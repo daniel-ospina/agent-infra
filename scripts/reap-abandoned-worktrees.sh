@@ -98,14 +98,20 @@
 #                           every EXPENSIVE per-candidate step (the live-pid census,
 #                           `git status`, the re-probe, removal). Cheap eligibility (the structural
 #                           rejections and the age floor) still runs for the whole population, so an
-#                           over-budget pass classifies what it saw and preserves the rest — it never
-#                           spends the budget on trees the age floor rejects anyway. ⛔ AND AN EXHAUSTED
+#                           over-budget pass classifies what it saw and preserves the rest — on the
+#                           GITLESS arm it never spends the census on a tree the age floor rejects,
+#                           because that floor precedes the census there. ⚠️ NOT so on the LINKED arm:
+#                           its age floor sits AFTER the census (a linked worktree's own proof order is
+#                           unchanged, and moving the bound above the census is the only change to
+#                           that order), so a YOUNG linked worktree does spend one census before the
+#                           floor rejects it. ⛔ AND AN EXHAUSTED
 #                           CEILING SHORT-CIRCUITS THE SCAN (see REAP_AW_GITLESS_MAX below), so past it a
 #                           tree costs one integer compare rather than the ~6 forks the
 #                           canonical/keep/state guards need.
-#                           It bounds the PER-CANDIDATE work, not the whole class: the eligibility scan is
-#                           proportional to the population and the outer bound stays
-#                           DISK_REAPER_CLASS_TIMEOUT (1800) in the caller.
+#                           It bounds the PER-CANDIDATE work, not the whole class: the eligibility scan
+#                           is proportional to the population. The caller (`disk-reaper.sh`) invokes this
+#                           delegate ONCE PER ROOT under its own DISK_REAPER_CLASS_TIMEOUT (1800), so an
+#                           N-root pass is bounded by N x 1800 — not by 1800.
 #   REAP_AW_GITLESS_MAX     the gitless arm's count ceiling (default 10), applied PER ROOT — the
 #                           counter is reset inside each `sweep_root`, and `ROOTS` is colon-separated,
 #                           so a two-root pass permits two ceilings — and charged PER AGED CANDIDATE:
@@ -701,9 +707,13 @@ sweep_root() { # <root>
             # ⛔ THE TWO BOUNDS ARE **NOT** HERE ANY MORE (#3278). They used to be checked here, BEFORE
             # the age floor — so a tree the floor would preserve still consumed a cap unit, and on a
             # root with thousands of young trees the ten slots went to trees that could never be
-            # removed (measured: 89 % of them). The cheap structural rejections below are the only
-            # thing that belongs ahead of the age test; the count ceiling and the TIME bound are both
-            # applied after it, where the expensive work actually starts.
+            # removed (measured: 89 % of them). ⛔ TWO DIFFERENT THINGS MOVED, and conflating them is
+            # what makes this block read as its own contradiction: the CHARGE (`GITLESS_DONE++` below)
+            # moved after the age floor, so a young tree still costs no slot; the REFUSAL did NOT move
+            # with it — it is the O(1) check at the TOP of this branch, ahead of the structural
+            # rejections and of everything that forks or walks (see the next block). The TIME bound is a
+            # separate pre-census gate further down. Cheap structural rejections are the only per-entry
+            # work that legitimately precedes the age test.
             # ⛔ THE COUNT CEILING SHORT-CIRCUITS THE SCAN (#3278 P1, completed in review round 11).
             # It needs NO per-entry work — one integer compare — so it sits ABOVE everything that forks
             # or walks. That is the difference between the ceiling being a bound and only a label:

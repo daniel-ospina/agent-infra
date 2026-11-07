@@ -305,7 +305,9 @@ lane preserves the tree with `reason=live-cwd`). It carries a keep list (`REAP_A
 default `/tmp/actions-runner:/tmp/venv-shared*`), is bounded **per root** by a **wall-clock budget**
 (`REAP_AW_BUDGET_SECONDS`, default 300 s) that gates its **expensive per-candidate work** (the census,
 `git status`, the re-probe, removal) — not the whole class: the eligibility scan is proportional to the
-population, so the pass's outer bound remains `DISK_REAPER_CLASS_TIMEOUT=1800` — and keeps #3272's
+population, so the caller's outer bound is `DISK_REAPER_CLASS_TIMEOUT=1800` **per root invocation**
+(the caller runs this delegate once per root, each under its own watchdog — an N-root pass is bounded by
+N x 1800, not by 1800) — and keeps #3272's
 **count ceiling** (`REAP_AW_GITLESS_MAX`,
 default 10 per root). #3278 changed **when that ceiling is charged**, not its size: the unit is now
 taken after the age floor and before the live-pid census, so the ten slots go to AGED trees instead of

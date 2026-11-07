@@ -81,6 +81,17 @@
 #     makes the census observable) and the holder preserves the tree under every order, so it could not
 #     tell a working bound from an absent one. H's ordering is carried instead by `reason=budget` WITH
 #     the holder present and `reason=live-cwd` absent — the pair a census-first order cannot produce.
+# Round 12 found a FIFTH: G's "the directory it points to OUTSIDE the root survived" was `[ -d "$outside" ]`
+# inside a DRY-RUN pass, so nothing there deletes and the target survived under every mutant — INCLUDING
+# one with the `-L` gate removed (agent-infra#3442). REPLACED by three rows: the dry-run RECORD must never
+# name the outside target for removal (`remove <outside>` is what a followed link would print, since the row
+# prints `canon` = `pwd -P`), and an `--apply` pass must leave the target — CONTENTS included — while the
+# aged unprotected tree in that SAME pass is gone (the non-vacuity companion; without it a crash before any
+# deletion would satisfy the survival row). ⛔ The property has TWO independent gates (`-L` and the
+# `_lp_rel` containment re-check), so no single-line regression reddens those rows: `MUT_SYMLINK` proves
+# the `reason=symlink` row, and `MUT_SYMLINK_OUTSIDE` removes BOTH gates and reddens all three. Both depend
+# on `age_link`: `file_mtime` is lstat, so with only the TARGET aged the link reads YOUNG and the age floor
+# masks the gates (measured — with both gates removed the row still read `reason=young (age=0m)`).
 # A test that passes against a script with the bound
 # DELETED proves nothing, and a mutation that cannot be applied is counted a FAILURE — a stale mutation
 # is a case that has silently stopped checking.
@@ -169,6 +180,18 @@ age_path() {
     local when=$(( $(date +%s) - $2 * 60 ))
     touch -d "@$when" "$1" 2>/dev/null \
         || touch -t "$(date -r "$when" +%Y%m%d%H%M 2>/dev/null || printf 202001010000)" "$1" 2>/dev/null \
+        || true
+}
+
+# age_link <path> <minutes> — set a SYMLINK's OWN mtime (`touch -h`). `file_mtime` runs `stat` WITHOUT
+# `-L`, i.e. lstat, so the age floor reads the LINK's times and NOT its target's. Ageing only the target
+# therefore leaves the link YOUNG, and the age floor then keeps it for a reason that has nothing to do
+# with the gate under test — measured in review round 12: with both containment gates removed the row
+# still read `reason=young (age=0m)`, so case G's new rows could not be reddened at all.
+age_link() {
+    local when=$(( $(date +%s) - $2 * 60 ))
+    touch -h -d "@$when" "$1" 2>/dev/null \
+        || touch -h -t "$(date -r "$when" +%Y%m%d%H%M 2>/dev/null || printf 202001010000)" "$1" 2>/dev/null \
         || true
 }
 
@@ -446,10 +469,16 @@ case_g() { # <owner-script>
     UNDER_TEST="$owner"
     newfixture g || { case_check 1 "fixture could not be built"; return 1; }
     local root="$FB/root"
-    # G1 symlink: never followed, and its TARGET (outside the root) survives.
+    # G1 symlink: never followed, and its TARGET (outside the root) is never even a candidate.
     outside="$(mk_gitless "$FB" outside-target)"
+    # a sentinel file, so the `--apply` survival row below proves the TARGET'S CONTENTS survived and not
+    # merely that a directory of some name still exists.
+    printf 'must survive\n' >"$outside/keep-me"
     ln -s "$outside" "$root/a-link"
+    # ⛔ AGE THE LINK, not only the target — see `age_link`. Ageing the target alone leaves the LINK young
+    # (lstat), and the age floor then keeps it for an unrelated reason, masking both gates.
     age_path "$outside" 400
+    age_link "$root/a-link" 400
     # G2 a primary checkout (`.git` is a DIRECTORY) is never a candidate.
     mkdir -p "$root/a-maincheckout/.git"
     age_path "$root/a-maincheckout" 400
@@ -472,7 +501,19 @@ case_g() { # <owner-script>
     [ -n "${AW_DEBUG:-}" ] && printf '%s\n' "$OUT" >&2
     case_check "$(grep -qF "KEPT   $root/a-link reason=symlink" <<<"$OUT" && echo 0 || echo 1)" \
                "a SYMLINK in the root is never followed (reason=symlink)"
-    case_check "$([ -d "$outside" ] && echo 0 || echo 1)" "and the directory it points to OUTSIDE the root survived"
+    # ⛔ THIS ROW USED TO BE `[ -d "$outside" ]`, AND IT COULD NOT FAIL: that pass is a DRY RUN (no
+    # `--apply`), so nothing there deletes anything and the target survived under every implementation,
+    # every mutant and pre-#3278 code alike (review round 12, agent-infra#3442). What IS observable in a
+    # dry run is the RECORD: the removal row prints `$canon` (`log_line "remove $canon"`), and `canon`
+    # is `pwd -P` — so a followed symlink names the OUTSIDE target in its remove row. The survival half
+    # is asserted separately, on the pass that actually DELETES (see the --apply run below).
+    # ⛔ THIS IS THE BACKSTOP ROW, AND IT IS HONESTLY A BACKSTOP: TWO independent gates defend the
+    # outside target (`-L`, and the `_lp_rel` containment re-check), so no SINGLE-line regression reddens
+    # this row or the two below — either gate alone still keeps the tree out. `MUT_SYMLINK_OUTSIDE`
+    # removes BOTH, which is what proves these rows can go RED (`remove <outside>` appears, and `--apply`
+    # really deletes the target). `MUT_SYMLINK` alone reddens the `reason=symlink` row ABOVE, not these.
+    case_check "$(grep -qF "remove $outside" <<<"$OUT" && echo 1 || echo 0)" \
+               "and it is NEVER named as a removal candidate — following it would resolve to a path OUTSIDE the root"
     case_check "$(grep -qF "PRESERVED($root/a-maincheckout, main-checkout)" <<<"$OUT" && echo 0 || echo 1)" \
                "a primary checkout (.git is a DIRECTORY) is preserved BY NAME (preserved:main-checkout)"
     case_check "$(grep -qF "KEPT   $root/a-gitbelow reason=git-below" <<<"$OUT" && echo 0 || echo 1)" \
@@ -485,6 +526,22 @@ case_g() { # <owner-script>
                "the one aged, unprotected tree IS a candidate (these gates are not a blanket refusal)"
     case_check "$([ -d "$root/b-reapable" ] && echo 0 || echo 1)" \
                "and with NO mode flag the pass was a DRY RUN — nothing was removed"
+    # ── G1b THE SURVIVAL HALF, ON A PASS THAT REALLY DELETES ───────────────────────────────────────
+    # Everything above is a dry run, so nothing there can prove a directory is protected from deletion.
+    # This is the arm that DELETES: the symlink's OUTSIDE target must still exist afterwards, and — the
+    # non-vacuity half — the aged unprotected tree in the SAME pass must be gone, proving the `rm -rf`
+    # really ran. Without that second row a crash before any deletion would satisfy the first.
+    OUT="$(HOME="$FB/home" CELL_HOME="" REAP_AW_STATE_DIR="$FB/state" REAP_AW_LOG="$FB/state/log" \
+           REAP_AW_PROC_ROOT="$FB/proc" REAP_AW_GITLESS_KEEP="$root/a-keeplist" \
+           bash "$owner" --root "$root" --include-gitless --apply 2>&1)"; OUT_RC=$?
+    [ -n "${AW_DEBUG:-}" ] && printf '%s\n' "$OUT" >&2
+    case_check "$([ "$OUT_RC" = 0 ] && echo 0 || echo 1)" "the ARMED pass exits 0 (rc=$OUT_RC)"
+    case_check "$([ -d "$outside" ] && [ -f "$outside/keep-me" ] && echo 0 || echo 1)" \
+               "the directory the symlink points to, OUTSIDE the root, is UNTOUCHED after --apply — its contents included"
+    # ⛔ NON-VACUITY: `--apply` really deleted something in this same pass. A pass that removed nothing
+    # would make the row above true for the trivial reason.
+    case_check "$([ -e "$root/b-reapable" ] && echo 1 || echo 0)" \
+               "and the aged unprotected tree in the SAME pass WAS removed, so the row above is not trivially true"
     # G7 --include-gitless is still OPT-IN: every existing caller keeps its exact behaviour.
     OUT="$(HOME="$FB/home" CELL_HOME="" REAP_AW_STATE_DIR="$FB/state" REAP_AW_LOG="$FB/state/log" \
            REAP_AW_PROC_ROOT="$FB/proc" bash "$owner" --root "$root" 2>&1)"; OUT_RC=$?
@@ -787,6 +844,36 @@ if apply_mutation "$OWNER" "$T/mut-cellhome-ref/reap-abandoned-worktrees.sh" -e 
     expect_fail "MUT_CELLHOME_REF the guard reads the raw CELL_HOME, not the fallback — case G must go RED" case_g "$T/mut-cellhome-ref/reap-abandoned-worktrees.sh"
 else
     bad "MUT_CELLHOME_REF could not be applied — the guard's use site is not being checked any more"
+fi
+
+# MUT_SYMLINK removes the `-L` gate at the top of `sweep_root`, so a symlink sitting in the scratch root
+# is no longer refused there. It is what proves case G's `reason=symlink` row can fail.
+# ⚠️ By ITSELF it does NOT turn the target into a candidate: the independent `_lp_rel` containment
+# re-check still refuses it (`reason=outside-root`, measured in review round 12). That is defence in
+# depth working, not a weak mutation — the mutation for case G's OUTSIDE-target rows is the two-gate one
+# below.
+MUT_SYMLINK='s|^        if \[ -L "\$d" \]; then$|        if false; then|'
+if apply_mutation "$OWNER" "$T/mut-symlink/reap-abandoned-worktrees.sh" -e "$MUT_SYMLINK"; then
+    expect_fail "MUT_SYMLINK the symlink gate removed — case G must go RED (reason=symlink is gone)" case_g "$T/mut-symlink/reap-abandoned-worktrees.sh"
+else
+    bad "MUT_SYMLINK could not be applied — the symlink refusal is not being checked any more"
+fi
+
+# MUT_SYMLINK_OUTSIDE removes BOTH gates that keep a directory outside the scratch root out of reach: the
+# `-L` refusal and the `_lp_rel` containment re-check. Neither alone is enough to reach the target (the
+# survivor still refuses it), so this is the only edit that makes the property observable — and it is
+# what makes case G's three outside-target rows falsifiable rather than decorative. Measured (review
+# round 12): the dry run then prints `remove <outside-target>`, and `--apply` prints
+# `REAPED <outside-target> how=rm-gitless` and the target is actually gone.
+# ⛔ IT ALSO DEPENDS ON `age_link`: `file_mtime` is lstat, so with only the TARGET aged the link reads
+# YOUNG and the age floor keeps it — the rows stay green for a reason unrelated to either gate.
+MUT_SYMLINK_OUTSIDE_A="$MUT_SYMLINK"
+MUT_SYMLINK_OUTSIDE_B='s|^        if ! _lp_rel "\$canon" "\$root_canon"; then$|        if false; then|'
+if apply_mutation "$OWNER" "$T/mut-symlink-outside/reap-abandoned-worktrees.sh" \
+        -e "$MUT_SYMLINK_OUTSIDE_A" -e "$MUT_SYMLINK_OUTSIDE_B"; then
+    expect_fail "MUT_SYMLINK_OUTSIDE both containment gates removed — case G must go RED (a target outside the root becomes a candidate, and is deleted)" case_g "$T/mut-symlink-outside/reap-abandoned-worktrees.sh"
+else
+    bad "MUT_SYMLINK_OUTSIDE could not be applied — the outside-root containment is not being checked any more"
 fi
 
 # MUT_CENSUS_FIRST makes the bound's DECISION depend on the census, i.e. the census runs first — the
