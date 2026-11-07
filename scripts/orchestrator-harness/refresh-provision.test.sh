@@ -64,15 +64,19 @@
 #       the cause can never report a "DIFFERENT repo" mismatch it did not measure.
 #
 # #3584 — THE GH PRECONDITION MUST NAME ITSELF IN THE RECORD, one arm each:
-#   (g)  a `gh` whose `api rate_limit` validation read is refused BY THE BUDGET records the specific
-#        precondition AND its evidence (`gh-core-floor remaining=… floor=…`) in `state/refresh-last`'s
-#        `why=`, instead of the old pointer `(the refusal line above names which one)`;
+#   (g)  the gh precondition refuses LOCALLY (rc=75, the shim's real `gh-contended` shared-window note)
+#        and the RECORD names the specific precondition plus that evidence, instead of the old pointer
+#        `(the refusal line above names which one)` — and claims NO quota exhaustion that 75 does not
+#        establish;
 #   (g2) NON-VACUITY: reverting ONLY the call-site interpolation in a copy puts the pointer back and
-#        drops the budget evidence — so (g) measures the record, not the probe's log line;
+#        drops the evidence — so (g) measures the record, not the probe's log line;
 #   (g3) the clause is MEASURED, not constant: a REJECTED credential (HTTP 401) is still rc=3 and is
 #        recorded as rejected, claiming no budget refusal;
-#   (g4) rc=75 (`EX_TEMPFAIL` — "refused LOCALLY, nothing was sent", the gh layer's own contract) is
-#        named as budget/throttling off the EXIT CODE, with a stub that writes NOTHING on stderr.
+#   (g4) rc=75 with a ZERO-BYTE capture is named off the EXIT CODE, and the empty capture is named as
+#        such — the branch a text classifier could not reach at all.
+#   ⛔ The stub feeds the SHIM's string, not `gh-core-floor`: this call cannot receive a floor line
+#   (`gh-limit.py`'s `reaches_api()` is False for the meter), and a fixture asserting one would grade
+#   the label against evidence production cannot emit (#3701 review, P2).
 #
 # HOW. Every arm drives the SHIPPED script inside a sandbox: a real git repo with a real (local, bare)
 # origin and a real `git worktree` scout, so `scout_is_worktree`/`fetch`/`checkout` all run for real
@@ -181,17 +185,24 @@ SH
 
 # mk_gh_budget_stub <case-dir> <rc> <stderr-line> — the same `gh`, answering `auth token` from a
 # STORED credential but REFUSING the `api rate_limit` validation read with the given rc and stderr.
-# This is the shape `gh-limit.py` and `scripts/gh-shim/gh` produce on a box whose CORE pool is inside
-# the reserve: `gh api rate_limit` is exempt from the primary limit, so it is the WINDOW/partition
-# layer that refuses it, and the refusal is a real `gh-limit: gh-core-floor remaining=… floor=…` line
-# (#3584).
+# An EMPTY <stderr-line> writes NOTHING AT ALL (a zero-byte capture) — `printf '%s\n' ""` writes one
+# newline, which is not the same shape and would leave the "no stderr written" branch unexercised
+# (#3701 review, P2).
+# ⛔ WHAT CAN ACTUALLY REFUSE THIS CALL (#3701 review, P2 — measured, not assumed). `gh api rate_limit`
+# IS THE METER: `gh-limit.py`'s `reaches_api()` answers False for it and the CORE floor is gated behind
+# `reaches_api`, so `gh-limit: gh-core-floor …` can NEVER appear on this probe's stderr — it comes from
+# the CORE reads the same pass makes. The reachable local refusal is one layer DOWN,
+# `scripts/gh-shim/gh:1874`: a shared cooldown window that outlives its own wait budget exits 75 with
+# `gh-contended — a shared gh throttle window outlived this call's …ms wait budget and no exempt quota
+# read cleared it (a burst/concurrency window is never discharged by one)`. So the arms below feed the
+# SHIM's string, not a floor line production cannot emit here.
 mk_gh_budget_stub() {
   local D="$1" rc="$2" line="$3"
   cat > "$D/bin/gh" <<SH
 #!/bin/bash
 case "\$1 \$2" in
   "auth token") exit 0 ;;
-  *" rate_limit"*) printf '%s\\n' "$line" >&2; exit $rc ;;
+  *" rate_limit"*) [ -z "$line" ] || printf '%s\\n' "$line" >&2; exit $rc ;;
   *) printf '[]\\n' ;;
 esac
 SH
@@ -910,27 +921,40 @@ ck "(h3) …and offers no 'unset OR' remedy the refusal ignores" "$r"
 #
 # — a POINTER into the log, written into `state/refresh-last`, which is the artifact `orch-loop.sh`
 # builds `[dispatch] BLOCKED: refresh failed — stage=provision` from and which `.refresh-blocked`
-# quotes as "Reason and evidence". A reader of the RECORD therefore got no cause at all, and the
-# measured case was worse than uninformative: the refusal two log lines above was the BUDGET
-# (`gh-limit: gh-core-floor remaining=312 floor=800 resets_in=7m`), so "refused because quota" and
-# "refused because auth" were indistinguishable in the one sentence an operator reads. That is
+# quotes as "Reason and evidence". A reader of the RECORD therefore got no cause at all: "refused
+# because auth", "refused because the gh layer would not let the call out" and "refused because the
+# box could not reach GitHub" were indistinguishable in the one sentence an operator reads. That is
 # #3584's own acceptance criterion for the provision stage, and the reason a week of `TRANSIENT`
 # refusals presented with "no visible cause".
 #
 # The rows below drive the SHIPPED pass against a stub whose `gh` refuses exactly that read, and read
 # the RECORD (not the log) — the record is what the beat prints.
+# ⛔ THE STUB FEEDS THE SHIM'S REAL STRING, NOT A FLOOR LINE (#3701 review, P2). `gh api rate_limit` is
+# the METER: `gh-limit.py`'s `reaches_api()` answers False for it, so the CORE floor — which is gated
+# behind `reaches_api` — can never refuse this call, and a `gh-core-floor` line on its stderr is a
+# shape production cannot emit. What DOES refuse it is the shared-cooldown layer in
+# `scripts/gh-shim/gh:1874`, and this is that layer's own wording.
 mk_case gh_budget
-mk_gh_budget_stub "$D" 1 \
-  'gh-limit: gh-core-floor remaining=312 floor=800 resets_in=7m - gh rate limit: this is the GitHub BUDGET, not a broken repo, an invalid token, or GitHub being down.'
+mk_gh_budget_stub "$D" 75 \
+  "gh-contended - a shared gh throttle window outlived this call's 120000ms wait budget and no exempt quota read cleared it (a burst/concurrency window is never discharged by one) - returning rc=75 rather than hanging into the caller's timeout"
 rp "$D"
 G_WHY="$(rec why)"
-ck "(g) a budget-refused gh precondition is still TRANSIENT (rc=$RC)" "$([ "$RC" -eq 1 ]; echo $?)"
+ck "(g) a locally-refused gh precondition is TRANSIENT (rc=$RC)" "$([ "$RC" -eq 1 ]; echo $?)"
 ck "(g) …and the failure is recorded at the provision stage (stage=$(rec stage))" \
    "$([ "$(rec stage)" = provision ]; echo $?)"
 ck "(g) …and the RECORD names the PRECONDITION, not a pointer to a log line" \
    "$(case "$G_WHY" in *'refusal line above names which one'*) echo 1 ;; *'question='*) echo 0 ;; *) echo 1 ;; esac)"
-ck "(g) …and the record carries the BUDGET EVIDENCE that refused it (remaining=/floor=)" \
-   "$(case "$G_WHY" in *'gh-core-floor remaining=312 floor=800'*) echo 0 ;; *) echo 1 ;; esac)"
+ck "(g) …and the record carries the GH LAYER'S OWN refusal line, verbatim (gh-contended)" \
+   "$(case "$G_WHY" in *'gh-contended'*) echo 0 ;; *) echo 1 ;; esac)"
+# ⛔ AND IT MUST NOT CLAIM A CAUSE 75 DOES NOT ESTABLISH (#3701 review, P1). 75 is EX_TEMPFAIL —
+# "refused LOCALLY, nothing was sent" — which is ALSO single-flight BUSY and the shared-window verdict;
+# `gh-limit.py:3446` records "a contended verdict is NOT a limit" as a defect it fixed. A clause saying
+# "quota" here would publish, in the one sentence this change exists to make true, a diagnosis the
+# evidence beside it contradicts.
+ck "(g) …and claims NO quota/budget exhaustion that rc=75 does not establish" \
+   "$(case "$G_WHY" in *'quota/throttling'*|*'out of quota'*) echo 1 ;; *) echo 0 ;; esac)"
+ck "(g) …and DOES say nothing was sent, so neither credential nor budget was tested" \
+   "$(case "$G_WHY" in *'nothing was sent, so NEITHER the credential NOR the budget was tested'*) echo 0 ;; *) echo 1 ;; esac)"
 # ⛔ NON-VACUITY: revert ONLY the call-site interpolation in a copy and re-run the SAME fixture. If the
 # record still named the clause, these rows would be measuring the probe's log line rather than what
 # the record carries — i.e. they would be green for a fix that was never applied.
@@ -949,8 +973,8 @@ then
   ck "(g2) with the call-site interpolation reverted the pass STILL refuses (rc=$RC)" "$([ "$RC" -eq 1 ]; echo $?)"
   ck "(g2) …and its record falls back to the POINTER, so (g) is not vacuous" \
      "$(case "$GM_WHY" in *'refusal line above names which one'*) echo 0 ;; *) echo 1 ;; esac)"
-  ck "(g2) …and the reverted record loses the budget evidence (the row (g) pins is live)" \
-     "$(case "$GM_WHY" in *'gh-core-floor'*) echo 1 ;; *) echo 0 ;; esac)"
+  ck "(g2) …and the reverted record loses the gh layer's evidence (the row (g) pins is live)" \
+     "$(case "$GM_WHY" in *'gh-contended'*) echo 1 ;; *) echo 0 ;; esac)"
 else
   bad "(g2) the non-vacuity control could not be produced"
 fi
@@ -965,17 +989,22 @@ ck "(g3) a REJECTED credential is still NOT PROVISIONABLE (rc=$RC, expected 3)" 
 ck "(g3) …and the record names the credential as REJECTED, from the evidence it measured" \
    "$(case "$G401_WHY" in *'REJECTED'*) echo 0 ;; *) echo 1 ;; esac)"
 ck "(g3) …and claims NO budget refusal it did not measure" \
-   "$(case "$G401_WHY" in *'gh-core-floor'*|*'budget'*) echo 1 ;; *) echo 0 ;; esac)"
-# ⛔ rc=75 IS THE GH LAYER'S OWN CONTRACT (`gh-limit.py`'s and `scripts/gh-shim/gh`'s EX_TEMPFAIL —
-# "refused LOCALLY, nothing was sent"). It is read off the EXIT CODE and never off the prose, so this
-# row uses a stub that writes NOTHING on stderr: a text classifier could not name it at all.
+   "$(case "$G401_WHY" in *'gh-core-floor'*|*'budget'*|*'quota'*) echo 1 ;; *) echo 0 ;; esac)"
+# ⛔ rc=75 IS READ OFF THE EXIT CODE, NOT OFF PROSE. This arm's stub writes a ZERO-BYTE capture, so a
+# text classifier would have nothing at all to match — the shape `printf '%s\n' ""` does NOT produce
+# (that writes one newline; #3701 review, P2). The record must still name the verdict, and name the
+# empty capture as an empty capture rather than rendering an empty parenthetical.
 mk_case gh_75
 mk_gh_budget_stub "$D" 75 ''
 rp "$D"
 G75_WHY="$(rec why)"
 ck "(g4) a locally-refused validation read is TRANSIENT (rc=$RC)" "$([ "$RC" -eq 1 ]; echo $?)"
-ck "(g4) …and rc=75 alone is named as budget/throttling, with NO stderr to grep" \
+ck "(g4) …and rc=75 ALONE is named as a local refusal, with a zero-byte capture to grep" \
    "$(case "$G75_WHY" in *'REFUSED LOCALLY'*) echo 0 ;; *) echo 1 ;; esac)"
+ck "(g4) …and the empty capture is NAMED as such, not rendered as an empty parenthetical" \
+   "$(case "$G75_WHY" in *'no stderr written'*) echo 0 ;; *) echo 1 ;; esac)"
+ck "(g4) …and it still claims no quota exhaustion" \
+   "$(case "$G75_WHY" in *'quota/throttling'*|*'out of quota'*) echo 1 ;; *) echo 0 ;; esac)"
 
 # ── (h5) THE FOURTH COPY OF THE ACCEPT LIST MUST NOT DRIFT ────────────────────────────────────────
 # ⛔ THE DRIFT THIS PINS WAS LIVE (review of #3188, P2). The predicate has FOUR copies: three here

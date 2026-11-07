@@ -880,17 +880,29 @@ gh_probe_err_cleanup() { case "${GH_PROBE_ERR:-}" in ''|/dev/null) return 0 ;; e
 #
 #     why=TRANSIENT: the gh environment precondition refused (the refusal line above names which one) …
 #
-# while the refusal two log lines above it was a BUDGET refusal
-# (`gh-limit: gh-core-floor remaining=312 floor=800 resets_in=7m`). So the one sentence an operator
-# reads named neither the precondition nor the budget, and "refused because quota" and "refused
-# because auth" were indistinguishable in the record — the `provision` stage's own acceptance
-# criterion on #3584, and the reason a week of `TRANSIENT` refusals had "no visible cause".
+# so the one sentence an operator reads named neither the precondition nor the gh layer's own refusal.
+# "Refused because auth", "refused because the budget/throttle layer would not let the call out" and
+# "refused because this box could not reach GitHub" were indistinguishable in the record — the
+# `provision` stage's own acceptance criterion on #3584, and the reason a week of `TRANSIENT` refusals
+# had "no visible cause".
 #
 # WHAT NAMES IT. Every refusing arm sets `GH_PROBE_CAUSE` to the question it asked and the answer it
 # MEASURED, and the call site interpolates it. NO new classifier and NO new gh call: the clause is
-# rendered from evidence the probe has already paid for (`$GH_PROBE_ERR`, the rc) — a budget refusal
-# keeps its own `gh-limit: gh-core-floor remaining=… floor=… resets_in=…` line, so the numbers reach
-# the record with the words that produced them rather than a paraphrase.
+# rendered from evidence the probe has already paid for (`$GH_PROBE_ERR` — STDERR only — plus the rc),
+# so the gh layer's own refusal line reaches the record with the words that produced it. That matters
+# most for a BUDGET refusal, where the numbers (`remaining=`, `floor=`, `resets_in=`, or the shim's
+# `gh-contended … wait budget` note) ARE the diagnosis.
+#
+# ⛔ ONE SHAPE THAT CANNOT ARRIVE HERE, SAID OUT LOUD SO NOBODY CHASES IT (#3701 review, P2). `gh api
+# rate_limit` IS THE METER: `gh-limit.py`'s `reaches_api()` answers False for it, and the CORE floor is
+# gated behind `reaches_api` — so `gh-limit: gh-core-floor …` can NEVER appear on THIS call's stderr.
+# (It appears on the CORE reads the same pass makes, which is where an operator's
+# `BUDGET:gh-rest: gh-limit: gh-core-floor remaining=N` log line comes from — a different call.) What
+# CAN refuse the meter is the LAYER BELOW it: `scripts/gh-shim/gh`'s shared cooldown window, which
+# exits 75 with a `gh-contended — a shared gh throttle window outlived this call's …ms wait budget …`
+# note — a burst/concurrency window is invisible to `/rate_limit`, which is exactly why it is the one
+# that bites. A fixture that fed this probe a floor line would grade the label against evidence
+# production cannot emit; `refresh-provision.test.sh`'s `(g)` drives the reachable shape instead.
 GH_PROBE_CAUSE=""
 # ⛔ ONE LINE, BOUNDED, AND NEVER THE TOKEN. `gh auth token`'s STDOUT is already discarded by
 # `gh_probe_bounded`; this reads STDERR only. The take must not grow the record without limit either:
@@ -1082,16 +1094,23 @@ gh_probe_env() {
     return "$EXIT_NOT_PROVISIONABLE"
   fi
   # ⛔ THE AMBIGUOUS ARM NAMES ITS EVIDENCE, NOT JUST ITS ABSENCES. "the API did not answer with a
-  # 401" describes what was NOT seen; it was TRUE and USELESS — the measured answer was a budget
-  # refusal, and only this variable carries it to `state/refresh-last` (#3584). The rc-75 arm is the
-  # gh layer's own documented contract (EX_TEMPFAIL = "refused LOCALLY, nothing was sent"), read off
-  # the EXIT CODE and never off the prose, so it is named without a text match.
+  # 401" describes what was NOT seen; it was TRUE and USELESS when the measured answer was the gh
+  # layer declining to let the call out, and only this variable carries that to `state/refresh-last`
+  # (#3584).
+  # ⛔ rc=75 IS NAMED OFF THE EXIT CODE, AND THE CLAUSE CLAIMS ONLY WHAT 75 MEANS (#3701 review, P1).
+  # 75 is gh-limit.py's / scripts/gh-shim/gh's EX_TEMPFAIL: "refused LOCALLY, nothing was sent". It
+  # is NOT "the account is out of quota" — `gh-limit.py:3446` states that exact inversion as a defect
+  # it fixed ("A CONTENDED VERDICT IS NOT A LIMIT … That says 'I could not ask', NOT 'the account is
+  # out of quota'"), and the same code is BUSY_EXIT for single-flight contention. So the clause says
+  # what is TRUE — nothing was sent, so neither the credential nor the budget was tested — and lets
+  # the layer's own line, quoted verbatim, say which local verdict it was. A text match could not
+  # name this at all: prose drifts, which is why the repo keys on the rc for this code.
   # ⛔ THE EVIDENCE COMES FIRST IN THE CLAUSE, DELIBERATELY. `refresh_cause_brief` prints `why=` cut at
   # 400 characters (origination-funnel.test.sh pins that cut), so a clause built question-first would
-  # push the numbers — the thing this exists to surface — toward the truncation edge on a long stderr
-  # line. Evidence first puts `gh-core-floor remaining=…` around character 110 of the beat's line.
+  # push the evidence — the thing this exists to surface — toward the truncation edge on a long stderr
+  # line. Evidence first puts it around character 110 of the beat's line.
   case "$prc" in
-    75) GH_PROBE_CAUSE="answer=REFUSED LOCALLY by the gh budget/throttle layer (rc=75 EX_TEMPFAIL — NOTHING was sent): quota/throttling, NOT auth and NOT an outage ($(gh_probe_evidence "$prc")); question=can the stored credential answer at all (gh api rate_limit, source=$presence)" ;;
+    75) GH_PROBE_CAUSE="answer=REFUSED LOCALLY by the gh layer (rc=75 EX_TEMPFAIL — nothing was sent, so NEITHER the credential NOR the budget was tested): NOT auth and NOT an outage ($(gh_probe_evidence "$prc")); question=can the stored credential answer at all (gh api rate_limit, source=$presence)" ;;
     *)  GH_PROBE_CAUSE="answer=NO — the call failed, and this is the evidence it wrote ($(gh_probe_evidence "$prc")); question=can the stored credential answer at all (gh api rate_limit, source=$presence) — read that evidence before calling this auth or an outage" ;;
   esac
   echo "[refresh] TRANSIENT: a gh credential is PRESENT for the host gh is configured for (source=$presence) but the API did not answer with a 401 in the environment the pre-flight runs in (HOME=$HOME) — treating it as an outage rather than a rejected credential, so this is retried next cycle instead of latching the permanent MERGE-ONLY marker (#1736)"
