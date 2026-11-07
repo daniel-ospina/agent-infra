@@ -1301,7 +1301,7 @@ delta_git_neutral() { # <root> <git args…>
 delta_verify() { # <id: A..B[+artifact]> <head_sha> -> 0 = verified (sets DELTA_*)
   local id="$1" head="$2" range from to cover="" root="" tmp="" norm=""
   local authored="" newest="" n_authored=0 anchor="" dg_rc=0 base_sha="" base_ref=""
-  local merges_in_range="" evil="" evil_shas="" m="" parents="" pcount="" p1="" p2="" prest="" want="" actual="" cands="" mrc="" body_claim="" stated_from="" stated_to="" stated_sep="" _delta_tok="" E_OUT="" E_RC="" _scan="" _any="" _all_ok="" _sf="" _ss="" _st="" _ok="" _sfs="" _r="" _claim="" _toks="" _tok_rc=0 _tok="" _tsha="" _drivers="" _dg_rc=0 _gitdir="" _gd_rc=0 _commondir="" _cd_rc=0 _attr_amb="" _wt_amb="" _ls_rc=0 _st_amb="" _st_rc=0 _ad=""
+  local merges_in_range="" evil="" evil_shas="" m="" parents="" pcount="" p1="" p2="" prest="" want="" actual="" cands="" mrc="" body_claim="" stated_from="" stated_to="" stated_sep="" _delta_tok="" E_OUT="" E_RC="" _scan="" _any="" _all_ok="" _sf="" _ss="" _st="" _ok="" _sfs="" _r="" _claim="" _toks="" _tok_rc=0 _tok="" _tsha="" _drivers="" _dg_rc=0 _gitdir="" _gd_rc=0 _commondir="" _cd_rc=0 _attr_amb="" _wt_amb="" _ls_rc=0 _st_amb="" _st_rc=0 _ad="" _adrift="" _adr_rc=0
   range="${id%%+*}"
   [ "$range" != "$id" ] && cover="${id#*+}"
   from="${range%%..*}"; to="${range##*..}"
@@ -1532,7 +1532,10 @@ delta_verify() { # <id: A..B[+artifact]> <head_sha> -> 0 = verified (sets DELTA_
       return 1
     fi
     _st_amb=""; _st_rc=0
-    _st_amb="$(delta_git "$root" ls-files -v -- '*.gitattributes' '.gitattributes' 2>/dev/null | command awk 'substr($0,1,1) ~ /[a-z]/ { print substr($0,3) }')" || _st_rc=$?
+    # ⛔ `[a-zS]`, NOT `[a-z]` (cycle-5 review, P1 — the comment above named skip-worktree while the
+    # predicate could never match it): `ls-files -v` prints `S` for skip-worktree and a LOWERCASE
+    # letter for assume-unchanged, and either one makes git refuse to compare the file at all.
+    _st_amb="$(delta_git "$root" ls-files -v -- '*.gitattributes' '.gitattributes' 2>/dev/null | command awk 'substr($0,1,1) ~ /[a-zS]/ { print substr($0,3) }')" || _st_rc=$?
     if [ "$_st_rc" -ne 0 ]; then
       echo "   delta: the assume-unchanged / skip-worktree scan FAILED (git ls-files -v rc $_st_rc) — a scan that did not run is not a checkout whose attributes are all real, so the range is not verified. Retry rather than record." >&2
       return 1
@@ -1558,6 +1561,24 @@ delta_verify() { # <id: A..B[+artifact]> <head_sha> -> 0 = verified (sets DELTA_
   evil=""
   while IFS= read -r m; do
     [ -n "$m" ] || continue
+    # ⛔ THE PROPERTY THAT MATTERS IS DRIFT, NOT INDEX STATUS (cycle-5 review, P0 — a REGRESSION
+    # from cycle 4, which dropped `-m` while adding `-o` and so lost the MODIFIED-TRACKED case the
+    # arm had been catching). `ls-files -o` sees untracked paths; `-m` compares worktree to INDEX,
+    # so a STAGED file is invisible to both, and assume-unchanged / skip-worktree hide a third
+    # shape. Enumerating index states is the spelling trap again. The one question is: does the
+    # `.gitattributes` the oracle will READ differ from the one in the MERGE'S OWN TREE? `git diff
+    # <merge> -- <pathspec>` answers exactly that for the worktree (staged and unstaged alike).
+    # The flag scan above still runs, because assume-unchanged/skip-worktree make git SKIP the file
+    # here — a state in which this read cannot prove equality, which is why it refuses.
+    _adrift=""; _adr_rc=0
+    _adrift="$(delta_git "$root" diff --name-only "$m" -- '*.gitattributes' '.gitattributes' 2>/dev/null)" || _adr_rc=$?
+    if [ "$_adr_rc" -ne 0 ]; then
+      echo "   delta: the ATTRIBUTES-DRIFT read FAILED for merge ${m:0:12}… (git diff rc $_adr_rc) — a read that did not run cannot prove the checkout's attributes match the commit's, so the range is not verified. Retry rather than record." >&2
+      return 1
+    fi
+    if [ -n "$_adrift" ]; then
+      _attr_amb="${_attr_amb}${_attr_amb:+$'\n'}${_adrift} (worktree copy differs from merge ${m:0:12}…)"
+    fi
     parents="$(delta_git "$root" rev-list --parents -n1 "$m" 2>/dev/null || true)"
     pcount="$(awk '{print NF-1}' <<< "$parents")"
     if [ "$pcount" != "2" ]; then
@@ -1608,6 +1629,14 @@ $m"
       fi
     fi
   done <<< "$merges_in_range"
+  # ⛔ THE DRIFT ARM'S ANSWER ARRIVES INSIDE THE LOOP, so the refusal is re-checked here, before any
+  # classification work can mint anything. `_attr_amb` is non-empty only for an AMBIENT source.
+  if [ -n "$_attr_amb" ]; then
+    echo "   delta: an AMBIENT ATTRIBUTES source steers this checkout's merge oracle — 'merge-tree' honours it, so a hand-resolved conflict and a clean merge become the SAME answer and this range cannot be classified:" >&2
+    printf '%s\n' "$_attr_amb" | command sed -e 's/^/     /' >&2
+    echo "   These sources are not what the merge's own tree carries (nothing in the diff, the record or the digest shows them), while a gitattributes file COMMITTED and unmodified is legitimate and stays accepted. Restore or commit the file, or run the record from a clean checkout of the same commit, then retry — a range whose merges cannot be judged is not evidence." >&2
+    return 1
+  fi
   if [ -n "$authored" ] || [ -n "$evil" ]; then
     n_authored="$(printf '%s\n' "$authored" | grep -c . || true)"
     # THE ANCHOR: the newest commit a covering verdict must have POSTDATED.

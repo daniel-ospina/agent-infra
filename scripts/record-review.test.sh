@@ -8295,6 +8295,83 @@ assert_eq "$RECORD_RC" "3" "20i6 a GLOBAL attributes file does NOT steer the rec
 assert_contains "$RECORD_ERR" "postdates ${DG_UN_H:0:12}" \
     "20i6 …the hand resolution is still classified EVIL (the anchor is the merge), because the oracle read neutralised the machine's rule"
 rm -f "$F_HOME/.config/git/attributes"
+# 20i7 THE TRACKED-BUT-DRIFTED `.gitattributes` (cycle-5 review, P0 — the previous commit dropped
+#      `-m` while adding `-o`, which LOST the modified-tracked case it had been catching; the staged
+#      and skip-worktree shapes were never in the population at all). The property is not an index
+#      state: it is whether the file the ORACLE reads differs from the one in the MERGE'S OWN TREE.
+#      All three states below steer `merge-tree` into the hand resolution and are invisible to
+#      `ls-files -o`; the drift read (`git diff <merge> -- <pathspec>`) is what catches the first
+#      two, and the flag scan catches the third because git refuses to compare it at all.
+git checkout -q -b attr_base "$DG_A1" >/dev/null 2>&1 || true
+printf '# fixture, no merge rules\n' > .gitattributes; git add -A
+GIT_COMMITTER_DATE='2025-08-01T00:00:00Z' GIT_AUTHOR_DATE='2025-08-01T00:00:00Z' git commit -qm 'fixture: tracked gitattributes'
+printf 'base-w\n' > w.txt; git add -A
+GIT_COMMITTER_DATE='2025-08-01T00:00:00Z' GIT_AUTHOR_DATE='2025-08-01T00:00:00Z' git commit -qm 'base: w'
+DG_AT_B="$(git rev-parse HEAD)"
+printf '%s\n' '2025-08-01T00:00:00Z' > "$T/dates/$DG_AT_B"
+git checkout -q -b attr_lane "$DG_A1" >/dev/null 2>&1 || true
+printf 'lane-w\n' > w.txt; git add -A
+GIT_COMMITTER_DATE='2025-08-01T00:00:00Z' GIT_AUTHOR_DATE='2025-08-01T00:00:00Z' git commit -qm 'lane: w'
+DG_AT_L="$(git rev-parse HEAD)"
+printf '%s\n' '2025-08-01T00:00:00Z' > "$T/dates/$DG_AT_L"
+git -c core.editor=true merge --no-ff --no-commit "$DG_AT_B" >/dev/null 2>&1 || true
+printf 'lane-w\nbase-w\n' > w.txt; git add -A
+GIT_COMMITTER_DATE='2025-09-01T00:00:00Z' GIT_AUTHOR_DATE='2025-09-01T00:00:00Z' git commit -qm 'keep both (hand)'
+DG_AT_H="$(git rev-parse HEAD)"
+printf '%s\n' '2025-09-01T00:00:00Z' > "$T/dates/$DG_AT_H"
+_at_mt=0
+DG_AT_MT="$(git merge-tree --write-tree "$DG_AT_L" "$DG_AT_B" 2>/dev/null)" || _at_mt=$?
+DG_AT_MT="${DG_AT_MT%%$'\n'*}"
+if [ "$_at_mt" != "0" ] && [ "$DG_AT_MT" != "$(git rev-parse "$DG_AT_H^{tree}")" ]; then
+    ok "20i7 fixture: the merge CONFLICTS while .gitattributes is untouched (rc $_at_mt)"
+else
+    bad "20i7 fixture: the conflict premise does not hold (rc=$_at_mt)"
+fi
+# the DRIFTED worktree copy: TRACKED, modified, NOT untracked, NOT staged
+printf 'w.txt merge=union\n' > .gitattributes
+_at_mt2=0
+DG_AT_MT2="$(git merge-tree --write-tree "$DG_AT_L" "$DG_AT_B" 2>/dev/null)" || _at_mt2=$?
+DG_AT_MT2="${DG_AT_MT2%%$'\n'*}"
+if [ "$_at_mt2" = "0" ] && [ "$DG_AT_MT2" = "$(git rev-parse "$DG_AT_H^{tree}")" ]; then
+    ok "20i7 control: the DRIFTED tracked attribute steers the oracle (rc 0, tree = the hand resolution)"
+else
+    bad "20i7 control: the drifted attribute did not steer merge-tree (rc=$_at_mt2)"
+fi
+if [ -z "$(git ls-files -o 2>/dev/null)" ]; then
+    ok "20i7 control: the drifted file is NOT untracked — ls-files -o sees nothing, which is why drift is a separate read"
+else
+    bad "20i7 control: the fixture file is untracked, so this vector would test the wrong arm"
+fi
+EHIB=425161; rm -f "$(Q2 $EHIB)"
+run_record_delta $EHIB "$DG_AT_H" "delta:$DG_AT_L..$DG_AT_H+comment:42516101" \
+    STUB_BASE_SHA="$DG_AT_B" STUB_EVIDENCE_AT="2025-08-15T00:00:00Z"
+assert_eq "$RECORD_RC" "3" "20i7 a MODIFIED tracked .gitattributes is refused (rc 3)"
+assert_contains "$RECORD_ERR" "worktree copy differs from merge" "20i7 the refusal names the drift, not an index state"
+# STAGED: same content, now in the index — invisible to `-o` and to `-m`
+git add .gitattributes
+EHIBA=425162; rm -f "$(Q2 $EHIBA)"
+run_record_delta $EHIBA "$DG_AT_H" "delta:$DG_AT_L..$DG_AT_H+comment:42516201" \
+    STUB_BASE_SHA="$DG_AT_B" STUB_EVIDENCE_AT="2025-08-15T00:00:00Z"
+assert_eq "$RECORD_RC" "3" "20i7 a STAGED tracked .gitattributes is refused (rc 3)"
+# SKIP-WORKTREE: git refuses to compare the file, so equality cannot be proven
+git update-index --skip-worktree .gitattributes
+EHIBB=425163; rm -f "$(Q2 $EHIBB)"
+run_record_delta $EHIBB "$DG_AT_H" "delta:$DG_AT_L..$DG_AT_H+comment:42516301" \
+    STUB_BASE_SHA="$DG_AT_B" STUB_EVIDENCE_AT="2025-08-15T00:00:00Z"
+assert_eq "$RECORD_RC" "3" "20i7 a SKIP-WORKTREE .gitattributes is refused (rc 3)"
+git update-index --no-skip-worktree .gitattributes 2>/dev/null || true
+# ⛔ UNSTAGE IT TOO. `git add` above left the union content in the INDEX; leaving it there makes the
+#    later `rm -f .gitattributes` a worktree DELETION relative to the index, which the drift read
+#    reports — so every following cell would refuse for a fixture residue rather than its own reason
+#    (measured: M36 "mutant still refused").
+git reset -q -- .gitattributes 2>/dev/null || true
+git checkout -- .gitattributes 2>/dev/null || true
+# ⛔ LEAVE THE FIXTURE REPO ON A BRANCH THAT HAS NO TRACKED .gitattributes. Later cells (M36) write
+#    an UNTRACKED one to test the untracked arm; with a tracked file still in the checkout that write
+#    would become a MODIFICATION, the drift arm would fire instead, and those cells would go vacuous
+#    (measured: M36 "mutant still refused"). 20i1's `hidlane` is that branch.
+git checkout -q hidlane >/dev/null 2>&1 || true
+rm -f .gitattributes
 # 20i5 THE CONFIG HALF: a CUSTOM driver (which has a config key) steered from an untracked
 #      attribute. Both halves are needed — the built-in drivers have no key, and a custom driver
 #      needs both the key and the attribute — and the refusal must name the scope, because the key
@@ -8815,6 +8892,13 @@ printf 'u.txt merge=union\n' > "$F_HOME/.config/git/attributes"
 MUT="$(mk_mutant nonneutral '    want="$(delta_git_neutral "$root" merge-tree --write-tree "$p1" "$p2" 2>/dev/null)"' '    want="$(delta_git "$root" merge-tree --write-tree "$p1" "$p2" 2>/dev/null)"')"
 mut_check "M38 the neutralised oracle" 425160 "$DG_UN_H" "delta:$DG_UN_L..$DG_UN_H+comment:42516001" accepted STUB_BASE_SHA="$DG_UN_B" STUB_EVIDENCE_AT="2025-08-15T00:00:00Z"
 rm -f "$F_HOME/.config/git/attributes"
+# M39 — THE ATTRIBUTES-DRIFT ARM (20i7). Dropping it re-accepts a TRACKED `.gitattributes` whose
+#       worktree copy steers the oracle — the P0 the previous commit introduced by removing `-m`.
+git checkout -q attr_lane >/dev/null 2>&1 || true
+printf 'w.txt merge=union\n' > "$DG/.gitattributes"
+MUT="$(mk_mutant nodrift '    _adrift="$(delta_git "$root" diff --name-only "$m" -- '\''*.gitattributes'\'' '\''.gitattributes'\'' 2>/dev/null)"' '    _adrift=""')"
+mut_check "M39 the attributes-drift arm" 425161 "$DG_AT_H" "delta:$DG_AT_L..$DG_AT_H+comment:42516101" accepted STUB_BASE_SHA="$DG_AT_B" STUB_EVIDENCE_AT="2025-08-15T00:00:00Z"
+git checkout -- .gitattributes 2>/dev/null || true
 # M8 (the tier arm) is RETIRED WITH ITS ARM: the unsigned local-record premise was a
 # forgery vector (review minted a signed `clean` from one `printf`), so there is no
 # tier left to launder into `clean`. 20h6 keeps its refusal, now reached through the
