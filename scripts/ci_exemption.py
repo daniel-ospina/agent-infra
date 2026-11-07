@@ -143,9 +143,26 @@ from pathlib import Path
 
 #: A pytest nodeid: ``path/to/test_x.py::[Class::]name`` (params allowed).
 #: Deliberately anchored and narrow — anything else is REJECTED, not guessed.
+#:
+#: OVERRIDES: the ``_NODEID_LOOSE_RE`` rationale ("``_NODEID_RE`` stays narrow for
+#: the RATE/UNION parsers; widening it there would loosen their fail-closed check
+#: for no gain") — the ``/`` in ``rest`` is ADMITTED, because that rationale's own
+#: premise, "for no gain", is measurably false. A pytest parameter legitimatey
+#: carries a PATH (``::test_x[tools/cache_evict.py]``), and the ``rest`` class
+#: already admits ``[``/``]``/``.``/``:``/``-`` — the parameter space — so omitting
+#: ``/`` drops main's rate row for EVERY such id. The consequence is not a
+#: formatting nicety, it is the exact failure mode :func:`is_failure_key`'s own
+#: docstring forbids: "a dropped main-side row makes the PR-side failure look
+#: unique, which BLOCKS". Measured on tortoise#11365: main's table carries all 10
+#: ``test_entry_point_python_guard.py`` rows (3/25, 3/25, 1/25, 2/25, 2/25) and
+#: ``parse_rates`` rejected all 10, so a PR that touches none of those files was
+#: BLOCKed as "introduced" while the 11 non-path-parameterized main-reds on the
+#: same run were correctly EXEMPT. The narrowness is retained everywhere the
+#: original rationale still holds: ``path`` stays anchored, the tail stays
+#: ``[A-Za-z0-9_[]-.:/]``-only (no spaces, no tab), and junk is still rejected.
 _NODEID_RE = re.compile(
     r"^(?P<path>[A-Za-z0-9_./\-]+\.py)"
-    r"::(?P<rest>[A-Za-z0-9_\[\]\-.:]+)$"
+    r"::(?P<rest>[A-Za-z0-9_\[\]\-.:/]+)$"
 )
 
 #: The tokens that open a failure record. One list, so the shell can never

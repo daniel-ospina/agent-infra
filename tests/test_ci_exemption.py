@@ -2974,6 +2974,115 @@ def test_6798_the_row_door_admits_the_non_nodeid_families():
         assert is_failure_key_loose(key), f"parse_failure_rows would DROP the PR row for {key}"
 
 
+# ── the row door must admit a PATH inside the parameter space (tortoise#11365) ──
+#
+# THE DEFECT. A pytest parameter legitimately carries a PATH —
+# `tests/test_entry_point_python_guard.py` is parametrized over `tools/<name>.py`,
+# so its ids read `::test_...[tools/cache_evict.py]`. `_NODEID_RE.rest` admitted
+# `[`/`]`/`.`/`:`/`-` — the parameter space — but NOT `/`. So `is_failure_key`
+# (which gates `parse_rates`, i.e. MAIN's table) rejected every such id, while the
+# PR side's `is_failure_key_loose` accepted it.
+#
+# WHY IT IS NOT COSMETIC. A rejected main-side row is DROPPED, so the id has no
+# main rate and is therefore not exempt — the PR's failure reads as PR-unique
+# forever. That is the exact asymmetry `is_failure_key`'s own docstring names:
+# "a dropped main-side row makes the PR-side failure look unique, which BLOCKS".
+#
+# MEASURED (tortoise#11365, head 28ea11a4d5ac). `main` was red on all ten
+# `test_entry_point_python_guard.py` ids. `parse_rates` accepted 0 of the 10 rate
+# rows and rejected 10; `VERDICT BLOCK blocked=6` named six of them against a PR
+# whose diff touches none of those files (they are byte-identical to origin/main,
+# and the same ten tests fail on origin/main itself), while the eleven
+# non-path-parameterized main-reds on the SAME run were correctly EXEMPT. The
+# required `python-ci-gate` then reds, which deadlocks the very PR that repairs
+# the trunk (#11262 / tortoise#11255 is the same class).
+
+_PATH_PARAM_IDS = (
+    "tests/test_entry_point_python_guard.py"
+    "::test_entry_point_guards_the_interpreter_before_its_imports[tools/cache_evict.py]",
+    "tests/test_entry_point_python_guard.py"
+    "::test_guard_refuses_an_old_interpreter_and_passes_the_floor[tools/test_design_map_check.py]",
+    # a subdirectory parameter, the same shape one level deeper
+    "tests/test_entry_point_python_guard.py"
+    "::test_entry_point_guards_the_interpreter_before_its_imports"
+    "[graph-scripts/2146_e2e_live_orphan_cleanup.py]",
+)
+
+
+def test_11365_the_row_door_admits_a_path_in_the_parameter_space():
+    """BOTH doors must admit a path-bearing parameter, or main's row is dropped."""
+    for key in _PATH_PARAM_IDS:
+        assert is_failure_key(key), (
+            f"`parse_rates` DROPS main's row for {key!r}: the id then has no main "
+            "rate and is never exempt, so an identical failure reads as PR-unique"
+        )
+        assert is_failure_key_loose(key), (
+            f"`parse_failure_rows` DROPS the PR's own row for {key!r}"
+        )
+
+
+def test_11365_a_main_red_with_a_path_parameter_is_EXEMPT_not_BLOCKED():
+    """The VERDICT, not the parse: a main-red must not read as PR-introduced.
+
+    ⛔ EVERY input goes through the real WIRE PARSER (`parse_rates` for main's
+    table, `parse_failure_rows` for the PR's). Constructing `main_rates` as a
+    dict instead would BYPASS the defect this test exists for — measured: the
+    dict-shaped version of this test stayed GREEN with the regex fix reverted,
+    because `parse_rates` (the door that drops the row) was never exercised.
+    """
+    key = _PATH_PARAM_IDS[0]
+    sig = (
+        "AssertionError: tools/cache_evict.py: the #5128 interpreter guard is not "
+        "the first statement after the docstring"
+    )
+    # main: 3/25 — measurably red, exactly as tortoise#11365's table carries it.
+    main_rates = parse_rates(f"{key}\t3\t25").rates
+    assert main_rates.get(key), (
+        "`parse_rates` DROPPED main's row — that is the whole defect; without a "
+        "main rate the id can never be exempt"
+    )
+    pr_rows = parse_failure_rows(f"{key}\t1\t1\t{sig}").failures
+    assert key in pr_rows, "the PR's own row must parse (that door is loose by design)"
+    main_signatures = {
+        k: frozenset({sig}) for k in parse_signature_rows(f"{key}\t{sig}")
+    }
+    assert key in main_signatures, "main's signature row must parse for the overlap test"
+
+    decision = decide(
+        pr_rows,
+        main_rates,
+        main_signatures=main_signatures,
+        k_pr=1,
+    )
+    assert not decision.blocked, (
+        "a failure main is measurably red for (3/25) was BLOCKED as introduced by "
+        f"the PR: {[v.line for v in decision.blocked]}"
+    )
+    assert any(key in line for line in decision.visible_exemptions()), (
+        "the main-red must be visibly EXEMPT, not merely absent from `blocked`"
+    )
+
+
+def test_11365_the_widened_tail_still_fails_closed_on_junk():
+    """NON-VACUITY: admitting `/` must not turn the rate door into a wildcard.
+
+    ⛔ "Unbalanced bracket" is deliberately NOT in this list: `[` was already in
+    `rest` before this change, so `test_x[a` was and remains admitted. Asserting
+    otherwise would pin a narrowing the door never had — the non-vacuity that
+    matters here is that the characters a rate TABLE cannot carry (whitespace,
+    the tab field separator, an empty tail, a missing `::`) stay rejected.
+    """
+    for junk in (
+        "tests/test_a.py::test_x[a b]",       # whitespace defeats the table's uniq|awk
+        "tests/test_a.py::test_x[a\tb]",      # a tab is a field separator, never an id
+        "tests/test_a.py::",                  # empty tail
+        "tests/test_a.py:test_x[a/b]",        # no `::` -> not a nodeid
+        "tests/test_a.py::test_x[a;b]",       # a shell metacharacter is not an id
+        "random-string",                      # not a nodeid at all
+    ):
+        assert not is_failure_key(junk), f"{junk!r} must NOT buy a rate row"
+
+
 
 
 def test_6798_the_row_door_admits_EVERY_produced_key_prefix():
