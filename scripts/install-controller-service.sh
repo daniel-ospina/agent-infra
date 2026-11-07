@@ -666,7 +666,11 @@ resolve_supervisor() {
                 err "  systemd converges it to 'failed' — and nothing pages. Every surface that asks reads a dead"
                 err "  unit, while the fleet still believes this box has a supervisor."
                 err "  Name a DURABLE supervisor instead, any one of:"
-                err "    ${AGENT_INFRA_PATH:-<checkout>}/scripts/cloud-cell-supervisor.sh  (a PRIMARY clone — not a worktree)"
+                # ⛔ THE REMEDY MUST NOT NAME A SHAPE THIS SAME GUARD REFUSES (review-7 P2, measured). Since
+                # `primary_clone_on_lane_branch` landed, "a PRIMARY clone" is not sufficient — a clone on a LANE
+                # branch is refused one branch over. An operator following the old wording landed back in the
+                # refusal it was printed by, with no way to tell which of the two rules refused them.
+                err "    ${AGENT_INFRA_PATH:-<checkout>}/scripts/cloud-cell-supervisor.sh  (a PRIMARY clone on its DEFAULT branch — not a worktree, and not a clone on a lane branch)"
                 err "    $CELL_HOME/harness/<pin-sha>/scripts/cloud-cell-supervisor.sh   (the harness pin)"
                 err "    $HOME/.pi/agent/scripts/cloud-cell-supervisor.sh        (the farm's PATH — see the warning below)"
                 err "  ⛔ THE FARM DOES NOT DELIVER THIS FILE (re-review P2, measured): 'cloud-cell-supervisor.sh' is in"
@@ -714,7 +718,7 @@ resolve_supervisor() {
 # until it restarts. Read it as "what this box will boot", which is what it measures.
 SUPERVISOR_PIN=""
 supervisor_pin() {
-    local dir repo="" sha="" gd named=""
+    local dir repo="" sha="" gd named="" dirty="" dirt_rc=0
     dir="$(dirname "$SUPERVISOR")"
     # ⛔ THE PIN NAMES A REPO THAT ACTUALLY CARRIES THIS FILE (re-review P2, measured). `git -C <dir> rev-parse`
     # answers the nearest ENCLOSING work tree, whether or not it has anything to do with the supervisor: a farmed
@@ -745,6 +749,25 @@ supervisor_pin() {
         fi
         if [ -n "$repo" ]; then
             sha="$("${GIT_SCRUB[@]}" git -C "$dir" rev-parse HEAD 2>/dev/null)" || sha=""
+            # ⛔ A DIRTY WORK TREE MAKES THE RECORDED SHA A CONFIDENT WRONG ANSWER (review-7 P2, MEASURED).
+            # `HEAD` describes the COMMIT; it does not describe the BYTES. With the tracked
+            # `scripts/cloud-cell-supervisor.sh` hand-edited in the work tree, the install rendered
+            # `…/repo@<sha>` while the file the unit executes was a different blob — the pin asserting "the
+            # unit boots <sha>" about bytes that are not `<sha>`. That is the same PLAUSIBLE WRONG answer this
+            # function already rejects for the dotfiles case, and the repo holds the opposite rule for exactly
+            # this question: `cloud-cell-supervisor.sh::stamp_write` reads the dirty bit LIVE and refuses to
+            # record a provenance stamp it cannot trust (`agentInfraDirty` exists because "its commit does not
+            # describe its bytes"). So the pin says so.
+            # ⛔ SCOPED TO THE SUPERVISOR FILE, not the whole tree. An unrelated dirty file (the ordinary state
+            # of a working checkout) does not change what this unit executes, and flagging it would make the
+            # pin cry wolf until operators learned to ignore it — the diagnostic would be dead.
+            # ⛔ AND A READ THAT FAILS IS CANNOT-VERIFY, NEVER "clean" (the `df`/`stamp_write` rule). A
+            # `core.bare` clone has NO work tree, so "dirty" is not a question about it at all: the bare arm is
+            # skipped, or §P3's `<repo>@<sha>` (the cells' own `/tmp/cell-ai` shape) would degrade to
+            # `unknown@unknown` on every cell.
+            if [ -n "$named" ]; then
+                dirty="$("${GIT_SCRUB[@]}" git -C "$dir" status --porcelain -- "$SUPERVISOR" 2>/dev/null)" || dirt_rc=1
+            fi
         fi
     fi
     case "$sha" in ''|*[!0-9a-f]*) sha="unknown" ;; esac
@@ -759,7 +782,18 @@ supervisor_pin() {
     # to `unknown@unknown` costs nothing and keeps the diagnostic honest.
     case "$repo" in *[[:space:]]*|*'"'*|*"'"*|*\\*|*%*|*'$'*) repo="" ;; esac
     [ -n "$repo" ] || repo="unknown"
-    SUPERVISOR_PIN="${repo}@${sha}"
+    # ⛔ A SHA THAT CANNOT BE CORROBORATED IS NOT A SHA (review-7 P2). If the dirty read failed we cannot say
+    # whether `<sha>` describes the bytes the unit boots, and recording it anyway is the confident-wrong-answer
+    # shape above — so the whole pin degrades rather than shipping an unqualified revision. `+dirty` marks the
+    # case we CAN see: HEAD resolves, but the executed file has local edits, so `<sha>` is the commit it was
+    # forked from and not the code that runs. Both spellings stay parseable by the `--status` reader.
+    if [ "$dirt_rc" -ne 0 ]; then
+        SUPERVISOR_PIN="unknown@unknown"
+    elif [ -n "$dirty" ]; then
+        SUPERVISOR_PIN="${repo}@${sha}+dirty"
+    else
+        SUPERVISOR_PIN="${repo}@${sha}"
+    fi
     return 0
 }
 

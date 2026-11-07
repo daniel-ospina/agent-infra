@@ -3218,6 +3218,81 @@ else
     *) bad "§P3: --status does not print the recorded pin — $PP_ST" ;;
   esac
 fi
+# ⛔ A DIRTY WORK TREE MAKES THE RECORDED SHA A CONFIDENT WRONG ANSWER (review-7 P2, MEASURED). `HEAD`
+# describes the COMMIT, never the BYTES: with the tracked supervisor hand-edited in the work tree, the pin
+# asserted `<repo>@<sha>` about a file whose blob is NOT `<sha>`. That is the same PLAUSIBLE WRONG answer this
+# installer rejects for the dotfiles case, and the rule `cloud-cell-supervisor.sh` already holds for its own
+# provenance stamp (`agentInfraDirty` exists because "its commit does not describe its bytes"). The pin is an
+# OBSERVATION, never a gate, so a dirty tree still INSTALLS — it just refuses to claim a revision it cannot
+# corroborate. The arm above is the control: a CLEAN tree must keep the bare `<repo>@<sha>` (it is asserted
+# with `grep -qxF`, so a stray `+dirty` there goes red).
+PPD="$(arm_root ppdirty)"; mk_systemctl "$PPD/bin" "$PPD/state" "$PPD/sc.log"; mk_tmux "$PPD/bin" "$PPD/tmux.log"
+PPD_REPO="$PPD/home/agent-infra"; mkdir -p "$PPD_REPO/scripts"
+cp "$SUP" "$PPD_REPO/scripts/cloud-cell-supervisor.sh"
+git init -q "$PPD_REPO" 2>/dev/null
+git -C "$PPD_REPO" add -A >/dev/null 2>&1
+git -C "$PPD_REPO" -c user.email=fixture@example.invalid -c user.name=fixture commit -qm fixture >/dev/null 2>&1
+PPD_SHA="$(git -C "$PPD_REPO" rev-parse HEAD 2>/dev/null)"
+PPD_TOP="$(git -C "$PPD_REPO" rev-parse --show-toplevel 2>/dev/null)"
+if [ -z "$PPD_SHA" ] || [ -z "$PPD_TOP" ]; then
+  bad '§P3: the dirty-work-tree fixture could not be created — the +dirty arm did NOT run, so it is not covered on this box'
+else
+  printf '\n# a hand edit made in place after the commit\n' >> "$PPD_REPO/scripts/cloud-cell-supervisor.sh"
+  PPD_RC=0; PPD_OUT="$(EXTRA_ENV="ORCH_SUPERVISOR=$PPD_REPO/scripts/cloud-cell-supervisor.sh" inst ppdirty --install 2>&1)" || PPD_RC=$?
+  [ "$PPD_RC" -eq 0 ] && ok '§P3: a supervisor in a DIRTY work tree still installs (the pin is an observation, not a gate)' \
+                      || bad "§P3: a dirty work tree refused the install — the pin must never withhold a supervisor: $PPD_OUT"
+  if grep -qxF "Environment=ORCH_SUPERVISOR_PIN=${PPD_TOP}@${PPD_SHA}+dirty" "$PPD/units/eldato-orchestrator.service" 2>/dev/null; then
+    ok '§P3: and it marks the revision +dirty, so <sha> is not read as the bytes the unit runs'
+  elif grep -qxF "Environment=ORCH_SUPERVISOR_PIN=${PPD_TOP}@${PPD_SHA}" "$PPD/units/eldato-orchestrator.service" 2>/dev/null; then
+    bad "§P3: the pin recorded ${PPD_TOP}@${PPD_SHA} for a HAND-EDITED supervisor — the recorded revision does not describe the bytes the unit boots"
+  else
+    bad "§P3: the dirty-work-tree pin is neither <repo>@<sha>+dirty nor <repo>@<sha> — $(grep -h 'ORCH_SUPERVISOR_PIN' "$PPD/units/eldato-orchestrator.service" 2>/dev/null)"
+  fi
+fi
+# ⛔ A `git status` THAT CANNOT RUN IS CANNOT-VERIFY, NEVER "clean" (review-7 P2). WITHOUT THIS ARM THE
+# DEGRADE BRANCH WAS UNEXERCISED: measured, DELETING it left the suite at 387/0 — so a regression would have
+# shipped the confident-wrong-answer the change above exists to prevent, and nothing would have noticed. That is
+# the same vacuity class this PR has now fixed six times, so it gets an arm.
+# The failure is injected the way a real one ARRIVES — git resolving the work tree and TRACKING the file, but
+# refusing the status read (a corrupt index, ENOSPC, EACCES, `safe.directory`) — so this is a PATH stub rather
+# than a mutated installer: the installer really runs, and really fails at the one call under test.
+PPG="$(arm_root ppgiterr)"; mk_systemctl "$PPG/bin" "$PPG/state" "$PPG/sc.log"; mk_tmux "$PPG/bin" "$PPG/tmux.log"
+PPG_REPO="$PPG/home/agent-infra"; mkdir -p "$PPG_REPO/scripts"
+cp "$SUP" "$PPG_REPO/scripts/cloud-cell-supervisor.sh"
+git init -q "$PPG_REPO" 2>/dev/null
+git -C "$PPG_REPO" add -A >/dev/null 2>&1
+git -C "$PPG_REPO" -c user.email=fixture@example.invalid -c user.name=fixture commit -qm fixture >/dev/null 2>&1
+PPG_SHA="$(git -C "$PPG_REPO" rev-parse HEAD 2>/dev/null)"
+PPG_TOP="$(git -C "$PPG_REPO" rev-parse --show-toplevel 2>/dev/null)"
+PPG_GIT="$(command -v git 2>/dev/null)"
+if [ -z "$PPG_SHA" ] || [ -z "$PPG_TOP" ] || [ -z "$PPG_GIT" ]; then
+  bad '§P3: the status-failure fixture could not be created — the cannot-verify arm did NOT run, so it is not covered on this box'
+else
+  # CONTROL FIRST: with a WORKING git the very same fixture must render a confident pin, so the next arm's
+  # `unknown@unknown` can only be the failed read and not some unrelated shape of this fixture.
+  PPG_OK_RC=0; PPG_OK_OUT="$(EXTRA_ENV="ORCH_SUPERVISOR=$PPG_REPO/scripts/cloud-cell-supervisor.sh" inst ppgiterr --install 2>&1)" || PPG_OK_RC=$?
+  if [ "$PPG_OK_RC" -eq 0 ] && grep -qxF "Environment=ORCH_SUPERVISOR_PIN=${PPG_TOP}@${PPG_SHA}" "$PPG/units/eldato-orchestrator.service" 2>/dev/null; then
+    ok '§P3: control — the status-failure fixture records a confident pin while git WORKS (so the arm below isolates the read)'
+    # …now the ONLY change: git resolves the tree and tracks the file, but refuses `status`.
+    {
+      printf '#!/usr/bin/env bash\n'
+      printf '# a git that answers every question EXCEPT the dirty read — the shape a corrupt index, ENOSPC, EACCES\n'
+      printf '# or safe.directory produces: resolution works, the status read does not.\n'
+      printf 'case "$*" in *"status --porcelain"*) exit 1 ;; esac\n'
+      printf 'exec %s "$@"\n' "$PPG_GIT"
+    } > "$PPG/bin/git"
+    chmod +x "$PPG/bin/git"
+    rm -f "$PPG/units/eldato-orchestrator.service"
+    PPG_ERR_RC=0; PPG_ERR_OUT="$(EXTRA_ENV="ORCH_SUPERVISOR=$PPG_REPO/scripts/cloud-cell-supervisor.sh" inst ppgiterr --install 2>&1)" || PPG_ERR_RC=$?
+    [ "$PPG_ERR_RC" -eq 0 ] && ok '§P3: a FAILED dirty read still installs (the pin is an observation, never a gate)' \
+                         || bad "§P3: a failed git status refused the install — a diagnostic must never withhold a supervisor: $PPG_ERR_OUT"
+    grep -qxF 'Environment=ORCH_SUPERVISOR_PIN=unknown@unknown' "$PPG/units/eldato-orchestrator.service" 2>/dev/null \
+      && ok '§P3: and an unreadable dirty state degrades to unknown@unknown rather than claiming a revision nobody verified' \
+      || bad "§P3: a FAILED git status rendered a confident pin — the recorded revision may not describe the bytes: $(grep -h 'ORCH_SUPERVISOR_PIN' "$PPG/units/eldato-orchestrator.service" 2>/dev/null)"
+  else
+    bad "§P3: the status-failure fixture did not render a confident pin while git worked, so the cannot-verify arm proves nothing — $PPG_OK_OUT"
+  fi
+fi
 # ⛔ AND A SUPERVISOR OUTSIDE ANY GIT WORK TREE IS STILL A VALID DEPLOYMENT (a farmed copy is exactly that).
 # The pin records `unknown@unknown`; it NEVER refuses — a diagnostic that withholds a supervisor is a false
 # block on the shape the farm produces.
@@ -3381,7 +3456,16 @@ git init -q "$PIN_REPO" 2>/dev/null
 git -C "$PIN_REPO" add -A >/dev/null 2>&1
 git -C "$PIN_REPO" -c user.email=fixture@example.invalid -c user.name=fixture commit -qm fixture >/dev/null 2>&1
 PIN_SHA="$(git -C "$PIN_REPO" rev-parse HEAD 2>/dev/null)"
-PIN_DIR="$PIN/home/harness/$PIN_SHA"
+# ⛔ THE PIN LIVES OUTSIDE THE FALLBACK ROOT, SO THE RECORD IS THE **ONLY** ADMITTING ROUTE (review-7 P2,
+# MEASURED). The previous fixture put the pin under `$CELL_HOME/harness`, which IS the fallback root
+# `pin_root_of_this_box` returns when no record exists — so this arm was admitted by the FALLBACK and its own
+# claim ("the RECORD BRANCH is what RUNS") was FALSE: replacing `pin_root_of_this_box` with the bare fallback
+# left the arm ARMED. A relocated pin is also a REAL shape (`HARNESS_PIN_FILE`/`HARNESS_PIN_DIR` are how a cell
+# moves its pin), so the fixture now exercises the record the way a cell that moved it does: with the record
+# honoured the pin root is `$PIN/home/pin-store`, and with the record IGNORED it is `$CELL_HOME/harness`, which
+# is NOT an ancestor of the pin tree — so the arm goes RED. That is the property the comment claimed and the
+# fixture could not see (the same vacuity class this PR has fixed five times).
+PIN_DIR="$PIN/home/pin-store/$PIN_SHA"
 PIN_SUP="$PIN_DIR/scripts"
 if [ -n "$PIN_SHA" ] && git -C "$PIN_REPO" worktree add --detach "$PIN_DIR" "$PIN_SHA" >/dev/null 2>&1; then
   # A REAL PIN CARRIES ITS HARNESS — the bring-up refuses a pin tree without
@@ -3389,11 +3473,12 @@ if [ -n "$PIN_SHA" ] && git -C "$PIN_REPO" worktree add --detach "$PIN_DIR" "$PI
   # not about a pin that no bring-up would ever accept).
   mkdir -p "$PIN_DIR/scripts/orchestrator-harness"
   : > "$PIN_DIR/scripts/orchestrator-harness/orch-loop.sh"
-  # ⛔ AND THE BOX\'S OWN PIN RECORD IS WRITTEN, SO THE RECORD BRANCH IS WHAT RUNS (review-5 P2). Without
-  # `.harness-path` this arm was admitted by the FALLBACK (`${HARNESS_PIN_DIR:-$CELL_HOME/harness}`), so a
-  # regression in the record parsing would leave it green while every cell\'s bring-up died. This is the record
-  # the bring-up writes (`printf "%s\n" "$dir/scripts/orchestrator-harness"`), and the trailing-slash spelling
-  # is included because that spelling used to be read as a pin ROOT and refused the box\'s real pin.
+  # ⛔ AND THE BOX\'S OWN PIN RECORD IS WRITTEN, AND IT NAMES THE **RELOCATED** ROOT, SO THE RECORD BRANCH IS THE
+  # ONLY ROUTE THAT RUNS (review-7 P2 — this claim was FALSE: measured, replacing `pin_root_of_this_box` with
+  # the bare `${HARNESS_PIN_DIR:-$CELL_HOME/harness}` fallback left this arm ARMED, because the pin sat under
+  # that very fallback). This is the record the bring-up writes
+  # (`printf "%s\n" "$dir/scripts/orchestrator-harness"`), and the trailing-slash spelling is included because
+  # that spelling used to be read as a pin ROOT and refused the box\'s real pin.
   printf '%s\n' "$PIN_DIR/scripts/orchestrator-harness/" > "$PIN/home/.harness-path"
   PIN_RC=0; PIN_OUT="$(EXTRA_ENV="ORCH_SUPERVISOR=$PIN_SUP/cloud-cell-supervisor.sh" inst pin --install 2>&1)" || PIN_RC=$?
   [ "$PIN_RC" -eq 0 ] && ok '§P4: the DETACHED pin worktree the bring-up really creates installs (a cell home under /tmp is a DECLARED root)' \
