@@ -233,11 +233,26 @@ is_transient_scratch() { # is_transient_scratch <path>
 # a legitimate thing to SCHEDULE (it is said out loud, not refused — `resolve_script`), while a
 # provisioner pinned there dies with the lane and leaves a pass that can never ADD capacity.
 # ⛔ THE SHAPE SET IS ADOPTED, NOT INVENTED: `scripts/install-repair-service.sh` already refuses to
-# render a unit whose ExecStart lives under exactly these four shapes (#2697, "a unit exec'd from it
-# dies when that lane's worktree is reaped"), and `templates/systemd/eldato-pr-repair.service:91`
-# records `/tmp/wt-<issue>-<slug>` as the measured one. Two definitions of "lane scratch" in one repo
-# would be a second answer to one question. `/tmp/cell-ai` and `/tmp/cell-home` stay durable — the
-# false block this whole family guards against.
+# render a unit whose ExecStart lives under the four PREFIX shapes (#2697, "a unit exec'd from it dies
+# when that lane's worktree is reaped"), and `templates/systemd/eldato-pr-repair.service:91` records
+# `/tmp/wt-<issue>-<slug>` as the measured one. Two definitions of "lane scratch" in one repo would be
+# a second answer to one question. `/tmp/cell-ai` and `/tmp/cell-home` stay durable — the false block
+# this whole family guards against.
+# ⛔ AND ONE MORE SHAPE THIS FILE USED TO MISS, MEASURED ON A CELL (agent-infra#3469 review P1). The
+# four prefix shapes above are the lane trees at a TEMPORARY ROOT; a CELL's lanes live one level deeper,
+# under the cell home: `scripts/orchestrator-harness/repo-slug.sh:486-487` calls
+# `git worktree add $HOME/wt-<slug>` "the fleet's OWN recipe" and measures 8 such trees under
+# `/tmp/cell-home/wt-*`. Those are lane scratch by this repo's own definition —
+# `scripts/pi-reap-worktrees.sh:676-682` keys `REAP_WT_SCRATCH_GLOB="wt-*|cell-wt-*"` on the BASENAME AT
+# ANY DEPTH` and says so again at `:1243-1252` — so `wt-<slug>`/`cell-wt-<slug>` as ANY path component is
+# the same fact, and the prefix-only set left the guard inert on exactly the platform #3469 is about:
+# `--install` from `/tmp/cell-home/wt-<slug>` (candidate 1) was PINNED instead of skipped, so the pin
+# died with the lane, every tick recorded `no provisioner`, and the "can never ADD capacity" warning was
+# suppressed because a pin DID resolve — the inert enforcer, with a green install.
+# ⛔ `*/wt-?*/*`, NOT `*/wt-*/*`: the `?` requires a character after the dash, so a name that merely
+# STARTS with `wt-` and nothing else (or a plausible directory like `wt-docs`) is not swept in by
+# accident, and the trailing `/*` keeps the WORKTREE ROOT itself out while matching everything a
+# provisioner path can actually be.
 is_lane_scratch() { # is_lane_scratch <path>
     local p="${1:-}"
     [ -n "$p" ] || return 1
@@ -248,6 +263,8 @@ is_lane_scratch() { # is_lane_scratch <path>
         /tmp/wt-?*|/var/tmp/wt-?*|/private/tmp/wt-?*|/private/var/tmp/wt-?*) return 0 ;;
         /tmp/cell-wt-?*|/var/tmp/cell-wt-?*|/private/tmp/cell-wt-?*|/private/var/tmp/cell-wt-?*) return 0 ;;
         /tmp/base-?*|/var/tmp/base-?*|/private/tmp/base-?*|/private/var/tmp/base-?*) return 0 ;;
+        # the CELL lane-worktree shape, at any depth (`pi-reap-worktrees.sh`'s own basename rule)
+        */wt-?*/*|*/cell-wt-?*/*) return 0 ;;
         /var/folders/*/*/T/wt-?*|/private/var/folders/*/*/T/wt-?*) return 0 ;;
         /var/folders/*/*/T/cell-wt-?*|/private/var/folders/*/*/T/cell-wt-?*) return 0 ;;
         /var/folders/*/*/T/base-?*|/private/var/folders/*/*/T/base-?*) return 0 ;;
@@ -775,6 +792,23 @@ mode_arg_for() {
 # line, so "no provisioner" cannot degrade into `Environment="RUNNER_AUTOSCALE_PROVISIONER="` — a
 # variable SET TO EMPTY, which is a different fact from an unset one.
 provisioner_env_for() { # provisioner_env_for systemd|launchd
+    # ⛔ `--disarm` MUST NOT WRITE A PIN IT REFUSES TO JUDGE (agent-infra#3469 review P2). `--disarm` is
+    # exempt from `refuse_adopted_provisioner` for the right reason — it forces a DISARMED render, where
+    # the pin is inert, and refusing would strand the arming record instead of disarming the box. But the
+    # render still EMITTED the pin, so `--disarm` exited 0, removed the record, and `--status` on the
+    # artifact it had just written exited 1 (`points into TRANSIENT SCRATCH SPACE`) — a false red on a
+    # legitimately disarmed box, and exactly the writer/reader split this file's T67 class closed.
+    # ⛔ THE REFUSABLE PIN IS THE ONE TO DROP, NOT EVERY PIN: dropping all of them on `--disarm` would
+    # lose a perfectly good adopted pin across an arm-after-disarm on a box whose shell cannot resolve
+    # one, which is a real regression on the ordinary path. So the pin is rendered unless the judgement
+    # site itself would refuse it.
+    # ⛔ AND THE TEST IS THE JUDGEMENT SITE, CALLED — NOT A SECOND COPY OF ITS RULES. A re-implemented
+    # predicate next door is how the writer and the refusal drifted apart in the first place; the
+    # subshell keeps its `err` output and its locals out of this render, and it reads the same globals
+    # (`PROVISIONER`, `TARGET`) that the real call reads.
+    if [ -n "$FORCE_MODE_FLAG" ] && [ "$REPORT_ONLY" != 1 ] && [ -n "$PROVISIONER" ]; then
+        if ! ( refuse_adopted_provisioner ) >/dev/null 2>&1; then printf '%s' ""; return 0; fi
+    fi
     [ -n "$PROVISIONER" ] || { printf '%s' ""; return 0; }
     case "$1" in
         systemd) printf '%s' "Environment=\"RUNNER_AUTOSCALE_PROVISIONER=$PROVISIONER\"" ;;
