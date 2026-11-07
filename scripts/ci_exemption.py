@@ -147,19 +147,33 @@ from pathlib import Path
 #: OVERRIDES: the ``_NODEID_LOOSE_RE`` rationale ("``_NODEID_RE`` stays narrow for
 #: the RATE/UNION parsers; widening it there would loosen their fail-closed check
 #: for no gain") — the ``/`` in ``rest`` is ADMITTED, because that rationale's own
-#: premise, "for no gain", is measurably false. A pytest parameter legitimatey
+#: premise, "for no gain", is measurably false. A pytest parameter legitimately
 #: carries a PATH (``::test_x[tools/cache_evict.py]``), and the ``rest`` class
-#: already admits ``[``/``]``/``.``/``:``/``-`` — the parameter space — so omitting
-#: ``/`` drops main's rate row for EVERY such id. The consequence is not a
+#: already admitted ``[``/``]``/``.``/``:``/``-`` — the parameter space — so omitting
+#: ``/`` dropped main's rate row for EVERY such id. The consequence is not a
 #: formatting nicety, it is the exact failure mode :func:`is_failure_key`'s own
 #: docstring forbids: "a dropped main-side row makes the PR-side failure look
 #: unique, which BLOCKS". Measured on tortoise#11365: main's table carries all 10
 #: ``test_entry_point_python_guard.py`` rows (3/25, 3/25, 1/25, 2/25, 2/25) and
 #: ``parse_rates`` rejected all 10, so a PR that touches none of those files was
 #: BLOCKed as "introduced" while the 11 non-path-parameterized main-reds on the
-#: same run were correctly EXEMPT. The narrowness is retained everywhere the
-#: original rationale still holds: ``path`` stays anchored, the tail stays
-#: ``[A-Za-z0-9_[]-.:/]``-only (no spaces, no tab), and junk is still rejected.
+#: same run were correctly EXEMPT.
+#:
+#: The narrowness that the overridden rationale still justifies is RETAINED: the
+#: ``path`` group stays anchored, and the tail admits only
+#: ``[A-Za-z0-9_\[\]\-.:/]`` — no whitespace, no tab, no empty tail, no missing ``::``.
+#:
+#: ⛔ KNOWN RESIDUAL, deliberately NOT closed here (measured, not assumed). A param
+#: carrying a SPACE, comma, quote, ``=``, ``+``, ``&`` or a non-ASCII character is
+#: still dropped, and the IDENTICAL BLOCK survives for it: the module's own
+#: ``test_the_id_door_and_the_signature_door_name_the_same_spaced_param_id`` pins
+#: ``[chromium-Claude Desktop]`` as a REAL id the loose door must name, yet
+#: ``_RATES_RE``'s nodeid group is ``\S+`` (and this ``rest`` excludes a space), so
+#: ``parse_rates`` drops that row too and the failure reads as PR-introduced. Closing
+#: it means widening BOTH ``_RATES_RE`` and ``rest`` — i.e. collapsing the strict
+#: door into the loose one — which is a decision about the allowlist's shape, not a
+#: silence to be papered over by the fix above. Filed as its own finding; do not
+#: read this class as "safe" because the path case now works.
 _NODEID_RE = re.compile(
     r"^(?P<path>[A-Za-z0-9_./\-]+\.py)"
     r"::(?P<rest>[A-Za-z0-9_\[\]\-.:/]+)$"
@@ -1037,6 +1051,11 @@ _SUMMARY_RE = re.compile(r"^(?:FAILED|ERROR)\s+(?P<nodeid>.+?)(?:\s+-\s+(?P<deta
 # RATE/UNION parsers; widening it there would loosen their fail-closed check for
 # no gain. Dropping a real id here would be fail-OPEN (an undecided id is an
 # unblocked id), which is why this path is deliberately the permissive one.
+#
+# ⛔ SEE ``_NODEID_RE`` ABOVE (its ``OVERRIDES:`` block). The "for no gain" above is
+# measurably false for a parameter that carries a PATH, so ``_NODEID_RE.rest`` now
+# admits ``/``. This paragraph is left verbatim as the record of the rationale that
+# was reopened, not as current policy about paths.
 _NODEID_LOOSE_RE = re.compile(r"^[A-Za-z0-9_./\-]+\.py::[^\t]+$")
 
 # A bare pytest PROGRESS fragment — `[  2%]`, `[100%]`, `[ 47%]`. It is the

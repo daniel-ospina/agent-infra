@@ -3068,9 +3068,20 @@ def test_11365_the_widened_tail_still_fails_closed_on_junk():
 
     ⛔ "Unbalanced bracket" is deliberately NOT in this list: `[` was already in
     `rest` before this change, so `test_x[a` was and remains admitted. Asserting
-    otherwise would pin a narrowing the door never had — the non-vacuity that
-    matters here is that the characters a rate TABLE cannot carry (whitespace,
-    the tab field separator, an empty tail, a missing `::`) stay rejected.
+    otherwise would pin a narrowing the door never had.
+
+    ⛔ SCOPE — what this list does and does not establish. It establishes that the
+    five shapes below are still REFUSED by the new class. It does NOT establish
+    that everything missing from the list is safe: a param carrying a SPACE,
+    comma, quote, `=`, `+`, `&` or a non-ASCII character is STILL dropped (by
+    `_RATES_RE`'s `\S+` nodeid group as well as by this class), and the identical
+    silent-drop → "absent from main's failure set" → permanent BLOCK survives for
+    it. The module's own
+    `test_the_id_door_and_the_signature_door_name_the_same_spaced_param_id` pins
+    `[chromium-Claude Desktop]` as a REAL id the loose door must name, so this is
+    a live residual, not a hypothetical. It is filed as its own finding; closing
+    it means widening BOTH `_RATES_RE` and `rest` — a decision about the
+    allowlist's shape, not a silence to paper over here.
     """
     for junk in (
         "tests/test_a.py::test_x[a b]",       # whitespace defeats the table's uniq|awk
