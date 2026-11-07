@@ -686,6 +686,54 @@ else
 fi
 ck "an ABSENT or NON-REGULAR queue is 'priority-unreadable' with NOTHING written — never a drained queue, never pool rows installed" $rc
 
+# ⛔ AND THE POOL'S SHAPE GUARD, THE ONE THE SAME PARAGRAPH PROMISES (review P3, cycle 62). `[ -f "$pool" ] &&
+# `[ -r "$pool" ] || return 1` is what makes README/ARCHITECTURE's "a `.pool` that is missing OR UNREADABLE
+# refuses the reorder" true. No case reached it with a NON-REGULAR pool: `drive nopool` passes with the guard
+# deleted, because *awk* itself fails on a missing file — it grades awk, not the guard. With the guard gone a
+# DIRECTORY at `.pool` is read by awk as "skipped, no rows", so the pass prints the `unranked` sentence —
+# "the pool ranked NONE of the 2 queued candidate(s) (no P0-blocker/… row matched)" — a MEASUREMENT it never
+# took, over a pool it never read. Both shapes are driven here, and both must refuse.
+GP="$TMP/poolguards"; rm -rf "$GP"; mkdir -p "$GP/dir-o/.pool" "$GP/mode000-o"
+printf '300\n9\n' > "$GP/dir-o/candidates.txt"
+printf '200\n300\n' > "$GP/mode000-o/.pool"; chmod 000 "$GP/mode000-o/.pool"
+printf '300\n9\n' > "$GP/mode000-o/candidates.txt"
+{
+  drive_prologue
+  cat "$FNS"
+  printf 'queue_order_from_pool "$1"\n_rc=$?\nprintf "STATE=%%s\\n" "$QUEUE_ORDER_STATE"\nexit $_rc\n'
+} > "$GP/drive.sh"
+( cd "$GP" && HOME="$GP" bash drive.sh "$GP/dir-o" ) > "$GP/dir.log" 2>&1
+pg_dir_rc=$?
+# the mode-000 shape is sampled WHILE it holds (a root host would read it): both arms are asserted below,
+# and the skip-if-readable case says so instead of passing silently
+( cd "$GP" && HOME="$GP" bash drive.sh "$GP/mode000-o" ) > "$GP/m000.log" 2>&1
+pg_m_rc=$?
+pg_dir_rows="$(tr '\n' ' ' < "$GP/dir-o/candidates.txt" 2>/dev/null | sed 's/ *$//')"
+pg_dir_awk=0; grep -q 'is a directory' "$GP/dir.log" 2>/dev/null && pg_dir_awk=1
+pg_dir_unranked=0; grep -q 'the pool ranked NONE' "$GP/dir.log" 2>/dev/null && pg_dir_unranked=1
+pg_m_unranked=0; grep -q 'the pool ranked NONE' "$GP/m000.log" 2>/dev/null && pg_m_unranked=1
+if [ "$pg_dir_rc" -ne 0 ] && [ "$pg_dir_rows" = "300 9" ] \
+   && grep -q 'STATE=priority-unreadable' "$GP/dir.log" 2>/dev/null \
+   && [ "$pg_dir_unranked" -eq 0 ] && [ "$pg_dir_awk" -eq 0 ] \
+   && { [ ! -r "$GP/mode000-o/.pool" ] && [ "$pg_m_rc" -ne 0 ] && grep -q 'STATE=priority-unreadable' "$GP/m000.log" 2>/dev/null && [ "$pg_m_unranked" -eq 0 ] || [ -r "$GP/mode000-o/.pool" ]; }; then rc=0
+else rc=1; echo "      pool-shape: dir rc=$pg_dir_rc rows='$pg_dir_rows' unranked-claim=$pg_dir_unranked awk-warning=$pg_dir_awk | mode000 rc=$pg_m_rc unranked-claim=$pg_m_unranked (want: both refuse as priority-unreadable, rows intact, NO 'the pool ranked NONE' claim, no awk directory warning)"; fi
+chmod 644 "$GP/mode000-o/.pool" 2>/dev/null || true
+ck "a NON-REGULAR or UNREADABLE .pool REFUSES the reorder (priority-unreadable) — never the 'pool ranked NONE' measurement it did not take" $rc
+# ⛔ NON-VACUITY: delete the pool-shape guard and the case above must redden.
+PGMUT="$TMP/poolguard-mut.sh"
+sed 's@^  \[ -f "\$pool" \] && \[ -r "\$pool" \] || return 1$@  :@' "$FNS" > "$PGMUT" 2>/dev/null
+if cmp -s "$FNS" "$PGMUT" 2>/dev/null; then
+  rc=1; echo "      the pool-guard deletion did not apply — the sed anchor drifted, so this non-vacuity half grades nothing"
+else
+  GPM="$TMP/poolguards-mut"; rm -rf "$GPM"; mkdir -p "$GPM/dir-o/.pool"
+  printf '300\n9\n' > "$GPM/dir-o/candidates.txt"
+  { drive_prologue; cat "$PGMUT"; printf 'queue_order_from_pool "$1"\n_rc=$?\nprintf "STATE=%%s\\n" "$QUEUE_ORDER_STATE"\nexit $_rc\n'; } > "$GPM/drive.sh"
+  ( cd "$GPM" && HOME="$GPM" bash drive.sh "$GPM/dir-o" ) > "$GPM/out" 2>&1
+  if grep -q 'the pool ranked NONE' "$GPM/out" 2>/dev/null; then rc=0
+  else rc=1; echo "      with the pool-shape guard DELETED the directory pool did not produce the 'pool ranked NONE' claim — the check above is not grading the guard: $(tr '\n' '|' < "$GPM/out" | head -c 240)"; fi
+fi
+ck "non-vacuity: deleting the .pool shape guard makes a directory pool print a 'pool ranked NONE' measurement the pass never took" $rc
+
 # ── 10) A REWRITE IS REPORTED AS A REWRITE ──────────────────────────────────
 # The ranked-none arm CAN write: `qseen` collapses a DUPLICATE row, so `300 9 300` comes out `300 9` and
 # the install runs. The message must then say it rewrote — "byte-identical" was a typed claim about a
