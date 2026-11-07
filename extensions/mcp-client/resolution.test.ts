@@ -358,15 +358,14 @@ await test("a repo entry of the SAME name wins; the base's other servers survive
 });
 
 await test("PER FIELD: a `url`-changing override KEEPS lazy/timeoutMs but NEVER carries the base's credentials", () => {
-  // The shape `tortoise`'s own `docs/quickstart-selfhosted.md` tells a self-host user to write (named
-  // with its repo, as `pi-bootstrap/lib/merge-mcp.py` and `pi-bootstrap/tests/test-cell-install.sh` do — the file is not in
-  // the product tree, so it ships with its repo and is cited by full path rather than by a bare name that
-  // resolves only on the box that wrote it (#3628 review round 4).
-  // THIS repo, so a bare path resolves to nothing here). `lazy` and `timeoutMs`
-  // must be inherited (a name-level spread dropped them → an EAGER connect at every session start on
-  // memory-constrained cells, the failure the base entry's own `_comment` records). The base's
-  // `headers` must NOT be: `.mcp.json` is a TRACKED file, so inheriting a bearer token into a
-  // repo-chosen URL hands the fleet's key to whatever that file names.
+  // The shape `tortoise`'s own `docs/quickstart-selfhosted.md` tells a self-host user to write, named
+  // with its repo as `pi-bootstrap/lib/merge-mcp.py` and `pi-bootstrap/tests/test-cell-install.sh` do
+  // (neither is in THIS repo, so both are cited by full path — a bare name resolves only on the box
+  // that wrote it). `lazy` and `timeoutMs` must be inherited: a name-level spread dropped them, which
+  // was an EAGER connect at every session start on memory-constrained cells, the failure the base
+  // entry's own `_comment` records. The base's `headers` must NOT be — `.mcp.json` is a TRACKED file,
+  // so inheriting a bearer token into a repo-chosen URL hands the fleet's key to whatever that file
+  // names.
   const merged = mergeMcpLayers(
     {
       mcpServers: {

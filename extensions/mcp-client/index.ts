@@ -1349,10 +1349,13 @@ export class McpServerManager {
    *   * an override that CHANGES `url` keeps `lazy`/`timeoutMs` but **DROPS `headers`/`oauth`**, which
    *     belong to the endpoint they were issued for; an override that changes the LAUNCH
    *     (`command`/`args`/`cwd`) **DROPS the base's `env`**. See `mergeMcpLayers` for both guards.
-   * The base must never be able to shadow what a repo declares: it is spread FIRST, so every field the
-   * repo sets wins — `~/.pi/agent/.mcp.json` is
-   * machine-local, and letting it override a repo would make one box's config change what a
-   * checked-out repo means.
+   * The base must never be able to shadow what a repo declares: every entry the merge APPLIES has the
+   * repo winning each field it sets and inheriting each field it omits, so `~/.pi/agent/.mcp.json` —
+   * machine-local — can never change what a checked-out repo means. ⛔ THE ONE EXCEPTION, stated here so
+   * this passage cannot be read as absolute: an AMBIGUOUS repo delta (an entry declaring BOTH `url` and
+   * `command`) is IGNORED before any merge and the base's entry is kept whole, so no repo field applies
+   * at all — see `mergeMcpLayers`, where that `continue` lives. (`mcpServers` comes from
+   * `mergeMcpLayers`; only the NON-`mcpServers` top-level keys are a base-first spread.)
    *
    * ⛔ A LAYER THAT FAILS TO READ IS SAID SO, BY NAME. A broken repo file must not take the hub's
    * servers away with it — so the surviving layer is still used — but the base is machine-local, so
