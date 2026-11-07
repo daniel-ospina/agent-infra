@@ -829,14 +829,22 @@ export function mergeMcpLayers(
     // destination, not as "no transport declared". (The layer read rejects such an entry anyway; this
     // is the belt for a caller that hands the merge raw JSON.)
     const projected = { ...carry, ...entry } as unknown as McpServerConfig;
-    if (typeDisagrees(projected)) {
+    if (typeDisagrees(projected) && hasField(entry, "type")) {
       // Only a warning, for the reason recorded on RECOGNISED_TYPES: `type` is inert here, so dropping
       // or ignoring the delta would destroy a working config over a field this client never reads.
+      // Attributed to the repo entry ONLY when the repo is the one that wrote a `type`: the projection
+      // can be incoherent because the BASE's label was, and `asMcpJson` has already reported that —
+      // blaming the repo sent the operator to edit a file that does not contain the field.
       console.log(
         `[mcp-client] note: repo entry "${name}" declares a "type" that disagrees with its transport — ` +
           `this client selects the transport from url/command, so the entry is kept as written.`
       );
     }
+    // TWO INDEPENDENT GUARDS, not `if/else if`. They defend different things — what LAUNCHES and what
+    // an endpoint RECEIVES — and a projected entry can change both at once (`{url: …, args: […]}`, or a
+    // base entry that declares both transports). Selecting one guard by presence let a repo suppress the
+    // HTTP credential guard with a field the client never dispatches on (`{url: "https://attacker/mcp",
+    // command: ""}`): the base's `Authorization` followed the repo to a NEW endpoint with nothing logged.
     if (hasField(projected, "command")) {
       if (!sameLaunch(inherited, projected)) {
         const dropped = STDIO_CREDENTIAL_FIELDS.filter(field => carry[field] !== undefined);
@@ -848,7 +856,8 @@ export function mergeMcpLayers(
           );
         }
       }
-    } else if (hasField(projected, "url") && !sameDestination(inherited.url, projected.url)) {
+    }
+    if (hasField(projected, "url") && !sameDestination(inherited.url, projected.url)) {
       const dropped = HTTP_CREDENTIAL_FIELDS.filter(field => carry[field] !== undefined);
       for (const field of dropped) delete carry[field];
       if (dropped.length > 0) {
@@ -928,21 +937,33 @@ function asMcpJson(value: unknown, label: string): McpJson | null {
     // would have done anyway, and the both-transports warning ("it will run over url") stops being a
     // lie. Only an entry left with NO transport at all — which has nothing to run — is dropped.
     const typed = entry as Record<string, unknown>;
+    // What `connectServer` does with the field decides what is safe here — it dispatches on
+    // `if (config.url)`, TRUTHINESS:
+    //   * a TRUTHY non-string (`["https://attacker/…"]`, `{}`) is STRINGIFIED into a real request, so
+    //     it is refused WITH its entry — a stringified destination must never reach the client;
+    //   * a FALSY value (`""`, `null`, `false`, `0`) is simply NOT SELECTED: dispatch falls through to
+    //     the other transport, so the entry may still work and refusing it would zero a working config
+    //     (this file's recurring failure). The FIELD is removed and the entry kept.
     const badTransport = (["url", "command"] as const).find(
-      field => typed[field] !== undefined && typeof typed[field] !== "string"
+      field =>
+        typed[field] !== undefined && typeof typed[field] !== "string" && !!typed[field]
     );
     if (badTransport) {
       console.log(
-        `[mcp-client] WARN: ${label} entry "${name}" has a non-string "${badTransport}" — dropped. ` + suffix
+        `[mcp-client] WARN: ${label} entry "${name}" has a non-string "${badTransport}" — dropped ` +
+          `(a truthy non-string is stringified into a real request, so it must not reach the client). ` +
+          suffix
       );
       continue;
     }
-    const emptyTransports = (["url", "command"] as const).filter(field => typed[field] === "");
-    if (emptyTransports.length > 0) {
-      for (const field of emptyTransports) {
+    const deadTransports = (["url", "command"] as const).filter(
+      field => typed[field] !== undefined && !typed[field]
+    );
+    if (deadTransports.length > 0) {
+      for (const field of deadTransports) {
         console.log(
           `[mcp-client] WARN: ${label} entry "${name}" has an empty "${field}" — that field is removed. ` +
-            `An empty value cannot select a transport (the client dispatches on whether the field is ` +
+            `A falsy value cannot select a transport (the client dispatches on whether the field is ` +
             `set to a value), so it is ignored rather than treated as a declared transport.`
         );
         delete typed[field];

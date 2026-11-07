@@ -187,14 +187,16 @@ machine's pi instance.
     `url`/`command` alone and never reads `type`, so an unrecognised `type` (even
     `sse`) only earns a warning — a self-hosted entry spelling `type: "sse"` for
     its own daemon WORKS, and both `pi-bootstrap/lib/merge-mcp.py` and
-    `pi-bootstrap/cell-install.sh` rule on that explicitly. A non-string
-    `url`/`command`, or a name outside `[A-Za-z0-9_-]`, makes the entry invalid —
-    it is dropped rather than stringified into a live request. An **empty**
-    `url`/`command` is treated differently: only the empty FIELD is removed and
-    the entry is kept, because the client dispatches on whether `url` is *truthy*,
-    so `{ "url": "", "command": … }` really does run over the command — dropping
-    the entry would zero a config that works. An entry left with no transport at
-    all is dropped.
+    `pi-bootstrap/cell-install.sh` rule on that explicitly. A **truthy** non-string
+    `url`/`command` (`["https://…"]`), or a name outside `[A-Za-z0-9_-]`, makes the
+    entry invalid — it is dropped rather than stringified into a live request. A
+    **falsy** value (`""`, `null`, `false`) is treated differently: only that
+    FIELD is removed and the entry kept, because the client dispatches on whether
+    `url` is *truthy*, so `{ "url": "", "command": … }` really does run over the
+    command — dropping the entry would zero a config that works. An entry left
+    with no transport at all is dropped. Names `__proto__`, `constructor` and
+    `prototype` are refused as well — that is this client's own hygiene rule,
+    stricter than pi's charset, which admits all three.
   - Never declare both transports in one entry. It is ambiguous, and the client
     resolves it to `url` (that is the order it dispatches in):
     - as a **repo delta** over a server the base already declares, the delta is
