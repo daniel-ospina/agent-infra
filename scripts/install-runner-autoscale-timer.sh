@@ -197,21 +197,15 @@ is_absolute_path() { case "$1" in /*) return 0 ;; *) return 1 ;; esac; }
 # gone before the first pass, so EVERY tick exited 127 while `list-timers` showed it healthy.
 # ⛔ NOT "anything under /tmp": a cell legitimately runs with HOME=/tmp/cell-home and checkouts under
 # /tmp/cell-ai, and refusing those would be a false block on the real target. What is transient by
-# CONSTRUCTION is the `tmp.` + random-suffix name, which is what leaked into the units — PLUS the
-# fleet's own lane-worktree layout (#3469 review).
-# ⛔ THE LANE-WORKTREE LAYOUT IS THE SECOND TRANSIENT SHAPE BY CONSTRUCTION, and rather than invent a
-# new definition of it this predicate adopts the one this repo ALREADY enforces: the sibling guard
-# `scripts/install-repair-service.sh` refuses to render a unit whose ExecStart lives under
-# `*/.worktrees/* | /tmp/wt-* | /tmp/cell-wt-* | /tmp/base-*` (#2697 — "a unit exec'd from it dies
-# when that lane's worktree is reaped"), and `templates/systemd/eldato-pr-repair.service:91` records
-# `/tmp/wt-<issue>-<slug>` as the measured shape. A provisioner pin has exactly the same fate. Two
-# different definitions of "lane scratch" in one repo would be a second answer to one question, so
-# this is the SAME set. Before this change the predicate matched only `mktemp`'s `tmp.????`, so a lane
-# worktree sailed through — and once `tools/install-ci-runner-x64.sh` exists (#3469) such a tree
-# RESOLVES, so `--install` from it pinned a path that is deleted with the lane. The old behaviour was a
-# LOUD failure ("resolves nothing … it can never ADD capacity"); that would have become a silent,
-# doomed pin. See `resolve_provisioner`, which SKIPS such a candidate instead of pinning it — skipped,
-# not refused, so this is a repair and not a new false block on a lane-worktree install.
+# CONSTRUCTION is the `tmp.` + random-suffix name, which is what leaked into the units.
+# ⛔ THIS PREDICATE IS UNCHANGED BY #3469, AND THAT IS DELIBERATE. Widening IT would have reversed a
+# RECORDED DECISION 130 lines above: "⛔ A WORKTREE PATH IS SAID OUT LOUD, NOT REFUSED (scheduling a
+# branch's copy is a legitimate test)" (see `resolve_script`). `refuse_unusable_target` applies this
+# predicate to SCRIPT, HOME and STATE_DIR, so a `*/.worktrees/*` arm here turned a WARNING into a
+# hard refusal for `RUNNER_AUTOSCALE_SCRIPT` — measured: origin/main warns and proceeds, the widened
+# predicate refused, and the remedy it prints ("Re-run from the box's real HOME") does not even apply
+# to a SCRIPT value. So the lane-checkout shapes live in `is_lane_scratch`, which is scoped to the
+# PROVISIONER ONLY — the one value whose whole job is to still exist at the first tick.
 is_transient_scratch() { # is_transient_scratch <path>
     # ⛔ NORMALISE FIRST. macOS sets TMPDIR with a TRAILING SLASH, so `mktemp -d` yields a DOUBLE slash,
     # and a naive prefix test misses the exact install this guard exists to refuse.
@@ -220,21 +214,8 @@ is_transient_scratch() { # is_transient_scratch <path>
     p="$(printf '%s' "$p" | tr -s '/')"
     case "$p" in
         /tmp/tmp.?*|/var/tmp/tmp.?*|/private/tmp/tmp.?*|/private/var/tmp/tmp.?*) return 0 ;;
-        # The repo's canonical LANE-SCRATCH set, adopted verbatim from
-        # scripts/install-repair-service.sh (#2697) rather than re-invented here. Anchored on
-        # `/tmp/` + `wt-`/`cell-wt-`/`base-` and on the `/.worktrees/` component, so a durable
-        # sibling (`/tmp/cell-ai`, `/tmp/cell-home`) is NOT matched — a cell legitimately runs with
-        # HOME=/tmp/cell-home and checkouts under /tmp/cell-ai, and refusing those would be a false
-        # block on the real target.
-        */.worktrees/*) return 0 ;;
-        /tmp/wt-?*|/var/tmp/wt-?*|/private/tmp/wt-?*|/private/var/tmp/wt-?*) return 0 ;;
-        /tmp/cell-wt-?*|/var/tmp/cell-wt-?*|/private/tmp/cell-wt-?*|/private/var/tmp/cell-wt-?*) return 0 ;;
-        /tmp/base-?*|/var/tmp/base-?*|/private/tmp/base-?*|/private/var/tmp/base-?*) return 0 ;;
         # macOS's OWN temp root is /var/folders/<a>/<b>/T/ — NOT /tmp — so it must be named.
         /var/folders/*/*/T/tmp.?*|/private/var/folders/*/*/T/tmp.?*) return 0 ;;
-        /var/folders/*/*/T/wt-?*|/private/var/folders/*/*/T/wt-?*) return 0 ;;
-        /var/folders/*/*/T/cell-wt-?*|/private/var/folders/*/*/T/cell-wt-?*) return 0 ;;
-        /var/folders/*/*/T/base-?*|/private/var/folders/*/*/T/base-?*) return 0 ;;
     esac
     for t in "${TMPDIR:-}"; do
         [ -n "$t" ] || continue
@@ -244,6 +225,33 @@ is_transient_scratch() { # is_transient_scratch <path>
         case "$t" in /var/*) t2="/private$t" ;; *) t2="$t" ;; esac
         case "$p" in "$t"/tmp.?*|"$t2"/tmp.?*|"/private$t"/tmp.?*) return 0 ;; esac
     done
+    return 1
+}
+
+# is_lane_scratch <path> — a LANE CHECKOUT: removed when that lane's worktree is reaped.
+# ⛔ SCOPED TO THE PROVISIONER, NEVER TO THE SCRIPT/HOME/STATE_DIR VALUES. A branch's converger copy is
+# a legitimate thing to SCHEDULE (it is said out loud, not refused — `resolve_script`), while a
+# provisioner pinned there dies with the lane and leaves a pass that can never ADD capacity.
+# ⛔ THE SHAPE SET IS ADOPTED, NOT INVENTED: `scripts/install-repair-service.sh` already refuses to
+# render a unit whose ExecStart lives under exactly these four shapes (#2697, "a unit exec'd from it
+# dies when that lane's worktree is reaped"), and `templates/systemd/eldato-pr-repair.service:91`
+# records `/tmp/wt-<issue>-<slug>` as the measured one. Two definitions of "lane scratch" in one repo
+# would be a second answer to one question. `/tmp/cell-ai` and `/tmp/cell-home` stay durable — the
+# false block this whole family guards against.
+is_lane_scratch() { # is_lane_scratch <path>
+    local p="${1:-}"
+    [ -n "$p" ] || return 1
+    is_transient_scratch "$p" && return 0
+    p="$(printf '%s' "$p" | tr -s '/')"
+    case "$p" in
+        */.worktrees/*) return 0 ;;
+        /tmp/wt-?*|/var/tmp/wt-?*|/private/tmp/wt-?*|/private/var/tmp/wt-?*) return 0 ;;
+        /tmp/cell-wt-?*|/var/tmp/cell-wt-?*|/private/tmp/cell-wt-?*|/private/var/tmp/cell-wt-?*) return 0 ;;
+        /tmp/base-?*|/var/tmp/base-?*|/private/tmp/base-?*|/private/var/tmp/base-?*) return 0 ;;
+        /var/folders/*/*/T/wt-?*|/private/var/folders/*/*/T/wt-?*) return 0 ;;
+        /var/folders/*/*/T/cell-wt-?*|/private/var/folders/*/*/T/cell-wt-?*) return 0 ;;
+        /var/folders/*/*/T/base-?*|/private/var/folders/*/*/T/base-?*) return 0 ;;
+    esac
     return 1
 }
 
@@ -450,6 +458,7 @@ resolve_provisioner() {
         return 0
     fi
     for cand in "$INFRA_ROOT/tools/install-ci-runner-x64.sh" \
+                "$(resolve_infra_main)/tools/install-ci-runner-x64.sh" \
                 "${AGENT_INFRA_PATH:-}/tools/install-ci-runner-x64.sh" \
                 "$PWD/tools/install-ci-runner-x64.sh" \
                 "${HOME:-}/.pi/agent/scripts/install-ci-runner-x64.sh"; do
@@ -464,8 +473,8 @@ resolve_provisioner() {
         # installed artifact already carries (`adopt_installed_provisioner`), and finally to the honest
         # "can never ADD capacity" warning (`warn_provisioner_reach`) — i.e. the pre-#3469 behaviour,
         # which is the correct one.
-        if is_transient_scratch "$cand"; then
-            err "note: skipping TRANSIENT PROVISIONER CANDIDATE $cand (a lane-scratch tree the reaper removes, so a pin to it could never ADD capacity) — looking for a durable one"
+        if is_lane_scratch "$cand"; then
+            err "note: skipping LANE-SCRATCH PROVISIONER CANDIDATE $cand (a lane checkout the reaper removes, so a pin to it could never ADD capacity) — looking for a durable one"
             continue
         fi
         PROVISIONER="$cand"; PROVISIONER_WHY="resolved"; return 0
@@ -853,7 +862,10 @@ refuse_unusable_target() { # refuse_unusable_target <target-or-"scheduled">
         is_transient_scratch "$SCRIPT"    && bad="SCRIPT=$SCRIPT"
         is_transient_scratch "$HOME"      && bad="${bad:+$bad; }HOME=$HOME"
         is_transient_scratch "$STATE_DIR" && bad="${bad:+$bad; }STATE_DIR=$STATE_DIR"
-        [ -n "$PROVISIONER" ] && is_transient_scratch "$PROVISIONER" && \
+        # ⛔ THE PROVISIONER USES THE WIDER PREDICATE, THE OTHER THREE DO NOT. Deliberate scoping:
+        # a scheduled SCRIPT inside a worktree is SAID OUT LOUD, NOT REFUSED (`resolve_script`), while a
+        # provisioner pinned there dies with the lane and leaves a pass that can never ADD capacity.
+        [ -n "$PROVISIONER" ] && is_lane_scratch "$PROVISIONER" && \
             bad="${bad:+$bad; }PROVISIONER=$PROVISIONER"
     fi
     if [ -n "$bad" ]; then
@@ -1395,7 +1407,7 @@ refuse_adopted_provisioner() {
             *%*) err "REFUSING: the provisioner pin this install would render contains '%', which systemd expands as a specifier at load time (%h, %i, %n) — the rendered path would differ from the real one"; return 1 ;;
         esac
     fi
-    if is_transient_scratch "$PROVISIONER"; then
+    if is_lane_scratch "$PROVISIONER"; then
         err "REFUSING: the provisioner pin this install would render is inside TRANSIENT SCRATCH SPACE: PROVISIONER=$PROVISIONER"
         err "That tree is removed before the first tick, so every pass reports 'no provisioner' and the box can"
         err "never ADD capacity — the same inert-enforcer shape the writers refuse to CREATE. Re-install from a"
@@ -1955,10 +1967,13 @@ refuse_transient_installed_artifact() { # rc belongs to the CALLER: return 1 and
     local art="$1" bad="" v
     for v in "SCRIPT=${installed_script:-}" \
              "HOME=$(artifact_env_value "$art" HOME)" \
-             "STATE_DIR=$(artifact_env_value "$art" RUNNER_AUTOSCALE_STATE_DIR)" \
-             "PROVISIONER=$(artifact_env_value "$art" RUNNER_AUTOSCALE_PROVISIONER)"; do
+             "STATE_DIR=$(artifact_env_value "$art" RUNNER_AUTOSCALE_STATE_DIR)"; do
         is_transient_scratch "${v#*=}" && bad="${bad:+$bad; }$v"
     done
+    # The provisioner is judged by the WIDER predicate — the same one the writers use for it — so the
+    # reader and the writer still agree about the one value whose job is to survive the first tick.
+    v="PROVISIONER=$(artifact_env_value "$art" RUNNER_AUTOSCALE_PROVISIONER)"
+    is_lane_scratch "${v#*=}" && bad="${bad:+$bad; }$v"
     [ -n "$bad" ] || return 0
     err "the installed artifact points into TRANSIENT SCRATCH SPACE: $bad"
     err "That tree is removed before the first tick, so every pass exits 127 while the scheduler lists the"
