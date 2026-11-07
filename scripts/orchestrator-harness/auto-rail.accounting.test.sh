@@ -1227,9 +1227,20 @@ printf '%s\n%s\n' "$_now" "$_now" > "$_led"
 printf '%s\n' "$(( _now - REVIEW_ATTEMPT_WINDOW_S - 1 ))" >> "$_led"
 [ "$(review_attempts "$_led")" = 2 ] \
   || bad "a dispatch OLDER than REVIEW_ATTEMPT_WINDOW_S must stop counting (got '$(review_attempts "$_led")', want 2) — a lifetime count turns one transient failure into a permanent EXHAUSTED head, which is the #3489 symptom rebuilt as the fix"
+# ⛔ A CORRUPT LINE FAILS CLOSED (review round 8, P3, measured — this arm used to pin the LENIENT
+# reading). The ledger is append-only, one epoch per paid dispatch, written by this file; a line that is not
+# an epoch means the counter cannot be trusted in EITHER direction, and the untrustworthy direction that
+# costs money is "the corrupt line was a dispatch" — reading past it would forgive up to
+# REVIEW_MAX_ATTEMPTS paid reviews at one head. The previous form of this arm required the count to ignore
+# it, which also made the file's own `REVIEW-LEDGER-UNPARSEABLE` arm unreachable (its awk always printed
+# digits, so the non-numeric case could never fire). Same answer as an unreadable ledger: the CAP.
 printf '%s\n' 'not-a-timestamp' >> "$_led"
-[ "$(review_attempts "$_led")" = 2 ] \
-  || bad "a corrupt ledger line must not be counted as an attempt (got '$(review_attempts "$_led")')"
+[ "$(review_attempts "$_led")" = "$REVIEW_MAX_ATTEMPTS" ] \
+  || bad "a corrupt ledger line must FAIL CLOSED (got '$(review_attempts "$_led")', want the cap $REVIEW_MAX_ATTEMPTS) — reading past a line that should have been a dispatch count forgives paid reviews at one head, and it makes REVIEW-LEDGER-UNPARSEABLE unreachable"
+grep -qF 'REVIEW-LEDGER-UNPARSEABLE' "$LOG" \
+  || bad "a corrupt ledger must SAY SO in the log (no REVIEW-LEDGER-UNPARSEABLE line) — a silent cap is indistinguishable from the defect it replaces"
+review_ledger_unreadable "$_led" \
+  || bad "review_ledger_unreadable must answer the SAME question as the counter for a corrupt ledger — otherwise the CAP wording (which exists so no comment asserts an unmeasured count) is skipped for exactly the record whose count was never measured"
 printf '%s\n' "$(( _now - REVIEW_ATTEMPT_WINDOW_S - 1 ))" > "$_led"
 [ "$(review_attempts "$_led")" = 0 ] \
   || bad "a ledger whose entries are ALL outside the window must read 0 attempts (got '$(review_attempts "$_led")') — otherwise a head is EXHAUSTED by history alone"
@@ -1878,6 +1889,7 @@ publish_review_state acme/widget 42 review-in-flight "$_HF"
 # "dispatched 0m ago, within its 900s window" on every pass and waited FOR EVER: never retried, never
 # exhausted, never published again. The record's mtime is the conservative fallback and is named as such.
 eval "$(sed -n '/^review_age() {/,/^}$/p' "$SUT")"
+eval "$(sed -n '/^review_dispatch_age() {/,/^}$/p' "$SUT")"
 command -v review_age >/dev/null || { echo "FATAL: review_age not found in $SUT"; exit 2; }
 _AG="$_rdir/age.out"
 _now0=$(date +%s)
@@ -1906,12 +1918,63 @@ rm -f "$_AG"
 review_age "$_rdir/absent.out" >/dev/null; [ $? = 2 ] \
   || bad "a MISSING record has nothing measurable and must say so (want rc 2) — 0 would read as a fresh dispatch"
 # …and the loop must actually USE the fallback and NAME it (a function nobody calls is an inert fix)
-grep -qF '_rdat=$(review_age "$_rout"); _rage_rc=$?' "$SUT" \
-  || bad "the loop must age the record through review_age and keep its rc — without the fallback a record with no epoch keeps the 0-age WAIT the P3 named, and without the rc the log cannot name the basis of the age"
+grep -qF '_rage=$(review_dispatch_age "$_rout"); _rage_rc=$?' "$SUT" \
+  || bad "the loop must age the record through review_dispatch_age and keep its rc — without the fallback a record with no epoch keeps the 0-age WAIT the P3 named, and without the rc the log cannot name the basis of the age"
 grep -qF 'measured from the record file' "$SUT" \
   || bad "the WAIT log line must NAME the age's basis when it comes from the record's mtime ('measured from the record file') — otherwise the operator's primary instrument reports a measurement that does not exist, which is the defect class itself"
 grep -qF 'its mtime could not be read, so the age is UNKNOWN' "$SUT" \
   || bad "the WAIT log line must also name the UNMEASURABLE case — a basis that degrades to silence is the same false claim one step later"
+
+# ⛔ THE AGE'S CONSUMPTION MUST BE DRIVEN, NOT PINNED BY TEXT (review round 8, P3, measured): the previous
+# pins checked the CALL and the log's WORDING, so a one-line insertion after the call (`_rdat=$(date +%s)`)
+# restored the permanent-WAIT defect with the whole suite green. `review_dispatch_age` owns the arithmetic,
+# so the suite drives the number the loop acts on.
+command -v review_dispatch_age >/dev/null || { echo "FATAL: review_dispatch_age not found in $SUT"; exit 2; }
+_AD="$_rdir/dispatch-age.out"
+_now1=$(date +%s)
+printf 'REVIEW-DISPATCHED at=%s head=x\n' "$(( _now1 - 5000 ))" > "$_AD"
+_d=$(review_dispatch_age "$_AD"); _drc=$?
+[ "$_drc" = 0 ] && [ "$_d" -ge 4999 ] && [ "$_d" -le 5100 ] \
+  || bad "review_dispatch_age must return the epoch-based age with rc 0 (got rc=$_drc, age='$_d')"
+printf 'REVIEW-EXIT rc=9\n' > "$_AD"
+touch -t 200001010000 "$_AD" 2>/dev/null || true
+_d2=$(review_dispatch_age "$_AD"); _drc2=$?
+[ "$_drc2" = 1 ] || bad "an epoch-less record must be aged from its mtime with rc 1 (got rc=$_drc2, age='$_d2') — rc is what makes the WAIT log name the basis"
+[ "$_d2" -gt 900 ] || bad "an epoch-less, old record must yield an age past the transient window (got ${_d2}s) — a 0 here is the permanent WAIT the P3 named"
+review_action retry "$_d2" 1; _dract=$?
+[ "$_dract" = 1 ] \
+  || bad "with that age the loop must RETRY (review_action returned $_dract, want 1) — otherwise the head is never retried, never exhausted and never re-published"
+# ⛔ AND NOTHING MAY SIT BETWEEN THE CALL AND ITS CONSUMER: an inserted line is how the fallback was discarded
+# while every text pin stayed green.
+_dnext=$(grep -A1 -F '_rage=$(review_dispatch_age "$_rout"); _rage_rc=$?' "$SUT" | sed -n '2p')
+case "$_dnext" in
+  *'review_action "$_rstate" "$_rage" "$_rattn"; _ract=$?'*) ;;
+  *) bad "the age must reach review_action on the VERY NEXT line (found: '$_dnext') — any line in between can overwrite the fallback with a fresh epoch, which restores the permanent-WAIT defect while the call itself still matches its pin" ;;
+esac
+rm -f "$_AD"
+
+# ⛔ THE TWO 'review-found-issues' FACTS MUST NOT SHARE ONE TEXT (review round 8, P3): rc=7 means no record was
+# written; a not-clean record means one WAS. The comment used to say "No attestation was recorded" for both,
+# contradicting the log line written for the same transition in the same pass.
+_b2=$(wc -l < "$POSTED")
+publish_review_state acme/widget 42 review-found-issues 1212121212121212121212121212121212121212 record
+_rej=$(sed -n "$(( _b2 + 1 )),\$p" "$POSTED")
+case "$_rej" in
+  *'RECORD EXISTS'*) ;;
+  *) bad "a not-clean-record publish must say the record EXISTS (got: $(printf '%s' "$_rej" | head -1)) — the operator's only visible surface otherwise denies a record the loop has read" ;;
+esac
+case "$_rej" in
+  *'No attestation was recorded'*) bad "a not-clean-record publish must NOT claim 'No attestation was recorded' — that is the rc=7 fact, and stating it here contradicts the log line for the same transition" ;;
+esac
+_b3=$(wc -l < "$POSTED")
+publish_review_state acme/widget 42 review-found-issues 3434343434343434343434343434343434343434
+_iss=$(sed -n "$(( _b3 + 1 )),\$p" "$POSTED")
+case "$_iss" in
+  *'No attestation was recorded'*) ;;
+  *) bad "the rc=7 publish must keep saying no attestation was recorded (got: $(printf '%s' "$_iss" | head -1))" ;;
+esac
+grep -qF 'publish_review_state "$repo" "$pr" review-found-issues "$head" record' "$SUT" \
+  || bad 'the not-clean-record arm must PASS its basis (review-found-issues "$head" record) — without it the comment falls back to the rc=7 text'
 
 PATH=$_oldpath
 rm -rf "$_ghdir" "$_rdir"

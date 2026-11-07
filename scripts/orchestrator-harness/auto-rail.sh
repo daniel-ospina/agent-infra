@@ -717,6 +717,23 @@ review_age() {  # $1 = the review's output file
   esac
   printf '%s\n' "$mt"; return 1
 }
+
+# ⛔ AND THE SECONDS THE LOOP ACTS ON COME FROM HERE, NOT FROM AN INLINE EXPRESSION (review round 8, P3,
+# measured): the fallback was pinned only by the TEXT of the call and by the log's wording, so a one-line
+# insertion after that call (`_rdat=$(date +%s)`) restored the permanent-WAIT defect with the suite green.
+# The arithmetic lives in a function the suite can drive, and the loop's one call is pinned for adjacency.
+# prints the age in seconds; rc = review_age's rc (0 epoch, 1 mtime, 2 unmeasurable, age then 0).
+review_dispatch_age() {  # $1 = the review's output file
+  local f=$1 v rc now
+  v=$(review_age "$f"); rc=$?
+  if [ "${rc:-2}" = 2 ]; then printf '0\n'; return 2; fi
+  case "${v:-}" in
+    ''|*[!0-9]*) printf '0\n'; return 2;;
+  esac
+  now=$(date +%s)
+  v=$(( now - v )); [ "$v" -ge 0 ] || v=0
+  printf '%s\n' "$v"; return "${rc:-0}"
+}
 review_dispatched_at() {  # $1 = the review's output file; prints the epoch, or nothing
   head -1 "$1" 2>/dev/null | sed -n 's/^REVIEW-DISPATCHED at=\([0-9][0-9]*\).*/\1/p'
 }
@@ -740,7 +757,17 @@ review_attempts() {  # $1 = the head-keyed attempt ledger; prints the in-window 
   # no diagnostic (the log prints the same 0). Every neighbouring counter in this file already fails
   # CLOSED on an unreadable source (`rails_for_repo` → COUNTER-FAILED, `rail_already_running` → rc 2,
   # `publish_review_state` → MARKER-UNREADABLE); this is the one that must too.
-  if ! n=$(awk -v cut="$cut" '$1 ~ /^[0-9]+$/ && $1 > cut {c++} END {printf "%d", c+0}' "$f" 2>/dev/null); then
+  # ⛔ THE UNPARSEABLE ARM USED TO BE UNREACHABLE (review round 8, P3, measured): the awk ended in
+  # `END {printf "%d", c+0}`, which ALWAYS prints digits and ALWAYS exits 0 — so `n` was numeric by
+  # construction, the `*[!0-9]*` case below could never fire, and a ledger full of garbage (`REVIEW-ATTEMPT
+  # corrupt`, `not-a-number`) was reported as **0 dispatches spent**: up to REVIEW_MAX_ATTEMPTS paid
+  # reviews forgiven by a corrupted counter, with no diagnostic. The scan now ALSO reports whether every
+  # non-empty line parsed, which is the fact the arm was written to test.
+  if ! n=$(awk -v cut="$cut" '
+      $0 ~ /^[[:space:]]*$/ { next }
+      $1 !~ /^[0-9]+$/ { bad = 1; next }
+      $1 > cut { c++ }
+      END { printf "%d %d\n", c + 0, bad + 0 }' "$f" 2>/dev/null); then
     log_line "$f REVIEW-LEDGER-UNREADABLE: the per-head attempt ledger exists but could not be read — treating this head as EXHAUSTED (fail-closed: an unreadable counter is not a free slot, and the append would otherwise grow a ledger nothing can count)"
     # ⛔ THE VALUE RETURNED HERE IS THE CAP, NOT A COUNT — so whoever PUBLISHES it must not present it as a
     # measurement. That cannot be signalled from here: the loop calls this function in `$( … )`, which is a
@@ -750,21 +777,39 @@ review_attempts() {  # $1 = the head-keyed attempt ledger; prints the in-window 
     printf '%s\n' "${REVIEW_MAX_ATTEMPTS:-3}"
     return 0
   fi
-  # An empty file counts as 0 (nothing spent yet); only a non-numeric answer is a failure, and it is the
-  # same failure as "could not read": fail closed.
+  # An empty file counts as 0 (nothing spent yet); a line that does not parse is the same failure as "could
+  # not read", and it fails CLOSED. The count and the parse verdict arrive together, so neither can be
+  # inferred from the other.
   case "${n:-}" in
     '') printf '0\n'; return 0;;
-    *[!0-9]*) log_line "$f REVIEW-LEDGER-UNPARSEABLE ('$n'): treating this head as EXHAUSTED (fail-closed)"; printf '%s\n' "${REVIEW_MAX_ATTEMPTS:-3}"; return 0;;
   esac
-  printf '%s\n' "$n"
+  case "$n" in
+    *[!0-9\ ]*)
+      log_line "$f REVIEW-LEDGER-UNPARSEABLE ('$n'): treating this head as EXHAUSTED (fail-closed)"
+      printf '%s\n' "${REVIEW_MAX_ATTEMPTS:-3}"; return 0;;
+  esac
+  case "${n#* }" in
+    1)
+      log_line "$f REVIEW-LEDGER-UNPARSEABLE (a line is not an epoch; count would be ${n%% *}): treating this head as EXHAUSTED (fail-closed — a corrupted counter must never forgive a paid dispatch)"
+      printf '%s\n' "${REVIEW_MAX_ATTEMPTS:-3}"; return 0;;
+  esac
+  printf '%s\n' "${n%% *}"
 }
 # Can this ledger be READ? Asked DIRECTLY by the caller, never through `$( )` — see the note inside
 # `review_attempts`: a subshell cannot hand a variable back, so a flag set there is silently inert and the
 # published comment keeps asserting the CAP as a measured count. rc 0 = exists and cannot be read.
-review_ledger_unreadable() {  # $1 = attempt ledger
-  local f=$1
+review_ledger_unreadable() {  # $1 = attempt ledger; rc 0 = exists but its content cannot be counted
+  local f=$1 bad
   [ -f "$f" ] || return 1
-  awk '$1 ~ /^[0-9]+$/ {c++} END {printf "%d", c+0}' "$f" >/dev/null 2>&1 || return 0
+  # ⛔ SAME QUESTION AS `review_attempts` (review round 8, P3): this used to test only that awk could RUN,
+  # so a readable ledger of garbage answered "readable" here while the count it produces is meaningless —
+  # and the CAP wording (which exists so the published comment never asserts an unmeasured count) would then
+  # be skipped for exactly the record whose count was never measured. One classifier, two consumers.
+  bad=$(awk '
+      $0 ~ /^[[:space:]]*$/ { next }
+      $1 !~ /^[0-9]+$/ { bad = 1 }
+      END { printf "%d\n", bad + 0 }' "$f" 2>/dev/null) || return 0
+  [ "${bad:-1}" = 0 ] || return 0
   return 1
 }
 # ── FORGIVING A REFUSAL, PRECISELY ───────────────────────────────────────────────────────────────
@@ -943,7 +988,16 @@ publish_review_state() {  # $1 repo, $2 pr, $3 state, $4 head (optional); rc 0 =
     review-in-flight)
       text="🔎 **auto-rail: review in flight** at \`${head:0:12}\`. No head-bound attestation existed, so a fresh-context reviewer was dispatched (\`review-pr.sh\`, KIND=reviewer) at $(date -u +%FT%TZ), and its launch was VERIFIED to have started before this comment was posted. auto-rail records nothing itself — any verdict and its attestation come from that reviewer. **It is not waiting on a lane.**";;
     review-found-issues)
-      text="⛔ **auto-rail: the review found blocking issues** at \`${head:0:12}\`. No attestation was recorded, and auto-rail will NOT re-review this head — the findings are in the reviewer's own comment. This head needs a fix; a new head gets a new review.";;
+      # ⛔ TWO DIFFERENT FACTS, TWO DIFFERENT TEXTS (review round 8, P3): this state is published for rc=7
+      # (the reviewer found issues and wrote no record) AND for a head that HAS a record whose verdict the
+      # gate will not accept (not-clean). Saying "no attestation was recorded" on the second one contradicts
+      # the log line written for the same transition in the same pass, and hides the record the operator
+      # needs to read. The caller passes `record` for that case.
+      if [ "$basis" = record ]; then
+        text="⛔ **auto-rail: the review found blocking issues** at \`${head:0:12}\`. A head-bound review RECORD EXISTS and its verdict is not one the merge gate accepts (\`not-clean\`), so auto-rail will NOT re-review this head and the rail cannot land it — the findings are in the reviewer's own comment and in that record. This head needs a fix; a new head gets a new review."
+      else
+        text="⛔ **auto-rail: the review found blocking issues** at \`${head:0:12}\`. No attestation was recorded, and auto-rail will NOT re-review this head — the findings are in the reviewer's own comment. This head needs a fix; a new head gets a new review."
+      fi;;
     review-retries-exhausted)
       text="⛔ **auto-rail: the reviewer is not producing a verdict** at \`${head:0:12}\` — ${_ratt_basis}. No attestation exists, and auto-rail is not dispatching another review at this revision. ${_ratt_tail}";;
     review-record-unbound)
@@ -1369,7 +1423,7 @@ PY
           # makes a PR that is blocked ON ITS OWN REVIEW readable instead of looking like a PR nobody has
           # looked at — and it is idempotent by (state, head), so it costs one comment per head.
           if [ "$_att" = rejected ]; then
-            publish_review_state "$repo" "$pr" review-found-issues "$head"
+            publish_review_state "$repo" "$pr" review-found-issues "$head" record
             log_line "$repo #$pr REVIEW-REJECTED at $head — a head-bound record EXISTS and its verdict is not one the gate accepts (not-clean), so the rail cannot land this revision and no second review is bought; the fix is a NEW head, which is a new key"
             continue
           fi
@@ -1399,11 +1453,11 @@ PY
         _ratt="$RAIL_DIR/review-$(printf '%s' "$repo" | tr '/' '-')-$pr-$head.attempts"
         _rstate=$(review_state "$_rout")
         _rattn=$(review_attempts "$_ratt")
-        _rdat=$(review_age "$_rout"); _rage_rc=$?
-        case "$_rage_rc" in
-          0|1) _rage=$(( $(date +%s) - _rdat )); [ "$_rage" -ge 0 ] || _rage=0;;
-          *)   _rage=0;;   # nothing measurable: the WAIT path below is the safe direction (it costs a pass)
-        esac
+        # ⛔ ONE CALL, NOTHING BETWEEN IT AND ITS CONSUMER (review round 8, P3): the age and its basis come
+        # out of `review_dispatch_age` together, so no line inserted after a pinned call can discard the
+        # mtime fallback and silently restore the permanent-WAIT defect. `_rage_rc` is the basis (0 epoch,
+        # 1 mtime, 2 unmeasurable) and only chooses wording; the number itself is already seconds.
+        _rage=$(review_dispatch_age "$_rout"); _rage_rc=$?
         review_action "$_rstate" "$_rage" "$_rattn"; _ract=$?
         if [ "$_ract" -eq 0 ]; then
           # ⛔ THE WINDOW IN THE LOG MUST BE THE ONE THE PREDICATE USED (review round 3, P3): `_ract` is 0
