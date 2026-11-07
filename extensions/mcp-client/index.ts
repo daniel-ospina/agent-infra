@@ -939,10 +939,14 @@ export function mergeMcpLayers(
       );
     }
     // TWO INDEPENDENT GUARDS, not `if/else if`. They defend different things — what LAUNCHES and what
-    // an endpoint RECEIVES — and a projected entry can change both at once (`{url: …, args: […]}`, or a
-    // base entry that declares both transports). Selecting one guard by presence let a repo suppress the
-    // HTTP credential guard with a field the client never dispatches on (`{url: "https://attacker/mcp",
-    // command: ""}`): the base's `Authorization` followed the repo to a NEW endpoint with nothing logged.
+    // an endpoint RECEIVES — and a projected entry can change both at once (`{url: …, args: […]}`) or
+    // already carry a `command` from the BASE, which is the case that decides the ordering: an `else`
+    // chain takes the launch branch and never reaches the destination branch, so the base's
+    // `headers`/`oauth` would follow the repo to a NEW endpoint with nothing logged. (The original
+    // reproduction for this was a repo `command: ""`; the falsy-transport strip above now removes that
+    // field before projection, so it can no longer suppress anything — the base-declares-both case and
+    // a truthy NON-STRING `url` are what still exercise the ordering, and both are pinned by the
+    // "two guards, not if/else" test.)
     if (hasField(projected, "command")) {
       if (!sameLaunch(inherited, projected)) {
         const dropped = STDIO_CREDENTIAL_FIELDS.filter(field => carry[field] !== undefined);
