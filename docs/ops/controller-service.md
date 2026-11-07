@@ -101,15 +101,22 @@ recommends: a loop for an operator with no farm. What makes the #2697 shape wron
 out **on a branch** — unmerged code a lane removes when it lands — and git answers that directly
 (`symbolic-ref -q HEAD` succeeds on a branch, fails on a detached HEAD). So a linked worktree **on a
 branch** is refused wherever it lives (`/tmp/wt-x`, `$HOME/wt-x`, `<repo>/.worktrees/x`); a **detached**
-one is a pin at a commit and is then merely subject to the temporary-root/declared-root rule above; a
-**primary** clone under `/tmp` (`/tmp/cell-ai`, the cells' own checkout) is untouched; and **no declaration
-launders a branch checkout**: a caller that names its own worktree as `AGENT_INFRA_PATH` does not get to
-admit it. When git cannot identify the checkout at all (a `.git` entry it refuses to read — dubious
-ownership, an unreadable directory), the answer is **cannot prove**, and it is refused rather than admitted.
+one is admitted ONLY when it is the pin this box records — `$CELL_HOME/.harness-path`, or the bring-up's
+default `$CELL_HOME/harness` — because detached is also the shape the fleet's **drainer** gives a lane's
+scratch checkout (`ai-drainer.sh`: `git worktree add -f "$AI/wt-drainer-<name>" "$SEED_REF"`, removed with
+`worktree remove --force` when the lane ends), and that one lives under `$HOME`; **every** other detached
+worktree is refused. A **primary** clone under `/tmp` (`/tmp/cell-ai`, the cells' own checkout) is
+untouched; and **no declaration launders a lane checkout**: a caller that names its own worktree as
+`AGENT_INFRA_PATH` does not get to admit it. When git cannot identify the checkout at all (a `.git` entry
+it refuses to read — dubious ownership, an unreadable directory), the answer is **cannot prove**, and it
+is refused rather than admitted. Every git read scrubs an ambient `GIT_DIR`/`GIT_WORK_TREE`/`GIT_COMMON_DIR`
+first, because one exported variable otherwise makes a branch worktree answer as a main clone.
 
 The fleet's scratch shapes (`*/.worktrees/*`, `/tmp/wt-*`, `/tmp/cell-wt-*`, `/tmp/base-*`) are refused
-by name as well, and that list is the **same** list `scripts/install-repair-service.sh` uses — the suite
-extracts both `case` statements and compares them, so a second hand-kept copy cannot drift.
+by name as well — a deliberate **coarse pre-filter** that runs before the git test, so it also refuses a
+detached pin under `.worktrees/` (and says which shape matched). That list is the **same** list
+`scripts/install-repair-service.sh` uses — the suite extracts both `case` statements and compares them, so
+a second hand-kept copy cannot drift.
 
 Two callers, two strengths, one owner of the rule:
 

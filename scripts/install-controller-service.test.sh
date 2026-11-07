@@ -2866,7 +2866,26 @@ if [ -d "$PG_CLONE/.git" ]; then
       *'LINKED GIT WORKTREE'*) ok '§P7: and the refusal says GIT reported it as a linked worktree (not "under /tmp")' ;;
       *) bad "§P7: the refusal does not name the git-worktree reason — $PG_C_OUT" ;;
     esac
-    # ⛔ AND "GIT COULD NOT ANSWER" IS NOT "NOT A WORKTREE" (re-review P2). The same path with a git that
+     # ⛔ AND A DETACHED ONE IS NOT AUTOMATICALLY A PIN (review-4 P1, measured). The fleet's drainer builds a
+    # lane's scratch exactly as a DETACHED worktree (`ai-drainer.sh`: `git worktree add -f
+    # "$AI/wt-drainer-<name>" "$SEED_REF"`, removed with `worktree remove --force` at lane end) under `$HOME` --
+    # a DECLARED root -- so admitting "detached" on its own re-opened the #2697 class one layer down from the
+    # branch rule that closed it. This arm builds THAT shape; §P4's recorded pin stays admitted.
+    rm -f "$PG/units/eldato-orchestrator.service"
+    PG_DET="$T/agent-infra-drainer/wt-drainer-lane9"
+    if git -C "$PG_CLONE" worktree add --detach "$PG_DET" >/dev/null 2>&1; then
+      mkdir -p "$PG_DET/scripts"; cp "$SUP" "$PG_DET/scripts/cloud-cell-supervisor.sh"
+      PG_D_RC=0; PG_D_OUT="$(EXTRA_ENV="ORCH_SUPERVISOR=$PG_DET/scripts/cloud-cell-supervisor.sh" inst pg --install 2>&1)" || PG_D_RC=$?
+      [ "$PG_D_RC" -ne 0 ] && ok "§P7: a DETACHED worktree that is not this box's recorded pin is REFUSED (the drainer scratch shape)" \
+                           || bad "§P7: armed a unit from a detached lane scratch checkout -- 'detached' alone is not a pin: $PG_D_OUT"
+      case "$PG_D_OUT" in
+        *'NOT the harness pin'*) ok '§P7: and the refusal says why detached was not enough' ;;
+        *) bad "§P7: the detached refusal does not name the pin record -- $PG_D_OUT" ;;
+      esac
+    else
+      bad '§P7: the fixture could not create the detached scratch worktree, so that arm did not run'
+    fi
+   # ⛔ AND "GIT COULD NOT ANSWER" IS NOT "NOT A WORKTREE" (re-review P2). The same path with a git that
     # FAILS — git's own `dubious ownership` refusal (a shape this repo runs: `CONTROLLER_ALLOW_ROOT=1`),
     # a wrapper exporting GIT_DIR, or a broken binary — used to read as durable and ARM the worktree, because
     # `git_dirs` prints nothing for both "not a repo" and "git failed". It must fail CLOSED as UNPROVEN.

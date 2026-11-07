@@ -56,9 +56,10 @@ fi
 # Env seams (tests + unusual cells):
 #   ORCH_SUPERVISOR        the supervisor entry point the unit runs
 #                          (default: $HOME/.pi/agent/scripts/cloud-cell-supervisor.sh, else beside this)
-#                          ⛔ REFUSED when it resolves into a lane worktree — any LINKED git worktree, whatever
-#                          the name, or the fleet's scratch shapes (`*/.worktrees/*`, `/tmp/wt-*`, …) — or under
-#                          a temporary root that no deployment root declares (agent-infra#2697): a unit whose
+#                          ⛔ REFUSED when it resolves into a lane worktree — a LINKED git worktree checked
+#                          out on a BRANCH, a DETACHED one that is not this box's recorded harness pin, or the
+#                          fleet's scratch shapes (`*/.worktrees/*`, `/tmp/wt-*`, …) — or under a temporary root
+#                          that no deployment root declares (agent-infra#2697): a unit whose
 #                          ExecStart a cleaning removes burns its start limit (3 attempts inside 300 s) and
 #                          converges to `failed` in well under a minute — SILENTLY, because nothing pages on
 #                          it, so the fleet still believes the box has a dispatcher. The refusal names the
@@ -203,6 +204,31 @@ lane_scratch_shape() {
         /tmp/cell-wt-*)  printf '%s' '/tmp/cell-wt-*' ;;
         /tmp/base-*)     printf '%s' '/tmp/base-*' ;;
     esac
+}
+
+# pin_root_of_this_box — the harness-pin root this box records, or `$CELL_HOME/harness` (the bring-up's
+# default) when no record exists yet.
+# ⛔ A DETACHED LINKED WORKTREE IS NOT AUTOMATICALLY A PIN (review-4 P1, measured). Detached is ALSO the shape
+# the fleet's drainer gives a lane's scratch checkout — `ai-drainer.sh` runs
+# `git worktree add -f "$AI/wt-drainer-<name>" "$SEED_REF"` (`SEED_REF` = `origin/main`, i.e. a detached HEAD)
+# under `$HOME`, a DECLARED root — and removes it with `worktree remove --force` when the lane ends. Treating
+# "detached ⇒ pin" therefore re-opened the exact class this guard exists for, one layer below the branch rule
+# that closed it: measured, that path was ADMITTED. What separates a pin from a lane's scratch is not the HEAD
+# state but WHERE the box says its pin lives: `$CELL_HOME/.harness-path` (written by the bring-up) or the
+# bring-up's own default `$CELL_HOME/harness` (`HARNESS_PIN_DIR`). A detached worktree outside that root is
+# refused.
+pin_root_of_this_box() {
+    local f p
+    f="${HARNESS_PIN_FILE:-$CELL_HOME/.harness-path}"
+    if [ -f "$f" ]; then
+        p="$(head -1 "$f" 2>/dev/null)"
+        case "$p" in
+            */scripts/orchestrator-harness) printf '%s\n' "$(dirname "$(dirname "$p")")"; return 0 ;;
+            '') ;;
+            *) printf '%s\n' "$p"; return 0 ;;
+        esac
+    fi
+    printf '%s\n' "${HARNESS_PIN_DIR:-$CELL_HOME/harness}"
 }
 
 # linked_worktree_root <resolved supervisor> — the LINKED git worktree this path lives in, or nothing.
@@ -376,7 +402,14 @@ scratch_supervisor_reason() {
     d="$(linked_worktree_root "$p")"
     case "$d" in
         '') ;;                       # not in any git work tree at all (a farmed copy): nothing to refuse here
-        *'|detached') ;;             # a PIN at a commit: admissible here, and the temporary-root test below applies
+        *'|detached')
+            # ⛔ DETACHED IS NOT ENOUGH — IT MUST BE THE PIN THIS BOX RECORDS (review-4 P1, measured). The
+            # fleet's drainer builds a lane's scratch as a DETACHED worktree under `$HOME` and deletes it when
+            # the lane ends, so admitting any detached worktree re-opened the #2697 class.
+            if ! path_under "${d%|detached}" "$(pin_root_of_this_box)"; then
+                printf 'it lives in a DETACHED GIT WORKTREE %s that is NOT the harness pin this box records (%s) — the fleet drainer builds a lane scratch checkout exactly like this and removes it with `worktree remove` when that lane ends' "${d%|detached}" "$(pin_root_of_this_box)"
+                return 0
+            fi ;;
         *'|branch')
             printf 'it lives in the LINKED GIT WORKTREE %s, which is checked out on a BRANCH — a lane checkout that is removed when that lane ends, and whose branch is merged nowhere (a pin is DETACHED at a commit; a branch is unmerged work)' "${d%|branch}"
             return 0 ;;
