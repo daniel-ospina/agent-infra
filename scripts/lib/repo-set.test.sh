@@ -540,6 +540,40 @@ PYNA
   ck "f48 a set beyond an UNTRAVERSABLE ancestor is INVALID (5), never 'does not exist' (3)" \
      '[ "$_rc_na" = 5 ] && ! grep -q "does not exist" <<<"$_o_na" && ! grep -q "Create it, one repo per line" <<<"$_o_na"'
 fi
+# ⛔ THREE CHARACTER RULES AND TWO DUPLICATE-KEY ARMS WERE EACH INDIVIDUALLY ARMLESS (sweep at
+# `a561fcc3`, P1). The existing `bad-slug`/`two-slashes` fixtures are BOTH satisfied by the
+# exactly-one-slash and the charset rule, so `notaslug` and `o/n/extra` cannot redden the three rules
+# SEPARATELY: deleting `[ -n "$owner" ] && [ -n "$name" ]`, the owner-first-character rule, or the
+# charset rule EACH left the suite green — and the mutated reader then certified `slug=o/`,
+# `slug=-o/n` and `slug=o/n!` at rc 0 with `OK — 1 repo(s)` for declarations the doctor's
+# `_normalize_slug` returns "" for. The shipped accept-set is still a SUBSET of the doctor's, so this
+# is a mutation-contract gap rather than a live false pass — but it is the same "a fix without an arm
+# is a regression channel" class, on the rules that decide what a slug IS.
+_c_slug() { printf 'slug=%s checkout=%s\n' "$1" "$T/tortoise" > "$T/slugbad.conf"; run_reader_rc "$T/slugbad.conf" check; }
+ck "f49 a slug with an EMPTY half (o/) is BAD-SLUG — the both-halves rule is load-bearing" \
+   '[ "$(_c_slug "o/")" = 5 ]'
+ck "f50 a slug whose OWNER starts with a non-alphanumeric (-o/n, .o/n) is BAD-SLUG" \
+   '[ "$(_c_slug "-o/n")" = 5 ] && [ "$(_c_slug ".o/n")" = 5 ]'
+ck "f51 …and one whose body carries a character outside [A-Za-z0-9._-] (o/n!) is BAD-SLUG" \
+   '[ "$(_c_slug "o/n!")" = 5 ]'
+# ⛔ AND THE DUPLICATE-KEY ARM WAS PINNED ONLY FOR `slug=` (sweep at `a561fcc3`, P1). `checkout=` and
+# `state=` are SEPARATE arms, and deleting either made the reader certify the set at rc 0 with the
+# operator's FIRST value silently discarded — last one wins. For `checkout=` the discarded value is the
+# checkout the box actually runs; for `state=` it is the controller state dir, the field whose sharing
+# and identity the rest of this file refuses at rc 1. Via `doctor-repos` the substituted value becomes
+# `PR_DOCTOR_REPOS`, so the silent substitution reaches the doctor as if it had been declared.
+printf 'slug=acme/alpha checkout=%s checkout=/tmp/decoy\n' "$T/tortoise" > "$T/dup-checkout.conf"
+ck "f52 a DUPLICATE checkout= is DUPLICATE-KEY, not a silent last-one-wins substitution" \
+   'o="$(run_reader "$T/dup-checkout.conf" check)"; [ "$(run_reader_rc "$T/dup-checkout.conf" check)" = 5 ] && grep -q "DUPLICATE-KEY" <<<"$o"'
+printf 'slug=acme/alpha checkout=%s state=/s/one state=/s/two\n' "$T/tortoise" > "$T/dup-state.conf"
+ck "f53 a DUPLICATE state= is DUPLICATE-KEY, not a silent last-one-wins substitution" \
+   'o="$(run_reader "$T/dup-state.conf" check)"; [ "$(run_reader_rc "$T/dup-state.conf" check)" = 5 ] && grep -q "DUPLICATE-KEY" <<<"$o"'
+# ⛔ AND A BARE INVOCATION IS A USAGE ERROR (sweep at `a561fcc3`, P1). `[ -n "$verb" ] || return 2`
+# sat ONE LINE ABOVE the unknown-verb arm `f43` pins, and deleting it made `bash repo-set.sh` with no
+# verb exit **0** where the RETURN CODES table says usage is 2 — a caller whose verb variable is empty
+# gets success from a run that validated nothing.
+ck "f54 a bare invocation (no verb) is rc 2, never a silent success" \
+   '[ "$(run_reader_rc "$T/severbad.conf" "")" = 2 ]'
 # ⛔ A COMPLETE-BUT-OLDER READER: THE THIRD SHAPE, AND THE ONE THE FARM ACTUALLY PRODUCES (round 37, P1).
 # The stub provides all four `repo_set_*` functions — so the round-35 probe passed it — and none of the
 # `_rs_*` helpers the wrapper then calls. Before the fix the wrapper emitted five `command not found`
