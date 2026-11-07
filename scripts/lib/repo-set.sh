@@ -137,10 +137,17 @@ _rs_nearest_existing_ancestor() {
 # then the two absolute paths launchd needs when it has no PATH of its own). ⛔ ONE HOME FOR THAT ORDER
 # IN THIS FILE — `_rs_doctor_available` and `_rs_with_doctor` both call this; neither carries its own
 # loop (round 15, P2: `_rs_with_doctor` did, which made this doc's "one home" claim false).
-# ⛔ THE WRAPPER HAS ITS OWN COPY AND THAT IS NOT A SECOND AUTHORITY: `scripts/pr-doctor-machine.sh`
-# resolves `$PY` in ITS process because it must `exec` the doctor itself, and it talks to this reader
-# over a subprocess (`bash "$READER" check`), not by sourcing it — so the function is not reachable
-# there. Same order, same three candidates, different process boundary.
+# ⛔ THE WRAPPER CARRIES THE SAME ORDER IN ITS OWN LINES, AND THAT IS AN ORDERING FACT, NOT A SECOND
+# AUTHORITY. `scripts/pr-doctor-machine.sh` resolves `$PY` BEFORE it sources this file (its loop is at
+# `:95-103`, the source is `:110`) — it has to, because it refuses with its own message when no
+# interpreter resolves, and it must do that before anything from here exists in its shell. So it cannot
+# call this function at that point; it CAN (and does, once sourced) everywhere afterwards. Same three
+# candidates in the same order, and the duplication is confined to those eight lines.
+# ⛔ AND THE WRAPPER DOES *NOT* TALK TO THIS READER OVER A SUBPROCESS — it SOURCES it, deliberately, and
+# says so at `:106-110`: a `bash "$READER" check` subprocess would collapse this file's 3 (absent) /
+# 4 (empty) / 5 (malformed) into 0/1, which is exactly the distinction the wrapper's `case` exists to
+# act on. A comment here claiming a subprocess boundary described the FORBIDDEN shape, and a lane
+# "correcting" the wrapper to match it would merge "no set" with "broken set".
 _rs_py_resolve() {
   local c
   for c in python3 /usr/bin/python3 /usr/local/bin/python3; do
