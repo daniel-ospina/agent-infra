@@ -2551,8 +2551,25 @@ rm -f "$TMP/gate-ran"
 # `pi … ; _grc=$?` the shell ABORTED on the gate's own 76 before `_grc` was ever assigned — the suite
 # exited 76 with 239 log lines and no recap, so the two real FAILs below were never reported and the
 # arm read as a harness crash. Capture the status the way the positive control below already does.
+# ⛔ THE INSTRUMENT IS PINNED TO THE TREE UNDER TEST, NOT TO THE BOX (#3531). The gate reaches the
+# LOAD arm only through `capacity.sh`, and `spawn-gate.sh` resolves it from `${O:-}`, its own dir,
+# `${AGENT_INFRA_PATH}/scripts/orchestrator-harness`, `${HOME}/orchestrator` and
+# `${HOME}/.pi/agent/scripts` — in that order. Nothing in this arm used to pin ANY of them, so the
+# verdict depended on ambient box state and DISAGREED between a lane and CI on the SAME commit:
+#   · measured 2026-11-07 on a lane box (`O=/home/cmux/orchestrator`, `AGENT_INFRA_PATH` set, both
+#     with a `capacity.sh`): rc 76, arm GREEN; reproduced the CI red only under
+#     `env -u O -u AGENT_INFRA_PATH`;
+#   · on CI both are unset and `$HOME` is the temp dir, so no candidate resolves -> the gate answers
+#     `nodeploy` (`capacity.sh is not reachable from this spawn gate`) and exits 83 — the two FAILs
+#     below, `FAILURES: 2`, byte-identical on `5fb383ac` (pre-fix) and after it.
+# ⛔ THE GREEN WAS THE WORSE HALF: on a box with an ambient payload the arm certified the LOAD gate
+# using `/home/cmux/orchestrator/capacity.sh`, a file from OUTSIDE the tree under test — so it could
+# pass while this repo's own `capacity.sh` was broken. Pin BOTH inputs: `O=` empties the first
+# candidate (the gate skips it on `[ -n ]`), and `AGENT_INFRA_PATH="$CLONE"` points the third at the
+# repo being installed, which is also the copy that installed this gate. A `$CLONE` whose
+# capacity.sh is incomplete then REFUSES loudly under 83 instead of borrowing a working copy.
 _grc=0
-HOME="$HOME_DIR" MAX_LOAD=0 MEM_MIN_AVAIL_MB=1 PATH="$DEST/bin:$TMP/gate-real:$PATH" pi -p "gate probe" >/dev/null 2>&1 || _grc=$?
+HOME="$HOME_DIR" O= AGENT_INFRA_PATH="$CLONE" MAX_LOAD=0 MEM_MIN_AVAIL_MB=1 PATH="$DEST/bin:$TMP/gate-real:$PATH" pi -p "gate probe" >/dev/null 2>&1 || _grc=$?
 if [ "$_grc" -eq 76 ] && [ ! -e "$TMP/gate-ran" ]; then
   echo "ok: the installed gate REFUSED a spawn at MAX_LOAD=0 with the LOAD code 76 (the real pi never ran)"
 elif [ ! -e "$TMP/gate-ran" ]; then
@@ -2563,7 +2580,7 @@ elif [ ! -e "$TMP/gate-ran" ]; then
 else
   fail "the installed gate allowed a spawn at MAX_LOAD=0 — 'spawn nothing' is not enforced"
 fi
-HOME="$HOME_DIR" MAX_LOAD=999999999 MEM_MIN_AVAIL_MB=1 PATH="$DEST/bin:$TMP/gate-real:$PATH" pi -p "gate probe" >/dev/null 2>&1 || true
+HOME="$HOME_DIR" O= AGENT_INFRA_PATH="$CLONE" MAX_LOAD=999999999 MEM_MIN_AVAIL_MB=1 PATH="$DEST/bin:$TMP/gate-real:$PATH" pi -p "gate probe" >/dev/null 2>&1 || true
 if [ -e "$TMP/gate-ran" ]; then
   echo "ok: POSITIVE CONTROL — below the ceiling the installed gate EXECs the real pi"
 else
