@@ -6781,7 +6781,11 @@ PY
   if [ "${CASCADE_ISSUE_SLOTS:-0}" -gt 0 ]; then
     cascade_level "$O/state"
     case "${CASCADE_LEVEL:-?}" in
-      1|2|3|4) # A HIGHER LEVEL HAS ACTIONABLE WORK: the room is not the issue path's this pass.
+      1|2|3|4) # A HIGHER LEVEL HOLDS A NON-ZERO COUNT: the room is not the issue path's this pass.
+               # ⛔ NOT "has actionable work" (review round 9, P2): the classifier counts CHECK STATE
+               # only, so this arm cannot know whether a lane could spend the room — the same gap the
+               # header at 3306 and docs/ops/self-healing-contract.md §6 now state. Saying "actionable"
+               # here made the consumption site disagree with the decision site about one question.
                CASCADE_ISSUE_SLOTS=0; CASCADE_LEVEL_HOLDS=1 ;;
       *) : ;;   # 5 = nothing above → issues; `?` = unmeasured → decide nothing (see cascade_level)
     esac
