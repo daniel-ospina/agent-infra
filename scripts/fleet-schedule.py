@@ -225,6 +225,16 @@ def absolutize_path_knobs():
     how the `INFRA_ROOT` gap happened. `FLEET_SCHEDULE_STATE` / `TEMPLATES_DIR` / `FLEET_SCHEDULE_LOCK_ROOT`
     still need their explicit handover because they are resolved from DEFAULTS rather than from an env
     value the child would simply re-read.
+
+    ⛔ EVERY KNOB IN THESE TUPLES IS GRADED, AND A NEW ONE NEEDS ITS OWN ARM (#3442). The completeness this
+    function claims is only worth what the suite can refuse, so §19 names one arm per knob — deleting a
+    knob from the tuples below REDDENS a named row instead of passing quietly (it used to pass quietly on
+    SIX of them: `SWARM_ROOT`, `CELL_HOME`, `SWARM_ENV_FILE`, `REAP_ORPHAN_ARM_FILE`, `PYTHON_BIN`,
+    `PI_NODE_BIN`, whose absence was invisible to every other check). The map, so the next knob cannot
+    repeat it: `TORTOISE_REPO` 19ak · `SWARM_ROOT` 19as (via the DERIVED `{{PYTHON_BIN}}`) · `CELL_HOME`
+    19at (via both arming records) · `SWARM_ENV_FILE` 19av · `WORKTREE_HYGIENE_ARM_FILE` 19am ·
+    `REAP_ORPHAN_ARM_FILE` 19au · `PYTHON_BIN`/`PI_NODE_BIN` 19av plus its CONTROL row, which is what pins
+    the bare-name exemption below.
     """
     for knob in ("TORTOISE_REPO", "SWARM_ROOT", "CELL_HOME", "SWARM_ENV_FILE",
                  "WORKTREE_HYGIENE_ARM_FILE", "REAP_ORPHAN_ARM_FILE"):

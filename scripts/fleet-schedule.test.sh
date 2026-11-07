@@ -4088,6 +4088,183 @@ grep -qvx 'wt=--apply' "$MARK19AM" 2>/dev/null \
   || ok "19am ⛔ the child resolved the SAME arming record the parent did (--apply, not --dry-run)"
 pidAM="$(cat "$T/s19am/loop.pid" 2>/dev/null)"; kill "$pidAM" 2>/dev/null; sleep 1
 
+# 19as — ⛔ A RELATIVE `SWARM_ROOT` MUST REACH THE CHILD RESOLVED TOO, and the placeholder that DIVERGES
+# is not `{{SWARM_ROOT}}` (rendered verbatim from the env in BOTH processes) but `{{PYTHON_BIN}}`, which
+# `placeholder_values()` DERIVES from it: `os.access(join(SWARM_ROOT, ".venv/bin/python"), os.X_OK)` is
+# cwd-relative, so a relative swarm root is found by the parent and NOT by the loop child (`cwd="/"`),
+# which falls through to `command -v python3` — two different interpreters rendered into one
+# `SCHEDULE VERIFIED`. This is the sixth of the twelve knobs `absolutize_path_knobs()` normalises and
+# the one #3636's own review measured as UNGRADED: deleting `"SWARM_ROOT"` from that tuple left the
+# suite GREEN, every assertion happy — the guard was advertised covered and was not (#3442).
+mkdir -p "$T/bin19as" "$T/tpl19as" "$T/relcwd19as/swarm19as/.venv/bin"
+cp "$SCHED" "$T/bin19as/fleet-schedule.py"
+printf '# none\n' > "$T/tpl19as/RETIRED"
+# A REAL executable at the path `placeholder_values()` probes: the arm grades the DERIVED placeholder,
+# so the probe has to SUCCEED for the resolved branch to be the one under test.
+printf '#!/bin/sh\nexec python3 "$@"\n' > "$T/relcwd19as/swarm19as/.venv/bin/python"
+chmod +x "$T/relcwd19as/swarm19as/.venv/bin/python"
+MARK19AS="$T/out/marker19as.log"
+python3 - "$T/tpl19as" "$MARK19AS" <<'PY19AS'
+import os, plistlib, sys
+d = {"Label": "com.test.swarm19as",
+     "ProgramArguments": ["/bin/sh", "-c", "echo py={{PYTHON_BIN}} >> %s" % sys.argv[2]],
+     "StartInterval": 2}
+with open(os.path.join(sys.argv[1], "com.test.swarm19as.plist"), "wb") as fh:
+    plistlib.dump(d, fh)
+PY19AS
+out19as="$(cd "$T/relcwd19as" && env -u AGENT_INFRA_PATH -u INFRA_ROOT -u CELL_HOME -u PYTHON_BIN SWARM_ROOT=swarm19as \
+  TEMPLATES_DIR="$T/tpl19as" FLEET_SCHEDULE_STATE="$T/s19as" FLEET_SCHEDULE_LOCK_ROOT="$L19/as" \
+  FLEET_SCHEDULE_TICK=2 python3 "$T/bin19as/fleet-schedule.py" --start 2>&1)"; rc19as=$?
+[ "$rc19as" -eq 0 ] \
+  && ok "19as --start with a RELATIVE SWARM_ROOT exits 0" \
+  || bad "19as --start exited $rc19as: $out19as"
+wait19as=0
+while [ ! -s "$MARK19AS" ] && [ "$wait19as" -lt 25 ]; do sleep 1; wait19as=$((wait19as + 1)); done
+[ -s "$MARK19AS" ] \
+  && ok "19as the loop child RAN the {{PYTHON_BIN}} job (the placeholder rendered)" \
+  || bad "19as the child never ran the job: $out19as / $(tail -3 "$T/s19as/loop.log" 2>/dev/null)"
+grep -qvx "py=$T/relcwd19as/swarm19as/.venv/bin/python" "$MARK19AS" 2>/dev/null \
+  && bad "19as the child DERIVED a different {{PYTHON_BIN}} from the same SWARM_ROOT: $(head -3 "$MARK19AS")" \
+  || ok "19as ⛔ the child derived the SAME interpreter the parent resolved (one swarm root, one argv)"
+pidAS="$(cat "$T/s19as/loop.pid" 2>/dev/null)"; kill "$pidAS" 2>/dev/null; sleep 1
+
+# 19at — ⛔ A RELATIVE `CELL_HOME` MUST REACH THE CHILD RESOLVED TOO. `home` is `CELL_HOME or HOME` and
+# BOTH arming records default THROUGH it (`open(home/.pi/agent/state/worktree-hygiene.armed)`,
+# `…/pi-reap-orphans.armed`), so a relative `CELL_HOME` decided the parent's `--apply`/armed answer by the
+# CALLER's cwd while the child (`cwd="/"`) read `/cell…`, hit `OSError` and answered `--dry-run`/disarmed
+# — one `SCHEDULE VERIFIED` over a sweeper that does not sweep and a reaper that does not reap. 19am
+# grades the `*_ARM_FILE` OVERRIDES; this is the DEFAULT they fall back to, and neither had an arm.
+mkdir -p "$T/bin19at" "$T/tpl19at" "$T/relcwd19at/cell19at/.pi/agent/state"
+cp "$SCHED" "$T/bin19at/fleet-schedule.py"
+printf '# none\n' > "$T/tpl19at/RETIRED"
+printf 'armed-by=test-19at\narmed-date=2026-11-07\n' \
+  > "$T/relcwd19at/cell19at/.pi/agent/state/worktree-hygiene.armed"
+printf 'armed-by=test-19at\narmed-date=2026-11-07\n' \
+  > "$T/relcwd19at/cell19at/.pi/agent/state/pi-reap-orphans.armed"
+MARK19AT="$T/out/marker19at.log"
+python3 - "$T/tpl19at" "$MARK19AT" <<'PY19AT'
+import os, plistlib, sys
+d = {"Label": "com.test.cell19at",
+     "ProgramArguments": ["/bin/sh", "-c", "echo wt={{WORKTREE_HYGIENE_MODE}} reap={{REAP_ORPHAN_MODE}} >> %s" % sys.argv[2]],
+     "StartInterval": 2}
+with open(os.path.join(sys.argv[1], "com.test.cell19at.plist"), "wb") as fh:
+    plistlib.dump(d, fh)
+PY19AT
+out19at="$(cd "$T/relcwd19at" && env -u AGENT_INFRA_PATH -u INFRA_ROOT -u WORKTREE_HYGIENE_ARM_FILE -u REAP_ORPHAN_ARM_FILE CELL_HOME=cell19at \
+  TEMPLATES_DIR="$T/tpl19at" FLEET_SCHEDULE_STATE="$T/s19at" FLEET_SCHEDULE_LOCK_ROOT="$L19/at" \
+  FLEET_SCHEDULE_TICK=2 python3 "$T/bin19at/fleet-schedule.py" --start 2>&1)"; rc19at=$?
+[ "$rc19at" -eq 0 ] \
+  && ok "19at --start with a RELATIVE CELL_HOME exits 0" \
+  || bad "19at --start exited $rc19at: $out19at"
+wait19at=0
+while [ ! -s "$MARK19AT" ] && [ "$wait19at" -lt 25 ]; do sleep 1; wait19at=$((wait19at + 1)); done
+[ -s "$MARK19AT" ] \
+  && ok "19at the loop child RAN the arming-record jobs" \
+  || bad "19at the child never ran the job: $out19at / $(tail -3 "$T/s19at/loop.log" 2>/dev/null)"
+grep -qvx 'wt=--apply reap=0' "$MARK19AT" 2>/dev/null \
+  && bad "19at the child resolved a DIFFERENT CELL_HOME, so the armed records read as UNARMED: $(head -3 "$MARK19AT")" \
+  || ok "19at ⛔ the child found the SAME armed records through the relative CELL_HOME (--apply / armed)"
+pidAT="$(cat "$T/s19at/loop.pid" 2>/dev/null)"; kill "$pidAT" 2>/dev/null; sleep 1
+
+# 19au — ⛔ A RELATIVE `REAP_ORPHAN_ARM_FILE` MUST REACH THE CHILD RESOLVED TOO — the 0-vs-1 twin of the
+# `WORKTREE_HYGIENE_ARM_FILE` leg 19am grades. Both OVERRIDE a path that is opened with `open()`, so a
+# relative override decides armed-vs-disarmed by the CALLER's cwd; measured here on the reaper, where the
+# wrong answer is `1` (dry run) over a record that says the box IS armed, i.e. a reaper that never reaps.
+mkdir -p "$T/bin19au" "$T/tpl19au" "$T/relcwd19au"
+cp "$SCHED" "$T/bin19au/fleet-schedule.py"
+printf '# none\n' > "$T/tpl19au/RETIRED"
+printf 'armed-by=test-19au\narmed-date=2026-11-07\n' > "$T/relcwd19au/armed19au"
+MARK19AU="$T/out/marker19au.log"
+python3 - "$T/tpl19au" "$MARK19AU" <<'PY19AU'
+import os, plistlib, sys
+d = {"Label": "com.test.reap19au",
+     "ProgramArguments": ["/bin/sh", "-c", "echo reap={{REAP_ORPHAN_MODE}} >> %s" % sys.argv[2]],
+     "StartInterval": 2}
+with open(os.path.join(sys.argv[1], "com.test.reap19au.plist"), "wb") as fh:
+    plistlib.dump(d, fh)
+PY19AU
+out19au="$(cd "$T/relcwd19au" && env -u AGENT_INFRA_PATH -u INFRA_ROOT -u CELL_HOME -u WORKTREE_HYGIENE_ARM_FILE REAP_ORPHAN_ARM_FILE=armed19au \
+  TEMPLATES_DIR="$T/tpl19au" FLEET_SCHEDULE_STATE="$T/s19au" FLEET_SCHEDULE_LOCK_ROOT="$L19/au" \
+  FLEET_SCHEDULE_TICK=2 python3 "$T/bin19au/fleet-schedule.py" --start 2>&1)"; rc19au=$?
+[ "$rc19au" -eq 0 ] \
+  && ok "19au --start with a RELATIVE reaper arming record exits 0" \
+  || bad "19au --start exited $rc19au: $out19au"
+wait19au=0
+while [ ! -s "$MARK19AU" ] && [ "$wait19au" -lt 25 ]; do sleep 1; wait19au=$((wait19au + 1)); done
+[ -s "$MARK19AU" ] \
+  && ok "19au the loop child RAN the {{REAP_ORPHAN_MODE}} job" \
+  || bad "19au the child never ran the job: $out19au / $(tail -3 "$T/s19au/loop.log" 2>/dev/null)"
+grep -qvx 'reap=0' "$MARK19AU" 2>/dev/null \
+  && bad "19au the child resolved a DIFFERENT arming record, so an armed reaper rendered as disarmed: $(head -3 "$MARK19AU")" \
+  || ok "19au ⛔ the child resolved the SAME reaper arming record the parent did (armed, not dry-run)"
+pidAU="$(cat "$T/s19au/loop.pid" 2>/dev/null)"; kill "$pidAU" 2>/dev/null; sleep 1
+
+# 19av — ⛔ THE THREE ENV-VALUED PATH KNOBS MUST REACH THE CHILD RESOLVED TOO — and the `os.sep`
+# CONDITION on the last two is part of the contract, not an optimisation. `PYTHON_BIN`, `PI_NODE_BIN` and
+# `SWARM_ENV_FILE` are rendered VERBATIM into job argv, and the loop child runs with `cwd="/"`, so a
+# relative value pointed the job at `/py` rather than at the caller's `./py`. A BARE name is deliberately
+# left alone (`python3` is a PATH lookup and `abspath("python3")` invents a file that does not exist), so
+# the control row below pins that the normalisation does not over-reach — that is the arm a blanket
+# `abspath` on every knob would redden.
+mkdir -p "$T/bin19av" "$T/tpl19av" "$T/relcwd19av/pib19av"
+cp "$SCHED" "$T/bin19av/fleet-schedule.py"
+printf '# none\n' > "$T/tpl19av/RETIRED"
+printf '#!/bin/sh\nexec python3 "$@"\n' > "$T/relcwd19av/py19av"; chmod +x "$T/relcwd19av/py19av"
+printf '#!/bin/sh\nexit 0\n' > "$T/relcwd19av/pib19av/pi"; chmod +x "$T/relcwd19av/pib19av/pi"
+MARK19AV="$T/out/marker19av.log"
+python3 - "$T/tpl19av" "$MARK19AV" <<'PY19AV'
+import os, plistlib, sys
+d = {"Label": "com.test.paths19av",
+     "ProgramArguments": ["/bin/sh", "-c",
+                         "echo py={{PYTHON_BIN}} pib={{PI_BIN_DIR}} env={{SWARM_ENV_FILE}} >> %s" % sys.argv[2]],
+     "StartInterval": 2}
+with open(os.path.join(sys.argv[1], "com.test.paths19av.plist"), "wb") as fh:
+    plistlib.dump(d, fh)
+PY19AV
+out19av="$(cd "$T/relcwd19av" && env -u AGENT_INFRA_PATH -u INFRA_ROOT -u CELL_HOME PYTHON_BIN=./py19av PI_NODE_BIN=./pib19av/pi \
+  SWARM_ENV_FILE=swarmenv19av \
+  TEMPLATES_DIR="$T/tpl19av" FLEET_SCHEDULE_STATE="$T/s19av" FLEET_SCHEDULE_LOCK_ROOT="$L19/av" \
+  FLEET_SCHEDULE_TICK=2 python3 "$T/bin19av/fleet-schedule.py" --start 2>&1)"; rc19av=$?
+[ "$rc19av" -eq 0 ] \
+  && ok "19av --start with RELATIVE PYTHON_BIN/PI_NODE_BIN/SWARM_ENV_FILE exits 0" \
+  || bad "19av --start exited $rc19av: $out19av"
+wait19av=0
+while [ ! -s "$MARK19AV" ] && [ "$wait19av" -lt 25 ]; do sleep 1; wait19av=$((wait19av + 1)); done
+[ -s "$MARK19AV" ] \
+  && ok "19av the loop child RAN the path-placeholder job" \
+  || bad "19av the child never ran the job: $out19av / $(tail -3 "$T/s19av/loop.log" 2>/dev/null)"
+grep -q "py=$T/relcwd19av/py19av " "$MARK19AV" 2>/dev/null \
+  && ok "19av ⛔ a relative PYTHON_BIN rendered RESOLVED in the child (a job's interpreter is not cwd-relative)" \
+  || bad "19av the child rendered a DIFFERENT {{PYTHON_BIN}}: $(head -3 "$MARK19AV")"
+grep -q "pib=$T/relcwd19av/pib19av " "$MARK19AV" 2>/dev/null \
+  && ok "19av ⛔ a relative PI_NODE_BIN rendered its RESOLVED directory in the child" \
+  || bad "19av the child rendered a DIFFERENT {{PI_BIN_DIR}}: $(head -3 "$MARK19AV")"
+grep -q "env=$T/relcwd19av/swarmenv19av$" "$MARK19AV" 2>/dev/null \
+  && ok "19av ⛔ a relative SWARM_ENV_FILE rendered RESOLVED in the child" \
+  || bad "19av the child rendered a DIFFERENT {{SWARM_ENV_FILE}}: $(head -3 "$MARK19AV")"
+pidAV="$(cat "$T/s19av/loop.pid" 2>/dev/null)"; kill "$pidAV" 2>/dev/null; sleep 1
+# ⛔ THE CONTROL: a BARE `PYTHON_BIN` is a PATH lookup and must stay BARE. Normalising it to `$PWD/python3`
+# would point every job at a file that does not exist — the over-reach a blanket `abspath` would ship.
+MARK19AVB="$T/out/marker19avb.log"
+mkdir -p "$T/tpl19avb"; printf '# none\n' > "$T/tpl19avb/RETIRED"
+python3 - "$T/tpl19avb" "$MARK19AVB" <<'PY19AVB'
+import os, plistlib, sys
+d = {"Label": "com.test.bare19av",
+     "ProgramArguments": ["/bin/sh", "-c", "echo pybare={{PYTHON_BIN}} >> %s" % sys.argv[2]],
+     "StartInterval": 2}
+with open(os.path.join(sys.argv[1], "com.test.bare19av.plist"), "wb") as fh:
+    plistlib.dump(d, fh)
+PY19AVB
+out19avb="$(cd "$T/relcwd19av" && env -u CELL_HOME -u AGENT_INFRA_PATH -u INFRA_ROOT PYTHON_BIN=python3 \
+  TEMPLATES_DIR="$T/tpl19avb" FLEET_SCHEDULE_STATE="$T/s19avB" FLEET_SCHEDULE_LOCK_ROOT="$L19/avb" \
+  FLEET_SCHEDULE_TICK=2 python3 "$T/bin19av/fleet-schedule.py" --start 2>&1)"; rc19avb=$?
+wait19avb=0
+while [ ! -s "$MARK19AVB" ] && [ "$wait19avb" -lt 25 ]; do sleep 1; wait19avb=$((wait19avb + 1)); done
+grep -qx 'pybare=python3' "$MARK19AVB" 2>/dev/null \
+  && ok "19av CONTROL: a BARE PYTHON_BIN is left alone (a PATH name is not a path)" \
+  || bad "19av CONTROL: a bare PYTHON_BIN was rewritten to something else: $(head -3 "$MARK19AVB") (rc=$rc19avb)"
+pidAVB="$(cat "$T/s19avB/loop.pid" 2>/dev/null)"; kill "$pidAVB" 2>/dev/null; sleep 1
+
 # 19an — ⛔ AN `--install` THAT STARTS NOTHING MUST STILL RECORD ITS DECLARATION SET. This is the
 # cell-bringup shape: a second state dir installs while another holds the BOX lock, so `spawn_loop`
 # returns the foreign holder with `started=False` — and the pointer is the ONLY thing the supervisor's
