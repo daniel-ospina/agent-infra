@@ -383,7 +383,7 @@ ck "f11 a missing sibling reader is a NAMED farm gap, not a silent one-repo box"
 # wrapper`), because the old one was a FALSE STATEMENT for the skew shape: that reader sources fine and is
 # simply older. A refusal that names the wrong cause is the class rounds 18/29/31/33 kept closing.
 ck "f11b an UNSOURCEABLE sibling reader (truncated) is refused BY NAME, with no 'command not found' noise" \
-   'mv "$W/lib/repo-set.sh" "$W/lib/repo-set.sh.away"; head -n "$(grep -n "^repo_set_doctor_repos()" "$READER" | cut -d: -f1)" "$READER" > "$W/lib/repo-set.sh"; o="$(REPO_SET_FILE="$CONF" HOME="$T" bash "$W/pr-doctor-machine.sh" 2>&1)"; rc=$?; mv "$W/lib/repo-set.sh.away" "$W/lib/repo-set.sh"; [ "$rc" = 2 ] && grep -q "cannot be used by this wrapper" <<<"$o" && ! grep -q "command not found" <<<"$o" && ! grep -q "is not a usable repo set" <<<"$o"'
+   'mv "$W/lib/repo-set.sh" "$W/lib/repo-set.sh.away"; head -n "$(grep -n "^repo_set_doctor_repos()" "$READER" | cut -d: -f1)" "$READER" > "$W/lib/repo-set.sh"; o="$(REPO_SET_FILE="$CONF" HOME="$T" bash "$W/pr-doctor-machine.sh" 2>&1)"; rc=$?; mv "$W/lib/repo-set.sh.away" "$W/lib/repo-set.sh"; [ "$rc" = 2 ] && grep -q "cannot be used by this wrapper" <<<"$o" && ! grep -qE "command not found|No such file or directory" <<<"$o" && ! grep -q "is not a usable repo set" <<<"$o"'
 # ⛔ THE SIBLING ARMS ALL GUARD `chmod 000` AGAINST ROOT (j1/j2, m13-m15, m18-m20, d-unreadable-checkout):
 # root ignores DAC, so on a root box the source SUCCEEDS, the probes pass, the doctor runs and this arm
 # asserts rc 2 on an rc 0 run — a hard red on a correct tree. Non-root CI masks it, which is exactly the
@@ -392,7 +392,7 @@ if [ "$(id -u)" = 0 ]; then
   printf 'skip f11c (running as root: mode 000 does not block a read)\n'
 else
   ck "f11c …and a mode-000 reader is refused the same way (unreadable, not unparsable)" \
-     'mv "$W/lib/repo-set.sh" "$W/lib/repo-set.sh.away"; cp "$W/lib/repo-set.sh.away" "$W/lib/repo-set.sh"; chmod 000 "$W/lib/repo-set.sh"; o="$(REPO_SET_FILE="$CONF" HOME="$T" bash "$W/pr-doctor-machine.sh" 2>&1)"; rc=$?; chmod 644 "$W/lib/repo-set.sh"; mv -f "$W/lib/repo-set.sh.away" "$W/lib/repo-set.sh"; [ "$rc" = 2 ] && grep -q "cannot be used by this wrapper" <<<"$o" && ! grep -q "command not found" <<<"$o"'
+     'mv "$W/lib/repo-set.sh" "$W/lib/repo-set.sh.away"; cp "$W/lib/repo-set.sh.away" "$W/lib/repo-set.sh"; chmod 000 "$W/lib/repo-set.sh"; o="$(REPO_SET_FILE="$CONF" HOME="$T" bash "$W/pr-doctor-machine.sh" 2>&1)"; rc=$?; chmod 644 "$W/lib/repo-set.sh"; mv -f "$W/lib/repo-set.sh.away" "$W/lib/repo-set.sh"; [ "$rc" = 2 ] && grep -q "cannot be used by this wrapper" <<<"$o" && ! grep -qE "command not found|No such file or directory" <<<"$o"'
 fi
 # ⛔ THE REFUSAL'S OWN CAUSE LINE WAS BROKEN BY THE COMMIT THAT WROTE IT (review at `93833f4d9`, P1).
 # Two of those `_say` lines put UNESCAPED backticks inside a double-quoted argument, so bash parsed them
@@ -448,19 +448,44 @@ cp "$WRAPPER" "$SW/pr-doctor-machine.sh"
 cp "$REPO_ROOT/scripts/pr-doctor.py" "$SW/pr-doctor.py"
 printf 'repo_set_file() { printf %%s "${REPO_SET_FILE:-}"; }\nrepo_set_parse() { return 3; }\nrepo_set_check() { return 0; }\nrepo_set_doctor_repos() { return 0; }\n' > "$SW/lib/repo-set.sh"
 ck "f11d an OLDER reader (all four repo_set_* present, the _rs_* helpers absent) is REFUSED by name, not used" \
-   'o="$(REPO_SET_FILE="$T/none.conf" OR=daniel-ospina/tortoise HOME="$T" bash "$SW/pr-doctor-machine.sh" 2>&1)"; rc=$?; [ "$rc" = 2 ] && grep -q "cannot be used by this wrapper" <<<"$o" && grep -q "_rs_normalize_slug" <<<"$o" && ! grep -q "command not found" <<<"$o" && ! grep -q "is not an owner/name slug" <<<"$o"'
+   'o="$(REPO_SET_FILE="$T/none.conf" OR=daniel-ospina/tortoise HOME="$T" bash "$SW/pr-doctor-machine.sh" 2>&1)"; rc=$?; [ "$rc" = 2 ] && grep -q "cannot be used by this wrapper" <<<"$o" && grep -q "_rs_normalize_slug" <<<"$o" && ! grep -qE "command not found|No such file or directory" <<<"$o" && ! grep -q "is not an owner/name slug" <<<"$o"'
 ck "f11d-0 …and the SHIPPED reader in the same env GRADES that same OR (so f11d reddens on the refusal, not on the setup)" \
    'o="$(REPO_SET_FILE="$T/none.conf" OR=daniel-ospina/tortoise HOME="$T" bash "$W/pr-doctor-machine.sh" 2>&1)"; grep -q "Grading the ONE repo" <<<"$o"'
-# ⛔ AND THE PROBE LIST IS KEPT EQUAL TO THE CALL SITES — BOTH DIRECTIONS (round 37, P1/P2). The wrapper's
-# own comment argues that naming functions one by one is what went wrong three times here, and a probe
-# list nothing watches is that problem with a gate attached: the reviewer MEASURED that dropping the
-# `repo_set_check` and `repo_set_file` probes reddened nothing at all (171/0). So compute the calls out
-# of the file — comment lines excluded (prose is not a call), `command -v` lines excluded (that IS the
-# probe), and the list line excluded (it would trivially satisfy itself) — and require set EQUALITY: a
-# call the list omits reddens, and a name the file no longer calls reddens too (an inert probe refuses a
-# healthy reader for a function nobody wants).
-_probe_calls="$(grep -vE '^[[:space:]]*#' "$WRAPPER" | grep -v 'command -v' | grep -v '^_reader_needs=' | grep -oE '(repo_set_[a-z_]+|_rs_[a-z_]+)' | sort -u | tr '\n' ' ')"
-_probe_list="$(grep -E '^_reader_needs=' "$WRAPPER" | head -1 | cut -d'"' -f2)"
+# ⛔ AND THE PROBE LIST IS KEPT EQUAL TO THE CALL SITES — BOTH DIRECTIONS (round 37, P1; round 38, P2).
+# The wrapper's own comment argues that naming functions one by one is what went wrong three times here,
+# and a probe list nothing watches is that problem with a gate attached: the reviewer MEASURED that
+# dropping the `repo_set_check` and `repo_set_file` probes reddened nothing at all (171/0). So compute
+# the calls out of the file and require set EQUALITY: a call the list omits reddens, and a name the file
+# no longer calls reddens too (an inert probe refuses a healthy reader for a function nobody wants).
+#
+# ⛔ THE FIRST VERSION OF THIS ARM COMPARED TEXTUAL MENTIONS, NOT CALLS, AND THE REVIEWER SHOWED FOUR WAYS
+# THROUGH IT (round 38, P2) — each one is closed below, and the residual is stated rather than implied:
+#   * a name mentioned only inside an emitted `_say` STRING counted as a "call" -> emitted text is no
+#     longer scanned AS text: for `_say` lines only the `$( … )` COMMAND SUBSTITUTIONS are scanned (the
+#     first cut excluded `_say` lines wholesale, which dropped `repo_set_file`, whose only call sites in
+#     this wrapper ARE inside `_say "… $(repo_set_file) …"` — a false red the round-38 verifier measured
+#     at 176/2 before it was fixed);
+#   * `grep -oE '[a-z_]+'` truncated `_rs_strip2` to `_rs_strip` (a probed name) -> the character class
+#     allows digits, so a name is never silently shortened into one that IS in the list;
+#   * a TRAILING comment on a code line both reddened the arm and could smuggle a name in -> trailing
+#     ` # …` is stripped before the scan (no non-comment line in this wrapper contains ` #`);
+#   * a second `_reader_needs=` assignment was invisible to both `head -1` and the exclusion -> the arm
+#     now requires EXACTLY ONE such line, which is also what makes the exclusion safe.
+# ⛔ RESIDUAL, DECLARED — and narrowed by measurement, not by wish. The scan can only see names in the
+# `repo_set_*`/`_rs_*` namespace, so a wrapper call to a helper named outside it would be invisible, and
+# omitting that helper from the list would not be caught. Two things bound it: `f11f` pins that every
+# function the READER defines is inside that namespace, so such a helper could only be a reader function
+# named against the reader's own scheme; and the mirror case (listing a name nothing calls or the reader
+# lacks) DOES redden — f11e for "probe without a call", and the guard itself then refuses every pass.
+_probe_nlist="$(grep -cE '^_reader_needs=' "$WRAPPER")"
+_probe_list="$(grep -E '^_reader_needs=' "$WRAPPER" | cut -d'"' -f2 | tr '\n' ' ')"
+_probe_calls="$(
+  {
+    grep -vE '^[[:space:]]*#' "$WRAPPER" | sed 's/[[:space:]]#.*$//' \
+      | grep -v 'command -v' | grep -vE '^_reader_needs=' | grep -v '_say '
+    # `_say` lines contribute ONLY their command substitutions — never their literal text.
+    grep -E '_say ' "$WRAPPER" | grep -oE '\$\([^)]*\)'
+  } | grep -oE '(repo_set_[A-Za-z0-9_]+|_rs_[A-Za-z0-9_]+)' | sort -u | tr '\n' ' ')"
 _probe_miss=""; _probe_extra=""; _probe_n=0
 for _c in $_probe_calls; do
   _probe_n=$(( _probe_n + 1 ))
@@ -469,10 +494,18 @@ done
 for _c in $_probe_list; do
   case " $_probe_calls " in *" $_c "*) : ;; *) _probe_extra="$_probe_extra $_c" ;; esac
 done
-ck "f11e the SOURCED guard's list EQUALS the reader functions this wrapper CALLS (a call without a probe, or a probe without a call, reddens)" \
-   '[ -z "$_probe_miss" ] && [ -z "$_probe_extra" ]'
+ck "f11e the SOURCED guard's list EQUALS the reader functions this wrapper CALLS (a call without a probe, a probe without a call, or a second list line all redden)" \
+   '[ "$_probe_nlist" = 1 ] && [ -z "$_probe_miss" ] && [ -z "$_probe_extra" ]'
 ck "f11e-0 …and that scan is non-vacuous: it really did find the nine names (an empty scan would pass f11e silently)" \
    '[ "$_probe_n" -ge 9 ]'
+# ⛔ THE NAMESPACE f11e SCANS IS NOT AN ASSUMPTION, IT IS PINNED (round 38, P2). `f11e` can only see calls
+# whose name starts `repo_set_` or `_rs_`; if the reader ever defined a helper outside that scheme, a call
+# to it would be invisible to the scan and the guard could omit it silently. Every function `repo-set.sh`
+# defines is checked here, so the scan's scope is a fact about the reader rather than a hope about it.
+_reader_defs="$(grep -cE '^[A-Za-z_][A-Za-z0-9_]*\(\)' "$READER")"
+_reader_odd="$(grep -oE '^[A-Za-z_][A-Za-z0-9_]*\(\)' "$READER" | sed 's/()$//' | grep -vE '^(repo_set_|_rs_)' | tr '\n' ' ')"
+ck "f11f every function the READER defines is in the repo_set_/_rs_ namespace f11e can see (and the scan found them)" \
+   '[ "$_reader_defs" -ge 15 ] && [ -z "$_reader_odd" ]'
 # ⛔ THE DEGRADED PATH MUST NOT CLAIM TO GRADE WHEN IT CANNOT NAME A REPO (review round 2, P1). The
 # doctor's REPO-only arm raises when the checkout's `origin` proves nothing — the TCC shape on the
 # default macOS install — so `f4`'s stub (which echoes argv) would pass on a wrapper that dies in

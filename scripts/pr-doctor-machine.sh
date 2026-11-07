@@ -156,10 +156,25 @@ for _need in $_reader_needs; do
 done
 if [ -n "$_reader_missing" ]; then
   _say "REFUSING — $READER cannot be used by this wrapper; it does not provide: $_reader_missing"
-  _say "  Three shapes land here, and the repair is the same for all of them: a reader that is"
-  _say "  unreadable, one truncated mid-file, or an OLDER reader than this wrapper — the state the"
-  _say "  farm deliberately leaves behind when a copy fails (\`COPY/RENAME FAILED … leaving any"
-  _say "  previous copy in place\`). Nothing ran."
+  # ⛔ NO UNESCAPED BACKTICKS IN AN EMITTED LINE (round 38, P1; the co-working lane fixed the same two
+  # lines independently — both escapes are kept, one is redundant and harmless). Both of these were
+  # double-quoted with raw backticks around the quoted farm message, so bash ran
+  # `COPY/RENAME FAILED … leaving any` as a COMMAND: every refusal printed
+  #   /path/pr-doctor-machine.sh: line N: COPY/RENAME: No such file or directory
+  # and the sentence lost the one clause that says the farm left an OLDER copy behind — i.e. the
+  # explanation this guard exists to give. It also executed a relative path in the job's cwd (the unit
+  # sets no WorkingDirectory, so `/`), which is why this is P1 and not a typo. The arms could not see
+  # it: bash reports a slash-bearing name as `No such file or directory`, and they only looked for
+  # `command not found`. They look for both now, and `f11b2` pins the log string verbatim.
+  # ⛔ AND THE SHAPES ARE NOT COUNTED (round 38, P2). This said "Three shapes land here" and then named
+  # three that did not include a reader that is present, readable and simply NOT SHELL — which the text
+  # it replaced did name, and which `check-farm-drift.sh` exists for. "Not shell at all" is in the list
+  # now and the count is gone, because a count in a refusal is a claim about the world that nothing
+  # re-checks when a fourth shape appears.
+  _say "  The shapes that land here share one repair: a reader that is unreadable, one that is not"
+  _say "  shell at all, one truncated mid-file, or an OLDER reader than this wrapper — the last being"
+  _say "  the state the farm deliberately leaves behind when a copy fails"
+  _say "  (\`COPY/RENAME FAILED … leaving any previous copy in place\`). Nothing ran."
   _say "  Repair the farm: re-run pi-bootstrap/setup.sh — its \`lib_srcs\` declares repo-set.sh."
   exit 2
 fi
