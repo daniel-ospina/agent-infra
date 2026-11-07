@@ -1306,7 +1306,8 @@ ck "A83 [RED→GREEN] the FLOOR TERM is hard-capped at the 30-day literal, so a 
 # bounds are written down rather than left to the next reader.
 #   * It does NOT change the run's polarity. An absent fixture was ALREADY a red run: A84 greps the prune
 #     output for the literal `pruned … refs/claims/pr-3236`, which a never-planted ref cannot produce, so
-#     A84 was the run-level red all along (`[ "$FAIL" -eq 0 ]`, :1947).
+#     A84 was the run-level red all along (the suite's own last command, `[ "$FAIL" -eq 0 ]` — cited by
+#     its TEXT, not a line number, which is what rotted the first draft of this pointer)
 #   * It does NOT stop A84/A85 running. The suite is `set -u`, NOT `set -e` (:69), and `ck` only increments
 #     FAIL (:275-282) — there is no early exit, so both rows still execute.
 #   * It DOES move the failure to a SETUP row whose message NAMES the seed, instead of surfacing as an A84
