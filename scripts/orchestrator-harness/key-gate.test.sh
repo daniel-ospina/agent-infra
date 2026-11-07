@@ -767,7 +767,7 @@ OUT="$(run_gate "$HMYL" MYV=sk_myv KG_PROV=myprov KG_MODEL=m1)"; RC="$(printf '%
 ck "3y18 an UNSHIPPED provider with oauth and no baseUrl is REFUSED (rc=${RC:-<none>})" \
    "$([ "${RC:-0}" = "82" ] && echo 0 || echo 1)"
 has "$OUT" "reason=models-json-provider-dropped why=oauth-no-baseurl" \
-    "3y18b \u2026naming the shape, because the remedy is the baseUrl"
+    "3y18b …naming the shape, because the remedy is the baseUrl"
 # ⛔ AN `oauth` PROVIDER'S BASE IS REPLACED, SO A VENDOR BUILT-IN IS **NOT** AUTOMATICALLY UNAFFECTED (round 29, P2,
 # measured): `configureRadiusProviders` swaps the built-in catalog for a gateway provider that is EMPTY until a refresh,
 # so `findModelDefaults` has nothing to compose from, the throw deletes the config, and `pi -p` answers `Unknown
@@ -1171,12 +1171,12 @@ HMY="$(mkset pin_myprov '{"providers":{"myprov":{"apiKey":"$MYV","models":[{"id"
 OUT="$(run_box_at "$HMY" "$T/nocwd" MYV=sk_myv)"; rc="$(rc_of "$OUT")"
 ck "8z43 a PIN of an UNSHIPPED provider with an unbuildable definition is REFUSED (rc=${rc:-<none>})" \
    "$([ "${rc:-0}" = "82" ] && echo 0 || echo 1)"
-has "$OUT" "reason=models-json-provider-dropped" "8z44 \u2026with the file-level reason, because pi deletes the provider"
+has "$OUT" "reason=models-json-provider-dropped" "8z44 …with the file-level reason, because pi deletes the provider"
 HMY2="$(mkset pin_myprov_oauth '{"providers":{"myprov":{"apiKey":"$MYV","oauth":"radius"}}}' '{"defaultProvider":"myprov","defaultModel":"m1"}')"
 OUT="$(run_box_at "$HMY2" "$T/nocwd" MYV=sk_myv)"; rc="$(rc_of "$OUT")"
-ck "8z45 \u2026and so is one whose provider sets oauth with no baseUrl (rc=${rc:-<none>})" \
+ck "8z45 …and so is one whose provider sets oauth with no baseUrl (rc=${rc:-<none>})" \
    "$([ "${rc:-0}" = "82" ] && echo 0 || echo 1)"
-has "$OUT" "why=oauth-no-baseurl" "8z46 \u2026naming that shape, so the remedy is the baseUrl"
+has "$OUT" "why=oauth-no-baseurl" "8z46 …naming that shape, so the remedy is the baseUrl"
 # A provider whose credential needs more than one value warns: the pin is NOT refused, because a false 82 on a box
 # that would run costs a lane and this gate cannot tell.
 HSB3="$(mkset boxazure ABSENT '{"defaultProvider":"azure","defaultModel":"gpt-4o"}')"
@@ -1834,7 +1834,7 @@ for _op in radius openai github-copilot kimi-coding meta openai-codex openrouter
   printf '{"%s":{"type":"oauth","access":"a","refresh":"r"}}\n' "$_op" > "$HROP/.pi/agent/auth.json"
   OUT="$(run_gate "$HROP" KG_PROV="$_op")"; RC="$(printf '%s\n' "$OUT" | sed -n 's/^RC=//p' | head -1)"
   eqv "${RC:-none}" "0" "8S4i a stored oauth entry for $_op is not refused \u2014 pi ships that handler (rc=${RC:-none})"
-  hasnt "$OUT" "auth-store-oauth-unusable" "8S4j \u2026so the no-handler reason never fires for $_op"
+  hasnt "$OUT" "auth-store-oauth-unusable" "8S4j …so the no-handler reason never fires for $_op"
 done
 # `key: null` is PRESENT, and pi dies on it before any lookup (measured: `Credential store read failed for
 # <provider>: Cannot read properties of null (reading \x27startsWith\x27)`), so it is store-invalid rather than the
