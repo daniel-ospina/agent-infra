@@ -506,11 +506,15 @@ brief_gate_previous_work() { # brief_gate_previous_work <file|-> [repo] [role]
     case "$head" in
       issue-"<"*">"*|pr-"<"*">"*)
         # ⛔ THE TAIL IS WHAT FOLLOWS THE BRACKET CLOSE, NOT WHAT FOLLOWS THE ARROW (review of #3621,
-        # cycle 8, P2). Deriving it from `head` (the text up to the arrow) threw the claim away whenever
-        # there was NO arrow: `issue-<4242> refs/wip/issue-4242-first-attempt` left `tail` empty, `claim`
-        # empty, and an HONEST brief was refused with "read the ref you already named". Cutting at the
-        # bracket handles both spellings; an UNTERMINATED bracket leaves no trustworthy claim text and is
-        # treated as an absence claim, which is the fail-closed direction.
+        # cycle 8, P2). ⛔ THE MECHANISM BELOW WAS STATED BACKWARDS UNTIL CYCLE 12 AND IS NOW MEASURED:
+        # the ARROWED spelling is the one that breaks, NOT the arrow-less one. `head` stops at the arrow,
+        # so deriving the tail from it truncates the claim on `issue-<4242> -> refs/wip/<ref>` to a bare
+        # space, leaving `claim` empty and REFUSING an honest brief with "read the ref you already
+        # named" (measured: shipped rc 0 → 80 under `${head#*>}`, reddening H55d and all four H57c
+        # spellings). The ARROW-LESS spelling is INERT under that same mutant — with no arrow `head` IS
+        # the whole value, so H62 stays green and must NOT be cited as its proof (cycle 12 review).
+        # Cutting at the bracket handles both spellings; an UNTERMINATED bracket leaves no trustworthy
+        # claim text and is treated as an absence claim, which is the fail-closed direction.
         after="${nval#*-<}"
         inner="${after%%>*}"
         # `after` always contains a `>` here — the arm was entered on `head`, which already held one, and
@@ -528,14 +532,18 @@ brief_gate_previous_work() { # brief_gate_previous_work <file|-> [repo] [role]
           #    refuse its own advice). The coverage limit is therefore "no digit inside the key's first
           #    bracket", not "no number anywhere in the value" — a number OUTSIDE the bracket (`issue-<x>
           #    4242`) leaves the key unparsable and the value is treated as the slot.
-          # 3. The number is joined to the tail WITH A SEPARATOR, and it IS load-bearing at this head
-          #    (review of #3621, cycle 9 corrected this paragraph; cycle 8's "the separator alone changes
-          #    nothing" was written against the OLD tail derivation and is false now): `tail` keeps
-          #    `4242> -> none (…)`, so without the separator the key really is `42424242` and H61 reddens
-          #    (measured: base 80 → separator-revert 0). The two lines are a PAIR — the same revert of
-          #    `tail` alone is inert here (`${nval#*>}` ≡ `${after#*>}`, since `after` always holds the
-          #    bracket close), and the shape that motivates both is the cycle-4/5 one, where `tail` was
-          #    derived from `head` and threw away an ARROW-LESS claim (H62 pins that).
+          # 3. The number is joined to the tail WITH A SEPARATOR, and it IS load-bearing — on ONE carrier
+          #    shape, which has to be NAMED or the attribution reads as false (cycle 12 review tried the
+          #    revert on `issue-<4242> -> none`, whose tail already BEGINS with the arrow's space, found it
+          #    inert, and reported the citation as non-reproducing — that is simply not the carrier).
+          #    The carrier is a number glued DIRECTLY after the closing bracket, i.e. H61's own
+          #    `issue-<4242>4242> -> none`: there `tail` is `4242> -> none (…)`, so without the separator
+          #    the key is the CONCATENATION `42424242` — a key that does not exist — and the contradicted
+          #    claim is ADMITTED (measured: base 80 → separator-revert 0, reddening
+          #    H61['issue-<4242>4242>'] and nothing else in the suite). The two lines are a PAIR: the
+          #    revert of `tail` alone is INERT here (`${nval#*>}` ≡ `${after#*>}`, since `after` always
+          #    holds the bracket close). What `tail`'s derivation decides is the ARROWED spelling — item 1
+          #    above, H55d/H57c — not the arrow-less one.
           issue-*) if [ -n "$num" ]; then nval="issue-$num $tail"; else nval="issue-slot"; fi ;;
           *)       if [ -n "$num" ]; then nval="pr-$num $tail";    else nval="pr-slot";    fi ;;
         esac ;;
@@ -558,9 +566,17 @@ brief_gate_previous_work() { # brief_gate_previous_work <file|-> [repo] [role]
       issue-slot)  : ;;
       pr-slot)     case "$role" in fixer|reviewer) : ;; *) unkeyed=1 ;; esac ;;
       pr-[0-9]*)   case "$role" in fixer|reviewer) : ;; *) unkeyed=1 ;; esac ;;
+      # ⛔ ANY WHITESPACE SEPARATES `keyless` FROM ITS REASON — NOT JUST A SPACE (cycle 12 review, P2).
+      # This arm required a literal space, so `keyless<TAB>— why` was classified UNKEYED and refused with
+      # a diagnostic about the key, for a brief whose key is the documented THIRD form and is correct. The
+      # SHAPE parser already accepted it (`^keyless[ \t]+[^ \t]`), so the two readers disagreed and the
+      # narrower one produced a NEW false block — measured on byte-identical briefs: `origin/main` rc 0,
+      # the cycle-11 head rc 80. The predicate below is that shape parser's own, whitespace-general —
+      # separator, then real text after it — so `keyless`, `keyless   ` and `keylessfoo` all stay
+      # REFUSED, the direction that matters. H51c/H51d are the rows.
       keyless*)
         rest="${nval#keyless}"
-        case "$rest" in ' '?*) : ;; *) unkeyed=1 ;; esac ;;
+        case "$rest" in [[:space:]]*[![:space:]]*) : ;; *) unkeyed=1 ;; esac ;;
       *) unkeyed=1 ;;
     esac
     [ -n "$issue" ] || continue
