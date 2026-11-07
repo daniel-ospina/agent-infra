@@ -1022,10 +1022,10 @@ EOF
     expected="$(printf '%s\n' "$parsed" | awk -F'\t' 'NF{print $1 "=" $2}')"
     diverged="$(_rs_split_divergence "$rendered" "$expected")"
   else
-    printf 'repo-set: WARN WHOLE-SET-PROOFS-SKIPPED — the two set-level proofs (the doctor splitter round-trip and `set_tag_collisions`) could NOT be run: pr-doctor.py is not beside this reader, or no python3 resolves, or it would not LOAD. The per-line arms still ran; this verdict is INCOMPLETE and says so.\n'
+    printf 'repo-set: WARN WHOLE-SET-PROOFS-SKIPPED — the two set-level proofs (the doctor splitter round-trip and `set_tag_collisions`) could NOT be run: pr-doctor.py is not beside this reader, or no python3 resolves. The per-line arms still ran; this verdict is INCOMPLETE and says so.\n'
   fi
   if [ "$diverged" = "__UNASKABLE__" ]; then
-    printf 'repo-set: WARN WHOLE-SET-PROOFS-SKIPPED — `configured_repos()` could not be asked (the sibling pr-doctor.py lacks it, or it raised), so the splitter round-trip did NOT run. The per-line arms still ran; this verdict is INCOMPLETE and says so.\n'
+    printf 'repo-set: WARN WHOLE-SET-PROOFS-SKIPPED — `configured_repos()` could not be asked (the sibling pr-doctor.py lacks it, or it raised, or it would not LOAD), so the splitter round-trip did NOT run. The per-line arms still ran; this verdict is INCOMPLETE and says so.\n'
     diverged=""
   fi
   if [ -n "$diverged" ]; then
@@ -1044,7 +1044,7 @@ EOF
     # STATE — one register, one worker name, one cooldown for two repos — so a silent pass here is
     # strictly worse than a loud one. It WARNS rather than refuses, the same rule as the splitter
     # round-trip: a broken/absent sibling is not a fact about the set.
-    printf 'repo-set: WARN WHOLE-SET-PROOFS-SKIPPED — `set_tag_collisions()` could not be asked (the sibling pr-doctor.py lacks it, or it raised), so the tag-collision proof did NOT run; a TAG collision between repos in this set would go undetected. The per-line arms still ran; this verdict is INCOMPLETE and says so.\n'
+    printf 'repo-set: WARN WHOLE-SET-PROOFS-SKIPPED — `set_tag_collisions()` could not be asked (the sibling pr-doctor.py lacks it, or it raised, or it would not LOAD), so the tag-collision proof did NOT run; a TAG collision between repos in this set would go undetected. The per-line arms still ran; this verdict is INCOMPLETE and says so.\n'
   elif [ -n "$tagwhy" ]; then
     printf 'repo-set: REFUSED set — %s\n' "$tagwhy"
     bad=1

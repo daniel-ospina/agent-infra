@@ -37,6 +37,14 @@ REPO_ROOT="$(cd "$HERE/../.." && pwd)"
 # shell (`bash < repo-set.test.sh`) leaves `BASH_SOURCE[0]` unbound, and under `-u` that is an error
 # before a single arm runs — the shard would red on the HARNESS, not on the behaviour.
 set -u
+# ⛔ HERMETIC AGAINST THE REPO'S OWN SEAM ENV (round 31, P2). The wrapper reads PR_DOCTOR_REPO,
+# PR_DOCTOR_REPO_DIR, OR and REPO from the AMBIENT environment, and an operator running this suite in a
+# shell that follows the bootstrap's "export REPO=<checkout>" step saw 6-12 arms go red on a suite that
+# is correct — and the arm to "fix" then is the one being weakened. Measured with each var exported
+# alone: OR -> 8 FAILs, REPO -> 6, PR_DOCTOR_REPO -> 12, PR_DOCTOR_REPO_DIR -> 2. `run-bash-shards.sh`
+# scrubs only its OWN vars, so a caller's env reaches a shard. `orchestrator-bringup.test.sh` does the
+# equivalent with `env -i` for exactly this reason.
+unset OR REPO PR_DOCTOR_REPO PR_DOCTOR_REPO_DIR
 READER="$HERE/repo-set.sh"
 WRAPPER="$REPO_ROOT/scripts/pr-doctor-machine.sh"
 PLIST="$REPO_ROOT/templates/launchd/com.tortoise.pr-doctor.plist"
