@@ -749,6 +749,7 @@ def decide(
     main_signatures: dict[str, frozenset[str]] | None = None,
     rotating: dict[str, frozenset[str]] | None = None,
     k_pr: int | None = None,
+    rotation_legacy: bool = False,
 
     # THE RATE TOLERANCE — owner-authorized "Option B" on tortoise #3756, whose deferred
     # residual is PARTLY CLOSED by the TOTAL-failure guard below.
@@ -883,6 +884,25 @@ def decide(
             decision.blocked.append(Verdict(
                 nodeid, True,
                 f"PR rate is unmeasurable ({pr.rate}) — NOT exempt"))
+            continue
+
+        # ⛔ THE EVIDENCE-FORM ARM MUST PRECEDE THE E5 TEST ITSELF (#3686 review
+        # cycle 6, P1). A tab-free (pre-#3686) per-run line CANNOT represent an id
+        # containing a space — the space split shreds it, so the real id is in no
+        # run set and the test five lines below is structurally blind to it. That
+        # is a limit of the WIRE FORM, not of the id, and before #3686 it did not
+        # matter (both doors rejected such an id). Now that the id is
+        # representable on the rate side, falling through to the rate comparison
+        # would EXEMPT an identity that may have MOVED — the fail-open direction.
+        # UNATTRIBUTABLE is the only correct verdict for evidence that cannot see
+        # the id: it gates, and it says why.
+        if rotation_legacy and any(ch.isspace() for ch in nodeid):
+            decision.unattributable.append(Verdict(
+                nodeid, True,
+                "UNATTRIBUTABLE: the per-run evidence is the pre-#3686 TAB-FREE "
+                "form, which cannot represent an id containing whitespace — the "
+                "space shreds it, so a MOVING identity is invisible to the "
+                "rotation guard and this id cannot be exempted on that evidence"))
             continue
 
         # Required class E5 — ROTATING IDENTITY, checked FIRST. An id whose class was
@@ -2788,7 +2808,49 @@ def parse_signature_rows(text: str) -> dict[str, frozenset[str]]:
     return {k: frozenset(v) for k, v in out.items()}
 
 
-def parse_rotation_runs(text: str) -> list[frozenset[str]]:
+class RotationRuns(list):
+    """``list[frozenset[str]]`` PLUS the wire FORM that produced it.
+
+    ⛔ THE FORM IS PART OF THE EVIDENCE, NOT A TRANSPORT DETAIL (#3686 review
+    cycle 6, P1). The tab-free fallback in :func:`parse_rotation_runs` keeps a
+    pre-#3686 producer's line parsing the way it always did — but that form CANNOT
+    represent an id containing a space: space-splitting shreds
+    ``…[argv14-at the EDGE]`` into ``…[argv14-at`` + ``the`` + ``EDGE]``, so the
+    real id sits in NO run set and :func:`detect_rotating_identity` can never
+    report it.
+
+    Before #3686 that was harmless, because both doors REJECTED such an id, so it
+    could not be exempted either way. After it, the id is representable on the
+    RATE side — so a shredded rotation line turns a previously fail-CLOSED
+    refusal (BLOCK, absent from main's set) into a silent EXEMPT for an identity
+    that provably MOVED, which is the one class the rail states may never merge.
+    ``legacy_lines`` is how :func:`decide` learns the evidence could not see the
+    id, so it refuses to exempt it.
+
+    A plain list was not enough: the caller cannot tell the two forms apart from
+    the parsed sets alone, which is exactly the ambiguity that made the failure
+    silent.
+    """
+
+    __slots__ = ("legacy_lines", "tab_lines")
+
+    def __init__(
+        self,
+        runs=(),
+        *,
+        legacy_lines: int = 0,
+        tab_lines: int = 0,
+    ) -> None:
+        super().__init__(runs)
+        self.legacy_lines = legacy_lines
+        self.tab_lines = tab_lines
+
+    @property
+    def has_legacy_lines(self) -> bool:
+        return self.legacy_lines > 0
+
+
+def parse_rotation_runs(text: str) -> RotationRuns:
     """Per-run id sets, one run per non-blank line, ids TAB-separated.
 
     ⛔ TAB, NOT WHITESPACE (#3686 second door). A pytest parameter legitimately
@@ -2805,15 +2867,31 @@ def parse_rotation_runs(text: str) -> list[frozenset[str]]:
     carrying no tab is still read the old way. That is deliberate: an older
     producer (or ``ADMIN_MERGE_FAILURE_SET_SH`` pointing at one) would otherwise
     be re-parsed as ONE giant id per run, which is a second, quieter way to
-    blind E5. The fallback keeps old input meaning what it always meant.
+    blind E5.
+
+    ⛔ BUT THE FALLBACK DOES **NOT** KEEP OLD INPUT MEANING WHAT IT ALWAYS MEANT
+    (review cycle 6, P1 — that sentence stood here and was false). It keeps the
+    PARSE the same and flips the VERDICT: for a space-carrying id the old world
+    BLOCKED it (both doors rejected the shape), while this world — where the id
+    is representable on the rate side — would EXEMPT it, because the shredded
+    identity is invisible to E5. So the counts ride back with the sets (see
+    :class:`RotationRuns`) and ``decide`` refuses to exempt a
+    whitespace-carrying id when any line took this branch.
     """
     runs: list[frozenset[str]] = []
+    legacy_lines = 0
+    tab_lines = 0
     for raw in text.splitlines():
         if not raw.strip():
             continue
-        ids = raw.split("\t") if "\t" in raw else raw.split()
+        if "\t" in raw:
+            ids = raw.split("\t")
+            tab_lines += 1
+        else:
+            ids = raw.split()
+            legacy_lines += 1
         runs.append(frozenset(i for i in ids if i))
-    return runs
+    return RotationRuns(runs, legacy_lines=legacy_lines, tab_lines=tab_lines)
 
 
 def render_signature_table(signatures: dict[str, frozenset[str]]) -> str:
@@ -3013,11 +3091,8 @@ def _cmd_decide(args: argparse.Namespace) -> int:
         if args.main_signatures
         else {}
     )
-    rotating = (
-        detect_rotating_identity(parse_rotation_runs(_read(args.rotation)))
-        if args.rotation
-        else {}
-    )
+    rotation = parse_rotation_runs(_read(args.rotation)) if args.rotation else None
+    rotating = detect_rotating_identity(rotation) if rotation is not None else {}
 
     decision = decide(
         pr.failures,
@@ -3027,6 +3102,9 @@ def _cmd_decide(args: argparse.Namespace) -> int:
         k_pr=max((f.rate.runs for f in pr.failures.values()), default=None),
         rate_tolerance=args.rate_tolerance,
         min_runs=args.min_runs,
+        # #3686 review cycle 6: a TAB-FREE line cannot represent a spacey id, so
+        # E5 cannot see one. Decide refuses to exempt those on such evidence.
+        rotation_legacy=bool(rotation is not None and rotation.has_legacy_lines),
     )
 
     lines = [v.line for v in decision.blocked]

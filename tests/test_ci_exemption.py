@@ -1167,18 +1167,83 @@ def test_a_SPACE_PARAMETRIZED_ROTATING_identity_is_UNATTRIBUTABLE_not_EXEMPT():
     )
 
 
+def test_a_LEGACY_TAB_FREE_rotation_line_cannot_license_a_spacey_EXEMPT():
+    r"""⛔ THE FALLBACK'S VERDICT FLIP — the P1 review cycle 6 measured.
+
+    Keeping the tab-free parse was justified as "old input keeps meaning what it
+    always meant". It does not: the PARSE is the same, the VERDICT is not. Before
+    #3686 a spacey id was BLOCKED (both doors rejected the shape); after it the id
+    is representable on the rate side, so a tab-free per-run line — which shreds
+    the id and leaves E5 structurally blind to it — would EXEMPT an identity that
+    may have MOVED, the one class the rail may never merge.
+
+    `RotationRuns.has_legacy_lines` is how the reader says so, and `decide`
+    refuses to exempt a whitespace-carrying id on that evidence. The contrast leg
+    below is the proof the arm keys on the FORM and not on the id: the SAME id on
+    TAB-form evidence is exempted normally.
+
+    MUTATION: drop the `rotation_legacy` arm from `decide` → this id is EXEMPTED
+    and the first assertion reddens.
+    """
+    moved = "tests/test_x.py::TestK::test_a[argv14-at the EDGE]"
+    sig = "sg-3686-legacy"
+    main = parse_rates(f"{moved}\t3\t26\n")
+    pr = parse_failure_rows(f"{moved}\t3\t26\t{sig}\n").failures
+
+    # The pre-#3686 producer's line: no tab, so the spacey id is shredded.
+    legacy = parse_rotation_runs("tests/other.py::test_y\n")
+    assert legacy.has_legacy_lines and not legacy.tab_lines, (
+        "the reader did not record the TAB-FREE form, so `decide` cannot refuse "
+        f"to exempt on it: tab={legacy.tab_lines} legacy={legacy.legacy_lines}"
+    )
+    guarded = decide(
+        pr, main.rates,
+        main_signatures={moved: frozenset({sig})},
+        rotating=detect_rotating_identity(legacy),
+        k_pr=26,
+        rotation_legacy=legacy.has_legacy_lines,
+    )
+    assert [v.nodeid for v in guarded.exempt] == [], (
+        "an id containing a space was EXEMPTED on TAB-FREE per-run evidence that "
+        "cannot represent it — a moving identity is invisible there, which is the "
+        f"fail-open this arm exists to refuse:\n{guarded.report()}"
+    )
+    assert [v.nodeid for v in guarded.unattributable] == [moved], guarded.report()
+
+    # CONTRAST — the same id, TAB-form evidence: exempted, so the arm is not a
+    # blanket refusal of spacey ids (which would be the over-block direction).
+    tab = parse_rotation_runs("tests/other.py::test_y\t")
+    assert not tab.has_legacy_lines and tab.tab_lines == 1
+    allowed = decide(
+        pr, main.rates,
+        main_signatures={moved: frozenset({sig})},
+        rotating=detect_rotating_identity(tab),
+        k_pr=26,
+        rotation_legacy=tab.has_legacy_lines,
+    )
+    assert [v.nodeid for v in allowed.exempt] == [moved], allowed.report()
+
+
 def test_the_ROTATION_reader_still_accepts_the_PRE_3686_space_joined_form():
-    """The tab-free form must keep meaning what it always meant.
+    """The tab-free PARSE must keep working — the FORM is now reported too.
 
     `ADMIN_MERGE_FAILURE_SET_SH` can point the rail at another producer, and an
     older one space-joins. Parsing its line as ONE giant id would blind E5 a second
     way — quietly, since no assertion would fire. A tab-free line is therefore read
     the old way, which is exactly why the producer emits a tab on EVERY line (even a
     single-id run): "no tab" unambiguously identifies the old form.
+
+    ⛔ AND THE FORM IS PART OF THE ANSWER (#3686 review cycle 6, P1). This docstring
+    used to say the fallback keeps old input "meaning what it always meant"; it kept
+    the parse and flipped the VERDICT, because a shredded spacey id is invisible to
+    E5. The reader therefore counts the lines it read each way, and `decide` refuses
+    to exempt a whitespace-carrying id when any line took the tab-free branch — see
+    `test_a_LEGACY_TAB_FREE_rotation_line_cannot_license_a_spacey_EXEMPT`.
     """
     runs = parse_rotation_runs("tests/a.py::t1 tests/a.py::t2\n")
 
     assert runs == [frozenset({"tests/a.py::t1", "tests/a.py::t2"})]
+    assert runs.legacy_lines == 1 and runs.tab_lines == 0
 
 
 def test_the_PRODUCER_and_the_READER_AGREE_on_the_rotation_wire_format(tmp_path):
