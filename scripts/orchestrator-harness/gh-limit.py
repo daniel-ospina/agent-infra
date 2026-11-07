@@ -1203,11 +1203,19 @@ def _api_endpoint_norm(argv):
     ⛔ `rate_limit?x=1` AND `rate_limit#frag` ARE THE METER. `cred_purpose` compared the raw endpoint,
     so those spellings fell through to `request` + `read` and the pace layer's own meter would have
     been answered from the INSTALLATION's remaining — the inverse of the pin's stated purpose (review
-    cycle 4). The file already strips a query string one function away (`ep.split("?")[0]`)."""
+    cycle 4). The file already strips a query string one function away (`ep.split("?")[0]`).
+
+    ⛔ AND THE QUERY/FRAGMENT IS SPLIT **BEFORE** THE SLASHES ARE STRIPPED (review). The other order
+    left `rate_limit/` behind for any endpoint carrying BOTH a trailing slash and a query/fragment, so
+    `/rate_limit/?x=1`, `rate_limit/#f`, `rate_limit/?x=1#f` and `/RATE_LIMIT/?x=1` still answered
+    `request` — and `decide()` pins only NON-`request` purposes to the user credential, so the meter
+    was answered from the INSTALLATION's remaining: the exact inversion the pin exists to prevent,
+    reached by COMBINING two spellings the enumeration varied separately. When a family is closed
+    per-axis, the cross-product is where it survives."""
     ep = api_endpoint(argv)
     if ep is None:
         return None
-    return ep.strip().strip("/").lower().split("?")[0].split("#")[0]
+    return ep.strip().split("?")[0].split("#")[0].strip("/").lower()
 
 
 def _api_has_write_shape(argv):

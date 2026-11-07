@@ -719,9 +719,16 @@ for pre, ep, pl in itertools.product(prefixes, rest_endpoints, rest_writes):
     if m.cred_kind(argv) == "read":
         bypass.append(" ".join(argv))
 # And the meter pin, under the same spellings.
+# ⛔ INCLUDING THE COMBINED ONES. Varying each axis separately missed `checkpoint+trailing slash +
+# query/fragment`: `/rate_limit/?x=1`, `rate_limit/#f`, `rate_limit/?x=1#f` and `/RATE_LIMIT/?x=1`
+# normalised to `rate_limit/` (the query was stripped AFTER the slashes) and answered `request`, so the
+# pacing layer's own meter was served from the INSTALLATION's remaining. A family closed per-axis
+# survives in the cross-product (review).
 meter_bad = []
 for pre in prefixes:
-    for ep in (["rate_limit"], ["/rate_limit"], ["RATE_LIMIT"], ["rate_limit?x=1"], ["rate_limit#f"]):
+    for ep in (["rate_limit"], ["/rate_limit"], ["RATE_LIMIT"], ["rate_limit?x=1"], ["rate_limit#f"],
+               ["/rate_limit/?x=1"], ["rate_limit/#f"], ["rate_limit/?x=1#f"], ["/RATE_LIMIT/?x=1"],
+               ["rate_limit/#f?x=1"], ["/rate_limit/#f"]):
         argv = ["api"] + pre + ep
         checked += 1
         if m.cred_purpose(argv) != "meter":
