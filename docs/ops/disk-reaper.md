@@ -976,9 +976,13 @@ an advertised `refs/heads/x/refs/heads/<b>` — ⛔ *not* because of glob metach
 rule 5 forbids `?`, `*` and `[` in a refname, so no branch name can widen the match that way), and the
 remote is the **longest configured remote name** prefixing the ref, not the first path
 segment (a remote name may contain a slash). Any failure, timeout, empty answer, unadvertised
-refname or different sha leaves the verdict where it was — `remote-only-ref`, PRESERVE — and a
-TRANSPORT failure is remembered for the rest of the pass so a dead remote costs one timeout,
-not one per candidate. The row is `remote-holds:<remote>/<branch>`, and — like
+refname or different sha at **classification** leaves the verdict where it was — `remote-only-ref`,
+PRESERVE — and a TRANSPORT failure is remembered for the rest of the pass so a dead remote costs one
+timeout, not one per candidate. ⛔ At **removal** the preserve verdict is different and the operator
+will see it: a `remote-holds` row whose targeted re-probe can no longer re-prove the head is kept as
+**`remote-holds-stale`** (`remote_holds_recheck`, taken twice — at classification and again
+immediately before the fork). Treat that as "the remote moved under us": the checkout is intact, the
+archive is kept, and the commit is what to look at, not the checkout. The row is `remote-holds:<remote>/<branch>`, and — like
 `remote-only-ref` — it does **NOT** block the end-of-pass prune: a `remote-holds` row is reached
 only when the commit is held by `refs/remotes/<remote>/<branch>` (the probe runs on that very ref),
 so the admin `HEAD` is not the commit's last durable handle, and the F17 window (a record that

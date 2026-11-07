@@ -3075,7 +3075,17 @@ _hr_line="$(grep -n 'holder_recheck "\$path" "\$sha" ||' "$REAPER" | tail -1 | c
 _fork_line="$(grep -n 'worktree remove "\$path"' "$REAPER" | head -1 | cut -d: -f1)"
 if [ -n "$_pa_line" ] && [ -n "$_hr_line" ] && [ -n "$_fork_line" ] \
         && [ "$_pa_line" -lt "$_hr_line" ] && [ "$_hr_line" -lt "$_fork_line" ]; then
-    ok "A21e the post-archive re-check runs BEFORE holder_recheck, which stays last before the fork"
+    # ⛔ AND IT IS THE LAST CODE LINE, NOT MERELY BELOW THE POST-ARCHIVE GATE (#3371 review cycle 4,
+    # P2). Cycle 3 inserted `remote_holds_recheck` — two bounded forks, up to ~40 s — BETWEEN
+    # `holder_recheck` and the fork, and this arm stayed GREEN because it only compared three line
+    # numbers. That is the exact regression the arm exists to prevent, so the property is pinned now:
+    # nothing but comments, blanks and braces may sit between the liveness probe and the fork.
+    _between="$(sed -n "$((_hr_line + 1)),$((_fork_line - 1))p" "$REAPER" 2>/dev/null | grep -vE '^[[:space:]]*(#|$)' || true)"
+    if [ -z "$_between" ]; then
+        ok "A21e the post-archive re-check runs BEFORE holder_recheck, which stays the LAST code line before the fork"
+    else
+        bad "A21e a probe sits between holder_recheck and the fork, so the last liveness read is no longer last: $(printf '%s' "$_between" | head -2 | tr '\n' ' ')"
+    fi
 else
     bad "A21e gate ORDER regressed: post-archive=$_pa_line holder_recheck=$_hr_line fork=$_fork_line"
 fi
@@ -5095,7 +5105,7 @@ OUT="$(FAKE_ADV_LINE="$A26G5_SHA	refs/heads/feat/a26g5" GIT_BIN_OVERRIDE="$T/bin
 assert_contains "$(row_for "$OUT" "$T/$ENV-det")" "reason=remote-holds:upstream/feat/a26g5" \
     "A26g5 the row is classified from the START-OF-PASS advertisement (the snapshot is real evidence for a CLASSIFICATION)"
 assert_contains "$OUT" "remote-holds-stale" \
-    "A26g5 …and the removal is refused at the fork, because the targeted re-probe no longer finds the head"
+    "A26g5 …and the removal is refused by the targeted re-probe at CLASSIFICATION (this shim answers every targeted probe with nothing, so remove_one is never entered — the fork arm is the declared residual, not what this line measures)"
 if [ -d "$T/$ENV-det" ]; then
     ok "A26g5 the checkout is STILL ON DISK — a stale snapshot never destroys the last durable handle"
 else

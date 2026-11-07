@@ -2435,8 +2435,10 @@ path_ctime() {
 # pass's cost grew with the number of `remote-only-ref` rows. MEASURED on cmux/cell-3, 2026-11-07,
 # against tortoise's real origin (2,111 heads): 12 targeted probes = 7.54 s wall (0.63 s each),
 # the remote's WHOLE head advertisement = 0.56 s. REAP_WT_GIT_TIMEOUT is 20 s, so FIFTEEN
-# candidates that each hit the bound is the entire REAP_WT_BUDGET_SECONDS=300 budget — the tail
-# then DEFERS, PRUNE_BLOCKED=1, and an armed pass reclaims nothing. That is "the reaper cannot
+# candidate probes that each hit the bound is the entire REAP_WT_BUDGET_SECONDS=300 budget — the tail
+# then DEFERS, PRUNE_BLOCKED=1, and an armed pass reclaims nothing. ⛔ AND A REMOVAL NOW PAYS TWO
+# TARGETED PROBES (classification, then the fork re-check), so ~7-8 `remote-holds` removals that each
+# hit the bound are the whole budget, not fifteen. That is "the reaper cannot
 # finish a pass" reached from the cost side, with no single gate wrong. The advertisement is cached
 # per pass (`remote_advertise`) and a TRANSPORT failure is still remembered (`remote_mark_dead`),
 # so a dead remote costs one timeout rather than one per candidate.
@@ -2532,8 +2534,14 @@ remote_advertise() { # <remote> -> 0 when that remote's `refs/heads/*` snapshot 
     # `remote_is_dead` would answer 1 and the matcher would read the torn snapshot after all — a
     # closure that needs a write to succeed immediately after a write failed is not a closure. A
     # truncate needs no free space (it RELEASES blocks), so `: >file` is the one operation that still
-    # works on the box this matters on. It discards EVERY remote's snapshot, not just this one; the
-    # others are simply re-advertised, which is cost, never safety.
+    # works on a FULL disk. It discards EVERY remote's snapshot, not just this one; the others are
+    # simply re-advertised, which is cost, never safety.
+    # ⛔ STATED RESIDUAL (#3371 review cycle 4, P2): this closure holds under ENOSPC. It does NOT hold
+    # under EROFS/EIO — a tmpdir remounted read-only after an I/O error fails the truncate too, and
+    # then the file keeps `R <remote>` plus its torn `A` lines while `remote_mark_dead` also fails
+    # silently. Closing THAT needs the reader not to depend on any write succeeding (a marker written
+    # LAST carrying the count of the lines it summarises, so a torn set fails the count and PRESERVEs).
+    # Do not read the paragraphs above as a proof immune to a read-only filesystem.
     # ⛔ And without the mark-dead, truncation alone re-probes once per candidate (the retry storm):
     # truncate = safe, mark-dead = cheap, and they do not share a failure mode.
     if ! printf 'R %s\n' "$remote" >>"$REMOTE_ADV_FILE" 2>/dev/null; then
@@ -2637,14 +2645,16 @@ remote_holds_recheck() { # <path> <sha> <reason> [phase] -> 0 to proceed, 2 to P
     branch="${rest#"$best"/}"
     [ -n "$branch" ] || return 2
     run_bounded "$REAP_WT_GIT_TIMEOUT" "$GIT_OUT" "$GIT_BIN" -C "$REPO_CANON" \
-        ls-remote --heads "$best" "refs/heads/$branch"
+        ls-remote --heads "$best" "refs/heads/$branch"; rc=$?
     # ⛔ A TRANSPORT FAILURE IS REMEMBERED, exactly as the classification probe remembers it (#3371
     # review cycle 2, P2). Without this a remote that dies mid-pass costs REAP_WT_GIT_TIMEOUT (20 s)
-    # PER `remote-holds` REMOVAL — fifteen of which are the whole REAP_WT_BUDGET_SECONDS=300, so the
-    # tail DEFERs, PRUNE_BLOCKED=1, and an armed pass reclaims nothing: the F7/#3371 state this file
-    # argues against. ⛔ ONLY a non-zero rc marks it dead: a branch DELETED on the remote answers rc 0
+    # PER `remote-holds` REMOVAL — seven or eight of which are now the whole
+    # REAP_WT_BUDGET_SECONDS=300, because a removal pays TWO targeted probes (classification and fork),
+    # so the tail DEFERs, PRUNE_BLOCKED=1, and an armed pass reclaims nothing: the F7/#3371 state this
+    # file argues against. ⛔ `rc` IS CAPTURED ON THE LINE AFTER THE CALL (#3371 review cycle 4, P3):
+    # the invariant "only a non-zero rc marks it dead" is exactly what a future edit in between would
+    # break silently. ⛔ ONLY a non-zero rc marks it dead: a branch DELETED on the remote answers rc 0
     # with an empty advertisement, which is a legitimate "not advertised" => preserve, never "dead".
-    rc=$?
     if [ "$rc" != 0 ]; then
         remote_mark_dead "$best"
         return 2
@@ -4643,22 +4653,26 @@ remove_one() {
     # comment on re-check #0 called it "right before the delete" while it actually ran first, leaving
     # the two `git status` calls and the ephemeral deletions (up to REAP_WT_REMOVE_TIMEOUT each)
     # uncovered — the largest part of the window, by this file's own reasoning for re-check #2.
-    # ⛔ AND IT STAYS LAST (#3405 review, P2): gate (b) above runs BEFORE it for exactly this reason.
-    holder_recheck "$path" "$sha" || { rm -f "$out"; return 2; }
-    # ⛔ AND THE NETWORK WARRANT IS RE-TAKEN HERE TOO (#3371 review cycle 2, P1; window corrected cycle
-    # 3, P2). A `remote-holds` row is removed with NO BACKUP on the warrant "the remote still
-    # advertises this head", and the classify-loop call is far from this line: `clean_gate` #1 (20 s),
-    # gate (b) (the archive, "up to ~4.7 min"), the evidence ladder ("up to ~18 min"), the ephemeral
-    # `rm` loop (up to REAP_WT_REMOVE_TIMEOUT=120 s each) and `clean_gate` #2 — so the fact warranting
-    # the destruction can be ~25 MINUTES stale at the defaults, not the 2.5 min an earlier draft of
-    # this comment claimed. That number IS the argument for this call. Exactly as `holder_recheck` is
-    # called twice for the same reason, the EARLY call (classify loop) saves the wasted archive work
-    # and THIS one is the decisive read. rc=2 preserves and keeps the archive, and it must NAME its
+    # ⛔ AND THE NETWORK WARRANT IS RE-TAKEN HERE, **BEFORE** THE LIVENESS PROBE — NOT AFTER IT
+    # (#3371 review cycle 2 P1; ordering corrected cycle 4 P1). A `remote-holds` row is removed with
+    # NO BACKUP on the warrant "the remote still advertises this head", and the classify-loop call is
+    # far from this line: `clean_gate` #1 (20 s), gate (b) (the archive, "up to ~4.7 min"), the
+    # evidence ladder ("up to ~18 min"), the ephemeral `rm` loop (up to REAP_WT_REMOVE_TIMEOUT=120 s
+    # each) and `clean_gate` #2 — so the fact warranting the destruction can be ~25 MINUTES stale here.
+    # ⛔ IT MUST GO ABOVE `holder_recheck` EVEN THOUGH IT IS THE MORE EXPENSIVE READ: this function
+    # forks `git remote` + `ls-remote`, two bounded commands at REAP_WT_GIT_TIMEOUT each (up to ~40 s
+    # at the defaults). Putting them between `holder_recheck` and the fork would make the LAST
+    # liveness read ~40 s before the destruction — reopening precisely the window re-check #3 exists
+    # to close ("a shell demoted as idle can pick up a child inside it. That is exactly 'started
+    # working again'"). The remote fact moves slowly; a resuming lane does not. So: network first,
+    # then liveness, then the fork. rc=2 preserves and keeps the archive, and it must NAME its
     # verdict — `REMOVE_SKIP_VERDICT` is what the operator's keep-line prints.
     if ! remote_holds_recheck "$path" "$sha" "$why"; then
         case "$why" in remote-holds:*) REMOVE_SKIP_VERDICT="remote-holds-stale" ;; esac
         rm -f "$out"; return 2
     fi
+    # ⛔ THIS ONE STAYS LAST — literally the last code line before the fork (cycle 4 P1).
+    holder_recheck "$path" "$sha" || { rm -f "$out"; return 2; }
 
     run_bounded "$REAP_WT_REMOVE_TIMEOUT" "$out" "$GIT_BIN" -C "$REPO_CANON" worktree remove "$path"
     rc=$?
