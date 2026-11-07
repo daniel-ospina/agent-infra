@@ -171,7 +171,20 @@ case "$_rc" in
     # OPPOSITE verdicts: `OR` + a CR-padded `REPO` printed "Grading the ONE repo …" and the doctor
     # then refused the pair, while a bare CR-padded `REPO` was refused here with "is not a directory"
     # for a path that plainly is one (the CR is invisible in the message). One trim rule, every value.
-    _trim() { printf '%s' "${1:-}" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//'; }
+    # ⛔ `_trim` IS THE DOCTOR'S OWN `str.strip()`, DELEGATED (review round 9, P2). `sed '[[:space:]]'`
+    # does not strip a non-ASCII space (U+00A0 and friends) and Python's `strip()` does, so a `REPO` with
+    # one trailing NBSP made the wrapper's proof fail on a path the doctor then resolved cleanly — the
+    # wrapper REFUSED every pass the doctor would run, on the migration state every box is in today.
+    # `_rs_strip` asks the same parser the doctor uses, and falls back to the sed form only when the
+    # doctor cannot be asked at all (in which case nothing else here can be proved either).
+    _trim() {
+      local v="${1:-}" out
+      out="$(_rs_strip "$v")"
+      if [ -z "$out" ] && [ -n "$v" ]; then
+        out="$(printf '%s' "$v" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+      fi
+      printf '%s' "$out"
+    }
     _seam="$(_trim "${PR_DOCTOR_REPO:-}")"
     _seam_dir="$(_trim "${PR_DOCTOR_REPO_DIR:-}")"
     _or="$(_trim "${OR:-}")"
