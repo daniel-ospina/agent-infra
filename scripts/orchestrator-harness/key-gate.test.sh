@@ -619,14 +619,64 @@ hasnt "$OUT" "models-json-provider-dropped" "3z15y19 …and never reported as a 
 # it. Measured: `pi -p --provider deepseek --model deepseek-flash` answers `Invalid URL` and exits 1 having sent nothing,
 # so the box is refused, with a reason of its own (the provider is not deleted — the URL cannot be built) and the
 # failure pi actually prints quoted, because a refusal's evidence is what the operator will go and check.
-RG_NOURL_JSON='{"providers":{"deepseek":{"oauth":"radius","baseUrl":"radius.pi.dev/v1","models":[{"id":"deepseek-flash"}]}}}'
+# ⛔ AND THE TEST IS PER DEFINITION, NOT PER PROVIDER BODY (round 37, P1/P2, measured — the first cut of this fix
+# refused on the body alone, which was a false block: pi only reaches the bad URL through `modelFromJson`,
+# `definition.baseUrl ?? providerConfig.baseUrl ?? defaults?.baseUrl` (`provider-composer.js:88`), so a grant with NO
+# `models` array, or a definition carrying its own `baseUrl`, runs — measured 401 and 404 from the gateway). The
+# fixture therefore carries `api` AND no model-level `baseUrl`: that is the one shape that inherits the raw value.
+RG_NOURL_JSON='{"providers":{"deepseek":{"oauth":"radius","baseUrl":"radius.pi.dev/v1","models":[{"id":"deepseek-flash","api":"pi-messages"}]}}}'
 HRGNOURL="$(mkhome radius_grant_nourl "$RG_NOURL_JSON")"
 OUT="$(run_gate "$HRGNOURL" RADIUS_API_KEY=rk)"; RC="$(printf '%s\n' "$OUT" | sed -n 's/^RC=//p' | head -1)"
-ck "3z15y20 a scheme-less gateway \`baseUrl\` REFUSES (rc=${RC:-none}) — pi dies \`Invalid URL\` there" \
+ck "3z15y20 a definition inheriting a scheme-less \`baseUrl\` REFUSES (rc=${RC:-none}) — pi dies \`Invalid URL\`" \
    "$([ "${RC:-0}" = "82" ] && echo 0 || echo 1)"
 has "$OUT" "reason=models-json-bad-gateway" "3z15y21 …with its own reason, not the deleted-provider one"
 has "$OUT" "Invalid URL" "3z15y22 …quoting the failure pi actually prints there"
 hasnt "$OUT" 'Unknown provider' "3z15y23 …and NOT quoting a deleted provider, which is a different fact"
+# …and the NOTHING-inherits shapes PASS, because pi runs: measured 401 (no `models` array — the gateway normalizes
+# its own config URL) and 404 (definition carries its own absolute baseUrl, which wins at :88). A refusal on either is
+# a false 82 on a provisioned box, printed with evidence that box never produced.
+RG_NOMODELS_JSON='{"providers":{"deepseek":{"oauth":"radius","baseUrl":"radius.pi.dev/v1"}}}'
+HRGNM="$(mkhome radius_grant_nomodels "$RG_NOMODELS_JSON")"
+OUT="$(run_gate "$HRGNM" RADIUS_API_KEY=rk)"; RC="$(printf '%s\n' "$OUT" | sed -n 's/^RC=//p' | head -1)"
+eqv "${RC:-none}" "0" "3z15y24 a scheme-less gateway with NO models array is NOT refused — pi runs (rc=${RC:-none})"
+has "$OUT" "check=ok var=RADIUS_API_KEY" "3z15y25 …on the grant’s variable"
+RG_OWNBASE_JSON='{"providers":{"deepseek":{"oauth":"radius","baseUrl":"radius.pi.dev/v1","models":[{"id":"deepseek-flash","api":"pi-messages","baseUrl":"https://radius.pi.dev"}]}}}'
+HRGOB="$(mkhome radius_grant_ownbase "$RG_OWNBASE_JSON")"
+OUT="$(run_gate "$HRGOB" RADIUS_API_KEY=rk)"; RC="$(printf '%s\n' "$OUT" | sed -n 's/^RC=//p' | head -1)"
+eqv "${RC:-none}" "0" "3z15y26 a definition with its OWN baseUrl is NOT refused (rc=${RC:-none}) — it wins over the body"
+hasnt "$OUT" "models-json-bad-gateway" "3z15y27 …and the URL reason never fires"
+# …and a scheme-less baseUrl is NOT a grant-only problem (round 37, P2, measured): an ordinary provider whose
+# definition inherits it dies `Invalid URL` too, and `check=ok` there is the false PASS this issue is about — a shipped
+# provider AND an unshipped one, because the credential is irrelevant to a URL that cannot be built.
+NGB_JSON='{"providers":{"deepseek":{"baseUrl":"gw.example/v1","models":[{"id":"deepseek-flash","api":"pi-messages"}]}}}'
+HNG="$(mkhome nongrant_badbase "$NGB_JSON")"
+OUT="$(run_gate "$HNG" DEEPSEEK_API_KEY=dk KG_PROV=deepseek KG_MODEL=deepseek-flash)"; RC="$(printf '%s\n' "$OUT" | sed -n 's/^RC=//p' | head -1)"
+ck "3z15y28 a NON-grant provider with a scheme-less baseUrl REFUSES (rc=${RC:-none})" \
+   "$([ "${RC:-0}" = "82" ] && echo 0 || echo 1)"
+has "$OUT" "reason=models-json-bad-gateway" "3z15y29 …the same URL-level fact, not a credential answer"
+NGBM_JSON='{"providers":{"myprov":{"apiKey":"$MYV","baseUrl":"gw.example/v1","models":[{"id":"m1","api":"pi-messages"}]}}}'
+HNGM="$(mkhome nongrant_badbase_unshipped "$NGBM_JSON")"
+OUT="$(run_gate "$HNGM" MYV=sk_myv KG_PROV=myprov KG_MODEL=m1)"; RC="$(printf '%s\n' "$OUT" | sed -n 's/^RC=//p' | head -1)"
+ck "3z15y30 …and so does an UNSHIPPED one with an \`api\` (rc=${RC:-none}) — pi dies Invalid URL there too" \
+   "$([ "${RC:-0}" = "82" ] && echo 0 || echo 1)"
+has "$OUT" "reason=models-json-bad-gateway" "3z15y31 …URL reason, because the provider composes and the request does not"
+# ⛔ AND THE `-no-api` SPLIT FOLLOWS THE PROVIDER, NOT THE FILE (round 37, P2, measured): a definition with no `api`
+# under a scheme-less baseUrl dies `Invalid URL` when pi ships the provider (it composes an api and inherits the URL)
+# and `Error: Unknown provider` when it does not (the composer throws first, on the custom gateway).
+RG_NOAPI_JSON='{"providers":{"deepseek":{"oauth":"radius","baseUrl":"radius.pi.dev/v1","models":[{"id":"deepseek-flash"}]}}}'
+HRNA="$(mkhome radius_grant_nourl_noapi "$RG_NOAPI_JSON")"
+OUT="$(run_gate "$HRNA" RADIUS_API_KEY=rk)"; RC="$(printf '%s\n' "$OUT" | sed -n 's/^RC=//p' | head -1)"
+ck "3z15y32 an \`api\`-less definition under a scheme-less baseUrl REFUSES (rc=${RC:-none})" \
+   "$([ "${RC:-0}" = "82" ] && echo 0 || echo 1)"
+has "$OUT" "Invalid URL" "3z15y33 …quoting Invalid URL, because this provider IS shipped and composes an api"
+hasnt "$OUT" "reason=models-json-provider-dropped" "3z15y34 …not the deleted-provider reason, which pi does not print here"
+NGNA_JSON='{"providers":{"myprov":{"apiKey":"$MYV","baseUrl":"gw.example/v1","models":[{"id":"m1"}]}}}'
+HNGNA="$(mkhome nongrant_badbase_noapi "$NGNA_JSON")"
+OUT="$(run_gate "$HNGNA" MYV=sk_myv KG_PROV=myprov KG_MODEL=m1)"; RC="$(printf '%s\n' "$OUT" | sed -n 's/^RC=//p' | head -1)"
+ck "3z15y35 …while an UNSHIPPED one is the deleted provider (rc=${RC:-none})" \
+   "$([ "${RC:-0}" = "82" ] && echo 0 || echo 1)"
+has "$OUT" "reason=models-json-provider-dropped" "3z15y36 …with the reason pi’s actual failure belongs to"
+has "$OUT" 'Unknown provider' "3z15y37 …quoting Unknown provider, the sentence pi prints on that box"
 # `composeat <home> <provider> [<model>]` — the compose answer itself, because the DROPPED-provider warning only prints on
 # paths that do not return early: on a refusal the caller returns first, so a `hasnt models-json-provider-dropped` arm cannot
 # fail (measured: the mutant that restored the old order stayed green). The token count is the observable fact.
@@ -1119,6 +1169,25 @@ OUT="$(run_box_at "$HPINFED" "$T/nocwd" ANTHROPIC_FEDERATION_RULE_ID=r ANTHROPIC
 eqv "$(rc_of "$OUT")" "0" "8z24b the federation-provisioned PIN passes in refused mode (rc=$(rc_of "$OUT"))"
 has "$OUT" "check=ok box_default=claude-sonnet-4-5" "8z24c …on the \`certain\` arm's own path line"
 has "$OUT" "path=anthropic-federation" "8z24d …naming the path that answered"
+# ⛔ AND THE COMPANION ABSTAINS ON A BAD GATEWAY IN `warn` MODE, BECAUSE `warn` IS THE LANE'S COMPANION LINE (round 38,
+# P2, measured): `key_gate_assert` runs `key_gate_box_default_assert … warn` BEFORE `key_gate_assert_main`, so a refusal
+# here puts a SECOND `result=REFUSED` line in one lane log for one box (the duplicate-noise class #3331 was filed about).
+# The lane still refuses — `key_gate_assert_main` owns that verdict — and `--probe --box-default` drives this function in
+# `refused` mode, so the refusal is reported by exactly one line in every real caller. Without an arm that actually
+# REACHES this branch with `quiet=1`, the guard can be deleted with the suite green — which is the class this PR exists to
+# remove. `mkset` (not `mkhome`) because without a `settings.json` PIN the function returns at its `status != "pin"` gate,
+# ~85 lines above the arm, and the assertion then passes vacuously on EMPTY output (measured: that is exactly how the
+# first cut of these arms certified a guard it never exercised).
+HWNB="$(mkset warn_badbase '{"providers":{"deepseek":{"oauth":"radius","baseUrl":"radius.pi.dev/v1","models":[{"id":"deepseek-flash","api":"pi-messages"}]}}}' '{"defaultProvider":"deepseek","defaultModel":"deepseek-flash"}')"
+OUT="$(warnrun "$HWNB" "$T/nocwd" RADIUS_API_KEY=rk)"
+hasnt "$OUT" "result=REFUSED" \
+    "8z24e warn mode does NOT print a second REFUSED line for a definition inheriting a scheme-less baseUrl"
+eqv "$(rc_of "$OUT")" "0" "8z24f …refusing nothing (rc=$(rc_of "$OUT")) — the lane's own verdict carries it"
+HOOB="$(mkset warn_ownbase '{"providers":{"deepseek":{"baseUrl":"gw.example/v1","models":[{"id":"deepseek-flash","api":"pi-messages"}]}}}' '{"defaultProvider":"deepseek","defaultModel":"deepseek-flash"}')"
+OUT="$(warnrun "$HOOB" "$T/nocwd" DEEPSEEK_API_KEY=dk)"
+hasnt "$OUT" "result=REFUSED" \
+    '8z24g …and not for a NON-grant provider with one either, the shape `_grant` used to miss'
+eqv "$(rc_of "$OUT")" "0" "8z24h …refusing nothing (rc=$(rc_of "$OUT"))"
 # ⛔ …AND A PIN WITH NO VARIABLE AND NO PATH IS STILL **SILENT** IN WARN MODE, BECAUSE VERTEX IS `uncertain`
 # (round 31, measured): the companion speaks on exactly one arm — a POSITIVELY absent credential — and an uncertain
 # provider's absence is not a verdict (the same reason `azure` and `cloudflare-*` pins are silent). What must NOT happen
@@ -1189,6 +1258,14 @@ ck "8z47 a PIN of a granted provider with a scheme-less gateway REFUSES (rc=${rc
    "$([ "${rc:-0}" = "82" ] && echo 0 || echo 1)"
 has "$OUT" "reason=models-json-bad-gateway" "8z48 …with the URL-level reason, not the deleted-provider one"
 hasnt "$OUT" 'Unknown provider' "8z49 …because pi does not delete that provider, it fails to build the URL"
+# \u26d4 and the PIN of the `-no-api`/unshipped shape names the failure pi prints there (round 37, P2, measured): its own
+# code path, so the lane-site split says nothing about it.
+HNP="$(mkset pin_badbase_noapi_unshipped '{"providers":{"myprov":{"apiKey":"$MYV","baseUrl":"gw.example/v1","models":[{"id":"m1"}]}}}' '{"defaultProvider":"myprov","defaultModel":"m1"}')"
+OUT="$(run_box_at "$HNP" "$T/nocwd" MYV=sk_myv)"; rc="$(rc_of "$OUT")"
+ck "8z50 a PIN of an unshipped provider under a scheme-less baseUrl REFUSES (rc=${rc:-<none>})" \
+   "$([ "${rc:-0}" = "82" ] && echo 0 || echo 1)"
+has "$OUT" "reason=models-json-provider-dropped" "8z51 …as a DELETED provider, which is what pi does there"
+has "$OUT" 'Unknown provider' "8z52 …quoting that sentence rather than an unbuildable URL"
 HMY="$(mkset pin_myprov '{"providers":{"myprov":{"apiKey":"$MYV","models":[{"id":"m1"}]}}}' '{"defaultProvider":"myprov","defaultModel":"m1"}')"
 OUT="$(run_box_at "$HMY" "$T/nocwd" MYV=sk_myv)"; rc="$(rc_of "$OUT")"
 ck "8z43 a PIN of an UNSHIPPED provider with an unbuildable definition is REFUSED (rc=${rc:-<none>})" \
@@ -1855,7 +1932,7 @@ for _op in radius openai github-copilot kimi-coding meta openai-codex openrouter
   HROP="$(mkset "oauth_$_op" "{\"providers\":{\"$_op\":{\"apiKey\":\"\$KG_CANARY_KEY\"}}}" ABSENT)"
   printf '{"%s":{"type":"oauth","access":"a","refresh":"r"}}\n' "$_op" > "$HROP/.pi/agent/auth.json"
   OUT="$(run_gate "$HROP" KG_PROV="$_op")"; RC="$(printf '%s\n' "$OUT" | sed -n 's/^RC=//p' | head -1)"
-  eqv "${RC:-none}" "0" "8S4i a stored oauth entry for $_op is not refused \u2014 pi ships that handler (rc=${RC:-none})"
+  eqv "${RC:-none}" "0" "8S4i a stored oauth entry for $_op is not refused — pi ships that handler (rc=${RC:-none})"
   hasnt "$OUT" "auth-store-oauth-unusable" "8S4j …so the no-handler reason never fires for $_op"
 done
 # `key: null` is PRESENT, and pi dies on it before any lookup (measured: `Credential store read failed for
