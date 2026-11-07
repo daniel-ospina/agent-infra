@@ -84,7 +84,7 @@ unset CELL_HOME REAP_AW_STAMP REAP_AW_DIRTY REAP_AW_ROOTS REAP_AW_AGED_MINUTES \
       REAP_AW_BUDGET_SECONDS REAP_AW_GITLESS_MAX REAP_AW_GITLESS_KEEP REAP_AW_PROC_ROOT \
       REAP_AW_DRY_RUN REAP_AW_GIT_TIMEOUT REAP_AW_LIVE_PATHS REAP_AW_LOCK_STALE_SECONDS \
       REAP_AW_LOG REAP_AW_STATE_DIR LP_PROC_ROOT LP_CENSUS_MECH \
-      LP_CENSUS_UNAVAILABLE LP_LS_PROBE LP_LSOF_PROBE LP_PS_PROBE 2>/dev/null || true
+      REAP_AW_CELL_HOME_DEFAULT LP_CENSUS_UNAVAILABLE LP_LS_PROBE LP_LSOF_PROBE LP_PS_PROBE 2>/dev/null || true
 
 PASS=0; FAIL=0
 ok()  { PASS=$((PASS + 1)); printf '  ✅ %s\n' "$1"; }
@@ -413,6 +413,18 @@ case_g() { # <owner-script>
            REAP_AW_PROC_ROOT="$FB/proc" bash "$owner" --root "$root" --include-gitless 2>&1)"; OUT_RC=$?
     case_check "$(grep -qF "PRESERVED($root/a-statedir, home-or-state)" <<<"$OUT" && echo 0 || echo 1)" \
                "and the pass's own STATE DIR (the third reference of the same guard)"
+    # G9 the FALLBACK itself — `CELL_HOME` unset AND empty is the systemd unit's shape (measured in
+    #    #3278: the unit renders `Environment=HOME=/home/cmux`, a real directory, so
+    #    `disk-reaper-run.sh`'s fallback never substituted). `REAP_AW_CELL_HOME_DEFAULT` points the
+    #    fallback at a fixture because a fixture cannot live at `/tmp/cell-home`; WITHOUT it this
+    #    reference had no behavioural test, and reverting the loop to a raw `${CELL_HOME:-}` kept every
+    #    case green while the real cell home became reapable (review round 7, measured).
+    mk_gitless "$root" a-fallback >/dev/null; age_path "$root/a-fallback" 400
+    OUT="$(HOME="$FB/home" CELL_HOME="" REAP_AW_CELL_HOME_DEFAULT="$root/a-fallback" \
+           REAP_AW_STATE_DIR="$FB/state" REAP_AW_LOG="$FB/state/log" \
+           REAP_AW_PROC_ROOT="$FB/proc" bash "$owner" --root "$root" --include-gitless 2>&1)"; OUT_RC=$?
+    case_check "$(grep -qF "PRESERVED($root/a-fallback, home-or-state)" <<<"$OUT" && echo 0 || echo 1)" \
+               "the guard's FALLBACK protects a cell home when nothing exports CELL_HOME (the unit's shape)"
     return $((CASE_FAIL > 0))
 }
 
@@ -433,6 +445,15 @@ case_h() { # <owner-script>
     mkdir -p "$FB/root/a-linked"
     printf 'gitdir: %s\n' "$FB/gitdir" >"$FB/root/a-linked/.git"
     age_path "$FB/root/a-linked" 0
+    # ⛔ AND THE CENSUS MUST BE ABLE TO ANSWER "HELD", or this case cannot tell bound-before-CENSUS from
+    # bound-before-age-floor. With nothing holding the tree, a census run FIRST finds nobody and the
+    # budget check then fires anyway, so `reason=budget` holds under BOTH orders — a mutant that moves
+    # the bound below the census survived the whole suite (review round 7, measured). A pid whose cwd IS
+    # the tree makes the two orders disagree: census-first reports `live-cwd`, bound-first reports
+    # `budget`. No `cmdline`: an argv token would take the `argv-named` branch first and re-hide it.
+    mkdir -p "$FB/proc/12"
+    ln -s "$FB/root/a-linked" "$FB/proc/12/cwd"
+    ln -s / "$FB/proc/12/exe"
     # ⛔ BUDGET=0, NOT A SLEEP: the deadline is the pass's own start, so the bound is already spent when
     # the first candidate arrives. Nothing here reads the wall clock, so the case cannot flake.
     OUT="$(HOME="$FB/home" CELL_HOME="" REAP_AW_STATE_DIR="$FB/state" REAP_AW_LOG="$FB/state/log" \
@@ -445,6 +466,10 @@ case_h() { # <owner-script>
                "the LINKED arm stops on the TIME bound (reason=budget)"
     case_check "$(grep -q 'reason=young' <<<"$OUT" && echo 1 || echo 0)" \
                "and NOT on the age floor — the bound precedes the census and the floor (no reason=young)"
+    # ⛔ THE ORDER ITSELF: the tree IS held by a live pid, so a census that ran first would have reported
+    #    the witness. `budget` with the holder present is what proves the bound went FIRST.
+    case_check "$(grep -q 'reason=live-cwd' <<<"$OUT" && echo 1 || echo 0)" \
+               "and the CENSUS never ran: the pid holding this tree is not reported (no reason=live-cwd)"
     case_check "$([ -d "$FB/root/a-linked" ] && echo 0 || echo 1)" \
                "the bound is REAL in --apply: the linked worktree is still there"
     case_check "$(grep -q 'budget=0s' <<<"$OUT" && echo 0 || echo 1)" \
@@ -504,11 +529,33 @@ fi
 # unit's path, where nothing exports CELL_HOME. It is a single assignment, so the mutation is exact and
 # case A sees it in `--print-config` (and, behaviourally, the guard reference becomes empty and is
 # skipped — the `rm -rf /tmp/cell-home` shape).
-MUT_CELLHOME='s|^CELL_HOME_DEFAULT="${CELL_HOME:-/tmp/cell-home}"$|CELL_HOME_DEFAULT="${CELL_HOME:-}"|'
+MUT_CELLHOME='s|^CELL_HOME_DEFAULT=.*|CELL_HOME_DEFAULT="${CELL_HOME:-}"|'
 if apply_mutation "$OWNER" "$T/mut-cellhome/reap-abandoned-worktrees.sh" -e "$MUT_CELLHOME"; then
     expect_fail "MUT_CELLHOME the guard's cell-home fallback removed — case A must go RED" case_a "$T/mut-cellhome/reap-abandoned-worktrees.sh"
 else
     bad "MUT_CELLHOME could not be applied — the guard's fallback is not being checked any more"
+fi
+
+# MUT_CELLHOME_REF reverts the GUARD LOOP's reference to the pre-fix raw expansion. This is the use
+# site, not the assignment: MUT_CELLHOME empties the value and case A sees it in `--print-config`, which
+# proves the variable is USED but never that the FALLBACK protects anything. Under this mutant every
+# case except G's fallback invocation stays green — which is how the fallback went untested until round 7.
+MUT_CELLHOME_REF='s|for _ref in "${HOME:-}" "$CELL_HOME_DEFAULT"|for _ref in "${HOME:-}" "${CELL_HOME:-}"|'
+if apply_mutation "$OWNER" "$T/mut-cellhome-ref/reap-abandoned-worktrees.sh" -e "$MUT_CELLHOME_REF"; then
+    expect_fail "MUT_CELLHOME_REF the guard reads the raw CELL_HOME, not the fallback — case G must go RED" case_g "$T/mut-cellhome-ref/reap-abandoned-worktrees.sh"
+else
+    bad "MUT_CELLHOME_REF could not be applied — the guard's use site is not being checked any more"
+fi
+
+# MUT_CENSUS_FIRST makes the bound's DECISION depend on the census, i.e. the census runs first — the
+# pre-#3278 order whose overrun this PR exists to remove (one FULL census per remaining candidate).
+# The mutant is a single line so it stays portable, and it is caught only because case H now holds its
+# fixture: without the holder the bound fires either way and the mutant survives.
+MUT_CENSUS_FIRST='s|^        if budget_spent "$deadline"; then$|        if budget_spent "$deadline" \&\& ! lp_path_held "$CENSUS" "$canon"; then|'
+if apply_mutation "$OWNER" "$T/mut-census-first/reap-abandoned-worktrees.sh" -e "$MUT_CENSUS_FIRST"; then
+    expect_fail "MUT_CENSUS_FIRST the census runs before the bound — case H must go RED" case_h "$T/mut-census-first/reap-abandoned-worktrees.sh"
+else
+    bad "MUT_CENSUS_FIRST could not be applied — the bound's POSITION relative to the census is not checked"
 fi
 
 # MUT_LINKED_BUDGET confines the time bound to the GITLESS arm: the linked arm is then unbounded before

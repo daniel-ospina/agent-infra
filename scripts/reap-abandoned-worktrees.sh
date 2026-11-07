@@ -168,12 +168,20 @@ ROOTS="${REAP_AW_ROOTS:-/tmp}"
 # `reason=gitless-cap` — a rate limit, not a gate.
 #
 # ⛔ IT IS RESOLVED HERE, NOT BY EXPORTING `CELL_HOME` UPSTREAM — that was tried and measured WRONG.
-# `load_pin` (`:332`) reads the same variable with FIRST-MATCH-WINS and a `break`
+# `load_pin` (defined BELOW — cite it by name, not by a line number; a stale `:332` sent a reader into
+# `acquire_lock`) reads the same variable with FIRST-MATCH-WINS and a `break`
 # (`${CELL_HOME}/orchestrator/…` then `${HOME}/.pi/orchestrator/…`), so its list is a SUBSTITUTION, not
 # a union: exporting would make one of the two stamps stop being read, i.e. a tree the other stamp
 # pinned becomes a candidate and `rm -rf` takes it. A local fallback is additive; an exported variable
-# is not. This value touches only the guard loop.
-CELL_HOME_DEFAULT="${CELL_HOME:-/tmp/cell-home}"
+# is additive; an exported variable is not. This value touches only the guard loop.
+# ⛔ `REAP_AW_CELL_HOME_DEFAULT` EXISTS SO THE FALLBACK ITSELF CAN BE EXERCISED. A fixture cannot live at
+# `/tmp/cell-home` on a real box, so without this seam the fallback had a *resolution* test
+# (`--print-config`) and no behavioural one: reverting the guard loop's reference to a raw
+# `"${CELL_HOME:-}"` left every case GREEN while `/tmp/cell-home` became reapable on the unit's path —
+# the exact shape #3278 measured (review round 7). It is a DEFAULT, not a second source of truth: an
+# exported `CELL_HOME` still wins, and a deliberately wrong value protects a different directory — the
+# same trade an operator already makes by setting `CELL_HOME`, so it adds no new hazard class.
+CELL_HOME_DEFAULT="${CELL_HOME:-${REAP_AW_CELL_HOME_DEFAULT:-/tmp/cell-home}}"
 DRY_RUN="${REAP_AW_DRY_RUN:-1}"
 BUDGET="${REAP_AW_BUDGET_SECONDS:-300}"
 GIT_TIMEOUT="${REAP_AW_GIT_TIMEOUT:-60}"
