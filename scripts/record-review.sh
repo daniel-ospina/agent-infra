@@ -6572,9 +6572,18 @@ if command -v gh >/dev/null 2>&1 && [ -n "$REPO" ]; then
     # `--flush-pending` "WILL FIND NOTHING and will report success". Two sentences in
     # one arm cannot both be true, and the one an operator ACTS on is the remedy, so
     # the result is captured here and both remedy sentences branch on it.
+    # ⛔ …AND THE CLAIM IS SCOPED TO THE MARKER THIS RUN OWED (#3712 review round 3,
+    # follow-up 1). The pending file is keyed by (repo, PR), and `marker_pending_write`
+    # OVERWRITES it. So an earlier run for the same PR that persisted a marker and was
+    # never flushed is still sitting there: on THIS run's persist failure,
+    # `--flush-pending` would find and deliver THAT OLDER marker — the very marker that
+    # is NOT this run's — not answer "nothing pending". The absolute form ("would find
+    # NOTHING") is therefore true only when no earlier marker exists, which this arm
+    # cannot see. Every sentence below that offers or denies the remedy says WHICH bytes
+    # it is talking about, so it holds in both cases.
     BODY_READ_PERSISTED=1
     marker_pending_write "$(marker_pending_file "$REPO" "$PR")" "$MARKER" || { BODY_READ_PERSISTED=0
-    echo "⚠️ body-marker: could NOT persist the pending marker at $(marker_pending_file "$REPO" "$PR") — ⛔ THE BYTES ARE NOT ON DISK, so NO --flush-pending remedy is offered below: it WOULD FIND NOTHING and would report success (it answers 'nothing pending … Nothing was written', exit 0). The marker is reproduced HERE so it is not lost: paste the line between the >>> markers into the PR body by hand if gh is throttled. >>> $MARKER <<<" >&2
+    echo "⚠️ body-marker: could NOT persist the pending marker at $(marker_pending_file "$REPO" "$PR") — ⛔ THE BYTES ARE NOT ON DISK, so NO --flush-pending remedy is offered below: for the marker THIS run owed it WOULD FIND NOTHING and would report success (it answers 'nothing pending … Nothing was written', exit 0). The marker is reproduced HERE so it is not lost: paste the line between the >>> markers into the PR body by hand if gh is throttled. >>> $MARKER <<<" >&2
     }
     if post_review_evidence_comment "$MARKER" "$REPO" "$PR"; then
       if [ "$BODY_READ_PERSISTED" -eq 1 ]; then
@@ -6582,7 +6591,7 @@ if command -v gh >/dev/null 2>&1 && [ -n "$REPO" ]; then
       else
         # ⛔ NO PENDING-FILE CLAIM WHEN THE PERSIST FAILED: the remedy offered here
         # is the one the persist warning above just said would find nothing.
-        echo "⚠️ record-review: could not read the PR body of $REPO#$PR (transient API failure / throttled token), so the BODY marker was NOT posted — but the #1224 evidence COMMENT WAS, and that is the copy the required check reads on a runner with no record store. The signed record at $FILE is unaffected. ⛔ THE BODY COPY IS ON NO CHANNEL AND NOT ON DISK: the ⚠️ body-marker persist line above says the pending file could NOT be written, so --flush-pending would find NOTHING and would answer 'nothing pending' over lost bytes. That line reproduces the marker between its >>> markers — paste it into the PR body by hand once gh is reachable (the durable comment is already the admitted evidence, so what is owed is the body copy and the 'edited' re-trigger, not the verdict)." >&2
+        echo "⚠️ record-review: could not read the PR body of $REPO#$PR (transient API failure / throttled token), so the BODY marker was NOT posted — but the #1224 evidence COMMENT WAS, and that is the copy the required check reads on a runner with no record store. The signed record at $FILE is unaffected. ⛔ THE BODY COPY IS ON NO CHANNEL AND NOT ON DISK: the ⚠️ body-marker persist line above says the pending file could NOT be written, so --flush-pending would find NOTHING for the marker this run owed and would answer 'nothing pending' over lost bytes. That line reproduces the marker between its >>> markers — paste it into the PR body by hand once gh is reachable (the durable comment is already the admitted evidence, so what is owed is the body copy and the 'edited' re-trigger, not the verdict)." >&2
       fi
       exit 0
     fi
@@ -6602,7 +6611,7 @@ if command -v gh >/dev/null 2>&1 && [ -n "$REPO" ]; then
     if [ "$BODY_READ_PERSISTED" -eq 1 ]; then
       _unposted_remedy="The marker is kept in $(marker_pending_file "$REPO" "$PR") and a later: record-review.sh --flush-pending $PR $REPO — delivers it WITHOUT a new review."
     else
-      _unposted_remedy="⛔ NO PENDING MARKER IS ON DISK EITHER — the ⚠️ body-marker persist line above says the pending file could NOT be written, so --flush-pending would find NOTHING and would answer 'nothing pending' over lost bytes. That line reproduces the marker between its >>> markers — paste it into the PR body by hand once gh is reachable."
+      _unposted_remedy="⛔ NO PENDING MARKER IS ON DISK EITHER — the ⚠️ body-marker persist line above says the pending file could NOT be written, so --flush-pending would find NOTHING for the marker this run owed and would answer 'nothing pending' over lost bytes. That line reproduces the marker between its >>> markers — paste it into the PR body by hand once gh is reachable."
     fi
     echo "⛔ body-marker-unposted: could not read the PR body of $REPO#$PR (⛔ this line does NOT assert WHICH cause — the error text is discarded, so a transient API failure, a throttled token and a permanent 404 all land here), and $_unposted_why — the record is saved but CI CANNOT SEE IT. $_unposted_remedy" >&2
     exit 5

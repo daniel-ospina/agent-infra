@@ -5480,6 +5480,16 @@ assert_not_contains "$RECORD_ERR" "The marker is kept in" \
     "14.1d(i) …whose exit-5 message does NOT offer --flush-pending as a remedy for bytes that were never persisted"
 assert_contains "$RECORD_ERR" "NO PENDING MARKER IS ON DISK EITHER" \
     "14.1d(i) …but names the real state instead — the PENDING MARKER is what is absent, not the record (the line above it says the record IS saved)"
+# ⛔ THE FLUSH CLAIM IS SCOPED TO THIS RUN'S MARKER (#3712 review round 3, follow-up 1).
+# The pending file is keyed by (repo, PR) and `marker_pending_write` OVERWRITES it, so an
+# earlier run's un-flushed marker for the same PR is still there: on a failed persist,
+# `--flush-pending` finds and delivers THAT OLDER marker rather than answering "nothing
+# pending". The absolute form ("would find NOTHING") is true only when no earlier marker
+# exists, which this arm cannot see — so both captures must say WHICH bytes they mean.
+assert_contains "$RECORD_ERR" "for the marker this run owed" \
+    "14.1d(i) …and the exit-5 remedy scopes 'would find NOTHING' to the marker THIS RUN owed (a stale earlier marker for the same PR is still in the pending file)"
+assert_not_contains "$RECORD_ERR" "would find NOTHING and would answer" \
+    "14.1d(i) …never the unscoped form, which is false whenever an earlier marker is pending"
 # ⛔ THE SAME CLASS, ONE CALL FURTHER IN (#3712 review round 2, P3):
 # `post_review_evidence_comment` runs INSIDE this arm and, when its comment READ
 # fails too, used to print "The signed record AND THE BODY MARKER are unaffected" —
