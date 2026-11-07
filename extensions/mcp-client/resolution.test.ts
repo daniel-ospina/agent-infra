@@ -727,6 +727,43 @@ await test("the LEGACY `connectAll` path cannot resurrect the crash (belt is in 
     else process.env.PI_MCP_SERVERS = prevAllowed;
   }
   ok(true, "a non-object entry no longer throws out of the extension factory");
+  // `mcp_catalog` is the tool every error message tells the operator to run, and it reads `cfg.lazy`.
+  // Before the sanitise-once fix the crash simply MOVED here.
+  const entries = manager.catalog();
+  ok(
+    entries.every(e => e.name !== "tortoise" && e.name !== "ghost"),
+    "invalid entries are absent from the catalog"
+  );
+  ok(
+    entries.some(e => e.name === "real"),
+    "and the valid one is still listed — catalog() must not be the tool that throws"
+  );
+});
+
+await test("`catalog()` survives a manager whose config was assigned directly", () => {
+  // `this.config` is sanitised by connectConfig, but a caller (or a test) can assign it directly — and
+  // `catalog()` is the tool every error message tells the operator to run, so it must not throw.
+  const manager = new McpServerManager();
+  (manager as unknown as { config: unknown }).config = {
+    mcpServers: { bad: null, ghost: 42, real: { url: "https://ok.example/mcp", lazy: true } },
+  };
+  const entries = manager.catalog();
+  ok(entries.some(e => e.name === "real"), "the valid entry is listed");
+  ok(entries.every(e => e.name !== "bad" && e.name !== "ghost"), "invalid entries are skipped");
+});
+
+await test("prototype-shaped server names are rejected (the second lock, not the first)", () => {
+  const merged = mergeMcpLayers(
+    { mcpServers: { real: { url: "https://ok/mcp" } } } as never,
+    JSON.parse(
+      '{"mcpServers":{"__proto__":{"command":"/bin/sh"},"constructor":{"command":"/bin/sh"},"prototype":{"command":"/bin/sh"}}}'
+    ) as never,
+  );
+  equal(Object.getPrototypeOf(merged), null, "the map stays null-prototype");
+  for (const bad of ["__proto__", "constructor", "prototype"]) {
+    ok(!Object.hasOwn(merged, bad), `\`${bad}\` must not become a server`);
+  }
+  ok(merged.real, "a normal server still merges");
 });
 
 await test("a `null` server ENTRY does not crash the session — it is dropped, with a warning", async () => {

@@ -621,13 +621,19 @@ const STDIO_TRANSPORT_FIELDS = ["command", "args", "env", "cwd"] as const;
 const STDIO_CREDENTIAL_FIELDS = ["env"] as const;
 
 /**
- * A server name pi accepts: letters, digits, `_` and `-` (`docs/mcp.md`). Enforced here because the
- * merge builds a plain map keyed by name — a `__proto__` key would hit the prototype setter instead of
- * adding a server, planting an entry that `loadServer` can resolve by name while `catalog()` never
- * lists it. Verified: the merged map's PROTOTYPE became the repo's entry object.
+ * A server name pi accepts: letters, digits, `_` and `-` (`docs/mcp.md`).
+ *
+ * ⛔ PLUS an explicit rejection of the PROTOTYPE-SHAPED names, which the charset admits. The real
+ * defence against prototype pollution is that the merge builds `Object.create(null)` and reads it with
+ * `Object.hasOwn` — this is the second lock, not the first. Without it, `__proto__` on any
+ * plain-object path (the legacy `connectAll` config is a normal object) resolves `Object.prototype`
+ * as if it were a server, and `loadServer("__proto__")` answers "has neither 'command' nor 'url'"
+ * instead of "Unknown MCP server".
  */
+const PROTOTYPE_SHAPED_NAMES = new Set(["__proto__", "constructor", "prototype"]);
+
 function isValidServerName(name: string): boolean {
-  return /^[A-Za-z0-9_-]+$/.test(name);
+  return /^[A-Za-z0-9_-]+$/.test(name) && !PROTOTYPE_SHAPED_NAMES.has(name);
 }
 
 /** The `type` values pi accepts. `sse` is explicitly rejected by the platform (`docs/mcp.md`). */
@@ -706,8 +712,9 @@ export function mergeMcpLayers(
   // ⛔ NULL-PROTOTYPE MAP. `merged[name] = …` on a plain object sends a `__proto__` key to the
   // prototype SETTER instead of adding a server: verified, the merged map's prototype became the repo's
   // entry object, and `loadServer` (which resolves `mcpServers[name]`) could reach a server that
-  // `catalog()` — which enumerates `Object.entries` — never lists. Names are also validated against
-  // pi's charset in `asMcpJson`; this is the belt for a caller that hands the merge raw JSON.
+  // `catalog()` — which enumerates `Object.entries` — never lists. THIS null prototype (plus the
+  // `Object.hasOwn` reads below) is the actual defence; `isValidServerName` rejecting prototype-shaped
+  // names is the second lock, and `isValidServerName` here is the belt for a raw-JSON caller.
   const merged: Record<string, McpServerConfig> = Object.create(null);
   const baseServers = (base?.mcpServers ?? {}) as Record<string, unknown>;
   const repoServers = (repo?.mcpServers ?? {}) as Record<string, unknown>;
@@ -778,7 +785,8 @@ export function mergeMcpLayers(
     //     after projection too.
     // Presence — not a string check — is the trigger: `{"url": ["https://attacker/…"]}` is a config
     // typo that `connectServer` STRINGIFIES into a real request, so it must be treated as a changed
-    // destination, not as "no transport declared".
+    // destination, not as "no transport declared". (The layer read rejects such an entry anyway; this
+    // is the belt for a caller that hands the merge raw JSON.)
     const projected = { ...carry, ...entry } as unknown as McpServerConfig;
     if (typeContradicts(projected)) {
       console.log(
@@ -851,12 +859,12 @@ function asMcpJson(value: unknown, label: string): McpJson | null {
       : `A server cannot be REMOVED from a repo layer; see #3612 for the disabled-tombstone proposal.`;
 
     if (!isValidServerName(name)) {
-      // pi restricts server names to `[A-Za-z0-9_-]` (`docs/mcp.md`). It also keeps `__proto__` out of
-      // the merge map — an invalid or prototype-shaped name can resolve a server that never appears in
-      // the catalog (verified: a `__proto__` key set the merged map's PROTOTYPE).
+      // pi restricts server names to `[A-Za-z0-9_-]` (`docs/mcp.md`), and the prototype-shaped names
+      // are rejected on top of that. Rejection here is the SECOND lock; the null-prototype merge map
+      // plus `Object.hasOwn` is what actually prevents pollution.
       console.log(
         `[mcp-client] WARN: ${label} entry name "${name}" is not a valid server name ` +
-          `(letters, digits, "_" and "-" only) — dropped.`
+          `(letters, digits, "_" and "-" only, and not a prototype-shaped name) — dropped.`
       );
       continue;
     }
@@ -867,8 +875,9 @@ function asMcpJson(value: unknown, label: string): McpJson | null {
       continue;
     }
     // A transport that is not a string is a config TYPO, and a dangerous one: `connectServer` reads
-    // `if (config.url)` and would STRINGIFY an array into a real request, while the merge's
-    // destination guard — keyed on a present string — would not fire. Refuse it here instead.
+    // `if (config.url)` and would STRINGIFY an array into a real request. The merge's own destination
+    // guard DOES fire for it (it is keyed on field PRESENCE — `hasField`), but rejecting it at the layer
+    // read means the entry never reaches the merge or the client at all. Both, deliberately.
     const typed = entry as Record<string, unknown>;
     const badTransport = (["url", "command"] as const).find(
       field => typed[field] !== undefined && typeof typed[field] !== "string"
@@ -1198,13 +1207,36 @@ export class McpServerManager {
   }
 
   private async connectConfig(config: McpJson): Promise<void> {
-    this.config = config;
+    // ⛔ SANITISE ONCE, HERE, so every reader of `this.config` is safe: `classifyServers` (below),
+    // `catalog()` (mcp_catalog), `loadServer`/the reconnect path, and the idle sweep. This is the single
+    // funnel both entry points go through, so a non-object entry (`{"tortoise": null}` in a legacy or
+    // hand-written config that bypassed `asMcpJson`) can no longer throw `reading 'lazy'` anywhere — the
+    // crash used to move from the extension factory to whichever tool ran next.
+    const sanitised: Record<string, McpServerConfig> = Object.create(null);
+    const rawServers = config?.mcpServers;
+    const declaresServers =
+      !!rawServers && typeof rawServers === "object" && !Array.isArray(rawServers);
+    if (declaresServers) {
+      for (const [name, entry] of Object.entries(rawServers as Record<string, unknown>)) {
+        if (!isServerEntry(entry)) {
+          console.log(
+            `[mcp-client] WARN: server "${name}" is not an object — skipped (no transport, and no crash)`
+          );
+          continue;
+        }
+        sanitised[name] = entry;
+      }
+    }
+    this.config = { ...config, mcpServers: sanitised } as McpJson;
 
-    const servers = config.mcpServers;
-    if (!servers) {
+    // Test the CONFIG, not the sanitised map: an empty map is also what a config with no `mcpServers`
+    // key produces, and that case must keep its own message.
+    if (!declaresServers) {
       console.log("[mcp-client] No mcpServers in .mcp.json");
       return;
     }
+
+    const servers = sanitised;
 
     // #199: eager core connects at startup; lazy servers are skipped and
     // remain discoverable via mcp_catalog + loadable via mcp_load.
@@ -1594,17 +1626,21 @@ export class McpServerManager {
   /** Static catalog of every declared server (no connect required). */
   catalog(): Array<{ name: string; tier: string; status: string; purpose: string; whenToLoad: string; cost: string }> {
     if (!this.config) return [];
-    return Object.entries(this.config.mcpServers).map(([name, cfg]) => {
+    return Object.entries(this.config.mcpServers).flatMap(([name, cfg]) => {
+      // `this.config` is sanitised by `connectConfig`, but `catalog()` is also reachable on a manager
+      // whose config a test (or a future caller) assigned directly — and this is the tool every error
+      // message tells the operator to run, so it must not be the one that throws.
+      if (!isServerEntry(cfg)) return [];
       const lazy = cfg.lazy === true;
       const loaded = this.findConnection(name) !== undefined;
-      return {
+      return [{
         name,
         tier: lazy ? "lazy" : "core",
         status: loaded ? "loaded" : lazy ? "sleeping" : "not-loaded",
         purpose: cfg.purpose ?? "",
         whenToLoad: cfg.whenToLoad ?? "",
         cost: cfg.cost ?? "",
-      };
+      }];
     });
   }
 
