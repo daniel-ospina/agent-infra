@@ -2408,8 +2408,33 @@ publish_review_state acme/widget 42 review-in-flight "$_H16" d1700099999
 # this ties the mechanism to the loop, or the fix lives in the library and never reaches a PR).
 [ "$(grep -cE 'publish_review_state "\$repo" "\$pr" (review-in-flight|awaiting-review) "\$head" "\$_rdisp"' "$SUT")" = 2 ] \
   || bad "both head-bound dispatch claims must pass the per-dispatch key (found $(grep -cE 'publish_review_state "\$repo" "\$pr" (review-in-flight|awaiting-review) "\$head" "\$_rdisp"' "$SUT"), want 2) — with \"\$head\" alone the tag already exists after the first dispatch, so a re-dispatch at the same head can never be published"
-grep -qF '_rdisp="d$(review_dispatched_at "$_rout")"' "$SUT" \
-  || bad "the per-dispatch key must be the DISPATCH EPOCH read from the record, not a constant — an empty or fixed key silently restores the tag that already exists"
+# ⛔ THE KEY MUST BE DRIVEN, AND NOTHING MAY OVERRIDE IT (review round 17, P2, measured): the literal/whole-file
+# pins above are satisfied by the shipped TEXT, so a statement INSERTED after the key's assignment — `_rdisp=`
+# or `_rdisp=d1700000000` — leaves every arm green (measured on the round-16 head: rc=0, 0 FAIL) while every
+# dispatch claim silently reverts to the `(state, head)` tag this fix exists to escape, i.e. the re-dispatch
+# after a rolled exhaustion window is suppressed again for ever. Three pins close it, and each one alone is
+# not enough: the assignment must EXECUTE to the record's epoch (driven), it must be the ONLY statement that
+# computes the key (a decoy duplicate is not a second safety net), and its successor statements are pinned so
+# no inserted line can clear or replace it (`_pin_next`, the technique this file already uses for the
+# `_rout`→`_ratt`→`_rstate` chain).
+_RDISPA='^[[:space:]]*_rdisp="d\$\(review_dispatched_at "\$_rout"\)"[[:space:]]*$'
+_RDEGRADE='^[[:space:]]*case "\$_rdisp" in d\) _rdisp=;; esac[[:space:]]*$'
+_RDISPATE='^[[:space:]]*case "\$\(review_state "\$_rout"\)" in[[:space:]]*$'
+_pin_once "$_RDISPA" "the loop must compute the per-dispatch key ONCE, as '_rdisp=\"d\$(review_dispatched_at \"\$_rout\")\"' — a constant there is a tag that already exists, i.e. the round-16 defect restored"
+_H16REC="$_rdir/review-dispatch-key.out"
+printf 'REVIEW-DISPATCHED at=1700000000 head=%s repo=acme/widget pr=42\nREVIEW-EXIT rc=0\n' "$_H16" > "$_H16REC"
+_rout_save=${_rout:-}
+_rout=$_H16REC
+_rdisp=
+_rdisp_line=$(grep -E "$_RDISPA" "$SUT")
+eval "$_rdisp_line"
+[ "${_rdisp:-}" = d1700000000 ] \
+  || bad "the per-dispatch key must EXECUTE to the dispatch epoch the record carries (got '${_rdisp:-<empty>}', want 'd1700000000') — an empty or constant key silently restores the (state, head) tag, so the claim that follows a rolled exhaustion window is suppressed and the PR keeps the 'not dispatching another review at this revision' text while the loop buys more reviews"
+_rout=$_rout_save
+_pin_next "$_RDISPA" "$_RDEGRADE" \
+  "the per-dispatch key's only degrade must be the VERY NEXT STATEMENT ('case \"\$_rdisp\" in d) _rdisp=;; esac' — the unmeasurable-epoch arm, which posts nothing rather than thrash) — a statement inserted between them ('_rdisp=', or a fixed 'd<epoch>') disarms the key with every text pin still satisfied"
+_pin_next "$_RDEGRADE" "$_RDISPATE" \
+  "the keyed publishes must be the statement that follows the degrade — a statement between them can override the key after it was both computed and checked, which no other arm in this file can see"
 # …and the family scan must match the tag's PREFIX, or every basis-carrying marker drops out of the pairing
 # the moment one is published — re-creating the permanent 'review in flight' this family exists to correct.
 grep -qF '<!-- auto-rail-review:$_o:$head" ' "$SUT" \
