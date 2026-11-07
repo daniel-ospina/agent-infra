@@ -3504,9 +3504,20 @@ ck "the output pin does NOT red a reformat that changes no output (it grades emi
 # separating data from code is the witnesses' `bash -n` + claim-check job, not this predicate's.
 # ⛔ EMPIRICAL FIRST, TEXTUAL ONLY AS A FALLBACK (review P2, cycle 93). `_opts_for` reads the option string the child
 # recorded at EXIT; when it exists it IS the answer ("is this shell in nounset"), and no parse can disagree with it. A
-# script that `exec`s (the PATH shims, and any future one) never reaches EXIT and has no record, so the textual
-# `_setu` covers it — that is the only population the parser is trusted with.
-_opts_for() { awk -F'\t' -v p="$1" '$1 == p { o = $2 } END { print o }' "$TMP/.optlog" 2>/dev/null; }
+# script that `exec`s (the PATH shims) never reaches EXIT and has no record, so the textual `_setu` covers it.
+# ⛔ THAT IS NOT THE ONLY SUCH POPULATION, AND THE COMMENT USED TO CLAIM IT WAS (review P3, cycle 94). The `.sh` sweep
+# also runs over files that are GENERATED BUT NEVER EXECUTED — today `moved.sh` and `skip-revert.sh`, both drivers
+# under `$TMP` that are not declared inputs and are never invoked (measured: 192 `.sh`, 172 executed, 59 unexecuted of
+# which 57 are declared inputs and those 2 are not). No record exists for them, so cycle 92's four wrong rows — a
+# subshell, an uncalled `fin() { set -u; }`, `set -- -u`, a `case` arm — are LIVE on that population. The residual is
+# bounded to the harmless polarity: a file that never runs cannot be unprotected at runtime, so a wrong PROTECTED
+# verdict there costs nothing; what it CAN do is false-block a correct never-executed driver, which is the same
+# over-block this file accepts everywhere else and would be reported by the driver's own author.
+# ⛔ AND THE PATH REACHES AWK THROUGH `ENVIRON`, NEVER `-v` (review P3, cycle 94). `-v` runs awk's escape processing, so
+# a `TMP` containing a backslash made EVERY lookup miss its own record and the channel quietly collapsed back to the
+# textual `_setu` — i.e. cycle 93's P2 false PASS returned in silence, on the one code path added to retire it. The
+# pin section has required `ENVIRON[]` for exactly this reason since cycle 83; this is the same rule, same file.
+_opts_for() { RQ_P="$1" awk -F'\t' '$1==ENVIRON["RQ_P"] { o = $2 } END { print o }' "$TMP/.optlog" 2>/dev/null; }
 _setu_verdict() { # $1=script -> 0 when it RUNS under nounset (empirical when possible)
   _o="$(_opts_for "$1")"
   if [ -n "$_o" ]; then case "$_o" in *u*) return 0 ;; *) return 1 ;; esac; fi
@@ -3596,7 +3607,12 @@ else
   # first snapshot`, and the previous header said the capture was present at one of them — a cause the leaf rules out,
   # the cycle-85 defect re-created twelve lines below its fix. Measured: `rm -f "$TMP/rank-prefix/out"` before the
   # first snapshot printed `was NEVER captured this run` under a "PRESENT at one of the two snapshots" header.
-  rc=1; echo "      a pinned capture is MISSING, CHANGED, or already differed at the first snapshot (the leaves below say which) — a file created AND removed entirely inside the window is outside what a snapshot pair can see:"
+  # ⛔ AND THE SCOPE IS THE WHOLE BRANCH, NOT THE PINNED HALF OF IT (review P3, cycle 94). Cycle 93's reword fixed the
+  # `was NEVER captured this run` leaf but overshot: the branch ALSO reports captures that are NOT in the pin at all —
+  # `APPEARED after the snapshot` and `is NEW and was ALREADY there at the first snapshot`. Measured: a late
+  # `rank/appeared-late.txt` printed `APPEARED after the snapshot` under a "a pinned capture is MISSING, CHANGED, or
+  # already differed" header, with all 159 pinned keys present and correct. The header now names both populations.
+  rc=1; echo "      a capture is MISSING, NEW (present at one snapshot only), CHANGED, or already differed at the first snapshot (the leaves below say which) — a file created AND removed entirely inside the window is outside what a snapshot pair can see:"
   # ⛔ LINE-BY-LINE, NOT WORD SPLITTING (review P3, cycle 79): a case dir named `late case` produced a red whose
   # PROMISED list was empty, because `for x in $( … )` split its key on the space and matched nothing.
   # ⛔ EVERY LOOKUP HERE READS THE KEY FIELD, NEVER A PREFIX (review P3, cycles 79 and 81): `grep -m1x` was parsed as
@@ -3632,7 +3648,7 @@ else
 $(printf '%s\n' "$_lkv_new" "$_lkv_pin" | cut -f1 | LC_ALL=C sort -u)
 EOF
 fi
-ck "the pinned population is UNCHANGED at the END of the run — every pinned capture is present with its pinned CRC (a missing, changed or drifted one was named above)" $rc
+ck "the capture population is UNCHANGED at the END of the run — every pinned capture is present with its pinned CRC, and no capture appeared or vanished (a missing, new, changed or drifted one was named above)" $rc
 
 echo "── rank-queue: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ] || exit 1
