@@ -3940,6 +3940,71 @@ grep -q 'run by NO loop on this box: com.test.extra19aj' <<<"$out19aj2" \
   || bad "19aj CONTROL: the fix swallowed a genuine divergence (rc=$rc19aj2): $out19aj2"
 kill "$pidAJ" 2>/dev/null; sleep 1
 
+# 19ak — ⛔ A RELATIVE `TORTOISE_REPO` MUST REACH THE CHILD RESOLVED TOO, and this one is NOT a matter
+# of taste: `placeholder_values()` decides with `os.path.isdir(tortoise)` whether to KEEP the value or
+# replace it with an absolute fallback checkout, so a relative pin kept its relative form in the parent
+# and was replaced (or emptied) in the child. Measured by the #3636 reviewer: `--install` printed
+# `SCHEDULE VERIFIED — 2 job(s) live` while the loop child rendered `{{TORTOISE_REPO}}` as "" and
+# classified the tortoise job as a named SKIP — the loop ran zero of it and `--verify` never saw it.
+# `absolutize_path_knobs()` now rewrites the knob in the PARENT, so `os.environ.copy()` hands the child
+# the resolved value and both processes render the same argv.
+mkdir -p "$T/bin19ak" "$T/tpl19ak" "$T/relcwd19ak/tort19ak/.git"
+cp "$SCHED" "$T/bin19ak/fleet-schedule.py"
+printf '# none\n' > "$T/tpl19ak/RETIRED"
+MARK19AK="$T/out/marker19ak.log"
+python3 - "$T/tpl19ak" "$MARK19AK" <<'PY19AK'
+import os, plistlib, sys
+d = {"Label": "com.test.tort19ak",
+     "ProgramArguments": ["/bin/sh", "-c", "echo tort={{TORTOISE_REPO}} >> %s" % sys.argv[2]],
+     "StartInterval": 2}
+with open(os.path.join(sys.argv[1], "com.test.tort19ak.plist"), "wb") as fh:
+    plistlib.dump(d, fh)
+PY19AK
+out19ak="$(cd "$T/relcwd19ak" && env -u CELL_HOME -u SWARM_ROOT TORTOISE_REPO=tort19ak \
+  TEMPLATES_DIR="$T/tpl19ak" FLEET_SCHEDULE_STATE="$T/s19ak" FLEET_SCHEDULE_LOCK_ROOT="$L19/ak" \
+  FLEET_SCHEDULE_TICK=2 python3 "$T/bin19ak/fleet-schedule.py" --start 2>&1)"; rc19ak=$?
+[ "$rc19ak" -eq 0 ] \
+  && ok "19ak --start with a RELATIVE TORTOISE_REPO exits 0" \
+  || bad "19ak --start exited $rc19ak: $out19ak"
+wait19ak=0
+while [ ! -s "$MARK19AK" ] && [ "$wait19ak" -lt 25 ]; do sleep 1; wait19ak=$((wait19ak + 1)); done
+[ -s "$MARK19AK" ] \
+  && ok "19ak the loop child RAN the {{TORTOISE_REPO}} job (the placeholder rendered)" \
+  || bad "19ak the child never ran the job — a relative TORTOISE_REPO emptied there: $out19ak / $(tail -3 "$T/s19ak/loop.log" 2>/dev/null)"
+grep -qvx "tort=$T/relcwd19ak/tort19ak" "$MARK19AK" 2>/dev/null \
+  && bad "19ak the child rendered a DIFFERENT {{TORTOISE_REPO}}: $(grep -v '^tort=' "$MARK19AK" | head -2)" \
+  || ok "19ak ⛔ the child's render IS the checkout the parent resolved (one repo, one argv)"
+pidAK="$(cat "$T/s19ak/loop.pid" 2>/dev/null)"; kill "$pidAK" 2>/dev/null; sleep 1
+
+# 19al — ⛔ `--install` MUST NOT REWRITE THE DECLARATION POINTER WHEN THE LOOP WAS ALREADY RUNNING. The
+# pointer became LOAD-BEARING in this change (`cmd_verify` reads it and grades THAT set), and
+# `--install` wrote it unconditionally at the top — so an install with a different TEMPLATES_DIR over an
+# already-running loop replaced "the set the box runs" with "the set this invocation happened to look
+# at". Measured: pointer tplA -> tplB while `loop.log` still start-named tplA, after which a second
+# home's `--verify` graded tplB and left every job of the loop's REAL set ungraded — the same lie 19ad
+# pins for `--start`, injected by the sibling entry point. `--start`'s ruling applies here verbatim:
+# record the set only when this invocation actually STARTED the loop.
+mkdir -p "$T/tpl19alA" "$T/tpl19alB"
+cp "$GOOD"/*.plist "$T/tpl19alA/" 2>/dev/null
+cp "$GOOD"/*.plist "$T/tpl19alB/" 2>/dev/null
+printf '# none\n' > "$T/tpl19alA/RETIRED"; printf '# none\n' > "$T/tpl19alB/RETIRED"
+s19 "$T/s19al" "$T/tpl19alA" --install >/dev/null 2>&1
+pidAL="$(cat "$T/s19al/loop.pid" 2>/dev/null)"
+[ -n "$pidAL" ] && kill -0 "$pidAL" 2>/dev/null \
+  && ok "19al baseline: --install started a loop for state dir AL" \
+  || bad "19al baseline loop never came up — the arm grades nothing"
+[ "$(cat "$T/s19al/templates-dir" 2>/dev/null)" = "$T/tpl19alA" ] \
+  && ok "19al --install records the declaration set when it STARTED the loop (the pointer is written)" \
+  || bad "19al --install did not record its own set: $(cat "$T/s19al/templates-dir" 2>/dev/null)"
+out19al="$(s19 "$T/s19al" "$T/tpl19alB" --install 2>&1)"
+grep -q 'loop already running' <<<"$out19al" \
+  && ok "19al the second --install found the live loop (so the pointer must not move)" \
+  || bad "19al the second --install did not see the running loop: $out19al"
+[ "$(cat "$T/s19al/templates-dir" 2>/dev/null)" = "$T/tpl19alA" ] \
+  && ok "19al ⛔ --install over a RUNNING loop did NOT rewrite the pointer to a set nothing reads" \
+  || bad "19al --install rewrote the pointer to a set the loop does not read ($T/tpl19alA -> $(cat "$T/s19al/templates-dir" 2>/dev/null))"
+kill "$pidAL" 2>/dev/null; sleep 1
+
 # 19g — an UNUSABLE lock root must NOT wedge the box: it degrades to the state dir and DISCLOSES it.
 : > "$T/not-a-dir"
 out19g="$(env TEMPLATES_DIR="$GOOD" FLEET_SCHEDULE_STATE="$T/s19g" \

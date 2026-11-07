@@ -189,6 +189,45 @@ def resolve_infra_root() -> str:
     return ""
 
 
+def absolutize_path_knobs():
+    """Resolve every CWD-SENSITIVE path knob ONCE, in the parent, before anything renders.
+
+    ⛔ The loop child runs with `cwd="/"` (see `spawn_loop`), and `placeholder_values()` re-reads these
+    knobs there. Any knob whose VALUE is acted on relative to the cwd — `os.path.isdir()`, `os.access()`,
+    `open()` — therefore resolves DIFFERENTLY in the child, and the child then renders a different job
+    argv than the inline pass and `--verify` certified: a placeholder renders empty (a named SKIP, so the
+    job silently never runs) or names a different checkout (so the job runs against something nobody
+    certified). Both are the `SCHEDULE VERIFIED`-over-a-loop-that-runs-nothing false PASS this change
+    exists to remove, and it is NOT just `INFRA_ROOT`:
+
+      TORTOISE_REPO  `os.path.isdir(tortoise)` decides whether the value is kept or replaced by the
+                     fallback scan, so a RELATIVE value can keep its relative form in the parent and
+                     be replaced by an ABSOLUTE checkout in the child (measured).
+      SWARM_ROOT     `os.access(join(SWARM_ROOT, '.venv/bin/python'))` feeds `PYTHON_BIN`, so the same
+                     relative root yields two different interpreters.
+      CELL_HOME      `home` — and `WORKTREE_HYGIENE_MODE` / `REAP_ORPHAN_MODE` / `SWARM_ENV_FILE` are
+                     all derived from it by `open()`.
+      SWARM_ENV_FILE a path read with `open()`.
+      PYTHON_BIN / PI_NODE_BIN  executables: a value WITH a separator is cwd-resolved; a BARE NAME is a
+                     PATH lookup and is identical in both processes, so it is left alone (abspath on
+                     `python3` would invent a file that does not exist).
+
+    Normalising `os.environ` itself is deliberate: `spawn_loop` passes `os.environ.copy()`, so the child
+    inherits the RESOLVED values without a second handover list to drift out of date — which is exactly
+    how the `INFRA_ROOT` gap happened. `FLEET_SCHEDULE_STATE` / `TEMPLATES_DIR` / `FLEET_SCHEDULE_LOCK_ROOT`
+    still need their explicit handover because they are resolved from DEFAULTS rather than from an env
+    value the child would simply re-read.
+    """
+    for knob in ("TORTOISE_REPO", "SWARM_ROOT", "CELL_HOME", "SWARM_ENV_FILE"):
+        val = os.environ.get(knob, "")
+        if val:
+            os.environ[knob] = os.path.abspath(val)
+    for knob in ("PYTHON_BIN", "PI_NODE_BIN"):
+        val = os.environ.get(knob, "")
+        if val and os.sep in val:
+            os.environ[knob] = os.path.abspath(val)
+
+
 def wt_hygiene_mode(home: str) -> str:
     """`--apply` only when the arming record exists AND names who armed it and when — the SAME
     two-key test scripts/install-launchd.sh's wt_hygiene_mode() applies. It ships DISARMED, so
@@ -2135,10 +2174,16 @@ def spawn_loop():
         # the loop ran ZERO of them while `--install` printed `SCHEDULE VERIFIED` — the same false
         # PASS as a relative `TEMPLATES_DIR`, one knob over (measured by the #3636 reviewer, who
         # watched the parent's marker carry the caller's path and the child's carry another).
-        # `SWARM_ROOT`/`TORTOISE_REPO` are NOT in this list on purpose: neither is `abspath`-ed
-        # anywhere, so both render VERBATIM in parent and child and cannot diverge. Named as a
-        # residual rather than silently normalised — making them absolute would change the argv the
-        # templates ship.
+        # ⛔ AND `INFRA_ROOT` IS NOT THE LAST ONE EITHER. The rest of the cwd-sensitive set —
+        # `TORTOISE_REPO`, `SWARM_ROOT`, `CELL_HOME`, `SWARM_ENV_FILE`, and the path-valued
+        # `PYTHON_BIN`/`PI_NODE_BIN` — is NOT listed here because `absolutize_path_knobs()` has
+        # already rewritten `os.environ` in the parent, so `os.environ.copy()` below carries them
+        # RESOLVED. A previous cut claimed in this comment that `SWARM_ROOT`/`TORTOISE_REPO` "cannot
+        # diverge because neither is abspath-ed anywhere" — that was FALSE (`placeholder_values()`
+        # does `os.path.isdir()`/`os.access()`/`open()` on them, which is cwd-relative) and the claim
+        # itself was the trap: a reviewer measured `--install` printing `SCHEDULE VERIFIED` over a
+        # loop that skipped its tortoise jobs. Keep the handover list and the absolutise list in sync
+        # — or better, add knobs to `absolutize_path_knobs()` and leave this block alone.
         child_env = os.environ.copy()
         child_env["FLEET_SCHEDULE_STATE"] = STATE
         if TEMPLATES_DIR:
@@ -2802,7 +2847,15 @@ def cmd_install():
             file=sys.stderr,
         )
         return 1
-    remember_templates_dir()
+
+    # ⛔ THE DECLARATION POINTER IS LOAD-BEARING NOW (`cmd_verify` reads it and grades THAT set), so it
+    # may only be written by an invocation that STARTED this state dir's loop — the same ruling `--start`
+    # already carries. Writing it unconditionally here recorded the CALLER's set for a loop that keeps
+    # reading its own: `--install` with a different `TEMPLATES_DIR` over an already-running loop rewrote
+    # the pointer, after which a second home's `--verify` graded the caller's set, printed "its DECLARATION
+    # set, which is the set that actually runs here" over a set the loop does not read, and left every job
+    # of the loop's REAL set ungraded (measured: pointer tplA -> tplB while `loop.log` still start-named
+    # tplA). That is the same lie 19ad was written to prevent, injected by the sibling entry point.
 
     # The first pass is run INLINE, before the loop exists, so that `--install` ends with EVIDENCE
     # (a stamp and a log line per runnable job) rather than with a pid. "A unit that loads and
@@ -2884,6 +2937,17 @@ def cmd_install():
         # delivery path could be beside it" message. Found by the [VGATE] pass.
         if started:
             print("loop started (pid %d, tick %ds)" % (pid, TICK))
+            try:
+                remember_templates_dir()
+            except OSError as exc:
+                # A state dir we cannot write the pointer into must not fail an install that just
+                # started the loop; it degrades a later second-home grade, so it is SAID.
+                print(
+                    "  NOTE   could not record the declaration set in %s (%s) — a scheduler for "
+                    "another state dir on this box will grade ITS OWN declarations against this "
+                    "loop's stamps" % (STATE, exc),
+                    file=sys.stderr,
+                )
     return cmd_verify()
 
 
@@ -3138,6 +3202,11 @@ def main(argv):
     # — and `cmd_verify`'s holder-set check would resolve it against whichever cwd the caller had.
     if TEMPLATES_DIR:
         TEMPLATES_DIR = os.path.abspath(TEMPLATES_DIR)
+    # ⛔ AND THE SAME RULE FOR EVERY OTHER CWD-SENSITIVE KNOB, in one place rather than one per fix (see
+    # `absolutize_path_knobs`): the child re-reads these against `cwd="/"`, so a relative value rendered
+    # a different argv there — `TORTOISE_REPO=tortoise` measured as a `SCHEDULE VERIFIED` over a loop
+    # that skipped its tortoise jobs entirely. Called BEFORE anything renders or spawns.
+    absolutize_path_knobs()
     TICK = int(os.environ.get("FLEET_SCHEDULE_TICK") or 60)
     JOB_TIMEOUT = int(os.environ.get("FLEET_SCHEDULE_JOB_TIMEOUT") or 1800)
 
