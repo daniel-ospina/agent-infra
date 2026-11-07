@@ -16630,10 +16630,19 @@ grep -qE 'of the (3600|3599|3598)s bound' "$TMP/err" \
 
 # ── 80. #3322: A CHECK MAIN ITSELF FAILS IS EXCLUDED FROM THE REQUIRED SURFACE ─
 # THE DEFECT. `ci.yml` is pull_request-only (it runs `bash-suites (1..n)`); `ci-main.yml`
-# is push-only and runs the SAME sweep UNSHARDED as `script-validate`. Main is red on
+# is push-only and runs the SAME sweep as `script-validate`. Main is red on
 # `script-validate`, so every PR is red on the shards — and the rail refused every merge
 # for a red NO diff can clear. Measured 2026-11-05: three unrelated PRs (#3478, #3168,
 # #3486) were red on the identical nine checks, and #3478 had zero unique reds.
+#
+# ⛔ THE BASE NAME IS ARM-KEYED HERE, because THIS PR shards main's lane (#3174):
+# `ci-main.yml`'s `script-validate` became a matrix and now publishes `script-validate (1)`
+# … `(8)`, exactly like the PR's `bash-suites (k)`, and `declared_base_equivalent` maps
+# arm k to arm k. The fixtures below therefore name the SHARDED base red. A bare
+# `script-validate` red is NOT a substituted counterpart: after this lands main publishes
+# it only from a pre-shard run still inside the baseline window, and excusing a PR arm on
+# a whole-sweep name is the name-family reading `(n1b)` exists to refuse (it fails CLOSED
+# instead — the pre-#2610 status quo — until a sharded base run is measured).
 #
 # THE RULE UNDER TEST: a red on the PR's evaluated tree is EXCLUDED from the required
 # surface when the BASE's own check surface (read from GitHub, not from a caller flag)
@@ -16645,8 +16654,8 @@ grep -qE 'of the (3600|3599|3598)s bound' "$TMP/err" \
 # arm must go RED when the exclusion is deleted.
 echo "== 80. #3322: a check MAIN ITSELF FAILS is excluded from the required surface =="
 
-# (a) THE FIX — the observed block. main fails `script-validate` (push-only ci-main.yml,
-# the sharded PR lane's unsharded twin); the PR's tree is red on `bash-suites (3)`.
+# (a) THE FIX — the observed block. main fails `script-validate (3)` (push-only ci-main.yml,
+# the sharded PR lane's arm-keyed twin); the PR's tree is red on `bash-suites (3)`.
 new_scen baseowned-excluded
 HEAD_BO1="b0b0000000000000000000000000000000000000"
 printf '%s\n' "$HEAD_BO1" > "$SCEN/head"
@@ -16658,7 +16667,7 @@ write_pr_checks \
 pr_run_map 7201 pull_request 'CI'
 pr_run_map 7202 pull_request 'CI'
 write_main_checks \
-  "$(check_run 6101 'script-validate' completed failure 8201 2026-01-02T00:00:00Z 2026-01-02T00:01:00Z)" \
+  "$(check_run 6101 'script-validate (3)' completed failure 8201 2026-01-02T00:00:00Z 2026-01-02T00:01:00Z)" \
   "$(check_run 6102 'extension-tests / lint' completed success 8201)"
 main_run_map 8201 push 'CI on main'
 printf 'push\tCI on main\t.github/workflows/ci-main.yml\n' > "$SCEN/run-8201"
@@ -16679,7 +16688,7 @@ grep -q "pr merge" "$SCEN/calls" && pass "(a) …and the merge actually happened
 # by the exclusion line (stderr) and by the evidence comment's exclusion block, so it is the
 # one string that makes the "with the base check that owns it" claim deny-able.
 if grep -q "EXCLUDED from the required surface" "$SCEN/err" \
-   && grep -q "the base itself fails 'script-validate'" "$SCEN/err" \
+   && grep -q "the base itself fails 'script-validate (3)'" "$SCEN/err" \
    && grep -q "bash-suites (3)" "$SCEN/err"; then
   pass "(a) …and the excluded red is REPORTED by name, with the base check that owns it"
 else
@@ -16699,7 +16708,7 @@ grep -q "NOT pull-request-evaluable" "$SCEN/err" \
 # indistinguishable there from a silent drop (the #6807 rule, same reason).
 if [ -f "$SCEN/comment" ] \
    && grep -q "Tree red(s) EXCLUDED from the required surface" "$SCEN/comment" \
-   && grep -q "the base itself fails 'script-validate'" "$SCEN/comment" \
+   && grep -q "the base itself fails 'script-validate (3)'" "$SCEN/comment" \
    && grep -q "bash-suites (3)" "$SCEN/comment"; then
   pass "(a) …and the DURABLE evidence comment carries the excluded red, not just stderr"
 else
@@ -16734,7 +16743,7 @@ grep -q "EXCLUDED from the required surface" "$SCEN/err" \
 grep -q "pr merge" "$SCEN/calls" && fail "(b) a merge was attempted over a red tree" || pass "(b) no merge attempted"
 
 # (c) THE SECOND GUARD — A PR-EVALUABLE BASE RED IS NOT BASE-OWNED. The base's
-# `script-validate` is red here too, but its workflow DECLARES pull_request, so a PR CAN
+# `script-validate (3)` is red here too, but its workflow DECLARES pull_request, so a PR CAN
 # attach that check and §4.5/§4.6 must keep insisting the repair PR clear it (#1261).
 # This is the arm that keeps the new exclusion off the repair direction.
 new_scen baseowned-base-prevaluable
@@ -16743,7 +16752,7 @@ printf '%s\n' "$HEAD_BO3" > "$SCEN/head"
 lane_pass "$HEAD_BO3" 7121 > "$SCEN/runs-$HEAD_BO3"
 lane_pass mainbo3 7122 > "$SCEN/runs-main"
 write_main_checks \
-  "$(check_run 6121 'script-validate' completed failure 8221 2026-01-02T00:00:00Z 2026-01-02T00:01:00Z)"
+  "$(check_run 6121 'script-validate (3)' completed failure 8221 2026-01-02T00:00:00Z 2026-01-02T00:01:00Z)"
 main_run_map 8221 push 'CI on main'
 printf 'push\tCI on main\t.github/workflows/ci-main.yml\n' > "$SCEN/run-8221"
 wf_declares .github/workflows/ci-main.yml push pull_request
@@ -16777,7 +16786,7 @@ printf '%s\n' "$HEAD_BO4" > "$SCEN/head"
 lane_pass "$HEAD_BO4" 7131 > "$SCEN/runs-$HEAD_BO4"
 lane_pass mainbo4 7132 > "$SCEN/runs-main"
 write_main_checks \
-  "$(check_run 6131 'script-validate' completed failure 8231 2026-01-02T00:00:00Z 2026-01-02T00:01:00Z)"
+  "$(check_run 6131 'script-validate (3)' completed failure 8231 2026-01-02T00:00:00Z 2026-01-02T00:01:00Z)"
 main_run_map 8231 push 'CI on main'
 printf 'push\tCI on main\t.github/workflows/ci-main.yml\n' > "$SCEN/run-8231"
 wf_declares .github/workflows/ci-main.yml push
@@ -16830,7 +16839,7 @@ write_pr_checks \
 pr_run_map 7241 pull_request 'CI'
 pr_run_map 7242 pull_request 'CI'
 write_main_checks \
-  "$(check_run 6141 'script-validate' completed failure 8241 2026-01-02T00:00:00Z 2026-01-02T00:01:00Z)" \
+  "$(check_run 6141 'script-validate (3)' completed failure 8241 2026-01-02T00:00:00Z 2026-01-02T00:01:00Z)" \
   "$(check_run 6142 'extension-tests / lint' completed success 8241)"
 main_run_map 8241 push 'CI on main'
 printf 'push\tCI on main\t.github/workflows/ci-main.yml\n' > "$SCEN/run-8241"
@@ -16863,7 +16872,7 @@ grep -q "pr merge" "$SCEN/calls" && fail "(e) the mutant merged — no defect re
 # every other assertion green — the vacuous-guard class #3442 exists to end (a test that
 # cannot fail is not a test). This arm makes the conjunct load-bearing: the tree's red is
 # `bash-suites (3)` (so `declared_base_equivalent` WOULD match it) but its run map says
-# `schedule`, and the base is red on `script-validate` under a push-only workflow. Without
+# `schedule`, and the base is red on `script-validate (3)` under a push-only workflow. Without
 # the conjunct the red is excluded as base-owned and the merge proceeds; with it the red is
 # the ANOMALY the header calls it and the rail must still refuse.
 new_scen baseowned-noncode
@@ -16879,7 +16888,7 @@ pr_run_map 7251 pull_request 'CI'
 # models: a run a PR cannot attach re-routed to a check on the head sha.
 pr_run_map 7252 schedule 'CI'
 write_main_checks \
-  "$(check_run 6151 'script-validate' completed failure 8251 2026-01-02T00:00:00Z 2026-01-02T00:01:00Z)" \
+  "$(check_run 6151 'script-validate (3)' completed failure 8251 2026-01-02T00:00:00Z 2026-01-02T00:01:00Z)" \
   "$(check_run 6152 'extension-tests / lint' completed success 8251)"
 main_run_map 8251 push 'CI on main'
 printf 'push\tCI on main\t.github/workflows/ci-main.yml\n' > "$SCEN/run-8251"
@@ -16928,8 +16937,8 @@ pr_run_map 7262 pull_request 'CI'
 # guard. The second row is therefore written raw with a different app slug: two identities,
 # one name — the real shape of "two apps publish the same check name".
 write_main_checks \
-  "$(check_run 6161 'script-validate' completed failure 8261 2026-01-02T00:00:00Z 2026-01-02T00:01:00Z)" \
-  "$(printf '{"id":6162,"name":"script-validate","status":"completed","conclusion":"failure","app":{"slug":"third-party-ci"},"started_at":"2026-01-02T00:00:00Z","completed_at":"2026-01-02T00:01:00Z","html_url":"https://github.com/daniel-ospina/agent-infra/actions/runs/8262/job/1"}')"
+  "$(check_run 6161 'script-validate (3)' completed failure 8261 2026-01-02T00:00:00Z 2026-01-02T00:01:00Z)" \
+  "$(printf '{"id":6162,"name":"script-validate (3)","status":"completed","conclusion":"failure","app":{"slug":"third-party-ci"},"started_at":"2026-01-02T00:00:00Z","completed_at":"2026-01-02T00:01:00Z","html_url":"https://github.com/daniel-ospina/agent-infra/actions/runs/8262/job/1"}')"
 main_run_map 8261 push 'CI on main' 8262 pull_request 'CI'
 printf 'push\tCI on main\t.github/workflows/ci-main.yml\n' > "$SCEN/run-8261"
 printf 'pull_request\tCI\t.github/workflows/ci.yml\n' > "$SCEN/run-8262"
