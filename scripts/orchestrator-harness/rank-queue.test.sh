@@ -1795,18 +1795,28 @@ ck "a 'handed NOTHING' record carries the order's PROVENANCE, so unranked and pr
 # ⛔ EVERY "HANDED NOTHING" ARM, NOT JUST THE ONE THE DIFFERENTIAL HAPPENS TO REACH (review P3, cycle 57): the
 # field was added to four records and only the measured-depth arm was graded, so deleting it from the other
 # three left both suites green while ARCHITECTURE's "every handoff record carries it" silently went false.
-for _hw in 'drained|empty|backlog=0' 'garbage|garbage|DEPTH is measured' 'dir|dir|queue could NOT be read' 'wcfailg|wcfail-garbage|its DEPTH nor its HEAD'; do
+# ⛔ EACH ARM IS DRIVEN UNDER **TWO** STATES (review P2, cycle 58). With one state per arm, a single hardcoded
+# state word in the arm (`$(skip_order_why severity)`) satisfied every check, so a `priority-unreadable` pass
+# would have recorded "the ORDER was re-derived severity-first from the pool" — the exact false durable claim
+# this PR exists to close — and both suites stayed green. Two states per arm make the arm's CONSULTATION of
+# the state observable: the second drive must carry the second state's clause.
+# ⛔ AND EACH NEEDLE IDENTIFIES ITS ARM (review P3, cycle 58): `backlog=0` also matches the rows-no-head arm
+# whenever its measured depth is 0, so the drained arm's needle is its sentence, not its count.
+for _hw in 'drained|empty|the queue is empty' 'garbage|garbage|DEPTH is measured' 'dir|dir|queue could NOT be read' 'wcfailg|wcfail-garbage|its DEPTH nor its HEAD'; do
   _hw_how="${_hw%%|*}"; _rest="${_hw#*|}"; _hw_setup="${_rest%%|*}"; _hw_needle="${_rest#*|}"
-  main_handoff "hw-$_hw_how" "$_hw_setup" severity
-  _hw_rec="$(printf '%s\n' "$MHOUT" | grep '^RECORD:' | grep 'handed=' | head -1)"
-  if [ -z "$_hw_rec" ]; then
-    rc=1; echo "      the $_hw_how arm recorded no handoff row"
-  elif ! grep -q 'handed_why=WHY:severity' <<<"$_hw_rec"; then
-    rc=1; echo "      the $_hw_how arm's record carries no handed_why= (field missing or not the state's clause): '$_hw_rec'"
-  elif ! grep -qF "$_hw_needle" <<<"$_hw_rec"; then
-    rc=1; echo "      the $_hw_how fixture did not land on the arm it names (want '$_hw_needle' in the row): '$_hw_rec'"
-  else rc=0; fi
-  ck "every 'handed NOTHING' arm records the provenance — the $_hw_how arm ('$_hw_needle')" $rc
+  _hw_bad=0
+  for _hw_st in severity priority-unreadable; do
+    main_handoff "hw-$_hw_how-$_hw_st" "$_hw_setup" "$_hw_st"
+    _hw_rec="$(printf '%s\n' "$MHOUT" | grep '^RECORD:' | grep 'handed=' | head -1)"
+    if [ -z "$_hw_rec" ]; then
+      _hw_bad=1; echo "      the $_hw_how arm ($_hw_st) recorded no handoff row"
+    elif ! grep -qF "handed_why=WHY:$_hw_st" <<<"$_hw_rec"; then
+      _hw_bad=1; echo "      the $_hw_how arm ($_hw_st) does not carry ITS OWN state's clause in handed_why= (the arm typed a word instead of consulting the state, or the field is gone): '$_hw_rec'"
+    elif ! grep -qF "$_hw_needle" <<<"$_hw_rec"; then
+      _hw_bad=1; echo "      the $_hw_how arm ($_hw_st) did not land on the arm it names (want '$_hw_needle' in the row): '$_hw_rec'"
+    fi
+  done
+  ck "every 'handed NOTHING' arm consults the STATE and records its clause — the $_hw_how arm ('$_hw_needle', driven under two states)" $_hw_bad
 done
 # (c) NON-VACUITY — revert the guarded read to the pre-fix unguarded one (which coerces a failed `wc` to 0)
 # and show fixture (a) goes RED. A guard that survives its own revert is not the thing being graded.
