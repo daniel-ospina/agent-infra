@@ -246,6 +246,15 @@ export SYSTEMD_UNIT_DIR="$T/systemd-units"
 # directory is derived from it.
 export CONTROLLER_SYSTEM_UNIT_DIR="$T/systemd-units"
 export HOME="$T/home"
+# ⛔ THE FIXTURE FARMS THE SUPERVISOR, AND THAT IS NOT COSMETIC (agent-infra#2697). `check_controller_service`
+# hands the installer the LAYER's supervisor as a PREFERENCE, and the installer SKIPS it when it cannot survive
+# a cleaning — which is the case whenever this suite runs from a lane worktree (`.worktrees/`), the exact
+# shape #2697 measured. What it falls through to is this farm, so a fixture home with an empty
+# `.pi/agent/scripts` would leave the controller install with nowhere durable to land. A cell whose farm has
+# no supervisor (#1938's named residual) is the shape that then gets the installer's loud refusal — correct
+# on a worktree, and not what these arms are about.
+mkdir -p "$T/home/.pi/agent/scripts"
+cp "$HERE/cloud-cell-supervisor.sh" "$T/home/.pi/agent/scripts/cloud-cell-supervisor.sh"
 # The one-home check (#2916) refuses a cell-state path under a volatile root that is NOT under
 # CELL_HOME. This fixture's home IS under the host's temp dir, so the shipped default (`/tmp:/var/tmp`)
 # would redden every arm on a Linux host for the fixture's own sake. Same kind of seam as
@@ -399,8 +408,18 @@ br() {
   # `INFRA_ROOT` is cleared for the same reason as the others: the bring-up tries it FIRST when it
   # resolves the infra checkout, so a developer shell that exports it makes the layer arms grade a
   # DIFFERENT checkout (measured: an ambient decoy's installer ran and the suite still reported 142/0).
+  # `HARNESS_PIN_DIR` / `HARNESS_PIN_FILE` are cleared for the SAME reason, and the measurement is this
+  # suite's own: with them ambient — every cell exports both to its children
+  # (`cloud-cell-supervisor.sh`, `launchd-controller.sh`) — the bring-up grades THIS BOX's pin instead of
+  # the fixture's, `check_harness_pin` FATALs on `/home/cmux/harness exists but is NOT a git worktree of
+  # $T/infra`, and the whole suite collapses (measured on a pin-exporting box: PASS=238 FAIL=78 here vs
+  # PASS=236 FAIL=77 on the unmodified `origin/main`, i.e. 76 arms red for one ambient seam rather than
+  # for anything the PR under test did). That is the identical "host dependency wearing a test's clothes"
+  # class the two paragraphs above record, one seam over; the arms that need a pin ask for one by name
+  # through `BR_EXTRA_ENV`, which is applied AFTER these clears.
   BR_OUT="$(env -u AGENT_INFRA_PATH -u INFRA_ROOT -u TORTOISE_REPO -u DISK_REAPER_REPOS -u GH_REPO \
             -u DEEPSEEK_API_KEY -u ANTHROPIC_API_KEY \
+            -u HARNESS_PIN_DIR -u HARNESS_PIN_FILE \
             PATH="$STUB:$PATH" REPO="${BR_AMBIENT_REPO:-}" GH_REPO="${BR_GH_REPO:-}" \
             ${BR_EXTRA_ENV:+$BR_EXTRA_ENV} \
             CELL_HOME="$T/home" WORKDIR="$T/cell" ENV_FILE="${BR_ENV_FILE:-$T/keys.env}" \
@@ -553,6 +572,52 @@ if [ -f "$T/systemd-units/eldato-orchestrator.service" ]; then
 else
   bad "no controller unit was installed under $T/systemd-units"
 fi
+# ⛔ AND ITS ExecStart MUST BE A PATH THAT OUTLIVES THE LANE (agent-infra#2697). The bring-up prefers the
+# LAYER's supervisor; when the layer IS a lane worktree that preference must be skipped, never rendered — a
+# unit whose ExecStart a lane reap removes burns its start limit, converges to `failed` inside a minute, and
+# nothing pages. This assertion is location-independent on purpose: on a durable checkout the layer path IS
+# correct, and on a worktree the farm is.
+case "$(sed -n 's|^ExecStart=/bin/bash \(.*\) start$|\1|p' "$T/systemd-units/eldato-orchestrator.service" 2>/dev/null | head -1)" in
+  */.worktrees/*) bad "the controller unit's ExecStart is a LANE WORKTREE path — the measured #2697 defect, re-shipped: $(grep -h '^ExecStart' "$T/systemd-units/eldato-orchestrator.service")" ;;
+  '') bad "the controller unit carries no readable ExecStart — cannot tell what this box would boot" ;;
+  *) ok "the controller unit's ExecStart is not a lane worktree — it survives the lane that installed it" ;;
+
+esac
+
+# ⛔ AND WITH NO FARM THE RUN MUST EITHER REFUSE OR ARM SOMETHING DURABLE — NEVER A TRANSIENT PATH.
+# This is the discriminating half of the arm above: a fixture that always has a farm would pass on pre-#2697
+# code too (the pre-fix installer ignores ORCH_SUPERVISOR_PREFER and picks the farm), while the shape this
+# fleet actually hit — install from a lane worktree with no farm — is exactly where the old code armed
+# `/tmp/wt-*` as the boot entry point.
+# ⛔ AND IT IS NOT THE LITERAL "MUST REFUSE" (re-review P1). The installer's fourth candidate is the copy
+# BESIDE ITSELF, so on a DURABLE checkout — which is what CI checks out (`/home/runner/work/…`) — that
+# candidate is legitimately durable and the install must succeed; an arm asserting a refusal would go red on
+# the durable-checkout leg CI itself runs. So this arm asserts the SHAPE property instead of a refusal.
+#
+# ⛔ THE SHAPES, NOT A PREFIX LIST (re-review P2). This arm used to red any `/tmp/*`, `/var/tmp/*`, `/run/*`
+# ExecStart — which contradicts the installer's own contract and is a FALSE RED on the fleet's real deployment
+# shape: a PRIMARY clone under `/tmp` (`/tmp/cell-ai`) and a harness pin under `/tmp/cell-home` are both
+# explicitly ADMITTED (install-controller-service.test.sh §P7(b) and §P4 assert exactly that). The property
+# this arm can hold on every box is the one the installer enforces: no lane-scratch shape, no empty entry.
+# The installer already refused every non-durable path, so re-deriving durability here would be a second
+# implementation of the rule — the class the installer's own header forbids.
+FARMED_SUP="$T/home/.pi/agent/scripts/cloud-cell-supervisor.sh"
+mv -f "$FARMED_SUP" "$FARMED_SUP.aside" 2>/dev/null
+rm -f "$T/systemd-units/eldato-orchestrator.service"
+printf '%s\n' "$TOK_BODY" > "$TOK"
+br ok normal --check
+if [ -f "$T/systemd-units/eldato-orchestrator.service" ]; then
+  case "$(sed -n 's|^ExecStart=/bin/bash \(.*\) start$|\1|p' "$T/systemd-units/eldato-orchestrator.service" 2>/dev/null | head -1)" in
+    */.worktrees/*|/tmp/wt-*|/tmp/cell-wt-*|/tmp/base-*|'') bad "with no farm the bring-up armed an ExecStart a lane removal takes — the #2697 defect, re-shipped: $(grep -h '^ExecStart' "$T/systemd-units/eldato-orchestrator.service")" ;;
+    *) ok "with no farm the bring-up armed only a path a cleaning SURVIVES (this checkout is durable, so the beside-the-layer candidate is real)" ;;
+  esac
+else
+  [ "$BR_RC" -ne 0 ] && ok "with no farm the bring-up REFUSED to supervise the controller from a transient checkout (rc=$BR_RC)" \
+                     || bad "the bring-up returned 0 with no controller unit installed and no durable supervisor — an unsupervised controller"
+  ok "…and it wrote NO unit (fail-closed, never a half-install)"
+fi
+mv -f "$FARMED_SUP.aside" "$FARMED_SUP" 2>/dev/null
+rm -f "$T/systemd-units/eldato-orchestrator.service"
 
 say_case "a cell whose CONTROLLER cannot be supervised is refused (not certified)"
 # A REAL installer that fails is the shape: the fix must not be "install it, ignore the exit code".

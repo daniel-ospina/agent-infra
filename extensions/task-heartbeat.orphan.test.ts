@@ -13,6 +13,15 @@
  * is SIGKILLed → ppid==1 → the watchdog's real descendant kill reaps the
  * grandchild and the child self-terminates.
  *
+ * ALSO COVERS THE SILENCE DEFECT: an actuator that destroys without recording
+ * makes "killed by our watchdog", "thought it was done" and "never started"
+ * indistinguishable. So: the settle ROW is written BEFORE the kill (asserted by
+ * ORDER, so deleting the write turns the suite red), it names the killed pids,
+ * the parent pid, the status `orphan-killed` and the dispatch identity, a
+ * record FAILURE is diagnosed without ever blocking the kill/exit, and the
+ * end-to-end fixture proves the row really lands in the ledger when a real
+ * parent is SIGKILLed.
+ *
  * Run: npx tsx extensions/task-heartbeat.orphan.test.ts
  */
 
@@ -20,6 +29,7 @@ import { spawn } from "node:child_process";
 import { execSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
+import * as path from "node:path";
 import {
   orphanWatchdogActive,
   isOrphaned,
@@ -28,9 +38,41 @@ import {
   getOrphanMinUptimeMs,
   getOrphanGraceMs,
   orphanWatchdogHooks,
+  buildOrphanSettleRow,
+  safeCwd,
+  orphanWatchdogLogPath,
+  ORPHAN_WATCHDOG_LOG_PATH,
+  ORPHAN_KILLED_REASON,
+  ORPHAN_KILLED_EXIT_CODE,
   _resetWatchdogArmedForTests,
 } from "./task-heartbeat.js";
-import { ok, equal } from "node:assert/strict";
+import { ok, equal, deepEqual } from "node:assert/strict";
+
+// ── Hermeticity (#783 precedent: tests isolate via PI_CODING_AGENT_DIR) ────
+// The settle row is now written by this suite's fire sequences. Point the agent
+// dir at a tmpdir BEFORE any test runs, so the operator's real
+// `<agentDir>/audit/provider-failover.jsonl` is never appended to from a test.
+const TEST_AGENT_DIR = fs.mkdtempSync(os.tmpdir() + "/orphan-watchdog-agent-");
+process.env.PI_CODING_AGENT_DIR = TEST_AGENT_DIR;
+const LEDGER_PATH = path.join(TEST_AGENT_DIR, "audit", "provider-failover.jsonl");
+// The attribution LINE is the other surface (it is documented as greppable by
+// `status=orphan-killed`), so a test run must not forge lines into the real
+// `~/.pi/agent/orphan-watchdog.log` either — the fixture child uses the default
+// appendLog. The seam redirects both.
+process.env.ORPHAN_WATCHDOG_LOG = path.join(TEST_AGENT_DIR, "orphan-watchdog.log");
+const TEST_LOG_PATH = path.join(TEST_AGENT_DIR, "orphan-watchdog.log");
+// Snapshot of the SHIPPED writer, taken before any test stubs the hook. The
+// seam tests below must drive the real implementation, not a stub.
+const SHIPPED_APPEND_LOG = orphanWatchdogHooks.appendLog;
+
+function ledgerRows(): any[] {
+  if (!fs.existsSync(LEDGER_PATH)) return [];
+  return fs
+    .readFileSync(LEDGER_PATH, "utf8")
+    .split("\n")
+    .filter((l) => l.trim().length > 0)
+    .map((l) => JSON.parse(l));
+}
 
 let passed = 0;
 let failed = 0;
@@ -278,6 +320,453 @@ test("arm returns null when the gate is off", () => {
   }
 });
 
+// ── Settle record: the actuator must not destroy without recording ──────
+
+section("settle record — an orphan kill is RECORDED (status, pids, parent, ts)");
+
+test("fireSequence writes the row BEFORE the kill and exits 137 (order: record → log → kill → exit)", async () => {
+  const real = { ...orphanWatchdogHooks };
+  setPairEnv();
+  process.env.ORPHAN_WATCHDOG_MIN_UPTIME_MS = "0";
+  // The line's join key comes from the dispatch nonce (env) and the child's own
+  // `--session-id` (argv) — so give this firing a real pair and assert the line
+  // NAMES it. `process.argv` is restored in the finally.
+  process.env.TASK_HEARTBEAT_NONCE = "order-nonce";
+  const savedArgv = process.argv.slice();
+  process.argv.push("--session-id", "sess-order", "--session-dir", "/tmp/order-sess");
+  const order: string[] = [];
+  const rows: any[] = [];
+  const logs: string[] = [];
+  let exitCode = 0;
+  let livePpid = 4321;
+  try {
+    orphanWatchdogHooks.ppidGetter = () => livePpid; // real parent at arm time
+    orphanWatchdogHooks.nowGetter = () => 0;
+    orphanWatchdogHooks.ownPgidGetter = () => null;
+    orphanWatchdogHooks.enumerateKillTargets = () => [111, 222];
+    orphanWatchdogHooks.recordSettle = (row) => {
+      order.push("record");
+      rows.push(row);
+      return { ok: true, path: "/tmp/fake-ledger.jsonl" };
+    };
+    orphanWatchdogHooks.killDescendants = async () => {
+      order.push("kill");
+    };
+    orphanWatchdogHooks.exitProcess = (code: number) => {
+      order.push("exit");
+      exitCode = code;
+    };
+    orphanWatchdogHooks.appendLog = (line: string) => {
+      // The log line is the human-greppable half of the record, so its POSITION
+      // is part of the contract: it must come AFTER the settle row (a line that
+      // announces `status=orphan-killed` before anything was written is the
+      // "we said we killed but recorded nothing" shape) and BEFORE the kill.
+      order.push("log");
+      logs.push(line);
+    };
+    _resetWatchdogArmedForTests();
+    const handle = armOrphanWatchdog();
+    ok(handle !== null, "watchdog should arm");
+    livePpid = 1; // parent disappeared
+    handle!.poll();
+    handle!.poll();
+    await new Promise((r) => setTimeout(r, 50));
+
+    equal(
+      order.join(","),
+      "record,log,kill,exit",
+      "the settle record must be written BEFORE the descendant kill (and the log line after the record, before the kill), and the exit must still follow",
+    );
+    equal(rows.length, 1, "exactly one settle row per firing");
+    const row = rows[0];
+    equal(row.reason, ORPHAN_KILLED_REASON, "status is `orphan-killed`, never `done`, never absent");
+    equal(row.reason, "orphan-killed");
+    equal(row.parentPid, 4321, "names the parent whose disappearance caused the kill");
+    deepEqual(row.killedPids, [111, 222], "names the pids the kill was about to signal");
+    equal(row.exitCode, ORPHAN_KILLED_EXIT_CODE, "row and process agree on 137");
+    ok(!Number.isNaN(Date.parse(row.ts)), "carries a parseable timestamp");
+    equal(exitCode, 137, "the process still exits non-zero");
+    // ⛔ THE LINE'S CONTRACT (mutant M-L1: strip `status=`/`killed_pids=`/
+    // `dispatch_id=`/`session_id=` → 26 green, 0 red). The grep-the-log half of
+    // the fix is a claim about this string, so the string is asserted, not just
+    // its position. Only `settle=FAILED` was ever pinned before.
+    equal(logs.length, 1, `exactly one attribution line (got ${logs.length})`);
+    const line = logs[0];
+    ok(line.includes(`status=${ORPHAN_KILLED_REASON}`), `names the kill status: ${line}`);
+    ok(line.includes("killed_pids=111,222"), `names the pids the kill signalled: ${line}`);
+    ok(line.includes("dispatch_id=order-nonce"), `carries the dispatch join key: ${line}`);
+    ok(line.includes("session_id=sess-order"), `carries the child session id: ${line}`);
+    ok(line.includes("settle=recorded"), `reports the write outcome: ${line}`);
+  } finally {
+    Object.assign(orphanWatchdogHooks, real);
+    process.argv.length = 0;
+    process.argv.push(...savedArgv);
+    delete process.env.TASK_HEARTBEAT_NONCE;
+    clearPairEnv();
+  }
+});
+
+test("a THROWING probe still lands the row — attribution can never discard the record", async () => {
+  // ⛔ The probe enumerates pids; the ROW is the deliverable. They used to share
+  // one try, so `enumerateKillTargets()` throwing skipped `buildOrphanSettleRow`
+  // AND `recordSettle` — leaving only `settle=FAILED`, i.e. the pre-fix absence
+  // plus a note, on exactly the population the record exists for. A row with
+  // `killedPids: []` beats no row at all.
+  const real = { ...orphanWatchdogHooks };
+  setPairEnv();
+  process.env.ORPHAN_WATCHDOG_MIN_UPTIME_MS = "0";
+  process.env.TASK_HEARTBEAT_NONCE = "probe-throw-nonce";
+  const rows: any[] = [];
+  const logs: string[] = [];
+  let killed = false;
+  let exitCode = 0;
+  let livePpid = 4321;
+  try {
+    orphanWatchdogHooks.ppidGetter = () => livePpid;
+    orphanWatchdogHooks.nowGetter = () => 0;
+    orphanWatchdogHooks.ownPgidGetter = () => null;
+    orphanWatchdogHooks.enumerateKillTargets = () => {
+      throw new Error("ps timed out");
+    };
+    orphanWatchdogHooks.recordSettle = (row) => {
+      rows.push(row);
+      return { ok: true, path: "/tmp/fake-ledger.jsonl" };
+    };
+    orphanWatchdogHooks.killDescendants = async () => { killed = true; };
+    orphanWatchdogHooks.exitProcess = (code: number) => { exitCode = code; };
+    orphanWatchdogHooks.appendLog = (line: string) => { logs.push(line); };
+    _resetWatchdogArmedForTests();
+    const handle = armOrphanWatchdog();
+    livePpid = 1;
+    handle!.poll();
+    handle!.poll();
+    await new Promise((r) => setTimeout(r, 50));
+
+    equal(rows.length, 1, `the row is written even though the probe threw (got ${rows.length})`);
+    equal(rows[0].reason, "orphan-killed", "why: the reason survives the probe failure");
+    equal(rows[0].parentPid, 4321, "who: the parent whose disappearance caused the kill survives");
+    equal(rows[0].dispatchId, "probe-throw-nonce", "and the identity is still joinable");
+    deepEqual(rows[0].killedPids, [], "attribution degrades to [], never to a lost row");
+    equal(killed, true, "the kill still happens");
+    equal(exitCode, 137, "and the exit still happens");
+    ok(
+      logs.some((l) => l.includes("enumerate=FAILED") && l.includes("ps timed out")),
+      `a failed probe is DIAGNOSED, not silent: ${logs.join(" | ")}`,
+    );
+    ok(
+      logs.some((l) => l.includes("dispatch_id=probe-throw-nonce")),
+      "the line keeps its join key on a failed probe",
+    );
+  } finally {
+    Object.assign(orphanWatchdogHooks, real);
+    delete process.env.TASK_HEARTBEAT_NONCE;
+    clearPairEnv();
+  }
+});
+
+test("the ORPHAN_WATCHDOG_LOG seam is real: the shipped log writer cannot reach the operator's forensic log", () => {
+  // ⛔ Mutant M8 (defaultAppendLog -> ORPHAN_WATCHDOG_LOG_PATH, i.e. drop the
+  // seam): 26 passed, 0 failed, while a fabricated `status=orphan-killed` line
+  // landed in the operator's real log. A forged line there is a forged verdict,
+  // and nothing in CI could see the seam's removal.
+  equal(
+    orphanWatchdogLogPath(),
+    TEST_LOG_PATH,
+    "the suite's ORPHAN_WATCHDOG_LOG redirect is what the resolver returns",
+  );
+  ok(
+    orphanWatchdogLogPath() !== ORPHAN_WATCHDOG_LOG_PATH,
+    "the resolved path is NOT the operator's real forensic log",
+  );
+  equal(
+    orphanWatchdogLogPath({ ORPHAN_WATCHDOG_LOG: "  /tmp/seam.log  " }),
+    "/tmp/seam.log",
+    "an override is trimmed, not used raw",
+  );
+  equal(
+    orphanWatchdogLogPath({}),
+    ORPHAN_WATCHDOG_LOG_PATH,
+    "with no override the default IS the operator path (the seam is an override, not a replacement)",
+  );
+  const marker = `seam-probe-${process.pid}-${Date.now()}`;
+  SHIPPED_APPEND_LOG(`[task-heartbeat] orphan_watchdog ${marker} status=${ORPHAN_KILLED_REASON} killed_pids=4242`);
+  const text = fs.readFileSync(TEST_LOG_PATH, "utf8");
+  ok(text.includes(marker), "the SHIPPED appendLog wrote under the seam path, not the operator's");
+  if (fs.existsSync(ORPHAN_WATCHDOG_LOG_PATH)) {
+    ok(
+      !fs.readFileSync(ORPHAN_WATCHDOG_LOG_PATH, "utf8").includes(marker),
+      "and no forged line reached the operator's forensic log",
+    );
+  }
+});
+
+test("a THROWING row build still NAMES THE LANE on the line — identity does not come from the row", async () => {
+  // ⛔ Mutant M-ID (revert the line to `row?.dispatchId ?? "-"`): the whole
+  // suite stayed 28 green, because every other firable case has a NON-NULL row,
+  // where row-derived and env/argv-derived render the same string. The property
+  // the extraction exists for is only observable when the row is null — which
+  // needs a build that throws, and there was no seam to make one.
+  const real = { ...orphanWatchdogHooks };
+  setPairEnv();
+  process.env.ORPHAN_WATCHDOG_MIN_UPTIME_MS = "0";
+  process.env.TASK_HEARTBEAT_NONCE = "build-throw-nonce";
+  const savedArgv = process.argv.slice();
+  process.argv.push("--session-id", "sess-build-throw");
+  const logs: string[] = [];
+  const rows: any[] = [];
+  let killed = false;
+  let exitCode = 0;
+  try {
+    orphanWatchdogHooks.ppidGetter = () => 1;
+    orphanWatchdogHooks.nowGetter = () => 0;
+    orphanWatchdogHooks.ownPgidGetter = () => null;
+    orphanWatchdogHooks.enumerateKillTargets = () => [4242];
+    orphanWatchdogHooks.buildSettleRow = () => {
+      throw new Error("ENOENT: cwd vanished");
+    };
+    orphanWatchdogHooks.recordSettle = (row) => {
+      rows.push(row);
+      return { ok: true, path: "/tmp/fake-ledger.jsonl" };
+    };
+    orphanWatchdogHooks.killDescendants = async () => { killed = true; };
+    orphanWatchdogHooks.exitProcess = (code: number) => { exitCode = code; };
+    orphanWatchdogHooks.appendLog = (line: string) => { logs.push(line); };
+    _resetWatchdogArmedForTests();
+    const handle = armOrphanWatchdog();
+    handle!.poll();
+    handle!.poll();
+    await new Promise((r) => setTimeout(r, 50));
+
+    equal(rows.length, 0, "no row — the build threw, so there was nothing to write");
+    equal(killed, true, "the kill is unconditional");
+    equal(exitCode, 137, "and so is the exit");
+    equal(logs.length, 1, `exactly one attribution line (got ${logs.length})`);
+    const line = logs[0];
+    ok(line.includes("settle=FAILED"), `the failure is diagnosed: ${line}`);
+    ok(
+      line.includes("dispatch_id=build-throw-nonce"),
+      `⛔ the line KEEPS its join key with no row to read it from: ${line}`,
+    );
+    ok(line.includes("session_id=sess-build-throw"), `and the child session id: ${line}`);
+    ok(line.includes("killed_pids=4242"), `and the pids it is about to signal: ${line}`);
+  } finally {
+    Object.assign(orphanWatchdogHooks, real);
+    process.argv.length = 0;
+    process.argv.push(...savedArgv);
+    delete process.env.TASK_HEARTBEAT_NONCE;
+    clearPairEnv();
+  }
+});
+
+test("a THROWING identity probe cannot un-reap the tree: kill + exit(137) still run", async () => {
+  // ⛔ `poll` calls `void fireSequence(...)`, so a throw BEFORE the sequence's
+  // `try/finally` rejects an unobserved promise: no record, no kill, no exit
+  // 137 — and `fired` is already latched, so it never retries. Identity is the
+  // one derivation that used to sit unguarded in front of that guarantee.
+  const real = { ...orphanWatchdogHooks };
+  setPairEnv();
+  process.env.ORPHAN_WATCHDOG_MIN_UPTIME_MS = "0";
+  const logs: string[] = [];
+  const rows: any[] = [];
+  let killed = false;
+  let exitCode = 0;
+  try {
+    orphanWatchdogHooks.ppidGetter = () => 1;
+    orphanWatchdogHooks.nowGetter = () => 0;
+    orphanWatchdogHooks.ownPgidGetter = () => null;
+    orphanWatchdogHooks.identityGetter = () => {
+      throw new Error("argv probe exploded");
+    };
+    orphanWatchdogHooks.enumerateKillTargets = () => [4242];
+    orphanWatchdogHooks.recordSettle = (row) => {
+      rows.push(row);
+      return { ok: true, path: "/tmp/fake-ledger.jsonl" };
+    };
+    orphanWatchdogHooks.killDescendants = async () => { killed = true; };
+    orphanWatchdogHooks.exitProcess = (code: number) => { exitCode = code; };
+    orphanWatchdogHooks.appendLog = (line: string) => { logs.push(line); };
+    _resetWatchdogArmedForTests();
+    const handle = armOrphanWatchdog();
+    handle!.poll();
+    handle!.poll();
+    await new Promise((r) => setTimeout(r, 50));
+
+    equal(killed, true, "the descendant tree is still reaped");
+    equal(exitCode, 137, "and the process still exits 137");
+    equal(rows.length, 1, "and the row is still written (identity is not required for it)");
+    const line = logs[0] ?? "";
+    ok(line.includes("identity=FAILED argv probe exploded"), `the probe failure is diagnosed: ${line}`);
+    ok(line.includes("dispatch_id=-"), "the join key degrades to the documented unknown, never a guess");
+  } finally {
+    Object.assign(orphanWatchdogHooks, real);
+    clearPairEnv();
+  }
+});
+
+test("the DEFAULT writer lands a real ledger row with the dispatch identity joined from env + argv", async () => {
+  // No recordSettle override: this drives the shipped writer into the
+  // hermetic ledger. dispatchId comes from the dispatch nonce, childSessionId
+  // from the child's own --session-id arg vector.
+  const real = { ...orphanWatchdogHooks };
+  setPairEnv();
+  process.env.ORPHAN_WATCHDOG_MIN_UPTIME_MS = "0";
+  process.env.TASK_HEARTBEAT_NONCE = "orphannonce01";
+  const before = ledgerRows().length;
+  let exited = 0;
+  try {
+    orphanWatchdogHooks.ppidGetter = () => 1;
+    orphanWatchdogHooks.nowGetter = () => 0;
+    orphanWatchdogHooks.ownPgidGetter = () => null;
+    orphanWatchdogHooks.enumerateKillTargets = () => [4242];
+    orphanWatchdogHooks.killDescendants = async () => {};
+    orphanWatchdogHooks.exitProcess = (code: number) => { exited = code; };
+    orphanWatchdogHooks.appendLog = () => {};
+    _resetWatchdogArmedForTests();
+    const handle = armOrphanWatchdog();
+    handle!.poll();
+    handle!.poll();
+    await new Promise((r) => setTimeout(r, 50));
+
+    const added = ledgerRows().slice(before);
+    equal(added.length, 1, `exactly one durable row appended (got ${added.length})`);
+    const row = added[0];
+    equal(row.event, "dispatch-outcome", "the repo's ONE outcome-row event (no second format)");
+    equal(row.extension, "task-heartbeat", "the row's writer is named");
+    equal(row.reason, "orphan-killed");
+    equal(row.dispatchId, "orphannonce01", "joins the #512/#476 rows on the dispatch nonce");
+    equal(row.parentPid, 1);
+    deepEqual(row.killedPids, [4242]);
+    equal(row.exitCode, 137);
+    equal(row.cwd, process.cwd(), "names the worktree the killed child was running in");
+    equal(exited, 137, "recording must not replace the exit");
+  } finally {
+    Object.assign(orphanWatchdogHooks, real);
+    delete process.env.TASK_HEARTBEAT_NONCE;
+    clearPairEnv();
+  }
+});
+
+test("buildOrphanSettleRow: unknown-at-settle values stay null/[] — never a confident guess", () => {
+  const row = buildOrphanSettleRow({
+    parentPid: 777,
+    killedPids: [10, 11],
+    now: new Date("2026-11-02T22:00:00.000Z"),
+    env: { TASK_HEARTBEAT_NONCE: " nonce-x ", TASK_DISPATCH_ATTEMPT: "3", TASK_DISPATCH_CLASS: "reviewer" },
+    argv: ["pi", "-p", "--session-id", "sess-abc", "--session-dir", "/tmp/s"],
+    cwd: "/w/tree",
+  });
+  equal(row.ts, "2026-11-02T22:00:00.000Z", "ts is stamped once, by the row");
+  equal(row.dispatchId, "nonce-x", "nonce is trimmed");
+  equal(row.childSessionId, "sess-abc", "read from the child's own arg vector");
+  equal(row.attempt, 3, "the per-leg ordinal travels in the child env");
+  equal(row.dispatchClass, "reviewer");
+  equal(row.cwd, "/w/tree");
+  equal(row.branch, null, "branch is UNKNOWN in a dying process, not a guess");
+  equal(row.headSha, null);
+  equal(row.dirty, null, "a failed/absent probe must not become a confident clean tree");
+  equal(row.dirtyPaths, null, "null is not [] (unknown is not zero dirty paths)");
+  equal(row.everSawTool, null, "a process killed mid-tool must not claim it never ran one");
+  equal(
+    row.transcriptPath,
+    "/tmp/s",
+    "the transcript locator is RESOLVED from the child's own --session-dir, never left null by omission",
+  );
+  equal(row.parentSessionId, null);
+  equal(row.parentPid, 777);
+  deepEqual(row.killedPids, [10, 11]);
+  equal(row.reason, "orphan-killed");
+  equal(row.exitCode, 137);
+  // Absent identity must degrade, not throw.
+  const bare = buildOrphanSettleRow({ parentPid: 1, killedPids: [], env: {}, argv: ["pi"] });
+  equal(bare.dispatchId, null);
+  equal(bare.childSessionId, null);
+  equal(bare.transcriptPath, null, "null means the --no-session degrade, not 'we did not look'");
+  equal(bare.attempt, 1, "the contract's parent-side default when no dispatcher exported one");
+  equal(bare.dispatchClass, "task");
+});
+
+test("a DELETED cwd (the reaped-worktree case) never discards the settle row", () => {
+  // `process.cwd()` throws ENOENT once its directory is gone, and a dying
+  // dispatch child's cwd IS its worktree — which `scripts/pi-reap-worktrees.sh`
+  // deletes. An unguarded call would throw inside the fire sequence's try and
+  // discard the WHOLE row (reason, parentPid, killedPids, identity) on exactly
+  // the population this record exists for. So: the resolver is guarded, and the
+  // row still lands, with `""` as the documented unknown.
+  const throwing = () => {
+    const err = new Error("ENOENT: no such file or directory, uv_cwd") as Error & { code?: string };
+    err.code = "ENOENT";
+    throw err;
+  };
+  equal(safeCwd(throwing), "", "an unresolvable cwd reads as unknown, never as a guess");
+  equal(safeCwd(() => "/w/tree"), "/w/tree", "and a resolvable one is passed through (the guard is not a bypass)");
+  const row = buildOrphanSettleRow({
+    parentPid: 4321,
+    killedPids: [11],
+    env: { TASK_HEARTBEAT_NONCE: "nonce-cwd" },
+    argv: ["pi"],
+    getCwd: throwing,
+  });
+  equal(row.cwd, "", "cwd is the documented unknown value");
+  equal(row.reason, "orphan-killed", "⛔ the ROW SURVIVES — that is the whole point");
+  equal(row.parentPid, 4321, "who: the parent whose disappearance caused the kill");
+  deepEqual(row.killedPids, [11], "who: the pids enumerated for the kill");
+  equal(row.dispatchId, "nonce-cwd", "and the dispatch identity is still joinable");
+});
+
+test("a FAILED settle record is diagnosed and never blocks the kill or the exit", async () => {
+  const real = { ...orphanWatchdogHooks };
+  setPairEnv();
+  process.env.ORPHAN_WATCHDOG_MIN_UPTIME_MS = "0";
+  const logs: string[] = [];
+  let killed = false;
+  let exitCode = 0;
+  try {
+    orphanWatchdogHooks.ppidGetter = () => 1;
+    orphanWatchdogHooks.nowGetter = () => 0;
+    orphanWatchdogHooks.ownPgidGetter = () => null;
+    orphanWatchdogHooks.enumerateKillTargets = () => [];
+    orphanWatchdogHooks.recordSettle = () => ({ ok: false, path: "/ro/ledger.jsonl", error: "EACCES" });
+    orphanWatchdogHooks.killDescendants = async () => { killed = true; };
+    orphanWatchdogHooks.exitProcess = (code: number) => { exitCode = code; };
+    orphanWatchdogHooks.appendLog = (line: string) => { logs.push(line); };
+    _resetWatchdogArmedForTests();
+    const handle = armOrphanWatchdog();
+    handle!.poll();
+    handle!.poll();
+    await new Promise((r) => setTimeout(r, 50));
+    equal(killed, true, "an unwritable ledger must never stop the cleanup");
+    equal(exitCode, 137, "nor the exit");
+    ok(
+      logs.some((l) => l.includes("settle=FAILED") && l.includes("EACCES")),
+      `the unrecorded kill must be DIAGNOSED, not silent: ${logs.join(" | ")}`,
+    );
+  } finally {
+    Object.assign(orphanWatchdogHooks, real);
+    clearPairEnv();
+  }
+});
+
+test("default enumeration names the REAL descendants and never the enum probe itself", async () => {
+  // The probe forks `pgrep`, which is itself a child at read time — a naive
+  // single read records a pid that is never signalled. The tell is that two
+  // consecutive reads differ (the probe pid is new each time).
+  const child = spawn(process.execPath, ["-e", "setInterval(()=>{},1000)"], { stdio: "ignore" });
+  try {
+    await new Promise((r) => setTimeout(r, 400)); // let it appear in the table
+    const first = orphanWatchdogHooks.enumerateKillTargets();
+    const second = orphanWatchdogHooks.enumerateKillTargets();
+    ok(first.includes(child.pid!), `names the real descendant (got [${first.join(",")}])`);
+    ok(!first.includes(process.pid), "never records self");
+    deepEqual(
+      first,
+      second,
+      `the enum probe's own pid must never leak in (two reads must agree: [${first.join(",")}] vs [${second.join(",")}])`,
+    );
+  } finally {
+    try { child.kill("SIGKILL"); } catch {}
+  }
+});
+
 // ── Real end-to-end integration test ─────────────────────────────────────
 
 section("integration: orphaned detached child self-terminates + kills its grandchild");
@@ -341,6 +830,10 @@ test("real reparenting: orphan watchdog reaps child + grandchild after parent SI
           PI_MODE: "print",
           ORPHAN_WATCHDOG_MIN_UPTIME_MS: "0",
           ORPHAN_WATCHDOG_GRACE_MS: "1000",
+          // Identity the settle row must carry (the dispatch nonce join key and
+          // the per-leg ordinal the parent exports).
+          TASK_HEARTBEAT_NONCE: "orphanintnonce",
+          TASK_DISPATCH_ATTEMPT: "2",
         },
       });
       let out = "";
@@ -393,6 +886,24 @@ test("real reparenting: orphan watchdog reaps child + grandchild after parent SI
   }
   ok(grandchildGone, "grandchild must be reaped by the descendant kill");
   ok(childGone, "orphaned child must self-terminate");
+
+  // ⛔ THE LIVE PROOF: the kill left a record naming who died and why. Without
+  // it, this exact event is indistinguishable from "the lane thought it was
+  // done" or "the lane never started" — which is how three lanes vanished.
+  const orphanRows = ledgerRows().filter((r) => r.dispatchId === "orphanintnonce");
+  equal(orphanRows.length, 1, `exactly one settle row for the killed child (got ${orphanRows.length})`);
+  const row = orphanRows[0];
+  equal(row.event, "dispatch-outcome");
+  equal(row.reason, "orphan-killed", "status the fleet reads — never `done`, never an absence");
+  equal(row.parentPid, fixture.pid, "names the parent whose SIGKILL caused the termination");
+  equal(row.attempt, 2, "the per-leg ordinal travelled in the child env");
+  ok(
+    row.killedPids.includes(grandchildPid),
+    `names the grandchild the kill signalled (row ${JSON.stringify(row.killedPids)}, grandchild ${grandchildPid})`,
+  );
+  ok(!row.killedPids.includes(childPid), "never names the process it was running IN");
+  equal(row.exitCode, 137);
+  equal(row.cwd, process.cwd());
   // Cleanup in case of failure:
   try { execSync(`kill -9 ${childPid} ${grandchildPid} 2>/dev/null || true`); } catch {}
   try { fs.rmSync(tmp, { recursive: true, force: true }); } catch {}

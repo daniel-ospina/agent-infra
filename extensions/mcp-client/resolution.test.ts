@@ -20,7 +20,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ok, equal, deepEqual } from "node:assert/strict";
 
-import { resolveMcpJsonPath, resolveMcpConfigPaths, mergeMcpLayers, expandEnvVars, buildMcpServerEnv, McpServerManager } from "./index.js";
+import { resolveMcpJsonPath, resolveMcpConfigPaths, mergeMcpLayers, expandEnvVars, buildMcpServerEnv, McpServerManager, classifyServers } from "./index.js";
 
 let passed = 0;
 let failed = 0;
@@ -37,6 +37,39 @@ async function test(name: string, fn: () => void | Promise<void>) {
 function section(name: string) {
   console.log(`\n${name}:`);
 }
+
+// ── Hermetic-suite guard ─────────────────────────────────────────
+// ⛔ THE `connectAllLayers` SECTION HEADER'S INVARIANT, ENFORCED FOR EVERY MANAGER-DRIVEN TEST IN THIS
+// FILE, not just the fixtures someone remembered to annotate. A manager-driven fixture that omits `lazy`
+// is classified EAGER by `classifyServers` and handed to `connectServer`, which then opens a REAL
+// outbound connection — measured: two such fixtures dialled host `x:443` twice each under
+// `EAGER_CONNECT_MAX_ATTEMPTS`. Pinning that per fixture leaves the hole open for every other one
+// (measured: removing `lazy` from `keep`, `both` and `fine` left the suite 63/0 green while netspy
+// logged `ok:443`, `ok.example:443`, `fine:443`), and an `ok(eager.length === 0)` per test still misses
+// the `PI_MCP_SERVERS` forced-eager path. So count the ONE call that can dial anything instead: if any
+// fixture reaches `connectServer`, this records it and the end-of-suite assertion below goes red.
+//
+// ⛔ THE GUARD MUST NOT BE DISARMABLE BY THE CALLER'S ENVIRONMENT. `connectAll` filters by
+// `getAllowedServers()` BEFORE it reads `cfg.lazy`, so with `PI_MCP_SERVERS` exported an eager fixture
+// is excluded instead of dialled, nothing reaches `connectServer`, and the end-of-suite assertion is
+// VACUOUSLY green — measured: `PI_MCP_SERVERS=none` + `lazy` deleted from `fine` stayed 64/0 green,
+// while the same edit is 63/1 red with the variable unset. A guard that a shell variable can silence is
+// the false-PASS shape this file already fixed twice (see the explicit `undefined` allowlists passed to
+// `classifyServers` below). No test in this file depends on the variable being SET — the one test that
+// cares clears it and restores it — so it is cleared here, for the whole run, and restored at cleanup.
+const PREV_PI_MCP_SERVERS = process.env.PI_MCP_SERVERS;
+delete process.env.PI_MCP_SERVERS;
+const CONNECT_CALLS: string[] = [];
+const realConnectServer = (McpServerManager.prototype as unknown as Record<string, unknown>)
+  .connectServer as (...args: unknown[]) => unknown;
+(McpServerManager.prototype as unknown as Record<string, unknown>).connectServer = function (
+  this: unknown,
+  name: string,
+  ...rest: unknown[]
+) {
+  CONNECT_CALLS.push(name);
+  return realConnectServer.apply(this, [name, ...rest]);
+};
 
 // ── Temp helpers ─────────────────────────────────────────────────────────
 const TMP_DIRS: string[] = [];
@@ -176,9 +209,10 @@ await test("parses as valid config with the expected server set", () => {
   // stdio is caught by CI rather than by a fleet of lanes writing GRAPH-UNREACHABLE.
   equal(tortoise.type, "http", "tortoise is the hosted HTTP server");
   equal(tortoise.url, "https://api.premiselabs.co/mcp/", "tortoise points at the hosted endpoint");
-  // ⛔ THE REPO'S OWN `.mcp.json` IS THE COPY THAT WINS for every agent-infra lane: mcp-client takes
-  // the FIRST `.mcp.json` walking up from the lane's cwd (then falls back to ~/.pi/agent/.mcp.json),
-  // so this file decides what an agent-infra lane connects to. Its own `_comment` claims a
+  // ⛔ THE REPO'S OWN `.mcp.json` IS THE COPY THAT WINS the `tortoise` name for every agent-infra
+  // lane: both layers are now read and MERGED (#3612), the repo's entry winning per field, so this
+  // file — not the template — decides an agent-infra lane's `tortoise`; the template's copy is what a
+  // repo WITHOUT this file receives. Its own `_comment` claims a
   // byte-identical shape to the template's — and NOTHING checked that, so a revert here would
   // return agent-infra lanes to the legacy server while `cell-install --verify` still certified the
   // base config. Asserted for the fields a lane actually needs.
@@ -323,6 +357,345 @@ await test("a repo entry of the SAME name wins; the base's other servers survive
   ok(merged.onlyBase, "and the base's other servers are not lost");
 });
 
+await test("PER FIELD: a `url`-changing override KEEPS lazy/timeoutMs but NEVER carries the base's credentials", () => {
+  // The shape `tortoise`'s own `docs/quickstart-selfhosted.md` tells a self-host user to write, spelled
+  // the way `pi-bootstrap/lib/merge-mcp.py` and `pi-bootstrap/tests/test-cell-install.sh` spell it.
+  // ⛔ The CITATION is the reason for the full path: that quickstart page lives in the tortoise repo,
+  // not this one, so a bare name resolves only on the box that wrote the comment. (The two
+  // pi-bootstrap files above ARE tracked here — do not read this as a claim that they are not.)
+  // `lazy` and `timeoutMs` must be inherited: a name-level spread dropped them, which was an EAGER
+  // connect at every session start on memory-constrained cells, the failure the base entry's own
+  // `_comment` records. The base's `headers` must NOT be — `.mcp.json` is a TRACKED file, so
+  // inheriting a bearer token into a repo-chosen URL hands the fleet's key to whatever that file names.
+  const merged = mergeMcpLayers(
+    {
+      mcpServers: {
+        tortoise: {
+          type: "http",
+          url: "https://api.premiselabs.co/mcp/",
+          headers: { Authorization: "Bearer ${TORTOISE_MCP_API_KEY}" },
+          lazy: true,
+          timeoutMs: 60000,
+        },
+      },
+    } as never,
+    { mcpServers: { tortoise: { url: "http://localhost:8000/mcp" } } } as never,
+  );
+  const t = merged.tortoise as Record<string, unknown> | undefined;
+  equal(t?.url, "http://localhost:8000/mcp", "the field the repo DID set wins");
+  equal(t?.headers, undefined,
+    "the base's Authorization header must NOT follow a repo to a new URL — restating it is the repo's call");
+  equal(t?.lazy, true, "`lazy` is inherited — dropping it makes a hosted server EAGER on every cell");
+  equal(t?.timeoutMs, 60000, "`timeoutMs` is inherited");
+});
+
+await test("PER FIELD: a TWO-FIELD base with ONE field overridden keeps the sibling field", () => {
+  // ⛔ THE MINIMAL DISCRIMINATOR between a FIELD delta and a whole-entry replacement. The base entry has
+  // exactly two fields and the repo restates ONE of them; a name-level merge (`merged[name] = repoEntry`,
+  // which is what this branch replaced) returns `{ timeoutMs: 40000 }` and silently drops `lazy` — the
+  // measured failure that made a hosted server EAGER at every session start on memory-constrained cells.
+  // Neither field is a transport field, so NO transport branch runs here: what this pins is the
+  // `{ ...carry, ...delta }` spread itself, which the larger fixtures above reach only through a branch
+  // that already deletes fields. The key-set assertion is what a whole-entry replacement cannot survive;
+  // asserting the two values alone would still pass if the merge also carried an unrelated third field.
+  const merged = mergeMcpLayers(
+    { mcpServers: { tortoise: { lazy: true, timeoutMs: 60000 } } } as never,
+    { mcpServers: { tortoise: { timeoutMs: 40000 } } } as never,
+  );
+  const t = merged.tortoise as Record<string, unknown> | undefined;
+  equal(t?.timeoutMs, 40000, "the field the repo SET wins");
+  equal(t?.lazy, true, "and the sibling field it did NOT set is inherited, not dropped with the entry");
+  deepEqual(
+    Object.keys(t ?? {}).sort(),
+    ["lazy", "timeoutMs"],
+    "EXACTLY the base's two fields, merged — a whole-entry replacement leaves one key here",
+  );
+});
+
+await test("a repo that restates `headers` alongside its own `url` gets exactly those headers", () => {
+  const merged = mergeMcpLayers(
+    { mcpServers: { tortoise: { url: "https://api.premiselabs.co/mcp/", headers: { Authorization: "Bearer ${TORTOISE_MCP_API_KEY}" } } } } as never,
+    { mcpServers: { tortoise: { url: "https://self.example/mcp", headers: { Authorization: "Bearer ${LOCAL_KEY}" } } } } as never,
+  );
+  const t = merged.tortoise as Record<string, unknown> | undefined;
+  deepEqual(t?.headers, { Authorization: "Bearer ${LOCAL_KEY}" }, "an explicit header wins outright");
+});
+
+await test("an UNCHANGED url still inherits the base's credentials (a pure delta keeps auth)", () => {
+  const merged = mergeMcpLayers(
+    { mcpServers: { tortoise: { url: "https://api.premiselabs.co/mcp/", headers: { Authorization: "Bearer K" }, lazy: true } } } as never,
+    { mcpServers: { tortoise: { lazy: false } } } as never,
+  );
+  const t = merged.tortoise as Record<string, unknown> | undefined;
+  equal(t?.lazy, false, "the repo's toggle wins");
+  deepEqual(t?.headers, { Authorization: "Bearer K" },
+    "the destination is unchanged, so the credentials issued for it still apply");
+});
+
+await test("TRANSPORT IS ATOMIC: a repo `command` drops the base's url AND its credentials", () => {
+  // connectServer tests `url` BEFORE `command`, so a merged entry carrying both silently ignored the
+  // repo's stdio daemon and kept talking to the base endpoint — with no warning.
+  const merged = mergeMcpLayers(
+    { mcpServers: { tortoise: { type: "http", url: "https://api.premiselabs.co/mcp/", headers: { Authorization: "Bearer K" }, oauth: true, lazy: true } } } as never,
+    { mcpServers: { tortoise: { command: "/usr/bin/python3", args: ["-m", "tortoise.mcp_server"] } } } as never,
+  );
+  const t = merged.tortoise as Record<string, unknown> | undefined;
+  equal(t?.command, "/usr/bin/python3", "the repo's transport is the one that runs");
+  equal(t?.url, undefined, "the base url must not survive — it would win at connectServer's `if (config.url)`");
+  equal(t?.headers, undefined, "nor may its credentials");
+  equal(t?.oauth, undefined, "nor its `oauth` config — it is one of HTTP_TRANSPORT_FIELDS for exactly this reason");
+  equal(t?.lazy, true, "non-transport metadata is still inherited");
+});
+
+await test("TRANSPORT IS ATOMIC: a repo `url` drops the base's command/args/env/cwd", () => {
+  const merged = mergeMcpLayers(
+    { mcpServers: { t: { command: "/usr/bin/python3", args: ["-m", "x"], env: { SECRET: "s" }, cwd: "/tmp" } } } as never,
+    { mcpServers: { t: { url: "https://self.example/mcp" } } } as never,
+  );
+  const entry = merged.t as Record<string, unknown> | undefined;
+  equal(entry?.url, "https://self.example/mcp");
+  for (const field of ["command", "args", "env", "cwd"]) {
+    equal(entry?.[field], undefined, `stdio field ${field} must not survive an HTTP override`);
+  }
+});
+
+await test("a transport switch drops the base's stale `type` instead of leaving it beside the new one", () => {
+  // Without `delete carry.type`, a repo switching the base's hosted server to stdio produced
+  // `{type:"http", command:…}` — a stale label contradicting the entry it now describes.
+  const merged = mergeMcpLayers(
+    { mcpServers: { t: { type: "http", url: "https://api.premiselabs.co/mcp/", lazy: true } } } as never,
+    { mcpServers: { t: { command: "/usr/bin/python3", args: ["-m", "x"] } } } as never,
+  );
+  const t = merged.t as Record<string, unknown> | undefined;
+  equal(t?.type, undefined, "the base's `type: http` must not survive a switch to stdio");
+  equal(t?.command, "/usr/bin/python3", "and the repo's transport is the one that runs");
+});
+
+await test("an entry declaring BOTH transports keeps the BASE entry — an ambiguous delta is not a removal", () => {
+  // Dropping the merged entry removed the hub's memory graph from that repo, while the warning said
+  // the entry was "ignored" and the documented invariant says a repo cannot REMOVE a base server.
+  const merged = mergeMcpLayers(
+    { mcpServers: { t: { url: "https://api.premiselabs.co/mcp/", lazy: true } } } as never,
+    { mcpServers: { t: { url: "https://self.example/mcp", command: "/bin/sh" } } } as never,
+  );
+  const t = merged.t as Record<string, unknown> | undefined;
+  ok(t, "the base server must SURVIVE an ambiguous repo entry");
+  equal(t?.url, "https://api.premiselabs.co/mcp/", "and it is the BASE entry, untouched");
+  equal(t?.command, undefined, "the ambiguous delta is not applied");
+});
+
+await test("a REPO-ONLY entry declaring BOTH transports is KEPT with a warning (it works over `url`)", () => {
+  // Same ruling as the base layer: `connectServer` tests `url` first, so such an entry WORKS and main
+  // refused nothing — dropping it would zero a working server.
+  const merged = mergeMcpLayers(
+    { mcpServers: {} } as never,
+    { mcpServers: { t: { url: "https://ok/mcp", command: "/bin/sh" } } } as never,
+  );
+  ok(merged.t, "kept, not dropped");
+  equal((merged.t as Record<string, unknown>).url, "https://ok/mcp", "and it will run over `url`");
+});
+
+await test("THE PRODUCTION PATH keeps a REPO-ONLY both-transports entry (asMcpJson must not pre-empt the merge)", async () => {
+  // `mergeMcpLayers` alone is not the code that runs: `connectAllLayers` reads each layer through
+  // `asMcpJson` FIRST, and that validator used to drop a repo entry declaring both transports
+  // unconditionally — so the ruling tested above was unreachable, the server was silently unloaded, and
+  // `SETUP-NEW-MACHINE.md` promised the opposite. Only a test through the real entry point catches it.
+  const repoDir = tempDir("mcp-repoonly-both-repo-");
+  const homeDir = tempDir("mcp-repoonly-both-home-");
+  mkdirSync(join(homeDir, ".pi", "agent"), { recursive: true });
+  writeJson(repoDir, ".mcp.json", {
+    mcpServers: {
+      both: { url: "https://ok/mcp", command: "/bin/sh", lazy: true },
+      fine: { url: "https://fine/mcp", lazy: true },
+    },
+  });
+  writeJson(join(homeDir, ".pi", "agent"), ".mcp.json", { mcpServers: {} });
+
+  const manager = new McpServerManager();
+  const logs = await withCapturedLogs(() =>
+    manager.connectAllLayers({
+      base: join(homeDir, ".pi", "agent", ".mcp.json"),
+      repo: join(repoDir, ".mcp.json"),
+    })
+  );
+  const cfg = (manager as unknown as { config: { mcpServers: Record<string, unknown> } }).config;
+  ok(
+    "both" in cfg.mcpServers,
+    `a repo-only entry declaring both transports must SURVIVE the layer read — got keys ${JSON.stringify(Object.keys(cfg.mcpServers))}`
+  );
+  equal((cfg.mcpServers.both as Record<string, unknown>).url, "https://ok/mcp", "and it runs over `url`");
+  ok(
+    logs.some(l => l.includes("declares BOTH") && l.includes("KEPT")),
+    `the operator must be told it is ambiguous but kept — got:\n${logs.join("\n")}`
+  );
+});
+
+await test("a BASE entry declaring BOTH transports is KEPT with a warning (dropping it would zero a working config)", async () => {
+  // The docs promise an ambiguous entry is rejected — which was only true for a REPO entry: a base entry
+  // declaring both was copied verbatim with no warning while connectServer silently used `url`.
+  const repoDir = tempDir("mcp-bind-baseboth-repo-");
+  const homeDir = tempDir("mcp-bind-baseboth-home-");
+  mkdirSync(join(homeDir, ".pi", "agent"), { recursive: true });
+  writeJson(repoDir, ".mcp.json", { mcpServers: {} });
+  writeJson(join(homeDir, ".pi", "agent"), ".mcp.json", {
+    mcpServers: {
+      // ⛔ `lazy: true` IS LOAD-BEARING HERE. This entry is ambiguous-but-KEPT, and `connectServer`
+      // dispatches on `url` before `command` — so without `lazy` this fixture is classified EAGER and
+      // the suite really attempts an outbound connection to host `x` (2 attempts × the 15s default
+      // timeout, retryable), making a hermetic assertion depend on the runner's resolver/proxy.
+      broken: { url: "https://x/mcp", command: "/bin/sh", lazy: true },
+      fine: { url: "https://ok.example/mcp", lazy: true },
+    },
+  });
+
+  const manager = new McpServerManager();
+  const logs = await withCapturedLogs(() =>
+    manager.connectAllLayers({
+      base: join(homeDir, ".pi", "agent", ".mcp.json"),
+      repo: join(repoDir, ".mcp.json"),
+    })
+  );
+  const cfg = (manager as unknown as { config: { mcpServers: Record<string, unknown> } }).config;
+  ok(
+    "broken" in cfg.mcpServers,
+    "a BASE entry declaring both transports must be KEPT — dropping it would zero a config that works over `url`"
+  );
+  ok(cfg.mcpServers.fine, "and a valid base entry still loads");
+  ok(
+    logs.some(l => l.includes("declares BOTH") && l.includes("base layer") && l.includes("KEPT")),
+    `the base layer must be named in the warning — got:\n${logs.join("\n")}`
+  );
+  // ⛔ ENFORCE THE SECTION HEADER'S INVARIANT, not just document it: a fixture without `lazy` is EAGER
+  // and `connectServer` dispatches on `url` FIRST, so this one — ambiguous-but-KEPT — really dials host
+  // `x` (measured: 2 outbound connects per eager fixture under `EAGER_CONNECT_MAX_ATTEMPTS`). Nothing
+  // else in this test notices, so deleting `lazy` from `broken` used to restore live traffic in
+  // silence. The allowlist is passed as an explicit `undefined` ON PURPOSE: `classifyServers` filters by
+  // `PI_MCP_SERVERS` BEFORE it reads `cfg.lazy`, so an assertion on the "lazy server(s) not loaded" log
+  // line instead would be a FALSE RED on any box with that variable exported (measured: 60 passed / 2
+  // failed with `PI_MCP_SERVERS=none`, 62/0 without).
+  ok(
+    classifyServers(cfg.mcpServers as never, undefined).lazySkipped.includes("broken"),
+    "`broken` must be classified LAZY — otherwise this suite opens a real socket to host `x`"
+  );
+});
+
+await test("a `type` that disagrees with the transport is a WARNING, and the delta still applies", async () => {
+  // `type` is the schema's transport selector, and connectServer dispatches on url/command — so
+  // `{"type":"http","command":…}` would silently run over stdio.
+  let merged: Record<string, unknown> = {};
+  const logs = await withCapturedLogs(async () => {
+    merged = mergeMcpLayers(
+      { mcpServers: { t: { url: "https://api.premiselabs.co/mcp/", lazy: true } } } as never,
+      { mcpServers: { t: { type: "http", command: "/bin/sh" } } } as never,
+    );
+  });
+  const t = merged.t as Record<string, unknown> | undefined;
+  equal(t?.command, "/bin/sh", "the delta applies — `type` is inert here, so it must not veto a working entry");
+  equal(t?.url, undefined, "and the transport switch removed the base's url");
+  // The test's NAME promises a warning. Without this assertion, deleting the `typeDisagrees` block that
+  // emits it left the suite bit-identical — the promise was untested prose.
+  ok(
+    logs.some(l => l.includes("disagrees with its transport")),
+    `the contradiction must be reported, not applied silently — got:\n${logs.join("\n")}`
+  );
+});
+
+await test("a BASE-only `type` contradicting its own transport is reported (the merge never inspects base entries)", async () => {
+  // The docstring justifies the `type` check with a measured `{"type":"http","command":…}` entry that ran
+  // over stdio "so the operator learns". A repo entry is reported by the merge; a BASE entry is copied
+  // verbatim by it and so was completely silent — the one layer an operator hand-edits.
+  const repoDir = tempDir("mcp-basetype-repo-");
+  const homeDir = tempDir("mcp-basetype-home-");
+  mkdirSync(join(homeDir, ".pi", "agent"), { recursive: true });
+  writeJson(repoDir, ".mcp.json", { mcpServers: {} });
+  writeJson(join(homeDir, ".pi", "agent"), ".mcp.json", {
+    mcpServers: { incoherent: { type: "http", command: "/bin/sh", lazy: true } },
+  });
+
+  const manager = new McpServerManager();
+  const logs = await withCapturedLogs(() =>
+    manager.connectAllLayers({
+      base: join(homeDir, ".pi", "agent", ".mcp.json"),
+      repo: join(repoDir, ".mcp.json"),
+    })
+  );
+  const cfg = (manager as unknown as { config: { mcpServers: Record<string, unknown> } }).config;
+  ok("incoherent" in cfg.mcpServers, "`type` must never disqualify an entry — it is kept");
+  ok(
+    logs.some(l => l.includes("disagrees with its transport")),
+    `a base entry's contradictory \`type\` must be reported — got:\n${logs.join("\n")}`
+  );
+});
+
+await test("a NORMALISED restatement of the same url still inherits the base's credentials", () => {
+  // Raw string equality stripped the credentials for a host-case or trailing-space difference, with
+  // nothing logged — a bare 401 with no diagnostic.
+  const merged = mergeMcpLayers(
+    { mcpServers: { t: { url: "https://api.premiselabs.co/mcp/", headers: { Authorization: "Bearer K" } } } } as never,
+    { mcpServers: { t: { url: "https://API.PREMISELABS.CO/mcp/" } } } as never,
+  );
+  const t = merged.t as Record<string, unknown> | undefined;
+  deepEqual(t?.headers, { Authorization: "Bearer K" },
+    "the same destination restated differently must keep its credentials — new URL().href normalises both");
+});
+
+await test("rewriting only `args` does NOT inherit the base's env — args decides what runs", () => {
+  // `npx -y @good/mcp` and `npx -y @evil/mcp` share a command. Comparing `command` alone inherited the
+  // base's API key into a repo-chosen package (measured).
+  const merged = mergeMcpLayers(
+    { mcpServers: { g: { command: "npx", args: ["-y", "@good/mcp"], env: { GEMINI_API_KEY: "k" } } } } as never,
+    { mcpServers: { g: { args: ["-y", "@evil/mcp"] } } } as never,
+  );
+  const g = merged.g as Record<string, unknown> | undefined;
+  deepEqual(g?.args, ["-y", "@evil/mcp"], "the repo's package runs");
+  equal(g?.env, undefined, "but it must NOT receive the key that was issued for the other package");
+});
+
+await test("changing only `cwd` is a DIFFERENT launch, so the base's env is not inherited", () => {
+  // `cwd` decides which code runs for a relative command (`python3 -m pkg`, `node server.js`), so it is
+  // part of the launch identity — without it a repo could run the base's command out of its own
+  // directory and still receive the base's API keys.
+  const merged = mergeMcpLayers(
+    { mcpServers: { t: { command: "python3", args: ["-m", "x"], env: { K: "1" }, cwd: "/base" } } } as never,
+    { mcpServers: { t: { cwd: "/repo" } } } as never,
+  );
+  const t = merged.t as Record<string, unknown> | undefined;
+  equal(t?.cwd, "/repo", "the repo's cwd applies");
+  equal(t?.env, undefined, "but the base's env must not follow it");
+});
+
+await test("a repo that only touches `lazy` keeps the base's env (pure launch-identity delta)", () => {
+  const merged = mergeMcpLayers(
+    { mcpServers: { g: { command: "npx", args: ["-y", "@good/mcp"], env: { GEMINI_API_KEY: "k" }, lazy: true } } } as never,
+    { mcpServers: { g: { lazy: false } } } as never,
+  );
+  const g = merged.g as Record<string, unknown> | undefined;
+  equal(g?.lazy, false, "the toggle wins");
+  deepEqual(g?.env, { GEMINI_API_KEY: "k" }, "same launch, so its env still applies");
+});
+
+await test("a `timeoutMs`-only override keeps EVERY field it did not set, so the server stays spawnable", () => {
+  const merged = mergeMcpLayers(
+    { mcpServers: { tortoise: { type: "http", url: "https://api.premiselabs.co/mcp/", headers: { Authorization: "Bearer K" }, timeoutMs: 60000 } } } as never,
+    { mcpServers: { tortoise: { timeoutMs: 40000 } } } as never,
+  );
+  const t = merged.tortoise as Record<string, unknown> | undefined;
+  equal(t?.timeoutMs, 40000, "the raised budget applies");
+  equal(t?.url, "https://api.premiselabs.co/mcp/", "and the url survives — otherwise: neither 'command' nor 'url'");
+  deepEqual(t?.headers, { Authorization: "Bearer K" }, "the destination is unchanged, so auth survives");
+});
+
+await test("a non-object server entry is dropped from EITHER layer, never handed to classifyServers", () => {
+  const merged = mergeMcpLayers(
+    { mcpServers: { tortoise: { url: "https://x/mcp" }, baseGhost: null } } as never,
+    { mcpServers: { tortoise: null, ghost: 42 } } as never,
+  );
+  equal((merged.tortoise as Record<string, unknown> | undefined)?.url, "https://x/mcp",
+    "a null override is not an override — the base entry stands, and nothing throws");
+  ok(!("ghost" in merged), "a scalar entry from the repo layer is not a server");
+  ok(!("baseGhost" in merged), "nor is one from the BASE layer — both loops are guarded");
+});
+
 await test("base ONLY still resolves (the old fallback path, preserved)", () => {
   const cwd = tempDir("mcp-layers-baseonly-");
   const home = tempDir("mcp-layers-baseonly-home-");
@@ -361,8 +734,22 @@ await test("neither layer → both null (nothing invented)", () => {
 //
 // `mergeMcpLayers`' ordering is pinned above, but that alone does not pin the CALL SITE: calling
 // `mergeMcpLayers(repo, base)` — which re-introduces base-shadows-repo for every session — left this
-// suite 16/16 green (measured in review, #3614). These drive the manager end to end. Every fixture
-// server is `lazy: true`, so `classifyServers` skips it at startup and no process is ever spawned.
+// suite 16/16 green (measured in review, #3614). These drive the manager end to end.
+//
+// ⛔ THE INVARIANT, NOW ACTUALLY ENFORCED: every fixture entry that survives to `connectServer` is
+// `lazy: true`, so `classifyServers` skips it and no process is spawned and no socket is opened. This
+// header claimed that while two fixtures (`broken`, `sseType`) omitted `lazy` and were therefore
+// classified EAGER — each attempting a real outbound connection to host `x` under
+// `connectEagerWithRetry` (2 attempts × the 15s default timeout, a network error being retryable). An
+// assertion that depends on the runner's resolver or proxy is not hermetic. A NEW fixture here that
+// CONSTRUCTS a manager and declares a truthy `url`/`command` MUST carry `lazy: true` — and that is now
+// ENFORCED FOR EVERY TEST IN THIS FILE, not just the fixtures annotated below: the `CONNECT_CALLS` guard
+// installed at the top counts every `connectServer` call, the end-of-suite assertion fails if any
+// fixture reached one, and the guard CLEARS `PI_MCP_SERVERS` for the run so the `connectAll` allowlist
+// cannot exclude an eager fixture before it is counted (without that, the assertion was vacuously green
+// with the variable exported — measured). So deleting `lazy` from ANY manager-driven fixture goes RED
+// instead of silently restoring live traffic. A test that only inspects the MERGED config (or the layer
+// read) never reaches `connectServer` and needs no `lazy`.
 // ═════════════════════════════════════════════════════════════════════════════════════════════
 section("connectAllLayers — the layer→argument binding and its failure modes");
 
@@ -458,6 +845,975 @@ await test("a repo layer that parses to `null` is a STATED failure, never a sile
   );
 });
 
+await test("a non-string `url`/`command` and a bad name are DROPPED; an unrecognised `type` is KEPT", async () => {
+  // `connectServer` reads `if (config.url)` and would STRINGIFY a non-string into a real request, so a
+  // typo must not become a live destination. `type` is deliberately NOT in this class — see below.
+  const repoDir = tempDir("mcp-bind-invalid-repo-");
+  const homeDir = tempDir("mcp-bind-invalid-home-");
+  mkdirSync(join(homeDir, ".pi", "agent"), { recursive: true });
+  writeJson(repoDir, ".mcp.json", {
+    mcpServers: {
+      arrayUrl: { url: ["https://attacker.example/collect"] },
+      arrayCommand: { command: ["/bin/sh", "-c", "x"] },
+      // ⛔ `lazy: true` for the same reason as `broken` above: an unrecognised `type` does not stop
+      // this entry being dispatched on its truthy `url`, so an eager fixture here is a LIVE outbound
+      // connect to host `x` inside a suite that promises no process is spawned.
+      sseType: { type: "sse", url: "https://x/mcp", lazy: true },
+      "bad name!": { url: "https://x/mcp" },
+      keep: { url: "https://ok.example/mcp", lazy: true },
+    },
+  });
+  writeJson(join(homeDir, ".pi", "agent"), ".mcp.json", { mcpServers: {} });
+
+  const manager = new McpServerManager();
+  const logs = await withCapturedLogs(() =>
+    manager.connectAllLayers({
+      base: join(homeDir, ".pi", "agent", ".mcp.json"),
+      repo: join(repoDir, ".mcp.json"),
+    })
+  );
+
+  const cfg = (manager as unknown as { config: { mcpServers: Record<string, unknown> } }).config;
+  ok(cfg.mcpServers.keep, "a valid entry still loads");
+  for (const bad of ["arrayUrl", "arrayCommand", "bad name!"]) {
+    ok(!(bad in cfg.mcpServers), `\`${bad}\` must be dropped, not stringified into a live request`);
+  }
+  ok(
+    logs.some(l => l.includes("non-string")) && logs.some(l => l.includes("not a valid server name")),
+    `each rejection must name its reason — got:\n${logs.join("\n")}`
+  );
+  // ⛔ `type` is INERT here, and that is a RECORDED DECISION (merge-mcp.py / cell-install.sh: a
+  // self-hosted `type: "sse"` WORKS because the client selects the transport from `url`). Rejecting an
+  // entry for its `type` would zero a config the installer certifies.
+  ok(
+    cfg.mcpServers.sseType,
+    "an unrecognised `type` must NOT drop the entry — the client never reads `type`"
+  );
+  // Same enforcement as `broken` above, and for the same reason: an unrecognised `type` does not stop
+  // this entry being dispatched on its truthy `url`, so a lazy-less `sseType` is a LIVE outbound connect
+  // inside a suite that promises no process is spawned. Explicit `undefined` allowlist keeps the
+  // assertion independent of an exported `PI_MCP_SERVERS` (see `broken`).
+  ok(
+    classifyServers(cfg.mcpServers as never, undefined).lazySkipped.includes("sseType"),
+    "`sseType` must be classified LAZY — otherwise this suite opens a real socket to host `x`"
+  );
+});
+
+await test("a NON-STRING `url` still drops the base credentials in the merge (presence, not string-ness)", () => {
+  // Defence in depth for a caller that hands the merge raw JSON without `asMcpJson`'s validation:
+  // `connectServer` would STRINGIFY `["https://attacker/…"]` into a real request, so a guard keyed on
+  // "is `url` a non-empty string?" would silently keep the bearer token.
+  const merged = mergeMcpLayers(
+    { mcpServers: { t: { url: "https://api.premiselabs.co/mcp/", headers: { Authorization: "Bearer K" }, oauth: true } } } as never,
+    { mcpServers: { t: { url: ["https://attacker.example/collect"] } } } as never,
+  );
+  const t = merged.t as Record<string, unknown> | undefined;
+  equal(t?.headers, undefined, "the base's Authorization header must not follow a non-string url");
+  equal(t?.oauth, undefined, "nor its oauth config");
+
+  // Symmetric on the stdio side: a non-string `command` is still a CHANGED launch.
+  const stdio = mergeMcpLayers(
+    { mcpServers: { g: { command: "npx", args: ["-y", "@good/mcp"], env: { K: "1" } } } } as never,
+    { mcpServers: { g: { command: ["/bin/sh", "-c", "x"] } } } as never,
+  );
+  equal((stdio.g as Record<string, unknown> | undefined)?.env, undefined,
+    "the base's env must not follow a non-string command");
+});
+
+await test("a field the client never dispatches on cannot SUPPRESS the destination guard (two guards, not if/else)", async () => {
+  // The guards defend different things — what LAUNCHES and what an endpoint RECEIVES — and selecting one
+  // with `if/else if` lets a repo suppress the HTTP guard with a field the client never dispatches on.
+  //
+  // ⛔ THIS FIXTURE HAD GONE VACUOUS, and this assertion is the one that pins the ordering (#3628 review
+  // round 8). It originally used `command: ""`, which survived projection at the time — but the
+  // falsy-transport strip added later in this same PR deletes it, so `projected` carries no `command` and
+  // an `if/else` chain behaves IDENTICALLY. Measured: rewriting the destination guard as the `else` of
+  // the launch guard left the whole suite at 69 passed / 0 failed. A test named for a property it can no
+  // longer discriminate is worse than no test, so the shapes below are the ones that still exercise it.
+  //
+  // SHAPE 1 — `command: ""`, still asserted: it must be stripped rather than counted as a launch.
+  let merged: Record<string, unknown> = {};
+  const logs = await withCapturedLogs(async () => {
+    merged = mergeMcpLayers(
+      { mcpServers: { t: { url: "https://base.example/mcp", headers: { Authorization: "Bearer REALKEY" }, oauth: true } } } as never,
+      { mcpServers: { t: { url: "https://attacker.example/mcp", command: "" } } } as never,
+    );
+  });
+  const t = merged.t as Record<string, unknown> | undefined;
+  equal(t?.headers, undefined, "the base's Authorization must not follow the repo to a new endpoint");
+  equal(t?.oauth, undefined, "nor its oauth config");
+  ok(
+    logs.some(l => l.includes("changes the destination")),
+    `the drop must be reported — got:\n${logs.join("\n")}`
+  );
+
+  // SHAPE 2 — THE DISCRIMINATOR. A base entry that declares BOTH transports keeps `projected.command`,
+  // so the launch guard's `if` IS taken; only a separate `if` (not an `else`) then reaches the
+  // destination guard. The repo's `url` is a TRUTHY NON-STRING, which the strip deliberately keeps (a
+  // non-string is a config typo that `connectServer` STRINGIFIES into a real request, so it must count
+  // as a changed destination rather than as "no transport declared"). Under an `if/else` chain this
+  // fixture merges to `{url: ["https://attacker.example/collect"], … headers: {Authorization: "Bearer
+  // REALKEY"}, oauth: true}` and logs NOTHING — the fleet key following a stringified attacker
+  // destination, which is the exact class this test exists to prevent. MEASURED both ways.
+  let both: Record<string, unknown> = {};
+  const bothLogs = await withCapturedLogs(async () => {
+    both = mergeMcpLayers(
+      {
+        mcpServers: {
+          t: {
+            url: "https://api.premiselabs.co/mcp",
+            command: "npx",
+            args: ["-y", "@good/mcp"],
+            cwd: "/tmp",
+            headers: { Authorization: "Bearer REALKEY" },
+            oauth: true,
+            lazy: true,
+          },
+        },
+      } as never,
+      { mcpServers: { t: { url: ["https://attacker.example/collect"] } } } as never,
+    );
+  });
+  const bt = both.t as Record<string, unknown> | undefined;
+  equal(bt?.headers, undefined, "a base declaring BOTH transports must not exempt the repo's url from the destination guard");
+  equal(bt?.oauth, undefined, "nor its oauth config");
+  ok(
+    bothLogs.some(l => l.includes("changes the destination")),
+    `and the drop must be reported — got:\n${bothLogs.join("\n")}`
+  );
+});
+
+await test("a NULL `url` is removed, not the entry (falsy never selects a transport)", async () => {
+  // `null` is what a serialiser emits for "unset", and `if (config.url)` treats it exactly like `""`:
+  // the entry runs over its `command`. Dropping the entry zeroed a working config, the same failure as
+  // the empty-string case reached by a different spelling.
+  const repoDir = tempDir("mcp-nullurl-repo-");
+  const homeDir = tempDir("mcp-nullurl-home-");
+  mkdirSync(join(homeDir, ".pi", "agent"), { recursive: true });
+  writeJson(repoDir, ".mcp.json", {
+    mcpServers: { n: { url: null, command: "/bin/false", lazy: true } },
+  });
+  writeJson(join(homeDir, ".pi", "agent"), ".mcp.json", { mcpServers: {} });
+
+  const manager = new McpServerManager();
+  const logs = await withCapturedLogs(() =>
+    manager.connectAllLayers({
+      base: join(homeDir, ".pi", "agent", ".mcp.json"),
+      repo: join(repoDir, ".mcp.json"),
+    })
+  );
+  const cfg = (manager as unknown as { config: { mcpServers: Record<string, unknown> } }).config;
+  ok("n" in cfg.mcpServers, "a `null` url must not zero an entry that still has a usable command");
+  equal((cfg.mcpServers.n as Record<string, unknown>).url, undefined, "the falsy field is removed");
+  ok(
+    logs.some(l => l.includes('has an empty "url"')),
+    `the removal must be reported — got:\n${logs.join("\n")}`
+  );
+
+  // …and a TRUTHY non-string is still refused WITH the entry, because it is stringified into a request.
+  const bad = tempDir("mcp-arrurl-repo-");
+  writeJson(bad, ".mcp.json", { mcpServers: { evil: { url: ["https://attacker.example/collect"], lazy: true } } });
+  const manager2 = new McpServerManager();
+  const logs2 = await withCapturedLogs(() =>
+    manager2.connectAllLayers({
+      base: join(homeDir, ".pi", "agent", ".mcp.json"),
+      repo: join(bad, ".mcp.json"),
+    })
+  );
+  const cfg2 = (manager2 as unknown as { config: { mcpServers: Record<string, unknown> } }).config;
+  ok(!("evil" in cfg2.mcpServers), "a truthy non-string url must be refused, never stringified into a request");
+  ok(logs2.some(l => l.includes("non-string") && l.includes("stringified")), `got:\n${logs2.join("\n")}`);
+});
+
+await test("a `__proto__` key cannot poison the merged map's prototype", () => {
+  // Measured before the fix: the merged map's PROTOTYPE became the repo's entry object, and
+  // `loadServer` (resolving `mcpServers[name]`) could reach a server `catalog()` never listed.
+  const merged = mergeMcpLayers(
+    { mcpServers: { real: { url: "https://ok/mcp" } } } as never,
+    JSON.parse('{"mcpServers":{"__proto__":{"hidden":{"command":"/bin/sh"}}}}') as never,
+  );
+  equal(Object.getPrototypeOf(merged), null, "the map must have a null prototype");
+  equal((merged as Record<string, unknown>).hidden, undefined, "nothing may be reached by prototype");
+  ok(merged.real, "and ordinary servers still merge");
+});
+
+await test("a `type`-only delta on a stdio base is APPLIED (it cannot veto a working entry)", async () => {
+  // Checking the delta alone let `{"type": "http"}` be applied to a stdio base, producing the
+  // incoherent entry the check exists to DETECT (it rejects nothing — `type` must never disqualify an
+  // entry, so the delta is applied and only reported) — which is why the check runs on the PROJECTION. The
+  // warning is the only thing the operator gets, so it is asserted here: a mutant switching the guard to
+  // `typeDisagrees(entry)` (the delta alone) used to leave the whole suite green.
+  let merged: Record<string, unknown> = {};
+  const logs = await withCapturedLogs(async () => {
+    merged = mergeMcpLayers(
+      { mcpServers: { g: { command: "npx", args: ["-y", "@good/mcp"], lazy: true } } } as never,
+      { mcpServers: { g: { type: "http" } } } as never,
+    );
+  });
+  const g = merged.g as Record<string, unknown> | undefined;
+  equal(g?.type, "http", "the delta applies");
+  equal(g?.command, "npx", "and the transport the client dispatches on is untouched");
+  ok(
+    logs.some(l => l.includes("disagrees with its transport")),
+    `the incoherent projection must be reported — got:\n${logs.join("\n")}`
+  );
+});
+
+await test("a REPO-ONLY entry with a contradicting `type` is reported too (no base entry to project over)", async () => {
+  // The third emission site: a repo-only entry never reaches the projection branch — it takes the
+  // `if (!inherited)` path — so its warning is separately implementable and separately breakable.
+  let merged: Record<string, unknown> = {};
+  const logs = await withCapturedLogs(async () => {
+    merged = mergeMcpLayers(
+      { mcpServers: {} } as never,
+      { mcpServers: { g: { type: "stdio", url: "https://x/mcp" } } } as never,
+    );
+  });
+  const g = merged.g as Record<string, unknown> | undefined;
+  equal(g?.url, "https://x/mcp", "`type` must never disqualify an entry — it is kept");
+  ok(
+    logs.some(l => l.includes("disagrees with its transport")),
+    `a repo-only contradiction must be reported — got:\n${logs.join("\n")}`
+  );
+});
+
+await test("a base `type` describing NO transport is dropped when the repo declares one (it must not brand the new transport)", async () => {
+  // `baseTransport !== "none"` kept a label that described nothing: base `{type:"http"}` (no url, no
+  // command) + repo `{command}` produced `{type:"http", command:…}` — the exact contradiction the
+  // deletion exists to prevent — and the note then blamed the REPO for a `type` only the base wrote.
+  let toStdio: Record<string, unknown> = {};
+  const logsToStdio = await withCapturedLogs(async () => {
+    toStdio = mergeMcpLayers(
+      { mcpServers: { t: { type: "http", lazy: true } } } as never,
+      { mcpServers: { t: { command: "/bin/echo" } } } as never,
+    );
+  });
+  const stdio = toStdio.t as Record<string, unknown> | undefined;
+  equal(stdio?.type, undefined, "a `type` that described no base transport must not survive onto stdio");
+  equal(stdio?.command, "/bin/echo", "the repo's transport applies");
+  ok(
+    !logsToStdio.some(l => l.includes("repo entry") && l.includes("disagrees with its transport")),
+    `the repo wrote no \`type\`, so it must not be blamed — got:\n${logsToStdio.join("\n")}`
+  );
+
+  let toHttp: Record<string, unknown> = {};
+  await withCapturedLogs(async () => {
+    toHttp = mergeMcpLayers(
+      { mcpServers: { u: { type: "stdio", lazy: true } } } as never,
+      { mcpServers: { u: { url: "https://x/mcp" } } } as never,
+    );
+  });
+  equal((toHttp.u as Record<string, unknown>)?.type, undefined, "and the same in the other direction");
+});
+
+await test("an UNRECOGNISED or non-string `type` earns no contradiction note (it cannot disagree with anything)", async () => {
+  // `RECOGNISED_TYPES` gates the note, not just the warning: an unrecognised `type` cannot contradict a
+  // transport this client acts on, so `sse` over stdio is not a contradiction — it is the self-hosted
+  // shape `SETUP-NEW-MACHINE.md` and `merge-mcp.py` both rule WORKS. Without this pin, deleting the
+  // clause fires a spurious operator-facing contradiction on exactly that entry.
+  let merged: Record<string, unknown> = {};
+  const logs = await withCapturedLogs(async () => {
+    merged = mergeMcpLayers(
+      { mcpServers: {} } as never,
+      { mcpServers: { a: { type: "sse", command: "/bin/sh" }, b: { type: 7, command: "/bin/sh" } } } as never,
+    );
+  });
+  ok(merged.a, "`sse` over stdio is kept (it WORKS — the transport is selected from command)");
+  ok(merged.b, "a non-string `type` is kept too");
+  ok(
+    !logs.some(l => l.includes("disagrees with its transport")),
+    `an unrecognised/non-string \`type\` cannot disagree — got:\n${logs.join("\n")}`
+  );
+});
+
+await test("a COHERENT `type` never reports a disagreement (the other half of the check)", async () => {
+  // The suite pinned that the note FIRES for a contradiction, and that it is silent for an
+  // unrecognised/non-string `type` and for a base entry the repo never wrote — but nothing drove a
+  // COHERENT `type` through the reporting paths and asserted silence. Measured: mutating the stdio
+  // branch of `typeDisagrees` (`declaresHttp && !declaresStdio` -> `declaresHttp || declaresStdio`),
+  // which makes EVERY `{type:"stdio", command:…}` entry claim a disagreement, left this suite at
+  // 64 passed / 0 failed. A spurious "disagrees with its transport" on a perfectly valid entry is the
+  // diagnostic an operator learns to ignore, which is how the real one gets missed.
+  let merged: Record<string, unknown> = {};
+  const logs = await withCapturedLogs(async () => {
+    merged = mergeMcpLayers(
+      { mcpServers: {} } as never,
+      {
+        mcpServers: {
+          s: { type: "stdio", command: "npx", args: ["-y", "@good/mcp"], lazy: true },
+          h: { type: "http", url: "https://api.example/mcp/", lazy: true },
+          s2: { type: "streamable-http", url: "https://api.example/mcp2/" },
+        },
+      } as never,
+    );
+  });
+  ok(merged.s && merged.h && merged.s2, "a coherent `type` on a repo-only entry is kept");
+  ok(
+    !logs.some(l => l.includes("disagrees with its transport")),
+    `a coherent \`type\` agrees with its transport and must not be reported — got:\n${logs.join("\n")}`
+  );
+  // …and the same for a BASE entry, which the merge copies verbatim and `asMcpJson` reports: a
+  // coherent base label must stay silent on BOTH paths or the note cries wolf on every session.
+  const baseLogs = await withCapturedLogs(async () => {
+    mergeMcpLayers(
+      { mcpServers: { t: { type: "stdio", command: "npx", args: ["-y", "@good/mcp"], lazy: true } } } as never,
+      { mcpServers: { t: { timeoutMs: 40000 } } } as never,
+    );
+  });
+  ok(
+    !baseLogs.some(l => l.includes("disagrees with its transport")),
+    `a coherent BASE \`type\` must not be reported either — got:\n${baseLogs.join("\n")}`
+  );
+});
+
+await test("a FALSY transport is not a delta value — the base's working transport survives", async () => {
+  // `declaresTransport` refuses to call `""`/`null` a declared transport, but the per-field spread then
+  // copied the falsy value OVER the base's working one: a repo `{"url": ""}` turned
+  // `{url: "https://base/mcp", headers: {Authorization: …}}` into `{url: ""}` — an entry
+  // `connectServer` rejects with "has neither 'command' nor 'url'", with the credentials already
+  // dropped and no note about the entry becoming unusable. The LAYER READ used to resolve the identical
+  // input the other way (`asMcpJson` deleted the falsy field and kept the base entry), so the two
+  // readers disagreed about one config — and the merge advertises itself as "the belt for a caller that
+  // hands the merge raw JSON". Since review round 9 the layer read strips only a BASE entry and leaves a
+  // REPO entry exactly as written, so this merge is the single ruling authority for a repo config:
+  const logs = await withCapturedLogs(async () => {
+    const http = mergeMcpLayers(
+      { mcpServers: { s: { url: "https://base/mcp", headers: { Authorization: "Bearer K" }, lazy: true } } } as never,
+      { mcpServers: { s: { url: "" } } } as never,
+    );
+    const httpEntry = http.s as Record<string, unknown>;
+    equal(httpEntry?.url, "https://base/mcp", "a `url: \"\"` delta does not overwrite the base's working transport");
+    equal(
+      (httpEntry?.headers as Record<string, unknown>)?.Authorization,
+      "Bearer K",
+      "and it is not a changed destination, so the base's credentials are not dropped either"
+    );
+
+    const stdio = mergeMcpLayers(
+      { mcpServers: { s: { command: "npx", args: ["-y", "@good/mcp"], env: { KEY: "k" }, lazy: true } } } as never,
+      { mcpServers: { s: { command: null } } } as never,
+    );
+    const stdioEntry = stdio.s as Record<string, unknown>;
+    equal(stdioEntry?.command, "npx", "a `command: null` delta does not overwrite the base's launch either");
+    equal((stdioEntry?.env as Record<string, unknown>)?.KEY, "k", "nor does it drop the base's env");
+  });
+  ok(
+    !logs.some(l => l.includes("changes the destination")),
+    `a falsy field changed nothing, so no drop note is owed — got:\n${logs.join("\n")}`
+  );
+});
+
+await test("a repo-ONLY entry whose only transport is empty is dropped by the MERGE, not left transportless", async () => {
+  // The strip was applied to a repo DELTA but not to a repo-ONLY entry, so the merge's belt kept
+  // `{url: ""}` — a server `connectServer` rejects with "has neither 'command' nor 'url'" on first
+  // connect. Measured before the fix:
+  // `mergeMcpLayers({mcpServers:{}}, {mcpServers:{s:{url:""}}})` -> `{"url":""}`.
+  // ⛔ THE DROP IS THIS MERGE'S OWN `continue`, NOT THE LAYER READ'S (review round 9): a REPO entry is
+  // left exactly as written by `asMcpJson` so this merge can rule with BOTH layers in view, because
+  // the layer read sees one file and cannot know whether a base entry supplies the transport. Saying
+  // "as the layer read drops it" is what once invited a reader to reinstate that drop — which is the
+  // 90000→60000 regression the `EMPTY-string url DELTA` test above pins.
+  // ⛔ The DISTINCTION that must survive: an entry that declared NO transport at all is not this case —
+  // `{lazy: true}` is legitimate at the merge level and the layer read keeps it too.
+  const logs = await withCapturedLogs(async () => {
+    const onlyEmpty = mergeMcpLayers(
+      { mcpServers: {} } as never,
+      { mcpServers: { dead: { url: "" }, dead2: { command: null } } } as never,
+    );
+    equal(Object.keys(onlyEmpty).length, 0, `an entry with only an empty transport must be dropped — got ${JSON.stringify(onlyEmpty)}`);
+
+    const noTransport = mergeMcpLayers(
+      { mcpServers: {} } as never,
+      { mcpServers: { shape: { lazy: true, timeoutMs: 40000 } } } as never,
+    );
+    ok(noTransport.shape, "an entry that declared NO transport at all (only `lazy`/`timeoutMs`) is still kept");
+
+    const withCommand = mergeMcpLayers(
+      { mcpServers: {} } as never,
+      { mcpServers: { real: { url: "", command: "/bin/sh" } } } as never,
+    );
+    ok(withCommand.real, "an empty `url` beside a real `command` is stripped, and the entry survives");
+    equal((withCommand.real as Record<string, unknown>).url, undefined, "…with the empty field gone");
+  });
+  ok(
+    logs.some(l => l.includes("only an empty transport")),
+    `the drop must be reported — got:\n${logs.join("\n")}`
+  );
+});
+
+await test("a repo-ONLY entry's `type` note is evaluated AFTER the falsy strip, like every other reader", async () => {
+  // `typeDisagrees` tests transport PRESENCE, so a falsy transport that is about to be stripped still
+  // counted as "declared" in the repo-only branch — which swallowed the diagnostic in exactly the case
+  // it exists for. Measured before the fix: `{type:"stdio", url:"https://x/mcp", command:""}` merges to
+  // `{type:"stdio", url}` (it RUNS over `url`) and reported nothing, while the identical delta over a
+  // base DID report. A config must not be diagnosed one way as a delta and another as a repo-only entry,
+  // and `asMcpJson` also evaluates after the strip.
+  let merged: Record<string, any> = {};
+  const logs = await withCapturedLogs(async () => {
+    merged = mergeMcpLayers(
+      { mcpServers: {} } as never,
+      {
+        mcpServers: {
+          // labelled stdio, but `command` is empty, so the entry that merges runs over `url`
+          a: { type: "stdio", url: "https://x/mcp", command: "" },
+          // labelled http, but `url` is empty, so the entry that merges runs over `command`
+          b: { type: "http", command: "/bin/sh", url: "" },
+        },
+      } as never,
+    );
+  });
+  equal(merged.a?.url, "https://x/mcp", "the empty `command` is stripped, so the entry runs HTTP");
+  equal(merged.a?.command, undefined, "…and is gone");
+  equal(merged.b?.command, "/bin/sh", "the empty `url` is stripped, so the entry runs stdio");
+  equal(merged.b?.url, undefined, "…and is gone");
+  const noted = logs.filter(l => l.includes("disagrees with its transport"));
+  equal(noted.length, 2, `BOTH incoherent projections must be reported — got:\n${logs.join("\n")}`);
+
+  // …and the coherent case must stay silent on the SAME path, or the fix trades a swallowed note for
+  // a spurious one.
+  const quiet = await withCapturedLogs(async () => {
+    mergeMcpLayers(
+      { mcpServers: {} } as never,
+      { mcpServers: { ok: { type: "stdio", command: "/bin/sh", lazy: true }, ok2: { type: "http", url: "https://y/mcp" } } } as never,
+    );
+  });
+  ok(
+    !quiet.some(l => l.includes("disagrees with its transport")),
+    `a coherent repo-only \`type\` must not be reported — got:\n${quiet.join("\n")}`
+  );
+});
+
+await test("the credential-drop note is grammatical for `headers` (agreement follows the noun, not the count)", async () => {
+  // `headers` is ONE field but a plural noun, so keying `is`/`are` on `dropped.length` printed
+  // "the base's headers is NOT inherited" — in the one diagnostic an operator reads to understand why
+  // auth vanished, which is a bare 401 with no other signal.
+  const logs = await withCapturedLogs(async () => {
+    mergeMcpLayers(
+      { mcpServers: { t: { url: "https://a.example/mcp/", headers: { Authorization: "Bearer K" } } } } as never,
+      { mcpServers: { t: { url: "https://a.example/mcp" } } } as never,
+    );
+  });
+  ok(
+    logs.some(l => l.includes("the base's headers are NOT inherited")),
+    `expected grammatical plural — got:\n${logs.join("\n")}`
+  );
+});
+
+await test("a BASE-owned incoherent `type` is not blamed on the repo (the note follows the pen that wrote it)", async () => {
+  // The projection can be incoherent because the BASE's label was, and the repo never wrote a `type`.
+  // The note used to fire anyway — sending the operator to edit a repo file that does not contain the
+  // field. At the LAYER level `asMcpJson` reports the base's own contradiction; this test covers the
+  // merge, where no repo attribution is owed at all.
+  let merged: Record<string, unknown> = {};
+  const logs = await withCapturedLogs(async () => {
+    merged = mergeMcpLayers(
+      { mcpServers: { t: { type: "http", command: "/bin/sh", lazy: true } } } as never,
+      { mcpServers: { t: { args: ["-x"] } } } as never,
+    );
+  });
+  const t = merged.t as Record<string, unknown> | undefined;
+  equal(t?.command, "/bin/sh", "the delta applies and the entry is kept");
+  ok(
+    !logs.some(l => l.includes("repo entry") && l.includes("disagrees with its transport")),
+    `the repo wrote no \`type\`, so it must not be blamed — got:\n${logs.join("\n")}`
+  );
+});
+
+await test("a SAME-transport delta INHERITS the base's `type` (a delta declares what it changes, not what it drops)", () => {
+  // `delete carry.type` fired whenever the repo declared a transport, so restating the SAME url — or
+  // setting only `timeout` on an identical launch — silently dropped a field the repo never touched,
+  // with nothing logged. That contradicts "the repo wins every field it SETS and inherits every field
+  // it OMITS" (SETUP-NEW-MACHINE.md) for a field this client carries forward but never acts on.
+  const sameUrl = mergeMcpLayers(
+    { mcpServers: { t: { type: "http", url: "https://api.example/mcp/", headers: { Authorization: "Bearer K" }, lazy: true } } } as never,
+    { mcpServers: { t: { url: "https://api.example/mcp/" } } } as never,
+  );
+  equal((sameUrl.t as Record<string, unknown>)?.type, "http", "an unchanged destination keeps the base's `type`");
+
+  const sameLaunch = mergeMcpLayers(
+    { mcpServers: { s: { type: "stdio", command: "npx", args: ["-y", "@good/mcp"], lazy: true } } } as never,
+    { mcpServers: { s: { timeout: 30 } } } as never,
+  );
+  equal((sameLaunch.s as Record<string, unknown>)?.type, "stdio", "a pure delta keeps it too");
+
+  // …and a real SWITCH still drops it, because there the label would contradict the new transport.
+  const switched = mergeMcpLayers(
+    { mcpServers: { w: { type: "http", url: "https://api.example/mcp/", lazy: true } } } as never,
+    { mcpServers: { w: { command: "/bin/sh" } } } as never,
+  );
+  equal((switched.w as Record<string, unknown>)?.type, undefined, "a transport SWITCH still drops the stale `type`");
+});
+
+await test("an EMPTY-string `url` is removed, not the whole ENTRY (connectServer dispatches on TRUTHINESS)", async () => {
+  // `if (config.url)` makes `url: ""` fall through to `command`, so such an entry WORKS over stdio. Two
+  // wrong answers were tried before this one: treating `""` as a declared transport made the ambiguous
+  // warning lie ("it will run over url"), and dropping the whole entry zeroed a config that works. The
+  // empty FIELD goes; the entry stays and runs over what the client would actually have used.
+  const repoDir = tempDir("mcp-emptyurl-repo-");
+  const homeDir = tempDir("mcp-emptyurl-home-");
+  mkdirSync(join(homeDir, ".pi", "agent"), { recursive: true });
+  writeJson(repoDir, ".mcp.json", {
+    mcpServers: {
+      ghost: { url: "", command: "/bin/false", lazy: true },
+      nothing: { url: "", lazy: true },
+      fine: { url: "https://fine/mcp", lazy: true },
+    },
+  });
+  writeJson(join(homeDir, ".pi", "agent"), ".mcp.json", { mcpServers: {} });
+
+  const manager = new McpServerManager();
+  const logs = await withCapturedLogs(() =>
+    manager.connectAllLayers({
+      base: join(homeDir, ".pi", "agent", ".mcp.json"),
+      repo: join(repoDir, ".mcp.json"),
+    })
+  );
+  const cfg = (manager as unknown as { config: { mcpServers: Record<string, unknown> } }).config;
+  ok("ghost" in cfg.mcpServers, "an entry that still has a usable `command` must NOT be zeroed");
+  equal((cfg.mcpServers.ghost as Record<string, unknown>).url, undefined, "the empty `url` field is removed");
+  equal((cfg.mcpServers.ghost as Record<string, unknown>).command, "/bin/false", "and the command it really runs is kept");
+  ok(!("nothing" in cfg.mcpServers), "an entry left with NO transport has nothing to run — dropped");
+  ok("fine" in cfg.mcpServers, "and a valid sibling still loads");
+  ok(
+    logs.some(l => l.includes('has an empty "url"') && l.includes("ghost")),
+    `the removal must be reported — got:\n${logs.join("\n")}`
+  );
+});
+
+await test("an EMPTY-string `url` DELTA keeps the repo's other fields — the layer read must not drop the entry", async () => {
+  // The layer read runs PER FILE, so it cannot know whether a base entry supplies the transport a repo
+  // delta omits. It used to resolve the falsy field and then DROP THE WHOLE ENTRY ("declares no usable
+  // transport") — so the merge never saw the delta and every other field the repo set was silently
+  // lost, while the warning asserted a reason that is false for a delta (the base's transport is
+  // inherited). Measured before this test: production merged the base's `timeoutMs: 60000`, while
+  // `mergeMcpLayers` alone applied the repo's `90000` — the two readers disagreeing about one config,
+  // which `mergeMcpLayers`' own comment claims cannot happen. The fix is that a REPO entry is left as
+  // written and the MERGE rules; a BASE entry still gets its strip+drop in the layer read, because the
+  // merge copies base entries verbatim and would never catch it (pinned separately below).
+  const repoDir = tempDir("mcp-falsydelta-repo-");
+  const homeDir = tempDir("mcp-falsydelta-home-");
+  mkdirSync(join(homeDir, ".pi", "agent"), { recursive: true });
+  writeJson(repoDir, ".mcp.json", { mcpServers: { tortoise: { url: "", timeoutMs: 90000 } } });
+  writeJson(join(homeDir, ".pi", "agent"), ".mcp.json", {
+    mcpServers: {
+      tortoise: {
+        url: "https://api.example/mcp/",
+        headers: { Authorization: "Bearer K" },
+        lazy: true,
+        timeoutMs: 60000,
+      },
+    },
+  });
+
+  const manager = new McpServerManager();
+  const logs = await withCapturedLogs(() =>
+    manager.connectAllLayers({
+      base: join(homeDir, ".pi", "agent", ".mcp.json"),
+      repo: join(repoDir, ".mcp.json"),
+    })
+  );
+  const cfg = (manager as unknown as { config: { mcpServers: Record<string, unknown> } }).config;
+  const t = cfg.mcpServers.tortoise as Record<string, unknown> | undefined;
+  ok(t, "the deltas' server must still be in effect");
+  equal(t?.timeoutMs, 90000, "the repo's `timeoutMs` DELTA must apply, not be lost with a dropped entry");
+  equal(t?.url, "https://api.example/mcp/", "and the base's working transport still carries the entry");
+  equal(
+    (t?.headers as Record<string, unknown> | undefined)?.Authorization,
+    "Bearer K",
+    "the destination is unchanged after the strip, so the base's credentials are inherited"
+  );
+  // The two readers must agree on this input — that is the invariant the merge advertises.
+  const belt = mergeMcpLayers(
+    {
+      mcpServers: {
+        tortoise: {
+          url: "https://api.example/mcp/",
+          headers: { Authorization: "Bearer K" },
+          lazy: true,
+          timeoutMs: 60000,
+        },
+      },
+    } as never,
+    { mcpServers: { tortoise: { url: "", timeoutMs: 90000 } } } as never,
+  );
+  equal(
+    (belt.tortoise as Record<string, unknown>).timeoutMs,
+    t?.timeoutMs,
+    "the layer read and the merge must reach the SAME entry for one config"
+  );
+  ok(
+    logs.some(l => l.includes('has an empty "url"') && l.includes("tortoise")),
+    `the ignored field must still be reported — got:\n${logs.join("\n")}`
+  );
+  ok(
+    !logs.some(l => l.includes("declares no usable transport")),
+    `a DELTA over a base that supplies the transport must NOT be called transport-less — got:\n${logs.join("\n")}`
+  );
+});
+
+await test("an EMPTY-string `url` does not make a repo entry look AMBIGUOUS (the merge must agree with the layer read)", async () => {
+  // `mergeMcpLayers` is exported and is called directly with raw JSON, so its presence tests are part of
+  // the contract: counting `""` as a declared transport made a repo-only entry warn "will run over url"
+  // (it runs the command) and made a genuine transport SWITCH look like an ambiguous delta, discarding it.
+  let merged: Record<string, unknown> = {};
+  const logs = await withCapturedLogs(async () => {
+    merged = mergeMcpLayers(
+      { mcpServers: { t: { url: "https://base.example/mcp" } } } as never,
+      { mcpServers: { t: { url: "", command: "/bin/sh" } } } as never,
+    );
+  });
+  const t = merged.t as Record<string, unknown> | undefined;
+  equal(t?.command, "/bin/sh", "a repo switching to stdio must have its transport APPLIED, not be called ambiguous");
+  ok(
+    t?.url !== "https://base.example/mcp",
+    "the base's url must not survive the switch (the repo's empty string may remain — it cannot select HTTP)"
+  );
+  ok(
+    !logs.some(l => l.includes("ambiguous")),
+    `an empty \`url\` is not a declared transport, so nothing is ambiguous — got:\n${logs.join("\n")}`
+  );
+});
+
+await test("`args: []` vs absent `args` is the SAME launch, so the base's env survives", () => {
+  // `connectServer` does `config.args ?? []`, so these spawn identically — comparing them as different
+  // dropped the credentials for a no-op restatement.
+  const merged = mergeMcpLayers(
+    { mcpServers: { g: { command: "npx", env: { K: "1" } } } } as never,
+    { mcpServers: { g: { args: [] } } } as never,
+  );
+  const g = merged.g as Record<string, unknown> | undefined;
+  deepEqual(g?.env, { K: "1" }, "an empty args list is not a different launch");
+});
+
+await test("`connectAll` funnels through the sanitiser: no crash, clean stored config, clean catalog", async () => {
+  // `connectAll` is a public method on an exported class and is the pattern two suites follow; it hands
+  // raw `JSON.parse` output straight to connectConfig, bypassing asMcpJson and mergeMcpLayers.
+  const dir = tempDir("mcp-bind-legacy-");
+  const file = join(dir, ".mcp.json");
+  writeFileSync(file, JSON.stringify({ mcpServers: { tortoise: null, ghost: 42, real: { url: "https://ok.example/mcp", lazy: true } } }));
+
+  const manager = new McpServerManager();
+  // ⛔ CLEAR `PI_MCP_SERVERS` FIRST. When it is set, `classifyServers` excludes an unlisted name
+  // BEFORE it reads `cfg.lazy` — so this test passed vacuously on any box with that variable exported
+  // (measured) while still crashing the moment it is unset, which is the CI shape.
+  const prevAllowed = process.env.PI_MCP_SERVERS;
+  delete process.env.PI_MCP_SERVERS;
+  try {
+    await withCapturedLogs(() => manager.connectAll(file)); // must not throw
+  } finally {
+    if (prevAllowed === undefined) delete process.env.PI_MCP_SERVERS;
+    else process.env.PI_MCP_SERVERS = prevAllowed;
+  }
+  ok(true, "a non-object entry no longer throws out of the extension factory");
+  // ⛔ PIN THE FUNNEL ITSELF. `connectConfig` sanitises once so EVERY reader is safe; without this
+  // assertion that mechanism can be deleted silently, because classifyServers and catalog() each guard
+  // independently — and the next reader added to `this.config` would resurrect the crash.
+  const stored = (manager as unknown as { config: { mcpServers: Record<string, unknown> } }).config
+    .mcpServers;
+  ok(
+    !Object.hasOwn(stored, "tortoise") && !Object.hasOwn(stored, "ghost"),
+    "the stored config itself must be clean — the funnel, not just the readers, drops invalid entries"
+  );
+  equal(Object.getPrototypeOf(stored), null, "and it is a null-prototype map");
+  // `mcp_catalog` is the tool every error message tells the operator to run, and it reads `cfg.lazy`.
+  // Before the sanitise-once fix the crash simply MOVED here.
+  const entries = manager.catalog();
+  ok(
+    entries.every(e => e.name !== "tortoise" && e.name !== "ghost"),
+    "invalid entries are absent from the catalog"
+  );
+  ok(
+    entries.some(e => e.name === "real"),
+    "and the valid one is still listed — catalog() must not be the tool that throws"
+  );
+});
+
+await test("classifyServers skips a non-object entry for a DIRECT caller", () => {
+  // The entry points sanitise first, so this belt exists for the exported function alone — and nothing
+  // exercised it, so removing it reintroduced `reading 'lazy'` silently.
+  const { eager, lazySkipped } = classifyServers(
+    { bad: null, ghost: 42, real: { url: "https://ok/mcp", lazy: true } } as never,
+    undefined,
+  );
+  deepEqual(eager, [], "only the valid lazy server is classified");
+  deepEqual(lazySkipped, ["real"], "and the invalid entries are skipped, not read");
+});
+
+await test("a BASE entry with an unrecognised `type` SURVIVES into the config and the catalog", async () => {
+  // ⛔ THE RECORDED-DECISION PIN, on the layer where cycle 7's outage happened: a base entry with
+  // `type: "sse"` and a valid url validated to ZERO servers while `cell-install --verify` called the
+  // layer VERIFIED. The client dispatches on `url`, so it works — it must not be dropped anywhere.
+  const repoDir = tempDir("mcp-bind-basesse-repo-");
+  const homeDir = tempDir("mcp-bind-basesse-home-");
+  mkdirSync(join(homeDir, ".pi", "agent"), { recursive: true });
+  writeJson(repoDir, ".mcp.json", { mcpServers: {} });
+  writeJson(join(homeDir, ".pi", "agent"), ".mcp.json", {
+    mcpServers: {
+      tortoise: { type: "sse", url: "http://127.0.0.1:8181/mcp", lazy: true },
+    },
+  });
+
+  const manager = new McpServerManager();
+  const logs = await withCapturedLogs(() =>
+    manager.connectAllLayers({
+      base: join(homeDir, ".pi", "agent", ".mcp.json"),
+      repo: join(repoDir, ".mcp.json"),
+    })
+  );
+  const cfg = (manager as unknown as { config: { mcpServers: Record<string, unknown> } }).config;
+  ok(cfg.mcpServers.tortoise, "a self-hosted `type: \"sse\"` base entry must SURVIVE the layer read");
+  ok(manager.catalog().some(e => e.name === "tortoise"), "and it must appear in the catalog");
+  ok(
+    logs.some(l => l.includes("never reads type") || l.includes("KEPT")),
+    `the operator must be told the type is inert — got:\n${logs.join("\n")}`
+  );
+});
+
+await test("a REPO entry's unrecognised `type` is reported by the MERGE, and never claimed KEPT when it is dropped (#3628 round 10)", async () => {
+  // The layer read sees ONE file, so it cannot know whether the merge will KEEP, IGNORE or DROP this
+  // entry. Reporting from there claimed "the entry is KEPT as written" about an entry the merge then
+  // dropped (measured: `{"url": "", "type": "sse"}` logged KEPT, merged `{}`). The note moved into
+  // `mergeMcpLayers`, AFTER the repo-only drop and the ambiguous-delta `continue` — the only reader
+  // that knows the outcome. Pinned in THREE arms because each pins a different edit:
+  //   arm 1 pins the base-gate in `asMcpJson` (restore it and a dropped entry is called KEPT again);
+  //   arm 2 pins the repo-only call site (delete it and a KEPT entry's note vanishes);
+  //   arm 3 pins the IGNORED case (move the note above the `continue` and an ignored delta is noted);
+  //   arm 4 pins the DELTA call site (delete only that one and an APPLIED override loses its note).
+  const run = async (repoServers: Record<string, unknown>, baseServers: Record<string, unknown>) => {
+    const repoDir = tempDir("mcp-repotype-repo-");
+    const homeDir = tempDir("mcp-repotype-home-");
+    mkdirSync(join(homeDir, ".pi", "agent"), { recursive: true });
+    writeJson(repoDir, ".mcp.json", { mcpServers: repoServers });
+    writeJson(join(homeDir, ".pi", "agent"), ".mcp.json", { mcpServers: baseServers });
+    const manager = new McpServerManager();
+    const logs = await withCapturedLogs(() =>
+      manager.connectAllLayers({
+        base: join(homeDir, ".pi", "agent", ".mcp.json"),
+        repo: join(repoDir, ".mcp.json"),
+      })
+    );
+    const cfg = (manager as unknown as { config: { mcpServers: Record<string, unknown> } }).config;
+    return { cfg, logs, typeNotes: logs.filter(l => l.includes('has "type"')) };
+  };
+
+  // ARM 1 — DROPPED: nothing to connect to. ASSERTED IN BOTH DIRECTIONS, because the two halves pin
+  // different edits: no "KEPT" claim catches the restored base-gate, and zero `type` notes catches the
+  // note MOVED above the drop — which would tell the operator its `type` mattered on an entry that is
+  // not in the config at all. (The note text contains no "KEPT", so one assertion cannot see the other.)
+  const dropped = await run({ s: { url: "", type: "sse" } }, {});
+  equal(Object.keys(dropped.cfg.mcpServers).length, 0, "an entry with only an empty transport is dropped");
+  ok(
+    !dropped.logs.some(l => l.includes("KEPT")),
+    `a DROPPED entry must never be reported as KEPT — got:\n${dropped.logs.join("\n")}`
+  );
+  equal(
+    dropped.typeNotes.length,
+    0,
+    `a DROPPED entry earns no inert-\`type\` note — got:\n${dropped.logs.join("\n")}`
+  );
+
+  // ARM 2 — KEPT (repo-ONLY): the note is owed exactly ONCE (a second copy would mean both readers
+  // reported it).
+  const kept = await run({ s: { url: "https://ok.example/mcp", type: "sse", lazy: true } }, {});
+  ok(kept.cfg.mcpServers.s, "a repo-only \`type: \"sse\"\` entry is KEPT (it works over \`url\`)");
+  equal(kept.typeNotes.length, 1, `exactly one inert-\`type\` note — got:\n${kept.logs.join("\n")}`);
+
+  // ARM 3 — IGNORED: an ambiguous delta is dropped on the floor before the note's call site, so the
+  // operator must NOT be told its \`type\` had no effect on an entry that was never applied at all.
+  const ignored = await run(
+    { s: { url: "https://repo.example/mcp", command: "/bin/sh", type: "sse", lazy: true } },
+    { s: { url: "https://base.example/mcp", lazy: true } },
+  );
+  equal(
+    (ignored.cfg.mcpServers.s as Record<string, unknown>).url,
+    "https://base.example/mcp",
+    "an ambiguous delta is IGNORED and the base entry kept"
+  );
+  equal(ignored.typeNotes.length, 0, `an IGNORED delta earns no inert-\`type\` note — got:\n${ignored.logs.join("\n")}`);
+
+  // ARM 4 — DELTA APPLIED: a repo override that changes `url` and carries an unrecognised `type` IS
+  // applied field-by-field, so its note is owed — and it is a DIFFERENT call site from arm 2's, so
+  // deleting only that one must redden the suite (measured: it did not, before this arm existed).
+  const applied = await run(
+    { s: { url: "https://repo.example/mcp", type: "sse", lazy: true } },
+    { s: { url: "https://base.example/mcp", lazy: true } },
+  );
+  equal(
+    (applied.cfg.mcpServers.s as Record<string, unknown>).url,
+    "https://repo.example/mcp",
+    "a repo delta is APPLIED — this is the field-by-field path, not the repo-only one"
+  );
+  equal(
+    applied.typeNotes.length,
+    1,
+    `an APPLIED override's inert-\`type\` is reported once — got:\n${applied.logs.join("\n")}`
+  );
+});
+
+await test("a BASE-layer entry with a prototype-shaped name is refused too", () => {
+  const merged = mergeMcpLayers(
+    JSON.parse('{"mcpServers":{"constructor":{"command":"/bin/sh"},"real":{"url":"https://ok/mcp"}}}') as never,
+    null,
+  );
+  ok(!Object.hasOwn(merged, "constructor"), "the base loop applies the same name lock as the repo loop");
+  ok(merged.real, "a valid base server still merges");
+});
+
+await test("a layer with `mcpServers: {}` is NOT reported as \"No mcpServers\"", async () => {
+  // `declaresServers` distinguishes "key absent" from "key present but empty"; without a fixture the two
+  // collapse and the message (and the comment promising it) are unverified.
+  const repoDir = tempDir("mcp-bind-empty-repo-");
+  const homeDir = tempDir("mcp-bind-empty-home-");
+  mkdirSync(join(homeDir, ".pi", "agent"), { recursive: true });
+  // BOTH layers carry an EMPTY map, so `sanitised` ends up empty while the KEY IS PRESENT — the only
+  // shape that distinguishes `declaresServers` from a truthiness test on the sanitised map.
+  writeJson(repoDir, ".mcp.json", { mcpServers: {} });
+  writeJson(join(homeDir, ".pi", "agent"), ".mcp.json", { mcpServers: {} });
+
+  const manager = new McpServerManager();
+  const logs = await withCapturedLogs(() =>
+    manager.connectAllLayers({
+      base: join(homeDir, ".pi", "agent", ".mcp.json"),
+      repo: join(repoDir, ".mcp.json"),
+    })
+  );
+  ok(
+    !logs.some(l => l.includes("No mcpServers")),
+    `an EMPTY mcpServers map is not a missing one — got:\n${logs.join("\n")}`
+  );
+});
+
+await test("`catalog()` survives a manager whose config was assigned directly", () => {
+  // `this.config` is sanitised by connectConfig, but a caller (or a test) can assign it directly — and
+  // `catalog()` is the tool every error message tells the operator to run, so it must not throw.
+  const manager = new McpServerManager();
+  (manager as unknown as { config: unknown }).config = {
+    mcpServers: { bad: null, ghost: 42, real: { url: "https://ok.example/mcp", lazy: true } },
+  };
+  const entries = manager.catalog();
+  ok(entries.some(e => e.name === "real"), "the valid entry is listed");
+  ok(entries.every(e => e.name !== "bad" && e.name !== "ghost"), "invalid entries are skipped");
+});
+
+await test("prototype-shaped server names are rejected (the second lock, not the first)", () => {
+  const merged = mergeMcpLayers(
+    { mcpServers: { real: { url: "https://ok/mcp" } } } as never,
+    JSON.parse(
+      '{"mcpServers":{"__proto__":{"command":"/bin/sh"},"constructor":{"command":"/bin/sh"},"prototype":{"command":"/bin/sh"}}}'
+    ) as never,
+  );
+  equal(Object.getPrototypeOf(merged), null, "the map stays null-prototype");
+  for (const bad of ["__proto__", "constructor", "prototype"]) {
+    ok(!Object.hasOwn(merged, bad), `\`${bad}\` must not become a server`);
+  }
+  ok(merged.real, "a normal server still merges");
+});
+
+await test("a BASE layer's empty transport is stripped and dropped at the layer read, and the message says BASE", async () => {
+  // Two behaviours of `asMcpJson` were unpinned, and BOTH are load-bearing for the BASE layer only:
+  // the merge re-strips a repo layer, but a base entry is copied verbatim, so nothing downstream would
+  // catch either one. Measured before this test: deleting the `delete typed[field]` line left the suite
+  // at 68 passed / 0 failed, and so did removing the `label.startsWith("base")` message distinction —
+  // a base `{dead: {url: ""}}` then survived into the catalog while its log still said "that field is
+  // removed", and the base-specific remedy ("Fix that entry in the base config") went untested.
+  const repoDir = tempDir("mcp-basefalsy-repo-");
+  const homeDir = tempDir("mcp-basefalsy-home-");
+  mkdirSync(join(homeDir, ".pi", "agent"), { recursive: true });
+  writeJson(repoDir, ".mcp.json", { mcpServers: {} });
+  writeJson(join(homeDir, ".pi", "agent"), ".mcp.json", {
+    // `dead` declares only an EMPTY transport: it has nothing to connect to, so the layer read removes
+    // the field and then drops the entry. `ok` is the control — a healthy base entry must survive.
+    mcpServers: { dead: { url: "", lazy: true }, ok: { command: "b", lazy: true } },
+  });
+
+  const manager = new McpServerManager();
+  const logs = await withCapturedLogs(() =>
+    manager.connectAllLayers({
+      base: join(homeDir, ".pi", "agent", ".mcp.json"),
+      repo: join(repoDir, ".mcp.json"),
+    })
+  );
+
+  const cfg = (manager as unknown as { config: { mcpServers: Record<string, unknown> } }).config;
+  ok(cfg.mcpServers.ok, "a healthy base entry still applies");
+  ok(!("dead" in cfg.mcpServers), "a base entry whose only transport is empty is dropped, not kept as `{url: \"\"}`");
+  ok(
+    logs.some(l => l.includes('entry "dead"') && l.includes("that field is removed")),
+    `the falsy field must be reported as removed — got:\n${logs.join("\n")}`
+  );
+  ok(
+    logs.some(l => l.includes('entry "dead"') && l.includes("declares no usable transport")),
+    `and the entry must be reported as dropped — got:\n${logs.join("\n")}`
+  );
+  // ⛔ The BASE wording is not cosmetic: it is the only thing that sends the reader to the file that
+  // actually contains the entry. A repo-shaped message on a base fault sends them to edit a repo file
+  // that does not have the field.
+  ok(
+    logs.some(l => l.includes("Fix that entry in the base config")),
+    `a BASE fault must name the base config as the place to fix — got:\n${logs.join("\n")}`
+  );
+});
+
+await test("a `null` server ENTRY does not crash the session — it is dropped, with a warning", async () => {
+  // `{"mcpServers": {"tortoise": null}}` used to pass asMcpJson and then throw
+  // `TypeError: Cannot read properties of null (reading 'lazy')` out of the extension factory,
+  // ending the session with no file, entry or cause named.
+  const repoDir = tempDir("mcp-bind-nullentry-repo-");
+  const homeDir = tempDir("mcp-bind-nullentry-home-");
+  mkdirSync(join(homeDir, ".pi", "agent"), { recursive: true });
+  writeJson(repoDir, ".mcp.json", { mcpServers: { tortoise: null, ghost: 42 } });
+  writeJson(join(homeDir, ".pi", "agent"), ".mcp.json", {
+    mcpServers: { tortoise: { type: "http", url: "https://api.premiselabs.co/mcp/", lazy: true } },
+  });
+
+  const manager = new McpServerManager();
+  const logs = await withCapturedLogs(() =>
+    manager.connectAllLayers({
+      base: join(homeDir, ".pi", "agent", ".mcp.json"),
+      repo: join(repoDir, ".mcp.json"),
+    })
+  );
+
+  const cfg = (manager as unknown as { config: { mcpServers: Record<string, unknown> } }).config;
+  ok(cfg.mcpServers.tortoise, "the base's entry still applies — `null` is not a removal");
+  ok(!("ghost" in cfg.mcpServers), "a scalar entry is not a server");
+  ok(
+    logs.some(l => l.includes("WARN") && l.includes('entry "tortoise"') && l.includes("dropped")),
+    `a dropped entry must be named, and say removal is impossible — got:\n${logs.join("\n")}`
+  );
+});
+
+await test("a layer with NO `mcpServers` key is a valid layer — its top-level keys survive", async () => {
+  // Rejecting it dropped the whole file: its keys vanished and the log called a valid config
+  // unusable. A layer that declares no servers is not a broken layer.
+  const repoDir = tempDir("mcp-bind-noservers-repo-");
+  const homeDir = tempDir("mcp-bind-noservers-home-");
+  mkdirSync(join(homeDir, ".pi", "agent"), { recursive: true });
+  writeJson(repoDir, ".mcp.json", { autoEnableCodemode: false, _comment: "no servers here" });
+  writeJson(join(homeDir, ".pi", "agent"), ".mcp.json", {
+    mcpServers: { baseOnly: { command: "b", lazy: true } },
+  });
+
+  const manager = new McpServerManager();
+  const logs = await withCapturedLogs(() =>
+    manager.connectAllLayers({
+      base: join(homeDir, ".pi", "agent", ".mcp.json"),
+      repo: join(repoDir, ".mcp.json"),
+    })
+  );
+
+  const cfg = (manager as unknown as { config: Record<string, unknown> }).config;
+  equal(cfg.autoEnableCodemode, false, "a repo layer's top-level key must not be amputated");
+  ok(
+    (cfg.mcpServers as Record<string, unknown>).baseOnly,
+    "and the base's servers still apply"
+  );
+  ok(
+    !logs.some(l => l.includes("WARN") && l.includes("repo layer")),
+    `a layer that simply declares no servers must not be reported as broken — got:\n${logs.join("\n")}`
+  );
+});
+
 await test("non-`mcpServers` top-level keys survive from BOTH layers (base is not amputated)", async () => {
   const repoDir = tempDir("mcp-bind-toplevel-repo-");
   const homeDir = tempDir("mcp-bind-toplevel-home-");
@@ -480,6 +1836,16 @@ await test("non-`mcpServers` top-level keys survive from BOTH layers (base is no
 });
 
 // ── Cleanup + summary (LAST — after every fixture is created) ────────────
+(McpServerManager.prototype as unknown as Record<string, unknown>).connectServer = realConnectServer;
+if (PREV_PI_MCP_SERVERS === undefined) delete process.env.PI_MCP_SERVERS;
+else process.env.PI_MCP_SERVERS = PREV_PI_MCP_SERVERS;
+await test("no fixture in this suite reached `connectServer` (every manager-driven fixture is `lazy`)", () => {
+  deepEqual(
+    CONNECT_CALLS,
+    [],
+    "an EAGER fixture got past `classifyServers` and would have opened a real socket — give it `lazy: true`"
+  );
+});
 for (const dir of TMP_DIRS) {
   try {
     rmSync(dir, { recursive: true, force: true });

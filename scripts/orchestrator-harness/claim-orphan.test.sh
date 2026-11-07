@@ -59,6 +59,10 @@
 #   O21 [RED→GREEN] a FORMER name of this box with a LIVE local pid on a PR key is held-by-live, and the
 #      prune leaves it alone — the P0 that a rename would otherwise turn into a deleted live claim.
 #   O20 [RED→GREEN] the prune's unparseable-lease skip is a DELETING branch and is pinned here.
+#   O27 [PINNED]    the SAME arm's DELETING branch is a HANDOVER too: it names the `refs/wip/*`
+#      snapshot behind the claim it deletes (#3484). Measured on 40800e8c6: deleting that one `echo`
+#      left this whole suite at 145 passed / 0 failed, so the third of `claim_prune`'s three reap arms
+#      was the only one with no assertion on its handover clause.
 #   O17 [RED→GREEN] the RECORDER (`claim_host_record`) is positively tested. Without it the
 #      former-name rule — the only thing that makes a rename self-heal — writes nothing at all, and
 #      the negative "a seam identity is not recorded" assertion would still pass.
@@ -1144,6 +1148,58 @@ ck "O20 [RED→GREEN] ...and NAMES it as kept with the fault, so the abstention 
 # Non-vacuity: the SAME host's EXPIRED claim IS reaped by this prune, and so is its ORPHANED one.
 has_ref "$ORIG20" refs/claims/issue-7004 && pr20=1 || pr20=0
 ck "O20 [PINNED] the expired claim from the same dead host IS still reaped (the arm is alive)" $pr20
+
+# ══ O27: the unparseable-lease reap arm HANDS the WIP over, not just the deletion (#3484) ══
+# #3484 requires `claim_prune` to print the WIP clause for EVERY reaped ref, so the release IS the
+# handover. Two of the three arms were asserted (O3b = expired, O2b = orphaned-host); the third — the
+# BOUNDED unparseable-lease arm (agent-infra#3203) — printed the clause with NOTHING watching it.
+# MEASURED on 40800e8c6: replacing claims.sh:2315 with `:` and running this suite gives
+# `145 passed, 0 failed` — identical to the pristine tree. The one arm that exists because that whole
+# class was blocked FOREVER could therefore stop handing over the work behind the claims it reaps, in
+# silence. (O20 cannot cover it: O20's fixture is INSIDE the bound, i.e. the KEPT half of the arm. It
+# asserts `kept unreadable-lease` and the ABSENCE of a `pruned …` line; this case is the pruned half.)
+# The claim commit is dated 2001 so its age is ~4500x `CLAIM_UNREADABLE_LEASE_MAX_AGE` (18000 s). That
+# is the only deterministic way to reach the deleting branch: shrinking the bound instead is itself the
+# scheduled steal claims.sh's floor exists to refuse, so a test must not do it either.
+# ⛔ LABEL: [PINNED], AND NOT AS A FORMALITY. Every check below is GREEN on the tree BEFORE this commit —
+# the code it covers shipped in #3607, so this commit adds an ASSERTION, not behaviour, and nothing can
+# be red before it. Its discrimination is therefore measured against the MUTANT that removes the covered
+# line, which is the direction the labelling-honesty paragraph at the top of this file demands
+# (measured: 150 passed/0 failed pristine → 147/3 with claims.sh:2315 replaced by `:`, the 3 reds being
+# exactly these). PINNED in this file's sense: it guards a new fail-open — the handover can go silent
+# again — and is not a regression the old tree would show.
+echo
+echo "── O27: the UNPARSEABLE-LEASE reap arm NAMES the rescued WIP it deletes (#3484) ─────"
+ORIG27="$(mk_origin o27)"; ensure_work_repo "$ORIG27" || { echo "❌ fixture"; exit 2; }
+# ⛔ THE COMMIT DATE IS WHAT PUTS THE CLAIM PAST THE BOUND, so it is set on the COMMIT, not faked in
+# the lease: an unparseable `lease_until` is the arm's input and its AGE is the arm's trigger.
+as_box "$ORIG27" deadbox 'export GIT_COMMITTER_DATE="2001-01-01T00:00:00Z"
+  c="$(_claim_commit "deadbox:2" 0)"
+  unset GIT_COMMITTER_DATE
+  _git push -q origin "$c:refs/claims/issue-7013" 2>/dev/null' >/dev/null
+as_box "$ORIG27" deadbox 'export GIT_COMMITTER_DATE="2001-01-01T00:00:00Z"
+  c="$(_claim_commit "deadbox:3" 0)"
+  unset GIT_COMMITTER_DATE
+  _git push -q origin "$c:refs/claims/issue-7014" 2>/dev/null' >/dev/null
+W27_TREE="$("$REAL_GIT" -C "$T/repo" hash-object -t tree /dev/null 2>/dev/null)"
+W27_SHA="$("$REAL_GIT" -C "$T/repo" -c user.name=wip -c user.email=wip@localhost \
+           commit-tree "$W27_TREE" -m 'wip: fixture snapshot for issue 7013' 2>/dev/null)"
+[ -n "$W27_SHA" ] && "$REAL_GIT" -C "$T/repo" push -q origin "$W27_SHA:refs/wip/issue-7013-second-attempt" 2>/dev/null
+has_ref "$ORIG27" refs/claims/issue-7013 && has_ref "$ORIG27" refs/claims/issue-7014 \
+  && has_ref "$ORIG27" refs/wip/issue-7013-second-attempt
+ck "O27 (setup) two PAST-BOUND unparseable claims and one rescued snapshot are planted" $?
+# `CLAIM_DEAD_HOSTS=deadbox` is deliberate: if the unparseable arm ever stopped reaping, the ORPHAN
+# arm would take both claims and this case would still see a reap — so the arm identity is asserted
+# first and on its own, and the WIP assertions below are only meaningful under it.
+PRUNE27="$(as_box "$ORIG27" livebox 'claim_prune' CLAIM_DEAD_HOSTS=deadbox 2>&1)"
+grep -q 'pruned unreadable-lease refs/claims/issue-7013' <<<"$PRUNE27"
+ck "O27 [PINNED] the reap ran through the UNPARSEABLE-LEASE arm, not expiry or orphanhood — the assertions below are on THAT branch" $?
+grep -q "WIP AT RELEASE: refs/wip/issue-7013-second-attempt @ ${W27_SHA:0:12}" <<<"$PRUNE27"
+ck "O27 [PINNED] the unparseable-lease reap NAMES the rescued ref behind the claim it deletes (#3484)" $?
+grep -q 'read it before starting; do not re-derive it' <<<"$PRUNE27"
+ck "O27 [PINNED] ...and tells the next actor what to do with it, not just that it exists" $?
+grep -q 'WIP AT RELEASE: none — no refs/wip ref matched #7014' <<<"$PRUNE27"
+ck "O27 [PINNED] ...and the clause is PER REF: the other reaped claim says 'none' for ITS issue, never this one's ref" $?
 
 # ══ O21: a PR claim from a FORMER NAME of this box with a LIVE pid is HELD-BY-LIVE ══
 # ⛔ P0, cycle-7 review. The pid gate used to be `host == claim_host`, so immediately after a rename a PR

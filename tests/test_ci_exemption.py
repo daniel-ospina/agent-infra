@@ -63,6 +63,7 @@ parse_failed_ids = ci_exemption.parse_failed_ids
 parse_failure_rows = ci_exemption.parse_failure_rows
 parse_pr_failure_text = ci_exemption.parse_pr_failure_text
 parse_rates = ci_exemption.parse_rates
+parse_rotation_runs = ci_exemption.parse_rotation_runs
 parse_signature_rows = ci_exemption.parse_signature_rows
 
 ID = "tests/test_dr_endpoints.py::TestDrDrill::test_restores_to_scratch"
@@ -898,6 +899,681 @@ def test_E3_via_the_real_wire_format_blocks_a_deterministic_regression():
     assert [v.nodeid for v in decision.blocked] == ["tests/a.py::T::t1"]
     assert decision.visible_exemptions() == []
     assert "rates" in decision.report().lower() or "BLOCK" in decision.report()
+
+
+# ── #3686 · a path-VALUED PARAMETER must survive BOTH doors ────────────────
+# `_NODEID_RE` admitted `/` in the `path` group and NOT in the parameter space,
+# so `parse_rates` (main's table) silently dropped a row that
+# `parse_failure_rows` (the PR's table) accepted. The consequence is not a
+# mis-grade, it is a permanent BLOCK: the id has a PR failure and no main rate,
+# which is `decide`'s "absent from main's failure set … not exempt" path.
+#
+# MEASURED 2026-11-07 on tortoise PR #11362 (run 42340742360): six ids blocked,
+# every one of this shape, each with a REAL main row printed in the same verdict
+# as `NOTE  : rejected main rate row: …[tools/cache_evict.py]\t3\t26`, while the
+# same ids were failing on main's own run 42320870743. The chain that matters:
+# `tests/test_entry_point_python_guard.py` parametrizes over `tools/**/*.py`, so
+# an ENTIRE FILE of the census can never be exempted — and while main is red with
+# several independent classes, no repair PR that fixes only some of them can be
+# certified. That is a deadlock, not an over-block.
+
+
+#: Real ids from the suite that REPORTED #3686, copied unchanged from `gh issue
+#: view 3686 --comments` (which carries each parameter verbatim): four
+#: `tools/**/*.py` census ids — `cache_evict.py`, `gen_placement_table.py`,
+#: `batch_open.py`, `test_design_map_check.py` — and one `tests/test_pages_bindings.py`
+#: argv id whose parameter is `argv14-at the EDGE`. ⛔ NOT "five `tools/**/*.py`
+#: census ids" (review cycle 5, P2): the fifth is an argv census in another FILE,
+#: so the old sentence contradicted its own list.
+#:
+#: The next five are SHAPE VECTORS, and they are here for a shape and one
+#: character, not for "characters no shipped id exercises" — that wording was
+#: false for four of the five (review cycle 5, P2): an uppercase letter, a `-` and
+#: an `_` are already in the attested ids, and `[cache_evict]` adds NOTHING to the
+#: class. What they genuinely add is a CLASS SEGMENT (`TestK::test_param`) and
+#: `:`, the one parameter character the attested ids do not carry — the rest
+#: restate coverage so a narrowing of `rest` still has to face the parameter
+#: punctuation #3686 was not reported for.
+#:
+#: ⛔ TWO OF THE FIVE REAL IDS WERE NOT ATTESTED (review cycle 2, P2).
+#: `…[tools/longmem_eval/run.py]` and `tests/test_ci_selection.py::test_surface[…]`
+#: appeared in NONE of #3686's measured blocks, and `test_ci_selection.py` defines
+#: no `test_surface` at all — so a nodeid naming it is not one any suite can
+#: print. They are replaced with two ids the issue record DOES carry, so
+#: "copied verbatim" is true of all five.
+#:
+#: ⛔ INCLUDING SPACE (#3686 second door). `[argv14-at the EDGE]` is a real id
+#: from a shipped suite and it was STILL dropped by both Python doors after `/`
+#: was fixed; a corpus that only carries `/` would have called that green.
+_PARAM_SPACE_CORPUS = (
+    "tests/test_entry_point_python_guard.py::test_entry_point_guards_the_interpreter_before_its_imports[tools/cache_evict.py]",
+    "tests/test_entry_point_python_guard.py::test_guard_refuses_an_old_interpreter_and_passes_the_floor[tools/gen_placement_table.py]",
+    "tests/test_entry_point_python_guard.py::test_entry_point_guards_the_interpreter_before_its_imports[tools/batch_open.py]",
+    "tests/test_entry_point_python_guard.py::test_entry_point_guards_the_interpreter_before_its_imports[tools/test_design_map_check.py]",
+    "tests/test_pages_bindings.py::test_the_indexnow_gate_fails_for_each_broken_surface[argv14-at the EDGE]",
+    "tests/e2e/test_x.py::test_a[chromium-Claude Desktop]",
+    "tests/test_a.py::test_param[a/b:c-d.e]",
+    "tests/test_a.py::test_param[cache_evict]",
+    "tests/test_a.py::TestK::test_param[x]-",
+    "tests/test_a.py::TestK::test_param",
+)
+
+
+#: The real id the SECOND door (#3686 follow-up) was measured on: a parameter
+#: carrying a SPACE. `parse_rates` could not represent it at all — `_RATES_RE`'s
+#: nodeid group was `\S+`, so the row `ci-failure-set.sh` emits never reached
+#: :func:`is_failure_key` and read as PR-unique forever.
+_SPACE_PARAM_ID = (
+    "tests/test_pages_bindings.py::test_the_indexnow_gate_fails_for_each_broken_surface[argv14-at the EDGE]"
+)
+
+
+def test_a_path_PARAMETRIZED_nodeid_survives_BOTH_doors():
+    """THE #3686 INVARIANT: the two predicates must agree on this corpus.
+
+    `is_failure_key` gates MAIN's rate table and `is_failure_key_loose` gates the
+    PR's failure table. If the strict form rejects what the loose form accepts,
+    main's row vanishes and the failure is unexemptible forever — the exact
+    asymmetry `is_failure_key`'s docstring forbids.
+    """
+    disagreements = [k for k in _PARAM_SPACE_CORPUS if not is_failure_key(k)]
+    assert not disagreements, (
+        "`is_failure_key` rejects id(s) the PR-side parser ACCEPTS, so main's "
+        "rate row for them is dropped and every such failure reads as "
+        f"PR-unique forever (#3686): {disagreements}"
+    )
+    # The loose form must also accept this corpus — the point is AGREEMENT, and
+    # asserting only the strict side would pass a narrowing of the loose one.
+    loose_disagreements = [k for k in _PARAM_SPACE_CORPUS if not is_failure_key_loose(k)]
+    assert not loose_disagreements, (
+        f"`is_failure_key_loose` rejects corpus id(s): {loose_disagreements}"
+    )
+
+
+def test_the_STRICT_form_stays_NARROWER_than_the_LOOSE_one():
+    """⛔ AGREEMENT IS A CLAIM ABOUT A CORPUS, NOT A LICENCE TO COLLAPSE THE SPLIT.
+
+    The obvious way to "close the class completely" is `rest -> [^\t]+`, i.e. make
+    `_NODEID_RE` identical to `_NODEID_LOOSE_RE`. Nothing reddened under it (measured
+    on this branch AND on `origin/main`, so it is not a gap this change introduced) —
+    yet the code states the narrowness as load-bearing twice: the strict form gates
+    MAIN's rate table, so a character it admits becomes an id that can PURCHASE AN
+    EXEMPTION, and the pytest parameter space is open-ended. That is why the loop above
+    covers `/` and space rather than every character, and why the split must survive a
+    future lane taking the tempting shortcut named in #3686's own scoping artifact.
+
+    ⛔ THIS PINS THE DIRECTION, NOT A CLOSURE CLAIM. An earlier version of this
+    docstring justified the split with "an id carrying parameter punctuation
+    neither our suites nor #3686 produce" — FALSE, and measurably so: collecting
+    this repo's shipped suites leaves 10 collected ids the strict form rejects and
+    the loose one accepts, 3 of them in `scripts/test_pr_doctor.py` (`[+12]`, and
+    two carrying `,`) and 7 in
+    `test_no_runner_or_hook_wrapper_is_ever_an_identity` (`#` and `'`). Those ids
+    are permanently BLOCKed — the deadlock #3686 reported is STILL LIVE for them,
+    and #3686 closed only for `/` and space, so the remainder is tracked separately
+    as agent-infra#3691. `test_the_OPEN_residual_parameter_punctuation_still_DEADLOCKS`
+    pins that consequence so no lane can read this split as the end of the work.
+
+    What the loop below asserts is what the predicates must keep doing: an id
+    carrying punctuation the strict form does not admit is rejected by it and
+    accepted by the loose one — so deleting the narrowness reddens HERE, by name,
+    instead of shipping silently (measured: collapsing `rest` to `[^\t]+` reds
+    this test and the residual leg below, which notices that closure) — while the
+    characters this change really did add to the strict class are accepted by BOTH
+    sides.
+    """
+    for loose_only in (
+        # a comma: pytest allows it, and this repo's own suites really print it
+        "tests/test_a.py::t[a,b]",
+        # braces: the ONLY shape-only vector here — no suite in this repo emits one
+        "tests/test_a.py::t[a{b}]",
+        # a quote: produced by the wrapper annotations (…Bash exited with code '1'.)
+        "tests/test_a.py::t[a'b]",
+    ):
+        assert not is_failure_key(loose_only), (
+            f"the STRICT form ADMITTED {loose_only!r} — `_NODEID_RE` has been widened "
+            "to (or past) the loose form, so main's rate table would now key ids that "
+            "can purchase an exemption (#3686)"
+        )
+        assert is_failure_key_loose(loose_only), loose_only
+
+    # …and the two DO agree on the characters this change added, so the split is
+    # narrow where it must be and equal where it must be. That pair is the whole claim.
+    for shared in _PARAM_SPACE_CORPUS:
+        assert is_failure_key(shared) and is_failure_key_loose(shared), shared
+
+
+#: ⛔ THE MEASURED **OPEN** REMAINDER OF #3686 — a pin on a HOLE, not a virtue.
+#: Tracked as agent-infra#3691 (whose scope is the whole residual class);
+#: #3686 itself closed for `/` and space only, and the space class is closed HERE.
+#:
+#: Every id below was COLLECTED from this repo's shipped suites (``pytest tests/
+#: scripts/test_pr_doctor.py --collect-only``), never invented, and every one is
+#: accepted by the PR-side predicate and rejected by the strict one. These three
+#: plus 7 siblings (the third ``scripts/test_pr_doctor.py`` id above and 6 more
+#: wrapper annotations) are the measured 10; 9 further ids live under
+#: ``tests/fixtures/``, which no CI job collects.
+_STRICT_FORM_RESIDUAL_IDS = (
+    # a `+` — and `ci.yml`'s `test` job runs this file
+    "scripts/test_pr_doctor.py::test_capacity_rejects_a_bad_value_and_uses_the_default[+12]",
+    # a `,` plus spaces in ONE parameter value
+    "scripts/test_pr_doctor.py::test_dispatch_returns_promptly_whatever_the_worker_does"
+    "[sleeps, then writes to stdout and stderr]",
+    # a `#`, a `'`, parentheses and a `.` — a real @pytest.mark.parametrize value
+    "tests/test_ci_exemption.py::test_no_runner_or_hook_wrapper_is_ever_an_identity"
+    "[##[error]Bash exited with code '1'.]",
+)
+
+
+def test_the_OPEN_residual_parameter_punctuation_still_DEADLOCKS():
+    """⛔ THIS LEG PINS A DEFECT THAT IS STILL THERE. DELETE IT WHEN #3691 CLOSES.
+
+    The strict form gates MAIN's rate table and still does not admit `+ , ' # @`,
+    so for an id carrying one of them main's row is dropped, the PR-side failure
+    reads PR-unique, and `decide` BLOCKS it forever — #3686's reported symptom
+    with the operator-facing sentences produced here rather than quoted from the
+    issue. The pin exists for ONE reason: the direction leg above used to justify
+    the split by asserting our suites produce no such id, which was false and
+    would have taught the next lane that the class was closed.
+
+    So this leg reds in BOTH directions it must:
+
+    * a lane WIDENING `rest` to admit one of these characters → the
+      `not is_failure_key` assertion below fails, which is agent-infra#3691 being
+      CLOSED: delete this test and the "NOT THE WHOLE PARAMETER SPACE" paragraph
+      in `_NODEID_RE`'s comment, and record the closure on #3691;
+    * a lane NARROWING the strict form further, or re-opening the `_RATES_RE` door
+      → `main.rejected` no longer holds the row, so the deadlock these ids pin has
+      moved and the measurement here is stale.
+
+    MUTATION: add `+` to `_NODEID_RE`'s `rest` class → the `[+12]` id stops being
+    blocked and this leg reds on the `not is_failure_key` assertion (measured:
+    `1 failed, 229 passed`).
+    """
+    for nodeid in _STRICT_FORM_RESIDUAL_IDS:
+        assert is_failure_key_loose(nodeid), nodeid
+        assert not is_failure_key(nodeid), (
+            f"{nodeid!r} is no longer a strict-form residual — `_NODEID_RE` has "
+            "been widened. If that was deliberate, DELETE this leg and the "
+            "residual paragraph in its comment, and record the closure on #3691"
+        )
+        row = f"{nodeid}\t3\t26"
+        main = parse_rates(f"{row}\n")
+        assert main.rejected == [row], (
+            "main's row for this id is no longer REJECTED, so the deadlock this "
+            f"leg pins has moved: rates={main.rates!r}"
+        )
+        pr = parse_failure_rows(f"{row}\tsg-residual\n").failures
+        assert nodeid in pr, (
+            "the PR-side parser dropped the row, so this leg would be vacuous"
+        )
+        decision = decide(
+            pr, main.rates, main_signatures={}, k_pr=26, rate_tolerance=1.5
+        )
+        assert [v.nodeid for v in decision.blocked] == [nodeid], (
+            "the residual is no longer BLOCKED, so #3686 may have closed for "
+            f"these ids: exempt={[v.nodeid for v in decision.exempt]}"
+        )
+        assert decision.blocked[0].line.startswith("BLOCK : "), (
+            "the operator-facing sentence changed shape, so the claim this leg "
+            "pins — a rejected main rate row beside an absent-from-failure-set "
+            "BLOCK — may no longer be what a lane reads: "
+            + decision.blocked[0].line
+        )
+
+
+def test_a_path_PARAMETRIZED_main_row_becomes_a_MEASURED_rate():
+    """The row must survive `parse_rates`, not merely the shape predicate.
+
+    The shape check is one gate inside the parser; this drives the WIRE format
+    the shell emits, so a second rejection on the parse path cannot hide behind a
+    green predicate.
+    """
+    nodeid = _PARAM_SPACE_CORPUS[0]
+    r = parse_rates(f"{nodeid}\t3\t26\n")
+    assert r.rejected == [], (
+        f"parse_rates DROPPED main's row for a path-parametrized id (#3686): {r.rejected}"
+    )
+    assert r.rates[nodeid] == Rate(3, 26)
+
+
+def test_a_path_PARAMETRIZED_failure_is_EXEMPT_not_permanently_BLOCKED():
+    """End to end: main red 3/26 on the id, the PR red 3/26 with the same sig.
+
+    This is the shape that deadlocked 2026-11-07. With the parameter space
+    repaired, `decide` must EXEMPT it — the same verdict any other main-red id
+    gets. Asserting only the parser would leave the verdict's own path unpinned.
+    """
+    nodeid = _PARAM_SPACE_CORPUS[0]
+    sig = "sg-3686"
+    main = parse_rates(f"{nodeid}\t3\t26\n")
+    pr = parse_failure_rows(f"{nodeid}\t3\t26\t{sig}\n").failures
+    assert pr, "the PR-side parser dropped the row, so this leg would be vacuous"
+    decision = decide(
+        pr,
+        main.rates,
+        main_signatures={nodeid: frozenset({sig})},
+        k_pr=26,
+        rate_tolerance=1.5,
+    )
+    assert [v.nodeid for v in decision.blocked] == [], (
+        "a path-parametrized id main already fails is still BLOCKED — the "
+        f"#3686 deadlock: {[v.line for v in decision.blocked]}"
+    )
+    assert nodeid in {v.nodeid for v in decision.exempt}, (
+        "the id was neither blocked nor exempted, so the verdict never saw it"
+    )
+
+
+def test_a_SPACE_PARAMETRIZED_main_row_becomes_a_MEASURED_rate():
+    r"""The SECOND door (#3686): `_RATES_RE`'s `\S+` could not carry a space.
+
+    This is a different gate from the shape predicate: the wire format itself
+    rejected the row, so widening `_NODEID_RE` alone left the id dropped. The tab
+    is the field delimiter — `_SIG_ROW_RE` already delimits that way — so the
+    nodeid group must be `[^\t]+`.
+
+    MUTATION: restore `(?P<nodeid>\S+)` → `parse_rates` rejects the row, so the
+    `r.rejected == []` assertion below fails FIRST (measured — `r.rates` is never
+    reached), because a dropped main-side row is exactly the permanent-BLOCK
+    mechanism this issue names.
+    """
+    r = parse_rates(f"{_SPACE_PARAM_ID}\t3\t26\n")
+
+    assert r.rejected == [], (
+        "parse_rates DROPPED main's row for a space-parametrized id (#3686): "
+        f"{r.rejected}"
+    )
+    assert r.rates[_SPACE_PARAM_ID] == Rate(3, 26)
+
+
+def test_a_SPACE_PARAMETRIZED_failure_is_EXEMPT_not_permanently_BLOCKED():
+    """End to end through `decide` for the space door, mirroring the `/` leg.
+
+    Asserting the parser alone would leave the verdict's own path unpinned, and
+    the verdict is the thing that BLOCKS a PR forever.
+    """
+    sig = "sg-3686-space"
+    main = parse_rates(f"{_SPACE_PARAM_ID}\t3\t26\n")
+    pr = parse_failure_rows(f"{_SPACE_PARAM_ID}\t3\t26\t{sig}\n").failures
+    assert pr, "the PR-side parser dropped the row, so this leg would be vacuous"
+    decision = decide(
+        pr,
+        main.rates,
+        main_signatures={_SPACE_PARAM_ID: frozenset({sig})},
+        k_pr=26,
+        rate_tolerance=1.5,
+    )
+    assert [v.nodeid for v in decision.blocked] == [], (
+        "a space-parametrized id main already fails is still BLOCKED — the "
+        f"#3686 deadlock: {[v.line for v in decision.blocked]}"
+    )
+    assert _SPACE_PARAM_ID in {v.nodeid for v in decision.exempt}, (
+        "the id was neither blocked nor exempted, so the verdict never saw it"
+    )
+
+
+def test_a_SPACE_PARAMETRIZED_ROTATING_identity_is_UNATTRIBUTABLE_not_EXEMPT():
+    r"""⛔ THE FAIL-OPEN THIS CHANGE COULD HAVE OPENED (#3686 second door, P1).
+
+    Un-blocking a space-parametrized id is only safe if the E5 rotating-identity
+    guard can still SEE it. The per-run wire format used to be space-joined, so a
+    spacey id was shredded into fragments: the real id appeared in NO run set,
+    `detect_rotating_identity` could not see it, and `decide` EXEMPTED an identity
+    that provably MOVED between runs — the one class the rail states may never
+    merge. Un-blocking without this is a silent exemption, i.e. strictly worse
+    than the refusal it replaced.
+
+    MUTATION: restore `raw.split()` in `parse_rotation_runs` → both ids shred into
+    fragments, and this test fails at the FIRST assertion below (`any(moved_b in s
+    …)`) — the shredding is caught before the verdict is even reached, so the
+    message names the reader, not `unattributable`.
+    """
+    moved_a = "tests/test_x.py::TestK::test_a[argv7-at the EDGE]"
+    moved_b = "tests/test_x.py::TestK::test_a[argv14-at the EDGE]"
+    stable = "tests/other.py::test_y"
+
+    # The producer's wire format: one line per failing run, ids TAB-joined.
+    runs = parse_rotation_runs(f"{stable}\t{moved_a}\n{stable}\t{moved_b}\n")
+    assert any(moved_b in s for s in runs), (
+        "the per-run reader SHREDDED a space-parametrized id, so E5 is blind to "
+        f"it: {runs}"
+    )
+
+    rotating = detect_rotating_identity(runs)
+    assert moved_b in rotating.get("tests/test_x.py::TestK", frozenset())
+
+    sig = "sg-3686-rotate"
+    main = parse_rates(f"{moved_b}\t3\t26\n")
+    pr = parse_failure_rows(f"{moved_b}\t3\t26\t{sig}\n").failures
+    decision = decide(
+        pr,
+        main.rates,
+        main_signatures={moved_b: frozenset({sig})},
+        rotating=rotating,
+        k_pr=26,
+        rate_tolerance=1.5,
+    )
+
+    assert [v.nodeid for v in decision.unattributable] == [moved_b], (
+        "a MOVING identity was not classified UNATTRIBUTABLE: "
+        f"{decision.report()}"
+    )
+    assert moved_b not in {v.nodeid for v in decision.exempt}, (
+        "a rotating identity on a space-parametrized id was EXEMPTED — the "
+        "fail-open #3686's second door opened in the E5 guard"
+    )
+
+
+def test_a_LEGACY_TAB_FREE_rotation_line_cannot_license_a_spacey_EXEMPT():
+    r"""⛔ THE FALLBACK'S VERDICT FLIP — the P1 review cycle 6 measured.
+
+    Keeping the tab-free parse was justified as "old input keeps meaning what it
+    always meant". It does not: the PARSE is the same, the VERDICT is not. Before
+    #3686 a spacey id was BLOCKED — through the #3686 ASYMMETRY (the PR door
+    admitted it, MAIN's rate door dropped its row, so it had no rate and `decide`
+    refused it), NOT through both doors agreeing — after it the id
+    is representable on the rate side, so a tab-free per-run line — which shreds
+    the id and leaves E5 structurally blind to it — would EXEMPT an identity that
+    may have MOVED, the one class the rail may never merge.
+
+    `RotationRuns.has_legacy_lines` is how the reader says so, and `decide`
+    refuses to exempt a whitespace-carrying id on that evidence. The contrast leg
+    below is the proof the arm keys on the FORM and not on the id: the SAME id on
+    TAB-form evidence is exempted normally.
+
+    MUTATION: drop the `rotation_legacy` arm from `decide` → this id is EXEMPTED
+    and the first assertion reddens.
+    """
+    moved = "tests/test_x.py::TestK::test_a[argv14-at the EDGE]"
+    sig = "sg-3686-legacy"
+    main = parse_rates(f"{moved}\t3\t26\n")
+    pr = parse_failure_rows(f"{moved}\t3\t26\t{sig}\n").failures
+
+    # The pre-#3686 producer's line: no tab, so the spacey id is shredded.
+    legacy = parse_rotation_runs("tests/other.py::test_y\n")
+    assert legacy.has_legacy_lines and not legacy.tab_lines, (
+        "the reader did not record the TAB-FREE form, so `decide` cannot refuse "
+        f"to exempt on it: tab={legacy.tab_lines} legacy={legacy.legacy_lines}"
+    )
+    guarded = decide(
+        pr, main.rates,
+        main_signatures={moved: frozenset({sig})},
+        rotating=detect_rotating_identity(legacy),
+        k_pr=26,
+        rotation_legacy=legacy.has_legacy_lines,
+    )
+    assert [v.nodeid for v in guarded.exempt] == [], (
+        "an id containing a space was EXEMPTED on TAB-FREE per-run evidence that "
+        "cannot represent it — a moving identity is invisible there, which is the "
+        f"fail-open this arm exists to refuse:\n{guarded.report()}"
+    )
+    assert [v.nodeid for v in guarded.unattributable] == [moved], guarded.report()
+
+    # CONTRAST — the same id, TAB-form evidence: exempted, so the arm is not a
+    # blanket refusal of spacey ids (which would be the over-block direction).
+    tab = parse_rotation_runs("tests/other.py::test_y\t")
+    assert not tab.has_legacy_lines and tab.tab_lines == 1
+    allowed = decide(
+        pr, main.rates,
+        main_signatures={moved: frozenset({sig})},
+        rotating=detect_rotating_identity(tab),
+        k_pr=26,
+        rotation_legacy=tab.has_legacy_lines,
+    )
+    assert [v.nodeid for v in allowed.exempt] == [moved], allowed.report()
+
+
+def test_the_COMPOSED_path_from_text_to_decide_refuses_a_spacey_id():
+    """⛔ THE FORM IS DERIVED, so the obvious composition cannot drop it.
+
+    #3686 review cycle 7, P2. `rotation_legacy` defaults to False — the PERMISSIVE
+    value — so a caller who writes the natural
+    ``decide(pr, main, rotating=detect_rotating_identity(parse_rotation_runs(text)))``
+    silently restores the cycle-6 fail-open, with a green suite. Passing the parsed
+    ``RotationRuns`` instead makes the form un-droppable: the object that knows the
+    form is the object that supplies it. This pins the composition a NEW caller would
+    write, not just `_cmd_decide`'s plumbing.
+
+    MUTATION: ignore `rotation=` in `decide` (back to flags only) → this id is
+    EXEMPTED and the first assertion reddens.
+    """
+    moved = "tests/test_x.py::TestK::test_a[argv14-at the EDGE]"
+    sig = "sg-3686-composed"
+    main = parse_rates(f"{moved}\t3\t26\n")
+    pr = parse_failure_rows(f"{moved}\t3\t26\t{sig}\n").failures
+
+    decision = decide(
+        pr, main.rates,
+        main_signatures={moved: frozenset({sig})},
+        rotation=parse_rotation_runs("tests/other.py::test_y\n"),  # tab-free
+        k_pr=26,
+    )
+    assert [v.nodeid for v in decision.exempt] == [], (
+        "composing `parse_rotation_runs` into `decide` via `rotation=` did not carry "
+        f"the TAB-FREE form, so a moving identity was EXEMPTED:\n{decision.report()}"
+    )
+    assert [v.nodeid for v in decision.unattributable] == [moved], decision.report()
+
+
+def test_an_EMPTY_rotating_map_cannot_SUPPRESS_the_E5_map_derived_from_rotation():
+    """⛔ "NO MAP" IS NOT "NO EVIDENCE" (#3686 review cycle 9, P2).
+
+    The cycle-7 fix made the FORM un-droppable, but `if rotating is None` still let a
+    caller pass `rotating={}` alongside `rotation=runs` and DROP the E5 map derived from
+    the very evidence it was handed — which exempts a TAB-form id that
+    `detect_rotating_identity` reports as having MOVED, the one class the rail states
+    may never merge. A falsy map is therefore treated as absent and RE-DERIVED; a
+    non-empty map is UNIONED with the derived one (review cycle 10), so an incomplete or
+    unrelated map can only ADD ids to the E5 signal — never subtract evidence.
+
+    MUTATION: trust the caller's map whenever it is not None (i.e. `if rotating is
+    not None: rotating = rotating`) → a falsy map stops being re-derived, this id is
+    EXEMPTED and the first assertion reddens. ⛔ The OLD note here named `if not
+    rotating:` → `if rotating is None:`; cycle 10 replaced that branch with a per-class
+    UNION, so the note had gone stale (the named edit no longer reddened this test).
+    """
+    moved_a = "tests/test_x.py::TestK::test_a[argv7-at the EDGE]"
+    moved_b = "tests/test_x.py::TestK::test_a[argv14-at the EDGE]"
+    stable = "tests/other.py::test_y"
+    sig = "sg-3686-suppressed"
+    runs = parse_rotation_runs(f"{stable}\t{moved_a}\n{stable}\t{moved_b}\n")
+    assert detect_rotating_identity(runs), "the fixture must report a MOVING identity"
+
+    main = parse_rates(f"{moved_b}\t3\t26\n")
+    pr = parse_failure_rows(f"{moved_b}\t3\t26\t{sig}\n").failures
+    decision = decide(
+        pr, main.rates,
+        main_signatures={moved_b: frozenset({sig})},
+        rotating={},          # ⛔ the suppression attempt
+        rotation=runs,
+        k_pr=26,
+    )
+    assert [v.nodeid for v in decision.exempt] == [], (
+        "an EMPTY `rotating=` map suppressed the E5 map derived from `rotation=`, so "
+        f"a MOVING identity was EXEMPTED:\n{decision.report()}"
+    )
+    assert [v.nodeid for v in decision.unattributable] == [moved_b], decision.report()
+
+
+def test_an_INCOMPLETE_rotating_map_cannot_SUBTRACT_the_derived_E5_signal():
+    """⛔ A SUPPLIED MAP IS UNIONED, NEVER SUBSTITUTED (#3686 review cycle 10, P2).
+
+    Cycle 9 stopped a FALSY map from suppressing the derivation; a TRUTHY one still
+    replaced it wholesale, so an unrelated or incomplete map DROPPED the E5 signal the
+    same caller handed in beside it. Measured before this fix: on TAB-form evidence
+    whose class reports a MOVING identity, `rotating={"Other::cls": …}` EXEMPTED the
+    moved id — again the class the rail states may never merge.
+
+    MUTATION: replace the union with `rotating = rotating or derived` (i.e. keep a
+    truthy map as-is) → this id is EXEMPTED and the first assertion reddens.
+    """
+    moved_a = "tests/test_x.py::TestK::test_a[argv7-at the EDGE]"
+    moved_b = "tests/test_x.py::TestK::test_a[argv14-at the EDGE]"
+    stable = "tests/other.py::test_y"
+    sig = "sg-3686-partial"
+    runs = parse_rotation_runs(f"{stable}\t{moved_a}\n{stable}\t{moved_b}\n")
+
+    main = parse_rates(f"{moved_b}\t3\t26\n")
+    pr = parse_failure_rows(f"{moved_b}\t3\t26\t{sig}\n").failures
+    decision = decide(
+        pr, main.rates,
+        main_signatures={moved_b: frozenset({sig})},
+        # ⛔ a TRUTHY map for an UNRELATED class — the substitution trap
+        rotating={"tests/other.py::Other": frozenset({stable})},
+        rotation=runs,
+        k_pr=26,
+    )
+    assert [v.nodeid for v in decision.exempt] == [], (
+        "an unrelated NON-EMPTY `rotating=` map SUBSTITUTED for the E5 map derived "
+        f"from `rotation=`, so a MOVING identity was EXEMPTED:\n{decision.report()}"
+    )
+    assert [v.nodeid for v in decision.unattributable] == [moved_b], decision.report()
+
+
+def test_the_ROTATION_reader_still_accepts_the_PRE_3686_space_joined_form():
+    """The tab-free PARSE must keep working — the FORM is now reported too.
+
+    `ADMIN_MERGE_FAILURE_SET_SH` can point the rail at another producer, and an
+    older one space-joins. Parsing its line as ONE giant id would blind E5 a second
+    way — quietly, since no assertion would fire. A tab-free line is therefore read
+    the old way, which is exactly why the producer emits a tab on EVERY line (even a
+    single-id run): "no tab" unambiguously identifies the old form.
+
+    ⛔ AND THE FORM IS PART OF THE ANSWER (#3686 review cycle 6, P1). This docstring
+    used to say the fallback keeps old input "meaning what it always meant"; it kept
+    the parse and flipped the VERDICT, because a shredded spacey id is invisible to
+    E5. The reader therefore counts the lines it read each way, and `decide` refuses
+    to exempt a whitespace-carrying id when any line took the tab-free branch — see
+    `test_a_LEGACY_TAB_FREE_rotation_line_cannot_license_a_spacey_EXEMPT`.
+    """
+    runs = parse_rotation_runs("tests/a.py::t1 tests/a.py::t2\n")
+
+    assert runs == [frozenset({"tests/a.py::t1", "tests/a.py::t2"})]
+    assert runs.legacy_lines == 1 and runs.tab_lines == 0
+
+
+def test_the_PRODUCER_and_the_READER_AGREE_on_the_rotation_wire_format(tmp_path):
+    """The cross-language half: the SHIPPED producer, executed, not quoted.
+
+    `parse_rotation_runs` is pinned above by behaviour, but nothing there stops
+    `ci-failure-set.sh` from reverting to a space join — two languages, one wire
+    format, and the Python suite is the part every change runs. So this leg reads
+    the producer's own STATEMENTS OUT OF THE SCRIPT and executes them, which pins
+    the script's real text with no second copy to drift.
+
+    ⛔ THE WHOLE STATEMENT IS BOUND, NOT THE PIECE THAT LOOKS INTERESTING (review
+    cycle 3, P1). The first two versions extracted the `awk …'{…}'` PROGRAM and the
+    INNER `$(…)` substitution respectively — so a filter appended AFTER either one
+    was outside both the assertion and the execution, and the pin stayed green:
+    `| sed 's/\t40$//'` deletes the runs column (every rate row then fails to parse,
+    a permanent BLOCK for every PR), and `| sed 's/\t$//'` makes a single spacey id
+    emit a TAB-FREE per-run line — which TODAY means the reader counts it as the
+    legacy form (`RotationRuns.has_legacy_lines`), so EVERY spacey id comes out
+    UNATTRIBUTABLE and #3686's deadlock returns (⛔ it is NOT an exemption any more:
+    that was the pre-cycle-6 consequence, and cycle 6 closed it). An
+    enforcer that cannot see the edit it advertises is inert, so both statements
+    are now bound END TO END and RUN with their own redirection/stream.
+    """
+    src = (Path(__file__).resolve().parent.parent / "scripts" / "ci-failure-set.sh").read_text()
+    lines = src.splitlines()
+
+    # (1) the RATE table: the id must reach the reader byte-for-byte.
+    heads = [i for i, ln in enumerate(lines) if 'sort "$tmp_all" | uniq -c' in ln]
+    assert len(heads) == 1, (
+        "the rate-table pipeline moved (or was duplicated) — update this pin: "
+        f"{len(heads)} site(s) found"
+    )
+    end = heads[0]
+    while lines[end].rstrip().endswith("\\"):
+        end += 1
+    rate_stmt = "\n".join(ln.strip() for ln in lines[heads[0]:end + 1])
+    assert '$1 = ""' not in rate_stmt, (
+        "field assignment rebuilds $0 and collapses runs of spaces — the #3686 "
+        "second door's silent re-keying"
+    )
+    nodeid = "tests/test_pages_bindings.py::t[a  b]"
+    fixture = tmp_path / "ids"
+    fixture.write_text(f"{nodeid}\n{nodeid}\n{nodeid}\n")
+    rate = subprocess.run(
+        ["bash", "-c", 'tmp_all="$1"; tested=40; ' + rate_stmt, "_", str(fixture)],
+        capture_output=True, text=True,
+    )
+    assert rate.returncode == 0, (
+        f"the shipped rate-table statement no longer runs: {rate.stderr!r}"
+    )
+    assert rate.stdout == f"{nodeid}\t3\t40\n", (
+        "the rate-table builder RE-KEYED the id (awk rebuilt $0 from its fields, "
+        "collapsing interior spacing) or a filter was appended to the statement: "
+        f"{rate.stdout!r}"
+    )
+
+    # (2) the per-run sets: TAB-joined, never space-joined.
+    assert src.count("| tr '\\n' ' '") == 0, (
+        "a per-run write is SPACE-joined again — a space-parametrized id would be "
+        "shredded and E5 blinded"
+    )
+    writes = [ln.strip() for ln in lines if "per_run" in ln and "tr '\\n' '\\t'" in ln]
+    assert len(writes) == 2, (
+        "the two per-run write sites moved — update this pin: "
+        f"{len(writes)} site(s) found"
+    )
+    assert len(set(writes)) == 1, (
+        "the two per-run write sites DIVERGED, so one of them is unpinned: "
+        f"{sorted(set(writes))!r}"
+    )
+    stmt = writes[0]
+    tail = '>> "$per_run"'
+    assert stmt.endswith(tail), (
+        "the per-run write no longer ENDS with its redirection, so this pin cannot "
+        "bind the whole statement (that is how cycle 2's pin went inert): "
+        f"{stmt!r}"
+    )
+    body = stmt[: -len(tail)].rstrip()
+    single = "tests/test_x.py::TestK::t[argv14-at the EDGE]"
+    dest = tmp_path / "per-run"
+    subprocess.run(
+        ["bash", "-c", 'ids="$1"; ' + body + ' > "$2"', "_", single, str(dest)],
+        capture_output=True, text=True, check=True,
+    )
+    emitted = dest.read_text()
+    assert emitted == f"{single}\t\n", (
+        "a SINGLE-id run no longer emits a TAB-bearing line, so the reader takes its "
+        "legacy space-split path and shreds a spacey id — E5 goes blind: "
+        f"{emitted!r}"
+    )
+    assert parse_rotation_runs(emitted) == [frozenset({single})], (
+        "the shipped producer's per-run line does not round-trip through the reader: "
+        f"{emitted!r}"
+    )
+
+
+def test_the_rate_table_is_still_EXACTLY_three_TAB_fields():
+    """`[^\t]+` must not have loosened the fail-closed FIELD check.
+
+    The nodeid group became delimiter-driven, which is what lets a space through;
+    the same change must not admit a fourth field, a non-numeric count, or a
+    zero run count.
+
+    MUTATION (verified 2026-11-07): drop the trailing `$` from `_RATES_RE` →
+    `…[argv14-at the EDGE]\t3\t26\textra` matches its own PREFIX, is accepted as
+    3/26, and this test reddens on `rejected == []`. ⛔ A WIDER NODEID GROUP IS
+    NOT that mutation: `(?P<nodeid>.+)` still leaves the two numeric tails
+    anchored, so the four-field line stays rejected and every assertion here
+    passes — the field check is carried by the anchors, not by the group's width.
+    """
+    for line in (
+        f"{_SPACE_PARAM_ID}\t3\t26\textra",
+        f"{_SPACE_PARAM_ID}\t3",
+        f"{_SPACE_PARAM_ID}\tx\t26",
+        f"{_SPACE_PARAM_ID}\t3\t0",
+        f"{_SPACE_PARAM_ID}\t27\t26",
+        "not a key at all\t3\t26",
+    ):
+        r = parse_rates(line + "\n")
+        assert r.rejected == [line], (
+            f"parse_rates ADMITTED a line it must reject: {line!r} -> {r.rates}"
+        )
 
 
 def test_the_total_failure_blocks_through_the_real_wire_format():
@@ -2974,6 +3650,192 @@ def test_6798_the_row_door_admits_the_non_nodeid_families():
         assert is_failure_key_loose(key), f"parse_failure_rows would DROP the PR row for {key}"
 
 
+# ── the row door must admit a PATH inside the parameter space (tortoise#11365) ──
+#
+# THE DEFECT. A pytest parameter legitimately carries a PATH —
+# `tests/test_entry_point_python_guard.py` is parametrized over `tools/<name>.py`,
+# so its ids read `::test_...[tools/cache_evict.py]`. `_NODEID_RE.rest` admitted
+# `[`/`]`/`.`/`:`/`-` — the parameter-SYNTAX characters, NOT the whole parameter
+# space — but NOT `/`. So `is_failure_key`
+# (which gates `parse_rates`, i.e. MAIN's table) rejected every such id, while the
+# PR side's `is_failure_key_loose` accepted it.
+#
+# WHY IT IS NOT COSMETIC. A rejected main-side row is DROPPED, so the id has no
+# main rate and is therefore not exempt — the PR's failure reads as PR-unique
+# forever. That is the exact asymmetry `is_failure_key`'s own docstring names:
+# "a dropped main-side row makes the PR-side failure look unique, which BLOCKS".
+#
+# MEASURED (tortoise#11365, head 28ea11a4d5ac). `main`'s rate table carried ten
+# `test_entry_point_python_guard.py` rows — that table is a UNION over 10 runs
+# (five tools × two arms) — and `parse_rates` accepted 0 of the 10 and rejected
+# all 10. `VERDICT BLOCK blocked=6` then named SIX of them against a PR whose
+# diff touches none of those files, while the eleven
+# non-path-parameterized main-reds on the SAME run were correctly EXEMPT. The
+# required `python-ci-gate` then reds, which permanently BLOCKs any PR that
+# touches none of those files.
+#
+# ⛔ SIX ARE NAMED, NOT TEN — do not write "ten tests fail on main". Ten is the
+# RATE-TABLE row count over the union window; the four rows outside the six are
+# carry-over from earlier runs in that window and were not failing on this run.
+# `blocked=6` is the same run's own count of what was actually red. Earlier
+# revisions of this note said "the same ten tests fail on origin/main itself"
+# and cited a `10 failed, 955 passed` worktree run. That citation is deleted
+# rather than reworded: `955 passed` is a WHOLE-SUITE total, not this test
+# module's count, so quoting it as a per-file measurement was wrong on its face.
+# No per-file test count is stated here, because every number written into this
+# block is a claim the next reader is entitled to check — and a bare count
+# invites the local module's own count to be read as the tortoise file's.
+#
+# ⛔ NOT the trunk repair — and NOT the "inverse" either. The sentence here used
+# to read that this "deadlocks the very PR that repairs the trunk (tortoise#11262 /
+# tortoise#11255 is the same class)". That claim is not SUPPORTED by measurement,
+# and this note does not replace it with its opposite, because the measurement
+# does not reach that far either. What IS measured: tortoise#11262's
+# `6c7a15f2a5` carries a `ci-introduced-failure` check-run whose status is
+# **queued** and whose conclusion is `null` — it has never completed — while the
+# other probed commits carry no such run. A queued run certifies nothing, so the
+# predicate has returned NO VERDICT on that PR and its check cannot be cited
+# either way. The basis for "can land" is agent-infra#3686's own table
+# (`#11262 … can land`, naming #11217 as the one BLOCKED by this defect) — not
+# this note, and not any claim about #11262's redness.
+#
+# (An earlier revision of this paragraph said the check-run was absent "AT ALL"
+# and concluded the predicate "never ran" there. That was FALSE: the check-run
+# exists and is queued. It was missed because a `filter=all` read taken before
+# the job starts has no check-run OBJECT yet, so grepping the response for the
+# NAME returns nothing and reads exactly like "it does not exist". Absence of a
+# check-run is not absence of a dispatch — a distinction this block exists for.)
+#
+# ⛔ This note deliberately does NOT say WHICH change landed the corpus guards.
+# #3686's table credits #11262 with "all 3 guards"; I could not reconcile that
+# with #11262's own diff, so no provenance claim is made here. (An earlier
+# revision of this note tried to, and got it wrong in a way worth recording:
+# it enumerated #11262's files and then said it "touches no corpus file" — but
+# `tools/ci_selection.py` IS a corpus file, because tortoise's
+# `CORPUS_DIRS = ("tools", "graph-scripts")`. The enumeration was also already
+# stale — #11262 had moved.) Nothing above depends on the answer, and an
+# unverified provenance sentence is exactly the defect this block exists to
+# prevent — so it is dropped, not restated.
+
+_PATH_PARAM_IDS = (
+    "tests/test_entry_point_python_guard.py"
+    "::test_entry_point_guards_the_interpreter_before_its_imports[tools/cache_evict.py]",
+    "tests/test_entry_point_python_guard.py"
+    "::test_guard_refuses_an_old_interpreter_and_passes_the_floor[tools/test_design_map_check.py]",
+    # a SIBLING directory parameter at the same depth (graph-scripts/ is a peer of
+    # tools/, not a level below it) — the shape is unchanged, the nesting is not.
+    "tests/test_entry_point_python_guard.py"
+    "::test_entry_point_guards_the_interpreter_before_its_imports"
+    "[graph-scripts/2146_e2e_live_orphan_cleanup.py]",
+)
+
+
+def test_11365_the_row_door_admits_a_path_in_the_parameter_space():
+    """BOTH doors must admit a path-bearing parameter, or main's row is dropped."""
+    for key in _PATH_PARAM_IDS:
+        assert is_failure_key(key), (
+            f"`parse_rates` DROPS main's row for {key!r}: the id then has no main "
+            "rate and is never exempt, so an identical failure reads as PR-unique"
+        )
+        assert is_failure_key_loose(key), (
+            f"`parse_failure_rows` DROPS the PR's own row for {key!r}"
+        )
+
+
+def test_11365_a_main_red_with_a_path_parameter_is_EXEMPT_not_BLOCKED():
+    """The VERDICT, not the parse: a main-red must not read as PR-introduced.
+
+    ⛔ EVERY input goes through the real WIRE PARSER (`parse_rates` for main's
+    table, `parse_failure_rows` for the PR's). Constructing `main_rates` as a
+    dict instead would BYPASS the defect this test exists for — measured: the
+    dict-shaped version of this test stayed GREEN with the regex fix reverted,
+    because `parse_rates` (the door that drops the row) was never exercised.
+    """
+    key = _PATH_PARAM_IDS[0]
+    sig = (
+        "AssertionError: tools/cache_evict.py: the #5128 interpreter guard is not "
+        "the first statement after the docstring"
+    )
+    # main: 3/25 — measurably red, exactly as tortoise#11365's table carries it.
+    main_rates = parse_rates(f"{key}\t3\t25").rates
+    assert main_rates.get(key), (
+        "`parse_rates` DROPPED main's row — that is the whole defect; without a "
+        "main rate the id can never be exempt"
+    )
+    pr_rows = parse_failure_rows(f"{key}\t1\t1\t{sig}").failures
+    assert key in pr_rows, "the PR's own row must parse (that door is loose by design)"
+    main_signatures = {
+        k: frozenset({sig}) for k in parse_signature_rows(f"{key}\t{sig}")
+    }
+    assert key in main_signatures, "main's signature row must parse for the overlap test"
+
+    decision = decide(
+        pr_rows,
+        main_rates,
+        main_signatures=main_signatures,
+        k_pr=1,
+    )
+    assert not decision.blocked, (
+        "a failure main is measurably red for (3/25) was BLOCKED as introduced by "
+        f"the PR: {[v.line for v in decision.blocked]}"
+    )
+    assert any(key in line for line in decision.visible_exemptions()), (
+        "the main-red must be visibly EXEMPT, not merely absent from `blocked`"
+    )
+
+
+def test_11365_the_widened_tail_still_fails_closed_on_junk():
+    r"""NON-VACUITY: admitting `/` must not turn the rate door into a wildcard.
+
+    ⛔ "Unbalanced bracket" is deliberately NOT asserted: `[` was already in `rest`
+    before this change, so `test_x[a` was and remains admitted. Pinning it would pin
+    a narrowing the door never had.
+
+    ⛔ TWO DOORS, AND A KNOWN RESIDUAL. `rest` is an allowlist; an id outside it
+    is dropped from MAIN's rate table and BLOCKs. The set is open-ended — do not
+    enumerate it. The whole discussion (which door, why a whitespace id has three,
+    what pytest escapes) lives in `scripts/ci_exemption.py`'s `_NODEID_RE` block;
+    it is NOT restated here, because two copies of "measured" prose drift — the
+    first draft of this pair already disagreed with itself on the character set.
+    """
+    # ── genuinely NOT ids — never emitted, so no door should name them ──
+    for junk in (
+        "tests/test_a.py::",                  # empty tail
+        "tests/test_a.py:test_x[a/b]",        # no `::` -> not a nodeid
+        "random-string",                      # not a nodeid at all
+        # a RAW tab byte: pytest renders a tab param as [a\tb] (backslash + `t`), so
+        # the raw byte is not an id and BOTH doors refuse it — `is_failure_key_loose`
+        # is False too, which is what makes it junk rather than residual.
+        "tests/test_a.py::test_x[a\tb]",
+    ):
+        assert not is_failure_key(junk), f"{junk!r} must NOT buy a rate row"
+
+    # ── REAL ids the strict door drops: the RESIDUAL.
+    # Each class is its OWN entry, asserted on its own, because a single block with
+    # one "delete when fixed" message let a space-only fix delete the guards for the
+    # other three. All of them are tracked by agent-infra#3691 (scope widened there).
+    #
+    # ⛔ SPACE WAS HERE AND WAS REMOVED BY #3686's OWN BRANCH (#3687), exactly as the
+    # per-entry message below instructs: the space class is CLOSED — `rest` admits a
+    # space, `_RATES_RE` delimits on the tab, and the producer no longer re-keys the
+    # row through `awk $1=""`. Entry removed ALONE; the three below are separate
+    # classes and are still open. `[a b]` is covered on the ACCEPTING side by
+    # `test_a_SPACE_PARAMETRIZED_nodeid_survives_BOTH_doors` and
+    # `test_a_SPACE_PARAMETRIZED_failure_is_EXEMPT_not_permanently_BLOCKED`.
+    for residual in (
+        "tests/test_a.py::test_x[a,b]",       # COMMA
+        "tests/test_a.py::test_x[a;b]",       # SEMICOLON
+        r"tests/test_a.py::test_x[a\tb]",     # ESCAPED TAB (as pytest emits it)
+    ):
+        assert is_failure_key_loose(residual), (
+            f"{residual!r} must be a REAL id (the loose/PR door names it), else it "
+            "belongs in the junk loop above, not here"
+        )
+        assert not is_failure_key(residual), (
+            f"RESIDUAL CLOSED for {residual!r}: the strict door now ACCEPTS it. "
+            "Remove THIS entry only — the other classes are separate and are not "
+            "fixed by closing this one (see agent-infra#3691)."
+        )
 
 
 def test_6798_the_row_door_admits_EVERY_produced_key_prefix():
@@ -3044,7 +3906,9 @@ def test_shard_token_is_in_the_row_doors_alphabet_for_every_hostile_path():
     """
     hostile = [
         "scripts/lib/a~b.sh",          # `~` — quote()'s always-safe set, the cycle-4 silent drop
-        "scripts/a b.test.sh",          # whitespace — the rate table is `uniq -c | awk`
+        "scripts/a b.test.sh",          # whitespace — outside this family's charset in
+                                        # `_NON_NODEID_KEY_RE` (the rate table itself is
+                                        # TAB-delimited since #3686, so it is not the reason)
         "scripts/a\tb.sh",              # a tab, which would also break the capture's field split
         "scripts/a%41.sh",             # a literal escape: must be RE-escaped, not passed through
         "scripts/a@b#c.sh",            # characters `_slug` would fold away
@@ -3154,7 +4018,9 @@ def test_bash_shard_identity_is_injective_over_the_listed_shards():
             "can fold two shards onto one identity"
         )
         ids.setdefault(got[0], []).append(path)
-        # …and the key must carry no whitespace (the rate table is `uniq -c | awk`).
+        # …and the key must carry no whitespace: the family's charset in `_NON_NODEID_KEY_RE`
+        # is `[A-Za-z0-9_./%\-]`. The rate table is TAB-delimited since #3686, so the table's
+        # old `uniq -c | awk` constraint is NOT the reason — this charset is.
         assert re.search(r"\s", got[0]) is None, got[0]
     collisions = {k: v for k, v in ids.items() if len(v) > 1}
     assert not collisions, f"distinct shards share one identity: {collisions}"
@@ -3195,7 +4061,7 @@ def test_6798_the_row_door_still_rejects_junk():
         "collect-error::",               # empty path
         "collect-error::tests/a.py::x",  # a nodeid is NOT a collect-error key
         "bash-shard::",                  # empty shard path
-        "bash-shard::a b",               # whitespace defeats the rate table's uniq|awk
+        "bash-shard::a b",               # whitespace is outside _NON_NODEID_KEY_RE's charset
         "runner::",                      # empty job slug
         "bash-shard::x::y",              # a nodeid is not a shard key
     ):
