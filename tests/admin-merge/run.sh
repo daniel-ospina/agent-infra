@@ -15991,17 +15991,19 @@ grep -q 'run view 9871 ' "$SCEN/calls" \
 # ⛔ THE DECLARED EQUIVALENCE ARM (#2610). That same real split is ALSO the one pair the rail
 # declares equivalent (`script-validate` on main CONTAINS `bash-suites (<n>)` on a PR — header,
 # "THE ONE DECLARED LANE EQUIVALENCE"), so this scenario exercises the mapping arm: the answer
-# must be `base-caused via script-validate ≡ bash-suites (5)`, never "no base counterpart".
+# must be `base-caused via script-validate (5) ≡ bash-suites (5)` — ARM-KEYED since #3174, because
+# main's `script-validate` is a matrix and publishes `script-validate (1)` … `(8)` — never "no base
+# counterpart".
 # Two more arms keep that from becoming a blanket excuse: (n1) a check name the mapping does
 # NOT name (`bash-suites-gate`, the nearest near-miss — a prefix rule would only map it if the
 # digits guard were dropped too, i.e. TWO guards stand between them) keeps today's
 # unqualified absence answer, and (n2) is the mutation — with the equivalence
 # deleted the mapped answer must disappear, so these assertions rest on that arm alone.
-# ⚠️ `bash-suites-gate` IS A KNOWN RESIDUAL, not an absence of counterpart: main has no gate
-# JOB, so its two programs run as STEPS inside `script-validate` (named, not line-cited) and
-# that red also has a base counterpart under the other name. (n1) pins the SCOPING decision
-# (one declared pair, as briefed) — it is recorded on #2610, and the mapping's own note says
-# so rather than claiming the programs differ.
+# ⚠️ `bash-suites-gate` IS A KNOWN RESIDUAL, not an absence of counterpart: since #3174 main DOES
+# publish a `script-validate-gate` job holding the same two programs, but the PR side's name and the
+# base side's name still differ, so that red keeps its unqualified absence answer. (n1) pins the
+# SCOPING decision (one declared pair, as briefed) — it is recorded on #2610, and the mapping's own
+# note says so rather than claiming the programs differ.
 echo "== 79. an unattributable failing run is refused BY NAME, with its base counterpart (#2610) =="
 new_scen named-refusal
 HEAD_NR="f9f90000000000000000000000000000000000ab"
@@ -16011,7 +16013,7 @@ lane_fail "$HEAD_NR" 9901 > "$SCEN/runs-$HEAD_NR"
 echo 'bash-suites (5)' > "$SCEN/jobs-failed-9901"
 write_pr_checks "$(check_run 5001 'bash-suites (5)' completed failure 9901)"
 # The base's OWN surface: the same suite under a DIFFERENT name — the split this repo has.
-write_main_checks "$(check_run 4001 'script-validate' completed failure 6101)"
+write_main_checks "$(check_run 4001 'script-validate (5)' completed failure 6101)"
 printf 'push\tCI on main\t.github/workflows/ci-main.yml\n' > "$SCEN/run-6101"
 wf_declares .github/workflows/ci-main.yml push          # …declaring NO pull_request trigger
 main_run_map 6101 push 'CI on main'
@@ -16029,8 +16031,8 @@ grep -q "check 'bash-suites (5)'" "$SCEN/err" \
 grep -q "run 9901" "$SCEN/err" \
   && pass "(b) …and the RUN it failed in" \
   || fail "(b) the refusal names no run"
-grep -q "base: base-caused via script-validate ≡ bash-suites (5)" "$SCEN/err" \
-  && pass "(c) …and answers the base question BY the DECLARED EQUIVALENCE: base-caused via script-validate ≡ bash-suites (5)" \
+grep -q "base: base-caused via script-validate (5) ≡ bash-suites (5)" "$SCEN/err" \
+  && pass "(c) …and answers the base question BY the DECLARED EQUIVALENCE, ARM-KEYED: base-caused via script-validate (5) ≡ bash-suites (5)" \
   || fail "(c) the declared-equivalence answer is missing: $(grep -n 'base:' "$SCEN/err" 2>/dev/null | head -3)"
 # The shard NAME must be carried: the refusal is about ONE shard, and `bash-suites` alone
 # does not say which one.
@@ -16041,7 +16043,7 @@ grep -q "≡ bash-suites (5) (" "$SCEN/err" \
 # EXEMPTED (its workflow declares no pull_request trigger), so it is NOT in the blocking set.
 # An arm reading only the blocking reds finds no counterpart at all — so the `exempt:` CLASS
 # in this answer is what pins the ALL_REDS reader (the false absence this fixture exists for).
-grep -q 'base: base-caused via script-validate ≡ bash-suites (5) (exempt:' "$SCEN/err" \
+grep -q 'base: base-caused via script-validate (5) ≡ bash-suites (5) (exempt:' "$SCEN/err" \
   && pass "(c) …naming the base's own red as EXEMPT even though it is not in the blocking set" \
   || fail "(c) the base's exempted red is missing from the answer (a blocking-set reader finds no counterpart): $(grep -n 'base:' "$SCEN/err" 2>/dev/null | head -4)"
 grep -q "NO BASE COUNTERPART" "$SCEN/err" \
@@ -16063,7 +16065,7 @@ log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-9921"
 : > "$SCEN/log-9922"
 echo 'test (z)' > "$SCEN/jobs-failed-9922"
 write_pr_checks "$(check_run 5021 'test (z)' completed failure 9922)"
-write_main_checks "$(check_run 4021 'script-validate' completed failure 6103)"
+write_main_checks "$(check_run 4021 'script-validate (5)' completed failure 6103)"
 printf 'push\tCI on main\t.github/workflows/ci-main.yml\n' > "$SCEN/run-6103"
 wf_declares .github/workflows/ci-main.yml push
 main_run_map 6103 push 'CI on main'
@@ -16262,7 +16264,7 @@ lane_fail "$HEAD_NU" 9951 > "$SCEN/runs-$HEAD_NU"
 : > "$SCEN/log-9951"
 echo 'bash-suites-gate' > "$SCEN/jobs-failed-9951"
 write_pr_checks "$(check_run 5051 'bash-suites-gate' completed failure 9951)"
-write_main_checks "$(check_run 4051 'script-validate' completed failure 6104)"
+write_main_checks "$(check_run 4051 'script-validate (5)' completed failure 6104)"
 printf 'push\tCI on main\t.github/workflows/ci-main.yml\n' > "$SCEN/run-6104"
 wf_declares .github/workflows/ci-main.yml push
 main_run_map 6104 push 'CI on main'
@@ -16277,9 +16279,45 @@ grep -q "base: base-caused via" "$SCEN/err" \
 grep -q "NO BASE COUNTERPART FOR THIS CHECK" "$SCEN/err" \
   && pass "(n1) …keeping today's unqualified absence answer" \
   || fail "(n1) the unmapped answer changed: $(grep -n 'base:' "$SCEN/err" 2>/dev/null | head -3)"
-grep -qE "^       red: script-validate$" "$SCEN/err" \
+grep -qE "^       red: script-validate \(5\)$" "$SCEN/err" \
   && pass "(n1) …naming the base's EXEMPTED red in the absence answer (the ALL_REDS reader)" \
   || fail "(n1) the base's exempted red vanished from the unmapped answer: $(grep -n 'red:' "$SCEN/err" 2>/dev/null | head -3)"
+
+# ── (n1b) ARM-KEYED, NOT A NAME FAMILY (#3174). Main publishes `script-validate (1)` … `(8)` now,
+# and the declaration maps ARM k to ARM k. A base red on a DIFFERENT arm must therefore keep the
+# unqualified absence answer — otherwise the map is "any script-validate red", the blanket family
+# rule the block forbids above.
+# ⛔ WHAT THIS ARM ADDS, STATED CORRECTLY (review cycle 1): it is NOT what kills a mutant that drops
+# `${shard}` and returns the whole-job name — arms (c) above already do, because (c) asserts the
+# exact line `base-caused via script-validate (5) ≡ bash-suites (5)` against a base publishing
+# `script-validate (5)` and a bare-name mutant cannot produce it. What ONLY this arm pins is the
+# FAMILY reading ("any `script-validate (<k>)` red is a counterpart"): every other arm here looks at
+# a MATCHING arm, so a map that ignored the extracted shard and accepted any arm would pass them all.
+new_scen named-refusal-wrongarm
+HEAD_NW="f9f90000000000000000000000000000000000e2"
+printf '%s\n' "$HEAD_NW" > "$SCEN/head"
+lane_fail "$HEAD_NW" 9961 > "$SCEN/runs-$HEAD_NW"
+: > "$SCEN/log-9961"
+echo 'bash-suites (5)' > "$SCEN/jobs-failed-9961"
+write_pr_checks "$(check_run 5061 'bash-suites (5)' completed failure 9961)"
+write_main_checks "$(check_run 4061 'script-validate (4)' completed failure 6105)"
+printf 'push\tCI on main\t.github/workflows/ci-main.yml\n' > "$SCEN/run-6105"
+wf_declares .github/workflows/ci-main.yml push
+main_run_map 6105 push 'CI on main'
+{ main_red_n mainnw01 9962 1 'tests/test_other.py::test_red_on_main'; } > "$SCEN/runs-main"
+run_admin_here 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "(n1b) a base red on a DIFFERENT arm still BLOCKS (exit $rc)" \
+  || fail "(n1b) the rail merged over an unattributable red"
+grep -q "base: base-caused via" "$SCEN/err" \
+  && fail "(n1b) base arm 4 was mapped to PR arm 5 — the map ignores the shard it extracted" \
+  || pass "(n1b) …and is NOT mapped to the PR's arm (the mapping is arm-keyed, not a name family)"
+grep -q "NO BASE COUNTERPART FOR THIS CHECK" "$SCEN/err" \
+  && pass "(n1b) …keeping the unqualified absence answer for a non-matching arm" \
+  || fail "(n1b) the answer changed for a non-matching arm: $(grep -n 'base:' "$SCEN/err" 2>/dev/null | head -3)"
+grep -qE "^       red: script-validate \(4\)$" "$SCEN/err" \
+  && pass "(n1b) …and still NAMES the base's own red on arm 4 in the absence answer" \
+  || fail "(n1b) the base's arm-4 red vanished from the absence answer: $(grep -n 'red:' "$SCEN/err" 2>/dev/null | head -3)"
 
 # ── (n2) MUTATION: DELETE THE EQUIVALENCE, AND THE MAPPED ANSWER MUST GO. The three (c) arms
 # assert a line the mapping arm alone produces; this proves it. The mutant keeps everything
@@ -16304,7 +16342,7 @@ bash -n "$MUTD2/admin-merge.sh" \
 #   ✅ (n2) deleting the equivalence removes the mapped answer: the (c) assertions rest on that arm
 # while the mapping was absent — a green arm asserted rather than verified. Same shape as (m)'s
 # own precondition: the SAME scenario through the UNMUTATED rail must carry the line first.
-grep -q "base: base-caused via script-validate ≡ bash-suites (5)" "$SCEN_EQ/err" 2>/dev/null \
+grep -q "base: base-caused via script-validate (5) ≡ bash-suites (5)" "$SCEN_EQ/err" 2>/dev/null \
   && pass "(n2) precondition: the UNMUTATED rail on this scenario prints the mapped answer" \
   || fail "(n2) precondition FAILED — the unmutated rail never printed the mapped answer, so the absence arm below would pass vacuously: $(grep -c 'base:' "$SCEN_EQ/err" 2>/dev/null || printf 'unreadable')"
 SCEN="$SCEN_EQ" ADMIN_MERGE_GH="$FAKE" CI_FAILURE_SET_GH="$FAKE" \
@@ -16317,7 +16355,7 @@ qrc=$?
 grep -q "BLOCKED — 1 of 1 failing PR run(s)" "$SCEN_EQ/eq-mut-err" 2>/dev/null \
   && pass "(n2) the mutant still refuses at step 1c — the refusal is not what the arm adds" \
   || fail "(n2) the mutant did not reach step 1c (exit $qrc): $(head -3 "$SCEN_EQ/eq-mut-err" 2>/dev/null)"
-grep -q "base: base-caused via script-validate ≡ bash-suites (5)" "$SCEN_EQ/eq-mut-err" 2>/dev/null \
+grep -q "base: base-caused via script-validate (5) ≡ bash-suites (5)" "$SCEN_EQ/eq-mut-err" 2>/dev/null \
   && fail "(n2) deleting the equivalence changed nothing — the (c) assertions pin no line the arm produces" \
   || pass "(n2) deleting the equivalence removes the mapped answer: the (c) assertions rest on that arm"
 grep -q "NO BASE COUNTERPART FOR THIS CHECK" "$SCEN_EQ/eq-mut-err" 2>/dev/null \
@@ -16859,10 +16897,19 @@ fi
 
 # ── 80. #3322: A CHECK MAIN ITSELF FAILS IS EXCLUDED FROM THE REQUIRED SURFACE ─
 # THE DEFECT. `ci.yml` is pull_request-only (it runs `bash-suites (1..n)`); `ci-main.yml`
-# is push-only and runs the SAME sweep UNSHARDED as `script-validate`. Main is red on
+# is push-only and runs the SAME sweep as `script-validate`. Main is red on
 # `script-validate`, so every PR is red on the shards — and the rail refused every merge
 # for a red NO diff can clear. Measured 2026-11-05: three unrelated PRs (#3478, #3168,
 # #3486) were red on the identical nine checks, and #3478 had zero unique reds.
+#
+# ⛔ THE BASE NAME IS ARM-KEYED HERE, because THIS PR shards main's lane (#3174):
+# `ci-main.yml`'s `script-validate` became a matrix and now publishes `script-validate (1)`
+# … `(8)`, exactly like the PR's `bash-suites (k)`, and `declared_base_equivalent` maps
+# arm k to arm k. The fixtures below therefore name the SHARDED base red. A bare
+# `script-validate` red is NOT a substituted counterpart: after this lands main publishes
+# it only from a pre-shard run still inside the baseline window, and excusing a PR arm on
+# a whole-sweep name is the name-family reading `(n1b)` exists to refuse (it fails CLOSED
+# instead — the pre-#2610 status quo — until a sharded base run is measured).
 #
 # THE RULE UNDER TEST: a red on the PR's evaluated tree is EXCLUDED from the required
 # surface when the BASE's own check surface (read from GitHub, not from a caller flag)
@@ -16874,8 +16921,8 @@ fi
 # arm must go RED when the exclusion is deleted.
 echo "== 80. #3322: a check MAIN ITSELF FAILS is excluded from the required surface =="
 
-# (a) THE FIX — the observed block. main fails `script-validate` (push-only ci-main.yml,
-# the sharded PR lane's unsharded twin); the PR's tree is red on `bash-suites (3)`.
+# (a) THE FIX — the observed block. main fails `script-validate (3)` (push-only ci-main.yml,
+# the sharded PR lane's arm-keyed twin); the PR's tree is red on `bash-suites (3)`.
 new_scen baseowned-excluded
 HEAD_BO1="b0b0000000000000000000000000000000000000"
 printf '%s\n' "$HEAD_BO1" > "$SCEN/head"
@@ -16887,7 +16934,7 @@ write_pr_checks \
 pr_run_map 7201 pull_request 'CI'
 pr_run_map 7202 pull_request 'CI'
 write_main_checks \
-  "$(check_run 6101 'script-validate' completed failure 8201 2026-01-02T00:00:00Z 2026-01-02T00:01:00Z)" \
+  "$(check_run 6101 'script-validate (3)' completed failure 8201 2026-01-02T00:00:00Z 2026-01-02T00:01:00Z)" \
   "$(check_run 6102 'extension-tests / lint' completed success 8201)"
 main_run_map 8201 push 'CI on main'
 printf 'push\tCI on main\t.github/workflows/ci-main.yml\n' > "$SCEN/run-8201"
@@ -16908,7 +16955,7 @@ grep -q "pr merge" "$SCEN/calls" && pass "(a) …and the merge actually happened
 # by the exclusion line (stderr) and by the evidence comment's exclusion block, so it is the
 # one string that makes the "with the base check that owns it" claim deny-able.
 if grep -q "EXCLUDED from the required surface" "$SCEN/err" \
-   && grep -q "the base itself fails 'script-validate'" "$SCEN/err" \
+   && grep -q "the base itself fails 'script-validate (3)'" "$SCEN/err" \
    && grep -q "bash-suites (3)" "$SCEN/err"; then
   pass "(a) …and the excluded red is REPORTED by name, with the base check that owns it"
 else
@@ -16928,7 +16975,7 @@ grep -q "NOT pull-request-evaluable" "$SCEN/err" \
 # indistinguishable there from a silent drop (the #6807 rule, same reason).
 if [ -f "$SCEN/comment" ] \
    && grep -q "Tree red(s) EXCLUDED from the required surface" "$SCEN/comment" \
-   && grep -q "the base itself fails 'script-validate'" "$SCEN/comment" \
+   && grep -q "the base itself fails 'script-validate (3)'" "$SCEN/comment" \
    && grep -q "bash-suites (3)" "$SCEN/comment"; then
   pass "(a) …and the DURABLE evidence comment carries the excluded red, not just stderr"
 else
@@ -16963,7 +17010,7 @@ grep -q "EXCLUDED from the required surface" "$SCEN/err" \
 grep -q "pr merge" "$SCEN/calls" && fail "(b) a merge was attempted over a red tree" || pass "(b) no merge attempted"
 
 # (c) THE SECOND GUARD — A PR-EVALUABLE BASE RED IS NOT BASE-OWNED. The base's
-# `script-validate` is red here too, but its workflow DECLARES pull_request, so a PR CAN
+# `script-validate (3)` is red here too, but its workflow DECLARES pull_request, so a PR CAN
 # attach that check and §4.5/§4.6 must keep insisting the repair PR clear it (#1261).
 # This is the arm that keeps the new exclusion off the repair direction.
 new_scen baseowned-base-prevaluable
@@ -16972,7 +17019,7 @@ printf '%s\n' "$HEAD_BO3" > "$SCEN/head"
 lane_pass "$HEAD_BO3" 7121 > "$SCEN/runs-$HEAD_BO3"
 lane_pass mainbo3 7122 > "$SCEN/runs-main"
 write_main_checks \
-  "$(check_run 6121 'script-validate' completed failure 8221 2026-01-02T00:00:00Z 2026-01-02T00:01:00Z)"
+  "$(check_run 6121 'script-validate (3)' completed failure 8221 2026-01-02T00:00:00Z 2026-01-02T00:01:00Z)"
 main_run_map 8221 push 'CI on main'
 printf 'push\tCI on main\t.github/workflows/ci-main.yml\n' > "$SCEN/run-8221"
 wf_declares .github/workflows/ci-main.yml push pull_request
@@ -17006,7 +17053,7 @@ printf '%s\n' "$HEAD_BO4" > "$SCEN/head"
 lane_pass "$HEAD_BO4" 7131 > "$SCEN/runs-$HEAD_BO4"
 lane_pass mainbo4 7132 > "$SCEN/runs-main"
 write_main_checks \
-  "$(check_run 6131 'script-validate' completed failure 8231 2026-01-02T00:00:00Z 2026-01-02T00:01:00Z)"
+  "$(check_run 6131 'script-validate (3)' completed failure 8231 2026-01-02T00:00:00Z 2026-01-02T00:01:00Z)"
 main_run_map 8231 push 'CI on main'
 printf 'push\tCI on main\t.github/workflows/ci-main.yml\n' > "$SCEN/run-8231"
 wf_declares .github/workflows/ci-main.yml push
@@ -17059,7 +17106,7 @@ write_pr_checks \
 pr_run_map 7241 pull_request 'CI'
 pr_run_map 7242 pull_request 'CI'
 write_main_checks \
-  "$(check_run 6141 'script-validate' completed failure 8241 2026-01-02T00:00:00Z 2026-01-02T00:01:00Z)" \
+  "$(check_run 6141 'script-validate (3)' completed failure 8241 2026-01-02T00:00:00Z 2026-01-02T00:01:00Z)" \
   "$(check_run 6142 'extension-tests / lint' completed success 8241)"
 main_run_map 8241 push 'CI on main'
 printf 'push\tCI on main\t.github/workflows/ci-main.yml\n' > "$SCEN/run-8241"
@@ -17092,7 +17139,7 @@ grep -q "pr merge" "$SCEN/calls" && fail "(e) the mutant merged — no defect re
 # every other assertion green — the vacuous-guard class #3442 exists to end (a test that
 # cannot fail is not a test). This arm makes the conjunct load-bearing: the tree's red is
 # `bash-suites (3)` (so `declared_base_equivalent` WOULD match it) but its run map says
-# `schedule`, and the base is red on `script-validate` under a push-only workflow. Without
+# `schedule`, and the base is red on `script-validate (3)` under a push-only workflow. Without
 # the conjunct the red is excluded as base-owned and the merge proceeds; with it the red is
 # the ANOMALY the header calls it and the rail must still refuse.
 new_scen baseowned-noncode
@@ -17108,7 +17155,7 @@ pr_run_map 7251 pull_request 'CI'
 # models: a run a PR cannot attach re-routed to a check on the head sha.
 pr_run_map 7252 schedule 'CI'
 write_main_checks \
-  "$(check_run 6151 'script-validate' completed failure 8251 2026-01-02T00:00:00Z 2026-01-02T00:01:00Z)" \
+  "$(check_run 6151 'script-validate (3)' completed failure 8251 2026-01-02T00:00:00Z 2026-01-02T00:01:00Z)" \
   "$(check_run 6152 'extension-tests / lint' completed success 8251)"
 main_run_map 8251 push 'CI on main'
 printf 'push\tCI on main\t.github/workflows/ci-main.yml\n' > "$SCEN/run-8251"
@@ -17157,8 +17204,8 @@ pr_run_map 7262 pull_request 'CI'
 # guard. The second row is therefore written raw with a different app slug: two identities,
 # one name — the real shape of "two apps publish the same check name".
 write_main_checks \
-  "$(check_run 6161 'script-validate' completed failure 8261 2026-01-02T00:00:00Z 2026-01-02T00:01:00Z)" \
-  "$(printf '{"id":6162,"name":"script-validate","status":"completed","conclusion":"failure","app":{"slug":"third-party-ci"},"started_at":"2026-01-02T00:00:00Z","completed_at":"2026-01-02T00:01:00Z","html_url":"https://github.com/daniel-ospina/agent-infra/actions/runs/8262/job/1"}')"
+  "$(check_run 6161 'script-validate (3)' completed failure 8261 2026-01-02T00:00:00Z 2026-01-02T00:01:00Z)" \
+  "$(printf '{"id":6162,"name":"script-validate (3)","status":"completed","conclusion":"failure","app":{"slug":"third-party-ci"},"started_at":"2026-01-02T00:00:00Z","completed_at":"2026-01-02T00:01:00Z","html_url":"https://github.com/daniel-ospina/agent-infra/actions/runs/8262/job/1"}')"
 main_run_map 8261 push 'CI on main' 8262 pull_request 'CI'
 printf 'push\tCI on main\t.github/workflows/ci-main.yml\n' > "$SCEN/run-8261"
 printf 'pull_request\tCI\t.github/workflows/ci.yml\n' > "$SCEN/run-8262"
