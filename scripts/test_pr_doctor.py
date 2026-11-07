@@ -3070,16 +3070,26 @@ def test_a_non_printable_branch_refuses_the_push_block():
 
     # …and a NORMAL branch still renders exactly ONE fence pair, so the parity assertion above is
     # not a tautology on a brief that happens to carry no fences at all.
+    # ⛔ NARROW TO THE BRANCH REFUSAL, NOT THE BARE WORD (measured on `origin/main`, 2026-11-07):
+    # the RESEARCH FIRST contract spliced into every brief uses "REFUSED" for an unrelated gate
+    # ("the dispatch is REFUSED when `refs/wip/*` holds a snapshot"), so `"REFUSED" not in plain`
+    # graded the PREAMBLE, not this refusal — it went red on a correct brief and would have gone
+    # green on a brief that refused for the wrong reason. The branch refusal is identified by its
+    # own sentence (and the loop-neutralising line it must carry), which is what this asserts.
     plain = pr.brief(_pr(13), "fix-ci", "python-ci-gate", [])
     assert plain.count("```") == 2
     # …and it is NOT REFUSED -- asserted by the refusal's own identity, never by a token scan over
     # text composed from sections this module does not own (see `refusal` above).
+    # ⛔ THE SAME TWO SENTENCES `origin/main` narrows to by hand (#3687 landed that narrowing as a
+    # drive-by on an unrelated ci-exemption lane), spelled ONCE as the constants the refused arm
+    # asserts, so the two halves cannot drift apart in either direction.
     assert refusal not in plain, "a PRINTABLE branch was refused: %r" % plain[:400]
     assert loop_neutraliser not in plain, (
         "a PRINTABLE branch carried a refused arm's loop-neutraliser: %r" % plain[:400])
     # ⛔ AND THE EFFECT, ASSERTED POSITIVELY: the refusal's effect is the ABSENCE of the push
     # command, so a normal branch must still carry one. A token scan could only ever say "the word
-    # is missing"; this says the arm rendered.
+    # is missing"; this says the arm rendered -- the half neither `origin/main` nor the pre-fix
+    # assertion could state, and the one that catches a brief that renders NO push command at all.
     assert "git push origin HEAD:refs/heads/fix/branch-13" in plain, (
         "the printable branch's push arm rendered no command: %r" % plain[-400:])
 
