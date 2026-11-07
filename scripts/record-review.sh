@@ -2444,7 +2444,7 @@ post_review_evidence_comment() { # <marker> <repo> <pr> -> 0 visible, 1 not
   have="$(command gh api "repos/$repo/issues/$pr/comments?per_page=100" --paginate \
     --jq '.[] | "\(.author_association)\u001f\(.body | gsub("[\u001e\u001f]"; ""))" + "\u001e"' 2>/dev/null)" || rc=$?
   if [ "$rc" -ne 0 ]; then
-    echo "⚠️ record-review: could not READ the PR comments (transient API failure?) — the #1224 evidence COMMENT was skipped. The signed record is unaffected. ⛔ This line makes NO CLAIM about the body marker: that is decided by the '⚠️ body-marker:' persist line above — where one appears, THAT attempt could not write the pending file; a later persist attempt may still have written it (this arm can make two). Re-run record-review.sh (idempotent) to retry the comment." >&2
+    echo "⚠️ record-review: could not READ the PR comments (transient API failure?) — the #1224 evidence COMMENT was skipped. The signed record is unaffected. ⛔ This line makes NO CLAIM about the body marker: whether a pending marker was persisted is reported by that persist attempt's own '⚠️ body-marker:' line, where one was printed — never here. Re-run record-review.sh (idempotent) to retry the comment." >&2
     return 1
   fi
   # Split per RECORD (0x1e), then split association from body (0x1f), and require
@@ -2474,7 +2474,7 @@ post_review_evidence_comment() { # <marker> <repo> <pr> -> 0 visible, 1 not
     echo "review evidence posted to $repo#$pr as a COMMENT (#1224: a later \`gh pr edit\` cannot wipe it, and unlike the per-box record it reaches CI)"
     return 0
   fi
-  echo "note: could not post the #1224 review-evidence comment (the signed record and the body marker are still saved)" >&2
+  echo "note: could not post the #1224 review-evidence comment (the signed record is still saved; this note makes NO CLAIM about the body marker — see the '⚠️ body-marker:' persist line, where one was printed)" >&2
   return 1
 }
 # ── BODY-MARKER DURABILITY (defect A) ─────────────────────────────────────

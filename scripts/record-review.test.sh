@@ -5489,6 +5489,20 @@ assert_not_contains "$RECORD_ERR" "and the body marker are unaffected" \
     "14.1d(i) …and NO line in the capture claims the body marker survived a failed persist"
 assert_contains "$RECORD_ERR" "This line makes NO CLAIM about the body marker" \
     "14.1d(i) …the comment-read failure instead defers to the persist line that decides it"
+# ⛔ THE SAME CLASS AT THE COMMENT-**POST** SITE (#3712 review round 4, P2):
+# the read arm's sibling note ("could not post the #1224 review-evidence comment")
+# asserted "the signed record AND THE BODY MARKER are still saved". With the persist
+# already failed that is false — the marker is on no channel — so it now defers too.
+# It is a SEPARATE site from the READ failure above, and no vector drove it with a
+# failed persist, so the invariant the two assertions above describe was stated more
+# broadly than it was enforced. This vector closes that gap.
+PERSIST_PR3=424364
+STUB_BODY_FAIL=1 STUB_BODY_FAIL_TEXT='gh: Not Found (HTTP 404)' STUB_COMMENT_POST_FAIL=1 \
+    run_record_633 "$PERSIST_PR3" "$SHA" "$DC_CRUNS"
+assert_not_contains "$RECORD_ERR" "the body marker are still saved" \
+    "14.1d(i) …nor does the comment-POST note claim the body marker survived a failed persist"
+assert_contains "$RECORD_ERR" "this note makes NO CLAIM about the body marker" \
+    "14.1d(i) …it defers to the persist line instead, so no line in this capture asserts the marker is saved"
 rm -f "$PEND_CONF_DIR/pending"
 mkdir -p "$PEND_CONF_DIR/pending"   # restore the real directory for later vectors
 
