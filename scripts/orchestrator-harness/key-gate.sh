@@ -1156,12 +1156,24 @@ if sys.argv[2] == "compose":
             host, port = hostport, ""
         if not host:
             return False
-        if re.search(r"[\s\x00-\x1f<>^|\[\]]", host):
-            # every C0 control is a forbidden host code point (`\t\n\r` were already REMOVED above, as the parser
-            # removes them, so this class cannot refuse a box that parses), and so is a stray `[`/`]`
-            # (`https://o[/v1` and `https://h\x00/v1` both throw, measured).
-            return False
-        if re.search(r"%(?![0-9A-Fa-f]{2})", host):
+        # \u26d4 THE HOST IS CHECKED ON ITS **DECODED** FORM, AND THAT ONE CLASS IS THE WHOLE TEST (round 43, P2,
+        # measured). The `%` check above tests escape SYNTAX only, so `h%2Fost`, `h%00st`, `h%20st`, `h%25st`,
+        # `h%3Aost`, `h%5Bost` and `h%40ost` were accepted while node throws `ERR_INVALID_URL` on every one \u2014 the
+        # escape decodes to a code point the DOMAIN pipeline then rejects. Measured over all 256 `%XX` escapes: node
+        # PARSES 81 (`! " $ & \x27 ( ) * + , - .` digits, `; =` A-Z `_` a-z `{ } ~`) and THROWS the other 175, whose
+        # decoded forms are exactly the C0 range, space, `# % / : < > ? @ [ \\ ] ^ |` and DEL \u2014 so this class is the
+        # measured THROW set, not a guess, and it cannot refuse a host the parser accepts.
+        # \u26d4 IT IS APPLIED TO `decoded`, WHICH IS WHY THERE IS **ONE** CHECK HERE AND NO SEPARATE RAW CLASS OR
+        # ESCAPE-SYNTAX TEST (measured by mutation, and both were deleted for it): when the host carries no VALID
+        # escape, `decoded` IS the host, so a raw `\x00`/`\x7f`/`<`/`[` is caught here anyway \u2014 and a MALFORMED escape
+        # (`%zz`, `%2`) is left UNREPLACED by the substitution, so the `%` it still carries is itself in this class. Two
+        # overlapping checks meant a mutant removing one stayed GREEN, i.e. half the guard was unfalsifiable. One check,
+        # one mutant, one red arm \u2014 and the `%` in the class is what makes the syntax test unnecessary.
+        # \u26d4 NON-ASCII DECODED BYTES ARE DELIBERATELY LEFT ACCEPTED: `%C3%BC` decodes to a non-ASCII letter that the
+        # punycode stage may well accept, and refusing non-ASCII would false-block a valid IDN host \u2014 the residual
+        # stays a false PASS, which is the direction this gate may err in.
+        decoded = re.sub(r"%([0-9A-Fa-f]{2})", lambda mm: chr(int(mm.group(1), 16)), host)
+        if re.search(r"[\s\x00-\x1f\x7f#%/ :<>?@\[\]\\^|]", decoded):
             return False
         return _port_ok(port)
     def _buildable(v):

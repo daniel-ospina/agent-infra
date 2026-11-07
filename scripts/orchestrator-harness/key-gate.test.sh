@@ -913,15 +913,23 @@ hasnt "$OUT" "models-json-bad-gateway" "3z15y80 …and the URL reason never fire
 # host `gw.example` and port `8080`, so the authority ends at the backslash. Leaving it in reads `8080\foo` as the port
 # and refuses the box. ⛔ THE FIXTURE CARRIES A PORT FOR EXACTLY THAT REASON (measured): without one, both the fixed and
 # the unfixed code accept `https://gw.example\foo/v1` and the arm is VACUOUS — it was, until the port was added.
-# ⛔ THE FALSE PASSES (3z15y83-90): a `<`/`>`/`^`/`|` in the host, a `%` escape that is not two hex digits, a `form`
-# of userinfo with an EMPTY host, and a `\u00a0`-prefixed value are all `ERR_INVALID_URL` in node and were accepted here.
-# ⛔ MEASURED BY MUTATION, per arm: removing the tab/NL/CR strip reddens 81/82; removing `\\` from the authority split
-# and the leading lstrip reddens 91/92; dropping the forbidden-code-point class reddens 83/84; dropping the `%` check
-# reddens 87/88; dropping the empty-host test reddens 85/86; restoring python's `.strip()` (which eats `\u00a0`) reddens
-# 89/90. No arm here is vacuous — each was observed red under its own mutant.
+# ⛔ THE FALSE PASSES (3z15y83-96): a `<`/`>`/`^`/`|` in the host, a `%` escape that is not two hex digits or that
+# DECODES to a forbidden code point, a `form` of userinfo with an EMPTY host, a DEL (U+007F), and a `\u00a0`-prefixed
+# value are all `ERR_INVALID_URL` in node and were accepted here.
+# ⛔ MEASURED BY MUTATION, PER MUTANT, WITH THE OBSERVED ARM SET (not assumed — and one claim below was corrected by
+# running it): removing the tab/NL/CR strip reddens 81/82; removing `\\` from the authority split and the leading lstrip
+# reddens 91/92; dropping the empty-host test reddens 85/86; restoring python\x27s `.strip()` reddens 89/90; and dropping
+# the ONE decoded-host check reddens 48/49, 83/84, 87/88, 93/94 and 95/96 together. ⛔ THAT LAST SET IS THE HONEST
+# SHAPE OF THIS FIX: the raw-class and `%`-syntax checks that used to sit beside it were REDUNDANT (when the host
+# carries no valid escape the decoded form IS the host, and a malformed escape leaves the `%` this class already
+# rejects), and while both existed a mutant removing EITHER stayed GREEN — half the guard was unfalsifiable. They were
+# deleted, so one check now answers to one mutant, and `3z15y97/98` are the other direction: refusing every escape
+# (rather than only those that decode to a forbidden code point) reddens them, because `%41`/`%2E` are `A` and `.`,
+# which the parser accepts. No arm here is vacuous — each was observed red under its own mutant.
 # ⛔ THE RESIDUAL IS DECLARED, NOT HIDDEN: the IPV6 INTERIOR is not validated (`[zzz]`, `[:::]` throw in node and pass
-# here). A 9470-case fuzz against node measured ZERO false blocks and exactly 12 false passes, every one of them an
-# IPv6-literal interior — so the unemulated surface is a known, bounded false PASS and never a false BLOCK.
+# here), the IPv4-number rule and the IDNA/punycode pipeline, so the residual is a false PASS and never a false
+# BLOCK. Measured, not assumed: three independent fuzz passes against node (~72,000 generated authorities) found ZERO
+# false blocks, with every false pass on that unemulated surface.
 SP_TAB_JSON='{"providers":{"deepseek":{"baseUrl":"https://ho\tst/v1","models":[{"id":"deepseek-flash","api":"pi-messages"}]}}}'
 HSPTAB="$(mkhome spell_tab_authority "$SP_TAB_JSON")"
 OUT="$(run_gate "$HSPTAB" DEEPSEEK_API_KEY=dk KG_PROV=deepseek KG_MODEL=deepseek-flash)"; RC="$(printf '%s\n' "$OUT" | sed -n 's/^RC=//p' | head -1)"
@@ -958,6 +966,34 @@ OUT="$(run_gate "$HSPBS" DEEPSEEK_API_KEY=dk KG_PROV=deepseek KG_MODEL=deepseek-
 ck "3z15y91 a BACKSLASH ends the authority, PORT INCLUDED (rc=${RC:-none}) — it is a path separator, so the port is \`8080\` and the text after it is not" \
    "$([ "${RC:-0}" = "0" ] && echo 0 || echo 1)"
 hasnt "$OUT" "models-json-bad-gateway" "3z15y92 …so the text after it is never read as a port"
+# ── 3z15y93-98: A CODE POINT THE DOMAIN PIPELINE REJECTS, RAW OR PERCENT-DECODED ────────────────────
+# ⛔ MEASURED (round 43, P2): the host check tested a HAND-WRITTEN class and the `%` test looked at escape SYNTAX
+# only, so a DEL character and an escape that DECODES to a forbidden code point were both accepted while node
+# throws `ERR_INVALID_URL` on every one. Measured over all 256 `%XX` escapes: node PARSES 81 and THROWS 175, whose
+# decoded forms are exactly the C0 range, space, `# % / : < > ? @ [ \ ] ^ |` and DEL — so the decoded check is the
+# measured THROW set, not a guess.
+# ⛔ THE PAIR 3z15y97/98 IS THE FALSE-BLOCK GUARD: `%41` decodes to `A` and `%2E` to `.`, both of which node PARSES, so
+# a "refuse any escape" fix would false-block them. Each arm here was observed red under its own mutant: dropping DEL
+# reddens 93/94, dropping the decoded check reddens 95/96, refusing every escape reddens 97/98.
+SP_DEL_JSON='{"providers":{"deepseek":{"baseUrl":"https://ho\u007fst/v1","models":[{"id":"deepseek-flash","api":"pi-messages"}]}}}'
+HSPDEL="$(mkhome spell_del_host "$SP_DEL_JSON")"
+OUT="$(run_gate "$HSPDEL" DEEPSEEK_API_KEY=dk KG_PROV=deepseek KG_MODEL=deepseek-flash)"; RC="$(printf '%s\n' "$OUT" | sed -n 's/^RC=//p' | head -1)"
+ck "3z15y93 a DEL (U+007F) in the host REFUSES (rc=${RC:-none}) — it is a forbidden host code point" \
+   "$([ "${RC:-0}" = "82" ] && echo 0 || echo 1)"
+has "$OUT" "reason=models-json-bad-gateway" "3z15y94 …as the URL-level fact"
+SP_ESCDEC_JSON='{"providers":{"deepseek":{"baseUrl":"https://h%2Fost/v1","models":[{"id":"deepseek-flash","api":"pi-messages"}]}}}'
+HSPESC="$(mkhome spell_escaped_slash "$SP_ESCDEC_JSON")"
+OUT="$(run_gate "$HSPESC" DEEPSEEK_API_KEY=dk KG_PROV=deepseek KG_MODEL=deepseek-flash)"; RC="$(printf '%s\n' "$OUT" | sed -n 's/^RC=//p' | head -1)"
+ck "3z15y95 an escape that DECODES to a forbidden code point REFUSES (rc=${RC:-none}) — \`%2F\` is a slash the domain pipeline rejects" \
+   "$([ "${RC:-0}" = "82" ] && echo 0 || echo 1)"
+has "$OUT" "reason=models-json-bad-gateway" "3z15y96 …the same URL-level fact"
+SP_ESCOK_JSON='{"providers":{"deepseek":{"baseUrl":"https://h%41st%2Eexample/v1","models":[{"id":"deepseek-flash","api":"pi-messages"}]}}}'
+HSPESCOK="$(mkhome spell_escaped_ok "$SP_ESCOK_JSON")"
+OUT="$(run_gate "$HSPESCOK" DEEPSEEK_API_KEY=dk KG_PROV=deepseek KG_MODEL=deepseek-flash)"; RC="$(printf '%s\n' "$OUT" | sed -n 's/^RC=//p' | head -1)"
+ck "3z15y97 a DECODABLE escape is NOT refused (rc=${RC:-none}) — \`%41\`/\`%2E\` are \`A\` and \`.\`, which the parser accepts" \
+   "$([ "${RC:-0}" = "0" ] && echo 0 || echo 1)"
+hasnt "$OUT" "models-json-bad-gateway" "3z15y98 …so refusing every escape would be the false block this pair prevents"
+
 
 # `composeat <home> <provider> [<model>]` — the compose answer itself, because the DROPPED-provider warning only prints on
 # paths that do not return early: on a refusal the caller returns first, so a `hasnt models-json-provider-dropped` arm cannot
