@@ -248,25 +248,26 @@ is_transient_scratch() { # is_transient_scratch <path>
 # this whole family guards against.
 # ⛔ AND ONE MORE SHAPE THIS FILE USED TO MISS, MEASURED ON A CELL (agent-infra#3469 review P1). The
 # four prefix shapes above are the lane trees at a TEMPORARY ROOT; a CELL's lanes live one level deeper,
-# under the cell home: `scripts/orchestrator-harness/repo-slug.sh:486-487` calls
-# `git worktree add $HOME/wt-<slug>` "the fleet's OWN recipe" and measures 8 such trees under
-# `/tmp/cell-home/wt-*`. Those are lane scratch by this repo's own definition —
-# `scripts/pi-reap-worktrees.sh:680` ships `REAP_WT_SCRATCH_GLOB="wt-*|cell-wt-*"` and `:1249-1251`
-# applies it to the BASENAME of each `git worktree list` entry — so the prefix-only set left the guard
+# under the cell home: `scripts/orchestrator-harness/repo-slug.sh:486-487` RECORDS
+# `git worktree add $HOME/wt-<slug>` as "the fleet's OWN recipe" — and names its caller,
+# `scripts/lane-actions.py` — measuring 8 such trees under `/tmp/cell-home/wt-*`. Those are lane scratch
+# by this repo's own definition — `scripts/pi-reap-worktrees.sh:681` ships
+# `REAP_WT_SCRATCH_GLOB="wt-*|cell-wt-*"` and `is_scratch_path` (`:1250-1263`) applies it to the
+# BASENAME of each `git worktree list` entry — so the prefix-only set left the guard
 # inert on exactly the platform #3469 is about:
 # `--install` from `/tmp/cell-home/wt-<slug>` (candidate 1) was PINNED instead of skipped, so the pin
 # died with the lane, every tick recorded `no provisioner`, and the "can never ADD capacity" warning was
 # suppressed because a pin DID resolve — the inert enforcer, with a green install.
 # ⛔ `*/wt-?*/*` WAS THE FIRST ATTEMPT AND IT WAS TOO BROAD (agent-infra#3469 review, round 3). The rule
 # it claims to transcribe is a BASENAME rule applied to `git worktree list` entries —
-# `scripts/pi-reap-worktrees.sh:1249-1251` does `base="${1%/}"; base="${base##*/}"` — so a `wt-…`
+# `scripts/pi-reap-worktrees.sh:1252` does `base="${1%/}"; base="${base##*/}"` — so a `wt-…`
 # component anywhere in the path is NOT the same fact: `/srv/wt-prod/agent-infra/tools/…` is never reaped
 # by that pass, and classifying it as lane scratch would refuse a working configuration while telling its
 # operator to use "a durable path" they already have. So the shape is recognised by the FACT the reaper
 # actually keys on: the component IS a linked worktree. `git worktree add` writes a `.git` FILE at the
 # worktree root (never a directory — that marker is what distinguishes a linked tree from a clone), so an
 # ancestor named `wt-<slug>`/`cell-wt-<slug>` that carries one is exactly a tree the reaper will delete.
-# That covers the CELL recipe (`git worktree add $HOME/wt-<slug>`, `repo-slug.sh:486-487`) without
+# That covers the CELL recipe (`git worktree add $HOME/wt-<slug>`, recorded at `repo-slug.sh:486-487`) without
 # swallowing a durable directory that merely starts with those letters.
 is_lane_scratch() { # is_lane_scratch <path>
     local p="${1:-}" d
@@ -480,8 +481,10 @@ resolve_python() {
 # With no directive systemd's cwd is `/`, which kills the pass's `$PWD/tools/…` candidate, so the
 # install is the ONE moment the path can be measured (the operator is standing in a checkout that has
 # it). ⛔ WARNED, NOT REFUSED: a repair-only schedule is still worth having, and refusing would
-# make this installer unusable on the boxes it exists for (no cell carries that installer today —
-# measured on pi-cell-1). The consequence is named, not implied.
+# make this installer unusable on the boxes it exists for (no cell CARRIED that installer when this was
+# written — measured on pi-cell-1 — and shipping it is what makes candidate 1 resolve there, so the
+# warn-over-refuse argument stands on the repair-only case, not on the installer being absent forever).
+# The consequence is named, not implied.
 PROVISIONER=""
 PROVISIONER_WHY="no tools/install-ci-runner-x64.sh at any candidate"
 resolve_provisioner() {

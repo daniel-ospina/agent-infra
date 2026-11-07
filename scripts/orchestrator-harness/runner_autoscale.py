@@ -1362,8 +1362,9 @@ def resolve_labels(
 ) -> str:
     """The ONE place a label set is decided: what the runner already carries, then the floor.
 
-    This mirrors `tools/install-ci-runner-x64.sh::resolve_labels` (the one registration path)
-    instead of inventing a second rule, and it is `auto`: the gate's state is the source of
+    This mirrors the pool tool's registration rule — `scripts/ci_runner_pool.sh::add`, whose label
+    wall is `POOL_LABEL_X64`/`RUNNER_LABELS` (`ci_runner_pool.sh:263`/`:1629`) — instead of inventing a
+    second rule, and it is `auto`: the gate's state is the source of
     truth, so a runner never acquires a permanent claim on the pool. An unknown architecture
     RAISES — `self-hosted`/`Linux`/`<ARCH>` are host-derived and may not be set, so there is no
     safe default to fall back to.

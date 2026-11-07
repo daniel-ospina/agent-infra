@@ -442,7 +442,8 @@ assert_contains "$OUT" "PROVISIONER=$WT2/inst.sh" "…and that refusal names the
 # against a prefix-only predicate and prove nothing about the deployment.
 # ⛔ THE FIXTURE IS A REAL LINKED WORKTREE, NOT MERELY A DIRECTORY WITH THE RIGHT NAME: the predicate
 # keys on the `.git` FILE `git worktree add` writes, because that is the fact `pi-reap-worktrees.sh`
-# actually reaps on (`:1249-1251` applies its glob to the basename of each `git worktree list` entry).
+# actually reaps on (`is_scratch_path`, `:1250-1263`, applies its glob to the basename of each `git
+# worktree list` entry).
 CW="$T/cellfixture/wt-9307"; mkdir -p "$CW"
 printf 'gitdir: /somewhere/.git/worktrees/wt-9307\n' >"$CW/.git"
 printf '#!/bin/sh\n' >"$CW/inst.sh"; chmod +x "$CW/inst.sh"
