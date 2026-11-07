@@ -49,6 +49,10 @@ Environment=REAP_WT_GH_TIMEOUT=120
 # surplus copies of the same runner install). Pinned for the same reason as the three above.
 Environment=ABANDONED_WT_REAPER={{REAPER_DIR}}/reap-abandoned-worktrees.sh
 Environment=DUP_INSTALL_REAPER={{REAPER_DIR}}/reap-duplicate-installs.sh
+# The runner `_work` sink: 19 G of dead job checkout on a box at 98% (2026-10-28). Pinned for the
+# same reason as the owners above — and this class is the one with no pre-existing policy owner,
+# so a pin that resolved to an older farmed copy would run a DIFFERENT delete rule.
+Environment=RUNNER_WORK_REAPER={{REAPER_DIR}}/reap-runner-work.sh
 # Never compete with a lane for CPU or I/O: the pass is a background sweep, not a deadline.
 Nice=10
 IOSchedulingClass=idle
