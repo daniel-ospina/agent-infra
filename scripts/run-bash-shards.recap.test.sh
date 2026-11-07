@@ -24,6 +24,26 @@
 #   as reached; (d) the exit status is 1 — an interrupted run must never read green.
 # ARM 2 — HAPPY PATH. A COMPLETE run prints the recap WITHOUT the marker. Without this arm the trap
 #   could fire on every run and arm 1 would still pass, making the marker noise.
+# ARM 3 — THE OUTER JOB'S SLICE MUST NOT REACH THE FIXTURE (#3452). `ci.yml`'s `bash-suites` matrix
+#   exports `BASH_SHARD_SLICE=<i>/<n>` for the WHOLE step, so every shard it runs inherits it — and
+#   this suite's subject is the runner's WHOLE-LIST recap over a THREE-shard fixture list. Inherited,
+#   a slice of 8 over 3 entries has nothing to run and the runner refuses (rc 2), so this shard
+#   reddens on EVERY PR in the sharded lane while it is green on unsharded `main` — a red no diff
+#   can cause. The suite therefore runs its fixtures unsliced (stated, never silent), and this arm
+#   is the MUTATION control pinning the HAZARD and the runner's refusal contract: the same fixture
+#   WITH the slice must still refuse with the runner's own message, so a changed refusal wording, a
+#   changed rc, or a weakened runner reds it. The drop above clears the runner's WHOLE env contract
+#   (`BASH_SHARD_SLICE`, `BASH_SHARDS_BUDGET_SECS`, `SHARD_BOUND`) because the two lanes export
+#   DIFFERENT knobs for the same runner and would otherwise each leak — see the block at the `unset`.
+#   ⛔ WHAT THIS ARM DOES NOT PIN, stated so nobody reads it as more than it is: it sets its own
+#   slice, so it is independent of the `unset` above and CANNOT see the mitigation disappear. That
+#   is measured, not assumed — delete the `unset` and an UNSLICED run is still green, while the
+#   SLICED run (the CI shape) reds 9 arms. So the discrimination is the sliced lane's, and a box
+#   that only ever runs unsliced cannot see it. Pinning the `unset` itself needs a hermetic-probe
+#   mutant — the pattern `tests/run-bash-shards-bound/run.sh` §0 already uses (it strips its own
+#   `unset` into a copy and requires the probe to then see the leaked value). That is not built
+#   here because it needs a probe mode this suite does not have, and a self-copying mutant without
+#   one recurses; it is the follow-up, not a claim of coverage.
 #
 # THE CONSUMERS of the marker are pinned next door, in `scripts/ci-failure-set.truncated.test.sh`:
 # `ci_exemption.py` must answer such a capture with UNPROVEN (no ids), and `ci-failure-set.sh` must
@@ -52,6 +72,42 @@ FAIL=0
 ok()  { PASS=$((PASS + 1)); printf '  ✅ %s\n' "$1"; }
 bad() { FAIL=$((FAIL + 1)); printf '  ❌ %s\n' "$1"; }
 
+# ⛔ THE FIXTURE'S LIST IS NOT THE JOB'S LIST (#3452). A slice is a MATRIX concern of the job that
+# owns the REAL list — `run-bash-shards.sh`'s own words — and it has no meaning inside a fixture
+# whose list is three entries long. Dropped here, PRINTED so a lane reading the job log can see the
+# value was dropped on purpose instead of wondering why a slice did nothing.
+#
+# ⛔ AND IT IS NOT THE ONLY NAME THAT LEAKS — this line clears the runner's WHOLE env contract,
+# not just the one that reddened first (review of this change, cycle 2, P1). The two lanes export
+# DIFFERENT knobs for the SAME runner: `ci.yml`'s `bash-suites` exports `BASH_SHARD_SLICE`, and
+# `ci-main.yml`'s `script-validate` exports `BASH_SHARDS_BUDGET_SECS: '7800'` for the whole step, so
+# every shard inherits it on main's lane too (`shard_run_bounded` hands a shard its environment
+# unchanged). TWO of the three are knobs a lane really exports, and each is a refusal waiting to
+# happen; the third is cleared so the suite is hermetic to the CONTRACT, not to today's two names:
+#   * a POSITIVE budget and a slice do not compose — the runner refuses the pair BY NAME, so an
+#     inherited budget makes a sliced ARM 3 meet THAT refusal instead of the slice one it pins. On
+#     the pre-fix head (`9b7ed763`, no `env -u` on the child) that reddened ARM 3 on main's lane:
+#     `PASS 12 · FAIL 1` with only `BASH_SHARDS_BUDGET_SECS=7800` inherited.
+#   * a SET-but-EMPTY budget is REFUSED by the runner as a missing value, not read as "no deadline".
+#     Hence the test below is PRESENCE (`+set`), never non-emptiness — but for the NOTICE's sake,
+#     not the runner's: the `unset` is unconditional, so the value is dropped under either spelling
+#     and that refusal never happens here whatever the test says. What `:-` would cost is the
+#     SIGNAL: a set-but-empty inherited value would be dropped with nothing printed, and this
+#     notice is the only evidence a lane has that the drop happened at all.
+#   * `SHARD_BOUND` is the third name in the runner's contract. NO lane exports it today — `grep -rn
+#     SHARD_BOUND .github/` finds nothing — so this is contract hygiene rather than a leak anyone
+#     currently causes, and it is cleared for that reason alone.
+# TWO CLEARANCES, ON PURPOSE, and both remove the leaked budget before ARM 3's child starts: this
+# `unset`, and the `env -u` on that child. The `env -u` is what makes the arm answer ONE variable;
+# it is not the only thing standing between the budget and the arm, and this comment must not be
+# read as claiming it is. `tests/run-bash-shards-bound/run.sh` §0 clears the identical set;
+# `tests/ci-lane-parity/run.sh` uses this same `env -u` spelling per invocation (e.g. `:998`,
+# `:1661`) — two different files, cited separately on purpose.
+if [ "${BASH_SHARD_SLICE+set}" = set ] || [ "${BASH_SHARDS_BUDGET_SECS+set}" = set ] || [ "${SHARD_BOUND+set}" = set ]; then
+  echo "  · inherited runner config dropped for the fixtures — BASH_SHARD_SLICE='${BASH_SHARD_SLICE-<unset>}' BASH_SHARDS_BUDGET_SECS='${BASH_SHARDS_BUDGET_SECS-<unset>}' SHARD_BOUND='${SHARD_BOUND-<unset>}'. They are the OUTER job's, over the REAL list; the fixture's 3-shard list is not that list, so the fixtures run with none of them set (#3452; ARM 3 pins the HAZARD and the runner's refusal, NOT this drop — see the header). A bare dash (not colon-dash) is used in this echo for the same reason the test above is +set: a SET-but-EMPTY value must print as '' and an ABSENT one as <unset>, or the two are indistinguishable in the log this notice exists for."
+fi
+unset SHARD_BOUND BASH_SHARDS_BUDGET_SECS BASH_SHARD_SLICE
+
 # ⛔ THE FIXTURE MUST NOT ASK THE HOST'S PROCESS TABLE ANYTHING (#3011): a copy of the runner calls
 # `fixture_guard_placement` with the DEFAULT root set, so on a box with a live cell controller the
 # copy would exit 78 and this suite's verdict would depend on the machine. An explicit EMPTY value
@@ -66,6 +122,10 @@ TMP="$(mktemp -d "${TMPDIR:-/tmp}/shard-recap.XXXXXX")" || {
 trap 'rm -rf "$TMP"' EXIT
 
 # narrow_runner <out> — the SHIPPED runner with its ONE data list narrowed to the fixture's shards.
+# SLICE_CONTROL — the value ARM 3 hands the fixture: index 5 of 8 over a 3-shard list, i.e. a slice
+# with nothing to run. That is exactly what a real `bash-suites (<n>)` job exports.
+SLICE_CONTROL="5/8"
+
 narrow_runner() {
   awk '
     /^SUITE_GLOBS=\($/ { print "SUITE_GLOBS=( \"shards/*.test.sh\" )"; skip = 1; next }
@@ -116,8 +176,33 @@ rm -f "$SLOW_SHARD_MARKER"
 # `kill -TERM -<pid>` reaches the RUNNER *and* the shard it waits on. Bash defers a trap until the
 # foreground child finishes, so signalling the runner alone would print the recap only after the
 # shard returned — an hour later on the real job. GitHub terminates the process GROUP on a timeout.
+# ⛔ THE FIXTURE MUST NOT INHERIT THE CALLER'S DISPATCH DECISION — and this `env -u` is the half of
+# that contract which sits at the SPAWN SITE. `run-bash-shards.sh` scrubs the identical three names at
+# its own `shard_exec` (:926), but that guard protects a shard the RUNNER spawns; it cannot reach the
+# runner when a TEST spawns it, and this suite spawns `runner-narrow.sh` DIRECTLY. The narrowed list is
+# THREE shards, so a child handed the outer job's slice REFUSES — `❌ BASH_SHARD_SLICE asks for 8
+# slice(s) of 3 listed shard(s)` (run-bash-shards.sh:432, rc 2) — and every arm below would then read a
+# refusal as if it were a recap. `env -u` (not `unset`) is the contract, and it keeps `$!` equal to the
+# runner's pid because `env` execs in place — a wrapper subshell would reintroduce the pid-vs-pgid
+# ambiguity :907-925 documents.
+#
+# ⛔ WHAT THIS GUARD IS **NOT**, stated so the comment is not over-read: it is NOT claiming that CI's
+# `bash-suites` lane leaks today — it does not, and it is covered twice over. `bash-suites` exports
+# `BASH_SHARD_SLICE=<i>/<n>` for the whole step (`.github/workflows/ci.yml:1384`), but every SHARD is
+# already scrubbed by `shard_exec` before this file runs, and the script-wide `unset` in the notice
+# block above (#3452) drops it again for everything below. Both halves are MUTUALLY SUFFICIENT —
+# measured on the merged tree with `BASH_SHARD_SLICE=5/8`, the value a real `bash-suites (<n>)` job
+# hands its shards:
+#   · `unset` KEPT,   `env -u` REMOVED  ->  PASS 13 · FAIL 0   (#3452 alone covers the CI lane)
+#   · `unset` REMOVED, `env -u` KEPT    ->  PASS 13 · FAIL 0   (this guard alone is sufficient here)
+#   · BOTH removed                      ->  PASS  4 · FAIL 9   (the leak, reproduced — the hazard is real)
+# So what this buys is defence in depth at the one seat the runner's guard cannot reach: the leak
+# re-opens at these two sites if that `unset` ever moves or is deleted, and a DIRECT invocation (a
+# repro shell that exports the slice and runs THIS FILE rather than the runner) relies on this guard
+# alone.
 set -m
-bash "$KILLED/scripts/runner-narrow.sh" >"$TMP/killed.out" 2>&1 &
+env -u BASH_SHARD_SLICE -u BASH_SHARDS_BUDGET_SECS -u SHARD_BOUND \
+  bash "$KILLED/scripts/runner-narrow.sh" >"$TMP/killed.out" 2>&1 &
 kpid=$!
 set +m
 
@@ -201,7 +286,12 @@ if ! build_fixture "$COMPLETE" fast; then
   echo "❌ run-bash-shards.recap: cannot build the fixture — refusing to report"
   exit 2
 fi
-bash "$COMPLETE/scripts/runner-narrow.sh" >"$TMP/complete.out" 2>&1
+# The same spawn-site contract as ARM 1's child above — see the ⛔ note in the ARM 1 section for what
+# it is and is not. (Deliberately NOT a line number, here or in that note: a same-file pin drifts on
+# every edit above it, and this comment's own first draft carried one that had already gone stale.)
+# Kept inline for the same reason: `env` execs in place, so `$?` is the runner's own status.
+env -u BASH_SHARD_SLICE -u BASH_SHARDS_BUDGET_SECS -u SHARD_BOUND \
+  bash "$COMPLETE/scripts/runner-narrow.sh" >"$TMP/complete.out" 2>&1
 CRC=$?
 COUT="$(cat "$TMP/complete.out" 2>/dev/null)"
 
@@ -219,6 +309,24 @@ if grep -q 'RECAP INCOMPLETE' <<<"$COUT"; then
   bad "the incomplete marker FIRED ON THE HAPPY PATH — a marker that is always present is not a signal"
 else
   ok "the incomplete marker does NOT fire on the happy path (so its presence MEANS something)"
+fi
+
+# ARM 3 — THE MUTATION CONTROL (#3452). Hand the SAME fixture the outer job's slice and the runner
+# must refuse: that is the red this suite shipped in the sharded lane, and this arm is what keeps
+# the mitigation above from being deleted as unexplained noise. ⛔ ONE VARIABLE IS ISOLATED ON
+# PURPOSE: the other two runner knobs are `env -u`n out of the child, because `BASH_SHARDS_BUDGET_SECS`
+# plus a slice is a DIFFERENT refusal (a positive budget and a slice do not compose) and would satisfy
+# this arm's `rc 2` for the wrong reason, or fail it for a reason that is not the one asserted.
+BASH_SHARD_SLICE="$SLICE_CONTROL" env -u BASH_SHARDS_BUDGET_SECS -u SHARD_BOUND bash "$COMPLETE/scripts/runner-narrow.sh" >"$TMP/sliced.out" 2>&1
+SRC=$?
+SOUT="$(cat "$TMP/sliced.out" 2>/dev/null)"
+# The refusal's count is DERIVED from SLICE_CONTROL, never re-typed: a literal here would let the
+# control drift away from the value it claims to describe and still pass.
+SLICE_COUNT="${SLICE_CONTROL##*/}"
+if [ "$SRC" -eq 2 ] && grep -q "asks for $SLICE_COUNT slice(s) of 3 listed shard(s)" <<<"$SOUT"; then
+  ok "(mutation) the SAME fixture WITH BASH_SHARD_SLICE=$SLICE_CONTROL REFUSES (rc 2) — the hazard the fixtures are protected from is real"
+else
+  bad "(mutation) a sliced fixture run exited $SRC and did not name the slice refusal — the fixtures' isolation would then be described by nothing: $(tr '\n' '|' <<<"$SOUT" | cut -c1-300)"
 fi
 
 echo ""
