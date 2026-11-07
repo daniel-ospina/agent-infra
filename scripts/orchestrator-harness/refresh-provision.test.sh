@@ -1119,6 +1119,49 @@ else
   bad "(g7) the real refresh_cause_brief could not be extracted from $LOOP — the beat's cut is ungraded"
 fi
 
+# ── (g8) THE EVIDENCE TAKE IS BOUNDED (#3701 round 4, P2) ─────────────────────────────────────────
+# ⛔ `GH_PROBE_CAUSE_MAX` is the ONLY bound on the stderr take, and NOTHING exercised it: deleting the
+# truncation left this suite green. `why=` is a single-line key in a file every beat reads, and a
+# `--paginate` refusal can replay a whole error body into it — so an unexercised cap is a bound nobody
+# would notice disappearing. The row fails three independent ways when the cap goes: the length, the
+# marker, and the tail.
+LONGNOTE="$(printf 'A%.0s' $(seq 1 1000))TAILMARKER"
+mk_case gh_cap
+mk_gh_budget_stub "$D" 1 "$LONGNOTE"
+rp "$D"
+GC_WHY="$(rec why)"
+ck "(g8) a 1000-character stderr does not reach the record unbounded (why len=${#GC_WHY})" \
+   "$([ "${#GC_WHY}" -lt 700 ]; echo $?)"
+ck "(g8) …and the take is closed with the ASCII marker, so the cut is visible" \
+   "$(case "$GC_WHY" in *'...'*) echo 0 ;; *) echo 1 ;; esac)"
+ck "(g8) …and the head of the refusal survives the cut" \
+   "$(case "$GC_WHY" in *'AAAA'*) echo 0 ;; *) echo 1 ;; esac)"
+ck "(g8) …and the tail beyond the cap is NOT in the record" \
+   "$(case "$GC_WHY" in *'TAILMARKER'*) echo 1 ;; *) echo 0 ;; esac)"
+
+# ── (g9) THE DEFAULT SHAPE CARRIES ITS EVIDENCE (#3701 round 4, P2) ────────────────────────────────
+# Both TIMEOUT arms compute the captured stderr and print it to the LOG only. At default knobs the
+# rate-limit timeout is the shape that actually fires (this probe bounds at 20 s; the shim sleeps
+# 120 s before returning 75), so on the ordinary path the record named no gh-layer line at all — the
+# second half of the acceptance bullet. The stub writes its stderr BEFORE it sleeps: a stub killed
+# mid-sleep has written nothing, so only this ordering leaves a capture to carry.
+mk_case gh_bound_evidence
+cat > "$D/bin/gh" <<'SH'
+#!/bin/bash
+case "$1 $2" in
+  "auth token") exit 0 ;;
+  *) printf 'gh: connection reset by peer\n' >&2; sleep 5; exit 1 ;;
+esac
+SH
+chmod +x "$D/bin/gh"
+rp "$D" "" GH_PROBE_TIMEOUT=1
+GBE_WHY="$(rec why)"
+ck "(g9) a probe killed by its own bound is TRANSIENT (rc=$RC)" "$([ "$RC" -eq 1 ]; echo $?)"
+ck "(g9) …and the RECORD carries the captured stderr, not just the log" \
+   "$(case "$GBE_WHY" in *'connection reset by peer'*) echo 0 ;; *) echo 1 ;; esac)"
+ck "(g9) …and the VERDICT still leads the evidence, so the beat can never cut it" \
+   "$(case "$GBE_WHY" in *'NON-ANSWER'*'evidence='*) echo 0 ;; *) echo 1 ;; esac)"
+
 # ── (h5) THE FOURTH COPY OF THE ACCEPT LIST MUST NOT DRIFT ────────────────────────────────────────
 # ⛔ THE DRIFT THIS PINS WAS LIVE (review of #3188, P2). The predicate has FOUR copies: three here
 # (the REPO-set arm, the candidate loop, and `_pair`'s cause classifier) and a fourth in

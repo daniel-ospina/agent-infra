@@ -1072,7 +1072,13 @@ gh_probe_env() {
     gh_probe_bounded "$GH_PROBE_TIMEOUT" gh auth token; prc=$?
     terr="$( [ -n "$GH_PROBE_ERR" ] && sed -n '1,4p' "$GH_PROBE_ERR" 2>/dev/null )"
     if gh_probe_timed_out "$prc"; then
-      GH_PROBE_CAUSE="answer=UNKNOWN — the probe did not answer within ${GH_PROBE_TIMEOUT}s (rc=$prc), so this is a NON-ANSWER, not an absence and not a rejected credential; question=is a gh credential STORED here (gh auth token)"
+      # ⛔ THE EVIDENCE RIDES ALONG HERE TOO (#3701 round 4, P2). This arm computed `terr` and printed
+      # it to the LOG only, while the fix line below names a hung credential helper as the usual
+      # cause — a diagnosis the reader of the RECORD could not reach. Same ordering as every other
+      # arm: the VERDICT leads (it is fixed-size and names the precondition, so the beat must never
+      # cut it) and the EVIDENCE closes (variable-length, and whole in the record). `rc=` is no longer
+      # repeated in the answer text, because `gh_probe_evidence` already prefixes it.
+      GH_PROBE_CAUSE="answer=UNKNOWN — the probe did not answer within ${GH_PROBE_TIMEOUT}s, so this is a NON-ANSWER, not an absence and not a rejected credential; question=is a gh credential STORED here (gh auth token); evidence=$(gh_probe_evidence "$prc")"
       echo "[refresh] TRANSIENT: gh credential PRESENCE UNKNOWN — 'gh auth token' did not answer within ${GH_PROBE_TIMEOUT}s in the environment the pre-flight runs in (HOME=$HOME), so whether a credential is stored here CANNOT BE VERIFIED from this box (rc=$prc). This is NOT 'no credential': a probe that cannot answer is a fact about the probe, not about the credential, and it is retried next cycle instead of latching the permanent MERGE-ONLY marker (#1736, TOKEN_HANG_FIX)"
       printf '%s\n' "$terr" | sed -n '1,2p' | sed 's/^/[refresh]   /'
       echo "[refresh]   fix: put the token in the cell's environment (GH_TOKEN/GITHUB_TOKEN) so presence needs no gh call at all, or raise GH_PROBE_TIMEOUT (now ${GH_PROBE_TIMEOUT}s) if this box's credential store is merely slow; a hung credential helper (gpg/keyring with no tty) is the usual cause"
@@ -1103,7 +1109,10 @@ gh_probe_env() {
     # settings the shim spends 120 s sleeping out a shared throttle window before it ever returns 75,
     # so a probe bounded at 20 s sees THIS arm — and "a shared budget is being slept out" is one of
     # the things a bound here can mean. It establishes a NON-ANSWER, nothing more.
-    GH_PROBE_CAUSE="answer=NO — the probe did not answer within ${GH_PROBE_TIMEOUT}s (rc=$prc): a NON-ANSWER, which establishes neither a rejected credential nor anything about the budget; question=can the stored credential answer at all (gh api rate_limit, source=$presence)"
+    # ⛔ AND IT CARRIES ITS EVIDENCE (#3701 round 4, P2) — this is the DEFAULT shape at default knobs,
+    # so leaving `err` in the LOG only meant the record on the ordinary path carried no gh-layer line
+    # at all, which is the second half of the acceptance bullet. Verdict leads, evidence closes.
+    GH_PROBE_CAUSE="answer=NO — the probe did not answer within ${GH_PROBE_TIMEOUT}s: a NON-ANSWER, which establishes neither a rejected credential nor anything about the budget; question=can the stored credential answer at all (gh api rate_limit, source=$presence); evidence=$(gh_probe_evidence "$prc")"
     echo "[refresh] TRANSIENT: the gh credential is present (source=$presence) but 'gh api rate_limit' did not answer within ${GH_PROBE_TIMEOUT}s (rc=$prc) in the environment the pre-flight runs in (HOME=$HOME) — a probe that cannot answer is an OUTAGE, not a rejected credential, so this is retried next cycle instead of latching the permanent MERGE-ONLY marker (#1736, TOKEN_HANG_FIX)"
     printf '%s\n' "$err" | sed -n '1,2p' | sed 's/^/[refresh]   /'
     gh_probe_err_cleanup
