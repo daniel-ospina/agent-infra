@@ -311,7 +311,18 @@ key=value surface agrees with the exit code; the recorded values are kept beside
 own key — `detail=` follows `status=`, which is why the rule is per-key, not "derived keys end the
 stream"). Neither emitted key can contain the substring `status=ok`, so even a `grep 'status=ok'`
 consumer cannot read green off a record this run judged stale — the same polarity
-`disk-reaper.sh --print-status` prints. Two clocks it refuses to
+`disk-reaper.sh --print-status` prints. That holds for the record VALUES too, not only for the keys the
+reader builds: `recorded=`, `recorded_rc=` and the `detail=` it derives from an unreadable `ts=` are
+passed through one redacting sink, so a corrupt record whose status or timestamp reads `status=ok` is
+printed as `status=<redacted>` while the exit code and the derived verdict stand. This holds on **both
+channels** — the reason string is built and redacted once and every surface prints that variable, so
+`--print-status 2>&1 | grep 'status=ok'` cannot read green either; the first cut of this fix redacted
+only stdout, and the same value reached stderr through the refusal message. The derived `status=ok` is
+deliberately exempt — when the record really is fresh and ok, that IS the answer. Two limits, stated
+rather than implied: the record **path** (`$STATUS_FILE`, from `WIP_SWEEP_STATE_DIR`) is printed
+verbatim because it is where the record lives, not a value a corrupt record supplies; and a reader
+that is handed a malformed **argument** still exits 2 without a record surface at all. Two
+clocks it refuses to
 judge: a `ts=` that is missing or unreadable (an uncomputable age is not freshness), and a `ts=` in the
 FUTURE (a clock step backwards — VM restore, NTP, a cell re-image — would otherwise disable the
 staleness test for the whole skew).

@@ -612,6 +612,72 @@ if grep -q 'status=ok' <<<"$OST2"; then
 else
   ok "I7e no passthrough line CONTAINS status=ok either (the pass-through is part of the guarantee)"
 fi
+# ⛔ AND THE ECHOED VALUES ARE THE SAME GUARANTEE ONE KEY OVER (review finding, round 9). The filter
+# behind I7e drops record LINES; `recorded=`, `recorded_rc=` and the `detail=` derived from an
+# unreadable `ts=` print record VALUES, which never pass through it. Measured on the pre-fix reader: a
+# stale record reading `status=note status=ok` printed `recorded=note status=ok` while exiting 3, and
+# `ts=status=ok` reached the surface inside the reader's OWN detail line. Values are REDACTED now, so
+# the audit trail survives instead of the line vanishing.
+mkdir -p "$T/state-xval1" "$T/state-xval2" "$T/state-xval3"
+printf 'status=note status=ok\nrc=3\nts=1\ndetail=x\n' > "$T/state-xval1/wip-sweep.status"
+OST3="$(WIP_SWEEP_STATE_DIR="$T/state-xval1" bash "$SW" --print-status 2>&1)"; RC=$?
+[ "$RC" -eq 3 ] && ok "I7f a record whose STATUS VALUE carries status=ok still answers 3" \
+                || bad "I7f answered $RC (want 3)"
+if grep -q 'status=ok' <<<"$OST3"; then
+  bad "I7f2 a raw record VALUE still CONTAINS status=ok — a grep consumer reads green"
+else
+  ok "I7f2 a raw record VALUE cannot CONTAIN status=ok on ANY channel (recorded= redacted, fd2 too)"
+fi
+# ⛔ THE STDERR CHANNEL, AND THE FALLBACK REASON IN PARTICULAR (review finding, round 11). The first
+# version of this arm read the STALE fixture above (`ts=1`), whose reason is "the record is Ns old" —
+# it embeds NO record value, so fd 2 never carried `status=ok` for that record: the arm was GREEN over
+# the very defect it names, and a verifier proved it by reverting the redaction and watching the arm
+# stay green. The fixture that ACTUALLY leaks on fd 2 is the CATCH-ALL one — a judgeable record whose
+# `DERIVED_WHY` is empty, so the refusal quotes the record's own `recorded status='…' rc='…'` — and it
+# is the `recorded status='…'` fallback branch that needs its own arm. Fresh `ts=` on purpose.
+mkdir -p "$T/state-xval4"
+printf 'status=note status=ok\nrc=3\nts=%s\ndetail=x\n' "$(date -u '+%s')" \
+  > "$T/state-xval4/wip-sweep.status"
+OSTC="$(WIP_SWEEP_STATE_DIR="$T/state-xval4" bash "$SW" --print-status 2>&1)"; RC=$?
+[ "$RC" -eq 3 ] && ok "I7i a judgeable record with a poisoned status VALUE answers 3" \
+                || bad "I7i answered $RC (want 3)"
+if grep -q 'status=ok' <<<"$OSTC"; then
+  bad "I7i2 the catch-all refusal still quotes a RAW record value — the combined surface reads green"
+else
+  ok "I7i2 the catch-all refusal quotes a REDACTED value (this branch was unarmed before)"
+fi
+SERR="$(WIP_SWEEP_STATE_DIR="$T/state-xval4" bash "$SW" --print-status 2>&1 >/dev/null)"
+if grep -q 'status=ok' <<<"$SERR"; then
+  bad "I7f3 the STDERR channel still carries status=ok off a corrupt record"
+else
+  ok "I7f3 the STDERR channel is redacted too — fd 2 cannot read green either"
+fi
+printf 'status=failed\nrc=3\nts=status=ok\ndetail=x\n' > "$T/state-xval2/wip-sweep.status"
+OST4="$(WIP_SWEEP_STATE_DIR="$T/state-xval2" bash "$SW" --print-status 2>&1)"; RC=$?
+[ "$RC" -eq 3 ] && ok "I7g a record whose ts= carries status=ok still answers 3" \
+                || bad "I7g answered $RC (want 3)"
+if grep -q 'status=ok' <<<"$OST4"; then
+  bad "I7g2 the reader's OWN detail= echoed status=ok from an unreadable ts="
+else
+  ok "I7g2 the reader's own detail= is redacted too (a raw ts= never reaches the surface, fd1 or fd2)"
+fi
+# ⛔ AND THE REDACTION MUST NOT EAT A TRUE GREEN. A genuine `status=ok` is the reader's VERDICT and has
+# to survive; only values that merely QUOTE the substring are redacted.
+printf 'status=ok\nrc=status=ok\nts=%s\ndetail=none\n' "$(date -u '+%s')" \
+  > "$T/state-xval3/wip-sweep.status"
+OST5="$(WIP_SWEEP_STATE_DIR="$T/state-xval3" bash "$SW" --print-status 2>/dev/null)"; RC=$?
+[ "$RC" -eq 0 ] && ok "I7h a true-ok record with a poisoned rc= still answers 0" \
+                || bad "I7h answered $RC (want 0)"
+if grep -q 'recorded_rc=status=ok' <<<"$OST5"; then
+  bad "I7h2 recorded_rc= echoed status=ok raw"
+else
+  ok "I7h2 recorded_rc= is redacted while the record is otherwise still ok"
+fi
+if grep -q '^status=ok$' <<<"$OST5"; then
+  ok "I7h3 and the DERIVED status=ok IS still printed — redaction never eats a true green"
+else
+  bad "I7h3 a TRUE green lost its status=ok: $OST5"
+fi
 OST_RC="$(sed -n 's/^rc=//p' <<<"$OST" | tail -1)"
 [ "$OST_RC" = "3" ] \
   && ok "I7c the printed rc= is the DERIVED one (3), not the recorded rc of a stale pass" \

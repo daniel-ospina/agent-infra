@@ -141,6 +141,18 @@ refuse_startup() {
   exit "$1"
 }
 note() { echo "wip-sweep: $*" >&2; }
+# ⛔ ONE SINK FOR EVERY VALUE THAT CAME OUT OF THE RECORD (review finding, round 9). `--print-status`
+# must never put the substring `status=ok` on its surface except as its OWN derived verdict — that is
+# the whole point of emitting the derived pair LAST, and `docs/ops/wip-sweep.md` states it as a
+# guarantee. Round 8 closed the PASSTHROUGH lines; the VALUES the reader ECHOES (`recorded=`,
+# `recorded_rc=`, and an unreadable `ts=` quoted inside the reader's own `detail=`) still went out raw,
+# which is the same defect one key over. Measured on a stale record reading `status=note status=ok`:
+# `recorded=note status=ok` was printed while the script exited 3; and a record with `ts=status=ok`
+# printed it inside `detail=`. Values are REDACTED rather than dropped so the audit trail (what the
+# record actually said) survives on the surface; the untouched record is still on disk at $STATUS_FILE.
+# `${var//pat/rep}` is POSIX pattern substitution — bash 3.2 supports it, and `=` is literal in a
+# pattern, so no quoting tricks are needed. `status=<redacted>` cannot itself contain `status=ok`.
+redact() { printf '%s' "${1//status=ok/status=<redacted>}"; }
 
 usage() {
   sed -n '2,/^set -uo pipefail$/p' "${BASH_SOURCE[0]}" 2>/dev/null | sed -n 's/^# \{0,1\}//p'
@@ -518,17 +530,39 @@ if [ "$MODE" = status ]; then
   # than rewritten because dropping can only REMOVE green, never add it, and the record itself is still
   # on disk at $STATUS_FILE (the refusal below names that path). Arm I7e pins it.
   grep -v '^status=' "$STATUS_FILE" | grep -v '^rc=' | grep -v '^recorded' | grep -v 'status=ok'
-  printf 'recorded=%s\n' "${S_ST:-<none>}"
-  printf 'recorded_rc=%s\n' "${S_RC:-?}"
+  # ⛔ AND THE ECHOED VALUES ARE THE SAME GUARANTEE ONE KEY OVER (review finding, round 9). The filter
+  # above drops record LINES; these three lines print record VALUES, which never pass through it. Every
+  # raw value therefore goes through `redact` — the one sink defined beside `note()` at the top, above
+  # every call site — so `recorded=note status=ok` becomes `recorded=note status=<redacted>` and an
+  # unreadable `ts=status=ok` is redacted inside the reader's OWN `detail=` too. The DERIVED `status=`
+  # is printed UNREDACTED below, on purpose: a genuine `status=ok` is this reader's verdict and must
+  # survive (arms I7h/I7h3 pin both halves).
+  # ⛔ ONE REDACTED REASON, USED ON EVERY CHANNEL (review finding, round 10). Round 9 redacted the
+  # STDOUT sinks, and a verifier measured the hole that left: the SAME variables reach STDERR through
+  # the `err` calls below, so `--print-status 2>&1 | grep 'status=ok'` STILL read green off a record
+  # this run judged unjudgeable — the fd-2 mirror of the same defect. The arms could not see it because
+  # they captured stdout with `2>/dev/null`. The reason is therefore built ONCE and redacted ONCE here,
+  # and every channel prints THIS variable, so a future `err` cannot reintroduce the leak.
+  if [ -n "$DERIVED_WHY" ]; then
+    _WHY="$(redact "$DERIVED_WHY")"
+  else
+    _WHY="$(redact "recorded status='${S_ST:-<none>}' rc='${S_RC:-?}'")"
+  fi
+  printf 'recorded=%s\n' "$(redact "${S_ST:-<none>}")"
+  printf 'recorded_rc=%s\n' "$(redact "${S_RC:-?}")"
   printf 'rc=%s\n' "$_DERIVED_RC"
   printf 'status=%s\n' "$DERIVED"
-  [ -n "$DERIVED_WHY" ] && printf 'detail=%s\n' "$DERIVED_WHY"
+  [ -n "$DERIVED_WHY" ] && printf 'detail=%s\n' "$_WHY"
+  # NAMED RESIDUAL, stated so the doc does not claim more than the code does: `$STATUS_FILE` is the
+  # record PATH, not a record VALUE — it comes from `WIP_SWEEP_STATE_DIR`, is printed by design, and is
+  # NOT redacted (redacting it would mangle every message that names where the record lives). The
+  # guarantee is about what a corrupt RECORD can put on the surface, and that is fully covered.
   case "$DERIVED" in
     ok) exit 0 ;;
     incomplete) exit 1 ;;
     never) exit 3 ;;
-    stale) err "$DERIVED_WHY"; exit 3 ;;
-    *) err "the pass record at $STATUS_FILE cannot be judged (${DERIVED_WHY:-recorded status='${S_ST:-<none>}' rc='${S_RC:-?}'}) — a human must look; see $RECORD"; exit 3 ;;
+    stale) err "$_WHY"; exit 3 ;;
+    *) err "the pass record at $STATUS_FILE cannot be judged ($_WHY) — a human must look; see $RECORD"; exit 3 ;;
   esac
 fi
 
