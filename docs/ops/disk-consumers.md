@@ -369,8 +369,9 @@ rm -rf /tmp/venv-shared-py312                                       # 5,844 MB, 
 ```bash
 # dry-run: name them, size them, prove no live holder.
 # The age floor is 180 min — the scratch arm's OWN floor (`reap-abandoned-worktrees.sh:117`,
-# `AGED_MINUTES=180`), not 72 h. At 72 h the dirs this selects total ~5 MB (`du -xsc`) on a
-# box holding ~76 GB of scratch, which reads as "nothing to do" and stops anyone asking why.
+# `AGED_MINUTES=180`), not 72 h. On `cmux` the 72 h window is nearly empty (~5 MB of a ~76 GB
+# scratch population), which is what stopped anyone asking why the disk kept filling — but a
+# CELL is not empty at 72 h (see *Expected* and *Age distribution*: the page's own bands).
 find /tmp -maxdepth 1 -mindepth 1 -type d -mmin +180 \
      ! -name 'cell-*' ! -name 'actions-runner' ! -name 'venv-shared*' \
      ! -name 'G-*' ! -name '.pytest_cache' ! -name 'systemd-*' -print0 |
@@ -385,12 +386,20 @@ find /tmp -maxdepth 1 -mindepth 1 -type d -mmin +180 \
   | `-mmin +4320` (the old 72 h) | **5,008 KB — 4.9 MB** | 8 |
   | `-mmin +180` (this one) | **80,155,676 KB — ~76.4 GB** | 3,124 |
 
-  `/tmp` totalled **94 GB** (`du -xsm /tmp` → `96,310`), so the 3 h–72 h band is essentially the
-  whole scratch population: **a 72 h floor reports 0.006% of that 76.4 GB population** (0.005% of
-  all of `/tmp`), and the directory count grows each time it is re-run (a tree joins the set the
-  moment it crosses 180 min). Its top-20 rows are ordinary mutation/review copies (`/tmp/muth`
-  1.4 G, `/tmp/revX` 2.4 G, `/tmp/tt_s80isga_` 1.6 G, `/tmp/wt-prefix-11211` 1.2 G …), which is
-  what the bucket is *for*.
+  `/tmp` totalled **94 GB** (`du -xsm /tmp` → `96,310`), so on this box the 3 h–72 h band is
+  essentially the whole scratch population: **a 72 h floor reports 0.006% of that 76.4 GB
+  population** (0.005% of all of `/tmp`), and the directory count grows each time it is re-run
+  (a tree joins the set the moment it crosses 180 min). Its top-20 rows are ordinary
+  mutation/review copies (`/tmp/muth` 1.4 G, `/tmp/revX` 2.4 G, `/tmp/tt_s80isga_` 1.6 G,
+  `/tmp/wt-prefix-11211` 1.2 G …), which is what the bucket is *for*.
+
+  ⛔ **Those figures are `cmux`'s, and they are NOT a box-wide claim that 72 h finds nothing.**
+  A cell looks different: *Age distribution* above (top-250 `/tmp` children by directory mtime —
+  a different basis, and measured before this recipe's exclusions) puts cell 3's 3–7 d band at
+  **18,292 MB** and its 7–14 d band at 7,959 MB, with cell 4 at 20,423 MB in the 3–7 d band. So
+  a cell at 72 h still has tens of GB on the table, and the floor moved to 180 min because that
+  is the **scratch arm's own floor** — the number this recipe has to agree with — not because a
+  72 h window is empty on every box.
 * **Guard (all must hold):** age ≥ 180 min — the arm's own floor, not a second number — **and** not a
   git checkout (`.git` present ⇒ skip) **and** no live process holds it **and** the run is a dry-run
   whose count matches on a second read. Never take this from a single `find | head` — a first-match
