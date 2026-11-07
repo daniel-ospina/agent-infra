@@ -911,8 +911,14 @@ t += ("\n\n_orig_configured_repos = configured_repos\n"
       "    return [parts[0], '', parts[1]] if len(parts) > 1 else parts\n")
 open(dst, "w").write(t)
 PYI
-ck "m25 …and an EMPTY ENTRY in the middle is refused (an empty first-difference must not read as agreement)" \
-   '[ "$(REPO_SET_DOCTOR="$MI/pr-doctor.py" run_reader_rc "$CONF" check)" = 1 ]'
+# ⛔ THIS ARM MUST ASSERT THE MESSAGE, NOT ONLY THE EXIT CODE (review round 13, P2). It originally
+# checked rc alone — and rc is 1 EITHER WAY, because the entry INDEX keeps the report non-empty even
+# when the field is a blank, so the arm stayed green with the fix reverted: vacuous, the exact failure
+# the suite's own non-vacuity doctrine (header cases (g)/(h)) exists to prevent. Measured: shipped
+# prints `entry 2 … <empty entry>`; reverted prints `entry 2 … reads it as `` `. The two greps below
+# are what discriminate.
+ck "m25 …and an EMPTY ENTRY in the middle is refused and NAMED as \`<empty entry>\` (not a blank field)" \
+   'o="$(REPO_SET_DOCTOR="$MI/pr-doctor.py" run_reader "$CONF" check)"; printf "%s" "$o" | grep -q "entry 2 of this set" && printf "%s" "$o" | grep -q "<empty entry>"'
 
 # ── (n) SOURCING the reader must not change the caller's shell options ────────────────────
 # The file advertises sourcing as its contract, and the PR plans more consumers (the controllers and the
