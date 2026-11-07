@@ -1044,6 +1044,17 @@ export function classifyServers(
   const eager: [string, McpServerConfig][] = [];
   const lazySkipped: string[] = [];
   for (const [name, cfg] of Object.entries(servers)) {
+    // ⛔ THE BELT THAT COVERS EVERY ENTRY POINT. This function is exported and reads `cfg.lazy`, so a
+    // non-object entry (`{"mcpServers": {"tortoise": null}}`) throws out of the extension factory and
+    // ends the session naming no file, entry or cause. `asMcpJson` and `mergeMcpLayers` both guard it on
+    // the normal path, but `connectAll` — a public method, and the pattern two suites follow — hands raw
+    // `JSON.parse` output straight through. Guarding here means NO caller can resurrect the crash.
+    if (!isServerEntry(cfg)) {
+      console.log(
+        `[mcp-client] WARN: server "${name}" is not an object — skipped (no transport, and no crash)`
+      );
+      continue;
+    }
     if (allowedServers && !allowedServers.has(name)) continue; // excluded by PI_MCP_SERVERS
     const forcedEager = allowedServers?.has(name) === true;
     if (cfg.lazy === true && !forcedEager) lazySkipped.push(name);
@@ -1102,10 +1113,15 @@ export class McpServerManager {
   /**
    * Connect from BOTH layers: the hub's base config underneath, the repo's `.mcp.json` over it.
    *
-   * ⛔ MERGE ORDER IS `{ **base, **repo }` — the repo is LAST, so a repo field WINS against the base's,
-   * per server and per field (see `mergeMcpLayers`: an override entry that sets only `url` keeps the
-   * base's `headers`, `lazy` and `timeoutMs`; setting the whole entry is what used to destroy them).
-   * The base must never be able to shadow what a repo declares: `~/.pi/agent/.mcp.json` is
+   * ⛔ MERGE ORDER IS `{ **base, **repo }` — the repo is LAST, so a repo FIELD wins against the base's,
+   * per server and per field. What that means in practice:
+   *   * an override that sets only `timeoutMs` / `lazy` / catalog metadata keeps the base's `url`,
+   *     `headers`, `oauth` and the rest — the destination and the launch are unchanged;
+   *   * an override that CHANGES `url` keeps `lazy`/`timeoutMs` but **DROPS `headers`/`oauth`**, which
+   *     belong to the endpoint they were issued for; an override that changes the LAUNCH
+   *     (`command`/`args`/`cwd`) **DROPS the base's `env`**. See `mergeMcpLayers` for both guards.
+   * The base must never be able to shadow what a repo declares: it is spread FIRST, so every field the
+   * repo sets wins — `~/.pi/agent/.mcp.json` is
    * machine-local, and letting it override a repo would make one box's config change what a
    * checked-out repo means.
    *

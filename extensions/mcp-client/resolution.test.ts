@@ -707,6 +707,28 @@ await test("`args: []` vs absent `args` is the SAME launch, so the base's env su
   deepEqual(g?.env, { K: "1" }, "an empty args list is not a different launch");
 });
 
+await test("the LEGACY `connectAll` path cannot resurrect the crash (belt is in classifyServers)", async () => {
+  // `connectAll` is a public method on an exported class and is the pattern two suites follow; it hands
+  // raw `JSON.parse` output straight to connectConfig, bypassing asMcpJson and mergeMcpLayers.
+  const dir = tempDir("mcp-bind-legacy-");
+  const file = join(dir, ".mcp.json");
+  writeFileSync(file, JSON.stringify({ mcpServers: { tortoise: null, ghost: 42, real: { url: "https://ok.example/mcp", lazy: true } } }));
+
+  const manager = new McpServerManager();
+  // ⛔ CLEAR `PI_MCP_SERVERS` FIRST. When it is set, `classifyServers` excludes an unlisted name
+  // BEFORE it reads `cfg.lazy` — so this test passed vacuously on any box with that variable exported
+  // (measured) while still crashing the moment it is unset, which is the CI shape.
+  const prevAllowed = process.env.PI_MCP_SERVERS;
+  delete process.env.PI_MCP_SERVERS;
+  try {
+    await withCapturedLogs(() => manager.connectAll(file)); // must not throw
+  } finally {
+    if (prevAllowed === undefined) delete process.env.PI_MCP_SERVERS;
+    else process.env.PI_MCP_SERVERS = prevAllowed;
+  }
+  ok(true, "a non-object entry no longer throws out of the extension factory");
+});
+
 await test("a `null` server ENTRY does not crash the session — it is dropped, with a warning", async () => {
   // `{"mcpServers": {"tortoise": null}}` used to pass asMcpJson and then throw
   // `TypeError: Cannot read properties of null (reading 'lazy')` out of the extension factory,
