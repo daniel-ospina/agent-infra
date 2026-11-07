@@ -937,11 +937,20 @@ sweep_repo() {
     # gitdir -> HEAD -> commondir` (measured) — namely an EMPTY dir, or one holding NOTHING BUT `locked`.
     # A directory that holds even one other entry is counted, whatever it holds: over-counting is
     # fail-CLOSED (a loud rc=3), while under-counting is the false PASS above.
-    # ⛔ STATED RESIDUAL, one direction only: a registration EMPTIED COMPLETELY (every file deleted) is
-    # indistinguishable from never-populated debris by content, so it is skipped and that omission reads
-    # clean. No content test can separate the two. It is narrow: `git gc` and `git worktree prune` remove an
-    # empty admin dir on their own (`Removing worktrees/<name>: gitdir file does not exist`, measured), so it
-    # does not persist — unlike the `locked`-only shape, which both commands leave in place.
+    # ⛔ TWO SKIPPED SHAPES, NOT ONE, and the persistent one is the wider blind spot (#3588 review, cycle 6).
+    # Both read CLEAN, because git omits such a worktree from its own listing, so neither can be detected
+    # from the listing side:
+    #   (1) a registration EMPTIED COMPLETELY — indistinguishable by content from never-populated debris.
+    #       Narrow in practice: `git gc` and `git worktree prune` remove an empty admin dir on their own
+    #       (`Removing worktrees/<name>: gitdir file does not exist`, measured), so it does not persist.
+    #   (2) a registration reduced to ONLY `locked` — MEASURED over a linked worktree still holding
+    #       uncommitted work: git lists 1 of 2, this pass answers `status=ok rc=0`, AND `git worktree prune`
+    #       and `git gc --prune=now` both LEAVE the dir in place. So this is the shape that does NOT
+    #       self-heal, and it is the one to remember when auditing this gate.
+    # ⛔ DO NOT unskip (2). `{locked}`-only is a measured PREFIX of a `git worktree add --lock` killed
+    # after the `locked` write (`mkdir -> locked -> gitdir -> HEAD -> commondir`), i.e. real debris, and
+    # counting it restores the permanent false block that S8a exists to prevent. The trade is deliberate:
+    # a false "the work is LOST" over archived work is worse than a narrow blind spot stated here.
     for wdir in "$common/worktrees"/*/; do
       [ -d "$wdir" ] || continue
       debris=1
