@@ -1252,7 +1252,7 @@ timer_value_ok() { # <directive> <value> — ok iff systemd can ACT on this valu
 
 verify_timer() { # <rendered timer> [expected Unit= target]
   local f="$1" expect="${2:-cell-self-pin.service}" body timer units nunits _rep _badval _c
-  local _trigs _reset _n _k _v _inst _nw
+  local _trigs _reset _n _k _v _inst_vals
   # Comments are stripped for the same reason `verify_unit` strips them: this template documents the
   # cadence decisions it made, and that prose legitimately names the directives the rules below ban.
   body="$(grep -vE '^[[:space:]]*#' "$f")"
@@ -1382,15 +1382,32 @@ verify_timer() { # <rendered timer> [expected Unit= target]
   # ⛔ THIS IS THE SAME MEASURED MECHANISM THE DROP-IN RULE ALREADY REFUSES (see `verify_dropin_file`'s
   # `[Install]` arm): a drop-in may not carry `[Install]` at all, and the RENDERED unit — whose enablement is
   # the thing `--install` actually claims — had no rule at all about it.
-  # The grammar is deliberately narrow (`WantedBy=`/`RequiredBy=` with a NON-BLANK value) because an EMPTY
-  # assignment is a LIST RESET (`systemd.unit(5)`) and is precisely the "no installation config" state: a
-  # refusal here costs an operator one edit, a false PASS costs the pin.
-  _inst="$(unit_section "$body" Install)"
-  [ -n "$_inst" ] || { bad "the rendered timer declares no [Install] section — systemd applies [Install] at ENABLE time, and with none 'systemctl enable' exits 0 and creates NO symlink (measured, systemd 255.4: 'The unit files have no installation config', rc=0, no link), so '--install' would print its own success over a pin that never fires; the template must declare '[Install]' with 'WantedBy=timers.target'"; return 1; }
-  _nw=0
-  for _v in $(directive "$_inst" WantedBy); do [ -n "$_v" ] && _nw=$((_nw + 1)); done
-  for _v in $(directive "$_inst" RequiredBy); do [ -n "$_v" ] && _nw=$((_nw + 1)); done
-  [ "$_nw" -gt 0 ] || { bad "the rendered timer's [Install] section carries no non-blank WantedBy=/RequiredBy= — an EMPTY assignment is a LIST RESET (systemd.unit(5)), which systemd reads as 'no installation config', so 'systemctl enable' exits 0 and creates NO symlink (measured, systemd 255.4) and the pin is never scheduled with every surface green"; return 1; }
+  # ⛔ THE LIST IS REPLAYED, NOT COUNTED (round-17 review, P3) — the same shape the `SuccessExitStatus=`
+  # rule above uses. Each of `WantedBy=`/`RequiredBy=`/`UpheldBy=`/`Alias=` is a LIST, and
+  # `systemd.unit(5)` resets it on an EMPTY assignment: `WantedBy=timers.target` followed by `WantedBy=`
+  # leaves NO installation config (MEASURED on 255.4: `enable` answers "The unit files have no
+  # installation config", rc=0, creates no link, `is-enabled` then says `static`) — and a rule that merely
+  # counted non-blank values ABOVE the reset certified that dead clock. Order matters, so the replay honours
+  # it rather than latching the first good line.
+  # ⛔ AND `UpheldBy=` COUNTS: systemd's own "no installation config" message lists it, and MEASURED on
+  # 255.4 a timer carrying only `[Install] UpheldBy=timers.target` DOES link
+  # (`timers.target.upholds/<unit>`) and reads `enabled` — so omitting it was a FALSE REFUSAL of a
+  # legitimate shape (round-17 review, P3). `Also=` is deliberately NOT in the list: it enables OTHER
+  # units, creates no link for this one, and leaves `is-enabled` answering `indirect` — systemd's word for
+  # "the unit file itself is not enabled", the exact state `own_state` maps to `disabled`.
+  # ⛔ A rule that fires on a state another arm already refuses cannot be gated (its removal changes only
+  # the wording), so [Install] PRESENCE is not a separate arm: the replay below reports the same state for
+  # a missing section, an empty one, and a fully reset one, and it is the arm a leg reds.
+  _inst_vals="$(unit_section "$body" Install | awk '
+    { line = $0; sub(/^[[:space:]]*/, "", line) }
+    line ~ /^(WantedBy|RequiredBy|UpheldBy|Alias)[[:space:]]*=/ {
+      key = line; sub(/[[:space:]]*=.*$/, "", key)
+      val = line; sub(/^[^=]*=[[:space:]]*/, "", val)
+      if (val == "") { acc[key] = ""; next }
+      acc[key] = (acc[key] == "" ? val : acc[key] " " val)
+    }
+    END { for (k in acc) if (acc[k] != "") { print k "=" acc[k]; n++ } }')"
+  [ -n "$_inst_vals" ] || { bad "the rendered timer carries NO EFFECTIVE installation config — systemd applies [Install] at ENABLE time, and with no non-blank WantedBy=/RequiredBy=/UpheldBy=/Alias= left after replaying the list (an EMPTY assignment is a LIST RESET, systemd.unit(5)), 'systemctl enable' exits 0 and creates NO symlink (measured, systemd 255.4: 'The unit files have no installation config', rc=0, no link, 'is-enabled' then answers 'static'), so '--install' would print its own success over a pin that never fires; the template must declare '[Install]' with 'WantedBy=timers.target'"; return 1; }
   return 0
 }
 
@@ -1891,9 +1908,14 @@ own_state() { # <scope> — prints enabled | disabled | unknown
   if [[ "$out" =~ $BUS_UNREACHABLE_PAT ]]; then printf 'unknown\n'; return 0; fi
   if [ "$rc" -eq 0 ]; then
     case "$out" in
-      enabled|enabled-runtime|alias|indirect) printf 'enabled\n' ;;
+      enabled|enabled-runtime|alias) printf 'enabled\n' ;;
       # systemd's answer for "no installation config": `enable` cannot link it, so it is never scheduled.
       static) printf 'disabled\n' ;;
+      # ⛔ `indirect` IS NOT `enabled` (round-17 review, P3). `systemd.unit(5)`: with `indirect` "the unit
+      # file itself is not enabled, but it has a non-empty Also= setting in the [Install] section" — i.e.
+      # the manager answering `indirect` is telling us THIS unit has no link of its own. Accepting it as
+      # enabled would make a read-back green over the very state it exists to catch.
+      indirect) printf 'disabled\n' ;;
       # An empty or unrecognised answer is NOT a verdict about this unit.
       *) printf 'unknown\n' ;;
     esac

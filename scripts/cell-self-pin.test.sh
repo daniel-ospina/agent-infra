@@ -799,6 +799,24 @@ refuses_timer 'a timer template with NO installation config ([Install] WantedBy=
   "$(doctor_timer noinstall '/^WantedBy=/d')" "$T/tu40" 'installation config'
 refuses_timer 'a timer template whose WantedBy= is EMPTY (a LIST RESET — the same no-config state)' \
   "$(doctor_timer noinstall-empty 's|^WantedBy=.*$|WantedBy=|')" "$T/tu41" 'non-blank WantedBy='
+# ⛔ THE POSITIVE CONTROL, BECAUSE "REFUSE EVERY INSTALLATION CONFIG" WOULD SATISFY BOTH LEGS ABOVE.
+# `UpheldBy=` is a legitimate enablement — systemd's own "no installation config" message lists it, and
+# MEASURED on 255.4 a timer carrying ONLY `[Install] UpheldBy=timers.target` links
+# (`timers.target.upholds/<unit>`) and reads `enabled`. The first version of the rule counted only
+# `WantedBy=`/`RequiredBy=` and thus FALSE-REFUSED this shape (round-17 review, P3); this leg is what stops
+# the narrow grammar from being narrowed back.
+u_upheld="$T/units-upheld"; out="$(install_doctored "$(doctor_timer noinstall-upheld 's|^WantedBy=.*$|UpheldBy=timers.target|')" "$u_upheld")"; rc=$?
+[ "$rc" -eq 0 ] && [ -f "$u_upheld/cell-self-pin.timer" ] && ok "…and UpheldBy= is accepted as an installation config (a timer enabled only through 'timers.target.upholds/' installs)" \
+  || bad "FALSE-REFUSED UpheldBy=timers.target, a legitimate installation config (rc=$rc): $out"
+cp "$T/placed.before" "$PLACED"   # the positive control above legitimately re-placed the pass; the refusal legs below re-assert the sentinel
+# ⛔ AND THE RESET IS REPLAYED, NOT COUNTED (round-17 review, P3). The rule's own comment claimed LIST-RESET
+# awareness while `_nw` counted non-blank values across every line, so `WantedBy=timers.target` followed by
+# an empty `WantedBy=` — systemd's "no installation config" state, MEASURED (enable rc=0, no link,
+# `is-enabled` → `static`) — was ACCEPTED at the input gate. Only the enable read-back stood between that
+# shape and a green install, and an unanswerable manager degrades the read-back to a warning. The replay is
+# the shape `SuccessExitStatus=` already uses.
+refuses_timer 'a WantedBy= RESET by a later EMPTY WantedBy= (the list is discarded, no config left)' \
+  "$(doctor_timer_append noinstall-reset 's|^OnUnitActiveSec=.*$|OnUnitActiveSec=10min|' 'WantedBy=\n')" "$T/tu42" 'installation config'
 
 # ⛔ AND WITH NO PARSER ON THE BOX, THE FALLBACK IS A WHITELIST, NOT A GUESS: the ten documented shortcut
 # words are certifiable by construction, and any explicit EXPRESSION is REFUSED with the two routes out
@@ -1341,6 +1359,32 @@ mk_nolink_systemctl() { # <dir> <state-dir>
   chmod +x "$d/systemctl"
   return 0
 }
+# mk_indirect_systemctl — the manager answers `indirect`, which `systemd.unit(5)` defines as "the unit file
+# itself is not enabled, but it has a non-empty Also= setting in the [Install] section". It is the one
+# rc=0 answer that says NOT enabled, so mapping it to `enabled` would green a read-back over the very state
+# it exists to catch (round-17 review, P3). Anything else is `disabled` unless real state exists, so the
+# duplicate-actuator gate cannot answer for this leg.
+mk_indirect_systemctl() { # <dir> <state-dir>
+  local d="$1" s="$2"
+  mkdir -p "$d" "$s"
+  printf '%s\n' \
+    '#!/bin/bash' \
+    "S='$s'" \
+    'scope=system' \
+    'if [ "${1:-}" = "--user" ]; then scope=user; shift; fi' \
+    'verb="${1:-}"; shift 2>/dev/null || true' \
+    '[ "${1:-}" = "--now" ] && shift' \
+    'unit="${1:-}"' \
+    'st="$S/$scope-$unit"' \
+    'case "$verb" in' \
+    '  is-enabled) if [ "$unit" = cell-self-pin.timer ]; then echo indirect; exit 0; fi; if [ -f "$st" ]; then echo enabled; exit 0; fi; echo disabled; exit 1 ;;' \
+    '  disable) rm -f "$st"; exit 0 ;;' \
+    '  enable) : >"$st"; exit 0 ;;' \
+    'esac' \
+    'exit 0' >"$d/systemctl"
+  chmod +x "$d/systemctl"
+  return 0
+}
 # mk_rearm_systemctl — the shipped actuator is RE-ARMED by the very `enable` that completes the migration.
 # That is `cloud-cell-bringup.sh`'s `check_harness_apply` (it runs `install-harness-apply-timer.sh
 # --install` on EVERY bring-up, and that ends in `systemctl enable --now eldato-harness-apply.timer`),
@@ -1612,6 +1656,19 @@ esac
 case "$out" in
   *'NOT enabled'*) ok "…and the refusal says what it READ (the unit reads as not enabled)" ;;
   *) bad "…but the refusal does not say the unit reads as not enabled: $out" ;;
+esac
+# ⛔ AND THE ONE rc=0 ANSWER THAT MEANS **NOT ENABLED** IS NOT ACCEPTED (round-17 review, P3). `indirect` is
+# systemd's word for "the unit file itself is not enabled" (`systemd.unit(5)`) — the manager answering it is
+# telling us this unit has no link of its own. Mapping it to `enabled` would make the read-back green over
+# the state it exists to catch, and no other leg can see that: every passing gate produces a real link.
+mk_indirect_systemctl "$T/fake-indirect" "$T/state-indirect"
+out="$(runat "$T/home" TEMPLATES_DIR="$TPL" SYSTEMD_UNIT_DIR="$T/units-indirect" PATH="$T/fake-indirect:$PATH" \
+       bash "$PIN" --install 2>&1)"; rc=$?
+[ "$rc" -ne 0 ] && ok "an 'indirect' answer (rc=0, but the unit itself is NOT enabled) fails the install (rc=$rc)" \
+  || bad "installed (rc=0) on an 'indirect' answer, which means the unit itself has no link: $out"
+case "$out" in
+  *'ONE actuator on this pin'*) bad "…and it printed the ONE-actuator claim over a unit the manager says is not enabled" ;;
+  *) ok "…and it does NOT print the one-actuator claim over it" ;;
 esac
 
 # ── (f) A SCOPE THAT GOES ENABLED *DURING* THE INSTALL IS STILL CAUGHT ─────────────────────────────
