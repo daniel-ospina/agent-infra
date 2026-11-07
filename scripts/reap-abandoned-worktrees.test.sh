@@ -10,7 +10,7 @@
 # reached the box." So the arm that deletes trees nothing can recover now has a suite of its own.
 #
 # The judgement under test is the BOUND — not the deletion predicate, whose gates the sibling suites
-# own one at a time. Five things are asserted, and each has its own mutation:
+# own one at a time. Eight things are asserted, and each has its own mutation:
 #
 #   (a) THE UNIT IS CHARGED TO CANDIDATES, NOT CLASSIFICATIONS. The fixture from #3278: twelve YOUNG
 #       gitless trees, then the AGED thirteenth in sort order. Under the pre-#3278 code the cap unit was
@@ -32,6 +32,20 @@
 #       is the one behaviour change the LINKED arm receives, and it is observable only on a pass that
 #       has already spent its budget — so it needs a LINKED fixture, which no other suite supplies
 #       (`disk-reaper.test.sh` drives this delegate through a `/nonexistent` stub).
+#   (f) AN EXHAUSTED CEILING SHORT-CIRCUITS THE *SCAN*, not only the census (round 11, P1). Case I
+#       places a tree the scan would classify DIFFERENTLY (a nested `.git` → `reason=git-below`) AFTER
+#       the ceiling is spent: the O(1) refusal reports `gitless-cap`, a refusal downstream of the scan
+#       reports `git-below`. The cost that makes this matter was measured, not assumed: 8.98 s vs
+#       0.60 s over 300 entries with the census isolated, for a byte-identical pass record.
+#   (g) THE BUDGET GATES THE REMOVAL, not only the census. Case J's census costs two seconds under a
+#       one-second budget, so the tree passes the PRE-census gate and meets the gate above the
+#       destructive call. Deleting that second gate left all 20 shipped cases green (measured, round
+#       11) — every other fixture either dry-runs, where the gate is skipped, or runs `BUDGET=0`,
+#       where the first gate has already fired.
+#   (h) THE CEILING *AND* THE BUDGET ARE PER ROOT. Case K runs a two-root pass: 2 × 12 aged trees → 20
+#       candidates and 4 capped (one ceiling per root), and a two-root budget pass where BOTH roots
+#       spend their own budget on their own census. Hoisting either counter to pass scope changed no
+#       shipped assertion (measured, round 11) — every other fixture builds one root.
 #
 # Plus: the ceiling is honoured EXACTLY (10 aged candidates, then `gitless-cap` — an operator ceiling
 # that silently stopped working would be the same defect in mirror image), a non-numeric seam is
@@ -40,7 +54,7 @@
 # guard's THREE references — HOME, CELL_HOME, the pass state dir), the keep list, `git-below`, the
 # bare-repo refusal, the young floor, the `--dry-run` default, and `--include-gitless` being OPT-IN.
 #
-# ⛔ ALL EIGHT CASES (A–H) ARE MUTATION-CHECKED (`expect_pass` then `expect_fail` against a mutated
+# ⛔ ALL ELEVEN CASES (A–K) ARE MUTATION-CHECKED (`expect_pass` then `expect_fail` against a mutated
 # copy). B was the exception until review round 10, on the reasoning that "its subject (the `--apply`
 # removal) is asserted directly and a mutation of it would only reproduce the same assertion" — that
 # reasoning was wrong in the way agent-infra#3442 exists to catch: it left B's young-tree guarantee
@@ -170,6 +184,43 @@ pass() {
     OUT="$(HOME="$base/home" CELL_HOME="" REAP_AW_STATE_DIR="$base/state" REAP_AW_LOG="$base/state/log" \
            REAP_AW_PROC_ROOT="$base/proc" bash "$UNDER_TEST" --root "$base/root" "$@" 2>&1)"
     OUT_RC=$?
+}
+
+# pass_roots <base> <root:root[:root]> [args...] — a pass over MORE THAN ONE root. The ceiling and the
+# time bound are documented as PER-ROOT (each `sweep_root` resets them), and with a single root that
+# claim is unfalsifiable: a whole-pass counter and a per-root one produce identical output (measured,
+# review round 11 — hoisting `GITLESS_DONE` to pass scope left all 20 cases green). This helper is what
+# makes the scoping observable.
+pass_roots() {
+    local base="$1" roots="$2"; shift 2
+    local _r _args=""
+    local IFS=':'
+    for _r in $roots; do _args="$_args --root $_r"; done
+    unset IFS
+    # shellcheck disable=SC2086 # _args is a list of already-quoted --root/value pairs, not one word
+    OUT="$(HOME="$base/home" CELL_HOME="" REAP_AW_STATE_DIR="$base/state" REAP_AW_LOG="$base/state/log" \
+           REAP_AW_PROC_ROOT="$base/proc" bash "$UNDER_TEST" $_args "$@" 2>&1)"
+    OUT_RC=$?
+}
+
+# slow_held <dest-lib> <real-lib> — a live-paths library that IS the shipped one with a single change:
+# `lp_path_held` sleeps two seconds. That is the only way to make a 1 s budget expire between the
+# pre-census gate and the gate above the destructive call, because the CENSUS ITSELF is built once per
+# pass (before any deadline exists) — the per-candidate cost is the `lp_path_named`/`lp_path_held`
+# QUERIES, which the library's own header measures at 3.6 s and 8.1 s on a 33k-row table. Getting that
+# window wrong is how the first cut of these cases failed: slowing the `ls` probe only slowed the
+# startup, the pre-removal gate never saw the budget, and the tree was reaped (measured, review round 11).
+# ⛔ It still answers NOT-HELD, exactly like the real query on a table with nothing holding the tree —
+# only the COST is inflated, so the assertion is about the budget's arithmetic, never about the census.
+slow_held() {
+    local dest="$1" real="$2"
+    {
+        printf '# a STUB over the real library: one function slowed, every answer unchanged\n'
+        printf '. "%s"\n' "$real"
+        printf 'lp_path_held() { sleep 2; LP_HOLD_WHY="stub: the cost is real, the answer is not-held"; return 1; }\n'
+    } >"$dest" || return 1
+    bash -n "$dest" || return 1
+    return 0
 }
 
 # newfixture <letter> — sets FB to a fixture base with root/ state/ proc/ home/.
@@ -532,6 +583,124 @@ case_h() { # <owner-script>
     return $((CASE_FAIL > 0))
 }
 
+# ── I: an EXHAUSTED ceiling short-circuits the SCAN, not just the census ──────────
+# Round 11 measured the P1 this case exists for: with the refusal downstream of the eligibility scan, a
+# capped pass still paid ~6 forks per entry (`git_below`'s two-level walk, `lp_canon`, the home-or-state
+# loop, the keep list, `pinned`) to print rows that say `gitless-cap` either way. On a 300-entry fixture
+# with the census isolated that was 8.98 s versus 0.60 s on `2c18ff89a`, for a byte-identical record.
+# ⛔ COST IS NOT DIRECTLY ASSERTABLE without a wall-clock assertion (flaky by construction), so the case
+# asserts the only thing that is OBSERVABLE and attributable: past the ceiling the arm does not LOOK.
+# The discriminating fixture is a tree the scan would classify DIFFERENTLY — a nested `.git` (which the
+# scan reports as `reason=git-below`, i.e. "a git arm owns this") — placed after the ceiling is spent.
+# The O(1) refusal reports `gitless-cap`; a refusal that ran after the scan reports `git-below`.
+case_i() { # <owner-script>
+    local owner="$1" root n
+    UNDER_TEST="$owner"
+    newfixture i || { case_check 1 "fixture could not be built"; return 1; }
+    root="$FB/root"
+    # ten AGED trees spend the default ceiling of 10 …
+    for n in 01 02 03 04 05 06 07 08 09 10; do
+        mk_gitless "$root" "a$n-aged" >/dev/null
+        age_path "$root/a$n-aged" 400
+    done
+    # … and this one sorts LAST, so it is only ever reached with the ceiling already exhausted.
+    mkdir -p "$root/z-gitbelow/inner/.git"
+    age_path "$root/z-gitbelow" 400
+    pass "$FB" --include-gitless
+    [ -n "${AW_DEBUG:-}" ] && printf '%s\n' "$OUT" >&2
+    case_check "$([ "$OUT_RC" = 0 ] && echo 0 || echo 1)" "the pass exits 0 (rc=$OUT_RC)"
+    case_check "$(grep -qF "KEPT   $root/z-gitbelow reason=gitless-cap" <<<"$OUT" && echo 0 || echo 1)" \
+               "past the ceiling the row names the CEILING — this arm did not look at the tree"
+    # ⛔ THE NON-VACUITY ASSERTION. `git-below` here would mean the scan ran for a tree the ceiling had
+    # already refused: the exact cost regression this case exists to prevent.
+    case_check "$(grep -q 'reason=git-below' <<<"$OUT" && echo 1 || echo 0)" \
+               "and the SCAN never ran for it (no reason=git-below) — the refusal is O(1)"
+    case_check "$(grep -q '^SUMMARY .*candidates=10 reaped=0 kept=1 ' <<<"$OUT" && echo 0 || echo 1)" \
+               "the ceiling still classifies exactly ten, and the eleventh is a keep (candidates=10 kept=1)"
+    return $((CASE_FAIL > 0))
+}
+
+# ── J: the budget gates the REMOVAL, not only the census ─────────────────────────────────
+# The gate above `toctou_preserve`/`remove_*` is what stops a 20–60 s `rm -rf` from starting after the
+# census consumed the budget (the census measures 3.6 s + 8.1 s per candidate on a loaded box). Every
+# other case here reaches the PRE-census gate first (BUDGET=0, or an over-budget pass), so deleting the
+# second gate left all 20 cases green (review round 11, measured) — it was a documented guard with a
+# surviving mutant. This case makes the budget expire in the ONE window where the second gate matters:
+# a census that costs two seconds under a one-second budget, so the pre-census gate is passed and the
+# pre-removal gate is spent.
+case_j() { # <owner-script>
+    local owner="$1" root
+    UNDER_TEST="$owner"
+    newfixture j || { case_check 1 "fixture could not be built"; return 1; }
+    root="$FB/root"
+    mk_gitless "$root" a-aged >/dev/null
+    age_path "$root/a-aged" 400
+    slow_held "$FB/slow-lib.sh" "$LIVE_LIB" || { case_check 1 "the slow census library could not be written"; return 1; }
+    OUT="$(HOME="$FB/home" CELL_HOME="" REAP_AW_STATE_DIR="$FB/state" REAP_AW_LOG="$FB/state/log" \
+           REAP_AW_PROC_ROOT="$FB/proc" REAP_AW_LIVE_PATHS="$FB/slow-lib.sh" REAP_AW_BUDGET_SECONDS=1 \
+           bash "$owner" --root "$root" --include-gitless --apply 2>&1)"; OUT_RC=$?
+    [ -n "${AW_DEBUG:-}" ] && printf '%s\n' "$OUT" >&2
+    case_check "$([ "$OUT_RC" = 0 ] && echo 0 || echo 1)" "a budget spent BY THE CENSUS still exits 0 (rc=$OUT_RC)"
+    # ⛔ THE TWO SITES SAY DIFFERENT THINGS on purpose — `unprocessed trees` is the pre-census gate,
+    # `unprocessed worktrees` is the one above the destructive call. Asserting the second string is what
+    # makes the catch attributable: with only the first gate present, this row cannot be produced here.
+    case_check "$(grep -q 'unprocessed worktrees are PRESERVED' <<<"$OUT" && echo 0 || echo 1)" \
+               "the gate ABOVE THE REMOVAL fired (the row names unprocessed worktrees)"
+    case_check "$(grep -q 'unprocessed trees are PRESERVED' <<<"$OUT" && echo 1 || echo 0)" \
+               "and it was NOT the pre-census gate — that one was still affordable when the tree arrived"
+    case_check "$([ -d "$root/a-aged" ] && echo 0 || echo 1)" \
+               "the aged tree is STILL THERE: a census that ate the budget must not be followed by an rm -rf"
+    # ⛔ THE RECORD, which varies independently of the row text: the tree reached CANDIDACY (the census
+    # ran for it) and was not reaped. With the gate deleted the same pass reports reaped=1 and the tree
+    # is gone.
+    case_check "$(grep -q '^SUMMARY .*candidates=1 reaped=0 ' <<<"$OUT" && echo 0 || echo 1)" \
+               "the record says it reached candidacy and was NOT reaped (candidates=1 reaped=0)"
+    return $((CASE_FAIL > 0))
+}
+
+# ── K: the ceiling AND the time bound are PER ROOT ─────────────────────────────────────
+# Four places state the scoping (the script header twice, `docs/ops/disk-reaper.md:709`,
+# `docs/ops/disk-consumers.md`), and with one root it is unfalsifiable: hoisting either counter to pass
+# scope changed no shipped assertion (review round 11, measured). Each half gets a fixture that makes
+# the two scopings disagree.
+case_k() { # <owner-script>
+    local owner="$1" n r1 r2
+    UNDER_TEST="$owner"
+    newfixture k || { case_check 1 "fixture could not be built"; return 1; }
+    r1="$FB/root"; r2="$FB/root2"
+    for n in 01 02 03 04 05 06 07 08 09 10 11 12; do
+        mk_gitless "$r1" "a$n-aged" >/dev/null; age_path "$r1/a$n-aged" 400
+        mk_gitless "$r2" "a$n-aged" >/dev/null; age_path "$r2/a$n-aged" 400
+    done
+    pass_roots "$FB" "$r1:$r2" --include-gitless
+    [ -n "${AW_DEBUG:-}" ] && printf '%s\n' "$OUT" >&2
+    # (a) THE CEILING IS PER ROOT: two roots × 10 = 20 aged candidates, and two remainders of 2 trees.
+    case_check "$([ "$OUT_RC" = 0 ] && echo 0 || echo 1)" "a two-root pass exits 0 (rc=$OUT_RC)"
+    case_check "$([ "$(grep -c '^remove ' <<<"$OUT")" = 20 ] && echo 0 || echo 1)" \
+               "each root gets its OWN ceiling of ten (got $(grep -c '^remove ' <<<"$OUT") removable, expected 20)"
+    case_check "$([ "$(grep -c 'reason=gitless-cap' <<<"$OUT")" = 4 ] && echo 0 || echo 1)" \
+               "and each root's remainder is capped separately (got $(grep -c 'reason=gitless-cap' <<<"$OUT") capped, expected 4 = 2 + 2)"
+    # (b) THE TIME BOUND IS PER ROOT. Two roots, one aged tree each, a one-second budget and a census
+    #     that costs two: under PER-ROOT deadlines both roots spend their own budget on their own census
+    #     and BOTH report the gate above the removal; under ONE pass-wide deadline the second root's
+    #     first candidate is already over budget and stops at the PRE-census gate instead.
+    r1="$FB/root3"; r2="$FB/root4"
+    mkdir -p "$r1" "$r2"
+    mk_gitless "$r1" a-aged >/dev/null; age_path "$r1/a-aged" 400
+    mk_gitless "$r2" a-aged >/dev/null; age_path "$r2/a-aged" 400
+    slow_held "$FB/slow-lib.sh" "$LIVE_LIB" || { case_check 1 "the slow census library could not be written"; return 1; }
+    OUT="$(HOME="$FB/home" CELL_HOME="" REAP_AW_STATE_DIR="$FB/state" REAP_AW_LOG="$FB/state/log" \
+           REAP_AW_PROC_ROOT="$FB/proc" REAP_AW_LIVE_PATHS="$FB/slow-lib.sh" REAP_AW_BUDGET_SECONDS=1 \
+           bash "$owner" --root "$r1" --root "$r2" --include-gitless --apply 2>&1)"; OUT_RC=$?
+    [ -n "${AW_DEBUG:-}" ] && printf '%s\n' "$OUT" >&2
+    case_check "$([ "$OUT_RC" = 0 ] && echo 0 || echo 1)" "the two-root budget pass exits 0 (rc=$OUT_RC)"
+    case_check "$([ "$(grep -c 'unprocessed worktrees are PRESERVED' <<<"$OUT")" = 2 ] && echo 0 || echo 1)" \
+               "BOTH roots spent their OWN budget on their OWN census (got $(grep -c 'unprocessed worktrees are PRESERVED' <<<"$OUT") of 2 — one pass-wide deadline would stop the second root's first candidate before its census)"
+    case_check "$([ -d "$r1/a-aged" ] && [ -d "$r2/a-aged" ] && echo 0 || echo 1)" \
+               "and neither aged tree was removed"
+    return $((CASE_FAIL > 0))
+}
+
 # ── the suite ────────────────────────────────────────────────────────────────────────────────────────────────
 printf '\nreap-abandoned-worktrees.test.sh — the gitless BOUND (#3278)\n\n'
 
@@ -543,6 +712,9 @@ expect_pass "E a young tree costs no cap unit (the ordering half of the bound)" 
 expect_pass "F the count cap survives as an operator override; a bad seam is refused" case_f "$OWNER"
 expect_pass "G the safety gates this arm carries are unchanged" case_g "$OWNER"
 expect_pass "H the LINKED arm's time bound precedes its census, not just the gitless arm's" case_h "$OWNER"
+expect_pass "I an exhausted ceiling short-circuits the SCAN, not just the census" case_i "$OWNER"
+expect_pass "J the budget gates the REMOVAL, not only the census" case_j "$OWNER"
+expect_pass "K the ceiling AND the time bound are per root" case_k "$OWNER"
 
 # ═══ mutations — one per half of the change ══════════════════════════════════════════════════
 # MUT_CAP removes the ceiling entirely (the #3278 P3 shape this PR deliberately does NOT ship). If case
@@ -653,6 +825,64 @@ if apply_mutation "$OWNER" "$T/mut-linked-budget/reap-abandoned-worktrees.sh" -e
     expect_fail "MUT_LINKED_BUDGET bound confined to gitless — case H must go RED" case_h "$T/mut-linked-budget/reap-abandoned-worktrees.sh"
 else
     bad "MUT_LINKED_BUDGET could not be applied — the linked arm's bound is not being checked any more"
+fi
+
+# MUT_SCAN_SHORTCIRCUIT restores round 10's ORDER: the ceiling still refuses, but only AFTER the
+# eligibility scan. Two single-line edits: the O(1) gate is replaced by a condition that is never true
+# (a variable nothing sets), and the refusal is RE-ADDED on the `git_below` line — the first step of the
+# scan — as a compound condition. Case C stays GREEN (an AGED tree still reaches a refusal and is still
+# capped, so the ceiling is not what this mutant breaks) and case I goes RED (`z-gitbelow` returns at
+# `git_below` with `reason=git-below`, i.e. the arm LOOKED at a tree the ceiling had already refused).
+# That pairing is what makes I the test of the ORDER rather than a second copy of C.
+MUT_SCAN_SHORTCIRCUIT_A='s|if \[ -n "$GITLESS_MAX" \] && \[ "$GITLESS_DONE" -ge "$GITLESS_MAX" \]; then|if [ -n "${MUTANT_NEVER_SET:-}" ]; then|'
+MUT_SCAN_SHORTCIRCUIT_B='s|^            if git_below "$d"; then$|            if git_below "$d" \|\| { [ -n "$GITLESS_MAX" ] \&\& [ "$GITLESS_DONE" -ge "$GITLESS_MAX" ] \&\& { KEPT=$((KEPT + 1)); log_line "KEPT   $d reason=gitless-cap (MUTANT: refusal moved below the scan)"; continue; }; }; then|'
+if apply_mutation "$OWNER" "$T/mut-scan-shortcircuit/reap-abandoned-worktrees.sh" \
+        -e "$MUT_SCAN_SHORTCIRCUIT_A" -e "$MUT_SCAN_SHORTCIRCUIT_B"; then
+    expect_pass "MUT_SCAN_SHORTCIRCUIT the ceiling still refuses a SCANNED tree — case C is not what I tests" \
+        case_c "$T/mut-scan-shortcircuit/reap-abandoned-worktrees.sh"
+    expect_fail "MUT_SCAN_SHORTCIRCUIT refusal moved BELOW the scan — case I must go RED" \
+        case_i "$T/mut-scan-shortcircuit/reap-abandoned-worktrees.sh"
+else
+    bad "MUT_SCAN_SHORTCIRCUIT could not be applied — the order of the refusal is not being checked"
+fi
+
+# MUT_REMOVAL_BUDGET deletes the gate ABOVE the destructive call (leaving the pre-census one intact).
+# Round 11 measured that this exact edit left all 20 shipped cases green: every fixture either
+# dry-runs (where the gate is skipped) or runs BUDGET=0 (where the pre-census gate has already fired).
+# Case J must go RED — the tree is reaped although the census consumed the budget.
+MUT_REMOVAL_BUDGET='s|^budget_before_removal() { budget_spent "$1"; }|budget_before_removal() { return 1; }|'
+if apply_mutation "$OWNER" "$T/mut-removal-budget/reap-abandoned-worktrees.sh" -e "$MUT_REMOVAL_BUDGET"; then
+    expect_fail "MUT_REMOVAL_BUDGET the budget no longer gates the removal — case J must go RED" \
+        case_j "$T/mut-removal-budget/reap-abandoned-worktrees.sh"
+else
+    bad "MUT_REMOVAL_BUDGET could not be applied — the gate above the destructive call is not being checked"
+fi
+
+# MUT_ROOT_CEILING hoists `GITLESS_DONE` to PASS scope: one ceiling for the whole pass instead of one per
+# root. Round 11 measured that it left all 20 shipped cases green (every fixture builds ONE root).
+# Case K's first half must go RED: 20 removable becomes 10, and 4 capped becomes 14.
+MUT_ROOT_CEILING_A='s| _refc GITLESS_DONE=0$| _refc|'
+MUT_ROOT_CEILING_B='s|^CAND=0; REAPED=0;|GITLESS_DONE=0; CAND=0; REAPED=0;|'
+if apply_mutation "$OWNER" "$T/mut-root-ceiling/reap-abandoned-worktrees.sh" \
+        -e "$MUT_ROOT_CEILING_A" -e "$MUT_ROOT_CEILING_B"; then
+    expect_fail "MUT_ROOT_CEILING one ceiling for the whole pass — case K must go RED" \
+        case_k "$T/mut-root-ceiling/reap-abandoned-worktrees.sh"
+else
+    bad "MUT_ROOT_CEILING could not be applied — the ceiling's per-root scoping is not being checked"
+fi
+
+# MUT_ROOT_BUDGET hoists `deadline` to PASS scope: one budget for the whole pass instead of one per root.
+# Same story — unfalsifiable with a single root (measured, review round 11). Case K's second half must go
+# RED: the second root's first candidate stops at the PRE-census gate (its row says `unprocessed trees`),
+# so the count of `unprocessed worktrees` rows falls from 2 to 1.
+MUT_ROOT_BUDGET_A='s|^    deadline=\$(( \$(now) + BUDGET ))$|    deadline="$PASS_DEADLINE"|'
+MUT_ROOT_BUDGET_B='s|^CAND=0; REAPED=0;|PASS_DEADLINE=$(( $(now) + BUDGET )); CAND=0; REAPED=0;|'
+if apply_mutation "$OWNER" "$T/mut-root-budget/reap-abandoned-worktrees.sh" \
+        -e "$MUT_ROOT_BUDGET_A" -e "$MUT_ROOT_BUDGET_B"; then
+    expect_fail "MUT_ROOT_BUDGET one budget for the whole pass — case K must go RED" \
+        case_k "$T/mut-root-budget/reap-abandoned-worktrees.sh"
+else
+    bad "MUT_ROOT_BUDGET could not be applied — the budget's per-root scoping is not being checked"
 fi
 
 printf '\n  %d passed, %d failed\n\n' "$PASS" "$FAIL"

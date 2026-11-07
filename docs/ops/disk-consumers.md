@@ -311,7 +311,10 @@ default 10 per root). #3278 changed **when that ceiling is charged**, not its si
 taken after the age floor and before the live-pid census, so the ten slots go to AGED trees instead of
 being spent on the young ones the floor preserves anyway — that mis-charging was what starved the class
 (a dry run classified 10 of 3,314 entries and printed `gitless-cap` for 3,137, ~89 % of the slots
-having gone to trees the floor would have kept). **Raising or removing the ceiling is #3278's P3, an
+having gone to trees the floor would have kept). **An exhausted ceiling short-circuits the eligibility
+scan too**, so the scan is bounded by the ceiling as well as by the class timeout — past the ceiling a
+tree costs one compare, and its row names the ceiling rather than its own reason (the arm did not look;
+the tree is preserved either way). **Raising or removing the ceiling is #3278's P3, an
 owner decision, and has not been taken.**
 **#3043's remaining scope** is therefore the trees a `.git`-owned arm claims (they keep their own
 `open-pr`/`dirty`/`main-checkout` proofs) plus whatever the ceiling and the pass's time bound leave for
