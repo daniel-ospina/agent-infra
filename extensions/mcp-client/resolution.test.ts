@@ -1081,6 +1081,82 @@ await test("an UNRECOGNISED or non-string `type` earns no contradiction note (it
   );
 });
 
+await test("a COHERENT `type` never reports a disagreement (the other half of the check)", async () => {
+  // The suite pinned that the note FIRES for a contradiction, and that it is silent for an
+  // unrecognised/non-string `type` and for a base entry the repo never wrote — but nothing drove a
+  // COHERENT `type` through the reporting paths and asserted silence. Measured: mutating the stdio
+  // branch of `typeDisagrees` (`declaresHttp && !declaresStdio` -> `declaresHttp || declaresStdio`),
+  // which makes EVERY `{type:"stdio", command:…}` entry claim a disagreement, left this suite at
+  // 64 passed / 0 failed. A spurious "disagrees with its transport" on a perfectly valid entry is the
+  // diagnostic an operator learns to ignore, which is how the real one gets missed.
+  let merged: Record<string, unknown> = {};
+  const logs = await withCapturedLogs(async () => {
+    merged = mergeMcpLayers(
+      { mcpServers: {} } as never,
+      {
+        mcpServers: {
+          s: { type: "stdio", command: "npx", args: ["-y", "@good/mcp"], lazy: true },
+          h: { type: "http", url: "https://api.example/mcp/", lazy: true },
+          s2: { type: "streamable-http", url: "https://api.example/mcp2/" },
+        },
+      } as never,
+    );
+  });
+  ok(merged.s && merged.h && merged.s2, "a coherent `type` on a repo-only entry is kept");
+  ok(
+    !logs.some(l => l.includes("disagrees with its transport")),
+    `a coherent \`type\` agrees with its transport and must not be reported — got:\n${logs.join("\n")}`
+  );
+  // …and the same for a BASE entry, which the merge copies verbatim and `asMcpJson` reports: a
+  // coherent base label must stay silent on BOTH paths or the note cries wolf on every session.
+  const baseLogs = await withCapturedLogs(async () => {
+    mergeMcpLayers(
+      { mcpServers: { t: { type: "stdio", command: "npx", args: ["-y", "@good/mcp"], lazy: true } } } as never,
+      { mcpServers: { t: { timeoutMs: 40000 } } } as never,
+    );
+  });
+  ok(
+    !baseLogs.some(l => l.includes("disagrees with its transport")),
+    `a coherent BASE \`type\` must not be reported either — got:\n${baseLogs.join("\n")}`
+  );
+});
+
+await test("a FALSY transport is not a delta value — the base's working transport survives", async () => {
+  // `declaresTransport` refuses to call `""`/`null` a declared transport, but the per-field spread then
+  // copied the falsy value OVER the base's working one: a repo `{"url": ""}` turned
+  // `{url: "https://base/mcp", headers: {Authorization: …}}` into `{url: ""}` — an entry
+  // `connectServer` rejects with "has neither 'command' nor 'url'", with the credentials already
+  // dropped and no note about the entry becoming unusable. The LAYER READ resolves the identical input
+  // the other way (`asMcpJson` deletes the falsy field and keeps the base entry), so the two readers
+  // disagreed about one config — and the merge advertises itself as "the belt for a caller that hands
+  // the merge raw JSON".
+  const logs = await withCapturedLogs(async () => {
+    const http = mergeMcpLayers(
+      { mcpServers: { s: { url: "https://base/mcp", headers: { Authorization: "Bearer K" }, lazy: true } } } as never,
+      { mcpServers: { s: { url: "" } } } as never,
+    );
+    const httpEntry = http.s as Record<string, unknown>;
+    equal(httpEntry?.url, "https://base/mcp", "a `url: \"\"` delta does not overwrite the base's working transport");
+    equal(
+      (httpEntry?.headers as Record<string, unknown>)?.Authorization,
+      "Bearer K",
+      "and it is not a changed destination, so the base's credentials are not dropped either"
+    );
+
+    const stdio = mergeMcpLayers(
+      { mcpServers: { s: { command: "npx", args: ["-y", "@good/mcp"], env: { KEY: "k" }, lazy: true } } } as never,
+      { mcpServers: { s: { command: null } } } as never,
+    );
+    const stdioEntry = stdio.s as Record<string, unknown>;
+    equal(stdioEntry?.command, "npx", "a `command: null` delta does not overwrite the base's launch either");
+    equal((stdioEntry?.env as Record<string, unknown>)?.KEY, "k", "nor does it drop the base's env");
+  });
+  ok(
+    !logs.some(l => l.includes("changes the destination")),
+    `a falsy field changed nothing, so no drop note is owed — got:\n${logs.join("\n")}`
+  );
+});
+
 await test("the credential-drop note is grammatical for `headers` (agreement follows the noun, not the count)", async () => {
   // `headers` is ONE field but a plural noun, so keying `is`/`are` on `dropped.length` printed
   // "the base's headers is NOT inherited" — in the one diagnostic an operator reads to understand why

@@ -845,6 +845,20 @@ export function mergeMcpLayers(
       );
       continue;
     }
+    // ⛔ A FALSY TRANSPORT IS NOT A DELTA VALUE — IT IS THE ABSENCE OF ONE (#3628 review round 3).
+    // `declaresTransport` already refuses to treat `""`/`null` as a declared transport, but the spread
+    // below then copied the falsy value OVER the base's working one: a repo `{"url": ""}` turned
+    // `{url: "https://base/mcp", headers: …}` into `{url: ""}` — an entry `connectServer` rejects with
+    // "has neither 'command' nor 'url'", credentials already dropped, and nothing said so. That is also
+    // what the LAYER READ does with the identical input (`asMcpJson` deletes the falsy field, keeping
+    // the base entry), and the two readers must not disagree about one config.
+    // ⛔ Only DEFINED-but-falsy values are stripped. A present TRUTHY non-string (`{"url": ["…"]}`) is
+    // deliberately kept: it is a typo that must still count as a CHANGED destination, so the credential
+    // guards below see it rather than reading it as "no transport declared".
+    const delta = { ...entry } as Record<string, unknown>;
+    for (const field of ["url", "command"] as const) {
+      if (delta[field] !== undefined && !delta[field]) delete delta[field];
+    }
     const carry = { ...inherited } as Record<string, unknown>;
     // The base's `type` describes the base's transport, so it must not outlive a SWITCH: keeping it
     // beside the new transport produced `{type:"http", command:…}` — a stale label contradicting the
@@ -878,8 +892,8 @@ export function mergeMcpLayers(
     // typo that `connectServer` STRINGIFIES into a real request, so it must be treated as a changed
     // destination, not as "no transport declared". (The layer read rejects such an entry anyway; this
     // is the belt for a caller that hands the merge raw JSON.)
-    const projected = { ...carry, ...entry } as unknown as McpServerConfig;
-    if (typeDisagrees(projected) && hasField(entry, "type")) {
+    const projected = { ...carry, ...delta } as unknown as McpServerConfig;
+    if (typeDisagrees(projected) && hasField(delta, "type")) {
       // Only a warning, for the reason recorded on RECOGNISED_TYPES: `type` is inert here, so dropping
       // or ignoring the delta would destroy a working config over a field this client never reads.
       // Attributed to the repo entry ONLY when the repo is the one that wrote a `type`: the projection
@@ -919,7 +933,7 @@ export function mergeMcpLayers(
       }
     }
 
-    merged[name] = { ...carry, ...entry };
+    merged[name] = { ...carry, ...delta };
   }
   return merged;
 }
