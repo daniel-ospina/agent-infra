@@ -1949,12 +1949,18 @@ MUTATIONS = [
         "the snapshot fields are Unicode-trimmed, so a lease with a TRAILING separator becomes a pure "
         "digit string and reads as a real (expired) term \u2014 FREE",
     ),
+    # ⛔ THE ANCHOR IS THE SHIPPED LINE, VERBATIM. Rounds 22 and 28 rewrote `_COMMITTER_TIME_RE`
+    # (the `.*> ` field, then the `[ \t]*` blank class) and this mutation kept the pre-round-22
+    # spelling, so `--mutations` aborted here with "anchor not unique … (0 hits)" — every mutation
+    # AFTER this one went unexercised and CI's mutation step read RED. A mutation anchor is a copy of
+    # the shipped line: when the line moves, the anchor moves with it, or the evidence silently stops
+    # being collected.
     Mutation(
         "L30", "reader",
-        '_COMMITTER_TIME_RE = re.compile(r"^committer .* ([0-9]+) [+-][0-9]{4}$", re.M)',
-        '_COMMITTER_TIME_RE = re.compile(r"^committer .* ([0-9]+) [+-][0-9]{4}[ \\t]*$", re.M)',
-        "the committer stamp is accepted with trailing whitespace and any length, so an object the "
-        "oracle calls UNMEASURABLE is dated here and the bounded reap is measured from a guess",
+        '_COMMITTER_TIME_RE = re.compile(r"^committer .*>[ \\t]*([0-9]+) [+-][0-9]{4}$", re.M)',
+        '_COMMITTER_TIME_RE = re.compile(r"^committer .*>[ \\t]*([0-9]+) [+-][0-9]{4}[ \\t]*$", re.M)',
+        "the committer stamp is accepted with trailing whitespace, so an object the oracle calls "
+        "UNMEASURABLE is dated here and the bounded reap is measured from a guess",
     ),
     Mutation(
         "L30", "reader",
