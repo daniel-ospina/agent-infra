@@ -482,15 +482,21 @@ LANE_PRODUCERS_FOREIGN_RESIDUAL="cmux_dispatch.py:#1957"
 # undeclared entry here would grow the `DELIVERED BY NOTHING` set by two names while the PR reported
 # itself clean (measured: this landing adds exactly `script:install-ci-runner-x64.sh` and
 # `script:runner_autoscale.py` to it).
-# `cloud-cell-doctor.sh` joined on 2026-11-06 (#3530) — the fourth producer a farmed consumer now
-# EXECS, and the one the farm cannot carry. `cloud-cell-supervisor.sh` (farmed below, beside the
-# `cloud-cell-quiesce.sh` that execs it) resolves the doctor by absolute path and `die`s without it
-# (`doctor_path`, `die "cloud-cell-doctor.sh not found"`), but it does not exist at
-# `scripts/cloud-cell-doctor.sh` at all: it lives at `scripts/orchestrator-harness/cloud-cell-doctor.sh`,
-# a DIFFERENT destination delivered by the harness installer, whose file list is not one of FARM_ARRAYS
-# (the suite names that boundary itself below). #3530 owns whether it gains an `harness_srcs` array or a
-# first-class residual list; until then it is WITHHELD and DECLARED, never silently undelivered.
-LANE_PRODUCERS_EXEMPT="lane-status.py:#1553 heartbeat-loop.sh:#1553 install-ci-runner-x64.sh:#2403 runner_autoscale.py:#2403 repo-target.sh:#3174 cloud-cell-doctor.sh:#3530"
+# `cloud-cell-doctor.sh` was EXEMPTED HERE on 2026-11-06 (#3530) and is now DELIVERED instead — the
+# exemption is GONE because its stated reason was false. It read "it does not exist at
+# `scripts/cloud-cell-doctor.sh` at all … whose file list is not one of FARM_ARRAYS": but
+# `mcp_harness_srcs` IS in `FARM_ARRAYS` below, and it is precisely the src-one-down / dest-flat array
+# that writes `$INFRA_ROOT/scripts/orchestrator-harness/<base>` to `$DEST/scripts/<base>` — exactly
+# the path `cloud-cell-supervisor.sh`'s `doctor_path()` resolves as
+# `$(dirname "$SUP_SELF")/cloud-cell-doctor.sh` (:4530), and `run_role` `die`s without it (:4550).
+# The doctor is now a member of that array, so it arrives beside the farmed supervisor.
+# ⛔ THE FALSE BLOCK THIS REMOVED is why it matters and must not come back: the `script)` disposition
+# branch below enumerated FOUR flat arrays and not `mcp_harness_srcs`, so farming the doctor and
+# dropping this exemption went RED — `DELIVERED BY NOTHING: cloud-cell-doctor.sh` — over a file
+# `setup.sh` then delivers. That was the in-file "natural remedy for a false block is to widen the
+# exemption list, i.e. to weaken the gate" hazard firing for real. The branch now consults every flat
+# array `FARM_ARRAYS` names.
+LANE_PRODUCERS_EXEMPT="lane-status.py:#1553 heartbeat-loop.sh:#1553 install-ci-runner-x64.sh:#2403 runner_autoscale.py:#2403 repo-target.sh:#3174"
 # A ROOT of the derivation rather than a producer found by it: `heartbeat-loop.sh` is run by a launchd job
 # on the owner's box (no plist template in this repo names it; the label `com.tortoise.heartbeat-loop`
 # appears only in a comment at scripts/lane-status.py:41) and NO farmed consumer execs it (measured at
@@ -518,6 +524,14 @@ farm_source_dir() { # <array-name> -> the repo dir its entries are read from
     # #3486 farms `lane_registry.py` FLAT into `$DEST/scripts/` from the harness subdirectory, so its
     # SOURCE dir is one down even though its destination is not — the reason it is its own array and
     # not a `fleet_srcs` member (that array resolves every source as `$INFRA_ROOT/scripts/$base`).
+    # `cloud-cell-doctor.sh` rides the same array and the same src-one-down / dest-flat shape, which is
+    # the destination `cloud-cell-supervisor.sh`'s `doctor_path()` resolves beside itself.
+    # ⛔ THIS ARM IS PROBED, not merely asserted: PROBE_CLOSURE declares an `mcp_harness_srcs` root whose
+    # source lives at `scripts/orchestrator-harness/` and which execs a producer. Delete this arm and
+    # that root resolves to `scripts/mcp-root.py` (absent) → skipped → its producer silently leaves the
+    # population → the closure comparison names it. Without that probe the arm was UNFALSIFIABLE: the
+    # only live entry (`lane_registry.py`) execs nothing, so no mutation of this diff could redden it
+    # (#3442 rule 3, the inert-assertion class).
     mcp_harness_srcs) printf 'scripts/orchestrator-harness' ;;
     *)           printf 'scripts' ;;
   esac
@@ -570,27 +584,42 @@ state:lane-confirm.py state:lane-triage.py state:lane-verdict.py
 foreign:cmux_dispatch.py
 other:orchestrator-harness/brief-gate.sh other:orchestrator-harness/capacity.sh
 other:orchestrator-harness/cloud-cell-doctor.sh"
-# RE-CUT 2026-11-06 (computed by `--cut`, never hand-typed), nine producers ADDED and NONE removed:
-# `admin-merge.sh`, `cloud-cell-doctor.sh`, `cloud-cell-supervisor.sh`, `install-controller-service.sh`,
-# `fleet-schedule.py`, `pi-cache-reap.sh`, `reap-lane-venvs.sh`, `registry-sync.sh`, and the `other:`
-# form of `cloud-cell-doctor.sh`.
+# RE-CUT 2026-11-07 (computed by `--cut`, never hand-typed): NINE PIN LINES added, NONE removed,
+# covering EIGHT distinct files — the doctor appears twice, as `script:cloud-cell-doctor.sh` (the flat
+# `$DEST/scripts/` location) and as `other:orchestrator-harness/cloud-cell-doctor.sh` (the $O payload).
+# `admin-merge.sh`, `cloud-cell-doctor.sh`×2, `cloud-cell-supervisor.sh`,
+# `install-controller-service.sh`, `fleet-schedule.py`, `pi-cache-reap.sh`, `reap-lane-venvs.sh`,
+# `registry-sync.sh`.
 #
-# FOUR of them were `DELIVERED BY NOTHING` — the #1552 shape the same run names: a fresh
+# FOUR of the eight were `DELIVERED BY NOTHING` — the #1552 shape the same run names: a fresh
 # `$DEST/scripts` gets a farmed consumer WITHOUT the executable it calls. Verified against the CODE,
 # not the diff (#1899):
-#   · `cloud-cell-quiesce.sh` (fleet_srcs) resolves and EXECs the supervisor — `for c in
-#     "$REPO/scripts/cloud-cell-supervisor.sh" …` then `bash "$SW" stop` (:44-55).
-#   · `cloud-cell-supervisor.sh` execs `cloud-cell-doctor.sh` (`doctor_path`/`die "cloud-cell-doctor.sh
-#     not found"`, :4247-4261) and names `install-controller-service.sh --install` as its own repair
-#     (:3410, :4020).
-#   · `admin-merge.sh` is the merge rail the gate set already carries by name
-#     (`record-review.sh:627` allow-lists it beside `verify-admin-merge-evidence.sh`).
-# So all four are FARMED rather than exempt: `cloud-cell-{doctor,supervisor}.sh` and
-# `install-controller-service.sh` join `fleet_srcs` (destination `$DEST/scripts/`, beside the
-# `cloud-cell-quiesce.sh` that calls them), and `admin-merge.sh` joins `merge_gate_srcs` (beside
-# `verify-admin-merge-evidence.sh`). The remaining five were already DELIVERED and are a pure re-pin.
-# The closure scans each of these files already, so farming them adds no new producers — it only
-# delivers the ones the adjacent consumer calls.
+#   · `cloud-cell-quiesce.sh` (fleet_srcs) resolves and EXECs the supervisor — the
+#     `for c in "$REPO/scripts/cloud-cell-supervisor.sh" …` loop then `bash "$SW" stop` (:44-55).
+#   · `cloud-cell-supervisor.sh` execs `cloud-cell-doctor.sh` — `doctor_path()` (:4530) and
+#     `die "cloud-cell-doctor.sh not found …"` (:4550) — and names `install-controller-service.sh
+#     --install` as its own repair (:3654, :4264).
+#   · `cloud-cell-doctor.sh` execs the rail: `${SUPERVISOR:+$(dirname "$SUPERVISOR")/admin-merge.sh}`
+#     (:1153) and `$CELL_HOME/.pi/agent/scripts/admin-merge.sh` (:1157).
+# So all four are FARMED rather than exempt, each into the FLAT array whose destination its consumer
+# resolves:
+#   · `cloud-cell-supervisor.sh` + `install-controller-service.sh` → `fleet_srcs` (destination
+#     `$DEST/scripts/`, beside the `cloud-cell-quiesce.sh` that calls them);
+#   · `cloud-cell-doctor.sh` → `mcp_harness_srcs`, the src-one-down / dest-flat array
+#     (`scripts/orchestrator-harness/` → `$DEST/scripts/`) — exactly what `doctor_path()` resolves as
+#     `$(dirname "$SUP_SELF")/cloud-cell-doctor.sh` beside the farmed supervisor. It was EXEMPTED
+#     under #3530 on the claim that no farm array could carry it; that claim was false (the array's
+#     loop is content-agnostic and `cell-install.sh:FARM_LAYOUT` already maps it), and the exemption
+#     is DELETED — it would now read STALE;
+#   · `admin-merge.sh` → `merge_gate_srcs` (flat `$DEST/scripts/`). Its independent corroboration is
+#     `record-review.sh`'s always-review-the-full-surface list, which carries `scripts/admin-merge.sh`
+#     BY NAME (:719, `review_full_surface_path`) — ⛔ NOT "beside `verify-admin-merge-evidence.sh`":
+#     that string does not occur in `record-review.sh` at all (`grep -c` = 0), and the pair shares no
+#     list. The rail is genuinely exec'd by a farmed consumer, which is what justifies the farm entry.
+# The remaining FOUR were already DELIVERED and are a pure re-pin: `fleet-schedule.py`,
+# `pi-cache-reap.sh`, `reap-lane-venvs.sh`, `registry-sync.sh` (all members of `fleet_srcs`).
+# The closure already scanned the three cell scripts as producers, so farming them adds no new
+# producers — it only DELIVERS the ones the adjacent consumer calls.
 #
 # `script:harness-apply-pass.sh` joined on 2026-10-23 (PR #2427): the harness-apply timer's unit and
 # its plist exec the pass (`install-harness-apply-timer.sh` renders both from templates/), so it is a
@@ -944,9 +973,19 @@ check_producer_farm_declared() { # <label> <derived-population>
       script)
         # Every FLAT array counts: `lane_root_srcs` is absent on this tree until #1553 (the membership
         # branch simply goes false), and `merge_gate_srcs` also lands in `$DEST/scripts/`.
+        # ⛔ `mcp_harness_srcs` is a FLAT destination too, and omitting it was a FALSE BLOCK, not a
+        # conservative default: it copies `scripts/orchestrator-harness/<base>` to `$DEST/scripts/<base>`
+        # (`setup.sh`, the loop under `mcp_harness_srcs=`), so a producer it delivers IS at the flat
+        # `agent/scripts/<n>` location every other arm here is testing for. Before this arm existed the
+        # gate refused the CORRECT remedy for `cloud-cell-doctor.sh` — farm it, drop the #3530
+        # exemption — with `DELIVERED BY NOTHING`, over a file `setup.sh` then wrote; the documented
+        # remedy for a false block is to widen the exemption list, i.e. to WEAKEN the gate. Enumerate
+        # the array by NAME, from `FARM_ARRAYS`, so a future flat array cannot reintroduce the gap
+        # (the root-set floor below already refuses an unread array).
         if farm_declares fleet_srcs "$name" "$root" || farm_declares lane_root_srcs "$name" "$root" \
            || farm_declares merge_gate_srcs "$name" "$root" \
-           || farm_declares graph_srcs "$name" "$root"; then
+           || farm_declares graph_srcs "$name" "$root" \
+           || farm_declares mcp_harness_srcs "$name" "$root"; then
           delivered=$((delivered+1)); continue
         fi
         # The fleet directory IS a real deployed location (`setup.sh` mkdirs `$DEST/scripts/fleet/`), so
@@ -1204,9 +1243,9 @@ fi
 # and must REPORT an entrypoint handed to it, from a synthetic tree so the probe cannot drift with the
 # real repo.
 PROBE_CLOSURE="$TMP/producer-closure"
-mkdir -p "$PROBE_CLOSURE/scripts" "$PROBE_CLOSURE/scripts/lib" "$PROBE_CLOSURE/pi-bootstrap" \
-  "$PROBE_CLOSURE/tools/fleet"
-printf 'fleet_srcs=(root.sh)\nlib_srcs=(lib-root.sh)\nmerge_gate_srcs=()\nfleet_tools=(tool-fleet.py)\n' > "$PROBE_CLOSURE/pi-bootstrap/setup.sh"
+mkdir -p "$PROBE_CLOSURE/scripts" "$PROBE_CLOSURE/scripts/lib" "$PROBE_CLOSURE/scripts/orchestrator-harness" \
+  "$PROBE_CLOSURE/pi-bootstrap" "$PROBE_CLOSURE/tools/fleet"
+printf 'fleet_srcs=(root.sh)\nlib_srcs=(lib-root.sh)\nmerge_gate_srcs=()\nfleet_tools=(tool-fleet.py)\nmcp_harness_srcs=(mcp-root.py)\n' > "$PROBE_CLOSURE/pi-bootstrap/setup.sh"
 printf '#!/bin/bash\nY=$(/usr/bin/python3 "$SCRIPTS/hop1.py")\n' > "$PROBE_CLOSURE/scripts/root.sh"
 printf '#!/bin/bash\nZ=$(/usr/bin/python3 "$SCRIPTS/hop2.py")\n' > "$PROBE_CLOSURE/scripts/hop1.py"
 # A subdirectory dest (`$SCRIPTS/fleet/<n>`) must be followed to its REAL source dir (`tools/fleet/`),
@@ -1220,6 +1259,13 @@ printf '#!/bin/bash\nF=$(/usr/bin/python3 "$SCRIPTS/hop-fleet.py")\n' > "$PROBE_
 # site is the proof — with the arm wrong the root is never found, `hop4.py` silently leaves the
 # population, and the set comparison stays green because it compares two sets that agree.
 printf '#!/bin/bash\nL4=$(/usr/bin/python3 "$SCRIPTS/hop4.py")\n' > "$PROBE_CLOSURE/scripts/lib/lib-root.sh"
+# An `mcp_harness_srcs` ROOT — the SAME proof for the src-one-down / dest-flat arm (`scripts/
+# orchestrator-harness/` → `$DEST/scripts/`). Its live entry (`lane_registry.py`) execs nothing, so
+# without this root deleting the arm reddens NOTHING: `scripts/lane_registry.py` does not exist and the
+# `[ -f ]` guard skips it silently. That is #3442 rule 3 exactly — an assertion whose value cannot vary
+# under any mutation of the diff. With this root, deleting the arm resolves `mcp-root.py` under
+# `scripts/` (absent) and `hop-mcp.py` leaves the population, which the comparison NAMES.
+printf '#!/bin/bash\nMC=$(/usr/bin/python3 "$SCRIPTS/hop-mcp.py")\n' > "$PROBE_CLOSURE/scripts/orchestrator-harness/mcp-root.py"
 printf '#!/bin/bash\nS=$(/usr/bin/python3 "$SCRIPTS/lib/shared.sh")\n' > "$PROBE_CLOSURE/scripts/entry.sh"
 # SAME BASENAME, DIFFERENT FILE: `entry3.sh` execs `lib/entry3.sh`. The self-edge filter must keep it —
 # a basename-blind filter drops it, the closure never enqueues `scripts/lib/entry3.sh`, and `hop5.py`
@@ -1233,11 +1279,11 @@ printf '#!/bin/bash\nS2=$(/usr/bin/python3 "$SCRIPTS/hop3.py")\n' > "$PROBE_CLOS
 closure_want="$(printf '%s\n' \
   lib:entry3.sh lib:shared.sh other:fleet/other-tool.py script:entry.sh script:entry2.sh \
   script:entry3.sh script:hop-deep.py \
-  script:hop-fleet.py script:hop1.py script:hop2.py script:hop3.py script:hop4.py \
+  script:hop-fleet.py script:hop-mcp.py script:hop1.py script:hop2.py script:hop3.py script:hop4.py \
   script:hop5.py state:lane-x.py | sort)"
 closure_got="$(derive_lane_producers "$PROBE_CLOSURE" scripts/entry.sh scripts/entry2.sh scripts/entry3.sh | sort -u)"
 if [ "$closure_got" = "$closure_want" ]; then
-  echo "ok: the producer closure is TRANSITIVE, follows a subdir dest to its real source dir, reads each root from its own dir, keeps a SAME-BASENAME substrate that is a different file, and reports EVERY entrypoint (5 hops + 3 entrypoints) (#1899)"
+  echo "ok: the producer closure is TRANSITIVE, follows a subdir dest to its real source dir, reads each root from its own dir (fleet_tools, lib_srcs AND the src-one-down mcp_harness_srcs), keeps a SAME-BASENAME substrate that is a different file, and reports EVERY entrypoint (6 hops + 3 entrypoints) (#1899)"
 else
   fail "the producer closure is not transitive — got:$(printf '\n  %s' $closure_got | tr '\n' '|') want:$(printf '\n  %s' $closure_want | tr '\n' '|') (#1899)"
 fi
