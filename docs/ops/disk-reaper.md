@@ -957,8 +957,9 @@ ONCE per remote per pass, that fact is **re-proved against the remote at the mom
 removal** (`remote_holds_recheck`: one targeted `ls-remote --heads <remote> refs/heads/<branch>`,
 same exact refname+sha compare). The snapshot is CLASSIFICATION evidence; a branch auto-deleted on
 merge between the snapshot and the fork would otherwise make "the remote still holds this head"
-false at the instant a checkout with **no backup** is destroyed. The cost is one round trip per
-REMOVAL (the work the pass exists to do), not per candidate. A failed, timed-out or empty targeted
+false at the instant a checkout with **no backup** is destroyed. The cost is two round trips per
+REMOVAL (classification, then again at the fork — the work the pass exists to do), not per candidate;
+and the second is the decisive one. A failed, timed-out or empty targeted
 probe at removal time preserves.
 The remote's own `refs/heads/*` are
 read by ONE bounded `git ls-remote --heads <remote>` **per remote per pass** (#3371) and cached for

@@ -2443,14 +2443,15 @@ path_ctime() {
 #
 # ⛔ AND IT IS CLASSIFICATION EVIDENCE, NOT REMOVAL EVIDENCE: the snapshot can be minutes old by
 # the time a late row is removed with no backup, so `remote_holds_recheck` re-takes the targeted
-# probe at the moment of the fork (one round trip per REMOVAL, not per candidate).
+# probe at the moment of the fork (two round trips per REMOVAL — classification and fork — not per
+# candidate).
 #
 # ⛔ THE DEAD-REMOTE CACHE IS A FILE, NOT A VARIABLE. This function is called from inside a
 # COMMAND SUBSTITUTION (`refs=$(commits_survive …)`), so nothing it assigns survives the call:
 # an in-process cache would be a cache that never hits while looking exactly like one.
 REMOTE_DEAD_FILE=""
 
-remote_is_dead() { # <remote> -> 0 when this pass already saw its ls-remote fail
+remote_is_dead() { # <remote> -> 0 when this pass found the remote UNUSABLE (transport failure, or a failed cache write)
     [ -n "$REMOTE_DEAD_FILE" ] && [ -s "$REMOTE_DEAD_FILE" ] || return 1
     grep -qxF -- "$1" "$REMOTE_DEAD_FILE" 2>/dev/null
 }
@@ -2524,16 +2525,25 @@ remote_advertise() { # <remote> -> 0 when that remote's `refs/heads/*` snapshot 
     #     written before the refname, so it survives intact — and the `n == 1` guard never sees it,
     #     because the truncated line is not a duplicate of `want`. That is a FABRICATED
     #     `remote-holds`, i.e. a NO-BACKUP removal on a torn record.
-    # So BOTH arms call `remote_mark_dead`, the file's durable per-pass suppression: the CURRENT
-    # candidate returns 1 (caller PRESERVES) and every later candidate for that remote short-circuits
-    # at `remote_is_dead` BEFORE the matcher, so the poisoned snapshot is never read again.
-    # ⛔ `remote_mark_dead` is a per-pass "unusable this pass" record — NOT a claim the remote is gone.
+    # So BOTH arms TRUNCATE THE SNAPSHOT FILE and then best-effort `remote_mark_dead`.
+    # ⛔ THE TRUNCATION IS THE ACTUAL SAFETY, THE MARK-DEAD IS ONLY THE COST FIX (#3371 review cycle 3,
+    # P1). `remote_mark_dead` appends to `$REMOTE_DEAD_FILE`, which sits under the SAME tmpdir: on
+    # ENOSPC the one write that just failed will fail again, and it fails SILENTLY (`|| true`), so
+    # `remote_is_dead` would answer 1 and the matcher would read the torn snapshot after all — a
+    # closure that needs a write to succeed immediately after a write failed is not a closure. A
+    # truncate needs no free space (it RELEASES blocks), so `: >file` is the one operation that still
+    # works on the box this matters on. It discards EVERY remote's snapshot, not just this one; the
+    # others are simply re-advertised, which is cost, never safety.
+    # ⛔ And without the mark-dead, truncation alone re-probes once per candidate (the retry storm):
+    # truncate = safe, mark-dead = cheap, and they do not share a failure mode.
     if ! printf 'R %s\n' "$remote" >>"$REMOTE_ADV_FILE" 2>/dev/null; then
+        : >"$REMOTE_ADV_FILE" 2>/dev/null || true
         remote_mark_dead "$remote"
         return 1
     fi
     if ! awk -v r="$remote" 'NF >= 2 { printf "A %s %s %s\n", r, $1, $2 }' "$GIT_OUT" \
             >>"$REMOTE_ADV_FILE" 2>/dev/null; then
+        : >"$REMOTE_ADV_FILE" 2>/dev/null || true
         remote_mark_dead "$remote"
         return 1
     fi
@@ -2599,15 +2609,17 @@ remote_holds_probe() { # <sha> <refs/remotes/*-holder> -> "remote-holds:<remote>
 # A branch auto-deleted by the remote on merge — the ordinary squash-merge+auto-delete — between the
 # snapshot and the fork makes that sentence false at the instant it is printed, and the commit then
 # dies on the next `fetch --prune`. So the removal path re-takes the SAME evidence the pre-#3371 code
-# took per candidate: ONE targeted `ls-remote --heads <remote> refs/heads/<branch>`, exact refname +
-# exactly this sha. The cost is one round trip per REMOVAL (the work the pass exists to do), not per
-# candidate — the classification cost stays at one advertisement per remote.
+# took per candidate: one targeted `ls-remote --heads <remote> refs/heads/<branch>`, exact refname +
+# exactly this sha. ⛔ The cost is TWO round trips per REMOVAL, not one, because the re-proof runs at
+# BOTH ends of remove_one (the classify loop, then again as re-check #3 immediately before the fork —
+# see the note there) — 2x the price the pre-#3371 code paid per candidate, paid only by the rows the
+# pass actually destroys. The classification cost stays at one advertisement per remote.
 # FAIL-CLOSED: an unreadable remote list, a failed/timed-out probe, an unadvertised refname or a
 # different sha all return 2, and 2 is the file's existing "preserved, nothing removed" arm — never
 # an exit 4. (The branch is re-derived from the reason token rather than passed in because the probe
 # that minted it ran inside a command substitution, so its globals never reach this point.)
-remote_holds_recheck() { # <path> <sha> <reason>
-    local path="$1" sha="$2" why="$3" rest remote branch best out rc
+remote_holds_recheck() { # <path> <sha> <reason> [phase] -> 0 to proceed, 2 to PRESERVE
+    local path="$1" sha="$2" why="$3" phase="${4:-at the fork}" rest remote branch best out rc
     case "$why" in remote-holds:*) ;; *) return 0 ;; esac
     [ -n "$sha" ] || return 2
     rest="${why#remote-holds:}"
@@ -2641,7 +2653,10 @@ remote_holds_recheck() { # <path> <sha> <reason>
         NF >= 2 && $2 == want { n++; if ($1 == sha) hit = 1 }
         END { if (n == 1 && hit == 1) print "yes" }' "$GIT_OUT" 2>/dev/null)"
     [ "$out" = "yes" ] || return 2
-    log "REMOVE-RECHECK $path remote-holds re-proved at removal time: $best refs/heads/$branch=$sha"
+    # ⛔ THE AUDIT LINE NAMES THE PHASE (#3371 review cycle 3, P2). For a no-backup removal the log IS
+    # the proof, and this function is called up to twice per row; a single message meaning "proved"
+    # would let a reader take the classify-time read as the decisive one.
+    log "REMOVE-RECHECK $path remote-holds re-proved $phase: $best refs/heads/$branch=$sha"
     return 0
 }
 
@@ -4385,7 +4400,10 @@ holder_recheck() {
     return 0
 }
 
-# remove_one <path> <sha>
+# remove_one <path> <sha> [branch] [reason]
+# ⛔ `reason` IS NOT OPTIONAL IN PRACTICE (#3371 review cycle 3, P2): the re-check #3 arm passes it to
+# `remote_holds_recheck`, which returns 0 = PROCEED when it is empty — so a caller that dropped the
+# token would silently disable the network warrant on the one class removed with NO BACKUP.
 # Never --force. Deletes the declared-ephemeral ROOT names first, whether
 # UNTRACKED (`??`, which git DOES refuse on) or IGNORED (`!!`) — clean_gate's
 # root branch collects both, so both are pre-deleted here. NESTED ignored
@@ -4627,15 +4645,20 @@ remove_one() {
     # uncovered — the largest part of the window, by this file's own reasoning for re-check #2.
     # ⛔ AND IT STAYS LAST (#3405 review, P2): gate (b) above runs BEFORE it for exactly this reason.
     holder_recheck "$path" "$sha" || { rm -f "$out"; return 2; }
-    # ⛔ AND THE NETWORK WARRANT IS RE-TAKEN HERE TOO (#3371 review cycle 2, P1). A `remote-holds`
-    # row is removed with NO BACKUP on the warrant "the remote still advertises this head", and the
-    # classify-loop call is up to a whole remove_one away from this line: `clean_gate` #1 (20 s), the
-    # ephemeral `rm` loop (up to REAP_WT_REMOVE_TIMEOUT=120 s each), `clean_gate` #2, then this. So
-    # the fact warranting the destruction could be ~2.5 min and several forks stale — the same
-    # auto-delete-on-merge window, narrowed and NOT closed. Exactly as `holder_recheck` is called
-    # twice for this reason, the EARLY call (classify loop) saves the wasted archive work and THIS one
-    # is the decisive read. rc=2 preserves and keeps the archive.
-    remote_holds_recheck "$path" "$sha" "$why" || { rm -f "$out"; return 2; }
+    # ⛔ AND THE NETWORK WARRANT IS RE-TAKEN HERE TOO (#3371 review cycle 2, P1; window corrected cycle
+    # 3, P2). A `remote-holds` row is removed with NO BACKUP on the warrant "the remote still
+    # advertises this head", and the classify-loop call is far from this line: `clean_gate` #1 (20 s),
+    # gate (b) (the archive, "up to ~4.7 min"), the evidence ladder ("up to ~18 min"), the ephemeral
+    # `rm` loop (up to REAP_WT_REMOVE_TIMEOUT=120 s each) and `clean_gate` #2 — so the fact warranting
+    # the destruction can be ~25 MINUTES stale at the defaults, not the 2.5 min an earlier draft of
+    # this comment claimed. That number IS the argument for this call. Exactly as `holder_recheck` is
+    # called twice for the same reason, the EARLY call (classify loop) saves the wasted archive work
+    # and THIS one is the decisive read. rc=2 preserves and keeps the archive, and it must NAME its
+    # verdict — `REMOVE_SKIP_VERDICT` is what the operator's keep-line prints.
+    if ! remote_holds_recheck "$path" "$sha" "$why"; then
+        case "$why" in remote-holds:*) REMOVE_SKIP_VERDICT="remote-holds-stale" ;; esac
+        rm -f "$out"; return 2
+    fi
 
     run_bounded "$REAP_WT_REMOVE_TIMEOUT" "$out" "$GIT_BIN" -C "$REPO_CANON" worktree remove "$path"
     rc=$?
@@ -4971,8 +4994,11 @@ run() {
         exit 3
     fi
     # The pass's dead-remote cache (#3041). A file, because the probe runs inside a command
-    # substitution; a scratch file that cannot be created simply disables the cache and leaves every
-    # candidate probing on its own — slower, never less safe.
+    # substitution. ⛔ A scratch file that cannot be created no longer just costs time: since #3371 the
+    # `remote_advertise` write-failure path leans on `remote_mark_dead` to suppress a TORN snapshot,
+    # and with no REMOTE_DEAD_FILE that suppression is a silent no-op. Safety therefore does NOT rest
+    # on it — the truncation inside `remote_advertise` is what makes a torn snapshot unreadable — so a
+    # missing cache is still "slower, never less safe".
     REMOTE_DEAD_FILE="$(mktemp "${TMPDIR:-/tmp}/pi-reap-deadremotes.XXXXXX")" || REMOTE_DEAD_FILE=""
     # The per-pass REMOTE HEAD ADVERTISEMENT cache (#3371) — one `ls-remote --heads` per remote,
     # shared by every candidate. A scratch file that cannot be created disables the cache, and a
@@ -5371,7 +5397,7 @@ run() {
                         # was classified against a snapshot that can be minutes old, and this class is
                         # removed with NO BACKUP. See `remote_holds_recheck`. rc=2 is the file's
                         # existing "the evidence changed, preserved" arm — never exit 4.
-                        if remote_holds_recheck "$p" "$h" "$reason"; then
+                        if remote_holds_recheck "$p" "$h" "$reason" "at classification"; then
                             remove_one "$p" "$h" "$b" "$reason"; rc=$?
                         else
                             case "$reason" in remote-holds:*) REMOVE_SKIP_VERDICT="remote-holds-stale" ;; esac
