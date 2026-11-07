@@ -1142,6 +1142,27 @@ grep -q 'PREVIOUS-WORK-WIP-CONTRADICTED' <<<"$miss"; rc=$?
 sed 's|^WIP:.*|WIP_:      issue-4242 -> refs/wip/issue-4242-first-attempt @ 111111111111|' "$CANON" > "$TMP/pw-under.txt"
 bash "$GATE" --check "$TMP/pw-under.txt" lane 0 "$HW/work" >/dev/null 2>&1; rc=$?
 [ "$rc" -eq 80 ]; ck $? "(H58c) …so the named form is refused too, and for the same reason (got $rc)"
+# ── A TAB SEPARATOR IS NOT A `wip` LABEL TO EITHER READER (review of #3621 cycle 2, P2). `_label`'s
+# label class is `[A-Za-z][A-Za-z0-9 _-]`, so `WIP<TAB>:` matches NO label — the SHAPE parser refuses
+# the brief for having no `WIP:` line. This gets the same three-way treatment (H58) gives `WIP_:`
+# because the guarantee here is the label CLASS: `_label` folds `[ \t-]+` only AFTER it matches, so
+# teaching it to span `\t` without extending this reader's `[ -]*` would satisfy the shape and leave the
+# reader silent — an ADMITTED absence claim, the #3484 fail-open. The last arm is the CONTROL that makes
+# (H63c) mean something: the SAME brief with a colon is admitted, so a TAB refusal is the label class and
+# not "it named a ref". `tab` is a literal TAB built by printf, because a `\t` in a sed REPLACEMENT is a
+# GNU extension and this suite runs on BSD sed (the cycle-3 portability defect).
+tab="$(printf '\t')"
+sed "s|^WIP:.*|WIP${tab}:      issue-4242 -> none (measured)|" "$CANON" > "$TMP/pw-tab-absence.txt"
+miss="$(bash "$GATE" --missing "$TMP/pw-tab-absence.txt" lane 0 "$HW/work" 2>/dev/null)"
+grep -qx 'PREVIOUS-WORK-WIP' <<<"$miss"; ck $? "(H63) 'WIP<TAB>:' is not a wip label — the brief is refused for having no WIP line"
+grep -q 'PREVIOUS-WORK-WIP-CONTRADICTED' <<<"$miss"; rc=$?
+[ "$rc" -ne 0 ]; ck $? "(H63b) …and the reader did not collect it either — no CONTRADICTED token, so the two readers agree (a reader that spanned TAB would add one)"
+sed "s|^WIP:.*|WIP${tab}:      issue-4242 -> refs/wip/issue-4242-first-attempt @ 111111111111|" "$CANON" > "$TMP/pw-tab-named.txt"
+bash "$GATE" --check "$TMP/pw-tab-named.txt" lane 0 "$HW/work" >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 80 ]; ck $? "(H63c) …and the NAMED form is refused for the same reason, not for naming a ref (got $rc)"
+sed 's|^WIP:.*|WIP:      issue-4242 -> refs/wip/issue-4242-first-attempt @ 111111111111|' "$CANON" > "$TMP/pw-colon-named.txt"
+bash "$GATE" --check "$TMP/pw-colon-named.txt" lane 0 "$HW/work" >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 0 ]; ck $? "(H63d) CONTROL: the same brief with a COLON label is ADMITTED — so (H63c) is the label class, not the named ref (got $rc)"
 
 # ── THE TWO COPIES OF THE QUOTING HELPERS MUST STAY BYTE-IDENTICAL (review of #3621, P3). They are
 # duplicated because the two awk programs are separate single-quoted strings by design (#3442's reason:

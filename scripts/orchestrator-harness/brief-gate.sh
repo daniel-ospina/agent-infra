@@ -326,9 +326,16 @@ BEGIN { ins = 0; depth = 0; val = ""; _n = 0; fence = 0; fencec = ""; fencelen =
   # #3621, cycle 3, P3: the first version also spanned `_`, which `_label` never folds, so `WIP_:` was
   # collected by this reader while the shape parser saw no `wip` label at all — the "line this reader
   # collected and that parser ignored" the sentence above calls a new disagreement, two lines below it).
-  # TAB is excluded for the same reason: `_label` reads `WIP<TAB>:` as `wip` plus whitespace it cannot
-  # span. Both exclusions err toward the SHAPE parser, which then refuses the brief for having no `WIP:`
-  # line — fail-closed, and now consistent between the two readers.
+  # TAB is excluded for a DIFFERENT reason, and it is worth stating precisely (review of #3621, P2 —
+  # the earlier text here claimed `_label` reads `WIP<TAB>:` as `wip`, which it does NOT: the label
+  # class of `_label` is `[A-Za-z][A-Za-z0-9 _-]`, so a TAB before the colon matches NO label at all, and
+  # a TAB-label brief is refused by the SHAPE parser for having no `WIP:` line — measured
+  # `PREVIOUS-WORK-WIP` with NO `CONTRADICTED` token, while the identical colon-label brief is ADMITTED
+  # at rc 0). So the guarantee here is the LABEL CLASS, NOT a fold: `_label` folds `[ \t-]+` only AFTER
+  # it has matched, so teaching that class to span `\t` (a plausible "make the two readers agree" edit)
+  # would let the shape parser see `wip` while the `[ -]*` of this reader still spans no TAB — shape
+  # satisfied, reader silent, absence claim ADMITTED. That is the #3484 fail-open, so the class and this
+  # reader move together or not at all. (H63/H63b/H63c/H63d pin the TAB spellings.)
   if (tolower(t) ~ /^wip[ -]*:/) {
     sub(/^[^:]*:/, "", t)
     sub(/^[ \t]+/, "", t); sub(/[ \t]+$/, "", t)
