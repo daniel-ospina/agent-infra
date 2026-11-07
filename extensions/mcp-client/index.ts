@@ -620,37 +620,58 @@ const STDIO_TRANSPORT_FIELDS = ["command", "args", "env", "cwd"] as const;
 /** Of those, the one that carries secrets declared for a spawned process. */
 const STDIO_CREDENTIAL_FIELDS = ["env"] as const;
 
+/**
+ * A server name pi accepts: letters, digits, `_` and `-` (`docs/mcp.md`). Enforced here because the
+ * merge builds a plain map keyed by name — a `__proto__` key would hit the prototype setter instead of
+ * adding a server, planting an entry that `loadServer` can resolve by name while `catalog()` never
+ * lists it. Verified: the merged map's PROTOTYPE became the repo's entry object.
+ */
+function isValidServerName(name: string): boolean {
+  return /^[A-Za-z0-9_-]+$/.test(name);
+}
+
+/** The `type` values pi accepts. `sse` is explicitly rejected by the platform (`docs/mcp.md`). */
+const VALID_TYPES = new Set(["stdio", "http", "streamable-http"]);
+
 function isServerEntry(value: unknown): value is McpServerConfig {
   return !!value && typeof value === "object" && !Array.isArray(value);
 }
 
-/** Does this entry DECLARE the named transport? A placeholder-expanded value still counts. */
-function declares(entry: McpServerConfig, field: "url" | "command"): boolean {
-  const value = field === "url" ? entry.url : entry.command;
-  return typeof value === "string" && value.length > 0;
+/** Is `field` PRESENT on this entry (regardless of type — a wrong type is still a declared field)? */
+function hasField(entry: McpServerConfig, field: string): boolean {
+  return (entry as Record<string, unknown>)[field] !== undefined;
 }
 
 /**
- * `type` is the schema's transport selector (`stdio` / `http` / `streamable-http`), so a repo entry
- * can name a transport WITHOUT naming `url` or `command`. An entry whose `type` contradicts the
- * transport it declares is incoherent — `connectServer` dispatches on `url`/`command` and would
- * silently ignore the `type` the operator wrote (measured: `{"type":"http","command":…}` ran over
- * stdio).
+ * `type` is OPTIONAL and is an AGREEMENT constraint, not a transport selector: `command` selects stdio
+ * and `url` selects streamable HTTP, and `type` — when present — must agree (`docs/mcp.md`).
+ * `connectServer` dispatches on `url`/`command` and never reads `type`, so an incoherent entry would
+ * silently run over the OTHER transport from the one the operator wrote (measured:
+ * `{"type":"http","command":…}` ran over stdio).
+ *
+ * Evaluated on the EFFECTIVE entry, not the delta: a `{"type":"http"}`-only override is otherwise
+ * applied to a stdio base and produces exactly the incoherent entry this rejects.
  */
 function typeContradicts(entry: McpServerConfig): boolean {
   const type = (entry as Record<string, unknown>).type;
   if (typeof type !== "string") return false;
-  const saysHttp = type === "http" || type === "streamable-http" || type === "sse";
-  const saysStdio = type === "stdio";
-  if (saysHttp && declares(entry, "command") && !declares(entry, "url")) return true;
-  if (saysStdio && declares(entry, "url") && !declares(entry, "command")) return true;
-  return false;
+  const declaresStdio = hasField(entry, "command");
+  const declaresHttp = hasField(entry, "url");
+  if (!declaresStdio && !declaresHttp) return false;
+  if (type === "stdio") return declaresHttp && !declaresStdio;
+  if (type === "http" || type === "streamable-http") return declaresStdio && !declaresHttp;
+  // Any other value (`sse`, a typo) is rejected by the platform, so it cannot AGREE with anything.
+  return true;
 }
 
 /**
- * Are two destinations the same server? A URL is compared NORMALISED (via `new URL().href`), because
- * a repo restating the same endpoint with a different host case or a trailing space is the SAME
- * destination, and a raw string compare would silently strip its credentials with no diagnostic.
+ * Are two destinations the same server? Compared NORMALISED via `new URL().href`, so host case,
+ * default port and surrounding whitespace are ignored — a repo restating the same endpoint must not
+ * lose its credentials with no diagnostic. A TRAILING SLASH still distinguishes two destinations
+ * (`/mcp` and `/mcp/` are routed separately by many servers), and that direction is fail-closed.
+ *
+ * A non-string on either side (a config typo such as `"url": ["…"]`) is NOT the same destination:
+ * `connectServer` would stringify it into a real request, so the safe answer is "different".
  */
 function sameDestination(a: unknown, b: unknown): boolean {
   if (typeof a !== "string" || typeof b !== "string") return false;
@@ -668,18 +689,26 @@ function sameDestination(a: unknown, b: unknown): boolean {
  * Is this the same LAUNCH? What a stdio child runs is the `(command, args, cwd)` triple, not the
  * command alone: `npx -y @good/mcp` and `npx -y @evil/mcp` share a command and run different code,
  * so comparing only `command` left the base's `env` reachable by rewriting `args` (measured).
+ *
+ * `args` absent and `args: []` spawn IDENTICALLY (`connectServer` does `config.args ?? []`), so they
+ * must compare equal or a no-op restatement would drop the credentials.
  */
 function sameLaunch(a: McpServerConfig, b: McpServerConfig): boolean {
   if (a.command !== b.command) return false;
   if ((a.cwd ?? "") !== (b.cwd ?? "")) return false;
-  return JSON.stringify(a.args ?? null) === JSON.stringify(b.args ?? null);
+  return JSON.stringify(a.args ?? []) === JSON.stringify(b.args ?? []);
 }
 
 export function mergeMcpLayers(
   base: McpJson | null,
   repo: McpJson | null,
 ): Record<string, McpServerConfig> {
-  const merged: Record<string, McpServerConfig> = {};
+  // ⛔ NULL-PROTOTYPE MAP. `merged[name] = …` on a plain object sends a `__proto__` key to the
+  // prototype SETTER instead of adding a server: verified, the merged map's prototype became the repo's
+  // entry object, and `loadServer` (which resolves `mcpServers[name]`) could reach a server that
+  // `catalog()` — which enumerates `Object.entries` — never lists. Names are also validated against
+  // pi's charset in `asMcpJson`; this is the belt for a caller that hands the merge raw JSON.
+  const merged: Record<string, McpServerConfig> = Object.create(null);
   const baseServers = (base?.mcpServers ?? {}) as Record<string, unknown>;
   const repoServers = (repo?.mcpServers ?? {}) as Record<string, unknown>;
 
@@ -688,20 +717,38 @@ export function mergeMcpLayers(
     // `cfg.lazy` and would throw out of the extension factory — killing the whole session with no
     // file or entry named (`{"mcpServers": {"tortoise": null}}` did exactly that). `asMcpJson`
     // already reports these; this is the belt for a caller that hands the merge raw JSON.
-    if (!isServerEntry(entry)) continue;
+    if (!isServerEntry(entry) || !isValidServerName(name)) continue;
     merged[name] = { ...entry };
   }
 
   for (const [name, entry] of Object.entries(repoServers)) {
-    if (!isServerEntry(entry)) continue;
-    const inherited = merged[name];
+    if (!isServerEntry(entry) || !isValidServerName(name)) continue;
+    // `Object.hasOwn`, never a truthiness read: `merged["constructor"]` on a prototype-bearing object
+    // returns a FUNCTION, so a repo-only server with that name would take the delta path.
+    const inherited = Object.hasOwn(merged, name) ? merged[name] : undefined;
     if (!inherited) {
+      // A repo entry that declares both transports, or an impossible `type`, is incoherent even with
+      // no base entry to contradict — report it rather than adding a server that cannot work.
+      if (hasField(entry, "url") && hasField(entry, "command")) {
+        console.log(
+          `[mcp-client] WARN: repo entry "${name}" declares BOTH "url" and "command" — the entry is ` +
+            `IGNORED. Declare ONE transport.`
+        );
+        continue;
+      }
+      if (typeContradicts(entry)) {
+        console.log(
+          `[mcp-client] WARN: repo entry "${name}" declares a "type" that contradicts its transport — ` +
+            `the entry is IGNORED.`
+        );
+        continue;
+      }
       merged[name] = { ...entry };
       continue;
     }
 
-    const repoDeclaresHttp = declares(entry, "url");
-    const repoDeclaresStdio = declares(entry, "command");
+    const repoDeclaresHttp = hasField(entry, "url");
+    const repoDeclaresStdio = hasField(entry, "command");
     if (repoDeclaresHttp && repoDeclaresStdio) {
       // Two transports in one entry is ambiguous, not a delta. Guessing would silently pick `url`
       // (connectServer tests it first) and ignore the command the operator actually wrote.
@@ -711,14 +758,6 @@ export function mergeMcpLayers(
       );
       continue;
     }
-    if (typeContradicts(entry)) {
-      console.log(
-        `[mcp-client] WARN: repo entry "${name}" declares a "type" that contradicts its transport — ` +
-          `the entry is IGNORED and the base's entry is kept.`
-      );
-      continue;
-    }
-
     const carry = { ...inherited } as Record<string, unknown>;
     if (repoDeclaresHttp || repoDeclaresStdio) {
       // The base's `type` describes the base's transport; the repo's own `type`, if any, arrives with
@@ -732,12 +771,23 @@ export function mergeMcpLayers(
     }
 
     // ⛔ THE GUARD IS EVALUATED ON THE **EFFECTIVE** ENTRY, not on what the repo happened to restate.
-    // A repo can reach a base secret WITHOUT naming the transport or the destination: `{"args": ["-y",
-    // "@evil/mcp"]}` changes what launches while `command` stays the base's, and a guard keyed on "did
-    // the repo set command/url?" misses it entirely (measured: the base's API key reached the
-    // repo-named package). So project the merged entry first, then compare it to the base's.
+    // Two reasons, both measured:
+    //   * `{"args": ["-y", "@evil/mcp"]}` changes what launches while `command` stays the base's, so a
+    //     guard keyed on "did the repo set command/url?" let the base's API key reach the repo's package.
+    //   * `{"type": "http"}` on a stdio base produces an incoherent entry, so the `type` check must run
+    //     after projection too.
+    // Presence — not a string check — is the trigger: `{"url": ["https://attacker/…"]}` is a config
+    // typo that `connectServer` STRINGIFIES into a real request, so it must be treated as a changed
+    // destination, not as "no transport declared".
     const projected = { ...carry, ...entry } as unknown as McpServerConfig;
-    if (declares(projected, "command")) {
+    if (typeContradicts(projected)) {
+      console.log(
+        `[mcp-client] WARN: repo entry "${name}" makes the entry's "type" contradict its transport — ` +
+          `the delta is IGNORED and the base's entry is kept.`
+      );
+      continue;
+    }
+    if (hasField(projected, "command")) {
       if (!sameLaunch(inherited, projected)) {
         const dropped = STDIO_CREDENTIAL_FIELDS.filter(field => carry[field] !== undefined);
         for (const field of dropped) delete carry[field];
@@ -748,7 +798,7 @@ export function mergeMcpLayers(
           );
         }
       }
-    } else if (declares(projected, "url") && !sameDestination(inherited.url, projected.url)) {
+    } else if (hasField(projected, "url") && !sameDestination(inherited.url, projected.url)) {
       const dropped = HTTP_CREDENTIAL_FIELDS.filter(field => carry[field] !== undefined);
       for (const field of dropped) delete carry[field];
       if (dropped.length > 0) {
@@ -792,18 +842,48 @@ function asMcpJson(value: unknown, label: string): McpJson | null {
   }
   if (!rawServers || typeof rawServers !== "object" || Array.isArray(rawServers)) return null;
 
-  const servers: Record<string, McpServerConfig> = {};
+  const servers: Record<string, McpServerConfig> = Object.create(null);
   for (const [name, entry] of Object.entries(rawServers as Record<string, unknown>)) {
+    const suffix = label.startsWith("base")
+      ? // A base entry is the machine's own config: the "removal" sentence below is about a REPO layer
+        // and would be nonsense here, in the one message a user reads while debugging.
+        `Fix that entry in the base config; it is skipped, and its servers are unavailable.`
+      : `A server cannot be REMOVED from a repo layer; see #3612 for the disabled-tombstone proposal.`;
+
+    if (!isValidServerName(name)) {
+      // pi restricts server names to `[A-Za-z0-9_-]` (`docs/mcp.md`). It also keeps `__proto__` out of
+      // the merge map — an invalid or prototype-shaped name can resolve a server that never appears in
+      // the catalog (verified: a `__proto__` key set the merged map's PROTOTYPE).
+      console.log(
+        `[mcp-client] WARN: ${label} entry name "${name}" is not a valid server name ` +
+          `(letters, digits, "_" and "-" only) — dropped.`
+      );
+      continue;
+    }
     if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
       // `null` is the tempting way to say "not here" — and there is no tombstone in this schema
       // (#3612), so say why the entry was dropped instead of crashing the session.
+      console.log(`[mcp-client] WARN: ${label} entry "${name}" is not an object — dropped. ` + suffix);
+      continue;
+    }
+    // A transport that is not a string is a config TYPO, and a dangerous one: `connectServer` reads
+    // `if (config.url)` and would STRINGIFY an array into a real request, while the merge's
+    // destination guard — keyed on a present string — would not fire. Refuse it here instead.
+    const typed = entry as Record<string, unknown>;
+    const badTransport = (["url", "command"] as const).find(
+      field => typed[field] !== undefined && typeof typed[field] !== "string"
+    );
+    if (badTransport) {
       console.log(
-        `[mcp-client] WARN: ${label} entry "${name}" is not an object — dropped. ` +
-          (label.startsWith("base")
-            ? // A base entry is the machine's own config: the "removal" sentence below is about a REPO
-              // layer and would be nonsense here, in the one message a user reads while debugging.
-              `Fix that entry in the base config; it is skipped, and its servers are unavailable.`
-            : `A server cannot be REMOVED from a repo layer; see #3612 for the disabled-tombstone proposal.`)
+        `[mcp-client] WARN: ${label} entry "${name}" has a non-string "${badTransport}" — dropped. ` + suffix
+      );
+      continue;
+    }
+    if (typed.type !== undefined && !(typeof typed.type === "string" && VALID_TYPES.has(typed.type))) {
+      console.log(
+        `[mcp-client] WARN: ${label} entry "${name}" has "type": ${JSON.stringify(typed.type)} — ` +
+          `pi accepts only ${[...VALID_TYPES].join("/")}. Dropped. ` +
+          suffix
       );
       continue;
     }

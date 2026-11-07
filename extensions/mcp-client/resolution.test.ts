@@ -614,6 +614,99 @@ await test("a repo layer that parses to `null` is a STATED failure, never a sile
   );
 });
 
+await test("a non-string `url`/`command`, or an invalid `type`/name, is DROPPED at the layer read", async () => {
+  // `connectServer` reads `if (config.url)` and would STRINGIFY a non-string into a real request; and
+  // `sse` is rejected by pi (`docs/mcp.md`). A typo must not become a live destination.
+  const repoDir = tempDir("mcp-bind-invalid-repo-");
+  const homeDir = tempDir("mcp-bind-invalid-home-");
+  mkdirSync(join(homeDir, ".pi", "agent"), { recursive: true });
+  writeJson(repoDir, ".mcp.json", {
+    mcpServers: {
+      arrayUrl: { url: ["https://attacker.example/collect"] },
+      arrayCommand: { command: ["/bin/sh", "-c", "x"] },
+      sseType: { type: "sse", url: "https://x/mcp" },
+      "bad name!": { url: "https://x/mcp" },
+      keep: { url: "https://ok.example/mcp", lazy: true },
+    },
+  });
+  writeJson(join(homeDir, ".pi", "agent"), ".mcp.json", { mcpServers: {} });
+
+  const manager = new McpServerManager();
+  const logs = await withCapturedLogs(() =>
+    manager.connectAllLayers({
+      base: join(homeDir, ".pi", "agent", ".mcp.json"),
+      repo: join(repoDir, ".mcp.json"),
+    })
+  );
+
+  const cfg = (manager as unknown as { config: { mcpServers: Record<string, unknown> } }).config;
+  ok(cfg.mcpServers.keep, "a valid entry still loads");
+  for (const bad of ["arrayUrl", "arrayCommand", "sseType", "bad name!"]) {
+    ok(!(bad in cfg.mcpServers), `\`${bad}\` must be dropped, not stringified into a live request`);
+  }
+  ok(
+    logs.some(l => l.includes("non-string")) && logs.some(l => l.includes("type")) &&
+      logs.some(l => l.includes("not a valid server name")),
+    `each rejection must name its reason — got:\n${logs.join("\n")}`
+  );
+});
+
+await test("a NON-STRING `url` still drops the base credentials in the merge (presence, not string-ness)", () => {
+  // Defence in depth for a caller that hands the merge raw JSON without `asMcpJson`'s validation:
+  // `connectServer` would STRINGIFY `["https://attacker/…"]` into a real request, so a guard keyed on
+  // "is `url` a non-empty string?" would silently keep the bearer token.
+  const merged = mergeMcpLayers(
+    { mcpServers: { t: { url: "https://api.premiselabs.co/mcp/", headers: { Authorization: "Bearer K" }, oauth: true } } } as never,
+    { mcpServers: { t: { url: ["https://attacker.example/collect"] } } } as never,
+  );
+  const t = merged.t as Record<string, unknown> | undefined;
+  equal(t?.headers, undefined, "the base's Authorization header must not follow a non-string url");
+  equal(t?.oauth, undefined, "nor its oauth config");
+
+  // Symmetric on the stdio side: a non-string `command` is still a CHANGED launch.
+  const stdio = mergeMcpLayers(
+    { mcpServers: { g: { command: "npx", args: ["-y", "@good/mcp"], env: { K: "1" } } } } as never,
+    { mcpServers: { g: { command: ["/bin/sh", "-c", "x"] } } } as never,
+  );
+  equal((stdio.g as Record<string, unknown> | undefined)?.env, undefined,
+    "the base's env must not follow a non-string command");
+});
+
+await test("a `__proto__` key cannot poison the merged map's prototype", () => {
+  // Measured before the fix: the merged map's PROTOTYPE became the repo's entry object, and
+  // `loadServer` (resolving `mcpServers[name]`) could reach a server `catalog()` never listed.
+  const merged = mergeMcpLayers(
+    { mcpServers: { real: { url: "https://ok/mcp" } } } as never,
+    JSON.parse('{"mcpServers":{"__proto__":{"hidden":{"command":"/bin/sh"}}}}') as never,
+  );
+  equal(Object.getPrototypeOf(merged), null, "the map must have a null prototype");
+  equal((merged as Record<string, unknown>).hidden, undefined, "nothing may be reached by prototype");
+  ok(merged.real, "and ordinary servers still merge");
+});
+
+await test("a `type`-only delta on a stdio base is REFUSED (the check runs on the EFFECTIVE entry)", () => {
+  // Checking the delta alone let `{"type": "http"}` be applied to a stdio base, producing exactly the
+  // incoherent entry the check exists to reject.
+  const merged = mergeMcpLayers(
+    { mcpServers: { g: { command: "npx", args: ["-y", "@good/mcp"], lazy: true } } } as never,
+    { mcpServers: { g: { type: "http" } } } as never,
+  );
+  const g = merged.g as Record<string, unknown> | undefined;
+  equal(g?.type, undefined, "the contradictory type is not applied");
+  equal(g?.command, "npx", "and the base entry is kept intact");
+});
+
+await test("`args: []` vs absent `args` is the SAME launch, so the base's env survives", () => {
+  // `connectServer` does `config.args ?? []`, so these spawn identically — comparing them as different
+  // dropped the credentials for a no-op restatement.
+  const merged = mergeMcpLayers(
+    { mcpServers: { g: { command: "npx", env: { K: "1" } } } } as never,
+    { mcpServers: { g: { args: [] } } } as never,
+  );
+  const g = merged.g as Record<string, unknown> | undefined;
+  deepEqual(g?.env, { K: "1" }, "an empty args list is not a different launch");
+});
+
 await test("a `null` server ENTRY does not crash the session — it is dropped, with a warning", async () => {
   // `{"mcpServers": {"tortoise": null}}` used to pass asMcpJson and then throw
   // `TypeError: Cannot read properties of null (reading 'lazy')` out of the extension factory,

@@ -176,16 +176,21 @@ machine's pi instance.
   - Changing `url` keeps `lazy`, `timeoutMs` and the catalog metadata, but **does
     not inherit** the base's `headers`/`oauth`: the base's credentials belong to the
     base's own endpoint. A `lazy`-only override does not change the destination,
-    so it keeps them. URLs are compared normalised, so restating the same endpoint
-    is still the same destination.
+    so it keeps them. Host case, default port and surrounding whitespace are
+    normalised away before comparing — **a trailing slash is not**, so `/mcp` and
+    `/mcp/` count as different destinations (fail-closed; restate the header).
   - Declaring `command` drops the base's `url`/`headers`/`oauth`; declaring `url`
     drops the base's `command`/`args`/`env`/`cwd`. The base's `env` is inherited
     only when the same thing is LAUNCHED — `command` **and** `args` **and** `cwd`,
     because `args` decides what actually runs.
-  - Never declare both transports (or a `type` contradicting the one you declare):
-    such an entry is ambiguous, so it is IGNORED with a warning and the base's
-    entry is kept. Silently it would resolve to `url`, because that is what the
-    client tests first.
+  - `type` is OPTIONAL and must AGREE with the transport you declare (`command` →
+    `stdio`, `url` → `http`/`streamable-http`; pi rejects `sse`). An invalid or
+    contradicting `type`, a non-string `url`/`command`, or a name outside
+    `[A-Za-z0-9_-]` makes the entry invalid — it is dropped or ignored with a
+    warning rather than stringified into a live request.
+  - Never declare both transports: such an entry is ambiguous, so it is IGNORED
+    with a warning and the base's entry is kept. Silently it would resolve to
+    `url`, because that is what the client tests first.
 
   ⛔ **A repo's `.mcp.json` is TRUSTED INPUT.** These rules stop a repo from
   *accidentally* inheriting the hub's credentials. They do **not** sandbox one: a
