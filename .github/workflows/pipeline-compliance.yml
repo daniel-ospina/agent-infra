@@ -283,8 +283,10 @@ jobs:
         # bound when this was written (`script-validate`'s "Bash shards" step was cancelled at
         # 110 min on 2026-11-01), so adding a shard would have bought the same coverage at the
         # cost of a lane that was already timing out. That lane is now an 8-way slice with a
-        # 70-minute step bound (agent-infra#2483), so the constraint this paragraph describes has
-        # changed shape; the reasoning is kept because it is why the copy lives here.
+        # 40-minute step bound inside an 80-minute job (agent-infra#2483; the 70-minute bound is
+        # `ci.yml`'s `bash-suites`, NOT this lane — quote the lane you mean), so the constraint this
+        # paragraph describes has changed shape; the reasoning is kept because it is why the copy
+        # lives here.
         #
         # Also: the comment job's OWN copy was moved to run before its live step
         # (see that job), because a self-test that is a LATER step of a job is skipped
