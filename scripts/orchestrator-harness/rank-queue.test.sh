@@ -174,12 +174,13 @@ if [ -n "${RANK_QUEUE_BOOTLOG:-}" ]; then
     trap 'printf "%s\t%s\t%s\t%s\n" "E" "$-" "${BASH_SUBSHELL:-0}" "$_b" >> "$RANK_QUEUE_OPTLOG" 2>/dev/null || :' EXIT
     # ⛔ EVERY RECORD IS TAGGED WITH THE TRAP THAT WROTE IT (review P2/P3, cycle 97): `E` = an END state (this EXIT trap,
     # or an `exit` about to run), `D` = a point-in-time state taken for `exec`, `T` = a point-in-time state taken when a
-    # DEPTH-0 command whose FIRST WORD is `trap` and whose text contains UPPERCASE `EXIT` runs. The arm matches TEXT, not
+    # command whose FIRST WORD is `trap` and whose text contains UPPERCASE `EXIT` runs. The arm has no depth test, so it
+    # writes `T` at ANY depth and only `${BASH_SUBSHELL}` 0 is ever read (`_trapopts_for`). The arm matches TEXT, not
     # intent, so it also covers REMOVING a trap (`trap - EXIT`) and a `trap ... 0` whose handler merely names EXIT (both
     # measured to write `T`). RESIDUAL, declared: it MISSES an EXIT trap spelled `exit`/`Exit` — bash's trap names are
-    # case-insensitive, the match is not — and one reached as `command trap`/`builtin trap`; all three measured to leave
-    # no record at all, i.e. NO RECORD. See `_opts_for` for why the distinction is load-bearing, and for why `T` is
-    # deliberately NOT a tag it reads.
+    # case-insensitive, the match is not — and one reached as `command trap`/`builtin trap`; every spelling listed is
+    # measured to leave no record at all, i.e. NO RECORD. See `_opts_for` for why the distinction is load-bearing, and for
+    # why `T` is deliberately NOT a tag it reads.
     # ⛔ `return` IS NOT AN END STATE AND A SUBSHELL'S EXIT IS NOT THIS SHELL'S END (review P2, cycle 98). A top-level
     # `return` prints "can only 'return' from a function or sourced script" and the script CONTINUES (measured); an
     # interior `return` leaves the function, not the shell. Both used to write `E` and win. `exit` still does, and the
@@ -3787,7 +3788,7 @@ if [ -n "$exec_unobs" ]; then
   echo "      UNOBSERVABLE: the TRAP-INSTALL snapshot and the textual parser DISAGREE about \`set -u\`, so neither can grade it —${exec_unobs} — the script ran a \`trap\` command naming \`EXIT\` (installing, REMOVING, or ignoring the hook's EXIT trap), so no end state was recorded; add an explicit \`exit 0\` so the shell's own end state is observable"
 fi
 if [ -n "$exec_norecord" ]; then
-  echo "      NO RECORD: executed but left no end state to grade —${exec_norecord} — these ran, and nothing about their \`set -u\` state could be observed (a script that writes no DEPTH-0 record AT ALL does this — e.g. it replaces the hook's EXIT trap and falls off the end with \`trap … 0\`, or with \`trap … exit\`/\`Exit\` (bash's trap names are case-insensitive; the arm matches UPPERCASE \`EXIT\` only), or through \`command trap\`/\`builtin trap\`; a DEEPER record cannot answer either; and a bare \`trap\` command whose text contains uppercase \`EXIT\` — an install, a removal, or a handler that merely names it — writes a \`T\` and lands in the agreement test above, not here)"
+  echo "      NO RECORD: executed but left no end state to grade —${exec_norecord} — these ran, and nothing about their \`set -u\` state could be observed (a script that writes no DEPTH-0 record AT ALL does this — e.g. it replaces the hook's EXIT trap and falls off the end with \`trap … 0\` whose TEXT names no uppercase \`EXIT\`, or with \`trap … exit\`/\`Exit\` (bash's trap names are case-insensitive; the arm matches UPPERCASE \`EXIT\` only), or through \`command trap\`/\`builtin trap\`; a DEEPER record cannot answer either; and a bare \`trap\` command whose text contains uppercase \`EXIT\` — an install, a removal, or a handler that merely names it — writes a \`T\` and lands in the agreement test above, not here)"
 fi
 if [ -n "$exec_foreign" ]; then
   echo "      OUTSIDE \$TMP: the hook recorded an execution this sweep cannot grade —${exec_foreign} — a body run from outside the sandbox is outside the population the check names"
