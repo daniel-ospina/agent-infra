@@ -126,6 +126,17 @@ fi
 # same reader's.
 # shellcheck disable=SC1090  # a farmed sibling, resolved above
 . "$READER"
+# ⛔ SOURCED IS NOT THE SAME AS LOADED (round 34, P2). `[ -f "$READER" ]` above accepts a reader that
+# EXISTS but produces nothing — mode 000, a truncated or corrupt farmed copy (the drift class
+# `check-farm-drift.sh` exists for). The `.` then defines no functions, the probe below returns 127, and
+# the `*)` arm printed `no usable repo set at` followed by an EMPTY path plus two `command not found`
+# lines — the round-33 defect one layer down: a summary naming a file it could not name. Refuse by name
+# here, where the fact is known.
+if ! command -v repo_set_parse >/dev/null 2>&1; then
+  _say "REFUSING — $READER exists but could not be SOURCED (unreadable, truncated, or not shell); nothing ran."
+  _say "  Repair the farm: re-run pi-bootstrap/setup.sh — its \`lib_srcs\` declares repo-set.sh."
+  exit 2
+fi
 
 # The code probe: the reader's refusal text is printed by the branch that ACTS on the code, so it is
 # emitted once and always next to the line that says what this wrapper did about it.
