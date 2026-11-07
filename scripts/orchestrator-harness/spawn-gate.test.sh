@@ -2344,7 +2344,20 @@ grep -q 'MEMORY gate' "$RO/logs/adopt-7.log"; rc=$?
 ck "...and does NOT name it a MEMORY refusal — the P1: 'wait for resident lanes' on a box out of PROCESSES" $rc
 grep -q 'restart or drain the BOX from outside' "$RO/logs/adopt-7.log"; rc=$?
 ck "...and carries the remedy that actually helps (restart/drain the box from OUTSIDE), not 'wait'" $rc
-rm -f "$RO/capacity.sh"   # EVERY LATER ARM RUNS ON THE REAL INSTRUMENT (or its documented ABSTAIN)
+# ⛔ RE-SEED, DO NOT REMOVE (fresh review of #3231, P2 — measured). This line used to `rm` the stub
+# with the rationale "EVERY LATER ARM RUNS ON THE REAL INSTRUMENT (or its documented ABSTAIN)", and
+# both halves of that rationale are now false:
+#   * the stub in `$RO` at this point is not the healthy one — the `adopt-7` arms above install the
+#     FORK-REFUSING `CAPSTUB` (15840/15841, headroom 1), so leaving it makes every later `O="$RO"`
+#     arm answer 73 (fork) instead of the load 75 / disk 77 / mem 81 it names. Measured: 5 arms red.
+#   * an ABSENT instrument is no longer an abstain either: since the fork floor became the 83
+#     `nodeploy` REFUSAL, `rm` leaves the later arms decided by whatever the HOST supplies via
+#     `$O`/`AGENT_INFRA_PATH`/`~/orchestrator` — green on a box that happens to have it, red on a clean
+#     runner. That is the host-decides class the seeder above exists to end.
+# So: restore the HEALTHY stub (present + `ok`, it can decide nothing), and assert it landed, one line
+# that cannot rot the way the comment did.
+seed_capacity_instrument "$RO"; rc=$?
+ck "the fork instrument is re-seeded HEALTHY after the fork-refusal rig (else the 5 arms below answer 73/83)" $rc
 
 : > "$MERGE_LOG"
 
