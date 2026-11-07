@@ -61,7 +61,7 @@
 #       exactly as the research contract admits its own `<…>` slots. This is a presence-and-shape gate,
 #       and the number is the one field it cannot invent for the author.
 #   (b) MEASUREMENT: it needs a repository and a reachable `origin`. With neither, the gate says so on
-#       stderr (`UNVERIFIED` / `PREVIOUS-WORK-WIP-UNMEASURED`) and ADMITS the brief, because refusing
+#       stderr (the word `UNVERIFIED`, naming the issue) and ADMITS the brief, because refusing
 #       every dispatch on a moment's network failure converts a memory gap into a fleet-wide outage.
 #       The claim pre-flight on this same dispatch path already hard-depends on that reachability, so
 #       the ordinary case is the measured one.
@@ -312,8 +312,10 @@ BEGIN { ins = 0; depth = 0; val = ""; _n = 0; fence = 0; fencec = ""; fencelen =
   # `WIP- :` are all the `wip` LABEL to the shape check — while this reader required `^wip[ \t]*:` and
   # therefore collected NOTHING, so the cross-check abstained and the brief was ADMITTED with an
   # unchecked claim of absence (measured: `WIP-: issue-4242 -> none` → rc 0 against an existing ref).
-  # The class below is exactly the set of separators `_label` normalises away (space, underscore,
-  # hyphen) and DELIBERATELY not TAB, which the `_label` class [A-Za-z0-9 _-]* cannot span.
+  # The class below spans exactly the separators that can appear BETWEEN `wip` and the colon of a
+  # label `_label` still resolves to `wip` (spaces and hyphens, which it folds to one space) and
+  # DELIBERATELY excludes TAB: `_label` reads `WIP<TAB>:` as the label `wip` followed by whitespace it
+  # cannot span, so a line this reader collected and that parser ignored would be a new disagreement.
   if (tolower(t) ~ /^wip[ _-]*:/) {
     sub(/^[^:]*:/, "", t)
     sub(/^[ \t]+/, "", t); sub(/[ \t]+$/, "", t)
@@ -436,9 +438,10 @@ brief_gate_wip_refs() { # brief_gate_wip_refs <issue> [repo]
   return 0
 }
 
-# brief_gate_previous_work <brief-file|-> [repo] — print ONE token when the PREVIOUS WORK block
-# CONTRADICTS what `refs/wip/*` holds; nothing when it is consistent, unmeasurable-but-usable, or when
-# the block's own shape tokens already speak (a shape refusal must not be doubled by a guess).
+# brief_gate_previous_work <brief-file|-> [repo] [role] — print the tokens the cross-check contributes:
+# `PREVIOUS-WORK-WIP` once when ANY `WIP:` value is unkeyed for this role, and
+# `PREVIOUS-WORK-WIP-CONTRADICTED<TAB>refs…` once when any issue that claims absence has a matching ref.
+# Nothing when the block is consistent, unmeasurable-but-usable, or when the shape tokens already speak.
 #
 # ⛔ THE ABSENCE CLAIM IS THE PART *AFTER* THE KEY, NOT THE WHOLE LINE — and this is the shape the
 # first draft got wrong. Reading the whole value for a `refs/wip/` substring made the MOST natural
@@ -465,42 +468,55 @@ brief_gate_previous_work() { # brief_gate_previous_work <file|-> [repo] [role]
     # (`_label` lowercases), so `WIP: Issue-4242 -> none` was refused while `WIP:` was accepted — an
     # asymmetry no author can be expected to guess. `vlow` is what every key and claim test reads.
     vlow="$(printf '%s' "$val" | tr 'ABCDEFGHIJKLMNOPQRSTUVWXYZ' 'abcdefghijklmnopqrstuvwxyz')"
+    # ── THE KEY IS CLASSIFIED ONCE, THEN THE CLAIM IS READ ONCE (review of #3621, cycle 2, P2) ─────
+    # The first cut had an arm per key spelling and only the plain `issue-<digits>` arm read the claim,
+    # so `issue-<4242> -> none` (a REAL number inside the slot brackets) was keyed-but-UNCHECKED — the
+    # very fail-open the doc says cannot exist, reachable with two brackets. Classifying first means
+    # every arm that yields a number goes through the same measurement.
+    issue=""
     case "$vlow" in
-      # ⛔ THE SLOT IS A KEY TOO (`issue-<N>`, `pr-<N>`). The canonical block ships the slot, and the
-      # gate cannot refuse its own advice — the same reason the research contract admits `<…>`. A slot
-      # has no number to look up, so it is keyed-but-unchecked; that is the stated coverage limit.
-      issue-"<"*|pr-"<"*) : ;;   # `<` is a REDIRECTION metacharacter in a bare case pattern
-      issue-[0-9]*)
-        issue="${vlow#issue-}"; issue="${issue%%[!0-9]*}"
-        # the claim is what FOLLOWS the key, so a measurement note that mentions `refs/wip/*` is still a
-        # claim of absence (an earlier draft read the whole value and switched itself off)
-        rest="${vlow#issue-}"; rest="${rest#"$issue"}"
-        # ⛔ ERE, NOT GNU's `\|` (review cycle 3, P2). BSD sed — macOS, where install.sh and launchd
-        # run — does not implement `\|` in a BRE, so this substitution was INERT there: the arrow
-        # stayed in `claim`, the claim no longer began `refs/wip/`, and an HONEST brief that named its
-        # ref was falsely REFUSED on the exact platforms the fleet runs on while Linux stayed green.
-        # Same class as orch-loop.sh:1329 and fleet-inventory.sh:927.
-        claim="$(printf '%s' "$rest" | sed -E 's/^[[:space:]]*(->|→|:)[[:space:]]*//')"
-        # ⛔ A GLOB IS NOT A REF (review of #3621, P2). `refs/wip/* is empty` begins with `refs/wip/`
-        # and was therefore read as "a ref is named", so the most honest possible way to say "I looked
-        # and there is nothing" switched the check OFF — measured rc 0 with a matching ref on origin,
-        # on the merged baseline too. A named ref must be a CONCRETE token: the word after `refs/wip/`
-        # must be non-empty and free of glob characters, or the value is a claim of absence.
-        case "$claim" in
-          refs/wip/*)
-            ref="$(printf '%s' "${claim#refs/wip/}" | sed -E 's/[[:space:]].*$//')"
-            case "$ref" in ''|*'*'*|*'?'*|*'['*) issues="${issues:+$issues }$issue" ;; esac ;;
-          *) issues="${issues:+$issues }$issue" ;;
-        esac ;;
-      pr-[0-9]*)
-        # A PR key is the FIXER's and the REVIEWER's key (they hold `refs/claims/<pr>-<sha>`); for a
-        # lane/worker dispatch the key is the issue, so `pr-<N> -> none` there is an unkeyed claim, not
-        # an exemption (fresh-context review of #3484, P1: it was accepted for every role).
-        case "$role" in fixer|reviewer) : ;; *) unkeyed=1 ;; esac ;;
+      issue-[0-9]*)        issue="${vlow#issue-}"; issue="${issue%%[!0-9]*}" ;;
+      issue-"<"[0-9]*">"*) issue="${vlow#issue-<}";  issue="${issue%%[!0-9]*}" ;;   # `<` is a REDIRECTION metacharacter bare
+      # a `pr-<N>` that CARRIES a number is the same key as `pr-N` — checked for the role that may use it,
+      # where the unfilled `pr-<N>` slot is keyed-but-unchecked for fixer/reviewer only (H55c)
+      pr-"<"[0-9]*">"*)   case "$role" in fixer|reviewer) : ;; *) unkeyed=1 ;; esac ;;
+      # ⛔ THE UNFILLED SLOT IS KEYED BUT UNCHECKED (`issue-<N>`, `pr-<N>`): the canonical block ships it
+      # and the gate cannot refuse its own advice — the same reason the research contract admits `<…>`.
+      # That is the stated coverage limit, and it is now ONLY the literal slot: anything that carries a
+      # number in any bracket spelling is resolved and measured.
+      issue-"<"*|pr-"<"*)  : ;;
+      pr-[0-9]*)           case "$role" in fixer|reviewer) : ;; *) unkeyed=1 ;; esac ;;
       keyless*)
         rest="${vlow#keyless}"
         case "$rest" in ' '?*) : ;; *) unkeyed=1 ;; esac ;;
       *) unkeyed=1 ;;
+    esac
+    [ -n "$issue" ] || continue
+    # the claim is what FOLLOWS the key, so a measurement note that mentions `refs/wip/*` is still a
+    # claim of absence (an earlier draft read the whole value and switched itself off)
+    rest="${vlow#issue-}"
+    rest="${rest#*>}"
+    rest="${rest#"$issue"}"
+    # ⛔ ERE, NOT GNU's `\|` (review cycle 3, P2). BSD sed — macOS, where install.sh and launchd run —
+    # does not implement `\|` in a BRE, so this substitution was INERT there: the arrow stayed in
+    # `claim`, the claim no longer began `refs/wip/`, and an HONEST brief that named its ref was
+    # falsely REFUSED on the exact platforms the fleet runs on while Linux stayed green.
+    # ⛔ THE ARROW IS OPTIONAL HERE (review of #3621, cycle 2). The line above already consumed a trailing
+    # `>` (the bracket form `issue-<4242> -> ...`), so for the PLAIN form the `->` is still present and for
+    # the bracket form it is gone — a sed that REQUIRES it left a leading space on the bracket path and
+    # on both paths could leave `claim` starting with whitespace, which made `refs/wip/<ref>` fail the
+    # `case` below and be read as a CLAIM OF ABSENCE (measured: an honest named ref refused, 5 arms).
+    claim="$(printf '%s' "$rest" | sed -E 's/^[[:space:]]*(->|→|:)?[[:space:]]*//')"
+    # ⛔ A GLOB IS NOT A REF (review of #3621, P2). `refs/wip/* is empty` begins with `refs/wip/` and
+    # was therefore read as "a ref is named", so the most honest possible way to say "I looked and there
+    # is nothing" switched the check OFF — measured rc 0 with a matching ref on origin, on the merged
+    # baseline too. A named ref must be a CONCRETE token: the word after `refs/wip/` non-empty and free
+    # of glob characters, or the value is a claim of absence.
+    case "$claim" in
+      refs/wip/*)
+        ref="$(printf '%s' "${claim#refs/wip/}" | sed -E 's/[[:space:]].*$//')"
+        case "$ref" in ''|*'*'*|*'?'*|*'['*) issues="${issues:+$issues }$issue" ;; esac ;;
+      *) issues="${issues:+$issues }$issue" ;;
     esac
   done <<< "$values"
   [ "$unkeyed" -eq 0 ] || printf 'PREVIOUS-WORK-WIP\n'

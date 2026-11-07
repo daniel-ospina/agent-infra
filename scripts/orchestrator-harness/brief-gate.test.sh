@@ -1016,7 +1016,7 @@ bash "$GATE" --check "$TMP/pw-glob.txt" lane 0 "$HW/work" >/dev/null 2>&1; rc=$?
 [ "$rc" -eq 80 ]; ck $? "(H48) a GLOB claim ('refs/wip/* is empty') is a claim of ABSENCE and is CHECKED (got $rc)"
 sed 's|^WIP:.*|WIP:       issue-4242 -> refs/wip/ — nothing there (measured)|' "$CANON" > "$TMP/pw-barewip.txt"
 bash "$GATE" --check "$TMP/pw-barewip.txt" lane 0 "$HW/work" >/dev/null 2>&1; rc=$?
-[ "$rc" -eq 80 ]; ck $? "(H49) …and so is `refs/wip/` with no token after it (got $rc)"
+[ "$rc" -eq 80 ]; ck $? "(H49) …and so is \`refs/wip/\` with no token after it (got $rc)"
 bash "$GATE" --check "$TMP/pw-named.txt" lane 0 "$HW/work" >/dev/null 2>&1; rc=$?
 [ "$rc" -eq 0 ]; ck $? "(H50) …while a CONCRETE ref still satisfies it (no over-block; got $rc)"
 # ── `keyless — <why>` HAD NO ARM AT ALL (review of #3621, P2): the branch that decides it is a single
@@ -1035,23 +1035,49 @@ diff -q "$GATE" "$MUT_PW4" >/dev/null 2>&1; rc=$?
 bash "$MUT_PW4" --check "$TMP/pw-keyless.txt" lane 0 "$HW/work" >/dev/null 2>&1; rc=$?
 [ "$rc" -eq 80 ]; ck $? "(H52b) MUTATION: H51 now FAILS — with the keyless branch deleted the honest form is refused (rc=$rc)"
 # ── the KEY is case-folded like the label (review of #3621, nit): `Issue-4242 -> none` was refused.
+# ⛔ THE ARM MUST NAME WHICH 80 IT IS (review of #3621, cycle 2, P2). Asserting rc alone was satisfied by
+# the UNFIXED gate for a different reason (the key read as unkeyed), so it could not fail. The TOKEN is
+# the discriminator, plus the named-ref direction, which the unfixed gate rejects as unkeyed.
 sed 's|^WIP:.*|WIP:       Issue-4242 -> none (measured: git ls-remote refs/wip/* at 2026-11-06)|' "$CANON" > "$TMP/pw-case.txt"
-bash "$GATE" --check "$TMP/pw-case.txt" lane 0 "$HW/work" >/dev/null 2>&1; rc=$?
-[ "$rc" -eq 80 ]; ck $? "(H53) a case-folded key ('Issue-4242') is the same key — its claim is CHECKED (got $rc)"
+miss="$(bash "$GATE" --missing "$TMP/pw-case.txt" lane 0 "$HW/work" 2>/dev/null)"
+grep -q 'PREVIOUS-WORK-WIP-CONTRADICTED' <<<"$miss"; ck $? "(H53) a case-folded key ('Issue-4242') is the SAME key — it is looked up, and its contradiction is what refuses it"
+sed 's|^WIP:.*|WIP:       Issue-4242 -> refs/wip/issue-4242-first-attempt @ 111111111111|' "$CANON" > "$TMP/pw-case-named.txt"
+bash "$GATE" --check "$TMP/pw-case-named.txt" lane 0 "$HW/work" >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 0 ]; ck $? "(H53b) …so an honest NAMED ref under the folded key is ADMITTED, not refused as unkeyed (got $rc)"
+# ── A NUMBER IN BRACKETS IS STILL A NUMBER (review of #3621, cycle 2, P2): `issue-<4242> -> none` was
+# keyed-but-UNCHECKED — the doc's "carries a REAL issue number" fail-open, reachable with two brackets —
+# and `pr-<1>` bypassed the role rule the same way.
+sed 's|^WIP:.*|WIP:       issue-<4242> -> none (measured: git ls-remote refs/wip/* at 2026-11-06)|' "$CANON" > "$TMP/pw-slotnum.txt"
+bash "$GATE" --check "$TMP/pw-slotnum.txt" lane 0 "$HW/work" >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 80 ]; ck $? "(H55) 'issue-<4242> -> none' is CHECKED — a bracketed number is still a number (got $rc)"
+sed 's|^WIP:.*|WIP:       issue-<4242> -> refs/wip/* is empty (measured)|' "$CANON" > "$TMP/pw-slotglob.txt"
+bash "$GATE" --check "$TMP/pw-slotglob.txt" lane 0 "$HW/work" >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 80 ]; ck $? "(H55b) …and the bracketed form cannot smuggle a GLOB claim past H48 either (got $rc)"
+{ cat "$CANON"; printf '\nWIP:       pr-<1> -> none\n'; } > "$TMP/pw-slotpr.txt"
+bash "$GATE" --check "$TMP/pw-slotpr.txt" lane 0 "$HW/work" >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 80 ]; ck $? "(H55c) …and 'pr-<1>' does not bypass the role rule on a lane (got $rc)"
 
 # ── THE TWO COPIES OF THE QUOTING HELPERS MUST STAY BYTE-IDENTICAL (review of #3621, P3). They are
 # duplicated because the two awk programs are separate single-quoted strings by design (#3442's reason:
 # wrapping two contracts in one END block is how a change to one re-opens the other). That is safe only
 # while the bodies are equal — unequal copies is exactly how the cycle-3 recognizer divergence happened.
-extract_qskip() { # <n> — the n-th `function _qskip(s,…){…}` block of the gate
-  awk -v want="$1" 'BEGIN{n=0;f=0}
-    /^function _qskip\(s,/{n++; f=(n==want); if (f) print; next}
+extract_fn() { # <n> <function-name> — the n-th `function <name>(…){…}` block of the gate
+  awk -v want="$1" -v fn="$2" 'BEGIN{n=0;f=0}
+    index($0, "function " fn "(") == 1 {n++; f=(n==want); if (f) print; next}
     f && /^\}/{print; f=0; next}
     f {print}' "$GATE"
 }
-diff <(extract_qskip 1) <(extract_qskip 2) >/dev/null 2>&1; ck $? "(H54) the two copies of the quoting helper are IDENTICAL (a divergence is the cycle-3 defect class)"
-[ "$(extract_qskip 1 | grep -c '')" -gt 4 ]; ck $? "(H54b) …and the extract is not empty (an empty pair would make 'identical' vacuous)"
-[ "$(extract_qskip 1 | grep -c 'function _qskip')" = "1" ] && [ "$(extract_qskip 2 | grep -c 'function _qskip')" = "1" ]; ck $? "(H54c) …and both copies were really found (a missing second copy cannot pass as equal)"
+for fn in _qskip _fence; do
+  diff <(extract_fn 1 "$fn") <(extract_fn 2 "$fn") >/dev/null 2>&1; ck $? "(H54) the two copies of $fn are IDENTICAL (a divergence is the cycle-3 defect class)"
+  [ "$(extract_fn 1 "$fn" | grep -c '')" -gt 2 ]; ck $? "(H54b) …$fn: the extract is not empty (an empty pair would make 'identical' vacuous)"
+  [ "$(extract_fn 1 "$fn" | grep -c "function $fn")" = "1" ] && [ "$(extract_fn 2 "$fn" | grep -c "function $fn")" = "1" ]; ck $? "(H54c) …$fn: both copies were really found (a missing second copy cannot pass as equal)"
+done
+# ── `--missing` MUST NOT ANSWER CANNOT-VERIFY WITH STATUS 0 (review of #3621, cycle 2, P3): with an
+# unusable TMPDIR it printed GATE-UNAVAILABLE and returned 0, so a consumer's `if ! --missing` read a
+# cannot-verify as SUCCESS. `--check` already answered 78 for the same condition.
+out="$(TMPDIR=/nonexistent-brief-gate-$$ bash "$GATE" --missing - lane 0 "$HW/work" < "$TMP/pw-clean.txt" 2>/dev/null)"; rc=$?
+grep -q 'GATE-UNAVAILABLE' <<<"$out"; ck $? "(H56) an unusable TMPDIR answers GATE-UNAVAILABLE from --missing"
+[ "$rc" -eq 78 ]; ck $? "(H56b) …with status 78 (cannot verify), never 0 (got $rc)"
 
 # ── NON-VACUITY: remove the check and the arms above go green.
 MUT_PW="$TMP/mutant-pw.sh"
