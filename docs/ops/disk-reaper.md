@@ -52,13 +52,14 @@ merged-head floor below).
 ⛔ **The merge-time teardown is NOT one of them — it is a manual convention, not an
 automation.** An earlier version of this page (and of `scripts/disk-reaper.sh`'s
 header) listed `cleanup-worktree.sh` *at merge time* as a fourth consolidated
-trigger. It never was one: **nothing invokes it.** `merge-one.sh` performs no
+trigger. It never was one: **no automation invokes it.** `merge-one.sh` performs no
 worktree removal at all, `admin-merge.sh` removes only its own scratch worktree,
 and an index-bounded `git grep -n 'cleanup-worktree' origin/main` finds the
 script's only operational **caller** in a **manual step** —
 `skills/commit-workflow/workflow/05-cleanup.md:20`, which a lane has to remember to
-run. (Every other hit is a comment, a scoping doc, or the `main-worktree-guard`
-tests that assert the script is *refused* — not a caller.) So what the fleet has at
+run. (Every other hit is prose or a test — the script's own usage line, comments,
+a scoping doc, the guard extension's README, and guard tests that assert the script
+is *refused* — never an executor.) So what the fleet has at
 merge time is a convention a lane may forget, not a scheduled pass: this script
 neither schedules it nor accounts for it, and a reader who saw it in the list above
 would rightly stop asking why the disk still fills.

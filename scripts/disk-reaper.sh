@@ -20,15 +20,15 @@
 # and accounts for the class owners below:
 #
 # ⛔ NOT one of those triggers, and never was an automation: `scripts/cleanup-worktree.sh` "at
-# merge time". NOTHING invokes it — `merge-one.sh` does no worktree removal and `admin-merge.sh`
-# removes only its own scratch worktree; an index-bounded `git grep -n 'cleanup-worktree'
-# origin/main` finds its only operational CALLER in a MANUAL step,
+# merge time". NO AUTOMATION invokes it — `merge-one.sh` does no worktree removal and
+# `admin-merge.sh` removes only its own scratch worktree; an index-bounded `git grep -n
+# 'cleanup-worktree' origin/main` finds its only operational CALLER in a MANUAL step,
 # `skills/commit-workflow/workflow/05-cleanup.md:20`, which a lane has to remember to run (every
-# other hit is a comment, a scoping doc, or a guard test asserting it is REFUSED). This
-# pass neither schedules nor accounts for merge-time teardown (agent-infra#3278 plan comment §4:
-# the mass a merge hook cannot reach is `no-pr`/`open-pr`, which by definition have not merged). The
-# automated merge trigger that DOES exist is `pi-reap-worktrees.sh` rule 4 — inside the
-# `worktree` class below, not a merge hook.
+# other hit is prose or a test — its own usage line, comments, a scoping doc, the guard README,
+# and guard tests asserting it is REFUSED). This pass neither schedules nor accounts for
+# merge-time teardown (agent-infra#3278 plan comment §4: the mass a merge hook cannot reach is
+# `no-pr`/`open-pr`, which by definition have not merged). The automated merge trigger that DOES
+# exist is `pi-reap-worktrees.sh` rule 4 — inside the `worktree` class below, not a merge hook.
 #
 #   class      owner (the single source of the delete rule)      what it reclaims
 #   ---------  -------------------------------------------------  --------------------------------
