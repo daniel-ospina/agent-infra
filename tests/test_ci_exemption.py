@@ -3067,108 +3067,50 @@ def test_11365_a_main_red_with_a_path_parameter_is_EXEMPT_not_BLOCKED():
 def test_11365_the_widened_tail_still_fails_closed_on_junk():
     r"""NON-VACUITY: admitting `/` must not turn the rate door into a wildcard.
 
-    ⛔ "Unbalanced bracket" is deliberately NOT asserted here: `[` was already in
-    `rest` before this change, so `test_x[a` was and remains admitted. Pinning it
-    would pin a narrowing the door never had.
+    ⛔ "Unbalanced bracket" is deliberately NOT asserted: `[` was already in `rest`
+    before this change, so `test_x[a` was and remains admitted. Pinning it would pin
+    a narrowing the door never had.
 
-    ⛔ THE RESIDUAL, AS A PROPERTY — NEVER AS A LIST. `rest` is an allowlist:
-
-        A-Za-z0-9_  [  ]  .  :  -  /
-
-    ANY real id carrying a character outside that allowlist is dropped from MAIN's
-    rate table, and the identical silent-drop → "absent from main's failure set" →
-    permanent BLOCK survives for it. **That set is OPEN-ENDED and must not be
-    enumerated.** Five drafts of this docstring tried, and each one was measurably
-    wrong: it listed space, then `,`, then `;`, then the escape family, then
-    "exactly two shapes" — and "two shapes" was still false, because raw `#`,
-    `(`, `)`, `@`, `*`, `|`, `` ` ``, `<` and `>` are emitted verbatim, fit neither
-    shape, and are already live in THIS repo's own collected population.
-
-    Measured, so the shape of the gap is on the record rather than in someone's
-    memory. `pytest tests/ --collect-only -q` on this tree collects 1543 ids; the
-    strict door drops **47** of them, and **10** of those carry offending characters
-    (raw `#`, `(`, `)`, `@`, `` ` ``, `|`, `<`, `>`) that no earlier enumeration
-    named. Two real examples from the collected population — the first lives in
-    THIS file, the second in a drift fixture (``tests/fixtures/drift/current/...``):
-
-        tests/test_ci_exemption.py::test_no_runner_or_hook_wrapper_is_ever_an_identity[##[error]Bash exited with code '1'.]
-        ...test_queue_dispatch.py::test_an_unreadable_roster_still_aborts[None--(timeout)]
-
-    ⛔ WHAT pytest DOES AND DOES NOT ESCAPE — both halves are measured, and the
-    second half is the one that keeps getting stated wrongly.
-
-      * PARAMS are escaped when needed. `parametrize("x", ["a\tb", "caf\u00e9",
-        "a\\b"])` emits `test_esc[a\tb]`, `test_esc[caf\xe9]`, `test_esc[a\\b]` —
-        backslash sequences, no raw byte. So for that class the character to admit
-        is `\`.
-      * NAMES are NOT escaped. `def test_café(): pass` emits a nodeid containing the
-        RAW UTF-8 bytes `c3 a9` (verified with `--collect-only -q | hexdump -C`), so
-        a non-ASCII NAME needs a non-ASCII RANGE and admitting `\` does not help it.
-        An earlier draft asserted "the id never contains a non-ASCII byte" — false
-        for names.
-
-    ⛔ WHICH DOOR REFUSES WHICH — measured, because the obvious guess is wrong.
-    `_RATES_RE`'s nodeid group is `\S+`, so it ALSO refuses a row whose id contains
-    whitespace (space is the practical case): the row is IN the table and
-    `_RATES_RE` declines to match it — a reader-side refusal, not a property of the
-    table — a reader-side refusal. Every other offending character — punctuation,
-    escapes, raw non-ASCII — is `\S`, so `_RATES_RE` matches those rows fine and
-    the drop is `is_failure_key` / `rest` ALONE. Do not send a future fixer to
-    `_RATES_RE` for a comma; it is not involved.
-
-    ⛔ BUT A WHITESPACE ID HAS THREE DOORS, NOT TWO — the third is UPSTREAM. The
-    table is built at `scripts/ci-failure-set.sh` by
-    `sort | uniq -c | awk '{ c=$1; $1=""; ... }'`, and `$1 = ""` REBUILDS `$0`
-    joined by OFS, so every whitespace RUN inside the id collapses to one space.
-    Measured on this repo's own 47 dropped ids: **22 of 47** rows are not present
-    verbatim in the produced table (`[   ]` -> `[ ]`). Widening both doors still
-    leaves the PR's id and main's row unjoined and the BLOCK survives. Do not
-    record "both doors" as the whitespace fix; the producer is the first one.
-
-    The module's own
-    `test_the_id_door_and_the_signature_door_name_the_same_spaced_param_id` pins
-    `[chromium-Claude Desktop]` as a REAL id the loose door must name, so the
-    residual is live, not hypothetical. Filed as agent-infra#3691.
+    ⛔ TWO DOORS, AND A KNOWN RESIDUAL. `rest` is an allowlist (alnum, `_`, `[`, `]`,
+    `.`, `:`, `-`, `/`). An id outside it is dropped from MAIN's rate table and the
+    silent-drop → "absent from main's failure set" → permanent BLOCK follows.
+    **That set is open-ended; do not enumerate it.** Measured on this tree:
+    `pytest tests/ --collect-only -q` collects 1543 ids, this door drops 47, and 10
+    of those carry characters no earlier draft of these comments named. The full
+    discussion — which door, why a whitespace id has THREE of them, and what pytest
+    escapes — lives in `scripts/ci_exemption.py`'s `_NODEID_RE` block; it is NOT
+    duplicated here, because two copies of "measured" prose drift.
     """
     # ── genuinely NOT ids: refused for a STRUCTURAL reason, not by the alphabet ──
     for junk in (
         "tests/test_a.py::",                  # empty tail
         "tests/test_a.py:test_x[a/b]",        # no `::` -> not a nodeid
         "random-string",                      # not a nodeid at all
-        # a RAW tab byte: never emitted. pytest renders a tab param as [a\tb] (a
-        # backslash and a `t`), so the raw byte is not an id and BOTH doors refuse
-        # it — `is_failure_key_loose` is False too, which is what makes it junk
-        # rather than residual.
+        # a RAW tab byte: pytest renders a tab param as [a\tb] (backslash + `t`), so
+        # the raw byte is not an id and BOTH doors refuse it — `is_failure_key_loose`
+        # is False too, which is what makes it junk rather than residual.
         "tests/test_a.py::test_x[a\tb]",
     ):
         assert not is_failure_key(junk), f"{junk!r} must NOT buy a rate row"
 
-    # ── REAL ids the strict door drops: the RESIDUAL, pinned so it cannot be
-    # silently declared fixed and CANNOT be mistaken for correct behaviour.
-    # Space is a real id (the module pins `[chromium-Claude Desktop]`), so it does
-    # NOT belong in the junk loop above — asserting "must not buy a rate row" about
-    # a real id asserts that a live BLOCK is right.
-    #
-    # ⛔ EACH CLASS IS ITS OWN ENTRY, checked in its OWN assertion. A single block
-    # for all four, with one "delete this block when #3691 closes" message, would
-    # let a SPACE-ONLY fix delete the guards for comma, semicolon and the escape
-    # family — three independent silent-drop → permanent-BLOCK classes that no
-    # issue covers — and their re-introduction would then be silent. Each entry
-    # therefore fails alone and says which class it is.
-    for residual, why in (
-        ("tests/test_a.py::test_x[a b]", "SPACE — tracked as agent-infra#3691"),
-        ("tests/test_a.py::test_x[a,b]", "COMMA — no issue yet; needs its own"),
-        ("tests/test_a.py::test_x[a;b]", "SEMICOLON — no issue yet; needs its own"),
-        (r"tests/test_a.py::test_x[a\tb]", "ESCAPED TAB — no issue yet; needs its own"),
+    # ── REAL ids the strict door drops: the RESIDUAL.
+    # Each class is its OWN entry, asserted on its own, because a single block with
+    # one "delete when fixed" message let a space-only fix delete the guards for the
+    # other three. All four are tracked by agent-infra#3691 (scope widened there).
+    for residual in (
+        "tests/test_a.py::test_x[a b]",       # SPACE
+        "tests/test_a.py::test_x[a,b]",       # COMMA
+        "tests/test_a.py::test_x[a;b]",       # SEMICOLON
+        r"tests/test_a.py::test_x[a\tb]",     # ESCAPED TAB (as pytest emits it)
     ):
         assert is_failure_key_loose(residual), (
             f"{residual!r} must be a REAL id (the loose/PR door names it), else it "
             "belongs in the junk loop above, not here"
         )
         assert not is_failure_key(residual), (
-            f"RESIDUAL CLOSED for {why}: {residual!r} is now ACCEPTED by the strict "
-            "door. Remove THIS entry only — the other three classes are separate and "
-            "are not fixed by closing this one."
+            f"RESIDUAL CLOSED for {residual!r}: the strict door now ACCEPTS it. "
+            "Remove THIS entry only — the other classes are separate and are not "
+            "fixed by closing this one (see agent-infra#3691)."
         )
 
 

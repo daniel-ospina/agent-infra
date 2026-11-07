@@ -167,13 +167,11 @@ from pathlib import Path
 #: list. `rest` is an allowlist: alnum, ``_``, ``[``, ``]``, ``.``, ``:``, ``-``,
 #: ``/``. ANY real id carrying a character outside it is dropped from MAIN's rate
 #: table, and the IDENTICAL BLOCK survives for it. **That set is OPEN-ENDED.**
-#: Five drafts enumerated it and every one was measurably wrong — space, then
-#: ``,``, then ``;``, then the escape family, then "exactly two shapes"; the last
-#: was still false, because raw ``#``, ``(``, ``)``, ``@``, ``|``, ``<``, ``>`` are
-#: emitted verbatim and are already in this fleet's own corpus. Measured on this
-#: repo's collected population: 1543 ids, 47 dropped by this door, 10 of them
-#: carrying characters no earlier draft named. If a real id is dropped, ask WHICH
-#: DOOR and WHY — not whether it fits a list.
+#: Measured on this repo's collected population:
+#: 1543 ids, 47 dropped by this door, 10 of them carrying characters (raw ``#``,
+#: ``(``, ``)``, ``@``, ``|``, ``<``, ``>``) that no earlier draft of this comment
+#: named. If a real id is dropped, ask WHICH DOOR and WHY — not whether it fits a
+#: list; every list written here was measurably short.
 #:
 #: WHAT pytest ESCAPES — both halves measured. A PARAM is escaped when needed
 #: (``[a\tb]``, ``[caf\xe9]``, ``[a\\b]`` — backslash sequences, no raw byte), so for
@@ -186,12 +184,14 @@ from pathlib import Path
 #: ALSO rewritten upstream, before this module ever sees it: the table is built at
 #: ``scripts/ci-failure-set.sh`` by ``sort | uniq -c | awk '{ c=$1; $1=""; ... }'``,
 #: and ``$1 = ""`` REBUILDS ``$0`` joined by OFS, so every whitespace RUN inside the
-#: id collapses to one space. Measured on this repo's own 47 dropped ids: 22 of the
-#: 47 rows are NOT present verbatim in the produced table (``[   ]`` -> ``[ ]``).
-#: So a whitespace fix needs the PRODUCER fixed too, or the PR id and main's row
-#: never joined and the BLOCK survives a "both doors widened" change. This module
-#: already records the mangling where it matters for guard keys — see the
-#: ``uniq -c | awk`` note further down; this is the same fact for nodeids.
+#: id collapses to one space. This is NARROWER than it sounds, and the distinction
+#: matters: a SINGLE-space id passes the producer verbatim; only a RUN is rewritten.
+#: Measured on this repo's 47 dropped ids: 43 carry whitespace and 22 are not present
+#: verbatim in the produced table, so 21 of the 43 are rewritten and the rest are
+#: untouched. A fix widening both doors therefore repairs the single-space rows and
+#: leaves the run-bearing ones unjoined — for those the producer is the third door.
+#: This module already records the mangling where it matters for guard keys — see
+#: the ``uniq -c | awk`` note further down; this is the same fact for nodeids.
 #: Every other offending character is ``\S``, so ``_RATES_RE`` matches those rows
 #: and the drop is ``rest`` ALONE. Do not send a fixer to ``_RATES_RE`` for a
 #: comma; it is not involved.
