@@ -569,9 +569,12 @@ def test_cli_decide_LEGACY_tab_free_rotation_marks_a_spacey_id_UNATTRIBUTABLE(tm
     refuses to exempt a whitespace-carrying id on that evidence; this test pins the
     PLUMBING between them, which no unit test covers on its own.
 
-    MUTATION: drop ``rotation_legacy=...(has_legacy_lines)`` from ``_cmd_decide`` →
-    the run EXEMPTS and the ``--unattributable-out``/exit assertions RED (measured).
-    MUTATION: pass a constant ``rotation_legacy=False`` → same RED.
+    MUTATION: drop ``rotation=rotation`` from ``_cmd_decide`` → the run EXEMPTS and
+    the ``--unattributable-out``/exit assertions RED (measured, 1 failed).
+    ⛔ NOT a mutation: passing a constant ``rotation_legacy=False`` — that is a
+    NO-OP by design, because ``decide`` ORs the flag with the form DERIVED from
+    ``rotation=`` (``scripts/ci_exemption.py``, the ``rotation is not None`` arm), so
+    a caller can never CLEAR the fail-closed direction (measured, 1 passed).
     """
     a = "tests/test_x.py::TestK::test_a[argv14-at the EDGE]"
     sig = "sg-3686-legacy-cli"

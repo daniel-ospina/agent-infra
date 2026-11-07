@@ -816,6 +816,23 @@ def decide(
 
     Rules, in order — each one closes a declared class:
 
+    * an id carrying WHITESPACE while ANY per-run line arrived in the TAB-FREE
+      (pre-#3686) form -> **UNATTRIBUTABLE** (#3686 review cycle 6). That form
+      cannot represent a space — the split shreds it — so E5 is structurally blind
+      to such an id; exempting it would be a silent EXEMPT for an identity that may
+      have MOVED, and the pre-#3686 code BLOCKED it. ⛔ THIS ARM RUNS AHEAD OF EVERY
+      ATTRIBUTION RULE — ahead of the E5 rotation test, ahead of absent-from-main,
+      and ahead of the signature and rate rules — because each of those is an
+      ATTRIBUTION, and evidence that cannot SEE the id supports no attribution at
+      all. The one guard that does precede it is the EMPTY-PR-SAMPLE refusal (a PR
+      failure with no measured sample is not an attribution question at all). It is
+      listed here, first, for that reason: a reader who placed it after the rate
+      comparison would re-open the cycle-6 fail-open. Pass ``rotation=`` (the parsed
+      ``RotationRuns``) rather than ``rotating=`` and this is DERIVED for you;
+      passing ``rotating=`` alone means ``rotation_legacy`` defaults to False, which
+      is the FAIL-OPEN value, so a caller doing that on tab-free evidence re-opens
+      the class (measured — see
+      ``test_the_COMPOSED_path_from_text_to_decide_refuses_a_spacey_id``).
     * id ABSENT from main's failure set -> **BLOCK** (nothing shows it pre-exists).
       The baseline is FAILURE-ONLY, so a test main runs and passes leaves no row, which
       makes this neither "known new" nor "unmeasured" — the reason must claim NEITHER.
@@ -841,16 +858,6 @@ def decide(
       ``max(row.runs)`` over the PR table (the producer emits one uniform K per
       file), so this second use of ``min_runs`` is caller-declared and table-wide,
       UNLIKE the per-id MAIN floor above.
-    * an id carrying WHITESPACE while ANY per-run line arrived in the TAB-FREE
-      (pre-#3686) form -> **UNATTRIBUTABLE** (#3686 review cycle 6). That form
-      cannot represent a space — the split shreds it — so E5 is structurally blind
-      to such an id; exempting it would be a silent EXEMPT for an identity that may
-      have MOVED, and the pre-#3686 code BLOCKED it. Pass ``rotation=`` (the parsed
-      ``RotationRuns``) rather than ``rotating=`` and this is DERIVED for you;
-      passing ``rotating=`` alone means ``rotation_legacy`` defaults to False, which
-      is the FAIL-OPEN value, so a caller doing that on tab-free evidence re-opens
-      the class (measured — see
-      ``test_the_COMPOSED_path_from_text_to_decide_refuses_a_spacey_id``).
     * PR rate materially above main's -> **BLOCK** (the PR made it worse).
     * PR failure is TOTAL (every observed run failed) while main's measured rate is
       NOT total -> **BLOCK** (a deterministic failure is not a rate fluctuation, and
