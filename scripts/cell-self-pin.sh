@@ -1395,19 +1395,28 @@ verify_timer() { # <rendered timer> [expected Unit= target]
   # legitimate shape (round-17 review, P3). `Also=` is deliberately NOT in the list: it enables OTHER
   # units, creates no link for this one, and leaves `is-enabled` answering `indirect` — systemd's word for
   # "the unit file itself is not enabled", the exact state `own_state` maps to `disabled`.
+  # ⛔ AND `Alias=` IS NOT AN ENABLEMENT EITHER — IT CERTIFIED A DEAD CLOCK (round-18 review, P2). `Alias=`
+  # creates a symlink for a DIFFERENT NAME pointing AT this unit; it never puts this unit into any target's
+  # `.wants/`, so nothing starts it. It was briefly in this list on the strength of "systemd accepts it",
+  # and that was a FALSE PASS in the one shape the read-back cannot catch: MEASURED on 255.4, an
+  # `Alias=`-only timer answers `enable` rc=0, creates `cell-self-pin-legacy.timer -> …` with NO
+  # `timers.target.wants/`, and then `is-enabled` answers **`enabled`** (rc=0) — so `own_state` goes green
+  # and `--install` prints its own success over a pin that never fires. `Also=` fails safe here only
+  # because it answers `indirect`; `Alias=` is the one that lies. A link under another name is not a
+  # schedule, so it is not an installation config.
   # ⛔ A rule that fires on a state another arm already refuses cannot be gated (its removal changes only
   # the wording), so [Install] PRESENCE is not a separate arm: the replay below reports the same state for
   # a missing section, an empty one, and a fully reset one, and it is the arm a leg reds.
   _inst_vals="$(unit_section "$body" Install | awk '
     { line = $0; sub(/^[[:space:]]*/, "", line) }
-    line ~ /^(WantedBy|RequiredBy|UpheldBy|Alias)[[:space:]]*=/ {
+    line ~ /^(WantedBy|RequiredBy|UpheldBy)[[:space:]]*=/ {
       key = line; sub(/[[:space:]]*=.*$/, "", key)
       val = line; sub(/^[^=]*=[[:space:]]*/, "", val)
       if (val == "") { acc[key] = ""; next }
       acc[key] = (acc[key] == "" ? val : acc[key] " " val)
     }
     END { for (k in acc) if (acc[k] != "") { print k "=" acc[k]; n++ } }')"
-  [ -n "$_inst_vals" ] || { bad "the rendered timer carries NO EFFECTIVE installation config — systemd applies [Install] at ENABLE time, and with no non-blank WantedBy=/RequiredBy=/UpheldBy=/Alias= left after replaying the list (an EMPTY assignment is a LIST RESET, systemd.unit(5)), 'systemctl enable' exits 0 and creates NO symlink (measured, systemd 255.4: 'The unit files have no installation config', rc=0, no link, 'is-enabled' then answers 'static'), so '--install' would print its own success over a pin that never fires; the template must declare '[Install]' with 'WantedBy=timers.target'"; return 1; }
+  [ -n "$_inst_vals" ] || { bad "the rendered timer carries NO EFFECTIVE installation config — systemd applies [Install] at ENABLE time, and with no non-blank WantedBy=/RequiredBy=/UpheldBy= left after replaying the list (an EMPTY assignment is a LIST RESET, systemd.unit(5)), 'systemctl enable' exits 0 and creates NO symlink that schedules this unit (measured, systemd 255.4: 'The unit files have no installation config', rc=0, no link, 'is-enabled' then answers 'static'), so '--install' would print its own success over a pin that never fires. NOTE Alias= does NOT count: it links a different NAME at this unit, never this unit into a target, and measures 'enabled' — a green read on a clock that is never started. The template must declare '[Install]' with 'WantedBy=timers.target'"; return 1; }
   return 0
 }
 

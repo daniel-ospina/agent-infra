@@ -817,6 +817,16 @@ cp "$T/placed.before" "$PLACED"   # the positive control above legitimately re-p
 # the shape `SuccessExitStatus=` already uses.
 refuses_timer 'a WantedBy= RESET by a later EMPTY WantedBy= (the list is discarded, no config left)' \
   "$(doctor_timer_append noinstall-reset 's|^OnUnitActiveSec=.*$|OnUnitActiveSec=10min|' 'WantedBy=\n')" "$T/tu42" 'installation config'
+# ⛔ AND AN `Alias=` IS NOT AN INSTALLATION CONFIG — IT WAS A FALSE PASS, IN THE ONE SHAPE THE READ-BACK CANNOT
+# CATCH (round-18 review, P2). `Alias=` links a DIFFERENT NAME pointing at this unit; it never puts this unit
+# into any target's `.wants/`, so nothing starts it. MEASURED on systemd 255.4: an `Alias=`-only timer gives
+# `enable` rc=0, creates `cell-self-pin-legacy.timer -> …` with NO `timers.target.wants/`, and then
+# `is-enabled` answers **`enabled`** (rc=0) — so `own_state` reads green and `--install` prints its own
+# success over a pin that never fires. `Also=` fails safe here only because it answers `indirect`; `Alias=`
+# is the one that lies. This leg is what stops the accept-set being widened back: re-adding `Alias` to the
+# replay's alternation makes this template INSTALL, and the leg reds.
+refuses_timer 'a timer whose ONLY installation config is Alias= (a name for THIS unit, never a schedule)' \
+  "$(doctor_timer alias-only 's|^WantedBy=.*$|Alias=cell-self-pin-legacy.timer|')" "$T/tu43" 'installation config'
 
 # ⛔ AND WITH NO PARSER ON THE BOX, THE FALLBACK IS A WHITELIST, NOT A GUESS: the ten documented shortcut
 # words are certifiable by construction, and any explicit EXPRESSION is REFUSED with the two routes out
