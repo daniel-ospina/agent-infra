@@ -430,7 +430,7 @@ primary_clone_root() {
 # when it is. Takes the RESOLVED path: a symlink is a spelling, and `ln -s /tmp/wt-x $HOME/sup` must be
 # refused for the same reason the #2666 unit-dir guard resolves before it grades.
 scratch_supervisor_reason() {
-    local p="${1:-}" d root="" declared="" shape=""
+    local p="${1:-}" d root="" declared="" shape="" pin="" tree="" base="" pin_ok=0
     shape="$(lane_scratch_shape "$p")"
     if [ -n "$shape" ]; then
         printf 'it matches the lane-scratch shape %s — a checkout a lane removes when it ends, whose branch is merged nowhere' "$shape"
@@ -443,8 +443,32 @@ scratch_supervisor_reason() {
             # ⛔ DETACHED IS NOT ENOUGH — IT MUST BE THE PIN THIS BOX RECORDS (review-4 P1, measured). The
             # fleet's drainer builds a lane's scratch as a DETACHED worktree under `$HOME` and deletes it when
             # the lane ends, so admitting any detached worktree re-opened the #2697 class.
-            if ! path_under "${d%|detached}" "$(pin_root_of_this_box)"; then
-                printf 'it lives in a DETACHED GIT WORKTREE %s that is NOT the harness pin this box records (%s) — the fleet drainer builds a lane scratch checkout exactly like this and removes it with `worktree remove` when that lane ends' "${d%|detached}" "$(pin_root_of_this_box)"
+            # ⛔ AND "UNDER THE PIN ROOT" ALONE IS DEFEATED BY THE VARIABLE THAT NAMES THE ROOT (cycle-3 P1,
+            # MEASURED — an ambient-env bypass, not doc drift). `pin_root_of_this_box` falls back to
+            # `HARNESS_PIN_DIR`, so `HARNESS_PIN_DIR=$HOME` made ALL of `$HOME` a pin root and re-admitted the
+            # ordinary drainer scratch: reproduced on a primary clone with `git worktree add --detach
+            # $HOME/wt-drainer-x`, `ORCH_SUPERVISOR` on it — refused when the variable was unset, ARMED with the
+            # unit naming `ExecStart=…/wt-drainer-x/scripts/cloud-cell-supervisor.sh` when it was `$HOME`. That
+            # contradicts `docs/ops/controller-service.md` ("every other detached worktree is refused"), so the
+            # TREE ITSELF is graded now, not just its prefix: it must be a PIN TREE — `<pin>/<commit>` as
+            # `cloud-cell-bringup.sh` builds it (`git worktree add --detach "$HARNESS_PIN_DIR/$sha"`) — or be
+            # exactly the root this box records (the bring-up also accepts a pin that IS the root, when that
+            # path is already a worktree of the repo). `HARNESS_PIN_DIR=$HOME` now admits `$HOME/wt-drainer-x`
+            # only if someone also names THAT directory as the pin root, which is the same declaration the
+            # residual below already names for HOME/CELL_HOME rather than a widening of the rule.
+            pin="$(pin_root_of_this_box)"
+            tree="${d%|detached}"
+            base="$(basename "$tree")"
+            if [ "${tree%/}" = "${pin%/}" ]; then
+                pin_ok=1
+            else
+                case "$base" in
+                    ''|*[!0-9a-f]*) ;;        # not a commit id: a lane scratch is named by its lane
+                    *) [ "${#base}" -ge 7 ] && [ "${#base}" -le 40 ] && pin_ok=1 ;;
+                esac
+            fi
+            if [ "$pin_ok" -ne 1 ] || ! path_under "$tree" "$pin"; then
+                printf 'it lives in a DETACHED GIT WORKTREE %s that is NOT the harness pin this box records (%s) — a pin is a TREE named for the commit it holds (`<pin dir>/<sha>`, what the bring-up creates with `git worktree add --detach`) or the recorded pin root itself; this one is named `%s`, and the fleet drainer builds a lane scratch checkout exactly like it and removes that with `worktree remove` when the lane ends' "$tree" "$pin" "$base"
                 return 0
             fi ;;
         *'|branch')
@@ -544,16 +568,23 @@ resolve_supervisor() {
         # still passes, and `systemd-analyze` refuses to even grade an ExecStart whose path contains `%`.
         # A checkout under such a path therefore renders an artifact systemd reads differently than this
         # installer does, so it is refused for the same reason rather than silently shipped.
+        # ⛔ AND THE QUOTING META‑CHARACTERS ARE A THIRD SPELLING (cycle-3 P2, MEASURED). systemd parses these
+        # two unquoted lines with its own word splitter, which STRIPS single quotes and interprets `\`: a
+        # supervisor under `…/ag'in'fra/…` installed with rc=0 and an ExecStart naming `…/aginfra/…`, which
+        # `systemd-analyze verify` then rejected as "not executable" (an unpaired quote gives "Unbalanced
+        # quoting, ignoring"; a backslash gives "Ignoring unknown escape sequences") — the same false PASS the
+        # whitespace arm closes, one character class over. `verify_unit`'s `grep -qxF` still matches the raw
+        # text either way, so the render refuses them too.
         case "$r" in
-            *[[:space:]]*|*'"'*|*%*|*'$'*)
+            *[[:space:]]*|*'"'*|*"'"*|*\\*|*%*|*'$'*)
                 if [ "$hard" = 1 ]; then
-                    err "REFUSING: the supervisor path '$r' contains whitespace, a double quote, '%' (a systemd specifier) or '$' (variable expansion), and this unit renders its environment and ExecStart UNQUOTED."
-                    err "  systemd would split, expand or drop that value, silently DROP the pin assignment and fail to exec the supervisor (measured:"
-                    err "  'Invalid environment assignment, ignoring: …' and 'Failed to resolve specifiers …, ignoring: Invalid slot'), while the rendered text still looks right."
-                    err "  Move the checkout to a path without spaces, quotes, '%' or '$', or pass a supervisor that has none."
+                    err "REFUSING: the supervisor path '$r' contains whitespace, a quote, a backslash, '%' (a systemd specifier) or '$' (variable expansion), and this unit renders its environment and ExecStart UNQUOTED."
+                    err "  systemd would split, strip, expand or drop that value, silently DROP the pin assignment and fail to exec the supervisor (measured:"
+                    err "  'Invalid environment assignment, ignoring: …', 'Failed to resolve specifiers …, ignoring: Invalid slot' and an ExecStart whose quoted path is not executable), while the rendered text still looks right."
+                    err "  Move the checkout to a path without spaces, quotes, a backslash, '%' or '$', or pass a supervisor that has none."
                     return 1
                 fi
-                err "note: NOT rendering ExecStart from $r — the path contains whitespace, a double quote, '%' or '$', which this unit renders unquoted and systemd would split, expand or drop."
+                err "note: NOT rendering ExecStart from $r — the path contains whitespace, a quote, a backslash, '%' or '$', which this unit renders unquoted and systemd would split, strip, expand or drop."
                 continue ;;
         esac
         if why="$(scratch_supervisor_reason "$r")"; then
