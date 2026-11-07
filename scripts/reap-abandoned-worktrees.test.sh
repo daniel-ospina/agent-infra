@@ -65,9 +65,14 @@ trap 'chmod -R u+rwX "$T" 2>/dev/null; rm -rf "$T"' EXIT
 # ⛔ THE BOX'S OWN HARNESS ENV MUST NOT LEAK IN: a cell exports CELL_HOME, and a present-but-unparseable
 # stamp makes the owner REFUSE (exit 3) — the trap its sibling suite documents. A case must fail for
 # the code's reason, never the box's.
-# ⛔ EVERY SEAM THE OWNER READS IS UNSET, not merely the ones this suite pokes. The list is derived
-# from `grep -oE '\$\{(REAP_AW_[A-Z_]+|CELL_HOME|LP_[A-Z_]+)'` over the owner, so a seam added later
-# shows up as a diff here. The mode seam is the sharp one: `REAP_AW_DRY_RUN=0` — a DOCUMENTED arming
+# ⛔ EVERY SEAM THE OWNER — AND THE `lib/live-paths.sh` IT SOURCES — READS IS UNSET, not merely the
+# ones this suite pokes. The `REAP_AW_*`/`CELL_HOME` names are derived from
+# `grep -oE '\$\{(REAP_AW_[A-Z_]+|CELL_HOME|LP_[A-Z_]+)'` over the owner, so a seam added later shows
+# up as a diff here. The library's four READ seams are not in that spelling (it reads them bare, e.g.
+# `${LP_LS_PROBE:-ls}` at `scripts/lib/live-paths.sh:95`), so they are named explicitly below: a
+# forced-unavailable census or a probe that cannot run makes the whole suite fail for the BOX's reason
+# (measured: `LP_CENSUS_UNAVAILABLE=1` → 6 passed, 9 failed) while the mutation assertions still read
+# "caught" — i.e. the mutants look proven and prove nothing. The mode seam is the sharp one: `REAP_AW_DRY_RUN=0` — a DOCUMENTED arming
 # path — supplies the default mode, so on a box armed through it every case that relies on the dry-run
 # default would run as an APPLY and fail for the box's reason (review of #3278, measured: A, C, E and
 # G red with `REAP_AW_DRY_RUN=0` against a correct implementation). `REAP_AW_LOG` and
@@ -75,7 +80,8 @@ trap 'chmod -R u+rwX "$T" 2>/dev/null; rm -rf "$T"' EXIT
 unset CELL_HOME REAP_AW_STAMP REAP_AW_DIRTY REAP_AW_ROOTS REAP_AW_AGED_MINUTES \
       REAP_AW_BUDGET_SECONDS REAP_AW_GITLESS_MAX REAP_AW_GITLESS_KEEP REAP_AW_PROC_ROOT \
       REAP_AW_DRY_RUN REAP_AW_GIT_TIMEOUT REAP_AW_LIVE_PATHS REAP_AW_LOCK_STALE_SECONDS \
-      REAP_AW_LOG REAP_AW_STATE_DIR LP_PROC_ROOT LP_CENSUS_MECH 2>/dev/null || true
+      REAP_AW_LOG REAP_AW_STATE_DIR LP_PROC_ROOT LP_CENSUS_MECH \
+      LP_CENSUS_UNAVAILABLE LP_LS_PROBE LP_LSOF_PROBE LP_PS_PROBE 2>/dev/null || true
 
 PASS=0; FAIL=0
 ok()  { PASS=$((PASS + 1)); printf '  ✅ %s\n' "$1"; }
