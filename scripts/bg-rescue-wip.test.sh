@@ -1232,7 +1232,10 @@ else
   # meaning in this output, and the honest line on this path says "no ambient GH_TOKEN/GITHUB_TOKEN **to
   # unshadow**" — a statement of absence, not a claim of action — so matching the stem cannot false-red
   # a correct tree (verified against the unmutated run below).
-  if printf '%s\n' "$OUT" | grep -qi 'remov'; then
+  # ⛔ A HERE-STRING, NOT A PIPE (#841/#864): this suite runs under `set -o pipefail`, where
+  # `printf … | grep -q` takes the ELSE branch whenever the quiet grep exits early on a large
+  # $OUT — i.e. the assertion silently stops asserting on exactly the input it exists to grade.
+  if grep -qi 'remov' <<<"$OUT"; then
     bad "wfnocred: claims a credential was REMOVED on the path where nothing was tried — $(printf '%s\n' "$OUT" | grep -i 'remov' | head -1)"
   else
     ok "wfnocred: claims no removal, in any spelling — nothing was unset on the path where no retry was made"
