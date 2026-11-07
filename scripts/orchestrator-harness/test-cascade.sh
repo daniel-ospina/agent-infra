@@ -1005,6 +1005,20 @@ PEOF
 mutlo "M5 the funnel ignores arg 12 and re-closes the issue path" \
     's/^  pr_waiting="\${prw:-1}"$/  pr_waiting=1/' "$TMP/p-sel.sh"
 
+# ⛔ THE ZERO-UN-OWNED HOLD ARM, WHICH NOTHING PINNED (review 2026-11-07, P1 — measured). The
+# `elif [ "${prw:-}" = "1" ]` arm is the ONLY place a pass with ZERO un-owned PRs can report that a
+# higher level holds the room, and every OTHER probe here reaches the other arms first: M5 and `sel13`
+# both drive `unowned=5`, and `live-ownership.test.sh`'s (a2)/(b) never pass `prw=1` at `unowned=0`.
+# So deleting the whole arm left test-cascade at 167/0 and live-ownership at 74/0 — the exact
+# silent-coverage hole a mutant exists to close. Driven at the state the arm is FOR: `unowned=0`,
+# `prw=1`, no cap, room to give ⇒ `DEFERRED`, because `CASCADE_ISSUE_SLOTS` is 0 and the batch's own
+# first guard would break (a printed DISPATCH over a batch that queues nothing).
+cat > "$TMP/p-selz.sh" <<'PEOF'
+. "$ORCH_FNS"; lo_select 0 0 0 0 3 "" 10 1 2 ok 1 1 >/dev/null 2>&1; [ "$LO_CHOICE" = "none" ] && echo yes || echo no
+PEOF
+mutlo "M24 the funnel drops the ZERO-un-owned hold arm -> it prints DISPATCH over a batch that queues nothing" \
+    's/^  elif \[ "${prw:-}" = "1" \]; then$/  elif false; then/' "$TMP/p-selz.sh"
+
 cat > "$TMP/p-cap.sh" <<'PEOF'
 grep -qF '[ "$K" -ge "${CASCADE_ISSUE_SLOTS:-${BATCH:-2}}" ] && break' "$TGT" && echo yes || echo no
 PEOF
