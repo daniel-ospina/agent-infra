@@ -411,6 +411,36 @@ await test("an entry declaring BOTH transports keeps the BASE entry — an ambig
   equal(t?.command, undefined, "the ambiguous delta is not applied");
 });
 
+await test("a BASE entry declaring BOTH transports is dropped at the read, with a warning", async () => {
+  // The docs promise an ambiguous entry is rejected — which was only true for a REPO entry: a base entry
+  // declaring both was copied verbatim with no warning while connectServer silently used `url`.
+  const repoDir = tempDir("mcp-bind-baseboth-repo-");
+  const homeDir = tempDir("mcp-bind-baseboth-home-");
+  mkdirSync(join(homeDir, ".pi", "agent"), { recursive: true });
+  writeJson(repoDir, ".mcp.json", { mcpServers: {} });
+  writeJson(join(homeDir, ".pi", "agent"), ".mcp.json", {
+    mcpServers: {
+      broken: { url: "https://x/mcp", command: "/bin/sh" },
+      fine: { url: "https://ok.example/mcp", lazy: true },
+    },
+  });
+
+  const manager = new McpServerManager();
+  const logs = await withCapturedLogs(() =>
+    manager.connectAllLayers({
+      base: join(homeDir, ".pi", "agent", ".mcp.json"),
+      repo: join(repoDir, ".mcp.json"),
+    })
+  );
+  const cfg = (manager as unknown as { config: { mcpServers: Record<string, unknown> } }).config;
+  ok(!("broken" in cfg.mcpServers), "an ambiguous BASE entry must be dropped, not silently resolved to `url`");
+  ok(cfg.mcpServers.fine, "and a valid base entry still loads");
+  ok(
+    logs.some(l => l.includes("declares BOTH") && l.includes("base layer")),
+    `the base layer must be named in the warning — got:\n${logs.join("\n")}`
+  );
+});
+
 await test("a `type` that contradicts the declared transport keeps the BASE entry", () => {
   // `type` is the schema's transport selector, and connectServer dispatches on url/command — so
   // `{"type":"http","command":…}` would silently run over stdio.
@@ -707,7 +737,7 @@ await test("`args: []` vs absent `args` is the SAME launch, so the base's env su
   deepEqual(g?.env, { K: "1" }, "an empty args list is not a different launch");
 });
 
-await test("the LEGACY `connectAll` path cannot resurrect the crash (belt is in classifyServers)", async () => {
+await test("`connectAll` funnels through the sanitiser: no crash, clean stored config, clean catalog", async () => {
   // `connectAll` is a public method on an exported class and is the pattern two suites follow; it hands
   // raw `JSON.parse` output straight to connectConfig, bypassing asMcpJson and mergeMcpLayers.
   const dir = tempDir("mcp-bind-legacy-");
@@ -727,6 +757,16 @@ await test("the LEGACY `connectAll` path cannot resurrect the crash (belt is in 
     else process.env.PI_MCP_SERVERS = prevAllowed;
   }
   ok(true, "a non-object entry no longer throws out of the extension factory");
+  // ⛔ PIN THE FUNNEL ITSELF. `connectConfig` sanitises once so EVERY reader is safe; without this
+  // assertion that mechanism can be deleted silently, because classifyServers and catalog() each guard
+  // independently — and the next reader added to `this.config` would resurrect the crash.
+  const stored = (manager as unknown as { config: { mcpServers: Record<string, unknown> } }).config
+    .mcpServers;
+  ok(
+    !Object.hasOwn(stored, "tortoise") && !Object.hasOwn(stored, "ghost"),
+    "the stored config itself must be clean — the funnel, not just the readers, drops invalid entries"
+  );
+  equal(Object.getPrototypeOf(stored), null, "and it is a null-prototype map");
   // `mcp_catalog` is the tool every error message tells the operator to run, and it reads `cfg.lazy`.
   // Before the sanitise-once fix the crash simply MOVED here.
   const entries = manager.catalog();

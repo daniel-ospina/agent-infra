@@ -625,10 +625,11 @@ const STDIO_CREDENTIAL_FIELDS = ["env"] as const;
  *
  * ⛔ PLUS an explicit rejection of the PROTOTYPE-SHAPED names, which the charset admits. The real
  * defence against prototype pollution is that the merge builds `Object.create(null)` and reads it with
- * `Object.hasOwn` — this is the second lock, not the first. Without it, `__proto__` on any
- * plain-object path (the legacy `connectAll` config is a normal object) resolves `Object.prototype`
- * as if it were a server, and `loadServer("__proto__")` answers "has neither 'command' nor 'url'"
- * instead of "Unknown MCP server".
+ * `Object.hasOwn` — this is the second lock, not the first. `connectConfig` also stores a
+ * null-prototype sanitised map, so even the legacy `connectAll` config — a plain object off
+ * `JSON.parse` — cannot resolve `Object.prototype` as a server; without this name check,
+ * `loadServer("__proto__")` would answer "has neither 'command' nor 'url'" instead of "Unknown MCP
+ * server".
  */
 const PROTOTYPE_SHAPED_NAMES = new Set(["__proto__", "constructor", "prototype"]);
 
@@ -896,6 +897,19 @@ function asMcpJson(value: unknown, label: string): McpJson | null {
       );
       continue;
     }
+    // ⛔ BOTH TRANSPORTS IS INVALID FOR EITHER LAYER, and it is refused at the READ so the promise holds
+    // on the base path too. `connectServer` tests `url` BEFORE `command`, so such an entry silently runs
+    // over HTTP and ignores the `command` — and a base entry declaring both used to be copied verbatim
+    // with NO warning, exactly the silent outcome the docs promise to reject. pi reports and skips an
+    // invalid entry (`docs/mcp.md`); so do we.
+    if (typed.url !== undefined && typed.command !== undefined) {
+      console.log(
+        `[mcp-client] WARN: ${label} entry "${name}" declares BOTH "url" and "command" — ambiguous, so ` +
+          `dropped. Declare ONE transport. ` +
+          suffix
+      );
+      continue;
+    }
     servers[name] = entry as McpServerConfig;
   }
   return { ...(value as Record<string, unknown>), mcpServers: servers } as McpJson;
@@ -1053,11 +1067,10 @@ export function classifyServers(
   const eager: [string, McpServerConfig][] = [];
   const lazySkipped: string[] = [];
   for (const [name, cfg] of Object.entries(servers)) {
-    // ⛔ THE BELT THAT COVERS EVERY ENTRY POINT. This function is exported and reads `cfg.lazy`, so a
-    // non-object entry (`{"mcpServers": {"tortoise": null}}`) throws out of the extension factory and
-    // ends the session naming no file, entry or cause. `asMcpJson` and `mergeMcpLayers` both guard it on
-    // the normal path, but `connectAll` — a public method, and the pattern two suites follow — hands raw
-    // `JSON.parse` output straight through. Guarding here means NO caller can resurrect the crash.
+    // ⛔ THE BELT FOR A DIRECT CALLER. This function is exported, and it reads `cfg.lazy` — so a
+    // non-object entry throws `reading 'lazy'`. The entry points do NOT need this: `connectConfig`
+    // sanitises `mcpServers` once, so `classifyServers` reached through it only ever sees objects. This
+    // covers a direct caller of the exported function, and a `this.config` assigned by hand.
     if (!isServerEntry(cfg)) {
       console.log(
         `[mcp-client] WARN: server "${name}" is not an object — skipped (no transport, and no crash)`

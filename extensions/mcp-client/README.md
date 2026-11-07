@@ -141,7 +141,7 @@ attempts — set it higher for a server that reliably needs longer than 15s (e.g
 recovery command:
 
 ```
-[mcp-client] MCP server 'tortoise' unavailable — continuing without it. Recover with: mcp_load tortoise (or raise "timeoutMs" in .mcp.json for a slow cold start).
+[mcp-client] MCP server 'tortoise' unavailable — continuing without it. Recover with: mcp_load tortoise (or raise "timeoutMs" in .mcp.json for a slow cold start — set only that field).
 ```
 
 `mcp_load <server>` reconnects on demand and registers the server's tools for
