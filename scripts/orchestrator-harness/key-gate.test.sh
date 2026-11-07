@@ -836,13 +836,18 @@ HGWTRAIL="$(mkhome gateway_trailing_ws "$GW_TRAIL_WS_JSON")"
 OUT="$(run_gate "$HGWTRAIL" RADIUS_API_KEY=rk KG_PROV=deepseek KG_MODEL=deepseek-flash)"; RC="$(printf '%s\n' "$OUT" | sed -n 's/^RC=//p' | head -1)"
 ck "3z15y66 a TRAILING-SPACE default gateway is not the default one either (rc=${RC:-none})" \
    "$([ "${RC:-0}" = "82" ] && echo 0 || echo 1)"
-# ⛔ AND THE TWO PADDED SPELLINGS ARE REFUSED FOR DIFFERENT REASONS, WHICH IS THE CORRECT ANSWER (round 45, measured):
-# the parser TRIMS a LEADING C0-or-space of the whole string, so `" https://radius.pi.dev"` is still a buildable URL and its
-# api-less definition is the deleted provider (3z15y65); it does NOT trim a TRAILING one, and the vendor appends
-# `/messages` first, so `"https://radius.pi.dev "` puts the space INSIDE the host and the URL cannot be built at all —
-# measured, node THROWS on it and `pi -p` answers `Invalid URL`, so that arm asserts the URL reason. It asserted
-# `provider-dropped` until the trailing trim was removed, i.e. it was pinning this fix’s own false PASS.
-has "$OUT" "reason=models-json-bad-gateway" "3z15y67 …and the TRAILING-space spelling is a URL failure, because the vendor appends \`/messages\` before the parser trims"
+# ⛔ AND THE TWO PADDED SPELLINGS ARE REFUSED FOR DIFFERENT REASONS, WHICH IS THE CORRECT ANSWER (round 46, measured
+# ON THE INSTALLED pi): the parser TRIMS a LEADING C0-or-space of the whole string, so `" https://radius.pi.dev"` is a
+# buildable URL whose api-less definition is the deleted provider (3z15y65); it does NOT trim a TRAILING one, so
+# `"https://radius.pi.dev "` puts the space INSIDE the host — but for a RADIUS GRANT that URL is NEVER BUILT.
+# `configureRadiusProviders` (`model-runtime.js:119-132`) runs before any request, the non-default gateway gives
+# `radiusProvider` an EMPTY baseline catalog, `findModelDefaults` finds nothing and `modelFromJson` throws, so
+# `recomposeProvider` DELETES the provider — measured on pi: `Error: Unknown provider "deepseek". Use --list-models`,
+# NOT `Invalid URL`. ⛔ SO THIS ARM ASSERTS `provider-dropped`, AND AN EARLIER DRAFT OF THIS COMMENT WAS WRONG (round 46,
+# P2): it claimed pi answers `Invalid URL` here and moved the arm to the URL reason, which sends the operator to a
+# remedy that does not clear the box. The code was fixed instead — the URL test now skips an api-less definition on a
+# non-default grant gateway so the `no-api` branch can answer (see `_url_models` in key-gate.sh).
+has "$OUT" "reason=models-json-provider-dropped" "3z15y67 …and a GRANT's trailing-space gateway is the DELETED provider, because compose throws before any URL is built"
 hasnt "$OUT" "check=ok" "3z15y68 …and never the green line the trimming normaliser printed"
 # ── 3z15y69-76: THE AUTHORITY'S PORT IS PART OF "WOULD `new URL()` THROW" ──────────────────────────────
 # ⛔ MEASURED ON node, on the vendor's own URL construction (round 41, P1): `new URL("<baseUrl>/messages")` THROWS
@@ -925,10 +930,12 @@ hasnt "$OUT" "models-json-bad-gateway" "3z15y80 …and the URL reason never fire
 # ⛔ MEASURED BY MUTATION, PER MUTANT, WITH THE OBSERVED ARM SET (not assumed — and one claim below was corrected by
 # running it): removing the tab/NL/CR strip reddens 81/82; removing `\\` from the authority split and the leading lstrip
 # reddens 91/92; dropping the empty-host test reddens 85/86; restoring python\x27s `.strip()` reddens 89/90; and dropping
-# the ONE decoded-host check reddens 48/49, 83/84, 87/88, 93/94 and 95/96 together. ⛔ THAT LAST SET IS THE HONEST
-# SHAPE OF THIS FIX: the raw-class and `%`-syntax checks that used to sit beside it were REDUNDANT (when the host
-# carries no valid escape the decoded form IS the host, and a malformed escape leaves the `%` this class already
-# rejects), and while both existed a mutant removing EITHER stayed GREEN — half the guard was unfalsifiable. They were
+# the ONE decoded-host check reddens 48/49, 83/84, 93/94 and 95/96 together — NOT 87/88, which an earlier draft of this comment claimed
+# (round 46, P3, measured): since the byte-decode rewrite a mid-host `%zz` returns False at the `int()`
+# `ValueError` BEFORE the class is reached, so it no longer rides this mutant. `87/88` are still real — skipping
+# escapes entirely reddens them — they are simply not pinned by THIS one. ⛔ THAT LAST SET IS THE HONEST
+# SHAPE OF THIS FIX: the raw-class and `%`-syntax checks that used to sit beside it were REDUNDANT — measured by
+# re-adding BOTH at once, which changes no arm’s verdict — and while they existed a mutant removing EITHER stayed GREEN — half the guard was unfalsifiable. They were
 # deleted, so one check now answers to one mutant, and `3z15y97/98` are the other direction: refusing every escape
 # (rather than only those that decode to a forbidden code point) reddens them, because `%41`/`%2E` are `A` and `.`,
 # which the parser accepts. No arm here is vacuous — each was observed red under its own mutant.
@@ -1042,6 +1049,22 @@ OUT="$(run_gate "$HSPTP" DEEPSEEK_API_KEY=dk KG_PROV=deepseek KG_MODEL=deepseek-
 ck "3z15y105 the same space WITH a path is NOT refused (rc=${RC:-none}) — it lands in the path, which \`new URL\` accepts" \
    "$([ "${RC:-0}" = "0" ] && echo 0 || echo 1)"
 hasnt "$OUT" "models-json-bad-gateway" "3z15y106 …so the URL reason never fires on the control this pair needs"
+# ── 3z15y107-108: AN UNENCODABLE CODE POINT IS A THROW, AND MUST NEVER CRASH THE PAYLOAD ───────────────
+# ⛔ MEASURED (round 46, P1): a LONE SURROGATE (`\ud800`) is accepted by python\u2019s `json` inside a string and is NOT
+# UTF-8-encodable, and `buf.extend(_c.encode("utf-8"))` sat OUTSIDE any handler \u2014 so the interpreter DIED, the caller
+# runs it with `2>/dev/null`, and the gate printed `check=ok var=DEEPSEEK_API_KEY` over a box node refuses
+# (`ERR_INVALID_URL`) while the PREVIOUS commit refused it 82. This is the same failure mode the `int()` guard exists
+# for: an exception escaping the compose payload loses EVERY compose-level refusal in the document, not just this one.
+# \u26d4 THE FIXTURE ALSO CARRIES A BAD PORT ON PURPOSE: without the guard the surrogate kills the payload and the port is
+# never diagnosed, so a green `check=ok` here means the crash swallowed a real refusal \u2014 which is what the arm detects.
+# MEASURED BY MUTATION: removing the `UnicodeEncodeError` handler reddens both arms.
+SP_SURR_JSON='{"providers":{"deepseek":{"baseUrl":"https://gw\ud800.example:abc/v1","models":[{"id":"deepseek-flash","api":"pi-messages"}]}}}'
+HSPSSURR="$(mkhome spell_surrogate_host "$SP_SURR_JSON")"
+OUT="$(run_gate "$HSPSSURR" DEEPSEEK_API_KEY=dk KG_PROV=deepseek KG_MODEL=deepseek-flash)"; RC="$(printf '%s\n' "$OUT" | sed -n 's/^RC=//p' | head -1)"
+ck "3z15y107 a LONE SURROGATE in the host REFUSES (rc=${RC:-none}) — an unencodable code point must return False, never crash the payload" \
+   "$([ "${RC:-0}" = "82" ] && echo 0 || echo 1)"
+has "$OUT" "reason=models-json-bad-gateway" "3z15y108 \u2026and the refusal it swallowed comes back, so the crash is not silently green"
+
 
 
 # `composeat <home> <provider> [<model>]` — the compose answer itself, because the DROPPED-provider warning only prints on

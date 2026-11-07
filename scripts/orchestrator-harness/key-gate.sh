@@ -1132,8 +1132,11 @@ if sys.argv[2] == "compose":
         #     `ho\xa0st`, `ho\u2003st`, `ho<st`, `ho>st`, `ho^st`, `ho|st`, `h%zz` and `h%2` all throw, while `h%41`
         #     PARSES (as host `ha`).
         # \u26d4 WHAT IS DELIBERATELY **NOT** EMULATED, and why the refusal\x27s own comment and the README row are worded
-        # to match: the IPV6 INTERIOR is not validated (`[zzz]`/`[:::]` throw in node and pass here), and the WHATWG
-        # host parser\x27s full code-point and punycode pipeline is not reproduced. This is a refusal that must never
+        # to match: the IPV6 INTERIOR is not validated (`[zzz]`/`[:::]` throw in node and pass here), the WHATWG
+        # host parser\x27s full code-point and punycode pipeline is not reproduced, the IPv4-NUMBER RULE is not
+        # reproduced (`0000080` throws in node), and a NON-http(s) scheme is not inspected at all \u2014 `_buildable`
+        # returns True for it before this function is reached (`ftp://[zzz]/v1` throws in node and passes here).
+        # This is a refusal that must never
         # fire on a box `pi -p` runs, so an unemulated shape stays ACCEPTED rather than guessed at \u2014 the direction that
         # leaves a residual false PASS (pre-existing: no URL test at all existed before this PR) instead of inventing a
         # false BLOCK. Both halves are declared, and the arms pin the ones that are emulated.
@@ -1180,8 +1183,11 @@ if sys.argv[2] == "compose":
         # parser accepts were refused. That is the false-BLOCK direction this file\x27s header forbids, introduced by
         # this very fix, so the decoding is the parser\x27s: collect BYTES (an escape is one byte, a literal character is
         # its UTF-8 encoding), then decode the buffer strictly. INVALID UTF-8 IS A THROW, not a pass \u2014 node refuses
-        # `%80`, `%A0`, `%C2%41` and `%C0%AF` too (measured) \u2014 and so is a malformed escape (`%zz` reaches `int()` as
-        # non-hex, `%4` as a truncated pair: both raise, both throw in node, so both refuse here).
+        # `%80`, `%A0`, `%C2%41` and `%C0%AF` too (measured) \u2014 and so is a malformed escape, which the `int()` below
+        # turns into `return False`. \u26d4 THE TWO MALFORMED SPELLINGS FAIL BY DIFFERENT MECHANISMS, AND SAYING BOTH "raise"
+        # WAS WRONG (round 46, P3, measured): a MID-host `%zz`/`%4s` makes `int()` raise `ValueError` directly, while a
+        # `%4` at the END of the host does NOT \u2014 `int("4", 16)` is `4`, so it appends byte `0x04` and it is the DECODED
+        # class below that refuses it (measured: removing that class makes `https://h%4` ACCEPT). Same verdict, two paths.
         buf = bytearray()
         _i = 0
         while _i < len(host):
@@ -1193,7 +1199,16 @@ if sys.argv[2] == "compose":
                     return False
                 _i += 3
             else:
-                buf.extend(_c.encode("utf-8"))
+                # \u26d4 AN UNENCODABLE CODE POINT IS A THROW, NOT A CRASH (round 46, P1, measured): a LONE SURROGATE
+                # (`\ud800`, which python\x27s `json` ACCEPTS inside a string) is not UTF-8-encodable, and this call used
+                # to sit OUTSIDE any handler \u2014 the interpreter DIED, `key_gate_compose` runs it with `2>/dev/null`, and
+                # the gate printed `check=ok var=DEEPSEEK_API_KEY` over a box node refuses (`ERR_INVALID_URL`) while the
+                # PREVIOUS gate refused it 82. That is the same class the `int()` above is guarded for, and an
+                # exception escaping this payload loses EVERY compose-level refusal, not just this one.
+                try:
+                    buf.extend(_c.encode("utf-8"))
+                except UnicodeEncodeError:
+                    return False
                 _i += 1
         try:
             decoded = bytes(buf).decode("utf-8")
@@ -1308,6 +1323,19 @@ if sys.argv[2] == "compose":
     # RAW, scheme-less value dies `Invalid URL` whatever the gateway is). Measured: the normaliser half alone reddened
     # `3z15y20/21/22`, `32/33`, `8z47/48`, `8z53/54`; the pair is green.
     for _m in _url_models:
+        # \u26d4 A GRANT ON A NON-DEFAULT GATEWAY NEVER REACHES THE URL (round 46, P2, measured):
+        # `configureRadiusProviders` (`model-runtime.js:119-132`) is called BEFORE any request, `radiusProvider` takes the
+        # EMPTY baseline catalog when the gateway is not the default one (`radius.js:21-24`), `findModelDefaults` finds
+        # nothing and `modelFromJson` THROWS on the `api`-less definition \u2014 so `recomposeProvider` DELETES the provider
+        # and no URL is ever built. Measured on pi for a trailing-space gateway + an api-less definition
+        # (`https://radius.pi.dev `): `Error: Unknown provider "deepseek". Use --list-models ...`, NOT `Invalid URL` \u2014
+        # while the URL test says `_buildable` is false and quoted `Invalid URL`, a failure that box never prints. The
+        # shape therefore falls THROUGH to the `no-api` branch below, whose caller answers `no-api:<id>:oauth` on a grant
+        # as `models-json-provider-dropped` \u2014 the reason pi\x27s own sentence belongs to. The URL test still applies to
+        # every definition that HAS an `api` (composed from a baseline that exists, or from the definition itself) and to
+        # every non-grant provider.
+        if _grant and not _grant_default and not (_m.get("api") or _body.get("api")):
+            continue
         _eff = _m.get("baseUrl") or _raw_base
         if _eff and not _buildable(_eff):
             _bad_gw(_m)

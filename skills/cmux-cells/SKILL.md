@@ -102,8 +102,9 @@ and `https:///host` / a bare `https://` PARSE and reach the network (not refused
 those MEASURED shapes (userinfo split off first, empty host / empty or unclosed IPv6 literal / forbidden code point / bad
 `%` escape refused, tab-NL-CR removed rather than refused, C0-or-space trim, `\` ending the authority like `/`, port
 empty or all-decimal ≤65535 with leading zeros read as the value) — it is NOT a URL-parser emulation: the IPV6 INTERIOR
-is not validated, so `[zzz]`/`[:::]` pass here although node throws, and neither the IPv4-number rule nor the
-IDNA/punycode pipeline is reproduced. That gap can only ever be a false PASS, and that is measured: three independent
+is not validated, so `[zzz]`/`[:::]` pass here although node throws, neither the IPv4-number rule nor the
+IDNA/punycode pipeline is reproduced, and a NON-`http(s)` SCHEME is not inspected at all (`ftp://[zzz]/v1` throws in
+node and passes here — pre-existing, unchanged by this change). That gap can only ever be a false PASS, and that is measured: three independent
 fuzz passes against node (~72,000 generated authorities) found ZERO false blocks, with every false pass confined to
 that unemulated surface. Such a provider also has an oauth
 handler, so the store refusal below never applies to it.
