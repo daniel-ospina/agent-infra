@@ -961,6 +961,31 @@ ck "m30 …and an unloadable sibling does NOT turn a valid 2-repo set into DUPLI
    '[ "$(REPO_SET_DOCTOR="$T/unloadable-doctor.py" run_reader_rc "$CONF" check)" = 0 ]'
 ck "m31 …and it does not print DUPLICATE-SLUG for a set whose slugs are plainly distinct" \
    '! REPO_SET_DOCTOR="$T/unloadable-doctor.py" run_reader "$CONF" check 2>&1 | grep -q "DUPLICATE-SLUG"'
+# Round 26, P2: the ROUND-25 fix (normalise the DECLARED slug before comparing it to the origin proof)
+# shipped with NO arm — measured: reverting it in a /tmp copy reproduced the exact defect
+# (`REFUSED acme/alpha.git — … is a checkout of acme/alpha, not acme/alpha.git`) and the suite still
+# reported 155 passed. The rest of this file pins every round's fix, so a fix without an arm is a
+# regression channel. m32 is the behaviour, m33 is the mutation that proves m32 is load-bearing.
+mk_repo "$T/dotgit" acme/alpha
+printf 'slug=acme/alpha.git checkout=%s state=%s/dotgit-state\n' "$T/dotgit" "$T" > "$T/dotgit.conf"
+ck "m32 a \`.git\`-spelled slug over a checkout that PROVES the repo is ACCEPTED (the doctor normalizes it)" \
+   '[ "$(run_reader_rc "$T/dotgit.conf" check)" = 0 ]'
+M4="$T/mutdotgit"; mkdir -p "$M4/lib"
+python3 - "$READER" "$M4/lib/repo-set.sh" <<'PYD'
+import sys
+src, dst = sys.argv[1], sys.argv[2]
+t = open(src).read()
+old = '''      slug_n="$(_rs_normalize_slug "$slug")"
+      case "$slug_n" in ''|'__UNASKABLE__') slug_n="$slug" ;; esac'''
+assert t.count(old) == 1, "the provenance normalisation moved; the mutation cannot be expressed"
+open(dst, "w").write(t.replace(old, '      slug_n="$slug"'))
+PYD
+ck "m33 …and with that normalisation REVERTED the same fixture is refused (rc 1) — m32 discriminates" \
+   '[ "$(REPO_SET_DOCTOR="$REPO_ROOT/scripts/pr-doctor.py" REPO_SET_FILE="$T/dotgit.conf" bash "$M4/lib/repo-set.sh" check >/dev/null 2>&1; echo $?)" = 1 ]'
+# Round 26, P2: the ROUND-24 separator strip also had no arm — reverting `${problems#; }` left the
+# suite green. Asserted on the operator-facing line itself, where the defect was visible.
+ck "m34 a refusal renders 'REFUSED <slug> — <reason>' with NO doubled '—;' separator" \
+   'o="$(run_reader "$T/proof-shared-state.conf" check)"; printf "%s" "$o" | grep -q "— state=" && ! printf "%s" "$o" | grep -q "—;"'
 
 # ── (n) SOURCING the reader must not change the caller's shell options ────────────────────
 # The file advertises sourcing as its contract, and the PR plans more consumers (the controllers and the
