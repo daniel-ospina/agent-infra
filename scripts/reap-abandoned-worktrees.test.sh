@@ -10,7 +10,7 @@
 # reached the box." So the arm that deletes trees nothing can recover now has a suite of its own.
 #
 # The judgement under test is the BOUND — not the deletion predicate, whose gates the sibling suites
-# own one at a time. Four things are asserted, and each has its own mutation:
+# own one at a time. Five things are asserted, and each has its own mutation:
 #
 #   (a) DEFAULT = NO COUNT CAP. The fixture from #3278: twelve YOUNG gitless trees, then the AGED
 #       thirteenth in sort order. Under the pre-#3278 code the cap unit was charged BEFORE the age
@@ -25,6 +25,10 @@
 #   (d) THE ORDERING IS PART OF THE BOUND. A tree the age floor rejects must cost NOTHING — no count
 #       unit, no budget unit. `REAP_AW_GITLESS_MAX=1` with twelve young trees ahead of the aged one is
 #       the sharpest form: under the old order the single unit went to the first young tree.
+#   (e) AND THE TIME BOUND PRECEDES THE CENSUS FOR *BOTH* ARMS, not only the gitless one. That reorder
+#       is the one behaviour change the LINKED arm receives, and it is observable only on a pass that
+#       has already spent its budget — so it needs a LINKED fixture, which no other suite supplies
+#       (`disk-reaper.test.sh` drives this delegate through a `/nonexistent` stub).
 #
 # Plus: the cap survives as an OPT-IN override (an operator ceiling that silently stopped working
 # would be the same defect in mirror image), a non-numeric seam is REFUSED rather than read as
@@ -33,12 +37,12 @@
 # guard's THREE references — HOME, CELL_HOME, the pass state dir), the keep list, `git-below`, the
 # bare-repo refusal, the young floor, the `--dry-run` default, and `--include-gitless` being OPT-IN.
 #
-# ⛔ THE FOUR BOUND-SHAPING CASES (A, C, D, E) ARE MUTATION-CHECKED (`expect_pass` then `expect_fail`
-# against a mutated copy); B, F and G are not, because their subjects (an `--apply` removal, the
-# operator override, the unchanged safety gates) are asserted directly and a mutation of them would
-# only reproduce the same assertion. A test that passes against a script with the bound DELETED proves
-# nothing, and a mutation that cannot be applied is counted a FAILURE — a stale mutation is a case
-# that has silently stopped checking.
+# ⛔ THE FIVE BOUND-SHAPING CASES (A, C, D, E, H) ARE MUTATION-CHECKED (`expect_pass` then
+# `expect_fail` against a mutated copy); B, F and G are not, because their subjects (an `--apply`
+# removal, the operator override, the unchanged safety gates) are asserted directly and a mutation of
+# them would only reproduce the same assertion. A test that passes against a script with the bound
+# DELETED proves nothing, and a mutation that cannot be applied is counted a FAILURE — a stale mutation
+# is a case that has silently stopped checking.
 #
 # Hermetic: every fixture is under $T; HOME, CELL_HOME, the state dir and the log are redirected there;
 # the process table is a SYNTHETIC `/proc` (the library's documented `LP_PROC_ROOT` seam, driven the
@@ -381,7 +385,43 @@ case_g() { # <owner-script>
     return $((CASE_FAIL > 0))
 }
 
-# ── the suite ────────────────────────────────────────────────────────────────────────────────
+# ── H: the LINKED arm's TIME bound — checked BEFORE the census, for BOTH arms ────────────────
+# `budget_spent` sits above the census for both arms; the body calls that "the only change to the linked
+# arm's order". It is observable ONLY on a pass that has already spent its budget (`reason=budget`
+# instead of the `reason=young` / `reason=live-cwd` the old order reported), and NO other suite can see
+# it: `disk-reaper.test.sh` drives this delegate through a `/nonexistent` stub (`:2931`), and every
+# other case in this file builds GITLESS trees (review of #3278 round 4, P2).
+case_h() { # <owner-script>
+    local owner="$1"
+    UNDER_TEST="$owner"
+    newfixture h || { case_check 1 "fixture could not be built"; return 1; }
+    # `.git` is a FILE ⇒ a LINKED worktree, so the gitless arm never sees it and the linked arm owns it.
+    # It is deliberately YOUNG: that is what makes the assertion discriminate. Under the fixed order the
+    # bound fires before anything else and the tree reports `budget`; under the pre-#3278 order the
+    # census and then the LINKED arm's age floor run first, and the same tree reports `young`.
+    mkdir -p "$FB/root/a-linked"
+    printf 'gitdir: %s\n' "$FB/gitdir" >"$FB/root/a-linked/.git"
+    age_path "$FB/root/a-linked" 0
+    # ⛔ BUDGET=0, NOT A SLEEP: the deadline is the pass's own start, so the bound is already spent when
+    # the first candidate arrives. Nothing here reads the wall clock, so the case cannot flake.
+    OUT="$(HOME="$FB/home" CELL_HOME="" REAP_AW_STATE_DIR="$FB/state" REAP_AW_LOG="$FB/state/log" \
+           REAP_AW_PROC_ROOT="$FB/proc" REAP_AW_BUDGET_SECONDS=0 \
+           bash "$owner" --root "$FB/root" --apply 2>&1)"; OUT_RC=$?
+    [ -n "${AW_DEBUG:-}" ] && printf '%s\n' "$OUT" >&2
+    case_check "$([ "$OUT_RC" = 0 ] && echo 0 || echo 1)" \
+               "a spent-budget pass over a LINKED worktree exits 0 (rc=$OUT_RC)"
+    case_check "$(grep -qF "KEPT   $FB/root/a-linked reason=budget" <<<"$OUT" && echo 0 || echo 1)" \
+               "the LINKED arm stops on the TIME bound (reason=budget)"
+    case_check "$(grep -q 'reason=young' <<<"$OUT" && echo 1 || echo 0)" \
+               "and NOT on the age floor — the bound precedes the census and the floor (no reason=young)"
+    case_check "$([ -d "$FB/root/a-linked" ] && echo 0 || echo 1)" \
+               "the bound is REAL in --apply: the linked worktree is still there"
+    case_check "$(grep -q 'budget=0s' <<<"$OUT" && echo 0 || echo 1)" \
+               "the SUMMARY states the bound it ran under (budget=0s)"
+    return $((CASE_FAIL > 0))
+}
+
+# ── the suite ────────────────────────────────────────────────────────────────────────────────────────────────
 printf '\nreap-abandoned-worktrees.test.sh — the gitless BOUND (#3278)\n\n'
 
 expect_pass "A the #3278 fixture: the 13th (aged) tree is classified, not capped" case_a "$OWNER"
@@ -391,6 +431,7 @@ expect_pass "D the TIME bound stops the pass and preserves everything" case_d "$
 expect_pass "E a young tree costs no cap unit (the ordering half of the bound)" case_e "$OWNER"
 expect_pass "F the count cap survives as an operator override; a bad seam is refused" case_f "$OWNER"
 expect_pass "G the safety gates this arm carries are unchanged" case_g "$OWNER"
+expect_pass "H the LINKED arm's time bound precedes its census, not just the gitless arm's" case_h "$OWNER"
 
 # ═══ mutations — one per half of the change ══════════════════════════════════════════════════
 # MUT_CAP restores the REPLACED DEFAULT. If A and C survive it, the suite is not checking it.
@@ -423,6 +464,18 @@ if apply_mutation "$OWNER" "$T/mut-order/reap-abandoned-worktrees.sh" -e "$MUT_O
     expect_fail "MUT_ORDER the unit charged before the age floor — case E must go RED" case_e "$T/mut-order/reap-abandoned-worktrees.sh"
 else
     bad "MUT_ORDER could not be applied — the ordering is not being checked any more"
+fi
+
+# MUT_LINKED_BUDGET confines the time bound to the GITLESS arm: the linked arm is then unbounded before
+# its census again, which is the overrun this PR exists to remove. Case D must stay GREEN (the gitless
+# bound still fires) and case H must go RED — that pairing is what makes H the linked arm's test rather
+# than a second copy of D.
+MUT_LINKED_BUDGET='s|^budget_spent() {.*|budget_spent() { [ "${gitless:-0}" = 1 ] \&\& [ "$(now)" -ge "$1" ]; }|'
+if apply_mutation "$OWNER" "$T/mut-linked-budget/reap-abandoned-worktrees.sh" -e "$MUT_LINKED_BUDGET"; then
+    expect_pass "MUT_LINKED_BUDGET still green for the GITLESS arm — case D is not what H tests" case_d "$T/mut-linked-budget/reap-abandoned-worktrees.sh"
+    expect_fail "MUT_LINKED_BUDGET bound confined to gitless — case H must go RED" case_h "$T/mut-linked-budget/reap-abandoned-worktrees.sh"
+else
+    bad "MUT_LINKED_BUDGET could not be applied — the linked arm's bound is not being checked any more"
 fi
 
 printf '\n  %d passed, %d failed\n\n' "$PASS" "$FAIL"
