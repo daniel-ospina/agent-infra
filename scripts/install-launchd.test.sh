@@ -1705,6 +1705,45 @@ set -e
 assert_eq "$RC" "0" "§7c python reader: env -u NAME consumes its VALUE too (the two agree)"
 assert_contains "$OUT" "WARN TCC-root launcher: $PROBE_TCC_BIN" "§7c …and promotes the program the same way"
 
+# (c22j) THE VALUE OF A REQUIRED-VALUE OPTION MUST ALSO BE **SKIPPED**, not just dropped from the scan:
+# the emission loop re-read `/tmp` as a target, so `env -C /tmp /bin/bash <farm>` was verdict 1 — the
+# WHOLE install aborted — and a TCC-root value was SKIPped + DISARMED, while the reader that really
+# drops it installed. Same for the JOINED spelling, which the `--opt=<value>` arm split into
+# `exec /tmp`. And the GNU signal options take an OPTIONAL argument, so listing them consumed the
+# PROGRAM instead (fresh review of #3413, round 9 P1/P1/P2 — three shapes, one table).
+PROBE_FARM="$PROBE_HOME/.pi/agent/scripts/probe-ok.sh"
+set +e
+OUT="$(probe_install "$PROBE_HOME" /usr/bin/env -C /tmp /bin/bash "$PROBE_FARM" 2>&1)"; RC=$?
+set -e
+assert_eq "$RC" "0" "§7c python reader: env -C DIR consumes the DIRECTORY, which is not a target"
+assert_not_contains "$OUT" "unreadable or not a regular file: /tmp" "§7c …so the option value is not verdict-ed as an executed target"
+set +e
+OUT="$(probe_install "$PROBE_HOME" /usr/bin/env --chdir=/tmp /bin/bash "$PROBE_FARM" 2>&1)"; RC=$?
+set -e
+assert_eq "$RC" "0" "§7c python reader: the JOINED --chdir=<dir> spelling is skipped, not split into exec <dir>"
+# The signal options take an OPTIONAL argument, so the PROGRAM follows directly. The discriminator is
+# WHICH token is promoted to launcher: the binary, or (buggy) the script after it.
+set +e
+OUT="$(probe_install "$PROBE_HOME" /usr/bin/env --ignore-signal "$PROBE_TCC_BIN" "$PROBE_DEAD" 2>&1)"; RC=$?
+set -e
+assert_eq "$RC" "0" "§7c python reader: --ignore-signal takes an OPTIONAL argument, so the PROGRAM is not swallowed"
+assert_contains "$OUT" "WARN TCC-root launcher: $PROBE_TCC_BIN" "§7c …the BINARY is the promoted launcher, not the script after it"
+set +e
+OUT="$(probe_install_fallback "$PROBE_HOME" /usr/bin/env --ignore-signal "$PROBE_TCC_BIN" "$PROBE_DEAD" 2>&1)"; RC=$?
+set -e
+assert_eq "$RC" "0" "§7c fallback: --ignore-signal does not swallow the program either"
+assert_contains "$OUT" "WARN TCC-root launcher: $PROBE_TCC_BIN" "§7c …same launcher on both readers"
+assert_contains "$OUT" "installed + loaded" "§7c …and the unit installs"
+set +e
+OUT="$(probe_install "$PROBE_HOME" /usr/bin/env -S "-u PYTHONPATH $PROBE_TCC_BIN $PROBE_DEAD" 2>&1)"; RC=$?
+set -e
+assert_eq "$RC" "0" "§7c python reader: env -S honours a required-value option INSIDE the string"
+assert_contains "$OUT" "WARN TCC-root launcher: $PROBE_TCC_BIN" "§7c …so the value is not promoted to launcher inside -S"
+set +e
+OUT="$(probe_install_fallback "$PROBE_HOME" /usr/bin/env -S "-u PYTHONPATH $PROBE_TCC_BIN $PROBE_DEAD" 2>&1)"; RC=$?
+set -e
+assert_eq "$RC" "0" "§7c fallback: same for the -S form (the two readers agree)"
+
 # (c22h) THE GRANT APPLIES TO THE `unknown` ROLE TOO. `[<TCC-root BINARY>, <script in the SAME TCC
 # root>]` is what the two `com.tortoise.*` reapers render whenever the farmed entry resolves into the
 # tree: the launcher is a BINARY, which #1311 measured DOES hold the grant for that tree, so the

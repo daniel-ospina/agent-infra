@@ -559,14 +559,19 @@ if not isinstance(pargs, list) and not absolute(prog):
     sys.exit(4)                      # neither key names anything verifiable
 argv = pargs if isinstance(pargs, list) else []
 DATA_OPTIONS = {"--repo", "--root"}  # long options whose VALUE the job's work only READS
-# ⛔ env OPTIONS THAT TAKE A VALUE IN THE SPACE FORM. Skipping only the OPTION left its VALUE as the
-# first positional, so the VALUE was promoted to launcher and the real program was then classified as a
-# TARGET: `env -u PYTHONPATH <TCC venv python> <script>` — the two reapers' shape — went from verdict 0
-# to verdict 2, i.e. SKIP + `launchctl bootout` + `rm -f` of an installed, grant-holding unit (review of
-# #3413, round 8 P2). The JOINED spellings (`--unset=NAME`) carry their value in the token and are
-# already skipped by the `"=" in a` arm below.
-ENV_VALUE_OPTIONS = {"-u", "--unset", "-C", "--chdir", "-P", "--block-signal",
-                     "--default-signal", "--ignore-signal"}
+# ⛔ env OPTIONS THAT TAKE A **REQUIRED** VALUE IN THE SPACE FORM. Skipping only the OPTION left its
+# VALUE as the first positional, so the VALUE was promoted to launcher and the real program was then
+# classified as a TARGET: `env -u PYTHONPATH <TCC venv python> <script>` — the two reapers' shape —
+# went from verdict 0 to verdict 2, i.e. SKIP + `launchctl bootout` + `rm -f` of an installed,
+# grant-holding unit (review of #3413, round 8 P2).
+# The JOINED spellings (`--unset=NAME`) carry their value in the token and are already skipped by the
+# `"=" in a` arm below.
+# ⛔ AND ONLY THE **REQUIRED** ONES: coreutils declares `--block-signal[=SIG]`,
+# `--default-signal[=SIG]` and `--ignore-signal[=SIG]` with an OPTIONAL argument, so the space form
+# passes the PROGRAM through (`env --ignore-signal /bin/echo HELLO` echoes HELLO — measured). Listing
+# them here consumed the program and turned a working unit into a SKIP + disarm in BOTH readers, which
+# no differential test can see (review of #3413, round 9 P2).
+ENV_VALUE_OPTIONS = {"-u", "--unset", "-C", "--chdir", "-P"}
 launchers = []                       # what launchd actually execs
 skipped = set()                      # argv indices already reported as a launcher
 if absolute(prog):
@@ -613,6 +618,7 @@ if launchers and launchers[-1].rsplit("/", 1)[-1] == "env":
                 #   `-S '<non-executable program>'`      → installed, though launchd cannot exec it
                 toks = env_split(cmd)
                 seen_prog = False
+                seen_val_opt = False
                 for j, tok in enumerate(toks):
                     if not isinstance(tok, str) or not tok:
                         continue
@@ -620,6 +626,17 @@ if launchers and launchers[-1].rsplit("/", 1)[-1] == "env":
                         # env's FIRST POSITIONAL token is the program it execs, so it is a LAUNCHER —
                         # exactly what the space form promotes at argv[1]. An option or a NAME=VALUE
                         # is not the program and does not end the search.
+                        # ⛔ AND A REQUIRED-VALUE OPTION CONSUMES THE NEXT TOKEN FIRST, the same rule
+                        # the space form applies: without it `-S '-u PYTHONPATH <TCC python> <script>'`
+                        # promoted the VALUE to launcher, verdicted the real program as a TARGET, and
+                        # SKIPped + DISARMED a grant-holding unit that the awk reader installed
+                        # (review of #3413, round 9 P1).
+                        if tok in ENV_VALUE_OPTIONS:
+                            seen_val_opt = True
+                            continue
+                        if seen_val_opt:
+                            seen_val_opt = False
+                            continue
                         if tok.startswith("-") or ("=" in tok and not tok.startswith("/")):
                             continue
                         seen_prog = True
@@ -637,9 +654,25 @@ if launchers and launchers[-1].rsplit("/", 1)[-1] == "env":
                     print("%s\t%s" % ("data" if prev in DATA_OPTIONS else "exec", tok))
                 break
             if a in ENV_VALUE_OPTIONS:
-                i += 2 if i + 1 < len(argv) else 1
+                # ⛔ THE VALUE IS CONSUMED **AND SKIPPED**. Dropping it from the scan alone left the
+                # emission loop below to re-read it as a target: `env -C /tmp /bin/bash <farm>` filed
+                # `/tmp` as EXEC → verdict 1 → the WHOLE install aborted (`sync.sh` dies under `set -e`),
+                # and a TCC-root value was SKIPped + DISARMED — while the awk reader, which does drop
+                # it, installed. A reader disagreement introduced by the round-8 fix (review of #3413,
+                # round 9 P1).
+                if i + 1 < len(argv):
+                    skipped.add(i + 1)
+                    i += 2
+                else:
+                    i += 1
                 continue
             if a.startswith("-") or ("=" in a and not a.startswith("/")):
+                # ⛔ THE **JOINED** SPELLING OF A REQUIRED-VALUE OPTION CARRIES ITS VALUE IN THE TOKEN,
+                # so it must be SKIPPED as well as dropped from the scan: the emission loop's
+                # `--opt=<value>` arm split `--chdir=/tmp` into `exec /tmp` and FAILED the whole
+                # install (review of #3413, round 9 P1).
+                if a.startswith("--") and "=" in a and a.split("=", 1)[0] in ENV_VALUE_OPTIONS:
+                    skipped.add(i)
                 i += 1
                 continue
             # the FIRST positional token is env's program, absolute or not. A RELATIVE one (bash,
@@ -792,10 +825,13 @@ plist_program_args() {
             # the same table the python reader carries (ENV_VALUE_OPTIONS): an option whose VALUE is
             # the next element, or the value is mistaken for env program and the real program becomes a
             # TARGET (review of #3413, round 8 P2).
+            # ONLY the REQUIRED-value options (the python table is the same set): coreutils declares
+            # `--block-signal[=SIG]` / `--default-signal[=SIG]` / `--ignore-signal[=SIG]` with an
+            # OPTIONAL argument, so the space form passes the PROGRAM through and listing them here
+            # consumed it — turning a working unit into a SKIP + disarm in both readers (review of
+            # #3413, round 9 P2).
             VALUE_OPTS["-u"] = 1; VALUE_OPTS["--unset"] = 1; VALUE_OPTS["-C"] = 1
             VALUE_OPTS["--chdir"] = 1; VALUE_OPTS["-P"] = 1
-            VALUE_OPTS["--block-signal"] = 1; VALUE_OPTS["--default-signal"] = 1
-            VALUE_OPTS["--ignore-signal"] = 1
             if (prog ~ /(^|\/)env$/) envmode = 1
             # The launcher is emitted BEFORE the argument walk, as the python reader does: the exec
             # arm consults the grant this record establishes, so an order flip changes its verdict.
