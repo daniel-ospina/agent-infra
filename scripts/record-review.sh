@@ -1282,7 +1282,7 @@ delta_git() { # <root> <git args…>
 delta_verify() { # <id: A..B[+artifact]> <head_sha> -> 0 = verified (sets DELTA_*)
   local id="$1" head="$2" range from to cover="" root="" tmp="" norm=""
   local authored="" newest="" n_authored=0 anchor="" dg_rc=0 base_sha="" base_ref=""
-  local merges_in_range="" evil="" evil_shas="" m="" parents="" pcount="" p1="" p2="" prest="" want="" actual="" cands="" mrc="" body_claim="" stated_from="" stated_to="" stated_sep="" _delta_tok="" E_OUT="" E_RC="" _scan="" _any="" _all_ok="" _sf="" _ss="" _st="" _ok="" _sfs="" _r="" _claim="" _toks="" _tok="" _tsha=""
+  local merges_in_range="" evil="" evil_shas="" m="" parents="" pcount="" p1="" p2="" prest="" want="" actual="" cands="" mrc="" body_claim="" stated_from="" stated_to="" stated_sep="" _delta_tok="" E_OUT="" E_RC="" _scan="" _any="" _all_ok="" _sf="" _ss="" _st="" _ok="" _sfs="" _r="" _claim="" _toks="" _tok_rc=0 _tok="" _tsha=""
   range="${id%%+*}"
   [ "$range" != "$id" ] && cover="${id#*+}"
   from="${range%%..*}"; to="${range##*..}"
@@ -1323,11 +1323,20 @@ delta_verify() { # <id: A..B[+artifact]> <head_sha> -> 0 = verified (sets DELTA_
   # ⛔ `check_surface_scan` IS CALLED DIRECTLY, and that is the point: (#3440) DELETED
   # the `target_head_red` wrapper this arm used to call — its last caller was this very
   # arm — so that no second polarity with a divergent meaning is left behind. The mapping
-  # below is clause E's, taken verbatim from the carry arm: a REFUSED read (rc != 0)
-  # refuses, a `red` surface refuses, and a read-but-unanswered surface (`in_flight` /
-  # `empty` / `green`) proceeds. `empty` is NOT green — the record write below still
-  # classifies it `unknown` — but it is an ANSWER, and refusing on it here would be a
+  # below is clause E's, and it is STRICTLY NARROWER than the carry arm's: a REFUSED read
+  # (rc != 0) refuses, a `red` surface refuses, and a read-but-unanswered surface
+  # (`in_flight` / `empty` / `green`) proceeds. `empty` is NOT green — the record write below
+  # still classifies it `unknown` — but it is an ANSWER, and refusing on it here would be a
   # polarity the arm this mirrors does not share.
+  # ⛔ THE NARROWING IS DELIBERATE AND IS STATED, NOT IMPLIED (found in review: this comment
+  # used to say "taken verbatim from the carry arm", which was FALSE in the direction that
+  # matters). The carry arm's test is `rc != 0 || first-line == red`, so an rc-0 answer it does
+  # not NAME — a word `check_surface_scan` does not print today — falls through as "not red"
+  # there, while the enum below REFUSES it. Today the two agree because that helper's whole
+  # rc-0 vocabulary is `green`/`in_flight`/`empty`/`red`; the delta arm is the one written so a
+  # future sixth word fails CLOSED. The carry arm's own shape is left exactly as it is: it is a
+  # signed-clean path whose behaviour this change does not touch, and "fixing" it here would
+  # smuggle a second change into a delta-evidence PR. DECLARED RESIDUAL, not a silent one.
   # ⛔ AN UNNAMED ANSWER STILL MUST NOT FALL THROUGH. The old `case` on the helper's rc
   # was the only thing enforcing that, so the enum is written out explicitly rather than
   # implied by a helper nobody reading this arm can see; anything not named refuses.
@@ -1803,7 +1812,14 @@ $m"
     # `delta:` form the parser accepts — the two layers would diverge and the guard would go
     # blind again. Using the SAME regex token prefix in both is what makes divergence
     # impossible rather than merely unlikely.
-    if [[ "$EVIDENCE_BODY" =~ [Dd][Ee][Ll][Tt][Aa][[:space:]]*: ]]; then _delta_tok=1; fi
+    # ⛔ THE SCANNED FORM IS `$_claim`, THE SAME ONE BOTH SCANS BELOW READ — NOT `$EVIDENCE_BODY`
+    # (found in review). The #3442 kill table is MANDATORY in every fresh clean artifact and its
+    # rows quote `delta:` as a matter of course (they exist to name the arm being re-pointed), so
+    # reading the RAW body made a table ROW arm this token while `_any` — which reads the excluded
+    # claim — stayed 0. The resulting branch accuses the artifact of a range "this code cannot
+    # parse" that it never stated, and points at a bare-head fallback that no longer exists. A row
+    # is not a claim, which is why every other reader in this block strips the table first.
+    if [[ "$_claim" =~ [Dd][Ee][Ll][Tt][Aa][[:space:]]*: ]]; then _delta_tok=1; fi
     # ⛔ ARM ON THE RANGE SHAPE, AND CHECK EVERY OCCURRENCE (4th review cycle — two findings,
     # both reproduced against this file).
     # (a) Keying the guard on the WORD `delta` left every other honest spelling of "I read
@@ -1956,7 +1972,18 @@ $m"
     # above. The rule is therefore conservative in the FAIL-CLOSED direction, the refusal names
     # the offending commit so the fix is one re-reading of the claim, and a false `clean` over
     # commits nobody read is not the alternative on offer.
-    _toks="$(printf '%s\n' "$_claim" | command grep -oE '[0-9a-fA-F]{7,40}' | command tr 'A-F' 'a-f' | command sort -u || true)"
+    # ⛔ THE EXIT STATUS IS KEPT, NOT SWALLOWED WITH `|| true` (found in review). `grep` exits 1
+    # for "no match", which is a legitimate answer here — but a REAL failure of any pipeline member
+    # (rc >= 2: a broken `sort`, a missing `tr`) produced the SAME empty `_toks`, so the loop below
+    # simply did not execute and the arm silently did nothing. That is the vacuous-guard shape M21
+    # exists to catch, reached through the guard itself: "the claim names no commits" and "nothing
+    # scanned the claim" must not be one value. rc 1 stays a pass; rc >= 2 refuses.
+    _toks=""; _tok_rc=0
+    _toks="$(printf '%s\n' "$_claim" | command grep -oE '[0-9a-fA-F]{7,40}' | command tr 'A-F' 'a-f' | command sort -u)" || _tok_rc=$?
+    if [ "$_tok_rc" -gt 1 ]; then
+      echo "   delta: the commit-token scan FAILED (rc $_tok_rc) — a scan that did not run is not evidence that the claim names no commits, so the range is not verified. Retry rather than record." >&2
+      return 1
+    fi
     for _tok in $_toks; do
       _tsha="$(delta_git "$root" rev-parse --verify "${_tok}^{commit}" 2>/dev/null || true)"
       [ -n "$_tsha" ] || continue

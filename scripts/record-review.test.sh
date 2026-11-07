@@ -8086,6 +8086,121 @@ I also reviewed up to ${DG_SIB} on the side branch, which is where the real work
 assert_eq "$RECORD_RC" "3" "20h47 a commit on a PARALLEL lineage is refused (rc 3)"
 assert_contains "$RECORD_ERR" "PARALLEL lineage" "20h47 and the refusal says the lineage it cannot tell apart"
 assert_not_contains "$RECORD_ERR" "notation this code does not parse" "20h47 and does NOT assert a narrowing the artifact never wrote (thirteenth cycle)"
+
+# ── 20i — THE DELTA PATH'S REPLACE/GRAFT POSTURE (review of this change, P1) ─────────
+# `delta_git` is the ONE line that disables `refs/replace/*` and the grafts FILE for every object
+# read the delta arms make (`rev-list`, `merge-tree`, `rev-parse`, `git diff`). It had NO vector
+# anywhere: `GIT_NO_REPLACE_OBJECTS` appeared ZERO times in this suite, and
+# `tests/record-review/run.sh` (12)/(13) mutate the CARRY walk's `local -x` export — a DIFFERENT
+# site — so the pin could be deleted and every vector here stayed green.
+#
+# WHAT A MISSING PIN BUYS, and why 20h2's fixture cannot show it: the attack needs a merge whose
+# tree was HAND-EDITED while its parents still merge CLEANLY. Then `merge-tree` answers rc 0 with
+# the AUTOMATIC tree, so a replacement object carrying that tree makes the hand-edited merge
+# compare EQUAL to the automatic one — the classifier calls it a clean merge, the range becomes
+# merge-only, the cover requirement degrades to "a comment naming A", and `clean` is minted over
+# lines nobody reviewed. 20h2's parents CONFLICT, so its `merge-tree` exits 1 and the rc check
+# alone refuses; the forgery is unreachable there.
+git checkout -q -b hidlane "$DG_A1" >/dev/null 2>&1
+printf 'lane h1\n' > h1.txt; git add -A
+GIT_COMMITTER_DATE='2025-08-01T00:00:00Z' GIT_AUTHOR_DATE='2025-08-01T00:00:00Z' git commit -qm 'lane: h1'
+DG_HI_L="$(git rev-parse HEAD)"
+printf '%s\n' '2025-08-01T00:00:00Z' > "$T/dates/$DG_HI_L"
+git checkout -q -b hidbase "$DG_A1" >/dev/null 2>&1
+printf 'base h2\n' > h2.txt; git add -A
+GIT_COMMITTER_DATE='2025-08-01T00:00:00Z' GIT_AUTHOR_DATE='2025-08-01T00:00:00Z' git commit -qm 'base: h2'
+DG_HI_B="$(git rev-parse HEAD)"
+printf '%s\n' '2025-08-01T00:00:00Z' > "$T/dates/$DG_HI_B"
+git checkout -q hidlane >/dev/null 2>&1
+git -c core.editor=true merge --no-ff --no-commit "$DG_HI_B" >/dev/null 2>&1 || true
+# the hand edit lives ONLY in the merge commit — the state a reviewer never saw
+printf 'HAND EDIT nobody reviewed\n' >> h1.txt
+git add -A
+GIT_COMMITTER_DATE='2025-09-01T00:00:00Z' GIT_AUTHOR_DATE='2025-09-01T00:00:00Z' \
+    git commit -qm 'merge base (tree hand-edited after a CLEAN merge)'
+DG_HI_H="$(git rev-parse HEAD)"
+printf '%s\n' '2025-09-01T00:00:00Z' > "$T/dates/$DG_HI_H"
+# BOTH premises are ASSERTED, or the vector silently stops testing the arm it was written for.
+if [ "$(git rev-list --merges "$DG_HI_L..$DG_HI_H" --not "$DG_HI_B" 2>/dev/null | wc -l | tr -d ' ')" = "1" ]; then
+    ok "20i1 fixture: the range's only new commit is the merge"
+else
+    bad "20i1 fixture: the range does not hold exactly one merge — the vector would not test the classifier"
+fi
+DG_HI_PAR="$(git rev-list --parents -n1 "$DG_HI_H" 2>/dev/null)"
+read -r _hi_self DG_HI_P1 DG_HI_P2 _hi_rest <<< "$DG_HI_PAR"
+_hi_mtrc=0
+DG_HI_MT="$(git merge-tree --write-tree "$DG_HI_P1" "$DG_HI_P2" 2>/dev/null)" || _hi_mtrc=$?
+DG_HI_MT="${DG_HI_MT%%$'\n'*}"
+if [ "$_hi_mtrc" = "0" ]; then
+    ok "20i1 fixture: the merge is CLEAN (merge-tree rc 0) — the shape a replace ref can forge"
+else
+    bad "20i1 fixture: merge-tree exits $_hi_mtrc, so the rc check would refuse on its own and this vector would certify nothing"
+fi
+if [ -n "$DG_HI_MT" ] && [ "$DG_HI_MT" != "$(git rev-parse "$DG_HI_H^{tree}")" ]; then
+    ok "20i1 fixture: the merge tree is NOT the automatic one (the hand edit is real)"
+else
+    bad "20i1 fixture: the merge tree equals the automatic one — nothing was hand-edited"
+fi
+# A cover dated BETWEEN the lane work (2025-08-01) and the hand-edited merge (2025-09-01): it
+# postdates A, so a recorder that believed a forgery (merge-only ⇒ anchor = A) would ACCEPT it.
+EHI1=425150; rm -f "$(Q2 $EHI1)"
+run_record_delta $EHI1 "$DG_HI_H" "delta:$DG_HI_L..$DG_HI_H+comment:42515001" \
+    STUB_BASE_SHA="$DG_HI_B" STUB_EVIDENCE_AT="2025-08-15T00:00:00Z"
+assert_eq "$RECORD_RC" "3" "20i1 a hand-edited merge that postdates the cover is refused (rc 3)"
+# ⛔ THE ANCHOR IS THE ATTRIBUTION HERE, not the wording of the no-cover sentence: with a cover
+#    named, the refusal is verify_review_evidence's date refusal, and what identifies WHICH commit
+#    the classifier anchored on is the sha it prints. A recorder that believed a forged
+#    (merge-only) range would anchor on A and ACCEPT; this one anchors on the hand-edited merge.
+assert_contains "$RECORD_ERR" "postdates ${DG_HI_H:0:12}" \
+    "20i1 the anchor is the hand-edited MERGE — the classifier read the REAL tree, not the forged one"
+[ ! -f "$(Q2 $EHI1)" ] && ok "20i1 no record written over the hand edit" || bad "20i1 a clean was minted over the hand edit"
+# ⛔ THE FORGERY, PLANTED. The replacement carries the AUTOMATIC tree and the SAME parents, so
+# plain git now answers `<merge>^{tree}` with the tree `merge-tree` produces — the tree-equality
+# test alone cannot catch it, which is exactly why the export exists.
+DG_HI_FAKE="$(git commit-tree "$DG_HI_MT" -p "$DG_HI_P1" -p "$DG_HI_P2" -m 'forged: the automatic merge tree')"
+git replace "$DG_HI_H" "$DG_HI_FAKE" >/dev/null 2>&1
+if [ "$(git rev-parse "$DG_HI_H^{tree}")" = "$DG_HI_MT" ]; then
+    ok "20i1 control: the replace ref is LIVE — the merge now REPORTS the automatic tree"
+else
+    bad "20i1 control: the replace ref did not take, so the fixture is vacuous"
+fi
+if [ "$(GIT_NO_REPLACE_OBJECTS=1 git rev-parse "$DG_HI_H^{tree}")" != "$DG_HI_MT" ]; then
+    ok "20i1 control: under GIT_NO_REPLACE_OBJECTS the REAL tree is still visible"
+else
+    bad "20i1 control: the export is not what makes the difference"
+fi
+EHI2=425151; rm -f "$(Q2 $EHI2)"
+run_record_delta $EHI2 "$DG_HI_H" "delta:$DG_HI_L..$DG_HI_H+comment:42515101" \
+    STUB_BASE_SHA="$DG_HI_B" STUB_EVIDENCE_AT="2025-08-15T00:00:00Z"
+assert_eq "$RECORD_RC" "3" "20i1 WITH the replace ref planted the SAME range is still REFUSED (rc 3)"
+assert_contains "$RECORD_ERR" "postdates ${DG_HI_H:0:12}" \
+    "20i1 …and the anchor is STILL the real merge — the pin made the replacement invisible to every arm"
+git replace -d "$DG_HI_H" >/dev/null 2>&1
+# 20i2 THE GRAFTS FILE is a DIFFERENT mechanism, and `GIT_NO_REPLACE_OBJECTS` does NOT cover it
+#      (`tests/record-review/run.sh` (13) records that lesson for the carry walk). Here the graft
+#      rewrites the merge's PARENTAGE, so plain git stops seeing a merge at all and walks the
+#      commit as ordinary authored content — a classification change a graft-honouring recorder
+#      would report as the COUNT form ("contains authored content (1 commit(s))").
+printf '%s %s\n' "$DG_HI_H" "$DG_HI_L" > "$DG/.git/info/grafts"
+if [ "$(git rev-list --parents -n1 "$DG_HI_H" 2>/dev/null | wc -w | tr -d ' ')" = "2" ]; then
+    ok "20i2 control: the grafts file is LIVE — plain git now sees ONE parent (no merge)"
+else
+    bad "20i2 control: the grafts file did not take, so the fixture is vacuous"
+fi
+# ⛔ COVER-LESS ON PURPOSE. With a cover both classifications refuse on the same DATE sentence,
+#    so the exit code and the message would be identical and the vector would certify nothing.
+#    Without one, the two classifications print DIFFERENT sentences: a recorder that sees the
+#    MERGE says "holds authored content in a MERGE" (n_authored = 0); one that honoured the graft
+#    sees an ordinary authored commit and says "contains authored content (1 commit(s))".
+EHI3=425152; rm -f "$(Q2 $EHI3)"
+run_record_delta $EHI3 "$DG_HI_H" "delta:$DG_HI_L..$DG_HI_H" STUB_BASE_SHA="$DG_HI_B"
+assert_eq "$RECORD_RC" "3" "20i2 a grafted-away merge is still refused (rc 3)"
+assert_contains "$RECORD_ERR" "holds authored content in a MERGE" \
+    "20i2 the refusal is STILL the evil-merge arm — GIT_GRAFT_FILE made the graft invisible"
+assert_not_contains "$RECORD_ERR" "contains authored content (1 commit(s))" \
+    "20i2 …and NOT the count form a graft-honouring recorder would produce"
+rm -f "$DG/.git/info/grafts"
+
 # ── 20g — MUTATION MATRIX: break each guard, name the vector that goes RED ──
 # ⛔ errexit is OFF for this block on purpose. A mutation harness that ABORTS the
 # whole suite when an anchor text moves is a footgun: an unrelated edit renames
@@ -8108,6 +8223,12 @@ assert old in text, "mutation anchor not found: %r" % old[:60]
 open(dst, "w").write(text.replace(old, new, 1))
 PY
     [ -s "$d/record-review.sh" ] || return 1
+    # ⛔ A MUTANT THAT DOES NOT PARSE MUST NOT SCORE OK (found in review). `mut_check … refused`
+    # accepts ANY non-zero exit, and bash exits 2 on a syntax error — so a mutation whose
+    # replacement broke the file's syntax would have reported "the guard is load-bearing" from a
+    # script that never ran a single arm. A parse check is the cheapest way to close that for
+    # EVERY cell at once rather than relying on each one's message attribution.
+    bash -n "$d/record-review.sh" 2>/dev/null || return 1
     printf '%s' "$d/record-review.sh"
 }
 mut_run() { # <mutant-script> <pr> <sha> <ref> [VAR=VAL…] → $RECORD_RC
@@ -8361,7 +8482,10 @@ mut_check "M20 the stated range is REQUIRED, no alphabet-dependent fallback" 425
 #       claim scanned for resolvable commits and the narrowing one caught by MEANING, disabling
 #       the population re-opens exactly the decoy bypass — the parsed range passes, the narrowed
 #       sentence beside it is never examined, and the record is minted over the wider range.
-MUT="$(mk_mutant novalley '    _toks="$(printf '\''%s\n'\'' "$_claim" | command grep -oE '\''[0-9a-fA-F]{7,40}'\'' | command tr '\''A-F'\'' '\''a-f'\'' | command sort -u || true)"' '    _toks=""')"
+# ⛔ TWO ANCHORS, NOT ONE: the scan line and the rc check that now guards it. Replacing only the
+#       scan leaves `_tok_rc` 0 and the mutant would still refuse on the token rule's real answer —
+#       the mutation has to restore the pre-fix "empty means nothing to check" shape.
+MUT="$(mk_mutant novalley '    _toks="$(printf '\''%s\n'\'' "$_claim" | command grep -oE '\''[0-9a-fA-F]{7,40}'\'' | command tr '\''A-F'\'' '\''a-f'\'' | command sort -u)" || _tok_rc=$?' '    _toks=""; _tok_rc=0')"
 mut_check "M21 every resolvable commit in the claim is checked" 425204 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42520501" accepted STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
 Reviewed only ${DG_A1}–${DG_HEAD}; no issues found."
 # M22 — THE TIP-RELATIVE ARM (20h33). Disabling it re-accepts `HEAD~1..HEAD` beside the decoy,
@@ -8503,6 +8627,36 @@ mut_check "M25 the merge-only arm reads the CLAIM, not the raw body" 425216 "$DG
 | assertion | mutant (reverts the fix) | reddened row | observed |
 |---|---|---|---|
 | x | the row that reddens delta:${DG_A1}..${DG_HEAD} | z | rc 3 |"
+# M34 — THE DELTA PATH'S REPLACE PIN (20i1). `delta_git`'s export is a SEPARATE site from the
+#       carry walk's `local -x` export that `tests/record-review/run.sh` (12)/(13) mutate, so
+#       until this cell NOTHING pinned it: the line could be deleted and every delta vector stayed
+#       green. With `GIT_NO_REPLACE_OBJECTS` dropped, the planted replacement is read, the
+#       hand-edited merge compares EQUAL to the automatic one, the range classifies merge-only,
+#       and the vector the shipped recorder REFUSES (20i1) is ACCEPTED.
+git replace "$DG_HI_H" "$DG_HI_FAKE" >/dev/null 2>&1
+MUT="$(mk_mutant nodelreplace '  GIT_NO_REPLACE_OBJECTS=1 GIT_GRAFT_FILE=/dev/null command git -C "$root" "$@"' '  GIT_GRAFT_FILE=/dev/null command git -C "$root" "$@"')"
+mut_check "M34 the delta path's REPLACE pin" 425150 "$DG_HI_H" "delta:$DG_HI_L..$DG_HI_H+comment:42515001" accepted STUB_BASE_SHA="$DG_HI_B" STUB_EVIDENCE_AT="2025-08-15T00:00:00Z"
+git replace -d "$DG_HI_H" >/dev/null 2>&1
+# M35 — THE DELTA PATH'S GRAFTS-FILE PIN, measured by ATTRIBUTION because BOTH scripts refuse.
+#       Dropping only `GIT_GRAFT_FILE` leaves the graft readable: the merge stops being a merge,
+#       the commit becomes ordinary AUTHORED content, and the refusal moves from the evil-merge
+#       sentence to the authored COUNT form (20i2). That move IS the proof the export is
+#       load-bearing; `mut_check … refused` could not see it.
+printf '%s %s\n' "$DG_HI_H" "$DG_HI_L" > "$DG/.git/info/grafts"
+MM=$((MM+1))
+MUT="$(mk_mutant nograftfile '  GIT_NO_REPLACE_OBJECTS=1 GIT_GRAFT_FILE=/dev/null command git -C "$root" "$@"' '  GIT_NO_REPLACE_OBJECTS=1 command git -C "$root" "$@"')"
+if [ -s "${MUT:-}" ]; then
+    rm -f "$(Q2 425150)"
+    mut_run "$MUT" 425152 "$DG_HI_H" "delta:$DG_HI_L..$DG_HI_H" STUB_BASE_SHA="$DG_HI_B"
+    if [ "$RECORD_RC" != "0" ] && command grep -q "contains authored content" "$T/merr" 2>/dev/null; then
+        MM_OK=$((MM_OK+1)); ok "20g M35 the delta path's GRAFTS-FILE pin: with only the replace export the graft is READ, the refusal becomes the authored COUNT form, so GIT_GRAFT_FILE IS load-bearing and is covered here"
+    else
+        bad "20g M35 the grafts-file pin is vacuously green — the mutant's refusal is not the graft-honouring classification (rc=$RECORD_RC)"
+    fi
+else
+    bad "20g M35 the mutant could not be built (mutation anchor missing from the recorder) — this vector was NOT measured"
+fi
+rm -f "$DG/.git/info/grafts"
 # M8 (the tier arm) is RETIRED WITH ITS ARM: the unsigned local-record premise was a
 # forgery vector (review minted a signed `clean` from one `printf`), so there is no
 # tier left to launder into `clean`. 20h6 keeps its refusal, now reached through the
