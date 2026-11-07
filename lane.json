@@ -1,0 +1,21 @@
+{
+  "artifacts": [],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 2400,
+  "exit_code": null,
+  "heartbeat_at": 1794079518,
+  "host": "Daniels-MacBook-Air-new",
+  "issue": null,
+  "kind": "prfix",
+  "lane_id": "Daniels-MacBook-Air-new.kprfix-stallfix-20261107T192443Z-1794079518-p29155-e23efd1f",
+  "lease_until": 1794081918,
+  "pid": 29155,
+  "reason": null,
+  "repo": "daniel-ospina/agent-infra",
+  "schema": 1,
+  "started_at": 1794079518,
+  "state": "RUNNING",
+  "tag": "stallfix-20261107T192443Z",
+  "worktree": "/Users/danielospina/orchestrator/state/wt-stallfix"
+}
