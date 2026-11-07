@@ -433,7 +433,8 @@ if grep -q 'STATE=empty' <<<"$_e14" \
    && ! grep -q 'could not be READ' <<<"$_e14" \
    && ! grep -qF 'is NOT A REGULAR FILE' <<<"$_e14" \
    && ! grep -qiE 'ended FULL|NEWEST members' <<<"$_e14" \
-   && ! grep -q 'carried no tier name this code recognises' <<<"$_e14"; then rc=0
+   && ! grep -q 'carried no tier name this code recognises' <<<"$_e14" \
+   && ! grep -q 'no tier this code recognises' <<<"$_e14"; then rc=0
 else rc=1; echo "      drained+clip '$(printf '%s' "$_e14" | tr '\n' '|' | head -c 340)' (want STATE=empty and NO tier-window clause of any kind: a drained queue has no row that a clipped window could have pushed behind a lower tier, and no order for a record to qualify)"; fi
 ck "the DRAINED arm carries NO tier-window clause even with a clip record present (nothing can be inverted in an empty queue)" $rc
 # ⛔ NON-VACUITY: append `$_sat_said` to the drained echo and the check above must redden — and ASK FOR THE ECHO
@@ -484,47 +485,204 @@ if grep -q 'STATE=priority-unreadable' <<<"$_pr14" \
    && ! grep -q 'could not be USED' <<<"$_pr14" \
    && ! grep -q 'could not be READ' <<<"$_pr14" \
    && ! grep -qF 'is NOT A REGULAR FILE' <<<"$_pr14" \
-   && ! grep -q 'carried no tier name this code recognises' <<<"$_pr14"; then rc=0
+   && ! grep -q 'carried no tier name this code recognises' <<<"$_pr14" \
+   && ! grep -q 'no tier this code recognises' <<<"$_pr14"; then rc=0
 else rc=1; echo "      refuse-with-clip-record '$(printf '%s' "$_pr14" | tr '\n' '|' | head -c 340)' (want the refusal's own sentence and NO tier-window clause: the read happens after the install, so this arm measured nothing about the record)"; fi
 ck "the PRIORITY-UNREADABLE arm carries NO tier-window clause even with a clip record present (it returns before the read)" $rc
 
-# ⛔ THE ORDER PROPERTY, which is what covers the `mv`-failure arm too (a sandbox cannot cheaply make `mv` fail
-# without failing an earlier guard): every line in the driven function that mentions a tier-window spelling must
-# come AFTER the `.pool-sat` read block. Read from the SHIPPED source, not a comment.
-_ord_bad="$(awk '
-  { line = $0; sub(/^[ \t]+/, "", line) }
-  /^  _sat=""; _sat_junk=0/ { read_at = NR }
-  line ~ /^#/ { next }
-  /windows=TRUNCATED|tier window was clipped|NEWEST members|NOT A REGULAR FILE|could not be READ/ {
-    if (read_at == 0) print NR ": " substr($0, 1, 90)
-  }' "$FNS" 2>/dev/null)"
-if [ -z "$_ord_bad" ] && grep -q '^  _sat=""; _sat_junk=0' "$FNS" 2>/dev/null; then rc=0
-else rc=1; echo "      a tier-window spelling appears BEFORE the .pool-sat read block, so an arm that returns earlier CAN carry a claim this pass never measured: ${_ord_bad:-<read block itself missing>}"; fi
-ck "no tier-window spelling appears in the function BEFORE the .pool-sat read (the refusal arms cannot carry a claim they never measured)" $rc
-# ⛔ NON-VACUITY: append the clause to the `priority-unreadable` echo — BEFORE the read — and both halves must red.
-_mut_pr="$TMP/fns-refuse-mut.sh"
-_pr_gate='echo "[refresh] priority-unreadable: the queue order could NOT be re-derived'
-_pr_cause=""
-if ! grep -qF "$_pr_gate" "$FNS" 2>/dev/null; then
-  _pr_cause="the priority-unreadable echo is not in the shipped function as spelled — its sentence changed, so this half grades nothing"
+# ⛔ AND THE TWO `queue_order_refuse` ARMS, WHICH **ARE** REACHABLE (review P2, cycle 69). Cycle 68 argued they
+# could not be driven cheaply; that was wrong — an `mv` shim and the `cmp` shim §11 already uses both land on
+# them with no earlier guard firing. Each is driven WITH a recognised clip record present, and each must print
+# its own refusal sentence and NO record clause of any kind (these arms return before the `.pool-sat` read).
+_mv="$TMP/arm-refuse-mv"; rm -rf "$_mv"; mkdir -p "$_mv/o" "$_mv/bin"
+printf '300\n9\n' > "$_mv/o/candidates.txt"; printf '9\n300\n' > "$_mv/o/.pool"; printf 'P1-severe\n' > "$_mv/o/.pool-sat"
+printf '#!/usr/bin/env bash\nexit 1\n' > "$_mv/bin/mv"; chmod +x "$_mv/bin/mv"
+{ drive_prologue; cat "$FNS"; printf 'queue_order_from_pool "$1"\n_rc=$?\nprintf "STATE=%%s\\n" "$QUEUE_ORDER_STATE"\nexit $_rc\n'; } > "$_mv/drive.sh"
+( cd "$_mv" && HOME="$_mv" PATH="$_mv/bin:$PATH" bash drive.sh "$_mv/o" ) > "$_mv/out" 2>&1
+_mv14="$(cat "$_mv/out" 2>/dev/null)"
+if grep -q 'could not be moved into' <<<"$_mv14" \
+   && ! grep -q 'windows=TRUNCATED' <<<"$_mv14" \
+   && ! grep -q 'tier window was clipped' <<<"$_mv14" \
+   && ! grep -qiE 'ended FULL|NEWEST members' <<<"$_mv14" \
+   && ! grep -q 'could not be USED' <<<"$_mv14" \
+   && ! grep -q 'could not be READ' <<<"$_mv14" \
+   && ! grep -qF 'is NOT A REGULAR FILE' <<<"$_mv14" \
+   && ! grep -q 'no tier this code recognises' <<<"$_mv14"; then rc=0
+else rc=1; echo "      mv-refusal '$(printf '%s' "$_mv14" | tr '\n' '|' | head -c 340)' (want the mv refusal's own sentence and NO record clause: it returns before the read)"; fi
+ck "the MV-FAILURE refusal carries NO tier-window clause even with a clip record present" $rc
+
+_rs="$TMP/arm-refuse-rowset"; rm -rf "$_rs"; mkdir -p "$_rs/o" "$_rs/bin"
+printf '111\n222\n' > "$_rs/seed"; printf '200\n300\n' > "$_rs/o/.pool"; printf 'P1-severe\n' > "$_rs/o/.pool-sat"
+: > "$_rs/o/candidates.txt"
+cat > "$_rs/bin/cmp" <<'SHIM'
+#!/usr/bin/env bash
+cp "$PRUNE_SEED" "$PRUNE_QUEUE" 2>/dev/null || true
+exec /usr/bin/cmp "$@"
+SHIM
+chmod +x "$_rs/bin/cmp"
+{ drive_prologue; cat "$FNS"; printf 'queue_order_from_pool "$1"\n_rc=$?\nprintf "STATE=%%s\\n" "$QUEUE_ORDER_STATE"\nexit $_rc\n'; } > "$_rs/drive.sh"
+( cd "$_rs" && HOME="$_rs" PATH="$_rs/bin:$PATH" PRUNE_SEED="$_rs/seed" PRUNE_QUEUE="$_rs/o/candidates.txt" bash drive.sh "$_rs/o" ) > "$_rs/out" 2>&1
+_rs14="$(cat "$_rs/out" 2>/dev/null)"
+if grep -q 'the queue changed between this pass' <<<"$_rs14" \
+   && ! grep -q 'windows=TRUNCATED' <<<"$_rs14" \
+   && ! grep -q 'tier window was clipped' <<<"$_rs14" \
+   && ! grep -qiE 'ended FULL|NEWEST members' <<<"$_rs14" \
+   && ! grep -q 'could not be USED' <<<"$_rs14" \
+   && ! grep -q 'could not be READ' <<<"$_rs14" \
+   && ! grep -qF 'is NOT A REGULAR FILE' <<<"$_rs14" \
+   && ! grep -q 'no tier this code recognises' <<<"$_rs14"; then rc=0
+else rc=1; echo "      rowset-refusal '$(printf '%s' "$_rs14" | tr '\n' '|' | head -c 340)' (want the row-set refusal's own sentence and NO record clause)"; fi
+ck "the ROW-SET refusal carries NO tier-window clause even with a clip record present" $rc
+
+# ⛔ WHERE THE RECORD MAY BE SPOKEN ABOUT — TWO STRUCTURAL RULES, NO WORDING LIST (review cycles 68-70).
+# Six consecutive cycles found the same defect in the same construction: a forbidden-WORDING list. Cycle 69's list
+# was still a list — of four record NAMES (`pool-sat|tier-window|tier window|window record`) — and a reviewer put
+# three claims straight through it: ` — a tier was clipped` (names no artefact), a claim composed into a SECOND
+# variable and expanded on the line, and one printed by `cat <<<`; a fourth rode a continuation line. Wordings
+# cannot be enumerated; POSITIONS and REGIONS can. So the property is not about words at all:
+#   (1) THE OPERATOR POPULATION IS PINNED. Every line these two functions can print is a fixed sentence, and each
+#       is pinned below by CRC. ANY prose added to ANY of them — whatever words, wherever on the line, before or
+#       after the channel — changes a CRC and reds. This is the half a wording list cannot outrun. It is a
+#       TRIPWIRE over text, not a semantic gate: a deliberate message change means re-pinning `_pop_pin` below
+#       from the CRCs this check prints, and the diff then shows the re-pin next to the message change.
+#   (2) THE RECORD'S NAMES LIVE IN ONE REGION. Every line that mentions the record (`.pool-sat`, the tier window)
+#       must sit inside the read/compose block — from the `.pool-sat` read guard through the last `_sat_said=`
+#       line — or be a `_why_none=` assignment, and none may precede the read. A claim routed through a second
+#       variable, a continuation line, or a verb that is not an echo violates (2) with no verb list involved.
+# Both detectors are FAIL-CLOSED through `_awk_gate`: a detector that cannot run reports DETECTOR-FAILED and reds,
+# never silence (review P2: an awk that rejects its program used to yield empty output, which read as clean).
+_awk_gate() { # $1=awk program, rest=files (the region detector reads its file TWICE) -> stdout = findings; rc 2 = the DETECTOR failed (never a clean read)
+  _ag_e="$TMP/_awkgate.$$.err"
+  _ag_p="$1"; shift
+  _ag_o="$(awk "$_ag_p" "$@" 2>"$_ag_e")"; _ag_rc=$?
+  if [ "$_ag_rc" -ne 0 ] || [ -s "$_ag_e" ]; then
+    _ag_msg="$(head -1 "$_ag_e" 2>/dev/null)"; rm -f "$_ag_e"
+    printf 'DETECTOR-FAILED rc=%s %s\n' "$_ag_rc" "$_ag_msg"
+    return 2
+  fi
+  rm -f "$_ag_e"
+  printf '%s' "$_ag_o"
+  return 0
+}
+_pop_prog='{ line = $0; sub(/^[ \t]+/, "", line); if (line ~ /^(echo|printf|queue_order_refuse)[ (]/) print line }'
+_region_prog='
+FNR == NR {
+  if (!_r1s && /\[ -e "\$o\/\.pool-sat" \]/) _r1s = FNR
+  if (!_read_at && /^  _sat=""; _sat_junk=0/) _read_at = FNR
+  if (/_sat_said="/) _r1e = FNR
+  next
+}
+{ line = $0; sub(/^[ \t]+/, "", line) }
+line ~ /^#/ { next }
+line ~ /_why_none="/ {
+  if (!_read_at || FNR < _r1s) print "why-none-before-read " FNR ": " substr(line, 1, 60)
+  next
+}
+line ~ /pool-sat|tier-window|tier window|window record/ {
+  if (_r1s && _r1e && FNR >= _r1s && FNR <= _r1e) next
+  print "outside-region " FNR ": " substr(line, 1, 70)
+}'
+_pop_pin='794523629 1217193846 3449875175 1246035678 1484820831 3614574003 2367692148 2406618603 2471640373 3256525803 3493478597 2071418210 383261823 2177402208 2841344729 3656594574 1369661817 3280589147 2030608365 2580804388'
+_pop_lines="$(_awk_gate "$_pop_prog" "$FNS")"; _pop_rc=$?
+_pop_bad="$(_awk_gate "$_region_prog" "$FNS" "$FNS")"; _reg_rc=$?
+if [ "$_pop_rc" -ne 0 ]; then
+  rc=1; echo "      the operator-population detector could not run: $_pop_lines"
+elif [ "$_reg_rc" -ne 0 ]; then
+  rc=1; echo "      the record-region detector could not run: $_pop_bad"
+elif [ -z "$_pop_lines" ]; then
+  rc=1; echo "      the operator population came back EMPTY — nothing to pin, so this check grades nothing"
 else
-  awk -v g="$_pr_gate" '{ print; if (index($0, g)) print "    echo \" — windows=TRUNCATED(P1-severe): a tier window ended FULL with a next page still advertised\"" }' "$FNS" > "$_mut_pr"
-  cmp -s "$FNS" "$_mut_pr" 2>/dev/null && _pr_cause="the refusal-arm mutation did not apply (the sentence IS present, so the mutation is what drifted)"
+  _pop_n="$(printf '%s\n' "$_pop_lines" | wc -l | tr -d ' ')"
+  _pop_pin_n="$(printf '%s\n' $_pop_pin | wc -l | tr -d ' ')"
+  _pop_got="$(printf '%s\n' "$_pop_lines" | while IFS= read -r _pl; do printf '%s\n' "$(printf '%s' "$_pl" | cksum | cut -d' ' -f1)"; done | tr '\n' ' ' | sed 's/ $//')"
+  if [ "$_pop_n" != "$_pop_pin_n" ]; then
+    rc=1; echo "      the OPERATOR POPULATION changed size ($_pop_pin_n pinned, $_pop_n found) — a line was added to or removed from what these functions print; if that is deliberate, re-pin _pop_pin"
+  elif [ "$_pop_got" != "$_pop_pin" ]; then
+    rc=1; _pi=0
+    for _pv in $_pop_pin; do
+      _pi=$((_pi + 1))
+      [ "$(printf '%s' "$_pop_got" | cut -d' ' -f"$_pi")" = "$_pv" ] && continue
+      echo "      operator line #$_pi CHANGED (pinned CRC $_pv, now $(printf '%s' "$_pop_got" | cut -d' ' -f"$_pi")): $(printf '%s\n' "$_pop_lines" | sed -n "${_pi}p" | head -c 150)"
+      break
+    done
+  elif [ -n "$_pop_bad" ]; then
+    rc=1; echo "      the record is spoken about OUTSIDE the read/compose region (or before the read): $(printf '%s' "$_pop_bad" | tr '\n' '|' | head -c 400)"
+  else rc=0; fi
 fi
-if [ -n "$_pr_cause" ]; then
-  rc=1; echo "      $_pr_cause"
-else
-  _ord_bad_m="$(awk '
-    { line = $0; sub(/^[ \t]+/, "", line) }
-    /^  _sat=""; _sat_junk=0/ { read_at = NR }
-    line ~ /^#/ { next }
-    /windows=TRUNCATED|tier window was clipped|NEWEST members|NOT A REGULAR FILE|could not be READ/ {
-      if (read_at == 0) print NR ": " substr($0, 1, 90)
-    }' "$_mut_pr" 2>/dev/null)"
-  if [ -n "$_ord_bad_m" ]; then rc=0
-  else rc=1; echo "      with the clause appended to the refusal arm the ORDER property did not see it — the check above grades nothing"; fi
-fi
-ck "non-vacuity: appending the tier-window clause to a REFUSAL arm reddens the order property" $rc
+ck "the record's NAMES are confined to the read/compose block and the _why_none assignments, and the OPERATOR POPULATION is pinned line-for-line (no wording list involved)" $rc
+
+# ⛔ NON-VACUITY, one mutant per mechanism — a CRUCIAL word: each mutates a COPY of the shipped function text and
+# requires the rule it targets to red. The first two mutate PROSE NO WORDING LIST CONTAINS, which is the point.
+_mk_pop_mut() { # $1=name $2=sed program -> path on stdout
+  _mp_out="$TMP/fns-$1.sh"
+  sed "$2" "$FNS" > "$_mp_out" 2>/dev/null
+  printf '%s' "$_mp_out"
+}
+_popred() { # $1=file -> 0 when the population rule REDS on that file
+  _pr_rc=0
+  _pr_lines="$(_awk_gate "$_pop_prog" "$1")" || return 1
+  _pr_n="$(printf '%s\n' "$_pr_lines" | wc -l | tr -d ' ')"
+  _pr_got="$(printf '%s\n' "$_pr_lines" | while IFS= read -r _pl; do printf '%s\n' "$(printf '%s' "$_pl" | cksum | cut -d' ' -f1)"; done | tr '\n' ' ' | sed 's/ $//')"
+  [ "$_pr_n" = "$_pop_pin_n" ] && [ "$_pr_got" = "$_pop_pin" ] && return 1
+  return 0
+}
+_regred() { # $1=file -> 0 when the region rule REDS on that file
+  _rr_out="$(_awk_gate "$_region_prog" "$1" "$1")" || return 1
+  [ -n "$_rr_out" ]
+}
+# (a) prose appended INSIDE an installed arm, with NO record name and NO known claim wording
+_m1="$(_mk_pop_mut inline-noname 's/(this is NOT a drained queue)\$_sat_said"/(this is NOT a drained queue) — a tier was clipped$_sat_said"/')"
+if ! cmp -s "$FNS" "$_m1" 2>/dev/null && _popred "$_m1"; then rc=0
+else rc=1; echo "      an appended claim that names NEITHER the record NOR any known wording did not red the population pin (mutation applied: $(cmp -s "$FNS" "$_m1" 2>/dev/null && echo NO || echo yes))"; fi
+ck "non-vacuity: ' — a tier was clipped' appended to an installed arm reds the POPULATION pin (no wording list)" $rc
+
+# (b) prose appended to a REFUSAL arm — the arm that returns before the read (the historical family)
+_m2="$(_mk_pop_mut refuse-inline 's/not as arrival order either"/not as arrival order either — a tier was clipped"/')"
+if ! cmp -s "$FNS" "$_m2" 2>/dev/null && _popred "$_m2"; then rc=0
+else rc=1; echo "      the clause appended to the priority-unreadable arm did not red the population pin"; fi
+ck "non-vacuity: the same claim on a REFUSAL arm (which returns before the read) reds the POPULATION pin" $rc
+
+# (c) a NEW operator line carrying a claim — the population pin is a line-for-line pin, so an added line reds
+_m3="$TMP/fns-newline.sh"
+awk '{ print; if (index($0, "does not add up to the queue")) print "      echo \"[refresh] queue order: a tier was clipped but the order still stands\"" }' "$FNS" > "$_m3"
+if ! cmp -s "$FNS" "$_m3" 2>/dev/null && _popred "$_m3"; then rc=0
+else rc=1; echo "      a NEW operator line carrying a claim did not red the population pin"; fi
+ck "non-vacuity: a NEW operator line carrying a claim reds the POPULATION pin (the pin is line-for-line)" $rc
+
+# (d) a claim composed into a SECOND variable: no operator line is touched, only an added assignment — the region
+# rule sees it, and a verb/expansion allowlist over echo lines cannot
+_m4="$TMP/fns-secondvar.sh"
+awk '{ print; if (index($0, "_sat=\"\"; _sat_junk=0")) print "  _sat_extra_said=\" — the .pool-sat record was stale\"" }' "$FNS" > "$_m4"
+if ! cmp -s "$FNS" "$_m4" 2>/dev/null && _regred "$_m4"; then rc=0
+else rc=1; echo "      a record claim composed into a SECOND variable did not red the region rule"; fi
+ck "non-vacuity: a record claim in a SECOND variable reds the REGION rule (no verb list involved)" $rc
+
+# (e) a claim on an echo CONTINUATION line — the line the claim sits on does not begin with a verb
+_m5="$TMP/fns-contline.sh"
+awk '{ print; if (index($0, "does not add up to the queue")) print "      \" — the tier-window record was stale\"" }' "$FNS" > "$_m5"
+if ! cmp -s "$FNS" "$_m5" 2>/dev/null && _regred "$_m5"; then rc=0
+else rc=1; echo "      a claim on an echo CONTINUATION line did not red the region rule"; fi
+ck "non-vacuity: a claim on a CONTINUATION line reds the REGION rule" $rc
+
+# (f) a claim printed by a verb that is not an echo
+_m6="$TMP/fns-otherverb.sh"
+awk '{ print; if (index($0, "does not add up to the queue")) print "      cat <<< \"[refresh] queue order: the tier-window record was stale\"" }' "$FNS" > "$_m6"
+if ! cmp -s "$FNS" "$_m6" 2>/dev/null && _regred "$_m6"; then rc=0
+else rc=1; echo "      a claim printed by cat did not red the region rule"; fi
+ck "non-vacuity: a claim printed by a NON-ECHO verb reds the REGION rule" $rc
+
+# (g) a mention BEFORE the read — the refusal arms' property
+_m7="$TMP/fns-preread.sh"
+awk '{ if (index($0, "priority-unreadable: the queue order could NOT")) print "    echo \"[refresh] the tier-window record may be stale\""; print }' "$FNS" > "$_m7"
+if ! cmp -s "$FNS" "$_m7" 2>/dev/null && _regred "$_m7"; then rc=0
+else rc=1; echo "      a record mention placed BEFORE the read block did not red the region rule"; fi
+ck "non-vacuity: a record mention BEFORE the read reds the REGION rule" $rc
+
+# (h) the detectors are FAIL-CLOSED: an awk that rejects its own program must report, not return silence
+_out="$(_awk_gate 'BEGIN { if (' "$FNS")"; _orc=$?
+if [ "$_orc" -eq 2 ] && printf '%s' "$_out" | grep -q 'DETECTOR-FAILED'; then rc=0
+else rc=1; echo "      a detector that could not run returned rc=$_orc and '$(printf '%s' "$_out" | head -c 80)' — silence would read as clean"; fi
+ck "fail-closed: a detector that CANNOT RUN reds instead of returning the silence a clean run returns" $rc
 
 # ── 6) A FAILED REORDER LEAVES THE QUEUE INTACT AND SAYS SO ──────────────────
 # No `.pool` at all: the rank cannot be derived. The queue must stay byte-identical and the state must be
@@ -2435,7 +2593,8 @@ if grep -q 'STATE=unranked' <<<"$_u14" \
    && ! grep -q 'tier window was clipped' <<<"$_u14" \
    && ! grep -qiE 'ended FULL|NEWEST members' <<<"$_u14" \
    && ! grep -q 'windows=TRUNCATED' <<<"$_u14" \
-   && ! grep -q 'carries no tier name this code recognises' <<<"$_u14"; then rc=0
+   && ! grep -q 'carries no tier name this code recognises' <<<"$_u14" \
+   && ! grep -q 'no tier this code recognises' <<<"$_u14"; then rc=0
 else rc=1; echo "      unranked-absent '$(printf '%s' "$_u14" | tr '\n' '|' | head -c 340)' (want STATE=unranked and the plain 'row matched' clause, and NO clip/unusable/foreign-record wording over a record that does not exist)"; fi
 ck "(14d) an ABSENT window record makes the UNRANKED arm claim NO clip and NO unreadable record — the plain clause, nothing else" $rc
 # ⛔ NON-VACUITY: make `_why_none`'s absent branch claim a clip and the check above must redden.
