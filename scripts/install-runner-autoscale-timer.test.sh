@@ -408,10 +408,12 @@ assert_contains "$OUT" "127" "the refusal names the measured consequence (127 ev
 # to schedule. The shapes are adopted verbatim from `scripts/install-repair-service.sh` (#2697).
 WT="/tmp/wt-runnerautoscale.$$"; mkdir -p "$WT"
 printf '#!/bin/sh\n' >"$WT/inst.sh"; chmod +x "$WT/inst.sh"
+# A real fixture target, so the judgement under test is the PROVISIONER's and not "no scheduler available".
+D="$T/cwt1"; fresh "$D"; rm -f "$ARM"
 ENVV=(RUNNER_AUTOSCALE_PROVISIONER="$WT/inst.sh" SUDO=false)
-OUT="$(run_install Linux - --install)"; RC=$?; ENVV=()
+OUT="$(run_install Linux "$D" --install)"; RC=$?; ENVV=()
 assert_eq "$RC" 1 "a provisioner pinned under /tmp/wt-<issue>-<slug> is REFUSED (rc 1)"
-assert_contains "$OUT" "REFUSING a scheduled install rendered from transient scratch space" \
+assert_contains "$OUT" "REFUSING: the provisioner pin this install would render is inside TRANSIENT SCRATCH SPACE" \
     "…naming the class it would create, with the pin it judged"
 assert_contains "$OUT" "PROVISIONER=$WT/inst.sh" "…and the value it judged"
 # ⛔ AND THE *OTHER* LANE CHECKOUT SHAPE THE REPO ALREADY NAMES, because a predicate that covers one
@@ -419,18 +421,45 @@ assert_contains "$OUT" "PROVISIONER=$WT/inst.sh" "…and the value it judged"
 # matches ONLY the `*/.worktrees/*` alternative and not `/tmp/wt-*`.
 WT2="$T/.worktrees/lane"; mkdir -p "$WT2"
 printf '#!/bin/sh\n' >"$WT2/inst.sh"; chmod +x "$WT2/inst.sh"
+D="$T/cwt2"; fresh "$D"
 ENVV=(RUNNER_AUTOSCALE_PROVISIONER="$WT2/inst.sh" SUDO=false)
-OUT="$(run_install Linux - --install)"; RC=$?; ENVV=()
+OUT="$(run_install Linux "$D" --install)"; RC=$?; ENVV=()
 assert_eq "$RC" 1 "a provisioner pinned under */.worktrees/<lane> is REFUSED (rc 1)"
 assert_contains "$OUT" "PROVISIONER=$WT2/inst.sh" "…and that refusal names the value it judged"
+# ⛔ AND `--disarm` IS STILL EXEMPT FROM THAT JUDGEMENT (#3469 review, MEASURED). `--disarm` forces a
+# DISARMED render where the pin is inert, so refusing it protects nothing: it strands the arming record on
+# a box nobody can disarm without hand-editing. Judging the provisioner inside `refuse_unusable_target`
+# (which `--disarm` also runs) did exactly that — rc 1, record KEPT — where origin/main exited 0 and
+# removed it. The judgement now lives only in `refuse_adopted_provisioner`, which carries this exemption.
+D="$T/cwt3"; fresh "$D"; rm -f "$ARM"
+OUT="$(run_install Linux "$D" --arm --reason 'disarm exemption')"
+assert_eq "$?" 0 "precondition: the box arms with a durable pin"
+assert_file "$ARM" "precondition: the arming record exists"
+ENVV=(RUNNER_AUTOSCALE_PROVISIONER="$WT2/inst.sh" SUDO=false)
+OUT="$(run_install Linux "$D" --disarm)"; RC=$?; ENVV=()
+assert_eq "$RC" 0 "--disarm is NOT refused by a lane-scratch provisioner (the safe direction)"
+assert_nofile "$ARM" "…and the arming record was actually removed, not stranded"
+assert_absent "$OUT" "STILL ARMED" "…and the verb did not report the record stuck"
+# ⛔ AND A STRUCTURAL PIN ON THE SAME DECISION, BECAUSE THE BEHAVIOURAL ARM ABOVE CANNOT REACH THE BUG ON
+# EVERY BOX. The regression the reviewer measured lives in `refuse_unusable_target`, and a `SYSTEMD_UNIT_DIR`
+# override (which this suite always sets, to stay hermetic) makes that function SKIP its scratch heuristic
+# — so on a fixture box `--disarm` exits 0 whether or not the arm is there. The decision is therefore
+# pinned where it is written: the verb-level gate must not judge the provisioner at all, because it also
+# runs on `--disarm`. Without this assertion the fix above could be reverted and the suite stay green.
+if sed -n '/^refuse_unusable_target()/,/^}/p' "$INST" | grep -q 'is_lane_scratch'; then
+    bad "refuse_unusable_target judges the PROVISIONER — it runs on --disarm, so that strands the arming record"
+else
+    ok "refuse_unusable_target does not judge the PROVISIONER (only refuse_adopted_provisioner does, with the exemption)"
+fi
 # ⛔ AND THE OTHER HALF OF THE SCOPING: THE CONVERGER ITSELF IS *NOT* REFUSED FROM A WORKTREE. This is
 # the decision the wider predicate must not swallow (`resolve_script`: a branch's copy is a legitimate
 # thing to schedule — say it out loud, do not refuse it). Without this arm, widening the predicate to
 # the SCRIPT value would look correct to every other assertion in this file.
 WT3="$T/.worktrees/lane3"; mkdir -p "$WT3"
 cp "$T/home/converger.py" "$WT3/converger.py"
+D="$T/cwt4"; fresh "$D"
 ENVV=(RUNNER_AUTOSCALE_SCRIPT="$WT3/converger.py" SUDO=false)
-OUT="$(run_install Linux - --install)"; RC=$?; ENVV=()
+OUT="$(run_install Linux "$D" --install)"; RC=$?; ENVV=()
 assert_eq "$RC" 0 "a CONVERGER pinned in a worktree still installs (the recorded decision)"
 assert_contains "$OUT" "is inside a WORKTREE" "…and the worktree is SAID OUT LOUD, as decided"
 
