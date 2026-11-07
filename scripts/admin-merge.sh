@@ -864,6 +864,64 @@
 #                                         named interpreter that cannot run the
 #                                         selector is REPORTED rather than
 #                                         silently ignored.
+#
+# ── THE WHOLE-ATTEMPT DEADLINE (the rail's ACTUATION bound, #3223/#3287/#3294) ──
+#   ADMIN_MERGE_RAIL_DEADLINE            the whole-attempt bound in seconds. Omit it
+#                                         and the value is DERIVED as the SUM of the
+#                                         phase bounds this guard supervises:
+#                                         FIRST_CHECKS_CEILING + RERUN_BUDGET +
+#                                         2 × SELF_EDIT_WAIT + MERGE_REF_WAIT +
+#                                         ADMIN_MERGE_REPRO_TIMEOUT
+#                                         (18064 + 1800 + 600 + 90 + 900 = 21454s
+#                                         = 5h57m34s at the defaults). A bound
+#                                         ABOVE that sum can never fire, so it is
+#                                         CLAMPED to it and the clamp is disclosed
+#                                         on stderr; a bound BELOW it is honoured
+#                                         (that is how a short bound is driven on
+#                                         purpose). Refused BY NAME (rc=2) for a
+#                                         non-numeric value, a leading zero, zero,
+#                                         or an all-digit value past the shell
+#                                         range — an erroring comparison SKIPS the
+#                                         guard rather than failing it. Exceeding
+#                                         it REFUSES with
+#                                         `REFUSED(rail-deadline:<elapsed>s/<bound>s, <pr>)`
+#                                         and exit 1: a failed actuation, never a
+#                                         stall verdict and never a merge.
+#                                         `--print-bounds` reports the bound IN
+#                                         FORCE plus `rail-deadline-source`, whose
+#                                         printed addends sum to the printed total.
+#   ADMIN_MERGE_RAIL_STARTED_AT          TEST SEAM ONLY. An epoch stamp that starts
+#                                         the attempt clock in the PAST, so a
+#                                         deadline can be exercised in seconds
+#                                         instead of hours. Clamped to now in the
+#                                         young direction (the attempt can only be
+#                                         made OLDER) and the seam's use is
+#                                         disclosed on stderr; an unreadable clock
+#                                         REFUSES (`REFUSED(rail-deadline:clock-unreadable)`,
+#                                         exit 1) rather than proceeding with an
+#                                         unenforceable bound. Never set it in a
+#                                         real invocation: it ages a healthy head.
+#   ADMIN_MERGE_TERMINAL_CHECK_EVERY     seconds between the guard's terminal-state
+#                                         re-reads of the PR (default 60; a
+#                                         positive integer — 0 would issue a PR
+#                                         read on EVERY poll and burn the API
+#                                         budget). Orthogonal to the deadline: it
+#                                         stops a rail early when the PR itself
+#                                         reached MERGED/CLOSED.
+#   ADMIN_MERGE_LOCK_TTL                 lease TTL in seconds; must EXCEED the
+#                                         whole-attempt bound (default = the bound
+#                                         in force + 3600), or a rail still
+#                                         running inside its own deadline can have
+#                                         its lease stolen. 0 is refused: it is a
+#                                         lease that can block a PR forever behind
+#                                         a recycled pid, not "never expire".
+#   ADMIN_MERGE_PER_PR_LEASE             `1` enables the per-PR lease. OFF (0) by
+#                                         default and NOT certified: the reclaim
+#                                         path still admits two holders in a
+#                                         measured fraction of trials, and a
+#                                         double-held lease is a double merge.
+#                                         The deadline and the terminal-state exit
+#                                         do not depend on it and are always on.
 
 set -uo pipefail
 
@@ -1130,30 +1188,43 @@ FIRST_CHECKS_POLL_MAX="${ADMIN_MERGE_FIRST_CHECKS_POLL_MAX:-300}"
 # legal attempt 900s short of the ceiling at the defaults and 7,200s short at the
 # documented `ADMIN_MERGE_REPRO_TIMEOUT=7200`.) That is above the worst-case HEALTHY
 # landing this rail knows about (one slow run, one flake re-run), and below
-# #3287's 33664s by 41%, where it actually terminates something. Raising the
+# #3287's 33664s by 36.3% (12210s lower — the SHIPPED bound against #3287's), where it
+# actually terminates something. ⛔ RECOMPUTE THIS WHENEVER A TERM CHANGES: 41% was the
+# figure for the four-term 20554s, 38.9% for the five-term sum BEFORE the reproduction
+# bound was added, and neither describes the number this file ships. A percentage that
+# does not follow its own sum is the defect this whole block exists to remove. Raising the
 # number is NOT the fix (`:855`): an override above the reachable ceiling is
 # CLAMPED to it and the clamp is DISCLOSED, so the reported bound is never a
 # number the rail did not use.
 #
 # ⛔ FALSE-POSITIVE RISK, DECLARED (this is an ELAPSED bound, not a stall claim).
-# A genuinely healthy attempt needing TWO consecutive near-ceiling first-checks
-# waits would be refused here at 21454s instead of at 2 x 18064s. No such
-# landing is represented in any measurement this rail holds (the observed
-# population at this scale is STUCK, not healthy), and the outcome is exit 1 —
-# a parked head that the next invocation re-runs — never a false green, and never
-# a merge that would otherwise have happened. It is operator-overridable. This is
+# The ceiling is the exact SUM of the phase maxima, so it carries ZERO headroom for
+# everything else the SAME attempt spends from the SAME clock: `run_failure_set` on every
+# poll, the green-population and baseline reads, `derive_rerun_timeout`, the head reads.
+# A landing that spends every supervised phase at its maximum AND those unpriced reads is
+# refused here — at 21454s, a few hundred seconds short of what it actually needed — with
+# its own phase bounds unspent. That is the shape reachable in practice; the shape this
+# block used to describe (two consecutive near-ceiling first-checks waits) is NOT
+# (`wait_for_first_checks` has one call site per attempt, latched by
+# `pr_first_checks_waited`, and the clock is per-process). ⛔ AND THE ESCAPE HATCH IS
+# ONE-WAY: an override above the ceiling is clamped away and the refusal tells the operator
+# a raise cannot help, so a genuinely long-but-healthy attempt exits 1 and the next
+# invocation repeats it. That is accepted, not hidden: the observed population at this
+# scale is STUCK, not healthy, the outcome is exit 1 — a parked head the next invocation
+# re-runs — never a false green and never a merge that would otherwise have happened, and
+# the operator CAN raise a phase bound (which raises the ceiling with it). This is
 # deliberately NOT a progress-liveness bound: the rail ALREADY rejected
 # job/step-transition progress as a stall signal for exactly this wait
-# (`:6256-6261`: `updatedAt` is frozen for a whole long step), so a
-# progress-resetting clock here would fire on a legitimate silent step — the
-# false stall §39 pins out.
+# (`wait_for_run`: `updatedAt` advances only on job/step transitions, so it is frozen for a
+# whole long step), so a progress-resetting clock here would fire on a legitimate silent
+# step — the false stall §39 pins out.
 # ⛔ THE VALUES ARE COMPUTED AT CALL TIME, NOT HERE. Most of the phase bounds this deadline
 # must cover (`SELF_EDIT_WAIT`, `MERGE_REF_WAIT`, `ADMIN_MERGE_REPRO_TIMEOUT`) are declared LATER in
 # this file, so a load-time sum would either crash under `set -u` or silently omit
 # them (see `rail_deadline_default` below). They are also left UNSET until
 # `rail_attempt_start` validates them: an UNVALIDATED non-integer makes `[ -ge ]`
 # ERROR, and under `set -u` without `-e` that SKIPS the guard — a fail-open
-# (`validate_timing_knobs`'s own rule, `:1880-1885`). So the knob is refused BY
+# (`validate_timing_knobs`'s own rule). So the knob is refused BY
 # NAME at start, exactly like every other timing knob, and never merely defaulted.
 RAIL_DEADLINE=""
 RAIL_DEADLINE_CEILING=0
@@ -3462,11 +3533,20 @@ rail_attempt_start() {
     case "$_real_now" in
       ''|*[!0-9]*)
         say_err "admin-merge: ✗ BLOCK — REFUSED(rail-deadline:clock-unreadable, ${PR:-?})"
-        say_err "   The attempt clock could not be read (`date +%s` failed), so the whole-attempt deadline"
+        say_err '   The attempt clock could not be read (`date +%s` failed), so the whole-attempt deadline'
         say_err "   cannot be evaluated. Refusing rather than proceeding with an unenforceable bound."
         exit 1 ;;
     esac
     if [ "$ADMIN_MERGE_RAIL_STARTED_AT" -lt "$_real_now" ]; then
+      # ⛔ THE OLDER DIRECTION IS DISCLOSED TOO (review of the rebase, P2). Only the clamp
+      # announced itself, so an AMBIENT `ADMIN_MERGE_RAIL_STARTED_AT` (a stale export, a
+      # container env, a lane that leaks it — this file has already been burned by exactly
+      # that shape with `GH_REPO`, #2235) aged every attempt and made every rail refuse with
+      # `REFUSED(rail-deadline:1789998000s/21454s)`: a healthy fleet reading "healthy looks
+      # broken", with an elapsed that looks like nonsense and no line saying where the clock
+      # came from. Fail-closed, so not a P1 — but the operator must be able to see the SEAM
+      # in the refusal's own context, not infer it from a number.
+      say_err "admin-merge: note — the attempt clock was taken from ADMIN_MERGE_RAIL_STARTED_AT=${ADMIN_MERGE_RAIL_STARTED_AT} (the TEST SEAM), so this attempt starts $(( _real_now - ADMIN_MERGE_RAIL_STARTED_AT ))s OLD. It can only make the attempt OLDER, never younger; unset it to start the clock now."
       RAIL_STARTED_AT="$ADMIN_MERGE_RAIL_STARTED_AT"
     else
       # DISCLOSED, so the clamp is on the record and an arm can DISCRIMINATE it
@@ -3599,7 +3679,7 @@ rail_guard_poll() {
   case "$now" in
     ''|*[!0-9]*)
       say_err "admin-merge: ✗ BLOCK — REFUSED(rail-deadline:clock-unreadable, ${PR:-?})"
-      say_err "   The attempt clock could not be read (`date +%s` failed), so the whole-attempt deadline"
+      say_err '   The attempt clock could not be read (`date +%s` failed), so the whole-attempt deadline'
       say_err "   cannot be evaluated. Refusing rather than proceeding with an unenforceable bound."
       exit 1 ;;
   esac

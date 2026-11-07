@@ -16733,6 +16733,130 @@ grep -q '^rail-deadline=33664' "$SCEN/out" \
   && fail "(rd7) it printed the RAW knob — the #3287 value the clamp exists to reject" \
   || pass "(rd7) it does NOT print the raw unreachable value"
 
+# ⛔ (rd8) THE IN-LOOP CALL SITE — THE PROPERTY THE FEATURE EXISTS FOR, AND THE ONE
+# NOTHING ELSE HERE MEASURES (cycle 5 finding 2). Every other arm drives an attempt that is
+# ALREADY aged when the rail starts, so the MAIN-PATH guard decides it and all N in-loop
+# `rail_guard_poll` calls could be DELETED with the suite still green — the "a rail cannot
+# cross four waits and still live" claim would be unverified where it matters.
+# So the clock is made to STEP: `date +%s` returns base + n × step (n = how many times it has
+# been read), which lets the attempt be YOUNG at the main path and OLD by the third poll of a
+# real wait loop. The refusal's own elapsed is then the discriminator — the main path saw
+# `step`, so any `elapsed ≥ bound` can only have been produced by a LATER call site.
+SKEW_BIN="$TMP/skew-bin"; mkdir -p "$SKEW_BIN"
+printf '%s\n' '#!/bin/sh' \
+  '# `date +%s` STEPS by SKEW_CLOCK_STEP on every read; everything else delegates to the REAL' \
+  '# date (`date -r`, `date -d` are used by the mtime paths and must keep working).' \
+  'case "${1:-}" in' \
+  '  +%s) _n=$(cat "$SKEW_COUNTER" 2>/dev/null || echo 0); _n=$((_n + 1)); printf "%s\\n" "$_n" > "$SKEW_COUNTER"' \
+  '       printf "%s\\n" "$(( $(cat "$SKEW_CLOCK_BASE") + _n * $(cat "$SKEW_CLOCK_STEP") ))" ;;' \
+  '  *)   exec /bin/date "$@" ;;' \
+  'esac' > "$SKEW_BIN/date"
+chmod +x "$SKEW_BIN/date"
+
+# (rd8a) NON-VACUITY: the SAME fixture under the REAL clock must NOT refuse. Without this,
+# a scenario that refuses for an unrelated reason would satisfy (rd8b) and the arm would
+# measure nothing about the deadline.
+new_scen dl-inloop-plain
+HEAD_DL="d1d1000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_DL" > "$SCEN/head"
+lane_fail "$HEAD_DL" 9671 > "$SCEN/runs-$HEAD_DL"
+log_failed 'tests/test_deadline.py::test_long' > "$SCEN/log-9671"
+lane_fail maindl 9672 > "$SCEN/runs-main"
+log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-9672"
+target_shard 9671 "test (b)"
+green_shard 9673 "test (b)" 30
+: > "$SCEN/status-9671"
+_i=0; while [ "$_i" -lt 60 ]; do printf 'in_progress\n' >> "$SCEN/status-9671"; _i=$((_i + 1)); done
+SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" CI_FAILURE_SET_GH="$FAKE" ADMIN_MERGE_POLL_INTERVAL=0 \
+  PATH="$NOSLEEP_BIN:$PATH" ADMIN_MERGE_RAIL_DEADLINE=1799 ADMIN_MERGE_RERUN_FLOOR=1 \
+  bash "$ADM" 42 --main-runs 1 >"$TMP/out" 2>"$TMP/err" || true
+grep -q 'REFUSED(rail-deadline:' "$TMP/err" \
+  && fail "(rd8a) the real clock refused a young attempt under a 1799s bound — the arm would pass for the wrong reason" \
+  || pass "(rd8a) …with the real clock and the same 1799s bound the attempt is NOT refused (the arms below rest on the CLOCK, not the fixture)"
+
+# (rd8b) THE IN-LOOP SITE. bound 25, step 5: the main path sees elapsed=5 and passes; each
+# later poll adds 5, so the attempt crosses 25 a few polls INTO the loop. ⛔ 25, not 100: the
+# re-run wait's DERIVED stall bound for this fixture is 60s (2 x the 30s green max), and a
+# deadline larger than it would let STALLED win the race and this arm would measure the
+# wrong refusal.
+new_scen dl-inloop
+printf '%s\n' "$HEAD_DL" > "$SCEN/head"
+lane_fail "$HEAD_DL" 9671 > "$SCEN/runs-$HEAD_DL"
+log_failed 'tests/test_deadline.py::test_long' > "$SCEN/log-9671"
+lane_fail maindl 9672 > "$SCEN/runs-main"
+log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-9672"
+target_shard 9671 "test (b)"
+green_shard 9673 "test (b)" 30
+: > "$SCEN/status-9671"
+_i=0; while [ "$_i" -lt 60 ]; do printf 'in_progress\n' >> "$SCEN/status-9671"; _i=$((_i + 1)); done
+printf '%s\n' "$(/bin/date +%s)" > "$TMP/skew-base"
+printf '5\n' > "$TMP/skew-step"
+printf '0\n' > "$TMP/skew-counter"
+set +e
+SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" CI_FAILURE_SET_GH="$FAKE" ADMIN_MERGE_POLL_INTERVAL=0 \
+  PATH="$SKEW_BIN:$NOSLEEP_BIN:$PATH" \
+  SKEW_COUNTER="$TMP/skew-counter" SKEW_CLOCK_BASE="$TMP/skew-base" SKEW_CLOCK_STEP="$TMP/skew-step" \
+  ADMIN_MERGE_RAIL_DEADLINE=25 ADMIN_MERGE_RERUN_FLOOR=1 \
+  bash "$ADM" 42 --main-runs 1 >"$TMP/out" 2>"$TMP/err"
+rd8_rc=$?
+set -e
+[ "$rd8_rc" -ne 0 ] \
+  && pass "(rd8b) a stepping clock crosses the bound and the attempt REFUSES (exit $rd8_rc) — the guard is wired into a real wait loop" \
+  || fail "(rd8b) the attempt never refused under a stepping clock — the in-loop guard is not reached"
+_dl_elapsed="$(sed -nE 's/.*REFUSED\(rail-deadline:([0-9]+)s\/25s, 42\).*/\1/p' "$TMP/err" | head -1)"
+if [ -n "${_dl_elapsed:-}" ] && [ "$_dl_elapsed" -ge 25 ]; then
+  pass "(rd8b) the refusal carries elapsed=${_dl_elapsed}s on a 25s bound — the MAIN path saw 5s, so this came from a LATER (in-loop) call site"
+else
+  fail "(rd8b) no REFUSED(rail-deadline:<n>s/25s, 42) with elapsed >= 25 (got '${_dl_elapsed:-<none>}') — the in-loop call site did not decide it"
+fi
+# ⛔ EITHER loop proves it: the deadline is on the head of the FIRST-CHECKS loop as well as
+# the RE-RUN loop, and which one the fixture reaches first is not the property under test —
+# that the guard runs INSIDE a poll loop is. So the evidence is "the surface was POLLED".
+rd8_reads="$(grep -cE '^(run view 9671|run list)' "$SCEN/calls" 2>/dev/null || true)"
+[ "${rd8_reads:-0}" -ge 2 ] \
+  && pass "(rd8b) …and the wait really POLLED ($rd8_reads surface reads) before the bound was crossed" \
+  || fail "(rd8b) the wait loop never polled (${rd8_reads:-0} surface reads) — the refusal is not evidence of an in-loop guard"
+grep -q 'pr merge' "$SCEN/calls" \
+  && fail "(rd8b) a merge was attempted on a deadline refusal" \
+  || pass "(rd8b) …and nothing merged"
+
+# ⛔ (rd9) BOTH `clock-unreadable` ARMS — new fail-closed exits with NO test at all
+# (review of the rebase, P2). They guard the fail-open this change exists to remove: an
+# erroring `[ -ge ]` under `set -u` without `-e` SKIPS its body, so an unreadable clock used
+# to let a 600s-aged attempt under a 60s bound exit 0. `PATH` is the seam that breaks `date`.
+NODATE_BIN="$TMP/nodate-bin"; mkdir -p "$NODATE_BIN"
+printf '#!/bin/sh\nexit 1\n' > "$NODATE_BIN/date"
+chmod +x "$NODATE_BIN/date"
+
+# (rd9a) the START-SEAM branch validates the clock it reads.
+new_scen dl-clock-start
+set +e
+SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" CI_FAILURE_SET_GH="$FAKE" ADMIN_MERGE_POLL_INTERVAL=0 \
+  PATH="$NODATE_BIN:$PATH" ADMIN_MERGE_RAIL_DEADLINE=1800 \
+  ADMIN_MERGE_RAIL_STARTED_AT=$(( $(/bin/date +%s) - 600 )) \
+  bash "$ADM" 42 --main-runs 1 >"$TMP/out" 2>"$TMP/err"
+rd9a_rc=$?
+set -e
+if [ "$rd9a_rc" -eq 1 ] && grep -q 'REFUSED(rail-deadline:clock-unreadable' "$TMP/err"; then
+  pass "(rd9a) an unreadable clock with the START SEAM set REFUSES by name (exit 1), never proceeds unbounded"
+else
+  fail "(rd9a) an unreadable clock at start exited $rd9a_rc and/or did not name clock-unreadable — the clock is unvalidated there"
+fi
+
+# (rd9b) the GUARD branch validates the clock it reads, on the ordinary (no-seam) path.
+new_scen dl-clock-poll
+set +e
+SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" CI_FAILURE_SET_GH="$FAKE" ADMIN_MERGE_POLL_INTERVAL=0 \
+  PATH="$NODATE_BIN:$PATH" ADMIN_MERGE_RAIL_DEADLINE=1800 \
+  bash "$ADM" 42 --main-runs 1 >"$TMP/out" 2>"$TMP/err"
+rd9b_rc=$?
+set -e
+if [ "$rd9b_rc" -eq 1 ] && grep -q 'REFUSED(rail-deadline:clock-unreadable' "$TMP/err"; then
+  pass "(rd9b) an unreadable clock at the GUARD REFUSES by name (exit 1) — an unenforceable bound is not a pass"
+else
+  fail "(rd9b) an unreadable clock at the guard exited $rd9b_rc and/or did not name clock-unreadable — the guard would be inert"
+fi
+
 # ── 80. #3322: A CHECK MAIN ITSELF FAILS IS EXCLUDED FROM THE REQUIRED SURFACE ─
 # THE DEFECT. `ci.yml` is pull_request-only (it runs `bash-suites (1..n)`); `ci-main.yml`
 # is push-only and runs the SAME sweep UNSHARDED as `script-validate`. Main is red on
