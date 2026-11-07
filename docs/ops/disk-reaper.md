@@ -711,8 +711,10 @@ default 10 per root) is still the bound on destructive capacity, and it is now t
 floor and before the live-pid census** — the unit used to be spent BEFORE the floor was consulted, so
 ~89 % of those ten slots went to trees the age test preserved anyway, and on a population of thousands
 the aged trees were never reachable at all (a dry run over 3,314 entries classified 10 and printed
-`gitless-cap` for **3,137**). The pass is additionally bounded by a **TIME** bound,
-`REAP_AW_BUDGET_SECONDS` default 300 s, inside the pass's own `DISK_REAPER_CLASS_TIMEOUT=1800`.
+`gitless-cap` for **3,137**). The pass's **expensive per-candidate work** is additionally bounded, **per
+root**, by a **TIME** bound, `REAP_AW_BUDGET_SECONDS` default 300 s — the eligibility scan over the whole
+population is *not* budgeted (classifying every entry is the product), and `DISK_REAPER_CLASS_TIMEOUT`
+(1800) bounds each **per-root invocation**, not the whole pass.
 **Raising or removing the ceiling is #3278's P3 — an owner decision, sequenced after P2 — and is not
 part of this change.**
 What **#3043** still covers is the remainder: trees a `.git`-owned arm claims (those keep their own
@@ -1929,8 +1931,9 @@ of that decision, not an optimisation.
   `class=runner-work` — a live lane's cwd can BE under `/tmp` (measured, a running `pi` lane cwd'd in
   `/tmp/cell-t3/.worktrees/…`), so an mtime floor is not proof of death, and a scratch copy is the only
   artifact of an unfinished review. Beyond the pass's own bounds (the count ceiling,
-  `REAP_AW_GITLESS_MAX` default 10 per root, now charged to AGED candidates — #3278 — and a wall-clock
-  budget, `REAP_AW_BUDGET_SECONDS` default 300 s) and the trees a `.git`-owned arm claims, it needs an
+  `REAP_AW_GITLESS_MAX` default 10 per root, now charged to AGED candidates — #3278 — and a per-root
+  wall-clock budget on its **expensive per-candidate work**, `REAP_AW_BUDGET_SECONDS` default 300 s, inside
+  a `DISK_REAPER_CLASS_TIMEOUT` of 1800 *per root invocation*) and the trees a `.git`-owned arm claims, it needs an
   owner ruling on what scratch counts as evidence — the same reversal-of-a-decision problem
   `docs/ops/disk-consumers.md` G2 records. Do not "just add an age sweep": it would delete working
   lanes' trees.

@@ -565,11 +565,12 @@ fi
 
 # MUT_CENSUS_FIRST makes the bound's DECISION depend on the census, i.e. the census runs first — the
 # pre-#3278 order whose overrun this PR exists to remove (one FULL census per remaining candidate).
-# ⛔ IT IS ONE sed EXPRESSION OVER TWO CALL SITES, and the comment used to say "a single line": the
-# anchor matches BOTH `budget_spent` sites (the gitless arm's and the linked arm's), so both arms are
-# mutated. That is deliberate — case H is the LINKED arm's test, so a mutation confined to the gitless
-# arm would leave H green and the mutant would survive. It is caught only because case H now holds its
-# fixture: without the holder the bound fires either way and the mutant survives.
+# ⛔ IT IS ONE sed EXPRESSION OVER BOTH `budget_spent` CALL SITES, and the comment used to say "a single
+# line": the anchor matches the shared PRE-CENSUS check (the one that reddens case H) and the shared
+# PRE-REPROBE check (already past the census, so it is a no-op under this edit). ⛔ NEITHER SITE IS
+# ARM-SPECIFIC — the pre-census check is reached by BOTH arms, which is exactly why case H (the LINKED
+# arm's test) can detect the reorder at all. It is caught only because case H now holds its fixture:
+# without the holder the bound fires either way and the mutant survives.
 MUT_CENSUS_FIRST='s|^        if budget_spent "$deadline"; then$|        if budget_spent "$deadline" \&\& ! lp_path_held "$CENSUS" "$canon"; then|'
 if apply_mutation "$OWNER" "$T/mut-census-first/reap-abandoned-worktrees.sh" -e "$MUT_CENSUS_FIRST"; then
     expect_fail "MUT_CENSUS_FIRST the census runs before the bound — case H must go RED" case_h "$T/mut-census-first/reap-abandoned-worktrees.sh"
