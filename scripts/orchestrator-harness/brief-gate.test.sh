@@ -34,6 +34,14 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # escape, declared where it applies — not a silent bypass: unsetting it here turns the gate back on and
 # these arms go red, which is the assertion that the line is load-bearing rather than decorative.
 export LANE_PREFLIGHT=0
+# ⛔ AND THE MEMORY ARM IS NEUTRALISED FOR THE SAME REASON, one gate over (agent-infra#2387). Every arm
+# below drives the SHIPPED `run_agent` with `MAX_LOAD=1000 DISK_MIN_FREE_MB=1` so that a load or disk
+# refusal cannot decide an arm about the BRIEF. `run_agent` now also consults available memory before
+# load, so on a box under the shipped 2048 MB floor the positive control (`rc=0 started=1`) returned 73
+# and the suite reported its own subject — the research-first contract — as broken. `1` disables the
+# floor's ability to bind; the SHIPPED default and its arithmetic are asserted in spawn-gate.test.sh,
+# which owns them.
+export MEM_MIN_AVAIL_MB=1
 ROOT="$(cd "$HERE/../.." && pwd)"
 GATE="$HERE/brief-gate.sh"
 PASS=0; FAIL=0
@@ -1270,7 +1278,17 @@ grep -q 'PI_RAN' "$PI_LOG"; ck $? "…the stub pi really ran (the refusal above 
 mkdir -p "$TMP/nolib"
 cp "$HERE/spawn-gate.sh" "$TMP/nolib/"
 : > "$PI_LOG"
-res="$( cd "$FIXREPO" && env -u AGENT_INFRA_PATH PATH="$TMP/bin:$PATH" O="$TMP/o2" HOME="$TMP/fakehome" PI_LOG="$PI_LOG" MAX_LOAD=1000 DISK_MIN_FREE_MB=1 \
+# ⛔ AND $AGENT_INFRA_PATH (measured on a developer box, 2026-10-28: rc=0 started=1 — the arm's whole
+# claim is that the search cannot reach a real installed copy, and `brief_gate_lib` consults
+# `$AGENT_INFRA_PATH/scripts/orchestrator-harness/brief-gate.sh` as its THIRD home, which an isolated
+# HOME does not cover. `env -u` is what clears it here, and it is the same isolation the arm claims.)
+# ⛔ AND THE MEMORY FLOOR IS NEUTRALISED (`MEM_MIN_AVAIL_MB=1`), for the reason the disk and load
+# confounders are: this arm is about the BRIEF gate's cannot-verify path, and the memory gate sits at
+# the SAME spawn point (#2387), so on a box below its 2048 MB floor the spawn is refused 81 before the
+# validator is ever sought and the suite reports its own subject as broken. One line, same shape the
+# sibling suites carry. (Both isolation idioms merged: main's `env -u AGENT_INFRA_PATH` is the one the
+# note above documents — an empty assignment and `env -u` drive the same not-found path.)
+res="$( cd "$FIXREPO" && env -u AGENT_INFRA_PATH PATH="$TMP/bin:$PATH" O="$TMP/o2" HOME="$TMP/fakehome" PI_LOG="$PI_LOG" MAX_LOAD=1000 MEM_MIN_AVAIL_MB=1 DISK_MIN_FREE_MB=1 \
   bash -c '. "$1"; load1() { printf "1"; }; run_agent 1 "$2" "$3" "no validator" >/dev/null 2>&1
            printf "rc=%s started=%s" "$?" "$AGENT_STARTED"' _ "$TMP/nolib/spawn-gate.sh" "$TMP/nolib.log" "$CANON" )"
 [ "$res" = "rc=78 started=0" ]; ck $? "a MISSING validator is 78/cannot-verify, not a pass ($res)"
@@ -1652,8 +1670,14 @@ mv "$GATE" "$GATE.moved"
 # ⛔ `env -u AGENT_INFRA_PATH`: see the note at the §"MISSING validator" arm — the variable is a
 # documented fifth search root and is exported on every cell, so without this the "missing validator"
 # fixture finds the REAL one and the arm refuses 72 (the worktree precondition) instead of 78.
+# ⛔ AND THE BRANCH MUST BE THE ONE THE FIXTURE IS ON (measured: `fix/x` -> rc=72,
+# `REPO_TARGET_REFUSED`, `branch-missing`). lane.sh asserts the checkout's own origin AND attached
+# branch (#2724/#2694) BEFORE it looks for a validator, so a lane told a branch the fixture does not
+# have is refused for the REPO-IDENTITY reason and never reaches the missing-validator path this arm
+# is about — the assertion then reads as "the fail-closed arm is broken" when the arm had not run. The
+# fixture is born on `init.defaultBranch=fix/research-first-gate` above; one word, same branch.
 ( cd "$TMP" && env -u AGENT_INFRA_PATH O="$TMP/lane-o2" PATH="$TMP/bin:$PATH" PI_LOG="$PI_LOG" REAP_LANE_VENV_DISABLE=1 LANE_DRY_RUN=1 \
-    HOME="$TMP/fakehome" bash "$HERE/lane.sh" 2258 fix/x daniel-ospina/agent-infra ) >/dev/null 2>&1; rc=$?
+    HOME="$TMP/fakehome" bash "$HERE/lane.sh" 2258 fix/research-first-gate daniel-ospina/agent-infra ) >/dev/null 2>&1; rc=$?
 mv "$GATE.moved" "$GATE"
 [ "$rc" -eq 78 ]; ck $? "a MISSING validator refuses the LANE with 78 (fail-closed: never a lane nobody asked to look first) (rc=$rc)"
 
@@ -1688,8 +1712,6 @@ found="$(cd "$ROOT" && { grep -rlE 'brief-gate\.sh|brief_gate_(lib|run|verify|se
 # this census cannot see one that merely *drives* the path. That gap let two registered shards go red
 # in one commit (capacity-transfer and tests/pi-shim — the latter with a brief that was never created
 # at all). Declared here so the reference is accounted for; the broader class is named in the STATED
-# LIMIT below rather than silently believed to be covered.
-# the at all). Declared here so the reference is accounted for; the broader class is named in the STATED
 # LIMIT below rather than silently believed to be covered.
 #
 # ⛔ AND A SUITE THAT BUILDS ITS OWN FIXTURES FROM THIS VALIDATOR IS A MEMBER TOO (#1881 review P2).

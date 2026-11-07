@@ -1115,7 +1115,13 @@ run_admin() {
     "ADMIN_MERGE_FIRST_CHECKS_CEILING=${SUITE_FIRST_CHECKS_CEILING:-${SUITE_FIRST_CHECKS_WAIT:-}}"
     "ADMIN_MERGE_FIRST_CHECKS_STALL=${SUITE_FIRST_CHECKS_STALL:-}"
     "ADMIN_MERGE_FIRST_CHECKS_POLL=${SUITE_FIRST_CHECKS_POLL:-1}"
+    # #gh-quota: the backoff ceiling DEFAULTS to the poll step here, so every
+    # scenario written before the backoff existed keeps its exact poll count. A
+    # scenario that wants the backoff says so with SUITE_FIRST_CHECKS_POLL_MAX.
+    "ADMIN_MERGE_FIRST_CHECKS_POLL_MAX=${SUITE_FIRST_CHECKS_POLL_MAX:-${SUITE_FIRST_CHECKS_POLL:-1}}"
     "ADMIN_MERGE_MERGE_REF_WAIT=${SUITE_MERGE_REF_WAIT:-0}"
+    "ADMIN_MERGE_RAIL_DEADLINE=${SUITE_RAIL_DEADLINE:-}"
+    "ADMIN_MERGE_RAIL_STARTED_AT=${SUITE_RAIL_STARTED_AT:-}"
     "ADMIN_MERGE_POLL_INTERVAL=0" "ADMIN_MERGE_HEAD_READ_SLEEP=0" "ADMIN_MERGE_VERIFY_POLL=0"
   )
   [ "${SUITE_NOSLEEP:-0}" = "1" ] && env_args+=("PATH=$NOSLEEP_BIN:$PATH")
@@ -1139,7 +1145,12 @@ run_admin_here() {
     "ADMIN_MERGE_FIRST_CHECKS_CEILING=${SUITE_FIRST_CHECKS_CEILING:-${SUITE_FIRST_CHECKS_WAIT:-}}"
     "ADMIN_MERGE_FIRST_CHECKS_STALL=${SUITE_FIRST_CHECKS_STALL:-}"
     "ADMIN_MERGE_FIRST_CHECKS_POLL=${SUITE_FIRST_CHECKS_POLL:-1}"
+    # #gh-quota: see run_admin's copy — the backoff ceiling defaults to the poll
+    # step, so a pre-existing scenario's poll count is unchanged unless it opts in.
+    "ADMIN_MERGE_FIRST_CHECKS_POLL_MAX=${SUITE_FIRST_CHECKS_POLL_MAX:-${SUITE_FIRST_CHECKS_POLL:-1}}"
     "ADMIN_MERGE_MERGE_REF_WAIT=${SUITE_MERGE_REF_WAIT:-0}"
+    "ADMIN_MERGE_RAIL_DEADLINE=${SUITE_RAIL_DEADLINE:-}"
+    "ADMIN_MERGE_RAIL_STARTED_AT=${SUITE_RAIL_STARTED_AT:-}"
     "ADMIN_MERGE_POLL_INTERVAL=0" "ADMIN_MERGE_HEAD_READ_SLEEP=0" "ADMIN_MERGE_VERIFY_POLL=0"
   )
   # #2235: an ambient GH_REPO reaches the rail only when THIS invocation sets one, so a
@@ -15695,6 +15706,12 @@ grep -q '^first-checks-ceiling=18064$' "$SCEN/fcb.txt" \
 grep -q '^first-checks-window=3900$' "$SCEN/fcb.txt" \
   && pass "(f) the legacy window is unchanged at 3900s (it bounds only no-run/unreadable)" \
   || fail "(f) the legacy window changed: $(grep '^first-checks-window' "$SCEN/fcb.txt")"
+# ⛔ THE BACKOFF CEILING'S DEFAULT IS THE FIX ITSELF (#gh-quota). Reverting it to the poll
+# step silently restores the 60 s fleet burn this change exists to stop, and nothing else
+# in the suite would notice: every scenario injects POLL_MAX explicitly.
+grep -q '^first-checks-poll-ceiling=300$' "$SCEN/fcb.txt" \
+  && pass "(f) the backoff ceiling defaults to 300s — the number that bounds a silent surface, stated where an operator looks" \
+  || fail "(f) the default backoff ceiling is not 300s: $(grep '^first-checks-poll-ceiling' "$SCEN/fcb.txt" || echo '<absent>')"
 grep -q 'MEASURED' "$SCEN/fcb.txt" \
   && pass "(f) …and the DERIVATION is printed beside them" \
   || fail "(f) no derivation is stated"
@@ -16936,6 +16953,296 @@ elif bash "$RAIL_EXIT_TEST"; then
 else
   fail "(p) rail-exit.test.sh FAILED — see its output above"
 fi
+# ═══ 79. GH API QUOTA PACING (#gh-quota) ═════════════════════════════════
+#
+# MEASURED DEFECT (2026-11-03): the account's ONE shared 5000/h bucket was exhausted
+# (`gh run list` → HTTP 403 "API rate limit exceeded for user id 81560491") while
+# ~20 lanes each ran this wait. Five rails' logs on this box held 85 / 75 / 56 / 54
+# FIRST-CHECKS polls on heads whose runs NEVER advanced — the 85-poll one waited
+# ~5185 s on a single `queued` run with 4 jobs at step 0/0, paying 1 run list + 1
+# Jobs read per poll for an answer that could not change. The quota then RECOVERED
+# (core 4830/5000), so the problem is not the limit: it is unbounded per-lane
+# consumption against it, multiplied by every lane in the fleet.
+#
+# What this section pins:
+#   (a) a poll that observes NO change DOUBLES its interval, bounded by
+#       FIRST_CHECKS_POLL_MAX — asserted as a POLL-COUNT DROP on the same wait, not
+#       as "we set a variable"
+#   (b) a `queued` run is read ONCE, not once per poll: no runner has picked it up,
+#       so its job steps cannot advance and re-reading them is pure quota waste
+#   (c) ⛔ the skip is NOT blind — a queued → in_progress transition RE-PROBES, and
+#       the advanced step is what the wait reports
+#   (d) ⛔ the pacing softens NO verdict: the same silent run still reaches its
+#       CEILING verdict, and still says what it observed
+#   (e) ⛔ the zero-JOB exclusion (#1623) survives: its one read still establishes
+#       the count, so a run GitHub never expanded cannot hold the wait
+#   (f) the knob is VALIDATED like the interval it bounds (a typo must not silently
+#       decide how long a silent surface goes unread)
+echo "== 79. the FIRST-CHECKS wait is PACED: silence backs off, queued runs are not re-read =="
+new_scen fq-paced
+HEAD_FQ="f7f9000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_FQ" > "$SCEN/head"
+lane_queued "$HEAD_FQ" 9801 > "$SCEN/runs-$HEAD_FQ"
+# The measured shape: the run is `queued`, its job has NO steps yet (step 0/0).
+first_checks_line queued "" "$HEAD_FQ" 9801 2026-11-03T01:00:00Z > "$SCEN/first-checks-gen-1"
+first_checks_jobs_gen 9801 1 0 0
+lane_fail fqmain 9802 > "$SCEN/runs-main"
+# (a)/(b) THE SAME SILENT WAIT, RUN TWICE — only the backoff ceiling differs.
+_flat_t0="$(date -u +%s)"
+rm -f "$SCEN/first-checks-list-count" "$SCEN/jobs-gen-count-9801"
+SUITE_FIRST_CHECKS_WAIT=1 SUITE_FIRST_CHECKS_CEILING=9 SUITE_FIRST_CHECKS_STALL=900 \
+  SUITE_FIRST_CHECKS_POLL=1 SUITE_FIRST_CHECKS_POLL_MAX=1 \
+  run_admin_here 42 --main-runs 1 >/dev/null 2>&1
+_flat_t1="$(date -u +%s)"
+polls_flat="$(cat "$SCEN/first-checks-list-count" 2>/dev/null || echo 0)"
+jobs_flat="$(cat "$SCEN/jobs-gen-count-9801" 2>/dev/null || echo 0)"
+_back_t0="$(date -u +%s)"
+rm -f "$SCEN/first-checks-list-count" "$SCEN/jobs-gen-count-9801"
+SUITE_FIRST_CHECKS_WAIT=1 SUITE_FIRST_CHECKS_CEILING=9 SUITE_FIRST_CHECKS_STALL=900 \
+  SUITE_FIRST_CHECKS_POLL=1 SUITE_FIRST_CHECKS_POLL_MAX=8 \
+  run_admin_here 42 --main-runs 1 >/dev/null 2>&1
+_back_t1="$(date -u +%s)"
+polls_back="$(cat "$SCEN/first-checks-list-count" 2>/dev/null || echo 0)"
+jobs_back="$(cat "$SCEN/jobs-gen-count-9801" 2>/dev/null || echo 0)"
+[ "$polls_flat" -ge 5 ] \
+  && pass "(a) the flat-cadence arm really polled (${polls_flat} run-list reads in $(( _flat_t1 - _flat_t0 ))s) — the comparison is not vacuous" \
+  || fail "(a) the flat arm made only ${polls_flat} polls — nothing to compare (fixture drift)"
+[ "$polls_back" -lt "$polls_flat" ] \
+  && pass "(a) backoff CUT the polls on the SAME wait: ${polls_flat} → ${polls_back} run-list reads, same ceiling (${polls_back} in $(( _back_t1 - _back_t0 ))s)" \
+  || fail "(a) the interval did not back off: ${polls_flat} flat vs ${polls_back} backed (POLL_MAX=8)"
+[ "$jobs_back" -le 1 ] \
+  && pass "(b) a QUEUED run's jobs were read once (${jobs_back}), not once per poll" \
+  || fail "(b) a queued run's jobs were re-read ${jobs_back} times — the zero-step waste is back"
+# ⛔ A POSITIVE CONTROL, or `0 <= 1` satisfies the line above: a broken jobs fixture (or
+# a regression that never probes the queued run at all) would keep this arm green while
+# proving nothing.
+[ "${jobs_flat:-0}" -ge 1 ] \
+  && pass "(b) …and the queued run WAS probed (${jobs_flat} read) — the count above is a real observation, not an absent one" \
+  || fail "(b) the queued run was never probed (${jobs_flat} read(s)) — the 'read once' assertion is vacuous"
+# ⛔ THE GUARD IS INDEPENDENT OF THE CADENCE, and asserting otherwise would be a
+# vacuous cross-arm comparison (the skip is not gated by POLL_MAX). What must hold
+# is that BOTH arms spend exactly ONE read on a queued run.
+[ "$jobs_flat" -eq "$jobs_back" ] \
+  && pass "(b) …and the CADENCE does not change that (${jobs_flat} vs ${jobs_back}): the skip is a property of the run's state, not of the interval" \
+  || fail "(b) the two arms spent different read counts on a queued run (${jobs_flat} vs ${jobs_back}) — the guard is cadence-dependent, which the design says it is not"
+# (d) ⛔ THE PACING MUST NOT BECOME A VERDICT. Both arms must still refuse, and the
+# refusal must still be the CEILING — not a silent "done", and not a stall claim.
+grep -q 'BLOCK' "$SCEN/err" \
+  && pass "(d) the paced wait still BLOCKS — pacing is not a pass" \
+  || { fail "(d) the paced wait did not block: a slower poll must not become a silent success"; sed 's/^/      /' "$SCEN/err" | head -8; }
+grep -q 'expired after' "$SCEN/err" \
+  && pass "(d) …with its CEILING verdict, at the bound it was given" \
+  || fail "(d) the paced wait did not reach its ceiling verdict"
+# (c) A TRANSITION MUST RE-PROBE. queued → in_progress with the job at step 3/8:
+# the cached (zero-step) line must be REPLACED, not reused.
+new_scen fq-transition
+HEAD_FT="f7fa000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_FT" > "$SCEN/head"
+lane_queued "$HEAD_FT" 9811 > "$SCEN/runs-$HEAD_FT"
+first_checks_line queued      "" "$HEAD_FT" 9811 2026-11-03T01:00:00Z > "$SCEN/first-checks-gen-1"
+first_checks_line in_progress "" "$HEAD_FT" 9811 2026-11-03T01:00:00Z > "$SCEN/first-checks-gen-2"
+first_checks_jobs_gen 9811 1 0 0
+for _g in 2 3 4 5 6 7 8 9; do first_checks_jobs_gen 9811 "$_g" 3 8; done
+lane_fail fqmain2 9812 > "$SCEN/runs-main"
+rm -f "$SCEN/first-checks-list-count" "$SCEN/jobs-gen-count-9811"
+SUITE_FIRST_CHECKS_WAIT=1 SUITE_FIRST_CHECKS_CEILING=3 SUITE_FIRST_CHECKS_STALL=900 \
+  SUITE_FIRST_CHECKS_POLL=1 SUITE_FIRST_CHECKS_POLL_MAX=1 \
+  run_admin_here 42 --main-runs 1 >/dev/null 2>&1
+jobs_tr="$(cat "$SCEN/jobs-gen-count-9811" 2>/dev/null || echo 0)"
+[ "${jobs_tr:-0}" -ge 2 ] \
+  && pass "(c) a queued → in_progress transition RE-PROBED the jobs (${jobs_tr} reads): the guard is not blind" \
+  || fail "(c) the transition did NOT re-probe (${jobs_tr} read(s)) — the wait would never see the run advance"
+# `job_step` names the in-progress step as done+1, so gen 4/8 with 3 completed steps
+# reports "step 4/8" — that is the advanced step the wait must SEE (it must not keep
+# serving the cached zero-step line from the queued spell).
+grep -q 'step 4/8' "$SCEN/out" "$SCEN/err" \
+  && pass "(c) …and the ADVANCED step is what it reports (step 4/8), not the stale 0/0" \
+  || { fail "(c) the advanced step was not reported — the cached line was reused"; sed 's/^/      /' "$SCEN/out" "$SCEN/err" | head -8; }
+# (c2) THE RESET, pinned on the PROGRESSING path. The backoff is state-driven, so a
+# fixture whose fingerprint changes on EVERY poll leaves `quiet == 0` on every poll: with
+# the reset the interval stays at its base, without it the step doubles 1->2->4->8.
+# ⛔ THE CEILING IS WIDE ON PURPOSE (20 s, not 9). The green count is
+# `ceiling / (poll_step + poll_cost)`, so it DEGRADES WITH HOST LOAD while the mutant's
+# count is nearly load-insensitive — a narrow window puts the threshold on the green
+# distribution's floor and turns this arm RED on a correct tree under load (measured on
+# an 8-core box at load ~25: 6 polls at a 9 s ceiling, i.e. a false red). At 20 s the
+# two counts are green 13-18 (even loaded) vs mutant ~6 — margin on BOTH sides.
+# §79(a) pins the SILENT path (no change => back off); this arm pins the other half.
+new_scen fq-reset
+HEAD_FR="f7fc000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_FR" > "$SCEN/head"
+lane_queued "$HEAD_FR" 9831 > "$SCEN/runs-$HEAD_FR"
+# Generations must OUTLAST the ceiling, or the fingerprint stops advancing and a correct
+# wait legitimately backs off again.
+for _g in $(seq 24); do
+  first_checks_line in_progress "" "$HEAD_FR" 9831 2026-11-03T01:00:00Z > "$SCEN/first-checks-gen-$_g"
+  first_checks_jobs_gen 9831 "$_g" "$_g" 30
+done
+lane_fail fqmain4 9832 > "$SCEN/runs-main"
+rm -f "$SCEN/first-checks-list-count" "$SCEN/jobs-gen-count-9831"
+SUITE_FIRST_CHECKS_WAIT=1 SUITE_FIRST_CHECKS_CEILING=20 SUITE_FIRST_CHECKS_STALL=900 \
+  SUITE_FIRST_CHECKS_POLL=1 SUITE_FIRST_CHECKS_POLL_MAX=8 \
+  run_admin_here 42 --main-runs 1 >/dev/null 2>&1
+polls_reset="$(cat "$SCEN/first-checks-list-count" 2>/dev/null || echo 0)"
+grep -q 'still RUNNING and PROGRESSING' "$SCEN/out" \
+  && pass "(c2) the wait OBSERVED the transitions (so the reset had something to react to)" \
+  || fail "(c2) the fixture never produced an observed transition — the arm below is vacuous"
+[ "$polls_reset" -ge 10 ] \
+  && pass "(c2) …and a PROGRESSING wait keeps polling at its base interval: ${polls_reset} polls in 20s (without the reset the doubling leaves ~6)" \
+  || fail "(c2) the interval did not stay at base while the run PROGRESSED: only ${polls_reset} polls in 20s — a progressing lane would be polled slower and slower"
+# (e) A ZERO-JOB RUN IS STILL NOT IN FLIGHT (#1623). Its one read establishes the
+# count; the wait must then CLEAR, not sit until the ceiling.
+new_scen fq-zerojob
+HEAD_FZ="f7fb000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_FZ" > "$SCEN/head"
+lane_queued "$HEAD_FZ" 9821 > "$SCEN/runs-$HEAD_FZ"
+first_checks_line queued "" "$HEAD_FZ" 9821 2026-11-03T01:00:00Z > "$SCEN/first-checks-gen-1"
+printf '%s\n' '{"total_count":0,"jobs":[]}' > "$SCEN/jobs-gen-9821-1.json"
+lane_fail fqmain3 9822 > "$SCEN/runs-main"
+SUITE_FIRST_CHECKS_WAIT=1 SUITE_FIRST_CHECKS_CEILING=20 SUITE_FIRST_CHECKS_STALL=900 \
+  SUITE_FIRST_CHECKS_POLL=1 SUITE_FIRST_CHECKS_POLL_MAX=1 \
+  run_admin_here 42 --main-runs 1 >/dev/null 2>&1
+# ⛔ AND THE WAIT MUST HAVE POLLED AT ALL. "No ceiling verdict" is also true when the
+# wait never ran (fixture drift, a pending count read as 0), so pin the observation the
+# fake records on every FIRST-CHECKS run-list call before asserting the absence.
+[ -s "$SCEN/first-checks-list-count" ] \
+  && pass "(e) …and the wait really polled (run-list reads recorded), so the exclusion is what cleared it" \
+  || fail "(e) the FIRST-CHECKS wait never polled — the absence of a ceiling verdict proves nothing"
+grep -q 'expired after' "$SCEN/err" \
+  && fail "(e) a zero-JOB run held the wait to its ceiling — #1623's exclusion was lost with the skip" \
+  || pass "(e) a zero-JOB run is still excluded, so it cannot hold the wait (#1623 preserved)"
+# (f) THE KNOB IS VALIDATED. A typo must be refused, not coerced.
+for _bad in 0300 abc; do
+  ADMIN_MERGE_FIRST_CHECKS_POLL_MAX="$_bad" bash "$ADM" --print-bounds >"$SCEN/fqb" 2>&1
+  rc=$?
+  [ "$rc" -ne 0 ] && grep -q 'FIRST_CHECKS_POLL_MAX' "$SCEN/fqb" \
+    && pass "(f) ADMIN_MERGE_FIRST_CHECKS_POLL_MAX='${_bad}' is REFUSED (rc=$rc), not coerced" \
+    || fail "(f) ADMIN_MERGE_FIRST_CHECKS_POLL_MAX='${_bad}' was accepted (rc=$rc): ${_} $(head -2 "$SCEN/fqb" | tr '\n' ' ')"
+done
+# ── (p) THE WHOLE-ATTEMPT DEADLINE — the rail's ACTUATION gets a bound ────────
+# A bound on each wait is not a bound on the ATTEMPT (#3223). Measured 2026-11-02:
+# five rails lived 32:46-59:09 with ZERO progress, each inside its own wait's
+# bound. These arms drive the attempt clock EARLIER via the fail-safe seam
+# (ADMIN_MERGE_RAIL_STARTED_AT can only make the attempt OLDER), so the expiry is
+# reached on the FIRST poll and the arm is deterministic in seconds — never a CI
+# timeout standing in for an assertion (#3280 cycle 3).
+# The section label is `p1–p7`, NOT a bare `(p)`: main's delegation block above asserts under
+# the id `(p)`, so a bare `(p)` header made a red `❌ (p) rail-exit.test.sh FAILED` line
+# indistinguishable from this section's header at triage time. The arms keep their own ids.
+echo "   ▸ (p1–p7) whole-attempt deadline"
+SCEN="$TMP/scen-p1"; mkdir -p "$SCEN"
+set +e
+SUITE_RAIL_DEADLINE=60 SUITE_RAIL_STARTED_AT=$(( $(date +%s) - 600 )) \
+  run_admin_here 42 --main-runs 1 >/dev/null 2>&1
+p1_rc=$?
+set -e
+grep -qE 'REFUSED\(rail-deadline:[0-9]+s/60s, ' "$SCEN/err" \
+  && pass "(p1) an aged attempt REFUSES by name: REFUSED(rail-deadline:<elapsed>s/<bound>s, <pr>)" \
+  || fail "(p1) no REFUSED(rail-deadline:…) line — the attempt deadline is not an actuator"
+grep -qE 'REFUSED\(rail-deadline:[0-9]+s/60s, 42\)' "$SCEN/err" \
+  && pass "(p1) the refusal NAMES the PR, so the next supervisor knows which rail died" \
+  || fail "(p1) the refusal does not name the PR"
+[ "$p1_rc" -ne 0 ] \
+  && pass "(p1) expiry EXITS NON-ZERO (rc=$p1_rc) — a failed actuation, not a live process" \
+  || fail "(p1) expiry exited 0 — the bound would leave a supervisor reading SUCCESS"
+grep -q 'NOT a verdict on any run' "$SCEN/err" \
+  && pass "(p1) the refusal does NOT claim the run stalled — no false stall diagnosis" \
+  || fail "(p1) the refusal does not disclaim a stall verdict"
+
+# (p2) A BOUND THAT CANNOT FIRE IS REFUSED, NOT TRUSTED. #3287's default is
+# FIRST_CHECKS_CEILING + 4 x FAILSAFE_RERUN_TIMEOUT = 18064 + 15600 = 33664s,
+# which is above every phase bound that could carry an attempt there, so a rail
+# can never reach it. An override above the reachable ceiling is CLAMPED to it
+# and the clamp is DISCLOSED — the number the rail reports is the number it used.
+SCEN="$TMP/scen-p2"; mkdir -p "$SCEN"
+set +e
+SUITE_RAIL_DEADLINE=33664 SUITE_FIRST_CHECKS_CEILING=100 SUITE_RAIL_STARTED_AT=$(( $(date +%s) - 5000 )) \
+  run_admin_here 42 --main-runs 1 >/dev/null 2>&1
+set -e
+grep -q 'CLAMPED to the reachable 2500s' "$SCEN/err" \
+  && pass "(p2) an unreachable deadline is CLAMPED to the SUM of the phase bounds and DISCLOSED" \
+  || fail "(p2) an unreachable deadline was accepted silently — a bound that can never fire"
+grep -qE 'REFUSED\(rail-deadline:[0-9]+s/2500s, 42\)' "$SCEN/err" \
+  && pass "(p2) the refusal reports the CLAMPED bound, never the unused 33664s" \
+  || fail "(p2) the refusal reported a bound the rail did not use"
+
+# (p3) THE KNOB IS VALIDATED BY NAME, NOT DEFAULTED SILENTLY (review P1). A
+# non-integer deadline makes the guard's own `[ -ge ]` ERROR — and under `set -u`
+# without `-e` an erroring `if` body is SKIPPED, so the typo DELETES the bound
+# instead of weakening it. Each arm must REFUSE, naming the knob, never proceed.
+for bad in 10m 99999999999999999999999 0 019864; do
+  SCEN="$TMP/scen-p3-$bad"; mkdir -p "$SCEN"
+  set +e
+  SUITE_RAIL_DEADLINE="$bad" run_admin_here 42 --main-runs 1 >/dev/null 2>&1
+  bad_rc=$?
+  set -e
+  if [ "$bad_rc" -eq 2 ] && grep -q 'refusing ADMIN_MERGE_RAIL_DEADLINE' "$SCEN/err"; then
+    pass "(p3) ADMIN_MERGE_RAIL_DEADLINE='$bad' is REFUSED BY NAME (rc=2) instead of silently deleting the bound"
+  else
+    fail "(p3) ADMIN_MERGE_RAIL_DEADLINE='$bad' was accepted (rc=$bad_rc) — a typo disables the guard (fail-open)"
+  fi
+done
+
+# (p4) THE SEAM CANNOT MAKE THE ATTEMPT YOUNGER (review cycle 1 P1) — AND THE ARM
+# MUST DISCRIMINATE. Review cycle 2 found the first version of this arm asserted
+# only the ABSENCE of a refusal, which the BROKEN code also produced (a future stamp
+# made elapsed negative, so nothing fired): it could not tell "CLAMPED" from "the
+# guard was never reached". It now asserts the clamp's own DISCLOSURE, which only
+# exists when the clamp ran.
+SCEN="$TMP/scen-p4"; mkdir -p "$SCEN"
+set +e
+SUITE_RAIL_DEADLINE=60 SUITE_RAIL_STARTED_AT=$(( $(date +%s) + 86400 )) \
+  run_admin_here 42 --main-runs 1 >/dev/null 2>&1
+p4_rc=$?
+set -e
+grep -q 'CLAMPED to now' "$SCEN/err" \
+  && pass "(p4) a FUTURE start stamp is CLAMPED to now and the clamp is DISCLOSED — the attempt can only be made older" \
+  || fail "(p4) no 'CLAMPED to now' disclosure — the seam's clamp is unseen, so 'clamped' and 'guard absent' look identical"
+grep -qE 'REFUSED\(rail-deadline:' "$SCEN/err" \
+  && fail "(p4) a FUTURE start stamp evaded the deadline — the seam is not fail-safe" \
+  || pass "(p4) …and it produced no spurious refusal (rc=$p4_rc)"
+
+# (p5) THE SEAM IS VALIDATED LIKE THE KNOB (review cycle 2 P1). An all-digit
+# 23-digit stamp made `[ -lt ]` ERROR, the erroring body was SKIPPED under `set -u`
+# without `-e`, and the age was silently CANCELLED — the young direction. A leading
+# zero was worse: `[ -lt ]` read it DECIMAL while the age arithmetic read it OCTAL.
+for bads in 999999999999999999999999 01767000000 notanepoch; do
+  SCEN="$TMP/scen-p5-$bads"; mkdir -p "$SCEN"
+  set +e
+  SUITE_RAIL_DEADLINE=60 SUITE_RAIL_STARTED_AT="$bads" run_admin_here 42 --main-runs 1 >/dev/null 2>&1
+  bads_rc=$?
+  set -e
+  if [ "$bads_rc" -eq 2 ] && grep -q 'refusing ADMIN_MERGE_RAIL_STARTED_AT' "$SCEN/err"; then
+    pass "(p5) ADMIN_MERGE_RAIL_STARTED_AT='$bads' is REFUSED BY NAME (rc=2), never a silent age-cancel or octal misread"
+  else
+    fail "(p5) ADMIN_MERGE_RAIL_STARTED_AT='$bads' was accepted (rc=$bads_rc) — the seam's age can be cancelled or misread"
+  fi
+done
+
+# (p6) THE INSPECTION SURFACE REPORTS THE BOUND IN FORCE (review cycle 2 P2). It
+# used to print the DEFAULT, so `--print-bounds` said 20254 while a real run used
+# 500 — "reported bound ≠ bound used" in the one field an operator greps.
+SCEN="$TMP/scen-p6"; mkdir -p "$SCEN"
+SUITE_RAIL_DEADLINE=500 run_admin_here 42 --print-bounds >/dev/null 2>&1 || true
+grep -q '^rail-deadline=500' "$SCEN/out" \
+  && pass "(p6) --print-bounds reports the bound IN FORCE (500), not the 20254 default" \
+  || fail "(p6) --print-bounds does not report the bound in force — the operator is sent to a number the rail is not using"
+grep -q '^rail-deadline-source=' "$SCEN/out" \
+  && pass "(p6) --print-bounds carries the derivation, so the number is auditable" \
+  || fail "(p6) --print-bounds has no rail-deadline-source line"
+
+# (p7) THE CLAMPED CASE IS THE ONE WHERE "reported" AND "used" USED TO DIVERGE
+# (review cycle 3, P2). (p6) pins 500, which is BELOW the ceiling, so it never
+# exercised the clamp — and the clamp branch is exactly where the surface printed
+# the raw 33664 beside a refusal that enforced 20254.
+SCEN="$TMP/scen-p7"; mkdir -p "$SCEN"
+SUITE_RAIL_DEADLINE=33664 SUITE_FIRST_CHECKS_CEILING=100 run_admin_here 42 --print-bounds >/dev/null 2>&1 || true
+grep -q '^rail-deadline=2500 (CLAMPED from 33664)' "$SCEN/out" \
+  && pass "(p7) at the CLAMP the inspection surface prints the bound IN FORCE and names what it was clamped from" \
+  || fail "(p7) the inspection surface reports a bound the rail is not using"
+grep -q '^rail-deadline=33664' "$SCEN/out" \
+  && fail "(p7) it printed the RAW knob — the #3287 value the clamp exists to reject" \
+  || pass "(p7) it does NOT print the raw unreachable value"
 
 # ── (q) EVERY `--jq` PROGRAM IN THE THREE DECLARED FORMS MUST COMPILE ─────────
 # #2598's sibling, and the reason #2598's own repro could not find it: `wait_for_run`'s

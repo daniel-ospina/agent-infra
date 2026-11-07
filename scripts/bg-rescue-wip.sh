@@ -43,10 +43,29 @@
 #   - commits already on the branch but NOT pushed are out of scope — this tool archives uncommitted
 #     work. The clean exit says so rather than implying the lane is safe.
 #   - ONE credential retry is attempted, and only when the remote's own refusal says WORKFLOW SCOPE
-#     (the configured token often lacks `Workflows: write` while the keychain credential has it,
+#     (the configured token often lacks `Workflows: write` while a second credential has it,
 #     #2292). The predicate is the refusal TEXT, not the remote host or the snapshot's paths: any host
 #     whose pre-receive output matches that wording takes the retry, and a host that words it
 #     differently does not. Every other refusal is reported as-is — see section 6.
+#   - the retry's credential is chosen PER HOST, and it is chosen to be one the CONFIGURED CHAIN did not
+#     just use, where this script can tell, in this order: `BG_RESCUE_PUSH_HELPER=<helper>` (an explicit
+#     choice, so it wins everywhere), then `BG_RESCUE_PUSH_UNSHADOW=1` (an explicit request for the STORED
+#     credential, which is the only way to reach that candidate on macOS), then the platform default —
+#     `osxkeychain` on macOS, else the STORED credential with an ambient `GH_TOKEN`/`GITHUB_TOKEN` removed
+#     for that attempt (the cell shape). On a host where none of those can be a DIFFERENT credential, no
+#     retry is attempted and the run says so rather than spending 45 s re-sending the same token.
+#   - ⛔ DECLARED RESIDUALS: WHAT IT CANNOT TELL. `retry_credential` knows which candidates EXIST, never
+#     which credential the configured chain actually returned — so two shapes still retry with the very
+#     credential that was just refused, and both are stated rather than implied: (i) a helper that never
+#     reads the environment (`store`, `cache`) on a host with an ambient token, and (ii) macOS whose
+#     configured helper IS `osxkeychain` with a keychain PAT that lacks `Workflows: write` — candidate 3
+#     is then the refused credential. Both are what today's code ships; the messages do not claim
+#     otherwise, and `BG_RESCUE_PUSH_HELPER=<a store that can push>` is the escape for either.
+#   - a host with NO workflow-scoped credential at all still ends local-only, loudly (cause + a valid
+#     `refs/wip-local/<slug>` + exit 2). That is what SHIPS today and the alternatives are OPEN with the
+#     owner on #2292 — an off-box channel that keeps the snapshot whole (`git bundle` as a release
+#     asset), or item 4. ⛔ The one part that IS decided is that the snapshot stays WHOLE: excluding
+#     `.github/workflows/` into a side patch is a recorded refusal, so do not "fix" this case that way.
 #
 # Exit: 0 = nothing at risk, or rescued and pushed (prints the ref + sha)
 #       1 = the path is not the root of a git worktree
@@ -341,8 +360,8 @@ fi
 # A fine-grained PAT without `Workflows: write` is refused by github.com for ANY snapshot that touches
 # `.github/workflows/` — and the rescue then reported "push failed" and exited 2, i.e. the tool that
 # exists to survive a killed lane degraded to local-only for exactly the lanes whose work touches CI.
-# The osxkeychain credential carries `workflow` in its scopes, so ONE retry with that helper selected
-# publishes the same ref. Three properties this must keep:
+# A second credential that carries `workflow` in its scopes publishes the same ref on ONE retry. Three
+# properties this must keep:
 #   - the retry is gated on the REFUSAL, not on "the push failed": a network outage, an auth failure, a
 #     non-fast-forward or a hook rejection is NOT retried, because a blanket retry can turn a
 #     diagnosable failure into a green run and hide the cause;
@@ -356,16 +375,79 @@ fi
 WORKFLOW_SCOPE_RE='refusing to allow .*(create|update) workflow|without .?workflow.? scope'
 is_workflow_scope() { grep -qiE "$WORKFLOW_SCOPE_RE" "$1" 2>/dev/null; }
 
-# push_plain / push_keychain — the SAME refspec, the same bounds, the same no-force. The only difference
-# is which credential is consulted, so a retry can never publish something the first push would not.
+# push_plain / push_with_helper / push_unshadowed — the SAME refspec, the same bounds, the same
+# no-force. The only difference is WHICH CREDENTIAL is consulted, so a retry can never publish
+# something the first push would not.
 push_plain() {
   bounded 45 git -C "$WT" -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=20 \
     push -q origin "$C:refs/wip/$SLUG" 2>"$ERRF"
 }
-push_keychain() {
+push_with_helper() {  # push_with_helper <helper-name> — clear the configured helpers, then name ONE
   bounded 45 git -C "$WT" -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=20 \
-    -c credential.helper= -c credential.helper=osxkeychain \
+    -c credential.helper= -c credential.helper="$1" \
     push -q origin "$C:refs/wip/$SLUG" 2>"$ERRF"
+}
+# ⛔ THE STORED CREDENTIAL, WITH THE AMBIENT TOKEN OUT OF ITS WAY — the ONE retry that needs no new store
+# and works on every host. An ambient `GH_TOKEN`/`GITHUB_TOKEN` is consulted by git's configured helper
+# chain (gh's helper reads it FIRST, ahead of its own store), so a read-only or scope-less ambient token
+# SILENTLY wins over a stored credential that can push — measured on this fleet twice (#3483's shadowed
+# env var voiding a review, #3453's dispatcher resolving a read-only PAT) — and nothing in the push
+# output says which of the two was used. Removing those two variables for THIS INVOCATION ONLY lets the
+# configured helper answer from its store; it is not a config write, it is never a force, and it cannot
+# PUBLISH anything the first push would not (same repo, same refspec, same sha) — what it reaches is a
+# credential the first push never CONSULTED, which is the point. ⛔ THE PREDICATE IS "an ambient token is
+# SET", NOT "the configured helper READS it" (review round 3, P2). On a host whose helper is `store` or
+# `cache` — a common setup where `GH_TOKEN` is exported for the `gh` CLI rather than for git — the retry
+# removes a variable that helper never read, so it re-sends the SAME credential the remote just
+# refused. Detecting "does this helper consult the environment" is not something this script can know
+# cheaply, so the predicate stays what it is and the DECLARED RESIDUAL is that shape; the messages below
+# are worded for it ("if the configured helper reads them") rather than claiming a shadow that may not
+# exist — a false mechanism claim is worse than an imprecise one.
+push_unshadowed() {
+  bounded 45 env -u GH_TOKEN -u GITHUB_TOKEN \
+    git -C "$WT" -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=20 \
+    push -q origin "$C:refs/wip/$SLUG" 2>"$ERRF"
+}
+
+# ⛔ WHICH CREDENTIAL THE RETRY USES IS A PER-HOST FACT, NOT A CONSTANT (agent-infra#2292, follow-up).
+# The retry above is right and load-bearing; the CREDENTIAL it named was not. It hard-coded
+# `osxkeychain`, which exists only on macOS — so on a Linux cell (every cell in this fleet, and the
+# hosts a lane is most likely to be reaped on) that attempt could never succeed, and because
+# `-c credential.helper=` had already cleared the configured helper, the one path to an off-box
+# credential the box HAS was structurally closed. The candidates, first one that can be a DIFFERENT
+# credential from the one just refused wins:
+#   1. `BG_RESCUE_PUSH_HELPER=<name>` — the operator's explicit choice, for a store this script cannot
+#      guess (trusted exactly as the caller is: it reaches the shell git would run anyway);
+#   2. `BG_RESCUE_PUSH_UNSHADOW=1` — an explicit request for the STORED credential below, which is the
+#      only way to reach that candidate on macOS (where the platform default is unconditional). ⛔ IT
+#      REQUIRES AN AMBIENT TOKEN TO REMOVE: with none set the retry would be BYTE-IDENTICAL to the one
+#      that was just refused, so none is attempted (a reviewer measured exactly that — two identical
+#      argv lines, a message claiming a removal that never happened, 45 s spent in the second before a
+#      kill). A seam cannot buy a different credential out of nothing;
+#   3. `osxkeychain` on Darwin — the proven macOS credential, unchanged behaviour there;
+#   4. `unshadow` elsewhere, when an ambient token is actually set to remove;
+#   5. nothing — and then NO retry is attempted. A second attempt carrying the same credential cannot
+#      succeed, and in the second before a kill it costs 45 s to learn what the first attempt already
+#      said; the run reports "no second credential" instead, which is a different operator action from
+#      "the retry also failed" (that is what the `unclassified`/`NO USABLE CREDENTIAL HELPER` causes are
+#      for, and the message names the seam above rather than leaving the operator to guess).
+# ⛔ DECLARED RESIDUAL: on macOS the DEFAULT is `osxkeychain`, so a Mac whose configured helper is gh's
+# (ambient token shadowing a keychain-stored one) does not reach the unshadow candidate unless the
+# operator asks for it (`BG_RESCUE_PUSH_UNSHADOW=1`). That is deliberate — the keychain path is the one
+# measured there, and reordering a PROVEN macOS behaviour to cover a shape this fleet has not measured
+# on that platform is a worse trade — and it is reachable, which the previous text got wrong.
+RETRY_HELPER="${BG_RESCUE_PUSH_HELPER:-}"
+RETRY_UNSHADOW="${BG_RESCUE_PUSH_UNSHADOW:-0}"
+retry_credential() {  # echoes "helper <name>" | "unshadow" | "" (nothing that can differ)
+  if [ -n "$RETRY_HELPER" ]; then printf 'helper %s' "$RETRY_HELPER"; return 0; fi
+  # ⛔ THE SEAM IS CONDITIONAL ON A SHADOW EXISTING (review round 2, P2): asking to remove an ambient
+  # token that is not set selects the credential the first push already used — it cannot succeed, and
+  # the message would then be LYING about a removal that never happened. Same predicate as the platform
+  # default below: one rule, `unshadow` only when there is something to unshadow.
+  if [ "$RETRY_UNSHADOW" = "1" ] && [ -n "${GH_TOKEN:-}${GITHUB_TOKEN:-}" ]; then printf 'unshadow'; return 0; fi
+  if [ "$(uname -s 2>/dev/null)" = "Darwin" ]; then printf 'helper osxkeychain'; return 0; fi
+  if [ -n "${GH_TOKEN:-}${GITHUB_TOKEN:-}" ]; then printf 'unshadow'; return 0; fi
+  printf ''
 }
 
 # classify_push_failure <stderr-file> — ONE line naming WHY, because "the push failed" sent a diagnosis
@@ -388,30 +470,59 @@ classify_push_failure() {
   fi
 }
 
-RETRIED=0; PUSHED=0; FIRST_CAUSE=""; PUSH_TIMEOUTS=""
+RETRIED=0; PUSHED=0; FIRST_CAUSE=""; PUSH_TIMEOUTS=""; RETRY_GOT=""; NO_SECOND=0
 if push_plain; then
   PUSHED=1
 else
   [ "$BOUNDED_TIMEOUT" -eq 1 ] && PUSH_TIMEOUTS="the first push HIT ITS TIME BOUND and was cut off (the remote is stalled, not refusing)"
   FIRST_CAUSE="$(classify_push_failure "$ERRF")"
   if is_workflow_scope "$ERRF"; then
-    RETRIED=1
-    # ⛔ NO PROMPT: this runs in the second before a kill, so an absent keychain entry must FAIL rather
-    # than wait on a terminal nobody is watching. Exported once here — every later git call in this
-    # script is non-interactive too, so there is nothing to restore.
-    GIT_TERMINAL_PROMPT=0; export GIT_TERMINAL_PROMPT
-    echo "bg-rescue-wip: the push was refused for WORKFLOW SCOPE — retrying ONCE with the osxkeychain credential (no force, no config written)" >&2
-    if push_keychain; then
-      PUSHED=1
-    else
-      [ "$BOUNDED_TIMEOUT" -eq 1 ] && PUSH_TIMEOUTS="the keychain retry HIT ITS TIME BOUND and was cut off (the remote is stalled, not refusing)"
-    fi
+    RETRY_PLAN="$(retry_credential)"
+    case "$RETRY_PLAN" in
+      'helper '*)
+        RETRIED=1; RETRY_GOT="the ${RETRY_PLAN#helper } credential"
+        # ⛔ NO PROMPT: this runs in the second before a kill, so an absent store entry must FAIL rather
+        # than wait on a terminal nobody is watching. Exported once here — every later git call in this
+        # script is non-interactive too, so there is nothing to restore.
+        GIT_TERMINAL_PROMPT=0; export GIT_TERMINAL_PROMPT
+        echo "bg-rescue-wip: the push was refused for WORKFLOW SCOPE — retrying ONCE with the ${RETRY_PLAN#helper } credential (no force, no config written)" >&2
+        if push_with_helper "${RETRY_PLAN#helper }"; then
+          PUSHED=1
+        else
+          [ "$BOUNDED_TIMEOUT" -eq 1 ] && PUSH_TIMEOUTS="the ${RETRY_PLAN#helper } retry HIT ITS TIME BOUND and was cut off (the remote is stalled, not refusing)"
+        fi
+        ;;
+      'unshadow')
+        RETRIED=1; RETRY_GOT="the STORED credential (the ambient GH_TOKEN/GITHUB_TOKEN was removed for that attempt)"
+        GIT_TERMINAL_PROMPT=0; export GIT_TERMINAL_PROMPT
+        echo "bg-rescue-wip: the push was refused for WORKFLOW SCOPE — retrying ONCE with the STORED credential (GH_TOKEN/GITHUB_TOKEN removed from THIS attempt only, so if the configured helper reads them the stored credential can answer; no force, no config written)" >&2
+        if push_unshadowed; then
+          PUSHED=1
+        else
+          [ "$BOUNDED_TIMEOUT" -eq 1 ] && PUSH_TIMEOUTS="the stored-credential retry HIT ITS TIME BOUND and was cut off (the remote is stalled, not refusing)"
+        fi
+        ;;
+      *)
+        # ⛔ NO SECOND CREDENTIAL: attempting anyway would re-send the credential the remote just
+        # refused, which cannot succeed. The refusal is still reported in full below (cause + the
+        # remote's own first lines); what changes is that the operator is told the fleet has nothing
+        # else to try HERE, and how to supply something (#2292's remaining availability gap is this
+        # case, and it is an owner decision — accept the loud local-only outcome, or an off-box channel
+        # that keeps the snapshot whole. Do not narrow the snapshot instead: the whole-tree commit is
+        # what this tool guarantees.)
+        # ⛔ AND THE ADVICE NAMES ONLY THE HELPER SEAM (review round 2, P2). `BG_RESCUE_PUSH_UNSHADOW=1`
+        # cannot help on the shape that reaches this line — it is reached precisely when there is NO
+        # ambient token to unshadow, and the seam is conditional on one existing — so recommending it
+        # would send the operator after a guaranteed-useless 45 s retry, the outcome this gate avoids.
+        NO_SECOND=1
+        ;;
+    esac
   fi
 fi
 
 if [ "$PUSHED" -eq 1 ]; then
   if [ "$RETRIED" -eq 1 ]; then
-    echo "bg-rescue-wip: rescued $BR → origin refs/wip/$SLUG ($C) — pushed with the OSXKEYCHAIN credential after the configured one was refused for workflow scope"
+    echo "bg-rescue-wip: rescued $BR → origin refs/wip/$SLUG ($C) — pushed with $RETRY_GOT after the configured one was refused for workflow scope"
   else
     echo "bg-rescue-wip: rescued $BR → origin refs/wip/$SLUG ($C)"
   fi
@@ -440,7 +551,15 @@ PUSH_ERR="$(cat "$ERRF" 2>/dev/null)"
 # allowed to overwrite why the work could not leave in the first place.
 WHY=("$FIRST_CAUSE")
 if [ "$RETRIED" -eq 1 ]; then
-  WHY+=("retried ONCE with the osxkeychain credential — it ALSO failed: $(classify_push_failure "$ERRF")")
+  WHY+=("retried ONCE with $RETRY_GOT — it ALSO failed: $(classify_push_failure "$ERRF")")
+fi
+if [ "$NO_SECOND" -eq 1 ]; then
+  # ⛔ "THE PUSH FAILED" AND "THIS HOST HAS NOTHING ELSE TO TRY" ARE DIFFERENT OPERATOR ACTIONS
+  # (agent-infra#2292). Without this line the run looks like a credential that was rejected; with it,
+  # the reader knows the rescue had no second credential to select on $(uname -s 2>/dev/null) and that
+  # the fix is to supply one. The retry was deliberately NOT attempted — re-sending the same credential
+  # cannot succeed, and it is the one attempt that would turn a named cause into a timeout.
+  WHY+=("no second credential was tried: on $(uname -s 2>/dev/null), the retry would have re-sent the SAME credential (no ambient GH_TOKEN/GITHUB_TOKEN to unshadow, and no osxkeychain). Supply a workflow-scoped one with BG_RESCUE_PUSH_HELPER=<helper-name>.")
 fi
 
 if [ "$LOCAL_OK" -eq 1 ]; then

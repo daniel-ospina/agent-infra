@@ -296,13 +296,14 @@ if [ "${REV_PAID:-0}" = "1" ]; then
   # ⛔ THE WRITE IS BOUNDED LIKE THE READ — the clamp sits AFTER the whole `if`/`else` so it covers
   # BOTH branches (round 7 review, P2: it was first put inside this branch, so the NON-`REV_PAID`
   # branch — every `chain-<N>` / `fix-one` review, the majority path — still wrote an unbounded
-  # `_rr_prev + 1`, and a book at 999999999 made the next run write 1000000000). ⛔ THIS PARAGRAPH USED
-  # TO SAY that both readers "coerce to 0 and the ceiling RESETS", WHICH IS FALSE AT THE SHIPPED CODE
-  # (round-17 review, P3): both readers clamp a >9-digit book to 999999999 — EXHAUSTED, not reset — and
-  # any book at or above `max` is refused at the ceiling check before either spend site can run, so a
-  # 10-digit value can never be written in the first place. The clamp stays as canonicalisation at the
-  # writer's own bound; the reason is overflow hardening, NOT a reset it was preventing. See the clamp
-  # below the `fi`.
+  # `_rr_prev + 1`). ⛔ THIS PARAGRAPH USED TO SAY that both readers "coerce to 0 and the ceiling
+  # RESETS", WHICH IS FALSE AT THE SHIPPED CODE (round-17 review, P3): both readers clamp a >9-digit
+  # book to 999999999 — EXHAUSTED, not reset. ⛔ AND IT USED TO FOLLOW THAT WITH an inference ("so a
+  # 10-digit value can never be written"), which is FALSE AS AN INFERENCE, corrected in the same round
+  # that wrote it (fresh review of #3441, P3): the ceiling check runs ONCE, before the spend, and the
+  # spend re-reads the book — so the guarantee that the book stays 9 digits is the IN-SPEND clamp in
+  # `review_round_spend`, not the ceiling check. What this top-of-file clamp guarantees is narrower and
+  # stated at its own line below. See the two clamp notes there.
   # ⛔ `0` IS UNKNOWN, NOT ROUND ZERO (round 4 review, P3). `brief-gate.sh`'s `brief_gate_round_norm`
   # maps an unreadable round to 0, and its comparable mandate is skipped at 0 — so this file must
   # treat 0 the same way or the two halves of one feature disagree about the same value. It did: a
@@ -331,19 +332,35 @@ fi
 # ⛔ THE WRITTEN VALUE IS BOUNDED LIKE THE READ ONE, FOR BOTH BRANCHES (round 7 review, P2).
 # `_rr_prev` is bounded to 9 digits when READ (`_rr_read_book`, above), but nothing bounded what was
 # WRITTEN. A book at 999999999 (set in ONE run by `REV_PAID=1 REV_ROUND=999999999` — the very caller
-# the floor defends against) would make the NEXT ordinary review write 1000000000, TEN digits.
+# the floor defends against) would make a LATER SPEND write 1000000000, TEN digits.
 # ⛔ WHAT THAT WOULD DO, AND WHAT IT WOULD NOT (fresh review of #3441, P3 — THIS PARAGRAPH USED TO BE
 # FALSE, in the very section whose earlier copy was corrected; the correction sat 30 lines above the
 # surviving falsehood, which is the trap `AGENTS.md` §Finding Verification names: a marker steers a
 # reader away from re-checking the sentence it did not fix). It said the 10-digit value "both this
 # reader and `orch-loop.sh`'s `review_round_read` coerce to 0 — so THE PER-PR CEILING RESETS and every
 # later review is free". NEITHER READER COERCES TO 0: both clamp anything over 9 digits to 999999999,
-# i.e. EXHAUSTED, so the ceiling cannot be reset by a long book at all. And the 10-digit write is
-# UNREACHABLE anyway — `_rr_ceiling_hit` refuses at `book >= max` above, before either spend site can
-# run, so a book already at 999999999 parks the PR instead of spending on top of it. The clamp stays as
-# what it is: CANONICALISATION at the writer's own bound (overflow hardening, and the one place that
-# guarantees the book is always a 9-digit numeral), NOT a reset it was preventing. The `_rr_read_book`
-# sibling note asserts the same thing at the reader.
+# i.e. EXHAUSTED, so the ceiling cannot be reset by a long book at all.
+# ⛔ AND A SECOND CORRECTION, BECAUSE THE FIX FOR THE FIRST ONE OVERCLAIMED (fresh review of #3441, P3,
+# MEASURED). The previous version of this paragraph said the 10-digit write is "UNREACHABLE anyway —
+# `_rr_ceiling_hit` refuses at `book >= max` above, before either spend site can run". THAT IS FALSE FOR
+# THE SPEND SITES OF THE RUN THE CEILING **ALREADY ALLOWED**: the check reads the book once, near the
+# top, and both spend sites run after it — the ingress spend below `run_agent`, and the EXIT recorder,
+# which can fire up to `REVIEW_TIMEOUT` later. The write re-reads the book at that moment (the floor
+# re-derivation above), so a book that advanced past 9 digits WHILE the review was running hands the
+# clamp a 10-digit candidate. Measured on a copy: seed the book at 8 so `_rr_ceiling_hit 8 10` ALLOWS
+# the review, advance the book to 999999999 during it, then spend — shipped (clamp present) leaves
+# 999999999, and with this line deleted the book becomes 1000000000. What is genuinely unreachable is
+# only the NEXT RUN's spend: that run's ceiling check refuses at `book >= max` before it can spend.
+# ⛔ SO THE CLAMP BELOW IS **CANONICALISATION**, AND SAYING WHICH ONE IS WHICH IS THE POINT (fresh
+# review of #3441, P3). The WRITER's in-spend clamp is the reachable, load-bearing one (see the note at
+# the spend's re-derivation: a book that moved past 9 digits DURING an already-allowed review). This
+# top-of-file one keeps the value ASSIGNED HERE a 9-digit numeral, and what it guarantees is exactly
+# that assignment — it does NOT make a 10-digit write impossible (the spend's own clamp does, in
+# `review_round_spend` below). ⛔ IT ALSO RESTS ON AN UNSTATED INVARIANT (fresh review of #3441, P3): the
+# `book >= max` refusal below only bounds this value if the book is never LOWERED (or removed, which
+# `_rr_read_book` reads as round 0 = a free budget) between the read above and the ceiling check. The
+# shipped clearers target dead or converged PRs and no path was found that lowers a LIVE PR's book in
+# that window, so the invariant holds today and is named here rather than assumed.
 if [ "${#REVIEW_ROUND}" -gt 9 ]; then REVIEW_ROUND=999999999; fi
 
 # ⛔ THE ONE WRITE, DEFINED **HERE** — BEFORE `run_agent` AND BEFORE THE TRAP (round 10 review, P1).
@@ -390,6 +407,14 @@ review_round_spend() {
   _rr_prev_now="$(_rr_read_book)"
   if [ "$_rr_prev_now" -ge "$REVIEW_ROUND" ]; then
     REVIEW_ROUND=$(( _rr_prev_now + 1 ))
+    # ⛔ THIS CLAMP IS LOAD-BEARING AND REACHABLE, NOT CANONICALISATION (fresh review of #3441, P3,
+    # MEASURED) — unlike the top-of-file one ABOVE, which bounds only the value assigned there. The book
+    # is re-read HERE, after `_rr_ceiling_hit` has already ALLOWED this review, so a book that reached
+    # 999999999 while the reviewer ran makes `+ 1` a TEN-digit value. Measured on a copy: book at
+    # 999999999, round in hand 5 — shipped leaves 999999999; with this line deleted the book becomes
+    # 1000000000. Nothing unsafe ships either way (both readers coerce a long book to 999999999), but
+    # the writer would emit a numeral its own readers must launder, so the clamp is what keeps
+    # "the book is always a 9-digit numeral" an invariant rather than a hope. `(c4o)` drives it.
     [ "${#REVIEW_ROUND}" -gt 9 ] && REVIEW_ROUND=999999999
   fi
   # ⛔ THE WRITE IS ATOMIC — A SIBLING, THEN A RENAME (fresh review of #3441, P2: a TORN book PARKS a
@@ -1926,6 +1951,29 @@ if [ "${AGENT_STARTED:-0}" = "1" ] && { [ "$AGENT_RC" = "${PI_FORK_REFUSED:-78}"
   echo "[merge $PR] reviewer NOT started (spawn point FORK floor, rc 78 — this box is out of PROCESSES, so waiting for load will not help) — no verdict, NO marker, and NO review round spent; re-dispatched when the box drains (agent-infra#2293)" >> "$L.log"
   exit 75
 fi
+# ⛔ AND THE SPAWN POINT'S MEMORY REFUSAL IS THE SAME CLASS, WITH ITS OWN CODE (agent-infra#2387).
+# This file's `run_agent` is its OWN copy (the header's named residual), so the installed `pi` shim
+# is the ONLY memory gate on this path — and it now refuses for memory as well as load (rc=84 vs 76).
+# Without this arm a memory refusal falls through to the verdict extractor below, which finds an empty
+# `LAST` and records NO-VERDICT: that spends one of the bounded MAX_REVIEW_TRIES per refusal and, at 3,
+# PARKS the PR "for a human" with a reason about the reviewer's output format — for a reviewer that
+# was never started. That is exactly the #1716/#1720 class the 76 arm above exists to prevent, and it
+# is reachable on precisely the box state #2387 is about. 81 is AGENT_MEM_REFUSED; the tolerant
+# defaults survive a `$O` seeded file-by-file from an older helper (which can never return 84/81).
+# The marker is withheld for the same reason as above, and the remedy is NOT "wait for load".
+# ⛔ AND BOTH FLAGS GO BACK TO 0, FOR THE REASON THE 76 AND 78 ARMS ABOVE GIVE (#3441, same defect one
+# code over): a memory refusal is NOT a reviewer run, so leaving `AGENT_STARTED=1` and `REV_STARTED=1`
+# lets the EXIT trap's `review_round_spend_at_exit` BANK a review round for a reviewer that never
+# started. Ten of those on a box below its memory floor burn MAX_REVIEW=10 with ZERO reviews and then
+# park the PR with a `REVIEW-CEILING` reason asserting a diagnosis nobody made — the false diagnosis
+# manufactured by capacity that #3441 exists to remove. Reachable here because the `AGENT_STARTED` gate
+# for the round spend sits BELOW this arm.
+if [ "$AGENT_RC" = "${PI_GATE_MEM_REFUSED:-84}" ]; then
+  AGENT_STARTED=0
+  REV_STARTED=0
+  echo "[merge $PR] reviewer NOT started (pi spawn-point MEMORY gate) — no verdict, NO marker written (a needsreview marker would spend one of MAX_REVIEW_TRIES for a review that never started, and three of those park the PR); re-dispatched when resident lanes finish and release their working set — this does NOT clear by waiting for load, the [pi-gate] line carries the reading and the floor; no review round spent" >> "$L.log"
+  exit "${AGENT_MEM_REFUSED:-81}"
+fi
 # ⛔ THE BRIEF REFUSAL IS ITS OWN ARM (#2258), and it must NOT reach the verdict classifier. The
 # reviewer's brief is GENERATED by this file, so a refusal here means the splice lost the research
 # block or `brief-gate.sh` drifted — a HARNESS defect. Classified as a verdict-less review it would be
@@ -1939,6 +1987,29 @@ if [ "$AGENT_RC" = "${AGENT_BRIEF_REFUSED:-80}" ]; then
   echo "[merge $PR] reviewer NOT started (BRIEF gate) — no verdict, NO needsfix marker; the reviewer brief failed brief-gate.sh, which is a harness defect: fix the brief's build, not the PR" >> "$L.log"
   echo "[merge $PR] brief refused (harness defect) — no reviewer started; see $L.log" >&2
   exit 80
+fi
+# ⛔ THE SYNC REFUSAL IS ITS OWN ARM (agent-infra#2293 follow-up), and without it this file turns a
+# helper-deploy fault into a REVIEW VERDICT. The spawn point exits `AGENT_HARNESS_SKEW_REFUSED` (83) when
+# ITS copy of `spawn-gate.sh` cannot resolve `capacity.sh` at all; that code matched neither the 76 arm
+# nor the 80 arm above, so the refusal fell through to the verdict extractor, produced an EMPTY verdict,
+# and wrote `needsreview-<PR>-<head>` — spending one of MAX_REVIEW_TRIES per refusal for a review
+# that never started, and PARKING the PR once the budget ran out. That is the #1716/#1720 class this
+# file's own load-gate arm exists to prevent, and no marker may be written for it: no reviewer ran.
+# ⛔ IT IS 83, NOT 81 (this branch was merged onto `#3237`): 81 belongs to `AGENT_MEM_REFUSED` (#2387),
+# the caller-facing memory gate — the arm two blocks up exits it — and a reader default of 81 under the
+# skew name would relabel every sync refusal as that gate. The collision `#3237` moved the harness code
+# off 81 to end. The default must equal the declaration, or `spawn-gate.test.sh`'s guard (g) REDS the
+# tree.
+# ⛔ AND IT CLEARS `AGENT_STARTED` AS WELL AS `REV_STARTED` (merge resolution against `#3441`): the EXIT
+# hook `review_round_spend_at_exit` fires only when BOTH are 1, and `run_agent` sets `AGENT_STARTED=1`
+# before `pi` launches. Clearing only `REV_STARTED` would spend a review round on a helper-deploy
+# fault — the exact defect `#3441` fixed for 76/78/127, reintroduced one code over. No reviewer ran.
+if [ "$AGENT_RC" = "${AGENT_HARNESS_SKEW_REFUSED:-83}" ]; then
+  REV_STARTED=0
+  AGENT_STARTED=0
+  echo "[merge $PR] reviewer NOT started (HELPER/SYNC gate: capacity.sh not resolvable from the spawn gate) — no verdict, NO marker written; this is not a property of this PR or this box: sync the helper pair with a VERIFIED redeploy (bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o \$O) wherever reviewers run, then re-dispatch. Do NOT dispatch the PR elsewhere: every box with these files refuses identically" >> "$L.log"
+  echo "[merge $PR] reviewer NOT started (helper/sync refusal) — no verdict, no marker; see $L.log" >&2
+  exit "$AGENT_HARNESS_SKEW_REFUSED"
 fi
 # ⛔ THE ROUND IS SPENT **HERE**, AND THIS FILE IS ITS ONLY WRITER (#3441). It sits BELOW every
 # refusal arm above, because those are the arms whose own words are "no reviewer ran":
@@ -1955,6 +2026,12 @@ fi
 #     below for uniformity and so the invariant is one rule, not two.
 #   * `exit 75` / `exit 127` — the SPAWN POINT's fork floor (incoming 78) and "no identifiable pi"
 #     (127). Added by the round-7 review; the bullets above miscounted the arms until round 8.
+#   * `exit 81` — the SPAWN POINT's MEMORY gate refused (incoming 84). Added by #2387 when it was
+#     re-applied onto #3441; it is above the spend for the same reason as the rest, and it clears
+#     BOTH flags so the EXIT recorder stays inert and no round is banked for a reviewer that never ran.
+#   * `exit 83` — the SPAWN POINT's helper/sync floor (`AGENT_HARNESS_SKEW_REFUSED`): the spawn
+#     gate could not resolve `capacity.sh`, so the reviewer never started. Named by the sync arm
+#     above, and it clears BOTH flags for the same reason the memory arm does.
 # And it is below `run_agent` for the reasons the two earlier rounds established: not at the top of the
 # file (a rail merge, a claim race and a duplicate invocation all exit before any review, so the
 # counter counted MERGE ATTEMPTS), and not just above `run_agent` (which would pay before it knows a

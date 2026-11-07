@@ -328,7 +328,7 @@ function fail(msg) { print "❌ " msg > "/dev/stderr"; exit 2 }
 # quoted `)` re-opened, so the stripper believed it was inside code from line 723 onward — every
 # COMMENT past that point was read as a command (`timeout` in prose reported as a trap) and every
 # quote stopped bounding anything. The sibling detector records the same class for the same reason
-# (scripts/check-false-pass-shapes.sh:663).
+# (scripts/check-false-pass-shapes.sh:672).
 #   ST     the context stack, last char = current: S single-quote, D double-quote, C `$(`, K
 #          backtick, B `${`.
 #   SN[d]  1 when the span opened at stack depth d had literal content (the `@@` marker above).
@@ -359,7 +359,7 @@ function strip_code(line,   i, n, c, out, prev, d, top, ansi) {
       # trailing quote RE-OPENS one, and every later line of the file is read as DATA — no findings, a
       # GREEN gate, and `--emit-baseline` then mints the `context-unbalanced` row that makes the loss
       # permanent. The sibling detector models this as its own mode for the same reason
-      # (scripts/check-false-pass-shapes.sh:427).
+      # (scripts/check-false-pass-shapes.sh:436).
       if (AC[d]) {
         if (c == "\\") { SN[d] = 1; i++; continue }
         if (c == SQ) { if (SN[d]) out = out "@@"; out = out SQ; st_pop(); continue }
@@ -715,7 +715,7 @@ function heredoc_open(line,   i, n, c, q, j, marker, arith, test, hdm) {
     # measured on `scripts/orchestrator-harness/test-claims.sh:226`, where `n=$(( (RANDOM << 15 | …) ))`
     # made the whole 500+ line suite report `heredoc-unterminated` and go unscanned past line 226.
     # The sibling detector refuses the opener in these same two contexts and states the reason
-    # (scripts/check-false-pass-shapes.sh:676, `$(( 1 << n ))` opened a heredoc whose delimiter was `n`).
+    # (scripts/check-false-pass-shapes.sh:685, `$(( 1 << n ))` opened a heredoc whose delimiter was `n`).
     if (arith > 0) {
       if (c == ")" && substr(line, i + 1, 1) == ")" && arith == 1) { arith = 0; i++; continue }
       if (c == ")" && arith > 1) { arith--; continue }
