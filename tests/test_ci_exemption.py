@@ -1224,6 +1224,38 @@ def test_a_LEGACY_TAB_FREE_rotation_line_cannot_license_a_spacey_EXEMPT():
     assert [v.nodeid for v in allowed.exempt] == [moved], allowed.report()
 
 
+def test_the_COMPOSED_path_from_text_to_decide_refuses_a_spacey_id():
+    """⛔ THE FORM IS DERIVED, so the obvious composition cannot drop it.
+
+    #3686 review cycle 7, P2. `rotation_legacy` defaults to False — the PERMISSIVE
+    value — so a caller who writes the natural
+    ``decide(pr, main, rotating=detect_rotating_identity(parse_rotation_runs(text)))``
+    silently restores the cycle-6 fail-open, with a green suite. Passing the parsed
+    ``RotationRuns`` instead makes the form un-droppable: the object that knows the
+    form is the object that supplies it. This pins the composition a NEW caller would
+    write, not just `_cmd_decide`'s plumbing.
+
+    MUTATION: ignore `rotation=` in `decide` (back to flags only) → this id is
+    EXEMPTED and the first assertion reddens.
+    """
+    moved = "tests/test_x.py::TestK::test_a[argv14-at the EDGE]"
+    sig = "sg-3686-composed"
+    main = parse_rates(f"{moved}\t3\t26\n")
+    pr = parse_failure_rows(f"{moved}\t3\t26\t{sig}\n").failures
+
+    decision = decide(
+        pr, main.rates,
+        main_signatures={moved: frozenset({sig})},
+        rotation=parse_rotation_runs("tests/other.py::test_y\n"),  # tab-free
+        k_pr=26,
+    )
+    assert [v.nodeid for v in decision.exempt] == [], (
+        "composing `parse_rotation_runs` into `decide` via `rotation=` did not carry "
+        f"the TAB-FREE form, so a moving identity was EXEMPTED:\n{decision.report()}"
+    )
+    assert [v.nodeid for v in decision.unattributable] == [moved], decision.report()
+
+
 def test_the_ROTATION_reader_still_accepts_the_PRE_3686_space_joined_form():
     """The tab-free PARSE must keep working — the FORM is now reported too.
 

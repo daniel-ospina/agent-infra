@@ -748,6 +748,7 @@ def decide(
     *,
     main_signatures: dict[str, frozenset[str]] | None = None,
     rotating: dict[str, frozenset[str]] | None = None,
+    rotation: "RotationRuns | None" = None,
     k_pr: int | None = None,
     rotation_legacy: bool = False,
 
@@ -840,6 +841,16 @@ def decide(
       ``max(row.runs)`` over the PR table (the producer emits one uniform K per
       file), so this second use of ``min_runs`` is caller-declared and table-wide,
       UNLIKE the per-id MAIN floor above.
+    * an id carrying WHITESPACE while ANY per-run line arrived in the TAB-FREE
+      (pre-#3686) form -> **UNATTRIBUTABLE** (#3686 review cycle 6). That form
+      cannot represent a space — the split shreds it — so E5 is structurally blind
+      to such an id; exempting it would be a silent EXEMPT for an identity that may
+      have MOVED, and the pre-#3686 code BLOCKED it. Pass ``rotation=`` (the parsed
+      ``RotationRuns``) rather than ``rotating=`` and this is DERIVED for you;
+      passing ``rotating=`` alone means ``rotation_legacy`` defaults to False, which
+      is the FAIL-OPEN value, so a caller doing that on tab-free evidence re-opens
+      the class (measured — see
+      ``test_the_COMPOSED_path_from_text_to_decide_refuses_a_spacey_id``).
     * PR rate materially above main's -> **BLOCK** (the PR made it worse).
     * PR failure is TOTAL (every observed run failed) while main's measured rate is
       NOT total -> **BLOCK** (a deterministic failure is not a rate fluctuation, and
@@ -859,6 +870,18 @@ def decide(
     """
     decision = Decision()
     sig_main = main_signatures or {}
+
+    # ⛔ THE EVIDENCE FORM IS DERIVED, NOT TRUSTED TO THE CALLER (#3686 review cycle 7,
+    # P2). `rotation_legacy` defaults to False — the PERMISSIVE value — so a caller
+    # that passes `rotating=` (or composes `detect_rotating_identity(parse_rotation_runs(
+    # text))` by hand, which is the obvious thing to write) silently restores the
+    # cycle-6 fail-open. Accepting the parsed `RotationRuns` makes the form
+    # un-droppable at the boundary: the object that knows the form is the object that
+    # supplies it. The explicit flags stay for callers that already have the pieces.
+    if rotation is not None:
+        if rotating is None:
+            rotating = detect_rotating_identity(rotation)
+        rotation_legacy = rotation_legacy or rotation.has_legacy_lines
 
     # The floor is PER-ID and has NO table-wide form (review cycle 2). A table-max
     # derivation has no legitimate use: the question is always "does THIS id's row
@@ -3092,19 +3115,18 @@ def _cmd_decide(args: argparse.Namespace) -> int:
         else {}
     )
     rotation = parse_rotation_runs(_read(args.rotation)) if args.rotation else None
-    rotating = detect_rotating_identity(rotation) if rotation is not None else {}
 
     decision = decide(
         pr.failures,
         main.rates,
         main_signatures=main_sigs,
-        rotating=rotating,
+        # ⛔ THE PARSED EVIDENCE, not `rotating=` + a separate flag: `decide` derives
+        # BOTH the rotating map and the TAB-FREE arm from it, so the form cannot be
+        # dropped in transit (#3686 review cycle 7).
+        rotation=rotation,
         k_pr=max((f.rate.runs for f in pr.failures.values()), default=None),
         rate_tolerance=args.rate_tolerance,
         min_runs=args.min_runs,
-        # #3686 review cycle 6: a TAB-FREE line cannot represent a spacey id, so
-        # E5 cannot see one. Decide refuses to exempt those on such evidence.
-        rotation_legacy=bool(rotation is not None and rotation.has_legacy_lines),
     )
 
     lines = [v.line for v in decision.blocked]
