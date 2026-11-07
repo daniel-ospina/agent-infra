@@ -501,9 +501,9 @@ new_scen() {
   SCEN_REGISTRY_SYNC=
   unset mb_seq 2>/dev/null || true
   rm -f "$SCEN/state-seq" "$SCEN/state-count" 2>/dev/null || true
-  # #1845: the guard's evidence files are per scenario. A stale sentinel would make a
-  # watchdog report 124 for a rail that stopped by itself (a false red, and the wrong
-  # reason for it).
+  # #1845: the guard's evidence files are cleared per scenario. `run_rail_watchdog` already
+  # clears both at entry, so this is belt-and-braces; a stale sentinel would make a watchdog
+  # report 124 for a rail that stopped by itself.
   rm -f "$SCEN/wd-fired" "$SCEN/wd-fired.report" "$SCEN/guard-fired" "$SCEN/victim-pid" 2>/dev/null || true
   # #1565 fixtures: absent by default, i.e. UNREADABLE protection (the fail-closed
   # default) so every pre-existing scenario keeps refreshing exactly as before.
@@ -740,6 +740,11 @@ run_rail_watchdog() { # <limit-secs> <extra args...>
     # nothing left to bound it: the hang this arm exists to prevent.
     if is_running "$pid"; then
       reap_pid "$pid" "$ident" || return 125
+      # ⛔ AND NEVER `wait` ON A LIVE PID WITH NOTHING LEFT TO BOUND IT. `reap_pid` answers 0
+      # for "gone" AND for "provably NOT ours", so its success is not on its own a licence
+      # to block; this belt is what makes the arm safe even if the identity logic is wrong
+      # again (#3622 review round 3, P2).
+      if is_running "$pid"; then return 125; fi
     fi
     wait "$pid" 2>/dev/null || true
     return 125
@@ -766,6 +771,7 @@ run_rail_watchdog() { # <limit-secs> <extra args...>
   if is_running "$pid"; then
     echo "❌ rail-guard.sh exited without reaping, but pid $pid is STILL RUNNING — it lost the process and the bound with it" >&2
     reap_pid "$pid" "$ident" || return 125
+    if is_running "$pid"; then return 125; fi   # never wait on a live pid with no bound left
     wait "$pid" 2>/dev/null || true
     return 125
   fi
