@@ -813,6 +813,63 @@ _pin_next() {  # $1 = anchor ERE, $2 = the ERE its next STATEMENT must match, $3
     || bad "$3 (found: '${_nx:-MISSING}')"
 }
 
+# ⛔ THE rc-2 DISCRIMINATOR IS PART OF THE GATE (review round 13, P2, measured): the block that publishes
+# `review-found-issues` (rc=7) or `review-record-unbound` (rc=0/5, a clean record whose body marker is missing)
+# is reached by BOTH states, and one line decides which text a head gets. Nothing pinned that line or the
+# pairing of branches to publishes, so `= issues` -> `= clean` (bodies left in place), `!= issues`, exchanging
+# the two bodies, moving the publish INTO the `issues` branch, or hoisting it ABOVE the discriminator all left
+# the suite green — an rc=7 head told "a record EXISTS" when none does, and a clean-but-unbound head told
+# nothing at all (the #3489 invisibility). Both markers are presence-keyed, so the wrong one is the operator's
+# only visible surface and nothing later supersedes it.
+# ⛔ PIN THE BLOCK'S ORDER, NOT A COUNT OF LINES IN THE FILE: relocation keeps an any-occurrence count at 1, so
+# the four statements are pinned as a SEQUENCE inside the extracted rc-2 block.
+# (The `if` anchor tolerates a trailing comment — a comment is not a behaviour change, and an anchor that dies
+# on one reports a "decoy duplicate" that does not exist.)
+_RSTISSUESRE='^[[:space:]]*if \[ "\$_rstate" = issues \]; then([[:space:]]*#.*)?$'
+_rc2=$(sed -n '/^[[:space:]]*if \[ "\$_ract" -eq 2 \]; then$/,/^[[:space:]]*fi$/p' "$SUT")
+[ -n "$_rc2" ] \
+  || bad "the rc-2 window must exist as its own block ('if [ \"\$_ract\" -eq 2 ]; then' … 'fi') — without it the two rc-2 states have no owner"
+[ "$(printf '%s\n' "$_rc2" | grep -cE "$_RSTISSUESRE")" = 1 ] \
+  || bad "the rc-2 discriminator must appear exactly ONCE inside the rc-2 block ('if [ \"\$_rstate\" = issues ]; then') — a swapped ('= clean'), inverted ('!= issues') or duplicated discriminator makes the two rc-2 states publish each other's text, and both markers are presence-keyed so nothing later corrects it"
+_rc2_fi=$(printf '%s\n' "$_rc2" | grep -nE '^[[:space:]]*publish_review_state "\$repo" "\$pr" review-found-issues "\$head"$' | head -1 | cut -d: -f1)
+_rc2_ru=$(printf '%s\n' "$_rc2" | grep -nE '^[[:space:]]*publish_review_state "\$repo" "\$pr" review-record-unbound "\$head"$' | head -1 | cut -d: -f1)
+_rc2_el=$(printf '%s\n' "$_rc2" | grep -nE '^[[:space:]]*else$' | head -1 | cut -d: -f1)
+_rc2_dis=$(printf '%s\n' "$_rc2" | grep -nE "$_RSTISSUESRE" | head -1 | cut -d: -f1)
+# ⛔ AND THE DISCRIMINATOR MUST BE THE BLOCK'S FIRST STATEMENT (review round 13 verification, category A,
+# measured): inserting `continue` (or `return`) on the line after `if [ "$_ract" -eq 2 ]; then` kept every
+# other arm green while BOTH rc-2 states published NOTHING — the rc=7 head lost its findings notice and the
+# clean-but-unbound head lost the recorder remedy, permanently, since the key never changes without a new
+# head. A successor pin protects a statement; only a FIRST-statement pin protects entry into the block.
+_rc2_first=$(printf '%s\n' "$_rc2" | awk '
+  flag && $0 !~ /^[[:space:]]*(#|$)/ { print; exit }
+  !flag && /^[[:space:]]*if \[ "\$_ract" -eq 2 \]; then$/ { flag=1 }
+')
+grep -qE "$_RSTISSUESRE" <<<"${_rc2_first:-}" \
+  || bad "the rc-2 block must ENTER at its discriminator (first statement found: '${_rc2_first:-MISSING}') — a continue/return or a guard inserted before it silences BOTH rc-2 states at once (the review's findings notice and the recorder remedy), with every other arm green"
+[ -n "$_rc2_fi" ] && [ -n "$_rc2_ru" ] && [ -n "$_rc2_el" ] && [ -n "$_rc2_dis" ] \
+  || bad "the rc-2 block must contain ALL FOUR statements — the discriminator, an 'else', and one publish per branch (found discriminator=${_rc2_dis:-MISSING} else=${_rc2_el:-MISSING} issues-publish=${_rc2_fi:-MISSING} unbound-publish=${_rc2_ru:-MISSING}); a missing publish leaves that state invisible and a missing 'else' leaves it unreachable"
+# ⛔ GUARDED, OR THE FAIL PATH PRINTS BASH NOISE (review round 13 verification): `bad` only sets `fail=1`, so
+# execution continues; comparing an EMPTY value made `[: : integer expression expected` appear on the
+# operator's log beside the real failure. Every operand is defaulted before it is compared.
+: "${_rc2_dis:=0}" "${_rc2_fi:=0}" "${_rc2_el:=0}" "${_rc2_ru:=0}"
+[ "$_rc2_dis" -lt "$_rc2_fi" ] && [ "$_rc2_fi" -lt "$_rc2_el" ] && [ "$_rc2_el" -lt "$_rc2_ru" ] \
+  || bad "in the rc-2 block the ORDER must be discriminator -> review-found-issues publish -> else -> review-record-unbound publish (found discrimin=${_rc2_dis:-?} issues=${_rc2_fi:-?} else=${_rc2_el:-?} unbound=${_rc2_ru:-?}) — moving either publish into the other branch, or hoisting one above the discriminator, publishes a state the loop did not measure (a record claimed where none exists, or a clean-but-unbound head told its review found blocking issues)"
+# ⛔ AND THE `else` BRANCH IS PINNED BY EXECUTION TOO (review round 13 verification, P3, measured): position
+# plus an any-occurrence count left the symmetric hole — wrapping the publish in `if false; then` keeps its
+# line number and its single occurrence while making it DEAD, so a clean-but-unbound head publishes nothing at
+# all and nothing later supersedes that (the #3489 invisibility, made permanent). The `issues` branch was
+# already pinned this way one line above; this is the same shape for the other branch.
+_rc2_elsenext=$(printf '%s\n' "$_rc2" | awk '
+  flag && $0 !~ /^[[:space:]]*(#|$)/ { print; exit }
+  !flag && /^[[:space:]]*else$/ { flag=1 }
+')
+grep -qE '^[[:space:]]*publish_review_state "\$repo" "\$pr" review-record-unbound "\$head"$' <<<"${_rc2_elsenext:-}" \
+  || bad "the 'else' branch must publish review-record-unbound as its FIRST statement (found: '${_rc2_elsenext:-MISSING}') — a guard in front of it turns the publish dead while keeping its position and its single occurrence, and a clean-but-unbound head then publishes nothing at all"
+_pin_next "$_RSTISSUESRE" '^[[:space:]]*publish_review_state "\$repo" "\$pr" review-found-issues "\$head"$' \
+  "the 'issues' branch must publish review-found-issues (head-bound, no record basis) as its FIRST statement — a comment or a continue statement in between leaves the state unpublishable"
+_pin_once '^[[:space:]]*publish_review_state "\$repo" "\$pr" review-record-unbound "\$head"$' \
+  "review-record-unbound must be published exactly once — the recorder remedy is the only thing that makes a clean-but-unbound head visible, and #3489 is exactly the PR that looked like nobody had looked at it"
+
 # ── STATE 1 — ATTESTED AT HEAD: the rail runs, no reviewer is dispatched ──────────────────────────
 # (Pinned where the decision is MADE, in the search arms above: `green 7 at-head`.) What this arm adds
 # ⛔ THE END ANCHOR IS THE BRANCH'S OWN STRUCTURAL CLOSE, NOT A COMMENT (review, P3). The previous end
