@@ -550,19 +550,59 @@ farm_source_dir() { # <array-name> -> the repo dir its entries are read from
 # and the one the delivery ladder needs. Read BY NAME from `FARM_ARRAYS` (see `delivered_flat`), so a
 # new flat array is consulted the moment it joins the list — which the root-set floor below already
 # requires of every array setup.sh declares.
-# ⛔ EACH KIND IS READ OFF setup.sh's OWN COPY LINES, not guessed: `flat` is what `fleet_srcs` (`:647`),
-# `mcp_harness_srcs` (`:692`), `merge_gate_srcs` (`:959`) and `graph_srcs` (`:1001`) all write
-# (`$DEST/scripts/$base`); `lib_srcs` writes `$DEST/scripts/lib/$base` (`:760`); `fleet_tools` writes
-# `$DEST/scripts/fleet/$base` (`:852`).
-# The DEFAULT is `flat` deliberately: a future array with a destination no arm here knows then
-# false-BLOCKS loudly (`DELIVERED BY NOTHING`) instead of reading as delivered — fail-closed. The
-# opposite default is the false PASS this whole gate exists to refuse.
-farm_dest_kind() { # <array-name> -> flat | lib | fleet
-  case "$1" in
+# ⛔ EACH KIND IS READ OFF setup.sh's OWN COPY-LOOP DESTINATION, not guessed and NOT cited by line
+# number: `flat` is `dest="$DEST/scripts/$base"`, `lib` is `dest="$DEST/scripts/lib/$base"`, `fleet`
+# is `dest="$DEST/scripts/fleet/$base"`. The arrays are named here rather than the lines because the
+# lines DRIFT on every rebase — an earlier head of this comment cited `:647/:692/:959/:1001/:760/:852`
+# and ALL SIX were stale within one base move, which is the same defect class as a stale pin (a
+# comment a next lane quotes as authority must still be true). Re-derive with
+# `grep -n '<array>=(\|dest="$DEST/scripts' pi-bootstrap/setup.sh` if a line is ever needed.
+# ⛔ EVERY ARRAY IN `FARM_ARRAYS` IS NAMED BELOW, and `unknown` is the default. The previous version
+# defaulted to `flat`, which was a FALSE PASS in the one direction this gate exists to refuse: an
+# array added to `FARM_ARRAYS` that writes a SUBDIRECTORY (`$DEST/scripts/lib/<n>`) was unknown here,
+# read as `flat`, and therefore CREDITED with delivering `<n>` where `$DEST/scripts/<n>` does not
+# exist — a `script:<n>` producer reading DELIVERED over nothing. The comment above it claimed the
+# default was fail-CLOSED ("false-BLOCKS loudly … instead of reading as delivered"); it was inverted.
+# Two independent guards now make the promise true, and neither relies on the default being lucky:
+# `delivered_flat` credits ONLY `flat` (so `unknown` can never be a false PASS), and
+# `check_farm_dest_kinds` below FAILS LOUDLY naming every `unknown` member (so an unmapped array
+# cannot be silently skipped either). Probe: `dest-kind-probe`.
+# ⛔ A PROBE SEAM, and it is EMPTY in every real run. It exists because the ladder probe needs a
+# SYNTHETIC flat array, and a probe that adds its own name to the map above would be testing the MAP
+# instead of the ladder — the exact hand-list circularity the ladder probe was written to break. The
+# seam can only ever supply a KIND for a name the probe itself passed; it cannot add a name to any
+# list, so a `delivered_flat` reverted to a fixed list still reddens `ladder-probe` (that list would
+# not contain `zz_flat_srcs` at all). (`cap_int_seam` is the same shape, for the same reason.)
+FARM_DEST_KIND_SEAM=""
+farm_dest_kind() { # <array-name> -> flat | lib | fleet | unknown
+  local a="$1"
+  if [ -n "$FARM_DEST_KIND_SEAM" ]; then
+    case " $FARM_DEST_KIND_SEAM " in *" $a "*) printf 'flat'; return 0 ;; esac
+  fi
+  case "$a" in
+    fleet_srcs|merge_gate_srcs|lane_root_srcs|graph_srcs|mcp_harness_srcs) printf 'flat' ;;
     lib_srcs)    printf 'lib' ;;
     fleet_tools) printf 'fleet' ;;
-    *)           printf 'flat' ;;
+    *)           printf 'unknown' ;;
   esac
+}
+# THE DEST-KIND FLOOR: every member of `FARM_ARRAYS` must have a KNOWN destination kind. `delivered_flat`
+# refusing an `unknown` kind keeps it from being a false PASS, but on its own it would make an unmapped
+# array read as `DELIVERED BY NOTHING` — a false BLOCK over a file setup.sh really writes. So the
+# unmapped array is NAMED and FAILED here instead, which is the "fail-closed loudly" the comment has
+# always promised. Mirrors `check_farm_arrays`: the same `_DEST_KIND_RAN` sentinel proves the wiring,
+# and `dest-kind-probe` proves each direction on a synthetic tree.
+check_farm_dest_kinds() { # <label>
+  _DEST_KIND_RAN=1  # proof-of-wiring sentinel: asserted at the end of the #1899 block (see there)
+  local label="$1" a miss=""
+  for a in $FARM_ARRAYS; do
+    [ "$(farm_dest_kind "$a")" = unknown ] && miss="$miss $a"
+  done
+  if [ -n "$miss" ]; then
+    fail "$label: farm array(s) in FARM_ARRAYS with NO destination kind in farm_dest_kind:$miss — an unknown kind is credited with nothing by delivered_flat and skipped silently, so its producers read DELIVERED BY NOTHING over files setup.sh writes; add each array to farm_dest_kind (flat|lib|fleet) (#1899)"
+    return
+  fi
+  echo "ok: $label every FARM_ARRAYS member has a known destination kind ($(printf '%s\n' $FARM_ARRAYS | grep -c .) mapped) (#1899)"
 }
 # The arrays setup.sh actually declares (a destination-agnostic floor for the list above).
 declared_farm_arrays() { # <repo-root>
@@ -745,6 +785,12 @@ farm_declares() { # <array-name> <entry> [<repo-root>|<setup.sh>] -> 0 when the 
 # ⛔ PROBED, not merely asserted: `ladder-probe` below declares `zz_flat_srcs`, a name NO hand list
 # could contain, and asserts a member of it is delivered. Replace this loop with any fixed list and
 # that probe reddens.
+# ⛔ AND THE KIND TEST IS AN ALLOW-LIST ON PURPOSE (`= flat`, not `!= lib`): an array whose kind
+# `farm_dest_kind` does not know is `unknown` and is credited with NOTHING here. With the old
+# `* -> flat` default, a NEW subdir-dest array read as flat-delivered — a `<n>` reported DELIVERED at
+# `$DEST/scripts/<n>` that setup.sh actually writes to `$DEST/scripts/lib/<n>` — i.e. a false PASS.
+# The matching loud half is `check_farm_dest_kinds`, so the array is NAMED rather than silently
+# skipped; both directions are probed by `dest-kind-probe`.
 delivered_flat() { # <entry> <repo-root>
   local entry="$1" root="${2:-$ROOT}" a
   for a in $FARM_ARRAYS; do
@@ -1352,15 +1398,22 @@ fi
 # about "everything reads delivered"), and a `lib_srcs` member is NOT flat (it lands at
 # `$DEST/scripts/lib/<n>`, so calling `script:<n>` delivered would be a false PASS of exactly the
 # kind the missing `mcp_harness_srcs` arm produced in the other direction).
+# ⛔ `zz_flat_srcs`'s DESTINATION KIND comes from `FARM_DEST_KIND_SEAM`, not from the map above: the
+# probe must not edit the map it is testing against (see the seam's own comment). Everything else in
+# this probe — the membership in `FARM_ARRAYS`, the entry name, the delivered answer — is the real
+# code path.
 PROBE_LADDER="$TMP/producer-ladder"
 mkdir -p "$PROBE_LADDER/pi-bootstrap"
 printf 'fleet_srcs=(flat-x.sh)\nlib_srcs=(lib-x.sh)\nmerge_gate_srcs=()\ngraph_srcs=()\nmcp_harness_srcs=()\nzz_flat_srcs=(zz-flat-producer.sh)\n' > "$PROBE_LADDER/pi-bootstrap/setup.sh"
-if ( FARM_ARRAYS="$FARM_ARRAYS zz_flat_srcs"; delivered_flat zz-flat-producer.sh "$PROBE_LADDER" ); then
+if ( FARM_ARRAYS="$FARM_ARRAYS zz_flat_srcs" FARM_DEST_KIND_SEAM="zz_flat_srcs"; delivered_flat zz-flat-producer.sh "$PROBE_LADDER" ); then
   echo "ok: the delivery ladder enumerates FARM_ARRAYS BY NAME — a flat array no hand list names still delivers its producer (#1899)"
 else
   fail "the delivery ladder does not consult FARM_ARRAYS by name — a sixth flat array reads DELIVERED BY NOTHING over a file setup.sh writes, i.e. the false block whose documented remedy weakens the gate (#1899)"
 fi
-if ( delivered_flat zz-flat-producer.sh "$PROBE_LADDER" ); then
+# The control is a SINGLE-VARIABLE one: the seam still says `zz_flat_srcs` is flat, so the only
+# difference from the assertion above is membership in `FARM_ARRAYS`. Without the seam this would
+# also be testing the kind map, and a green would say less than it appears to.
+if ( FARM_DEST_KIND_SEAM="zz_flat_srcs"; delivered_flat zz-flat-producer.sh "$PROBE_LADDER" ); then
   fail "the delivery ladder delivers from an array FARM_ARRAYS does NOT name — the root-set floor is the only thing enforcing membership, so a member of an unread array reads as delivered (#1899)"
 else
   echo "ok: an array absent from FARM_ARRAYS is NOT consulted (positive control for the ladder probe) (#1899)"
@@ -1369,6 +1422,35 @@ if ( delivered_flat lib-x.sh "$PROBE_LADDER" ); then
   fail "the delivery ladder reports a lib_srcs member as FLAT-delivered — it lands at \$DEST/scripts/lib/<n>, so a script:<n> consumer still finds nothing, which is a false PASS (#1899)"
 else
   echo "ok: a lib_srcs member is NOT flat-delivered (farm_dest_kind is consulted, not bypassed) (#1899)"
+fi
+# DEST-KIND PROBE — the two directions the `farm_dest_kind` default must get right, asserted on a
+# SYNTHETIC tree because the live tree cannot express either one: today every `FARM_ARRAYS` member is
+# mapped, so no real array can exercise the unknown arm and a bug in it would be invisible (#3442
+# rule 3). `zz_subdir_srcs` writes `$DEST/scripts/lib/`, i.e. a SUBDIRECTORY destination — the shape
+# the old `* -> flat` default mis-graded.
+#   1. NO FALSE PASS: `delivered_flat` must NOT credit an unknown-kind array's member as flat, or a
+#      `script:<n>` consumer reads DELIVERED over `$DEST/scripts/<n>` that nothing writes.
+#   2. NO SILENT SKIP: `check_farm_dest_kinds` must FAIL LOUDLY naming the array, or the honest
+#      remedy for that false block would be to widen another list (i.e. weaken the gate).
+#   3. POSITIVE CONTROL: the REAL `FARM_ARRAYS` passes the floor. Without it a `check_farm_dest_kinds`
+#      that failed unconditionally would satisfy (2) and redden every run.
+PROBE_DESTKIND="$TMP/producer-destkind"
+mkdir -p "$PROBE_DESTKIND/pi-bootstrap"
+printf 'fleet_srcs=(flat-x.sh)\nzz_subdir_srcs=(subdir-producer.sh)\n' > "$PROBE_DESTKIND/pi-bootstrap/setup.sh"
+if ( FARM_ARRAYS="$FARM_ARRAYS zz_subdir_srcs"; delivered_flat subdir-producer.sh "$PROBE_DESTKIND" ); then
+  fail "the delivery ladder credits an UNKNOWN-destination array as flat — a <n> written to \$DEST/scripts/lib/<n> is reported DELIVERED at \$DEST/scripts/<n>, which is the false PASS the fail-closed default was supposed to prevent (#1899)"
+else
+  echo "ok: a member of an array with an UNKNOWN destination kind is NOT credited as flat-delivered (no false PASS) (#1899)"
+fi
+if ( FARM_ARRAYS="$FARM_ARRAYS zz_subdir_srcs"; producer_probe check_farm_dest_kinds "dest-kind-probe" ) | grep -q '^0$'; then
+  fail "an array in FARM_ARRAYS with NO destination kind did NOT trip the dest-kind floor — it is silently skipped, so its producers read DELIVERED BY NOTHING over files setup.sh writes (#1899)"
+else
+  echo "ok: an UNKNOWN-destination array in FARM_ARRAYS trips the dest-kind floor by name (fail-closed LOUDLY, not silently) (#1899)"
+fi
+if ( producer_probe check_farm_dest_kinds "dest-kind-real" ) | grep -q '^0$'; then
+  echo "ok: the REAL FARM_ARRAYS passes the dest-kind floor (positive control — every declared array is mapped) (#1899)"
+else
+  fail "the dest-kind floor FAILS on the real FARM_ARRAYS — an array setup.sh declares has no farm_dest_kind arm, so its destination is unknown (#1899)"
 fi
 # DRIFT PIN — a population that cannot be built, or that shrank, substituted or GREW, must never read
 # as clean. The GROWTH case is #1899's own defect: an exec site no farm array delivers.
@@ -1385,6 +1467,7 @@ fi
 # an output assertion cannot tell "never ran" from "ran and failed", and reporting a drift failure as
 # "its invocation is unproven" sends the reader to the wrong file.
 check_farm_arrays "$ROOT" "run1"
+check_farm_dest_kinds "run1"
 LANE_PRODUCERS_DERIVED=""
 _ENTRY_ARGS=""
 for _e in $LAUNCHD_ENTRY_PRODUCERS; do _ENTRY_ARGS="$_ENTRY_ARGS scripts/$_e"; done
@@ -2239,6 +2322,8 @@ check_producer_farm_declared "run1" "$LANE_PRODUCERS_DERIVED"
 # not a signal anything reads.
 [ "${_FLOOR_RAN:-0}" = 1 ] \
   || fail "run1: the root-set floor NEVER RAN on the real tree — its invocation is missing or was skipped, so an unread farm array would go unnoticed (#1899)"
+[ "${_DEST_KIND_RAN:-0}" = 1 ] \
+  || fail "run1: the dest-kind floor NEVER RAN on the real tree — its invocation is missing or was skipped, so a FARM_ARRAYS member with no farm_dest_kind arm would be credited with nothing and skipped silently (#1899)"
 [ "${_PIN_RAN:-0}" = 1 ] \
   || fail "run1: the population pin NEVER RAN on the real tree — its invocation is missing or was skipped, so a silently SHRUNK population would read as clean (#1899)"
 [ "${_DISPO_RAN:-0}" = 1 ] \
