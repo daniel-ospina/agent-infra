@@ -312,11 +312,14 @@ BEGIN { ins = 0; depth = 0; val = ""; _n = 0; fence = 0; fencec = ""; fencelen =
   # `WIP- :` are all the `wip` LABEL to the shape check — while this reader required `^wip[ \t]*:` and
   # therefore collected NOTHING, so the cross-check abstained and the brief was ADMITTED with an
   # unchecked claim of absence (measured: `WIP-: issue-4242 -> none` → rc 0 against an existing ref).
-  # The class below spans exactly the separators that can appear BETWEEN `wip` and the colon of a
-  # label `_label` still resolves to `wip` (spaces and hyphens, which it folds to one space) and
-  # DELIBERATELY excludes TAB: `_label` reads `WIP<TAB>:` as the label `wip` followed by whitespace it
-  # cannot span, so a line this reader collected and that parser ignored would be a new disagreement.
-  if (tolower(t) ~ /^wip[ _-]*:/) {
+  # ⛔ THE CLASS IS EXACTLY THE SEPARATORS `_label` FOLDS — SPACE AND HYPHEN — AND NOTHING ELSE (review of
+  # #3621, cycle 3, P3: the first version also spanned `_`, which `_label` never folds, so `WIP_:` was
+  # collected by this reader while the shape parser saw no `wip` label at all — the "line this reader
+  # collected and that parser ignored" the sentence above calls a new disagreement, two lines below it).
+  # TAB is excluded for the same reason: `_label` reads `WIP<TAB>:` as `wip` plus whitespace it cannot
+  # span. Both exclusions err toward the SHAPE parser, which then refuses the brief for having no `WIP:`
+  # line — fail-closed, and now consistent between the two readers.
+  if (tolower(t) ~ /^wip[ -]*:/) {
     sub(/^[^:]*:/, "", t)
     sub(/^[ \t]+/, "", t); sub(/[ \t]+$/, "", t)
     # …and the value is measured UNDRESSED, for the reason given in the `_label` comment above a
@@ -476,10 +479,17 @@ brief_gate_previous_work() { # brief_gate_previous_work <file|-> [repo] [role]
     issue=""
     case "$vlow" in
       issue-[0-9]*)        issue="${vlow#issue-}"; issue="${issue%%[!0-9]*}" ;;
-      issue-"<"[0-9]*">"*) issue="${vlow#issue-<}";  issue="${issue%%[!0-9]*}" ;;   # `<` is a REDIRECTION metacharacter bare
+      # ⛔ THE BRACKET ARM IS NOT A WHITELIST OF ONE SPELLING (review of #3621, cycle 3, P2). Requiring
+      # a digit immediately after `<` left `issue-<#4242>`, `issue-< 4242>`, `issue-<issue-4242>` and
+      # `issue-<+4242>` falling through to the unfilled-slot arm — keyed-but-UNCHECKED. A natural way to
+      # write "issue #4242" is a number, so the arm takes ANY bracket content ending in `>` and extracts
+      # the first digit run inside it. `<` must be quoted: it is a REDIRECTION metacharacter bare.
+      issue-"<"*[0-9]*">"*)
+        rest="${vlow#issue-<}"; issue="${rest%%>*}"
+        issue="$(printf '%s' "$issue" | sed -E 's/[^0-9]//g')" ;;
       # a `pr-<N>` that CARRIES a number is the same key as `pr-N` — checked for the role that may use it,
       # where the unfilled `pr-<N>` slot is keyed-but-unchecked for fixer/reviewer only (H55c)
-      pr-"<"[0-9]*">"*)   case "$role" in fixer|reviewer) : ;; *) unkeyed=1 ;; esac ;;
+      pr-"<"*[0-9]*">"*)   case "$role" in fixer|reviewer) : ;; *) unkeyed=1 ;; esac ;;
       # ⛔ THE UNFILLED SLOT IS KEYED BUT UNCHECKED (`issue-<N>`, `pr-<N>`): the canonical block ships it
       # and the gate cannot refuse its own advice — the same reason the research contract admits `<…>`.
       # That is the stated coverage limit, and it is now ONLY the literal slot: anything that carries a
@@ -501,11 +511,13 @@ brief_gate_previous_work() { # brief_gate_previous_work <file|-> [repo] [role]
     # does not implement `\|` in a BRE, so this substitution was INERT there: the arrow stayed in
     # `claim`, the claim no longer began `refs/wip/`, and an HONEST brief that named its ref was
     # falsely REFUSED on the exact platforms the fleet runs on while Linux stayed green.
-    # ⛔ THE ARROW IS OPTIONAL HERE (review of #3621, cycle 2). The line above already consumed a trailing
-    # `>` (the bracket form `issue-<4242> -> ...`), so for the PLAIN form the `->` is still present and for
-    # the bracket form it is gone — a sed that REQUIRES it left a leading space on the bracket path and
-    # on both paths could leave `claim` starting with whitespace, which made `refs/wip/<ref>` fail the
-    # `case` below and be read as a CLAIM OF ABSENCE (measured: an honest named ref refused, 5 arms).
+    # ⛔ THE ARROW IS OPTIONAL HERE, AND THE `?` IS LOAD-BEARING ON THE BRACKET PATH (review of #3621,
+    # cycle 3 — the cycle-2 wording had this backwards). Measured, on the shipped expansions:
+    #   `issue-4242 -> refs/wip/x`     after the `#*>` strip → ` refs/wip/x`   (the `->` is consumed there)
+    #   `issue-<4242> -> refs/wip/x`   after the `#*>` strip → ` -> refs/wip/x` (the `->` SURVIVES)
+    # so a sed that REQUIRES the arrow leaves a leading space on the BRACKET path only, `refs/wip/<ref>`
+    # then fails the `case` below, and an HONEST named ref is read as a CLAIM OF ABSENCE (measured: 5
+    # arms red before the `?`). The bracket named-ref direction is now pinned by H55d.
     claim="$(printf '%s' "$rest" | sed -E 's/^[[:space:]]*(->|→|:)?[[:space:]]*//')"
     # ⛔ A GLOB IS NOT A REF (review of #3621, P2). `refs/wip/* is empty` begins with `refs/wip/` and
     # was therefore read as "a ref is named", so the most honest possible way to say "I looked and there

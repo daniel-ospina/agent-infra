@@ -1056,6 +1056,35 @@ bash "$GATE" --check "$TMP/pw-slotglob.txt" lane 0 "$HW/work" >/dev/null 2>&1; r
 { cat "$CANON"; printf '\nWIP:       pr-<1> -> none\n'; } > "$TMP/pw-slotpr.txt"
 bash "$GATE" --check "$TMP/pw-slotpr.txt" lane 0 "$HW/work" >/dev/null 2>&1; rc=$?
 [ "$rc" -eq 80 ]; ck $? "(H55c) …and 'pr-<1>' does not bypass the role rule on a lane (got $rc)"
+# ⛔ THE REFUSAL DIRECTION IS NOT ENOUGH (review of #3621, cycle 3, P3): a misfix that treated the
+# bracketed number as UNKEYED would keep H55/H55b/H55c green while falsely refusing the honest form.
+# These are the mirror rows, including the BRACKET NAMED-REF path that the optional arrow protects.
+sed 's|^WIP:.*|WIP:       issue-<4242> -> refs/wip/issue-4242-first-attempt @ 111111111111|' "$CANON" > "$TMP/pw-slot-named.txt"
+bash "$GATE" --check "$TMP/pw-slot-named.txt" lane 0 "$HW/work" >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 0 ]; ck $? "(H55d) a bracketed key with a NAMED ref is ADMITTED — this is the row the optional-arrow strip protects (got $rc)"
+# ⛔ THE FIXTURE MUST BE ROLE-SHAPED: testing the LANE section as `reviewer` is ALSO refused for the
+# missing MUTATION ATTRIBUTION block, which would measure the wrong contract (it did, at 80).
+for r in fixer reviewer; do
+  { bash "$GATE" --section "$r"; printf '\nWIP:       pr-<1> -> none\n'; } > "$TMP/pw-slotpr-$r.txt"
+  bash "$GATE" --check "$TMP/pw-slotpr-$r.txt" "$r" 0 "$HW/work" >/dev/null 2>&1; rc=$?
+  [ "$rc" -eq 0 ]; ck $? "(H55e[$r]) …while 'pr-<1>' IS the right key for a $r (the role rule, not a blanket ban) (got $rc)"
+done
+# ── ANY SPELLING OF A BRACKETED NUMBER IS STILL A NUMBER (review of #3621, cycle 3, P2): requiring a
+# digit immediately after `<` left `issue-<#4242>`, `issue-< 4242>`, `issue-<issue-4242>` UNCHECKED — and
+# `issue #4242` is the natural way to write it.
+for spell in 'issue-<#4242>' 'issue-< 4242>' 'issue-<issue-4242>' 'issue-<+4242>'; do
+  sed "s|^WIP:.*|WIP:       $spell -> none (measured: git ls-remote refs/wip/* at 2026-11-06)|" "$CANON" > "$TMP/pw-spell.txt"
+  bash "$GATE" --check "$TMP/pw-spell.txt" lane 0 "$HW/work" >/dev/null 2>&1; rc=$?
+  [ "$rc" -eq 80 ]; ck $? "(H57['$spell']) a bracketed number in ANY spelling is CHECKED (got $rc)"
+done
+sed 's|^WIP:.*|WIP:       issue-<#4242> -> refs/wip/* is empty (measured)|' "$CANON" > "$TMP/pw-spellglob.txt"
+bash "$GATE" --check "$TMP/pw-spellglob.txt" lane 0 "$HW/work" >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 80 ]; ck $? "(H57b) …and it cannot smuggle the GLOB claim past H48 either (got $rc)"
+# ── `WIP_:` IS NOT A `wip` LABEL TO THE SHAPE PARSER (`_label` folds only space/hyphen), and the reader
+# no longer collects it either: ONE verdict, fail-closed, from both readers (review of #3621, cycle 3, P3).
+sed 's|^WIP:.*|WIP_:      issue-4242 -> refs/wip/issue-4242-first-attempt @ 111111111111|' "$CANON" > "$TMP/pw-under.txt"
+bash "$GATE" --check "$TMP/pw-under.txt" lane 0 "$HW/work" >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 80 ]; ck $? "(H58) 'WIP_:' is NOT a wip label to either reader — the brief is refused as having no WIP line (got $rc)"
 
 # ── THE TWO COPIES OF THE QUOTING HELPERS MUST STAY BYTE-IDENTICAL (review of #3621, P3). They are
 # duplicated because the two awk programs are separate single-quoted strings by design (#3442's reason:
