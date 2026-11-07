@@ -158,8 +158,8 @@ if [ -n "$_reader_missing" ]; then
   _say "REFUSING — $READER cannot be used by this wrapper; it does not provide: $_reader_missing"
   _say "  Three shapes land here, and the repair is the same for all of them: a reader that is"
   _say "  unreadable, one truncated mid-file, or an OLDER reader than this wrapper — the state the"
-  _say "  farm deliberately leaves behind when a copy fails (`COPY/RENAME FAILED … leaving any"
-  _say "  previous copy in place`). Nothing ran."
+  _say "  farm deliberately leaves behind when a copy fails (\`COPY/RENAME FAILED … leaving any"
+  _say "  previous copy in place\`). Nothing ran."
   _say "  Repair the farm: re-run pi-bootstrap/setup.sh — its \`lib_srcs\` declares repo-set.sh."
   exit 2
 fi

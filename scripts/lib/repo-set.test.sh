@@ -394,6 +394,23 @@ else
   ck "f11c …and a mode-000 reader is refused the same way (unreadable, not unparsable)" \
      'mv "$W/lib/repo-set.sh" "$W/lib/repo-set.sh.away"; cp "$W/lib/repo-set.sh.away" "$W/lib/repo-set.sh"; chmod 000 "$W/lib/repo-set.sh"; o="$(REPO_SET_FILE="$CONF" HOME="$T" bash "$W/pr-doctor-machine.sh" 2>&1)"; rc=$?; chmod 644 "$W/lib/repo-set.sh"; mv -f "$W/lib/repo-set.sh.away" "$W/lib/repo-set.sh"; [ "$rc" = 2 ] && grep -q "cannot be used by this wrapper" <<<"$o" && ! grep -q "command not found" <<<"$o"'
 fi
+# ⛔ THE REFUSAL'S OWN CAUSE LINE WAS BROKEN BY THE COMMIT THAT WROTE IT (review at `93833f4d9`, P1).
+# Two of those `_say` lines put UNESCAPED backticks inside a double-quoted argument, so bash parsed them
+# as a COMMAND SUBSTITUTION: the two lines collapsed into one, `COPY/RENAME FAILED … leaving any
+# previous copy in place` — the exact string `setup.sh` prints and the operator is told to grep for —
+# was replaced by `()`, and a bash `No such file or directory` landed in StandardErrorPath. `bash -n`
+# is clean (it is valid syntax) and CI does not shellcheck, so NOTHING caught it — and the sibling arms
+# above assert `! grep "command not found"`, which that noise does not match. This arm pins the
+# OPERATOR-VISIBLE sentence instead, which is the thing the refusal exists to deliver.
+ck "f11b2 the farm-gap refusal quotes the log string VERBATIM, and emits no bash-level error" \
+   'mv "$W/lib/repo-set.sh" "$W/lib/repo-set.sh.away"; head -n "$(grep -n "^repo_set_doctor_repos()" "$READER" | cut -d: -f1)" "$READER" > "$W/lib/repo-set.sh"; o="$(REPO_SET_FILE="$CONF" HOME="$T" bash "$W/pr-doctor-machine.sh" 2>&1)"; mv "$W/lib/repo-set.sh.away" "$W/lib/repo-set.sh"; grep -qF "COPY/RENAME FAILED … leaving any" <<<"$o" && ! grep -q "No such file or directory" <<<"$o"'
+# ⛔ THE FARM GAP'S OTHER HALF HAD NO ARM (review at `93833f4d9`, P2). `f11` pins a missing READER;
+# nothing pinned a missing DOCTOR, and `[ ! -f "$DOCTOR" ]` was the ONE guard in this file whose
+# deletion left the suite green. Without it the wrapper announces `grading N repo(s)` and then dies on
+# python's own `can't open file` — a PASS CLAIM for a run that never started, which is the shape this
+# file's header says the whole unit exists to prevent.
+ck "f34 a missing sibling DOCTOR is a NAMED farm gap, and never announces 'grading N repo(s)'" \
+   'mv "$W/pr-doctor.py" "$W/pr-doctor.py.away"; o="$(REPO_SET_FILE="$CONF" HOME="$T" bash "$W/pr-doctor-machine.sh" 2>&1)"; rc=$?; mv "$W/pr-doctor.py.away" "$W/pr-doctor.py"; [ "$rc" = 2 ] && grep -q "pr-doctor.py is missing" <<<"$o" && ! grep -q "grading .* repo(s)" <<<"$o"'
 # ⛔ A COMPLETE-BUT-OLDER READER: THE THIRD SHAPE, AND THE ONE THE FARM ACTUALLY PRODUCES (round 37, P1).
 # The stub provides all four `repo_set_*` functions — so the round-35 probe passed it — and none of the
 # `_rs_*` helpers the wrapper then calls. Before the fix the wrapper emitted five `command not found`
