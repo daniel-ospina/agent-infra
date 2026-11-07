@@ -777,7 +777,8 @@ except Exception:
     #   origin— answers its own TAB reason (round 42) **including in THIS arm** (round 44, P2 — measured):
     #            before that it wrote nothing here, fell through to the caller's residue line, and the
     #            operator was told `the proof child did not start` about a child that started, imported and
-    #            RAISED. Every verb now answers here.
+    #            RAISED. Every verb EXCEPT `split` answers here — `split` is mapped shell-side by
+    #            `_rs_split_entries` (the line above), and saying "every verb" contradicted that line.
     if verb in ("tags", "strip", "norm"):
         sys.stdout.write("__UNASKABLE__")
     elif verb == "origin":
