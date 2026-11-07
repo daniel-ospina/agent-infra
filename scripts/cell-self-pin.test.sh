@@ -778,6 +778,28 @@ AN="$u_acc/systemd-analyze"; out="$(install_doctored "$(doctor_timer cal-exotic 
 [ "$rc" -eq 0 ] && [ -f "$T/units-deleg-accept/cell-self-pin.timer" ] && ok "…and a value the parser ACCEPTS is installed without this file re-grading it (OnCalendar=1..5 04:00:00 — a form the old grammar could only guess at)" \
   || bad "refused OnCalendar=1..5 04:00:00 although the parser ACCEPTED it — the pass is still re-implementing the parser (rc=$rc): $out"
 
+# ── 4a-ter. THE ENABLEMENT ITSELF — THE ONE THING `--install` NEVER VERIFIED ─────────────────────────
+# ⛔ `systemctl enable` EXITS 0 AND CREATES NO SYMLINK for a unit with no installation config. MEASURED on
+# systemd 255.4 in this review round: rc=0, "The unit files have no installation config (WantedBy=,
+# RequiredBy=, UpheldBy=, Also=, or Alias= …)", `timers.target.wants/` never created — while the control
+# WITH `[Install] WantedBy=timers.target` links, and `is-enabled` answers `enabled` (without it: `static`,
+# rc=0). So EVERY line below `enable` — the one-actor read-back, the final "installed —" note — was printed
+# over a pin that never fires: #3194's symptom, produced by the verb that exists to end it. The same
+# measured mechanism was already refused in a DROP-IN (`verify_dropin_file`'s `[Install]` arm, which cites
+# this exact measurement); the RENDERED unit, whose enablement is what `--install` claims, had no rule.
+# ⛔ A RESEED BEFORE THE REFUSAL LEGS BELOW, AND THE REASON IS THE SENTINEL'S OWN DESIGN. `$PLACED` is
+# seeded with a SENTINEL (`# a copy placed by an EARLIER install …`), not with this file's bytes, so that
+# a mutant moving `place_pass` above `verify_unit` is caught by `cmp`. The POSITIVE CONTROLS above
+# (`u_cal`, `u_daily`, `u_multi`, the delegation legs) install SUCCESSFULLY and therefore legitimately
+# replace it with the real pass — which would make every refusal leg below report "REPLACED the placed
+# pass" for a replacement that was correct. This is the same reseed shape the timer and drop-in sections
+# already use; without it one correct install reds a cascade of unrelated legs.
+cp "$T/placed.before" "$PLACED"   # the refusal legs below re-assert that a REFUSAL cannot replace it
+refuses_timer 'a timer template with NO installation config ([Install] WantedBy= dropped)' \
+  "$(doctor_timer noinstall '/^WantedBy=/d')" "$T/tu40" 'installation config'
+refuses_timer 'a timer template whose WantedBy= is EMPTY (a LIST RESET — the same no-config state)' \
+  "$(doctor_timer noinstall-empty 's|^WantedBy=.*$|WantedBy=|')" "$T/tu41" 'non-blank WantedBy='
+
 # ⛔ AND WITH NO PARSER ON THE BOX, THE FALLBACK IS A WHITELIST, NOT A GUESS: the ten documented shortcut
 # words are certifiable by construction, and any explicit EXPRESSION is REFUSED with the two routes out
 # named. That direction is deliberate — a refusal an operator fixes with one line, never a false PASS —
@@ -1290,6 +1312,61 @@ mk_denied_systemctl() { # <dir> <state-dir>
   chmod +x "$d/systemctl"
   return 0
 }
+# mk_nolink_systemctl — the manager ACCEPTS the `enable` and LINKS NOTHING. This is not a hypothetical
+# stub: it is systemd's own measured answer for a unit with no installation config. MEASURED on systemd
+# 255.4 — `systemctl enable` on a timer carrying no `[Install] WantedBy=`/`RequiredBy=` answers "The unit
+# files have no installation config (WantedBy=, RequiredBy=, UpheldBy=, Also=, or Alias= …)", exits **0**
+# and creates NO symlink in `timers.target.wants/`; the control fixture WITH `[Install]
+# WantedBy=timers.target` links, and `is-enabled` answers `enabled`. And `is-enabled` AFTERWARDS answers
+# `static` **with rc=0**, which is what made an exit-code read-back report "enabled" about a clock that
+# never fires. `enable` here writes no state at all, so the read-back can only see `static`.
+mk_nolink_systemctl() { # <dir> <state-dir>
+  local d="$1" s="$2"
+  mkdir -p "$d" "$s"
+  printf '%s\n' \
+    '#!/bin/bash' \
+    "S='$s'" \
+    'scope=system' \
+    'if [ "${1:-}" = "--user" ]; then scope=user; shift; fi' \
+    'verb="${1:-}"; shift 2>/dev/null || true' \
+    '[ "${1:-}" = "--now" ] && shift' \
+    'unit="${1:-}"' \
+    'st="$S/$scope-$unit"' \
+    'case "$verb" in' \
+    '  is-enabled) if [ -f "$st" ]; then echo enabled; exit 0; fi; if [ "$unit" = cell-self-pin.timer ]; then echo static; exit 0; fi; echo disabled; exit 1 ;;' \
+    '  disable) rm -f "$st"; exit 0 ;;' \
+    '  enable) exit 0 ;;' \
+    'esac' \
+    'exit 0' >"$d/systemctl"
+  chmod +x "$d/systemctl"
+  return 0
+}
+# mk_rearm_systemctl — the shipped actuator is RE-ARMED by the very `enable` that completes the migration.
+# That is `cloud-cell-bringup.sh`'s `check_harness_apply` (it runs `install-harness-apply-timer.sh
+# --install` on EVERY bring-up, and that ends in `systemctl enable --now eldato-harness-apply.timer`),
+# collapsed into the ONE window the install cannot see: `$scopes` is read BEFORE the install, so a scope
+# that goes enabled during it is in neither `$scopes` nor the retirement loop.
+mk_rearm_systemctl() { # <dir> <state-dir>
+  local d="$1" s="$2"
+  mkdir -p "$d" "$s"
+  printf '%s\n' \
+    '#!/bin/bash' \
+    "S='$s'" \
+    'scope=system' \
+    'if [ "${1:-}" = "--user" ]; then scope=user; shift; fi' \
+    'verb="${1:-}"; shift 2>/dev/null || true' \
+    '[ "${1:-}" = "--now" ] && shift' \
+    'unit="${1:-}"' \
+    'st="$S/$scope-$unit"' \
+    'case "$verb" in' \
+    '  is-enabled) if [ -f "$st" ]; then echo enabled; exit 0; fi; echo disabled; exit 1 ;;' \
+    '  disable) rm -f "$st"; exit 0 ;;' \
+    '  enable) : >"$st"; if [ "$unit" = cell-self-pin.timer ]; then : >"$S/user-'"$SHIPPED"'"; fi; exit 0 ;;' \
+    'esac' \
+    'exit 0' >"$d/systemctl"
+  chmod +x "$d/systemctl"
+  return 0
+}
 # ── (a) a SYSTEM-manager-only box refuses, and names that scope ────────────────────────────────
 mk_scoped_systemctl "$T/fake-1sys" "$T/state-1sys"; : >"$T/state-1sys/system-$SHIPPED"
 out="$(runat "$T/home" TEMPLATES_DIR="$TPL" SYSTEMD_UNIT_DIR="$T/units-sys" PATH="$T/fake-1sys:$PATH" \
@@ -1513,6 +1590,50 @@ esac
 [ -f "$T/state-enfail/system-$SHIPPED" ] \
   && ok "…the shipped timer is enabled again (one actuator preserved through a failed migration)" \
   || bad "a failed migration left ZERO pin actuators where the box started with one"
+
+# ── (f0) THE READ-BACK AT THE POINT OF THE CLAIM, NOT ONLY AT THE INPUT ──────────────────────────
+# ⛔ `verify_timer` refuses a rendered unit with no installation config, but a template is not the only way
+# to reach a unit the manager never links (a manager that ignores the unit dir, a `--root` mismatch, a
+# future `[Install]` spelling). So the enablement is READ BACK from the manager's own answer where the
+# positive claim is printed, instead of being inferred from `enable`'s exit code. `mk_nolink_systemctl`
+# models systemd's MEASURED behaviour for such a unit: `enable` exits 0, links nothing, and `is-enabled`
+# then answers `static` with **rc=0** — the word that made an exit-code read-back say "enabled" about a
+# clock that never fires. It answers `disabled` for any OTHER unit, so the duplicate-actuator gate cannot
+# answer for this leg.
+mk_nolink_systemctl "$T/fake-nolink" "$T/state-nolink"
+out="$(runat "$T/home" TEMPLATES_DIR="$TPL" SYSTEMD_UNIT_DIR="$T/units-nolink" PATH="$T/fake-nolink:$PATH" \
+       bash "$PIN" --install 2>&1)"; rc=$?
+[ "$rc" -ne 0 ] && ok "an 'enable' that exits 0 and links NOTHING fails the install instead of being certified (rc=$rc)" \
+  || bad "installed (rc=0) after an 'enable' that created no link — the positive claim printed over a dead pin: $out"
+case "$out" in
+  *'ONE actuator on this pin'*) bad "…and it still printed the ONE-actuator claim over a timer the manager never enabled" ;;
+  *) ok "…and it does NOT print the one-actuator claim over it" ;;
+esac
+case "$out" in
+  *'NOT enabled'*) ok "…and the refusal says what it READ (the unit reads as not enabled)" ;;
+  *) bad "…but the refusal does not say the unit reads as not enabled: $out" ;;
+esac
+
+# ── (f) A SCOPE THAT GOES ENABLED *DURING* THE INSTALL IS STILL CAUGHT ─────────────────────────────
+# ⛔ THE POST-MIGRATION READ-BACK IS THE SOLE DECIDER OF THE ONE-ACTOR CLAIM, and deleting it left this
+# suite at 421 ok / 0 failed (round-16 review, P1). `retire_actuator`'s per-scope read-back can only see
+# scopes that were ALREADY enabled when `actuator_scopes` ran BEFORE the install, so a scope re-armed
+# DURING it — the documented `cloud-cell-bringup.sh` `check_harness_apply` re-arm, on every bring-up — is
+# in neither `$scopes` nor the retirement loop. Without the read-back, `--install` prints "installed — ONE
+# actuator on this pin" and exits 0 over a pin with TWO mutating actors: a race, silently greened.
+mk_rearm_systemctl "$T/fake-rearm" "$T/state-rearm"
+out="$(runat "$T/home" TEMPLATES_DIR="$TPL" SYSTEMD_UNIT_DIR="$T/units-rearm" PATH="$T/fake-rearm:$PATH" \
+       bash "$PIN" --install 2>&1)"; rc=$?
+[ "$rc" -ne 0 ] && ok "an actuator RE-ARMED in a scope the install never saw enabled fails the install (rc=$rc)" \
+  || bad "installed (rc=0) while a shipped actuator was re-armed DURING the install: $out"
+case "$out" in
+  *'still reads ENABLED'*) ok "…and the refusal names the scope that still carries it" ;;
+  *) bad "…but it did not report the still-enabled actuator: $out" ;;
+esac
+case "$out" in
+  *'ONE actuator on this pin'*) bad "…and it printed the ONE-actuator claim over two actors" ;;
+  *) ok "…and it does NOT print the one-actuator claim over it" ;;
+esac
 
 # ── 4c. THE ONE-ACTOR INVARIANT IS RE-READ ON EVERY TICK, NOT ONLY AT INSTALL TIME ────────────────
 # ⛔ THE RE-ARM IS BY DESIGN, IN THE SHIPPED CODE: `cloud-cell-bringup.sh`'s `check_harness_apply` runs
@@ -2229,6 +2350,31 @@ case "$out_mb" in
   *) bad "…but it did not diagnose the un-mendable record: $out_mb" ;;
 esac
 [ -s "$MG/.harness-path" ] && bad "a record was WRITTEN naming a tree that is not at the target: $(head -1 "$MG/.harness-path")" \
+  || ok "…and no record was written for it"
+# ⛔ AND IT MINDS ONLY FROM A TREE THAT CARRIES THE HARNESS DIR — the arm that is the difference between a
+# `mended` (exit 11, a SUCCESS verdict that keeps the retirement) and a record naming a directory that does
+# not exist. Deleting that ONE test left this suite at **421 ok / 0 failed** (round-16 review, P1) while the
+# verdict flipped from rc=1 (STALE-RECORD) to rc=11 over a record the controller cannot exec from
+# (`cloud-cell-supervisor.sh start` dies "harness not found at $HARNESS — that is the path RECORDED"), and
+# the mend write, then the read-back `pinned_head` comes back EMPTY, which is logged and greened.
+# A pin-root tree at the target whose `scripts/` carries the supervisor but NO `orchestrator-harness`
+# subdirectory is a real shape: the pin only has to be a worktree of the target, not a working harness
+# layout — and the record is supposed to name the HARNESS DIR, which does not exist there.
+MH="$T/home-mendnoharness"
+mkdir -p "$MH/harness"
+git clone -q "$T/origin.git" "$MH/harness/$SHA12" 2>/dev/null
+mkdir -p "$MH/harness/$SHA12/scripts"
+mk_sup "$MH/harness/$SHA12/scripts/cloud-cell-supervisor.sh"
+rm -rf "$MH/harness/$SHA12/scripts/orchestrator-harness"
+rm -f "$MH/.harness-path"
+out_mh="$(pinrun "$MH" 2>&1)"; rc_mh=$?
+[ "$rc_mh" -ne 11 ] && ok "a pin-root tree at the target with NO scripts/orchestrator-harness is refused as a MEND source (never 11)" \
+  || bad "the pass MENDED the record to a tree that carries no harness dir (rc=$rc_mh, 11 is a success verdict): $out_mh"
+case "$out_mh" in
+  *'STALE-RECORD'*) ok "…and it reports STALE-RECORD rather than greening an unexecutable record" ;;
+  *) bad "…but it did not diagnose the un-mendable record: $out_mh" ;;
+esac
+[ -s "$MH/.harness-path" ] && bad "a record was WRITTEN naming a tree with no scripts/orchestrator-harness: $(head -1 "$MH/.harness-path")" \
   || ok "…and no record was written for it"
 
 # ── 9. two ways a reading that is NOT a green used to come back GREEN ──────────────────────────

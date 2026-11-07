@@ -1252,7 +1252,7 @@ timer_value_ok() { # <directive> <value> — ok iff systemd can ACT on this valu
 
 verify_timer() { # <rendered timer> [expected Unit= target]
   local f="$1" expect="${2:-cell-self-pin.service}" body timer units nunits _rep _badval _c
-  local _trigs _reset _n _k _v
+  local _trigs _reset _n _k _v _inst _nw
   # Comments are stripped for the same reason `verify_unit` strips them: this template documents the
   # cadence decisions it made, and that prose legitimately names the directives the rules below ban.
   body="$(grep -vE '^[[:space:]]*#' "$f")"
@@ -1370,6 +1370,27 @@ verify_timer() { # <rendered timer> [expected Unit= target]
     bad "the rendered timer's only REPEATING trigger(s) carry a value systemd cannot parse or CANNOT ACT ON (${_badval%; }) and no other one is valid — the manager DISCARDS such a value ('Failed to parse timer value, ignoring' / 'Failed to parse calendar specification, ignoring', systemd.timer(5)), which leaves the ONCE-per-boot OnBootSec=/OnStartupSec=/OnActiveSec= triggers alone, so the pin would run a single time and then stop for ever with every surface green. NOTE systemd.syntax(7): there are NO trailing comments, so a value followed by '#…' is an unparseable value. The verdict is the MANAGER's ('systemd-analyze calendar|timespan'), not this file's; where no parser is available on the box, an explicit OnCalendar= expression is REFUSED rather than certified, because verifying it without the parser means re-implementing it. Write a value the manager accepts ('OnUnitActiveSec=10min', 'OnCalendar=daily', 'OnCalendar=*-*-* 04:00:00'), or make 'systemd-analyze' available"; return 1
   fi
   [ "$_rep" -eq 1 ] || { bad "the rendered timer's EFFECTIVE trigger list declares no REPEATING trigger — OnBootSec=/OnStartupSec=/OnActiveSec= each fire ONCE, and an EMPTY OnUnitActiveSec=/OnCalendar= is a LIST RESET that discards every trigger above it, so the pin would run a single time and then stop for ever with every surface green (this template uses OnUnitActiveSec= for exactly this reason); declare a non-empty OnUnitActiveSec= or OnCalendar= and put no empty assignment after it"; return 1; }
+  # ⛔ AND THE ENABLEMENT ITSELF MUST BE VERIFIABLE, NOT ASSUMED (round-16 review, P2). `do_install` ends by
+  # running `systemctl enable --now cell-self-pin.timer` and, until this rule, concluded enablement from that
+  # command's EXIT CODE. systemd exits **0** and creates **NO SYMLINK** for a unit with no installation
+  # config: MEASURED on systemd 255.4, `enable` answers "The unit files have no installation config
+  # (WantedBy=, RequiredBy=, UpheldBy=, Also=, or Alias= settings in the [Install] section …)", rc=0, and
+  # `timers.target.wants/` is never created — while the same fixture WITH `[Install] WantedBy=timers.target`
+  # links, and `is-enabled` answers `enabled` (without it: `static`, rc=0). So a template that lost its
+  # `[Install]`, or a stale `$CELL_HOME/.pi/agent/templates/systemd` copy that never had one, installs GREEN
+  # over a pin that never fires — #3194's symptom produced by the verb that exists to end it.
+  # ⛔ THIS IS THE SAME MEASURED MECHANISM THE DROP-IN RULE ALREADY REFUSES (see `verify_dropin_file`'s
+  # `[Install]` arm): a drop-in may not carry `[Install]` at all, and the RENDERED unit — whose enablement is
+  # the thing `--install` actually claims — had no rule at all about it.
+  # The grammar is deliberately narrow (`WantedBy=`/`RequiredBy=` with a NON-BLANK value) because an EMPTY
+  # assignment is a LIST RESET (`systemd.unit(5)`) and is precisely the "no installation config" state: a
+  # refusal here costs an operator one edit, a false PASS costs the pin.
+  _inst="$(unit_section "$body" Install)"
+  [ -n "$_inst" ] || { bad "the rendered timer declares no [Install] section — systemd applies [Install] at ENABLE time, and with none 'systemctl enable' exits 0 and creates NO symlink (measured, systemd 255.4: 'The unit files have no installation config', rc=0, no link), so '--install' would print its own success over a pin that never fires; the template must declare '[Install]' with 'WantedBy=timers.target'"; return 1; }
+  _nw=0
+  for _v in $(directive "$_inst" WantedBy); do [ -n "$_v" ] && _nw=$((_nw + 1)); done
+  for _v in $(directive "$_inst" RequiredBy); do [ -n "$_v" ] && _nw=$((_nw + 1)); done
+  [ "$_nw" -gt 0 ] || { bad "the rendered timer's [Install] section carries no non-blank WantedBy=/RequiredBy= — an EMPTY assignment is a LIST RESET (systemd.unit(5)), which systemd reads as 'no installation config', so 'systemctl enable' exits 0 and creates NO symlink (measured, systemd 255.4) and the pin is never scheduled with every surface green"; return 1; }
   return 0
 }
 
@@ -1846,6 +1867,43 @@ own_enabled_in() { # <scope> — is THIS unit installed in that manager?
     *)      return 1 ;;
   esac
 }
+# own_state <scope> — enabled | disabled | unknown, for THIS unit, from the MANAGER'S OWN WORDS.
+# ⛔ WHY AN EXIT CODE CANNOT ANSWER THIS, AND WHY IT IS NOT `own_enabled_in` REUSED. `is-enabled` exits **0**
+# for `static` — a unit with no installation config, which `enable` can never link. MEASURED on systemd 255.4:
+# `systemctl enable` a timer carrying no `[Install] WantedBy=`/`RequiredBy=` prints "The unit files have no
+# installation config", exits **0** and creates NO symlink, and `is-enabled` then answers `static`, rc=0. So
+# the exit-code form answers "yes" for a timer that is never scheduled — a pin that never runs with every
+# surface green, which is #3194's own shape one layer down (`--install` printing its positive claim over
+# it). The polarity rule is `scope_state`'s (#1178: one polarity, not a second): only the manager's OWN
+# answer word may produce a verdict, and an answer this code does not recognise is UNKNOWN — never `enabled`,
+# and never `disabled` (an unanswerable manager is not a manager with no actuator).
+# ⚠️ `own_enabled_in` IS DELIBERATELY LEFT AS IT WAS. It is `one_actor_check`'s predicate on the TICK, and
+# narrowing it there (a `static` unit stops counting as a scheduled actor of ours) changes which ticks
+# retire the shipped actuator — a decision this fix does not own. The install path is the one whose positive
+# claim the read-back has to survive, and that is what `own_state` is used for.
+own_state() { # <scope> — prints enabled | disabled | unknown
+  local out rc
+  case "$1" in
+    system) out="$(systemctl is-enabled cell-self-pin.timer 2>&1)"; rc=$? ;;
+    user)   out="$(systemctl --user is-enabled cell-self-pin.timer 2>&1)"; rc=$? ;;
+    *)      printf 'unknown\n'; return 0 ;;
+  esac
+  if [[ "$out" =~ $BUS_UNREACHABLE_PAT ]]; then printf 'unknown\n'; return 0; fi
+  if [ "$rc" -eq 0 ]; then
+    case "$out" in
+      enabled|enabled-runtime|alias|indirect) printf 'enabled\n' ;;
+      # systemd's answer for "no installation config": `enable` cannot link it, so it is never scheduled.
+      static) printf 'disabled\n' ;;
+      # An empty or unrecognised answer is NOT a verdict about this unit.
+      *) printf 'unknown\n' ;;
+    esac
+    return 0
+  fi
+  case "$out" in
+    disabled|masked|masked-runtime|not-found|bad|static) printf 'disabled\n' ;;
+    *) printf 'unknown\n' ;;
+  esac
+}
 # retire_actuator <scope> — RETIRE the shipped timer, explicitly. This is the one-actor decision, taken.
 # ⛔ VERIFIED, NOT ASSUMED: a `disable` that did not take leaves exactly the state this whole guard exists
 # to prevent, so the refusal is on the READ-BACK, not on the exit code.
@@ -1963,7 +2021,7 @@ one_actor_check() {
 }
 
 do_install() { # [--takeover]
-  local takeover="${1:-}" unit_dir="${SYSTEMD_UNIT_DIR:-/etc/systemd/system}" tmp rc=0 u script scopes="" retired="" who="" s unknown="" still="" scopes_now="" retiring=""
+  local takeover="${1:-}" unit_dir="${SYSTEMD_UNIT_DIR:-/etc/systemd/system}" tmp rc=0 u script scopes="" retired="" who="" s unknown="" still="" scopes_now="" retiring="" _own=""
   case "$takeover" in
     ""|--takeover) ;;
     *) bad "unknown argument '${takeover}' to --install (only --takeover is accepted)"; return 64 ;;
@@ -2110,6 +2168,27 @@ do_install() { # [--takeover]
     done
   fi
   if ! systemctl enable --now cell-self-pin.timer; then rc=1; fi
+  # ⛔ ⛔ AND THE ENABLE IS READ BACK, NOT INFERRED FROM ITS EXIT CODE (round-16 review, P2). `systemctl enable`
+  # exits **0** and creates **NO SYMLINK** for a unit with no installation config — MEASURED on systemd 255.4:
+  # "The unit files have no installation config (WantedBy=, RequiredBy=, UpheldBy=, Also=, or Alias= …)", rc=0,
+  # `timers.target.wants/` never created, and `is-enabled` afterwards answers `static` with rc=0. So the ONE
+  # command whose whole job is "this timer will now fire" can succeed at doing nothing, and every line below
+  # (the one-actor claim, the final note) would be printed over a pin that never runs — #3194's symptom, with
+  # the installer's own green light on top of it. `verify_timer` closes the same hole at the INPUT (the
+  # rendered unit must declare an installation config); this is the READ-BACK of the manager's answer at the
+  # point where the claim is made, because a template is not the only way to reach it (a manager that ignores
+  # the unit dir, a `--root` mismatch, a future `[Install]` spelling).
+  # ⛔ POLARITY IS `own_state`'s, NOT `enable`'s: `disabled` is a CLAIM the manager made about THIS unit (it
+  # answered with its own word), while an unanswerable manager is UNKNOWN and must not turn a healthy box into
+  # a false RED — the same posture `retire_actuator` and the one-actor read-back already take.
+  if [ "$rc" -eq 0 ]; then
+    _own="$(own_state system)"
+    case "$_own" in
+      enabled) : ;;
+      disabled) bad "'systemctl enable --now cell-self-pin.timer' exited 0, but the manager reads cell-self-pin.timer as NOT enabled — a unit with no installation config is exactly this shape (measured, systemd 255.4: 'The unit files have no installation config', rc=0, NO symlink, 'is-enabled' then answers 'static'), so this box would go on failing to advance its layer every ten minutes with every surface green. Check it with 'systemctl is-enabled cell-self-pin.timer' (it must answer 'enabled') and 'systemctl list-timers cell-self-pin.timer'"; rc=1 ;;
+      *) note "  NOT VERIFIED: the system manager did NOT ANSWER the read-back of cell-self-pin.timer, so its enablement was NOT confirmed by this run — check it by hand: 'systemctl is-enabled cell-self-pin.timer'" ;;
+    esac
+  fi
   if [ "$rc" -ne 0 ]; then
     # ⛔ A MIGRATION THAT CANNOT COMPLETE PUTS ITSELF BACK. Zero actuators is WORSE than two: two race on
     # one target, none leaves the box unpinned with a green-looking nothing.
