@@ -1193,6 +1193,48 @@ await test("a repo-ONLY entry whose only transport is empty is dropped, as the l
   );
 });
 
+await test("a repo-ONLY entry's `type` note is evaluated AFTER the falsy strip, like every other reader", async () => {
+  // `typeDisagrees` tests transport PRESENCE, so a falsy transport that is about to be stripped still
+  // counted as "declared" in the repo-only branch — which swallowed the diagnostic in exactly the case
+  // it exists for. Measured before the fix: `{type:"stdio", url:"https://x/mcp", command:""}` merges to
+  // `{type:"stdio", url}` (it RUNS over `url`) and reported nothing, while the identical delta over a
+  // base DID report. A config must not be diagnosed one way as a delta and another as a repo-only entry,
+  // and `asMcpJson` also evaluates after the strip.
+  let merged: Record<string, any> = {};
+  const logs = await withCapturedLogs(async () => {
+    merged = mergeMcpLayers(
+      { mcpServers: {} } as never,
+      {
+        mcpServers: {
+          // labelled stdio, but `command` is empty, so the entry that merges runs over `url`
+          a: { type: "stdio", url: "https://x/mcp", command: "" },
+          // labelled http, but `url` is empty, so the entry that merges runs over `command`
+          b: { type: "http", command: "/bin/sh", url: "" },
+        },
+      } as never,
+    );
+  });
+  equal(merged.a?.url, "https://x/mcp", "the empty `command` is stripped, so the entry runs HTTP");
+  equal(merged.a?.command, undefined, "…and is gone");
+  equal(merged.b?.command, "/bin/sh", "the empty `url` is stripped, so the entry runs stdio");
+  equal(merged.b?.url, undefined, "…and is gone");
+  const noted = logs.filter(l => l.includes("disagrees with its transport"));
+  equal(noted.length, 2, `BOTH incoherent projections must be reported — got:\n${logs.join("\n")}`);
+
+  // …and the coherent case must stay silent on the SAME path, or the fix trades a swallowed note for
+  // a spurious one.
+  const quiet = await withCapturedLogs(async () => {
+    mergeMcpLayers(
+      { mcpServers: {} } as never,
+      { mcpServers: { ok: { type: "stdio", command: "/bin/sh", lazy: true }, ok2: { type: "http", url: "https://y/mcp" } } } as never,
+    );
+  });
+  ok(
+    !quiet.some(l => l.includes("disagrees with its transport")),
+    `a coherent repo-only \`type\` must not be reported — got:\n${quiet.join("\n")}`
+  );
+});
+
 await test("the credential-drop note is grammatical for `headers` (agreement follows the noun, not the count)", async () => {
   // `headers` is ONE field but a plural noun, so keying `is`/`are` on `dropped.length` printed
   // "the base's headers is NOT inherited" — in the one diagnostic an operator reads to understand why

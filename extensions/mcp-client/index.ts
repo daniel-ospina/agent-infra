@@ -847,13 +847,20 @@ export function mergeMcpLayers(
         );
         continue;
       }
-      if (declaresTransport(entry, "url") && declaresTransport(entry, "command")) {
+      if (declaresTransport(delta, "url") && declaresTransport(delta, "command")) {
         console.log(
           `[mcp-client] WARN: repo entry "${name}" declares BOTH "url" and "command" — ambiguous; it is ` +
             `KEPT and will run over "url" (the order this client dispatches in). Declare ONE transport.`
         );
       }
-      if (typeDisagrees(entry)) {
+      // ⛔ Evaluated on the STRIPPED entry, the same object that will be merged — not on `entry`
+      // (#3628 review round 5). `typeDisagrees` tests transport PRESENCE, so a falsy transport that is
+      // about to be stripped still counted as "declared" here: `{type:"stdio", url:"…", command:""}`
+      // was reported as COHERENT (it declared `command`) even though the entry that merges runs over
+      // `url` — the exact incoherence this note exists to report, silently swallowed. The delta branch
+      // below and `asMcpJson` both evaluate after the strip; this branch must agree with them or the
+      // same config is diagnosed one way as a delta and the other way as a repo-only entry.
+      if (typeDisagrees(delta as unknown as McpServerConfig)) {
         // WARN, never drop: `type` is inert in this client (see RECOGNISED_TYPES), so refusing the entry
         // would destroy a config that works — the ruling `merge-mcp.py`/`cell-install.sh` already made.
         console.log(
