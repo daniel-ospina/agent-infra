@@ -637,8 +637,12 @@ ck "…while the SAME hold on an INERT PR path DOES trip it at the bound (the co
 # `\${CASCADE_MAIN_RED` only, so the very shape its comment above QUOTES — `[ "$CASCADE_MAIN_RED" = 1 ]`
 # — did not match, and an actor written that way left both pins green (measured: appending that line
 # kept the count at 1). Both spellings are counted now, and the actor line takes it to 2.
+# ⛔ COUNTED AS **OCCURRENCES**, NOT LINES (review round 9, P2) — the same rule the sibling name pin eight
+# lines below already states, and for the same measured reason: an actor appended to the consumer's OWN
+# line (`if [ "${CASCADE_MAIN_RED:-0}" = "1" ]; then spawn_main_repair "$CASCADE_MAIN_RED"; fi`) is a
+# second CONSUMER on ONE line, so `grep -c` answered 1 and both tripwires stayed green over a live actor.
 ck "…and CASCADE_MAIN_RED is CONSUMED exactly once (a second consumer is where an actor would live)" \
-   "$(grep -vE '^[[:space:]]*#' "$ORCH" | grep -cE '\$\{CASCADE_MAIN_RED|\$CASCADE_MAIN_RED([^A-Z_]|$)' | tr -d ' ')" "1"
+   "$(grep -vE '^[[:space:]]*#' "$ORCH" | grep -oE '\$\{CASCADE_MAIN_RED|\$CASCADE_MAIN_RED([^A-Z_]|$)' | wc -l | tr -d ' ')" "1"
 # ⛔ DECLARED LIMIT OF THIS PIN, so it is not read as a proof it does not give: it is NAME-based. It
 # fires when an actor is added KEYED ON THE LEVEL'S NAME (`FIX_MAIN`), which is how a level branch is
 # written in this file (`cascade_level_name` is the one map every other consumer uses) — it cannot
@@ -1178,6 +1182,18 @@ n="$(grep -vE '^[[:space:]]*#' "$TGT" 2>/dev/null | grep -o 'FIX_MAIN' | wc -l |
 PEOF
 mutfile "M20 an ACTOR is added for level 1 (a spawn keyed on FIX_MAIN) -> the 'no actor' pin goes RED" \
     "$ORCH" 's/^    1) echo FIX_MAIN ;;$/    1) echo FIX_MAIN ;; spawn_main_repair "FIX_MAIN"/' "$TMP/p-l1actor.sh"
+
+# ⛔ M23 GRADES THE **WIDENED** `CASCADE_MAIN_RED` PIN (review round 9, P2). The suite's own contract
+# (`:34-36`) says a mutation is what turns "the assertion can fail" from a claim into a measurement, and
+# the widened pin had none: reverting it to the braced-only pattern left every assertion green. The
+# mutant is the shape the pin exists for — an actor written against the UNBRACED variable, APPENDED TO
+# THE CONSUMER'S OWN LINE (a second consumer on one line, which is what `grep -c` could not see).
+cat > "$TMP/p-mainred-consumer.sh" <<'PEOF'
+n="$(grep -vE '^[[:space:]]*#' "$TGT" 2>/dev/null | grep -oE '\$\{CASCADE_MAIN_RED|\$CASCADE_MAIN_RED([^A-Z_]|$)' | wc -l | tr -d ' ')"
+[ "$n" = "1" ] && echo yes || echo no
+PEOF
+mutfile "M23 an actor consumes the UNBRACED \$CASCADE_MAIN_RED on the consumer's own line -> the pin goes RED" \
+    "$ORCH" 's|^  if \[ "${CASCADE_MAIN_RED:-0}" = "1" \]; then$|  if [ "${CASCADE_MAIN_RED:-0}" = "1" ]; then spawn_main_repair "$CASCADE_MAIN_RED"; fi|' "$TMP/p-mainred-consumer.sh"
 # (c) the repair pattern widened to accept the auto-filed title — the pin must catch that too, in the
 # OTHER direction from the control half above (widening makes the gap vanish and the pin go RED).
 cat > "$TMP/p-l1pattern.sh" <<'PEOF'
