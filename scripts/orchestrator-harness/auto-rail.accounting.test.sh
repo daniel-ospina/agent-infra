@@ -2339,15 +2339,19 @@ _pin_next '^[[:space:]]*awaiting-review\)$' '^[[:space:]]*if \[ -n "\$head" \]; 
 # ⛔ AND THE DEAD SECOND ARM MUST STAY DELETED (review round 11, P3): the attempt scan always prints
 # "<digits> <digits>", so a `*[!0-9 ]*` case could never fire — an arm advertising a failure mode the code
 # cannot produce, with a message naming a count that never exists.
-# ⛔ THE PATTERN MUST ACTUALLY MATCH THE SPELLING IT NAMES (fresh-context review, P2, measured):
-# the previous pattern carried a `\\` before the space, i.e. an ERE-escaped BACKSLASH followed by a
-# literal space — so it demanded a `\` inside the bracket expression, which neither historically-real
-# spelling contains, and restoring the dead arm in EITHER spelling left this guard GREEN while its own
-# message asserted the branch was pinned. `[!0-9 *]` is one class: it rejects the digits, the space and
-# the `*` of the round-11 spelling, and the `]` that ends main's `[!0-9]` is not in the class, so ONE
-# pattern covers both real shapes. Verified: rc 0 on the round-11 mutant and on origin/main's spelling,
-# rc 1 on this tree.
-grep -qE '^[[:space:]]*\*\[!0-9 *\]\*\)' "$SUT" \
+# ⛔ THE PATTERN MUST ACTUALLY MATCH THE SPELLING IT NAMES (fresh-context reviews, P2, measured TWICE):
+# the first revision carried `\\` before the space — an ERE-escaped BACKSLASH plus a literal space — so it
+# demanded a `\` INSIDE the bracket expression and matched no spelling at all. The second revision
+# (`[!0-9 *]` read as one class) matched the bare-space and no-space shapes only, and the bare space is
+# not a spelling the arm ever had: it is a bash SYNTAX ERROR (`syntax error near unexpected token ']*'`,
+# measured). What git history actually holds is `    *[!0-9\ ]*)` — an ESCAPED space
+# (`99e55ac9f^:scripts/orchestrator-harness/auto-rail.sh:787`), the only parseable form of that arm, so a
+# guard that rejects "the arm this diff deletes" must reject THAT. `\\?` is an optional literal
+# backslash: one pattern now matches the escaped spelling, the bare-space spelling and origin/main's
+# `*[!0-9]*)`, and nothing else. Verified by grep against all three (all rc 0) and against this tree
+# (rc 1 — no false block), and behaviourally by running the suite on a SUT copy carrying the arm
+# verbatim from git history.
+grep -qE '^[[:space:]]*\*\[!0-9\\? *\]\*\)' "$SUT" \
   && bad "review_attempts must not keep the unreachable '*[!0-9 ]*' arm — the scan above always prints two decimal fields, so that branch is dead code claiming a failure it cannot detect"
 
 PATH=$_oldpath
