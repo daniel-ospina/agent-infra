@@ -662,7 +662,14 @@ sweep_root() { # <root>
         # `.git`, so no `main-checkout` guard either — matched NONE of the three references, i.e. the
         # guard was inert exactly where it is the last thing between an armed pass and
         # `rm -rf /tmp/cell-home`. Resolving the default HERE covers every caller (the systemd unit, the
-        # darwin plist, a manual run) instead of trusting each one to export it.
+        # darwin launcher, a manual run) instead of trusting each one to export it.
+        # ⛔ AND IT MUST BE RESOLVED **HERE**, NOT BY EXPORTING `CELL_HOME` UPSTREAM. `load_pin` (`:332`)
+        # reads the same variable with FIRST-MATCH-WINS and a `break` — `${CELL_HOME}/orchestrator/…`
+        # then `${HOME}/.pi/orchestrator/…` — so the list is a substitution, not a union. A box whose two
+        # stamps disagree (exactly the `HOME=/home/cmux` vs `CELL_HOME=/tmp/cell-home` divergence above)
+        # would have the HOME stamp silently STOP being read, i.e. a pinned tree becomes a candidate and
+        # `rm -rf` takes it. This default touches only the guard loop and leaves `load_pin`'s input
+        # exactly as it was; a local fallback is additive, an exported variable is not.
         if [ "$gitless" = 1 ]; then
             for _ref in "${HOME:-}" "${CELL_HOME:-/tmp/cell-home}" "${REAP_AW_STATE_DIR:-}"; do
                 [ -n "$_ref" ] || continue
