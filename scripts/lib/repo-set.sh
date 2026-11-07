@@ -493,8 +493,17 @@ _rs_doctor_py() {
 }
 
 # _rs_with_doctor <verb> <arg> — run ONE question against pr-doctor.py's own functions, so the reader
-# and the doctor cannot disagree about a remote or a slug. Prints the answer, or "" when nothing could
-# be asked. `verb` is `origin` (_origin_slug) or `norm` (_normalize_slug).
+# and the doctor cannot disagree about a remote, a slug, a tag set or the set's own splitting.
+# Prints the answer, or "" when nothing could be asked.
+#
+# ⛔ THE VERB LIST IS PART OF THE CONTRACT — KEEP IT TRUE (review round 12, P2). It said `origin` or
+# `norm` long after three more verbs had been added, so a reader could believe the whole-set guards
+# did not exist. There are FIVE, each delegating to the function named:
+#   strip  (_rs_strip)          `str.strip()` — what Python's strip removes, incl. U+00A0
+#   split  (configured_repos)   the set as the doctor's own splitter reads it
+#   tags   (set_tag_collisions) repo-tag collisions across the whole set
+#   norm   (_normalize_slug)    one slug normalised
+#   origin (_origin_slug)       the slug a checkout's origin PROVES (the `else` arm)
 _rs_with_doctor() {
   local verb="${1:-}" arg="${2:-}" doc py
   doc="$(_rs_doctor_py)"
@@ -604,10 +613,20 @@ _rs_split_entries() {
 }
 
 # _rs_split_divergence <rendered> <expected-newline-joined> — "" when the doctor's own splitter
-# reproduces EXACTLY the entries we meant to render, else the first entry that differs.
+# reproduces EXACTLY the entries we meant to render, a non-empty `index<TAB>got<TAB>want` report for the
+# first entry that differs, or the `__UNASKABLE__` sentinel (the question could not be answered).
+#
+# ⛔ "" IS RESERVED FOR "NO DIVERGENCE", AND "" IS NOT A DIFFERENCE (review round 12, P2). The
+# first-difference report was `printf … "$line" …`, so a divergence that IS an EMPTY entry printed an
+# empty field and the caller's `[ -n "$diverged" ]` read it as agreement. Measured with a doctored
+# `pr-doctor.py` in /tmp whose `configured_repos` yields `['o/a=…', '', 'o/b=…']`, the reader printed
+# `OK — 2 repo(s)` at rc 0 — the guard SILENT on a set the doctor would split into an entry that is
+# not there. `${line:-<empty entry>}` makes the report non-empty, so it flows through the refusal the
+# same way truncation does. ("Could not ask" is a DIFFERENT case and is handled above by the
+# `__UNASKABLE__` sentinel: one sentinel, not two.)
 #
 # ⛔ BY ENTRIES, NOT BY COUNT (review round 9, P2). The count-only round-trip could not see a separator
-# at the END of a value: `repo_set_doctor_repos` joins with `,`, so `/x/decoy ` + `,` is one `[,\s]+` run
+# at the END of a value: `repo_set_doctor_repos` joins with `,`, so `/x/decoy ` + `,` is one `[,\s]+` run
 # and the count stayed `n` — the value was silently TRUNCATED to `/x/decoy` (the doctor strips it
 # again), so `check` returned 0 on a set whose checkout proved a DIFFERENT repo. Comparing the actual
 # entries to the intended ones catches truncation, insertion and reordering alike.
@@ -623,7 +642,7 @@ _rs_split_divergence() {
   local i=1 line want
   while IFS= read -r line; do
     want="$(printf '%s\n' "$expected" | sed -n "${i}p")"
-    if [ "$line" != "$want" ]; then printf '%s\t%s\t%s' "$i" "$line" "$want"; return 0; fi
+    if [ "$line" != "$want" ]; then printf '%s\t%s\t%s' "$i" "${line:-<empty entry>}" "$want"; return 0; fi
     i=$(( i + 1 ))
   done <<EOF_GOT
 $got

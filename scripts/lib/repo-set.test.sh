@@ -11,8 +11,12 @@
 #   (a) two valid repos                  -> parses, lists, renders `PR_DOCTOR_REPOS`, `check` returns 0
 #   (b) NO set at all                    -> rc 3, named NO-REPO-SET — and DISTINCT from (c)
 #   (c) a set that exists and is broken  -> rc 5, one named refusal per line, nothing emitted
-#   (d) a set that parses but does not PROVE -> `check` refuses by name (missing checkout, not a work
-#       tree, a checkout that is a DIFFERENT repo, two repos sharing a state dir)
+#   (d) a set that parses but does not PROVE -> `check` WARNS on an unprovable checkout and REFUSES
+#       only PROVEN faults (a checkout that is a DIFFERENT repo, two repos sharing a state dir, a set
+#       the doctor's own splitter divides differently, colliding repo tags). ⛔ ABSENCE IS NEVER
+#       PROVABLE from inside this process — rounds 3/4 removed "missing checkout" and "not a work
+#       tree" from the refusing set precisely because macOS TCC and a sandbox both deny or ENOENT
+#       what plainly exists, so those arms assert WARN + rc 0.
 #   (e) the shipped unit                 -> execs the wrapper, names NO repo in argv
 #   (f) the wrapper's three states       -> set / degraded / refuse, plus "takes no arguments"
 #
@@ -627,7 +631,7 @@ ck "j22 a set at a path whose PARENTS do not exist yet is NO-REPO-SET (3), not b
    'REPO_SET_FILE="$FRESH/.config/orchestrator/repos.conf" bash "$READER" list >/dev/null 2>&1; [ $? = 3 ]'
 ck "j23 …and the wrapper reaches the DEGRADED path for it (the migration state this change serves)" \
    'REPO_SET_FILE="$FRESH/.config/orchestrator/repos.conf" OR=daniel-ospina/tortoise HOME="$FRESH" bash "$W/pr-doctor-machine.sh" 2>/dev/null | grep -q "^ARGV $"'
-ck "j24 a mode-111 parent still proves absence (`x` is what stat needs; `r` was over-blocking)" \
+ck "j24 a mode-111 parent still proves absence (\`x\` is what stat needs; \`r\` was over-blocking)" \
    'mkdir -p "$T/m111"; chmod 111 "$T/m111"; if [ "$(id -u)" != 0 ]; then REPO_SET_FILE="$T/m111/repos.conf" bash "$READER" list >/dev/null 2>&1; _r=$?; chmod 755 "$T/m111"; [ "$_r" = 3 ]; else chmod 755 "$T/m111"; true; fi'
 
 # ⛔ "COULD NOT ASK" MUST NOT READ AS "THE PROOF HELD" (review round 10, P2).
@@ -842,6 +846,41 @@ open(dst, "w").write(t.replace(old, 'items = [s.strip() for s in re.split(r"[,\\
 PYM
 ck "m22 …and when the DOCTOR's splitter learns \`;\`, the reader FOLLOWS it and refuses (delegation, not a copy)" \
    '[ "$(REPO_SET_DOCTOR="$MD/pr-doctor.py" run_reader_rc "$T/semi.conf" check)" = 1 ]'
+# Round 12, P2: "" is the divergence function's "NO DIVERGENCE" answer, and it was ALSO what an empty
+# entry printed — so a splitter yielding NOTHING (or an empty entry) read as agreement. Measured with
+# a doctor whose `configured_repos` returns []: `OK — 2 repo(s)`, rc 0, no message. The guard was
+# SILENT where its whole job is to refuse. An empty split is never legitimate for a non-empty rendered
+# set, so it is now UNPROVABLE (`\t`-marked, the `_rs_origin_slug` convention) and the caller WARNS —
+# not refuses, because "only a PROVEN fault refuses".
+ME="$T/mutempty"; mkdir -p "$ME"
+python3 - "$REPO_ROOT/scripts/pr-doctor.py" "$ME/pr-doctor.py" <<'PYE'
+import sys
+src, dst = sys.argv[1], sys.argv[2]
+t = open(src).read()
+t += "\n\n_orig_configured_repos = configured_repos\ndef configured_repos(explicit=(), env=None):\n    return []\n"
+open(dst, "w").write(t)
+PYE
+ck "m23 a doctor that yields NO entries is NOT silently \`ok\` — it WARNS WHOLE-SET-PROOFS-SKIPPED" \
+   'REPO_SET_DOCTOR="$ME/pr-doctor.py" run_reader "$CONF" check | grep -q "WARN WHOLE-SET-PROOFS-SKIPPED"'
+# …and this is a DIFFERENT trigger from j25, which covers a doctor that is ABSENT. Here the doctor is
+# present and loadable and simply answers nothing, so the round-trip ran and could not conclude — the
+# case that made the reader print `OK — 2 repo(s)` with no message at all before the abstain path.
+ck "m24 …and it does NOT refuse (a question that cannot be answered is not a proven fault)" \
+   '[ "$(REPO_SET_DOCTOR="$ME/pr-doctor.py" run_reader_rc "$CONF" check)" = 0 ]'
+# …while a splitter that yields an EMPTY ENTRY is a real divergence and must refuse, not print "".
+MI="$T/mutmid"; mkdir -p "$MI"
+python3 - "$REPO_ROOT/scripts/pr-doctor.py" "$MI/pr-doctor.py" <<'PYI'
+import sys
+src, dst = sys.argv[1], sys.argv[2]
+t = open(src).read()
+t += ("\n\n_orig_configured_repos = configured_repos\n"
+      "def configured_repos(explicit=(), env=None):\n"
+      "    parts = (env or {}).get('PR_DOCTOR_REPOS', '').split(',')\n"
+      "    return [parts[0], '', parts[1]] if len(parts) > 1 else parts\n")
+open(dst, "w").write(t)
+PYI
+ck "m25 …and an EMPTY ENTRY in the middle is refused (an empty first-difference must not read as agreement)" \
+   '[ "$(REPO_SET_DOCTOR="$MI/pr-doctor.py" run_reader_rc "$CONF" check)" = 1 ]'
 
 # ── (n) SOURCING the reader must not change the caller's shell options ────────────────────
 # The file advertises sourcing as its contract, and the PR plans more consumers (the controllers and the

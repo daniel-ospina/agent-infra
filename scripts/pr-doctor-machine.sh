@@ -115,9 +115,12 @@ repo_set_parse >/dev/null 2>&1
 _rc=$?
 case "$_rc" in
   0)
-    # The proofs (checkout exists, its origin PROVES the slug, no shared state dir) run BEFORE the
-    # pass: a set that is valid on paper but names a checkout that is gone is refused here, not
-    # discovered as 40 unreadable PR rows inside the pass.
+    # ⛔ THE PROOFS THAT CAN REFUSE RUN BEFORE THE PASS (review round 12, P2). They are: an origin that
+    # PROVES a DIFFERENT slug, two repos sharing a state dir, a set the doctor's own splitter divides
+    # differently, and colliding repo tags. A GONE OR DENIED CHECKOUT IS NOT ONE OF THEM — this reader
+    # cannot prove absence from inside the process (macOS TCC/sandboxes answer EACCES or even ENOENT
+    # for paths that exist), so it WARNS CHECKOUT-UNVERIFIED and the pass still runs. This comment
+    # used to claim the opposite, which sent a reader looking for a refusal that is not there.
     if ! repo_set_check 1>&2; then
       _say "REFUSING — $(repo_set_file) exists and is not a usable repo set (see the report above)."
       _say "  Nothing was graded and nothing was dispatched: a shorter set would read exactly like a"
