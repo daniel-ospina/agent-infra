@@ -80,7 +80,13 @@ wip_ref_parts() { # wip_ref_parts <branch>
   case "$br" in
     */*)
       case "${br%%/*}" in
-        fix|rescue|feat|chore|docs|test|hotfix|wip|issue|pr)
+        # ⛔ NOT `pr` (fresh review of #3484, nit). A `pr/<N>` branch is keyed to a PR, and emitting
+        # `refs/wip/issue-<N>-…` for it would collapse the two namespaces `claims.sh` keeps
+        # deliberately apart (`refs/claims/<pr>-<sha12>` vs `refs/claims/issue-<N>`), so PR N's
+        # archive would answer — and could contradict — an issue-N handover. No `pr/<N>` convention
+        # exists in this tree, and a branch outside the list is still rescued and still REPORTED as
+        # carrying no issue link, which is the honest outcome for one.
+        fix|rescue|feat|chore|docs|test|hotfix|wip|issue)
           case "${br#*/}" in
             [0-9]*) WIP_ISSUE="${br#*/}"; WIP_ISSUE="${WIP_ISSUE%%[!0-9]*}" ;;
           esac ;;

@@ -958,13 +958,13 @@ bash "$GATE" --check "$TMP/pwplus-other.txt" lane 0 "$HW/work" >/dev/null 2>&1; 
 { cat "$CANON"; printf '\nWIP:       pr-1 -> none\n'; } > "$TMP/pwplus-pr.txt"
 bash "$GATE" --check "$TMP/pwplus-pr.txt" lane 0 "$HW/work" >/dev/null 2>&1; rc=$?
 [ "$rc" -eq 80 ]; ck $? "(xix) 'pr-<N>' is NOT a lane/worker key — it is the fixer's and the reviewer's (got $rc)"
-bash "$GATE" --check "$TMP/pwplus-pr.txt" fixer "$HW/work" >/dev/null 2>&1; rc=$?
+bash "$GATE" --check "$TMP/pwplus-pr.txt" fixer 0 "$HW/work" >/dev/null 2>&1; rc=$?
 [ "$rc" -eq 0 ]; ck $? "(xix-b) …and for a FIXER it is the right key, so the rule is role-scoped and not a blanket ban (got $rc)"
 # ⛔ THE REVIEWER FIXTURE MUST BE THE REVIEWER SECTION (`--section reviewer`): the same file tested as
 # `reviewer` is ALSO refused for the missing MUTATION ATTRIBUTION block, which would make this arm
 # measure the wrong contract (it did, at 80, until the fixture was role-shaped).
 { bash "$GATE" --section reviewer; printf '\nWIP:       pr-1 -> none\n'; } > "$TMP/pwplus-pr-rev.txt"
-bash "$GATE" --check "$TMP/pwplus-pr-rev.txt" reviewer "$HW/work" >/dev/null 2>&1; rc=$?
+bash "$GATE" --check "$TMP/pwplus-pr-rev.txt" reviewer 0 "$HW/work" >/dev/null 2>&1; rc=$?
 [ "$rc" -eq 0 ]; ck $? "(xix-c) …and for a REVIEWER too (it reviews one PR at a head) (got $rc)"
 # ── THE INDENT HALF OF THE QUOTING FIX NEEDS ITS OWN MUTANT-KILLING ARM (review cycle 2, P2). §H(xiii)
 # indents the WHOLE brief, and heading detection already rejects an indented heading — so that arm
@@ -976,6 +976,40 @@ bash "$GATE" --check "$TMP/pwplus-ind.txt" lane 0 "$HW/work" >/dev/null 2>&1; rc
 { cp "$TMP/pw-contradicted.txt" "$TMP/pwplus-tab.txt"; printf '\n\tWIP:       issue-4242 -> refs/wip/issue-4242-first-attempt @ 111111111111\n' >> "$TMP/pwplus-tab.txt"; }
 bash "$GATE" --check "$TMP/pwplus-tab.txt" lane 0 "$HW/work" >/dev/null 2>&1; rc=$?
 [ "$rc" -eq 80 ]; ck $? "(xx-b) …and the TAB spelling of the same indent (a 4-column stop) too (got $rc)"
+
+# ── PORTABILITY OF THE CLAIM-SEPARATOR STRIP (fresh review of #3484, P1) ──────────────────────
+# ⛔ THE MEASURED FAILURE. The `WIP:` separator was stripped with BRE alternation — `sed -e
+# 's/[[:space:]]*\(->\|→\|:\)…'` — and BSD sed (macOS, the platform `install.sh` and launchd target)
+# has NO `\|`: it reads the group as the LITERAL string `->|→|:`. The strip then never fired, the claim
+# kept its leading `-> `, failed the `refs/wip/*` test, and an HONEST brief that NAMED its rescued ref
+# was REFUSED with 80 on every Mac — while this Linux suite stayed green, because GNU sed accepts the
+# extension. An inert enforcer with no diagnostic, the exact class `orch-loop.sh` already ruled on for
+# this spelling (`sed -E`, not BRE `\|`).
+# ⛔ SO THE ARM IS ABOUT THE SPELLING AND NOT THE BEHAVIOUR, deliberately and in that order: (vii) pins
+# the behaviour and PASSES WITH THE BUG on GNU sed, so a behavioural arm cannot catch this class on
+# this platform. A source assertion can, and `pi-cache-reap.test.sh` already accepts exactly this shape
+# for the GNU-only `date -r <path>` trap. Comments are stripped first, because prose may cite the bad
+# spelling while explaining why it is banned.
+# ⛔ THE ARM IS SCOPED TO `sed` ON PURPOSE. `\|` is a LEGAL awk regex (a literal pipe, `BRIEF_GATE_WIP_AWK`
+# uses one) and a legal shell escape elsewhere, so a blanket "no `\|` anywhere" assertion would flag
+# correct code — and an arm that flags correct code gets deleted by the next lane instead of fixed. The
+# defect class is exactly "a `sed` script that uses GNU BRE alternation".
+grep -v '^[[:space:]]*#' "$GATE" | grep -F 'sed' | grep -qF '\|' ; rc=$?
+[ "$rc" -ne 0 ]; ck $? "(xxi) no \`sed\` script in the gate's EXECUTED code uses BRE alternation ('\|') — BSD sed reads it as a literal pipe, so the strip would silently never fire on macOS"
+# …and the arm is non-vacuous: the same probe DOES find the spelling where it used to live, so a
+# `grep -F` that matched nothing at all would be caught rather than passing this arm for ever.
+printf '%s\n' "sed -e 's/\\(a\\|b\\)/x/'" | grep -F 'sed' | grep -qF '\|'; ck $? "(xxi-b) …and the probe really matches the banned spelling (a control, so (xxi) cannot pass by matching nothing)"
+# ── ONE `V` ROW PER `WIP:` VALUE (fresh review of #3484, nit) ────────────────────────────────
+# The emission sat in a PATTERN-LESS rule after `END {}`, so it ran once per INPUT LINE: a 6-line block
+# with one WIP line printed its value 4 times. Harmless only because the consumer loop is idempotent —
+# the contract beside it says one line per value, and a reader that ever counted rows would be misled.
+# The awk program is a documented global, so this is driven from the SHIPPED reader, not a copy.
+WIP_AWK="$TMP/wip.awk"
+( set -u; . "$GATE" >/dev/null 2>&1; printf '%s\n' "$BRIEF_GATE_WIP_AWK" ) > "$WIP_AWK" 2>/dev/null
+[ -s "$WIP_AWK" ]; ck $? "(xxii) the WIP reader is reachable from the shipped file (not retyped in the suite)"
+printf '## PREVIOUS WORK\nCLAIM: unclaimed\nWIP: issue-777 -> none\nBRANCH: none\nWORKTREE: none\nPRIOR: no previous attempt\n' > "$TMP/wip-one.txt"
+n_rows="$(awk -f "$WIP_AWK" "$TMP/wip-one.txt" 2>/dev/null | wc -l | tr -d ' ')"
+[ "$n_rows" = "1" ]; ck $? "(xxii-b) one WIP line in a SIX-line block emits EXACTLY one value row (got '$n_rows' — a pattern-less rule emits once per input line)"
 
 # ── NON-VACUITY: remove the check and the arms above go green.
 MUT_PW="$TMP/mutant-pw.sh"

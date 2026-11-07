@@ -55,7 +55,7 @@
 # registry. The check is a CONTRADICTION test, not a substance test: it cannot tell whether the
 # author READ the ref, and the next actor still has to read it.
 #
-# ⚠️ STATED RESIDUAL — THE WIP CROSS-CHECK IS BEST-EFFORT, AND DELIBERATELY SO, IN THREE WAYS.
+# ⚠️ STATED RESIDUAL — THE WIP CROSS-CHECK IS BEST-EFFORT, AND DELIBERATELY SO, IN FOUR WAYS.
 #   (a) COVERAGE: it bites on a brief whose `WIP:` line carries a REAL issue number. The canonical
 #       block ships the slot `issue-<N>`, so a brief that still carries the slot is admitted by SHAPE —
 #       exactly as the research contract admits its own `<…>` slots. This is a presence-and-shape gate,
@@ -67,6 +67,13 @@
 #       the ordinary case is the measured one.
 #   (c) NAME, NOT CONTENT: it can prove that a snapshot EXISTS for an issue, never that the snapshot
 #       contains the work you need. Reading it is the next actor's job — which is why the line says so.
+#   (d) `keyless — <why>` SKIPS THE CROSS-CHECK ENTIRELY, FOR EVERY ROLE. It exists because a
+#       diagnosis lane (stall-fix, the drainer) really has no issue and refusing it would force a
+#       false key — but the gate cannot distinguish that lane from an evader, so it is a declared
+#       OFF-SWITCH and the cheapest way past the machine check. Not fixed here: the durable fix is
+#       an input the gate does not have yet (the key the DISPATCHER already knows — `lane.sh`,
+#       `fix-one.sh` and `merge-one.sh` each hold their issue/PR), which would let a `keyless` claim
+#       be refused when a key is known. Stated rather than absorbed.
 # The refusal is deterministic and per-issue, so (a) and (b) are boundaries of a real check rather than
 # a hopeful one; and `--wip-refs` (the verb `claim-reaper.sh` and `claims.sh` consume) fails CLOSED for
 # the handover record, where abstaining costs nothing.
@@ -320,8 +327,11 @@ BEGIN { ins = 0; depth = 0; val = ""; _n = 0; fence = 0; fencec = ""; fencelen =
 # ⛔ EVERY `WIP:` VALUE, one per line, prefixed `V<TAB>` — the earlier "last one wins" shape made the
 # cross-check trivially bypassable: append a second `WIP:` line (unfenced, and the canonical block IS
 # such a line) and the checker abstained on it while the shape check was satisfied by the first.
-END {}
-{
+# ⛔ THE EMISSION IS IN `END`, NOT IN A TRAILING PATTERN-LESS RULE (fresh review of #3484, nit). A
+# pattern-less rule runs once per INPUT LINE, so it printed `_n` values for EVERY record — a 6-line
+# block with one WIP line emitted its value 4 times. Harmless only because the consumer loops and
+# dedups; the contract here says one line per value.
+END {
   for (_i = 1; _i <= _n; _i++) printf "V\t%s\n", _v[_i]
 }
 '
@@ -473,7 +483,13 @@ brief_gate_previous_work() { # brief_gate_previous_work <file|-> [repo] [role]
         # the claim is what FOLLOWS the key, so a measurement note that mentions `refs/wip/*` is still a
         # claim of absence (an earlier draft read the whole value and switched itself off)
         rest="${val#issue-}"; rest="${rest#"$issue"}"
-        claim="$(printf '%s' "$rest" | sed -e 's/^[[:space:]]*\(->\|→\|:\)[[:space:]]*//')"
+        # ⛔ `sed -E`, NOT BRE `\|` (fresh review of #3484, P1). BSD sed — macOS, the platform
+        # `install.sh`/launchd target — does not implement `\|`, so `\(->\|→\|\)` matched the LITERAL
+        # three-token string `->|→|:` and never a real separator. The claim then kept its leading
+        # `-> `, failed the `refs/wip/*` test below, and an HONEST brief that NAMED its rescued ref
+        # was REFUSED with 80 on every Mac while the Linux suite stayed green — an inert enforcer
+        # with no diagnostic, the exact class `orch-loop.sh` already ruled on for this spelling.
+        claim="$(printf '%s' "$rest" | sed -E -e 's/^[[:space:]]*(->|→|:)[[:space:]]*//')"
         case "$claim" in refs/wip/*) : ;; *) issues="$issues $issue" ;; esac ;;
       pr-[0-9]*)
         # A PR key is the FIXER's and the REVIEWER's key (they hold `refs/claims/<pr>-<sha>`); for a
@@ -637,9 +653,18 @@ BEGIN { ins = 0; depth = 0; sec = 0; internal = 0; external = 0; rung = 0; ct = 
     # ⛔ THREE ACCEPTED KEYS, AND `keyless` IS THE THIRD ON PURPOSE (#3484). `issue-<N>` is the normal
     # case and the only one the cross-check can resolve; `pr-<N>` is a fixer working one PR; and a
     # DIAGNOSIS lane (stall-fix, the drainer) genuinely has no key, so refusing it would force a FALSE
-    # one — the choice is between an honest `keyless — <why>` and an invented issue number. An author
-    # who means to evade can invent a number more easily than they can justify `keyless`, so nothing is
-    # gained by withholding the honest form.
+    # one — and a FALSE one does not merely get accepted, it TRIGGERS the cross-check against the
+    # wrong issue and is refused, which sends the author back to invent a better number.
+    # ⛔ `keyless` IS A DECLARED ESCAPE, AND THE CHEAPEST ONE (fresh review of #3484, P2 — the earlier
+    # sentence here claimed the opposite, that "an author who means to evade can invent a number more
+    # easily than they can justify `keyless`", which is backwards: inventing a number is the path that
+    # gets REFUSED, so `keyless — <anything>` is strictly cheaper for an evader than honesty, for every
+    # role this gate accepts). What bounds it is NOT that it is hard to write — it is that the gate
+    # cannot tell a diagnosis lane from an evasion, and the alternative (refusing it) kills the drainer
+    # and `stall-fix.sh`, which are real dispatches with no issue. Recorded as residual (d) above and
+    # not hidden here; the durable fix is for the callers that DO know the key to pass it, so a
+    # `keyless` claim can be checked against a known key (`lane.sh`/`fix-one.sh`/`merge-one.sh` each
+    # know their issue or PR today).
     # ⛔ PRESENCE ONLY, HERE. Whether the key is valid is decided in ONE place — `brief_gate_previous_work`,
     # which reads EVERY `WIP:` value (fresh-context review of #3484, P1: two readers that disagreed about
     # WHICH line is the claim let a trailing `WIP: none` / a pasted canonical block / a bare label satisfy

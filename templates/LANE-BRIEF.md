@@ -63,7 +63,7 @@ CONTRADICTION TEST: which RECORDED DECISION covers this work — an owner ruling
 ## PREVIOUS WORK — did someone already start this? (agent-infra#3484)
 
 A released claim reads as "nothing happened here" unless someone looks, and 222 rescued `refs/wip/*`
-snapshots existed on this repo that nothing told the next actor about. Measure the four facts below
+snapshots existed on this repo that nothing told the next actor about. Measure the five facts below
 and paste the MEASUREMENT — this is the handover the reaper cannot write for you, because only you
 know what the previous attempt concluded.
 
