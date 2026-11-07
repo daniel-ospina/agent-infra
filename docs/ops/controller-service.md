@@ -68,7 +68,8 @@ render time" is not a property systemd can rely on at boot. Measured on cell-1:
 `ExecStart=/bin/bash /tmp/wt-2433-fu/scripts/cloud-cell-supervisor.sh start` — a **lane worktree** at an
 unmerged branch — so once that path goes the unit's `ExecStart` cannot resolve, `Restart=always` retries
 a 127 for ever, `is-active` reads `activating`, and **nothing pages**. `/tmp` is not its own mount on
-these cells, so the mechanism is `systemd-tmpfiles --clean` (10 days after the entry is last touched),
+these cells, so the mechanism is `systemd-tmpfiles --clean` once the entry ages out of the window the box's
+own `tmpfiles.d` sets (`D /tmp … 30d` on this fleet's Ubuntu/systemd-255 image, `10d` on some others),
 not a reboot: the box looks healthy for a while and then fails silently.
 
 So the installer **refuses to render** a supervisor that resolves into a lane worktree, or under a

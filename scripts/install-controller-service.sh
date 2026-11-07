@@ -160,9 +160,11 @@ help_text() {
 # whatever checkout the operator happened to run `--install` from. MEASURED on cell-1:
 # `ExecStart=/bin/bash /tmp/wt-2433-fu/scripts/cloud-cell-supervisor.sh start`, i.e. a LANE WORKTREE at a
 # branch nobody merged (`fix/2402-fence-and-scope`). Two silent consequences: `/tmp` entries are dropped by
-# `systemd-tmpfiles --clean` ten days after they are last touched (`/tmp` is not its own mount on these
-# cells, so the CLEANER, not a reboot, is the mechanism) — after which the unit's ExecStart cannot resolve,
-# `Restart=always` retries a 127 for ever, `is-active` reads `activating`, and NOTHING pages — and the code
+# `systemd-tmpfiles --clean` once they age out of the window the box's own tmpfiles.d sets — `D /tmp … 30d`
+# on this fleet's Ubuntu/systemd-255 image (`/usr/lib/tmpfiles.d/tmp.conf`), 10d on some others; `/tmp` is
+# not its own mount on these cells, so the CLEANER, not a reboot, is the mechanism. After that the unit's
+# ExecStart cannot resolve, `Restart=always` retries a 127 for ever, `is-active` reads `activating`, and
+# NOTHING pages — and the code
 # the dispatcher runs is a branch nobody merged. Same seam, three cells, three different ExecStart shapes,
 # all of them "whatever was beside the installer". Measured again on cell-4 in the shape a TEST render
 # leaves behind: `ExecStart="/usr/local/bin/python3.12" "/tmp/rp3055.SzqD2K/converger.py" --repo "o/r"
@@ -178,9 +180,13 @@ help_text() {
 # home, the checkout `$AGENT_INFRA_PATH` names), and a lane worktree is refused wherever it lives, because
 # that is the directory a lane removes when it ends.
 # ⛔ THE TEMPORARY-ROOT LIST IS THE ONE `scripts/orchestrator-harness/runner_autoscale.py` ALREADY USES for
-# the same judgement (`TRANSIENT_UNIT_PREFIXES`). Two lists would drift, and the copy that stays un-updated
-# would be the one that admits the next measured shape. `$TMPDIR` joins it because a fixture — or a box with
-# a relocated temp — is under whatever it says.
+# the same judgement (`TRANSIENT_UNIT_PREFIXES`), COPIED here because a farmed installer cannot import the
+# python — and the copy is DRIFT-GATED rather than trusted: `install-controller-service.test.sh` §P8 compares
+# the two lists as sets, so a root added on either side reddens until both agree. Without that gate the copy
+# would be the one that stays un-updated and silently ADMITS the next measured shape. `$TMPDIR` is graded at
+# USE time in `transient_root_of`, separately and quoted (never concatenated into the literal: it is a
+# property of the calling shell, a relocated temp is under whatever it says, and a value containing a space
+# must not split into two bogus roots).
 TRANSIENT_ROOTS="/tmp /var/tmp /run /dev/shm /var/folders /private/tmp /private/var/tmp /private/var/folders"
 
 # lane_scratch_shape <resolved path> — the lane-scratch SHAPE this path matches, or nothing.
@@ -333,7 +339,7 @@ scratch_supervisor_reason() {
         if [ -z "$(transient_root_of "$d")" ] || primary_clone_root "$d"; then declared="$d"; break; fi
     done
     [ -z "$declared" ] || return 1
-    printf 'it is under %s, which a reclaim or a tmp cleaner removes (systemd-tmpfiles --clean drops /tmp entries 10 days after they are last touched), and it is under none of the deployment roots this box declares (CELL_HOME=%s, HOME=%s%s)' \
+    printf 'it is under %s, which a reclaim or a tmp cleaner removes (systemd-tmpfiles --clean drops /tmp entries once they age out of this box'\''s window — 30 days on the fleet'\''s Ubuntu/systemd-255 image, 10 on others), and it is under none of the deployment roots this box declares (CELL_HOME=%s, HOME=%s%s)' \
         "$root" "$CELL_HOME" "$HOME" "${AGENT_INFRA_PATH:+, AGENT_INFRA_PATH=$AGENT_INFRA_PATH}"
     return 0
 }

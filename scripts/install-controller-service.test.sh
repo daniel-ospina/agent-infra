@@ -49,9 +49,10 @@
 #       §P6 asserts the lane-scratch shape list is IDENTICAL to install-repair-service.sh's (two copies
 #       would drift), §P7 proves a lane worktree is decided by GIT (a LINKED worktree is refused under a
 #       durable root and with a name no pattern matches, a caller cannot launder one by declaring its
-#       own root, and a PRIMARY clone under /tmp — the cells' `/tmp/cell-ai` — still installs), and §P5
-#       pins the two seam strengths (a caller's preference is skipped loudly, an operator's requirement
-#       is refused).
+#       own root, and a PRIMARY clone under /tmp — the cells' `/tmp/cell-ai` — still installs), §P8 gates
+#       the OTHER list, the transient roots, against runner_autoscale.py's `TRANSIENT_UNIT_PREFIXES` (the
+#       guard is only as wide as that list, and it is a copy), and §P5 pins the two seam strengths (a
+#       caller's preference is skipped loudly, an operator's requirement is refused).
 #
 # Hermetic: temp HOME/state/unit dirs, stub `systemctl`/`tmux` that RECORD their argv (so "did it call
 # start/stop" is answered by evidence, not by the absence of an error), a stub supervisor built from
@@ -2997,6 +2998,31 @@ case "$PREFB_OUT" in
   *'no DURABLE cloud-cell-supervisor.sh'*) ok '§P5: and that refusal names what a durable supervisor would be' ;;
   *) bad "§P5: the nothing-durable refusal does not name a durable alternative — $PREFB_OUT" ;;
 esac
+
+# ── §P8 — the transient-root list has ONE source of truth, and this arm is its drift gate ────────
+# ⛔ THE GUARD IS ONLY AS WIDE AS ITS ROOT LIST, AND THE INSTALLER'S LIST IS A COPY. `runner_autoscale.py`
+# (`TRANSIENT_UNIT_PREFIXES`) already owns this judgement for a unit's WorkingDirectory and its ExecStart
+# program; the installer carries its own literal because a farmed copy cannot import the python. An
+# ungated copy is exactly the drift the installer's own comment warns about: a root added to the Python
+# would keep being ADMITTED here, and the measured shape under that root would re-ship — a fail-open in
+# the guard, not a cosmetic mismatch. So the two lists are compared as SETS; a root added on either side
+# reddens this arm until both agree. (Distinct from §P6, which gates the lane-scratch SHAPE list against
+# install-repair-service.sh's mirror — two different lists, two different owners, two drift gates.)
+say_case 'the transient-root list the installer grades against is the one runner_autoscale.py owns'
+PY_ROOTS="$(sed -n '/^TRANSIENT_UNIT_PREFIXES = (/,/^)/p' "$HERE/orchestrator-harness/runner_autoscale.py" 2>/dev/null \
+  | sed -n 's/^[[:space:]]*"\([^"]*\)",*$/\1/p' | grep -v '^$' | sort -u)"
+SH_ROOTS="$(sed -n 's/^TRANSIENT_ROOTS="\(.*\)"$/\1/p' "$HERE/install-controller-service.sh" 2>/dev/null \
+  | tr ' ' '\n' | grep -v '^$' | sort -u)"
+if [ -z "$PY_ROOTS" ] || [ -z "$SH_ROOTS" ]; then
+  bad '§P8: could not read BOTH root lists, so drift cannot be shown — an arm that passes on an unreadable side is vacuous'
+else
+  printf '%s\n' "$PY_ROOTS" > "$T/p8-py.txt"; printf '%s\n' "$SH_ROOTS" > "$T/p8-sh.txt"
+  P8_ONLY_PY="$(comm -23 "$T/p8-py.txt" "$T/p8-sh.txt" | tr '\n' ' ')"
+  P8_ONLY_SH="$(comm -13 "$T/p8-py.txt" "$T/p8-sh.txt" | tr '\n' ' ')"
+  [ "$PY_ROOTS" = "$SH_ROOTS" ] \
+    && ok "§P8: both lists name the same $(printf '%s\n' "$PY_ROOTS" | grep -c .) transient roots" \
+    || bad "§P8: TRANSIENT_ROOTS drifted from runner_autoscale.py's TRANSIENT_UNIT_PREFIXES — a root one side refuses is ADMITTED by the other (only-python=[${P8_ONLY_PY% }] only-shell=[${P8_ONLY_SH% }])"
+fi
 
 printf '\n────────────────────────────────────────────\n'
 printf 'passed=%s failed=%s\n' "$PASS" "$FAIL"
