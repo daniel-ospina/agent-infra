@@ -913,11 +913,13 @@ GH_PROBE_CAUSE=""
 # a `--paginate` refusal can replay a whole error body, and `why=` is a single-line key in a file every
 # beat reads — so the first non-empty line, whitespace-collapsed, truncated.
 # ⛔ AND THE CLAUSE PUTS IT AT THE FRONT (#3701 review round 2, P2). `refresh_cause_brief` prints
-# `why=` cut at 400 characters, and the outer `provision_fail` prefix plus the arm's own verdict words
-# consumed ~200 of them on some arms — so a clause that led with its verdict left under half the
-# beat's window for the evidence. Measured after this ordering: the evidence begins at character ~61
-# on every arm, so ~340 characters of it survive the cut instead of ~186 on the worst one. The cap
-# below still bounds the whole line; only its tail can ever be clipped, and only in the beat.
+# `why=` cut at 400 characters (`orch-loop.sh:2558`), and the words in front of the evidence are not
+# free: `provision_fail` prepends its own verdict token and the refusal sentence. MEASURED on the real
+# record (`state/refresh-last`'s `why=`, both arms driven by this suite's own stubs): the evidence now
+# begins at character 62 of the line, against 93 (`rc=75`) and 117 (the default arm) before this
+# ordering — so ~338 characters of the evidence sit inside the beat's 400-character window instead of
+# ~307 and ~283. The cap below still bounds the whole clause; only its tail can ever be clipped, and
+# only in the beat.
 GH_PROBE_CAUSE_MAX=320
 gh_probe_evidence() {  # <rc> — the measured answer, one line, or a named non-answer
   local rc="${1:-?}" line
@@ -1077,7 +1079,7 @@ gh_probe_env() {
   [ "$prc" -eq 0 ] && { GH_PROBE_CAUSE=""; gh_probe_err_cleanup; return 0; }
   err="$( [ -n "$GH_PROBE_ERR" ] && sed -n '1,4p' "$GH_PROBE_ERR" 2>/dev/null )"
   if gh_probe_timed_out "$prc"; then
-    # ⛔ "NOT A SPENT BUDGET" WAS A CLAIM THIS ARM CANNOT MAKE (#3701 review round 2, P1). At DEFAULT
+    # ⛔ "NOT A SPENT BUDGET" WAS A CLAIM THIS ARM CANNOT MAKE (#3701 review round 2, P2). At DEFAULT
     # settings the shim spends 120 s sleeping out a shared throttle window before it ever returns 75,
     # so a probe bounded at 20 s sees THIS arm — and "a shared budget is being slept out" is one of
     # the things a bound here can mean. It establishes a NON-ANSWER, nothing more.
