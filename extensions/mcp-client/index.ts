@@ -653,6 +653,17 @@ function isValidServerName(name: string): boolean {
  * ("refusing `sse` here would refuse a config that WORKS"). Rejecting an entry for its `type` would
  * therefore reverse that ruling AND zero a self-hosted config the installer certifies — so an
  * unrecognised `type` only earns a warning, never a drop.
+ *
+ * ⛔ OVERRIDES: the platform rule that `type` is the transport SELECTOR — pi's `docs/mcp.md:78`
+ * ("When present, `type` must be `stdio`, `http`, or `streamable-http`") and Agent Client Protocol's
+ * "transport variants are selected through this field" both treat a `type` that disagrees with the
+ * entry as disqualifying. This client never reads `type` (it dispatches on `url`/`command`), so a
+ * `type` can only ever ANNOTATE an entry here — it never selects, refuses or rewrites one. Reason: the
+ * sibling ruling in `pi-bootstrap/lib/merge-mcp.py` and `pi-bootstrap/cell-install.sh` is that a
+ * self-hosted `type: "sse"` config WORKS as written, so refusing or rewriting it would zero a config
+ * the installer certifies. ⛔ Read this line before "correcting" the behaviour back to the platform
+ * default — that is a reopen of that decision, not a bug fix. The absence of this marker is what let an
+ * earlier revision of the PR that introduced this file describe the opposite behaviour in its own body.
  */
 const RECOGNISED_TYPES = new Set(["stdio", "http", "streamable-http"]);
 
