@@ -1970,10 +1970,15 @@ async function partB() {
       expectTrue(`B13d: F1 an unmatched \`[\` does not expose its bytes to a rejecting rule (${f1})`,
         cg.wtIsPathShapedScriptWord(f1) === true);
     }
-    for (const [why, cmd] of deleted1228) {
-      write(join(wt, "dirty.txt"), "MUTANT\n");
-      const r = await bash(cmd, wt);
-      expectTrue(`B13d: ${why} → BLOCKED (${cmd})`, blocked(r), JSON.stringify(r)?.slice(0, 200));
+    // ⛔ F1's SECOND shape (#3333 review cycle-4): the jump must start from `origin/main`'s FIRST
+    // closer, not the LAST `]` in the whole word. `[/]/[]` and friends are real executable paths
+    // (unmatched brackets are literal in pathname expansion) that were `true` on main and `false` on
+    // both earlier cuts of this rule, ALLOW-through-the-handler where main BLOCKed. Predicate-level:
+    // the fixture is a directory literally named `[` holding `[]`, which no shell-quoting form can
+    // express portably, so the assertion is made where the failure lived.
+    for (const b of ["[/]/[]", "a[/]/[]", "x[/]/y[]", "[a/b]/[]", "[/]/~[]", "/[]`]`", "[]`]`/"]) {
+      expectTrue(`B13d: F1 the \`[\` jump is main's FIRST closer, so a real path survives (${b})`,
+        cg.wtIsPathShapedScriptWord(b) === true);
     }
     // ⛔ THE POSITIVE CONTROLS the fail-open class needs: the LITERAL spellings stay gated by their
     // EFFECT (#709), so the arms above are not "everything under these directories is refused", and
@@ -2940,32 +2945,58 @@ if (process.argv.includes("--mutations")) {
       // separates two real components — into ONE placeholder. `q[0]w/undo[x].sh`, `a[b]c/d[e]` and
       // `x[b]y/z[c]` were ALLOW at that head and BLOCK on `origin/main`. Bounding the jump to a closer
       // inside the current component is the fix; removing the bound reproduces the fail-open.
-      "the `[` closer hunt is bounded to the CURRENT component, so it cannot swallow a `/` (#3333 c2 P1-2)",
+      "the `[` fold cannot swallow a separator — the `/` in `q[0]w/undo[x].sh` survives (#3333 c2 P1-2)",
       [[
-        String.raw`        if (inComponent > i) e = inComponent;`,
-        String.raw`        if (false) e = inComponent;`,
+        String.raw`      let e = s.indexOf("]", i + 1);`,
+        String.raw`      let e = LAST_CLOSE;`,
       ]],
       (m) => m.wtIsPathShapedScriptWord("q[0]w/undo[x].sh"),
       true,
       false,
       "the `/` between two bracket groups is swallowed into one placeholder again",
     ],
+    // (No separate pair for the POSIX-class FOLD's `/`-bound: reverting the DEFAULT to `LAST_CLOSE` —
+    // the pair immediately above — reintroduces the old unbounded jump, and that is the only way this
+    // code can still cross a separator. The FOLD itself is structurally bounded by `sl`, so a pair
+    // aimed at it could not fail. It is pinned by its own pair above (the sed exclusion).)
     [
-      // ⛔ THE F1 PAIR (#3333 review cycle-2). The bind above shipped in a first cut that, when NO closer
-      // sat inside the current component, assigned `e = -1` and then did not jump at all — leaving the
-      // loop to VISIT the group's bytes, where the `^` anchor, the unbalanced-`${`/backtick refusals and
-      // the alphabet could each delete the word. `a/[/^/[0]` and `a/[b/c/'${x'/undo]z/d.sh` were real
-      // expanded paths that went ALLOW here and BLOCK on `origin/main`, destroying uncommitted work
-      // end-to-end. The fallback restores main's jump for that case; neutering it must reproduce F1a.
-      "an unmatched `[` STILL jumps when no closer is in reach, so its bytes reach no rejecting rule (#3333 c2 F1)",
+      // ⛔ THE F1 PAIR (#3333 review cycles 2 and 4 — this rule has now been wrong TWICE, in opposite
+      // directions, and each cut moved the hole instead of closing it).
+      //   cut 1: `e = LAST_CLOSE` unconditionally — swallowed `/` bytes, so `q[0]w/undo[x].sh` was
+      //          deleted (`false`) while `origin/main` kept it.
+      //   cut 2: bound it with `e = -1` when no closer was in reach — the loop then did not jump and
+      //          VISITED the bytes, so the `^` anchor and the unbalanced-`${` refusal deleted real
+      //          paths (`a/[/^/[0]`).
+      //   cut 3 (this one): start from `origin/main`'s own jump — the FIRST closer — so parity holds by
+      //          construction, and depart from it only to fold a POSIX class.
+      // This pair reverts the default back to `LAST_CLOSE` and demands the cycle-4 class come back.
+      "the `[` jump starts from main's FIRST closer, so a real path is never skipped (#3333 c4 F1)",
       [[
-        String.raw`        if (inComponent > i) e = inComponent;`,
-        String.raw`        e = inComponent;`,
+        String.raw`      let e = s.indexOf("]", i + 1);`,
+        String.raw`      let e = LAST_CLOSE;`,
       ]],
-      (m) => m.wtIsPathShapedScriptWord("a/[/^/[0]"),
+      (m) => ["[/]/[]", "a[/]/[]", "x[/]/y[]", "[a/b]/[]"].every((w) => m.wtIsPathShapedScriptWord(w)),
       true,
       false,
-      "an unmatched `[` falls through to the next byte and the `^` component anchor deletes a real path again",
+      "unmatched brackets stop being literal filename bytes and every `[/]`-shaped real path goes invisible",
+    ],
+    [
+      // ⛔ THE POSIX-CLASS FOLD PAIR (#3333 review cycle-3/4). The fold is the ONE departure from
+      // main's jump: a `[[:…:]]` class consumes its own closers so the group is ONE placeholder instead
+      // of leaking a `]`. That is what keeps the sed exclusion a NAMED rule — remove the fold and `out`
+      // ends `]`+`PG` rather than `PH`+`PG`, so the `$` end-anchor no longer fires and the sed
+      // expression #3243 was filed for becomes a script path again. NOTE this pair is deliberately
+      // separate from the `$` pair above: they pin DIFFERENT rules on the same probe, and neither may
+      // mask the other.
+      "a POSIX character class folds to ONE group, so the sed exclusion is a rule and not a leaked byte (#3333 c3)",
+      [[
+        String.raw`        if (inComponent > e) e = inComponent;`,
+        String.raw`        if (false) e = inComponent;`,
+      ]],
+      (m) => m.wtIsPathShapedScriptWord("s/[[:space:]]*$//"),
+      false,
+      true,
+      "the class leaks its closing `]`, the `$` end-anchor stops matching, and the sed expression becomes a path",
     ],
     [
       // ⛔ THE P2-1 PAIR (#3333 review cycle-2, measured): the prologue accept was the cycle-7 P0 fix

@@ -3551,23 +3551,36 @@ export function wtIsPathShapedScriptWord(word) {
     // BLOCKed — a bash glob really expands `q[0]w/undo[x].sh` to `q0w/undox.sh`. So the jump is bounded
     // to a closer INSIDE THE CURRENT COMPONENT: the last `]` before the next `/`. `[[:space:]]` still
     // folds to ONE group (it carries no `/`), which is what `LAST_CLOSE` was introduced for.
+    // ⛔ THE `[` JUMP IS MAIN'S JUMP: THE **FIRST** CLOSER AFTER THE `[` (#3333 review cycle-4, F1 —
+    // measured, and the two earlier cuts of this rule each opened a NEW fail-open, so this one is built
+    // for PARITY BY CONSTRUCTION: it starts from exactly what `origin/main` does and departs from it
+    // in ONE direction, which can only ADD candidates). `origin/main` is `s.indexOf("]", i + 1)`; two
+    // prior cuts of this branch instead jumped to `LAST_CLOSE` (the last `]` in the WHOLE word), which
+    // skipped `/` bytes main visits — `[/]/[]`, `a[/]/[]`, `x[/]/y[]`, `[a/b]/[]`, `[/]/~[]`,
+    // `/[]`]`` and `[]`]`/` are real executable paths that were `true` on main and `false` here, and
+    // ALLOW-through-the-handler where main BLOCKed. A bound that instead refused to jump at all was the
+    // same class one spelling over (`a/[/^/[0]`). Neither is possible now: the default is main's first
+    // closer.
+    // ⛔ THEN ONE DELIBERATE DEPARTURE, IN THE ACCEPTING DIRECTION: a closer that sits inside the
+    // CURRENT COMPONENT and is FURTHER RIGHT is also consumed, so a POSIX class (`[[:space:]]`) folds to
+    // ONE group instead of leaking its closing `]`. That is what keeps `s/[[:space:]]*$//`'s exclusion
+    // a NAMED rule rather than an accident of a leaked byte — but it can only ever swallow bytes up to
+    // the next `/`, so it cannot hide a separator. The earlier bug was jumping to the LAST `]` with no
+    // `/` bound at all; this one is bounded by construction, not by a fallback.
     if (ch === "[") {
       const sl = s.indexOf("/", i + 1);
-      let e = LAST_CLOSE;
-      if (sl >= 0 && e > sl) {
+      let e = s.indexOf("]", i + 1);
+      // ⛔ THE DEPARTURE IS NARROWER THAN "a closer inside the component": it is a POSIX CHARACTER
+      // CLASS, `[[:…:]]`, which is the ONLY shape that needs folding — a class is one group in a shell
+      // glob, so leaving its inner `]` loose is what made `s/[[:space:]]*$//` depend on a leaked byte.
+      // ⚠️ A GENERAL fold was wrong and was measured wrong (#3333 review cycle-4): folding ANY group up
+      // to the next `/` skipped an opening backtick and left its partner unbalanced, so `[]`]`/` went
+      // `false` here and `true` on `origin/main` — the same fail-open class once more. Keyed on `[[:`
+      // and on a `/` existing to the right, the fold cannot reach a separator and cannot skip a quote
+      // opener that a POSIX class would contain.
+      if (sl >= 0 && s.startsWith("[[:", i)) {
         const inComponent = s.lastIndexOf("]", sl);
-        // ⛔ WHEN NO CLOSER SITS INSIDE THIS COMPONENT THERE IS NOTHING TO BOUND, AND THE JUMP MUST
-        // STILL HAPPEN (#3333 review cycle-2, F1 — measured, and it was a P0 fail-OPEN this bound
-        // introduced in its first cut). Falling through to `e = -1` and then `if (e > i)` left the loop
-        // VISITING the group's bytes as ordinary bytes, so every rejecting byte rule could fire on
-        // them — `a/[/^/[0]` hit the `^` component anchor, `a/[b/c/'${x'/undo]z/d.sh` hit the
-        // unbalanced-`${` refusal, `a/[/x'|'y/undo]z/w.sh` hit the alphabet. All three are real paths a
-        // shell expands and execs, all three were **true on `origin/main`**, and through the real
-        // handler they went ALLOW where main BLOCKed (end-to-end: uncommitted work destroyed). The
-        // greedy jump `origin/main` performed was correct here — it is only the case where a closer
-        // DOES sit inside the component (`q[0]w/undo[x].sh`) that the greedy jump swallowed a `/`.
-        // So: bound the jump when a closer is in reach, otherwise keep main's jump unchanged.
-        if (inComponent > i) e = inComponent;
+        if (inComponent > e) e = inComponent;
       }
       out += PH; if (e > i) i = e; continue;
     }
