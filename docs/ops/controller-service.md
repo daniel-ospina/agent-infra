@@ -79,14 +79,20 @@ are the cell's own home (`CELL_HOME`), the operator's `HOME`, and `$AGENT_INFRA_
 cells keep their home under `/tmp`** (`/tmp/cell-home`) and their harness pin under it too
 (`/tmp/cell-home/harness/<sha>/scripts/…`, the shape cell-3 measured as correct), so "under `/tmp`"
 alone cannot be the rule without blocking every cell bring-up. The refusal names the durable
-alternatives (the farmed `$HOME/.pi/agent/scripts/…`, `$AGENT_INFRA_PATH/scripts/…`, or the harness pin)
-and writes **nothing** — the preview verb refuses too.
+alternatives (`$AGENT_INFRA_PATH/scripts/…`, the harness pin, and `$HOME/.pi/agent/scripts/…`) and writes
+**nothing** — the preview verb refuses too. ⛔ **The farmed path is only viable on a box that already has
+the file there**: `cloud-cell-supervisor.sh` is in **no** `pi-bootstrap` array (setup.sh records it as a named
+residual owned by #1938), so `bash pi-bootstrap/setup.sh` alone does not create it — the refusal says so
+rather than handing an operator a remedy that cannot be followed.
 
 ⛔ **"Lane worktree" is decided by GIT — and by the BRANCH, not by being a worktree.** A name list cannot
 be the guard (the measured shape was `/tmp/wt-2433-fu`; the next lane picks the next name, and a copy
 nested one directory deeper matches no pattern). In a **linked** worktree `git rev-parse
 --absolute-git-dir` answers `<main>/.git/worktrees/<name>` while `--git-common-dir` still answers
-`<main>/.git`; in the **main** clone the two are the same directory.
+`<main>/.git`; in the **main** clone the two are the same directory. ⛔ Those questions (and the pin's) are
+asked with `GIT_DIR`, `GIT_WORK_TREE`, `GIT_COMMON_DIR` and `GIT_INDEX_FILE` **scrubbed**, because an exported
+`GIT_DIR` at the hub makes both answers the hub's and reads a linked worktree as primary — measured, and
+§P7 arms it.
 
 ⛔ **NOT EVERY LINKED WORKTREE IS A LANE'S — the cell's harness pin is one too.** The bring-up creates the
 pin with `git worktree add --detach <pin>/<sha> <sha>`, so a rule that refused every linked worktree
@@ -99,8 +105,7 @@ one is a pin at a commit and is then merely subject to the temporary-root/declar
 **primary** clone under `/tmp` (`/tmp/cell-ai`, the cells' own checkout) is untouched; and **no declaration
 launders a branch checkout**: a caller that names its own worktree as `AGENT_INFRA_PATH` does not get to
 admit it. When git cannot identify the checkout at all (a `.git` entry it refuses to read — dubious
-ownership, an exported `GIT_DIR`, an unreadable directory), the answer is **cannot prove**, and it is
-refused rather than admitted.
+ownership, an unreadable directory), the answer is **cannot prove**, and it is refused rather than admitted.
 
 The fleet's scratch shapes (`*/.worktrees/*`, `/tmp/wt-*`, `/tmp/cell-wt-*`, `/tmp/base-*`) are refused
 by name as well, and that list is the **same** list `scripts/install-repair-service.sh` uses — the suite
