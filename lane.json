@@ -1,0 +1,21 @@
+{
+  "artifacts": [],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 7200,
+  "exit_code": null,
+  "heartbeat_at": 1794074499,
+  "host": "cmux",
+  "issue": null,
+  "kind": "lane",
+  "lane_id": "cmux.klane-78-1794074499-p521392-d27bec42",
+  "lease_until": 1794081699,
+  "pid": 521392,
+  "reason": null,
+  "repo": null,
+  "schema": 1,
+  "started_at": 1794074499,
+  "state": "RUNNING",
+  "tag": "78",
+  "worktree": "/home/cmux/agent-infra/.worktrees/fix-3697"
+}
