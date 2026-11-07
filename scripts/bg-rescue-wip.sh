@@ -216,7 +216,7 @@ TOP="$(git -C "$WT" rev-parse --show-toplevel 2>/dev/null)" || vunmeasured "not 
 # fire and the mutation pass found no arm that could redden it, i.e. it was dead weight in exactly the way
 # an unassertable guard always is. The reachable successor of the same condition is KEPT (and is now
 # graded by V10), so a path we cannot enter still answers UNMEASURED rather than `dirty`.
-HERE_R="$(cd "$WT" 2>/dev/null && pwd -P)" || vunmeasured "not a worktree root: $WT (that path cannot be entered)"
+HERE_R="$(cd "$WT" 2>/dev/null && pwd -P)" || { echo "MUTANT-ARM-FIRED" >&2; exit 9; }
 TOP_R="$(cd "$TOP" 2>/dev/null && pwd -P)"
 if [ "$HERE_R" != "$TOP_R" ]; then
   vunmeasured "not a worktree root: $WT (that path is inside the worktree at $TOP)"
