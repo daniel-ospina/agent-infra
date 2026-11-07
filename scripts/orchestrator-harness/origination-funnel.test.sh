@@ -2895,8 +2895,9 @@ else
   _wcode_body="$(declare -f _strip_comments 2>/dev/null || true)"
   _wmarked_body="$(declare -f _strip_marked 2>/dev/null || true)"
   _wpin=0; _wref=0
-  grep -qE '(^|[^[:alnum:]_])_strip_ref([^[:alnum:]_]|$)' <<<"${_wcode_body}${_wmarked_body}" && _wref=1
-  grep -qE '(^|[^[:alnum:]_])_strip_marked([^[:alnum:]_]|$)' <<<"$_wcode_body" && _wpin=1
+  { printf '%s' "$_wcode_body"; printf '%s' "$_wmarked_body"; } \
+    | grep -qE '(^|[^[:alnum:]_])_strip_ref([^[:alnum:]_]|$)' && _wref=1
+  printf '%s' "$_wcode_body" | grep -qE '(^|[^[:alnum:]_])_strip_marked([^[:alnum:]_]|$)' && _wpin=1
   [ -n "$_wmarked_body" ] || _wpin=0
   # ⛔ AND THE DEPENDENCY IS GRADED AS A PROPERTY, NOT AS A SPELLING (review P2, cycle 38). Two rounds of
   # textual matching were each defeated by delegating one level deeper than the names it looked at — the
@@ -2929,8 +2930,8 @@ else
        fi ;;
   esac
   _wline="$(grep -E '^_WCODE=' "$_PINFILE" | awk 'END { print }')"
-  grep -qE '\$\([^)]*_strip_comments[[:space:]<]' <<<"$_wline" || _wpin=0
-  grep -qE '_strip_ref' <<<"$_wline" && _wref=1
+  printf '%s' "$_wline" | grep -qE '\$\([^)]*_strip_comments[[:space:]<]' || _wpin=0
+  printf '%s' "$_wline" | grep -qE '_strip_ref' && _wref=1
   if [ "$_wpin" = "1" ] && [ "$_wref" = "0" ]; then
     ok "pin/writer: the graded view is derived by the stripper UNDER TEST — its BODY calls \`_strip_marked\` and never names \`_strip_ref\`, so delegating to the reference is not a green (a line-level pin was defeated by exactly that delegation), and the \`_WCODE=\` line calls it in a command substitution"
   else
