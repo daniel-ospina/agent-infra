@@ -4773,8 +4773,8 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
               lastLifeSignAt: lastHeartbeat,
               lastProgressAt: hbCtx.state.lastProgressAt,
               startedAt,
-              sessionEnded: hbCtx.state.sessionEnded,
-              toolsInFlight: hbCtx.state.toolsInFlight,
+              sessionEnded: false,
+              toolsInFlight: 0,
             });
       if (supersededBy) {
         staleSuppressCount += 1;
