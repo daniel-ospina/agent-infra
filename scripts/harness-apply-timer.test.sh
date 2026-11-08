@@ -1576,6 +1576,97 @@ OUT="$(PASS_UNDER_TEST="$PASS_PRE" run_pass_unit "$T/t26pf" 2>&1)"; RC=$?
 assert_eq "$RC" "25" "T26 control: the PRE-FIX pass never reaches predicate 4 (25, not 24) with the same drift"
 assert_absent "$OUT" "farm: DRIFT" "T26 control: so the farm grade this feature exists to emit is never printed"
 
+# ── T27: THE PASS AND ITS CONTROLLER MUST RESOLVE ONE HOME — OR THE PASS REFUSES ────────────────
+# Review F1 + F2 (blocking). F1 measured that the pass DERIVED `/home/cmux` while the controller read
+# `/tmp/cell-home`, so one tick wrote a pin under one home and re-read its own record for the verdict —
+# a GREEN unit over a pin the controller never sees. F2 measured that NO arm could see it: every arm's
+# account stub answered the SAME home the arm also set as `HOME`, so `cell_home_resolve` and the
+# pre-fix `CELL_HOME="${CELL_HOME:-$HOME}"` returned one string everywhere and reverting the derivation
+# left the suite green. These arms drive the REAL templates (not a hand-spelled copy) with a stub that
+# answers a home the arm does NOT set as `HOME`, which is the row that could not fail before.
+say_case "T27 the pass refuses when its unit's HOME and its derivation disagree (one home, or no pass)"
+T27="$T/t27"; mkdir -p "$T27" "$T27/state" "$T27/acct-home" "$T27/legacy-home/home"
+ACCT27="$(acct_stub "$T27/acct" "$T27/acct-home")" || bad "T27 fixture: could not build the account stub"
+# render_unit_env <template> <HOME> <CELL_HOME> <state> — the artifact's OWN Environment= lines as
+# `env` assignments. Driving the template is the point: a hand-spelled environment is a second source of
+# truth, and this suite exists because that is how the split stayed invisible.
+render_unit_env() {
+    sed -e "s|{{HOME}}|$2|g" -e "s|{{CELL_HOME}}|$3|g" -e "s|{{STATE_DIR}}|$4|g" \
+        -e "s|{{USER}}|$(id -un)|g" -e "s|{{PATH}}|/usr/bin:/bin:/usr/sbin:/sbin|g" \
+        -e "s|{{PASS}}|$PASS_SH|g" -e "s|{{PASS_DIR}}|${PASS_SH%/*}|g" \
+        -e "s|{{PASS_REPO}}|${REPO_P:-$HERE/..}|g" -e "s|{{PASS_REF}}|origin/main|g" \
+        -e "s|{{PASS_MODE}}||g" -e "s|{{ENV_FILE}}||g" -e "s|{{O}}||g" "$1" \
+      | sed -n 's/^Environment=\([A-Za-z_][A-Za-z0-9_]*\)=\(.\+\)$/\1=\2/p' \
+      | grep -v '{{'
+}
+# resolve_under <env assignments…> — the SAME resolver the pass sources, under exactly this environment.
+# Not a re-implementation: it sources scripts/lib/cell-home.sh from the tree under test.
+resolve_under() {
+    env -i "$@" PATH="$ACCT27:/usr/bin:/bin:/usr/sbin:/sbin" \
+        bash -c '. "$1/scripts/lib/cell-home.sh"; cell_home_resolve' _ "$HERE/.."
+}
+# run_under <env assignments…> — the pass under exactly this environment.
+run_under() {
+    env -i "$@" PATH="$ACCT27:/usr/bin:/bin:/usr/sbin:/sbin" HARNESS_APPLY_DRIFT_CHECK=0 \
+        bash "${PASS_UNDER_TEST:-$PASS_SH}" --print-status 2>&1
+}
+  # ⛔ NO `mapfile`: macOS ships bash 3.2 and CI parses every script with it (`bash32-parse`).
+read_env() { # <template> <HOME> <CELL_HOME> <state> — fills the global ENV_ARR
+    ENV_ARR=()
+    local _l
+    while IFS= read -r _l; do ENV_ARR+=("$_l"); done < <(render_unit_env "$@")
+}
+read_env "$HERE/../templates/systemd/eldato-harness-apply.service" \
+    "$T27/legacy-home" "$T27/legacy-home" "$T27/state"; HA_ENV=("${ENV_ARR[@]}")
+read_env "$HERE/../templates/systemd/eldato-orchestrator.service" \
+    "$T27/legacy-home" "$T27/legacy-home" "$T27/state"; ORCH_ENV=("${ENV_ARR[@]}")
+# The fixture must BE the shape the finding measured, or the arms below grade a fixture property: the
+# harness-apply unit says HOME and NOT CELL_HOME, the controller's unit says BOTH.
+assert_contains "$(printf '%s\n' "${HA_ENV[@]}")" "HOME=" "T27 fixture: the harness-apply unit exports HOME"
+assert_absent "$(printf '%s\n' "${HA_ENV[@]}")" "CELL_HOME=" "T27 fixture: …and NOT CELL_HOME (the state the finding measured)"
+assert_contains "$(printf '%s\n' "${ORCH_ENV[@]}")" "CELL_HOME=" "T27 fixture: the controller's unit DOES export CELL_HOME"
+# THE SPLIT, measured on the templates: on a box whose units still name the legacy home, the two units
+# answer DIFFERENT homes — so the pass must not silently pick one.
+assert_eq "$(resolve_under "${HA_ENV[@]}")" "$T27/acct-home" \
+    "T27 the pass's unit derives the ACCOUNT's home (the passwd record)"
+assert_eq "$(resolve_under "${ORCH_ENV[@]}")" "$T27/legacy-home" \
+    "T27 the controller's unit resolves the home it PINNED — the two disagree on an un-migrated box"
+OUT="$(run_under "${HA_ENV[@]}")"; RC=$?
+assert_eq "$RC" "27" "T27 so the pass REFUSES (27) rather than writing a pin its controller never reads"
+assert_contains "$OUT" "REFUSED split-home" "T27 and the refusal says what it is"
+assert_contains "$OUT" "CELL_HOME='$T27/acct-home'" "T27 naming the home it would have used"
+assert_contains "$OUT" "HOME='$T27/legacy-home'" "T27 and the unit's home it would have diverged from"
+assert_contains "$OUT" "cell-home-migrate.sh" "T27 and the remedy, so the operator is not left to guess"
+# ⛔ NON-VACUITY: the refusal is what stops it. Remove `exit 27` and the same environment runs — and the
+# home it runs with is the account's, i.e. the split F1 measured. Without this leg, T27 would be green
+# on a tree whose guard had been deleted.
+PASS_NOGUARD="$T27/pass-noguard.sh"
+sed '/^    exit 27$/d' "$PASS_SH" >"$PASS_NOGUARD"
+if cmp -s "$PASS_SH" "$PASS_NOGUARD"; then
+    bad "T27 control: the guard-removal mutant is IDENTICAL to the pass — this control proves nothing"
+else
+    ok "T27 control: the guard-removal mutant really drops only the refusal"
+fi
+OUT="$(PASS_UNDER_TEST="$PASS_NOGUARD" run_under "${HA_ENV[@]}")"; RC=$?
+if [ "$RC" = "27" ]; then bad "T27 control: the guard-less pass still exits 27 — the guard is not what refused";
+else ok "T27 control: WITHOUT the guard the same environment is NOT refused (rc=$RC)"; fi
+assert_absent "$OUT" "REFUSED split-home" "T27 control: …and nothing says the homes disagree"
+assert_eq "$(resolve_under "${HA_ENV[@]}")" "$T27/acct-home" \
+    "T27 control: …so it wrote under the account's home, not the controller's — F1's split, reproduced"
+# AND THE FALSE-POSITIVE ARM: a CONVERGED box (the unit's HOME IS the account's home) must run normally.
+# A refusal that fires on a healthy box would red every migrated cell, which is its own outage.
+read_env "$HERE/../templates/systemd/eldato-harness-apply.service" \
+    "$T27/acct-home" "$T27/acct-home" "$T27/state"; HA_CONV=("${ENV_ARR[@]}")
+OUT="$(run_under "${HA_CONV[@]}")"; RC=$?
+if [ "$RC" = "27" ]; then bad "T27 a CONVERGED box (HOME == the account's home) is refused — the guard is a false positive";
+else ok "T27 a CONVERGED box is NOT refused (rc=$RC) — the guard fires only on the real disagreement"; fi
+assert_absent "$OUT" "REFUSED split-home" "T27 …and says nothing about a split"
+# AND AN EXPLICIT `CELL_HOME` IS NEVER SECOND-GUESSED (`cell_home_resolve` step 1): the controller's own
+# unit sets it, and a migration or an operator naming the home must get that home.
+OUT="$(run_under "${ORCH_ENV[@]}")"; RC=$?
+if [ "$RC" = "27" ]; then bad "T27 an explicit CELL_HOME was second-guessed (refused) — step 1 must win";
+else ok "T27 an explicit CELL_HOME wins and is never second-guessed (rc=$RC)"; fi
+
 echo
 echo "────────────────────────────────────────────────────────"
 echo "harness-apply: $PASS passed, $FAIL failed"

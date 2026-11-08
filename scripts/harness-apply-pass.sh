@@ -85,6 +85,11 @@
 #                     already spends 25 (`behind`) and 26 (`REFUSED blocked`), and re-using either
 #                     for a different fact is the two-vocabularies defect this header rejects.
 #   25  behind        on the ref's line but older, and this box has no materialiser to advance it
+#   27  REFUSED split-home  this pass would write the pin under a home its own controller does not
+#                     read — the unit's `$HOME` disagrees with the derivation, so the box is
+#                     mid-migration and BOTH homes are still live. Nothing was touched. 26 is
+#                     already `REFUSED blocked` in `harness-refresh.sh`; a different fact may not
+#                     share a code (the ONE VOCABULARY rule above)
 #   2   usage
 # The systemd unit treats 0/10/11 as success and everything else as RED: a refusal means a HUMAN must
 # resolve something (an ahead box, a tree that cannot be preserved), and reddening the unit is the
@@ -210,13 +215,43 @@ done
 # harness. The rule and the ONLY literal live in `scripts/lib/cell-home.sh`; a copy without it (a
 # `bash -s` start has no file, so `$SELF_FILE` is empty and the lookup is SKIPPED) falls back to $HOME
 # exactly as before. ⛔ See `lib/cell-home.sh` §CONSUMERS for why `$HERE` is not used in a piped start.
+# ⛔ ONE HOME, OR NO PASS (review F1, blocking). Deriving is only half the rule: the CONSUMER that
+# reads what this pass writes is the controller, and the controller resolves its own home from ITS
+# unit. Measured on the population this change exists to migrate — a box whose units still name
+# /tmp/cell-home — the two disagree:
+#
+#   harness-apply unit   Environment=HOME=/tmp/cell-home, no CELL_HOME  -> derive -> /home/cmux
+#   controller unit      Environment=HOME=/tmp/cell-home CELL_HOME=... -> /tmp/cell-home
+#
+# so one tick wrote $CELL_HOME/.pi/agent/state/HARNESS-PIN, $CELL_HOME/.harness-path and the pin root
+# under /home/cmux while the controller read them from /tmp/cell-home — and then re-read its OWN record
+# (`read_pin`) and exited 10, a GREEN unit over a pin the controller never sees. That is the same
+# two-surface disagreement #3453 removes, re-created on the pass/controller boundary. systemd's `%h`
+# does NOT close it (it expands to the passwd record = the same /home/cmux the derivation already
+# answers while the controller's unit still pins the legacy value), so the pass REFUSES instead: a
+# human-visible RED is the only surface that is not a log nobody reads, and `cell-home-migrate.sh` is
+# the named remedy. ⛔ An EXPLICIT CELL_HOME is an operator's answer and is never second-guessed
+# (`cell_home_resolve` step 1) — the refusal exists for the box where nothing said what the home is.
 CELL_HOME_LIB=""
 if [ -n "$SELF_FILE" ]; then
   for _cand in "$HERE/lib/cell-home.sh" "$HERE/../lib/cell-home.sh"; do
     [ -r "$_cand" ] && { CELL_HOME_LIB="$_cand"; break; }
   done
 fi
-if [ -n "$CELL_HOME_LIB" ]; then . "$CELL_HOME_LIB"; CELL_HOME="$(cell_home_resolve)"; else CELL_HOME="${CELL_HOME:-${HOME:?HOME is required}}"; fi
+_CELL_HOME_EXPLICIT="${CELL_HOME:-}"
+if [ -n "$CELL_HOME_LIB" ]; then
+  . "$CELL_HOME_LIB"
+  CELL_HOME="$(cell_home_resolve)"
+  if [ -z "$_CELL_HOME_EXPLICIT" ] && [ -n "${HOME:-}" ] && [ "$HOME" != "$CELL_HOME" ]; then
+    err "REFUSED split-home: this pass resolves CELL_HOME='$CELL_HOME' but the unit that starts it exports HOME='$HOME' — two live homes on one box, so the pin this pass would write is not the pin the controller reads (agent-infra#3453)"
+    err "  Nothing was touched. Converge the box first: bash scripts/cell-home-migrate.sh --check, then --apply"
+    err "  (or set CELL_HOME explicitly if '$HOME' is the home this box's controller really reads)"
+    exit 27
+  fi
+else
+  CELL_HOME="${CELL_HOME:-${HOME:?HOME is required}}"
+fi
+unset _CELL_HOME_EXPLICIT
 O="${O:-$CELL_HOME/orchestrator}"
 # ⛔ BOTH SPELLINGS, AND THE UNIT'S IS THE ONE THAT MATTERS IN PRODUCTION. The rendered systemd unit
 # and launchd plist export `HARNESS_APPLY_REPO` / `HARNESS_APPLY_REF` (they are the INSTALLER's seams);
