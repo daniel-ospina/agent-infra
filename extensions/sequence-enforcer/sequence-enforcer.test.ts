@@ -2977,16 +2977,23 @@ await test("#1662 review: a refused background dispatch does NOT advance the ver
 
         // A pre-spawn refusal (invalid cwd) is built BEFORE the background
         // branch: its details carry `status: "invalid-cwd"` but NO
-        // `details.background`. Only the tool INPUT marks it as background —
-        // and a refusal is not a reviewer verdict, so it must not decrement the
-        // count or advance the step (#1662 review).
+        // `details.background`. Only the tool INPUT marks it as background.
+        // ⛔ IT MUST STILL RELEASE ITS RESERVATION (#2242 review round 6, P2). This row used to
+        // assert `reviewers.get(1) === 1` — i.e. it PINNED the leak. The #1662 rationale was that a
+        // refusal must not ADVANCE the step, which is preserved; but a refusal means no child exists
+        // to collect, so the reservation incremented at `tool_call` can never be satisfied, and each
+        // leak converts into one extra genuine verdict the step then needs forever.
         await handlers.tool_result!({
           toolName: "task",
           input: { background: true },
           details: { model: "m", provider: "p", status: "invalid-cwd", retryable: false, error: "bad cwd", cwd: "/nope" },
         });
         equal(_stackForTest()[0]!.stepIndex, 1, "a refused background dispatch must NOT advance the step");
-        equal(_stackForTest()[0]!.reviewers.get(1), 1, "a refused background dispatch must NOT decrement the count");
+        equal(
+          _stackForTest()[0]!.reviewers.get(1),
+          undefined,
+          "⛔ a refused background dispatch releases its reservation — no child exists to collect it (#2242 R6)",
+        );
       },
     );
   } finally { auditRelease(); }
@@ -3043,6 +3050,12 @@ await test("#2242: a BLOCKING `fleet-saturated` refusal does NOT advance the ver
         equal(row!.step, 1, "the row names the step that stayed open");
         equal(row!.outcome, "refused", "the row names the classification outcome");
         ok(String(row!.evidence).includes("fleet-saturated"), `the row carries the evidence (got ${row!.evidence})`);
+        // ⛔ `ts` IS THE READER'S ADMISSION TEST (#2242 review round 6, P1). `readEnforcementLog`
+        // drops any row whose `ts` is not a string into `skipped`, and `auditLog` does NOT stamp it —
+        // so a ts-less row is on disk but unreadable, which reads as "no refusal ever happened".
+        // `step_name` matches the convention every other event row in this file follows.
+        ok(typeof row!.ts === "string" && row!.ts.length > 0, "the row carries `ts` — without it the reader drops it as malformed");
+        equal(row!.step_name, "review", "the row carries the step NAME, so a name filter finds it");
         // …and a REAL verdict afterwards still advances it, so the fix cannot deadlock the step.
         // A CLEAN task success carries `{model, provider}` and NO `exitCode` (see
         // `classifySpawnOutcome`: an emitted `exitCode` means a non-clean composition), so this is

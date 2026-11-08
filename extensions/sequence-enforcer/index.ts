@@ -1008,6 +1008,34 @@ function auditLog(entry: Record<string, unknown>) {
 
 // ── enforcement.jsonl path + reader (#377) ─────────
 
+/** #2242: release ONE reviewer reservation without advancing the verifier step, and record the
+ * durable evidence. `reviewers` is a COUNT of in-flight dispatches per step — not a flag — so this
+ * DECREMENTS and deletes only at zero. `delete` (the original shape) released EVERY outstanding
+ * reservation, so with two reviewers in flight one refusal zeroed the count and the second
+ * reviewer's genuine verdict then read `current = 0`, skipped the advance block, and was silently
+ * discarded (review round 5, P1).
+ *
+ * ⛔ `ts` IS REQUIRED, not decorative: `readEnforcementLog` below drops any row whose `ts` is not a
+ * string into its `skipped` counter (and `EnforcementLogEntry.ts` types it as required), and
+ * `auditLog` does NOT stamp it — so a row written without `ts` is on disk but unreadable, which is
+ * indistinguishable from the event never having happened (review round 6, P1). Every other event
+ * row in this file carries `ts` + `step_name`; this helper is the ONE place the no-verdict rows are
+ * written, so neither can be forgotten again. */
+function releaseReviewerReservation(skill: SkillState, stepName: string, outcome: string, evidence: string): void {
+  auditLog({
+    ts: new Date().toISOString(),
+    event: "verifier-no-verdict",
+    skill: skill.path,
+    step: skill.stepIndex,
+    step_name: stepName,
+    outcome,
+    evidence,
+  });
+  const outstanding = (skill.reviewers.get(skill.stepIndex) ?? 0) - 1;
+  if (outstanding > 0) skill.reviewers.set(skill.stepIndex, outstanding);
+  else skill.reviewers.delete(skill.stepIndex);
+}
+
 // Lazy path resolution (mirrors shared/audit-log.ts gateEventsFile()):
 // resolved per call, not at module load, so a $HOME change (tests, alternate
 // agent dirs) takes effect.
@@ -2833,6 +2861,38 @@ function tokenStateLabel(reason: string): string {
     // advance the verifier step with fewer verdicts than were dispatched.
     const collectRunId =
       typeof verifierDetails?.run_id === "string" ? verifierDetails.run_id : "";
+    // ⛔ A REFUSED BACKGROUND DISPATCH MUST RELEASE ITS RESERVATION (review round 6, P2).
+    //
+    // The branch below is entered only for a terminal collect or a BLOCKING result, so a
+    // `task({ background: true })` refused before any spawn fell through it ENTIRELY: the count was
+    // incremented on the `tool_call` and nothing ever decremented it, because a refusal means there
+    // is no child to collect. Each leak then costs one EXTRA genuine verdict before the step can
+    // advance (`current = 2 -> 1 -> no advance`), and #2242's opt-in makes repeated background
+    // refusals ordinary on a saturated box — the refusal text itself invites a re-dispatch, which
+    // leaks again. Release one reservation and do NOT advance: the same pair the blocking path
+    // asserts.
+    //
+    // The returns-early dispatch NOTICE is deliberately NOT touched: it carries no
+    // status/exitCode/results, so `classifySpawnOutcome` answers `verdict` for it and it keeps its
+    // reservation until the child settles — that is #1662's whole contract.
+    if (
+      step.gate === "verifier" &&
+      isBackgroundDispatch &&
+      !isTerminalCollect &&
+      (event.toolName === "task" || event.toolName === "subagent")
+    ) {
+      const bgOutcome = classifySpawnOutcome({
+        details: verifierDetails as Record<string, unknown> | undefined,
+        isError: (event as { isError?: unknown }).isError,
+      });
+      if (bgOutcome.outcome !== "verdict") {
+        console.log(
+          `[sequence-enforcer] ⛔ background dispatch produced NO verdict (${bgOutcome.outcome}: ${bgOutcome.evidence}) — releasing its reservation, the step stays open (#2242)`,
+        );
+        releaseReviewerReservation(targetSkill, step.name, bgOutcome.outcome, bgOutcome.evidence);
+        return undefined;
+      }
+    }
     if (
       step.gate === "verifier" &&
       (isTerminalCollect ||
@@ -2889,21 +2949,7 @@ function tokenStateLabel(reason: string): string {
         console.log(
           `[sequence-enforcer] ⛔ dispatch produced NO verdict (${spawnOutcome.outcome}: ${spawnOutcome.evidence}) — the verifier step stays open (#2242)`,
         );
-        auditLog({
-          event: "verifier-no-verdict",
-          step: targetSkill.stepIndex,
-          outcome: spawnOutcome.outcome,
-          evidence: spawnOutcome.evidence,
-        });
-        // ⛔ DECREMENT, never `delete` (review round 5, P1). `reviewers` is a COUNT of in-flight
-        // dispatches per step, not a boolean. `delete` released EVERY outstanding reservation, so
-        // with two reviewers in flight a single refusal zeroed the count, the SECOND reviewer's
-        // genuine verdict then read `current = 0`, the advance block was skipped, and that verdict
-        // was silently discarded — the step wedged forever with no explanation. This is the same
-        // arithmetic the verdict arm below already does.
-        const outstanding = (targetSkill.reviewers.get(targetSkill.stepIndex) ?? 0) - 1;
-        if (outstanding > 0) targetSkill.reviewers.set(targetSkill.stepIndex, outstanding);
-        else targetSkill.reviewers.delete(targetSkill.stepIndex);
+        releaseReviewerReservation(targetSkill, step.name, spawnOutcome.outcome, spawnOutcome.evidence);
         return undefined;
       }
       const current = targetSkill.reviewers.get(targetSkill.stepIndex) || 0;
