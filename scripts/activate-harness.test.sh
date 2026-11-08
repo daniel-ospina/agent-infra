@@ -816,11 +816,32 @@ while [ "${1:-}" = "-u" ]; do shift; done
 case "${1:-}" in +%s) printf '%s\n' 1700000100 ;; *) exit 1 ;; esac
 NODATE
 chmod +x "$FX/no-date/date"
-OUT="$(CONFLICT_REBASE_STATE="$FX/iso-state" PATH="$FX/bsd-date:$PATH" bash "$TIMER" status 2>&1)"; RC=$?
+# ⛔ NEUTRALISE THE INSTALLED-UNIT LOOKUP, OR THIS CASE IS BOX-DEPENDENT (cycle 13, measured). The wrapper
+# gained a divergence guard: an ambient `CONFLICT_REBASE_STATE` that disagrees with what the INSTALLED unit
+# exports is REFUSED (rc 2) rather than written, which is right — and it made T33 green on ubuntu-latest
+# (no unit installed, nothing to disagree with) and RED on any box where the timer is armed, i.e. exactly
+# the "verdict depends on the box, not the tree" defect this suite's own T11/T12 exist to prevent. This
+# fixture state dir is deliberately not the installed one, so the guard fires here and every assertion
+# below fails at `rc 2`. `CONFLICT_REBASE_SYSTEMCTL`/`CONFLICT_REBASE_PLIST` are the wrapper's own seams:
+# point them at a scheduler that answers nothing and a plist that does not exist.
+printf '#!/usr/bin/env bash\nexit 0\n' >"$FX/no-systemctl"; chmod +x "$FX/no-systemctl"
+ISOLATE="CONFLICT_REBASE_SYSTEMCTL=$FX/no-systemctl CONFLICT_REBASE_PLIST=$FX/absent.plist"
+# and PROVE the guard is real, from the other side: with the real scheduler visible, the same fixture dir
+# must be REFUSED. A guard that no test can make fire is a comment (T22's lesson).
+OUT="$(CONFLICT_REBASE_STATE="$FX/iso-state" bash "$TIMER" status 2>&1)"; RC=$?
+case "$RC:$OUT" in
+    2:*REFUSING*) ok "T33 the divergence guard REFUSES a fixture state dir when a real unit is installed (rc 2)" ;;
+    *) if command -v systemctl >/dev/null 2>&1 && systemctl show -p Environment eldato-conflict-rebase.service 2>/dev/null | grep -q CONFLICT_REBASE_STATE; then
+           bad "T33 the divergence guard did not fire on a box whose unit exports the state dir (rc=$RC)"
+       else
+           ok "T33 no installed unit on this box, so there is nothing for the guard to refuse (not a failure)"
+       fi ;;
+esac
+OUT="$(env $ISOLATE CONFLICT_REBASE_STATE="$FX/iso-state" PATH="$FX/bsd-date:$PATH" bash "$TIMER" status 2>&1)"; RC=$?
 assert_eq "$RC" 0 "T33 --status runs against a fixture state dir (rc 0)"
 assert_contains "$OUT" "-> $ISO_WANT" "T33 the beacon is RENDERED through the BSD arm (-r), not left as an epoch and not '?'"
 assert_absent   "$OUT" '-> ?' "T33 and never the '?' the old fallback printed on every Mac"
-OUT="$(CONFLICT_REBASE_STATE="$FX/iso-state" PATH="$FX/no-date:$PATH" bash "$TIMER" status 2>&1)"; RC=$?
+OUT="$(env $ISOLATE CONFLICT_REBASE_STATE="$FX/iso-state" PATH="$FX/no-date:$PATH" bash "$TIMER" status 2>&1)"; RC=$?
 assert_eq "$RC" 0 "T33 --status still exits 0 when NO date mechanism works (a format is not the datum)"
 assert_contains "$OUT" "-> $ISO_EPOCH" "T33 with no mechanism at all it degrades to the RAW EPOCH — never to '?' and never to silence"
 assert_absent   "$OUT" '-> ?' "T33 and the degraded form is the datum, not the question mark"
