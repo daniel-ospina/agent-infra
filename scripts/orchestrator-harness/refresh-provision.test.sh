@@ -96,8 +96,15 @@
 #   (`gh-limit.py`'s `reaches_api()` is False for the meter), and a fixture asserting one would grade
 #   the label against evidence production cannot emit (#3701 review, P2). ALL THREE captured notes are
 #   DERIVED from `scripts/gh-shim/gh` itself (with only the runtime figures substituted), so "verbatim"
-#   is a fact rather than a transcription — and a reword of any of them reds a row instead of silently
-#   leaving the fixture behind.
+#   is a fact rather than a transcription.
+#   ⛔ AND THE CONSEQUENCE OF DERIVING IS THAT A REWORD DOES *NOT* RED A ROW — SAYING IT DID WAS WRONG
+#   (#3701 review round 18, P2, mutation-tested): rewording `gh:1874` or `gh:1485` leaves this suite at
+#   187/0, because the fixture and the assertion move TOGETHER. That is the property worth having — a
+#   hand-typed copy is the only way the fixture can go stale — but it is the opposite of a tripwire.
+#   The one exception is the PACING note, whose wording `(g)` asserts BY CONTENT because the record has
+#   to quote it: rewording `gh:1479` reds `(g) …the record quotes the FIRST captured line`. So a reword
+#   in the shim reds a row exactly when the row pins that note's words, and the two notes production
+#   never takes are (correctly) ungraded.
 #
 # HOW. Every arm drives the SHIPPED script inside a sandbox: a real git repo with a real (local, bare)
 # origin and a real `git worktree` scout, so `scout_is_worktree`/`fetch`/`checkout` all run for real
