@@ -605,6 +605,16 @@ export function describeSpawnCapacity(
       "     dispatch a fresh sub-agent. A retry of the IDENTICAL dispatch is refused again — there is",
       "     no child to wait for."
     );
+  } else if (capacityRefusal) {
+    // #2242 review, P1 second leg: the final `else` below is written for a CUT child ("the child
+    // needs a first message", "the cut one"). A saturation refusal spawned no child, so reusing it
+    // would assert a child beside an ATTEMPTS line that says none existed (#2349).
+    lines.push(
+      `   → RETRY (attempt ${n} of ${SPAWN_ATTEMPT_CAP}): wait for the box to drain below the session`,
+      "     ceiling, then re-dispatch. The dispatch was REFUSED before a child existed, so there is",
+      "     no partial child output to distrust — the IDENTICAL dispatch succeeds once the box drains.",
+      `     Below the cap this is a RETRY; at ${SPAWN_ATTEMPT_CAP} attempts this gate will tell you to stop.`
+    );
   } else {
     lines.push(
       `   → RETRY (attempt ${n} of ${SPAWN_ATTEMPT_CAP}): re-dispatch the sub-agent — the child needs a`,

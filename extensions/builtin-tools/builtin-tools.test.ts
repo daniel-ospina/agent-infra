@@ -8687,7 +8687,27 @@ test("#2242 WIRING: spawnSubAgent consults the preflight BEFORE any spawn, and t
   ok(head.includes("dispatchSaturationRefusal(saturation)"), "the refusal decides from that same probe");
   // It must not touch a kill bound: load-policy §1 forbids shrinking one under
   // load, and #279 deliberately handed between-turn quiet to stream-stall.
-  ok(!/streamStallMs\s*=[^=]/.test(head), "the preflight never rescales the inactivity bound");
+  //
+  // ⛔ ANCHORED ON THE CODE THAT ACTUALLY SETS S (#2242 review, P2 finding 3). This row used to
+  // regex `head` — the ~22 lines between the probe and `return new Promise` — while S is resolved
+  // ~500 lines LATER, inside the promise body, so the window structurally COULD NOT contain an
+  // assignment: the row was true for any code whatsoever in it, and the mutant it is named after
+  // (`streamStallMs: Math.min(streamStallMs ?? getStreamStallMs(), 60_000)`, the #279 reversal)
+  // left it GREEN. Anchor on the `hbThresholds` composition, the one place per-dispatch S is
+  // decided, and assert both halves by name so a rescale cannot hide in a rewritten expression.
+  const thrAt = source.indexOf("const hbThresholds = {");
+  ok(thrAt > 0, "the per-dispatch threshold composition is still where this row expects it");
+  const thrEnd = source.indexOf("\n    };", thrAt);
+  const thr = source.slice(thrAt, thrEnd);
+  ok(thr.includes("maxDispatchMs"), "the window really covers the whole hbThresholds object");
+  ok(
+    /streamStallMs:\s*streamStallMs \?\? getStreamStallMs\(\)/.test(thr),
+    "S is the dispatch override or the resolved default, threaded VERBATIM",
+  );
+  ok(
+    !/Math\.(min|max|floor|round|ceil)\([^)]*streamStallMs/.test(thr),
+    "⛔ S is never rescaled — a `Math.min(…, 60_000)` here is the #279 reversal load-policy §1 forbids",
+  );
 });
 
 testAsync("#2242 WIRING: a saturated box + the opt-in REFUSES the dispatch with the documented text", async () => {
