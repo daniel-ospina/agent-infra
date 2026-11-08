@@ -70,7 +70,7 @@ ck() { # ck <name> <0|1>
   if [ "$2" -eq 0 ]; then printf '  ✅ %s\n' "$1"; PASS=$((PASS+1));
   else printf '  ❌ %s\n' "$1"; FAIL=$((FAIL+1)); fi
 }
-TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
+TMP="${KEEP_TMP:?}"; trap ":" EXIT; mkdir -p "$TMP"
 O="$TMP/O"; mkdir -p "$O/state" "$O/logs" "$TMP/bin"
 # ⛔ THE MEMORY GATE'S NEUTRALISER (agent-infra#2387), for exactly the reason every arm below pins
 # `DISK_MIN_FREE_MB=1`: since #2387 `run_agent` refuses a spawn when available memory is below its
