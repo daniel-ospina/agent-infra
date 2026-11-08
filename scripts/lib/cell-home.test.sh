@@ -177,12 +177,57 @@ source_in "$LIB" '[ "$(cell_home_project_line /home/cmux "ExecStart=/tmp/cell-ho
   && ok "b8 project_line: every legacy token in a line moves, a sibling suffix (.bak, -2) does not, and a clean line is returned verbatim" \
   || bad "b8 project_line: whole-line re-basing"
 
+# b8b: A PATH COMPONENT ENDS AT ANY SEPARATOR, NOT ONLY AT `/` OR END-OF-LINE (review F1). The
+# boundary used to be `''|/*`, so EVERY other following character read as a continuation of the
+# filename: a legacy path followed by a `"` or a space was treated as a SIBLING and did not move. Both
+# are ordinary systemd — `systemd.syntax(7)`: quotes "may be used to wrap a whole item" and "quotes
+# themselves are removed"; `systemd.exec(5)` documents `Environment="VAR1=word1 word2"` — so
+# `Environment="HOME=/tmp/cell-home"` sets HOME to the legacy home while the scan's record test ("the
+# projection CHANGED this line") saw nothing. `--check` answered 0 (the RECLAIM precondition) and
+# `--apply` reported "one home" over a unit it had left naming the legacy home.
+proj_line_in() { # <lib> <line> — run one line through the projector, with no quoting in between
+  env -i PATH="$STUB:/usr/bin:/bin" bash -c '. "$1"; cell_home_project_line /home/cmux "$2"' _ "$1" "$2"
+}
+[ "$(proj_line_in "$LIB" 'Environment="HOME=/tmp/cell-home"')" = 'Environment="HOME=/home/cmux"' ] \
+  && ok "b8b project_line: a QUOTED legacy path moves (systemd strips the quotes, so the value really is the legacy home)" \
+  || bad "b8b a quoted legacy path was left alone — --check would call that unit converged"
+[ "$(proj_line_in "$LIB" 'ReadWritePaths=/tmp/cell-home /home/cmux/state')" = 'ReadWritePaths=/home/cmux /home/cmux/state' ] \
+  && ok "b8b2 project_line: a space-separated path LIST moves, token by token" \
+  || bad "b8b2 a space-separated legacy path was treated as a sibling filename"
+[ "$(proj_line_in "$LIB" 'Environment=PATH=/tmp/cell-home:/tmp/cell-home/.local/bin:/usr/bin')" = 'Environment=PATH=/home/cmux:/home/cmux/.local/bin:/usr/bin' ] \
+  && ok "b8b3 project_line: a colon-separated PATH list moves (the whole-home and the sub-path form)" \
+  || bad "b8b3 a colon-terminated legacy path was left alone"
+# …and the SIBLING rule survives the wider terminator set: a name that CONTINUES the component is not us.
+[ "$(proj_line_in "$LIB" 'Environment=O=/tmp/cell-home.bak X=/tmp/cell-home-2/y Z=/tmp/cell-homed')" = 'Environment=O=/tmp/cell-home.bak X=/tmp/cell-home-2/y Z=/tmp/cell-homed' ] \
+  && ok "b8b4 …while a component that CONTINUES (.bak, -2/y, d) is still NOT this home" \
+  || bad "b8b4 the wider terminator set now re-bases a sibling name (fabricated target)"
+
 # b9: the two projectors answer the SAME single token the same way — they are one rule with two arities,
 # so a future edit to either boundary reddens here instead of drifting into two opinions.
 _pl_tok=/tmp/cell-home/keys.env
 [ "$(source_in "$LIB" "cell_home_project /home/cmux $_pl_tok")" = "$(source_in "$LIB" "cell_home_project_line /home/cmux $_pl_tok")" ] \
   && ok "b9 project and project_line agree on a single token (one rule, two arities)" \
   || bad "b9 project and project_line disagree on a single token"
+
+# e7: THE BOUNDARY RULE MUST BE ABLE TO VARY (the non-vacuity partner of b8b). Rewriting the sibling
+# class back to the old "everything that is not `/` or EOL is a sibling" rule must make b8b's quoted and
+# space-separated cases STOP moving — otherwise b8b asserts a constant of the fixture, not the boundary
+# the migration depends on.
+MUTB="$T/mutboundary"; mkdir -p "$MUTB/lib"
+awk 'index($0, "[-._[:alnum:]]*)") > 0 { sub(/\[-\._\[:alnum:\]\]\*\)/, "*)"); print; next } { print }' \
+  "$LIB" >"$MUTB/lib/cell-home.sh"
+if cmp -s "$LIB" "$MUTB/lib/cell-home.sh"; then
+  bad "e7 the boundary mutation could not be applied — b8b is not checking the boundary rule"
+elif [ "$(proj_line_in "$MUTB/lib/cell-home.sh" 'Environment="HOME=/tmp/cell-home"')" = 'Environment="HOME=/home/cmux"' ]; then
+  bad "e7 the mutated boundary still moved a quoted path — b8b does not measure the rule"
+else
+  ok "e7 WITH the old boundary rule (every non-`/` tail a sibling) the quoted and space-separated cases do NOT move — b8b measures the rule"
+fi
+# e8: POLARITY on the sibling side — the same mutant must still leave `.bak` alone, so e7 is about the
+# TERMINATOR set and not about the projector having stopped working altogether.
+[ "$(proj_line_in "$MUTB/lib/cell-home.sh" 'Environment=O=/tmp/cell-home.bak')" = 'Environment=O=/tmp/cell-home.bak' ] \
+  && ok "e8 …and it still leaves a sibling (.bak) alone, so e7 isolates the terminator set" \
+  || bad "e8 the mutant re-based a sibling too — e7 is not isolating the terminator rule"
 
 printf '\n── (c) THE ONE LITERAL / NO LEGACY DEFAULTS ─────────────────────────────────────────\n'
 

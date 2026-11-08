@@ -164,10 +164,22 @@ volatile_home_assignments() {
     }' "$f" 2>/dev/null
 }
 
-# report_env_file <rel> <path> <what> — return 1 (naming the VARIABLE, never the value) when a sourceable
-# env file re-points HOME/CELL_HOME at a volatile home that is not the durable one.
+# report_env_file <rel> <path> <what> — 1 (naming the VARIABLE, never the value) when a sourceable env
+# file re-points HOME/CELL_HOME at a volatile home that is not the durable one; 3 when this account
+# could not OPEN the file at all (a reading that was never taken is not "no assignments").
 report_env_file() {
   local rel="$1" f="$2" what="$3" names
+  # ⛔ A REAL OPEN, AND AN UNREADABLE FILE IS NOT "NAMES NO VOLATILE HOME" (review F2).
+  # `volatile_home_assignments`'s own `[ -r "$f" ] || return 0` printed nothing for a file this account
+  # cannot read, and an empty answer is indistinguishable from a converged one: a DURABLE `keys.env`
+  # that re-pointed HOME/CELL_HOME at the legacy home therefore read as clean, `--check` answered 0 (the
+  # number that authorises RECLAIMING the legacy home) and `--apply` reported the poisoned copy as
+  # "kept". `[ -r ]` is also permission BITS rather than a reading, so it would call unreadable a file
+  # root can read (root holds DAC_OVERRIDE) — `probe_open` is the open itself.
+  if [ -e "$f" ] && ! probe_open "$f"; then
+    warn_line "  CANNOT MEASURE: $rel — $what at $f cannot be opened by $INVOKER (mode $(mode_of "$f")), so 'it assigns no volatile home' is not a reading this tool took"
+    return 3
+  fi
   names="$(volatile_home_assignments "$f")"
   [ -n "$names" ] || return 0
   warn_line "  $rel: $what ASSIGNS $(printf '%s ' $names)to a home that is NOT $HOME_DURABLE — a lane that sources this file is put back into the volatile/legacy home. The VALUE is not printed (rule 3); inspect $f by hand. This tool never repairs a credential."
@@ -227,7 +239,7 @@ credential_conflict() {
 }
 
 check_credentials() {
-  local rel f_leg f_dur rc=0 unmeas=0
+  local rel f_leg f_dur rc=0 unmeas=0 st
   note "credentials (durable=$HOME_DURABLE legacy=$HOME_LEGACY)"
   [ -d "$HOME_LEGACY" ] || note "  legacy home is absent — nothing to converge (this box is already on one home)"
   while IFS= read -r rel; do
@@ -247,9 +259,15 @@ check_credentials() {
     # ⛔ THE CONTENT LEG RUNS FIRST AND INDEPENDENT OF THE LEGACY SIDE. The DURABLE file is what lanes
     # SOURCE, so a re-pointing assignment in it is drift whether or not a legacy copy still exists —
     # the legacy home is reclaimed later, and this check must not disappear with it. Names only, never
-    # a value.
+    # a value. ⛔ AND ITS OWN READ FAILURE IS CANNOT MEASURE (review F2), not "no assignments": 3 outranks
+    # the ordinary drift this arm would otherwise report.
     case " $ENV_FILES " in
-      *" $rel "*) if [ -e "$f_dur" ]; then report_env_file "$rel" "$f_dur" "the DURABLE copy" || rc=1; fi ;;
+      *" $rel "*)
+        if [ -e "$f_dur" ]; then
+          report_env_file "$rel" "$f_dur" "the DURABLE copy"; st=$?
+          [ "$st" = 3 ] && unmeas=1
+          [ "$st" = 1 ] && rc=1
+        fi ;;
     esac
     if [ ! -e "$f_leg" ]; then
       note "  $rel: legacy MIA, durable $(describe "$f_dur")"
@@ -260,7 +278,7 @@ check_credentials() {
       rc=1
       # The copy would install the legacy file's ASSIGNMENTS too, so say so now rather than letting the
       # operator meet the refusal in `--apply` with no advance notice.
-      case " $ENV_FILES " in *" $rel "*) report_env_file "$rel" "$f_leg" "the LEGACY copy --apply would install" || true ;; esac
+      case " $ENV_FILES " in *" $rel "*) report_env_file "$rel" "$f_leg" "the LEGACY copy --apply would install"; st=$?; [ "$st" = 3 ] && unmeas=1 ;; esac
       continue
     fi
     note "  $rel: legacy $(describe "$f_leg") | durable $(describe "$f_dur")"
@@ -282,7 +300,7 @@ EOF
 # The credential copy. Only when the durable side is MISSING; mode preserved from the source and
 # clamped to 600 for the two secret stores; contents never read, never echoed, never in argv.
 migrate_credentials() {
-  local rel f_leg f_dur rc=0 unmeas=0 mode
+  local rel f_leg f_dur rc=0 unmeas=0 st mode
   while IFS= read -r rel; do
     [ -n "$rel" ] || continue
     f_leg="$HOME_LEGACY/$rel"
@@ -299,7 +317,12 @@ migrate_credentials() {
     # durable file is what lanes source, and the legacy home is reclaimed later, so this report must not
     # vanish with it (and the two modes must not disagree about the same box).
     case " $ENV_FILES " in
-      *" $rel "*) if [ -e "$f_dur" ]; then report_env_file "$rel" "$f_dur" "the DURABLE copy" || rc=1; fi ;;
+      *" $rel "*)
+        if [ -e "$f_dur" ]; then
+          report_env_file "$rel" "$f_dur" "the DURABLE copy"; st=$?
+          [ "$st" = 3 ] && unmeas=1
+          [ "$st" = 1 ] && rc=1
+        fi ;;
     esac
     [ -e "$f_leg" ] || continue
     if [ -e "$f_dur" ]; then
@@ -326,7 +349,9 @@ migrate_credentials() {
     # silently moves every lane back into the home this migration exists to leave.
     case " $ENV_FILES " in
       *" $rel "*)
-        if ! report_env_file "$rel" "$f_leg" "the copy is REFUSED: the LEGACY file"; then
+        report_env_file "$rel" "$f_leg" "the copy is REFUSED: the LEGACY file"; st=$?
+        if [ "$st" = 3 ]; then unmeas=1; continue; fi
+        if [ "$st" = 1 ]; then
           warn_line "  REFUSED $rel — not copied (edit $f_leg so it names $HOME_DURABLE, then re-run)"
           rc=1; continue
         fi ;;
@@ -416,8 +441,18 @@ paths_in() {
 #     PREFIX but is a different directory. Emitting a record for it made `--check` call a converged box
 #     drifted, and made `--apply` project it to `<home>.bak` — a target nobody has, refused by name.
 #   * AN UNREADABLE FILE IS A NAMED RECORD, NOT AN EMPTY SCAN — see `probe_open` and the guard below.
+#   * ⛔ THE DIRECTIVE NAME COMES FROM THE LOGICAL LINE, AND LEADING WHITESPACE IS NOT PART OF THE NAME
+#     (review F4). systemd accepts an INDENTED directive (`   Environment=HOME=…` — measured with
+#     `systemd-analyze verify`, which reports an unknown key in that position and not the indentation),
+#     and the continuation name is inherited no matter what the continuation line starts with. Deriving
+#     the name from the line's FIRST CHARACTER made both shapes UNHANDLED: an indented directive was
+#     refused forever, and `ExecStart=/bin/sh -c \` + `cd <legacy>` (a continuation that happens to
+#     begin with a word, not `--`) was refused as "a directive this tool does not re-base" about an
+#     `ExecStart=` it re-bases two lines above. Both are the `;`-comment false block's class — the
+#     scanner's line classification disagreeing with systemd's parser — so the rule is structural: if a
+#     continuation is OPEN the name is the inherited one, otherwise it is `<Name>` after leading blanks.
 unit_scan() {
-  local f="$1" n=0 line dir projected miss p cont=""
+  local f="$1" n=0 line stripped dir projected miss p cont=""
   # ⛔ A FILE THAT CANNOT BE OPENED HAS NO RECORD ONLY IF YOU LET THE REDIRECT FAIL SILENTLY. `done < "$f"`
   # produced zero records for an unreadable unit, which the verdict then read as "clear of the legacy
   # home" (review F1). The open is attempted here, so the caller gets a NAMED CANNOT-MEASURE record.
@@ -429,6 +464,12 @@ unit_scan() {
     n=$((n + 1))
     # ⛔ A COMMENT IS IGNORED BY systemd, SO IT NEITHER SETS NOR CLEARS THE CONTINUATION (review F2).
     if is_comment "$line"; then continue; fi
+    # ⛔ LEADING BLANKS ARE NOT PART OF THE DIRECTIVE NAME (review F4). One strip, used by every test
+    # below, so an indented directive and an indented continuation are classified like systemd does.
+    stripped="$line"
+    while :; do
+      case "$stripped" in [[:space:]]*) stripped="${stripped#?}" ;; *) break ;; esac
+    done
     # ⛔ THE PROJECTION IS THE LIB'S RULE, NOT A COPY OF IT. `cell_home_project_line` applies the
     # boundary rule (`/tmp/cell-home-2/x` and `/tmp/cell-home.bak` are not this home), and it is also
     # the record test: an unchanged projection means this line names no legacy home of OURS.
@@ -438,20 +479,31 @@ unit_scan() {
         # This line names no legacy home of ours — but it may still BE part of the logical line above, so
         # the inherited directive name must survive it. Only a line that does NOT end in `\` ends the
         # logical line; a fresh `<Name>=… \` line starts a new one and sets the name it will hand down.
-        case "$line" in
-          *\\ ) case "$line" in [A-Za-z]*) cont="${line%%=*}" ;; esac ;;
-          *)    cont="" ;;
+        # ⛔ AND A LINE THAT ENDS IN `\` WHILE A CONTINUATION IS OPEN KEEPS THE INHERITED NAME (review
+        # F4): `cd … \` inside an `ExecStart=` continuation is not a directive named `cd …`.
+        case "$stripped" in
+          *\\ )
+            if [ -z "$cont" ]; then
+              case "$stripped" in [A-Za-z]*) cont="${stripped%%=*}" ;; esac
+            fi ;;
+          *) cont="" ;;
         esac
         continue ;;
     esac
-    case "$line" in [A-Za-z]*) dir="${line%%=*}" ;; *) dir="$cont" ;; esac
+    # ⛔ A CONTINUATION THAT NAMES THE HOME INHERITS, WHATEVER ITS FIRST CHARACTER IS (review F4); a new
+    # directive is `<Name>` read AFTER leading blanks, so an indented `   Environment=` is `Environment`.
+    if [ -n "$cont" ]; then
+      dir="$cont"
+    else
+      case "$stripped" in [A-Za-z]*) dir="${stripped%%=*}" ;; *) dir="" ;; esac
+    fi
     case "$dir" in
       "") printf '%s\tUNHANDLED\t%s\t\n' "$n" "$line"; cont=""; continue ;;
     esac
     if ! grep -Eq "^($UNIT_DIRECTIVES)\$" <<<"$dir"; then
       printf '%s\tUNHANDLED\t%s\t\n' "$n" "$line"; cont=""; continue
     fi
-    case "$line" in *\\ ) cont="$dir" ;; *) cont="" ;; esac
+    case "$stripped" in *\\ ) cont="$dir" ;; *) cont="" ;; esac
     miss=""
     while IFS= read -r p; do
       [ -n "$p" ] || continue
@@ -492,11 +544,23 @@ _project_file() {
 # thrown away (`2>/dev/null`), so a `<unit>.service.d` dir this account cannot read contributed NO file
 # at all and the dir then read as "clear of the legacy home" — the same false PASS as an unreadable
 # FILE, one level up.
+#
+# ⛔ THE POPULATION MUST BE THE ONE systemd LOADS, BECAUSE THE VERDICT SPEAKS FOR ALL OF IT (review F5).
+# It used to be `*.service|*.timer|*.conf` AND `-type f`, so three shapes systemd reads were invisible:
+# a SYMLINKED unit (`systemctl link` exists precisely to install a unit as a symlink — `-type f`
+# excludes it), and every unit type other than `.service`/`.timer` (`.socket`, `.mount`, `.path`, …) —
+# and `--check` then said "none — every unit … is clear of the legacy home" and answered 0 (the RECLAIM
+# precondition) over a `.socket` whose `ListenStream=` named the legacy home. The writer refuses a
+# symlink by name (see `migrate_units`) rather than swapping the link for a regular file.
 UNIT_FILES=""
 UNIT_FIND_ERR=""
 unit_files() {
   local args
-  args=( "$1" -maxdepth 2 \( -name '*.service' -o -name '*.timer' -o -name '*.conf' \) -type f )
+  args=( "$1" -maxdepth 2
+         \( -name '*.service' -o -name '*.socket' -o -name '*.timer' -o -name '*.mount' -o -name '*.automount'
+            -o -name '*.path' -o -name '*.swap' -o -name '*.target' -o -name '*.slice' -o -name '*.conf' \)
+         \( -type f -o -type l \)
+         ! -name '*.pre-cell-home' )
   UNIT_FILES="$(find "${args[@]}" 2>/dev/null | LC_ALL=C sort)"
   UNIT_FIND_ERR="$(find "${args[@]}" 2>&1 >/dev/null | LC_ALL=C sort -u)"
 }
@@ -544,7 +608,7 @@ check_units() {
   note "units naming the legacy home ($HOME_LEGACY)"
   scan="$(unit_scan_all)"
   if [ -z "$scan" ]; then
-    note "  none — every unit and drop-in directive is clear of the legacy home"
+    note "  none — every unit and drop-in directive this tool grades (.service .socket .timer .mount .automount .path .swap .target .slice, plus *.conf drop-ins) is clear of the legacy home"
     return 0
   fi
   # ⛔ A RECORD WHOSE READING COULD NOT BE TAKEN IS CANNOT-MEASURE, NEVER DRIFT AND NEVER CLEAR (review
@@ -630,6 +694,15 @@ migrate_units() {
 $scan
 EOF
       if [ "$refuse" = 1 ]; then
+        refused=$((refused + 1)); rc=1; continue
+      fi
+      # ⛔ A SYMLINKED UNIT IS GRADED BUT NEVER REPLACED (review F5). `systemctl link` installs a unit as
+      # a symlink on purpose; the atomic `mv` below would replace the LINK with a regular file and
+      # silently detach it from the tree the operator linked to. Reporting the drift in `--check` (the
+      # population now includes symlinks) and refusing the write BY NAME is the honest pair: the box
+      # cannot read "one home" over a linked unit, and nothing is destroyed to get there.
+      if [ -L "$f" ]; then
+        warn_line "  REFUSED $f — installed as a symlink ($(readlink "$f" 2>/dev/null || printf '?')); this tool does not replace a link. Edit the target by hand, then re-run."
         refused=$((refused + 1)); rc=1; continue
       fi
       # ⛔ WRITABILITY IS CHECKED BEFORE THE BACKUP, so the operator gets "run this under sudo" instead
@@ -721,11 +794,17 @@ unit_users() {
   local dir f
   while IFS= read -r dir; do
     [ -n "$dir" ] && [ -d "$dir" ] || continue
+    # ⛔ THE SAME POPULATION WALK THE CHECK AND THE WRITER USE (review F3). This function had its own
+    # `find … 2>/dev/null` and its own `awk … 2>/dev/null`, so a dir it could not walk, or a unit it
+    # could not open, contributed NO `User=` — which `check_derivation` reads as "no conflicting
+    # account". Measurability is asserted by `check_derivation` before this runs; sharing `unit_files`
+    # keeps "which units declare a User=" and "which units get graded" the same population.
+    unit_files "$dir"
     while IFS= read -r f; do
       [ -n "$f" ] || continue
       awk '/^[[:space:]]*User=/ { v = $0; sub(/^[[:space:]]*User=[[:space:]]*/, "", v); sub(/[[:space:]]+$/, "", v); if (v != "") print v }' "$f" 2>/dev/null
     done <<EOF
-$(find "$dir" -maxdepth 2 \( -name '*.service' -o -name '*.timer' -o -name '*.conf' \) -type f 2>/dev/null | LC_ALL=C sort)
+$UNIT_FILES
 EOF
   done <<EOF
 $(unit_dirs)
@@ -747,13 +826,40 @@ account_home() {
 
 # check_derivation — 0 when HOME_DURABLE may be acted on; 1 with the reason on stderr when it may not.
 check_derivation() {
-  local u h conflicts=""
+  local u h conflicts="" d f
   [ "$HOME_DURABLE_GIVEN" = 0 ] || return 0        # an explicit CELL_HOME is the operator's decision
   # (i) a PRIVILEGED invoker: the resolver answers root's passwd home, which is not a cell home at all.
   if [ "$INVOKER_UID" = 0 ]; then
     warn_line "  REFUSED: refusing to DERIVE the durable home from a privileged invoking account ($INVOKER -> $HOME_DURABLE). The units run as the cell account, not as root, so this would repoint them (and their credentials) into $HOME_DURABLE. Name the home explicitly: sudo -n env CELL_HOME=/home/cmux bash $0 --apply"
     return 1
   fi
+  # (0) ⛔ THE POPULATION MUST BE MEASURABLE BEFORE "NO CONFLICTING User=" CAN BE AN ANSWER (review F3).
+  # (ii) below reads an EMPTY `User=` list as "the units declare no other account", and an unreadable
+  # dir or unit file produced exactly that empty list — so a derivation the units do not run as was
+  # ACCEPTED and the credential half then wrote the cell's secrets into it (a THIRD home, the dangerous
+  # write this guard exists to prevent). `main` runs the credential half before the unit half, so the
+  # write happened before `migrate_units` could report that the population was never walkable. This gate
+  # runs in the CURRENT shell (no command substitution), which is why it uses `unit_files` directly
+  # instead of asking `unit_users` — a flag set inside `$( )` does not survive.
+  while IFS= read -r d; do
+    [ -n "$d" ] && [ -d "$d" ] || continue
+    unit_files "$d"
+    if [ -n "$UNIT_FIND_ERR" ]; then
+      warn_line "  REFUSED: $d — part of this population cannot be walked by $INVOKER ($(printf '%s' "$UNIT_FIND_ERR" | tr '\n' ' ')), so 'the units declare no other account' is not a reading this tool took. Refusing BEFORE any write; name the home explicitly: CELL_HOME=<the units account's home> $0 $MODE"
+      return 1
+    fi
+    while IFS= read -r f; do
+      [ -n "$f" ] || continue
+      if ! probe_open "$f"; then
+        warn_line "  REFUSED: $f cannot be opened by $INVOKER (mode $(mode_of "$f")), so 'the units declare no other account' is not a reading this tool took. Refusing BEFORE any write; name the home explicitly: CELL_HOME=<the units account's home> $0 $MODE"
+        return 1
+      fi
+    done <<EOF
+$UNIT_FILES
+EOF
+  done <<EOF
+$(unit_dirs)
+EOF
   # (ii) the graded units declare an account whose home is not the derived one: the derivation is not
   #      the home they run as, so repointing them would move them off their own tree.
   while IFS= read -r u; do

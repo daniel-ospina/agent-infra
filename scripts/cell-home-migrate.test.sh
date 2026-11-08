@@ -293,6 +293,27 @@ case "$_out" in
   *) ok "d22b …and no UNHANDLED record is raised for it" ;;
 esac
 
+# ⛔ A PATH COMPONENT ENDS AT ANY SEPARATOR, NOT ONLY AT `/` (review F1). The projector treated every
+# non-`/` tail as a continuation of the filename, so `Environment="HOME=<legacy>"` (systemd removes the
+# quotes: the value really is the legacy home) and `ReadWritePaths=<legacy> <durable>/state` (a
+# space-separated list) read as SIBLINGS. `--check` answered 0 — the RECLAIM precondition — over units
+# that still named the legacy home, and `--apply` printed "one home" over a file it had half-written.
+mk_box "$T/sep"; mkdir -p "$DUR/state"
+run_tool "$TOOL" --apply >/dev/null 2>&1              # converge the box first
+cat >>"$UNITS/app.service" <<EOF
+Environment="HOME=$LEG"
+ReadWritePaths=$LEG $DUR/state
+EOF
+_out="$(run_tool "$TOOL" --check)"; _rc=$?
+[ "$_rc" = 1 ] && ok "d23 a QUOTED legacy path and a space-separated path list are DRIFT (--check 1, not a false one home)" \
+  || bad "d23 --check answered $_rc over a unit whose quoted/space-separated legacy paths were never moved"
+_out="$(run_tool "$TOOL" --apply)"; _rc=$?
+if grep -q "Environment=\"HOME=$DUR\"" "$UNITS/app.service" && grep -q "ReadWritePaths=$DUR $DUR/state" "$UNITS/app.service"; then
+  ok "d24 …and --apply re-bases BOTH shapes (rc $_rc), so nothing names the legacy home afterwards"
+else
+  bad "d24 --apply left a legacy path in place: $(grep -E 'Environment="HOME=|ReadWritePaths=' "$UNITS/app.service" | tr '\n' ' ')"
+fi
+
 printf '\n── (i) THE DERIVATION: the account the UNITS RUN AS, not the invoker (review F2) ────────\n'
 # ⛔ THE DANGEROUS WRITE. `sudo` re-sets HOME to the target account's home and drops an ambient
 # CELL_HOME (`env_reset`), so the remedy this tool used to print — `sudo -n bash $0 --apply` — derived
@@ -332,6 +353,36 @@ env -u CELL_HOME PATH="$STUBACCT:$PATH" CELL_HOME="$T/otherhome" CELL_HOME_LEGAC
   CELL_HOME_MIGRATE_NO_RELOAD=1 bash "$TOOL" --check >/dev/null 2>&1
 [ "$?" != 3 ] && ok "i6 …while an explicit CELL_HOME for that account is honoured (not refused)" \
   || bad "i6 an explicit CELL_HOME was refused too — the guard would block the sanctioned fix"
+
+# ⛔ AN UNREADABLE POPULATION IS NOT "THE UNITS DECLARE NO OTHER ACCOUNT" (review F3). `unit_users`
+# silenced its own `find`/`awk` errors, so a unit dir this account cannot walk contributed NO `User=` —
+# which `check_derivation` reads as "no conflicting account". The derivation was then ACCEPTED and the
+# credential half — which `main` runs BEFORE the unit half — wrote the cell's secrets into a home the
+# units were never verified to run in. That is the THIRD-home write the guard exists to prevent, reached
+# by a read that was never taken.
+mk_box "$T/acct2"
+sed -i.bak 's/^User=.*/User=ubuntu/' "$UNITS/app.service" && rm -f "$UNITS/app.service.bak"
+rm -f "$DUR/keys.env"                                  # so a copy would be observable
+chmod 000 "$UNITS"
+if ls "$UNITS" >/dev/null 2>&1; then
+  ok "i7 SKIPS honestly: this account can read a mode-000 unit dir, so the fixture cannot be made unreadable"
+  ok "i8 (same skip)"
+else
+  # ⛔ WITH NO EXPLICIT CELL_HOME THE HOME IS DERIVED, so the fixture must know WHICH home that is: the
+  # `getent`/`id` stubs answer `$T/realhome` for `cmux` (the same shim i4 uses). Asserting on `$DUR`
+  # would look green while the tool wrote somewhere else — the shape of a vacuous arm.
+  rm -f "$T/realhome/keys.env" "$T/realhome/.pi/agent/auth.json"
+  _out="$(env -u CELL_HOME PATH="$STUBACCT:$PATH" CELL_HOME_LEGACY="$LEG" CELL_HOME_MIGRATE_UNIT_DIRS="$UNITS" \
+          CELL_HOME_MIGRATE_NO_RELOAD=1 bash "$TOOL" --apply 2>&1)"; _rc=$?
+  [ "$_rc" = 3 ] && ok "i7 an UNWALKABLE unit dir is refused BEFORE any write (rc 3, not an accepted derivation)" \
+    || bad "i7 the derivation was accepted over a population it could not walk (rc $_rc)"
+  # ⛔ EITHER CREDENTIAL COUNTS: `keys.env` can also be refused on content (it names the OTHER home), so
+  # the copy this arm must see blocked is the one no content rule can stall — `auth.json`.
+  [ ! -e "$T/realhome/keys.env" ] && [ ! -e "$T/realhome/.pi/agent/auth.json" ] \
+    && ok "i8 …and NO credential was written into the DERIVED home ($T/realhome) whose account could not be verified" \
+    || bad "i8 a credential was written into the derived home before the population was known to be measurable"
+fi
+chmod 755 "$UNITS" 2>/dev/null
 
 printf '\n── (j) THE CREDENTIAL THAT IS ALSO A PROGRAM (review F3/P1) ─────────────────────────────\n'
 
@@ -379,6 +430,25 @@ run_tool "$TOOL" --check >/dev/null 2>&1; _rc=$?
 _out="$(run_tool "$TOOL" --apply)"; _rc=$?
 [ "$_rc" = 1 ] && ok "j8 …and --apply does not report convergence over it either (the two modes agree)" \
   || bad "j8 --apply answered $_rc while --check answers 1 on the same box"
+
+# ⛔ AN UNREADABLE DURABLE `keys.env` IS NOT "NAMES NO VOLATILE HOME" (review F2).
+# `volatile_home_assignments` starts with `[ -r "$f" ] || return 0`, so a file this account cannot read
+# printed NOTHING — which is indistinguishable from a converged one. A durable `keys.env` that
+# re-pointed HOME/CELL_HOME at the legacy home therefore read as clean: `--check` answered 0 (the
+# RECLAIM precondition) and `--apply` reported the poisoned copy as "kept". `[ -r ]` is also permission
+# BITS rather than a reading (`probe_open` is the open), so the same arm holds for root.
+mk_box "$T/env5"
+printf 'export CELL_HOME=%s\nDEEPSEEK_API_KEY=%s\n' "$LEG" "$POISON" >"$DUR/keys.env"; chmod 000 "$DUR/keys.env"
+if ( : <"$DUR/keys.env" ) 2>/dev/null; then
+  ok "j9 SKIPS honestly: this account can open a mode-000 file, so the fixture cannot be made unreadable"
+  ok "j10 (same skip)"
+else
+  _out="$(run_tool "$TOOL" --check)"; _rc=$?
+  [ "$_rc" = 3 ] && ok "j9 a durable keys.env this account cannot OPEN is CANNOT MEASURE (3), never 'one home'" \
+    || bad "j9 an unreadable durable keys.env read as converged (rc $_rc) — a false PASS on the reclaim precondition"
+  case "$_out" in *"CANNOT MEASURE"*"keys.env"*) ok "j10 …and the report names the file it could not read" ;; *) bad "j10 the unreadable env file is not named" ;; esac
+fi
+chmod 600 "$DUR/keys.env" 2>/dev/null
 
 printf '\n── (k) CANNOT MEASURE IS NOT A VERDICT (review F1/F2) ───────────────────────────────\n'
 # ⛔ THE FALSE PASS THIS SECTION EXISTS FOR. `--check` -> 0 is the stated precondition for RECLAIMING the
@@ -496,6 +566,69 @@ esac
 grep -q "^# measured note naming $LEG/harness/run.sh" "$UNITS/app.service" \
   && ok "k14 …while the comment itself is copied VERBATIM (ignored in both directions)" \
   || bad "k14 the comment was rewritten or dropped"
+
+# ── F4: the DIRECTIVE NAME comes from the logical line, not the line's first character ────────
+# systemd accepts an INDENTED directive (measured with `systemd-analyze verify`, which reports an
+# unknown key in that position and not the indentation), and a continuation may begin with a word that
+# is not `--`. Deriving the name from the first character made both shapes UNHANDLED: refused forever by
+# `--apply`, on a diagnostic that was FALSE ("a directive this tool does not re-base" about an
+# `ExecStart=`/`Environment=` it demonstrably does). Same class as the `;`-comment false block.
+mk_box "$T/ind"
+cat >"$UNITS/ind.service" <<EOF
+[Service]
+   Environment=HOME=$LEG
+EOF
+cat >"$UNITS/word.service" <<EOF
+[Service]
+ExecStart=/bin/sh -c \\
+cd $LEG
+EOF
+_out="$(run_tool "$TOOL" --apply)"; _rc=$?
+[ "$_rc" = 0 ] && ok "k15 an INDENTED directive and a word-starting continuation converge (rc 0, no UNHANDLED record)" \
+  || bad "k15 an indented directive / word-starting continuation was refused ($_rc) — --check could never reach 0"
+grep -q "^   Environment=HOME=$DUR$" "$UNITS/ind.service" \
+  && ok "k16 …and the indented directive is repointed, keeping its indentation" \
+  || bad "k16 the indented directive was not repointed"
+grep -q "^cd $DUR$" "$UNITS/word.service" \
+  && ok "k16b …and so is the continuation line that begins with a word" \
+  || bad "k16b the word-starting continuation still names the legacy home"
+
+# ── F5: the GRADED POPULATION is the one systemd LOADS ─────────────────────────────────────
+# The verdict asserts "none — every unit … is clear of the legacy home", so the population must not be
+# `*.service|*.timer` AND `-type f` only: a `.socket` naming the legacy home, and a SYMLINKED unit
+# (`systemctl link` installs units as symlinks) were both invisible and `--check` answered 0.
+# ⛔ EACH FIXTURE IS CONVERGED FIRST: the default `mk_box` unit drifts, so without that every arm would
+# redden for the wrong reason and none would measure the new population member.
+mk_box "$T/pop"
+run_tool "$TOOL" --apply >/dev/null 2>&1              # converge, so ONLY the .socket can drift
+printf '[Socket]\nListenStream=%s/lane.sock\n' "$LEG" >"$UNITS/app.socket"
+_out="$(run_tool "$TOOL" --check)"; _rc=$?
+[ "$_rc" = 1 ] && ok "k17 a .socket whose ListenStream names the legacy home is DRIFT, not an invisible file" \
+  || bad "k17 a .socket naming the legacy home was outside the population (--check $_rc)"
+case "$_out" in *"app.socket"*) ok "k18 …and it is named in the report" ;; *) bad "k18 the .socket is not named" ;; esac
+
+mk_box "$T/link"
+run_tool "$TOOL" --apply >/dev/null 2>&1              # converge, so ONLY the link can drift
+printf '[Service]\nEnvironment=HOME=%s\n' "$LEG" >"$T/link/target.service"
+ln -s "$T/link/target.service" "$UNITS/linked.service"
+run_tool "$TOOL" --check >/dev/null 2>&1; _rc=$?
+[ "$_rc" = 1 ] && ok "k19 a SYMLINKED unit (systemctl link) is graded like any other (--check 1)" \
+  || bad "k19 a symlinked unit was outside the population (--check $_rc)"
+_out="$(run_tool "$TOOL" --apply)"; _rc=$?
+case "$_out" in *symlink*) ok "k20 …and --apply REFUSES it by name instead of replacing the link with a file" ;; *) bad "k20 the writer did not call out the symlinked unit" ;; esac
+[ -L "$UNITS/linked.service" ] && ok "k20b …so the link survives (systemctl link semantics preserved)" \
+  || bad "k20b the writer replaced a symlink with a regular file"
+
+# mut_sub <src> <dst> <function> <old-substring> <new> — replace ONE substring on the FIRST line of ONE
+# function that carries it. Scoped by function because several guards share a spelling; a control whose
+# mutation cannot be applied must fail loudly rather than silently grade the unmutated tool.
+mut_sub() {
+  awk -v fn="$3" -v old="$4" -v new="$5" '
+    $0 == fn "() {" { inf=1 }
+    inf && !done && index($0, old) > 0 { i=index($0, old); $0 = substr($0,1,i-1) new substr($0,i+length(old)); done=1 }
+    inf && /^}$/ { inf=0 }
+    { print }' "$1" >"$2"
+}
 printf '\n── (g) NON-VACUITY: the refusals are the code, not the fixture ──────────────────────\n'
 
 # g1: remove the existence check from the tool and d11-d14 must fail — i.e. the arm above really is
@@ -571,7 +704,7 @@ fi
 # g5: DROP THE CONTINUATION INHERITANCE and d17-d19 must redden. This is the writer/scanner disagreement
 # shape: a continuation line is then no longer graded at all, so the file cannot converge.
 mkdir -p "$T/mutdir5/lib"; cp "$HERE/lib/cell-home.sh" "$T/mutdir5/lib/cell-home.sh"
-sed 's#^    case "\$line" in \[A-Za-z\]\*) dir="\${line%%=\*}" ;; \*) dir="\$cont" ;; esac#    case "$line" in [A-Za-z]*) dir="${line%%=*}" ;; *) dir="" ;; esac#' "$HERE/cell-home-migrate.sh" >"$T/mutdir5/cell-home-migrate.sh"
+mut_sub "$TOOL" "$T/mutdir5/cell-home-migrate.sh" unit_scan 'if [ -n "$cont" ]; then' 'if false; then' 
 if cmp -s "$HERE/cell-home-migrate.sh" "$T/mutdir5/cell-home-migrate.sh"; then
   bad "g5 the continuation mutation could not be applied — d17-d19 are not checking the continuation"
 else
@@ -586,6 +719,20 @@ EOF
   case "$(cat "$UNITS/app.service")" in
     *"--state $LEG/state"*) ok "g5 WITHOUT the continuation inheritance the continuation keeps the legacy path — d18 measures it" ;;
     *) bad "g5 the mutant still converged the continuation — d18 is not measuring it" ;;
+  esac
+  # …and the SAME mutant is F4's pre-fix shape for a continuation that begins with a WORD (it is derived
+  # from the first character instead of inherited), so k16b must redden here too.
+  mk_box "$T/g5b"
+  cat >"$UNITS/app.service" <<EOF
+[Service]
+ExecStart=/bin/sh -c \\
+cd $LEG
+EOF
+  run_tool "$T/mutdir5/cell-home-migrate.sh" --apply >/dev/null 2>&1; _m5rc=$?
+  case "$(cat "$UNITS/app.service")" in
+    *"cd $DUR"*) bad "g5b the mutant still repointed a word-starting continuation — k16b is not measuring the inheritance" ;;
+    *) [ "$_m5rc" != 0 ] && ok "g5b WITHOUT the inheritance a word-starting continuation is refused (rc $_m5rc) — k16b measures it" \
+         || bad "g5b the mutant answered 0 without repointing the continuation — k16b is ambiguous" ;;
   esac
 fi
 
@@ -637,8 +784,11 @@ chmod 644 "$UNITS/hidden.service" 2>/dev/null
 # inheritance `g5` already covers.
 mkdir -p "$T/mutdir8/lib"; cp "$HERE/lib/cell-home.sh" "$T/mutdir8/lib/cell-home.sh"
 MUT8="$T/mutdir8/cell-home-migrate.sh"
-sed -e 's#^    if is_comment "\$line"; then continue; fi#    if is_comment "$line"; then cont=""; continue; fi#' "$TOOL" \
-  | awk 'index($0, "[A-Za-z]*) cont=") > 0 { print "          : ;;"; next } { print }' >"$MUT8"
+sed -e 's#^    if is_comment "\$line"; then continue; fi#    if is_comment "$line"; then cont=""; continue; fi#' "$TOOL" >"$T/mutdir8/tmp.sh"
+# the pre-fix rule: every NON-HIT line cleared the inherited name, whether or not it was a continuation.
+# Restored by short-circuiting the branch (the bookkeeping below it becomes dead code, which is the point).
+mut_sub "$T/mutdir8/tmp.sh" "$MUT8" unit_scan '        case "$stripped" in' '        cont=""; continue; case "$stripped" in'
+rm -f "$T/mutdir8/tmp.sh"
 if cmp -s "$TOOL" "$MUT8"; then
   bad "g8 the continuation mutation could not be applied — k10-k13 are not checking the logical line"
 else
@@ -706,6 +856,79 @@ else
   esac
 fi
 
+
+# g10: REMOVE THE DERIVATION'S MEASURABILITY GATE and i7/i8 must redden — i.e. those arms measure the
+# gate, not a fixture that happens to refuse for another reason. Both read failures (an unwalkable dir
+# and an unopenable unit) are mutated together: either one alone still blocks i7.
+mkdir -p "$T/mutdir10/lib"; cp "$HERE/lib/cell-home.sh" "$T/mutdir10/lib/cell-home.sh"
+MUT10="$T/mutdir10/cell-home-migrate.sh"
+mut_sub "$TOOL" "$T/mutdir10/m1.sh" check_derivation 'if [ -n "$UNIT_FIND_ERR" ]; then' 'if false; then'
+mut_sub "$T/mutdir10/m1.sh" "$MUT10" check_derivation 'if ! probe_open "$f"; then' 'if false; then'
+rm -f "$T/mutdir10/m1.sh"
+if cmp -s "$TOOL" "$MUT10"; then
+  bad "g10 the derivation-gate mutation could not be applied — i7/i8 are not checking it"
+elif ! ls "$UNITS" >/dev/null 2>&1; then
+  ok "g10 SKIPS honestly: the previous fixture is still unreadable"
+else
+  mk_box "$T/g10"
+  sed -i.bak 's/^User=.*/User=ubuntu/' "$UNITS/app.service" && rm -f "$UNITS/app.service.bak"
+  rm -f "$T/realhome/keys.env" "$T/realhome/.pi/agent/auth.json" "$DUR/keys.env"
+  chmod 000 "$UNITS"
+  if ls "$UNITS" >/dev/null 2>&1; then
+    ok "g10 SKIPS honestly: this account can read a mode-000 unit dir"
+  else
+    env -u CELL_HOME PATH="$STUBACCT:$PATH" CELL_HOME_LEGACY="$LEG" CELL_HOME_MIGRATE_UNIT_DIRS="$UNITS" \
+      CELL_HOME_MIGRATE_NO_RELOAD=1 bash "$MUT10" --apply >/dev/null 2>&1
+    [ -e "$T/realhome/.pi/agent/auth.json" ] && ok "g10 WITHOUT the measurability gate a credential IS written into the DERIVED home — i8 measures the gate" \
+      || bad "g10 the mutant still wrote nothing into the derived home — i8 is not attributable to the gate"
+  fi
+  chmod 755 "$UNITS" 2>/dev/null
+fi
+
+# g11: REMOVE the `probe_open` leg from `report_env_file` and j9 must redden — an unreadable durable
+# `keys.env` then reads as "names no volatile home" again (0/1 instead of 3).
+mkdir -p "$T/mutdir11/lib"; cp "$HERE/lib/cell-home.sh" "$T/mutdir11/lib/cell-home.sh"
+MUT11="$T/mutdir11/cell-home-migrate.sh"
+mut_sub "$TOOL" "$MUT11" report_env_file 'if [ -e "$f" ] && ! probe_open "$f"; then' 'if false; then'
+if cmp -s "$TOOL" "$MUT11"; then
+  bad "g11 the env-file probe mutation could not be applied — j9 is not checking it"
+else
+  mk_box "$T/g11"
+  printf 'export CELL_HOME=%s\nK=%s\n' "$LEG" "$POISON" >"$DUR/keys.env"; chmod 000 "$DUR/keys.env"
+  if ( : <"$DUR/keys.env" ) 2>/dev/null; then
+    ok "g11 SKIPS honestly: this account can open a mode-000 file"
+  else
+    run_tool "$MUT11" --check >/dev/null 2>&1; _m11rc=$?
+    [ "$_m11rc" != 3 ] && ok "g11 WITHOUT the probe an unreadable durable keys.env is no longer CANNOT MEASURE (rc $_m11rc) — j9 measures the probe" \
+      || bad "g11 the mutant still answered 3 — j9 is not measuring the probe"
+  fi
+  chmod 600 "$DUR/keys.env" 2>/dev/null
+fi
+
+# g12: NARROW THE POPULATION back to `-type f` and k19 must redden (the symlink becomes invisible);
+# g12b: drop `*.socket` from the name set and k17 must redden.
+mkdir -p "$T/mutdir12/lib"; cp "$HERE/lib/cell-home.sh" "$T/mutdir12/lib/cell-home.sh"
+MUT12="$T/mutdir12/cell-home-migrate.sh"
+mut_sub "$TOOL" "$MUT12" unit_files '-type f -o -type l' '-type f'
+MUT12b="$T/mutdir12/cell-home-migrate-nosock.sh"
+mut_sub "$TOOL" "$MUT12b" unit_files " -o -name '*.socket'" ""
+if cmp -s "$TOOL" "$MUT12" || cmp -s "$TOOL" "$MUT12b"; then
+  bad "g12 the population mutations could not be applied — k17/k19 are not checking the population"
+else
+  mk_box "$T/g12"
+  run_tool "$TOOL" --apply >/dev/null 2>&1
+  printf '[Service]\nEnvironment=HOME=%s\n' "$LEG" >"$T/g12/target.service"
+  ln -s "$T/g12/target.service" "$UNITS/linked.service"
+  run_tool "$MUT12" --check >/dev/null 2>&1; _m12rc=$?
+  [ "$_m12rc" = 0 ] && ok "g12 WITHOUT -type l a symlinked unit is invisible again (--check 0) — k19 measures the population" \
+    || bad "g12 the mutant still saw the symlink (rc $_m12rc) — k19 is not measuring it"
+  mk_box "$T/g12b"
+  run_tool "$TOOL" --apply >/dev/null 2>&1
+  printf '[Socket]\nListenStream=%s/lane.sock\n' "$LEG" >"$UNITS/app.socket"
+  run_tool "$MUT12b" --check >/dev/null 2>&1; _m12brc=$?
+  [ "$_m12brc" = 0 ] && ok "g12b WITHOUT *.socket a socket unit is invisible again (--check 0) — k17 measures the name set" \
+    || bad "g12b the mutant still saw the .socket (rc $_m12brc) — k17 is not measuring it"
+fi
 printf '\n── (h) argument handling ────────────────────────────────────────────────────────────\n'
 run_tool "$TOOL" --nonsense >/dev/null 2>&1 && bad "h1 an unknown argument is not refused" || ok "h1 an unknown argument is refused"
 run_tool "$TOOL" --help >/dev/null 2>&1 && ok "h2 --help exits 0" || bad "h2 --help exits non-zero"

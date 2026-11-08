@@ -159,7 +159,22 @@ cell_home_project() { # <home> <value>
 # whole-line replace (`${line//$CELL_HOME_LEGACY/$home}`) re-bases `/tmp/cell-home.bak` — an operator's
 # pre-migration archive, and the same shape the migration writes as `<file>.pre-cell-home` — to
 # `<home>.bak`, a path nobody has. The migration then refused the whole unit and diagnosed a FABRICATED
-# target. Only a whole path COMPONENT moves: the occurrence must be followed by `/` or end the line.
+# target. Only a whole path COMPONENT moves.
+#
+# ⛔ AND A COMPONENT ENDS AT ANY SEPARATOR, NOT ONLY AT `/` OR THE END OF THE LINE (review F1). The old
+# test (`''|/*`) treated EVERY other following character as a continuation of the filename, so a legacy
+# path followed by a `"` or a space read as a SIBLING and did not move. Both shapes are ordinary
+# systemd, not exotica: `systemd.syntax(7)` says quotes "may be used to wrap a whole item" and that
+# "quotes themselves are removed", and `systemd.exec(5)` documents `Environment="VAR1=word1 word2"` —
+# so `Environment="HOME=/tmp/cell-home"` sets HOME to the legacy home while the projector called the
+# line unchanged, and the scan's record test ("the projection changed this line") saw nothing. That is
+# a PASS manufactured from a reading that never happened: `--check` answered 0 (the RECLAIM
+# precondition) and `--apply` reported "one home" over a unit it left naming the legacy home.
+#
+# So the test is inverted: the occurrence is a SIBLING only when the next character could CONTINUE a
+# filename component (`.`, `-`, `_`, or alphanumeric — `.bak`, `-2`, `d`). Everything else terminates a
+# path: `/`, the end of the line, whitespace, a quote, `,` `;` `:` `)` `$` `%` … and a colon-separated
+# `PATH=` list moves token by token (`$LEG/bin:$DUR/bin` has both occurrences followed by `/` or `:`).
 #
 # `${line%%$pat*}` / `${line#*$pat}` are UNQUOTED ON PURPOSE: on bash 3.2 (macOS) a quoted alternative
 # inside `${…%%…}` splices the quote characters into the pattern (the same trap the migration records).
@@ -172,8 +187,8 @@ cell_home_project_line() { # <home> <line>
     head="${line%%$pat*}"        # everything before the FIRST occurrence
     tail="${line#*$pat}"         # everything after that occurrence
     case "$tail" in
-      ''|/*) out="$out$head$home" ;;   # a component boundary: this really is the legacy home
-      *)     out="$out$head$pat"  ;;   # a sibling (-2, .bak, .pre-cell-home): NOT this home
+      [-._[:alnum:]]*) out="$out$head$pat"  ;;  # continues the filename (-2, .bak, d): a SIBLING, not this home
+      *)               out="$out$head$home" ;;  # `/`, end of line, blank, quote, `,;:` … end the path
     esac
     line="$tail"
   done
