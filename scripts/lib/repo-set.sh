@@ -196,8 +196,8 @@ _rs_nearest_existing_ancestor() {
   # ⛔ AND THE CALLER NOW REFUSES IT ON BOTH ROUTES (round 48 review, P2 — this note used to say the refusal
   # was the `unknown` path only, "because a DANGLING link is `absent`, whose 3 is correct"). THE STAT ANSWER
   # DOES NOT DECIDE THE VERDICT ANY MORE: a shape whose chain holds a link that cannot be resolved is
-  # refused 5 before the absence test can see it. ⛔ BUT IT IS NOT ALWAYS THIS ARM THAT REFUSES IT (#3960
-  # review cycle 2, P3 — measured, and this sentence used to claim the opposite): a link LOOP answers
+  # refused 5 before the absence test can see it. ⛔ BUT IT IS NOT ALWAYS THIS ARM THAT REFUSES IT (round 48
+  # review, P3 — measured, and this sentence used to claim the opposite): a link LOOP answers
   # `other` at `_rs_stat_kind`, and `denied|other` returns 5 from the ERRNO arm, which runs EARLIER — so the
   # loop's 5 has the same verdict through a different arm. ⛔ AND THIS ARM'S SCOPE IS NARROWER THAN "EVERY
   # `absent` ROUTE" (round 48 cycle 4, P2 — measured, and the line below over-generalised): it is the refusal
@@ -578,9 +578,12 @@ repo_set_parse() {
     # review, P1). `stat("<file>/")` is ENOTDIR, so `[ -e "<file>/" ]` is FALSE while `[ -e "<file>" ]` is
     # true — which is how this arm was reached for a set that is right there. The walk cannot see it
     # either: it strips the trailing slash and then starts at the PARENT, so `anc` is a TRAVERSABLE
-    # DIRECTORY and the ancestor test alone proves absence. With a stat answer the `notdir` errno now names
-    # the cause (below); with none — `unknown`, the no-interpreter route — the stripped spelling is the
-    # ONLY evidence available, so it is tested before absence is claimed.
+    # DIRECTORY and the ancestor test alone proves absence. With a stat answer the `notdir` errno names what
+    # the path IS (a file, not a directory), and NOT who found it: the refusal below branches on the SPELLING
+    # (`[ -e "$stripped" ] && [ ! -d "$stripped" ]`), so an errno route and a no-errno route answer the same
+    # text — measured, byte-identical output with and without an interpreter; with none — `unknown`, the
+    # no-interpreter route — the stripped spelling is the ONLY evidence available, so it is tested before
+    # absence is claimed.
     # ⛔ AND IT IS NOT GATED ON `kind` (round 48 — measured, and this note used to claim the opposite): a
     # dangling link spelled with a trailing slash answers `absent` (ENOENT), NOT ENOTDIR, and it very much
     # has an existing stripped form. The stripped-spelling test therefore fires on the `absent` route as well
