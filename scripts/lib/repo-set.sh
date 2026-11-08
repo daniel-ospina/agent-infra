@@ -236,7 +236,11 @@ _rs_doctor_available() {
   return 0
 }
 
-# _rs_stat_kind <path> — `present` | `absent` | `denied` | `other` | `unknown`.
+# _rs_stat_kind <path> — `present` | `absent` | `denied` | `notdir` | `other` | `unknown`.
+# ⛔ `notdir` IS ITS OWN ANSWER AND THE ENUMERATION ABOVE IS THE CONTRACT (review round 44, P2): it was
+# added for `ENOTDIR` (a path component is a FILE) and left out of this line, which is the drift this file
+# keeps recording. `unknown` means the stat call itself was unavailable (no interpreter), NOT "some other
+# errno" — the walk below is what answers then.
 #
 # ⛔ `[ ! -e ]` DOES NOT MEAN "ABSENT", AND THE ANCESTOR WALK ALONE CANNOT TELL (review round 11, P2).
 # `-e` is false for EVERY stat failure: ENOENT (absent), EACCES/EPERM (a denial — TCC denies at an
@@ -264,6 +268,8 @@ except FileNotFoundError:
     print("absent")
 except PermissionError:
     print("denied")
+except NotADirectoryError:
+    print("notdir")
 except OSError:
     print("other")
 else:
@@ -503,6 +509,18 @@ repo_set_parse() {
     # When no interpreter resolves, `unknown` falls back to the ancestor walk below and the narrower
     # claim in its message ("we cannot see it") is the honest one.
     case "$kind" in
+      # ⛔ `ENOTDIR` IS ITS OWN CAUSE, AND IT USED TO LAND IN `other` (review round 44, P2 — measured).
+      # `/etc/passwd/foo/x.conf` was refused at rc 5 with "a permission denial on an ancestor … a path that
+      # is too long, or an I/O error" — none of which is true: a COMPONENT IS A FILE. `_rs_stat_kind` maps
+      # it now, so this arm serves every run where an interpreter RESOLVES; with none, `unknown` skips this
+      # block and the walk's own fallback below names the same cause in the same words. Same
+      # right-code/wrong-cause class as the FIFO parenthetical `j4b` fixes.
+      notdir)
+        _rs_say 2 "repo-set: INVALID — $f is not visible from here, because its nearest existing component is not a directory"
+        _rs_say 2 "repo-set:   (nearest existing: ${anc:-none}). That is the BROKEN state, not the absent one:"
+        _rs_say 2 "repo-set:   every component above the file must be a DIRECTORY, and one of them is not."
+        _rs_say 2 "repo-set:   Do not create the file; fix the path above."
+        return 5 ;;
       denied|other)
         _rs_say 2 "repo-set: INVALID — $f cannot be STAT'd, and the failure is NOT "no such file""
         _rs_say 2 "repo-set:   (errno reported: $kind). That is the BROKEN state, not the absent one: this"
@@ -530,8 +548,19 @@ repo_set_parse() {
       _rs_say 2 "repo-set:     slug=OWNER/NAME checkout=/abs/checkout [state=/abs/state-dir]"
       return 3
     fi
-    _rs_say 2 "repo-set: INVALID — $f is not visible from here, and neither is any directory above it"
-    _rs_say 2 "repo-set:   (nearest existing: ${anc:-none}). That is the BROKEN state, not the absent one:"
+    if [ -n "$anc" ] && [ ! -d "$anc" ]; then
+      # ⛔ THE FALLBACK FOR THE CASE THE STAT ARM CANNOT SEE (review round 44, P2 — measured, and the first
+      # version of this comment was wrong about WHY it runs). With no interpreter `_rs_stat_kind` answers
+      # `unknown`, so `ENOTDIR` never arrives as `notdir` and the walk decides; then the nearest existing
+      # component can be a FILE and "neither is any directory above it" is false. It is NOT reached on the
+      # ordinary path — that one is served by the `notdir` arm above — and the wording matches that arm so
+      # one grep covers both.
+      _rs_say 2 "repo-set: INVALID — $f is not visible from here, because its nearest existing component is not a directory"
+      _rs_say 2 "repo-set:   (nearest existing: $anc). That is the BROKEN state, not the absent one:"
+    else
+      _rs_say 2 "repo-set: INVALID — $f is not visible from here, and neither is any directory above it"
+      _rs_say 2 "repo-set:   (nearest existing: ${anc:-none}). That is the BROKEN state, not the absent one:"
+    fi
     _rs_say 2 "repo-set:   this box may well have named its repos and this process cannot see them (launchd"
     _rs_say 2 "repo-set:   has no Full Disk Access under ~/Documents). Do not create the file; check the"
     _rs_say 2 "repo-set:   location and mode of the path above."
