@@ -1255,7 +1255,7 @@ else
     bad "T24 control: a NOT-GRADED pass must not DELETE the previous rows list"
 fi
 assert_contains "$(cat "$T/t24d/state/harness-apply.status" 2>/dev/null || true)" "farm_rows=not-graded" \
-    "T24 control: and the record says this pass did not grade the farm — not `none`, which claims it did"
+    "T24 control: and the record says this pass did not grade the farm — not 'none', which claims it did"
 
 
 # Control 4: a DANGLING farm link is NOT an absent farm — `-d` follows symlinks, so the skipped arm
@@ -1450,6 +1450,22 @@ assert_contains "$(cat "$T/t24r/state/harness-apply.status" 2>/dev/null || true)
     "T24 control: while still carrying the instrument's row count"
 assert_contains "$OUT" "named NOWHERE durable" \
     "T24 control: and the journal says the elided rows are named nowhere, rather than implying they are on disk"
+# ⛔ AND THE TEMP NEVER LANDS *INSIDE* THAT DIRECTORY (round-1 review issue 3 — its uncovered mutant).
+# With only the trailing `[ -f ]`, `mv src dir` MOVES the temp into the directory (rc 0) and `[ -f dir ]`
+# then refuses it — so every row above stays green while the pass litters the operator's state dir with
+# a temp its else-arm can no longer find (`rm -f "$FARM_ROWS_FILE.tmp-$$"` no longer exists at that
+# path). Deleting the `[ ! -d ]` pre-check must red SOMETHING, and this is it (measured: `[ -n … ]` in
+# its place reds this row and nothing else).
+assert_eq "$(ls -A "$T/t24r/state/harness-apply-farm-rows.txt" 2>/dev/null | wc -l | tr -d ' ')" "0" \
+    "T24 control: and no temp is left INSIDE the directory (the -d pre-check is what refuses that, not the -f post-check)"
+# ⛔ AND `detail=` CARRIES THE *UNWRITABLE* SENTENCE, NOT THE PERSISTED ONE (round-1 review issue 3).
+# Nothing read `detail=` on this arm, so always taking the `FARM_ROWS_OK=1` sentence reddened no row: the
+# record would have claimed the names are on disk in the one state where they are not.
+REC24R="$(cat "$T/t24r/state/harness-apply.status" 2>/dev/null || true)"
+assert_contains "$(grep '^detail=' <<<"$REC24R")" "the full list could not be persisted" \
+    "T24 control: and the detail= field says the names are NOT on disk"
+assert_absent "$(grep '^detail=' <<<"$REC24R")" "every one named in" \
+    "T24 control: and it does NOT claim every row is named in a file that holds no list"
 # ⛔ A RELATIVE SEAM MUST STILL PUBLISH AN ABSOLUTE PATH (review round 3). Every fixture above reaches
 # the pass through `run_pass`, which pins an ABSOLUTE HARNESS_APPLY_STATE_DIR — so the absolutisation
 # was untested and reverting it kept this suite green. This case invokes the pass directly with a
