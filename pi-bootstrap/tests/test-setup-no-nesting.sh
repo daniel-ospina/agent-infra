@@ -678,8 +678,13 @@ other:orchestrator-harness/capacity.sh other:orchestrator-harness/cloud-cell-doc
 # FOUR of the eight were `DELIVERED BY NOTHING` — the #1552 shape the same run names: a fresh
 # `$DEST/scripts` gets a farmed consumer WITHOUT the executable it calls. Verified against the CODE,
 # not the diff (#1899):
-#   · `cloud-cell-quiesce.sh` (fleet_srcs) resolves and EXECs the supervisor — the
-#     `for c in "$REPO/scripts/cloud-cell-supervisor.sh" …` loop then `bash "$SW" stop` (:44-55).
+#   · `cloud-cell-quiesce.sh` (fleet_srcs) resolves and EXECs the supervisor — the candidate
+#     `for c in "$REPO/scripts/cloud-cell-supervisor.sh" …` loop (:44-49, through its `done`) sets `SW`,
+#     and the exec is `[ -n "$SW" ] && bash "$SW" stop` (:139). ⛔ The loop and the exec are 90 lines
+#     apart; an earlier version of this bullet cited `:44-55` for both, which covered the loop plus
+#     unrelated comment text and never reached the exec — the claim was right and the citation was not.
+#     That is the defect this file's P3 rule removes, stated further down in this same block: cite the
+#     FUNCTION and let `grep -n` find the line, rather than a number that a base move can strand.
 #   · `cloud-cell-supervisor.sh` execs `cloud-cell-doctor.sh` — `doctor_path()` (:4530) and
 #     `die "cloud-cell-doctor.sh not found …"` (:4550) — and names `install-controller-service.sh
 #     --install` as its own repair (:3654, :4264).
