@@ -388,8 +388,10 @@ skip (row 11); a cell with no `keys.env` has no `MAX_LOAD` (row 9).
 
 ## 6. The launcher's own self-check, case by case
 
-`bash scripts/activate-harness.test.sh` — 119 assertions, hermetic (fixture HOME, fixture checkout,
-fake `systemctl`/`launchctl`, a stubbed bot).
+`bash scripts/activate-harness.test.sh` — 129 assertions, hermetic (fixture HOME, fixture checkout,
+fake `systemctl`/`launchctl`, a stubbed bot). The count is kept honest by re-reading the suite's last
+line, which is the only place it is stated: a figure in prose re-stales silently, and that is the class
+this whole document is about.
 
 | case | what it proves | why it exists |
 |---|---|---|
@@ -424,13 +426,19 @@ fake `systemctl`/`launchctl`, a stubbed bot).
 | **T31** | a unit whose period cannot be read says `cadence UNREADABLE … assumed 1800 s` on the OK row, and stays green | the disclosure was computed, passed as a parameter, and rendered by **none** of the four beacon emits — the only branch that row reaches — so an assumed bound printed identically to a measured one. A disclosure no state renders is not a disclosure |
 | **T31b–T31d** | the same disclosure appears on the `NEVER-FIRED` and `LATE` rows, and is **absent** when the period *was* read (`30min` ⇒ 8400 s, undressed) | after T31 the note was still a comment on three of four arms — and those are the states an operator actually meets (a freshly built box, a stopped one). The negative case is the other half: a disclosure printed always is as useless as one printed never. The `UNKNOWN-mtime` arm is the one use **no test can pin** (breaking `stat` portably is not a thing a fixture can do), and the code says so |
 | **T32** | the repair pool's **supply half** is a row on a cell: no supervisor ⇒ exit **1** + `NOT ARMED: eldato-worker-supply.service`; installed-but-**disabled** and enabled-but-**failed** each fail it; enabled+active is green | `templates/systemd/eldato-worker-supply.service` ships with its own Linux installer and carries no `.timer`, so the derivation loop could not see it and no explicit row named it — a cell with no supply half printed `ACTIVATION COMPLETE` at rc 0 while `pr-doctor` refused every order (review cycle 11, F2). Deleting the row takes the first case to rc 0, so the case is the row's only pin |
+| **T33** | `conflict-rebase-timer.sh status` renders the beacon's epoch as an ISO date through the **BSD** arm (a stub `date` that rejects `-d @…`, exactly as coreutils-less macOS does), never prints `-> ?`, and degrades to the **raw epoch** when no mechanism works at all | review P1-3: the portable `_iso` replaced `date -u -d "@$beat" … \|\| echo '?'` — which printed `-> ?` on every Mac — and NOTHING pinned it. T8 is the only case that runs the real wrapper and never invokes `status`; `conflict-rebase.test.sh` "pins" status with a text grep that cannot see `_iso`. Restoring the pre-fix line reddens four of these assertions |
 
----
-
----
+`bash scripts/install-conflict-rebase-timer.test.sh` — 51 assertions, the installer's own fixture suite
+(fixture HOME/checkout/install dirs, `systemctl`/`launchctl` shims that record every call). Before it
+existed the installer was executed by **nothing**: the launcher suite replaces it with a two-line stub and
+every other gate gave it `bash -n`, so deleting the file left the whole suite green. It pins the two
+platform paths end to end (including F3 — `--report-only` must land `CONFLICT_REBASE_DRY_RUN` **inside**
+`EnvironmentVariables` and be readable back), the `ExecStart=` and cadence refusals, `--status`,
+`--uninstall`, the Darwin/systemd whitespace asymmetry (`PLATFORM`, not the not-yet-assigned `TARGET`),
+and the brake's state-dir resolution (`pause`/`resume` write the directory the INSTALLED unit exports,
+and an ambient value that disagrees is REFUSED rather than written where nothing looks).
 
 ## 7. The review record
-
 **Eight** fresh-context review cycles ran against these files. Issues found per cycle: **18, 12, 7, 6, 3,
 1, 1, then `NO ISSUES FOUND`** — the seventh of which was that cycle 6's own fix was pinned on **one of
 the four** arms it patched. Zero P0 from cycle 2 onward. The counts are not progress; the *class* of finding is: cycle 1's five P0s were all in the **instrument** (a plist read whose `sed` delimiter collided with
