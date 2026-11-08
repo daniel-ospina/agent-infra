@@ -1,0 +1,36 @@
+{
+  "artifacts": [
+    {
+      "kind": "log",
+      "value": "/Users/danielospina/orchestrator/bg/stallfix-20261108T195333Z.log"
+    },
+    {
+      "kind": "sha",
+      "value": "86a6119fcbe3e4a70f036730ef12c3a9b3d3a6de"
+    },
+    {
+      "kind": "worktree",
+      "value": "/Users/danielospina/orchestrator/state/wt-stallfix"
+    }
+  ],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 2400,
+  "duration_s": 312,
+  "ended_at": 1794167986,
+  "exit_code": 0,
+  "heartbeat_at": 1794167986,
+  "host": "Daniels-MacBook-Air-new",
+  "issue": null,
+  "kind": "prfix",
+  "lane_id": "Daniels-MacBook-Air-new.kprfix-stallfix-20261108T195333Z-1794167674-p49880-75b9440a",
+  "lease_until": 1794170386,
+  "pid": 49880,
+  "reason": null,
+  "repo": "daniel-ospina/agent-infra",
+  "schema": 1,
+  "started_at": 1794167674,
+  "state": "DONE",
+  "tag": "stallfix-20261108T195333Z",
+  "worktree": "/Users/danielospina/orchestrator/state/wt-stallfix"
+}
