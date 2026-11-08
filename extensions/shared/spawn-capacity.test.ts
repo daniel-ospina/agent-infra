@@ -21,6 +21,7 @@ import {
   type SpawnAttempt,
 } from "./spawn-capacity.js";
 import { ok, equal } from "node:assert/strict";
+import { readFileSync } from "node:fs";
 
 let passed = 0, failed = 0;
 function test(name: string, fn: () => void | Promise<void>) {
@@ -58,9 +59,63 @@ test("`status: failed` (retry exhaustion — the measured case) is FAILED, and n
 });
 
 test("a pre-spawn refusal is REFUSED", () => {
-  for (const status of ["invalid-cwd", "invalid-session-id", "circuit_open"]) {
+  // ⛔ THIS LOOP IS THE MIRROR of `builtin-tools`' FAILED_TASK_STATUS (#2242 review, P1): a
+  // member added there and not here classifies as a `verdict` — an UNREVIEWED push satisfying
+  // the >=1-dispatch floor — because a pre-spawn refusal payload carries `details.status` and no
+  // `isError`, and the remaining arms are decided by extension LOAD ORDER.
+  for (const status of ["invalid-cwd", "invalid-session-id", "circuit_open", "fleet-saturated"]) {
     equal(classifySpawnOutcome({ details: { status } }).outcome, "refused", status);
   }
+});
+
+test("#2242: a `fleet-saturated` refusal is REFUSED — the exact payload the pre-spawn path emits", () => {
+  // Not just the status string: the shape `spawnSubAgent` actually returns, which is what made
+  // the missing mirror invisible. `isError` is deliberately ABSENT (the producer does not set it)
+  // and `retryable:false` must not be read as a verdict.
+  const payload = {
+    details: {
+      status: "fleet-saturated",
+      retryable: false,
+      error: "could not dispatch: fleet saturated at 88 sessions on 10 cores (ceiling 80)",
+      piProcs: 88,
+      cores: 10,
+      ceiling: 80,
+    },
+  };
+  const c = classifySpawnOutcome(payload);
+  equal(c.outcome, "refused", "a refused dispatch is not a counted review");
+  equal(c.evidence, "status=fleet-saturated", "the classification names what it read");
+  ok(c.outcome !== "verdict", "THE REGRESSION: a refusal must never satisfy the dispatch floor");
+});
+
+test("#2242 DRIFT: every member of `builtin-tools`' FAILED_TASK_STATUS is mirrored here", () => {
+  // ⛔ THE MIRROR, PINNED AS A RELATION RATHER THAN A SECOND HAND-WRITTEN LIST (#2242 review, P1).
+  // The defect that shipped was exactly this drift: `fleet-saturated` was added to
+  // `builtin-tools`' FAILED_TASK_STATUS and not to `REFUSED_STATUS`, so the refusal fell through
+  // every arm to the load-order-dependent `isError` tail and classified as a `verdict` — a refusal
+  // that SATISFIED the review floor for an unreviewed push. A per-set loop cannot catch that (it
+  // enumerates what someone remembered to add); reading the sibling producer's own set can: a
+  // member added THERE and not mirrored here reddens this row by name.
+  //
+  // The source is read as TEXT on purpose — this module is stdlib-only and CI runs
+  // `extensions/shared/*.test.ts` BEFORE the extensions' `npm ci`, so importing `builtin-tools`
+  // (pi SDK) is not available here.
+  const src = readFileSync(new URL("../builtin-tools/index.ts", import.meta.url), "utf8");
+  const m = /const FAILED_TASK_STATUS = new Set\(\[([^\]]*)\]\)/.exec(src);
+  ok(m, "FAILED_TASK_STATUS is still a `new Set([...])` literal — the drift read must be updated, not skipped");
+  const members = [...m![1].matchAll(/"([^"]+)"/g)].map((x) => x[1]);
+  ok(members.length >= 5, `read the producer's members (got ${JSON.stringify(members)})`);
+  ok(members.includes("fleet-saturated"), "the #2242 member is present in the producer's set");
+  for (const status of members) {
+    const c = classifySpawnOutcome({ details: { status } });
+    ok(
+      c.outcome !== "verdict",
+      `FAILED_TASK_STATUS member \`${status}\` is NOT mirrored in shared/spawn-capacity.ts — it classifies as a verdict and satisfies the review floor (#2242)`,
+    );
+  }
+  // …and the reverse leg, which is the #2242 SUPPLEMENT: `fleet-saturated` is the one member whose
+  // remedy is CAPACITY, not an argument, so the class — not just the outcome — is the property.
+  equal(attemptClass({ tool: "task", outcome: "refused", evidence: "status=fleet-saturated" }), "capacity");
 });
 
 test("`killed: true` is a CUT — and the reason it carries is preserved", () => {
@@ -380,6 +435,59 @@ test("F7: a PROVIDER LATCH halt is durable state, never 'fix the argument' (revi
     pre,
   ]);
   ok(/SUSPEND AND POLL/.test(mixedLatch), "a mixed ledger with a latch waits rather than retrying");
+});
+
+test("#2242: a `fleet-saturated` refusal is a CAPACITY fault — never 'fix the argument'", () => {
+  // The second leg of the review's P1, which adding the status to REFUSED_STATUS alone does NOT
+  // fix: `attemptClass` filed every non-circuit_open refusal as `refusal`, so the renderer printed
+  // "a pre-spawn refusal (cwd / session id) — NOT a load effect, and re-dispatching the SAME
+  // argument is refused again". Both halves are false for a concurrency refusal: the argument is
+  // fine, and the IDENTICAL dispatch succeeds once the box drains.
+  const sat: SpawnAttempt = {
+    tool: "task",
+    outcome: "refused",
+    evidence: "status=fleet-saturated",
+  };
+  equal(attemptClass(sat), "capacity", "the class decides the remedy, so it must be capacity");
+  equal(spawnFaultClass([sat]), "capacity", "a saturation-only ledger is a CAPACITY fault");
+  const below = render([sat]);
+  ok(/CAPACITY fault/.test(below), "names the fault it can support");
+  ok(!/fix the refused argument/.test(below), "⛔ NEVER sends the lane to fix an argument that is fine");
+  ok(!/refused again/.test(below), "⛔ never claims the identical dispatch is refused again");
+  ok(/once the box drains/.test(below), "says the identical dispatch succeeds later");
+  ok(/TASK_SESSION_CEILING/.test(below), "names the knob so the remedy is not a dead end");
+  // #2349: no child was ever spawned, so the capacity wording must not claim one.
+  ok(!/child never returned a verdict/.test(below), `header must not claim a returned child: ${below.replace(/\n/g, " | ")}`);
+  ok(/refused BEFORE a child existed/.test(below), "says the refusal happened before a child existed");
+  ok(!/the child needs a/.test(below), "does not claim a child existed in the ACTION either");
+  ok(!/cut child/.test(below), "does not advise about a cut that did not happen");
+  ok(/REFUSED before a child existed/.test(below), "the action says the refusal was pre-spawn");
+  // At the cap, the advice follows the same predicate.
+  const atCap = render([sat, sat, sat]);
+  ok(/WAIT for the box to drain/.test(atCap), "the cap advice says wait, not fix the argument");
+  ok(!/fix the refused argument/.test(atCap), "…and not an argument");
+  ok(!/load-gate/.test(atCap), "the load-gate remedy is for a starved child, not a refused one");
+});
+
+test("#2242 review round 4: a MIXED ledger keeps the cut child's wording it earned", () => {
+  // THE ROW THE COMMENT IMPLIED AND NOBODY HAD (round-4 P2). `attemptClass` files BOTH a cut child
+  // and a saturation refusal as `capacity`, so `spawnFaultClass` says `capacity` — never `mixed` —
+  // and the old `.some(refused)` predicate fired on `[cut child, sat]`, telling a blocked lane
+  // "the dispatch was REFUSED before a child existed" and "there is no partial child output to
+  // distrust" in the same message whose ATTEMPTS line listed the CUT child. The pair is REACHABLE:
+  // `review-enforcer` pushes every non-`verdict` outcome into one session-scoped span, so
+  // cut-after-S then refused-on-the-still-saturated-box is #2242's own incident shape.
+  const sat: SpawnAttempt = { tool: "task", outcome: "refused", evidence: "status=fleet-saturated" };
+  const cutChild: SpawnAttempt = { tool: "task", outcome: "cut", evidence: "killed=true reason=stream-stall" };
+  const mixed = render([cutChild, sat]);
+  equal(spawnFaultClass([cutChild, sat]), "capacity", "precondition: this ledger is capacity, NOT mixed — which is why nothing else caught it");
+  ok(!/refused BEFORE a child existed/.test(mixed), `a mixed ledger keeps the child wording it earned: ${mixed.replace(/\n/g, " | ")}`);
+  ok(!/no partial child output to distrust/.test(mixed), "⛔ never covers a cut child's partial output — the rule classifySpawnOutcome's header states");
+  ok(!/REFUSED before a child existed/.test(mixed), "the ACTION line must not claim a pre-spawn refusal over a cut child");
+  ok(/cut child|child never returned a verdict/.test(mixed), "the cut child is still acknowledged somewhere in the message");
+  // Order-independence: the predicate must not depend on which attempt came first.
+  const reversed = render([sat, cutChild]);
+  ok(!/refused BEFORE a child existed/.test(reversed), "…and the same holds with the refusal first");
 });
 
 test("the refusal gloss is derived from the EVIDENCE, not assumed (review of #2665)", () => {

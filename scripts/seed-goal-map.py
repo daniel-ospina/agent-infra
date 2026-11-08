@@ -26,8 +26,24 @@ escalations. Preconditions are now keyed by ID, and the direction is read off ea
 import os
 import sys
 
-sys.path.insert(0, "/Users/danielospina/Documents/GitHub/tortoise")
-os.environ["TORTOISE_DB_URI"] = "docker://:@localhost:16379/tortoise"
+# ⛔ BOTH HALVES OF THIS LINE ARE A DEFECT CLASS THE FLEET HAS ALREADY PAID FOR:
+#
+#   1. THE ADDRESS. `localhost` resolves `::1` BEFORE `127.0.0.1` on macOS, and port 16379 can carry
+#      a SECOND, near-empty FalkorDB on `::1` (tortoise#6666 — a 1,263-node graph that read as 25
+#      and looked like total data loss). A connect succeeds against either server, so writing to the
+#      decoy reports SUCCESS and the points are then "gone". `127.0.0.1` is the canonical instance.
+#      This script is the ONLY writer of goal state, so a mis-addressed run on the decoy is a boot
+#      of the map into a graph nothing reads.
+#   2. `setdefault`, NOT assignment. It used to CLOBBER `TORTOISE_DB_URI`, so the seeder could not be
+#      pointed at a test graph (or at a restored one) at all — the env var was silently discarded.
+#      An explicit URI must always win.
+#
+# `TORTOISE_REPO` overrides the checkout: the literal below is one machine's path and this file is
+# FARMED to every box (`pi-bootstrap/setup.sh` `fleet_srcs`), which is also what lets the suite point
+# the SDK import at a stub instead of a live graph.
+REPO = os.environ.get("TORTOISE_REPO") or "/Users/danielospina/Documents/GitHub/tortoise"
+sys.path.insert(0, REPO)
+os.environ.setdefault("TORTOISE_DB_URI", "docker://:@127.0.0.1:16379/tortoise")
 from tortoise.sdk import TortoiseSDK  # noqa: E402
 
 sdk = TortoiseSDK()

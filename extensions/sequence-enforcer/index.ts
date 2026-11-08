@@ -59,6 +59,11 @@ import { isPrintMode, isPrintModeEnv } from "../shared/print-mode.js";
 // after a pi upgrade, leaving the checkpoint gate inert while the extension
 // reported itself loaded.
 import { isToolCallEventType } from "../shared/tool-call-event.js";
+// #2242: ONE spawn-outcome classification for the whole harness (the `review-enforcer`
+// dispatch floor reads it too). A private copy here would drift, and the drift is silent:
+// a status this extension does not know reads as a completed dispatch, advancing a
+// verifier step with zero verdicts.
+import { classifySpawnOutcome } from "../shared/spawn-capacity.js";
 // #1419: the kill switch has ONE home. It used to be defined here and
 // referenced-but-never-imported in loop-enforcer, where every write raised
 // `ReferenceError` into a swallowed catch — the documented escape was inert.
@@ -1002,6 +1007,41 @@ function auditLog(entry: Record<string, unknown>) {
 }
 
 // ── enforcement.jsonl path + reader (#377) ─────────
+
+/** #2242: release ONE reviewer reservation without advancing the verifier step, and record the
+ * durable evidence. `reviewers` is a COUNT of in-flight dispatches per step — not a flag — so this
+ * DECREMENTS and deletes only at zero. `delete` (the original shape) released EVERY outstanding
+ * reservation, so with two reviewers in flight one refusal zeroed the count and the second
+ * reviewer's genuine verdict then read `current = 0`, skipped the advance block, and was silently
+ * discarded (review round 5, P1).
+ *
+ * ⛔ `ts` IS REQUIRED, not decorative: `readEnforcementLog` drops any row whose `ts` is not a string
+ * into its `skipped` counter, and `auditLog` does NOT stamp it — so a row written without `ts` is on
+ * disk but unreadable, which is indistinguishable from the event never having happened (review
+ * round 6, P1). The requirement is declared by the `EnforcementLogEntry` interface in THIS file,
+ * whose `ts` is a required `string`, and enforced by that reader's admission test. Every other event
+ * row in this file carries `ts` + `step_name`; this helper is the ONE place the no-verdict rows are
+ * written, so neither can be forgotten again.
+ *
+ * ⛔ CITED BY SYMBOL, NOT BY LINE NUMBER, on purpose — and this is the second correction on this
+ * paragraph. Round 6 cited an `EnforcementLogEntry.ts` file that does not exist; round 7 replaced it
+ * with line numbers that the round-7 edit itself shifted by +6. A pointer that rots on the next
+ * edit reproduces the exact defect it was written to fix, silently, because a comment is the only
+ * consumer. Names cannot rot; numbers do. */
+function releaseReviewerReservation(skill: SkillState, stepName: string, outcome: string, evidence: string): void {
+  auditLog({
+    ts: new Date().toISOString(),
+    event: "verifier-no-verdict",
+    skill: skill.path,
+    step: skill.stepIndex,
+    step_name: stepName,
+    outcome,
+    evidence,
+  });
+  const outstanding = (skill.reviewers.get(skill.stepIndex) ?? 0) - 1;
+  if (outstanding > 0) skill.reviewers.set(skill.stepIndex, outstanding);
+  else skill.reviewers.delete(skill.stepIndex);
+}
 
 // Lazy path resolution (mirrors shared/audit-log.ts gateEventsFile()):
 // resolved per call, not at module load, so a $HOME change (tests, alternate
@@ -2793,7 +2833,23 @@ function tokenStateLabel(reason: string): string {
     // A non-terminal collect (still running) and the background dispatch notice
     // both leave the count untouched, so the step cannot advance until the
     // verdict is reaped.
-    const verifierDetails = (event as { details?: { background?: boolean; terminal?: boolean; run_id?: string } }).details;
+    const verifierDetails = (event as {
+      details?: {
+        background?: boolean;
+        terminal?: boolean;
+        run_id?: string;
+        status?: unknown;
+        killed?: unknown;
+        fallbackStatus?: unknown;
+        failoverHalt?: unknown;
+        failoverHopSpawnFailed?: unknown;
+        isError?: unknown;
+        exitCode?: unknown;
+        /** The CHILD's composed payload on a terminal `task_collect` view — merged into the
+         * classification below so the child's own `killed`/`exitCode` are readable. */
+        details?: unknown;
+      };
+    }).details;
     // #1662 review: the pre-spawn refusal / halted-chain / invalid-session-id
     // results are built BEFORE the background branch, so they carry NO
     // `details.background` — a refused `task({ background: true })` would then
@@ -2812,6 +2868,38 @@ function tokenStateLabel(reason: string): string {
     // advance the verifier step with fewer verdicts than were dispatched.
     const collectRunId =
       typeof verifierDetails?.run_id === "string" ? verifierDetails.run_id : "";
+    // ⛔ A REFUSED BACKGROUND DISPATCH MUST RELEASE ITS RESERVATION (review round 6, P2).
+    //
+    // The branch below is entered only for a terminal collect or a BLOCKING result, so a
+    // `task({ background: true })` refused before any spawn fell through it ENTIRELY: the count was
+    // incremented on the `tool_call` and nothing ever decremented it, because a refusal means there
+    // is no child to collect. Each leak then costs one EXTRA genuine verdict before the step can
+    // advance (`current = 2 -> 1 -> no advance`), and #2242's opt-in makes repeated background
+    // refusals ordinary on a saturated box — the refusal text itself invites a re-dispatch, which
+    // leaks again. Release one reservation and do NOT advance: the same pair the blocking path
+    // asserts.
+    //
+    // The returns-early dispatch NOTICE is deliberately NOT touched: it carries no
+    // status/exitCode/results, so `classifySpawnOutcome` answers `verdict` for it and it keeps its
+    // reservation until the child settles — that is #1662's whole contract.
+    if (
+      step.gate === "verifier" &&
+      isBackgroundDispatch &&
+      !isTerminalCollect &&
+      (event.toolName === "task" || event.toolName === "subagent")
+    ) {
+      const bgOutcome = classifySpawnOutcome({
+        details: verifierDetails as Record<string, unknown> | undefined,
+        isError: (event as { isError?: unknown }).isError,
+      });
+      if (bgOutcome.outcome !== "verdict") {
+        console.log(
+          `[sequence-enforcer] ⛔ background dispatch produced NO verdict (${bgOutcome.outcome}: ${bgOutcome.evidence}) — releasing its reservation, the step stays open (#2242)`,
+        );
+        releaseReviewerReservation(targetSkill, step.name, bgOutcome.outcome, bgOutcome.evidence);
+        return undefined;
+      }
+    }
     if (
       step.gate === "verifier" &&
       (isTerminalCollect ||
@@ -2820,6 +2908,56 @@ function tokenStateLabel(reason: string): string {
       if (isTerminalCollect && collectRunId) {
         if (targetSkill.countedCollects.has(collectRunId)) return undefined; // already counted — never advance twice
         targetSkill.countedCollects.add(collectRunId);
+      }
+      // ⛔ #2242 review (P1): a dispatch that produced NO VERDICT must not advance the
+      // verifier step. This branch used to read only `step.gate === "verifier"` and the
+      // background marker, so the OUTCOME of the dispatch never entered the accounting —
+      // a classification read here is the whole fix, and `shared/spawn-capacity.ts` is the
+      // one place that owns it (the `review-enforcer` floor reads the same function).
+      //
+      // Why it became reachable rather than latent: the blocking pre-spawn refusals were
+      // `invalid-cwd` (a code bug) and `circuit_open` (a breaker), neither of which a
+      // healthy lane hits routinely. #2242 added a BLOCKING refusal that fires on a
+      // measured, routine condition — `TASK_SESSION_CEILING_REFUSE=1` on a box at
+      // `8 × cores`, which is exactly the box on which a lane is most likely to be
+      // dispatching a reviewer. Flow was: `tool_call task` -> +1, `tool_result` with
+      // `details:{status:"fleet-saturated"}` -> -1 and `stepIndex++`, i.e. ONE refused
+      // reviewer dispatch satisfying a verifier step that requires a verdict — a gate
+      // reporting OK with zero verdicts, the Product-Over-Process class A false PASS.
+      //
+      // A pre-spawn refusal carries no `details.background`, so the marker read above
+      // cannot catch it; the status is the only evidence there is, and `classifySpawnOutcome`
+      // is the order-independent way to read it (it also consults the failover fields).
+      // This closes the pre-existing `invalid-cwd` / `circuit_open` hole at the same time.
+      // NOTE the counting asymmetry is deliberate: the count was INCREMENTED on the
+      // `tool_call`, and only the `tool_result` is seen here, so a no-verdict dispatch still
+      // RELEASES one reservation — it just does not ADVANCE the step. That is the correct pair:
+      // the reservation is released (the dispatch is over) while the step stays open for a real
+      // verdict, matching the `return undefined` shape of the still-waiting arm above.
+      // Release ONE, never all: see the decrement below (review round 5, P1).
+      const collectPayload =
+        isTerminalCollect && verifierDetails && typeof verifierDetails.details === "object" && verifierDetails.details !== null
+          ? (verifierDetails.details as Record<string, unknown>)
+          : null;
+      const spawnOutcome = classifySpawnOutcome({
+        // ⛔ A terminal collect carries the CHILD's composed payload one level down, at
+        // `view.details` — and the classifier reads `exitCode` from the object it is HANDED. Passing
+        // the view alone means a child that died on a signal (`exitCode: null`) or exited 0 with no
+        // output reads as a `status:"done"` run and classifies as a VERDICT, advancing the step with
+        // zero verdicts (review round 5, P1 — the #2665 failure shape, in the one consumer whose
+        // whole purpose is to refuse it). Mirror `review-enforcer`'s floor: merge payload LAST so the
+        // child's own `killed`/`exitCode` win.
+        details: collectPayload
+          ? { ...(verifierDetails as Record<string, unknown>), ...collectPayload }
+          : (verifierDetails as Record<string, unknown> | undefined),
+        isError: (event as { isError?: unknown }).isError,
+      });
+      if (spawnOutcome.outcome !== "verdict") {
+        console.log(
+          `[sequence-enforcer] ⛔ dispatch produced NO verdict (${spawnOutcome.outcome}: ${spawnOutcome.evidence}) — the verifier step stays open (#2242)`,
+        );
+        releaseReviewerReservation(targetSkill, step.name, spawnOutcome.outcome, spawnOutcome.evidence);
+        return undefined;
       }
       const current = targetSkill.reviewers.get(targetSkill.stepIndex) || 0;
       if (current > 0) {
