@@ -236,21 +236,51 @@ def resolve_session_id(workspace: str, run, attempts: int = 3,
     message that really was submitted then reads as "not submitted", with a remedy that invites the
     operator to re-send it. A bounded retry costs nothing in soundness (nothing has been sent yet)
     and cannot pick up a new session: the pane that names an id at all is the one that held it.
+
+    ⛔ AND `--surface` MAY NOT EXIST ON THIS BOX'S `cmux` AT ALL (#3795 review P1). Every deployed
+    caller of `cmux surface resume show` is WORKSPACE-ONLY (`orchestrator-heartbeat.sh:1425`,
+    `ask-owner.py:1051`, `lane-status.py:968`, `lane-read.py:21`), and `--surface` is recorded as a
+    flag of `send` / `read-screen` — not of the `resume` scope. A cmux that rejects the flag exits
+    NON-ZERO, this function then names no session, and the caller's best reachable verdict drops to
+    `PANE_ONLY` — i.e. the floor would report `NOT-SUBMITTED` on every tick on a HEALTHY fleet. So a
+    FAILED surface-qualified read retries once WORKSPACE-ONLY, which is exactly the pre-#3795
+    behaviour and can only ever be better than naming nothing.
+
+    ⛔ THE FALLBACK IS KEYED ON A FAILED READ, NEVER ON AN EMPTY ONE (#3795 review P1). `surface
+    resume show` exits 0 with empty stdout for a pane that names no session — that is a real answer,
+    and falling back there could bind this send's verification to a DIFFERENT surface's transcript,
+    which is how a `VERIFIED` gets minted from another pane's bytes. Only "the read did not happen"
+    licenses the retry.
     """
-    for attempt in range(max(1, attempts)):
-        try:
-            proc = run(["cmux", "surface", "resume", "show", "--workspace", workspace,
-                        *(["--surface", surface] if surface else [])],
-                       timeout=45)
-            out = getattr(proc, "stdout", "") or ""
-        except Exception:                                      # noqa: BLE001
-            out = ""
-        for tok in out.replace("'", " ").split():
-            if len(tok) == 36 and tok.count("-") == 4:
-                return tok
-        if attempt + 1 < max(1, attempts):
-            sleep(retry_s)
-    return None
+
+    def probe(surface_arg: str | None) -> tuple[str | None, bool]:
+        """`(session id or None, did any read actually SUCCEED)`."""
+        read_ok = False
+        for attempt in range(max(1, attempts)):
+            try:
+                proc = run(["cmux", "surface", "resume", "show", "--workspace", workspace,
+                            *(["--surface", surface_arg] if surface_arg else [])],
+                           timeout=45)
+                out = getattr(proc, "stdout", "") or ""
+                # A non-zero exit is a FAILED READ, not an empty answer. `_default_run` does not
+                # raise on one, so this is the only place that fact is available.
+                if getattr(proc, "returncode", 0) == 0:
+                    read_ok = True
+            except Exception:                                  # noqa: BLE001
+                out = ""
+            for tok in out.replace("'", " ").split():
+                if len(tok) == 36 and tok.count("-") == 4:
+                    return tok, True
+            if attempt + 1 < max(1, attempts):
+                sleep(retry_s)
+        return None, read_ok
+
+    session_id, read_ok = probe(surface)
+    if session_id is None and surface and not read_ok:
+        _warn("surface-qualified `surface resume show` gave no readable answer; "
+              "retrying workspace-only (this cmux may not accept --surface)")
+        session_id, _ = probe(None)
+    return session_id
 
 
 def session_file_hits(session_id: str | None) -> list[str]:

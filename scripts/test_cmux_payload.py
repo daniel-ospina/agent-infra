@@ -1239,6 +1239,10 @@ def test_verify_cli_forwards_a_surface(P, monkeypatch):
 
 _NUDGE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cadence-nudge.sh")
 _SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))
+# The interpreter the floor hardcodes (`[ -x /usr/bin/python3 ]`). A runner without it silently takes
+# the NO-CHECKER path, so every checker-branch test must SKIP rather than fail with a message that
+# says nothing about the cause (#3795 review P2).
+_FLOOR_PY = "/usr/bin/python3"
 
 
 def _cadence_home(tmp_path, screen_text, previous_line):
@@ -1288,7 +1292,8 @@ def _cadence_home(tmp_path, screen_text, previous_line):
     return home, bindir, screen, state
 
 
-def _run_cadence_nudge(home, bindir, screen, session=None, sid=None, checker=True):
+def _run_cadence_nudge(home, bindir, screen, session=None, sid=None, checker=True,
+                       stub_verdict=None):
     env = dict(os.environ)
     env["HOME"] = str(home)
     env["PATH"] = f"{bindir}{os.pathsep}{env['PATH']}"
@@ -1304,6 +1309,14 @@ def _run_cadence_nudge(home, bindir, screen, session=None, sid=None, checker=Tru
         # The farmed copy lost its checker: the floor must still send, and must still refuse to
         # certify what it could not check.
         (home / ".pi" / "agent" / "scripts" / "lib" / "cmux_payload.py").unlink()
+    if stub_verdict is not None:
+        # ⛔ DRIVE THE VERDICT MAPPING DIRECTLY (#3795 review P2). The `case` in the floor decides
+        # what a `delivered=` value MEANS, and only the VERIFIED and UNVERIFIED arms were pinned. A
+        # later "simplification" to `VERIFIED|PANE_ONLY) delivered="yes"` reds no test without these.
+        stub = (home / ".pi" / "agent" / "scripts" / "lib" / "cmux_payload.py")
+        stub.write_text("import sys\nprint(%r)\nsys.exit(%d)\n"
+                        % (stub_verdict, 0 if stub_verdict == "VERIFIED" else 3),
+                        encoding="utf-8")
     return subprocess.run(["bash", str(script)], capture_output=True, text=True, env=env,
                           timeout=120)
 
@@ -1341,6 +1354,9 @@ def test_cadence_nudge_does_not_report_a_prefix_as_delivered(tmp_path):
 
 def test_cadence_nudge_still_reports_delivery_it_can_prove(tmp_path):
     """The fix is not "never say yes": a send the transcript records IS certified."""
+    # This arm needs the REAL checker on the interpreter the floor hardcodes.
+    if not os.access(_FLOOR_PY, os.X_OK):
+        pytest.skip(f"{_FLOOR_PY} is not executable on this runner")
     sid = "01a0d648-4097-74b8-8cfd-3df3a071b463"
     seed = _seeded_log(600)
     home, bindir, screen, state = _cadence_home(tmp_path, "ok\n", seed)
@@ -1389,3 +1405,106 @@ def test_cadence_nudge_without_its_checker_still_beats_and_still_refuses_to_cert
     assert all("delivered=yes" not in line for line in nudges), appended
     assert "delivered=UNVERIFIED" in appended, appended
     assert "payload checker unavailable" in appended, appended
+
+
+# ── the verdict MAPPING in the floor, one arm at a time (#3795 review P2) ──────
+#
+# The `case` in `cadence-nudge.sh` is where a checker verdict becomes a receipt field. Only the
+# VERIFIED and UNVERIFIED arms were pinned, so the two outcome that must NEVER reach `delivered=yes`
+# — PANE_ONLY and SUBMIT_FAILED — could drift there with every test still green.
+
+def test_cadence_nudge_reports_pane_only_as_not_submitted_and_names_the_verdict(tmp_path):
+    """`PANE_ONLY` is not a delivery verdict (`cmux_payload.py`'s own contract): the tail is on the
+    surface, submission is unproven. The receipt must not say `yes` — and must still say WHICH it
+    was, since `NOT-SUBMITTED` is shared with `SUBMIT_FAILED`."""
+    seed = _seeded_log(600)
+    home, bindir, screen, state = _cadence_home(
+        tmp_path, "the pane shows nothing relevant\n", seed)
+    r = _run_cadence_nudge(home, bindir, screen, stub_verdict="PANE_ONLY")
+    assert r.returncode == 0, r.stdout + r.stderr
+    nudges, appended = _new_nudge_lines(state, seed)
+    assert nudges, appended
+    assert all("delivered=yes" not in line for line in nudges), appended
+    assert "delivered=NOT-SUBMITTED" in appended, appended
+    assert "verdict=PANE_ONLY" in appended, appended
+    assert "NOT CERTIFIED" in appended, appended
+
+
+def test_cadence_nudge_reports_submit_failed_as_not_submitted(tmp_path):
+    """The terminating Enter failed: submission was never attempted. Same receipt value as
+    PANE_ONLY, and the verdict on the line is how a reader tells them apart."""
+    seed = _seeded_log(600)
+    home, bindir, screen, state = _cadence_home(
+        tmp_path, "the payload sits in the composer\n", seed)
+    r = _run_cadence_nudge(home, bindir, screen, stub_verdict="SUBMIT_FAILED")
+    assert r.returncode == 0, r.stdout + r.stderr
+    nudges, appended = _new_nudge_lines(state, seed)
+    assert nudges, appended
+    assert all("delivered=yes" not in line for line in nudges), appended
+    assert "delivered=NOT-SUBMITTED" in appended, appended
+    assert "verdict=SUBMIT_FAILED" in appended, appended
+
+
+@pytest.mark.parametrize("stub_verdict", ["", "GARBAGE", "VERIFIED\nOK"])
+def test_cadence_nudge_never_certifies_an_unrecognised_checker_verdict(tmp_path, stub_verdict):
+    """⛔ THE `case` DEFAULT MUST NOT BE `delivered=yes` (#3795 review P2). A checker that prints
+    nothing, a token the floor has never heard of, or TWO lines must all land in the loud arm — the
+    whole point of the fix is that only a recognised `VERIFIED` buys a receipt."""
+    seed = _seeded_log(600)
+    home, bindir, screen, state = _cadence_home(
+        tmp_path, "the pane shows nothing relevant\n", seed)
+    r = _run_cadence_nudge(home, bindir, screen, stub_verdict=stub_verdict)
+    assert r.returncode == 0, r.stdout + r.stderr
+    nudges, appended = _new_nudge_lines(state, seed)
+    assert nudges, appended
+    assert all("delivered=yes" not in line for line in nudges), (
+        f"an unrecognised verdict ({stub_verdict!r}) bought a delivery receipt:\n{appended}")
+    assert "NOT CERTIFIED" in appended, appended
+
+
+# ── the `--surface` read: fall back on a FAILED read, never on an empty one (#3795 review P1) ──
+#
+# `cmux surface resume show` is called WORKSPACE-ONLY at every other deployed site, and `--surface`
+# is recorded as a flag of `send`/`read-screen`, not of the `resume` scope. If this box's cmux
+# rejects the flag, the read fails, no session is named, and the floor's best verdict drops to
+# PANE_ONLY — i.e. `NOT-SUBMITTED` on every tick on a healthy fleet. A rejected flag must degrade to
+# the pre-existing behaviour; a pane that genuinely names no session must NOT, because that retry
+# could bind the verification to another surface's transcript.
+
+def test_resolve_session_id_falls_back_to_workspace_only_when_the_flag_is_rejected(P):
+    """A non-zero exit from the surface-qualified read is a FAILED read, and the retry must still
+    find the session through the workspace-only form every other caller uses."""
+    sid = "01a0d648-4097-74b8-8cfd-3df3a071b463"
+    seen = []
+
+    def run(argv, timeout=None):
+        seen.append(list(argv))
+        if "--surface" in argv:
+            # What a cmux that does not know the flag does: refuse, print nothing useful.
+            return _Proc("", returncode=2)
+        return _Proc(sid)
+
+    got = P.resolve_session_id("ws-1", run, sleep=_noop_sleep, surface="surf-9")
+    assert got == sid, seen
+    assert any("--surface" in argv for argv in seen), "the surface-qualified read was never tried"
+    assert any("--surface" not in argv and "resume" in argv for argv in seen), (
+        f"no workspace-only retry was made — the flag rejection is unrecoverable:\n{seen}")
+
+
+def test_resolve_session_id_does_not_fall_back_when_the_read_succeeded_but_named_no_session(P):
+    """⛔ AN EMPTY ANSWER IS AN ANSWER (#3795 review P1). `surface resume show` exits 0 with empty
+    stdout for a pane that names no session. Falling back there would let the workspace' OTHER
+    surface supply the id, and this send's tail would then be verified against a transcript it was
+    never written to — the false PASS the whole helper exists to prevent."""
+    seen = []
+
+    def run(argv, timeout=None):
+        seen.append(list(argv))
+        if "--surface" in argv:
+            return _Proc("", returncode=0)          # read fine, names no session
+        return _Proc("01a0d648-4097-74b8-8cfd-3df3a071b463")
+
+    got = P.resolve_session_id("ws-1", run, sleep=_noop_sleep, surface="surf-9")
+    assert got is None, got
+    assert all("--surface" in argv for argv in seen), (
+        f"an EMPTY (but successful) read was treated as a failed one:\n{seen}")

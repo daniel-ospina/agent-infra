@@ -498,8 +498,8 @@ fi
 # receipt. The comment that used to sit above the send — "THE SEND IS THE TEST: `cmux send` already
 # tells us whether it worked" — is the premise #1187 FALSIFIED: the 1,962-byte message arrived as its
 # first sentence and the 5,464-byte one arrived complete, both with `OK`. The log is what the next
-# reader (and `session-postmortem.sh`) takes as the receipt, so a receipt that certifies nothing is
-# exactly the defect class this file's own delivery promise cannot afford.
+# reader — the operator, and this file's own due-read — takes as the receipt, so a receipt that
+# certifies nothing is exactly the defect class this file's own delivery promise cannot afford.
 #
 # The verdict now comes from `scripts/lib/cmux_payload.py` (#1187, #1881) — the same checker the lane
 # dispatcher uses — so there is ONE definition of "delivered" in the fleet, not a second one here.
@@ -543,18 +543,39 @@ else
   fi
   verdict="NO-CHECKER"
   delivered="UNVERIFIED"
-  _vdiag=" diag=[payload checker unavailable: $([ -f "$_verify" ] || echo "$_verify")$([ -x /usr/bin/python3 ] || echo " /usr/bin/python3")] rc=${rc:-?}"
+  # ⛔ THE FAILED SEND'S OWN STDERR IS KEPT (#3795 review P2). This branch exists FOR a broken box, so
+  # the cause it already holds — `cmux` refusing the send, or a usage error — is the most valuable
+  # line it could report; naming only what is MISSING leaves the operator to guess. `err` was
+  # captured and never read.
+  _missing=""
+  [ -f "$_verify" ] || _missing="$_verify"
+  [ -x /usr/bin/python3 ] || _missing="${_missing}${_missing:+ }/usr/bin/python3"
+  _cause="payload checker unavailable: $_missing"
+  if [ -n "$err" ]; then
+    _cause="$_cause; cmux=[$(printf '%s' "$err" | tr '\n' ' ' | tail -c 200)]"
+  fi
+  _vdiag=" diag=[$_cause] rc=${rc:-?}"
 fi
 # ⛔ THE DUE READ MUST COUNT ATTEMPTS, NOT ONLY SUCCESSES (see the `last=` read near the top). A
 # verification that cannot be PROVEN — the orchestrator was mid-turn, so its transcript had not
 # flushed inside the window — is a normal outcome here, and if this line only counted verified sends
 # the gap would never advance and the floor would re-fire on EVERY tick: a flood, which is the other
-# way out of the owner's 5-9 min band. Every attempt stamps `NUDGE at=`, and the `delivered=` field
-# carries the verdict, so the reader gets both facts and the cadence stays bounded.
+# way out of the owner's 5-9 min band. Every attempt that reaches this point stamps `NUDGE at=`, and
+# the `delivered=` field carries the verdict, so the reader gets both facts and the cadence stays
+# bounded.
+#
+# ⛔ THE STAMP IS WRITTEN AFTER THE CHECK RETURNS, which is why the wording above says "reaches this
+# point" and not "every attempt" (#3795 review P2). A nudge KILLED inside the verification window
+# (`--timeout 90` plus up to three 45 s surface reads) has sent its message and stamped nothing, so
+# the next tick re-fires once the 6-minute lock takeover expires. That window is BOUNDED and stays
+# inside the band — the beat-pair timer is fire-and-forget at 450 s, so nothing else terminates it —
+# but the guarantee here is "bounded", not "impossible".
 printf '%s NUDGE at=%s delivered=%s (cadence-floor) gap=%sm queue=[%s] alerts=[] ask=[] verdict=%s%s\n' \
   "$(date '+%m-%d %H:%M:%S')" "$now" "$delivered" "$gap_min" "$q" "$verdict" "$_vdiag" >> "$LOG"
-# A failed verdict gets its own line TOO, so `grep CADENCE-NUDGE` still finds the failure even when a
-# reader is scanning for the old rc-only signature, and so the remedy is stated rather than implied.
+# A failed verdict gets its own line TOO, so a reader scanning for `CADENCE-NUDGE` sees the failure
+# without parsing the receipt above, and so the remedy is stated rather than implied. (It is NOT
+# backward compatible with the pre-#1187 `CADENCE-NUDGE rc=<n>` line, which this change removed — the
+# `rc=` in this line lives inside `diag=[…]`.)
 if [ "$delivered" != "yes" ]; then
   printf '%s CADENCE-NUDGE NOT CERTIFIED verdict=%s%s — the nudge was NOT proven delivered; check the orchestrator pane before assuming the beat arrived (#1187).\n' \
     "$(date '+%m-%d %H:%M:%S')" "$verdict" "$_vdiag" >> "$LOG"
