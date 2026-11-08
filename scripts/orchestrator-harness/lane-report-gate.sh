@@ -732,21 +732,54 @@ if _sealed_n == 1:
             or _seal_idx + 1 >= len(_hdr) or not _hdr[_seal_idx + 1].startswith("- **Started:** ")
             or len(_wt_lines) != 1 or _wt_lines[0] > _seal_idx - 1):
         _seal_split = 1
+    # ⛔ "A Worktree line is present" IS NOT ENOUGH, BECAUSE THE WRITER SUPPLIES IT FROM A LANE-WRITABLE VALUE
+    # (round-16 review, HIGH). `render()` emits `- **Worktree:** `{state['worktree']}``, so a newline in that
+    # value lets the LANE position the Branch/stamp/Started lines itself while the writer still supplies the
+    # one Worktree line the arm above demands: measured with the real writer, rc=0 PASS on a state whose
+    # only edit was `head_at_write`, both arms green. So the block is pinned to the writer EXACT SHAPE — each
+    # field value is one line, inside backticks, with the stamp exactly two lines below the Worktree line —
+    # and to the writer FIRST HEADING, which `render()` always emits as `## Files changed`. An injected
+    # heading is what the attacker needs to hide the real block, so requiring the known first heading closes
+    # the ingress the shapes alone cannot.
+    if _wt_lines:
+        if (_seal_idx != _wt_lines[0] + 2
+                or not re.match(r"^- \*\*Worktree:\*\* `[^`]*`$", _hdr[_wt_lines[0]])
+                or not re.match(r"^- \*\*Branch:\*\* `[^`]*`$", _hdr[_seal_idx - 1])):
+            _seal_split = 1
+    if _first_heading >= 0 and _rlines[_first_heading].rstrip() != "## Files changed":
+        _seal_split = 1
 # ⛔ AND THE STAMP MUST BE THE ONLY Base LINE OUTSIDE A CODE FENCE (round-15 review, HIGH). The writer renders
 # suite commands and their log tails inside ``` fences, so an honest report can legitimately PRINT the stamp
 # shape (the false-refusal row from round 13). Outside a fence, a second Base line means the header was cut and the
 # real stamp ended up in the body — the same bypass, with the injected one in the header.
 # Measured: no honest rendering path can produce an unfenced duplicate — a `note --not-done` item is prefixed
-# `- ` by the writer (so `- - **Base:** …` cannot match the anchored shape), and suite output is fenced. The
-# only way to hit this arm is text written into the markdown by hand, which is the digest residual disclosed
-# further down, so the rule costs an honest lane nothing.
+# `- ` by the writer (so `- - **Base:** …` cannot match the anchored shape), and suite output is fenced with
+# FOUR backticks, which is why the toggle below must be delimiter-aware: a log line opening with three of them
+# is data inside the writer fence, not its close (a boolean toggle refused an honest VALID report — measured,
+# round-16). The only way to hit this arm is text written into the markdown by hand, which is the digest
+# residual disclosed further down, so the rule costs an honest lane nothing.
 _outside = 0
-_fenced = False
+_fence_len = 0
 for _rl in _rlines:
-    if _rl.startswith("```"):
-        _fenced = not _fenced
+    # ⛔ DELIMITER-AWARE, NOT A BOOLEAN TOGGLE (round-16 review, MED). The writer fences suite output with
+    # FOUR backticks, so a log line that starts with THREE of them is DATA inside that fence — a boolean
+    # toggle read it as the close, counted the writer own stamp as an unfenced duplicate, and refused an
+    # honest VALID report with a remedy that reproduces the refusal (measured with the real writer). CommonMark
+    # closes a fence only with a run at least as long as the opener, which is the rule applied here.
+    _s = _rl.strip()
+    _bt = len(_s) - len(_s.lstrip("`"))
+    if _bt >= 3:
+        # An OPENER may carry an info string (` ```text `, ` ````text `); a CLOSER must be a bare run at least
+        # as long as the opener. Anything else starting with backticks is data inside the open fence — which is
+        # exactly the case the boolean toggle got wrong.
+        if _fence_len == 0:
+            _fence_len = _bt
+            continue
+        if _s == "`" * _bt and _bt >= _fence_len:
+            _fence_len = 0
+            continue
         continue
-    if not _fenced and _rl.startswith("- **Base:**"):
+    if _fence_len == 0 and _rl.startswith("- **Base:**"):
         _outside += 1
 if _outside != _sealed_n:
     _seal_split = 1

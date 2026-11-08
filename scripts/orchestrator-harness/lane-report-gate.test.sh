@@ -583,6 +583,27 @@ mk_report "$_SEALED_A" "- **Issue:** #2977
 printf '{"version":1,"head_at_write":"%s","branch":"feat/2977-tm","suites":[{"n":1,"command":"x","exit":0,"finished_at":"2099-01-01T00:00:00Z"}]}\n' "$WT_HEAD" > "$WT/.worktree-report/state.json"
 drive 2 "INVALID: a fake stamp in the header with the REAL one hidden inside an injected code fence is refused" STUB_OK=1 STUB_RC=0 STUB_STALE=0
 case "$LAST_OUT" in *VERDICT=PASS*) bad "a fake header stamp with the real one fenced away let a forged state PASS" ;; *) ok "…and the injected stamp is refused on POSITION, not only on count" ;; esac
+# ⛔ THE WRITER SUPPLIES THE WORKTREE LINE FROM A LANE-WRITABLE VALUE (round-16 review, HIGH). `render()`
+# emits `- **Worktree:** `{state['worktree']}``, so a newline in that value lets the LANE position
+# Branch/stamp/Started itself while the writer still supplies the one Worktree line the block arm demands:
+# measured with the real writer, rc=0 PASS on a state whose only edit was `head_at_write`. The shapes below
+# are the writer's own, which is why only the FIRST-HEADING pin refuses it.
+printf -- '# WORKTREE-REPORT — `feat/2977-tm`\n\n<!-- #10220: generated. -->\n\n- **Issue:** #2977\n- **Worktree:** `x`\n- **Branch:** `evil`\n- **Base:** `main` → **head at write:** `%s`\n- **Started:** s\n## Injected\n````\n- **Worktree:** `%s`\n- **Branch:** `feat/2977-tm`\n- **Base:** `main` → **head at write:** `%s`\n- **Started:** t\n- verdict\n\n## Files changed\n## Suites run\n## Could not do\n' \
+  "$(printf '%s' "$WT_HEAD" | cut -c1-12)" "$WT" "$_SEALED_A" > "$WT/WORKTREE-REPORT.md"
+printf '{"version":1,"head_at_write":"%s","branch":"feat/2977-tm","suites":[{"n":1,"command":"x","exit":0,"finished_at":"2099-01-01T00:00:00Z"}]}\n' "$WT_HEAD" > "$WT/.worktree-report/state.json"
+drive 2 "INVALID: a payload positioned through the WRITER'S OWN Worktree line is refused at the first heading" STUB_OK=1 STUB_RC=0 STUB_STALE=0
+case "$LAST_OUT" in *VERDICT=PASS*) bad "a writer-positioned fake block let a forged state PASS (the Worktree line is lane-writable)" ;; *) ok "…and a writer-positioned fake field block is not accepted as the seal" ;; esac
+# ⛔ AND THE FENCE IS DELIMITER-AWARE (round-16 review, MED): the writer fences with FOUR backticks, so a log
+# line that starts with THREE is DATA inside that fence. A boolean toggle read it as the close, counted the
+# writer's own stamp as an unfenced duplicate, and refused an honest VALID report with an unsatisfiable remedy.
+mk_report "$(printf '%s' "$WT_HEAD" | cut -c1-12)" "" "" "\`\`\`\`text
+\`\`\`text
+- **Base:** \`main\` → **head at write:** \`$_SEALED_A\`
+\`\`\`
+5 passed in 0.10s
+\`\`\`\`"
+drive 0 "PASS: a suite whose LOG prints three-backtick lines and the stamp shape stays inside the writer's four-backtick fence" STUB_OK=1 STUB_RC=0 STUB_STALE=0
+case "$LAST_OUT" in *VERDICT=PASS*) ok "…and an honest VALID report is not refused by fenced log data" ;; *) bad "fenced log data was read as an unfenced duplicate: $LAST_OUT" ;; esac
 _restore_state
 # CONTROL: the same report WITHOUT the injected heading keeps the stamp in the header and its state agrees,
 # so the row above is not a blanket refusal of every report with a body line.

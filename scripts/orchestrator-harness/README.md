@@ -1993,9 +1993,11 @@ off macOS (it renders a launchd plist) — the portability that matters is `orch
    value, a header ended before it by an injected `## `, a lane-supplied stamp with the real one pushed
    into the body, or a second `Base:` line outside a code fence. Those last spellings are one class: any of
    them makes the sealed cross-check go dark (or read a stamp of the lane's choosing) while the writer
-   re-seals its own digest honestly, so the gate trusts a stamp only inside the writer's field block
-   (`- **Worktree:**`, `- **Branch:**`, the stamp, `- **Started:**`) and only as the single `Base:` line
-   outside code fences. The stamp count is scoped to
+   re-seals its own digest honestly, so the gate trusts a stamp only inside the writer's field block —
+   `- **Worktree:**`, `- **Branch:**`, the stamp exactly two lines below it, `- **Started:**` below that,
+   each value on one line — only when the report's first heading is the writer's own `## Files changed`, and
+   only as the single `Base:` line outside code fences (counted delimiter-aware, because the writer fences
+   suite output with FOUR backticks and a log line opening with three is data, not the close). The stamp count is scoped to
    the report HEADER — the writer renders suite commands, their log tails and `note` text VERBATIM below
    it, so a body line reproducing the shape is lane-authored prose, not a seal, and refusing it refused
    untampered reports.
