@@ -1206,8 +1206,9 @@ ck "(g6) …and does NOT reuse another arm's verdict (no REJECTED, no NON-ANSWER
 # `TRANSIENT: the gh environment precondition refused [` plus 46 on the trailing
 # `] — no candidate can be judged from this box`. So a suite that reads only the record stays GREEN
 # while the beat prints half a sentence — which is exactly what happened: with the evidence first, the
-# real 101-byte capture loses `, source=stored)` off the end of `question=`, and from a 171-byte capture
-# the verdict is gone with it (both measured through the real renderer; see the script's own block).
+# real 101-byte capture loses `, source=stored)` off the end of `question=` (which is absent whole from a
+# 160-byte capture), and from 171 bytes the cut reaches the verdict's last byte (all measured through the
+# real renderer; see the script's own block for the full table).
 # The invariant pinned here: the cut may land inside the EVIDENCE (variable-length, and whole in the
 # record), never inside the VERDICT (fixed-size, and the thing that names the precondition).
 LOOP="${LOOP:-$HERE/orch-loop.sh}"

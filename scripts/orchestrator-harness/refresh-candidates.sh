@@ -940,9 +940,12 @@ GH_PROBE_CAUSE=""
 # not about which line arrives.
 # Round 2 answered "the verdict", and MEASURED with the capture this block establishes is real, that
 # pushes out the OTHER half instead — it does not save the verdict, it moves the damage:
-#   * from a captured line of 86 bytes the `question=` is no longer whole, and `source=` is the first
-#     thing lost — the real 101-byte pacing note loses exactly `, source=stored)`;
-#   * from 171 bytes the VERDICT itself is gone, and the 320-byte cap permits 323.
+#   * from a captured line of 86 bytes the `question=` is no longer whole — it loses its closing `)`
+#     first, `source=` only with the 16-byte tail `, source=stored)`, which is what the real 101-byte
+#     pacing note loses; and `question=` is ABSENT ENTIRELY from a 160-byte capture;
+#   * from 171 bytes the cut reaches the VERDICT — it severs its last byte (`… NOT auth and NOT an
+#     outag`). The verdict is absent WHOLLY only at 324 bytes, which the 323-byte take cap just misses,
+#     so "gone" would overstate it: this is the one place the cap keeps something whole.
 # (Both boundaries measured with this arm's own clause through the real `refresh_cause_brief`. An earlier
 # version of this paragraph quoted `… — nothing was sent, so NEI`, which reproduces only when the capture
 # is led by the `gh-contended` note ALONE — the 244-byte note, i.e. WITHOUT `gate_note`'s `gh-gate: `
@@ -1097,10 +1100,15 @@ gh_probe_env() {
   # PRESENCE is `gh auth token`: an OFFLINE lookup of the stored credential (hosts.yml / the keyring),
   # so its exit status is cause-independent. ⛔ ITS STDOUT IS THE TOKEN — it is discarded below and the
   # captured stream is STDERR ONLY. The real idiom is `>/dev/null 2>"$GH_PROBE_ERR"` (stdout to
-  # /dev/null, stderr to the capture file); ⛔ NOT `2>&1 >/dev/null`, which this comment used to name
-  # and which would duplicate stderr onto the CURRENT stdout — the log — while capturing nothing.
-  # (Pre-existing comment defect — blame 5a378bac5d — corrected here because this PR is what made the
-  # `gh auth token` stream carry load; the CODE was always safe, only the sentence was wrong.)
+  # /dev/null, stderr to the capture file).
+  # ⛔ AND `2>&1 >/dev/null` IS ALSO SAFE **HERE**, WHICH AN EARLIER REVISION OF THIS COMMENT CALLED A
+  # DEFECT (#3701 review round 21, P2 — and that revision was itself the mistake). Inside a COMMAND
+  # SUBSTITUTION the two orders are EQUIVALENT: `2>&1` points stderr at the capture pipe, then
+  # `>/dev/null` re-points only stdout, so stderr is captured and stdout is discarded — measured,
+  # `x="$(cmd 2>&1 >/dev/null)"` yields the stderr text and nothing from stdout. The order matters only
+  # at TOP LEVEL, where `2>&1` targets the real stdout and so duplicates stderr into the log — which is
+  # not the context this code is in. The code has always used the explicit form, which is clearer; the
+  # point is that the alternative was mislabelled, not that it was used.
   # ⛔ BOUNDED, STDIN CLOSED, AND A NON-ANSWER IS NOT AN ABSENCE (TOKEN_HANG_FIX). See the block above
   # `gh_probe_bounded`. MEASURED rc=142: an unbounded capture here is what stalled the funnel forever.
   if [ -z "$presence" ]; then
