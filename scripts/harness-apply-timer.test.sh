@@ -1723,6 +1723,48 @@ assert_contains "$OUT" "lives INSIDE the farm" \
     "T24 control: and it is the CONTAINMENT refusal, so the resolved path really landed inside the farm"
 assert_absent "$OUT" "farm: ok" "T24 control: and the farm did not grade itself ok through its own checker"
 
+# ── T24x2: the SAME hazard one site over — `cd` inside the SYMLINK HOP (review round 19) ─────────
+# ⛔ MEASURED (review round 19): the containment leg has SIX captured `cd`s and the suite pinned only
+# the last ones. The hop loop (`pass:1407`, `*) FARM_CHECKER_T="$(CDPATH= cd "$(dirname …)" && pwd -P)/$_l"`)
+# is driven by a RELATIVE LINK, and with an inherited CDPATH whose entry contains the script dir bash's
+# `cd` printed a SECOND line — so `$FARM_CHECKER_T` became a two-line path that can never carry the
+# `$FARM_DEST_REAL/` prefix. The containment test then read a FARM-LOCAL checker as OUTSIDE the farm,
+# EXECUTED it, and the farm graded itself `farm: ok` at rc=0 — the exact fail-open T24x exists to
+# remove, one site over. Dropping `CDPATH=` at `pass:1407` left the whole suite green before this case,
+# so the guard had no attributable mutant (#3442 rule 1).
+# ⛔ THE LINK IS RELATIVE ON PURPOSE: an absolute `ln -s "$dir/real-check.sh"` resolves without ever
+# entering the `*)` arm, and an absolute or `.`-prefixed CHECKER operand skips CDPATH entirely — either
+# shape would leave the hop untested and prove nothing.
+say_case "T24x2 the readlink hop is CDPATH-immune too — a relative SYMLINK checker cannot grade its own farm"
+mk_origin t24x2; mk_clone t24x2
+REPO_P="$CLONE"; MODE_P=sync
+mkdir -p "$T/t24x2/farm-ish/.pi/agent/scripts"
+printf 'x\n' >"$T/t24x2/farm-ish/.pi/agent/scripts/pr-doctor.py"
+printf '#!/usr/bin/env bash\nprintf "check-farm-drift: ok\\n"; exit 0\n' \
+    >"$T/t24x2/farm-ish/.pi/agent/scripts/real-check.sh"
+chmod +x "$T/t24x2/farm-ish/.pi/agent/scripts/real-check.sh"
+ln -s real-check.sh "$T/t24x2/farm-ish/.pi/agent/scripts/check-farm-drift.sh"
+OUT="$(cd "$T/t24x2/farm-ish/.pi/agent" && CDPATH="$T/t24x2/farm-ish/.pi/agent" CELL_HOME_P="$T/t24x2/farm-ish" \
+    HARNESS_APPLY_FARM_CHECKER="scripts/check-farm-drift.sh" run_pass "$T/t24x2" 2>&1)"; RC=$?
+assert_eq "$RC" "24" "T24 control: a relative SYMLINK checker under an inherited CDPATH is REFUSED (24)"
+assert_contains "$OUT" "lives INSIDE the farm" \
+    "T24 control: and the hop resolved to ONE line inside the farm, so the CONTAINMENT refusal fires"
+assert_absent "$OUT" "farm: ok" "T24 control: and the farm did not grade itself ok through a link to its own checker"
+# Control: the SAME relative symlink with NO CDPATH. If this stops being refused, the three rows above
+# could be passing for the symlink's shape rather than for the `CDPATH=` prefix the hop must carry.
+mk_origin t24x2b; mk_clone t24x2b
+REPO_P="$CLONE"; MODE_P=sync
+mkdir -p "$T/t24x2b/farm-ish/.pi/agent/scripts"
+printf 'x\n' >"$T/t24x2b/farm-ish/.pi/agent/scripts/pr-doctor.py"
+printf '#!/usr/bin/env bash\nprintf "check-farm-drift: ok\\n"; exit 0\n' \
+    >"$T/t24x2b/farm-ish/.pi/agent/scripts/real-check.sh"
+chmod +x "$T/t24x2b/farm-ish/.pi/agent/scripts/real-check.sh"
+ln -s real-check.sh "$T/t24x2b/farm-ish/.pi/agent/scripts/check-farm-drift.sh"
+OUT="$(cd "$T/t24x2b/farm-ish/.pi/agent" && CELL_HOME_P="$T/t24x2b/farm-ish" \
+    HARNESS_APPLY_FARM_CHECKER="scripts/check-farm-drift.sh" run_pass "$T/t24x2b" 2>&1)"; RC=$?
+assert_eq "$RC" "24" "T24 control: the same relative symlink with NO CDPATH is refused the same way (the rows above are about CDPATH, not about the link)"
+assert_absent "$OUT" "farm: ok" "T24 control: and it does not execute a link that lands inside the farm"
+
 # ⛔ A PARTIAL EXTRACTION MUST NOT CERTIFY COMPLETENESS (review round 10, reproduced). A farmed checker
 # whose verdict vocabulary this pass only partly knows yields a RED grade with SOME extracted rows —
 # and before this case existed the record said `farm_n=1` beside "1 row(s), every one named in
@@ -2128,6 +2170,45 @@ assert_contains "$(grep '^remedy=' <<<"$REC24AH")" "no 'Next:' remedy" \
 # clause. Mutant that reds this row: append the clause after `$FARM_DEST` again.
 assert_absent "$(grep '^detail=' <<<"$REC24AH")" "with the instrument's own remedy" \
     "T24 control: and detail= does not repeat the remedy at the end of a bounded field"
+
+# ⛔ THE ZERO-EXTRACTION ARM IS THE ONLY GUARD ON A RED GRADE WHOSE SUMMARY PARSES TO ZERO (review
+# round 19, measured). `pass` decides completeness from the instrument's own summary; when all three
+# labels parse and the total is 0 while the grade is RED, `[ "$FARM_NROWS" -eq 0 ]` is the ONLY arm
+# standing between the record and "n=0 … EXACTLY this run" + `farm_n=0` over a header-only artifact,
+# i.e. a red drift pass recording "zero rows drifted" with the drifting file named NOWHERE.
+# ⛔ WHY THE EXISTING FIXTURE DOES NOT PIN IT: t24v's stub reports `1 stale`, so a zero-row mutant falls
+# into the PARTIAL arm and still publishes raw output with `n=unparsed` — measured, neutering the arm
+# left 421/0 green. Here the summary's three counts are ALL ZERO (a lagging farmed copy whose classes
+# this pass's summary regex still reads but whose total it cannot compare against), so the zero-row arm
+# is what produces `n=unparsed` and the raw names; without it the record certifies an empty list.
+mk_origin t24al; mk_clone t24al
+REPO_P="$CLONE"; MODE_P=sync
+mkdir -p "$T/t24al/home/.pi/agent/scripts"
+cat >"$T/t24al/stub-zero-summary.sh" <<'FARM'
+#!/usr/bin/env bash
+# A drifting file this pass's extractor does NOT match, and a full three-label summary whose counts
+# are all zero — so `FARM_EXPECT=0` and the extraction cannot be compared for completeness.
+printf 'pr-doctor.py differs from the ref (STALE, in a vocabulary this pass does not extract)\n' >&2
+printf 'check-farm-drift: DRIFT — 0 stale (0 farm-declared; 0 outside the farm), 0 declared-but-absent, 0 unsourced, of 1 deployed file(s) against origin/main (sync) in %s.\n' "$PWD/src"
+exit 1
+FARM
+chmod +x "$T/t24al/stub-zero-summary.sh"
+OUT="$(HARNESS_APPLY_FARM_CHECKER="$T/t24al/stub-zero-summary.sh" run_pass "$T/t24al" 2>&1)"; RC=$?
+assert_eq "$RC" "24" "T24 control: a zero-total DRIFT summary over an unmatched row is still RED (24)"
+ROWS24AL="$T/t24al/state/harness-apply-farm-rows.txt"
+assert_contains "$(head -1 "$ROWS24AL" 2>/dev/null || true)" "n=unparsed (NO row matched this pass's extractor" \
+    "T24 control: the header says NO row matched — the zero-extraction arm, not the partial one"
+assert_absent "$(head -1 "$ROWS24AL" 2>/dev/null || true)" "n=0" \
+    "T24 control: and it never reads n=0, which says 'nothing drifted' over a RED grade"
+assert_contains "$(cat "$ROWS24AL" 2>/dev/null || true)" "pr-doctor.py differs from the ref" \
+    "T24 control: while the artifact carries the instrument's RAW output, which DOES name the file"
+REC24AL="$(cat "$T/t24al/state/harness-apply.status" 2>/dev/null || true)"
+assert_contains "$(grep '^farm_rows=' <<<"$REC24AL")" "farm_rows=$ROWS24AL" \
+    "T24 control: and the record names that artifact"
+assert_contains "$(grep '^farm_n=' <<<"$REC24AL")" "farm_n=unparsed" \
+    "T24 control: with farm_n=unparsed, never 0 (which means the farm matched everywhere else)"
+assert_contains "$(grep '^detail=' <<<"$REC24AL")" "no row matched this pass's extractor" \
+    "T24 control: and detail= says the extractor matched nothing, not that zero rows drifted"
 
 # ── T26: the materialiser is TOLD which cell home to pin into (agent-infra#3593) ─────────────────
 # MEASURED on the `cmux` cell, 2026-11-06: this pass resolves CELL_HOME from $HOME (pass:195) and the
