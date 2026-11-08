@@ -714,6 +714,83 @@ grep -q "TOOLDIR=/opt/tools$LEG/bin" "$UNITS/app.service" \
   && ok "k25b …and --apply left both BYTE FOR BYTE" \
   || bad "k25b --apply rewrote a foreign prefix or a sibling continuation"
 
+# ── F1 (round 3): the systemd EXEC PREFIXES belong to the token ────────────────────────────
+# `systemd.service(5)` Table 2: `@`, `-`, `:`, `+`, `!` may prefix an executable path, in any order;
+# `-` is also a per-item prefix for `WorkingDirectory=`/`EnvironmentFile=`/`ReadWritePaths=`. Without
+# them in the START set the line produced NO record: `--check` 0, `--apply` repointing the OTHER
+# directives and leaving these, i.e. two homes in one file — and `203/EXEC` after the reclaim.
+mk_box "$T/pfx"; mkdir -p "$DUR/state" "$DUR/env"
+printf '#!/bin/sh\n' >"$DUR/harness/run.sh"
+cat >"$UNITS/pfx.service" <<EOF
+[Service]
+Environment=HOME=$LEG
+EnvironmentFile=-$LEG/env
+WorkingDirectory=-$LEG/state
+ExecStart=-$LEG/harness/run.sh
+ExecStartPost=+$LEG/harness/run.sh
+EOF
+_out="$(run_tool "$TOOL" --apply)"; _rc=$?
+[ "$_rc" = 0 ] && ok "k26 a unit whose paths carry systemd exec prefixes converges (rc 0)" \
+  || bad "k26 the prefixed unit was refused ($_rc)"
+if grep -q "$LEG" "$UNITS/pfx.service"; then
+  bad "k26b …but the file STILL names the legacy home: $(grep -- "$LEG" "$UNITS/pfx.service" | tr '\n' ' ')"
+else
+  ok "k26b …and NOTHING in it names the legacy home any more (no half-migration)"
+fi
+run_tool "$TOOL" --check >/dev/null 2>&1; _rc=$?
+[ "$_rc" = 0 ] && ok "k26c …so the follow-up --check reads 0 (the reclaim precondition is met over a file that meets it)" \
+  || bad "k26c the follow-up --check answered $_rc — the tool left something behind and called it converged"
+
+# ── F2 (round 3): a TAB inside a graded line must not move a record field ───────────────────
+# Tabs are legal systemd whitespace. The raw line used to be field 3 of a TAB-delimited record, so a tab
+# pushed the tail into the MISS field and the tool then reported a "durable counterpart missing" for a
+# path that exists — refusing the file forever.
+mk_box "$T/tab"; mkdir -p "$DUR/state"
+printf '#!/bin/sh\n' >"$DUR/harness/run.sh"
+printf '[Service]\nEnvironment=HOME=%s\nExecStart=%s/harness/run.sh\t--state %s/state\n' "$LEG" "$LEG" "$LEG" >"$UNITS/tab.service"
+_out="$(run_tool "$TOOL" --apply)"; _rc=$?
+[ "$_rc" = 0 ] && ok "k27 a unit with a TAB inside a graded directive converges (rc 0, no fabricated missing target)" \
+  || bad "k27 a tab in the line corrupted the record and refused the file ($_rc)"
+case "$_out" in
+  *"durable counterpart missing"*) bad "k27b …and the report claims a durable counterpart is missing (it exists)" ;;
+  *) ok "k27b …and no missing-counterpart was invented from the line's tail" ;;
+esac
+
+# ── F3 (round 3): pi-keys.env is a credential the fleet reads ───────────────────────────────
+# The launch line sources `$home/keys.env` AND `$home/pi-keys.env`; the tool's own notes say so. Outside
+# CRED_FILES it read as "one home" while the only copy of the model credential sat in the legacy home.
+mk_box "$T/pikeys"
+printf 'DEEPSEEK_API_KEY=%s\n' "$SENTINEL" >"$LEG/pi-keys.env"; chmod 600 "$LEG/pi-keys.env"
+rm -f "$DUR/pi-keys.env"
+run_tool "$TOOL" --check >/dev/null 2>&1; _rc=$?
+[ "$_rc" = 1 ] && ok "k28 a legacy-only pi-keys.env is DRIFT (--check 1, not a false one home over the model credential)" \
+  || bad "k28 pi-keys.env was outside the credential population (--check $_rc)"
+_out="$(run_tool "$TOOL" --apply)"; _rc=$?
+[ -e "$DUR/pi-keys.env" ] && ok "k28b …and --apply copies it into the durable home" \
+  || bad "k28b pi-keys.env was not copied (rc $_rc) — it would be lost with the legacy home"
+case "$_out" in *"$SENTINEL"*) bad "k28c the run printed the credential VALUE (rule 3)" ;; *) ok "k28c …and no credential value appears in the output" ;; esac
+
+# ── F3 general: the ADVISORY listing is visible and changes nothing ─────────────────────────
+mk_box "$T/adv"
+run_tool "$TOOL" --apply >/dev/null 2>&1
+printf 'operator notes\n' >"$LEG/legacy-only.txt"
+_out="$(run_tool "$TOOL" --check)"; _rc=$?
+case "$_out" in *"ADVISORY"*"legacy-only.txt"*) ok "k29 an entry the tool does not grade is listed ADVISORY" ;; *) bad "k29 the ungraded population is not surfaced" ;; esac
+[ "$_rc" = 0 ] && ok "k29b …and it does NOT change the verdict (an advisory is not a gate, so no false block)" \
+  || bad "k29b the advisory changed the exit code ($_rc) — it would block real boxes"
+
+# ── F4 (round 3): the ownership fix must be gradeable, and its failure reported ────────────
+# Ownership only needs fixing on a ROOT run, so the fixture stubs `id` (as i1 does) and names the owner
+# that SHOULD be stamped. A chown that cannot succeed must be a WARN + rc 1, not `|| true`.
+mk_box "$T/own"
+rm -f "$DUR/keys.env"
+_out="$(env CELL_HOME="$DUR" CELL_HOME_LEGACY="$LEG" CELL_HOME_MIGRATE_UNIT_DIRS="$UNITS" \
+        CELL_HOME_MIGRATE_NO_RELOAD=1 CELL_HOME_MIGRATE_FORCE_OWNER="4242:4242" \
+        PATH="$STUBROOT:$PATH" bash "$TOOL" --apply 2>&1)"; _rc=$?
+[ "$_rc" = 1 ] && ok "k30 a root run whose ownership fix FAILS reports it (rc 1, not a swallowed 'copied …')" \
+  || bad "k30 the ownership failure was swallowed (rc $_rc)"
+case "$_out" in *"WRITTEN BUT NOT RE-OWNED"*) ok "k30b …naming the file and the owner it did not get" ;; *) bad "k30b the ownership failure is not reported" ;; esac
+
 # mut_sub <src> <dst> <function> <old-substring> <new> — replace ONE substring on the FIRST line of ONE
 # function that carries it. Scoped by function because several guards share a spelling; a control whose
 # mutation cannot be applied must fail loudly rather than silently grade the unmutated tool.
@@ -1112,6 +1189,56 @@ else
       || bad "g16 the mutant answered $_m16rc — k24 is not measuring the guards"
   fi
   chmod 755 "$DUR" 2>/dev/null
+fi
+
+# g17: remove the durable-side ownership fix (F4 round 3) and k30 must redden — the failure is then
+# swallowed and the run reports success over a credential the cell account cannot read.
+mkdir -p "$T/mutdir17/lib"; cp "$HERE/lib/cell-home.sh" "$T/mutdir17/lib/cell-home.sh"
+MUT17="$T/mutdir17/cell-home-migrate.sh"
+mut_sub "$TOOL" "$MUT17" migrate_credentials 'if ! chown "$DUR_OWNER" "$f_dur" 2>/dev/null; then' 'if false; then'
+if cmp -s "$TOOL" "$MUT17"; then
+  bad "g17 the ownership mutation could not be applied — k30 is not checking it"
+else
+  mk_box "$T/g17"; rm -f "$DUR/keys.env"
+  env CELL_HOME="$DUR" CELL_HOME_LEGACY="$LEG" CELL_HOME_MIGRATE_UNIT_DIRS="$UNITS" \
+      CELL_HOME_MIGRATE_NO_RELOAD=1 CELL_HOME_MIGRATE_FORCE_OWNER="4242:4242" \
+      PATH="$STUBROOT:$PATH" bash "$MUT17" --apply >/dev/null 2>&1; _m17rc=$?
+  [ "$_m17rc" = 0 ] && ok "g17 WITHOUT the ownership report a failed chown is swallowed (rc 0) — k30 measures it" \
+    || bad "g17 the mutant still failed (rc $_m17rc) — k30 is not attributable to the ownership fix"
+fi
+
+# g18: put the raw unit line back into the TAB-delimited record (F2 round 3) and k27 must redden.
+mkdir -p "$T/mutdir18/lib"; cp "$HERE/lib/cell-home.sh" "$T/mutdir18/lib/cell-home.sh"
+MUT18="$T/mutdir18/cell-home-migrate.sh"
+# the pre-fix record carried the LINE as a field; putting a line-shaped value back in the payload is
+# the same defect in miniature (a TAB in the line then moves the field boundary).
+mut_sub "$TOOL" "$MUT18" unit_scan '${miss# }' '$projected'
+if cmp -s "$TOOL" "$MUT18"; then
+  bad "g18 the record-format mutation could not be applied — k27 is not checking it"
+else
+  mk_box "$T/g18"; mkdir -p "$DUR/state"
+  printf '#!/bin/sh\n' >"$DUR/harness/run.sh"
+  printf '[Service]\nEnvironment=HOME=%s\nExecStart=%s/harness/run.sh\t--state %s/state\n' "$LEG" "$LEG" "$LEG" >"$UNITS/tab.service"
+  run_tool "$MUT18" --apply >/dev/null 2>&1; _m18rc=$?
+  [ "$_m18rc" != 0 ] && ok "g18 WITH the raw line in the record a TAB corrupts it and the file is refused (rc $_m18rc) — k27 measures the format" \
+    || bad "g18 the mutant converged anyway — k27 is not measuring the record format"
+fi
+
+# g19: drop pi-keys.env from the population (F3 round 3) and k28 must redden.
+mkdir -p "$T/mutdir19/lib"; cp "$HERE/lib/cell-home.sh" "$T/mutdir19/lib/cell-home.sh"
+MUT19="$T/mutdir19/cell-home-migrate.sh"
+# the list entry is the line that is EXACTLY `pi-keys.env` (the comments mention it in prose).
+awk '$0 == "pi-keys.env" && !done { done=1; next } { print }' "$TOOL" >"$MUT19"
+if cmp -s "$TOOL" "$MUT19"; then
+  bad "g19 the credential-population mutation could not be applied — k28 is not checking it"
+else
+  mk_box "$T/g19"
+  run_tool "$TOOL" --apply >/dev/null 2>&1              # converge FIRST, so only pi-keys.env can drift
+  printf 'DEEPSEEK_API_KEY=%s\n' "$SENTINEL" >"$LEG/pi-keys.env"; chmod 600 "$LEG/pi-keys.env"
+  rm -f "$DUR/pi-keys.env"
+  run_tool "$MUT19" --check >/dev/null 2>&1; _m19rc=$?
+  [ "$_m19rc" = 0 ] && ok "g19 WITHOUT pi-keys.env in the population the box reads 'one home' (0) — k28 measures it" \
+    || bad "g19 the mutant still reported drift (rc $_m19rc) — k28 is not measuring the population"
 fi
 
 printf '\n── (h) argument handling ────────────────────────────────────────────────────────────\n'

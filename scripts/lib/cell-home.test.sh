@@ -216,6 +216,22 @@ proj_line_in() { # <lib> <line> — run one line through the projector, with no 
   && ok "b8b7 …while a quoted INTERIOR token still moves (preceded by a quote/space, terminated by a quote)" \
   || bad "b8b7 a quoted interior path was not rebased — a false unchanged line"
 
+# b8b8: A RUN OF systemd EXEC PREFIXES BELONGS TO THE TOKEN (review F1). `systemd.service(5)` Table 2:
+# `@`, `-`, `:`, `+`, `!` may prefix an executable path, in any order; `-` is also a per-item prefix for
+# `WorkingDirectory=`/`EnvironmentFile=`/`ReadWritePaths=`. Without the prefix run in the START set these
+# read as "a foreign path", produced NO record, and the migration half-wrote the unit.
+for _pfx in '-@-+!' '@' '+-' '!' ':'; do
+  [ "$(proj_line_in "$LIB" "ExecStart=${_pfx}/tmp/cell-home/harness/run.sh")" = "ExecStart=${_pfx}/home/cmux/harness/run.sh" ] \
+    && ok "b8b8 project_line: the exec prefix run '${_pfx}' still moves the path" \
+    || bad "b8b8 a path behind the exec prefix '${_pfx}' did not move — --check would call that unit converged"
+done
+[ "$(proj_line_in "$LIB" 'ExecStart=a-/tmp/cell-home/x')" = 'ExecStart=a-/tmp/cell-home/x' ] \
+  && ok "b8b9 …while a prefix-looking run inside a WORD (a-<legacy>) is NOT a token start" \
+  || bad "b8b9 a word ending in '-' made the following path look like a token — a foreign path would be rewritten"
+[ "$(proj_line_in "$LIB" 'Environment=HOME=/tmp/cell-home\')" = 'Environment=HOME=/home/cmux\' ] \
+  && ok "b8c …and a path at the end of a CONTINUED line (trailing backslash) moves too" \
+  || bad "b8c a continued line's trailing backslash was treated as a filename continuation"
+
 # b9: the two projectors answer the SAME single token the same way — they are one rule with two arities,
 # so a future edit to either boundary reddens here instead of drifting into two opinions.
 _pl_tok=/tmp/cell-home/keys.env
@@ -240,6 +256,23 @@ elif [ "$(proj_line_in "$MUTB/lib/cell-home.sh" 'Environment="HOME=/tmp/cell-hom
 else
   ok "e7 WITH the old boundary rule (every non-`/` tail a sibling) the quoted and space-separated cases do NOT move — b8b measures the rule"
 fi
+# e9: THE EXEC-PREFIX RUN MUST BE ABLE TO VARY (review F1's non-vacuity partner for b8b8). Deleting the
+# strip restores the pre-fix answer: `ExecStart=-<legacy>/…` stops moving, which is the half-migration
+# that shipped at c96ff1c00.
+MUTP="$T/mutprefix"; mkdir -p "$MUTP/lib"
+awk '
+  index($0, "*[-+!@]) probe=") > 0 { skip=1; print "        :"; next }
+  skip && index($0, "done") > 0 { skip=0; next }
+  skip { next }
+  { print }' "$LIB" >"$MUTP/lib/cell-home.sh"
+if cmp -s "$LIB" "$MUTP/lib/cell-home.sh"; then
+  bad "e9 the prefix-run mutation could not be applied — b8b8 is not checking it"
+elif [ "$(proj_line_in "$MUTP/lib/cell-home.sh" 'ExecStart=-/tmp/cell-home/harness/run.sh')" = 'ExecStart=-/home/cmux/harness/run.sh' ]; then
+  bad "e9 the mutated projector still moved a prefixed path — b8b8 does not measure the prefix run"
+else
+  ok "e9 WITHOUT the exec-prefix strip a prefixed path does NOT move — b8b8 measures it"
+fi
+
 # e8: POLARITY on the sibling side — the same mutant must still leave `.bak` alone, so e7 is about the
 # TERMINATOR set and not about the projector having stopped working altogether.
 [ "$(proj_line_in "$MUTB/lib/cell-home.sh" 'Environment=O=/tmp/cell-home.bak')" = 'Environment=O=/tmp/cell-home.bak' ] \

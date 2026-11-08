@@ -188,7 +188,7 @@ cell_home_project() { # <home> <value>
 # inside `${…%%…}` splices the quote characters into the pattern (the same trap the migration records).
 # A printf builtin is the producer here, so no pipe exists to SIGPIPE (#841).
 cell_home_project_line() { # <home> <line>
-  local home="${1:-}" line="${2:-}" pat="$CELL_HOME_LEGACY" out="" head tail prev tok end
+  local home="${1:-}" line="${2:-}" pat="$CELL_HOME_LEGACY" out="" head tail probe prev tok end
   [ -n "$home" ] && [ -n "$line" ] || { printf '%s\n' "$line"; return 0; }
   while :; do
     case "$line" in *"$pat"*) ;; *) out="$out$line"; break ;; esac
@@ -199,8 +199,22 @@ cell_home_project_line() { # <home> <line>
     # `<legacy>#1` (all legal filename continuations that are NOT our home) move, because "not one of
     # `.` `-` `_` alnum" is not the same as "terminates a path". So: the token must START where a path
     # token starts, and END at a separator or the end of the line.
+    # ⛔ A RUN OF systemd EXEC PREFIXES BELONGS TO THE TOKEN (review F1). `systemd.service(5)` Table 2:
+    # `@`, `-`, `:`, `+`, `!` (and `!!`) may prefix an executable path, in any order and in combination,
+    # and `-` is also a documented per-item prefix for `WorkingDirectory=`, `EnvironmentFile=` and
+    # `ReadWritePaths=`. Without this, `ExecStart=-<legacy>/run.sh` read as "a sibling or a foreign path"
+    # — NO record, `--check` 0 (the reclaim precondition), `--apply` half-migrating the file (the other
+    # directives repointed, this one not), and after the reclaim `203/EXEC`. So the prefix run is
+    # stripped first and the character BEFORE the run must still start a token: `a-<legacy>/x` is NOT ours.
+    probe="$out$head"
+    while :; do
+      case "$probe" in
+        *[-+!@]) probe="${probe%?}" ;;
+        *) break ;;
+      esac
+    done
     prev=""
-    if [ -n "$out$head" ]; then prev="$out$head"; prev="${prev: -1}"; fi
+    if [ -n "$probe" ]; then prev="${probe: -1}"; fi
     tok=0
     case "$prev" in
       '') tok=1 ;;                                   # start of the line
@@ -212,7 +226,7 @@ cell_home_project_line() { # <home> <line>
       '') end=1 ;;                                   # end of the line
       *)
         case "${tail:0:1}" in
-          [[:space:]]|'"'|"'"|','|';'|':'|')'|']') end=1 ;;
+          [[:space:]]|'"'|"'"|','|';'|':'|')'|']'|\\) end=1 ;;   # …and a continuation ends the ITEM
         esac ;;
     esac
     if [ "$tok" = 1 ] && [ "$end" = 1 ]; then

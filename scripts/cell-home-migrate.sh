@@ -129,7 +129,14 @@ unit_dirs() {
 # The files a lane's provider/`gh`/`git` resolution actually reads. Each is described, never shown.
 # `keys.env` is the cell's pushed env (HOME/CELL_HOME + provider keys); `auth.json` is pi's credential
 # store; `hosts.yml` is `gh`'s token source, which `git` reuses via the credential helper.
+# ⛔ `pi-keys.env` IS A CREDENTIAL THE FLEET READS, and this list must contain it (review F3). The
+# launch line sources `$home/keys.env` AND `$home/pi-keys.env` (`orchestrator-harness/worker-terminal.sh`,
+# and `key-gate.sh` names `${home}/pi-keys.env` as a credential location) — this file's OWN notes below
+# say so. Leaving it out meant `--check` answered 0 (the RECLAIM precondition) while the only copy of the
+# model credential sat in the legacy home: the operator deletes it. A per-name list will always lag the
+# fleet — see `legacy_home_advisory` for the general mitigation.
 CRED_FILES="keys.env
+pi-keys.env
 .pi/agent/auth.json
 .config/gh/hosts.yml"
 
@@ -420,6 +427,9 @@ migrate_credentials() {
         fi ;;
     esac
     mkdir -p "$(dirname "$f_dur")" 2>/dev/null || { warn_line "  cannot create $(dirname "$f_dur") — $rel NOT copied"; rc=1; continue; }
+    # ⛔ A DIRECTORY THIS ROOT RUN CREATED MUST ALSO BELONG TO THE CELL ACCOUNT, or the credential inside
+    # it is unreadable for the same reason (review F4). Best effort, like the file's own chown below.
+    if [ "$INVOKER_UID" = 0 ] && [ -n "${DUR_OWNER:-}" ]; then chown "$DUR_OWNER" "$(dirname "$f_dur")" 2>/dev/null || true; fi
     # `install` copies bytes without ever putting them in this process's stdout; -m sets the mode in
     # the same syscall, so the file is never momentarily world-readable.
     if install -m "$mode" "$f_leg" "$f_dur" 2>/dev/null; then
@@ -427,7 +437,15 @@ migrate_credentials() {
       # invoker, and one of this tool's own remedies is `sudo -n env CELL_HOME=… bash $0 --apply`; the
       # cell account must still be able to READ what this migration exists to make readable, and a later
       # run would otherwise report the root-owned file as `kept`. The durable home's owner is the answer.
-      if [ "$INVOKER_UID" = 0 ] && [ -n "${DUR_OWNER:-}" ]; then chown "$DUR_OWNER" "$f_dur" 2>/dev/null || true; fi
+      # ⛔ AND A chown THAT FAILS IS REPORTED, NOT SWALLOWED (review F4): a root run whose ownership fix
+      # fails still says "copied …" and the cell account cannot read it — verbatim the failure this fix
+      # exists to prevent — so it is a WARN and a non-zero rc.
+      if [ "$INVOKER_UID" = 0 ] && [ -n "${DUR_OWNER:-}" ]; then
+        if ! chown "$DUR_OWNER" "$f_dur" 2>/dev/null; then
+          warn_line "  $rel: WRITTEN BUT NOT RE-OWNED — $f_dur is owned by $(owner_of "$f_dur" || printf '?') instead of $DUR_OWNER, so $INVOKER's account may not be able to read it"
+          rc=1
+        fi
+      fi
       note "  copied $rel -> $f_dur (mode $mode; value not printed)"
     else
       warn_line "  COPY FAILED for $rel (from $f_leg) — refused rather than left half-written"
@@ -524,6 +542,16 @@ paths_in() {
 # `systemd-analyze verify`), so `Environment = HOME=<legacy>` is an `Environment=` directive. Deriving
 # the name from `${stripped%%=*}` kept the blank, the name matched no known directive, and the line was
 # graded UNHANDLED — a permanent false block on a shape systemd accepts (review F3).
+# _notab <string> — the string with any TAB replaced by a space. ⛔ A RECORD IS TAB-DELIMITED AND A UNIT
+# LINE MAY CONTAIN A TAB, which is legal systemd whitespace (review F2): the raw line used to be field 3,
+# so a tab inside it pushed the tail into the MISS field and the tool then reported "durable counterpart
+# missing: <a path that exists>" and refused the file forever. Anything that goes into a record is
+# sanitised here, and the record no longer carries a raw line at all (see `unit_scan`).
+_notab() {
+  local s="${1//$'\t'/ }"
+  printf '%s' "$s"
+}
+
 trim_tail() {
   local v="${1:-}"
   while :; do case "$v" in *[[:space:]]) v="${v%?}" ;; *) break ;; esac; done
@@ -536,7 +564,7 @@ unit_scan() {
   # produced zero records for an unreadable unit, which the verdict then read as "clear of the legacy
   # home" (review F1). The open is attempted here, so the caller gets a NAMED CANNOT-MEASURE record.
   if ! probe_open "$f"; then
-    printf '0\tUNMEASURABLE\t%s\t\n' "$f cannot be opened by $INVOKER (mode $(mode_of "$f")) — 'could not read' is not 'clear of the legacy home'"
+    printf '0\tUNMEASURABLE\t%s\n' "$(_notab "$f cannot be opened by $INVOKER (mode $(mode_of "$f")) — 'could not read' is not 'clear of the legacy home'")"
     return 0
   fi
   # ⛔ A LAST LINE WITHOUT A TRAILING NEWLINE IS STILL A LINE (review F1). `while IFS= read -r line`
@@ -582,10 +610,10 @@ unit_scan() {
       case "$stripped" in [A-Za-z]*) dir="$(trim_tail "${stripped%%=*}")" ;; *) dir="" ;; esac
     fi
     case "$dir" in
-      "") printf '%s\tUNHANDLED\t%s\t\n' "$n" "$line"; cont=""; continue ;;
+      "") printf '%s\tUNHANDLED\t%s\n' "$n" "$(_notab "$line")"; cont=""; continue ;;
     esac
     if ! grep -Eq "^($UNIT_DIRECTIVES)\$" <<<"$dir"; then
-      printf '%s\tUNHANDLED\t%s\t\n' "$n" "$line"; cont=""; continue
+      printf '%s\tUNHANDLED\t%s\n' "$n" "$(_notab "$line")"; cont=""; continue
     fi
     case "$stripped" in *\\ ) cont="$dir" ;; *) cont="" ;; esac
     miss=""
@@ -597,7 +625,10 @@ unit_scan() {
     done <<EOF
 $(paths_in "$projected")
 EOF
-    printf '%s\t%s\t%s\t%s\n' "$n" "$dir" "$projected" "${miss# }"
+    # ⛔ THREE FIELDS, NO RAW LINE (review F2): `n`, the DIRECTIVE NAME, and the MISS list. The line itself
+    # is re-read from the file by number wherever a message needs it, so a TAB in a unit can never move a
+    # field — and a "missing durable counterpart" can never be fabricated from a line's tail.
+    printf '%s\t%s\t%s\n' "$n" "$dir" "${miss# }"
   done < "$f"
 }
 
@@ -676,7 +707,7 @@ unit_scan_all() {
     [ -n "$dir" ] && [ -d "$dir" ] || continue
     unit_files "$dir"
     if [ -n "$UNIT_FIND_ERR" ]; then
-      printf '%s\t0\tUNMEASURABLE\t%s\t\n' "$dir" "$dir: part of this population cannot be walked by $INVOKER ($(printf '%s' "$UNIT_FIND_ERR" | tr '\n' ' ')), so 'no unit here names the legacy home' is not a reading this tool took"
+      printf '%s\t0\tUNMEASURABLE\t%s\n' "$dir" "$(_notab "$dir: part of this population cannot be walked by $INVOKER ($(printf '%s' "$UNIT_FIND_ERR" | tr '\n' ' ')), so 'no unit here names the legacy home' is not a reading this tool took")"
     fi
     # A unit file, and any drop-in under `<unit>.service.d/*.conf` — the two shapes systemd merges.
     while IFS= read -r f; do
@@ -686,13 +717,13 @@ unit_scan_all() {
       # read silently became "clear of the legacy home" and `--check` answered 0 — the delete-the-live-
       # directory false PASS, reached through the prefilter instead of through the verdict.
       if ! probe_open "$f"; then
-        printf '%s\t0\tUNMEASURABLE\t%s\t\n' "$f" "$f: cannot be opened by $INVOKER (mode $(mode_of "$f")) — cannot tell whether it names the legacy home"
+        printf '%s\t0\tUNMEASURABLE\t%s\n' "$f" "$(_notab "$f: cannot be opened by $INVOKER (mode $(mode_of "$f")) — cannot tell whether it names the legacy home")"
         continue
       fi
       grep -q -- "$HOME_LEGACY" "$f" 2>/dev/null
       st=$?
       if [ "$st" -gt 1 ]; then
-        printf '%s\t0\tUNMEASURABLE\t%s\t\n' "$f" "$f: scanning it failed (grep status $st) — cannot tell whether it names the legacy home"
+        printf '%s\t0\tUNMEASURABLE\t%s\n' "$f" "$(_notab "$f: scanning it failed (grep status $st) — cannot tell whether it names the legacy home")"
         continue
       fi
       [ "$st" = 0 ] || continue
@@ -705,6 +736,21 @@ EOF
   done <<EOF
 $(unit_dirs)
 EOF
+}
+
+# legacy_home_advisory — the ADVISORY list of what the legacy home still holds that this tool does not
+# grade. ⛔ A PER-NAME LIST ALWAYS LAGS THE FLEET (review F3): `CRED_FILES` is four names, and a fifth
+# credential added tomorrow would read as "one home" and be deleted with the directory. This cannot be a
+# hard gate — a cell home legitimately carries `harness/`, `.cache`, `.config` … and grading those would
+# make `--check` -> 0 unreachable on every real box (a false block). So it is printed as an ADVISORY
+# beside the verdict: the operator sees the whole population before reclaiming, and nothing fails on it.
+legacy_home_advisory() {
+  local name
+  [ -d "$HOME_LEGACY" ] && [ -r "$HOME_LEGACY" ] || return 0
+  # shellcheck disable=SC2012  # names only: no metadata, no sorting subtleties, and the listing is capped
+  ls -A "$HOME_LEGACY" 2>/dev/null | LC_ALL=C sort | awk 'NR<=40' | while IFS= read -r name; do
+    printf 'ADVISORY %s\n' "  not graded by this tool (review before reclaiming): $HOME_LEGACY/$name"
+  done
 }
 
 check_units() {
@@ -720,18 +766,18 @@ check_units() {
   # command substitution: a counter incremented over there does not survive, and a verdict that loses
   # its own unmeasurable count is the very defect this arm exists to prevent.
   case "$scan" in *$'\tUNMEASURABLE\t'*) cant=1 ;; esac
-  printf '%s\n' "$scan" | while IFS='	' read -r f n dir projected miss; do
+  printf '%s\n' "$scan" | while IFS='	' read -r f n dir payload; do
     if [ "$dir" = "UNMEASURABLE" ]; then
-      warn_line "  CANNOT MEASURE: $projected"
+      warn_line "  CANNOT MEASURE: $payload"
       continue
     fi
     if [ "$dir" = "UNHANDLED" ]; then
       warn_line "  $f:$n names the legacy home in a directive this tool does not re-base — fix or replace that file by hand:
-      $projected"
+      $payload"
       continue
     fi
-    if [ -n "$miss" ]; then
-      warn_line "  $f:$n would NOT run after a repoint — the durable counterpart does not exist: $miss
+    if [ -n "$payload" ]; then
+      warn_line "  $f:$n would NOT run after a repoint — the durable counterpart does not exist: $payload
       (a unit that execs a missing path is 203/EXEC on the next restart, so --apply will REFUSE this file)"
     else
       warn_line "  $f:$n  $dir=…  ->  NOT CONVERGED: the directive still names the legacy home; --apply would repoint it"
@@ -777,13 +823,13 @@ migrate_units() {
       # Refuse the WHOLE file if any line is unhandled or names a missing durable counterpart: a
       # partially repointed unit is worse than an unmigrated one (it reads as migrated).
       local refuse=0
-      while IFS='	' read -r n directive projected miss; do
+      while IFS='	' read -r n directive miss; do
         # ⛔ A FILE THIS TOOL COULD NOT OPEN IS REFUSED AND REPORTED AS UNMEASURABLE, not skipped: an
         # `install`/`cp`/`mv` on a file we cannot read would either fail late or write a unit nobody
         # graded. `unit_scan` names it; this is where the run's exit class follows (3, not 0 and not a
         # bare 1 — same reason as the check).
         if [ "$directive" = "UNMEASURABLE" ]; then
-          warn_line "  CANNOT MEASURE: $projected (nothing written to $f)"
+          warn_line "  CANNOT MEASURE: $miss (nothing written to $f)"
           refuse=1; cant=1; break
         fi
         if [ "$directive" = "UNHANDLED" ]; then
@@ -845,7 +891,10 @@ EOF
         # was written for (review F7 — the comment claimed this and only `chmod` was done).
         chmod "$(mode_of "$f")" "$tmpdir" 2>/dev/null || true
         _own="$(owner_of "$f")"
-        if [ -n "$_own" ]; then chown "$_own" "$tmpdir" 2>/dev/null || true; fi
+        if [ -n "$_own" ] && ! chown "$_own" "$tmpdir" 2>/dev/null; then
+          warn_line "  REFUSED $f — the rewritten file could not be re-owned to $_own (it would land owned by the invoker); the original was NOT touched"
+          rm -f "$tmpdir"; refused=$((refused + 1)); rc=1; continue
+        fi
         if mv -f "$tmpdir" "$f" 2>/dev/null; then
           note "  repointed $f (backup: $backup)"
           applied=$((applied + 1))
@@ -989,7 +1038,10 @@ EOF
 
 # ── MAIN ──────────────────────────────────────────────────────────────────────────────────────
 # The owner a ROOT run must stamp onto what it writes into the durable home (review F7).
-DUR_OWNER="$(owner_of "$HOME_DURABLE" 2>/dev/null || true)"
+# ⛔ `CELL_HOME_MIGRATE_FORCE_OWNER` IS A DECLARED FIXTURE SEAM, like the four above: ownership only
+# needs fixing on a ROOT run, and a suite that cannot become root cannot otherwise grade the enforcer —
+# an untestable guard is an inert one (review F4). It names the uid:gid that SHOULD own what we write.
+DUR_OWNER="${CELL_HOME_MIGRATE_FORCE_OWNER:-$(owner_of "$HOME_DURABLE" 2>/dev/null || true)}"
 note "cell-home-migrate: mode=$MODE"
 note "  durable home: $HOME_DURABLE  (derived by scripts/lib/cell-home.sh)"
 note "  legacy home:  $HOME_LEGACY   (never deleted by this tool)"
@@ -1043,4 +1095,9 @@ elif [ "$rc" = 0 ]; then
 else
   note "VERDICT: drift found (see WARN lines above)"
 fi
+# ⛔ THE ADVISORY IS PRINTED BESIDE THE VERDICT AND CHANGES NOTHING (review F3): the graded population is
+# a per-name list, and a credential added tomorrow would read as "one home" and be deleted with the
+# directory. This is the visible remainder — never a gate, because a cell home legitimately carries
+# operational directories and grading those would make `--check` -> 0 unreachable on every real box.
+legacy_home_advisory
 exit "$rc"
