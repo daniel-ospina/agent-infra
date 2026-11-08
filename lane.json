@@ -1,0 +1,21 @@
+{
+  "artifacts": [],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 601,
+  "exit_code": null,
+  "heartbeat_at": 1794150292,
+  "host": "Daniels-MacBook-Air-new",
+  "issue": 2834,
+  "kind": "lane",
+  "lane_id": "Daniels-MacBook-Air-new.klane-2834-1794150292-p35364-25cff8a1",
+  "lease_until": 1794150893,
+  "pid": 35364,
+  "reason": null,
+  "repo": null,
+  "schema": 1,
+  "started_at": 1794150292,
+  "state": "RUNNING",
+  "tag": "2834",
+  "worktree": "/private/var/folders/lh/4zv9grjx0958bnrclvkt8dv40000gn/T/tmp.T6X8WkWYZM/wt"
+}
