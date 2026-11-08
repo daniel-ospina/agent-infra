@@ -4754,8 +4754,16 @@ type TaskResultDetails = {
  * with a row in each suite.
  *
  * Guarded by builtin-tools.test.ts, which exercises every member through the
- * registered hook and pins that an unknown status stays a success. */
-const FAILED_TASK_STATUS = new Set(["failed", "circuit_open", "invalid-cwd", "invalid-session-id", "fleet-saturated"]);
+ * registered hook and pins that an unknown status stays a success.
+ *
+ * ⛔ EXPORTED ON PURPOSE — DO NOT UN-EXPORT. `docs/ops/load-policy.md` §12 names
+ * this set as one of the three spawn-outcome consumers (the vocabulary it
+ * enumerates), and the load-scale doc↔code contract (#1073) exempts a doc-named
+ * CAPS identifier ONLY when it is an `export`ed declaration — the same arm that
+ * legitimises `DEFAULT_TOOL_STALL_MS` in §6. Dropping the keyword does not
+ * weaken the set; it silently re-reds that contract as "documented but read by
+ * nothing", which reads as a phantom knob to whoever hits it next. */
+export const FAILED_TASK_STATUS = new Set(["failed", "circuit_open", "invalid-cwd", "invalid-session-id", "fleet-saturated"]);
 
 // ── #1662: background dispatch (returns-early) + status/collect seam ────────
 //

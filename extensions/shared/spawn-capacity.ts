@@ -77,8 +77,17 @@ export type SpawnOutcome = "verdict" | "refused" | "cut" | "failed";
  * classified as a `verdict` on any box where `review-enforcer` loads first, and satisfied the
  * >=1-dispatch floor for an UNREVIEWED push. Both sets are enumerated in
  * `spawn-capacity.test.ts`; add the row in the same edit as the member.
+ *
+ * ⛔ EXPORTED ON PURPOSE — DO NOT UN-EXPORT. `docs/ops/load-policy.md` §12 names
+ * this set as the review-enforcer's dispatch-floor mirror, and the load-scale
+ * doc↔code contract (#1073) exempts a doc-named CAPS identifier ONLY when it is
+ * an `export`ed declaration. Exporting is the correct shape anyway: the set is
+ * the declared vocabulary a future consumer should IMPORT rather than
+ * re-enumerate, which is the drift this comment block already records happening
+ * once. Un-exporting silently re-reds the #1073 contract as "documented but
+ * read by nothing".
  */
-const REFUSED_STATUS = new Set(["invalid-cwd", "invalid-session-id", "circuit_open", "fleet-saturated"]);
+export const REFUSED_STATUS = new Set(["invalid-cwd", "invalid-session-id", "circuit_open", "fleet-saturated"]);
 const FAILED_STATUS = new Set(["failed"]);
 const CUT_STATUS = new Set(["cut"]);
 
