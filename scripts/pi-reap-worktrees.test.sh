@@ -3093,8 +3093,13 @@ if [ -n "$_pa_line" ] && [ -n "$_hr_line" ] && [ -n "$_fork_line" ] \
     # false-blocks is a guard that later gets edited away.
     _hr_linetext="$(sed -n "${_hr_line}p" "$REAPER" 2>/dev/null)"
     _hr_code="${_hr_linetext%%#*}"
+    # ⛔ NO PIPE on the compare (#841/#864, red `sigpipe-grep` on this PR): a builtin writer piped
+    # into a quiet grep under `pipefail` can report "not found" for a match that IS present (the
+    # writer takes SIGPIPE once grep exits early), which would invert this arm into a false RED —
+    # or, with the polarity of a different arm, into a silent pass. The here-string has no writer
+    # to kill, and `-qxE` still matches the whole line.
     if [ -z "$_between" ] \
-            && printf '%s' "$_hr_code" | grep -qxE '[[:space:]]*holder_recheck "\$path" "\$sha" \|\| \{ rm -f "\$out"; return 2; \}[[:space:]]*'; then
+            && grep -qxE '[[:space:]]*holder_recheck "\$path" "\$sha" \|\| \{ rm -f "\$out"; return 2; \}[[:space:]]*' <<<"$_hr_code"; then
         ok "A21e the post-archive re-check runs BEFORE holder_recheck, which stays the LAST code line before the fork"
     else
         bad "A21e a probe sits between holder_recheck and the fork (between='$(printf '%s' "$_between" | head -2 | tr '\n' ' ')' line='$_hr_linetext'), so the last liveness read is no longer last"
