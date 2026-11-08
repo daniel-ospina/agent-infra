@@ -775,29 +775,16 @@ _rs_doctor_py() {
 #   tags   (set_tag_collisions) repo-tag collisions across the whole set
 #   norm   (_normalize_slug)    one slug normalised
 #   origin (_origin_slug)       the slug a checkout's origin PROVES (the `else` arm)
-_rs_with_doctor() {
-  local verb="${1:-}" arg="${2:-}" doc py
-  doc="$(_rs_doctor_py)"
-  [ -n "$doc" ] || return 0
-  # ⛔ THE SAME RESOLUTION THE WRAPPER USES (review round 8, P2). `command -v python3` alone fails on the
-  # launchd-shaped PATH this whole unit exists to survive, and because an empty answer means "no proof"
-  # the provenance arm silently downgraded from REFUSE to WARN and the tag guard silently no-op'd — so
-  # the wrapper announced a pass for a set the doctor then refused wholesale. An absolute fallback is
-  # not a nicety here; it is the difference between a proof and a silent skip.
-  py="$(_rs_py_resolve)"
-  [ -n "$py" ] || return 0
-  # ⛔ `PYTHONUTF8=1` IS PART OF THE PROOF, NOT A TIDY-UP (review round 41, P2 — measured fail-open).
-  # The value travels on ARGV, and under an ambient `LC_ALL=POSIX` (the launchd/cron default shape this
-  # unit exists to survive) CPython decodes argv with surrogateescape, so a UTF-8 NBSP arrives as
-  # `\udcc2\udca0`: `str.strip()` sees no whitespace, `re.split` sees one part, and the delegated guards
-  # become NO-OPS. Measured end to end on a value with a trailing NBSP separator: `LC_ALL=C.UTF-8` ->
-  # `REFUSED set … a value contains a separator`, rc 1; `LC_ALL=POSIX` -> `repo-set: OK — 1 repo(s)`,
-  # rc 0. Same bytes, opposite verdicts, and the permissive one wins on the box's default locale — a
-  # child that reads the value differently from the caller is not a proof. UTF-8 mode fixes the DECODE
-  # (surrogateescape still applies to invalid bytes, so no path is lost), and it is scoped to this one
-  # child so nothing else inherits it.
-  local out rc
-  out="$(PYTHONUTF8=1 "$py" - "$doc" "$verb" "$arg" <<'PY_PROOF' 2>/dev/null
+# ⛔ THE PROOF CHILD'S HEREDOC LIVES IN A FUNCTION BODY, NOT INSIDE `$( )` — BASH 3.2 CANNOT PARSE
+# THE OTHER SHAPE (measured). macOS ships bash 3.2 as /bin/bash, and the `bash32-parse` gate parses every
+# tracked `*.sh` with it. bash 3.2's `$( )` scanner does not understand here-documents: inside the
+# substitution it enters single-quote mode at the first apostrophe in the heredoc BODY (`wrapper's`,
+# `caller's`, ...) and never leaves, so the file fails to parse at EOF — "unexpected EOF while looking
+# for matching `\"'", thousands of lines from the cause, and only on the platform the fleet runs.
+# Wrapping this heredoc in `out="$( … )"` is what introduced that; the remediation the gate itself
+# names (#2248, #2930) is this one: keep the heredoc in a function body, make the capture a plain call.
+_rs_proof_child() {
+  PYTHONUTF8=1 "$1" - "$2" "$3" "$4" <<'PY_PROOF' 2>/dev/null
 import importlib.util, sys
 doc, verb, arg = sys.argv[1], sys.argv[2], sys.argv[3]
 spec = importlib.util.spec_from_file_location("_prd", doc)
@@ -883,7 +870,33 @@ else:
     else:
         sys.stdout.write(("%s\t" % slug) if slug else ("\t%s" % why))
 PY_PROOF
-)"
+}
+
+_rs_with_doctor() {
+  local verb="${1:-}" arg="${2:-}" doc py
+  doc="$(_rs_doctor_py)"
+  [ -n "$doc" ] || return 0
+  # ⛔ THE SAME RESOLUTION THE WRAPPER USES (review round 8, P2). `command -v python3` alone fails on the
+  # launchd-shaped PATH this whole unit exists to survive, and because an empty answer means "no proof"
+  # the provenance arm silently downgraded from REFUSE to WARN and the tag guard silently no-op'd — so
+  # the wrapper announced a pass for a set the doctor then refused wholesale. An absolute fallback is
+  # not a nicety here; it is the difference between a proof and a silent skip.
+  py="$(_rs_py_resolve)"
+  [ -n "$py" ] || return 0
+  # ⛔ `PYTHONUTF8=1` IS PART OF THE PROOF, NOT A TIDY-UP (review round 41, P2 — measured fail-open).
+  # The value travels on ARGV, and under an ambient `LC_ALL=POSIX` (the launchd/cron default shape this
+  # unit exists to survive) CPython decodes argv with surrogateescape, so a UTF-8 NBSP arrives as
+  # `\udcc2\udca0`: `str.strip()` sees no whitespace, `re.split` sees one part, and the delegated guards
+  # become NO-OPS. Measured end to end on a value with a trailing NBSP separator: `LC_ALL=C.UTF-8` ->
+  # `REFUSED set … a value contains a separator`, rc 1; `LC_ALL=POSIX` -> `repo-set: OK — 1 repo(s)`,
+  # rc 0. Same bytes, opposite verdicts, and the permissive one wins on the box's default locale — a
+  # child that reads the value differently from the caller is not a proof. UTF-8 mode fixes the DECODE
+  # (surrogateescape still applies to invalid bytes, so no path is lost), and it is scoped to this one
+  # child so nothing else inherits it.
+  # ⚠️ THE `PYTHONUTF8=1` ITSELF LIVES IN `_rs_proof_child` ABOVE: the heredoc had to leave `$( )` so
+  # bash 3.2 could parse this file, which moved the invocation with it. The reasoning is unchanged.
+  local out rc
+  out="$(_rs_proof_child "$py" "$doc" "$verb" "$arg")"
   rc=$?
   # ⛔ A CHILD THAT CANNOT BE RUN ANSWERS NOTHING, AND "NOTHING" IS AN ANSWER FOR THREE VERBS (round 45,
   # P1 — measured). Every arm ABOVE distinguishes the ways the child fails AFTER it starts — the module
