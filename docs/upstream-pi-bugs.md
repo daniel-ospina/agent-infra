@@ -1130,12 +1130,17 @@ evaluated.)
 The substitute is **`/proc/<pid>/io`'s `rchar`**, which needs no cooperation from
 `pi` and — read alongside ΔCPU — separates the two cases this issue conflates:
 *idle* (reads sit on a flat floor) versus *legitimately working* (reads scale with
-the provider stream or the tool output). Be precise about which of the two does
-the work: the floor and the working minimum very nearly touch (quantified in the
-first result bullet below), so **ΔCPU makes the split and `rchar` is the
-corroboration** — a bare read-rate threshold would not classify on its own. ΔCPU
+the provider stream or the tool output). Be precise about which of the two carries
+the weight, though: on these four windows a read threshold *does* separate every
+sample (idle tops out at 10 KB/s, the working minimum is 10.4 — quantified in the
+first result bullet below), but the margin is **0.4 KB/s, about 4%** — too thin
+to be a stand-alone trip. That is why **ΔCPU makes the split and `rchar` is the
+corroboration**, rather than a read threshold on its own. ΔCPU
 comes from `/proc/<pid>/stat`'s `utime+stime` ticks (`USER_HZ=100`), i.e. the
-09-16 method (`ps -o time` twice) at 10 ms resolution.
+09-16 method (`ps -o time` twice) at 10 ms resolution. The main-thread vs
+`V8Worker` split in the last bullet cannot come from those **process-level**
+totals, which sum every thread; it reads the same counters **per thread**
+(`/proc/<pid>/task/<tid>/stat`), identifying the worker pool by `comm`.
 Both are measured on the **same** 25–30 s window, so CPU and reads are the same
 epoch — the property the epoch analysis above found missing across windows.
 
@@ -1154,10 +1159,11 @@ epoch — the property the epoch analysis above found missing across windows.
   quote read 8.4, 8 and 10 KB/s, and the 10.4 KB/s case three bullets down sits
   just above it — a fixed background poll, not input, so the floor is a stable
   control rather than a per-process accident. Two honest qualifications: it is a
-  *band*, not a constant; and it is a **read** floor, not by itself a classifier
-  — the working minimum in one window (10.4 KB/s) is just above the idle maximum
-  (10 KB/s), so the idle/working split is made by ΔCPU and `rchar` is the
-  corroborating signal, which is exactly what the next bullet tests.
+  *band*, not a constant; and its margin to the working minimum is only **0.4
+  KB/s** (working min 10.4 vs idle max 10, in one window) — a threshold does
+  separate these samples, but by too little to be trusted as a stand-alone
+  classifier, so ΔCPU makes the split and `rchar` corroborates it. That is
+  exactly what the next bullet tests.
 - **No window contained a process above 1% of a core with reads at that floor** —
   which is exactly the 09-16 defect signature (11 processes at 6.4–26.3% while
   silent for 1.0–209.5 min). Run as a filter over all four windows it returns
