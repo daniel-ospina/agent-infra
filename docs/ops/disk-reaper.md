@@ -964,37 +964,36 @@ false at the instant a checkout with **no backup** is destroyed. The cost is ONE
 targeted probe at removal time preserves.
 
 The remote's own `refs/heads/*` are read by ONE bounded `git ls-remote --heads <remote>` **per remote
-per pass** (#3371) and cached for that pass. That is what took the per-candidate round trip out of
-the **classification**: it used to cost ONE targeted `ls-remote` per `remote-only-ref` candidate, one
+per pass** (#3371) and cached for that pass. That is what took the per-candidate round trip out of the
+**classification**: it used to cost ONE targeted `ls-remote` per `remote-only-ref` candidate, one
 network round trip each, which is what made a large `remote-only-ref` population unable to finish a
-pass (measured on cmux/cell-3, 2026-11-07: 12 targeted probes = 7.54 s wall (0.63 s each), versus
-0.56 s for the remote's whole 2,111-head advertisement). The cached advertisement is the same
-evidence **for the CLASSIFICATION only** — the remote's advertised heads at one instant, a superset
-of any single targeted answer *at t0* is not evidence of anything at the removal, which is exactly
-why `remote_holds_recheck` re-takes it — and the advertised refname is still matched literally and
-exactly once against it (⚠️ because `ls-remote` matches a pattern against the ref's **tail, from any
-slash separator**, so `refs/heads/<b>` also selects
-an advertised `refs/heads/x/refs/heads/<b>` — ⛔ *not* because of glob metacharacters: `check-ref-format`
-rule 5 forbids `?`, `*` and `[` in a refname, so no branch name can widen the match that way), and the
-remote is the **longest configured remote name** prefixing the ref, not the first path
-segment (a remote name may contain a slash). Any failure, timeout, empty answer, unadvertised
-refname or different sha at **classification** leaves the verdict where it was — `remote-only-ref`,
-PRESERVE — and a TRANSPORT failure is remembered for the rest of the pass so a dead remote costs one
-timeout, not one per candidate. ⛔ At **removal** the preserve verdict is different and the operator
-will see it: a `remote-holds` row whose targeted re-probe can no longer re-prove the head is kept as
-**`remote-holds-stale`** (`remote_holds_recheck`, taken twice — at classification and again
-immediately before the fork). Treat that as "the remote moved under us": the checkout is intact, and
-— if the preserve happened at the **fork** — the archive it had just taken is kept too (a
-**classification-time** preserve never entered `remove_one`, so there is no archive to look for).
-The commit is what to look at, not the checkout. The row is `remote-holds:<remote>/<branch>`, and — like
-`remote-only-ref` — it does **NOT** block the end-of-pass prune: a `remote-holds` row is reached
-only when the commit is held by `refs/remotes/<remote>/<branch>` (the probe runs on that very ref),
-so the admin `HEAD` is not the commit's last durable handle, and the F17 window (a record that
-becomes prunable mid-pass, after a snapshot that saw it present) is closed for **every** reason by the
+pass (measured on cmux/cell-3, 2026-11-07: 12 targeted probes = 7.54 s wall (0.63 s each), versus 0.56
+s for the remote's whole 2,111-head advertisement). The cached advertisement is the same evidence **for
+the CLASSIFICATION only** — the remote's advertised heads at one instant, a superset of any single
+targeted answer *at t0* is not evidence of anything at the removal, which is exactly why
+`remote_holds_recheck` re-takes it — and the advertised refname is still matched literally and exactly
+once against it (⚠️ because `ls-remote` matches a pattern against the ref's **tail, from any slash
+separator**, so `refs/heads/<b>` also selects an advertised `refs/heads/x/refs/heads/<b>` — ⛔ *not*
+because of glob metacharacters: `check-ref-format` rule 5 forbids `?`, `*` and `[` in a refname, so no
+branch name can widen the match that way), and the remote is the **longest configured remote name**
+prefixing the ref, not the first path segment (a remote name may contain a slash). Any failure,
+timeout, empty answer, unadvertised refname or different sha at **classification** leaves the verdict
+where it was — `remote-only-ref`, PRESERVE — and a TRANSPORT failure is remembered for the rest of the
+pass so a dead remote costs one timeout, not one per candidate. ⛔ At **removal** the preserve verdict
+is different and the operator will see it: a `remote-holds` row whose targeted re-probe can no longer
+re-prove the head is kept as **`remote-holds-stale`** (`remote_holds_recheck`, taken twice — at
+classification and again immediately before the fork). Treat that as "the remote moved under us": the
+checkout is intact, and — if the preserve happened at the **fork** — the archive it had just taken is
+kept too (a **classification-time** preserve never entered `remove_one`, so there is no archive to look
+for). The commit is what to look at, not the checkout. The row is `remote-holds:<remote>/<branch>`, and
+— like `remote-only-ref` — it does **NOT** block the end-of-pass prune: a `remote-holds` row is reached
+only when the commit is held by `refs/remotes/<remote>/<branch>` (the probe runs on that very ref), so
+the admin `HEAD` is not the commit's last durable handle, and the F17 window (a record that becomes
+prunable mid-pass, after a snapshot that saw it present) is closed for **every** reason by the
 reason-independent pre-prune re-read. Blocking on the reason instead would disable the `prunable`
 reclaim path for as long as ONE preserve row lives — `no-pr`, `too-recent` and `too-young` rows carry
-`refs=remote-holds:` too, for up to the whole aged-days floor — which is the F7 defect one reason
-class over. A26c pins both arms (the `reason=` REMOVE row and the `refs=` PRESERVE row).
+`refs=remote-holds:` too, for up to the whole aged-days floor — which is the F7 defect one reason class
+over. A26c pins both arms (the `reason=` REMOVE row and the `refs=` PRESERVE row).
 
 A lane **scratch** checkout — a directory whose basename matches
 `REAP_WT_SCRATCH_GLOB` (default `wt-*|cell-wt-*`) — has its floor **capped at**
