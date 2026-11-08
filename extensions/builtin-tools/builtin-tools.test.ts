@@ -8957,7 +8957,7 @@ testAsync("#1208 (E2E): a child that exits 0 with zero completed messages is a D
     equal((died as any).isError, true, "…and flagged on the returned payload (the #1508 hook is what delivers it to the model — pi drops the field here)");
     equal(typeof dd.childPid, "number", "the pid is on the result (ask 1) — no `ps` guessing required");
     equal(dd.childExited, true, "the child is known to be gone");
-    ok(TASK_LIVENESS_DETAIL_KEYS.every((k) => k in dd), `all of ${TASK_LIVENESS_DETAIL_KEYS.join(",")} are present`);
+    ok(TASK_LIVENESS_DETAIL_KEYS.every((k) => dd[k] !== undefined), `all of ${TASK_LIVENESS_DETAIL_KEYS.join(",")} carry a VALUE (not just a key — see the JSON note below)`);
     // ⛔ AND NOTHING ELSE IS (review round 11, P2). The composer writes this set THROUGH the
     // exported list, so an extra `child*` literal added here would be a field the contract does not
     // describe — the drift one direction, exactly as a missing member is the other.
@@ -9211,6 +9211,19 @@ test("#1208: the field set is PRESENT on arms where no child ever existed — ne
   equal(stamped.childExited, null, "`null` — not `false`: no child was ever seen alive either");
   equal(stamped.childMessagesSent, null, "no message count is knowable without a child");
   ok(TASK_LIVENESS_DETAIL_KEYS.every((k) => k in stamped), "all keys present");
+  // ⛔ PRESENT IS NOT ENOUGH: THE VALUE MUST SURVIVE SERIALIZATION (review round 12, P2).
+  // `in` is true for an own property whose value is `undefined`, and JSON drops such a member — so a
+  // member added to the vocabulary without a default would emit a key that is GONE by the time the
+  // run record's `final_details` / the `task_collect` view is read, while a key-presence assertion
+  // stayed green. The guard is therefore a VALUE check, and an explicit `undefined` is filled too.
+  ok(TASK_LIVENESS_DETAIL_KEYS.every((k) => stamped[k] !== undefined), "every member carries a value, not an `undefined` that vanishes in JSON");
+  const explicitUndefined = stampLivenessDefaults({ childPid: undefined, childState: undefined });
+  equal(explicitUndefined.childPid, null, "an explicit `undefined` is an ABSENT measurement, not a value");
+  equal(explicitUndefined.childState, "never-started", "…filled from the same vocabulary, so it serializes");
+  ok(
+    TASK_LIVENESS_DETAIL_KEYS.every((k) => Object.prototype.hasOwnProperty.call(JSON.parse(JSON.stringify(explicitUndefined)), k)),
+    "and all four survive a JSON round-trip — the surface a consumer actually reads",
+  );
   // ONLY fills absent keys: a measured value must never be overwritten by the tool layer.
   // The field set never contradicts itself: stdout is proof of a message, so it floors the count.
   const withOut = childLivenessFor({ details: {}, hbState: createHeartbeatState(), pid: 11, stdout: "some answer\n", exited: true });

@@ -2165,9 +2165,13 @@ export type TaskChildState =
  * The docstring above used to claim the suites assert "the same list the composer
  * emits" while `stampLivenessDefaults` and the `doResolve` funnel each spelled the
  * four names out by hand — so a fifth field added to either went on emitting a set
- * the exported contract did not describe, and nothing reddened. Now the defaults
- * table is keyed by this tuple (a missing member is a compile error) and the funnel
- * assigns through it, which is what makes the list a contract rather than a comment.
+ * the exported contract did not describe, and nothing reddened. Now both iterate this
+ * tuple, and the suites assert the emitted set is EXACTLY the declared one, BY VALUE.
+ * ⛔ THE GUARD MUST BE EXECUTABLE, NOT ONLY TYPED (review round 12, P2): this repo has
+ * no tsconfig covering `extensions/`, so `node-ci.yml`'s `typecheck` self-skips with
+ * "No tsconfig.json" and a type error is a gate that never runs. A key present with
+ * value `undefined` also passes `in` and then VANISHES through JSON — so the checks
+ * that count are values, and they live in the suites.
  *
  * TWO producers fill it, because a `task` call has two layers of failure:
  *   * `doResolve` inside `spawnSubAgent` — a child DID run, so the values are
@@ -2186,10 +2190,26 @@ export const TASK_LIVENESS_DETAIL_KEYS = [
   "childMessagesSent",
 ] as const;
 
-/** The tool layer's default for each member of the field set, keyed by the SAME
- * tuple the contract exports: adding a member to `TASK_LIVENESS_DETAIL_KEYS` makes
- * its default a type error until it is named here, so the stamped set cannot fall
- * behind the declared one by omission. */
+/** The tool layer's default for each member of the field set, keyed by the SAME tuple
+ * the contract exports (a member added without a default is a type error where a
+ * typechecker runs — `extensions/` has no tsconfig, so the executable guard lives in
+ * `stampLivenessDefaults` and in the suite's value assertions).
+ *
+ * ⛔ `undefined` IS ABSENCE, AND THE GUARD IS EXECUTABLE (review round 12, P2).
+ * `"childPid" in out` is true for an own property whose value is `undefined`, and
+ * that is the shape that VANISHES at the surface consumers actually read: JSON
+ * serialization drops an `undefined` member, so the run record's `final_details`
+ * and the `task_collect` view carry NO key at all — back to "branch on absence",
+ * which is the defect this field set exists to remove. The default is therefore
+ * also written over an explicit `undefined`, and the suites assert VALUES rather
+ * than key presence.
+ *
+ * The `Record` below is keyed by the exported tuple, which makes a member added
+ * without a default a TYPE error — belt and braces, not the only guard: this
+ * repo has no tsconfig covering `extensions/`, so the typechecker is a gate that
+ * does not run here (node-ci's `typecheck` self-skips with `No tsconfig.json`).
+ * The executable half is the `undefined` check below plus the value assertions in
+ * `builtin-tools.test.ts`; do not weaken either on the strength of the Record. */
 const TASK_LIVENESS_DEFAULTS: Record<(typeof TASK_LIVENESS_DETAIL_KEYS)[number], unknown> = {
   childPid: null,
   childState: "never-started",
@@ -2199,12 +2219,13 @@ const TASK_LIVENESS_DEFAULTS: Record<(typeof TASK_LIVENESS_DETAIL_KEYS)[number],
 };
 
 /** Fill the liveness keys onto a TOOL-LEVEL result that never got them from a
- * spawn. ONLY fills absent keys — a value the spawn path measured always wins,
- * so this can be applied at a single choke point without erasing evidence. */
+ * spawn. ONLY fills absent keys — a value the spawn path measured always wins, so
+ * this can be applied at a single choke point without erasing evidence. `undefined`
+ * counts as absent: see the warning above. */
 export function stampLivenessDefaults(details: Record<string, unknown>): Record<string, unknown> {
   const out = { ...details };
   for (const key of TASK_LIVENESS_DETAIL_KEYS) {
-    if (!(key in out)) out[key] = TASK_LIVENESS_DEFAULTS[key];
+    if (!(key in out) || out[key] === undefined) out[key] = TASK_LIVENESS_DEFAULTS[key];
   }
   return out;
 }
