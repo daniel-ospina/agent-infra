@@ -5911,11 +5911,14 @@ async function main() {
     const audit = readAuditLines();
     const forB = (e: string) => audit.filter((l) => l.event === e && String(l.root ?? "").endsWith("wt-1265-b") && String(l.session_cwd ?? "").startsWith(realB));
     // The DURABLE half, asserted in the shape that CAN hold. `gate_recovery` now
-    // carries the root it recovered for, so the inspection merge is recorded
-    // against A and never against B. This is fail-able in both directions: with no
-    // `root` field (the pre-fix record) the A-keyed count is 0, and a partial
-    // revert that COUNTS the sibling emits it twice. Filtering on B alone could
-    // never see either — that was a dead assertion.
+    // carries the root it recovered for, so the inspection merge is recorded against
+    // A and never against B. The A-keyed assertion is fail-able in the direction that
+    // matters: with no `root` field (the pre-fix record) it counts 0. The
+    // SIBLING-COUNTING revert is caught by the transcript assertions above
+    // (`📂 Recovered N … for <ownRoot>`), NOT here — there is one emit site, so that
+    // revert still leaves exactly one A-keyed record (the repeat call is short-
+    // circuited by the mtime guard). Filtering on B alone could never see either
+    // direction — that was a dead assertion.
     equal(audit.filter((l) => l.event === "gate_recovery" && String(l.root ?? "") === realA).length, 1,
       "1265a: the inspection merge must record exactly ONE gate_recovery against the SIBLING root it recovered for");
     equal(audit.filter((l) => l.event === "gate_recovery" && String(l.root ?? "") === realB).length, 0,
