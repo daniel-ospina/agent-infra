@@ -232,6 +232,22 @@ done
   && ok "b8c …and a path at the end of a CONTINUED line (trailing backslash) moves too" \
   || bad "b8c a continued line's trailing backslash was treated as a filename continuation"
 
+# b8b10: A REDIRECT/PIPE TARGET IS A PATH TOKEN TOO (review F4 round 4). `>` `>>` `2>` `<` `|` `&` begin a
+# whole path inside a `sh -c` payload; without them in the START set the line produced NO record, so
+# `--check` answered 0 over a unit that still named the legacy home — the exec-prefix fail-open one
+# character over.
+for _red in '>>' '>' '2>' '<' '>|'; do
+  [ "$(proj_line_in "$LIB" "ExecStartPost=/bin/sh -c \"echo x ${_red}/tmp/cell-home/logs/run.log\"")" = "ExecStartPost=/bin/sh -c \"echo x ${_red}/home/cmux/logs/run.log\"" ] \
+    && ok "b8b10 project_line: the redirect '${_red}' target still moves" \
+    || bad "b8b10 a path behind '${_red}' did not move — --check would call that unit converged"
+done
+[ "$(proj_line_in "$LIB" 'ExecStartPost=/bin/sh -c "x | /tmp/cell-home/bin/y"')" = 'ExecStartPost=/bin/sh -c "x | /home/cmux/bin/y"' ] \
+  && ok "b8b11 …and so does a pipe target" \
+  || bad "b8b11 a pipe target did not move"
+[ "$(proj_line_in "$LIB" 'Environment=TOOLDIR=/opt/tools/tmp/cell-home/bin')" = 'Environment=TOOLDIR=/opt/tools/tmp/cell-home/bin' ] \
+  && ok "b8b12 …while the foreign-prefix rule is unaffected (no metacharacter before the occurrence)" \
+  || bad "b8b12 the wider START set now rewrites a foreign path"
+
 # b9: the two projectors answer the SAME single token the same way — they are one rule with two arities,
 # so a future edit to either boundary reddens here instead of drifting into two opinions.
 _pl_tok=/tmp/cell-home/keys.env
@@ -271,6 +287,20 @@ elif [ "$(proj_line_in "$MUTP/lib/cell-home.sh" 'ExecStart=-/tmp/cell-home/harne
   bad "e9 the mutated projector still moved a prefixed path — b8b8 does not measure the prefix run"
 else
   ok "e9 WITHOUT the exec-prefix strip a prefixed path does NOT move — b8b8 measures it"
+fi
+
+# e10: THE REDIRECT START SET MUST BE ABLE TO VARY — dropping `>` must make b8b10 redden.
+MUTR="$T/mutredir"; mkdir -p "$MUTR/lib"
+mut_lib() { # <src> <dst> <pattern-line-marker> <replacement-line>
+  awk -v old="$3" -v new="$4" 'index($0, old) > 0 && !done { print new; done=1; next } { print }' "$1" >"$2"
+}
+mut_lib "$LIB" "$MUTR/lib/cell-home.sh" "'|'|'&') tok=1" "      '='|' '|'	'|'"'|"'"|','|';'|':'|'(') tok=1 ;;"
+if cmp -s "$LIB" "$MUTR/lib/cell-home.sh"; then
+  bad "e10 the redirect-set mutation could not be applied — b8b10 is not checking it"
+elif [ "$(proj_line_in "$MUTR/lib/cell-home.sh" 'ExecStartPost=/bin/sh -c "echo x >>/tmp/cell-home/logs/run.log"')" = 'ExecStartPost=/bin/sh -c "echo x >>/home/cmux/logs/run.log"' ]; then
+  bad "e10 the mutated projector still moved a redirect target — b8b10 does not measure the START set"
+else
+  ok "e10 WITHOUT '>' in the START set a redirect target does NOT move — b8b10 measures it"
 fi
 
 # e8: POLARITY on the sibling side — the same mutant must still leave `.bak` alone, so e7 is about the

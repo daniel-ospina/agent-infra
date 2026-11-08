@@ -135,6 +135,9 @@ unit_dirs() {
 # say so. Leaving it out meant `--check` answered 0 (the RECLAIM precondition) while the only copy of the
 # model credential sat in the legacy home: the operator deletes it. A per-name list will always lag the
 # fleet — see `legacy_home_advisory` for the general mitigation.
+# ⛔ ONE NAME PER LINE: every consumer reads it with `while IFS= read -r rel; do … done <<EOF $CRED_FILES`,
+# so a space-separated list would be read as ONE name. The advisory matches by iterating this variable
+# (not by `case`), which is why it does not need a space-delimited form (review F5 round 4).
 CRED_FILES="keys.env
 pi-keys.env
 .pi/agent/auth.json
@@ -147,7 +150,15 @@ pi-keys.env
 # byte-for-byte (rule 3 forbids reading values), so a poisoned file would be installed faithfully; it is
 # therefore GRADED by assignment NAME, REPORTED by `--check` and REFUSED as a copy. Nothing is repaired
 # here (rule 2), and no value is ever printed (rule 3).
-ENV_FILES="keys.env"
+# ⛔ THE SAME SET DECIDES CONTENT GRADING (review F1 round 4). `CRED_FILES` gives a file PRESENCE
+# treatment (copy when missing); `ENV_FILES` is what gets its ASSIGNMENTS graded and refuses a copy that
+# re-points the home. `pi-keys.env` was added to the first and not the second, so a legacy-only copy that
+# said `export HOME=<legacy>` was installed into the durable home and the box certified "one home" — the
+# exact case rule 2/3 in the header forbids, on the file the round before added for being fleet-sourced
+# (`orchestrator-harness/worker-terminal.sh` does `set -a; . "$home/pi-keys.env"`). One set, both jobs.
+# ⛔ SPACE-SEPARATED, because every consumer tests it as `case " $ENV_FILES " in *" $rel "*)` — a newline
+# between the names would leave neither name with a blank on both sides and silently grade nothing.
+ENV_FILES="keys.env pi-keys.env"
 
 note() { printf '%s\n' "$*"; }
 warn_line() { printf 'WARN %s\n' "$*"; }
@@ -409,7 +420,7 @@ migrate_credentials() {
     fi
     mode="$(mode_of "$f_leg")"
     case "$rel" in
-      keys.env|.pi/agent/auth.json|.config/gh/hosts.yml) mode=600 ;;
+      keys.env|pi-keys.env|.pi/agent/auth.json|.config/gh/hosts.yml) mode=600 ;;
       *) [ -n "$mode" ] || mode=600 ;;
     esac
     # ⛔ A COPY OF A FILE THAT RE-POINTS THE HOME IS NOT CONVERGENCE, IT IS THE SPLIT RE-INSTALLED.
@@ -428,8 +439,16 @@ migrate_credentials() {
     esac
     mkdir -p "$(dirname "$f_dur")" 2>/dev/null || { warn_line "  cannot create $(dirname "$f_dur") — $rel NOT copied"; rc=1; continue; }
     # ⛔ A DIRECTORY THIS ROOT RUN CREATED MUST ALSO BELONG TO THE CELL ACCOUNT, or the credential inside
-    # it is unreadable for the same reason (review F4). Best effort, like the file's own chown below.
-    if [ "$INVOKER_UID" = 0 ] && [ -n "${DUR_OWNER:-}" ]; then chown "$DUR_OWNER" "$(dirname "$f_dur")" 2>/dev/null || true; fi
+    # it is unreadable for the same reason — and the FAILURE IS REPORTED, exactly like the file's own
+    # chown below (review F3 round 4). `|| true` here said "the guard exists" and then discarded its only
+    # signal: a root run under `umask 077` leaves `root:root 0700`, the cell account cannot traverse to
+    # the credential, and the run printed "one home".
+    if [ "$INVOKER_UID" = 0 ] && [ -n "${DUR_OWNER:-}" ]; then
+      if ! chown "$DUR_OWNER" "$(dirname "$f_dur")" 2>/dev/null; then
+        warn_line "  $rel: the directory $(dirname "$f_dur") could NOT be re-owned to $DUR_OWNER — $INVOKER's account may not be able to traverse to the credential"
+        rc=1
+      fi
+    fi
     # `install` copies bytes without ever putting them in this process's stdout; -m sets the mode in
     # the same syscall, so the file is never momentarily world-readable.
     if install -m "$mode" "$f_leg" "$f_dur" 2>/dev/null; then
@@ -745,11 +764,29 @@ EOF
 # make `--check` -> 0 unreachable on every real box (a false block). So it is printed as an ADVISORY
 # beside the verdict: the operator sees the whole population before reclaiming, and nothing fails on it.
 legacy_home_advisory() {
-  local name
-  [ -d "$HOME_LEGACY" ] && [ -r "$HOME_LEGACY" ] || return 0
-  # shellcheck disable=SC2012  # names only: no metadata, no sorting subtleties, and the listing is capped
-  ls -A "$HOME_LEGACY" 2>/dev/null | LC_ALL=C sort | awk 'NR<=40' | while IFS= read -r name; do
-    printf 'ADVISORY %s\n' "  not graded by this tool (review before reclaiming): $HOME_LEGACY/$name"
+  local entries name
+  [ -d "$HOME_LEGACY" ] || return 0
+  # ⛔ A REAL READ, NOT `[ -r ]` (review F5 round 4). `[ -r ]` is permission BITS, and `ls`'s error was
+  # discarded, so a legacy home that is SEARCHABLE but not LISTABLE (mode 111) printed ZERO advisory
+  # lines — i.e. "nothing ungraded here" — while the population was never read. Silence is not an answer:
+  # a failed listing is stated as such.
+  if ! entries="$(ls -A "$HOME_LEGACY" 2>/dev/null)"; then
+    printf 'ADVISORY %s\n' "  CANNOT LIST $HOME_LEGACY — its contents were NOT reviewed; look before reclaiming"
+    return 0
+  fi
+  printf '%s\n' "$entries" | LC_ALL=C sort | awk 'NR<=40' | while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    # ⛔ AND THE GRADED CREDENTIALS ARE NOT "NOT GRADED" (review F5): the credentials section above
+    # already measured them, so labelling them ungraded is a false statement about this run's own reading.
+    # ⛔ A GRADED CREDENTIAL IS NOT "NOT GRADED" (review F5): the credentials section above already
+    # measured it. Matched by ITERATING the list (newline-separated), not with a `case` on the raw value —
+    # and by first component too, so `.pi` (which holds the graded `.pi/agent/auth.json`) is not libelled.
+    _graded=0
+    for _c in $CRED_FILES; do
+      case "$_c" in "$name"|"$name"/*) _graded=1; break ;; esac
+    done
+    [ "$_graded" = 1 ] && continue
+    printf 'ADVISORY %s\n' "  present in the legacy home and NOT graded by this tool (review before reclaiming): $HOME_LEGACY/$name"
   done
 }
 

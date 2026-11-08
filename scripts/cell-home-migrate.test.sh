@@ -791,6 +791,56 @@ _out="$(env CELL_HOME="$DUR" CELL_HOME_LEGACY="$LEG" CELL_HOME_MIGRATE_UNIT_DIRS
   || bad "k30 the ownership failure was swallowed (rc $_rc)"
 case "$_out" in *"WRITTEN BUT NOT RE-OWNED"*) ok "k30b …naming the file and the owner it did not get" ;; *) bad "k30b the ownership failure is not reported" ;; esac
 
+# ── F1/F2 (round 4): pi-keys.env is CONTENT-graded and mode-clamped, like keys.env ──────────
+# `CRED_FILES` gives a file presence treatment; `ENV_FILES` is what gets its ASSIGNMENTS graded and what
+# refuses a copy that re-points the home. Adding pi-keys.env to the first only installed a poisoned copy
+# and certified "one home" — and it took the SOURCE mode, so a 0644 legacy file became a world-readable
+# model credential.
+mk_box "$T/pk2"
+rm -f "$DUR/pi-keys.env"
+printf 'export HOME=%s\nDEEPSEEK_API_KEY=%s\n' "$LEG" "$SENTINEL" >"$LEG/pi-keys.env"; chmod 644 "$LEG/pi-keys.env"
+_out="$(run_tool "$TOOL" --apply)"; _rc=$?
+[ "$_rc" = 1 ] && ok "k31 a legacy pi-keys.env that re-points HOME is REFUSED as a copy (rc 1, same rule as keys.env)" \
+  || bad "k31 the poisoned pi-keys.env was copied ($_rc) — one rule for one file and not the other"
+[ ! -e "$DUR/pi-keys.env" ] && ok "k31b …and the durable side is left MISSING rather than installed poisoned" \
+  || bad "k31b the poisoned pi-keys.env landed in the durable home"
+mk_box "$T/pk3"
+rm -f "$DUR/pi-keys.env"
+printf 'DEEPSEEK_API_KEY=%s\n' "$SENTINEL" >"$LEG/pi-keys.env"; chmod 644 "$LEG/pi-keys.env"
+run_tool "$TOOL" --apply >/dev/null 2>&1
+# `mode_of` lives in the TOOL, not in this suite: ask stat directly, guarded the way the tool does it.
+_pm="$(stat -c '%a' "$DUR/pi-keys.env" 2>/dev/null || stat -f '%Lp' "$DUR/pi-keys.env" 2>/dev/null || true)"
+[ -n "$_pm" ] && [ "$_pm" != "644" ] && ok "k32 a copied pi-keys.env is clamped to a private mode (got $_pm, source was 644)" \
+  || bad "k32 the model credential was installed with the SOURCE mode (${_pm:-missing}) — world-readable"
+
+# ── F3 (round 4): the UNIT chown refusal is armed (it had no arm at all) ─────────────────────
+# A `chown` stub that always fails, and NO root stub, so only the unit-write leg can reach it: the rewrite
+# must be refused by name and the original left byte-for-byte.
+STUBCH="$T/stubchown"; mkdir -p "$STUBCH"
+printf '#!/bin/sh\nexit 1\n' >"$STUBCH/chown"; chmod +x "$STUBCH/chown"
+mk_box "$T/uch"
+_before_u="$(cat "$UNITS/app.service")"
+_out="$(PATH="$STUBCH:$PATH" CELL_HOME="$DUR" CELL_HOME_LEGACY="$LEG" CELL_HOME_MIGRATE_UNIT_DIRS="$UNITS" \
+        CELL_HOME_MIGRATE_NO_RELOAD=1 bash "$TOOL" --apply 2>&1)"; _rc=$?
+case "$_out" in *"could not be re-owned"*) ok "k33 a unit whose ownership cannot be restored is REFUSED by name" ;; *) bad "k33 the unit-write ownership failure is not reported" ;; esac
+[ "$_before_u" = "$(cat "$UNITS/app.service")" ] && ok "k33b …and the original unit is left BYTE-FOR-BYTE intact" \
+  || bad "k33b the refused rewrite still replaced the unit"
+
+# ── F5 (round 4): the ADVISORY must be a real read and must not mislabel graded files ───────
+mk_box "$T/adv2"
+run_tool "$TOOL" --apply >/dev/null 2>&1
+printf 'operator notes\n' >"$LEG/legacy-only.txt"
+_out="$(run_tool "$TOOL" --check)"
+case "$_out" in *"NOT graded by this tool"*"keys.env"*) bad "k34 the advisory calls a GRADED credential 'not graded'" ;; *) ok "k34 …and a graded credential is not labelled ungraded" ;; esac
+chmod 111 "$LEG"                                        # searchable but NOT listable
+if ls -A "$LEG" >/dev/null 2>&1; then
+  ok "k34b SKIPS honestly: this account can still list a mode-111 directory"
+else
+  _out="$(run_tool "$TOOL" --check)"
+  case "$_out" in *"CANNOT LIST"*) ok "k34b …and an UNLISTABLE legacy home is stated, not read as 'nothing ungraded'" ;; *) bad "k34b silence was presented as 'nothing ungraded' over a population that was never read" ;; esac
+fi
+chmod 755 "$LEG" 2>/dev/null
+
 # mut_sub <src> <dst> <function> <old-substring> <new> — replace ONE substring on the FIRST line of ONE
 # function that carries it. Scoped by function because several guards share a spelling; a control whose
 # mutation cannot be applied must fail loudly rather than silently grade the unmutated tool.
@@ -1195,7 +1245,9 @@ fi
 # swallowed and the run reports success over a credential the cell account cannot read.
 mkdir -p "$T/mutdir17/lib"; cp "$HERE/lib/cell-home.sh" "$T/mutdir17/lib/cell-home.sh"
 MUT17="$T/mutdir17/cell-home-migrate.sh"
-mut_sub "$TOOL" "$MUT17" migrate_credentials 'if ! chown "$DUR_OWNER" "$f_dur" 2>/dev/null; then' 'if false; then'
+mut_sub "$TOOL" "$T/mutdir17/m1.sh" migrate_credentials 'if ! chown "$DUR_OWNER" "$(dirname "$f_dur")" 2>/dev/null; then' 'if false; then'
+mut_sub "$T/mutdir17/m1.sh" "$MUT17" migrate_credentials 'if ! chown "$DUR_OWNER" "$f_dur" 2>/dev/null; then' 'if false; then'
+rm -f "$T/mutdir17/m1.sh"
 if cmp -s "$TOOL" "$MUT17"; then
   bad "g17 the ownership mutation could not be applied — k30 is not checking it"
 else
@@ -1239,6 +1291,68 @@ else
   run_tool "$MUT19" --check >/dev/null 2>&1; _m19rc=$?
   [ "$_m19rc" = 0 ] && ok "g19 WITHOUT pi-keys.env in the population the box reads 'one home' (0) — k28 measures it" \
     || bad "g19 the mutant still reported drift (rc $_m19rc) — k28 is not measuring the population"
+fi
+
+# g20: revert ENV_FILES to `keys.env` only (round-4 F1) and k31 must redden — the poisoned pi-keys.env is
+# then copied and certified "one home".
+mkdir -p "$T/mutdir20/lib"; cp "$HERE/lib/cell-home.sh" "$T/mutdir20/lib/cell-home.sh"
+MUT20="$T/mutdir20/cell-home-migrate.sh"
+awk 'index($0, "ENV_FILES=\"keys.env pi-keys.env\"") > 0 && !done { print "ENV_FILES=\"keys.env\""; done=1; next } { print }' "$TOOL" >"$MUT20"
+if cmp -s "$TOOL" "$MUT20"; then
+  bad "g20 the ENV_FILES mutation could not be applied — k31 is not checking it"
+else
+  mk_box "$T/g20"; rm -f "$DUR/pi-keys.env"
+  printf 'export HOME=%s\nK=%s\n' "$LEG" "$SENTINEL" >"$LEG/pi-keys.env"; chmod 644 "$LEG/pi-keys.env"
+  run_tool "$MUT20" --apply >/dev/null 2>&1; _m20rc=$?
+  [ -e "$DUR/pi-keys.env" ] && [ "$_m20rc" = 0 ] \
+    && ok "g20 WITHOUT pi-keys.env in ENV_FILES a home-re-pointing copy IS installed and the run reads 0 — k31 measures it" \
+    || bad "g20 the mutant still refused the copy (rc $_m20rc) — k31 is not attributable to ENV_FILES"
+fi
+
+# g21: revert the 600 clamp (round-4 F2) and k32 must redden.
+MUT21="$T/mutdir20/cell-home-migrate-mode.sh"
+awk 'index($0, "keys.env|pi-keys.env|.pi/agent/auth.json|.config/gh/hosts.yml) mode=600") > 0 && !done { print "      keys.env|.pi/agent/auth.json|.config/gh/hosts.yml) mode=600 ;;"; done=1; next } { print }' "$TOOL" >"$MUT21"
+if cmp -s "$TOOL" "$MUT21"; then
+  bad "g21 the mode-clamp mutation could not be applied — k32 is not checking it"
+else
+  mk_box "$T/g21"; rm -f "$DUR/pi-keys.env"
+  printf 'K=%s\n' "$SENTINEL" >"$LEG/pi-keys.env"; chmod 644 "$LEG/pi-keys.env"
+  run_tool "$MUT21" --apply >/dev/null 2>&1
+  _m21m="$(stat -c '%a' "$DUR/pi-keys.env" 2>/dev/null || stat -f '%Lp' "$DUR/pi-keys.env" 2>/dev/null || true)"
+  [ "$_m21m" = "644" ] && ok "g21 WITHOUT the clamp pi-keys.env keeps the legacy 644 — k32 measures the clamp" \
+    || bad "g21 the mutant still installed a private mode ($_m21m) — k32 is not measuring the clamp"
+fi
+
+# g22: remove the unit-chown refusal (round-4 F3) and k33 must redden — the swap lands with the wrong owner.
+MUT22="$T/mutdir20/cell-home-migrate-unitown.sh"
+mut_sub "$TOOL" "$MUT22" migrate_units 'if [ -n "$_own" ] && ! chown "$_own" "$tmpdir" 2>/dev/null; then' 'if false; then'
+if cmp -s "$TOOL" "$MUT22"; then
+  bad "g22 the unit-chown mutation could not be applied — k33 is not checking it"
+else
+  mk_box "$T/g22"
+  _before22="$(cat "$UNITS/app.service")"
+  PATH="$STUBCH:$PATH" CELL_HOME="$DUR" CELL_HOME_LEGACY="$LEG" CELL_HOME_MIGRATE_UNIT_DIRS="$UNITS" \
+    CELL_HOME_MIGRATE_NO_RELOAD=1 bash "$MUT22" --apply >/dev/null 2>&1; _m22rc=$?
+  [ "$_before22" != "$(cat "$UNITS/app.service")" ] \
+    && ok "g22 WITHOUT the unit-chown refusal the rewrite IS swapped in (rc $_m22rc) — k33 measures the refusal" \
+    || bad "g22 the mutant still left the unit untouched — k33 is not attributable to the refusal"
+fi
+
+# g23: silence the advisory's failed listing (round-4 F5) and k34b must redden.
+MUT23="$T/mutdir20/cell-home-migrate-adv.sh"
+mut_sub "$TOOL" "$MUT23" legacy_home_advisory 'if ! entries="$(ls -A "$HOME_LEGACY" 2>/dev/null)"; then' 'if false; then'
+if cmp -s "$TOOL" "$MUT23"; then
+  bad "g23 the advisory mutation could not be applied — k34b is not checking it"
+else
+  mk_box "$T/g23"; run_tool "$TOOL" --apply >/dev/null 2>&1
+  printf 'note\n' >"$LEG/legacy-only.txt"; chmod 111 "$LEG"
+  if ls -A "$LEG" >/dev/null 2>&1; then
+    ok "g23 SKIPS honestly: this account can still list a mode-111 directory"
+  else
+    _out23="$(run_tool "$MUT23" --check)"
+    case "$_out23" in *"CANNOT LIST"*) bad "g23 the mutant still stated it could not list" ;; *) ok "g23 WITHOUT the failed-listing line silence reads as 'nothing ungraded' — k34b measures it" ;; esac
+  fi
+  chmod 755 "$LEG" 2>/dev/null
 fi
 
 printf '\n── (h) argument handling ────────────────────────────────────────────────────────────\n'

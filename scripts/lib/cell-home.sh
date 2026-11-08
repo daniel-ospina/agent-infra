@@ -218,7 +218,11 @@ cell_home_project_line() { # <home> <line>
     tok=0
     case "$prev" in
       '') tok=1 ;;                                   # start of the line
-      '='|' '|'	'|'"'|"'"|','|';'|':'|'(') tok=1 ;;  # a value, an item-list separator, a quote
+      # `>` `<` `|` `&` begin a REDIRECT or PIPE TARGET, which is a whole path token inside a `sh -c`
+      # payload: without them `ExecStartPost=/bin/sh -c "echo x >>/legacy/log"` produced NO record, so
+      # `--check` answered 0 over a unit that still named the legacy home (review F4 round 4 — the same
+      # fail-open class as the exec prefixes, one character over).
+      '='|' '|'	'|'"'|"'"|','|';'|':'|'('|'>'|'<'|'|'|'&') tok=1 ;;  # a value, separator, quote, redirect
     esac
     end=0
     case "$tail" in
