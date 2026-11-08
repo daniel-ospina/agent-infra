@@ -5536,6 +5536,29 @@ assert_not_contains "$RECORD_ERR" "would find NOTHING" \
     "14.1d(i) …and the exit-0 remedy never PREDICTS the flush's output either — the marker is deterministic, so an earlier run at this head may hold exactly these bytes"
 assert_not_contains "$RECORD_ERR" "neither delivers these bytes" \
     "14.1d(i) …nor denies the flush can deliver them, which would withdraw the working one-command remedy (round 10: it must be OFFERED in both arms)"
+# ⛔ THE EXIT-0 REMEDY ITSELF MUST BE PINNED, NOT ONLY ITS DENIALS (#3712 review at
+# `1dece6108`, FINDING 1 — the absent-mutation-leg class of agent-infra#3442).
+# Every row above on this capture is either a POSITIVE about a state that is still
+# true without the remedy (`:5524`) or a NEGATIVE about a denial; deleting the remedy
+# clause makes each negative MORE satisfied, so the whole block stayed GREEN with the
+# round-10 regression direction live. The label at `:5537` states the invariant
+# ("it must be OFFERED in both arms") and the comment above it repeats it, but nothing
+# enforced it on THIS arm — the only two positives on the offer read the rc-5 capture
+# (`:5563`/`:5565`). These two are DIFFERENT predicates from those two rows on a
+# DIFFERENT capture, so neither can redden in lockstep with them: `:5563`/`:5565`
+# prove the exit-5 arm offers the flush, these prove the exit-0 arm still does.
+# RED pre-fix: delete the `So TRY --flush-pending $PR ${REPO:-} …` clause from the
+# exit-0 else-branch of `scripts/record-review.sh` and BOTH rows below red. MEASURED in
+# this lane, both directions, full suite each time:
+#   · mutant alone                  → PASS=1453 FAIL=0   (the finding: the clause is unpinned)
+#   · mutant + these two rows       → PASS=1453 FAIL=2   (both new rows, each naming its literal)
+#   · head (no mutant) + these rows → PASS=1455 FAIL=0
+# i.e. the rows are the only thing standing between that deletion and a green suite, and
+# the untouched head stays green — a pin, not a regression.
+assert_contains "$RECORD_ERR" "TRY --flush-pending" \
+    "14.1d(i) …and the exit-0 arm still OFFERS the flush — the sibling rows here only FORBID the denial and the output prediction, so without this row the working one-command remedy can be deleted from this arm and every row stays GREEN (#3712 review at 1dece6108, FINDING 1)"
+assert_contains "$RECORD_ERR" "findings/note, the diff and a signature" \
+    "14.1d(i) …and the identity test it hands the operator on THIS arm enumerates the same inputs as its exit-5 sibling, findings=/note= included — round 10 added the clause to BOTH sites and only the exit-5 one was pinned (#3712 review at 1dece6108, FINDING 1)"
 PERSIST_PR2=424363
 STUB_BODY_FAIL=1 STUB_BODY_FAIL_TEXT='gh: Not Found (HTTP 404)' STUB_COMMENTS_FAIL=1 \
     run_record_633 "$PERSIST_PR2" "$SHA" "$DC_CRUNS"
