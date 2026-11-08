@@ -1976,11 +1976,14 @@ off macOS (it renders a launchd plist) — the portability that matters is `orch
    decision whose docstring hands the judgement to "the consumer"), and two review rounds on 2026-11-07
    were re-run because a report described a tree one commit behind the head being merged.
    ⛔ Two outcomes ABSTAIN rather than refuse, and are logged as such (`5` = the repo ships no writer, so
-   no report of this format can exist; `6` = no worktree for this branch on this box, so the lane's
-   evidence is not reachable from here — measured 2026-11-08: 13 of 13 open tortoise PRs had none on the
-   hub). Refusing on either would stop every cross-box merge in the fleet; counting either as green would
-   be the false PASS the ruling exists to close. `7` (a report that exists and could not be VERIFIED)
-   refuses.
+   no report of this format can exist; `6` = no worktree for this branch on this box AND no writer state
+   on it that names this branch or this head, so the lane's evidence is not reachable from here —
+   measured 2026-11-08: 13 of 13 open tortoise PRs had none on the hub). Refusing on either would stop
+   every cross-box merge in the fleet; counting either as green would be the false PASS the ruling exists
+   to close. ⛔ `6` IS NOT REACHABLE BY MOVING THE WORKTREE ITSELF: detaching at the merging head, at
+   ANY other commit, or onto a scratch branch leaves writer state that still names the branch/head, so
+   those answer `7` — one `git switch` must not convert a refusal into the abstention both carriers
+   merge on. `7` (a report that exists and could not be VERIFIED) refuses.
 
 ### 5.3 Untrusted input and worker containment — read before running this unattended
 

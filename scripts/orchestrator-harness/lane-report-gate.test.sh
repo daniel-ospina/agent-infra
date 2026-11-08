@@ -450,6 +450,40 @@ case "$LAST_OUT" in *VERDICT=PASS*) bad "a state contradicting the sealed report
 printf '## Files changed\n- **Base:** `main` → **head at write:** `%s`\n## Suites run\n## Could not do\n' "$(printf '%s' "$WT_HEAD" | cut -c1-12)" > "$WT/WORKTREE-REPORT.md"
 _restore_state
 drive 0 "CONTROL: a report whose sealed head AGREES with the state still PASSES" STUB_OK=1 STUB_RC=0 STUB_STALE=0
+# ── 2h-2. THE SEALED CROSS-CHECK MUST NOT BE DISABLEABLE FROM `PATH` (fresh review 2026-11-08, MED) ──
+# ⛔ IT WAS `sed -n … | tail -1` PLUS A `cut`, i.e. THREE PATH-RESOLVED PROGRAMS COMPUTING THIS ARM, while
+# the file's disclosure scoped the open PATH residual to `git` alone. The graded party owns PATH and runs
+# the carrier itself, so a `sed` shim that exits 0 and prints nothing blanked the stamp, the cross-check
+# went dark, and the two-field-edited state below PASSED. The extraction is now inside the pinned,
+# `-I`-isolated interpreter pass, so the shim must change nothing.
+_SHIM="$TMP/pathshim"; mkdir -p "$_SHIM"
+for _p in sed tail cut awk head; do printf '#!/bin/sh\nexit 0\n' > "$_SHIM/$_p"; chmod +x "$_SHIM/$_p"; done
+if PATH="$_SHIM:$PATH" command -v sed >/dev/null 2>&1 \
+   && [ "$(PATH="$_SHIM:$PATH" sed -n '1p' /dev/null; echo "$?")X" = "0X" ] \
+   && [ -z "$(PATH="$_SHIM:$PATH" sed -n 'p' "$WT/WORKTREE-REPORT.md" 2>/dev/null)" ]; then
+  # ⛔ THE FORGERY MUST NAME THE MERGING HEAD (round-8's actual two-field edit). With a DIFFERENT state head,
+  # the ordinary `report_head != merging_head` arm refuses anyway and this row would pass with the sealed
+  # cross-check deleted — measured while writing it. Here every OTHER witness agrees and only the sealed
+  # stamp can catch it: sealed says `$_SEALED_A`, state says `$WT_HEAD`.
+  printf '## Files changed\n- **Base:** `main` → **head at write:** `%s`\n## Suites run\n## Could not do\n' "$_SEALED_A" > "$WT/WORKTREE-REPORT.md"
+  printf '{"version":1,"head_at_write":"%s","branch":"feat/2977-tm","suites":[{"n":1,"command":"x","exit":0,"finished_at":"2099-01-01T00:00:00Z"}]}\n' "$WT_HEAD" > "$WT/.worktree-report/state.json"
+  out="$(env PATH="$_SHIM:$PATH" STUB_OK=1 STUB_RC=0 STUB_STALE=0 bash "$GATE" --check "$REPO" "feat/2977-tm" "$WT_HEAD" 2>&1)"; rc=$?
+  if [ "$rc" = 4 ]; then ok "a sed/tail/cut/awk/head shim on PATH cannot switch the sealed cross-check off — the two-field edit is still STALE (rc=$rc)"; else bad "a PATH shim disabled the sealed cross-check: expected rc=4, got rc=$rc :: $out"; fi
+  case "$out" in *reason=state-disagrees-with-the-sealed-report*) ok "…and the reason is still the sealed disagreement, computed without a PATH-resolved program" ;; *) bad "PATH-shim reason: $out" ;; esac
+  case "$out" in *VERDICT=PASS*) bad "a PATH-resolved extractor let a forged state PASS" ;; *) ok "…and a forged state is not a PASS" ;; esac
+  # CONTROL: the same artifacts WITHOUT the shim agree with the row above (so the row is not asserting a
+  # blanket refusal, and the shim is not what makes it red).
+  _restore_state
+  printf '## Files changed\n- **Base:** `main` → **head at write:** `%s`\n## Suites run\n## Could not do\n' "$_SEALED_A" > "$WT/WORKTREE-REPORT.md"
+  printf '{"version":1,"head_at_write":"%s","branch":"feat/2977-tm","suites":[{"n":1,"command":"x","exit":0,"finished_at":"2099-01-01T00:00:00Z"}]}\n' "$WT_HEAD" > "$WT/.worktree-report/state.json"
+  drive 4 "CONTROL: the same two-field edit is STALE with a clean PATH too (the sealed stamp is the only witness left)" STUB_OK=1 STUB_RC=0 STUB_STALE=0
+else
+  skip "the PATH-shim row (this host cannot shadow sed/tail/cut)"
+fi
+# ⛔ AND THE IDIOM MUST STAY DELETED, not merely be unused: a future edit that reintroduces `sed -n` over
+# the report would pass the behavioural row only while the host happens to have a working sed.
+if grep -vE '^[[:space:]]*#' "$GATE" | grep -q 'sed -n'; then bad "the gate reintroduced a PATH-resolved \`sed -n\` over the report (the sealed cross-check is disableable again)"; else ok "no \`sed -n\` extractor remains in the executable part of the gate — the sealed stamp comes from the pinned interpreter pass"; fi
+if grep -q '_seal_pat' "$GATE" && grep -q 'sealed12' "$GATE"; then ok "…and the stamp is extracted inside the isolated JSON pass (sealed12)"; else bad "the sealed stamp is not extracted in the isolated pass — the PATH disclosure would be false"; fi
 # Restore the stanza-free report the baseline fixtures use, so later arms that re-point the head are not
 # judged against a stamp from this block.
 printf '## Files changed\n## Suites run\n## Could not do\n' > "$WT/WORKTREE-REPORT.md"
@@ -627,6 +661,49 @@ fi
 _NOSTANZA="0123456789abcdef0123456789abcdef01234567"
 out="$(env STUB_OK=1 STUB_RC=0 STUB_STALE=0 bash "$GATE" --check "$REPO" "feat/not-here-at-all" "$_NOSTANZA" 2>&1)"; rc=$?
 if [ "$rc" = 6 ]; then ok "CONTROL a head that no worktree of this box sits at still abstains with 6 (no over-block)" ; else bad "the detached-worktree fix over-blocked the cross-box case: expected rc=6, got rc=$rc :: $out"; fi
+
+# ── 4h. DETACHING AT A *DIFFERENT* COMMIT IS THE SAME BYPASS, ONE ARGUMENT OVER (fresh review 2026-11-08, P0) ──
+# ⛔ THE ROUND-10/11 ARM KEYS ON "a stanza whose HEAD == the merging head", so
+# `git switch --detach HEAD~1` and `git switch -c scratch HEAD~1` left every artefact untouched and answered
+# 6 NO-WORKTREE — the code BOTH carriers log as "NOT ENFORCED" and merge on. Driven in its OWN fixture (a
+# second repo), because re-pointing the shared `$WT` would invalidate every row that follows.
+OFF="$TMP/offbr"
+mkdir -p "$OFF"; git -C "$OFF" init -q -b main
+printf 'a\n' > "$OFF/f"; git -C "$OFF" add f; git -C "$OFF" commit -qm one
+printf 'b\n' > "$OFF/f"; git -C "$OFF" commit -qam two
+OFF_HEAD="$(git -C "$OFF" rev-parse HEAD)"
+OFFWT="$OFF/.worktrees/lane"
+git -C "$OFF" worktree add -q -b feat/off "$OFFWT" HEAD 2>/dev/null || bad "fixture: could not create the off-branch worktree"
+# ⛔ THE HUB MUST NOT SIT AT THE MERGING HEAD, or the ALREADY-PINNED stanza-at-head arm answers first and
+# this row never reaches the arm it claims to test (measured while writing it: the hub was at OFF_HEAD).
+printf 'c\n' > "$OFF/c"; git -C "$OFF" add c; git -C "$OFF" commit -qm three
+_off_state() { # <head_at_write>
+  mkdir -p "$OFFWT/.worktree-report"
+  printf '{"version":1,"head_at_write":"%s","branch":"feat/off","suites":[{"n":1,"command":"x","exit":0,"finished_at":"2099-01-01T00:00:00Z"}]}\n' "$1" > "$OFFWT/.worktree-report/state.json"
+}
+printf '## Files changed\n## Suites run\n## Could not do\n' > "$OFFWT/WORKTREE-REPORT.md"
+_off_state "$OFF_HEAD"
+# (i) detached at HEAD~1 with the state still naming the MERGING head (the head_at_write witness).
+git -C "$OFFWT" checkout -q --detach HEAD~1 2>/dev/null || true
+out="$(env STUB_OK=1 STUB_RC=0 STUB_STALE=0 bash "$GATE" --check "$OFF" "feat/off" "$OFF_HEAD" 2>&1)"; rc=$?
+if [ "$rc" = 7 ]; then ok "detach at HEAD~1 (not the merging head) is UNMEASURABLE, not the mergeable abstention 6 (rc=$rc)"; else bad "detach-at-HEAD~1 produced rc=$rc (expected 7) — 6 would be merged on: $out"; fi
+case "$out" in *reason=this-box-holds-the-report-for-this-branch-in-a-worktree-that-is-not-at-the-merging-head*) ok "…and it names that this box HOLDS the report for this branch, rather than that the box is elsewhere" ;; *) bad "detach-at-HEAD~1 reason: $out" ;; esac
+case "$out" in *VERDICT=NO-WORKTREE*) bad "detach at another commit was reported as NO-WORKTREE (the mergeable abstention)" ;; *) ok "…and it is not the abstention a lane merges on" ;; esac
+# (ii) a SCRATCH BRANCH at HEAD~1, with the state recording the OLD head too — so only the `branch` key can
+# attribute the evidence. This is what proves the attribution is not just the head_at_write witness.
+_off_state "$(git -C "$OFFWT" rev-parse HEAD)"
+git -C "$OFFWT" switch -q -c scratch 2>/dev/null || git -C "$OFFWT" checkout -q -b scratch 2>/dev/null || true
+out="$(env STUB_OK=1 STUB_RC=0 STUB_STALE=0 bash "$GATE" --check "$OFF" "feat/off" "$OFF_HEAD" 2>&1)"; rc=$?
+if [ "$rc" = 7 ]; then ok "a scratch branch at HEAD~1 is UNMEASURABLE too — the state's branch key attributes the evidence (rc=$rc)"; else bad "scratch-branch-at-HEAD~1 produced rc=$rc (expected 7): $out"; fi
+# ⛔ CONTROL: the arm must not fire on a genuine cross-box merge. Same repo, a branch whose evidence is
+# NOT on this box and a head no state names — the ordinary 13/13-hub shape — is still 6.
+_off_state "$OFF_HEAD"
+out="$(env STUB_OK=1 STUB_RC=0 STUB_STALE=0 bash "$GATE" --check "$OFF" "feat/not-here" "0123456789abcdef0123456789abcdef01234567" 2>&1)"; rc=$?
+if [ "$rc" = 6 ]; then ok "CONTROL: evidence for no branch on this box still abstains with 6 (the off-branch arm does not over-block)"; else bad "the off-branch arm over-blocked a genuine cross-box merge: expected rc=6, got rc=$rc :: $out"; fi
+# ⛔ AND THE RESIDUAL IS DISCLOSED, NOT IMPLIED: deleting the state removes the attribution, so a lane that
+# detaches at another commit AND deletes its writer state still gets 6. The disclosure must stay in the file
+# (the same rule the consumer-provenance row above pins).
+if grep -q 'detaches at another commit AND deletes' "$GATE"; then ok "the off-branch residual (detach at another commit + delete the writer state) is DISCLOSED in the gate"; else bad "the off-branch residual is not disclosed — the arm would read as closing more than it does"; fi
 
 # ── 5. EXACT BRANCH MATCH (§6) — both mutant directions — the decoys sort FIRST in the walk ──
 # ── 5. EXACT BRANCH MATCH (§6) — both mutant directions, and the decoys sort BEFORE the real worktree ──

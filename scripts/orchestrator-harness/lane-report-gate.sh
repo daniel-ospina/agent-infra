@@ -161,6 +161,14 @@ _lrg_py() {
 #       lane that sets `PATH` can substitute the git that reports the head. That is FILED (agent-infra
 #       #3789, which carries the measurement and the 66-row bar any fix must clear), and disclosed HERE
 #       so nobody reads the seam class as closed.
+#   (3) NO OTHER PROGRAM IN THE DECISION PATH IS PATH-RESOLVED (fresh review, MED). That is a claim a
+#       reader is entitled to check, so it is asserted below and pinned by a suite row: everything that
+#       computes or compares a field runs the pinned interpreter (`_lrg_py`) or a bash BUILTIN. The
+#       `sed -n … | tail -1` + `cut` that extracted the sealed stamp and the state's 12-hex prefix were
+#       the one exception, and a `sed` shim on PATH switched the sealed cross-check off (a two-field
+#       edit then PASSed) — they are gone, folded into the isolated JSON pass. `grep`/`sed`/`awk` are
+#       not used on any value that decides a code. Treat any NEW PATH-resolved program here as a breach
+#       of this disclosure, not as a detail.
 unset -f git 2>/dev/null || true
 
 # _lrg_worktree <repo> <branch> — the worktree of <repo> checked out on <branch>, or nothing.
@@ -188,11 +196,16 @@ _lrg_worktree() {
   return 1
 }
 
-# _lrg_stanza_at_head <repo> <head> — a worktree stanza whose HEAD is <head> AND which holds a report.
+# _lrg_stanza_at_head <repo> <head> — a worktree stanza whose HEAD is <head>.
 # ⛔ THIS IS WHAT SEPARATES A CROSS-BOX ABSTENTION FROM A SELF-INFLICTED ONE (round-10 review, P0).
 # `git worktree list --porcelain` prints `HEAD <sha>` in every stanza, including a DETACHED one that has no
 # branch line — so a lane that detaches its own worktree is still visible here, and its evidence with it.
-# The report conjunct keeps a coincidental hub checkout at the same head from becoming an over-block.
+# ⛔ WHAT THIS DELIBERATELY DOES *NOT* DO: IT DOES NOT CHECK THE BRANCH. Round 11 removed the
+# `-f WORKTREE-REPORT.md` conjunct from the FIRING condition on purpose (a lane turned off its own
+# precondition by deleting the report), so the only lane-independent fact left is "a stanza of this repo
+# sits at the merging head" — that is what fires, and what the stanza HOLDS decides only the wording.
+# (The earlier comment here claimed a branch check this function never performed; the branch-attribution
+# arm lives in `_lrg_evidence_off_branch` below, which is where it can actually be evaluated.)
 _lrg_stanza_at_head() {
   local repo="$1" head="$2" wt="" hd="" line="" listing=""
   [ -n "$repo" ] && [ -n "$head" ] || return 1
@@ -202,12 +215,6 @@ _lrg_stanza_at_head() {
     case "$line" in
       'worktree '*) wt="${line#worktree }"; hd="" ;;
       'HEAD '*) hd="${line#HEAD }"
-                # ⛔ THE STANZA MUST ALSO BELONG TO *THIS* BRANCH (the over-block guard, measured): a
-                # stanza at the same head is not enough, because an ordinary cross-box merge can have the
-                # hub checkout sitting at exactly the PR head on a DIFFERENT branch. The writer records
-                # the branch in its state, which is what a detached worktree keeps (detaching changes the
-                # ref, not the lane), so this separates "the lane detached its own worktree" from "some
-                # other worktree happens to be at this head".
                 if [ "$hd" = "$head" ] && [ -n "$wt" ]; then
                   printf '%s' "$wt"; return 0
                 fi ;;
@@ -216,10 +223,71 @@ _lrg_stanza_at_head() {
   return 1
 }
 
+# _lrg_stanza_paths <repo> — every worktree path in `git worktree list --porcelain`, one per line.
+_lrg_stanza_paths() {
+  local repo="$1" line="" listing=""
+  [ -n "$repo" ] || return 1
+  listing="$(git -C "$repo" worktree list --porcelain 2>/dev/null)" || listing=""
+  [ -n "$listing" ] || return 1
+  while IFS= read -r line; do
+    case "$line" in 'worktree '*) printf '%s\n' "${line#worktree }" ;; esac
+  done <<< "$listing"
+  return 0
+}
+
+# _lrg_evidence_off_branch <repo> <branch> <head> — a worktree that NAMES this branch's evidence while NOT
+# being registered on the branch (a detached HEAD, or a scratch branch), or nothing.
+# ⛔ DETACHING AT A MERGING HEAD WAS ONLY HALF THE BYPASS (fresh review, P0). The arm above fires when a
+# stanza sits at the MERGING head, so the SAME one command with one different argument —
+# `git switch --detach HEAD~1`, or `git switch -c scratch HEAD~1` — left every artefact untouched and
+# answered 6 NO-WORKTREE, the code BOTH carriers log as "NOT ENFORCED" and merge on. RED/INVALID/STALE/
+# UNMEASURABLE are all downstream of that resolution, so the whole table was defeated by one argument.
+# The discriminator is still "does this box NAME the evidence", just not only "at this head": the writer
+# state keeps the lane's `branch` (detaching changes the ref, not the lane) and `head_at_write` (the head
+# the evidence claims to describe). Either matching this branch or this head makes the box the holder of
+# the evidence, and a holder that cannot be graded is UNMEASURABLE, never an abstention.
+# ⛔ THE RESIDUAL IS DISCLOSED, NOT IMPLIED: a lane that detaches at another commit AND deletes
+# `.worktree-report/state.json` from that worktree leaves nothing that attributes the worktree to this
+# branch, and this arm answers 6 as it does for a genuine cross-box merge. Closing that needs a
+# lane-independent attribution (the same class as #3789's `git` seam), not another lane-owned file.
+# Returns 0 and prints the path when attributed, 2 when no interpreter can attribute at all.
+_lrg_evidence_off_branch() {
+  local repo="$1" branch="$2" head="$3" p="" py="" kv="" b="" hw=""
+  [ -n "$repo" ] || return 1
+  py="$(_lrg_py)" || return 2
+  while IFS= read -r p; do
+    [ -n "$p" ] || continue
+    [ -f "$p/.worktree-report/state.json" ] || continue
+    # The two fields are read in ONE isolated pass, with the SAME pinned interpreter the verdict uses:
+    # a `grep`/`sed` over JSON here would be a PATH-resolved program computing part of the decision.
+    kv="$("$py" -I -c 'import json, sys
+# ⛔ THE KEYS ARE READ FROM THE UNDIGESTED WRITER STATE AND ARE LANE-WRITABLE. That is why they may only
+# NAME the evidence ("this box holds a report for this branch/head"), never whether the arm fires on
+# their absence: a lane that deletes them is answering the OTHER spelling of this bypass, which the
+# disclosure above states plainly instead of pretending this file can close it.
+try:
+    with open(sys.argv[1], encoding="utf-8", errors="replace") as _fh:
+        _d = json.load(_fh)
+except Exception:
+    sys.exit(3)
+if not isinstance(_d, dict):
+    sys.exit(3)
+_b = _d.get("branch")
+_h = _d.get("head_at_write")
+print("%s\x1f%s" % (_b if isinstance(_b, str) else "", _h if isinstance(_h, str) else ""))' "$p/.worktree-report/state.json" 2>/dev/null)" || kv=""
+    b="${kv%%$'\x1f'*}"
+    hw="${kv#*$'\x1f'}"
+    [ "$hw" = "$kv" ] && hw=""
+    if [ -n "$branch" ] && [ "$b" = "$branch" ]; then printf '%s' "$p"; return 0; fi
+    if [ -n "$head" ] && [ -n "$hw" ] && [ "$hw" = "$head" ]; then printf '%s' "$p"; return 0; fi
+  done <<< "$(_lrg_stanza_paths "$repo")"
+  return 1
+}
+
 # lane_report_gate <repo-path> <branch> <head> — the decision table above.
 lane_report_gate() {
   local repo="${1:-}" branch="${2:-}" head="${3:-}" wt="" tool="" py="" out="" rc=0
-  local ok="" stale="" rules="" rec_head="" live_head=""
+  local ok="" stale="" rules="" rec_head="" live_head="" sealed12="" rec12="" _lrg_ev="" _lrg_ev_rc=0
 
   # ⛔ `head` IS THE WHOLE POINT OF THE GATE, SO AN EMPTY ONE CANNOT PASS ANY ARM (fresh review, P1).
   # The first version took it as documentation: `head=` appeared in every message and in NO comparison,
@@ -284,6 +352,20 @@ lane_report_gate() {
       else
         _lrg_emit 7 UNMEASURABLE "branch=$branch repo=$repo stanza=$_lrg_sh reason=worktree-at-this-head-is-not-registered-on-this-branch-and-holds-no-report head=$head hint=restore-the-branch-in-that-worktree-or-run-the-suites-there"
       fi
+      return 7
+    fi
+    # ⛔ AND DETACHING AT ANY *OTHER* COMMIT IS THE SAME BYPASS ONE ARGUMENT OVER (fresh review, P0).
+    # `git switch --detach HEAD~1` / `git switch -c scratch HEAD~1` are not covered by the stanza-at-head
+    # arm above, and they answered 6 — the abstention both carriers merge on — with every artefact intact.
+    # The box still NAMES the evidence (the writer state keeps `branch` and `head_at_write`), so it must
+    # answer 7, not 6. A genuine cross-box merge has no such state on this box and still gets 6.
+    _lrg_ev="$(_lrg_evidence_off_branch "$repo" "$branch" "$head" 2>/dev/null)"; _lrg_ev_rc=$?
+    if [ "$_lrg_ev_rc" = 2 ]; then
+      _lrg_emit 7 UNMEASURABLE "branch=$branch repo=$repo reason=cannot-attribute-this-repos-lane-evidence-without-a-python-3-12-interpreter head=$head hint=install-a-python-3-12-interpreter-an-unreadable-attribution-is-not-an-abstention"
+      return 7
+    fi
+    if [ -n "$_lrg_ev" ]; then
+      _lrg_emit 7 UNMEASURABLE "branch=$branch repo=$repo stanza=$_lrg_ev reason=this-box-holds-the-report-for-this-branch-in-a-worktree-that-is-not-at-the-merging-head head=$head hint=check-the-branch-out-at-the-merging-head-and-re-run-the-suites-there-detach-is-not-an-abstention"
       return 7
     fi
     _lrg_emit 6 NO-WORKTREE "branch=$branch reason=no-worktree-for-branch-on-this-box head=$head"
@@ -408,7 +490,7 @@ lane_report_gate() {
   # ⛔ `-c`, NOT A NESTED HEREDOC: a heredoc body is literal text, so a `<<PY` inside a `<<EOF` body
   # never runs as a program — it is the outer heredoc's DATA, the reader then gets garbage and this gate
   # would abstain on every lane that has a perfectly good report (found before it shipped).
-  _LRG_JSON_PY='import datetime, json, sys
+  _LRG_JSON_PY='import datetime, json, re, sys
 try:
     d = json.loads(sys.argv[1])
 except Exception:
@@ -542,7 +624,30 @@ if newest is not None and sys.argv[3]:
     except Exception:
         predates = ""
         skew = ""
-print("%s|%s|%s|%s|%s|%s|%s|%s" % (
+# ⛔ THE SEALED-REPORT STAMP IS EXTRACTED HERE, IN THE PASS THAT IS ALREADY PINNED (fresh review, MED).
+# It used to be `sed -n … | tail -1` plus a `cut`: TWO PATH-RESOLVED PROGRAMS COMPUTING PART OF THE
+# VERDICT, while the PATH disclosure scoped the open PATH residual to `git` alone and `_lrg_py` states
+# that the inherited PATH is never consulted. The graded party owns PATH and runs the carrier itself, so a
+# `sed` shim that exits 0 and prints nothing blanked the stamp, switched the sealed cross-check off, and
+# let a two-field-edited `state.json` PASS (measured against the shipped script). Extraction now happens
+# with the same absolute, `-I`-isolated interpreter as every other field; the only PATH-resolved program
+# left in the decision path is `git` (the disclosed #3789 seam).
+# ⛔ THE LAST FULL-SHAPE LINE, NOT THE FIRST: the writer renders the lane-owned `state["worktree"]` value
+# VERBATIM on `- **Worktree:**` ABOVE the real stamp, so a newline in that value reproduces the anchored
+# shape and a first-match read would take the injected one. The writer emits exactly one real stamp, after
+# every lane-controlled field, so the LAST match is the real one.
+_sealed12 = ""
+try:
+    with open(sys.argv[4], encoding="utf-8", errors="replace") as _rf:
+        _rlines = _rf.read().splitlines()
+except Exception:
+    _rlines = []
+_seal_pat = re.compile(r"^- \*\*Base:\*\* .*head at write:\*\* `([0-9a-f]{12})`.*$")
+for _rl in _rlines:
+    _sm = _seal_pat.match(_rl)
+    if _sm:
+        _sealed12 = _sm.group(1)
+print("%s|%s|%s|%s|%s|%s|%s|%s|%s|%s" % (
     "1" if d.get("ok") is True else "0",
     "1" if d.get("head_moved_since_write") is True else "0",
     ",".join(str(r) for r in rules)[:400],
@@ -551,8 +656,10 @@ print("%s|%s|%s|%s|%s|%s|%s|%s" % (
     predates,
     skew,
     state_ok,
+    _sealed12,
+    rec[:12],
 ))'
-  if ! IFS='|' read -r ok stale rules rec_head live_head predates skew state_ok <<< "$("$py" -I -c "$_LRG_JSON_PY" "$out" "$wt/.worktree-report/state.json" "$commit_iso" 2>/dev/null)"; then
+  if ! IFS='|' read -r ok stale rules rec_head live_head predates skew state_ok sealed12 rec12 <<< "$("$py" -I -c "$_LRG_JSON_PY" "$out" "$wt/.worktree-report/state.json" "$commit_iso" "$wt/WORKTREE-REPORT.md" 2>/dev/null)"; then
     _lrg_emit 7 UNMEASURABLE "branch=$branch worktree=$wt tool=$tool reason=consumer-json-unusable check_rc=$rc head=$head"
     return 7
   fi
@@ -619,15 +726,15 @@ print("%s|%s|%s|%s|%s|%s|%s|%s" % (
   # lane-owned files instead of one, not tamper-proofing — see the disclosure above, which says so.
   # ⛔ THE LAST FULL-SHAPE LINE, NOT THE FIRST (round-11 review, P2). The writer renders the lane-owned
   # `state["worktree"]` value VERBATIM on `- **Worktree:**` ABOVE the real stamp, so a newline in that
-  # value reproduces the anchored shape and `head -1` would take the injected one. The writer emits
-  # exactly one real stamp, after every lane-controlled field, so `tail -1` reads it and the injected
-  # earlier line is ignored. (Not independently exploitable in a realistic flow — the worktree must
-  # really be at the merging head for the `live_head` arm, and an honest `write` stamps it — but the
-  # comment claimed an unambiguous position, and this is what makes that true.)
-  _sealed12="$(sed -n 's/^- \*\*Base:\*\* .*head at write:\*\* `\([0-9a-f]\{12\}\)`.*$/\1/p' "$wt/WORKTREE-REPORT.md" 2>/dev/null | tail -1)"
-  if [ -n "$_sealed12" ] && [ -n "$rec_head" ] && \
-     [ "$(printf '%s' "$rec_head" | cut -c1-12)" != "$_sealed12" ]; then
-    _lrg_emit 4 STALE "branch=$branch worktree=$wt report=$wt/WORKTREE-REPORT.md reason=state-disagrees-with-the-sealed-report sealed_head=$_sealed12 state_head_at_write=$rec_head merging_head=$head"
+  # value reproduces the anchored shape and a first-match read would take the injected one. The writer
+  # emits exactly one real stamp, after every lane-controlled field, so the LAST match is the real one —
+  # and BOTH the stamp and the state head's 12-hex prefix now come out of the pinned interpreter pass
+  # (fresh review, MED: `sed`/`tail`/`cut` were PATH-resolved programs computing this arm's verdict).
+  # (Not independently exploitable in a realistic flow — the worktree must really be at the merging head
+  # for the `live_head` arm, and an honest `write` stamps it — but the comment claimed an unambiguous
+  # position, and this is what makes that true.)
+  if [ -n "$sealed12" ] && [ -n "$rec12" ] && [ "$rec12" != "$sealed12" ]; then
+    _lrg_emit 4 STALE "branch=$branch worktree=$wt report=$wt/WORKTREE-REPORT.md reason=state-disagrees-with-the-sealed-report sealed_head=$sealed12 state_head_at_write=$rec_head merging_head=$head"
     return 4
   fi
   if [ -n "$rec_head" ] && [ "$rec_head" != "$head" ]; then
