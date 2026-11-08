@@ -8914,6 +8914,7 @@ PY
             echo "[refresh] TRANSIENT rc=$rc (attempt ${_att}/${REFRESH_RETRY_MAX_ATTEMPTS}) — retrying in ${_rd}s, on a SHORT BOUNDED BACKOFF INSIDE this cycle rather than at the next one (agent-infra#3584)" >> "$LOG"
             sleep "$_rd"
           done
+          : ) ; command sleep 3 ; (
           # <<< END NOT-A-CYCLE-NAP
         rm -rf "$O/.refresh.lock"
         if [ "$rc" -eq 3 ]; then
