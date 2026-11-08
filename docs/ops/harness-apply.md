@@ -184,10 +184,12 @@ removes another's file), but it is **not per-run**, and the header is what you c
   the visible farm path must be a **prefix** of the header's `dest=`, and the visible fragment after
   `is NOT the code ` **up to the next space** must be a prefix of the header's `ref=` (clip at that
   space: a whole clause reads `origin/main ships — …`, which is LONGER than the ref and is not a prefix
-  of it — without the clip the test rejects the very records it exists to accept). Measured: a 60-char farm keeps
-  `is NOT the code origin/main ships` whole; ~92 chars cuts it to `is NOT the code or`; ~120 cuts the
-  farm path itself — the visible part agrees in all three, which is the decidable test. When the clause
-  is cut, the header's `dest=`/`ref=` are authoritative; a `detail=` whose VISIBLE farm or ref
+  of it — without the clip the test rejects the very records it exists to accept). WHERE the clause
+  breaks cannot be stated as a number: it depends on the ARM SENTENCE's own length (a longer arm starts
+  the clause later in the field) and on the farm path, so the ONE property to rely on is that the
+  visible part is always a PREFIX of the whole — the clause is either entire or cut from the right,
+  never altered in the middle. Compare the visible prefix and nothing else; when the clause is cut, the
+  header's `dest=`/`ref=` are authoritative. A `detail=` whose VISIBLE farm or ref
   DISAGREES is a different pass's and is what this rule rejects. (The arm sentence leads `detail=`
   precisely so a truncation can never eat the diagnosis.)
 - the header's UTC must **not be later than** the record's `at=` (the artifact is published first,
