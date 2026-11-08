@@ -316,7 +316,7 @@ REC_FARM_ROWS="not-graded"; REC_FARM_NROWS="not-graded"
 FARM_ROWS_FILE="$STATE_DIR/harness-apply-farm-rows.txt"
 # ⛔ `REC_REMEDY` IS A FIELD FOR THE SAME REASON `preserved=` IS (review finding, #10114). Measured
 # on the deployed-drift refusal: its `detail=` is 706 characters and the word `Remedy:` begins at
-# offset 272 — so `cut -c1-240` DISCARDS THE ENTIRE REMEDY from the durable record. stderr still
+# offset 272 — so the 240-byte `detail=` bound DISCARDS THE ENTIRE REMEDY from the durable record. stderr still
 # showed it, which is exactly why it survived review: an operator reading a LIVE terminal sees the
 # remedy, and the operator reading the record (or fleet-health, or `--print-status`, or a lane on
 # the next day) sees a refusal that names no action. A refusal whose remedy is lost is a gate that
@@ -375,7 +375,7 @@ write_record() { # <ok> <rc>
         printf 'action=%s\n' "$REC_ACTION"
         printf 'lanes=none-signalled\n'
         printf 'fetch=%s\n' "${FETCH_STATE:-notfetched}"
-        printf 'detail=%s\n' "$(printf '%s' "$REC_DETAIL" | tr '\n' ' ' | cut -c1-240)"
+        printf 'detail=%s\n' "$(bounded "$(printf '%s' "$REC_DETAIL" | tr '\n' ' ')")"
     } >"$tmp" 2>/dev/null \
         || { rm -f "$tmp"; err "cannot stage the pass record in $STATE_DIR"; return 1; }
     mv -f "$tmp" "$RECORD" || { rm -f "$tmp"; err "cannot write the pass record at $RECORD"; return 1; }
@@ -384,6 +384,20 @@ write_record() { # <ok> <rc>
 }
 
 short() { [ -n "${1:-}" ] && printf '%s' "$1" | cut -c1-12; }
+
+# ⛔ A BOUNDED FIELD MUST STILL BE READABLE TEXT (review round 11, reproduced). `cut -c1-240` is
+# BYTE-oriented on GNU coreutils, so a multi-byte character straddling byte 240 is SPLIT and the record
+# then holds an invalid UTF-8 sequence — and `grep '^detail=' <record>`, which is how every key=value
+# reader (fleet-health, the suite's own assertions) reads the record, classifies the whole file as
+# BINARY and prints NOTHING for the pattern. Measured: the t24w record's detail= was cut inside the
+# em dash of "farm: DRIFT —", `grep` printed ``binary file matches`` on stderr and zero bytes on
+# stdout, so the one field that answers "what happened" read as ABSENT. So the truncation stops at the
+# last ASCII byte: every multi-byte UTF-8 sequence is composed of bytes >= 0x80, so a prefix that ends
+# on an ASCII byte cannot split one — no locale, iconv or multibyte-aware `substr` required.
+bounded() {
+    printf '%s' "$1" | LC_ALL=C awk -v n=240 '
+        { if (length($0) > n) { s = substr($0, 1, n); sub(/[^ -~]+$/, "", s); print s } else print }'
+}
 
 # ── --print-status: the record answers "did it succeed", and STALENESS is an alarm ─────────────
 # ⛔ AN ENABLED TIMER THAT STOPPED FIRING MUST NOT READ AS A HEALTHY NO-OP. A pass whose pin already
@@ -838,7 +852,7 @@ finish() { # <ok> <rc> <verdict-phrase>
 case "$FETCH_STATE" in
     ok) ;;
     *) REC_ACTION=cannot-verify-fetch
-       # Its `detail=` is ~250+ chars once the readings suffix is appended, so `cut -c1-240` drops the
+       # Its `detail=` is ~250+ chars once the readings suffix is appended, so the 240-byte bound drops the
        # tail; `remedy=` is a FIELD so the REMEDY survives regardless (review round 3, finding 5).
        # (`action=` is written on its own line at :278-279 and never depended on this — what the prose
        # bound was eating is the sentence a reader has to act on.)
@@ -1046,7 +1060,7 @@ if [ "$PASS_MODE" = sync ] && [ "$RELATION" = behind ] && [ "$DIRTY_N" != "unkno
         preserve_dirty "$PRESERVED_DIR" || {
             REC_ACTION=refused-dirty
             # ⛔ THE REDDEST REFUSAL MUST NOT RECORD `remedy=none` (review finding 6). This `detail=` is
-            # 474 chars, so `cut -c1-240` lands mid-sentence and discards the action clause — the same
+            # 474 chars, so the 240-byte bound lands mid-sentence and discards the action clause — the same
             # class of loss the `remedy=` field exists to prevent, left on the one path that most needs it.
             REC_REMEDY="recover the work from $PRESERVED_DIR (changes.patch + changes.index.patch), fix the cause, then re-run"
             # ⛔ NOT "nothing was touched". Preservation and restore are one pass over the list, so a
@@ -1445,14 +1459,24 @@ if [ "$FARM_CHECK_ON" = "1" ]; then
                     [ -n "$_fa" ] && FARM_EXPECT=$(( ${_fa:-0} + ${_fb:-0} + ${_fc:-0} ))
                 fi
                 unset _fx _fa _fb _fc
-                FARM_ROWS_RAW=0; PERSIST_BODY="$FARM_ROWS"
+                FARM_ROWS_RAW=0; PERSIST_BODY="$FARM_ROWS"; FARM_RAW_WHY=""
                 HDR_NOTE="n=$FARM_NROWS (the rows below are EXACTLY this run; farm_rows= in harness-apply.status is the currency indicator)"
                 if [ "$FARM_NROWS" -eq 0 ]; then
-                    FARM_ROWS_RAW=1; PERSIST_BODY="$FARM_OUT"
+                    FARM_ROWS_RAW=1; PERSIST_BODY="$FARM_OUT"; FARM_RAW_WHY=zero
                     HDR_NOTE="n=unparsed (NO row matched this pass's extractor — the instrument's RAW output follows verbatim; farm_n=unparsed says the count is UNKNOWN, not that nothing drifted)"
-                elif [ -n "$FARM_EXPECT" ] && [ "$FARM_NROWS" -lt "$FARM_EXPECT" ]; then
-                    FARM_ROWS_RAW=1; PERSIST_BODY="$FARM_OUT"
-                    HDR_NOTE="n=unparsed (this pass's extractor matched only $FARM_NROWS of the $FARM_EXPECT row(s) the instrument reports — the names it could not match are in the RAW output that follows verbatim; farm_n=unparsed)"
+                elif [ -z "$FARM_EXPECT" ]; then
+                    # ⛔ AN ABSENT OR UNREADABLE PROOF IS NOT PROOF (review round 11, reproduced). The
+                    # branch below used to read `[ -n "$FARM_EXPECT" ] && …`, so an instrument that
+                    # printed its drift rows but NO readable `DRIFT — <n> stale …` summary fell through
+                    # to the COMPLETE arm: header "EXACTLY this run", `farm_n=<matched>`, detail "N
+                    # row(s), every one named in <file>" — over an extraction nothing had checked. A
+                    # re-worded or pre-summary farmed copy is exactly the premise this whole arm exists
+                    # for, so "cannot prove it" must take the same door as "proved it wrong".
+                    FARM_ROWS_RAW=1; PERSIST_BODY="$FARM_OUT"; FARM_RAW_WHY=noproof
+                    HDR_NOTE="n=unparsed (no readable 'DRIFT — <n> stale …' summary, so this pass cannot PROVE its $FARM_NROWS extracted row(s) are all of them — the instrument's RAW output follows verbatim; farm_n=unparsed)"
+                elif [ "$FARM_NROWS" -ne "$FARM_EXPECT" ]; then
+                    FARM_ROWS_RAW=1; PERSIST_BODY="$FARM_OUT"; FARM_RAW_WHY=partial
+                    HDR_NOTE="n=unparsed (this pass's extractor matched $FARM_NROWS row(s), the instrument reports $FARM_EXPECT — the names it could not match are in the RAW output that follows verbatim; farm_n=unparsed)"
                 fi
                 # ⛔ EVERY ROW IS PERSISTED, NOT JUST THE EXCERPT (tortoise#10114 arm 2). The journal
                 # keeps a bounded human view, but the durable answer to "which files have drifted" is
@@ -1510,12 +1534,31 @@ if [ "$FARM_CHECK_ON" = "1" ]; then
                 # the value is free to carry the truth: a count when the extraction parsed, `unparsed`
                 # when it did not, `not-graded` when no grade was produced.
                 if [ "$FARM_ROWS_RAW" = 1 ]; then REC_FARM_NROWS=unparsed; else REC_FARM_NROWS="$FARM_NROWS"; fi
-                printf '%s\n' "$PERSIST_BODY" | head -12 | while IFS= read -r _row; do
+                # ⛔ THE JOURNAL EXCERPT IS THE EXTRACTED ROWS EVEN ON THE RAW ARM (review round 11).
+                # It used to `head -12` the PERSIST body, i.e. the instrument's RAW output — while the
+                # "… and N more" line below counted EXTRACTED rows, so a 34-line report whose drift rows
+                # came last printed twelve `ok`/header lines and then said "and 2 more row(s) — ALL 14
+                # are named in <file>". Two different populations in one journal block. The bounded
+                # human view is now always the rows THIS PASS matched; the file still carries everything
+                # (raw, when the extraction is unproven).
+                FARM_EXCERPT="$FARM_ROWS"
+                [ "$FARM_NROWS" -eq 0 ] && FARM_EXCERPT="$FARM_OUT"
+                printf '%s\n' "$FARM_EXCERPT" | head -12 | while IFS= read -r _row; do
                     log_line "farm:   $_row"
                 done
                 if [ "$FARM_ROWS_RAW" = 1 ]; then
                     if [ "$FARM_ROWS_OK" = 1 ]; then
-                        log_line "farm:   the extraction was NOT PROVEN complete — the instrument's RAW output above is published in $REC_FARM_ROWS"
+                        # ⛔ THE EXCERPT ABOVE IS NOT THE RAW OUTPUT WHENEVER ANYTHING WAS EXTRACTED
+                        # (VGATE round 12, measured on the noproof arm): the excerpt is now ALWAYS the
+                        # rows this pass matched, so "the RAW output above" pointed at matched rows —
+                        # the same two-populations-in-one-block defect this round removed from the
+                        # excerpt. It stays truthful only on the zero-extraction arm, where the
+                        # excerpt fallback really is the instrument's output.
+                        if [ "$FARM_NROWS" -eq 0 ]; then
+                            log_line "farm:   the extraction was NOT PROVEN complete — the instrument's RAW output above is published in $REC_FARM_ROWS"
+                        else
+                            log_line "farm:   the extraction was NOT PROVEN complete — the excerpt above is the rows THIS PASS matched; the instrument's RAW output is published in $REC_FARM_ROWS"
+                        fi
                     else
                         log_line "farm:   the extraction was NOT PROVEN complete, and the RAW output could not be persisted ($REC_FARM_ROWS) — only the line(s) excerpted above are in this run's output, and any past the 12-line excerpt are named nowhere"
                     fi
@@ -1529,22 +1572,41 @@ if [ "$FARM_CHECK_ON" = "1" ]; then
                     else
                         log_line "farm:   … and $((FARM_NROWS - 12)) more row(s) — the full list could NOT be persisted ($REC_FARM_ROWS), so rows 13..$FARM_NROWS are named NOWHERE durable"
                     fi
+                elif [ "$FARM_NROWS" -eq 0 ]; then
+                    # ⛔ AND WHEN NOTHING WAS EXTRACTED THE EXCERPT IS RAW LINES, so the elision is
+                    # counted in LINES (review round 11). `$FARM_NROWS - 12` is -12 here and never
+                    # fired, so a 30-line raw output truncated to 12 said nothing at all about the
+                    # other 18 lines and whether they were durable.
+                    _oline="$(printf '%s\n' "$FARM_OUT" | grep -c .)"
+                    if [ "$_oline" -gt 12 ]; then
+                        if [ "$FARM_ROWS_OK" = 1 ]; then
+                            log_line "farm:   … and $((_oline - 12)) more line(s) of the instrument's output — ALL $_oline are named in $REC_FARM_ROWS"
+                        else
+                            log_line "farm:   … and $((_oline - 12)) more line(s) of the instrument's output — the full output could NOT be persisted ($REC_FARM_ROWS), so lines 13..$_oline are named NOWHERE durable"
+                        fi
+                    fi
+                    unset _oline
                 fi
                 [ -n "$FARM_REMEDY" ] && printf '%s\n' "$FARM_REMEDY" | while IFS= read -r _row; do
                     log_line "farm:   $_row"
                 done
                 if [ "$FARM_ROWS_RAW" = 1 ] && [ "$FARM_ROWS_OK" = 1 ]; then
-                    if [ "$FARM_NROWS" -eq 0 ]; then
-                        FARM_ROW_SENTENCE="no row matched this pass's extractor, so the instrument's RAW output is published verbatim in $REC_FARM_ROWS"
-                    else
-                        FARM_ROW_SENTENCE="this pass's extractor matched only $FARM_NROWS of the $FARM_EXPECT row(s) the instrument reports, so its RAW output is published verbatim in $REC_FARM_ROWS"
-                    fi
+                    # ⛔ NO PATH IN THESE SENTENCES (review round 11). `detail=` is cut at 240, and the
+                    # prefix already spends ~106 chars on the farm + ref, so "… published verbatim in
+                    # <path>" was cut MID-FILENAME: key=value readers printed a path that does not
+                    # exist. `farm_rows=` in the same record carries the path, so the sentence names the
+                    # FIELD instead.
+                    case "$FARM_RAW_WHY" in
+                        noproof) FARM_ROW_SENTENCE="its extraction is unproven (no readable 'DRIFT' summary); RAW output published verbatim (see farm_rows=)" ;;
+                        partial) FARM_ROW_SENTENCE="matched only $FARM_NROWS of the $FARM_EXPECT row(s) the instrument reports; its RAW output is published verbatim (see farm_rows=)" ;;
+                        *)       FARM_ROW_SENTENCE="no row matched this pass's extractor; its RAW output is published verbatim (see farm_rows=)" ;;
+                    esac
                 elif [ "$FARM_ROWS_OK" = 1 ]; then
                     FARM_ROW_SENTENCE="${FARM_NROWS} row(s), every one named in $REC_FARM_ROWS"
                 elif [ "$FARM_ROWS_RAW" = 1 ]; then
-                    FARM_ROW_SENTENCE="the extraction was not proven complete and the instrument's RAW output could not be persisted ($REC_FARM_ROWS)"
+                    FARM_ROW_SENTENCE="the instrument's RAW output could not be persisted (farm_rows= names the failure, not a file)"
                 else
-                    FARM_ROW_SENTENCE="${FARM_NROWS} row(s) matched by the extractor, and the full list could not be persisted ($REC_FARM_ROWS)"
+                    FARM_ROW_SENTENCE="${FARM_NROWS} row(s) matched, and the full list could not be persisted (farm_rows= names the failure, not a file)"
                 fi
                 finish 0 24 "farm: DRIFT — $FARM_DEST is NOT the code $REF ships ($FARM_ROW_SENTENCE, with the instrument's own remedy — a stale copy, a layout move and an unsourced file do NOT all have the same fix)" ;;
             *)

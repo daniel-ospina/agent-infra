@@ -116,7 +116,7 @@ pin=ce987bb2c1de
 pin_tree=ce987bb2c1de
 drift=clean:current          <- the deployed-drift reading, `<state>:<token>` (`executes:<dir>` is the red one)
 farm_rows=none               <- `none` (farm matched), `not-graded` (NO USABLE grade), `unwritable` (rows write failed), or the FILE naming every drifting file
-farm_n=0                     <- rows the farm grade reported: a COUNT when graded (0 when the farm matched), `not-graded` when no grade was produced, `unparsed` when a RED grade's rows did not match this pass's extractor (the artifact's header reads `n=unparsed`; `0` would read as "nothing drifted")
+farm_n=0                     <- rows the farm grade reported: a COUNT when graded (0 when the farm matched), `not-graded` when no grade was produced, `unparsed` when a RED grade's completeness could not be PROVEN (rows did not match this pass's extractor, or no readable `DRIFT` summary was printed; the artifact's header reads `n=unparsed`; `0` would read as "nothing drifted")
 preserved=none
 remedy=none                  <- the ACTION for a refusal, never truncated (`detail=` is bounded at 240)
 action=none
@@ -192,15 +192,19 @@ and `at=` seconds later, which is exactly why rule 2 permits `header ≤ at=` in
 equality.)
 
 `farm_n=unparsed` on a RED (`action=farm-drift`, `rc=24`) record means this pass's **extractor** could
-not account for every row the instrument reported — the installed `check-farm-drift.sh` is a copy
-whose row vocabulary this pass does not know (a farm that lags the ref), so it matched none or only
-some of them. The proof used is the instrument's own summary (`DRIFT — <n> stale …, <n>
-declared-but-absent, <n> unsourced`): when the extracted rows are fewer than that, the extraction is
-not complete and the artifact carries the instrument's **RAW output** verbatim, with `n=unparsed` in
-its header. The DRIFT is still red and still recorded. The names are wherever the instrument printed
-them — in that file whenever it published, and in this run's own journal excerpt (at most the first
-12 lines) only when the publish failed — so the record says "published verbatim" and never "every
-one named".
+not PROVE it accounted for every row the instrument reported — the installed `check-farm-drift.sh` is a
+copy whose row vocabulary this pass does not know (a farm that lags the ref), so it matched none of
+them, only some of them, or the proof itself was absent. The proof used is the instrument's own summary
+(`DRIFT — <n> stale …, <n> declared-but-absent, <n> unsourced`), and it cuts BOTH ways: the extraction
+is unproven when the extracted rows are **fewer** than that sum, when they are **more** (a widened
+vocabulary that names a healthy `ok`/`LOCAL`/`SYMLINK` row), and when **no readable summary was printed
+at all** — an unprovable extraction is not a complete one, so "cannot prove it" takes the same door as
+"proved it wrong". Unproven, the artifact carries the instrument's **RAW output** verbatim, with
+`n=unparsed` in its header. The DRIFT is still red and still recorded. The names are wherever the
+instrument printed them — in that file whenever it published, and in this run's own journal excerpt (at
+most the first 12 lines: the rows this pass MATCHED when it matched any, the instrument's own output
+when it matched none) only when the publish failed — so the record says "published verbatim" and never
+"every one named".
 
 `farm_rows=unwritable` means the rows write failed **while the record write still succeeded** — the
 drift is still red, `farm_n` still carries the count it had (or `unparsed` when the extraction was
@@ -208,6 +212,16 @@ drift is still red, `farm_n` still carries the count it had (or `unparsed` when 
 written by this pass**, so the journal says so in as many words and the rows past the 12-line excerpt
 are named nowhere durable. (A state dir that is unwritable for the
 record too leaves the PREVIOUS record in place: staleness, not a field, is that signal.)
+
+⛔ **`detail=` IS BOUNDED, SO THE SENTENCES IN IT NAME `farm_rows=` RATHER THAN A PATH.** The field is
+cut at 240 bytes, and the drift refusal's own prefix (the farm path plus the ref) already spends most
+of that: a raw-arm sentence ending "… published verbatim in <path>" was cut MID-FILENAME, so a reader
+of `detail=` (fleet-health, `--print-status`) got a path that does not exist. The raw and
+not-persisted sentences therefore say "see `farm_rows=`", which is the field that carries the path
+(or `unwritable`) in the same record. The bound also truncates at a **byte** and used to land inside a
+multi-byte character — leaving one invalid UTF-8 sequence that made `grep '^detail='` classify the WHOLE
+record as binary and print nothing, so the truncation now stops at the last ASCII byte (a boundary a
+multi-byte sequence cannot straddle).
 
 ⛔ `deployed` EXISTS BECAUSE THE CHECKOUT IS NOT THE DEPLOYMENT. A pin-per-commit cell
 never moves its checkout, so `behind` measured there would be permanently non-zero and
