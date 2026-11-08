@@ -155,14 +155,19 @@ _nudge_holder_live() {      # rc 0 = a process that IS this script owns the lock
   return 0
 }
 if [ -d "$LOCK" ]; then
+  # ⛔ AN UNDATEABLE LOCK IS HELD, NOT RECLAIMED (#3795 review cycle 3). `ls -di` is what lets the
+  # reclaim prove it moved the lock it JUDGED; without that inode there is no such proof, so the
+  # fail-closed answer is the one `auto-rail.sh` already gives for a lock it cannot date: HELD.
   _lock_ino=$(ls -di "$LOCK" 2>/dev/null | awk '{print $1}')
-  _known=0   # 1 = we can bound this lock by AGE (a holder, or a pid that is not ours)
+  if [ -z "$_lock_ino" ]; then
+    printf '%s CADENCE-NUDGE lock-skip holder=%s — lock exists but cannot be identified; treating it as held\n' \
+      "$(date '+%m-%d %H:%M:%S')" "none" >> "$LOG"
+    exit 0
+  fi
   if _nudge_holder_live; then
-    _known=1
     _bound=$NUDGE_LOCK_CEILING_MIN
     _why="a nudge is still running (pid $_hpid)"
   elif [ "$_hpid_alive" = "1" ]; then
-    _known=1
     _bound=$NUDGE_LOCK_GRACE_MIN
     _why="pid $_hpid is alive but is not this script (recycled or foreign)"
   else
@@ -179,12 +184,23 @@ if [ -d "$LOCK" ]; then
   fi
   # ⛔ RECLAIM BY RENAME (rule 6). Only one contender can move this directory away; a contender that
   # judged it stale and then lost the race finds no `$LOCK` and exits quietly below.
+  # The destination is OURS (`$$`), so a leftover from a run killed mid-reclaim is removable without
+  # touching anyone else's -- and it MUST be removed first, or `mv` would move the lock INSIDE it
+  # (`mv a b` with `b` an existing directory nests instead of renaming) and the lock would never be
+  # released.
+  rm -rf "$LOCK.reclaim.$$" 2>/dev/null
   mv "$LOCK" "$LOCK.reclaim.$$" 2>/dev/null || exit 0
   # ...and the directory we actually MOVED must be the one we JUDGED. A contender that decided while
   # the previous holder was still finishing can otherwise move the NEW, live lock.
   _moved_ino=$(ls -di "$LOCK.reclaim.$$" 2>/dev/null | awk '{print $1}')
-  if [ -n "$_lock_ino" ] && [ "$_moved_ino" != "$_lock_ino" ]; then
-    mv "$LOCK.reclaim.$$" "$LOCK" 2>/dev/null
+  if [ "$_moved_ino" != "$_lock_ino" ]; then
+    # We moved a newer lock than the one we judged. Put it back ONLY if nothing has taken its place;
+    # if something has, that newer holder owns the path and ours is garbage.
+    if [ -e "$LOCK" ]; then
+      rm -rf "$LOCK.reclaim.$$" 2>/dev/null
+    else
+      mv "$LOCK.reclaim.$$" "$LOCK" 2>/dev/null
+    fi
     printf '%s CADENCE-NUDGE lock-skip holder=%s — reclaimed lock was not the one judged stale; put it back\n' \
       "$(date '+%m-%d %H:%M:%S')" "${_hpid:-none}" >> "$LOG"
     exit 0
