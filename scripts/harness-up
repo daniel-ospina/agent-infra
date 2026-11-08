@@ -122,7 +122,8 @@ set -uo pipefail
 # ⛔ THE SELF PATH COUNTS ONLY WHEN IT NAMES THIS FILE — see `lib/cell-home.sh` §CONSUMERS.
 _SELF="${BASH_SOURCE[0]:-}"; [ -f "$_SELF" ] || _SELF=""     # under `bash -s` $0 is literally `bash` -> `.`
 SELF_PATH=""
-if [ -n "$_SELF" ]; then SELF_PATH="$(cd "$(dirname "$_SELF")" && pwd)"; SELF="$SELF_PATH/$(basename "$_SELF")"; else SELF=""; fi
+if [ -n "$_SELF" ]; then SELF_PATH="$(cd "$(dirname "$_SELF")" && pwd)"; SELF="$SELF_PATH/$(basename "$_SELF")";
+else SELF="${0:-harness-up}"; fi   # a piped start keeps a COHERENT name in the warnings below
 
 log_line()  { printf '%s\n' "$*"; }
 warn() { printf 'harness-up: %s\n' "$*" >&2; }

@@ -573,11 +573,14 @@ if [ "$HOME_DURABLE" = "$HOME_LEGACY" ]; then
   warn_line "  the derived durable home IS the legacy home — refusing to grade a box against itself; set CELL_HOME to the durable home (agent-infra#3453)"
   exit 3
 fi
-if [ ! -d "$HOME_DURABLE" ]; then
-  warn_line "  the durable home $HOME_DURABLE does not exist — CANNOT MEASURE (nothing was changed)"
+# ⛔ THE DERIVATION GUARD COMES FIRST: it must be able to refuse a home that is not the units' account
+# home BEFORE anything is measured against it (a privileged invoker's `/root` may not even be readable
+# from here, and "does not exist" would hide the actionable refusal behind a confusing one).
+if ! check_derivation; then
   exit 3
 fi
-if ! check_derivation; then
+if [ ! -d "$HOME_DURABLE" ]; then
+  warn_line "  the durable home $HOME_DURABLE does not exist — CANNOT MEASURE (nothing was changed)"
   exit 3
 fi
 
