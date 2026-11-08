@@ -5178,9 +5178,11 @@ fi
 #     evidence that a reader can check the claim. Prose rots silently: the comment block
 #     added above the persist site moved BOTH body-presence predicates by +9 and the numbers
 #     beside them stayed put — so the sentence went on *reading* correct while pointing at
-#     prose (MEASURED, one commit per pair: the same two predicate cites read `:6625` / `:6770`
-#     at `dc7e3ae99`, `:6634` / `:6779` at `921109de2` and `:6639` / `:6796` at `17551325e` as
-#     comment blocks were added above them — at this head they are `:6642` / `:6816`). One
+#     prose (MEASURED, one commit per pair: the two body-presence PREDICATES sat at
+#     `:6625` / `:6770` at `dc7e3ae99`, `:6634` / `:6779` at `921109de2` and `:6639` / `:6796` at
+#     `17551325e` as comment blocks were added above them, while the CITES beside them still read
+#     `:6625` / `:6770` at all three — that divergence IS the rot this paragraph describes — and at
+#     this head the predicates are `:6642` / `:6816`). One
 #     lane's response was to delete the numbers — which removes the rot but also removes the
 #     reader's target. Both intents are kept here: the number stays, and it is CHECKED.
 #     Every head number printed FOR A BODY-PRESENCE PREDICATE is TAGGED `CITE-CHECK:`; the tagged
@@ -9127,6 +9129,12 @@ rm -f .gitattributes
 #      review, P1: `~/.config/git/attributes` steering `merge=union` produced rc 0 + tree-equal while
 #      every ambient scan came back empty). The recorder's HOME here is the suite's FAKE home, which
 #      is exactly where a user-level attribute file lives.
+#    ⛔ `XDG_CONFIG_HOME=` ON THE VECTOR BELOW IS PART OF ITS PREMISE, NOT TIDINESS — the same
+#    measured class as M38. git reads that DEFAULT user-level attributes file only when this
+#    variable is UNSET; a runner exports it (`worker-terminal.test.sh:36`), so without the pin the
+#    fixture is written where no git process looks and this vector silently degenerates into a
+#    duplicate of 20i3's plain-conflict case. The control on the next line has always pinned it;
+#    the vector did not.
 mkdir -p "$F_HOME/.config/git"
 printf 'u.txt merge=union\n' > "$F_HOME/.config/git/attributes"
 _un_g=0
@@ -9139,7 +9147,7 @@ else
 fi
 EHIA=425160; rm -f "$(Q2 $EHIA)"
 run_record_delta $EHIA "$DG_UN_H" "delta:$DG_UN_L..$DG_UN_H+comment:42516001" \
-    STUB_BASE_SHA="$DG_UN_B" STUB_EVIDENCE_AT="2025-08-15T00:00:00Z"
+    XDG_CONFIG_HOME= STUB_BASE_SHA="$DG_UN_B" STUB_EVIDENCE_AT="2025-08-15T00:00:00Z"
 assert_eq "$RECORD_RC" "3" "20i6 a GLOBAL attributes file does NOT steer the recorder's oracle (rc 3)"
 # ⛔ THE ANCHOR IS THE ATTRIBUTION when a cover is named (the no-cover sentence belongs to the other
 #    branch): a recorder whose oracle HAD been steered would classify merge-only, anchor on A and
