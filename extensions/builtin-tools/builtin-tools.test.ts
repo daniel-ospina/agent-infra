@@ -7577,7 +7577,15 @@ test("#1508 — the registered tool_result handler turns a failed child into isE
   // actually reaches the caller: `finalizeExecutedToolCall` rebuilds the result from a field
   // allow-list, so an `isError` on the object `execute()` returned is dropped (see the hook's own
   // note) — the `tool_result` handler is what makes the model see the error.
-  deepEqual(h({ toolName: "task", isError: false, details: { status: "died-before-first-message", childMessagesSent: 0, childState: "died-before-first-message", childExited: true } }), { isError: true }, "a child that died before its first message is a FAILURE, never an empty success");
+  //
+  // ⛔ THE ROW CARRIES `exitCode: 0` (review round 6, P3). It used to omit `exitCode` entirely,
+  // which is a shape production does not emit: the death payload is composed as
+  // `doResolve({..., details: { model, provider, exitCode: code }}, ...)` (index.ts:4722), and the
+  // PR's own E2E death IS exit 0. Without it the row never exercised the interaction that matters —
+  // that a `status` in FAILED_TASK_STATUS wins over a zero exit — so a refactor adding an early
+  // `exitCode === 0 → return undefined` would have left this row AND the `{ exitCode: 0 } → undefined`
+  // row green while production stopped flagging the silent death.
+  deepEqual(h({ toolName: "task", isError: false, details: { status: "died-before-first-message", childMessagesSent: 0, childState: "died-before-first-message", childExited: true, exitCode: 0 } }), { isError: true }, "a child that died before its first message is a FAILURE, never an empty success — even at exit 0");
   deepEqual(h({ toolName: "task", isError: false, details: { failoverHopSpawnFailed: true } }), { isError: true }, "a hop leg that never produced a result is a failure");
   equal(h({ toolName: "task", isError: false, details: { exitCode: null } }), undefined, "a null exit is a settle (composeTaskResult's own okExit contract)");
   equal(h({ toolName: "task", isError: false, details: { exitCode: 0 } }), undefined, "exit 0 is a settle");
@@ -9181,7 +9189,21 @@ testAsync("#1208 (E2E): an EMPTY-TURN LOOP child is the zero-message death, not 
     equal(ld.childMessagesSent, 0, "a completed turn with no content is NOT a message");
     equal(ld.childState, "died-before-first-message", "so the empty-turn loop is the slow-start death class");
     equal((looped as any).isError, true, "…and it stops a parent's default handling instead of reading as a quiet finish");
-    ok(!String((looped as any).content?.[0]?.text).includes("exited with code 0\n"), "the bare composer sentence is not the whole result");
+    // ⛔ ORDERING, not substring absence (review round 6, P3). The previous assertion here was
+    // `!text.includes("exited with code 0\n")`, and it could NEVER fail: the composer text is
+    // `.join("\n").trim()`-ed before it is appended, so no composed sentence this arm can carry
+    // ever ends in a newline. Reverting the prepend back to a REPLACEMENT would leave
+    // `"Sub-agent exited with code 0"` — no trailing newline — and the assertion would still pass,
+    // so it did not test the property its message named. The property that IS the fix is that the
+    // header PRECEDES the composer text: present, and ahead of it.
+    const deathText = String((looped as any).content?.[0]?.text);
+    const headerAt = deathText.indexOf("died before its first message");
+    const composerAt = deathText.indexOf("Sub-agent exited with code 0");
+    ok(headerAt >= 0, "the death header is present in the text the parent reads");
+    ok(
+      composerAt === -1 || headerAt < composerAt,
+      `the header PRECEDES the composer sentence — the composer text is kept BELOW it, never replaced by it (header@${headerAt}, composer@${composerAt})`,
+    );
     ok(
       String((looped as any).content?.[0]?.text).includes("no content-bearing turn"),
       "the header states the MEASURED fact (no content-bearing turn), not a count the arm does not have",
