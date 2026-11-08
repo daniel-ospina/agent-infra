@@ -376,10 +376,34 @@ assert_contains "$out" "could not be read" "…and names the unverified list as 
 rm -f "$HUB/extensions/stable-tool" "$FARMWT/stable-tool"
 # Negative control for the class: a hub that merely HAS a worktree, which the farm does
 # not point into, is healthy — otherwise this token would red every hub with a worktree.
-ln -sfn "$HUB/extensions/builtin-tools" "$FARMWT/builtin-tools"
+# ⛔ THE WORKTREE MUST EXIST HERE. It is asserted below, because an earlier version of
+# this control ran AFTER the only worktree had been removed and its record pruned, so it
+# silently reduced to "a farm link into the hub's own extensions → PASS" (#1877's skip)
+# and the over-match mutant it names left both rows GREEN — a control labelled for a
+# shape it never built (review finding at head 37410bfd, P2).
+WTCTL="$HUB/wt-ctl-649"
+git -C "$HUB" worktree add -q "$WTCTL" -b wt/ctl-649
+assert_contains "$(git -C "$HUB" worktree list --porcelain)" "worktree $WTCTL" \
+  "fixture: a worktree EXISTS at this control, so it tests the shape it names"
+# The farm entry here is ANOTHER checkout's — deliberately NOT the hub's own extensions,
+# which the detector skips earlier (#1877's class). That makes the row ATTRIBUTABLE to
+# the over-match mutant ("report every farm entry whenever a worktree exists"): with a
+# worktree present and a link the hub does not own, that mutant reports it and this row
+# reds. A hub-own link would stay silently GREEN, which is exactly the vacuity the
+# review found at this head.
+mkdir -p "$FIX/wt-ctl-foreign/extensions/other"
+ln -sfn "$FIX/wt-ctl-foreign/extensions/other" "$FARMWT/builtin-tools"
 out="$(PI_EXTENSIONS_DIR="$FARMWT" bash "$CHECK" --repo "$HUB" 2>&1)" && rc=0 || rc=$?
 assert_eq "$rc" 0 "a hub WITH a worktree that the farm does not point into still exits 0"
 assert_not_contains "$out" "farm_worktree" "…and never reports the token"
+# …and the SAME row with the hub's own extensions as the target: #1877's skip must win
+# over this new class, so the two never double-name one link.
+ln -sfn "$HUB/extensions/builtin-tools" "$FARMWT/builtin-tools"
+out="$(PI_EXTENSIONS_DIR="$FARMWT" bash "$CHECK" --repo "$HUB" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 0 "a farm link into the hub's OWN extensions is still PASS beside a worktree"
+rm -rf "$WTCTL" "$FIX/wt-ctl-foreign"
+git -C "$HUB" worktree prune >/dev/null 2>&1 || true
+git -C "$HUB" branch -D wt/ctl-649 >/dev/null 2>&1 || true
 # The DOMINANT fleet layout — `.worktrees/<name>` — must fire too. Asserted by substring,
 # not by exact token: git reports the containing `.worktrees/` as an untracked directory
 # (the #1919 filter matches the worktree itself, not its parent), so the hub is also dirty
