@@ -772,12 +772,20 @@ ck "every nap path calls stg_nap_mark (${_nap_n} nap_mark sites for ${_loop_n} s
 # the fence contains NO subshell opener and NO closer (it is strictly INTERIOR to the subshell), and the
 # nearest preceding code line is the opener itself. The pair is what makes "not a cycle nap" a
 # statement about the code rather than a label.
+# ⛔ A CLOSER IS ANY LINE THAT BEGINS WITH `)` — NOT TWO SPELLINGS OF IT (fresh-context review, P1,
+# measured). The previous pair anchored on `)^$` and `)&$`, so a closer written `) ;` matched NEITHER,
+# and `_nap_excl_sleeps` only counted lines that BEGIN with `sleep`, so a nap on the same line was
+# invisible too. Measured: inserting the single line `          ) ; sleep 300 ; (` immediately before
+# the END marker closes the subshell INSIDE the fence and runs a real 300 s nap on the CYCLE path —
+# with every arm here byte-identically green (openers=0 closers=0, sleeps=1). That is the round-2 P2
+# defect reintroduced through a spelling the counters could not see, so both are now spelling-agnostic:
+# any line starting with `)` is a closer, and a nap counts anywhere it appears as a COMMAND on a line.
 _nap_beg_n="$(grep -cE '^[[:space:]]*# >>> BEGIN NOT-A-CYCLE-NAP' <<<"$_loop_nap_region")"
 _nap_end_n="$(grep -cE '^[[:space:]]*# <<< END NOT-A-CYCLE-NAP' <<<"$_loop_nap_region")"
-_nap_excl_sleeps="$(grep -cE '^[[:space:]]*(fork_free_sleep|sleep) ' <<<"$_nap_excl_body")"
+_nap_excl_sleeps="$(grep -cE '(^|[;&|])[[:space:]]*(fork_free_sleep|sleep)[[:space:]]' <<<"$_nap_excl_body")"
 _nap_excl_marks="$(grep -cE '^[[:space:]]*stg_nap_mark([[:space:]]|$)' <<<"$_nap_excl_body")"
-_nap_excl_openers="$(grep -cE '^[[:space:]]*\(([[:space:]]|$)' <<<"$_nap_excl_body")"
-_nap_excl_closers=$(( $(grep -cE '^[[:space:]]*\)[[:space:]]*$' <<<"$_nap_excl_body") + $(grep -cE '([[:space:];]|^)\)[[:space:]]*&[[:space:]]*$' <<<"$_nap_excl_body") )) 
+_nap_excl_openers="$(grep -cE '^[[:space:]]*\(' <<<"$_nap_excl_body")"
+_nap_excl_closers="$(grep -cE '^[[:space:]]*\)' <<<"$_nap_excl_body")"
 _nap_prev_code="$(awk '
   /^[[:space:]]*# >>> BEGIN NOT-A-CYCLE-NAP/ { exit }
   /^[[:space:]]*$/ { next }

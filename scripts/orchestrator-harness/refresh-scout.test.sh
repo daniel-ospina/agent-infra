@@ -1862,9 +1862,13 @@ if [ -s "$T/refreshblock.sh" ] && grep -q 'refresh-candidates.sh' "$T/refreshblo
   # ⛔ `REFRESH_RETRY_BACKOFF_S=0` IS LOAD-BEARING HERE, NOT A SHORTCUT (agent-infra#3584): the shipped
   # default is a 30 s then 60 s in-cycle backoff, and this arm drives the block twice — 180 s of real
   # `sleep` for a property that has nothing to do with the delay. The delay itself, its doubling, the
-  # attempt cap and the total-sleep budget are graded in (b1)-(b11) below — with REAL delays in
-  # (b7)/(b8)/(b9)/(b10), not a stubbed clock: (b9) sleeps 10 s + 20 s on purpose, because a clock stub
-  # is what let the doubling go ungraded in the first place (review round 2, P3).
+  # attempt cap and the total-sleep budget are graded in (b1)-(b9),(b11) plus (b3b) below — with REAL
+  # delays in (b7)/(b8)/(b9), not a stubbed clock: (b9) sleeps 10 s + 20 s on purpose, because a clock
+  # stub is what let the doubling go ungraded in the first place (review round 2, P3). ⛔ THE ARM LABELS
+  # ARE NOT A CONTIGUOUS RANGE (fresh-context review, P2): there is no (b5) and no (b10) — this comment
+  # used to cite "(b1)-(b11) … (b7)/(b8)/(b9)/(b10)" and a grep of the suite yields exactly
+  # (b1) (b2) (b3) (b3b) (b4) (b6) (b7) (b8) (b9) (b11), so the citation named a fourth real-delay arm
+  # that does not exist. Cite what is there.
   BL2="$T/block2"; mkdir -p "$BL2"; : > "$BL2/candidates.txt"
   printf '#!/bin/bash\nprintf "x" >> "%s/invoked"\nrefresh_record_write() { :; }\nexit 1\n' "$BL2" > "$BL2/refresh-candidates.sh"
   O="$BL2" LOG="$BL2/log" REFRESH_RETRY_BACKOFF_S=0 bash "$T/refreshblock.sh" >/dev/null 2>&1
@@ -1943,6 +1947,29 @@ if [ -s "$T/refreshblock.sh" ] && grep -q 'refresh-candidates.sh' "$T/refreshblo
     || bad "orch-loop: a 3000s budget survived against a 60s stale-lock guard — $(grep 'TRANSIENT' "$BLR11/log" 2>/dev/null | tail -1)"
   [ "$n11" = "1" ] && ok "orch-loop: …and the over-guard budget makes ONE attempt, so nothing is slept" \
                     || bad "orch-loop: the over-guard budget still made $n11 attempt(s)"
+  # (b3c) A LEADING-ZERO GUARD IS NOT OCTAL (fresh-context review, P0 — measured). This block is the
+  # file's FIRST octal-sensitive arithmetic use of REFRESH_STALE_LOCK_MIN, and that knob's only
+  # validation is the digit-only `case` at `orch-loop.sh:2571-2572`, which ACCEPTS `08`/`09` because
+  # both are all-digits. A bare `$(( 08 * 60 ))` aborts with `08: value too great for base`, and the
+  # measured consequence is not cosmetic: the pass was NEVER invoked, `.refresh.lock` was left on disk
+  # (the `rm -rf` sits downstream of the abort), the block still exited 0, and in the controller's own
+  # `while` shape that error aborts the enclosing loop — the cycle loop exits after ONE cycle at rc=0,
+  # so KeepAlive does not restart it. `10#` is the fix; this arm is the regression case it lacked.
+  # It distinguishes on the INVOKE COUNT: with `08` a correct block retries normally (3 attempts at
+  # BACKOFF=0), a pre-fix block makes ZERO. Instant (the retry budget is never reached at 240 s).
+  BLR12="$T/retry12"; mkdir -p "$BLR12"; : > "$BLR12/candidates.txt"
+  printf '#!/bin/bash\nprintf "x" >> "%s/invoked"\nrefresh_record_write() { :; }\nexit 1\n' "$BLR12" > "$BLR12/refresh-candidates.sh"
+  O="$BLR12" LOG="$BLR12/log" REFRESH_STALE_LOCK_MIN=08 REFRESH_RETRY_BACKOFF_S=0 \
+    REFRESH_RETRY_MAX_ATTEMPTS=3 REFRESH_RETRY_BUDGET_S=300 bash "$T/refreshblock.sh" >"$BLR12/out" 2>&1
+  n12="$(wc -c < "$BLR12/invoked" 2>/dev/null | tr -d ' ')"
+  [ "$n12" = "3" ] && ok "orch-loop: a leading-zero REFRESH_STALE_LOCK_MIN (08) does not abort the pass (3 attempts, as at 8)" \
+                    || bad "orch-loop: REFRESH_STALE_LOCK_MIN=08 gave ${n12:-0} attempt(s), expected 3 — the guard is being read as octal"
+  # The arm's stderr is captured (NOT discarded) so this assertion can actually fire: an arith aborts
+  # to stderr, and a `/dev/null` here made it vacuous — the first version of this arm kept this line
+  # GREEN against a mutated block, which is why the capture is load-bearing rather than tidy.
+  ! grep -q 'value too great for base' "$BLR12/out" "$BLR12/log" 2>/dev/null \
+    && ok "orch-loop: …and no octal arithmetic error was raised" \
+    || bad "orch-loop: the leading-zero guard raised an octal arithmetic error — $(grep -h 'value too great for base' "$BLR12/out" "$BLR12/log" 2>/dev/null | tail -1)"
   # (b4) A PERMANENT REFUSAL IS NEVER RETRIED IN-CYCLE. rc=3 and rc=78 are verdicts about the BOX, not
   # the network; retrying them is the #1736 defect. (Arm (a) grades the across-cycle half.)
   BLR4="$T/retry4"; mkdir -p "$BLR4"; : > "$BLR4/candidates.txt"

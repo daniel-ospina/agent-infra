@@ -1008,7 +1008,7 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     overrides: ["REFRESH_RETRY_MAX_DELAY_S=120"],
     axis: "gate",
     guardedBy:
-      "scripts/orchestrator-harness/refresh-scout.test.sh §7 (b7) — the backoff is set ABOVE the cap and the arm asserts the LOGGED delay is the cap, so `[ \"$_rd\" -gt \"$REFRESH_RETRY_MAX_DELAY_S\" ]` is exercised; (b3)'s budget refusal reads the same clamped delay",
+      "scripts/orchestrator-harness/refresh-scout.test.sh §7 (b7) — the backoff is set ABOVE the cap and the arm asserts the LOGGED delay is the cap, so `[ \"$_rd\" -gt \"$REFRESH_RETRY_MAX_DELAY_S\" ]` is exercised, and (b7) is the ONLY arm that exercises it: (b3) sets only REFRESH_RETRY_BACKOFF_S=30 and REFRESH_RETRY_BUDGET_S=1, so REFRESH_RETRY_MAX_DELAY_S is the default 120, `_rd` stays 30, the clamp never fires there, and the refusal it logs prints the UNCLAMPED delay (fresh-context review, P2 — measured)",
     note: "per-delay cap on the doubled backoff, so raising REFRESH_RETRY_BACKOFF_S or the attempt cap cannot make one sleep unbounded. The TOTAL bound is REFRESH_RETRY_BUDGET_S, not this — this one only stops a single delay running away.",
   },
   {

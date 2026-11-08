@@ -8854,9 +8854,20 @@ PY
       # This is the knob's SECOND guard and each class is still ATTRIBUTABLE: junk and leading zeros are
       # the `case` above, a numeric value at/past the guard is this test. (The other three knobs have
       # exactly one, per the note below.)
-      _budget_cap=$(( ${REFRESH_STALE_LOCK_MIN:-20} * 60 / 2 ))
+      # ⛔ THE BASE IS EXPLICIT (`10#`), AND THAT IS LOAD-BEARING RATHER THAN TIDY (fresh-context
+      # review, P0 — measured). This is the file's FIRST octal-sensitive arithmetic use of
+      # REFRESH_STALE_LOCK_MIN: its only validation is the digit-only `case` at `:2571-2572`, which
+      # ACCEPTS `08`/`09` because both are all-digits. Every earlier use is decimal-safe by accident of
+      # its operator (`[ -ge ]`, `find -mmin +08`), so nothing broke before this block. Measured on the
+      # shipped block: `REFRESH_STALE_LOCK_MIN=08` made the arithmetic expansion abort with `08: value
+      # too great for base (error token is "08")`, the pass was NEVER invoked, `.refresh.lock` was left
+      # on disk (the `rm -rf` is downstream of the abort) and the block still exited 0 — and inside the
+      # controller's own `while` shape that arithmetic error aborts the enclosing loop, so the cycle
+      # loop exits after ONE cycle with rc=0 (KeepAlive does not restart it). `10#` is the fix rather
+      # than tightening `:2572`, because `08` plainly means eight minutes, not twenty.
+      _budget_cap=$(( 10#${REFRESH_STALE_LOCK_MIN:-20} * 60 / 2 ))
       [ "$_budget_cap" -gt 300 ] && _budget_cap=300
-      if [ "$REFRESH_RETRY_BUDGET_S" -ge "$(( ${REFRESH_STALE_LOCK_MIN:-20} * 60 ))" ]; then
+      if [ "$REFRESH_RETRY_BUDGET_S" -ge "$(( 10#${REFRESH_STALE_LOCK_MIN:-20} * 60 ))" ]; then
         REFRESH_RETRY_BUDGET_S="$_budget_cap"
       fi
       # ⛔ THE RETRY BACKOFF IS DECLARED IN-BAND AS NOT-A-CYCLE-NAP, and the markers are load-bearing
