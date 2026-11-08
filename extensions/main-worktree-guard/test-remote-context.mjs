@@ -718,6 +718,18 @@ if (typeof stripTypeScriptTypes !== "function" ||
       local: "git pull --ff-only && make test",
       marker: "blocked" },
     { id: "B4", guard: "#709 piped payload",
+      // ⛔ THIS PIN CANNOT DISCRIMINATE THE PRE-FIX MUTANT, and that is MEASURED, not assumed.
+      // Under `no remote boundary` (mask = identity) the pre-fix guard ALLOWS this remote form
+      // too, so `expectRed` cannot hold it. The reason is structural, not a stale anchor: the
+      // pipe and its `bash -s` target live INSIDE the `sh -c` script, so there is no top-level
+      // pipe and no LOCAL stage head for the walk to gate, and the payload is an ARGUMENT to
+      // `printf` rather than a command in command position. Nothing the mask does or does not do
+      // changes that answer, so pinning it here would report evidence the mutant does not produce.
+      // What this pin IS is COVERAGE, and it is worth keeping: a fully-REMOTE pipeline must not be
+      // false-blocked. The #709 arm's DISCRIMINATING pins are B16/B16r (a top-level pipe into a
+      // LOCAL shell, still REFUSED), B19 (`|&`) and the B21 stage-head allow-list — which is where
+      // that guard actually belongs, because there the pipe runs HERE.
+      preFixDiscriminating: false,
       remote: `cmux vm exec cell-a -- sh -c 'printf "git checkout -- a.txt" | bash -s'`,
       local: `printf 'git checkout -- a.txt' | bash -s`,
       marker: "#709" },
@@ -946,7 +958,12 @@ if (typeof stripTypeScriptTypes !== "function" ||
             "export function maskRemoteExecPayloads(command) {",
             "export function maskRemoteExecPayloads(command) {\n  return String(command ?? \"\"); // MUTANT: pre-fix identity",
           ),
-          expectRed: PINNED.filter((x) => !x.both).map((x) => x.id),
+          // ⛔ `preFixDiscriminating: false` on a pin is a CLAIM WITH A REASON, never a waiver:
+          // it says this pin's answer cannot change when the mask is reverted (see B4), so
+          // holding it here would assert evidence the mutant never produced. A pin may opt out
+          // ONLY for that structural reason; `M0` still proves every pin GREEN on the unmutated
+          // module, so a pin excluded here is still a live assertion (#3774).
+          expectRed: PINNED.filter((x) => !x.both && x.preFixDiscriminating !== false).map((x) => x.id),
           check: (r) => blocked(r),                  // RED means "refused again"
           probe: (p) => p.remote,
         },
