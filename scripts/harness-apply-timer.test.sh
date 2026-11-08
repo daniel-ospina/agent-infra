@@ -2737,6 +2737,36 @@ assert_contains "$(grep '^farm_n=' "$T/t24bp/state/harness-apply.status" 2>/dev/
 assert_absent "$(grep '^farm_n=' "$T/t24bp/state/harness-apply.status" 2>/dev/null || true)" "not-graded" \
     "T24 control: and a prose mention of one label word is not a summary this pass cannot count"
 
+# ⛔ AND EACH CLASS TOKEN IN THE ALLOW-LIST IS PINNED ON ITS OWN (review round 37, P3 — measured: only
+# `STALE` was reachable at rc=0, so `UNSOURCED`, `NOT-EXECUTABLE` and `DECLARED-BUT-ABSENT` could each be
+# DELETED from the allow-list with the suite fully green, 636 passed / 0 failed). The consequence is not a
+# wrong verdict — rc stays 24 — it is a WRONG DIAGNOSIS: a missing entry drops the row into `FARM_UNC0`,
+# so `remedy=` blames the checker's vocabulary ("a farmed copy whose vocabulary has moved on cannot be
+# graded here") for a class this pass plainly knows, and the journal adds "an unclassifiable <TOKEN> —
+# this pass cannot count or grade it". That is the false-reason over-block review round 34 filed for
+# `STALE`; these rows are its three siblings. One run per token, because the scan exits on the first hit.
+# Mutant that reds a token's two rows: delete that token from the allow-list (pass:1659-1660).
+mk_origin t24c4; mk_clone t24c4
+REPO_P="$CLONE"; MODE_P=sync
+for _tok in 'STALE' 'UNSOURCED' 'NOT-EXECUTABLE' 'DECLARED-BUT-ABSENT'; do
+    _safe="$(printf '%s' "$_tok" | tr -c 'A-Za-z0-9' '_')"
+    mkdir -p "$T/t24c4/$_safe/home/.pi/agent/scripts"
+    cat >"$T/t24c4/$_safe/class-token.sh" <<FARM
+#!/usr/bin/env bash
+printf 'check-farm-drift: OK — 5/5 sourced file(s) match the source at origin/main (sync).\\n' >&2
+printf '%-46s | %-12s | %-12s | %s\\n' 'handmade.py' aaaa11112222 bbbb33334444 '$_tok' >&2
+exit 0
+FARM
+    chmod +x "$T/t24c4/$_safe/class-token.sh"
+    OUT="$(HARNESS_APPLY_FARM_CHECKER="$T/t24c4/$_safe/class-token.sh" run_pass "$T/t24c4/$_safe" 2>&1)"; RC=$?
+    assert_eq "$RC" "24" "T24 control: a KNOWN class row ($_tok) at rc=0 still refuses the match (RED 24)"
+    assert_absent "$OUT" "unclassifiable $_tok" \
+        "T24 control: and $_tok is CLASSIFIED, never reported as an unclassifiable row"
+    assert_absent "$(grep '^remedy=' "$T/t24c4/$_safe/state/harness-apply.status" 2>/dev/null || true)" "vocabulary has moved on" \
+        "T24 control: and the remedy never blames the checker's vocabulary for $_tok"
+done
+unset _tok _safe
+
 # ⛔ A PREFIX-LESS SUMMARY WITH MATCHING ROWS IS THE COMPLETE ARM (review round 31, measured: the reviewer
 # proved end-to-end against the REAL instrument that stripping `PROG: DRIFT — ` left the pass recording
 # farm_n=unparsed with the header claiming no parsable summary — an over-block with a false reason). A
@@ -3477,7 +3507,7 @@ assert_contains "$(grep '^detail=' <<<"$REC24AL")" "no row matched this pass's e
 # MEASURED on the `cmux` cell, 2026-11-06: this pass resolves CELL_HOME from $HOME (pass:221) and the
 # pin records from it, then invoked the materialiser with NONE of them. The materialiser resolves the
 # same names from ITS defaults — `CELL_HOME="${CELL_HOME:-/tmp/cell-home}"` (cloud-cell-supervisor.sh:139),
-# `HARNESS_PIN_DIR`/`HARNESS_PIN_FILE` from it (pass:233-234) — so the pin advanced into /tmp, the re-read
+# `HARNESS_PIN_DIR`/`HARNESS_PIN_FILE` from it (cloud-cell-supervisor.sh:1774-1775) — so the pin advanced into /tmp, the re-read
 # below saw no move, and the pass recorded rc=25 "nothing moved this box": rc=25 is raised BEFORE
 # predicate 4, so the farm grade could never be emitted on any box in that state. The suite had no
 # fixture for this because every materialiser stub here reads the seam the PASS sets explicitly.
