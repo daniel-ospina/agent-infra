@@ -3269,6 +3269,19 @@ test("#1339d: loop wiring — the verdict is re-validated against evidence acros
   const killIdx = src.indexOf("killTreeAndEscalate();", settledIdx);
   ok(settledIdx > -1 && settledIdx < guardIdx, "the evidence re-check follows the post-await settled re-check (the same await window, asked about evidence)");
   ok(guardIdx < killIdx, "the evidence re-check precedes the tree kill — a stale verdict must never be executed");
+  // #1339 CYCLE-3 P2 — the SAME class that produced the cycle-2 P1, one layer
+  // out: `supersedingEvidence` was pinned but the two lines that hand it LIVE
+  // scope-gate state were not, so replacing them with the constants
+  // `false`/`0` restored the P1 (a `session_end`/`tool_start` inside the awaited
+  // window stops superseding a `no-progress` kill → finished work discarded as a
+  // partial-result kill) and left all 373 tests green. A typecheck would not
+  // catch it either (`false`/`0` satisfy `boolean`/`number`), and this repo has
+  // no root tsconfig so that job self-skips. The channels are INERT without this
+  // wiring, so the wiring is pinned.
+  ok(
+    src.includes("sessionEnded: hbCtx.state.sessionEnded,") && src.includes("toolsInFlight: hbCtx.state.toolsInFlight,"),
+    "the loop hands the guard LIVE scope-gate state, not constants — the session-end / tool-in-flight channels are inert without this wiring (cycle-3 review)",
+  );
   // The exemption is a WALL-CLOCK policy cap, not a liveness inference.
   ok(
     /decision\.reason === "max-dispatch"\s*\n\s*\? null\s*\n\s*: supersedingEvidence\(/.test(src),
