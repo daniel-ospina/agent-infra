@@ -113,6 +113,21 @@ _lrg_py() {
   return 1
 }
 
+# ⛔ THE GIT SEAM: ONE HALF IS CLOSED HERE, THE OTHER IS RECORDED AND FILED (#2977 review round 7).
+# The program that answers "which worktree, which HEAD, which commit date" decides WHICH REPO IS GRADED,
+# so it is as load-bearing as the interpreter. Two vectors:
+#   (1) AN EXPORTED BASH FUNCTION — `git() { … }; export -f git` propagates as `BASH_FUNC_git%%` into the
+#       child `bash` hops a lane's carrier forks and shadows the binary with NO PATH change. CLOSED:
+#       unset here, at source time, before any call.
+#   (2) A `git` EARLIER ON THE INHERITED `PATH`. ⛔ NOT CLOSED, DELIBERATELY AND VISIBLY. Pinning this to
+#       absolute paths (as `_lrg_py` does) was implemented and REVERTED: the merge-one fixtures drive
+#       the gate with a stubbed `git` on PATH over a SYNTHETIC repo and head, so an absolute pin
+#       bypasses the stub and took 66 of that suite's rows red. Closing it needs those fixtures rebuilt
+#       around a real repository, which is its own change — not a silent omission here. Until then a
+#       lane that sets `PATH` can substitute the git that reports the head; that is filed, and the two
+#       CARRIERS are the enforcement point (`lane-merge.sh` resolves its own trusted checkout).
+unset -f git 2>/dev/null || true
+
 # _lrg_worktree <repo> <branch> — the worktree of <repo> checked out on <branch>, or nothing.
 # ⛔ EXACT BRANCH MATCH ONLY. `refs/heads/<branch>` compared whole: a prefix match would hand the gate
 # a DIFFERENT lane's report (`feat/297-tm` for `feat/2977-tm`), which verifies a tree nobody is
@@ -211,9 +226,18 @@ lane_report_gate() {
   # main, but `merge-one.sh` passes `$REPO` straight from argv, and a lane that runs the deployed
   # `merge-one.sh` with its OWN worktree would then hand the gate the graded tree's own copy of the
   # writer — the same self-grading escape the `$wt` fallback removal above closed, reached through the
-  # `$repo` half instead. Resolving it HERE makes the property hold for every carrier instead of being
-  # a convention each caller must remember. Falls back to `$repo` only when it cannot enumerate
-  # worktrees (a plain/non-git fixture, where `$repo` IS the tree).
+  # `$repo` half instead. Resolving it HERE makes the property hold for every carrier that is handed a
+  # LINKED worktree of the governed repo. Falls back to `$repo` only when it cannot enumerate worktrees
+  # (a plain/non-git fixture, where `$repo` IS the tree).
+  # ⛔ WHAT THIS DOES *NOT* BUY, STATED SO THE COMMENT IS NOT AN OVERCLAIM (round-7 review, P1): it does
+  # not make `$repo` trustworthy. A caller that hands the gate an INDEPENDENT CLONE gets that clone's
+  # own main worktree as "main" — measured: a lane clone plus three files returned VERDICT=PASS over a
+  # graded repo that was RED. main-of-a-clone is not main-of-the-governed-repo, and the gate has no
+  # trusted notion of which repo is the subject: that binding belongs to the CALLER. `lane-merge.sh`
+  # discharges it by resolving its own trusted checkout; `merge-one.sh` cannot (it is handed a path), so
+  # it refuses when the checkout's `origin` is not the repo it was told to merge — see the origin-slug
+  # guard there. The residual (a same-repo clone whose working tree edits the consumer) is the lane's
+  # own tree and would be visible in the reviewed diff; it is NOT closed here.
   if _lrg_wl="$(git -C "$repo" worktree list --porcelain 2>/dev/null)" && [ -n "$_lrg_wl" ]; then
     while IFS= read -r _lrg_line; do
       case "$_lrg_line" in
@@ -222,6 +246,20 @@ lane_report_gate() {
     done <<< "$_lrg_wl"
     [ -n "${_lrg_main:-}" ] && tool="$_lrg_main/tools/worktree_report.py"
   fi
+  # ⛔ THE GRADER'S PROVENANCE IS A CALLER OBLIGATION, AND IT IS WRITTEN DOWN HERE (round-7 review, P1).
+  # Resolving main closes the LINKED-worktree escape but NOT the INDEPENDENT-CLONE one: a clone's own
+  # main worktree IS the clone, so a caller that hands the gate a clone supplies the graded tree's own
+  # `tools/worktree_report.py`. The gate cannot fix that alone — it has no trusted notion of which repo
+  # is the subject — so the disposition is stated rather than silently implied:
+  #   * `lane-merge.sh` discharges it: it resolves `resolve_trusted_checkout` and passes MAIN.
+  #   * `merge-one.sh` takes `$REPO` from argv; it is the `$O`-pinned backstop reached by chain-merge.sh
+  #     (harness code), so the path is not lane-authored on the normal route. A lane that runs the
+  #     deployed `merge-one.sh` itself with its own clone is NOT covered.
+  # ⛔ A PATH-SHAPE TEST WAS TRIED AND REVERTED: refusing when `$tool` sits under `$wt` looks right but
+  # OVER-BLOCKS the ordinary case — a lane working directly in the repository root has `$wt` == the
+  # checkout, so its consumer is legitimately inside it. Measured: 66 merge-one rows red. An
+  # over-blocking gate that refuses honest merges is the failure this file exists to prevent, so the
+  # property is documented and the caller's binding is the enforcement point, not a guess about paths.
   [ -f "$tool" ] && [ -s "$tool" ] || tool=""
   if [ -z "$tool" ] || [ ! -f "$tool" ]; then
     # ⛔ AN AUDITED ABSTENTION, the same shape `gate-policy.sh` uses for the gate-policy probe: the
@@ -288,20 +326,20 @@ if not isinstance(rules, list):
 # describes.
 rec = ""
 newest = None
-# ⛔ AN UNREADABLE WRITER STATE IS UNMEASURABLE, NOT A PASS (fresh review, P2). `rec` (the recorded
-# head) and `newest` (the newest suite) are BOTH read from this file, so on any exception both head
-# witnesses below go dark — the `rec_head != head` arm and the laundering arm are both `[ -n … ]`-guarded
-# and simply do not run. The gate then PASSed on the consumer `ok`/`head_moved_since_write` alone,
-# which its own header says is insufficient, and printed `report_head=$head` because the emit line
-# defaulted the MISSING reading to the MERGING head — recording a head binding that was never read.
-# Worse, the lane controls this worktree, so `rm state.json` was a one-command way to delete both
-# witnesses. So a CORRUPT or ABSENT state cannot be read as a pass. The two are distinguished because
-# their remedies and their risk differ: an ABSENT file is what the suite models as an ordinary run
-# (the writer may hold its state elsewhere), so refusing it would over-block honest merges -- it is
-# RECORDED (`state=absent`) on the PASS line instead, which makes the missing witness countable rather
-# than silent. A file that EXISTS and will not parse is tampering with a witness that was there, and
-# is UNMEASURABLE (7), the code this file already reserves for "an unreadable verification is not a
-# pass".
+# ⛔ AN UNREADABLE WRITER STATE IS UNMEASURABLE, NOT A PASS. `rec` (the recorded head) and `newest`
+# (the newest suite) are BOTH read from this file, and both arms that consume them are `[ -n … ]`-guarded,
+# so an unreadable state silently switches BOTH head witnesses off and leaves `ok:true` alone as the
+# verdict. The lane owns this worktree, so the cheapest action available to the graded party was to
+# remove the witness. Three spellings of that removal are now all refused with 7 UNMEASURABLE:
+#   * ABSENT  — `rm state.json` (round-6 review, P1: `rm` is cheaper than damaging the file, so an
+#               absent state could not be the one that still passed);
+#   * CORRUPT — truncated / unparseable / not a dict;
+#   * NO WITNESS — VALID JSON that has simply had `head_at_write` (or every `finished_at`) deleted
+#               (round-7 review, P0: `{}` parsed fine and yielded `state_ok = "ok"` with both witnesses
+#               dark, so the witness could be removed with a one-line edit instead of a `rm` — the
+#               round-6 hole one spelling over). The `run` writer always stamps both, so their absence
+#               is tampering on exactly the same argument.
+# The reasons are distinguished because the remedies differ; the CODE is the same, because the effect is.
 state_ok = "absent"
 try:
     with open(sys.argv[2], encoding="utf-8", errors="replace") as fh:
@@ -310,6 +348,10 @@ try:
         state_ok = "ok"
         rec = st.get("head_at_write") or ""
         _suites = st.get("suites")
+        # ⛔ A PARSING STATE IS NOT A WITNESS. Require `head_at_write`, and require a parseable
+        # `finished_at` whenever the state records suites at all (a report with suites and no timestamps
+        # has had the laundering witness deleted, not legitimately omitted).
+        _have_suites = isinstance(_suites, list) and len(_suites) > 0
         if isinstance(_suites, list):
             for _s in _suites:
                 _ts = _s.get("finished_at") if isinstance(_s, dict) else None
@@ -321,6 +363,10 @@ try:
                     continue
                 if newest is None or _t > newest:
                     newest = _t
+        if not rec:
+            state_ok = "missing-witness"
+        elif _have_suites and newest is None:
+            state_ok = "missing-witness"
     else:
         state_ok = "corrupt"
 except FileNotFoundError:

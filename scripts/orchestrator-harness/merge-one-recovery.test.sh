@@ -61,6 +61,27 @@ ln -sf "$BASH_BIN" "$STUBS/bash"
 # python3 real: step 3 parses `gh pr checks --json` THROUGH it, and an `exit 0` stub makes json.load
 # never run, the gate read EMPTY, and the worker wait the whole 30 x 30 s loop.
 p="$(command -v python3 2>/dev/null)" && ln -sf "$p" "$STUBS/python3"
+# ⛔ `git` IS A FILE HERE, NOT AN EXPORTED FUNCTION (round-7 review, P0). The gate clears the git
+# FUNCTION namespace (`unset -f git`) because `git() {…}; export -f git` reaches every child `bash` hop
+# a lane's carrier forks and shadows the binary with no PATH change. This fixture used exactly that
+# vector to simulate git, so it now ships a PATH stub instead — same case logic, and an env-reading
+# SCRIPT is simpler than the exported body the comment below explains. The FUNCTION vector stays closed
+# and this suite keeps driving the gate's real arms.
+cat > "$STUBS/git" <<'SH'
+#!/bin/bash
+case "${FAKE_GIT_MODE:-}" in
+  report-gate)
+    case "$*" in
+      *"rev-parse --git-dir"*) exit 0 ;;
+      *"worktree list"*) printf 'worktree %s\nHEAD %s\nbranch refs/heads/%s\n\n' \
+                           "${FAKE_GIT_WT}" "${FAKE_GIT_HEAD}" "${FAKE_GIT_BRANCH:-fix/x}"; exit 0 ;;
+      *) printf 'worktree %s\nHEAD %s\nbranch refs/heads/%s\n\n' \
+           "${FAKE_GIT_WT}" "${FAKE_GIT_HEAD}" "${FAKE_GIT_BRANCH:-fix/x}"; exit 0 ;;
+    esac ;;
+  *) exit 0 ;;
+esac
+SH
+chmod +x "$STUBS/git"
 # openssl real: the worker VERIFIES the marker's HMAC, so a matching-digest stub would make the
 # fixture unfaithful — it would pass whether or not the worker really verified anything.
 p="$(command -v openssl 2>/dev/null)" && ln -sf "$p" "$STUBS/openssl"
@@ -94,6 +115,26 @@ printf 'rail ran pr=%s\n' "${1:-}" >> "$RAIL_SPY"
 exit 0
 SH
   chmod +x "$MRG/repo/scripts/admin-merge.sh"
+  # ⛔ THE GIT SIMULATOR GOES IN `$O/gh-limit`, NOT ON THE INHERITED PATH (round-7 review, P0). The gate
+  # clears the git FUNCTION namespace (`unset -f git`) because `git() {…}; export -f git` shadows the
+  # binary in every child `bash` hop a lane's carrier forks — this fixture used exactly that vector. A
+  # file in `$STUBS` is NOT enough: `merge-one.sh` prepends `/opt/homebrew/bin:/usr/local/bin:$PATH`
+  # itself (line 123), so a real `/usr/local/bin/git` shadows it. `$O/gh-limit` is prepended by that
+  # same script (line 129) and is therefore the one PATH slot ABOVE the real git that the fixture owns.
+  mkdir -p "$MRG/o/gh-limit"
+  cat > "$MRG/o/gh-limit/git" <<'SH'
+#!/bin/bash
+case "${FAKE_GIT_MODE:-}" in
+  report-gate)
+    case "$*" in
+      *"rev-parse --git-dir"*) exit 0 ;;
+      *) printf 'worktree %s\nHEAD %s\nbranch refs/heads/%s\n\n' \
+           "${FAKE_GIT_WT}" "${FAKE_GIT_HEAD}" "${FAKE_GIT_BRANCH:-fix/x}"; exit 0 ;;
+    esac ;;
+  *) exit 0 ;;
+esac
+SH
+  chmod +x "$MRG/o/gh-limit/git"
 }
 
 marker_line() { # marker_line <head> <verdict> — the SIGNED line record-review.sh posts into the body
@@ -237,7 +278,7 @@ run_merge() {
         *) return 0 ;;
       esac
     }
-    export -f pi gh git
+    export -f pi gh
     env PATH="$STUBS" HOME="$MRG/home" O="$MRG/o" \
         RAIL_SPY="$MRG/rail-ran" MERGE_SPY="$MRG/merged" CC_RETRY_SECS="${CC_RETRY_SECS:-0}" \
         AI_REVIEW_GATE_KEY="$TEST_GATE_KEY" \

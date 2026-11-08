@@ -1965,6 +1965,13 @@ off macOS (it renders a launchd plist) — the portability that matters is `orch
    the lane worktree for the PR's branch, runs the repo's own consumer (`tools/worktree_report.py check
    --json`), and refuses on **absent, invalid, red, or head-moved** evidence. `lane-merge.sh` runs it
    before the paid chain; `merge-one.sh` runs it before the rail short-circuit and the reviewer.
+   ⛔ **SCOPE — WHICH PATHS ARE COVERED, STATED PLAINLY (round-7 review, P1).** The two carriers above
+   are the LANE's paths. The unattended actuator (`auto-rail.sh`) merges by repo slug through
+   `admin-merge.sh` and does **not** consult this gate — it has no local checkout to resolve and no
+   branch in scope, so wiring it is a feature, not a call. Until that is done the guarantee is "a lane
+   cannot merge unverified work", **not** "no merge can land unverified": a lane that dies mid-run and
+   whose checks go green can still be landed by the actuator. That gap is tracked rather than implied —
+   do not read this section as claiming the actuator is covered.
    ⛔ It is deliberately STRICTER than the consumer's `$?`: `check` EXITS 0 on a moved head (a recorded
    decision whose docstring hands the judgement to "the consumer"), and two review rounds on 2026-11-07
    were re-run because a report described a tree one commit behind the head being merged.

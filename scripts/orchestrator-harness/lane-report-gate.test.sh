@@ -181,6 +181,25 @@ drive 7 "UNMEASURABLE: a writer state that exists but will not parse (both head 
 case "$LAST_OUT" in *reason=writer-state-corrupt*) ok "…and it names the corrupt state instead of returning a verdict about it" ;; *) bad "corrupt-state reason: $LAST_OUT" ;; esac
 case "$LAST_OUT" in *VERDICT=PASS*) bad "a corrupt writer state was read as a PASS" ;; *) ok "…and it is not reported as PASS" ;; esac
 _restore_state
+# ── 1d. A STATE THAT PARSES IS NOT A WITNESS (round-7 review, P0) ──────────────────
+# ⛔ `{}` IS VALID JSON AND A DICT, so it used to be `state_ok = "ok"` — with `head_at_write` and every
+# `finished_at` simply DELETED, both head witnesses went dark and the gate PASSED. That is the round-6
+# hole one spelling over: `rm` and truncation were refused, a one-line JSON edit was accepted. Each of
+# the three deletions below must be refused, because the `run` writer always stamps both.
+printf '{}\n' > "$WT/.worktree-report/state.json"
+drive 7 "UNMEASURABLE: a state that parses but carries NO witness keys ({}) is not evidence" STUB_OK=1 STUB_RC=0 STUB_STALE=0
+case "$LAST_OUT" in *reason=writer-state-missing-witness*) ok "…named writer-state-missing-witness, not a verdict about the report" ;; *) bad "empty-object state reason: $LAST_OUT" ;; esac
+case "$LAST_OUT" in *VERDICT=PASS*) bad "an EMPTY state object was read as a PASS" ;; *) ok "…and it is not reported as PASS" ;; esac
+printf '{"version":1,"branch":"feat/2977-tm","suites":[{"n":1,"command":"x","exit":0,"finished_at":"2099-01-01T00:00:00Z"}]}\n' > "$WT/.worktree-report/state.json"
+drive 7 "UNMEASURABLE: `head_at_write` deleted (the recorded-head witness is gone)" STUB_OK=1 STUB_RC=0 STUB_STALE=0
+case "$LAST_OUT" in *reason=writer-state-missing-witness*) ok "…named missing-witness for the deleted head binding" ;; *) bad "deleted head_at_write reason: $LAST_OUT" ;; esac
+printf '{"version":1,"head_at_write":"%s","branch":"feat/2977-tm","suites":[{"n":1,"command":"x","exit":0}]}\n' "$WT_HEAD" > "$WT/.worktree-report/state.json"
+drive 7 "UNMEASURABLE: every suite `finished_at` deleted (the laundering witness is gone)" STUB_OK=1 STUB_RC=0 STUB_STALE=0
+case "$LAST_OUT" in *reason=writer-state-missing-witness*) ok "…named missing-witness for the deleted timestamps" ;; *) bad "deleted finished_at reason: $LAST_OUT" ;; esac
+# CONTROL: the honest shape (both witnesses present) still PASSES, so the three rows above are not just
+# asserting that every state is refused.
+_restore_state
+drive 0 "CONTROL: a state carrying both witnesses still PASSES (the missing-witness rows are not a blanket refusal)" STUB_OK=1 STUB_RC=0 STUB_STALE=0
 
 # ── 2. THE MEASURED DEFECT: rc 0 + a moved head is NOT a pass ────────────────────────────────────
 mkdir -p "$WT/.worktree-report"
@@ -300,6 +319,62 @@ if [ "$rc" = 3 ]; then ok "…and an UNTRACKED json.py in the calling directory 
 out="$(env STUB_OK=0 STUB_RC=3 STUB_FAILING=1 GIT_DIR=/nonexistent/git/dir bash "$GATE" --check "$REPO" "feat/2977-tm" "$WT_HEAD" 2>&1)"; rc=$?
 if [ "$rc" = 3 ]; then ok "…and an ambient GIT_DIR cannot retarget which repo is graded (rc=$rc)"; else bad "GIT_DIR retargeted the enumeration: expected rc=3, got rc=$rc :: $out"; fi
 
+# ── 2e. THE GIT SEAM: THE FUNCTION VECTOR IS CLOSED, THE PATH VECTOR IS DISCLOSED (round-7 review, P0)
+# ⛔ THE PROGRAM THAT ANSWERS worktree/HEAD/commit-date DECIDES WHICH REPO IS GRADED, so it is as
+# load-bearing as the interpreter. Two vectors, and they are handled DIFFERENTLY on purpose:
+#   (1) an exported bash function (`git() {…}; export -f git` → `BASH_FUNC_git%%` in the child hops a
+#       lane's carrier forks) shadows the binary with NO PATH change. Closed by `unset -f git` at source
+#       time — asserted behaviourally below.
+#   (2) a `git` earlier on the inherited PATH. NOT closed: pinning to absolute paths was implemented and
+#       REVERTED because the merge-one fixtures drive this gate with a stubbed `git` over a synthetic
+#       repo/head, so the pin bypassed the stub and took 66 rows red. That residual is FILED and
+#       DISCLOSED in the gate — asserted below — because a silent omission is the failure mode here.
+GSHIM="$TMP/gitshim"; mkdir -p "$GSHIM"
+printf '#!/bin/sh\nexit 1\n' > "$GSHIM/git"; chmod +x "$GSHIM/git"
+out="$(bash -c 'git() { return 1; }; export -f git; STUB_OK=0 STUB_RC=3 STUB_FAILING=1 exec bash "$1" --check "$2" feat/2977-tm "$3"' _ "$GATE" "$REPO" "$WT_HEAD" 2>&1)"; rc=$?
+if [ "$rc" = 3 ]; then ok "an EXPORTED bash function named git cannot replace the binary (rc=$rc) — the function namespace is cleared at source time"; else bad "an exported git function replaced the binary: expected rc=3, got rc=$rc :: $out"; fi
+# NEGATIVE CONTROL: the same exported function DOES shadow an unreserved git, so the row above can fail.
+_cf="$(bash -c 'git() { echo HIJACKED; }; export -f git; exec bash -c "git --version"' 2>&1 | head -1)"
+if [ "$_cf" = "HIJACKED" ]; then ok "CONTROL an exported git function DOES shadow a bare git — so the row above can fail"; else bad "CONTROL the exported-function shadow is inert ($_cf), so the row above cannot fail"; fi
+if grep -q 'unset -f git' "$GATE"; then ok "…and the gate clears the git function namespace explicitly (unset -f git)"; else bad "the gate no longer clears exported git functions"; fi
+# ⛔ THE DISCLOSURE PIN. The PATH residual must stay written down, with the reason its fix was reverted, or
+# the next reader will assume the seam class is fully closed (the file claims it for python).
+if grep -q 'A `git` EARLIER ON THE INHERITED `PATH`' "$GATE" && grep -q 'REVERTED' "$GATE" && grep -q '66 of that suite' "$GATE"; then
+  ok "…and the PATH-shim residual is DISCLOSED with the measured over-block that ruled out the obvious fix"
+else
+  bad "the git PATH-shim residual is no longer disclosed in the gate — an open P0 would read as closed"
+fi
+
+# ── 2f. A GATE-ENABLE KNOB IS THE INERT GATE, AND NEITHER SUITE CAUGHT IT (round-7 review, P2) ─
+# ⛔ THE NESTING ROW ABOVE READS THE LINE *BEFORE* THE ANCHOR, so a guard opened immediately AFTER the
+# anchor is invisible to it — and that is byte-for-byte the instance its own comment names. Measured:
+# wrapping the block in `if [ -n "${LANE_REPORT_ENFORCE:-}" ]; then … fi` left THIS suite at 82/82 AND
+# lane-merge.test.sh at 115/115, while lane-merge.sh logged "lane-report: verified at head …" — a claim
+# of a verification that never ran. The assertions below pin what such a wrapper breaks.
+# The block ends at the `launch_chain` INVOCATION (`launch_chain()` is DEFINED far earlier, so an
+# `^launch_chain` range end matched nothing and the span came back empty — a range that yields nothing
+# is not a pass, it is a silent skip).
+_lm_anchor="$(grep -nE '^_lrg_rc=0; _lrg_out=""' "$LANE_MERGE" | head -1 | cut -d: -f1)"
+_lm_block="$([ -n "$_lm_anchor" ] && sed -n "${_lm_anchor},/^launch_chain /p" "$LANE_MERGE")"
+if [ -z "$_lm_block" ]; then bad "the lane-merge.sh gate-block span could not be extracted (anchor=${_lm_anchor:-none}) — the rows below would be vacuous"; fi
+_knob="$(printf '%s\n' "$_lm_block" | grep -nE '^[[:space:]]*(if|elif|while)[[:space:]].*:-' | head -1)"
+if [ -n "$_knob" ]; then
+  bad "lane-merge.sh's gate block is guarded by an opt-in default ($_knob) — unset means the gate never runs"
+else
+  ok "lane-merge.sh's gate block has no opt-in enable knob — an unset variable cannot switch it off"
+fi
+_n_reset="$(printf '%s\n' "$_lm_block" | grep -cE '_lrg_rc=0')"
+if [ "$_n_reset" = 1 ]; then
+  ok "…and _lrg_rc=0 appears exactly once (at the anchor) — a later reset cannot launder a refusal"
+else
+  bad "the gate block contains $_n_reset _lrg_rc=0 assignments — one of them can mask the verdict"
+fi
+if printf '%s\n' "$_lm_block" | grep -E 'verified at head' | grep -qE '^[[:space:]]*0\)'; then
+  ok "…and 'verified at head' is emitted only from the 0) arm — the log cannot claim a verdict it did not get"
+else
+  bad "the 'verified at head' line is not confined to the 0) arm of the verdict case"
+fi
+
 # The structural half: the resolver must not consult PATH at all. Kept deliberately BLUNT (any
 # `command -v` in the function body fails) — a precise pattern here is how the previous version of this
 # row matched nothing and stayed green over a mutant.
@@ -367,13 +442,26 @@ case "$out" in
   *reason=recorded-suites-did-not-pass*) ok "…and the verdict is the MAIN worktree consumer's (its rule set), not the lane's liar" ;;
   *) bad "the verdict did not come from the main worktree's consumer: $out" ;;
 esac
-# ⛔ AND A LANE CANNOT SUPPLY THE MISSING VERIFIER EITHER (fresh review, P1). A non-participant repo
-# normally gets 7 (report present, no writer). A lane that ADDS tools/worktree_report.py to its own
-# branch must not convert that into a PASS — the `$wt` fallback that allowed it is gone.
-mv "$REPO/tools/worktree_report.py" "$TMP/stub2.bak"
-drive 7 "a repo with NO writer abstains even when the lane worktree carries one (the merged tree cannot supply its grader)" STUB_OK=1 STUB_RC=0
-mv "$TMP/stub2.bak" "$REPO/tools/worktree_report.py"
-rm -f "$WT/tools/worktree_report.py"
+# ⛔ THE INDEPENDENT CLONE IS *NOT* CLOSED HERE — AND THAT IS DISCLOSED, NOT HIDDEN (round-7 review, P1).
+# A clone's own main worktree IS the clone, so a caller that hands the gate a clone supplies the graded
+# tree's own consumer. The gate cannot fix it (it has no trusted notion of which repo is the subject),
+# so the disposition is: `lane-merge.sh` resolves a trusted checkout and passes MAIN; `merge-one.sh`
+# takes `$REPO` from argv and is therefore the caller obligation. ⛔ A PATH-SHAPE FIX WAS TRIED AND
+# REVERTED — refusing when the consumer sits under `$wt` over-blocked the ORDINARY case (a lane working
+# in the repo root legitimately has its consumer inside `$wt`): measured, 66 merge-one rows went red.
+# This row pins the DISCLOSURE, so the residual cannot be dropped by deleting the comment that records it.
+if grep -q 'INDEPENDENT-CLONE' "$GATE" \
+   && grep -q 'merge-one.sh. takes .\$REPO. from argv' "$GATE" \
+   && grep -q 'OVERS-BLOCKS\|OVER-BLOCKS' "$GATE"; then
+  ok "the consumer-provenance residual (an independent clone is NOT covered) is DISCLOSED in the gate, with the over-block that a path check causes"
+else
+  bad "the gate no longer discloses the independent-clone residual (or the over-block that rules out a path-shape fix) — the limitation would go unrecorded"
+fi
+if grep -q 'SCOPE — WHICH PATHS ARE COVERED' scripts/orchestrator-harness/README.md 2>/dev/null; then
+  ok "…and the README states the SCOPE of the guarantee rather than claiming every merge path is covered"
+else
+  bad "the README does not scope the guarantee — auto-rail.sh merges without this gate and the text implies otherwise"
+fi
 
 # ── 5. EXACT BRANCH MATCH (§6) — both mutant directions — the decoys sort FIRST in the walk ──
 # ── 5. EXACT BRANCH MATCH (§6) — both mutant directions, and the decoys sort BEFORE the real worktree ──
