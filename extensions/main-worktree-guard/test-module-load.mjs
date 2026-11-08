@@ -1076,7 +1076,7 @@ process.stdout.write(JSON.stringify({ warns, notified, registered: !!start, decl
     delete env.AGENT_ALLOW_MAIN_EDITS;
     delete env.ELDATO_ALLOW_MAIN_EDITS;
     // C12's arm: the escape hatch ON, which is the state `session_start` returns
-    // early from (`index.ts:5164`). Kept as an ENV seam rather than a ctx stub so
+    // early from (`index.ts:5177`). Kept as an ENV seam rather than a ctx stub so
     // the arm exercises the real `_isAllowMainEdits()` the handler consults.
     if (allowMainEdits) env.AGENT_ALLOW_MAIN_EDITS = "1";
     if (throwNotify) env.PROBE_THROW_NOTIFY = "1"; else delete env.PROBE_THROW_NOTIFY;
@@ -1186,7 +1186,7 @@ process.stdout.write(JSON.stringify({ warns, notified, registered: !!start, decl
   // ── The PLACEMENT arm. The report is the FIRST statement of `session_start`
   // specifically so it cannot sit behind an early return — and the early return
   // that matters most is the ESCAPE HATCH: `if (_isAllowMainEdits()) return;`
-  // (`index.ts:5164`) is the natural place a later "don't nag a deliberate solo
+  // (`index.ts:5177`) is the natural place a later "don't nag a deliberate solo
   // session" refactor would move it under. Without this arm the ordering is
   // proven only by reading the source, and moving the call reddens nothing —
   // which is the same silent-loss class #853 exists to close, one level down.

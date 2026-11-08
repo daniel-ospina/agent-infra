@@ -1,4 +1,4 @@
-<!-- research-path: issue comment (<!-- research: v1 -->, 2026-11-08) -->
+<!-- research-path: the issue comment carrying the research: v1 block (2026-11-08) -->
 <!-- plan-review: cycles=0, status=pending, version=2.3.0 -->
 
 # #853 — a degraded classifier load must be LOUD and DURABLE, not one warn line
@@ -74,8 +74,8 @@ leaves exactly one row) and **C14b** (the throw does not propagate out of `sessi
 Properties that make it safe:
 
 - **Placed before every early return** in `session_start` — a degradation report that sat behind the
-  escape-hatch return would be silent on the sessions that need it most. Pinned by **C12** (a hatched
-  arm still gets the banner + the row) and **C12b** (source-order: the call precedes
+  escape-hatch return (`index.ts:5177`) would be silent on the sessions that need it most. Pinned by
+  **C12** (a hatched arm still gets the banner + the row) and **C12b** (source-order: the call precedes
   `if (_isAllowMainEdits()) return;`).
 - **Once per session process** (`_classifierDegradedPids`), so `/resume` cannot spam the banner or
   duplicate the audit row.
@@ -88,12 +88,12 @@ Properties that make it safe:
 
 | Thing | Call site / importer / consumer | What it does there |
 |---|---|---|
-| `_reportClassifierDegradation` | `extensions/main-worktree-guard/index.ts:5129` — the only caller, first statement of `pi.on("session_start")` | turns the degraded state into the banner + notify + event |
+| `_reportClassifierDegradation` | `extensions/main-worktree-guard/index.ts:5142` — the only caller, first statement of `pi.on("session_start")` (`:5137`); its own definition is `:5072` | turns the degraded state into the banner + notify + event |
 | `_classifierLoadFailure` | written in the classify-git load `catch` (`index.ts:399-404`, the write at `:402`); read only by `_reportClassifierDegradation` | carries the real load error into the banner and the event's `error` field |
 | `_classifierDegradedPids` | read+written only inside `_reportClassifierDegradation` | once-per-session-process dedupe (mirrors the existing pid-keyed `warnedDeviations`) |
-| `appendJsonl` (`extensions/shared/audit-log.ts`) | imported at `index.ts:147`; existing callers `:539`, `:4094`, `:4711`, `:5347`; new caller in `_reportClassifierDegradation` (`:5110`) | appends one JSONL row to `~/.pi/agent/audit/gate-events.jsonl`; already fail-safe (never throws) |
-| `GateEventName` (`extensions/shared/audit-log.ts:44-66`) | the shape a report/replay MATCHES ON; `extensions/shared/audit-log.test.ts`; Part C `C13` | `"guard_degraded"` declared, with a comment naming the failure mode. The vocabulary is a runtime `GATE_EVENT_NAMES` array the type derives from, so membership is ASSERTABLE (`appendJsonl` still takes `Record<string, unknown>`, so the type alone enforces nothing): deleting the member reddens `audit-log.test.ts` + `C13`. |
-| `isPrintMode()` (`extensions/shared/print-mode.ts`) | already imported at `index.ts:146`; new call site in `_reportClassifierDegradation` | suppresses the `ui.notify` arm for headless lanes, which get the banner in their own log |
+| `appendJsonl` (`extensions/shared/audit-log.ts`) | imported at `index.ts:147`; existing callers `:539`, `:4094`, `:4711`, `:5360`; new caller inside `_reportClassifierDegradation` at `:5104` | appends one JSONL row to `~/.pi/agent/audit/gate-events.jsonl`; already fail-safe (never throws) |
+| `GateEventName` (`extensions/shared/audit-log.ts:72`) | the shape a report/replay MATCHES ON; `extensions/shared/audit-log.test.ts`; Part C `C13` | `GATE_EVENT_NAMES` (`:47-71`) is the runtime source and `GateEventName` (`:72`) is derived from it, so membership is ASSERTABLE (`appendJsonl` still takes `Record<string, unknown>`, so the type alone enforces nothing): deleting the member reddens `audit-log.test.ts` + `C13`. |
+| `isPrintMode()` (`extensions/shared/print-mode.ts`) | already imported at `index.ts:146`; new call site inside `_reportClassifierDegradation` | suppresses the `ui.notify` arm for headless lanes, which get the banner in their own log |
 | `module-load-hooks.mjs` (`resolve`/`load`) | imported by `test-module-load.mjs` Part B (in-process) and by the new Part C probe (child process) | Part C wraps `load` to make `classify-git.mjs` throw while evaluating — the ONE injection |
 | `test-module-load.mjs` | `ci.yml:980` (per-PR `verify` job) and `ci-main.yml:158` (post-merge `extensions/*/test*.mjs` glob) | Part C runs on the PR lane, so the report is proved before a merge; no new CI step or file registration needed |
 
