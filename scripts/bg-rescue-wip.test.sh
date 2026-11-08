@@ -1343,6 +1343,118 @@ esac
   && ok "unlinked: …the old (branch-named) ref still travels, so nothing is lost by the new naming" \
   || bad "unlinked: the rescue did not travel under the branch-named ref"
 
+# ── --verdict: the READ-ONLY mode `scripts/wip-sweep.sh` classifies with (agent-infra#3485) ─────────
+# ⛔ THIS SUITE OWNS THE CONTRACT, so the mode is pinned HERE and not only in its consumer's suite: an
+# edit to THIS file that broke `--verdict` would otherwise be seen only by a suite about a different
+# script, and the sweep would silently archive nothing while reporting a clean fleet (its `clean`
+# verdict is the one answer that costs work). The properties: one machine-readable line, 0/1/2 for
+# clean/dirty/cannot-verify, NO `paths=` on cannot-verify (an unknown count is not zero), and the
+# ordinary mode's exit codes untouched.
+echo; echo "── --verdict: the read-only classifier ──"
+mk_repo vd || { echo "❌ fixture failed (vd)"; exit 1; }
+V="$T/vd"
+OVO="$(bash "$RR" --verdict "$V/wt" 2>&1)"; RCVO=$?
+case "$RCVO:$OVO" in
+  0:*verdict=clean*) ok "V1 a clean tree is verdict=clean, exit 0" ;;
+  *) bad "V1 clean verdict wrong (rc=$RCVO): $OVO" ;;
+esac
+printf 'wip\n' >> "$V/wt/base.txt"; printf 'new\n' > "$V/wt/new.txt"
+OVO="$(bash "$RR" --verdict "$V/wt" 2>&1)"; RCVO=$?
+case "$RCVO:$OVO" in
+  1:*verdict=dirty*paths=2*) ok "V2 a dirty tree is verdict=dirty paths=2, exit 1" ;;
+  *) bad "V2 dirty verdict wrong (rc=$RCVO): $OVO" ;;
+esac
+case "$OVO" in
+  *" slug=fix-lane-one"*) ok "V3 the verdict carries the file's OWN slug, so a caller never re-derives the ref name" ;;
+  *) bad "V3 the verdict did not carry slug=: $OVO" ;;
+esac
+# ⛔ THE ISSUE TRAVELS WITH THE SLUG, FROM THE SAME DERIVATION (review finding P2). `wip_ref_parts`
+# already answers "which issue does this branch name" to build the ref, so `--verdict` reports that
+# answer instead of letting every caller re-derive it — a second rule disagreed with the ref in both
+# directions (`fix/lane-3485` claimed 3485 over a ref carrying none; `fix/1-x` claimed nothing over a
+# ref carrying `issue-1-x`). V3b pins that the two fields AGREE; V3c pins the non-typed branch says `-`.
+case "$OVO" in
+  *" issue=-"*) ok "V3b an untyped branch reports issue=- (the field exists, and claims no link)" ;;
+  *) bad "V3b the verdict carries no issue= field: $OVO" ;;
+esac
+mk_repo viss fix/4242-vissue || { echo "❌ fixture failed (viss)"; exit 1; }
+printf 'wip\n' >> "$T/viss/wt/base.txt"
+OVO="$(bash "$RR" --verdict "$T/viss/wt" 2>&1)"; RCVO=$?
+case "$OVO" in
+  *" slug=issue-4242-vissue issue=4242"*)
+    ok "V3c a typed branch reports slug=issue-4242-vissue AND issue=4242 — one derivation supplies both" ;;
+  *) bad "V3c slug= and issue= disagree with each other: $OVO" ;;
+esac
+# The mode must not archive: no ref may exist after a verdict run on a dirty tree.
+[ -z "$(ref_of "$V/origin.git" refs/wip/fix-lane-one)" ] \
+  && ok "V4 --verdict archived NOTHING (it returns before §3: no tree, no commit, no push)" \
+  || bad "V4 --verdict pushed a ref — the read-only mode is not read-only"
+# ⛔ THE ARM THAT MATTERS: an INCOMPLETE enumeration is cannot-verify, and it carries NO path count.
+if [ "$(id -u)" = "0" ]; then
+  skip "V5/V6 an unreadable directory cannot be simulated as root — the cannot-verify arm is UNPROVEN here"
+else
+  mkdir -p "$V/wt/locked" && printf 'x\n' > "$V/wt/locked/f.txt" && chmod 000 "$V/wt/locked"
+  OVO="$(bash "$RR" --verdict "$V/wt" 2>&1)"; RCVO=$?
+  chmod 755 "$V/wt/locked"
+  [ "$RCVO" -eq 2 ] && case "$OVO" in *verdict=cannot-verify*) true ;; *) false ;; esac \
+    && ok "V5 an INCOMPLETE enumeration is verdict=cannot-verify, exit 2 — never clean" \
+    || bad "V5 an unreadable directory was not cannot-verify (rc=$RCVO): $OVO"
+  case "$OVO" in
+    *paths=*) bad "V6 cannot-verify carried a paths= field: $OVO" ;;
+    *) ok "V6 cannot-verify carries NO paths= (an unenumerated tree has no count — 0 would read as clean)" ;;
+  esac
+fi
+# The shipped ordinary contract must not move: same path, plain mode, still exit 1.
+bash "$RR" "$V/origin.git" >/dev/null 2>&1; RCVO=$?
+[ "$RCVO" -eq 1 ] \
+  && ok "V7 plain mode still exits 1 for a non-worktree — the mode is ADDITIVE, no shipped code moved" \
+  || bad "V7 plain-mode exit code moved for a non-worktree (rc=$RCVO, want 1)"
+
+# ── V8/V9: NO REFUSAL MAY ANSWER WITH A VERDICT CODE (review finding P2) ────────────────────────
+# `0` means clean and `1` means dirty in this mode, so an invocation that answered NOTHING must not
+# exit 0 or 1 — an exit-code reader would read a verdict out of a refusal. Both were measured on the
+# rebased tree: `--verdict --slug fix/x` fell through to the --slug branch and exited 0 ("clean"), and
+# `--verdict` with no path died on `${1:?}` with 1 ("dirty").
+OVO="$(bash "$RR" --verdict --slug fix/3485-x 2>&1)"; RCVO=$?
+[ "$RCVO" -eq 2 ] \
+  && ok "V8a --verdict --slug is REFUSED with 2 (the modes are exclusive, not silently re-ordered)" \
+  || bad "V8a --verdict --slug exited $RCVO (want 2 — 0 would read as 'clean'): $OVO"
+case "$OVO" in
+  *verdict=*) bad "V8b the refusal still printed a verdict= line: $OVO" ;;
+  *) ok "V8b …and it prints no verdict= line, so nothing can read it as an answer" ;;
+esac
+bash "$RR" --verdict >/dev/null 2>&1; RCVO=$?
+[ "$RCVO" -eq 2 ] \
+  && ok "V9 a MISSING ARGUMENT under --verdict exits 2 (cannot-verify), never 1 (= dirty)" \
+  || bad "V9 --verdict with no path exited $RCVO (want 2, never 1)"
+bash "$RR" >/dev/null 2>&1; RCVO=$?
+[ "$RCVO" -eq 1 ] \
+  && ok "V9b …while the ORDINARY mode keeps its shipped exit 1 for a missing argument" \
+  || bad "V9b plain-mode missing-argument exit moved (rc=$RCVO, want 1)"
+
+# ⛔ V10 — A SUBDIRECTORY OF A WORKTREE IS NOT A WORKTREE ROOT (#3588 review, cycle 8). The
+# `vunmeasured "not a worktree root: …"` branch had NO arm: the mutation pass reverted it to `exit 1` and
+# both suites stayed at 206/0, so in verdict mode a misrouted path would have reported `dirty` — the
+# caller then "archives" nothing, and `dirty` is the answer this file exists to stop being wrong.
+# `rev-parse --git-dir` succeeds ANYWHERE inside a repo, which is exactly why this branch must exist and
+# must be graded: nothing else in the suite constructs that input.
+mk_repo subroot || { echo "❌ fixture failed (subroot)"; exit 1; }
+mkdir -p "$T/subroot/wt/sub/deeper" || { echo "❌ could not make the subdirectory"; exit 1; }
+echo work > "$T/subroot/wt/sub/deeper/file.txt"
+OVO="$(bash "$RR" --verdict "$T/subroot/wt/sub" 2>&1)"; RCVO=$?
+[ "$RCVO" -eq 2 ] && case "$OVO" in *verdict=cannot-verify*) true ;; *) false ;; esac \
+  && ok "V10 a SUBDIRECTORY answers verdict=cannot-verify, exit 2 — never dirty, never clean" \
+  || bad "V10 a subdirectory of a worktree answered rc=$RCVO (want 2 = cannot-verify): $OVO"
+case "$OVO" in
+  *"not a worktree root"*) ok "V10b …and it SAYS it is not a root, so the caller knows to pass the root" ;;
+  *) bad "V10b the refusal does not name 'not a worktree root': $OVO" ;;
+esac
+# the ordinary mode keeps its shipped exit 1 for the same path (no shipped code moved)
+bash "$RR" "$T/subroot/wt/sub" >/dev/null 2>&1; RCVO=$?
+[ "$RCVO" -eq 1 ] \
+  && ok "V10c plain mode still exits 1 for a subdirectory — the mode is ADDITIVE" \
+  || bad "V10c plain-mode exit moved for a subdirectory (rc=$RCVO, want 1)"
+
 echo; echo "── Summary ───────────────────────────────────────────────────────"
 echo "  PASS=$PASS FAIL=$FAIL SKIP=$SKIP"
 [ "$FAIL" -eq 0 ] || { echo "  ❌ FAILURES — fix and re-run"; exit 1; }
