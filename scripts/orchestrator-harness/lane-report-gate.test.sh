@@ -273,6 +273,22 @@ drive 0 "PASS: evidence finished AFTER the merging commit was created (the hones
 HEAD_ISO="$(git -C "$WT" log -1 --format=%cI "$WT_HEAD")"
 printf '{"version":1,"head_at_write":"%s","branch":"feat/2977-tm","suites":[{"n":1,"command":"x","exit":0,"finished_at":"%s"}]}\n' "$WT_HEAD" "$HEAD_ISO" > "$WT/.worktree-report/state.json"
 drive 4 "STALE: evidence finished in the merging commit's OWN second (ambiguous, so it cannot pass)" STUB_OK=1 STUB_RC=0 STUB_STALE=0
+# ⛔ THE TWO LANE-AUTHORED INPUTS OF THE LAUNDERING ARM ARE DISCLOSED, WITH TRACKERS (round-9/10). One is
+# `finished_at` in an undigested state.json (tortoise#11551); the other is the COMMITTER date, which the
+# party making the commit writes (agent-infra#3791). A future reader who assumes either is tamper-proof
+# would trust a staleness signal as proof — this row keeps the disclosure honest.
+if grep -q 'GIT_COMMITTER_DATE' "$GATE" && grep -q '#3791' "$GATE" && grep -q '#11551' "$GATE"; then
+  ok "the laundering arm DISCLOSES that both of its inputs are lane-authored, with tracker references (#3791, tortoise#11551)"
+else
+  bad "the laundering arm no longer discloses that its inputs are lane-authored — a staleness signal would read as proof"
+fi
+
+# ⛔ EVERY RECORD COUNTS, NOT JUST THE NEWEST (round-10 review, P2). With a `max`, ONE post-commit suite
+# legitimised every older record riding in the same report — no editing, no forgery: measured, an honest
+# `run` at the old head plus one trivial `run --cmd true` after the commit PASSED, and so did an explicit
+# 2020-dated record sitting beside a 2099 one. The remedy text already speaks per-suite.
+printf '{"version":1,"head_at_write":"%s","branch":"feat/2977-tm","suites":[{"n":1,"command":"x","exit":0,"finished_at":"2099-01-01T00:00:00Z"},{"n":2,"command":"y","exit":0,"finished_at":"2020-01-01T00:00:00Z"}]}\n' "$WT_HEAD" > "$WT/.worktree-report/state.json"
+drive 4 "STALE: ONE pre-commit record refuses, even beside a post-commit one (a max would let it ride)" STUB_OK=1 STUB_RC=0 STUB_STALE=0
 _restore_state
 
 # ── 3. RED and INVALID, and polarity by CONTENT ──────────────────────────────────────────────────
@@ -545,6 +561,33 @@ if grep -q 'SCOPE — WHICH PATHS ARE COVERED' scripts/orchestrator-harness/READ
 else
   bad "the README does not scope the guarantee — auto-rail.sh merges without this gate and the text implies otherwise"
 fi
+
+# ── 4g. DETACHING THE LANE WORKTREE IS NOT AN ABSTENTION (round-10 review, P0) ───────
+# ⛔ THE CHEAPEST BYPASS IN THE FILE, AND IT DEFEATED EVERY OTHER ARM AT ONCE. 6 is justified as a
+# property of the BOX, but `_lrg_worktree` only matches a stanza that is ON the branch: one
+# `git checkout --detach` in the lane's own worktree left the report, the writer state and the commit in
+# place at exactly the merging head and made the gate answer 6 — which BOTH carriers log as "NOT
+# ENFORCED" and then merge on. Measured: PASS on a valid report, then detach, then `VERDICT=NO-WORKTREE
+# rc=6` with every artefact untouched. RED/INVALID/STALE/UNMEASURABLE are all downstream of this
+# resolution, so that single command bypassed all of them.
+_det_ok=0
+if git -C "$WT" rev-parse --git-dir >/dev/null 2>&1; then
+  _prev="$(git -C "$WT" rev-parse --abbrev-ref HEAD 2>/dev/null)"
+  git -C "$WT" checkout -q --detach 2>/dev/null && _det_ok=1
+fi
+if [ "$_det_ok" = 1 ]; then
+  out="$(env STUB_OK=1 STUB_RC=0 STUB_STALE=0 bash "$GATE" --check "$REPO" "feat/2977-tm" "$WT_HEAD" 2>&1)"; rc=$?
+  if [ "$rc" = 7 ]; then ok "a DETACHED lane worktree holding the report is UNMEASURABLE, not the mergeable abstention 6 (rc=$rc)"; else bad "detaching the lane worktree produced rc=$rc (expected 7) — 6 would be merged on: $out"; fi
+  case "$out" in *reason=evidence-present-on-this-box-but-no-worktree-is-registered-on-this-branch*) ok "…and it says the box HOLDS the evidence, rather than that the box is elsewhere" ;; *) bad "detached-worktree reason: $out" ;; esac
+  case "$out" in *VERDICT=NO-WORKTREE*) bad "a detached worktree was reported as NO-WORKTREE (the mergeable abstention)" ;; *) ok "…and it is not reported as NO-WORKTREE" ;; esac
+  git -C "$WT" checkout -q "$_prev" 2>/dev/null || true
+else
+  ok "SKIPPED the detached-worktree row (fixture git could not detach)"
+fi
+# ⛔ AND THE CROSS-BOX CASE MUST STILL ABSTAIN, or the fix over-blocks: a branch with NO stanza anywhere,
+# and no report at that head on this box, is genuinely 6.
+out="$(env STUB_OK=1 STUB_RC=0 STUB_STALE=0 bash "$GATE" --check "$REPO" "feat/not-here-at-all" "$WT_HEAD" 2>&1)"; rc=$?
+if [ "$rc" = 6 ]; then ok "CONTROL a branch with no worktree AND no report at this head still abstains with 6 (the fix does not over-block)" ; else bad "the detached-worktree fix over-blocked the cross-box case: expected rc=6, got rc=$rc :: $out"; fi
 
 # ── 5. EXACT BRANCH MATCH (§6) — both mutant directions — the decoys sort FIRST in the walk ──
 # ── 5. EXACT BRANCH MATCH (§6) — both mutant directions, and the decoys sort BEFORE the real worktree ──

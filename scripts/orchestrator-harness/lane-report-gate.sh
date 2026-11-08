@@ -188,6 +188,35 @@ _lrg_worktree() {
   return 1
 }
 
+# _lrg_stanza_at_head <repo> <head> — a worktree stanza whose HEAD is <head> AND which holds a report.
+# ⛔ THIS IS WHAT SEPARATES A CROSS-BOX ABSTENTION FROM A SELF-INFLICTED ONE (round-10 review, P0).
+# `git worktree list --porcelain` prints `HEAD <sha>` in every stanza, including a DETACHED one that has no
+# branch line — so a lane that detaches its own worktree is still visible here, and its evidence with it.
+# The report conjunct keeps a coincidental hub checkout at the same head from becoming an over-block.
+_lrg_stanza_at_head() {
+  local repo="$1" head="$2" wt="" hd="" line="" listing=""
+  [ -n "$repo" ] && [ -n "$head" ] || return 1
+  listing="$(git -C "$repo" worktree list --porcelain 2>/dev/null)" || listing=""
+  [ -n "$listing" ] || return 1
+  while IFS= read -r line; do
+    case "$line" in
+      'worktree '*) wt="${line#worktree }"; hd="" ;;
+      'HEAD '*) hd="${line#HEAD }"
+                # ⛔ THE STANZA MUST ALSO BELONG TO *THIS* BRANCH (the over-block guard, measured): a
+                # stanza at the same head is not enough, because an ordinary cross-box merge can have the
+                # hub checkout sitting at exactly the PR head on a DIFFERENT branch. The writer records
+                # the branch in its state, which is what a detached worktree keeps (detaching changes the
+                # ref, not the lane), so this separates "the lane detached its own worktree" from "some
+                # other worktree happens to be at this head".
+                if [ "$hd" = "$head" ] && [ -n "$wt" ] && [ -f "$wt/WORKTREE-REPORT.md" ] \
+                   && grep -qE "\"branch\": *\"$branch\"" "$wt/.worktree-report/state.json" 2>/dev/null; then
+                  printf '%s' "$wt"; return 0
+                fi ;;
+    esac
+  done <<< "$listing"
+  return 1
+}
+
 # lane_report_gate <repo-path> <branch> <head> — the decision table above.
 lane_report_gate() {
   local repo="${1:-}" branch="${2:-}" head="${3:-}" wt="" tool="" py="" out="" rc=0
@@ -229,6 +258,25 @@ lane_report_gate() {
 
   wt="$(_lrg_worktree "$repo" "$branch")" || wt=""
   if [ -z "$wt" ]; then
+    # ⛔ ABSTAINING HERE WAS LANE-CONTROLLED, AND IT WAS THE CHEAPEST BYPASS IN THE FILE (round-10
+    # review, P0). 6 is justified as a property of the BOX ("the lane's evidence is not reachable from
+    # here"), but `_lrg_worktree` only recognises a stanza that is ON the branch: one `git checkout
+    # --detach` in the lane's own worktree leaves the report, the writer state and the commit in place at
+    # exactly the merging head and makes the gate answer 6 — which BOTH carriers log as "NOT ENFORCED"
+    # and then merge on (`lane-merge.sh:1339`, `merge-one.sh:1221`). Measured: PASS on a valid report,
+    # then `git checkout --detach`, then `VERDICT=NO-WORKTREE rc=6` with every artefact untouched — and
+    # that one command defeats RED/INVALID/STALE/UNMEASURABLE at once, because they are all downstream of
+    # this resolution.
+    # The two cases are distinguishable from the listing already in hand: a CROSS-BOX abstention has no
+    # stanza at this head, while a self-detached lane has one. ⛔ THE `WORKTREE-REPORT.md` CONJUNCT IS
+    # LOAD-BEARING: a bare `HEAD == $head` test would over-block the ordinary case where the hub checkout
+    # happens to sit at the PR head (the 66-row over-block lesson above). With it, the box must actually
+    # HOLD a report for this head — so the refusal is "this box has your evidence and cannot grade it",
+    # which has a cheap remedy, not "the box is elsewhere".
+    if _lrg_stanza_at_head "$repo" "$head" >/dev/null 2>&1; then
+      _lrg_emit 7 UNMEASURABLE "branch=$branch repo=$repo reason=evidence-present-on-this-box-but-no-worktree-is-registered-on-this-branch head=$head hint=check-the-branch-out-in-the-worktree-that-holds-the-report-or-detach-is-not-an-abstention"
+      return 7
+    fi
     _lrg_emit 6 NO-WORKTREE "branch=$branch reason=no-worktree-for-branch-on-this-box head=$head"
     return 6
   fi
@@ -363,6 +411,7 @@ if not isinstance(rules, list):
 # describes.
 rec = ""
 newest = None
+_any_ts = []
 # ⛔ AN UNREADABLE WRITER STATE IS UNMEASURABLE, NOT A PASS. `rec` (the recorded head) and `newest`
 # (the newest suite) are BOTH read from this file, and both arms that consume them are `[ -n … ]`-guarded,
 # so an unreadable state silently switches BOTH head witnesses off and leaves `ok:true` alone as the
@@ -398,6 +447,7 @@ try:
                     _t = datetime.datetime.fromisoformat(str(_ts).replace("Z", "+00:00"))
                 except Exception:
                     continue
+                _any_ts.append(_t)
                 if newest is None or _t > newest:
                     newest = _t
         if not rec:
@@ -417,6 +467,17 @@ except Exception:
 # of the gate head witnesses then agree with the merge. The newest suite `finished_at` is NOT
 # re-stamped by a render, so "the newest suite finished BEFORE the merging commit was created" is the
 # one witness that survives a RE-RENDER.
+# ⛔ AND THE OTHER SIDE OF THAT COMPARISON IS LANE-AUTHORED TOO (round-10 review, P1). "%cI" is the
+# COMMITTER date of the commit under review, which the party making the commit writes: backdating it
+# (`GIT_COMMITTER_DATE=2020-01-01 git commit`) makes evidence from the PREVIOUS tree look newer than the
+# head, so the arm PASSes a report describing a tree one commit behind — measured end-to-end with the real
+# writer, every file honest, no artifact edited; the control (a normally-dated commit) returns STALE. The
+# harness already treats commit headers as peer-writable elsewhere (`claims.sh`: a lease body is
+# PEER-WRITABLE and "committer Evil <e@x> 1 +0000 used to supply the age"). A local-only gate has no
+# lane-independent clock to order against — the trustworthy source would be the host record of the head
+# transition (an API timestamp) or a stamp the lane cannot write, both of which are design changes, not
+# wiring. So: this arm is a STALENESS SIGNAL, not proof, in BOTH of its inputs. Filed as agent-infra
+# #3791 (the writer-side half is daniel-ospina/tortoise#11551).
 # ⛔ IT DOES NOT SURVIVE AN EDIT, AND THAT IS DISCLOSED RATHER THAN IMPLIED (round-9 review, P0).
 # `finished_at` lives ONLY in `state.json`, which carries no digest — the sealed `WORKTREE-REPORT.md`
 # renders `Started:`/`Written:` and each suite command/exit, but NEVER the finish time of a suite (tortoise
@@ -448,7 +509,15 @@ skew = ""
 if newest is not None and sys.argv[3]:
     try:
         _c = datetime.datetime.fromisoformat(str(sys.argv[3]).replace("Z", "+00:00"))
-        predates = "1" if newest <= _c else "0"
+        # ⛔ EVERY RECORD, NOT JUST THE NEWEST (round-10 review, P2). The remedy text below tells a lane to
+        # re-run THE SUITES at the head, and says "only `run` produces evidence for the head you are
+        # merging" — a PER-SUITE semantic. A `max` let ONE post-commit suite legitimise every older record
+        # riding in the same report, with no editing at all: measured, an honest `run` at the old head plus
+        # one trivial `run --cmd true` after the commit PASSed, and so did an explicitly 2020-dated record
+        # sitting beside a 2099 one. Comparison is now `any()`: a single pre-commit record makes the
+        # evidence predate the merge. The cost is that a lane re-running only the failing suite is refused
+        # until it re-runs all of them — which is exactly what the code-4 remedy already instructs.
+        predates = "1" if _any_ts and any(_t <= _c for _t in _any_ts) else "0"
         # ⛔ A FUTURE-DATED MERGING HEAD IS A DIFFERENT FAULT WITH A DIFFERENT REMEDY (fresh review, P2).
         # If the commit was stamped by a box whose clock is ahead of this one, an honest run at that head
         # is ALWAYS "older" than it, and the printed remedy (re-run the suites) can never converge — a
@@ -525,7 +594,16 @@ print("%s|%s|%s|%s|%s|%s|%s|%s" % (
   # `<12 hex>`), so the two halves are cross-checked here. An ABSENT stamp on either side does not
   # refuse (an older writer, and "an empty witness never refuses" is this file's existing rule); a
   # DISAGREEMENT is a falsified state and refuses.
-  _sealed12="$(sed -n 's/.*head at write:[^0-9a-f]*\([0-9a-f]\{12\}\).*/\1/p' "$wt/WORKTREE-REPORT.md" 2>/dev/null | head -1)"
+  # ⛔ THE STAMP IS READ BY ITS FULL RENDERED SHAPE, NOT BY `head -1` OVER ANY OCCURRENCE (round-10
+  # review, P1). `head -1` matched the FIRST `head at write:` anywhere in the file, and the writer renders
+  # the lane-owned `state["worktree"]` value VERBATIM in its own line ABOVE the real stamp — so a lane
+  # could have the tool itself print a forged `head at write: <target12>` and the cross-check would read
+  # that one while the real stamp kept naming the old head (measured: PASS on a report whose sealed line
+  # still said the previous commit). Anchoring on the rendered line `- **Base:** \`…\` → **head at
+  # write:** \`<12hex>\`` makes the position unambiguous. \u26d4 THE DIGEST IS NOT A SEAL AGAINST THE GRADED
+  # PARTY EITHER (unkeyed sha256 stored in the same file): this cross-check is a SPEED BUMP that costs two
+  # lane-owned files instead of one, not tamper-proofing — see the disclosure above, which says so.
+  _sealed12="$(sed -n 's/^- \*\*Base:\*\* .*head at write:\*\* `\([0-9a-f]\{12\}\)`.*$/\1/p' "$wt/WORKTREE-REPORT.md" 2>/dev/null | head -1)"
   if [ -n "$_sealed12" ] && [ -n "$rec_head" ] && \
      [ "$(printf '%s' "$rec_head" | cut -c1-12)" != "$_sealed12" ]; then
     _lrg_emit 4 STALE "branch=$branch worktree=$wt report=$wt/WORKTREE-REPORT.md reason=state-disagrees-with-the-sealed-report sealed_head=$_sealed12 state_head_at_write=$rec_head merging_head=$head"
