@@ -231,6 +231,15 @@ worktree_state() {
     return 0
 }
 
+# ambiguous_remedy — the ONE definition of the operator's next action for a registration that still
+# claims a branch whose directory is gone. Used by BOTH the classifier's DIRTY line and
+# delete_branch_cas's refusal (round-9 F2): the classifier is what a plain `--apply` prints, so the
+# remedy must not be reachable only behind `--force-dirty` — the two sentences drifted apart once and
+# the plain run withheld exactly the two that stop an operator clearing a MOVED lane's registration.
+ambiguous_remedy() {
+    printf '%s' "Look for the tree BEFORE clearing anything: .git/worktrees/<name>/gitdir names the path it expects, and 'git worktree repair <new path>' recovers a moved one. Clear a registration only when its tree is genuinely gone, and only THAT one, path-scoped: 'git worktree remove --force <path>'. ⛔ Once the registration is cleared the next --apply WILL reclaim the ref, so do not clear it until you are sure."
+}
+
 # delete_branch_cas <branch> <expected-oid> — atomic compare-and-delete, NEVER `git branch -D`
 # (#1393 G3). `update-ref -d <ref> <old>` has GIT compare the ref's current value to <old> and remove
 # it in the SAME operation, so a tip that moved between classification and delete is refused rather
@@ -317,7 +326,7 @@ delete_branch_cas() {
             return 2
         fi
         if [ -n "$wt_stale" ]; then
-            DCAS_REASON="a worktree registration ($wt_stale) still claims it while that directory is gone — git cannot tell a STALE registration from a worktree MOVED with 'mv', and the moved case is a live lane, so the ref is kept. Look for the tree BEFORE clearing anything: .git/worktrees/<name>/gitdir names the path it expects, and 'git worktree repair <new path>' recovers a moved one. Clear a registration only when its tree is genuinely gone, and only THAT one, path-scoped: 'git worktree remove --force <path>'. ⛔ Once the registration is cleared the next --apply WILL reclaim refs/heads/$br, so do not clear it until you are sure."
+            DCAS_REASON="a worktree registration ($wt_stale) still claims it while that directory is gone — git cannot tell a STALE registration from a worktree MOVED with 'mv', and the moved case is a live lane, so the ref is kept. $(ambiguous_remedy)"
             return 2
         fi
     fi
@@ -512,7 +521,7 @@ if [ -f "$RECORD_FILE" ]; then
                     if [ "$REG_CLAIMS" = unknown ]; then
                         DIRTY_OUT="${DIRTY_OUT}  ⚠️  ORPHANED BUT DIRTY: branch=$BRANCH dir=$DIR — state ABSENT, but the worktree list could not be read, so whether a registration still claims this branch cannot be established. --apply refuses it\n"
                     else
-                        DIRTY_OUT="${DIRTY_OUT}  ⚠️  ORPHANED BUT DIRTY: branch=$BRANCH dir=$DIR — state ABSENT, but a worktree registration still claims this branch: either a STALE registration or a worktree that was MOVED and is live. --apply refuses it — look for the tree before clearing anything\n"
+                        DIRTY_OUT="${DIRTY_OUT}  ⚠️  ORPHANED BUT DIRTY: branch=$BRANCH dir=$DIR — state ABSENT, but a worktree registration still claims this branch: either a STALE registration or a worktree that was MOVED and is live, so --apply refuses it. $(ambiguous_remedy)\n"
                     fi ;;
                 *)
                     DIRTY_OUT="${DIRTY_OUT}  ⚠️  ORPHANED BUT DIRTY: branch=$BRANCH dir=$DIR (uncommitted changes — review manually)\n" ;;

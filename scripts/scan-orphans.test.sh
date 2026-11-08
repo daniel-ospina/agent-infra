@@ -278,6 +278,8 @@ $RW add --branch fix/cas-move --worktree "$FIX/gone-too" --dispatch d-casmove --
 OUT="$(PATH="$FIX/shim:$PATH" GIT_WRAP_REAL="$REAL_GIT" GIT_WRAP_REPO="$REPO" $SCAN --apply 2>&1 || true)"
 git show-ref --verify --quiet refs/heads/fix/cas-move && ok "a tip that MOVED inside the reap window is refused (CAS is in the script)" || bad "reap_record deleted a ref whose tip moved (unconditional update-ref)"
 assert_contains "$OUT" "compare-and-delete at" "the in-window CAS refusal is named as the CAS refusal"
+# round-9 F1: pin the KEPT counter on the ORPHAN arm (the other counter that had no reddening row).
+assert_contains "$OUT" "KEPT by --apply: 1 record(s)" "the orphan-arm refusal is counted as a keep"
 $RW done --dispatch d-casmove >/dev/null
 git branch -D fix/cas-move >/dev/null 2>&1 || true
 
@@ -480,6 +482,13 @@ assert_contains "$OUT" "a worktree registration still claims this branch" "the D
 OUT="$($SCAN --apply 2>&1 || true)"                          # apply, no --force-dirty
 git show-ref --verify --quiet refs/heads/fix/prunable-1 && ok "an ambiguous (prunable) registration keeps its ref" || bad "the ref was deleted on the prunable guess"
 assert_eq "$(wc -l < "$WORKTREES_RECORD" | tr -d ' ')" "1" "the ambiguous record is kept"
+# round-9 F2: the PLAIN --apply must name the remedies too — gating them behind --force-dirty (whose
+# documented meaning is "destroy uncommitted work") withheld exactly the two that stop an operator
+# clearing a MOVED lane's registration.
+assert_contains "$OUT" "worktree repair" "the PLAIN --apply names the moved case's remedy"
+assert_contains "$OUT" "worktree remove --force" "the PLAIN --apply names the path-scoped cleanup"
+# round-9 F1: pin the KEPT counter on the DIRTY/--force-dirty arm, which had no reddening row.
+assert_contains "$OUT" "KEPT by --apply: 1 record(s)" "the plain --apply counts the keep"
 OUT="$($SCAN --apply --force-dirty 2>&1 || true)"            # --force-dirty reaches the CAS itself
 git show-ref --verify --quiet refs/heads/fix/prunable-1 && ok "--force-dirty does not override the ambiguity either" || bad "the ref was deleted on the prunable guess"
 assert_contains "$OUT" "STALE registration" "the refusal names the STALE half of the ambiguity"
@@ -488,6 +497,7 @@ assert_contains "$OUT" "worktree repair" "the refusal names the moved case's rem
 assert_contains "$OUT" "worktree remove --force" "the refusal names a PATH-SCOPED registration cleanup"
 assert_not_contains "$OUT" "worktree prune" "the refusal never names the banned bare prune (#1141)"
 assert_eq "$(wc -l < "$WORKTREES_RECORD" | tr -d ' ')" "1" "the ambiguous record stays kept after --force-dirty"
+assert_contains "$OUT" "KEPT by --apply: 1 record(s)" "the --force-dirty run counts the keep too"
 git worktree remove --force "$FIX/wt-prunable" >/dev/null 2>&1 || true
 git branch -D fix/prunable-1 >/dev/null 2>&1 || true
 
