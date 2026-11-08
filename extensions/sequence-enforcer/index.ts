@@ -44,8 +44,8 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { homedir } from "node:os";
 import { execFileSync } from "node:child_process";
-import { existsSync, readFileSync, writeFileSync, appendFileSync, mkdirSync, unlinkSync, renameSync, statSync } from "node:fs";
-import { resolve, join, dirname } from "node:path";
+import { existsSync, readFileSync, writeFileSync, appendFileSync, mkdirSync, unlinkSync, renameSync, statSync, realpathSync } from "node:fs";
+import { resolve, join, dirname, relative, isAbsolute, sep } from "node:path";
 import { isIP } from "node:net"; // #383 (Task 3, P3-1 FINAL mechanical): true IPv6 mirror — zero-dep builtin
 import { isPrintMode, isPrintModeEnv } from "../shared/print-mode.js";
 // #357 (Task 1) introduced the inline; #1330 gave it ONE home and a pin.
@@ -1298,15 +1298,20 @@ export const CHECKPOINT_WHITESPACE_REJECT = /[^\S\u0020]|[\u200B-\u200D\u2060\u0
 //     what finishes or unwinds a rebase that hit a conflict.
 //   * `git add PATHS` — stages a conflict resolution before `--continue`.
 //     Index-only; `git commit` stays blocked, so this can never land anything.
-//   * `edit` / `write` while a rebase is IN PROGRESS — without them the conflict
-//     path is the same circle one level deeper (review F1): `git rebase` only
-//     REPLAYS, `git add` only stages what is already on disk, and no admitted
-//     command writes file content — so a lane stopped on a content conflict
-//     could only `--skip` (discard the commit), `--abort` (back to STALE), or
-//     stage the conflict MARKERS and continue. A rebase in progress is detected
-//     from the checkout (`rebase-merge/` or `rebase-apply/` in the git dir —
-//     the `.git` file indirection of a linked worktree is followed), so the
-//     allowance exists only inside the remediation window this escape opens.
+//   * `edit` / `write` while a rebase is IN PROGRESS, TARGET-SCOPED — without
+//     them the conflict path is the same circle one level deeper (review F1):
+//     `git rebase` only REPLAYS, `git add` only stages what is already on disk,
+//     and no admitted command writes file content — so a lane stopped on a
+//     content conflict could only `--skip` (discard the commit), `--abort`
+//     (back to STALE), or stage the conflict MARKERS and continue. A rebase in
+//     progress is detected from the checkout (`rebase-merge/` or
+//     `rebase-apply/` in the git dir — the `.git` file indirection of a linked
+//     worktree is followed), so the allowance exists only inside the
+//     remediation window this escape opens. The TARGET must also be inside
+//     this worktree and must not be one of the gate's ledgers or the git dir
+//     (see checkpointWriteTargetAllowed): an unscoped allowance would let one
+//     `write` mint the operator FORCE-PASS file, which is the gate's own second
+//     advance path — a bypass, not a remedy (review round 2, F1).
 // NONE of these can advance the step: only a fresh phase-correct CLEAR token
 // can, and no admitted command can forge one. Value classes are the same
 // safe set the checker escape uses and reject a LEADING `-`, which is what
@@ -1354,17 +1359,92 @@ export function _setRebaseProbeForTest(fn: (() => boolean) | null): void {
 export function rebaseInProgress(cwd: string = process.cwd()): boolean {
   if (rebaseProbeForTest) return rebaseProbeForTest();
   const markers = ["rebase-merge", "rebase-apply"];
+  const gitDir = resolveGitDir(cwd);
+  if (!gitDir) return false;
+  return markers.some((d) => existsSync(join(gitDir, d)));
+}
+
+// The checkout's git dir, following the `.git` FILE indirection a linked
+// worktree uses. null when there is none / it cannot be read (fail-closed).
+function resolveGitDir(cwd: string): string | null {
   try {
-    let gitDir = resolve(cwd, ".git");
-    const st = statSync(gitDir, { throwIfNoEntry: false });
-    if (!st) return false;
-    if (st.isFile()) {
-      const gitdirLine = readFileSync(gitDir, "utf-8");
-      const m = /^gitdir:[ ]*(.+)$/m.exec(gitdirLine);
-      if (!m) return false;
-      gitDir = resolve(cwd, m[1]!.trim());
+    const dotGit = resolve(cwd, ".git");
+    const st = statSync(dotGit, { throwIfNoEntry: false });
+    if (!st) return null;
+    if (!st.isFile()) return dotGit;
+    const gitdirLine = readFileSync(dotGit, "utf-8");
+    const m = /^gitdir:[ ]*(.+)$/m.exec(gitdirLine);
+    return m ? resolve(cwd, m[1]!.trim()) : null;
+  } catch {
+    return null;
+  }
+}
+
+/** is `child` at or below `parent` (both absolute, already resolved)? */
+function pathInside(child: string, parent: string): boolean {
+  const rel = relative(parent, child);
+  return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+}
+
+/** the real path of the nearest EXISTING ancestor of `p` (symlinks resolved), or null. */
+function nearestRealPath(p: string): string | null {
+  let cur = p;
+  for (let i = 0; i < 64; i++) {
+    try {
+      if (existsSync(cur)) return realpathSync(cur);
+    } catch {
+      return null;
     }
-    return markers.some((d) => existsSync(join(gitDir, d)));
+    const up = dirname(cur);
+    if (up === cur) return null;
+    cur = up;
+  }
+  return null;
+}
+
+// #1418 (review round 2, F1): TARGET-SCOPED write allowance.
+// The round-1 allowance was "edit/write anywhere while a rebase is in progress",
+// which hands the agent the gate's own second advance path: the operator
+// force-pass file is an ordinary JSON file that `write` could mint, and
+// `checkpointTokenOk` honours it whenever the real token fails — so one write
+// would advance the step with no checker run and an audit line recording an
+// "operator" the agent invented. That is a bypass of the gate this escape is
+// meant to unblock, so the allowance is now bounded the way the F1 argument
+// itself describes — to the conflict the rebase is actually stopping on:
+//   * the path must resolve INSIDE this worktree (an interrupted rebase can
+//     only be conflicted on tracked files, and a rebase never touches anything
+//     outside the checkout);
+//   * the gate's LEDGERS are refused by IDENTITY, even if one is relocated into
+//     the tree (the token file is settable via PARALLEL_CHECK_TOKEN_FILE);
+//   * the git dir is refused (hooks, config and refs are not conflict content,
+//     and a `.git` write outlives the rebase window entirely);
+//   * symlinks are resolved on the nearest existing ancestor, so a link inside
+//     the worktree cannot point the write back outside it.
+// Everything else still fails closed: a non-string/empty target is a BLOCK.
+export function checkpointWriteTargetAllowed(target: unknown, cwd: string = process.cwd()): boolean {
+  if (typeof target !== "string" || target.trim() === "") return false;
+  try {
+    const root = realpathSync(cwd);
+    const abs = resolve(cwd, target);
+    const ledgers = [tokenFile(), forceFile()].map((p) => resolve(cwd, p));
+    if (ledgers.includes(abs)) return false;
+    const real = nearestRealPath(abs);
+    if (!real || !pathInside(real, root)) return false;
+    const gitDir = resolveGitDir(cwd);
+    if (gitDir) {
+      const realGit = nearestRealPath(gitDir);
+      // BOTH the `.git` the path names (a directory in a normal checkout, a
+      // FILE in a linked worktree — the prefix check covers both, and refuses
+      // `.git/hooks/...` even where that path cannot exist on disk) and the git
+      // dir it resolves to.
+      const dotGitAbs = resolve(cwd, ".git");
+      if (
+        pathInside(abs, dotGitAbs) ||
+        pathInside(abs, gitDir) ||
+        (realGit && pathInside(real, realGit))
+      ) return false;
+    }
+    return true;
   } catch {
     return false;
   }
@@ -1985,7 +2065,7 @@ export function gateGuidance(step: Step, mode: Mode = "gate"): string {
     if (!resolvedBin) {
       return `→ To proceed: set AGENT_INFRA_PATH (a required prerequisite per AGENTS.md), then run \`…/scripts/parallel_work_check.sh ${requiredPhase}\` until the verdict is CLEAR (writes the PASS token).
 → If the checker reports STALE (behind origin/main), clear it first: \`git fetch\` then \`git rebase origin/main\`, then re-run the checker.
-→ If that rebase stops on a conflict, resolve it in place (edit/write are admitted while a rebase is in progress), then \`git add\` and \`git rebase --continue\`.
+→ If that rebase stops on a conflict, resolve it in place (edit/write are admitted while a rebase is in progress, for paths inside this worktree only), then \`git add\` and \`git rebase --continue\`.
 → Escape tools available: read, loop_enforcer, and bash for the checker invocation or the stale-branch remedy (git fetch, git status, git diff, git rebase, git add)
 → If the check cannot CLEAR in this environment, the checkpoint is unpassable — end your turn and report`;
     }
@@ -2004,7 +2084,7 @@ export function gateGuidance(step: Step, mode: Mode = "gate"): string {
       : "";
     return `→ To proceed: run \`${enforcePrefix}${resolvedBin} ${requiredPhase}\`${ghostHint} until the verdict is CLEAR (writes the PASS token).
 → If the checker reports STALE (behind origin/main), clear it first: \`git fetch\` then \`git rebase origin/main\`, then re-run the checker.
-→ If that rebase stops on a conflict, resolve it in place (edit/write are admitted while a rebase is in progress), then \`git add\` and \`git rebase --continue\`.
+→ If that rebase stops on a conflict, resolve it in place (edit/write are admitted while a rebase is in progress, for paths inside this worktree only), then \`git add\` and \`git rebase --continue\`.
 → Escape tools available: read, loop_enforcer, and bash for the checker invocation or the stale-branch remedy (git fetch, git status, git diff, git rebase, git add)
 → If the check cannot CLEAR in this environment, the checkpoint is unpassable — end your turn and report`;
   }
@@ -2118,6 +2198,10 @@ function blockAuditEntry(event: string, toolName: string, step: Step, mode: Mode
 
 export function validateToolCall(
   toolName: string, command: unknown, step: Step, mode: Mode,
+  // #1418 (review round 2, F1): the WRITE TARGET (`event.input.path` for
+  // edit/write). Optional so every existing caller/test stays valid, and its
+  // absence is a DENY — the write allowance is fail-closed.
+  targetPath?: unknown,
 ): { block: boolean; reason?: string; wouldBlock?: boolean; freshTokenBlock?: boolean } {
   // #357 (Task 5): validateToolCall is PURE — it never writes audit. The
   // handler owns every audit write (single-audit: one entry per blocked /
@@ -2185,7 +2269,11 @@ export function validateToolCall(
     // the agent can EDIT the file — it could otherwise only `--skip` (discard
     // the commit), `--abort` (straight back to STALE), or stage the conflict
     // markers. Bounded to the rebase window: outside it these stay blocked.
-    if ((toolName === "edit" || toolName === "write") && rebaseInProgress()) {
+    if (
+      (toolName === "edit" || toolName === "write") &&
+      rebaseInProgress() &&
+      checkpointWriteTargetAllowed(targetPath)
+    ) {
       return { block: false };
     }
     if (isCheckpointEscape(toolName, command)) {
@@ -2623,6 +2711,11 @@ export default function (pi: ExtensionAPI) {
     const command = isToolCallEventType("bash", event)
       ? (event.input as any)?.command ?? ""
       : "";
+    // #1418 (review round 2, F1): the write allowance is TARGET-scoped, so the
+    // handler must hand over the path edit/write is aimed at — `command` is ""
+    // for every non-bash event, which is what made the round-1 allowance blind
+    // to what it was allowing.
+    const writeTarget = (event.input as any)?.path;
 
     const mode = resolveMode();
 
@@ -2708,7 +2801,7 @@ export default function (pi: ExtensionAPI) {
           });
         }
         advanceCheckpoint(target);
-        const result = validateToolCall(toolName, command, ownerStep, mode);
+        const result = validateToolCall(toolName, command, ownerStep, mode, writeTarget);
         if (result.block) {
           const trail = target.steps
             .map((s, i) => i === checkpointIndex ? `[${s.name}]` : s.name)
@@ -2742,7 +2835,7 @@ export default function (pi: ExtensionAPI) {
       // token NOT ok — the escape is the only way out; record an ok:false marker
       // for allowed calls so a producer-timing tool_result (!ok@call → ok@result)
       // can advance. Blocked calls never advance and emit no marker.
-      const result = validateToolCall(toolName, command, ownerStep, mode);
+      const result = validateToolCall(toolName, command, ownerStep, mode, writeTarget);
       if (result.block) {
         const key = checkpointKey(target);
         // #357 (Task 8, j): consecutive-block streak — ≥3 → park immediately.
@@ -2768,7 +2861,7 @@ export default function (pi: ExtensionAPI) {
       return undefined;
     }
 
-    const result = validateToolCall(toolName, command, step, mode);
+    const result = validateToolCall(toolName, command, step, mode, writeTarget);
 
     if (result.block) {
       const trail = top.steps

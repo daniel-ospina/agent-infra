@@ -753,13 +753,48 @@ await test("#1418 F1: edit/write are BLOCKED at a pending checkpoint when no reb
   } finally { _setRebaseProbeForTest(null); }
 });
 
-await test("#1418 F1: edit/write are ADMITTED at a pending checkpoint while a rebase is in progress", () => {
+await test("#1418 F1: edit/write are ADMITTED mid-rebase for a path INSIDE the worktree", () => {
   _setTokenFileForTest(null);
   _setRebaseProbeForTest(() => true);
   try {
-    ok(!validateToolCall("edit", "a.ts", checkpointStep(), "gate").block, "edit admitted mid-rebase");
-    ok(!validateToolCall("write", "a.ts", checkpointStep(), "gate").block, "write admitted mid-rebase");
+    ok(!validateToolCall("edit", "", checkpointStep(), "gate", "src/a.ts").block, "edit admitted mid-rebase");
+    ok(!validateToolCall("write", "", checkpointStep(), "gate", "src/a.ts").block, "write admitted mid-rebase");
+    ok(!validateToolCall("write", "", checkpointStep(), "gate", "deep/dir/b.ts").block, "nested path admitted");
   } finally { _setRebaseProbeForTest(null); }
+});
+
+// #1418 review round 2, F1 — the allowance must not reach the gate's OWN
+// advance path. The operator force-pass file is ordinary JSON that `write`
+// could mint, and checkpointTokenOk honours it whenever the real token fails,
+// so an unscoped allowance would let one write advance the step with no
+// checker run (and an audit line naming an "operator" the agent invented).
+await test("#1418 F1 (round 2): mid-rebase writes are REFUSED outside the worktree / on the ledgers / in the git dir", () => {
+  _setTokenFileForTest(null);
+  const step = checkpointStep();
+  const tok = join(process.cwd(), ".mid-rebase-token.json");
+  try {
+    _setRebaseProbeForTest(() => true);
+    _setTokenFileForTest(tok);
+    const denied: Array<[string, string]> = [
+      ["the operator force-pass file", "/tmp/parallel-check-force.json"],
+      ["an absolute path outside the worktree", "/etc/passwd"],
+      ["a traversal escape", "../../etc/passwd"],
+      ["the token file, by IDENTITY (inside the tree)", tok],
+      ["a git hook (git dir)", ".git/hooks/pre-commit"],
+      ["the git config", ".git/config"],
+      ["an empty target", ""],
+    ];
+    for (const [label, target] of denied) {
+      ok(validateToolCall("write", "", step, "gate", target).block, `write refused: ${label}`);
+      ok(validateToolCall("edit", "", step, "gate", target).block, `edit refused: ${label}`);
+    }
+    // a missing target is a DENY, not an allow (the fail-closed direction)
+    ok(validateToolCall("write", "", step, "gate").block, "no target at all → blocked");
+    ok(validateToolCall("write", "", step, "gate", 42).block, "non-string target → blocked");
+    // …and the SAME targets are still refused once the rebase ends
+    _setRebaseProbeForTest(() => false);
+    ok(validateToolCall("write", "", step, "gate", "src/a.ts").block, "no rebase → even an inside path is blocked");
+  } finally { _setRebaseProbeForTest(null); _setTokenFileForTest(null); }
 });
 
 await test("#1418 F1: the full CONFLICT loop is reachable at one pending checkpoint (rebase stops → edit → add → continue)", () => {
@@ -768,14 +803,14 @@ await test("#1418 F1: the full CONFLICT loop is reachable at one pending checkpo
   const step = makeStep({ name: "check", gate: "checkpoint", token_phase: "implement" });
   try {
     ok(!validateToolCall("bash", "git rebase origin/main", step, "gate").block, "rebase reachable");
-    ok(!validateToolCall("edit", "src/conflicted.ts", step, "gate").block, "conflict resolution reachable");
+    ok(!validateToolCall("edit", "", step, "gate", "src/conflicted.ts").block, "conflict resolution reachable");
     ok(!validateToolCall("bash", "git add src/conflicted.ts", step, "gate").block, "staging reachable");
     ok(!validateToolCall("bash", "git rebase --continue", step, "gate").block, "continuation reachable");
     ok(!validateToolCall("bash", "parallel_work_check.sh implement", step, "gate").block, "checker re-run reachable");
     // …and the allowance dies with the rebase: the step still cannot advance
     // without a fresh CLEAR token.
     _setRebaseProbeForTest(() => false);
-    ok(validateToolCall("edit", "src/conflicted.ts", step, "gate").block, "edit re-blocked once the rebase ends");
+    ok(validateToolCall("edit", "", step, "gate", "src/conflicted.ts").block, "edit re-blocked once the rebase ends");
   } finally { _setRebaseProbeForTest(null); }
 });
 
@@ -800,12 +835,23 @@ await test("#1418 F1: rebaseInProgress() follows the linked-worktree `.git` FILE
   } finally { rmSync(base, { recursive: true, force: true }); }
 });
 
-await test("#1418 at an ALREADY-ok checkpoint the remedy proceeds (not the checker-fresh guard)", () => {
+// Review round 2, F2: this row used to assert only that `git fetch` is not
+// blocked at an ok-checkpoint — which was TRUE BEFORE the diff, so no mutation
+// of the change could redden it (dead weight that read as coverage of the
+// token_fresh guard). It now PINS the premise (`checkpointTokenOk` really is ok
+// at this fixture) and asserts the PAIR that bounds the guard: the remedy
+// proceeds, and a checker re-run at the same state is refused by
+// `checkpoint_token_fresh`. Drop either half of the guard's scope and one of
+// the two assertions reddens.
+await test("#1418 at an ALREADY-ok checkpoint: the remedy proceeds while a checker re-run is refused (guard scope, both halves)", () => {
   try {
     _setRepoForTest(TEST_REPO);
     writeToken(new Date().toISOString(), { phase: "plan" });
+    ok(checkpointTokenOk(checkpointStep(), { enforceBinding: true }).ok, "premise pinned: this IS an ok checkpoint");
     const r = validateToolCall("bash", "git fetch", checkpointStep(), "gate");
     ok(!r.block, "a git fetch is not a checker re-run — the token_fresh guard must not fire");
+    const re = validateToolCall("bash", "parallel_work_check.sh plan", checkpointStep(), "gate");
+    ok(re.block && re.freshTokenBlock === true, "the same state DOES refuse a checker re-run with freshTokenBlock");
   } finally { _setTokenFileForTest(null); _setRepoForTest(null); }
 });
 
