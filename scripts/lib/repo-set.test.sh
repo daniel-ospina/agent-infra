@@ -31,7 +31,10 @@
 # state dir, config file or launchd domain is touched. External dependencies: `git`, and `python3` for
 # the doctored-doctor mutation fixtures (both are already required by the reader's own delegated
 # proofs, so the suite needs nothing a real box does not — INCLUDING NO `timeout`, which macOS does not
-# ship: `_rs_bound` below is the pure-bash substitute).
+# ship: `_rs_bound` below is the substitute). ⛔ "PURE-BASH" DESCRIBED THE RUNNER, NOT ITS PROOFS
+# (round 45 — the review caught this sentence contradicting the bound's own header further down):
+# `_rs_bound` is pure BASH, and it also calls `ps`, `awk` and `sleep`, all of which stock macOS and
+# Linux ship — and the bound's own `ps`-unavailable residual is written around that dependency.
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$HERE/../.." && pwd)"
 # `set -u` comes AFTER the two resolutions on purpose: a harness that streams the shard list into a
@@ -107,10 +110,14 @@ EOF
 #     of a launchd unit. An arm leaning on it reds on `command not found`, i.e. on the HARNESS, where the
 #     arm exists to prove BEHAVIOUR (the same trap `set -u` is placed after the resolutions for).
 #  2. THE BOUND CANNOT LIVE ONLY IN THE ARM THAT NAMES THE REGRESSION: the ancestor walk used to LOOP on a
-#     slash-less parent, and that regression HANGS rather than reddening — measured: rc 124 with no output
-#     under a 15 s bound. Putting the bound in the helper covers every `run_reader*` call site at once,
-#     plus the fixture arms below that call it directly (`j-emptyrender`, both halves of `j16f`, and
-#     `m46`).
+#     slash-less parent, and the FIRST absent-path arm to run is `b1`, which had no bound — so a
+#     re-regression WEDGED the shard for its whole CI timeout instead of reddening (measured: rc 124 with
+#     no output under a 15 s bound). Putting the bound in the helper covers every `run_reader*` call site
+#     at once, plus the fixture arms that call `_rs_bound` DIRECTLY — which are enumerated by
+#     `grep -n '_rs_bound [0-9]' <this file>` and not from memory: this sentence once listed three of them
+#     (`j-emptyrender`, both halves of `j16f`, `m46`) and was three short the moment the merged lineage
+#     added `j16k`/`j16k2` and `m47`. A list in a comment about the file's own instrumentation is exactly
+#     the thing that goes stale, so the recipe is the enumeration.
 #     ⛔ AND THE RETURN CODE ALONE WAS NOT ENOUGH — IT MADE THREE ARMS PASS ON A HANG (round 45 review, P2 —
 #     measured, and this paragraph claimed the opposite: "`124` is `timeout`'s own code, so the arms'
 #     arithmetic is unchanged", which is FALSE for any arm whose subject is EMPTINESS). `_rs_bound` used to
@@ -123,31 +130,33 @@ EOF
 #     stdout, so it lands in the `2>&1` form and in the `2>/dev/null` form alike and no emptiness arm can
 #     pass on it; `j-bound-expiry-*` are the sensors, and they drive the same two shapes through a child
 #     that never answers.
-#     ⛔ IT DOES NOT COVER EVERY ARM, AND CLAIMING IT DID WAS FALSE (round 44 review, P2). The unbounded
-#     shapes are NAMED rather than counted, because a count in this sentence has already been wrong more
-#     than once — including the "Three" this paragraph itself said while also saying "not counted":
-#       (a) the `bash "$W/pr-doctor-machine.sh"` wrapper arms;
-#       (b) the direct `bash "$READER"` / `/bin/bash "$READER"` arms — which are THREE different shapes and
-#           must not be described together: the PATH-scoped fault-injection fixtures (`no-sed`, `no-awk`,
-#           `no-tr`, `NODIR`) cannot simply wrap the helper, because it needs `ps` and `sleep` from the
-#           AMBIENT path; the `$HOME`-unset arms set no `PATH` at all and are unbounded by omission rather
-#           than necessity; and the PLAIN direct arms — `b4` and the `j22`/`j24`/`j29`/`j30` path and
-#           absence fixtures — scope neither `PATH` nor `HOME`, so they are unbounded purely because
-#           nobody wrapped them, and `run_reader*` would take them as-is. The round-44 arms below show
-#           the shape that works for a PATH-scoped child:
-#           route the CHILD's environment through `env` (`REPO_SET_FILE` in all of them, plus `PATH` in
-#           BOTH of the `j16f` halves — `j16f` and `j16f2` each pass `PATH="$ND"`, and naming only the
-#           first is the one-arm-short enumeration this paragraph has now been wrong about twice) and
-#           leave the helper on the ambient path;
-#       (c) the COPY/MUTANT reader arms (`bash "$M/lib/repo-set.sh"` and the `$NA`/`$ND`/`$NODOC`/`$M2`/
-#           `$M3`/`$M4` siblings), which run a rewritten reader instead of the shipped one;
+#     ⛔ BUT IT DOES NOT COVER EVERY ARM, AND SAYING IT DID WAS A FALSE COVERAGE CLAIM (round 44 review,
+#     P2). Populations bypass the helper and stay unbounded, and they are NAMED rather than counted on
+#     purpose — the counts in the first version of this paragraph were wrong (this file's `f11f` lesson,
+#     one arm over), which is what a count in a comment reliably becomes. The list below is the count.
+#       (a) The `bash "$W/pr-doctor-machine.sh"` wrapper arms.
+#       (b) The direct `bash "$READER"` / `/bin/bash "$READER"` arms — which are THREE different shapes
+#           and must not be described together: the PATH-scoped fault-injection fixtures (`no-sed`,
+#           `no-awk`, `no-tr`, `NODIR`) cannot simply wrap the helper, because it needs `ps` and `sleep`
+#           from the AMBIENT path; the `$HOME`-unset arms set no `PATH` at all and are unbounded by
+#           omission rather than necessity; and the PLAIN direct arms — `b4` and the
+#           `j22`/`j24`/`j29`/`j30` path and absence fixtures — scope neither `PATH` nor `HOME`, so they
+#           are unbounded purely because nobody wrapped them, and `run_reader*` would take them as-is. The
+#           round-44 arms below show the shape that works for a PATH-scoped child: route the CHILD's
+#           environment through `env` (`REPO_SET_FILE` in all of them, plus `PATH` in BOTH of the `j16f`
+#           halves — `j16f` and `j16f2` each pass `PATH="$ND"`, and naming only the first is the
+#           one-arm-short enumeration this paragraph has now been wrong about twice) and leave the helper
+#           on the ambient path.
+#       (c) The COPY/MUTANT reader arms (`bash "$M/lib/repo-set.sh"` and the `$NA`/`$ND`/`$NODOC`/`$M2`/
+#           `$M3`/`$M4` siblings), which run a rewritten reader instead of the shipped one.
 #       (d) `rs_call` and the other arms that SOURCE the reader in a `bash -c` child, which reach no bound
 #           either.
 #     ⛔ AND AN ABSOLUTE PATH IS NOT THE HANG RISK — a slash-less RELATIVE one is (measured on the
 #     reconstructed first-cut walk: a deep absolute nonexistent path answers in 4 ms, while
 #     `absent-relative.conf` hangs to the bound). `j16g` is the arm that owns that distinction and `j16h`
-#     says so; the unbounded arms above pass absolute paths, so they are a coverage gap to close, not a
-#     live wedge.
+#     says so. So the unbounded arms above are a coverage gap to close, not a live wedge — but a future
+#     walk that hangs on an ABSOLUTE path WOULD wedge the shard from them, because absolute is precisely
+#     what every pre-round-44 fixture passes.
 #  3. ⛔ IT MUST KILL THE WHOLE TREE, NOT `$!` — and the first cut did not, which made it INERT exactly
 #     where it was needed. Measured: with the walk broken, `_rs_bound` returned 124 at 30.9 s and the
 #     calling `$( )` STILL BLOCKED past 60 s, because the killed reader left children whose stdout IS the
@@ -217,9 +226,21 @@ run_reader_rel() { local c="$1"; shift; ( cd "$T" && REPO_SET_FILE="$c" _rs_boun
 
 # ⛔ NON-VACUITY FOR THE EMPTINESS ARMS (round 45 review, P2 — this was a measured FALSE PASS). The two
 # arms below drive the bound through a child that NEVER answers, in exactly the two stream shapes the
-# `-z` arms use, and require the captured text to be NON-empty. Without the stdout/stderr markers in
-# `_rs_bound` the first arm passes for the wrong reason (stderr carries the marker) and the second PASSES
-# OUTRIGHT (`2>/dev/null` leaves nothing at all), which is the pass-on-a-hang these arms exist to kill.
+# `-z` arms use, and require the captured text to be NON-empty. ⛔ MEASURED ON FOUR MUTANTS of `_rs_bound`
+# (each still returning 124 at the bound), because the first version of this paragraph said the arms PASSED
+# without a marker, which inverts them — and a description that tells a maintainer a working sensor is
+# vacuous is how a sensor gets deleted. The truth table, run rather than reasoned:
+#   no marker     -> BOTH arms RED   ← the non-vacuity this pins: the sensors are real against the pre-fix
+#   stderr only   -> arm1 passes, arm2 RED
+#   stdout only   -> both pass
+#   both (shipped)-> both pass
+# So arm2 is the sensor that would catch a future edit back to STDERR-ONLY, and without it `i3`/`k2` would
+# again read a hang as an empty answer; the stdout copy is the load-bearing one for that shape. The stderr
+# copy is kept because this reader's refusals go to stderr, so the marker rides the same channel in
+# `run_reader`'s merged form.
+# The pass-on-a-hang these arms exist to kill lives in the GUARDED arms, all three measured PASSING on a
+# hung reader before this round: `c-nothing-emitted-on-a-refusal` (the `2>&1` shape) and `i3`/`k2` (the
+# `2>/dev/null` shape).
 ck "j-bound-expiry-cannot-satisfy-a-merged-stream emptiness arm (2>&1)" \
    'o="$(_rs_bound 1 bash -c "sleep 5" 2>&1)"; rc=$?; [ "$rc" = 124 ] && [ -n "$o" ]'
 ck "j-bound-expiry-cannot-satisfy-a-stdout-ONLY emptiness arm (2>/dev/null, the shape of i3/k2)" \
@@ -1342,12 +1363,11 @@ else
   done
   NI="$T/nointerp-dirname"; mkdir -p "$NI/lib"
   # ⛔ THE `lib/` LAYOUT HERE IS NOT WHAT MAKES THIS ARM WORK, AND SAYING IT WAS WOULD BE A FALSE "MEASURED"
-  # (review round 44, P2 — a reviewer re-ran the arm with the reader at `$NI/repo-set.sh` and got the SAME
-  # rc 5: the absence arm returns during parse, before any delegated proof, so `_rs_doctor_py` is never
-  # consulted — a booby-trapped doctor recorded zero consultations while a parsing set fired the trap).
-  # The layout is used because it is the real one, and because the arms NEXT DOOR do need it:
-  # `j-emptyrender` passes VACUOUSLY without it (its guard only runs once a render happens) and `m46` REDS
-  # without it (it reads the "not found beside this reader" branch instead of its subject).
+  # (review round 44, P2 — the reviewer re-ran the arm with the reader at `$NI/repo-set.sh` and got the
+  # SAME rc 5: the absence arm returns during parse, before any delegated proof, so `_rs_doctor_py` is
+  # never consulted). The layout is used because it is the real one, and because the arms NEXT DOOR do
+  # need it: `j-emptyrender` passes VACUOUSLY without it (its guard only runs once a render happens) and
+  # `m46` REDS without it (it reads the "not found beside this reader" branch instead of its subject).
   cp "$READER" "$NI/lib/repo-set.sh"; cp "$REPO_ROOT/scripts/pr-doctor.py" "$NI/pr-doctor.py"
   python3 - "$NI/lib/repo-set.sh" <<'PYNID'
 import sys
@@ -1395,10 +1415,10 @@ PYNID
      '[ "$_rc_na2" = 5 ] && grep -q "is not a directory" <<<"$_o_na2" && ! grep -q "neither is any directory above it" <<<"$_o_na2"'
 fi
 # ⛔ THE REFUSAL NAMED A CAUSE THAT IS FALSE WHEN THE NEAREST EXISTING COMPONENT IS A FILE (review round 44,
-# P2 — measured). `/etc/passwd/foo/repos.conf` was refused with "a permission denial on an ancestor … a path
-# that is too long, or an I/O error", none of which is true: a COMPONENT IS A FILE. `_rs_stat_kind` folded
-# `ENOTDIR` into `other`; it has its own kind and its own arm now. Same right-code/wrong-cause class as the
-# FIFO parenthetical `j4b` fixes a few arms up.
+# P2 — measured). `/etc/passwd/foo/repos.conf` was refused at rc 5 with "neither is any directory above it",
+# while `/etc` and `/` are traversable directories: what is wrong is that the ancestor itself is not a
+# directory. The code was right and the CAUSE was wrong — the same class as the FIFO parenthetical `j4b`
+# fixes a few arms up, one message further down.
 printf 'slug=o/n checkout=%s state=%s/st\n' "$T/tortoise" "$T" > "$T/notadir-anc.conf"
 _o_na="$(_rs_bound 30 env REPO_SET_FILE="$T/notadir-anc.conf/inside/repos.conf" /bin/bash "$READER" check 2>&1)"; _rc_na=$?
 ck "j16k a FILE as the nearest existing ancestor names THAT — not 'neither is any directory above it'" \
@@ -1914,6 +1934,23 @@ PYMI
 printf 'slug=o/n checkout=%s state=%s/st\n' "$T/tortoise" "$T" > "$T/nointerp.conf"
 ck "m46 sibling PRESENT + NO interpreter: the origin line names THAT, never 'cannot see why'" \
    'o="$(_rs_bound 30 env REPO_SET_FILE="$T/nointerp.conf" /bin/bash "$MI/lib/repo-set.sh" check 2>&1)"; grep -q "no python3 resolves here, so pr-doctor.py could not be RUN at all" <<<"$o" && ! grep -q "cannot see why" <<<"$o"'
+# ⛔ AND THE RESIDUE MUST NOT CLAIM THE CHILD "COULD BE RUN" EITHER (review round 45, P2 — measured).
+# m45 covers the sibling that will not LOAD; m46 covers no interpreter resolving. This is the third shape
+# the residue got wrong: `python3` RESOLVES but cannot EXEC — a stale shim that exits 127 — so
+# `_rs_py_resolve` is non-empty and the old line asserted the child "could be run" about the one
+# interpreter that provably could not. `command -v` reports how the shell would resolve a name WITHOUT
+# invoking it (POSIX splits 126 `found but not invokable` from 127), so resolution is never evidence of a
+# run. The `lib/` subdir is load-bearing for the same reason it is in m46 — it is the real layout
+# `_rs_doctor_py` resolves the sibling from, so the failure under test is the EXEC, not a missing doctor.
+# ⛔ THE `env` SCOPING IS LOAD-BEARING TOO: the helper needs `ps`/`sleep` from the AMBIENT path, so the
+# shim goes on the CHILD's PATH only. Measured: pre-fix the line reads "even though it could be run";
+# post-fix it reads "produced no answer, and this reader cannot see why".
+MP="$T/unrunnable-py"; mkdir -p "$MP/lib" "$MP/pybin"
+cp "$READER" "$MP/lib/repo-set.sh"; cp "$REPO_ROOT/scripts/pr-doctor.py" "$MP/pr-doctor.py"
+printf '#!/bin/sh\nexit 127\n' > "$MP/pybin/python3"; chmod +x "$MP/pybin/python3"
+printf 'slug=o/n checkout=%s state=%s/st\n' "$T/tortoise" "$T" > "$T/unrunnable.conf"
+ck "m47 python3 RESOLVES but cannot EXEC: the residue names NO cause — never 'could be run'" \
+   'o="$(_rs_bound 30 env PATH="$MP/pybin:$PATH" REPO_SET_FILE="$T/unrunnable.conf" /bin/bash "$MP/lib/repo-set.sh" check 2>&1)"; grep -q "cannot see why" <<<"$o" && ! grep -q "could be run" <<<"$o"'
 ck "m37 …while the SHIPPED doctor still REFUSES a genuinely different slug on the same checkout (rc 1)" \
    '[ "$(run_reader_rc "$T/nonorm-wrong.conf" check)" = 1 ]'
 ck "m38 …and with the shipped doctor the \`.git\` spelling is simply ACCEPTED, with no WARN" \

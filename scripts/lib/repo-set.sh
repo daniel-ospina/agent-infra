@@ -243,10 +243,13 @@ _rs_doctor_available() {
 # errno" — the walk below is what answers then.
 #
 # ⛔ `[ ! -e ]` DOES NOT MEAN "ABSENT", AND THE ANCESTOR WALK ALONE CANNOT TELL (review round 11, P2).
-# `-e` is false for EVERY stat failure: ENOENT (absent), EACCES/EPERM (a denial — TCC denies at an
-# ancestor while that ancestor's MODE still reads traversable, which is exactly how the walk above gets
-# it wrong), ENAMETOOLONG, EIO. A denial read as absence means the box DEGRADES on a set that exists and
-# is told to create it — the round-9 P2 this arm keeps trying to close, surviving one errno over.
+# `-e` is false for EVERY stat failure, and absence (ENOENT) is only one of them — so what follows is
+# EXAMPLES, not an enumeration, and a new errno does not make it false: EACCES/EPERM (a denial — TCC
+# denies at an ancestor while that ancestor's MODE still reads traversable, which is exactly how the walk
+# above gets it wrong), ENOTDIR (a path component is a FILE — the `notdir` kind above, and the sharpest
+# demonstration that `-e` false is not absence), ENAMETOOLONG, EIO. A denial read as absence means the box
+# DEGRADES on a set that exists and is told to create it — the round-9 P2 this arm keeps trying to close,
+# surviving one errno over.
 # Bash cannot see the errno; python can, and the same interpreter is already resolved for the doctor.
 _rs_stat_kind() {
   local p="${1:-}" py
@@ -504,8 +507,10 @@ repo_set_parse() {
   if [ ! -e "$f" ]; then
     local anc kind; anc="$(_rs_nearest_existing_ancestor "$f")"
     kind="$(_rs_stat_kind "$f")"
-    # ⛔ THE ERRNO DECIDES WHEN IT CAN (review round 11, P2). `-e` false covers ENOENT, EACCES/EPERM
-    # (a TCC denial under a MODE-traversable ancestor), ENAMETOOLONG and EIO; only the first is absence.
+    # ⛔ THE ERRNO DECIDES WHEN IT CAN (review round 11, P2). `-e` false is false for EVERY stat failure,
+    # and absence is only one of them — EXAMPLES, not an enumeration, so the list cannot go stale the way
+    # the kind list beside it did: ENOENT, EACCES/EPERM (a TCC denial under a MODE-traversable ancestor),
+    # ENOTDIR (a component is a FILE — the `notdir` arm below), ENAMETOOLONG, EIO. Only ENOENT is absence.
     # When no interpreter resolves, `unknown` falls back to the ancestor walk below and the narrower
     # claim in its message ("we cannot see it") is the honest one.
     case "$kind" in
