@@ -916,7 +916,12 @@ for i, raw in enumerate(lines):
         continue
     s = re.sub(r'\s#.*$', '', raw)
     m = defn.match(s)
-    if m:
+    # ⛔ A KEYWORD IS NOT A FUNCTION NAME ON THIS BRANCH EITHER (round 48 review, P3 — measured): the
+    # exclusion below existed only for the brace-on-the-NEXT-line form, so a ONE-LINE group command —
+    # `if { …; }` / `while { …; }` — was reported as a definition named `if`, and the namespace arm
+    # (`f11f`) reded on a change that violates no namespace. Measured: the same condition written with no
+    # leading `if` is not reported, and `if { …; }` is.
+    if m and m.group(1) not in KEYWORDS:
         defs.append(m.group(1)); continue
     m = head.match(s)
     if not m or m.group(1) in KEYWORDS:
@@ -1485,6 +1490,50 @@ ck "j16q a TRAILING SLASH on a regular file is BROKEN (5) — never 'does not ex
 _o_nt2="$(_rs_bound 30 env REPO_SET_FILE="$T/notadir-trail.conf/" /bin/bash "$NI/lib/repo-set.sh" check 2>&1)"; _rc_nt2=$?
 ck "j16q2 …and with NO stat answer the stripped spelling is what exposes it (5, never the degrade code)" \
    '[ "$_rc_nt2" = 5 ] && grep -q "must be a DIRECTORY" <<<"$_o_nt2" && ! grep -q "does not exist" <<<"$_o_nt2" && ! grep -q "not traversable" <<<"$_o_nt2"'
+# ⛔ THE SAME SHAPE ONE LEVEL OUT: A DANGLING LINK SPELLED WITH A TRAILING SLASH (round 48 review, P1 —
+# measured). Round 47 keys the absence clause on `[ ! -e "$stripped" ]` and `-e` FOLLOWS the link, so a link
+# whose target is not there reads "absent" in the stripped spelling too — and the clause certified ABSENCE
+# at rc 3, the degrade code, for a set that is a link in plain sight. `[ -L "dang.conf/" ]` is FALSE (the
+# trailing slash makes the check follow), so the link is visible only in the stripped spelling, and the
+# shape is on the `absent` route as well as `unknown` — hence the arm is shown on BOTH readers, and each
+# half reds on its own when the arm is removed (interpreter: `absent` → 3; no interpreter: the traversable
+# parent → 3). `j16n` above keeps the resolving-to-a-file link OUT of this arm, and `j16n2` below is what
+# actually PINS that exclusion: it lives in ITS OWN fixtures on purpose, because an arm that borrows `j8`'s
+# `dangling.conf` silently depends on an arm eighty lines up (measured round 48: the borrowed name printed
+# `ln: File exists` on every run, and the verdict rode on `j8`'s leftover link).
+ln -s "$T/no-such-target-xyz" "$T/traildang.conf"
+_o_dg="$(_rs_bound 30 env REPO_SET_FILE="$T/traildang.conf/" /bin/bash "$READER" check 2>&1)"; _rc_dg=$?
+ck "j16r a TRAILING SLASH on a DANGLING LINK is BROKEN (5) — \`-e\` follows the link, so the stripped spelling reads 'absent' too" \
+   '[ "$_rc_dg" = 5 ] && grep -q "symbolic link that cannot be resolved" <<<"$_o_dg" && ! grep -q "does not exist" <<<"$_o_dg"'
+_o_dg2="$(_rs_bound 30 env REPO_SET_FILE="$T/traildang.conf/" /bin/bash "$NI/lib/repo-set.sh" check 2>&1)"; _rc_dg2=$?
+ck "j16r2 …and with NO stat answer, where the link is visible only in the stripped spelling" \
+   '[ "$_rc_dg2" = 5 ] && grep -q "symbolic link that cannot be resolved" <<<"$_o_dg2" && ! grep -q "does not exist" <<<"$_o_dg2"'
+# ⛔ THE `[ ! -e "$stripped" ]` CONJUNCT IS LOAD-BEARING FOR THE MESSAGE AND NOTHING SENSED IT (round 48
+# review, P2 — measured). Without it the dangling-link arm also claims a link whose target is RIGHT THERE
+# (`<a link to a regular FILE>/`), so the operator is told "cannot be resolved" about a link that resolves
+# fine — and the whole suite stayed green while that happened, because `j16n`'s fixture carries no trailing
+# slash and `$stripped` is therefore not a link. Own fixtures, so this arm cannot ride on `j16n`'s.
+printf 'not a dir\n' > "$T/trailplainfile"; ln -s "$T/trailplainfile" "$T/trailfilelink"
+_o_tf="$(_rs_bound 30 env REPO_SET_FILE="$T/trailfilelink/" /bin/bash "$READER" check 2>&1)"; _rc_tf=$?
+ck "j16n2 …a link that RESOLVES to a FILE, spelled with a slash, keeps the not-a-directory cause — never 'cannot be resolved'" \
+   '[ "$_rc_tf" = 5 ] && grep -q "must be a DIRECTORY" <<<"$_o_tf" && ! grep -q "cannot be resolved" <<<"$_o_tf"'
+# ⛔ THE ABSENT VERDICT MUST NOT CLAIM A PROOF IT DOES NOT HAVE (round 48 review, P3 — measured). The
+# `unknown` disjunct is an INFERENCE from a traversable ancestor and has no length or permission test, so a
+# set path over `PATH_MAX` (or one only Full Disk Access can see) with no runnable interpreter is told
+# `does not exist` as though that had been established. The verdict stays 3 — the walk is the best evidence
+# available — but the sentence says which evidence it is. BOTH branches are asserted, because a message
+# that reports from one branch only is how the other one drifts back. ⛔ AND THE PAIR IS NOT TWO INDEPENDENT
+# SENSORS (measured round 48): making BOTH branches print the inference text reds `{b2, j16s2}` — `b2`
+# watches this same proven sentence — while making BOTH print the proof reds `j16s` alone. What `j16s2` adds
+# over `b2` is the `! grep INFERENCE` conjunct on the ABSENT branch, which is sole when isolated (proven
+# branch prints the proof AND the inference text → `j16s2` alone). Stated here rather than implied, because
+# it has already been written down backwards once.
+_o_ia="$(_rs_bound 30 env REPO_SET_FILE="$T/absent-unknown/repos.conf" /bin/bash "$NI/lib/repo-set.sh" check 2>&1)"; _rc_ia=$?
+ck "j16s with NO stat answer the absence verdict says it is the walk's INFERENCE — not a proof that the path is absent" \
+   '[ "$_rc_ia" = 3 ] && grep -q "INFERENCE and not a proof" <<<"$_o_ia" && ! grep -q "does not exist, so this machine" <<<"$_o_ia"'
+_o_pv="$(_rs_bound 30 env REPO_SET_FILE="$T/absent-proven/repos.conf" /bin/bash "$READER" check 2>&1)"; _rc_pv=$?
+ck "j16s2 …while with a stat answer the ABSENT verdict IS stated as proof (both branches are observable)" \
+   '[ "$_rc_pv" = 3 ] && grep -q "does not exist, so this machine has named no repo" <<<"$_o_pv" && ! grep -q "INFERENCE" <<<"$_o_pv"'
 # ⛔ AN UNRESOLVABLE SYMLINK COMPONENT USED TO PROVE ABSENCE (round 46, P2 — measured). The walk's only test
 # was `[ -e ]`, which FOLLOWS the link; a component whose target cannot be resolved answers FALSE, so the
 # walk SKIPPED it and returned a traversable grandparent ABOVE the link. The caller reads a traversable

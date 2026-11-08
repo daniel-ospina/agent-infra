@@ -601,6 +601,14 @@ assert_not_contains "$_PRD_TPL" "the log and the verdict MOVE to" "pr-doctor tem
 assert_not_contains "$_PRD_TPL" "canonical files BY NAME" "pr-doctor template: does NOT claim three readers open the canonical PAIR (round 45's overstatement)"
 assert_contains "$_PRD_TPL" "nothing live READS \`pr-doctor.log\`" "pr-doctor template: says out loud that the log has no live reader"
 assert_contains "$_PRD_TPL" "two things that WRITE it are" "pr-doctor template: pins the corrected writer count (two, not one appender)"
+# ⛔ THE PATH SENTENCE NAMED A GUARANTEE THE INSTALLER DOES NOT IMPLEMENT (round 48 review, P3 — measured).
+# It said PATH "carries the fleet's gh-wrapper dir FIRST", but `launchd_path()` only DROPS entries (unresolved,
+# and `*/shims`) and preserves the AMBIENT order — nothing is prepended, so a job installed from a shell with
+# no gh wrapper on PATH has none, and an operator debugging a bypassed wrapper was sent to the wrong file.
+# Both halves are pinned: the sentence that was false, and the one that replaced it.
+assert_contains "$_PRD_TPL" "PATH is the INSTALLER's PATH" "pr-doctor template: says which PATH the job gets — the installer's, not a curated one"
+assert_contains "$_PRD_TPL" "Nothing is prepended" "pr-doctor template: says the renderer DROPS only — the order it keeps is the ambient one"
+assert_not_contains "$_PRD_TPL" "gh-wrapper dir first" "pr-doctor template: never claims a gh wrapper is placed first (install-launchd.sh does not do that)"
 # ⛔ AND THE THREE READERS IT NAMES MUST ACTUALLY EXIST (round 46 review, P2 — measured). The arms above
 # pin the paragraph's WORDING only, so renaming or deleting `_fleet_pr_doctor_bound` kept them GREEN while
 # the operator-facing text named a function nobody can call — the drift this paragraph's own comment says

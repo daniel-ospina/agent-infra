@@ -609,6 +609,25 @@ repo_set_parse() {
     # claim — no interpreter resolve, or an answer outside the six-value contract — so it is the one case
     # where the traversable-ancestor test is the only evidence available, which is what `j16f` and
     # `j16l` pin.
+    # ⛔ A DANGLING LINK SPELLED WITH A TRAILING SLASH IS THE SAME SHAPE ONE LEVEL OUT, AND IT SATISFIED THE
+    # ABSENCE CLAUSE (round 48 review, P1 — measured). Round 47 keys absence on `[ ! -e "$stripped" ]`, and
+    # `-e` FOLLOWS the link: for `dang.conf -> <a target that is not there>` the STRIPPED spelling reads
+    # "absent" as well, so a set that is right there was certified absent at **rc 3** — the code the wrapper
+    # DEGRADES on — and the operator was told to create a file that is a link in plain sight. `[ -L
+    # "dang.conf/" ]` is FALSE (the trailing slash makes the check follow), so no arm could see it in the
+    # spelled form; the link is visible only in the STRIPPED spelling. ⛔ THIS IS THE `absent` ROUTE, NOT ONLY
+    # `unknown` — a dangling leaf answers `absent` even WITH an interpreter — which is why it is tested
+    # BEFORE the absent disjunct rather than inside it.
+    # ⛔ AND IT MUST NOT SWALLOW A LINK THAT RESOLVES TO A FILE (`filelink/`): `[ ! -e ]` is false for that
+    # one, so it keeps the not-a-directory cause below, which is true of it.
+    if [ -n "$stripped" ] && [ -L "$stripped" ] && [ ! -e "$stripped" ]; then
+      _rs_say 2 "repo-set: INVALID — $f is not visible from here, because the spelling without its trailing slash is a symbolic link that cannot be resolved from here"
+      _rs_say 2 "repo-set:   (the link: $stripped). That is the BROKEN state, not the absent one:"
+      _rs_say 2 "repo-set:   nothing below an unresolvable link can be shown to exist OR to be absent."
+      _rs_say 2 "repo-set:   Do not create the file; check what that link points at, and whether this"
+      _rs_say 2 "repo-set:   process is allowed to follow it."
+      return 5
+    fi
     if [ "$kind" = absent ] || { [ "$kind" = unknown ] && [ ! -e "$stripped" ] && [ -n "$anc" ] && [ -d "$anc" ] && [ -x "$anc" ]; }; then
       # ⛔ "NO HOME TO RESOLVE" IS BROKEN (5), NOT ABSENT (3) (round 32, P2). With `HOME` unset the path
       # above is EMPTY, and calling that "this machine has named no repo" degrades the wrapper on a box
@@ -617,7 +636,21 @@ repo_set_parse() {
         _rs_say 2 "repo-set: INVALID — HOME is unset or empty and REPO_SET_FILE names nothing, so the set path cannot be resolved; set REPO_SET_FILE=<absolute path>"
         return 5
       fi
-      _rs_say 2 "repo-set: NO-REPO-SET — $f does not exist, so this machine has named no repo."
+      # ⛔ THE MESSAGE MUST NOT CLAIM MORE THAN THE ROUTE PROVED (round 48 review, P3 — measured): the
+      # `unknown` disjunct is an INFERENCE from a traversable ancestor, and no length or permission test
+      # exists on it, so a set path over `PATH_MAX` (or one only launchd's Full Disk Access can see) with
+      # no runnable interpreter reaches this branch and used to be told `does not exist` as though that had
+      # been established. The verdict stays 3 — the ancestor walk is the best evidence there is here — but
+      # the sentence says which evidence it is, and names what it cannot rule out.
+      if [ "$kind" = absent ]; then
+        _rs_say 2 "repo-set: NO-REPO-SET — $f does not exist, so this machine has named no repo."
+      else
+        _rs_say 2 "repo-set: NO-REPO-SET — $f shows no sign of existing, and no stat answer came back (no"
+        _rs_say 2 "repo-set:   runnable python3 resolved, or the answer was outside the six-value contract), so"
+        _rs_say 2 "repo-set:   this is the ancestor walk's INFERENCE and not a proof: the path could be too"
+        _rs_say 2 "repo-set:   long, or visible only with Full Disk Access. As far as this process can tell,"
+        _rs_say 2 "repo-set:   this machine has named no repo."
+      fi
       _rs_say 2 "repo-set:   Create it, one repo per line:"
       _rs_say 2 "repo-set:     slug=OWNER/NAME checkout=/abs/checkout [state=/abs/state-dir]"
       return 3

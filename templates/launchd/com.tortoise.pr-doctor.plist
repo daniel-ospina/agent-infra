@@ -139,9 +139,12 @@
          (`set: … grading N repo(s)`, or `DEGRADED — NO-REPO-SET …`) is on the same
          capture, which is what makes a box with no repo set visible instead of quiet.
 
-         GH: PATH carries the fleet's gh-wrapper dir first (rendered by
-         install-launchd.sh with the unreadable pi shim dir removed, #1719/#427), and
-         HOME stays the real home so the doctor's state dir is the fleet's, not
+         GH: PATH is the INSTALLER's PATH — launchd_path() in install-launchd.sh keeps the
+         ambient order and only DROPS entries (anything that does not resolve, and any
+         */shims dir, #1719/#427). Nothing is prepended, so a job installed from a shell
+         whose PATH had no gh-wrapper dir has no gh wrapper either: check the installer's
+         PATH, not this file, when a launchd pass appears to bypass a PATH-installed
+         wrapper. HOME stays the real home so the doctor's state dir is the fleet's, not
          launchd's.
 
          ⛔ THE REPO IS NOT NAMED HERE AT ALL ANY MORE (agent-infra#2281 §1). This unit used to
