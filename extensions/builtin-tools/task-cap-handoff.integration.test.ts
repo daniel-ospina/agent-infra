@@ -336,7 +336,12 @@ test("circuit_open: the PRE-SPAWN refusal shape is unchanged (Task 3 scope guard
 	// (`retries === 0`) must keep its current refusal text + details — the
 	// composer has no access to a child's stderr/stdout at that scope.
 	ok(source.includes("❌ Sub-agent circuit breaker open — too many consecutive zero-output failures. Wait 60s before retrying."), "pre-spawn refusal text unchanged");
-	ok(source.includes('details: { model, provider, status: "circuit_open", retries: result.retries }'), "pre-spawn details literal unchanged");
+	// #1208 moved this details literal onto multiple lines (the liveness spread). The SCOPE GUARD is
+	// that the pre-spawn arm's own key set is unchanged, so it is asserted by token: the spread is
+	// gated on the existing `retries === 0` discriminator, which means a never-spawned breaker adds
+	// NO key at all.
+	ok(source.includes('status: "circuit_open"') && source.includes("retries: result.retries"), "pre-spawn details tokens unchanged");
+	ok(source.includes("breakerNeverSpawned ? {} : (lastLiveness ?? {})"), "the #1208 liveness spread is gated on the never-spawned discriminator");
 	// The real-spawn discriminator (venice-route guard, #512) still marks
 	// circuit_open-with-retries>0 as "a child ran".
 	ok(source.includes('result.status === "circuit_open" && result.retries === 0'), "never-spawned discriminator still present");

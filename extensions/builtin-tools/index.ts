@@ -2188,6 +2188,10 @@ export function stampLivenessDefaults(details: Record<string, unknown>): Record<
   return out;
 }
 
+/** #1208: settle reasons that are NOT a parent kill — an exit-path failure, a clean-but-silent
+ * exit, or a failed exec. Every other reason `doResolve` accepts is a watchdog kill. */
+export const NON_KILL_SETTLE_REASONS = new Set(["failed", "clean-empty", "spawn-error"]);
+
 /** #1208: the measured liveness of ONE settle, as the funnel computes it. Exported so the
  * caller-side retry wrapper can carry it onto the terminal result it composes when every attempt
  * resolved with no payload at all (review of this PR round 2, P2). */
@@ -2209,6 +2213,11 @@ export function childLivenessFor(i: {
   pid: number | undefined;
   stdout: string;
   exited: boolean;
+  /** #1208 (review round 3, P3): the settle was a WATCHDOG KILL even though it composed no payload.
+   * The zero-output kills resolve `undefined`, so `details.killed` is absent and the child would
+   * otherwise be measured `died-before-first-message` — losing the difference between "the parent
+   * cut it, raise the bound" and "the child died on its own". */
+  killedByReason?: boolean;
 }): TaskChildLivenessSnapshot {
   const spawnError = i.details.isError === true && i.details.killed !== true && !("exitCode" in i.details);
   const messagesSent = childMessagesSent(i.hbState);
@@ -2217,7 +2226,7 @@ export function childLivenessFor(i: {
     childState: spawnError
       ? "never-started"
       : classifyChildLiveness({
-          killed: i.details.killed === true,
+          killed: i.details.killed === true || i.killedByReason === true,
           hasStdout: i.stdout.trim().length > 0,
           messagesSent,
         }),
@@ -4347,6 +4356,9 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
         pid: proc.pid,
         stdout,
         exited: proc.exitCode !== null || proc.signalCode !== null,
+        // The `undefined` settles carry no payload, so the kill is named by the REASON that
+        // settled them. `failed` / `clean-empty` / `spawn-error` are not kills.
+        killedByReason: opts?.reason !== undefined && !NON_KILL_SETTLE_REASONS.has(opts.reason),
       });
       observers?.onLiveness?.(livenessSnapshot);
       if (value && typeof value === "object") {
@@ -6629,16 +6641,19 @@ export default function (pi: ExtensionAPI) {
         // four post-spawn returns so the caller can see that. (The pre-spawn
         // halt above is deliberately NOT wrapped — the root is untouched
         // there.)
-        return withSessionDegraded(
-          haltDispatchResult({
-            family: loopOut.halted.family,
-            provider: loopOut.halted.provider,
-            model: loopOut.halted.model,
-            reason: loopOut.halted.reason,
-            state: readLatchState(subAgentEnv),
-            attempted: true,
-          }),
-        );
+        // #1208 (review round 3, P2): a POST-spawn halt ran a real child ("the dispatch ran on
+        // <provider>/<model> and exhausted it"), so it must carry the MEASURED liveness rather than
+        // the tool layer's `never-started` default — otherwise a consumer reads "no child existed,
+        // fix the arguments" for a dispatch that spawned, ran and exhausted a child.
+        const halt = haltDispatchResult({
+          family: loopOut.halted.family,
+          provider: loopOut.halted.provider,
+          model: loopOut.halted.model,
+          reason: loopOut.halted.reason,
+          state: readLatchState(subAgentEnv),
+          attempted: true,
+        });
+        return withSessionDegraded({ ...halt, details: { ...(lastLiveness ?? {}), ...halt.details } });
       }
       result = loopOut.result;
       dispatchLeg = loopOut.dispatchLeg;
@@ -6696,9 +6711,20 @@ export default function (pi: ExtensionAPI) {
       }
 
       if (result.status === "circuit_open") {
+        const breakerNeverSpawned = result.retries === 0;
         return withSessionDegraded({
           content: [{ type: "text", text: "❌ Sub-agent circuit breaker open — too many consecutive zero-output failures. Wait 60s before retrying." }],
-          details: { model, provider, status: "circuit_open", retries: result.retries },
+          // #1208 (review round 3, P2): the half-open path that reaches this arm had a REAL child
+          // run, so the measurement is available and must be used — gated on the file's EXISTING
+          // never-spawned discriminator (`retries === 0`), so the pre-spawn refusal payload keeps the
+          // exact key set its own scope guard pins.
+          details: {
+            ...(breakerNeverSpawned ? {} : (lastLiveness ?? {})),
+            model,
+            provider,
+            status: "circuit_open",
+            retries: result.retries,
+          },
         });
       }
 

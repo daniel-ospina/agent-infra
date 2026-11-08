@@ -8984,9 +8984,18 @@ test("#1208: a KILLED zero-output settle keeps its measurement (review round 2, 
   const st = createHeartbeatState();
   parseHeartbeatLine("[task-heartbeat] ready nonce=nn", st, 1000);
   parseHeartbeatLine("[task-heartbeat] turn_start nonce=nn 1", st, 1001);
-  const snap = childLivenessFor({ details: { killed: true }, hbState: st, pid: 4242, stdout: "", exited: false });
+  // ⛔ THE PRODUCTION INPUT for a zero-output kill: NO payload at all (`details: {}`, killed absent)
+  // plus the settle REASON naming the kill. An earlier revision of this test fed `{killed:true}`
+  // with no payload — a combination `doResolve` never produces — which green-lit the mislabel the
+  // round-3 review found (the kills that carry no payload were measured as "died on its own").
+  const snap = childLivenessFor({ details: {}, hbState: st, pid: 4242, stdout: "", exited: false, killedByReason: true });
   equal(snap.childPid, 4242, "a killed child still has a pid — the measurement is not discarded");
-  equal(snap.childState, "killed", "the kill is named, not `never-started`");
+  equal(snap.childState, "killed", "the kill is named, not `never-started` and not `died on its own`");
+  equal(
+    childLivenessFor({ details: {}, hbState: st, pid: 4242, stdout: "", exited: true, killedByReason: false }).childState,
+    "died-before-first-message",
+    "the NEGATIVE twin: the same silent child that was NOT killed died on its own — the two are separable",
+  );
   equal(snap.childMessagesSent, 0, "and the zero-message evidence survives (ask 2)");
   equal(snap.childExited, false, "the kill was just signalled: the OS has not reported the child gone");
   equal(exhaustionStatusFor(snap), "died-before-first-message", "the exhaustion result names what was measured");
@@ -9005,6 +9014,9 @@ test("#1208: the retry-exhaustion arm is WIRED to the measured snapshot (source 
   // in this suite pays for that.
   ok(source.includes("status: exhaustionStatusFor(snap)"), "the exhaustion status comes from the measurement");
   ok(source.includes("onLiveness: (snap) => { lastLiveness = snap; }"), "every leg reports its settle to the caller");
+  ok(source.includes("killedByReason: opts?.reason !== undefined && !NON_KILL_SETTLE_REASONS.has(opts.reason)"), "a payload-less kill is named by its settle reason");
+  ok(source.includes("...(lastLiveness ?? {}), ...halt.details"), "the post-spawn halt carries the measurement");
+  ok(source.includes("breakerNeverSpawned ? {} : (lastLiveness ?? {})"), "the breaker arm carries it when a child actually ran");
   ok(source.includes("dispatchStreamStallMs, livenessObserver)"), "and every spawnLeg passes the observer");
   ok(source.includes("...(snap ?? {})"), "the measured fields ride the terminal result");
 });
