@@ -254,8 +254,9 @@ env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
 # supervisor reads it with an AMBIENT DEFAULT (`cloud-cell-supervisor.sh`'s
 # `MIN_FREE_MB="${MIN_FREE_MB:-500}"`) and `die`s below the floor (the `below the ${MIN_FREE_MB}MB floor`
 # line in `cmd_check_disk`), which BOTH `start` and `check` reach through that one call. Measured without
-# the pin: `MIN_FREE_MB=99999999 bash <this file>` reddens the whole-start assertion with `start_rc=1` plus
-# at least nine further failures — a red for a reason that is not this suite's subject. With `MIN_FREE_MB=1`
+# the pin: `MIN_FREE_MB=99999999 bash <this file>` reddens the whole-start assertion with `start_rc=1` and
+# 15 of the suite's rows in total, including at least nine beyond it — a red for a reason that is not this
+# suite's subject. With `MIN_FREE_MB=1`
 # in both callers' `env` lines, an inherited floor cannot ride in, exactly as for `GH_REPO` at the top.
 # So the rc is ASSERTED again — the only whole-`start` success assertion KIND in this suite. There are three,
 # and they are the `ck "… SUCCEEDED …" "$start_rc"` calls: each passes the start's OWN rc, and each sits
@@ -1091,8 +1092,9 @@ ck "no controller park site writes parked-\$PR without its reason" $rc
 
 # ⛔ THE EXECUTED FLOOR FOR THE WHOLE-`start` ASSERTIONS (#3774 review, P2). This PR's own thesis is that
 # #3760 deleted these three assertions and NOTHING reddened, and the restored lines are on their own
-# exactly as deletable — measured: commenting out only the `ck_start_succeeded …` calls returns
-# `115 passed, 0 failed`, exit 0, the identical #3760 state. So the expectation is DERIVED from this file,
+# exactly as deletable — measured BEFORE this floor existed, neutralising only the `ck_start_succeeded …`
+# calls returned `115 passed, 0 failed`, exit 0, the identical #3760 state. With the floor, that same edit
+# reddens one row: `116 passed, 1 failed`, exit 1. So the expectation is DERIVED from this file,
 # not declared as a figure: every arm that CAPTURES `start_rc` must also ASSERT it. `^[[:space:]]*unset start_rc`
 # is the capture marker (it opens each arm and is what makes a dropped binding abort under `set -u`), and it
 # is anchored so the prose that MENTIONS `unset start_rc` in the header cannot inflate the count.
