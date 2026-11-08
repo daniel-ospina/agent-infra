@@ -1,0 +1,40 @@
+{
+  "artifacts": [
+    {
+      "kind": "log",
+      "value": "/home/cmux/orchestrator/logs/lane-2249.log"
+    },
+    {
+      "kind": "branch",
+      "value": "feat/2249-tm"
+    },
+    {
+      "kind": "sha",
+      "value": "6b6c28fa6eb6602378adc7a1a9a0fe1da6df218e"
+    },
+    {
+      "kind": "worktree",
+      "value": "/home/cmux/agent-infra/.worktrees/tm-2249"
+    }
+  ],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 7800,
+  "duration_s": 7220,
+  "ended_at": 1794117284,
+  "exit_code": 143,
+  "heartbeat_at": 1794117284,
+  "host": "cmux",
+  "issue": 2249,
+  "kind": "lane",
+  "lane_id": "cmux.klane-2249-1794110064-p939962-5969e8f3",
+  "lease_until": 1794125084,
+  "pid": 939962,
+  "reason": "bound:exceeded-wallclock",
+  "repo": "daniel-ospina/agent-infra",
+  "schema": 1,
+  "started_at": 1794110064,
+  "state": "FAILED",
+  "tag": "2249",
+  "worktree": "/home/cmux/agent-infra/.worktrees/tm-2249"
+}
