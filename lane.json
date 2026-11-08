@@ -1,0 +1,42 @@
+{
+  "_ref": "refs/lanes/cmux.kprfix-prd-daniel-ospina-tortoise-11529-1794129669-p2243682-8b9514d8",
+  "_sha": "27a109ad2a33537498d888de14dd56f480e0d9f9",
+  "artifacts": [
+    {
+      "kind": "log",
+      "value": "/home/cmux/orchestrator/bg/prd-daniel-ospina-tortoise-11529.log"
+    },
+    {
+      "kind": "branch",
+      "value": "test/11202-pin-the-kill-arm"
+    },
+    {
+      "kind": "sha",
+      "value": "4d34150f40b49853742e72a4db56fd031e8ff7c1"
+    },
+    {
+      "kind": "worktree",
+      "value": "/home/cmux/tortoise/.worktrees/prd-11529"
+    }
+  ],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 7800,
+  "duration_s": 6788,
+  "ended_at": 1794136457,
+  "exit_code": 0,
+  "heartbeat_at": 1794136457,
+  "host": "cmux",
+  "issue": null,
+  "kind": "prfix",
+  "lane_id": "cmux.kprfix-prd-daniel-ospina-tortoise-11529-1794129669-p2243682-8b9514d8",
+  "lease_until": 1794144257,
+  "pid": 2243682,
+  "reason": null,
+  "repo": "daniel-ospina/tortoise",
+  "schema": 1,
+  "started_at": 1794129669,
+  "state": "DONE",
+  "tag": "prd-daniel-ospina-tortoise-11529",
+  "worktree": "/home/cmux/tortoise/.worktrees/prd-11529"
+}
