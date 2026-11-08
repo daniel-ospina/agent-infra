@@ -1,0 +1,63 @@
+[Unit]
+# eldato conflict-rebase — keep CONFLICTING/BEHIND PRs mergeable, on a clock (agent-infra#2698).
+#
+# WHY THIS IS A TIMER AND NOT A GITHUB ACTION — the .py's header carries the full argument, and the
+# two reasons are mechanical rather than stylistic:
+#   1. a push made with GITHUB_TOKEN creates NO new workflow runs, so a bot-rebased head would carry
+#      no check runs and scripts/admin-merge.sh's "the head must have been TESTED" precondition would
+#      refuse every PR the bot touched;
+#   2. the review record is a LOCAL file bound to head_sha AND diff_sha256. A runner cannot invalidate
+#      it, so an Actions bot would leave an attestation standing over a diff no reviewer saw. The
+#      cell's own credential pushes as the owner and can see the record store.
+#
+# ⛔ WHAT IT WILL NOT DO. It never resolves a content conflict (it labels `needs-human-conflict` and
+# pushes nothing), never edits a PR body, and after every push it re-reads the gate's OWN diff hash:
+# unchanged => the record is kept and the comment names the hash; changed => the record is moved aside
+# (`*.superseded-<head>`, and any review-asserting label is removed) and the comment says so. A stale
+# attestation is never left standing SILENTLY — that is the property the arming audit asked for, and
+# it is `record_state()` + `strip_review_labels()` in the .py, not this comment.
+#
+# ⛔ THE BRAKE FILE IS THE OPERATOR'S STOP, AND THIS UNIT HONOURS IT. `conflict-rebase-timer.sh pause`
+# creates `{{STATE}}/PAUSED`. The detached-loop form always honoured it; `start --once` — the form a
+# systemd timer calls — did NOT, so a brake written by an operator would have been ignored by exactly
+# the shape the fleet schedules. Fixed here (and pinned by a test): a brake that works in only one of
+# two invocation shapes is a brake the operator would be wrong to trust.
+#
+# NO `--dry-run` HERE, AND THAT IS THE ARMING. The pass acts by default; `CONFLICT_REBASE_DRY_RUN`
+# exists and is honoured, but this unit does not set it, so the arming is visible in the artifact
+# rather than hidden in an environment default (the #1678 rule — arming a bot actor is an operator
+# decision; this one was instructed by the owner, 2026-11-07).
+Description=eldato conflict-rebase — rebase PRs whose only blocker is CONFLICTING/BEHIND
+Documentation=https://github.com/daniel-ospina/agent-infra/blob/main/docs/ops/conflict-rebase.md
+# It talks to GitHub and pushes. The ordering only avoids a guaranteed first-run failure on a box that
+# boots disconnected; a failed pass stamps `last-failure` and reads red, which is the honest state.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User={{USER}}
+Environment=HOME={{HOME}}
+Environment=PATH={{PATH}}
+# ⛔ THE CHECKOUT IS PINNED, never left ambient. `conflict-rebase.py` cannot see DETACHED worktrees
+# without one — the sibling conflict lane holds its PRs in exactly those (`/tmp/rcwt/<PR>`) — so a
+# scheduled pass with no checkout loses half its lane-hold guard and says nothing. A unit that
+# resolved the repo from the service's own environment would also act on a different tree than the
+# operator means (the harness-apply precedent, agent-infra#2416).
+Environment=CONFLICT_REBASE_CHECKOUT={{CHECKOUT}}
+Environment=CONFLICT_REBASE_REPO={{REPO}}
+Environment=CONFLICT_REBASE_MAX={{MAX_PRS}}
+Environment=CONFLICT_REBASE_INCLUDE_BEHIND={{INCLUDE_BEHIND}}
+# One record, one path: the scheduled pass, `conflict-rebase-timer.sh status` and
+# `activate-harness.sh --check` all read this directory.
+Environment=CONFLICT_REBASE_STATE={{STATE}}
+# A background pass: it must never compete with a lane for CPU or I/O.
+Nice=10
+IOSchedulingClass=idle
+# The pass bounds itself with `lib/bounded.sh` (a Mac has no `timeout`). This ceiling is the outer
+# backstop for the case where it wedges BEFORE it arms its own bound.
+TimeoutStartSec=2400
+# `start --once` is EXACTLY ONE PASS in the foreground — the shape the timer wants. It is not the
+# detached loop: the timer IS the schedule here, and two loops pacing each other is the double-actor
+# class this repo keeps removing. The wrapper still holds its own pidfile guard and its own brake.
+ExecStart=/bin/bash {{TIMER}} start --once

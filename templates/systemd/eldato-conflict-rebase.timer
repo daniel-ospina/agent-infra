@@ -1,0 +1,29 @@
+[Unit]
+# Every {{INTERVAL_MIN}} minutes, measured from the last pass (`OnUnitActiveSec`) rather than from the
+# wall clock.
+#
+# WHY A MONOTONIC TIMER AND NOT `OnCalendar=*:0/30`. The cadence is a seam the installer validates
+# (CONFLICT_REBASE_INTERVAL_MIN, 1..1440). `OnCalendar` can only express a value that divides the hour,
+# so a 45-minute cadence would fire at :00 :45 and then wait fifteen minutes — a cadence the unit
+# states and does not keep (the measured reason the harness-apply timer is monotonic, #2416).
+#
+# ⛔ `OnUnitActiveSec=` ALONE WOULD NEVER FIRE, and that is not hypothetical: two shipped timers
+# (`eldato-objective-reminder`, `eldato-controller-watchdog`) carry exactly that shape and were
+# measured on pi-cell-1 as `enabled`, `active` and NEVER TRIGGERED — an inert enforcer that reads
+# green. `OnBootSec=` above is the trigger that arms the monotonic cycle; without it the timer has no
+# first elapse to be relative to.
+#
+# ⛔ `Persistent=` IS DELIBERATELY ABSENT. It only means anything for `OnCalendar=` timers; on a
+# monotonic timer systemd ignores it, and writing it would claim a catch-up behaviour that does not
+# happen. The reboot case is `OnBootSec`.
+Description=eldato conflict-rebase every {{INTERVAL_MIN}} minutes
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec={{INTERVAL_MIN}}min
+# Spread the fleet's passes so four cells do not push against GitHub in the same second.
+RandomizedDelaySec=120
+Unit=eldato-conflict-rebase.service
+
+[Install]
+WantedBy=timers.target

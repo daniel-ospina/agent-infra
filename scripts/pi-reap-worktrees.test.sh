@@ -3093,8 +3093,14 @@ if [ -n "$_pa_line" ] && [ -n "$_hr_line" ] && [ -n "$_fork_line" ] \
     # false-blocks is a guard that later gets edited away.
     _hr_linetext="$(sed -n "${_hr_line}p" "$REAPER" 2>/dev/null)"
     _hr_code="${_hr_linetext%%#*}"
+    # ⛔ A HERE-STRING, NOT A PIPE (#841/#864). `printf … | grep -q` is the SIGPIPE false-negative
+    # idiom this repo's own gate refuses: under `set -o pipefail`, `grep -q` exits as soon as it matches,
+    # the builtin producer takes SIGPIPE, the PIPELINE returns non-zero, and the assertion reports RED on
+    # the case that was actually GREEN. A builtin writer inverts to a here-string, which has no pipe to
+    # signal. The finding was on `origin/main` (`scripts/pi-reap-worktrees.test.sh:3096`), untouched by
+    # this branch, and it read as a red `sigpipe-grep` required check on every PR.
     if [ -z "$_between" ] \
-            && printf '%s' "$_hr_code" | grep -qxE '[[:space:]]*holder_recheck "\$path" "\$sha" \|\| \{ rm -f "\$out"; return 2; \}[[:space:]]*'; then
+            && grep -qxE '[[:space:]]*holder_recheck "\$path" "\$sha" \|\| \{ rm -f "\$out"; return 2; \}[[:space:]]*' <<<"$_hr_code"; then
         ok "A21e the post-archive re-check runs BEFORE holder_recheck, which stays the LAST code line before the fork"
     else
         bad "A21e a probe sits between holder_recheck and the fork (between='$(printf '%s' "$_between" | head -2 | tr '\n' ' ')' line='$_hr_linetext'), so the last liveness read is no longer last"
