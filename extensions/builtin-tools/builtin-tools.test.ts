@@ -12,7 +12,7 @@
  * node_modules/typebox. Created by CI setup or manually.
  */
 
-import { stripHtml, getPerplexityKey, augmentPath, PATH_EXTRA_DIRS, getPiInvocation, getSubAgentPath, resolveProviderModel, loadModelRegistry, getModelsJsonPath, getExitGraceMs, DEFAULT_EXIT_GRACE_MS, armExitWatchdog, getExitCompleteGraceMs, DEFAULT_EXIT_COMPLETE_GRACE_MS, armCompletionWatchdog, composeTaskResult, getFallbackModel, DEFAULT_FALLBACK_MODEL, connectionErrorDetected, shouldFallback, resolveProviderBaseUrl, HEARTBEAT_MARKER_PREFIX, HEARTBEAT_INTERVAL_MIN_MS, HEARTBEAT_INTERVAL_MAX_MS, DEFAULT_HEARTBEAT_INTERVAL_MS, DEFAULT_STREAM_STALL_MS, DEFAULT_TOOL_STALL_MS, DEFAULT_FIRST_MESSAGE_MS, clampHeartbeatIntervalMs, getHeartbeatIntervalMs, getStreamStallMs, getToolStallMs, getFirstMessageMs, createHeartbeatState, parseHeartbeatLine, flushHeartbeatResidue, flushHeartbeatLineBuf, ingestHeartbeatChunk, heartbeatKillDecision, HEARTBEAT_LINE_BUF_MAX, HEARTBEAT_TRACE_MAX, getTaskMaxDispatchMs, getTaskHardCapMs, DEFAULT_HARD_CAP_MS, loadScaledBound, getFirstOutputTimeoutMs, getSystemLoad, setLoad1Override, getLoad1, getCutGapMs, getEffectiveCutGapMs, getCpuStallMs, DEFAULT_CPU_STALL_MS, DEFAULT_PROGRESS_AGE_MS, getProgressAgeMs, classifyTaskExit, getTaskBackstopMs, DEFAULT_BACKSTOP_MARGIN_MS, DEFAULT_TASK_MODEL, renderRepoStateLine, renderMachineStateLine, countPiProcs, countPiInPsOutput, formatLoad1, probeSystemLoad, resolveTaskCwd, taskCwdRefusal, spawnSubAgent, resolveStreamStallMs, streamStallInertWarning, inFlightProgress, DEFAULT_SESSION_CEILING_MULT, resolveSessionCeiling, isDispatchSaturated, saturationNotice, dispatchSaturationRefusal, probeDispatchSaturation, probePiProcs, setPiProcsOverride, classifyChildLiveness, childMessagesSent, TASK_LIVENESS_DETAIL_KEYS, stampLivenessDefaults, childLivenessFor, exhaustionStatusFor, classifyBackgroundOutcome, readMarkerAge, decisionSnapshotStale } from "./index.js";
+import { stripHtml, getPerplexityKey, augmentPath, PATH_EXTRA_DIRS, getPiInvocation, getSubAgentPath, resolveProviderModel, loadModelRegistry, getModelsJsonPath, getExitGraceMs, DEFAULT_EXIT_GRACE_MS, armExitWatchdog, getExitCompleteGraceMs, DEFAULT_EXIT_COMPLETE_GRACE_MS, armCompletionWatchdog, composeTaskResult, getFallbackModel, DEFAULT_FALLBACK_MODEL, connectionErrorDetected, shouldFallback, resolveProviderBaseUrl, HEARTBEAT_MARKER_PREFIX, HEARTBEAT_INTERVAL_MIN_MS, HEARTBEAT_INTERVAL_MAX_MS, DEFAULT_HEARTBEAT_INTERVAL_MS, DEFAULT_STREAM_STALL_MS, DEFAULT_TOOL_STALL_MS, DEFAULT_FIRST_MESSAGE_MS, clampHeartbeatIntervalMs, getHeartbeatIntervalMs, getStreamStallMs, getToolStallMs, getFirstMessageMs, createHeartbeatState, parseHeartbeatLine, flushHeartbeatResidue, flushHeartbeatLineBuf, ingestHeartbeatChunk, heartbeatKillDecision, HEARTBEAT_LINE_BUF_MAX, HEARTBEAT_TRACE_MAX, getTaskMaxDispatchMs, getTaskHardCapMs, DEFAULT_HARD_CAP_MS, loadScaledBound, getFirstOutputTimeoutMs, getSystemLoad, setLoad1Override, getLoad1, getCutGapMs, getEffectiveCutGapMs, getCpuStallMs, DEFAULT_CPU_STALL_MS, DEFAULT_PROGRESS_AGE_MS, getProgressAgeMs, classifyTaskExit, getTaskBackstopMs, DEFAULT_BACKSTOP_MARGIN_MS, DEFAULT_TASK_MODEL, renderRepoStateLine, renderMachineStateLine, countPiProcs, countPiInPsOutput, formatLoad1, probeSystemLoad, resolveTaskCwd, taskCwdRefusal, spawnSubAgent, resolveStreamStallMs, streamStallInertWarning, inFlightProgress, DEFAULT_SESSION_CEILING_MULT, resolveSessionCeiling, isDispatchSaturated, saturationNotice, dispatchSaturationRefusal, probeDispatchSaturation, probePiProcs, setPiProcsOverride, classifyChildLiveness, childMessagesSent, TASK_LIVENESS_DETAIL_KEYS, stampLivenessDefaults, childLivenessFor, exhaustionStatusFor, classifyBackgroundOutcome, readMarkerAge, decisionSnapshotStale, supersedingEvidence } from "./index.js";
 import { dispatchUnkeyedSet } from "../shared/provider-failover.js";
 import { asyncRepoState } from "../repo-freshness.js";
 import builtinTools from "./index.js";
@@ -3157,13 +3157,20 @@ test("#1339b: the decision never evaluates a threshold against an invalid marker
 
   // The DEFECT shape: the marker timestamp is in the FUTURE of the decision
   // clock (it was ingested after `now` was taken, inside the awaited kill path).
-  // Every other input is identical, so if the clause consumed the raw difference
-  // it would fire — clamped to 0 it must not.
+  // NOTE (#1339 review): the `cut` clause is `markerAge > cutGapMs`, so a raw
+  // NEGATIVE age would be LESS than the gap and could not fire it either way —
+  // asserting `kill === false` here proves nothing about the clamp. What the
+  // clamp actually buys is that no consumer ever receives the negative number,
+  // so THAT is what is pinned: the decision carries 0, not -532.
   const future = cutClauseState(gap + 20_000, now);
   future.lastMarkerAt = now + 532;
   const invalid = heartbeatKillDecision(dinput({ now, lastLifeSignAt: now, state: future, cutGapMs: gap }));
-  equal(invalid.kill, false, "a marker timestamp in the future must NOT be read as 'silence past the gap'");
-  equal(invalid.reason, undefined);
+  equal(invalid.kill, false, "a marker timestamp in the future is not silence past the gap (it is not silence at all)");
+  equal(invalid.markerAgeMs, undefined, "no kill → no decision age to report");
+  ok(
+    readMarkerAge(future.lastMarkerAt, now).ageMs === 0,
+    "the clamp is what turns the measured -532ms into 0 — this is the assertion the raw-difference revert fails (#1339 review: the earlier `kill === false` legs passed even with the clamp reverted)",
+  );
 
   // And the snapshot the headline prints is the clamped one, never the raw
   // negative difference — where a kill IS taken (a different clause), the
@@ -3176,7 +3183,46 @@ test("#1339b: the decision never evaluates a threshold against an invalid marker
   );
   equal(otherClause.kill, true, "a clause that does not read the marker clock still fires");
   equal(otherClause.reason, "tool-stall");
-  ok((otherClause.markerAgeMs ?? -1) >= 0, `every kill's markerAgeMs is non-negative, got ${otherClause.markerAgeMs}`);
+  equal(otherClause.markerAgeMs, 0, "…and the payload still carries the CLAMPED 0, not the raw -532 (fails if the clamp is reverted)");
+});
+
+test("#1339e: supersedingEvidence — the guard asks each clause about ITS OWN clock", () => {
+  const snap = 5_000_000;
+  const base = { lastMarkerAt: 0, lastLifeSignAt: snap - 1, lastProgressAt: 0, startedAt: 1 };
+
+  // No-progress is measured on `lastProgressAt`, which ticks and bytes do NOT
+  // advance (the clause's binding rule). A marker inside the awaited window is
+  // therefore NOT a refutation of it — the content-free loop stays killable.
+  equal(
+    supersedingEvidence("no-progress", snap, { ...base, lastMarkerAt: snap + 1, lastLifeSignAt: snap + 1 }),
+    null,
+    "no-progress: a marker AND a byte after the snapshot do not refute a verdict about WORK COMPLETED — suppressing here re-opens the hole the clause exists to close",
+  );
+  equal(
+    supersedingEvidence("no-progress", snap, { ...base, lastProgressAt: snap + 1 }),
+    "progress",
+    "no-progress: real work completing inside the window DOES refute it (fail-safe direction preserved)",
+  );
+  equal(
+    supersedingEvidence("no-progress", snap, { ...base, lastProgressAt: 0, startedAt: snap + 1 }),
+    "progress",
+    "no-progress: the anchor falls back to `startedAt` exactly as the clause does — a dispatch that started inside the window has not had its bound yet",
+  );
+  equal(
+    supersedingEvidence("no-progress", snap, { ...base, lastProgressAt: snap }),
+    null,
+    "no-progress: progress AT the snapshot instant is not newer (equality is not staleness)",
+  );
+
+  // Every other reason is superseded by the marker/byte channels, and the
+  // returned channel NAMES the one that fired so the log cannot print a
+  // negative delta for a channel that did not move (#1339 review).
+  for (const reason of ["cut", "silence-threshold", "stream-stall", "tool-silence", "tool-dead", "tool-stall", "first-message-stall", "zero-output"] as const) {
+    equal(supersedingEvidence(reason, snap, base), null, `${reason}: a silent child (both channels behind the snapshot) leaves the verdict standing`);
+    equal(supersedingEvidence(reason, snap, { ...base, lastMarkerAt: snap + 1 }), "marker", `${reason}: a marker after the snapshot supersedes, and is NAMED`);
+    equal(supersedingEvidence(reason, snap, { ...base, lastLifeSignAt: snap + 1 }), "bytes", `${reason}: a byte after the snapshot supersedes, and is NAMED`);
+    equal(supersedingEvidence(reason, snap, { ...base, lastMarkerAt: snap + 1, lastLifeSignAt: snap + 1 }), "marker", `${reason}: the marker is named first when both fired`);
+  }
 });
 
 test("#1339c: decisionSnapshotStale — evidence newer than the snapshot supersedes the verdict", () => {
@@ -3191,24 +3237,36 @@ test("#1339c: decisionSnapshotStale — evidence newer than the snapshot superse
 
 test("#1339d: loop wiring — the verdict is re-validated against evidence across the awaited probe (source-scan)", () => {
   const src = readFileSync(resolve(__dirname, "index.ts"), "utf-8");
-  // The guard is the ONLY consumer of `decisionSnapshotStale` in the loop, and it
+  // The guard is the ONLY consumer of `supersedingEvidence` in the loop, and it
   // must sit between the post-await `settled`/exit re-check and the tree kill —
   // the window it protects is exactly that gap.
-  const guardIdx = src.indexOf("decisionSnapshotStale(now, hbCtx.state.lastMarkerAt, lastHeartbeat)");
-  ok(guardIdx > -1, "the kill path re-validates the decision against the marker and byte channels");
+  const guardIdx = src.indexOf("supersedingEvidence(decision.reason, now, {");
+  ok(guardIdx > -1, "the kill path re-validates the decision against the marker, byte AND progress clocks");
   const settledIdx = src.indexOf("if (settled || proc.exitCode !== null) return;");
   const killIdx = src.indexOf("killTreeAndEscalate();", settledIdx);
   ok(settledIdx > -1 && settledIdx < guardIdx, "the evidence re-check follows the post-await settled re-check (the same await window, asked about evidence)");
   ok(guardIdx < killIdx, "the evidence re-check precedes the tree kill — a stale verdict must never be executed");
   // The exemption is a WALL-CLOCK policy cap, not a liveness inference.
   ok(
-    /decision\.reason !== "max-dispatch" &&\s*\n\s*decisionSnapshotStale\(/.test(src),
+    /decision\.reason === "max-dispatch"\s*\n\s*\? null\s*\n\s*: supersedingEvidence\(/.test(src),
     "`max-dispatch` is exempt: a fresh byte does not make a policy-capped dispatch younger",
   );
-  // One-shot logging, following the siblings in the same closure.
-  ok(src.includes("let staleDecisionSuppressLogged = false;"), "the suppression log is one-shot per dispatch (an unlatched warn would spam every tick of a slow-ticking child)");
-  equal(src.split("staleDecisionSuppressLogged = true").length - 1, 1, "the latch is written exactly once");
+  // Rate-limited, NOT one-shot: a permanent latch hides exactly the recurrence
+  // the parent must see (#1339 review).
+  ok(src.includes("let staleSuppressCount = 0;"), "the suppressions are COUNTED per dispatch, so the log can report the running total");
+  ok(
+    src.includes("now - staleSuppressLoggedAt >= STALE_SUPPRESS_RELOG_MS"),
+    "the suppression log RE-ARMS (bounded to one line per minute) — a one-shot latch would report a wedge suppressed for hours only once",
+  );
+  ok(src.includes("${staleSuppressCount} suppression(s) this dispatch"), "the log carries the count, not just the first occurrence");
   ok(src.includes("re-deciding on the next tick (#1339)"), "the suppression states what happens next, so the operator does not read it as a lost kill");
+  // The log must never print a delta for a channel that did not move — that was
+  // the `marker +-45123ms` nonsense (#1339 review).
+  ok(
+    src.includes("(${supersededBy} +${evidenceDelta}ms relative to the snapshot;"),
+    "the log names the channel that ACTUALLY fired and one positive delta, never an untouched channel's negative one",
+  );
+  equal(src.split("staleDecisionSuppressLogged").length - 1, 0, "the permanent one-shot latch is gone (replaced by the rate-limited counter)");
   // The headline prints the DECISION's snapshot; the payload keeps the live read
   // beside it, labelled. Both are clamped through the single reader.
   ok(src.includes("const decMarkerAgeMs = decision.markerAgeMs ?? -1;"), "the kill path exposes the decision's own marker age");
