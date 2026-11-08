@@ -32,8 +32,10 @@ Two acceptance indicators in the issue are nevertheless still unmet at this head
 2. **The neighbouring false signal (`session_start`).** Session-start recovery is executed at the root
    `recoveryOnlyRoot` hands back, so when this worktree has **no** entries and one same-repo sibling
    has them, `recovered` is the **sibling's** count and the child prints
-   `📂 Recovered N verified files from bridge`. Every one of those N is dropped by
-   `recoverBridgeForRoot`'s `parsed.root !== normRoot` guard (`foreign root — inert`), so the line
+   `📂 Recovered N verified files from bridge`. Every one of those N is INERT for this root: they are
+   keyed on the sibling, so every lookup at this worktree's root misses (the op path's own
+   `recoverBridgeForRoot(<op root>)` re-drops them at its `parsed.root !== normRoot` guard — the
+   inspection call itself is made WITH the sibling root, which is why it can count them), so the line
    claims verified state the session does not have — and because `recovered > 0`, the
    `else if (isTaskSubAgent())` zero-entry warning (the #264 P2 "every commit will block" signal, added
    *precisely* because the parent needs it) never fires. A false PASS over a real block, in the one
@@ -108,8 +110,9 @@ git-op root is the command's own cwd — and the report must say so — durably.
 ## Research
 
 See the `<!-- research: v1 -->` artifact (issue comment 6722549255). It settles:
-(a) the mechanism is `session_start`'s `recoveryOnlyRoot` call plus `recoverBridgeForRoot`'s foreign-root
-skip, (b) the industry rule is *key by real path, report the miss,
+(a) the mechanism is `session_start`'s `recoveryOnlyRoot` call plus the ROOT-KEYED lookup that makes a
+sibling's merged entries inert wherever they are inspected (`recoverBridgeForRoot`'s foreign-root skip
+applies when it is called with the OP's root, not when the inspection call hands it the sibling's), (b) the industry rule is *key by real path, report the miss,
 never substitute a hit* (Turborepo `cacheDir` guidance; Bazel hermeticity), (c) on a busy box adoption
 is already unreachable (`pickVerifiedRoot` returns `null` at 2+ siblings — measured 12 agent-infra
 roots and 20+ tortoise roots in the live bridge), so this is the narrow one-sibling case.
@@ -142,6 +145,13 @@ roots and 20+ tortoise roots in the live bridge), so this is the narrow one-sibl
    `recoverBridgeForRoot(realB)` returns 0 under every mutant), and it was deleted in review cycle 5.
    The sibling-counting revert is caught by the transcript rows instead — the pre-fix
    `📂 Recovered N verified files from bridge` line and the absent `0 bridge-recovered files` warning.
+   The durable empty row also carries `task_capable` (from `argvAllowsTask`), because the remedy
+   differs by class and a parent reading the log is deciding exactly one thing — wait, or re-verify
+   and re-dispatch: a task-CAPABLE child self-verifies in-band, a task-RESTRICTED one is blocked for
+   good (#285 P1-A). *Proves it:* 1265a's SECOND arm injects a `--tools` allowlist without `task` (the
+   seam scenario 285 uses), asserts the "block is final" remedy is rendered and that `task_capable`
+   is `false`. Without that arm the field could be hardcoded `true` and every row would stay green —
+   measured: `task_capable: true` gives `119 passed, 1 failed`, the one red being that row.
 2. **`diagnoseRootMismatch`**: keep the narration, put the **safe** remedy first
    ("re-dispatch verification for `<this root>`") and state that adopting another tree's entries is
    refused by design; append `gate_root_mismatch` once per `(root, siblings)` fingerprint, reset at

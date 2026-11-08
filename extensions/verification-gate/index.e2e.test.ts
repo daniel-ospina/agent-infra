@@ -6034,6 +6034,40 @@ async function main() {
     // registry never held the foreign entry — do not read this row as covering that,
     // and do not delete 21b on the strength of this one.
     ok(bridgeAfter.includes(`${realA}::src/a1265.ts`), "1265a: B's PASS leaves A's entry in the bridge (AC c end state — see scenario 21b for the snapshot-revert discriminator)");
+
+    // ── SECOND ARM: the task-RESTRICTED class — the branch the new `task_capable` field exists for. ──
+    // ⛔ The arm above runs in the HARNESS's argv, which carries no `--tools` flag, so
+    // `argvAllowsTask()` is TRUE by default: there `task_capable` can only ever be `true`, and a
+    // mutant that HARDCODED true (or derived it from `isTaskSubAgent()`, true in both arms) stays
+    // green. So this arm injects a restricted allowlist — the same argv seam scenario 285 uses — and
+    // asserts the OTHER branch: the block is FINAL and only the parent can end it (#285 P1-A).
+    // C is used because its own registry is still empty (only A and B have entries by now).
+    const prevArgv = process.argv;
+    const prevMode2 = process.env.PI_MODE;
+    const prevHeartbeat2 = process.env.TASK_HEARTBEAT;
+    const capturedRestricted: string[] = [];
+    const auditBeforeRestricted = readAuditLines().length;
+    try {
+      process.argv = ["pi", "-p", "--tools", "read,bash,edit,write"] as unknown as string[];
+      process.env.PI_MODE = "print";
+      process.env.TASK_HEARTBEAT = "1";
+      console.log = ((msg: string, ...rest: unknown[]) => { capturedRestricted.push(String(msg)); origLog(msg, ...rest); }) as typeof console.log;
+      process.chdir(realC);
+      await fire("session_start", {});
+    } finally {
+      console.log = origLog;
+      process.chdir(prevCwd);
+      process.argv = prevArgv;
+      if (prevMode2 === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode2;
+      if (prevHeartbeat2 === undefined) delete process.env.TASK_HEARTBEAT; else process.env.TASK_HEARTBEAT = prevHeartbeat2;
+    }
+    ok(capturedRestricted.some((l) => l.includes("task-restricted") && l.includes("block is final")),
+      `1265a: a task-RESTRICTED child must be told the block is FINAL and the parent must act, got: ${capturedRestricted.join(" | ")}`);
+    const restrictedRows = readAuditLines().slice(auditBeforeRestricted)
+      .filter((l) => l.event === "gate_recovery_empty" && String(l.root ?? "") === realC);
+    equal(restrictedRows.length, 1, "1265a: the restricted arm records exactly one durable empty row for C");
+    equal(restrictedRows[0].task_capable, false,
+      "1265a: task_capable must be FALSE for a restricted child — without this arm a hardcoded true stays green");
   });
 
 } // main: plugin loaded; tests run sequentially via runAll()

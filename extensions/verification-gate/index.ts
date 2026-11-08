@@ -494,15 +494,16 @@ function recoveryOnlyRoot(root: string): string {
 // reset at session_start (it is a session fact, like the block registry).
 // #1265 (review F5): a SET, not a single slot. The stated invariant is "once per
 // session per (root, siblings)", and a single slot only dedupes CONSECUTIVE
-// repeats — the hub/linked-worktree case #3255 exists for ALTERNATES roots, so the
-// same pair was re-recorded on every alternation, unbounded: a bare `git push`
-// resolves the hub, then `cd <worktree> && git commit` resolves the worktree (the
-// `cd` prefix via `extractCdPath`, or a differing `inputCwd`). ⛔ NOT `git -C`: that
+// repeats. ⛔ The shape that ALTERNATES is TWO roots that both LACK entries — one
+// session working in two unverified worktrees of one repo (B and C, with A
+// verified): each records once, while a single slot re-records B on the return
+// visit, unbounded. An op IN the verified worktree cannot be the other half: this
+// function returns at the `roots.some(…)` guard below when the op's root IS a
+// bridge root, so it records nothing at all. And it is not `git -C` either — that
 // is a REPO-REDIRECTING global (GIT_REDIRECT), `isGitOp` refuses the invocation as
-// foreign, and the tool_call handler returns before this function — so `-C` never
-// produces a mismatch record at all and cannot alternate anything here. A session
-// with three worktrees (A verified, B and C not) records each of B and C exactly
-// once, which e2e 1265a now exercises by alternating B -> C -> B inside one session.
+// foreign, and the tool_call handler returns before this function ever runs. The
+// root alternates through the `cd` prefix (`extractCdPath`) or a differing
+// `inputCwd`; e2e 1265a exercises exactly that by alternating B -> C -> B.
 const recordedRootMismatches = new Set<string>();
 function diagnoseRootMismatch(root: string): void {
   const roots = bridgeRoots();
@@ -4445,10 +4446,12 @@ export default function (pi: ExtensionAPI) {
     //
     // #1265: recover the SESSION'S OWN root first and report THAT count. The
     // sibling root `recoveryOnlyRoot` may name is merged for INSPECTION only: its
-    // entries carry the sibling's root, so `recoverBridgeForRoot` drops every one
-    // of them at the git-op root filter (`recoverBridgeForRoot`'s
-    // `parsed.root !== normRoot` guard, "foreign root — inert"). Counting
-    // them as "recovered for this worktree" was a false verified-state claim — and
+    // entries carry the sibling's root, so they enter `verifiedSet` INERT — every
+    // lookup is keyed on the OP's root (`compoundKey(worktreeRoot, …)`), and the op
+    // path's own `recoverBridgeForRoot(<op root>)` re-drops them at the same
+    // `parsed.root !== normRoot` guard. ⛔ The INSPECTION call does NOT drop them —
+    // it is made WITH the sibling root, precisely so `inspected` can count them.
+    // Counting them as "recovered for this worktree" was a false verified-state claim — and
     // because `recovered > 0` it also SKIPPED the `else if (isTaskSubAgent())`
     // zero-entry warning below, which exists precisely so a parent learns that
     // every changed-file commit in a fresh worktree will block (#264 P2).
