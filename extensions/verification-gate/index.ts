@@ -508,8 +508,8 @@ function diagnoseRootMismatch(root: string): void {
   if (mine === null) return;
   const siblings = roots.filter((r) => gitCommonDir(r) === mine);
   if (siblings.length === 0) return;
-  // The SAFE remedy comes FIRST. "re-run the op from the verified tree (cd into
-  // it)" used to lead, and it is not merely unhelpful — the FIRST of three
+  // The SAFE remedy comes FIRST. The old advice — re-run the op from the verified
+  // tree, i.e. `cd` into it — used to lead, and it is not merely unhelpful: the FIRST of three
   // consecutive children that died in one worktree followed it into a tree it did
   // not own (issue #1265: "doing so is what the first child did, after which it too
   // was killed"; the three deaths are attributed there to per-worktree

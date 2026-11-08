@@ -37,46 +37,6 @@ function section(name: string) {
   console.log(`\n${name}:`);
 }
 
-// #1265: remove COMMENTS from a TypeScript source WITHOUT touching string or template
-// bodies. A regex like /\/\/.*$/ cannot tell a trailing comment from a ` // ` inside a
-// rendered template literal, and truncating that line MUZZLES a negative pin — measured:
-// `console.log(`… // legacy note (cd into it)`)` goes GREEN under a regex strip while the
-// gate still renders the banned remedy. Hence a small state scan: line comment, block
-// comment, and the three quote styles are the only states, and a backslash escapes the
-// next character inside a quote.
-function stripTsComments(source: string): string {
-  let out = "";
-  let i = 0;
-  while (i < source.length) {
-    const c = source[i];
-    const next = source[i + 1];
-    if (c === "/" && next === "/") {
-      while (i < source.length && source[i] !== "\n") i++;
-      continue;
-    }
-    if (c === "/" && next === "*") {
-      i += 2;
-      while (i < source.length && !(source[i] === "*" && source[i + 1] === "/")) i++;
-      i += 2;
-      continue;
-    }
-    if (c === '"' || c === "'" || c === "`") {
-      out += c;
-      i++;
-      while (i < source.length) {
-        if (source[i] === "\\") { out += source[i] + (source[i + 1] ?? ""); i += 2; continue; }
-        out += source[i];
-        if (source[i] === c) { i++; break; }
-        i++;
-      }
-      continue;
-    }
-    out += c;
-    i++;
-  }
-  return out;
-}
-
 // ── extractJson ──────────────────────────────────────
 
 section("extractJson — raw JSON");
@@ -3866,27 +3826,24 @@ test("#3255 policy: the git-op root is authoritative — adoption must never gat
     /event: "gate_recovery"[^}]*?root: normRoot/.test(src),
     "the durable gate_recovery record must name the root it recovered for",
   );
-  // #1265 AC (b)/R3: "re-run the op from the verified tree (cd into it)" — the FIRST of three
-  // consecutive children that died in one worktree followed it into a tree it did not own. The pin's
-  // SUBJECT is RENDERED output, so it runs on the source with COMMENTS REMOVED (`stripTsComments` —
-  // comment-aware, so a ` // ` inside a template literal cannot truncate the line and muzzle the pin):
-  // a docblock must be free to quote the old remedy while explaining why it went (index.ts's #1265
-  // note does), and a comment reflow changes no output. Before this the pin was green only because
-  // that historical mention happened to wrap mid-phrase — a pure reflow of it reddened a pin whose
-  // message asserts a *rendered message* regressed (#1265 review). The behavioural half is e2e 1265a,
-  // which asserts the captured transcript never contains the phrase.
-  const srcCode = stripTsComments(src);
-  // POSITIVE CONTROL for the strip itself: a rendered occurrence hidden behind a ` // ` INSIDE a
-  // template literal must SURVIVE the strip (a regex strip truncated the line and left this pin
-  // green over a gate that still rendered the banned remedy — measured in review), while a real
-  // line comment must be removed. Without these two rows the strip is trusted, not tested.
-  ok(/\(cd into it\)/.test(stripTsComments("console.log(`remedy: // legacy note (cd into it)`);\n")),
-    "the comment stripper must KEEP a rendered template literal behind a ' // ' — it is not a comment, and clipping it muzzles the pin");
-  ok(!/\(cd into it\)/.test(stripTsComments("// real comment (cd into it)\n")),
-    "the comment stripper must REMOVE a real line comment");
+  // #1265 AC (b)/R3: the un-followable "cd into it" remedy — the FIRST of three consecutive
+  // children that died in one worktree followed it into a tree it did not own.
+  //
+  // ⛔ THIS IS A WHOLE-FILE NEGATION, COMMENTS INCLUDED, AND IT SAYS SO. That is deliberate, and
+  // it is the honest shape: two earlier versions of this pin tried to test only RENDERED text
+  // and both lied. The first ran over the file while its message asserted a *rendered message*
+  // regressed, so a pure comment reflow turned it red; the second added a hand-written comment
+  // scanner, which desynced TWICE (on `.replace(/"[^"]*"/g, " ")`'s quotes, then on the nested
+  // template in the Plain-text PASS log line) and left 274 then 21 comment lines verbatim — i.e.
+  // a strip that silently stops stripping is exactly how a negative pin goes green over the
+  // code it bans. A lexer in a test file is not worth the blast radius, so the pin covers the
+  // whole file and the constraint is stated where it bites: index.ts may not CONTAIN this
+  // phrase anywhere, so its #1265 note paraphrases the old remedy (`cd` is what it told you to
+  // do) instead of quoting it. The behavioural half — the guarantee that matters — is e2e
+  // 1265a, which asserts the captured transcript never contains the phrase at all.
   ok(
-    !/\(cd into it\)/.test(srcCode),
-    "the un-followable 'cd into it' remedy must not come back in any rendered message (pinned on code, comments removed) — the first child that followed it died in a tree it did not own",
+    !/\(cd into it\)/.test(src),
+    "the 'cd into it' remedy must appear NOWHERE in index.ts — comments included (that is why the #1265 note paraphrases it) — the first child that followed it died in a tree it did not own",
   );
   ok(
     /re-dispatch verification for THIS root/.test(src) && /refused by design/.test(src),
