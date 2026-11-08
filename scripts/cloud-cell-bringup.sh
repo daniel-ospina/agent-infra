@@ -2435,8 +2435,12 @@ check_controller_service() {
   # an installer of a different vintage, while the supervisor just below is resolved from the layer. The
   # order here keeps installer and supervisor on one vintage and leaves the farmed copy as a genuine
   # FALLBACK for a box with no layer — which is what it was before this PR, when it simply did not exist.
-  # ⛔ ORDER IS LOAD-BEARING, so the suite pins it with a sentinel: putting `$HOME` back ahead of
-  # `$LAYER_ROOT` reddens that arm instead of silently reinstating the skew.
+  # ⛔ ORDER IS LOAD-BEARING, so the suite pins it STATICALLY, reading this very `for cand` list: putting
+  # `$HOME` back ahead of `$LAYER_ROOT` reddens that arm instead of silently reinstating the skew.
+  # ⛔ IT MUST BE STATIC — a DYNAMIC sentinel cannot discriminate here, and an earlier version of this
+  # comment claimed one: the operational-layer step re-farms this installer from the layer earlier in the
+  # same run, so both orders resolve byte-identical files and a sentinel arm stays green either way. An
+  # arm that cannot fail is worse than no arm, because it advertises a guarantee it does not hold.
   # The supervisor is resolved from the SAME checkout: the installer prefers $HOME/.pi/agent/scripts, and a
   # stale copy there predating ORCH_FOREGROUND would hand the unit a launcher that exits 0.
   local layer_sup="${LAYER_ROOT:+$LAYER_ROOT/scripts/cloud-cell-supervisor.sh}"
