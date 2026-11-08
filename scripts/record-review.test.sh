@@ -5202,7 +5202,7 @@ QR_CITE_SITES="$(command grep -n 'grep -qxF' "$RECORD" | command grep -vE '^[0-9
 # ⛔ THE PATTERNS NAME NO BACKTICK — 20h48b scans double-quoted command substitutions for one, and
 # it CAUGHT the first draft of this guard. The tag is the anchor, so the phrasing around a number
 # can be reworded freely; only the tag and the numbers after it are contractual.
-QR_CITED="$(command grep -E '^#.*CITE-CHECK:' "$QR_SELF" \
+QR_CITED="$(command grep -E '^[[:space:]]*#.*CITE-CHECK:' "$QR_SELF" \
     | sed -n 's/.*CITE-CHECK: *\(:[0-9][0-9 :]*\).*/\1/p' \
     | tr -d ':' | tr -s ' ' | tr '\n' ' ' | tr ' ' '\n' | sort -un | tr '\n' ' ' \
     | sed 's/^ *//; s/ *$//')"
@@ -5712,8 +5712,8 @@ assert_not_contains "$RECORD_ERR" "THIS RUN WROTE NO PENDING COPY" \
     "14.1d(j2) …a failed RETRY makes NO 'this run wrote nothing' claim — the pre-PATCH copy is still on disk"
 assert_contains "$RECORD_ERR" "or post the body copy with --flush-pending, to fire" \
     "14.1d(j2) …so the WORKING flush remedy is still offered, instead of the hand-PATCH a false absence claim demands"
-assert_not_contains "$RECORD_ERR" "⚠️ body-marker: could NOT persist" \
-    "14.1d(j2) …and no persist warning is printed at all: the bytes ARE on disk, so there is nothing to warn about"
+assert_not_contains "$RECORD_ERR" "⚠️ body-marker: could" \
+    "14.1d(j2) …and NO persist warning is printed in EITHER spelling ('could not' is the pre-PATCH line, 'could NOT' the both-failed one; the literal is deliberately case-truncated so a regression printing the pre-PATCH warning reddens too): the bytes ARE on disk, so there is nothing to warn about"
 
 # 14.1e THE DURABLE CHANNEL IN `--recover-body` (#3168 fresh-review finding 1).
 #      The recovery verb exists BECAUSE the body was the only copy of the verdict that
