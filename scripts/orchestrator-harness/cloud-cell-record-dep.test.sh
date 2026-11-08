@@ -56,24 +56,26 @@ pass=0; fail=0
 # success assertion KIND in this file, and #3760 DELETED them while nothing reddened: the file ends at
 # `[ "$fail" -eq 0 ]` and `run-bash-shards.sh` discovers by glob and reads only the exit code, so no count
 # pinned them. Restored lines are, on their own, exactly as deletable as they were the first time.
-# So they go through `ck_start_succeeded`, which the floor at the bottom compares with the number of arms
-# that actually capture `start_rc`. Deliberately the same shape as the guard suite's `optOutLegRan` floor
-# (`test-remote-context.mjs`): a DECLARED line is satisfied by a neutralised consumer; an EXECUTED count is
-# not. Precedent outside this repo: Jest's `expect.assertions(n)` / `hasAssertions()`.
-# ⛔ THE COUNTER IS BUMPED BY THE ASSERTION PRIMITIVE, NOT BY THE WRAPPER (#3774 review, P2 — measured). Jest's
-# counter is bumped by `expect()` itself, and that detail is the whole guard: bumping it inside
-# `ck_start_succeeded` counts WRAPPER INVOCATIONS, so removing the `ck "$1" "$2"` call from the helper's body
-# (one line) left `117 passed, 0 failed`, exit 0 — every whole-`start` assertion gone and the floor row
-# printed ✅. The bump therefore lives in `ck`, keyed on the label kind, so the datum exists only when the
-# assertion really ran.
+# So the floor at the bottom checks them against TWO INDEPENDENT derivations from this file — an EXECUTED
+# count and a SOURCE binding — each compared with the number of arms that invoke `cell_start`. Deliberately
+# the same shape as the guard suite's `optOutLegRan` floor (`test-remote-context.mjs`): a DECLARED line is
+# satisfied by a neutralised consumer; an EXECUTED count is not. Precedent outside this repo: Jest's
+# `expect.assertions(n)` / `hasAssertions()`, whose counter is bumped by `expect()` itself.
+# ⛔ THE COUNTER IS BUMPED BY THE ASSERTION PRIMITIVE, NOT BY A WRAPPER (#3774 review, P2 — measured). Jest's
+# counter is bumped by `expect()` itself, and that detail is the whole guard: a wrapper that bumps on entry
+# counts WRAPPER INVOCATIONS, so emptying the helper's body (one line) left `117 passed, 0 failed`, exit 0 —
+# every whole-`start` assertion gone and the floor row printed ✅. The bump therefore lives in `ck`, keyed on
+# the label kind, so the datum exists only when the assertion really ran. There is deliberately NO wrapper
+# function here: an indirection whose only job is to forward two arguments is the neutralisable consumer.
+# ⛔ AND A COUNT OF LABELS IS NOT A BINDING (#3774 review round 2, P1 — measured). With only the executed
+# count, `ck "…SUCCEEDED…" 0` graded every arm against the constant 0 and the suite stayed `120 passed, 0
+# failed`, exit 0 — the assertion present, the verdict gone. So the floor ALSO derives, from this file's
+# source, how many positive assertions bind `"$start_rc"`, and requires the two counts to agree.
 start_rc_asserted=0
 ck() { # ck <name> <0|1>
   case "$1" in *SUCCEEDED*) start_rc_asserted=$((start_rc_asserted + 1)) ;; esac
   if [ "$2" -eq 0 ]; then printf '  \033[32mPASS\033[0m  %s\n' "$1"; pass=$((pass+1))
   else printf '  \033[31mFAIL\033[0m  %s\n' "$1"; fail=$((fail+1)); fi
-}
-ck_start_succeeded() { # ck_start_succeeded <label> <start_rc> — the whole-`start` verdict; `ck` counts it
-  ck "$1" "$2"
 }
 note() { printf '      %s\n' "$*"; }
 
@@ -227,7 +229,8 @@ env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
 # This block used to say that seeding `check-class.py` "turns the pre-flight into a REAL controller cycle
 # that never returns (measured: a 240 s timeout)", and on that premise three passing assertions were
 # deleted so that `start`'s rc was "reported, never asserted". The premise does NOT reproduce: the fixture's
-# tmux stub only RECORDS `new-session`'s argv (`:110-118`) and never runs it, and service mode
+# tmux stub only RECORDS `new-session`'s argv (the `cat > "$d/tmux"` heredoc in `mkstubs` — grep the
+# `new-session)` case; this block's own rule is never to cite a line number) and never runs it, and service mode
 # (`cloud-cell-supervisor.sh` — the `exec bash "$HARNESS/orch-loop.sh"` arm) is not taken, so no loop can
 # hang. Measured on this fixture with the helper seeded: `start_rc=0` in ALL THREE arms and `118 passed /
 # 0 failed` either way IN THE FILE AS IT STOOD THEN — `120 passed / 0 failed` at this head, which adds the
@@ -423,7 +426,7 @@ out="$(cell_start)"; rc=$?
 start_rc="$rc"          # the controller launch's own verdict; asserted directly below — see the header
 [ -x "$RECORDER" ] && rc=0 || { rc=1; note "recorder=$([ -x "$RECORDER" ] && echo present || echo absent) start_rc=$start_rc out=$(printf '%s' "$out" | tail -3)"; }
 ck "start provisions record-review.sh from the checkout (start_rc=$start_rc)" $rc
-ck_start_succeeded "start itself SUCCEEDED (the controller launch is not this suite's subject, but its exit status is the whole-start verdict; start_rc=$start_rc)" "$start_rc"
+ck "start itself SUCCEEDED (the controller launch is not this suite's subject, but its exit status is the whole-start verdict; start_rc=$start_rc)" "$start_rc"
 [ -s "$RECORDER_LIB" ] && rc=0 || { rc=1; note "normalizer=$([ -s "$RECORDER_LIB" ] && echo present || echo absent) out=$(printf '%s' "$out" | tail -3)"; }
 ck "RED→GREEN: start provisions the recorder's SIBLING diff-normalize.py in lib/" $rc
 [ -f "$CELL/tmstate/cmd" ] && rc=0 || rc=1
@@ -438,7 +441,7 @@ unset start_rc          # see above: each arm's binding is asserted, never inher
 out="$(cell_start)"; rc=$?; start_rc="$rc"     # asserted below — see the header
 [ -s "$RECORDER_LIB" ] && rc=0 || { rc=1; note "normalizer=$([ -s "$RECORDER_LIB" ] && echo present || echo absent) out=$(printf '%s' "$out" | tail -3)"; }
 ck "start provisions ONLY the missing normalizer when the recorder already exists" $rc
-ck_start_succeeded "and that start SUCCEEDED (start_rc=$start_rc)" "$start_rc"
+ck "and that start SUCCEEDED (start_rc=$start_rc)" "$start_rc"
 
 # 5b) A ZERO-BYTE recorder must be RE-provisioned by `start`, not left in place: the old provision
 # ran only when the path was ABSENT, so a `cp` killed mid-write (or a full disk) would persist
@@ -451,7 +454,7 @@ unset start_rc          # see above: each arm's binding is asserted, never inher
 out="$(cell_start)"; rc=$?; start_rc="$rc"     # asserted below — see the header
 [ -s "$RECORDER" ] && rc=0 || { rc=1; note "recorder=$([ -s "$RECORDER" ] && echo nonempty || echo empty) out=$(printf '%s' "$out" | tail -3)"; }
 ck "RED→GREEN: start re-provisions a ZERO-BYTE recorder" $rc
-ck_start_succeeded "and that start SUCCEEDED (start_rc=$start_rc)" "$start_rc"
+ck "and that start SUCCEEDED (start_rc=$start_rc)" "$start_rc"
 out="$(cell_check)"; rc=$?
 [ "$rc" -eq 0 ] && certified "$out" && rc=0 || { rc=1; note "$(printf '%s' "$out" | tail -3)"; }
 ck "the re-provisioned cell is then certified" $rc
@@ -459,6 +462,9 @@ ck "the re-provisioned cell is then certified" $rc
 # 6) …and when there is nothing to provision FROM, `start` refuses rather than creating a cell that
 # can never merge. Non-vacuity: the same invocation WITHOUT the missing source succeeds above.
 rm -f "$RECORDER" "$CELL/record-review.sh" "$CELL/tmstate/up" "$CELL/tmstate/cmd"
+# start-arm: negative — this arm asserts the REFUSAL (`rc≠0`), so it carries no SUCCEEDED verdict. The
+# executed floor counts it from this marker; an arm with NEITHER this marker NOR a positive assertion
+# reddens that floor, which is how a new §6-shaped arm cannot land ungraded (`#3774 review round 2, P2`).
 out="$(cell_start)"; rc=$?
 [ "$rc" -ne 0 ] && [ ! -f "$CELL/tmstate/cmd" ] && rc=0 || { rc=1; note "rc=$rc session=$([ -f "$CELL/tmstate/cmd" ] && echo created || echo none)"; }
 ck "start refuses (and creates no session) when the recorder cannot be provisioned" $rc
@@ -1099,21 +1105,35 @@ ck "no controller park site writes parked-\$PR without its reason" $rc
 
 # ⛔ THE EXECUTED FLOOR FOR THE WHOLE-`start` ASSERTIONS (#3774 review, P2). This PR's own thesis is that
 # #3760 deleted these three assertions and NOTHING reddened, and the restored lines are on their own
-# exactly as deletable — measured BEFORE this floor existed, neutralising only the `ck_start_succeeded …`
-# calls returned `115 passed, 0 failed`, exit 0, the identical #3760 state. With the floor, that same edit
-# reddens one row: `116 passed, 1 failed`, exit 1. So the expectation is DERIVED from this file,
-# not declared as a figure: every arm that CAPTURES `start_rc` must also ASSERT it. `^[[:space:]]*unset start_rc`
-# is the capture marker (it opens each arm and is what makes a dropped binding abort under `set -u`), and it
-# is anchored so the prose that MENTIONS `unset start_rc` in the header cannot inflate the count.
+# exactly as deletable — measured BEFORE this floor existed, neutralising only the three
+# `ck "…SUCCEEDED…" "$start_rc"` calls returned `115 passed, 0 failed`, exit 0, the identical #3760 state.
+# With the floor, that same edit reddens one row: `116 passed, 1 failed`, exit 1. So the expectation is
+# DERIVED from this file, not declared as a figure, and it is derived TWICE because one derivation cannot
+# cover both failure modes (both measured, below):
+#   1. EXPECTED, from the CALL SITES. Every `cell_start` invocation is either a POSITIVE arm (captures
+#      `start_rc` and asserts it SUCCEEDED) or a declared NEGATIVE arm (the `# start-arm: negative` marker,
+#      §6). Derived from the call sites and NOT from the `unset start_rc` idiom (#3774 review round 2, P2):
+#      an arm written in §6's shape (`out="$(cell_start)"; rc=$?`, no marker) moved NEITHER side of an
+#      idiom-derived count, so it landed green — the count tracked a convention, not the arms.
+#   2. EXECUTED + BOUND. The first half is the counter `ck` bumps, which proves the assertion RAN. The second
+#      is a SOURCE grep for assertions that grade `"$start_rc"`, which proves the verdict was not replaced
+#      by a constant — `ck "…SUCCEEDED…" 0` still executes and still counts, so the counter alone cannot see
+#      it (#3774 review round 2, P1: that edit left `120 passed, 0 failed`, exit 0).
 # Derived rather than hard-coded on purpose: this file's labelling rule already records that a stated COUNT
-# re-stales, and a hard-coded 3 would have to be bumped by hand on the next arm. Adding an arm moves both
-# sides together; DELETING an assertion moves only the counter, which is the whole point.
-start_arms="$(grep -c '^[[:space:]]*unset start_rc' "$SELF" 2>/dev/null || true)"
-case "$start_arms" in ''|*[!0-9]*) start_arms=-1 ;; esac
-[ "$start_arms" -gt 0 ] && rc=0 || { rc=1; note "could not read the arm count from $SELF (got '$start_arms') — an unverifiable floor FAILS CLOSED, it is not a pass"; }
-ck "the executed floor's expected count is readable ($start_arms arm(s) capture start_rc)" $rc
-[ "$start_rc_asserted" -eq "$start_arms" ] && [ "$start_rc_asserted" -gt 0 ] && rc=0 || { rc=1; note "$start_rc_asserted whole-start assertion(s) ran for $start_arms arm(s) that capture start_rc — a deleted assertion, or an arm added without one, leaves this row red"; }
-ck "every arm that captures start_rc also ASSERTS it (executed floor, not a declared line)" $rc
+# re-stales, and a hard-coded 3 would have to be bumped by hand on the next arm. Adding an arm moves the
+# call-site side; adding it WITHOUT an assertion (or with a constant) moves nothing else, which is the point.
+# The `^[[:space:]]*out=` anchor keeps prose that merely MENTIONS the call out of the count.
+start_sites="$(grep -cE '^[[:space:]]*out="\$\(cell_start\)"' "$SELF" 2>/dev/null || true)"
+start_neg="$(grep -cE '^[[:space:]]*# start-arm: negative' "$SELF" 2>/dev/null || true)"
+case "$start_sites" in ''|*[!0-9]*) start_sites=-1 ;; esac
+case "$start_neg" in ''|*[!0-9]*) start_neg=-1 ;; esac
+start_arms=$((start_sites - start_neg))
+[ "$start_sites" -gt 0 ] && [ "$start_arms" -gt 0 ] && rc=0 || { rc=1; note "could not read the arm count from $SELF (got '$start_sites' cell_start call site(s), '$start_neg' declared negative) — an unverifiable floor FAILS CLOSED, it is not a pass"; }
+ck "the executed floor's expected count is readable ($start_arms positive arm(s), $start_neg negative, of $start_sites cell_start call site(s))" $rc
+start_bound="$(grep -cE '^[[:space:]]*ck ".*SUCCEEDED.*" "\$start_rc"[[:space:]]*$' "$SELF" 2>/dev/null || true)"
+case "$start_bound" in ''|*[!0-9]*) start_bound=-1 ;; esac
+[ "$start_bound" -eq "$start_arms" ] && [ "$start_rc_asserted" -eq "$start_arms" ] && rc=0 || { rc=1; note "$start_rc_asserted whole-start assertion(s) RAN and $start_bound BIND \$start_rc, for $start_arms positive arm(s) — a deleted assertion, a CONSTANT argument (the label still counts), or an arm added without one, leaves this row red"; }
+ck "every arm's whole-start verdict is ASSERTED (executed) AND BOUND (graded from \$start_rc, not a constant)" $rc
 
 echo
 echo "==> $pass passed, $fail failed"
