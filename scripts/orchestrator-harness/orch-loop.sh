@@ -2145,8 +2145,15 @@ is_limit "${STALE_MIN:-}" || STALE_MIN=40
 #           the worker's surface is GONE (nothing left to destroy)      -> reap (the slot is freeable).
 #   UNKNOWN anything else — an unreadable table, a worker the probe
 #           could not identify, a window too short to mean anything     -> SPARE it. Assume active until
-#           proven idle: sparing a hung worker costs one slot until the next cycle, while killing a
-#           live one destroys work nothing records.
+#           proven idle, because killing a live one destroys work nothing records.
+#           ⛔ AND THE UNKNOWN ARM'S COST IS NOT "one slot until the next cycle" (review of PR #3756,
+#           P3 — corrected here rather than left as a claim the code does not make). It is UNBOUNDED:
+#           `_wreap_verdict` returns 2 on `matched == 0` BEFORE any time comparison, and `_wreap_note`
+#           then re-writes `m=0`, so the identical spare repeats on every pass and nothing in this
+#           function ever escalates it. The record keeps holding a lane slot (`wt_count` counts every
+#           row that is not `dead`) and only the `wedged=` line names it — a human has to read the log.
+#           That is the deliberate price of not destroying work; the ACTIVE arm is the one that costs a
+#           single cycle, because the next pass re-measures it and can free the slot.
 #
 # ⛔ THE IDENTITY MUST COVER **BOTH** LAUNCH ARMS, AND THE FIRST CUT OF THIS FIX DID NOT (review of
 # PR #3756, P0 — reproduced). `worker-terminal.sh` launches a worker on a durable cmux terminal
@@ -2178,17 +2185,24 @@ is_num "${_WREAP_WINDOW_MIN:-}" || _WREAP_WINDOW_MIN=6
 # _wreap_ps — one process-table snapshot: pid, ppid, cpu time, and the command line (which is how a
 # worker is identified when it has no pane pid — see `_wreap_patterns`).
 _wreap_ps() { ps -Ao pid=,ppid=,time=,command= 2>/dev/null; }
-# _wreap_patterns <name> <logpath> -> the `<TAB>`-separated identity set for one worker.
-# ⛔ EVERY ENTRY IS ANCHORED BY SOMETHING THAT IS NOT THE WORKER'S NAME, because `index()` is a plain
-# substring test: `wt-fix-19` is a PREFIX of `wt-fix-1949` and matched ANOTHER live worker's subtree
-# (review of PR #3756, P1 — reproduced). The log path is anchored by `/logs/` and a `.log` suffix; the
-# run script by `run-`…`.sh`. A name form is deliberately NOT in this set.
-# ⛔ AND THE RECORD'S `cwd` IS DELIBERATELY NOT IN IT EITHER (measured while fixing that P1). A cwd is
-# not exclusive to one worker: the fixtures and real records alike carry `/tmp`, a repo root, or a shared
-# cluster home, so `index(cmd, "/tmp")` matched half the box and attributed tens of thousands of
-# centiseconds to a worker that had burned none — which reads as ACTIVE and spares a genuinely wedged
-# lane for ever. The two anchored forms plus the tmux pane pid are the whole identity set.
-_wreap_patterns() { printf '%s\t%s' "${2:-}" "run-${1:-}.sh"; }
+# _wreap_patterns <name> -> the `<TAB>`-separated identity set for one worker.
+# ⛔ ONE FORM, AND IT IS THE LAUNCHER'S OWN: the run script (`run-<w>.sh`) that the cmux arm executes as
+# `/bin/bash <dir>/run-<w>.sh` (`worker-terminal.sh:2066`/`:2075`). Together with the tmux pane pid,
+# supplied separately by `_wreap_pane_pid`, those are the only two handles the two launch arms put on a
+# process — and between them every worker this reaper walks is identifiable, and anchored (`run-`…`.sh`
+# can never match `run-fix-1949.sh` for `fix-19`).
+# ⛔ THE LOG PATH IS NOT AN IDENTITY (review of PR #3756, P2 — reproduced). Nothing on a WORKER's argv
+# carries it: `spawn-gate.sh`'s `run_agent` applies it as a shell REDIRECT. The one process that does
+# carry it is the lane-bound PROGRESS WATCHDOG (`spawn-gate.sh:4567`: `sh "$_lb_sh" watch --pid … --log
+# "$log"`), which is a SIBLING of the agent — outside the subtree this probe sums — and flat by
+# construction. So the log path made `matched` ≥ 1 for every `fix-*`/`lane-*` worker whether or not a
+# worker was found, and the `matched == 0 ⇒ UNKNOWN ⇒ spare` net in `_wreap_verdict` could not fire in
+# the one family #2104 was measured on: `matched>0` was not evidence the worker had been identified.
+# ⛔ A NAME FORM IS DELIBERATELY NOT IN THE SET (`index()` is a plain substring test, and `wt-fix-19` is
+# a PREFIX of `wt-fix-1949`, which matched ANOTHER live worker's subtree — P1 of the same review), and
+# neither is the record's `cwd` (a cwd is not exclusive to one worker: `/tmp`, a repo root or a shared
+# cluster home matched half the box and read as ACTIVE for ever — measured while fixing that P1).
+_wreap_patterns() { printf 'run-%s.sh' "${1:-}"; }
 # _wreap_cpu <table|-> <patterns> <seed-pids> -> "<matched> <cpu_cs>", or NOTHING when unreadable.
 # `seed-pids` are roots that ARE the worker (a tmux pane pid): they are counted as matched and their
 # subtrees summed, which is the only identity the tmux arm offers.
@@ -2259,12 +2273,28 @@ _wreap_pane_pid() {
 # is carried across passes instead — the delta is then over minutes, which is what "no CPU delta for
 # the idle window" means.
 _wreap_sample_file() { printf '%s/state/wreap-%s' "$O" "${1:-}"; }
+# _wreap_prev <name> [<log-mtime>] -> the previous sample line, or nothing.
+# ⛔ A BASELINE BELONGS TO ONE INCARNATION OF THE NAME (review of PR #3756, P2 — reproduced). Worker
+# names are RECYCLED by construction (`fix-<PR>`, `merge-<PR>`, `review-<PR>` are reused every time the
+# same PR is dispatched again) and `_wreap_forget` runs on the reap arm only, so a sample left by a dead
+# predecessor was read as THIS worker's window — `_wreap_verdict` then returned REAP for a live,
+# identified, flat-reading tree whose baseline was three days old. The generation key is the worker's own
+# log write: a baseline taken BEFORE the current log mtime cannot be a reading of the current
+# incarnation, because whatever wrote the log at `m` had not started when that sample was taken. Such a
+# baseline is discarded and the window restarts. Discarding can only SPARE (the verdict then answers
+# "first sighting"), which is the safe direction here — the same discipline as a supervisor pinning
+# `(pid, start time)` rather than trusting a recycled pid.
 _wreap_prev() {
-  local f; f="$(_wreap_sample_file "$1")"
+  local f line pts
+  f="$(_wreap_sample_file "$1")"
   [ -f "$f" ] || return 0
-  head -1 "$f" 2>/dev/null
+  line="$(head -1 "$f" 2>/dev/null)"
+  [ -n "${line:-}" ] || return 0
+  pts="${line%% *}"
+  if is_num "${2:-}" && is_num "${pts:-}" && [ "${pts:-0}" -lt "${2:-0}" ]; then return 0; fi
+  printf '%s\n' "$line"
 }
-_wreap_note() { # <name> <epoch> <cpu> <matched>
+_wreap_note() { # <name> <epoch> <cpu> <matched> [<log-mtime>]
   # ⛔ THE BASELINE EPOCH IS THE *FIRST* READING OF A FLAT SPELL, NOT THE LATEST ONE (found while
   # reviewing this fix — an INERT gate, the same class as #2104). Rewriting `<now>` on every pass keeps
   # `now - pts` at ~0 for ever, so `_wreap_verdict` answers "window too short" every cycle and the gate
@@ -2272,7 +2302,9 @@ _wreap_note() { # <name> <epoch> <cpu> <matched>
   # could not answer its own question again. So a reading that has NOT progressed PRESERVES the older
   # baseline, and only real progress (or an unusable baseline) restarts the window.
   local prev pts rest pcpu pm cpu="${3:-0}" m="${4:-0}"
-  prev="$(_wreap_prev "$1")"
+  # The incarnation key is passed THROUGH so this function cannot resurrect a predecessor's baseline
+  # with its own preserve-the-window rule: `_wreap_prev` is the one place that decides whose sample it is.
+  prev="$(_wreap_prev "$1" "${5:-}")"
   if [ -n "$prev" ]; then
     pts="${prev%% *}"; rest="${prev#* }"; pcpu="${rest%% *}"; pm="${rest#* }"
     if is_num "${pts:-}" && is_num "${pcpu:-}" && is_num "${pm:-}" && is_num "${cpu:-}" \
@@ -2317,7 +2349,7 @@ _wreap_verdict() {
 }
 reap_stale_workers() {
   local s f age m _wm _wn=0 _wl=""
-  # Candidates for this pass, one row each: name, log path, identity patterns, age. The reap DECISION
+  # Candidates for this pass, one row each: name, log path, age, log mtime (the incarnation key). The reap DECISION
   # cannot be taken inside the census walk any more, because the positive-liveness gate needs TWO
   # samples of the process table with a window between them, and that window must be paid ONCE for the
   # whole pass — a per-candidate `sleep` would stall a loaded box's cycle by N x the window, and the
@@ -2362,7 +2394,9 @@ reap_stale_workers() {
     _wm="$( _wedge_min 2>/dev/null )"; is_num "${_wm:-}" || _wm=80
     if [ "$age" -gt $(( _wm * 60 )) ]; then _wn=$(( _wn + 1 )); _wl="${_wl:+$_wl,}$s(${age}s)"; fi
     [ "$age" -gt $(( 10#${STALE_MIN} * 60 )) ] || continue
-    _wc="${_wc}${s}$(printf '\t')${f}$(printf '\t')${age}
+    # `<log mtime>` rides along as the INCARNATION KEY for the durable sample: a baseline older than the
+    # worker's last log write is a previous `fix-<PR>`/`merge-<PR>`'s, not this one's (see `_wreap_prev`).
+    _wc="${_wc}${s}$(printf '\t')${f}$(printf '\t')${age}$(printf '\t')${m}
 "
   done <<EOF
 $(wt_table)
@@ -2374,16 +2408,17 @@ EOF
   # ONE process-table read per pass: the previous reading comes from the durable sample file, so the
   # delta is over controller time rather than over an instant (see `_WREAP_WINDOW_MIN`).
   if [ -n "$_wc" ]; then
-    local _now _tbl _cn _cf _ca _pats _seed _pane _prev _pcpu _o _cpu _m _surf _v
+    local _now _tbl _cn _cf _ca _cm _pats _seed _pane _prev _pcpu _o _cpu _m _surf _v
     _now="$(date +%s 2>/dev/null)" || _now=0
     is_num "${_now:-}" || _now=0
     _tbl="$(_wreap_ps)"
-    while IFS="$(printf '\t')" read -r _cn _cf _ca; do
+    while IFS="$(printf '\t')" read -r _cn _cf _ca _cm; do
       [ -n "${_cn:-}" ] || continue
-      _pats="$(_wreap_patterns "$_cn" "$_cf")"
+      _pats="$(_wreap_patterns "$_cn")"
       # The tmux arm's ONLY identity is its pane pid; the same resolution `wt_close` will use.
       _pane="$(_wreap_pane_pid "$_cn")"
-      _prev="$(_wreap_prev "$_cn")"
+      # `<log mtime>` decides WHOSE baseline this is; without it a recycled name inherits a corpse's window.
+      _prev="$(_wreap_prev "$_cn" "${_cm:-}")"
       _pcpu=""
       _seed="${_prev#* }"; [ "$_seed" != "$_prev" ] && _pcpu="${_seed%% *}"
       _o=""; _cpu=""; _m=0
@@ -2435,7 +2470,7 @@ EOF
       esac
       # The sample is written on EVERY arm that did not reap. On the two spare arms it IS the next
       # pass's window: a worker measuring flat keeps ageing its baseline, one that progresses resets it.
-      [ "$_v" = "0" ] || _wreap_note "$_cn" "$_now" "${_cpu:-0}" "${_m:-0}"
+      [ "$_v" = "0" ] || _wreap_note "$_cn" "$_now" "${_cpu:-0}" "${_m:-0}" "${_cm:-0}"
     done <<EOF
 $_wc
 EOF
