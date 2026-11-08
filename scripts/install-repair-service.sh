@@ -90,11 +90,20 @@ UNIT_NAME="eldato-pr-repair.service"
 # The rule lives in `scripts/lib/cell-home.sh`; a missing resolver falls back to `$HOME` (the one home on
 # a compliant cell), never to the legacy volatile path.
 CELL_HOME_LIB=""
-for _cand in "$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd -P)/lib/cell-home.sh" \
-             "$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/.." 2>/dev/null && pwd -P)/lib/cell-home.sh"; do
-  [ -r "$_cand" ] && { CELL_HOME_LIB="$_cand"; break; }
-done
+# ⛔ THE SELF PATH COUNTS ONLY WHEN IT NAMES THIS FILE — see `lib/cell-home.sh` §CONSUMERS.
+_SELF="${BASH_SOURCE[0]:-}"; [ -f "$_SELF" ] || _SELF=""     # under `bash -s` $0 is literally `bash` -> `.`
+if [ -n "$_SELF" ]; then
+  _SELF_DIR="$(cd "$(dirname "$_SELF")" 2>/dev/null && pwd -P)"
+  for _cand in "$_SELF_DIR/lib/cell-home.sh" "$_SELF_DIR/../lib/cell-home.sh"; do
+    [ -r "$_cand" ] && { CELL_HOME_LIB="$_cand"; break; }
+  done
+fi
 if [ -n "$CELL_HOME_LIB" ]; then . "$CELL_HOME_LIB"; CELL_HOME="$(cell_home_resolve)"; else CELL_HOME="${CELL_HOME:-${HOME:-}}"; fi
+# ⛔ AN EMPTY CELL_HOME IS NOT A HOME — it is the FILESYSTEM ROOT (`O=/orchestrator`,
+# `SCRIPTS=/.pi/agent/scripts`, a layer installed at `/.pi/agent`). A missing resolver is the
+# incomplete-install case the resolver's header names, so it is the SAME refusal the five sibling
+# consumers already make (exit 78, EX_CONFIG) instead of a silent walk to `/`.
+[ -n "$CELL_HOME" ] || { printf '%s: FATAL: %s is not readable and neither CELL_HOME nor HOME is set — refusing to default the cell home (agent-infra#3453)\n' "${0##*/}" "${CELL_HOME_LIB:-lib/cell-home.sh}" >&2; exit 78; }
 O="${O:-$CELL_HOME/orchestrator}"
 ENV_FILE="${ENV_FILE:-$CELL_HOME/keys.env}"
 REPO_SLUG="${PR_DOCTOR_REPO:-${GH_REPO:-daniel-ospina/tortoise}}"

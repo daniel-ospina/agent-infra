@@ -78,7 +78,10 @@ set -uo pipefail
 # bring-up must still be able to REPORT the state of a box. The fallback is `$HOME` (never the legacy
 # path), and it is not trusted — `check_one_home` re-derives the account home from the passwd record
 # and refuses a mismatch, so a wrong `$HOME` becomes a named CHECK FAILURE, not a silent second home.
-BRINGUP_SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd -P)"
+# ⛔ THE SELF PATH COUNTS ONLY WHEN IT NAMES THIS FILE — see `lib/cell-home.sh` §CONSUMERS.
+_SELF="${BASH_SOURCE[0]:-}"; [ -f "$_SELF" ] || _SELF=""     # under `bash -s` $0 is literally `bash` -> `.`
+BRINGUP_SELF_DIR=""
+if [ -n "$_SELF" ]; then BRINGUP_SELF_DIR="$(cd "$(dirname "$_SELF")" 2>/dev/null && pwd -P)"; fi
 CELL_HOME_LIB="${BRINGUP_SELF_DIR:+$BRINGUP_SELF_DIR/lib/cell-home.sh}"
 if [ -n "$CELL_HOME_LIB" ] && [ -r "$CELL_HOME_LIB" ]; then
   . "$CELL_HOME_LIB"

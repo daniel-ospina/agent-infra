@@ -136,6 +136,24 @@ source_in "$LIB" '[ "$(cell_home_project /home/cmux /tmp/cell-home/keys.env)" = 
   && ok "b7 project: a legacy path is re-based; a sibling (/tmp/cell-home-2/x) and an unrelated path are NOT touched" \
   || bad "b7 project: re-basing boundary"
 
+# b8: the LINE projector the migration uses — several tokens move, and the boundary rule is unchanged
+# inside a line. ⛔ `/tmp/cell-home.bak` is the shape a migration itself CREATES (`.pre-cell-home`
+# backups) and the shape an operator makes before one; re-basing it produced `<home>.bak`, a path that
+# does not exist, and the unit was then refused over a FABRICATED target.
+source_in "$LIB" '[ "$(cell_home_project_line /home/cmux "ExecStart=/tmp/cell-home/harness/run.sh --state /tmp/cell-home/state")" = "ExecStart=/home/cmux/harness/run.sh --state /home/cmux/state" ] \
+               && [ "$(cell_home_project_line /home/cmux "Environment=ARCHIVE=/tmp/cell-home.bak")" = "Environment=ARCHIVE=/tmp/cell-home.bak" ] \
+               && [ "$(cell_home_project_line /home/cmux "ExecStart=/tmp/cell-home/a /tmp/cell-home-2/b /tmp/cell-home/c")" = "ExecStart=/home/cmux/a /tmp/cell-home-2/b /home/cmux/c" ] \
+               && [ "$(cell_home_project_line /home/cmux "no legacy path here")" = "no legacy path here" ]' \
+  && ok "b8 project_line: every legacy token in a line moves, a sibling suffix (.bak, -2) does not, and a clean line is returned verbatim" \
+  || bad "b8 project_line: whole-line re-basing"
+
+# b9: the two projectors answer the SAME single token the same way — they are one rule with two arities,
+# so a future edit to either boundary reddens here instead of drifting into two opinions.
+_pl_tok=/tmp/cell-home/keys.env
+[ "$(source_in "$LIB" "cell_home_project /home/cmux $_pl_tok")" = "$(source_in "$LIB" "cell_home_project_line /home/cmux $_pl_tok")" ] \
+  && ok "b9 project and project_line agree on a single token (one rule, two arities)" \
+  || bad "b9 project and project_line disagree on a single token"
+
 printf '\n── (c) THE ONE LITERAL / NO LEGACY DEFAULTS ─────────────────────────────────────────\n'
 
 # Every non-test shell/python file under scripts/ and pi-bootstrap/ that assigns a CELL_HOME default

@@ -22,7 +22,10 @@ set -uo pipefail
 # controller session with `HOME=/tmp/cell-home` while the unit that spawns lanes gave them
 # `/home/cmux`, so the relaunched controller's `git push` read a `contents=read` PAT while its `gh`
 # reads worked. One derivation, one home: `scripts/lib/cell-home.sh`.
-QUIESCE_SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd -P)"
+# ⛔ THE SELF PATH COUNTS ONLY WHEN IT NAMES THIS FILE — see `lib/cell-home.sh` §CONSUMERS.
+_SELF="${BASH_SOURCE[0]:-}"; [ -f "$_SELF" ] || _SELF=""     # under `bash -s` $0 is literally `bash` -> `.`
+QUIESCE_SELF_DIR=""
+if [ -n "$_SELF" ]; then QUIESCE_SELF_DIR="$(cd "$(dirname "$_SELF")" 2>/dev/null && pwd -P)"; fi
 CELL_HOME_LIB="${QUIESCE_SELF_DIR:+$QUIESCE_SELF_DIR/lib/cell-home.sh}"
 if [ -n "$CELL_HOME_LIB" ] && [ -r "$CELL_HOME_LIB" ]; then
   . "$CELL_HOME_LIB"

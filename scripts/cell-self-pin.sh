@@ -122,7 +122,10 @@ set -u
 # /etc/systemd/system, and at that one moment an operator saying which home is the cell's is worth
 # requiring. A bare PASS keeps the tolerant default, because a manual run must not be refused over an
 # environment variable.
-PIN_SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd -P)"
+# ⛔ THE SELF PATH COUNTS ONLY WHEN IT NAMES THIS FILE — see `lib/cell-home.sh` §CONSUMERS.
+_SELF="${BASH_SOURCE[0]:-}"; [ -f "$_SELF" ] || _SELF=""     # under `bash -s` $0 is literally `bash` -> `.`
+PIN_SELF_DIR=""
+if [ -n "$_SELF" ]; then PIN_SELF_DIR="$(cd "$(dirname "$_SELF")" 2>/dev/null && pwd -P)"; fi
 CELL_HOME_LIB="${PIN_SELF_DIR:+$PIN_SELF_DIR/lib/cell-home.sh}"
 CELL_HOME_GIVEN="${CELL_HOME:-}"
 if [ -n "$CELL_HOME_LIB" ] && [ -r "$CELL_HOME_LIB" ]; then

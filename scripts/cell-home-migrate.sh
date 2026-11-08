@@ -30,6 +30,11 @@
 #     reported, never repaired.
 #  3. ⛔ IT NEVER PRINTS A SECRET. Every credential is described by path, size, mode and mtime. No
 #     value is read into a variable the log could reach, and no value appears in a diff or a message.
+#     The ONE exception is a NAME, never a value: `keys.env` is a SOURCEABLE shell file, so an
+#     assignment in it that re-points `HOME`/`CELL_HOME` at the legacy (or any volatile) home is named
+#     as drift — the variable's NAME only, never what it was set to. A copy of such a file is REFUSED
+#     rather than installed: copying it would re-point every lane that sources it back into the
+#     second home, i.e. undo this migration from inside the file the migration installed.
 #  4. ⛔ IT NEVER WRITES A UNIT THAT WOULD NOT RUN. A repointed path is written ONLY when its
 #     counterpart under the durable home EXISTS. If it does not, the file is refused BY NAME with the
 #     missing target quoted — a unit that execs a path that is not there is `203/EXEC` on the next
@@ -41,10 +46,13 @@
 # writes are `<file>.pre-cell-home` (mode preserved, written once — never clobbered by a later run).
 #
 # ── EXIT CODES ──────────────────────────────────────────────────────────────────────────────────
-#   0  converged — one home, nothing to do
+#   0  converged — one home, nothing to do (i.e. NOT ONE unit/drop-in/credential still names the
+#      legacy home. A record that `--apply` COULD repoint is drift, not convergence: `--check` gates
+#      the reclaim of the legacy home, so "would be repointable" must never read as "one home")
 #   1  drift found (`--check`) / something was refused or left for an operator (`--apply`)
-#   3  CANNOT MEASURE — a reading this tool needs could not be taken (named on stderr). Never 0:
-#      "could not read" is not "one home".
+#   3  CANNOT MEASURE — a reading this tool needs could not be taken (named on stderr), or the
+#      durable home cannot be derived for the account the UNITS RUN AS (a privileged invoking account
+#      derives `/root`; see `check_derivation`). Never 0: "could not read" is not "one home".
 #
 # ── FIXTURE SEAMS (declared, not hidden) ────────────────────────────────────────────────────────
 #   CELL_HOME_MIGRATE_UNIT_DIRS   colon list of unit dirs to grade (default: the three below)
@@ -53,8 +61,12 @@
 #                                 bring-up and the supervisor already read
 set -uo pipefail
 
-SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd -P)"
-CELL_HOME_LIB="$SELF_DIR/lib/cell-home.sh"
+# ⛔ THE SELF PATH COUNTS ONLY WHEN IT NAMES THIS FILE — see `lib/cell-home.sh` §CONSUMERS.
+_SELF="${BASH_SOURCE[0]:-}"; [ -f "$_SELF" ] || _SELF=""     # under `bash -s` $0 is literally `bash` -> `.`
+SELF_DIR=""
+if [ -n "$_SELF" ]; then SELF_DIR="$(cd "$(dirname "$_SELF")" 2>/dev/null && pwd -P)"; fi
+CELL_HOME_LIB="${SELF_DIR:+$SELF_DIR/lib/cell-home.sh}"
+CELL_HOME_LIB="${CELL_HOME_LIB:-lib/cell-home.sh}"
 if [ ! -r "$CELL_HOME_LIB" ]; then
   printf '%s: FATAL: %s is not readable — this tool will not derive a cell home from a guess. Run pi-bootstrap/setup.sh (its lib farm places the resolver) (agent-infra#3453)\n' "${0##*/}" "$CELL_HOME_LIB" >&2
   exit 3
@@ -73,8 +85,12 @@ for a in "$@"; do
 done
 if [ "$MODE" = "--help" ]; then sed -n '2,12p' "${BASH_SOURCE[0]:-$0}" | sed 's/^# \{0,1\}//'; exit 0; fi
 
+HOME_DURABLE_GIVEN=0
+[ -n "${CELL_HOME:-}" ] && HOME_DURABLE_GIVEN=1
 HOME_DURABLE="$(cell_home_resolve)"
 HOME_LEGACY="$CELL_HOME_LEGACY"
+INVOKER_UID="$(id -u 2>/dev/null || printf '1')"
+INVOKER="$(id -un 2>/dev/null || printf '?')"
 
 # The unit directories, in the order the installers try them — the same read-side seams the bring-up
 # and the supervisor use, so "which units this tool grades" cannot drift from "which units exist".
@@ -98,8 +114,56 @@ CRED_FILES="keys.env
 .pi/agent/auth.json
 .config/gh/hosts.yml"
 
+# ⛔ THE ONE CREDENTIAL THAT IS ALSO A PROGRAM. `keys.env` is SOURCED as shell by the very processes this
+# migration converges (`cloud-cell-supervisor.sh` sources it under `set -a`; `orchestrator-harness/lane-env.sh`
+# too), so a `HOME=`/`CELL_HOME=` assignment inside it is not a comment — it re-selects the home of every
+# lane that reads it, including one that puts them back in the legacy home. The copy below is
+# byte-for-byte (rule 3 forbids reading values), so a poisoned file would be installed faithfully; it is
+# therefore GRADED by assignment NAME, REPORTED by `--check` and REFUSED as a copy. Nothing is repaired
+# here (rule 2), and no value is ever printed (rule 3).
+ENV_FILES="keys.env"
+
 note() { printf '%s\n' "$*"; }
 warn_line() { printf 'WARN %s\n' "$*"; }
+
+# volatile_home_assignments <file> — the NAMES (HOME, CELL_HOME) of assignments in a sourceable env file
+# whose value is ABSOLUTE, is NOT the durable home, and sits under a volatile root. ⛔ IT NEVER PRINTS A
+# VALUE: the caller learns which variable was re-pointed, never what it was set to. Only the shapes such
+# a file really carries are parsed (leading blanks, `export `, one layer of quotes).
+volatile_home_assignments() {
+  local f="$1"
+  [ -r "$f" ] || return 0
+  awk -v dur="$HOME_DURABLE" -v vol="$CELL_HOME_VOLATILE_ROOTS" '
+    BEGIN { n = split(vol, roots, ":") }
+    {
+      line = $0
+      if (line ~ /^[[:space:]]*#/) next
+      if (!match(line, /^[[:space:]]*(export[[:space:]]+)?(HOME|CELL_HOME)=/)) next
+      name = substr(line, RSTART, RLENGTH)
+      sub(/^[[:space:]]*(export[[:space:]]+)?/, "", name)
+      sub(/=$/, "", name)
+      val = substr(line, RLENGTH + 1)
+      gsub(/^[[:space:]]+/, "", val); gsub(/[[:space:]]+$/, "", val)
+      gsub(/^["\047]/, "", val); gsub(/["\047]$/, "", val)
+      if (val == "" || val == dur) next
+      if (substr(val, 1, 1) != "/") next
+      for (i = 1; i <= n; i++) {
+        r = roots[i]
+        if (r == "") continue
+        if (val == r || index(val, r "/") == 1) { if (!seen[name]++) print name; next }
+      }
+    }' "$f" 2>/dev/null
+}
+
+# report_env_file <rel> <path> <what> — return 1 (naming the VARIABLE, never the value) when a sourceable
+# env file re-points HOME/CELL_HOME at a volatile home that is not the durable one.
+report_env_file() {
+  local rel="$1" f="$2" what="$3" names
+  names="$(volatile_home_assignments "$f")"
+  [ -n "$names" ] || return 0
+  warn_line "  $rel: $what ASSIGNS $(printf '%s ' $names)to a home that is NOT $HOME_DURABLE — a lane that sources this file is put back into the volatile/legacy home. The VALUE is not printed (rule 3); inspect $f by hand. This tool never repairs a credential."
+  return 1
+}
 
 # describe <path> — "<size>/<mode>/<mtime>" or MISSING. Never the contents; never a value.
 describe() {
@@ -128,9 +192,16 @@ check_credentials() {
     if [ ! -e "$f_dur" ]; then
       note "  $rel: legacy $(describe "$f_leg") -> durable MISSING (a copy is what --apply does)"
       rc=1
+      # The copy would install the legacy file's ASSIGNMENTS too, so say so now rather than letting the
+      # operator meet the refusal in `--apply` with no advance notice.
+      case " $ENV_FILES " in *" $rel "*) report_env_file "$rel" "$f_leg" "the LEGACY copy --apply would install" || true ;; esac
       continue
     fi
     note "  $rel: legacy $(describe "$f_leg") | durable $(describe "$f_dur")"
+    # ⛔ THE CONTENT LEG. A durable `keys.env` that re-points HOME/CELL_HOME is drift even though every
+    # path, size and mode says "converged": lanes source it, so the box runs in the second home while
+    # `--check` would say one. Names only — never the value.
+    case " $ENV_FILES " in *" $rel "*) report_env_file "$rel" "$f_dur" "the DURABLE copy" || rc=1 ;; esac
     # BOTH PRESENT. Never overwrite either one. If the legacy copy is NEWER that is a real hazard a
     # human has to settle — a rotated key on the legacy side would otherwise look converged.
     if [ "$(mtime_of "$f_leg")" -gt "$(mtime_of "$f_dur")" ]; then
@@ -167,6 +238,18 @@ migrate_credentials() {
       keys.env|.pi/agent/auth.json|.config/gh/hosts.yml) mode=600 ;;
       *) [ -n "$mode" ] || mode=600 ;;
     esac
+    # ⛔ A COPY OF A FILE THAT RE-POINTS THE HOME IS NOT CONVERGENCE, IT IS THE SPLIT RE-INSTALLED.
+    # Named-and-refused rather than repaired: rule 2 says a credential is never rewritten, and rule 3
+    # says its value is never read — so the tool reports WHICH variable is wrong and stops. The durable
+    # side stays MISSING deliberately: a missing credential a lane reports is safer than one that
+    # silently moves every lane back into the home this migration exists to leave.
+    case " $ENV_FILES " in
+      *" $rel "*)
+        if ! report_env_file "$rel" "$f_leg" "the copy is REFUSED: the LEGACY file"; then
+          warn_line "  REFUSED $rel — not copied (edit $f_leg so it names $HOME_DURABLE, then re-run)"
+          rc=1; continue
+        fi ;;
+    esac
     mkdir -p "$(dirname "$f_dur")" 2>/dev/null || { warn_line "  cannot create $(dirname "$f_dur") — $rel NOT copied"; rc=1; continue; }
     # `install` copies bytes without ever putting them in this process's stdout; -m sets the mode in
     # the same syscall, so the file is never momentarily world-readable.
@@ -199,44 +282,67 @@ paths_in() {
 
 # unit_scan <file> — one record per DIRECTIVE line that carries the legacy home:
 #   "<lineno>\t<directive>\t<projected-line>\t<missing-targets>"
-# <projected-line> is the line with every `$HOME_LEGACY` prefix replaced by `$HOME_DURABLE`.
-# <missing-targets> is a space-separated list of projected paths that do NOT exist.
+# <projected-line> is the line with every BOUNDARY-ANCHORED `$HOME_LEGACY` component re-based onto
+# `$HOME_DURABLE` — by `cell_home_project_line`, the lib's one projection rule (a sibling such as
+# `/tmp/cell-home.bak` is NOT this home; a naive replace re-based it to a path nobody has).
+# <missing-targets> is a space-separated list of paths the tool WOULD INTRODUCE under the durable home
+# that do NOT exist. ⛔ IT IS SCOPED TO THE DURABLE HOME ON PURPOSE: the guard exists to stop a REWRITE
+# that would not run (rule 4), so it grades the paths the rewrite introduces — not paths that were
+# already in the unit, unrelated and untouched. Grading those refused whole units over pre-existing
+# paths (an operator's `ARCHIVE=/var/backups/…` that does not exist yet) — a false block, and the
+# sibling defect to the fabricated-target refusal the boundary rule above removes.
 #   * COMMENT and BLANK lines are SKIPPED, never graded: a `#` line cannot affect systemd, and every
 #     cell unit carries paragraphs of measured history that mention the legacy path by name. Grading
 #     prose would refuse every real unit — the false-block shape this repo treats as its own defect.
 #     (Nothing is hidden by skipping them: a comment does not run.)
 #   * BACKSLASH CONTINUATIONS inherit the previous directive name, because systemd CONCATENATES the
 #     lines and expands C-style escapes — a continuation is the same directive, not a new one.
+#   * A SIBLING NAME IS NOT THIS HOME. The record test is "the projection CHANGES this line", not "the
+#     line contains the legacy string": `/tmp/cell-home.bak` (an operator's pre-migration archive, and
+#     the same shape as this tool's own `<file>.pre-cell-home` backups) contains the legacy path as a
+#     PREFIX but is a different directory. Emitting a record for it made `--check` call a converged box
+#     drifted, and made `--apply` project it to `<home>.bak` — a target nobody has, refused by name.
 unit_scan() {
-  local f="$1" n=0 line dir projected miss p cont="" pat="$HOME_LEGACY" rep="$HOME_DURABLE"
+  local f="$1" n=0 line dir projected miss p cont=""
   while IFS= read -r line; do
     n=$((n + 1))
     case "$line" in ''|'#'*) cont=""; continue ;; esac
-    case "$line" in *"$HOME_LEGACY"*) ;; *) cont=""; continue ;; esac
+    # ⛔ THE PROJECTION IS THE LIB'S RULE, NOT A COPY OF IT. `cell_home_project_line` applies the
+    # boundary rule (`/tmp/cell-home-2/x` and `/tmp/cell-home.bak` are not this home), and it is also
+    # the record test: an unchanged projection means this line names no legacy home of OURS.
+    projected="$(cell_home_project_line "$HOME_DURABLE" "$line")"
+    case "$projected" in "$line") cont=""; continue ;; esac
     case "$line" in [A-Za-z]*) dir="${line%%=*}" ;; *) dir="$cont" ;; esac
     case "$dir" in
       "") printf '%s\tUNHANDLED\t%s\t\n' "$n" "$line"; cont=""; continue ;;
     esac
-    if ! printf '%s' "$dir" | grep -Eq "^($UNIT_DIRECTIVES)\$"; then
+    if ! grep -Eq "^($UNIT_DIRECTIVES)\$" <<<"$dir"; then
       printf '%s\tUNHANDLED\t%s\t\n' "$n" "$line"; cont=""; continue
     fi
     case "$line" in *\\ ) cont="$dir" ;; *) cont="" ;; esac
-    # ⛔ THE UNQUOTED `${line//$pat/$rep}` IS DELIBERATE (bash 3.2, and this repo runs on macOS):
-    # `${line//"$pat"/"$rep"}` makes bash 3.2 splice the QUOTE CHARACTERS into the result, so the
-    # projected line became `ExecStart="/home/cmux"/harness/run.sh` — a path that does not exist, so
-    # the existence guard then refused every honest unit with a target nobody could explain. Measured
-    # while writing this suite, which is why the arms below assert the REWRITE and not just its rc.
-    projected="${line//$pat/$rep}"
     miss=""
     while IFS= read -r p; do
       [ -n "$p" ] || continue
       case "$p" in *'$'*|*'{'*|*'%'*) continue ;; esac   # systemd specifiers are not resolved here
+      case "$p" in "$HOME_DURABLE"|"$HOME_DURABLE"/*) ;; *) continue ;; esac   # only what WE introduce
       [ -e "$p" ] || miss="$miss $p"
     done <<EOF
 $(paths_in "$projected")
 EOF
     printf '%s\t%s\t%s\t%s\n' "$n" "$dir" "$projected" "${miss# }"
   done < "$f"
+}
+
+# _project_file <src> <dst> — <src> with every line passed through the SAME projector the scan uses.
+# The scan has already accepted the file (no UNHANDLED, every introduced target exists), so a line the
+# projector changes is a line the scan graded; anything else is copied byte for byte. A here-string-free
+# bash loop on purpose: no external producer, no pipe (#841 SIGPIPE), and no second rewriting rule.
+_project_file() {
+  local src="$1" dst="$2" line
+  : >"$dst" || return 1
+  while IFS= read -r line || [ -n "$line" ]; do
+    printf '%s\n' "$(cell_home_project_line "$HOME_DURABLE" "$line")" >>"$dst" || return 1
+  done <"$src"
 }
 
 # unit_scan_all — every unit/drop-in under the declared dirs, one "<file>\t<record…>" line per hit.
@@ -260,7 +366,7 @@ EOF
 }
 
 check_units() {
-  local scan rc=0
+  local scan
   note "units naming the legacy home ($HOME_LEGACY)"
   scan="$(unit_scan_all)"
   if [ -z "$scan" ]; then
@@ -277,15 +383,18 @@ check_units() {
       warn_line "  $f:$n would NOT run after a repoint — the durable counterpart does not exist: $miss
       (a unit that execs a missing path is 203/EXEC on the next restart, so --apply will REFUSE this file)"
     else
-      note "  $f:$n  $dir=…  ->  durable counterpart exists"
+      warn_line "  $f:$n  $dir=…  ->  NOT CONVERGED: the directive still names the legacy home; --apply would repoint it"
     fi
   done
-  # The report above runs in a subshell, so the VERDICT is derived again here rather than borrowed
-  # from it: a loop's exit status cannot speak for a pipeline.
-  if printf '%s\n' "$scan" | awk -F'\t' '{ if ($3=="UNHANDLED") bad=1; else if ($5 != "") bad=1 } END { exit bad?0:1 }'; then
-    rc=1
-  fi
-  return "$rc"
+  # ⛔ THE VERDICT IS "NO RECORD AT ALL", NOT "NO UNHANDLED AND NO MISSING TARGET". Every record exists
+  # because a line STILL NAMES THE LEGACY HOME, so every record is drift — including the ordinary,
+  # un-migrated unit whose durable counterpart happens to exist, which `--apply` can cleanly repoint.
+  # Reading "would be repointable" as "converged" made `--check` answer 0 on a box with every unit
+  # pointed at the legacy home, and `--check` -> 0 is the stated precondition for RECLAIMING that home
+  # (PR/issue #3453, "What is NOT in this PR" 1 and 3): an operator would delete the directory every
+  # unit still names, i.e. `203/EXEC` on the next restart. UNHANDLED and `miss` stay a DISTINCT (louder)
+  # class — they are refusals `--apply` cannot fix — but they are not the only kind of "not one home".
+  return 1
 }
 
 # The rewrite. One file at a time, atomically, with a one-time backup that preserves the mode.
@@ -318,31 +427,35 @@ EOF
       fi
       # ⛔ WRITABILITY IS CHECKED BEFORE THE BACKUP, so the operator gets "run this under sudo" instead
       # of a confusing copy failure. `/etc/systemd/system` is root's; this tool never elevates itself.
+      # ⛔ AND THE ADVICE NAMES THE HOME. `sudo` re-sets `HOME` to the TARGET account's home
+      # (`env_reset`), so a bare `sudo -n bash $0 --apply` derives `/root` — it would repoint every
+      # `Environment=`-only directive (the commonest shape) at `/root`, create a THIRD home there, and
+      # report "one home" (see `check_derivation`). `env CELL_HOME=…` is what survives that reset.
       if [ ! -w "$f" ]; then
-        warn_line "  REFUSED $f — not writable by $(id -un). Re-run the unit half as root: sudo -n bash $0 --apply"
+        warn_line "  REFUSED $f — not writable by $INVOKER. Re-run the unit half as root WITH the home named: sudo -n env CELL_HOME=$HOME_DURABLE bash $0 --apply"
         refused=$((refused + 1)); rc=1; continue
       fi
-      # Write: a per-file awk pass that re-bases only the graded directives, so words the tool did
-      # not classify are untouched byte for byte.
+      # ⛔ THE WRITER IS THE PROJECTOR — there is no second rewriting rule to drift from the scanner's.
+      # The first attempt re-based with its own awk that matched `^(directive)=` at the START of a line,
+      # while the scan grades a BACKSLASH CONTINUATION by inheriting the previous directive name. The two
+      # halves disagreed and the disagreement was a FALSE PASS (review, P1): `ExecStart=<legacy>/run.sh \`
+      # + `  --state <legacy>/state` was HALF-written, `--apply` printed "one home" and exited 0 over a
+      # unit that still named the legacy home, and the next `--check` then reported the tool's own partial
+      # write as the operator's hand-written defect. Now every accepted line goes through the same
+      # `cell_home_project_line` the scan used to accept the file — so coverage cannot differ, only the
+      # whole FILE is accepted first (any UNHANDLED / missing-target record refuses it above).
       backup="$f.pre-cell-home"
       [ -e "$backup" ] || { cp -p "$f" "$backup" 2>/dev/null || { warn_line "  cannot back up $f — refusing to write it"; rc=1; continue; }; }
       tmpdir="$(mktemp "${f}.cell-home.XXXXXX" 2>/dev/null)" || { warn_line "  cannot create a temp file beside $f — refusing to write it"; rc=1; continue; }
-      if LC_ALL=C awk -v legacy="$HOME_LEGACY" -v durable="$HOME_DURABLE" -v dirs="^($UNIT_DIRECTIVES)=" '
-          {
-            line = $0
-            if (index(line, legacy) == 0) { print line; next }
-            d = line; sub(/=.*$/, "", d)
-            if (line ~ dirs) {
-              out = ""
-              while ((i = index(line, legacy)) > 0) {
-                out = out substr(line, 1, i - 1) durable
-                line = substr(line, i + length(legacy))
-              }
-              print out line
-              next
-            }
-            print line
-          }' "$f" >"$tmpdir" 2>/dev/null; then
+      if _project_file "$f" "$tmpdir"; then
+        # ⛔ THE POST-CONDITION: re-grade what was just written, with the SAME scanner the verdict uses.
+        # A leftover record means the write did not carry what the scan accepted (a broken pipe, a
+        # short write, a future refactor of either half) — refuse the swap, leave the original in place.
+        if [ -n "$(unit_scan "$tmpdir")" ]; then
+          rm -f "$tmpdir"
+          warn_line "  REFUSED $f — the rewrite left a line that still names $HOME_LEGACY (the writer and the scanner disagree); the original file was NOT touched"
+          refused=$((refused + 1)); rc=1; continue
+        fi
         # Preserve the original mode and ownership, then swap in atomically.
         chmod "$(mode_of "$f")" "$tmpdir" 2>/dev/null || true
         if mv -f "$tmpdir" "$f" 2>/dev/null; then
@@ -379,6 +492,79 @@ EOF
   return "$rc"
 }
 
+# ── THE DERIVATION GUARD (the account the UNITS RUN AS, not the account that invoked this) ─────
+# ⛔ THE DANGEROUS WRITE THIS GUARDS (review, P2/BLOCKING). `HOME_DURABLE` is `cell_home_resolve`'s
+# answer, and that resolver's step 2 is the PASSWD HOME OF WHOEVER IS RUNNING. The remedy this tool
+# prints for a root-owned unit dir used to be `sudo -n bash $0 --apply` — and `sudo` re-sets `HOME` to
+# the TARGET account's home (`env_reset`, sudoers(5)) while `env_reset` also drops an ambient
+# `CELL_HOME`. So the exact advice the tool gave derived `HOME_DURABLE=/root` and then:
+#   * created `/root/keys.env`, `/root/.pi/agent/auth.json`, `/root/.config/gh/hosts.yml` — a THIRD home
+#     with the cell's credentials in it; and
+#   * repointed every directive whose projected path exists — `/root` exists — so the commonest shape
+#     of all, `Environment=HOME=<legacy>` (the `cell-self-pin.service.d/*.conf` drop-in this change
+#     itself names), became `Environment=HOME=/root`;
+# and it printed `VERDICT: one home`. Rule 4's existence guard does not save it: only units whose
+# PAYLOAD is under the home are refused, and an `Environment=`-only line has no payload.
+#
+# So the DERIVATION is refused unless it is the home the units actually run as. An explicit `CELL_HOME`
+# is always honoured (the resolver's rule 1, and the seam every hermetic suite uses); what is refused is
+# GUESSING it — from `root`, or from an account the graded units do not declare.
+unit_users() {
+  local dir f
+  while IFS= read -r dir; do
+    [ -n "$dir" ] && [ -d "$dir" ] || continue
+    while IFS= read -r f; do
+      [ -n "$f" ] || continue
+      awk '/^[[:space:]]*User=/ { v = $0; sub(/^[[:space:]]*User=[[:space:]]*/, "", v); sub(/[[:space:]]+$/, "", v); if (v != "") print v }' "$f" 2>/dev/null
+    done <<EOF
+$(find "$dir" -maxdepth 2 \( -name '*.service' -o -name '*.timer' -o -name '*.conf' \) -type f 2>/dev/null | LC_ALL=C sort)
+EOF
+  done <<EOF
+$(unit_dirs)
+EOF
+}
+
+# account_home <user> — that account's passwd home, or nothing when it cannot be resolved (a unit whose
+# `User=` is still the unrendered `{{USER}}` template, a numeric uid, a user that does not exist here).
+account_home() {
+  local u="$1" h=""
+  [ -n "$u" ] || return 1
+  if command -v getent >/dev/null 2>&1; then
+    h="$(getent passwd "$u" 2>/dev/null | awk -F: 'NR==1{print $6}')"
+  fi
+  [ -n "$h" ] || h="$(cd ~"$u" 2>/dev/null && pwd -P)"
+  [ -n "$h" ] || return 1
+  printf '%s\n' "$h"
+}
+
+# check_derivation — 0 when HOME_DURABLE may be acted on; 1 with the reason on stderr when it may not.
+check_derivation() {
+  local u h conflicts=""
+  [ "$HOME_DURABLE_GIVEN" = 0 ] || return 0        # an explicit CELL_HOME is the operator's decision
+  # (i) a PRIVILEGED invoker: the resolver answers root's passwd home, which is not a cell home at all.
+  if [ "$INVOKER_UID" = 0 ]; then
+    warn_line "  REFUSED: refusing to DERIVE the durable home from a privileged invoking account ($INVOKER -> $HOME_DURABLE). The units run as the cell account, not as root, so this would repoint them (and their credentials) into $HOME_DURABLE. Name the home explicitly: sudo -n env CELL_HOME=/home/cmux bash $0 --apply"
+    return 1
+  fi
+  # (ii) the graded units declare an account whose home is not the derived one: the derivation is not
+  #      the home they run as, so repointing them would move them off their own tree.
+  while IFS= read -r u; do
+    [ -n "$u" ] || continue
+    [ "$u" = "root" ] && continue                      # root units genuinely live in /root
+    h="$(account_home "$u")" || continue
+    [ -n "$h" ] || continue
+    [ "$h" = "$HOME_DURABLE" ] && continue
+    conflicts="$conflicts $u($h)"
+  done <<EOF
+$(unit_users | awk '!s[$0]++')
+EOF
+  if [ -n "$conflicts" ]; then
+    warn_line "  REFUSED: the derived durable home $HOME_DURABLE is not the home of the account the graded units run as:$conflicts. Refusing to repoint units onto a home they do not run in — name the home explicitly: CELL_HOME=<that account's home> $0 --apply"
+    return 1
+  fi
+  return 0
+}
+
 # ── MAIN ──────────────────────────────────────────────────────────────────────────────────────
 note "cell-home-migrate: mode=$MODE"
 note "  durable home: $HOME_DURABLE  (derived by scripts/lib/cell-home.sh)"
@@ -389,6 +575,9 @@ if [ "$HOME_DURABLE" = "$HOME_LEGACY" ]; then
 fi
 if [ ! -d "$HOME_DURABLE" ]; then
   warn_line "  the durable home $HOME_DURABLE does not exist — CANNOT MEASURE (nothing was changed)"
+  exit 3
+fi
+if ! check_derivation; then
   exit 3
 fi
 

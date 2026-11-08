@@ -3094,7 +3094,7 @@ if [ -n "$_pa_line" ] && [ -n "$_hr_line" ] && [ -n "$_fork_line" ] \
     _hr_linetext="$(sed -n "${_hr_line}p" "$REAPER" 2>/dev/null)"
     _hr_code="${_hr_linetext%%#*}"
     if [ -z "$_between" ] \
-            && printf '%s' "$_hr_code" | grep -qxE '[[:space:]]*holder_recheck "\$path" "\$sha" \|\| \{ rm -f "\$out"; return 2; \}[[:space:]]*'; then
+            && grep -qxE '[[:space:]]*holder_recheck "\$path" "\$sha" \|\| \{ rm -f "\$out"; return 2; \}[[:space:]]*' <<<"$_hr_code"; then
         ok "A21e the post-archive re-check runs BEFORE holder_recheck, which stays the LAST code line before the fork"
     else
         bad "A21e a probe sits between holder_recheck and the fork (between='$(printf '%s' "$_between" | head -2 | tr '\n' ' ')' line='$_hr_linetext'), so the last liveness read is no longer last"

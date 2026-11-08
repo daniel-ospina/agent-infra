@@ -48,6 +48,28 @@
 # `lib_srcs`, so a farm delivers it to `$HOME/.pi/agent/scripts/lib/cell-home.sh` next to every consumer
 # that is farmed, and a checkout or a pinned harness worktree carries it at `<repo>/scripts/lib/`.
 #
+# ── CONSUMERS: THE SELF PATH, AND WHY `${BASH_SOURCE[0]:-$0}` IS NOT ENOUGH ─────────────────────
+# ⛔ A PIPED START (`... | bash -s`) HAS NO `BASH_SOURCE` AND ITS `$0` IS LITERALLY `bash`. So
+# `dirname "${BASH_SOURCE[0]:-$0}"` answers `.`, the consumer's `SELF_DIR` becomes the CURRENT WORKING
+# DIRECTORY, and `<SELF_DIR>/lib/cell-home.sh` becomes `$PWD/lib/cell-home.sh` — the consumer then
+# SOURCES CODE FROM A DIRECTORY IT DOES NOT OWN. That is the same code-execution-from-CWD shape
+# `pi-bootstrap/cell-install.sh` refuses for a `keys.env` it does not own (a world-writable parent makes
+# "the file is there" not a trust signal). `:-$0` removes the `set -u` crash and replaces it with a
+# quieter, worse failure; the crash was at least fail-closed.
+#
+# THE RULE, at every consumer: the self path counts only when it NAMES THE FILE BEING EXECUTED.
+#
+#   _SELF="${BASH_SOURCE[0]:-}"; [ -f "$_SELF" ] || _SELF=""
+#   SELF_DIR=""
+#   if [ -n "$_SELF" ]; then SELF_DIR="$(cd "$(dirname "$_SELF")" 2>/dev/null && pwd -P)"; fi
+#
+# Without a file there is no sibling to trust, so the consumer takes its documented non-resolver
+# fallback — and where that fallback would be an EMPTY home (`O=/orchestrator`,
+# `SCRIPTS=/.pi/agent/scripts`, a layer installed at `/.pi/agent`), it REFUSES with exit 78 instead, the
+# same refusal the strict consumers already make. Reachability, stated honestly: no shipped invocation
+# pipes these files today (`pi-reap-worktrees-launchd.py` is the one piped caller, and launchd's cwd is
+# `/`, which holds no `lib/`), so this closes a latent hole rather than a live one.
+#
 # ── NOT A GATE ──────────────────────────────────────────────────────────────────────────────────
 # This file does not decide whether a box is compliant, and it repairs nothing. The gate that REFUSES a
 # two-home box is `cloud-cell-bringup.sh::check_one_home` (`--check`), the repointing/migration tool is
@@ -127,4 +149,33 @@ cell_home_project() { # <home> <value>
     "$CELL_HOME_LEGACY"/*) printf '%s\n' "$home${val#"$CELL_HOME_LEGACY"}" ;;
     *) printf '%s\n' "$val" ;;
   esac
+}
+
+# cell_home_project_line <home> <line> — the SAME boundary rule, applied to EVERY occurrence inside a
+# value that carries several path tokens. This is the projector the migration uses (a unit directive is
+# `ExecStart=<path> --state <path> --log <path>`, and a whole line is what has to be re-based).
+#
+# ⛔ THE BOUNDARY IS THE WHOLE POINT, AND IT IS THE SAME BOUNDARY cell_home_project APPLIES. A naive
+# whole-line replace (`${line//$CELL_HOME_LEGACY/$home}`) re-bases `/tmp/cell-home.bak` — an operator's
+# pre-migration archive, and the same shape the migration writes as `<file>.pre-cell-home` — to
+# `<home>.bak`, a path nobody has. The migration then refused the whole unit and diagnosed a FABRICATED
+# target. Only a whole path COMPONENT moves: the occurrence must be followed by `/` or end the line.
+#
+# `${line%%$pat*}` / `${line#*$pat}` are UNQUOTED ON PURPOSE: on bash 3.2 (macOS) a quoted alternative
+# inside `${…%%…}` splices the quote characters into the pattern (the same trap the migration records).
+# A printf builtin is the producer here, so no pipe exists to SIGPIPE (#841).
+cell_home_project_line() { # <home> <line>
+  local home="${1:-}" line="${2:-}" pat="$CELL_HOME_LEGACY" out="" head tail
+  [ -n "$home" ] && [ -n "$line" ] || { printf '%s\n' "$line"; return 0; }
+  while :; do
+    case "$line" in *"$pat"*) ;; *) out="$out$line"; break ;; esac
+    head="${line%%$pat*}"        # everything before the FIRST occurrence
+    tail="${line#*$pat}"         # everything after that occurrence
+    case "$tail" in
+      ''|/*) out="$out$head$home" ;;   # a component boundary: this really is the legacy home
+      *)     out="$out$head$pat"  ;;   # a sibling (-2, .bak, .pre-cell-home): NOT this home
+    esac
+    line="$tail"
+  done
+  printf '%s\n' "$out"
 }

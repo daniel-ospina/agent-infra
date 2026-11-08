@@ -91,6 +91,28 @@ _after="$(cat "$UNITS/app.service" "$UNITS/app.service.d/env.conf")"
 case "$_out" in *"legacy home size:"*) ok "a5 the deferred reclaim is stated as a NUMBER, not as prose" ;; *) bad "a5 the legacy home size is not reported" ;; esac
 case "$_out" in *"NOT reclaimed"*) ok "a6 …and it says the legacy home is NOT reclaimed by this change" ;; *) bad "a6 the output does not say the legacy home is left alone" ;; esac
 
+# ⛔ THE ARM THAT WAS MISSING, AND WHY IT MATTERS (review F1 / rule-3). The ONLY row that claimed to
+# observe the `--check` verdict used to be `a2`, and its red came from `check_credentials` ALONE (the
+# fixture plants `auth.json` on the legacy side only). So `check_units` could `return 0` unconditionally
+# and the whole suite stayed green — which is how a `--check` that answered "one home" on a box with
+# EVERY unit still pointed at the legacy home shipped. `--check` -> 0 is the stated precondition for
+# RECLAIMING the legacy home, so that false PASS is a delete-the-live-directory defect, not a cosmetic
+# one. The fixture below is the shape that catches it: credentials already CONVERGED (nothing for the
+# credential leg to report) and units un-migrated with every durable counterpart PRESENT (nothing for
+# the missing-target leg to refuse) — i.e. the ordinary "just run --apply" box.
+mk_box "$T/a2"
+cp "$LEG/.pi/agent/auth.json" "$DUR/.pi/agent/auth.json"
+chmod 600 "$DUR/.pi/agent/auth.json"
+_out="$(run_tool "$TOOL" --check)"; _rc=$?
+[ "$_rc" = 1 ] && ok "a7 CONVERGED credentials + UN-MIGRATED units whose every target exists -> --check is 1 (a repointable record is drift, not convergence)" \
+  || bad "a7 --check reported $_rc on an un-migrated box whose credentials were already converged — the reclaim precondition would read as met"
+case "$_out" in *"NOT CONVERGED"*) ok "a8 …and it reports the record as NOT CONVERGED, not as a mere existing counterpart" ;; *) bad "a8 the check does not report the record as un-converged" ;; esac
+# The polarity partner: the SAME fixture after --apply must be 0, so a7 cannot be satisfied by a tool
+# that answers 1 to everything.
+run_tool "$TOOL" --apply >/dev/null 2>&1
+run_tool "$TOOL" --check >/dev/null 2>&1 && ok "a9 …the same fixture after --apply reads 0 (a7 is a polarity, not a tool that always says drift)" \
+  || bad "a9 the migrated box does not read converged"
+
 printf '\n── (c) NO SECRET VALUE EVER REACHES THE OUTPUT ─────────────────────────────────────\n'
 
 case "$_out" in *"$SENTINEL"*) bad "c1 --check printed a credential VALUE" ;; *) ok "c1 --check never prints a credential value (the fixture sentinel does not appear)" ;; esac
@@ -132,7 +154,11 @@ grep -q "Environment=HOME=$DUR" "$UNITS/app.service" && ok "d1 --apply repoints 
   || bad "d1 Environment=HOME= was not repointed"
 grep -q "ExecStart=$DUR/harness/run.sh" "$UNITS/app.service" && ok "d2 …and ExecStart= (a projected path that EXISTS)" \
   || bad "d2 ExecStart= was not repointed"
-grep -v '^[[:space:]]*#' "$UNITS/app.service" | grep -qF "$LEG" && bad "d3 the legacy path survived in a graded directive" || ok "d3 no graded directive still names the legacy home (comments excluded by design)"
+# A GRADED directive must carry no legacy path once migrated — compared through the SHELL, not through a
+# `grep -q` pipe: a quiet grep at the end of a pipe is the SIGPIPE false-negative idiom under `pipefail`
+# (#841/#864), and this suite is itself linted by `scripts/check-no-sigpipe-grep.sh`.
+_graded_body="$(grep -v '^[[:space:]]*#' "$UNITS/app.service" || true)"
+case "$_graded_body" in *"$LEG"*) bad "d3 the legacy path survived in a graded directive" ;; *) ok "d3 no graded directive still names the legacy home (comments excluded by design)" ;; esac
 grep -q "a COMMENT naming" "$UNITS/app.service" && ok "d4 …while the COMMENT naming the legacy home is untouched (a comment is not a directive)" \
   || bad "d4 the comment was altered (comments must not be graded)"
 [ -f "$UNITS/app.service.pre-cell-home" ] && ok "d5 a one-time backup is kept beside the rewritten file" || bad "d5 no backup was written"
@@ -167,6 +193,116 @@ case "$_out" in *"$DUR/harness/run.sh"*) ok "d13 …and names the MISSING durabl
 # The legacy home is NEVER deleted — the constraint the change is bounded by.
 [ -d "$LEG" ] && [ -f "$LEG/keys.env" ] && ok "d16 the LEGACY home still exists after --apply (never deleted by this change)" \
   || bad "d16 the legacy home was deleted or emptied"
+
+# ⛔ A BACKSLASH CONTINUATION IS PART OF ITS DIRECTIVE (review P1). The scan grades a continuation by
+# INHERITING the directive name while the old writer re-based only lines that literally began with a
+# graded directive — so this file was HALF-written, `--apply` printed "one home" and exited 0, and the
+# next `--check` blamed the operator for the tool's own partial write. The arm asserts the CONTENT (a
+# half-written file also exits 0 on the pre-fix code, so an rc assertion here would be vacuous).
+mk_box "$T/cont"
+mkdir -p "$DUR/state"
+cat >"$UNITS/app.service" <<EOF
+[Service]
+Environment=HOME=$LEG
+ExecStart=$LEG/harness/run.sh \\
+  --state $LEG/state
+EOF
+_out="$(run_tool "$TOOL" --apply)"; _rc=$?
+[ "$_rc" = 0 ] && ok "d17 a unit with a continued directive converges (rc 0)" || bad "d17 the continued unit exited $_rc"
+case "$(cat "$UNITS/app.service")" in
+  *"--state $LEG/state"*) bad "d18 the CONTINUATION still names the legacy home — the file was half-written while --apply reported success" ;;
+  *"--state $DUR/state"*) ok "d18 …and the CONTINUATION is repointed too (the writer agrees with the scanner)" ;;
+  *) bad "d18 the continuation was neither repointed nor left as it was" ;;
+esac
+run_tool "$TOOL" --check >/dev/null 2>&1 && ok "d19 …and the follow-up --check is green (the tool does not cite its own partial write as the operator's defect)" \
+  || bad "d19 the follow-up --check is not green after a continued-directive migration"
+
+# ⛔ A SIBLING NAME IS NOT THIS HOME (review P2): `/tmp/cell-home.bak` is a pre-migration ARCHIVE, and a
+# naive replace projected it to `<durable>.bak` — a target nobody has — so `--apply` refused the whole
+# unit and named a FABRICATED path. The arm asserts the sibling survives BYTE FOR BYTE.
+mk_box "$T/sib"
+cat >>"$UNITS/app.service" <<EOF
+Environment=ARCHIVE=$LEG.bak
+EOF
+_out="$(run_tool "$TOOL" --apply)"; _rc=$?
+[ "$_rc" = 0 ] && ok "d20 a unit carrying a SIBLING name ($LEG.bak) still converges (rc 0)" || bad "d20 the sibling-name unit exited $_rc"
+case "$(cat "$UNITS/app.service")" in
+  *"Environment=ARCHIVE=$LEG.bak"*) ok "d21 …and the sibling path is left EXACTLY as it was (only a whole path component moves)" ;;
+  *) bad "d21 the sibling path was re-based (fabricated target: $(grep ARCHIVE "$UNITS/app.service" || true))" ;;
+esac
+
+printf '\n── (i) THE DERIVATION: the account the UNITS RUN AS, not the invoker (review F2) ────────\n'
+
+# ⛔ THE DANGEROUS WRITE. `sudo` re-sets HOME to the target account's home and drops an ambient
+# CELL_HOME (`env_reset`), so the remedy this tool used to print — `sudo -n bash $0 --apply` — derived
+# /root: it created a THIRD home there with the cell's credentials in it and repointed every
+# `Environment=`-only directive (the commonest shape of all) to it, then reported "one home". The tool
+# must now REFUSE to derive from a privileged invoker. `id` is stubbed, so the arm grades the guard and
+# not the account running the suite.
+STUBROOT="$T/stubroot"; mkdir -p "$STUBROOT"
+printf '#!/bin/sh\ncase "$1" in -u) echo 0 ;; -un) echo root ;; *) exit 1 ;; esac\n' >"$STUBROOT/id"; chmod +x "$STUBROOT/id"
+mk_box "$T/root"
+# ⛔ `env -u CELL_HOME` IS PART OF THE ARM: on a real cell this suite itself runs with CELL_HOME
+# exported, and an inherited CELL_HOME is an EXPLICIT home — the guard is about GUESSING it. Without
+# the unset this arm would grade the host's env and pass for the wrong reason.
+_out="$(env -u CELL_HOME PATH="$STUBROOT:$PATH" CELL_HOME_LEGACY="$LEG" CELL_HOME_MIGRATE_UNIT_DIRS="$UNITS" \
+        CELL_HOME_MIGRATE_NO_RELOAD=1 bash "$TOOL" --apply 2>&1)"; _rc=$?
+[ "$_rc" = 3 ] && ok "i1 a PRIVILEGED invoker with no explicit CELL_HOME is refused (rc 3, CANNOT MEASURE — never a repoint into /root)" \
+  || bad "i1 a privileged invoker exited $_rc instead of refusing the derivation"
+case "$_out" in *"REFUSED"*"CELL_HOME="*) ok "i2 …and the refusal names the explicit-CELL_HOME remedy (so a bare sudo cannot derive /root again)" ;; *) bad "i2 the refusal does not name the explicit-home remedy" ;; esac
+case "$(cat "$UNITS/app.service")" in *"$DUR"*) bad "i3 the refused run WROTE the unit anyway" ;; *) ok "i3 …and nothing was written to the units" ;; esac
+
+# The second half: units that declare an account which does not live in the derived home. HERE the
+# derivation IS possible (a passwd record answers) and it is WRONG for these units, which is the same
+# defect one step quieter.
+STUBACCT="$T/stubacct"; mkdir -p "$STUBACCT" "$T/realhome" "$T/otherhome"
+printf '#!/bin/sh\ncase "$1" in -u) echo 1000 ;; -un) echo cmux ;; *) exit 1 ;; esac\n' >"$STUBACCT/id"
+printf '#!/bin/sh\ncase "$1" in passwd) case "$2" in cmux) echo "cmux:x:1000:1000::%s:/bin/bash" ;; ubuntu) echo "ubuntu:x:1001:1001::%s:/bin/bash" ;; esac ;; esac\n' "$T/realhome" "$T/otherhome" >"$STUBACCT/getent"
+chmod +x "$STUBACCT/id" "$STUBACCT/getent"
+mk_box "$T/acct"
+sed -i.bak 's/^User=.*/User=ubuntu/' "$UNITS/app.service" && rm -f "$UNITS/app.service.bak"
+_out="$(env -u CELL_HOME PATH="$STUBACCT:$PATH" CELL_HOME_LEGACY="$LEG" CELL_HOME_MIGRATE_UNIT_DIRS="$UNITS" \
+        CELL_HOME_MIGRATE_NO_RELOAD=1 bash "$TOOL" --check 2>&1)"; _rc=$?
+[ "$_rc" = 3 ] && ok "i4 units that declare an account which does NOT live in the derived home -> refused (rc 3)" \
+  || bad "i4 a home that is not the units' account home was accepted (rc $_rc)"
+case "$_out" in *"not the home of the account the graded units run as"*) ok "i5 …naming the conflict, so the operator knows which home to pass" ;; *) bad "i5 the conflict is not named" ;; esac
+# …and the SAME box converges when the operator names the home (an explicit CELL_HOME is always honoured).
+env -u CELL_HOME PATH="$STUBACCT:$PATH" CELL_HOME="$T/otherhome" CELL_HOME_LEGACY="$LEG" CELL_HOME_MIGRATE_UNIT_DIRS="$UNITS" \
+  CELL_HOME_MIGRATE_NO_RELOAD=1 bash "$TOOL" --check >/dev/null 2>&1
+[ "$?" != 3 ] && ok "i6 …while an explicit CELL_HOME for that account is honoured (not refused)" \
+  || bad "i6 an explicit CELL_HOME was refused too — the guard would block the sanctioned fix"
+
+printf '\n── (j) THE CREDENTIAL THAT IS ALSO A PROGRAM (review F3/P1) ─────────────────────────────\n'
+
+# `keys.env` is SOURCED by the processes this migration converges, so a `HOME=`/`CELL_HOME=` assignment in
+# it re-selects the home of every lane that reads it — including one that puts them back in the legacy
+# home. Rule 3 forbids printing a VALUE, so the tool reports the NAME only, and it refuses to COPY a
+# poisoned file rather than installing it.
+POISON="sk-CELLHOME-ENVVAL-3453"
+mk_box "$T/env1"
+printf 'export CELL_HOME=%s\nDEEPSEEK_API_KEY=%s\n' "$LEG" "$POISON" >"$DUR/keys.env"; chmod 600 "$DUR/keys.env"
+_out="$(run_tool "$TOOL" --check)"; _rc=$?
+[ "$_rc" = 1 ] && ok "j1 a durable keys.env whose ASSIGNMENT re-points CELL_HOME at the legacy home -> --check is 1" \
+  || bad "j1 a re-pointing durable keys.env read as converged (rc $_rc)"
+case "$_out" in *"ASSIGNS CELL_HOME"*) ok "j2 …naming the VARIABLE that re-points the home" ;; *) bad "j2 the re-pointing assignment is not reported" ;; esac
+case "$_out" in *"$POISON"*) bad "j2b the report printed the assignment's VALUE (rule 3)" ;; *) ok "j2b …and the value never appears in the output (rule 3 holds for the content leg)" ;; esac
+
+# The copy leg: the durable side is MISSING, so `--apply` would install the legacy file — including its
+# assignment. It must refuse, and leave the durable side MISSING (a missing credential a lane reports is
+# safer than one that silently moves every lane back).
+mk_box "$T/env2"
+rm -f "$DUR/keys.env"
+printf 'export HOME=%s\nexport CELL_HOME=%s\nDEEPSEEK_API_KEY=%s\n' "$LEG" "$LEG" "$POISON" >"$LEG/keys.env"; chmod 600 "$LEG/keys.env"
+_out="$(run_tool "$TOOL" --apply)"; _rc=$?
+[ "$_rc" = 1 ] && ok "j3 --apply REFUSES to copy a legacy keys.env that re-points the home (rc 1)" || bad "j3 the poisoned copy exited $_rc"
+[ ! -e "$DUR/keys.env" ] && ok "j4 …and the durable side is left MISSING rather than installed poisoned" \
+  || bad "j4 the poisoned keys.env was installed in the durable home"
+case "$_out" in *"$POISON"*) bad "j4b the refusal printed a credential value (rule 3)" ;; *) ok "j4b …and the refusal prints no credential value" ;; esac
+# …while a clean keys.env still copies (the polarity: the refusal is about the CONTENT, not the file).
+mk_box "$T/env3"
+rm -f "$DUR/keys.env"
+_out="$(run_tool "$TOOL" --apply)"; _rc=$?
+if [ -f "$DUR/keys.env" ]; then ok "j5 a keys.env that names the DURABLE home is copied (the refusal is content, not the filename)"; else bad "j5 a clean keys.env was not copied (rc $_rc)"; fi
 
 printf '\n── (g) NON-VACUITY: the refusals are the code, not the fixture ──────────────────────\n'
 
@@ -203,6 +339,62 @@ else
   else
     ok "g2 WITHOUT the copy guard the tool OVERWRITES the durable credential — (b) measures the guard"
   fi
+fi
+
+# g3: NEUTRALISE THE PROJECTOR so no unit line is ever graded (the PRE-FIX SHAPE of the verdict: a box
+# with every unit pointed at the legacy home produced no record, so `--check` answered "one home"). a7/a8
+# must redden — that is what makes them a measurement of the VERDICT rather than of the fixture.
+mkdir -p "$T/mutdir3/lib"
+cp "$TOOL" "$T/mutdir3/cell-home-migrate.sh"
+sed 's#out="\$out\$head\$home"#out="$out$head$pat"#' "$HERE/lib/cell-home.sh" >"$T/mutdir3/lib/cell-home.sh"
+if cmp -s "$HERE/lib/cell-home.sh" "$T/mutdir3/lib/cell-home.sh"; then
+  bad "g3 the boundary-neutralising mutation could not be applied — a7 is not checking the verdict"
+else
+  mk_box "$T/g3"
+  cp "$LEG/.pi/agent/auth.json" "$DUR/.pi/agent/auth.json"; chmod 600 "$DUR/.pi/agent/auth.json"
+  run_tool "$T/mutdir3/cell-home-migrate.sh" --check >/dev/null 2>&1
+  if [ "$?" = 0 ]; then
+    ok "g3 WITH the projector neutralised the un-migrated box reads 0 — a7 measures the VERDICT (the F1 false PASS)"
+  else
+    bad "g3 the neutralised projector still reported drift — a7 is not measuring the verdict"
+  fi
+fi
+
+# g4: RE-BASE SIBLINGS (the naive-replace shape) and d20/d21 must redden — the boundary arm really is
+# testing `cell_home_project_line`'s `/`-or-end-of-line rule.
+mkdir -p "$T/mutdir4/lib"; cp "$HERE/cell-home-migrate.sh" "$T/mutdir4/cell-home-migrate.sh"
+sed 's#out="\$out\$head\$pat"#out="$out$head$home"#' "$HERE/lib/cell-home.sh" >"$T/mutdir4/lib/cell-home.sh"
+if cmp -s "$HERE/lib/cell-home.sh" "$T/mutdir4/lib/cell-home.sh"; then
+  bad "g4 the sibling-rebasing mutation could not be applied — d20/d21 are not checking the boundary"
+else
+  mk_box "$T/g4"
+  printf 'Environment=ARCHIVE=%s.bak\n' "$LEG" >>"$UNITS/app.service"
+  run_tool "$T/mutdir4/cell-home-migrate.sh" --apply >/dev/null 2>&1
+  case "$(cat "$UNITS/app.service")" in
+    *"ARCHIVE=$LEG.bak"*) bad "g4 the sibling-rebasing mutant still left the archive path alone — d21 is not measuring the boundary" ;;
+    *) ok "g4 WITH siblings re-based the archive path is rewritten (or the file refused) — d21 measures the boundary" ;;
+  esac
+fi
+
+# g5: DROP THE CONTINUATION INHERITANCE and d17-d19 must redden. This is the writer/scanner disagreement
+# shape: a continuation line is then no longer graded at all, so the file cannot converge.
+mkdir -p "$T/mutdir5/lib"; cp "$HERE/lib/cell-home.sh" "$T/mutdir5/lib/cell-home.sh"
+sed 's#^    case "\$line" in \[A-Za-z\]\*) dir="\${line%%=\*}" ;; \*) dir="\$cont" ;; esac#    case "$line" in [A-Za-z]*) dir="${line%%=*}" ;; *) dir="" ;; esac#' "$HERE/cell-home-migrate.sh" >"$T/mutdir5/cell-home-migrate.sh"
+if cmp -s "$HERE/cell-home-migrate.sh" "$T/mutdir5/cell-home-migrate.sh"; then
+  bad "g5 the continuation mutation could not be applied — d17-d19 are not checking the continuation"
+else
+  mk_box "$T/g5"; mkdir -p "$DUR/state"
+  cat >"$UNITS/app.service" <<EOF
+[Service]
+Environment=HOME=$LEG
+ExecStart=$LEG/harness/run.sh \\
+  --state $LEG/state
+EOF
+  run_tool "$T/mutdir5/cell-home-migrate.sh" --apply >/dev/null 2>&1
+  case "$(cat "$UNITS/app.service")" in
+    *"--state $LEG/state"*) ok "g5 WITHOUT the continuation inheritance the continuation keeps the legacy path — d18 measures it" ;;
+    *) bad "g5 the mutant still converged the continuation — d18 is not measuring it" ;;
+  esac
 fi
 
 printf '\n── (h) argument handling ────────────────────────────────────────────────────────────\n'

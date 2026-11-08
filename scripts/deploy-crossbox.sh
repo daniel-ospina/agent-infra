@@ -20,7 +20,10 @@ set -uo pipefail
 # `HOME="$CELL_HOME"` for the controller session it builds, so a default pointing at the legacy home
 # handed every lane a home the spawning unit did not use — the measured 403-contents=write split.
 # The rule and its precedence live in `scripts/lib/cell-home.sh`.
-CROSSBOX_SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd -P)"
+# ⛔ THE SELF PATH COUNTS ONLY WHEN IT NAMES THIS FILE — see `lib/cell-home.sh` §CONSUMERS.
+_SELF="${BASH_SOURCE[0]:-}"; [ -f "$_SELF" ] || _SELF=""     # under `bash -s` $0 is literally `bash` -> `.`
+CROSSBOX_SELF_DIR=""
+if [ -n "$_SELF" ]; then CROSSBOX_SELF_DIR="$(cd "$(dirname "$_SELF")" 2>/dev/null && pwd -P)"; fi
 CELL_HOME_LIB="${CROSSBOX_SELF_DIR:+$CROSSBOX_SELF_DIR/lib/cell-home.sh}"
 if [ -n "$CELL_HOME_LIB" ] && [ -r "$CELL_HOME_LIB" ]; then
   . "$CELL_HOME_LIB"

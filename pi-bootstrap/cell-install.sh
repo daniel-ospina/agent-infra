@@ -210,7 +210,10 @@
 
 set -uo pipefail
 
-SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# ⛔ THE SELF PATH COUNTS ONLY WHEN IT NAMES THIS FILE — see `scripts/lib/cell-home.sh` §CONSUMERS.
+_SELF="${BASH_SOURCE[0]:-}"; [ -f "$_SELF" ] || _SELF=""     # under `bash -s` $0 is literally `bash` -> `.`
+SELF_DIR=""
+if [ -n "$_SELF" ]; then SELF_DIR="$(cd "$(dirname "$_SELF")" && pwd)"; fi
 # ── THE ONE HOME (agent-infra#3453) — DERIVED, never defaulted to the legacy /tmp/cell-home ────────
 # ⛔ THIS IS THE LINE THAT DECIDED WHERE A FRESH CELL'S OPERATIONAL LAYER LANDS, and it used to land
 # it in `/tmp/cell-home` — a volatile home, and the SECOND home on a box whose account home is
@@ -223,6 +226,11 @@ for _cand in "$SELF_DIR/../scripts/lib/cell-home.sh" "$SELF_DIR/lib/cell-home.sh
   [ -r "$_cand" ] && { CELL_HOME_LIB="$_cand"; break; }
 done
 if [ -n "$CELL_HOME_LIB" ]; then . "$CELL_HOME_LIB"; CELL_HOME="$(cell_home_resolve)"; else CELL_HOME="${CELL_HOME:-${HOME:-}}"; fi
+# ⛔ AN EMPTY CELL_HOME IS NOT A HOME — it is the FILESYSTEM ROOT (`O=/orchestrator`,
+# `SCRIPTS=/.pi/agent/scripts`, a layer installed at `/.pi/agent`). A missing resolver is the
+# incomplete-install case the resolver's header names, so it is the SAME refusal the five sibling
+# consumers already make (exit 78, EX_CONFIG) instead of a silent walk to `/`.
+[ -n "$CELL_HOME" ] || { printf '%s: FATAL: %s is not readable and neither CELL_HOME nor HOME is set — refusing to default the cell home (agent-infra#3453)\n' "${0##*/}" "${CELL_HOME_LIB:-lib/cell-home.sh}" >&2; exit 78; }
 DEST="$CELL_HOME/.pi/agent"
 MODE="${1:---install}"
 

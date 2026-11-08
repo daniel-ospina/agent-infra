@@ -150,10 +150,18 @@ set -uo pipefail
 
 # ⛔ `${BASH_SOURCE[0]:-}` IS LOAD-BEARING, not tidiness. The macOS agent runs this file through
 # `pi-reap-worktrees-launchd.py`, which pipes it to `bash -s`: there is NO BASH_SOURCE[0] there, and with
-# `set -u` the unguarded form printed "BASH_SOURCE[0]: unbound variable" on EVERY tick, left $HERE empty
-# (silently degrading the repo-resolution fallback to `.`), and broke `--help` through the launcher. The
-# sibling artifact this launcher already runs carries the same note (scripts/disk-reaper.sh).
+# `set -u` the unguarded form printed "BASH_SOURCE[0]: unbound variable" on EVERY tick, left `$HERE`
+# degrading to `.` (silently degrading the repo-resolution fallback to `.`), and broke `--help` through the
+# launcher. ⛔ AND `:-$0` IS NOT A FIX FOR THAT, which is what a later version of this comment claimed: a
+# piped start's `$0` is LITERALLY `bash`, so `dirname bash` is `.` and `$HERE` is the CURRENT WORKING
+# DIRECTORY — not empty. `$HERE/lib/cell-home.sh` is then `$PWD/lib/cell-home.sh`, i.e. a piped start would
+# SOURCE THE RESOLVER FROM A DIRECTORY THIS SCRIPT DOES NOT OWN (the code-execution-from-CWD shape
+# `pi-bootstrap/cell-install.sh` refuses for `keys.env`). `SELF_FILE` therefore counts only when it names
+# the file being executed, and the lookup below is skipped otherwise. The sibling artifact this launcher
+# already runs carries the same note (scripts/disk-reaper.sh).
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)"
+SELF_FILE="${BASH_SOURCE[0]:-}"
+[ -f "$SELF_FILE" ] || SELF_FILE=""
 
 log_line()  { printf '%s\n' "$*"; }
 err()  { printf '%s: %s\n' "${0##*/}" "$*" >&2; }
@@ -200,11 +208,14 @@ done
 # a directory that does not exist on the image) would pin and record under one home while the
 # supervisor resolves another — the two-home split #3453 removes, on the pass that advances the
 # harness. The rule and the ONLY literal live in `scripts/lib/cell-home.sh`; a copy without it (a
-# `bash -s` start has no BASH_SOURCE, so $HERE is empty) falls back to $HOME exactly as before.
+# `bash -s` start has no file, so `$SELF_FILE` is empty and the lookup is SKIPPED) falls back to $HOME
+# exactly as before. ⛔ See `lib/cell-home.sh` §CONSUMERS for why `$HERE` is not used in a piped start.
 CELL_HOME_LIB=""
-for _cand in "$HERE/lib/cell-home.sh" "$HERE/../lib/cell-home.sh"; do
-  [ -r "$_cand" ] && { CELL_HOME_LIB="$_cand"; break; }
-done
+if [ -n "$SELF_FILE" ]; then
+  for _cand in "$HERE/lib/cell-home.sh" "$HERE/../lib/cell-home.sh"; do
+    [ -r "$_cand" ] && { CELL_HOME_LIB="$_cand"; break; }
+  done
+fi
 if [ -n "$CELL_HOME_LIB" ]; then . "$CELL_HOME_LIB"; CELL_HOME="$(cell_home_resolve)"; else CELL_HOME="${CELL_HOME:-${HOME:?HOME is required}}"; fi
 O="${O:-$CELL_HOME/orchestrator}"
 # ⛔ BOTH SPELLINGS, AND THE UNIT'S IS THE ONE THAT MATTERS IN PRODUCTION. The rendered systemd unit
