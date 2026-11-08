@@ -1859,25 +1859,94 @@ if [ -s "$T/refreshblock.sh" ] && grep -q 'refresh-candidates.sh' "$T/refreshblo
     && ok "orch-loop: the skip is visible (each cycle logs why)" \
     || bad "orch-loop: the skip is silent"
   # (b) TRANSIENT (rc=1): no marker, logged as transient, and the next cycle DOES retry.
+  # ⛔ `REFRESH_RETRY_BACKOFF_S=0` IS LOAD-BEARING HERE, NOT A SHORTCUT (agent-infra#3584): the shipped
+  # default is a 30 s then 60 s in-cycle backoff, and this arm drives the block twice — 180 s of real
+  # `sleep` for a property that has nothing to do with the delay. The delay itself, its doubling, the
+  # attempt cap and the total-sleep budget are graded in (b1)-(b6) below, with the clock stubbed.
   BL2="$T/block2"; mkdir -p "$BL2"; : > "$BL2/candidates.txt"
   printf '#!/bin/bash\nprintf "x" >> "%s/invoked"\nrefresh_record_write() { :; }\nexit 1\n' "$BL2" > "$BL2/refresh-candidates.sh"
-  O="$BL2" LOG="$BL2/log" bash "$T/refreshblock.sh" >/dev/null 2>&1
+  O="$BL2" LOG="$BL2/log" REFRESH_RETRY_BACKOFF_S=0 bash "$T/refreshblock.sh" >/dev/null 2>&1
   [ ! -e "$BL2/.refresh-blocked" ] && ok "orch-loop: rc=1 (transient) writes no permanent marker" \
                                    || bad "orch-loop: rc=1 wrongly marked permanent"
-  grep -q 'FAILED rc=1 (transient' "$BL2/log" 2>/dev/null \
+  grep -q 'FAILED rc=1 after ' "$BL2/log" 2>/dev/null \
     && ok "orch-loop: rc=1 is logged as transient" \
     || bad "orch-loop: rc=1 is not distinguished — $(cat "$BL2/log" 2>/dev/null)"
   # ⛔ AND THE CAUSE IS QUOTED, NOT BLANK (review P2). With the cause helpers missing from the
   # extraction this line printed `— ` and the assertion above still passed, so "the pass's own cause is
   # reported" was ungraded. `refresh_cause_brief` renders `stage=<x>: <why>` even with no record.
-  grep -q 'transient — retried next cycle) — stage=' "$BL2/log" 2>/dev/null \
+  # ⛔ THE PIN NOW SPELLS THE ATTEMPT COUNT (agent-infra#3584): the line used to read "(transient —
+  # retried next cycle)", which described a retry policy the pass did not actually have. What a reader
+  # needs from it is WAS THIS THE FIRST REFUSAL OR THE LAST ONE, so the count is part of the pin — a
+  # reword that drops it reddens this arm instead of passing on the old wording.
+  grep -q 'FAILED rc=1 after 3 attempt(s) — stage=' "$BL2/log" 2>/dev/null \
     && ok "orch-loop: rc=1 quotes the pass's OWN cause (not an empty tail)" \
     || bad "orch-loop: the rc=1 line carries no cause — $(cat "$BL2/log" 2>/dev/null | tail -1)"
   before="$(wc -c < "$BL2/invoked" | tr -d ' ')"
-  O="$BL2" LOG="$BL2/log" bash "$T/refreshblock.sh" >/dev/null 2>&1
+  O="$BL2" LOG="$BL2/log" REFRESH_RETRY_BACKOFF_S=0 bash "$T/refreshblock.sh" >/dev/null 2>&1
   after="$(wc -c < "$BL2/invoked" | tr -d ' ')"
   [ "$before" != "$after" ] && ok "orch-loop: a transient failure IS retried next cycle" \
                             || bad "orch-loop: a transient failure was not retried"
+  # (b1-b6) THE IN-CYCLE RETRY (agent-infra#3584). The defect the issue's STATUS comment measured: a
+  # TRANSIENT refresh failure was retried ONLY when the next cycle came round — 15-161 minutes away
+  # (#3585) — so a hiccup a 30 s retry clears cost HOURS of origination and nothing escalated in
+  # between. These arms drive the SHIPPED block, so deleting the loop reddens them: an
+  # invoke-count assertion cannot pass on a block that invokes the pass once.
+  #
+  # (b1) the retry happens INSIDE one invocation, and the count is the attempt cap.
+  BLR1="$T/retry1"; mkdir -p "$BLR1"; : > "$BLR1/candidates.txt"
+  printf '#!/bin/bash\nprintf "x" >> "%s/invoked"\nrefresh_record_write() { :; }\nexit 1\n' "$BLR1" > "$BLR1/refresh-candidates.sh"
+  O="$BLR1" LOG="$BLR1/log" REFRESH_RETRY_BACKOFF_S=0 REFRESH_RETRY_MAX_ATTEMPTS=3 bash "$T/refreshblock.sh" >/dev/null 2>&1
+  n4="$(wc -c < "$BLR1/invoked" | tr -d ' ')"
+  [ "$n4" = "3" ] && ok "orch-loop: a transient pass is retried 3x INSIDE one cycle, not once per cycle" \
+                   || bad "orch-loop: in-cycle retry count was $n4, expected 3 (the retry loop did not run)"
+  [ "$(grep -c 'retrying in 0s, on a SHORT BOUNDED BACKOFF INSIDE this cycle' "$BLR1/log" 2>/dev/null)" = "2" ] \
+    && ok "orch-loop: each in-cycle retry is LOGGED with its attempt number and delay" \
+    || bad "orch-loop: retries are silent — $(grep -c 'TRANSIENT rc=1' "$BLR1/log" 2>/dev/null) transient line(s) in the log"
+  grep -q 'TRANSIENT rc=1 (attempt 1/3) — retrying in 0s' "$BLR1/log" 2>/dev/null \
+    && ok "orch-loop: the retry line names the attempt out of the cap (attempt 1/3)" \
+    || bad "orch-loop: the retry line does not name attempt N/cap — $(grep 'TRANSIENT rc=1' "$BLR1/log" 2>/dev/null | head -1)"
+  # (b2) the cap is HONOURED, not decorative: cap=1 means exactly one attempt.
+  BLR2="$T/retry2"; mkdir -p "$BLR2"; : > "$BLR2/candidates.txt"
+  printf '#!/bin/bash\nprintf "x" >> "%s/invoked"\nrefresh_record_write() { :; }\nexit 1\n' "$BLR2" > "$BLR2/refresh-candidates.sh"
+  O="$BLR2" LOG="$BLR2/log" REFRESH_RETRY_BACKOFF_S=0 REFRESH_RETRY_MAX_ATTEMPTS=1 bash "$T/refreshblock.sh" >/dev/null 2>&1
+  n5="$(wc -c < "$BLR2/invoked" | tr -d ' ')"
+  [ "$n5" = "1" ] && ok "orch-loop: the attempt cap is honoured (cap=1 makes exactly 1 attempt)" \
+                   || bad "orch-loop: cap=1 still made $n5 attempt(s) — the cap is decorative"
+  # (b3) the TOTAL-SLEEP BUDGET is the bound that keeps a retrying pass from outliving
+  # REFRESH_STALE_LOCK_MIN (a reaped-mid-run pass would be the concurrent double-pass the lock
+  # exists to prevent). A delay that cannot fit the budget must be REFUSED, not shortened silently.
+  BLR3="$T/retry3"; mkdir -p "$BLR3"; : > "$BLR3/candidates.txt"
+  printf '#!/bin/bash\nprintf "x" >> "%s/invoked"\nrefresh_record_write() { :; }\nexit 1\n' "$BLR3" > "$BLR3/refresh-candidates.sh"
+  O="$BLR3" LOG="$BLR3/log" REFRESH_RETRY_BACKOFF_S=30 REFRESH_RETRY_BUDGET_S=1 bash "$T/refreshblock.sh" >/dev/null 2>&1
+  n6="$(wc -c < "$BLR3/invoked" | tr -d ' ')"
+  [ "$n6" = "1" ] && ok "orch-loop: a delay that does not fit the retry budget is NOT slept (no attempt 2)" \
+                   || bad "orch-loop: slept past the declared retry budget ($n6 attempts)"
+  grep -q 'the 1s in-cycle retry budget is spent' "$BLR3/log" 2>/dev/null \
+    && ok "orch-loop: the budget refusal is REPORTED, naming the stale-lock guard it protects" \
+    || bad "orch-loop: the budget refusal is silent — $(grep 'TRANSIENT' "$BLR3/log" 2>/dev/null | tail -1)"
+  # (b4) A PERMANENT REFUSAL IS NEVER RETRIED IN-CYCLE. rc=3 and rc=78 are verdicts about the BOX, not
+  # the network; retrying them is the #1736 defect. (Arm (a) grades the across-cycle half.)
+  BLR4="$T/retry4"; mkdir -p "$BLR4"; : > "$BLR4/candidates.txt"
+  printf '#!/bin/bash\nprintf "x" >> "%s/invoked"\nrefresh_record_write() { :; }\nexit 3\n' "$BLR4" > "$BLR4/refresh-candidates.sh"
+  O="$BLR4" LOG="$BLR4/log" REFRESH_RETRY_BACKOFF_S=0 REFRESH_RETRY_MAX_ATTEMPTS=3 bash "$T/refreshblock.sh" >/dev/null 2>&1
+  n7="$(wc -c < "$BLR4/invoked" | tr -d ' ')"
+  [ "$n7" = "1" ] && ok "orch-loop: rc=3 (NOT PROVISIONABLE) is NOT retried in-cycle" \
+                  || bad "orch-loop: rc=3 was retried $n7 times in one cycle — a permanent refusal looped"
+  BLR5="$T/retry5"; mkdir -p "$BLR5"; : > "$BLR5/candidates.txt"
+  printf '#!/bin/bash\nprintf "x" >> "%s/invoked"\nrefresh_record_write() { :; }\nexit 78\n' "$BLR5" > "$BLR5/refresh-candidates.sh"
+  O="$BLR5" LOG="$BLR5/log" REFRESH_RETRY_BACKOFF_S=0 REFRESH_RETRY_MAX_ATTEMPTS=3 bash "$T/refreshblock.sh" >/dev/null 2>&1
+  n8="$(wc -c < "$BLR5/invoked" | tr -d ' ')"
+  [ "$n8" = "1" ] && ok "orch-loop: rc=78 (a config refusal) is NOT retried in-cycle" \
+                  || bad "orch-loop: rc=78 was retried $n8 times in one cycle — a config error looped"
+  # (b6) THE KNOBS ARE VALIDATED, not trusted. These feed `[ -ge ]` and `$(( ))`: an unvalidated
+  # `abc` makes the comparison an ERROR (read as false) and the cap silently misses — the one failure
+  # this block exists to prevent. A junk value must fall back to the shipped default, not to no cap.
+  BLR6="$T/retry6"; mkdir -p "$BLR6"; : > "$BLR6/candidates.txt"
+  printf '#!/bin/bash\nprintf "x" >> "%s/invoked"\nrefresh_record_write() { :; }\nexit 1\n' "$BLR6" > "$BLR6/refresh-candidates.sh"
+  O="$BLR6" LOG="$BLR6/log" REFRESH_RETRY_BACKOFF_S=0 REFRESH_RETRY_MAX_ATTEMPTS=abc bash "$T/refreshblock.sh" >/dev/null 2>&1
+  n9="$(wc -c < "$BLR6/invoked" | tr -d ' ')"
+  [ "$n9" = "3" ] && ok "orch-loop: a junk REFRESH_RETRY_MAX_ATTEMPTS falls back to the default (3), not to no cap" \
+                   || bad "orch-loop: REFRESH_RETRY_MAX_ATTEMPTS=abc gave $n9 attempt(s), expected the default 3"
   # (c) BOUND THE MARKER'S EVIDENCE TO THE CURRENT RUN (agent-infra#1853 review P2). $LOG is
   # append-only and never rotated, so a bare `grep 'NOT PROVISIONABLE' "$LOG"` would quote a
   # PREVIOUS cycle's refusal as this run's reason — presenting a cause that no longer fired. The

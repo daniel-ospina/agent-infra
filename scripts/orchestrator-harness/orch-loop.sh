@@ -8786,8 +8786,64 @@ PY
         echo "[refresh] SEED-SKEW: the refresh resolver returned an UNRECOGNISED answer (rc=$_rrc, script='${REFRESH_SH:-none}') — NOT spawning a pass whose writer cannot be identified; tried: ${REFRESH_TRIED:-none}. Fix: re-seed \$O with the VERIFYING seeder (bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o \$O)" >> "$LOG"
         rm -rf "$O/.refresh.lock"
       fi
+      # ⛔ A TRANSIENT PASS IS NOW RETRIED ON A SHORT BOUNDED BACKOFF, NOT ONLY AT THE NEXT CYCLE
+      # (agent-infra#3584). The issue's own STATUS comment measured the defect: a `TRANSIENT`
+      # `provision` refusal was retried only when the next cycle came round — 15-161 minutes away
+      # (#3585's cycle period) — so a hiccup a 30-second retry clears cost HOURS of origination, and
+      # nothing in between escalated or re-provisioned sooner. The pass is now attempted up to
+      # REFRESH_RETRY_MAX_ATTEMPTS times, backoff doubling from REFRESH_RETRY_BACKOFF_S, ALL INSIDE
+      # ONE CYCLE, so a transient refusal either clears or is REPORTED before the next beat instead of
+      # being silently deferred to it.
+      # ⛔ BOUNDED THREE INDEPENDENT WAYS, because an unbounded retry here would be a worse defect than
+      # the one it fixes: an ATTEMPT cap, a per-DELAY cap, and a TOTAL-SLEEP budget. The budget is the
+      # one that matters — REFRESH_STALE_LOCK_MIN clears `.refresh.lock` after N minutes, and a pass
+      # that outlived it would be reaped by the NEXT cycle while STILL RUNNING, which is exactly the
+      # concurrent double-pass the lock exists to prevent. The shipped defaults (3 attempts, delays
+      # 30 then 60 = 90 s) sit an order of magnitude under that guard.
+      # ⛔ AND IT NEVER RETRIES A PERMANENT REFUSAL. rc=3 (NOT PROVISIONABLE) and rc=78 (a config
+      # refusal) are facts about the BOX, not about the network; retrying them is the #1736 defect the
+      # two `elif` arms below exist to prevent. Only "something else went wrong" — the class this
+      # block already called transient — is retried.
+      # The knobs default HERE, inside the block, so the extracted-block suite (`refresh-scout.test.sh`
+      # §7) drives the values the loop actually runs rather than an untested unset default.
+      REFRESH_RETRY_MAX_ATTEMPTS="${REFRESH_RETRY_MAX_ATTEMPTS:-3}"
+      case "$REFRESH_RETRY_MAX_ATTEMPTS" in ''|*[!0-9]*|0[0-9]*) REFRESH_RETRY_MAX_ATTEMPTS=3 ;; esac
+      [ "${#REFRESH_RETRY_MAX_ATTEMPTS}" -le 2 ] || REFRESH_RETRY_MAX_ATTEMPTS=3
+      [ "$REFRESH_RETRY_MAX_ATTEMPTS" -ge 1 ] || REFRESH_RETRY_MAX_ATTEMPTS=3
+      [ "$REFRESH_RETRY_MAX_ATTEMPTS" -le 10 ] || REFRESH_RETRY_MAX_ATTEMPTS=10
+      REFRESH_RETRY_BACKOFF_S="${REFRESH_RETRY_BACKOFF_S:-30}"
+      case "$REFRESH_RETRY_BACKOFF_S" in ''|*[!0-9]*|0[0-9]*) REFRESH_RETRY_BACKOFF_S=30 ;; esac
+      [ "${#REFRESH_RETRY_BACKOFF_S}" -le 6 ] || REFRESH_RETRY_BACKOFF_S=30
+      REFRESH_RETRY_MAX_DELAY_S="${REFRESH_RETRY_MAX_DELAY_S:-120}"
+      case "$REFRESH_RETRY_MAX_DELAY_S" in ''|*[!0-9]*|0[0-9]*) REFRESH_RETRY_MAX_DELAY_S=120 ;; esac
+      [ "${#REFRESH_RETRY_MAX_DELAY_S}" -le 6 ] || REFRESH_RETRY_MAX_DELAY_S=120
+      REFRESH_RETRY_BUDGET_S="${REFRESH_RETRY_BUDGET_S:-300}"
+      case "$REFRESH_RETRY_BUDGET_S" in ''|*[!0-9]*|0[0-9]*) REFRESH_RETRY_BUDGET_S=300 ;; esac
+      [ "${#REFRESH_RETRY_BUDGET_S}" -le 6 ] || REFRESH_RETRY_BUDGET_S=300
+      [ "$REFRESH_RETRY_BUDGET_S" -ge 1 ] || REFRESH_RETRY_BUDGET_S=300
       if [ -n "$REFRESH_SH" ]; then
-        ( bash "$REFRESH_SH" 6 >> "$LOG" 2>&1; rc=$?
+        ( _att=0; _spent=0
+          while :; do
+            _att=$(( _att + 1 ))
+            bash "$REFRESH_SH" 6 >> "$LOG" 2>&1; rc=$?
+            # 0 is done; 3 and 78 are PERMANENT verdicts about the box (see the two arms below), so
+            # neither is a retryable failure no matter how the knobs are set.
+            case "$rc" in 0|3|78) break ;; esac
+            [ "$_att" -ge "$REFRESH_RETRY_MAX_ATTEMPTS" ] && break
+            _rd="$REFRESH_RETRY_BACKOFF_S"; _dbl=1
+            while [ "$_dbl" -lt "$_att" ]; do _rd=$(( _rd * 2 )); _dbl=$(( _dbl + 1 )); done
+            [ "$_rd" -gt "$REFRESH_RETRY_MAX_DELAY_S" ] && _rd="$REFRESH_RETRY_MAX_DELAY_S"
+            # THE BUDGET IS CHECKED BEFORE SLEEPING, so the declared bound holds whatever the two
+            # per-delay knobs are set to: the pass never sleeps past it, and so never outlives the
+            # stale-lock guard and gets reaped mid-run by the next cycle.
+            if [ $(( _spent + _rd )) -gt "$REFRESH_RETRY_BUDGET_S" ]; then
+              echo "[refresh] TRANSIENT rc=$rc (attempt ${_att}/${REFRESH_RETRY_MAX_ATTEMPTS}) — NOT retrying again: the ${REFRESH_RETRY_BUDGET_S}s in-cycle retry budget is spent, and a longer backoff would risk the ${REFRESH_STALE_LOCK_MIN:-20}m stale-lock guard reaping this pass while it still runs — the next cycle picks it up (agent-infra#3584)" >> "$LOG"
+              break
+            fi
+            _spent=$(( _spent + _rd ))
+            echo "[refresh] TRANSIENT rc=$rc (attempt ${_att}/${REFRESH_RETRY_MAX_ATTEMPTS}) — retrying in ${_rd}s, on a SHORT BOUNDED BACKOFF INSIDE this cycle rather than at the next one (agent-infra#3584)" >> "$LOG"
+            sleep "$_rd"
+          done
         rm -rf "$O/.refresh.lock"
         if [ "$rc" -eq 3 ]; then
           echo "[refresh] BLOCKED (permanent): this repo cannot be provisioned for dispatch — see the reason above. Not retrying (agent-infra#1736); fix it, then delete $O/.refresh-blocked" >> "$LOG"
@@ -8819,7 +8875,12 @@ PY
           # The pass recorded its own cause in `state/refresh-last` (agent-infra#2229); QUOTE it here
           # rather than restating `transient` alone, so this line and the next beat's BLOCKED line
           # agree on the cause. A missing record is named, not glossed.
-          echo "[refresh] FAILED rc=$rc (transient — retried next cycle) — $(refresh_cause_brief "$(refresh_record_snapshot)")" >> "$LOG"
+          # ⛔ IT NAMES THE ATTEMPTS THAT WERE MADE (agent-infra#3584). The old wording —
+          # "(transient — retried next cycle)" — described a retry policy that did not exist inside the
+          # pass; the in-cycle retries have now already happened, so "retried next cycle" is a false
+          # statement about the work this line reports. The count is what a reader needs: was this the
+          # FIRST refusal or the LAST one available? By the time this prints, the attempt budget is spent.
+          echo "[refresh] FAILED rc=$rc after ${_att:-1} attempt(s) — $(refresh_cause_brief "$(refresh_record_snapshot)")" >> "$LOG"
         fi ) &
       fi
     else
