@@ -873,7 +873,12 @@ ck "…and nothing merged" $rc2
 mkmrg; mkrecorder; write_record "$HEAD" clean
 mkdir -p "$MRG/repo/tools"
 printf '#!/usr/bin/env python3\nimport json\nprint(json.dumps({"ok":True,"rules":[],"suites":1,"failing_suites":0,"head":"%s","head_moved_since_write":False}))\n' "$HEAD" > "$MRG/repo/tools/worktree_report.py"
-out="$(run_merge FAKE_GIT_MODE=report-gate FAKE_GIT_WT="$MRG/repo" FAKE_GIT_HEAD="$HEAD" FAKE_GIT_BRANCH=other/x)"
+# ⛔ A GENUINE CROSS-BOX 6 NEEDS A HEAD NO STANZA SITS AT (round-11 review, P0). The gate now refuses
+# with 7 whenever a worktree of this box is AT the merging head, because "named but unreadable" is a
+# fault with a remedy, not "the box is elsewhere". So the abstention fixture must put its stub stanza at
+# a DIFFERENT head — which is the ordinary cross-box shape (the 13/13 hub measurement) — or it is
+# modelling a self-detached lane and correctly gets 7.
+out="$(run_merge FAKE_GIT_MODE=report-gate FAKE_GIT_WT="$MRG/repo" FAKE_GIT_HEAD="1111111111111111111111111111111111111111" FAKE_GIT_BRANCH=other/x)"
 rc=$?
 rc2=0; log_has 'LANE REPORT NOT ENFORCED' || { rc2=1; note "log: $(tail -3 "$MRG/o/logs/merge-$PR.log")"; }
 ck "NO-WORKTREE (6) on merge-one.sh is LOGGED as NOT ENFORCED" $rc2

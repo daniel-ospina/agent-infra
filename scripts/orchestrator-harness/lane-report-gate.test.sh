@@ -578,16 +578,55 @@ fi
 if [ "$_det_ok" = 1 ]; then
   out="$(env STUB_OK=1 STUB_RC=0 STUB_STALE=0 bash "$GATE" --check "$REPO" "feat/2977-tm" "$WT_HEAD" 2>&1)"; rc=$?
   if [ "$rc" = 7 ]; then ok "a DETACHED lane worktree holding the report is UNMEASURABLE, not the mergeable abstention 6 (rc=$rc)"; else bad "detaching the lane worktree produced rc=$rc (expected 7) — 6 would be merged on: $out"; fi
-  case "$out" in *reason=evidence-present-on-this-box-but-no-worktree-is-registered-on-this-branch*) ok "…and it says the box HOLDS the evidence, rather than that the box is elsewhere" ;; *) bad "detached-worktree reason: $out" ;; esac
+  case "$out" in
+    *reason=evidence-present-on-this-box-but-no-worktree-is-registered-on-this-branch*|*reason=worktree-at-this-head-is-not-registered-on-this-branch-and-holds-no-report*)
+      ok "…and it says this box NAMES the evidence, rather than that the box is elsewhere" ;;
+    *) bad "detached-worktree reason: $out" ;;
+  esac
   case "$out" in *VERDICT=NO-WORKTREE*) bad "a detached worktree was reported as NO-WORKTREE (the mergeable abstention)" ;; *) ok "…and it is not reported as NO-WORKTREE" ;; esac
   git -C "$WT" checkout -q "$_prev" 2>/dev/null || true
 else
   ok "SKIPPED the detached-worktree row (fixture git could not detach)"
 fi
-# ⛔ AND THE CROSS-BOX CASE MUST STILL ABSTAIN, or the fix over-blocks: a branch with NO stanza anywhere,
-# and no report at that head on this box, is genuinely 6.
-out="$(env STUB_OK=1 STUB_RC=0 STUB_STALE=0 bash "$GATE" --check "$REPO" "feat/not-here-at-all" "$WT_HEAD" 2>&1)"; rc=$?
-if [ "$rc" = 6 ]; then ok "CONTROL a branch with no worktree AND no report at this head still abstains with 6 (the fix does not over-block)" ; else bad "the detached-worktree fix over-blocked the cross-box case: expected rc=6, got rc=$rc :: $out"; fi
+# ⛔ THE THREE SPELLINGS THAT STILL WORKED (round-11 review, P0). Each converts a refusal into the
+# mergeable abstention while leaving the evidence untouched — they are why the arm now keys on "does a
+# stanza sit at this head" and lets the lane-owned facts choose only the WORDING.
+det_again() { git -C "$WT" checkout -q --detach 2>/dev/null; }
+if git -C "$WT" rev-parse --git-dir >/dev/null 2>&1; then
+  _prev2="$(git -C "$WT" rev-parse --abbrev-ref HEAD 2>/dev/null)"
+  # (b) detach + remove the report: the old arm's own precondition, turned off by the lane.
+  det_again
+  mv "$WT/WORKTREE-REPORT.md" "$TMP/wr.bak" 2>/dev/null
+  out="$(env STUB_OK=1 STUB_RC=0 STUB_STALE=0 bash "$GATE" --check "$REPO" "feat/2977-tm" "$WT_HEAD" 2>&1)"; rc=$?
+  if [ "$rc" = 7 ]; then ok "(b) detach + report removed is still UNMEASURABLE (rc=$rc) — the lane cannot switch the arm off by deleting its own precondition"; else bad "(b) detach+rm-report produced rc=$rc (expected 7) — 6 would be merged on: $out"; fi
+  mv "$TMP/wr.bak" "$WT/WORKTREE-REPORT.md" 2>/dev/null
+  # (c) detach + drop the `branch` key from the undigested state.
+  cp "$WT/.worktree-report/state.json" "$TMP/st.bak" 2>/dev/null
+  python3 - "$WT/.worktree-report/state.json" <<'PYX' 2>/dev/null || true
+import json,sys
+p=sys.argv[1]
+d=json.load(open(p)); d.pop("branch", None); json.dump(d, open(p,"w"))
+PYX
+  out="$(env STUB_OK=1 STUB_RC=0 STUB_STALE=0 bash "$GATE" --check "$REPO" "feat/2977-tm" "$WT_HEAD" 2>&1)"; rc=$?
+  if [ "$rc" = 7 ]; then ok "(c) detach + the state branch key deleted is still UNMEASURABLE (rc=$rc)"; else bad "(c) detach+no-branch-key produced rc=$rc (expected 7): $out"; fi
+  cp "$TMP/st.bak" "$WT/.worktree-report/state.json" 2>/dev/null
+  git -C "$WT" checkout -q "$_prev2" 2>/dev/null || true
+  # (a) MOVE the worktree away while still ON the branch: the stanza stays registered, the report intact.
+  _WTMOVED="$TMP/wt-moved-away"
+  if mv "$WT" "$_WTMOVED" 2>/dev/null; then
+    out="$(env STUB_OK=1 STUB_RC=0 STUB_STALE=0 bash "$GATE" --check "$REPO" "feat/2977-tm" "$WT_HEAD" 2>&1)"; rc=$?
+    if [ "$rc" = 7 ]; then ok "(a) a MOVED-AWAY worktree is UNMEASURABLE (rc=$rc), not the abstention a lane merges on"; else bad "(a) moved-away worktree produced rc=$rc (expected 7): $out"; fi
+    mv "$_WTMOVED" "$WT" 2>/dev/null
+  fi
+fi
+# ⛔ AND THE CROSS-BOX CASE MUST STILL ABSTAIN, or the fix over-blocks. The discriminator is “does a
+# stanza sit at the HEAD being merged”, so the control uses a head that is on no worktree of this box —
+# the ordinary cross-box shape (the 13/13 hub measurement). Passing a branch that merely is not checked
+# out is NOT the control: if some worktree shares the merging head, returning 7 is the intended
+# fail-closed answer, and asserting 6 there would re-open the hole.
+_NOSTANZA="0123456789abcdef0123456789abcdef01234567"
+out="$(env STUB_OK=1 STUB_RC=0 STUB_STALE=0 bash "$GATE" --check "$REPO" "feat/not-here-at-all" "$_NOSTANZA" 2>&1)"; rc=$?
+if [ "$rc" = 6 ]; then ok "CONTROL a head that no worktree of this box sits at still abstains with 6 (no over-block)" ; else bad "the detached-worktree fix over-blocked the cross-box case: expected rc=6, got rc=$rc :: $out"; fi
 
 # ── 5. EXACT BRANCH MATCH (§6) — both mutant directions — the decoys sort FIRST in the walk ──
 # ── 5. EXACT BRANCH MATCH (§6) — both mutant directions, and the decoys sort BEFORE the real worktree ──
@@ -611,17 +650,18 @@ if [ "$rc" = 6 ]; then ok "NO-WORKTREE for feat/2977-ext (a reverse-prefix mutan
 out="$(env STUB_OK=1 STUB_RC=0 bash "$GATE" --check "$REPO" "feat/nobody-tm" deadbeef 2>&1)"; rc=$?
 if [ "$rc" = 6 ]; then ok "NO-WORKTREE: no worktree on this box for the branch (an abstention, not a pass) (rc=$rc)"; else bad "NO-WORKTREE: expected rc=6, got rc=$rc :: $out"; fi
 case "$out" in *VERDICT=NO-WORKTREE*) ok "NO-WORKTREE is spelled on the line, so a census can count abstentions" ;; *) bad "NO-WORKTREE line: $out" ;; esac
-# ⛔ A PRUNABLE REGISTRATION IS NOT EVIDENCE (fresh review, P2): `git worktree list --porcelain` keeps the
-# stanza after the directory is deleted, so a resolver that trusts it refuses ABSENT on a file that
-# cannot exist — with a remedy that is impossible in a worktree that is gone. It is 6, the code for
-# "the evidence is not reachable from here".
+# ⛔ A PRUNABLE REGISTRATION IS *UNMEASURABLE*, NOT AN ABSTENTION (round-11 review, P0). `git worktree
+# list --porcelain` keeps the stanza after the directory is deleted, and this used to be code 6 — so
+# `mv`-ing the lane worktree away, with the report and state intact and the stanza still registered on
+# the branch, was a one-command conversion of every refusal into a MERGE. A stanza on this branch NAMES
+# the evidence; that it cannot be read is a fault with a possible remedy, not "the box is elsewhere".
 git -C "$REPO" worktree add -q -b feat/gone "$TMP/gone" main 2>/dev/null || true
 rm -rf "$TMP/gone"
 out="$(bash "$GATE" --check "$REPO" "feat/gone" "$(git -C "$REPO" rev-parse HEAD)" 2>&1)"; rc=$?
-if [ "$rc" = 6 ] && grep -q 'reason=worktree-directory-is-gone' <<<"$out"; then
-  ok "a PRUNABLE worktree registration is NO-WORKTREE (6), not ABSENT with an impossible remedy (rc=$rc)"
+if [ "$rc" = 7 ] && grep -q 'reason=worktree-registered-but-unreadable' <<<"$out"; then
+  ok "a PRUNABLE (moved-away) worktree is UNMEASURABLE (7), never the mergeable abstention (rc=$rc)"
 else
-  bad "prunable worktree: expected rc=6 + worktree-directory-is-gone, got rc=$rc :: $out"
+  bad "prunable worktree: expected rc=7 + worktree-registered-but-unreadable, got rc=$rc :: $out"
 fi
 git -C "$REPO" worktree prune 2>/dev/null || true
 

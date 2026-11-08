@@ -208,8 +208,7 @@ _lrg_stanza_at_head() {
                 # the branch in its state, which is what a detached worktree keeps (detaching changes the
                 # ref, not the lane), so this separates "the lane detached its own worktree" from "some
                 # other worktree happens to be at this head".
-                if [ "$hd" = "$head" ] && [ -n "$wt" ] && [ -f "$wt/WORKTREE-REPORT.md" ] \
-                   && grep -qE "\"branch\": *\"$branch\"" "$wt/.worktree-report/state.json" 2>/dev/null; then
+                if [ "$hd" = "$head" ] && [ -n "$wt" ]; then
                   printf '%s' "$wt"; return 0
                 fi ;;
     esac
@@ -273,8 +272,18 @@ lane_report_gate() {
     # happens to sit at the PR head (the 66-row over-block lesson above). With it, the box must actually
     # HOLD a report for this head — so the refusal is "this box has your evidence and cannot grade it",
     # which has a cheap remedy, not "the box is elsewhere".
-    if _lrg_stanza_at_head "$repo" "$head" >/dev/null 2>&1; then
-      _lrg_emit 7 UNMEASURABLE "branch=$branch repo=$repo reason=evidence-present-on-this-box-but-no-worktree-is-registered-on-this-branch head=$head hint=check-the-branch-out-in-the-worktree-that-holds-the-report-or-detach-is-not-an-abstention"
+    # ⛔ THE LANE-OWNED FACTS MAY CHOOSE THE REASON, NEVER WHETHER THE ARM FIRES (round-11 review, P0).
+    # Round 10 keyed the refusal on `-f WORKTREE-REPORT.md` and a `grep` of the state branch, so a lane
+    # defeated the arm by turning off ITS OWN PRECONDITION: deleting the report, or dropping the `branch`
+    # key from the (undigested) state, restored the mergeable 6 with every other artefact untouched. A
+    # stanza at the merging head is the fact that this box NAMES the evidence; what that stanza holds
+    # decides the wording.
+    if _lrg_sh="$(_lrg_stanza_at_head "$repo" "$head" 2>/dev/null)"; then
+      if [ -n "$_lrg_sh" ] && [ -f "$_lrg_sh/WORKTREE-REPORT.md" ]; then
+        _lrg_emit 7 UNMEASURABLE "branch=$branch repo=$repo stanza=$_lrg_sh reason=evidence-present-on-this-box-but-no-worktree-is-registered-on-this-branch head=$head hint=check-the-branch-out-in-the-worktree-that-holds-the-report-detach-is-not-an-abstention"
+      else
+        _lrg_emit 7 UNMEASURABLE "branch=$branch repo=$repo stanza=$_lrg_sh reason=worktree-at-this-head-is-not-registered-on-this-branch-and-holds-no-report head=$head hint=restore-the-branch-in-that-worktree-or-run-the-suites-there"
+      fi
       return 7
     fi
     _lrg_emit 6 NO-WORKTREE "branch=$branch reason=no-worktree-for-branch-on-this-box head=$head"
@@ -286,9 +295,14 @@ lane_report_gate() {
   # a remedy (`write one`) that is impossible in a worktree that is gone. The physical fact is the same
   # one code 6 exists for: the lane's evidence is not reachable from this box. Checked HERE, once, for
   # both the absent and the consumer arms.
+  # ⛔ NAMED BUT UNREADABLE IS 7, NOT 6 (round-11 review, P0). `mv`-ing the lane worktree away left the
+  # stanza registered ON THE BRANCH at the merging head with the report and state intact, and this arm
+  # answered 6 — the code BOTH carriers merge on. The distinction that matters is not "does the directory
+  # exist" (lane-controlled) but "does this box NAME the evidence at all": a stanza on this branch names
+  # it, so it is UNMEASURABLE with a remedy that can succeed, never the mergeable abstention.
   if [ ! -d "$wt" ]; then
-    _lrg_emit 6 NO-WORKTREE "branch=$branch worktree=$wt reason=worktree-directory-is-gone head=$head"
-    return 6
+    _lrg_emit 7 UNMEASURABLE "branch=$branch worktree=$wt reason=worktree-registered-but-unreadable head=$head hint=the-branch-is-registered-here-but-its-directory-is-gone-restore-or-recreate-it"
+    return 7
   fi
 
   # ⛔ THE CONSUMER IS RESOLVED BEFORE ABSENCE IS JUDGED, AND THIS ORDER IS LOAD-BEARING. The report's
@@ -603,7 +617,14 @@ print("%s|%s|%s|%s|%s|%s|%s|%s" % (
   # write:** \`<12hex>\`` makes the position unambiguous. \u26d4 THE DIGEST IS NOT A SEAL AGAINST THE GRADED
   # PARTY EITHER (unkeyed sha256 stored in the same file): this cross-check is a SPEED BUMP that costs two
   # lane-owned files instead of one, not tamper-proofing — see the disclosure above, which says so.
-  _sealed12="$(sed -n 's/^- \*\*Base:\*\* .*head at write:\*\* `\([0-9a-f]\{12\}\)`.*$/\1/p' "$wt/WORKTREE-REPORT.md" 2>/dev/null | head -1)"
+  # ⛔ THE LAST FULL-SHAPE LINE, NOT THE FIRST (round-11 review, P2). The writer renders the lane-owned
+  # `state["worktree"]` value VERBATIM on `- **Worktree:**` ABOVE the real stamp, so a newline in that
+  # value reproduces the anchored shape and `head -1` would take the injected one. The writer emits
+  # exactly one real stamp, after every lane-controlled field, so `tail -1` reads it and the injected
+  # earlier line is ignored. (Not independently exploitable in a realistic flow — the worktree must
+  # really be at the merging head for the `live_head` arm, and an honest `write` stamps it — but the
+  # comment claimed an unambiguous position, and this is what makes that true.)
+  _sealed12="$(sed -n 's/^- \*\*Base:\*\* .*head at write:\*\* `\([0-9a-f]\{12\}\)`.*$/\1/p' "$wt/WORKTREE-REPORT.md" 2>/dev/null | tail -1)"
   if [ -n "$_sealed12" ] && [ -n "$rec_head" ] && \
      [ "$(printf '%s' "$rec_head" | cut -c1-12)" != "$_sealed12" ]; then
     _lrg_emit 4 STALE "branch=$branch worktree=$wt report=$wt/WORKTREE-REPORT.md reason=state-disagrees-with-the-sealed-report sealed_head=$_sealed12 state_head_at_write=$rec_head merging_head=$head"

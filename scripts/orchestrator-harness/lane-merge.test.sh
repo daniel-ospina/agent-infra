@@ -302,9 +302,14 @@ ck "an ABSENT lane report REFUSES the merge (exit 10 FIX_REQUIRED) and launches 
 
 # The abstention arm: no worktree for the branch on this box is 6, LOGGED, and the chain still gets the
 # PR. It must never read as a verification — that string is the entire justification for not refusing.
+# ⛔ A GENUINE CROSS-BOX 6 NEEDS A HEAD NO STANZA SITS AT (round-11 review, P0). The gate now refuses with
+# 7 whenever a worktree of this box is AT the merging head ("named but unreadable" has a remedy), so a
+# fixture that keeps its worktree at the PR head models a SELF-DETACHED lane and correctly gets 7. The
+# ordinary cross-box shape (the 13/13 hub measurement) is a head this box has no stanza for.
 new_o "$T/pr.tsv"
+printf 'open||%s|clean\n' "2222222222222222222222222222222222222222" > "$T/pr-crossbox.tsv"
 OUT="$(PATH="$BIN:$PATH" GH_LOG=/dev/null O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 REPO_PATH="$GL" \
-      bash "$SCRIPT" 91 --repo o/r --branch feat/no-such-branch --pr-tsv "$T/pr-gate.tsv" --checks-tsv "$T/checks-gate.tsv" 2>&1)"; RC=$?
+      bash "$SCRIPT" 91 --repo o/r --branch feat/no-such-branch --pr-tsv "$T/pr-crossbox.tsv" --checks-tsv "$T/checks-gate.tsv" 2>&1)"; RC=$?
 ck "NO-WORKTREE (6) is an ABSTENTION: logged, never 'verified at head', and the chain still gets the PR" \
    $([ "$RC" = 11 ] && grep -q 'abstention, not a green' <<<"$OUT" && ! grep -q 'verified at head' <<<"$OUT" && echo 0 || echo 1)
 
