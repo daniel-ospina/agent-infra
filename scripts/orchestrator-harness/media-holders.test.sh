@@ -122,6 +122,52 @@ OUT="$(run_linux "$PROC" "$TMP/nonexistent-video*" "$TMP/no-such-asound")"
 grep -q 'microphone: UNVERIFIABLE(no readable' <<<"$OUT"
 check "L9 no readable ALSA state ⇒ UNVERIFIABLE (a failed read is not absence)" $? "$OUT"
 
+# ── F1 (review cycle 1) — a HOSTILE `comm` must not desynchronise the census ──
+# `/proc/<pid>/comm` is a free-form 15-byte string any process sets with
+# `prctl(PR_SET_NAME)`. While the record was `pid|comm|target`, a `|` or a LF in
+# it shifted the fields: `target` stopped matching the device, the census was
+# still COMPLETE (so UNREADABLE stayed 0) and the script printed **FREE over a
+# device the process provably held** — the one answer its header forbids.
+# The record now carries `pid|target` and resolves `comm` at emit time.
+PROC_HOSTILE="$TMP/proc-hostile"
+mkdir -p "$PROC_HOSTILE/100/fd" "$PROC_HOSTILE/200/fd"
+ln -s "$TMP/dev/video0" "$PROC_HOSTILE/100/fd/7"
+ln -s "$TMP/dev/video1" "$PROC_HOSTILE/200/fd/9"
+printf 'we|ird\n' > "$PROC_HOSTILE/100/comm"       # the delimiter, inside comm
+printf 'we\nird\n' > "$PROC_HOSTILE/200/comm"      # a NEWLINE, inside comm
+OUT="$(run_linux "$PROC_HOSTILE" "$TMP/dev/video*" "$ASOUND")"
+grep -q 'camera: HELD-BY(pid=100 comm=we/ird device='"$TMP"'/dev/video0)' <<<"$OUT"
+check "F1a a comm containing '|' still yields HELD-BY (never FREE)" $? "$OUT"
+grep -q 'camera: HELD-BY(pid=200 comm=weird device='"$TMP"'/dev/video1)' <<<"$OUT"
+check "F1b a comm containing a NEWLINE still yields HELD-BY (never FREE)" $? "$OUT"
+grep -qx 'camera: FREE' <<<"$OUT"
+check "F1c …and the camera is NOT reported FREE over a proven holder" \
+  "$([ "$?" -ne 0 ] && echo 0 || echo 1)" "$OUT"
+# F1d — the same on the microphone path.
+PROC_HOSTILE_MIC="$TMP/proc-hostile-mic"
+mkdir -p "$PROC_HOSTILE_MIC/200/fd"
+ln -s "/dev/snd/pcmC0D0c" "$PROC_HOSTILE_MIC/200/fd/3"
+printf 'Meet|Helper\n' > "$PROC_HOSTILE_MIC/200/comm"
+OUT="$(run_linux "$PROC_HOSTILE_MIC" "$TMP/nonexistent-video*" "$ASOUND")"
+grep -q 'microphone: HELD-BY(pid=200 comm=Meet/Helper device=/dev/snd/pcmC0D0c)' <<<"$OUT"
+check "F1d the microphone path survives a '|' in comm too" $? "$OUT"
+
+# ── F3 (review cycle 1) — `--ancestry --json` must survive a multi-line argv ──
+# The lane root's argv IS multi-line: `pi -p "<multi-line brief>"`. `json_str`
+# used to strip the control range and escape TAB only, so a literal LF passed
+# through and `--json` emitted an INVALID document — on the one shape the verb
+# exists to describe.
+PROC_MULTI="$TMP/proc-multi"
+mkdir -p "$PROC_MULTI/300"
+printf 'pi\n' > "$PROC_MULTI/300/comm"
+printf 'PPid:\t1\n' > "$PROC_MULTI/300/status"
+printf '/usr/bin/pi\0-p\0line one\nline two\n' > "$PROC_MULTI/300/cmdline"
+OUT="$(MH_PLATFORM=Linux MH_PROC="$PROC_MULTI" bash "$SCRIPT" --ancestry 300 --json 2>&1)"
+printf '%s' "$OUT" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["chain"][0]["cmdline"], d' 2>/dev/null
+check "F3a --ancestry --json is ONE valid JSON document for a multi-line argv" $? "$OUT"
+grep -q 'line one' <<<"$OUT"
+check "F3b …and the argv's content survives (escaped, not dropped)" $? "$OUT"
+
 # ── JSON shape: the same verdicts, machine-readable ───────────────────────
 OUT="$(run_linux "$PROC" "$TMP/dev/video*" "$ASOUND" --json)"
 grep -q '^{"platform":"Linux","devices":\[' <<<"$OUT"

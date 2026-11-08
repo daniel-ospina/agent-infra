@@ -55,11 +55,30 @@ jq -c 'select(.media)' ~/.pi/agent/state/host-app-launches.jsonl | tail -20
 jq -r '[.ts, .decision, .rule, .app, .cwd] | @tsv' ~/.pi/agent/state/host-app-launches.jsonl
 ```
 
-## Declared residuals (in the module header, not discovered later)
+## Wrappers and substitutions are RE-READ, not declared away
+
+`bash -c "<cmd>"`, `sh -c`, `sudo bash -lc`, `eval …`, and the body of `$( … )`
+or backticks are **recursed into** (bounded to 3 levels) — the command string is
+argv and can be classified. Playwright's `codegen` and `open` subcommands are
+headed **by default**, and a `PWDEBUG` exported in an earlier segment applies to
+the whole line.
+
+This was review cycle 1's **F2**: those shapes were measured as `[]` (no finding)
+while the header claimed completeness, and `bash -c` is a form `AGENTS.md` hands
+lanes routinely. Every one of them is now pinned in the suite (L13/L14) with an
+ALLOW twin (A10–A12), because a guard that refuses correct work is its own defect.
+
+## Declared residuals — what is STILL not classified
+
+This is a residual list, not a completeness claim:
 
 - `node script.js` that `require("electron")`s, a compiled `.app` started by a
   shell function, `xcodebuild test`, `xcrun simctl` — **not classified**. argv
   cannot tell them from a plain `node` run.
+- A command assembled at **run time** is invisible: `find … -exec`, `xargs`, a
+  `while read` loop that runs its input, and `node -e`/`python -c` bodies (only a
+  literal `-c`-style **shell** string is re-read). At the moment this hook sees
+  the command those are data, not argv.
 - A launch built from a shell variable (`APP=Electron; open -a "$APP"`) is
   recorded with the unexpanded name — the shape is kept, the string is not.
 - A process started by anything that is not `pi` (`cron`, systemd, a human
@@ -73,7 +92,7 @@ jq -r '[.ts, .decision, .rule, .app, .cwd] | @tsv' ~/.pi/agent/state/host-app-la
 ## Tests
 
 ```bash
-node extensions/gui-device-guard/test.mjs                    # 54 assertions, threat table L1–L12 + handler H1–H11
+node extensions/gui-device-guard/test.mjs                    # 68 assertions, threat table L1–L14 + handler H1–H11
 node extensions/gui-device-guard/test.mjs --classify 'npm exec electron .'
 ```
 
@@ -82,7 +101,8 @@ The suite loads the **real** `index.ts` through
 `tool_call` handler** — the #744/#697 lesson: a suite that imports only a helper
 stays green while `index.ts` is broken and the guard is inert in every session.
 Mutations are pinned: turning the Electron rule's `media` to `false` reds 11
-assertions; removing the fake-switch mitigation reds the L11 arm.
+assertions; removing the wrapper recursion reds 5; removing the fake-switch
+mitigation reds the L11 arm.
 
 ## Runbook
 

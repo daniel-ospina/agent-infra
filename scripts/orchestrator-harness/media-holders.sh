@@ -100,10 +100,24 @@ done
 
 # ── JSON helpers (bash 3.2: no printf %q for JSON, so escape by hand) ────────
 json_str() {
-  # Escape \, ", and control chars. A device name/comm never carries the last,
-  # but an `ls`/`osascript` error message can, and an invalid JSON document is
-  # worse than a plain one.
-  printf '"%s"' "$(printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/	/\\t/g' | tr -d '\000-\010\013\014\016-\037')"
+  # Escape \ and ", and every control character a JSON document cannot carry raw.
+  #
+  # ⛔ LF AND CR ARE ESCAPED, NOT ASSUMED AWAY (review F3). The first version
+  # stripped the control range and escaped TAB only — so a literal LF or CR passed
+  # through UNESCAPED and `--json` emitted an invalid document. Not hypothetical:
+  # `--ancestry`'s whole purpose is the LANE ROOT, whose argv is
+  # `pi -p "<multi-line brief>"`, and a NUL→space `tr` leaves the LFs in place.
+  # awk (not sed) because sed is line-oriented and cannot see a LF inside its
+  # pattern space at all; awk's `gsub` on a `-v` value can.
+  awk -v s="$1" 'BEGIN {
+    gsub(/\\/, "\\\\", s)
+    gsub(/"/, "\\\"", s)
+    gsub(/\t/, "\\t", s)
+    gsub(/\r/, "\\r", s)
+    gsub(/\n/, "\\n", s)
+    gsub(/[\001-\010\013\014\016-\037]/, "", s)
+    printf "\"%s\"", s
+  }'
 }
 JSON_DEVICES=""
 SAW_UNVERIFIABLE=0
@@ -154,10 +168,22 @@ read_apps() {
 # per descriptor costs seconds on a busy box, and this runs while a human is
 # waiting to get into a call.
 linux_fd_census() {
-  # Sets: HOLDERS (newline "pid|comm|target" pairs), UNREADABLE (count)
+  # Sets: HOLDERS (newline-separated "pid|target" records), UNREADABLE (count).
+  #
+  # ⛔ THE RECORD CARRIES `pid|target` AND NOTHING ELSE, AND THE FREE-FORM FIELD
+  # IS LAST (review F1). `/proc/<pid>/comm` is a 15-byte string any process can
+  # set with `prctl(PR_SET_NAME)` — it may contain `|` or a NEWLINE, and either
+  # one DESYNCHRONISED the old `pid|comm|target` tuple: `target` no longer
+  # equalled the device, `found` stayed 0, the census was COMPLETE so UNREADABLE
+  # was 0, and the script printed **FREE over a device a process provably held**.
+  # That is the exact fail-open the header forbids, so the free-form value is not
+  # in the record at all: `comm` is resolved per holder, at emit time, through
+  # `pid_comm`, which strips every character that could re-frame a record.
+  # (`target`, the last field, can still contain `|` and survives — `read` gives
+  # the remainder of the line to the last variable.)
   HOLDERS=""
   UNREADABLE=0
-  local d pid comm line target total=0
+  local d pid line target total=0
   for d in "$MH_PROC"/[0-9]*; do
     [ -d "$d" ] || continue
     total=$((total + 1))
@@ -166,12 +192,17 @@ linux_fd_census() {
       UNREADABLE=$((UNREADABLE + 1))
       continue
     fi
-    comm="$(cat "$d/comm" 2>/dev/null || echo '?')"
     while IFS= read -r line; do
       case "$line" in *' -> '*) ;; *) continue ;; esac
       target="${line##* -> }"
       target="${target% (deleted)}"
-      HOLDERS="$HOLDERS$pid|$comm|$target
+      # (No newline guard is needed — or possible: `ls -l` is line-oriented, so a
+      # target carrying an LF arrives as a SEPARATE line without " -> " and is
+      # already skipped by the case above. A `case` pattern built from
+      # `$(printf '\n')` collapses to the empty string and matches EVERY line,
+      # which silently disabled the whole census — the shape of bug this file is
+      # about, so it is named rather than quietly deleted.)
+      HOLDERS="$HOLDERS$pid|$target
 "
     done <<EOF
 $(ls -l "$d/fd" 2>/dev/null)
@@ -185,6 +216,21 @@ EOF
   return 0
 }
 
+# pid_comm <pid> — a DISPLAY-only process name, stripped of every byte that could
+# re-frame a census record or produce a second line ("|", LF, CR, tab, other
+# controls). `/proc/<pid>/comm` is attacker-influenced-by-the-process, so it is
+# never trusted to be delimiter-free; the record simply does not contain it.
+pid_comm() {
+  local c
+  # Delete the WHOLE C0 range including TAB (009), LF (012) and CR (015), plus
+  # DEL. ⛔ The first cut wrote `\000-\011\013-\037`, which SKIPS 012 — so the LF
+  # case the finding is about survived the sanitiser and still split the record.
+  # The set is stated as one range for exactly that reason.
+  c="$(tr -d '\000-\037\177' < "$MH_PROC/$1/comm" 2>/dev/null | tr '|' '/')"
+  [ -n "$c" ] || c="?"
+  printf '%s' "$c"
+}
+
 linux_camera() {
   local devs dev found=0
   devs="$(ls -d $MH_V4L_GLOB 2>/dev/null)"
@@ -194,10 +240,10 @@ linux_camera() {
   fi
   linux_fd_census
   for dev in $devs; do
-    while IFS='|' read -r pid comm target; do
+    while IFS='|' read -r pid target; do
       [ -n "$pid" ] || continue
       [ "$target" = "$dev" ] || continue
-      emit_device camera HELD-BY "pid=$pid comm=$comm device=$dev"
+      emit_device camera HELD-BY "pid=$pid comm=$(pid_comm "$pid") device=$dev"
       found=1
     done <<EOF
 $(printf '%s' "$HOLDERS")
@@ -225,22 +271,22 @@ linux_microphone() {
     return 0
   fi
   linux_fd_census
-  # One LINE per holder — a comm may contain spaces ("Meet Helper"), so the
-  # record is assembled here and never split on whitespace afterwards.
-  while IFS='|' read -r pid comm target; do
+  # One LINE per holder, and the record is `pid|target` only (see
+  # linux_fd_census for why `comm` is never carried inside it).
+  while IFS='|' read -r pid target; do
     [ -n "$pid" ] || continue
     case "$target" in
-      /dev/snd/pcmC*c) holders="$holders$pid|$comm|$target
+      /dev/snd/pcmC*c) holders="$holders$pid|$target
 " ;;
     esac
   done <<EOF
 $(printf '%s' "$HOLDERS")
 EOF
   if [ -n "$holders" ]; then
-    local p c t
-    while IFS='|' read -r p c t; do
+    local p t
+    while IFS='|' read -r p t; do
       [ -n "${p:-}" ] || continue
-      emit_device microphone HELD-BY "pid=$p comm=${c:-?} device=$t"
+      emit_device microphone HELD-BY "pid=$p comm=$(pid_comm "$p") device=$t"
     done <<EOF
 $(printf '%s' "$holders")
 EOF
@@ -336,19 +382,33 @@ mac_microphone() {
 
 # ── --ancestry: the LANE root, not the app ─────────────────────────────────
 ancestry() {
-  local pid="$1" hops=0 prev="" line comm ppid cmd
+  # `--ancestry <pid>` ACQUIRES evidence; it pronounces no verdict. Emits one line
+  # per hop (plain), or ONE JSON OBJECT carrying a `chain` array — never a stream
+  # of objects, because `--json` is documented as one document and a caller that
+  # pipes it into a parser must not have to guess how many objects to expect
+  # (review F3: the second hop used to arrive as a bare prose line).
+  local pid="$1" hops=0 prev="" comm ppid cmd chain_json=""
   case "$pid" in ''|*[!0-9]*) die3 "--ancestry needs a numeric pid, got '$pid'" ;; esac
   while [ -n "$pid" ] && [ "$pid" != "0" ] && [ "$hops" -lt 24 ]; do
     comm="$(cat "$MH_PROC/$pid/comm" 2>/dev/null || true)"
     if [ -z "$comm" ]; then
-      say "pid=$pid (unreadable in $MH_PROC — the chain stops here)"
-      return 0
+      if [ "$JSON" -eq 1 ]; then
+        [ -n "$chain_json" ] && chain_json="$chain_json,"
+        chain_json="$chain_json{\"pid\":$pid,\"unreadable\":true,\"why\":$(json_str "unreadable in $MH_PROC — the chain stops here")}"
+      else
+        say "pid=$pid (unreadable in $MH_PROC — the chain stops here)"
+      fi
+      pid=""
+      break
     fi
     # The full cmdline is what names the lane (`pi -p …`, `bash …/lane.sh <N>`).
-    cmd="$(tr '\0' ' ' < "$MH_PROC/$pid/cmdline" 2>/dev/null | cut -c1-160)"
+    # NULs are the argument separators; LF/CR are kept for `json_str` to ESCAPE
+    # (a lane root's argv is multi-line by construction).
+    cmd="$(tr '\000' ' ' < "$MH_PROC/$pid/cmdline" 2>/dev/null | cut -c1-160)"
     ppid="$(awk '/^PPid:/{print $2}' "$MH_PROC/$pid/status" 2>/dev/null || true)"
     if [ "$JSON" -eq 1 ]; then
-      say "{\"pid\":$pid,\"ppid\":${ppid:-0},\"comm\":$(json_str "$comm"),\"cmdline\":$(json_str "$cmd")}"
+      [ -n "$chain_json" ] && chain_json="$chain_json,"
+      chain_json="$chain_json{\"pid\":$pid,\"ppid\":${ppid:-0},\"comm\":$(json_str "$comm"),\"cmdline\":$(json_str "$cmd")}"
     else
       say "pid=$pid ppid=${ppid:-?} comm=$comm cmd=$cmd"
     fi
@@ -358,6 +418,9 @@ ancestry() {
     hops=$((hops + 1))
   done
   [ "$hops" -lt 24 ] || say "$PROG: ancestry truncated at 24 hops (a cycle, or a very deep tree)" >&2
+  if [ "$JSON" -eq 1 ]; then
+    say "{\"platform\":$(json_str "$MH_PLATFORM"),\"chain\":[$chain_json]}"
+  fi
   return 0
 }
 

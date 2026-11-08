@@ -82,6 +82,21 @@ const ROWS = [
   ["L10a playwright --headed", "npx playwright test --headed", 1, "playwright", true],
   ["L10b PWDEBUG", "PWDEBUG=1 npx playwright test", 1, "playwright", true],
   ["L10c --ui mode", "npx playwright test --ui", 1, "playwright", true],
+  // ── L13 (review cycle 1, F2) — WRAPPERS ARE RE-READ, not declared away.
+  //     Each of these was measured as `[]` before the recursion landed, i.e. an
+  //     undeclared bypass of R2 in a shape AGENTS.md hands lanes routinely.
+  ["L13a bash -c", 'bash -c "npm exec electron ."', 1, "electron", true],
+  ["L13b sh -c", 'sh -c "electron ."', 1, "electron", true],
+  ["L13c sudo bash -lc", 'sudo bash -lc "electron ."', 1, "electron", true],
+  ["L13d env -i bash -c (a flag the prefix table does not know)", 'env -i bash -c "electron ."', 1, "electron", true],
+  ["L13e eval", 'eval "electron ."', 1, "electron", true],
+  ["L13f $( … ) substitution", "echo $(npm exec electron .)", 1, "electron", true],
+  ["L13g backtick substitution", "echo \`npm exec electron .\`", 1, "electron", true],
+  ["L13h nice -5 electron", "nice -5 electron .", 1, "electron", true],
+  // ── L14 — headed-by-default Playwright subcommands and a line-scoped PWDEBUG
+  ["L14a playwright codegen", "npx playwright codegen https://x.test", 1, "playwright", true],
+  ["L14b playwright open", "npx playwright open https://x.test", 1, "playwright", true],
+  ["L14c PWDEBUG exported in an EARLIER segment", "export PWDEBUG=1; npx playwright test", 1, "playwright", true],
   // ── ALLOW rows: none of these may be refused ──────────────────────────────
   ["A1 plain grep", "grep -rn TODO src/", 0, null, false],
   ["A2 an ELECTRON MENTION inside quotes is not a launch", 'echo "npm exec electron ."', 0, null, false],
@@ -92,6 +107,11 @@ const ROWS = [
   ["A7 electron as a non-command argument", "rg electron .", 0, null, false],
   ["A8 npm run of an unrelated script", "npm run build", 0, null, false],
   ["A9 a second, innocent segment after a launch", "true && ls -la", 0, null, false],
+  // A10/A11 are the twins of L13/L14: the recursion must not turn a MENTION or a
+  // benign wrapper into a refusal (the false-BLOCK class L/A2/A3 already guard).
+  ["A10 a SINGLE-QUOTED substitution is literal text, not a launch", "echo '$(npm exec electron .)'", 0, null, false],
+  ["A11 a benign bash -c", 'bash -c "ls -la"', 0, null, false],
+  ["A12 headless playwright with an explicit PWDEBUG=0", "PWDEBUG=0 npx playwright test", 0, null, false],
 ];
 
 for (const [name, cmd, count, rule, media] of ROWS) {

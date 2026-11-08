@@ -41,12 +41,27 @@
  *      blocking every `npx playwright test` would be the category-B friction
  *      this repo has already paid for once.
  *
- * ── DECLARED RESIDUALS (nothing here is silently "not a launch") ─────────────
+ * ── WRAPPERS AND SUBSTITUTIONS ARE RE-READ, NOT DECLARED AWAY ───────────────
+ * `bash -c "<cmd>"`, `sh -c`, `sudo bash -lc`, `eval …`, and the body of
+ * `$( … )` / backticks are RECURSED INTO (bounded to 3 levels), because the
+ * command string is argv and can be classified. Review cycle 1 (F2) found these
+ * were an UNDECLARED bypass of R2 while the header claimed completeness — and
+ * `bash -c` is a shape `AGENTS.md` hands lanes routinely. Playwright's `codegen`
+ * and `open` subcommands are headed BY DEFAULT, and a `PWDEBUG` exported in an
+ * earlier segment now applies to the whole line.
+ *
+ * ── DECLARED RESIDUALS (what is still NOT classified, stated plainly) ────────
+ * The list below is what a wrapper-recurse CANNOT reach; it is a residual list,
+ * not a completeness claim.
  *   - `node script.js` that `require("electron")`s, a Swift/ObjC helper, a
  *     compiled `.app` started by name through a shell function, `xcodebuild
  *     test`, and `xcrun simctl` launches are NOT classified. argv cannot tell
  *     them apart from a plain `node` run; inventing a heuristic there would
  *     block correct work.
+ *   - A command assembled at RUN time is not visible: `find … -exec`, `xargs`,
+ *     a `while read` loop that runs its input, and `node -e`/`python -c` bodies
+ *     (only a literal `-c`-style SHELL string is re-read). Those are DATA, not
+ *     argv, at the moment this hook sees the command.
  *   - A GUI launch built by a shell variable (`APP=Electron; open -a "$APP"`) is
  *     not expanded: the token is `$APP` and the guard records it as an `open`
  *     launch with the unexpanded app name. Recording the SHAPE is still worth
@@ -132,6 +147,19 @@ const RUNNERS = new Set(["npx", "npm", "pnpm", "yarn", "bunx"]);
 
 /** A headed-browser signal: the run can present a real device picker. */
 const HEADED_FLAGS = new Set(["--headed", "--ui", "--debug", "--pause"]);
+
+/**
+ * Playwright's subcommands that are HEADED BY DEFAULT — `codegen` records a
+ * browser the user drives, and `open` opens one. Neither needs a flag, so a
+ * `--headed`-only test missed them entirely (review cycle 1, F2).
+ */
+const HEADED_SUBCOMMANDS = new Set(["codegen", "open"]);
+
+/** Shells whose `-c <string>` argument is a COMMAND this classifier must re-read. */
+const SHELLS = new Set(["bash", "sh", "zsh", "dash", "ksh", "ash", "busybox"]);
+
+/** How deep a nested wrapper may go before it is refused as un-analysable. */
+const MAX_WRAPPER_DEPTH = 3;
 
 export type LaunchRule = "electron" | "open" | "app-bundle" | "playwright";
 
@@ -308,7 +336,15 @@ function commandWordIndex(toks: string[]): number {
         if (i < toks.length && TIMEOUT_DURATION.test(toks[i])) i++;
         continue;
       }
-      while (i < toks.length && valueFlags.includes(toks[i])) i += 2;
+      // ⛔ SKIP EVERY FLAG-LIKE WORD, not just the declared value-takers
+      // (review F2's sibling). `env -i bash -c "electron ."` used to leave `-i`
+      // sitting where the command word belongs, so the wrapper was never seen.
+      // A command word can never START with `-`, so this direction can only
+      // make the guard fire MORE, never less; a flag this table does not know
+      // costs an extra word of over-read at worst.
+      while (i < toks.length && toks[i].startsWith("-")) {
+        i += valueFlags.includes(toks[i]) ? 2 : 1;
+      }
       continue;
     }
     return i;
@@ -358,9 +394,78 @@ function appBundleBinary(tok: string): string | null {
  * Returns one finding per GUI launch found; an empty array means "not a host GUI
  * app launch" (allow, and record nothing).
  */
-export function classifyLaunchCommand(command: string): LaunchFinding[] {
+/**
+ * The bodies of every command substitution in a command line — `$( … )` and
+ * `` ` … ` `` — that is NOT inside single quotes.
+ *
+ * ⛔ SINGLE-QUOTED MATTERS (review cycle 1, F2's twin). `unquotedMask` cannot be
+ * used here: it masks `$(…)` inside DOUBLE quotes too, and a double-quoted
+ * substitution IS executed (`echo "$(npm exec electron .)"` launches the app).
+ * A single-quoted one is literal text, and treating it as a launch is the exact
+ * false BLOCK this guard already paid for once (`git commit` message bodies).
+ * Parenthesis depth is counted so `$(a $(b))` yields the outer body whole.
+ */
+export function extractSubstitutions(command: string): string[] {
+  const bodies: string[] = [];
+  let i = 0;
+  while (i < command.length) {
+    const ch = command[i];
+    if (ch === "'") {
+      // Skip a single-quoted run wholesale.
+      const end = command.indexOf("'", i + 1);
+      i = end === -1 ? command.length : end + 1;
+      continue;
+    }
+    if (ch === "`") {
+      const end = command.indexOf("`", i + 1);
+      if (end === -1) break;
+      bodies.push(command.slice(i + 1, end));
+      i = end + 1;
+      continue;
+    }
+    if (ch === "$" && command[i + 1] === "(") {
+      let depth = 0;
+      let j = i + 1;
+      for (; j < command.length; j++) {
+        if (command[j] === "(") depth++;
+        else if (command[j] === ")") {
+          depth--;
+          if (depth === 0) break;
+        }
+      }
+      if (j < command.length) {
+        bodies.push(command.slice(i + 2, j));
+        i = j + 1;
+        continue;
+      }
+      break; // unterminated — nothing to analyse
+    }
+    i++;
+  }
+  return bodies;
+}
+
+/** The `-c <string>` argument of a shell invocation, or null. */
+function shellCommandArg(toks: string[], headIndex: number): string | null {
+  for (let i = headIndex + 1; i < toks.length; i++) {
+    const tok = toks[i];
+    // `-c`, `-lc`, `-ec`, `-o pipefail -c` … a short-flag cluster containing `c`.
+    if (/^-[A-Za-z]*c[A-Za-z]*$/.test(tok)) return toks[i + 1] ?? null;
+    if (tok === "--") return null;
+  }
+  return null;
+}
+
+export function classifyLaunchCommand(command: string, depth = 0): LaunchFinding[] {
   const findings: LaunchFinding[] = [];
-  for (const segment of splitSegments(stripHeredocBodies(command))) {
+  const body = stripHeredocBodies(command);
+
+  // ⛔ A `PWDEBUG` EXPORTED IN AN EARLIER SEGMENT STILL APPLIES (review F2:
+  // `export PWDEBUG=1; npx playwright test` used to classify as `[]` because the
+  // assignment is its own segment). Read it from the WHOLE line, once.
+  const pwdebug = /(?:^|[\s;|&])(?:export\s+)?PWDEBUG=(?!0\b|false\b)/.test(body);
+
+  for (const segment of splitSegments(body)) {
     const toks = tokenize(segment);
     if (toks.length === 0) continue;
     const cwi = commandWordIndex(toks);
@@ -422,6 +527,8 @@ export function classifyLaunchCommand(command: string): LaunchFinding[] {
     if (isPlaywright) {
       const rest = toks.slice(Math.max(index, cwi) + 1);
       const headed = rest.some((t) => HEADED_FLAGS.has(t)) ||
+        rest.some((t) => HEADED_SUBCOMMANDS.has(t)) ||
+        pwdebug ||
         toks.some((t) => /^PWDEBUG=(?!0$|false$)/.test(t));
       if (headed) {
         findings.push({
@@ -432,6 +539,29 @@ export function classifyLaunchCommand(command: string): LaunchFinding[] {
           faked,
         });
       }
+      continue;
+    }
+
+    // R-wrapper: `bash -c "<cmd>"`, `sh -c …`, `sudo bash -lc …`, `eval …` —
+    // the command string is ARGV, so it is re-read rather than declared away
+    // (review cycle 1, F2: these were an UNDECLARED bypass of R2, and
+    // `AGENTS.md`/the runbooks hand lanes `bash -c` idioms routinely).
+    if (depth < MAX_WRAPPER_DEPTH) {
+      const shellBody = SHELLS.has(head) ? shellCommandArg(toks, cwi) : null;
+      const evalBody = head === "eval" ? toks.slice(cwi + 1).join(" ") : null;
+      const nested = shellBody ?? evalBody;
+      if (nested !== null && nested !== "") {
+        findings.push(...classifyLaunchCommand(nested, depth + 1));
+        continue;
+      }
+    }
+  }
+
+  // R-substitution: the body of `$( … )` / backticks executes, so it is
+  // classified as its own command line. Recurse rather than declare.
+  if (depth < MAX_WRAPPER_DEPTH) {
+    for (const sub of extractSubstitutions(body)) {
+      findings.push(...classifyLaunchCommand(sub, depth + 1));
     }
   }
   return findings;
