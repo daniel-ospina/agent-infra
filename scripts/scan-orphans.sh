@@ -81,16 +81,20 @@
 #       uncommitted copy of what that ref points at, and for an unregistered tree we cannot even
 #       read its state. So the ref is deleted ONLY once the directory is provably gone; otherwise
 #       both are kept and the record is kept so the next pass re-reports it.
-#       ⛔ "PROVABLY GONE" IS THE DIRECTORY, NOT THE REGISTRATION (round-4 F1, measured on git 2.43).
-#       A worktree directory removed with `rm -rf` — not `git worktree remove` — leaves its
-#       REGISTRATION behind, and `git worktree list --porcelain` keeps reporting it, flagged
-#       `prunable`, at a path that no longer exists. Skipping the removal on `absent` therefore made
-#       such a phantom look "checked out in a live worktree" for ever: `KEPT by --apply` grew
-#       monotonically, the "re-run when nothing is writing there" advice could never come true, and
-#       the diagnosis named a lane that did not exist (the pre-fix code reclaimed it in one pass).
-#       So the `absent` arm DEREGISTERS the phantom before the CAS, and the checked-out guard treats
-#       a `prunable` entry, or one whose path is provably absent, as not a live lane. A worktree that
-#       might still exist — `unmeasurable` — still refuses.
+#       ⛔ "PROVABLY GONE" IS THE DIRECTORY, AND THE REGISTRATION IS NOT PROOF EITHER WAY (round-6 F1,
+#       measured on git 2.43; this supersedes the round-4 text that used to live here). A worktree
+#       directory removed with `rm -rf` — and ALSO one MOVED with a raw `mv` — leaves the same
+#       REGISTRATION behind, which `git worktree list --porcelain` keeps reporting at the OLD path,
+#       flagged `prunable`. git cannot tell the two apart, and they are not symmetric: clearing a
+#       stale registration saves an operator one `git worktree prune`, while clearing a moved one
+#       SEVERS A LIVE LANE — `git worktree remove --force` returns 0 and the lane's `git status`
+#       then fails rc=128 (`not a git repository: …/.git/worktrees/<name>`), its unpushed commit
+#       goes unreachable, and the pruned record means nothing re-reports it. So the `absent` arm
+#       does NOT deregister, and the checked-out guard treats a `prunable`/absent-path entry as
+#       AMBIGUOUS: it keeps the ref, the record and the tree state, and names the explicit remedy
+#       (`git worktree prune`, after confirming nothing is live at the moved path). A `locked`
+#       entry is live even when its directory is gone, because `git branch -D` refuses it too. A
+#       worktree that might still exist — `unmeasurable` — still refuses.
 #
 #   G5  (in-window) The classification's `clean` read describes a moment that has PASSED by the time
 #       --apply acts, and `git worktree remove --force` does not refuse — `--force` suppresses git's
@@ -246,7 +250,7 @@ worktree_state() {
 # CHECKED OUT in a live worktree · 3 the CAS was refused / the worktree list was unreadable.
 # On non-zero, $DCAS_REASON carries the sentence reap_record prints.
 delete_branch_cas() {
-    local br="$1" oid="$2" wt_now="" wt_here="" wt_path=""
+    local br="$1" oid="$2" wt_now="" wt_hits="" wt_live="" wt_locked="" wt_stale="" p pr lk
     DCAS_REASON=""
     branch_local "$br" || return 0          # already gone — nothing to delete, nothing lost
     if [ -z "$oid" ]; then
@@ -259,22 +263,50 @@ delete_branch_cas() {
     fi
     # The path is parsed per line, so command substitution's stripped trailing newlines cannot hide
     # the LAST entry of the listing (a `case` over the whole string needed two patterns for that).
-    # ⛔ AND A `prunable` ENTRY IS NOT A LIVE LANE (round-4 F1). The block-level parse keeps the
-    # `prunable` flag, and an entry whose path is provably ABSENT is not a worktree anyone is
-    # standing in — refusing on it blocked the reclaim for ever, because the registration outlives
-    # `rm -rf` of its directory. A tree that might still exist (unmeasurable) still refuses.
-    wt_here="$(printf '%s\n' "$wt_now" | awk -v b="refs/heads/$br" '
-        /^worktree / { p = substr($0, 10); pr = 0; hit = 0 }
+    # ⛔ EVERY MATCHING ENTRY IS EXAMINED, NOT JUST THE FIRST (round-6 F3). `git worktree add --force
+    # <path> <branch>` really does register TWO worktrees on one branch (measured rc=0), so exiting
+    # on the first block let a live second entry go unseen behind a stale first one.
+    # ⛔ AND A `prunable` OR ABSENT-PATH ENTRY IS *NOT* PROOF THE LANE IS DEAD (round-6 F1, measured
+    # on git 2.43). Deleting a worktree directory and MOVING one with a raw `mv` leave the SAME
+    # `prunable gitdir file points to non-existent location` entry at the OLD path — while a moved
+    # lane is fully live at its new path (`git -C <new> status` rc=0). git cannot tell these apart,
+    # and the two outcomes are not symmetric: clearing a stale registration saves one `git worktree
+    # prune`, while clearing a moved one severs a live lane (its `status` then fails rc=128 with
+    # "not a git repository: …/.git/worktrees/<name>") and makes its unpushed commit unreachable.
+    # Category A beats the friction, so this refuses BOTH and names the explicit remedy.
+    # ⛔ A `locked` WORKTREE IS LIVE EVEN WHEN ITS DIRECTORY IS GONE (round-6 F2). `lock` exists for
+    # trees that may be moved or offline, and the listing shows `locked` with no `prunable` line.
+    # `git branch -D` REFUSES these and this repo preserves them (`pi-reap-worktrees.sh` emits
+    # `preserve worktree-locked`), so deleting the ref here would be strictly broader than the call
+    # being replaced. The `locked` flag also arrives AFTER `branch`, so it is read at block end.
+    wt_hits="$(printf '%s\n' "$wt_now" | awk -v b="refs/heads/$br" '
+        /^worktree / { p = substr($0, 10); pr = 0; lk = 0; hit = 0 }
         /^prunable/  { pr = 1 }
+        /^locked/    { lk = 1 }
         /^branch /   { if (substr($0, 8) == b) hit = 1 }
-        /^$/         { if (hit) { print p "\t" pr; exit } }
-        END          { if (hit) print p "\t" pr }')"
-    if [ -n "$wt_here" ]; then
-        wt_path="${wt_here%%$'\t'*}"
-        if [ "${wt_here##*$'\t'}" = 1 ] || path_absent "$wt_path"; then
-            :   # a stale registration: prunable, or its path is provably gone — not a live lane
-        else
-            DCAS_REASON="it is CHECKED OUT in a live worktree ($wt_path), and deleting the ref would leave that lane on an unborn branch"
+        /^[[:space:]]*$/ { if (hit) print p "\t" pr "\t" lk; p = ""; pr = 0; lk = 0; hit = 0 }
+        END { if (hit) print p "\t" pr "\t" lk }')"
+    if [ -n "$wt_hits" ]; then
+        while IFS=$'\t' read -r p pr lk; do
+            [ -n "$p" ] || continue
+            if [ "$lk" = 1 ]; then
+                wt_locked="${wt_locked:-$p}"
+            elif [ "$pr" = 1 ] || path_absent "$p"; then
+                wt_stale="${wt_stale:-$p}"
+            else
+                wt_live="${wt_live:-$p}"
+            fi
+        done <<<"$wt_hits"
+        if [ -n "$wt_live" ]; then
+            DCAS_REASON="it is CHECKED OUT in a live worktree ($wt_live), and deleting the ref would leave that lane on an unborn branch"
+            return 2
+        fi
+        if [ -n "$wt_locked" ]; then
+            DCAS_REASON="it is CHECKED OUT in a LOCKED worktree ($wt_locked), and a lock exists to protect a tree that may be moved or offline — a plain branch delete refuses this too"
+            return 2
+        fi
+        if [ -n "$wt_stale" ]; then
+            DCAS_REASON="a worktree registration ($wt_stale) still claims it while that directory is gone — git cannot tell a STALE registration from a worktree that was MOVED with 'mv', and the moved case is a live lane, so the ref is kept. Confirm nothing is live there, then clear the registration explicitly: 'git worktree prune'"
             return 2
         fi
     fi
@@ -301,15 +333,17 @@ reap_record() {
         st="$(worktree_state "$dir")"
         case "$st" in
             absent)
-                # ⛔ DEREGISTER THE PHANTOM BEFORE THE CAS (round-4 F1, measured on git 2.43).
-                # A worktree directory removed with `rm -rf` (not `git worktree remove`) leaves its
-                # REGISTRATION behind, and `git worktree list --porcelain` keeps reporting it — with
-                # `prunable` — at a path that no longer exists. Skipping the removal here therefore
-                # made the ref look "checked out in a live worktree" for ever: `KEPT by --apply` grew
-                # monotonically, the retry advice could never come true, and the diagnosis named a
-                # lane that did not exist. `absent` is decided on evidence, so deregistering here
-                # cannot destroy anything: `worktree remove --force` on a prunable entry returns 0.
-                git worktree remove --force "$dir" >/dev/null 2>&1 || true ;;
+                # ⛔ DO NOT DEREGISTER HERE (round-6 F1, measured on git 2.43 — this reverses the
+                # round-4 fix, which destroyed work). The directory is provably gone, but its STILL-
+                # REGISTERED worktree entry is ambiguous: `rm -rf` of a worktree and a raw `mv` of a
+                # live one leave the SAME `prunable` entry at the OLD path. `git worktree remove
+                # --force` on it returns 0 in BOTH cases — and in the moved case it severs the live
+                # lane (`git -C <new path> status` then fails rc=128 "not a git repository:
+                # …/.git/worktrees/<name>") and its unpushed commit goes unreachable, while the
+                # record is pruned so nothing re-reports it. That is #1393's own failure class, so
+                # the ref is left to `delete_branch_cas`, which refuses an ambiguous registration and
+                # names the explicit remedy (`git worktree prune`) rather than guessing.
+                : ;;
             unmeasurable)
                 printf '%b' "     ⚠️ KEPT tree+ref+record: '${dir}' cannot be reached or read (state 'unmeasurable'), so whether a tree is there — and what is in it — cannot be ruled out.\n"
                 return 1 ;;
