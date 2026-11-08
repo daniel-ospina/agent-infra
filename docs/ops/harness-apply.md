@@ -197,8 +197,10 @@ so a header timestamp *after* the record's own is the one cheap impossibility �
 strings, both UTC, NOT the header's UTC against the record's `epoch=`);
 - the header's `n=` must equal the record's `farm_n=`, **except** when the header reads `n=unparsed`
   — then `farm_n` is `unparsed` (the paragraph below governs), or `not-graded` when the header ALSO
-  says `NO GRADE` (the instrument exited 2, so the file holds its output verbatim and no grade exists —
-  see the `farm-unknown` paragraph below).
+  says `NO GRADE` (the instrument gave up with its own non-0/1/3 code — 2 is the common one — or the
+  checker's exit status contradicted its own report; either way the file holds its output verbatim and
+  no grade exists, so the header is the field that separates "not graded" from "graded, 2 rows" — see
+  the `farm-unknown` paragraph below).
 
 Those rules cannot separate two passes that produced the **same** row count inside this record's own
 publish→`finish` window (~3–4 s); nothing in the artifact can, and claiming otherwise is worse than
@@ -231,7 +233,14 @@ would be a stray row for anyone sizing the list with `wc -l - 1`), and the recor
 instead of claiming output was published. That is the one state where a published list can name no
 file — because the instrument named none.
 
-`farm_rows=<path>` is ALSO written on `action=farm-unknown` (`rc=24`, the instrument's own exit 2). The
+`action=farm-unknown` (`rc=24`) is also the answer when the checker's exit status CONTRADICTS its own
+report — `rc=0` over a report that names drift. `HARNESS_APPLY_FARM_CHECKER` is a seam, so a wrapper
+that reports the *pipeline's* status (`bash inner "$@" 2>&1 | tee -a log`) returns 0 over a drifting
+farm; the report wins over the status (the output is published with a `NO GRADE` header and `remedy=`
+names the wrapper), because an exit code that contradicts what it printed is not a grade. A wrapper over
+a genuinely matching farm still passes — the check reads the report, not the wrapper's shape.
+
+`farm_rows=<path>` is ALSO written on `action=farm-unknown` when the instrument gives up (its own exit 2). The
 instrument prints its per-file rows BEFORE the exits that give up (`matched == 0`, a partly ungradeable
 declaration), so "no grade" never meant "nothing was reported": the file carries that output verbatim
 with a `NO GRADE` header, `farm_n=not-graded` still says no grade was produced, and `farm_rows=` stays
@@ -449,7 +458,7 @@ checkout can use the documented hatch. The same interaction is recorded for
 
 ## Tests
 
-`scripts/harness-apply-timer.test.sh` — 460 assertions, run by the
+`scripts/harness-apply-timer.test.sh` — 999 assertions, run by the
 `harness-apply-timer` shard of `run-bash-shards.sh`:
 
 | | |

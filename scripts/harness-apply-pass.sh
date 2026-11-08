@@ -172,8 +172,11 @@ set -uo pipefail
 # (`*)` in the loop below) IS THE SIXTH SITE AND IT IS PINNED TOO — `T24x2`, one site over from `T24x`:
 # a RELATIVE LINK checker inside the farm, run from a cwd carrying a CDPATH that resolves its directory,
 # resolved to a TWO-LINE `$FARM_CHECKER_T`, was read as OUTSIDE the farm, and GRADED ITSELF `farm: ok` at
-# rc=0 (measured: dropping this `CDPATH=` reds T24x2's three rows and nothing else, while the same link
-# with no CDPATH stays refused — so those rows are about the prefix, not about the link's shape).
+# rc=0. MEASURED at this head: dropping this `CDPATH=` reds TWO rows — `T24x2`'s containment row and its
+# "not the missing-instrument sentence" row — and leaves the rc and `farm: ok` rows green, because the
+# `[ ! -f "$FARM_CHECKER_T" ]` refusal added in review round 20 stops the two-line path before it can be
+# executed, so the wrong ANSWER replaces the wrong ACTION. Both red rows pin the prefix; the other two are
+# not pins for it and must not be counted as such.
 HERE="$(CDPATH= cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)"
 
 log_line()  { printf '%s\n' "$*"; }
@@ -1481,8 +1484,31 @@ if [ "$FARM_CHECK_ON" = "1" ]; then
         # an UNKNOWN reason and `   Next: fix the declaration entries … then re-run this.` produced
         # `action=farm-unknown` + `remedy=none`, with the word `Next` nowhere in the record.
         FARM_REMEDY="$(printf '%s\n' "$FARM_OUT" | sed -n '/^[[:space:]]*Next:/,$p' | head -8)"
+        # ⛔ THE EXIT CODE IS NOT THE GRADE — THIS PROCESS MAY NOT BE THE INSTRUMENT (review round 21,
+        # measured). `HARNESS_APPLY_FARM_CHECKER` is a documented seam, and an operator wrapper that
+        # reports the PIPELINE's status (`bash inner "$@" 2>&1 | tee -a log`) exits 0 no matter what
+        # the instrument said. Measured with such a wrapper over a checker printing one STALE row and
+        # `DRIFT — 1 stale …`: the pass recorded `action=none farm_rows=none farm_n=0` + `detail=current`
+        # and printed `farm: ok`, so the one drifting file the instrument named was durable NOWHERE
+        # while the record positively certified a match — the exact green-over-drift the whole predicate
+        # exists to remove, at the one arm that trusted its input absolutely. So a rc=0 that also
+        # reported drift is CONTRADICTORY, and a contradiction is not a grade: the output is published
+        # under a NO GRADE header and the pass refuses, exactly as an unreadable grade does.
+        # `NF>=4` is not decoration: without it a summary or class-prose line that happens to END in a
+        # class word ("…, 0 unsourced") would read as a row and refuse a healthy farm (over-block).
+        FARM_ROWS0="$(printf '%s\n' "$FARM_OUT" | awk -F'|' 'NF>=4 && $NF ~ /(^|[[:space:]])(STALE|UNSOURCED|NOT-EXECUTABLE|DECLARED-BUT-ABSENT)[[:space:]]*$/')"
+        FARM_NROWS0="$(printf '%s' "$FARM_ROWS0" | grep -c .)"
+        FARM_SUM0="$(printf '%s\n' "$FARM_OUT" | sed -n 's/.*DRIFT — \([0-9][0-9]*\) stale.*/\1/p' | head -1)"
         case "$FARM_RC" in
             0)
+                if [ "$FARM_NROWS0" -gt 0 ] || { [ -n "$FARM_SUM0" ] && [ "$FARM_SUM0" -gt 0 ]; }; then
+                    REC_ACTION=farm-unknown
+                    publish_farm_rows "$FARM_OUT" "n=unparsed (NO GRADE — the checker exited 0 while reporting drift, so its exit status and its report contradict each other; this is its output verbatim, not a grade; farm_n=not-graded)"
+                    REC_FARM_NROWS=not-graded
+                    REC_REMEDY="the checker exited 0 while reporting drift — point HARNESS_APPLY_FARM_CHECKER at check-farm-drift.sh itself (a wrapper that reports the pipeline's status hides the instrument's), then re-run"
+                    log_line "farm: UNKNOWN — the checker exited 0 but its output reports drift ($FARM_NROWS0 row(s) matched, summary says ${FARM_SUM0:-nothing}); an exit status that contradicts its own report is not a grade"
+                    finish 0 24 "farm: UNKNOWN (check-farm-drift rc=0) — $FARM_DEST could not be graded against $REF: the checker exited 0 while reporting drift, so its status and its report contradict each other, and an unreadable grade is not a pass. Its output is published in $REC_FARM_ROWS"
+                fi
                 REC_FARM_ROWS=none; REC_FARM_NROWS=0
                 log_line "farm: ok — $FARM_DEST matches $REF" ;;
             1|3)
