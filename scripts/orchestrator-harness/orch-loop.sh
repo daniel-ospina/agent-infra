@@ -9100,8 +9100,167 @@ PY
         echo "[refresh] SEED-SKEW: the refresh resolver returned an UNRECOGNISED answer (rc=$_rrc, script='${REFRESH_SH:-none}') — NOT spawning a pass whose writer cannot be identified; tried: ${REFRESH_TRIED:-none}. Fix: re-seed \$O with the VERIFYING seeder (bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o \$O)" >> "$LOG"
         rm -rf "$O/.refresh.lock"
       fi
+      # ⛔ A TRANSIENT PASS IS NOW RETRIED ON A SHORT BOUNDED BACKOFF, NOT ONLY AT THE NEXT CYCLE
+      # (agent-infra#3584). The issue's own STATUS comment measured the defect: a `TRANSIENT`
+      # `provision` refusal was retried only when the next cycle came round — 15-161 minutes away
+      # (#3585's cycle period) — so a hiccup a 30-second retry clears cost HOURS of origination, and
+      # nothing in between escalated or re-provisioned sooner. The pass is now attempted up to
+      # REFRESH_RETRY_MAX_ATTEMPTS times, backoff doubling from REFRESH_RETRY_BACKOFF_S, ALL INSIDE
+      # ONE CYCLE, so a transient refusal either clears or is REPORTED before the next beat instead of
+      # being silently deferred to it.
+      # ⛔ BOUNDED THREE INDEPENDENT WAYS, because an unbounded retry here would be a worse defect than
+      # the one it fixes: an ATTEMPT cap, a per-DELAY cap, and a WALL-CLOCK retry budget. The budget is
+      # the one that matters, and it is a correctness bound, not politeness: REFRESH_STALE_LOCK_MIN
+      # clears `.refresh.lock` after N minutes, so a pass that outlived it would be reaped by the NEXT
+      # cycle while STILL RUNNING — the concurrent double-pass the lock exists to prevent.
+      # ⛔ THE BUDGET IS WALL CLOCK, NOT THE SUM OF THE SLEEPS (review round 2, F1, verified against
+      # `refresh-candidates.sh:3244-3248`, which already records that a SINGLE pass can cross that
+      # guard: "96 asks against a blackholed origin is still hours of kernel connect timeouts"). The
+      # first version accumulated only `sleep` time, so three passes at ~6m20s each would have passed a
+      # 300 s "budget" and tripped the guard anyway — the comment claimed a bound the code did not
+      # implement. It is now measured from the FIRST attempt's start and includes the pass runtime, so
+      # what it protects is stated exactly: it bounds the WALL CLOCK the retries add. ⛔ THE RESIDUAL IS
+      # ONE ATTEMPT'S RUNTIME, said out loud (review round 3, measured): the check runs BEFORE the sleep,
+      # so the worst case is `budget + one further pass runtime` — a retrying pass cannot cap how long an
+      # attempt takes. And it cannot shorten a FIRST attempt that on its own outlives the guard — that
+      # pre-existing exposure is the pass's, and is named in `refresh-candidates.sh` rather than papered
+      # over here. The shipped defaults (30 + 60 s of sleep against a 300 s budget, under a 20 min guard)
+      # leave a factor of ~4 of headroom for a pass that completes in its usual seconds — ~1.8x at the
+      # ~6m20s pass the paragraph above cites, which is the honest figure, not "an order of magnitude".
+      # ⛔ AND IT DOES NOT RETRY A PERMANENT VERDICT. rc=3 (NOT PROVISIONABLE) and rc=78 (a config
+      # refusal) are facts about the BOX, not about the network; retrying them is the #1736 defect the
+      # two `elif` arms below exist to prevent.
+      # ⛔ WHAT THIS DOES NOT CLAIM (review round 2, F2): rc=1 is the pass's TRANSIENT class and it is
+      # NOT exclusively network-shaped — `refresh-candidates.sh` also returns it for operator-action
+      # conditions (a scout with uncommitted work `:1757`, a disk-floor refusal `:1919`, an unwritable
+      # `$O` `:2014`). Those are retried too, up to the attempt cap and inside the wall-clock budget,
+      # where a single pass was previously spent. Mapping them onto EXIT_NOT_PROVISIONABLE is the right
+      # fix and belongs to that file's own change (this slice's scoping excludes it); until then the
+      # cost is 2 extra pre-flights on a box that already needs a human, bounded to the budget — stated
+      # here rather than left for a reader to discover.
+      # The knobs default HERE, inside the block, so the extracted-block suite (`refresh-scout.test.sh`
+      # §7) drives the values the loop actually runs rather than an untested unset default.
+      # ⛔ ONE GUARD PER KNOB (review round 2, F3). Three redundant resets (`case`, a length test and a
+      # `[ -ge ]` fallback) meant a junk value was restored by whichever line ran last, so a suite arm
+      # could not attribute a red to the check it names — deleting the `case` left the arm GREEN. Each
+      # knob now has exactly ONE rejecting guard whose pattern covers junk, leading zeros AND (for the
+      # attempt cap) the legal range, so the arm that drives it measures that guard and nothing else.
+      REFRESH_RETRY_MAX_ATTEMPTS="${REFRESH_RETRY_MAX_ATTEMPTS:-3}"
+      case "$REFRESH_RETRY_MAX_ATTEMPTS" in [1-9]|10) ;; *) REFRESH_RETRY_MAX_ATTEMPTS=3 ;; esac
+      REFRESH_RETRY_BACKOFF_S="${REFRESH_RETRY_BACKOFF_S:-30}"
+      case "$REFRESH_RETRY_BACKOFF_S" in
+        ''|*[!0-9]*|0[0-9]*|[0-9][0-9][0-9][0-9][0-9][0-9][0-9]*) REFRESH_RETRY_BACKOFF_S=30 ;; esac
+      REFRESH_RETRY_MAX_DELAY_S="${REFRESH_RETRY_MAX_DELAY_S:-120}"
+      case "$REFRESH_RETRY_MAX_DELAY_S" in
+        ''|*[!0-9]*|0[0-9]*|[0-9][0-9][0-9][0-9][0-9][0-9][0-9]*) REFRESH_RETRY_MAX_DELAY_S=120 ;; esac
+      REFRESH_RETRY_BUDGET_S="${REFRESH_RETRY_BUDGET_S:-300}"
+      case "$REFRESH_RETRY_BUDGET_S" in
+        ''|*[!0-9]*|0[0-9]*|[0-9][0-9][0-9][0-9][0-9][0-9][0-9]*) REFRESH_RETRY_BUDGET_S=300 ;; esac
+      # ⛔ AND A CEILING DERIVED FROM THE GUARD IT PROTECTS (review round 2, P2 — measured). The shape
+      # above rejects JUNK; it cannot tell that a four-digit number is a TYPO rather than a choice, and
+      # that is precisely the failure this block exists to prevent. Measured on the shipped code:
+      # `REFRESH_RETRY_BUDGET_S=3000` — one extra zero, 4 digits, no leading zero, ACCEPTED — bought
+      # 2000 s of sleep against the 1200 s (20 min) `REFRESH_STALE_LOCK_MIN` window, i.e. exactly the
+      # "reaped by the NEXT cycle while STILL RUNNING" double-pass the lock exists to prevent. So the
+      # budget may not REACH the headroom: at or past it the value falls back to `min(shipped default,
+      # half the guard)` — `_budget_cap` — rather than being silently shortened to the guard, because a
+      # silent clamp would make the effective policy unnamed and let an operator believe a setting was
+      # honoured when it was not. (The comparand is the CAP, not the guard; see the note below, which is
+      # why the band `(cap, guard)` is not a hole.)
+      # This is the knob's SECOND guard and each class is still ATTRIBUTABLE: junk and leading zeros are
+      # the `case` above, a numeric value above the headroom is this test. (The other three knobs have
+      # exactly one, per the note below.)
+      # ⛔ THE BASE IS EXPLICIT (`10#`), AND THAT IS LOAD-BEARING RATHER THAN TIDY (fresh-context
+      # review, P0 — measured). This is the file's FIRST octal-sensitive arithmetic use of
+      # REFRESH_STALE_LOCK_MIN: its only validation is the digit-only `case` at `:2571-2572`, which
+      # ACCEPTS `08`/`09` because both are all-digits. Every earlier use is decimal-safe by accident of
+      # its operator (`[ -ge ]`, `find -mmin +08`), so nothing broke before this block. Measured on the
+      # shipped block: `REFRESH_STALE_LOCK_MIN=08` made the arithmetic expansion abort with `08: value
+      # too great for base (error token is "08")`, the pass was NEVER invoked, `.refresh.lock` was left
+      # on disk (the `rm -rf` is downstream of the abort) and the block still exited 0 — and inside the
+      # controller's own `while` shape that arithmetic error aborts the enclosing loop, so the cycle
+      # loop exits after ONE cycle with rc=0 (KeepAlive does not restart it). `10#` is the fix rather
+      # than tightening `:2572`, because `08` plainly means eight minutes, not twenty.
+      # ⛔ AND THE CEILING IS THE CAP, NOT THE GUARD (fresh-context review, P2 — measured). Comparing
+      # against the guard left a BAND uncovered: every budget in `(cap, guard)` passed through
+      # UNCLAMPED, and the block's own residual (`budget + one attempt runtime`) then crossed the
+      # guard. Measured with `REFRESH_STALE_LOCK_MIN=1` (60 s guard), `REFRESH_RETRY_BUDGET_S=50`
+      # (accepted, 50 < 60, no clamp), `REFRESH_RETRY_BACKOFF_S=30` and a 20 s pass: the block slept
+      # and reported `70s of wall clock already spent … against the 1m stale-lock guard` — the reaped
+      # mid-run pass the lock exists to prevent, reported AFTER it was already past. On the shipped
+      # defaults the same band is 300–1200 s. `_budget_cap` IS that headroom made arithmetic (half the
+      # guard), so it is the correct comparand: a value above it is a value that cannot fit the window.
+      _budget_cap=$(( 10#${REFRESH_STALE_LOCK_MIN:-20} * 60 / 2 ))
+      [ "$_budget_cap" -gt 300 ] && _budget_cap=300
+      # ⛔ THE COMPARAND IS `_budget_cap` (the note above). Do not "simplify" this back to the guard
+      # arithmetic: a guard comparison leaves everything in `(cap, guard)` UNCLAMPED, and the block's
+      # residual then crosses the guard — arm (b3e) is the pin that goes red if this line regresses.
+      if [ "$REFRESH_RETRY_BUDGET_S" -gt "$_budget_cap" ]; then
+        REFRESH_RETRY_BUDGET_S="$_budget_cap"
+      fi
+      # ⛔ THE RETRY BACKOFF IS DECLARED IN-BAND AS NOT-A-CYCLE-NAP, and the markers are load-bearing
+      # (agent-infra#3584). `cycle-stages.test.sh` §9.1d-iii derives its nap population from the
+      # `sleep`/`fork_free_sleep` lines inside the controller loop and requires every one of them to be
+      # paired with a `stg_nap_mark` — because an unmarked CYCLE nap loses `prev_wait`. This `sleep` is
+      # not a cycle nap in kind: it runs inside the BACKGROUNDED pass subshell below, so the cycle
+      # waits on nothing, its 30-90 s sit inside the refresh stage rather than between cycles, and a
+      # `stg_nap_mark` here could not even work (it writes a shell variable, and a subshell's write dies
+      # with it). Without the declaration the arm charged it as a nap path and reddened a correct tree
+      # (measured: pristine `main` 123 passed/0 failed, this branch 122/1 before the markers). The
+      # exclusion is not a licence: the suite bounds the declared block to ONE sleep line, requires it
+      # to sit STRICTLY INSIDE the backgrounded subshell (no opener and no closer in the fence), and
+      # the `_nap_n >= 3` floor means a block wrapped round the whole loop reddens the arm instead of
+      # emptying it.
+      # ⛔ AND THE FENCE OPENS INSIDE THE SUBSHELL, NOT OUTSIDE IT (fresh-context review, P2 — measured).
+      # The first version put `BEGIN` before `if [ -n "$REFRESH_SH" ]; then`, so the fenced region
+      # spanned the subshell opener: an outer-shell `sleep` added between the fence and `while :; do`
+      # was excluded from the nap population while sitting on the CYCLE path — a real nap, hidden, with
+      # every arm green. The fence therefore starts AFTER `( _att=0`, and two arms pin that structure
+      # (no `(`/`)` boundary inside it, an opener immediately before it).
       if [ -n "$REFRESH_SH" ]; then
-        ( bash "$REFRESH_SH" 6 >> "$LOG" 2>&1; rc=$?
+        ( _att=0; _t0="$(date +%s)"
+          # >>> BEGIN NOT-A-CYCLE-NAP — the in-cycle retry backoff below (agent-infra#3584)
+          while :; do
+            _att=$(( _att + 1 ))
+            bash "$REFRESH_SH" 6 >> "$LOG" 2>&1; rc=$?
+            # 0 is done; 3 and 78 are PERMANENT verdicts about the box (see the two arms below), so
+            # neither is a retryable failure no matter how the knobs are set.
+            case "$rc" in 0|3|78) break ;; esac
+            [ "$_att" -ge "$REFRESH_RETRY_MAX_ATTEMPTS" ] && break
+            _rd="$REFRESH_RETRY_BACKOFF_S"; _dbl=1
+            while [ "$_dbl" -lt "$_att" ]; do _rd=$(( _rd * 2 )); _dbl=$(( _dbl + 1 )); done
+            [ "$_rd" -gt "$REFRESH_RETRY_MAX_DELAY_S" ] && _rd="$REFRESH_RETRY_MAX_DELAY_S"
+            # THE BUDGET IS CHECKED BEFORE SLEEPING, and it is WALL CLOCK SINCE THE FIRST ATTEMPT —
+            # pass runtime included (F1 above). Checking before the sleep is what makes the bound hold
+            # whatever the two per-delay knobs are set to: the pass never sleeps past the budget, so
+            # the retries cannot walk it past the stale-lock guard.
+            # ⛔ A FAILED CLOCK READ MUST FAIL CLOSED (fresh-context review, P2 — measured). Bash's
+            # arithmetic does not ERROR on an empty operand, it reads it as a UNARY MINUS: measured,
+            # `_t0=1000; echo $(( $(false) - _t0 ))` prints `-1000`. So under fork pressure — the exact
+            # condition `fork_gate` exists for (#2293) — a failed `date` made `_elapsed` a large
+            # NEGATIVE number, `_elapsed + _rd` never exceeded the budget, and the one bound that counts
+            # PASS RUNTIME stopped refusing silently. That is a fail-OPEN in the guard whose whole job is
+            # to keep a retrying pass from outliving the stale-lock window, so an unmeasurable budget is
+            # treated as SPENT: no further retry, and the refusal is REPORTED. A backwards clock step is
+            # the same case (the read succeeds, the elapsed is negative) and takes the same branch.
+            # ⛔ `date +%s` is the SHIM TARGET for arm (b3d): that arm fails only `+%s` and delegates
+            # every other date call, so this guard is graded rather than merely asserted.
+            _now="$(date +%s 2>/dev/null)"
+            case "$_now" in ''|*[!0-9]*) _now="" ;; esac
+            _elapsed=""
+            if [ -n "$_now" ]; then _elapsed=$(( _now - _t0 )); fi
+            if [ -z "$_elapsed" ] || [ "$_elapsed" -lt 0 ]; then
+              echo "[refresh] TRANSIENT rc=$rc (attempt ${_att}/${REFRESH_RETRY_MAX_ATTEMPTS}) — NOT retrying again: the in-cycle retry budget cannot be MEASURED (the wall clock read failed or stepped backwards), and an unmeasurable budget is treated as SPENT rather than skipped — an unmeasured bound over the ${REFRESH_STALE_LOCK_MIN:-20}m stale-lock guard would be no bound at all, so the next cycle picks it up (agent-infra#3584)" >> "$LOG"
+              break
+            fi
+            if [ $(( _elapsed + _rd )) -gt "$REFRESH_RETRY_BUDGET_S" ]; then
+              echo "[refresh] TRANSIENT rc=$rc (attempt ${_att}/${REFRESH_RETRY_MAX_ATTEMPTS}) — NOT retrying again: the ${REFRESH_RETRY_BUDGET_S}s in-cycle retry budget is spent (${_elapsed}s of wall clock already spent on the attempts so far, + ${_rd}s wanted), and a longer backoff would risk the ${REFRESH_STALE_LOCK_MIN:-20}m stale-lock guard reaping this pass while it still runs — the next cycle picks it up (agent-infra#3584)" >> "$LOG"
+              break
+            fi
+            echo "[refresh] TRANSIENT rc=$rc (attempt ${_att}/${REFRESH_RETRY_MAX_ATTEMPTS}) — retrying in ${_rd}s, on a SHORT BOUNDED BACKOFF INSIDE this cycle rather than at the next one (agent-infra#3584)" >> "$LOG"
+            sleep "$_rd"
+          done
+          # <<< END NOT-A-CYCLE-NAP
         rm -rf "$O/.refresh.lock"
         if [ "$rc" -eq 3 ]; then
           echo "[refresh] BLOCKED (permanent): this repo cannot be provisioned for dispatch — see the reason above. Not retrying (agent-infra#1736); fix it, then delete $O/.refresh-blocked" >> "$LOG"
@@ -9133,7 +9292,12 @@ PY
           # The pass recorded its own cause in `state/refresh-last` (agent-infra#2229); QUOTE it here
           # rather than restating `transient` alone, so this line and the next beat's BLOCKED line
           # agree on the cause. A missing record is named, not glossed.
-          echo "[refresh] FAILED rc=$rc (transient — retried next cycle) — $(refresh_cause_brief "$(refresh_record_snapshot)")" >> "$LOG"
+          # ⛔ IT NAMES THE ATTEMPTS THAT WERE MADE (agent-infra#3584). The old wording —
+          # "(transient — retried next cycle)" — described a retry policy that did not exist inside the
+          # pass; the in-cycle retries have now already happened, so "retried next cycle" is a false
+          # statement about the work this line reports. The count is what a reader needs: was this the
+          # FIRST refusal or the LAST one available? By the time this prints, the attempt budget is spent.
+          echo "[refresh] FAILED rc=$rc after ${_att:-1} attempt(s) — $(refresh_cause_brief "$(refresh_record_snapshot)")" >> "$LOG"
         fi ) &
       fi
     else

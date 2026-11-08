@@ -722,13 +722,123 @@ ck "  …and \`gate\` covers the floor/gate work it names — a \`floor_emergenc
 # 123 passed, 0 failed) — i.e. the controller could stop napping on its normal path and this arm would
 # still certify it. Filed as agent-infra#3763. The slack is a property of the count, not of the
 # fork-starved site, and a future author must not read the green as "no nap can be dropped".
-_loop_nap_region="$(printf '%s\n' "$_loop_nc" | awk '/^[[:space:]]*while true; do/{f=1} f')"
+# ⛔ AND THE POPULATION EXCLUDES ONE DECLARED, BOUNDED NON-NAP BLOCK (agent-infra#3584, measured).
+# A `sleep` inside the controller loop is a nap only if the CYCLE waits on it. #3584 added an in-cycle
+# RETRY BACKOFF — `sleep "$_rd"` inside the BACKGROUNDED refresh-pass subshell — which the cycle waits
+# on for nothing, whose time sits inside the `refresh` stage rather than between cycles, and which
+# could not carry a `stg_nap_mark` even in principle (that helper writes a shell variable, and a
+# subshell's write dies with the subshell). The blanket rule charged it as a nap path and reddened a
+# CORRECT tree: measured pristine `main` 123 passed/0 failed, this branch 122/1, with the arm reading
+# `3 nap_mark sites for 5 sleep/fork_free_sleep lines`. Rather than widen the rule, `orch-loop.sh`
+# DECLARES the block between `>>> BEGIN NOT-A-CYCLE-NAP` and `<<< END NOT-A-CYCLE-NAP`, and the arms
+# below bound that declaration so it cannot become a place to hide a real nap:
+#   (a) the pair appears EXACTLY ONCE inside the loop region (a lost END would otherwise exclude the
+#       rest of the file, and a lost BEGIN silently re-counts the sleep — the main arm then reds);
+#   (b) the block holds AT MOST ONE sleep line, so wrapping a second nap in it reds (b);
+#   (c) the `_nap_n >= 3` floor above means a block drawn round the WHOLE loop empties `_nap_n` and
+#       reds the main arm instead of vacuously passing it.
+# This is the same doctrine as the `cascade_wait` scoping above: the rule is about CYCLE naps, and a
+# declaration is what lets a text-derived population tell the two apart.
+_loop_nap_region="$(printf '%s\n' "$_loop_tc" | awk '/^[[:space:]]*while true; do/{f=1} f')"
+_nap_fence="$(awk '
+  /^[[:space:]]*# >>> BEGIN NOT-A-CYCLE-NAP/ {f=1; next}
+  /^[[:space:]]*# <<< END NOT-A-CYCLE-NAP/   {f=0; next}
+  f' <<<"$_loop_nap_region")"
+_nap_unfenced="$(awk '
+  /^[[:space:]]*# >>> BEGIN NOT-A-CYCLE-NAP/ {f=1; next}
+  /^[[:space:]]*# <<< END NOT-A-CYCLE-NAP/   {f=0; next}
+  !f' <<<"$_loop_nap_region")"
+# The fences are COMMENT lines, so the split above needs the comment-preserving view (`_loop_tc`, not
+# `_loop_nc` — the same trap §9.1d-v records). The COUNTS then run on CODE-ONLY views (`_nap_code` for
+# the fenced body, `_loop_code` for the population), so a word in a comment can neither become a nap
+# nor hide one.
+printf '%s\n' "$_nap_unfenced" > "$TMP/nap-region.txt"
+printf '%s\n' "$_nap_fence" > "$TMP/nap-fenced.txt"
+_nap_region="$(_strip_tc "$TMP/nap-region.txt")"
+_nap_excl_body="$(_strip_tc "$TMP/nap-fenced.txt")"
+# ⛔ THE COUNTS RUN ON A CODE-ONLY VIEW, AND THAT IS TWO FIXES IN ONE (fresh-context review, P1+P2,
+# measured). First: `_strip_tc` removes only TRAILING comments, so a FULL-LINE comment survived into
+# `_nap_excl_body`, falsifying the claim two lines above — adding the comment
+# `# NB: the old shape was `if false; sleep 30 ; fi`` reddened a nap-free tree (127/1). Second, and
+# worse: every counter was LINE-POSITION dependent, so a boundary or a nap could be hidden by
+# prefixing ONE token. Measured — all four of these left `RESULT: 128 passed, 0 failed`:
+#   `) ; sleep 300 ; (`   ·   `: ) ; command sleep 3 ; (`   ·   `true ) ; (` + `\sleep 300`
+#   ·   `) ; command sleep 300 ; (` appended to the existing `done` line
+# So the view is comment-free AND string-literal-free (the TRANSIENT echo messages carry `(attempt ...)`
+# parens, which would otherwise read as openers), a nap is matched as a TOKEN ANYWHERE on a line (so
+# `command sleep`, `\sleep` and `sleep$IFS` all count), and the CLOSER is proven by the PARSER rather
+# than by a spelling: `f() { <body> }` fails `bash -n` on an unmatched `)`. Over-counting is the
+# fail-closed direction; UNDER-counting is the bypass, so every pattern errs wide on purpose.
+_nap_code="$(printf '%s\n' "$_nap_excl_body" | grep -vE '^[[:space:]]*#' | sed -E 's/"[^"]*"//g')"
+_nap_closers=0
+printf 'f() {\n%s\n}\n' "$_nap_excl_body" | bash -n 2>/dev/null || _nap_closers=1
 _region_ok=1
 [ -n "$_loop_nap_region" ] || _region_ok=0
-_nap_n="$(printf '%s\n' "$_loop_nap_region" | grep -cE '^[[:space:]]*stg_nap_mark([[:space:]]|$)')"
-_loop_n="$(printf '%s\n' "$_loop_nap_region" | grep -cE '^[[:space:]]*(fork_free_sleep|sleep) ')"
+_nap_n="$(grep -cE '^[[:space:]]*stg_nap_mark([[:space:]]|$)' <<<"$_nap_region")"
+# ⛔ THE POPULATION COUNTER IS TOKEN-ANYWHERE TOO (fresh-context review, P1 — measured). `_loop_n`
+# stayed anchored at the START of the line, so the one view that decides whether a nap is IN the
+# population still missed a nap hidden behind a prefix token. Measured on this tree: inserting the
+# single line `: ; sleep 300` inside `while true; do` (a real 300 s nap on the CYCLE path, no
+# `stg_nap_mark`) left the suite at `RESULT: 128 passed, 0 failed`. The two fence counters above were
+# fixed and this one — grading the same class, in the same arm — was not, so "every pattern errs wide
+# on purpose" was false until this line changed.
+# ⛔ CONTINUATIONS ARE JOINED INTO ONE LOGICAL LINE, NOT DROPPED (fresh-context review, P1 — measured).
+# Dropping the lines that BEGIN with `||`/`&&` was this arm's first fix, and it re-created the very
+# under-count it was added to close: a nap written as a two-line conditional whose PARENT is not a nap
+# —
+#     false \
+#       || sleep 300
+# — has its nap line dropped and its parent contributes no token, so the nap left the population and
+# the suite stayed at `RESULT: 128 passed, 0 failed` (measured). The shipped fork-starved nap has the
+# same two-line SHAPE but the opposite meaning (one logical nap, counted once), so NO line-shape rule
+# can separate the two cases: the only sound reading is per LOGICAL line. Continuations are therefore
+# JOINED before counting, and `grep -c` then gives 4 on this tree and 5 with the conditional nap above.
+_loop_code="$(grep -vE '^[[:space:]]*#' <<<"$_nap_region" | sed -E 's/"[^"]*"//g' \
+  | awk '{ while (sub(/\\[[:space:]]*$/, "")) { if ((getline n) <= 0) break; $0 = $0 " " n } print }')"
+_loop_n="$(grep -cE '(^|[^[:alnum:]_])(fork_free_sleep|sleep)([^[:alnum:]_]|$)' <<<"$_loop_code")"
 ck "every nap path calls stg_nap_mark (${_nap_n} nap_mark sites for ${_loop_n} sleep/fork_free_sleep lines inside the controller loop — a path without one loses prev_wait; loop region ${_region_ok})" \
    "$(if [ "$_region_ok" -eq 1 ] && [ "${_nap_n:-0}" -ge 3 ] && [ "${_nap_n:-0}" -ge "$(( ${_loop_n:-0} - 1 ))" ]; then echo 0; else echo 1; fi)"
+
+# 9.1d-iii-b: THE NON-NAP DECLARATION IS BOUNDED, so it cannot be used to hide a nap. Every arm here
+# reds if the declaration is widened, duplicated or lost — the three ways the exclusion above could
+# become a hole instead of a fact about a subshell backoff.
+# ⛔ AND IT MUST NOT SPAN THE SUBSHELL BOUNDARY (fresh-context review, P2 — measured). The first
+# revision opened the fence BEFORE `if [ -n "$REFRESH_SH" ]; then`, so an outer-shell `sleep` inserted
+# between the fence and `while :; do` sat on the CYCLE path, was excluded from the population, and left
+# all arms GREEN — a real nap hidden by the exemption. So the structure is pinned, not just the counts:
+# the fence contains NO subshell opener and NO closer (it is strictly INTERIOR to the subshell), and the
+# nearest preceding code line is the opener itself. The pair is what makes "not a cycle nap" a
+# statement about the code rather than a label.
+# ⛔ A CLOSER IS ANY LINE THAT BEGINS WITH `)` — NOT TWO SPELLINGS OF IT (fresh-context review, P1,
+# measured). The previous pair anchored on `)^$` and `)&$`, so a closer written `) ;` matched NEITHER,
+# and `_nap_excl_sleeps` only counted lines that BEGIN with `sleep`, so a nap on the same line was
+# invisible too. Measured: inserting the single line `          ) ; sleep 300 ; (` immediately before
+# the END marker closes the subshell INSIDE the fence and runs a real 300 s nap on the CYCLE path —
+# with every arm here byte-identically green (openers=0 closers=0, sleeps=1). That is the round-2 P2
+# defect reintroduced through a spelling the counters could not see, so both are now spelling-agnostic:
+# any line starting with `)` is a closer, and a nap counts anywhere it appears as a COMMAND on a line.
+_nap_beg_n="$(grep -cE '^[[:space:]]*# >>> BEGIN NOT-A-CYCLE-NAP' <<<"$_loop_nap_region")"
+_nap_end_n="$(grep -cE '^[[:space:]]*# <<< END NOT-A-CYCLE-NAP' <<<"$_loop_nap_region")"
+_nap_excl_sleeps="$(grep -cE '(^|[^[:alnum:]_])(fork_free_sleep|sleep)([^[:alnum:]_]|$)' <<<"$_nap_code")"
+_nap_excl_marks="$(grep -cE '(^|[^[:alnum:]_])stg_nap_mark([^[:alnum:]_]|$)' <<<"$_nap_code")"
+_nap_excl_openers="$(grep -cE '(^|[^[:alnum:]_$(])\(' <<<"$_nap_code")"
+_nap_excl_closers="$_nap_closers"
+_nap_prev_code="$(awk '
+  /^[[:space:]]*# >>> BEGIN NOT-A-CYCLE-NAP/ { exit }
+  /^[[:space:]]*$/ { next }
+  /^[[:space:]]*#/ { next }
+  { last=$0 }
+  END { print last }' <<<"$_loop_nap_region")"
+ck "the non-nap declaration is EXACTLY ONE bounded pair inside the loop (begin=${_nap_beg_n}, end=${_nap_end_n} — a lost end excludes the rest of the file)" \
+   "$(if [ "${_nap_beg_n:-0}" -eq 1 ] && [ "${_nap_end_n:-0}" -eq 1 ]; then echo 0; else echo 1; fi)"
+ck "  …and it holds AT MOST ONE sleep line, so a second nap cannot be parked in it (found ${_nap_excl_sleeps})" \
+   "$(if [ "${_nap_excl_sleeps:-9}" -le 1 ]; then echo 0; else echo 1; fi)"
+ck "  …and it holds NO stg_nap_mark, because a marked nap is not what it declares (found ${_nap_excl_marks})" \
+   "$(if [ "${_nap_excl_marks:-9}" -eq 0 ]; then echo 0; else echo 1; fi)"
+ck "  …and it spans NO subshell boundary — no opener and no closer inside it (openers=${_nap_excl_openers}, closers=${_nap_excl_closers})" \
+   "$(if [ "${_nap_excl_openers:-9}" -eq 0 ] && [ "${_nap_excl_closers:-9}" -eq 0 ]; then echo 0; else echo 1; fi)"
+ck "  …and the nearest code line BEFORE it opens that subshell, so the fence is interior to the backgrounded pass ('${_nap_prev_code}')" \
+   "$(if [ "${_nap_prev_code:-x}" = x ]; then echo 1; elif [[ "${_nap_prev_code}" =~ ^[[:space:]]*\(([[:space:]]|$) ]]; then echo 0; else echo 1; fi)"
 
 # 9.1g THE READER REFUSES A GLOB AS A STAGE NAME.
 # ⛔ THESE ARMS PIN THE OBSERVABLE, NOT THE GUARD. The wanted name is validated AND used quoted, so the
