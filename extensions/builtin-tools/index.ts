@@ -5638,11 +5638,11 @@ export function classifyBackgroundOutcome(
   // before its first message carries BOTH, and testing `isError` first recorded it as
   // `reason: "spawn-error"` — which this module documents as "pi never started". A child that ran
   // and died is not a spawn error, and the durable record would name the wrong cause.
-  if (typeof d.status === "string" && FAILED_TASK_STATUS.has(d.status)) {
-    return { status: "failed", exitCode, reason: d.status };
-  }
   if (d.isError === true) {
     return { status: "failed", exitCode, reason: typeof d.reason === "string" ? d.reason : "spawn-error" };
+  }
+  if (typeof d.status === "string" && FAILED_TASK_STATUS.has(d.status)) {
+    return { status: "failed", exitCode, reason: d.status };
   }
   if (typeof exitCode === "number" && exitCode !== 0) {
     return { status: "failed", exitCode, reason: "non-zero-exit" };
