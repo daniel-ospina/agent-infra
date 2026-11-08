@@ -773,6 +773,58 @@ arm_all
 RUN --check
 assert_eq "$RC" 0 "T32 and a supervisor that is enabled+active is green (the row is a gate, not a wall)"
 
+# ── T33: `--status` RENDERS THE BEACON AS A DATE, ON A BOX THAT ONLY HAS THE BSD MECHANISM ─────
+# ⛔ REVIEW P1-3. `conflict-rebase-timer.sh`'s `status` renders the last pass with `$(_iso "$beat")`.
+# The defect that replaced — `date -u -d "@$beat" … || echo '?'`, which prints `-> ?` on every Mac,
+# because `-d` is coreutils and BSD's equivalent is `-r` — could be restored VERBATIM and the suite
+# stayed at 119/0: T8 is the only case that runs the real wrapper and it never invokes `status`, and
+# `conflict-rebase.test.sh` "pins" status with a text grep over the source, which cannot see `_iso` at
+# all. Worse, the portable replacement makes the two arms indistinguishable on a LINUX host, where the
+# GNU arm succeeds — so the pin has to drive the BSD shape explicitly, which is what the stub below is.
+# The contract under test is `_iso`'s own: degrade to the RAW EPOCH when no mechanism can render it,
+# never to `?` — a missing formatter may cost a format, never the datum.
+ISO_EPOCH=1700000000                     # 2023-11-14T22:13:20Z, fixed so the assertion is a constant
+ISO_WANT='2023-11-14T22:13:20Z'
+mkdir -p "$FX/bsd-date" "$FX/no-date" "$FX/iso-state"
+printf '%s\n' "$ISO_EPOCH" >"$FX/iso-state/timer.beat"
+cat >"$FX/bsd-date/date" <<'FAKEDATE'
+#!/usr/bin/env bash
+# A BSD-shaped `date`: `-r <epoch>` exists, `-d @<epoch>` does NOT (that arm is coreutils only), and the
+# clock is pinned. This is how `_iso`'s second mechanism is exercised on a Linux CI host, and it is the
+# shape a Mac actually has.
+# ⛔ NO `sed -i` TO FILL IN THE CLOCK, and no placeholder at all: the heredoc is QUOTED, so the numbers
+# below are literal text, and `sed -i` is exactly the GNU-only in-place form this repo's portability gate
+# refuses (baseline 0 for this file — the first draft of this case took it to 1).
+while [ "${1:-}" = "-u" ]; do shift; done
+case "${1:-}" in
+  -d) exit 1 ;;
+  -r) e="$2"; shift 2
+      case "${1:-}" in
+        +%s) printf '%s\n' "$e" ;;
+        +%Y-%m-%dT%H:%M:%SZ) python3 -c 'import sys,time;print(time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(int(sys.argv[1]))))' "$e" ;;
+        *) exit 1 ;;
+      esac ;;
+  +%s) printf '%s\n' 1700000100 ;;
+  *) exit 1 ;;
+esac
+FAKEDATE
+chmod +x "$FX/bsd-date/date"
+cat >"$FX/no-date/date" <<'NODATE'
+#!/usr/bin/env bash
+# Neither mechanism exists: every rendering arm must FAIL, and the caller must degrade to the datum.
+while [ "${1:-}" = "-u" ]; do shift; done
+case "${1:-}" in +%s) printf '%s\n' 1700000100 ;; *) exit 1 ;; esac
+NODATE
+chmod +x "$FX/no-date/date"
+OUT="$(CONFLICT_REBASE_STATE="$FX/iso-state" PATH="$FX/bsd-date:$PATH" bash "$TIMER" status 2>&1)"; RC=$?
+assert_eq "$RC" 0 "T33 --status runs against a fixture state dir (rc 0)"
+assert_contains "$OUT" "-> $ISO_WANT" "T33 the beacon is RENDERED through the BSD arm (-r), not left as an epoch and not '?'"
+assert_absent   "$OUT" '-> ?' "T33 and never the '?' the old fallback printed on every Mac"
+OUT="$(CONFLICT_REBASE_STATE="$FX/iso-state" PATH="$FX/no-date:$PATH" bash "$TIMER" status 2>&1)"; RC=$?
+assert_eq "$RC" 0 "T33 --status still exits 0 when NO date mechanism works (a format is not the datum)"
+assert_contains "$OUT" "-> $ISO_EPOCH" "T33 with no mechanism at all it degrades to the RAW EPOCH — never to '?' and never to silence"
+assert_absent   "$OUT" '-> ?' "T33 and the degraded form is the datum, not the question mark"
+
 echo "activate-harness.test.sh — passed=$PASS failed=$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1
 exit 0

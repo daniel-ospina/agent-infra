@@ -319,7 +319,16 @@ refuse_bad_target() {
             *\\*) err "REFUSING: ${v%%=*} contains a backslash — the artifact is rendered with sed, where a backslash is an escape, so the rendered path would silently differ from the real one"; return 1 ;;
         esac
     done
-    if [ "${TARGET:-}" != "launchd" ]; then
+    # ⛔ KEY THE SYSTEMD EXEMPTION ON THE PLATFORM, NOT ON `TARGET` (review P2-5). `TARGET` is assigned
+    # by `choose_target` ALONE, and `do_install_launchd` calls THIS function before ever calling it — so
+    # in the one path this exemption exists for, `TARGET` was empty, `${TARGET:-}` was not `launchd`, the
+    # guard was ALWAYS true, and a Darwin install was refused over systemd's whitespace rules while the
+    # message named systemd. Measured before the fix: `HOME="/tmp/sp ace" ELDATO_PLATFORM=Darwin …
+    # --dry-run` -> `REFUSING: HOME contains whitespace — systemd splits the rendered unit on it`, rc 1.
+    # A plist `<string>` may legitimately carry a space, so that threw away a configuration that works,
+    # on the exact platform the exemption was written for. `PLATFORM` is resolved from `uname -s` (with
+    # ELDATO_PLATFORM as the test seam) before any verb runs, so it is the fact this guard wants.
+    if [ "${PLATFORM:-}" != "Darwin" ]; then
         for v in "HOME=$HOME" "PATH=$PATH" "STATE=$STATE" "TIMER=$TIMER" "CHECKOUT=$CHECKOUT" "REPO=$REPO"; do
             case "${v#*=}" in
                 *[[:space:]]*) err "REFUSING: ${v%%=*} contains whitespace — systemd splits the rendered unit on it, so it would never run"; return 1 ;;
@@ -434,6 +443,17 @@ do_install_launchd() {
     local src="$LAUNCHD_TEMPLATES_DIR/$LABEL.plist" tmpd changed=0
     [ -f "$src" ] || { err "plist template missing: $src"; return 1; }
     refuse_bad_target || return 1
+    # ⛔ THE LAUNCHD TARGET DIRECTORY IS NOT RESOLVED FOR US — AND IT WAS EMPTY. `choose_target` is what
+    # assigns TARGET/UNIT_DIR/SC, and this path calls `refuse_bad_target` BEFORE it on purpose (a refusal
+    # must precede any scheduler probe). So at this point UNIT_DIR and SC were both empty: `mkdir -p ""`
+    # failed with `cannot create ''`, and the macOS install could NEVER complete. `--dry-run` returns above
+    # the mkdir, which is exactly why a review that exercised only the dry-run render did not see it —
+    # MEASURED on this suite's own fixture: the first real `--install` printed `mkdir: cannot create
+    # directory ''` and exited 1. do_status and do_uninstall already set these three explicitly for
+    # Darwin; the install path is the one that did not, and nothing ever ran it (review P1-2).
+    TARGET="launchd"
+    UNIT_DIR="${LAUNCHD_AGENTS_DIR:-${HOME:?HOME is required}/Library/LaunchAgents}"
+    SC="${LAUNCHCTL:-launchctl}"
     resolve_launcher || return 1
     tmpd="$(mktemp -d "${TMPDIR:-/tmp}/conflict-rebase-plist.XXXXXX")" || { err "cannot create a temp dir"; return 1; }
     render "$src" "$tmpd/$LABEL.plist" || { rm -rf "$tmpd"; return 1; }
@@ -551,9 +571,15 @@ do_uninstall() {
     else
         if choose_target >/dev/null 2>&1; then :; else SC="${SYSTEMCTL:-systemctl}"; fi
         $SC disable --now "$UNIT_NAME.timer" >/dev/null 2>&1 || true
+        # ⛔ THE REMOVAL FOLLOWS THE TARGET THE INSTALL WROTE TO. `SYSTEMD_UNIT_DIR` is a documented
+        # override seam, and without this arm an override install was "uninstalled" by deleting
+        # /etc/systemd/system — files it had never written — while the override copies stayed in place,
+        # armed and firing: the installer printed `uninstalled`, and the unit was still there (a false
+        # PASS, measured by this suite's T9 before the arm existed).
         case "$TARGET" in
-            user) rm -f "$HOME/.config/systemd/user/$UNIT_NAME.service" "$HOME/.config/systemd/user/$UNIT_NAME.timer" ;;
-            *)    ${SUDO-sudo -n} rm -f "/etc/systemd/system/$UNIT_NAME.service" "/etc/systemd/system/$UNIT_NAME.timer" ;;
+            override) rm -f "$UNIT_DIR/$UNIT_NAME.service" "$UNIT_DIR/$UNIT_NAME.timer" || rc=1 ;;
+            user) rm -f "$HOME/.config/systemd/user/$UNIT_NAME.service" "$HOME/.config/systemd/user/$UNIT_NAME.timer" || rc=1 ;;
+            *)    ${SUDO-sudo -n} rm -f "/etc/systemd/system/$UNIT_NAME.service" "/etc/systemd/system/$UNIT_NAME.timer" || rc=1 ;;
         esac
         $SC daemon-reload >/dev/null 2>&1 || true
         log_line "uninstalled: $UNIT_NAME.{service,timer} (state and beacon left in place: $STATE)"

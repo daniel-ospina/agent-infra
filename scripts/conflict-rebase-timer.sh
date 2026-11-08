@@ -93,6 +93,7 @@ BOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/conflict-rebase.py"
 # uses is the two-paths-that-look-alike defect the harness keeps removing — and a `pause` written to
 # the exported path would not have been seen by the pass that reads this one.
 STATE="${CONFLICT_REBASE_STATE:-${HOME}/.pi/agent/state/conflict-rebase}"
+DEFAULT_STATE="${HOME}/.pi/agent/state/conflict-rebase"
 PIDFILE="$STATE/timer.pid"
 BEACON="$STATE/timer.beat"
 LOG="$STATE/timer.log"
@@ -100,6 +101,87 @@ INTERVAL="${CONFLICT_REBASE_INTERVAL_S:-1800}"
 MAXPRS="${CONFLICT_REBASE_MAX:-3}"
 REPO="${CONFLICT_REBASE_REPO:-daniel-ospina/agent-infra}"
 mkdir -p "$STATE"
+
+# ⛔ THE BRAKE AND `status` MUST READ THE DIRECTORY THE **SCHEDULED PASS** READS (review P1-4).
+# `STATE` above resolves from the OPERATOR'S ambient shell. The scheduled pass does not: the systemd unit
+# ships `Environment=CONFLICT_REBASE_STATE={{STATE}}` and the plist carries the same key, so the timer's
+# tick reads the INSTALLED directory while `pause` wrote the ambient one. On any box installed with a
+# non-default `CONFLICT_REBASE_STATE` (a seam the installer advertises and renders) those two differ, and
+# the failure is silent in the worst way: `pause` printed `paused`, the brake file landed where nothing
+# looks, the pass kept rebasing and PUSHING, and `status` read `PAUSED (brake file present)` while
+# `activate-harness.sh --check` — which reads the unit's Environment — said the row was not paused. One
+# brake, two answers, and the operator held the wrong one.
+#
+# So the brake verbs resolve the state dir the way the SCHEDULED pass does: the installed unit's
+# Environment first, then the installed plist, then the ambient value, then the default. Two further
+# rules turn a silent no-op into a loud refusal:
+#   * the resolved path and HOW it was resolved are printed, so an operator can see which directory the
+#     brake landed in without reading the unit by hand;
+#   * an ambient value that DISAGREES with an installed one is refused (rc 2) rather than written — that
+#     divergence is exactly the state that produced the silent no-op, and it is cheap to answer.
+# The scheduled pass is deliberately NOT re-resolved here: when the timer fires, the scheduler has
+# already exported the unit's value, and overriding it from a second source is the bug, not the fix.
+state_from_systemd() { # -> the installed unit's CONFLICT_REBASE_STATE, or nothing
+  local sc="${CONFLICT_REBASE_SYSTEMCTL:-systemctl}" line="" tok=""
+  # `${sc%% *}` so a `sudo -n systemctl` style seam is still probed on its first word.
+  command -v "${sc%% *}" >/dev/null 2>&1 || return 0
+  # ⛔ NO PIPE HERE AT ALL. `systemctl show -p Environment` prints `Environment=A=1 B=2` — so the prefix
+  # has to come off before the key can match — and a `| head -1` (the obvious way to take one token)
+  # gives the producer a SIGPIPE under `set -o pipefail`, which made `|| out=""` discard a value it had
+  # just read correctly. That empty answer is indistinguishable from "the unit declares nothing", i.e.
+  # it would silently disarm the divergence guard below. Split in the shell instead.
+  line="$($sc show -p Environment eldato-conflict-rebase.service 2>/dev/null)" || line=""
+  line="${line#Environment=}"
+  for tok in $line; do
+    case "$tok" in
+      CONFLICT_REBASE_STATE=?*) printf '%s\n' "${tok#CONFLICT_REBASE_STATE=}"; return 0 ;;
+    esac
+  done
+  return 0
+}
+state_from_plist() { # -> the installed LaunchAgent's CONFLICT_REBASE_STATE, or nothing
+  local p="${CONFLICT_REBASE_PLIST:-${HOME}/Library/LaunchAgents/com.eldato.conflict-rebase.plist}"
+  local py="${CONFLICT_REBASE_PYTHON:-python3}"
+  [ -f "$p" ] || return 0
+  command -v "$py" >/dev/null 2>&1 || return 0
+  "$py" - "$p" <<'PY' 2>/dev/null
+import sys, plistlib
+try:
+    d = plistlib.load(open(sys.argv[1], "rb"))
+except Exception:
+    sys.exit(0)
+v = (d.get("EnvironmentVariables") or {}).get("CONFLICT_REBASE_STATE")
+if isinstance(v, str) and v:
+    print(v)
+PY
+}
+BRAKE_SRC="the default (no installed unit or plist declares CONFLICT_REBASE_STATE)"
+resolve_brake_state() {
+  local ambient="${CONFLICT_REBASE_STATE:-}" inst="" src=""
+  inst="$(state_from_systemd)"
+  if [ -n "$inst" ]; then
+    src="the installed systemd unit eldato-conflict-rebase.service"
+  else
+    inst="$(state_from_plist)"
+    [ -n "$inst" ] && src="the installed LaunchAgent ${CONFLICT_REBASE_PLIST:-$HOME/Library/LaunchAgents/com.eldato.conflict-rebase.plist}"
+  fi
+  if [ -n "$ambient" ] && [ -n "$inst" ] && [ "$ambient" != "$inst" ]; then
+    printf 'conflict-rebase-timer: REFUSING — CONFLICT_REBASE_STATE=%s in this shell, but %s exports %s.\n' "$ambient" "$src" "$inst" >&2
+    printf '  The scheduled pass reads the INSTALLED directory, so a brake written to the ambient one is a no-op that prints success.\n' >&2
+    printf '  Re-run with CONFLICT_REBASE_STATE=%s (or unset it) and the brake lands where the pass looks.\n' "$inst" >&2
+    return 2
+  fi
+  if [ -n "$inst" ]; then
+    STATE="$inst"; BRAKE_SRC="$src"
+  elif [ -n "$ambient" ]; then
+    STATE="$ambient"; BRAKE_SRC="CONFLICT_REBASE_STATE in this shell (no installed unit or plist declares one)"
+  else
+    STATE="$DEFAULT_STATE"
+  fi
+  PIDFILE="$STATE/timer.pid"; BEACON="$STATE/timer.beat"; LOG="$STATE/timer.log"
+  mkdir -p "$STATE" 2>/dev/null || true
+  return 0
+}
 
 pass() {
   # ⛔ THE LANE-HOLD SURFACE NEEDS A CHECKOUT. Without one the bot cannot see
@@ -133,6 +215,12 @@ pass() {
   date +%s >"$BEACON"
   return "$rc"
 }
+
+# ⛔ THE BRAKE VERBS RESOLVE THE INSTALLED STATE DIR BEFORE ANYTHING READS OR WRITES ONE (review P1-4).
+# One place, so `status`, `pause` and `resume` cannot drift into three answers about one directory.
+case "${1:-}" in
+  status|pause|resume) resolve_brake_state || exit $? ;;
+esac
 
 case "${1:-}" in
   start)
@@ -195,6 +283,7 @@ case "${1:-}" in
       echo "last pass: never"
     fi
     [ -f "$STATE/PAUSED" ] && echo "PAUSED (brake file present)" || echo "not paused"
+    echo "state dir: $STATE (from $BRAKE_SRC)"
     if [ -f "$STATE/last-failure" ]; then
       echo "LAST PASS FAILED: $(cat "$STATE/last-failure")"
     else
@@ -205,7 +294,7 @@ case "${1:-}" in
     if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null; then
       kill "$(cat "$PIDFILE")" && rm -f "$PIDFILE" && echo "stopped"; else echo "not running"; fi
     ;;
-  pause)  : >"$STATE/PAUSED"; echo "paused (the bot itself refuses to act while $STATE/PAUSED exists)" ;;
-  resume) rm -f "$STATE/PAUSED"; echo "resumed" ;;
+  pause)  : >"$STATE/PAUSED"; echo "paused ($STATE/PAUSED, state dir from $BRAKE_SRC)" ;;
+  resume) rm -f "$STATE/PAUSED"; echo "resumed ($STATE/PAUSED removed, state dir from $BRAKE_SRC)" ;;
   *) sed -n '2,40p' "$SELF" | sed 's/^# \{0,1\}//'; exit 2 ;;
 esac
