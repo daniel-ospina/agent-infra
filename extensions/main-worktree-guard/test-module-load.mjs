@@ -1056,7 +1056,7 @@ process.stdout.write(JSON.stringify({ warns, notified, registered: !!start }) + 
 
   // Hermetic HOME per arm: the gate event lands in $HOME/.pi/agent/audit/
   // gate-events.jsonl, so each arm reads only the row it caused.
-  const runArm = ({ printMode = false, injectFailure = true } = {}) => {
+  const runArm = ({ printMode = false, injectFailure = true, allowMainEdits = false } = {}) => {
     const home = realpathSync(mkdtempSync(join(tmpdir(), "guard-degraded-home-")));
     const env = { ...process.env, HOME: home };
     // isPrintMode() reads env.PI_MODE first; argv here carries no -p/--print.
@@ -1064,6 +1064,10 @@ process.stdout.write(JSON.stringify({ warns, notified, registered: !!start }) + 
     if (injectFailure) env.PROBE_FAIL_CLASSIFY = "1"; else delete env.PROBE_FAIL_CLASSIFY;
     delete env.AGENT_ALLOW_MAIN_EDITS;
     delete env.ELDATO_ALLOW_MAIN_EDITS;
+    // C12's arm: the escape hatch ON, which is the state `session_start` returns
+    // early from (`index.ts:5164`). Kept as an ENV seam rather than a ctx stub so
+    // the arm exercises the real `_isAllowMainEdits()` the handler consults.
+    if (allowMainEdits) env.AGENT_ALLOW_MAIN_EDITS = "1";
     const out = spawnSync(process.execPath, ["--input-type=module", "-e", probe], {
       env, encoding: "utf8", timeout: 120_000, cwd: HERE,
     });
@@ -1150,6 +1154,35 @@ process.stdout.write(JSON.stringify({ warns, notified, registered: !!start }) + 
     !!healthy.parsed &&
       (healthy.parsed.warns ?? []).every((w) => !/classify-git\.mjs failed to load/.test(w)),
     `captured: ${JSON.stringify(healthy.parsed?.warns ?? []).slice(0, 300)}`);
+
+  // ── The PLACEMENT arm. The report is the FIRST statement of `session_start`
+  // specifically so it cannot sit behind an early return — and the early return
+  // that matters most is the ESCAPE HATCH: `if (_isAllowMainEdits()) return;`
+  // (`index.ts:5164`) is the natural place a later "don't nag a deliberate solo
+  // session" refactor would move it under. Without this arm the ordering is
+  // proven only by reading the source, and moving the call reddens nothing —
+  // which is the same silent-loss class #853 exists to close, one level down.
+  const hatched = runArm({ printMode: false, allowMainEdits: true });
+  expectTrue("C12: the degraded report is NOT behind the escape hatch — a hatched session still gets the banner + the event",
+    !!hatched.parsed &&
+      (hatched.parsed.warns ?? []).some((w) => w.includes("MAIN-WORKTREE GUARD — DEGRADED")) &&
+      hatched.auditRows.filter((r) => r.event === "guard_degraded").length === 1,
+    `parsed=${JSON.stringify(hatched.parsed ?? null).slice(0, 300)} audit=${JSON.stringify(hatched.auditRows).slice(0, 200)} stderr=${hatched.stderr}`);
+  expectTrue("C12b: the hatched arm really is hatched AND the call sits ABOVE the hatch return (source-order pin)",
+    // C12 alone is only conclusive if the hatch was genuinely ON — otherwise it is
+    // indistinguishable from the non-hatched arms. Reading the env back would just
+    // restate `_isAllowMainEdits()` (`index.ts:506` = `_getEnv("ALLOW_MAIN_EDITS") === "1"`),
+    // so the non-vacuous half is a SOURCE-ORDER pin: the report call must precede the
+    // `if (_isAllowMainEdits()) return;` inside the registered `session_start` handler.
+    (() => {
+      const src = readFileSync(INDEX_TS, "utf8");
+      const handlerAt = src.indexOf('pi.on("session_start"');
+      if (handlerAt < 0) return false;
+      const callAt = src.indexOf("_reportClassifierDegradation(ctx", handlerAt);
+      const hatchAt = src.indexOf("if (_isAllowMainEdits()) return;", handlerAt);
+      return callAt > handlerAt && hatchAt > handlerAt && callAt < hatchAt;
+    })(),
+    `handler=${INDEX_TS}: pi.on("session_start") / _reportClassifierDegradation / _isAllowMainEdits order — the report must come FIRST, before the escape-hatch return`);
 }
 
 await partC();

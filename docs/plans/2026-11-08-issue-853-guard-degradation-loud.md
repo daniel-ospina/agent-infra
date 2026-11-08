@@ -57,12 +57,16 @@ statement of the registered `session_start` handler:
    exactly what nothing reads.
 3. **A durable `guard_degraded` event** in `~/.pi/agent/audit/gate-events.jsonl`
    (`extension`, `reason`, `error`, `session_cwd`, `ts`), and `"guard_degraded"` added to the
-   `GateEventName` union in `extensions/shared/audit-log.ts` so a reader type-checks against it.
+   `GateEventName` union in `extensions/shared/audit-log.ts` so a report matches on a recorded name
+   rather than a free string. ⛔ That union is DOCUMENTATION, not enforcement: `appendJsonl` takes an
+   unconstrained `event` and no tsconfig covers `extensions/`, so removing the member reddens nothing.
 
 Properties that make it safe:
 
 - **Placed before every early return** in `session_start` — a degradation report that sat behind the
-  escape-hatch return would be silent on the sessions that need it most.
+  escape-hatch return would be silent on the sessions that need it most. Pinned by **C12** (a hatched
+  arm still gets the banner + the row) and **C12b** (source-order: the call precedes
+  `if (_isAllowMainEdits()) return;`).
 - **Once per session process** (`_classifierDegradedPids`), so `/resume` cannot spam the banner or
   duplicate the audit row.
 - **Never throws** — the whole report is wrapped: a report that throws would change a verdict.
@@ -74,13 +78,13 @@ Properties that make it safe:
 | Thing | Call site / importer / consumer | What it does there |
 |---|---|---|
 | `_reportClassifierDegradation` | `extensions/main-worktree-guard/index.ts:5129` — the only caller, first statement of `pi.on("session_start")` | turns the degraded state into the banner + notify + event |
-| `_classifierLoadFailure` | written in the classify-git load `catch` (`index.ts:394-399`); read only by `_reportClassifierDegradation` | carries the real load error into the banner and the event's `error` field |
+| `_classifierLoadFailure` | written in the classify-git load `catch` (`index.ts:399-404`, the write at `:402`); read only by `_reportClassifierDegradation` | carries the real load error into the banner and the event's `error` field |
 | `_classifierDegradedPids` | read+written only inside `_reportClassifierDegradation` | once-per-session-process dedupe (mirrors the existing pid-keyed `warnedDeviations`) |
-| `appendJsonl` (`extensions/shared/audit-log.ts`) | imported at `index.ts:147`; existing callers `:531`, `:4086`, `:4703`, `:5272`; new caller in `_reportClassifierDegradation` | appends one JSONL row to `~/.pi/agent/audit/gate-events.jsonl`; already fail-safe (never throws) |
-| `GateEventName` (`extensions/shared/audit-log.ts:40-64`) | every reader of `gate-events.jsonl`; `extensions/shared/audit-log.test.ts` | the union a report type-checks against; `"guard_degraded"` added, with a comment naming the failure mode |
+| `appendJsonl` (`extensions/shared/audit-log.ts`) | imported at `index.ts:147`; existing callers `:539`, `:4094`, `:4711`, `:5347`; new caller in `_reportClassifierDegradation` (`:5110`) | appends one JSONL row to `~/.pi/agent/audit/gate-events.jsonl`; already fail-safe (never throws) |
+| `GateEventName` (`extensions/shared/audit-log.ts:40-63`) | the shape a report/replay MATCHES ON; `extensions/shared/audit-log.test.ts` | `"guard_degraded"` added, with a comment naming the failure mode. ⛔ DOCUMENTATION ONLY: `appendJsonl(entry: Record<string, unknown>)` (`audit-log.ts:72`) takes an unconstrained `event` string and no tsconfig covers `extensions/` (extensions are type-stripped, never typechecked), so nothing ENFORCES the union — deleting the member reddens no suite. The member is the recorded name, not a gate. |
 | `isPrintMode()` (`extensions/shared/print-mode.ts`) | already imported at `index.ts:146`; new call site in `_reportClassifierDegradation` | suppresses the `ui.notify` arm for headless lanes, which get the banner in their own log |
 | `module-load-hooks.mjs` (`resolve`/`load`) | imported by `test-module-load.mjs` Part B (in-process) and by the new Part C probe (child process) | Part C wraps `load` to make `classify-git.mjs` throw while evaluating — the ONE injection |
-| `test-module-load.mjs` | `ci.yml:980` (per-PR `verify` job) and `ci-main.yml:157` (post-merge `extensions/*/test*.mjs` glob) | Part C runs on the PR lane, so the report is proved before a merge; no new CI step or file registration needed |
+| `test-module-load.mjs` | `ci.yml:980` (per-PR `verify` job) and `ci-main.yml:158` (post-merge `extensions/*/test*.mjs` glob) | Part C runs on the PR lane, so the report is proved before a merge; no new CI step or file registration needed |
 
 ## Implementation steps (built — each with the test that proves it)
 
@@ -88,11 +92,16 @@ Properties that make it safe:
 2. `index.ts` — record the load failure in the `catch`; add `_reportClassifierDegradation`; wire it as
    the first `session_start` statement → `test-module-load.mjs` **C1-C6** (banner content, cause,
    remedy, dedupe, notify level) and **C7-C8** (event row + attribution).
-3. `test-module-load.mjs` — Part C child-process probe, three arms (interactive-degraded,
-   print-mode-degraded, healthy control) → **C9** (print mode keeps banner + event, no notify),
-   **C11/C11b** (a healthy load reports nothing and really loaded the classifier).
-4. Mutation proof → delete the `session_start` wiring: **9 red** (C1-C9). Delete only the `appendJsonl`
-   block: **3 red** (C7-C9). Both restored.
+3. `test-module-load.mjs` — Part C child-process probe, four arms (interactive-degraded,
+   print-mode-degraded, healthy control, escape-hatch-on) → **C9** (print mode keeps banner + event,
+   no notify), **C11/C11b** (a healthy load reports nothing and really loaded the classifier),
+   **C12/C12b** (the report is NOT behind the escape-hatch return — behaviourally, plus a
+   source-order pin so a later refactor cannot silently move it under the hatch).
+4. Mutation proof — every arm must be able to go RED, or it is a pin that cannot fail:
+   - delete the `session_start` wiring → **9 red** (C1-C9);
+   - delete only the `appendJsonl` block → **3 red** (C7-C9);
+   - move the call BELOW `if (_isAllowMainEdits()) return;` → **12 red** (C1-C9, C12, C12b).
+   All three restored.
 
 ## Out of scope — must NOT be raised
 
