@@ -92,21 +92,52 @@ so the launch behind them produced **no finding at all** — which is not "allow
 the handler returns early on an empty list, so R1 did not record it either and the
 diagnosis half of #2249 vanished with the block.
 
-**A package-runner anywhere in the segment is a launch shape.** The table above
+**A nested EXEC-style runner's payload is a launch shape.** The table above
 cannot close that class — there is no command database, so a wrapper word it has
 never heard of is unrecognisable as a wrapper — but a runner does not need to be
-recognised: `npm exec`/`npx`/`pnpm dlx`/`yarn exec` is itself the announcement that
-the next word is a program, and it reads the same behind ANY prefix. So
-`xvfb-run -a npm exec electron .`, `strace -f npm exec electron .` and
-`eatmydata npm exec electron .` are classified without naming `xvfb-run`,
-`strace` or `eatmydata` anywhere (L19h/L19i name no wrapper at all).
+recognised: `npm exec`/`npx`/`pnpm dlx`/`yarn exec`/`bun x`/`mise exec`/`asdf exec`
+is itself the announcement that the next word is a program, and it reads the same
+behind ANY prefix. So `xvfb-run -a npm exec electron .`, `strace -f npm exec
+electron .` and `eatmydata npm exec electron .` are classified without naming
+`xvfb-run`, `strace` or `eatmydata` anywhere (L19h/L19i name no wrapper at all),
+and `bun x electron .` — `bunx`'s own alias — is classified exactly like
+`bunx electron .` (L24a). The **exec verb** is what makes it a launch shape, not
+the runner's name: a runner that is only *installing* (`sudo npm install electron
+-D`, `bun install electron`) or running a script is not launching anything, so it
+stays clean (A13, A36, A41). Reading the runner NAME alone refused both
+(`review cycle 6/7, P2-5`).
+
+**A version pin is a lexical suffix, not another program.** `npx electron@30 .`,
+`npm exec electron@latest -- .` and `npx playwright@1.50.0 --headed` are the same
+launch as their unpinned spellings, so the payload is compared by its **package
+name** (`packageBaseName`), not verbatim. All three were `[]` — no block, no
+ledger row — because the token was matched against `electron`/`LAUNCH_WORDS`
+literally (`round 7, P1-2`, rows L24e–L24g). This is the "two spellings of one
+flag must not disagree" rule applied to the payload instead of the flag.
 
 **Two spellings of one flag must not disagree.** Every value-taking option is
 closed in both spellings (`--user` as well as `-u`, `--signal=` as well as `-s`,
 `--prefix` as well as `-p`), `--flag=value` is treated as self-contained, and a
-fail-safe word scan covers a flag nobody has seen yet — restricted to a segment
-that began with a prefix word or an *exec*-style runner, so `rg electron .` and
-`npm install electron` (an install, not a launch) stay clean.
+fail-safe word scan covers a flag nobody has seen yet. That scan is gated on the
+prefix having **skipped at least one flag**, or on the command word itself
+resolving a runner in EXEC position — the two shapes where a wrapper's grammar can
+have swallowed the command word. With no flag between the prefix and the command
+word nothing could have been swallowed, so `rg electron .`, `sudo rg electron .`,
+`timeout 30 rg electron .`, `timeout 60 grep -rn electron src/` and `npm install
+electron` (an install, not a launch) stay clean. Before that gate, the rescue
+picked up **any** later word spelled `electron` and refused a search run under
+`sudo`/`timeout` — the documented reassurance was true only for the unprefixed
+spelling (`round 7, P2-5`, rows A38–A41).
+
+**An argument that EXECUTES is re-read, whoever declared it a value.** `env -S
+"<cmd>"` / `env --split-string=<cmd>`, `npm exec -c "<cmd>"` and `npx -c "<cmd>"`
+are command strings in argv, so they go to `COMMAND_STRING_FLAGS` — the same table
+`flock -c`/`script -c`/`su -c` already use — instead of being consumed as ordinary
+values. `env -S` was in the value-flag table and absent from the command-string
+table, i.e. two tables disagreed about the same flag; the runner family's
+`-c/--call` had no row anywhere. All were `[]`, and the wrapper is looked for at
+**any** position, not only token 0 (`sudo env -S "<cmd>"` consumes its whole
+segment) — `round 7, P1-3`, rows L25a–L25f, with A34/A35 as the benign twins.
 
 **A standalone shell operator is SEPARATION, not a command word.** `( electron .
 &)`, `{ electron . ; }` and `! electron .` are the spaced spellings of the shape
@@ -126,6 +157,27 @@ the separated form reads, so a wrapper added later gets both spellings at once.
 rule: **not** refused (a named app is recorded, `media: false`), but not recorded
 either — which lost R1, the diagnosis half of #2249 (`review cycle 5, F1`, rows
 L21a–L21h).
+
+**`open`'s argument goes to an OPTION LETTER, and a plain word is never a flag.**
+`-a<app>`, `-na <name>`, `-bna <id>` are spellings of the same option: a cluster
+is a thing for `open` (`open -na "Google Chrome"` is `-n -a`, getopt clustering,
+the documented "named app, new instance" idiom), every letter before the option
+letter is a bare flag, and everything after it is the argument — or the next word
+when nothing follows. The predicate is `clusterShortArg`, the same shape
+`attachedShortArg` uses for the shells. Two defects lived in the previous inline
+copy, in opposite directions (`round 7, P1-1 and P2-4`):
+
+- it never checked that the token **starts with `-`**, so any bare `<Name>.app`
+  whose **second letter** is `a`/`b` was read as an attached flag — `open
+  Banjo.app` and `open Safari.app` became `media: false`/`decision: "record"` and
+  were **allowed**, i.e. a FALSE PASS on the incident's own `open <bundle>` shape
+  downgraded by a letter of the app's name, with a mangled identity (`njo.app`) in
+  the ledger row. L9d/L9e were green only because their app names spell the second
+  letter differently; L23a–L23c now pin both spellings;
+- it required the option letter to be the **first** one, so `open -na <name>` was
+  `[]` — no ledger row for the canonical idiom, R1's half of #2249 lost — while
+  `open -bna com.x` recorded `app: "na"`. L23d/L23e pin the cluster and its
+  identity.
 
 **A `<<` inside a comment is DATA.** The heredoc scanner reads raw lines with the
 quote model, and `#` is not a quote character — so a comment merely *mentioning*
@@ -169,10 +221,14 @@ This is a residual list, not a completeness claim:
   command database, so widening further would refuse the search. The list is
   deliberate and finite; adding one is a one-word edit. (`xvfb-run` USED to be the
   example here and no longer is: it is in the list, pinned green as L19d.)
-- **Over-fire, declared**: because a runner anywhere in the segment counts, an
-  UNQUOTED line that merely *prints* a runner launch — `echo npm exec electron .` —
-  is refused. Quoting it (`echo "npm exec electron ."`) is the workaround, and
+- **Over-fire, declared**: a runner in EXEC position with a flag the table does
+  not know, or a prefix that skipped a **flag**, can still rescue a later word
+  spelled `electron` — so `sudo -n rg electron .` and an UNQUOTED line that merely
+  *prints* a runner launch (`echo npm exec electron .`) are refused. Quoting the
+  line (`echo "npm exec electron ."`) is the workaround, and
   `GUI_DEVICE_GUARD_ALLOW_MEDIA=1` waives one run. A miss is not waivable; this is.
+  The unprefixed or flag-free spelling of a search is NOT affected
+  (`sudo rg electron .`, `timeout 30 rg electron .` — A38–A40).
 - A launch built from a shell variable (`APP=Electron; open -a "$APP"`) is
   recorded with the unexpanded name — the shape is kept, the string is not.
 - A process started by anything that is not `pi` (`cron`, systemd, a human
@@ -186,7 +242,7 @@ This is a residual list, not a completeness claim:
 ## Tests
 
 ```bash
-node extensions/gui-device-guard/test.mjs                    # 146 assertions, threat table L1–L22 + handler H1–H14
+node extensions/gui-device-guard/test.mjs                    # 177 assertions, threat table L1–L25 + handler H1–H14
 node extensions/gui-device-guard/test.mjs --classify 'npm exec electron .'
 ```
 
@@ -203,7 +259,13 @@ comment stripper removed reds **1** (L11d); the fail-safe word scan removed reds
 switches on an `open` line reds **3** (L18b + H3b/H3c); refusing to normalise an
 ATTACHED short-option argument reds **8** (L21a–L21f, H13, H13a); removing the
 `open -a<name>` attached branch reds **3** (L21g, L21h, H13b); reading a commented
-`<<` as a heredoc again reds **4** (L22a, L22b, H14, H14a).
+`<<` as a heredoc again reds **4** (L22a, L22b, H14, H14a); dropping the `-` guard
+from the `open` option predicate reds **3** (L23a, L23b + the identity rows);
+refusing a getopt CLUSTER reds **2** (L23d, L23e); reading a runner's payload
+verbatim instead of by package name reds **3** (L24e–L24g); removing `bun` from the
+runner set reds **2** (L24a, L24b); dropping the `env -S`/runner `-c` command-string
+rows reds **6** (L25a–L25f); ungating the fail-safe word scan from `sawFlag` reds
+**4** (A38–A41).
 
 ⛔ Deleting the `if (cwi < 0) continue;` guard does not print a red row — it makes
 the SUITE CRASH (`Cannot read properties of undefined`, from `basename(toks[-1])`),

@@ -210,11 +210,24 @@ const PREFIX_VALUE_FLAGS: Record<string, string[]> = {
  * Flags whose ARGUMENT is a COMMAND STRING (the shell's `-c`, `flock -c`,
  * `script -c`). The parser used to special-case `bash -c` only; a `flock … -c
  * "npm exec electron ."` was therefore invisible (review cycle 3, F1).
+ *
+ * ⛔ AN ARGUMENT THAT EXECUTES IS RE-READ, WHOEVER DECLARED IT A VALUE
+ * (review cycle 6 F4 / round 7 P1-3). `env` is in `PREFIXES` and `-S` is in
+ * `PREFIX_VALUE_FLAGS` — the prefix loop consumed the split string as an ordinary
+ * VALUE and never looked at it, so `env -S "npm exec electron ."` was `[]`: no
+ * block AND no ledger row. The two tables disagreed about the same flag, one
+ * knowing it takes a value and the other not knowing that the value RUNS. The
+ * runner family's `-c/--call` (`npm exec -c`, `npx -c`) is the same mechanism
+ * (`afterRunner` skips an unrecognised runner flag as a boolean), so it belongs
+ * in the same table rather than in a second branch.
  */
 const COMMAND_STRING_FLAGS: Record<string, string[]> = {
   bash: ["-c"], sh: ["-c"], zsh: ["-c"], dash: ["-c"], ksh: ["-c"], ash: ["-c"],
   busybox: ["-c"], flock: ["-c", "--command"], script: ["-c", "--command"],
   su: ["-c", "--command", "--session-command"], runuser: ["-c", "--command"],
+  env: ["-S", "--split-string"],
+  npm: ["-c", "--call"], npx: ["-c", "--call"],
+  pnpm: ["-c", "--call"], yarn: ["-c", "--call"],
 };
 
 /**
@@ -241,8 +254,20 @@ const TIMEOUT_DURATION = /^\d+(\.\d+)?[smhd]?$/;
  */
 const TRANSPARENT = new Set(["{", "}", "(", ")", "then", "do", "done", "fi", "else", "elif", "if", "while"]);
 
-/** Package-runners whose first PACKAGE argument is the thing being launched. */
-const RUNNERS = new Set(["npx", "npm", "pnpm", "yarn", "bunx"]);
+/**
+ * Package-runners whose first PACKAGE argument is the thing being launched.
+ *
+ * ⛔ A RUNNER'S ALIAS IS THE SAME RUNNER (review cycle 6 F3 / round 7 P1-2).
+ * `bunx` was listed and `bun x` was not, so `bun x electron .` was `[]` — no
+ * refusal, no ledger row — while Bun's own documentation says *"bunx is an alias
+ * for bun x"* (`https://bun.com/docs/cli/bunx`). `EXEC_VERBS` already carried `x`,
+ * so the table already intended to cover it. `mise exec -- <cmd>` and
+ * `asdf exec <cmd>` are the same shape in the version-manager family; the
+ * structural rule in `classifyLaunchCommand` reads an exec-verb payload behind ANY
+ * of these, so a runner the table has not heard of degrades to an over-fire at
+ * worst, never to a `[]`.
+ */
+const RUNNERS = new Set(["npx", "npm", "pnpm", "yarn", "bunx", "bun", "mise", "asdf"]);
 
 /**
  * The runner verbs that EXECUTE a payload (`npx foo`, `npm exec foo`,
@@ -514,6 +539,25 @@ function basename(p: string): string {
 }
 
 /**
+ * The PACKAGE a runner's argument names, without its version spec:
+ * `electron@30` → `electron`, `playwright@1.50.0` → `playwright`,
+ * `@scope/pkg@2` → `pkg`, `electron` → `electron`.
+ *
+ * ⛔ A VERSION PIN IS ONE LEXICAL SUFFIX, NOT ANOTHER PROGRAM (round 7 P1-2).
+ * `npx electron@30 .`, `npm exec electron@latest -- .` and
+ * `npx playwright@1.50.0 test --headed` were all `[]` because the payload token was
+ * compared VERBATIM against `electron` and against `LAUNCH_WORDS`. That is the
+ * README's own "two spellings of one thing must not disagree" rule applied to the
+ * payload instead of to the flag — and it was an undeclared residual, not a
+ * declared one.
+ */
+function packageBaseName(tok: string): string {
+  const word = basename(tok);
+  const at = word.lastIndexOf("@");
+  return at > 0 ? word.slice(0, at) : word;
+}
+
+/**
  * Index of the command word: skip leading `A=B` assignments, prefix-like words
  * (and the values their own flags consume) and grouping words. Returns -1 when
  * the segment holds no command word.
@@ -541,6 +585,11 @@ function commandWordIndex(toks: string[], out?: { prefixSeen?: boolean }): numbe
   if (toks.length === 0) return -1;
   let i = 0;
   let prefixSeen = false;
+  // ⛔ A PREFIX THAT SKIPPED NO FLAG CANNOT HAVE SWALLOWED THE COMMAND WORD
+  // (round 7 P2-5). `out.sawFlag` records whether the prefix's flag loop consumed
+  // at least one token; the fail-safe scan is gated on it, so `sudo rg electron .
+  // …` and `timeout 30 rg electron .` (a bare prefix then the real command) stay
+  // clean while `sudo --some-future-flag value electron .` is still rescued.
   toks[0] = stripLeadingMetachars(toks[0]);
   while (i < toks.length) {
     const tok = toks[i];
@@ -569,6 +618,7 @@ function commandWordIndex(toks: string[], out?: { prefixSeen?: boolean }): numbe
       // unclassifiable. Its duration argument is now just another positional.
       while (i < toks.length && toks[i].startsWith("-")) {
         // `--flag=value` is SELF-CONTAINED and consumes no following word.
+        if (out) out.sawFlag = true;
         if (toks[i].includes("=")) {
           i += 1;
         } else if (valueFlags.includes(toks[i])) {
@@ -638,7 +688,7 @@ function launchWordIndex(toks: string[], from: number): number {
   for (let i = from; i < toks.length; i++) {
     const tok = toks[i];
     if (tok.startsWith("-") || isAssignment(tok)) continue;
-    if (LAUNCH_WORDS.has(basename(tok)) || appBundleBinary(tok) !== null) return i;
+    if (LAUNCH_WORDS.has(packageBaseName(tok)) || appBundleBinary(tok) !== null) return i;
   }
   return -1;
 }
@@ -743,6 +793,41 @@ function attachedShortArg(tok: string, letter: string): string | null {
 }
 
 /**
+ * The argument a SHORT-FLAG CLUSTER hands to one of `letters` — `-na <name>`,
+ * `-bna <id>`, `-a<app>` — or null when this token is not a flag cluster that
+ * carries one of those letters at all. An empty string means the argument is the
+ * NEXT token.
+ *
+ * ⛔ A CLUSTER IS A THING FOR `open` (review cycle 6 F2 / round 7 P2-4). The
+ * previous inline copy (`tok[1] === "a" || tok[1] === "b"`) had TWO defects in one
+ * predicate:
+ *
+ * 1. it never checked `tok.startsWith("-")`, so any plain word whose SECOND
+ *    character is `a`/`b` was read as an attached flag — `open Banjo.app` became
+ *    `app: "njo.app"`, `fromFlag = true`, `media: false`, i.e. a FALSE PASS on the
+ *    incident's own `open <bundle>` shape, downgraded by a letter of the app's
+ *    name, with a mangled identity in the ledger row;
+ * 2. it insisted the flag letter be the FIRST one, which is false — `open -na
+ *    "Google Chrome"` is `-n -a <name>` (getopt clustering; the widely used
+ *    "new instance of a named app" idiom) and it classified `[]`, losing the R1
+ *    row, while `open -bna com.x` recorded `app: "na"`.
+ *
+ * The rule here is the one `attachedShortArg` already writes for the shell
+ * family: every character BEFORE the option letter must itself be a letter (a
+ * bare flag), and the LAST of `letters` present in the cluster wins — so `-bna`
+ * is `-b -n -a` and its argument is the next word, matching `-na`.
+ */
+function clusterShortArg(tok: string, letters: readonly string[]): string | null {
+  if (!tok.startsWith("-") || tok.startsWith("--")) return null;
+  const body = tok.slice(1);
+  let at = -1;
+  for (const letter of letters) at = Math.max(at, body.lastIndexOf(letter));
+  if (at < 0) return null;
+  if (!/^[A-Za-z]*$/.test(body.slice(0, at))) return null;
+  return body.slice(at + 1);
+}
+
+/**
  * The command-string argument of a wrapper that takes one — the shell's `-c`
  * (also `-lc`, `-ec`, `-o pipefail -c`), `flock -c`, `script -c` — or null.
  *
@@ -758,6 +843,13 @@ function shellCommandArg(toks: string[], headIndex: number): string | null {
   for (let i = headIndex + 1; i < toks.length; i++) {
     const tok = toks[i];
     if (tok === "--") continue;
+    // ⛔ `--flag=value` IS THE SAME FLAG (round 7 P1-3). `env --split-string='npm
+    // exec electron .'` was `[]` even with the `env` row present, because only the
+    // exact token was matched. A self-contained long spelling must not disagree
+    // with the separated one.
+    for (const flag of flags) {
+      if (flag.startsWith("--") && tok.startsWith(`${flag}=`)) return tok.slice(flag.length + 1);
+    }
     if (flags.includes(tok)) return toks[i + 1] ?? null;
     // A short-flag cluster containing `c` for the shell family only.
     if (SHELLS.has(head) && /^-[A-Za-z]*c[A-Za-z]*$/.test(tok)) return toks[i + 1] ?? null;
@@ -767,6 +859,24 @@ function shellCommandArg(toks: string[], headIndex: number): string | null {
       const attached = attachedShortArg(tok, flag[1]);
       if (attached !== null) return attached;
     }
+  }
+  return null;
+}
+
+/**
+ * The nearest COMMAND STRING carried by ANY wrapper in the segment, or null.
+ *
+ * ⛔ THE WRAPPER IS NOT ALWAYS AT TOKEN 0 (round 7 P1-3). `sudo env -S "electron
+ * ."` resolves no command word at all (`env -S` consumes its value, `cwi === -1`),
+ * and `shellCommandArg(toks, 0)` asked `sudo` — which carries no command-string
+ * flag — so the split string was never re-read. Scanning every position finds the
+ * wrapper wherever the prefix chain left it; a token that is not a registered head
+ * returns null immediately, so the scan costs one comparison per token.
+ */
+function wrapperCommandArg(toks: string[]): string | null {
+  for (let i = 0; i < toks.length; i++) {
+    const arg = shellCommandArg(toks, i);
+    if (arg !== null && arg !== "") return arg;
   }
   return null;
 }
@@ -783,7 +893,9 @@ function classifySegment(
   pwdebug: boolean,
 ): LaunchFinding | null {
   const { index } = afterRunner(toks, cwi);
-  const head = index >= 0 ? basename(toks[index]) : basename(toks[cwi]);
+  // ⛔ THE PAYLOAD'S *PACKAGE* NAME, NOT ITS VERBATIM TOKEN (round 7 P1-2):
+  // `npx electron@30 .` must read the same as `npx electron .`.
+  const head = index >= 0 ? packageBaseName(toks[index]) : basename(toks[cwi]);
 
   // R-electron: `electron .`, `npx electron .`, `npm exec electron -- .`,
   // or a binary inside an Electron bundle.
@@ -807,21 +919,16 @@ function classifySegment(
     let fromFlag = false;
     for (let i = 0; i < rest.length; i++) {
       const tok = rest[i];
-      if ((tok === "-a" || tok === "-b") && i + 1 < rest.length) {
-        app = rest[i + 1];
-        fromFlag = true;
-        break;
-      }
-      if (tok === "-a" || tok === "-b") continue;
-      // ⛔ `-a<app>` / `-b<id>` — the ATTACHED spelling (review cycle 5, F1).
-      // `open -a"Google Chrome"` tokenises to `-aGoogle Chrome`, matched no
-      // branch, and the launch was `[]`: not refused (correct — a NAMED app is
-      // record-only) but also NOT RECORDED, which loses R1 — the half of #2249
-      // that would have cut the incident to one `jq` lookup. The flag letter must
-      // be the FIRST one (a cluster is not a thing for `open`), so `--args` and
-      // `open -R`/`-n`/`-g` are untouched.
-      if (tok.length > 2 && !tok.startsWith("--") && (tok[1] === "a" || tok[1] === "b")) {
-        app = tok.slice(2);
+      // ⛔ THE FLAG CLUSTER IS ONE PREDICATE, WITH THE `-` GUARD (round 7 P1-1 and
+      // P2-4): `-a<app>` / `-b<id>` / `-na <name>` / `-bna <id>` hand their ARGUMENT
+      // to the option letter, and a plain word never does. The letter comes from
+      // the caller's own list, exactly like `attachedShortArg`.
+      const flagArg = clusterShortArg(tok, ["a", "b"]);
+      if (flagArg !== null) {
+        // An empty remainder means the argument is the NEXT token (`-a <app>`,
+        // `-na <name>`); a non-empty one is the ATTACHED spelling (`-aDMeer`).
+        app = flagArg !== "" ? flagArg : (rest[i + 1] ?? null);
+        if (app === null) continue; // a lone `-a` with nothing after it
         fromFlag = true;
         break;
       }
@@ -907,7 +1014,9 @@ export function classifyLaunchCommand(command: string, depth = 0): LaunchFinding
       // generic flag-skip ate the token and left nothing behind (review cycle 5,
       // F1). `cwi >= 0` segments take the wrapper branch below as before.
       if (depth < MAX_WRAPPER_DEPTH) {
-        const body0 = shellCommandArg(toks, 0);
+        // ⛔ ANY POSITION, NOT JUST TOKEN 0 (round 7 P1-3): `sudo env -S "…"`
+        // resolves no command word and the wrapper sits at index 1.
+        const body0 = wrapperCommandArg(toks);
         if (body0 !== null && body0 !== "") {
           findings.push(...classifyLaunchCommand(body0, depth + 1));
         }
@@ -930,23 +1039,45 @@ export function classifyLaunchCommand(command: string, depth = 0): LaunchFinding
       continue;
     }
 
-    // ⛔ A PACKAGE-RUNNER ANYWHERE IN THE SEGMENT IS A LAUNCH SHAPE, whatever
-    // heads the segment (review cycle 3, F1's CLASS rather than its instances).
-    // The wrapper table above cannot close this class — there is no command
-    // database, so a wrapper word it has never heard of is unrecognisable — but a
-    // runner does not need to be recognised as a WRAPPER: `npm exec`/`npx`/
-    // `pnpm dlx` is itself the announcement that the next word is a program, and
-    // that reads the same behind ANY prefix. `xvfb-run -a npm exec electron .`,
-    // `strace -f npx playwright test --headed` and `systemd-run --user npm exec
-    // electron .` were all `[]` (no block, no ledger row) before this. Rows
-    // L19h/L19i name no wrapper at all, so deleting this rule cannot stay green.
-    const runnerNested = toks.some((t, i) => i > 0 && RUNNERS.has(basename(t)));
+    // ⛔ A NESTED EXEC-STYLE RUNNER IS A LAUNCH SHAPE (review cycle 3's CLASS,
+    // narrowed in round 7 P2-5). There is no command database, so a wrapper word
+    // the table has never heard of is unrecognisable — but `npm exec` / `npx` /
+    // `bun x` / `mise exec` is itself the announcement that the next word is a
+    // PROGRAM, and that reads the same behind ANY prefix: `eatmydata npm exec
+    // electron .`, `sudo npm exec electron .`, `xvfb-run -a npm exec electron .`.
+    // The EXEC VERB is what makes it a launch shape (`afterRunner().execVerb`), not
+    // the mere presence of a runner name: a runner that is only INSTALLING or
+    // RUNNING A SCRIPT (`sudo npm install electron -D`, `bun install electron`) is
+    // not launching it, and reading the runner NAME alone refused both (round 7
+    // P2-5's over-fire). The payload index it resolves is classified directly, so
+    // the rescue is positional rather than a word scan.
+    let nestedPayload = -1;
+    for (let i = 1; i < toks.length; i++) {
+      if (!RUNNERS.has(basename(toks[i]))) continue;
+      const nested = afterRunner(toks, i);
+      if (nested.execVerb && nested.index > i) {
+        nestedPayload = nested.index;
+        break;
+      }
+    }
+    if (nestedPayload >= 0 && nestedPayload !== cwi) {
+      const rescued = classifySegment(toks, nestedPayload, faked, pwdebug);
+      if (rescued) {
+        findings.push(rescued);
+        continue;
+      }
+    }
 
-    // R-failsafe: a PREFIX or an EXEC-style runner can swallow the command word
-    // with a value-taking flag this table does not know (review cycle 2, F1:
-    // `sudo --user root electron .`). Only those shapes are scanned, so a plain
-    // `rg electron .` is untouched.
-    if (flags.prefixSeen || execVerb || runnerNested) {
+    // R-failsafe: a PREFIX that consumed a flag, or an EXEC-style runner, can have
+    // swallowed the command word with a flag this table does not know (review cycle
+    // 2, F1: `sudo --user root electron .`; L15j/L15k). ⛔ GATED ON A FLAG ACTUALLY
+    // BEING SKIPPED (round 7 P2-5): with no flag between the prefix and the command
+    // word, nothing could have swallowed it, so `sudo rg electron .`, `timeout 30 rg
+    // electron .` and `timeout 60 grep -rn electron src/` are a SEARCH and stay
+    // clean, instead of being refused by a word scan that rescued any later
+    // `electron`. A prefix that DID skip a flag keeps the over-fire, which is the
+    // declared direction (README's Declared residuals).
+    if (flags.sawFlag || execVerb) {
       const alt = launchWordIndex(toks, cwi + 1);
       if (alt >= 0 && alt !== cwi) {
         const rescued = classifySegment(toks, alt, faked, pwdebug);
@@ -969,7 +1100,7 @@ export function classifyLaunchCommand(command: string, depth = 0): LaunchFinding
       // found nothing. `toks[0]` is the wrapper (already metachar-stripped by
       // `commandWordIndex`); the `cwi` read stays as the fallback for
       // `sudo bash -c "…"`, where the wrapper is `sudo` and the shell is `bash`.
-      const shellBody = shellCommandArg(toks, 0) ?? shellCommandArg(toks, cwi);
+      const shellBody = wrapperCommandArg(toks);
       const evalBody = head === "eval" ? toks.slice(cwi + 1).join(" ") : null;
       const nested = shellBody ?? evalBody;
       if (nested !== null && nested !== "") {

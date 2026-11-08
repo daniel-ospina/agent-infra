@@ -265,6 +265,59 @@ const ROWS = [
   ["A32 a heredoc whose TERMINATOR carries a trailing comment is still unterminated",
     "cat > /tmp/n.md <<'EOF'\nbody\nEOF # done\nnpm exec electron .", 0, null, false],
   ["A33 open -R (a boolean short flag, not an attached app)", "open -R .", 0, null, false],
+  // ── L23 (round 7, P1-1 and P2-4) — the `open` argument is handed to an OPTION
+  //     LETTER, and a plain word is never a flag. The one predicate that replaced
+  //     `tok[1] === "a" || tok[1] === "b"` fixes BOTH directions of the same bug:
+  //     any bare `<Name>.app` whose second letter is `a`/`b` was a FALSE PASS
+  //     (`media:false`, `decision:"record"`, ledger identity `njo.app`), and
+  //     `open -na <name>` — a getopt CLUSTER, the documented "named app, new
+  //     instance" idiom — was `[]`, losing R1's row entirely. L9d/L9e are the
+  //     same invariant in the one spelling the old predicate could not intercept;
+  //     L23c keeps them from regressing alone.
+  ["L23a open a bare .app whose 2nd letter is `a` (was media:false)", "open Banjo.app", 1, "open", true],
+  ["L23b open a bare .app whose 2nd letter is `b` (was media:false)", "open Baz.app", 1, "open", true],
+  ["L23c the `./` twin of L23a (the row that was already green)", "open ./Banjo.app", 1, "open", true],
+  ["L23d open -na <name> (a CLUSTER; R1's row must exist)", 'open -na "Google Chrome" https://x.test', 1, "open", false],
+  ["L23e open -nb <bundle id> (the same cluster, `b`)", "open -nb com.example.app", 1, "open", false],
+  // ── L24 (round 7, P1-2) — a runner ALIAS and a version PIN are the same
+  //     program. `bunx` was listed and `bun x` was not (Bun's own docs: "bunx is an
+  //     alias for bun x"), and every `@version` payload missed the verbatim
+  //     `head === "electron"` / `LAUNCH_WORDS` comparisons. Both were `[]`: no
+  //     refusal AND no ledger row. A36/A41 are the ALLOW twins that keep the
+  //     widened runner set from turning an INSTALL or a script run into a launch.
+  ["L24a bun x electron . (bunx is an ALIAS for bun x)", "bun x electron .", 1, "electron", true],
+  ["L24b bun x playwright --headed", "bun x playwright test --headed", 1, "playwright", true],
+  ["L24c mise exec -- <cmd>", "mise exec -- electron .", 1, "electron", true],
+  ["L24d asdf exec <cmd>", "asdf exec electron .", 1, "electron", true],
+  ["L24e npx electron@30 . (a version pin is not another program)", "npx electron@30 .", 1, "electron", true],
+  ["L24f npm exec electron@latest -- .", "npm exec electron@latest -- .", 1, "electron", true],
+  ["L24g npx playwright@1.50.0 test --headed", "npx playwright@1.50.0 test --headed", 1, "playwright", true],
+  // ── L25 (round 7, P1-3) — an argument that EXECUTES is re-read, whoever
+  //     declared it a value. `env -S` was in `PREFIX_VALUE_FLAGS` (the prefix loop
+  //     consumed it and never looked at it) and absent from
+  //     `COMMAND_STRING_FLAGS` (the table built for exactly this); the runner
+  //     family's `-c/--call` had no row at all. All were `[]`. A34/A35 are the
+  //     ALLOW twins: a benign command string must not become a refusal.
+  ["L25a env -S \"<cmd>\" (the value EXECUTES)", 'env -S "npm exec electron ."', 1, "electron", true],
+  ["L25b env --split-string=<cmd> (self-contained long spelling)", "env --split-string='npm exec electron .'", 1, "electron", true],
+  ["L25c sudo env -S (the wrapper is NOT at token 0)", 'sudo env -S "electron ."', 1, "electron", true],
+  ["L25d npm exec -c <cmd> (npm's documented --call)", 'npm exec -c "electron ."', 1, "electron", true],
+  ["L25e npx -c <cmd>", 'npx -c "electron ."', 1, "electron", true],
+  ["L25f npx --package=<pinned> -c <cmd>", 'npx --package=electron@30 -c "electron ."', 1, "electron", true],
+  // ── A34–A41 — ALLOW twins for L24/L25 AND for round 7's P2-5 over-fire. The
+  //     fail-safe word scan is now gated on the prefix having SKIPPED A FLAG: with
+  //     no flag between the prefix and the command word, nothing could have
+  //     swallowed it, so a SEARCH that mentions `electron` is not a launch — while
+  //     L15j/L15k (a flag the table has never seen) must stay refused. These rows
+  //     are the two directions of that gate.
+  ["A34 env -S with a benign command string", 'env -S "ls -la"', 0, null, false],
+  ["A35 npx -c with a benign command string", 'npx -c "ls -la"', 0, null, false],
+  ["A36 bun install electron is an INSTALL (the A13 twin)", "bun install electron", 0, null, false],
+  ["A37 bun run build", "bun run build", 0, null, false],
+  ["A38 sudo rg electron . (a prefix with NO flag cannot swallow the word)", "sudo rg electron .", 0, null, false],
+  ["A39 timeout 30 rg electron . (its duration is not a flag)", "timeout 30 rg electron .", 0, null, false],
+  ["A40 timeout 60 grep -rn electron src/", "timeout 60 grep -rn electron src/", 0, null, false],
+  ["A41 sudo npm install electron -D (a nested runner that INSTALLS)", "sudo npm install electron -D", 0, null, false],
 ];
 
 for (const [name, cmd, count, rule, media] of ROWS) {
@@ -276,6 +329,28 @@ for (const [name, cmd, count, rule, media] of ROWS) {
     `classify: ${name}`,
     okCount && okRule && okMedia,
     `count=${found.length} (want ${count}) rules=[${found.map((f) => f.rule)}] media=[${found.map((f) => f.media)}]`,
+  );
+}
+
+// ── the ledger's `app` field: the DIAGNOSIS half of #2249 ────────────────────
+// ⛔ A ROW THAT ONLY COUNTS CANNOT SEE A MANGLED IDENTITY (round 7, P1-1/P2-4).
+// `open Banjo.app` used to produce exactly one `open` finding — with
+// `app: "njo.app"` — so a count/rule/media row stayed GREEN over the defect. The
+// argument handed to the option letter is what R1 answers "which app?" with, so it
+// is pinned here separately.
+const APP_ROWS = [
+  ["P1-1 an app name whose 2nd letter is `a` keeps its FULL identity", "open Banjo.app", "Banjo.app"],
+  ["P1-1 …and a `Safari.app` bundle is not truncated to `fari.app`", "open Safari.app", "Safari.app"],
+  ["P2-4 `open -bna com.x` hands the NEXT word to `-a` (was `na`)", "open -bna com.x", "com.x"],
+  ["P2-4 `open -na <name>` (was `[]`, so nothing was recorded)", 'open -na "Google Chrome"', "Google Chrome"],
+  ["L21h twin: an ATTACHED `-a<app>`", "open -aDMeer", "DMeer"],
+];
+for (const [name, cmd, expected] of APP_ROWS) {
+  const found = classify(cmd);
+  check(
+    `identity: ${name}`,
+    found.length > 0 && found[0].app === expected,
+    `app=${JSON.stringify(found[0]?.app)} (want ${JSON.stringify(expected)})`,
   );
 }
 

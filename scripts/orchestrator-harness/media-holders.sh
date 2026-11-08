@@ -108,16 +108,30 @@ json_str() {
   # `--ancestry`'s whole purpose is the LANE ROOT, whose argv is
   # `pi -p "<multi-line brief>"`, and a NUL→space `tr` leaves the LFs in place.
   # awk (not sed) because sed is line-oriented and cannot see a LF inside its
-  # pattern space at all; awk's `gsub` on a `-v` value can.
-  awk -v s="$1" 'BEGIN {
-    gsub(/\\/, "\\\\", s)
-    gsub(/"/, "\\\"", s)
-    gsub(/\t/, "\\t", s)
-    gsub(/\r/, "\\r", s)
-    gsub(/\n/, "\\n", s)
-    gsub(/[\001-\010\013\014\016-\037]/, "", s)
-    printf "\"%s\"", s
-  }'
+  # pattern space at all; awk's `gsub` can — but ONLY if the value is not smuggled
+  # in as an `awk -v` ASSIGNMENT (round 7, measured on this host).
+  #
+  # ⛔ `-v s="$1"` IS PARSED AS SOURCE TEXT, SO A LF IN THE VALUE IS A SYNTAX
+  # ERROR on any BSD-derived awk (macOS, `awk version 20200816`):
+  #   `awk: newline in string /usr/bin/pi -p line … at source line 1`
+  # and the assignment is discarded — so `cmdline` came out EMPTY and the document
+  # read `"cmdline":}`. That is invalid JSON, and it fails on exactly the shape
+  # this verb exists to describe (the lane root's `pi -p "<multi-line brief>"`),
+  # on the platform the fleet's lanes run on. GNU awk accepts the same call, which
+  # is why the suite was green on Linux and red here. Reading the value as ONE
+  # RECORD (`RS` set to a byte `json_str` strips anyway) keeps `gsub` and removes
+  # the assignment entirely, so both awks agree.
+  printf '%s' "$1" | awk 'BEGIN { RS = "\001"; s = "" }
+    { s = s $0 }
+    END {
+      gsub(/\\/, "\\\\", s)
+      gsub(/"/, "\\\"", s)
+      gsub(/\t/, "\\t", s)
+      gsub(/\r/, "\\r", s)
+      gsub(/\n/, "\\n", s)
+      gsub(/[\001-\010\013\014\016-\037]/, "", s)
+      printf "\"%s\"", s
+    }'
 }
 JSON_DEVICES=""
 SAW_UNVERIFIABLE=0
