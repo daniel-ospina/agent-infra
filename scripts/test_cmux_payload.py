@@ -1313,8 +1313,16 @@ def _run_cadence_nudge(home, bindir, screen, session=None, sid=None, checker=Tru
         # ⛔ DRIVE THE VERDICT MAPPING DIRECTLY (#3795 review P2). The `case` in the floor decides
         # what a `delivered=` value MEANS, and only the VERIFIED and UNVERIFIED arms were pinned. A
         # later "simplification" to `VERIFIED|PANE_ONLY) delivered="yes"` reds no test without these.
+        # The stub ADVERTISES `--surface` on `--help` because the floor probes capability before it
+        # commits to the checker path (#3795 review cycle 3): a stand-in for the CURRENT checker must
+        # look like one, or the floor correctly takes the raw-send path instead.
         stub = (home / ".pi" / "agent" / "scripts" / "lib" / "cmux_payload.py")
-        stub.write_text("import sys\nprint(%r)\nsys.exit(%d)\n"
+        stub.write_text("import sys\n"
+                        "if '--help' in sys.argv:\n"
+                        "    print('usage: cmux_payload.py verify --workspace W [--surface S]')\n"
+                        "    sys.exit(0)\n"
+                        "print(%r)\n"
+                        "sys.exit(%d)\n"
                         % (stub_verdict, 0 if stub_verdict == "VERIFIED" else 3),
                         encoding="utf-8")
     return subprocess.run(["bash", str(script)], capture_output=True, text=True, env=env,
@@ -1486,7 +1494,8 @@ def test_cadence_nudge_never_certifies_an_unrecognised_checker_verdict(tmp_path,
     assert len(lines) == 2, (
         f"the receipt was split across {len(lines)} log lines instead of 2:\n{appended}")
     # ...and the flatten is visible: the break became a SPACE inside the one field that carries it.
-    assert "verdict=VERIFIED OK" in lines[1] or stub_verdict != "VERIFIED\nOK", appended
+    if stub_verdict == "VERIFIED\nOK":
+        assert "verdict=VERIFIED OK" in lines[1], appended
     assert "NOT CERTIFIED" in appended, appended
 
 
@@ -1517,6 +1526,40 @@ def test_resolve_session_id_falls_back_to_workspace_only_when_the_flag_is_reject
     assert any("--surface" in argv for argv in seen), "the surface-qualified read was never tried"
     assert any("--surface" not in argv and "resume" in argv for argv in seen), (
         f"no workspace-only retry was made — the flag rejection is unrecoverable:\n{seen}")
+
+
+def test_cadence_nudge_still_sends_when_the_checker_predates_the_argv(tmp_path):
+    """⛔ THE HEARTBEAT INVARIANT, AT THE ONE STATE THIS PR MADE REACHABLE (#3795 review cycle 3, P1).
+    `cadence-nudge.sh` is farmed before `lib/cmux_payload.py` (fleet_srcs then lib_srcs), so a box
+    whose farm pass stopped between them holds a NEW floor beside a STALE checker — one that exits 2
+    on `verify --surface` BEFORE it sends. Presence-only gating took the checker path, nothing left
+    the box, and the receipt still said `delivered=UNVERIFIED` — a value this file documents as
+    "prefix, unreadable pane, or a refused send", never "nothing was sent". The floor must send, and
+    must say why it could not verify."""
+    seed = _seeded_log(600)
+    home, bindir, screen, state = _cadence_home(
+        tmp_path, "the pane shows nothing relevant\n", seed)
+    # A checker that predates the flag: argparse refuses the argv and exits 2 without sending.
+    (home / ".pi" / "agent" / "scripts" / "lib" / "cmux_payload.py").write_text(
+        "import sys\n"
+        "if '--surface' in sys.argv:\n"
+        "    sys.stderr.write('error: unrecognized arguments: --surface\\n')\n"
+        "    sys.exit(2)\n"
+        "sys.exit(0)\n", encoding="utf-8")
+    sent = tmp_path / "SENT"
+    r = _run_cadence_nudge(home, bindir, screen, session=sent)
+    assert r.returncode == 0, r.stdout + r.stderr
+    nudges, appended = _new_nudge_lines(state, seed)
+    assert nudges, appended
+    # THE POINT: a heartbeat left the box anyway.
+    assert sent.exists(), (
+        "the floor did not send at all — its one invariant is broken:" + appended)
+    assert all("delivered=yes" not in line for line in nudges), appended
+    assert "delivered=UNVERIFIED" in appended, appended
+    # ...and the receipt names the real cause instead of implying a send it never made.
+    assert "predates --surface" in appended, appended
+    assert "unrecognized arguments" not in appended, (
+        "the checker ran anyway and its usage error became the receipt:" + appended)
 
 
 def test_resolve_session_id_does_not_fall_back_when_the_read_succeeded_but_named_no_session(P):

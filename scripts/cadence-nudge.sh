@@ -515,7 +515,34 @@ fi
 # refuses to certify a send whose delivery it could not check. So: send, then say honestly that it
 # could not be checked. Never: send, then claim it landed.
 _verify="$SCRIPTS/lib/cmux_payload.py"
-if [ -x /usr/bin/python3 ] && [ -f "$_verify" ]; then
+# ⛔ ONE PLACE DECIDES WHETHER THE CHECKER CAN BE USED — AND IT PROBES CAPABILITY, NOT JUST PRESENCE
+# (#3795 review cycle 3, P1). `cadence-nudge.sh` is farmed from `fleet_srcs` and `lib/cmux_payload.py`
+# from `lib_srcs` (pi-bootstrap/setup.sh) — fleet FIRST — so a box whose farm pass stopped between the
+# two holds a NEW floor beside a STALE checker. Such a checker exits 2 on `verify --surface` BEFORE it
+# sends anything, and the floor's one invariant ("a heartbeat leaves even on a broken box") is lost
+# while the receipt still reads `delivered=UNVERIFIED` — the value this file documents as "prefix,
+# unreadable pane, or a refused send", never "nothing was sent". MEASURED on the PR's own fixture with
+# a stale stub: no send reached cmux, and two honest-looking log lines were written. So a checker that
+# does not advertise the argv we are about to pass takes the raw-send path, exactly like a missing one.
+#
+# ⛔ AND IT MUST NOT "just retry without --surface" (#3795 review cycle 3): a checker that has ALREADY
+# sent and then crashed would be called a second time, double-sending the payload (rejected Approach 5).
+_checker_broken=""
+if [ ! -f "$_verify" ]; then
+  _checker_broken="not on this box: $_verify"
+elif [ ! -x /usr/bin/python3 ]; then
+  _checker_broken="no interpreter: /usr/bin/python3"
+else
+  # ⛔ NOT A PIPE INTO `grep -q` (#3795 review cycle 3): under `set -o pipefail` the producer takes
+  # SIGPIPE when grep exits early, the pipeline reports 141, and the capability test reads as ABSENT
+  # on a good checker — the same class of false signal this file exists to catch.
+  _help=$(/usr/bin/python3 "$_verify" verify --help 2>/dev/null)
+  case "$_help" in
+    *--surface*) ;;
+    *) _checker_broken="stale farmed copy ($_verify) predates --surface, so it would refuse the argv before sending" ;;
+  esac
+fi
+if [ -z "$_checker_broken" ]; then
   _verr=$(mktemp "${TMPDIR:-/tmp}/cadence-nudge-verify.XXXXXX") || _verr=/dev/null
   verdict=$(/usr/bin/python3 "$_verify" verify \
               --workspace "$ORCH_WS" --surface "$ORCH_SURFACE" \
@@ -544,7 +571,7 @@ if [ -x /usr/bin/python3 ] && [ -f "$_verify" ]; then
   [ -s "$_verr" ] && _vdiag=" diag=[$(tr '\n' ' ' <"$_verr" | tail -c 240)]"
   [ "$_verr" = /dev/null ] || rm -f "$_verr"
 else
-  # No checker on this box. Send anyway (the floor's whole job) and record the attempt as unverified.
+  # No usable checker on this box. Send anyway (the floor's whole job) and record it as unverified.
   err=$(cmux send --workspace "$ORCH_WS" --surface "$ORCH_SURFACE" "$MSG\n" 2>&1)
   rc=$?
   if [ "$rc" -ne 0 ]; then
@@ -556,19 +583,12 @@ else
   # the cause it already holds — `cmux` refusing the send, or a usage error — is the most valuable
   # line it could report; naming only what is MISSING leaves the operator to guess. `err` was
   # captured and never read.
-  # ⛔ EVERY MISSING PIECE IS DERIVED FROM ONE PLACE (#3795 review cycle 2, P2). This used to be a
-  # SECOND copy of the guard above: re-deriving `-f "$_verify"` / `-x /usr/bin/python3` here meant that
-  # any drift between the two copies produced `payload checker unavailable: ` with NOTHING named — a
-  # cause that certifies nothing, inside a receipt. The `else` arm is unreachable while the guard and
-  # this block agree, so instead of risking an empty cause it NAMES what it would have used.
-  _missing=""
-  [ -f "$_verify" ] || _missing="$_verify"
-  [ -x /usr/bin/python3 ] || _missing="${_missing}${_missing:+ }/usr/bin/python3"
-  if [ -n "$_missing" ]; then
-    _cause="payload checker unavailable: $_missing"
-  else
-    _cause="payload checker unusable: /usr/bin/python3 $_verify"
-  fi
+  # ⛔ THE CAUSE COMES FROM THE ONE DECISION ABOVE, NOT A SECOND COPY OF ITS PREDICATES (#3795 review
+  # cycles 2 and 3, P2). `_checker_broken` is non-empty on every path into this branch, so the receipt
+  # cannot degrade to `payload checker unavailable: ` with nothing named — which is what a re-derived
+  # guard produced when the two copies drifted, and a cause that certifies nothing inside a receipt is
+  # the same defect class as the receipt itself.
+  _cause="payload checker unavailable: $_checker_broken"
   if [ -n "$err" ]; then
     _cause="$_cause; cmux=[$(printf '%s' "$err" | tr '\n' ' ' | tail -c 200)]"
   fi
@@ -586,14 +606,20 @@ fi
 # point" and not "every attempt" (#3795 review P2). A nudge KILLED inside the verification window
 # has sent its message and stamped nothing, so the next tick re-fires once the lock takeover expires.
 #
-# ⛔ AND THE WINDOW IS MEASURED, NOT ASSERTED "SAFE" (#3795 review cycle 2, P2 — the previous wording
-# understated it by ~2x, because session resolution is retried and the sentinel reads can outlast the
-# deadline). Worst case, with the `--surface` fallback now ONE shot: 3x45 s surface-qualified reads +
-# 1x45 s workspace-only retry + 45 s send + 45 s Enter + ~90 s tail sentinel = ~360 s, against a
-# 6-minute (`-mmin +6`) lock takeover and a 450 s `cadence-timer.sh` interval. The margin was always
-# thin — the pre-#3795 path was ~315 s — and this retry spends 45 s of it. That is bounded and no
-# worse in kind than what it replaces, but it is NOT "impossible": a slow-but-working cmux can still
-# let a second tick take the lock over. Keep the retry cheap; do not add another full retry budget.
+# ⛔ AND THE WINDOW IS MEASURED, NOT ASSERTED "SAFE" (#3795 review cycles 2 and 3, P2 — each earlier
+# wording understated it). Worst case, with the `--surface` fallback ONE shot, from the real code:
+#   3x45 s surface-qualified reads + 1 s of retry sleeps   = 136 s
+#   1x45 s workspace-only fallback read                    =  45 s
+#   45 s payload send + 2 s sleep + 45 s Enter + 2 s sleep  =  94 s
+#   tail sentinel: `--timeout 90` PLUS one 45 s read-screen, because the deadline is tested AFTER the
+#   read, plus a final 3 s poll                               = 138 s
+#                                                        TOTAL = 413 s
+# The governing boundary is the 450 s `cadence-timer.sh` interval — NOT the `-mmin +6` (360 s) takeover,
+# which can never protect: the next tick arrives at 450 s, by which time the lock is already older than
+# 6 min, so the takeover always fires. The number that must fit is therefore 413 s into the 450 s
+# timer: it does, with ~37 s to spare (the pre-#3795 path measured 368 s, so this retry spends 45 s of
+# an 82 s margin). Keep the retry cheap. Do not add another full retry budget, and do not "fix" the
+# sentinel by trusting `--timeout` — the overshoot is real and measured.
 printf '%s NUDGE at=%s delivered=%s (cadence-floor) gap=%sm queue=[%s] alerts=[] ask=[] verdict=%s%s\n' \
   "$(date '+%m-%d %H:%M:%S')" "$now" "$delivered" "$gap_min" "$q" "$verdict" "$_vdiag" >> "$LOG"
 # A failed verdict gets its own line TOO, so a reader scanning for `CADENCE-NUDGE` sees the failure
