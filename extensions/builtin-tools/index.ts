@@ -2256,10 +2256,16 @@ export function exhaustionStatusFor(snap: TaskChildLivenessSnapshot | null): "fa
  * dispatch on a heartbeat-less box as dead — a false failure in the one place
  * the fleet reads as "stop, do not continue".
  *
- * The count is COMPLETED turns (`turn_end`, monotonic), floored at 1 when the
- * content latch `everSawMsg` fired: a child that streamed its first message and
- * died before finishing that turn has still sent something, and the floor keeps
- * the "zero messages" claim honest without inventing a count. */
+ * The count is COMPLETED, CONTENT-BEARING turns (`turn_end` with `content=1`,
+ * monotonic), floored at 1 when the content latch `everSawMsg` fired: a child
+ * that streamed its first message and died before finishing that turn has still
+ * sent something, and the floor keeps the "zero messages" claim honest without
+ * inventing a count.
+ *
+ * ⛔ A `turn_end` is NOT by itself a message: the E-shape child cycles
+ * `turn_start`/`turn_end` producing nothing (#5195). Only a `content=1` turn — or
+ * a legacy marker carrying no flag at all, read as content-bearing so version
+ * skew degrades to the pre-#1208 behaviour — counts. */
 export function childMessagesSent(
   state: Pick<HeartbeatState, "messagesSent" | "everSawMsg" | "sawReady" | "markerCount">,
 ): number | null {
@@ -2357,13 +2363,15 @@ export interface HeartbeatState {
   /** Session latch — tool activity was ever observed (tool_start/tool_end or
    * tick saw_tool=1). Distinct from per-turn turnSawTool (resets on turn_start). */
   everSawTool: boolean;
-  /** #1208: COMPLETED model turns observed via `turn_end` markers — the
-   * parent-side "did this child ever say anything" count. Monotonic and
-   * session-level (a child's turn resets cannot erase it), so `0` is positive
-   * evidence that NO turn ever ran to completion, which is the slow-start
-   * death. Deliberately NOT derived from ticks: `saw_msg=1` repeats on every
-   * tick of a turn, so a tick-derived counter measures ticks, not messages.
-   * Read it through `childMessagesSent()`, never directly. */
+  /** #1208: COMPLETED, CONTENT-BEARING model turns — the parent-side "did this
+   * child ever say anything" count. Monotonic and session-level (a child's turn
+   * resets cannot erase it), so `0` is positive evidence that NO turn ever ran
+   * to completion, which is the slow-start death. Deliberately NOT derived from
+   * ticks: `saw_msg=1` repeats on every tick of a turn, so a tick-derived
+   * counter measures ticks, not messages. Also not derived from a bare
+   * `turn_end`: an EMPTY turn emits one too (#5195's E shape), so the marker's
+   * own `content` flag decides. Read it through `childMessagesSent()`, never
+   * directly. */
   messagesSent: number;
   /** ts of the first everSawRealActivity source (0 = none) — the parent's
    * time-to-first-observable-activity, comparable to the child's own
@@ -2605,12 +2613,19 @@ export function parseHeartbeatLine(
       state.streamAgeMs = 0;
       state.toolAgeMaxMs = 0;
       break;
-    case "turn_end":
+    case "turn_end": {
       state.turnActive = false;
-      // #1208: one COMPLETED model turn = one message the child emitted. The
-      // only marker that proves a message finished end-to-end (turn_start
-      // fires before the provider call, so it proves nothing about output).
-      state.messagesSent += 1;
+      // #1208: one COMPLETED, CONTENT-BEARING model turn = one message the child
+      // emitted. `turn_end` alone is NOT sufficient: the E-shape child cycles
+      // turn_start/turn_end producing nothing (#5195), so a bare count reports
+      // "the child said something" for a child that said nothing — the
+      // false-liveness direction this whole field exists to close. The child
+      // stamps `content=` from `hasTurnContent`; an ABSENT flag means an older
+      // emitter and is read as content-bearing (the pre-#1208 reading), so
+      // version skew degrades to yesterday's behaviour rather than inventing a
+      // false silence.
+      const contentFlag = rest.match(/(?:^|\s)content=([01])(?:\s|$)/);
+      if (!contentFlag || contentFlag[1] === "1") state.messagesSent += 1;
       // Mirror the child's outstanding-tools clear on turn_end (pi guarantees
       // all tools finalize before turn_end). Prevents a stale event counter
       // after a lost tool_end from causing a false tool-stall kill (code-
@@ -2634,6 +2649,7 @@ export function parseHeartbeatLine(
       state.toolCpuStallMs = 0;
       state.toolCpuAdvanced = false;
       break;
+    }
     case "tick": {
       state.tickCount += 1;
       if (state.firstTickAt === 0) state.firstTickAt = now;

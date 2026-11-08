@@ -9039,6 +9039,81 @@ test("#1208: the field set is PRESENT on arms where no child ever existed — ne
   equal(measured.childMessagesSent, 3, "a measured count survives");
 });
 
+section("#1208: an EMPTY turn is not a message");
+
+// #5195's E shape: a child cycling turn_start/turn_end producing NOTHING. Counting
+// every `turn_end` reported "the child said something" for a child that said nothing,
+// classifying it `exited-no-result` (not an error) and leaving its empty payload
+// unflagged — the false-liveness direction this field exists to close.
+test("#1208: content=0 does not count, content=1 does, and a legacy flag-less marker still counts", () => {
+  const st = createHeartbeatState();
+  parseHeartbeatLine("[task-heartbeat] ready nonce=nn", st, 1000);
+  parseHeartbeatLine("[task-heartbeat] turn_start nonce=nn 1", st, 1001);
+  parseHeartbeatLine("[task-heartbeat] turn_end nonce=nn 1 content=0", st, 1002);
+  equal(st.messagesSent, 0, "an EMPTY turn is NOT a message — the E shape says nothing");
+  equal(childMessagesSent(st), 0, "…so an empty-turn loop is still the zero-message class");
+  parseHeartbeatLine("[task-heartbeat] turn_start nonce=nn 2", st, 1003);
+  parseHeartbeatLine("[task-heartbeat] turn_end nonce=nn 2 content=1", st, 1004);
+  equal(st.messagesSent, 1, "a content-bearing turn counts");
+  // Version skew: an OLDER child omits the flag entirely. Read as content-bearing (the
+  // pre-#1208 reading) so a mixed fleet degrades to yesterday's behaviour rather than
+  // classifying a working old child as dead.
+  parseHeartbeatLine("[task-heartbeat] turn_end nonce=nn 3", st, 1005);
+  equal(st.messagesSent, 2, "an absent flag is read as content-bearing — never a false silence");
+  // The child-side formatter emits the flag from the SAME `hasTurnContent` the #5195
+  // progress clock uses — one definition of "the turn produced something".
+  ok(childHb.formatTurnEnd("nn", 7, false).includes("content=0"), "formatTurnEnd(false) emits content=0");
+  ok(childHb.formatTurnEnd("nn", 7, true).includes("content=1"), "formatTurnEnd(true) emits content=1");
+  ok(!childHb.formatTurnEnd("nn", 7).includes("content="), "omitted ⇒ legacy shape (no flag), for old callers");
+});
+
+// The spawn-level consequence of the same defect: an EMPTY-TURN LOOP child (#5195 E)
+// completes turns that carry no content. Counting `turn_end` made it report "1 message
+// sent", classify `exited-no-result` and return NO error — so its empty payload read as
+// a quiet-but-finished child. With the flag it is the zero-message class: a distinct,
+// non-zero result.
+const FAKE_PI_EMPTY_TURN_SHIM = `#!/bin/sh
+NONCE="${'${TASK_HEARTBEAT_NONCE:-}'}"
+echo "[task-heartbeat] ready nonce=$NONCE" >&2
+echo "[task-heartbeat] turn_start nonce=$NONCE 1" >&2
+echo "[task-heartbeat] turn_end nonce=$NONCE 1 content=0" >&2
+exit 0
+`;
+
+testAsync("#1208 (E2E): an EMPTY-TURN LOOP child is the zero-message death, not a quiet success", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "t1208-empty-turn-"));
+  const shimDir = join(dir, "bin");
+  mkdirSync(shimDir, { recursive: true });
+  writeFileSync(join(shimDir, "pi"), FAKE_PI_EMPTY_TURN_SHIM, { mode: 0o755 });
+  const savedPath = process.env.PATH ?? "";
+  const savedArgv1 = process.argv[1];
+  const savedLedger = process.env.DISPATCH_LEDGER;
+  try {
+    process.env.PATH = `${shimDir}:${savedPath}`;
+    process.argv[1] = undefined as unknown as string;
+    process.env.DISPATCH_LEDGER = "0";
+    const baseEnv: Record<string, string | undefined> = {
+      ...process.env,
+      PATH: process.env.PATH,
+      TASK_HEARTBEAT: "1",
+      DISPATCH_LEDGER: "0",
+    };
+    const looped = await spawnSubAgent("deepseek-v4-flash", "deepseek", baseEnv, ["-p", "--no-session", "spin"]);
+    ok(looped, "the dispatch settles");
+    const ld = (looped as any).details as Record<string, unknown>;
+    equal(ld.childMessagesSent, 0, "a completed turn with no content is NOT a message");
+    equal(ld.childState, "died-before-first-message", "so the empty-turn loop is the slow-start death class");
+    equal((looped as any).isError, true, "…and it stops a parent's default handling instead of reading as a quiet finish");
+    ok(!String((looped as any).content?.[0]?.text).includes("exited with code 0\n"), "the bare composer sentence is not the whole result");
+  } finally {
+    process.env.PATH = savedPath;
+    process.argv[1] = savedArgv1;
+    if (savedLedger === undefined) delete process.env.DISPATCH_LEDGER;
+    else process.env.DISPATCH_LEDGER = savedLedger;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
   for (const t of asyncTests) await t();
   console.log(`\n=== Results: ${passed} passed, ${failed} failed ===`);
   if (failed > 0) {
