@@ -9033,6 +9033,10 @@ test("#1208: the field set is PRESENT on arms where no child ever existed — ne
   equal(stamped.childMessagesSent, null, "no message count is knowable without a child");
   ok(TASK_LIVENESS_DETAIL_KEYS.every((k) => k in stamped), "all keys present");
   // ONLY fills absent keys: a measured value must never be overwritten by the tool layer.
+  // The field set never contradicts itself: stdout is proof of a message, so it floors the count.
+  const withOut = childLivenessFor({ details: {}, hbState: createHeartbeatState(), pid: 11, stdout: "some answer\n", exited: true });
+  equal(withOut.childState, "completed", "stdout is a completion");
+  equal(withOut.childMessagesSent, 1, "and a completion cannot carry `messagesSent: 0` (round-4 P3)");
   const measured = stampLivenessDefaults({ childPid: 4242, childState: "completed", childExited: true, childMessagesSent: 3 });
   equal(measured.childPid, 4242, "a measured pid survives");
   equal(measured.childState, "completed", "a measured state survives");

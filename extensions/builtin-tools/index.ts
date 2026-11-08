@@ -2220,14 +2220,21 @@ export function childLivenessFor(i: {
   killedByReason?: boolean;
 }): TaskChildLivenessSnapshot {
   const spawnError = i.details.isError === true && i.details.killed !== true && !("exitCode" in i.details);
-  const messagesSent = childMessagesSent(i.hbState);
+  const hasStdout = i.stdout.trim().length > 0;
+  const measured = childMessagesSent(i.hbState);
+  // ⛔ THE FIELD SET MUST NOT CONTRADICT ITSELF (review round 4, P3). stdout content IS a message the
+  // child emitted, so it floors the count at 1 exactly as the `everSawMsg` latch does — otherwise a
+  // child that wrote to stdout and then exited non-zero reported `childState: "completed"` alongside
+  // `childMessagesSent: 0`, and a consumer applying this PR's own rule ("0 messages is never a valid
+  // empty answer") would have had to choose which field to disbelieve.
+  const messagesSent = hasStdout ? Math.max(measured ?? 0, 1) : measured;
   return {
     childPid: typeof i.pid === "number" ? i.pid : null,
     childState: spawnError
       ? "never-started"
       : classifyChildLiveness({
           killed: i.details.killed === true || i.killedByReason === true,
-          hasStdout: i.stdout.trim().length > 0,
+          hasStdout,
           messagesSent,
         }),
     childExited: spawnError ? null : i.exited,
