@@ -266,9 +266,11 @@ each named in the journal as an unclassifiable summary or row
 (with a `remedy=` pointing at the checker's vocabulary, not at the farm): a pipe-free line carrying two
 of the three label words with no parsable total, and a per-file row whose trailing token is neither benign
 (`verdict`, `ok`, `LOCAL (declared)`, `SYMLINK (graded via its target)`) nor a class this pass knows —
-scanned on any row of **two or more fields** and for **any verdict-shaped token**, because a vocabulary
-that drifts by a suffix (`drift_v2`, `NOT-LANDED2`) or a report that prints two-field rows is exactly the
-class this check exists for. One
+scanned on any **row** of two or more fields and for any **verdict-shaped token** (`[A-Za-z][A-Za-z0-9_.:! ()-]*`),
+because a vocabulary that drifts by a suffix (`drift_v2`, `drift.v2`) or a report that prints two-field
+rows is exactly the class this check exists for. A row is *a path at column 1 with no `PROG: text`
+prefix*: an indented line and a `phase | token` line are prose or wrapper chatter, not rows, and are
+skipped — otherwise a `tee` wrapper's own progress line would refuse a proven match. One
 label word in prose is NOT a summary — a healthy copy that mentions a `stale` entry while matching still
 records a proven match. A checker that exits 0 printing **nothing** is refused too — the instrument
 prints a summary on every graded run, so a silent exit produced no evidence and is not a match. One
@@ -281,8 +283,9 @@ whose output carries **no verdict** — the `bash inner "$@" 2>&1 | tee -a log` 
 missing, where `tee` supplies the 0 and the only output is bash's error line — is `farm-unknown`, never
 `farm: ok`. Without that, `farm_rows=none` / `farm_n=0` would certify a farm that was never graded and
 `--print-status` would answer `status=ok` for it. A wrapper over a genuinely matching farm still passes
-(it prints the instrument's verdict), and prose/summary lines are never read as rows (the class token
-must END the line). The verdict probes are anchored on the instrument's LINE shape rather than on the bare token, because a
+(it prints the instrument's verdict), and prose/summary lines are never read as rows — the class token
+must END the line, the line must reach the row scan at all (a column-1 path, no `PROG: ` prefix), and a
+verdict-shaped token that is neither benign nor a known class is the thing the scan reports. The verdict probes are anchored on the instrument's LINE shape rather than on the bare token, because a
 per-file ROW can carry either word — measured both ways: an unanchored `OK — ` certified a match over a
 report whose only "OK" was a filename, and an unanchored `DRIFT — ` refused a genuine match whose output
 merely mentioned the word. The anchor is **no pipe anywhere on the line** (`^[^|]*: OK — [^|]*$`), not
@@ -517,7 +520,7 @@ checkout can use the documented hatch. The same interaction is recorded for
 
 ## Tests
 
-`scripts/harness-apply-timer.test.sh` — 590 assertions, run by the
+`scripts/harness-apply-timer.test.sh` — 602 assertions, run by the
 `harness-apply-timer` shard of `run-bash-shards.sh`:
 
 | | |

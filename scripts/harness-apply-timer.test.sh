@@ -2202,7 +2202,10 @@ printf '#!/usr/bin/env bash\nbash "$(dirname "$0")/inner/%s" "$@" 2>&1 | tee -a 
 printf '#!/usr/bin/env bash\nbash "$(dirname "$0")/inner/%s" "$@" 2>&1 | tee -a "$(dirname "$0")/log.txt"\n' healthy.sh >"$T/t24ap/wrap-healthy.sh"
 chmod +x "$T/t24ap/wrap-drifting.sh" "$T/t24ap/wrap-healthy.sh" "$T/t24ap/inner/drifting.sh" "$T/t24ap/inner/healthy.sh"
 OUT="$(HARNESS_APPLY_FARM_CHECKER="$T/t24ap/wrap-drifting.sh" run_pass "$T/t24ap" 2>&1)"; RC=$?
-assert_eq "$RC" "24" "T24 control: a wrapper that exits 0 over a DRIFTING farm is RED (24), never a green pass"
+# ⛔ THIS RUN'S OUTPUT, KEPT: the STALE-allow-list pin below is about the DRIFTING arm, and reading the
+# healthy run's `$OUT` made that pin unfailable (review round 34, measured: dropping `STALE` from the
+# allow-list kept the suite green because the assertion looked at output that can never carry the phrase).
+OUT24AP_D="$OUT"
 assert_absent "$OUT" "farm: ok" "T24 control: and the pass does not print the matched-farm sentence over a report that names drift"
 assert_contains "$OUT" "exited 0 but its output reports drift" "T24 control: and it says WHY the exit status is not a grade"
 assert_contains "$OUT" "verdict: check-farm-drift: DRIFT — 1 stale" \
@@ -2221,6 +2224,14 @@ assert_contains "$(grep '^remedy=' "$T/t24ap/state/harness-apply.status" 2>/dev/
 # refuse every wrapper on every box and no row would notice.
 OUT="$(HARNESS_APPLY_FARM_CHECKER="$T/t24ap/wrap-healthy.sh" run_pass "$T/t24ap" 2>&1)"; RC=$?
 assert_eq "$RC" "0" "T24 control: a wrapper over a MATCHING farm still passes (the contradiction check does not over-block)"
+# ⛔ AND A KNOWN CLASS TOKEN IS A CLASSIFICATION, NOT AN UNREADABLE ROW (review round 34, measured:
+# dropping `STALE` from the class allow-list left the suite green, and a wrapper over a STALE row at rc=0
+# then recorded "an unclassifiable STALE — this pass cannot count or grade it", denying a
+# classification the pass plainly has). The arm that prints it is the DRIFTING wrapper above, so this
+# reads THIS run's output — the healthy run's `$OUT` can never carry the phrase, which made an earlier
+# version of this row unfailable.
+assert_absent "$OUT24AP_D" "unclassifiable STALE" \
+    "T24 control: a STALE row at rc=0 is named as DRIFT, never as an unclassifiable row"
 assert_contains "$OUT" "farm: ok" "T24 control: and it prints the matched-farm sentence"
 assert_contains "$(grep '^farm_n=' "$T/t24ap/state/harness-apply.status" 2>/dev/null || true)" "farm_n=0" \
     "T24 control: with farm_n=0, which on a MATCHED farm is the truth"
@@ -2440,8 +2451,94 @@ FARM
 chmod +x "$T/t24br/two-field-rows.sh"
 OUT="$(HARNESS_APPLY_FARM_CHECKER="$T/t24br/two-field-rows.sh" run_pass "$T/t24br" 2>&1)"; RC=$?
 assert_eq "$RC" "24" "T24 control: an rc=0 report made of TWO-FIELD rows is refused (RED 24)"
+assert_contains "$(cat "$T/t24br/state/harness-apply-farm-rows.txt" 2>/dev/null || true)" "handmade.py" \
+    "T24 control: and the first two-field name is published"
 assert_contains "$(cat "$T/t24br/state/harness-apply-farm-rows.txt" 2>/dev/null || true)" "gone.py" \
-    "T24 control: and both two-field names are published"
+    "T24 control: and the second, so both two-field names are published"
+
+# ⛔ A TOKEN PUNCTUATED BY A SUFFIX IS THE SAME CLASS (review round 34, measured: the shape gate excluded
+# `.`/`:`/`!`, so `drift.v2` certified `farm: ok` / `farm_rows=none` / `farm_n=0` with no artifact while
+# the same bytes at exit 1 were RED). Mutant that reds these rows: drop `.` (and `:`/`!`) from the class.
+mk_origin t24bs; mk_clone t24bs
+REPO_P="$CLONE"; MODE_P=sync
+mkdir -p "$T/t24bs/home/.pi/agent/scripts"
+cat >"$T/t24bs/dotted-token.sh" <<"FARM"
+#!/usr/bin/env bash
+printf 'check-farm-drift: OK — 5/5 sourced file(s) match the source at origin/main (sync).\n' >&2
+printf '%-46s | %-12s | %-12s | %s\n' 'handmade.py' aaaa11112222 bbbb33334444 drift.v2 >&2
+exit 0
+FARM
+chmod +x "$T/t24bs/dotted-token.sh"
+OUT="$(HARNESS_APPLY_FARM_CHECKER="$T/t24bs/dotted-token.sh" run_pass "$T/t24bs" 2>&1)"; RC=$?
+assert_eq "$RC" "24" "T24 control: an rc=0 report whose row token is PUNCTUATED (drift.v2) is refused (RED 24)"
+assert_contains "$(cat "$T/t24bs/state/harness-apply-farm-rows.txt" 2>/dev/null || true)" "handmade.py" \
+    "T24 control: with the name published, so a refusal costs no name"
+
+# ⛔ AND AN UNDERSCORE ALONE MUST PIN THE CLASS (review round 34, measured: t24bq holds both an underscore
+# and a digit token, so dropping ONLY the underscore from the class left the suite green — the digit row
+# fired instead, and `handmade.py | drift_v2` escaped with `farm: ok` / `farm_rows=none` / `farm_n=0` and
+# no artifact). This fixture's ONLY unclassifiable token is underscore-shaped.
+mk_origin t24bt; mk_clone t24bt
+REPO_P="$CLONE"; MODE_P=sync
+mkdir -p "$T/t24bt/home/.pi/agent/scripts"
+cat >"$T/t24bt/underscore-token.sh" <<"FARM"
+#!/usr/bin/env bash
+printf 'check-farm-drift: OK — 5/5 sourced file(s) match the source at origin/main (sync).\n' >&2
+printf '%-46s | %-12s | %-12s | %s\n' 'handmade.py' aaaa11112222 bbbb33334444 drift_v2 >&2
+exit 0
+FARM
+chmod +x "$T/t24bt/underscore-token.sh"
+OUT="$(HARNESS_APPLY_FARM_CHECKER="$T/t24bt/underscore-token.sh" run_pass "$T/t24bt" 2>&1)"; RC=$?
+assert_eq "$RC" "24" "T24 control: an rc=0 report whose row token carries an UNDERSCORE is refused (RED 24)"
+assert_contains "$(cat "$T/t24bt/state/harness-apply-farm-rows.txt" 2>/dev/null || true)" "handmade.py" \
+    "T24 control: and its name is published"
+
+# ⛔ BUT A PHASE LINE IS NOT A ROW (review round 34, measured: with the row scan widened to two-field
+# lines, a wrapper's `harness-apply: checking farm | starting` phase line beside a HEALTHY instrument
+# refused a proven match at rc 24 and blamed the checker's vocabulary). A row is a path at column 1 with
+# no `PROG: text` prefix; a phase line carries that prefix (and an indented prose line is skipped too).
+mk_origin t24bu; mk_clone t24bu
+REPO_P="$CLONE"; MODE_P=sync
+mkdir -p "$T/t24bu/home/.pi/agent/scripts"
+cat >"$T/t24bu/phase-line.sh" <<"FARM"
+#!/usr/bin/env bash
+printf 'check-farm-drift: OK — 3/3 sourced file(s) match the source at origin/main (sync).\n' >&2
+printf 'harness-apply: checking farm | starting\n' >&2
+printf '   graded 3 files, nothing drifted.\n' >&2
+# ⛔ AND AN INDENTED LINE IS PROSE, NOT A ROW (review round 34, measured: the leading-space skip could be
+# deleted with the suite green, because the prose line above carries no pipe and never reached the token
+# test). This one DOES carry a pipe and a verdict-shaped token; only the indentation keeps it out.
+printf '   handmade.py | drift.v2\n' >&2
+exit 0
+FARM
+chmod +x "$T/t24bu/phase-line.sh"
+OUT="$(HARNESS_APPLY_FARM_CHECKER="$T/t24bu/phase-line.sh" run_pass "$T/t24bu" 2>&1)"; RC=$?
+assert_eq "$RC" "0" "T24 control: a wrapper's phase line beside a healthy instrument never refuses the match"
+assert_contains "$(grep '^farm_n=' "$T/t24bu/state/harness-apply.status" 2>/dev/null || true)" "farm_n=0" \
+    "T24 control: so the proven match is recorded as a match, with no artifact owed"
+assert_absent "$(grep '^remedy=' "$T/t24bu/state/harness-apply.status" 2>/dev/null || true)" "vocabulary has moved on" \
+    "T24 control: and the remedy never blames the checker's vocabulary for a healthy farm"
+
+# ⛔ AND `--quiet` IS NAMED WHERE IT MATTERS (review round 34, measured: deleting the `--quiet` clause
+# from BOTH the journal and `remedy=` left the suite green — no fixture ran a quiet checker, yet the
+# clause is the entire remedy for the one documented flag that suppresses the `OK —` summary).
+mk_origin t24bv; mk_clone t24bv
+REPO_P="$CLONE"; MODE_P=sync
+mkdir -p "$T/t24bv/home/.pi/agent/scripts"
+cat >"$T/t24bv/quiet-ok.sh" <<"FARM"
+#!/usr/bin/env bash
+printf 'check-farm-drift: note — nothing to grade in this run.\n' >&2
+exit 0
+FARM
+chmod +x "$T/t24bv/quiet-ok.sh"
+OUT="$(HARNESS_APPLY_FARM_CHECKER="$T/t24bv/quiet-ok.sh" run_pass "$T/t24bv" 2>&1)"; RC=$?
+assert_eq "$RC" "24" "T24 control: a quiet (verdict-suppressed) exit 0 is refused (24)"
+assert_contains "$(grep '^remedy=' "$T/t24bv/state/harness-apply.status" 2>/dev/null || true)" "--quiet" \
+    "T24 control: and remedy= names --quiet, which is what suppressed the verdict"
+assert_contains "$OUT" "--quiet" \
+    "T24 control: with the journal naming it too, so the operator is not sent to fix the wrong thing"
+assert_contains "$(grep '^farm_n=' "$T/t24bv/state/harness-apply.status" 2>/dev/null || true)" "farm_n=not-graded" \
+    "T24 control: and farm_n= says no grade was produced"
 
 # ⛔ AND THE MIRROR: THE INSTRUMENT'S OWN BENIGN ROW TOKENS MUST NOT TRIP IT (review round 32). A healthy
 # copy prints `ok` rows and a `verdict` header; a farm with a declared local file prints
