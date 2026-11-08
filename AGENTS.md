@@ -670,8 +670,11 @@ three months). Two documented ways it then survives:
 | **`git worktree lock`** | prune skips it **silently** — rc 0, no warning — and `git worktree remove --force` refuses (`cannot remove a locked working tree`). This is the one silent skip. |
 | `git gc` instead of prune | a freshly-dead record is **still listed** after `git gc` — it honours `gc.worktreePruneExpire`, default **3 months** |
 
-Remedy, scoped to **your own** record: `git worktree remove -f -f <path>` — a locked record needs the flag
-twice (`remove -f` refuses with `use 'remove -f -f' to override or unlock first`).
+Remedy, scoped to **your own** record: `git worktree unlock <path> && git worktree remove <path>` — that
+removes a locked record whose directory is gone (measured rc 0) and REFUSES on a tree that still has
+uncommitted work, so it cannot destroy one. Git's own message names the other arm: `remove -f -f`
+overrides the lock **and** the dirty guard (the only guard left), so it silently deletes uncommitted work —
+use it only when you mean to discard the tree.
 ⛔ **Never run a bare `git worktree prune` as housekeeping.** It takes **no path argument**
 (`git worktree prune [-n] [-v] [--expire <expire>]`), so it cannot be scoped: it deregisters EVERY record
 whose directory is momentarily unstat-able — an unmounted volume, a permission blip — destroying an
