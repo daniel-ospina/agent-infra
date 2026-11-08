@@ -1011,6 +1011,7 @@ async function partC() {
 
   const hooksUrl = new URL("./module-load-hooks.mjs", import.meta.url).href;
   const indexUrl = pathToFileURL(INDEX_TS).href;
+  const auditLogUrl = new URL("../shared/audit-log.ts", import.meta.url).href;
 
   // The probe runs in a fresh process so `classify-git.mjs` is genuinely
   // EVALUATED (and throws) instead of being served from a cache. It drives the
@@ -1043,6 +1044,12 @@ const realWarn = console.warn;
 // genuine failure elsewhere in the child stays diagnosable.
 console.warn = (...a) => { warns.push(a.map(String).join(" ")); realWarn(...a); };
 const mod = await import(${JSON.stringify(indexUrl)});
+// The DECLARED vocabulary, read from the real module (hooks strip its types), so the parent can
+// assert the name this extension actually WRITES is a name the repo DECLARES. A type union is
+// invisible at runtime, so without this the two can drift silently — the exact defect the #853
+// review measured (deleting the union member reddened nothing).
+const auditLog = await import(${JSON.stringify(auditLogUrl)});
+const declaredEvents = Array.from(auditLog.GATE_EVENT_NAMES ?? []);
 const notified = [];
 const handlers = new Map();
 mod.default({ on(n, f) { if (!handlers.has(n)) handlers.set(n, []); handlers.get(n).push(f); } });
@@ -1051,7 +1058,7 @@ const start = handlers.get("session_start")?.[0];
 // /resume must not duplicate the banner or the audit row.
 const ctx = { ui: { notify: (msg, level) => notified.push({ msg, level }) } };
 if (typeof start === "function") { await start({}, ctx); await start({}, ctx); }
-process.stdout.write(JSON.stringify({ warns, notified, registered: !!start }) + "\\n");
+process.stdout.write(JSON.stringify({ warns, notified, registered: !!start, declaredEvents }) + "\\n");
 `;
 
   // Hermetic HOME per arm: the gate event lands in $HOME/.pi/agent/audit/
@@ -1126,6 +1133,22 @@ process.stdout.write(JSON.stringify({ warns, notified, registered: !!start }) + 
       typeof rows[0].session_cwd === "string" && rows[0].session_cwd.length > 0 &&
       typeof rows[0].ts === "string",
     `row: ${JSON.stringify(rows[0] ?? null).slice(0, 400)}`);
+
+  // ── C13: the name the guard WRITES is a name the repo DECLARES (#853 review, issue 1).
+  // R6's original "covered" claim cited `audit-log.test.ts`, which never referenced the union —
+  // so deleting the union member reddened nothing. `appendJsonl` takes `Record<string, unknown>`,
+  // so the type cannot catch this either. This row closes it end-to-end: it reads the emitted
+  // event back out of gate-events.jsonl and checks it against the vocabulary the REAL module
+  // exports. Delete the `"guard_degraded"` member and this reddens; typo the emit and C7 reddens.
+  // (Numbered C13 to leave C12/C12b — the PLACEMENT arm below — as the fixer's commit
+  // introduced them; two different assertions on one label is a report that cannot be cited.)
+  const declared = interactive.parsed.declaredEvents ?? [];
+  expectTrue("C13: the event name the guard WRITES is a DECLARED GateEventName (emit ↔ vocabulary pinned end-to-end)",
+    declared.length > 0 && rows.length === 1 && declared.includes(rows[0].event),
+    `emitted=${JSON.stringify(rows[0]?.event ?? null)} declared(${declared.length})=${JSON.stringify(declared).slice(0, 300)}`);
+  expectTrue("C13b: the vocabulary cross-check is not vacuous (the probe really read GATE_EVENT_NAMES)",
+    declared.length >= 10 && declared.includes("gate_bypass"),
+    `declared(${declared.length})=${JSON.stringify(declared).slice(0, 200)}`);
 
   // ── Print mode: the banner + the event must survive, the ui.notify must not fire
   // (a headless lane has no UI; its own log carries the banner — never no surface).

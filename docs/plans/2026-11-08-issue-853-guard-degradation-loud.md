@@ -56,10 +56,13 @@ statement of the registered `session_start` handler:
 2. **`ctx.ui.notify(…, "error")`** in interactive sessions — a warn line in a noisy startup log is
    exactly what nothing reads.
 3. **A durable `guard_degraded` event** in `~/.pi/agent/audit/gate-events.jsonl`
-   (`extension`, `reason`, `error`, `session_cwd`, `ts`), and `"guard_degraded"` added to the
-   `GateEventName` union in `extensions/shared/audit-log.ts` so a report matches on a recorded name
-   rather than a free string. ⛔ That union is DOCUMENTATION, not enforcement: `appendJsonl` takes an
-   unconstrained `event` and no tsconfig covers `extensions/`, so removing the member reddens nothing.
+   (`extension`, `reason`, `error`, `session_cwd`, `ts`), declared in the `GateEventName` vocabulary in
+   `extensions/shared/audit-log.ts` so a report matches on a recorded name rather than a free string.
+   ⛔ The vocabulary is **derived from a runtime `GATE_EVENT_NAMES` array**, not a bare type union:
+   `appendJsonl` takes an unconstrained `event` and no tsconfig covers `extensions/` (they are
+   type-stripped, never typechecked), so a bare union would be DOCUMENTATION and removing a member
+   would redden nothing — measured. With the array, membership is assertable: deleting
+   `"guard_degraded"` reddens `audit-log.test.ts` **and** Part C **C13**.
 
 Properties that make it safe:
 
@@ -81,7 +84,7 @@ Properties that make it safe:
 | `_classifierLoadFailure` | written in the classify-git load `catch` (`index.ts:399-404`, the write at `:402`); read only by `_reportClassifierDegradation` | carries the real load error into the banner and the event's `error` field |
 | `_classifierDegradedPids` | read+written only inside `_reportClassifierDegradation` | once-per-session-process dedupe (mirrors the existing pid-keyed `warnedDeviations`) |
 | `appendJsonl` (`extensions/shared/audit-log.ts`) | imported at `index.ts:147`; existing callers `:539`, `:4094`, `:4711`, `:5347`; new caller in `_reportClassifierDegradation` (`:5110`) | appends one JSONL row to `~/.pi/agent/audit/gate-events.jsonl`; already fail-safe (never throws) |
-| `GateEventName` (`extensions/shared/audit-log.ts:40-63`) | the shape a report/replay MATCHES ON; `extensions/shared/audit-log.test.ts` | `"guard_degraded"` added, with a comment naming the failure mode. ⛔ DOCUMENTATION ONLY: `appendJsonl(entry: Record<string, unknown>)` (`audit-log.ts:72`) takes an unconstrained `event` string and no tsconfig covers `extensions/` (extensions are type-stripped, never typechecked), so nothing ENFORCES the union — deleting the member reddens no suite. The member is the recorded name, not a gate. |
+| `GateEventName` (`extensions/shared/audit-log.ts:44-66`) | the shape a report/replay MATCHES ON; `extensions/shared/audit-log.test.ts`; Part C `C13` | `"guard_degraded"` declared, with a comment naming the failure mode. The vocabulary is a runtime `GATE_EVENT_NAMES` array the type derives from, so membership is ASSERTABLE (`appendJsonl` still takes `Record<string, unknown>`, so the type alone enforces nothing): deleting the member reddens `audit-log.test.ts` + `C13`. |
 | `isPrintMode()` (`extensions/shared/print-mode.ts`) | already imported at `index.ts:146`; new call site in `_reportClassifierDegradation` | suppresses the `ui.notify` arm for headless lanes, which get the banner in their own log |
 | `module-load-hooks.mjs` (`resolve`/`load`) | imported by `test-module-load.mjs` Part B (in-process) and by the new Part C probe (child process) | Part C wraps `load` to make `classify-git.mjs` throw while evaluating — the ONE injection |
 | `test-module-load.mjs` | `ci.yml:980` (per-PR `verify` job) and `ci-main.yml:158` (post-merge `extensions/*/test*.mjs` glob) | Part C runs on the PR lane, so the report is proved before a merge; no new CI step or file registration needed |
@@ -96,12 +99,14 @@ Properties that make it safe:
    print-mode-degraded, healthy control, escape-hatch-on) → **C9** (print mode keeps banner + event,
    no notify), **C11/C11b** (a healthy load reports nothing and really loaded the classifier),
    **C12/C12b** (the report is NOT behind the escape-hatch return — behaviourally, plus a
-   source-order pin so a later refactor cannot silently move it under the hatch).
+   source-order pin so a later refactor cannot silently move it under the hatch), **C13/C13b** (the
+   name the guard WRITES is a name the real module DECLARES — emit ↔ vocabulary, end-to-end).
 4. Mutation proof — every arm must be able to go RED, or it is a pin that cannot fail:
    - delete the `session_start` wiring → **9 red** (C1-C9);
    - delete only the `appendJsonl` block → **3 red** (C7-C9);
-   - move the call BELOW `if (_isAllowMainEdits()) return;` → **12 red** (C1-C9, C12, C12b).
-   All three restored.
+   - move the call BELOW `if (_isAllowMainEdits()) return;` → **12 red** (C1-C9, C12, C12b);
+   - delete the `"guard_degraded"` vocabulary member → **C13 red + `audit-log.test.ts` red**.
+   All four restored.
 
 ## Out of scope — must NOT be raised
 
