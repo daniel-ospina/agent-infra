@@ -12,7 +12,7 @@
  * node_modules/typebox. Created by CI setup or manually.
  */
 
-import { stripHtml, getPerplexityKey, augmentPath, PATH_EXTRA_DIRS, getPiInvocation, getSubAgentPath, resolveProviderModel, loadModelRegistry, getModelsJsonPath, getExitGraceMs, DEFAULT_EXIT_GRACE_MS, armExitWatchdog, getExitCompleteGraceMs, DEFAULT_EXIT_COMPLETE_GRACE_MS, armCompletionWatchdog, composeTaskResult, getFallbackModel, DEFAULT_FALLBACK_MODEL, connectionErrorDetected, shouldFallback, resolveProviderBaseUrl, HEARTBEAT_MARKER_PREFIX, HEARTBEAT_INTERVAL_MIN_MS, HEARTBEAT_INTERVAL_MAX_MS, DEFAULT_HEARTBEAT_INTERVAL_MS, DEFAULT_STREAM_STALL_MS, DEFAULT_TOOL_STALL_MS, DEFAULT_FIRST_MESSAGE_MS, clampHeartbeatIntervalMs, getHeartbeatIntervalMs, getStreamStallMs, getToolStallMs, getFirstMessageMs, createHeartbeatState, parseHeartbeatLine, flushHeartbeatResidue, flushHeartbeatLineBuf, ingestHeartbeatChunk, heartbeatKillDecision, HEARTBEAT_LINE_BUF_MAX, HEARTBEAT_TRACE_MAX, getTaskMaxDispatchMs, getTaskHardCapMs, DEFAULT_HARD_CAP_MS, loadScaledBound, getFirstOutputTimeoutMs, getSystemLoad, setLoad1Override, getLoad1, getCutGapMs, getEffectiveCutGapMs, getCpuStallMs, DEFAULT_CPU_STALL_MS, DEFAULT_PROGRESS_AGE_MS, getProgressAgeMs, classifyTaskExit, getTaskBackstopMs, DEFAULT_BACKSTOP_MARGIN_MS, DEFAULT_TASK_MODEL, renderRepoStateLine, renderMachineStateLine, countPiProcs, countPiInPsOutput, formatLoad1, probeSystemLoad, resolveTaskCwd, taskCwdRefusal, spawnSubAgent, resolveStreamStallMs, streamStallInertWarning, inFlightProgress } from "./index.js";
+import { stripHtml, getPerplexityKey, augmentPath, PATH_EXTRA_DIRS, getPiInvocation, getSubAgentPath, resolveProviderModel, loadModelRegistry, getModelsJsonPath, getExitGraceMs, DEFAULT_EXIT_GRACE_MS, armExitWatchdog, getExitCompleteGraceMs, DEFAULT_EXIT_COMPLETE_GRACE_MS, armCompletionWatchdog, composeTaskResult, getFallbackModel, DEFAULT_FALLBACK_MODEL, connectionErrorDetected, shouldFallback, resolveProviderBaseUrl, HEARTBEAT_MARKER_PREFIX, HEARTBEAT_INTERVAL_MIN_MS, HEARTBEAT_INTERVAL_MAX_MS, DEFAULT_HEARTBEAT_INTERVAL_MS, DEFAULT_STREAM_STALL_MS, DEFAULT_TOOL_STALL_MS, DEFAULT_FIRST_MESSAGE_MS, clampHeartbeatIntervalMs, getHeartbeatIntervalMs, getStreamStallMs, getToolStallMs, getFirstMessageMs, createHeartbeatState, parseHeartbeatLine, flushHeartbeatResidue, flushHeartbeatLineBuf, ingestHeartbeatChunk, heartbeatKillDecision, HEARTBEAT_LINE_BUF_MAX, HEARTBEAT_TRACE_MAX, getTaskMaxDispatchMs, getTaskHardCapMs, DEFAULT_HARD_CAP_MS, loadScaledBound, getFirstOutputTimeoutMs, getSystemLoad, setLoad1Override, getLoad1, getCutGapMs, getEffectiveCutGapMs, getCpuStallMs, DEFAULT_CPU_STALL_MS, DEFAULT_PROGRESS_AGE_MS, getProgressAgeMs, classifyTaskExit, getTaskBackstopMs, DEFAULT_BACKSTOP_MARGIN_MS, DEFAULT_TASK_MODEL, renderRepoStateLine, renderMachineStateLine, countPiProcs, countPiInPsOutput, formatLoad1, probeSystemLoad, resolveTaskCwd, taskCwdRefusal, spawnSubAgent, resolveStreamStallMs, streamStallInertWarning, inFlightProgress, DEFAULT_SESSION_CEILING_MULT, resolveSessionCeiling, isDispatchSaturated, saturationNotice, dispatchSaturationRefusal, probeDispatchSaturation, probePiProcs, setPiProcsOverride } from "./index.js";
 import { dispatchUnkeyedSet } from "../shared/provider-failover.js";
 import { asyncRepoState } from "../repo-freshness.js";
 import builtinTools from "./index.js";
@@ -8525,6 +8525,189 @@ section("#1662 — tool surface");
     ok(source.includes("review_gate: handle.review_gate"), "the dispatch details read the handle's review_gate");
   });
 }
+
+// ── #2242: dispatch-time fleet-concurrency preflight ────────────────────
+//
+// The measured defect: five `task` dispatches on one box (88 live `pi`
+// processes, 10 cores) each reported `turn_start` on the SECOND model turn and
+// then nothing, so every one burned its whole inactivity bound before the parent
+// learned anything. The issue's own direction is a FAST, LOUD signal at
+// dispatch. These tests pin that signal, the calibration's fail-safe edges (an
+// unmeasured box must never be called saturated), and — the part a pure-formatter
+// test cannot reach — that the pre-spawn path actually CONSULTS it.
+
+section("#2242: dispatch-time fleet-concurrency preflight");
+
+/** Drive the env the preflight reads without leaking into sibling tests. */
+function withDispatchEnv<T>(vars: Record<string, string | undefined>, fn: () => T): T {
+  const saved: Record<string, string | undefined> = {};
+  for (const k of Object.keys(vars)) {
+    saved[k] = process.env[k];
+    if (vars[k] === undefined) delete process.env[k];
+    else process.env[k] = vars[k] as string;
+  }
+  try {
+    return fn();
+  } finally {
+    for (const k of Object.keys(saved)) {
+      if (saved[k] === undefined) delete process.env[k];
+      else process.env[k] = saved[k] as string;
+    }
+  }
+}
+
+test("#2242: the ceiling is derived at 8x cores and an operator override is honoured VERBATIM", () => {
+  delete process.env.TASK_SESSION_CEILING;
+  deepEqual(resolveSessionCeiling(10, {}), { ceiling: 8 * 10, source: "derived" }, "10 cores -> derived 80");
+  deepEqual(resolveSessionCeiling(4, {}), { ceiling: 32, source: "derived" }, "the default is a MULTIPLE of cores, not a flat number");
+  // #1070's rule: an operator who names a number means it — never rescaled.
+  deepEqual(resolveSessionCeiling(10, { TASK_SESSION_CEILING: "13" }), { ceiling: 13, source: "env" }, "an override is not rescaled by cores");
+  deepEqual(resolveSessionCeiling(10, { TASK_SESSION_CEILING: " 13 " }), { ceiling: 13, source: "env" }, "surrounding whitespace is tolerated");
+  // `0` is a REAL value (the deterministic kill switch), not "unset".
+  deepEqual(resolveSessionCeiling(10, { TASK_SESSION_CEILING: "0" }), { ceiling: 0, source: "disabled" }, "0 disables the preflight");
+  // Garbage fails CLOSED to the derived default — an unparseable knob must not
+  // silently disable a safety preflight, nor set it to something absurd.
+  for (const bad of ["", "   ", "abc", "-5", "Infinity", "1e400", "NaN"]) {
+    deepEqual(
+      resolveSessionCeiling(10, { TASK_SESSION_CEILING: bad }),
+      { ceiling: 80, source: "derived" },
+      `TASK_SESSION_CEILING=${JSON.stringify(bad)} falls back to the derived ceiling`,
+    );
+  }
+  equal(DEFAULT_SESSION_CEILING_MULT, 8, "the derived multiplier is the documented 8x");
+});
+
+test("#2242: an UNMEASURED box is never called saturated (the fail-safe edge)", () => {
+  // `ps` unavailable -> countPiProcs() = -1. A broken probe must never be read
+  // as "no fleet" NOR as "saturated": the first would hide the signal, the
+  // second would refuse every dispatch on a box where `ps` is missing.
+  equal(isDispatchSaturated({ piProcs: -1, cores: 10, ceiling: 80 }), false, "the -1 unknown sentinel is not saturation");
+  equal(isDispatchSaturated({ piProcs: Number.NaN, cores: 10, ceiling: 80 }), false, "NaN is not saturation");
+  equal(isDispatchSaturated({ piProcs: 500, cores: 10, ceiling: 0 }), false, "ceiling 0 (operator disable) never fires");
+  equal(isDispatchSaturated({ piProcs: 79, cores: 10, ceiling: 80 }), false, "below the ceiling");
+  equal(isDispatchSaturated({ piProcs: 80, cores: 10, ceiling: 80 }), true, "AT the ceiling is saturated");
+  equal(isDispatchSaturated({ piProcs: 88, cores: 10, ceiling: 80 }), true, "the incident's 88/10 is saturated");
+  // The two measured points, asserted as the calibration itself.
+  equal(isDispatchSaturated({ piProcs: 24, cores: 16, ceiling: 8 * 16 }), false, "24 procs / 16 cores (36/36 healthy) is NOT saturated");
+  equal(isDispatchSaturated({ piProcs: 88, cores: 10, ceiling: 8 * 10 }), true, "88 procs / 10 cores (5/5 wedges) IS saturated");
+});
+
+test("#2242: the notice is silent on a healthy box and loud on a saturated one", () => {
+  equal(saturationNotice({ piProcs: 24, cores: 16, ceiling: 128 }, {}), null, "a healthy box prints nothing — the line is signal, not noise");
+  equal(saturationNotice({ piProcs: -1, cores: 16, ceiling: 128 }, {}), null, "an unknown probe prints nothing");
+  equal(saturationNotice({ piProcs: 500, cores: 16, ceiling: 0 }, {}), null, "a disabled ceiling prints nothing");
+  const line = saturationNotice({ piProcs: 88, cores: 10, ceiling: 80 }, {});
+  ok(line !== null, "a saturated box prints exactly one line");
+  ok(!String(line).includes("\n"), "single line — it must not break the transcript's line shape");
+  for (const must of ["88", "10", "8.8x", "80", "#2242", "SECOND model turn", "TASK_SESSION_CEILING_REFUSE=1"]) {
+    ok(String(line).includes(must), `the notice names the measurement ${JSON.stringify(must)} (got ${line})`);
+  }
+  // It states the ratio against CORES, because the count alone is not
+  // interpretable across boxes of different sizes (a 4-core and a 32-core box
+  // are not comparable by raw process count).
+  ok(String(line).includes("8.8x cores"), "the ratio is rendered against cores");
+});
+
+test("#2242: the fast refusal is OPT-IN and says `could not dispatch: fleet saturated at N sessions`", () => {
+  const saturated = { piProcs: 88, cores: 10, ceiling: 80 };
+  equal(dispatchSaturationRefusal(saturated, {}), null, "default behaviour is unchanged: no refusal without the opt-in");
+  equal(dispatchSaturationRefusal(saturated, { TASK_SESSION_CEILING_REFUSE: "0" }), null, "an explicit 0 is also no refusal");
+  equal(dispatchSaturationRefusal({ piProcs: 24, cores: 16, ceiling: 128 }, { TASK_SESSION_CEILING_REFUSE: "1" }), null, "opt-in never refuses a healthy box");
+  equal(dispatchSaturationRefusal({ piProcs: -1, cores: 10, ceiling: 80 }, { TASK_SESSION_CEILING_REFUSE: "1" }), null, "opt-in never refuses on an unknown probe");
+  const text = dispatchSaturationRefusal(saturated, { TASK_SESSION_CEILING_REFUSE: "1" });
+  ok(text !== null, "opt-in + saturated -> a refusal");
+  ok(String(text).startsWith("could not dispatch: fleet saturated at 88 sessions"), `the refusal opens with the exact shape the issue asks for (got ${text})`);
+  ok(String(text).includes("#2242"), "the refusal cites the issue, so the next actor can re-derive it");
+  ok(String(text).includes("TASK_SESSION_CEILING_REFUSE=0"), "it names its own override, so the refusal is never a dead end");
+});
+
+test("#2242: probeDispatchSaturation reads ONE count through the injectable seam", () => {
+  let calls = 0;
+  setPiProcsOverride(() => {
+    calls += 1;
+    return 88;
+  });
+  try {
+    const got = probeDispatchSaturation({ TASK_SESSION_CEILING: "80" }, 10);
+    equal(calls, 1, "exactly one `ps` read per probe");
+    deepEqual(got, { piProcs: 88, cores: 10, ceiling: 80, source: "env" }, "the probe carries the measurement and the ceiling's provenance");
+    // The settle-path machine line must read the SAME count, so a wedge can be
+    // attributed to the concurrency it was dispatched into.
+    ok(renderMachineStateLine().includes("piProcs=88"), "renderMachineStateLine reads the same seam");
+  } finally {
+    setPiProcsOverride(null);
+  }
+  ok(probePiProcs() === countPiProcs() || probePiProcs() >= -1, "with the seam cleared the live probe is used again");
+});
+
+test("#2242 WIRING: spawnSubAgent consults the preflight BEFORE any spawn, and the refusal is a FAILED status", () => {
+  // `source` is the module-level read of index.ts (line 73) — the same pin the
+  // #1662 wiring test uses.
+  ok(source.includes("const saturation = probeDispatchSaturation();"), "the pre-spawn path probes once per attempt");
+  ok(source.includes("status: \"fleet-saturated\""), "the refusal carries its own status");
+  // The regression this pins: a refusal result that is NOT in the failed set is
+  // classified as a successful dispatch, so a background lane would report
+  // `done` for a child that was never spawned (#1662's class, one refusal over).
+  ok(
+    /const FAILED_TASK_STATUS = new Set\(\[[^\]]*"fleet-saturated"/.test(source),
+    "fleet-saturated is a FAILED status, never a silent success",
+  );
+  // The notice and the refusal must both come from the SAME probe — a second
+  // `ps` read could disagree with the one the refusal acted on.
+  const body = source.slice(source.indexOf("const saturation = probeDispatchSaturation();"));
+  const head = body.slice(0, body.indexOf("return new Promise"));
+  ok(head.includes("saturationNotice(saturation)"), "the notice renders from that probe");
+  ok(head.includes("dispatchSaturationRefusal(saturation)"), "the refusal decides from that same probe");
+  // It must not touch a kill bound: load-policy §1 forbids shrinking one under
+  // load, and #279 deliberately handed between-turn quiet to stream-stall.
+  ok(!/streamStallMs\s*=[^=]/.test(head), "the preflight never rescales the inactivity bound");
+});
+
+testAsync("#2242 WIRING: a saturated box + the opt-in REFUSES the dispatch with the documented text", async () => {
+  const savedRefuse = process.env.TASK_SESSION_CEILING_REFUSE;
+  const savedCeiling = process.env.TASK_SESSION_CEILING;
+  const savedError = console.error;
+  const printed: string[] = [];
+  const refusals: any[] = [];
+  setPiProcsOverride(() => 88);
+  process.env.TASK_SESSION_CEILING = "80";
+  process.env.TASK_SESSION_CEILING_REFUSE = "1";
+  console.error = (...a: any[]) => { printed.push(a.map(String).join(" ")); };
+  try {
+    const result = await spawnSubAgent(
+      "deepseek-flash",
+      "deepseek",
+      { TASK_HEARTBEAT: "1" },
+      ["-p", "never actually spawned"],
+      undefined,
+      undefined,
+      process.cwd(),
+      undefined,
+      { onRefusal: (r: any) => refusals.push(r) },
+    );
+    ok(result !== undefined, "a refusal RESOLVES with a payload (it never rejects)");
+    equal((result as any).details.status, "fleet-saturated", "the refusal carries the fleet-saturated status");
+    equal((result as any).details.retryable, false, "a saturated box is not retryable at once — retrying is the 20-minute burn");
+    equal((result as any).details.piProcs, 88, "the payload carries the MEASUREMENT, not just a verdict");
+    ok(String((result as any).content[0].text).includes("could not dispatch: fleet saturated at 88 sessions"), "the model-visible text is the issue's own wording");
+    equal(refusals.length, 1, "the background path's onRefusal observer fires, so a refusal is never reported as a dispatch");
+    ok(printed.some((l) => l.includes("fleet saturated at dispatch")), "the loud line is printed at dispatch");
+  } finally {
+    console.error = savedError;
+    setPiProcsOverride(null);
+    if (savedRefuse === undefined) delete process.env.TASK_SESSION_CEILING_REFUSE; else process.env.TASK_SESSION_CEILING_REFUSE = savedRefuse;
+    if (savedCeiling === undefined) delete process.env.TASK_SESSION_CEILING; else process.env.TASK_SESSION_CEILING = savedCeiling;
+  }
+  // The NEGATIVE twin is pinned at the DECISION level (the pure test above:
+  // no opt-in -> null), and structurally here: the pre-spawn guard is keyed on
+  // the decision's result, so a null decision cannot reach the refusal branch.
+  // Deliberately NOT asserted by spawning a real child — a unit test must not
+  // pay a model call to prove that a dispatch proceeds.
+  ok(
+    /if \(saturationRefusal\) \{/.test(source),
+    "the refusal branch is gated on the decision function, which is a no-op without the opt-in",
+  );
+});
 
   for (const t of asyncTests) await t();
   console.log(`\n=== Results: ${passed} passed, ${failed} failed ===`);

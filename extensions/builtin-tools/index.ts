@@ -3311,6 +3311,171 @@ export function formatLoad1(v: number | null): string {
   return v === null ? "unknown" : String(v);
 }
 
+// ── #2242: dispatch-time fleet-concurrency preflight ────────────────────────
+//
+// WHY. `task` sub-agents were measured hanging on the SECOND model turn — five
+// dispatches, two models, one box at 88 concurrent `pi` processes and load 28
+// (issue #2242). Every attempt reported `turn_start` and then nothing, so the
+// parent could not tell a throttled/hung provider request apart from a slow
+// child and each dispatch burned its whole inactivity bound (S = 20 min, or the
+// per-dispatch override) before reporting zero output. A lane needs to know
+// WITHIN SECONDS that the box cannot serve a dispatch, because the only
+// alternatives to that knowledge are (a) wait out the bound and (b) bypass the
+// review gate the dispatch existed to satisfy — and (b) is the one an agent
+// under time pressure picks.
+//
+// WHAT THIS IS NOT. It adjusts NO kill bound. `docs/ops/load-policy.md` §1
+// records that watchdog bounds SCALE WITH LOAD and never shrink, and #279
+// deliberately handed the between-turn quiet to `stream-stall` (S) rather than a
+// short per-turn cut so that a demonstrably-working child is never killed. A
+// preflight that shortened S on a loaded box would reverse both. So the
+// measurement is taken ONCE per dispatch, BEFORE any spawn, and it can only ever
+// act on the DISPATCH — never on a child already running.
+//
+// WHAT IT DOES.
+//   · every dispatch measures the box with `countPiProcs()` — the SAME probe the
+//     `Alive state:` machine line renders, so the two readings are comparable;
+//   · over the ceiling it prints ONE loud line naming the measurement, the
+//     ceiling and the ratio — a measurement, never a verdict;
+//   · with `TASK_SESSION_CEILING_REFUSE=1` it REFUSES the dispatch in about a
+//     second — `could not dispatch: fleet saturated at N sessions` — instead of
+//     spawning a child that will burn the bound.
+//
+// CALIBRATION, stated rather than hidden. The derived ceiling is 8× cores
+// because the one measured failure is 88 `pi` processes on 10 cores (8.8×),
+// while a controlled probe completed 36/36 two-tool-call children at up to 24
+// concurrent `pi` processes on 16 cores (≤2.1×, 8–14 s each) — see #2242. There
+// is NO measurement between those points, so the default sits at the high-water
+// mark: it can only fire on a box shaped like the incident. Refusing by default
+// would risk bricking a legitimately busy fleet on a number nobody measured, so
+// the refusal is opt-in and the notice is unconditional.
+
+/** #2242: the derived ceiling, as a MULTIPLE OF CORES. See the calibration note
+ * above before changing it: the only two measured points are ≤2.1× (healthy,
+ * 36/36 dispatches) and 8.8× (five consecutive second-turn wedges). */
+export const DEFAULT_SESSION_CEILING_MULT = 8;
+
+export interface SessionCeiling {
+  /** Absolute live-`pi`-process count at/above which the box is "saturated".
+   * `0` = the operator disabled the preflight (`TASK_SESSION_CEILING=0`). */
+  ceiling: number;
+  source: "env" | "derived" | "disabled";
+}
+
+/** Valid env ceiling: absent/blank/non-finite/negative → the derived default;
+ * `0` is VALID and disables the preflight — the same `0`-is-a-real-value hook
+ * `scripts/load-gate.mjs` documents for `LOAD_SUSPEND_THRESHOLD`, so a
+ * deterministic-kill-switch test needs no monkeypatching. A positive value is
+ * honoured verbatim (floored to an integer, min 1): an operator who names a
+ * number means it, and silently rescaling it is the rule #1070 forbids. */
+export function resolveSessionCeiling(
+  cores: number,
+  env: Record<string, string | undefined> = process.env,
+): SessionCeiling {
+  const raw = env.TASK_SESSION_CEILING;
+  const s = typeof raw === "string" ? raw.trim() : "";
+  if (s !== "") {
+    const n = Number(s);
+    if (Number.isFinite(n) && n >= 0) {
+      if (n === 0) return { ceiling: 0, source: "disabled" };
+      return { ceiling: Math.max(1, Math.floor(n)), source: "env" };
+    }
+  }
+  const c = Number.isFinite(cores) && cores > 0 ? Math.floor(cores) : 1;
+  return { ceiling: DEFAULT_SESSION_CEILING_MULT * c, source: "derived" };
+}
+
+/** #2242: the measured input to the preflight. `piProcs` is `countPiProcs()`'s
+ * tri-state count-or-`-1`, deliberately NOT narrowed to a number here so the
+ * unknown case stays visible at the decision. */
+export interface SaturationInput {
+  piProcs: number;
+  cores: number;
+  ceiling: number;
+}
+
+/** The ceiling must never fire on an UNMEASURED box. `-1`/NaN (`ps` could not
+ * run) is "unknown", not "no fleet" and not "saturated" — the same fail-safe
+ * direction `countPiProcs` already takes, and the reason a refusal can never be
+ * triggered by a broken probe. `0` is the operator's disable. */
+export function isDispatchSaturated(i: SaturationInput): boolean {
+  if (!(i.ceiling > 0)) return false;
+  if (!Number.isFinite(i.piProcs) || i.piProcs < 0) return false;
+  return i.piProcs >= i.ceiling;
+}
+
+function saturationCores(i: SaturationInput): number {
+  return Number.isFinite(i.cores) && i.cores > 0 ? Math.floor(i.cores) : 1;
+}
+
+/** #2242: the ONE loud line printed at dispatch when the box is at/above its
+ * ceiling. Returns `null` when there is nothing measured to report (under the
+ * ceiling, ceiling disabled, or probe unknown) — so a healthy box stays silent
+ * and the line is signal rather than noise. */
+export function saturationNotice(
+  i: SaturationInput,
+  env: Record<string, string | undefined> = process.env,
+): string | null {
+  if (!isDispatchSaturated(i)) return null;
+  const cores = saturationCores(i);
+  const ratio = (i.piProcs / cores).toFixed(1);
+  const refusing = env.TASK_SESSION_CEILING_REFUSE === "1";
+  return (
+    `[task] ⚠️ fleet saturated at dispatch: ${i.piProcs} live pi sessions on ${cores} cores ` +
+    `(${ratio}x cores, ceiling ${i.ceiling}) — a dispatch here may wedge on its SECOND model turn ` +
+    `and then burn its whole inactivity bound (#2242). ` +
+    (refusing
+      ? `TASK_SESSION_CEILING_REFUSE=1 is set, so this dispatch is REFUSED before any spawn.`
+      : `Set TASK_SESSION_CEILING_REFUSE=1 to fail fast instead of waiting the bound, or ` +
+        `TASK_SESSION_CEILING=<n> to move the ceiling (0 disables the preflight).`)
+  );
+}
+
+/** #2242: the fast-refusal text, VERBATIM the shape the issue asks for
+ * (`could not dispatch: fleet saturated at N sessions`). Opt-in only
+ * (`TASK_SESSION_CEILING_REFUSE=1`): the ceiling's calibration has no
+ * measurement between 2.1× and 8.8× cores, and a default refusal on an
+ * unmeasured number could brick a legitimately busy fleet — the failure the
+ * notice exists to make visible is a slow dispatch, the failure a wrong refusal
+ * would cause is no dispatch at all. */
+export function dispatchSaturationRefusal(
+  i: SaturationInput,
+  env: Record<string, string | undefined> = process.env,
+): string | null {
+  if (env.TASK_SESSION_CEILING_REFUSE !== "1") return null;
+  if (!isDispatchSaturated(i)) return null;
+  const cores = saturationCores(i);
+  return (
+    `could not dispatch: fleet saturated at ${i.piProcs} sessions on ${cores} cores ` +
+    `(ceiling ${i.ceiling}) — refusing in about a second rather than spawning a child that would ` +
+    `burn its whole inactivity bound on the second model turn (#2242). Free capacity, or set ` +
+    `TASK_SESSION_CEILING_REFUSE=0 to dispatch anyway.`
+  );
+}
+
+/** #2242: test seam for the live `pi` process count — the exact shape
+ * `setLoad1Override` already uses for the sibling machine measurement, so the
+ * preflight can be driven WITHOUT a real fleet (and without a flaky `ps`
+ * reading) from a test. `null` restores the live probe. */
+let _piProcsOverride: (() => number) | null = null;
+export function setPiProcsOverride(fn: (() => number) | null): void { _piProcsOverride = fn; }
+/** #2242: the count the preflight reads — the injectable seam when set, else
+ * `countPiProcs()` (whose failure sentinel `-1` is preserved verbatim). */
+export function probePiProcs(): number {
+  return _piProcsOverride ? _piProcsOverride() : countPiProcs();
+}
+
+/** #2242: one probe per dispatch — cores and ceiling resolved from env, the
+ * live count from the shared `ps` reader. Never throws: a failed `ps` yields the
+ * `-1` unknown sentinel, which every predicate above treats as "do not act". */
+export function probeDispatchSaturation(
+  env: Record<string, string | undefined> = process.env,
+  cores: number = cpus().length,
+): SaturationInput & { source: SessionCeiling["source"] } {
+  const { ceiling, source } = resolveSessionCeiling(cores, env);
+  return { piProcs: probePiProcs(), cores, ceiling, source };
+}
+
 /**
  * #1485 (from tortoise#3001): machine-level starvation evidence for the
  * single-line `Alive state:` rendering.
@@ -3335,7 +3500,7 @@ export function renderMachineStateLine(): string {
   // to return for bound scaling (#1485 review P2).
   const load1 = probeLoad1();
   const freeMB = Math.round(freemem() / (1024 * 1024));
-  return `load1=${formatLoad1(load1)} cores=${cpus().length} freeMB=${freeMB} piProcs=${countPiProcs()}`;
+  return `load1=${formatLoad1(load1)} cores=${cpus().length} freeMB=${freeMB} piProcs=${probePiProcs()}`;
 }
 
 // ── #783 Task 3: the ONE abnormal-exit composer ─────────────────────
@@ -3541,6 +3706,37 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
     // observed, so `pid === null` is its only synchronous signal that no child
     // exists. Report the refusal through the observer so the handle is not
     // rendered as a successful dispatch.
+    observers?.onRefusal?.(refusal);
+    return Promise.resolve(refusal);
+  }
+  // #2242: fleet-concurrency preflight — the SECOND pre-spawn refusal, and the
+  // only one whose evidence is the BOX rather than the arguments. Placed here
+  // (after the cwd check, before the Promise) for the same reason: no spawn
+  // attempt runs, so no outcome row is owed, and both dispatch paths (blocking
+  // and `background: true`) get it through `observers.onRefusal`.
+  //
+  // It measures ONCE per attempt and it never touches a kill bound — the
+  // reasoning, the calibration and why the refusal is opt-in are in the
+  // `#2242` block above `resolveSessionCeiling`.
+  const saturation = probeDispatchSaturation();
+  const saturationWarning = saturationNotice(saturation);
+  if (saturationWarning) console.error(saturationWarning);
+  const saturationRefusal = dispatchSaturationRefusal(saturation);
+  if (saturationRefusal) {
+    const refusal: PreSpawnRefusal = {
+      content: [{ type: "text", text: `❌ ${saturationRefusal}` }],
+      details: {
+        model,
+        provider,
+        status: "fleet-saturated",
+        retryable: false,
+        error: saturationRefusal,
+        piProcs: saturation.piProcs,
+        cores: saturation.cores,
+        ceiling: saturation.ceiling,
+        cwd: resolveTaskCwd(cwd),
+      },
+    };
     observers?.onRefusal?.(refusal);
     return Promise.resolve(refusal);
   }
@@ -4541,7 +4737,7 @@ type TaskResultDetails = {
  * maintainer to the wrong construct. Guarded by builtin-tools.test.ts, which
  * exercises every member through the registered hook and pins that an unknown
  * status stays a success. */
-const FAILED_TASK_STATUS = new Set(["failed", "circuit_open", "invalid-cwd", "invalid-session-id"]);
+const FAILED_TASK_STATUS = new Set(["failed", "circuit_open", "invalid-cwd", "invalid-session-id", "fleet-saturated"]);
 
 // ── #1662: background dispatch (returns-early) + status/collect seam ────────
 //
