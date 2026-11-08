@@ -1,0 +1,42 @@
+{
+  "_ref": "refs/lanes/cmux.kprfix-prd-daniel-ospina-tortoise-11508-1794116005-p81132-0ebddc44",
+  "_sha": "2759069a0eb6a5962152718d43b8bf6aa487f663",
+  "artifacts": [
+    {
+      "kind": "log",
+      "value": "/home/cmux/orchestrator/bg/prd-daniel-ospina-tortoise-11508.log"
+    },
+    {
+      "kind": "branch",
+      "value": "fix/11202-claim-gate-board"
+    },
+    {
+      "kind": "sha",
+      "value": "f42f0a1b5550e6bf1ddf67354c0d4ecdbbbccdd8"
+    },
+    {
+      "kind": "worktree",
+      "value": "/home/cmux/tortoise/.worktrees/prd-11508"
+    }
+  ],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 7800,
+  "duration_s": 1470,
+  "ended_at": 1794117475,
+  "exit_code": 0,
+  "heartbeat_at": 1794117475,
+  "host": "cmux",
+  "issue": null,
+  "kind": "prfix",
+  "lane_id": "cmux.kprfix-prd-daniel-ospina-tortoise-11508-1794116005-p81132-0ebddc44",
+  "lease_until": 1794125275,
+  "pid": 81132,
+  "reason": null,
+  "repo": "daniel-ospina/tortoise",
+  "schema": 1,
+  "started_at": 1794116005,
+  "state": "DONE",
+  "tag": "prd-daniel-ospina-tortoise-11508",
+  "worktree": "/home/cmux/tortoise/.worktrees/prd-11508"
+}
