@@ -7572,6 +7572,12 @@ test("#1508 — the registered tool_result handler turns a failed child into isE
   // like every other member — the docstring's "exercises every member" claim is only true if this
   // row exists. Its shape is the pre-spawn payload: no exitCode, no isError, `retryable:false`.
   deepEqual(h({ toolName: "task", isError: false, details: { status: "fleet-saturated", retryable: false, piProcs: 88, cores: 10, ceiling: 80 } }), { isError: true }, "a refused dispatch (fleet saturated) is a failure");
+  // #1208: the slow-start death. Same rule as #2242 above — a member of the set is only
+  // "exercised" if this test has a row for it. This is also the ONLY route by which the flag
+  // actually reaches the caller: `finalizeExecutedToolCall` rebuilds the result from a field
+  // allow-list, so an `isError` on the object `execute()` returned is dropped (see the hook's own
+  // note) — the `tool_result` handler is what makes the model see the error.
+  deepEqual(h({ toolName: "task", isError: false, details: { status: "died-before-first-message", childMessagesSent: 0, childState: "died-before-first-message", childExited: true } }), { isError: true }, "a child that died before its first message is a FAILURE, never an empty success");
   deepEqual(h({ toolName: "task", isError: false, details: { failoverHopSpawnFailed: true } }), { isError: true }, "a hop leg that never produced a result is a failure");
   equal(h({ toolName: "task", isError: false, details: { exitCode: null } }), undefined, "a null exit is a settle (composeTaskResult's own okExit contract)");
   equal(h({ toolName: "task", isError: false, details: { exitCode: 0 } }), undefined, "exit 0 is a settle");
@@ -8890,7 +8896,7 @@ testAsync("#1208 (E2E): a child that exits 0 with zero completed messages is a D
     equal(dd.childState, "died-before-first-message", "the distinct state the issue asks for");
     equal(dd.status, "died-before-first-message", "…carried as a machine `status` a consumer can branch on");
     equal(dd.isError, true, "…and as a failure in the load-order-independent form");
-    equal((died as any).isError, true, "…and as a TOOL-LEVEL error, so a parent's default handling is to stop (ask 4)");
+    equal((died as any).isError, true, "…and flagged on the returned payload (the #1508 hook is what delivers it to the model — pi drops the field here)");
     equal(typeof dd.childPid, "number", "the pid is on the result (ask 1) — no `ps` guessing required");
     equal(dd.childExited, true, "the child is known to be gone");
     ok(TASK_LIVENESS_DETAIL_KEYS.every((k) => k in dd), `all of ${TASK_LIVENESS_DETAIL_KEYS.join(",")} are present`);
