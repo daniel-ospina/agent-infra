@@ -215,14 +215,21 @@ env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
 # lane shell through the tmux server — `scripts/cloud-cell-quiesce.sh:279`). Under the inherited value the
 # foreground arm is taken, `orch-loop.sh` exits 78, and these very assertions go RED with `start_rc=78`
 # (measured: 115 passed / 3 failed here, against 115/0 for `origin/main` — the file this PR starts from,
-# i.e. post-#3760; the PRE-#3760 file is 98/17, the 17 being the ambient-`GH_REPO` failures #3760 fixed)
-# — i.e. the box would decide
-# the result, which is the same class this file already neutralises for `GH_REPO` at `:40`.
+# i.e. POST-#3760). The PRE-#3760 file is 98/17, but those 17 are not ONE cause: #3760 closed THREE
+# co-located fixture gaps (`python3` stubbed as `exit 0`, a missing provider store at `auth.json`, and the
+# ambient-`GH_REPO` unset) — the bare pre-#3760 figure measures the first two, and deleting ONLY the `unset`
+# from `origin/main`'s otherwise-fixed file also gives 98/17. So the box would decide the result — the same
+# class this file already neutralises for `GH_REPO` at `:40`.
 # So `cell_start` now PINS `ORCH_FOREGROUND=0`, the idiom every other `start` caller already uses for exactly
 # this reason (`watchdog-loop.sh:1046`, `orchestrator-bringup.sh:1037`, `cloud-cell-quiesce.sh:286`, #2402),
 # and an inherited `=1` cannot ride in.
-# So the rc is ASSERTED again — the only whole-`start` success assertion KIND in this suite, at `:364`,
-# `:378` and `:390` (each passing `"$start_rc"`, not the provision probe's `$rc`) — and without it
+# So the rc is ASSERTED again — the only whole-`start` success assertion KIND in this suite. There are three,
+# and they are the `ck "… SUCCEEDED …" "$start_rc"` calls: each passes the start's OWN rc, and each sits
+# directly BELOW a provision probe that asserts a DIFFERENT `$rc`. ⛔ That adjacency is why no line number is
+# given here: this block previously cited them as `:363`/`:377`/`:389` and then `:364`/`:378`/`:390`, and BOTH
+# were wrong inside one commit — the first named the probes, and the "fix" named the probe's `[ -x … ]`
+# guard, because editing the comment above had shifted every line it pointed at. Grep for the LABEL, never
+# the number. And without this assertion
 # a `start` that provisions the recorder and then `die`s (a failing `cmd_check` after the seed, a failing
 # `start_doctor_loop`) passes every arm here — a regression this suite exists to catch, hiding behind a
 # comment about a timeout that cannot happen.
