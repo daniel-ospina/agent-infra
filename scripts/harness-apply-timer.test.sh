@@ -2358,12 +2358,15 @@ assert_contains "$(head -1 "$T/t24az/state/harness-apply-farm-rows.txt" 2>/dev/n
 mk_origin t24bn; mk_clone t24bn
 REPO_P="$CLONE"; MODE_P=sync
 mkdir -p "$T/t24bn/home/.pi/agent/scripts"
+# ⛔ SUMMARY ONLY — NO ROWS (review round 33, measured: with both signals in one fixture, deleting the
+# whole summary block left the suite green because the ROWS fired instead, so nothing pinned the summary
+# half at all). This output carries no `|` anywhere, so only the summary signal can refuse it.
 cat >"$T/t24bn/uncountable-summary.sh" <<"FARM"
 #!/usr/bin/env bash
 printf 'check-farm-drift: OK — 5/5 sourced file(s) match the source at origin/main (sync).\n' >&2
-printf '%-46s | %-12s | %-12s | %s\n' 'handmade.py' aaaa11112222 bbbb33334444 drift >&2
-printf '%-46s | %-12s | %-12s | %s\n' 'gone.py' aaaa11112222 - missing >&2
 printf 'check-farm-drift: summary — 2 drift, 0 stale, 0 declared-but-absent, 0 unsourced, of 5 deployed file(s).\n' >&2
+printf '   handmade.py could not be compared.\n' >&2
+printf '   gone.py could not be compared.\n' >&2
 exit 0
 FARM
 chmod +x "$T/t24bn/uncountable-summary.sh"
@@ -2371,8 +2374,10 @@ OUT="$(HARNESS_APPLY_FARM_CHECKER="$T/t24bn/uncountable-summary.sh" run_pass "$T
 assert_eq "$RC" "24" "T24 control: an rc=0 report carrying a summary this pass CANNOT count is RED (24)"
 assert_contains "$OUT" "cannot count or grade it" \
     "T24 control: and the journal says it could not read the report, not that the farm matched"
+assert_contains "$OUT" "an unclassifiable summary" \
+    "T24 control: and it names the SUMMARY as the unreadable part, which is the signal this fixture owns"
 assert_contains "$(cat "$T/t24bn/state/harness-apply-farm-rows.txt" 2>/dev/null || true)" "handmade.py" \
-    "T24 control: with both names published durably, so a refusal costs no name"
+    "T24 control: with the output published durably, so a refusal costs no name"
 assert_contains "$(grep '^farm_n=' "$T/t24bn/state/harness-apply.status" 2>/dev/null || true)" "farm_n=not-graded" \
     "T24 control: and farm_n= says no grade was produced"
 assert_contains "$(grep '^remedy=' "$T/t24bn/state/harness-apply.status" 2>/dev/null || true)" "vocabulary has moved on" \
@@ -2395,6 +2400,48 @@ assert_contains "$OUT" "cannot count or grade it" \
     "T24 control: and the journal names the unclassifiable row, not a match"
 assert_contains "$(cat "$T/t24bo/state/harness-apply-farm-rows.txt" 2>/dev/null || true)" "gone.py" \
     "T24 control: with the names published, since a refusal never costs one"
+
+# ⛔ A VOCABULARY THAT DRIFTED BY A SUFFIX IS STILL A ROW THIS PASS CANNOT CLASS (review round 33,
+# measured: the unknown-token class admitted only letters, spaces and dashes, so `drift_v2` fell outside
+# it, the row scan printed nothing, and an rc=0 report with two drifting files certified `farm: ok` /
+# `farm_rows=none` / `farm_n=0` with NO artifact). Mutant that reds these rows: narrow the token class
+# back to `^[A-Za-z][A-Za-z ()-]*$`.
+mk_origin t24bq; mk_clone t24bq
+REPO_P="$CLONE"; MODE_P=sync
+mkdir -p "$T/t24bq/home/.pi/agent/scripts"
+cat >"$T/t24bq/suffixed-tokens.sh" <<"FARM"
+#!/usr/bin/env bash
+printf 'check-farm-drift: OK — 5/5 sourced file(s) match the source at origin/main (sync).\n' >&2
+printf '%-46s | %-12s | %-12s | %s\n' 'handmade.py' aaaa11112222 bbbb33334444 drift_v2 >&2
+printf '%-46s | %-12s | %-12s | %s\n' 'gone.py' aaaa11112222 - NOT-LANDED2 >&2
+exit 0
+FARM
+chmod +x "$T/t24bq/suffixed-tokens.sh"
+OUT="$(HARNESS_APPLY_FARM_CHECKER="$T/t24bq/suffixed-tokens.sh" run_pass "$T/t24bq" 2>&1)"; RC=$?
+assert_eq "$RC" "24" "T24 control: an rc=0 report whose row token drifted by a SUFFIX is refused (RED 24)"
+assert_contains "$OUT" "cannot count or grade it" \
+    "T24 control: and the journal names the unclassifiable row"
+assert_contains "$(cat "$T/t24bq/state/harness-apply-farm-rows.txt" 2>/dev/null || true)" "handmade.py" \
+    "T24 control: with the names published under NO GRADE, so a refusal costs no name"
+
+# ⛔ AND A TWO-FIELD ROW IS A ROW (review round 33, measured: the scan required four fields, so
+# `handmade.py | drift` was skipped entirely and certified as a match). Mutant that reds these rows:
+# `NF >= 2` back to `NF >= 4`.
+mk_origin t24br; mk_clone t24br
+REPO_P="$CLONE"; MODE_P=sync
+mkdir -p "$T/t24br/home/.pi/agent/scripts"
+cat >"$T/t24br/two-field-rows.sh" <<"FARM"
+#!/usr/bin/env bash
+printf 'check-farm-drift: OK — 5/5 sourced file(s) match the source at origin/main (sync).\n' >&2
+printf 'handmade.py | drift\n' >&2
+printf 'gone.py | missing\n' >&2
+exit 0
+FARM
+chmod +x "$T/t24br/two-field-rows.sh"
+OUT="$(HARNESS_APPLY_FARM_CHECKER="$T/t24br/two-field-rows.sh" run_pass "$T/t24br" 2>&1)"; RC=$?
+assert_eq "$RC" "24" "T24 control: an rc=0 report made of TWO-FIELD rows is refused (RED 24)"
+assert_contains "$(cat "$T/t24br/state/harness-apply-farm-rows.txt" 2>/dev/null || true)" "gone.py" \
+    "T24 control: and both two-field names are published"
 
 # ⛔ AND THE MIRROR: THE INSTRUMENT'S OWN BENIGN ROW TOKENS MUST NOT TRIP IT (review round 32). A healthy
 # copy prints `ok` rows and a `verdict` header; a farm with a declared local file prints
