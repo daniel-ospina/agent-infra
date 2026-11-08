@@ -826,10 +826,16 @@ await test("#1418 F1 (round 4): each bound refuses INDEPENDENTLY of the unmerged
     // (a) the TOKEN ledger, refused by identity even though it IS the unmerged path
     _setConflictedProbeForTest(() => [".mid-rebase-token.json"]);
     ok(validateToolCall("write", "", step, "gate", tok).block, "ledger identity refuses an UNMERGED token path");
-    // (b) the FORCE-PASS ledger (NODE_ENV=test path), same way
-    const forceP = "/tmp/sequence-enforcer-test-none/force.json";
-    _setConflictedProbeForTest(() => [forceP]);
+    // (b) the FORCE-PASS ledger, same way. ⛔ The force file is relocated INSIDE the
+    // worktree for this row (review round 5, F1): with its default /tmp path the
+    // call was refused by CONTAINMENT before the ledger check ran, so deleting
+    // `forceFile()` from the ledger array left this row green — an assertion
+    // shadowed by a neighbouring bound, which is the class rounds 2/4 named.
+    const forceP = join(process.cwd(), ".mid-rebase-force.json");
+    _setForceFileForTest(forceP);
+    _setConflictedProbeForTest(() => [".mid-rebase-force.json"]);
     ok(validateToolCall("write", "", step, "gate", forceP).block, "ledger identity refuses an UNMERGED force-pass path");
+    _setForceFileForTest(null);
     // (c) the git dir
     _setConflictedProbeForTest(() => [".git/config"]);
     ok(validateToolCall("write", "", step, "gate", ".git/config").block, "git dir refuses an 'unmerged' .git path");
