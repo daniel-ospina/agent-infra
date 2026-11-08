@@ -707,13 +707,49 @@ for _i, _rl in enumerate(_rlines):
         _first_heading = _i
         break
     _hdr.append(_rl)
-for _rl in _hdr:
+_seal_idx = -1
+for _i, _rl in enumerate(_hdr):
     _sm = _seal_pat.match(_rl)
     if _sm:
         _sealed_n += 1
         _sealed12 = _sm.group(1)
+        _seal_idx = _i
     elif _rl.startswith("- **Base:**"):
         _seal_split = 1
+# ⛔ THE STAMP MUST SIT IN THE WRITER FIELD BLOCK, NOT MERELY SOMEWHERE IN THE HEADER (round-15 review, HIGH).
+# Round 15 refused a header ENDED before the Base line, and the next spelling simply put a stamp-shaped line
+# of the lane choosing in the header INSTEAD: an injection that renders a fake stamp and then a `## `
+# heading leaves `_sealed_n == 1` (so the duplicate arm is silent) while the REAL Base line falls into the
+# body where nothing compares it — measured with the real writer through all three verbatim-rendered fields
+# (issue/worktree/branch): rc=0 PASS on a state whose only edit was `head_at_write`. The writer emits a FIXED
+# block — [Optionally `- **Issue:**`], `- **Worktree:**`, `- **Branch:**`, the Base stamp, `- **Started:**`,
+# one verdict line — so the stamp is only trusted when that block is intact: a `- **Branch:** ` line
+# immediately above it, a `- **Started:** ` line immediately below it, and exactly one `- **Worktree:** `
+# above that Branch line. Anything else in that position is an injected stamp, not the writer.
+if _sealed_n == 1:
+    _wt_lines = [i for i, _rl in enumerate(_hdr) if _rl.startswith("- **Worktree:**")]
+    if (_seal_idx < 1 or not _hdr[_seal_idx - 1].startswith("- **Branch:** ")
+            or _seal_idx + 1 >= len(_hdr) or not _hdr[_seal_idx + 1].startswith("- **Started:** ")
+            or len(_wt_lines) != 1 or _wt_lines[0] > _seal_idx - 1):
+        _seal_split = 1
+# ⛔ AND THE STAMP MUST BE THE ONLY Base LINE OUTSIDE A CODE FENCE (round-15 review, HIGH). The writer renders
+# suite commands and their log tails inside ``` fences, so an honest report can legitimately PRINT the stamp
+# shape (the false-refusal row from round 13). Outside a fence, a second Base line means the header was cut and the
+# real stamp ended up in the body — the same bypass, with the injected one in the header.
+# Measured: no honest rendering path can produce an unfenced duplicate — a `note --not-done` item is prefixed
+# `- ` by the writer (so `- - **Base:** …` cannot match the anchored shape), and suite output is fenced. The
+# only way to hit this arm is text written into the markdown by hand, which is the digest residual disclosed
+# further down, so the rule costs an honest lane nothing.
+_outside = 0
+_fenced = False
+for _rl in _rlines:
+    if _rl.startswith("```"):
+        _fenced = not _fenced
+        continue
+    if not _fenced and _rl.startswith("- **Base:**"):
+        _outside += 1
+if _outside != _sealed_n:
+    _seal_split = 1
 # ⛔ A HEADER TRUNCATED BEFORE THE BASE LINE IS THE SAME ATTACK AS A SPLIT BASE LINE (round-14 review, HIGH).
 # The writer renders `state["issue"]`, `state["worktree"]` and `state["branch"]` VERBATIM on their own header
 # lines ABOVE the Base line, so a newline plus `## ` inside ANY of them makes the FIRST heading land before
@@ -929,7 +965,7 @@ lane_report_remedy() {
   case "${1:-}" in
     1) printf '  The lane wrote no report. Write one BEFORE the next merge attempt: %s\n' \
          'python3 tools/worktree_report.py init --issue <N>, then run every suite through it (run --cmd <cmd>), then write.' ;;
-    2) printf '  The evidence in the report does not hold up (a recorded log is missing, its hash does not\n  match, or a promised section is absent). Re-run the affected suite through the tool so the record\n  matches its log.\n  Three shapes cannot be fixed by re-running the SAME suite, because the report itself is malformed:\n  • `reason=recorded-suites-produced-no-output` — the report claims suites whose logs are empty and\n    whose counts did not parse (`run --cmd true` is the minimal case). Run a suite that produces output.\n  • `reason=report-carries-more-than-one-head-at-write-stamp` — two header stamps. Do NOT hand-edit the\n    markdown: rewrite the report from the writer (`run` each suite again, then `write`).\n  • `reason=report-header-base-line-was-split-or-malformed` — a lane-writable value split the header\n    line. Same remedy: rewrite it from the writer, do not patch the markdown.\n' ;;
+    2) printf '  The evidence in the report does not hold up (a recorded log is missing, its hash does not\n  match, or a promised section is absent). Re-run the affected suite through the tool so the record\n  matches its log.\n  Three reasons cannot be fixed by re-running the SAME suite, because the report itself is malformed:\n  • `reason=recorded-suites-produced-no-output` — the report claims suites whose logs are empty and\n    whose counts did not parse (`run --cmd true` is the minimal case). Run a suite that produces output.\n  • `reason=report-carries-more-than-one-head-at-write-stamp` — two header stamps. Do NOT hand-edit the\n    markdown: rewrite the report from the writer (`run` each suite again, then `write`).\n  • `reason=report-header-base-line-was-split-or-malformed` — the seal is not where the writer puts it:\n    a lane-writable value split the Base line, or ended the header before it, or left a second Base line\n    outside a code fence. Same remedy: rewrite it from the writer, do not patch the markdown.\n' ;;
     3) printf '  The report RECORDS A FAILING SUITE. A green report is a precondition of merge: fix the failure and\n  re-run that suite through the tool (a lane whose own evidence says red may not merge).\n' ;;
     4) printf '  The report does not describe the tree being merged (it was written at another head, the\n  lane worktree is not at the head on the branch, or its evidence finished before that head was\n  created — a push from another worktree/box moves the branch and leaves your worktree behind).\n  Re-run the suites AT THE HEAD ON THE BRANCH through the tool (do NOT just re-render):\n     git -C <your worktree> status ; git log --oneline -1   # confirm you are at the PR head\n     python3 tools/worktree_report.py run --cmd <the exact command>   # for each suite\n  ⛔ `write`, `note` and a plain `init` re-render the report AND re-stamp the recorded head WITHOUT\n  re-running anything, so they turn a stale report into a green-looking one. Only `run` produces\n  evidence for the head you are merging.\n  ⛔ If the reason is `merging-head-is-dated-ahead-of-this-box`, RE-RUNNING WILL NOT HELP: the head\n  was committed on a box whose clock is ahead, so no run here can ever be newer than it. Re-push the\n  head from a correctly-clocked box, or wait for the skew to pass.\n' ;;
     7) printf '  The report exists but could not be VERIFIED. Two distinct causes, with different remedies:\n     • no interpreter, or the consumer failed / printed no parseable JSON — repair the consumer, then re-run;\n     • the writer state is missing or damaged (`reason=writer-state-absent|corrupt`) — the head binding\n       lives there, so the report cannot be tied to the head being merged. Do NOT hand-edit or delete\n       it: re-run the suites through the tool (`python3 tools/worktree_report.py run --cmd <cmd>`),\n       which rewrites the state. A state file you removed is a witness you removed.\n  An unreadable verification is not a pass.\n' ;;
