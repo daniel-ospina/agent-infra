@@ -10636,6 +10636,22 @@ const SPAWN_REFUSED = {
   retryable: false,
   error: "bad cwd",
 };
+/**
+ * #2242: the BLOCKING pre-spawn saturation refusal, exactly as `spawnSubAgent` emits it —
+ * `status` in `details`, NO `details.background` and NO `isError`. It is the shape the review's
+ * P1 turns on: the background guard (`details.background`) cannot absorb it, so it reaches the
+ * floor as a blocking dispatch and, unmirrored, counted as a reviewer verdict.
+ */
+const SPAWN_SATURATED = {
+  model: "m",
+  provider: "p",
+  status: "fleet-saturated",
+  retryable: false,
+  error: "could not dispatch: fleet saturated at 88 sessions on 10 cores (ceiling 80)",
+  piProcs: 88,
+  cores: 10,
+  ceiling: 80,
+};
 /** A pre-spawn provider-latch halt (builtin-tools' haltDispatchResult): the dispatch never ran. */
 const SPAWN_LATCH = {
   model: "deepseek-v4-flash",
@@ -10948,6 +10964,42 @@ testAsync("#spawngate 2d — a REFUSAL-only ledger reaches the argument remedy t
         // the same switch the body uses. A refusal-only ledger must not head itself CAPACITY.
         ok(!/CAPACITY fault/.test(reason), "the header does not claim CAPACITY for a refusal");
         ok(/SPAWN-SIDE refusal/.test(reason), "the header names the class the ledger supports");
+      } finally {
+        process.env.PI_MODE = prevMode;
+      }
+    });
+  });
+});
+
+testAsync("#2242 — a `fleet-saturated` BLOCKING refusal does not satisfy the floor (the category-A false PASS)", async () => {
+  // The review's P1, end to end. `shared/spawn-capacity.ts` re-enumerates `FAILED_TASK_STATUS`
+  // for this floor; a `fleet-saturated` member added THERE and not there classified as a
+  // `verdict`, and `dispatchCount++` then satisfied the >=1-dispatch floor for an UNREVIEWED
+  // push. The blocking path is the reachable one (`details.background` is absent, so the
+  // background guard does not absorb it) and the outcome hinges on extension LOAD ORDER, so a
+  // classification-only row is not enough: this drives the registered hooks and asserts the GATE.
+  await withTempHome(async () => {
+    await withMarkerIsolated(async () => {
+      const prevMode = process.env.PI_MODE;
+      process.env.PI_MODE = "print";
+      const { pi, fire } = mockPi();
+      (reviewEnforcerFactory as any)(pi);
+      try {
+        await fire("session_start");
+        await fire("tool_result", { toolName: "task", details: SPAWN_SATURATED });
+        const r = await fire("tool_call", { toolName: "bash", input: { command: "git commit -m x" } });
+        ok(r && r.block === true, "⛔ THE REGRESSION: a refused dispatch must never allow the unreviewed commit");
+        const reason = (r as any).reason as string;
+        ok(reason.includes(UNSPAWNABLE_TOKEN), "the capacity verdict is rendered");
+        ok(reason.includes("refused BEFORE a child existed"), "says the refusal happened before a child existed");
+        ok(!/child never returned a verdict/.test(reason), "…and does not claim a returned child (#2349)");
+        // The second leg of the same finding: the REMEDY. Filed as an argument refusal, the
+        // renderer told the lane to fix "the cwd / session id" — false on both halves for a box at
+        // its concurrency ceiling, where the IDENTICAL dispatch succeeds once it drains.
+        ok(!/fix the refused argument/.test(reason), "never sends the lane to fix an argument that is fine");
+        ok(!/refused again/.test(reason), "never claims the identical dispatch is refused again");
+        ok(/TASK_SESSION_CEILING/.test(reason), "names the knob, so the remedy is not a dead end");
+        ok(!/the child needs a/.test(reason), "does not claim a child existed");
       } finally {
         process.env.PI_MODE = prevMode;
       }
