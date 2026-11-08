@@ -210,11 +210,64 @@ def test_refuses_when_session_record_unreadable(R):
 
 
 def test_refuses_on_empty_session_record(R):
-    """rc=0 with EMPTY stdout is not an answer either (a renamed key after a cmux bump)."""
+    """rc=0 with EMPTY stdout is not an answer either — but this is the EMPTY case, not the
+    renamed-key case; `test_refuses_when_roster_rows_are_unparseable` pins that one (review round 2:
+    this test's docstring used to claim the renamed-key coverage it did not have)."""
     cmux = FakeCmux(record_out="")
     obs = _run(R, FakeLS(), cmux)
     assert obs["refused"] is True
     assert cmux.sent() == []
+
+
+def test_refuses_when_roster_rows_are_unparseable(R):
+    """A roster we READ but cannot parse is UNKNOWN, not "no live pi" (review round 2, P1).
+
+    A cmux bump renames `pid_exists`/`workspace`; every row stops matching and the old code fell
+    through to False — which the caller quotes as the licence to type into the pane. The class this
+    closes: "a roster we could not read must never be quoted as no live pi".
+    """
+    for roster in (
+        "id=x pid=42 pid_exists=true workspace=WS-1\n",   # value changed: `true`, not `yes`
+        "session=WS-1 state=live pid=42\n",              # keys renamed entirely
+        "workspace WS-1 running\n",                        # not key=value at all
+    ):
+        cmux = FakeCmux(record_out=roster)
+        obs = _run(R, FakeLS(), cmux)
+        assert obs["refused"] is True, (roster, obs)
+        assert "unreadable" in obs["reason"], (roster, obs["reason"])
+        assert cmux.sent() == [], (roster, cmux.sent())
+
+
+def test_refuses_when_our_own_row_is_unreadable(R):
+    """The precise hole: OTHER rows parse, so "the roster is fine" is true — but the row that names
+    OUR workspace does not, so "our workspace is not live" is unproven. Absence is only an answer
+    when we could read the rows we needed."""
+    cmux = FakeCmux(record_out="id=y pid=4 pid_exists=no workspace=WS-9 title=other\n"
+                               "session=WS-1 state=live pid=42\n")
+    obs = _run(R, FakeLS(), cmux)
+    assert obs["refused"] is True, obs
+    assert "unreadable" in obs["reason"], obs["reason"]
+    assert cmux.sent() == []
+
+
+def test_our_own_pid_exists_no_row_is_a_real_no(R):
+    """Our own row, readable, `pid_exists=no` — the ordinary DEAD lane. This must NOT be treated as
+    unreadable: an UNKNOWN here would refuse every legitimate relaunch, and it is the value the
+    heartbeat's own DEAD definition reads."""
+    cmux = FakeCmux(record_out="id=y pid=4 pid_exists=no workspace=WS-9 title=other\n"
+                               "id=z pid=0 pid_exists=no workspace=WS-1 title=ours\n")
+    obs = _run(R, FakeLS(transcript=_T), cmux)
+    assert obs["refused"] is False, obs
+    assert cmux.sent(), "a readable pid_exists=no row for our workspace is a DEAD lane, not a refusal"
+
+
+def test_a_shaped_roster_without_our_workspace_is_a_real_no(R):
+    """The negative control: a readable roster in the expected shape that simply does not name our
+    workspace IS evidence of absence — otherwise the guard above would refuse every relaunch."""
+    cmux = FakeCmux(record_out="id=y pid=4 pid_exists=no workspace=WS-9 title=other\n")
+    obs = _run(R, FakeLS(transcript=_T), cmux)
+    assert obs["refused"] is False, obs
+    assert cmux.sent(), "a readable roster without our workspace must not block the relaunch"
 
 
 def test_refuses_when_pane_unreadable(R):
@@ -426,6 +479,44 @@ def test_the_payload_never_execs_the_panes_shell_away(R, tmp_path):
 
 
 # ── R4: the tool must never be the destructive verb it exists to replace -----------------------
+def _fold_argv(node):
+    """Constant-fold an argv-ish expression to a str or a LIST of strings/None.
+
+    Exists so the source check reads an ASSEMBLED argv as the value it evaluates to: `"respawn" +
+    "-pane"` must fold to the single string `"respawn-pane"`, because a token-level regex cannot see
+    it — and because folding it into two list entries would let `"send" + "x"` pass as `send`. `None`
+    marks a part the folder could not resolve (a Name, a call, a starred element), so the caller can
+    demand a BOUNDED VERB without demanding that every argument be a literal, since a real argv
+    legitimately carries variables.
+    """
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        left, right = _fold_argv(node.left), _fold_argv(node.right)
+        if left is None or right is None:
+            return None
+        if isinstance(left, str) and isinstance(right, str):
+            return left + right                     # adjacent literals JOIN
+        lseq = left if isinstance(left, list) else [left]
+        rseq = right if isinstance(right, list) else [right]
+        return lseq + rseq
+    if isinstance(node, (ast.List, ast.Tuple)):
+        out = []
+        for elt in node.elts:
+            if isinstance(elt, ast.Starred):
+                out.append(None)
+                continue
+            val = _fold_argv(elt)
+            if isinstance(val, str):
+                out.append(val)
+            elif isinstance(val, list):
+                out.extend(val)
+            else:
+                out.append(None)
+        return out
+    return None
+
+
 def test_no_destructive_verb_on_any_path(R, tmp_path):
     """Every path the tool can take, every argv it builds, checked against the verb list. This is
     the test that fails if someone 'fixes' the tool into `respawn-pane`."""
@@ -447,6 +538,14 @@ def test_no_destructive_verb_on_any_path(R, tmp_path):
         dict(ls=FakeLS(screen="no prompt here"), cmux=FakeCmux(), new=True),
         dict(ls=FakeLS(cwd=None), cmux=FakeCmux(), new=True),
         dict(ls=FakeLS(transcript=path), cmux=FakeCmux(on_send=lambda: None), new=True),
+        # ⛔ THE SEND-FAILURE PATH IS A PATH TOO (review round 2, P1). No scenario used `send_rc != 0`,
+        # so a "fall back to respawn-pane when the send fails" mutation — the exact hazard this tool
+        # exists to prevent — kept the suite green while the tool emitted the destructive verb. The
+        # failure branch is precisely where an author is tempted to reach for the verb "just to retry".
+        dict(ls=FakeLS(transcript=path), cmux=FakeCmux(send_rc=1)),
+        dict(ls=FakeLS(transcript=path), cmux=FakeCmux(send_rc=1), new=True),
+        dict(ls=FakeLS(transcript=path), cmux=FakeCmux(on_send=lambda: None, send_rc=3)),
+        dict(ls=FakeLS(transcript=path), cmux=FakeCmux(on_send=lambda: None, send_rc=3), new=True),
     ]
     seen = []
     fresh_sent = 0
@@ -464,19 +563,36 @@ def test_no_destructive_verb_on_any_path(R, tmp_path):
         assert verb not in blob, "a forbidden verb was emitted: %s" % verb
     src = open(_MINE).read()
     # ⛔ VERB-BLIND, NOT LITERAL (review finding 1): the old check matched only the exact spelling
-    # `["cmux", "respawn-pane"`, so `"respawn" + "-pane"` walked straight through it. This asserts
-    # the SHAPE of every cmux call site instead: a constructed verb must still be a member of the
-    # allowed set, so an assembled or aliased destructive verb cannot pass.
-    call_sites = re.findall(r'\[\s*"cmux"\s*,\s*([^\]]+)\]', src)
-    assert call_sites, "no cmux call site found in the source — did the argv construction move?"
+    # `["cmux", "respawn-pane"`, so `"respawn" + "-pane"` walked straight through it. This walks
+    # every argv-shaped expression, CONSTANT-FOLDS string concatenation, and requires the verb of any
+    # list that starts with `"cmux"` to be a member of the allowed set — so an assembled verb is
+    # checked as the value it evaluates to, not as the tokens it was written from. It also refuses a
+    # cmux argv it cannot statically bound (a variable verb), because no test can bound that: an argv
+    # built from a name is a hole this file would otherwise report as covered.
     allowed = {"send", "sessions", "read-screen"}
-    for rest in call_sites:
-        m = re.match(r'\s*"([^"]*)"', rest)
-        assert m, (
-            "a cmux call site builds its verb from something other than a literal, so no test can "
-            "bound it: %r" % rest)
-        assert m.group(1) in allowed, (
-            "a cmux call site builds a verb outside %s: %r" % (sorted(allowed), m.group(1)))
+    tree = ast.parse(src)
+    checked = 0
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.List, ast.BinOp, ast.Tuple)):
+            continue
+        seq = _fold_argv(node)
+        if not isinstance(seq, list) or "cmux" not in seq:
+            continue
+        checked += 1
+        i = seq.index("cmux")
+        # The VERB position must be bounded. An argv that reaches `cmux` and then a name is a hole
+        # this file would otherwise report as covered — the arguments after the verb are free to be
+        # variables, the verb is not.
+        assert i + 1 < len(seq) and seq[i + 1] is not None, (
+            "line %d builds a cmux argv whose verb is not statically bounded, so no test can assert "
+            "it" % node.lineno)
+        assert seq[i + 1] in allowed, (
+            "line %d builds the cmux verb %r, outside %s" % (node.lineno, seq[i + 1], sorted(allowed)))
+        joined = " ".join(s for s in seq if s is not None)
+        for verb in ("respawn-pane", "close-workspace", "kill-pane"):
+            assert verb not in joined, (
+                "line %d builds a destructive verb: %r" % (node.lineno, joined))
+    assert checked, "no cmux argv was bound by the source check — is the argv construction gone?"
     # and no NON-docstring string constant anywhere may spell a destructive verb (an argv assembled
     # over several statements has no `["cmux", …]` shape to match, so the shape check above alone
     # would miss it). Docstrings and comments are excluded on purpose: they are prose ABOUT the

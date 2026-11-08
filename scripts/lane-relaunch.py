@@ -142,17 +142,39 @@ def _live_pi_record(ws, runner, timeout=45):
 
     None is UNREADABLE, and an empty list is not an answer (the fleet's own rule): a roster we could
     not read must never be quoted as "no live pi".
+
+    ⛔ A READ ROSTER WHOSE ROWS WE CANNOT PARSE IS UNREADABLE TOO (review round 2, P1). `rc=0` with
+    output is not the same fact as "we understood the output": if a cmux bump renames `pid_exists`
+    or `workspace`, every row stops matching and the old code fell through to `False` — "no live pi"
+    — which is quoted downstream as the licence to type into the pane. So absence is only an answer
+    when at least one row was in the shape we can read and no row naming this workspace was
+    unreadable.
     """
     rc, out, err = runner(["cmux", "sessions", "list"], timeout)
     if rc != 0 or not (out or "").strip():
         return None
     want = str(ws).strip().upper()
+    recognised = 0
+    our_row_unreadable = False
     for ln in out.splitlines():
-        if "pid_exists=yes" not in ln or "workspace=" not in ln:
+        if "pid_exists=" not in ln or "workspace=" not in ln:
+            # A line that names OUR workspace but not in the shape we read: we cannot say whether it
+            # is live, and UNKNOWN is not a licence.
+            if want and want in ln.upper():
+                our_row_unreadable = True
             continue
+        recognised += 1
         got = ln.split("workspace=")[1].split()[0].strip().strip(',').upper()
-        if got == want:
+        if got != want:
+            continue
+        # OUR row, in a shape we understand: its pid_exists value is the answer — but only the two
+        # values we recognise. Anything else (`true`, `1`, empty) is UNKNOWN, not "dead".
+        if "pid_exists=yes" in ln:
             return True
+        if "pid_exists=no" not in ln:
+            our_row_unreadable = True
+    if recognised == 0 or our_row_unreadable:
+        return None
     return False
 
 
