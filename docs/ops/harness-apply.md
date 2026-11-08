@@ -115,8 +115,8 @@ dirty=0
 pin=ce987bb2c1de
 pin_tree=ce987bb2c1de
 drift=clean:current          <- the deployed-drift reading, `<state>:<token>` (`executes:<dir>` is the red one)
-farm_rows=none               <- a farm drift grade: `none` (farm matched), `unwritable`, or the FILE that names every drifting file
-farm_n=0                     <- how many rows that list holds (0 when the farm matched)
+farm_rows=none               <- `none` (farm matched, no artifact), `not-graded` (this pass never graded the farm), `unwritable`, or the FILE naming every drifting file
+farm_n=0                     <- rows the farm grade reported: a COUNT when graded (0 when the farm matched), `not-graded` otherwise
 preserved=none
 remedy=none                  <- the ACTION for a refusal, never truncated (`detail=` is bounded at 240)
 action=none
@@ -134,12 +134,16 @@ check that names *each* drifting file"). The journal keeps a bounded human view 
 "… and N more" — so on a 30-row farm 18 files were counted and named nowhere durable (measured
 on the `cmux` cell, 2026-11-07). Every row the instrument reports is therefore written, atomically,
 to `${HARNESS_APPLY_STATE_DIR:-$HOME/.pi/agent/state}/harness-apply-farm-rows.txt`, and the record
-names that file. The artifact is **derived state**: a pass whose farm matches DELETES it, and says
-`farm_rows=none`, because a list that outlives the condition it describes cannot be told from
-today's answer. `farm_rows=unwritable` means the state dir could not be written — the drift is
-still red and still counted, but rows 13..N are named nowhere, which is said out loud rather than
-left to be discovered. A path that never reached the farm block (a pre-flow refusal) reads
-`not-graded`.
+names that file.
+
+The artifact is **derived state, and every pass deletes it before it can exit** — including the
+passes that never grade the farm (the kill switch, every pre-flow refusal), because it is published
+at a fixed path and a list that outlives the condition it describes cannot be told from today's
+answer. `farm_rows=none` says a graded farm matched; `not-graded` says this pass did not look.
+`farm_rows=unwritable` means the rows write failed **while the record write still succeeded** — the
+drift is still red and still counted, `farm_n` is still the instrument's row count, but the names
+are not on disk, so the journal says so in as many words. (A state dir that is unwritable for the
+record too leaves the PREVIOUS record in place: staleness, not a field, is that signal.)
 
 ⛔ `deployed` EXISTS BECAUSE THE CHECKOUT IS NOT THE DEPLOYMENT. A pin-per-commit cell
 never moves its checkout, so `behind` measured there would be permanently non-zero and

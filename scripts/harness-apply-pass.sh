@@ -279,6 +279,16 @@ REC_PIN="none"; REC_PIN_TREE="none"; REC_ACTION="none"; REC_DETAIL=""; REC_REMED
 # 30-row farm had 18 files that were COUNTED and never named anywhere durable. `not-graded` is the
 # truthful value on every path that never reached the farm block (a pre-flow refusal).
 REC_FARM_ROWS="not-graded"; REC_FARM_NROWS="not-graded"
+# ⛔ THE DRIFT ROWS ARTIFACT IS DELETED ON EVERY PASS, NOT ONLY ON A GRADED ONE (review finding).
+# It is published at a FIXED path, so anything left there is read as "today's drift" — and the passes
+# that never reach the farm block (HARNESS_APPLY_FARM_CHECK=0, every pre-flow refusal) would otherwise leave
+# yesterday's undated list behind with no record field pointing at it. Removing it here, before any
+# branch can exit, makes every exit path leave the artifact consistent with its record.
+# ⛔ ONLY THIS PASS'S OWN TEMP IS EVER REMOVED. A `$FARM_ROWS_FILE.tmp-*` glob would unlink a
+# CONCURRENT pass's in-flight temp (the timer fires while an operator may run the pass by hand, and
+# nothing serialises them), turning its successful write into a false `unwritable`.
+FARM_ROWS_FILE="$STATE_DIR/harness-apply-farm-rows.txt"
+rm -f "$FARM_ROWS_FILE" 2>/dev/null || true
 # ⛔ `REC_REMEDY` IS A FIELD FOR THE SAME REASON `preserved=` IS (review finding, #10114). Measured
 # on the deployed-drift refusal: its `detail=` is 706 characters and the word `Remedy:` begins at
 # offset 272 — so `cut -c1-240` DISCARDS THE ENTIRE REMEDY from the durable record. stderr still
@@ -1343,12 +1353,8 @@ if [ "$FARM_CHECK_ON" = "1" ]; then
         # (A `FARM_NAMED` short list was computed here and never read — the row extraction below owns
         # the predicate, so it was dead code plus a redundant `awk|head|paste` subprocess on the red
         # path. Removed in batch-ai2 review cycle 2, F7.)
-        # ⛔ THE ROWS ARTIFACT IS DERIVED STATE, SO A PASS THAT FINDS NO DRIFT MUST DELETE IT.
-        # Leaving yesterday's 30 rows in place beside a clean grade is a false positive a reader has no
-        # way to date — the same shape as a stale `HARNESS-PIN`, which is the defect this pass exists
-        # to remove. Removed BEFORE the grade so every exit from the block leaves it consistent.
-        FARM_ROWS_FILE="$STATE_DIR/harness-apply-farm-rows.txt"
-        rm -f "$FARM_ROWS_FILE" "$FARM_ROWS_FILE".tmp-* 2>/dev/null || true
+        # ⛔ THE ROWS ARTIFACT WAS ALREADY DELETED beside the record-field init, so a pass that finds no
+        # drift cannot leave yesterday's list behind — the deletion is not owned by this branch.
         case "$FARM_RC" in
             0)
                 REC_FARM_ROWS=none; REC_FARM_NROWS=0
@@ -1394,9 +1400,23 @@ if [ "$FARM_CHECK_ON" = "1" ]; then
                 # that runs at `finish`, i.e. AFTER this write — a first pass on a fresh box would
                 # otherwise record `unwritable` on the one run that had drift to name.
                 mkdir -p "$STATE_DIR" 2>/dev/null || true
-                if printf '%s\n' "$FARM_ROWS" >"$FARM_ROWS_FILE.tmp-$$" 2>/dev/null \
-                   && mv -f "$FARM_ROWS_FILE.tmp-$$" "$FARM_ROWS_FILE" 2>/dev/null; then
-                    REC_FARM_ROWS="$FARM_ROWS_FILE"
+                # ⛔ THE OUTCOME IS TRACKED SEPARATELY FROM THE VALUE (review finding). Branching the
+                # messages on `case "$REC_FARM_ROWS" in /*)` decided "did it persist?" from the SHAPE
+                # of a path, and `HARNESS_APPLY_STATE_DIR` is not required to be absolute here — so a
+                # SUCCESSFUL write to a relative state dir reported itself as "could NOT be persisted"
+                # while `farm_rows=` named the file. One record contradicting itself is exactly the
+                # class this pass exists to remove.
+                FARM_ROWS_OK=0
+                # ⛔ THE POST-CONDITION IS THE PUBLISHED PATH, NOT `mv`'s EXIT CODE (review finding).
+                # `mv src dir` where the artifact path is a DIRECTORY moves the tempfile INTO it and
+                # returns 0 — so an exit-code-only test records a path that holds no list. `[ -d ]`
+                # refuses that state up front and `[ -f ]` makes "persisted" mean "a readable file is
+                # at the path the record names", which is the only property a reader can rely on.
+                if [ ! -d "$FARM_ROWS_FILE" ] \
+                   && printf '%s\n' "$FARM_ROWS" >"$FARM_ROWS_FILE.tmp-$$" 2>/dev/null \
+                   && mv -f "$FARM_ROWS_FILE.tmp-$$" "$FARM_ROWS_FILE" 2>/dev/null \
+                   && [ -f "$FARM_ROWS_FILE" ]; then
+                    REC_FARM_ROWS="$FARM_ROWS_FILE"; FARM_ROWS_OK=1
                 else
                     rm -f "$FARM_ROWS_FILE.tmp-$$" 2>/dev/null || true
                     REC_FARM_ROWS=unwritable
@@ -1409,18 +1429,20 @@ if [ "$FARM_CHECK_ON" = "1" ]; then
                     # The count is NOT the answer (tortoise#10114 arm 2): the other rows are named, and
                     # this line says where — an operator reading the journal must be able to get from
                     # "18 more" to the 18 names without re-running the instrument by hand.
-                    case "$REC_FARM_ROWS" in
-                        /*) log_line "farm:   … and $((FARM_NROWS - 12)) more row(s) — ALL $FARM_NROWS are named in $REC_FARM_ROWS" ;;
-                        *)  log_line "farm:   … and $((FARM_NROWS - 12)) more row(s) in the instrument's own output — the full list could NOT be persisted ($REC_FARM_ROWS), so rows 13..$FARM_NROWS are named NOWHERE durable" ;;
-                    esac
+                    if [ "$FARM_ROWS_OK" = 1 ]; then
+                        log_line "farm:   … and $((FARM_NROWS - 12)) more row(s) — ALL $FARM_NROWS are named in $REC_FARM_ROWS"
+                    else
+                        log_line "farm:   … and $((FARM_NROWS - 12)) more row(s) — the full list could NOT be persisted ($REC_FARM_ROWS), so rows 13..$FARM_NROWS are named NOWHERE durable"
+                    fi
                 fi
                 [ -n "$FARM_REMEDY" ] && printf '%s\n' "$FARM_REMEDY" | while IFS= read -r _row; do
                     log_line "farm:   $_row"
                 done
-                case "$REC_FARM_ROWS" in
-                    /*) finish 0 24 "farm: DRIFT — $FARM_DEST is NOT the code $REF ships (${FARM_NROWS} row(s), every one named in $REC_FARM_ROWS, with the instrument's own remedy — a stale copy, a layout move and an unsourced file do NOT all have the same fix)" ;;
-                    *)  finish 0 24 "farm: DRIFT — $FARM_DEST is NOT the code $REF ships (${FARM_NROWS} row(s) above, and the full list could not be persisted ($REC_FARM_ROWS), with the instrument's own remedy — a stale copy, a layout move and an unsourced file do NOT all have the same fix)" ;;
-                esac ;;
+                if [ "$FARM_ROWS_OK" = 1 ]; then
+                    finish 0 24 "farm: DRIFT — $FARM_DEST is NOT the code $REF ships (${FARM_NROWS} row(s), every one named in $REC_FARM_ROWS, with the instrument's own remedy — a stale copy, a layout move and an unsourced file do NOT all have the same fix)"
+                else
+                    finish 0 24 "farm: DRIFT — $FARM_DEST is NOT the code $REF ships (${FARM_NROWS} row(s) above, and the full list could not be persisted ($REC_FARM_ROWS), with the instrument's own remedy — a stale copy, a layout move and an unsourced file do NOT all have the same fix)"
+                fi ;;
             *)
                 REC_ACTION=farm-unknown
                 finish 0 24 "farm: UNKNOWN (check-farm-drift rc=$FARM_RC) — $FARM_DEST could not be graded against $REF, and cannot-verify is not a pass: $(printf '%s' "$FARM_OUT" | grep -m1 -iE 'unknown|cannot|refus' || printf 'no reason printed')" ;;

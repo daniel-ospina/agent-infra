@@ -1241,9 +1241,20 @@ assert_contains "$(cat "$T/t24c/state/harness-apply.status" 2>/dev/null || true)
 # and reddening every such box would make the alarm worthless.
 mk_origin t24d; mk_clone t24d
 REPO_P="$CLONE"; MODE_P=sync
+# ⛔ AND A PASS THAT NEVER GRADES THE FARM MUST STILL CLEAR THE ARTIFACT (review finding). The rows
+# list is published at a fixed path, so a kill-switched or refused pass that left yesterday's file
+# there would be read as today's drift — with no record field naming it (`farm_rows=not-graded`).
+mkdir -p "$T/t24d/state"; printf 'file-from-yesterday.py | a | b | STALE\n' >"$T/t24d/state/harness-apply-farm-rows.txt"
 OUT="$(run_pass "$T/t24d" 2>&1)"; RC=$?
 assert_contains "$OUT" "farm: SKIPPED" "T24 control: an absent farm is SKIPPED by name, never silently passed"
 assert_eq "$RC" "0" "T24 control: an absent farm does not redden the pass (exact rc)"
+if [ -f "$T/t24d/state/harness-apply-farm-rows.txt" ]; then
+    bad "T24 control: a NOT-GRADED pass still deletes the rows artifact (a fixed-path list has no epoch)"
+else
+    ok "T24 control: a NOT-GRADED pass still deletes the rows artifact (a fixed-path list has no epoch)"
+fi
+assert_contains "$(cat "$T/t24d/state/harness-apply.status" 2>/dev/null || true)" "farm_rows=not-graded" \
+    "T24 control: and the record says this pass did not grade the farm — not `none`, which claims it did"
 
 
 # Control 4: a DANGLING farm link is NOT an absent farm — `-d` follows symlinks, so the skipped arm
@@ -1419,6 +1430,21 @@ assert_contains "$(cat "$T/t24q/state/harness-apply.status" 2>/dev/null || true)
     "T24 control: the durable RECORD names the rows file, so it is reachable without the journal"
 assert_contains "$(cat "$T/t24q/state/harness-apply.status" 2>/dev/null || true)" "farm_n=20" \
     "T24 control: and carries the row count beside it"
+# ⛔ THE `unwritable` ARM IS PONED, NOT ASSERTED AWAY (review finding). A DIRECTORY at the artifact
+# path is the cheapest honest way to make the rows write fail while the RECORD write still succeeds —
+# which is the only state that can produce `farm_rows=unwritable` at all (an unwritable state dir
+# fails the record too, and leaves the previous record as the signal).
+mk_origin t24r; mk_clone t24r
+REPO_P="$CLONE"; MODE_P=sync
+mkdir -p "$T/t24r/home/.pi/agent/scripts" "$T/t24r/state/harness-apply-farm-rows.txt"
+OUT="$(HARNESS_APPLY_FARM_CHECKER="$T/t24q/stub-checker.sh" run_pass "$T/t24r" 2>&1)"; RC=$?
+assert_eq "$RC" "24" "T24 control: an unwritable rows artifact leaves the drift grade RED (24), not green"
+assert_contains "$(cat "$T/t24r/state/harness-apply.status" 2>/dev/null || true)" "farm_rows=unwritable" \
+    "T24 control: and the record says the list could not be persisted, not that there was none"
+assert_contains "$(cat "$T/t24r/state/harness-apply.status" 2>/dev/null || true)" "farm_n=20" \
+    "T24 control: while still carrying the instrument's row count"
+assert_contains "$OUT" "named NOWHERE durable" \
+    "T24 control: and the journal says the elided rows are named nowhere, rather than implying they are on disk"
 # ⛔ THE COUNT MUST NOT COUNT PROSE. The instrument prints class-prose lines that contain the same
 # words as a row ("A STALE file is a copy …"), so a whole-line match reported 3 real rows as 7
 # (review round 8). 20 stub rows + 2 prose lines must still read as 20.
