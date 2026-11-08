@@ -1547,9 +1547,12 @@ if [ "$FARM_CHECK_ON" = "1" ]; then
         # certified a match with the drifting file named durably nowhere — the very hazard this chain
         # anchored away in `farm_sum_count` (`DRIFT-log.txt | …` read as the summary). Its mirror was
         # worse: an unanchored `DRIFT — ` OVER-BLOCKED a legitimate match whose output merely contained
-        # the text. The instrument prints `check-farm-drift: OK — …` / `…: DRIFT — …` (PROG + ': '), and
-        # a per-file row always carries pipes, so `^[^|]*: ` separates the verdict from a row.
-        FARM_VERDICT0="$(printf '%s\n' "$FARM_OUT" | sed -n '/^[^|]*: DRIFT — /{p;q;}')"
+        # the text. The instrument prints `check-farm-drift: OK — …` / `…: DRIFT — …` (PROG + ': '), and a
+        # VERDICT LINE CARRIES NO PIPE ANYWHERE while a per-file row always does — so the test is "no pipe
+        # on the whole line", `^[^|]*: … [^|]*$`, not merely "no pipe before the token": a row's FIRST
+        # field is its PATH, so `weird: OK — x.py | … | DRIFTED` matched a prefix-only anchor and certified
+        # a match with the drifting name durable nowhere (measured, review round 27).
+        FARM_VERDICT0="$(printf '%s\n' "$FARM_OUT" | sed -n '/^[^|]*: DRIFT — [^|]*$/{p;q;}')"
 
         # ⛔ AND A SILENT rc=0 IS NOT A MATCH (review round 24). The instrument always prints a summary,
         # so a checker that exits 0 with NO output produced no evidence at all. ⛔ AND NEITHER IS AN rc=0
@@ -1564,7 +1567,7 @@ if [ "$FARM_CHECK_ON" = "1" ]; then
         # can read, and it fails CLOSED. This SUBSUMES the emptiness test (empty output carries no
         # verdict either), so the two are one condition rather than two that can drift apart.
         # Case-insensitive because the suite's clean stubs print `check-farm-drift: ok — 0 stale …`.
-        FARM_OK0="$(printf '%s\n' "$FARM_OUT" | grep -Eim1 '^[^|]*: OK — ')"
+        FARM_OK0="$(printf '%s\n' "$FARM_OUT" | grep -Eim1 '^[^|]*: OK — [^|]*$')"
         case "$FARM_RC" in
             0)
                 if [ -z "$FARM_OK0" ] && [ "$FARM_NROWS0" -eq 0 ] && [ -z "$FARM_VERDICT0" ]; then

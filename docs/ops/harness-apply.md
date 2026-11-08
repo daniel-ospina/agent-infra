@@ -252,10 +252,12 @@ missing, where `tee` supplies the 0 and the only output is bash's error line —
 `farm: ok`. Without that, `farm_rows=none` / `farm_n=0` would certify a farm that was never graded and
 `--print-status` would answer `status=ok` for it. A wrapper over a genuinely matching farm still passes
 (it prints the instrument's verdict), and prose/summary lines are never read as rows (the class token
-must END the line). The verdict probes are anchored on the instrument's LINE shape (`<prog>: OK — `,
-`<prog>: DRIFT — `) rather than on the bare token, because a per-file ROW can carry either word —
-measured both ways: an unanchored `OK — ` certified a match over a report whose only "OK" was a filename,
-and an unanchored `DRIFT — ` refused a genuine match whose output merely mentioned the word.
+must END the line). The verdict probes are anchored on the instrument's LINE shape rather than on the bare token, because a
+per-file ROW can carry either word — measured both ways: an unanchored `OK — ` certified a match over a
+report whose only "OK" was a filename, and an unanchored `DRIFT — ` refused a genuine match whose output
+merely mentioned the word. The anchor is **no pipe anywhere on the line** (`^[^|]*: OK — [^|]*$`), not
+merely "no pipe before the token": a row's FIRST field is its PATH, so a prefix-only anchor still let
+`weird: OK — x.py | … | DRIFTED` certify a match. A verdict line never contains a pipe; a row always does.
 
 `farm_rows=<path>` is ALSO written on `action=farm-unknown` — on all THREE producers: the arm where the
 instrument gives up (its own exit 2), the `rc=0`-contradicts-its-report arm, and the `rc=0`-with-no-verdict
@@ -479,7 +481,7 @@ checkout can use the documented hatch. The same interaction is recorded for
 
 ## Tests
 
-`scripts/harness-apply-timer.test.sh` — 510 assertions, run by the
+`scripts/harness-apply-timer.test.sh` — 511 assertions, run by the
 `harness-apply-timer` shard of `run-bash-shards.sh`:
 
 | | |

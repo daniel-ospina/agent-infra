@@ -2232,6 +2232,7 @@ cat >"$T/t24ax/inner/ok-token-row.sh" <<'FARM'
 #!/usr/bin/env bash
 printf 'OK — handmade-note.py\n' >&2
 printf '%-46s | %-12s | %-12s | %s\n' 'drifted-a.py' aaaa11112222 bbbb33334444 DRIFTED >&2
+printf '%-46s | %-12s | %-12s | %s\n' 'weird: OK — x.py' aaaa11112222 bbbb33334444 DRIFTED >&2
 printf 'SUMMARY: 1 file drifted, counts unavailable\n' >&2
 exit 0
 FARM
@@ -2242,6 +2243,12 @@ assert_eq "$RC" "24" "T24 control: an OK-token inside a ROW is not a verdict —
 assert_contains "$OUT" "printed NO verdict line" "T24 control: and it says no verdict line was printed, because none was"
 assert_contains "$(cat "$T/t24ax/state/harness-apply-farm-rows.txt" 2>/dev/null || true)" "drifted-a.py" \
     "T24 control: with the drifting name durable in the published output, not merely counted"
+# ⛔ AND A ROW'S FIRST FIELD IS ITS PATH, so a prefix-only anchor lets a PATH carry the verdict token
+# (review round 27, measured: `weird: OK — x.py | … | DRIFTED` matched `^[^|]*: OK — ` and certified a
+# match with the drifting name durable nowhere). A verdict line carries NO pipe anywhere; a row always
+# does. This row is the discriminator between the prefix-only anchor and the whole-line one.
+assert_contains "$(cat "$T/t24ax/state/harness-apply-farm-rows.txt" 2>/dev/null || true)" "weird: OK — x.py" \
+    "T24 control: a row whose PATH contains the OK token is still a row — the whole-line anchor sees it"
 
 # ⛔ AND THE ANCHOR DOES NOT OVER-BLOCK A REAL MATCH (the mirror the same review measured): the
 # instrument's `OK — ` line followed by prose that MENTIONS `DRIFT — ` is still a match, because the prose
@@ -2252,6 +2259,7 @@ mkdir -p "$T/t24ay/home/.pi/agent/scripts" "$T/t24ay/inner"
 cat >"$T/t24ay/inner/ok-then-prose.sh" <<'FARM'
 #!/usr/bin/env bash
 printf 'check-farm-drift: OK — 2/2 sourced file(s) match the source at origin/main (sync).\n' >&2
+printf '%-46s | %-12s | %-12s | %s\n' 'weird: DRIFT — y.py' aaaa11112222 bbbb33334444 ok >&2
 printf 'Note that a DRIFT — verdict is what this prints when the bytes do not match.\n' >&2
 exit 0
 FARM
