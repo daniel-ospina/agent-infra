@@ -940,9 +940,16 @@ raw_lines = [l.rstrip('\n') for l in open(sys.argv[1], encoding='utf-8')]
 # continues only on an ODD run of trailing backslashes. `echo a\\` (an EVEN run) is valid bash whose line ENDS
 # there, and stripping one backslash and joining anyway swallowed the real definition on the next line — a
 # FALSE PASS for the namespace arm, the same class as the phantom heredoc below. The note that used to sit
-# here justified removing an odd-run test by saying "bash REJECTS the only line that could exercise it";
-# `probe() \\` is indeed a syntax error, but it is the ODD case, and the live defect was the EVEN one on a
-# line bash accepts. Both directions are now pinned by a fixture line.
+# here justified removing an odd-run test by saying "bash REJECTS the only line that could exercise it".
+# ⛔ AND THAT SENTENCE HAD THE PARITY BACKWARDS (round 48 review, P1 — measured, and this note repeated the
+# error for one round): `probe() \\` carries TWO trailing backslashes — an EVEN run — and `bash -n` refuses it
+# (rc 2) BECAUSE the run is even: `\\` is one escaped backslash left dangling as a word. The ODD shape is the
+# one bash ACCEPTS — `probe() \` + a newline + `{ :; }` is `bash -n` rc 0 and `declare -F` lists `probe` — so
+# "no valid script contains the shape" is FALSE as stated. What is rejected is that definition SIGNATURE, and
+# the removed test was about a different shape: an EVEN run on a line bash ACCEPTS (`echo a\\`), which is the
+# live defect. Both directions are pinned, and the mutation measures it: restoring the pre-cycle-2 rule
+# `s.endswith('\\')` drops `after_even_backslash_run` from the fixture scan, and deleting the join loses
+# `continued_name` (the odd continuation).
 # ⛔ THE OPENER IS FOUND BY A WALK, NOT BY A SUBSTRING SEARCH (#3960 review cycle 2, P2 — measured). A regex
 # over the whole line has no idea whether a `<<` sits in a comment or in an arithmetic expansion, and two
 # valid-bash shapes made it open a PHANTOM heredoc that swallowed the rest of the file — so the namespace arm
@@ -952,12 +959,24 @@ raw_lines = [l.rstrip('\n') for l in open(sys.argv[1], encoding='utf-8')]
 # ⛔ DECLARED LIMITS, each a limit of a LINE-SHAPE model rather than an accident, and each in a KNOWN
 # direction. (i) `<<$X` — a delimiter spelled with a parameter expansion — is not modelled, so bash opens a
 # heredoc whose body this scans as code. (ii) a `$((` that NEVER closes leaves the residue of the file in
-# arithmetic, so definitions are MISSED: fail-closed, never a false PASS. (iii) the three definition
+# arithmetic — but ⛔ NOT in the direction this note used to claim (round 48 review, P2 — measured):
+# `_arith_depth` is read and written by `_openers` ALONE, so the definition loop still scans every logical
+# line and an unclosed depth cannot HIDE a definition. The reachable effect is the OPPOSITE one — a `<<`
+# after the stuck opener is never recorded, so the heredoc BODY is scanned as code and a body line can be
+# INVENTED as a definition (a FALSE RED). Measured, on valid bash: `x='ab((cd'` + `y=${x#((}` makes bash
+# read `((` as a pattern while the walk enters arithmetic, and the `cat <<INNER` body line is then reported
+# where `declare -F` lists only `after_heredoc`. (iii) the three definition
 # SPELLINGS the `defn`/`head` patterns cannot see — a SUB-SHELL body (`name() (`), a SECOND definition on
-# one line, and a name inside a MULTI-LINE quoted string (that one is INVENTED, not missed). ⛔ The list this
+# one line, and a name inside a MULTI-LINE quoted string (that one is INVENTED, not missed). (iv) QUOTING IS
+# TRACKED PER LINE, so a `<<` on a line INSIDE a multi-line quoted string opens a PHANTOM heredoc (round 48
+# review, P2 — measured): `usage="Run it like this:` / `  cat <<EOF` / `to pipe a file"` / `after_quoted() {
+# :; }` is `bash -n` rc 0 and `declare -F` lists `after_quoted`, while this scanner prints NOTHING — the
+# phantom terminator never arrives and the rest of the file is swallowed, i.e. the FALSE-PASS direction. It is
+# latent today only because the reader's own scan still equals `declare -F` (26/26), and nothing here claims
+# more than that. ⛔ The list this
 # replaced was wrong in BOTH directions: it declared `$(( … ))` inside a `$( … )` substitution "not
 # modelled" when it IS (measured: `out=$(cat <<EOF … )` scans identically to bash), and `[[ a << b ]]`
-# when that spelling is a bash SYNTAX ERROR (`rc 2`) and so is vacuous. None of (i)–(iii) occurs in
+# when that spelling is a bash SYNTAX ERROR (`rc 2`) and so is vacuous. None of (i)–(iv) occurs in
 # `repo-set.sh`, the only file the namespace arm scans, and the closing sentence of the old note had the
 # arrow backwards — it said the unmodelled list was what the walk EXCLUDES, while the walk excludes
 # comments and arithmetic, which were never on it.
@@ -1010,8 +1029,11 @@ def _strip_comment(line):
 # ⛔ ARITHMETIC OUTLIVES THE LINE (#3960 cycle 3, P2 — measured): `$(( 1 +` may close on a LATER line with
 # no backslash, and a `<<` inside it is still a SHIFT. A per-line depth started every line at 0, so such a
 # shift reopened a phantom heredoc and swallowed the rest of the file (a FALSE PASS). The depth is carried
-# between logical lines now. An `arith` that never closes makes the residue of the file arithmetic — i.e.
-# definitions are MISSED, which is the fail-closed direction — and that is a declared limit, not a claim.
+# between logical lines now. ⛔ AN `arith` THAT NEVER CLOSES IS NOT THE FAIL-CLOSED DIRECTION (round 48
+# review, P2 — measured, and this note used to claim the opposite): the depth is read and written by
+# `_openers` ALONE, so the definition loop still sees every logical line and nothing is hidden. The reachable
+# effect is the OTHER direction — a `<<` after the stuck opener is never recorded, its body is scanned as
+# code, and a body line is INVENTED as a definition (a FALSE RED). It is a declared limit, not a claim.
 _arith_depth = 0
 
 
@@ -1269,8 +1291,10 @@ cat <<'INNER2'
 INNER2;
 after_bad_terminator() { :; }
 INNER2
-# ⛔ THREE MORE CONDITIONS, EACH UNPINNED UNTIL ITS OWN LINE EXISTED (measured — every one is a false-PASS
-# direction: a real definition goes invisible, or a body line is invented, while all 246 arms stay green):
+# ⛔ THREE MORE CONDITIONS, EACH UNPINNED UNTIL ITS OWN LINE EXISTED (measured — and they are NOT all the
+# same direction, which this note used to claim it was: (d) and (e) hide a real definition, the false-PASS
+# direction, while (f) INVENTS one from a heredoc body, the false-RED direction. All 246 arms stay green
+# without any of the three):
 #   (d) an INDENTED head with the brace on the next line — pins `head`'s leading `\s*`, which the arm label
 #       "brace on either line, any indent" had claimed all along;
 #   (e) a head separated from its `{` by a BLANK line — pins the empty-line half of the later-lines skip (the
