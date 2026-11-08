@@ -277,8 +277,11 @@ REC_PIN="none"; REC_PIN_TREE="none"; REC_ACTION="none"; REC_DETAIL=""; REC_REMED
 # ⛔ THE FARM ROWS ARE FIELDS, NOT PROSE (tortoise#10114 arm 2, review round 9). The acceptance arm is
 # "a scheduled check that NAMES EACH drifting file"; the journal excerpt below is bounded at 12 so a
 # 30-row farm had 18 files that were COUNTED and never named anywhere durable. `not-graded` means NO
-# USABLE GRADE was produced — the switch is off, a refusal exited first, or the instrument's rc was
-# unreadable (`action=` distinguishes those; the arm that cannot read a grade must not claim one).
+# USABLE GRADE was produced — the switch is off, there was NO FARM TO GRADE, a refusal exited first, or
+# the instrument's rc was unreadable. `action=` names which of those it can — but NOT the farmless
+# SKIPPED arm, where it is `none` (the same value a clean no-op carries), so there `farm_rows=` is the
+# only signal: the arm that cannot read a grade must not claim one, and must not look like a pass that
+# graded and found nothing.
 REC_FARM_ROWS="not-graded"; REC_FARM_NROWS="not-graded"
 # ⛔ THE DRIFT ROWS ARTIFACT IS SELF-DATING AND IS NEVER DELETED BY A LATER PASS (review round 2).
 # Round 1 deleted it on every pass so a stale list could not be read as current — and that delete was
@@ -338,8 +341,10 @@ write_record() { # <ok> <rc>
         # a path it can be `none` (the farm matched — this pass wrote NO list, and whatever is on disk
         # is not today's answer), `unwritable` (the rows write failed while this record still wrote:
         # said out loud rather than silently leaving 18 files named nowhere) or `not-graded` (NO USABLE
-        # GRADE was produced: the switch is off, a refusal exited first, or the instrument's rc was
-        # unreadable — `action=` says which: `farm-unknown` vs `none`).
+        # GRADE was produced: the switch is off, there was no farm to grade, a refusal exited first, or
+        # the instrument's rc was unreadable — `action=` says which, EXCEPT on the farmless SKIPPED arm
+        # where it is `none`; there `farm_rows=` itself is the signal, because a farmless host must not
+        # read like a pass that graded and found nothing to name).
         printf 'farm_rows=%s\n' "$REC_FARM_ROWS"
         printf 'farm_n=%s\n' "$REC_FARM_NROWS"
         printf 'preserved=%s\n' "${PRESERVED_DIR:-none}"

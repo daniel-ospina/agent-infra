@@ -1256,6 +1256,12 @@ else
 fi
 assert_contains "$(cat "$T/t24d/state/harness-apply.status" 2>/dev/null || true)" "farm_rows=not-graded" \
     "T24 control: and the record says this pass did not grade the farm — not 'none', which claims it did"
+# ⛔ AND ON THIS ARM `action=` IS `none`, THE SAME VALUE A CLEAN NO-OP CARRIES (review round 4). So the
+# docs' "`not-graded` — see `action=`" is not sufficient disambiguation here: the only thing that tells
+# a farmless host apart from a pass that graded and found nothing is `farm_rows=` itself. Pinned, so the
+# doc sentence and the record cannot drift apart.
+assert_contains "$(cat "$T/t24d/state/harness-apply.status" 2>/dev/null || true)" "action=none" \
+    "T24 control: and action= is the same 'none' a clean no-op carries — so farm_rows= is the only signal here, which is what the doc now says"
 
 
 # Control 4: a DANGLING farm link is NOT an absent farm — `-d` follows symlinks, so the skipped arm
