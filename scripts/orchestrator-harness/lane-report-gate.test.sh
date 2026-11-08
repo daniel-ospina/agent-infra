@@ -1115,6 +1115,15 @@ if [ "$rc" = 4 ] && grep -q 'reason=merging-head-is-dated-ahead-of-this-box' <<<
 else
   bad "future-dated head: expected rc=4 + merging-head-is-dated-ahead-of-this-box, got rc=$rc :: $out"
 fi
+# ⛔ AND IT MUST NOT NAME ITS OWN HEAD TWICE EITHER (round-20 review, P2). At this point the report IS
+# bound to the merging head, so `report_head=` + `merging_head=` rendered the SAME 40-hex twice, and the
+# same-head row above could not catch it because that row drives the OTHER arm of the same block. A
+# `report_head=${rec_head:-$head}` re-introduction on either arm reds this row.
+case "$out" in
+  *report_head=*) bad "the skew STALE names report_head+merging_head, which are the SAME sha here — it reads as a contradiction: $out" ;;
+  *head_date=*)   ok "…and the skew STALE names the head DATE instead of printing one sha twice" ;;
+  *)              bad "the skew STALE names neither head_date nor a distinguishable head: $out" ;;
+esac
 case "$(bash "$GATE" --remedy 4 2>&1)" in
   *'RE-RUNNING WILL NOT HELP'*) ok "the code-4 remedy tells the lane that re-running cannot clear a clock-skewed head" ;;
   *) bad "the code-4 remedy does not distinguish the clock-skew case" ;;

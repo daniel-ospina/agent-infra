@@ -300,30 +300,46 @@ ck "an ABSENT lane report REFUSES the merge (exit 10 FIX_REQUIRED) and launches 
    $([ "$RC" = 10 ] && [ "$(verdict_of 90 | cut -d' ' -f1)" = FIX_REQUIRED ] \
       && ! grep -q 'launched the merge chain' <<<"$OUT" && grep -q 'VERDICT=ABSENT' <<<"$OUT" && echo 0 || echo 1)
 
-# ── 11c-quater-bis. rc=7 (UNMEASURABLE) IS A BOX FAULT, SO IT MUST NOT SPEND A FIX ROUND ────────
-# ⛔ MEASURED BEFORE THE FIX (round-19 review, P1): 7 fell through the `*)` arm into emit_fix, so a box
-# whose python is below 3.12 (stock macOS, Debian 11) burned ALL THREE of the lane's rounds on pushes
-# that cannot change the verdict and then reported `round cap reached` — labelling a box defect as a
-# lane failure, and leaving the lane at the cap once the box WAS repaired. merge-one.sh already refuses
-# 7 with no round (exit 9), so the two carriers were disagreeing about the same fault.
-# DISCRIMINATOR: against the pre-fix mapping this row exits 10/FIX_REQUIRED with a round spent, so it
-# cannot pass by accident. The gate is stubbed beside the script (the deployed `$O/lane-merge.sh`
-# shape) because rc=7 depends on the BOX, not on any report a fixture could write.
-new_o "$T/pr.tsv"
-cp "$SCRIPT" "$OT/lane-merge.sh"
-cat > "$OT/lane-report-gate.sh" <<'LRGEOF'
-lane_report_gate() { printf 'lane-report: VERDICT=UNMEASURABLE branch=feat/lane reason=no-interpreter-at-or-above-python-3.12\n'; return 7; }
-lane_report_remedy() { printf '  (remedy %s)\n' "${1:-}"; }
+# ── 11c-quater-bis. rc=7 IS A BAG: the BOX-only reasons hand off with no round, the LANE-fixable
+# ones still spend one (round-19/20 review, P1) ────────────────────────────────────────────────
+# ⛔ MEASURED BEFORE THE FIX: 7 fell through the `*)` arm into emit_fix, so a box whose python is below
+# 3.12 (stock macOS, Debian 11) burned ALL THREE of the lane's rounds on pushes that cannot change the
+# verdict and then reported `round cap reached` — a box defect labelled a lane failure. Round 19 then
+# over-corrected: it treated EVERY 7 as a box fault, but 7 is a bag of ~10 reasons and only the
+# interpreter/consumer ones are box-only. The rest (`writer-state-absent|corrupt`,
+# `worktree-registered-but-unreadable`, a detached/moved worktree) are cleared by an action the gate's
+# own code-7 remedy names, so they must keep their fix round — otherwise the hand-off tells the lane to
+# re-run something the disposition just made un-runnable.
+# DISCRIMINATOR: each row reds against the other branch's mapping (the box rows on exit 10, the lane row
+# on exit 14 / zero rounds), so neither can pass by accident. The gate is stubbed beside the script (the
+# deployed `$O/lane-merge.sh` shape) because rc=7 depends on the BOX, not on a report a fixture can write.
+mk7row() { # mk7row <pr> <reason> — a carrier + a gate stub that returns 7 with that reason
+  new_o "$T/pr.tsv"
+  cp "$SCRIPT" "$OT/lane-merge.sh"
+  cat > "$OT/lane-report-gate.sh" <<LRGEOF
+lane_report_gate() { printf 'lane-report: VERDICT=UNMEASURABLE branch=feat/lane reason=$2\\n'; return 7; }
+lane_report_remedy() { printf '  (remedy %s)\\n' "\${1:-}"; }
 LRGEOF
-OUT="$(PATH="$BIN:$PATH" GH_LOG=/dev/null O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 REPO_PATH="$GL" \
-      bash "$OT/lane-merge.sh" 91 --repo o/r --branch feat/lane --pr-tsv "$T/pr-gate.tsv" --checks-tsv "$T/checks-gate.tsv" 2>&1)"; RC=$?
-ck "an UNMEASURABLE report (rc=7) hands off as BLOCKED_ATTEMPTS (exit 14) instead of a FIX round" \
+  OUT="$(PATH="$BIN:$PATH" GH_LOG="$OT/gh.log" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 REPO_PATH="$GL" \
+        bash "$OT/lane-merge.sh" "$1" --repo o/r --branch feat/lane --pr-tsv "$T/pr-gate.tsv" --checks-tsv "$T/checks-gate.tsv" 2>&1)"; RC=$?
+}
+mk7row 91 no-interpreter-at-or-above-python-3.12
+ck "a BOX-only rc=7 (no interpreter) hands off as BLOCKED_ATTEMPTS/14 instead of a FIX round" \
    $([ "$RC" = 14 ] && [ "$(verdict_of 91 | cut -d' ' -f1)" = BLOCKED_ATTEMPTS ] \
       && ! grep -q 'launched the merge chain' <<<"$OUT" && echo 0 || echo 1)
 ck "…and it spends NO fix round (the lane can re-run from round 0 once the box is repaired)" \
    $([ "$(cat "$OT/state/lanemerge-91.round" 2>/dev/null || echo 0)" = 0 ] && echo 0 || echo 1)
 ck "…and it still says UNMEASURABLE rather than a verdict about the PR" \
    $(grep -q 'UNMEASURABLE (rc=7)' <<<"$OUT" && [ "$(verdict_of 91 | cut -d' ' -f1)" != FIX_REQUIRED ] && echo 0 || echo 1)
+# ⛔ THE HAND-OFF BODY MUST NOT BORROW THE BUDGET DIAGNOSIS. Measured on the round-19 arm: it rendered
+# `- Rounds spent: 0/3` plus "another watch chunk is charged before it does any work", neither of which
+# is true here (no round, no chunk) — the next holder inherited "reset the budget" as the reason.
+ck "…and the hand-off says the blocker is the BOX, not a spent budget (no false 'watch chunk' claim)" \
+   $(grep -q 'blocker is the BOX' "$OT/gh.log" && ! grep -q 'another watch chunk is charged' "$OT/gh.log" && echo 0 || echo 1)
+mk7row 92 writer-state-absent
+ck "a LANE-fixable rc=7 (writer state absent) STILL spends its fix round (FIX_REQUIRED/10)" \
+   $([ "$RC" = 10 ] && [ "$(verdict_of 92 | cut -d' ' -f1)" = FIX_REQUIRED ] \
+      && [ "$(cat "$OT/state/lanemerge-92.round" 2>/dev/null)" = 1 ] && echo 0 || echo 1)
 
 # The abstention arm: no worktree for the branch on this box is 6, LOGGED, and the chain still gets the
 # PR. It must never read as a verification — that string is the entire justification for not refusing.

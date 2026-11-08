@@ -981,23 +981,29 @@ print("%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s" % (
   # two arms above can both be satisfied by a report whose SUITES ran at an older commit. The newest
   # suite's `finished_at` is written only by `run` and is never touched by a render, so evidence that
   # finished before the merging commit existed cannot describe it.
-  # ⛔ THE REFUSAL LINE MUST NOT NAME TWO IDENTICAL SHAS (round-19 review, P2). The arm fires when a
-  # suite's `finished_at` is `<=` the merging commit's date, and that includes the SAME-HEAD case — a
-  # report correctly bound to the merging head whose suite finished in the commit's OWN second (both
-  # clocks are second-resolution). Printing `report_head` and `merging_head` there emits the SAME 40-hex
-  # twice, which reads as a contradiction and names nothing: measured end-to-end with the real writer,
-  # `commit=…T14:06:04+00:00 finished=…T14:06:04Z -> rc=4` with both fields equal. The head pair is
-  # therefore printed ONLY when it actually differs; the same-head arm names the timestamps instead, and
-  # the code-4 remedy offers the re-run for that cause (re-push cannot help — nothing was pushed).
+  # ⛔ THE REFUSAL LINE MUST NOT NAME TWO IDENTICAL SHAS (round-19 review, P2; round-20 review, P2).
+  # This arm fires when a suite's `finished_at` is `<=` the merging commit's date, and that includes the
+  # SAME-HEAD case — a report correctly bound to the merging head whose suite finished in the commit's
+  # OWN second (both clocks are second-resolution). At this point `rec_head` is always non-empty and
+  # equal to `head` (the `report-bound-to-another-head` arm above returns first, and an `ok` state
+  # requires a recorded head), so `report_head=X merging_head=X` printed the SAME 40-hex twice — which
+  # reads as a contradiction and names nothing: measured end-to-end with the real writer,
+  # `commit=…T14:06:04+00:00 finished=…T14:06:04Z -> rc=4` with both fields equal, and the code-4 remedy
+  # then sent the lane hunting for a push that never happened. The head pair is therefore printed ONLY
+  # on the defensive branch where it genuinely differs; both live arms name `head` + `head_date`.
+  # ⛔ THE SKEW ARM IS PART OF THIS RULE TOO: it emitted the identical pair until round 20.
   if [ "$predates" = "1" ]; then
     if [ "$skew" = "1" ]; then
-      _lrg_emit 4 STALE "branch=$branch worktree=$wt report=$wt/WORKTREE-REPORT.md reason=merging-head-is-dated-ahead-of-this-box report_head=${rec_head:-$head} merging_head=$head head_date=$commit_iso"
+      _lrg_emit 4 STALE "branch=$branch worktree=$wt report=$wt/WORKTREE-REPORT.md reason=merging-head-is-dated-ahead-of-this-box head=$head head_date=$commit_iso"
       return 4
     fi
-    if [ "${rec_head:-$head}" = "$head" ]; then
-      _lrg_emit 4 STALE "branch=$branch worktree=$wt report=$wt/WORKTREE-REPORT.md reason=evidence-not-produced-after-the-merging-commit head=$head head_date=$commit_iso"
-    else
+    if [ -n "$rec_head" ] && [ "$rec_head" != "$head" ]; then
+      # DEFENSIVE, and stated as such rather than implied reachable: no arm above can currently leave a
+      # differing `rec_head` in place. Kept total so a future reordering cannot silently print one sha
+      # twice again (the round-19 defect this arm exists for).
       _lrg_emit 4 STALE "branch=$branch worktree=$wt report=$wt/WORKTREE-REPORT.md reason=evidence-not-produced-after-the-merging-commit report_head=$rec_head merging_head=$head head_date=$commit_iso"
+    else
+      _lrg_emit 4 STALE "branch=$branch worktree=$wt report=$wt/WORKTREE-REPORT.md reason=evidence-not-produced-after-the-merging-commit head=$head head_date=$commit_iso"
     fi
     return 4
   fi
