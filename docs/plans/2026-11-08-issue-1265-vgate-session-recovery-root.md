@@ -11,7 +11,7 @@ The issue's headline ("the gate adopts ANOTHER worktree's root as the git-op roo
 true**, and that is provable from this tree: PR #1780 (merged to `main` 2026-10-15, merge commit
 `26ad39a33`, which IS in this head's history — `compare/26ad39a33...main` reports `behind_by: 0`)
 removed that claim from the log, `recoveryOnlyRoot` is **inspection-only** — its return never becomes a
-git-op root and never becomes the reported count — the `tool_call` handler's git-op path is
+git-op root and never becomes **this worktree's** recovery count — the `tool_call` handler's git-op path is
 `const cwd = resolveGitRoot(cdPath ?? inputCwd)`, and `pickVerifiedRoot` is documented
 RECOVERY-ONLY.
 
@@ -114,7 +114,7 @@ roots and 20+ tortoise roots in the live bridge), so this is the narrow one-sibl
 
 | Call site / consumer | What it does there |
 |---|---|
-| `recoveryOnlyRoot(root)` — 1 call site, `session_start` | names a same-repo sibling whose entries may be merged **for inspection**. Its return becomes `inspectRoot`; it never becomes a recovery *count* nor a git-op root. |
+| `recoveryOnlyRoot(root)` — 1 call site, `session_start` | names a same-repo sibling whose entries may be merged **for inspection**. Its return becomes `inspectRoot`; it never becomes a git-op root and never becomes **this worktree's** recovery count. It does produce a SEPARATE count — `inspected`, reported as INSPECTION ONLY and recorded as `gate_recovery_foreign_root.inspected` — which is why the record is readable outside the child's stdout (AC (b)). |
 | `recoverBridgeForRoot(normRoot)` — **3** call sites: `session_start` twice (`ownRoot` = the count, `inspectRoot` = inspection only) and the git-op mid-session recovery path | filters `parsed.root !== normRoot` ("foreign root — inert"), so it only ever installs entries for the root it is given. |
 | `diagnoseRootMismatch(root)` — 1 call site, the git-op path | narrates a root mismatch; gains the durable `gate_root_mismatch` record + dedupe. Block decision untouched. |
 | `bridgeRoots()` | reads the bridge's PASS roots; unchanged. |
