@@ -3072,6 +3072,22 @@ TBL
   _wreap_verdict_win() { ( _WREAP_WINDOW_MIN=6; . "$TMP/reapw.sh"; _wreap_verdict "$@" ); }
   _wreap_verdict_win "$(date +%s)" "$(date +%s) 100 2" 100 2 alive; [ "$?" = "2" ] && rc=0 || rc=1
   ck "#2104: a baseline younger than the window is UNKNOWN (a 2 s sample cannot tell wedged from off-CPU)" $rc
+  # ⛔ #3793 — THE SHIPPED DEFAULT NEEDS AN ARM THAT DOES NOT INHERIT THE FIXTURE'S `0` (#2104/#3756 added
+  # the bound and pinned it nowhere). `_WREAP_WINDOW_MIN=0` is assigned in THIS suite's shell above
+  # (`:2916`, deliberately: it disarms the window for arms whose subject is something else), so every arm
+  # above inherits `0` and `1  >= 0` is true for ANY declared default — the default itself was unmeasured.
+  # Here the variable is UNSET, so `_wreap_verdict` resolves the shipped `${_WREAP_WINDOW_MIN:-6}`: a flat
+  # reading across a 3600 s gap is past any sane window and is IDLE (rc 0). Raise the shipped default past
+  # 60 minutes and that same baseline becomes UNKNOWN (rc 2) and this arm reds — the value is pinned from
+  # the side `_wreap_verdict_win` (which pins 6 in its own subshell) cannot reach.
+  _wreap_verdict_def() { ( unset _WREAP_WINDOW_MIN; . "$TMP/reapw.sh"; _wreap_verdict "$@" ); }
+  _wreap_verdict_def "$(date +%s)" "$OLDV 100 2" 100 2 alive; [ "$?" = "0" ] && rc=0 || rc=1
+  ck "#3793: an UNSET window resolves the SHIPPED default, so a flat reading across a 3600 s gap is IDLE" $rc
+  # …and the DECLARATION's own default is a SECOND literal the extracted unit never sees (`reapw_prelude`
+  # extracts FUNCTIONS only, so `_WREAP_WINDOW_MIN="${WREAP_WINDOW_MIN:-6}"` never enters `$TMP/reapw.sh`),
+  # so it is pinned by SHAPE: the shipped window is 6 minutes. Both literals move together or this reds.
+  grep -qF '_WREAP_WINDOW_MIN="${WREAP_WINDOW_MIN:-6}"' "$LOOP" && rc=0 || rc=1
+  ck "#3793: the reaper's shipped WINDOW default is 6 min (the DECLARATION, not just its consumer's fallback)" $rc
   vrun "$(date +%s)" "" 100 0 alive; [ "$?" = "2" ] && rc=0 || rc=1
   ck "#2104: an UNIDENTIFIED worker on a LIVE surface is UNKNOWN — the P1 fail-open is closed" $rc
   vrun "$(date +%s)" "" "" 0 dead; [ "$?" = "0" ] && rc=0 || rc=1
@@ -3121,7 +3137,7 @@ TBL
   kept="$(cut -d' ' -f1 "$TMP/RW/state/wreap-inc")"
   [ "$kept" = "$_inc_now" ] && rc=0 || { rc=1; echo "      kept a predecessor epoch: $(cat "$TMP/RW/state/wreap-inc")"; }
   ck "#2104: …and the sample writer RESTARTS the window instead of preserving a predecessor's epoch" $rc
-  unset -f vrun _wreap_verdict_win _note_b2 _prev_inc _note_inc
+  unset -f vrun _wreap_verdict_win _wreap_verdict_def _note_b2 _prev_inc _note_inc
   # (c) END-TO-END on the SHIPPED reaper, TMUX ARM (the reviewer's P2: the old fixture wrote `kind=tmux`
   # but backed it with `run-<w>.sh`, a shape only the cmux arms produce, so the assertion could not fail
   # for the arm its own record named). Here the pane pid is the ONLY identity, exactly as on a cell.
