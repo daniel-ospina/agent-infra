@@ -255,7 +255,11 @@ case "$_rc" in
     #                                     letting the doctor die with a resolver message that does not
     #                                     mention the file that fixes it.
     repo_set_parse 1>&2
-    _say "DEGRADED — NO-REPO-SET: $(repo_set_file) does not exist, so this box has named no repo set."
+    _say "DEGRADED — NO-REPO-SET: $(repo_set_file) reported no usable repo set, so this box has named no repo set."
+    # ⛔ AND THE SENTENCE MUST NOT RE-ASSERT AN EXISTENCE PROOF THE READER JUST DISCLAIMED (round 48 review,
+    # P3 — measured). It said `<path> does not exist` unconditionally, one line after the reader printed that
+    # on the no-stat route this is the ancestor walk's INFERENCE and not a proof — so the operator-facing
+    # line claimed more than the evidence did, in the one place they are most likely to read.
     # The wrapper must establish the SAME evidence pr-doctor's resolver will use, in ITS rank order
     # (2 `PR_DOCTOR_REPO`, 3 `OR`, 4 `REPO`'s proved `origin`), and refuse only when that resolution
     # cannot produce a repo. Two easy ways to get this wrong, both MEASURED in review round 3:

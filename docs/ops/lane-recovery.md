@@ -1,0 +1,180 @@
+---
+title: "Lane recovery — how to restart a dead lane WITHOUT deleting its workspace (#942)"
+type: engineering
+domain: operations
+doc_status: live
+subjects.team: organisation-design-team
+created: 2026-11-08
+aboutSubjects: organisation-design-team
+aboutObjects: agent-infra, issue-942, lane-relaunch, safe-send, orchestrator-heartbeat, fleet-liveness, respawn-pane, cmux
+---
+
+# Lane recovery — restart a dead lane without deleting its workspace (#942)
+
+**One rule: a lane is relaunched by typing its launch line into the pane's OWN shell —
+`scripts/lane-relaunch.py --ws <uuid>`. Never `cmux respawn-pane`.**
+
+This page exists because three places in this repo prescribed a relaunch and named a remedy that
+did not exist (`recover-fleet / relaunch`, "board §72", `ORCHESTRATION-BOARD 72` — measured
+2026-11-08: no such script in the repo or in `~/.pi/agent/scripts/`, and no `ORCHESTRATION-BOARD-*.md`
+on the box). An operator who follows a pointer to nothing improvises, and the improvisation was the
+one verb this repo already documents as destructive.
+
+## Why `respawn-pane` is not the tool
+
+`cmux respawn-pane --workspace <W> --command "<cmd>"` replaces the pane's process. When `<cmd>` exits
+immediately — the binary is not on the respawn PATH, a wrapper cannot find `node` — the pane's
+process terminates, the surface closes, and because it was the workspace's only surface **the
+workspace is removed**. It then presents one step later as `Error: not_found: Workspace not found`,
+which does not point back at the respawn. The blast radius includes the session binding: the
+workspace is where the resume state lives, so the orchestrator loses its handle on that thread.
+
+Measured (issue #942): two workspaces destroyed in one session («π - tortoise 1», «Issue workflow»),
+and a later controlled repro destroyed a *scratch* workspace with `--command "pi --help"` — the
+command that was being tested precisely because the previous attempt had failed.
+
+Two aggravating factors, both designed around:
+
+1. **The respawn environment is `--noprofile --norc`.** Ghostty launches
+   `/usr/bin/login -flp <user> /bin/bash --noprofile --norc -c exec -l /bin/sh -c '<cmd>'`, so the
+   user's PATH and exported keys are absent. `pi` is typically not on it; a tool needing a key starts
+   broken ("No models available. Use /login"). The pane's own login shell has both.
+2. **Stored resume state can point at a session file that does not exist.** `cmux surface resume
+   show` returned ids for which `ls ~/.pi/agent/sessions/*/*<id>*.jsonl` found nothing; resuming from
+   one would silently start an EMPTY session that looks like a restore. See
+   [Identifying the real session](#identifying-the-real-session) below.
+
+This is also the multiplexer convention, not a fleet idiosyncrasy: tmux makes pane destruction on
+child exit **opt-in** (`remain-on-exit` keeps a "dead pane" with its output; modes `failed` /
+`failed-key` keep it exactly when the child *failed*), and an application is started in an existing
+pane by `send-keys` into that pane's shell — after which `respawn-pane` would restart the *shell*,
+not the application (tmux wiki *Advanced Use*, tmux(1), tmuxp#139). We cannot give cmux
+`remain-on-exit`; we can stop depending on the destructive verb.
+
+## The procedure
+
+```bash
+# CONFIRMED dead: the pane is a bare shell (no pi footer) AND the workspace has no live pi record.
+scripts/lane-relaunch.py --ws <workspace-uuid> --dry-run      # prints the exact launch line
+scripts/lane-relaunch.py --ws <workspace-uuid>                # sends it, then confirms
+```
+
+Exit codes are the answer, not the pixels:
+
+| Exit | Meaning |
+|---|---|
+| `0` | **CONFIRMED** — the line was sent and the proof fired: the session transcript **advanced** (resume arm), or a **fresh session appeared / the pane left the shell prompt** (`--new` arm) |
+| `3` | **REFUSED** — a guard refused and nothing was sent; the message names the guard |
+| `4` | **UNCONFIRMED** — sent, but the proof did not fire inside `--wait`; the message carries the pane tail and names the signal that arm was actually watching |
+| `5` | **DRY-RUN** — `--dry-run`: nothing was sent. Deliberately NOT `0`, which means CONFIRMED ("sent AND proven") — a scripted caller reading `$?` must not be told the lane came back |
+| `1` | **ERROR** — the tool itself raised. Never reported as DRY-RUN or as an unconfirmed send: the operator's next move is chosen on this line |
+
+The launch line it sends is the form the fleet's own recovery used to bring back 14 lanes (issue
+#942):
+
+```
+cd <cwd> && <abs path to pi> --session <id>
+```
+
+⛔ **No `exec`.** `exec` would REPLACE the pane's shell with pi, so a later pi exit (a finished turn,
+`/quit`, a crash) leaves no shell: the pane's process terminates, the surface closes, and on the
+only-surface case cmux removes the workspace — #942's own chain, reached hours later and looking like a
+different bug. With pi as a **child** of the shell, a pi exit returns the pane to the bare-shell state
+that [the guards](#what-it-refuses-and-why-each-refusal-exists) read, so the lane is relaunchable again.
+That is also literally the line #942 records as having recovered 14 lanes.
+
+…sent as ONE `cmux send` payload **with a trailing newline** (`cmux send` without one types but never
+submits — #941, a silent dispatch no-op). If the line is wrong you get a shell prompt back, and when the
+lane's pi exits later the shell it ran under is still there. Nothing is destroyed.
+
+### What it refuses, and why each refusal exists
+
+| Refusal | Why it is a refusal and not a warning |
+|---|---|
+| pane unreadable | UNKNOWN is not idle, and it is not dead either. Never type into a pane you cannot read. |
+| `Working` in the pane | a turn is in flight; the text would be taken as **steering into a live model** |
+| no shell prompt on the last line | the pane is not at a bare shell (a pi footer, a pager, an editor would take the text). Positive match only — a negative list fails open. `>` is deliberately NOT accepted: pi draws `> ` as its input line |
+| a LIVE pi session record for the workspace | the lane is not dead; the orthogonal half of the fleet's own DEAD definition (`cmux sessions list` records + pane) |
+| the session record is unreadable | an unread read is not "no live pi" |
+| the resolved session has no transcript | #942 aggravating factor 2. `--new` is how you say "fresh session" deliberately |
+| no cwd / no `pi` binary | a launch line that cannot resolve is the failure this tool exists to avoid |
+| `lane-status.py` not importable | the fleet's resolution primitives are not installed beside the tool; nothing was read, so nothing may be sent |
+
+`--new` starts a fresh session (no `--session`), and is the only way to relaunch a lane whose
+transcript is genuinely gone. Its confirmation is anchored to a **pre-send baseline** — never to a
+state that already existed:
+
+- **proof (i):** a `*.jsonl` transcript that was NOT present before the send **and whose own first
+  record names exactly this lane's cwd**. The cwd is read from the transcript, never inferred from a
+  directory name — `lane-status.mangled()` turns `.` into `-` while pi keeps the dot, and every fleet
+  lane lives in a dotted path, so a derived directory name is not a key. The comparison is
+  **identity, not containment**: a session started in an ancestor (the repo root, `$HOME`, the
+  worktrees dir) or a subdirectory of the lane's cwd is a different lane's business. New transcripts
+  are opened **newest first**, and only the five newest are read, so a burst of other lanes appearing
+  inside `--wait` cannot push this lane's own transcript out of the window — while a box with
+  thousands of session files still costs five opens;
+- **proof (ii):** the pane **left the shell prompt** on two consecutive reads. pi creates its session
+  file lazily (the path is assigned at session start; the first write arrives with the first entry), so
+  a fresh session with no prompt yet may leave no file — the pane is then the only witness;
+- **not proof:** a recorded session id that still has a transcript on disk (the common shape), a
+  transcript from a different cwd, or a single non-prompt frame (a redraw). Each would report
+  `CONFIRMED` for a session nothing had started.
+
+### Identifying the real session
+
+Do not trust the stored resume id when the transcript is missing — find the session **by content**:
+
+```bash
+grep -rl "<a distinctive phrase from that thread>" ~/.pi/agent/sessions/*/
+# then confirm no live writer: size and mtime stable over ~25s
+```
+
+That is how the sessions in #942 were recovered (`loop_liveness` located `01a09b33…` and
+`01a09bcd…`; the stored ids `01a09c4a…` and `5a51b1ed…` matched no file).
+
+## Scope and known limits
+
+- **It is not a fix for cmux.** The teardown belongs to cmux and is not in this repo; this page and
+  the tool remove this fleet's *reason* to invoke it.
+- **On a build without `cmux sessions list`, the tool refuses** (exit 3). That is deliberate: the
+  live-pi half of the guard cannot be answered, and a refusal is cheaper than typing into a live
+  session. Use the manual form above on such a box, with the pane read as the only evidence.
+- **Missing imports are a refusal, not a crash.** `pi-bootstrap`'s farm withholds `lane-status.py`
+  deliberately (#1553), so dropping this tool beside the *farmed* heartbeat leaves its imported
+  primitives absent — the tool then refuses (exit 3) with a message saying so, rather than raising.
+  Run it from a repo checkout.
+- **Declared residual (not closed):** proof (ii) — "the pane left the shell prompt" — is exactly the
+  state the `cmux send` Enter itself produces, so a launch line that fails *slowly* (a wrapper taking
+  longer than the poll interval to error) reads `CONFIRMED` for a command that is still running. Two
+  consecutive reads remove the redraw case, not this one. A positive pi-footer check would close it and
+  is the vocabulary `orchestrator-heartbeat.sh`'s `_shell_visible` owns — one source of truth beats a
+  drifted second one, so it stays declared here.
+- **Declared residual (not closed):** the `--new` appearance proof cannot tell two pis in ONE cwd
+  apart. Proof (i) is realpath **identity** on the cwd read from the transcript — stricter than
+  containment, and the round-6 fix — but identity is not ATTRIBUTION: a `task` child is literally a
+  second pi in the lane's own directory ([fleet liveness](./fleet-liveness.md) records that state as
+  measured, together with a nine-lanes-one-cwd box), so a co-located lane or child that starts a
+  session inside the `--wait` window reads `CONFIRMED` for a relaunch that started nothing. Closing
+  it needs an identity the transcript does not carry (the pid that wrote the first record), which is
+  a session-lifecycle change rather than a guard here, so the window stays declared — read the exit-0
+  with it in mind, exactly like proof (ii)'s below.
+- **Declared residual (not closed):** the shell-prompt guard is a last-character test, so a live pi
+  whose session record is stale (the documented record-only-dead class), not drawing `Working`, and
+  whose last line happens to end in `$ % # ❯ »` would be mistaken for a shell. Three guards must miss
+  at once, and pi draws its footer ending in the model/thinking level, not in a prompt character. A
+  footer-ABSENT check would close the window but would need a second copy of the footer vocabulary
+  that `orchestrator-heartbeat.sh`'s `_shell_visible` already owns — one source of truth beats a
+  drifted second one, so the window stays declared here rather than duplicated.
+- **The cmux CLI grammar drifts between builds** (`cmux send --workspace <ws>` on the Mac build vs
+  `cmux terminal send <id>` on a cell). The tool uses the Mac/fleet form — the one every other script
+  in this repo uses — and prints the exact argv it tried when the send fails.
+- **It does not decide whether the lane is dead.** That is
+  [fleet liveness](./fleet-liveness.md)'s five states; this tool acts only on the state that page
+  calls CONFIRMED bare-shell, and it re-proves both halves itself rather than trusting a snapshot.
+
+## Related
+
+- [fleet-liveness.md](./fleet-liveness.md) — the verdicts, the identity rule, the abstention doctrine
+- [session-lifecycle-contract.md](./session-lifecycle-contract.md) — one issue per session, handoff budget
+- `scripts/safe-send.sh` — the dispatch path; its refusal for a pane with no pi now names this tool
+- `scripts/orchestrator-heartbeat.sh` — the DEAD LANES clause names this tool

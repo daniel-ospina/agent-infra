@@ -37,24 +37,39 @@ import { appendFileSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
-export type GateEventName =
-  | "gate_bypass"
-  | "review_dispatch"
-  | "merge_gate_block"
-  | "merge_gate_pass"
-  | "review_record_collision" // #426: cross-repo PR-number registry collision (readReviewRecord)
-  | "gate_block" // #516: review-enforcer dispatch-count block at 0 dispatches (uniform ≥1-dispatch floor, #485)
-  | "gate_pass" // #2204: a command the text POSITIVELY reads as read-only gh work, allowed with ZERO dispatches (the floor covers writes; the reason tag is "read_only_no_dispatch")
-  | "reviewer_preflight" // #2148: the reviewer requirement disclosed BEFORE the work (session_start → phase:"session_start", first push → phase:"first_push", refused op → phase:"block_recovery")
-  | "bridge_clear" // #561: scripts/vgate.sh clear — root-scoped bridge rewrite (type-documentation; vgate.sh appends raw JSONL)
-  | "review_spawn_no_verdict" // #2665: a reviewer spawn returned no verdict (attempt, NOT a dispatch)
+// ⛔ THE LIST IS THE SOURCE OF THE TYPE, NOT A SECOND COPY OF IT (#853 review).
+// `GateEventName` used to be a bare type union, and a type is INVISIBLE at runtime — so nothing
+// could assert that a name a report reads is a name this repo declares. The reviewer's measured
+// mutant: deleting a member reddened NO test, because `appendJsonl` takes `Record<string,
+// unknown>` and the suite never referenced the union. Deriving the type from a runtime array makes
+// membership assertable (`GATE_EVENT_NAMES`), so the drift the union exists to prevent is now
+// caught by a test rather than by the honour system. Add a new event HERE; the type follows.
+export const GATE_EVENT_NAMES = [
+  "gate_bypass",
+  "review_dispatch",
+  "merge_gate_block",
+  "merge_gate_pass",
+  "review_record_collision", // #426: cross-repo PR-number registry collision (readReviewRecord)
+  "gate_block", // #516: review-enforcer dispatch-count block at 0 dispatches (uniform ≥1-dispatch floor, #485)
+  "gate_pass", // #2204: a command the text POSITIVELY reads as read-only gh work, allowed with ZERO dispatches (the floor covers writes; the reason tag is "read_only_no_dispatch")
+  "reviewer_preflight", // #2148: the reviewer requirement disclosed BEFORE the work (session_start → phase:"session_start", first push → phase:"first_push", refused op → phase:"block_recovery")
+  "bridge_clear", // #561: scripts/vgate.sh clear — root-scoped bridge rewrite (type-documentation; vgate.sh appends raw JSONL)
+  "review_spawn_no_verdict", // #2665: a reviewer spawn returned no verdict (attempt, NOT a dispatch)
   // #3297: the argv-level gh shim (#984) was NOT LOADED on this box, so the admin-merge gate
   // refused to certify a merge. Recorded as an EVENT, not only as console prose: row 1 of
   // docs/ops/ACTIVATION-MATRIX.md promises a report can read the degraded state without
   // anyone parsing a log line, and a name outside this union is exactly the "written outside
   // the type a report reads" gap that ships green under `tsx` and reddens the first tree
   // that adds a tsconfig.
-  | "gh_shim_degraded";
+  "gh_shim_degraded",
+  // #853: the main-worktree guard's own classifier FAILED TO LOAD, so every gate it backs is
+  // inert (the bash git guard non-blocking, the write/edit main-checkout gate fail-OPEN — #761).
+  // Same reason as `gh_shim_degraded` above: a degraded enforcement layer must be readable by a
+  // report, not only by whoever scrolls back through the session prose. This is the ONE surface
+  // that knows a session ran unguarded, so it may not be a `console.warn` nobody reads.
+  "guard_degraded",
+] as const;
+export type GateEventName = (typeof GATE_EVENT_NAMES)[number];
 // Resolved lazily per call (not at module load) so a $HOME change — tests,
 // alternate agent dirs — takes effect. Uses os.homedir(); never hardcoded.
 export function gateEventsFile(): string {

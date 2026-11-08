@@ -292,6 +292,11 @@ let maskRemoteExecPayloads: (command: string) => string = (c: string) => String(
 // default: inert (null) — a failed import NEVER false-blocks (same contract
 // as the #350 warn helpers; the gate is opt-in by explicit call only).
 let classifierLoaded = false;
+// #853: WHAT a degraded load must not stay silent about. `classifierLoaded === false` already
+// means every binding above is a fail-safe stub; these carry the REASON to the two surfaces a
+// session cannot miss — the startup self-test at `session_start` and the durable audit trail.
+let _classifierLoadFailure: string | null = null;
+const _classifierDegradedPids = new Set<number>();
 let branchDeleteAllowance: (targetNames: string[], currentBranch: string | null, checkedOutBranches?: Set<string>) => boolean = () => false;
 let newFileWriteCollisionFree: (relPath: string, untrackedPaths: string[]) => boolean = () => false;
 let ALLOW_MAIN_EDITS_MARKER_TTL_MS = 15 * 60 * 1000;
@@ -392,6 +397,9 @@ try {
   classifierLoaded = true;
   isWorktreeCwdWrite = isWorktreeCwd; // real function once loaded
 } catch (e) {
+  // #853: record WHY, so the startup self-test can name the cause instead of a bare
+  // "DISABLED". The console line stays (it is the only trace if the session never starts).
+  _classifierLoadFailure = String(e);
   console.warn("[main-worktree-guard] ⚠️ classify-git.mjs failed to load — bash git guard DISABLED:", String(e));
 }
 
@@ -5089,10 +5097,90 @@ function _m1(pid: number) {
   } catch { /* warn-only — never blocks reads */ }
 }
 
+// ── #853: the startup SELF-TEST for a degraded classifier ────────────────
+// `classifierLoaded === false` means the load `catch` above fired: every binding in this file is
+// still its fail-safe stub, so the bash git guard passes EVERY command and the write/edit target
+// gate takes its "isolated by construction" branch and ALLOWS writes into the main checkout
+// (#761). Until #853 both consequences were reported by exactly one `console.warn` at load, which
+// nothing reads — a NO-OP GATE that looks enforced. This is the same correction `review-enforcer`
+// made for the absent `gh` argv shim (`gh_shim_degraded`, #984/#3297): name the consequence and
+// the remedy, and RECORD a durable gate event so a report can read the state without anyone
+// parsing prose.
+//
+// It changes no verdict. A notification on a path that has already decided to allow cannot
+// introduce a block, which is why this does not touch the module's never-false-block contract —
+// the fail-CLOSED question stays open on #761 and is deliberately NOT decided here.
+function _reportClassifierDegradation(ctx?: { ui?: { notify?: (msg: string, level?: string) => void } }): void {
+  if (classifierLoaded) return;
+  const pid = process.pid;
+  if (_classifierDegradedPids.has(pid)) return; // once per session process; /resume must not spam
+  _classifierDegradedPids.add(pid);
+  const reason = _classifierLoadFailure ?? "classify-git.mjs did not bind the expected exports";
+  const row = (s: string) => `║  ${s.padEnd(64)}║`;
+  const lines = [
+    "",
+    "╔══════════════════════════════════════════════════════════════════╗",
+    row("🚫  MAIN-WORKTREE GUARD — DEGRADED (a STATE, not a warning)"),
+    "╠══════════════════════════════════════════════════════════════════╣",
+    row("classify-git.mjs FAILED TO LOAD, so every gate it backs is OFF:"),
+    row("  · bash git mutations in a main checkout → ALLOWED"),
+    row("  · write/edit in a main checkout → FAILS OPEN (#761)"),
+    row("This is NOT a safe mode. Nothing else in this session will stop a"),
+    row("destructive git command in the shared main checkout."),
+    row("FIX: reinstall the extension tree (pi-bootstrap/setup.sh, or"),
+    row("cell-install.sh on a cell), then verify with:"),
+    row("  node extensions/main-worktree-guard/test-module-load.mjs"),
+    row("Deliberate acceptance: AGENT_ALLOW_MAIN_EDITS=1 (solo sessions)."),
+    "╚══════════════════════════════════════════════════════════════════╝",
+    `   cause: ${reason}`,
+    "",
+  ];
+  // ── ORDER MATTERS: the DURABLE row is written FIRST, and each surface has its OWN try. ──
+  // #853 review (cycle 2, P3): with a single `try` around all three surfaces and the row LAST, a
+  // `ui.notify` that THREW skipped the row entirely — and because the pid is marked above, the loss
+  // was PERMANENT for the process: the one surface a report can read would never learn the session
+  // ran unguarded, while the banner suggested it could. A presentation surface must never be able to
+  // cost the machine-readable record. Each arm is isolated for the same reason.
+  try {
+    appendJsonl({
+      event: "guard_degraded",
+      extension: "main-worktree-guard",
+      reason: "classifier_load_failed",
+      error: reason,
+      session_cwd: process.cwd(),
+    });
+  } catch {
+    // appendJsonl is already fail-safe internally; this arm exists so the property is LOCAL and
+    // provable here too — a report must never change a verdict, including by throwing.
+  }
+  try {
+    console.warn(lines.join("\n"));
+  } catch { /* a console that throws must not cost the notify arm below */ }
+  try {
+    // A warn line in a noisy startup log is exactly what nothing reads (#853). An INTERACTIVE
+    // session also gets the SDK's error-level notification; a print-mode lane's own log carries
+    // the banner above, so the surface is never absent — only one of the two applies.
+    if (!isPrintMode()) {
+      ctx?.ui?.notify?.(
+        "[main-worktree-guard] 🚫 DEGRADED — classify-git.mjs failed to load: the bash git guard " +
+        "and the main-checkout write gate are OFF for this session. See the session log for the " +
+        "cause and the fix.",
+        "error"
+      );
+    }
+  } catch {
+    // The banner and the durable row above have already been delivered.
+  }
+}
+
 export default function (pi: ExtensionAPI) {
   // ── Session-start: record the branch-ownership baseline + hub check ──────
-  pi.on("session_start", async () => {
+  pi.on("session_start", async (_event, ctx) => {
     const pid = process.pid;
+    // #853: the guard's startup self-test. FIRST, before every early return below — a degraded
+    // classifier is exactly the case where those checks are inert, so a degradation report that
+    // sat behind the escape-hatch return would be silent on the sessions that need it most.
+    _reportClassifierDegradation(ctx as { ui?: { notify?: (msg: string, level?: string) => void } });
     // #628 reviewer P3: the new-file volume counter is per-SESSION state — a
     // resumed/reused process must not inherit a prior session's count.
     hubNewFileCounts.clear();

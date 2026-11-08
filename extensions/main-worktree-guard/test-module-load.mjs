@@ -34,8 +34,8 @@
 //           hubNewFileVolumeVerdict + HUB_NEW_FILE_BLOCK_CAP
 //
 // Run: node extensions/main-worktree-guard/test-module-load.mjs
-import { execSync } from "node:child_process";
-import { mkdtempSync, readFileSync, writeFileSync, realpathSync, rmSync } from "node:fs";
+import { execSync, spawnSync } from "node:child_process";
+import { mkdtempSync, readFileSync, writeFileSync, realpathSync, rmSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -982,6 +982,258 @@ async function partB() {
 }
 
 await partB();
+
+// ─────────────────────────────────────────────────────────
+// Part C — a DEGRADED classifier load is LOUD and DURABLE (#853)
+// ─────────────────────────────────────────────────────────
+// Why this Part exists. Part B proves a HEALTHY load binds the real exports,
+// and B1 asserts it emits no degradation warning — but nothing asserted what a
+// DEGRADED load reports. That was the gap #853 is about: `classifierLoaded`
+// false left every gate inert and reported it with one `console.warn`, which no
+// gate and no report reads, so the guard was a NO-OP GATE that looked enforced.
+//
+// A real load failure cannot be produced in-process: Part B has already imported
+// `classify-git.mjs`, so the ESM registry serves it from cache and a load hook
+// never runs for it. So this Part spawns a CHILD node process with a fresh
+// module registry, installs the repo's own loader hooks (module-load-hooks.mjs)
+// with ONE wrapper that makes `classify-git.mjs` throw while it evaluates, and
+// asserts the degraded session_start reports on the surfaces #853 named —
+// banner, error-level notification, and a durable `guard_degraded` gate event.
+console.log("\n── Part C: a degraded classifier load is LOUD + DURABLE (#853) ──");
+
+async function partC() {
+  if (typeof stripTypeScriptTypes !== "function" || typeof registerHooks !== "function") {
+    skipped("C: degraded-load reporting",
+      `node ${process.versions.node} lacks module.stripTypeScriptTypes/registerHooks (needs Node >= 22.15) — ` +
+      "Part A/B still guard the load path, but the #853 reporting is unproven on this interpreter");
+    return;
+  }
+
+  const hooksUrl = new URL("./module-load-hooks.mjs", import.meta.url).href;
+  const indexUrl = pathToFileURL(INDEX_TS).href;
+  const auditLogUrl = new URL("../shared/audit-log.ts", import.meta.url).href;
+
+  // The probe runs in a fresh process so `classify-git.mjs` is genuinely
+  // EVALUATED (and throws) instead of being served from a cache. It drives the
+  // registered session_start exactly as pi does, with a ctx whose ui.notify is
+  // recorded, and prints one JSON line for the parent to assert against.
+  const probe = `
+import { registerHooks } from "node:module";
+const hooks = await import(${JSON.stringify(hooksUrl)});
+const realLoad = hooks.load;
+// The ONE injection (armed by the parent's env): classify-git.mjs throws while
+// evaluating, which is the TOTAL load failure #853 describes (the catch in
+// index.ts fires, every binding keeps its fail-safe default, classifierLoaded
+// never flips). Disarmed, the SAME probe is the healthy control.
+const injectFailure = process.env.PROBE_FAIL_CLASSIFY === "1";
+registerHooks({
+  resolve: hooks.resolve,
+  load(url, context, nextLoad) {
+    if (injectFailure && url.endsWith("/main-worktree-guard/classify-git.mjs")) {
+      return { format: "module", shortCircuit: true,
+        source: 'throw new Error("injected classify-git.mjs load failure (#853 test)");' };
+    }
+    return realLoad(url, context, nextLoad);
+  },
+});
+const warns = [];
+const realWarn = console.warn;
+// Kept overridden ACROSS session_start: the #853 report fires there, not at load,
+// so restoring the real warn before driving the handler would send the banner to
+// stderr and leave this probe unable to see it. Forwarded, not swallowed, so a
+// genuine failure elsewhere in the child stays diagnosable.
+console.warn = (...a) => { warns.push(a.map(String).join(" ")); realWarn(...a); };
+const mod = await import(${JSON.stringify(indexUrl)});
+// The DECLARED vocabulary, read from the real module (hooks strip its types), so the parent can
+// assert the name this extension actually WRITES is a name the repo DECLARES. A type union is
+// invisible at runtime, so without this the two can drift silently — the exact defect the #853
+// review measured (deleting the union member reddened nothing).
+const auditLog = await import(${JSON.stringify(auditLogUrl)});
+const declaredEvents = Array.from(auditLog.GATE_EVENT_NAMES ?? []);
+const notified = [];
+const handlers = new Map();
+mod.default({ on(n, f) { if (!handlers.has(n)) handlers.set(n, []); handlers.get(n).push(f); } });
+const start = handlers.get("session_start")?.[0];
+// Fire session_start TWICE: the report is once per session process, so a
+// /resume must not duplicate the banner or the audit row.
+const throwNotify = process.env.PROBE_THROW_NOTIFY === "1";
+const ctx = { ui: { notify: (msg, level) => {
+  if (throwNotify) throw new Error("injected ui.notify throw (#853 test)");
+  notified.push({ msg, level });
+} } };
+if (typeof start === "function") { await start({}, ctx); await start({}, ctx); }
+process.stdout.write(JSON.stringify({ warns, notified, registered: !!start, declaredEvents }) + "\\n");
+`;
+
+  // Hermetic HOME per arm: the gate event lands in $HOME/.pi/agent/audit/
+  // gate-events.jsonl, so each arm reads only the row it caused.
+  const runArm = ({ printMode = false, injectFailure = true, allowMainEdits = false, throwNotify = false } = {}) => {
+    const home = realpathSync(mkdtempSync(join(tmpdir(), "guard-degraded-home-")));
+    const env = { ...process.env, HOME: home };
+    // isPrintMode() reads env.PI_MODE first; argv here carries no -p/--print.
+    if (printMode) env.PI_MODE = "print"; else delete env.PI_MODE;
+    if (injectFailure) env.PROBE_FAIL_CLASSIFY = "1"; else delete env.PROBE_FAIL_CLASSIFY;
+    delete env.AGENT_ALLOW_MAIN_EDITS;
+    delete env.ELDATO_ALLOW_MAIN_EDITS;
+    // C12's arm: the escape hatch ON, which is the state `session_start` returns
+    // early from (`index.ts:5177`). Kept as an ENV seam rather than a ctx stub so
+    // the arm exercises the real `_isAllowMainEdits()` the handler consults.
+    if (allowMainEdits) env.AGENT_ALLOW_MAIN_EDITS = "1";
+    if (throwNotify) env.PROBE_THROW_NOTIFY = "1"; else delete env.PROBE_THROW_NOTIFY;
+    const out = spawnSync(process.execPath, ["--input-type=module", "-e", probe], {
+      env, encoding: "utf8", timeout: 120_000, cwd: HERE,
+    });
+    const last = (out.stdout ?? "").trim().split("\n").filter(Boolean).pop();
+    let parsed = null;
+    try { parsed = JSON.parse(last ?? "null"); } catch { /* asserted below */ }
+    const auditFile = join(home, ".pi", "agent", "audit", "gate-events.jsonl");
+    const auditRows = existsSync(auditFile)
+      ? readFileSync(auditFile, "utf8").trim().split("\n").filter(Boolean).map((l) => {
+          try { return JSON.parse(l); } catch { return null; }
+        }).filter(Boolean)
+      : [];
+    rmSync(home, { recursive: true, force: true });
+    return { parsed, auditRows, stderr: (out.stderr ?? "").slice(-500), status: out.status };
+  };
+
+  const interactive = runArm({ printMode: false });
+  if (!interactive.parsed) {
+    expectTrue("C0: the degraded-load probe ran and reported (precondition)", false,
+      `probe exited ${interactive.status}; stderr tail: ${interactive.stderr}`);
+    return;
+  }
+  expectTrue("C0: the degraded load still registered a session_start handler (precondition)",
+    interactive.parsed.registered === true,
+    `registered=${JSON.stringify(interactive.parsed.registered)} — the probe never reached the factory`);
+
+  const banner = (interactive.parsed.warns ?? []).find((w) => w.includes("MAIN-WORKTREE GUARD — DEGRADED"));
+  expectTrue("C1: a degraded load reports a LOUD state banner at session_start (not a bare ⚠️ line)",
+    !!banner, `captured warnings: ${JSON.stringify(interactive.parsed.warns ?? [])}`.slice(0, 400));
+  expectTrue("C2: the banner NAMES the consequence (the gates it leaves off)",
+    !!banner && /bash git mutations/.test(banner) && /FAILS OPEN/.test(banner),
+    `banner missing the consequence sentences: ${String(banner).slice(0, 300)}`);
+  expectTrue("C3: the banner NAMES the cause (the injected load error, not a generic message)",
+    !!banner && /injected classify-git\.mjs load failure/.test(banner),
+    `banner does not carry the cause: ${String(banner).slice(0, 300)}`);
+  expectTrue("C4: the banner NAMES a remedy",
+    !!banner && /FIX: reinstall/.test(banner), `banner has no remedy: ${String(banner).slice(0, 300)}`);
+  expectTrue("C5: session_start fired TWICE but the banner was reported ONCE (once per session process)",
+    (interactive.parsed.warns ?? []).filter((w) => w.includes("MAIN-WORKTREE GUARD — DEGRADED")).length === 1,
+    `degradation banners: ${(interactive.parsed.warns ?? []).filter((w) => w.includes("DEGRADED")).length}`);
+
+  const notes = interactive.parsed.notified ?? [];
+  expectTrue("C6: an INTERACTIVE session also gets an error-level ui.notify (a log line is what nothing reads)",
+    notes.length === 1 && notes[0].level === "error" && /DEGRADED/.test(notes[0].msg),
+    `notified: ${JSON.stringify(notes).slice(0, 300)}`);
+
+  // ── The DURABLE half: a gate event a report can read without parsing prose.
+  const rows = interactive.auditRows.filter((r) => r.event === "guard_degraded");
+  expect(`C7: a degraded load appends exactly one \`guard_degraded\` gate event (twice-fired session_start → 1 row)`,
+    rows.length, 1);
+  expectTrue("C8: the gate event is attribution-complete (extension + reason + cause + cwd)",
+    rows.length === 1 &&
+      rows[0].extension === "main-worktree-guard" &&
+      rows[0].reason === "classifier_load_failed" &&
+      /injected classify-git\.mjs load failure/.test(rows[0].error ?? "") &&
+      typeof rows[0].session_cwd === "string" && rows[0].session_cwd.length > 0 &&
+      typeof rows[0].ts === "string",
+    `row: ${JSON.stringify(rows[0] ?? null).slice(0, 400)}`);
+
+  // ── C13: the name the guard WRITES is a name the repo DECLARES (#853 review, issue 1).
+  // R6's original "covered" claim cited `audit-log.test.ts`, which never referenced the union —
+  // so deleting the union member reddened nothing. `appendJsonl` takes `Record<string, unknown>`,
+  // so the type cannot catch this either. This row closes it end-to-end: it reads the emitted
+  // event back out of gate-events.jsonl and checks it against the vocabulary the REAL module
+  // exports. Delete the `"guard_degraded"` member and this reddens; typo the emit and C7 reddens.
+  // (Numbered C13 to leave C12/C12b — the PLACEMENT arm below — as the fixer's commit
+  // introduced them; two different assertions on one label is a report that cannot be cited.)
+  const declared = interactive.parsed.declaredEvents ?? [];
+  expectTrue("C13: the event name the guard WRITES is a DECLARED GateEventName (emit ↔ vocabulary pinned end-to-end)",
+    declared.length > 0 && rows.length === 1 && declared.includes(rows[0].event),
+    `emitted=${JSON.stringify(rows[0]?.event ?? null)} declared(${declared.length})=${JSON.stringify(declared).slice(0, 300)}`);
+  expectTrue("C13b: the vocabulary cross-check is not vacuous (the probe really read GATE_EVENT_NAMES)",
+    declared.length >= 10 && declared.includes("gate_bypass"),
+    `declared(${declared.length})=${JSON.stringify(declared).slice(0, 200)}`);
+
+  // ── Print mode: the banner + the event must survive, the ui.notify must not fire
+  // (a headless lane has no UI; its own log carries the banner — never no surface).
+  const headless = runArm({ printMode: true });
+  expectTrue("C9: a PRINT-MODE session still delivers the banner and the gate event (never no surface)",
+    !!headless.parsed &&
+      (headless.parsed.warns ?? []).some((w) => w.includes("MAIN-WORKTREE GUARD — DEGRADED")) &&
+      headless.auditRows.some((r) => r.event === "guard_degraded"),
+    `parsed=${JSON.stringify(headless.parsed ?? null).slice(0, 200)} audit=${headless.auditRows.length} stderr=${headless.stderr}`);
+  expect("C10: print mode does NOT call ui.notify (no ctx surface to call, and the log already carries it)",
+    (headless.parsed?.notified ?? []).length, 0);
+
+  // ── The HEALTHY control: the SAME probe with the injection disarmed. Part B's
+  // B1 pins "zero degradation warnings" for a good in-process load, but it cannot
+  // see the event surface — a report that fired unconditionally would append a
+  // `guard_degraded` row for every healthy session and turn the durable signal
+  // into noise. This is the arm that proves the report is gated on the STATE.
+  const healthy = runArm({ printMode: false, injectFailure: false });
+  expectTrue("C11: a HEALTHY load reports nothing (no banner, no notify, no event) — the report is gated on the state",
+    !!healthy.parsed &&
+      (healthy.parsed.warns ?? []).every((w) => !w.includes("MAIN-WORKTREE GUARD — DEGRADED")) &&
+      (healthy.parsed.notified ?? []).length === 0 &&
+      healthy.auditRows.filter((r) => r.event === "guard_degraded").length === 0,
+    `parsed=${JSON.stringify(healthy.parsed ?? null).slice(0, 300)} audit=${JSON.stringify(healthy.auditRows).slice(0, 200)} stderr=${healthy.stderr}`);
+  expectTrue("C11b: the healthy control actually LOADED the classifier (otherwise C11 is vacuous)",
+    !!healthy.parsed &&
+      (healthy.parsed.warns ?? []).every((w) => !/classify-git\.mjs failed to load/.test(w)),
+    `captured: ${JSON.stringify(healthy.parsed?.warns ?? []).slice(0, 300)}`);
+
+  // ── The PLACEMENT arm. The report is the FIRST statement of `session_start`
+  // specifically so it cannot sit behind an early return — and the early return
+  // that matters most is the ESCAPE HATCH: `if (_isAllowMainEdits()) return;`
+  // (`index.ts:5177`) is the natural place a later "don't nag a deliberate solo
+  // session" refactor would move it under. Without this arm the ordering is
+  // proven only by reading the source, and moving the call reddens nothing —
+  // which is the same silent-loss class #853 exists to close, one level down.
+  const hatched = runArm({ printMode: false, allowMainEdits: true });
+  expectTrue("C12: the degraded report is NOT behind the escape hatch — a hatched session still gets the banner + the event",
+    !!hatched.parsed &&
+      (hatched.parsed.warns ?? []).some((w) => w.includes("MAIN-WORKTREE GUARD — DEGRADED")) &&
+      hatched.auditRows.filter((r) => r.event === "guard_degraded").length === 1,
+    `parsed=${JSON.stringify(hatched.parsed ?? null).slice(0, 300)} audit=${JSON.stringify(hatched.auditRows).slice(0, 200)} stderr=${hatched.stderr}`);
+  // Its NAME states exactly what its body checks: the source ORDER. That the hatch arm really took
+  // the early return is proven BEHAVIOURALLY by C12 (move the call below it and C12 goes red —
+  // measured on a copy), not by reading the env back, which would only restate
+  // `_isAllowMainEdits()` (`index.ts:506` = `_getEnv("ALLOW_MAIN_EDITS") === "1"`).
+  expectTrue("C12b: the call sits ABOVE the escape-hatch return inside the session_start handler (source-order pin)",
+    // C12 alone is only conclusive if the hatch was genuinely ON — otherwise it is
+    // indistinguishable from the non-hatched arms. Reading the env back would just
+    // restate `_isAllowMainEdits()` (`index.ts:506` = `_getEnv("ALLOW_MAIN_EDITS") === "1"`),
+    // so the non-vacuous half is a SOURCE-ORDER pin: the report call must precede the
+    // `if (_isAllowMainEdits()) return;` inside the registered `session_start` handler.
+    (() => {
+      const src = readFileSync(INDEX_TS, "utf8");
+      const handlerAt = src.indexOf('pi.on("session_start"');
+      if (handlerAt < 0) return false;
+      const callAt = src.indexOf("_reportClassifierDegradation(ctx", handlerAt);
+      const hatchAt = src.indexOf("if (_isAllowMainEdits()) return;", handlerAt);
+      return callAt > handlerAt && hatchAt > handlerAt && callAt < hatchAt;
+    })(),
+    `handler=${INDEX_TS}: pi.on("session_start") / _reportClassifierDegradation / _isAllowMainEdits order — the report must come FIRST, before the escape-hatch return`);
+
+  // ── ORDER-INDEPENDENCE: a PRESENTATION surface that throws must not cost the durable row. ──
+  // Numbered C14/C14b: C13/C13b is the emit↔vocabulary pin, and two different assertions on one
+  // label is a report that cannot be cited.
+  // Before the fix the row was written AFTER `ui.notify` inside ONE try, so a throwing notify skipped
+  // it — and the per-pid dedupe made that loss PERMANENT for the process, leaving the machine-readable
+  // surface (the whole point of #853) silently absent while the banner implied otherwise.
+  const throwingNotify = runArm({ printMode: false, throwNotify: true });
+  expectTrue("C14: a THROWING ui.notify still leaves the durable `guard_degraded` row (written first, each surface its own try)",
+    !!throwingNotify.parsed &&
+      throwingNotify.auditRows.filter((r) => r.event === "guard_degraded").length === 1 &&
+      (throwingNotify.parsed.warns ?? []).some((w) => w.includes("MAIN-WORKTREE GUARD — DEGRADED")),
+    `parsed=${JSON.stringify(throwingNotify.parsed ?? null).slice(0, 200)} audit=${JSON.stringify(throwingNotify.auditRows).slice(0, 200)} stderr=${throwingNotify.stderr}`);
+  expectTrue("C14b: the throwing arm's session_start did NOT propagate the throw (a report never changes a verdict)",
+    !!throwingNotify.parsed && throwingNotify.parsed.registered === true && throwingNotify.status === 0,
+    `status=${throwingNotify.status} parsed=${JSON.stringify(throwingNotify.parsed ?? null).slice(0, 120)}`);
+}
+
+await partC();
 
 console.log(`\n${fail === 0 ? "✅" : "❌"} test-module-load: ${pass} passed, ${fail} failed, ${skip} skipped`);
 process.exit(fail === 0 ? 0 : 1);

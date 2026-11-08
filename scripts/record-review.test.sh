@@ -222,8 +222,10 @@ if [ "$1" = "api" ]; then
             # ⛔ MODEL --jq, DO NOT IGNORE IT. When a JSON ENVELOPE fixture is supplied,
             # apply the CALLER'S OWN expression to it with the real jq — the same shape
             # real `gh` has. Without this the recorder's frame expression (the
-            # `gsub("[…]"; "")` delimiter strip and the `\u001e` record terminator at
-            # scripts/record-review.sh:1901-1902) is executed by NO vector at all: every
+            # `gsub("[…]"; "")` delimiter strip and the `\u001e` record terminator —
+            # `git show bd1b205d:scripts/record-review.sh | grep -nF 'gsub("[\u001e\u001f]"; "")'` → :2386; head
+            # `grep -nF 'gsub("[\u001e\u001f]"; "")' scripts/record-review.sh` → :2445) is executed by NO vector at
+            # all: every
             # other fixture supplies the frame PRE-BUILT through $STUB_COMMENTS, so
             # deleting either half of the expression left the suite GREEN. §14.1d(b4)
             # is the vector that now reddens when the strip is removed.
@@ -2970,9 +2972,9 @@ fi
 #      evidence, so the refusal must come from the missing PROOF, not from the mint word:
 #      a real delta record DOES write top-level `carry_arm` and `evidence`, so naming the mint
 #      alone buys nothing. The write is the `CARRY_FIELDS="\"carry_arm\":\"$CARRY_ARM\","` line
-#      (scripts/record-review.sh:4703 at this head — RE-DERIVE it, do not trust the number: a bare
-#      line citation here rotted once already, :4174 -> :4210, and this comment is not what makes
-#      the assertion true). One command answers it:
+#      (scripts/record-review.sh:6324 at this head — RE-DERIVE it, do not trust the number: a bare
+#      line citation here has rotted before, and this comment is not what makes
+#      the assertion true). One command answers it (origin/main bd1b205d is :6225):
 #        grep -n 'CARRY_FIELDS=.*carry_arm' scripts/record-review.sh
 printf '{"pr":424920,"head_sha":"%s","diff_sha256":"%s","mint":"delta","carried_from":"%s","delta":{"from":"%s","to":"%s","proved":"lane","arm":"lane"},"verdict":"clean","repo":"%s","reviewed_at":"2026-11-03T01:05:33Z"}\n' \
     "$CC_SHA" "$CC_D64" "$CC_STALE" "$CC_STALE" "$CC_SHA" "$CC_REPO" > "$CC_FILE-424920.json"
@@ -5157,13 +5159,18 @@ fi
 #     PART OF THE PIN — and it was WRONG twice before this correction (#3168 re-review
 #     finding 2), so state it exactly: THIS DIFF ANCHORS **NO** SITE in the recorder.
 #     All four `grep -qxF` sites are ALREADY anchored on main
-#     (`git show origin/main:scripts/record-review.sh | grep -n 'grep -qxF'`
-#     → :1939 :3643 :5956 :6068) and the same four are at head
-#     (`grep -n 'grep -qxF' scripts/record-review.sh` → :2003 :3729 :6056 :6201):
-#     the only diff hunk at `post_marker()` (:1995-2005) ADDS A COMMENT — the
-#     predicate line beside it is CONTEXT, not a change.
+#     (`git show bd1b205d:scripts/record-review.sh | grep -n 'grep -qxF'` — the sha is NAMED because
+#     `origin/main` moves and a bare "main :NNNN" rots the moment it does
+#     → :2482 :4186 :6501 :6613, plus a comment mention at :2356) and the
+#     same four PREDICATE sites are at head
+#     (`grep -n 'grep -qxF' scripts/record-review.sh` prints all four PREDICATE lines at head —
+#     CITE-CHECK: :2546 :4272 :6642 :6816, plus a comment mention at :2415; `14.1c-CITE` below
+#     re-derives these numbers, so they cannot rot silently): in #3168's diff the only
+#     hunk at `post_marker()` (:2524) ADDS A COMMENT — this PR does not touch
+#     `post_marker()` at all — and the
+#     predicate line beside it (:2546) is CONTEXT, not a change.
 #     WHAT THE VECTOR BELOW ACTUALLY PINS: the BODY-APPEND site
-#     (`if ! grep -qxF -- "$MARKER" <<<"$BODY"`, main :4643 / head :6056). It is a
+#     (`if ! grep -qxF -- "$MARKER" <<<"$BODY"`; on main at bd1b205d :6501 — at head CITE-CHECK: :6642). It is a
 #     MAIN-REGRESSION pin — reverting this PR leaves 14.1c GREEN, and 14.10f is a
 #     main-regression pin for the same reason. Keeping them is right (main's
 #     anchoring should not silently regress); calling them evidence about this diff
@@ -5179,6 +5186,55 @@ fi
 #     stays green — which is what makes the pair pin the predicate rather than
 #     the fixture. The marker text is SEEDED from the recorder's own post (never
 #     hand-written) so its diff=/sig= contract cannot drift from the script's.
+#
+# 14.1c-CITE ⛔ A CITATION MUST RE-DERIVE — SO THE SENTENCE ABOVE IS A TEST, NOT A NOTE
+#     (agent-infra#3712 re-review). The comments above print head line numbers as the
+#     evidence that a reader can check the claim. Prose rots silently: the comment block
+#     added above the persist site moved BOTH body-presence predicates by +9 and the numbers
+#     beside them stayed put — so the sentence went on *reading* correct while pointing at
+#     prose (MEASURED, one commit per pair: the two body-presence PREDICATES sat at
+#     `:6625` / `:6770` at `dc7e3ae99`, `:6634` / `:6779` at `921109de2` and `:6639` / `:6796` at
+#     `17551325e` as comment blocks were added above them, while the CITES beside them still read
+#     `:6625` / `:6770` at all three — that divergence IS the rot this paragraph describes — and at
+#     this head the predicates are `:6642` / `:6816`). One
+#     lane's response was to delete the numbers — which removes the rot but also removes the
+#     reader's target. Both intents are kept here: the number stays, and it is CHECKED.
+#     Every head number printed FOR A BODY-PRESENCE PREDICATE is TAGGED `CITE-CHECK:`; the tagged
+#     numbers are parsed back OUT, each must land on a `grep -qxF` line, and the deduped set must
+#     EQUAL the executing sites — so a predicate added without a citation reddens too, and a stale
+#     number REDDENS instead of waiting for a reviewer. ⛔ SCOPE: cites for anything else are NOT
+#     tagged and NOT checked — tagging one REDDENS, since membership is set EQUALITY, not a superset.
+#     ⛔ WHAT IS OUT OF ITS REACH, measured: an UNTAGGED head number elsewhere in this file is
+#     invisible (mutating one to a nonexistent line leaves all four assertions green), every head
+#     number in `tests/record-review/run.sh` is never read, and a RANGE (`:6537-6549`) cannot be
+#     tagged at all because the tag parser reads a run of `:NNNN` tokens and a dash ends it. Those
+#     are still re-derived BY HAND each round: this guard makes the tagged cites un-rottable, it
+#     does not make the rest safe.
+QR_SELF="$SCRIPT_DIR/record-review.test.sh"
+QR_CITE_SITES="$(command grep -n 'grep -qxF' "$RECORD" | command grep -vE '^[0-9]+: *#' \
+    | cut -d: -f1 | sort -un | tr '\n' ' ' | sed 's/^ *//; s/ *$//')"
+# ⛔ THE PATTERNS NAME NO BACKTICK — 20h48b scans double-quoted command substitutions for one, and
+# it CAUGHT the first draft of this guard. The tag is the anchor, so the phrasing around a number
+# can be reworded freely; only the tag and the numbers after it are contractual.
+QR_CITED="$(command grep -E '^[[:space:]]*#.*CITE-CHECK:' "$QR_SELF" \
+    | sed -n 's/.*CITE-CHECK: *\(:[0-9][0-9 :]*\).*/\1/p' \
+    | tr -d ':' | tr -s ' ' | tr '\n' ' ' | tr ' ' '\n' | sort -un | tr '\n' ' ' \
+    | sed 's/^ *//; s/ *$//')"
+# Every prerequisite below proves its capture is LIVE, so no assertion can pass on an empty parse.
+assert_eq "$([ -n "$QR_CITE_SITES" ] && echo live || echo dead)" "live" \
+    "14.1c-CITE prerequisite: the recorder has identifiable executing grep -qxF sites"
+assert_eq "$([ -n "$QR_CITED" ] && echo live || echo dead)" "live" \
+    "14.1c-CITE prerequisite: the CITE-CHECK tags parse (the citation is still tagged)"
+assert_eq "$QR_CITED" "$QR_CITE_SITES" \
+    "14.1c-CITE the head sites the comments print ARE the recorder's grep -qxF sites"
+QR_STALE=""
+for _qr_n in $QR_CITED; do
+    command grep -qF -- 'grep -qxF' <<<"$(command sed -n "${_qr_n}p" "$RECORD")" \
+        || QR_STALE="$QR_STALE :$_qr_n"
+done
+assert_eq "$QR_STALE" "" \
+    "14.1c-CITE every tagged line number IS a grep -qxF line (stale:$QR_STALE)"
+
 QB_PR=424339
 QB_SEED="$(seed_marker_body "$QB_PR")"
 QB_LINE=""
@@ -5256,7 +5312,7 @@ assert_eq "$(dc_posts "$DC_PR")" "0" "14.1d a comment already carrying the marke
 #      previously claimed "`-qxF`->`-qF` at the dedup read left the suite at
 #      PASS=921 FAIL=0". THERE IS NO GREP AT THE DEDUP READ — not anchored, not
 #      unanchored: the loop compares whole bodies with `[ "$_body" = "$marker" ]`
-#      (scripts/record-review.sh:1925), so that mutant does not exist and could not
+#      (scripts/record-review.sh:2468 — `grep -n '\[ "$_body" = "$marker" \]'`), so that mutant does not exist and could not
 #      have been measured. The mutant that actually makes (b2) meaningful is replacing
 #      that equality with a SUBSTRING test (`case "$_body" in *"$marker"*)`): it
 #      reddens (b2) — which expects 1 POST and would get 0.
@@ -5287,7 +5343,7 @@ fi
 #      The read hands the gate's own expression to `--jq`:
 #        .[] | "<assoc>\u001f<body | gsub("[\u001e\u001f]"; "")>" + "\u001e"
 #      BOTH halves are load-bearing: the strip because an UNSTRIPPED body can FORGE the
-#      frame (the recorder's own comment at :1894-1895 names the measured exploit), the
+#      frame (the recorder's own comment at :2437 — `grep -n 'could FORGE the frame'` — names the measured exploit), the
 #      `\u001e` because it is how records are split. NO OTHER VECTOR EXERCISES EITHER —
 #      every other fixture feeds the frame PRE-BUILT through $STUB_COMMENTS, so the
 #      recorder's expression is never evaluated and deleting the strip left the suite
@@ -5406,15 +5462,16 @@ STUB_BODY_FAIL=1 STUB_BODY_FAIL_TEXT='gh: Not Found (HTTP 404)' STUB_COMMENTS_FA
     STUB_COMMENT_CAPTURE="$T/ccap_e2" run_record_633 "$DC_PR" "$SHA" "$DC_CRUNS"
 assert_eq "$RECORD_RC" "5" "14.1d …but a comment that did NOT land is still a NAMED failure (rc 5) — neither channel carries the marker [err: $(printf '%s' "$RECORD_ERR" | tr '\n' ' ')]"
 assert_not_contains "$RECORD_ERR" "nothing carries the marker yet" "14.1d …and does not claim an ABSENCE it cannot know (a previous run's comment may carry it)"
-# ⛔ THE RETIRED PHRASINGS BELONG TO *THIS* ARM, NOT THE PATCH ARM (#3168 review
-#    cycle 4). "CI CANNOT SEE IT" shipped on main in the BODY-READ-failure message
-#    (`git show origin/main:scripts/record-review.sh | grep -n 'CI CANNOT SEE IT'`
-#    → :4630), so pinning its absence against the PATCH arm's stderr (14.10a3)
-#    guarded an arm the phrase was never in — restoring it HERE kept the suite GREEN
-#    (measured). The assertions above prove this variable is populated before these
-#    negatives run, so none of them can pass on an empty capture.
-assert_contains "$RECORD_ERR" "CI CANNOT SEE IT" \
-    "14.1d …and, when NOTHING landed, it DOES say CI cannot see the record — the claim is true on the only arm that emits it"
+# ⛔ CORRECTED (#3712 review round 5, P2): "CI CANNOT SEE IT" was an absence claim
+#    this arm cannot make. Its only justification — "true on the only arm that emits
+#    it" — was false: the body READ is exactly what failed here, so a PREVIOUS run's
+#    body or comment may already carry the marker, and the gate reads both channels
+#    independently. The pin had it PRESENT; it is now pinned ABSENT, with the
+#    observable statement that replaced it pinned PRESENT.
+assert_not_contains "$RECORD_ERR" "CI CANNOT SEE IT" \
+    "14.1d …and does NOT claim CI cannot see the record — a previous run's copy may already carry it"
+assert_contains "$RECORD_ERR" "is NOT observable from here" \
+    "14.1d …it states what THIS run delivered and names what it cannot observe"
 assert_not_contains "$RECORD_ERR" "currently INVISIBLE" \
     "14.1d …nor that the evidence is invisible"
 assert_not_contains "$RECORD_ERR" "attempted on the line above" \
@@ -5423,7 +5480,7 @@ assert_not_contains "$RECORD_ERR" "already admits the evidence" \
     "14.1d …nor derive ADMISSION from a POST 2xx (author_association decides admission, see residual 1)"
 # 14.1d(h) ⛔ THE EXIT-5 NOUN (#3168 re-review, latest comment, P2). Both exit-5
 #      messages said "the signed marker" — but BOTH arms are reachable with
-#      `MARKER_SIGNED=0` (:4831-4834: no gate key warns and CONTINUES), so the
+#      `MARKER_SIGNED=0` (:6537-6549: no gate key warns and CONTINUES), so the
 #      adjective named a property those bytes need not have. These
 #      two vectors drive that exact conjunction (key unset + a refused body GET / a
 #      refused body PATCH) and are placed HERE, inside §14, because a fresh CLEAN
@@ -5454,6 +5511,223 @@ assert_contains "$RECORD_ERR" "the marker for daniel-ospina/agent-infra#$UNC_PR2
     "14.1d(h) …its exit-5 message still names the marker (capture is live)"
 assert_not_contains "$RECORD_ERR" "the signed marker for daniel-ospina/agent-infra#$UNC_PR2 could NOT be PATCHed" \
     "14.1d(h) …and does NOT call it 'the signed marker' on the PATCH-failure arm either"
+
+# 14.1d(i) ⛔ THE PERSIST RESULT DECIDES THE REMEDY (#3168 review P2). The exit-0
+#      message used to assert the marker "is also kept in <pending file>" — and to
+#      offer `--flush-pending` as the remedy — even when the persist ABOVE it had just
+#      failed and warned that that remedy "WILL FIND NOTHING". Two sentences in one
+#      arm cannot both be true, and the one an operator ACTS on is the remedy.
+#      Reaching the persist-failure sub-path needs the pending DIRECTORY to be
+#      un-makeable: a regular FILE is put where the directory belongs, so the
+#      `mkdir -p` inside `marker_pending_write` fails. BOTH body-read arms are
+#      driven here (comment landed ⇒ exit 0; comment failed too ⇒ exit 5), because
+#      both used to print the same unconditional claim.
+#      RED pre-fix: every `assert_not_contains` below, on a capture the
+#      `assert_contains` beside it proves is live.
+PEND_CONF_DIR="$F_HOME/.pi/agent/reviews"
+mkdir -p "$PEND_CONF_DIR"
+rm -rf "$PEND_CONF_DIR/pending"     # earlier vectors left a real DIRECTORY here
+: > "$PEND_CONF_DIR/pending"        # a FILE where the pending DIR must be
+PERSIST_PR=424362
+STUB_BODY_FAIL=1 STUB_BODY_FAIL_TEXT='gh: Not Found (HTTP 404)' \
+    run_record_633 "$PERSIST_PR" "$SHA" "$DC_CRUNS"
+assert_eq "$RECORD_RC" "0" \
+    "14.1d(i) a persist-FAILED body-read run whose comment landed is still a success (rc 0) [err: $(printf '%s' "$RECORD_ERR" | tr '\n' ' ')]"
+assert_contains "$RECORD_ERR" "could NOT persist the pending marker" \
+    "14.1d(i) …the failed persist is reported (positive-first: the capture is live)"
+assert_not_contains "$RECORD_ERR" "The marker is also kept in" \
+    "14.1d(i) …and the exit-0 message does NOT claim the marker is on disk — the 'NOT ON DISK' branch fires instead"
+assert_contains "$RECORD_ERR" "THIS RUN PLACED NO BODY COPY ON ANY CHANNEL" \
+    "14.1d(i) …naming the real, ATTEMPT-scoped state (this run's write did not land) instead of claiming the file is empty or that a flush would find nothing — both of which the deterministic marker falsifies"
+assert_not_contains "$RECORD_ERR" "THIS RUN'S BODY COPY IS ON NO CHANNEL" \
+    "14.1d(i) …and the round-3 SPELLING is gone: 'BODY COPY IS ON NO CHANNEL' read as a claim about the body's CONTENTS, which this arm cannot observe, where 'PLACED NO BODY COPY' states only what THIS RUN did"
+# ⛔ THE ROUND-9 INVARIANT ON THE EXIT-0 CAPTURE TOO (#3712 review round 10, P2).
+# The two negatives below already existed, but both read the rc-5 capture ($PERSIST_PR2);
+# the rc-0 arm's own line carried round 3's falsified denial until round 10 ("would find NOTHING for the
+# marker this run owed … neither delivers these bytes") and stayed GREEN under a live
+# instance of the forbidden literal — the guard was never pointed at this stream. The
+# capture is the same one proved live by the two `assert_contains` above, so these cost
+# nothing and close the gap. RED pre-fix: both literals are in the exit-0 message.
+assert_not_contains "$RECORD_ERR" "would find NOTHING" \
+    "14.1d(i) …and the exit-0 remedy never PREDICTS the flush's output either — the marker is deterministic, so an earlier run at this head may hold exactly these bytes"
+assert_not_contains "$RECORD_ERR" "neither delivers these bytes" \
+    "14.1d(i) …nor denies the flush can deliver them, which would withdraw the working one-command remedy (round 10: it must be OFFERED in both arms)"
+# ⛔ THE EXIT-0 REMEDY ITSELF MUST BE PINNED, NOT ONLY ITS DENIALS (#3712 review at
+# `1dece6108`, FINDING 1 — the absent-mutation-leg class of agent-infra#3442).
+# Every row above on this capture is either a POSITIVE about a state that is still
+# true without the remedy (`:5526` — `rg -n '^assert_contains .*THIS RUN PLACED NO BODY COPY'`) or a
+# NEGATIVE about a denial; deleting the remedy clause makes each negative MORE satisfied, so the
+# whole block stayed GREEN with the round-10 regression direction live. The label at `:5540`
+# (`rg -n '^    "14\.1d\(i\) …nor denies'`) states the invariant and the comment above it
+# repeats it, but nothing enforced it on THIS arm — the only two positives on the offer read the
+# rc-5 capture (`:5589`/`:5591` — `rg -n 'assert_contains "\$RECORD_ERR" "(TRY --flush-pending|findings/note, the diff)'`
+# gives FOUR rows, the LAST TWO of which are this rc-5 capture's). These two are DIFFERENT
+# predicates from those two rows on a DIFFERENT capture, so neither can redden in lockstep with
+# them: `:5589`/`:5591` prove the exit-5 arm offers the flush, these prove the exit-0 arm still does.
+# RED pre-fix: delete the `So TRY --flush-pending $PR ${REPO:-} …` clause from the
+# exit-0 else-branch of `scripts/record-review.sh` and BOTH rows below red. MEASURED in
+# this lane, both directions, full suite each time:
+#   · mutant alone                  → PASS=1453 FAIL=0   (the finding: the clause is unpinned)
+#   · mutant + these two rows       → PASS=1453 FAIL=2   (both new rows, each naming its literal)
+#   · head (no mutant) + these rows → PASS=1455 FAIL=0
+# i.e. the rows are the only thing standing between that deletion and a green suite, and
+# the untouched head stays green — a pin, not a regression.
+assert_contains "$RECORD_ERR" "TRY --flush-pending" \
+    "14.1d(i) …and the exit-0 arm still OFFERS the flush — the sibling rows here only FORBID the denial and the output prediction, so without this row the working one-command remedy can be deleted from this arm and every row stays GREEN (#3712 review at 1dece6108, FINDING 1)"
+assert_contains "$RECORD_ERR" "findings/note, the diff and a signature" \
+    "14.1d(i) …and the identity test it hands the operator on THIS arm enumerates the same inputs as its exit-5 sibling, findings=/note= included — round 10 added the clause to BOTH sites and only the exit-5 one was pinned (#3712 review at 1dece6108, FINDING 1)"
+PERSIST_PR2=424363
+STUB_BODY_FAIL=1 STUB_BODY_FAIL_TEXT='gh: Not Found (HTTP 404)' STUB_COMMENTS_FAIL=1 \
+    run_record_633 "$PERSIST_PR2" "$SHA" "$DC_CRUNS"
+assert_eq "$RECORD_RC" "5" \
+    "14.1d(i) …and with the comment failing too the arm is still a NAMED failure (rc 5) [err: $(printf '%s' "$RECORD_ERR" | tr '\n' ' ')]"
+assert_not_contains "$RECORD_ERR" "The marker is kept in" \
+    "14.1d(i) …whose exit-5 message never ASSERTS the marker IS kept in the pending file (it cannot know: it never read it)"
+assert_contains "$RECORD_ERR" "THIS RUN WROTE NO PENDING COPY" \
+    "14.1d(i) …but states the observed fact instead — THIS run's write failed — which is not 'the record is missing' (the line above says the record IS saved) and not 'the file is empty'"
+# ⛔ THE FLUSH CLAIM IS SCOPED TO THIS RUN'S MARKER, AND ITS OUTCOME IS NEVER PREDICTED
+# (#3712 round 3; REWRITTEN in round 9 after a fresh review falsified the round-3 form).
+# Round 3 reasoned: the pending file is keyed by (repo, PR) and OVERWRITTEN, so an earlier
+# run's marker is still there, therefore "would find NOTHING" is wrong — and replaced it with
+# "it can only deliver an OLDER marker … and neither delivers these bytes". That is ALSO
+# false, and the reason is the determinism of the marker itself: it is built from
+# (PR, verdict, head, diff, repo, key) with no timestamp and no run id, so an EARLIER RUN AT
+# THE SAME HEAD leaves BYTE-IDENTICAL bytes — `--flush-pending` would deliver exactly what
+# this run owed. The process also never READS the file, so it cannot report its contents in
+# either direction. Hence the rule now enforced below: state only what was observed (THIS
+# run's write failed), never predict the flush's OUTPUT, and OFFER the flush in both arms
+# rather than denying it — an incorrect denial costs an operator the working one-command
+# remedy that this whole arm exists to point at.
+assert_contains "$RECORD_ERR" "is NOT thereby this run's evidence" \
+    "14.1d(i) …and the exit-5 remedy scopes a flushed line to the marker's ANATOMY, not to this run — a delivered line naming the sha alone is not evidence, so the operator must read the WHOLE line. A DIFFERENT predicate from the row above on purpose: two assert_contains rows sharing one literal AND one capture can only ever redden in lockstep, so the second would add no discriminating power (#3712 review, finding 2)"
+assert_contains "$RECORD_ERR" "TRY --flush-pending" \
+    "14.1d(i) …and still OFFERS the flush: an earlier run at the same head leaves byte-identical bytes, so denying it withdraws a remedy that works (round 9)"
+assert_contains "$RECORD_ERR" "findings/note, the diff and a signature" \
+    "14.1d(i) …and the identity test it hands the operator enumerates the SAME inputs as its exit-0 sibling, findings=/note= included — a not-clean marker splices both in, so a test naming only verdict+diff+sig admits a DIFFERENT run's open-findings record (#3712 review round 4)"
+assert_not_contains "$RECORD_ERR" "would find NOTHING" \
+    "14.1d(i) …while never PREDICTING the flush's output, which depends on a file this run never read"
+assert_not_contains "$RECORD_ERR" "neither delivers these bytes" \
+    "14.1d(i) …and never asserting the flush cannot deliver these bytes — the marker is deterministic, so an earlier run at this head holds exactly them (round 9 falsified this)"
+# ⛔ THE EXIT-5 WHY-CLAUSE MAY NAME NO CAUSE THIS ARM CANNOT OBSERVE (#3712 review at
+# `0aca7410b`, finding F2 — the MISSING MUTATION LEG). `post_review_evidence_comment`
+# returns 1 for TWO different events: the comment READ failed (the post is then SKIPPED
+# by design — never attempted) and the POST itself was refused. This arm discards the
+# error text, so it cannot tell them apart and may name NEITHER. Main's wording did name
+# the POST — "the #1224 evidence COMMENT could not be posted either" — and that is the
+# misdirection the round-5 fix removes: a lane reading it goes hunting API permissions
+# instead of configuring the gate key. Until now NOTHING pinned it: restoring main's
+# sentence at the why-clause left EVERY row of this capture GREEN (measured in the PR
+# body), which is the absent-mutation-leg class of agent-infra#3442 — the fix was
+# invisible to the suite. These rows read the SAME already-live rc-5 capture as the rows
+# above (signed key ⇒ this arm is reached; persist failed ⇒ this branch is the one it
+# prints), so the coverage costs three rows and no new vector.
+# The two POSITIVE rows come first ON PURPOSE: the negative below cannot pass on a
+# capture that never reached the arm — it would also pass on an EMPTY string.
+assert_contains "$RECORD_ERR" "NO durable comment copy of its own" \
+    "14.1d(i) …and the exit-5 why-clause reports what THIS RUN published, not what the API did (#3712 F2)"
+assert_contains "$RECORD_ERR" "SKIPPED by design" \
+    "14.1d(i) …naming the never-ATTEMPTED branch as well as the refused one, because this arm cannot distinguish them and so may not pick one (#3712 F2)"
+assert_not_contains "$RECORD_ERR" "COMMENT could not be posted" \
+    "14.1d(i) …and never claims the comment POST was refused — that is unobservable here (RED when main's sentence is restored; #3712 F2)"
+# ⛔ THE SAME CLASS, ONE CALL FURTHER IN (#3712 review round 2, P3):
+# `post_review_evidence_comment` runs INSIDE this arm and, when its comment READ
+# fails too, used to print "The signed record AND THE BODY MARKER are unaffected" —
+# on the very stream whose other two lines say the marker is on no channel and not on
+# disk. A caller cannot know the marker survived; that sentence asserted it anyway.
+assert_not_contains "$RECORD_ERR" "and the body marker are unaffected" \
+    "14.1d(i) …and NO line in the capture claims the body marker survived a failed persist"
+assert_contains "$RECORD_ERR" "This line makes NO CLAIM about the body marker" \
+    "14.1d(i) …the comment-read failure instead defers to the persist line that decides it"
+# ⛔ THE SAME CLASS AT THE COMMENT-**POST** SITE (#3712 review round 4, P2):
+# the read arm's sibling note ("could not post the #1224 review-evidence comment")
+# asserted "the signed record AND THE BODY MARKER are still saved". With the persist
+# already failed that is false — the marker is on no channel — so it now defers too.
+# It is a SEPARATE site from the READ failure above, and no vector drove it with a
+# failed persist, so the invariant the two assertions above describe was stated more
+# broadly than it was enforced. This vector closes that gap.
+PERSIST_PR3=424364
+STUB_BODY_FAIL=1 STUB_BODY_FAIL_TEXT='gh: Not Found (HTTP 404)' STUB_COMMENT_POST_FAIL=1 \
+    run_record_633 "$PERSIST_PR3" "$SHA" "$DC_CRUNS"
+assert_not_contains "$RECORD_ERR" "the body marker are still saved" \
+    "14.1d(i) …nor does the comment-POST note claim the body marker survived a failed persist"
+assert_contains "$RECORD_ERR" "this note makes NO CLAIM about the body marker" \
+    "14.1d(i) …it defers to the persist line instead, so no line in this capture asserts the marker is saved"
+# ⛔ THE PATCH ARM'S OWN REMEDY MUST BRANCH ON *ITS* PERSIST RESULT (#3712 review
+# round 5, P3). `--flush-pending` can only fire the `edited` event if a PENDING FILE
+# exists; when the post-PATCH persist failed it answers "nothing pending … Nothing was
+# written" and exits 0 without touching the body. The read arm branches its remedy on
+# the persist result — this arm offered the inert flush anyway. No vector combined a
+# failed PATCH with an unwritable pending dir, so it went unpinned; this one does.
+PATCH_FAIL_PR=424365
+STUB_PATCH_FAIL=1 STUB_BODY="PR body — no review evidence yet" \
+    run_record_633 "$PATCH_FAIL_PR" "$SHA" "$DC_CRUNS"
+assert_contains "$RECORD_ERR" "THIS RUN WROTE NO PENDING COPY" \
+    "14.1d(j) the PATCH arm's comment-visible message says what was observed — neither of its persist attempts wrote — and not what the file holds"
+assert_not_contains "$RECORD_ERR" "or post the body copy with --flush-pending, to fire" \
+    "14.1d(j) …and does NOT offer the inert flush as the route to the edited event"
+# ⛔ A ⚠️ LINE'S *ABSENCE* IS DISPOSITIVE, ITS APPEARANCE IS NOT (#3712 review round 10,
+# P3). The PATCH arm's pending-file paragraph said neither the appearance nor the absence
+# of a `⚠️ body-marker:` line tells you the file's contents. The ABSENCE does: the
+# both-attempts-failed warning prints only when PATCH_PERSISTED=0, so NO line at all means
+# the pre-PATCH write landed and the file holds exactly the bytes this run minted. Only the
+# APPEARANCE is non-dispositive (the retry can succeed after a failed early write) — which
+# is the half the paragraph already had right. The paragraph is reachable ONLY when the
+# PATCH and the durable comment BOTH fail, which is the vector below, with the pending
+# path still un-makeable (a FILE where the directory belongs). RED pre-fix: the negative
+# (the false universal) AND the positive (that silence is dispositive).
+PATCH_CMT_FAIL_PR=424367
+STUB_PATCH_FAIL=1 STUB_BODY="PR body — no review evidence yet" STUB_COMMENTS_FAIL=1 \
+    run_record_633 "$PATCH_CMT_FAIL_PR" "$SHA" "$DC_CRUNS"
+assert_eq "$RECORD_RC" "5" \
+    "14.1d(j3) a refused PATCH with a refused durable comment is still a NAMED failure (rc 5) [err: $(printf '%s' "$RECORD_ERR" | tr '\n' ' ')]"
+assert_contains "$RECORD_ERR" "Only NEITHER line appearing is dispositive" \
+    "14.1d(j3) …and its pending-file paragraph says the ABSENCE of a persist warning IS dispositive — the PRE-PATCH write landed and the bytes are on disk (capture live)"
+assert_not_contains "$RECORD_ERR" "tells you the file's contents" \
+    "14.1d(j3) …instead of telling an operator whose PRE-PATCH write landed that the file's contents cannot be known"
+rm -f "$PEND_CONF_DIR/pending"
+mkdir -p "$PEND_CONF_DIR/pending"   # restore the real directory for later vectors
+
+# ⛔ 14.1d(j2) A FAILED *RETRY* DOES NOT MAKE THE BYTES ABSENT (#3712 review round 6, P2).
+# The arm writes the pending file TWICE: once BEFORE the PATCH (so a shell killed mid-PATCH
+# leaves a recoverable copy) and again as a RETRY when the PATCH is refused. Both write the
+# same $MISSING to the same (repo,PR)-keyed path, and `marker_pending_write` returns 1 WITHOUT
+# unlinking the target — so when the retry fails after the first write succeeded, this run's
+# bytes ARE on disk and `--flush-pending` WOULD deliver them. Reading the state off the retry
+# alone told an operator the opposite …and withdrew a remedy that worked. This vector drives
+# exactly that window with a counting `mv` stub: the FIRST pending-marker move succeeds, the
+# SECOND fails. ⛔ The stub keys on the DESTINATION — the 3rd argument of `mv -f`, which is the
+# shape `marker_pending_write` uses — because keying on the 2nd would test the `.tmp` SOURCE,
+# which never ends in `.marker` and so never fires (measured: an earlier draft of this stub
+# matched nothing and the vector passed VACUOUSLY with counter 0). It is scoped to
+# `*/pending/*.marker`, so the recorder's other `mv` (:3501, `command mv "$tmp" "$out"` — OUT of the mktemp) is unaffected.
+rm -f "$T/bin/mv"
+_MV_REAL="$(command -v mv)"
+_MV_COUNT="$T/mvcount-pending"
+printf '0' > "$_MV_COUNT"
+cat > "$T/bin/mv" <<MVSTUB
+#!/usr/bin/env bash
+# marker_pending_write runs "command mv -f <src> <dst>", so the DESTINATION is the 3rd
+# argument. Matching the 2nd would test the .tmp SOURCE, which never ends in .marker.
+case "\${3:-}" in
+  */pending/*.marker)
+    n=\$(cat "$_MV_COUNT" 2>/dev/null || echo 0); n=\$((n+1)); printf '%s' "\$n" > "$_MV_COUNT"
+    if [ "\$n" -ge 2 ]; then exit 1; fi ;;
+esac
+exec "$_MV_REAL" "\$@"
+MVSTUB
+chmod +x "$T/bin/mv"
+PEND_RETRY_PR=424366
+STUB_PATCH_FAIL=1 STUB_BODY="PR body — no review evidence yet" \
+    run_record_633 "$PEND_RETRY_PR" "$SHA" "$DC_CRUNS"
+rm -f "$T/bin/mv"
+assert_eq "$(cat "$_MV_COUNT" 2>/dev/null || echo 0)" "2" \
+    "14.1d(j2) NON-VACUITY: the pending-marker move ran twice and the SECOND one failed (the window below is REACHED, not assumed)"
+assert_not_contains "$RECORD_ERR" "THIS RUN WROTE NO PENDING COPY" \
+    "14.1d(j2) …a failed RETRY makes NO 'this run wrote nothing' claim — the pre-PATCH copy is still on disk"
+assert_contains "$RECORD_ERR" "or post the body copy with --flush-pending, to fire" \
+    "14.1d(j2) …so the WORKING flush remedy is still offered, instead of the hand-PATCH a false absence claim demands"
+assert_not_contains "$RECORD_ERR" "⚠️ body-marker: could" \
+    "14.1d(j2) …and NO persist warning is printed in EITHER spelling ('could not' is the pre-PATCH line, 'could NOT' the both-failed one; the literal is deliberately case-truncated so a regression printing the pre-PATCH warning reddens too): the bytes ARE on disk, so there is nothing to warn about"
 
 # 14.1e THE DURABLE CHANNEL IN `--recover-body` (#3168 fresh-review finding 1).
 #      The recovery verb exists BECAUSE the body was the only copy of the verdict that
@@ -5821,13 +6095,16 @@ assert_eq "$REC_BEFORE_14B" "$(cat "$F_HOME/.pi/agent/reviews/daniel-ospina-agen
 #       by EVERY later minting run.
 #       ⛔ WHAT THIS ROW DOES **NOT** PROVE: that this PR anchored `post_marker()`. It did
 #       not. `if command grep -qxF -- "$marker" <<<"$body"` is ALREADY `-qxF` on main
-#       (`git show origin/main:scripts/record-review.sh | sed -n 1939p`), and the diff
-#       hunk at scripts/record-review.sh:1995-2005 only ADDS A COMMENT above it — the
-#       predicate line is CONTEXT. Reverting this PR leaves this vector GREEN; it is kept
+#       (`git show bd1b205d:scripts/record-review.sh | grep -n 'grep -qxF'` — the sha is NAMED
+#       because `origin/main` moves and a bare "main :NNNN" rots the moment it does → :2482),
+#       and in #3168's diff the only hunk at `post_marker()` (head :2524) ADDS A COMMENT above
+#       it (this PR does not touch `post_marker()` at all) — the
+#       predicate line (head :2546) is CONTEXT. Reverting #3168 leaves this vector GREEN; it is kept
 #       because main's anchoring should not silently regress, and it is labelled so the
 #       next reader does not mistake it for evidence about this diff. The predicate must
 #       match the gate's line-anchored `^…$` admission, exactly like the three other
-#       sites already anchored on main (`:1939`, `:3643`, `:5956`, `:6068`).
+#       sites already anchored on main (bd1b205d :4186 :6501 :6613) — the same four that the grep
+#       above prints at head, CITE-CHECK: :4272 :6642 :6816 (`14.1c-CITE` re-derives the triple).
 #       ⛔ ASSERTS THE TRANSPORT (a PATCH was issued), not the exit code: the destructive
 #       mutant also exited 0.
 if [ -n "${QB_LINE:-}" ]; then
@@ -6644,7 +6921,7 @@ S21_ROWS="$T/s21-rows"; mkdir -p "$S21_ROWS"
 # for a reason unrelated to its mutation (measured: 21.12's first pin). Prepared once here.
 S21_MUTDIR="$T/s21-mut"; mkdir -p "$S21_MUTDIR"
 cp -r "$SCRIPT_DIR/lib" "$S21_MUTDIR/lib"
-# SELF-CONTAINED digest fixtures (§11.13 unsets CC_SHA at :2623, and the §11.12 note is
+# SELF-CONTAINED digest fixtures (§11.13 unsets CC_SHA at :2974 — `grep -n '^unset CC_OUT CC_RC'` —, and the §11.12 note is
 # explicit that a section leaning on another's fixture is either an abort under `set -u`
 # or — worse — a silent comparison against bytes some other section computed). The
 # digest comes from the ONE shared normalizer, exactly as the producer and the GitHub
@@ -8587,10 +8864,10 @@ targets = sys.argv[2:]
 # ⛔ A WHOLE-FILE LEXER WAS BUILT AND REJECTED — with the measurement, not as a preference.
 # Carrying quote state across lines is the only way to close the multi-line hole, and on the
 # REAL recorder it desyncs at `$(` inside a double-quoted string, because `$(` resets quoting:
-# the awk program at record-review.sh:1680 ends a line inside a single-quoted string, and a
-# state machine that does not model `$(` re-opens a quote mid-program and flags the awk
-# comments at 1685-1734 as live backticks — 26 false REDs across 12 lines (that region plus a
-# second desync at 4331-4354) on the recorder. Modelling `$(`,
+# the awk program at record-review.sh:1846 (`grep -n 'EVIDENCE_BODY" | command awk'`) carries
+# its own comment block across lines (`sed -n '1851,1860p'`), so a lexer that does not model `$(`
+# re-opens a quote mid-program and reports those lines as live backticks — 26 false REDs over 12
+# lines in the prototype run (a COUNT, not a line map). Modelling `$(`,
 # `${`, `$'` and heredocs well enough to stay in sync is a bash lexer, which is a different
 # project from this vector. So the scope is DECLARED here instead of over-claimed: this
 # sweep bounds the shipped defect (a `"..."` message that runs its own backticks) on every
@@ -8867,6 +9144,18 @@ rm -f .gitattributes
 #      review, P1: `~/.config/git/attributes` steering `merge=union` produced rc 0 + tree-equal while
 #      every ambient scan came back empty). The recorder's HOME here is the suite's FAKE home, which
 #      is exactly where a user-level attribute file lives.
+#    ⛔ `XDG_CONFIG_HOME=` ON THE VECTOR BELOW IS PART OF ITS PREMISE, NOT TIDINESS — the same
+#    measured class as M38. git resolves the DEFAULT user-level attributes file as
+#    `$XDG_CONFIG_HOME/git/attributes` when that variable holds a NON-EMPTY value, and falls back to
+#    `$HOME/.config/git/attributes` when it is unset OR EMPTY — which is why the pin is spelled
+#    `XDG_CONFIG_HOME=` (empty) and NOT `env -u XDG_CONFIG_HOME`: an empty value still falls back. A
+#    runner exports it (`worker-terminal.test.sh:36`), so with an inherited NON-EMPTY value the
+#    fixture is written where no git process looks and this vector silently degenerates into a
+#    duplicate of 20i3's plain-conflict case. ⛔ `origin/main` ALSO pins it SUITE-WIDE —
+#    `export XDG_CONFIG_HOME="$F_HOME/.config"` (#3755), which this branch's older base predates —
+#    so this per-vector pin is belt-and-braces: it keeps the vector independent of that suite-level
+#    line rather than being the only thing carrying the fix. The control on the next line has always
+#    pinned it; the vector did not.
 mkdir -p "$F_HOME/.config/git"
 printf 'u.txt merge=union\n' > "$F_HOME/.config/git/attributes"
 _un_g=0
@@ -8879,7 +9168,7 @@ else
 fi
 EHIA=425160; rm -f "$(Q2 $EHIA)"
 run_record_delta $EHIA "$DG_UN_H" "delta:$DG_UN_L..$DG_UN_H+comment:42516001" \
-    STUB_BASE_SHA="$DG_UN_B" STUB_EVIDENCE_AT="2025-08-15T00:00:00Z"
+    XDG_CONFIG_HOME= STUB_BASE_SHA="$DG_UN_B" STUB_EVIDENCE_AT="2025-08-15T00:00:00Z"
 assert_eq "$RECORD_RC" "3" "20i6 a GLOBAL attributes file does NOT steer the recorder's oracle (rc 3)"
 # ⛔ THE ANCHOR IS THE ATTRIBUTION when a cover is named (the no-cover sentence belongs to the other
 #    branch): a recorder whose oracle HAD been steered would classify merge-only, anchor on A and
@@ -9479,10 +9768,29 @@ git config --unset merge.hidrv.driver 2>/dev/null || true
 # M38 — THE ORACLE NEUTRALISATION (20i6). With the box-global attributes file in place, dropping the
 #       neutralised read lets the MACHINE's `merge=union` decide the answer: the hand resolution
 #       compares equal, the range becomes merge-only, and the cover naming A is enough.
+#
+# ⛔ `XDG_CONFIG_HOME=` IS PART OF THIS CELL'S PREMISE, NOT TIDINESS (measured on a runner, #3712).
+#       git resolves the DEFAULT user-level attributes file as `$XDG_CONFIG_HOME/git/attributes`
+#       when that variable holds a NON-EMPTY value, and falls back to `$HOME/.config/git/attributes`
+#       when it is unset OR EMPTY — which is why the pin is `XDG_CONFIG_HOME=` (empty) and NOT
+#       `env -u XDG_CONFIG_HOME`. With an inherited NON-EMPTY value the fixture below is written
+#       somewhere git never reads, the mutant's raw `merge-tree` CONFLICTS again, and the cell
+#       refuses at 3 for a reason that has nothing to do with the guard it mutates: VACUOUS,
+#       reported against itself. The 20i6 control above pins the same variable for exactly this
+#       reason; this cell must too. GitHub runners export
+#       `XDG_CONFIG_HOME=/home/runner/.config` (see
+#       `scripts/orchestrator-harness/worker-terminal.test.sh:36`), so an unpinned mutant is green
+#       on a dev box and red on CI — measured on THIS branch's pre-#3755 base: `PASS=1453 FAIL=2`,
+#       with `20g M38` and the `MUTATION-MATRIX` rollup the two red rows, total unchanged at 1455.
+#       ⛔ THAT MEASUREMENT NO LONGER RE-DERIVES ON THE MERGED TREE, so do not quote it as current:
+#       `origin/main` pins the variable SUITE-WIDE (`export XDG_CONFIG_HOME="$F_HOME/.config"`,
+#       #3755), so after the merge this cell stays green even with this per-vector pin removed. The
+#       pin is kept as belt-and-braces — it makes the cell independent of that suite-level line —
+#       not as the thing carrying the fix.
 mkdir -p "$F_HOME/.config/git"
 printf 'u.txt merge=union\n' > "$F_HOME/.config/git/attributes"
 MUT="$(mk_mutant nonneutral '    want="$(delta_git_neutral "$root" merge-tree --write-tree "$p1" "$p2" 2>/dev/null)"' '    want="$(delta_git "$root" merge-tree --write-tree "$p1" "$p2" 2>/dev/null)"')"
-mut_check "M38 the neutralised oracle" 425160 "$DG_UN_H" "delta:$DG_UN_L..$DG_UN_H+comment:42516001" accepted STUB_BASE_SHA="$DG_UN_B" STUB_EVIDENCE_AT="2025-08-15T00:00:00Z"
+mut_check "M38 the neutralised oracle" 425160 "$DG_UN_H" "delta:$DG_UN_L..$DG_UN_H+comment:42516001" accepted XDG_CONFIG_HOME= STUB_BASE_SHA="$DG_UN_B" STUB_EVIDENCE_AT="2025-08-15T00:00:00Z"
 rm -f "$F_HOME/.config/git/attributes"
 # M39 — THE ATTRIBUTES-DRIFT ARM (20i7). Dropping it re-accepts a TRACKED `.gitattributes` whose
 #       worktree copy steers the oracle — the P0 the previous commit introduced by removing `-m`.
