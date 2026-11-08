@@ -239,7 +239,7 @@ def test_confirmed_only_when_the_transcript_advances(R, tmp_path):
     sent = cmux.sent()
     assert len(sent) == 1
     line = sent[0][-1]
-    assert line.startswith("cd /tmp/lane && exec %s --session s-1" % sys.executable)
+    assert line.startswith("cd /tmp/lane && %s --session s-1" % sys.executable)
     assert line.endswith("\n"), "the trailing newline is part of the payload (#941: without it the text never submits)"
 
 
@@ -339,8 +339,21 @@ def test_dry_run_sends_nothing_and_prints_the_line(R, tmp_path):
     cmux = FakeCmux()
     obs = _run(R, FakeLS(transcript=path), cmux, dry_run=True)
     assert cmux.sent() == []
-    assert obs["line"].startswith("cd /tmp/lane && exec %s --session s-1" % sys.executable)
+    assert obs["line"].startswith("cd /tmp/lane && %s --session s-1" % sys.executable)
     assert obs["refused"] is False
+
+
+def test_the_payload_never_execs_the_panes_shell_away(R, tmp_path):
+    """⛔ `exec` REPLACES the pane's shell with pi, so a later pi exit takes the process — and with it
+    the surface, and (on the only-surface case) the workspace: #942's own chain, one process-identity
+    change away, hours later. pi as a CHILD keeps the bare-shell state this tool exists to act on.
+    This row is the mutation target for a future reintroduction."""
+    cmux = FakeCmux()
+    _run(R, FakeLS(transcript=_transcript(tmp_path)), cmux)
+    payload = cmux.sent()[0][-1]
+    assert " exec " not in payload, "an exec'd payload hands the pane's process to pi: %r" % payload
+    assert "&& exec" not in payload, payload
+    assert payload.startswith("cd /tmp/lane && /"), payload
 
 
 # ── R4: the tool must never be the destructive verb it exists to replace -----------------------

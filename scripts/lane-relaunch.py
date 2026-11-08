@@ -16,7 +16,9 @@ WHY THIS EXISTS (issue #942, measured 2026-09-26 twice in one session)
     into the pane's OWN login shell, where the user's PATH and exported environment are present (the
     respawn environment is `login -flp … /bin/bash --noprofile --norc`, i.e. no profile, no user
     PATH, no exported keys — the second aggravating factor in #942). If the launch line fails there,
-    you get a shell prompt back. Nothing is destroyed.
+    you get a shell prompt back — and because pi runs as a CHILD of that shell (never `exec`, see the
+    payload comment), the same holds when the lane's pi exits later: the shell survives, the pane
+    stays, and the lane returns to the bare-shell state a relaunch can act on again.
 
     That is also the convention of the multiplexer this one is modelled on: tmux makes pane
     destruction on child exit OPT-IN (`remain-on-exit` keeps a "dead pane"), and an application is
@@ -271,7 +273,15 @@ def relaunch(ws, label="", cwd=None, session=None, pi=None, new=False, wait=45.0
         return refuse("`pi` not found on this PATH (%r) — provide --pi <abs path>; a launch line "
                       "that cannot resolve is the failure this tool exists to avoid" % (pi,))
 
-    line = "cd %s && exec %s%s" % (shlex.quote(cwd), shlex.quote(pi),
+    # ⛔ NO `exec` (review round 3, P1 — and it is #942's own defect one process away). `exec` REPLACES
+    # the pane's shell with pi, so when pi later exits (turn ends, /quit, crash) there is no shell left:
+    # the pane's process terminates, the surface closes, and on the only-surface case cmux removes the
+    # workspace — the exact chain this tool exists to avoid, reached hours later and looking like a
+    # different bug. pi as a CHILD of the shell is what makes "nothing is destroyed" true for a pi
+    # exit too, not merely for a bad launch line, and it preserves the bare-shell state the guard-1
+    # read depends on (the DEAD-LANES class this tool is for). It is also literally the line #942
+    # records as having recovered 14 lanes.
+    line = "cd %s && %s%s" % (shlex.quote(cwd), shlex.quote(pi),
                                    (" --session %s" % shlex.quote(sid)) if sid else "")
     obs.update(action="relaunch-fresh" if fresh else "relaunch-session", line=line,
                cwd=cwd, sid=sid, session_file=path, pi=pi)

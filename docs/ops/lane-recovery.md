@@ -72,12 +72,19 @@ The launch line it sends is the form the fleet's own recovery used to bring back
 #942):
 
 ```
-cd <cwd> && exec <abs path to pi> --session <id>
+cd <cwd> && <abs path to pi> --session <id>
 ```
 
+⛔ **No `exec`.** `exec` would REPLACE the pane's shell with pi, so a later pi exit (a finished turn,
+`/quit`, a crash) leaves no shell: the pane's process terminates, the surface closes, and on the
+only-surface case cmux removes the workspace — #942's own chain, reached hours later and looking like a
+different bug. With pi as a **child** of the shell, a pi exit returns the pane to the bare-shell state
+that [the guards](#what-it-refuses-and-why-each-refusal-exists) read, so the lane is relaunchable again.
+That is also literally the line #942 records as having recovered 14 lanes.
+
 …sent as ONE `cmux send` payload **with a trailing newline** (`cmux send` without one types but never
-submits — #941, a silent dispatch no-op). If the line is wrong you get a shell prompt back. Nothing
-is destroyed.
+submits — #941, a silent dispatch no-op). If the line is wrong you get a shell prompt back, and when the
+lane's pi exits later the shell it ran under is still there. Nothing is destroyed.
 
 ### What it refuses, and why each refusal exists
 
