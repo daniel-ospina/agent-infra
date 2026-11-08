@@ -5854,9 +5854,20 @@ export function buildBackgroundDispatchResult(handle: BackgroundDispatchHandle):
       // #1208: this dispatch's child IS the pid the handle carries, and it has not
       // exited — the blocking path's `never-started` default would be a false claim
       // on the arm that exists precisely because the child is alive.
+      //
+      // ⛔ BUT ONLY WHEN THERE IS A PID (review round 5, P3). `handle.pid` comes from
+      // `observers.onSpawn({ pid: proc.pid ?? null })` and `proc.pid` is `undefined`
+      // SYNCHRONOUSLY when the exec itself fails (measured: `spawn('/definitely/not/here')`
+      // yields `pid: undefined` then an `ENOENT` `error` event), and the pre-spawn refusals
+      // above cannot cover it — they are checked before `spawn()` is reached. Stamping
+      // `childState: "running"` there produced `{ childPid: null, childState: "running",
+      // childExited: false }`: the exact self-contradiction the field set exists to prevent,
+      // and it claimed a live child on a box where none was ever created. `null`/`never-started`
+      // is the same claim `stampLivenessDefaults` makes, and the text above already tolerates it
+      // (`pid: ${handle.pid ?? "unknown"}`).
       childPid: handle.pid,
-      childState: "running",
-      childExited: false,
+      childState: handle.pid === null ? "never-started" : "running",
+      childExited: handle.pid === null ? null : false,
       childMessagesSent: null,
     }),
   };
@@ -6788,8 +6799,16 @@ export default function (pi: ExtensionAPI) {
           content: [{ type: "text", text: "❌ Sub-agent circuit breaker open — too many consecutive zero-output failures. Wait 60s before retrying." }],
           // #1208 (review round 3, P2): the half-open path that reaches this arm had a REAL child
           // run, so the measurement is available and must be used — gated on the file's EXISTING
-          // never-spawned discriminator (`retries === 0`), so the pre-spawn refusal payload keeps the
-          // exact key set its own scope guard pins.
+          // never-spawned discriminator (`retries === 0`).
+          //
+          // ⛔ WHAT THE GATE ACTUALLY BUYS (review round 5, P3 — this comment claimed the pre-spawn
+          // refusal "keeps the exact key set", which is FALSE): the tool-level stamp this payload
+          // passes through (`stampToolLiveness` → `stampLivenessDefaults`) adds all four liveness
+          // keys unconditionally, so a never-spawned breaker's payload DOES carry them. What the
+          // discriminator preserves is their VALUE: because the spread is empty at `retries === 0`,
+          // the stamp fills `childPid: null, childState: "never-started", childExited: null,
+          // childMessagesSent: null` — a refusal, not a measured snapshot. At `retries > 0` the
+          // spread wins and the half-open path keeps the measurement it actually took.
           details: {
             ...(breakerNeverSpawned ? {} : (lastLiveness ?? {})),
             model,

@@ -8530,6 +8530,20 @@ section("#1662 — tool surface");
       refusal: null,
     });
     ok(String(unpersisted.content[0].text).includes("NOT persisted"), "a failed persist is surfaced in the text");
+    // #1208 (review round 5, P3): a handle with NO pid must not claim a live child. `proc.pid` is
+    // `undefined` synchronously when the exec itself fails (measured: `spawn('/definitely/not/here')`
+    // → `pid: undefined`, then an `ENOENT` error event), and no pre-spawn refusal covers that arm —
+    // those are checked before `spawn()` is reached. Unconditionally stamping `running` there gave
+    // `{ childPid: null, childState: "running", childExited: false }`: the self-contradiction this
+    // field set exists to prevent, claiming a child that was never created.
+    equal((unpersisted.details as any).childPid, null, "no pid");
+    equal((unpersisted.details as any).childState, "never-started", "no pid ⇒ nothing ran; `running` would be a false liveness claim");
+    equal((unpersisted.details as any).childExited, null, "and `null` — not `false`, which would assert it was seen alive");
+    // The positive control: a real pid IS still rendered as a running child, so the fix cannot
+    // pass by degrading every handle to `never-started`.
+    equal((res.details as any).childState, "running", "a handle with a real pid still names the live child");
+    equal((res.details as any).childExited, false, "…and it has not exited");
+    equal((res.details as any).childMessagesSent, null, "…with no message count knowable at dispatch");
     // The module must never reintroduce the camelCase field on the dispatch result.
     equal(/\breviewGate\s*:/.test(source), false, "no camelCase reviewGate field remains in the module");
     ok(source.includes("review_gate: handle.review_gate"), "the dispatch details read the handle's review_gate");
@@ -9088,6 +9102,15 @@ test("#1208: the field set is PRESENT on arms where no child ever existed — ne
   equal(measured.childPid, 4242, "a measured pid survives");
   equal(measured.childState, "completed", "a measured state survives");
   equal(measured.childMessagesSent, 3, "a measured count survives");
+  // The circuit-open PRE-SPAWN refusal's value set (review round 5, P3). The arm's details literal
+  // carries no liveness key (the spread is gated empty at `retries === 0`), so the tool-level stamp
+  // supplies all four. THIS is the invariant the scope guard's comment used to mis-state as
+  // "adds NO key at all": the keys are present, and their VALUE is the refusal's.
+  const breakerRefusal = stampLivenessDefaults({ model: "m", provider: "p", status: "circuit_open", retries: 0 });
+  equal(breakerRefusal.childState, "never-started", "a never-spawned breaker is a refusal, not a measured snapshot");
+  equal(breakerRefusal.childPid, null, "no pid was ever assigned");
+  equal(breakerRefusal.childExited, null, "nothing was seen alive, so `null` — never `false`");
+  equal(breakerRefusal.childMessagesSent, null, "no count is knowable without a child");
 });
 
 section("#1208: an EMPTY turn is not a message");

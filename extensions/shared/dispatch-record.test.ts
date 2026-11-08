@@ -781,7 +781,12 @@ test("#783 review: the spawn-error settle records a row — the abnormal populat
 	// reason from the settle fails it.
 	const chokepoint = source.indexOf("if (opts?.reason)");
 	ok(chokepoint > 0, "the row gate still keys on opts.reason");
-	const spawn = source.indexOf('proc.on("error"');
+	// Anchor on the HANDLER LINE, not the bare call spelling: a doc comment that quotes
+	// `proc.on("error")` matched first and the probe then walked to the WRONG settle
+	// (measured: char 107789 vs the handler's 250973, so the assertion read the hard-cap
+	// settle and the spawn-error reason looked absent). A prose mention can never match
+	// the handler's own signature.
+	const spawn = source.indexOf('proc.on("error", (err: Error)');
 	ok(spawn > 0, "spawn-error handler present");
 	const spawnSettle = source.indexOf("doResolve(", spawn);
 	ok(spawnSettle > spawn, "spawn-error settle found");
@@ -795,7 +800,7 @@ test("#783 review: the spawn-error settle records a row — the abnormal populat
 test("attempt is threaded from retry() into every spawn leg (primary / failover / fallback)", () => {
 	ok(source.includes("retry((attempt) => spawnLeg(dispatchLeg, attempt), retryOptions)"), "primary leg threads attempt");
 	ok(source.includes("retry((attempt) => spawnLeg(leg, attempt), retryOptions)"), "failover leg threads attempt");
-	ok(source.includes("spawnSubAgent(fallbackModel, fallbackProvider, subAgentEnv, buildFbArgs(), signal, recordCtx(attempt), params.cwd, dispatchStreamStallMs)"), "fallback leg threads attempt");
+	ok(source.includes("spawnSubAgent(fallbackModel, fallbackProvider, subAgentEnv, buildFbArgs(), signal, recordCtx(attempt), params.cwd, dispatchStreamStallMs, livenessObserver)"), "fallback leg threads attempt");
 	ok(source.includes("const recordCtx = (attempt: number): DispatchRecordContext"), "recordCtx carries the identity");
 	ok(source.includes("const attempt = record?.attempt ?? 1;"), "missing metadata defaults to 1 (tsx does not typecheck)");
 	ok(
