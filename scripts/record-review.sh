@@ -2444,7 +2444,7 @@ post_review_evidence_comment() { # <marker> <repo> <pr> -> 0 visible, 1 not
   have="$(command gh api "repos/$repo/issues/$pr/comments?per_page=100" --paginate \
     --jq '.[] | "\(.author_association)\u001f\(.body | gsub("[\u001e\u001f]"; ""))" + "\u001e"' 2>/dev/null)" || rc=$?
   if [ "$rc" -ne 0 ]; then
-    echo "⚠️ record-review: could not READ the PR comments (transient API failure?) — the #1224 evidence COMMENT was skipped. The signed record is unaffected. ⛔ This line makes NO CLAIM about the body marker: whether a pending marker was persisted is reported by that persist attempt's own '⚠️ body-marker:' line, where one was printed — never here. Re-run record-review.sh (idempotent) to retry the comment." >&2
+    echo "⚠️ record-review: could not READ the PR comments (transient API failure?) — the #1224 evidence COMMENT was skipped. The signed record is unaffected. ⛔ This line makes NO CLAIM about the body marker: a persist is reported by the '⚠️ body-marker:' line THAT ATTEMPT printed, and it reports that attempt only — when it appears the bytes may still be on disk, because this function is called from an arm that can make TWO persist attempts and a later one prints NO line when it succeeds (#3712 review round 8). So no line decides the file's state, and certainly not this one. Re-run record-review.sh (idempotent) to retry the comment." >&2
     return 1
   fi
   # Split per RECORD (0x1e), then split association from body (0x1f), and require
@@ -6576,14 +6576,16 @@ if command -v gh >/dev/null 2>&1 && [ -n "$REPO" ]; then
     # follow-up 1). The pending file is keyed by (repo, PR) and `marker_pending_write`
     # OVERWRITES it, so what it holds on THIS run's failure is not observable here: an
     # earlier run may have left a marker, and because the marker text is DETERMINISTIC a
-    # same-head run with the same verdict leaves BYTE-IDENTICAL bytes — while a same-head
-    # run with a DIFFERENT verdict leaves a marker that is not this run's. So no sentence
+    # same-head run with the same verdict AND the same `findings`/`note` leaves
+    # BYTE-IDENTICAL bytes — while a same-head run with a DIFFERENT verdict, or a not-clean
+    # record with a different `findings`/`note` (both are spliced into the marker at
+    # `findings=`/`note=`), leaves a marker that is not this run's. So no sentence
     # below may state the file's contents; each says WHICH bytes IT knows about, and a
     # flush is offered as something to TRY, never as a promise — an offer is not a claim
     # about what its output will be.
     BODY_READ_PERSISTED=1
     marker_pending_write "$(marker_pending_file "$REPO" "$PR")" "$MARKER" || { BODY_READ_PERSISTED=0
-    echo "⚠️ body-marker: could NOT persist the pending marker at $(marker_pending_file "$REPO" "$PR") — ⛔ THIS RUN'S WRITE DID NOT LAND, and that is ALL this line knows: it never read the file, so it cannot report the file's contents. ⛔ Do NOT read this as 'the file is empty': the marker is a DETERMINISTIC function of (PR, verdict, head, diff, repo, key), so an EARLIER run at this SAME head MAY have left BYTE-IDENTICAL bytes, in which case a flush CAN deliver THOSE — the 'edited' event fires only if the body PATCH actually changes the text (post_marker returns 0 without PATCHing when the body already carries the line). The marker is reproduced HERE so it is not lost either way: paste the line between the >>> markers into the PR body by hand if gh is throttled. >>> $MARKER <<<" >&2
+    echo "⚠️ body-marker: could NOT persist the pending marker at $(marker_pending_file "$REPO" "$PR") — ⛔ THIS RUN'S WRITE DID NOT LAND, and that is ALL this line knows: it never read the file, so it cannot report the file's contents. ⛔ Do NOT read this as 'the file is empty': the marker is a DETERMINISTIC function of (PR, verdict, head, diff, repo, key — plus findings/note, which a not-clean record splices in; no timestamp, no run id), so an EARLIER run at this SAME head MAY have left BYTE-IDENTICAL bytes, in which case a flush CAN deliver THOSE — the 'edited' event fires only if the body PATCH actually changes the text (post_marker returns 0 without PATCHing when the body already carries the line). The marker is reproduced HERE so it is not lost either way: paste the line between the >>> markers into the PR body by hand if gh is throttled. >>> $MARKER <<<" >&2
     }
     if post_review_evidence_comment "$MARKER" "$REPO" "$PR"; then
       if [ "$BODY_READ_PERSISTED" -eq 1 ]; then
