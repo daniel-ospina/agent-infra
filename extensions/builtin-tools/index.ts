@@ -2148,7 +2148,11 @@ export type TaskChildState =
   /** NO child process ever existed (a pre-spawn refusal, a provider halt, a
    * circuit breaker). Distinct from every state above: there is no pid to
    * probe and no transcript to read, so "it died" would be a false claim. */
-  | "never-started";
+  | "never-started"
+  /** A background dispatch's child is still running (`task_status` is the
+   * instrument for it). Present so the background result does not have to
+   * borrow a state that asserts an outcome nobody has observed yet. */
+  | "running";
 
 /** The canonical liveness field set, present on EVERY `task` result `details`
  * (exported so a consumer imports the vocabulary instead of re-enumerating it,
@@ -2182,6 +2186,55 @@ export function stampLivenessDefaults(details: Record<string, unknown>): Record<
   if (!("childExited" in out)) out.childExited = null;
   if (!("childMessagesSent" in out)) out.childMessagesSent = null;
   return out;
+}
+
+/** #1208: the measured liveness of ONE settle, as the funnel computes it. Exported so the
+ * caller-side retry wrapper can carry it onto the terminal result it composes when every attempt
+ * resolved with no payload at all (review of this PR round 2, P2). */
+export interface TaskChildLivenessSnapshot {
+  childPid: number | null;
+  childState: TaskChildState;
+  childExited: boolean | null;
+  childMessagesSent: number | null;
+}
+
+/** #1208: build one snapshot from the evidence available at settle time.
+ *
+ * `spawnError` is its own arm: `proc.on("error")` composes a payload with `isError` and NO exit
+ * code, and no process ever ran — so it is `never-started`, not "the child ran and produced
+ * nothing" (review round 2, P3). */
+export function childLivenessFor(i: {
+  details: Record<string, unknown>;
+  hbState: Pick<HeartbeatState, "messagesSent" | "everSawMsg" | "sawReady" | "markerCount">;
+  pid: number | undefined;
+  stdout: string;
+  exited: boolean;
+}): TaskChildLivenessSnapshot {
+  const spawnError = i.details.isError === true && i.details.killed !== true && !("exitCode" in i.details);
+  const messagesSent = childMessagesSent(i.hbState);
+  return {
+    childPid: typeof i.pid === "number" ? i.pid : null,
+    childState: spawnError
+      ? "never-started"
+      : classifyChildLiveness({
+          killed: i.details.killed === true,
+          hasStdout: i.stdout.trim().length > 0,
+          messagesSent,
+        }),
+    childExited: spawnError ? null : i.exited,
+    childMessagesSent: messagesSent,
+  };
+}
+
+/** #1208: the status a zero-output RETRY EXHAUSTION names, from the last settle's measurement.
+ *
+ * Extracted so the decision is testable without paying three killed spawns: the arm is reached only
+ * when every attempt resolved `undefined`, which needs a real watchdog kill. `0` messages is the
+ * slow-start death and is named as such; `null` keeps `failed`, because with no heartbeat evidence
+ * "no attempt produced a message" is not provable and a false death claim is the worse error.
+ * (Review round 2, P2 — the tool layer used to stamp `never-started` for a child that DID run.) */
+export function exhaustionStatusFor(snap: TaskChildLivenessSnapshot | null): "failed" | "died-before-first-message" {
+  return snap !== null && snap.childMessagesSent === 0 ? "died-before-first-message" : "failed";
 }
 
 /** #1208: how many messages the child is known to have sent, or `null` when the
@@ -3836,6 +3889,10 @@ export interface SpawnObservers {
    * (#1662 review). The blocking path is unchanged: it surfaces the same
    * `details.status: "invalid-cwd"` through `FAILED_TASK_STATUS`. */
   onRefusal?: (refusal: PreSpawnRefusal) => void;
+  /** #1208: the measured liveness of the settle, fired BEFORE the resolution is handed back so
+   * the value survives a settle that resolves `undefined` (a retryable zero-output kill carries no
+   * payload, and that is the issue's own case). */
+  onLiveness?: (snapshot: TaskChildLivenessSnapshot) => void;
   /** When set, every raw stdout/stderr chunk is appended here (the background
    * run's capture log). The log carries the `[task-heartbeat]` markers verbatim,
    * so liveness is derived from markers — never from `%CPU` (#1662). */
@@ -4273,6 +4330,25 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
       // can land after this snapshot and be missed — fail-closed (no latch),
       // one bounded retry-cycle cost; genuine exhaustion deaths settle via
       // the exit/close paths where stderr has fully drained.
+      // ── #1208: child liveness, measured ONCE per settle — INCLUDING the settles that resolve
+      // `undefined` ────────────────────────────────────────────────────────────────────────────────
+      // ⛔ THE `undefined` SETTLES ARE THE ISSUE'S OWN CASE (review of this PR round 2, P2). Every
+      // zero-output kill — silence-threshold, cut-with-no-output, hard cap, backstop — resolves
+      // `undefined` so the retry wrapper can re-spawn, and the first cut of this change computed
+      // liveness only where a payload object existed. The retry-exhaustion result then stamped
+      // `never-started` / `childPid: null` for a child that DID exist, WAS killed, HAS a pid and HAS
+      // a transcript: a consumer would read "no child existed, fix the arguments" where the honest
+      // verdict is "a child ran and died before its first message — re-dispatch". The measurement is
+      // therefore taken BEFORE the payload branch and handed to the caller through the observer,
+      // so the evidence survives a resolution that carries no payload.
+      const livenessSnapshot = childLivenessFor({
+        details: value && typeof value === "object" ? (value.details ?? {}) : {},
+        hbState: hbCtx.state,
+        pid: proc.pid,
+        stdout,
+        exited: proc.exitCode !== null || proc.signalCode !== null,
+      });
+      observers?.onLiveness?.(livenessSnapshot);
       if (value && typeof value === "object") {
         const marker = detectExhaustionMarker();
         const details: Record<string, unknown> = { ...(value.details ?? {}) };
@@ -4311,30 +4387,21 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
         }
         if (hbCtx.state.everSawTool) details.sawTools = true;
         else if (hbEnabled && hbCtx.state.markerCount === 0) details.sawToolsUnknown = true;
-        // ── #1208: child liveness as a FIELD, on every settled result ─────────
-        // Composed at this one funnel rather than at the dozen composition call
-        // sites: a field set that must be remembered at each of them is the same
-        // "every consumer reconstructs liveness for itself" defect the issue
-        // names, only with a shorter half-life. See TASK_LIVENESS_DETAIL_KEYS.
-        const messagesSent = childMessagesSent(hbCtx.state);
-        const childState = classifyChildLiveness({
-          killed: details.killed === true,
-          hasStdout: stdout.trim().length > 0,
-          messagesSent,
-        });
-        details.childPid = typeof proc.pid === "number" ? proc.pid : null;
-        details.childState = childState;
+        // ── #1208: the measured snapshot rides the payload ────────────────────
+        // Measured ONCE, above, so the `undefined` settles get the same evidence.
+        details.childPid = livenessSnapshot.childPid;
+        details.childState = livenessSnapshot.childState;
         // "terminal status" (issue ask 1): whether the OS told us the child is
         // gone. On the kill paths it is still false at settle time — the kill
         // was just signalled — and saying so is the point: `childState: killed`
         // with `childExited: false` is a child the parent believes is still
         // dying, not one it proved dead.
-        details.childExited = proc.exitCode !== null || proc.signalCode !== null;
+        details.childExited = livenessSnapshot.childExited;
         // `0` is positive evidence (no completed message ever); `null` means
         // the child ran no heartbeat emitter and the parent knows nothing.
-        details.childMessagesSent = messagesSent;
+        details.childMessagesSent = livenessSnapshot.childMessagesSent;
         value = { ...value, details };
-        if (childState === "died-before-first-message") {
+        if (livenessSnapshot.childState === "died-before-first-message") {
           // Issue asks 3 + 4: a DISTINCT result for the slow-start death, and a
           // non-zero exit by default so a parent's default handling is to stop
           // rather than to continue on a payload that means "nothing happened".
@@ -5668,7 +5735,11 @@ export function buildBackgroundDispatchResult(handle: BackgroundDispatchHandle):
     // flips the dispatch to `isError`.
     return {
       content: handle.refusal.content as Array<{ type: string; text: string }>,
-      details: { ...handle.refusal.details, background: true },
+      // #1208: a refused background dispatch never created a child — say so in the field set rather
+      // than leaving it absent (review round 2, P3: this arm carried none of the keys, which made the
+      // exported "present on every `task` result" contract false for the one arm whose subject is a
+      // child that is still running).
+      details: stampLivenessDefaults({ ...handle.refusal.details, background: true }),
     };
   }
   return {
@@ -5687,7 +5758,7 @@ export function buildBackgroundDispatchResult(handle: BackgroundDispatchHandle):
         `Reap:  task_collect({ run_id: "${handle.run_id}" }) → final message + exit status\n\n` +
         `⚠️ REVIEW GATE IS A PARENT STEP (#825): the child runs with AGENT_SKIP_REVIEW_GATE=1 and cannot review itself. After task_collect returns a terminal result, run the review ceremony for this lane BEFORE treating it as complete.`,
     }],
-    details: {
+    details: stampLivenessDefaults({
       run_id: handle.run_id,
       pid: handle.pid,
       pgid: handle.pgid,
@@ -5696,7 +5767,14 @@ export function buildBackgroundDispatchResult(handle: BackgroundDispatchHandle):
       background: true,
       record_persisted: handle.record_persisted,
       review_gate: handle.review_gate,
-    },
+      // #1208: this dispatch's child IS the pid the handle carries, and it has not
+      // exited — the blocking path's `never-started` default would be a false claim
+      // on the arm that exists precisely because the child is alive.
+      childPid: handle.pid,
+      childState: "running",
+      childExited: false,
+      childMessagesSent: null,
+    }),
   };
 }
 
@@ -6439,8 +6517,13 @@ export default function (pi: ExtensionAPI) {
         parentSessionId,
         dispatchClass,
       });
+      // #1208 (review round 2, P2): the LAST settle's measured liveness. A zero-output kill resolves
+      // `undefined`, so the payload that would have carried this evidence does not exist — the
+      // observer is how it reaches the terminal result the retry wrapper composes instead.
+      let lastLiveness: TaskChildLivenessSnapshot | null = null;
+      const livenessObserver: SpawnObservers = { onLiveness: (snap) => { lastLiveness = snap; } };
       const spawnLeg = (leg: LegRef, attempt = 1) =>
-        spawnSubAgent(leg.model, leg.provider, subAgentEnv, buildArgs(leg), signal, recordCtx(attempt), params.cwd, dispatchStreamStallMs);
+        spawnSubAgent(leg.model, leg.provider, subAgentEnv, buildArgs(leg), signal, recordCtx(attempt), params.cwd, dispatchStreamStallMs, livenessObserver);
 
       // #1662: returns-early BACKGROUND dispatch. Everything above — provider
       // resolution, the failover leg, child session, env, heartbeat nonce — is
@@ -6589,7 +6672,7 @@ export default function (pi: ExtensionAPI) {
         const buildFbArgs = (): string[] =>
           ["-p", "--provider", fallbackProvider, "--model", fallbackModel, ...childSessionArgs(), params.prompt];
         const fbResult = await retry(
-          (attempt) => spawnSubAgent(fallbackModel, fallbackProvider, subAgentEnv, buildFbArgs(), signal, recordCtx(attempt), params.cwd, dispatchStreamStallMs),
+          (attempt) => spawnSubAgent(fallbackModel, fallbackProvider, subAgentEnv, buildFbArgs(), signal, recordCtx(attempt), params.cwd, dispatchStreamStallMs, livenessObserver),
           retryOptions,
         );
         if (fbResult.status === "success" && fbResult.value) {
@@ -6627,9 +6710,25 @@ export default function (pi: ExtensionAPI) {
         // terminal message. `isError` is what makes the default handling stop;
         // `details.isError` is the same fact in the load-order-independent form
         // `shared/spawn-capacity.ts` reads.
+        //
+        // #1208 (review round 2, P2): a child DID run — the last settle measured
+        // its pid and its message count — so the terminal result names the
+        // MEASURED state rather than the tool layer's `never-started` default.
+        // `childMessagesSent === 0` is positive evidence of the slow-start death
+        // and is named as such; `null` (no heartbeat evidence) keeps `failed`,
+        // because "no attempt ever produced a message" is not provable there.
+        const snap = lastLiveness as TaskChildLivenessSnapshot | null;
         return withSessionDegraded({
           content: [{ type: "text", text: `❌ Sub-agent failed after ${result.retries} attempts with no output. Model may be hung or overloaded.` }],
-          details: { model, provider, status: "failed", retries: result.retries, elapsedMs: result.elapsedMs, isError: true },
+          details: {
+            model,
+            provider,
+            status: exhaustionStatusFor(snap),
+            retries: result.retries,
+            elapsedMs: result.elapsedMs,
+            isError: true,
+            ...(snap ?? {}),
+          },
           isError: true,
         });
       }

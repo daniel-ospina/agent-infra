@@ -12,7 +12,7 @@
  * node_modules/typebox. Created by CI setup or manually.
  */
 
-import { stripHtml, getPerplexityKey, augmentPath, PATH_EXTRA_DIRS, getPiInvocation, getSubAgentPath, resolveProviderModel, loadModelRegistry, getModelsJsonPath, getExitGraceMs, DEFAULT_EXIT_GRACE_MS, armExitWatchdog, getExitCompleteGraceMs, DEFAULT_EXIT_COMPLETE_GRACE_MS, armCompletionWatchdog, composeTaskResult, getFallbackModel, DEFAULT_FALLBACK_MODEL, connectionErrorDetected, shouldFallback, resolveProviderBaseUrl, HEARTBEAT_MARKER_PREFIX, HEARTBEAT_INTERVAL_MIN_MS, HEARTBEAT_INTERVAL_MAX_MS, DEFAULT_HEARTBEAT_INTERVAL_MS, DEFAULT_STREAM_STALL_MS, DEFAULT_TOOL_STALL_MS, DEFAULT_FIRST_MESSAGE_MS, clampHeartbeatIntervalMs, getHeartbeatIntervalMs, getStreamStallMs, getToolStallMs, getFirstMessageMs, createHeartbeatState, parseHeartbeatLine, flushHeartbeatResidue, flushHeartbeatLineBuf, ingestHeartbeatChunk, heartbeatKillDecision, HEARTBEAT_LINE_BUF_MAX, HEARTBEAT_TRACE_MAX, getTaskMaxDispatchMs, getTaskHardCapMs, DEFAULT_HARD_CAP_MS, loadScaledBound, getFirstOutputTimeoutMs, getSystemLoad, setLoad1Override, getLoad1, getCutGapMs, getEffectiveCutGapMs, getCpuStallMs, DEFAULT_CPU_STALL_MS, DEFAULT_PROGRESS_AGE_MS, getProgressAgeMs, classifyTaskExit, getTaskBackstopMs, DEFAULT_BACKSTOP_MARGIN_MS, DEFAULT_TASK_MODEL, renderRepoStateLine, renderMachineStateLine, countPiProcs, countPiInPsOutput, formatLoad1, probeSystemLoad, resolveTaskCwd, taskCwdRefusal, spawnSubAgent, resolveStreamStallMs, streamStallInertWarning, inFlightProgress, DEFAULT_SESSION_CEILING_MULT, resolveSessionCeiling, isDispatchSaturated, saturationNotice, dispatchSaturationRefusal, probeDispatchSaturation, probePiProcs, setPiProcsOverride, classifyChildLiveness, childMessagesSent, TASK_LIVENESS_DETAIL_KEYS, stampLivenessDefaults } from "./index.js";
+import { stripHtml, getPerplexityKey, augmentPath, PATH_EXTRA_DIRS, getPiInvocation, getSubAgentPath, resolveProviderModel, loadModelRegistry, getModelsJsonPath, getExitGraceMs, DEFAULT_EXIT_GRACE_MS, armExitWatchdog, getExitCompleteGraceMs, DEFAULT_EXIT_COMPLETE_GRACE_MS, armCompletionWatchdog, composeTaskResult, getFallbackModel, DEFAULT_FALLBACK_MODEL, connectionErrorDetected, shouldFallback, resolveProviderBaseUrl, HEARTBEAT_MARKER_PREFIX, HEARTBEAT_INTERVAL_MIN_MS, HEARTBEAT_INTERVAL_MAX_MS, DEFAULT_HEARTBEAT_INTERVAL_MS, DEFAULT_STREAM_STALL_MS, DEFAULT_TOOL_STALL_MS, DEFAULT_FIRST_MESSAGE_MS, clampHeartbeatIntervalMs, getHeartbeatIntervalMs, getStreamStallMs, getToolStallMs, getFirstMessageMs, createHeartbeatState, parseHeartbeatLine, flushHeartbeatResidue, flushHeartbeatLineBuf, ingestHeartbeatChunk, heartbeatKillDecision, HEARTBEAT_LINE_BUF_MAX, HEARTBEAT_TRACE_MAX, getTaskMaxDispatchMs, getTaskHardCapMs, DEFAULT_HARD_CAP_MS, loadScaledBound, getFirstOutputTimeoutMs, getSystemLoad, setLoad1Override, getLoad1, getCutGapMs, getEffectiveCutGapMs, getCpuStallMs, DEFAULT_CPU_STALL_MS, DEFAULT_PROGRESS_AGE_MS, getProgressAgeMs, classifyTaskExit, getTaskBackstopMs, DEFAULT_BACKSTOP_MARGIN_MS, DEFAULT_TASK_MODEL, renderRepoStateLine, renderMachineStateLine, countPiProcs, countPiInPsOutput, formatLoad1, probeSystemLoad, resolveTaskCwd, taskCwdRefusal, spawnSubAgent, resolveStreamStallMs, streamStallInertWarning, inFlightProgress, DEFAULT_SESSION_CEILING_MULT, resolveSessionCeiling, isDispatchSaturated, saturationNotice, dispatchSaturationRefusal, probeDispatchSaturation, probePiProcs, setPiProcsOverride, classifyChildLiveness, childMessagesSent, TASK_LIVENESS_DETAIL_KEYS, stampLivenessDefaults, childLivenessFor, exhaustionStatusFor } from "./index.js";
 import { dispatchUnkeyedSet } from "../shared/provider-failover.js";
 import { asyncRepoState } from "../repo-freshness.js";
 import builtinTools from "./index.js";
@@ -7415,8 +7415,8 @@ test("#1071: the task tool schema exposes `cwd` and threads it to every leg (sou
   // #1030 appended the dispatch's inactivity bound as the 8th argument, so
   // these pins name the whole argument list (that is their point: the leg
   // carries the target cwd — and now the bound resolved for the same dispatch).
-  ok(source.includes("spawnSubAgent(leg.model, leg.provider, subAgentEnv, buildArgs(leg), signal, recordCtx(attempt), params.cwd, dispatchStreamStallMs)"), "primary + failover-hop legs pass params.cwd");
-  ok(source.includes("spawnSubAgent(fallbackModel, fallbackProvider, subAgentEnv, buildFbArgs(), signal, recordCtx(attempt), params.cwd, dispatchStreamStallMs)"), "the provider-fallback leg passes params.cwd");
+  ok(source.includes("spawnSubAgent(leg.model, leg.provider, subAgentEnv, buildArgs(leg), signal, recordCtx(attempt), params.cwd, dispatchStreamStallMs, livenessObserver)"), "primary + failover-hop legs pass params.cwd (and the #1208 liveness observer)");
+  ok(source.includes("spawnSubAgent(fallbackModel, fallbackProvider, subAgentEnv, buildFbArgs(), signal, recordCtx(attempt), params.cwd, dispatchStreamStallMs, livenessObserver)"), "the provider-fallback leg passes params.cwd (and the #1208 liveness observer)");
   ok(!/\{\s*\n\s*cwd: process\.cwd\(\),/.test(source), "no spawn options block pins the parent cwd (scoped to the block — a whole-file negative match is over-broad and its failure message cannot name a real spawn site)");
 });
 
@@ -8974,6 +8974,39 @@ testAsync("#1208 (E2E): the rewrite keeps the child's STDERR diagnostic — and 
     else process.env.DISPATCH_LEDGER = savedLedger;
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test("#1208: a KILLED zero-output settle keeps its measurement (review round 2, P2)", () => {
+  // The `undefined` settles (silence-threshold, cut-with-no-output, hard cap, backstop) carry no
+  // payload, so the first cut lost the pid and the zero-message evidence and the terminal result
+  // said `never-started` — "no child existed" — for a child that ran and was killed. That is a false
+  // claim in the direction that tells a parent to fix its arguments instead of re-dispatching.
+  const st = createHeartbeatState();
+  parseHeartbeatLine("[task-heartbeat] ready nonce=nn", st, 1000);
+  parseHeartbeatLine("[task-heartbeat] turn_start nonce=nn 1", st, 1001);
+  const snap = childLivenessFor({ details: { killed: true }, hbState: st, pid: 4242, stdout: "", exited: false });
+  equal(snap.childPid, 4242, "a killed child still has a pid — the measurement is not discarded");
+  equal(snap.childState, "killed", "the kill is named, not `never-started`");
+  equal(snap.childMessagesSent, 0, "and the zero-message evidence survives (ask 2)");
+  equal(snap.childExited, false, "the kill was just signalled: the OS has not reported the child gone");
+  equal(exhaustionStatusFor(snap), "died-before-first-message", "the exhaustion result names what was measured");
+  // `null` is not `0`: with no emitter, "no attempt produced a message" is unprovable.
+  equal(exhaustionStatusFor({ ...snap, childMessagesSent: null }), "failed", "unknown stays failed — a false death claim is the worse error");
+  equal(exhaustionStatusFor(null), "failed", "no measurement at all (a pre-spawn refusal) stays failed");
+  // The spawn-error arm (exec never ran) is `never-started`, not "it ran and produced nothing".
+  const err = childLivenessFor({ details: { isError: true }, hbState: createHeartbeatState(), pid: 77, stdout: "", exited: false });
+  equal(err.childState, "never-started", "a failed exec never created a child");
+  equal(err.childExited, null, "`null` — not `false`: no child was ever seen alive");
+});
+
+test("#1208: the retry-exhaustion arm is WIRED to the measured snapshot (source pin)", () => {
+  // The decision above is pure; this pins that the arm actually consumes it and carries the
+  // measurement, because the arm is only reachable through three real watchdog kills and no test
+  // in this suite pays for that.
+  ok(source.includes("status: exhaustionStatusFor(snap)"), "the exhaustion status comes from the measurement");
+  ok(source.includes("onLiveness: (snap) => { lastLiveness = snap; }"), "every leg reports its settle to the caller");
+  ok(source.includes("dispatchStreamStallMs, livenessObserver)"), "and every spawnLeg passes the observer");
+  ok(source.includes("...(snap ?? {})"), "the measured fields ride the terminal result");
 });
 
 test("#1208: the field set is PRESENT on arms where no child ever existed — never-started, not absent", () => {
