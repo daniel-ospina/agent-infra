@@ -7498,6 +7498,37 @@ test("#1698: an existing cwd whose stat FAILS keeps the plain message (the fail-
   }
 });
 
+// ⛔ THE OTHER HALF OF THE SAME GUARD (review round 5, P3 — the `ENOTDIR` arm). The
+// row above pins the catch: a failure that is neither `ENOENT` nor `ENOTDIR` must
+// claim nothing. But `isAbsentPath` accepts the PAIR, and dropping `ENOTDIR` from it
+// (`return code === "ENOENT"`) left every row GREEN — measured, mutant applied to the
+// real `index.ts`: the only row that reddens is this one. The arm is not decorative:
+// a target whose ancestor is a FILE cannot exist, so the cause IS the missing cwd and
+// must be named — an `ENOENT`-only guard sends that dispatch back to reading
+// "spawn <binary> ENOENT" with no cause at all, which is the #1698 defect again for
+// the one shape a wrong `--work-tree`/`cwd` most often produces.
+test("#1698: a target whose ancestor is a FILE (ENOTDIR) names the missing cwd", () => {
+  const dir = mkdtempSync(join(tmpdir(), "t1698-enotdir-"));
+  try {
+    const file = join(dir, "not-a-dir");
+    writeFileSync(file, "x");
+    const under = join(file, "child");
+    let code: string | undefined;
+    try {
+      statSync(under);
+    } catch (err) {
+      code = (err as { code?: string } | null)?.code;
+    }
+    equal(code, "ENOTDIR", "premise — the probe really hits ENOTDIR here, not ENOENT");
+    ok(
+      describeSpawnFailure({ code: "ENOENT", message: "spawn /x ENOENT" }, under).includes("DOES NOT EXIST"),
+      "a target under a FILE cannot exist, so the missing-cwd cause IS named (the ENOTDIR arm is kept)",
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 // ⛔ THE CALL SITE, PINNED (review round 2, P2 — verified finding). The five rows
 // above test `describeSpawnFailure` DIRECTLY, so before this block the mutant
 // `:5152 → text: `Sub-agent failed: ${err.message} (spawn cwd: ${targetCwd})``
