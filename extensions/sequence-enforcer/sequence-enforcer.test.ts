@@ -23,6 +23,9 @@ import {
   configuredRemotes,
   isConfiguredFetchSource,
   rebaseFetchTarget,
+  rebaseTargetToken,
+  isAllowedRebaseTarget,
+  defaultBranchOf,
   checkpointWriteTargetAllowed,
   conflictedPaths,
   _setConflictedProbeForTest,
@@ -672,14 +675,13 @@ for (const cmd of [
   "git fetch upstream",
   "git rebase origin/main",
   "git rebase --autostash origin/main",
+  "git rebase upstream/main",
   "git rebase --continue",
   "git rebase --abort",
   "git rebase --skip",
   "git status",
   "git diff",
   "git diff origin/main",
-  "git rebase FETCH_HEAD",
-  "git rebase refs/heads/main",
   "git add src/a.ts",
   "git add src/a.ts src/b.ts",
   "git add .",
@@ -751,6 +753,23 @@ for (const cmd of [
   "git rm a;id",
   "git fetch a|id",
   "git add a>b",
+  // #1418 review round 6, F4 — the T1 rows above pin `_PATH`; these pin `_REF`,
+  // which had NO T1 row at all (widening `_REF` left the suite green).
+  "git rebase origin/main;id",
+  "git status origin/main;id",
+  "git diff origin/main$(id)",
+  "git fetch origin/main|id",
+  // #1418 review round 6, F1 — the LANDING command. The rebase target is the ref
+  // C4 measures and nothing else, so the round-5 forge cannot be re-opened by
+  // rebasing onto an agent-pushed branch, onto FETCH_HEAD, or onto a path.
+  "git rebase FETCH_HEAD",
+  "git rebase refs/heads/main",
+  "git rebase origin/ai-3175",
+  "git rebase origin/../../evil-bare",
+  "git rebase origin/",
+  "git rebase evil",
+  "git fetch origin/../../evil-bare",
+  "git fetch origin//main",
 ]) {
   await test(`BLOCKED (not the remedy / code-exec vector): ${cmd.replace(/\n/g, "\\n").replace(/\t/g, "\\t")}`, () => {
     _setRemotesProbeForTest(() => REMOTES);
@@ -761,37 +780,96 @@ for (const cmd of [
 }
 
 // #1418 review round 5, F1 — the composed exploit, asserted as a CHAIN rather
-// than as two independent rows: the source is refused, so `FETCH_HEAD` can never
-// be pointed at an agent-supplied commit and `git rebase FETCH_HEAD` (which is
-// legitimately admitted) cannot land unreviewed content.
+// than as two independent rows. Round 5 closed this by bounding the fetch source;
+// round 6 (F1) found the SAME chain still open through the landing command, so
+// both halves are now bound: the source must be a configured remote, and the
+// rebase target must be the ref C4 measures.
 await test("#1418 F1 (round 5): `git fetch <path>` is refused, so the fetch→rebase FETCH_HEAD chain cannot inject a commit", () => {
   _setTokenFileForTest(null);
   _setRemotesProbeForTest(() => REMOTES);
   const step = makeStep({ name: "check", gate: "checkpoint", token_phase: "implement" });
   try {
-    for (const source of ["/tmp/evil", "./evil", "evil", "tmp/evil", "file:///tmp/evil"]) {
+    for (const source of ["/tmp/evil", "./evil", "evil", "tmp/evil", "file:///tmp/evil", "origin/../../evil-bare"]) {
       // Two bounds, two refusals: `_REF` rejects a leading `.`/`/` (and `:`), and
       // the tokens that DO pass the class are refused SEMANTICALLY — so only the
       // latter name the remote bound, and both must block.
       const r = validateToolCall("bash", `git fetch ${source}`, step, "gate");
       ok(r.block, `the fetch source must be refused: ${source}`);
     }
-    for (const source of ["evil", "tmp/evil"]) {
+    for (const source of ["evil", "tmp/evil", "origin/../.."] ) {
       const r = validateToolCall("bash", `git fetch ${source}`, step, "gate");
-      ok((r.reason || "").includes("CONFIGURED remote"), `the SEMANTIC refusal names the bound (${source}): ${r.reason}`);
+      if (source !== "origin/../..") {
+        ok((r.reason || "").includes("CONFIGURED remote"), `the SEMANTIC refusal names the bound (${source}): ${r.reason}`);
+      }
     }
     ok(rebaseFetchTarget("git fetch evil") === "evil", "the token is extracted for the semantic check");
     ok(rebaseFetchTarget("git fetch") === null, "a bare fetch has no token to check (and needs none)");
     ok(rebaseFetchTarget("git fetch origin") === "origin", "a configured remote extracts as its own name");
+    // review round 6, F6: the token is CAPTURED, not sliced off a fixed prefix.
+    ok(rebaseFetchTarget("git  fetch origin") === "origin", "doubled space after `git` still parses the token");
+    ok(rebaseFetchTarget("git fetch  origin") === "origin", "doubled space after `fetch` still parses the token");
     _setRemotesProbeForTest(() => REMOTES);
     ok(isConfiguredFetchSource("origin"), "a configured remote is a source");
     ok(isConfiguredFetchSource("origin/main"), "a ref on a configured remote is a source");
     ok(!isConfiguredFetchSource("evil"), "a relative path is not");
     ok(!isConfiguredFetchSource("tmp/evil"), "a path whose first segment is not a remote is not");
     ok(!isConfiguredFetchSource("/tmp/evil"), "an absolute path is not");
+    ok(!isConfiguredFetchSource("origin/../../evil-bare"), "`..` traversal under a configured remote is not (round 6, F1a)");
+    ok(!isConfiguredFetchSource("origin//main"), "an empty segment is not");
     _setRemotesProbeForTest(() => []);
     ok(!isConfiguredFetchSource("origin"), "no configured remotes ⇒ fail closed");
     ok(configuredRemotes().length === 0, "configuredRemotes honours the probe");
+  } finally { _setRemotesProbeForTest(null); }
+});
+
+// #1418 review round 6, F1 — THE LANDING COMMAND. Round 5 bounded the fetch token
+// and left the rebase target unbounded, so `git rebase origin/<any-branch>`
+// reproduced the forge against the real origin: the fleet pushes hundreds of lane
+// branches, and one carrying a rewritten checker is a minted token. The target is
+// now the ref C4 measures and nothing else.
+await test("#1418 F1 (round 6): the rebase TARGET is bound to the ref C4 measures", () => {
+  _setTokenFileForTest(null);
+  _setRemotesProbeForTest(() => REMOTES);
+  const step = makeStep({ name: "check", gate: "checkpoint", token_phase: "implement" });
+  try {
+    // admitted: the base branch of a configured remote, and the continuation flags
+    for (const cmd of [
+      "git rebase origin/main",
+      "git rebase --autostash origin/main",
+      "git rebase upstream/main",
+      "git rebase --continue",
+      "git rebase --abort",
+      "git rebase --skip",
+    ]) {
+      ok(!validateToolCall("bash", cmd, step, "gate").block, `admitted: ${cmd}`);
+    }
+    // refused: everything else that lands content
+    for (const target of [
+      "FETCH_HEAD",                 // the round-5 exploit's landing pad
+      "origin/ai-3175",             // an agent-pushed lane branch
+      "upstream/feature",
+      "refs/heads/main",
+      "refs/remotes/origin/main",
+      "origin/../../evil-bare",     // a path spelling of a repository
+      "origin/",
+      "origin//main",
+      "evil",
+      "main",
+    ]) {
+      const r = validateToolCall("bash", `git rebase ${target}`, step, "gate");
+      ok(r.block, `refused: git rebase ${target}`);
+    }
+    // ...and the refusal names the bound for the tokens that reach the semantic layer
+    const named = validateToolCall("bash", "git rebase origin/ai-3175", step, "gate");
+    ok((named.reason || "").includes("base C4 measures"), `the refusal names the bound: ${named.reason}`);
+    // the target extractor itself
+    equal(rebaseTargetToken("git rebase origin/main"), "origin/main");
+    equal(rebaseTargetToken("git rebase --autostash origin/main"), "origin/main");
+    equal(rebaseTargetToken("git rebase --continue"), null, "a continuation flag is not a target");
+    ok(isAllowedRebaseTarget("origin/main"), "the base of a configured remote is allowed");
+    ok(!isAllowedRebaseTarget("origin/ai-3175"), "another branch of the same remote is not");
+    ok(!isAllowedRebaseTarget("evil/main"), "a non-remote prefix is not");
+    equal(defaultBranchOf("origin"), "main", "the fallback base is the checker's own (origin/main)");
   } finally { _setRemotesProbeForTest(null); }
 });
 
@@ -996,6 +1074,71 @@ await test("#1418 F1 (round 5): the gate's GRADER is refused by IDENTITY even wh
     _setConflictedProbeForTest(() => ["src/conflicted.ts"]);
     ok(!validateToolCall("write", "", step, "gate", "src/conflicted.ts").block, "an ordinary conflict is still writable");
   } finally { _setRebaseProbeForTest(null); _setConflictedProbeForTest(null); _setTokenFileForTest(null); }
+});
+
+await test("#1418 F2 (round 6): a DANGLING symlink at an unmerged path is refused — the write must not land on its target", () => {
+  // `canonicalPath` uses existsSync, which FOLLOWS links: a dangling link reads as
+  // non-existent, so the link PATH is returned and the identity bound never sees
+  // the target — measured as a write creating the force-pass ledger OUTSIDE the
+  // checkout. The link shape is now refused structurally, so both the existing- and
+  // the dangling-target cases are covered.
+  const base = mkdtempSync(join(tmpdir(), "ckpt-dangling-"));
+  try {
+    const outside = join(base, "force-outside.json");   // deliberately NOT created
+    const link = join(base, "innocent.ts");
+    symlinkSync(outside, link);                         // dangling: target absent
+    equal(existsSync(outside), false, "the fixture target really dangles");
+    _setTokenFileForTest(null);
+    _setRebaseProbeForTest(() => true);
+    _setConflictedProbeForTest(() => ["innocent.ts"]);
+    ok(!checkpointWriteTargetAllowed(link, base), "a dangling symlink is refused");
+    ok(validateToolCall("write", "", checkpointStep(), "gate", link).block, "validateToolCall refuses it too");
+    ok(!existsSync(outside), "nothing was created at the target");
+    // control: an ordinary unmerged file in the same window is still writable
+    writeFileSync(join(base, "normal.ts"), "x\n");
+    _setConflictedProbeForTest(() => ["normal.ts"]);
+    ok(checkpointWriteTargetAllowed(join(base, "normal.ts"), base), "an ordinary file is still admitted");
+  } finally { _setRebaseProbeForTest(null); _setConflictedProbeForTest(null); _setTokenFileForTest(null); rmSync(base, { recursive: true, force: true }); }
+});
+
+await test("#1418 F3 (round 6): the identity and git-dir bounds are resolved from the TOP LEVEL, so a subdir cwd protects them too", () => {
+  const base = mkdtempSync(join(tmpdir(), "ckpt-subident-"));
+  try {
+    const repo = join(base, "repo");
+    const sub = join(repo, "deep", "dir");
+    mkdirSync(sub, { recursive: true });
+    const g = (...a: string[]) => execFileSync("git", a, { cwd: repo, encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"] });
+    g("init", "-q", "-b", "main");
+    g("config", "user.email", "t@example.com");
+    g("config", "user.name", "t");
+    mkdirSync(join(repo, "scripts"), { recursive: true });
+    writeFileSync(join(repo, "scripts", "parallel_work_check.py"), "x\n");
+    writeFileSync(join(repo, "x.ts"), "base\n");
+    g("add", ".");
+    g("commit", "-qm", "c1");
+    g("checkout", "-qb", "other");
+    writeFileSync(join(repo, "x.ts"), "other\n");
+    g("commit", "-qam", "c2");
+    g("checkout", "-q", "main");
+    writeFileSync(join(repo, "x.ts"), "main\n");
+    g("commit", "-qam", "c3");
+    try { g("merge", "other"); } catch { /* the conflict is the fixture */ }
+    const grader = join(repo, "scripts", "parallel_work_check.py");
+    _setTokenFileForTest(null);
+    _setRebaseProbeForTest(() => true);
+    // seed the grader INTO the unmerged set so only the IDENTITY bound can refuse it
+    _setConflictedProbeForTest(() => ["scripts/parallel_work_check.py"]);
+    ok(!checkpointWriteTargetAllowed(grader, repo), "CONTROL (repo root): the grader is refused by identity");
+    ok(!checkpointWriteTargetAllowed(grader, sub), "SUBDIR cwd: the grader is STILL refused (round 6, F3)");
+    ok(!checkpointWriteTargetAllowed("enforcement/dangerous-ops.txt", sub), "SUBDIR cwd: the manifest is refused too");
+    ok(validateToolCall("write", "", checkpointStep(), "gate", grader).block, "validateToolCall agrees at the root");
+    // the git dir is resolved from the top level as well (a subdir has no .git)
+    _setConflictedProbeForTest(() => [".git/config"]);
+    ok(!checkpointWriteTargetAllowed(join(repo, ".git", "config"), sub), "the git dir is refused from a subdir cwd");
+    // and a genuine conflict is still resolvable (the bound did not close the window)
+    _setConflictedProbeForTest(() => ["x.ts"]);
+    ok(checkpointWriteTargetAllowed(join(repo, "x.ts"), sub), "an ordinary conflict is writable from a subdir cwd");
+  } finally { _setRebaseProbeForTest(null); _setConflictedProbeForTest(null); _setTokenFileForTest(null); rmSync(base, { recursive: true, force: true }); }
 });
 
 await test("#1418 F2 (round 4): conflictedPaths resolves git's --full-name output against the TOP LEVEL, not cwd", () => {

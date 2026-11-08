@@ -44,8 +44,8 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { homedir } from "node:os";
 import { execFileSync } from "node:child_process";
-import { existsSync, readFileSync, writeFileSync, appendFileSync, mkdirSync, unlinkSync, renameSync, statSync, realpathSync } from "node:fs";
-import { resolve, join, dirname, relative, isAbsolute, sep } from "node:path";
+import { existsSync, readFileSync, writeFileSync, appendFileSync, mkdirSync, unlinkSync, renameSync, statSync, lstatSync, realpathSync } from "node:fs";
+import { resolve, join, dirname, relative, isAbsolute } from "node:path";
 import { isIP } from "node:net"; // #383 (Task 3, P3-1 FINAL mechanical): true IPv6 mirror — zero-dep builtin
 import { isPrintMode, isPrintModeEnv } from "../shared/print-mode.js";
 // #357 (Task 1) introduced the inline; #1330 gave it ONE home and a pin.
@@ -1306,8 +1306,19 @@ export const CHECKPOINT_WHITESPACE_REJECT = /[^\S\u0020]|[\u200B-\u200D\u2060\u0
 //     the token is validated against `git remote` at the decision point.
 //     `git fetch` (bare) stays admitted — it needs no token and refreshes the
 //     configured remote's refs, which is all C4 measures.
-//   * `git rebase <ref>` + `--continue|--abort|--skip`, plus the ONE flag
-//     `--autostash` — C4/C3 prescribes `rebase` verbatim (`options=rebase`), and
+//   * `git rebase <target>` where the TARGET IS BOUND SEMANTICALLY, not lexically
+//     (review round 6, F1). Round 5 bounded the fetch token and left the rebase
+//     target unbounded — but the LANDING command is the rebase, so `git rebase
+//     origin/<any-branch>` reproduced the round-5 exploit against the real origin
+//     with no path trick at all: the fleet pushes hundreds of lane branches, and a
+//     branch carrying a rewritten checker became a minted token. The target is now
+//     the ref C4 actually measures — `<configured-remote>/<that remote's default
+//     branch>` (the checker hardcodes `origin/main` in its own pickaxe re-check,
+//     so this is derived from the verdict, not invented) — plus the three
+//     continuation flags. `FETCH_HEAD`, `refs/...` and arbitrary `<remote>/<branch>`
+//     are gone: a rebase onto a branch nobody reviewed is not a remedy.
+//   * `--autostash` is allowed on the rebase: C4/C3 prescribes `rebase` verbatim
+//     (`options=rebase`), and
 //     the three continuation flags are what finishes or unwinds a rebase that
 //     hit a conflict. `--autostash` is not a convenience: `git rebase` REFUSES
 //     to start on a dirty tree ("cannot rebase: You have unstaged changes"),
@@ -1377,8 +1388,62 @@ export const CHECKPOINT_REMEDY_RM_RE = new RegExp(`^git[ ]+rm[ ]+${_PATH}(?:[ ]+
 // the hole — a path is a fetch source that injects unreviewed commits.
 export const CHECKPOINT_REMEDY_FETCH_RE = new RegExp(`^git[ ]+fetch[ ]+${_REF}$`);
 export function rebaseFetchTarget(command: unknown): string | null {
-  if (typeof command !== "string" || !CHECKPOINT_REMEDY_FETCH_RE.test(command)) return null;
-  return command.slice("git fetch ".length);
+  if (typeof command !== "string") return null;
+  // Capture the token rather than slicing a fixed prefix (review round 6, F6):
+  // the regex allows `[ ]+`, so `git  fetch origin` sliced to `" origin"` and the
+  // lane got a nonsense refusal for correct input.
+  const m = CHECKPOINT_REMEDY_FETCH_RE.exec(command);
+  return m ? command.slice(command.indexOf("fetch") + "fetch".length).trim() : null;
+}
+
+// #1418 (review round 6, F1): the LANDING command. `git rebase <target>` is what
+// actually writes content into the checkout, so bounding the fetch token alone
+// bounded the wrong half — `git rebase origin/<any-branch>` re-opened the same
+// forge. The target must be a remote-tracking ref of a configured remote ON THAT
+// REMOTE'S DEFAULT BRANCH, i.e. the ref C4 measures.
+export const CHECKPOINT_REMEDY_REBASE_RE = new RegExp(
+  `^git[ ]+rebase[ ]+(?:--autostash[ ]+)?${_REF}$`,
+);
+export function rebaseTargetToken(command: unknown): string | null {
+  if (typeof command !== "string") return null;
+  if (!CHECKPOINT_REMEDY_REBASE_RE.test(command)) return null;
+  const i = command.indexOf("rebase");
+  return command.slice(i + "rebase".length).replace("--autostash", "").trim();
+}
+
+// A ref whose resolution is a PATH rather than a ref is not a ref. `..` is the
+// spelling that turns `<remote>/<ref>` into a repository path git will happily
+// fetch from (measured: `git fetch origin/../../evil-bare` exits 0 and writes
+// FETCH_HEAD), so it is refused in both semantic validators.
+function isPathShapedRef(token: string): boolean {
+  return token.includes("..") || token.startsWith("/") || token.endsWith("/") || token.includes("//");
+}
+
+// The default branch of a configured remote, as git records it (`refs/remotes/<r>/HEAD`).
+// When it is not resolvable, fall back to `main` — the branch the checker itself
+// names (`pickaxe(..., "origin/main")`), so the remedy matches the verdict's own base.
+export function defaultBranchOf(remote: string, cwd: string = process.cwd()): string {
+  try {
+    const out = execFileSync("git", ["symbolic-ref", "--short", `refs/remotes/${remote}/HEAD`], {
+      cwd, encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"], timeout: 5000,
+    }).trim();
+    const i = out.indexOf("/");
+    if (i > 0 && i + 1 < out.length) return out.slice(i + 1);
+  } catch { /* no remote HEAD ref — fall through to the checker's own base */ }
+  return "main";
+}
+
+// The rebase target the remedy is allowed to name: `<configured-remote>/<that
+// remote's default branch>`. Everything else — `FETCH_HEAD`, `refs/heads/...`, a
+// bare branch, another branch of the same remote, a path spelling — is refused.
+export function isAllowedRebaseTarget(token: string, cwd: string = process.cwd()): boolean {
+  if (isPathShapedRef(token)) return false;
+  const slash = token.indexOf("/");
+  if (slash <= 0 || slash === token.length - 1) return false;
+  const remote = token.slice(0, slash);
+  const branch = token.slice(slash + 1);
+  if (!configuredRemotes(cwd).includes(remote)) return false;
+  return branch === defaultBranchOf(remote, cwd);
 }
 // The configured remote names for this checkout. Fail-closed: an unreadable git
 // dir yields [] and every `git fetch <token>` is refused (bare `git fetch` still
@@ -1404,6 +1469,7 @@ export function configuredRemotes(cwd: string = process.cwd()): string[] {
 // ref on one of them (`origin/main`). A PATH is neither — `/tmp/evil`, `./evil`,
 // `evil` and `tmp/evil` all fail, which is the whole point (round 5, F1).
 export function isConfiguredFetchSource(token: string, cwd: string = process.cwd()): boolean {
+  if (isPathShapedRef(token)) return false;
   const remotes = configuredRemotes(cwd);
   if (remotes.includes(token)) return true;
   const slash = token.indexOf("/");
@@ -1444,7 +1510,11 @@ export function _setRebaseProbeForTest(fn: (() => boolean) | null): void {
 export function rebaseInProgress(cwd: string = process.cwd()): boolean {
   if (rebaseProbeForTest) return rebaseProbeForTest();
   const markers = ["rebase-merge", "rebase-apply"];
-  const gitDir = resolveGitDir(cwd);
+  // Resolved from the TOP LEVEL: a subdirectory cwd has no `.git`, so a
+  // cwd-relative probe reported "no rebase" for every subdirectory session and
+  // silently refused the conflict remedy (review round 6, F3 — fail-closed, but
+  // wrong about reality).
+  const gitDir = resolveGitDir(repoTopLevel(cwd) ?? cwd);
   if (!gitDir) return false;
   return markers.some((d) => existsSync(join(gitDir, d)));
 }
@@ -1522,7 +1592,14 @@ export function repoTopLevel(cwd: string = process.cwd()): string | null {
   }
 }
 export function conflictedPaths(cwd: string = process.cwd()): string[] {
-  if (conflictedProbeForTest) return conflictedProbeForTest(cwd).map((p) => resolve(cwd, p));
+  // The probe stands in for `git ls-files -u --full-name`. It is resolved against
+  // the TOP LEVEL (falling back to `cwd`), because that is what the real path does
+  // — a probe resolved against `cwd` would make every subdirectory assertion test
+  // the seam instead of the code (review round 6, F3).
+  if (conflictedProbeForTest) {
+    const base = repoTopLevel(cwd) ?? cwd;
+    return conflictedProbeForTest(cwd).map((p) => resolve(base, p));
+  }
   try {
     const top = repoTopLevel(cwd);
     if (!top) return [];
@@ -1593,23 +1670,37 @@ export function checkpointWriteTargetAllowed(target: unknown, cwd: string = proc
     //    is unconditional: these files are never conflict content a lane may
     //    author, conflicted or not. A genuine conflict on one of them is a
     //    declared residual (resolve it out-of-session and escalate).
+    //    ⛔ THE BASE IS THE REPO TOP LEVEL, NOT `cwd` (review round 6, F3): the
+    //    relative artefact names were spelled against `cwd`, so in a subdirectory
+    //    session NOTHING was protected by identity — a bound this comment calls
+    //    "unconditional" and the doc calls "UNCONDITIONALLY".
+    const top = repoTopLevel(cwd) ?? cwd;
     const protectedByIdentity = [
       tokenFile(),
       forceFile(),
-      "scripts/parallel_work_check.sh",
-      "scripts/parallel_work_check.py",
-      "enforcement/dangerous-ops.txt",
+      resolve(top, "scripts/parallel_work_check.sh"),
+      resolve(top, "scripts/parallel_work_check.py"),
+      resolve(top, "enforcement/dangerous-ops.txt"),
     ].map((p) => canonicalPath(resolve(cwd, p)));
     if (protectedByIdentity.includes(real) || protectedByIdentity.includes(abs)) return false;
+    // 1b. A SYMLINK IS NEVER CONFLICT CONTENT (review round 6, F2). A DANGLING
+    //    symlink defeats `canonicalPath` (existsSync follows links, so the link
+    //    reads as non-existent and the link PATH is returned while the write
+    //    lands on the TARGET) — measured: a dangling link at an unmerged path
+    //    resolving to the force-pass ledger was admitted and the write created
+    //    it OUTSIDE the checkout. Refusing the link shape closes it structurally
+    //    rather than relying on canonicalisation catching every case.
+    const lst = lstatSync(abs, { throwIfNoEntry: false });
+    if (lst && lst.isSymbolicLink()) return false;
     // 2. THE GIT DIR — hooks/config/refs are not conflict content, and a `.git`
     //    write outlives the rebase window entirely. Both the `.git` the path
     //    names (a FILE in a linked worktree, so the prefix check matters) and the
     //    git dir it resolves to.
-    const gitDir = resolveGitDir(cwd);
+    const gitDir = resolveGitDir(top);
     if (gitDir) {
       const realGit = canonicalPath(gitDir);
       if (
-        pathInside(abs, resolve(cwd, ".git")) ||
+        pathInside(abs, resolve(top, ".git")) ||
         pathInside(abs, gitDir) ||
         pathInside(real, realGit)
       ) return false;
@@ -1621,7 +1712,7 @@ export function checkpointWriteTargetAllowed(target: unknown, cwd: string = proc
     //    `cwd` made the two halves disagree — a session whose cwd is a
     //    subdirectory got the top-level conflict LISTED and then DENIED as
     //    outside the checkout, which is the doc's exact claim in reverse.
-    const root = canonicalPath(repoTopLevel(cwd) ?? cwd);
+    const root = canonicalPath(top);
     if (!pathInside(real, root)) return false;
     // 4. THE CONTENT BOUND (review round 3, F2): only a path git currently
     //    reports as UNMERGED. A worktree-wide allowance reached the artefacts
@@ -2470,6 +2561,14 @@ export function validateToolCall(
       const fetchTarget = toolName === "bash" ? rebaseFetchTarget(command) : null;
       if (fetchTarget !== null && !isConfiguredFetchSource(fetchTarget)) {
         return { block: true, reason: `⛔ checkpoint gate — \`git fetch\` is admitted only for a CONFIGURED remote; "${fetchTarget}" is not one. A local path or URL is a fetch source that smuggles commits this gate never reviewed (a rewritten checker is a minted token) — use bare \`git fetch\` or a configured remote name` };
+      }
+      // #1418 (round 6, F1): the LANDING command is the rebase, so the TARGET is
+      // the bound that matters. Only `<configured-remote>/<that remote's default
+      // branch>` — the ref C4 measures — is admitted; `FETCH_HEAD`, `refs/...` and
+      // any other branch of the remote are not.
+      const rebaseTarget = toolName === "bash" ? rebaseTargetToken(command) : null;
+      if (rebaseTarget !== null && !isAllowedRebaseTarget(rebaseTarget)) {
+        return { block: true, reason: `⛔ checkpoint gate — \`git rebase\` is admitted only onto the base C4 measures: \`<remote>/<that remote's default branch>\` (e.g. \`origin/main\`). "${rebaseTarget}" is not that ref — a rebase onto content nobody reviewed is a way to rewrite the checker, so it is refused` };
       }
       // #1418 (round 4, F3): `git rm` is bounded to the UNMERGED set — the
       // deletions a stopped rebase is actually asking about.
