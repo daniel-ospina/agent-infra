@@ -706,11 +706,35 @@ assert_eq "$(wc -c <"$T/t19/err" | tr -d ' ')" "0" \
 assert_contains "$(cat "$T/t19/out" 2>/dev/null || true)" "harness: mode=sync" "T19 and the pass really ran"
 assert_contains "$(cat "$T/t19/state/harness-apply.status" 2>/dev/null || true)" "rc=0" "T19 and it recorded a pass"
 
+# ── T19b: A PIPED START MUST NOT SOURCE THE RESOLVER OUT OF THE WORKING DIRECTORY ─────────────
+# ⛔ `bash -s` has no BASH_SOURCE **and its `$0` is literally `bash`**, so `dirname` answers `.` and a
+# naive `$SELF_DIR/lib/cell-home.sh` lookup becomes `$PWD/lib/cell-home.sh` — the pass would SOURCE
+# code from whatever directory it was started in, which is the same code-execution-from-CWD shape
+# `pi-bootstrap/cell-install.sh` refuses for a `keys.env` it does not own. (The earlier note that
+# `$HERE` is left EMPTY was wrong: it degrades to `.`.) The hostile library plants a marker, and the arm
+# asserts the marker is NEVER created — i.e. `$PWD/lib/` is not on the resolver search path at all.
+say_case "T19b a piped start does not source \$PWD/lib/cell-home.sh"
+mk_origin t19b; mk_clone t19b; write_sync_stub
+REPO_P="$CLONE"; MODE_P=sync
+mkdir -p "$T/t19b/state" "$T/t19b/cwd/lib"
+MARKER="$T/t19b/SOURCED-FROM-CWD"
+printf 'touch %s\n' "$MARKER" >"$T/t19b/cwd/lib/cell-home.sh"
+( cd "$T/t19b/cwd" && env -i HOME="$T/t19b/home" PATH="$(acct_stub "$T/t19b/acct" "$T/t19b/home"):$PATH" \
+    HARNESS_APPLY_REPO="$CLONE" HARNESS_APPLY_REF=origin/main \
+    HARNESS_APPLY_MODE=sync HARNESS_APPLY_STATE_DIR="$T/t19b/state" \
+    HARNESS_APPLY_SYNC_CMD="$T/sync-stub.sh" \
+    bash -s <"$PASS_SH" >"$T/t19b/out" 2>"$T/t19b/err" ); RC=$?
+assert_eq "$RC" "0" "T19b the piped start still runs (rc 0 — the guard does not break the entry point)"
+assert_eq "$([ -e "$MARKER" ] && echo SOURCED || echo clean)" "clean" \
+    "T19b …and it did NOT source \$PWD/lib/cell-home.sh (no code from the working directory)"
+assert_contains "$(cat "$T/t19b/out" 2>/dev/null || true)" "harness: mode=sync" "T19b …and the pass really ran"
+
 # ── T21: a FAILED fetch is cannot-verify, never "current" against a stale ref ────────────────
 # THE HEADLINE OF ONE REVIEW ROUND, and it had no test: the pass used to warn on stderr and compare
 # against the stale remote-tracking ref, so a box that lost egress wrote `behind=0 action=none rc=0`,
 # went green in the unit, and raised no alarm anywhere — every signal saying "auto" while it aged.
-say_case "T21 a failed fetch is cannot-verify, not current"
+
+# ── T21: a FAILED fetch is cannot-verify, never "current" against a stale ref ────────────────say_case "T21 a failed fetch is cannot-verify, not current"
 mk_origin t21; mk_clone t21; write_sync_stub
 REPO_P="$CLONE"; MODE_P=sync
 # Move the origin away: `git fetch` cannot reach it, while `origin/main` STILL resolves locally to a
@@ -1464,7 +1488,17 @@ MAT
 # `run_pass_unit <case-dir>` — the pass under the rendered unit's environment.
 run_pass_unit() {
     local d="$1"; shift
-    local -a e=( HOME="$d/home" PATH="$(acct_stub "$d/acct" "$d/home"):$PATH" TMPDIR="${TMPDIR:-/tmp}"
+    # ⛔ THE STUB IS BUILT FIRST AND ITS STATUS IS CHECKED. `PATH="$(acct_stub …):$PATH"` inside the
+    # array literal below hands the substitution's status to `local`, a builtin that ALWAYS succeeds — so
+    # a FAILED stub and an EMPTY one were indistinguishable, and an empty PATH entry silently grades the
+    # HOST again, which is the exact defect this seam exists to remove (`check-false-pass-shapes.sh`,
+    # discarded-status, #2096).
+    local _acct
+    if ! _acct="$(acct_stub "$d/acct" "$d/home")"; then
+        printf 'FIXTURE FAILURE: could not build the account stub for %s — refusing to run the pass against the HOST\n' "$d" >&2
+        return 1
+    fi
+    local -a e=( HOME="$d/home" PATH="$_acct:$PATH" TMPDIR="${TMPDIR:-/tmp}"
                  HARNESS_APPLY_REPO="$REPO_P" HARNESS_APPLY_REF=origin/main HARNESS_APPLY_MODE=
                  HARNESS_APPLY_STATE_DIR="$d/state" HARNESS_APPLY_DRIFT_CHECK=0 HARNESS_FETCH=1
                  HARNESS_APPLY_SYNC_CMD="$T/sync-stub.sh"
