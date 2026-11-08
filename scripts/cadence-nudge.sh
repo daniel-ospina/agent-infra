@@ -367,9 +367,17 @@ if [ -z "$ORCH_WS" ] || [ -z "$ORCH_SURFACE" ]; then
 fi
 # ⛔ NO REACHABILITY PROBE BEFORE THE SEND. The first version probed with `cmux read-screen` and only sent
 # if it answered -- a slow-but-working cmux then consumed the budget BEFORE the message went out, which is
-# the same ordering defect as the tick's. THE SEND IS THE TEST: `cmux send` already tells us whether it
-# worked, so probing first only adds a way to fail without having tried. On failure we log and exit; the
-# next pass retries, and the lock in heartbeat-loop.sh prevents a pile-up.
+# the same ordering defect as the tick's. Probing first only adds a way to fail without having tried.
+#
+# ⛔ AND "THE SEND IS THE TEST" IS RETIRED (#3795 review F1, carried unfixed through cycles 1/4/5). This
+# line used to continue "`cmux send` already tells us whether it worked", and that half is the premise
+# #1187 FALSIFIED: the measured 1,962-byte message arrived as its FIRST SENTENCE and a 5,464-byte one
+# arrived COMPLETE, both with `OK`, and an 8-byte `/reload` was lost entirely. The send's exit code is a
+# HINT, never a delivery verdict — the verdict comes from `scripts/lib/cmux_payload.py` (transcript
+# evidence, after a pre-send baseline) and is recorded in `delivered=` beside every `NUDGE at=`. Leaving
+# the old sentence in place let the next editor of this tail cite the file's own doctrine to restore
+# `delivered=yes`-by-`$rc`, and made the new block below false about this file. On failure we log and
+# exit; the next pass retries, and the lock in heartbeat-loop.sh prevents a pile-up.
 
 # ⛔ ONE MESSAGE, ONE LINE -- NO EMBEDDED NEWLINES (2026-10-05, owner report).
 # MEASURED DEFECT: the multi-line form of this message arrived as 5-6 SEPARATE turns in the pane.
