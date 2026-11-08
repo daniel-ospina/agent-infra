@@ -478,8 +478,9 @@ def transcript_has_payload(path: str, sent_text: str,
 
     ⛔ `since_offset` IS THE POINT (#1881 review P1). Without it this function answered "is the marker
     anywhere in the last 2 MB", which on a live lane can span DAYS — so an earlier message with the
-    same body (a standing order, a nudge, the retry that `orch-send.sh 165` tells the operator to
-    send) certifies a LATER, truncated send. The caller records the transcript's size BEFORE sending
+    same body (a standing order, a nudge, the retry that the re-send branch in `scripts/orch-send.sh`
+    tells the operator to send -- grep `Re-send ONLY if`; the line number rots) certifies a LATER,
+    truncated send. The caller records the transcript's size BEFORE sending
     and passes it here, so only bytes APPENDED BY THIS SEND can match. Omitting it keeps the old
     behaviour for a caller that has no pre-send reading — which is weaker, not stronger, and says so.
     """

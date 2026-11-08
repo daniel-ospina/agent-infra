@@ -11,7 +11,7 @@
 #         (measured 2026-10-04; today it is `TARGET - IN_PASS_RESERVE` = 390s, and the
 #         DISPATCH_BUDGET reserve it was subtracted from no longer exists -- agent-infra#1874), and it
 #         is killed (rc=143) under load BEFORE it reaches its `cmux send`
-#         (`orchestrator-heartbeat.sh:997`; the number rots — grep `cmux send`). The slow reads
+#         (`orchestrator-heartbeat.sh`; the number rots — grep `cmux send`). The slow reads
 #         (`lane-status.py` 167-273s, `beta-progress.py`) all sit ABOVE the send in that file, so a
 #         kill removes the message while the pass still logs `PASS done in 540s`.
 #     (b) even when it gets there, the `Working` guard withholds the nudge unless PULSE_FIRED is set.
@@ -23,16 +23,26 @@
 #
 # WHAT IT DOES. Reads the last NUDGE ATTEMPT from the log (cheap, local) -- every attempt that reaches
 # the receipt stamps `NUDGE at=`, and the `delivered=` field beside it carries the verdict for that
-# attempt (see the note above `last=` for why the read must not require `yes`, and the note at the
-# receipt for why a killed run can have sent and stamped nothing). If one is not due, exits immediately
-# (the common case -- a few ms, so it never costs the pass anything). If one IS due, builds a minimal
-# heartbeat from CACHED/local state only -- NO network, NO `gh`, NO lane classification -- and sends it
-# by ONE OF TWO PATHS:
+# attempt (see the note above `last=` for why the read must not require `yes`). Two states stamp NO
+# receipt, both deliberately: a run KILLED inside the verification window has sent and stamped nothing,
+# and a run whose checker printed no verdict writes only the `NOT CERTIFIED` line -- neither is counted
+# as an attempt, so both retry on the next tick. If one is not due, exits immediately (the common case
+# -- a few ms, so it never costs the pass anything). If one IS due, builds a minimal heartbeat from
+# CACHED/local state only -- NO network, NO `gh`, NO lane classification -- and sends it by ONE OF TWO
+# PATHS:
 #   * checker usable -- `lib/cmux_payload.py verify`, which types the payload and submits it as a
 #     SEPARATE Enter, then reports a verdict. Only `VERIFIED` earns `delivered=yes`.
-#   * checker missing / broken / not advertising `--surface` -- ONE raw `cmux send "$MSG\n"`, recorded
-#     as `delivered=UNVERIFIED verdict=NO-USABLE-CHECKER`. Nothing verifies it, deliberately: the floor's
-#     job is that a beat leaves even on a broken box, and it refuses to certify what it could not check.
+#   * checker missing / broken / not advertising `--surface` / the `CADENCE_NUDGE_VERIFY_TIMEOUT` value
+#     rejected -- ONE raw `cmux send "$MSG\n"`, recorded as `delivered=UNVERIFIED`. Nothing verifies
+#     it, deliberately: the floor's job is that a beat leaves even on a broken box, and it refuses to
+#     certify what it could not check. The verdict token names WHICH of those was measured
+#     (`NO-USABLE-CHECKER` or `BAD-VERIFY-TIMEOUT`), because a receipt must not assert an absence the
+#     box contradicts.
+#   ⛔ AND THERE IS A THIRD STATE WHERE NEITHER PATH SENDS: the checker runs and prints NO verdict. The
+#   floor cannot know whether it sent before dying, so it does not send again in the same tick -- it
+#   reports `verdict=NO-VERDICT` and leaves the next tick to retry (see the note at the receipt). That
+#   is the one state where this file's invariant ("a heartbeat leaves even on a broken box") is carried
+#   by the TICK instead of by the floor, and it is stated here rather than implied.
 #   ⛔ CHEAP IS THE DUE CHECK, NOT THE SEND (#3795 review P1). This paragraph used to promise the send
 #   could not be slow, and that it was "one atomic `text\n` call" -- the single-call-implies-delivery
 #   premise this change retires, false about the checker path, and still literally true only on the raw
@@ -67,10 +77,12 @@ GRACE=0
 # ⛔ ONE NUDGE AT A TIME. The timer is now fire-and-forget (see cadence-timer.sh: it must never wait on a
 # send), so a slow cmux can leave one nudge in flight when the next tick fires. Without a lock, both
 # would read the same "is it due?" answer from the log and both would send -- two messages seconds apart,
-# which is out-of-band in the over-frequent direction. The loser exits silently; the next tick retries.
-# A STALE lock (its holder has EXITED, or it is older than 6 min and names no pid, so a killed nudge
-# cannot wedge the floor) is taken over -- that is the same failure that stranded the loop on a dead pid
-# file earlier today, so it is handled here. A lock whose holder is still ALIVE is never taken over.
+# which is out-of-band in the over-frequent direction. The loser does not send, and says so (a silent
+# skip is how the floor died with a clean log -- see the block below); the next tick retries.
+# A STALE lock is taken over -- that is the same failure that stranded the loop on a dead pid file
+# earlier today, so it is handled here. What counts as stale is decided by the block below and is NOT a
+# bare age bound: a holder is reclaimed only by the absolute ceiling, a pid that is provably not this
+# script by the short grace, and an unidentifiable lock by the ceiling. See the rules there.
 LOCK="$STATE/cadence-nudge.lock"
 # ⛔ THE HOLDER'S PID LIVES BESIDE THE LOCK, NOT INSIDE IT. Two reasons, both load-bearing:
 #   * the lock DIRECTORY stays EMPTY, so `rmdir` still reclaims it. The previous version of this file
@@ -99,43 +111,102 @@ LOCKPID="$LOCK.pid"
 # (`scripts/orchestrator-harness/auto-rail.sh:315-345`: "a pid is not an identity ... ALIVE non-matching
 # or unreadable pid is only reclaimable once the lock is OLDER than LOCK_AGE_GRACE ... the actuator was
 # permanently dead with a clean log"). Applied here:
-#   1. a pid is not an identity -- the process must BE this script (`ps -o args=` must name
-#      `cadence-nudge.sh`), so a recycled or foreign pid never reads as a holder;
-#   2. a genuine live holder younger than the ABSOLUTE CEILING is never taken over, and the skip is
-#      LOGGED so it stops being invisible;
-#   3. a genuine live holder past the ceiling IS taken over -- bounded, because past 2 intervals its
-#      message is stale anyway and a duplicate heartbeat is explicitly not the dangerous duplicate a
-#      duplicate lane ORDER is (see the residual note at the receipt);
-#   4. an absent or unreadable pid is HELD while the lock is young (fail-closed on the window between
-#      `mkdir` and the pid write) and reclaimed once it is older than the grace.
+#   1. a pid is not an identity -- the holder's argv must CONTAIN this script's name
+#      (`ps -o args=`), so a recycled or FOREIGN pid never reads as a holder. A substring match, not
+#      equality: a foreign process merely NAMED after this file (an editor with it open, a wrapper)
+#      still reads as a holder. That residual is bounded by rule 3's ceiling, and is stated here rather
+#      than denied -- the same honesty `auto-rail.sh` applies to its own predicate;
+#   2. a genuine live holder is not taken over by AGE alone; it is taken over only by the ABSOLUTE
+#      CEILING in rule 3. Every skip is LOGGED, because a silent skip is how the floor died once;
+#   3. a genuine live holder past the 20-min ceiling IS taken over -- bounded, because past 2.7
+#      intervals its message is stale anyway and a duplicate heartbeat is explicitly not the dangerous
+#      duplicate a duplicate lane ORDER is (see the residual note at the receipt);
+#   4. a pid that is ALIVE but not this script (recycled, or foreign) is reclaimed at the SHORT grace:
+#      it is provably not the nudge that wrote it, so nothing is raced by reclaiming;
+#   5. a lock the code cannot IDENTIFY at all (no pid file, an empty or unreadable one, or one left
+#      INSIDE the dir by the intermediate version) is held to the CEILING, not the short grace: that
+#      is the arm where only the clock stands between a second contender and a live sender, and the
+#      clock must exceed the ~413 s window it is protecting. MEASURED: with the short grace here, a
+#      holder whose pid write had failed was reclaimed mid-run and two receipts landed 4 s apart.
+#   6. the RECLAIM is a rename, not a delete-then-create: `mv "$LOCK" "$LOCK.reclaim.$$"` can succeed
+#      for only ONE contender (the second finds no `$LOCK`), and the moved directory's INODE is checked
+#      against the one that was judged stale, so a contender that lost the decision race cannot move a
+#      NEWER, live lock. MEASURED without this: two contenders that both judged the lock stale typed a
+#      heartbeat 19 ms apart. (That window exists on `main` too; it is closed here because this is the
+#      file's own subject and because the delete-then-create form made it worse by destroying the
+#      live winner's pid file.)
 NUDGE_LOCK_CEILING_MIN=20   # >> the ~413 s verification budget (2.7 timer intervals)
-NUDGE_LOCK_GRACE_MIN=6      # an absent/unreadable pid: fail-closed this long, then reclaim
-_nudge_holder_live() {      # rc 0 = a process that IS this script owns the lock
+NUDGE_LOCK_GRACE_MIN=6      # a pid that is provably NOT this script: reclaim after this
+_hpid=""
+_hpid_alive=0
+_nudge_holder_live() {      # rc 0 = a process that IS this script owns the lock; sets _hpid/_hpid_alive
   _hpid=$(cat "$LOCKPID" 2>/dev/null | tr -cd '0-9')
+  _hpid_alive=0
   [ -n "$_hpid" ] || return 1
-  # ⛔ THE ARGS MUST NAME **THIS** SCRIPT, not any string containing "cadence-nudge" (#3795 review P1).
-  # A bare `kill -0` proves a pid EXISTS, never that it is the nudge that wrote it.
-  ps -p "$_hpid" -o args= 2>/dev/null | grep -q 'cadence-nudge[.]sh' || return 1
+  # ⛔ NOT A PIPE INTO `grep -q` (#3795 review cycle 3, P2). `scripts/check-no-sigpipe-grep.sh` bans
+  # the idiom outright and cannot see this site (`ps` is not one of its recognised producers), and
+  # under `set -o pipefail` a large enough payload after the match makes the pipeline report 141 —
+  # which `|| return 1` would read as "not this script", i.e. NO HOLDER, failing OPEN in the
+  # duplicate-send direction. This file already uses the sanctioned here-string form at the due read;
+  # this is the same shape.
+  _pargs=$(ps -p "$_hpid" -o args= 2>/dev/null)
+  [ -n "$_pargs" ] && _hpid_alive=1
+  grep -q 'cadence-nudge[.]sh' <<<"$_pargs" || return 1
   return 0
 }
 if [ -d "$LOCK" ]; then
+  _lock_ino=$(ls -di "$LOCK" 2>/dev/null | awk '{print $1}')
+  _known=0   # 1 = we can bound this lock by AGE (a holder, or a pid that is not ours)
   if _nudge_holder_live; then
-    if [ -z "$(find "$LOCK" -maxdepth 0 -mmin +"$NUDGE_LOCK_CEILING_MIN" 2>/dev/null)" ]; then
-      # A real nudge is running. Say so -- a silent skip is how the floor died with a clean log.
-      printf '%s CADENCE-NUDGE lock-held holder=%s — a nudge is still running, so this pass made no attempt; the next tick retries (#1187).\n' \
-        "$(date '+%m-%d %H:%M:%S')" "$_hpid" >> "$LOG"
-      exit 0
-    fi
-  elif [ -z "$(find "$LOCK" -maxdepth 0 -mmin +"$NUDGE_LOCK_GRACE_MIN" 2>/dev/null)" ]; then
-    # No pid, or a pid that is not this script, and the lock is young: HELD (fail-closed).
+    _known=1
+    _bound=$NUDGE_LOCK_CEILING_MIN
+    _why="a nudge is still running (pid $_hpid)"
+  elif [ "$_hpid_alive" = "1" ]; then
+    _known=1
+    _bound=$NUDGE_LOCK_GRACE_MIN
+    _why="pid $_hpid is alive but is not this script (recycled or foreign)"
+  else
+    # Unidentifiable: no pid file, an empty/unreadable one, or one left inside the dir. Only the
+    # clock protects a live sender here, so the bound is the CEILING (rule 5).
+    _bound=$NUDGE_LOCK_CEILING_MIN
+    _why="no identifiable holder"
+  fi
+  if [ -z "$(find "$LOCK" -maxdepth 0 -mmin +"$_bound" 2>/dev/null)" ]; then
+    # Held. Say so on EVERY arm -- a silent skip is how the floor died with a clean log.
+    printf '%s CADENCE-NUDGE lock-skip holder=%s bound=%sm — %s, so this pass made no attempt; the next tick retries (#1187).\n' \
+      "$(date '+%m-%d %H:%M:%S')" "${_hpid:-none}" "$_bound" "$_why" >> "$LOG"
     exit 0
   fi
-  # Reclaim. `"$LOCK/pid"` is removed too, so a lock left by the intermediate version of this fix
-  # (which wrote the pid INSIDE the directory) can still be reclaimed.
-  rm -f "$LOCK/pid" "$LOCKPID" 2>/dev/null
-  rmdir "$LOCK" 2>/dev/null
+  # ⛔ RECLAIM BY RENAME (rule 6). Only one contender can move this directory away; a contender that
+  # judged it stale and then lost the race finds no `$LOCK` and exits quietly below.
+  mv "$LOCK" "$LOCK.reclaim.$$" 2>/dev/null || exit 0
+  # ...and the directory we actually MOVED must be the one we JUDGED. A contender that decided while
+  # the previous holder was still finishing can otherwise move the NEW, live lock.
+  _moved_ino=$(ls -di "$LOCK.reclaim.$$" 2>/dev/null | awk '{print $1}')
+  if [ -n "$_lock_ino" ] && [ "$_moved_ino" != "$_lock_ino" ]; then
+    mv "$LOCK.reclaim.$$" "$LOCK" 2>/dev/null
+    printf '%s CADENCE-NUDGE lock-skip holder=%s — reclaimed lock was not the one judged stale; put it back\n' \
+      "$(date '+%m-%d %H:%M:%S')" "${_hpid:-none}" >> "$LOG"
+    exit 0
+  fi
+  rm -f "$LOCK.reclaim.$$/pid" 2>/dev/null
+  rmdir "$LOCK.reclaim.$$" 2>/dev/null || rm -rf "$LOCK.reclaim.$$" 2>/dev/null
+  # The sibling pid file is removed only if it still names the holder we judged -- never a new one.
+  _now_pid=$(cat "$LOCKPID" 2>/dev/null | tr -cd '0-9')
+  if [ "$_now_pid" = "${_hpid:-}" ] || [ -z "$_now_pid" ]; then
+    rm -f "$LOCKPID" 2>/dev/null
+  fi
+  printf '%s CADENCE-NUDGE lock-reclaimed bound=%sm — %s; taking the lock (#1187).\n' \
+    "$(date '+%m-%d %H:%M:%S')" "$_bound" "$_why" >> "$LOG"
 fi
-mkdir "$LOCK" 2>/dev/null || exit 0
+# ⛔ THE LOSER OF `mkdir` IS LOGGED TOO (#3795 review cycle 3, P2). It was a silent `exit 0`, i.e. the
+# same invisible-skip shape, in a window that is only microseconds wide but completely unobservable
+# when it is hit.
+mkdir "$LOCK" 2>/dev/null || {
+  printf '%s CADENCE-NUDGE lock-skip holder=%s — another pass took the lock first; this one made no attempt\n' \
+    "$(date '+%m-%d %H:%M:%S')" "none" >> "$LOG"
+  exit 0
+}
 printf '%s\n' "$$" > "$LOCKPID" 2>/dev/null || true
 # ⛔ AN OWNERSHIP-CHECKED TRAP (#3795 review P2). An unconditional `rm -f "$LOCKPID"` deletes whatever
 # pid is there -- if this run's own pid write failed and a later tick reclaimed the lock, this run's EXIT
@@ -480,7 +551,8 @@ fi
 # it carried the per-lane verdicts (ACT:) and the objective verdict, i.e. THE STATE OF THE CMUX
 # SESSIONS. My one-line rewrite kept the goal and the free list but DROPPED `ACT:`, which is the
 # field the orchestrator actually acts on. Restored field-for-field from the tick's own template
-# (orchestrator-heartbeat.sh line 577), which was never changed -- it simply never delivers,
+# (the tick's own template, `orchestrator-heartbeat.sh`, the `MSG="[HEARTBEAT ${TS}] ..."` assignment --
+# grep `^MSG="\[HEARTBEAT`; the line number rots), which was never changed -- it simply never delivers,
 # because this floor pre-empts it. So the floor must speak Friday's language.
 # STILL ONE MESSAGE, ONE LINE: `cmux send` submits every newline as its own turn (that was the
 # noise defect). Friday's shape was always a single line; it is reproduced as one.
@@ -721,10 +793,15 @@ if [ -z "$_checker_broken" ]; then
   # and writes NO receipt (see below), which is the only lever both clocks share.
   #
   # Residual, stated because it is a real ambiguity: a checker killed between its `cmux send` and the
-  # FLUSH of its buffered stdout is indistinguishable from a pre-send failure, so this path may re-send
-  # once. That is the direction this file already chooses -- "a false UNVERIFIED costs a pane check; a
-  # false delivered=yes is how a lane sits idle believing it was woken" -- and a duplicate heartbeat is
-  # explicitly not the dangerous duplicate a duplicate lane ORDER is.
+  # FLUSH of its buffered stdout is indistinguishable from a pre-send failure, and because this path
+  # writes NO receipt, the due read never advances -- so it re-sends on the NEXT tick, and on EVERY
+  # tick while the condition persists, not once (#3795 review cycle 3, P2; measured: three runs, three
+  # sends, one receipt). The duplicate is therefore bounded by how long the no-verdict state lasts.
+  # That is the direction this file already chooses -- "a false UNVERIFIED costs a pane check; a false
+  # delivered=yes is how a lane sits idle believing it was woken" -- and a duplicate heartbeat is
+  # explicitly not the dangerous duplicate a duplicate lane ORDER is. The alternative (stamp a receipt)
+  # is the P1 this branch exists to fix: `NUDGE at=` is read by BOTH clocks, so one unearned stamp
+  # silences the tick as well.
   _no_verdict=0
   if [ -z "$verdict" ]; then
     verdict="NO-VERDICT"
@@ -748,10 +825,20 @@ else
   if [ "$rc" -ne 0 ]; then
     cmux send --workspace "$ORCH_WS" --surface "$ORCH_SURFACE" '\n' >/dev/null 2>&1
   fi
-  # ⛔ `NO-USABLE-CHECKER`, NOT `NO-CHECKER` (#3795 review cycle 4, P2). This branch is also reached
-  # when the file EXISTS and cannot be used (stale, or broken), so the old token asserted an absence
-  # the box contradicted. `diag=[…]` still carries the measured reason.
-  verdict="NO-USABLE-CHECKER"
+  # ⛔ A BAD ENV VALUE IS NOT AN UNAVAILABLE CHECKER (#3795 review cycle 3, P2). The
+  # `CADENCE_NUDGE_VERIFY_TIMEOUT` gate sets `_checker_broken`, so this arm is reached with a PERFECTLY
+  # USABLE checker on the box and a rejected config value — and it used to report
+  # `verdict=NO-USABLE-CHECKER` with `diag=[payload checker unavailable: CADENCE_NUDGE_VERIFY_TIMEOUT
+  # is not a positive number: ...]`: a receipt asserting an absence the box contradicted, which is the
+  # exact class the token rename below was meant to close. It now names the config, not the checker.
+  case "$_checker_broken" in
+    CADENCE_NUDGE_VERIFY_TIMEOUT*) verdict="BAD-VERIFY-TIMEOUT" ;;
+    *)
+      # ⛔ `NO-USABLE-CHECKER`, NOT `NO-CHECKER` (#3795 review cycle 4, P2). This branch is also reached
+      # when the file EXISTS and cannot be used (stale, or broken), so the old token asserted an absence
+      # the box contradicted. `diag=[…]` still carries the measured reason.
+      verdict="NO-USABLE-CHECKER" ;;
+  esac
   delivered="UNVERIFIED"
   # ⛔ THE FAILED SEND'S OWN STDERR IS KEPT (#3795 review P2). This branch exists FOR a broken box, so
   # the cause it already holds — `cmux` refusing the send, or a usage error — is the most valuable
@@ -761,8 +848,12 @@ else
   # cycles 2 and 3, P2). `_checker_broken` is non-empty on every path into this branch, so the receipt
   # cannot degrade to `payload checker unavailable: ` with nothing named — which is what a re-derived
   # guard produced when the two copies drifted, and a cause that certifies nothing inside a receipt is
-  # the same defect class as the receipt itself.
-  _cause="payload checker unavailable: $_checker_broken"
+  # the same defect class as the receipt itself. The PREFIX is chosen by which state was measured, for
+  # the same reason the token above is.
+  case "$_checker_broken" in
+    CADENCE_NUDGE_VERIFY_TIMEOUT*) _cause="CADENCE_NUDGE_VERIFY_TIMEOUT rejected: $_checker_broken" ;;
+    *) _cause="payload checker unavailable: $_checker_broken" ;;
+  esac
   # ⛔ ONLY A FAILED SEND'S OUTPUT IS A "CAUSE" (#3795 review P2). `err` captures the send's SUCCESS
   # banner as well as its failures, and appending it unconditionally made the field that exists to
   # carry the cause present `cmux=[OK surface:19 workspace:19]` as one -- so an operator triaging
@@ -793,10 +884,12 @@ fi
 #   tail sentinel: `--timeout 90` PLUS one 45 s read-screen, because the deadline is tested AFTER the
 #   read, plus a final 3 s poll                               = 138 s
 #                                                        TOTAL = 413 s
-# The governing boundary is the 450 s `cadence-timer.sh` interval. The `-mmin +6` (360 s) age bound is
-# NOT the protection it looks like -- this window exceeds it -- which is why the takeover at the top of
-# this file is PID-guarded: a live holder is never raced whatever the clock says, and a dead one is
-# taken over at once. An age-only takeover here produced two heartbeats 5 s apart.
+# The governing boundary is the 450 s `cadence-timer.sh` interval. An age bound alone is NOT the
+# protection it looks like -- this window exceeds any short one -- which is why the takeover at the top
+# of this file checks IDENTITY as well as age: a holder is reclaimed only by the 20-min ceiling (never
+# by age alone), a pid that is provably not this script at the short grace, and an unidentifiable lock
+# not until the ceiling. An age-only takeover here produced two heartbeats 5 s apart; a pid-only one
+# killed the floor outright on a recycled pid.
 #
 # ⛔ AND 413 s IS THE VERIFICATION WINDOW ONLY (#3795 review cycle 4, P2). The lock is taken at the TOP
 # of this file and the pre-send work runs under it too: `goal-state.py` is bounded by its 20 s + 3 s

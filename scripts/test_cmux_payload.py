@@ -1516,8 +1516,12 @@ def test_cadence_nudge_does_not_race_a_live_holder_and_says_so(tmp_path):
         assert not sent.exists(), "raced a live holder and sent a second heartbeat"
         nudges, appended = _new_nudge_lines(state, seed)
         assert not nudges, "a skipped tick stamped a receipt:\n" + appended
-        assert "lock-held" in appended, (
+        assert "lock-skip" in appended, (
             "the skip was silent — an invisible skip is how the floor dies with a clean log:\n" + appended)
+        # The bound on the line is the CEILING: a genuine holder is reclaimed by age alone never, by the
+        # 20-min ceiling only. If this ever reads `bound=6m` the holder arm was re-pointed at the short
+        # grace, which is the mid-run reclaim measured as two receipts 4 s apart.
+        assert "bound=20m" in appended, appended
     finally:
         holder.terminate()
         holder.wait(timeout=10)
@@ -1600,6 +1604,59 @@ def test_cadence_nudge_lock_arms_for_an_unowned_lock(tmp_path):
     r = _run_cadence_nudge(home_b, bindir_b, screen_b, session=sent_b)
     assert r.returncode == 0, r.stdout + r.stderr
     assert sent_b.exists(), "a stale lock was never reclaimed — the floor is wedged"
+
+
+def test_cadence_nudge_holds_an_unidentifiable_lock_to_the_ceiling_not_the_grace(tmp_path):
+    """⛔ A LOCK NOTHING CAN VOUCH FOR MUST OUTLIVE THE SHORT GRACE (#3795 review cycle 3, P2).
+
+    On the arm where the holder cannot be identified (no pid file, an empty/unreadable one, or one
+    left inside the dir), the ONLY thing between a second contender and a live sender is the clock —
+    and the clock must exceed the ~413 s window it protects. With the short 6-min grace here, a holder
+    whose pid write had failed was reclaimed MID-RUN and two receipts landed 4 s apart (measured).
+
+    500 s is the discriminating age: past the 360 s grace, inside the 20-min ceiling.
+    """
+    seed = _seeded_log(600)
+    home, bindir, screen, state = _cadence_home(
+        tmp_path, "the pane shows nothing relevant\n", seed)
+    _lock(state, age_s=500)          # no pid at all — unidentifiable
+    sent = tmp_path / "SENT"
+    r = _run_cadence_nudge(home, bindir, screen, session=sent)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert not sent.exists(), (
+        "an unidentifiable lock was reclaimed at the short grace — a live sender can be raced inside "
+        "its own 413 s window")
+    nudges, appended = _new_nudge_lines(state, seed)
+    assert not nudges, appended
+    assert "lock-skip" in appended and "bound=20m" in appended, appended
+
+
+def test_cadence_nudge_lock_survives_a_concurrent_burst(tmp_path):
+    """⛔ ONE HEARTBEAT FOR A WHOLE BURST (#3795 review cycle 3, P1).
+
+    The reclaim used to be delete-then-create, so two contenders that both judged the lock stale could
+    both end up sending — measured 19 ms apart, and the second also destroyed the live winner's pid
+    file. It is now a rename, which only one contender can win, with an inode check so a contender
+    that lost the DECISION race cannot move a newer, live lock.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    seed = _seeded_log(600)
+    home, bindir, screen, state = _cadence_home(
+        tmp_path, "the pane shows nothing relevant\n", seed)
+    sent = tmp_path / "SENT"
+
+    def once(_i):
+        return _run_cadence_nudge(home, bindir, screen, session=sent)
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(once, range(8)))
+    for r in results:
+        assert r.returncode == 0, r.stdout + r.stderr
+    nudges, appended = _new_nudge_lines(state, seed)
+    assert len(nudges) == 1, (
+        f"{len(nudges)} heartbeats left the box for one due window:\n{appended}")
+    assert "delivered=yes" in nudges[0] or "delivered=" in nudges[0], nudges[0]
 
 
 def test_cadence_nudge_does_not_report_a_prefix_as_delivered(tmp_path):
