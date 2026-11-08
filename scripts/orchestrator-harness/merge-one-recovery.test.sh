@@ -219,13 +219,32 @@ run_merge() {
         *) return 0 ;;
       esac
     }
-    git() { return 0; }
+    git() {
+      # ⛔ A BLANKET `return 0` MADE THE REPORT GATE UNREACHABLE (fresh review, P2): every driven worker
+      # got the gate's 6 abstention, so `merge-one.sh`'s REFUSAL arm was executed by NO test and two
+      # one-token mutants (`|| _lrg_rc=0`, and extracting the block into an uncalled function) left all
+      # three suites green. `report-gate` answers the two calls the gate makes, with a branch the row
+      # chooses; every other invocation keeps the old permissive behaviour. Dedicated env names only,
+      # for the reason in the header: an exported body cannot read the fixture's own variables.
+      case "${FAKE_GIT_MODE:-}" in
+        report-gate)
+          case "$*" in
+            *"rev-parse --git-dir"*) return 0 ;;
+            *"worktree list"*) printf 'worktree %s\nHEAD %s\nbranch refs/heads/%s\n\n' \
+                                 "${FAKE_GIT_WT}" "${FAKE_GIT_HEAD}" "${FAKE_GIT_BRANCH:-fix/x}"; return 0 ;;
+            *) return 0 ;;
+          esac ;;
+        *) return 0 ;;
+      esac
+    }
     export -f pi gh git
     env PATH="$STUBS" HOME="$MRG/home" O="$MRG/o" \
         RAIL_SPY="$MRG/rail-ran" MERGE_SPY="$MRG/merged" CC_RETRY_SECS="${CC_RETRY_SECS:-0}" \
         AI_REVIEW_GATE_KEY="$TEST_GATE_KEY" \
         PI_COUNT="$MRG/pi-count" FAKE_PR="$PR" FAKE_HEAD="$HEAD" \
         FAKE_BODY_FILE="$MRG/pr-body" \
+        FAKE_GIT_MODE="${FAKE_GIT_MODE:-}" FAKE_GIT_WT="${FAKE_GIT_WT:-}" \
+        FAKE_GIT_HEAD="${FAKE_GIT_HEAD:-}" FAKE_GIT_BRANCH="${FAKE_GIT_BRANCH:-fix/x}" \
         FAKE_LIVE_HEAD="${FAKE_LIVE_HEAD:-}" FAKE_HEADREADS="$MRG/headreads" \
         FAKE_CC_TOKEN="${FAKE_CC_TOKEN:-unknown}" FAKE_CC_RC="${FAKE_CC_RC:-0}" \
         FAKE_CC_STDERR="${FAKE_CC_STDERR:-}" \
@@ -789,6 +808,37 @@ mkmrg; mkrecorder; write_record "$OLDH" clean
 out="$(run_merge FAKE_CC_TOKEN=fresh FAKE_CC_RC=1 FAKE_MINT_MARKER=0 FAKE_LIVE_HEAD="$OLDH")"
 rc=0; grep -qF 'FRESH review at head' "$MRG/o/state/parkreason-$PR" 2>/dev/null || { rc=1; note "parkreason=$(cat "$MRG/o/state/parkreason-$PR" 2>/dev/null)"; }
 ck "…and the PAID path still says a FRESH review is owed (the branch did not flatten the two arms)" $rc
+
+# ══ THE LANE REPORT GATE ON THE BACKSTOP CARRIER ═════════════════════════════════════════════════
+# ⛔ merge-one.sh IS THE `$O`-PINNED BACKSTOP that chain-merge.sh / fix-one.sh reach, and until now no
+# test drove its gate at all (see the git() stub comment). These two rows pin the OBSERVABLE outcome —
+# exit 9 + the merge-log line + no park + no merge for a refusal, and the audit string (never
+# "verified") + a continuing run for the 6 abstention — so a wrapper, a coerced rc, or an altered
+# abstention arm reds here rather than passing on syntax.
+mkmrg; mkrecorder; write_record "$HEAD" clean
+mkdir -p "$MRG/repo/tools"
+printf '#!/usr/bin/env python3\nimport json\nprint(json.dumps({"ok":True,"rules":[],"suites":1,"failing_suites":0,"head":"%s","head_moved_since_write":False}))\n' "$HEAD" > "$MRG/repo/tools/worktree_report.py"
+out="$(run_merge FAKE_GIT_MODE=report-gate FAKE_GIT_WT="$MRG/repo" FAKE_GIT_HEAD="$HEAD" FAKE_GIT_BRANCH=fix/x)"
+rc=$?
+rc2=0; [ "$rc" = 9 ] || { rc2=1; note "rc=$rc (expected 9); log: $(tail -3 "$MRG/o/logs/merge-$PR.log")"; }
+ck "an ABSENT lane report REFUSES the merge on merge-one.sh (exit 9)" $rc2
+rc2=0; log_has 'LANE REPORT REFUSED' || { rc2=1; note "log: $(tail -3 "$MRG/o/logs/merge-$PR.log")"; }
+ck "…and the refusal is recorded in the merge log" $rc2
+rc2=0; no_park || { rc2=1; note "parkreason=$(cat "$MRG/o/state/parkreason-$PR" 2>/dev/null)"; }
+ck "…with NO park (the remedy is a re-run at the same head)" $rc2
+rc2=0; ! merge_ran || { rc2=1; note "a merge ran: $(merge_ran_whence)"; }
+ck "…and nothing merged" $rc2
+
+mkmrg; mkrecorder; write_record "$HEAD" clean
+mkdir -p "$MRG/repo/tools"
+printf '#!/usr/bin/env python3\nimport json\nprint(json.dumps({"ok":True,"rules":[],"suites":1,"failing_suites":0,"head":"%s","head_moved_since_write":False}))\n' "$HEAD" > "$MRG/repo/tools/worktree_report.py"
+out="$(run_merge FAKE_GIT_MODE=report-gate FAKE_GIT_WT="$MRG/repo" FAKE_GIT_HEAD="$HEAD" FAKE_GIT_BRANCH=other/x)"
+rc=$?
+rc2=0; log_has 'LANE REPORT NOT ENFORCED' || { rc2=1; note "log: $(tail -3 "$MRG/o/logs/merge-$PR.log")"; }
+ck "NO-WORKTREE (6) on merge-one.sh is LOGGED as NOT ENFORCED" $rc2
+rc2=0; ! grep -qiE 'was verified|is verified|verified at head' "$MRG/o/logs/merge-$PR.log" || { rc2=1; note "the log claims a verification"; }
+ck "…and never claims the report was verified" $rc2
+ck "…and the worker continues past the gate (no exit 9)" $([ "$rc" != 9 ] && echo 0 || echo 1)
 
 echo
 echo "==> $pass passed, $fail failed"

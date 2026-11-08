@@ -1196,7 +1196,16 @@ _lrg_rc=0; _lrg_out=""
 # consumer, with no `parked-<PR>` written (defeating the #1717 mechanism). The other carrier already
 # applies this principle (lane-merge.sh skips the gate on an empty branch so the actionable refusal is
 # not outranked). A head the gate cannot bind is not a report defect.
-if [ -n "${HEAD:-}" ] && [ "${#HEAD}" -eq 40 ]; then
+# ⛔ 40 HEX CHARACTERS, NOT 40 CHARACTERS (fresh review, P2). The guard decides "is this a report state
+# or a gh state"; a 40-char non-sha would still be handed to the gate and relabelled as a report fault —
+# the exact misclassification this guard removes. This is the same shape test `head_ok` uses below, so
+# the file has ONE definition of a bindable head.
+_lrg_head_bindable=0
+case "${HEAD:-}" in
+  ''|*[!0-9a-f]*) : ;;
+  *) [ "${#HEAD}" -eq 40 ] && _lrg_head_bindable=1 ;;
+esac
+if [ "$_lrg_head_bindable" = 1 ]; then
 _lrg_out="$(lane_report_gate "$REPO" "$BR" "${HEAD:-}" 2>&1)" || _lrg_rc=$?
 [ -n "$_lrg_out" ] && echo "[merge $PR] $_lrg_out" >> "$L.log"
 case "$_lrg_rc" in

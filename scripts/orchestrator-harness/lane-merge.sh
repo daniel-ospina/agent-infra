@@ -1285,7 +1285,7 @@ done
 # it was not given. Running it first would turn that exit 2 into a `FIX_REQUIRED` telling the lane to
 # fix CODE over a caller error. The empty-branch arm still refuses in the gate itself, which is where
 # merge-one.sh / chain-merge.sh / fix-one.sh reach it.
-_lrg_rc=0; _lrg_out=""
+_lrg_rc=0; _lrg_out=""; _lrg_skip=0
 if [ -z "${RESOLVED_BR// /}" ]; then
   : # launch_chain owns the refusal below; nothing to gate, and no chain will launch.
 elif [ -n "$LANE_REPORT_GATE" ]; then
@@ -1293,15 +1293,24 @@ elif [ -n "$LANE_REPORT_GATE" ]; then
   # `tools/worktree_report.py` from the repo it is handed, and `$(pwd)` here is the LANE's own
   # worktree on the branch under review — so a lane could edit the grader that grades it. A trusted
   # (main) checkout is resolved here, once, exactly as `launch_chain` resolves it, so the gate's
-  # instrument comes from the tree nobody is merging. When no main worktree is reachable the lane
-  # checkout is passed (pre-existing behaviour): the gate then abstains (6) rather than passing.
+  # instrument comes from the tree nobody is merging.
+  # ⛔ AND WHEN THERE IS NO TRUSTED CHECKOUT, THE GATE DOES NOT RUN AT ALL (fresh review, P2). Falling
+  # back to the lane checkout made the gate source its verifier from the tree under review and return
+  # a self-graded PASS — the bypass this block exists to close, re-reachable on the fallback path. It
+  # is skipped instead, and `launch_chain` refuses immediately below (it resolves the same checkout and
+  # BLOCKs with the actionable remedy), so no merge can follow a skipped check.
   _lrg_repo="${REPO_PATH:-$(pwd)}"
   _lrg_trusted="$(resolve_trusted_checkout "$_lrg_repo" 2>/dev/null)" || _lrg_trusted=""
-  [ -n "$_lrg_trusted" ] && _lrg_repo="$_lrg_trusted"
-  # ONE run, captured: the verdict line is the diagnosis, and running the gate twice to quote it would
-  # pay two git/python invocations per merge for a message.
-  _lrg_out="$(lane_report_gate "$_lrg_repo" "$RESOLVED_BR" "$HEAD" 2>&1)" || _lrg_rc=$?
-  [ -n "$_lrg_out" ] && log_line "$_lrg_out"
+  if [ -z "$_lrg_trusted" ]; then
+    _lrg_skip=1
+    log_line "lane-report: NOT CHECKED — no trusted (main) checkout to source the verifier from (the only reachable copy is the tree under review); launch_chain will refuse this merge."
+  else
+    _lrg_repo="$_lrg_trusted"
+    # ONE run, captured: the verdict line is the diagnosis, and running the gate twice to quote it would
+    # pay two git/python invocations per merge for a message.
+    _lrg_out="$(lane_report_gate "$_lrg_repo" "$RESOLVED_BR" "$HEAD" 2>&1)" || _lrg_rc=$?
+    [ -n "$_lrg_out" ] && log_line "$_lrg_out"
+  fi
 else
   log_line "lane-report: NOT CHECKED — lane-report-gate.sh is not deployed (looked beside this script and in \$O=$O). The mandatory lane report (#2977) is NOT verified on this box; redeploy the harness."
   _lrg_rc=5
@@ -1309,7 +1318,7 @@ fi
 # ⛔ THE CASE RUNS ONLY WHEN THE GATE RAN: with no branch, `_lrg_rc` is 0 and this block would CLAIM a
 # verification that never happened. The branchless path falls straight through to `launch_chain`, which
 # refuses before anything merges.
-if [ -n "${RESOLVED_BR// /}" ]; then
+if [ -n "${RESOLVED_BR// /}" ] && [ "$_lrg_skip" = 0 ]; then
   case "$_lrg_rc" in
     0)  log_line "lane-report: verified at head ${HEAD:0:12} — the report describes the tree being merged" ;;
     5|6) log_line "lane-report: NOT ENFORCED here (rc=$_lrg_rc) — an abstention, not a green: this box/repo cannot carry the check" ;;

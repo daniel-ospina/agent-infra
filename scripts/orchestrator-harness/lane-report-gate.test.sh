@@ -408,24 +408,49 @@ fi
 # much of the queue is actually covered" and are "never counted as a green". Nothing pinned that: both
 # carriers' abstention arms could be made SILENT, or made to print "verified at head …", with every
 # suite green. Pin the audit half here (the reachability half is the nesting row above).
-if grep -qE 'abstention, not a green' "$LANE_MERGE" && ! grep -qE 'verified at head .*5\|6' "$LANE_MERGE"; then
-  ok "lane-merge.sh's 5/6 arm still SAYS abstention and never claims a verification"
+# ⛔ ASSERT THE ARM LINE ITSELF, NOT A FILE-WIDE REGEX (fresh review, P2): `grep -E 'verified at head .*5\|6'`
+# reads `\|` as a LITERAL pipe, so it matched nothing and the negative half was inert. Extracting the
+# `5|6)` arm and testing THAT line is the only version that can fail.
+# ⛔ READ THE LINE ONCE INTO A VARIABLE AND TEST IT WITH A HERE-STRING: `sed -n Np file | grep -q` is
+# itself a SIGPIPE false-negative (the quiet grep exits on its first match and sed dies of SIGPIPE
+# under pipefail), so the assertion meant to protect the audit string could silently invert.
+_lm56="$(grep -nE '^[[:space:]]*5\|6\)' "$LANE_MERGE" | head -1 | cut -d: -f1)"
+_lm56_line=""; [ -n "$_lm56" ] && _lm56_line="$(sed -n "${_lm56}p" "$LANE_MERGE")"
+if [ -n "$_lm56" ] && grep -qE 'abstention, not a green' <<<"$_lm56_line" \
+   && ! grep -qiE 'was verified|is verified|verified at head' <<<"$_lm56_line"; then
+  ok "lane-merge.sh's 5/6 arm SAYS abstention and does not claim a verification"
 else
-  bad "lane-merge.sh's abstention arm no longer names itself (or claims a verification)"
+  bad "lane-merge.sh's abstention arm no longer names itself, or claims a verification"
 fi
-if grep -qE 'LANE REPORT NOT ENFORCED' "$MERGE_ONE" && grep -qE 'ABSTENTION, not a green' "$MERGE_ONE"; then
-  ok "merge-one.sh's 5/6 arm still records NOT ENFORCED / ABSTENTION for the merge log"
+_co56="$(grep -nE '^[[:space:]]*5\|6\)' "$MERGE_ONE" | head -1 | cut -d: -f1)"
+_co56_line=""; [ -n "$_co56" ] && _co56_line="$(sed -n "${_co56}p" "$MERGE_ONE")"
+if [ -n "$_co56" ] && grep -qE 'NOT ENFORCED' <<<"$_co56_line" \
+   && grep -qE 'ABSTENTION, not a green' <<<"$_co56_line" \
+   && ! grep -qiE 'was verified|is verified|verified at head' <<<"$_co56_line"; then
+  ok "merge-one.sh's 5/6 arm still records NOT ENFORCED / ABSTENTION and claims no verification"
 else
-  bad "merge-one.sh's abstention arm no longer records the audit string"
+  bad "merge-one.sh's abstention arm no longer records the audit string (or claims a verification)"
 fi
 # ⛔ A HEAD THE GATE CANNOT BIND IS NOT A REPORT DEFECT (fresh review, P2). `HEAD` comes from a swallowed
 # API read, so one gh blip would otherwise be RELABELLED as a lane-report fault: exit 9 → FIX_REQUIRED,
 # telling the lane to re-run suites, with no park — while the file's own arm for that state (park +
 # exit 3) sits DOWNSTREAM of the gate. The gate must run only on a 40-hex head.
-if grep -qE '^if \[ -n "\$\{HEAD:-\}" \] && \[ "\$\{#HEAD\}" -eq 40 \]; then$' "$MERGE_ONE"; then
-  ok "merge-one.sh gates only on a bindable 40-hex head (a transient gh failure parks, it is not a report fault)"
+if grep -qE '^case "\$\{HEAD:-\}" in$' "$MERGE_ONE" && grep -qE '^  \*\) \[ "\$\{#HEAD\}" -eq 40 \] && _lrg_head_bindable=1 ;;$' "$MERGE_ONE" \
+   && grep -qE '^if \[ "\$\{?_lrg_head_bindable\}?" = 1 \]; then$' "$MERGE_ONE"; then
+  ok "merge-one.sh gates only on a bindable 40-HEX head (gh's own shape test; a transient failure parks, it is not a report fault)"
 else
-  bad "merge-one.sh runs the report gate on an empty/malformed head — a gh blip becomes a FIX_REQUIRED report fault"
+  bad "merge-one.sh gates on an empty/malformed head — a gh blip (or a 40-char non-sha) becomes a FIX_REQUIRED report fault"
+fi
+
+# ⛔ THE FALLBACK MUST FAIL CLOSED, NOT SELF-GRADE (fresh review, P2). When no trusted (main) checkout
+# resolves, the only reachable copy of `tools/worktree_report.py` is the tree under review — so passing
+# the lane checkout makes the gate PASS on a grader the graded tree supplied. The gate is SKIPPED there
+# and `launch_chain` refuses immediately below. (No merge follows today; the danger is a future edit
+# that softens that refusal.)
+if grep -qE '^    _lrg_skip=1$' "$LANE_MERGE" && grep -qE 'no trusted \(main\) checkout to source the verifier from' "$LANE_MERGE"; then
+  ok "lane-merge.sh SKIPS the gate (and lets launch_chain refuse) when no trusted checkout resolves — it never self-grades"
+else
+  bad "lane-merge.sh falls back to the lane checkout when no trusted checkout resolves — the graded tree would supply its own verifier"
 fi
 
 # The deployed set: a $O without the file makes every caller's `lane_report_gate` an unbound command.
