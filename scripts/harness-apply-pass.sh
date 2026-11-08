@@ -458,6 +458,14 @@ publish_farm_rows() {   # $1 body, $2 header note → sets REC_FARM_ROWS, FARM_R
     # would record a path that holds no list. The `[ ! -d ]` pre-check refuses that state UP FRONT
     # (replacing it with `[ -n … ]` strands the temp inside the directory and reds T24r); the trailing
     # `[ -f ]` is DEFENCE IN DEPTH for the concurrent case and is stated as such (#3442).
+    # ⛔ AND IT IS UNPINNED BY CONSTRUCTION — this file's second DECLARED inert-defence site (the first
+    # is `$FARM_DEST_REAL`/`$HERE_REAL` on the `CDPATH=` legs, `:167-171`). Measured (review round 25):
+    # deleting `&& [ -f "$FARM_ROWS_FILE" ]` leaves the suite green. That is not an oversight — the only
+    # state it can catch is a race (something replacing the published path with a directory between the
+    # `rename` and this test), and a fixture cannot produce that race deterministically without stubbing
+    # `mv`. It is kept because it is cheap and it is the one post-condition that cannot be forged, and it
+    # is DECLARED here so that "every new guard has an attributable mutant" is not left standing as a
+    # claim this file contradicts.
     FARM_ROWS_OK=0
     # ⛔ AN EMPTY BODY WRITES NO BODY LINE (review round 15, measured): `printf '%s\n' ""` emits one
     # BLANK line, so the mute-instrument artifact was a header plus a stray empty row — a reader sizing
@@ -1536,19 +1544,29 @@ if [ "$FARM_CHECK_ON" = "1" ]; then
         # counts answers a narrower question than the one being asked.)
         FARM_VERDICT0="$(printf '%s\n' "$FARM_OUT" | sed -n '/DRIFT — /{p;q;}')"
         # ⛔ AND A SILENT rc=0 IS NOT A MATCH (review round 24). The instrument always prints a summary,
-        # so a checker that exits 0 with NO output produced no evidence at all.
-        FARM_SILENT0=0
-        [ -n "$(printf '%s\n' "$FARM_OUT" | grep -v '^[[:space:]]*$' || true)" ] || FARM_SILENT0=1
+        # so a checker that exits 0 with NO output produced no evidence at all. ⛔ AND NEITHER IS AN rc=0
+        # WHOSE OUTPUT CARRIES NO VERDICT (review round 25, measured): this check used to test only for
+        # an EMPTY output, so the wrapper shape this file's own comment names —
+        # `bash inner "$@" 2>&1 | tee -a log` — still certified a match when `inner` was MISSING, because
+        # `tee` supplies the 0 and the output is bash's `No such file or directory` line: non-empty,
+        # verdictless, and recorded `farm_rows=none` / `farm_n=0` / `farm: ok` — the values the doc
+        # defines as "the farm matched", over a farm that was never graded, with `--print-status`
+        # answering `status=ok`. A match is PROVEN by the instrument's own `OK —` line
+        # (`check-farm-drift.sh:706`), which it prints before exiting; anything else is a grade nobody
+        # can read, and it fails CLOSED. This SUBSUMES the emptiness test (empty output carries no
+        # verdict either), so the two are one condition rather than two that can drift apart.
+        # Case-insensitive because the suite's clean stubs print `check-farm-drift: ok — 0 stale …`.
+        FARM_OK0="$(printf '%s\n' "$FARM_OUT" | grep -im1 'OK — ')"
         case "$FARM_RC" in
             0)
-                if [ "$FARM_SILENT0" = 1 ]; then
-                    # ⛔ A SILENT CHECKER CANNOT CERTIFY A MATCH (review round 24). The instrument always
-                    # prints a summary; an rc=0 with NO output is a seam that produced no evidence, and
-                    # `farm: ok` over no evidence is the same false pass as `farm: ok` over a drift report.
+                if [ -z "$FARM_OK0" ] && [ "$FARM_NROWS0" -eq 0 ] && [ -z "$FARM_VERDICT0" ]; then
+                    # ⛔ A CHECKER THAT PROVED NOTHING CANNOT CERTIFY A MATCH. Its own arm, because its
+                    # own sentence: "reports drift" is false here, and a reader sent looking for drift
+                    # rows that were never printed is a second defect.
                     REC_ACTION=farm-unknown
-                    REC_REMEDY="the checker exited 0 printing NOTHING — point HARNESS_APPLY_FARM_CHECKER at check-farm-drift.sh itself (a wrapper or a broken copy that prints no report cannot certify a match), then re-run"
-                    log_line "farm: UNKNOWN — the checker exited 0 but printed NO report, so nothing was graded"
-                    finish 0 24 "farm: UNKNOWN (check-farm-drift rc=0) — the checker printed NOTHING, so $FARM_DEST was never graded: a silent exit is not a match. Fix the seam (HARNESS_APPLY_FARM_CHECKER) and re-run"
+                    REC_REMEDY="the checker exited 0 without printing the instrument's 'OK —' line — point HARNESS_APPLY_FARM_CHECKER at check-farm-drift.sh itself (a wrapper or a broken copy that prints no verdict cannot certify a match), then re-run"
+                    log_line "farm: UNKNOWN — the checker exited 0 but printed NO verdict line (neither 'OK —' nor 'DRIFT —'), so nothing it printed can certify a match"
+                    finish 0 24 "farm: UNKNOWN (check-farm-drift rc=0) — no readable grade (see farm_rows=), so a status of 0 is not a match for $FARM_DEST against $REF: the checker printed no verdict line at all"
                 fi
                 if [ "$FARM_NROWS0" -gt 0 ] || [ -n "$FARM_VERDICT0" ]; then
                     REC_ACTION=farm-unknown

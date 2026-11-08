@@ -245,8 +245,13 @@ would record `farm: ok` / `farm_rows=none` over two files the farm owes. The ins
 match, so the verdict line by itself is the contradiction. The row half uses the SAME predicate and the
 SAME three-label summary proof as the drift arm (one vocabulary, so the guard can never be weaker than
 the branch it guards), and a checker that exits 0 printing **nothing** is refused too — the instrument
-always prints a summary, so a silent exit produced no evidence and is not a match. A wrapper over a
-genuinely matching farm still passes, and prose/summary lines are never read as rows (the class token
+always prints a summary, so a silent exit produced no evidence and is not a match. ⛔ **And output being
+non-empty is not a report either:** a match is PROVEN by the instrument's own `OK —` line, so an `rc=0`
+whose output carries **no verdict** — the `bash inner "$@" 2>&1 | tee -a log` wrapper whose `inner` is
+missing, where `tee` supplies the 0 and the only output is bash's error line — is `farm-unknown`, never
+`farm: ok`. Without that, `farm_rows=none` / `farm_n=0` would certify a farm that was never graded and
+`--print-status` would answer `status=ok` for it. A wrapper over a genuinely matching farm still passes
+(it prints the instrument's verdict), and prose/summary lines are never read as rows (the class token
 must END the line).
 
 `farm_rows=<path>` is ALSO written on `action=farm-unknown` — on the arm where the instrument gives up
@@ -470,7 +475,7 @@ checkout can use the documented hatch. The same interaction is recorded for
 
 ## Tests
 
-`scripts/harness-apply-timer.test.sh` — 501 assertions, run by the
+`scripts/harness-apply-timer.test.sh` — 504 assertions, run by the
 `harness-apply-timer` shard of `run-bash-shards.sh`:
 
 | | |

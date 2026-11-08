@@ -2196,10 +2196,30 @@ printf '#!/usr/bin/env bash\nexit 0\n' >"$T/t24au/mute-ok.sh"
 chmod +x "$T/t24au/mute-ok.sh"
 OUT="$(HARNESS_APPLY_FARM_CHECKER="$T/t24au/mute-ok.sh" run_pass "$T/t24au" 2>&1)"; RC=$?
 assert_eq "$RC" "24" "T24 control: a SILENT rc=0 checker is RED (24) — a silent exit is not a match"
-assert_contains "$OUT" "printed NOTHING" "T24 control: and the line says the checker printed no report"
+assert_contains "$OUT" "printed NO verdict line" "T24 control: and the line says the checker printed no verdict, not that it reported drift"
 assert_absent "$OUT" "farm: ok" "T24 control: so the matched-farm sentence is never printed over no evidence"
 assert_contains "$(grep '^remedy=' "$T/t24au/state/harness-apply.status" 2>/dev/null || true)" "HARNESS_APPLY_FARM_CHECKER" \
     "T24 control: and remedy= names the seam to fix"
+
+# ⛔ ...AND THE OUTPUT BEING NON-EMPTY DOES NOT MAKE IT A REPORT (review round 25, measured). The
+# emptiness test above is not enough: the wrapper shape this file's own comment names —
+# `bash inner "$@" 2>&1 | tee -a log` — certifies a match when `inner` is MISSING, because `tee`
+# supplies the 0 and the output is bash's `No such file or directory` line: non-empty, verdictless, and
+# recorded `farm_rows=none` / `farm_n=0` / `farm: ok` — the values that mean "the farm matched" — over a
+# farm that was never graded, with `--print-status` answering `status=ok`. A match is PROVEN by the
+# instrument's own `OK —`, so this fixture (a) must red for the same reason t24au does, and (b) is a
+# different reachable path than an empty output.
+mk_origin t24aw; mk_clone t24aw
+REPO_P="$CLONE"; MODE_P=sync
+mkdir -p "$T/t24aw/home/.pi/agent/scripts" "$T/t24aw/probe"
+printf 'x\n' >"$T/t24aw/home/.pi/agent/scripts/pr-doctor.py"
+printf '#!/usr/bin/env bash\nbash "$(dirname "$0")/inner-does-not-exist.sh" "$@" 2>&1 | tee -a "$(dirname "$0")/log.txt"\n' >"$T/t24aw/probe/wrap.sh"
+chmod +x "$T/t24aw/probe/wrap.sh"
+OUT="$(HARNESS_APPLY_FARM_CHECKER="$T/t24aw/probe/wrap.sh" run_pass "$T/t24aw" 2>&1)"; RC=$?
+assert_eq "$RC" "24" "T24 control: a wrapper whose inner script is MISSING is RED (24), not a match won by tee's exit status"
+assert_contains "$OUT" "printed NO verdict line" "T24 control: and it names the missing VERDICT rather than treating the wrapper's error line as a report"
+assert_absent "$(grep '^farm_rows=' "$T/t24aw/state/harness-apply.status" 2>/dev/null || true)" "farm_rows=none" \
+    "T24 control: and it never records none, which would certify a match over a farm that was never graded"
 
 # ⛔ A PER-FILE ROW CONTAINING THE WORD DRIFT IS NOT THE SUMMARY (review round 24, measured:
 # `grep -m1 'DRIFT'` took `DRIFT-log.txt | a | b | STALE` as the summary line, so the real summary two
