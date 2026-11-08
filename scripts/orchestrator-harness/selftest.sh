@@ -3085,7 +3085,17 @@ TBL
   ck "#3793: an UNSET window resolves the SHIPPED default, so a flat reading across a 3600 s gap is IDLE" $rc
   # …and the DECLARATION's own default is a SECOND literal the extracted unit never sees (`reapw_prelude`
   # extracts FUNCTIONS only, so `_WREAP_WINDOW_MIN="${WREAP_WINDOW_MIN:-6}"` never enters `$TMP/reapw.sh`),
-  # so it is pinned by SHAPE: the shipped window is 6 minutes. Both literals move together or this reds.
+  # …and the DECLARATION's own default is a SECOND literal the extracted unit never sees (`reapw_prelude`
+  # extracts FUNCTIONS only, so `_WREAP_WINDOW_MIN="${WREAP_WINDOW_MIN:-6}"` never enters `$TMP/reapw.sh`),
+  # so it is pinned by SHAPE: the shipped window is 6 minutes. ⛔ WHAT THIS ARM DOES NOT DO (review round 1):
+  # the literal `6` IS the grep pattern, so it pins only that the line still reads `:-6}` — a move of the
+  # declaration forces this pattern to be edited in the same commit, and that edit is the tripwire, not an
+  # invariant. NOTHING here ties the declaration (`orch-loop.sh:2183`) to the consumer fallback (`:2357`),
+  # which the arm ABOVE brackets only at `<= 60` min (its baseline is 3600 s, i.e. `mmin` = 60); and two
+  # further sites carry the same default with nothing reading them at all (`:2184`'s `_WREAP_WINDOW_MIN=6`
+  # and `:2485`'s operator-facing `window=${_WREAP_WINDOW_MIN:-6}m`). So: the declaration's exact `6` and the
+  # consumer's `<= 60` are pinned, their EQUALITY is not, and `:2184`/`:2485` are unread. Tracked in
+  # #3804, filed with this PR, rather than claimed as covered.
   grep -qF '_WREAP_WINDOW_MIN="${WREAP_WINDOW_MIN:-6}"' "$LOOP" && rc=0 || rc=1
   ck "#3793: the reaper's shipped WINDOW default is 6 min (the DECLARATION, not just its consumer's fallback)" $rc
   vrun "$(date +%s)" "" 100 0 alive; [ "$?" = "2" ] && rc=0 || rc=1
