@@ -2815,7 +2815,20 @@ cmux() {
 tmux() {
   case "${1:-}" in
     ls) for _s in fix-77; do case "$KILLED" in *"$_s"*) continue ;; esac; printf '%s\n' "$_s"; done ;;
-    list-panes) echo 4242 ;;
+    # ⛔ THE STUB ANSWERS NO PANE PID AT ALL — FOR ANY NAME (measured 2026-11-08, the reason this shard
+    # was red in CI and green on a dev box on an UNCHANGED commit). `_wreap_pane_pid` SEEDS the pid that
+    # #2104's `_wreap_cpu` counts as the worker and sums the subtree of, so a stub that FABRICATES a pid
+    # hands the verdict to whatever process the HOST happens to have at that number. Two measured costs
+    # of the fabricating stub, both `bash-suites`-red in CI behind a differently-named row:
+    #   • `fix-77` (the PANE-GONE row): a stranger at pid 4242 made `matched` 1, the verdict stopped
+    #     being "surface PROVEN GONE", and the corpse was SPARED — the job log reads `killed: []`.
+    #   • `merge-999` (the GNU-stat row, a `kind=terminal` worker that has no pane at all): the same
+    #     stranger was summed into that worker's CPU, so a flat worker read as "burning" and the drive
+    #     got `closed=''`.
+    # A fixture must not name a pid it does not own, and "no tmux session for this name" is exactly what a
+    # `kind=terminal` record and a PANE-GONE record both mean. Arms that DO want a pane pid set it in
+    # their own `tmux()` stub (`$BUSYPID`), which is where the identity belongs.
+    list-panes) : ;;
     kill-session) KILLED="$KILLED ${3#=}" ;;
   esac
   return 0
@@ -2827,6 +2840,42 @@ SH
 # 2026-10-12 while the caps (which count SESSIONS) reported the slot as busy.
 grep -q '^  reap_stale_workers$' "$LOOP" && rc=0 || rc=1
 ck "the reaper runs every cycle" $rc
+# ⛔ ONE HOME FOR THE REAPER'S DEPENDENCY SET (agent-infra#2104). This list has now been edited four
+# times — `file_mtime_epoch` (#1702), `worker_log_name` (2026-11-06), and the #2104 liveness probe's
+# four helpers — and EVERY omission produced a SILENT failure rather than an error: the missing
+# helper makes a `$( )` return empty, a guard swallows the result, and the reaper then either skips
+# every record or (for the probe) spares every one while still exiting 0. Keeping the list in one
+# function is what makes the next addition a one-line edit instead of a hunt through two extractors.
+# Nothing here sets a constant: the probe's `_WREAP_TOL_CS` / `_WREAP_WINDOW` are read through
+# `${X:-default}` everywhere, so an older `$O` copy that lacks them still behaves as documented.
+# ⛔ A FUNCTION-SHAPED EXTRACTOR, NOT A `sed` LINE RANGE (review of PR #3756, P3 — measured). The
+# previous `sed -n '/^_wreap_ps() {/,/^}/p'` never closed on a ONE-LINE definition, so it ran on to the
+# next function's `}` and the prelude emitted `_wreap_cpu` and `_wreap_verdict` TWICE (defs at 28/72 and
+# 119/136). Harmless at run time and fatal to the non-vacuity discipline this file depends on: a mutation
+# applied to the first copy was silently replaced by the unmutated second. This stops at the definition's
+# own closing line whether it is `}` on its own line or the whole function on one line.
+_reapw_fn() { # <loopfile> <fn-name>
+  awk -v n="$2" '
+    $0 ~ ("^" n "\\(\\) \\{") { p = 1 }
+    p { print }
+    p && ($0 == "}" || $0 ~ ("^" n "\\(\\) \\{.*\\}$")) { exit }
+  ' "$1"
+}
+reapw_prelude() { # <loopfile> -> the shipped helpers, in dependency order
+  local L="$1"
+  grep -m1 '^is_num() {' "$L"
+  _reapw_fn "$L" file_mtime_epoch
+  _reapw_fn "$L" worker_log_name
+  _reapw_fn "$L" _wreap_ps
+  _reapw_fn "$L" _wreap_cpu
+  _reapw_fn "$L" _wreap_patterns
+  _reapw_fn "$L" _wreap_pane_pid
+  _reapw_fn "$L" _wreap_sample_file
+  _reapw_fn "$L" _wreap_prev
+  _reapw_fn "$L" _wreap_note
+  _reapw_fn "$L" _wreap_forget
+  _reapw_fn "$L" _wreap_verdict
+}
 sed -n '/^reap_stale_workers() {/,/^}/p' "$LOOP" > "$TMP/reapw-body.sh"
 # The reaper now delegates the mtime probe to the shipped portable helper (#1702), so its unit is
 # the helper PLUS the reaper. Extracting the reaper alone leaves file_mtime_epoch undefined and the
@@ -2839,8 +2888,9 @@ sed -n '/^reap_stale_workers() {/,/^}/p' "$LOOP" > "$TMP/reapw-body.sh"
 # DIRECTORY — so `[ -f "$f" ] || continue` skipped every record and the reaper silently reaped
 # nothing: the same "helper missing ⇒ the guard swallows everything" failure this prelude's own
 # comment records for `file_mtime_epoch`. Adding a call to the reaper means adding it here.
-{ grep -m1 '^is_num() {' "$LOOP"; sed -n '/^file_mtime_epoch() {/,/^}/p' "$LOOP"; sed -n '/^worker_log_name() {/,/^}/p' "$LOOP"; cat "$TMP/reapw-body.sh"; } > "$TMP/reapw.sh"
-if need "$TMP/reapw.sh" "reap_stale_workers() and its file_mtime_epoch() helper are extracted from the shipped loop"; then
+reapw_prelude "$LOOP" > "$TMP/reapw.sh"
+cat "$TMP/reapw-body.sh" >> "$TMP/reapw.sh"
+if need "$TMP/reapw.sh" "reap_stale_workers() and its helpers are extracted from the shipped loop"; then
   mkdir -p "$TMP/RW/logs" "$TMP/RW/state"
   : > "$TMP/RW/logs/merge-999.log"; touch -t 202601010000 "$TMP/RW/logs/merge-999.log"
   : > "$TMP/RW/logs/fix-77.log";   touch -t 202601010000 "$TMP/RW/logs/fix-77.log"
@@ -2848,34 +2898,432 @@ if need "$TMP/reapw.sh" "reap_stale_workers() and its file_mtime_epoch() helper 
   # The launcher's own records: two durable terminals (one stale, one fresh) and one LEGACY tmux
   # worker. All three answers come from the shipped census, which is the point — the two kinds share
   # one table, so a reaper that still looked for tmux sessions would reap neither terminal.
-  printf 'kind=terminal\nid=term_merge-999\nworkspace=ws_merge-999\n' > "$TMP/RW/state/worker-merge-999"
-  printf 'kind=terminal\nid=term_merge-100\nworkspace=ws_merge-100\n' > "$TMP/RW/state/worker-merge-100"
+  printf 'kind=terminal\nid=term_merge-999\nworkspace=ws_merge-999\ncwd=/tmp\n' > "$TMP/RW/state/worker-merge-999"
+  printf 'kind=terminal\nid=term_merge-100\nworkspace=ws_merge-100\ncwd=/tmp\n' > "$TMP/RW/state/worker-merge-100"
   printf 'kind=tmux\ncwd=/tmp\n' > "$TMP/RW/state/worker-fix-77"
+  # ⛔ THE PREVIOUS SAMPLE IS THE WINDOW (#2104). A single pass has no baseline, so the gate spares —
+  # correctly: "no CPU delta" needs two readings. `fix-77` gets one here, which is the state a hung
+  # worker is in on its second pass; `merge-999` deliberately gets NONE, because that arm is about an
+  # unidentifiable worker on a LIVE surface and the spare must come from the verdict, not from a
+  # missing baseline.
+  # ⛔ AND NO DEAD LINE BESIDE IT (review of PR #3756, P3). A `printf '1 %s 1\n' "…" > /dev/null` used to
+  # sit here — its `%s` consumed the fixture's own path and the result went to /dev/null, a no-op in the
+  # block whose subject is "a test that cannot fail is not a gate". Removed rather than left as decoration.
+  printf '1 0 1\n' > "$TMP/RW/state/wreap-fix-77"
   # shellcheck disable=SC1090
   . "$TMP/wtstub.sh"
   LOG="$TMP/RW/rw.log"; O="$TMP/RW"; WT_DIR="$TMP/RW/state"; STALE_MIN=1; WT_TABLE_TTL=0
+  _WREAP_WINDOW_MIN=0
   # shellcheck disable=SC1090
   . "$HERE/worker-terminal.sh"
   # shellcheck disable=SC1090
   . "$TMP/reapw.sh"
   reap_stale_workers
-  case "$CLOSED" in *term_merge-999*) rc=0 ;; *) rc=1; echo "      closed: [$CLOSED]";; esac
-  ck "shipped reaper closes the DURABLE TERMINAL whose log has gone stale" $rc
+  # ⛔ THE CONTRACT CHANGED, DELIBERATELY, AND THE CHANGE IS THE FIX (review of PR #3756, P1). A stale
+  # record whose SURFACE IS STILL ALIVE and whose process tree this probe could not identify is now
+  # SPARED: "the probe saw nothing" and "the worker is gone" are different facts, and only the launcher's
+  # own census may say which. Killing there is what destroyed the 2026-10-19 lane.
+  case "$CLOSED" in *term_merge-999*) rc=1; echo "      closed a live, unidentifiable surface: [$CLOSED]";; *) rc=0 ;; esac
+  ck "a STALE record whose surface is still ALIVE is SPARED when the probe cannot identify it (#2104 P1)" $rc
   case "$CLOSED" in *term_merge-100*) rc=1 ;; *) rc=0 ;; esac
   ck "shipped reaper leaves the FRESH durable terminal alone" $rc
+  # …while a record whose surface the census reports GONE is still reaped on silence alone: there is
+  # nothing left to destroy, and that is the slot this reaper exists to free.
   case "$KILLED" in *fix-77*) rc=0 ;; *) rc=1; echo "      killed: [$KILLED]";; esac
-  ck "shipped reaper still reaps a LEGACY tmux worker out of the same census" $rc
-  grep -q 'reap-worker' "$LOG" && rc=0 || rc=1
-  ck "the reaper logs what it killed" $rc
+  ck "a stale LEGACY tmux worker whose PANE is gone is still reaped out of the same census" $rc
+  # ⛔ NOT THE WORD `reap-worker` (review of PR #3756, P3). `reap_stale_workers` ALWAYS emits
+  # `[reap-worker] wedged=…`, so the old assertion here was green with every per-candidate decision echo
+  # deleted — the same vacuity a sibling fixture closed one commit earlier, reproduced in this row. Assert
+  # the PER-CANDIDATE sentences this pass must produce: the spare for the unidentified live surface, and
+  # the reap for the record whose surface is PROVEN GONE.
+  grep -q '^\[reap-worker\] merge-999 .*NOT PROVEN idle' "$LOG" && rc=0 || { rc=1; echo "      log: $(cat "$LOG" 2>/dev/null)"; }
+  ck "the reaper logs a PER-CANDIDATE decision for the SPARED worker, not just the wedged= summary" $rc
+  grep -q '^\[reap-worker\] fix-77 .*PROVEN GONE' "$LOG" && rc=0 || { rc=1; echo "      log: $(cat "$LOG" 2>/dev/null)"; }
+  ck "…and a PER-CANDIDATE decision for the REAPED one" $rc
   # Exact-match targets: a prefix match would let the reaper kill a DIFFERENT, healthy session
   # if the stale one exited between the snapshot and the kill. The tmux branch moved with the
   # launcher, so this pin follows it to the file that now owns it.
   grep -q 'kill-session -t "=\$name"' "$HERE/worker-terminal.sh" && rc=0 || rc=1
   ck "the reaper uses exact session targets (=name), not prefix matches" $rc
+  # ⛔ AND THE FIXTURE'S "PANE IS GONE" REALLY IS GONE (see the stub's `list-panes`). Without this pin a
+  # later edit that answered a pid here would silently turn the row above into "a stranger's pid decides"
+  # — which is exactly how it read green on a box where that pid was free and red on the runner where it
+  # was not.
+  got="$( . "$TMP/wtstub.sh"; . "$TMP/reapw.sh"; _wreap_pane_pid fix-77 )"
+  [ -z "$got" ] && rc=0 || { rc=1; echo "      a GONE pane still resolved to pid [$got]"; }
+  ck "…and its PANE-GONE record resolves to NO pane pid (the premise the row above rests on)" $rc
   grep -q 'list-panes -t "=\$name"' "$HERE/worker-terminal.sh" && rc=0 || rc=1
   ck "the reaper resolves the pane pid with an exact target" $rc
+  # ⛔ THE PANE PROBE IS BOUNDED, BECAUSE IT RUNS ON THE CONTROLLER'S SYNCHRONOUS CYCLE PATH (review of
+  # PR #3756, P3). `worker-terminal.sh`'s module invariant — "EVERY probe here can HANG … a tmux server
+  # that is REACHABLE BUT WEDGED makes `show-environment`/`ls`/`new-session` block indefinitely (measured
+  # on tmux 3.4 … still blocked after 8 s)" — covers `list-panes`, the same socket/client path. The
+  # reaper reaches it for candidates it then SPARES, i.e. once per stale candidate per cycle. Driven, not
+  # grepped: a `tmux` that sleeps far longer than the bound must be CUT, and "no answer" is read as no
+  # pane pid (⇒ matched 0 ⇒ UNKNOWN ⇒ SPARE), the safe direction.
+  _pn_body="$(sed -n '/^_wreap_pane_pid() {/,/^}/p' "$LOOP")"
+  # ⛔ THE CALL SHAPE, NOT THE WORD (measured): the body's own COMMENT names `wt_bounded`, so a bare
+  # `*wt_bounded*` match stays green with the call deleted — a comment-satisfiable assertion in a block
+  # whose subject is exactly that vacuity. Pin the invocation.
+  case "$_pn_body" in *'wt_bounded "${WT_PROBE_TIMEOUT:-15}" tmux list-panes'*) rc=0 ;; *) rc=1; echo "      _wreap_pane_pid does not route the probe through wt_bounded";; esac
+  ck "#2104: the tmux pane probe goes through wt_bounded (the module's every-probe-can-hang rule)" $rc
+  if command -v perl >/dev/null 2>&1 || command -v timeout >/dev/null 2>&1; then
+    mkdir -p "$TMP/slowbin"
+    # `exec` so NO CHILD HOLDS THE PROBE'S STDOUT PIPE PAST THE BOUND (measured while writing this):
+    # a plain `sleep 5` is a child of the stub, it inherits the pipe, and the command substitution
+    # waits for the PIPE to close rather than for the bound — so the row read 5 s with the fix fully
+    # in place. The defect it must catch is an UNBOUNDED probe, not a straggling child.
+    printf '#!/bin/sh\n# a wedged tmux: no answer, ever\nexec sleep 5\n' > "$TMP/slowbin/tmux"; chmod +x "$TMP/slowbin/tmux"
+    _t0="$(date +%s)"
+    got="$( PATH="$TMP/slowbin:$PATH"; export WT_PROBE_TIMEOUT=1; _wreap_pane_pid fix-99 )"
+    _dt=$(( $(date +%s) - _t0 ))
+    if [ -z "$got" ] && [ "$_dt" -lt 4 ]; then rc=0; else rc=1; echo "      a wedged tmux held the cycle for ${_dt}s and answered [$got] (want: cut at 1s, no pid)"; fi
+    ck "#2104: …and a WEDGED tmux is cut at the bound (measured ${_dt}s), never blocking the cycle" $rc
+  fi
   unset -f cmux tmux kill
 fi
+# ── 15b) a STALE LOG IS NOT A HUNG WORKER: the positive-liveness gate (agent-infra#2104) ───────
+# MEASURED 2026-10-19: this reaper closed a worker logged as "silent 8287s" (2.3 h) while its agent
+# had been running `bash`/`edit` calls for hours with ~200 lines of uncommitted work, and closed 7
+# other sessions in the same second. The single signal it read was one harness-written log file's
+# mtime, which an agent's own work never touches. Every assertion below drives the SHIPPED functions
+# extracted from the shipped loop — none re-implements the verdict it checks.
+if need "$TMP/reapw.sh" "the #2104 liveness probe is extracted from the shipped loop"; then
+  # (a) UNIT: the awk's identity match. A synthetic `ps` table carrying a name that is a PREFIX of
+  # the wanted one (fix-889 vs fix-88) and the wanted worker's own subtree.
+  cat > "$TMP/wr-table.txt" <<'TBL'
+    100     1  0:00.10 bash /x/state/run-fix-889.sh
+    101     1  0:00.10 bash /x/state/run-fix-88.sh
+    102   101  1:02.03 pytest /w
+    103     1  0:00.05 /nowhere/bin/pi --model m --no-session
+TBL
+  got="$( . "$TMP/reapw.sh"; _wreap_cpu "$TMP/wr-table.txt" "$(_wreap_patterns fix-88)" "" )"
+  [ "$got" = "1 6213" ] && rc=0 || { rc=1; echo "      got '$got' want '1 6213'"; }
+  ck "#2104: the probe matches ONLY the wanted worker (a prefix name is not it) and sums its SUBTREE (got '$got')" $rc
+  # (a2) ⛔ THE PREFIX DEFECT THE FIRST CUT SHIPPED (review of PR #3756, P1 — measured): `wt-fix-19` is a
+  # prefix of `wt-fix-1949`, so a `wt-` pattern matched ANOTHER live worker and summed ITS CPU. The
+  # identity set no longer contains a name form at all, and this row proves the collision is gone.
+  cat > "$TMP/wr-wt.txt" <<'TBL'
+    200     1  1:23.45 pi --model m --no-session inside wt-fix-1949
+    201   200  0:00.02 bash -c uv run pytest
+TBL
+  got="$( . "$TMP/reapw.sh"; _wreap_cpu "$TMP/wr-wt.txt" "$(_wreap_patterns fix-19)" "" )"
+  [ "$got" = "0 0" ] && rc=0 || { rc=1; echo "      got '$got' want '0 0' (another worker's wt-fix-1949 was summed)"; }
+  ck "#2104: another live worker whose workspace is a PREFIX (wt-fix-1949 for fix-19) is not attributed to this one" $rc
+  # (a3) the identity set is anchored, and it is the LAUNCHER's own handle — the run script — with the
+  # tmux pane pid supplied separately. ⛔ THE LOG PATH IS NOT IN IT (review of PR #3756, P2 — reproduced).
+  # It is on NO worker's argv (the launcher applies it as a redirect); the only process carrying it is
+  # the `lane-bound.sh` WATCHDOG, a sibling of the agent. Including it made `matched >= 1` unconditional
+  # for every `fix-*`/`lane-*` worker, so the `matched == 0 ⇒ UNKNOWN ⇒ spare` net could not fire in the
+  # family #2104 was measured on — `matched>0` was not evidence the worker had been found.
+  # ⛔ THE SECOND ARGUMENT IS THE PRE-FIX CALL SHAPE AND IS PASSED ON PURPOSE: the reaper used to call
+  # `_wreap_patterns <name> <logpath>` and the log path was an identity. Passing it here is what makes
+  # these rows RED on the pre-fix tree (verified: pre-fix returns `/o/logs/fix-19.log\trun-fix-19.sh`
+  # and the watcher row reads `1 300`); without it the pre-fix defect is invisible to its own test.
+  pats="$( . "$TMP/reapw.sh"; _wreap_patterns fix-19 /o/logs/fix-19.log )"
+  [ "$pats" = "run-fix-19.sh" ] && rc=0 || { rc=1; echo "      pats: [$pats]"; }
+  ck "#2104: the identity set is the launcher's own handle, run-…sh [$pats]" $rc
+  case "$pats" in *'wt-fix-19'*|*'/logs/'*|*'.log'*) rc=1 ;; *) rc=0 ;; esac
+  ck "#2104: …and carries NO bare-name/workspace form and NO log path, which matched the wrong processes" $rc
+  # (a3b) ⛔ THE WATCHER IS NOT THE WORKER (review of PR #3756, P2 — reproduced). `spawn-gate.sh:4567`
+  # spawns `sh lane-bound.sh watch --pid … --log <the same path the reaper derives>` as a SIBLING of the
+  # agent, so the log path matched IT: `matched=1`, a flat ~0 cs, and a REAP verdict for a worker the
+  # probe never saw — with the audit line publishing a measurement of a tree it never summed. The row
+  # below is the reviewer's own reproduction; nothing may match, so the net is REACHABLE.
+  cat > "$TMP/wr-watch.txt" <<'TBL'
+    900     1  0:00:03 sh /o/lane-bound.sh watch --pid 901 --log /o/logs/fix-19.log --wall 2700
+    901     1  1:24:01 pi --model m --no-session prompttext
+TBL
+  got="$( . "$TMP/reapw.sh"; _wreap_cpu "$TMP/wr-watch.txt" "$(_wreap_patterns fix-19 /o/logs/fix-19.log)" "" )"
+  [ "$got" = "0 0" ] && rc=0 || { rc=1; echo "      got '$got' want '0 0' (the watcher, not the worker, was summed)"; }
+  ck "#2104: the lane-bound WATCHDOG — the only process carrying the log path — is not read as the worker" $rc
+  # …and an unidentified worker on a LIVE surface is therefore UNKNOWN (spare), which is the polarity the
+  # watcher match used to route around. Driven through the shipped verdict, not re-implemented.
+  ( . "$TMP/reapw.sh"; _wreap_verdict "$(date +%s)" "" 0 0 alive ); [ "$?" = "2" ] && rc=0 || rc=1
+  ck "#2104: …so an unmatched worker over a LIVE surface is UNKNOWN (the net the watcher defeated)" $rc
+  # (a4) ⛔ THE TMUX ARM, WHICH IS THE SURFACE #2104 WAS MEASURED ON (review of PR #3756, P0 —
+  # reproduced). A cell worker's pane command is `bash -c '… cd <cwd> && bash fix-one.sh --argv …'`; the
+  # run script does not exist and the log path is a redirect, so the ONLY identity is the pane pid. The
+  # fixture is the reviewer's own reproduction, with the pid the launcher would report.
+  cat > "$TMP/wr-tmux.txt" <<'TBL'
+    300     1  0:00:00 bash -c export PATH=/usr/bin:/bin; cd /wt/fix-19 && bash /o/fix-one.sh --argv /o/state/argv-19
+    301   300  0:00:41 bash /o/fix-one.sh --argv /o/state/argv-19
+    302   301  0:00:00 pi --model m --no-session <prompt>
+    303   302  1:24:01 bash -c uv run pytest
+TBL
+  got="$( . "$TMP/reapw.sh"; _wreap_cpu "$TMP/wr-tmux.txt" "$(_wreap_patterns fix-19)" 300 )"
+  case "$got" in '1 '*|'2 '*) rc=0 ;; *) rc=1; echo "      got '$got'";; esac
+  ck "#2104: the TMUX arm is identified by its PANE PID, so a cell worker is measurable at all (got '$got')" $rc
+  tot="${got##* }"; [ "${tot:-0}" -ge 5000 ] && rc=0 || { rc=1; echo "      total '$tot' misses the agent's 1:24:01"; }
+  ck "#2104: …and the pane's whole SUBTREE is summed (a flat pi parent does not hide a burning pytest)" $rc
+  # (b) UNIT: the verdict table, including every direction that would destroy work.
+  vrun() { ( . "$TMP/reapw.sh"; _wreap_verdict "$1" "$2" "$3" "$4" "$5" ); }
+  OLDV=$(( $(date +%s) - 3600 ))
+  vrun "$(date +%s)" "$OLDV 100 2" 100 2 alive; [ "$?" = "0" ] && rc=0 || rc=1
+  ck "#2104: flat CPU on a PRESENT subtree over the window is IDLE (a real hang is still reaped)" $rc
+  vrun "$(date +%s)" "$OLDV 100 2" 400 2 alive; [ "$?" = "1" ] && rc=0 || rc=1
+  ck "#2104: the working subtree that burned CPU is ACTIVE — the 8287s case is spared" $rc
+  vrun "$(date +%s)" "$OLDV 400 2" 100 2 alive; [ "$?" = "1" ] && rc=0 || rc=1
+  ck "#2104: a CPU total that FELL (the matched set changed) is change, not idleness" $rc
+  vrun "$(date +%s)" "$OLDV 100 2" 100 0 alive; [ "$?" = "2" ] && rc=0 || rc=1
+  ck "#2104: a worker present in the baseline and absent now is UNKNOWN, not idle" $rc
+  vrun "$(date +%s)" "" 100 2 alive; [ "$?" = "2" ] && rc=0 || rc=1
+  ck "#2104: a FIRST sighting has no window, so it is UNKNOWN — the gate cannot fire on one pass" $rc
+  _wreap_verdict_win() { ( _WREAP_WINDOW_MIN=6; . "$TMP/reapw.sh"; _wreap_verdict "$@" ); }
+  _wreap_verdict_win "$(date +%s)" "$(date +%s) 100 2" 100 2 alive; [ "$?" = "2" ] && rc=0 || rc=1
+  ck "#2104: a baseline younger than the window is UNKNOWN (a 2 s sample cannot tell wedged from off-CPU)" $rc
+  vrun "$(date +%s)" "" 100 0 alive; [ "$?" = "2" ] && rc=0 || rc=1
+  ck "#2104: an UNIDENTIFIED worker on a LIVE surface is UNKNOWN — the P1 fail-open is closed" $rc
+  vrun "$(date +%s)" "" "" 0 dead; [ "$?" = "0" ] && rc=0 || rc=1
+  ck "#2104: an UNIDENTIFIED worker whose surface is PROVEN GONE is idle — nothing is left to destroy" $rc
+  vrun "" "" "" 0 dead; [ "$?" = "0" ] && rc=0 || rc=1
+  ck "#2104: an UNREADABLE probe over a dead surface still frees the record" $rc
+  vrun "" "" "" 2 alive; [ "$?" = "2" ] && rc=0 || rc=1
+  ck "#2104: an UNMEASURED CPU is UNKNOWN, never idle" $rc
+  # (b2) ⛔ THE WINDOW MUST BE ABLE TO ELAPSE (found reviewing this fix — an INERT gate, the same class
+  # as #2104 itself). `_wreap_note` rewrote `<now>` on EVERY pass, so `now - pts` stayed at ~0, the verdict
+  # answered "window too short" every cycle, and a genuinely wedged worker was spared until a human
+  # noticed. A flat pass must PRESERVE the baseline; only progress restarts the window.
+  _note_b2() { ( O="$TMP/RW"; . "$TMP/reapw.sh"; _wreap_note b2 "$1" "$2" "$3" ); }
+  mkdir -p "$TMP/RW/state"
+  oldv=$(( $(date +%s) - 600 ))
+  printf '%s 100 2\n' "$oldv" > "$TMP/RW/state/wreap-b2"
+  _note_b2 "$(date +%s)" 105 2
+  kept="$(cut -d' ' -f1 "$TMP/RW/state/wreap-b2")"
+  [ "$kept" = "$oldv" ] && rc=0 || { rc=1; echo "      a FLAT pass reset the baseline: $(cat "$TMP/RW/state/wreap-b2")"; }
+  ck "#2104: a FLAT pass PRESERVES the baseline epoch, so the idle window can actually elapse" $rc
+  _note_b2 "$(date +%s)" 400 2
+  newv="$(cut -d' ' -f1 "$TMP/RW/state/wreap-b2")"
+  [ "$newv" != "$oldv" ] && rc=0 || { rc=1; echo "      progress did not restart the window"; }
+  ck "#2104: …and real progress RESTARTS it, so a working lane is never measured across old work" $rc
+  # (b3) ⛔ A BASELINE BELONGS TO ONE INCARNATION OF THE NAME (review of PR #3756, P2 — reproduced).
+  # Worker names are RECYCLED (`fix-<PR>`/`merge-<PR>`/`review-<PR>` are reused on every re-dispatch) and
+  # `_wreap_forget` runs only on the reap arm, so a sample left by a dead predecessor was read as this
+  # worker's window — the shipped verdict then returned REAP for a live, identified, flat-reading tree on
+  # a three-day-old baseline. The generation key is the worker's own log write: a baseline older than it
+  # cannot be a reading of the current incarnation.
+  _prev_inc() { ( O="$TMP/RW"; . "$TMP/reapw.sh"; _wreap_prev "$1" "${2:-}" ); }
+  mkdir -p "$TMP/RW/state"
+  _inc_logm=$(( $(date +%s) - 3600 ))                       # the worker's last log write, an hour ago
+  printf '%s 5000 3\n' "$(( $(date +%s) - 259200 ))" > "$TMP/RW/state/wreap-inc"
+  got="$(_prev_inc inc "$_inc_logm")"
+  [ -z "$got" ] && rc=0 || { rc=1; echo "      predecessor baseline was accepted: [$got]"; }
+  ck "#2104: a baseline taken BEFORE the worker's last log write is a PREVIOUS incarnation, not this window" $rc
+  # Non-vacuity, the other direction: the SAME baseline IS this worker's window when the log is older than
+  # the sample. Without this row the check above also passes on a `_wreap_prev` that always returns nothing.
+  got="$(_prev_inc inc "$(( $(date +%s) - 604800 ))")"
+  [ -n "$got" ] && rc=0 || rc=1
+  ck "#2104: …and a baseline taken AFTER the last log write IS this worker's window (so (b3) is not vacuous)" $rc
+  # …and the preserve-the-window rule must not RESURRECT a predecessor's baseline as this worker's epoch.
+  _note_inc() { ( O="$TMP/RW"; . "$TMP/reapw.sh"; _wreap_note inc "$1" "$2" "$3" "$4" ); }
+  _inc_now=$(date +%s)
+  _note_inc "$_inc_now" 5000 3 "$_inc_logm"
+  kept="$(cut -d' ' -f1 "$TMP/RW/state/wreap-inc")"
+  [ "$kept" = "$_inc_now" ] && rc=0 || { rc=1; echo "      kept a predecessor epoch: $(cat "$TMP/RW/state/wreap-inc")"; }
+  ck "#2104: …and the sample writer RESTARTS the window instead of preserving a predecessor's epoch" $rc
+  unset -f vrun _wreap_verdict_win _note_b2 _prev_inc _note_inc
+  # (c) END-TO-END on the SHIPPED reaper, TMUX ARM (the reviewer's P2: the old fixture wrote `kind=tmux`
+  # but backed it with `run-<w>.sh`, a shape only the cmux arms produce, so the assertion could not fail
+  # for the arm its own record named). Here the pane pid is the ONLY identity, exactly as on a cell.
+  mkdir -p "$TMP/RL/logs" "$TMP/RL/state"
+  : > "$TMP/RL/logs/fix-88.log"; touch -t 202601010000 "$TMP/RL/logs/fix-88.log"
+  printf 'kind=tmux\ncwd=/tmp\n' > "$TMP/RL/state/worker-fix-88"
+  # ⛔ THE HEREDOC IS UNQUOTED (it must expand $TMP and $HERE), SO EVERY BACKTICK IN THIS BODY IS A
+  # COMMAND SUBSTITUTION RUN AT BUILD TIME — IN THE SUITE'S OWN SHELL (measured 2026-11-08). The prose
+  # below used to carry raw backticks; `wt_tmux_names` is defined in that shell once worker-terminal.sh is
+  # sourced, so the substitution actually RAN and spliced this box's LIVE tmux session names into the
+  # generated script, which then died `syntax error near unexpected token '('` and reddened the five arms
+  # that drive it. On a runner with no tmux sessions the substitution is empty and the fixture survives,
+  # so the SAME commit was green in CI and red on a real controller box — a false PASS on the exact host
+  # type this suite runs on. Backticks in an unquoted heredoc are ESCAPED here, exactly as the prompt
+  # heredocs in lane.sh/fix-one.sh/merge-one.sh already do it.
+  # ⛔ THE PANE PID REACHES `_wreap_pane_pid` THROUGH `wt_bounded`, SO ITS STUB MUST BE ON THE PATH
+  # (review of PR #3756, P3 — measured while fixing it). `_wreap_pane_pid` is now bounded because it runs
+  # on the controller's synchronous cycle path, and `wt_bounded` runs the probe through
+  # `perl -e 'alarm shift; exec @ARGV'` — a fresh process that CANNOT SEE A SHELL FUNCTION named `tmux`.
+  # That is the same trap this file records for `wt_tmux_names`; here it means the `tmux()` function
+  # below answers `wt_close` while this PATH stub answers the bounded probe. Without it (c)/(d) go red
+  # for a reason unrelated to what they test — the bound would swallow the pane pid.
+  mkdir -p "$TMP/gnubin-tmux"
+  cat > "$TMP/gnubin-tmux/tmux" <<'SH'
+#!/bin/sh
+# Only the pane resolution: the pid the drive owns, handed in through BUSYPID. Everything else is the
+# `tmux()` function inside the drive (a shell function still wins for a DIRECT call, i.e. `wt_close`).
+case "${1:-}" in
+  list-panes) [ -n "${BUSYPID:-}" ] && printf '%s\n' "$BUSYPID" ;;
+esac
+exit 0
+SH
+  chmod +x "$TMP/gnubin-tmux/tmux"
+  cat > "$TMP/rl.sh" <<SH
+set -u
+. "$TMP/wtstub.sh"
+# the tmux arm: the pane pid is the ONLY handle
+# ⛔ THIS FUNCTION ANSWERS \`wt_close\` (a DIRECT call), NOT THE BOUNDED PROBE — see the PATH stub above.
+tmux() {
+  case "\${1:-}" in
+    list-panes) printf '%s\n' "\$BUSYPID" ;;
+    ls) for _s in fix-77; do printf '%s\n' "\$_s"; done ;;
+    kill-session) KILLED="\$KILLED \${3#=}" ;;
+  esac
+  return 0
+}
+LOG="$TMP/RL/rw.log"; O="$TMP/RL"; WT_DIR="$TMP/RL/state"; STALE_MIN=1; WT_TABLE_TTL=0
+_WREAP_WINDOW_MIN=0; _WREAP_TOL_CS=0
+. "$HERE/worker-terminal.sh"
+# ⛔ THE CENSUS IS STUBBED AT \`wt_tmux_names\`, NOT AT \`tmux\` (measured while writing this fixture):
+# \`wt_tmux_names\` runs the session list through \`wt_bounded\`, which \`perl … exec @ARGV\`s — a shell FUNCTION
+# named \`tmux\` is invisible to that exec, so a \`tmux()\` stub answered nothing and every record read
+# \`dead\` whatever the fixture intended. \`wt_tmux_names\` is called in-shell, so stubbing IT is what
+# actually controls the surface answer this arm depends on.
+wt_tmux_names() { printf 'fix-88\n'; return 0; }
+. "$TMP/reapw.sh"
+reap_stale_workers; echo "closed=\$CLOSED killed=\$KILLED"
+SH
+  # ⛔ THE GENERATED FIXTURE MUST BE A VALID SCRIPT, AND THAT IS ASSERTED DIRECTLY (measured
+  # 2026-11-08). Build-time substitution corrupts this file in ways no arm below can name: the arm it
+  # lands on fails for a reason unrelated to what it tests, and the reader debugs the reaper instead of
+  # the fixture. `bash -n` on the ARTIFACT catches any such corruption, whatever its cause — a stronger
+  # and less brittle guard than grepping this body for backticks.
+  bash -n "$TMP/rl.sh" 2>/dev/null && rc=0 || { rc=1; echo "      fixture does not parse: $(bash -n "$TMP/rl.sh" 2>&1 | head -1)"; }
+  ck "#2104: the rl.sh fixture PARSES (an unquoted heredoc is not corrupted at build time)" $rc
+  # ⛔ THE PANE IS THE REAL TMUX SHAPE (`worker-terminal.sh:2020`: `bash -c '… cd <cwd> && …'`), NOT the
+  # run script — the run script is a CMUX-arm artifact, and a fixture that starts one would let the
+  # `run-<w>.sh` pattern do the identifying, which is exactly the vacuity the reviewer named. Here the
+  # argv carries neither the log path nor a run script, so nothing but the pane pid can match.
+  bash -c 'while :; do :; done' & busy=$!
+  sleep 3   # procps `time=` is whole seconds: let the pane accrue a measurable one
+  printf '%s 0 1\n' "$(( $(date +%s) - 3600 ))" > "$TMP/RL/state/wreap-fix-88"
+  out="$(BUSYPID="$busy" PATH="$TMP/gnubin-tmux:$PATH" bash "$TMP/rl.sh" 2>&1)"
+  kill -KILL "$busy" 2>/dev/null; wait "$busy" 2>/dev/null
+  case "$out" in *fix-88*) rc=1; echo "      closed/killed a LIVE tmux worker: $out";; *) rc=0 ;; esac
+  ck "#2104: shipped reaper SPARES a TMUX worker whose log is stale but whose PANE is BURNING CPU" $rc
+  grep -q 'BURNING CPU' "$TMP/RL/rw.log" && rc=0 || { rc=1; echo "      log: $(cat "$TMP/RL/rw.log" 2>/dev/null)"; }
+  ck "#2104: and says so in the log, naming the CPU delta it spared on" $rc
+  # (d) END-TO-END, NON-VACUITY for (c): the SAME drive with a pane that exists but burns nothing must
+  # REAP. Without this, a reaper that simply stopped reaping would pass (c).
+  : > "$TMP/RL/rw.log"
+  sh -c 'sleep 30' & idle=$!
+  printf '%s 0 1\n' "$(( $(date +%s) - 3600 ))" > "$TMP/RL/state/wreap-fix-88"
+  out="$(BUSYPID="$idle" PATH="$TMP/gnubin-tmux:$PATH" bash "$TMP/rl.sh" 2>&1)"
+  kill -KILL "$idle" 2>/dev/null; wait "$idle" 2>/dev/null
+  case "$out" in *fix-88*) rc=0 ;; *) rc=1; echo "      an IDLE pane was not reaped: $out";; esac
+  ck "#2104: …and the SAME drive REAPS when the pane is flat, so (c) is not vacuous" $rc
+  # ⛔ AND IT IS REAPED BY THE CPU ARM, NOT BY THE SURFACE. This fixture's census reports fix-88 ALIVE,
+  # so the only route to REAP is "identified, measurable, flat across the window" — the hung-worker case.
+  # Without this row the check above would also pass on a reaper that killed every record whose surface it
+  # could not see, which is a different (and wrong) reason to kill.
+  grep -q 'burned no CPU across the window' "$TMP/RL/rw.log" && rc=0 || { rc=1; echo "      log: $(cat "$TMP/RL/rw.log" 2>/dev/null)"; }
+  ck "#2104: …reaped by the FLAT-CPU arm over the window, not by an unreadable surface" $rc
+  # (e) END-TO-END: an UNREADABLE process table spares a worker whose SURFACE IS STILL THERE —
+  # assume-active-until-proven-idle. `WT_LS=alive` keeps the census answering "this worker exists", which
+  # is what makes the spare the probe's own verdict rather than the census's.
+  # ⛔ BACKTICKS ESCAPED FOR THE SAME REASON AS `rl.sh` ABOVE: this heredoc is unquoted, so a raw
+  # backtick in the prose runs as a command substitution in the suite's own shell at build time.
+  cat > "$TMP/rl2.sh" <<SH
+set -u
+ps() { :; }                     # a blind probe: no rows at all
+. "$TMP/wtstub.sh"
+LOG="$TMP/RL/rw2.log"; O="$TMP/RL"; WT_DIR="$TMP/RL/state"; STALE_MIN=1; WT_TABLE_TTL=0
+_WREAP_WINDOW_MIN=0
+. "$HERE/worker-terminal.sh"
+# THE SURFACE ANSWER — the only thing that differs between the two arms below, and stubbed at
+# \`wt_tmux_names\` for the reason recorded in \`rl.sh\` (a \`tmux()\` function does not survive wt_bounded's exec).
+wt_tmux_names() { [ "\${WT_LS:-}" = alive ] && printf '%s\n' fix-88; return 0; }
+tmux() {
+  case "\${1:-}" in
+    list-panes) : ;;
+    kill-session) KILLED="\$KILLED \${3#=}" ;;
+  esac
+  return 0
+}
+. "$TMP/reapw.sh"
+reap_stale_workers; echo "closed=\$CLOSED killed=\$KILLED"
+SH
+  # ⛔ RE-BUILD THE FIXTURE: the drive above REAPED fix-88, and `wt_close` removes the record — so
+  # without this the blind arm measures an EMPTY census and "spares" for a reason that has nothing to do
+  # with the probe (measured: rw2.log carried only the `wedged=0` line).
+  : > "$TMP/RL/logs/fix-88.log"; touch -t 202601010000 "$TMP/RL/logs/fix-88.log"
+  printf 'kind=tmux\ncwd=/tmp\n' > "$TMP/RL/state/worker-fix-88"
+  printf '%s 0 1\n' "$(( $(date +%s) - 3600 ))" > "$TMP/RL/state/wreap-fix-88"
+  bash -n "$TMP/rl2.sh" 2>/dev/null && rc=0 || { rc=1; echo "      fixture does not parse: $(bash -n "$TMP/rl2.sh" 2>&1 | head -1)"; }
+  ck "#2104: the rl2.sh fixture PARSES (an unquoted heredoc is not corrupted at build time)" $rc
+  : > "$TMP/RL/rw2.log"
+  out="$(WT_LS=alive PATH="$TMP/gnubin-tmux:$PATH" bash "$TMP/rl2.sh" 2>&1)"
+  case "$out" in *fix-88*) rc=1; echo "      blinded probe still reaped: $out";; *) rc=0 ;; esac
+  ck "#2104: a BLIND process probe spares the worker instead of reading 'unmeasurable' as 'idle'" $rc
+  grep -q "NOT PROVEN idle" "$TMP/RL/rw2.log" && rc=0 || rc=1
+  ck "#2104: and the log names the unproven liveness rather than a silent skip" $rc
+  # (e2) ⛔ THE OTHER HALF OF THE SAME BRANCH, and without it the record of a worker whose surface is
+  # PROVEN GONE could never be freed — an inert arm: the slot stays held by a corpse for ever. The probe
+  # is still blind; only the census's answer changed.
+  : > "$TMP/RL/rw2.log"
+  out="$(WT_LS=dead PATH="$TMP/gnubin-tmux:$PATH" bash "$TMP/rl2.sh" 2>&1)"
+  case "$out" in *fix-88*) rc=0 ;; *) rc=1; echo "      a corpse's record was never freed: $out";; esac
+  ck "#2104: …but an unreadable probe over a surface PROVEN GONE still frees the record (no inert arm)" $rc
+  # (g) ⛔ THE DURABLE-SAMPLE WRITE *AND* ITS CLEAR NEED AN END-TO-END ASSERTION, AND NOTHING ELSE
+  # PROVIDED ONE (review of PR #3756, P2 — measured). `reap_stale_workers` carries its reading across
+  # passes with `_wreap_note` (`orch-loop.sh:2473`) and clears it on the reap arm with `_wreap_forget`.
+  # EVERY OTHER end-to-end drive in this file PRE-SEEDS `state/wreap-<w>` and runs the reaper exactly
+  # ONCE, so deleting either CALL SITE left this whole suite green while the two-signal gate went INERT
+  # in production: no sample is ever written ⇒ every candidate is a "first sighting" ⇒ `_wreap_verdict`
+  # answers UNKNOWN and SPARES for ever, so a wedged-but-present worker holds its lane slot with no
+  # escalation — #2104's own inert-enforcer class, sitting on the two lines that make the gate work.
+  # The shape that makes the mutant detectable is ONE state dir and TWO passes:
+  #   pass 1 (no baseline) → SPARE, and it MUST write this pass's sample (that write IS the window)
+  #   pass 2 (window elapsed) → REAP, and the sample MUST be gone (else a recycled name inherits it)
+  mkdir -p "$TMP/RR/logs" "$TMP/RR/state"
+  : > "$TMP/RR/logs/fix-66.log"; touch -t 202601010000 "$TMP/RR/logs/fix-66.log"
+  printf 'kind=tmux\ncwd=/tmp\n' > "$TMP/RR/state/worker-fix-66"
+  cat > "$TMP/rr.sh" <<SH
+set -u
+. "$TMP/wtstub.sh"
+LOG="$TMP/RR/rw.log"; O="$TMP/RR"; WT_DIR="$TMP/RR/state"; STALE_MIN=1; WT_TABLE_TTL=0
+_WREAP_WINDOW_MIN=0; _WREAP_TOL_CS=0
+. "$HERE/worker-terminal.sh"
+# The census answers this worker UNTIL ITS OWN KILL RECORDS IT. That is what lets \`wt_close\` PROVE the
+# close (it re-reads the census), and therefore what makes the reap arm reach \`_wreap_forget\` — with a
+# permanently-'alive' stub the record would be KEPT and the clear would never be exercised.
+wt_tmux_names() { case " \$KILLED " in *" fix-66 "*) return 0 ;; esac; printf '%s\n' fix-66; return 0; }
+. "$TMP/reapw.sh"
+reap_stale_workers; echo "closed=\$CLOSED killed=\$KILLED"
+SH
+  bash -n "$TMP/rr.sh" 2>/dev/null && rc=0 || { rc=1; echo "      fixture does not parse: $(bash -n "$TMP/rr.sh" 2>&1 | head -1)"; }
+  ck "#2104: the two-pass rr.sh fixture PARSES" $rc
+  sh -c 'sleep 60' & _rr_flat=$!
+  samp="$TMP/RR/state/wreap-fix-66"
+  rm -f "$samp"                      # NO baseline: this is the worker's FIRST pass, the zero-sample state
+  : > "$TMP/RR/rw.log"
+  out1="$(BUSYPID="$_rr_flat" PATH="$TMP/gnubin-tmux:$PATH" bash "$TMP/rr.sh" 2>&1)"
+  case "$out1" in *fix-66*) rc=1; echo "      pass 1 reaped on a FIRST sighting: $out1";; *) rc=0 ;; esac
+  ck "#2104: pass 1 of a two-pass drive SPARES (a first sighting has no window)" $rc
+  # ⛔ THE ASSERTION THE MUTANT HAS TO BREAK: delete `_wreap_note`'s call site and NO sample is written,
+  # so the second pass can only ever be another "first sighting" and the gate can never fire again.
+  pts1=""; cpu1=""; m1=""; now1="$(date +%s)"
+  [ -f "$samp" ] && read -r pts1 cpu1 m1 < "$samp"
+  case "${pts1:-}" in
+    ''|*[!0-9]*) rc=1; echo "      pass 1 wrote NO usable sample: [$(cat "$samp" 2>/dev/null)]";;
+    *) if [ "$pts1" -ge $(( now1 - 60 )) ] && [ "$pts1" -le $(( now1 + 60 )) ] && [ "${m1:-0}" -gt 0 ]; then rc=0; else rc=1; echo "      sample is not this pass's: [$(cat "$samp" 2>/dev/null)] want epoch~$now1 matched>0"; fi ;;
+  esac
+  ck "#2104: …and it WRITES this pass's sample, which is the window the next pass measures against" $rc
+  : > "$TMP/RR/rw.log"
+  out2="$(BUSYPID="$_rr_flat" PATH="$TMP/gnubin-tmux:$PATH" bash "$TMP/rr.sh" 2>&1)"
+  kill -KILL "$_rr_flat" 2>/dev/null; wait "$_rr_flat" 2>/dev/null
+  case "$out2" in *fix-66*) rc=0 ;; *) rc=1; echo "      pass 2 did not reap the flat worker: $out2";; esac
+  ck "#2104: …and pass 2 REAPS the same worker on the flat reading, so the written window is load-bearing" $rc
+  [ ! -f "$samp" ] && rc=0 || { rc=1; echo "      the sample survived the reap: [$(cat "$samp" 2>/dev/null)]"; }
+  ck "#2104: …and the CLEAR removes it, so a recycled fix-<PR> cannot inherit this worker's window" $rc
+  # (f) ⛔ THE PRELUDE EMITS EACH HELPER ONCE (review of PR #3756, P3). A doubled definition silently
+  # replaces any mutation applied to the first copy, which would make every future non-vacuity run a lie.
+  dups=""
+  for fn in _wreap_ps _wreap_cpu _wreap_patterns _wreap_verdict _wreap_pane_pid _wreap_prev _wreap_note _wreap_sample_file _wreap_forget; do
+    n="$(grep -c "^$fn() {" "$TMP/reapw.sh" 2>/dev/null)"
+    [ "${n:-0}" -eq 1 ] || dups="$dups $fn=$n"
+  done
+  [ -z "$dups" ] && rc=0 || { rc=1; echo "      duplicated in the prelude:$dups"; }
+  ck "#2104: the extracted prelude defines each shipped helper EXACTLY once$dups" $rc
+fi
+
 # the agent invocation is wall-clock bounded, portably (macOS has no timeout/gtimeout)
 sed -n '/^run_agent() {/,/^}/p' "$MERGE" > "$TMP/runagent.sh"
 if need "$TMP/runagent.sh" "run_agent() is extracted from the shipped merge-one.sh"; then
@@ -4182,7 +4630,7 @@ fi
 # The reaper driven with the GNU stat shape: the pre-fix copy ABORTS here (`age: unbound variable`,
 # rc 1) and kills nothing. Assert rc=0 AND the kill decision — stale reaped, fresh spared — so a
 # "fix" that simply stopped reaping cannot pass this.
-{ grep -m1 '^is_num() {' "$LOOP"; sed -n '/^file_mtime_epoch() {/,/^}/p' "$LOOP"; sed -n '/^worker_log_name() {/,/^}/p' "$LOOP"; sed -n '/^reap_stale_workers() {/,/^}/p' "$LOOP"; } > "$TMP/reapw-gnu.sh"
+{ reapw_prelude "$LOOP"; sed -n '/^reap_stale_workers() {/,/^}/p' "$LOOP"; } > "$TMP/reapw-gnu.sh"
 if need "$TMP/reapw-gnu.sh" "the reaper and its stat helper are extracted for the GNU-shape drive"; then
   mkdir -p "$TMP/RG/logs" "$TMP/RG/state"
   : > "$TMP/RG/logs/merge-999.log"; touch -t 202601010000 "$TMP/RG/logs/merge-999.log"
@@ -4202,7 +4650,22 @@ printf 'kind=terminal\nid=term_merge-100\nworkspace=ws_merge-100\n' > "$TMP/RG/s
 reap_stale_workers; rc=\$?
 echo "rc=\$rc closed=\$CLOSED"
 SH
+  # ⛔ THE STALE WORKER MUST BE IDENTIFIABLE FOR THE GATE TO BE ABLE TO REAP IT (agent-infra#2104). The
+  # gate reaps on TWO quiet signals; a record with NO process behind it is not "proven idle", it is
+  # unmeasurable, and it is now SPARED (that is the whole fix — the 2026-10-19 lane was killed from a
+  # record with no measurable process). So the drive starts the worker in the CMUX-arm shape
+  # (`bash $O/state/run-<w>.sh`, the identity `_wreap_patterns` matches) doing nothing — exactly the hung
+  # worker this drive is about — and hands the gate a baseline older than its window.
+  # \u26d4 `exec` WOULD DESTROY THE IDENTITY IT IS THERE TO PROVIDE (measured). The gate identifies a
+  # cmux-arm worker by `run-<w>.sh` on its ARGV, and `exec sleep` REPLACES the process so the run script
+  # vanishes from the table (`ps` then shows only `sleep 120`). The cmux arm does not exec \u2014 the run
+  # script stays the process \u2014 so the fixture must not either. Without this the drive fails for a
+  # reason that has nothing to do with the GNU stat shape it exists to test.
+  printf '#!/bin/sh\nsleep 120\n' > "$TMP/RG/state/run-merge-999.sh"
+  bash "$TMP/RG/state/run-merge-999.sh" & _gnu_worker=$!
+  printf '%s 0 1\n' "$(( $(date +%s) - 3600 ))" > "$TMP/RG/state/wreap-merge-999"
   out="$(bash "$TMP/rg.sh" 2>&1)"
+  kill -KILL "$_gnu_worker" 2>/dev/null; wait "$_gnu_worker" 2>/dev/null
   case "$out" in *"rc=0"*) rc=0;; *) rc=1; echo "      got: $out";; esac
   ck "shipped reaper, GNU stat shape: the cycle COMPLETES (rc 0) with no arithmetic abort" $rc
   case "$out" in *"merge-999"*) rc=0;; *) rc=1;; esac
@@ -4216,7 +4679,9 @@ SH
   closed_list="$(printf '%s\n' "$out" | grep -o 'closed=.*' | sed 's/^closed= *//')"
   [ "$closed_list" = "term_merge-999" ] || { rc=1; echo "      closed exactly: '$closed_list'"; }
   ck "shipped reaper, GNU stat shape: completes (rc 0) and reaps exactly the stale worker" $rc
-  grep -q 'reap-worker' "$TMP/RG/rw.log" 2>/dev/null && rc=0 || rc=1
+  # \u26d4 THE KILL LINE, NOT THE WORD `reap-worker` (which the `wedged=0` summary also carries \u2014 measured,
+  # so this row passed while nothing was reaped, the vacuity this file exists to prevent).
+  grep -q 'burned no CPU across the window' "$TMP/RG/rw.log" 2>/dev/null && rc=0 || rc=1
   ck "shipped reaper, GNU stat shape: the kill is logged" $rc
 fi
 sed -n '/^load1() {/,/^}/p' "$LOOP" > "$TMP/load1.sh"
@@ -4395,8 +4860,12 @@ _ngrd_n="$(printf '%s\n' "$NGRD" | grep -cE '^is_(num|limit) "\$\{[A-Z_]+:')"
 # 19 -> 20 for the LANDING FLOOR (2026-11-03): `LANDING_FLOOR` feeds `[ "${OPEN_N}" -ge "$LF_M" ]` at
 # a dispatch decision, so an uncoerced typo would either disarm the WIP limit or error the test and
 # OPEN the gate — the same fail-open class as every coercion above.
-[ "$_ngrd_n" = "20" ] && rcn=0 || { rcn=1; echo "      expected 20 shipped coercions in the extraction, got $_ngrd_n"; }
-ck "all 20 shipped limit coercions are extracted (a definition alone is not an extraction)" $rcn
+# 20 -> 22 for the #2104 liveness probe (`_WREAP_TOL_CS`, `_WREAP_WINDOW`): both feed a `[ … -le ]` /
+# `sleep` in the reap decision, and an uncoerced typo makes that test ERROR — which reads FALSE, i.e.
+# "not idle", so the reaper would spare every worker for ever. That is the inert-enforcer direction
+# rather than the fail-open one, and it is still a bound silently disarmed by a typo.
+[ "$_ngrd_n" = "22" ] && rcn=0 || { rcn=1; echo "      expected 22 shipped coercions in the extraction, got $_ngrd_n"; }
+ck "all 22 shipped limit coercions are extracted (a definition alone is not an extraction)" $rcn
 # The CYC FLOOR is part of the same coercion block but is not an is_* line, so it is extracted by an
 # explicit pattern (P3, third review round, 2026-10-14). Without it in NGRD, `nlim` could not drive
 # CYC=0 and the floor assertion below would be RED on the FIXED file — a false negative that would

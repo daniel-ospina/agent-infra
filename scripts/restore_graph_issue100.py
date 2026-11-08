@@ -3,7 +3,11 @@
 
 Reads from: redislite fragment at /tmp/tortoise_restore_src.db (copy of
     /home/user/eldato/tortoise.db)
-Writes to: docker FalkorDB localhost:16379, graph `tortoise_restored_20260805`
+Writes to: docker FalkorDB 127.0.0.1:16379, graph `tortoise_restored_20260805`
+
+⛔ `127.0.0.1`, never `localhost`: on macOS the name resolves `::1` first and port 16379 can carry a
+SECOND, near-empty FalkorDB there, so a restore aimed at the name writes the recovered points into a
+graph nothing reads — and reports success (agent-infra#907, tortoise#6666).
 
 Fragment stats: 2,312 statements + 1,991 operators = 4,303 total points.
 Operator content format: IMPL|NAND|ALTERNATIVE_TO(source_id, target_id)
@@ -55,9 +59,12 @@ print(f"  Total:      {len(statements) + len(operators)}")
 print(f"  Read in {elapsed_read:.1f}s")
 
 # ── Connect to target (docker FalkorDB) ───────────────────────────────────
-print("\n[3/5] Connecting to target (docker falkordb-personal:16379)...")
+# 127.0.0.1, not `localhost` (#907), and the container is named by the port it publishes rather than
+# by a recalled name: the shipped `daily-backup.sh` pointed at `falkordb-personal`, which exists on no
+# machine, and the same stale name was repeated here.
+print("\n[3/5] Connecting to target (docker falkordb, 127.0.0.1:16379)...")
 from falkordb import FalkorDB
-target_db = FalkorDB(host="localhost", port=16379, socket_connect_timeout=5, socket_timeout=30)
+target_db = FalkorDB(host="127.0.0.1", port=16379, socket_connect_timeout=5, socket_timeout=30)
 target_g = target_db.select_graph("tortoise_restored_20260805")
 
 # Verify target is empty

@@ -84,6 +84,15 @@ function expect(name, got, expected) {
   console.log(`${ok ? "✅" : "❌"} ${name}: ${JSON.stringify(got)}${ok ? "" : ` (expected ${JSON.stringify(expected)})`}`);
   ok ? pass++ : fail++;
 }
+/** A boolean arm that FAILS WITH ITS OBSERVATION. `expect()` compares against an
+ *  expected value, so a multi-part assertion (`blocked(r) && /reason/`) has no honest
+ *  `expected` to print — this is that shape: the condition is the verdict, and the
+ *  refusal text (which is what makes the arm unable to pass for the wrong reason) rides
+ *  the failure line. Same helper the sibling suites carry. */
+function expectTrue(name, cond, detail = "") {
+  console.log(`${cond ? "✅" : "❌"} ${name}${cond || !detail ? "" : ` — ${String(detail).slice(0, 400)}`}`);
+  cond ? pass++ : fail++;
+}
 function fatal(name, detail) {
   console.log(`❌ ${name}: ${detail}`);
   fail++;
@@ -185,17 +194,35 @@ if (typeof stripTypeScriptTypes !== "function" || (typeof register !== "function
   /** Deploy the guard extension to <root>/extensions/main-worktree-guard (a
    *  COPY, exactly how pi lands it on a cell) and return the module's file URL.
    *  `mutate` is applied to index.ts and MUST match — an unapplied patch fails
-   *  loudly instead of silently testing the unmutated code. */
+   *  loudly instead of silently testing the unmutated code.
+   *
+   *  ⛔ AND IT MUST MATCH EXACTLY ONCE. `String.replace` with a string pattern
+   *  rewrites only the FIRST occurrence, so an anchor that also appears in a
+   *  sibling function mutates the WRONG one and the arm then “passes” against
+   *  unmutated code — an assertion that cannot fail for its claimed reason,
+   *  which is the one defect this suite exists to prevent (measured while
+   *  writing the #2775 arms: the M4 stand-down anchor occurs twice in index.ts).
+   *  `mutate` may be ONE mutation or an ARRAY of them, applied in order — arms
+   *  that isolate one site need to neutralize the other gate that would otherwise
+   *  speak first. */
   function deploy(root, mutate = null) {
     const dir = join(root, "extensions", "main-worktree-guard");
     mkdirSync(dir, { recursive: true });
     for (const f of readdirSync(HERE)) {
       if (/\.(ts|mjs|json)$/.test(f) && !f.startsWith("test")) copyFileSync(join(HERE, f), join(dir, f));
     }
-    if (mutate) {
-      const src = readFileSync(join(dir, "index.ts"), "utf-8");
-      if (!src.includes(mutate.from)) { fatal(`mutation ${mutate.name} applies`, `anchor not found in index.ts: ${mutate.from.slice(0, 80)}`); return null; }
-      writeFileSync(join(dir, "index.ts"), src.replace(mutate.from, mutate.to));
+    const mutations = mutate === null ? [] : (Array.isArray(mutate) ? mutate : [mutate]);
+    if (mutations.length) {
+      let src = readFileSync(join(dir, "index.ts"), "utf-8");
+      for (const m of mutations) {
+        const hits = src.split(m.from).length - 1;
+        if (hits !== 1) {
+          fatal(`mutation ${m.name} applies`, `anchor occurs ${hits} time(s) in index.ts, needs exactly 1: ${m.from.slice(0, 80)}`);
+          return null;
+        }
+        src = src.replace(m.from, m.to);
+      }
+      writeFileSync(join(dir, "index.ts"), src);
     }
     // index.ts imports ../shared/* (audit + print-mode) — a deployment carries
     // the whole extensions tree, so the copy has to as well.
@@ -281,13 +308,20 @@ if (typeof stripTypeScriptTypes !== "function" || (typeof register !== "function
     // ── (b) AN UNRELATED SCRIPT RENAMED TO THE SANCTIONED RELPATH → BLOCKED ──
     // Same framework tree, same relpath, same filename — only the BYTES differ.
     // This is the half a path rule cannot see, so it is what proves identity.
+    // The body is a PUSH, not a discard, because #2775 made M5's set filter digest-keyed
+    // too: a discard body would then be refused by M5 as well, and M2's mutation (drop arm
+    // 2's digest) could no longer make THIS arm red — an arm that passes for the other
+    // gate's reason measures nothing about the leaf digest. A push is refused by M4's walk
+    // alone, so the fixture isolates the half under test.
+    const PUSH = ["git", "push", "origin", "feat/x"].join(" ");
     const fw2 = join(work, "framework-forged");
     framework(fw2);
     mkdirSync(join(fw2, "scripts"), { recursive: true });
     installClosure(fw2); // a real attack copies the whole farm; only the LEAF differs
-    writeFileSync(join(fw2, "scripts", "admin-merge.sh"), `#!/bin/bash\n${RESET}\n`);
-    expect("(b) an UNRELATED script at a framework tree's scripts/admin-merge.sh (right name, wrong bytes) → BLOCKED",
-      blocked(await bash(guard, `bash "${join(fw2, "scripts", "admin-merge.sh")}" 123`, hub)), true);
+    writeFileSync(join(fw2, "scripts", "admin-merge.sh"), `#!/bin/bash\n${PUSH}\n`);
+    const forgedRes = await bash(guard, `bash "${join(fw2, "scripts", "admin-merge.sh")}" 123`, hub);
+    expect("(b) an UNRELATED script at a framework tree's scripts/admin-merge.sh (right name, wrong bytes) → BLOCKED by M4's walk",
+      blocked(forgedRes) && /script content contains a blocked git operation/.test(String(forgedRes.reason)), true);
 
     // ── (b3) THE #1228 BODY ARM IS DIGEST-KEYED, NOT PATH-KEYED ──
     // `_sanctionedScriptExemption` arm 1 is PATH ONLY by spec (the pre-existing #1129
@@ -300,10 +334,11 @@ if (typeof stripTypeScriptTypes !== "function" || (typeof register !== "function
     // fail-open (an operand the shell resolves at runtime, discarding work the gate never
     // read). M6 below drops the digest and requires this invocation to be ALLOWED, so this
     // arm fails if the key ever becomes the path again.
-    const plant = (root) => {
+    const EXPANDED_BODY = '#!/bin/bash\ngrep -qa m <(head -c 10 "$HOME/x")\n';
+    const plant = (root, body = EXPANDED_BODY) => {
       mkdirSync(join(root, "scripts"), { recursive: true });
       const p = join(root, "scripts", "scratch-worktree.sh");
-      writeFileSync(p, '#!/bin/bash\ngrep -qa m <(head -c 10 "$HOME/x")\n');
+      writeFileSync(p, body);
       return p;
     };
     const planted = plant(join(work, "deploy"));
@@ -316,6 +351,48 @@ if (typeof stripTypeScriptTypes !== "function" || (typeof register !== "function
       // this arm exists for is untouched (M6 below still requires it to admit).
       blocked(plantedRes) && /#709/.test(String(plantedRes.reason)) &&
       /is invoked as a script \(line 2 of .*scratch-worktree\.sh\)/.test(String(plantedRes.reason)), true);
+
+    // ── (g)/(h) THE TWO SITES #2775 NAMES ──
+    // `plant()` puts an unaudited body at a sanctioned relpath under the MODULE root, which
+    // is the one geometry where arm 1 matches and arm 2 cannot (the module root of a
+    // copy-deployed box is not a framework checkout) — i.e. the attack, not a mock. Both
+    // sites used to key on that PATH for a decision about BYTES: M4's `_backdoorBlock`
+    // stand-down (skips the WHOLE content walk) and M5's `sets` filter (drops the parsed
+    // discard verdict). Measured on origin/main before the fix, both ALLOWED:
+    //   `bash <moduleRoot>/scripts/scratch-worktree.sh` with a `reset --hard` / `push` /
+    //   `checkout -- "$FILE"` body ran, while the same bytes at any other path were BLOCKED.
+    // Each arm is paired with a mutation restoring the path-only key, because an arm that
+    // cannot fail for its claimed reason is worse than no arm.
+    //
+    // (g) isolates M4: a PUSH body is refused by the M4 walk and is not a discard, so M5
+    //     has nothing to say about it — flip M4 back to the path and the run is ALLOWED.
+    const m4Planted = plant(join(work, "deploy"), `#!/bin/bash\n${PUSH}\n`);
+    const m4Res = await bash(guard, `bash "${m4Planted}" --help`, hub);
+    expectTrue("(g) #2775 — M4: unaudited bytes at a sanctioned relpath under the MODULE root are NOT exempt from the content walk (a push body)",
+      blocked(m4Res) && /script content contains a blocked git operation/.test(String(m4Res.reason)),
+      `reason=${JSON.stringify(String(m4Res?.reason)).slice(0, 200)}`);
+
+    // (h) isolates M5: with M4 NEUTRALIZED, M5 is the only gate, and its own verdict on the
+    //     same geometry is observable. The body's discard has an UNRESOLVABLE pathspec, which
+    //     is M5's fail-closed arm (#709) and NOT a wording M4 can produce — so the arm cannot
+    //     pass for M4's reason.
+    const CHECKOUT_VAR = `${["git", "checkout", "--"].join(" ")} "$FILE"`;
+    const M4_OFF = {
+      name: "M4-neutralized",
+      // TWO lines: the same statement also sits in an unrelated helper, and a one-line anchor
+      // mutates THAT one instead (see `deploy`'s note).
+      from: 'if (isWorktreeCwdWrite(resolve(process.cwd()))) return null; // worktree sessions are isolated\n    // #627: non-shell CODE interpreters',
+      to: 'if (true) return null; // MUTATION M4-off: M4 neutralized, M5 is the only gate\n    // #627: non-shell CODE interpreters',
+    };
+    const m5Only = await loadGuard(join(work, "m5-only"), M4_OFF);
+    if (m5Only) {
+      const m5Planted = plant(join(work, "m5-only"), `#!/bin/bash\n${CHECKOUT_VAR}\n`);
+      const m5Res = await bash(m5Only, `bash "${m5Planted}" --help`, hub);
+      expectTrue("(h) #2775 — M5: the sanctioned SET exemption does not drop a discard parsed from unaudited bytes at a sanctioned relpath",
+        blocked(m5Res) && /#709/.test(String(m5Res.reason)) && /not statically resolvable/.test(String(m5Res.reason)),
+        `reason=${JSON.stringify(String(m5Res?.reason)).slice(0, 200)}`);
+    }
+
 
     // ── (c) THE AUDITED BYTES AT AN ARBITRARY PATH → BLOCKED (#1485 B5b) ──
     // The pin alone would exempt this; the framework-root half is what does not.
@@ -383,10 +460,19 @@ if (typeof stripTypeScriptTypes !== "function" || (typeof register !== "function
       from: "if (_sha256Of(real) !== want) continue;",
       to: "if (false) continue; // MUTATION M2: the leaf's own bytes not compared",
     };
+    // M2 drops the leaf DIGEST inside arm 2 (`_sanctionedScriptExemption`). ⛔ THIS ARM'S
+    // EXPECTATION WAS INVERTED BY #2775, deliberately: it used to require (b) to become
+    // ALLOWED, because arm 2's digest was the ONLY thing refusing a right-name/wrong-bytes
+    // leaf. #2775 put the same digest check at the two GRANT sites (M4's stand-down, M5's set
+    // filter), so arm 2's own digest is now a second line of defence rather than the only
+    // one — and dropping it must NOT open the gate. Asserting that (instead of the old
+    // "⇒ (b) FAILS") keeps the arm able to fail: it reds the day a grant site starts
+    // trusting `via === "identity"` instead of re-checking the bytes, which is exactly how a
+    // single dropped check would become a fail-open again.
     const m2 = await loadGuard(join(work, "mut-m2"), M2);
     if (m2) {
-      expect("(d2) MUTATION M2 — digest comparison dropped ⇒ (b) FAILS (a renamed destructive script is allowed)",
-        blocked(await bash(m2, `bash "${join(fw2, "scripts", "admin-merge.sh")}" 123`, hub)), false);
+      expect("(d2) MUTATION M2 — arm 2's leaf digest dropped ⇒ (b) STAYS BLOCKED (the grant site re-checks the bytes, so one dropped check cannot open the gate)",
+        blocked(await bash(m2, `bash "${join(fw2, "scripts", "admin-merge.sh")}" 123`, hub)), true);
     }
 
     // M3 drops the framework-root check. If (c) then passes, the root check is
@@ -429,24 +515,54 @@ if (typeof stripTypeScriptTypes !== "function" || (typeof register !== "function
       expect("(d6) MUTATION M5 — an ABSENT delegate skipped instead of declining ⇒ (e) FAILS (a bare pinned leaf is admitted)",
         blocked(await bash(m5, `bash "${join(fwBare, "scripts", "admin-merge.sh")}" 123`, hub)), false);
     }
-    // M6 drops the DIGEST from `_isAuditedSanctionedScript`. If (b3) then passes, the whole
-    // stand-down rests on a path an agent can reproduce — which is the fail-open it replaced.
+    // M6 drops the DIGEST from the shared narrowing predicate (#2775 moved the comparison out of
+    // `_isAuditedSanctionedScript` into `_auditedSanctionedExemption`, so that both callers and
+    // the boolean wrapper ask ONE question). If (b3) then passes, the whole stand-down rests on a
+    // path an agent can reproduce — which is the fail-open it replaced.
     const M6 = {
       name: "M6 body-arm-digest-dropped",
-      // The anchor tracks the CURRENT body of `_isAuditedSanctionedScript`, re-cut on
-      // 2026-10-24 when `bodyDigest` became a REQUIRED parameter and the disk-read fallback was
-      // removed; the previous anchor (`got !== null && got === want`) no longer occurs there.
-      // `deploy()` refuses to run a mutation whose anchor is absent (`fatal()` → nonzero exit),
-      // so a stale anchor reds this suite rather than silently testing unmutated code — which
-      // is why re-cutting it is a one-line maintenance task and not a silent hole.
-      from: 'return typeof want === "string" && want.length === 64 && bodyDigest === want;',
-      to: 'return true; // MUTATION M6: the body-arm digest dropped — the anchor alone grants',
+      // The anchor tracks the CURRENT body, re-cut when the digest became a REQUIRED parameter
+      // (2026-10-24, disk-read fallback removed) and again when #2775 extracted the predicate.
+      // `deploy()` refuses to run a mutation whose anchor is absent OR not unique (`fatal()` →
+      // nonzero exit), so a stale anchor reds this suite rather than silently testing unmutated
+      // code — which is why re-cutting it is a one-line maintenance task and not a silent hole.
+      from: '  return bodyDigest === want ? sa : null;',
+      to: '  return sa; // MUTATION M6: the body-arm digest dropped — the anchor alone grants',
     };
     const m6 = await loadGuard(join(work, "mut-m6"), M6);
     if (m6) {
       const m6Planted = plant(join(work, "mut-m6"));
-      expect("(d7) MUTATION M6 — digest dropped from _isAuditedSanctionedScript ⇒ (b3) FAILS (unaudited bytes at a sanctioned relpath are admitted)",
+      expect("(d7) MUTATION M6 — digest dropped from _auditedSanctionedExemption ⇒ (b3) FAILS (unaudited bytes at a sanctioned relpath are admitted)",
         blocked(await bash(m6, `bash "${m6Planted}" --help`, hub)), false);
+    }
+
+    // M7 restores the PATH-only key at M4's stand-down (`_backdoorBlock`) — the #2775 fail-open.
+    // (g) must go red, or M4's digest is not load-bearing.
+    const M7 = {
+      name: "M7 m4-stand-down-path-only",
+      from: '    const sanctionedMatch = sanctionedPath === null\n      ? null\n      : _auditedSanctionedExemption(resolved, _sha256Of(resolved) ?? "");',
+      to: '    const sanctionedMatch = sanctionedPath; // MUTATION M7: M4 keys on the PATH again',
+    };
+    const m7 = await loadGuard(join(work, "mut-m7"), M7);
+    if (m7) {
+      const m7Planted = plant(join(work, "mut-m7"), `#!/bin/bash\n${PUSH}\n`);
+      expect("(d8) MUTATION M7 — M4's stand-down keyed on the PATH again ⇒ (g) FAILS (agent-minted bytes at a sanctioned relpath skip the content walk)",
+        blocked(await bash(m7, `bash "${m7Planted}" --help`, hub)), false);
+    }
+
+    // M8 restores the PATH-only key at M5's `sets` filter. M4 is neutralized in the SAME guard,
+    // because M4 runs first and would otherwise refuse the fixture for its own reason — the arm
+    // is about M5's key, so M5 must be the only gate that can speak.
+    const M8 = {
+      name: "M8 m5-set-filter-path-only",
+      from: '    try { sa = s.digest === null ? null : _auditedSanctionedExemption(resolve(execCwd, s.script), s.digest); } catch { sa = null; }',
+      to: '    try { sa = _sanctionedScriptExemption(resolve(execCwd, s.script)); } catch { sa = null; } // MUTATION M8: M5 keys on the PATH again',
+    };
+    const m8 = await loadGuard(join(work, "mut-m8"), [M4_OFF, M8]);
+    if (m8) {
+      const m8Planted = plant(join(work, "mut-m8"), `#!/bin/bash\n${CHECKOUT_VAR}\n`);
+      expect("(d9) MUTATION M8 — M5's set filter keyed on the PATH again ⇒ (h) FAILS (a discard parsed from agent-minted bytes at a sanctioned relpath is dropped from the set)",
+        blocked(await bash(m8, `bash "${m8Planted}" --help`, hub)), false);
     }
   } finally {
     for (const [k, v] of savedEnv) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }

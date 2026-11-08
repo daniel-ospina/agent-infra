@@ -466,6 +466,64 @@ async function main() {
     await fire("session_start", {});
   });
 
+  test("scenario 8d (#2242): a REFUSED `[VGATE]` dispatch must not fail-open the gate", async () => {
+    // ⛔ THE GUARD WHOSE ABSENCE IS A CLASS-A FALSE PASS (review round 7, P2). A pre-spawn refusal
+    // carries NON-EMPTY content and NO `details.background`, so it passes the #1662 guard and the
+    // empty-content guard, falls through the parse, and — in an INTERACTIVE orchestrator
+    // (`isTaskSubAgent()` is false for a lane controller) — reaches the #5724 fail-open
+    // prompt-merge, which marks every file named in the prompt VERIFIED with no verifier run.
+    // #2242 makes it routine: `TASK_SESSION_CEILING_REFUSE=1` refuses every `[VGATE]` dispatch on a
+    // saturated box, so the knob documented as "fail fast" would defeat the gate it is fastest on
+    // the box most likely to be dispatching a reviewer. Nothing reddened if the guard were moved,
+    // narrowed or deleted — hence this row.
+    const repo = join(TEST_ROOT, "repo");
+    git(repo, "reset -q");
+    await fire("session_start", {});
+    writeFileSync(join(repo, "fileREF.txt"), "ref1\n");
+    git(repo, "add fileREF.txt");
+    const prompt = `[VGATE] verify files: fileREF.txt. Classification: UI. Project root: ${repo}`;
+    // Block first — establishes lastBlockedCwd/lastBlockedFiles (what the prompt-merge would consume).
+    const blocked = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git commit -m 'ref0'", cwd: repo },
+    });
+    ok(blocked && blocked.block === true, "must be blocked before any verifier verdict");
+    // The exact shape `task` emits for a pre-spawn refusal: non-empty content, a status, no bg marker.
+    await fire("tool_result", {
+      toolName: "task",
+      input: { prompt },
+      details: { status: "fleet-saturated", retryable: false, error: "could not dispatch: fleet saturated at 88 sessions on 10 cores (ceiling 80)" },
+      content: [{ type: "text", text: "❌ could not dispatch: fleet saturated at 88 sessions on 10 cores (ceiling 80)" }],
+    });
+    const res = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git commit -m 'ref1'", cwd: repo },
+    });
+    ok(res && res.block === true, "⛔ a refused [VGATE] dispatch must NOT fail-open — the gate stays BLOCKED");
+    // ⛔ AND IT MUST NOT FEED THE `vgateFailures` LATCH: three COUNTED failures auto-DISABLE the gate,
+    // so counting refusals would let a saturated box switch verification off entirely. Assert on the
+    // audit row rather than on a third blocked commit — the gate ALSO has a separate per-file
+    // `blockAttempts` bypass (`⏩ Auto-bypassed after 3+ attempts on 1 files`), and three blocked
+    // commits would trip THAT one, reddening this row for a reason that has nothing to do with
+    // refusals. `vgate_failure_threshold_disable` is the refusal-driven latch and nothing else.
+    const disablesBefore = readAuditLines().filter(
+      (l) => l.event === "gate_bypass" && l.reason === "vgate_failure_threshold_disable",
+    ).length;
+    for (let i = 0; i < 3; i++) {
+      await fire("tool_result", {
+        toolName: "task",
+        input: { prompt },
+        details: { status: "fleet-saturated", retryable: false },
+        content: [{ type: "text", text: "❌ could not dispatch: fleet saturated at 88 sessions" }],
+      });
+    }
+    const disablesAfter = readAuditLines().filter(
+      (l) => l.event === "gate_bypass" && l.reason === "vgate_failure_threshold_disable",
+    ).length;
+    equal(disablesAfter, disablesBefore, "⛔ three refusals must NOT trip the `vgateFailures` latch — a refusal may not move the gate toward disabled");
+    await fire("session_start", {});
+  });
+
   test("scenario 8b (#561 review r4): unparseable arm single-fire — 3 strikes + post-latch dispatch → exactly ONE audit", async () => {
     const repo = join(TEST_ROOT, "repo");
     git(repo, "reset -q");
