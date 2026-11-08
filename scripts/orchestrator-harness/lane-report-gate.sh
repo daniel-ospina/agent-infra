@@ -138,6 +138,18 @@ _lrg_py() {
   # macOS layouts this list exists for — preferring them would put the verdict-computing program in a
   # directory the lane's own user can replace. `/usr/bin/python3` is SIP/root-owned on macOS and root on
   # Debian/Ubuntu, so it is preferred wherever it satisfies the floor.
+  # ⛔ AND THAT PREFERENCE IS NOT A CLOSURE ON THE macOS SHAPES THIS LIST EXISTS FOR (round-13 review, MED,
+  # measured). Where `/usr/bin/python3` is 3.9 it FAILS the probe, so the FIRST SATISFYING candidate is the
+  # homebrew/`/usr/local` build — the user-owned directory this comment just called replaceable. Absolute
+  # paths therefore close "which PATH entry" but not "which program": a lane that replaces that file
+  # chooses the program that computes every arm of the verdict. ⛔ IT IS DISCLOSED RATHER THAN SILENTLY
+  # ACCEPTED, and it is NOT fixed here on purpose: refusing a user-writable interpreter refuses EVERY merge
+  # on a dev Mac / a cell with no root-owned 3.12, which is a larger outage than the bypass it closes (the
+  # harness's own rule: a false block is repaired, not shipped). The durable fix is a pinned, root-owned
+  # runtime for the gate, tracked with the `git` half of the same class — agent-infra#3789, whose note
+  # covers "a lane that sets PATH can substitute the git that reports the head"; this is that class one
+  # program over, and the same 66-fixture bar applies. Do not read `_lrg_py`'s absolute candidates as
+  # closing the self-supplied-verifier class.
   for c in /usr/bin/python3 /usr/bin/python /opt/homebrew/bin/python3 /usr/local/bin/python3 \
            /opt/homebrew/bin/python /usr/local/bin/python; do
     [ -x "$c" ] || continue
@@ -261,15 +273,30 @@ _lrg_stanza_paths() {
 _lrg_evidence_off_branch() {
   local repo="$1" branch="$2" head="$3" p="" py="" kv="" b="" hw="" holders=""
   [ -n "$repo" ] || return 1
-  # Pass 1 — bash builtins only: which stanzas hold a writer state at all? No interpreter needed to answer
-  # "does this box hold any evidence", which is exactly the question code 6 turns on.
+  # Pass 1 — bash builtins only: which stanzas hold a writer state, and does any of them even MENTION this
+  # branch or this head? Both questions are answered without an interpreter, and both are what code 6 turns
+  # on. ⛔ A HOLDER IS NOT AN ATTRIBUTION (round-13 review, MED): a multi-lane box has worktrees for OTHER
+  # branches holding their own state, and refusing on the bare existence of one turned every cross-box merge
+  # into a hard refusal on any box below the 3.12 floor — while the same repo WITH an interpreter answers 6.
+  # The substring test is a heuristic, and it is allowed to be one: when an interpreter IS available the
+  # exact parse in pass 2 decides, and when it is not, the cheapest alternative for the lane is the
+  # already-disclosed residual (delete the state, answer 6) — so it hands the graded party nothing new.
+  local named=0
   while IFS= read -r p; do
     [ -n "$p" ] || continue
-    [ -f "$p/.worktree-report/state.json" ] && holders="$holders$p
+    [ -f "$p/.worktree-report/state.json" ] || continue
+    holders="$holders$p
 "
+    if [ "$named" = 0 ]; then
+      while IFS= read -r _lrg_raw; do
+        case "$_lrg_raw" in
+          *"$branch"*|*"$head"*) [ -n "$branch" ] || [ -n "$head" ] && named=1; break ;;
+        esac
+      done < "$p/.worktree-report/state.json"
+    fi
   done <<< "$(_lrg_stanza_paths "$repo")"
   [ -n "$holders" ] || return 1
-  py="$(_lrg_py)" || return 2
+  py="$(_lrg_py)" || { [ "$named" = 1 ] && return 2; return 1; }
   while IFS= read -r p; do
     [ -n "$p" ] || continue
     [ -f "$p/.worktree-report/state.json" ] || continue
@@ -302,7 +329,7 @@ print("%s\x1f%s" % (_b if isinstance(_b, str) else "", _h if isinstance(_h, str)
 # lane_report_gate <repo-path> <branch> <head> — the decision table above.
 lane_report_gate() {
   local repo="${1:-}" branch="${2:-}" head="${3:-}" wt="" tool="" py="" out="" rc=0
-  local ok="" stale="" rules="" rec_head="" live_head="" sealed12="" rec12="" sealed_n="" _lrg_ev="" _lrg_ev_rc=0
+  local ok="" stale="" rules="" rec_head="" live_head="" sealed12="" rec12="" sealed_n="" seal_split="" suite_ev="" _lrg_ev="" _lrg_ev_rc=0
 
   # ⛔ `head` IS THE WHOLE POINT OF THE GATE, SO AN EMPTY ONE CANNOT PASS ANY ARM (fresh review, P1).
   # The first version took it as documentation: `head=` appeared in every message and in NO comparison,
@@ -350,11 +377,14 @@ lane_report_gate() {
     # that one command defeats RED/INVALID/STALE/UNMEASURABLE at once, because they are all downstream of
     # this resolution.
     # The two cases are distinguishable from the listing already in hand: a CROSS-BOX abstention has no
-    # stanza at this head, while a self-detached lane has one. ⛔ THE `WORKTREE-REPORT.md` CONJUNCT IS
-    # LOAD-BEARING: a bare `HEAD == $head` test would over-block the ordinary case where the hub checkout
-    # happens to sit at the PR head (the 66-row over-block lesson above). With it, the box must actually
-    # HOLD a report for this head — so the refusal is "this box has your evidence and cannot grade it",
-    # which has a cheap remedy, not "the box is elsewhere".
+    # stanza at this head, while a self-detached lane has one. ⛔ THE `WORKTREE-REPORT.md` TEST DOES NOT
+    # GATE THE ARM — IT CHOOSES THE WORDING (round-13 review, LOW: an earlier comment here claimed it was
+    # "LOAD-BEARING" and that a bare `HEAD == $head` test would over-block the hub-at-head case; both were
+    # false — this arm answers 7 with or without a report). Round 11 removed the conjunct from the FIRING
+    # condition on purpose, because a lane switched its own precondition off by deleting the report. So a
+    # stanza at the merging head fires, report or not, and what it holds decides only the reason; the
+    # over-block the old comment named is LIVE and accepted, because the alternative is the delete-the-
+    # report bypass that round 11 closed.
     # ⛔ THE LANE-OWNED FACTS MAY CHOOSE THE REASON, NEVER WHETHER THE ARM FIRES (round-11 review, P0).
     # Round 10 keyed the refusal on `-f WORKTREE-REPORT.md` and a `grep` of the state branch, so a lane
     # defeated the arm by turning off ITS OWN PRECONDITION: deleting the report, or dropping the `branch`
@@ -505,7 +535,7 @@ lane_report_gate() {
   # ⛔ `-c`, NOT A NESTED HEREDOC: a heredoc body is literal text, so a `<<PY` inside a `<<EOF` body
   # never runs as a program — it is the outer heredoc's DATA, the reader then gets garbage and this gate
   # would abstain on every lane that has a perfectly good report (found before it shipped).
-  _LRG_JSON_PY='import datetime, json, re, sys
+  _LRG_JSON_PY='import datetime, json, os, re, sys
 try:
     d = json.loads(sys.argv[1])
 except Exception:
@@ -647,26 +677,80 @@ if newest is not None and sys.argv[3]:
 # let a two-field-edited `state.json` PASS (measured against the shipped script). Extraction now happens
 # with the same absolute, `-I`-isolated interpreter as every other field; the only PATH-resolved program
 # left in the decision path is `git` (the disclosed #3789 seam).
-# ⛔ THE LAST FULL-SHAPE LINE, NOT THE FIRST: the writer renders the lane-owned `state["worktree"]` value
-# VERBATIM on `- **Worktree:**` ABOVE the real stamp, so a newline in that value reproduces the anchored
-# shape and a first-match read would take the injected one. The writer emits exactly one real stamp, after
-# every lane-controlled field, so the LAST match is the real one.
+# THE STAMP LIVES IN THE REPORT HEADER, AND ONLY THE HEADER IS READ.
+# ⛔ "THE LAST MATCH IS THE REAL ONE" WAS NEVER TRUE AND IS GONE (round-13 review, LOW). The writer renders
+# the real stamp in the header and then renders `## Suites run` (suite commands AND log tails, verbatim)
+# and `## Could not do` (lane-supplied `note --not-done` text, verbatim) BELOW it, so position cannot
+# separate the writer stamp from lane-authored text: a body line can reproduce the shape. Counting over
+# the whole document also refused an UNTAMPERED report whose own suite log tail contained the shape
+# (measured, real writer: two matches, rc=2, remedy unsatisfiable). So the split is structural — the
+# header ends at the first `## ` heading — and only header lines are counted.
+# ⛔ AND A SPLIT BASE LINE IS REFUSED, because the writer renders `state["base_sha"]` VERBATIM, so a
+# newline in it splits the anchored line and NOTHING matches: a forged `head_at_write` then sailed past
+# the cross-check with the tool re-sealing its own digest honestly (measured, real writer: rc=4 STALE ->
+# rc=0 PASS, at a cost of two JSON fields — cheaper than the disclosed stamp-rewrite residual). A header
+# line that STARTS a Base stamp but is not the full shape is therefore tampering, not an older writer:
+# an older writer has no Base line at all.
 _sealed12 = ""
 _sealed_n = 0
+_seal_split = 0
 try:
     with open(sys.argv[4], encoding="utf-8", errors="replace") as _rf:
         _rlines = _rf.read().splitlines()
 except Exception:
     _rlines = []
 _seal_pat = re.compile(r"^- \*\*Base:\*\* .*head at write:\*\* `([0-9a-f]{12})`.*$")
+_hdr = []
 for _rl in _rlines:
+    if _rl.startswith("## "):
+        break
+    _hdr.append(_rl)
+for _rl in _hdr:
     _sm = _seal_pat.match(_rl)
     if _sm:
-        # EVERY match is counted: an honest report carries exactly one real stamp, and the lane-authored
-        # text the writer renders BELOW it can reproduce the shape (see the refusal in the caller).
         _sealed_n += 1
         _sealed12 = _sm.group(1)
-print("%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s" % (
+    elif _rl.startswith("- **Base:**"):
+        _seal_split = 1
+# ⛔ NO RECORDED OUTPUT AT ALL IS NOT EVIDENCE (round-13 review, MED). The owner ruling this gate implements
+# refuses a report that "claims tests without output", and `run --cmd true` records a suite with exit 0, no
+# counts and a 0-byte log — which the consumer itself calls VALID, so the gate is the only refusal point
+# (measured, real writer: the whole substitution was satisfiable with `init; run --cmd true; write`).
+# A suite whose log is non-empty OR whose counts parsed is evidence; if NO recorded suite has either, the
+# report claims tests without output.
+_suite_ev = ""
+try:
+    with open(sys.argv[2], encoding="utf-8", errors="replace") as _sf:
+        _st2 = json.load(_sf)
+    _recs = _st2.get("suites") if isinstance(_st2, dict) else None
+    if isinstance(_recs, list) and _recs:
+        _bytes = 0
+        _counted = 0
+        _logged = 0
+        for _rec in _recs:
+            if not isinstance(_rec, dict):
+                continue
+            if isinstance(_rec.get("counts"), dict) and _rec.get("counts"):
+                _counted += 1
+            _lp = str(_rec.get("log") or "")
+            # ⛔ A RECORD WITH NO `log` KEY IS NOT THE BUSINESS OF THIS ARM: the writer always records one, and a
+            # state that omits it is what the consumer refuses on its own (`suite-log-missing`, so `ok:false`
+            # -> INVALID before this arm is reached). Only the WRITER shape — a log path that EXISTS and is
+            # EMPTY (`run --cmd true`) — is the "tests without output" hole, so only that shape is measured.
+            if not _lp:
+                continue
+            _logged += 1
+            # a path from the state is lane-written: absolute paths and `..` are never joined.
+            if _lp.startswith("/") or ".." in _lp.split("/"):
+                continue
+            try:
+                _bytes += os.path.getsize(os.path.join(sys.argv[5], _lp))
+            except Exception:
+                pass
+        _suite_ev = "no-output" if (_logged > 0 and _bytes <= 0 and _counted == 0) else "ok"
+except Exception:
+    _suite_ev = ""
+print("%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s" % (
     "1" if d.get("ok") is True else "0",
     "1" if d.get("head_moved_since_write") is True else "0",
     ",".join(str(r) for r in rules)[:400],
@@ -678,8 +762,10 @@ print("%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s" % (
     _sealed12,
     rec[:12],
     _sealed_n,
+    _seal_split,
+    _suite_ev,
 ))'
-  if ! IFS='|' read -r ok stale rules rec_head live_head predates skew state_ok sealed12 rec12 sealed_n <<< "$("$py" -I -c "$_LRG_JSON_PY" "$out" "$wt/.worktree-report/state.json" "$commit_iso" "$wt/WORKTREE-REPORT.md" 2>/dev/null)"; then
+  if ! IFS='|' read -r ok stale rules rec_head live_head predates skew state_ok sealed12 rec12 sealed_n seal_split suite_ev <<< "$("$py" -I -c "$_LRG_JSON_PY" "$out" "$wt/.worktree-report/state.json" "$commit_iso" "$wt/WORKTREE-REPORT.md" "$wt" 2>/dev/null)"; then
     _lrg_emit 7 UNMEASURABLE "branch=$branch worktree=$wt tool=$tool reason=consumer-json-unusable check_rc=$rc head=$head"
     return 7
   fi
@@ -756,8 +842,31 @@ print("%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s" % (
   # at the same cost as forging two — the disclosure above says so, and this arm is a speed bump, not
   # tamper-proofing. Both the stamp and the state head's 12-hex prefix come out of the pinned interpreter
   # pass (round-12 review, MED: `sed`/`tail`/`cut` were PATH-resolved programs computing this verdict).
+  # ⛔ A COUNT OVER THE HEADER, NOT OVER THE DOCUMENT (round-13 review, LOW): a body stamp is lane-authored
+  # prose (a suite command, a log tail, a `note --not-done` item) and refusing it made an UNTAMPERED report
+  # INVALID with a remedy that re-runs the same suite and reproduces the duplicate. Only a SECOND header
+  # stamp is a self-contradicting artifact — that is the round-10/11 injection through `state["worktree"]`.
   if [ "${sealed_n:-0}" -gt 1 ] 2>/dev/null; then
     _lrg_emit 2 INVALID "branch=$branch worktree=$wt report=$wt/WORKTREE-REPORT.md reason=report-carries-more-than-one-head-at-write-stamp stamps=$sealed_n head=$head"
+    return 2
+  fi
+  # ⛔ A HEADER BASE LINE THAT CANNOT CARRY ITS STAMP IS TAMPERING, NOT AN OLDER WRITER (round-13 review,
+  # HIGH). The writer interpolates `state["base_sha"]` VERBATIM, so a newline in it splits the anchored
+  # line and NOTHING matches — the cross-check is skipped, the tool re-seals its own digest honestly, and a
+  # forged `head_at_write` PASSes (measured with the real writer: rc=4 STALE -> rc=0 PASS for two JSON
+  # fields). `0` stamps WITH a Base line present is that split; `0` stamps with NO Base line is an older
+  # writer and keeps abstaining from this arm, as before.
+  if [ "${seal_split:-0}" = "1" ]; then
+    _lrg_emit 2 INVALID "branch=$branch worktree=$wt report=$wt/WORKTREE-REPORT.md reason=report-header-base-line-was-split-or-malformed head=$head"
+    return 2
+  fi
+  # ⛔ A REPORT WHOSE RECORDED SUITES PRODUCED NO OUTPUT AT ALL IS "tests without output" — the exact shape
+  # the owner ruling says the verifier must refuse (round-13 review, MED). `init; run --cmd true; write`
+  # records exit 0, no counts and a 0-byte log, and the consumer calls that VALID, so the gate is the only
+  # refusal point. One recorded suite with a non-empty log OR parsed counts is enough: a silent lint run
+  # beside a real one is not refused.
+  if [ "$suite_ev" = "no-output" ]; then
+    _lrg_emit 2 INVALID "branch=$branch worktree=$wt report=$wt/WORKTREE-REPORT.md reason=recorded-suites-produced-no-output head=$head"
     return 2
   fi
   if [ -n "$sealed12" ] && [ -n "$rec12" ] && [ "$rec12" != "$sealed12" ]; then
@@ -803,7 +912,7 @@ lane_report_remedy() {
   case "${1:-}" in
     1) printf '  The lane wrote no report. Write one BEFORE the next merge attempt: %s\n' \
          'python3 tools/worktree_report.py init --issue <N>, then run every suite through it (run --cmd <cmd>), then write.' ;;
-    2) printf '  The evidence in the report does not hold up (a recorded log is missing, its hash does not\n  match, or a promised section is absent). Re-run the affected suite through the tool so the record\n  matches its log.\n' ;;
+    2) printf '  The evidence in the report does not hold up (a recorded log is missing, its hash does not\n  match, or a promised section is absent). Re-run the affected suite through the tool so the record\n  matches its log.\n  Three shapes cannot be fixed by re-running the SAME suite, because the report itself is malformed:\n  • `reason=recorded-suites-produced-no-output` — the report claims suites whose logs are empty and\n    whose counts did not parse (`run --cmd true` is the minimal case). Run a suite that produces output.\n  • `reason=report-carries-more-than-one-head-at-write-stamp` — two header stamps. Do NOT hand-edit the\n    markdown: rewrite the report from the writer (`run` each suite again, then `write`).\n  • `reason=report-header-base-line-was-split-or-malformed` — a lane-writable value split the header\n    line. Same remedy: rewrite it from the writer, do not patch the markdown.\n' ;;
     3) printf '  The report RECORDS A FAILING SUITE. A green report is a precondition of merge: fix the failure and\n  re-run that suite through the tool (a lane whose own evidence says red may not merge).\n' ;;
     4) printf '  The report does not describe the tree being merged (it was written at another head, the\n  lane worktree is not at the head on the branch, or its evidence finished before that head was\n  created — a push from another worktree/box moves the branch and leaves your worktree behind).\n  Re-run the suites AT THE HEAD ON THE BRANCH through the tool (do NOT just re-render):\n     git -C <your worktree> status ; git log --oneline -1   # confirm you are at the PR head\n     python3 tools/worktree_report.py run --cmd <the exact command>   # for each suite\n  ⛔ `write`, `note` and a plain `init` re-render the report AND re-stamp the recorded head WITHOUT\n  re-running anything, so they turn a stale report into a green-looking one. Only `run` produces\n  evidence for the head you are merging.\n  ⛔ If the reason is `merging-head-is-dated-ahead-of-this-box`, RE-RUNNING WILL NOT HELP: the head\n  was committed on a box whose clock is ahead, so no run here can ever be newer than it. Re-push the\n  head from a correctly-clocked box, or wait for the skew to pass.\n' ;;
     7) printf '  The report exists but could not be VERIFIED. Two distinct causes, with different remedies:\n     • no interpreter, or the consumer failed / printed no parseable JSON — repair the consumer, then re-run;\n     • the writer state is missing or damaged (`reason=writer-state-absent|corrupt`) — the head binding\n       lives there, so the report cannot be tied to the head being merged. Do NOT hand-edit or delete\n       it: re-run the suites through the tool (`python3 tools/worktree_report.py run --cmd <cmd>`),\n       which rewrites the state. A state file you removed is a witness you removed.\n  An unreadable verification is not a pass.\n' ;;

@@ -1984,6 +1984,16 @@ off macOS (it renders a launchd plist) — the portability that matters is `orch
    ANY other commit, or onto a scratch branch leaves writer state that still names the branch/head, so
    those answer `7` — one `git switch` must not convert a refusal into the abstention both carriers
    merge on. `7` (a report that exists and could not be VERIFIED) refuses.
+   ⛔ **`2` NOW COVERS THREE MALFORMED-REPORT SHAPES, EACH MEASURED AGAINST THE REAL WRITER** (round-13
+   review): a report whose recorded suites ALL logged zero bytes with no parsed counts (`init; run --cmd
+   true; write` — the consumer itself calls that VALID, so the gate is the only refusal point, and the
+   ruling says "claims tests without output" must be refused); a report carrying more than one
+   **header** stamp (a newline in a lane-writable state value rendering an injected stamp line above the
+   real one); and a header `Base:` line that was split or malformed, which is what makes the sealed
+   cross-check go dark while the writer re-seals its own digest honestly. The stamp count is scoped to
+   the report HEADER — the writer renders suite commands, their log tails and `note` text VERBATIM below
+   it, so a body line reproducing the shape is lane-authored prose, not a seal, and refusing it refused
+   untampered reports.
 
 ### 5.3 Untrusted input and worker containment — read before running this unattended
 

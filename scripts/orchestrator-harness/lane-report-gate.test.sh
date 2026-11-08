@@ -441,13 +441,13 @@ fi
 # + the newest finished_at) laundered a STALE report into PASS while the sealed report still named the
 # old head: a self-contradicting artifact, which this file's header says must not be mergeable.
 _SEALED_A="aaaaaaaaaaaa"; _SEALED_B="bbbbbbbbbbbb"
-printf '## Files changed\n- **Base:** `main` → **head at write:** `%s`\n## Suites run\n## Could not do\n' "$_SEALED_A" > "$WT/WORKTREE-REPORT.md"
+printf -- '- **Base:** `main` → **head at write:** `%s`\n## Files changed\n## Suites run\n## Could not do\n' "$_SEALED_A" > "$WT/WORKTREE-REPORT.md"
 printf '{"version":1,"head_at_write":"%s","branch":"feat/2977-tm","suites":[{"n":1,"command":"x","exit":0,"finished_at":"2099-01-01T00:00:00Z"}]}\n' "$_SEALED_B" > "$WT/.worktree-report/state.json"
 drive 4 "STALE: the state claims a head the SEALED report does not name (a falsified state is self-contradicting)" STUB_OK=1 STUB_RC=0 STUB_STALE=0
 case "$LAST_OUT" in *reason=state-disagrees-with-the-sealed-report*) ok "…and it names the disagreement rather than reporting a head binding" ;; *) bad "sealed-vs-state reason: $LAST_OUT" ;; esac
 case "$LAST_OUT" in *VERDICT=PASS*) bad "a state contradicting the sealed report was read as a PASS" ;; *) ok "…and it is not reported as PASS" ;; esac
 # CONTROL: when the two halves AGREE, the honest flow still passes.
-printf '## Files changed\n- **Base:** `main` → **head at write:** `%s`\n## Suites run\n## Could not do\n' "$(printf '%s' "$WT_HEAD" | cut -c1-12)" > "$WT/WORKTREE-REPORT.md"
+printf -- '- **Base:** `main` → **head at write:** `%s`\n## Files changed\n## Suites run\n## Could not do\n' "$(printf '%s' "$WT_HEAD" | cut -c1-12)" > "$WT/WORKTREE-REPORT.md"
 _restore_state
 drive 0 "CONTROL: a report whose sealed head AGREES with the state still PASSES" STUB_OK=1 STUB_RC=0 STUB_STALE=0
 # ── 2h-2. THE SEALED CROSS-CHECK MUST NOT BE DISABLEABLE FROM `PATH` (fresh review 2026-11-08, MED) ──
@@ -465,7 +465,7 @@ if PATH="$_SHIM:$PATH" command -v sed >/dev/null 2>&1 \
   # the ordinary `report_head != merging_head` arm refuses anyway and this row would pass with the sealed
   # cross-check deleted — measured while writing it. Here every OTHER witness agrees and only the sealed
   # stamp can catch it: sealed says `$_SEALED_A`, state says `$WT_HEAD`.
-  printf '## Files changed\n- **Base:** `main` → **head at write:** `%s`\n## Suites run\n## Could not do\n' "$_SEALED_A" > "$WT/WORKTREE-REPORT.md"
+  printf -- '- **Base:** `main` → **head at write:** `%s`\n## Files changed\n## Suites run\n## Could not do\n' "$_SEALED_A" > "$WT/WORKTREE-REPORT.md"
   printf '{"version":1,"head_at_write":"%s","branch":"feat/2977-tm","suites":[{"n":1,"command":"x","exit":0,"finished_at":"2099-01-01T00:00:00Z"}]}\n' "$WT_HEAD" > "$WT/.worktree-report/state.json"
   out="$(env PATH="$_SHIM:$PATH" STUB_OK=1 STUB_RC=0 STUB_STALE=0 bash "$GATE" --check "$REPO" "feat/2977-tm" "$WT_HEAD" 2>&1)"; rc=$?
   if [ "$rc" = 4 ]; then ok "a sed/tail/cut/awk/head shim on PATH cannot switch the sealed cross-check off — the two-field edit is still STALE (rc=$rc)"; else bad "a PATH shim disabled the sealed cross-check: expected rc=4, got rc=$rc :: $out"; fi
@@ -474,7 +474,7 @@ if PATH="$_SHIM:$PATH" command -v sed >/dev/null 2>&1 \
   # CONTROL: the same artifacts WITHOUT the shim agree with the row above (so the row is not asserting a
   # blanket refusal, and the shim is not what makes it red).
   _restore_state
-  printf '## Files changed\n- **Base:** `main` → **head at write:** `%s`\n## Suites run\n## Could not do\n' "$_SEALED_A" > "$WT/WORKTREE-REPORT.md"
+  printf -- '- **Base:** `main` → **head at write:** `%s`\n## Files changed\n## Suites run\n## Could not do\n' "$_SEALED_A" > "$WT/WORKTREE-REPORT.md"
   printf '{"version":1,"head_at_write":"%s","branch":"feat/2977-tm","suites":[{"n":1,"command":"x","exit":0,"finished_at":"2099-01-01T00:00:00Z"}]}\n' "$WT_HEAD" > "$WT/.worktree-report/state.json"
   drive 4 "CONTROL: the same two-field edit is STALE with a clean PATH too (the sealed stamp is the only witness left)" STUB_OK=1 STUB_RC=0 STUB_STALE=0
 else
@@ -492,11 +492,39 @@ if grep -q '_seal_pat' "$GATE" && grep -q 'sealed12' "$GATE"; then ok "…and th
 # stamp agree with a forged state. Measured on the pre-fix gate: rc=4 STALE → rc=0 PASS. An honest report
 # carries exactly one stamp, so a second is a self-contradicting artifact, not a tie to break by position.
 _INJ="**Base:** \`main\` → **head at write:** \`$(printf '%s' "$WT_HEAD" | cut -c1-12)\`"
-printf '## Files changed\n- **Base:** `main` → **head at write:** `%s`\n## Suites run\n## Could not do\n- %s\n' "$_SEALED_A" "$_INJ" > "$WT/WORKTREE-REPORT.md"
+# TWO HEADER STAMPS: a newline in the lane-writable `state["worktree"]` value renders an injected stamp
+# line ABOVE the real one — the round-10/11 spelling, and the only duplicate a state value can produce.
+printf -- '- **Worktree:** `x\n- %s`\n- **Base:** `main` → **head at write:** `%s`\n## Files changed\n## Suites run\n## Could not do\n' "$_INJ" "$_SEALED_A" > "$WT/WORKTREE-REPORT.md"
 printf '{"version":1,"head_at_write":"%s","branch":"feat/2977-tm","suites":[{"n":1,"command":"x","exit":0,"finished_at":"2099-01-01T00:00:00Z"}]}\n' "$WT_HEAD" > "$WT/.worktree-report/state.json"
 drive 2 "INVALID: a report carrying TWO head-at-write stamps (a 'note --not-done' line reproducing the shape) is refused" STUB_OK=1 STUB_RC=0 STUB_STALE=0
 case "$LAST_OUT" in *reason=report-carries-more-than-one-head-at-write-stamp*) ok "…and it names the duplicate stamps rather than picking one by position" ;; *) bad "duplicate-stamp reason: $LAST_OUT" ;; esac
 case "$LAST_OUT" in *VERDICT=PASS*) bad "a duplicated stamp let a forged state PASS (the lane-authored line was read as sealed)" ;; *) ok "…and the injected stamp does not become the sealed head" ;; esac
+# ⛔ A BODY STAMP IS LANE-AUTHORED PROSE, NOT A SECOND SEAL (round-13 review, LOW). The writer renders suite
+# commands, their log tails and `note --not-done` items VERBATIM below the header, so counting the whole
+# document refused an UNTAMPERED report with a remedy that re-runs the suite and reproduces the duplicate.
+# The header stamp must still be the one that decides: the forged state below must be STALE, not ignored.
+printf -- '- **Base:** `main` → **head at write:** `%s`\n## Files changed\n## Suites run\n## Could not do\n- %s\n' "$_SEALED_A" "$_INJ" > "$WT/WORKTREE-REPORT.md"
+printf '{"version":1,"head_at_write":"%s","branch":"feat/2977-tm","suites":[{"n":1,"command":"x","exit":0,"finished_at":"2099-01-01T00:00:00Z"}]}\n' "$WT_HEAD" > "$WT/.worktree-report/state.json"
+drive 4 "the HEADER stamp still decides when a body line reproduces the shape (a suite log tail is not a seal)" STUB_OK=1 STUB_RC=0 STUB_STALE=0
+case "$LAST_OUT" in *VERDICT=INVALID*) bad "a lane-authored body stamp was refused the way an untampered report would be (rc=2, unsatisfiable remedy)" ;; *) ok "…and a body stamp is not refused as a duplicate" ;; esac
+# ⛔ A SPLIT BASE LINE IS TAMPERING, NOT AN OLDER WRITER (round-13 review, HIGH). `state["base_sha"]` is
+# rendered VERBATIM, so a newline in it splits the anchored line and NOTHING matches: the cross-check is
+# skipped and a forged `head_at_write` PASSes (measured with the real writer: rc=4 -> rc=0).
+printf -- '- **Base:** `x\nyyyy`\n## Files changed\n## Suites run\n## Could not do\n' > "$WT/WORKTREE-REPORT.md"
+printf '{"version":1,"head_at_write":"%s","branch":"feat/2977-tm","suites":[{"n":1,"command":"x","exit":0,"finished_at":"2099-01-01T00:00:00Z"}]}\n' "$WT_HEAD" > "$WT/.worktree-report/state.json"
+drive 2 "INVALID: a header Base line split by a lane-writable value is refused, not read as an absent stamp" STUB_OK=1 STUB_RC=0 STUB_STALE=0
+case "$LAST_OUT" in *reason=report-header-base-line-was-split-or-malformed*) ok "…and it names the split header line" ;; *) bad "split-header reason: $LAST_OUT" ;; esac
+# ⛔ NO RECORDED OUTPUT AT ALL IS NOT EVIDENCE (round-13 review, MED): `init; run --cmd true; write` records
+# exit 0, no counts and a 0-byte log, and the consumer calls it VALID — the owner ruling says the verifier
+# must refuse a report that "claims tests without output", so this is the only refusal point.
+mkdir -p "$WT/.worktree-report/logs"; : > "$WT/.worktree-report/logs/01-true.log"
+printf -- '- **Base:** `main` → **head at write:** `%s`\n## Files changed\n## Suites run\n## Could not do\n' "$(printf '%s' "$WT_HEAD" | cut -c1-12)" > "$WT/WORKTREE-REPORT.md"
+printf '{"version":1,"head_at_write":"%s","branch":"feat/2977-tm","suites":[{"n":1,"command":"true","exit":0,"finished_at":"2099-01-01T00:00:00Z","log":".worktree-report/logs/01-true.log","log_sha256":"x"}]}\n' "$WT_HEAD" > "$WT/.worktree-report/state.json"
+drive 2 "INVALID: a report whose only suite logged ZERO bytes (run --cmd true) claims tests without output" STUB_OK=1 STUB_RC=0 STUB_STALE=0
+case "$LAST_OUT" in *reason=recorded-suites-produced-no-output*) ok "…and it names the missing output rather than reporting a head binding" ;; *) bad "no-output reason: $LAST_OUT" ;; esac
+# CONTROL: the same state with a NON-EMPTY log is evidence and passes, so the row is not a blanket refusal.
+printf 'suite output: 3 passed\n' > "$WT/.worktree-report/logs/01-true.log"
+drive 0 "CONTROL: the same suite with a non-empty log PASSES (the no-output arm is not a blanket refusal)" STUB_OK=1 STUB_RC=0 STUB_STALE=0
 _restore_state
 # Restore the stanza-free report the baseline fixtures use, so later arms that re-point the head are not
 # judged against a stamp from this block.
@@ -741,9 +769,13 @@ git -C "$NOSTATE" worktree add -q -b feat/elsewhere "$NOSTATE/.worktrees/lane" H
 _FAKE="0123456789abcdef0123456789abcdef01234567"
 out="$(bash "$GATE_NOPY" --check "$NOSTATE" "feat/absent" "$_FAKE" 2>&1)"; rc=$?
 if [ "$rc" = 6 ]; then ok "a box with NO usable interpreter and NO writer state still ABSTAINS with 6 — the cross-box merge is not refused (rc=$rc)"; else bad "a box with no interpreter over a repo holding no evidence produced rc=$rc (expected 6): $out"; fi
+out="$(bash "$GATE_NOPY" --check "$OFF" "feat/off" "$OFF_HEAD" 2>&1)"; rc=$?
+if [ "$rc" = 7 ]; then ok "…but the SAME box, over a repo whose writer state NAMES this branch and head, is 7 UNMEASURABLE (rc=$rc)"; else bad "an attributed holder with no interpreter produced rc=$rc (expected 7): $out"; fi
+# ⛔ A HOLDER FOR ANOTHER BRANCH IS NOT AN ATTRIBUTION (round-13 review, MED): a multi-lane box has other
+# lanes' state files, and refusing on their mere existence hard-refused every cross-box merge on a box below
+# the interpreter floor while the same repo WITH one answered 6.
 out="$(bash "$GATE_NOPY" --check "$OFF" "feat/absent" "$_FAKE" 2>&1)"; rc=$?
-if [ "$rc" = 7 ]; then ok "…but the SAME box, over a repo that DOES hold writer state, is 7 UNMEASURABLE — an unreadable attribution of real evidence is not an abstention (rc=$rc)"; else bad "a holder with no interpreter produced rc=$rc (expected 7): $out"; fi
-case "$out" in *reason=cannot-attribute-this-repos-lane-evidence-without-a-python-3-12-interpreter*) ok "…and it names the interpreter, not the report" ;; *) bad "no-interpreter-holder reason: $out" ;; esac
+if [ "$rc" = 6 ]; then ok "…while a FOREIGN holder that names neither this branch nor this head still ABSTAINS with 6 under the same no-interpreter box (rc=$rc)"; else bad "a foreign holder with no interpreter produced rc=$rc (expected 6): $out"; fi
 out="$(bash "$GATE" --check "$NOSTATE" "feat/absent" "$_FAKE" 2>&1)"; rc=$?
 if [ "$rc" = 6 ]; then ok "CONTROL: on a normal box the same no-evidence repo is also 6 (the row above is not asserting a blanket 7)"; else bad "no-evidence repo on a normal box: expected rc=6, got rc=$rc :: $out"; fi
 
