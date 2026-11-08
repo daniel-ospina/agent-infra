@@ -3077,15 +3077,16 @@ TBL
   # (`:2916`, deliberately: it disarms the window for arms whose subject is something else), so every arm
   # above inherits `0` and `1  >= 0` is true for ANY declared default — the default itself was unmeasured.
   # Here the variable is UNSET, so `_wreap_verdict` resolves the shipped `${_WREAP_WINDOW_MIN:-6}`: a flat
-  # reading across a 3600 s gap is past any sane window and is IDLE (rc 0). Raise the shipped default past
-  # 60 minutes and that same baseline becomes UNKNOWN (rc 2) and this arm reds — the value is pinned from
-  # the side `_wreap_verdict_win` (which pins 6 in its own subshell) cannot reach.
+  # reading across a 3600 s gap is past any sane window and is IDLE (rc 0). Raise the CONSUMER's fallback
+  # (`orch-loop.sh:2357`) past 60 minutes and that same baseline becomes UNKNOWN (rc 2) and this arm reds
+  # — the value is pinned from the side `_wreap_verdict_win` (which pins 6 in its own subshell) cannot
+  # reach. ⛔ NOT the DECLARATION at `orch-loop.sh:2183`: only FUNCTIONS are extracted into `$TMP/reapw.sh`,
+  # so that literal never reaches this arm (round-2 review finding 1 — the text above used to say
+  # "shipped default" and thereby claimed the declaration, which the shape arm below is what actually pins).
   _wreap_verdict_def() { ( unset _WREAP_WINDOW_MIN; . "$TMP/reapw.sh"; _wreap_verdict "$@" ); }
   _wreap_verdict_def "$(date +%s)" "$OLDV 100 2" 100 2 alive; [ "$?" = "0" ] && rc=0 || rc=1
-  ck "#3793: an UNSET window resolves the SHIPPED default, so a flat reading across a 3600 s gap is IDLE" $rc
-  # …and the DECLARATION's own default is a SECOND literal the extracted unit never sees (`reapw_prelude`
-  # extracts FUNCTIONS only, so `_WREAP_WINDOW_MIN="${WREAP_WINDOW_MIN:-6}"` never enters `$TMP/reapw.sh`),
-  # …and the DECLARATION's own default is a SECOND literal the extracted unit never sees (`reapw_prelude`
+  ck "#3793: an UNSET window resolves the CONSUMER's shipped fallback, so a flat reading across a 3600 s gap is IDLE" $rc
+  # …and the DECLARATION's own default is a SEPARATE literal the extracted unit never sees (`reapw_prelude`
   # extracts FUNCTIONS only, so `_WREAP_WINDOW_MIN="${WREAP_WINDOW_MIN:-6}"` never enters `$TMP/reapw.sh`),
   # so it is pinned by SHAPE: the shipped window is 6 minutes. ⛔ WHAT THIS ARM DOES NOT DO (review round 1):
   # the literal `6` IS the grep pattern, so it pins only that the line still reads `:-6}` — a move of the
