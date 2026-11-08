@@ -1498,16 +1498,29 @@ if [ "$FARM_CHECK_ON" = "1" ]; then
         # class word ("…, 0 unsourced") would read as a row and refuse a healthy farm (over-block).
         FARM_ROWS0="$(printf '%s\n' "$FARM_OUT" | awk -F'|' 'NF>=4 && $NF ~ /(^|[[:space:]])(STALE|UNSOURCED|NOT-EXECUTABLE|DECLARED-BUT-ABSENT)[[:space:]]*$/')"
         FARM_NROWS0="$(printf '%s' "$FARM_ROWS0" | grep -c .)"
-        FARM_SUM0="$(printf '%s\n' "$FARM_OUT" | sed -n 's/.*DRIFT — \([0-9][0-9]*\) stale.*/\1/p' | head -1)"
+        # ⛔ THE CONTRADICTION IS THE *VERDICT*, NOT ONE OF ITS COUNTS (review: the parse read only the
+        # `stale` count, so `rc=0` over `DRIFT — 0 stale …, 2 declared-but-absent, 0 unsourced` — drift
+        # this pass's row vocabulary did not match, which is the premise the whole extraction arm exists
+        # for — recorded `farm: ok` / `farm_rows=none` / `farm_n=0`. The instrument prints `OK — ` on a
+        # match and `DRIFT — ` otherwise, so the verdict line ALONE is the contradiction; summing three
+        # counts answers a narrower question than the one being asked.
+        FARM_VERDICT0="$(printf '%s\n' "$FARM_OUT" | sed -n '/DRIFT — /{p;q;}')"
         case "$FARM_RC" in
             0)
-                if [ "$FARM_NROWS0" -gt 0 ] || { [ -n "$FARM_SUM0" ] && [ "$FARM_SUM0" -gt 0 ]; }; then
+                if [ "$FARM_NROWS0" -gt 0 ] || [ -n "$FARM_VERDICT0" ]; then
                     REC_ACTION=farm-unknown
                     publish_farm_rows "$FARM_OUT" "n=unparsed (NO GRADE — the checker exited 0 while reporting drift, so its exit status and its report contradict each other; this is its output verbatim, not a grade; farm_n=not-graded)"
                     REC_FARM_NROWS=not-graded
                     REC_REMEDY="the checker exited 0 while reporting drift — point HARNESS_APPLY_FARM_CHECKER at check-farm-drift.sh itself (a wrapper that reports the pipeline's status hides the instrument's), then re-run"
-                    log_line "farm: UNKNOWN — the checker exited 0 but its output reports drift ($FARM_NROWS0 row(s) matched, summary says ${FARM_SUM0:-nothing}); an exit status that contradicts its own report is not a grade"
-                    finish 0 24 "farm: UNKNOWN (check-farm-drift rc=0) — $FARM_DEST could not be graded against $REF: the checker exited 0 while reporting drift, so its status and its report contradict each other, and an unreadable grade is not a pass. Its output is published in $REC_FARM_ROWS"
+                    log_line "farm: UNKNOWN — the checker exited 0 but its output reports drift ($FARM_NROWS0 row(s) matched; verdict: ${FARM_VERDICT0:-no DRIFT line, rows only}); an exit status that contradicts its own report is not a grade"
+                    # ⛔ NO `detail=` SENTENCE INLINES THE ARTIFACT PATH, AND THE POINTER MUST SURVIVE THE
+                    # 240-BYTE BOUND (review round 23, measured twice): the sentence used to END in "published
+                    # in $REC_FARM_ROWS", which both inlined the path the doc forbids (and would have read
+                    # "published in unwritable" on a failed publish — a publication that never happened) AND
+                    # sat past the cut, so the record ended mid-word naming no file. Naming the diagnosis
+                    # FIRST and the field pointer immediately after it is what keeps the pointer inside the
+                    # bound; a pointer at the tail is lost at exactly the farms with the longest paths.
+                    finish 0 24 "farm: UNKNOWN (check-farm-drift rc=0) — the checker exited 0 while reporting drift (see farm_rows=), so its exit status and its report contradict each other; an unreadable grade is not a pass for $FARM_DEST against $REF"
                 fi
                 REC_FARM_ROWS=none; REC_FARM_NROWS=0
                 log_line "farm: ok — $FARM_DEST matches $REF" ;;

@@ -237,17 +237,24 @@ file — because the instrument named none.
 report — `rc=0` over a report that names drift. `HARNESS_APPLY_FARM_CHECKER` is a seam, so a wrapper
 that reports the *pipeline's* status (`bash inner "$@" 2>&1 | tee -a log`) returns 0 over a drifting
 farm; the report wins over the status (the output is published with a `NO GRADE` header and `remedy=`
-names the wrapper), because an exit code that contradicts what it printed is not a grade. A wrapper over
-a genuinely matching farm still passes — the check reads the report, not the wrapper's shape.
+names the wrapper), because an exit code that contradicts what it printed is not a grade. **`rc=0` is
+refused on the `DRIFT —` VERDICT, not on one of its counts** — a summary reading `DRIFT — 0 stale, 2
+declared-but-absent, 0 unsourced` is drift in a class a `stale`-only parse does not read, and a checker
+whose row vocabulary this pass does not match leaves the row half blind too, so counting `stale` alone
+would record `farm: ok` / `farm_rows=none` over two files the farm owes. The instrument prints `OK —` on a
+match, so the verdict line by itself is the contradiction. A wrapper over a genuinely matching farm still
+passes — the check reads the report, not the wrapper's shape.
 
-`farm_rows=<path>` is ALSO written on `action=farm-unknown` when the instrument gives up (its own exit 2). The
+`farm_rows=<path>` is ALSO written on `action=farm-unknown` — on the arm where the instrument gives up
+(its own exit 2), and on the `rc=0`-contradicts-its-report arm above, which publishes the output with the
+same `NO GRADE` header. On the give-up arm, the
 instrument prints its per-file rows BEFORE the exits that give up (`matched == 0`, a partly ungradeable
 declaration), so "no grade" never meant "nothing was reported": the file carries that output verbatim
 with a `NO GRADE` header, `farm_n=not-graded` still says no grade was produced, and `farm_rows=` stays
 `not-graded` only when the instrument printed nothing at all.
 
 `remedy=` carries the instrument's own `Next:` block on ANY refusal that has one — the drift arms and
-the `farm-unknown` (rc=2) arm, which is the one that often prints it last — and the one actionable text it
+the give-up `farm-unknown` arm (rc=2), which is the one that often prints it last — and the one actionable text it
 prints, which is per class ("re-run the farm", "declare it LOCAL, delete, or retire it", "a deploy
 cannot fix this") — so the record never names a defect and leaves nobody an action. A checker that
 printed no `Next:` block (a mis-worded farmed copy, or one that died after its rows) makes `remedy=`
@@ -262,7 +269,8 @@ could be found" answer — neither is ever executed, and neither is reported as 
 DRIFT arms the drift is still red, `farm_n` still carries the count it had (or `unparsed` when the
 extraction was **not proven complete** — a partial match counts here too, not only a total miss), and
 the journal says in as many words that the rows past the 12-line excerpt are named nowhere durable. On
-the `farm-unknown` (rc=2) arm the field alone carries it: `farm_n=not-graded`, and the journal prints
+the `farm-unknown` arm (either producer: an instrument that gave up with its own exit 2, or an `rc=0`
+that contradicts its report) the field alone carries it: `farm_n=not-graded`, and the journal prints
 only its UNKNOWN line — a checker that printed rows before giving up had them captured, but nothing was
 ever excerpted and no artifact was written, so those names are durable nowhere (that is the price of a
 failed write on an arm with no grade to justify another one). When the instrument printed nothing at
@@ -458,7 +466,7 @@ checkout can use the documented hatch. The same interaction is recorded for
 
 ## Tests
 
-`scripts/harness-apply-timer.test.sh` — 484 assertions, run by the
+`scripts/harness-apply-timer.test.sh` — 491 assertions, run by the
 `harness-apply-timer` shard of `run-bash-shards.sh`:
 
 | | |

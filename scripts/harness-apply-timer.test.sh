@@ -1229,7 +1229,8 @@ assert_eq "$RC" "24" "T24 control: an unpaid-by-the-farm stale file is RED too, 
 # Control 2: the SAME fixture with a matching farm (checker exits 0) keeps its normal verdict — the
 # leg is a gate, not a hard-coded failure.
 # ⛔ AND A CLEAN GRADE PUBLISHES NO LIST, WHILE THE OLD ONE STAYS SELF-DATING (tortoise#10114 arm 2,
-# review round 2). Round 1 asserted a clean grade DELETES the previous list; that delete was removed —# it fired on read-only verbs and could unlink a concurrent pass's file. The list stays, its header
+# review round 2). Round 1 asserted a clean grade DELETES the previous list; that delete was removed —
+# it fired on read-only verbs and could unlink a concurrent pass's file. The list stays, its header
 # dates it, and `farm_rows=none` is what says the list on disk is not today's answer.
 mkdir -p "$T/t24c/home/.pi/agent/scripts" "$T/t24c/state"; printf 'x\n' >"$T/t24c/home/.pi/agent/scripts/pr-doctor.py"
 printf 'file-from-yesterday.py | a | b | STALE\n' >"$T/t24c/state/harness-apply-farm-rows.txt"
@@ -1296,6 +1297,10 @@ assert_contains "$(cat "$T/t24d/state/harness-apply.status" 2>/dev/null || true)
     "T24 control: and action= is the same 'none' a clean no-op carries — so farm_rows= is the only signal here, which is what the doc now says"
 
 
+# ⛔ THE FARM GATE'S OWN REFUSALS GET THEIR LABEL BACK — the rows-artifact heading above spans fixtures
+# only; `t24e`-`t24p` are the farm gate (dangling link, invalid seam, inside-the-farm checker), which is
+# what the doc's `T24` row claims, so a reader indexing that table by the printed label must land here.
+say_case "T24 the farm gate and its refusals — dangling link, invalid seam, in-farm checker"
 # Control 4: a DANGLING farm link is NOT an absent farm — `-d` follows symlinks, so the skipped arm
 # must not swallow a path the box still points at but cannot read.
 mk_origin t24e; mk_clone t24e
@@ -2076,6 +2081,43 @@ assert_contains "$(cat "$T/t24aq/state/harness-apply-farm-rows.txt" 2>/dev/null 
     "T24 control: with the instrument's output published verbatim, so the odd vocabulary is still durable"
 assert_contains "$(grep '^farm_n=' "$T/t24aq/state/harness-apply.status" 2>/dev/null || true)" "farm_n=not-graded" \
     "T24 control: and no count is claimed for a list this pass could not extract"
+
+# ⛔ THE CONTRADICTION IS THE VERDICT, NOT THE `stale` COUNT (review round 23, measured: the guard parsed
+# only `<n> stale` out of the instrument's summary, so an `rc=0` over `DRIFT — 0 stale, 2
+# declared-but-absent, 0 unsourced` — drift in a class the `stale` parse does not read, with row verdicts
+# this pass's vocabulary does not match — recorded `farm: ok` / `farm_rows=none` / `farm_n=0`: two files
+# the farm owes, named durably nowhere, positively certified as a match). `t24aq` above pins the `2
+# stale` shape; this fixture pins the shape where EVERY other count is zero and the row half is blind.
+mk_origin t24at; mk_clone t24at
+REPO_P="$CLONE"; MODE_P=sync
+mkdir -p "$T/t24at/home/.pi/agent/scripts" "$T/t24at/inner"
+cat >"$T/t24at/inner/absent-only.sh" <<'FARM'
+#!/usr/bin/env bash
+printf '%-46s | %-12s | %-12s | %s\n' 'file' 'deployed' 'source' 'verdict' >&2
+printf '%-46s | %-12s | %-12s | %s\n' 'gone-a.py' '-' '-' 'MISSING' >&2
+printf '%-46s | %-12s | %-12s | %s\n' 'gone-b.py' '-' '-' 'MISSING' >&2
+printf 'check-farm-drift: DRIFT — 0 stale (0 farm-declared; 0 outside the farm), 2 declared-but-absent, 0 unsourced, of 4 deployed file(s) (2 sourced, 2 matching) against origin/main (sync) in %s.\n' "$PWD/src"
+exit 1
+FARM
+printf '#!/usr/bin/env bash\nbash "$(dirname "$0")/inner/absent-only.sh" "$@" 2>&1 | tee -a "$(dirname "$0")/log.txt"\n' >"$T/t24at/wrap.sh"
+chmod +x "$T/t24at/wrap.sh" "$T/t24at/inner/absent-only.sh"
+OUT="$(HARNESS_APPLY_FARM_CHECKER="$T/t24at/wrap.sh" run_pass "$T/t24at" 2>&1)"; RC=$?
+assert_eq "$RC" "24" "T24 control: rc=0 over a DRIFT whose only non-zero count is declared-but-absent is RED — the verdict is the contradiction, not one of its counts"
+assert_contains "$OUT" "exited 0 but its output reports drift" "T24 control: and it names the contradiction even though neither the rows nor the stale count matched"
+assert_contains "$(cat "$T/t24at/state/harness-apply-farm-rows.txt" 2>/dev/null || true)" "gone-a.py" \
+    "T24 control: with the two absent names published verbatim, so they are durable rather than merely counted"
+assert_contains "$(grep '^farm_n=' "$T/t24at/state/harness-apply.status" 2>/dev/null || true)" "farm_n=not-graded" \
+    "T24 control: and no count is claimed for a list this pass could not extract"
+assert_absent "$(grep '^farm_rows=' "$T/t24at/state/harness-apply.status" 2>/dev/null || true)" "farm_rows=none" \
+    "T24 control: and it never records none, which would assert this pass graded the farm and found it clean"
+# ⛔ AND THIS ARM'S `detail=` POINTS AT THE FIELD, NEVER AT THE PATH (review round 23, measured: it was the
+# ONLY `detail=` sentence that interpolated `$REC_FARM_ROWS`, contradicting the doc's own bound rule — and
+# the path sat past the 240-byte cut, so the record ended mid-word and named no file, while on a failed
+# publish the clause would have read "published in unwritable", a publication that never happened).
+assert_contains "$(grep '^detail=' "$T/t24at/state/harness-apply.status" 2>/dev/null || true)" "(see farm_rows=)" \
+    "T24 control: the contradiction arm points at farm_rows= rather than inlining a path the 240-byte bound can cut"
+assert_absent "$(grep '^detail=' "$T/t24at/state/harness-apply.status" 2>/dev/null || true)" "harness-apply-farm-rows.txt" \
+    "T24 control: and it really inlines no artifact path"
 
 # ⛔ AND A NON-ROW LINE ENDING IN A CLASS WORD MUST NOT TRIP IT (review round 22, measured: deleting
 # `NF>=4 &&` from the extractor left the suite green, so the over-block this guard prevents was unpinned).
