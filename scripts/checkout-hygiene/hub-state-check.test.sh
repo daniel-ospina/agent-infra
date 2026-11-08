@@ -237,6 +237,16 @@ git -C "$HUB" worktree add -q "$WTLIVE" -b wt/live-649
 mkdir -p "$WTLIVE/extensions/builtin-tools"
 FARMWT="$FIX/farm-wt-649"
 mkdir -p "$FARMWT"
+# ⛔ THE `pi` STUB GOES UP BEFORE THE FIRST CHECK INVOCATION IN THIS BLOCK (review finding
+# at head d0718744a, P1). The dangling-farm-entry state exists from the `rm -rf "$WTLIVE"`
+# below, and every invocation after that point would otherwise run with the CALLER's PATH.
+# A guard armed one invocation late can only speak about a SECOND run — the first has
+# already executed the operator's REAL `pi -p`, which on this fleet dispatches an agent.
+# One PATH for the whole block; restored at its end.
+PISTUB="$FIX/pi-stub-bin"; mkdir -p "$PISTUB"
+printf '#!/bin/sh\ntouch %s\nexit 0\n' "$FIX/pi-stub-called" > "$PISTUB/pi"
+chmod +x "$PISTUB/pi"
+ORIG_PATH="$PATH"; export PATH="$PISTUB:$PATH"
 # A REAL worktree of a DIFFERENT checkout — not a bare directory named `extensions`.
 # `mkdir` alone would make this control untestable: it would only prove that a plain
 # directory is not matched, while the claim under test is that another repo's WORKTREE
@@ -309,17 +319,19 @@ assert_eq "$(disorder_tok "$out")" "farm_worktree" "…the token is still exactl
 assert_contains "$out" "DANGLING" "…and says the link DANGLES rather than claiming a branch"
 # ⛔ The guide is TEXT, and the DANGLING branch is where that is load-bearing. A backtick
 # span in a DOUBLE-QUOTED element is not prose: bash runs it as a command substitution, and
-# that element is read inside the `done <<<"$farm_wt"` loop, so the here-string becomes the
-# child's STDIN. MEASURED 2026-11-08, pre-fix: the guide ran a real `pi -p` whose prompt was
-# the NEXT LINE of $farm_wt — the dangling entry's own record, `nope-tool<TAB>…<TAB>DANGLING`
-# — which dispatched an agent that ran THIS SUITE, reached this line, and spawned the next
-# agent. ~24 live agents at one per ~20 s, load 18, 99 wedged suites; only a kill stopped it.
-# Two assertions pin the class: the literal rendering, and the execution.
+# inside a `done <<<"$farm_wt"` loop the here-string becomes the child's STDIN, so the
+# spawned process's prompt is the next farm_wt record. PROVENANCE, stated exactly: the
+# MECHANISM is a property of bash (command substitution inside a double-quoted expansion;
+# fd 0 inherited from the redirection), but the recursive-spawn INCIDENT recorded in commit
+# dee4f806f does NOT reproduce at any committed head of this branch — the element was
+# introduced already single-quoted, and a stub `pi` on PATH is never invoked at the reviewed
+# heads. So this guard is PREVENTIVE, not a regression test for that incident, and it says
+# so here so that no later reader carries a false MEASURED claim forward.
+# Two assertions pin the class: the literal rendering, and the execution — and BOTH run with
+# the stub already on PATH (armed at the top of this block), so the mutant is caught by the
+# stub and never by the operator's real binary.
 assert_contains "$out" 'pi -p' "the guide PRINTS the literal text [pi -p] (a backtick span swallows it)"
-PISTUB="$FIX/pi-stub-bin"; mkdir -p "$PISTUB"
 rm -f "$FIX/pi-stub-called"
-printf '#!/bin/sh\ntouch %s\nexit 0\n' "$FIX/pi-stub-called" > "$PISTUB/pi"
-chmod +x "$PISTUB/pi"
 out="$(PATH="$PISTUB:$PATH" PI_EXTENSIONS_DIR="$FARMWT" bash "$CHECK" --repo "$HUB" 2>&1)" && rc=0 || rc=$?
 if [ -e "$FIX/pi-stub-called" ]; then
   bad "the recovery guide EXECUTED a command it was printing (pi) — a backtick span in a double-quoted element, with the farm_wt here-string as its STDIN"
@@ -404,6 +416,7 @@ assert_eq "$rc" 0 "a farm link into the hub's OWN extensions is still PASS besid
 rm -rf "$WTCTL" "$FIX/wt-ctl-foreign"
 git -C "$HUB" worktree prune >/dev/null 2>&1 || true
 git -C "$HUB" branch -D wt/ctl-649 >/dev/null 2>&1 || true
+export PATH="$ORIG_PATH"
 # The DOMINANT fleet layout — `.worktrees/<name>` — must fire too. Asserted by substring,
 # not by exact token: git reports the containing `.worktrees/` as an untracked directory
 # (the #1919 filter matches the worktree itself, not its parent), so the hub is also dirty
@@ -1217,6 +1230,14 @@ touch "$HR/a.txt"
 mkdir -p "$HR/extensions/builtin-tools"; touch "$HR/extensions/builtin-tools/index.ts"
 git -C "$HR" add .; git -C "$HR" commit -qm init
 git -C "$HR" remote add origin "https://github.com/daniel-ospina/tortoise.git"
+# A real upstream, so this hub is clean + on main + CURRENT and the composed token is exactly
+# `farm_worktree` — the same state the headline case asserts, and the one that makes the
+# body-line assertion below able to name the class alone (a `no_upstream` companion would
+# hide a regression that dropped the class from the token line).
+hr_bare="$FIX/hub649rep-upstream.git"
+git init -q --bare -b main "$hr_bare"
+git -C "$HR" remote add upstream "$hr_bare"
+git -C "$HR" push -qu upstream main
 HRWT="$HR/wt-649rep"
 git -C "$HR" worktree add -q "$HRWT" -b wt/649rep
 mkdir -p "$HRWT/extensions/builtin-tools"
@@ -1228,7 +1249,12 @@ out="$(PI_EXTENSIONS_DIR="$FARMREP" bash "$CHECK" --repo "$HR" --gh-report 2>&1)
 assert_eq "$rc" 1 "--gh-report with farm_worktree exits 1"
 assert_contains "$out" "opened hub-state issue" "…and files the hub-disorder issue"
 rep_body="$(cat "$GH_STUB_LOG" 2>/dev/null)"
-assert_contains "$rep_body" "farm_worktree" "…whose FILED body names the class"
+# ⛔ Assert the BODY's own line, not the class name: the gh stub logs every ARGUMENT, and
+# `issue create` carries `--title "hub-state FAIL: <repo> (<disorder>)"` — so a bare
+# `farm_worktree` needle is satisfied by the TITLE, and a regression that dropped the class
+# from the filed body would leave this row GREEN (review finding at head d0718744a, P2).
+# The `HUB_DISORDER=` LINE only ever appears in the body.
+assert_contains "$rep_body" "HUB_DISORDER=farm_worktree" "…whose FILED BODY carries the class line, not just the issue title"
 assert_contains "$rep_body" "ln -s $HR/extensions/builtin-tools" "…and carries the repoint remedy, not just stdout"
 assert_contains "$rep_body" "worktree branch: wt/649rep" "…naming the branch the live runtime was executing"
 rm -rf "$HRWT"; rm -rf "$FARMREP"

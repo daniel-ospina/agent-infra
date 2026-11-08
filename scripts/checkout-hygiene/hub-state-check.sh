@@ -46,6 +46,21 @@
 #                Independent of the branch/freshness facts (it composes with them,
 #                like `dirty`). Taken from the hub's own worktree records, so a plain
 #                directory that merely CONTAINS worktrees is never flagged.
+#   farm_worktree  the live pi extension farm (`PI_EXTENSIONS_DIR`, default
+#                ~/.pi/agent/extensions) symlinks into a WORKTREE of this hub, so every
+#                running session executes that branch's working tree — unmerged code —
+#                and a merged fix is not live (#649). Computed UNCONDITIONALLY, not only
+#                off main, because the hub is clean and current in exactly this state and
+#                every other arm is then silent.
+#                A farm entry whose target no longer EXISTS is the same class: it DANGLES,
+#                and print-mode (`pi -p` — every `task` child, every harness lane) treats a
+#                failed extension load as FATAL, so a reaped lane takes the dispatch path
+#                with it (#602). Gated on the LINK, never on git still recording the
+#                worktree, because `worktree remove`/`gc` prune that record routinely.
+#                NEIGHBOURS, one owner each: a link into `<hub>/extensions` is the
+#                off-main class above (`live_extension_links`); a recorded-but-unlinked
+#                directory is `worktree_unlinked`; a farm link into ANOTHER checkout is
+#                not this hub's and is never named by either.
 #                Detected HERE, hub-side, because the fallback is undetectable from
 #                the worktree itself: inside a pre-commit hook `$PWD` and
 #                `git rev-parse --show-toplevel` are BOTH the hub (measured).
