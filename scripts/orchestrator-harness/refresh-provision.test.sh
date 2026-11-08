@@ -101,10 +101,18 @@
 #   (#3701 review round 18, P2, mutation-tested): rewording `gh:1874` or `gh:1485` leaves this suite at
 #   187/0, because the fixture and the assertion move TOGETHER. That is the property worth having — a
 #   hand-typed copy is the only way the fixture can go stale — but it is the opposite of a tripwire.
-#   The one exception is the PACING note, whose wording `(g)` asserts BY CONTENT because the record has
-#   to quote it: rewording `gh:1479` reds `(g) …the record quotes the FIRST captured line`. So a reword
-#   in the shim reds a row exactly when the row pins that note's words, and the two notes production
-#   never takes are (correctly) ungraded.
+#   ⛔ BUT "NOTHING REDS" IS ALSO TOO STRONG, and this paragraph's first cut swung from one extreme to
+#   the other (#3701 review round 19, P2, mutation-tested). Three kinds of wording ARE pinned:
+#     * the PACING note's words, because `(g)` asserts BY CONTENT that the record quotes them —
+#       rewording `gh:1479` reds `(g) …the record quotes the FIRST captured line`;
+#     * the figure `outlived this call's Nms wait budget` inside `gh:1874`, which the budget-agreement
+#       row extracts — rewording it reds `(g) …ONE wait budget`;
+#     * the derivation ANCHORS this suite greps for (`the account is in a shared rate-limit window —
+#       waiting`, `if the account BUDGET is what refused`, `gh-contended`) — moving one reds the
+#       capture-derivation rows outright.
+#   Anything else is free: rewording `a shared gh throttle` or `(no API call)` leaves the suite green,
+#   because the fixture moves with the shim. So the accurate claim is the one that matters — the fixture
+#   can NEVER silently go stale, which is why it is derived — not that no reword can red a row.
 #
 # HOW. Every arm drives the SHIPPED script inside a sandbox: a real git repo with a real (local, bare)
 # origin and a real `git worktree` scout, so `scout_is_worktree`/`fetch`/`checkout` all run for real

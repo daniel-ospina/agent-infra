@@ -900,8 +900,11 @@ gh_probe_err_cleanup() { case "${GH_PROBE_ERR:-}" in ''|/dev/null) return 0 ;; e
 # ⛔ ONE SHAPE THAT CANNOT ARRIVE HERE, SAID OUT LOUD SO NOBODY CHASES IT (#3701 review, P2). `gh api
 # rate_limit` IS THE METER: `gh-limit.py`'s `reaches_api()` answers False for it, and the CORE floor is
 # gated behind `reaches_api` — so `gh-limit: gh-core-floor …` can NEVER appear on THIS call's stderr.
-# (It appears on the CORE reads the same pass makes, which is where an operator's
-# `BUDGET:gh-rest: gh-limit: gh-core-floor remaining=N` log line comes from — a different call.)
+# (It appears on the CORE reads the same pass makes, which is where the floor's own line comes from —
+# a different call. ⛔ AND ITS SHAPE IS `gh-limit.py:4780`'s, NOT the `BUDGET:gh-rest: …` wrapper an
+# earlier version of this comment quoted: a reviewer grepped for that prefix and found no producer
+# anywhere in the tree, so it was a remembered shape rather than a real one. The real one is
+# `gh-limit: gh-core-floor remaining=<N> floor=<F> resets_in=<Nm> — gh rate limit: …`.)
 #
 # ⛔ AND WHICH REFUSAL *DOES* REACH IT DEPENDS ON ONE KNOB, SO THE CLAUSES SAY ONLY WHAT THE ARM
 # ESTABLISHES (#3701 review round 2, P2). The layer that CAN stop this call is `scripts/gh-shim/gh`'s
