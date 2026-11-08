@@ -71,7 +71,14 @@ now=$(date +%s)
 # `gap=29852468m` (56 years) while still delivering. A check that computes a nonsense number and
 # proceeds anyway is the same shape as the gates this file exists to catch. Capture the digits with
 # an ANCHORED pattern that cannot match empty (`[0-9]\{1,\}` / `[0-9]+`), or not at all.
-last=$(sed -n 's/.*NUDGE at=\([0-9][0-9]*\) delivered=yes.*/\1/p' "$LOG" 2>/dev/null | tail -1)
+# ⛔ THE DUE READ COUNTS EVERY ATTEMPT, NOT ONLY THE VERIFIED ONES — and the receipt it reads is
+# the SAME one this file writes. It used to require `delivered=yes`, which was correct only while
+# `delivered=yes` was written unconditionally (#1187): now that the field carries the checker's
+# verdict, requiring `yes` would make a run of unprovable verifications (`the orchestrator was
+# mid-turn, its transcript had not flushed`) look like NO nudge for a growing gap — so the floor
+# would re-fire on every tick and flood the pane. The band is 5-9 min; an attempt 5 min ago is an
+# attempt, and the verdict beside it says whether it was proven. Both facts are on the line.
+last=$(sed -n 's/.*NUDGE at=\([0-9][0-9]*\) delivered=.*/\1/p' "$LOG" 2>/dev/null | tail -1)
 # Fail LOUD on an unparseable timestamp rather than treating it as epoch 0: if the log format
 # changes, a silent 0 means "due" on EVERY pass and the floor turns into a flood.
 #
@@ -483,15 +490,73 @@ if [ "${NUDGE_DRY:-}" = "1" ]; then
   printf '%s\n' "$MSG"
   exit 0
 fi
-err=$(cmux send --workspace "$ORCH_WS" --surface "$ORCH_SURFACE" "$MSG\n" 2>&1)
-rc=$?
-if [ "$rc" -ne 0 ]; then
-  cmux send --workspace "$ORCH_WS" --surface "$ORCH_SURFACE" '\n' >/dev/null 2>&1
-  # rc != 0 is NOT proof it failed to land (the tick documents four nudges that logged rc=1 and arrived),
-  # so record the attempt either way -- but say which it was, so the log cannot manufacture an outage.
-  printf '%s CADENCE-NUDGE rc=%s (may still have landed) gap=%sm\n' \
-    "$(date '+%m-%d %H:%M:%S')" "$rc" "$gap_min" >> "$LOG"
+# ⛔ `delivered=yes` USED TO BE WRITTEN UNCONDITIONALLY — THAT WAS #1187's FALSE PASS AT THIS SITE.
+# The old tail was a bare `cmux send "$MSG\n"`, `rc=$?`, and then this line:
+#     printf '… NUDGE at=%s delivered=yes …'
+# with NO reference to `$rc` and NO verification of any kind, so a send that exited non-zero, and a
+# send that returned OK while the pane received only a PREFIX, both wrote the same `delivered=yes`
+# receipt. The comment that used to sit above the send — "THE SEND IS THE TEST: `cmux send` already
+# tells us whether it worked" — is the premise #1187 FALSIFIED: the 1,962-byte message arrived as its
+# first sentence and the 5,464-byte one arrived complete, both with `OK`. The log is what the next
+# reader (and `session-postmortem.sh`) takes as the receipt, so a receipt that certifies nothing is
+# exactly the defect class this file's own delivery promise cannot afford.
+#
+# The verdict now comes from `scripts/lib/cmux_payload.py` (#1187, #1881) — the same checker the lane
+# dispatcher uses — so there is ONE definition of "delivered" in the fleet, not a second one here.
+#   VERIFIED      → delivered=yes          (tail appended to the pane's transcript after this send)
+#   PANE_ONLY     → delivered=NOT-SUBMITTED (on the surface, submission unproven)
+#   SUBMIT_FAILED → delivered=NOT-SUBMITTED (the terminating Enter failed)
+#   UNVERIFIED    → delivered=UNVERIFIED    (prefix, unreadable pane, or a refused send)
+# Only the first is a success signal; the other three are LOUD, never silent.
+#
+# ⛔ THE FLOOR STILL SENDS WHEN THE CHECKER CANNOT RUN. `orch-send.sh` refuses to dispatch at all in
+# that case (exit 7), because a duplicate LANE ORDER is dangerous. This file is the cadence FLOOR: its
+# entire purpose is that a heartbeat leaves even on a broken box, and `delivered=UNVERIFIED` already
+# refuses to certify a send whose delivery it could not check. So: send, then say honestly that it
+# could not be checked. Never: send, then claim it landed.
+_verify="$SCRIPTS/lib/cmux_payload.py"
+if [ -x /usr/bin/python3 ] && [ -f "$_verify" ]; then
+  _verr=$(mktemp "${TMPDIR:-/tmp}/cadence-nudge-verify.XXXXXX") || _verr=/dev/null
+  verdict=$(/usr/bin/python3 "$_verify" verify \
+              --workspace "$ORCH_WS" --surface "$ORCH_SURFACE" \
+              --text="$MSG" --timeout "${CADENCE_NUDGE_VERIFY_TIMEOUT:-90}" \
+              2>"$_verr")
+  # A checker that crashed or was silent printed no verdict. That is NOT `VERIFIED`, and it must not
+  # fall through a `case` default that says so — name it explicitly instead.
+  [ -n "$verdict" ] || verdict="UNVERIFIED"
+  case "$verdict" in
+    VERIFIED) delivered="yes" ;;
+    PANE_ONLY|SUBMIT_FAILED) delivered="NOT-SUBMITTED" ;;
+    *) delivered="UNVERIFIED" ;;
+  esac
+  # The checker's stderr is kept: a crashing or refused send must not vanish, or the operator sees
+  # only a verdict with no cause (orch-send.sh makes the same call for the same reason).
+  _vdiag=""
+  [ -s "$_verr" ] && _vdiag=" diag=[$(tr '\n' ' ' <"$_verr" | tail -c 240)]"
+  [ "$_verr" = /dev/null ] || rm -f "$_verr"
+else
+  # No checker on this box. Send anyway (the floor's whole job) and record the attempt as unverified.
+  err=$(cmux send --workspace "$ORCH_WS" --surface "$ORCH_SURFACE" "$MSG\n" 2>&1)
+  rc=$?
+  if [ "$rc" -ne 0 ]; then
+    cmux send --workspace "$ORCH_WS" --surface "$ORCH_SURFACE" '\n' >/dev/null 2>&1
+  fi
+  verdict="NO-CHECKER"
+  delivered="UNVERIFIED"
+  _vdiag=" diag=[payload checker unavailable: $([ -f "$_verify" ] || echo "$_verify")$([ -x /usr/bin/python3 ] || echo " /usr/bin/python3")] rc=${rc:-?}"
 fi
-printf '%s NUDGE at=%s delivered=yes (cadence-floor) gap=%sm queue=[%s] alerts=[] ask=[]\n' \
-  "$(date '+%m-%d %H:%M:%S')" "$now" "$gap_min" "$q" >> "$LOG"
+# ⛔ THE DUE READ MUST COUNT ATTEMPTS, NOT ONLY SUCCESSES (see the `last=` read near the top). A
+# verification that cannot be PROVEN — the orchestrator was mid-turn, so its transcript had not
+# flushed inside the window — is a normal outcome here, and if this line only counted verified sends
+# the gap would never advance and the floor would re-fire on EVERY tick: a flood, which is the other
+# way out of the owner's 5-9 min band. Every attempt stamps `NUDGE at=`, and the `delivered=` field
+# carries the verdict, so the reader gets both facts and the cadence stays bounded.
+printf '%s NUDGE at=%s delivered=%s (cadence-floor) gap=%sm queue=[%s] alerts=[] ask=[] verdict=%s%s\n' \
+  "$(date '+%m-%d %H:%M:%S')" "$now" "$delivered" "$gap_min" "$q" "$verdict" "$_vdiag" >> "$LOG"
+# A failed verdict gets its own line TOO, so `grep CADENCE-NUDGE` still finds the failure even when a
+# reader is scanning for the old rc-only signature, and so the remedy is stated rather than implied.
+if [ "$delivered" != "yes" ]; then
+  printf '%s CADENCE-NUDGE NOT CERTIFIED verdict=%s%s — the nudge was NOT proven delivered; check the orchestrator pane before assuming the beat arrived (#1187).\n' \
+    "$(date '+%m-%d %H:%M:%S')" "$verdict" "$_vdiag" >> "$LOG"
+fi
 exit 0

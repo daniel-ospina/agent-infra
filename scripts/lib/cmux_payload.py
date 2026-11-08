@@ -216,7 +216,8 @@ def screen_has_payload(screen: str | None, sent_text: str,
 
 
 def resolve_session_id(workspace: str, run, attempts: int = 3,
-                       retry_s: float = 0.5, sleep=time.sleep) -> str | None:
+                       retry_s: float = 0.5, sleep=time.sleep,
+                       surface: str | None = None) -> str | None:
     """The pane's bound session id, or None when the pane does not NAME one.
 
     ⛔ SPLIT FROM THE FILE LOOKUP (#1881 review P1). `resolve_session_file` used to answer None for
@@ -238,7 +239,8 @@ def resolve_session_id(workspace: str, run, attempts: int = 3,
     """
     for attempt in range(max(1, attempts)):
         try:
-            proc = run(["cmux", "surface", "resume", "show", "--workspace", workspace],
+            proc = run(["cmux", "surface", "resume", "show", "--workspace", workspace,
+                        *(["--surface", surface] if surface else [])],
                        timeout=45)
             out = getattr(proc, "stdout", "") or ""
         except Exception:                                      # noqa: BLE001
@@ -460,7 +462,8 @@ def send_verified(workspace: str, text: str, *, run=None, sleep=time.sleep,
                   tail_chars: int = DEFAULT_TAIL_CHARS,
                   screen_lines: int = DEFAULT_SCREEN_LINES,
                   timeout_s: float = DEFAULT_VERIFY_TIMEOUT_S,
-                  poll_s: float = DEFAULT_POLL_S) -> tuple[str, str]:
+                  poll_s: float = DEFAULT_POLL_S,
+                  surface: str | None = None) -> tuple[str, str]:
     """Send `text` to `workspace`, then verify its tail on the pane.
 
     Returns ``(VERIFIED|PANE_ONLY|SUBMIT_FAILED|UNVERIFIED, last_screen)``. Never raises on a clean
@@ -487,6 +490,13 @@ def send_verified(workspace: str, text: str, *, run=None, sleep=time.sleep,
     """
     run = run or _default_run
     text = flatten(text)
+    # ⛔ THE TARGET IS A WORKSPACE **AND** AN OPTIONAL SURFACE, AND BOTH MUST BE THE CALLER'S (#1187
+    # follow-up). `send_verified` used to address `--workspace` only, so a sender that had already
+    # resolved a SPECIFIC surface (`cadence-nudge.sh` reads `ORCH_SURFACE` from the tick's own state)
+    # could not adopt the checker without silently retargeting its message at whatever surface cmux
+    # considers active — the same "delivered to the wrong place" class as the mis-addressed send in
+    # this issue's own record. Omitted by default, so every existing caller's argv is unchanged.
+    target = ["--workspace", workspace, *(["--surface", surface] if surface else [])]
 
     def cmux(*args):
         return run(["cmux", *args], timeout=45)
@@ -500,7 +510,7 @@ def send_verified(workspace: str, text: str, *, run=None, sleep=time.sleep,
     # by this send (or later) — only that case may reopen the search at offset 0. An id this read
     # could not obtain says nothing about whether a transcript existed, so it must never license the
     # 2 MB window: without a baseline the verdict stays below VERIFIED (PANE_ONLY at best).
-    session_id = resolve_session_id(workspace, run, sleep=sleep)
+    session_id = resolve_session_id(workspace, run, sleep=sleep, surface=surface)
     # ⛔ EXISTENCE IS A READ, NOT AN INFERENCE (#1881 review, rounds 4 and 5): `session_file_for`
     # answers None for "no file", "stat failed" AND "could not look", and only the FIRST of those may
     # reopen the search at offset 0. `session_files_state` reports unreadability as None, which never
@@ -511,7 +521,7 @@ def send_verified(workspace: str, text: str, *, run=None, sleep=time.sleep,
     may_await_new_file = bool(session_id) and session_had_file is False
 
     try:
-        sent = cmux("send", "--workspace", workspace, text)
+        sent = cmux("send", *target, text)
     except Exception as exc:                                   # noqa: BLE001
         # ⛔ A FAILED SEND IS NOT A SILENT ONE (#1881 review P2). The caller's catch-all arm tells the
         # operator "the checker's diagnostics below say which when it printed any", so this path must
@@ -534,7 +544,7 @@ def send_verified(workspace: str, text: str, *, run=None, sleep=time.sleep,
     try:
         # The terminating Enter. Sent as its own call so a payload that itself
         # ends in a newline does not submit the message twice.
-        enter = cmux("send", "--workspace", workspace, "\n")
+        enter = cmux("send", *target, "\n")
         # ⛔ A NON-ZERO EXIT FROM THE ENTER IS A DROPPED ENTER (#1881 review P2). Only the raised
         # case used to clear `entered`, so a `cmux` that exited 2 instead of raising left the flag
         # True and the verdict PANE_ONLY — whose remedy is the re-send this flag exists to forbid.
@@ -564,8 +574,7 @@ def send_verified(workspace: str, text: str, *, run=None, sleep=time.sleep,
     saw_tail = False
     while True:
         try:
-            proc = cmux("read-screen", "--workspace", workspace,
-                        "--lines", str(screen_lines))
+            proc = cmux("read-screen", *target, "--lines", str(screen_lines))
             screen = getattr(proc, "stdout", "") or ""
         except Exception:                                      # noqa: BLE001
             screen = ""
@@ -615,6 +624,9 @@ def _main(argv: list[str] | None = None) -> int:
 
     p = sub.add_parser("verify", help="send a payload, then verify its tail landed")
     p.add_argument("--workspace", required=True)
+    # Optional, and passed through unchanged to `send`, `read-screen` and `surface resume show`.
+    # A caller that resolved a specific surface must keep addressing it (#1187 follow-up).
+    p.add_argument("--surface", default=None)
     p.add_argument("--text", default=None)
     p.add_argument("--file", default=None)
     p.add_argument("--tail-chars", type=int, default=DEFAULT_TAIL_CHARS)
@@ -657,7 +669,8 @@ def _main(argv: list[str] | None = None) -> int:
     # cannot re-open the hole this line used to close for the CLI only.
     verdict, screen = send_verified(args.workspace, text, tail_chars=args.tail_chars,
                                     screen_lines=args.screen_lines,
-                                    timeout_s=args.timeout)
+                                    timeout_s=args.timeout,
+                                    surface=args.surface)
     print(verdict)
     return 0 if verdict == VERIFIED else 3
 

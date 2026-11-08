@@ -1177,3 +1177,215 @@ def test_orch_send_verifies_a_quoted_tail_against_a_real_jsonl_transcript(tmp_pa
     assert r.returncode == 0, r.stdout + r.stderr
     assert "CONSUMED" in r.stdout
     assert "NOT SUBMITTED" not in r.stdout
+
+
+# ── the surface passthrough (#1187 follow-up) ─────────────────────────────────
+#
+# `send_verified` addressed `--workspace` only, so a caller that had ALREADY resolved a specific
+# surface could not adopt the checker without silently retargeting its message at whatever surface
+# cmux considers active. Every arm of the send/verify sequence must carry the caller's target.
+
+def test_send_verified_forwards_the_callers_surface(P):
+    seen = []
+
+    def run(argv, timeout=None):
+        seen.append(list(argv))
+        return _Proc("")
+
+    P.send_verified("ws-1", LONG, run=run, sleep=_noop_sleep, timeout_s=0, surface="surf-9")
+    assert seen, "nothing was sent"
+    for argv in seen:
+        assert "--surface" in argv, f"an arm lost the caller's surface: {argv}"
+        assert argv[argv.index("--surface") + 1] == "surf-9", argv
+    # The send, the terminating Enter, the session lookup and the pane read all reach the same target.
+    kinds = {argv[1] for argv in seen}
+    assert kinds == {"send", "read-screen", "surface"}, kinds
+
+
+def test_send_verified_without_a_surface_is_unchanged(P):
+    """The default must be byte-identical to the pre-fix argv, or every existing caller moves."""
+    seen = []
+
+    def run(argv, timeout=None):
+        seen.append(list(argv))
+        return _Proc("")
+
+    P.send_verified("ws-1", LONG, run=run, sleep=_noop_sleep, timeout_s=0)
+    assert seen
+    for argv in seen:
+        assert "--surface" not in argv, argv
+
+
+def test_verify_cli_forwards_a_surface(P, monkeypatch):
+    seen = []
+
+    def run(argv, timeout=45):
+        seen.append(list(argv))
+        return _Proc("")
+
+    monkeypatch.setattr(P, "_default_run", run)
+    P._main(["verify", "--workspace", "ws-1", "--surface", "surf-9",
+             "--text", LONG, "--timeout", "0"])
+    assert seen
+    assert all("--surface" in argv for argv in seen), seen
+
+
+# ── end-to-end: the cadence FLOOR (scripts/cadence-nudge.sh) ───────────────────
+#
+# The floor wrote `delivered=yes` UNCONDITIONALLY: `cmux send` returned OK, and the receipt was
+# printed with no reference to the exit code and no verification at all. Under #1187 that receipt
+# certified a pane that had received only a prefix — and the log is what the next reader (and
+# `session-postmortem.sh`) takes as the receipt. These drive the REAL script.
+
+_NUDGE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cadence-nudge.sh")
+_SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def _cadence_home(tmp_path, screen_text, previous_line):
+    """A farmed copy of the floor, with the pane it resolves and the state it reads."""
+    home = tmp_path / "home"
+    scripts = home / ".pi" / "agent" / "scripts"
+    (scripts / "lib").mkdir(parents=True)
+    state = home / ".pi" / "agent" / "state"
+    state.mkdir(parents=True)
+    # The floor's own SCRIPTS root, exactly as it is farmed.
+    (scripts / "cadence-nudge.sh").write_text(open(_NUDGE, encoding="utf-8").read(),
+                                              encoding="utf-8")
+    for name in ("objective.py",):
+        (scripts / name).write_text(open(os.path.join(_SCRIPTS_DIR, name), encoding="utf-8").read(),
+                                    encoding="utf-8")
+    (scripts / "lib" / "cmux_payload.py").write_text(
+        open(os.path.join(_SCRIPTS_DIR, "lib", "cmux_payload.py"), encoding="utf-8").read(),
+        encoding="utf-8")
+    (scripts / "lib" / "beat-pair.sh").write_text(
+        open(os.path.join(_SCRIPTS_DIR, "lib", "beat-pair.sh"), encoding="utf-8").read(),
+        encoding="utf-8")
+    # The pane the floor sends to is READ from the tick, never hardcoded here.
+    (scripts / "orchestrator-heartbeat.sh").write_text(
+        'ORCH_WS="WS-FAKE"\nORCH_SURFACE="SURF-FAKE"\n', encoding="utf-8")
+    (state / "orchestrator-heartbeat.log").write_text(previous_line, encoding="utf-8")
+    (state / "objective.last").write_text("OBJECTIVE: fixture\nobj-line\nres-line\n",
+                                          encoding="utf-8")
+
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    cmux = bindir / "cmux"
+    cmux.write_text(textwrap.dedent('''\
+        #!/usr/bin/env bash
+        args="$*"
+        case "$args" in
+          *"resume show"*) echo "${FAKE_SESSION_SID:-}" ;;
+          *read-screen*) cat "${FAKE_SCREEN_FILE:-/dev/null}" ;;
+          *send*)
+            if [ -n "${FAKE_SESSION_FILE:-}" ]; then printf '%s\\n' "$args" >>"$FAKE_SESSION_FILE"; fi
+            echo "OK surface:19 workspace:19" ;;
+          *) echo "" ;;
+        esac
+        '''))
+    cmux.chmod(cmux.stat().st_mode | stat.S_IEXEC)
+    screen = tmp_path / "screen.txt"
+    screen.write_text(screen_text, encoding="utf-8")
+    return home, bindir, screen, state
+
+
+def _run_cadence_nudge(home, bindir, screen, session=None, sid=None, checker=True):
+    env = dict(os.environ)
+    env["HOME"] = str(home)
+    env["PATH"] = f"{bindir}{os.pathsep}{env['PATH']}"
+    env["FAKE_SCREEN_FILE"] = str(screen)
+    env["CADENCE_NUDGE_VERIFY_TIMEOUT"] = "0"
+    if session:
+        env["FAKE_SESSION_FILE"] = str(session)
+    if sid:
+        env["FAKE_SESSION_SID"] = str(sid)
+    env = _runner_env(env)
+    script = home / ".pi" / "agent" / "scripts" / "cadence-nudge.sh"
+    if not checker:
+        # The farmed copy lost its checker: the floor must still send, and must still refuse to
+        # certify what it could not check.
+        (home / ".pi" / "agent" / "scripts" / "lib" / "cmux_payload.py").unlink()
+    return subprocess.run(["bash", str(script)], capture_output=True, text=True, env=env,
+                          timeout=120)
+
+
+def _new_nudge_lines(state, seed):
+    """The `NUDGE at=` lines THIS run wrote. The seeded line is a PRIOR, legitimate receipt: asserting
+    over the whole file would fail on it and say nothing about what this send claimed."""
+    log = (state / "orchestrator-heartbeat.log").read_text(encoding="utf-8")
+    appended = log[len(seed):] if log.startswith(seed) else log
+    return [line for line in appended.splitlines() if "NUDGE at=" in line], appended
+
+
+def _seeded_log(seconds_ago):
+    import time as _t
+    return ("NUDGE at=%d delivered=yes (cadence-floor) gap=1m queue=[] alerts=[] ask=[]\n"
+            % (int(_t.time()) - seconds_ago))
+
+
+def test_cadence_nudge_does_not_report_a_prefix_as_delivered(tmp_path):
+    """⛔ THE #1187 FALSE PASS AT THE FLOOR. The pane was never given the payload (the fake cmux
+    answers OK and shows nothing, which is the measured shape: `OK` over a one-sentence prefix).
+    Pre-fix this wrote `delivered=yes`; the log is the receipt, so it must not."""
+    seed = _seeded_log(600)
+    home, bindir, screen, state = _cadence_home(
+        tmp_path, "the pane shows nothing relevant\n", seed)
+    r = _run_cadence_nudge(home, bindir, screen)
+    assert r.returncode == 0, r.stdout + r.stderr
+    nudges, appended = _new_nudge_lines(state, seed)
+    assert nudges, appended
+    assert all("delivered=yes" not in line for line in nudges), (
+        f"a delivery receipt the send did not earn:\n{appended}")
+    assert "delivered=UNVERIFIED" in appended, appended
+    assert "NOT CERTIFIED" in appended, "an uncertified send must be LOUD, not merely absent"
+
+
+def test_cadence_nudge_still_reports_delivery_it_can_prove(tmp_path):
+    """The fix is not "never say yes": a send the transcript records IS certified."""
+    sid = "01a0d648-4097-74b8-8cfd-3df3a071b463"
+    seed = _seeded_log(600)
+    home, bindir, screen, state = _cadence_home(tmp_path, "ok\n", seed)
+    sessions = home / ".pi" / "agent" / "sessions" / "proj"
+    sessions.mkdir(parents=True)
+    session = sessions / f"2026-09-29T12-00-00Z-{sid}.jsonl"
+    session.write_text('{"type":"user","content":"an earlier message"}\n', encoding="utf-8")
+    r = _run_cadence_nudge(home, bindir, screen, session=session, sid=sid)
+    assert r.returncode == 0, r.stdout + r.stderr
+    nudges, appended = _new_nudge_lines(state, seed)
+    assert nudges, appended
+    assert "delivered=yes" in appended, appended
+    assert "verdict=VERIFIED" in appended, appended
+    assert "NOT CERTIFIED" not in appended, appended
+
+
+def test_cadence_nudge_counts_an_unverified_attempt_so_it_cannot_flood(tmp_path):
+    """⛔ THE OTHER SIDE OF THE RECEIPT. If the due-read only counted VERIFIED sends, a run of
+    unprovable verifications (the orchestrator mid-turn, its transcript not yet flushed) would read
+    as NO nudge for a growing gap and the floor would re-fire on EVERY tick — out of the owner's
+    5-9 min band in the over-frequent direction. Every attempt stamps `NUDGE at=`, the verdict sits
+    beside it, and a second run inside the band sends nothing."""
+    home, bindir, screen, state = _cadence_home(
+        tmp_path, "the pane shows nothing relevant\n", _seeded_log(600))
+    first = _run_cadence_nudge(home, bindir, screen)
+    assert first.returncode == 0, first.stdout + first.stderr
+    log_path = state / "orchestrator-heartbeat.log"
+    after_first = log_path.read_text(encoding="utf-8")
+    assert "delivered=UNVERIFIED" in after_first
+    second = _run_cadence_nudge(home, bindir, screen)
+    assert second.returncode == 0, second.stdout + second.stderr
+    assert log_path.read_text(encoding="utf-8") == after_first, (
+        "the floor re-fired inside the band after an unverified attempt: it would flood the pane")
+
+
+def test_cadence_nudge_without_its_checker_still_beats_and_still_refuses_to_certify(tmp_path):
+    """The floor's job is that a heartbeat LEAVES even on a broken box. Losing the checker must not
+    silence it — but it must not buy a receipt either."""
+    seed = _seeded_log(600)
+    home, bindir, screen, state = _cadence_home(
+        tmp_path, "the pane shows nothing relevant\n", seed)
+    r = _run_cadence_nudge(home, bindir, screen, checker=False)
+    assert r.returncode == 0, r.stdout + r.stderr
+    nudges, appended = _new_nudge_lines(state, seed)
+    assert nudges, appended
+    assert all("delivered=yes" not in line for line in nudges), appended
+    assert "delivered=UNVERIFIED" in appended, appended
+    assert "payload checker unavailable" in appended, appended
