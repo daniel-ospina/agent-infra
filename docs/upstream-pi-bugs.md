@@ -1111,7 +1111,8 @@ reads `None` for almost every live process (below) — and the substitute read
 predicate below classifies every process above 5% as *working*, i.e. **not**
 silent. So what this section records is **the CPU signal firing and the burn
 being absent**, not the committed two-conjunct trigger having fired. It also
-records, more durably, a **better predicate** than the one the 09-16 table used.
+records, more durably, a **better predicate pair** (ΔCPU + `rchar`) than the
+09-16 table's transcript-age predicate.
 
 **A method correction, forced by the data.** The 09-16 table keys "idle" on the
 age of the session `.jsonl`. That predicate is **not obtainable on a fleet box**:
@@ -1127,10 +1128,14 @@ them — which is itself the point: for the rest the predicate cannot even be
 evaluated.)
 
 The substitute is **`/proc/<pid>/io`'s `rchar`**, which needs no cooperation from
-`pi` and separates the two cases this issue conflates: *idle* (reads sit on a flat
-floor) versus *legitimately working* (reads scale with the provider stream or the
-tool output). ΔCPU comes from `/proc/<pid>/stat`'s `utime+stime` ticks
-(`USER_HZ=100`), i.e. the 09-16 method (`ps -o time` twice) at 10 ms resolution.
+`pi` and — read alongside ΔCPU — separates the two cases this issue conflates:
+*idle* (reads sit on a flat floor) versus *legitimately working* (reads scale with
+the provider stream or the tool output). Be precise about which of the two does
+the work: the floor and the working minimum very nearly touch (quantified in the
+first result bullet below), so **ΔCPU makes the split and `rchar` is the
+corroboration** — a bare read-rate threshold would not classify on its own. ΔCPU
+comes from `/proc/<pid>/stat`'s `utime+stime` ticks (`USER_HZ=100`), i.e. the
+09-16 method (`ps -o time` twice) at 10 ms resolution.
 Both are measured on the **same** 25–30 s window, so CPU and reads are the same
 epoch — the property the epoch analysis above found missing across windows.
 
@@ -1180,9 +1185,10 @@ epoch — the property the epoch analysis above found missing across windows.
   63.1%, `python3` 16.9%, `bash` 15.8%, `pytest` 7.3% — i.e. the fleet's own
   work. That further undercuts the "`pi` CPU → load → swap → reboot" chain from
   the *other* direction: on a host at the same order of load, `pi` was 10% of it.
-- **Main thread vs workers** (the size column, and the report's caveat
-  quantified): on the processes that were busy, the main thread carried
-  **0.61–1.00** of the ΔCPU and the `V8Worker` pool **0.02–0.41**. So the burn,
+- **Main thread vs workers** (the report's caveat quantified, though *not* the
+  size column, which stays missing below): on the processes that were busy, the
+  main thread carried **0.61–1.00** of the ΔCPU and the `V8Worker` pool
+  **0.02–0.41**. So the burn,
   when it exists, is main-thread JS — consistent with the render-frame mechanism
   and *not* primarily collector throughput.
 
