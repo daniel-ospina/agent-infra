@@ -632,12 +632,13 @@ three months). Two documented ways it then survives:
 | **`git worktree lock`** | prune skips it **silently** — rc 0, no warning — and `git worktree remove --force` refuses (`cannot remove a locked working tree`). This is the one silent skip. |
 | `git gc` instead of prune | a freshly-dead record is **still listed** after `git gc` — it honours `gc.worktreePruneExpire`, default **3 months** |
 
-Remedy, and only with **your own** path: `git worktree unlock <path> && git worktree prune`, or
-`git worktree remove -f -f <path>`.
-⛔ **Never run a bare `git worktree prune` as housekeeping.** It has no path filter and deregisters EVERY
-record whose directory is momentarily unstat-able — an unmounted volume, a permission blip — destroying an
-unrelated checkout whose files are still on disk (#1141). Remove your own record:
-`git worktree remove --force <your path>`.
+Remedy, scoped to **your own** record: `git worktree remove -f -f <path>` — a locked record needs the flag
+twice (`remove -f` refuses with `use 'remove -f -f' to override or unlock first`).
+⛔ **Never run a bare `git worktree prune` as housekeeping.** It takes **no path argument**
+(`git worktree prune [-n] [-v] [--expire <expire>]`), so it cannot be scoped: it deregisters EVERY record
+whose directory is momentarily unstat-able — an unmounted volume, a permission blip — destroying an
+unrelated checkout whose files are still on disk. The measurement behind this ban is recorded at
+`scripts/stale-worktrees.sh:145-150`; `#1141`'s tracker entry does not carry it.
 
 ## Search
 
