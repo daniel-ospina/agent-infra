@@ -39,6 +39,27 @@
 # repo, a sandbox HOME, and stub binaries — no network, no launchd, no real `$O`.
 set -uo pipefail
 
+# ⛔ THE SUITE IS HERMETIC, AND THAT IS ASSERTED, NOT ASSUMED (agent-infra#3762, measured 2026-11-08).
+# Every arm below drives the REAL installer against a sandbox `$HOME`, and `install.sh` defaults its
+# three record paths FROM `$HOME` (`HARNESS_PIN_DIR`, `HARNESS_PIN_FILE`, `HARNESS_PIN`). An INHERITED
+# value therefore silently overrode the sandbox for every arm that does not pass one of its own. Two
+# measured consequences, and both were invisible:
+#   1. IT WROTE THE OPERATOR'S LIVE `.harness-path`. `pin_write_record` writes `$HARNESS_PIN_FILE`, and
+#      that file is what this box's running controller EXECS. Measured: the record was left naming
+#      `/tmp/macpin.<rand>/repo/scripts/orchestrator-harness`, a fixture the suite deletes on exit —
+#      i.e. one suite run pointed a live controller at a tree that no longer exists.
+#   2. THE VERDICT DEPENDED ON THE BOX, not on the tree. Same checkout, same commit: 82 passed / 48
+#      failed with the ambient record, and 130 passed / 0 failed with it cleared. The 48 reds were
+#      `REFUSED (pin): the resolved harness dir /tmp/macpin… does not exist` — the fixture's own
+#      leftovers read back as the operator's pin.
+# A suite that can be RED on a correct tree by inheritance is a false FAIL; one that writes the live
+# record is worse than that. So the records are cleared HERE, and every arm supplies its own under its
+# sandbox `$HOME`. §G below re-reads the real records at exit and reddens if anything here touched them.
+HERMETIC_SNAP_PATH="$(cksum <"$HOME/.harness-path" 2>/dev/null || printf 'absent')"
+HERMETIC_SNAP_PIN="$(cksum <"$HOME/.pi/agent/state/HARNESS-PIN" 2>/dev/null || printf 'absent')"
+unset HARNESS_PIN_FILE HARNESS_PIN_DIR HARNESS_PIN HARNESS_REPO HARNESS_REF \
+      HARNESS_MATERIALISER CELL_HOME
+
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$HERE/.." && pwd)"
 HARNESS="$HERE/orchestrator-harness"
@@ -904,6 +925,21 @@ portability_scan() { # <file>
 }
 for f in "$HERE/harness-up" "$HERE/orchestrator-bringup.sh" "$INSTALL" "$HERE/mac-pin-parity.test.sh"; do
   portability_scan "$f" || true
+done
+
+# ── G. the suite did not touch this box's OWN pin records ─────────────────────────────────────
+# ⛔ THE ARM THAT MAKES §THE-HEADER A PROPERTY RATHER THAN A COMMENT (agent-infra#3762). The defect this
+# pins is not "a variable was inherited" — it is that a hermetic suite could leave a LIVE box pointed at
+# a deleted fixture and still print a verdict. Deleting the `unset` above restores exactly that, and
+# this arm is what reddens for it. It reads the SAME two records `install.sh` writes, at the real
+# `$HOME` captured before the unset, so it catches the next leak (a new record path, a new consumer)
+# without needing to name which variable carried it.
+sec "G. HERMETIC: the real \$HOME pin records are byte-identical to what they were at start"
+for _herm in "$HOME/.harness-path" "$HOME/.pi/agent/state/HARNESS-PIN"; do
+  _want="$HERMETIC_SNAP_PATH"; [ "$_herm" = "$HOME/.harness-path" ] || _want="$HERMETIC_SNAP_PIN"
+  _got="$(cksum <"$_herm" 2>/dev/null || printf 'absent')"
+  ck "$([ "$_want" = "$_got" ] && echo 0 || echo 1)" \
+     "$_herm is UNCHANGED (a suite that writes the operator's pin record retargets a live controller) — was '$_want', now '$_got'"
 done
 
 sec "summary"

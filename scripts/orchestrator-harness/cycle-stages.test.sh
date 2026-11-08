@@ -704,10 +704,23 @@ ck "  …and \`gate\` covers the floor/gate work it names — a \`floor_emergenc
    "$(if [ "${_floor_in_gate:-no}" = "yes" ]; then echo 0; else echo 1; fi)"
 
 # 9.1d-iii: NO NAP SITE MAY BE DROPPED, and the count is derived from the NAPS the loop performs.
-_nap_n="$(printf '%s\n' "$_loop_nc" | grep -cE '^[[:space:]]*stg_nap_mark([[:space:]]|$)')"
-_loop_n="$(printf '%s\n' "$_loop_nc" | grep -cE '^[[:space:]]*(fork_free_sleep|sleep) ')"
-ck "every nap path calls stg_nap_mark (${_nap_n} nap_mark sites for ${_loop_n} sleep/fork_free_sleep lines — a path without one loses prev_wait)" \
-   "$(if [ "${_nap_n:-0}" -ge 3 ] && [ "${_nap_n:-0}" -ge "$(( ${_loop_n:-0} - 1 ))" ]; then echo 0; else echo 1; fi)"
+# ⛔ THE COUNT IS SCOPED TO THE CONTROLLER'S OWN LOOP, NOT TO THE WHOLE FILE (agent-infra#3762,
+# measured). `cascade_wait()` is a HELPER defined ABOVE `while true; do`, and its poll — `fork_free_sleep
+# "$poll" || sleep "$poll"` — is a cadence measurement, not a cycle nap: it returns the moment a slot
+# frees and has no `prev_wait` to carry. It was added by #3594, which took `_loop_n` from 4 to 5 while
+# `_nap_n` stayed 3, so `_nap_n >= _loop_n - 1` became `3 >= 4` and this arm reddened ON MAIN — a false
+# FAIL on a correct tree, for every branch off it. Scoping to the loop body restores the property the
+# arm was written for (a DROPPED nap site or a dropped mark still reddens: 4 lines, 3 marks, and the
+# slack of 1 is exactly the fork-starved site's TWO nap forms sharing ONE mark) without grading a
+# helper's poll as if it were a cycle nap. The region is derived, never assumed: a file that loses its
+# `while true; do` FAILS here rather than silently counting every sleep in the file.
+_loop_nap_region="$(printf '%s\n' "$_loop_nc" | awk '/^[[:space:]]*while true; do/{f=1} f')"
+_region_ok=1
+[ -n "$_loop_nap_region" ] || _region_ok=0
+_nap_n="$(printf '%s\n' "$_loop_nap_region" | grep -cE '^[[:space:]]*stg_nap_mark([[:space:]]|$)')"
+_loop_n="$(printf '%s\n' "$_loop_nap_region" | grep -cE '^[[:space:]]*(fork_free_sleep|sleep) ')"
+ck "every nap path calls stg_nap_mark (${_nap_n} nap_mark sites for ${_loop_n} sleep/fork_free_sleep lines inside the controller loop — a path without one loses prev_wait; loop region ${_region_ok})" \
+   "$(if [ "$_region_ok" -eq 1 ] && [ "${_nap_n:-0}" -ge 3 ] && [ "${_nap_n:-0}" -ge "$(( ${_loop_n:-0} - 1 ))" ]; then echo 0; else echo 1; fi)"
 
 # 9.1g THE READER REFUSES A GLOB AS A STAGE NAME.
 # ⛔ THESE ARMS PIN THE OBSERVABLE, NOT THE GUARD. The wanted name is validated AND used quoted, so the
