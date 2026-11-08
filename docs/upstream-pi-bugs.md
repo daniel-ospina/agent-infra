@@ -1227,13 +1227,12 @@ reading.**
 - **Main thread vs workers** (the report's caveat quantified, though *not* the
   size column, which stays missing below): on the processes that were busy, the
   main thread carried **0.61–1.00** of the ΔCPU; the `V8Worker` pool's largest
-  observed share was **0.41**. Those are two **separate envelopes over the busy set,
-  and they do not compose into one**: a 0.61 main-thread floor leaves at most 0.39
-  for every other thread, so the 0.41 maximum cannot belong to a process inside that
-  floor's population — the pair is recorded as measured, and it does not add up. The
-  load-bearing observation is the main-thread range: the burn,
-  when it exists, is main-thread JS — consistent with the render-frame mechanism
-  and *not* primarily collector throughput.
+  observed share was **0.41**. Those **cannot both be true of the same busy set**: a
+  0.61 main-thread floor leaves at most 0.39 for every other thread, so a 0.41
+  `V8Worker` maximum is arithmetically excluded — both are recorded as measured, they
+  do not add up, and one of the two must be wrong. The load-bearing observation is
+  the main-thread range: the burn, when it exists, is main-thread JS — consistent
+  with the render-frame mechanism and *not* primarily collector throughput.
 
 **What this settles, and what it does not.** What it **records** is narrower than
 an independent negative: **no process labelled idle on one Linux x86_64 fleet box
