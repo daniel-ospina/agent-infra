@@ -1069,6 +1069,11 @@ Ink-based TUI with a large mounted output also burn under the same profile?
    per-frame cost is `getEntries()` (a fresh filtered array plus a scan of every
    session entry). Cache on the branch/last-entry identity, and stop walking
    every entry to build a fresh array per frame.
+   **Landed upstream as of `pi` 1.2.0** — `getSessionStats()` now caches on
+   `(session, sessionId, leafId, entryCount, limitsModel)`
+   (`dist/modes/interactive/components/footer.js:85-95`, whose own docstring
+   states the reason: "the footer renders on every frame"). See the re-measure
+   below; this is the one recommendation of the five that has shipped.
 3. **Make frames cheap and windowed** (the issue's ask 2). Note the ask as
    filed — "make the idle path event-driven" — is **insufficient as stated and
    is not adopted here without re-derivation**: an animated indicator (`Working`
@@ -1093,6 +1098,85 @@ this paragraph is the only re-check. Trigger for a manual re-measure: the next
 time any `pi` process exceeds ~5% of a core with a transcript silent > 120 s. If
 the fleet's next restart shows the spin gone, that is evidence for the "not idle
 at all — queued auto-continuation" framing rather than against it.
+
+### Re-measure 2026-11-08 (Linux cell, `pi` 1.2.0) — the trigger fired; no idle burn observed
+
+**Why this section exists.** The re-check paragraph above commits this report to
+a manual re-measure the next time a `pi` process exceeds ~5% of a core. That
+trigger fired on 2026-11-08 on a Linux fleet cell (x86_64, load 17.70, 22 days
+uptime, `pi` **1.2.0** — the report above probed **0.85.1** on macOS arm64).
+This section records the result, and — more durably — a **better predicate**
+than the one the 09-16 table used.
+
+**A method correction, forced by the data.** The 09-16 table keys "idle" on the
+age of the session `.jsonl`. That predicate is **not obtainable on a fleet box**:
+in the first window, **18 of 19** live `pi` processes had no session directory at
+all for their cwd (nothing at `~/.pi/agent/sessions/--<cwd>--/`), and exactly
+**one** `.jsonl` in the whole sessions tree had been written in the previous 15
+minutes. Silence therefore read `None` for 18 of 19 — the 09-16 predicate is a
+single-host artifact and cannot be the fleet's trip.
+
+The substitute is **`/proc/<pid>/io`'s `rchar`**, which needs no cooperation from
+`pi` and separates the two cases this issue conflates: *idle* (reads sit on a flat
+floor) versus *legitimately working* (reads scale with the provider stream or the
+tool output). ΔCPU comes from `/proc/<pid>/stat`'s `utime+stime` ticks
+(`USER_HZ=100`), i.e. the 09-16 method (`ps -o time` twice) at 10 ms resolution.
+Both are measured on the **same** 25–30 s window, so CPU and reads are the same
+epoch — the property the epoch analysis above found missing across windows.
+
+| window (UTC) | `pi` procs | TUI | TUI Σ % of one core | idle TUI | worst idle % | working TUI | min `rchar` of those |
+|---|---|---|---|---|---|---|---|
+| 09:26:14 (30 s) | 30 | 15 | 18.0 | 11 | **0.3** | 4 | 26.4 KB/s |
+| 09:26:50 (25 s) | 22 | 14 | 18.1 | 8 | **0.2** | 6 | 10.4 KB/s |
+| 09:27:15 (25 s) | 22 | 14 | 11.7 | 9 | **0.1** | 5 | 54.5 KB/s |
+| 09:27:40 (25 s) | 22 | 14 | 20.8 | 9 | **0.1** | 5 | 299.7 KB/s |
+
+**Result — the idle burn is absent, and every hot process is reading.**
+
+- **12 distinct idle TUI processes across the four windows, and the worst of them
+  is 0.3% of a core** (11 of 12 at ≤ 0.2%). Their read rate is a flat **8.4–10.1
+  KB/s**, *identical* across every idle process in every window — a fixed
+  background poll, not input, so the floor is a stable control rather than a
+  per-process accident.
+- **No window contained a process above 1% of a core with reads at that floor** —
+  which is exactly the 09-16 defect signature (11 processes at 6.4–26.3% while
+  silent for 1.0–209.5 min). Run as a filter over all four windows it returns
+  `NONE`.
+- ΔCPU tracked `rchar` **in both directions, for the same pid, across windows**
+  rather than following a constant cadence: pid 2324326 read
+  `0.1%/8.4 KB/s → 2.8%/4 089 KB/s → 3.4%/9 841 KB/s → 5.5%/708 KB/s`, pid
+  1040172 `7.0%/41 KB/s → 0.2%/10 KB/s → 0.0%/10 KB/s → 2.0%/35 911 KB/s`, pid
+  1956953 `0.0%/8 KB/s → 2.6%/179 KB/s → 2.8%/198 KB/s → 5.2%/300 KB/s`. A render
+  loop on a timer would not idle at 0.0% and then follow a provider stream —
+  **these sessions were working, not spinning.**
+- **One honest exception, recorded rather than smoothed:** pid 4076400 spent one
+  window at **0.8% of a core** with 10.4 KB/s of reads — a transient ~30× below
+  the 26.3% peak this report measured, and inside the report's own ~0.1%–1%
+  residual band once a frame is emitted.
+- **Aggregate:** `pi`'s whole process tree summed to **38.2% of one core** over a
+  10 s window (22 processes) against **177.5%** on 09-16. And the box's load was
+  **not `pi`'s**: the top consumers were `bash` 99.9%, `python3` 96.3%, `bash`
+  63.1%, `python3` 16.9%, `bash` 15.8%, `pytest` 7.3% — i.e. the fleet's own
+  work. That further undercuts the "`pi` CPU → load → swap → reboot" chain from
+  the *other* direction: on a host at the same order of load, `pi` was 10% of it.
+- **Main thread vs workers** (the size column, and the report's caveat
+  quantified): on the processes that were busy, the main thread carried
+  **0.61–1.00** of the ΔCPU and the `V8Worker` pool **0.02–0.41**. So the burn,
+  when it exists, is main-thread JS — consistent with the render-frame mechanism
+  and *not* primarily collector throughput.
+
+**What this settles, and what it does not.** It settles that **a fleet box at
+0.85.1→1.2.0 shows no idle `pi` spin in 105 s of windows**, and it supplies the
+missing discriminator for telling a burner from a worker. It does **not** settle
+that the defect is fixed, for three reasons this report's own analysis demands be
+stated: (a) the burn is **episodic** — 30 s windows cannot exclude a bursty
+offender, so a negative here is one epoch, not a lifetime rate; (b) the OS and
+version both moved (macOS arm64/0.85.1 → Linux x86_64/1.2.0), so the two
+observations are confounded exactly as the 09-16 confound analysis warns; and
+(c) one of the five recommendations above **has shipped** in between (the footer
+memoisation, item 2), which is a plausible partial cause and is *not* demonstrated
+to be the cause. What it does mean operationally is that the **mechanical trip is
+still #1127** — a prose re-check answered once is still prose.
 
 ### Mitigation available in agent-infra (the issue's ask 3)
 
