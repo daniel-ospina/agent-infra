@@ -945,6 +945,29 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
       "scripts/orchestrator-harness/origination-funnel.test.sh §5c — the reader's in-flight/dead split (see REFRESH_STALE_LOCK_MIN)",
     note: "DERIVED alias of REFRESH_STALE_LOCK_MIN, kept as its own symbol so the reader can be re-pointed without touching the lock guard. `inFamily` cannot see it (no family token in `RUNNING`), so it is registered rather than left to the reverse scan — the audit should know every bound the beat acts on.",
   },
+  // — reap axis: the worker reaper's IDLE WINDOW (#2104) —
+  //
+  // ⛔ THIS BOUND EXISTS BECAUSE A 2-SECOND INSTANT IS NOT A WINDOW (PR #3756 review, P2). The
+  // reaper decides "idle" on the conjunction lane-bound.sh defines — NO OUTPUT GROWTH **and** NO CPU
+  // DELTA **for the idle window** — but it originally took both CPU samples inside one pass, 2 s
+  // apart, and measured a genuinely live fleet lane flat at 1100 -> 1100 cs. A lane parked off-CPU
+  // (waiting on a model response, `gh`, a CI poll) is flat for minutes and is NOT idle, so the window
+  // has to be minutes: the previous reading is now carried across PASSES in a durable per-worker file
+  // (`$O/state/wreap-<name>`) and this is how far apart two readings must be before a flat one counts.
+  // It is deliberately a MINIMUM, not a timeout: a shorter gap returns UNKNOWN (spare), so a busy box
+  // that cycles faster cannot convert "I did not wait long enough" into "it is dead". Registered on
+  // introduction, per this file's rule — a bound the reaper acts on but no audit knows about is the
+  // invisibility the registry exists to remove.
+  {
+    name: "_WREAP_WINDOW_MIN",
+    owners: ["scripts/orchestrator-harness/orch-loop.sh"],
+    value: '"${WREAP_WINDOW_MIN:-6}"',
+    axis: "reap",
+    guardedBy:
+      "scripts/orchestrator-harness/selftest.sh §15b (c6/c7): the shipped `_wreap_verdict` is extracted and DRIVEN — a flat pair closer than the window answers UNKNOWN (rc 2, spare), a flat pair past it answers REAP (rc 0), and the §15b (d) end-to-end fixture asserts the REAP line names the window; the forward check here pins the VALUE",
+    overrides: ["_WREAP_WINDOW_MIN=6"],
+    note: "how many MINUTES must separate two CPU readings of a worker's subtree before a flat delta is read as idle (default 6). `${WREAP_WINDOW_MIN}` is the env seam; the second declaration is the `is_num` coercion that drops a non-numeric override back to 6 — recorded so a third assignment cannot shadow the default unnoticed. ⛔ THE TOLERANCE ALONGSIDE IT (`_WREAP_TOL_CS`, 10 cs) IS *BELOW* THE INSTRUMENT: `ps -o time=` prints WHOLE seconds, so a 100 cs quantum makes `delta <= 10` mean `delta == 0` on a cell. That is stated at the constant rather than hidden, and its harm direction is SPARE (a matched process crossing a second boundary reads ACTIVE), never a wrong kill.",
+  },
   // — retention axis —
   {
     name: "MAX_AGE_DAYS",
@@ -1572,6 +1595,12 @@ export const STALL_SCAN_EXEMPTIONS: readonly Exemption[] = [
     rationale:
       "durable task-run RECORD retention age (7 days) in shared/task-runs.ts — a disk-retention backstop for the run-record/log tree, not a session or child liveness bound (the byte cap binds first in practice); paired with the live-pid / settle-grace guard so it never evicts an in-flight lane",
     owner: "#1662",
+  },
+  {
+    symbol: "WREAP_WINDOW_MIN",
+    rationale:
+      "an ENV SEAM, not a bound: the production bound is `_WREAP_WINDOW_MIN` (registered on its own row above, default 6, owners: scripts/orchestrator-harness/orch-loop.sh). This symbol never holds a decided value — it is set by the SUITES that drive the shipped helpers, to 0 so a two-signal gate is answerable inside one fixture pass, or to 6 to reproduce the 'baseline younger than the window' arm. Registering it as a term is impossible by construction, not merely inconvenient: the forward check requires every owner to declare the SAME value, and these callers deliberately declare different ones. The `_MIN` suffix rule matches the seam's assignment lines; the value it guards is the registered term's, so the audit still sees every number the reaper acts on",
+    owner: "#2104",
   },
 ];
 

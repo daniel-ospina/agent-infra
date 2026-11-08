@@ -2851,6 +2851,14 @@ _reapw_fn() { # <loopfile> <fn-name>
 reapw_prelude() { # <loopfile> -> the shipped helpers, in dependency order
   local L="$1"
   grep -m1 '^is_num() {' "$L"
+  # ⛔ THE BOUNDS COME FROM THE SHIPPED LOOP, NOT FROM THIS FILE. A fixture that assigns
+  # `_WREAP_WINDOW_MIN` here is a SECOND declaration of a registered stall bound in a file the
+  # registry does not list as an owner — `heartbeat-progress-edges.test.ts`'s reverse scan refuses
+  # exactly that (measured: the three fixture assignments below were the only violation the scan
+  # found for this term). Extracting the shipped line instead means the rig carries the REAL default
+  # and the `WREAP_WINDOW_MIN` env seam is honoured, which is how the sibling suites drive
+  # `SWEEP_MAX_AGE`.
+  grep -E '^_WREAP_(TOL_CS|WINDOW_MIN)=' "$L"
   _reapw_fn "$L" file_mtime_epoch
   _reapw_fn "$L" worker_log_name
   _reapw_fn "$L" _wreap_ps
@@ -2896,7 +2904,9 @@ if need "$TMP/reapw.sh" "reap_stale_workers() and its helpers are extracted from
   # shellcheck disable=SC1090
   . "$TMP/wtstub.sh"
   LOG="$TMP/RW/rw.log"; O="$TMP/RW"; WT_DIR="$TMP/RW/state"; STALE_MIN=1; WT_TABLE_TTL=0
-  _WREAP_WINDOW_MIN=0
+  # The WINDOW is driven through the seam the shipped line reads, never by re-declaring the bound
+  # here (see reapw_prelude): a 0 window makes the two-signal gate answerable in one fixture pass.
+  WREAP_WINDOW_MIN=0
   # shellcheck disable=SC1090
   . "$HERE/worker-terminal.sh"
   # shellcheck disable=SC1090
@@ -2987,7 +2997,7 @@ TBL
   ck "#2104: a worker present in the baseline and absent now is UNKNOWN, not idle" $rc
   vrun "$(date +%s)" "" 100 2 alive; [ "$?" = "2" ] && rc=0 || rc=1
   ck "#2104: a FIRST sighting has no window, so it is UNKNOWN — the gate cannot fire on one pass" $rc
-  _wreap_verdict_win() { ( _WREAP_WINDOW_MIN=6; . "$TMP/reapw.sh"; _wreap_verdict "$@" ); }
+  _wreap_verdict_win() { ( WREAP_WINDOW_MIN=6; . "$TMP/reapw.sh"; _wreap_verdict "$@" ); }
   _wreap_verdict_win "$(date +%s)" "$(date +%s) 100 2" 100 2 alive; [ "$?" = "2" ] && rc=0 || rc=1
   ck "#2104: a baseline younger than the window is UNKNOWN (a 2 s sample cannot tell wedged from off-CPU)" $rc
   vrun "$(date +%s)" "" 100 0 alive; [ "$?" = "2" ] && rc=0 || rc=1
@@ -3034,7 +3044,7 @@ tmux() {
   return 0
 }
 LOG="$TMP/RL/rw.log"; O="$TMP/RL"; WT_DIR="$TMP/RL/state"; STALE_MIN=1; WT_TABLE_TTL=0
-_WREAP_WINDOW_MIN=0; _WREAP_TOL_CS=0
+WREAP_WINDOW_MIN=0; _WREAP_TOL_CS=0
 . "$HERE/worker-terminal.sh"
 # ⛔ THE CENSUS IS STUBBED AT `wt_tmux_names`, NOT AT `tmux` (measured while writing this fixture):
 # `wt_tmux_names` runs the session list through `wt_bounded`, which `perl … exec @ARGV`s — a shell FUNCTION
@@ -3081,7 +3091,7 @@ set -u
 ps() { :; }                     # a blind probe: no rows at all
 . "$TMP/wtstub.sh"
 LOG="$TMP/RL/rw2.log"; O="$TMP/RL"; WT_DIR="$TMP/RL/state"; STALE_MIN=1; WT_TABLE_TTL=0
-_WREAP_WINDOW_MIN=0
+WREAP_WINDOW_MIN=0
 . "$HERE/worker-terminal.sh"
 # THE SURFACE ANSWER — the only thing that differs between the two arms below, and stubbed at
 # `wt_tmux_names` for the reason recorded in `rl.sh` (a `tmux()` function does not survive wt_bounded's exec).
