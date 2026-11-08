@@ -76,9 +76,11 @@ never from a launcher-set variable). An interactive session is never guarded.
 - **R1 RECORD** — every host GUI launch appends one row to
   `~/.pi/agent/state/host-app-launches.jsonl`. This is the cheap half: with it,
   the incident above is one lookup instead of six rounds of `ps`.
-- **R2 BLOCK THE MEDIA SHAPES** — an Electron launch, or a **headed** Playwright
-  run, without `--use-fake-device-for-media-stream --use-fake-ui-for-media-stream`
-  is refused, and the refusal names both flags.
+- **R2 BLOCK THE MEDIA SHAPES** — an Electron launch, a **headed** Playwright run,
+  or `open <path>.app`, without
+  `--use-fake-device-for-media-stream --use-fake-ui-for-media-stream` is refused,
+  and the refusal names both flags. A named-app launch (`open -a Safari`) is only
+  recorded: refusing every GUI launch is the friction the scoping comment rejects.
 
 The lookup that was missing:
 
@@ -86,6 +88,10 @@ The lookup that was missing:
 jq -c 'select(.media)' ~/.pi/agent/state/host-app-launches.jsonl | tail -20
 jq -r '[.ts, .decision, .rule, .app, .cwd] | @tsv' ~/.pi/agent/state/host-app-launches.jsonl
 ```
+
+`select(.media)` answers "what could take the camera": Electron, headed Playwright,
+and an `open <path>.app`. A named-app launch (`open -a Safari`) is recorded with
+`media: false` deliberately, so use plain `jq -c '.' …` for every GUI launch.
 
 See [`extensions/gui-device-guard/README.md`](../../extensions/gui-device-guard/README.md)
 for the knobs and the declared residuals (a `node script.js` that requires

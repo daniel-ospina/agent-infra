@@ -77,7 +77,11 @@ const ROWS = [
   ["L9a open -a Safari", "open -a Safari", 1, "open", false],
   ["L9b open -a 'Google Chrome'", 'open -a "Google Chrome" https://x.test', 1, "open", false],
   ["L9c open -b bundle id", "open -b com.apple.Safari", 1, "open", false],
-  ["L9d open a .app path", "open ./Build/DMeer.app", 1, "open", false],
+  // ⛔ A PATH IS A MEDIA SHAPE, A NAME IS NOT (review cycle 2, F3). The incident's
+  // own app, launched the way a lane launches the bundle it just built. `-a <name>`
+  // stays record-only: that is the category-B rejection the scoping comment records.
+  ["L9d open an explicit .app PATH", "open ./Build/DMeer.app", 1, "open", true],
+  ["L9e open a bare .app in cwd is a path too", "open DMeer.app", 1, "open", true],
   // L10 — headed browser runs can present a REAL device picker.
   ["L10a playwright --headed", "npx playwright test --headed", 1, "playwright", true],
   ["L10b PWDEBUG", "PWDEBUG=1 npx playwright test", 1, "playwright", true],
@@ -97,6 +101,26 @@ const ROWS = [
   ["L14a playwright codegen", "npx playwright codegen https://x.test", 1, "playwright", true],
   ["L14b playwright open", "npx playwright open https://x.test", 1, "playwright", true],
   ["L14c PWDEBUG exported in an EARLIER segment", "export PWDEBUG=1; npx playwright test", 1, "playwright", true],
+  // ── L15 (review cycle 2, F1) — an UNLISTED value-taking flag must not swallow
+  //     the command word. Every row below was measured `[]` at the previous head,
+  //     i.e. a fail-open in the class the header called "a BYPASS". Two spellings
+  //     of the SAME flag disagreed (`sudo -u` fired, `sudo --user` did not), which
+  //     is the tell that a table was being trusted as if it were complete.
+  ["L15a sudo --user", "sudo --user root electron .", 1, "electron", true],
+  ["L15b sudo --user=", "sudo --user=root electron .", 1, "electron", true],
+  ["L15c env --unset", "env --unset FOO electron .", 1, "electron", true],
+  ["L15d npm exec --prefix <dir>", "npm exec --prefix apps/web electron .", 1, "electron", true],
+  ["L15e npm --prefix <dir> exec", "npm --prefix apps/web exec electron .", 1, "electron", true],
+  ["L15f yarn --cwd <dir> playwright", "yarn --cwd web playwright test --headed", 1, "playwright", true],
+  ["L15g timeout --preserve-status", "timeout --preserve-status 300 electron .", 1, "electron", true],
+  ["L15h timeout --signal=", "timeout --signal=KILL 300 electron .", 1, "electron", true],
+  ["L15i timeout --kill-after= DUR", "timeout --kill-after=5 300 electron .", 1, "electron", true],
+  // L15j/L15k exercise the SECOND line of defence — the fail-safe word scan — with
+  // a flag this table has NEVER seen (the case the tables cannot cover by
+  // construction). Without the scan these two return `[]`, because an unknown
+  // value-taking flag is skipped ONE word and the launch is never classified.
+  ["L15j an UNKNOWN sudo flag (fail-safe word scan)", "sudo --some-future-flag value electron .", 1, "electron", true],
+  ["L15k an UNKNOWN npm exec flag (fail-safe word scan)", "npm exec --some-future-flag value electron .", 1, "electron", true],
   // ── ALLOW rows: none of these may be refused ──────────────────────────────
   ["A1 plain grep", "grep -rn TODO src/", 0, null, false],
   ["A2 an ELECTRON MENTION inside quotes is not a launch", 'echo "npm exec electron ."', 0, null, false],
@@ -112,6 +136,12 @@ const ROWS = [
   ["A10 a SINGLE-QUOTED substitution is literal text, not a launch", "echo '$(npm exec electron .)'", 0, null, false],
   ["A11 a benign bash -c", 'bash -c "ls -la"', 0, null, false],
   ["A12 headless playwright with an explicit PWDEBUG=0", "PWDEBUG=0 npx playwright test", 0, null, false],
+  // A13 is the natural twin of L15d and the one that MUST stay clean: installing a
+  // dependency is not launching it, and it is a shape every lane runs.
+  ["A13 npm install electron is an INSTALL, not a launch", "npm install electron", 0, null, false],
+  ["A14 npm exec --prefix= is the self-contained spelling", "npm exec --prefix=apps/web electron .", 1, "electron", true],
+  ["A15 a plain argument naming electron stays clean", "rg electron .", 0, null, false],
+  ["A16 a comment is not argv", 'electron . # --use-fake-device-for-media-stream --use-fake-ui-for-media-stream', 1, "electron", true],
 ];
 
 for (const [name, cmd, count, rule, media] of ROWS) {
@@ -127,13 +157,24 @@ for (const [name, cmd, count, rule, media] of ROWS) {
 }
 
 // ── L11 — the fake-capture mitigation is RECOGNISED (both switches required) ─
+// ⛔ `length === 1 &&` on BOTH rows (review minor): `.every()` over an EMPTY array
+// is `true`, so a guard that stopped firing would have left these two GREEN — they
+// would have survived exactly the mutant they exist to catch.
 check(
   "L11a electron WITH both fake switches is classified faked",
-  classify(`electron . ${FAKE}`).every((f) => f.faked === true),
+  (() => { const f = classify(`electron . ${FAKE}`); return f.length === 1 && f[0].faked === true; })(),
 );
 check(
   "L11b HALF the switches is not a mitigation (one flag is not enough)",
-  classify(`electron . ${mod.FAKE_DEVICE_FLAG}`).every((f) => f.faked === false),
+  (() => { const f = classify(`electron . ${mod.FAKE_DEVICE_FLAG}`); return f.length === 1 && f[0].faked === false; })(),
+);
+// L11d — the mitigation must be ARGV, not COMMENT text (review cycle 2, F2).
+check(
+  "L11d a fake switch inside a COMMENT is not a mitigation (faked === false)",
+  (() => {
+    const f = classify(`electron . # ${FAKE}`);
+    return f.length === 1 && f[0].faked === false;
+  })(),
 );
 check(
   "L11c a fake switch in ANOTHER segment does not cover the launch",

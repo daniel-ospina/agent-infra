@@ -24,7 +24,7 @@ owner's machine unable to take a call.
 | rule | when | effect |
 |---|---|---|
 | **R1 RECORD** | an **unattended** run launches a host GUI app | one row appended to `~/.pi/agent/state/host-app-launches.jsonl` |
-| **R2 BLOCK THE MEDIA SHAPES** | an Electron launch, or a **headed** Playwright run, without `--use-fake-device-for-media-stream --use-fake-ui-for-media-stream` | the `bash` call is refused, and the refusal names both flags |
+| **R2 BLOCK THE MEDIA SHAPES** | an Electron launch, a **headed** Playwright run, or `open <path>.app`, without `--use-fake-device-for-media-stream --use-fake-ui-for-media-stream` | the `bash` call is refused, and the refusal names both flags |
 
 R1 is the cheap half and the one that would have cut the incident to a single
 lookup. R2 is the load-bearing half: it stops the seizure instead of documenting
@@ -32,7 +32,14 @@ it.
 
 **Kinds recorded:** Electron (`electron`, `npx/npm exec electron`, a
 `node_modules/.bin/electron`, the `…/Contents/MacOS/<bin>` shape), macOS
-`open -a` / `open -b` / `open Foo.app`, and headed Playwright/Puppeteer.
+`open -a` / `open -b` / `open <path>.app`, and headed Playwright/Puppeteer.
+
+**A PATH is a media shape; a NAME is not.** `open ./Build/DMeer.app` — the
+incident's own app, launched the way a lane launches the bundle it just built — is
+`media: true` and is refused without the fake switches. `open -a Safari` /
+`open -b com.apple.Safari` stays `media: false` and is only recorded: refusing
+every named-app launch is the category-B friction the scoping comment records as
+rejected.
 
 **"Unattended" is DERIVED, not declared** — `shared/print-mode.ts` (print mode)
 or `shared/headless-lane.ts` (a headless run in a *linked worktree*). The
@@ -61,6 +68,11 @@ Reading the ledger — the lookup that was missing during the incident:
 jq -c 'select(.media)' ~/.pi/agent/state/host-app-launches.jsonl | tail -20
 jq -r '[.ts, .decision, .rule, .app, .cwd] | @tsv' ~/.pi/agent/state/host-app-launches.jsonl
 ```
+
+⛔ `select(.media)` shows every launch that could take a capture device — Electron,
+headed Playwright, and an `open <path>.app`. It does **not** show a named-app
+launch (`open -a Safari`), which is recorded with `media: false` on purpose. If you
+want every GUI launch regardless, drop the filter: `jq -c '.' …`.
 
 ## Wrappers and substitutions are RE-READ, not declared away
 
@@ -99,7 +111,7 @@ This is a residual list, not a completeness claim:
 ## Tests
 
 ```bash
-node extensions/gui-device-guard/test.mjs                    # 68 assertions, threat table L1–L14 + handler H1–H11
+node extensions/gui-device-guard/test.mjs                    # 85 assertions, threat table L1–L15 + handler H1–H11
 node extensions/gui-device-guard/test.mjs --classify 'npm exec electron .'
 ```
 
@@ -107,9 +119,10 @@ The suite loads the **real** `index.ts` through
 `../main-worktree-guard/module-load-hooks.mjs` and drives the **real registered
 `tool_call` handler** — the #744/#697 lesson: a suite that imports only a helper
 stays green while `index.ts` is broken and the guard is inert in every session.
-Mutations are pinned: turning the Electron rule's `media` to `false` reds 11
-assertions; removing the wrapper recursion reds 5; removing the fake-switch
-mitigation reds the L11 arm.
+Mutations are pinned, each attributable to the row it is about: turning the
+Electron rule's `media` to `false` reds **29**; removing the wrapper recursion
+reds **5**; removing the comment stripper reds **1** (L11d); removing the
+fail-safe word scan reds **2** (L15j/L15k).
 
 ## Runbook
 

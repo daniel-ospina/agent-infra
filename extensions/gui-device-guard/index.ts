@@ -126,15 +126,41 @@ const PREFIXES = new Set([
   "nice", "ionice", "stdbuf", "timeout",
 ]);
 
-/** The value-taking options of the prefixes above, per GNU/BSD's own grammars. */
+/**
+ * The value-taking options of the prefixes above, per GNU/BSD's own grammars —
+ * SHORT AND LONG SPELLINGS ALIKE.
+ *
+ * ⛔ A MISSING ENTRY HERE IS A FAIL-OPEN, NOT AN OVER-READ (review cycle 2, F1).
+ * The comment above claimed "the cost of a flag this table does not know is an
+ * over-read of the NEXT word as the command (which can only make the guard MORE
+ * likely to fire)". That was FALSE, and measurably so: an unknown flag is skipped
+ * ONE word, so the flag's VALUE became the command word and the launch was never
+ * classified. `sudo -u root electron .` fired while `sudo --user root electron .`
+ * returned `[]` — the same flag, two spellings, opposite coverage. `man7.org`'s
+ * `timeout(1)` supplies the long forms below; the rest are the tools' own.
+ */
 const PREFIX_VALUE_FLAGS: Record<string, string[]> = {
-  sudo: ["-u", "-g", "-p", "-C", "-D", "-h", "-r", "-t", "-U", "-R", "-T", "-c"],
+  sudo: ["-u", "--user", "-g", "--group", "-p", "--prompt", "-C", "--close-from",
+    "-D", "--chdir", "-h", "--host", "-r", "--role", "-t", "--type",
+    "-U", "--other-user", "-R", "--chroot", "-T", "--command-timeout"],
   doas: ["-u", "-C"],
-  nice: ["-n"],
-  ionice: ["-c", "-n", "-p"],
-  env: ["-u", "-C", "-S"],
-  stdbuf: ["-i", "-o", "-e"],
+  nice: ["-n", "--adjustment"],
+  ionice: ["-c", "--class", "-n", "--classdata", "-p", "--pid"],
+  env: ["-u", "--unset", "-C", "--chdir", "-S", "--split-string"],
+  stdbuf: ["-i", "--input", "-o", "--output", "-e", "--error"],
+  timeout: ["-s", "--signal", "-k", "--kill-after"],
 };
+
+/**
+ * Options of the PACKAGE RUNNERS that take a value. Same failure direction as
+ * `PREFIX_VALUE_FLAGS`: `npm exec --prefix apps/web electron .` swallowed
+ * `apps/web` as the payload while `--prefix=apps/web` (self-contained) classified,
+ * and `yarn --cwd web playwright test --headed` swallowed `web`.
+ */
+const RUNNER_VALUE_FLAGS = [
+  "--prefix", "-w", "--workspace", "--cwd", "--registry", "--cache",
+  "--userconfig", "--script-shell", "--filter", "--package", "-p",
+];
 
 /** `timeout`'s own duration (`30`, `2.5s`, `1m`), or its `-s`\/`-k` value. */
 const TIMEOUT_DURATION = /^\d+(\.\d+)?[smhd]?$/;
@@ -144,6 +170,18 @@ const TRANSPARENT = new Set(["{", "}", "(", ")", "then", "do", "done", "fi", "el
 
 /** Package-runners whose first PACKAGE argument is the thing being launched. */
 const RUNNERS = new Set(["npx", "npm", "pnpm", "yarn", "bunx"]);
+
+/**
+ * The runner verbs that EXECUTE a payload (`npx foo`, `npm exec foo`,
+ * `pnpm dlx foo`, `yarn dlx foo`) rather than managing a dependency tree.
+ * The distinction is load-bearing: `npm install electron` INSTALLS the package
+ * and must never be read as launching it (an over-fire on a shape every lane
+ * runs), while `npm exec electron` IS a launch.
+ */
+const EXEC_VERBS = new Set(["exec", "dlx", "x", "execx"]);
+
+/** Words that NAME a GUI launch — used only as the last-resort fail-safe scan. */
+const LAUNCH_WORDS = new Set(["electron", "playwright", "puppeteer", "playwright-core"]);
 
 /** A headed-browser signal: the run can present a real device picker. */
 const HEADED_FLAGS = new Set(["--headed", "--ui", "--debug", "--pause"]);
@@ -208,6 +246,40 @@ export function splitSegments(command: string): string[] {
   }
   out.push(cur);
   return out.map((s) => s.trim()).filter((s) => s.length > 0);
+}
+
+/**
+ * Blank out shell COMMENTS before segmentation.
+ *
+ * ⛔ A COMMENT IS NOT ARGV (review cycle 2, F2). Without this, an unquoted `#`
+ * left the rest of the line as ordinary tokens, so
+ *
+ *     electron . # --use-fake-device-for-media-stream --use-fake-ui-for-media-stream
+ *
+ * produced `faked: true` and the launch was ALLOWED while Chromium received
+ * neither switch — a false PASS in the one direction this guard exists to
+ * prevent, and reachable by pasting the guard's OWN refusal text (which prints
+ * both flags). Only an unquoted `#` that BEGINS A WORD is a comment: `a#b` is
+ * one word, and a `#` inside single/double quotes or a heredoc body is data.
+ */
+export function stripComments(command: string): string {
+  if (!command.includes("#")) return command;
+  const mask = unquotedMask(command);
+  const lines = command.split("\n");
+  const out: string[] = [];
+  let at = 0;
+  for (const line of lines) {
+    let cut = -1;
+    for (let i = 0; i < line.length; i++) {
+      if (line[i] !== "#") continue;
+      if (mask[at + i] !== true) continue;             // quoted: data, not a comment
+      const prev = i === 0 ? " " : line[i - 1];
+      if (/\s/.test(prev) || ";&|(".includes(prev)) { cut = i; break; }
+    }
+    out.push(cut === -1 ? line : line.slice(0, cut));
+    at += line.length + 1;
+  }
+  return out.join("\n");
 }
 
 /**
@@ -319,8 +391,9 @@ function basename(p: string): string {
  * (and the values their own flags consume) and grouping words. Returns -1 when
  * the segment holds no command word.
  */
-function commandWordIndex(toks: string[]): number {
+function commandWordIndex(toks: string[], out?: { prefixSeen?: boolean }): number {
   let i = 0;
+  let prefixSeen = false;
   while (i < toks.length) {
     const tok = toks[i];
     if (isAssignment(tok) || TRANSPARENT.has(tok)) {
@@ -328,38 +401,48 @@ function commandWordIndex(toks: string[]): number {
       continue;
     }
     if (PREFIXES.has(tok)) {
+      prefixSeen = true;
       const valueFlags = PREFIX_VALUE_FLAGS[tok] ?? [];
       i++;
-      if (tok === "timeout" && i < toks.length) {
-        // `timeout 30 electron .` / `timeout -s KILL 30 electron .`
-        while (i < toks.length && (toks[i] === "-s" || toks[i] === "-k")) i += 2;
-        if (i < toks.length && TIMEOUT_DURATION.test(toks[i])) i++;
-        continue;
-      }
-      // ⛔ SKIP EVERY FLAG-LIKE WORD, not just the declared value-takers
-      // (review F2's sibling). `env -i bash -c "electron ."` used to leave `-i`
-      // sitting where the command word belongs, so the wrapper was never seen.
-      // A command word can never START with `-`, so this direction can only
-      // make the guard fire MORE, never less; a flag this table does not know
-      // costs an extra word of over-read at worst.
+      // ⛔ ONE LOOP FOR EVERY PREFIX (review cycle 2, F1). `timeout` used to have
+      // its own branch that `continue`d BEFORE the generic skip, so any long
+      // option (`--preserve-status`, `--foreground`, `--verbose`) left a `--flag`
+      // token sitting where the command word belongs and the segment became
+      // unclassifiable. Its duration argument is now just another positional.
       while (i < toks.length && toks[i].startsWith("-")) {
-        i += valueFlags.includes(toks[i]) ? 2 : 1;
+        // `--flag=value` is SELF-CONTAINED and consumes no following word.
+        if (toks[i].includes("=")) {
+          i += 1;
+        } else if (valueFlags.includes(toks[i])) {
+          i += 2;
+        } else {
+          i += 1;
+        }
       }
+      if (tok === "timeout" && i < toks.length && TIMEOUT_DURATION.test(toks[i])) i++;
       continue;
     }
+    if (out) out.prefixSeen = prefixSeen;
     return i;
   }
+  if (out) out.prefixSeen = prefixSeen;
   return -1;
 }
 
 /** Strip a package-runner prefix, returning the package/command index. */
-function afterRunner(toks: string[], start: number): { index: number; runner: string | null } {
+function afterRunner(
+  toks: string[],
+  start: number,
+): { index: number; runner: string | null; execVerb: boolean } {
   const word = basename(toks[start] ?? "");
-  if (!RUNNERS.has(word)) return { index: start, runner: null };
+  if (!RUNNERS.has(word)) return { index: start, runner: null, execVerb: false };
+  const bare = word === "npx" || word === "bunx";
   let i = start + 1;
+  let execVerb = bare;
   while (i < toks.length) {
     const tok = toks[i];
-    if (tok === "exec" || tok === "dlx" || tok === "x") {
+    if (EXEC_VERBS.has(tok)) {
+      execVerb = true;
       i++;
       continue;
     }
@@ -368,15 +451,38 @@ function afterRunner(toks: string[], start: number): { index: number; runner: st
       continue;
     }
     if (tok.startsWith("-")) {
-      // `npm exec --yes electron` / `npx --package electron`: consume the flag's
-      // value only for the two spellings that take one.
-      if ((tok === "--package" || tok === "-p") && i + 1 < toks.length) i += 2;
-      else i++;
+      // ⛔ THE RULE IS THE SAME ONE AS `commandWordIndex` (review cycle 2, F1):
+      // `--flag=value` is self-contained, a KNOWN value flag consumes the next
+      // word, and anything else is a boolean. `-p` is deliberately NOT treated as
+      // npx's `--package` here — for `npx -p foo` the payload follows, and the
+      // fail-safe scan below covers the ambiguity instead of guessing.
+      if (tok.includes("=")) i += 1;
+      else if (RUNNER_VALUE_FLAGS.includes(tok) && i + 1 < toks.length) i += 2;
+      else i += 1;
       continue;
     }
-    return { index: i, runner: word };
+    return { index: i, runner: word, execVerb };
   }
-  return { index: -1, runner: word };
+  return { index: -1, runner: word, execVerb };
+}
+
+/**
+ * The index of the first word that NAMES a GUI launch, or -1.
+ *
+ * ⛔ THE LAST-RESORT FAIL-SAFE (review cycle 2, F1). It is applied ONLY to a
+ * segment that began with a prefix word or an EXEC-style runner — the two shapes
+ * where a wrapper's own grammar can swallow the command word — so a plain
+ * `rg electron .` is untouched. Its direction is "catch more": a value that
+ * happens to be spelled `electron` would over-fire, and an over-fire is waivable
+ * (`GUI_DEVICE_GUARD_ALLOW_MEDIA=1`) while a miss is not.
+ */
+function launchWordIndex(toks: string[], from: number): number {
+  for (let i = from; i < toks.length; i++) {
+    const tok = toks[i];
+    if (tok.startsWith("-") || isAssignment(tok)) continue;
+    if (LAUNCH_WORDS.has(basename(tok)) || appBundleBinary(tok) !== null) return i;
+  }
+  return -1;
 }
 
 // ── classification ──────────────────────────────────────────────────────────
@@ -456,90 +562,137 @@ function shellCommandArg(toks: string[], headIndex: number): string | null {
   return null;
 }
 
+/**
+ * One segment, classified from a given command-word index. Split out of the loop
+ * so the same segment can be read TWICE when a wrapper's own grammar is ambiguous
+ * (see `classifyLaunchCommand`'s fail-safe scan) without duplicating a single rule.
+ */
+function classifySegment(
+  toks: string[],
+  cwi: number,
+  faked: boolean,
+  pwdebug: boolean,
+): LaunchFinding | null {
+  const { index } = afterRunner(toks, cwi);
+  const head = index >= 0 ? basename(toks[index]) : basename(toks[cwi]);
+
+  // R-electron: `electron .`, `npx electron .`, `npm exec electron -- .`,
+  // or a binary inside an Electron bundle.
+  const bundle = index >= 0 ? appBundleBinary(toks[index]) : null;
+  if (bundle || head === "electron") {
+    return {
+      rule: "electron",
+      app: bundle ?? "Electron",
+      argv: toks.join(" "),
+      // An Electron app is a GUI app whose own code may request a capture
+      // device at any moment — it is the exact shape of the #2249 incident.
+      media: true,
+      faked,
+    };
+  }
+
+  // R-open: `open -a <app>` / `open -b <bundle-id>` / `open <path>.app`.
+  if (head === "open" || head === "xdg-open") {
+    const rest = toks.slice(index >= 0 ? index + 1 : cwi + 1);
+    let app: string | null = null;
+    let fromFlag = false;
+    for (let i = 0; i < rest.length; i++) {
+      const tok = rest[i];
+      if ((tok === "-a" || tok === "-b") && i + 1 < rest.length) {
+        app = rest[i + 1];
+        fromFlag = true;
+        break;
+      }
+      if (tok === "-a" || tok === "-b") continue;
+      if (tok.endsWith(".app")) {
+        app = tok;
+        fromFlag = false;
+        break;
+      }
+    }
+    if (app !== null) {
+      // ⛔ AN EXPLICIT BUNDLE *PATH* IS A MEDIA SHAPE; A NAMED APP IS NOT
+      // (review cycle 2, F3). `open -a Safari` / `open -b <bundle id>` is the
+      // category-B friction the scoping comment records as REJECTED — it is
+      // RECORDED, never refused. But `open ./Build/DMeer.app` launches a bundle a
+      // lane just built, which is exactly the app in the #2249 incident and the
+      // same thing as running its `Contents/MacOS` binary (already `media: true`).
+      // Leaving it `false` meant the README's own `select(.media)` lookup could
+      // not find it. So: a PATH is a media claim, a NAME is not.
+      const isPath = !fromFlag || app.includes("/");
+      return {
+        rule: "open",
+        app,
+        argv: toks.join(" "),
+        media: isPath,
+        faked,
+      };
+    }
+    return null;
+  }
+
+  // R-playwright: a HEADED run can present a real device picker. Headless is
+  // recorded by neither rule — see the header's friction note.
+  const isPlaywright = head === "playwright" || head === "puppeteer" || head === "playwright-core";
+  if (isPlaywright) {
+    const rest = toks.slice(Math.max(index, cwi) + 1);
+    const headed = rest.some((t) => HEADED_FLAGS.has(t)) ||
+      rest.some((t) => HEADED_SUBCOMMANDS.has(t)) ||
+      pwdebug ||
+      toks.some((t) => /^PWDEBUG=(?!0$|false$)/.test(t));
+    if (!headed) return null;
+    return { rule: "playwright", app: head, argv: toks.join(" "), media: true, faked };
+  }
+
+  return null;
+}
+
 export function classifyLaunchCommand(command: string, depth = 0): LaunchFinding[] {
   const findings: LaunchFinding[] = [];
-  const body = stripHeredocBodies(command);
+  // Comments are removed BEFORE tokens are read, so a comment can never satisfy
+  // the fake-capture mitigation (review cycle 2, F2).
+  const body = stripComments(stripHeredocBodies(command));
 
-  // ⛔ A `PWDEBUG` EXPORTED IN AN EARLIER SEGMENT STILL APPLIES (review F2:
-  // `export PWDEBUG=1; npx playwright test` used to classify as `[]` because the
-  // assignment is its own segment). Read it from the WHOLE line, once.
+  // ⛔ A `PWDEBUG` EXPORTED IN AN EARLIER SEGMENT STILL APPLIES (review cycle 1,
+  // F2: `export PWDEBUG=1; npx playwright test` used to classify as `[]` because
+  // the assignment is its own segment). Read it from the WHOLE line, once.
   const pwdebug = /(?:^|[\s;|&])(?:export\s+)?PWDEBUG=(?!0\b|false\b)/.test(body);
 
   for (const segment of splitSegments(body)) {
     const toks = tokenize(segment);
     if (toks.length === 0) continue;
-    const cwi = commandWordIndex(toks);
+    const flags: { prefixSeen?: boolean } = {};
+    const cwi = commandWordIndex(toks, flags);
     if (cwi < 0) continue;
 
+    // ⛔ THE MITIGATION IS READ FROM ARGV, NOT FROM SHELL TEXT (review cycle 2,
+    // F2). Segments were never comment-stripped, so
+    // `electron . # --use-fake-device-for-media-stream --use-fake-ui-…` read the
+    // two switches out of the COMMENT and allowed the launch while Chromium
+    // received neither — a false PASS in the exact direction this guard exists to
+    // prevent, reachable by pasting the guard's own refusal text.
     const faked = toks.includes(FAKE_DEVICE_FLAG) && toks.includes(FAKE_UI_FLAG);
-    const { index, runner } = afterRunner(toks, cwi);
-    const head = index >= 0 ? basename(toks[index]) : basename(toks[cwi]);
+    const { execVerb } = afterRunner(toks, cwi);
 
-    // R-electron: `electron .`, `npx electron .`, `npm exec electron -- .`,
-    // or a binary inside an Electron bundle.
-    const bundle = index >= 0 ? appBundleBinary(toks[index]) : null;
-    if (bundle || head === "electron") {
-      findings.push({
-        rule: "electron",
-        app: bundle ?? "Electron",
-        argv: toks.join(" "),
-        // An Electron app is a GUI app whose own code may request a capture
-        // device at any moment — it is the exact shape of the #2249 incident.
-        media: true,
-        faked,
-      });
+    const primary = classifySegment(toks, cwi, faked, pwdebug);
+    if (primary) {
+      findings.push(primary);
       continue;
     }
 
-    // R-open: `open -a <app>` / `open -b <bundle-id>` / `open Foo.app`.
-    if (runner === null && (head === "open" || head === "xdg-open") && cwi >= 0) {
-      const rest = toks.slice(cwi + 1);
-      let app: string | null = null;
-      for (let i = 0; i < rest.length; i++) {
-        const tok = rest[i];
-        if ((tok === "-a" || tok === "-b") && i + 1 < rest.length) {
-          app = rest[i + 1];
-          break;
-        }
-        if (tok.endsWith(".app")) {
-          app = tok;
-          break;
+    // R-failsafe: a PREFIX or an EXEC-style runner can swallow the command word
+    // with a value-taking flag this table does not know (review cycle 2, F1:
+    // `sudo --user root electron .`). Only those two shapes are scanned, so a
+    // plain `rg electron .` is untouched.
+    if (flags.prefixSeen || execVerb) {
+      const alt = launchWordIndex(toks, cwi + 1);
+      if (alt >= 0 && alt !== cwi) {
+        const rescued = classifySegment(toks, alt, faked, pwdebug);
+        if (rescued) {
+          findings.push(rescued);
+          continue;
         }
       }
-      if (app !== null) {
-        findings.push({
-          rule: "open",
-          app,
-          argv: toks.join(" "),
-          // `open -a Safari` is not a media claim; it is a GUI app on the host
-          // and is RECORDED, never blocked. Blocking it would refuse correct
-          // work (a lane legitimately opening a doc/browser is not this bug).
-          media: false,
-          faked,
-        });
-      }
-      continue;
-    }
-
-    // R-playwright: a HEADED run can present a real device picker. Headless is
-    // recorded by neither rule — see the header's friction note.
-    const isPlaywright = head === "playwright" || head === "puppeteer" || head === "playwright-core";
-    if (isPlaywright) {
-      const rest = toks.slice(Math.max(index, cwi) + 1);
-      const headed = rest.some((t) => HEADED_FLAGS.has(t)) ||
-        rest.some((t) => HEADED_SUBCOMMANDS.has(t)) ||
-        pwdebug ||
-        toks.some((t) => /^PWDEBUG=(?!0$|false$)/.test(t));
-      if (headed) {
-        findings.push({
-          rule: "playwright",
-          app: head,
-          argv: toks.join(" "),
-          media: true,
-          faked,
-        });
-      }
-      continue;
     }
 
     // R-wrapper: `bash -c "<cmd>"`, `sh -c …`, `sudo bash -lc …`, `eval …` —
@@ -547,6 +700,7 @@ export function classifyLaunchCommand(command: string, depth = 0): LaunchFinding
     // (review cycle 1, F2: these were an UNDECLARED bypass of R2, and
     // `AGENTS.md`/the runbooks hand lanes `bash -c` idioms routinely).
     if (depth < MAX_WRAPPER_DEPTH) {
+      const head = basename(toks[cwi]);
       const shellBody = SHELLS.has(head) ? shellCommandArg(toks, cwi) : null;
       const evalBody = head === "eval" ? toks.slice(cwi + 1).join(" ") : null;
       const nested = shellBody ?? evalBody;
