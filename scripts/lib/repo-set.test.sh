@@ -130,8 +130,9 @@ EOF
 #     shapes are NAMED rather than counted, because a count in this sentence has already been wrong more
 #     than once — including the "Three" this paragraph itself said while also saying "not counted":
 #       (a) the `bash "$W/pr-doctor-machine.sh"` wrapper arms;
-#       (b) the direct `bash "$READER"` / `/bin/bash "$READER"` arms — which are THREE different shapes and
-#           must not be described together: the PATH-scoped fault-injection fixtures (`no-sed`, `no-awk`,
+#       (b) the direct `bash "$READER"` / `/bin/bash "$READER"` arms — which fall into shapes that must not
+#           be described together (the list below is the count, deliberately not a number, for the reason
+#           just given): the PATH-scoped fault-injection fixtures (`no-sed`, `no-awk`,
 #           `no-tr`, `NODIR`) cannot simply wrap the helper, because it needs `ps` and `sleep` from the
 #           AMBIENT path; the `$HOME`-unset arms set no `PATH` at all and are unbounded by omission rather
 #           than necessity; and the PLAIN direct arms — `b4` and the `j22`/`j24`/`j29`/`j30` path and
@@ -1387,25 +1388,31 @@ PYNID
   chmod 755 "$T/den2/den"
   ck "j16f2 …two hops up, so the loop's SHORTENING runs without \`dirname\` too (rc 5, never the degrade code)" \
      '[ "$_rc_dn2" = 5 ] && grep -q "INVALID — " <<<"$_o_dn2" && grep -q "is not visible from here" <<<"$_o_dn2" && ! grep -q "does not exist" <<<"$_o_dn2"'
-  # ⛔ AND THE WALK'S OWN FILE-ANCESTOR FALLBACK NEEDS A SENSOR (review round 44, P2 — measured): with no
-  # interpreter `_rs_stat_kind` answers `unknown`, so `ENOTDIR` never arrives as `notdir` and the walk
-  # decides. Reverting that branch to the single "neither is any directory above it" message left the suite
-  # FULLY GREEN while this path printed the previously falsified sentence — the same dead-sensor class as
-  # `j16k` had one branch up.
+  # ⛔ THE FILE-ANCESTOR GUIDANCE NEEDS A SENSOR FOR ITS GUIDANCE, NOT JUST FOR ITS FIRST LINE (round 44 P2,
+  # sharpened by round 45's P2 — measured). Deleting the errno arm that used to serve this cause left the
+  # suite FULLY GREEN; so did keeping the two SHARED opening lines while substituting a different tail.
+  # "is not a directory" is printed by every shape of this message, so grepping it discriminates NOTHING.
+  # What only the measured guidance says is "must be a DIRECTORY" and "fix the path above"; the generic tail
+  # offers "check the location and mode" instead, which is FALSE here — the walk has just measured a FILE,
+  # so this is not a permission case. Both conjuncts are pinned, on both runs of this cause.
   printf 'slug=o/n checkout=%s state=%s/st\n' "$T/tortoise" "$T" > "$T/notadir-anc2.conf"
   _o_na2="$(_rs_bound 30 env REPO_SET_FILE="$T/notadir-anc2.conf/inside/repos.conf" /bin/bash "$NI/lib/repo-set.sh" check 2>&1)"; _rc_na2=$?
   ck "j16k2 …and with NO interpreter the walk's fallback names the FILE too (rc 5, not 'neither is any directory above it')" \
-     '[ "$_rc_na2" = 5 ] && grep -q "is not a directory" <<<"$_o_na2" && ! grep -q "neither is any directory above it" <<<"$_o_na2"'
+     '[ "$_rc_na2" = 5 ] && grep -q "is not a directory" <<<"$_o_na2" && grep -q "must be a DIRECTORY" <<<"$_o_na2" && grep -q "fix the path above" <<<"$_o_na2" && ! grep -q "neither is any directory above it" <<<"$_o_na2" && ! grep -q "check the" <<<"$_o_na2"'
 fi
-# ⛔ THE REFUSAL NAMED A CAUSE THAT IS FALSE WHEN THE NEAREST EXISTING COMPONENT IS A FILE (review round 44,
+# ⛔ THE REFUSAL NAMED A CAUSE THAT IS FALSE WHEN THE NEAREST EXISTING COMPONENT IS A FILE (round 44,
 # P2 — measured). `/etc/passwd/foo/repos.conf` was refused with "a permission denial on an ancestor … a path
-# that is too long, or an I/O error", none of which is true: a COMPONENT IS A FILE. `_rs_stat_kind` folded
-# `ENOTDIR` into `other`; it has its own kind and its own arm now. Same right-code/wrong-cause class as the
-# FIFO parenthetical `j4b` fixes a few arms up.
+# that is too long, or an I/O error", none of which is true: a COMPONENT IS A FILE. ⛔ ROUND 45 CORRECTED THE
+# REPAIR THIS ARM WAS WRITTEN FOR: the errno arm it pinned had NO SENSOR of its own (deleting that arm left
+# the suite green, because the walk serves the same cause at the same code), and the comments claiming the
+# two "match in the same words" were false about their tails. There is ONE authority now — the walk — and
+# this arm pins the guidance only it emits: the generic "neither … above it" tail offers the launchd/TCC
+# candidate, which the walk has just DISPROVED for this path. "is not a directory" is the line EVERY shape
+# prints, so the two conjuncts that discriminate are "must be a DIRECTORY" and "fix the path above".
 printf 'slug=o/n checkout=%s state=%s/st\n' "$T/tortoise" "$T" > "$T/notadir-anc.conf"
 _o_na="$(_rs_bound 30 env REPO_SET_FILE="$T/notadir-anc.conf/inside/repos.conf" /bin/bash "$READER" check 2>&1)"; _rc_na=$?
 ck "j16k a FILE as the nearest existing ancestor names THAT — not 'neither is any directory above it'" \
-   '[ "$_rc_na" = 5 ] && grep -q "is not a directory" <<<"$_o_na" && ! grep -q "neither is any directory above it" <<<"$_o_na"'
+   '[ "$_rc_na" = 5 ] && grep -q "is not a directory" <<<"$_o_na" && grep -q "must be a DIRECTORY" <<<"$_o_na" && grep -q "fix the path above" <<<"$_o_na" && ! grep -q "neither is any directory above it" <<<"$_o_na" && ! grep -q "check the" <<<"$_o_na"'
 # ⛔ A RELATIVE `REPO_SET_FILE` USED TO HANG THIS READER, AND NO ARM USED ONE (review-instrumented round 44).
 # Removing `dirname` from the ancestor walk left `${d%/*}`, which returns a SLASH-LESS name UNCHANGED — so
 # the walk re-tested the same string forever: `REPO_SET_FILE=repo.conf` gave rc 124 and no output, where the
@@ -1934,6 +1941,18 @@ printf '#!/bin/sh\nexit 127\n' > "$MP/pybin/python3"; chmod +x "$MP/pybin/python
 printf 'slug=o/n checkout=%s state=%s/st\n' "$T/tortoise" "$T" > "$T/unrunnable.conf"
 ck "m47 python3 RESOLVES but cannot EXEC: the residue names NO cause — never 'could be run'" \
    'o="$(_rs_bound 30 env PATH="$MP/pybin:$PATH" REPO_SET_FILE="$T/unrunnable.conf" /bin/bash "$MP/lib/repo-set.sh" check 2>&1)"; grep -q "cannot see why" <<<"$o" && ! grep -q "could be run" <<<"$o"'
+# ⛔ AND THE TAG GUARD HAD THE SAME THIRD SHAPE, ONE VERB OVER (round 45 review, P1 — measured). `m45`
+# covers a sibling that will not LOAD, `m46` no interpreter resolving, `m47` the residue sentence. In THAT
+# last shape — an interpreter that RESOLVES and cannot EXEC — the child writes no sentinel at all, so the
+# tag guard read its empty stdout as "no collision" and certified a TAG-COLLIDING set `OK — 2 repo(s)` at
+# rc 0 with NO warning, while the splitter round-trip in the SAME run correctly said it was unaskable. Round
+# 16's ruling (a missing or raising `set_tag_collisions` must not look like "no collision") was open for
+# this route. `_rs_with_doctor` now reads the child's STATUS: empty stdout plus non-zero exit is
+# `__UNASKABLE__` for `tags`/`strip`/`norm` (every legitimate empty answer exits 0), so the existing WARN
+# arm fires. It WARNS and does not refuse — a child that cannot run is not a fact about the set — but it
+# says the verdict is INCOMPLETE. Revert the sentinel and this arm reds, alone.
+ck "m48 …and the TAG guard is not silenced by it: a colliding set is never certified with no tag WARN" \
+   'o="$(_rs_bound 30 env PATH="$MP/pybin:$PATH" REPO_SET_FILE="$T/tag-collide.conf" /bin/bash "$MP/lib/repo-set.sh" check 2>&1)"; grep -q "tag-collision proof did NOT run" <<<"$o"'
 ck "m37 …while the SHIPPED doctor still REFUSES a genuinely different slug on the same checkout (rc 1)" \
    '[ "$(run_reader_rc "$T/nonorm-wrong.conf" check)" = 1 ]'
 ck "m38 …and with the shipped doctor the \`.git\` spelling is simply ACCEPTED, with no WARN" \

@@ -509,18 +509,15 @@ repo_set_parse() {
     # When no interpreter resolves, `unknown` falls back to the ancestor walk below and the narrower
     # claim in its message ("we cannot see it") is the honest one.
     case "$kind" in
-      # ⛔ `ENOTDIR` IS ITS OWN CAUSE, AND IT USED TO LAND IN `other` (review round 44, P2 — measured).
-      # `/etc/passwd/foo/x.conf` was refused at rc 5 with "a permission denial on an ancestor … a path that
-      # is too long, or an I/O error" — none of which is true: a COMPONENT IS A FILE. `_rs_stat_kind` maps
-      # it now, so this arm serves every run where an interpreter RESOLVES; with none, `unknown` skips this
-      # block and the walk's own fallback below names the same cause in the same words. Same
-      # right-code/wrong-cause class as the FIFO parenthetical `j4b` fixes.
-      notdir)
-        _rs_say 2 "repo-set: INVALID — $f is not visible from here, because its nearest existing component is not a directory"
-        _rs_say 2 "repo-set:   (nearest existing: ${anc:-none}). That is the BROKEN state, not the absent one:"
-        _rs_say 2 "repo-set:   every component above the file must be a DIRECTORY, and one of them is not."
-        _rs_say 2 "repo-set:   Do not create the file; fix the path above."
-        return 5 ;;
+      # ⛔ `ENOTDIR` HAS NO ARM HERE, AND THAT IS THE FIX (round 45, P2 — measured). Round 44 gave it its own
+      # arm here; deleting that arm left the suite GREEN, because `notdir` then falls through to the walk
+      # below — which measures the SAME fact, in bash, with or without an interpreter — and prints the same
+      # refusal at the same code. Two code paths for one cause, the redundant one with no sensor behind it,
+      # and the comments beside them claiming the two matched "in the same words" when their tails did not
+      # (the arm said "fix the path above" while the fallback offered the launchd/TCC candidate the walk had
+      # just DISPROVED for that path). So the walk is the ONE authority: `j16k` (interpreter resolves) and
+      # `j16k2` (none) both pin `must be a DIRECTORY`, and a removal of that guidance reds either way.
+      # Same right-code/wrong-cause class as the FIFO parenthetical `j4b` fixes.
       denied|other)
         _rs_say 2 "repo-set: INVALID — $f cannot be STAT'd, and the failure is NOT "no such file""
         _rs_say 2 "repo-set:   (errno reported: $kind). That is the BROKEN state, not the absent one: this"
@@ -549,18 +546,23 @@ repo_set_parse() {
       return 3
     fi
     if [ -n "$anc" ] && [ ! -d "$anc" ]; then
-      # ⛔ THE FALLBACK FOR THE CASE THE STAT ARM CANNOT SEE (review round 44, P2 — measured, and the first
-      # version of this comment was wrong about WHY it runs). With no interpreter `_rs_stat_kind` answers
-      # `unknown`, so `ENOTDIR` never arrives as `notdir` and the walk decides; then the nearest existing
-      # component can be a FILE and "neither is any directory above it" is false. It is NOT reached on the
-      # ordinary path — that one is served by the `notdir` arm above — and the wording matches that arm so
-      # one grep covers both.
+      # ⛔ THE WALK IS THE ONE AUTHORITY FOR THIS CAUSE, AND THIS IS THE ONLY PLACE THAT SAYS SO (round 45,
+      # P2 — measured). It serves BOTH runs: with an interpreter `_rs_stat_kind` answers `notdir` and falls
+      # through to here (no `case` arm claims it above), and with none it answers `unknown` and lands here
+      # the same way. A set under a directory that exists but cannot be entered is the `else` below — a
+      # different case, and a different candidate.
+      # ⛔ AND THE GUIDANCE IS THE MEASURED ONE, NOT A LIST OF CANDIDATES: the walk has just established
+      # that the nearest existing component is a FILE, so offering "launchd has no Full Disk Access" or
+      # "check the location and mode" would send the operator to a cause this code just DISPROVED. Every
+      # component above the file must be a directory, and one of them is not.
       _rs_say 2 "repo-set: INVALID — $f is not visible from here, because its nearest existing component is not a directory"
       _rs_say 2 "repo-set:   (nearest existing: $anc). That is the BROKEN state, not the absent one:"
-    else
-      _rs_say 2 "repo-set: INVALID — $f is not visible from here, and neither is any directory above it"
-      _rs_say 2 "repo-set:   (nearest existing: ${anc:-none}). That is the BROKEN state, not the absent one:"
+      _rs_say 2 "repo-set:   every component above the file must be a DIRECTORY, and one of them is not."
+      _rs_say 2 "repo-set:   Do not create the file; fix the path above."
+      return 5
     fi
+    _rs_say 2 "repo-set: INVALID — $f is not visible from here, and neither is any directory above it"
+    _rs_say 2 "repo-set:   (nearest existing: ${anc:-none}). That is the BROKEN state, not the absent one:"
     _rs_say 2 "repo-set:   this box may well have named its repos and this process cannot see them (launchd"
     _rs_say 2 "repo-set:   has no Full Disk Access under ~/Documents). Do not create the file; check the"
     _rs_say 2 "repo-set:   location and mode of the path above."
@@ -784,7 +786,8 @@ _rs_with_doctor() {
   # child that reads the value differently from the caller is not a proof. UTF-8 mode fixes the DECODE
   # (surrogateescape still applies to invalid bytes, so no path is lost), and it is scoped to this one
   # child so nothing else inherits it.
-  PYTHONUTF8=1 "$py" - "$doc" "$verb" "$arg" <<'PY_PROOF' 2>/dev/null
+  local out rc
+  out="$(PYTHONUTF8=1 "$py" - "$doc" "$verb" "$arg" <<'PY_PROOF' 2>/dev/null
 import importlib.util, sys
 doc, verb, arg = sys.argv[1], sys.argv[2], sys.argv[3]
 spec = importlib.util.spec_from_file_location("_prd", doc)
@@ -870,6 +873,30 @@ else:
     else:
         sys.stdout.write(("%s\t" % slug) if slug else ("\t%s" % why))
 PY_PROOF
+)"
+  rc=$?
+  # ⛔ A CHILD THAT CANNOT BE RUN ANSWERS NOTHING, AND "NOTHING" IS AN ANSWER FOR THREE VERBS (round 45,
+  # P1 — measured). Every arm ABOVE distinguishes the ways the child fails AFTER it starts — the module
+  # will not load, the function is missing, it raised — because each of those writes its own sentinel.
+  # None of them covers the interpreter that RESOLVES and cannot EXEC: the child never runs, no sentinel is
+  # written, stdout is empty, and `tags` read that empty answer as "no collision". MEASURED through a
+  # `python3` shim that exits 127 (the shape `m47` builds) over a tag-colliding set: `repo-set: OK — 2
+  # repo(s)`, rc 0, and the whole-set tag WARN never printed — while the splitter round-trip in the SAME
+  # run warned, so one guard said "unaskable" and the other said "nothing to report" about one dead child.
+  # Round 16's own ruling — a missing or raising `set_tag_collisions` MUST NOT look like "no collision" —
+  # was still open for the cannot-run route.
+  # ⛔ THE EXIT STATUS IS THE DISCRIMINATOR, NOT A SECOND GUESS AT THE CAUSE: every LEGITIMATE empty
+  # answer here comes with exit 0 (`set_tag_collisions` returning "" is "no collision"; `str.strip` and
+  # `_normalize_slug` returning "" are answers too). Empty stdout AND a non-zero status means the question
+  # was never asked. `origin` and `split` are deliberately EXCLUDED: their empty answer is mapped
+  # shell-side (`_rs_origin_slug`'s residue, `_rs_split_entries`'s sentinel), and a sentinel here would be
+  # read as a slug or as an entry list.
+  if [ -z "$out" ] && [ "$rc" -ne 0 ]; then
+    case "$verb" in
+      tags|strip|norm) out="__UNASKABLE__" ;;
+    esac
+  fi
+  printf '%s' "$out"
 }
 
 # _rs_origin_slug <checkout> — the `owner/name` this checkout's `origin` PROVES, or "" and a reason.
@@ -1256,7 +1283,7 @@ EOF
     fi
   fi
   if [ "$diverged" = "__UNASKABLE__" ]; then
-    printf 'repo-set: WARN WHOLE-SET-PROOFS-SKIPPED — `configured_repos()` could not be asked (the sibling pr-doctor.py lacks it, or it raised, or it would not LOAD), so the splitter round-trip did NOT run. The per-line arms still ran; this verdict is INCOMPLETE and says so.\n'
+    printf 'repo-set: WARN WHOLE-SET-PROOFS-SKIPPED — `configured_repos()` could not be asked (the sibling pr-doctor.py lacks it, or it raised, or it would not LOAD, or the interpreter that RESOLVES could not RUN it), so the splitter round-trip did NOT run. The per-line arms still ran; this verdict is INCOMPLETE and says so.\n'
     diverged=""
   fi
   if [ -n "$diverged" ]; then
@@ -1275,7 +1302,7 @@ EOF
     # STATE — one register, one worker name, one cooldown for two repos — so a silent pass here is
     # strictly worse than a loud one. It WARNS rather than refuses, the same rule as the splitter
     # round-trip: a broken/absent sibling is not a fact about the set.
-    printf 'repo-set: WARN WHOLE-SET-PROOFS-SKIPPED — `set_tag_collisions()` could not be asked (the sibling pr-doctor.py lacks it, or it raised, or it would not LOAD), so the tag-collision proof did NOT run; a TAG collision between repos in this set would go undetected. The per-line arms still ran; this verdict is INCOMPLETE and says so.\n'
+    printf 'repo-set: WARN WHOLE-SET-PROOFS-SKIPPED — `set_tag_collisions()` could not be asked (the sibling pr-doctor.py lacks it, or it raised, or it would not LOAD, or the interpreter that RESOLVES could not RUN it — `command -v` proves resolution, never runnability), so the tag-collision proof did NOT run; a TAG collision between repos in this set would go undetected. The per-line arms still ran; this verdict is INCOMPLETE and says so.\n'
   elif [ -n "$tagwhy" ]; then
     printf 'repo-set: REFUSED set — %s\n' "$tagwhy"
     bad=1
