@@ -2327,12 +2327,15 @@ assert_contains "$OUT" "farm: ok" "T24 control: and it reports the match, rather
 assert_contains "$(grep '^farm_n=' "$T/t24ar/state/harness-apply.status" 2>/dev/null || true)" "farm_n=0" \
     "T24 control: with farm_n=0, the matched-farm truth — no phantom row"
 
-# ⛔ A SUMMARY THAT SATISFIES THE PRE-FILTER BUT NOT THE STALE LABEL IS STILL UNPROVEN (review round 26,
-# measured: deleting the `_a` requirement from `farm_sum_count` left the suite green at 510/0, because the
-# only fixture with an unparseable label — `5 fresh` — is rejected by the `<n> stale` pre-filter before the
-# label checks are reached). This fixture prints the stale count at COLUMN 1, which the pre-filter matches
-# and the label sed cannot parse, plus a verdict word the extractor does not know (`CHANGED`). Mutant that
-# reds these rows: drop the `_a` requirement.
+# ⛔ A SUMMARY THE PRE-FILTER READS BUT THE PROOF CANNOT CLOSE IS STILL UNPROVEN (review round 26,
+# measured: the only fixture with an unparseable label — `5 fresh` — is rejected by the `<n> stale`
+# pre-filter before the label checks are reached). HISTORY, because the mechanics moved twice: round 31
+# gave `_a`'s sed a start-of-line form, so this fixture's column-1 stale count now PARSES (the count is
+# readable and the ROW carries the verdict word `CHANGED`, which is what refuses the report); and the
+# pass's own note records that `_a` is no longer a separate gate at all, so the round-26 mutant ("drop
+# the `_a` requirement") is a NO-OP at this head. What reds these rows now: adding `CHANGED` to
+# `farm_drift_rows`' class alternation — NOT to the rc=0 closed allow-list, which this fixture never
+# reaches because it exits 3 — or dropping the start-of-line expression from `_a`'s sed.
 mk_origin t24az; mk_clone t24az
 REPO_P="$CLONE"; MODE_P=sync
 mkdir -p "$T/t24az/home/.pi/agent/scripts"
@@ -2462,9 +2465,10 @@ assert_contains "$(cat "$T/t24br/state/harness-apply-farm-rows.txt" 2>/dev/null 
 # `.`/`:`/`!`, so `drift.v2` certified `farm: ok` / `farm_rows=none` / `farm_n=0` with no artifact while
 # the same bytes at exit 1 were RED). Round 35 closed the vocabulary instead, so the pin is again
 # non-membership, not shape: the mutant that reds these rows is adding `drift.v2` to the allow-list
-# (`if (v == "drift.v2") next`). Restoring the round-33/34 shape block-list does NOT red this fixture (the
-# dotted token is inside that class and is still refused on shape, so the verdict is unchanged); the
-# benign-token rows (t24bp) are pinned by DELETING the benign allow-list entries, not by a class restore.
+# (`if (v == "drift.v2") next`). Restoring the ROUND-34 (widened) class does NOT red this fixture — the
+# dotted token is inside it and is still refused on shape — while restoring round 33's class (the one that
+# excluded `.`/`:`/`!`) DOES red it, which is what this fixture was written for. The benign-token rows
+# (t24bp) are pinned by DELETING the benign allow-list entries, not by a class restore.
 mk_origin t24bs; mk_clone t24bs
 REPO_P="$CLONE"; MODE_P=sync
 mkdir -p "$T/t24bs/home/.pi/agent/scripts"
@@ -2571,10 +2575,13 @@ assert_eq "$RC" "24" "T24 control: a drifted row whose PATH carries a colon-spac
 assert_contains "$(cat "$T/t24bw/state/harness-apply-farm-rows.txt" 2>/dev/null || true)" "notes.md" \
     "T24 control: with that path published, so the skip cannot swallow the name"
 
-# ⛔ AND EVERY PUNCTUATION THE CLASS ADDED IS PINNED (review round 35, measured: only `.` had a fixture —
-# `drift:2` and `DRIFTED!` were pinned by NOTHING, so dropping `:` or `!` from the class left the suite
-# green while those tokens again certified `farm: ok` with no artifact). One shape per fixture, because
-# the scan reports the FIRST unclassifiable token and a shared fixture would hide the second.
+# ⛔ AND EVERY PUNCTUATION THE OLD CLASS ADMITTED IS PINNED (review round 35, measured: only `.` had a
+# fixture — `drift:2` and `DRIFTED!` were pinned by NOTHING, so dropping `:` or `!` from the class left
+# the suite green while those tokens again certified `farm: ok` with no artifact). One shape per fixture,
+# because the scan reports the FIRST unclassifiable token and a shared fixture would hide the second.
+# At this head the token test is the CLOSED allow-list, so the mutant that reds these rows is the
+# membership route rather than a class edit: `if (v == "drift:2") next` reds t24bx, and
+# `if (v == "DRIFTED!") next` reds t24by.
 mk_origin t24bx; mk_clone t24bx
 REPO_P="$CLONE"; MODE_P=sync
 mkdir -p "$T/t24bx/home/.pi/agent/scripts"
@@ -2676,8 +2683,8 @@ assert_absent "$(grep '^remedy=' "$T/t24c2/state/harness-apply.status" 2>/dev/nu
 # BLOCK-list of token shapes, so `N/A`, `drift+1`, `x=y`, `#2`, `2-drift`, `DRIFT/2` and `stale;` all
 # escaped it and certified `farm: ok` / `farm_rows=none` / `farm_n=0` with the drifting name durable
 # nowhere; `drift:2` and `DRIFTED!` were already refused by that block-list, and a lowercase `stale`
-# matches every historical class — those three are listed because a WIDENED class would re-admit them, and
-# because the closed vocabulary refuses them on MEMBERSHIP rather than on shape). Any trailing token outside the instrument's own
+# matches every historical class — those three are listed because NARROWING the block-list re-admits them
+# (widening it only refuses more), and because the closed vocabulary refuses them on MEMBERSHIP, not shape). Any trailing token outside the instrument's own
 # vocabulary is now a refusal, and each token is its own run because the scan exits on the first hit.
 mk_origin t24c3; mk_clone t24c3
 REPO_P="$CLONE"; MODE_P=sync
@@ -2893,9 +2900,11 @@ assert_contains "$(grep '^farm_rows=' "$T/t24ay/state/harness-apply.status" 2>/d
 # ⛔ THE SUMMARY IS THE THIRD HALF OF THE rc=0 CONTRADICTION CHECK (review round 29, measured: the arm
 # read the row predicate and the verdict line but NEVER the three-label summary — `farm_sum_count` was
 # called only inside the `1|3` arm — so the same bytes recorded `farm: ok` at rc=0 and RED at rc=1). The
-# rows here use a vocabulary this pass does not know (`drift`, `missing`), which is exactly why the row
-# half is blind and why the summary has to speak. Mutant that reds these rows: drop
-# `|| { [ -n "$FARM_EXPECT0" ] && [ "$FARM_EXPECT0" -gt 0 ]; }`.
+# rows here carry the verdicts under DIFFERENT names (`drift`, `missing`) on purpose: round 32's closed
+# vocabulary is not blind to them, so the row half fires too, and this fixture pins the SUMMARY only
+# because its own header names the summary in the journal (assert below). Mutant that reds the summary
+# half: drop `|| { [ -n "$FARM_EXPECT0" ] && [ "$FARM_EXPECT0" -gt 0 ]; }` — which ALONE is a no-op here,
+# because the row operand refuses first; drop BOTH operands' evidence (or the whole disjunction) to see it.
 mk_origin t24bd; mk_clone t24bd
 REPO_P="$CLONE"; MODE_P=sync
 mkdir -p "$T/t24bd/home/.pi/agent/scripts"
@@ -2918,6 +2927,27 @@ assert_contains "$(cat "$T/t24bd/state/harness-apply-farm-rows.txt" 2>/dev/null 
     "T24 control: and the second, so a refusal still costs no name"
 assert_contains "$(grep '^farm_n=' "$T/t24bd/state/harness-apply.status" 2>/dev/null || true)" "farm_n=not-graded" \
     "T24 control: while farm_n= says no grade was produced — the counts were never PROVEN against an extraction"
+
+# ⛔ AND THE SUMMARY ALONE MUST DO IT (review round 36, measured: t24bd's rows carry `drift`/`missing`,
+# which the closed row vocabulary also refuses, so that fixture cannot tell the two operands apart and the
+# summary half alone was UNPINNED — dropping `|| { [ -n "$FARM_EXPECT0" ] && [ "$FARM_EXPECT0" -gt 0 ]; }`
+# left the suite green). Here every row is BENIGN (`ok`), so the summary is the ONLY signal that can
+# refuse. Mutant that reds these rows: drop that disjunct.
+mk_origin t24c5; mk_clone t24c5
+REPO_P="$CLONE"; MODE_P=sync
+mkdir -p "$T/t24c5/home/.pi/agent/scripts"
+cat >"$T/t24c5/summary-only.sh" <<'FARM'
+#!/usr/bin/env bash
+printf 'check-farm-drift: OK — 5/5 sourced file(s) match the source at origin/main (sync).\n' >&2
+printf '%-46s | %-12s | %-12s | %s\n' 'handmade.py' aaaa11112222 bbbb33334444 ok >&2
+printf 'check-farm-drift: summary — 2 stale, 0 declared-but-absent, 0 unsourced, of 5 deployed file(s).\n' >&2
+exit 0
+FARM
+chmod +x "$T/t24c5/summary-only.sh"
+OUT="$(HARNESS_APPLY_FARM_CHECKER="$T/t24c5/summary-only.sh" run_pass "$T/t24c5" 2>&1)"; RC=$?
+assert_eq "$RC" "24" "T24 control: an OK line over a summary reporting 2 stale rows is refused even when every ROW is benign"
+assert_contains "$OUT" "summary reports 2 row(s)" \
+    "T24 control: and the journal quotes the summary, which is the only half that could have fired"
 
 # ⛔ AND THE MIRROR: A SUMMARY THAT REPORTS ZERO ROWS IS STILL A MATCH (review round 29). A copy that
 # prints both verdict forms must not be refused for saying 0 — the contradiction is a NON-ZERO total.
@@ -3470,7 +3500,7 @@ assert_contains "$(grep '^detail=' <<<"$REC24AL")" "no row matched this pass's e
 # MEASURED on the `cmux` cell, 2026-11-06: this pass resolves CELL_HOME from $HOME (pass:221) and the
 # pin records from it, then invoked the materialiser with NONE of them. The materialiser resolves the
 # same names from ITS defaults — `CELL_HOME="${CELL_HOME:-/tmp/cell-home}"` (cloud-cell-supervisor.sh:139),
-# `HARNESS_PIN_DIR`/`HARNESS_PIN_FILE` from it (pass:233-234) — so the pin advanced into /tmp, the re-read
+# `HARNESS_PIN_DIR`/`HARNESS_PIN_FILE` from it (cloud-cell-supervisor.sh:1774-1775) — so the pin advanced into /tmp, the re-read
 # below saw no move, and the pass recorded rc=25 "nothing moved this box": rc=25 is raised BEFORE
 # predicate 4, so the farm grade could never be emitted on any box in that state. The suite had no
 # fixture for this because every materialiser stub here reads the seam the PASS sets explicitly.
