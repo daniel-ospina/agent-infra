@@ -8906,7 +8906,25 @@ PY
             # pass runtime included (F1 above). Checking before the sleep is what makes the bound hold
             # whatever the two per-delay knobs are set to: the pass never sleeps past the budget, so
             # the retries cannot walk it past the stale-lock guard.
-            _elapsed=$(( $(date +%s) - _t0 ))
+            # ⛔ A FAILED CLOCK READ MUST FAIL CLOSED (fresh-context review, P2 — measured). Bash's
+            # arithmetic does not ERROR on an empty operand, it reads it as a UNARY MINUS: measured,
+            # `_t0=1000; echo $(( $(false) - _t0 ))` prints `-1000`. So under fork pressure — the exact
+            # condition `fork_gate` exists for (#2293) — a failed `date` made `_elapsed` a large
+            # NEGATIVE number, `_elapsed + _rd` never exceeded the budget, and the one bound that counts
+            # PASS RUNTIME stopped refusing silently. That is a fail-OPEN in the guard whose whole job is
+            # to keep a retrying pass from outliving the stale-lock window, so an unmeasurable budget is
+            # treated as SPENT: no further retry, and the refusal is REPORTED. A backwards clock step is
+            # the same case (the read succeeds, the elapsed is negative) and takes the same branch.
+            # ⛔ `date +%s` is the SHIM TARGET for arm (b3c): that arm fails only `+%s` and delegates
+            # every other date call, so this guard is graded rather than merely asserted.
+            _now="$(date +%s 2>/dev/null)"
+            case "$_now" in ''|*[!0-9]*) _now="" ;; esac
+            _elapsed=""
+            if [ -n "$_now" ]; then _elapsed=$(( _now - _t0 )); fi
+            if [ -z "$_elapsed" ] || [ "$_elapsed" -lt 0 ]; then
+              echo "[refresh] TRANSIENT rc=$rc (attempt ${_att}/${REFRESH_RETRY_MAX_ATTEMPTS}) — NOT retrying again: the in-cycle retry budget cannot be MEASURED (the wall clock read failed or stepped backwards), and an unmeasurable budget is treated as SPENT rather than skipped — an unmeasured bound over the ${REFRESH_STALE_LOCK_MIN:-20}m stale-lock guard would be no bound at all, so the next cycle picks it up (agent-infra#3584)" >> "$LOG"
+              break
+            fi
             if [ $(( _elapsed + _rd )) -gt "$REFRESH_RETRY_BUDGET_S" ]; then
               echo "[refresh] TRANSIENT rc=$rc (attempt ${_att}/${REFRESH_RETRY_MAX_ATTEMPTS}) — NOT retrying again: the ${REFRESH_RETRY_BUDGET_S}s in-cycle retry budget is spent (${_elapsed}s of wall clock already spent on the attempts so far, + ${_rd}s wanted), and a longer backoff would risk the ${REFRESH_STALE_LOCK_MIN:-20}m stale-lock guard reaping this pass while it still runs — the next cycle picks it up (agent-infra#3584)" >> "$LOG"
               break

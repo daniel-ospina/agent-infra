@@ -1931,6 +1931,33 @@ if [ -s "$T/refreshblock.sh" ] && grep -q 'refresh-candidates.sh' "$T/refreshblo
     && grep -q 'stale-lock guard reaping this pass while it still runs' "$BLR3/log" 2>/dev/null \
     && ok "orch-loop: the budget refusal is REPORTED, naming the stale-lock guard it protects" \
     || bad "orch-loop: the budget refusal is silent or does not name the guard it protects — $(grep 'TRANSIENT' "$BLR3/log" 2>/dev/null | tail -1)"
+  # (b3d) AN UNMEASURABLE BUDGET FAILS CLOSED, NOT OPEN (fresh-context review, P2 — measured). Bash's
+  # arithmetic does not ERROR on an empty operand: `$(false)` expands to nothing, so
+  # `_elapsed=$(( $(false) - _t0 ))` yields `-0`/a NEGATIVE value, the comparison below is false
+  # forever, and the only bound that counts PASS RUNTIME silently stops refusing — fail-open in a
+  # guard whose whole job is to keep a retrying pass from outliving the stale-lock window. That is
+  # exactly the fork-starved box `fork_gate` exists for (#2293), i.e. when the bound matters most.
+  # The lever is a `date` shim that fails ONLY `+%s` and delegates every other form, so the pass and
+  # the age probe keep working and the retry block is the thing under test. It DISCRIMINATES: on the
+  # pre-fix block `_elapsed` reads 0, `0 + delay` never exceeds the budget, and this arm makes the
+  # full 3 attempts with no refusal line (measured) — the assertion is on the count, not on a grep.
+  BLR13="$T/retry13"; mkdir -p "$BLR13/shim"; : > "$BLR13/candidates.txt"
+  printf '#!/bin/bash\nprintf "x" >> "%s/invoked"\nrefresh_record_write() { :; }\nexit 1\n' "$BLR13" > "$BLR13/refresh-candidates.sh"
+  {
+    printf '#!/bin/bash\n'
+    printf 'for a in "$@"; do case "$a" in +%%s) exit 1 ;; esac; done\n'
+    printf 'exec "%s" "$@"\n' "$(command -v date)"
+  } > "$BLR13/shim/date"
+  chmod +x "$BLR13/shim/date"
+  O="$BLR13" LOG="$BLR13/log" REFRESH_RETRY_BACKOFF_S=0 REFRESH_RETRY_BUDGET_S=300 \
+    PATH="$BLR13/shim:$PATH" bash "$T/refreshblock.sh" >/dev/null 2>&1
+  n13="$(wc -c < "$BLR13/invoked" | tr -d ' ')"
+  [ "$n13" = "1" ] && ok "orch-loop: a FAILED clock read fails CLOSED (budget treated as spent: 1 attempt, not 3)" \
+                    || bad "orch-loop: an unmeasurable budget failed OPEN — $n13 attempt(s) taken"
+  grep -q 'in-cycle retry budget cannot be MEASURED' "$BLR13/log" 2>/dev/null \
+    && grep -q 'stale-lock guard' "$BLR13/log" 2>/dev/null \
+    && ok "orch-loop: the unmeasurable-budget refusal is REPORTED and names the guard it protects" \
+    || bad "orch-loop: the unmeasurable budget is silent — $(grep 'TRANSIENT' "$BLR13/log" 2>/dev/null | tail -1)"
   # (b3b) THE BUDGET HAS A CEILING TIED TO THE GUARD, so a typo cannot re-create the very double-pass
   # this block exists to prevent (review round 2, P2 — measured). The `case` above only rejects junk, so
   # `3000` (one extra zero) was ACCEPTED and bought 2000 s of sleep against a 1200 s stale-lock window.
