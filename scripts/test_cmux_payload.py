@@ -2310,6 +2310,8 @@ def test_cadence_nudge_still_sends_when_the_checker_predates_the_argv(tmp_path):
     the box, and the receipt still said `delivered=UNVERIFIED` — a value this file documents as
     "prefix, unreadable pane, or a refused send", never "nothing was sent". The floor must send, and
     must say why it could not verify."""
+    if not os.access(_FLOOR_PY, os.X_OK):
+        pytest.skip(f"{_FLOOR_PY} is not executable on this runner")
     seed = _seeded_log(600)
     home, bindir, screen, state = _cadence_home(
         tmp_path, "the pane shows nothing relevant\n", seed)
@@ -2353,6 +2355,8 @@ def test_cadence_nudge_still_sends_when_the_help_READ_fails_but_names_the_flag(t
     DISCRIMINATOR: the flag-bearing FAILING help must take the raw-send path, and the receipt must name
     the SyntaxError rather than a version claim about a checker that never parsed.
     """
+    if not os.access(_FLOOR_PY, os.X_OK):
+        pytest.skip(f"{_FLOOR_PY} is not executable on this runner")
     seed = _seeded_log(600)
     home, bindir, screen, state = _cadence_home(
         tmp_path, "the pane shows nothing relevant\n", seed)
