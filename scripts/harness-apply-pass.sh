@@ -1630,8 +1630,16 @@ if [ "$FARM_CHECK_ON" = "1" ]; then
         # minimum that can carry a verdict token, and the token class admits word characters; a token that
         # is not even shaped like a verdict (a timing `3.2s`, a timestamp) is left alone so a wrapper's
         # informational line cannot refuse a proven match.
+        # ⛔ AND ONLY A ROW IS A ROW (review round 34, measured: with `NF >= 2` alone, ANY two-field line
+        # whose last field was word-shaped refused a PROVEN match — a healthy instrument's output plus a
+        # wrapper's `harness-apply: checking farm | starting` phase line went from rc 0 to rc 24 with the
+        # remedy blaming the checker's vocabulary, and the operator was sent to fix the one thing that was
+        # not broken). A per-file row is a path at COLUMN 1 with no `PROG: text` prefix; a phase or prose
+        # line is indented or carries that prefix, and is skipped before the token test.
         [ -n "$FARM_UNC0" ] || FARM_UNC0="$(printf '%s\n' "$FARM_OUT" | awk -F'|' '
             NF >= 2 {
+                if ($1 ~ /^[[:space:]]/) next
+                if ($1 ~ /: /) next
                 v = $NF
                 gsub(/^[[:space:]]+|[[:space:]]+$/, "", v)
                 if (v == "verdict" || v == "ok") next
@@ -1642,7 +1650,10 @@ if [ "$FARM_CHECK_ON" = "1" ]; then
                 # `LOCAL (declared)` and `SYMLINK (graded via its target)` fell through WITHOUT the
                 # skip — the allow-list entries for them could be deleted with the suite green. The
                 # regex now admits their shape, so the entries are what spares them.)
-                if (v ~ /^[A-Za-z][A-Za-z0-9_ ()-]*$/) { print v; exit }
+                # `drift.v2`, `drift:2` and `DRIFTED!` are the same class as `drift_v2` — a vocabulary
+                # that drifted by a suffix (review round 34, measured: the class excluded `.`/`:`/`!`,
+                # so those tokens certified a match with both names durable nowhere).
+                if (v ~ /^[A-Za-z][A-Za-z0-9_.:! ()-]*$/) { print v; exit }
             }')"
 
         # ⛔ AND A SILENT rc=0 IS NOT A MATCH (review round 24). The instrument always prints a summary,
