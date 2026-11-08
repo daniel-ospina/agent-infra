@@ -2256,14 +2256,30 @@ _wreap_cpu() {
       printf "%d %d\n", matched, total + 0
     }' "${1:-/dev/null}"
 }
-# _wreap_pane_pid <name> — the worker's pane pid, for the tmux arm. The SAME resolution `wt_close` uses
-# before killing (`tmux list-panes -t "=<name>"`), so "what this probe measured" and "what the kill would
-# hit" cannot disagree. Empty when the worker is not a tmux session, or when tmux is absent.
+# _wreap_pane_pid <name> — the worker's pane pid, for the tmux arm. The SAME target and format
+# `wt_close` uses before killing (`tmux list-panes -t "=<name>" -F '#{pane_pid}'`), so "what this probe
+# measured" and "what the kill would hit" cannot disagree. Empty when the worker is not a tmux session,
+# or when tmux is absent.
+# ⛔ AND IT IS BOUNDED, BECAUSE IT RUNS ON THE CONTROLLER'S SYNCHRONOUS CYCLE PATH (review of PR #3756,
+# P3). `worker-terminal.sh`'s module invariant is explicit: EVERY probe there can HANG — "a tmux server
+# that is REACHABLE BUT WEDGED makes `show-environment`/`ls`/`new-session` block indefinitely (measured on
+# tmux 3.4 … still blocked after 8 s)" — and `list-panes` is the same socket/client path, so "an
+# unbounded probe there is a controller that silently stops cycling". This was not a regression when it
+# was raised (`wt_close` already made the same unbounded call), but the reaper now reaches it for
+# candidates it then SPARES, i.e. once per stale candidate per cycle with no kill to show for it. A fired
+# bound answers nothing, which the caller reads as "no pane pid" ⇒ `matched == 0` ⇒ UNKNOWN ⇒ SPARE: the
+# safe direction. ⛔ A rig that extracts the reaper WITHOUT `worker-terminal.sh` has no `wt_bounded` to
+# call and falls back to the unbounded probe — stated rather than hidden, and it is exactly the state
+# this fix removes from production.
 _wreap_pane_pid() {
   local n="${1:-}" p
   case "$n" in ''|*[!A-Za-z0-9-]*) return 0 ;; esac
   command -v tmux >/dev/null 2>&1 || return 0
-  p="$(tmux list-panes -t "=$n" -F '#{pane_pid}' 2>/dev/null | head -1)"
+  if declare -f wt_bounded >/dev/null 2>&1; then
+    p="$(wt_bounded "${WT_PROBE_TIMEOUT:-15}" tmux list-panes -t "=$n" -F '#{pane_pid}' 2>/dev/null | head -1)"
+  else
+    p="$(tmux list-panes -t "=$n" -F '#{pane_pid}' 2>/dev/null | head -1)"
+  fi
   case "$p" in ''|*[!0-9]*) return 0 ;; esac
   printf '%s' "$p"
 }
