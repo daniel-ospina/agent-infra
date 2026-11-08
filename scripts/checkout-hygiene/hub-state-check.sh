@@ -355,17 +355,51 @@ recovery_guide() {
     local farm_root_wt
     farm_root_wt="$(extensions_farm_root)"
     lines+=("")
-    lines+=("#649 — the live pi extension farm symlinks into a WORKTREE of this hub, not at")
-    lines+=("the hub itself: every running session executes that BRANCH's working tree.")
+    lines+=("#649 — the live pi extension farm symlinks into a WORKTREE of this hub, or into")
+    lines+=("a worktree that is GONE, so every running session executes (or fails to load)")
+    lines+=("that BRANCH's working tree instead of the hub's.")
+    # ⛔ SINGLE QUOTES, deliberately — and this element is the one that makes it
+    # load-bearing in the LIVE case too, not only once the link dangles. A backtick
+    # span in a double-quoted element is not prose: bash runs it as a command
+    # substitution. MEASURED 2026-11-08: while a dangling arm printed this inside the
+    # `done <<<"$farm_wt"` loop, the here-string became the child's STDIN, so the
+    # spawned `pi -p` received the next line of $farm_wt (the dangling entry's own
+    # record) as its prompt, dispatched an agent that ran THIS SUITE, reached this
+    # line and spawned the next agent — a recursive agent-spawn loop (~1 session/20 s,
+    # 24 live agents, load 18) that only a kill stopped. Single quotes make the
+    # backticks literal text wherever this element is read.
+    lines+=('A link whose worktree is GONE therefore DANGLES, and print-mode (`pi -p` —')
+    lines+=('every `task` child and every harness lane) treats a failed extension load as FATAL,')
+    lines+=('so a reaped lane takes the whole dispatch path with it, not just this checkout.')
     while IFS=$'\t' read -r n tgt br; do
       [[ -n "$n" ]] || continue
-      lines+=("  $farm_root_wt/$n -> $tgt   (worktree branch: $br)")
+      if [[ "$br" == DANGLING ]]; then
+        lines+=("  $farm_root_wt/$n -> $tgt")
+        lines+=("      DANGLING — no worktree record remains (the lane was reaped and its")
+        lines+=("      record pruned), so the extension FAILS TO LOAD. This is FATAL, not")
+        lines+=("      cosmetic.")
+      else
+        lines+=("  $farm_root_wt/$n -> $tgt   (worktree branch: $br)")
+      fi
     done <<<"$farm_wt"
     lines+=("Repoint each entry at this hub's own extensions — the checkout that must stay on")
     lines+=("main, clean and current:")
     while IFS=$'\t' read -r n tgt br; do
       [[ -n "$n" ]] || continue
-      lines+=("  rm -f $farm_root_wt/$n && ln -s $repo/extensions/$n $farm_root_wt/$n")
+      # The remedy must never CREATE the state it is repairing: `ln -s` onto a path that
+      # does not exist leaves a DANGLING link, which print-mode treats as a failed
+      # extension load — a wrong-tree link traded for a total dispatch outage. So the
+      # relink is printed only when its target really exists. Paths are %q-quoted like
+      # every other paste-ready command here (:307, :310, :313), where an unquoted path
+      # with a space was MEASURED to emit a chain that silently did nothing.
+      if [[ -d "$repo/extensions/$n" ]]; then
+        lines+=("  rm -f $(printf '%q' "$farm_root_wt/$n") && ln -s $(printf '%q' "$repo/extensions/$n") $(printf '%q' "$farm_root_wt/$n")")
+      else
+        lines+=("  rm -f $(printf '%q' "$farm_root_wt/$n")   # this hub has NO extensions/$n to")
+        lines+=("  #   point at, so a relink here would itself dangle — the entry is removed.")
+        lines+=("  #   To run that extension before it lands on main, use a separate farm root:")
+        lines+=("  #   PI_EXTENSIONS_DIR, never the live one.")
+      fi
     done <<<"$farm_wt"
     lines+=("Then restart pi. A deliberate preview of a branch's extension uses a SEPARATE")
     lines+=("farm root (PI_EXTENSIONS_DIR), never the live one — the live farm is what every")
@@ -559,11 +593,16 @@ hub_worktrees() { # $1=hub
 # clean on-main hub whose farm linked into `hub/.worktrees/live/extensions/…`
 # reported PASS and exited 0.
 farm_worktree_links() { # $1=hub
-  local hub="$1" farm wts e base target real d wt br
+  local hub="$1" farm wts e base target real d wt br hub_ext matched
   farm="$(extensions_farm_root)"
   [ -d "$farm" ] || return 0
+  # NOT gated on a non-empty worktree list — see the DANGLING arm below. A reaped lane
+  # whose record has ALSO been pruned (`git worktree remove` prunes it, `git gc` prunes
+  # it once expired, and this suite's own cleanup prunes) leaves nothing to match
+  # against, and that is exactly the state in which the farm link dangles and print-mode
+  # dies. Gating on git's retention made this class fail OPEN on the fatal case.
   wts="$(hub_worktrees "$hub")"
-  [ -n "$wts" ] || return 0
+  hub_ext="$(physical_path "$hub/extensions")"
   for e in "$farm"/*; do
     [ -L "$e" ] || continue
     base="$(basename "$e")"
@@ -575,13 +614,31 @@ farm_worktree_links() { # $1=hub
     esac
     real="$(physical_path "$target")"
     d="$(physical_path "$(dirname "$real")")"
-    while IFS=$'\t' read -r wt br; do
-      [ -n "$wt" ] || continue
-      if [ "$d" = "$(physical_path "$wt/extensions")" ]; then
-        printf '%s\t%s\t%s\n' "$base" "$target" "$br"
-        break
-      fi
-    done <<<"$wts"
+    # This hub's OWN extensions is #1877's class (`live_extension_links`), never this
+    # one — and it is checked BEFORE the worktree loop because `<worktree>/extensions`
+    # can itself be a symlink onto `$hub/extensions`, which resolves `d` to the hub and
+    # would otherwise name one entry twice, under two different remedies.
+    [ "$d" = "$hub_ext" ] && continue
+    matched=0
+    if [ -n "$wts" ]; then
+      while IFS=$'\t' read -r wt br; do
+        [ -n "$wt" ] || continue
+        if [ "$d" = "$(physical_path "$wt/extensions")" ]; then
+          printf '%s\t%s\t%s\n' "$base" "$target" "$br"
+          matched=1
+          break
+        fi
+      done <<<"$wts"
+    fi
+    [ "$matched" -eq 1 ] && continue
+    # DANGLING, with no record left to explain it. Gated on the LINK, never on git's
+    # retention: `[ -e ]` follows the symlink, so it is false exactly when the farm
+    # entry no longer resolves. That state is FATAL (print-mode fails the whole dispatch
+    # on a failed extension load — every `task` child and harness lane), so it is
+    # reported even once the worktree record that used to name the branch is gone.
+    if [ ! -e "$e" ]; then
+      printf '%s\t%s\t%s\n' "$base" "$target" 'DANGLING'
+    fi
   done
   # ALWAYS 0 — same contract, and the same reason, as `live_extension_links`.
   return 0
