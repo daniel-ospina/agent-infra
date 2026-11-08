@@ -304,6 +304,17 @@ drive 0 "PASS: evidence finished AFTER the merging commit was created (the hones
 HEAD_ISO="$(git -C "$WT" log -1 --format=%cI "$WT_HEAD")"
 printf '{"version":1,"head_at_write":"%s","branch":"feat/2977-tm","suites":[{"n":1,"command":"x","exit":0,"finished_at":"%s"}]}\n' "$WT_HEAD" "$HEAD_ISO" > "$WT/.worktree-report/state.json"
 drive 4 "STALE: evidence finished in the merging commit's OWN second (ambiguous, so it cannot pass)" STUB_OK=1 STUB_RC=0 STUB_STALE=0
+# ⛔ THE SAME-HEAD STALE MUST NOT NAME ITS OWN HEAD TWICE (round-19 review, P2). This arm fires whenever a
+# suite's `finished_at` is `<=` the commit date, which INCLUDES the case where the report is correctly
+# bound to the merging head and only the clocks collide. Printing `report_head=X merging_head=X` reads as
+# a contradiction and names nothing, and the code-4 remedy then sends the lane hunting for a push that
+# never happened. The timestamps are the witness here, so the head pair must be absent and the date must
+# be named. A `report_head=${rec_head:-$head}` re-introduction reds this row.
+case "$LAST_OUT" in
+  *report_head=*) bad "the SAME-HEAD stale names report_head+merging_head, which are the SAME sha here — it reads as a contradiction: $LAST_OUT" ;;
+  *head_date=*)   ok "…and a same-head STALE names the commit DATE instead of printing one sha twice" ;;
+  *)              bad "a same-head STALE names neither head_date nor a distinguishable head: $LAST_OUT" ;;
+esac
 # ⛔ THE TWO LANE-AUTHORED INPUTS OF THE LAUNDERING ARM ARE DISCLOSED, WITH TRACKERS (round-9/10). One is
 # `finished_at` in an undigested state.json (tortoise#11551); the other is the COMMITTER date, which the
 # party making the commit writes (agent-infra#3791). A future reader who assumes either is tamper-proof
@@ -463,7 +474,7 @@ if git -C "$WT" rev-parse --git-dir >/dev/null 2>&1; then
     if [ "$rc" = 4 ]; then ok "a refs/replace ref cannot forge the commit date the laundering arm reads (rc=$rc, still STALE)"; else bad "a replace ref forged the commit date: expected rc=4, got rc=$rc :: $out"; fi
     git -C "$WT" replace -d "$_base" 2>/dev/null || true
   else
-    ok "SKIPPED the replace-ref row (git replace unavailable in this fixture)"
+    skip "the replace-ref row (git replace unavailable in this fixture)"
   fi
   _restore_state
 fi
@@ -781,7 +792,7 @@ if [ "$_det_ok" = 1 ]; then
   case "$out" in *VERDICT=NO-WORKTREE*) bad "a detached worktree was reported as NO-WORKTREE (the mergeable abstention)" ;; *) ok "…and it is not reported as NO-WORKTREE" ;; esac
   git -C "$WT" checkout -q "$_prev" 2>/dev/null || true
 else
-  ok "SKIPPED the detached-worktree row (fixture git could not detach)"
+  skip "the detached-worktree row (fixture git could not detach)"
 fi
 # ⛔ THE THREE SPELLINGS THAT STILL WORKED (round-11 review, P0). Each converts a refusal into the
 # mergeable abstention while leaving the evidence untouched — they are why the arm now keys on "does a

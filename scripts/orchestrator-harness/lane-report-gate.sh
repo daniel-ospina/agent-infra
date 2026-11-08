@@ -477,10 +477,21 @@ lane_report_gate() {
   # main worktree IS the clone, so a caller that hands the gate a clone supplies the graded tree's own
   # `tools/worktree_report.py`. The gate cannot fix that alone — it has no trusted notion of which repo
   # is the subject — so the disposition is stated rather than silently implied:
-  #   * `lane-merge.sh` discharges it: it resolves `resolve_trusted_checkout` and passes MAIN.
+  #   * `lane-merge.sh` discharges it for a LINKED WORKTREE ONLY: it resolves `resolve_trusted_checkout`
+  #     (the first `git worktree list` stanza) and passes that as MAIN. For a linked worktree the first
+  #     stanza is the hub, so the instrument comes from the tree nobody is merging. ⛔ IT DOES NOT
+  #     DISCHARGE THE CLONE CASE, and the earlier wording here claimed it did (round-19 review, P1): a
+  #     lane that runs `lane-merge.sh` from an independent clone resolves its OWN tree, so `$tool` is
+  #     again the graded tree's consumer and a lane could edit it uncommitted. Measured end-to-end on
+  #     that wording: `trusted checkout == the lane's clone`, the lane's own 7-line `ok:true` consumer
+  #     returned PASS while the committed consumer returned INVALID.
   #   * `merge-one.sh` takes `$REPO` from argv; it is the `$O`-pinned backstop reached by chain-merge.sh
   #     (harness code), so the path is not lane-authored on the normal route. A lane that runs the
-  #     deployed `merge-one.sh` itself with its own clone is NOT covered.
+  #     deployed `merge-one.sh` itself with its own clone is NOT covered either.
+  # ⛔ SO NEITHER CARRIER CLOSES THE SELF-SUPPLIED-INSTRUMENT CLASS; both DISCLOSE it, and it is tracked
+  # with its siblings in agent-infra#3789 (which measures the `git` spelling of the same class). A
+  # disclosure that promises a control the code lacks IS the bypass, which is why the clone half is
+  # stated as uncovered instead of being implied away.
   # ⛔ A PATH-SHAPE TEST WAS TRIED AND REVERTED: refusing when `$tool` sits under `$wt` looks right but
   # OVER-BLOCKS the ordinary case — a lane working directly in the repository root has `$wt` == the
   # checkout, so its consumer is legitimately inside it. Measured: 66 merge-one rows red. An
@@ -970,12 +981,24 @@ print("%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s" % (
   # two arms above can both be satisfied by a report whose SUITES ran at an older commit. The newest
   # suite's `finished_at` is written only by `run` and is never touched by a render, so evidence that
   # finished before the merging commit existed cannot describe it.
+  # ⛔ THE REFUSAL LINE MUST NOT NAME TWO IDENTICAL SHAS (round-19 review, P2). The arm fires when a
+  # suite's `finished_at` is `<=` the merging commit's date, and that includes the SAME-HEAD case — a
+  # report correctly bound to the merging head whose suite finished in the commit's OWN second (both
+  # clocks are second-resolution). Printing `report_head` and `merging_head` there emits the SAME 40-hex
+  # twice, which reads as a contradiction and names nothing: measured end-to-end with the real writer,
+  # `commit=…T14:06:04+00:00 finished=…T14:06:04Z -> rc=4` with both fields equal. The head pair is
+  # therefore printed ONLY when it actually differs; the same-head arm names the timestamps instead, and
+  # the code-4 remedy offers the re-run for that cause (re-push cannot help — nothing was pushed).
   if [ "$predates" = "1" ]; then
     if [ "$skew" = "1" ]; then
       _lrg_emit 4 STALE "branch=$branch worktree=$wt report=$wt/WORKTREE-REPORT.md reason=merging-head-is-dated-ahead-of-this-box report_head=${rec_head:-$head} merging_head=$head head_date=$commit_iso"
       return 4
     fi
-    _lrg_emit 4 STALE "branch=$branch worktree=$wt report=$wt/WORKTREE-REPORT.md reason=evidence-not-produced-after-the-merging-commit report_head=${rec_head:-$head} merging_head=$head"
+    if [ "${rec_head:-$head}" = "$head" ]; then
+      _lrg_emit 4 STALE "branch=$branch worktree=$wt report=$wt/WORKTREE-REPORT.md reason=evidence-not-produced-after-the-merging-commit head=$head head_date=$commit_iso"
+    else
+      _lrg_emit 4 STALE "branch=$branch worktree=$wt report=$wt/WORKTREE-REPORT.md reason=evidence-not-produced-after-the-merging-commit report_head=$rec_head merging_head=$head head_date=$commit_iso"
+    fi
     return 4
   fi
 
@@ -999,8 +1022,8 @@ lane_report_remedy() {
          'python3 tools/worktree_report.py init --issue <N>, then run every suite through it (run --cmd <cmd>), then write.' ;;
     2) printf '  The evidence in the report does not hold up (a recorded log is missing, its hash does not\n  match, or a promised section is absent). Re-run the affected suite through the tool so the record\n  matches its log.\n  Three reasons cannot be fixed by re-running the SAME suite, because the report itself is malformed:\n  • `reason=recorded-suites-produced-no-output` — the report claims suites whose logs are empty and\n    whose counts did not parse (`run --cmd true` is the minimal case). Run a suite that produces output.\n  • `reason=report-carries-more-than-one-head-at-write-stamp` — two header stamps. Do NOT hand-edit the\n    markdown: rewrite the report from the writer (`run` each suite again, then `write`).\n  • `reason=report-header-base-line-was-split-or-malformed` — the seal is not where the writer puts it:\n    a lane-writable value split the Base line, or ended the header before it, or left a second Base line\n    outside a code fence. Same remedy: rewrite it from the writer, do not patch the markdown.\n' ;;
     3) printf '  The report RECORDS A FAILING SUITE. A green report is a precondition of merge: fix the failure and\n  re-run that suite through the tool (a lane whose own evidence says red may not merge).\n' ;;
-    4) printf '  The report does not describe the tree being merged (it was written at another head, the\n  lane worktree is not at the head on the branch, or its evidence finished before that head was\n  created — a push from another worktree/box moves the branch and leaves your worktree behind).\n  Re-run the suites AT THE HEAD ON THE BRANCH through the tool (do NOT just re-render):\n     git -C <your worktree> status ; git log --oneline -1   # confirm you are at the PR head\n     python3 tools/worktree_report.py run --cmd <the exact command>   # for each suite\n  ⛔ `write`, `note` and a plain `init` re-render the report AND re-stamp the recorded head WITHOUT\n  re-running anything, so they turn a stale report into a green-looking one. Only `run` produces\n  evidence for the head you are merging.\n  ⛔ If the reason is `merging-head-is-dated-ahead-of-this-box`, RE-RUNNING WILL NOT HELP: the head\n  was committed on a box whose clock is ahead, so no run here can ever be newer than it. Re-push the\n  head from a correctly-clocked box, or wait for the skew to pass.\n' ;;
-    7) printf '  The report exists but could not be VERIFIED. Two distinct causes, with different remedies:\n     • no interpreter, or the consumer failed / printed no parseable JSON — repair the consumer, then re-run;\n     • the writer state is missing or damaged (`reason=writer-state-absent|corrupt`) — the head binding\n       lives there, so the report cannot be tied to the head being merged. Do NOT hand-edit or delete\n       it: re-run the suites through the tool (`python3 tools/worktree_report.py run --cmd <cmd>`),\n       which rewrites the state. A state file you removed is a witness you removed.\n  An unreadable verification is not a pass.\n' ;;
+    4) printf '  The report does not describe the tree being merged (it was written at another head, the\n  lane worktree is not at the head on the branch, or its evidence finished before that head was\n  created — a push from another worktree/box moves the branch and leaves your worktree behind).\n  Re-run the suites AT THE HEAD ON THE BRANCH through the tool (do NOT just re-render):\n     git -C <your worktree> status ; git log --oneline -1   # confirm you are at the PR head\n     python3 tools/worktree_report.py run --cmd <the exact command>   # for each suite\n  ⛔ `write`, `note` and a plain `init` re-render the report AND re-stamp the recorded head WITHOUT\n  re-running anything, so they turn a stale report into a green-looking one. Only `run` produces\n  evidence for the head you are merging.\n  ⛔ If the reason is `merging-head-is-dated-ahead-of-this-box`, RE-RUNNING WILL NOT HELP: the head\n  was committed on a box whose clock is ahead, so no run here can ever be newer than it. Re-push the\n  head from a correctly-clocked box, or wait for the skew to pass.\n  ⛔ If the line names `head=` and `head_date=` with NO `report_head=`, the report IS bound to this\n  head and only the TIMESTAMPS are ambiguous: a suite finished in the same second as the merging\n  commit (both clocks are second-resolution), so the witness cannot tell an honest run from a\n  laundered one. Nothing was pushed and no other box is involved — just re-run the suites.\n' ;;
+    7) printf '  The report exists but could not be VERIFIED. Two distinct causes, with different remedies:\n     • no interpreter, or the consumer failed / printed no parseable JSON — repair the consumer, then re-run;\n     • the writer state is missing or damaged (`reason=writer-state-absent|corrupt`) — the head binding\n       lives there, so the report cannot be tied to the head being merged. Do NOT hand-edit or delete\n       it: re-run the suites through the tool (`python3 tools/worktree_report.py run --cmd <cmd>`),\n       which rewrites the state. A state file you removed is a witness you removed.\n  An unreadable verification is not a pass.\n  ⛔ `reason=no-interpreter-at-or-above-python-3.12` IS NOT A LANE FAULT AND NOTHING THE LANE PUSHES CAN\n  CHANGE IT: this gate resolves the consumer interpreter from ABSOLUTE candidates only (a `PATH`- or\n  `uv`-resolved interpreter is the ambient-variable bypass this same file closes), and the consumer\n  refuses below 3.12. The action is an OPERATOR one — install or pin a Python >= 3.12 at one of those\n  absolute paths (`/usr/local/bin/python3` or `/opt/homebrew/bin/python3` on macOS, where the\n  Apple-shipped `/usr/bin/python3` is older) — and until then no merge on this box is verifiable.\n  `lane-merge.sh` treats 7 as a BOX fault: it refuses and hands off WITHOUT spending one of the\n  fix rounds, so a re-run after the box is repaired starts from round 0.\n' ;;
     *) : ;;
   esac
 }

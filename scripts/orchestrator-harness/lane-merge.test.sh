@@ -300,6 +300,31 @@ ck "an ABSENT lane report REFUSES the merge (exit 10 FIX_REQUIRED) and launches 
    $([ "$RC" = 10 ] && [ "$(verdict_of 90 | cut -d' ' -f1)" = FIX_REQUIRED ] \
       && ! grep -q 'launched the merge chain' <<<"$OUT" && grep -q 'VERDICT=ABSENT' <<<"$OUT" && echo 0 || echo 1)
 
+# ── 11c-quater-bis. rc=7 (UNMEASURABLE) IS A BOX FAULT, SO IT MUST NOT SPEND A FIX ROUND ────────
+# ⛔ MEASURED BEFORE THE FIX (round-19 review, P1): 7 fell through the `*)` arm into emit_fix, so a box
+# whose python is below 3.12 (stock macOS, Debian 11) burned ALL THREE of the lane's rounds on pushes
+# that cannot change the verdict and then reported `round cap reached` — labelling a box defect as a
+# lane failure, and leaving the lane at the cap once the box WAS repaired. merge-one.sh already refuses
+# 7 with no round (exit 9), so the two carriers were disagreeing about the same fault.
+# DISCRIMINATOR: against the pre-fix mapping this row exits 10/FIX_REQUIRED with a round spent, so it
+# cannot pass by accident. The gate is stubbed beside the script (the deployed `$O/lane-merge.sh`
+# shape) because rc=7 depends on the BOX, not on any report a fixture could write.
+new_o "$T/pr.tsv"
+cp "$SCRIPT" "$OT/lane-merge.sh"
+cat > "$OT/lane-report-gate.sh" <<'LRGEOF'
+lane_report_gate() { printf 'lane-report: VERDICT=UNMEASURABLE branch=feat/lane reason=no-interpreter-at-or-above-python-3.12\n'; return 7; }
+lane_report_remedy() { printf '  (remedy %s)\n' "${1:-}"; }
+LRGEOF
+OUT="$(PATH="$BIN:$PATH" GH_LOG=/dev/null O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 REPO_PATH="$GL" \
+      bash "$OT/lane-merge.sh" 91 --repo o/r --branch feat/lane --pr-tsv "$T/pr-gate.tsv" --checks-tsv "$T/checks-gate.tsv" 2>&1)"; RC=$?
+ck "an UNMEASURABLE report (rc=7) hands off as BLOCKED_ATTEMPTS (exit 14) instead of a FIX round" \
+   $([ "$RC" = 14 ] && [ "$(verdict_of 91 | cut -d' ' -f1)" = BLOCKED_ATTEMPTS ] \
+      && ! grep -q 'launched the merge chain' <<<"$OUT" && echo 0 || echo 1)
+ck "…and it spends NO fix round (the lane can re-run from round 0 once the box is repaired)" \
+   $([ "$(cat "$OT/state/lanemerge-91.round" 2>/dev/null || echo 0)" = 0 ] && echo 0 || echo 1)
+ck "…and it still says UNMEASURABLE rather than a verdict about the PR" \
+   $(grep -q 'UNMEASURABLE (rc=7)' <<<"$OUT" && [ "$(verdict_of 91 | cut -d' ' -f1)" != FIX_REQUIRED ] && echo 0 || echo 1)
+
 # The abstention arm: no worktree for the branch on this box is 6, LOGGED, and the chain still gets the
 # PR. It must never read as a verification — that string is the entire justification for not refusing.
 # ⛔ A GENUINE CROSS-BOX 6 NEEDS A HEAD NO STANZA SITS AT (round-11 review, P0). The gate now refuses with

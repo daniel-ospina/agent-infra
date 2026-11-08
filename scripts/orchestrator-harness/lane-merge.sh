@@ -1302,6 +1302,12 @@ elif [ -n "$LANE_REPORT_GATE" ]; then
   # worktree on the branch under review — so a lane could edit the grader that grades it. A trusted
   # (main) checkout is resolved here, once, exactly as `launch_chain` resolves it, so the gate's
   # instrument comes from the tree nobody is merging.
+  # ⛔ THAT IS TRUE FOR A LINKED WORKTREE AND FALSE FOR AN INDEPENDENT CLONE (round-19 review, P1).
+  # `resolve_trusted_checkout` returns the FIRST `git worktree list` stanza, which for a clone is the
+  # clone itself — i.e. the tree under review. So a lane running this script from its own clone still
+  # supplies the grader, and the residual is NOT closed here; it is disclosed here, in the gate's own
+  # provenance comment, and alongside its siblings in agent-infra#3789. Do not read this block as
+  # closing the self-supplied-instrument class.
   # ⛔ AND WHEN THERE IS NO TRUSTED CHECKOUT, THE GATE DOES NOT RUN AT ALL (fresh review, P2). Falling
   # back to the lane checkout made the gate source its verifier from the tree under review and return
   # a self-graded PASS — the bypass this block exists to close, re-reachable on the fallback path. It
@@ -1330,6 +1336,15 @@ if [ -n "${RESOLVED_BR// /}" ] && [ "$_lrg_skip" = 0 ]; then
   case "$_lrg_rc" in
     0)  log_line "lane-report: verified at head ${HEAD:0:12} — the report describes the tree being merged" ;;
     5|6) log_line "lane-report: NOT ENFORCED here (rc=$_lrg_rc) — an abstention, not a green: this box/repo cannot carry the check" ;;
+    # ⛔ 7 IS UNMEASURABLE — A BOX FAULT, NOT A PR FAULT, SO IT MUST NOT SPEND A FIX ROUND (round-19
+    # review, P1). It reached the `*)` arm, so a box whose python is below 3.12 (stock macOS, Debian 11)
+    # burned all 3 of the lane's rounds on pushes that cannot change the verdict and then reported
+    # `round cap reached` — labelling a box defect as a lane failure, and leaving the lane with no round
+    # to spend once the box WAS repaired. merge-one.sh already refuses 7 without a round (it exits 9),
+    # so this is the two carriers agreeing. Nothing is released by it: the merge is still refused.
+    7)  log_line "⛔ lane-report: UNMEASURABLE (rc=7) — this box cannot verify the report. A BOX fault, not a PR fault: no fix round is spent, so a re-run after the box is repaired starts from round 0."
+        lane_report_remedy 7 2>/dev/null || true
+        emit_blocked BLOCKED_ATTEMPTS "the lane report cannot be verified on this box (rc=7): $(printf '%s' "$_lrg_out" | tail -1)" ;;
     *)  log_line "⛔ lane-report: REFUSED (rc=$_lrg_rc) — the mandatory lane report does not support merging head ${HEAD:0:12}"
         lane_report_remedy "$_lrg_rc" 2>/dev/null || true
         emit_fix FIX_REQUIRED "the lane report does not support this merge (rc=$_lrg_rc): $(printf '%s' "$_lrg_out" | tail -1)" ;;
