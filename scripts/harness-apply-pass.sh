@@ -1450,13 +1450,24 @@ if [ "$FARM_CHECK_ON" = "1" ]; then
                 # says `n=unparsed`, and every sentence below says "raw".
                 # The proof is the instrument's own summary — "DRIFT — <n> stale (…), <n>
                 # declared-but-absent, <n> unsourced" — which a partial extraction cannot satisfy.
+                # ⛔ ALL THREE LABELS MUST PARSE, NOT JUST THE FIRST (review round 12, reproduced). The
+                # sum used `${_fb:-0}`/`${_fc:-0}`, so an instrument whose OTHER classes are labelled
+                # differently — `2 missing` instead of `2 declared-but-absent` — silently reduced the
+                # proof to the stale count alone: measured with 3 STALE + 2 DECLARED-BUT-ABSENT rows and
+                # the summary "3 stale …, 2 missing, 0 unsourced", matched 3 == expect 3 took the COMPLETE
+                # arm and published `farm_n=3` / "every one named in <file>" with the two absent names in
+                # NEITHER the artifact NOR the record. A lagging farmed copy is exactly the premise this
+                # arm exists for, so an unparseable label means the proof is ABSENT, not that the class
+                # counted zero.
                 FARM_EXPECT=""
                 _fx="$(printf '%s\n' "$FARM_OUT" | grep -m1 'DRIFT' || true)"
                 if [ -n "$_fx" ]; then
                     _fa="$(printf '%s' "$_fx" | sed -n 's/.*[^0-9]\([0-9][0-9]*\) stale.*/\1/p')"
                     _fb="$(printf '%s' "$_fx" | sed -n 's/.*[^0-9]\([0-9][0-9]*\) declared-but-absent.*/\1/p')"
                     _fc="$(printf '%s' "$_fx" | sed -n 's/.*[^0-9]\([0-9][0-9]*\) unsourced.*/\1/p')"
-                    [ -n "$_fa" ] && FARM_EXPECT=$(( ${_fa:-0} + ${_fb:-0} + ${_fc:-0} ))
+                    if [ -n "$_fa" ] && [ -n "$_fb" ] && [ -n "$_fc" ]; then
+                        FARM_EXPECT=$(( _fa + _fb + _fc ))
+                    fi
                 fi
                 unset _fx _fa _fb _fc
                 FARM_ROWS_RAW=0; PERSIST_BODY="$FARM_ROWS"; FARM_RAW_WHY=""
@@ -1476,7 +1487,11 @@ if [ "$FARM_CHECK_ON" = "1" ]; then
                     HDR_NOTE="n=unparsed (no readable 'DRIFT — <n> stale …' summary, so this pass cannot PROVE its $FARM_NROWS extracted row(s) are all of them — the instrument's RAW output follows verbatim; farm_n=unparsed)"
                 elif [ "$FARM_NROWS" -ne "$FARM_EXPECT" ]; then
                     FARM_ROWS_RAW=1; PERSIST_BODY="$FARM_OUT"; FARM_RAW_WHY=partial
-                    HDR_NOTE="n=unparsed (this pass's extractor matched $FARM_NROWS row(s), the instrument reports $FARM_EXPECT — the names it could not match are in the RAW output that follows verbatim; farm_n=unparsed)"
+                    if [ "$FARM_NROWS" -lt "$FARM_EXPECT" ]; then
+                        HDR_NOTE="n=unparsed (this pass's extractor matched $FARM_NROWS row(s), the instrument reports $FARM_EXPECT — the names it could not match are in the RAW output that follows verbatim; farm_n=unparsed)"
+                    else
+                        HDR_NOTE="n=unparsed (this pass's extractor matched $FARM_NROWS row(s), MORE than the $FARM_EXPECT the instrument reports — its vocabulary is too wide, so a row it named may not be drift; the RAW output follows verbatim, farm_n=unparsed)"
+                    fi
                 fi
                 # ⛔ EVERY ROW IS PERSISTED, NOT JUST THE EXCERPT (tortoise#10114 arm 2). The journal
                 # keeps a bounded human view, but the durable answer to "which files have drifted" is
@@ -1542,7 +1557,17 @@ if [ "$FARM_CHECK_ON" = "1" ]; then
                 # human view is now always the rows THIS PASS matched; the file still carries everything
                 # (raw, when the extraction is unproven).
                 FARM_EXCERPT="$FARM_ROWS"
-                [ "$FARM_NROWS" -eq 0 ] && FARM_EXCERPT="$FARM_OUT"
+                if [ "$FARM_NROWS" -eq 0 ]; then
+                    # ⛔ ONE POPULATION, ONE COUNT (review round 12, reproduced). The excerpt was
+                    # `head -12` of the raw output while the elision counted `grep -c .` — NON-BLANK
+                    # lines — and the real instrument prints a blank line before its summary
+                    # (check-farm-drift.sh:688). Measured: 11 rows + a blank + the summary (13 lines,
+                    # 12 non-blank) printed a 12-line excerpt that swallowed the summary, then said
+                    # nothing at all because `12 -gt 12` is false; 20 rows + 4 blanks printed 12 lines
+                    # holding 10 rows and claimed "and 8 more line(s)". Blanks are dropped ONCE, in the
+                    # population both the excerpt and the arithmetic read.
+                    FARM_EXCERPT="$(printf '%s\n' "$FARM_OUT" | grep -v '^[[:space:]]*$' || true)"
+                fi
                 printf '%s\n' "$FARM_EXCERPT" | head -12 | while IFS= read -r _row; do
                     log_line "farm:   $_row"
                 done
@@ -1577,7 +1602,7 @@ if [ "$FARM_CHECK_ON" = "1" ]; then
                     # counted in LINES (review round 11). `$FARM_NROWS - 12` is -12 here and never
                     # fired, so a 30-line raw output truncated to 12 said nothing at all about the
                     # other 18 lines and whether they were durable.
-                    _oline="$(printf '%s\n' "$FARM_OUT" | grep -c .)"
+                    _oline="$(printf '%s\n' "$FARM_EXCERPT" | grep -c . || true)"
                     if [ "$_oline" -gt 12 ]; then
                         if [ "$FARM_ROWS_OK" = 1 ]; then
                             log_line "farm:   … and $((_oline - 12)) more line(s) of the instrument's output — ALL $_oline are named in $REC_FARM_ROWS"
@@ -1597,12 +1622,25 @@ if [ "$FARM_CHECK_ON" = "1" ]; then
                     # exist. `farm_rows=` in the same record carries the path, so the sentence names the
                     # FIELD instead.
                     case "$FARM_RAW_WHY" in
-                        noproof) FARM_ROW_SENTENCE="its extraction is unproven (no readable 'DRIFT' summary); RAW output published verbatim (see farm_rows=)" ;;
-                        partial) FARM_ROW_SENTENCE="matched only $FARM_NROWS of the $FARM_EXPECT row(s) the instrument reports; its RAW output is published verbatim (see farm_rows=)" ;;
+                        noproof) FARM_ROW_SENTENCE="its extraction is unproven (no readable or complete 'DRIFT' summary); RAW output published verbatim (see farm_rows=)" ;;
+                        partial)
+                            # ⛔ AN OVER-MATCH IS NOT A SHORTFALL (review round 12, measured): "matched
+                            # only 5 of the 3 row(s)" told a reader 2 rows were MISSING when 2 EXTRA
+                            # were matched — the widened-vocabulary case, described backwards. The two
+                            # directions now have their own sentences.
+                            if [ "$FARM_NROWS" -lt "$FARM_EXPECT" ]; then
+                                FARM_ROW_SENTENCE="matched only $FARM_NROWS of the $FARM_EXPECT row(s) the instrument reports; its RAW output is published verbatim (see farm_rows=)"
+                            else
+                                FARM_ROW_SENTENCE="matched $FARM_NROWS row(s), MORE than the $FARM_EXPECT the instrument reports; its RAW output is published verbatim (see farm_rows=)"
+                            fi ;;
                         *)       FARM_ROW_SENTENCE="no row matched this pass's extractor; its RAW output is published verbatim (see farm_rows=)" ;;
                     esac
                 elif [ "$FARM_ROWS_OK" = 1 ]; then
-                    FARM_ROW_SENTENCE="${FARM_NROWS} row(s), every one named in $REC_FARM_ROWS"
+                    # ⛔ NO PATH HERE EITHER (review round 12, measured): with a 140-char farm path plus
+                    # the state path the prefix + sentence exceeded 240 and `detail=` ended
+                    # "… every one named in /tmp/meas2/state/h" — a path that does not exist, the exact
+                    # defect fixed above for the raw arms. Threshold measured: farm+state ≥ 132 chars.
+                    FARM_ROW_SENTENCE="${FARM_NROWS} row(s), every one named (see farm_rows=)"
                 elif [ "$FARM_ROWS_RAW" = 1 ]; then
                     FARM_ROW_SENTENCE="the instrument's RAW output could not be persisted (farm_rows= names the failure, not a file)"
                 else

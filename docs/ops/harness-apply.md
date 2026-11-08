@@ -197,9 +197,11 @@ copy whose row vocabulary this pass does not know (a farm that lags the ref), so
 them, only some of them, or the proof itself was absent. The proof used is the instrument's own summary
 (`DRIFT — <n> stale …, <n> declared-but-absent, <n> unsourced`), and it cuts BOTH ways: the extraction
 is unproven when the extracted rows are **fewer** than that sum, when they are **more** (a widened
-vocabulary that names a healthy `ok`/`LOCAL`/`SYMLINK` row), and when **no readable summary was printed
-at all** — an unprovable extraction is not a complete one, so "cannot prove it" takes the same door as
-"proved it wrong". Unproven, the artifact carries the instrument's **RAW output** verbatim, with
+vocabulary that names a healthy `ok`/`LOCAL`/`SYMLINK` row), when **no readable summary was printed at
+all**, and when **any of the three labels did not parse** (an instrument that says `2 missing` instead
+of `2 declared-but-absent` would otherwise reduce the proof to the stale count alone, and certify a
+short list as complete) — an unprovable extraction is not a complete one, so "cannot prove it" takes
+the same door as "proved it wrong". Unproven, the artifact carries the instrument's **RAW output** verbatim, with
 `n=unparsed` in its header. The DRIFT is still red and still recorded. The names are wherever the
 instrument printed them — in that file whenever it published, and in this run's own journal excerpt (at
 most the first 12 lines: the rows this pass MATCHED when it matched any, the instrument's own output
@@ -213,12 +215,13 @@ written by this pass**, so the journal says so in as many words and the rows pas
 are named nowhere durable. (A state dir that is unwritable for the
 record too leaves the PREVIOUS record in place: staleness, not a field, is that signal.)
 
-⛔ **`detail=` IS BOUNDED, SO THE SENTENCES IN IT NAME `farm_rows=` RATHER THAN A PATH.** The field is
-cut at 240 bytes, and the drift refusal's own prefix (the farm path plus the ref) already spends most
-of that: a raw-arm sentence ending "… published verbatim in <path>" was cut MID-FILENAME, so a reader
-of `detail=` (fleet-health, `--print-status`) got a path that does not exist. The raw and
-not-persisted sentences therefore say "see `farm_rows=`", which is the field that carries the path
-(or `unwritable`) in the same record. The bound also truncates at a **byte** and used to land inside a
+⛔ **`detail=` IS BOUNDED, SO NO SENTENCE IN IT NAMES A PATH.** The field is cut at 240 bytes, and the
+drift refusal's own prefix (the farm path plus the ref) already spends most of that: ANY sentence
+ending "… in <path>" was cut MID-FILENAME once the farm and state paths were long enough together
+(measured threshold: `len(farm) + len(state) ≥ 132`), so a reader of `detail=` (fleet-health,
+`--print-status`) got a path that does not exist. Every row sentence — including the complete one —
+therefore says "see `farm_rows=`", which is the field that carries the path (or `unwritable`) in the
+same record. The bound also truncates at a **byte** and used to land inside a
 multi-byte character — leaving one invalid UTF-8 sequence that made `grep '^detail='` classify the WHOLE
 record as binary and print nothing, so the truncation now stops at the last ASCII byte (a boundary a
 multi-byte sequence cannot straddle).

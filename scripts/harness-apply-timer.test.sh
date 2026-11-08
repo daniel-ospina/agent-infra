@@ -1195,7 +1195,10 @@ cat >"$CLONE/scripts/check-farm-drift.sh" <<'FARM'
 # on it — the reason `--pin-file`/`--no-pin-identity` went unnoticed in the first draft of T15.
 printf '%s\n' "$*" >>"${FARM_ARGV:-/dev/null}"
 printf 'pr-doctor.py | %s | %s | STALE\n' "${FARM_STALE_FROM:-2165b6dbedc0}" "${FARM_STALE_TO:-ba47776b0319}" >&2
-printf 'check-farm-drift: DRIFT — 1 stale\n'
+# ⛔ THE FULL SUMMARY, IN THE INSTRUMENT'S OWN SHAPE (review round 12). The pass proves its extraction
+# against ALL THREE labels (`… stale`, `… declared-but-absent`, `… unsourced`); a stub that prints only the
+# first makes the proof ABSENT and takes the RAW arm, which is a DIFFERENT state (pinned in t24aa).
+printf 'check-farm-drift: DRIFT — 1 stale (1 farm-declared — a re-run must fix these; 0 outside the farm), 0 declared-but-absent, 0 unsourced, of 1 deployed file(s) (1 sourced, 0 matching) against origin/main (sync) in %s.\n' "$PWD/src"
 exit "${FARM_RC:-1}"
 FARM
 chmod +x "$CLONE/scripts/check-farm-drift.sh"
@@ -1405,7 +1408,7 @@ cat >"$T/t24q/stub-checker.sh" <<'FARM'
 #!/usr/bin/env bash
 i=0
 while [ "$i" -lt 20 ]; do printf 'file-%s.py | a | b | STALE\n' "$i" >&2; i=$((i+1)); done
-printf 'check-farm-drift: DRIFT — 20 stale\n'
+printf 'check-farm-drift: DRIFT — 20 stale (20 farm-declared — a re-run must fix these; 0 outside the farm), 0 declared-but-absent, 0 unsourced, of 20 deployed file(s) (20 sourced, 20 matching) against origin/main (sync) in %s.\n' "$PWD/src"
 printf '   Next: re-run the farm from a ref-consistent checkout\n'
 printf '   then re-run this check; for an UNSOURCED name: declare it LOCAL, delete it, or retire it\n'
 printf 'A STALE file is a copy launchd/systemd will EXECUTE that is not the code the repo ships.\n'
@@ -1420,6 +1423,10 @@ assert_contains "$OUT" "re-run the farm from a ref-consistent checkout" \
 assert_contains "$OUT" "declare it LOCAL, delete it, or retire it" \
     "T24 control: including the remedy's CONTINUATION line, which carries the actions"
 assert_contains "$OUT" "and 8 more row(s)" "T24 control: while the row excerpt says how many it elided"
+# ⛔ THE EXCERPT BOUND IS 12, AND NOTHING PINNED IT (review round 12, measured: `head -12` → `head -20`
+# kept the suite green while the journal printed all 20 rows AND claimed "and 8 more").
+assert_eq "$(printf '%s\n' "$OUT" | grep -c '^farm:   file-' | tr -d ' ')" "12" \
+    "T24 control: the journal prints EXACTLY 12 rows, then the elision line — the bound is pinned, not implied"
 # ⛔ THE ELIDED ROWS ARE NAMED SOMEWHERE DURABLE (tortoise#10114 arm 2). The acceptance arm is "a
 # scheduled check that NAMES EACH drifting file", and the measured failure was exactly this fixture's
 # shape: 30 rows on the `cmux` cell, 12 named in the journal, 18 only COUNTED — named nowhere at all.
@@ -1580,7 +1587,10 @@ mkdir -p "$T/t24v/home/.pi/agent/scripts"
 cat >"$T/t24v/stub-other-vocab.sh" <<'FARM'
 #!/usr/bin/env bash
 printf 'pr-doctor.py differs from the ref (STALE, in a vocabulary this pass does not extract)\n' >&2
-printf 'check-farm-drift: DRIFT — 1 stale\n'
+# ⛔ THE FULL SUMMARY, IN THE INSTRUMENT'S OWN SHAPE (review round 12). The pass proves its extraction
+# against ALL THREE labels (`… stale`, `… declared-but-absent`, `… unsourced`); a stub that prints only the
+# first makes the proof ABSENT and takes the RAW arm, which is a DIFFERENT state (pinned in t24aa).
+printf 'check-farm-drift: DRIFT — 1 stale (1 farm-declared — a re-run must fix these; 0 outside the farm), 0 declared-but-absent, 0 unsourced, of 1 deployed file(s) (1 sourced, 0 matching) against origin/main (sync) in %s.\n' "$PWD/src"
 exit 1
 FARM
 chmod +x "$T/t24v/stub-other-vocab.sh"
@@ -1627,6 +1637,16 @@ assert_contains "$(grep '^detail=' <<<"$REC24W")" "the instrument's RAW output c
 # pins nothing. The discriminating read is the plain one, whose stdout is the field itself.
 assert_eq "$(grep '^detail=' "$T/t24w/state/harness-apply.status" 2>/dev/null | wc -l | tr -d ' ')" "1" \
     "T24 control: and a TRUNCATED detail= still reads as TEXT to a plain grep — the cut never splits a multi-byte character"
+# ⛔ AND THE BOUND IS 240 BYTES, PINNED (review round 12, measured: `n=240` → `n=400` kept the suite
+# green). Without this row the bound could be widened and every sentence above would still fit. Measure
+# the VALUE, not the line: `detail=` adds 7 bytes, and the trailing multi-byte strip can leave the value
+# a byte or two under the bound.
+DET24W_LEN="$(sed -n 's/^detail=//p' "$T/t24w/state/harness-apply.status" 2>/dev/null | LC_ALL=C awk '{print length($0)}')"
+if [ -n "$DET24W_LEN" ] && [ "$DET24W_LEN" -le 240 ] && [ "$DET24W_LEN" -ge 200 ]; then
+    ok "T24 control: detail='s VALUE is held at the 240-byte bound (measured $DET24W_LEN bytes) — and this fixture is long enough to hit it"
+else
+    bad "T24 control: detail='s value must be bounded at 240 bytes and actually reach the bound here (measured '$DET24W_LEN') — a wider bound lets a long path crowd out the sentence, and an unexercised bound is not the documented contract"
+fi
 assert_contains "$OUT" "the RAW output could not be persisted" \
     "T24 control: with the journal saying the same"
 assert_contains "$(grep '^farm_n=' <<<"$REC24W")" "farm_n=unparsed" \
@@ -1667,7 +1687,7 @@ cat >"$T/t24z/stub-partial.sh" <<'FARM'
 #!/usr/bin/env bash
 printf 'a-stale.py | a | b | STALE\n' >&2
 printf 'b-newclass.py | a | b | BLOCKED-BY-DECL\n' >&2
-printf 'check-farm-drift: DRIFT — 2 stale (1 STALE, 1 in a class this pass does not know)\n'
+printf 'check-farm-drift: DRIFT — 2 stale (2 farm-declared — a re-run must fix these; 0 outside the farm), 0 declared-but-absent, 0 unsourced, of 2 deployed file(s) (2 sourced, 1 matching) against origin/main (sync) in %s.\n' "$PWD/src"
 exit 1
 FARM
 chmod +x "$T/t24z/stub-partial.sh"
@@ -1789,8 +1809,142 @@ assert_contains "$(head -1 "$ROWS24AB" 2>/dev/null || true)" "n=3" \
     "T24 control: and the header count is the 3 drift rows, matched against the instrument's own summary"
 assert_contains "$(grep '^farm_n=' "$T/t24ab/state/harness-apply.status" 2>/dev/null || true)" "farm_n=3" \
     "T24 control: with farm_n= carrying that same count, so the complete arm — not the raw one — was taken"
+# ⛔ AND THE COMPLETE ARM'S SENTENCE MUST NOT EMBED THE PATH (VGATE round 13, measured). Every `every one
+# named` assertion was an `assert_absent` on a RAW arm, so restoring `"N row(s), every one named in <path>"`
+# here kept the suite green while `detail=` ended mid-filename (measured 241 bytes on this fixture once
+# the path is inlined). The positive form is what pins it.
+assert_contains "$(grep '^detail=' "$T/t24ab/state/harness-apply.status" 2>/dev/null || true)" "3 row(s), every one named (see farm_rows=)" \
+    "T24 control: the complete arm names farm_rows= rather than inlining a path the 240-byte bound can cut"
+assert_absent "$(grep '^detail=' "$T/t24ab/state/harness-apply.status" 2>/dev/null || true)" "harness-apply-farm-rows.txt" \
+    "T24 control: and it really inlines no artifact path"
 assert_contains "$OUT" "3 row(s) matched by this pass's extractor" \
     "T24 control: and the journal headline says 3, not 11"
+
+# ⛔ AN UNPARSEABLE LABEL IS AN ABSENT PROOF, NOT A ZERO (review round 12, reproduced). The proof summed
+# `${_fb:-0}`/`${_fc:-0}`, so an instrument that labels its other classes differently — `2 missing`
+# instead of `2 declared-but-absent` — silently reduced it to the stale count. MEASURED with 3 STALE + 2
+# DECLARED-BUT-ABSENT rows and "3 stale …, 2 missing, 0 unsourced": matched 3 == expect 3 took the
+# COMPLETE arm and published `farm_n=3` / "every one named (see farm_rows=)" with the two absent names in
+# NEITHER the artifact NOR the record. Mutant that reds these rows: restore the `:-0` defaults.
+mk_origin t24ac; mk_clone t24ac
+REPO_P="$CLONE"; MODE_P=sync
+mkdir -p "$T/t24ac/home/.pi/agent/scripts"
+cat >"$T/t24ac/stub-otherlabel.sh" <<'FARM'
+#!/usr/bin/env bash
+printf 'stale-a.py | a | b | STALE\n' >&2
+printf 'stale-b.py | a | b | STALE\n' >&2
+printf 'stale-c.py | a | b | STALE\n' >&2
+# ⛔ A CLASS THIS PASS DOES NOT EXTRACT, ON PURPOSE (VGATE round 13, measured). Printing these as
+# `DECLARED-BUT-ABSENT` — a token the extractor KNOWS — made `matched` 5 while the stale count was 3,
+# so the fixture took the OVER-match/partial arm and the `:-0` regression stayed GREEN: it reds only
+# when the extractor under-matches to exactly the stale count, which is the shape a real lagging farm
+# produces. `ABSENT` is what a farmed copy with a renamed class actually prints.
+printf 'owed-one.py | a | - | ABSENT\n' >&2
+printf 'owed-two.py | a | - | ABSENT\n' >&2
+printf 'check-farm-drift: DRIFT — 3 stale (3 farm-declared — a re-run must fix these; 0 outside the farm), 2 missing, 0 unsourced, of 5 deployed file(s) (3 sourced, 3 matching) against origin/main (sync) in %s.\n' "$PWD/src"
+exit 1
+FARM
+chmod +x "$T/t24ac/stub-otherlabel.sh"
+OUT="$(HARNESS_APPLY_FARM_CHECKER="$T/t24ac/stub-otherlabel.sh" run_pass "$T/t24ac" 2>&1)"; RC=$?
+assert_eq "$RC" "24" "T24 control: a drift summary this pass cannot fully read is still RED (24)"
+ROWS24AC="$T/t24ac/state/harness-apply-farm-rows.txt"
+assert_contains "$(head -1 "$ROWS24AC" 2>/dev/null || true)" "n=unparsed" \
+    "T24 control: an UNPARSEABLE summary label leaves the extraction UNPROVEN, never a count that certifies it"
+assert_contains "$(cat "$ROWS24AC" 2>/dev/null || true)" "owed-one.py" \
+    "T24 control: and the RAW output is published, so a class the pass could not COUNT is still NAMED"
+assert_contains "$(cat "$ROWS24AC" 2>/dev/null || true)" "owed-two.py" \
+    "T24 control: including the second absent file, which the complete arm would have dropped"
+REC24AC="$(cat "$T/t24ac/state/harness-apply.status" 2>/dev/null || true)"
+assert_contains "$(grep '^farm_n=' <<<"$REC24AC")" "farm_n=unparsed" \
+    "T24 control: with farm_n= saying UNPARSED, not the 3 rows the extractor happened to match"
+assert_absent "$(grep '^detail=' <<<"$REC24AC")" "every one named" \
+    "T24 control: and detail= never certifies a list shorter than the drift the instrument reported"
+
+# ⛔ A BLANK LINE IN THE EXCERPT POPULATION (VGATE round 13, measured: reverting the strip kept the suite
+# green). The REAL instrument emits a blank line before its summary (check-farm-drift.sh:688 `log_line ""`),
+# and the excerpt used to `head -12` all lines while the elision counted NON-BLANK ones: with 11 unmatched
+# rows + a blank + the summary (13 lines, 12 non-blank) the 12-line excerpt swallowed the SUMMARY and the
+# `12 -gt 12` test then said nothing about it — the journal's only statement about what drifted, gone.
+# Both populations are now the same (blanks dropped once), so the summary is inside the excerpt. Mutant
+# that reds these rows: restore `FARM_EXCERPT="$FARM_OUT"`.
+mk_origin t24ad; mk_clone t24ad
+REPO_P="$CLONE"; MODE_P=sync
+mkdir -p "$T/t24ad/home/.pi/agent/scripts"
+cat >"$T/t24ad/stub-blanks.sh" <<'FARM'
+#!/usr/bin/env bash
+i=1
+while [ "$i" -le 11 ]; do printf 'renamed-%s.py | a | b | IN-A-CLASS-THIS-PASS-CANNOT-EXTRACT
+' "$i" >&2; i=$((i+1)); done
+printf '\n' >&2
+printf 'check-farm-drift: DRIFT — 11 stale (11 farm-declared — a re-run must fix these; 0 outside the farm), 0 declared-but-absent, 0 unsourced, of 11 deployed file(s) (3 sourced, 0 matching) against origin/main (sync) in %s.\n' "$PWD/src"
+exit 1
+FARM
+chmod +x "$T/t24ad/stub-blanks.sh"
+OUT="$(HARNESS_APPLY_FARM_CHECKER="$T/t24ad/stub-blanks.sh" run_pass "$T/t24ad" 2>&1)"; RC=$?
+assert_eq "$RC" "24" "T24 control: a zero-extraction drift whose output carries a BLANK line is still RED (24)"
+assert_contains "$OUT" "DRIFT — 11 stale" \
+    "T24 control: and the excerpt still reaches the instrument's SUMMARY across the blank line (the blank is not an excerpt line)"
+assert_eq "$(printf '%s\n' "$OUT" | grep -c '^farm:   $' | tr -d ' ')" "0" \
+    "T24 control: because blanks are dropped from the excerpt population the elision counts"
+
+# ⛔ AND EVERY ONE OF THE THREE LABELS, NOT JUST TWO (VGATE round 13, measured: requiring only `_fa` and
+# `_fb` survived the suite, because t24ac relabels `declared-but-absent` only). The `unsourced` class is
+# the one a lagging farm is most likely to rename — it is the class #1552 measured 27 files of on this
+# box — so a fixture relabels THAT label and nothing else. Measured with the `_fc` requirement dropped:
+# `FARM_EXPECT` became `3 + 0` = 3 == matched 3, the COMPLETE arm was taken, and the two orphaned names
+# were in NEITHER the artifact NOR the record while `detail=` said "every one named".
+mk_origin t24ae; mk_clone t24ae
+REPO_P="$CLONE"; MODE_P=sync
+mkdir -p "$T/t24ae/home/.pi/agent/scripts"
+cat >"$T/t24ae/stub-otherlabel2.sh" <<'FARM'
+#!/usr/bin/env bash
+printf 'stale-a.py | a | b | STALE\n' >&2
+printf 'stale-b.py | a | b | STALE\n' >&2
+printf 'stale-c.py | a | b | STALE\n' >&2
+printf 'orphan-one.py | a | - | ORPHANED\n' >&2
+printf 'orphan-two.py | a | - | ORPHANED\n' >&2
+printf 'check-farm-drift: DRIFT — 3 stale (3 farm-declared — a re-run must fix these; 0 outside the farm), 0 declared-but-absent, 2 orphaned, of 5 deployed file(s) (3 sourced, 3 matching) against origin/main (sync) in %s.\n' "$PWD/src"
+exit 1
+FARM
+chmod +x "$T/t24ae/stub-otherlabel2.sh"
+OUT="$(HARNESS_APPLY_FARM_CHECKER="$T/t24ae/stub-otherlabel2.sh" run_pass "$T/t24ae" 2>&1)"; RC=$?
+assert_eq "$RC" "24" "T24 control: a drift whose UNSOURCED label was renamed is still RED (24)"
+ROWS24AE="$T/t24ae/state/harness-apply-farm-rows.txt"
+assert_contains "$(head -1 "$ROWS24AE" 2>/dev/null || true)" "n=unparsed" \
+    "T24 control: an unreadable UNSOURCED label leaves the extraction UNPROVEN (the proof needs all three)"
+assert_contains "$(cat "$ROWS24AE" 2>/dev/null || true)" "orphan-one.py" \
+    "T24 control: and the RAW output names the orphaned files the extraction could not class"
+REC24AE="$(cat "$T/t24ae/state/harness-apply.status" 2>/dev/null || true)"
+assert_contains "$(grep '^farm_n=' <<<"$REC24AE")" "farm_n=unparsed" \
+    "T24 control: with farm_n= UNPARSED, not the 3 rows the extractor happened to match"
+assert_absent "$(grep '^detail=' <<<"$REC24AE")" "every one named" \
+    "T24 control: and detail= never certifies a list that omits the orphaned class"
+
+# ⛔ AND THE STALE LABEL IS NOT OPTIONAL EITHER (VGATE round 13, measured: requiring only `_fb`/`_fc`
+# survived the suite). `$(( "" + 0 + 2 ))` is 2 in bash arithmetic, so dropping `_fa` turns an EMPTY
+# proof into "matched == expect" and flips UNPROVEN -> COMPLETE with the stale names in neither the
+# artifact nor the record. A farmed copy that renames its drift class (`5 fresh`) is the same premise.
+mk_origin t24af; mk_clone t24af
+REPO_P="$CLONE"; MODE_P=sync
+mkdir -p "$T/t24af/home/.pi/agent/scripts"
+cat >"$T/t24af/stub-otherlabel3.sh" <<'FARM'
+#!/usr/bin/env bash
+printf 'orphan-one.py | a | - | UNSOURCED\n' >&2
+printf 'orphan-two.py | a | - | UNSOURCED\n' >&2
+printf 'check-farm-drift: DRIFT — 5 fresh (5 farm-declared — a re-run must fix these; 0 outside the farm), 0 declared-but-absent, 2 unsourced, of 7 deployed file(s) (5 sourced, 0 matching) against origin/main (sync) in %s.\n' "$PWD/src"
+exit 1
+FARM
+chmod +x "$T/t24af/stub-otherlabel3.sh"
+OUT="$(HARNESS_APPLY_FARM_CHECKER="$T/t24af/stub-otherlabel3.sh" run_pass "$T/t24af" 2>&1)"; RC=$?
+assert_eq "$RC" "24" "T24 control: a drift whose STALE label was renamed is still RED (24)"
+ROWS24AF="$T/t24af/state/harness-apply-farm-rows.txt"
+assert_contains "$(head -1 "$ROWS24AF" 2>/dev/null || true)" "n=unparsed" \
+    "T24 control: an unreadable STALE label leaves the extraction UNPROVEN — an empty sum is not a match"
+REC24AF="$(cat "$T/t24af/state/harness-apply.status" 2>/dev/null || true)"
+assert_contains "$(grep '^farm_n=' <<<"$REC24AF")" "farm_n=unparsed" \
+    "T24 control: with farm_n= UNPARSED, never the 2 rows the extractor happened to match"
+assert_absent "$(grep '^detail=' <<<"$REC24AF")" "every one named" \
+    "T24 control: and detail= never certifies a list built from an empty proof"
 
 # ── T26: the materialiser is TOLD which cell home to pin into (agent-infra#3593) ─────────────────
 # MEASURED on the `cmux` cell, 2026-11-06: this pass resolves CELL_HOME from $HOME (pass:195) and the
