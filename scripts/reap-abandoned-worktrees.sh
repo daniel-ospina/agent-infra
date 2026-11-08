@@ -464,8 +464,12 @@ load_pin() {
         f="$REAP_AW_STAMP"
         [ -r "$f" ] || { log_line "SKIP reason=stamp-unreadable path=$f"; return 3; }
     else
-        for cand in "${CELL_HOME:-}/orchestrator/.agent-infra-stamp.json" \
-                    "${HOME:-}/.pi/orchestrator/.agent-infra-stamp.json"; do
+        # ⛔ `${VAR:+…}`, NOT `${VAR:-}` (review round-3 F5): with HOME unset the second candidate is
+        # `/.pi/orchestrator/…` — an absolute path no box owns, and the exact spelling the block 290 lines
+        # above declares forbidden. Fails closed either way, but a file that states a rule must not break
+        # it, or the next reader cannot tell which spelling is correct.
+        for cand in ${CELL_HOME:+"$CELL_HOME/orchestrator/.agent-infra-stamp.json"} \
+                    ${HOME:+"$HOME/.pi/orchestrator/.agent-infra-stamp.json"}; do
             [ -n "$cand" ] && [ -f "$cand" ] && { f="$cand"; break; }
         done
     fi

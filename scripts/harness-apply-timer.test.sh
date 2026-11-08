@@ -1792,6 +1792,54 @@ OUT="$(run_under HARNESS_APPLY_CONTROLLER_UNIT="$T27/controller-dropin.service" 
 if [ "$RC" = "27" ]; then bad "T27 a LATER drop-in did not win — systemd applies drop-ins in lexicographic order and last wins";
 else ok "T27 a lexicographically LATER drop-in wins (rc=$RC) — the order is systemd's, not the directory's"; fi
 
+# ⛔ THE THREE SPELLINGS THAT MEASURED NOTHING (review round-3 F1, each verified): systemd.syntax(7) says
+# whitespace around `=` is ignored, and that BOTH single and double quotes wrap an item and are then
+# removed. The first cut handled only the double-quoted, no-space form — so `'…'` and `Environment = …`
+# silently measured NOTHING (`split_home=none`, which every reader infers as agreement), and a quoted
+# value containing a space compared as a TRUNCATED PREFIX that could equal the derived home.
+printf "[Service]\nEnvironment='CELL_HOME=%s'\n" "$T27/legacy-home" >"$T27/controller-sq.service"
+OUT="$(run_under HARNESS_APPLY_CONTROLLER_UNIT="$T27/controller-sq.service" "${HA_CONV[@]}")"; RC=$?
+assert_eq "$RC" "27" "T27 a SINGLE-quoted Environment='CELL_HOME=…' is measured (systemd removes both quote kinds)"
+printf '[Service]\nEnvironment = %s\n' "CELL_HOME=$T27/legacy-home" >"$T27/controller-spaced.service"
+OUT="$(run_under HARNESS_APPLY_CONTROLLER_UNIT="$T27/controller-spaced.service" "${HA_CONV[@]}")"; RC=$?
+assert_eq "$RC" "27" "T27 whitespace around the '=' (Environment = CELL_HOME=…) is ignored, as systemd ignores it"
+# ⛔ THE TRUNCATION CASE, which was worse than "cannot measure": a quoted value with a space used to be
+# compared as its first token, so `"<derived> with-suffix"` read as EQUAL to a converged box's home and
+# the guard reported agreement over a real split.
+printf '[Service]\nEnvironment="CELL_HOME=%s with-suffix"\n' "$T27/acct-home" >"$T27/controller-spaceval.service"
+OUT="$(run_under HARNESS_APPLY_CONTROLLER_UNIT="$T27/controller-spaceval.service" "${HA_CONV[@]}")"; RC=$?
+assert_eq "$RC" "27" "T27 a quoted value CONTAINING A SPACE is compared whole, not truncated to a prefix"
+assert_contains "$OUT" "with-suffix" "T27 …and the whole value is what the refusal names"
+# ⛔ AND THE ORDERING ARM MUST BE ABLE TO FAIL (review round-3 F4, measured): the previous fixture had ONE
+# drop-in directory, so it only ever tested order WITHIN a directory and the mutation its own comment
+# names (directory-by-directory application) left the suite green. Two directories, two names, one
+# collision: systemd applies drop-ins lexicographically by FILE NAME across the directories, so the
+# LATER NAME wins, and an equally-named file resolves to the HIGHER-PRECEDENCE directory.
+# Two REAL drop-in directories, both on systemd's list: the unit's own, and the per-user one (which is
+# writable inside the fixture because `HOME` is the fixture's). The values are chosen so that NAME order
+# and DIRECTORY order give DIFFERENT answers — otherwise the arm cannot fail.
+ORD1="$T27/controller-ord.service.d"
+ORD2="$T27/acct-home/.config/systemd/user/controller-ord.service.d"
+mkdir -p "$ORD1" "$ORD2"
+printf '[Service]\nEnvironment=CELL_HOME=%s\n' "$T27/acct-home" >"$T27/controller-ord.service"
+# name order: a-aa (ORD2) then z-zz (ORD1)  -> LAST is z-zz  -> legacy-home
+# dir  order: ORD1 (z-zz) then ORD2 (a-aa)  -> LAST is a-aa  -> acct-home (agreement: no refusal)
+printf 'Environment=CELL_HOME=%s\n' "$T27/legacy-home" >"$ORD1/z-zz.conf"
+printf 'Environment=CELL_HOME=%s\n' "$T27/acct-home" >"$ORD2/a-aa.conf"
+OUT="$(run_under HARNESS_APPLY_CONTROLLER_UNIT="$T27/controller-ord.service" "${HA_CONV[@]}")"; RC=$?
+assert_eq "$RC" "27" "T27 drop-ins are applied by FILE NAME across directories, not directory-by-directory"
+assert_contains "$OUT" "split_home=$T27/legacy-home" "T27 …the later NAME wins, so the answer is the lower directory's z-zz (directory order would say acct-home)"
+# ⛔ AND THE COLLISION RULE: the same NAME in two directories resolves to the HIGHER-precedence one.
+ORD3="$T27/controller-same.service.d"
+mkdir -p "$ORD3" "$ORD2/../controller-same.service.d"
+mkdir -p "$T27/acct-home/.config/systemd/user/controller-same.service.d"
+printf '[Service]\nEnvironment=CELL_HOME=%s\n' "$T27/acct-home" >"$T27/controller-same.service"
+printf 'Environment=CELL_HOME=%s\n' "$T27/nowhere-home" >"$ORD3/mm.conf"
+printf 'Environment=CELL_HOME=%s\n' "$T27/acct-home" >"$T27/acct-home/.config/systemd/user/controller-same.service.d/mm.conf"
+OUT="$(run_under HARNESS_APPLY_CONTROLLER_UNIT="$T27/controller-same.service" "${HA_CONV[@]}")"; RC=$?
+assert_eq "$RC" "27" "T27 an equally-named drop-in resolves to the HIGHER-precedence directory"
+assert_contains "$OUT" "split_home=$T27/nowhere-home" "T27 …the unit's own directory wins the name, not the per-user one"
+
 echo
 echo "────────────────────────────────────────────────────────"
 echo "harness-apply: $PASS passed, $FAIL failed"

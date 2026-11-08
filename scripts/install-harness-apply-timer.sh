@@ -110,6 +110,13 @@ UNIT_NAME="eldato-harness-apply"
 LABEL="com.eldato.${UNIT_NAME#eldato-}"
 PASS_REF="${HARNESS_APPLY_REF:-origin/main}"
 PASS_MODE="${HARNESS_APPLY_MODE:-}"
+# ⛔ THE CONTROLLER'S UNIT NAME GOES INTO THE PASS'S UNIT (agent-infra#3453, review round-3 F2). The pass
+# READS that unit to compare homes; `install-controller-service.sh` renders and validates
+# `CONTROLLER_UNIT=<bare name>`, so a renamed controller is a supported install — and a pass that
+# assumed `eldato-orchestrator` would find no unit, print `split_home=none`, and refuse nothing. One
+# fact, rendered into both units, from the operator's own `CONTROLLER_UNIT`.
+CONTROLLER_UNIT="${CONTROLLER_UNIT:-eldato-orchestrator}"
+case "$CONTROLLER_UNIT" in *.service) : ;; *) CONTROLLER_UNIT="$CONTROLLER_UNIT.service" ;; esac
 
 # ── the checkout the pass converges ──────────────────────────────────────────────────────────
 # ⛔ A FARMED INSTALLER HAS NO CHECKOUT BESIDE IT. On a cell this file lives at
@@ -266,7 +273,7 @@ refuse_transient_target() {
     # ⛔ EVERY SUBSTITUTED VALUE GOES THROUGH `sed` — where a BACKSLASH IS AN ESCAPE. Measured on the
     # disk-reaper installer: `s|{{HOME}}|/tmp/a\b|` rendered `/tmp/ab`, exit 0, no `{{` left for the
     # post-render guard, and the unit pointed at a path that does not exist.
-    for v in "HOME=$HOME" "PATH=$PATH" "STATE_DIR=$STATE_DIR" "PASS=$PASS" "PASS_REPO=$PASS_REPO" "PASS_REF=$PASS_REF"; do
+    for v in "HOME=$HOME" "PATH=$PATH" "STATE_DIR=$STATE_DIR" "PASS=$PASS" "PASS_REPO=$PASS_REPO" "PASS_REF=$PASS_REF" "CONTROLLER_UNIT=$CONTROLLER_UNIT"; do
         case "${v#*=}" in
             *\\*) err "REFUSING: ${v%%=*} contains a backslash — the artifact is rendered with sed, where a backslash is an escape, so the rendered path would silently differ from the real one"; return 1 ;;
         esac
@@ -291,7 +298,7 @@ refuse_transient_target() {
 refuse_systemd_unsafe_values() {
     local v
     [ "${TARGET:-}" = "launchd" ] && return 0
-    for v in "HOME=$HOME" "PATH=$PATH" "STATE_DIR=$STATE_DIR" "PASS=$PASS" "PASS_REPO=$PASS_REPO"; do
+    for v in "HOME=$HOME" "PATH=$PATH" "STATE_DIR=$STATE_DIR" "PASS=$PASS" "PASS_REPO=$PASS_REPO" "CONTROLLER_UNIT=$CONTROLLER_UNIT"; do
         case "${v#*=}" in
             *[[:space:]]*) err "REFUSING: ${v%%=*} contains whitespace — systemd splits the rendered unit on it, so it would never run"; return 1 ;;
         esac
@@ -319,6 +326,7 @@ render() { # render <template> <dest>
         -e "s|{{PASS_REPO}}|$(xml_sed_repl "$PASS_REPO")|g" \
         -e "s|{{PASS_REF}}|$(xml_sed_repl "$PASS_REF")|g" \
         -e "s|{{PASS_MODE}}|$(xml_sed_repl "$PASS_MODE")|g" \
+        -e "s|{{CONTROLLER_UNIT}}|$(xml_sed_repl "$CONTROLLER_UNIT")|g" \
         -e "s|{{INTERVAL_MIN}}|$INTERVAL_MIN|g" \
         -e "s|{{INTERVAL_SEC}}|$(( INTERVAL_MIN * 60 ))|g" \
         -e "s|{{LABEL}}|$LABEL|g" \

@@ -260,34 +260,76 @@ done
 #         a name collision. All of that is honoured below.
 # A value this file cannot resolve (`{{CELL_HOME}}` unrendered, a `%h` specifier) is CANNOT MEASURE and
 # is skipped — never compared, because a string comparison against a placeholder is not a reading.
+# `split_env_tokens <line>` — one token per line, honouring ONE level of `'…'` / `"…"` quoting.
+# ⛔ THIS EXISTS BECAUSE `tr -d '"'` IS NOT "UNQUOTING" (review round-3 F1, verified). systemd.syntax(7):
+# "Whitespace immediately before or after the `=` is ignored", and "double quotes (…) AND SINGLE QUOTES
+# (…) may be used to wrap a whole item … Quotes themselves are removed". Measured failures of the first
+# cut: `Environment='CELL_HOME=/sq'` measured NOTHING; `Environment = CELL_HOME=/spaced` (a space before
+# the `=`) measured NOTHING; and a quoted value containing a space was compared as a TRUNCATED PREFIX —
+# `"CELL_HOME=/home/x with-suffix"` read as `/home/x`, i.e. it compared EQUAL to a converged box's
+# derived home and the guard reported agreement. A split that respects quotes fixes all three, and
+# stripping only the WRAPPING pair (not every quote character) keeps a value like `/Users/o'brien` intact.
+split_env_tokens() {
+    local str="$1" out="" cur="" q="" i=0 n=0 ch
+    n=${#str}
+    while [ "$i" -lt "$n" ]; do
+        ch="${str:$i:1}"; i=$((i + 1))
+        if [ -n "$q" ]; then
+            if [ "$ch" = "$q" ]; then q="" ; else cur="$cur$ch"; fi
+        else
+            case "$ch" in
+                "'"|'"') q="$ch" ;;
+                ' '|"	") [ -n "$cur" ] && { out="$out$cur"$'\n'; cur=""; } ;;
+                *) cur="$cur$ch" ;;
+            esac
+        fi
+    done
+    [ -n "$q" ] && return 0     # an UNTERMINATED quote is not a reading — say nothing, never half a value
+    [ -n "$cur" ] && out="$out$cur"$'\n'
+    printf '%s' "$out"
+}
+
 environment_cell_home() { # <file> — the CELL_HOME its Environment= lines set (last wins), or nothing
-    local envlines token
-    envlines="$(sed -n 's/^[[:space:]]*Environment=//p' "$1" 2>/dev/null)"
-    [ -n "$envlines" ] || return 0
-    token="$(printf '%s\n' "$envlines" | tr -d '"' | tr -s '[:space:]' '\n' \
-               | sed -n 's/^CELL_HOME=//p' | tail -1)"
-    case "$token" in
-        ''|*'{'*|*%*) return 0 ;;   # an unrendered placeholder or a specifier is not a reading
+    local line tok out=""
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        tok="$(split_env_tokens "$line" | sed -n 's/^CELL_HOME=//p' | tail -1)"
+        [ -n "$tok" ] && out="$tok"
+    done < <(sed -n 's/^[[:space:]]*Environment[[:space:]]*=[[:space:]]*//p' "$1" 2>/dev/null)
+    case "$out" in
+        ''|*'{'*|*'%'*) return 0 ;;   # an unrendered placeholder or a specifier is not a reading
     esac
-    printf '%s\n' "$token"
+    printf '%s\n' "$out"
 }
 
 dropin_cell_home() { # <unit-path> — the last CELL_HOME its drop-ins set, systemd's precedence order
-    local unit="$1" base d g name out="" v
+    local unit="$1" base d g name out="" v pre
     base="${unit##*/}"
     local -a dirs=() names=()
-    # ⛔ `"${unit}.d"`, NOT `"${unit%/*}.d"`: the latter strips the FILE NAME and yields `<dir>.d`, so the
-    # unit's own drop-in directory was never read at all (caught by probing the function directly — the
-    # suite had no drop-in arm, which is why it shipped; it has one now).
-    for d in "${unit}.d" "/run/systemd/system/$base.d" "/usr/lib/systemd/system/$base.d" \
-             ${HOME:+"$HOME/.config/systemd/user/$base.d"} "/etc/systemd/user/$base.d" \
-             "/run/systemd/user/$base.d" "/usr/lib/systemd/user/$base.d"; do
-        [ -d "$d" ] && dirs+=("$d")
+    # ⛔ DROP-INS ARE NOT "THE DIRECTORY THE UNIT FILE WAS FOUND IN" (review round-3 F3, verified).
+    # systemd.unit(5): drop-in files live in /etc, /run, /usr/local/lib and /usr/lib "regardless of where
+    # the unit file itself is located" — so an /etc drop-in for a /usr/lib-installed unit IS applied, and
+    # a `${unit}.d`-only reader misses it. Measured in a container: a unit under /usr/lib with its drop-in
+    # under /etc/systemd/system/<name>.service.d read NOTHING.
+    # ⛔ AND A UNIT NAME CONTAINING `-` ALSO GETS DASH-TRUNCATED PREFIX DIRECTORIES (`eldato-…-.service.d`).
+    for pre in "$base" "${base%%-*}-"; do
+        # ⛔ `"${unit}.d"` FIRST: a unit found at an ARBITRARY path (the `HARNESS_APPLY_CONTROLLER_UNIT`
+        # seam, or a `CONTROLLER_SYSTEM_UNIT_DIR` override) keeps its own drop-in directory. Dropping it in
+        # favour of the standard dirs alone made the reader blind to the seam's own `.d` — measured by the
+        # T27 drop-in arm going red — which is the same class of blindness this function exists to remove.
+        [ "$pre" = "$base" ] && [ -d "${unit}.d" ] && dirs+=("${unit}.d")
+        for d in "/etc/systemd/system/$pre.d" "/run/systemd/system/$pre.d" \
+                 "/usr/local/lib/systemd/system/$pre.d" "/usr/lib/systemd/system/$pre.d" \
+                 ${HOME:+"$HOME/.config/systemd/user/$pre.d"} "/etc/systemd/user/$pre.d" \
+                 "/run/systemd/user/$pre.d" "/usr/local/lib/systemd/user/$pre.d" \
+                 "/usr/lib/systemd/user/$pre.d"; do
+            [ -d "$d" ] && dirs+=("$d")
+        done
     done
     [ "${#dirs[@]}" -eq 0 ] && return 0
     # ⛔ LEXICOGRAPHIC BY FILE NAME ACROSS ALL THE DIRECTORIES, with the first (highest-precedence)
-    # directory winning a collision — not "directory by directory", which would let a `/usr/lib` drop-in
-    # named `z.conf` override an `/etc` one named `a.conf`, reversing systemd's own order.
+    # directory winning a NAME collision — not "directory by directory", which would let a /usr/lib
+    # drop-in named `z.conf` override an /etc one named `a.conf`, reversing systemd's own order.
     names="$(for d in "${dirs[@]}"; do for g in "$d"/*.conf; do [ -r "$g" ] && printf '%s\n' "${g##*/}"; done; done | LC_ALL=C sort -u)"
     while IFS= read -r name; do
         [ -n "$name" ] || continue
@@ -313,10 +355,12 @@ split_home_controller() { # prints the controller's pinned CELL_HOME, or nothing
         # ⛔ THE NAME IS NOT ASSUMED: a renamed controller is a supported install.
         name="${CONTROLLER_UNIT:-eldato-orchestrator}"
         case "$name" in *.service) : ;; *) name="$name.service" ;; esac
+        # ⛔ `/usr/local/lib/systemd/system` IS ON SYSTEMD'S LOAD PATH TOO ("System units installed by
+        # the administrator", systemd.unit(5)) and it sits between /run and /usr/lib (review round-3 F3).
         for f in "${CONTROLLER_SYSTEM_UNIT_DIR:-/etc/systemd/system}" /etc/systemd/system \
-                 /run/systemd/system /usr/lib/systemd/system \
+                 /run/systemd/system /usr/local/lib/systemd/system /usr/lib/systemd/system \
                  ${HOME:+"$HOME/.config/systemd/user"} /etc/systemd/user \
-                 /run/systemd/user /usr/lib/systemd/user; do
+                 /run/systemd/user /usr/local/lib/systemd/user /usr/lib/systemd/user; do
             units+=("$f/$name")
         done
     fi
@@ -1185,7 +1229,11 @@ if [ -n "$SPLIT_HOME" ]; then
     REC_DETAIL="split home: $SPLIT_HOME_WHY but this pass derives CELL_HOME=$CELL_HOME"
     REC_REMEDY="converge the box: bash scripts/cell-home-migrate.sh --check, then --apply (or set CELL_HOME explicitly if $SPLIT_HOME is the home this box's controller really reads)"
     err "REFUSED split-home: $SPLIT_HOME_WHY, but this pass derives CELL_HOME='$CELL_HOME' — two live homes on one box, so the pin this pass would write is not the pin the controller reads (agent-infra#3453)"
-    err "  Nothing was touched — this refusal precedes the dirty-preservation pass and every other write. $REC_REMEDY"
+    # ⛔ NOT "nothing was touched" WITHOUT A QUALIFIER (review round-3 F6, measured): the fetch that
+    # refreshed the ref already ran, and it writes `.git/FETCH_HEAD` and the remote-tracking ref. The
+    # WORKTREE is untouched — which is what an operator reaching for `git status` cares about — so say
+    # exactly that, and name the fetch rather than pretending it did not happen.
+    err "  Nothing in the worktree was touched — this refusal precedes the dirty-preservation pass and every other write (the fetch that refreshed $REF was the last thing that ran). $REC_REMEDY"
     write_record 0 27 || exit 23
     exit 27
 fi
