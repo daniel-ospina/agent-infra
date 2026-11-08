@@ -174,12 +174,16 @@ that path holds pass B's. The write is atomic (a reader never sees half a list, 
 removes another's file), but it is **not per-run**, and the header is what you can decide with:
 
 - the header's `ref=` and `dest=` are the **ref name and farm path this record's `detail=` quotes** —
-  `detail=` reads `farm: DRIFT — <the arm sentence>; <dest> is NOT the code <ref> ships`, so the
-  pair must appear there verbatim, after the arm sentence (they are the same two variables; the record
-  has NO `dest=` field of its own, and the record's `ref=` is the RESOLVED SHORT SHA, a different value
-  on purpose — do not compare those). The ARM SENTENCE leads because `detail=` is bounded and what
-  comes last is what gets lost, so on a very long farm path the `dest=` tail may itself be cut — the
-  header's `dest=` is then the value to trust;
+  `detail=` reads `farm: DRIFT — <the arm sentence>; <dest> is NOT the code <ref> ships`, the same two
+  variables (the record has NO `dest=` field of its own, and the record's `ref=` is the RESOLVED SHORT
+  SHA, a different value on purpose — do not compare those). ⛔ BOTH sit at the TAIL, which is what the
+  240-byte bound cuts, so compare **only the characters that are present**: the visible `dest=` must be
+  a **prefix** of the header's `dest=`, and the visible ref fragment must be a prefix of the header's
+  `ref=`. Measured: a 60-char farm keeps the ref whole, ~92 chars cuts it to a fragment (`or` of
+  `origin/main`), ~120 cuts the farm itself — in every case the visible part still agrees, which is the
+  decidable test. When `detail=` ends at the bound, the header's `dest=`/`ref=` are the authoritative
+  values; a `detail=` whose VISIBLE farm or ref DISAGREES is a different pass's and is what this rule
+  rejects. (The arm sentence leads `detail=` precisely so a truncation can never eat the diagnosis.)
 - the header's UTC must **not be later than** the record's `at=` (the artifact is published first,
 so a header timestamp *after* the record's own is the one cheap impossibility — compare same-format
 strings, both UTC, NOT the header's UTC against the record's `epoch=`);
@@ -214,9 +218,10 @@ when it matched none) only when the publish failed — so the record says "publi
 "every one named".
 
 `farm_rows=<path>` with `n=unparsed` is ALSO written when the instrument printed **nothing** for a red
-grade: the artifact is a header and no body, and the record's `detail=` says so instead of claiming
-output was published. That is the one state where a published list can name no file — because the
-instrument named none.
+grade: the artifact is a header and **no body line at all** (an empty body writes none — a blank line
+would be a stray row for anyone sizing the list with `wc -l - 1`), and the record's `detail=` says so
+instead of claiming output was published. That is the one state where a published list can name no
+file — because the instrument named none.
 
 `farm_rows=<path>` is ALSO written on `action=farm-unknown` (`rc=24`, the instrument's own exit 2). The
 instrument prints its per-file rows BEFORE the exits that give up (`matched == 0`, a partly ungradeable
@@ -239,7 +244,7 @@ written by this pass**, so the journal says so in as many words and the rows pas
 are named nowhere durable. (A state dir that is unwritable for the
 record too leaves the PREVIOUS record in place: staleness, not a field, is that signal.)
 
-⛔ **`detail=` IS BOUNDED, SO IT LEADS WITH THE DIAGNOSIS AND NO SENTENCE IN IT NAMES A PATH.** The
+⛔ **`detail=` IS BOUNDED, SO IT LEADS WITH THE DIAGNOSIS AND NO SENTENCE INLINES THE ARTIFACT PATH.** The
 field is cut at 240 bytes, so *what comes last is what gets lost*: with the farm path first, a 92-char
 farm pushed the arm sentence past the bound (`…; RAW output published verba`) and a very long one left
 nothing but a path — the record then stated no diagnosis at all. The arm sentence now comes FIRST and

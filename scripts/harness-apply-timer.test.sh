@@ -1869,9 +1869,10 @@ printf 'stale-b.py | a | b | STALE\n' >&2
 printf 'stale-c.py | a | b | STALE\n' >&2
 # ⛔ A CLASS THIS PASS DOES NOT EXTRACT, ON PURPOSE (VGATE round 13, measured). Printing these as
 # `DECLARED-BUT-ABSENT` — a token the extractor KNOWS — made `matched` 5 while the stale count was 3,
-# so the fixture took the OVER-match/partial arm and the `:-0` regression stayed GREEN: it reds only
-# when the extractor under-matches to exactly the stale count, which is the shape a real lagging farm
-# produces. `ABSENT` is what a farmed copy with a renamed class actually prints.
+# so the `:-0` regression stayed GREEN: it reds only when the extractor's match equals the stale count,
+# which is the shape a real lagging farm produces. `ABSENT` is what a farmed copy with a renamed class
+# actually prints. NOTE: this fixture lands on the NOPROOF arm, not the over-match one — the
+# over-match arm has its own fixture, t24ai.
 printf 'owed-one.py | a | - | ABSENT\n' >&2
 printf 'owed-two.py | a | - | ABSENT\n' >&2
 printf 'check-farm-drift: DRIFT — 3 stale (3 farm-declared — a re-run must fix these; 0 outside the farm), 2 missing, 0 unsourced, of 5 deployed file(s) (3 sourced, 3 matching) against origin/main (sync) in %s.\n' "$PWD/src"
@@ -2006,6 +2007,40 @@ assert_contains "$(cat "$ROWS24AG" 2>/dev/null || true)" "laggard-20.py" \
 assert_contains "$OUT" "9 more line(s) of the instrument's output — ALL 21 are named in" \
     "T24 control: and the journal says 9 more of 21, all of them in the file"
 
+# ⛔ AN OVER-MATCH IS ITS OWN ARM AND WAS UNPINNED (review round 15, measured: changing `-ne` to `-lt`
+# left the suite at 403/0 while flipping the fail-closed arm to fail-open). The extractor matching MORE
+# rows than the instrument's summary counts means its vocabulary is too WIDE — a healthy row may be
+# named as drift — so the extraction is unproven and the raw output is published. Measured with this
+# fixture on the shipping code: header `n=unparsed (… MORE than the 2 …)`, `farm_n=unparsed`,
+# `detail="matched 3 row(s), MORE than the 2 …"`; under the `-lt` mutant: `n=3`, `farm_n=3`, and
+# `detail` certifies a list that includes a row the instrument's own summary does not count as drift.
+mk_origin t24ai; mk_clone t24ai
+REPO_P="$CLONE"; MODE_P=sync
+mkdir -p "$T/t24ai/home/.pi/agent/scripts"
+cat >"$T/t24ai/stub-overmatch.sh" <<'FARM'
+#!/usr/bin/env bash
+printf 'stale-a.py | a | b | STALE\n' >&2
+printf 'stale-b.py | a | b | STALE\n' >&2
+printf 'overcounted.py | a | - | DECLARED-BUT-ABSENT\n' >&2
+printf 'check-farm-drift: DRIFT — 2 stale (2 farm-declared — a re-run must fix these; 0 outside the farm), 0 declared-but-absent, 0 unsourced, of 3 deployed file(s) (3 sourced, 2 matching) against origin/main (sync) in %s.\n' "$PWD/src"
+exit 1
+FARM
+chmod +x "$T/t24ai/stub-overmatch.sh"
+OUT="$(HARNESS_APPLY_FARM_CHECKER="$T/t24ai/stub-overmatch.sh" run_pass "$T/t24ai" 2>&1)"; RC=$?
+assert_eq "$RC" "24" "T24 control: an OVER-match (extractor wider than the instrument's own count) is still RED (24)"
+ROWS24AI="$T/t24ai/state/harness-apply-farm-rows.txt"
+assert_contains "$(head -1 "$ROWS24AI" 2>/dev/null || true)" "MORE than the 2" \
+    "T24 control: the header says the extractor matched MORE than the instrument reports — never 'EXACTLY this run'"
+REC24AI="$(cat "$T/t24ai/state/harness-apply.status" 2>/dev/null || true)"
+assert_contains "$(grep '^farm_n=' <<<"$REC24AI")" "farm_n=unparsed" \
+    "T24 control: farm_n= is UNPARSED, so no numeric count certifies a too-wide extraction"
+assert_contains "$(grep '^detail=' <<<"$REC24AI")" "MORE than the 2" \
+    "T24 control: and detail= describes the over-match as an over-match, never as a shortfall"
+assert_contains "$(cat "$ROWS24AI" 2>/dev/null || true)" "overcounted.py" \
+    "T24 control: while the OVER-matched row is still named in the published RAW output"
+assert_absent "$(grep '^detail=' <<<"$REC24AI")" "every one named" \
+    "T24 control: and nothing certifies the too-wide list as complete"
+
 # ⛔ AN INSTRUMENT THAT PRINTS NOTHING IS ITS OWN STATE (review round 13, measured: the guard that skips
 # the excerpt was unasserted and survived; `printf '%s\n' ""` emits ONE blank line, so the journal grew
 # an empty `farm:   ` row and `detail=` still said "RAW output published verbatim" over a header-only
@@ -2026,6 +2061,11 @@ assert_contains "$(grep '^farm_n=' <<<"$REC24AH")" "farm_n=unparsed" \
     "T24 control: the count is UNPARSED, not 0, and not the farm-matched meaning"
 assert_absent "$(grep '^detail=' <<<"$REC24AH")" "published verbatim" \
     "T24 control: and detail= never says output was published when none was printed"
+# ⛔ AND THE FILE HOLDS NO BODY LINE AT ALL (review round 15, measured: `printf '%s\n' ""` emitted one
+# BLANK line, so the artifact was a header plus a stray empty row and `wc -l - 1` counted a row in the
+# one state where the pass says no name exists). Mutant: unguard the body write.
+assert_eq "$(tail -n +2 "$T/t24ah/state/harness-apply-farm-rows.txt" 2>/dev/null | wc -l | tr -d ' ')" "0" \
+    "T24 control: the mute artifact is a header and NOTHING else — no stray blank row for wc to count"
 # ⛔ AND `remedy=` IS NEVER `none` ON A REFUSAL (review round 14, measured: the record promised "with
 # the instrument's own remedy" while emitting `remedy=none`, because this stub prints no `Next:` block).
 # A refusal that names a defect and leaves nobody an action is the class the `remedy=` field exists for.

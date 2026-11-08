@@ -422,10 +422,13 @@ publish_farm_rows() {   # $1 body, $2 header note → sets REC_FARM_ROWS, FARM_R
     # (replacing it with `[ -n … ]` strands the temp inside the directory and reds T24r); the trailing
     # `[ -f ]` is DEFENCE IN DEPTH for the concurrent case and is stated as such (#3442).
     FARM_ROWS_OK=0
+    # ⛔ AN EMPTY BODY WRITES NO BODY LINE (review round 15, measured): `printf '%s\n' ""` emits one
+    # BLANK line, so the mute-instrument artifact was a header plus a stray empty row — a reader sizing
+    # the list with `wc -l - 1` counted a row in the one state where the pass says no name exists.
     if [ ! -d "$FARM_ROWS_FILE" ] \
        && { printf '# harness-apply farm drift rows — %s — ref=%s dest=%s %s\n' \
                 "$(date -u +%FT%TZ)" "$REF" "$FARM_DEST" "$_note" >"$FARM_ROWS_FILE.tmp-$$" 2>/dev/null \
-            && printf '%s\n' "$_body" >>"$FARM_ROWS_FILE.tmp-$$" 2>/dev/null; } \
+            && { [ -z "$_body" ] || printf '%s\n' "$_body" >>"$FARM_ROWS_FILE.tmp-$$" 2>/dev/null; }; } \
        && mv -f "$FARM_ROWS_FILE.tmp-$$" "$FARM_ROWS_FILE" 2>/dev/null \
        && [ -f "$FARM_ROWS_FILE" ]; then
         REC_FARM_ROWS="$FARM_ROWS_FILE"; FARM_ROWS_OK=1
