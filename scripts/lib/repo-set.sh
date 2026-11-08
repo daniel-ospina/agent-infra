@@ -578,11 +578,14 @@ repo_set_parse() {
   # path "does not exist", which it plainly does. An existing thing that is not a usable file is the
   # broken-file state (5), never the absent one (3).
   if [ ! -f "$f" ]; then
-    # ⛔ THE PARENTHETICAL NAMED ONE CAUSE FOR THREE STATES (review round 44, P2 — measured). It said "a
-    # directory at the config path cannot name repos", while a FIFO and a SOCKET reach this same arm and
-    # a FIFO very much can carry lines. Only a directory was armed (`j3`/`j4`), so the emitted sentence
-    # asserted an unverified specific — the "right code, wrong cause" shape the `-L` arm above was
-    # rewritten to avoid. The rule, stated as the rule.
+    # ⛔ THE PARENTHETICAL NAMED ONE CAUSE FOR ONE OF MANY STATES (review round 44, P2; the COUNT corrected
+    # in round 45 — measured). It said "a directory at the config path cannot name repos", while a FIFO
+    # and a SOCKET reach this same arm and a FIFO very much can carry lines. ⚠️ "three states" was also an
+    # undercount: MEASURED, SIX kinds reach it at rc 5 — directory, FIFO, socket, character device, and a
+    # symlink to any of them — which is why the message below is stated as the BOUNDARY ("not a regular
+    # file") and not as a list of kinds: any list goes stale the moment another kind appears. Only a
+    # directory was armed (`j3`/`j4`), so the old sentence asserted an unverified specific — the "right
+    # code, wrong cause" shape the `-L` arm above was rewritten to avoid. The rule, stated as the rule.
     _rs_say 2 "repo-set: INVALID — $f exists but is not a regular file (a repo set must be a regular file)."
     return 5
   fi
