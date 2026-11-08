@@ -249,7 +249,7 @@ $RW add --branch fix/moved-1 --worktree "$FIX/gone-forever" --dispatch d-moved -
 OUT="$($SCAN --apply 2>&1 || true)"
 git show-ref --verify --quiet refs/heads/fix/moved-1 && ok "a branch checked out in a live worktree is never CAS-deleted" || bad "the ref of a LIVE worktree's branch was deleted"
 assert_contains "$OUT" "CHECKED OUT in a live worktree" "the checked-out refusal is named AS the checked-out refusal"
-assert_contains "$OUT" "$FIX/wt-moved" "the refusal names the live worktree holding the branch"
+assert_contains "$OUT" "$(cd "$FIX/wt-moved" && pwd -P)" "the refusal names the live worktree holding the branch"
 assert_eq "$(wc -l < "$WORKTREES_RECORD" | tr -d ' ')" "1" "the record is kept when the ref is refused"
 $RW done --dispatch d-moved >/dev/null
 git worktree remove --force "$FIX/wt-moved" >/dev/null 2>&1 || true
@@ -458,6 +458,43 @@ EOS
     git branch -D fix/vanish-1 >/dev/null 2>&1 || true
     rm -rf "$FIX/vparent"
 fi
+
+
+# ── 2v. round-4 F1: a worktree whose DIRECTORY was `rm -rf`'d but whose REGISTRATION survives is a
+#     phantom — `git worktree list --porcelain` still reports it, with `prunable`. It must be
+#     reclaimed by ONE --apply (it was before this PR), must not be diagnosed as a live lane, and
+#     must not leave the record behind for ever.
+git worktree add -q "$FIX/wt-prunable" -b fix/prunable-1
+$RW add --branch fix/prunable-1 --worktree "$FIX/wt-prunable" --dispatch d-prunable --ts 2026-08-01T00:00:00Z >/dev/null
+rm -rf "$FIX/wt-prunable"
+OUT="$($SCAN --apply 2>&1 || true)"
+assert_not_contains "$OUT" "CHECKED OUT in a live worktree" "a prunable registration is not diagnosed as a live lane"
+git show-ref --verify --quiet refs/heads/fix/prunable-1 && bad "the phantom's branch was NOT reclaimed by --apply" || ok "a phantom registration (dir gone, registration kept) is reclaimed by one --apply"
+assert_eq "$(wc -l < "$WORKTREES_RECORD" | tr -d ' ')" "0" "the phantom's record is pruned"
+assert_not_contains "$(git worktree list --porcelain 2>/dev/null)" "wt-prunable" "the phantom registration is deregistered, not left behind"
+git branch -D fix/prunable-1 >/dev/null 2>&1 || true
+
+
+# ── 2w. and the tolerance in `delete_branch_cas` is its own line of defence: when the
+#     deregistration itself FAILS, the phantom is still in the listing, and the reclaim must
+#     still happen rather than reporting a live lane that does not exist.
+cat > "$FIX/shim/git" <<'EOS'
+#!/usr/bin/env bash
+case " $* " in
+  *" worktree remove "*prunable2*) exit 1 ;;
+esac
+exec "$GIT_WRAP_REAL" "$@"
+EOS
+chmod +x "$FIX/shim/git"
+git worktree add -q "$FIX/wt-prunable2" -b fix/prunable-2
+$RW add --branch fix/prunable-2 --worktree "$FIX/wt-prunable2" --dispatch d-prunable2 --ts 2026-08-01T00:00:00Z >/dev/null
+rm -rf "$FIX/wt-prunable2"
+OUT="$(PATH="$FIX/shim:$PATH" GIT_WRAP_REAL="$REAL_GIT" GIT_WRAP_REPO="$REPO" $SCAN --apply 2>&1 || true)"
+assert_not_contains "$OUT" "CHECKED OUT in a live worktree" "a phantom whose deregistration failed is still not a live lane"
+git show-ref --verify --quiet refs/heads/fix/prunable-2 && bad "a phantom blocked the reclaim when its deregistration failed" || ok "a phantom is reclaimed even when its deregistration fails"
+assert_eq "$(wc -l < "$WORKTREES_RECORD" | tr -d ' ')" "0" "and its record is pruned"
+git worktree prune >/dev/null 2>&1 || true
+git branch -D fix/prunable-2 >/dev/null 2>&1 || true
 
 # ── Summary ───────────────────────────────────────────────────────────────
 echo ""
