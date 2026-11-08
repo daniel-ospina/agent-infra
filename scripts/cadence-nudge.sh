@@ -125,11 +125,11 @@ LOCKPID="$LOCK.pid"
 # or unreadable pid is only reclaimable once the lock is OLDER than LOCK_AGE_GRACE ... the actuator was
 # permanently dead with a clean log"). Applied here:
 #   1. a pid is not an identity -- the holder's argv must NAME this script (`cadence-nudge.sh`, the
-#      same conjunction `cloud-cell-supervisor.sh:820-828` applies; the SHAPE
-#      `<shell> <…/cadence-nudge.sh>` is the FAST PATH, never the gate), AND the process must not have
-#      BEGUN after the record was written (`pid_began_after`). The two terms are needed for different
-#      failures: the name test rejects a pid that now belongs to something else entirely, the age
-#      fence rejects a pid RECYCLED onto a process that began later.
+#      same conjunction `cloud-cell-supervisor.sh:820-828` applies). TWO ARMS, DELIBERATELY NOT ONE
+#      CONJUNCTION (#3795 review cycle 8, P2 -- the prose here claimed an "AND" the code does not
+#      apply): the SHAPE `<shell> <…/cadence-nudge.sh>` short-circuits and is accepted immediately,
+#      and only the looser NAME arm is additionally fenced on the process not having BEGUN after the
+#      record was written (`pid_began_after`).
 #      ⛔ OVER-MATCHING IS DELIBERATE, AND IT IS WHY THE FALSE POSITIVE THE SUBSTRING FORM SHIPPED IS
 #      KEPT HERE (#3795 review cycle 7, P2 -- this rule used to claim the opposite of what the code
 #      does). A process that merely NAMES this file in its argv -- an editor with it open, `sleep 300
@@ -137,7 +137,8 @@ LOCKPID="$LOCK.pid"
 #      holder read as FOREIGN gets rule 4's 6-min grace, which is SHORTER than this file's own ~413 s
 #      critical section, so a run could be reclaimed mid-send. The over-match is fail-closed and
 #      bounded by rule 3's 20-min ceiling (its only cost is held ticks, never a duplicate send), and
-#      an undatable record also keeps the holder, for the same reason;
+#      an undatable record also keeps the holder, for the same reason. A false "foreign" is the one
+#      answer this predicate must never give;
 #   2. a genuine live holder is not taken over by AGE alone; it is taken over only by the ABSOLUTE
 #      CEILING in rule 3. Every skip is LOGGED, because a silent skip is how the floor died once;
 #   3. a genuine live holder past the 20-min ceiling IS taken over -- bounded, because past 2.7
@@ -212,7 +213,8 @@ _nudge_holder_state() {   # sets _hpid and _hstate ∈ absent|dead|unknown|prese
   fi
   return 0
 }
-_nudge_holder_is_ours() {  # rc 0 = _hpid is a live process that IS this script (SHAPE or NAME, plus AGE)
+_nudge_holder_is_ours() {  # rc 0 = _hpid is a live process that IS this script (SHAPE short-circuits;
+                          # otherwise NAME, then AGE -- see the two arms below, they are NOT one conjunction)
   local _pargs _sh _arg _lm _brc
   _pargs=$(ps -p "$_hpid" -o args= 2>/dev/null)
   [ -n "$_pargs" ] || return 1
@@ -223,6 +225,16 @@ _nudge_holder_is_ours() {  # rc 0 = _hpid is a live process that IS this script 
   IFS=' ' read -r _sh _arg _ <<<"$_pargs"
   # SHAPE first: `<shell> <…/cadence-nudge.sh>` is the exact form `cadence-timer.sh` invokes, and the
   # form cloud-cell-supervisor.sh:820-822 requires. It is the FAST PATH, never the GATE.
+  # ⛔ AND IT SHORT-CIRCUITS THE AGE FENCE BELOW, DELIBERATELY (#3795 review cycle 8, P2). This docstring
+  # and rule 1 used to read as one conjunction -- "SHAPE … AND the process must not have BEGUN after the
+  # record" -- which is what `cloud-cell-supervisor.sh:838-845` does. Here it is an OR-with-a-fence on
+  # ONE arm only, and the asymmetry is the fail-closed direction: a pid recycled onto a process whose
+  # argv is literally `<bash> <…/cadence-nudge.sh>` is a LATER invocation of THIS script, so reading it
+  # as the holder only holds the floor to the 20-min ceiling (harmless: it costs a delayed tick), while
+  # reading it as FOREIGN would hand the lock a 6-min grace that is SHORTER than this file's ~413 s
+  # critical section. The same reasoning is why a same-second `pid_began_after` answer must never be
+  # able to demote this arm: a false "foreign" is the only outcome here that can duplicate a send.
+  # The age fence therefore guards the NAME arm, where the alternative is trusting a bare substring.
   case "${_sh##*/}" in bash|sh|dash|zsh|ksh) case "${_arg##*/}" in cadence-nudge.sh) return 0 ;; esac ;; esac
   # ⛔ THE FALLBACK OVER-MATCHES ON PURPOSE, AND THE POLARITY IS THE WHOLE POINT. Under-matching is
   # the DANGEROUS direction here: a live holder read as "foreign" gets the 6-min grace, which is
@@ -347,9 +359,17 @@ now=$(date +%s)
 # cycle 7, P2). Say it plainly, because two readers depend on knowing which instant it is: `gap_min`
 # below and `orchestrator-heartbeat.sh:475`'s rate limiter both measure TICK-TO-TICK intervals, not
 # beat-to-beat ones. Stamping the TICK is what keeps the field honest -- the number is the instant this
-# pass DECIDED to send, and the pre-send distance to the actual submit is bounded by this file's own
-# budget (~181 s of checker session resolution plus the goal-state/objective reads; the table at the
-# receipt totals 413 s of window inside a 450 s interval).
+# pass DECIDED to send, and the pre-send distance to the actual submit is bounded by those parts of
+# this file's budget that HAVE a bound: ~181 s of checker session resolution plus the `goal-state.py`
+# watchdog (20 s + 3 s).
+# ⛔ AND NOT BY THE REST OF IT (#3795 review cycle 8, P2). The `objective.py` reads between here and
+# the send have NO timeout in this file -- the receipt's own budget note says so at "the pre-send work
+# this file cannot bound" and again at "the `objective.py` reads have no timeout in this file". So δ is
+# bounded by cmux/python behaviour and by those three unbounded calls, NOT by the 413 s window that
+# note totals (which is the VERIFICATION window, measured from a later instant). An earlier wording of
+# this paragraph said "bounded by this file's own budget", which contradicted the receipt; if
+# `objective.py` hangs, the lock is held past the 450 s interval, the next tick logs `lock-skip`, and
+# the beat drifts past the 9-min ceiling -- so the honest statement is the decomposition, not a bound.
 # ⛔ ITS MEASURED CONSEQUENCE, STATED RATHER THAN IMPLIED: beat spacing is `450 s + δ_k − δ_(k−1)`,
 # where δ is that pre-send distance, so two adjacent beats can sit closer together than `PULSE_MIN`
 # (measured on a two-tick fixture: stamp gap 61 s while the real sends were 35 s apart) and can also

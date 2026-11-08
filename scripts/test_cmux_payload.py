@@ -1846,7 +1846,18 @@ def test_cadence_nudge_lock_survives_a_concurrent_burst(tmp_path):
     nudges, appended = _new_nudge_lines(state, seed)
     assert len(nudges) == 1, (
         f"{len(nudges)} heartbeats left the box for one due window:\n{appended}")
-    assert "delivered=yes" in nudges[0] or "delivered=" in nudges[0], nudges[0]
+    # ⛔ THIS LINE USED TO ASSERT NOTHING (#3795 review cycle 8, P2). It read
+    # `"delivered=yes" in nudges[0] or "delivered=" in nudges[0]` — and the right-hand disjunct is
+    # unconditionally true, because `_new_nudge_lines` selects lines that contain `NUDGE at=` and the
+    # floor's only producer of that token always writes `delivered=` beside it. So the line read as a
+    # pin on the receipt's delivery field while being incapable of failing. This fixture binds no
+    # session (`_run_cadence_nudge(..., session=sent)` with no `sid`), so the honest field here is a
+    # NON-yes verdict with the verdict named beside it — which is what a burst that raced a lock must
+    # not be able to upgrade.
+    assert "delivered=yes" not in nudges[0], (
+        "a burst over one lock certified a delivery it cannot have verified:\n" + nudges[0])
+    assert "verdict=" in nudges[0], (
+        "the receipt does not name the verdict it carries:\n" + nudges[0])
 
 
 def test_cadence_nudge_does_not_report_a_prefix_as_delivered(tmp_path):
