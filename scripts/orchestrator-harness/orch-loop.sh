@@ -8865,6 +8865,15 @@ PY
       # controller's own `while` shape that arithmetic error aborts the enclosing loop, so the cycle
       # loop exits after ONE cycle with rc=0 (KeepAlive does not restart it). `10#` is the fix rather
       # than tightening `:2572`, because `08` plainly means eight minutes, not twenty.
+      # ⛔ AND THE CEILING IS THE CAP, NOT THE GUARD (fresh-context review, P2 — measured). Comparing
+      # against the guard left a BAND uncovered: every budget in `(cap, guard)` passed through
+      # UNCLAMPED, and the block's own residual (`budget + one attempt runtime`) then crossed the
+      # guard. Measured with `REFRESH_STALE_LOCK_MIN=1` (60 s guard), `REFRESH_RETRY_BUDGET_S=50`
+      # (accepted, 50 < 60, no clamp), `REFRESH_RETRY_BACKOFF_S=30` and a 20 s pass: the block slept
+      # and reported `70s of wall clock already spent … against the 1m stale-lock guard` — the reaped
+      # mid-run pass the lock exists to prevent, reported AFTER it was already past. On the shipped
+      # defaults the same band is 300–1200 s. `_budget_cap` IS that headroom made arithmetic (half the
+      # guard), so it is the correct comparand: a value above it is a value that cannot fit the window.
       _budget_cap=$(( 10#${REFRESH_STALE_LOCK_MIN:-20} * 60 / 2 ))
       [ "$_budget_cap" -gt 300 ] && _budget_cap=300
       if [ "$REFRESH_RETRY_BUDGET_S" -ge "$(( 10#${REFRESH_STALE_LOCK_MIN:-20} * 60 ))" ]; then
@@ -8915,7 +8924,7 @@ PY
             # to keep a retrying pass from outliving the stale-lock window, so an unmeasurable budget is
             # treated as SPENT: no further retry, and the refusal is REPORTED. A backwards clock step is
             # the same case (the read succeeds, the elapsed is negative) and takes the same branch.
-            # ⛔ `date +%s` is the SHIM TARGET for arm (b3c): that arm fails only `+%s` and delegates
+            # ⛔ `date +%s` is the SHIM TARGET for arm (b3d): that arm fails only `+%s` and delegates
             # every other date call, so this guard is graded rather than merely asserted.
             _now="$(date +%s 2>/dev/null)"
             case "$_now" in ''|*[!0-9]*) _now="" ;; esac

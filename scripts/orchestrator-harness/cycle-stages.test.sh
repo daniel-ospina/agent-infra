@@ -782,13 +782,20 @@ _nap_n="$(grep -cE '^[[:space:]]*stg_nap_mark([[:space:]]|$)' <<<"$_nap_region")
 # `stg_nap_mark`) left the suite at `RESULT: 128 passed, 0 failed`. The two fence counters above were
 # fixed and this one — grading the same class, in the same arm — was not, so "every pattern errs wide
 # on purpose" was false until this line changed.
-# ⛔ AND A NAIVE SWAP BREAKS A CORRECT TREE: the fork-starved nap in `orch-loop.sh` is ONE logical nap
-# over TWO physical lines (`fork_free_sleep $(( … )) \` / `|| sleep $(( … )) 2>/dev/null`), so
-# token-anywhere counts 5 for 4 naps and `_nap_n(3) >= 5-1` reds on correct code. Continuation lines
-# are therefore dropped BEFORE counting, which keys the count on the LOGICAL nap rather than on a
-# spelling — and a continuation line cannot host a nap of its own without a `||`/`&&` its parent lacks.
-_loop_code="$(grep -vE '^[[:space:]]*#' <<<"$_nap_region" | sed -E 's/"[^"]*"//g')"
-_loop_n="$(grep -vE '^[[:space:]]*(\|\||&&)' <<<"$_loop_code" | grep -cE '(^|[^[:alnum:]_])(fork_free_sleep|sleep)([^[:alnum:]_]|$)')"
+# ⛔ CONTINUATIONS ARE JOINED INTO ONE LOGICAL LINE, NOT DROPPED (fresh-context review, P1 — measured).
+# Dropping the lines that BEGIN with `||`/`&&` was this arm's first fix, and it re-created the very
+# under-count it was added to close: a nap written as a two-line conditional whose PARENT is not a nap
+# —
+#     false \
+#       || sleep 300
+# — has its nap line dropped and its parent contributes no token, so the nap left the population and
+# the suite stayed at `RESULT: 128 passed, 0 failed` (measured). The shipped fork-starved nap has the
+# same two-line SHAPE but the opposite meaning (one logical nap, counted once), so NO line-shape rule
+# can separate the two cases: the only sound reading is per LOGICAL line. Continuations are therefore
+# JOINED before counting, and `grep -c` then gives 4 on this tree and 5 with the conditional nap above.
+_loop_code="$(grep -vE '^[[:space:]]*#' <<<"$_nap_region" | sed -E 's/"[^"]*"//g' \
+  | awk '{ while (sub(/\\[[:space:]]*$/, "")) { if ((getline n) <= 0) break; $0 = $0 " " n } print }')"
+_loop_n="$(grep -cE '(^|[^[:alnum:]_])(fork_free_sleep|sleep)([^[:alnum:]_]|$)' <<<"$_loop_code")"
 ck "every nap path calls stg_nap_mark (${_nap_n} nap_mark sites for ${_loop_n} sleep/fork_free_sleep lines inside the controller loop — a path without one loses prev_wait; loop region ${_region_ok})" \
    "$(if [ "$_region_ok" -eq 1 ] && [ "${_nap_n:-0}" -ge 3 ] && [ "${_nap_n:-0}" -ge "$(( ${_loop_n:-0} - 1 ))" ]; then echo 0; else echo 1; fi)"
 

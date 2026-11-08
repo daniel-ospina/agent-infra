@@ -1974,6 +1974,29 @@ if [ -s "$T/refreshblock.sh" ] && grep -q 'refresh-candidates.sh' "$T/refreshblo
     || bad "orch-loop: a 3000s budget survived against a 60s stale-lock guard — $(grep 'TRANSIENT' "$BLR11/log" 2>/dev/null | tail -1)"
   [ "$n11" = "1" ] && ok "orch-loop: …and the over-guard budget makes ONE attempt, so nothing is slept" \
                     || bad "orch-loop: the over-guard budget still made $n11 attempt(s)"
+  # (b3e) THE CEILING IS THE CAP, NOT THE GUARD (fresh-context review, P2 — measured). Comparing the
+  # budget against the GUARD left a band uncovered: every value in `(cap, guard)` passed through
+  # unclamped, and the block's own residual (`budget + one attempt runtime`) then crossed the guard. A
+  # budget is a bound on SLEEP; the pass also RUNS. So the comparand has to be the headroom itself
+  # (`_budget_cap` = half the guard), not the guard. The lever is a budget of 50 against a 60 s guard:
+  # `(cap=30, guard=60)` contains it, so a guard-comparison accepts it unchanged and then sleeps past
+  # the window, while a cap-comparison clamps it to 30 and refuses on the FIRST attempt. It grades the
+  # BAND specifically, which (b3b) cannot: 3000 is above the guard, so BOTH comparands clamp it.
+  # Distinguishes on the count (1 vs 2) AND on the quoted budget (30s vs 50s). The backoff is 40 for
+  # that reason: at a 30 s backoff the FIRST sleep exactly fits a clamped 30 s budget (`>` is strict),
+  # so both revisions make 2 attempts and only the message differs — a weaker arm. At 40 the pre-fix
+  # block sleeps 40 s (2 attempts, outliving a 60 s guard once the pass's own runtime is added) while
+  # the fixed block refuses on the FIRST attempt with nothing slept.
+  BLR14="$T/retry14"; mkdir -p "$BLR14"; : > "$BLR14/candidates.txt"
+  printf '#!/bin/bash\nprintf "x" >> "%s/invoked"\nrefresh_record_write() { :; }\nexit 1\n' "$BLR14" > "$BLR14/refresh-candidates.sh"
+  O="$BLR14" LOG="$BLR14/log" REFRESH_STALE_LOCK_MIN=1 REFRESH_RETRY_BACKOFF_S=40 \
+    REFRESH_RETRY_MAX_ATTEMPTS=3 REFRESH_RETRY_BUDGET_S=50 bash "$T/refreshblock.sh" >/dev/null 2>&1
+  n14="$(wc -c < "$BLR14/invoked" | tr -d ' ')"
+  grep -q 'the 30s in-cycle retry budget is spent' "$BLR14/log" 2>/dev/null \
+    && ok "orch-loop: a budget INSIDE the (cap,guard) band is CLAMPED to the cap (50 -> 30s against a 60s guard)" \
+    || bad "orch-loop: a 50s budget survived against a 60s guard — the band is uncovered — $(grep 'TRANSIENT' "$BLR14/log" 2>/dev/null | tail -1)"
+  [ "$n14" = "1" ] && ok "orch-loop: …and the band budget makes ONE attempt, so the pass never outlives the guard" \
+                    || bad "orch-loop: the band budget slept past the guard ($n14 attempts) — the reaped-mid-run double-pass"
   # (b3c) A LEADING-ZERO GUARD IS NOT OCTAL (fresh-context review, P0 — measured). This block is the
   # file's FIRST octal-sensitive arithmetic use of REFRESH_STALE_LOCK_MIN, and that knob's only
   # validation is the digit-only `case` at `orch-loop.sh:2571-2572`, which ACCEPTS `08`/`09` because
