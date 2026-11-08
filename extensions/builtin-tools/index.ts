@@ -2144,17 +2144,45 @@ export type TaskChildState =
   /** The child produced ZERO completed messages: it died during startup and
    * never said anything, so whatever rides the result must never be read as an
    * empty answer. */
-  | "died-before-first-message";
+  | "died-before-first-message"
+  /** NO child process ever existed (a pre-spawn refusal, a provider halt, a
+   * circuit breaker). Distinct from every state above: there is no pid to
+   * probe and no transcript to read, so "it died" would be a false claim. */
+  | "never-started";
 
 /** The canonical liveness field set, present on EVERY `task` result `details`
  * (exported so a consumer imports the vocabulary instead of re-enumerating it,
- * and so the suites assert against the same list the composer emits). */
+ * and so the suites assert against the same list the composer emits).
+ *
+ * TWO producers fill it, because a `task` call has two layers of failure:
+ *   * `doResolve` inside `spawnSubAgent` — a child DID run, so the values are
+ *     measured (pid, terminal state, message count);
+ *   * `stampLivenessDefaults` at the TOOL layer — no child ran at all (a
+ *     pre-spawn refusal / provider halt), or every attempt resolved with no
+ *     output so the retry wrapper produced the result. The keys are still
+ *     PRESENT, carrying `null`/`never-started`, because the contract a
+ *     consumer imports is presence: a missing key and "no child existed" are
+ *     not the same claim, and a consumer that has to branch on absence is back
+ *     to reconstructing the signal itself. */
 export const TASK_LIVENESS_DETAIL_KEYS = [
   "childPid",
   "childState",
   "childExited",
   "childMessagesSent",
 ] as const;
+
+/** Fill the liveness keys onto a TOOL-LEVEL result that never got them from a
+ * spawn. ONLY fills absent keys — a value the spawn path measured always wins,
+ * so this can be applied at a single choke point without erasing evidence. */
+export function stampLivenessDefaults(details: Record<string, unknown>): Record<string, unknown> {
+  const out = { ...details };
+  if (!("childPid" in out)) out.childPid = null;
+  if (!("childState" in out)) out.childState = "never-started";
+  // `null`, not `false`: "no child existed" is not "the child was seen alive".
+  if (!("childExited" in out)) out.childExited = null;
+  if (!("childMessagesSent" in out)) out.childMessagesSent = null;
+  return out;
+}
 
 /** #1208: how many messages the child is known to have sent, or `null` when the
  * child never ran the heartbeat emitter and the parent therefore has NO
@@ -4313,18 +4341,35 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
           // Without this the parent got `Sub-agent exited with code 0` — the
           // exact collapse the issue was filed for: a dead child's result read
           // as a completed one.
+          //
+          // ⛔ PREPEND, NEVER REPLACE (review of this PR, P2 — a real defect in
+          // the first cut). On this arm stdout is empty, so `finalize`'s composed
+          // text IS the child's cleaned STDERR (`const text = output ||
+          // stderrClean || …`) and the arm carries no `details.stderr`. Replacing
+          // it destroyed the only diagnostic the parent had, so a death caused by
+          // an auth or provider error reported "re-dispatch it" with the cause
+          // gone — and, worse, it was fail-SILENT in the failover layer:
+          // `connectionErrorDetected` reads `details.stderr` and falls back to the
+          // content, so #152's fallback and #476's markerless-hop branch could no
+          // longer see the signature for any such death. Keeping the composed
+          // text below the header preserves both.
+          const composed = (value.content ?? [])
+            .map((part: any) => (typeof part?.text === "string" ? part.text : ""))
+            .join("\n")
+            .trim();
           details.status = "died-before-first-message";
           details.isError = true;
+          const header =
+            `\u26d4 Sub-agent died before its first message \u2014 it completed 0 turns and returned no result ` +
+            `(pid ${details.childPid ?? "unknown"}, exit ${details.exitCode ?? "not recorded"}).\n\n` +
+            `This is NOT an empty answer. Nothing the child was asked to do was performed: no message was ` +
+            `ever emitted, so there is no verdict, no report and no "nothing to say" to read here. ` +
+            `Re-dispatch it, or investigate the child's transcript before assuming the work happened.`;
           value = {
             content: [
               {
                 type: "text",
-                text:
-                  `\u26d4 Sub-agent died before its first message \u2014 it completed 0 turns and returned no result ` +
-                  `(pid ${details.childPid ?? "unknown"}, exit ${details.exitCode ?? "not recorded"}).\n\n` +
-                  `This is NOT an empty answer. Nothing the child was asked to do was performed: no message was ` +
-                  `ever emitted, so there is no verdict, no report and no "nothing to say" to read here. ` +
-                  `Re-dispatch it, or investigate the child's transcript before assuming the work happened.`,
+                text: composed ? `${header}\n\n--- what the child left behind ---\n${composed}` : header,
               },
             ],
             details,
@@ -5365,11 +5410,15 @@ function classifyBackgroundOutcome(
   if (d.killed === true) {
     return { status: "cut", exitCode, reason: typeof d.reason === "string" ? d.reason : "killed" };
   }
-  if (d.isError === true) {
-    return { status: "failed", exitCode, reason: typeof d.reason === "string" ? d.reason : "spawn-error" };
-  }
+  // #1208 review (P3): the STATUS arm must precede the `isError` arm. A background lane that died
+  // before its first message carries BOTH, and testing `isError` first recorded it as
+  // `reason: "spawn-error"` — which this module documents as "pi never started". A child that ran
+  // and died is not a spawn error, and the durable record would name the wrong cause.
   if (typeof d.status === "string" && FAILED_TASK_STATUS.has(d.status)) {
     return { status: "failed", exitCode, reason: d.status };
+  }
+  if (d.isError === true) {
+    return { status: "failed", exitCode, reason: typeof d.reason === "string" ? d.reason : "spawn-error" };
   }
   if (typeof exitCode === "number" && exitCode !== 0) {
     return { status: "failed", exitCode, reason: "non-zero-exit" };
@@ -6274,13 +6323,16 @@ export default function (pi: ExtensionAPI) {
           })
         : { leg: { provider, model }, halted: false, hop: null, family: undefined };
       if (failoverResolution.halted) {
-        return haltDispatchResult({
+        // #1208: a PRE-SPAWN halt never created a child, so the liveness field set says exactly
+        // that (`never-started`, pid null) rather than being absent — see stampLivenessDefaults.
+        const halt = haltDispatchResult({
           family: failoverResolution.family!,
           provider,
           model,
           reason: failoverResolution.haltReason ?? "halt",
           state: readLatchState(subAgentEnv),
         });
+        return { ...halt, details: stampLivenessDefaults(halt.details) };
       }
       const family = failoverResolution.family; // undefined = not a chain member
       let dispatchLeg: LegRef = failoverResolution.leg;
@@ -6338,29 +6390,41 @@ export default function (pi: ExtensionAPI) {
           const msg = err instanceof Error ? err.message : String(err);
           return {
             content: [{ type: "text", text: `❌ Sub-agent dispatch refused: invalid child session id — ${msg}` }],
-            details: { model, provider, status: "invalid-session-id", retryable: false, error: msg },
+            details: stampLivenessDefaults({ model, provider, status: "invalid-session-id", retryable: false, error: msg }),
           };
         }
       }
       type DispatchPayload = { content: any[]; details: Record<string, unknown>; isError?: boolean };
+      // #1208: EVERY `task` result carries the liveness field set — including the arms where no
+      // child ever existed (a pre-spawn refusal / provider halt) and the arm the retry wrapper
+      // produces after every attempt resolved with no output. Those get `never-started` / `null`,
+      // which is a DIFFERENT claim from a measured one and must not be absent (review of this PR,
+      // P2: the field set was documented as present on every result while the tool-level arms —
+      // including the issue's own "child killed with no output" path — carried none).
+      const stampToolLiveness = (value: DispatchPayload): DispatchPayload => ({
+        ...value,
+        details: stampLivenessDefaults(value.details ?? {}),
+      });
       // #783 Task 1: a dispatch that could not persist a transcript is still a
       // dispatch (the tool result is real), but the degradation must be
       // visible AND non-retryable — a retry cannot fix an unwritable root.
       const withSessionDegraded = (value: DispatchPayload): DispatchPayload =>
-        sessionRootStatus.ok
-          ? value
-          : {
-              ...value,
-              details: {
-                ...value.details,
-                sessionDegraded: {
-                  reason: "task-session-root-unwritable",
-                  error: sessionRootStatus.error ?? "unknown",
-                  root: sessionRootStatus.root,
-                  retryable: false,
+        stampToolLiveness(
+          sessionRootStatus.ok
+            ? value
+            : {
+                ...value,
+                details: {
+                  ...value.details,
+                  sessionDegraded: {
+                    reason: "task-session-root-unwritable",
+                    error: sessionRootStatus.error ?? "unknown",
+                    root: sessionRootStatus.root,
+                    retryable: false,
+                  },
                 },
               },
-            };
+        );
       const buildArgs = (leg: LegRef): string[] =>
         ["-p", "--provider", leg.provider, "--model", leg.model, ...childSessionArgs(), params.prompt];
       // #783 Task 4: per-ATTEMPT record identity. `retry()` passes the attempt
@@ -6422,7 +6486,7 @@ export default function (pi: ExtensionAPI) {
       if (sessionIdError) {
         return {
           content: [{ type: "text", text: `❌ Sub-agent dispatch refused: invalid child session id — ${sessionIdError}` }],
-          details: { model, provider, status: "invalid-session-id", retryable: false, error: sessionIdError },
+          details: stampLivenessDefaults({ model, provider, status: "invalid-session-id", retryable: false, error: sessionIdError }),
         };
       }
 

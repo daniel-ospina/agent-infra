@@ -12,7 +12,7 @@
  * node_modules/typebox. Created by CI setup or manually.
  */
 
-import { stripHtml, getPerplexityKey, augmentPath, PATH_EXTRA_DIRS, getPiInvocation, getSubAgentPath, resolveProviderModel, loadModelRegistry, getModelsJsonPath, getExitGraceMs, DEFAULT_EXIT_GRACE_MS, armExitWatchdog, getExitCompleteGraceMs, DEFAULT_EXIT_COMPLETE_GRACE_MS, armCompletionWatchdog, composeTaskResult, getFallbackModel, DEFAULT_FALLBACK_MODEL, connectionErrorDetected, shouldFallback, resolveProviderBaseUrl, HEARTBEAT_MARKER_PREFIX, HEARTBEAT_INTERVAL_MIN_MS, HEARTBEAT_INTERVAL_MAX_MS, DEFAULT_HEARTBEAT_INTERVAL_MS, DEFAULT_STREAM_STALL_MS, DEFAULT_TOOL_STALL_MS, DEFAULT_FIRST_MESSAGE_MS, clampHeartbeatIntervalMs, getHeartbeatIntervalMs, getStreamStallMs, getToolStallMs, getFirstMessageMs, createHeartbeatState, parseHeartbeatLine, flushHeartbeatResidue, flushHeartbeatLineBuf, ingestHeartbeatChunk, heartbeatKillDecision, HEARTBEAT_LINE_BUF_MAX, HEARTBEAT_TRACE_MAX, getTaskMaxDispatchMs, getTaskHardCapMs, DEFAULT_HARD_CAP_MS, loadScaledBound, getFirstOutputTimeoutMs, getSystemLoad, setLoad1Override, getLoad1, getCutGapMs, getEffectiveCutGapMs, getCpuStallMs, DEFAULT_CPU_STALL_MS, DEFAULT_PROGRESS_AGE_MS, getProgressAgeMs, classifyTaskExit, getTaskBackstopMs, DEFAULT_BACKSTOP_MARGIN_MS, DEFAULT_TASK_MODEL, renderRepoStateLine, renderMachineStateLine, countPiProcs, countPiInPsOutput, formatLoad1, probeSystemLoad, resolveTaskCwd, taskCwdRefusal, spawnSubAgent, resolveStreamStallMs, streamStallInertWarning, inFlightProgress, DEFAULT_SESSION_CEILING_MULT, resolveSessionCeiling, isDispatchSaturated, saturationNotice, dispatchSaturationRefusal, probeDispatchSaturation, probePiProcs, setPiProcsOverride, classifyChildLiveness, childMessagesSent, TASK_LIVENESS_DETAIL_KEYS } from "./index.js";
+import { stripHtml, getPerplexityKey, augmentPath, PATH_EXTRA_DIRS, getPiInvocation, getSubAgentPath, resolveProviderModel, loadModelRegistry, getModelsJsonPath, getExitGraceMs, DEFAULT_EXIT_GRACE_MS, armExitWatchdog, getExitCompleteGraceMs, DEFAULT_EXIT_COMPLETE_GRACE_MS, armCompletionWatchdog, composeTaskResult, getFallbackModel, DEFAULT_FALLBACK_MODEL, connectionErrorDetected, shouldFallback, resolveProviderBaseUrl, HEARTBEAT_MARKER_PREFIX, HEARTBEAT_INTERVAL_MIN_MS, HEARTBEAT_INTERVAL_MAX_MS, DEFAULT_HEARTBEAT_INTERVAL_MS, DEFAULT_STREAM_STALL_MS, DEFAULT_TOOL_STALL_MS, DEFAULT_FIRST_MESSAGE_MS, clampHeartbeatIntervalMs, getHeartbeatIntervalMs, getStreamStallMs, getToolStallMs, getFirstMessageMs, createHeartbeatState, parseHeartbeatLine, flushHeartbeatResidue, flushHeartbeatLineBuf, ingestHeartbeatChunk, heartbeatKillDecision, HEARTBEAT_LINE_BUF_MAX, HEARTBEAT_TRACE_MAX, getTaskMaxDispatchMs, getTaskHardCapMs, DEFAULT_HARD_CAP_MS, loadScaledBound, getFirstOutputTimeoutMs, getSystemLoad, setLoad1Override, getLoad1, getCutGapMs, getEffectiveCutGapMs, getCpuStallMs, DEFAULT_CPU_STALL_MS, DEFAULT_PROGRESS_AGE_MS, getProgressAgeMs, classifyTaskExit, getTaskBackstopMs, DEFAULT_BACKSTOP_MARGIN_MS, DEFAULT_TASK_MODEL, renderRepoStateLine, renderMachineStateLine, countPiProcs, countPiInPsOutput, formatLoad1, probeSystemLoad, resolveTaskCwd, taskCwdRefusal, spawnSubAgent, resolveStreamStallMs, streamStallInertWarning, inFlightProgress, DEFAULT_SESSION_CEILING_MULT, resolveSessionCeiling, isDispatchSaturated, saturationNotice, dispatchSaturationRefusal, probeDispatchSaturation, probePiProcs, setPiProcsOverride, classifyChildLiveness, childMessagesSent, TASK_LIVENESS_DETAIL_KEYS, stampLivenessDefaults } from "./index.js";
 import { dispatchUnkeyedSet } from "../shared/provider-failover.js";
 import { asyncRepoState } from "../repo-freshness.js";
 import builtinTools from "./index.js";
@@ -8901,7 +8901,15 @@ testAsync("#1208 (E2E): a child that exits 0 with zero completed messages is a D
     equal(dd.childExited, true, "the child is known to be gone");
     ok(TASK_LIVENESS_DETAIL_KEYS.every((k) => k in dd), `all of ${TASK_LIVENESS_DETAIL_KEYS.join(",")} are present`);
     ok(String((died as any).content?.[0]?.text).includes("died before its first message"), "the text SAYS it, so the model cannot read it as an empty answer");
-    ok(!String((died as any).content?.[0]?.text).includes("exited with code 0"), "the old 'exited with code 0' wording (the exact collapse) is gone");
+    // ⛔ THE COMPOSED TEXT SURVIVES THE REWRITE (review of this PR, P2 — the first cut REPLACED it).
+    // On this arm stdout is empty, so the composer's text IS the child's cleaned stderr, and the arm
+    // carries no details.stderr: replacing it deleted the only diagnostic the parent had.
+    ok(String((died as any).content?.[0]?.text).includes("Sub-agent exited with code 0"), "the composer's own text is still there, below the header");
+    ok(
+      String((died as any).content?.[0]?.text).indexOf("died before its first message") <
+        String((died as any).content?.[0]?.text).indexOf("Sub-agent exited with code 0"),
+      "the death header comes FIRST and the diagnostic follows",
+    );
 
     // THE NEGATIVE TWIN: same exit, same empty stdout — one completed turn.
     // It must NOT be an error and must NOT claim the child died silently.
@@ -8920,6 +8928,70 @@ testAsync("#1208 (E2E): a child that exits 0 with zero completed messages is a D
     else process.env.DISPATCH_LEDGER = savedLedger;
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+testAsync("#1208 (E2E): the rewrite keeps the child's STDERR diagnostic — and the failover layer can still see it", async () => {
+  // The fail-SILENT half of the reviewer's P2: `connectionErrorDetected` reads `details.stderr`
+  // and falls back to the CONTENT, so a rewrite that discarded the composed text would make
+  // #152's fallback and #476's markerless-hop branch blind to every startup death that carried a
+  // connection-error signature. This drives the real path with a child that emits nothing but a
+  // ready marker and a connection error on stderr, then exits 1.
+  const dir = mkdtempSync(join(tmpdir(), "t1208-diag-"));
+  const shimDir = join(dir, "bin");
+  mkdirSync(shimDir, { recursive: true });
+  writeFileSync(
+    join(shimDir, "pi"),
+    `#!/bin/sh\necho "[task-heartbeat] ready nonce=${'${TASK_HEARTBEAT_NONCE:-}'}" >&2\necho "Error: Connection error." >&2\nexit 1\n`,
+    { mode: 0o755 },
+  );
+  const savedPath = process.env.PATH ?? "";
+  const savedArgv1 = process.argv[1];
+  const savedLedger = process.env.DISPATCH_LEDGER;
+  try {
+    process.env.PATH = `${shimDir}:${savedPath}`;
+    process.argv[1] = undefined as unknown as string;
+    process.env.DISPATCH_LEDGER = "0";
+    const env: Record<string, string | undefined> = {
+      ...process.env,
+      PATH: process.env.PATH,
+      TASK_HEARTBEAT: "1",
+      DISPATCH_LEDGER: "0",
+    };
+    const res = await spawnSubAgent("deepseek-v4-flash", "deepseek", env, ["-p", "--no-session", "boom"]);
+    ok(res, "settles");
+    const text = String((res as any).content?.[0]?.text ?? "");
+    equal((res as any).details?.childState, "died-before-first-message", "the death state still fires (ready, no turn_end)");
+    ok(text.includes("Connection error"), `the child's own stderr survives the rewrite (got: ${text.slice(0, 200)})`);
+    equal(
+      connectionErrorDetected(res as any),
+      true,
+      "the failover detectors can still see the signature — this is the regression the rewrite caused",
+    );
+  } finally {
+    process.env.PATH = savedPath;
+    process.argv[1] = savedArgv1;
+    if (savedLedger === undefined) delete process.env.DISPATCH_LEDGER;
+    else process.env.DISPATCH_LEDGER = savedLedger;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("#1208: the field set is PRESENT on arms where no child ever existed — never-started, not absent", () => {
+  // The other half of the reviewer's P2: the exported contract says the keys are present on every
+  // `task` result, and the tool-level arms (pre-spawn refusals, provider halts, the retry
+  // exhaustion result) carried NONE. `null`/`never-started` is a different CLAIM from a measured
+  // value — and a consumer that branches on absence is reconstructing the signal again.
+  const stamped = stampLivenessDefaults({ model: "m", provider: "p", status: "invalid-cwd" });
+  equal(stamped.childState, "never-started", "no child existed, and the field says so");
+  equal(stamped.childPid, null, "there is no pid to guess");
+  equal(stamped.childExited, null, "`null` — not `false`: no child was ever seen alive either");
+  equal(stamped.childMessagesSent, null, "no message count is knowable without a child");
+  ok(TASK_LIVENESS_DETAIL_KEYS.every((k) => k in stamped), "all keys present");
+  // ONLY fills absent keys: a measured value must never be overwritten by the tool layer.
+  const measured = stampLivenessDefaults({ childPid: 4242, childState: "completed", childExited: true, childMessagesSent: 3 });
+  equal(measured.childPid, 4242, "a measured pid survives");
+  equal(measured.childState, "completed", "a measured state survives");
+  equal(measured.childMessagesSent, 3, "a measured count survives");
 });
 
   for (const t of asyncTests) await t();
