@@ -1,0 +1,360 @@
+#!/usr/bin/env python3
+"""lane-relaunch.py — restart a dead lane's `pi` in its EXISTING cmux workspace. Never destructively.
+
+WHY THIS EXISTS (issue #942, measured 2026-09-26 twice in one session)
+    `cmux respawn-pane` is the *correct* tool for unwedging a session — it restarts the pane's
+    process without discarding the workspace — and that is exactly what makes it dangerous: if the
+    command it launches FAILS (a binary missing from the respawn PATH, a wrapper that cannot find
+    `node`), the pane's process terminates, the surface closes, and because it was the workspace's
+    only surface **the workspace is removed**. The failure then presents one step later as
+    `not_found: Workspace not found`, which does not point back at the respawn. Two workspaces were
+    destroyed that way, and a later controlled repro destroyed a scratch workspace with
+    `--command "pi --help"`.
+
+    ⛔ SO THIS TOOL DOES NOT CALL IT — not on any path, not even on a failure path. It relaunches the
+    way the fleet's own recovery procedure did when it recovered 14 lanes: it types the launch line
+    into the pane's OWN login shell, where the user's PATH and exported environment are present (the
+    respawn environment is `login -flp … /bin/bash --noprofile --norc`, i.e. no profile, no user
+    PATH, no exported keys — the second aggravating factor in #942). If the launch line fails there,
+    you get a shell prompt back. Nothing is destroyed.
+
+    That is also the convention of the multiplexer this one is modelled on: tmux makes pane
+    destruction on child exit OPT-IN (`remain-on-exit` keeps a "dead pane"), and an application is
+    started in an existing pane by `send-keys` into the pane's shell — `respawn-pane` after a
+    `send-keys` restart would restart the SHELL, not the application (tmux wiki, tmux(1),
+    tmuxp#139). We cannot give cmux `remain-on-exit`; we can stop depending on the destructive verb.
+
+WHY IT REFUSES SO MUCH
+    Typing a command into a pane is only safe when the pane is demonstrably at a shell. The refusals
+    are the design, and each one is a state this fleet has actually been burned by:
+
+      * pane unreadable            -> UNKNOWN. Never act on an unknown (exit 3).
+      * `Working` in the pane      -> a turn is in flight; typing injects text into a RUNNING MODEL
+                                      (the same class as sending into a busy lane, #1187/#941).
+      * no shell prompt visible    -> the pane is not at a bare shell (a pi footer, a pager, an editor).
+                                      Requires a POSITIVE prompt match: a negative list fails open.
+      * no transcript for the id   -> the stored resume target can point at a session file that does
+                                      not exist (#942's aggravating factor 2). Resuming from it would
+                                      start an EMPTY session that LOOKS like a restore. `--new` is the
+                                      explicit way to say "yes, a fresh session".
+      * no cwd / no `pi` binary    -> a launch line that cannot work is the failure mode we are
+                                      avoiding; refuse here instead of after the send.
+
+    And the confirmation is the fleet's own proof standard (`docs/ops/outcome-canary.md:102`): the
+    session transcript must ADVANCE, not merely look alive. A relaunch that restarted nothing reads
+    UNCONFIRMED (exit 4), never OK.
+
+USAGE
+    lane-relaunch.py --ws <workspace-uuid> [--label <lane-label>] [--cwd <dir>]
+                     [--session <id>] [--new] [--pi <path>] [--wait 45] [--dry-run] [--json]
+
+EXIT
+    0  CONFIRMED    the launch line was sent AND the session transcript advanced
+    3  REFUSED      a guard refused; nothing was sent (the message names the guard)
+    4  UNCONFIRMED  the line was sent (or the send failed) and no advance was observed
+    2  usage error
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shlex
+import shutil
+import subprocess
+import sys
+import time
+
+SCRIPTS = os.path.dirname(os.path.abspath(__file__))
+
+# ⛔ THE VERBS THIS TOOL MUST NEVER EMIT. `respawn-pane` deletes the workspace when its command
+# fails (#942); `close-workspace`/`terminal close` are the explicit versions of the same loss; and a
+# "kill the process first" step (`kill-pane`, or a `pkill` on the pane's pid) is the same idea by
+# another name. Kept as ONE list because it is checked on EVERY argv the tool builds, on every path
+# including refusals, and pinned by a test — a tool that can grow a destructive arm silently is the
+# defect it was written to remove.
+FORBIDDEN_VERBS = (
+    "respawn-pane", "respawn_pane", "respawnpane",
+    "close-workspace", "close_workspace", "workspace close",
+    "kill-pane", "kill_pane", "terminal close",
+)
+
+# cmux's response deadline. Measured (safe-send.sh): `cmux workspace list` takes 0.2-2s on a quiet
+# box and 13.4-15.1s at load 130+, against a fixed 15s CLI deadline — so a slow answer is
+# indistinguishable from a hang. 60s removes the ambiguity for our send/read.
+os.environ.setdefault("CMUXTERM_CLI_RESPONSE_TIMEOUT_SEC", "60")
+
+# A shell prompt is POSITIVE evidence and it is the LAST line that carries it. pi's TUI footer
+# (`… /800k  -flash • high`) does not end in any of these, which is what makes this discriminator
+# work without duplicating the fleet's footer vocabulary (orchestrator-heartbeat.sh owns that).
+# ⛔ `>` IS DELIBERATELY ABSENT: pi draws `> ` as its INPUT line, so accepting it would read a live
+# pi as a bare shell and type the launch line into a running session. Each tail below is one a
+# login shell draws and pi does not.
+PROMPT_TAILS = ("$", "%", "#", "❯", "»")
+
+
+def _load_lane_status():
+    """Import lane-status.py by path (its filename has a dash, so not a normal import).
+
+    REUSED, never re-implemented: `session_file`, `resolve_session`, `read_screen`, `ui_working`
+    and `workspace_cwds` are the fleet's own resolution and probe primitives. Two copies of
+    "which session is this lane on" is how the last two liveness defects were born.
+    """
+    import importlib.util
+    path = os.path.join(SCRIPTS, "lane-status.py")
+    spec = importlib.util.spec_from_file_location("lane_status", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _runner(argv, timeout=60):
+    """`(rc, stdout, stderr)`. Module-level so tests inject a fake cmux instead of driving one."""
+    try:
+        p = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+        return p.returncode, p.stdout or "", p.stderr or ""
+    except Exception as exc:                                    # noqa: BLE001
+        return None, "", "%s: %s" % (type(exc).__name__, exc)
+
+
+RUNNER = _runner
+
+
+def _has_prompt(screen: str) -> bool:
+    """True only if the LAST non-empty line of the pane ends with a shell-prompt character."""
+    lines = [ln.rstrip() for ln in (screen or "").splitlines() if ln.strip()]
+    if not lines:
+        return False
+    return lines[-1].endswith(PROMPT_TAILS)
+
+
+def _live_pi_record(ws, runner, timeout=45):
+    """True/False/None — is there a LIVE pi session record bound to this workspace?
+
+    The SECOND, orthogonal half of the fleet's own DEAD definition: `orchestrator-heartbeat.sh`
+    calls a lane DEAD only when it has BOTH `pid_exists=no` in `cmux sessions list` AND a bare shell
+    in the pane. A relaunch is safe under exactly that conjunction, so this tool asks for both — a
+    pane-only read can be fooled by output whose last line happens to end in `$`.
+
+    None is UNREADABLE, and an empty list is not an answer (the fleet's own rule): a roster we could
+    not read must never be quoted as "no live pi".
+    """
+    rc, out, err = runner(["cmux", "sessions", "list"], timeout)
+    if rc != 0 or not (out or "").strip():
+        return None
+    want = str(ws).strip().upper()
+    for ln in out.splitlines():
+        if "pid_exists=yes" not in ln or "workspace=" not in ln:
+            continue
+        got = ln.split("workspace=")[1].split()[0].strip().strip(',').upper()
+        if got == want:
+            return True
+    return False
+
+
+def _forbidden_in(argv) -> str:
+    blob = " ".join(str(a) for a in argv)
+    for v in FORBIDDEN_VERBS:
+        if v in blob:
+            return v
+    return ""
+
+
+def _stat(path):
+    try:
+        s = os.stat(path)
+        return (s.st_mtime, s.st_size)
+    except Exception:                                            # noqa: BLE001
+        return None
+
+
+def relaunch(ws, label="", cwd=None, session=None, pi=None, new=False, wait=45.0,
+             dry_run=False, ls=None, runner=None, sleep=time.sleep, clock=time.time):
+    """Return an observation dict. Every field is measured; nothing here infers success."""
+    runner = runner or RUNNER
+    obs = {"ws": ws, "label": label, "action": None, "sent": False, "confirmed": False,
+           "refused": False, "reason": "", "argv": None, "line": None, "elapsed_s": 0.0}
+    t0 = clock()
+
+    def refuse(reason):
+        obs["refused"] = True
+        obs["reason"] = reason
+        obs["elapsed_s"] = round(clock() - t0, 1)
+        return obs
+
+    ls = ls or _load_lane_status()
+
+    # ── 1. the pane must be READABLE. Unreadable is UNKNOWN, and UNKNOWN never gets a keystroke.
+    try:
+        screen = ls.read_screen(ws, lines=14) or ""
+    except Exception as exc:                                     # noqa: BLE001
+        return refuse("pane read RAISED (%s) — state UNKNOWN; nothing sent" % exc.__class__.__name__)
+    if not screen.strip():
+        return refuse("pane UNREADABLE (empty read) — state UNKNOWN; nothing sent")
+
+    # ── 2. a turn in flight takes the text as STEERING into a live model, not as a command.
+    try:
+        if ls.ui_working(ws):
+            return refuse("pane shows `Working` — a turn is in flight; a launch line typed now "
+                          "would be injected into the running session")
+    except Exception:                                            # noqa: BLE001
+        return refuse("spinner probe RAISED — busy/idle UNKNOWN; nothing sent")
+
+    # ── 3. POSITIVE evidence that the pane is at a shell. A negative test fails open.
+    if not _has_prompt(screen):
+        return refuse("no shell prompt at the last pane line — the pane is not at a bare shell "
+                      "(a pi footer, a pager or a full-screen tool would take the text); nothing sent")
+
+    # ── 3b. ...and NO live pi session record for this workspace. The pane read alone can be fooled
+    # by any output whose last line ends in a prompt character; this is the orthogonal half of the
+    # fleet's own DEAD definition (heartbeat: record AND pane). Unreadable is UNKNOWN -> refuse.
+    live = _live_pi_record(ws, runner)
+    if live is None:
+        return refuse("`cmux sessions list` unreadable — cannot rule out a LIVE pi in this pane; "
+                      "an unread read is not a licence to type into it; nothing sent")
+    if live:
+        return refuse("a LIVE pi session record is bound to this workspace — it is not dead; "
+                      "relaunching would inject text into the running session")
+
+    # ── 4. the session must RESOLVE TO AN EXISTING TRANSCRIPT (#942 aggravating factor 2).
+    sid, fresh = session, False
+    if not sid:
+        try:
+            sid = ls.resolve_session(ws) or None
+        except Exception as exc:                                 # noqa: BLE001
+            return refuse("session resolve RAISED (%s) — UNKNOWN; nothing sent"
+                          % exc.__class__.__name__)
+    path = None
+    if sid:
+        try:
+            path = ls.session_file(sid)
+        except Exception:                                        # noqa: BLE001
+            path = None
+    if not new and not path:
+        return refuse("session %r has NO transcript on disk — the stored resume target can be stale, "
+                      "and resuming from it would start an EMPTY session that looks like a restore. "
+                      "Pass --new to start a fresh session deliberately." % (sid,))
+    if new:
+        sid, path, fresh = None, None, True
+
+    # ── 5. the launch cwd. A relaunch into the WRONG cwd is a silent side effect.
+    if not cwd:
+        try:
+            cwd = (ls.workspace_cwds() or {}).get(str(ws).upper())
+        except Exception:                                        # noqa: BLE001
+            cwd = None
+    if not cwd or not os.path.isdir(cwd):
+        return refuse("launch cwd unresolved (%r) — refusing to start a lane somewhere unintended"
+                      % (cwd,))
+
+    # ── 6. the binary. Typing a command that cannot resolve is the exact failure #942 is about.
+    pi = pi or shutil.which("pi")
+    if not pi or not os.path.exists(pi):
+        return refuse("`pi` not found on this PATH (%r) — provide --pi <abs path>; a launch line "
+                      "that cannot resolve is the failure this tool exists to avoid" % (pi,))
+
+    line = "cd %s && exec %s%s" % (shlex.quote(cwd), shlex.quote(pi),
+                                   (" --session %s" % sid) if sid else "")
+    obs.update(action="relaunch-fresh" if fresh else "relaunch-session", line=line,
+               cwd=cwd, sid=sid, session_file=path, pi=pi)
+    argv = ["cmux", "send", "--workspace", ws, line + "\n"]
+    bad = _forbidden_in(argv)
+    if bad:                                                      # pragma: no cover — a build-time tripwire
+        return refuse("REFUSING to emit a destructive verb (%s)" % bad)
+    obs["argv"] = argv
+
+    if dry_run:
+        obs["reason"] = "dry run — nothing sent"
+        obs["elapsed_s"] = round(clock() - t0, 1)
+        return obs
+
+    # ── 7. ONE send, with the trailing newline: `cmux send` without it TYPES BUT NEVER SUBMITS
+    # (#941), which is a silent dispatch no-op. The newline is part of the payload on purpose.
+    before = _stat(path) if path else None
+    rc, out, err = runner(argv)
+    obs["sent"] = True
+    if rc != 0:
+        obs["reason"] = ("cmux send rc=%r (%s) — nothing confirmed; argv was: %s"
+                         % (rc, (err or out or "").strip()[:300], " ".join(argv[:-1])))
+        obs["elapsed_s"] = round(clock() - t0, 1)
+        return obs
+
+    # ── 8. CONFIRMATION IS AN ADVANCE, not a screenshot that looks alive (`outcome-canary.md:102`).
+    deadline = clock() + max(0.0, wait)
+    while True:
+        if fresh:
+            # a fresh session has no transcript to advance: the transcript APPEARING is the proof.
+            try:
+                sid_after = ls.resolve_session(ws)
+            except Exception:                                    # noqa: BLE001
+                sid_after = None
+            if sid_after and ls.session_file(sid_after):
+                obs.update(confirmed=True, sid=sid_after, reason="fresh session appeared")
+                break
+        else:
+            now = _stat(path)
+            if now and now != before:
+                obs.update(confirmed=True, reason="session transcript ADVANCED")
+                break
+        if clock() >= deadline:
+            try:
+                tail = "\n".join((ls.read_screen(ws, lines=6) or "").splitlines()[-6:])
+            except Exception:                                    # noqa: BLE001
+                tail = "(pane unreadable)"
+            obs["reason"] = ("sent, but no transcript advance within %ss — UNCONFIRMED. Pane now:\n%s"
+                             % (wait, tail))
+            break
+        sleep(3.0)
+
+    obs["elapsed_s"] = round(clock() - t0, 1)
+    return obs
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="Relaunch a dead lane in its existing cmux workspace "
+                                             "(never `respawn-pane`: #942).")
+    ap.add_argument("--ws", required=True, help="cmux workspace uuid")
+    ap.add_argument("--label", default="", help="lane label (diagnostics only)")
+    ap.add_argument("--cwd", default=None, help="launch cwd (default: cmux's current_directory)")
+    ap.add_argument("--session", default=None, help="session id (default: the pane's own record)")
+    ap.add_argument("--new", action="store_true", help="start a FRESH session (no --session)")
+    ap.add_argument("--pi", default=None, help="absolute path to the pi binary")
+    ap.add_argument("--wait", type=float, default=45.0, help="confirmation window, seconds")
+    ap.add_argument("--dry-run", action="store_true", help="print the launch line; send nothing")
+    ap.add_argument("--json", action="store_true")
+    a = ap.parse_args()
+    if a.new and a.session:
+        ap.error("--new and --session are mutually exclusive")
+
+    try:
+        obs = relaunch(a.ws, a.label, a.cwd, a.session, a.pi, a.new, a.wait, a.dry_run)
+    except Exception as exc:                                     # noqa: BLE001
+        obs = {"ws": a.ws, "confirmed": False, "refused": False, "sent": False,
+               "reason": "relaunch RAISED %s: %s" % (exc.__class__.__name__, exc)}
+
+    if a.json:
+        print(json.dumps(obs, indent=2))
+    else:
+        if obs.get("refused"):
+            label = "REFUSED"
+        elif obs.get("confirmed"):
+            label = "CONFIRMED"
+        elif obs.get("sent"):
+            label = "UNCONFIRMED"
+        else:
+            label = "DRY-RUN"
+        print("%s %s [%ss] %s" % (label, obs.get("ws", a.ws), obs.get("elapsed_s"), obs.get("reason", "")))
+        if a.dry_run and obs.get("line"):
+            print("would send: " + obs["line"])
+
+    if obs.get("refused"):
+        return 3
+    if obs.get("confirmed"):
+        return 0
+    if a.dry_run:
+        return 0
+    return 4
+
+
+if __name__ == "__main__":
+    sys.exit(main())

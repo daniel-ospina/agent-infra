@@ -126,7 +126,9 @@ if [ -n "$PSCREEN" ]; then
       if [ "$MODE" != "--force" ] || grep -qE '(%|\$|#)[[:space:]]*$' <<<"$PLAST"; then
         echo "REFUSED [$LABEL] $WS — NO pi IN THIS PANE (last line: $(printf '%s' "$PLAST" | tail -c 70))."
         echo "         A send here would be typed into a BARE LOGIN SHELL and EXECUTED."
-        echo "         Relaunch the lane first (ORCHESTRATION-BOARD 72). --force does NOT override this."
+        echo "         Relaunch the lane first: scripts/lane-relaunch.py --ws <uuid> (types the launch"
+        echo "         line into the pane's own login shell; never respawn-pane, which DELETES the"
+        echo "         workspace when its command fails — #942). --force does NOT override this."
         exit 3
       fi ;;
   esac

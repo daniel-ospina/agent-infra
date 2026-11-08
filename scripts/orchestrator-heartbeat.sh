@@ -1121,7 +1121,7 @@ fi
 # came to offer two dead panes as "free" on 2026-10-03 and order a send into a bare login
 # shell. They need a RELAUNCH; the exact mechanism is in ORCHESTRATION-BOARD §72.
 if [ "${N_DEAD:-0}" -gt 0 ]; then
-  CAPTEXT="${CAPTEXT} ⛔ DEAD LANES — CONFIRMED BARE SHELL, no pi in the pane: ${DEAD}. These are NOT free capacity and are NOT dispatchable: a send into one would be typed into a BARE LOGIN SHELL and executed. They need a RELAUNCH (recover-fleet / relaunch, board §72), not an item."
+  CAPTEXT="${CAPTEXT} ⛔ DEAD LANES — CONFIRMED BARE SHELL, no pi in the pane: ${DEAD}. These are NOT free capacity and are NOT dispatchable: a send into one would be typed into a BARE LOGIN SHELL and executed. They need a RELAUNCH via scripts/lane-relaunch.py --ws <uuid>, not an item. It types the launch line into the pane's OWN login shell (where the user's PATH lives); it never uses respawn-pane, which DELETES the workspace when its command fails (#942)."
 fi
 # ⛔ OCCUPIED IS NOT DEAD, AND MUST NEVER CARRY THE RELAUNCH REMEDY. Measured 2026-10-04:
 # `DMeer - linkedin outreach` read `pid_exists=no` and was reported "NO pi PROCESS IN THE
