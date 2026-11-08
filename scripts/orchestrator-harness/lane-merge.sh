@@ -254,7 +254,14 @@ verdict() { # verdict <TOKEN> <reason…> — the ONE writer, so no exit path ca
   [ -n "$ISSUE" ] && printf '%s %s\n' "$tok" "$*" > "$O/state/lanemerge-issue-$ISSUE.verdict"
   return 0
 }
-round_of() { local r=0; [ -f "$ROUND_F" ] && r="$(cat "$ROUND_F" 2>/dev/null || echo 0)"; is_limit "$r" || r=0; printf '%s' "$r"; }
+# ⛔ THE ROUND COUNTER IS READ WITH A BUILTIN, LIKE THE VERDICT LINE (round-24 review, P1). This was
+# `r="$(cat "$ROUND_F")"`, and a lane runs this carrier itself with its own PATH — a `cat` that answers 0
+# for `*.round` makes `round_of` return 0 forever, so `emit_fix` grants round 1 every time and THE CAP AT
+# MAX_ROUNDS NEVER FIRES: an unbounded budget on the one number this script exists to bound. Measured with
+# only PATH differing, round file seeded to the cap: control 13/BLOCKED_ATTEMPTS, shimmed 10/FIX_REQUIRED
+# round after round. `IFS= read -r` is a builtin; nothing to shim. (The `git` seam in this file is the
+# disclosed residual, agent-infra#3789 — but a counter is not a seam, it is a file read.)
+round_of() { local r=0; if [ -f "$ROUND_F" ]; then IFS= read -r r < "$ROUND_F" || true; fi; [ -n "$r" ] || r=0; is_limit "$r" || r=0; printf '%s' "$r"; }
 
 # ── --status: no network, no writes. chain-merge.sh and an operator both read this. ──────────────
 if [ "$STATUS" -eq 1 ]; then
@@ -426,7 +433,15 @@ resolve_trusted_checkout() {
   if ! git -C "$lane_real" rev-parse --git-dir >/dev/null 2>&1; then
     printf '%s' "$lane_real"; return 0
   fi
-  main="$(git -C "$lane_real" worktree list --porcelain 2>/dev/null | awk '/^worktree /{print substr($0,10); exit}')"
+  # ⛔ `awk` HERE DECIDED WHICH CHECKOUT IS "TRUSTED", AND `awk` IS PATH-RESOLVED (round-24 review, P2). A
+  # shimmed `awk` returning the lane's own worktree defeated the resolver this function exists to make
+  # fail-closed — measured: control handed the chain the hub, the awk shim handed it the lane. Parsed with
+  # a bash builtin loop instead (the same shape the gate uses for its own resolution). `git` remains the
+  # disclosed seam (agent-infra#3789); a field split is not a seam.
+  main=""
+  while IFS= read -r _stanza; do
+    case "$_stanza" in "worktree "*) main="${_stanza#worktree }"; break ;; esac
+  done <<< "$(git -C "$lane_real" worktree list --porcelain 2>/dev/null)"
   [ -n "$main" ] && [ -d "$main" ] || return 1
   main_real="$(cd "$main" 2>/dev/null && pwd -P)" || return 1
   [ -n "$main_real" ] || return 1
@@ -898,7 +913,9 @@ if [ "$WATCH" -eq 1 ]; then
   # a new head (the exact bug an earlier round fixed for the in-loop path only). A failed read in a
   # later chunk is the same story, so the seed covers both.
   HEAD="$(cat "$O/state/lanemerge-$PR.head" 2>/dev/null || true)"
-  w="$(cat "$WATCH_F" 2>/dev/null || echo 0)"; is_limit "$w" || w=0
+  # ⛔ SAME RULE AS round_of (round-24 review, P1): the supervision budget is a COUNTER read from a local
+  # file, so it is read with a builtin rather than a PATH-resolved `cat` a lane could shim into answering 0.
+  w=0; if [ -f "$WATCH_F" ]; then IFS= read -r w < "$WATCH_F" || true; fi; [ -n "$w" ] || w=0; is_limit "$w" || w=0
   w=$(( w + 1 )); printf '%s\n' "$w" > "$WATCH_F"
   deadline=$(( $(date +%s) + POLL_S ))
   # ⛔ ONE PR READ PER CHUNK, NOT PER TICK (A7). The header promises "reads the PR ONCE per

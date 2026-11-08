@@ -416,6 +416,35 @@ ck "a PATH-shimmed 'tail' cannot rewrite the verdict line the round budget is de
       && [ "$(cat "$OT/state/lanemerge-96.round" 2>/dev/null)" = 1 ] && echo 0 || echo 1)
 ck "…and the carrier logs the gate's OWN reason, not the shim text" \
    $(grep -q 'reason=writer-state-absent' <<<"$OUT" && ! grep -q 'blocker is the BOX' "$OT/gh.log" && echo 0 || echo 1)
+# ⛔ AND THE ROUND COUNTER IS READ WITH A BUILTIN, SO THE CAP CANNOT BE SHIMMED AWAY (round-24 review, P1).
+# `round_of` read `"$(cat "$ROUND_F")"`: a `cat` answering 0 for `*.round` made every call report round 0,
+# so `emit_fix` granted round 1 for ever and MAX_ROUNDS never fired — an unbounded budget on the one
+# number this script exists to bound. Measured with only PATH differing, round file seeded AT the cap:
+# control 13/BLOCKED_ATTEMPTS, shimmed 10/FIX_REQUIRED on every run. The shim touches only `*.round`, so it
+# isolates the counter read from the many legitimate `cat` uses in the carrier.
+CATSHIM="$T/catshim"; rm -rf "$CATSHIM"; mkdir -p "$CATSHIM"
+cat > "$CATSHIM/cat" <<'CSHIM'
+#!/usr/bin/env bash
+case "${1:-}" in
+  *.round) printf '0\n' ;;
+  *) exec /bin/cat "$@" ;;
+esac
+CSHIM
+chmod +x "$CATSHIM/cat"
+mk7row_shimcat() { # mk7row_shimcat <pr> <reason> <rounds-seeded>
+  new_o "$T/pr.tsv"
+  cp "$SCRIPT" "$OT/lane-merge.sh"
+  cat > "$OT/lane-report-gate.sh" <<LRGEOF
+lane_report_gate() { printf 'lane-report: VERDICT=UNMEASURABLE branch=feat/lane worktree=/tmp/wt reason=$2\\n'; return 7; }
+lane_report_remedy() { printf '  (remedy %s)\\n' "\${1:-}"; }
+LRGEOF
+  printf '%s\n' "$3" > "$OT/state/lanemerge-$1.round"
+  OUT="$(PATH="$CATSHIM:$BIN:$PATH" GH_LOG="$OT/gh.log" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 REPO_PATH="$GL" \
+        bash "$OT/lane-merge.sh" "$1" --repo o/r --branch feat/lane --pr-tsv "$T/pr-gate.tsv" --checks-tsv "$T/checks-gate.tsv" 2>&1)"; RC=$?
+}
+mk7row_shimcat 97 writer-state-absent 3
+ck "a PATH-shimmed 'cat' cannot reset the round counter — the cap still fires (exit 13 BLOCKED_ATTEMPTS)" \
+   $([ "$RC" = 13 ] && [ "$(verdict_of 97 | cut -d' ' -f1)" = BLOCKED_ATTEMPTS ] && echo 0 || echo 1)
 # ⛔ AND THE BODY MUST NOT CONTRADICT ITSELF (round-21 review, P2). The rounds line rendered
 # "Rounds spent: 0/3 ("the loop is capped by design")" and the footer said "after a fix" under a box
 # arm whose next line says NOTHING YOU CAN PUSH. Both were measured on a run with rounds already spent.
@@ -1042,6 +1071,29 @@ ck "…the chain is handed the MAIN worktree, not the lane's own checkout (got: 
    $([ -n "$LM_GOT" ] && [ "$(cd "$LM_GOT" && pwd -P)" = "$(cd "$LMFR" && pwd -P)" ] && echo 0 || echo 1)
 ck "…so the rail the chain will exec is the TRUSTED copy, not the lane's tampered one" \
    $(grep -q "the TRUSTED rail" "$LM_GOT/scripts/admin-merge.sh" 2>/dev/null && echo 0 || echo 1)
+# ⛔ AND A PATH-SHIMMED `awk` MUST NOT BE ABLE TO CHOOSE THE "TRUSTED" TREE (round-24 review, P2). The
+# resolver parsed `git worktree list --porcelain` with `awk`, which the lane's PATH owns: a shim answering
+# the lane's own path defeats the fail-closed property this function exists for (measured: control handed
+# the chain the hub, the awk shim handed it the lane). The shim below answers ONLY for the worktree-list
+# program string and passes everything else through, so it isolates exactly that read.
+AWKSHIM="$T/awkshim"; rm -rf "$AWKSHIM"; mkdir -p "$AWKSHIM"
+cat > "$AWKSHIM/awk" <<ASHIM
+#!/usr/bin/env bash
+case "\${1:-}" in
+  *worktree*) printf '%s\\n' "$LMWT" ;;
+  *) exec /usr/bin/awk "\$@" ;;
+esac
+ASHIM
+chmod +x "$AWKSHIM/awk"
+rm -f "$T/chain-repo.txt"
+new_o "$T/junk-q6.tsv"
+OUT="$(cd "$LMWT" && REPO_PATH="$LMWT" PATH="$AWKSHIM:$BIN:$PATH" GH_LOG="$T/gh.log" O="$OT" HOME="$T/home" T="$T" \
+      LANE_MERGE_INTERVAL=5 LANE_MERGE_WAIT=0 LANE_MERGE_POLL=0 \
+      bash "$SCRIPT" 61 --repo o/r --pr-tsv "$T/pr-open6.tsv" --checks-tsv "$T/checks-green.tsv" 2>&1)"; RC=$?
+sleep 1
+LM_GOT2="$(head -n 1 "$T/chain-repo.txt" 2>/dev/null)"
+ck "a PATH-shimmed 'awk' cannot hand the chain the lane's own checkout (got: ${LM_GOT2:-<nothing>})" \
+   $([ -n "$LM_GOT2" ] && [ "$(cd "$LM_GOT2" && pwd -P)" = "$(cd "$LMFR" && pwd -P)" ] && echo 0 || echo 1)
 
 # ── 11c-nonies-a. THE HAND-OFF'S PRINTED REMEDY NAMES THE SAME TREE (landing review F1, P1) ──────────
 # ⛔ F1 WAS REINTRODUCED AS DOCUMENTATION. `launch_chain` refuses to run the chain from a lane worktree —
