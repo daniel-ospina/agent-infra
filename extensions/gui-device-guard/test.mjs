@@ -225,6 +225,46 @@ const ROWS = [
   // be deleted again without the suite going red.
   ["A25 a bare assignment segment (no command word) does not throw", "FOO=1", 0, null, false],
   ["A16 a comment is not argv", 'electron . # --use-fake-device-for-media-stream --use-fake-ui-for-media-stream', 1, "electron", true],
+  // ── L21 (review cycle 5, F1) — an option's argument ATTACHED to its short flag
+  //     is the same argument. `tokenize` collapses `bash -c"…"` to ONE token
+  //     (`-cnpm exec electron .`), which is neither the exact flag nor a bare `-c`
+  //     cluster, so it was skipped as an ordinary flag and no argument ever reached
+  //     the wrapper recursion: `[]` — no block AND no ledger row. Every row here
+  //     was measured `[]` at the previous head; `-cCMD` is a legal, common spelling
+  //     of the very idiom the header says is recursed into. The control rows
+  //     (L13a/L13c, the SEPARATED spelling) keep both spellings from regressing
+  //     alone. A30/A31 are the ALLOW twins.
+  ["L21a bash -c\"<cmd>\" (ATTACHED argument)", 'bash -c"npm exec electron ."', 1, "electron", true],
+  ["L21b sh -c'<cmd>' (attached, single-quoted)", "sh -c'electron .'", 1, "electron", true],
+  ["L21c an attached shell argument behind a prefix", 'nohup bash -c"npm exec electron ." &', 1, "electron", true],
+  ["L21d an attached shell argument in a later segment", 'x=1; bash -c"npm exec electron ."', 1, "electron", true],
+  ["L21e an attached argument on a `-lc` cluster", 'bash -lc"electron ."', 1, "electron", true],
+  ["L21f flock -c\"<cmd>\" (the wrapper consumes the WHOLE segment)", 'flock -c"npm exec electron ."', 1, "electron", true],
+  // The same root on the SECOND rule. `open -a"Google Chrome"` was `[]`: not refused
+  // (correct — a NAMED app is record-only, that is the recorded category-B decision)
+  // but not RECORDED either, which loses R1 — the half of #2249 that would have cut
+  // the incident to one `jq` lookup. media=false on both, deliberately: L9a–L9c are
+  // the same verdicts for the separated spelling.
+  ["L21g open -a\"<name>\" (attached; RECORDED, never refused)", 'open -a"Google Chrome" https://x.test', 1, "open", false],
+  ["L21h open -a<name> (attached, no space)", "open -aDMeer", 1, "open", false],
+  // ── L22 (review cycle 5, F2) — a `<<` INSIDE A COMMENT is not a redirect. The
+  //     heredoc scanner read raw lines with only the quote model, so a comment
+  //     MENTIONING the idiom opened a heredoc, found no terminator, and deleted
+  //     every following line: the launch was neither blocked nor recorded.
+  ["L22a a `<<` in a comment must not delete the launch after it",
+    "# usage: write a file with cat <<EOF\nnpm exec electron .", 1, "electron", true],
+  ["L22b a trailing comment carrying `<<`", "true # see cat <<EOF\nnpm exec electron .", 1, "electron", true],
+  // A30–A33 are the twins of L21/L22: normalising attached arguments and skipping a
+  // commented `<<` must not turn a benign wrapper or a heredoc BODY into a refusal,
+  // and the terminator rule must not change in either direction. A33 pins the case
+  // the review warned about: `EOF # done` does NOT terminate a heredoc in `sh`, so
+  // the text after it really is data — removing it must stay data-on-both-sides.
+  ["A30 an attached shell argument with a benign body", 'bash -c"ls -la"', 0, null, false],
+  ["A31 a heredoc BODY naming the launch stays data",
+    "cat > /tmp/n.md <<'EOF'\nnpm exec electron .\nEOF", 0, null, false],
+  ["A32 a heredoc whose TERMINATOR carries a trailing comment is still unterminated",
+    "cat > /tmp/n.md <<'EOF'\nbody\nEOF # done\nnpm exec electron .", 0, null, false],
+  ["A33 open -R (a boolean short flag, not an attached app)", "open -R .", 0, null, false],
 ];
 
 for (const [name, cmd, count, rule, media] of ROWS) {
@@ -469,6 +509,27 @@ if (handler) {
   check("H12b handler: `command -v electron` is ALLOWED and not recorded",
     lookup === undefined && ledgerRows().length === 0,
     `allowed=${lookup === undefined} rows=${ledgerRows().length}`);
+
+  // ── H13/H14 — review cycle 5's two findings measured through the REAL handler.
+  //         F1: an attached `-c` argument lost the block, and an attached `-a`
+  //         lost the RECORD (R1, the diagnosis half). F2: a `<<` in a comment
+  //         deleted the rest of the command, losing both. Driven through the
+  //         handler on purpose — only the handler shows the ledger row.
+  resetLedger();
+  const attachedC = await drive('bash -c"npm exec electron ."');
+  check("H13 handler: BLOCKS an attached `-c` argument", Boolean(attachedC?.block),
+    `block=${Boolean(attachedC?.block)}`);
+  check("H13a …and WROTE its ledger row", ledgerRows().length === 1, `rows=${ledgerRows().length}`);
+  resetLedger();
+  const attachedA = await drive("open -aDMeer");
+  check("H13b handler: an attached `-a<name>` is RECORDED, never refused",
+    attachedA === undefined && ledgerRows().length === 1,
+    `allowed=${attachedA === undefined} rows=${ledgerRows().length}`);
+  resetLedger();
+  const commented = await drive("# usage: write a file with cat <<EOF\nnpm exec electron .");
+  check("H14 handler: BLOCKS a launch after a comment carrying `<<`", Boolean(commented?.block),
+    `block=${Boolean(commented?.block)}`);
+  check("H14a …and WROTE its ledger row", ledgerRows().length === 1, `rows=${ledgerRows().length}`);
 }
 
 // ── drift pins ─────────────────────────────────────────────────────────────

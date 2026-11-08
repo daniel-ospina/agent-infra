@@ -42,7 +42,8 @@
  *      this repo has already paid for once.
  *
  * ── WRAPPERS AND SUBSTITUTIONS ARE RE-READ, NOT DECLARED AWAY ───────────────
- * `bash -c "<cmd>"`, `sh -c`, `sudo bash -lc`, `eval …`, and the body of
+ * `bash -c "<cmd>"` and its ATTACHED spelling `bash -c"<cmd>"`, `sh -c`,
+ * `sudo bash -lc`, `eval …`, and the body of
  * `$( … )` / backticks are RECURSED INTO (bounded to 3 levels), because the
  * command string is argv and can be classified. Review cycle 1 (F2) found these
  * were an UNDECLARED bypass of R2 while the header claimed completeness — and
@@ -334,6 +335,23 @@ export function splitSegments(command: string): string[] {
  * both flags). Only an unquoted `#` that BEGINS A WORD is a comment: `a#b` is
  * one word, and a `#` inside single/double quotes or a heredoc body is data.
  */
+/**
+ * Index of the `#` that starts a COMMENT on `line`, or -1.
+ *
+ * One rule, two readers: `stripComments` (which cuts the line there) and
+ * `stripHeredocBodies` (which must not read a `<<` that lives in a comment).
+ * Duplicating it is the #966 defect — a second copy of a parse rule.
+ */
+function commentCutIndex(line: string, base: number, mask: boolean[]): number {
+  for (let i = 0; i < line.length; i++) {
+    if (line[i] !== "#") continue;
+    if (mask[base + i] !== true) continue;             // quoted: data, not a comment
+    const prev = i === 0 ? " " : line[i - 1];
+    if (/\s/.test(prev) || ";&|(".includes(prev)) return i;
+  }
+  return -1;
+}
+
 export function stripComments(command: string): string {
   if (!command.includes("#")) return command;
   const mask = unquotedMask(command);
@@ -341,13 +359,7 @@ export function stripComments(command: string): string {
   const out: string[] = [];
   let at = 0;
   for (const line of lines) {
-    let cut = -1;
-    for (let i = 0; i < line.length; i++) {
-      if (line[i] !== "#") continue;
-      if (mask[at + i] !== true) continue;             // quoted: data, not a comment
-      const prev = i === 0 ? " " : line[i - 1];
-      if (/\s/.test(prev) || ";&|(".includes(prev)) { cut = i; break; }
-    }
+    const cut = commentCutIndex(line, at, mask);
     out.push(cut === -1 ? line : line.slice(0, cut));
     at += line.length + 1;
   }
@@ -363,9 +375,29 @@ export function stripComments(command: string): string {
  * A guard that refuses correct work is the category-B friction `AGENTS.md`
  * names, so the body is removed rather than tolerated.
  *
- * Deliberately simple and one-directional: an unrecognised heredoc leaves the
- * text in place, which can only make the guard MORE likely to fire (over-read),
- * never less.
+ * ⛔ A `<<` INSIDE A COMMENT IS NOT A REDIRECT (review cycle 5, F2). This scanner
+ * used to read raw lines with only the quote model, and `#` is not a quote
+ * character — so a comment that merely MENTIONED the idiom
+ *
+ *     # usage: write a file with cat <<EOF
+ *     npm exec electron .
+ *
+ * opened a heredoc with delimiter `EOF`, found no terminator, and deleted every
+ * remaining line (`li = lines.length`). The launch was then neither blocked nor
+ * recorded — the double loss cycles 3 and 4 treated as blocking — and the
+ * one-directional claim this comment used to make was false for exactly that
+ * shape. `commentCutIndex` (the same rule `stripComments` uses) is consulted per
+ * line so a commented `<<` is data.
+ *
+ * The terminator comparison is deliberately UNCHANGED (a line must BE the
+ * delimiter): `EOF # done` really does not terminate a heredoc in `sh`, so the
+ * text after it really is data, and A32/A33 pin both directions.
+ *
+ * Declared residual: a `<<` inside an ARITHMETIC expansion (`$(( n << shift ))`)
+ * is still read as a redirect, because the delimiter there (`shift`) is a legal
+ * word. It is not closable without a real arithmetic grammar, it deletes DATA in
+ * the safe direction only when no later line equals the variable name, and the
+ * direction is stated rather than claimed complete.
  */
 export function stripHeredocBodies(command: string): string {
   if (!command.includes("<<")) return command;
@@ -383,12 +415,16 @@ export function stripHeredocBodies(command: string): string {
     const line = lines[li];
     out.push(line);
     const base = starts[li];
+    const cut = commentCutIndex(line, base, mask);
     const re = /<<(-?)\s*(['"]?)([A-Za-z_][A-Za-z0-9_]*)\2/g;
     let m: RegExpExecArray | null;
     let delim: string | null = null;
     while ((m = re.exec(line)) !== null) {
       const idx = base + m.index;
       if (mask[idx] === false) continue; // quoted `<<` inside a string, not a redirect
+      // ⛔ A COMMENTED `<<` IS DATA (review cycle 5, F2) — see the header. It used
+      // to delete every following line, which lost the block AND the ledger row.
+      if (cut !== -1 && m.index > cut) continue;
       delim = m[3];
     }
     if (delim === null) continue;
@@ -696,6 +732,31 @@ export function extractSubstitutions(command: string): string[] {
  * re-read. `COMMAND_STRING_FLAGS` names the flag per head, so a wrapper added
  * later is one table row rather than a second branch.
  */
+/**
+ * The argument ATTACHED to a short option: `-cCMD`, `-lcCMD`, `-aAPP`.
+ *
+ * ⛔ AN ATTACHED ARGUMENT IS THE SAME ARGUMENT (review cycle 5, F1). `tokenize`
+ * collapses `bash -c"npm exec electron ."` to ONE token, `-cnpm exec electron .`,
+ * which is neither the exact flag nor a bare `-c` cluster — so it was skipped as
+ * an ordinary flag, no argument was ever handed to the wrapper recursion, and the
+ * segment classified as `[]`: no block AND no ledger row. `-cCMD` is a legal, common
+ * spelling of the very idiom the header says is recursed into.
+ *
+ * The letter comes from the CALLER's table (never a second copy of "c"), so a
+ * wrapper added later gets the attached form for free. Anything after the flag
+ * letter is the argument, and every character BEFORE it must itself be a
+ * single-letter flag (`-lc`, `-xc`), which is how a cluster spells it.
+ */
+function attachedShortArg(tok: string, letter: string): string | null {
+  if (!tok.startsWith("-") || tok.startsWith("--")) return null;
+  const body = tok.slice(1);
+  const at = body.indexOf(letter);
+  if (at < 0) return null;
+  if (!/^[A-Za-z]*$/.test(body.slice(0, at))) return null;
+  const rest = body.slice(at + 1);
+  return rest === "" ? null : rest;
+}
+
 function shellCommandArg(toks: string[], headIndex: number): string | null {
   const head = basename(toks[headIndex] ?? "");
   const flags = COMMAND_STRING_FLAGS[head];
@@ -706,6 +767,12 @@ function shellCommandArg(toks: string[], headIndex: number): string | null {
     if (flags.includes(tok)) return toks[i + 1] ?? null;
     // A short-flag cluster containing `c` for the shell family only.
     if (SHELLS.has(head) && /^-[A-Za-z]*c[A-Za-z]*$/.test(tok)) return toks[i + 1] ?? null;
+    // ⛔ `-cCMD` — the ATTACHED spelling of the same flag (review cycle 5, F1).
+    for (const flag of flags) {
+      if (flag.startsWith("--")) continue;
+      const attached = attachedShortArg(tok, flag[1]);
+      if (attached !== null) return attached;
+    }
   }
   return null;
 }
@@ -752,6 +819,18 @@ function classifySegment(
         break;
       }
       if (tok === "-a" || tok === "-b") continue;
+      // ⛔ `-a<app>` / `-b<id>` — the ATTACHED spelling (review cycle 5, F1).
+      // `open -a"Google Chrome"` tokenises to `-aGoogle Chrome`, matched no
+      // branch, and the launch was `[]`: not refused (correct — a NAMED app is
+      // record-only) but also NOT RECORDED, which loses R1 — the half of #2249
+      // that would have cut the incident to one `jq` lookup. The flag letter must
+      // be the FIRST one (a cluster is not a thing for `open`), so `--args` and
+      // `open -R`/`-n`/`-g` are untouched.
+      if (tok.length > 2 && !tok.startsWith("--") && (tok[1] === "a" || tok[1] === "b")) {
+        app = tok.slice(2);
+        fromFlag = true;
+        break;
+      }
       if (tok.endsWith(".app")) {
         app = tok;
         fromFlag = false;
@@ -814,7 +893,21 @@ export function classifyLaunchCommand(command: string, depth = 0): LaunchFinding
     if (toks.length === 0) continue;
     const flags: { prefixSeen?: boolean } = {};
     const cwi = commandWordIndex(toks, flags);
-    if (cwi < 0) continue;
+    if (cwi < 0) {
+      // ⛔ A WRAPPER CAN CONSUME ITS WHOLE SEGMENT (`flock -c"<cmd>"`, `su -c
+      // "<cmd>"`): there is no command word left to locate, but the command string
+      // is still ARGV and still executes. Without this, the ATTACHED spelling of
+      // `flock -c` was `[]` even with the flag table fixed, because the prefix's
+      // generic flag-skip ate the token and left nothing behind (review cycle 5,
+      // F1). `cwi >= 0` segments take the wrapper branch below as before.
+      if (depth < MAX_WRAPPER_DEPTH) {
+        const body0 = shellCommandArg(toks, 0);
+        if (body0 !== null && body0 !== "") {
+          findings.push(...classifyLaunchCommand(body0, depth + 1));
+        }
+      }
+      continue;
+    }
 
     // ⛔ THE MITIGATION IS READ FROM ARGV, NOT FROM SHELL TEXT (review cycle 2,
     // F2). Segments were never comment-stripped, so
