@@ -384,6 +384,38 @@ ck "a WORKTREE path carrying 'reason=' cannot buy the no-round arm — an ambigu
       && [ "$(cat "$OT/state/lanemerge-95.round" 2>/dev/null)" = 1 ] && echo 0 || echo 1)
 ck "…and it SAYS the line is ambiguous rather than guessing a cause" \
    $(grep -q 'reason=. tokens\|reason=. tokens\|cannot be read unambiguously' <<<"$OUT" && echo 0 || echo 1)
+# ⛔ THE WITNESS LINE IS CUT BY A BUILTIN, SO A `tail` SHIM CANNOT AUTHOR IT (round-23 review, P1).
+# `lane-merge.sh` sets no PATH and a lane runs it itself, so a `tail` earlier on PATH could rewrite the
+# gate's output: keep only the UNMEASURABLE line and print a BOX reason, and the entire round-22 split —
+# including its reason= count — is computed over text the lane wrote. Measured pre-fix with the shim and an
+# identical stub: control 10/FIX_REQUIRED/round 1, shimmed 14/BLOCKED_ATTEMPTS/round 0. The shim below
+# rewrites ONLY a UNMEASURABLE verdict, so if this row ever goes green on 14 the decision read the shim.
+SHIMDIR="$T/tailshim"; rm -rf "$SHIMDIR"; mkdir -p "$SHIMDIR"
+cat > "$SHIMDIR/tail" <<'TSHIM'
+#!/usr/bin/env bash
+_out="$(cat)"
+case "$_out" in
+  *VERDICT=UNMEASURABLE*) printf 'lane-report: VERDICT=UNMEASURABLE branch=feat/lane reason=no-interpreter-at-or-above-python-3.12\n' ;;
+  *) printf '%s\n' "$_out" ;;
+esac
+TSHIM
+chmod +x "$SHIMDIR/tail"
+mk7row_shim() { # mk7row_shim <pr> <reason>
+  new_o "$T/pr.tsv"
+  cp "$SCRIPT" "$OT/lane-merge.sh"
+  cat > "$OT/lane-report-gate.sh" <<LRGEOF
+lane_report_gate() { printf 'lane-report: VERDICT=UNMEASURABLE branch=feat/lane worktree=/tmp/wt reason=$2\\n'; return 7; }
+lane_report_remedy() { printf '  (remedy %s)\\n' "\${1:-}"; }
+LRGEOF
+  OUT="$(PATH="$SHIMDIR:$BIN:$PATH" GH_LOG="$OT/gh.log" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 REPO_PATH="$GL" \
+        bash "$OT/lane-merge.sh" "$1" --repo o/r --branch feat/lane --pr-tsv "$T/pr-gate.tsv" --checks-tsv "$T/checks-gate.tsv" 2>&1)"; RC=$?
+}
+mk7row_shim 96 writer-state-absent
+ck "a PATH-shimmed 'tail' cannot rewrite the verdict line the round budget is decided on" \
+   $([ "$RC" = 10 ] && [ "$(verdict_of 96 | cut -d' ' -f1)" = FIX_REQUIRED ] \
+      && [ "$(cat "$OT/state/lanemerge-96.round" 2>/dev/null)" = 1 ] && echo 0 || echo 1)
+ck "…and the carrier logs the gate's OWN reason, not the shim text" \
+   $(grep -q 'reason=writer-state-absent' <<<"$OUT" && ! grep -q 'blocker is the BOX' "$OT/gh.log" && echo 0 || echo 1)
 # ⛔ AND THE BODY MUST NOT CONTRADICT ITSELF (round-21 review, P2). The rounds line rendered
 # "Rounds spent: 0/3 ("the loop is capped by design")" and the footer said "after a fix" under a box
 # arm whose next line says NOTHING YOU CAN PUSH. Both were measured on a run with rounds already spent.

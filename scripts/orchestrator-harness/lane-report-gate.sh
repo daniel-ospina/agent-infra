@@ -314,9 +314,11 @@ except Exception:
     sys.exit(3)
 if not isinstance(_d, dict):
     sys.exit(3)
-_b = _d.get("branch")
-_h = _d.get("head_at_write")
-print("%s\x1f%s" % (_b if isinstance(_b, str) else "", _h if isinstance(_h, str) else ""))' "$p/.worktree-report/state.json" 2>/dev/null)" || kv=""
+# ⛔ CONTROL CHARACTERS ARE STRIPPED FROM THE TWO LANE-WRITABLE FIELDS (round-23 review, P1): the pair is
+# joined on \x1f, so a `branch` containing the separator shifted `hw` into the branch and made this scan
+# attribute evidence the lane chose. Neither field is a control-character string in any honest state.
+_dc = lambda _v: (_v if isinstance(_v, str) else "").replace("\x1f", "").replace("\n", "").replace("\r", "")
+print("%s\x1f%s" % (_dc(_d.get("branch")), _dc(_d.get("head_at_write"))))' "$p/.worktree-report/state.json" 2>/dev/null)" || kv=""
     b="${kv%%$'\x1f'*}"
     hw="${kv#*$'\x1f'}"
     [ "$hw" = "$kv" ] && hw=""
@@ -553,6 +555,17 @@ except Exception:
     sys.exit(3)
 if not isinstance(d, dict):
     sys.exit(3)
+# ⛔ EVERY FIELD PRINTED BELOW IS SEPARATOR-SAFE (round-23 review, P1). The tuple is joined on a pipe and
+# read with IFS splitting on that same pipe, so a pipe inside a LANE-WRITABLE field did not merely corrupt
+# one value: it SHIFTED every later field, and lane-written text then supplied rec_head, live_head,
+# predates, skew and state_ok to the verdict. Measured: a state head_at_write of "<head>|<head>|0|0|ok"
+# re-assigned the whole witness row (the printed sealed-vs-state comparison then compared live_head to
+# predates), and a variant returned a false PASS on a report whose seal named a different head. _ishex is
+# the sha shape the binding must have; _flat strips separators and control characters from free text.
+def _ishex(_v):
+    return isinstance(_v, str) and 7 <= len(_v) <= 64 and all(_c in "0123456789abcdefABCDEF" for _c in _v)
+def _flat(_v):
+    return (_v if isinstance(_v, str) else ("" if _v is None else str(_v))).replace("|", " ").replace("\n", " ").replace("\r", " ")
 rules = d.get("rules") or []
 if not isinstance(rules, list):
     rules = [str(rules)]
@@ -604,6 +617,16 @@ try:
                     newest = _t
         if not rec:
             state_ok = "missing-witness"
+        elif not _ishex(rec):
+            # ⛔ A HEAD BINDING THAT IS NOT A SHA CANNOT BIND A HEAD (round-23 review, P1). This value comes
+            # from the writer state (head_at_write) and is LANE-WRITTEN, and it is interpolated into the
+            # pipe-delimited field line below. A value containing a pipe therefore SHIFTED every downstream
+            # field, so lane-written text supplied rec_head, live_head, predates, skew and state_ok itself,
+            # and the sealed cross-check compared garbage to garbage (measured: a false PASS on a report
+            # whose seal named a different head). Refusing here closes the shift at its source; a non-hex
+            # value is not merely unsafe, it is unusable, so this is not a loosened check.
+            state_ok = "missing-witness"
+            rec = ""
         elif _have_suites and newest is None:
             state_ok = "missing-witness"
     else:
@@ -849,9 +872,9 @@ except Exception:
 print("%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s" % (
     "1" if d.get("ok") is True else "0",
     "1" if d.get("head_moved_since_write") is True else "0",
-    ",".join(str(r) for r in rules)[:400],
+    _flat(",".join(str(r) for r in rules))[:400],
     rec,
-    d.get("head") or "",
+    _flat(d.get("head") or ""),
     predates,
     skew,
     state_ok,

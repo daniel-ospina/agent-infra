@@ -231,6 +231,25 @@ mkdir -p "$WT/.worktree-report"
 printf 'not json at all{{{\n' > "$WT/.worktree-report/state.json"
 drive 7 "UNMEASURABLE: a writer state that exists but will not parse (both head witnesses are dark)" STUB_OK=1 STUB_RC=0 STUB_STALE=0
 case "$LAST_OUT" in *reason=writer-state-corrupt*) ok "…and it names the corrupt state instead of returning a verdict about it" ;; *) bad "corrupt-state reason: $LAST_OUT" ;; esac
+# ⛔ A SEPARATOR INSIDE THE LANE-WRITTEN HEAD BINDING MUST NOT SHIFT THE WITNESS ROW (round-23 review, P1).
+# The python pass prints 13 pipe-joined fields; `head_at_write` was interpolated raw, so a value containing
+# pipes re-assigned every later field and the lane supplied rec_head/live_head/predates/skew/state_ok.
+# Measured pre-fix: a variant on this exact shape returned a false PASS on a report whose seal named a
+# different head. The binding must be a sha or it binds nothing — so the refusal is UNMEASURABLE, never a
+# verdict about the report, and never PASS. The row drives the REAL gate over a real state file.
+_orig_state="$(cat "$WT/.worktree-report/state.json" 2>/dev/null || true)"
+printf '{"version":1,"head_at_write":"%s|%s|0|0|ok","branch":"feat/2977-tm","suites":[]}\n' "$WT_HEAD" "$WT_HEAD" > "$WT/.worktree-report/state.json"
+out="$(env STUB_OK=1 STUB_RC=0 STUB_STALE=0 bash "$GATE" --check "$REPO" "feat/2977-tm" "$WT_HEAD" 2>&1)"; rc=$?
+if [ "$rc" = 7 ]; then
+  ok "a pipe inside head_at_write cannot shift the witness fields (rc=$rc, UNMEASURABLE not PASS)"
+else
+  bad "a pipe inside head_at_write was allowed to shift the verdict's witness row: expected rc=7, got rc=$rc :: $out"
+fi
+case "$out" in
+  *reason=writer-state-missing-witness*) ok "…and it says the binding is unusable rather than naming a witness it did not get" ;;
+  *) bad "the shifted-binding row does not name the unusable binding: $out" ;;
+esac
+printf '%s\n' "$_orig_state" > "$WT/.worktree-report/state.json"
 case "$LAST_OUT" in *VERDICT=PASS*) bad "a corrupt writer state was read as a PASS" ;; *) ok "…and it is not reported as PASS" ;; esac
 _restore_state
 # ── 1d. A STATE THAT PARSES IS NOT A WITNESS (round-7 review, P0) ──────────────────

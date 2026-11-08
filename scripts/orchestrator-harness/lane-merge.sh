@@ -1392,7 +1392,14 @@ if [ -n "${RESOLVED_BR// /}" ] && [ "$_lrg_skip" = 0 ]; then
     # what no push can change — the round-19 defect. The evaluable set is `writer-state-*`,
     # `worktree-registered-but-unreadable`, and the three report/worktree-placement arms, whose remedies
     # are all one `git switch` or one `run` away (`lane_report_remedy 7`).
-    7)  _lrg_line="$(printf '%s' "$_lrg_out" | tail -1)"
+    7)  # ⛔ THE WITNESS LINE IS CUT WITH A BUILTIN, NOT `tail` (round-23 review, P1). `lane-merge.sh` sets
+        # no PATH, and a lane runs this carrier itself — the gate's own threat premise — so a 7-line `tail`
+        # shim could author the line this decision reads: keep only lines containing `VERDICT=UNMEASURABLE`
+        # and replace them with a box reason, and the whole reason-token split (round 22), INCLUDING its
+        # `reason=` count, is computed over text the lane wrote. Measured on the fixture with only PATH
+        # differing: control 10/FIX_REQUIRED/round 1, shimmed 14/BLOCKED_ATTEMPTS/round 0. `${var##*$'\n'}`
+        # is a pure parameter expansion: no program, nothing to shim.
+        _lrg_line="${_lrg_out##*$'\n'}"
         # ⛔ A LINE WITH MORE THAN ONE `reason=` IS AMBIGUOUS AND IS TREATED AS LANE-FIXABLE (round-22
         # review, P1). Nothing in the gate promises the token is unique — every lane-chosen value is a
         # candidate (`branch`, `worktree`, a path in `state=`), and a path or branch containing
@@ -1421,7 +1428,7 @@ if [ -n "${RESOLVED_BR// /}" ] && [ "$_lrg_skip" = 0 ]; then
         esac ;;
     *)  log_line "⛔ lane-report: REFUSED (rc=$_lrg_rc) — the mandatory lane report does not support merging head ${HEAD:0:12}"
         lane_report_remedy "$_lrg_rc" 2>/dev/null || true
-        emit_fix FIX_REQUIRED "the lane report does not support this merge (rc=$_lrg_rc): $(printf '%s' "$_lrg_out" | tail -1)" ;;
+        emit_fix FIX_REQUIRED "the lane report does not support this merge (rc=$_lrg_rc): ${_lrg_out##*$'\n'}" ;;
   esac
 fi
 
