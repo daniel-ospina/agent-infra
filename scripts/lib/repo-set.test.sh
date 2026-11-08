@@ -1466,6 +1466,24 @@ printf 'slug=o/n checkout=%s state=%s/st\n' "$T/tortoise" "$T" > "$T/notadir-anc
 _o_na="$(_rs_bound 30 env REPO_SET_FILE="$T/notadir-anc.conf/inside/repos.conf" /bin/bash "$READER" check 2>&1)"; _rc_na=$?
 ck "j16k a FILE as the nearest existing ancestor names THAT — not 'neither is any directory above it'" \
    '[ "$_rc_na" = 5 ] && grep -q "is not a directory" <<<"$_o_na" && grep -q "must be a DIRECTORY" <<<"$_o_na" && grep -q "fix the path above" <<<"$_o_na" && ! grep -q "neither is any directory above it" <<<"$_o_na" && ! grep -q "check the" <<<"$_o_na"'
+# ⛔ THE SAME CAUSE SPELLED WITH A TRAILING SLASH WAS CERTIFIED **ABSENT** (round 47 review, P1 — measured).
+# `REPO_SET_FILE=<an existing set>/` is `-e`-FALSE (`stat("<file>/")` is ENOTDIR), and the absence proof
+# tested the ANCESTOR and never the KIND: the walk strips the trailing slash and then starts at the PARENT,
+# so `anc` is a TRAVERSABLE DIRECTORY and the clause `{ [ -n "$anc" ] && [ -d "$anc" ] && [ -x "$anc" ]; }`
+# was true. The reader then printed `NO-REPO-SET — <path> does not exist` at **rc 3** — the one code
+# `pr-doctor-machine.sh`'s degrade branch acts on, so the box stops grading the set it declares and is told
+# to CREATE a file that is right there. Measured pre-fix: rc 3 + `does not exist`. j16k/j16k2 drive the
+# NON-trailing-slash spelling, whose walk answer is the FILE, so nothing reddened on this shape.
+# ⛔ BOTH HALVES, ON BOTH READERS: with an interpreter the `notdir` errno names the cause, and with NONE
+# (`unknown`) the only evidence left is that the stripped path EXISTS — so the fix tests that too, and this
+# pair is what keeps either half from being deleted silently.
+printf 'slug=o/n checkout=%s state=%s/st\n' "$T/tortoise" "$T" > "$T/notadir-trail.conf"
+_o_nt="$(_rs_bound 30 env REPO_SET_FILE="$T/notadir-trail.conf/" /bin/bash "$READER" check 2>&1)"; _rc_nt=$?
+ck "j16q a TRAILING SLASH on a regular file is BROKEN (5) — never 'does not exist' at the degrade code 3" \
+   '[ "$_rc_nt" = 5 ] && grep -q "must be a DIRECTORY" <<<"$_o_nt" && grep -q "fix the path above" <<<"$_o_nt" && ! grep -q "does not exist" <<<"$_o_nt" && ! grep -q "not traversable" <<<"$_o_nt"'
+_o_nt2="$(_rs_bound 30 env REPO_SET_FILE="$T/notadir-trail.conf/" /bin/bash "$NI/lib/repo-set.sh" check 2>&1)"; _rc_nt2=$?
+ck "j16q2 …and with NO stat answer the stripped spelling is what exposes it (5, never the degrade code)" \
+   '[ "$_rc_nt2" = 5 ] && grep -q "must be a DIRECTORY" <<<"$_o_nt2" && ! grep -q "does not exist" <<<"$_o_nt2" && ! grep -q "not traversable" <<<"$_o_nt2"'
 # ⛔ AN UNRESOLVABLE SYMLINK COMPONENT USED TO PROVE ABSENCE (round 46, P2 — measured). The walk's only test
 # was `[ -e ]`, which FOLLOWS the link; a component whose target cannot be resolved answers FALSE, so the
 # walk SKIPPED it and returned a traversable grandparent ABOVE the link. The caller reads a traversable
@@ -2044,6 +2062,26 @@ ck "m47 python3 RESOLVES but cannot EXEC: the residue names NO cause — never '
 # says the verdict is INCOMPLETE. Revert the sentinel and this arm reds, alone.
 ck "m48 …and the TAG guard is not silenced by it: a colliding set is never certified with no tag WARN" \
    'o="$(_rs_bound 30 env PATH="$MP/pybin:$PATH" REPO_SET_FILE="$T/tag-collide.conf" /bin/bash "$MP/lib/repo-set.sh" check 2>&1)"; grep -q "tag-collision proof did NOT run" <<<"$o"'
+# ⛔ THE SAME SENTINEL IS READ BY THREE VERBS AND ONLY ONE OF THEM HAD AN ARM (round 47 review, P2 —
+# measured). `m48` drives `tags`; narrowing the guard to `tags)` alone left the suite FULLY GREEN while
+# `strip` silently returned "". That is not cosmetic and it is not a diagnosis defect — it is the
+# widest-blast-radius shape on this path: `_trim` in `pr-doctor-machine.sh` treats "" as "nothing to trim"
+# and PRINTS it, so an interpreter that RESOLVES and cannot RUN empties every declared seam
+# (`PR_DOCTOR_REPO`, `OR`, `REPO`), and the wrapper then reports `Nothing is declared` about a box that
+# declares one — a declared repo silently dropped, which is exactly the fail-open this branch exists to
+# close. Measured at this head with `$MP`'s shim: `PR_DOCTOR_REPO='acme/stale' could not be normalised …`
+# (the seam SURVIVED the trim and the refusal names it). Under the `tags)` mutant the same run prints
+# `Nothing is declared`: the seam is gone.
+# ⛔ SO THIS ARM DRIVES THE WRAPPER, where both legs' damage is observable: `strip` shows up as a seam that
+# survived at all, and `norm` as the honest "could not be normalised" instead of "is not an owner/name
+# slug". No mode bits and no state dir needed — `REPO_SET_FILE` under a traversable directory puts the
+# reader on code 3, which is the branch that trims the seams.
+MW="$T/wrapstriprun"; mkdir -p "$MW/lib"
+cp "$MP/lib/repo-set.sh" "$MW/lib/repo-set.sh"; cp "$MP/pr-doctor.py" "$MW/pr-doctor.py"
+cp "$WRAPPER" "$MW/pr-doctor-machine.sh"
+_o_ms="$(HOME="$T" REPO_SET_FILE="$T/no-set-m49.conf" PR_DOCTOR_REPO=acme/stale PATH="$MP/pybin:$PATH" bash "$MW/pr-doctor-machine.sh" 2>&1)"
+ck "m49 …and a DECLARED seam is never silently EMPTIED by it — the strip/norm legs the tag arm cannot see" \
+   'grep -qE "PR_DOCTOR_REPO=.acme/stale. could not be normalised" <<<"$_o_ms" && ! grep -q "Nothing is declared" <<<"$_o_ms"'
 ck "m37 …while the SHIPPED doctor still REFUSES a genuinely different slug on the same checkout (rc 1)" \
    '[ "$(run_reader_rc "$T/nonorm-wrong.conf" check)" = 1 ]'
 ck "m38 …and with the shipped doctor the \`.git\` spelling is simply ACCEPTED, with no WARN" \

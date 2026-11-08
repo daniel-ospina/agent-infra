@@ -557,6 +557,17 @@ repo_set_parse() {
   if [ ! -e "$f" ]; then
     local anc kind; anc="$(_rs_nearest_existing_ancestor "$f")"
     kind="$(_rs_stat_kind "$f")"
+    # ⛔ THE ONE SPELLING THAT MAKES `-e` LIE ABOUT AN EXISTING NON-DIRECTORY IS A TRAILING SLASH (round 47
+    # review, P1). `stat("<file>/")` is ENOTDIR, so `[ -e "<file>/" ]` is FALSE while `[ -e "<file>" ]` is
+    # true — which is how this arm was reached for a set that is right there. The walk cannot see it
+    # either: it strips the trailing slash and then starts at the PARENT, so `anc` is a TRAVERSABLE
+    # DIRECTORY and the ancestor test alone proves absence. With a stat answer the `notdir` errno now names
+    # the cause (below); with none — `unknown`, the no-interpreter route — the stripped spelling is the
+    # ONLY evidence available, so it is tested before absence is claimed. Tested only on the `unknown`
+    # branch: `absent` (ENOENT) cannot have an existing stripped form, because ENOTDIR is the answer when
+    # it does.
+    local stripped="$f"
+    while [ "${stripped%/}" != "$stripped" ] && [ -n "$stripped" ]; do stripped="${stripped%/}"; done
     # ⛔ THE ERRNO DECIDES WHEN IT CAN (review round 11, P2). `-e` false is false for EVERY stat failure,
     # and absence is only one of them — EXAMPLES, not an enumeration, so the list cannot go stale the way
     # the kind list beside it did: ENOENT, EACCES/EPERM (a TCC denial under a MODE-traversable ancestor),
@@ -579,7 +590,26 @@ repo_set_parse() {
       _rs_say 2 "repo-set: INVALID — $f stat's but is not visible as a path; refusing to guess why."
       return 5
     fi
-    if [ "$kind" = absent ] || { [ -n "$anc" ] && [ -d "$anc" ] && [ -x "$anc" ]; }; then
+    # ⛔ THE WALK'S FALLBACK IS FOR `unknown` ONLY — THE KIND-BLIND FORM CERTIFIED ABSENCE ON AN `ENOTDIR`
+    # PATH (round 47 review, P1 — measured). The clause used to be
+    # `[ "$kind" = absent ] || { [ -n "$anc" ] && [ -d "$anc" ] && [ -x "$anc" ]; }`: the second half
+    # tested the ANCESTOR and never the KIND, so any shape whose nearest existing component is a
+    # TRAVERSABLE DIRECTORY proved absence whatever the errno said. The spelling that reaches it without
+    # a mode bit, a link or an exotic host is a set path ending in `/` on a REGULAR FILE
+    # (`REPO_SET_FILE=<an existing set>/`): `-e` is false there (`stat` says ENOTDIR, the last component
+    # is not a directory), the walk STRIPS the trailing slash and answers the file's parent — a
+    # traversable directory — so the old clause certified "this machine has named no repo" about a file
+    # that is right there, at code 3, which is the one code `pr-doctor-machine.sh`'s degrade branch acts
+    # on. Measured on that exact fixture: the kind-blind clause answers rc 3 `NO-REPO-SET … does not
+    # exist`; with the kind pinned to `unknown` the walk's own fallback below answers rc 5 and keeps its
+    # `must be a DIRECTORY` guidance.
+    # ⛔ WHY `unknown` IS THE ONLY KIND THAT NEEDS THIS CLAUSE: every other kind that can reach here is
+    # either already returned above (`denied`/`other`, `present`) or a MEASURED fault of its own
+    # (`notdir` — a component is a file, which the walk names). `unknown` is the ONE answer that is not a
+    # claim — no interpreter resolve, or an answer outside the six-value contract — so it is the one case
+    # where the traversable-ancestor test is the only evidence available, which is what `j16f` and
+    # `j16l` pin.
+    if [ "$kind" = absent ] || { [ "$kind" = unknown ] && [ ! -e "$stripped" ] && [ -n "$anc" ] && [ -d "$anc" ] && [ -x "$anc" ]; }; then
       # ⛔ "NO HOME TO RESOLVE" IS BROKEN (5), NOT ABSENT (3) (round 32, P2). With `HOME` unset the path
       # above is EMPTY, and calling that "this machine has named no repo" degrades the wrapper on a box
       # that may well have named several — the opposite of what code 3 means. Name it instead.
@@ -607,6 +637,12 @@ repo_set_parse() {
     #     link whose target does not. Here we could neither resolve the link NOR stat through it, so
     #     neither existence nor absence is shown, and that is 5, never 3.
     #   * a nearest existing component that is not a DIRECTORY — a file, a FIFO, or a link resolving to one.
+    #   * a TRAILING-SLASH path whose stripped spelling is an existing NON-directory (`<an existing set>/`).
+    #     ⛔ THE WALK CANNOT SEE THAT COMPONENT: it strips the trailing slash and then starts at the PARENT,
+    #     so for this shape `anc` is a TRAVERSABLE DIRECTORY and every ancestor-based test below is false
+    #     about the real cause (round 47 review, P1 — measured). It is recognised by SPELLING, not by the
+    #     `notdir` errno, because the no-interpreter route has no errno at all. Without this the shape
+    #     reached the absence proof above and answered code 3 for a file that is right there.
     #   * a nearest existing DIRECTORY that is not traversable (mode 000, the TCC shape). It IS a directory,
     #     so the not-a-directory causes are false about it and it needs its own sentence.
     #   * nothing examinable at all (empty `anc`) — declared below, with no arm.
@@ -618,11 +654,19 @@ repo_set_parse() {
       _rs_say 2 "repo-set:   process is allowed to follow it."
       return 5
     fi
-    if [ -n "$anc" ] && [ ! -d "$anc" ]; then
+    if [ -n "$anc" ] && { [ ! -d "$anc" ] || { [ -e "$stripped" ] && [ ! -d "$stripped" ]; }; }; then
       # ⛔ AND THE GUIDANCE IS THE MEASURED ONE, NOT A LIST OF CANDIDATES: the walk has just established
       # that the nearest existing component is a FILE, so offering "launchd has no Full Disk Access" or
       # "check the location and mode" would send the operator to a cause this code just DISPROVED. Every
       # component above the file must be a directory, and one of them is not.
+      # ⛔ AND THE SECOND DISJUNCT IS THE TRAILING-SLASH CAUSE (round 47 review, P1 — measured), stated by
+      # the SPELLING rather than by the errno so it holds with OR without a stat answer: a path ending in
+      # `/` whose stripped spelling EXISTS but is not a directory names a non-directory AS a directory. The
+      # walk cannot see that component (it strips the slash and starts at the PARENT), so `anc` is an
+      # innocent traversable DIRECTORY and the traversability sentence below was false about it. This test
+      # is the one evidence that needs no interpreter, which is why it, and not `kind = notdir`, is what
+      # the arm branches on. "every component above the file must be a DIRECTORY, and one of them is not"
+      # is true of it; "not traversable" is not.
       _rs_say 2 "repo-set: INVALID — $f is not visible from here, because its nearest existing component is not a directory"
       _rs_say 2 "repo-set:   (nearest existing: $anc). That is the BROKEN state, not the absent one:"
       _rs_say 2 "repo-set:   every component above the file must be a DIRECTORY, and one of them is not."
