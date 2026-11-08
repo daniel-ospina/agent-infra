@@ -270,14 +270,17 @@ scanned on any **row** of two or more fields and for any **verdict-shaped token*
 because a vocabulary that drifts by a suffix (`drift_v2`, `drift.v2`, `drift:2`, `DRIFTED!`) or a report
 that prints two-field rows is exactly the class this check exists for. A row is *a path at column 1 with
 no `PROG: text` prefix*: an indented line, and a line whose first field carries a `PROG: ` prefix (a
-program name — it contains no `/` before the colon, unlike a repo-relative path), are prose or wrapper
+program name — it carries no `/` anywhere in field 1, unlike a repo-relative path), are prose or wrapper
 chatter, not rows, and are skipped — otherwise a `tee` wrapper's own progress line would refuse a proven
-match. The skip is a *skip*, not a stop: a real row further down the report is still scanned. Two
+match. The skip is a *skip*, not a stop: a real row further down the report is still scanned. Three
 boundaries are declared rather than implied, because the same bytes are read differently either side of
 them: (i) a colon-space inside a field-1 path that carries **no** `/` at all is read as a `PROG: ` prefix
 and skipped; (ii) a **sentence-final** token on a row-shaped line (`phase | done.`) is inside the class
 and is refused — `done.` and `DRIFTED!` are the same bytes, so refusing the first is the price of never
-certifying the second, which is the fail-closed direction. An empty verdict field is an unreadable row,
+certifying the second, which is the fail-closed direction; (iii) a **path-qualified** program prefix
+(`/usr/local/bin/harness-apply: checking farm | starting`) is NOT skipped, because field-1 shape alone
+cannot separate it from a path carrying a colon-space — it is refused, which is also what the check did
+before the skip existed, so it is the fail-closed price of closing (i). An empty verdict field is an unreadable row,
 not a non-row: a row printed with a trailing separator (`path | a | b |`) splits to zero fields after the
 last divider and is refused instead of dropped. One
 label word in prose is NOT a summary — a healthy copy that mentions a `stale` entry while matching still

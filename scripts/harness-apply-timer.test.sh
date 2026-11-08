@@ -2595,10 +2595,13 @@ assert_contains "$(cat "$T/t24by/state/harness-apply-farm-rows.txt" 2>/dev/null 
     "T24 control: and its name is published"
 
 # ⛔ AND A SKIP IS A SKIP, NOT A STOP — AND AN EMPTY VERDICT FIELD IS A ROW (review round 35, measured:
-# `next` -> `exit` on either skip left the suite GREEN, and the mutant certifies a drifted row that sits
-# AFTER the skipped line: rc=24 -> rc=0 / `farm: ok` / `farm_rows=none` / `farm_n=0`, no artifact. And a
-# row printed with a trailing separator (`a | b | c |`) splits to `NF=4` with an EMPTY `$NF`, matched no
-# clause, was silently dropped, and certified the same values). Mutants that red these rows: either skip
+# EITHER skip changed to `exit` left the suite GREEN while the mutant certified a drifted row sitting AFTER
+# the skipped line: rc=24 -> rc=0 / `farm: ok` / `farm_rows=none` / `farm_n=0`, no artifact. Both skip
+# shapes are therefore placed ABOVE the drift row — an indented line and a `PROG: `-prefixed line — because
+# a fixture that carries only one of them leaves the other skip's `next` unpinned (measured in review round
+# 36: t24bz held the `PROG: ` line alone, so the INDENT skip's `next` -> `exit` mutant was 612/0 green).
+# And a row printed with a trailing separator (`a | b | c |`) splits to `NF=4` with an EMPTY `$NF`, matched
+# no clause, was silently dropped, and certified the same values. Mutants that red these rows: EITHER skip
 # changed to `exit`; and deleting the `v == ""` arm.
 mk_origin t24bz; mk_clone t24bz
 REPO_P="$CLONE"; MODE_P=sync
@@ -2607,6 +2610,7 @@ cat >"$T/t24bz/skip-then-row.sh" <<"FARM"
 #!/usr/bin/env bash
 printf 'check-farm-drift: OK — 5/5 sourced file(s) match the source at origin/main (sync).\n' >&2
 printf 'harness-apply: checking farm | starting\n' >&2
+printf '   graded 5 files, checking each | one at a time\n' >&2
 printf '%-46s | %-12s | %-12s | %s\n' 'handmade.py' aaaa11112222 bbbb33334444 drift >&2
 exit 0
 FARM
