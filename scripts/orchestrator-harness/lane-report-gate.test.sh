@@ -127,6 +127,17 @@ printf '## Files changed\n## Suites run\n## Could not do\n' > "$DECOY_P/WORKTREE
 # The extension decoy deliberately has NO report: the extension mutant then returns ABSENT (1), not PASS.
 
 WT_HEAD="$(git -C "$WT" rev-parse HEAD)"
+# ⛔ THE HONEST BASELINE STATE IS PART OF THE FIXTURE (round-6 review, P1). An ABSENT writer state is
+# now 7 UNMEASURABLE (absence kills the same two head witnesses corruption does, and `rm` is the cheaper
+# way to do it), so every arm that expects a verdict about the EVIDENCE must start from a readable state,
+# exactly as a real run does. `finished_at` is far ahead of the fixture commit so the `predates` witness
+# reads "ran after the commit". Arms that need a different state overwrite this one.
+_restore_state() { # the honest baseline: state bound to the head being merged, evidence after it
+  mkdir -p "$WT/.worktree-report"
+  printf '{"version":1,"head_at_write":"%s","branch":"feat/2977-tm","suites":[{"n":1,"command":"x","exit":0,"finished_at":"2099-01-01T00:00:00Z"}]}\n' \
+    "$WT_HEAD" > "$WT/.worktree-report/state.json"
+}
+_restore_state
 
 # drive <expected-rc> <name> [env…] — run the SHIPPED gate AT THE WORKTREE'S HEAD and assert the code.
 drive() {
@@ -145,24 +156,20 @@ case "$LAST_OUT" in *worktree="$WT "*) ok "PASS resolves the EXACT branch worktr
 # not a control, and it is the only thing that makes a wrong grader visible AFTER it changed a verdict.
 case "$LAST_OUT" in *"tool=$REPO/tools/worktree_report.py"*) ok "PASS names the verifier it used (tool=…)" ;; *) bad "PASS does not name the verifier: $LAST_OUT" ;; esac
 
-# ── 1b. A MISSING WRITER STATE IS RECORDED, NEVER FABRICATED (fresh review, P2) ─┘──────────────
-# The PASS arm above runs with NO `state.json` — which is exactly what this suite models as an ordinary
-# run (the `worktree-behind` arm below deletes it for the same reason). The emit line used to default
-# the MISSING reading to the MERGING head (`report_head=${rec_head:-$head}`), so the merge log recorded
-# a head binding that was never read — in a design whose stated purpose is a countable census. The
-# absence is now NAMED, so the coverage can be counted instead of assumed.
+# ── 1b. AN ABSENT WRITER STATE IS UNMEASURABLE, NOT A PASS (round-6 review, P1) ───────────
+# The PASS arm above runs against the fixture's readable baseline state. With the state REMOVED, the two
+# head witnesses are unreadable — and because `rm` is cheaper than damaging the file, an absent state that
+# PASSED made deleting the witness the cheapest available action for the graded party (measured: the
+# laundering state refused rc=4, then PASSED rc=0 one `rm` later).
+rm -f "$WT/.worktree-report/state.json"
+drive 7 "UNMEASURABLE: an ABSENT writer state kills both head witnesses, exactly as a corrupt one does" STUB_OK=1 STUB_RC=0 STUB_STALE=0
+case "$LAST_OUT" in *reason=writer-state-absent*) ok "…and it names the ABSENT state rather than returning a verdict about the report" ;; *) bad "absent-state reason: $LAST_OUT" ;; esac
+case "$LAST_OUT" in *VERDICT=PASS*) bad "an absent writer state was read as a PASS — deleting the witness was the cheapest bypass" ;; *) ok "…and it is not reported as PASS" ;; esac
 case "$LAST_OUT" in
-  *report_head=unknown*) ok "…and a missing writer state is named report_head=unknown, not the merging head" ;;
-  *) bad "PASS fabricated a report head it never read: $LAST_OUT" ;;
+  *"report_head=$WT_HEAD"*) bad "the refusal substituted the MERGING head for a report head it never read" ;;
+  *) ok "…and no line substitutes the merging head for a head it did not read" ;;
 esac
-case "$LAST_OUT" in
-  *"report_head=$WT_HEAD"*) bad "PASS substituted the MERGING head for a report head it did not read" ;;
-  *) ok "…never substituting the merging head for a head it did not read" ;;
-esac
-case "$LAST_OUT" in
-  *state=absent*) ok "…and the missing state is recorded as state=absent (countable, not silent)" ;;
-  *) bad "PASS did not record that the writer state was absent: $LAST_OUT" ;;
-esac
+_restore_state
 # ── 1c. A CORRUPT WRITER STATE IS UNMEASURABLE, NOT A PASS (fresh review, P2) ──────────────────
 # ⛔ BOTH head witnesses are read out of this file, and both arms that consume them are `[ -n … ]`-guarded
 # — so on a parse failure they go DARK and `ok:true` alone reads as green. The lane owns this worktree,
@@ -173,7 +180,7 @@ printf 'not json at all{{{\n' > "$WT/.worktree-report/state.json"
 drive 7 "UNMEASURABLE: a writer state that exists but will not parse (both head witnesses are dark)" STUB_OK=1 STUB_RC=0 STUB_STALE=0
 case "$LAST_OUT" in *reason=writer-state-corrupt*) ok "…and it names the corrupt state instead of returning a verdict about it" ;; *) bad "corrupt-state reason: $LAST_OUT" ;; esac
 case "$LAST_OUT" in *VERDICT=PASS*) bad "a corrupt writer state was read as a PASS" ;; *) ok "…and it is not reported as PASS" ;; esac
-rm -f "$WT/.worktree-report/state.json"
+_restore_state
 
 # ── 2. THE MEASURED DEFECT: rc 0 + a moved head is NOT a pass ────────────────────────────────────
 mkdir -p "$WT/.worktree-report"
@@ -197,10 +204,10 @@ out="$(env STUB_OK=1 STUB_RC=0 STUB_STALE=0 bash "$GATE" --check "$REPO" "feat/2
 if [ "$rc" = 7 ]; then ok "EMPTY head is UNMEASURABLE (a report cannot be bound to no commit) (rc=$rc)"; else bad "empty head: expected rc=7, got rc=$rc :: $out"; fi
 drive 4 "report written at ANOTHER head (the state disagrees with the head being merged)" STUB_OK=1 STUB_RC=0 STUB_STALE=0
 case "$LAST_OUT" in *VERDICT=STALE*) ok "…and it is STALE, not PASS, even though the consumer exited 0" ;; *) bad "report-bound-to-another-head did not refuse: $LAST_OUT" ;; esac
-# ⛔ THE STATE MUST GO BEFORE THE NEXT ARM, or `rec_head` (which is checked first) answers for it and the
-# worktree-direction row below silently grades the wrong rule — measured: it reported
+# ⛔ THE rec_head WITNESS MUST AGREE HERE, or it (checked first) answers for this row and the
+# worktree-direction row silently grades the wrong rule — measured: it reported
 # `reason=report-bound-to-another-head` while claiming to test the worktree.
-rm -f "$WT/.worktree-report/state.json"
+_restore_state
 # The direction `head_moved_since_write` CANNOT see: the worktree is behind the branch because something
 # else pushed. The consumer reports its own worktree head, so `live_head != $head` is the only witness.
 out="$(env STUB_OK=1 STUB_RC=0 STUB_STALE=0 STUB_HEAD=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
@@ -236,7 +243,7 @@ drive 0 "PASS: evidence finished AFTER the merging commit was created (the hones
 HEAD_ISO="$(git -C "$WT" log -1 --format=%cI "$WT_HEAD")"
 printf '{"version":1,"head_at_write":"%s","branch":"feat/2977-tm","suites":[{"n":1,"command":"x","exit":0,"finished_at":"%s"}]}\n' "$WT_HEAD" "$HEAD_ISO" > "$WT/.worktree-report/state.json"
 drive 4 "STALE: evidence finished in the merging commit's OWN second (ambiguous, so it cannot pass)" STUB_OK=1 STUB_RC=0 STUB_STALE=0
-rm -f "$WT/.worktree-report/state.json"
+_restore_state
 
 # ── 3. RED and INVALID, and polarity by CONTENT ──────────────────────────────────────────────────
 drive 3 "RED: valid evidence that records a failing suite (consumer exit 3)" STUB_OK=0 STUB_RC=3 STUB_FAILING=1
@@ -263,6 +270,36 @@ _shim_wins="$(PATH="$SHIMDIR" /bin/sh -c 'command -v python3' 2>/dev/null)"
 if [ "$_shim_wins" = "$SHIMDIR/python3" ]; then ok "CONTROL the planted python3 IS what a PATH lookup returns ($_shim_wins) — so the arm below can fail"; else bad "CONTROL the planted shim is not reachable by a PATH lookup, so the arm below cannot fail"; fi
 out="$(env STUB_OK=0 STUB_RC=3 STUB_FAILING=1 PATH="$SHIMDIR:$PATH" bash "$GATE" --check "$REPO" "feat/2977-tm" "$WT_HEAD" 2>&1)"; rc=$?
 if [ "$rc" = 3 ]; then ok "a PATH-shimmed python3 does NOT flip genuinely RED evidence (rc=$rc) — the interpreter is pinned, not inherited"; else bad "PATH chose the interpreter: expected rc=3, got rc=$rc :: $out"; fi
+# ── 2d. NO AMBIENT IMPORT OR GIT VARIABLE MAY DECIDE THE VERDICT EITHER (round-6 review, P0) ──
+# ⛔ PINNING THE INTERPRETER PATH CLOSES "WHICH PROGRAM", NOT "WHICH MODULES". `python3 -c` puts `''`
+# (the process CWD) at `sys.path[0]` and honours `PYTHONPATH`, and BOTH are lane-controlled: a lane runs
+# lane-merge.sh itself with cwd = its own worktree, so an UNTRACKED `json.py` (or one `export`) made the
+# single pass that decides ok/stale/rec_head/predates return whatever the graded party wanted —
+# measured RED (rc 3) → PASS (rc 0) with a shim that only defines `loads()`. Both invocations now run
+# under `-I`, which implies `-E -s` and drops the cwd/script-dir entry.
+SEAM="$TMP/seam"; mkdir -p "$SEAM/shim" "$SEAM/cwd"
+cat > "$SEAM/shim/json.py" <<'LIARJSON'
+def loads(s, *a, **k):
+    return {"ok": True, "rules": [], "suites": 1, "failing_suites": 0,
+            "head": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", "head_moved_since_write": False}
+def load(f, *a, **k):
+    return {}
+LIARJSON
+cp "$SEAM/shim/json.py" "$SEAM/cwd/json.py"
+# Negative control: prove the shim WOULD have decided, so the arm can fail.
+_ctl="$(PYTHONPATH="$SEAM/shim" "$(command -v python3)" -c 'import json; print(json.loads("{}").get("ok"))' 2>/dev/null)"
+if [ "$_ctl" = "True" ]; then ok "CONTROL the PYTHONPATH shim DOES decide a bare python3 import — so the arms below can fail"; else bad "CONTROL the PYTHONPATH shim is inert, so the arms below cannot fail"; fi
+out="$(env STUB_OK=0 STUB_RC=3 STUB_FAILING=1 PYTHONPATH="$SEAM/shim" bash "$GATE" --check "$REPO" "feat/2977-tm" "$WT_HEAD" 2>&1)"; rc=$?
+if [ "$rc" = 3 ]; then ok "a PYTHONPATH-supplied json cannot flip genuinely RED evidence (rc=$rc) — the verdict pass is isolated"; else bad "PYTHONPATH supplied the module that computes the verdict: expected rc=3, got rc=$rc :: $out"; fi
+# The untracked-cwd variant needs no env at all — the lane simply runs the gate from its own worktree.
+out="$(cd "$SEAM/cwd" && env STUB_OK=0 STUB_RC=3 STUB_FAILING=1 bash "$GATE" --check "$REPO" "feat/2977-tm" "$WT_HEAD" 2>&1)"; rc=$?
+if [ "$rc" = 3 ]; then ok "…and an UNTRACKED json.py in the calling directory cannot either (rc=$rc)"; else bad "a cwd json.py decided the verdict: expected rc=3, got rc=$rc :: $out"; fi
+# ⛔ `git -C <dir>` DOES NOT OVERRIDE AN AMBIENT `GIT_DIR`, so the enumerations that choose WHICH REPO is
+# graded could be answered by another repository entirely (measured: a foreign GIT_DIR made the gate grade
+# another repo's worktree and PASS for a branch/head belonging to the named repo).
+out="$(env STUB_OK=0 STUB_RC=3 STUB_FAILING=1 GIT_DIR=/nonexistent/git/dir bash "$GATE" --check "$REPO" "feat/2977-tm" "$WT_HEAD" 2>&1)"; rc=$?
+if [ "$rc" = 3 ]; then ok "…and an ambient GIT_DIR cannot retarget which repo is graded (rc=$rc)"; else bad "GIT_DIR retargeted the enumeration: expected rc=3, got rc=$rc :: $out"; fi
+
 # The structural half: the resolver must not consult PATH at all. Kept deliberately BLUNT (any
 # `command -v` in the function body fails) — a precise pattern here is how the previous version of this
 # row matched nothing and stayed green over a mutant.

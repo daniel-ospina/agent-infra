@@ -76,6 +76,15 @@
 # are GONE rather than gated behind a second variable.
 set -u
 
+# ⛔ `git -C "$repo"` DOES NOT OVERRIDE AN AMBIENT `GIT_DIR` (round-6 review, P0). Git prefers `GIT_DIR`
+# / `GIT_WORK_TREE` over the `-C` directory, so every enumeration below — the branch's worktree and the
+# main-worktree resolution the consumer is read from — could be answered by a DIFFERENT repository while
+# the gate reported a verdict about the named one: measured, `GIT_DIR=<other>/.git` made the gate grade
+# another repo's worktree (a PASS) for a branch and head belonging to the named repo. Same class as the
+# `PATH`/`PYTHONPATH` seams: an inherited variable choosing the subject of the verdict. The gate never
+# needs either — it always names its repo explicitly — so they are dropped once, at entry.
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES
+
 # _lrg_emit <code> <verdict> <key=value>… — one machine-readable line on stdout, then the code.
 _lrg_emit() {
   local code="$1" verdict="$2"; shift 2
@@ -237,7 +246,16 @@ lane_report_gate() {
 
   py="$(_lrg_py)" || { _lrg_emit 7 UNMEASURABLE "branch=$branch worktree=$wt tool=$tool reason=no-python-interpreter head=$head"; return 7; }
 
-  out="$("$py" "$tool" check --json --worktree "$wt" 2>/dev/null)"; rc=$?
+  # ⛔ `-I` (ISOLATED MODE) IS PART OF THE SAME TRUST BOUNDARY AS THE ABSOLUTE INTERPRETER (round-6
+  # review, P0). Pinning the interpreter path closes "which PROGRAM", not "which MODULES": `python3 -c`
+  # puts `''` (the process CWD) at `sys.path[0]` and honours `PYTHONPATH`, and BOTH are lane-controlled —
+  # a lane runs `lane-merge.sh` itself with cwd = its own worktree, so an UNTRACKED `json.py` (or one
+  # `export PYTHONPATH`) made the verdict pass return whatever the graded party wanted: measured
+  # RED (`ok:false`, rc 3) → PASS (rc 0) with a shim that only had to define `loads()`. `-I` implies
+  # `-E -s` and drops the cwd/script-dir entry, so neither PYTHONPATH nor a cwd `json.py`,
+  # `datetime.py` or `sitecustomize.py` can supply a module. Both programs are stdlib-only by design
+  # (`_lrg_py`'s note), so `-I` costs nothing.
+  out="$("$py" -I "$tool" check --json --worktree "$wt" 2>/dev/null)"; rc=$?
   case "$out" in
     *'{'*) : ;;
     *) _lrg_emit 7 UNMEASURABLE "branch=$branch worktree=$wt tool=$tool reason=consumer-produced-no-json check_rc=$rc head=$head"; return 7 ;;
@@ -354,24 +372,13 @@ print("%s|%s|%s|%s|%s|%s|%s|%s" % (
     skew,
     state_ok,
 ))'
-  if ! IFS='|' read -r ok stale rules rec_head live_head predates skew state_ok <<< "$("$py" -c "$_LRG_JSON_PY" "$out" "$wt/.worktree-report/state.json" "$commit_iso" 2>/dev/null)"; then
+  if ! IFS='|' read -r ok stale rules rec_head live_head predates skew state_ok <<< "$("$py" -I -c "$_LRG_JSON_PY" "$out" "$wt/.worktree-report/state.json" "$commit_iso" 2>/dev/null)"; then
     _lrg_emit 7 UNMEASURABLE "branch=$branch worktree=$wt tool=$tool reason=consumer-json-unusable check_rc=$rc head=$head"
     return 7
   fi
   # An empty parse is the SAME witness as a failed one: the python exits 0 having printed nothing only
   # when it could not read the object, and `read` on an empty string SUCCEEDS on bash 3.2.
   case "$ok" in 0|1) : ;; *) _lrg_emit 7 UNMEASURABLE "branch=$branch worktree=$wt tool=$tool reason=consumer-json-unusable check_rc=$rc head=$head"; return 7 ;; esac
-  # ⛔ A MISSING/CORRUPT WRITER STATE KILLS BOTH HEAD WITNESSES, SO IT CANNOT BE A PASS (fresh review,
-  # P2). Checked BEFORE the arms that consume it and before the consumer's own `ok` is trusted: with
-  # `rec_head`/`predates` empty, `ok:true` alone reads as green here, and the lane controls this
-  # worktree — `rm .worktree-report/state.json` would otherwise delete both witnesses in one command.
-  # The remedy is the ordinary re-run (the writer re-creates it), which is why this is 7 UNMEASURABLE
-  # rather than a STALE/INVALID verdict about evidence that half-exists.
-  if [ "$state_ok" = "corrupt" ]; then
-    _lrg_emit 7 UNMEASURABLE "branch=$branch worktree=$wt tool=$tool reason=writer-state-corrupt state=$wt/.worktree-report/state.json head=$head"
-    return 7
-  fi
-
   if [ "$ok" != "1" ]; then
     if [ "$rc" = "3" ]; then
       _lrg_emit 3 RED "branch=$branch worktree=$wt report=$wt/WORKTREE-REPORT.md reason=recorded-suites-did-not-pass rules=${rules:-none} stale=$stale head=$head"
@@ -379,6 +386,22 @@ print("%s|%s|%s|%s|%s|%s|%s|%s" % (
     fi
     _lrg_emit 2 INVALID "branch=$branch worktree=$wt report=$wt/WORKTREE-REPORT.md reason=evidence-invalid rules=${rules:-none} head=$head"
     return 2
+  fi
+
+  # ⛔ AN ABSENT WRITER STATE IS THE SAME FAILURE AS A CORRUPT ONE, AND THE SAME REFUSAL (round-6 review,
+  # P1 — the round-5 fix left this asymmetric, which was indefensible). `rec_head` (the
+  # `report-bound-to-another-head` arm) and `predates` (the laundering arm) are BOTH read out of this
+  # file and both arms are `[ -n … ]`-guarded, so absence kills the identical two witnesses corruption
+  # does — and `rm` is CHEAPER to type than a truncation, so leaving absence as a PASS made the deleted
+  # witness the cheapest action available to the graded party while the damaged one was refused. The
+  # lane owns this worktree; a witness it can remove is not a witness. Both are therefore 7
+  # UNMEASURABLE, with the reason naming which, because the remedies differ.
+  # ⛔ ORDERED AFTER the `ok != 1` refusal ON PURPOSE: a report whose suites DID NOT PASS must read RED /
+  # INVALID — those are verdicts about the evidence and are the more actionable answer. Only once the
+  # consumer has said "the evidence passes" does an unreadable head binding become the deciding fault.
+  if [ "$state_ok" != "ok" ]; then
+    _lrg_emit 7 UNMEASURABLE "branch=$branch worktree=$wt tool=$tool reason=writer-state-$state_ok state=$wt/.worktree-report/state.json head=$head"
+    return 7
   fi
 
   # ⛔ THE ROW THE WRITER DELIBERATELY LEAVES TO ITS CONSUMER. `check` exits 0 here.
@@ -437,7 +460,7 @@ lane_report_remedy() {
     2) printf '  The evidence in the report does not hold up (a recorded log is missing, its hash does not\n  match, or a promised section is absent). Re-run the affected suite through the tool so the record\n  matches its log.\n' ;;
     3) printf '  The report RECORDS A FAILING SUITE. A green report is a precondition of merge: fix the failure and\n  re-run that suite through the tool (a lane whose own evidence says red may not merge).\n' ;;
     4) printf '  The report does not describe the tree being merged (it was written at another head, the\n  lane worktree is not at the head on the branch, or its evidence finished before that head was\n  created — a push from another worktree/box moves the branch and leaves your worktree behind).\n  Re-run the suites AT THE HEAD ON THE BRANCH through the tool (do NOT just re-render):\n     git -C <your worktree> status ; git log --oneline -1   # confirm you are at the PR head\n     python3 tools/worktree_report.py run --cmd <the exact command>   # for each suite\n  ⛔ `write`, `note` and a plain `init` re-render the report AND re-stamp the recorded head WITHOUT\n  re-running anything, so they turn a stale report into a green-looking one. Only `run` produces\n  evidence for the head you are merging.\n  ⛔ If the reason is `merging-head-is-dated-ahead-of-this-box`, RE-RUNNING WILL NOT HELP: the head\n  was committed on a box whose clock is ahead, so no run here can ever be newer than it. Re-push the\n  head from a correctly-clocked box, or wait for the skew to pass.\n' ;;
-    7) printf '  The report exists but could not be VERIFIED (no interpreter, or the consumer failed / printed no\n  parseable JSON). An unreadable verification is not a pass: repair the consumer, then re-run.\n' ;;
+    7) printf '  The report exists but could not be VERIFIED. Two distinct causes, with different remedies:\n     • no interpreter, or the consumer failed / printed no parseable JSON — repair the consumer, then re-run;\n     • the writer state is missing or damaged (`reason=writer-state-absent|corrupt`) — the head binding\n       lives there, so the report cannot be tied to the head being merged. Do NOT hand-edit or delete\n       it: re-run the suites through the tool (`python3 tools/worktree_report.py run --cmd <cmd>`),\n       which rewrites the state. A state file you removed is a witness you removed.\n  An unreadable verification is not a pass.\n' ;;
     *) : ;;
   esac
 }
