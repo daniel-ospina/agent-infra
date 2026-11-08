@@ -232,19 +232,10 @@ else
     fi
 fi
 
-# 2k. the ref delete is a COMPARE-AND-DELETE, never `git branch -D` (#1393 G3):
-#     a moved tip must be refused rather than destroyed. Exercises the primitive the
-#     script now relies on, on this git.
-git branch fix/cas-1
-git branch fix/cas-2
-CAS_OLD="$(git rev-parse fix/cas-1)"
-git checkout -q fix/cas-1 && echo moved >> file.txt && git commit -qam moved && git checkout -q main
-if git update-ref -d refs/heads/fix/cas-1 "$CAS_OLD" 2>/dev/null; then
-    bad "update-ref -d accepted a MOVED tip (the CAS this script relies on does not hold)"
-else
-    git show-ref --verify --quiet refs/heads/fix/cas-1 && ok "update-ref -d refuses a moved tip (CAS holds)" || bad "CAS refusal removed the ref anyway"
-fi
-git branch -D fix/cas-1 fix/cas-2 >/dev/null 2>&1 || true
+# 2k. the ref delete is a COMPARE-AND-DELETE, never `git branch -D` (#1393 G3).
+#     (The behavioural row is 2m: it drives the SCRIPT's own swap. A primitive-only
+#     check here would be invariant under every mutation of the script — #3442 rule 3 —
+#     so it is deliberately not asserted.)
 assert_not_contains "$(grep -vE '^[[:space:]]*#' scripts/scan-orphans.sh)" "git branch -D" "script never calls git branch -D"
 
 # ── #3799 review, Finding 1: `update-ref -d` does NOT inherit `git branch -D`'s
@@ -386,6 +377,86 @@ else
     assert_eq "$(wc -l < "$WORKTREES_RECORD" | tr -d ' ')" "1" "the record of an unreachable tree is not pruned"
     $RW done --dispatch d-gh >/dev/null
     rm -rf "$FIX/ghost-parent"
+fi
+
+
+# ── 2s. an EXISTING dir git does not vouch for must be refused by --apply AND must not be
+#     advertised as "safe to remove" by the default run (round-3 F2 + F3). A clean directory
+#     inside the checkout measures `clean`, so only the is_wt arm stands between it and a
+#     forced removal — the poisoned-record shape of review #216, in its measurable form.
+#     (A subdirectory of THIS checkout would be `dirty` — its files are untracked here — and
+#     would be caught by the dirt arm instead. To reach the is_wt arm the state must measure
+#     `clean`, so the recorded dir is a CLEAN checkout of a DIFFERENT repo.)
+git init -q -b main "$FIX/other-repo"
+git -C "$FIX/other-repo" config user.email test@test.test
+git -C "$FIX/other-repo" config user.name "Test Runner"
+echo theirs > "$FIX/other-repo/theirs.txt"
+git -C "$FIX/other-repo" add -A && git -C "$FIX/other-repo" commit -qm theirs
+git branch fix/subdir-1
+$RW add --branch fix/subdir-1 --worktree "$FIX/other-repo" --dispatch d-subdir --ts 2026-08-01T00:00:00Z >/dev/null
+OUT="$($SCAN)"
+assert_contains "$OUT" "does not vouch" "a clean unregistered dir is not advertised as safe to remove"
+assert_contains "$OUT" "ORPHANED BUT DIRTY" "a clean unregistered dir is classified DIRTY, not ORPHANED"
+$SCAN --apply >/dev/null 2>&1 || true
+[ -f "$FIX/other-repo/theirs.txt" ] && ok "a clean unregistered dir is never removed" || bad "--apply REMOVED a clean unregistered dir"
+git show-ref --verify --quiet refs/heads/fix/subdir-1 && ok "its branch is kept" || bad "its branch was deleted"
+assert_eq "$(wc -l < "$WORKTREES_RECORD" | tr -d ' ')" "1" "its record is kept"
+# --force-dirty is what REACHES the is_wt arm (without it the dirty arm never calls reap_record),
+# and it must refuse there too — this is the row that pins that guard (round-3 F2).
+OUT2="$($SCAN --apply --force-dirty 2>&1 || true)"
+assert_contains "$OUT2" "exists but git does not vouch" "--force-dirty reports the is_wt refusal"
+[ -f "$FIX/other-repo/theirs.txt" ] && ok "--force-dirty does not authorize an unregistered dir" || bad "--force-dirty removed an unregistered dir"
+$RW done --dispatch d-subdir >/dev/null
+git branch -D fix/subdir-1 >/dev/null 2>&1 || true
+rm -rf "$FIX/other-repo"
+
+# ── 2t. an UNREADABLE worktree list REFUSES the ref delete (round-3 F2, second guard):
+#     "not checked out anywhere" cannot be established, so nothing is deleted.
+cat > "$FIX/shim/git" <<'EOS'
+#!/usr/bin/env bash
+case " $* " in
+  *" worktree list --porcelain "*) exit 1 ;;
+esac
+exec "$GIT_WRAP_REAL" "$@"
+EOS
+chmod +x "$FIX/shim/git"
+git branch fix/tlist-1
+$RW add --branch fix/tlist-1 --worktree "$FIX/gone-four" --dispatch d-tlist --ts 2026-08-01T00:00:00Z >/dev/null
+OUT="$(PATH="$FIX/shim:$PATH" GIT_WRAP_REAL="$REAL_GIT" GIT_WRAP_REPO="$REPO" $SCAN --apply 2>&1 || true)"
+git show-ref --verify --quiet refs/heads/fix/tlist-1 && ok "an unreadable worktree list refuses the ref delete" || bad "the ref was deleted without establishing it was not checked out"
+assert_contains "$OUT" "worktree list could not be read" "the unreadable-list refusal is named"
+assert_eq "$(wc -l < "$WORKTREES_RECORD" | tr -d ' ')" "1" "the record is kept when the list is unreadable"
+$RW done --dispatch d-tlist >/dev/null
+git branch -D fix/tlist-1 >/dev/null 2>&1 || true
+
+
+# ── 2u. round-3 F1: after a FAILED removal the post-failure test must not be a bare stat.
+#     The wrapper `git` makes `worktree remove` fail AND makes the directory unstatable
+#     (chmod 444 on its parent) in the same instant — exactly the TOCTOU the fix is about.
+#     A bare `path_there` then reads "gone" and deletes the only ref to the tree.
+if [ "$(id -u)" = 0 ]; then
+    echo "  ⏭️  skipped 2u (running as root — chmod cannot make a path unstatable)"
+else
+    mkdir -p "$FIX/vparent"
+    git worktree add -q "$FIX/vparent/wt" -b fix/vanish-1
+    $RW add --branch fix/vanish-1 --worktree "$FIX/vparent/wt" --dispatch d-vanish --ts 2026-08-01T00:00:00Z >/dev/null
+    cat > "$FIX/shim/git" <<'EOS'
+#!/usr/bin/env bash
+case " $* " in
+  *" worktree remove "*) chmod 444 "$GIT_WRAP_PARENT"; exit 1 ;;
+esac
+exec "$GIT_WRAP_REAL" "$@"
+EOS
+    chmod +x "$FIX/shim/git"
+    OUT="$(PATH="$FIX/shim:$PATH" GIT_WRAP_REAL="$REAL_GIT" GIT_WRAP_REPO="$REPO" GIT_WRAP_PARENT="$FIX/vparent" $SCAN --apply 2>&1 || true)"
+    chmod 755 "$FIX/vparent"
+    assert_contains "$OUT" "not provably gone" "a removal that fails onto an unstatable dir is KEPT, not read as gone"
+    git show-ref --verify --quiet refs/heads/fix/vanish-1 && ok "the ref survives a failed removal onto an unstatable dir" || bad "the ref was deleted for a tree that could not be proved gone"
+    assert_eq "$(wc -l < "$WORKTREES_RECORD" | tr -d ' ')" "1" "the record is kept too"
+    $RW done --dispatch d-vanish >/dev/null
+    git worktree remove --force "$FIX/vparent/wt" >/dev/null 2>&1 || true
+    git branch -D fix/vanish-1 >/dev/null 2>&1 || true
+    rm -rf "$FIX/vparent"
 fi
 
 # ── Summary ───────────────────────────────────────────────────────────────

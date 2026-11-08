@@ -86,6 +86,11 @@
 #       --apply acts, and `git worktree remove --force` does not refuse — `--force` suppresses git's
 #       own dirty guard, which is the only guard left. So the state is re-measured IMMEDIATELY before
 #       the removal and a tree that changed since classification is kept (the #1105 window shape).
+#       ⛔ AND THE POST-FAILURE TEST IS THE SAME QUESTION (round-3 F1). A failed `worktree remove`
+#       followed by a bare `[ -e "$dir" ]` is the third instance of "a failed stat is not absence":
+#       a directory that lost its `x` parent, or sits on a dropped mount, INSIDE that window reads
+#       as gone and its only ref is deleted. It asks `worktree_state` too, so `absent` is still
+#       decided on evidence.
 #
 # ⛔ WHAT --force-dirty DOES AND DOES NOT AUTHORIZE. It authorizes destroying UNCOMMITTED WORK in a
 # registered worktree — that is the documented cost of the flag and the operator asked for it. It
@@ -287,8 +292,14 @@ reap_record() {
                     return 1
                 fi
                 if ! git worktree remove --force "$dir" 2>/dev/null; then
-                    if path_there "$dir"; then
-                        printf '%b' "     ⚠️ KEPT tree+ref+record: 'git worktree remove' failed and the tree is still there — the branch is kept because the tree may be the only copy of what it points at.\n"
+                    # ⛔ THE POST-FAILURE TEST IS NOT A BARE `path_there` (round-3 F1, third instance of
+                    # the same root): it is FALSE for any stat failure, so a directory that lost its
+                    # `x` parent or sits on a dropped mount INSIDE this window would read as "gone"
+                    # and the only ref to it would be deleted. Ask the state machine, which decides
+                    # `absent` on evidence.
+                    st="$(worktree_state "$dir")"
+                    if [ "$st" != absent ]; then
+                        printf '%b' "     ⚠️ KEPT tree+ref+record: 'git worktree remove' failed and the directory is not provably gone (state '${st}') — the branch is kept because the tree may be the only copy of what it points at.\n"
                         return 1
                     fi
                 fi ;;
@@ -392,16 +403,24 @@ if [ -f "$RECORD_FILE" ]; then
         WT_STATE="$(worktree_state "$DIR")"
         DIRTY_B=0
         case "$WT_STATE" in
-            absent|clean) DIRTY_B=0 ;;
+            absent) DIRTY_B=0 ;;
+            # ⛔ AN EXISTING DIRECTORY GIT DOES NOT VOUCH FOR IS NOT "safe to remove" (round-3 F3).
+            # `--apply` refuses it (the `is_wt` arm), but the DEFAULT run — the one an operator and
+            # `extensions/auto-sync.ts` actually read — printed it as ORPHANED and said nothing to
+            # contradict that. The classification has to agree with the destruction path.
+            clean) [ "$IS_WT" = true ] && DIRTY_B=0 || DIRTY_B=1 ;;
             *) DIRTY_B=1 ;;
         esac
         if [ "$DIRTY_B" = 1 ]; then
             DIRTY=$((DIRTY + 1))
-            if [ "$WT_STATE" = unmeasurable ]; then
-                DIRTY_OUT="${DIRTY_OUT}  ⚠️  ORPHANED BUT DIRTY: branch=$BRANCH dir=$DIR — state UNMEASURABLE, not a readable checkout, so uncommitted work there cannot be ruled out\n"
-            else
-                DIRTY_OUT="${DIRTY_OUT}  ⚠️  ORPHANED BUT DIRTY: branch=$BRANCH dir=$DIR (uncommitted changes — review manually)\n"
-            fi
+            case "$WT_STATE" in
+                unmeasurable)
+                    DIRTY_OUT="${DIRTY_OUT}  ⚠️  ORPHANED BUT DIRTY: branch=$BRANCH dir=$DIR — state UNMEASURABLE, not a readable checkout, so uncommitted work there cannot be ruled out\n" ;;
+                clean)
+                    DIRTY_OUT="${DIRTY_OUT}  ⚠️  ORPHANED BUT DIRTY: branch=$BRANCH dir=$DIR — clean, but git does not vouch for it as a worktree of this repo, so its contents cannot be reaped safely\n" ;;
+                *)
+                    DIRTY_OUT="${DIRTY_OUT}  ⚠️  ORPHANED BUT DIRTY: branch=$BRANCH dir=$DIR (uncommitted changes — review manually)\n" ;;
+            esac
             if [ "$APPLY" = true ]; then
                 if [ "$FORCE_DIRTY" = true ]; then
                     if reap_record "$BRANCH" "$DIR" "$DISPATCH" "$IS_WT" true; then :; else KEPT=$((KEPT + 1)); fi
