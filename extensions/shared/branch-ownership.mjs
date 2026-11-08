@@ -96,7 +96,21 @@ function _norm(p) {
 /**
  * Read branch state from a repo: { gitDir, branch (null if detached), head }.
  * Single combined git call (latency mitigation, plan AC/perf row).
- * Returns null when git fails (callers apply the fail-closed policy).
+ * Returns null when the repo is genuinely UNREADABLE (callers apply the
+ * fail-closed policy) — never merely because there is no commit yet (#2218).
+ *
+ * #2218: an UNBORN HEAD — a freshly-initialised repo with ZERO commits, also
+ * reached by `git checkout --orphan <new>` — makes the combined probe itself
+ * fail: `rev-parse` treats `HEAD` as an ambiguous argument and exits 128
+ * (`fatal: ambiguous argument 'HEAD': unknown revision or path not in the
+ * working tree`). A zero-commit repo is perfectly READABLE (`status` rc 0),
+ * so reading that as "unverifiable" blocked the FIRST commit in every fresh
+ * repo and trained lanes to mint the 15-minute escape hatch for a trivial
+ * commit. On the probe's failure path the state is re-read in pieces, which
+ * needs no commit: `rev-parse --git-dir` proves the repo is readable,
+ * `symbolic-ref --short -q HEAD` names the unborn branch, and
+ * `rev-parse --verify --quiet HEAD` separates "no commit yet" (exit 1 → head
+ * null) from an unreadable repo (any other exit → null, fail-closed).
  * @param {string} cwd
  * @param {string} [gitDir] explicit --git-dir (resolved) override
  */
@@ -105,9 +119,13 @@ export function readBranchState(cwd, gitDir) {
   try {
     // Order matters: --abbrev-ref applies to ALL following args, so the plain
     // HEAD (full sha) must come BEFORE --abbrev-ref HEAD (branch name).
+    // An explicit stdio disables execSync's stderr passthrough: git's `fatal:`
+    // line is EXPECTED on the unborn-HEAD path (#2218) and re-printing it on a
+    // healthy repo's first commit is exactly the confusion that path caused.
+    // It is re-emitted below only when the repo really is unreadable.
     const out = execSync(
       `git ${flags} rev-parse --git-dir HEAD --abbrev-ref HEAD`,
-      { encoding: "utf-8", cwd, timeout: 5000 },
+      { encoding: "utf-8", cwd, timeout: 5000, stdio: ["ignore", "pipe", "pipe"] },
     ).trim().split("\n");
     const [gd, head, branch] = out;
     if (!gd || !head) return null;
@@ -119,9 +137,58 @@ export function readBranchState(cwd, gitDir) {
       branch: branch === "HEAD" ? null : branch,
       head,
     };
-  } catch {
-    return null;
+  } catch (e) {
+    const state = _readBranchStateWithoutCommit(cwd, gitDir);
+    // Unreadable repo (not merely commit-less): keep git's own diagnosis so a
+    // real failure is never silent — the silent case is the unborn HEAD only.
+    if (!state && e && e.stderr) {
+      try { process.stderr.write(String(e.stderr)); } catch { /* never mask the null */ }
+    }
+    return state;
   }
+}
+
+/**
+ * Failure-path reader for `readBranchState` (#2218): report a READABLE repo
+ * that has no commit yet as `{ gitDir, branch, head: null }` instead of
+ * collapsing it into the unreadable case. Each probe is argv-based (no shell)
+ * and every "unknown" outcome still returns null, so the fail-closed policy
+ * is preserved for anything genuinely unreadable.
+ * @param {string} cwd
+ * @param {string} [gitDir]
+ * @returns {{gitDir: string, branch: string|null, head: string|null}|null}
+ */
+function _readBranchStateWithoutCommit(cwd, gitDir) {
+  const prefix = gitDir ? [`--git-dir=${gitDir}`] : [];
+  const run = (args) => execFileSync("git", [...prefix, ...args], {
+    encoding: "utf-8", cwd, timeout: 5000, stdio: ["ignore", "pipe", "ignore"],
+  });
+  let gd;
+  try {
+    gd = run(["rev-parse", "--git-dir"]).trim();
+  } catch {
+    return null; // the repo itself is unreadable → unknown → fail-closed
+  }
+  if (!gd) return null;
+  // The branch name WITHOUT needing a commit: `--short -q` prints the unborn
+  // branch and exits 0, and exits 1 for a DETACHED HEAD (no branch to name).
+  let branch = null;
+  try {
+    branch = run(["symbolic-ref", "--short", "-q", "HEAD"]).trim() || null;
+  } catch (e) {
+    if (e?.status !== 1) return null; // unknown failure → fail-closed
+  }
+  // `--verify --quiet` exits 1 when HEAD does not resolve. On an unborn HEAD
+  // that is "there is no commit yet" — a fact about the repo, not a read
+  // error — and any other exit stays unknown.
+  let head = null;
+  try {
+    head = run(["rev-parse", "--verify", "--quiet", "HEAD"]).trim() || null;
+  } catch (e) {
+    if (e?.status !== 1) return null;
+  }
+  if (!head && !branch) return null; // no commit AND no branch name → unknown
+  return { gitDir: resolve(cwd, gd), branch, head };
 }
 
 /**

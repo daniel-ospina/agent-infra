@@ -1575,7 +1575,7 @@ denied_extension_copies() { # <agent-dir>
       # `rm -rf`) — and if the repo SHIPS such a name, install would ship it and this sweep delete
       # it, so `--verify` would fail `extension MISSING` on every run and the cell could never be
       # provisioned. So the remainder must be a copy MARKER, and a ship-list row is never a copy.
-      if printf '%s\n' "$shipped" | grep -Fxq "$fbase"; then continue; fi
+      if grep -Fxq -- "$fbase" <<<"$shipped"; then continue; fi
       denied_copy_variant "$fbase" "$stem" || continue
       loadable_extension_entry "$f" || continue
       printf '%s\n' "$f"

@@ -1745,7 +1745,12 @@ ck "a disk-refused fixer starts no agent and does NOT re-run the merge chain" $r
 # memory: the third remedy is neither "wait for load" nor "reclaim disk" (a lane must FINISH), so a
 # caller that folds it into either sends the operator to a reading that will never move.
 fix_argv; printf '2\n' > "$RO/state/fixcount-7"; : > "$PI_LOG"; : > "$MERGE_LOG"; : > "$RO/logs/fix-7.log"
+# ⛔ ALL FOUR DISK TERMS, NOT ONE (disk-admission.test.sh §K). This arm's subject is the MEMORY refusal
+# (81), and the disk gate is evaluated BEFORE it — so with `DISK_LANE_TREE_MB`/`DISK_LANE_SELF_MB`/
+# `DISK_LANE_RESERVE_MB` unstated the lane-headroom term defaults to this host's own cost and a
+# disk-tight box answers 77 (a DISK-NOHEADROOM refusal) where the arm expects 81.
 ( cd "$RREPO" && O="$RO" MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 MEM_MIN_AVAIL_MB=999999999 \
+    DISK_LANE_TREE_MB=0 DISK_LANE_SELF_MB=0 DISK_LANE_RESERVE_MB=0 \
     PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
     bash "$HERE/fix-one.sh" --argv "$RIG/argv7" ) >/dev/null 2>&1; mrc=$?
 mgot="$(cat "$RO/state/fixcount-7" 2>/dev/null)"
@@ -6014,14 +6019,63 @@ done
 # ⛔ THIS ARM USED TO BE VACUOUS: it moved `$RREG/origin2.git`, a path nothing ever created (`mv:` said
 # so in the output), so the registry stayed reachable and `rc=0` passed without exercising anything. A
 # test whose setup silently no-ops is decoration. The remote is now REALLY broken — re-pointed at a path
-# that does not exist, with this box's local witness removed so no fallback can answer either.
+# that does not exist, with a local witness that cannot answer either.
+# ⛔ AND "A LOCAL WITNESS THAT CANNOT ANSWER" NEEDS ITS OWN EMPTY DIRECTORY (measured 2026-11-07,
+# two defects in this one probe):
+#   1. The probe inherited the AMBIENT fallback — `~/.pi/agent/state/lanes` on a real box, over a
+#      thousand records (1,079 here when measured; the count only grows, the defect does not) — so
+#      the registry answered `readable:true … FELL BACK to local` with rc 0 while
+#      the remote WAS unreachable, and the arm reddened on a CORRECT fail-closed registry.
+#   2. Pinning the probe to `$RREG/state/lanes` (the obvious repair) was still wrong, because
+#      `rdrive` above is run with `LANE_REGISTRY=1` and the lane WRITES ITS OWN RECORD into that
+#      directory — the probe then reads the record the lane just wrote and answers rc 0 again. The
+#      `rm -rf` that used to sit before `rdrive` cannot help: it is undone by the run it precedes.
+# So the probe gets a PRIVATE, EMPTY pair of paths that nothing else in this fixture writes, and the
+# FIXTURE's own env on all four vars — the same four `rdrive`/`r_end` pass — so the invocation under
+# test resolves the way its siblings do (#3604). `rc=3` then means exactly what the arm asserts — the
+# remote cannot be reached and NO local witness can answer — instead of a fact about this host or about
+# the lane the arm is measuring. Same defect class the suite's own brief-gate note names: a fixture that
+# inherits ambient (or sibling) state cannot make a claim about isolation.
+# ⛔ AND THE RC IS NOT THE WHOLE CLAIM (#3604). A registry that DEGRADES — answering `readable:true`
+# from this box's own records — is the false-negative the arm exists to catch, and it can degrade with
+# rc 3 the day someone changes the mapping. So the assertion reads the ANSWER as well: `readable` must
+# be `false`, and the source must not name the box-local fallback. Both halves are proved able to fail
+# by the DECOY below, which is the pre-fix condition reproduced hermetically (a witness that HAS a
+# record), rather than by this box's ambient state — which is exactly what made the old arm a function
+# of the measuring machine.
+rprobe() { # rprobe <state-dir> -> sets PROBE_JSON, PROBE_RC
+  PROBE_JSON="$(LANE_REGISTRY_STATE="$1" LANE_REGISTRY_LOCAL="$1/lanes" \
+    LANE_REGISTRY_GIT="$1/work.git" LANE_REGISTRY_REPO="$RREG/work" \
+    python3 "$HERE/lane_registry.py" list --remote "$RREG/missing.git" --json 2>/dev/null)"
+  PROBE_RC=$?
+}
 git -C "$RREG/work" remote set-url origin "$RREG/missing.git"
-rm -rf "$RREG/state/lanes"
+rm -rf "$RREG/probe-state"; mkdir -p "$RREG/probe-state"
 res="$(rdrive "registry-unreachable" 1)"; rc=$?
 rcval="$(sed -n 's/.*rc=\([0-9]*\).*/\1/p' <<<"$res")"
-unreachable="$(python3 "$HERE/lane_registry.py" list --remote "$RREG/missing.git" --json 2>&1 >/dev/null; echo "rc=$?")"
+rprobe "$RREG/probe-state"
+unreachable="rc=$PROBE_RC"
 ck "R4 an unreachable registry does not change the lane's rc=$rcval (registry itself: $unreachable)" \
-   $([ "${rcval:-x}" = "0" ] && [ "${unreachable##*rc=}" = "3" ] && echo 0 || echo 1)
+   $([ "${rcval:-x}" = "0" ] && [ "$PROBE_RC" = "3" ] && echo 0 || echo 1)
+# ⛔ THE ANSWER, NOT ONLY THE STATUS. `readable:true` here means the read was answered by SOMETHING, and
+# the only something left is a witness the fixture does not own.
+ck "R4 …and the probe's ANSWER is unreadable, not a fall-back to this box: readable=false, and no local witness named" \
+   $([ "$(grep -c '"readable": *false' <<<"$PROBE_JSON")" -eq 1 ] \
+      && ! grep -q 'FELL BACK to local' <<<"$PROBE_JSON" && echo 0 || echo 1)
+# ⛔ NON-VACUITY, HERMETICALLY. The two assertions above must be able to FAIL on the exact condition
+# they name, and the pre-fix condition is "a local witness that HAS records" — not "this box has run
+# lanes". So the fixture CREATES one (`start` writes a genuine record through the module's own write
+# path, under a state dir of its own) and the SAME probe must then answer readable=true and NAME the
+# fallback. If this arm ever stops flipping, the arms above are measuring nothing.
+rm -rf "$RREG/decoy-state"; mkdir -p "$RREG/decoy-state/lanes"
+LANE_REGISTRY_STATE="$RREG/decoy-state" LANE_REGISTRY_LOCAL="$RREG/decoy-state/lanes" \
+  LANE_REGISTRY_GIT="$RREG/decoy-state/work.git" LANE_REGISTRY_REPO="$RREG/work" \
+  python3 "$HERE/lane_registry.py" start --kind lane --tag 78 --pid $$ >/dev/null 2>&1 || true
+rprobe "$RREG/decoy-state"
+ck "R4 non-vacuity: a witness WITH a record answers readable=true and NAMES the box-local fallback (rc=$PROBE_RC)" \
+   $([ "$PROBE_RC" = "0" ] && ! grep -q '"readable": *false' <<<"$PROBE_JSON" \
+      && grep -q 'FELL BACK to local' <<<"$PROBE_JSON" && echo 0 || echo 1)
+rm -rf "$RREG/decoy-state"
 git -C "$RREG/work" remote set-url origin "$RREG/origin.git"
 
 echo

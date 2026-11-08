@@ -751,10 +751,37 @@ have an owner, so "nothing sweeps `/tmp`" is no longer true and this paragraph w
 that claim: `scripts/reap-abandoned-worktrees.sh --include-gitless` (reached from the pass's abandoned
 arm, `DISK_REAPER_GITLESS=0` off-switch) sweeps a `/tmp/<name>` scratch tree with **no `.git` at all**,
 using the liveness witness the objection above asks for (a live-pid cwd/exe census, `reason=live-cwd`)
-plus a keep list (`REAP_AW_GITLESS_KEEP`, default `/tmp/actions-runner:/tmp/venv-shared*`) and a
-per-pass cap (`REAP_AW_GITLESS_MAX`, default 10).
+plus a keep list (`REAP_AW_GITLESS_KEEP`, default `/tmp/actions-runner:/tmp/venv-shared*`).
+**#3278 changed WHEN #3272's count ceiling is charged, not its size.** The ceiling (`REAP_AW_GITLESS_MAX`,
+default 10 per root) is still the bound on destructive capacity, and it is now taken **after the age
+floor and before the live-pid census** — the unit used to be spent BEFORE the floor was consulted, so
+~89 % of those ten slots went to trees the age test preserved anyway, and on a population of thousands
+the aged trees were never reachable at all (a dry run over 3,314 entries classified 10 and printed
+`gitless-cap` for **3,137**). **An exhausted ceiling also short-circuits the eligibility scan itself**
+(one integer compare, at the top of the gitless branch): with the refusal downstream of the scan a
+capped pass still paid ~6 forks per entry to print rows that say the same thing — measured at 8.98 s
+versus 0.60 s over 300 entries with the census isolated, for a byte-identical pass record. The cost of
+that ordering is a REPORT change, and it is deliberate: past the ceiling a row names the ceiling
+(`gitless-cap`), not the tree's own reason, because the arm did not look. Every outcome there is a
+preserve.
+The pass's **expensive per-candidate work** is additionally bounded, **per
+root**, by a **TIME** bound, `REAP_AW_BUDGET_SECONDS` default 300 s — the eligibility scan over the whole
+population up to the ceiling is *not* budgeted (classifying every entry is the product), and
+`DISK_REAPER_CLASS_TIMEOUT` (1800) bounds each **per-root invocation**, not the whole pass.
+**Raising or removing the ceiling is #3278's P3 — an owner decision, sequenced after P2 — and is not
+part of this change.**
+
+The `home-or-state` guard protects the cell home even when nothing exports `CELL_HOME`: the unit renders
+`Environment=HOME=/home/cmux` (a real directory), so the wrapper's own fallback never fires and
+`/tmp/cell-home` — ~20 GB of live `.pi` state with no `.git` — used to match none of the guard's
+references. The guard now resolves it itself, via `REAP_AW_CELL_HOME_DEFAULT` (default
+`/tmp/cell-home`). ⛔ **That seam is TEST-ONLY: never set it in a systemd unit, a launchd plist, or any
+scheduled artifact.** It is a *substitution*, not an addition — an exported `CELL_HOME` still wins, and
+a wrong value protects a different directory **and drops `/tmp/cell-home`**. It exists so the fallback
+has a behavioural test (a fixture cannot live at `/tmp/cell-home`); it is a default, not a second
+source of truth.
 What **#3043** still covers is the remainder: trees a `.git`-owned arm claims (those keep their own
-`open-pr`/`dirty` proofs) and everything the cap leaves for the next hour.
+`open-pr`/`dirty` proofs) and everything the ceiling and the pass's time bound leave for the next run.
 
 ## Bounded execution — the pass cannot assume GNU `timeout` (#2046)
 
@@ -924,25 +951,49 @@ cost (pi-cell-4, 2026-10-29): `examined=52 classified=52 remove=0 preserved=52`,
 at **0 bytes free**, both repair loops at `cap: 0`, no cell able to dispatch for ~13 h;
 an operator then reclaimed 62 clean checkouts (7.7 GB) by hand, losing no commits.
 
-So a tip held only by `refs/remotes/<remote>/<branch>` is remove-eligible **only** when a
-bounded `git ls-remote --heads <remote> refs/heads/<branch>` answers with **exactly this
-HEAD sha**. The advertised refname is matched literally and exactly once (⚠️ because `ls-remote`
-matches a pattern against the ref's **tail, from any slash separator**, so `refs/heads/<b>` also selects
-an advertised `refs/heads/x/refs/heads/<b>` — ⛔ *not* because of glob metacharacters: `check-ref-format`
-rule 5 forbids `?`, `*` and `[` in a refname, so no branch name can widen the match that way), and the
-remote is the **longest configured remote name** prefixing the ref, not the first path
-segment (a remote name may contain a slash). Any failure, timeout, empty answer, unadvertised
-refname or different sha leaves the verdict where it was — `remote-only-ref`, PRESERVE — and a
-TRANSPORT failure is remembered for the rest of the pass so a dead remote costs one timeout,
-not one per candidate. The row is `remote-holds:<remote>/<branch>`, and — like
-`remote-only-ref` — it does **NOT** block the end-of-pass prune: a `remote-holds` row is reached
-only when the commit is held by `refs/remotes/<remote>/<branch>` (the probe runs on that very ref),
-so the admin `HEAD` is not the commit's last durable handle, and the F17 window (a record that
-becomes prunable mid-pass, after a snapshot that saw it present) is closed for **every** reason by the
+So a tip held only by `refs/remotes/<remote>/<branch>` is remove-eligible **only** when the
+remote advertises **exactly this HEAD sha** at that branch — and, because the advertisement is read
+ONCE per remote per pass, that fact is **re-proved against the remote at the moment of the
+removal** (`remote_holds_recheck`: one targeted `ls-remote --heads <remote> refs/heads/<branch>`,
+same exact refname+sha compare). The snapshot is CLASSIFICATION evidence; a branch auto-deleted on
+merge between the snapshot and the fork would otherwise make "the remote still holds this head"
+false at the instant a checkout with **no backup** is destroyed. The cost is ONE targeted probe per
+`remote-holds` candidate at classification, plus a SECOND at the fork for one that reaches re-check
+#3 — so a removal pays two, a preserve by `clean_gate`/gate (b)/the ladder pays one, and a preserve
+**at the fork** has already paid two; the second is the decisive one. A failed, timed-out or empty
+targeted probe at removal time preserves.
+
+The remote's own `refs/heads/*` are read by ONE bounded `git ls-remote --heads <remote>` **per remote
+per pass** (#3371) and cached for that pass. That is what took the per-candidate round trip out of the
+**classification**: it used to cost ONE targeted `ls-remote` per `remote-only-ref` candidate, one
+network round trip each, which is what made a large `remote-only-ref` population unable to finish a
+pass (measured on cmux/cell-3, 2026-11-07: 12 targeted probes = 7.54 s wall (0.63 s each), versus 0.56
+s for the remote's whole 2,111-head advertisement). The cached advertisement is the same evidence **for
+the CLASSIFICATION only** — the remote's advertised heads at one instant, a superset of any single
+targeted answer *at t0* is not evidence of anything at the removal, which is exactly why
+`remote_holds_recheck` re-takes it — and the advertised refname is still matched literally and exactly
+once against it (⚠️ because `ls-remote` matches a pattern against the ref's **tail, from any slash
+separator**, so `refs/heads/<b>` also selects an advertised `refs/heads/x/refs/heads/<b>` — ⛔ *not*
+because of glob metacharacters: `check-ref-format` rule 5 forbids `?`, `*` and `[` in a refname, so no
+branch name can widen the match that way), and the remote is the **longest configured remote name**
+prefixing the ref, not the first path segment (a remote name may contain a slash). Any failure,
+timeout, empty answer, unadvertised refname or different sha at **classification** leaves the verdict
+where it was — `remote-only-ref`, PRESERVE — and a TRANSPORT failure is remembered for the rest of the
+pass so a dead remote costs one timeout, not one per candidate. ⛔ At **removal** the preserve verdict
+is different and the operator will see it: a `remote-holds` row whose targeted re-probe can no longer
+re-prove the head is kept as **`remote-holds-stale`** (`remote_holds_recheck`, taken twice — at
+classification and again immediately before the fork). Treat that as "the remote moved under us": the
+checkout is intact, and — if the preserve happened at the **fork** — the archive it had just taken is
+kept too (a **classification-time** preserve never entered `remove_one`, so there is no archive to look
+for). The commit is what to look at, not the checkout. The row is `remote-holds:<remote>/<branch>`, and
+— like `remote-only-ref` — it does **NOT** block the end-of-pass prune: a `remote-holds` row is reached
+only when the commit is held by `refs/remotes/<remote>/<branch>` (the probe runs on that very ref), so
+the admin `HEAD` is not the commit's last durable handle, and the F17 window (a record that becomes
+prunable mid-pass, after a snapshot that saw it present) is closed for **every** reason by the
 reason-independent pre-prune re-read. Blocking on the reason instead would disable the `prunable`
 reclaim path for as long as ONE preserve row lives — `no-pr`, `too-recent` and `too-young` rows carry
-`refs=remote-holds:` too, for up to the whole aged-days floor — which is the F7 defect one reason
-class over. A26c pins both arms (the `reason=` REMOVE row and the `refs=` PRESERVE row).
+`refs=remote-holds:` too, for up to the whole aged-days floor — which is the F7 defect one reason class
+over. A26c pins both arms (the `reason=` REMOVE row and the `refs=` PRESERVE row).
 
 A lane **scratch** checkout — a directory whose basename matches
 `REAP_WT_SCRATCH_GLOB` (default `wt-*|cell-wt-*`) — has its floor **capped at**
@@ -1966,10 +2017,13 @@ of that decision, not an optimisation.
   remainder is filed as **#3043** and is still not implemented: it is a different trade from
   `class=runner-work` — a live lane's cwd can BE under `/tmp` (measured, a running `pi` lane cwd'd in
   `/tmp/cell-t3/.worktrees/…`), so an mtime floor is not proof of death, and a scratch copy is the only
-  artifact of an unfinished review. Beyond #3272's cap (`REAP_AW_GITLESS_MAX`, default 10 per pass) and
-  the trees a `.git`-owned arm claims, it needs an owner ruling on what scratch counts as evidence — the
-  same reversal-of-a-decision problem `docs/ops/disk-consumers.md` G2 records. Do not "just add an age
-  sweep": it would delete working lanes' trees.
+  artifact of an unfinished review. Beyond the pass's own bounds (the count ceiling,
+  `REAP_AW_GITLESS_MAX` default 10 per root, now charged to AGED candidates — #3278 — and a per-root
+  wall-clock budget on its **expensive per-candidate work**, `REAP_AW_BUDGET_SECONDS` default 300 s, inside
+  a `DISK_REAPER_CLASS_TIMEOUT` of 1800 *per root invocation*) and the trees a `.git`-owned arm claims, it needs an
+  owner ruling on what scratch counts as evidence — the same reversal-of-a-decision problem
+  `docs/ops/disk-consumers.md` G2 records. Do not "just add an age sweep": it would delete working
+  lanes' trees.
 
 ## Measured evidence (2026-10-18, cell-3, this box)
 

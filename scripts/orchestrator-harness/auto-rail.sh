@@ -1071,7 +1071,7 @@ publish_review_state() {  # $1 repo, $2 pr, $3 state, $4 head (optional); rc 0 =
         # reviewer the three enumerated reasons are all false and the first sentence was false too — and
         # while that box stays reviewerless nothing head-keyed is ever published to correct it. The
         # availability fact is named here, with the log line that reports it.
-        text="🔎 **auto-rail: review needed.** This PR is a merge candidate and carries no head-bound review attestation. If its current head is reviewable, auto-rail dispatches a reviewer for it as soon as this repo has a free slot AND a usable reviewer exists on this box (a missing or unparseable reviewer is logged by this actuator, and nothing is dispatched until one is deployed). It does NOT dispatch when one of these is already true — and each names a DIFFERENT fact, so read the one that applies: **(1)** the review at that head has ALREADY run and found blocking issues — the verdict is in that reviewer's own comment, and a NEW head is what gets a new review; **(2)** a review record exists that the gate cannot bind — re-running \`record-review.sh\` at the same head re-posts its marker, and no second review is bought; **(3)** this head's review attempts are spent — a reviewer that ran and left NO verdict, so there is none to read: that window rolls BY ITSELF and needs no action at all, UNLESS the attempt ledger cannot be read, in which case nothing was measured and that file needs repairing or removing. auto-rail records nothing itself. **It is not waiting on a lane.**"
+        text="🔎 **auto-rail: review needed.** This PR is a merge candidate and carries no head-bound review attestation. If its current head is reviewable, auto-rail dispatches a reviewer for it as soon as this repo has a free slot AND a usable reviewer exists on this box (a missing or unparseable reviewer is logged by this actuator, and nothing is dispatched until this actuator is RESTARTED with one in place (it checks once, at start, and never again)). It does NOT dispatch when one of these is already true — and each names a DIFFERENT fact, so read the one that applies: **(1)** the review at that head has ALREADY run and found blocking issues — the verdict is in that reviewer's own comment, and a NEW head is what gets a new review; **(2)** a review record exists that the gate cannot bind — re-running \`record-review.sh\` at the same head re-posts its marker, and no second review is bought; **(3)** this head's review attempts are spent — a reviewer that ran and left NO verdict, so there is none to read: that window rolls BY ITSELF and needs no action at all, UNLESS the attempt ledger cannot be read, in which case nothing was measured and that file needs repairing or removing. auto-rail records nothing itself. **It is not waiting on a lane.**"
       fi;;
     review-in-flight)
       text="🔎 **auto-rail: review in flight** at \`${head:0:12}\`. No head-bound attestation existed, so a fresh-context reviewer was dispatched (\`review-pr.sh\`, KIND=reviewer) at $(date -u +%FT%TZ), and its launch was VERIFIED to have started before this comment was posted. auto-rail records nothing itself — any verdict and its attestation come from that reviewer. **It is not waiting on a lane.**";;
@@ -1502,12 +1502,10 @@ PY
         # (#3333/#3308/#3231), and under sustained cap saturation \u2014 the NORMAL state, and the only state
         # in which this line runs \u2014 the pass never advances far enough to publish `review-found-issues`, so
         # the false claim could stand indefinitely. That is #3489's invisibility, inverted.
-        # ⛔ AND THE CORRECTED TEXT NEEDS A KEY OF ITS OWN (review round 15, P2, measured): the headless tag
-        # was byte-identical to the one `origin/main` posts, so on every PR that already carried the old
-        # promise the presence check returned before posting and the corrected text was a PERMANENT no-op —
-        # on exactly the heads it was written for (the cap path, where nothing newer is ever posted). The
-        # `notice` basis puts the correction in the key, exactly as `record` does for `review-found-issues`.
-        [ "$_kind" = green ] && [ "$_att" != at-head ] && [ "$_att" != rejected ] && publish_review_state "$repo" "$pr" awaiting-review "" notice
+        # ⛔ A REWORDED TEXT NEEDS A NEW KEY EVERY TIME (rounds 15 and 17, both measured): a headless tag is
+        # presence-keyed, so re-wording under an EXISTING key is a permanent no-op on every PR that carries
+        # the old sentence. `notice-restart`, over `notice`, is per-CORRECTION.
+        [ "$_kind" = green ] && [ "$_att" != at-head ] && [ "$_att" != rejected ] && publish_review_state "$repo" "$pr" awaiting-review "" notice-restart
         continue
       fi
       # ⛔ A FAILED HEAD READ IS NOT AN EMPTY HEAD. `gh` failing here used to write the cooldown key
@@ -1565,8 +1563,8 @@ PY
           # the burst counter never moves), so a mergeable green unattested PR got NO auto-rail comment at
           # all — indistinguishable from "a lane is working on it", the #3489 invisibility. The notice text
           # for exactly this population already exists; it is published here.
-          publish_review_state "$repo" "$pr" awaiting-review "" notice
-          log_line "$repo #$pr AWAITING-REVIEW ($_att) and this box has no reviewer at $REVIEW_SCRIPT — the PR stays unattested until one is reachable (said once at start, named here per candidate)"
+          publish_review_state "$repo" "$pr" awaiting-review "" notice-restart
+          log_line "$repo #$pr AWAITING-REVIEW ($_att) and this box has no reviewer at $REVIEW_SCRIPT — the PR stays unattested until this actuator is RESTARTED with a usable reviewer in place — the check is taken ONCE, before the loop, and never again (said once at start, named here per candidate)"
           continue
         fi
         # One state file per (repo, PR, HEAD): that file IS the head-keyed cooldown for this step, for
@@ -1640,7 +1638,7 @@ PY
         # ⛔ THE BURST BOUND, AND IT PUBLISHES WHILE IT WAITS: a PR queued behind this repo's own
         # reviews must still not look like a PR waiting on a lane.
         if review_should_defer "$_rdispatched"; then
-          publish_review_state "$repo" "$pr" awaiting-review "" notice
+          publish_review_state "$repo" "$pr" awaiting-review "" notice-restart
           log_line "$repo #$pr AWAITING-REVIEW ($_att at $head) — $_rdispatched review(s) already dispatched for this repo this pass (cap $REVIEW_PER_PASS); this head is next in the queue"
           continue
         fi

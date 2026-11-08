@@ -327,18 +327,27 @@
 #     until the per-worktree loop begins: enumeration/ps/lsof already have their
 #     own watchdogs, and charging their latency to the budget made a slow host
 #     defer EVERY worktree on every pass — a reaper that silently never reaps.
-#   * `git ls-remote` (#3041) is the ONE probe that can cross a network: it is
-#     watchdosed by REAP_WT_GIT_TIMEOUT, runs at most once per candidate, and a
-#     TRANSPORT failure is remembered per remote for the rest of the pass (a dead
-#     remote must not spend the whole budget on N candidates). ⛔ IT IS CHARGED TO
-#     THE BUDGET, so it is NOT free: a remote that answers slowly spends up to one
-#     timeout per candidate that reaches it, which can DEFER the rest of the
-#     listing — and a deferred pass removed nothing, which is exactly what the
-#     pass verdict judges (`reap-ineffective` counts EXAMINED records, not decided
-#     ones, so a deferral-heavy pass on a full box cannot read as `idle`). The
-#     population that reaches the probe is small by construction (only records
-#     whose sole holder is a remote-tracking ref), and the dead-remote cache
-#     collapses a transport failure to ONE timeout.
+#   * `git ls-remote` (#3041) is the ONE probe that can cross a network. THREE cost models, and they
+#     no longer coincide: the ADVERTISEMENT (`ls-remote --heads <remote>`) runs at most ONCE PER
+#     REMOTE PER PASS since #3371 and is CLASSIFICATION evidence only; and `remote_holds_recheck` pays
+#     a TARGETED `ls-remote --heads <remote> refs/heads/<branch>` TWICE for a row that REACHES THE
+#     FORK — once at classification, once at the fork; a row preserved earlier (`clean_gate` #1/#2,
+#     gate (b), the evidence ladder, re-check #0's `holder_recheck`) pays the classification probe only
+#     (measured on cmux/cell-3, 2026-11-07: 12 targeted probes = 7.54 s wall (0.63 s each), versus
+#     0.56 s for the remote's whole 2,111-head advertisement). ⛔ SO THE `remote-holds` HALF IS PER-ROW
+#     IN THE CLASSIFICATION PHASE, and per-row in the removal phase only for rows that get that far —
+#     an earlier version of this bullet said "only the destructive act pays the old per-REMOVAL
+#     price", which is false: the classification-time targeted probe is paid by rows that
+#     are later preserved and never become destructive. What #3371 did buy is
+#     that the `remote-only-ref` half is free, and that the whole remote need not be re-advertised per
+#     candidate. A TRANSPORT
+#     failure is remembered per remote for the rest of the pass (a dead remote must not spend the
+#     whole budget on N candidates) and collapses to ONE timeout. ⛔ IT IS STILL CHARGED TO THE
+#     BUDGET, so it is NOT free: a remote that answers slowly can DEFER the rest of the listing —
+#     and a deferred pass removed nothing, which is exactly what the pass verdict judges
+#     (`reap-ineffective` counts EXAMINED records, not decided ones, so a deferral-heavy pass on a
+#     full box cannot read as `idle`). The population that reaches the probe is small by
+#     construction (only records whose sole holder is a remote-tracking ref).
 #   * no `find`, `rg -r`, `du`, `lsof +D`, or recursive glob is executed
 #   * the removal path re-runs the clean gate TWICE (remove_one): both runs are
 #     `status` probes bounded by REAP_WT_STATUS_TIMEOUT, so the TOCTOU re-check
@@ -933,10 +942,12 @@ PRUNE_WANTED=0
 # `refs/remotes/<remote>/<branch>` — splitting at the first path segment probes the wrong remote
 # when a remote name itself contains a slash. Both calls are watchdosed by
 # `REAP_WT_GIT_TIMEOUT`, and `git remote` is local (no network). The expensive call is the
-# `ls-remote`; the TRANSPORT-failure cache that makes N candidates cost ONE timeout lives in a
-# FILE (`REMOTE_DEAD_FILE`), not in a variable — see the ⛔ note on `remote_holds_probe`.
-# A variable would not survive the call: the probe runs inside a command substitution, so an
-# in-process cache would be a cache that never hits while looking exactly like one.
+# `ls-remote`, and it is read ONCE per remote per PASS (#3371) into `REMOTE_ADV_FILE` — the
+# SUCCESS side of the same file-based cache pattern as `REMOTE_DEAD_FILE`, which is its failure
+# side. Both MUST be files, not variables: the probe runs inside a command substitution
+# (`refs=$(commits_survive …)`), where an in-process cache never survives and looks exactly like
+# one that hits. The advertisement is CLASSIFICATION evidence only — a `remote-holds` row is
+# re-proved by `remote_holds_recheck` at removal time, against the remote itself.
 # The pass's own verdict (#3041): one of dry-run|reclaimed|idle|reap-ineffective|unmeasured.
 PASS_VERDICT=""
 FREE_MB=""
@@ -2424,17 +2435,35 @@ path_ctime() {
 # refname the remote does not advertise, or an advertised sha that is not this HEAD all leave
 # the caller's verdict exactly where it was: `remote-only-ref` => PRESERVE.
 #
-# ⛔ THE PROBE IS ONE BOUNDED `ls-remote` PER CANDIDATE, and the one thing here that crosses a
-# network. The measured population is small (2 of 52 on pi-cell-4), and a TRANSPORT failure is
-# remembered for the rest of the pass (remote_mark_dead) so a dead remote costs one timeout
-# rather than one per candidate.
+# ⛔ THE PROBE IS ONE BOUNDED `ls-remote --heads <remote>` PER REMOTE PER PASS, not per candidate
+# (#3371), and it is the one thing here that crosses a network. It USED to issue a targeted
+# `ls-remote --heads <remote> refs/heads/<branch>` for every candidate: one round trip each, so the
+# pass's cost grew with the number of `remote-only-ref` rows. MEASURED on cmux/cell-3, 2026-11-07,
+# against tortoise's real origin (2,111 heads): 12 targeted probes = 7.54 s wall (0.63 s each),
+# the remote's WHOLE head advertisement = 0.56 s. REAP_WT_GIT_TIMEOUT is 20 s, so FIFTEEN
+# candidate probes that each hit the bound is the entire REAP_WT_BUDGET_SECONDS=300 budget — the tail
+# then DEFERS, PRUNE_BLOCKED=1, and an armed pass reclaims nothing. ⛔ BUT A DEAD-REMOTE TIMEOUT
+# CANNOT EXHAUST THE BUDGET BY ITSELF (#3371 review cycle 8, P2): `remote_is_dead` is read at
+# `remote_holds_probe` BEFORE the advertisement, so the next candidate for that remote short-circuits
+# with ZERO probes — a transport failure costs at most ONE extra timeout PER REMOTE, not one per row.
+# The shape that really can reach 300 s is a remote that answers SLOWLY BUT SUCCESSFULLY (rc 0, no
+# mark): at 0.63 s/probe that is ~200 removals, and at a 19 s probe the tail DEFERs. No cache bounds
+# that one. That is "the reaper cannot
+# finish a pass" reached from the cost side, with no single gate wrong. The advertisement is cached
+# per pass (`remote_advertise`) and a TRANSPORT failure is still remembered (`remote_mark_dead`),
+# so a dead remote costs one timeout rather than one per candidate.
+#
+# ⛔ AND IT IS CLASSIFICATION EVIDENCE, NOT REMOVAL EVIDENCE: the snapshot can be minutes old by
+# the time a late row is removed with no backup, so `remote_holds_recheck` re-takes the targeted
+# probe at the moment of the fork (one targeted probe per `remote-holds` candidate at classification,
+# plus a second at the fork for one that reaches re-check #3 — never per `remote-only-ref` candidate).
 #
 # ⛔ THE DEAD-REMOTE CACHE IS A FILE, NOT A VARIABLE. This function is called from inside a
 # COMMAND SUBSTITUTION (`refs=$(commits_survive …)`), so nothing it assigns survives the call:
 # an in-process cache would be a cache that never hits while looking exactly like one.
 REMOTE_DEAD_FILE=""
 
-remote_is_dead() { # <remote> -> 0 when this pass already saw its ls-remote fail
+remote_is_dead() { # <remote> -> 0 when this pass found the remote UNUSABLE (transport failure, or a failed cache write)
     [ -n "$REMOTE_DEAD_FILE" ] && [ -s "$REMOTE_DEAD_FILE" ] || return 1
     grep -qxF -- "$1" "$REMOTE_DEAD_FILE" 2>/dev/null
 }
@@ -2445,8 +2474,106 @@ remote_mark_dead() { # <remote>
     printf '%s\n' "$1" >>"$REMOTE_DEAD_FILE" 2>/dev/null || true
 }
 
+# ⛔ THE ADVERTISEMENT IS READ ONCE PER REMOTE PER PASS, NOT ONCE PER CANDIDATE (#3371).
+# The probe below used to run `git ls-remote --heads <remote> refs/heads/<branch>` for EVERY
+# candidate, i.e. one NETWORK round trip per `remote-only-ref` row. MEASURED on cmux/cell-3,
+# 2026-11-07, against tortoise's real origin (2,111 heads): 12 targeted probes = 7.54 s wall
+# (0.63 s each) inside a 90 s pass, while the remote's whole head advertisement = 0.56 s. The count
+# scales with the POPULATION, which is the one thing a pass cannot bound: at the 20 s bound
+# (REAP_WT_GIT_TIMEOUT) FIFTEEN candidates are the whole REAP_WT_BUDGET_SECONDS=300 budget, the
+# tail then DEFERS and an armed pass reclaims nothing.
+#
+# ONE advertisement answers every candidate, and it is the SAME evidence — the remote's own
+# `refs/heads/*` as it advertises them, taken once instead of N times — which is why the exact
+# refname+sha match below is unchanged and still decides. ⛔ "Same evidence" is a claim about the
+# MATCH, not about the AGE: the snapshot is CLASSIFICATION evidence and `remote_holds_recheck`
+# re-proves it against the remote at the moment of the fork, because this class is removed with no
+# backup and its warrant is a network fact that can change under a long pass.
+#
+# ⛔ FAIL-CLOSED, UNCHANGED, and the cache can only ever PRESERVE:
+#   · a remote this pass already saw fail        -> `remote_is_dead` (no second timeout)
+#   · an advertisement that fails or times out   -> `remote_mark_dead`, no `remote-holds` claim,
+#     and the whole class PRESERVEs for rest of the pass — the pre-existing #3041 semantics (a
+#     failed targeted probe marked the remote dead too), now reached through ONE larger read
+#   · an advertisement that answers NOTHING      -> cached as an EMPTY advertisement; the exact
+#     match finds nothing and the row keeps `remote-only-ref` (a remote with no heads is not
+#     evidence this head is recoverable)
+#   · an unusable/unwritable cache file          -> no advertisement, so no claim (degraded, safe)
+# ⛔ THE CACHE IS A FILE, NOT A VARIABLE, for the reason `REMOTE_DEAD_FILE` records above: the probe
+# runs inside a COMMAND SUBSTITUTION (`refs="$(commits_survive …)"`), so an in-process assignment
+# would never survive to the next candidate and would look exactly like a cache.
+REMOTE_ADV_FILE=""
+
+remote_advertise() { # <remote> -> 0 when that remote's `refs/heads/*` snapshot is in the cache
+    local remote="$1"
+    [ -n "$REMOTE_ADV_FILE" ] && [ -r "$REMOTE_ADV_FILE" ] || return 1
+    # One advertisement per remote per pass. The marker is matched with `-x` because a remote name
+    # may be a PREFIX of another (`up` / `upstream`): an unanchored match would let `R upstream`
+    # answer for `up`, i.e. one remote's snapshot would decide another remote's removal (A26g4 pins
+    # both that anchor and the `$2 == r` term in the matcher). A remote name can carry no space for
+    # the same reason the `A`/`R` records are space-separated: `best` is chosen as a prefix of a real
+    # `refs/remotes/<remote>/<branch>` refname, and a refname component cannot contain one
+    # (`check-ref-format`; note `git remote add` is what usually enforces the name, and a
+    # hand-written `git config remote."a b".url` is accepted and IS listed by `git remote`).
+    grep -qxF -- "R $remote" "$REMOTE_ADV_FILE" 2>/dev/null && return 0
+    if ! run_bounded "$REAP_WT_GIT_TIMEOUT" "$GIT_OUT" "$GIT_BIN" -C "$REPO_CANON" \
+            ls-remote --heads "$remote"; then
+        # 124 = timed out, anything else = the probe failed. Either way the remote is unusable for
+        # the REST of this pass — remembering that is fail-closed and saves N-1 timeouts.
+        remote_mark_dead "$remote"
+        return 1
+    fi
+    # `A <remote> <sha> <refname>` per advertised head.
+    # ⛔ A FAILED WRITE MUST SUPPRESS THE REMOTE, NOT MERELY SKIP THE MARKER (#3371 review cycle 2,
+    # P1). Two failure shapes, handled identically:
+    #   · the MARKER write fails — without suppression the next candidate re-reads, so a pass that
+    #     has run out of disk pays a WHOLE network advertisement per candidate, for ever (the retry
+    #     storm, on exactly the ENOSPC box this reaper exists for);
+    #   · the `A` append fails — `awk`'s append is BLOCK-BUFFERED, so a short write can seal a
+    #     TRUNCATED refname behind its own newline. ⛔ AN EARLIER DRAFT OF THIS COMMENT CLAIMED THAT
+    #     TRUNCATION ALWAYS FAILS THE EXACT MATCH, AND THAT IS FALSE: a truncation landing exactly on
+    #     another advertised branch's name (`refs/heads/feat/x` cut to `refs/heads/feat`) DOES match
+    #     `$4 == want` for a candidate whose branch IS `feat` at the SAME sha — the sha field is
+    #     written before the refname, so it survives intact — and the `n == 1` guard never sees it,
+    #     because the truncated line is not a duplicate of `want`. That is a FABRICATED
+    #     `remote-holds`, i.e. a NO-BACKUP removal on a torn record.
+    # So BOTH arms TRUNCATE THE SNAPSHOT FILE and then best-effort `remote_mark_dead`.
+    # ⛔ THE TRUNCATION IS THE ACTUAL SAFETY, THE MARK-DEAD IS ONLY THE COST FIX (#3371 review cycle 3,
+    # P1). `remote_mark_dead` appends to `$REMOTE_DEAD_FILE`, which sits under the SAME tmpdir: on
+    # ENOSPC the one write that just failed will fail again, and it fails SILENTLY (`|| true`), so
+    # `remote_is_dead` would answer 1 and the matcher would read the torn snapshot after all — a
+    # closure that needs a write to succeed immediately after a write failed is not a closure. A
+    # truncate needs no free space (it RELEASES blocks), so `: >file` is the one operation that still
+    # works on a FULL disk. It discards EVERY remote's snapshot, not just this one; the others are
+    # simply re-advertised, which is cost, never safety.
+    # ⛔ STATED RESIDUAL (#3371 review cycle 4, P2): this closure holds under ENOSPC. It does NOT hold
+    # under EROFS/EIO — a tmpdir remounted read-only after an I/O error fails the truncate too, and
+    # then the file keeps `R <remote>` plus its torn `A` lines while `remote_mark_dead` also fails
+    # silently. Closing THAT needs the reader not to depend on any write succeeding (a marker written
+    # LAST carrying the count of the lines it summarises, so a torn set fails the count and PRESERVEs).
+    # Do not read the paragraphs above as a proof immune to a read-only filesystem.
+    # ⛔ And the retry storm is only PARTLY closed — say so, because the paragraphs above explain why
+    # `remote_mark_dead` fails on exactly this box (#3371 review cycle 7, P3): on ENOSPC the
+    # mark-dead write fails too, so the suppression does not bind and the truncation has just wiped
+    # every remote's marker, i.e. one full advertisement per remaining candidate. The truncate holds
+    # the SAFETY (nothing torn is read); the COST fix is best-effort on the one condition it was
+    # written for. They are not independent, and calling them independent was the false claim.
+    if ! printf 'R %s\n' "$remote" >>"$REMOTE_ADV_FILE" 2>/dev/null; then
+        : >"$REMOTE_ADV_FILE" 2>/dev/null || true
+        remote_mark_dead "$remote"
+        return 1
+    fi
+    if ! awk -v r="$remote" 'NF >= 2 { printf "A %s %s %s\n", r, $1, $2 }' "$GIT_OUT" \
+            >>"$REMOTE_ADV_FILE" 2>/dev/null; then
+        : >"$REMOTE_ADV_FILE" 2>/dev/null || true
+        remote_mark_dead "$remote"
+        return 1
+    fi
+    return 0
+}
+
 remote_holds_probe() { # <sha> <refs/remotes/*-holder> -> "remote-holds:<remote>/<branch>" | ""
-    local sha="$1" ref="$2" rest remote branch best out rc
+    local sha="$1" ref="$2" rest remote branch best out
     [ -n "$sha" ] || return 0
     case "$ref" in refs/remotes/*) ;; *) return 0 ;; esac
     rest="${ref#refs/remotes/}"
@@ -2466,15 +2593,10 @@ remote_holds_probe() { # <sha> <refs/remotes/*-holder> -> "remote-holds:<remote>
     branch="${rest#"$best"/}"
     [ -n "$branch" ] || return 0
     remote_is_dead "$best" && return 0
-    run_bounded "$REAP_WT_GIT_TIMEOUT" "$GIT_OUT" "$GIT_BIN" -C "$REPO_CANON" \
-        ls-remote --heads "$best" "refs/heads/$branch"
-    rc=$?
-    if [ "$rc" != 0 ]; then
-        # 124 = timed out, anything else = the probe failed. Either way the remote is unusable for
-        # the REST of this pass — remembering that is fail-closed and saves N-1 timeouts.
-        remote_mark_dead "$best"
-        return 0
-    fi
+    # ONE advertisement per remote per pass (#3371 — see `remote_advertise`). A remote whose
+    # advertisement cannot be read is NOT evidence for a removal: the caller keeps
+    # `remote-only-ref` exactly as it did when a targeted probe failed.
+    remote_advertise "$best" || return 0
     # EXACT MATCH, or nothing — and the reason is the TAIL, not a glob (#3058 review, P2).
     # `ls-remote <remote> <pattern>` matches the pattern against the TAIL of each refname, from the
     # start of the ref OR from a slash separator (git-ls-remote(1) <patterns>, gitglossary(7) "glob"),
@@ -2486,11 +2608,84 @@ remote_holds_probe() { # <sha> <refs/remotes/*-holder> -> "remote-holds:<remote>
     # is the SLASH-TAIL one — do not "simplify" the literal compare away after checking the impossible
     # premise. Its sha must also be this HEAD: a remote branch pointing somewhere else is the
     # STALE-CACHE case — the local tracking ref lied — and it PRESERVES.
+    # The match is over the CACHED advertisement, and it is the same literal refname+sha compare:
+    # `ls-remote --heads` prints `<sha>\t<refname>`, which the cache stores as `A <remote> <sha>
+    # <refname>`. The `n == 1` clause keeps the SLASH-TAIL guard above intact: a snapshot that
+    # carries the wanted refname twice (it cannot, but the guard is what the widening was about)
+    # still answers nothing rather than picking one.
+    out="$(awk -v r="$best" -v want="refs/heads/$branch" -v sha="$sha" '
+        $1 == "A" && $2 == r && $4 == want { n++; if ($3 == sha) hit = 1 }
+        END { if (n == 1 && hit == 1) print "yes" }' "$REMOTE_ADV_FILE" 2>/dev/null)"
+    [ "$out" = "yes" ] || return 0
+    printf 'remote-holds:%s/%s\n' "$best" "$branch"
+}
+
+# remote_holds_recheck <path> <sha> <reason> -> 0 to proceed with the removal, 2 to PRESERVE.
+#
+# ⛔ THE SNAPSHOT IS CLASSIFICATION EVIDENCE, NEVER REMOVAL EVIDENCE (#3371 review, P1).
+# `remote_advertise` takes each remote's advertisement ONCE per pass and every candidate is answered
+# from it, so a row classified late in a pass reads a snapshot that can be minutes old. That is fine
+# for a CLASSIFICATION (the row only becomes a candidate), and it is not fine for the act: this class
+# is removed with NO backup (`_need_bk` covers only abandoned-wip/interrupted-add), and its whole
+# warrant is "the remote still advertises this head, so `git fetch <remote> <branch>` restores it".
+# A branch auto-deleted by the remote on merge — the ordinary squash-merge+auto-delete — between the
+# snapshot and the fork makes that sentence false at the instant it is printed, and the commit then
+# dies on the next `fetch --prune`. So the removal path re-takes the SAME evidence the pre-#3371 code
+# took per candidate: one targeted `ls-remote --heads <remote> refs/heads/<branch>`, exact refname +
+# exactly this sha. ⛔ The cost is ONE targeted probe per `remote-holds` CANDIDATE at classification,
+# plus a SECOND at the fork for a candidate that reaches re-check #3 — so a removal pays two, and a
+# preserve at `clean_gate` #1/#2, gate (b), the evidence ladder or re-check #0's `holder_recheck` pays
+# ONE, while a preserve AT THE FORK (by `remote_holds_recheck` or `holder_recheck` #3) has already paid
+# two. The `remote-only-ref` half of the population became free; the `remote-holds` half did not. The
+# per-remote advertisement is still once per pass.
+# FAIL-CLOSED: an unreadable remote list, a failed/timed-out probe, an unadvertised refname or a
+# different sha all return 2, and 2 is the file's existing "preserved, nothing removed" arm — never
+# an exit 4. (The branch is re-derived from the reason token rather than passed in because the probe
+# that minted it ran inside a command substitution, so its globals never reach this point.)
+remote_holds_recheck() { # <path> <sha> <reason> [phase] -> 0 to proceed, 2 to PRESERVE
+    local path="$1" sha="$2" why="$3" phase="${4:-at the fork}" rest remote branch best out rc
+    case "$why" in remote-holds:*) ;; *) return 0 ;; esac
+    [ -n "$sha" ] || return 2
+    rest="${why#remote-holds:}"
+    # The remote is the LONGEST configured name that prefixes the token, exactly as the probe
+    # resolved it (a remote name may itself contain a slash).
+    run_bounded "$REAP_WT_GIT_TIMEOUT" "$GIT_OUT" "$GIT_BIN" -C "$REPO_CANON" remote || return 2
+    best=""
+    while IFS= read -r remote; do
+        [ -n "$remote" ] || continue
+        case "$rest" in
+            "$remote"/*) if [ "${#remote}" -gt "${#best}" ]; then best="$remote"; fi ;;
+        esac
+    done <"$GIT_OUT"
+    [ -n "$best" ] || return 2
+    branch="${rest#"$best"/}"
+    [ -n "$branch" ] || return 2
+    run_bounded "$REAP_WT_GIT_TIMEOUT" "$GIT_OUT" "$GIT_BIN" -C "$REPO_CANON" \
+        ls-remote --heads "$best" "refs/heads/$branch"; rc=$?
+    # ⛔ A TRANSPORT FAILURE IS REMEMBERED, exactly as the classification probe remembers it (#3371
+    # review cycle 2, P2). A remote that dies mid-pass then costs at most ONE extra
+    # REAP_WT_GIT_TIMEOUT: `remote_is_dead` is read at `remote_holds_probe` BEFORE the advertisement, so
+    # every later candidate for that remote short-circuits with ZERO probes. ⛔ An earlier version of
+    # this comment claimed "seven or eight such removals are the whole budget" — that is UNREACHABLE,
+    # because the first timeout marks the remote and the second row never probes at all. What this arm
+    # actually buys is bounding a dead remote to one timeout per pass (the pre-#3371 shape, which paid
+    # it per candidate). ⛔ `rc` IS CAPTURED ON THE LINE AFTER THE CALL (#3371 review cycle 4, P3):
+    # the invariant "only a non-zero rc marks it dead" is exactly what a future edit in between would
+    # break silently. ⛔ ONLY a non-zero rc marks it dead: a branch DELETED on the remote answers rc 0
+    # with an empty advertisement, which is a legitimate "not advertised" => preserve, never "dead".
+    if [ "$rc" != 0 ]; then
+        remote_mark_dead "$best"
+        return 2
+    fi
     out="$(awk -v want="refs/heads/$branch" -v sha="$sha" '
         NF >= 2 && $2 == want { n++; if ($1 == sha) hit = 1 }
         END { if (n == 1 && hit == 1) print "yes" }' "$GIT_OUT" 2>/dev/null)"
-    [ "$out" = "yes" ] || return 0
-    printf 'remote-holds:%s/%s\n' "$best" "$branch"
+    [ "$out" = "yes" ] || return 2
+    # ⛔ THE AUDIT LINE NAMES THE PHASE (#3371 review cycle 3, P2). For a no-backup removal the log IS
+    # the proof, and this function is called up to twice per row; a single message meaning "proved"
+    # would let a reader take the classify-time read as the decisive one.
+    log "REMOVE-RECHECK $path remote-holds re-proved $phase: $best refs/heads/$branch=$sha"
+    return 0
 }
 
 # commits_survive <sha> <branch> [probe] -> prints the survival mechanism, or "" when
@@ -4233,7 +4428,10 @@ holder_recheck() {
     return 0
 }
 
-# remove_one <path> <sha>
+# remove_one <path> <sha> [branch] [reason]
+# ⛔ `reason` IS NOT OPTIONAL IN PRACTICE (#3371 review cycle 3, P2): the re-check #3 arm passes it to
+# `remote_holds_recheck`, which returns 0 = PROCEED when it is empty — so a caller that dropped the
+# token would silently disable the network warrant on the one class removed with NO BACKUP.
 # Never --force. Deletes the declared-ephemeral ROOT names first, whether
 # UNTRACKED (`??`, which git DOES refuse on) or IGNORED (`!!`) — clean_gate's
 # root branch collects both, so both are pre-deleted here. NESTED ignored
@@ -4473,7 +4671,25 @@ remove_one() {
     # comment on re-check #0 called it "right before the delete" while it actually ran first, leaving
     # the two `git status` calls and the ephemeral deletions (up to REAP_WT_REMOVE_TIMEOUT each)
     # uncovered — the largest part of the window, by this file's own reasoning for re-check #2.
-    # ⛔ AND IT STAYS LAST (#3405 review, P2): gate (b) above runs BEFORE it for exactly this reason.
+    # ⛔ AND THE NETWORK WARRANT IS RE-TAKEN HERE, **BEFORE** THE LIVENESS PROBE — NOT AFTER IT
+    # (#3371 review cycle 2 P1; ordering corrected cycle 4 P1). A `remote-holds` row is removed with
+    # NO BACKUP on the warrant "the remote still advertises this head", and the classify-loop call is
+    # far from this line: `clean_gate` #1 (20 s), gate (b) (the archive, "up to ~4.7 min"), the
+    # evidence ladder ("up to ~18 min"), the ephemeral `rm` loop (up to REAP_WT_REMOVE_TIMEOUT=120 s
+    # each) and `clean_gate` #2 — so the fact warranting the destruction can be ~25 MINUTES stale here.
+    # ⛔ IT MUST GO ABOVE `holder_recheck` EVEN THOUGH IT IS THE MORE EXPENSIVE READ: this function
+    # forks `git remote` + `ls-remote`, two bounded commands at REAP_WT_GIT_TIMEOUT each (up to ~40 s
+    # at the defaults). Putting them between `holder_recheck` and the fork would make the LAST
+    # liveness read ~40 s before the destruction — reopening precisely the window re-check #3 exists
+    # to close ("a shell demoted as idle can pick up a child inside it. That is exactly 'started
+    # working again'"). The remote fact moves slowly; a resuming lane does not. So: network first,
+    # then liveness, then the fork. rc=2 preserves and keeps the archive, and it must NAME its
+    # verdict — `REMOVE_SKIP_VERDICT` is what the operator's keep-line prints.
+    if ! remote_holds_recheck "$path" "$sha" "$why"; then
+        case "$why" in remote-holds:*) REMOVE_SKIP_VERDICT="remote-holds-stale" ;; esac
+        rm -f "$out"; return 2
+    fi
+    # ⛔ THIS ONE STAYS LAST — literally the last code line before the fork (cycle 4 P1).
     holder_recheck "$path" "$sha" || { rm -f "$out"; return 2; }
 
     run_bounded "$REAP_WT_REMOVE_TIMEOUT" "$out" "$GIT_BIN" -C "$REPO_CANON" worktree remove "$path"
@@ -4737,13 +4953,17 @@ run() {
     # it owns the probe scratch dir, the watchdog timers, the probe output files
     # and the lock. Installing it later (as it was) leaked the scratch dir on
     # every early fail-closed exit.
-    # The trap owns EVERY scratch file a pass can mint, from BOTH sides of this merge:
+    # The trap owns every PASS-SCOPED scratch file the pass mints BEFORE the worktree loop, from BOTH
+    # sides of this merge (`$PRUNE_START_TMP`/`$PRUNE_NOW_TMP` are minted later and cleared by their
+    # own region, so they are deliberately NOT in this list — do not read this as "every file"):
     #   · `$STASH_OUT` / `$REMOTE_DEAD_FILE` — the #2541/#3041 probes (origin/main);
+    #   · `$REMOTE_ADV_FILE` — the #3371 per-pass remote head advertisement (the SUCCESS side of the
+    #     same cache pattern `$REMOTE_DEAD_FILE` is the failure side of);
     #   · `$CLAIM_MAP` — the registry scratch this pass builds (claims_load), which used to be the ONE
     #     scratch file the trap did not own, so every launchd-scheduled pass left one behind
     #     (agent-infra#2102 review, minor). Guarded because the pass may exit before the registry was
     #     ever loaded.
-    trap 'tb_watchdogs_reap; tb_bound_cleanup; rm -f "$PS_OUT" "$CWD_OUT" "$GIT_OUT" "$STASH_OUT" "$REMOTE_DEAD_FILE"; if [ -n "${CLAIM_MAP:-}" ]; then rm -f "$CLAIM_MAP"; fi; lock_release' EXIT
+    trap 'tb_watchdogs_reap; tb_bound_cleanup; rm -f "$PS_OUT" "$CWD_OUT" "$GIT_OUT" "$STASH_OUT" "$REMOTE_DEAD_FILE" "$REMOTE_ADV_FILE"; if [ -n "${CLAIM_MAP:-}" ]; then rm -f "$CLAIM_MAP"; fi; lock_release' EXIT
     if [ "$MODE" = unknown ]; then
         if [ "$REAP_WT_DRY_RUN" = "0" ]; then MODE=apply; else MODE=dry-run; fi
     fi
@@ -4806,9 +5026,17 @@ run() {
         exit 3
     fi
     # The pass's dead-remote cache (#3041). A file, because the probe runs inside a command
-    # substitution; a scratch file that cannot be created simply disables the cache and leaves every
-    # candidate probing on its own — slower, never less safe.
+    # substitution. ⛔ A scratch file that cannot be created no longer just costs time: since #3371 the
+    # `remote_advertise` write-failure path leans on `remote_mark_dead` to suppress a TORN snapshot,
+    # and with no REMOTE_DEAD_FILE that suppression is a silent no-op. Safety therefore does NOT rest
+    # on it — the truncation inside `remote_advertise` is what makes a torn snapshot unreadable — so a
+    # missing cache is still "slower, never less safe".
     REMOTE_DEAD_FILE="$(mktemp "${TMPDIR:-/tmp}/pi-reap-deadremotes.XXXXXX")" || REMOTE_DEAD_FILE=""
+    # The per-pass REMOTE HEAD ADVERTISEMENT cache (#3371) — one `ls-remote --heads` per remote,
+    # shared by every candidate. A scratch file that cannot be created disables the cache, and a
+    # disabled cache makes `remote_advertise` answer "no snapshot", i.e. every such row keeps
+    # `remote-only-ref`/PRESERVE: degraded, never a removal.
+    REMOTE_ADV_FILE="$(mktemp "${TMPDIR:-/tmp}/pi-reap-remoteadv.XXXXXX")" || REMOTE_ADV_FILE=""
 
     # ⛔ REPO IS NAMED, NEVER ASSUMED — AND THERE IS NO `$PWD` DEFAULT (that default was the defect).
     # `$PWD` is not even a fact about the repo: it is whatever directory the CALLER happened to stand
@@ -5196,7 +5424,17 @@ run() {
                             rc=2
                         fi
                     else
-                        remove_one "$p" "$h" "$b" "$reason"; rc=$?
+                        # ⛔ A `remote-holds` ROW IS RE-PROVED AT THIS INSTANT (#3371 review, P1): its
+                        # warrant is a NETWORK fact ("the remote still advertises this head"), the row
+                        # was classified against a snapshot that can be minutes old, and this class is
+                        # removed with NO BACKUP. See `remote_holds_recheck`. rc=2 is the file's
+                        # existing "the evidence changed, preserved" arm — never exit 4.
+                        if remote_holds_recheck "$p" "$h" "$reason" "at classification"; then
+                            remove_one "$p" "$h" "$b" "$reason"; rc=$?
+                        else
+                            case "$reason" in remote-holds:*) REMOVE_SKIP_VERDICT="remote-holds-stale" ;; esac
+                            rc=2
+                        fi
                     fi
                     case "$rc" in
                         0)
