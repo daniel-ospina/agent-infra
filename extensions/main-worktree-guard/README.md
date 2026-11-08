@@ -103,10 +103,11 @@ command word (`~/undo.sh`, `sub/undo.sh` is READ instead), inside an
 interpreter `-c` payload / `eval` payload / a nested script, or as a piped
 producer (`cat ./undo*.sh | bash`, `F=./undo.sh; cat $F | bash`; #1228),
 **except in a SANCTIONED script's own body** — `SANCTIONED_SCRIPT_RELPATHS`
-entries are exempted from the whole content walk, path-keyed for the guard's own
-module root (the #1129 anchor, unchanged) and digest-plus-closure-keyed inside
-any other framework checkout (#2332 arm 2). **This (#1228) arm is now
-digest-keyed on BOTH arms**, because it is raised while READING the file:
+entries are exempted from the whole content walk **only for their PINNED bytes**:
+digest-plus-closure-keyed inside any framework checkout (#2332 arm 2), and the
+path-keyed module-root anchor (#1129 arm 1) is narrowed to the same digest because
+that anchor is agent-writable on a copy-deployed box (#2775). **This (#1228) arm is
+now digest-keyed on BOTH arms**, because it is raised while READING the file:
 `scripts/gh-shim/gh` carries
 `grep -qa '<marker>' <(head -c 8192 2>/dev/null < "$1")`, whose process
 substitution matches the expansion predicate, so path-spelled invocations of the
@@ -2296,10 +2297,16 @@ resolves to in this fleet) join `SANCTIONED_SCRIPT_RELPATHS` — #1129's existin
 audited, realpath-keyed mechanism, one entry per script, each with an
 `m4_script_exemption` audit row. The exemption returns BEFORE the walk, so the
 confinement of the rail's `worktree` operations is a property of that script, not
-something the list re-verifies: a listed path whose content is swapped for
-destructive content is trusted. The boundary against that is #1129's original
-one — a write into the framework checkout is the M-write gate's business, and a
-copy at any other path takes no exemption (pinned by B5b).
+something the list re-verifies per invocation: a listed path whose content is
+swapped for destructive content is trusted **only while the path is the sole
+key**, which is why #2775 narrowed this decision to the pinned digest on BOTH of
+its arms. A listed relpath under the module root is agent-writable on a
+copy-deployed box (the module root is not a git checkout there, so the write gate
+does not cover it), and with a path-only key an agent-minted destructive body at
+`<moduleRoot>/scripts/<listed rel>` ran with the whole walk skipped — measured
+2026-10-24 and re-measured 2026-11-08 (`ALLOWED` there, `BLOCKED` at any other
+path). The digest is the boundary, and a copy at any other path still takes no
+exemption at all (pinned by B5b).
 
 ⚠️ **A general "any committed repo script is exempt" rule was PROPOSED AND
 REJECTED at review**, with a reproduced bypass: **"committed" is purchasable.**

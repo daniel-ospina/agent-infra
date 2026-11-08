@@ -136,6 +136,13 @@ export const OUT_OF_FAMILY_TERMS = [
   // above and its BEHAVIOUR pinned by origination-funnel.test.sh §5c (young ⇒ in flight, past the
   // bound ⇒ BLOCKED, unreadable `at=` ⇒ BLOCKED).
   "RUNNING_STALE_MIN",
+  // agent-infra#3584: the in-cycle TRANSIENT retry's ATTEMPT cap. `inFamily` needs a family TOKEN
+  // *and* a bound SUFFIX: the token is present (`REFRESH` contains `FRESH`), but `_ATTEMPTS` is not
+  // in `SCAN_BOUND_SUFFIXES`, so the name scan cannot see it. Listed deliberately, with its value
+  // pinned by the registration above and its BEHAVIOUR pinned by refresh-scout.test.sh §7
+  // (b1) (3 attempts with the cap at 3, read off the invoke count), (b2) (cap=1 makes exactly one) and
+  // (b6)+(b11) (a junk and an over-range value are both rejected by ONE guard).
+  "REFRESH_RETRY_MAX_ATTEMPTS",
   "DEFAULT_MAX_DISPATCH_MS",
   // #1167: the merge rail's two surviving re-run bounds. Their shell symbols
   // carry no stall-family token (the STALLED threshold is now the DERIVED
@@ -878,21 +885,22 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
       "''|*[!0123456789]*|0*) CLAIM_SNAPSHOT_MAX_AGE=900 ;;",
       "[ \"${#CLAIM_SNAPSHOT_MAX_AGE}\" -le 9 ] || CLAIM_SNAPSHOT_MAX_AGE=900 ;;",
     ],
-    note: "#2466 — how stale a claim snapshot may be and still be believed (900 s ≈ 3.75 cycles at the shipped CYC=240). THREE shapes reach `claim-unreadable` and the bound governs only the third: no file at all, a header whose own fetch field says `failed` (refused at ANY age, because that test is the `if` and the age test only the `elif` — the bound must never be read as re-admitting a failed read), and an `ok` header older than this bound. The second declaration is the is_limit-style coercion that drops a zero/overflowing value back to 900, so an overflowing bound cannot make `[ -gt ]` error and turn the age test FALSE — an errored test is FALSE, which here would fail OPEN by believing every snapshot forever; it is recorded so a third assignment cannot shadow the default unnoticed.",
+    note: "#2466 — how stale a claim snapshot may be and still be believed (900 s ≈ 3.75 cycles at the shipped CYC=240). MANY shapes reach `claim-unreadable` (several `why=` sites in `claim_snapshot_verdict` alone, claims.sh:1967-2026, most of them NOT the bound's) and the bound governs exactly TWO of them: an `ok` header older than itself, and a HEADERLESS legacy snapshot older than itself by MTIME (claims.sh:1991 makes mtime the only age available for a writer that predates the header, and the same age test then fires). It must never be read as re-admitting any of the others: no file at all, a header whose own fetch field says `failed` (refused at ANY age, because the failed-fetch test and the age test are branches of the SAME chain and the fetch branch is tested FIRST — `claims.sh:2021` before `:2025` — so the bound must never be read as re-admitting a failed read). The second declaration is the is_limit-style coercion that drops a zero/overflowing value back to 900, so an overflowing bound cannot make `[ -gt ]` error and turn the age test FALSE — an errored test is FALSE, which here would fail OPEN by believing every snapshot forever; it is recorded so a third assignment cannot shadow the default unnoticed. The digit class is written OUT (`[!0123456789]`) rather than as the range `[!0-9]`: a bracket RANGE resolves against the current locale's collating sequence, so in a dictionary-sorting locale `[0-9]` need not be exactly the ten digits — this registry records the shipped explicit form, which is the locale-safe one.",
   },
   {
     name: "CLAIM_UNREADABLE_LEASE_MAX_AGE",
     owners: ["scripts/orchestrator-harness/claims.sh"],
     value: '"${CLAIM_UNREADABLE_LEASE_MAX_AGE:-18000}"',
     axis: "reap",
-    guardedBy: NONE,
+    guardedBy:
+      "scripts/orchestrator-harness/claim-reaper.test.sh — case F asserts the abstention message NAMES this bound as the reap that ends the block (a reader must state its own deadline, not abstain forever); the VALUE is pinned by THIS registry's forward check",
     overrides: [
       "''|*[!0123456789]*|0*) CLAIM_UNREADABLE_LEASE_MAX_AGE=18000 ;;",
       "[ \"${#CLAIM_UNREADABLE_LEASE_MAX_AGE}\" -le 9 ] || CLAIM_UNREADABLE_LEASE_MAX_AGE=18000 ;;",
       '&& CLAIM_UNREADABLE_LEASE_MAX_AGE="$_claim_floor_term"',
       '&& CLAIM_UNREADABLE_LEASE_MAX_AGE="$CLAIM_UNREADABLE_LEASE_MAX_AGE_CEIL"',
     ],
-    note: "#3203 — how old an UNPARSEABLE-lease claim may be before `claim_prune` may reap it. Registered on introduction because the reverse scan refused it: an unclassified stall-family bound is exactly how an unbounded bound reappears. TWO clamps and a floor, each a separate declaration and each recorded: the first drops a zero/overflowing value back to 18000 (an errored `[ -gt ]` test is FALSE, which would fail OPEN by trusting an unmeasurable age forever), the second caps at 9 digits, and the third RAISES the ceiling to the longest term this file can MINT (`CLAIM_ISSUE_TTL`/`CLAIM_BRANCH_TTL`/`CLAIM_TTL_MAX`, hard-capped at 30 days) — a ceiling below that can always fire INSIDE a live claim, i.e. it is a scheduled steal rather than a reaper.",
+    note: "#3203 — how old a claim commit may be before `claim_prune` DELETES a ref whose lease this reader cannot parse (default 18000 s = CLAIM_ISSUE_TTL, the longest shipped lease). It bounds WAITING, never grants a steal: every READER keeps answering abstention, and only `claim_prune` acts, on a line that names the ref, the age and the bound (claims.sh:2314). ⛔ IT GOVERNS ONLY THE CLASS IT CAN SEE: it is consulted INSIDE `if _lease_unparseable \"$until\"` (claims.sh:2295) and nowhere else, and that predicate (claims.sh:1302) admits only empty / `0` / leading-zero / non-digit / 19+-digit terms — a MINTED lease is a parseable epoch however long it is, so no mintable term is ever compared against this bound, and it must not be read as bounding live claims. The BOUND was introduced by agent-infra#3515 and went unregistered then; #3760 (`9ff6cf0bc`) added this row with `guardedBy: NONE`, and this commit is the corrected registration of it. The FIVE declaration sites this row models are the default plus the four `overrides`, and all five sit in the clamp chain at claims.sh:215-274 (a digit clamp, a magnitude guard, the FLOOR raise to `_claim_floor_term`, the CEILING clamp and its floor-vs-ceiling rule). ⛔ THE MECHANICS ARE DOCUMENTED AT THE SOURCE, NOT PARAPHRASED HERE: each of those five can move the effective bound, and a restatement of HOW is exactly the kind of prose that goes stale and then misleads the reader it was written for. What the row does assert is the two properties worth pinning in one place — every value below the floor term resolves UP to it, so no knob can push the bound below the floor (measured: `CLAIM_UNREADABLE_LEASE_MAX_AGE=1` → 18000), and the ceiling plus its 30-day hard cap stop a large value re-creating the eternal block this arm exists to end. The CEILING KNOB itself (`CLAIM_UNREADABLE_LEASE_MAX_AGE_CEIL`) is a SEPARATE symbol, outside the scan's name family and registered NOWHERE, so neither scan direction can demand it — agent-infra#3773 records that gap, and this note points at it rather than implying coverage.",
   },
   {
     name: "CRP_MIN_AGE",
@@ -900,7 +908,7 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     value: '"${CLAIM_REAPER_MIN_AGE:-}"',
     axis: "reap",
     guardedBy: NONE,
-    note: "#2094 — the DELETION tool's own age floor, forwarded to `claim-reaper.py --min-age`. Registered because the reverse scan refused it as an unclassified reap-family declaration. The default is EMPTY on purpose: an unset floor means the reaper uses the .py's own bound rather than this wrapper inventing one, so the registered value is the forwarding expression, not a number.",
+    note: "#3602 — the age FLOOR the scheduled claim-reaper PASS forwards to `claim-reaper.sh` as `--min-age`, reachable as `CLAIM_REAPER_MIN_AGE` and EMPTY by default. Deliberately not a second local number: with nothing set the flag is OMITTED (`[ -n \"$CRP_MIN_AGE\" ] && args+=(--min-age …)`) so the tool's own registered CR_MIN_AGE (10800 s) governs — ONE authority for the floor, which cannot disagree with the tool it drives. The reverse scan found it unregistered on introduction, which is exactly the hole that direction exists to close: a reap-family bound no audit knew about, in the script that arms the unattended hourly reap. `guardedBy` stays NONE — i.e. THIS registry's forward check pins the value — even though the pass-through itself IS pinned, at `scripts/orchestrator-harness/claim-reaper-pass.test.sh:161` (`ckg \"5 the age floor is passed through\" \"--min-age 600\" \"$ARGV\"`): that test drives the env ALIAS `CLAIM_REAPER_MIN_AGE` and never names the shell variable `CRP_MIN_AGE`, so citing it here would be a misattribution the registry's own test rejects — the two fields would then disagree about which one is lying.",
   },
   {
     name: "LANE_ARM_SNAPSHOT_MAX_AGE",
@@ -966,6 +974,53 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     guardedBy:
       "scripts/orchestrator-harness/origination-funnel.test.sh §5c — the reader's in-flight/dead split (see REFRESH_STALE_LOCK_MIN)",
     note: "DERIVED alias of REFRESH_STALE_LOCK_MIN, kept as its own symbol so the reader can be re-pointed without touching the lock guard. `inFamily` cannot see it (no family token in `RUNNING`), so it is registered rather than left to the reverse scan — the audit should know every bound the beat acts on.",
+  },
+  // agent-infra#3584 — the in-cycle TRANSIENT retry bounds. These are the actuation guard for the
+  // stall the issue measured: a `TRANSIENT` refresh refusal used to be retried only at the next
+  // cycle (15-161 min away, #3585), so a hiccup a 30 s retry clears cost HOURS of origination. The
+  // THREE `_S` knobs are seen by the reverse scan (`_S` is a bound suffix) and must be registered;
+  // `…_ATTEMPTS` is NOT (no family token), so it is registered DELIBERATELY on the
+  // `RUNNING_STALE_MIN` precedent: it is the runaway guard for exactly this failure mode, and a
+  // retry loop whose cap nothing audits is a bound nobody notices going missing.
+  {
+    name: "REFRESH_RETRY_MAX_ATTEMPTS",
+    owners: ["scripts/orchestrator-harness/orch-loop.sh"],
+    value: '"${REFRESH_RETRY_MAX_ATTEMPTS:-3}"',
+    overrides: ["REFRESH_RETRY_MAX_ATTEMPTS=3"],
+    axis: "gate",
+    guardedBy:
+      "scripts/orchestrator-harness/refresh-scout.test.sh §7 (b1)/(b2)/(b6)+(b11) — the shipped retry block is extracted VERBATIM and driven: an invoke count of 3 when the cap is 3, exactly 1 at cap=1, and the default restored when the knob is junk (`abc`) or over its ceiling (`99`). (b11) is the over-range arm's own label — it must NOT be cited as (b8), which is the wall-clock budget arm)",
+    note: "attempt cap for the in-cycle retry of a TRANSIENT refresh (3 default, legal range 1-10). `inFamily` cannot see it: the token is there (`REFRESH` contains `FRESH`) but `_ATTEMPTS` is not a bound suffix, so it is registered rather than left to the reverse scan. Validated by ONE `case` whose patterns reject junk, leading zeros AND out-of-range values (the second arm of `[1-9]|10` is the ceiling), so the check is the single authority — three redundant resets used to mean a suite arm could not attribute its red to this guard (review round 2, F3).",
+  },
+  {
+    name: "REFRESH_RETRY_BACKOFF_S",
+    owners: ["scripts/orchestrator-harness/orch-loop.sh"],
+    value: '"${REFRESH_RETRY_BACKOFF_S:-30}"',
+    overrides: ["REFRESH_RETRY_BACKOFF_S=30"],
+    axis: "gate",
+    guardedBy:
+      "scripts/orchestrator-harness/refresh-scout.test.sh §7 (b9) — a 10 s backoff is driven with BOTH the per-delay cap and the budget raised out of the way, and the arm asserts the LOGGED delays are `10s` then `20s`, so the DOUBLING itself is graded (deleting the doubling loop reds it, measured); (b3) proves the delay is REFUSED (not shortened) when it does not fit the budget; and (b7) drives REFRESH_RETRY_MAX_DELAY_S itself (backoff 1000 clamped to a 1 s cap), so the per-DELAY clamp is graded rather than assumed",
+    note: "first in-cycle backoff delay for a TRANSIENT refresh, DOUBLED per attempt and clamped by REFRESH_RETRY_MAX_DELAY_S. Suites set it to 0 so the policy is graded instead of slept through — which is also why it is a knob and not a literal.",
+  },
+  {
+    name: "REFRESH_RETRY_MAX_DELAY_S",
+    owners: ["scripts/orchestrator-harness/orch-loop.sh"],
+    value: '"${REFRESH_RETRY_MAX_DELAY_S:-120}"',
+    overrides: ["REFRESH_RETRY_MAX_DELAY_S=120"],
+    axis: "gate",
+    guardedBy:
+      "scripts/orchestrator-harness/refresh-scout.test.sh §7 (b7) — the backoff is set ABOVE the cap and the arm asserts the LOGGED delay is the cap, so `[ \"$_rd\" -gt \"$REFRESH_RETRY_MAX_DELAY_S\" ]` is exercised, and (b7) is the ONLY arm that exercises it: (b3) sets only REFRESH_RETRY_BACKOFF_S=30 and REFRESH_RETRY_BUDGET_S=1, so REFRESH_RETRY_MAX_DELAY_S is the default 120, `_rd` stays 30, the clamp never fires there, and the refusal it logs prints the UNCLAMPED delay (fresh-context review, P2 — measured)",
+    note: "per-delay cap on the doubled backoff, so raising REFRESH_RETRY_BACKOFF_S or the attempt cap cannot make one sleep unbounded. The TOTAL bound is REFRESH_RETRY_BUDGET_S, not this — this one only stops a single delay running away.",
+  },
+  {
+    name: "REFRESH_RETRY_BUDGET_S",
+    owners: ["scripts/orchestrator-harness/orch-loop.sh"],
+    value: '"${REFRESH_RETRY_BUDGET_S:-300}"',
+    overrides: ["REFRESH_RETRY_BUDGET_S=300", 'REFRESH_RETRY_BUDGET_S="$_budget_cap"'],
+    axis: "gate",
+    guardedBy:
+      "scripts/orchestrator-harness/refresh-scout.test.sh §7 (b3) — with REFRESH_RETRY_BACKOFF_S=30 and the budget at 1 s the block makes exactly ONE attempt and logs `the 1s in-cycle retry budget is spent` AND names the `stale-lock guard reaping this pass while it still runs` (both greps are required: deleting the guard mention alone reds the arm, measured); (b8) drives a stub that SLEEPS 2 s per pass against the same 1 s budget, so a sleeps-only accumulator (which would see 0 + 0 ≤ 1 and retry) reds, i.e. the bound is wall clock rather than the sum of the sleeps; and (b3b) pins the CEILING — with REFRESH_STALE_LOCK_MIN=1 (a 60 s guard) a bogus `REFRESH_RETRY_BUDGET_S=3000` must fall back to 30 s and refuse a 40 s backoff on the FIRST attempt, so a typo cannot buy a sleep longer than the guard it must not outlive",
+    note: "the TOTAL WALL CLOCK the retries may add in one cycle, checked BEFORE each sleep. This is a correctness bound, not politeness: REFRESH_STALE_LOCK_MIN clears `.refresh.lock` after 20 min, so a retrying pass that outlived it would be reaped by the NEXT cycle while STILL RUNNING — exactly the concurrent double-pass the lock exists to prevent. ⛔ WHAT IT DOES AND DOES NOT BOUND (review round 3, measured rather than argued): it bounds the SLEEPS the retries add plus one further pass runtime — the residual is one attempt's own duration, which a retrying pass cannot cap and which a FIRST attempt already carries today (`refresh-candidates.sh:3244-3248` records that a single pass can cross the guard on its own). Worst case is therefore budget + one pass runtime, not budget alone. ⛔ AND IT MAY NOT REACH THE GUARD (review round 2, P2 — measured): the `case` rejects junk but accepted `3000`, which bought 2000 s of sleep against the 1200 s window, so a value at or past `REFRESH_STALE_LOCK_MIN * 60` falls back to `min(300, guard/2)`. The shipped defaults (30 + 60 s of sleep against a 300 s budget, under a 20 min guard) leave a factor of ~4 of headroom for a pass that completes in its usual seconds — ~1.8x at the ~6m20s pass cited above, which is the honest figure rather than 'an order of magnitude'.",
   },
   // — retention axis —
   {

@@ -561,6 +561,72 @@ done
 # worktree-hygiene #2047), and the result was a RED `bash-suites` on main that had nothing to do with any
 # PR that touched it. Keep this list in step with `grep -l '{{TORTOISE_REPO}}' templates/launchd/*.plist`.
 assert_eq "$GATED_TEMPLATES1" "4" "the {{TORTOISE_REPO}}-gated inventory is accounted for (branch-reaper #1787 + worktree-reaper #1311 + worktree-hygiene #2047 + pr-doctor #2303)"
+# ⛔ THE OUTPUT-LOCATION PARAGRAPH HAS BEEN INVERTED TWICE, SO IT GETS A SENSOR AND NOT A THIRD CORRECTION
+# (agent-infra#2281 review round 44, P1 — measured). The prose is operator-facing: it says where a live
+# verdict is written, and THREE readers open the canonical STATUS file BY NAME — `heartbeat-loop.sh`,
+# `lib/fleet-inventory.sh`'s `_fleet_pr_doctor_bound`, and `objective.py`'s `pr_doctor_last_run` (review
+# cycle 2 measured the third; an earlier version of this very comment said two, which is the same
+# count-goes-stale defect the paragraph itself had). Round 44's first version said the per-repo pairs sat
+# "beside" the canonical one; its "correction" then claimed the canonical pair is never written in
+# `all-repos` mode — FALSE, because `run_all_repos()` ends by calling `canonical_paths()` and
+# `record_exit` writes the SET's aggregate there (measured over two repos: all six files appear and
+# `pr-doctor.status.json` carries `repo = "acme/alpha,acme/beta"` plus a two-row `repos` list). Both false
+# phrasings are pinned ABSENT and the aggregate fact pinned PRESENT — a paragraph nobody has got right
+# first is a claim, not a comment. The negative arms are the safe shape: they red only if the bug returns.
+_PRD_TPL="$(cat "$REPO_TEMPLATES/com.tortoise.pr-doctor.plist")"
+assert_contains "$_PRD_TPL" "each repo ALSO gets" "pr-doctor template: per-repo pairs are ADDITIONAL, not a replacement"
+# ⛔ NOT `grep -qi aggregate`: that needle is satisfied by the paragraph's own narration of the earlier
+# FALSE versions ("silent on the AGGREGATE", "the set's aggregate lands back on the canonical names"),
+# so deleting the operator-facing statement — or replacing it with round 44's inversion — left this arm
+# GREEN (measured, round 45: PASS=439 FAIL=0 with the fact gone). Pin the FACT's own wording, which
+# occurs once, and the rc semantics separately.
+assert_contains "$(tr 'A-Z' 'a-z' <<<"$_PRD_TPL")" "written with the set's aggregate verdict" "pr-doctor template: still states the SET aggregate lands on the canonical pair"
+assert_contains "$_PRD_TPL" '`rc` = the worst of the set' "pr-doctor template: still states the aggregate rc is the WORST of the set"
+assert_contains "$_PRD_TPL" "_fleet_pr_doctor_bound" "pr-doctor template: still names a reader that opens the canonical status file by name"
+assert_contains "$_PRD_TPL" "pr_doctor_last_run" "pr-doctor template: still names the beat's reader of the same canonical record"
+assert_not_contains "$_PRD_TPL" "NOT written at all" "pr-doctor template: does NOT claim the canonical pair is never written (round 44's inversion)"
+assert_not_contains "$_PRD_TPL" "the log and the verdict MOVE to" "pr-doctor template: does NOT claim the canonical pair moves away (round 44's inversion)"
+# ⛔ THE THREE READERS OPEN THE STATUS FILE, NOT THE PAIR (review round 45, P1 — measured). The sentence
+# said "THREE readers open those canonical **files** BY NAME", which is half false: all three open
+# `pr-doctor.status.json` (heartbeat-loop.sh:851, objective.py's `pr_doctor_last_run` at :3264,
+# lib/fleet-inventory.sh's `_fleet_pr_doctor_bound` at :953) and NOTHING LIVE READS `pr-doctor.log` —
+# it has TWO writers — `pr-doctor.py`'s own `log()` (open(_log_path(), "a")) and the heartbeat launcher
+# appending a child's stdout (heartbeat-loop.sh:800) — and nothing reads it; the other references only
+# print its path (:902/:906) or are prose. An operator reading "those canonical files" is promised a log
+# consumer that does not exist,
+# which is the same wrong-place-to-look failure the paragraph exists to prevent, inverted. All three
+# facts are pinned: the correction itself (negative, so a re-inversion reds), the log fact (positive),
+# and the corrected WRITER COUNT (positive — an earlier version of this very comment said ONE appender,
+# so the count is the half that went stale and the one a future editor is most likely to restore).
+assert_not_contains "$_PRD_TPL" "canonical files BY NAME" "pr-doctor template: does NOT claim three readers open the canonical PAIR (round 45's overstatement)"
+assert_contains "$_PRD_TPL" "nothing live READS \`pr-doctor.log\`" "pr-doctor template: says out loud that the log has no live reader"
+assert_contains "$_PRD_TPL" "two things that WRITE it are" "pr-doctor template: pins the corrected writer count (two, not one appender)"
+# ⛔ THE PATH SENTENCE NAMED A GUARANTEE THE INSTALLER DOES NOT IMPLEMENT (round 48 review, P3 — measured).
+# It said PATH "carries the fleet's gh-wrapper dir FIRST", but `launchd_path()` only DROPS entries (unresolved,
+# and `*/shims`) and preserves the AMBIENT order — nothing is prepended, so a job installed from a shell with
+# no gh wrapper on PATH has none, and an operator debugging a bypassed wrapper was sent to the wrong file.
+# Both halves are pinned: the sentence that was false, and the one that replaced it.
+assert_contains "$_PRD_TPL" "PATH is the INSTALLER's PATH" "pr-doctor template: says which PATH the job gets — the installer's, not a curated one"
+assert_contains "$_PRD_TPL" "Nothing is prepended" "pr-doctor template: says the renderer DROPS only — the order it keeps is the ambient one"
+# ⛔ THE DROP RULE IS NARROWER THAN "a */shims dir" (round 48 review, P3 — measured): `launchd_path()`
+# matches `*/shims | */shims/*`, so an entry INSIDE a shims dir is dropped too. The prose said only the dir,
+# and nothing asserted the clause at all — reverting it to the narrower sentence red NO check. This is the
+# pin: the "inside one" half is the load-bearing part.
+assert_contains "$_PRD_TPL" "OR ANYTHING INSIDE ONE" "pr-doctor template: the shims drop covers entries INSIDE a shims dir, as launchd_path() does"
+assert_not_contains "$_PRD_TPL" "gh-wrapper dir first" "pr-doctor template: never claims a gh wrapper is placed first (install-launchd.sh does not do that)"
+# ⛔ AND THE THREE READERS IT NAMES MUST ACTUALLY EXIST (round 46 review, P2 — measured). The arms above
+# pin the paragraph's WORDING only, so renaming or deleting `_fleet_pr_doctor_bound` kept them GREEN while
+# the operator-facing text named a function nobody can call — the drift this paragraph's own comment says
+# has already happened twice. These read the files the paragraph points at.
+_rd_missing=""
+grep -q '^_fleet_pr_doctor_bound()' "$SCRIPT_DIR/../scripts/lib/fleet-inventory.sh" || _rd_missing="$_rd_missing fleet-inventory.sh:_fleet_pr_doctor_bound"
+grep -q '^def pr_doctor_last_run(' "$SCRIPT_DIR/../scripts/objective.py" || _rd_missing="$_rd_missing objective.py:pr_doctor_last_run"
+awk '!/^[[:space:]]*#/ && /pr-doctor\.status\.json/ { f=1 } END { exit !f }' "$SCRIPT_DIR/../scripts/heartbeat-loop.sh" || _rd_missing="$_rd_missing heartbeat-loop.sh:pr-doctor.status.json"
+if [ -z "$_rd_missing" ]; then
+    ok "pr-doctor template: all three readers it names EXIST (status file, beat, inventory)"
+else
+    bad "pr-doctor template names reader(s) that do not exist — a renamed or deleted reader leaves the operator text pointing at a dead function:$_rd_missing"
+fi
 # A visible checkout whose resolution produced NOTHING is a regression, not a host without one. Ask
 # the same three candidates install-launchd.sh:76-82 asks (the fixture's HOME is the fake one the run
 # used, so §13/§14's seeded checkouts cannot make this look resolved).

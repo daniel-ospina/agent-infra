@@ -9,6 +9,9 @@ import { register } from "../shared/health.js";
 import { appendJsonl } from "../shared/audit-log.js";
 import { isPrintMode, argvAllowsTask } from "../shared/print-mode.js";
 import { redactCommand } from "../shared/redact-command.js";
+// #2242: the ONE spawn-outcome classifier (#2665). A `[VGATE]` dispatch that produced no verdict
+// must not reach the #5724 fail-open below — see the non-verdict guard in the tool_result handler.
+import { classifySpawnOutcome } from "../shared/spawn-capacity.js";
 // #966: the command parsers are ONE copy shared with review-enforcer, in
 // extensions/shared/ — the two extensions carried private copies that silently
 // drifted (and asserted opposite answers for the same input). Kept in shared/
@@ -5062,6 +5065,33 @@ export default function (pi: ExtensionAPI) {
     const bgDetails = event.details as { background?: boolean } | undefined;
     if (bgDetails?.background === true || input.background === true) {
       console.warn("[verification-gate] ⚠️ Ignoring a returns-early background `task` result — a background [VGATE] dispatch cannot satisfy the gate (#1662); the gate stays BLOCKED until a verifier verdict is delivered.");
+      return undefined;
+    }
+
+    // ⛔ A DISPATCH THAT PRODUCED NO VERDICT IS NOT AN UNPARSEABLE VERDICT (#2242 review R5, P1).
+    //
+    // This guard is the FOURTH consumer shape of the spawn-outcome vocabulary, and the one that
+    // makes the class reachable rather than latent. A pre-spawn refusal carries NON-EMPTY content
+    // (`could not dispatch: fleet saturated at N sessions`) and no `details.background`, so it
+    // passed the #1662 guard above AND the empty-content guard below, fell through the parse, and
+    // landed in the #5724 fail-open prompt-merge — which, for an INTERACTIVE orchestrator
+    // (`isTaskSubAgent()` is false for a lane controller), marks every file named in the prompt as
+    // VERIFIED with no verifier ever having run. `invalid-cwd`/`circuit_open` had the same shape;
+    // #2242 turns it routine, because `TASK_SESSION_CEILING_REFUSE=1` on a saturated box refuses
+    // every `[VGATE]` dispatch — i.e. the knob documented as "fail fast" would defeat the gate it
+    // is fastest on the box most likely to be dispatching a reviewer.
+    //
+    // Deliberately does NOT increment `vgateFailures`: three counted refusals would trip the
+    // auto-bypass latch below and switch the gate OFF — a refusal must leave the gate BLOCKED,
+    // never move it toward disabled. Same shape as the background guard above.
+    const spawnOutcome = classifySpawnOutcome({
+      details: event.details as Record<string, unknown> | undefined,
+      isError: (event as { isError?: unknown }).isError,
+    });
+    if (spawnOutcome.outcome !== "verdict") {
+      console.warn(
+        `[verification-gate] ⚠️ Ignoring a [VGATE] dispatch that produced NO VERDICT (${spawnOutcome.outcome}: ${spawnOutcome.evidence}) — it is not an unparseable verdict, so the #5724 fail-open prompt-merge must not run; the gate stays BLOCKED (#2242).`,
+      );
       return undefined;
     }
 
