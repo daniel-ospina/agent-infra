@@ -1291,16 +1291,20 @@ cat <<'INNER2'
 INNER2;
 after_bad_terminator() { :; }
 INNER2
-# ⛔ THREE MORE CONDITIONS, EACH UNPINNED UNTIL ITS OWN LINE EXISTED (measured — and they are NOT all the
-# same direction, which this note used to claim it was: (d) and (e) hide a real definition, the false-PASS
-# direction, while (f) INVENTS one from a heredoc body, the false-RED direction. All 246 arms stay green
-# without any of the three):
+# ⛔ THREE MORE CONDITIONS, EACH UNPINNED UNTIL ITS OWN LINE EXISTED (measured — and ALL THREE are the
+# false-PASS direction: each makes a real definition INVISIBLE while all 246 arms stay green. ⛔ AN EARLIER CUT
+# OF THIS NOTE CALLED (f) THE FALSE-RED DIRECTION, and that was measured FALSE — see (f)):
 #   (d) an INDENTED head with the brace on the next line — pins `head`'s leading `\s*`, which the arm label
 #       "brace on either line, any indent" had claimed all along;
 #   (e) a head separated from its `{` by a BLANK line — pins the empty-line half of the later-lines skip (the
 #       comment-line half already had its own line);
-#   (f) a heredoc opened with `<<-` whose body holds a brace-looking line — pins the `-?` in the opener regex;
-#       without it the opener is never recognised and the body is scanned as code.
+#   (f) a heredoc opened with `<<-` whose body holds a brace-looking line — pins the `-` branch of the opener
+#       WALK (`_openers`, NOT a regex — see the note below at "THE OPENER IS FOUND BY A WALK"), and it pins
+#       the false-PASS direction. ⛔ Measured by deleting that branch: `-` is itself in the delimiter charset,
+#       so the opener is recorded with delimiter `-`, never terminates, and the rest of the fixture is
+#       SWALLOWED — nine real definitions are LOST (`real_after_tab_heredoc` through `after_paren_arith`) and
+#       NOTHING is invented (`not_a_def_from_a_tab_heredoc` is not reported either). So the body line is not
+#       "scanned as code"; it and everything after it disappear.
   indented_head_only()
 {
   :

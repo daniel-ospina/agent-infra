@@ -199,8 +199,13 @@ _rs_nearest_existing_ancestor() {
   # refused 5 before the absence test can see it. ⛔ BUT IT IS NOT ALWAYS THIS ARM THAT REFUSES IT (#3960
   # review cycle 2, P3 — measured, and this sentence used to claim the opposite): a link LOOP answers
   # `other` at `_rs_stat_kind`, and `denied|other` returns 5 from the ERRNO arm, which runs EARLIER — so the
-  # ancestor-link arm is the refusal route for `absent`-with-errno and for `unknown`, and the loop's 5 has
-  # the same verdict through a different arm. Measured: every unresolvable-link spelling answers 5 on both
+  # loop's 5 has the same verdict through a different arm. ⛔ AND THIS ARM'S SCOPE IS NARROWER THAN "EVERY
+  # `absent` ROUTE" (round 48 cycle 4, P2 — measured, and the line below over-generalised): it is the refusal
+  # route for an `absent`-with-errno spelling whose LEAF is below the link (`<a dangling link>/repos.conf`)
+  # and for `unknown`. A dangling link spelled with a TRAILING SLASH is `absent` as well, but it is refused
+  # EARLIER, by `repo_set_parse`'s stripped-spelling arm — measured: `dang/` on a dangling link answers 5
+  # quoting "the spelling without its trailing slash is a symbolic link", NOT this arm's "nearest existing
+  # component". Measured: every unresolvable-link spelling answers 5 on both
   # readers whatever the arm, and the rc-3 set is IDENTICAL between them and contains no UNRESOLVABLE link.
   # ⛔ AND IT MUST NOT OVERCLAIM THE OTHER WAY EITHER: rc 3 IS right for a spelling that traverses a link
   # which RESOLVES, because then only the remainder is absent (`<a good link>/nope.conf` → 3). No COUNTS are
