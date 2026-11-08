@@ -628,7 +628,14 @@ HEAD="$(gh pr view "$PR" --repo "$OR" --json headRefOid --jq .headRefOid 2>/dev/
 CLAIM="$O/state/mergeclaim-$PR.lock"
 claim() { ( set -o noclobber; echo $$ > "$CLAIM" ) 2>/dev/null; }
 if ! claim; then
-  OPID="$(cat "$CLAIM" 2>/dev/null || echo 0)"
+  # ⛔ THE CLAIM PID IS A FILE READ, NOT A SEAM (round-26 review, P1). This was `cat "$CLAIM"`, and the
+  # lane's PATH reaches this line (`lane-merge.sh` launches the chain with inherited env, `chain-merge.sh`
+  # PREPENDS to PATH, and this script is exec'd as `bash "$O/merge-one.sh"`), so a `cat` answering 0 for
+  # `*.lock` makes a LIVE owner look stale: the branch removes its lock and spawns a competitor on the
+  # same head. Measured: control refused with "pid N already owns this PR"; shimmed, the second worker
+  # took PR 9999 while pid N was alive — two reviewers against one head, duplicate markers. Builtin read.
+  OPID=0; [ -f "$CLAIM" ] && { IFS= read -r OPID < "$CLAIM" || true; }; [ -n "$OPID" ] || OPID=0
+  case "${OPID:-0}" in ''|*[!0-9]*) OPID=0 ;; esac
   if [ "${OPID:-0}" -gt 0 ] && kill -0 "$OPID" 2>/dev/null; then echo "[merge $PR] pid $OPID already owns this PR — exiting" >> "$L.log"; exit 0; fi
   rm -f "$CLAIM"
   claim || { echo "[merge $PR] claim race — exiting" >> "$L.log"; exit 0; }
@@ -2130,7 +2137,24 @@ if [ "${AGENT_STARTED:-0}" = "1" ]; then review_round_spend; fi
 # MAX_REVIEW_TRIES paid re-reviews were spent, and the head was parked. A classifier tolerance that the
 # producer can never deliver is an inert guard; the suite pinned only the helper, so it stayed green.
 # (Both halves are pinned now: this expression is driven by the suite against every accepted form.)
-LAST="$(grep -aE '^(CLEAN|ISSUES)([[:space:]]|:|-)' "$L.log" | tail -1 | tr -d '\r')"
+# ⛔ THE VERDICT LINE IS EXTRACTED WITH BUILTINS, NOT `grep | tail | tr` (round-26 review, P1). This fed
+# `case "$LAST" in CLEAN*)` → `record-review.sh` → the signed marker, so a shimmed `grep`/`tail` that keeps
+# only CLEAN lines FABRICATES the verdict and the run mints an attestation for a head no reviewer read —
+# the thing AGENTS.md forbids. Measured: a reviewer log ending `ISSUES 3` yielded `LAST=[CLEAN]` with the
+# shim and `[ISSUES 3]` without it. Read line by line with a builtin loop; the LAST match wins, exactly as
+# `tail -1` did, and `\r` is stripped from the field remainder without `tr`.
+LAST=""
+if [ -f "$L.log" ]; then
+  while IFS= read -r _vln || [ -n "$_vln" ]; do
+    case "$_vln" in
+      # The ORIGINAL regex was `^(CLEAN|ISSUES)([[:space:]]|:|-)` — note it required a following
+      # character, so a BARE `CLEAN` line was never a verdict. That set is preserved exactly here; adding
+      # the bare form would widen what mints an attestation, which is the opposite of this file's rule.
+      CLEAN[[:space:]]*|CLEAN:*|CLEAN-*|ISSUES[[:space:]]*|ISSUES:*|ISSUES-*)
+        _vln="${_vln//$'\r'/}"; LAST="$_vln" ;;
+    esac
+  done < "$L.log"
+fi
 fi
 echo "[merge $PR] verdict: ${LAST:-<none>}" >> "$L.log"
 
@@ -2549,8 +2573,12 @@ case "$LAST" in
     # posts an UNSIGNED marker, which the gate also rejects — so the park must say so rather than
     # blame the post.
     MARK_KEY="${AI_REVIEW_GATE_KEY:-}"
+    # ⛔ THE SIGNING KEY IS READ WITH A BUILTIN, NOT `cat` (round-26 review, P2). This key is what verifies
+    # the marker two dozen lines down; a shimmed `cat` supplies a key of the lane's choosing, so a marker
+    # the lane signed itself passes `verify_any_marker` and "the PR body is not a trust boundary" becomes a
+    # tautology. A key file is a file read, not a seam.
     if [ -z "$MARK_KEY" ] && [ -f "$HOME/.pi/agent/.ai-review-gate-key" ]; then
-      MARK_KEY="$(cat "$HOME/.pi/agent/.ai-review-gate-key" 2>/dev/null || true)"
+      MK=""; IFS= read -r MK < "$HOME/.pi/agent/.ai-review-gate-key" || true; MARK_KEY="$MK"
     fi
     MARK_KEY="$(printf '%s' "$MARK_KEY" | tr -d '[:space:]')"
     # The pattern is ANCHORED to the WHOLE line, and that is what makes the matched line exactly the

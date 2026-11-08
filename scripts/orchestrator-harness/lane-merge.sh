@@ -891,13 +891,24 @@ emit_fix() { # emit_fix <TOKEN> <reason…>
 # record-review.sh writes; no API call. A record bound to a DIFFERENT head does NOT count: that is
 # the stranded-attestation condition, not coverage.
 review_record_at_head() {
-  local n slug f sha
+  local n slug f sha line
   n="$PR"; slug="$(printf '%s' "$OR" | tr '/' '-')"
   for f in "$HOME/.pi/agent/reviews/$slug-$n.json" "$HOME/.pi/agent/reviews/$n.json"; do
     [ -f "$f" ] || continue
-    sha="$(grep -o '"head_sha"[[:space:]]*:[[:space:]]*"[0-9a-fA-F]*"' "$f" 2>/dev/null \
-            | head -1 | grep -o '[0-9a-fA-F]\{7,\}')"
-    if [ -n "${sha:-}" ] && [ -n "${HEAD:-}" ]; then
+    # ⛔ BUILTIN PARSE OF THE ATTESTED HEAD (round-26 review, P3). This used `grep -o … | head -1 |
+    # grep -o`, three PATH-resolved programs deciding whether a signed review exists at $HEAD: a shim
+    # made a record bound to ANOTHER head read as present (measured: rc=1 → rc=0, "a signed review exists
+    # at this head" about a head it never named). The consequence is a mis-grade (exit 12
+    # BLOCKED_ATTESTATION → 13 BLOCKED, so the lane loses the exact remedy), not a merge — but it is a
+    # decision read, and the rest of this file now reads its state with builtins.
+    sha=""
+    while IFS= read -r line || [ -n "$line" ]; do
+      case "$line" in *'"head_sha"'*) sha="${line#*\"head_sha\"}"; break ;; esac
+    done < "$f"
+    sha="${sha#*:}"; sha="${sha#*\"}"; sha="${sha%%\"*}"
+    case "$sha" in ''|*[!0-9a-fA-F]*) sha="" ;; esac
+    [ "${#sha}" -ge 7 ] || sha=""
+    if [ -n "$sha" ] && [ -n "${HEAD:-}" ]; then
       case "$HEAD" in "$sha"*) return 0 ;; esac
     fi
   done
