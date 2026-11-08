@@ -7568,6 +7568,10 @@ test("#1508 — the registered tool_result handler turns a failed child into isE
   deepEqual(h({ toolName: "task", isError: false, details: { status: "circuit_open", retries: 0 } }), { isError: true }, "an open circuit breaker is a failure");
   deepEqual(h({ toolName: "task", isError: false, details: { status: "invalid-cwd", retryable: false } }), { isError: true }, "a refused dispatch (bad cwd) is a failure");
   deepEqual(h({ toolName: "task", isError: false, details: { status: "invalid-session-id", retryable: false } }), { isError: true }, "a refused dispatch (bad session id) is a failure");
+  // #2242: the fleet-concurrency refusal is a member of the SAME set, so it must be exercised here
+  // like every other member — the docstring's "exercises every member" claim is only true if this
+  // row exists. Its shape is the pre-spawn payload: no exitCode, no isError, `retryable:false`.
+  deepEqual(h({ toolName: "task", isError: false, details: { status: "fleet-saturated", retryable: false, piProcs: 88, cores: 10, ceiling: 80 } }), { isError: true }, "a refused dispatch (fleet saturated) is a failure");
   deepEqual(h({ toolName: "task", isError: false, details: { failoverHopSpawnFailed: true } }), { isError: true }, "a hop leg that never produced a result is a failure");
   equal(h({ toolName: "task", isError: false, details: { exitCode: null } }), undefined, "a null exit is a settle (composeTaskResult's own okExit contract)");
   equal(h({ toolName: "task", isError: false, details: { exitCode: 0 } }), undefined, "exit 0 is a settle");
@@ -8557,7 +8561,9 @@ function withDispatchEnv<T>(vars: Record<string, string | undefined>, fn: () => 
 }
 
 test("#2242: the ceiling is derived at 8x cores and an operator override is honoured VERBATIM", () => {
-  delete process.env.TASK_SESSION_CEILING;
+  // Every assertion below passes an EXPLICIT env map, so nothing here touches the ambient
+  // environment (a bare `delete process.env.TASK_SESSION_CEILING` would leak the deletion into
+  // every later test in this file — #2242 review, P3).
   deepEqual(resolveSessionCeiling(10, {}), { ceiling: 8 * 10, source: "derived" }, "10 cores -> derived 80");
   deepEqual(resolveSessionCeiling(4, {}), { ceiling: 32, source: "derived" }, "the default is a MULTIPLE of cores, not a flat number");
   // #1070's rule: an operator who names a number means it — never rescaled.
@@ -8577,11 +8583,13 @@ test("#2242: the ceiling is derived at 8x cores and an operator override is hono
   equal(DEFAULT_SESSION_CEILING_MULT, 8, "the derived multiplier is the documented 8x");
 });
 
-test("#2242: an UNMEASURED box is never called saturated (the fail-safe edge)", () => {
-  // `ps` unavailable -> countPiProcs() = -1. A broken probe must never be read
-  // as "no fleet" NOR as "saturated": the first would hide the signal, the
-  // second would refuse every dispatch on a box where `ps` is missing.
+test("#2242: an UNMEASURED box is never called saturated", () => {
+  // These pin BEHAVIOUR (the required property), not a guard: the safety comes from the
+  // comparison itself — `-1 >= <positive ceiling>` is false exactly as `NaN >= anything` is —
+  // which is why the explicit `Number.isFinite`/`>= 0` guard was removed rather than left in
+  // place looking load-bearing (#2242 review, P2 finding 3).
   equal(isDispatchSaturated({ piProcs: -1, cores: 10, ceiling: 80 }), false, "the -1 unknown sentinel is not saturation");
+  equal(isDispatchSaturated({ piProcs: -1, cores: 10, ceiling: 1 }), false, "…even against a ceiling of 1, so an unmeasured box can never be refused");
   equal(isDispatchSaturated({ piProcs: Number.NaN, cores: 10, ceiling: 80 }), false, "NaN is not saturation");
   equal(isDispatchSaturated({ piProcs: 500, cores: 10, ceiling: 0 }), false, "ceiling 0 (operator disable) never fires");
   equal(isDispatchSaturated({ piProcs: 79, cores: 10, ceiling: 80 }), false, "below the ceiling");
@@ -8619,25 +8627,44 @@ test("#2242: the fast refusal is OPT-IN and says `could not dispatch: fleet satu
   ok(String(text).startsWith("could not dispatch: fleet saturated at 88 sessions"), `the refusal opens with the exact shape the issue asks for (got ${text})`);
   ok(String(text).includes("#2242"), "the refusal cites the issue, so the next actor can re-derive it");
   ok(String(text).includes("TASK_SESSION_CEILING_REFUSE=0"), "it names its own override, so the refusal is never a dead end");
+  // The production default parameter (`env = process.env`) is what the pre-spawn path relies on,
+  // and every other row here passes an explicit map — so drive the AMBIENT path once, through the
+  // save-and-restore helper (a bare set/unset would leak the knob into every later test).
+  const beforeRefuse = process.env.TASK_SESSION_CEILING_REFUSE;
+  withDispatchEnv({ TASK_SESSION_CEILING_REFUSE: "1" }, () => {
+    ok(dispatchSaturationRefusal(saturated) !== null, "with no env argument the decision reads process.env");
+  });
+  equal(process.env.TASK_SESSION_CEILING_REFUSE, beforeRefuse, "the helper restored the ambient value it overwrote");
 });
 
 test("#2242: probeDispatchSaturation reads ONE count through the injectable seam", () => {
+  // The SENTINEL is the discriminator for the teardown (#2242 review P2 finding 2). The previous
+  // form (`probePiProcs() === countPiProcs() || probePiProcs() >= -1`) was ALWAYS true —
+  // `countPiProcs()` returns a count or -1, so the second disjunct also covered a LEAKED override —
+  // and the row stayed GREEN on the exact mutant it was named after (deleting the `finally`).
+  // A value the live probe can never return makes the leak detectable.
+  const SENTINEL = 987_654;
   let calls = 0;
-  setPiProcsOverride(() => {
-    calls += 1;
-    return 88;
-  });
   try {
+    setPiProcsOverride(() => {
+      calls += 1;
+      return 88;
+    });
     const got = probeDispatchSaturation({ TASK_SESSION_CEILING: "80" }, 10);
     equal(calls, 1, "exactly one `ps` read per probe");
     deepEqual(got, { piProcs: 88, cores: 10, ceiling: 80, source: "env" }, "the probe carries the measurement and the ceiling's provenance");
     // The settle-path machine line must read the SAME count, so a wedge can be
     // attributed to the concurrency it was dispatched into.
     ok(renderMachineStateLine().includes("piProcs=88"), "renderMachineStateLine reads the same seam");
+    // …and prove the seam is LIVE, so the 88 above is not a coincidence of the real count.
+    setPiProcsOverride(() => SENTINEL);
+    equal(probePiProcs(), SENTINEL, "the seam really drives the count");
   } finally {
     setPiProcsOverride(null);
   }
-  ok(probePiProcs() === countPiProcs() || probePiProcs() >= -1, "with the seam cleared the live probe is used again");
+  // AFTER the teardown: a leaked override still reports the sentinel here.
+  ok(probePiProcs() !== SENTINEL, "a cleared seam is INOPERATIVE — a leaked override would misreport piProcs in every wedge report");
+  equal(probePiProcs(), countPiProcs(), "with the seam cleared the live `ps` probe is read again");
 });
 
 test("#2242 WIRING: spawnSubAgent consults the preflight BEFORE any spawn, and the refusal is a FAILED status", () => {
@@ -8704,7 +8731,7 @@ testAsync("#2242 WIRING: a saturated box + the opt-in REFUSES the dispatch with 
   // Deliberately NOT asserted by spawning a real child — a unit test must not
   // pay a model call to prove that a dispatch proceeds.
   ok(
-    /if \(saturationRefusal\) \{/.test(source),
+    source.includes("if (saturationRefusal"),
     "the refusal branch is gated on the decision function, which is a no-op without the opt-in",
   );
 });

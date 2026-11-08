@@ -553,3 +553,14 @@ dispatch.
 The measurement is the same `ps` read the `Alive state:` machine line renders
 (§6, `#1485`'s `piProcs`), so a wedge report and the preflight cannot disagree
 about how many sessions the box held.
+
+**The refusal is a REFUSAL, in every consumer.** A pre-spawn refusal payload
+carries `details.status` and no `isError`, so the review-enforcer's dispatch
+floor classifies it through its own re-enumeration
+(`extensions/shared/spawn-capacity.ts` `REFUSED_STATUS`) — and a status missing
+from that mirror falls through to two arms decided by **extension load order**,
+making a refused dispatch read as a *completed unit* that satisfies the
+>=1-dispatch floor for an unreviewed push. That is a false PASS, not a
+bookkeeping slip: `fleet-saturated` is therefore in **both** sets
+(`FAILED_TASK_STATUS` and `REFUSED_STATUS`), each with a row in its own suite.
+Any future member of either set owes the same two edits.

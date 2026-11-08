@@ -63,13 +63,22 @@ export type SpawnOutcome = "verdict" | "refused" | "cut" | "failed";
 /**
  * Statuses a spawn result can carry that mean "no reviewer reported".
  *
- * `invalid-cwd` / `invalid-session-id` / `circuit_open` / `failed` are `builtin-tools`'
- * own `FAILED_TASK_STATUS` set; `cut` is `shared/task-runs`' terminal status for a child
- * killed by a bound. Enumerated rather than "anything not ok" so an unrecognised status
- * stays a COUNTED dispatch — a future success status must not become a false failure
+ * `invalid-cwd` / `invalid-session-id` / `circuit_open` / `fleet-saturated` / `failed` are
+ * `builtin-tools`' own `FAILED_TASK_STATUS` set; `cut` is `shared/task-runs`' terminal status
+ * for a child killed by a bound. Enumerated rather than "anything not ok" so an unrecognised
+ * status stays a COUNTED dispatch — a future success status must not become a false failure
  * (the same rule, and the same reason, as `FAILED_TASK_STATUS`).
+ *
+ * ⛔ THE MIRROR IS LOAD-BEARING, AND IT HAS ALREADY DRIFTED ONCE (#2242 review, P1). Adding a
+ * member to `FAILED_TASK_STATUS` in `builtin-tools` does NOT add it here: a pre-spawn refusal
+ * payload carries `details.status` and NO `isError`, so an unmapped status falls through every
+ * other arm to the last two — `details.isError` / `result.isError` — which by the module's own
+ * rule above are chosen by extension LOAD ORDER. A `fleet-saturated` refusal therefore
+ * classified as a `verdict` on any box where `review-enforcer` loads first, and satisfied the
+ * >=1-dispatch floor for an UNREVIEWED push. Both sets are enumerated in
+ * `spawn-capacity.test.ts`; add the row in the same edit as the member.
  */
-const REFUSED_STATUS = new Set(["invalid-cwd", "invalid-session-id", "circuit_open"]);
+const REFUSED_STATUS = new Set(["invalid-cwd", "invalid-session-id", "circuit_open", "fleet-saturated"]);
 const FAILED_STATUS = new Set(["failed"]);
 const CUT_STATUS = new Set(["cut"]);
 
@@ -310,6 +319,15 @@ export function attemptClass(a: SpawnAttempt): "capacity" | "breaker" | "latch" 
   if (/failoverHalt=true/.test(a.evidence)) return "latch";
   if (a.outcome === "cut" || a.outcome === "failed") return "capacity";
   if (a.outcome === "refused" && /circuit_open/.test(a.evidence)) return "breaker";
+  // ⛔ A CAPACITY REFUSAL IS A CAPACITY FAULT, NOT AN ARGUMENT (#2242 review, P1 second leg).
+  // `fleet-saturated` is refused BEFORE a child exists, but its cause is the box's concurrency
+  // ceiling — the same class as a cut child — and never the dispatch's argument. Filed as
+  // `refusal` it rendered "a pre-spawn refusal (cwd / session id) — NOT a load effect, and
+  // re-dispatching the SAME argument is refused again", which is false on BOTH halves: the
+  // argument is fine, and the IDENTICAL dispatch SUCCEEDS once the box drains. That is the
+  // wrong-remedy failure this module exists to remove — the same reason `circuit_open` was split
+  // to `breaker` and `failoverHalt` to `latch`.
+  if (a.outcome === "refused" && /fleet-saturated/.test(a.evidence)) return "capacity";
   return "refusal";
 }
 
@@ -393,6 +411,13 @@ export function describeSpawnCapacity(
   const atCap = n >= SPAWN_ATTEMPT_CAP;
   const cls = spawnFaultClass(attempts);
   const c = faultClasses(attempts);
+  // ⛔ A CAPACITY CLASS CAN COME FROM A PRE-SPAWN REFUSAL (#2242 review, P1 second leg), and the
+  // capacity wording below asserts a CHILD — "its child never returned a verdict", "a spawn that
+  // never gets a first message". For `fleet-saturated` no child was ever spawned, so that would
+  // be a claim the ledger's own ATTEMPTS line contradicts (the #2349 discipline). Derived from
+  // the attempts, not from `cls`, so a mixed ledger that holds BOTH a cut child and a saturation
+  // refusal keeps the child wording it has earned.
+  const capacityRefusal = attempts.some((a) => a.outcome === "refused" && attemptClass(a) === "capacity");
   // The remedy branch: the class that names the next ACTION. A breaker must be WAITED for before
   // anything else is worth trying, so it outranks a retry; with capacity present the load/retry
   // story is then the honest one. The per-class EVIDENCE lines below are emitted independently of
@@ -450,7 +475,9 @@ export function describeSpawnCapacity(
     : "a sub-agent dispatch";
   const headline =
     cls === "capacity"
-      ? `${dispatchNoun} WAS ATTEMPTED and its child never returned a verdict`
+      ? capacityRefusal
+        ? `${dispatchNoun} WAS ATTEMPTED and refused BEFORE a child existed — the box was already at its session ceiling (#2242)`
+        : `${dispatchNoun} WAS ATTEMPTED and its child never returned a verdict`
       : cls === "refusal"
         ? `${dispatchNoun} WAS ATTEMPTED and refused BEFORE a child existed`
         : cls === "breaker"
@@ -489,8 +516,15 @@ export function describeSpawnCapacity(
     );
   } else if (c.capacity) {
     lines.push(
-      "     A loaded box legitimately stretches every attempt: a spawn that never gets a first",
-      "     message is what load does to a provider request, not evidence that the reviewer was skipped."
+      capacityRefusal
+        ? "     The box was already at its session ceiling, so the dispatch was REFUSED before any"
+        : "     A loaded box legitimately stretches every attempt: a spawn that never gets a first",
+      capacityRefusal
+        ? "     child existed — that is capacity, not an argument, and the IDENTICAL dispatch succeeds"
+        : "     message is what load does to a provider request, not evidence that the reviewer was skipped.",
+      ...(capacityRefusal
+        ? ["     once the box drains (kill lanes / adjust TASK_SESSION_CEILING, then re-dispatch)."]
+        : [])
     );
   } else {
     lines.push("     No attempt in this ledger was cut or exhausted, so load scaling is NOT the cause here.");
@@ -536,7 +570,9 @@ export function describeSpawnCapacity(
         : remedy === "breaker"
           ? "     The review is still REQUIRED: whoever re-dispatches must WAIT for the breaker to close"
           : remedy === "capacity"
-            ? "     The review is still REQUIRED: whoever re-dispatches must place it where a child can"
+            ? capacityRefusal
+              ? "     The review is still REQUIRED: whoever re-dispatches must WAIT for the box to drain"
+              : "     The review is still REQUIRED: whoever re-dispatches must place it where a child can"
             : "     The review is still REQUIRED: whoever re-dispatches must first fix the refused argument"
     );
     lines.push(
@@ -545,7 +581,9 @@ export function describeSpawnCapacity(
         : remedy === "breaker"
           ? "     (state, not an argument), then dispatch again."
           : remedy === "capacity"
-            ? "     get a first message (load-gate: scripts/load-gate.mjs)."
+            ? capacityRefusal
+              ? "     below TASK_SESSION_CEILING (or raise the ceiling), then dispatch again."
+              : "     get a first message (load-gate: scripts/load-gate.mjs)."
             : "     named above (cwd / session id)."
     );
   } else if (remedy === "latch") {

@@ -58,9 +58,33 @@ test("`status: failed` (retry exhaustion — the measured case) is FAILED, and n
 });
 
 test("a pre-spawn refusal is REFUSED", () => {
-  for (const status of ["invalid-cwd", "invalid-session-id", "circuit_open"]) {
+  // ⛔ THIS LOOP IS THE MIRROR of `builtin-tools`' FAILED_TASK_STATUS (#2242 review, P1): a
+  // member added there and not here classifies as a `verdict` — an UNREVIEWED push satisfying
+  // the >=1-dispatch floor — because a pre-spawn refusal payload carries `details.status` and no
+  // `isError`, and the remaining arms are decided by extension LOAD ORDER.
+  for (const status of ["invalid-cwd", "invalid-session-id", "circuit_open", "fleet-saturated"]) {
     equal(classifySpawnOutcome({ details: { status } }).outcome, "refused", status);
   }
+});
+
+test("#2242: a `fleet-saturated` refusal is REFUSED — the exact payload the pre-spawn path emits", () => {
+  // Not just the status string: the shape `spawnSubAgent` actually returns, which is what made
+  // the missing mirror invisible. `isError` is deliberately ABSENT (the producer does not set it)
+  // and `retryable:false` must not be read as a verdict.
+  const payload = {
+    details: {
+      status: "fleet-saturated",
+      retryable: false,
+      error: "could not dispatch: fleet saturated at 88 sessions on 10 cores (ceiling 80)",
+      piProcs: 88,
+      cores: 10,
+      ceiling: 80,
+    },
+  };
+  const c = classifySpawnOutcome(payload);
+  equal(c.outcome, "refused", "a refused dispatch is not a counted review");
+  equal(c.evidence, "status=fleet-saturated", "the classification names what it read");
+  ok(c.outcome !== "verdict", "THE REGRESSION: a refusal must never satisfy the dispatch floor");
 });
 
 test("`killed: true` is a CUT — and the reason it carries is preserved", () => {

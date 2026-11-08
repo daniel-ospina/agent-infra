@@ -3399,9 +3399,17 @@ export interface SaturationInput {
  * direction `countPiProcs` already takes, and the reason a refusal can never be
  * triggered by a broken probe. `0` is the operator's disable. */
 export function isDispatchSaturated(i: SaturationInput): boolean {
-  if (!(i.ceiling > 0)) return false;
-  if (!Number.isFinite(i.piProcs) || i.piProcs < 0) return false;
-  return i.piProcs >= i.ceiling;
+  // `ceiling > 0` first: `0` is the operator's documented disable, and a non-positive ceiling
+  // must never be read as "every box is saturated".
+  //
+  // The comparison ITSELF is what makes an unmeasured box safe — an unknown count is the `-1`
+  // sentinel (or NaN), and `-1 >= <positive ceiling>` is false exactly as `NaN >= anything` is.
+  // Stated here rather than as an explicit `Number.isFinite`/`>= 0` guard on purpose: such a
+  // guard is UNREACHABLE as a decider once `ceiling > 0` is enforced, and an unreachable guard
+  // reads as the load-bearing line to the next reader while the comparison is doing the work
+  // (#2242 review, P2 finding 3). `probeDispatchSaturation` is the only production caller and
+  // it passes `countPiProcs()`'s tri-state value straight through.
+  return i.ceiling > 0 && i.piProcs >= i.ceiling;
 }
 
 function saturationCores(i: SaturationInput): number {
@@ -4730,13 +4738,23 @@ type TaskResultDetails = {
  *
  * Keep in sync with the producers in this file, which set `status` (or
  * `fallbackStatus`, for the #152 fallback leg's own status): the `invalid-cwd`
- * refusal in the spawn path, the two `invalid-session-id` refusals, the
- * `circuit_open` breaker result, the `failed` retry-exhaustion result, and the
- * fallback copy. Cited by label rather than by line on purpose: this same file
- * shifts whenever the dispatch path changes, and a stale number sends a
- * maintainer to the wrong construct. Guarded by builtin-tools.test.ts, which
- * exercises every member through the registered hook and pins that an unknown
- * status stays a success. */
+ * refusal in the spawn path, the `fleet-saturated` refusal beside it (#2242),
+ * the two `invalid-session-id` refusals, the `circuit_open` breaker result, the
+ * `failed` retry-exhaustion result, and the fallback copy. Cited by label
+ * rather than by line on purpose: this same file shifts whenever the dispatch
+ * path changes, and a stale number sends a maintainer to the wrong construct.
+ *
+ * ⛔ TWO MIRRORS, NOT ONE. `extensions/shared/spawn-capacity.ts`'s
+ * `REFUSED_STATUS` re-enumerates these members for the review-enforcer's
+ * dispatch floor, and it is LOAD-ORDER-sensitive (a pre-spawn refusal carries
+ * no `isError`, so an unmapped status falls through to the extension-order
+ * arms). A member added here and not there classifies as a `verdict`, i.e. a
+ * refusal satisfying the >=1-dispatch floor for an UNREVIEWED push — the exact
+ * false PASS that module exists to close (#2242 review, P1). Add it in both,
+ * with a row in each suite.
+ *
+ * Guarded by builtin-tools.test.ts, which exercises every member through the
+ * registered hook and pins that an unknown status stays a success. */
 const FAILED_TASK_STATUS = new Set(["failed", "circuit_open", "invalid-cwd", "invalid-session-id", "fleet-saturated"]);
 
 // ── #1662: background dispatch (returns-early) + status/collect seam ────────
