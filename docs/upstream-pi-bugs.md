@@ -1106,13 +1106,13 @@ a manual re-measure "the next time any `pi` process exceeds ~5% of a core **with
 transcript silent > 120 s**" — a **two-conjunct** trigger. The **CPU half** of it
 fired on 2026-11-08 on a Linux fleet cell (x86_64, load 17.70, 22 days uptime,
 `pi` **1.2.0** — the report above probed **0.85.1** on macOS arm64). The silence
-conjunct **could not be evaluated on that host at all** — the `.jsonl` predicate
-reads `None` for almost every live process (below) — and the substitute read
-predicate below classifies every process above 5% as *working*, i.e. **not**
-silent. So what this section records is **the CPU signal firing and the burn
-being absent**, not the committed two-conjunct trigger having fired. It also
-records, more durably, a **better predicate pair** (ΔCPU + `rchar`) than the
-09-16 table's transcript-age predicate.
+conjunct **could be evaluated for only one of the 19 processes on that host** — the
+`.jsonl` predicate reads `None` for the other 18 (below) — and the read evidence
+below shows the processes above 5% reading at working rates rather than sitting on
+the idle floor, i.e. **not** silent. So what this section records is **the CPU
+signal firing and the burn being absent**, not the committed two-conjunct trigger
+having fired. It also records, more durably, a **better predicate pair**
+(ΔCPU + `rchar`) than the 09-16 table's transcript-age predicate.
 
 **A method correction, forced by the data.** The 09-16 table keys "idle" on the
 age of the session `.jsonl`. That predicate is **not obtainable on a fleet box**:
@@ -1131,11 +1131,10 @@ The substitute is **`/proc/<pid>/io`'s `rchar`**, which needs no cooperation fro
 `pi` and — read alongside ΔCPU — separates the two cases this issue conflates:
 *idle* (reads sit on a flat floor) versus *legitimately working* (reads scale with
 the provider stream or the tool output). Be precise about which of the two carries
-the weight, though: on these four windows a read threshold *does* separate every
-sample (idle tops out at 10 KB/s, the working minimum is 10.4 — quantified in the
-first result bullet below), but the margin is **0.4 KB/s, about 4%** — too thin
-to be a stand-alone trip. That is why **ΔCPU makes the split and `rchar` is the
-corroboration**, rather than a read threshold on its own. ΔCPU
+the weight, though: the idle floor and the working minimum are only **0.4 KB/s
+apart** (quantified in the first result bullet below) — thin enough that no read
+threshold should be trusted as a stand-alone classifier, which is why **ΔCPU makes
+the split and `rchar` is the corroboration**. ΔCPU
 comes from `/proc/<pid>/stat`'s `utime+stime` ticks (`USER_HZ=100`), i.e. the
 09-16 method (`ps -o time` twice) at 10 ms resolution. The main-thread vs
 `V8Worker` split in the last bullet cannot come from those **process-level**
@@ -1159,11 +1158,14 @@ epoch — the property the epoch analysis above found missing across windows.
   quote read 8.4, 8 and 10 KB/s, and the 10.4 KB/s case three bullets down sits
   just above it — a fixed background poll, not input, so the floor is a stable
   control rather than a per-process accident. Two honest qualifications: it is a
-  *band*, not a constant; and its margin to the working minimum is only **0.4
-  KB/s** (working min 10.4 vs idle max 10, in one window) — a threshold does
-  separate these samples, but by too little to be trusted as a stand-alone
-  classifier, so ΔCPU makes the split and `rchar` corroborates it. That is
-  exactly what the next bullet tests.
+  *band*, not a constant; and its separation from the working minimum is only
+  **0.4 KB/s** (working min 10.4 vs idle max 10, ≈4%) — thin enough that no read
+  threshold deserves to be the classifier on its own. The one sample that looks
+  like a counter-example, pid 4076400 (the exception below), reads 10.4 KB/s at
+  just **0.8% of a core**; it is **not** a member of the idle set — that set's
+  worst member is 0.3%, so a 0.8% process is not in it — and a near-floor ΔCPU
+  carrying a working read rate is precisely why **ΔCPU makes the split and `rchar`
+  only corroborates**. The next bullet tests that pairing directly.
 - **No window contained a process above 1% of a core with reads at that floor** —
   which is exactly the 09-16 defect signature (11 processes at 6.4–26.3% while
   silent for 1.0–209.5 min). Run as a filter over all four windows it returns
@@ -1186,11 +1188,12 @@ epoch — the property the epoch analysis above found missing across windows.
   The 10 s window is shorter than the 25–30 s discriminator windows above;
   `%` of one core is rate-normalised, so the pair is comparable *as a rate*, but
   this is the weakest window in the section against the bursty offender that
-  point (a) below names. And the box's load was
-  **not `pi`'s**: the top consumers were `bash` 99.9%, `python3` 96.3%, `bash`
-  63.1%, `python3` 16.9%, `bash` 15.8%, `pytest` 7.3% — i.e. the fleet's own
+  point (a) below names. And the box's load was **not `pi`'s**: the top consumers
+  were `bash` 99.9%, `python3` 96.3%, `bash` 63.1%, `python3` 16.9%, `bash`
+  15.8%, `pytest` 7.3% — i.e. the fleet's own
   work. That further undercuts the "`pi` CPU → load → swap → reboot" chain from
-  the *other* direction: on a host at the same order of load, `pi` was 10% of it.
+  the *other* direction: against the CPU those six named consumers were using, `pi`
+  was **~13%** (38.2% vs 299.3% of one core), not the driver.
 - **Main thread vs workers** (the report's caveat quantified, though *not* the
   size column, which stays missing below): on the processes that were busy, the
   main thread carried **0.61–1.00** of the ΔCPU and the `V8Worker` pool
@@ -1198,8 +1201,9 @@ epoch — the property the epoch analysis above found missing across windows.
   when it exists, is main-thread JS — consistent with the render-frame mechanism
   and *not* primarily collector throughput.
 
-**What this settles, and what it does not.** It settles that **a fleet box at
-0.85.1→1.2.0 shows no idle `pi` spin in 105 s of windows**, and it supplies the
+**What this settles, and what it does not.** It settles that **one Linux x86_64
+fleet box on `pi` 1.2.0 shows no idle `pi` spin in 105 s of windows**, and it
+supplies the
 missing discriminator for telling a burner from a worker. It does **not** settle
 that the defect is fixed, for three reasons this report's own analysis demands be
 stated: (a) the burn is **episodic** — windows this short cannot exclude a bursty
