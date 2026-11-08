@@ -454,9 +454,15 @@ realpath STRING EQUALITY against `resolve(_frameworkRoot, rel)`, where
 `_frameworkRoot` is the directory the guard MODULE was loaded from. That is
 correct only where the guard and the scripts live in one tree, and pi's
 deployment does not guarantee it: on a copy-deployed box the module root is
-`~/.pi/agent`, whose `scripts/` is a PARTIAL surface that does **not** contain
+`~/.pi/agent`, whose `scripts/` WAS a PARTIAL surface that did **not** contain
 `admin-merge.sh` (#2176), while the rail's real home is
-`$AGENT_INFRA_PATH/scripts/`. Measured 2026-10-22 from a hub-rooted session:
+`$AGENT_INFRA_PATH/scripts/`. ⛔ `WAS` is the correction, not a typo: since #3531
+the rail is a `merge_gate_srcs` member and IS farmed flat to
+`$DEST/scripts/admin-merge.sh`, so on a copy-deployed box the farmed copy is now
+resolvable under `_frameworkRoot` and arm 2 is what reaches the CHECKOUT instead.
+Arm 2 is therefore still required — without it the mandated rail is refused from
+every hub-rooted session — and the #2176 deployment shape it was built for now
+describes an UN-REFRESHED farm rather than the normal one. Measured 2026-10-22 from a hub-rooted session:
 
 ```
 ⛔ Script execution blocked — script content contains a blocked git operation (#1484).

@@ -84,7 +84,7 @@ credential into a 0644 file). It is: **make the entry installable**, then instal
 | Fallback client delivery (`~/.pi/agent/scripts/tortoise-graph.sh` + python client) | shipped artifact | `pi-bootstrap/setup.sh` `graph_srcs` farm + `farm_declared_rel` | ✅ test: `the hosted-graph fallback landed executable (scripts/tortoise-graph.sh)` |
 | Fallback client tool signatures | code contract | `scripts/tortoise-graph.sh` → `scripts/tortoise_graph_client.py` → served MCP surface | ✅ corrected **twice**: `tortoise_get_entity(id, type)` / `tortoise_create_operator(op_type, source_id, target_ids, direction, semantics)` — the first correction (`tortoise_get_point`, `id`) landed against a handler the surface RETIRED in #3883, so the client now calls only ADVERTISED tools, and `tests/tortoise-graph-client/run.sh` asserts every recorded `tools/call` name is a member of the served `tools/list` |
 | `--verify` verdict surface (a cell must not start on a bad layer) | gate | `cell-install.sh verify_graph_mcp()` | ✅ test: both refusal arms above + the advisory (warn-not-fail) arm for a missing key |
-| Producer pin (`LANE_PRODUCERS_CANONICAL`) for the newly farmed pair | test-gate data | `pi-bootstrap/tests/test-setup-no-nesting.sh` | ✅ re-pinned here; ⚠️ that suite is red on `main` for an **unrelated** producer drift — see `## Known reds on main` |
+| Producer pin (`LANE_PRODUCERS_CANONICAL`) for the newly farmed pair | test-gate data | `pi-bootstrap/tests/test-setup-no-nesting.sh` | ✅ re-pinned here. ⚠️ This row used to point at `## Known reds on main` for an "unrelated" producer drift; that drift is the SAME one — four of those eight files were exec'd by farmed consumers and delivered by nothing — and it is RESOLVED by #3531/#1938 (see that section) |
 
 ## Tasks (all DONE — this is the record, not a to-do list)
 
@@ -128,12 +128,18 @@ recorded decision covers header interpolation; the relevant recorded decisions �
 
 ## Known reds on main (not caused by this PR, verified by re-running the same suites at `origin/main`)
 
-- `pi-bootstrap/tests/test-setup-no-nesting.sh` — 2 failures, `producer-set` drift: `admin-merge.sh`,
-  `cloud-cell-doctor.sh`, `cloud-cell-supervisor.sh`, `install-controller-service.sh`,
-  `fleet-schedule.py`, `pi-cache-reap.sh`, `reap-lane-venvs.sh`, `registry-sync.sh` are exec'd by farmed
-  consumers and delivered by nothing. Reproduced identically on `origin/main` at `9f7d20bd` in a clean
-  worktree — it is a re-pin debt on main, tracked separately, and NOT this diff (this PR only *adds* a
-  decode arm for `graph_srcs`).
+- ⛔ **RESOLVED — do not read this as a current red.** `pi-bootstrap/tests/test-setup-no-nesting.sh` — 2
+  failures, `producer-set` drift: `admin-merge.sh`, `cloud-cell-doctor.sh`, `cloud-cell-supervisor.sh`,
+  `install-controller-service.sh`, `fleet-schedule.py`, `pi-cache-reap.sh`, `reap-lane-venvs.sh`,
+  `registry-sync.sh` are exec'd by farmed consumers and delivered by nothing. Reproduced identically on
+  `origin/main` at `9f7d20bd` in a clean worktree — it is a re-pin debt on main, tracked separately, and
+  NOT this diff (this PR only *adds* a decode arm for `graph_srcs`).
+  **Fixed by #3531 (#1938):** the four producers are now farm entries, the pin is re-cut, and the suite is
+  `exit 0 / 237 ok / 0 FAIL` on the fixed tree. ⛔ And the list above was PARTLY WRONG even when written:
+  `fleet-schedule.py`, `pi-cache-reap.sh`, `reap-lane-venvs.sh` and `registry-sync.sh` were `fleet_srcs`
+  members on `main` and the producer gate credited them DELIVERED — only the four named first were actually
+  delivered by nothing. A stale "main is red" record is what has already stalled work on a green tree, so
+  this bullet stays as the record of what was believed, explicitly marked resolved, rather than deleted.
 - `scripts/orchestrator-harness/uv-env.test.sh` (sigpipe-grep), `scripts/test_lane_watchdog.py::test_a_frozen_child_of_a_pi_parent_is_a_candidate` and the `lane-liveness`/`verify` suite are red on this
   head and touch **nothing** in this diff; none is a required check (the repo's only required context is
   `pipeline-compliance`).
