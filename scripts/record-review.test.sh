@@ -5520,8 +5520,19 @@ assert_contains "$RECORD_ERR" "could NOT persist the pending marker" \
     "14.1d(i) …the failed persist is reported (positive-first: the capture is live)"
 assert_not_contains "$RECORD_ERR" "The marker is also kept in" \
     "14.1d(i) …and the exit-0 message does NOT claim the marker is on disk — the 'NOT ON DISK' branch fires instead"
-assert_contains "$RECORD_ERR" "THE BODY COPY IS ON NO CHANNEL AND NOT ON DISK" \
-    "14.1d(i) …naming the real state and pointing at the reproduced bytes, not at a flush that would find nothing"
+assert_contains "$RECORD_ERR" "THIS RUN'S BODY COPY WENT TO NEITHER THE BODY NOR THE PENDING FILE" \
+    "14.1d(i) …naming the real state — the two places THIS run owed a copy and delivered neither"
+# ⛔ THE ROUND-9 INVARIANT ON THE EXIT-0 CAPTURE TOO (#3712 review round 10, P2).
+# The two negatives below already existed, but both read the rc-5 capture ($PERSIST_PR2);
+# the rc-0 arm's own line kept round 3's falsified denial ("would find NOTHING for the
+# marker this run owed … neither delivers these bytes") and stayed GREEN under a live
+# instance of the forbidden literal — the guard was never pointed at this stream. The
+# capture is the same one proved live by the two `assert_contains` above, so these cost
+# nothing and close the gap. RED pre-fix: both literals are in the exit-0 message.
+assert_not_contains "$RECORD_ERR" "would find NOTHING" \
+    "14.1d(i) …and the exit-0 remedy never PREDICTS the flush's output either — the marker is deterministic, so an earlier run at this head may hold exactly these bytes"
+assert_not_contains "$RECORD_ERR" "neither delivers these bytes" \
+    "14.1d(i) …nor denies the flush can deliver them, which would withdraw the working one-command remedy (round 10: it must be OFFERED in both arms)"
 PERSIST_PR2=424363
 STUB_BODY_FAIL=1 STUB_BODY_FAIL_TEXT='gh: Not Found (HTTP 404)' STUB_COMMENTS_FAIL=1 \
     run_record_633 "$PERSIST_PR2" "$SHA" "$DC_CRUNS"
@@ -5588,6 +5599,25 @@ assert_contains "$RECORD_ERR" "THIS RUN WROTE NO PENDING COPY" \
     "14.1d(j) the PATCH arm's comment-visible message says what was observed — neither of its persist attempts wrote — and not what the file holds"
 assert_not_contains "$RECORD_ERR" "or post the body copy with --flush-pending, to fire" \
     "14.1d(j) …and does NOT offer the inert flush as the route to the edited event"
+# ⛔ A ⚠️ LINE'S *ABSENCE* IS DISPOSITIVE, ITS APPEARANCE IS NOT (#3712 review round 10,
+# P3). The PATCH arm's pending-file paragraph said neither the appearance nor the absence
+# of a `⚠️ body-marker:` line tells you the file's contents. The ABSENCE does: the
+# both-attempts-failed warning prints only when PATCH_PERSISTED=0, so NO line at all means
+# the pre-PATCH write landed and the file holds exactly the bytes this run minted. Only the
+# APPEARANCE is non-dispositive (the retry can succeed after a failed early write) — which
+# is the half the paragraph already had right. The paragraph is reachable ONLY when the
+# PATCH and the durable comment BOTH fail, which is the vector below, with the pending
+# path still un-makeable (a FILE where the directory belongs). RED pre-fix: the negative
+# (the false universal) AND the positive (that silence is dispositive).
+PATCH_CMT_FAIL_PR=424367
+STUB_PATCH_FAIL=1 STUB_BODY="PR body — no review evidence yet" STUB_COMMENTS_FAIL=1 \
+    run_record_633 "$PATCH_CMT_FAIL_PR" "$SHA" "$DC_CRUNS"
+assert_eq "$RECORD_RC" "5" \
+    "14.1d(j3) a refused PATCH with a refused durable comment is still a NAMED failure (rc 5) [err: $(printf '%s' "$RECORD_ERR" | tr '\n' ' ')]"
+assert_contains "$RECORD_ERR" "NO SUCH LINE AT ALL means a write landed" \
+    "14.1d(j3) …and its pending-file paragraph says the ABSENCE of a persist warning IS dispositive — the bytes are on disk (capture live)"
+assert_not_contains "$RECORD_ERR" "tells you the file's contents" \
+    "14.1d(j3) …instead of telling an operator whose writes both landed that the file's contents cannot be known"
 rm -f "$PEND_CONF_DIR/pending"
 mkdir -p "$PEND_CONF_DIR/pending"   # restore the real directory for later vectors
 
