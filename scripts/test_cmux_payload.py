@@ -1351,7 +1351,17 @@ def _cadence_home(tmp_path, screen_text, previous_line):
         #!/usr/bin/env bash
         args="$*"
         case "$args" in
-          *"resume show"*) echo "${FAKE_SESSION_SID:-}" ;;
+          *"resume show"*)
+            # ⛔ A cmux THAT DOES NOT KNOW `--surface` ON THE `resume` SCOPE (#3795 review cycle 12,
+            # P1). Every other fake in this file answers `resume show` IRRESPECTIVE of the flag, so
+            # `cmux_payload.py`'s workspace-only fallback was unreachable from the floor's own tests
+            # and the receipt it produces was never measured (`rg 'retrying workspace-only'` = 0).
+            # `FAKE_SURFACE_REJECTED=1` is that box: refuse the flag (non-zero, no id) and still
+            # answer the workspace form, which is exactly what a flag-rejecting cmux does.
+            case " $args " in
+              *" --surface "*) [ -z "${FAKE_SURFACE_REJECTED:-}" ] || exit 2 ;;
+            esac
+            echo "${FAKE_SESSION_SID:-}" ;;
           *read-screen*) cat "${FAKE_SCREEN_FILE:-/dev/null}" ;;
           *send*)
             if [ -n "${FAKE_SESSION_FILE:-}" ]; then printf '%s\\n' "$args" >>"$FAKE_SESSION_FILE"; fi
@@ -2060,6 +2070,65 @@ def test_cadence_nudge_still_reports_delivery_it_can_prove(tmp_path):
     assert "NOT CERTIFIED" not in appended, appended
 
 
+def test_cadence_nudge_never_certifies_from_a_box_whose_resume_scope_rejects_the_flag(tmp_path):
+    """⛔ THE CAP ON A FLAG-REJECTING BOX IS THE DELIBERATE CEILING, AND IT IS NOW MEASURED
+    (#3795 review cycle 12, P1).
+
+    `cmux_payload.py:244-253` states that `--surface` may not exist on a box's `cmux` at all, and
+    that such a box "still caps at `PANE_ONLY`". The objection that stood was that every floor test
+    ran against a fake that answers `resume show` IRRESPECTIVE of the flag, so the workspace-only
+    fallback was unreachable from the floor's own suite and the receipt it produces had no pin
+    anywhere (`rg 'retrying workspace-only' scripts/test_cmux_payload.py` was 0).
+
+    MEASURED, on the box class this repo deploys to cmux Cloud cells: `cmux surface resume show
+    --workspace X` exits 2 with `unknown resource scope "surface"` (that CLI's grammar has no
+    `surface` scope at all), so the fallback arm is the STEADY STATE there, not an edge case.
+    Whether a Mac's cmux accepts `--surface` on the `resume` scope is still unmeasured from a cell;
+    the PR records that as a comment rather than implying either answer.
+
+    DISCRIMINATOR: this fixture has everything `VERIFIED` needs — the pane names a session id and
+    THAT session's transcript gains the payload bytes during the send (the fake `cmux` appends every
+    `send` to it, exactly as `test_cadence_nudge_still_reports_delivery_it_can_prove` sets up) — and
+    the only difference between the two tests is that this resume read REFUSES the flag. A
+    qualification that trusted an id out of a FAILED read mints `VERIFIED` here, from a transcript
+    that may belong to another surface of the same workspace; MEASURED by removing the qualification
+    guard, this test REDS on `delivered=yes`.
+    """
+    if not os.access(_FLOOR_PY, os.X_OK):
+        pytest.skip(f"{_FLOOR_PY} is not executable on this runner")
+    sid = "01a0d648-4097-74b8-8cfd-3df3a071b463"
+    seed = _seeded_log(600)
+    home, bindir, screen, state = _cadence_home(tmp_path, "ok\n", seed)
+    sessions = home / ".pi" / "agent" / "sessions" / "proj"
+    sessions.mkdir(parents=True)
+    session = sessions / f"2026-09-29T12-00-00Z-{sid}.jsonl"
+    session.write_text('{"type":"user","content":"an earlier message"}\n', encoding="utf-8")
+    before = session.read_text(encoding="utf-8")
+    r = _run_cadence_nudge(home, bindir, screen, session=session, sid=sid,
+                           extra_env={"FAKE_SURFACE_REJECTED": "1"})
+    assert r.returncode == 0, r.stdout + r.stderr
+    nudges, appended = _new_nudge_lines(state, seed)
+    assert nudges, appended
+    # ⛔ THE HEARTBEAT INVARIANT STILL HOLDS: an unqualifiable address costs CERTIFICATION, not the
+    # beat. The transcript grew, so a payload really reached the pane on this run.
+    assert len(session.read_text(encoding="utf-8")) > len(before), (
+        "the floor did not send at all:\n" + appended)
+    # ⛔ THE CEILING: an id this process could not QUALIFY never awards a transcript verdict — even
+    # though the transcript now HOLDS the tail this send wrote.
+    assert "delivered=yes" not in appended, (
+        "a delivery receipt was minted from an address the caller could not qualify:\n" + appended)
+    assert "verdict=VERIFIED" not in appended, appended
+    assert "delivered=UNVERIFIED" in appended, appended
+    # ⛔ THE CAUSE IS NAMED — this is what makes the state distinguishable from a stuck composer, and
+    # it is the line the operator needs before deciding the beat did not land.
+    assert "retrying workspace-only" in appended, (
+        "the receipt does not name the surface read as the cause, so NOT CERTIFIED is unexplained:\n"
+        + appended)
+    # ⛔ POSITIVE PROOF THE CHECKER BRANCH RAN (the raw-send arm also says UNVERIFIED / NOT CERTIFIED).
+    assert "payload checker unavailable" not in appended, appended
+    assert "NOT CERTIFIED" in appended, appended
+
+
 def test_cadence_nudge_counts_an_unverified_attempt_so_it_cannot_flood(tmp_path):
     """⛔ THE OTHER SIDE OF THE RECEIPT. If the due-read only counted VERIFIED sends, a run of
     unprovable verifications (the orchestrator mid-turn, its transcript not yet flushed) would read
@@ -2148,8 +2217,9 @@ def test_cadence_nudge_submits_a_payload_left_in_the_composer_by_a_failed_enter(
 
     The adopted checker's own contract is the opposite action (`send_verified`: "the remedy is to
     submit in that pane, never to re-send"), so the floor now sends the bare terminating Enter the
-    raw-send arm has always used. The receipt says `re-submitted=` so a repaired Enter is
-    distinguishable from one that is still stuck.
+    raw-send arm has always used. The receipt says `re-submit-attempted=` — the ACT and its exit
+    status, never a delivery claim — so a retried Enter is distinguishable from one that was never
+    retried, and a reader is not invited to read it as "submitted" (#3795 review cycle 11, P2).
 
     DISCRIMINATOR: with the fix the fake cmux records a second `send` whose payload is the bare `\n`;
     pre-fix it records none. `delivered=` must stay `NOT-SUBMITTED` — the retried Enter is not proof.
@@ -2166,7 +2236,7 @@ def test_cadence_nudge_submits_a_payload_left_in_the_composer_by_a_failed_enter(
     assert "verdict=SUBMIT_FAILED" in appended, appended
     assert "delivered=NOT-SUBMITTED" in appended, (
         "a retried Enter was upgraded to a delivery claim it cannot support:\n" + appended)
-    assert "re-submitted=yes" in appended, appended
+    assert "re-submit-attempted=yes" in appended, appended
     sends = sent.read_text(encoding="utf-8").splitlines() if sent.exists() else []
     assert any(line.rstrip().endswith(r" \n") for line in sends), (
         "the payload left in the composer was never submitted, so the next tick duplicates it:\n"
@@ -2193,7 +2263,7 @@ def test_cadence_nudge_does_not_re_submit_a_pane_only_verdict(tmp_path):
     assert r.returncode == 0, r.stdout + r.stderr
     _n, appended = _new_nudge_lines(state, seed)
     assert "verdict=PANE_ONLY" in appended, appended
-    assert "re-submitted=" not in appended, (
+    assert "re-submit-attempted=" not in appended, (
         "PANE_ONLY pressed Enter a second time; its composer state is unknown, so that can submit "
         "a human's draft:\n" + appended)
 
@@ -2310,6 +2380,8 @@ def test_cadence_nudge_still_sends_when_the_checker_predates_the_argv(tmp_path):
     the box, and the receipt still said `delivered=UNVERIFIED` — a value this file documents as
     "prefix, unreadable pane, or a refused send", never "nothing was sent". The floor must send, and
     must say why it could not verify."""
+    if not os.access(_FLOOR_PY, os.X_OK):
+        pytest.skip(f"{_FLOOR_PY} is not executable on this runner")
     seed = _seeded_log(600)
     home, bindir, screen, state = _cadence_home(
         tmp_path, "the pane shows nothing relevant\n", seed)
@@ -2353,6 +2425,8 @@ def test_cadence_nudge_still_sends_when_the_help_READ_fails_but_names_the_flag(t
     DISCRIMINATOR: the flag-bearing FAILING help must take the raw-send path, and the receipt must name
     the SyntaxError rather than a version claim about a checker that never parsed.
     """
+    if not os.access(_FLOOR_PY, os.X_OK):
+        pytest.skip(f"{_FLOOR_PY} is not executable on this runner")
     seed = _seeded_log(600)
     home, bindir, screen, state = _cadence_home(
         tmp_path, "the pane shows nothing relevant\n", seed)

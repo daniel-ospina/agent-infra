@@ -1037,16 +1037,26 @@ if [ -z "$_checker_broken" ]; then
     #   The `re-submitted=` field is added to `diag=[…]` so the operator can tell an Enter that was
     # repaired from one that is still stuck. `delivered=` is deliberately NOT upgraded: nothing proves
     # the retried Enter landed, so the verdict stays `NOT-SUBMITTED` and the next tick still retries.
+    # ⛔ AND THE FIELD IS NAMED FOR THE MEASUREMENT, NOT FOR A VERDICT (#3795 review cycle 11, P2).
+    # It was `re-submitted=`, derived from this `cmux send`'s EXIT STATUS ALONE — the exact inference
+    # this file retires ~200 lines above (`:846-858`: `cmux send` exited 0 over a 1,962-byte message
+    # that arrived as its FIRST SENTENCE, and the same `OK` covered an 8-byte `/reload` that vanished).
+    # The retried Enter is that SAME call, made seconds later against the SAME pane, so its status is
+    # no more evidence of submission than the first one's was -- which is precisely why the checker
+    # returned `SUBMIT_FAILED` rather than `VERIFIED` for it. `re-submit-attempted=` states only what
+    # was observed (the bare-`\n` send ran, and what its status was), so a reader triaging
+    # `NOT-SUBMITTED` is not invited to stop checking a pane whose submission is still unproven.
     # ⛔ ITS RESIDUALS, STATED: (a) if this Enter ALSO fails, the text stays and the duplicate below
     # still happens once per due tick while the condition persists; (b) `PANE_ONLY` is deliberately NOT
     # re-submitted -- there the Enter WAS attempted, so the composer may already be clear, and pressing
     # Enter again would submit whatever else a human has since typed into that pane. `PANE_ONLY` keeps
     # the pre-existing duplicate exposure, bounded the same way.
     if [ "$verdict" = "SUBMIT_FAILED" ]; then
+      # The value is the ACT and its status, never a delivery claim (#3795 review cycle 11, P2).
       if cmux send --workspace "$ORCH_WS" --surface "$ORCH_SURFACE" '\n' >/dev/null 2>&1; then
-        _resubmit=" re-submitted=yes"
+        _resubmit=" re-submit-attempted=yes"
       else
-        _resubmit=" re-submitted=no"
+        _resubmit=" re-submit-attempted=no"
       fi
     fi
   fi
