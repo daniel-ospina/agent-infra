@@ -506,3 +506,50 @@ cycle**, and `p1` alone 881 MB.
   `--no-cone` a bare name is a patternspec matching at any depth, so
   `--paths small` also pulled in `nested/small/` — inflating the I/O this tool
   exists to cut and contradicting the "exactly these paths" contract.
+
+## 12. `task` dispatch-time concurrency preflight (#2242)
+
+Sections 1–6 bound a host that is *busy*. This one covers the case where being
+busy stops a **dispatch** from starting at all, and where the parent currently
+learns that only after burning a whole inactivity bound.
+
+**The measurement.** Five `task` sub-agent dispatches on one box — 88 live `pi`
+processes, 10 cores, load 28 — each reported `[task-heartbeat] … turn_start` for
+the **second** model turn and then produced nothing (`toolsInFlight=0`,
+`toolCpuMs=0`, `everSawTool=true`). Every one was killed by `stream-stall` (S,
+20 min default) having produced no output. Switching models changed nothing.
+
+**A controlled counter-measurement (2026-11-08).** A two-tool-call child — the
+exact shape the failure used — was run on 16 cores: 1 child alone (7 s), 12
+concurrent (7.5–8.9 s), and 24 concurrent (10.0–13.6 s), 36/36 completing **3
+model turns** each with `rc=0`. So the second-turn wedge does not reproduce at
+≤2.1× cores. What is measured is therefore a **box-concurrency** effect, and the
+number that predicts it is the live `pi` process count — not loadavg, and not the
+model.
+
+**The rule.** Every `task` dispatch measures the box once, before any spawn,
+through `probeDispatchSaturation()` → `resolveSessionCeiling()`:
+
+| knob | default | meaning |
+|---|---|---|
+| `TASK_SESSION_CEILING` | `8 × cores` | absolute live-`pi` count that counts as saturated. Honoured verbatim (#1070); `0` **disables** the preflight (a real value, the `LOAD_SUSPEND_THRESHOLD=0` shape); absent/garbage fails **closed** to the derived default |
+| `TASK_SESSION_CEILING_REFUSE` | unset | `1` turns the notice into a **fast refusal**: `could not dispatch: fleet saturated at N sessions`, in about a second, instead of spawning a child that will burn the bound |
+
+Over the ceiling the dispatch prints one line naming the count, the cores, the
+ratio and #2242; under it, on an unknown probe (`ps` unavailable → the `-1`
+sentinel, never a confident `0`) and when disabled, it prints nothing.
+
+**Why the refusal is opt-in, and why this is not a bound change.** §1 records
+that watchdog bounds SCALE WITH LOAD and never shrink, and #279 deliberately
+handed the between-turn quiet to `stream-stall` so a demonstrably-working child
+is never killed. A preflight that shortened S on a loaded box would reverse
+both. It therefore acts on the **dispatch only** — never on a child already
+running. The refusal stays opt-in because the calibration has an unmeasured gap:
+the measured points are ≤2.1× (healthy, 36/36) and 8.8× (5/5 wedges), so the
+derived 8× default sits at the high-water mark where it can only fire on a box
+shaped like the incident. A warning costs a log line; a wrong refusal costs the
+dispatch.
+
+The measurement is the same `ps` read the `Alive state:` machine line renders
+(§6, `#1485`'s `piProcs`), so a wedge report and the preflight cannot disagree
+about how many sessions the box held.
