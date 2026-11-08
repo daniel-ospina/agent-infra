@@ -5541,14 +5541,15 @@ assert_not_contains "$RECORD_ERR" "neither delivers these bytes" \
 # ⛔ THE EXIT-0 REMEDY ITSELF MUST BE PINNED, NOT ONLY ITS DENIALS (#3712 review at
 # `1dece6108`, FINDING 1 — the absent-mutation-leg class of agent-infra#3442).
 # Every row above on this capture is either a POSITIVE about a state that is still
-# true without the remedy (`:5524`) or a NEGATIVE about a denial; deleting the remedy
-# clause makes each negative MORE satisfied, so the whole block stayed GREEN with the
-# round-10 regression direction live. The label at `:5537` states the invariant
-# ("it must be OFFERED in both arms") and the comment above it repeats it, but nothing
-# enforced it on THIS arm — the only two positives on the offer read the rc-5 capture
-# (`:5563`/`:5565`). These two are DIFFERENT predicates from those two rows on a
-# DIFFERENT capture, so neither can redden in lockstep with them: `:5563`/`:5565`
-# prove the exit-5 arm offers the flush, these prove the exit-0 arm still does.
+# true without the remedy (`:5526` — `rg -n 'THIS RUN PLACED NO BODY COPY ON ANY CHANNEL'`) or a
+# NEGATIVE about a denial; deleting the remedy clause makes each negative MORE satisfied, so the
+# whole block stayed GREEN with the round-10 regression direction live. The label at `:5540`
+# (`rg -n 'it must be OFFERED in both arms'`) states the invariant and the comment above it
+# repeats it, but nothing enforced it on THIS arm — the only two positives on the offer read the
+# rc-5 capture (`:5589`/`:5591` — `rg -n 'assert_contains "\$RECORD_ERR" "(TRY --flush-pending|findings/note, the diff)'`
+# gives FOUR rows, the LAST TWO of which are this rc-5 capture's). These two are DIFFERENT
+# predicates from those two rows on a DIFFERENT capture, so neither can redden in lockstep with
+# them: `:5589`/`:5591` prove the exit-5 arm offers the flush, these prove the exit-0 arm still does.
 # RED pre-fix: delete the `So TRY --flush-pending $PR ${REPO:-} …` clause from the
 # exit-0 else-branch of `scripts/record-review.sh` and BOTH rows below red. MEASURED in
 # this lane, both directions, full suite each time:
