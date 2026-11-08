@@ -54,8 +54,10 @@ only root whose entries can cover this session's git ops, and the report must sa
    `status()` for a human (never parses, never selects by `event`), and (b) in-repo TEST helpers —
    `extensions/shared/audit-log.test.ts` (asserts the path and the row schema; selects by NOTHING),
    `extensions/verification-gate/index.e2e.test.ts`'s `readAuditLines()`,
-   `extensions/review-enforcer/index.test.ts`, and
-   `extensions/review-enforcer/index.spawn-evidence.test.ts` (these three select by `event`).
+   `extensions/review-enforcer/index.test.ts`,
+   `extensions/review-enforcer/index.spawn-evidence.test.ts`, and
+   `extensions/main-worktree-guard/test-module-load.mjs` (selects by `event === "guard_degraded"`,
+   unaffected by the four new names — these four select by `event`).
    `gateEventsFile()` has exactly one production caller, `appendJsonl`. So the record is durable and
    greppable by a parent or a future reader, and no shipping instrument can mis-read the new names.
    Recorded as a named residual.
@@ -96,7 +98,7 @@ only root whose entries can cover this session's git ops, and the report must sa
 | `diagnoseRootMismatch` → `tool_call` git-op path | unit-of-behaviour | e2e scenario 1265a (block + audit record + reworded remedy) |
 | `appendJsonl` / `GateEventName` union (`extensions/shared/audit-log.ts`) | type + contract | **documentation-only**: `appendJsonl` takes `Record<string, unknown>`, the repo has no `tsconfig.json`, and no roster pin exists — the union edit cannot be type-enforced (see step 3) |
 | source pins ("#3255 policy" test in `index.test.ts`) | structural | five pins across this PR — own-root declaration, own-root COUNT, durable-record `root`, rendered-remedy absence, followable-remedy presence |
-| `recoverBridgeForRoot` perf fast-path (`lastRecoveryMtime`) | regression | existing e2e scenario 16 (first_push mid-session bridge recovery) |
+| `recoverBridgeForRoot` perf fast-path (`lastRecoveryMtime`) | regression | existing e2e scenario 16 (mid-session bridge recovery — externally-written bridge unblocks the commit) |
 
 ## Research
 
@@ -117,7 +119,7 @@ roots and 20+ tortoise roots in the live bridge), so this is the narrow one-sibl
 | `bridgeRoots()` | reads the bridge's PASS roots; unchanged. |
 | `gitCommonDir(root)` | same-repo test (`--git-common-dir`); unchanged. |
 | `appendJsonl(entry, file?)` — `extensions/shared/audit-log.ts` | appends to `~/.pi/agent/audit/gate-events.jsonl`; **four** new event names added to `GateEventName` (`gate_recovery`, `gate_recovery_empty`, `gate_recovery_foreign_root`, `gate_root_mismatch`). `gate_recovery` carries the `root` it recovered for, so an inspection merge is **attributable** to the SIBLING root. It is not un-attributable by `session_cwd`: that field still names the inspecting session, so a session-keyed reader must select on `root`. |
-| `gate-events.jsonl` consumers | **no production consumer PARSES it** — `gateEventsFile()` has one production caller (`appendJsonl`); `scripts/vgate.sh` `tail`s the log in `status()` (selects nothing); `registry-sync.sh` / `admin-merge.sh` mention it only in comments; readers are in-repo TEST helpers — `extensions/shared/audit-log.test.ts` (path + row schema, selects by NOTHING), `index.e2e.test.ts`'s `readAuditLines()`, `review-enforcer/index.test.ts`, `review-enforcer/index.spawn-evidence.test.ts` (the last three select by `event`). The header's `event —` line is a stale closed enumeration (pre-existing) that names none of the four new events. |
+| `gate-events.jsonl` consumers | **no production consumer PARSES it** — `gateEventsFile()` has one production caller (`appendJsonl`); `scripts/vgate.sh` `tail`s the log in `status()` (selects nothing); `registry-sync.sh` / `admin-merge.sh` mention it only in comments; readers are in-repo TEST helpers — `extensions/shared/audit-log.test.ts` (path + row schema, selects by NOTHING), `index.e2e.test.ts`'s `readAuditLines()`, `review-enforcer/index.test.ts`, `review-enforcer/index.spawn-evidence.test.ts`, `main-worktree-guard/test-module-load.mjs` (`event === "guard_degraded"` only, unaffected by the four new names — the last four select by `event`). The header's `event —` line is a stale closed enumeration (pre-existing) that names none of the four new events. |
 | `extensions/verification-gate/index.e2e.test.ts`, `index.test.ts` | run by `ci-main.yml` (`npx tsx …`) — no new file, so no CI-surface registration applies (this repo has no `config/ci-surfaces.yml`). |
 
 ## Implementation steps
