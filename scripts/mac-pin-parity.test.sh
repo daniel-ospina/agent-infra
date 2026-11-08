@@ -931,9 +931,14 @@ done
 # ⛔ THE ARM THAT MAKES §THE-HEADER A PROPERTY RATHER THAN A COMMENT (agent-infra#3762). The defect this
 # pins is not "a variable was inherited" — it is that a hermetic suite could leave a LIVE box pointed at
 # a deleted fixture and still print a verdict. Deleting the `unset` above restores exactly that, and
-# this arm is what reddens for it. It reads the SAME two records `install.sh` writes, at the real
-# `$HOME` captured before the unset, so it catches the next leak (a new record path, a new consumer)
-# without needing to name which variable carried it.
+# this arm is what reddens for it. It snapshots the real `$HOME` records captured BEFORE the unset.
+# ⛔ IT COVERS TWO PATHS, NOT "THE NEXT LEAK" (review cycle 10, P2-3). An earlier revision of this
+# comment said it "catches the next leak (a new record path, a new consumer) without needing to name
+# which variable carried it". That is TRUE for `HARNESS_PIN_FILE` and `HARNESS_PIN`, and FALSE for the
+# third path `install.sh` defaults — `HARNESS_PIN_DIR` (`install.sh:907`) — which materialises a
+# `$HOME/harness/<sha12>/…` TREE rather than writing a record file, so a regression that leaked only
+# that variable would leave both arms green. The `unset` above covers it today; THIS ARM DOES NOT, and
+# the difference matters to anyone who reads a green run as a hermeticity proof.
 sec "G. HERMETIC: the real \$HOME pin records are byte-identical to what they were at start"
 for _herm in "$HOME/.harness-path" "$HOME/.pi/agent/state/HARNESS-PIN"; do
   _want="$HERMETIC_SNAP_PATH"; [ "$_herm" = "$HOME/.harness-path" ] || _want="$HERMETIC_SNAP_PIN"
