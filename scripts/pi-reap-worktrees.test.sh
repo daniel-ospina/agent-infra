@@ -3075,7 +3075,30 @@ _hr_line="$(grep -n 'holder_recheck "\$path" "\$sha" ||' "$REAPER" | tail -1 | c
 _fork_line="$(grep -n 'worktree remove "\$path"' "$REAPER" | head -1 | cut -d: -f1)"
 if [ -n "$_pa_line" ] && [ -n "$_hr_line" ] && [ -n "$_fork_line" ] \
         && [ "$_pa_line" -lt "$_hr_line" ] && [ "$_hr_line" -lt "$_fork_line" ]; then
-    ok "A21e the post-archive re-check runs BEFORE holder_recheck, which stays last before the fork"
+    # ⛔ AND IT IS THE LAST CODE LINE, NOT MERELY BELOW THE POST-ARCHIVE GATE (#3371 review cycle 4,
+    # P2). Cycle 3 inserted `remote_holds_recheck` — two bounded forks, up to ~40 s — BETWEEN
+    # `holder_recheck` and the fork, and this arm stayed GREEN because it only compared three line
+    # numbers. That is the exact regression the arm exists to prevent, so the property is pinned now:
+    # nothing but comments and blanks may sit between the liveness probe and the fork.
+    _between="$(sed -n "$((_hr_line + 1)),$((_fork_line - 1))p" "$REAPER" 2>/dev/null | grep -vE '^[[:space:]]*(#|$)' || true)"
+    # ⛔ AND THE REST OF THE PROBE'S OWN LINE (#3371 review cycle 6, P2): `_between` is LINE-granular,
+    # so `holder_recheck …; remote_holds_recheck …` appended to the SAME physical line is invisible to
+    # it. Measured: that rewrite left `_between` empty and the arm still printed "stays the LAST code
+    # line before the fork" while a ~40 s network probe ran after the liveness read.
+    # ⛔ AND THE TOKEN TEST WAS STILL TOKEN-BASED (#3371 review cycle 8, P2) — `; { slow_probe; }`,
+    # `&& { … }` and `&& { trap … DEBUG; }` all end the line at `}` and name no banned token, so they
+    # passed while a ~40 s probe ran after the liveness read. The line is now pinned to its EXACT
+    # correct form: that closes every same-line continuation (brace groups included) with no token
+    # guessing, AND stops the arm from falsely grading a correct reordering as RED — a guard that
+    # false-blocks is a guard that later gets edited away.
+    _hr_linetext="$(sed -n "${_hr_line}p" "$REAPER" 2>/dev/null)"
+    _hr_code="${_hr_linetext%%#*}"
+    if [ -z "$_between" ] \
+            && printf '%s' "$_hr_code" | grep -qxE '[[:space:]]*holder_recheck "\$path" "\$sha" \|\| \{ rm -f "\$out"; return 2; \}[[:space:]]*'; then
+        ok "A21e the post-archive re-check runs BEFORE holder_recheck, which stays the LAST code line before the fork"
+    else
+        bad "A21e a probe sits between holder_recheck and the fork (between='$(printf '%s' "$_between" | head -2 | tr '\n' ' ')' line='$_hr_linetext'), so the last liveness read is no longer last"
+    fi
 else
     bad "A21e gate ORDER regressed: post-archive=$_pa_line holder_recheck=$_hr_line fork=$_fork_line"
 fi
@@ -4998,6 +5021,222 @@ assert_eq "$(printf '%s\n' "$OUT" | grep -c 'reason=remote-holds:upstream/feat/a
     "A26g3 …and all three answers come off that ONE snapshot: every advertised tip is still REMOVE-eligible (a cache that answered nothing, or answered partially, would preserve them)"
 assert_contains "$OUT" "examined=4 classified=4" \
     "A26g3 non-vacuity: the main checkout plus all three detached records were classified"
+
+# ── A26g4: the cache's IDENTITY — one remote's snapshot must never answer another's (#3371) ──
+# `remote_advertise` keys the cache by remote name and the matcher filters on it, and BOTH of those
+# terms were unpinned: every other remote fixture probes exactly ONE remote, so deleting either one
+# left the whole suite green. The trap is concrete — a remote name may be a PREFIX of another
+# (`up` / `upstream`), and a shared `R <remote>` marker matched without `-x` lets `R upstream` answer
+# for `up`. So this fixture has two remotes whose names prefix each other, advertising the SAME
+# branch name at DIFFERENT shas, and asserts both rows still come back `remote-holds` with their OWN
+# sha:
+#   · drop the `-x` on the marker -> `up` short-circuits onto upstream's snapshot, finds no `A up …`
+#     line, and its row PRESERVEs => `reason=remote-holds:up/…` missing => RED;
+#   · drop the `$2 == r` term -> two `A … refs/heads/feat/a26g4` lines match, `n == 2`, and the row
+#     PRESERVEs => RED.
+ENV=A26g4; REPO="$(mk_repo $ENV)"
+BARE_UPSTREAM="$T/$ENV/upstream.git"; BARE_UP="$T/$ENV/up.git"
+"$REAL_GIT" init -q --bare "$BARE_UPSTREAM"
+"$REAL_GIT" init -q --bare "$BARE_UP"
+"$REAL_GIT" -C "$REPO" remote add upstream "$BARE_UPSTREAM"
+"$REAL_GIT" -C "$REPO" remote add up "$BARE_UP"
+A26G4_SHA=""
+for _g in 1 2; do
+    "$REAL_GIT" -C "$REPO" checkout -q -b "tmp-a26g4$_g"
+    commit_in_wt "$REPO" "$OLD_DATE" "a26g4$_g"
+    _gsha="$("$REAL_GIT" -C "$REPO" rev-parse HEAD)"
+    if [ "$_g" = 1 ]; then
+        "$REAL_GIT" -C "$REPO" push -q upstream "tmp-a26g4$_g:refs/heads/feat/a26g4"
+    else
+        "$REAL_GIT" -C "$REPO" push -q up "tmp-a26g4$_g:refs/heads/feat/a26g4"
+        A26G4_SHA="$_gsha"
+    fi
+    "$REAL_GIT" -C "$REPO" checkout -q main
+    "$REAL_GIT" -C "$REPO" branch -D "tmp-a26g4$_g" >/dev/null
+done
+"$REAL_GIT" -C "$REPO" fetch -q upstream
+"$REAL_GIT" -C "$REPO" fetch -q up
+"$REAL_GIT" -C "$REPO" worktree add -q --detach "$T/$ENV-det-1" "$("$REAL_GIT" -C "$BARE_UPSTREAM" rev-parse refs/heads/feat/a26g4)"
+"$REAL_GIT" -C "$REPO" worktree add -q --detach "$T/$ENV-det-2" "$A26G4_SHA"
+assert_eq "$("$REAL_GIT" -C "$BARE_UPSTREAM" rev-parse refs/heads/feat/a26g4)" \
+    "$("$REAL_GIT" -C "$REPO" rev-parse refs/remotes/upstream/feat/a26g4)" \
+    "A26g4 precondition: upstream's tracking ref is upstream's own head"
+assert_eq "$("$REAL_GIT" -C "$BARE_UP" rev-parse refs/heads/feat/a26g4)" \
+    "$("$REAL_GIT" -C "$REPO" rev-parse refs/remotes/up/feat/a26g4)" \
+    "A26g4 precondition: up advertises the SAME branch name at a DIFFERENT sha"
+A26G4_CNT="$T/$ENV/cnt"; rm -f "$A26G4_CNT"
+OUT="$(FAKE_LSREMOTE_COUNTER="$A26G4_CNT" GIT_BIN_OVERRIDE="$T/bin/git-lsremote-count" \
+    run_reaper $ENV --dry-run --repo "$REPO")"
+assert_eq "$(cat "$A26G4_CNT" 2>/dev/null)" "2" \
+    "A26g4 two remotes cost two advertisements — one each, and no more"
+assert_contains "$(row_for "$OUT" "$T/$ENV-det-1")" "reason=remote-holds:upstream/feat/a26g4" \
+    "A26g4 the row held by 'upstream' is proved against 'upstream'"
+assert_contains "$(row_for "$OUT" "$T/$ENV-det-2")" "reason=remote-holds:up/feat/a26g4" \
+    "A26g4 …and the row held by 'up' is proved against 'up': a marker matched without -x, or a matcher without the remote term, PRESERVEs it instead (the 'up'/'upstream' prefix trap)"
+
+# ── A26g5: the snapshot is CLASSIFICATION evidence — the REMOVAL re-proves it (#3371 review, P1) ──
+# The advertisement is taken once per pass, so a late row reads a snapshot that can be minutes old,
+# and this class is removed with NO backup on the warrant "the remote still advertises this head".
+# A branch auto-deleted on merge between the snapshot and the fork would make that warrant false at
+# the instant the checkout is destroyed. The fixture is that window, made deterministic: the shim
+# answers the ADVERTISEMENT with the branch at the right sha and answers every TARGETED re-probe
+# with nothing (the remote no longer holds it). The row must still CLASSIFY as `remote-holds`, and
+# `--apply` must remove NOTHING. Delete `remote_holds_recheck` and the checkout is deleted => RED.
+cat >"$T/bin/git-lsremote-advonce" <<'SHIM'
+#!/usr/bin/env bash
+# GIT_BIN shim for A26g5: the remote as it was when the pass STARTED (an advertisement) and as it
+# is at REMOVAL time (a targeted probe for one refname) — the auto-delete-on-merge window.
+seen_lsremote=0
+for a in "$@"; do [ "$a" = "ls-remote" ] && seen_lsremote=1; done
+if [ "$seen_lsremote" = 1 ]; then
+    pattern=0
+    for a in "$@"; do case "$a" in refs/heads/*) pattern=1 ;; esac; done
+    if [ "$pattern" = 0 ]; then printf '%s\n' "${FAKE_ADV_LINE:-}"; fi
+    exit 0
+fi
+exec "${REAL_GIT_BIN:-git}" "$@"
+SHIM
+chmod +x "$T/bin/git-lsremote-advonce"
+ENV=A26g5; REPO="$(mk_repo $ENV)"
+BARE="$T/$ENV/remote.git"
+"$REAL_GIT" init -q --bare "$BARE"
+"$REAL_GIT" -C "$REPO" remote add upstream "$BARE"
+"$REAL_GIT" -C "$REPO" checkout -q -b tmp-a26g5
+commit_in_wt "$REPO" "$OLD_DATE" "a26g5"
+A26G5_SHA="$("$REAL_GIT" -C "$REPO" rev-parse HEAD)"
+"$REAL_GIT" -C "$REPO" push -q upstream "tmp-a26g5:refs/heads/feat/a26g5"
+"$REAL_GIT" -C "$REPO" checkout -q main
+"$REAL_GIT" -C "$REPO" branch -D tmp-a26g5 >/dev/null
+"$REAL_GIT" -C "$REPO" fetch -q upstream
+"$REAL_GIT" -C "$REPO" worktree add -q --detach "$T/$ENV-det" "$A26G5_SHA"
+# the remote DELETES the branch (the auto-delete this arm is about) — the local tracking ref stays
+"$REAL_GIT" -C "$BARE" update-ref -d refs/heads/feat/a26g5
+assert_eq "$("$REAL_GIT" -C "$BARE" for-each-ref refs/heads | wc -l | tr -d ' ')" "0" \
+    "A26g5 precondition: the remote no longer advertises the branch"
+OUT="$(FAKE_ADV_LINE="$A26G5_SHA	refs/heads/feat/a26g5" GIT_BIN_OVERRIDE="$T/bin/git-lsremote-advonce" \
+    run_reaper $ENV --apply --repo "$REPO")"
+assert_contains "$(row_for "$OUT" "$T/$ENV-det")" "reason=remote-holds:upstream/feat/a26g5" \
+    "A26g5 the row is classified from the START-OF-PASS advertisement (the snapshot is real evidence for a CLASSIFICATION)"
+assert_contains "$OUT" "remote-holds-stale" \
+    "A26g5 …and the removal is refused by the targeted re-probe at CLASSIFICATION (this shim answers every targeted probe with nothing, so remove_one is never entered — the FORK arm is A26g6's, not what this line measures)"
+if [ -d "$T/$ENV-det" ]; then
+    ok "A26g5 the checkout is STILL ON DISK — a stale snapshot never destroys the last durable handle"
+else
+    bad "A26g5 the checkout was REMOVED on a snapshot the remote had already invalidated — the removal path must re-prove it (remote_holds_recheck)"
+fi
+assert_contains "$OUT" "removed=0" \
+    "A26g5 …and the pass reports no removal"
+
+# ── A26g6: the auto-delete lands BETWEEN classification and the fork (#3371 review cycle 8, P1) ──
+# A26g5 fails EARLY: its shim answers every targeted probe with nothing, so the classification-time
+# re-probe refuses and `remove_one` is never entered — which means A26g5 cannot see the fork arm at
+# all. Measured at c52503df2: deleting `remove_one`'s four-line fork re-probe left the WHOLE suite at
+# 858 passed / 0 failed, because A26a only needs the call to SUCCEED (which a deleted call also
+# yields) and A21e pins the ORDERING of `holder_recheck`, not the existence of the call above it.
+# That is the one thing this PR buys — a re-proof AT the fork — with no arm, on a no-backup
+# destructive path. So: phase-aware. The advertisement and the FIRST targeted probe answer with the
+# head (the branch is still there when the row is classified); the SECOND answers nothing (the
+# squash-merge + auto-delete landed while gate (b)'s archive and the evidence ladder ran). Delete
+# the fork arm and the checkout is REMOVED on a dead warrant => RED.
+cat >"$T/bin/git-lsremote-forkstale" <<'SHIM'
+#!/usr/bin/env bash
+# GIT_BIN shim for A26g6: the remote as it was at CLASSIFICATION (the advertisement AND the first
+# targeted re-probe both answer with the head) and as it is at the FORK (the second targeted
+# re-probe answers nothing — the auto-delete-on-merge window, made deterministic). Counting the
+# TARGETED probes in a file is the point: the two call sites are what must both exist.
+seen_lsremote=0
+for a in "$@"; do [ "$a" = "ls-remote" ] && seen_lsremote=1; done
+if [ "$seen_lsremote" = 1 ]; then
+    pattern=0
+    for a in "$@"; do case "$a" in refs/heads/*) pattern=1 ;; esac; done
+    if [ "$pattern" = 0 ]; then printf '%s\n' "${FAKE_ADV_LINE:-}"; exit 0; fi
+    c=0
+    [ -n "${FAKE_TARGETED_COUNTER:-}" ] && [ -f "$FAKE_TARGETED_COUNTER" ] && c="$(cat "$FAKE_TARGETED_COUNTER")"
+    c=$((c + 1))
+    [ -n "${FAKE_TARGETED_COUNTER:-}" ] && printf '%s\n' "$c" >"$FAKE_TARGETED_COUNTER"
+    [ "$c" -le 1 ] && printf '%s\n' "${FAKE_TARGETED_LINE:-}"
+    exit 0
+fi
+exec "${REAL_GIT_BIN:-git}" "$@"
+SHIM
+chmod +x "$T/bin/git-lsremote-forkstale"
+ENV=A26g6; REPO="$(mk_repo $ENV)"
+BARE="$T/$ENV/remote.git"
+"$REAL_GIT" init -q --bare "$BARE"
+"$REAL_GIT" -C "$REPO" remote add upstream "$BARE"
+"$REAL_GIT" -C "$REPO" checkout -q -b tmp-a26g6
+commit_in_wt "$REPO" "$OLD_DATE" "a26g6"
+A26G6_SHA="$("$REAL_GIT" -C "$REPO" rev-parse HEAD)"
+"$REAL_GIT" -C "$REPO" push -q upstream "tmp-a26g6:refs/heads/feat/a26g6"
+"$REAL_GIT" -C "$REPO" checkout -q main
+"$REAL_GIT" -C "$REPO" branch -D tmp-a26g6 >/dev/null
+"$REAL_GIT" -C "$REPO" fetch -q upstream
+"$REAL_GIT" -C "$REPO" worktree add -q --detach "$T/$ENV-det" "$A26G6_SHA"
+assert_contains "$("$REAL_GIT" -C "$REPO" for-each-ref --contains="$A26G6_SHA" --format='%(refname)')" \
+    "refs/remotes/upstream/feat/a26g6" "A26g6 precondition: the only local holder is a remote-tracking ref"
+assert_absent "$("$REAL_GIT" -C "$REPO" for-each-ref --contains="$A26G6_SHA" --format='%(refname)')" \
+    "refs/heads/" "A26g6 precondition: no LOCAL branch holds it"
+assert_eq "$("$REAL_GIT" -C "$BARE" rev-parse refs/heads/feat/a26g6)" "$A26G6_SHA" \
+    "A26g6 precondition: the REMOTE advertises exactly this HEAD at classification time"
+A26G6_CNT="$T/$ENV/cnt"; rm -f "$A26G6_CNT"
+OUT="$(FAKE_ADV_LINE="$A26G6_SHA	refs/heads/feat/a26g6" \
+    FAKE_TARGETED_LINE="$A26G6_SHA	refs/heads/feat/a26g6" \
+    FAKE_TARGETED_COUNTER="$A26G6_CNT" GIT_BIN_OVERRIDE="$T/bin/git-lsremote-forkstale" \
+    run_reaper $ENV --apply --repo "$REPO")"
+assert_eq "$(cat "$A26G6_CNT" 2>/dev/null)" "2" \
+    "A26g6 a removal pays TWO targeted probes — one at classification, one at the fork"
+assert_contains "$(row_for "$OUT" "$T/$ENV-det")" "reason=remote-holds:upstream/feat/a26g6" \
+    "A26g6 the row is classified remote-holds from the FIRST targeted answer (so the fixture really reaches the fork)"
+assert_contains "$OUT" "remote-holds-stale" \
+    "A26g6 …and the FORK re-probe refuses the removal — the auto-delete landed after classification"
+if [ -d "$T/$ENV-det" ]; then
+    ok "A26g6 the checkout is STILL ON DISK — the fork re-probe, not just the classification one, guards the delete"
+else
+    bad "A26g6 the checkout was REMOVED after the remote stopped advertising it — remove_one's fork re-probe (remote_holds_recheck at re-check #3) is missing or not wired to the PRESERVE path"
+fi
+assert_contains "$OUT" "removed=0" \
+    "A26g6 …and the pass reports no removal"
+# MUTANT — a pin is only a pin if a mutant actually REDDENS it, and that measurement must not live
+# only in a commit message: an out-of-suite mutation proves the arm once, and nothing re-checks it
+# afterwards, so the day an edit makes the fixture unable to redden, the suite is green again with
+# the guard gone. This leg deletes exactly `remove_one`'s four fork-probe lines (`:4688-4691`; the
+# classification call and its `"at classification"` phase token are untouched) and asserts the SAME
+# fixture LOSES the checkout — the destructive outcome, not a log line — and pays ONE targeted
+# probe instead of two.
+MUT6="$T/$ENV/pi-reap-worktrees.mutant-fork-recheck.sh"
+awk '
+    /if ! remote_holds_recheck "\$path" "\$sha" "\$why"; then/ { skip = 3; next }
+    skip > 0 { skip--; next }
+    { print }
+' "$REAPER" >"$MUT6"
+if cmp -s "$REAPER" "$MUT6"; then
+    bad "A26g6 the FORK-TIME MUTANT DID NOT APPLY — the pin is unverified"
+else
+    ok "A26g6 mutant applied: remove_one's four fork-probe lines are gone, the classification call is untouched"
+fi
+ENV2=A26g6m; REPO2="$(mk_repo $ENV2)"
+BARE2="$T/$ENV2/remote.git"
+"$REAL_GIT" init -q --bare "$BARE2"
+"$REAL_GIT" -C "$REPO2" remote add upstream "$BARE2"
+"$REAL_GIT" -C "$REPO2" checkout -q -b tmp-a26g6m
+commit_in_wt "$REPO2" "$OLD_DATE" a26g6m
+A26G6M_SHA="$("$REAL_GIT" -C "$REPO2" rev-parse HEAD)"
+"$REAL_GIT" -C "$REPO2" push -q upstream "tmp-a26g6m:refs/heads/feat/a26g6m"
+"$REAL_GIT" -C "$REPO2" checkout -q main
+"$REAL_GIT" -C "$REPO2" branch -D tmp-a26g6m >/dev/null
+"$REAL_GIT" -C "$REPO2" fetch -q upstream
+"$REAL_GIT" -C "$REPO2" worktree add -q --detach "$T/$ENV2-det" "$A26G6M_SHA"
+A26G6M_CNT="$T/$ENV2/cnt"; rm -f "$A26G6M_CNT"
+OUTM="$(REAPER_OVERRIDE="$MUT6" FAKE_ADV_LINE="$A26G6M_SHA	refs/heads/feat/a26g6m" \
+    FAKE_TARGETED_LINE="$A26G6M_SHA	refs/heads/feat/a26g6m" \
+    FAKE_TARGETED_COUNTER="$A26G6M_CNT" GIT_BIN_OVERRIDE="$T/bin/git-lsremote-forkstale" \
+    run_reaper $ENV2 --apply --repo "$REPO2")"
+assert_nodir "$T/$ENV2-det" \
+    "A26g6 MUTANT GOES RED: without the fork re-probe the checkout IS removed on a warrant the remote had already invalidated"
+assert_contains "$OUTM" "removed=1" \
+    "A26g6 …and the mutant pass reports the removal it should never have taken"
+assert_eq "$(cat "$A26G6M_CNT" 2>/dev/null)" "1" \
+    "A26g6 …and the mutant paid ONE targeted probe, not two — the fork probe is what the arm counts"
 
 # ── A26c: a remote-holds row does NOT block the end-of-pass prune — pinned BOTH ways ─────
 # This is the F7/A23 rule one reason class over, and it is a DECISION with a cost on both sides:
