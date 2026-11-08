@@ -2962,7 +2962,10 @@ if need "$TMP/reapw.sh" "reap_stale_workers() and its helpers are extracted from
   # grepped: a `tmux` that sleeps far longer than the bound must be CUT, and "no answer" is read as no
   # pane pid (⇒ matched 0 ⇒ UNKNOWN ⇒ SPARE), the safe direction.
   _pn_body="$(sed -n '/^_wreap_pane_pid() {/,/^}/p' "$LOOP")"
-  case "$_pn_body" in *wt_bounded*) rc=0 ;; *) rc=1; echo "      _wreap_pane_pid does not route the probe through wt_bounded";; esac
+  # ⛔ THE CALL SHAPE, NOT THE WORD (measured): the body's own COMMENT names `wt_bounded`, so a bare
+  # `*wt_bounded*` match stays green with the call deleted — a comment-satisfiable assertion in a block
+  # whose subject is exactly that vacuity. Pin the invocation.
+  case "$_pn_body" in *'wt_bounded "${WT_PROBE_TIMEOUT:-15}" tmux list-panes'*) rc=0 ;; *) rc=1; echo "      _wreap_pane_pid does not route the probe through wt_bounded";; esac
   ck "#2104: the tmux pane probe goes through wt_bounded (the module's every-probe-can-hang rule)" $rc
   if command -v perl >/dev/null 2>&1 || command -v timeout >/dev/null 2>&1; then
     mkdir -p "$TMP/slowbin"
