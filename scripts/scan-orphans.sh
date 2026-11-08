@@ -176,7 +176,11 @@ path_absent() {
             if listing="$(ls -A -- "$parent" 2>/dev/null)"; then
                 # readable as well: if the name IS in the listing while stat failed, something other
                 # than ENOENT is going on and we cannot decide.
-                if printf '%s\n' "$listing" | grep -qxF -- "$base"; then return 1; fi
+                # ⛔ NOT `printf … | grep -q`: under `pipefail` a `grep -q` exits at the first
+                # match and the writer takes SIGPIPE, so the pipeline reports 141 and the guard
+                # reads as a FALSE NEGATIVE (scripts/check-no-sigpipe-grep.sh, #841/#864). The
+                # here-string form feeds the same lines with no pipe to break.
+                if grep -qxF -- "$base" <<<"$listing"; then return 1; fi
             fi
             return 0
         fi
