@@ -3781,8 +3781,15 @@ test("#3255 policy: the git-op root is authoritative — adoption must never gat
     /const cwd = resolveGitRoot\(cdPath \?\? inputCwd\)/.test(src),
     "the git-op root must come from the command's own cwd",
   );
+  // ⛔ THE DECLARATION IS THE SHAPE THE PRE-FIX CODE ACTUALLY HAD (review cycle 6, F1).
+  // `origin/main` runs `const sessionRoot = normalizeWorktreeRoot(recoveryOnlyRoot(…));`
+  // then `recoverBridgeForRoot(sessionRoot)` — the adopted root arrives through a
+  // LOCAL, so neither inlined-call negation below matches it and this pin was GREEN on
+  // the very code it is named after. The third negation closes the declaration; the
+  // two inlined-call forms stay for the shapes a "tidy up the local" refactor produces.
   ok(
-    !/recoverBridgeForRoot\(\s*normalizeWorktreeRoot\(recoveryOnlyRoot/.test(src) &&
+    !/const sessionRoot = normalizeWorktreeRoot\(recoveryOnlyRoot\(/.test(src) &&
+      !/recoverBridgeForRoot\(\s*normalizeWorktreeRoot\(recoveryOnlyRoot/.test(src) &&
       !/recoverBridgeForRoot\(recoveryOnlyRoot/.test(src),
     "recovery must never be COUNTED against an adopted root — a sibling's entries are keyed on the " +
       "sibling, so counting them claims verified state this session does not have (#1265 AC (b))",

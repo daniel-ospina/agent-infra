@@ -129,8 +129,12 @@ roots and 20+ tortoise roots in the live bridge), so this is the narrow one-sibl
    zero-entry warning is now reachable whenever this worktree has none. When `inspected > 0`, log that
    the entries are INSPECTION ONLY / inert here and append `gate_recovery_foreign_root`.
    *Proves it:* e2e 1265a — exactly ONE `gate_recovery` keyed on **worktree A** (the sibling it
-   recovered for) and NONE keyed on B, one `gate_recovery_foreign_root`, and one durable
-   `gate_recovery_empty` for B (the #264 P2 signal the pre-fix run suppressed).
+   recovered for), one `gate_recovery_foreign_root`, and one durable `gate_recovery_empty` for B (the
+   #264 P2 signal the pre-fix run suppressed). ⛔ There is deliberately **no B-keyed `gate_recovery`
+   assertion**: such a row cannot fail in this scenario (the bridge's only compound key is A's, so
+   `recoverBridgeForRoot(realB)` returns 0 under every mutant), and it was deleted in review cycle 5.
+   The sibling-counting revert is caught by the transcript rows instead — the pre-fix
+   `📂 Recovered N verified files from bridge` line and the absent `0 bridge-recovered files` warning.
 2. **`diagnoseRootMismatch`**: keep the narration, put the **safe** remedy first
    ("re-dispatch verification for `<this root>`") and state that adopting another tree's entries is
    refused by design; append `gate_root_mismatch` once per `(root, siblings)` fingerprint, reset at
