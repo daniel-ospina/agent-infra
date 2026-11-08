@@ -63,9 +63,9 @@ Exit codes are the answer, not the pixels:
 
 | Exit | Meaning |
 |---|---|
-| `0` | **CONFIRMED** — the line was sent and the session transcript **advanced** |
+| `0` | **CONFIRMED** — the line was sent and the proof fired: the session transcript **advanced** (resume arm), or a **fresh session appeared / the pane left the shell prompt** (`--new` arm) |
 | `3` | **REFUSED** — a guard refused and nothing was sent; the message names the guard |
-| `4` | **UNCONFIRMED** — sent, but no transcript advance inside `--wait`; the message carries the pane tail |
+| `4` | **UNCONFIRMED** — sent, but the proof did not fire inside `--wait`; the message carries the pane tail and names the signal that arm was actually watching |
 | `1` | **ERROR** — the tool itself raised. Never reported as DRY-RUN or as an unconfirmed send: the operator's next move is chosen on this line |
 
 The launch line it sends is the form the fleet's own recovery used to bring back 14 lanes (issue
@@ -108,7 +108,10 @@ state that already existed:
   directory name — `lane-status.mangled()` turns `.` into `-` while pi keeps the dot, and every fleet
   lane lives in a dotted path, so a derived directory name is not a key. The comparison is
   **identity, not containment**: a session started in an ancestor (the repo root, `$HOME`, the
-  worktrees dir) or a subdirectory of the lane's cwd is a different lane's business;
+  worktrees dir) or a subdirectory of the lane's cwd is a different lane's business. New transcripts
+  are opened **newest first**, and only the five newest are read, so a burst of other lanes appearing
+  inside `--wait` cannot push this lane's own transcript out of the window — while a box with
+  thousands of session files still costs five opens;
 - **proof (ii):** the pane **left the shell prompt** on two consecutive reads. pi creates its session
   file lazily (the path is assigned at session start; the first write arrives with the first entry), so
   a fresh session with no prompt yet may leave no file — the pane is then the only witness;

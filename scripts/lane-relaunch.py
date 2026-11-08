@@ -216,6 +216,22 @@ def _stat(path):
         return None
 
 
+def _newest_first(paths, limit):
+    """The `limit` most recently written of `paths`, newest first.
+
+    Why not `sorted(paths)[:limit]`: a transcript filename is a session uuid, so a lexicographic
+    sort is arbitrary with respect to time — it kept the five that happen to sort first and dropped
+    the one the relaunch just created. A file that vanished between the glob and the stat is not a
+    candidate, and must not raise: this runs inside an error path.
+    """
+    def _key(p):
+        try:
+            return os.path.getmtime(p)
+        except Exception:                                        # noqa: BLE001
+            return float("-inf")
+    return sorted(paths, key=_key, reverse=True)[:limit]
+
+
 def relaunch(ws, label="", cwd=None, session=None, pi=None, new=False, wait=45.0,
              dry_run=False, ls=None, runner=None, sleep=time.sleep, clock=time.time):
     """Return an observation dict. Every field is measured; nothing here infers success."""
@@ -369,12 +385,18 @@ def relaunch(ws, label="", cwd=None, session=None, pi=None, new=False, wait=45.0
                                                           and pre_files is not None) else []
             # (i) a transcript that was NOT there before the send, for THIS cwd. Bounded: only the
             # candidates are opened, and only their first record.
-            hit = next((p for p in new_files[:5] if _records_cwd(ls, p, cwd)), None)
+            # ⛔ NEWEST FIRST, and the bound applies to the NEWEST (review finding 4, 2026-11-08):
+            # `sorted(...)[:5]` kept the five that sort FIRST lexicographically, and a filename is a
+            # uuid — so on a box where five other lanes appear inside the window, OUR transcript (the
+            # one that would prove the relaunch) was the file dropped. Newest-first is what "appeared
+            # after the send" actually means; the bound still caps how many files are opened.
+            cands = _newest_first(new_files, 5)
+            hit = next((p for p in cands if _records_cwd(ls, p, cwd)), None)
             if hit:
                 obs.update(confirmed=True, sid=sid_after or pre_sid,
                            reason="fresh session appeared (%s)" % os.path.basename(hit))
                 break
-            if new_files[:5] and not hit:
+            if cands and not hit:
                 obs["stray_new_sessions"] = len(new_files)
             # (ii) the pane LEFT the shell prompt — a transition the pane itself proves, and the one
             # signal that needs no transcript at all (pi creates its file lazily: `newSession` only
@@ -402,8 +424,15 @@ def relaunch(ws, label="", cwd=None, session=None, pi=None, new=False, wait=45.0
                 tail = "\n".join((ls.read_screen(ws, lines=6) or "").splitlines()[-6:])
             except Exception:                                    # noqa: BLE001
                 tail = "(pane unreadable)"
-            obs["reason"] = ("sent, but no transcript advance within %ss — UNCONFIRMED. Pane now:\n%s"
-                             % (wait, tail))
+            # ⛔ THE FRESH ARM DOES NOT MEASURE AN ADVANCE (review finding 4): it measures an
+            # APPEARANCE and a prompt TRANSITION. A timeout message naming an advance sends the
+            # operator to read a signal this arm never looked at.
+            if fresh:
+                obs["reason"] = ("sent, but no fresh session appeared and the pane did not leave the "
+                                 "shell prompt within %ss — UNCONFIRMED. Pane now:\n%s" % (wait, tail))
+            else:
+                obs["reason"] = ("sent, but no transcript advance within %ss — UNCONFIRMED. Pane now:\n%s"
+                                 % (wait, tail))
             break
         sleep(3.0)
 
