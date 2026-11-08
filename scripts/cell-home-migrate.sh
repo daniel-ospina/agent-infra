@@ -185,6 +185,13 @@ check_credentials() {
     [ -n "$rel" ] || continue
     f_leg="$HOME_LEGACY/$rel"
     f_dur="$HOME_DURABLE/$rel"
+    # ⛔ THE CONTENT LEG RUNS FIRST AND INDEPENDENT OF THE LEGACY SIDE. The DURABLE file is what lanes
+    # SOURCE, so a re-pointing assignment in it is drift whether or not a legacy copy still exists —
+    # the legacy home is reclaimed later, and this check must not disappear with it. Names only, never
+    # a value.
+    case " $ENV_FILES " in
+      *" $rel "*) if [ -e "$f_dur" ]; then report_env_file "$rel" "$f_dur" "the DURABLE copy" || rc=1; fi ;;
+    esac
     if [ ! -e "$f_leg" ]; then
       note "  $rel: legacy MIA, durable $(describe "$f_dur")"
       continue
@@ -198,10 +205,6 @@ check_credentials() {
       continue
     fi
     note "  $rel: legacy $(describe "$f_leg") | durable $(describe "$f_dur")"
-    # ⛔ THE CONTENT LEG. A durable `keys.env` that re-points HOME/CELL_HOME is drift even though every
-    # path, size and mode says "converged": lanes source it, so the box runs in the second home while
-    # `--check` would say one. Names only — never the value.
-    case " $ENV_FILES " in *" $rel "*) report_env_file "$rel" "$f_dur" "the DURABLE copy" || rc=1 ;; esac
     # BOTH PRESENT. Never overwrite either one. If the legacy copy is NEWER that is a real hazard a
     # human has to settle — a rotated key on the legacy side would otherwise look converged.
     if [ "$(mtime_of "$f_leg")" -gt "$(mtime_of "$f_dur")" ]; then
@@ -221,6 +224,12 @@ migrate_credentials() {
     [ -n "$rel" ] || continue
     f_leg="$HOME_LEGACY/$rel"
     f_dur="$HOME_DURABLE/$rel"
+    # ⛔ THE CONTENT LEG RUNS FIRST AND INDEPENDENT OF THE LEGACY SIDE — same reason as `--check`: the
+    # durable file is what lanes source, and the legacy home is reclaimed later, so this report must not
+    # vanish with it (and the two modes must not disagree about the same box).
+    case " $ENV_FILES " in
+      *" $rel "*) if [ -e "$f_dur" ]; then report_env_file "$rel" "$f_dur" "the DURABLE copy" || rc=1; fi ;;
+    esac
     [ -e "$f_leg" ] || continue
     if [ -e "$f_dur" ]; then
       note "  kept   $rel (durable copy exists — never overwritten)"

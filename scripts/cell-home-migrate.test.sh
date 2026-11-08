@@ -304,6 +304,21 @@ rm -f "$DUR/keys.env"
 _out="$(run_tool "$TOOL" --apply)"; _rc=$?
 if [ -f "$DUR/keys.env" ]; then ok "j5 a keys.env that names the DURABLE home is copied (the refusal is content, not the filename)"; else bad "j5 a clean keys.env was not copied (rc $_rc)"; fi
 
+# ⛔ THE CONTENT LEG IS INDEPENDENT OF THE LEGACY SIDE. The legacy home is reclaimed LATER, so a durable
+# `keys.env` that re-points the home must still be drift after the legacy copy is gone — otherwise the
+# report disappears exactly when the operator cleans up, and both modes would read "one home" over a
+# box whose every lane is back in the second home.
+mk_box "$T/env4"
+printf 'export CELL_HOME=%s\nDEEPSEEK_API_KEY=%s\n' "$LEG" "$POISON" >"$DUR/keys.env"; chmod 600 "$DUR/keys.env"
+rm -f "$LEG/keys.env"
+[ -e "$LEG/keys.env" ] && bad "j6 fixture: the legacy copy is still there" || ok "j6 fixture: the legacy keys.env is gone, the durable one is poisoned"
+run_tool "$TOOL" --check >/dev/null 2>&1; _rc=$?
+[ "$_rc" = 1 ] && ok "j7 …--check is STILL 1 with no legacy copy left (the check did not go quiet with the legacy home)" \
+  || bad "j7 the durable re-pointing went unreported once the legacy copy was removed (rc $_rc)"
+_out="$(run_tool "$TOOL" --apply)"; _rc=$?
+[ "$_rc" = 1 ] && ok "j8 …and --apply does not report convergence over it either (the two modes agree)" \
+  || bad "j8 --apply answered $_rc while --check answers 1 on the same box"
+
 printf '\n── (g) NON-VACUITY: the refusals are the code, not the fixture ──────────────────────\n'
 
 # g1: remove the existence check from the tool and d11-d14 must fail — i.e. the arm above really is
