@@ -17,6 +17,12 @@
 # #1410: a healthy worktree is PASS | a worktree whose .git link is deleted is a
 # worktree_unlinked FAIL naming the directory and the repair | empty debris under
 # .worktrees/ is not flagged | restoring the link returns the hub to PASS.
+# #649 residual: a farm symlink into a WORKTREE of this hub is a farm_worktree FAIL
+# that names the entry, the target and the BRANCH — reached with the hub clean, on
+# main and current, which is the state no other arm can see — and it survives the
+# worktree being reaped (the link then dangles); a hub that merely HAS a worktree, or
+# whose worktree is another checkout's, is not flagged; the --gh-report body carries
+# the same remedy.
 
 set -euo pipefail
 
@@ -48,6 +54,13 @@ assert_eq() { # <actual> <expected> <label>
 
 assert_not_contains() { # <haystack> <needle> <label>
   if grep -qF -- "$2" <<<"$1"; then bad "$3 (unexpectedly present: $2)"; else ok "$3"; fi
+}
+
+# <check-output> — the composed disorder token, exactly. Used where the whole point is
+# that the hub is OTHERWISE healthy: a substring match cannot say that, because
+# `HUB_DISORDER=dirty+farm_worktree` also contains `farm_worktree`.
+disorder_tok() {
+  printf '%s\n' "$1" | sed -n 's/^HUB_DISORDER=\([^ ]*\).*/\1/p' | head -1
 }
 
 FIX="$(mktemp -d)"
@@ -196,6 +209,74 @@ assert_not_contains "$out" "$FARM649/mid-out" "a '..' AFTER a symlink that resol
 assert_not_contains "$out" "$FARM649/other-tool" "a link into ANOTHER checkout is not named"
 git -C "$HUB" checkout -q main
 rm -rf "$HUB/extensions" "$FARM649" "$FIX/foreign" "$FIX/hub-alias" "$FIX/mid"
+
+# ── 4c. #649 residual: the farm symlinks into a WORKTREE of this hub ──────
+# MEASURED 2026-11-08: the hub was clean, ON main and up to date, and the live farm
+# still pointed into an in-flight branch's working tree — the check reported PASS and
+# exited 0. This class is invisible to every other arm (off_main is false, the
+# worktree is healthy, nothing is dirty), which is why it gets its own token, and why
+# it is evaluated UNCONDITIONALLY rather than only off main.
+# The fixture worktree sits DIRECTLY in the hub root, not under `.worktrees/`: git
+# reports a nested worktree as `?? <name>/`, which the #1919 filter excludes, so the hub
+# stays genuinely CLEAN — the premise of this case (a dirty or off-main hub would carry a
+# token of its own). The path SHAPE is irrelevant to the detector, which is sourced from
+# `git worktree list`; the dominant `.worktrees/` layout is covered at the end.
+# Case 3 above leaves a.txt staged-modified (`git checkout -- .` restores the WORKTREE
+# from the index); no later case asserts $HUB's porcelain count, and this case needs a
+# genuinely clean hub, so realign the fixture here rather than weakening the assertion.
+git -C "$HUB" checkout -q HEAD -- a.txt
+WTLIVE="$HUB/wt-live-649"
+git -C "$HUB" worktree add -q "$WTLIVE" -b wt/live-649
+mkdir -p "$WTLIVE/extensions/builtin-tools"
+FARMWT="$FIX/farm-wt-649"
+mkdir -p "$FARMWT" "$FIX/wt-foreign/extensions/other"
+ln -s "$WTLIVE/extensions/builtin-tools" "$FARMWT/builtin-tools"
+ln -s "$FIX/wt-foreign/extensions/other" "$FARMWT/other-tool"  # ANOTHER checkout's worktree shape
+ln -s "$HUB/extensions/builtin-tools" "$FARMWT/hub-tool"       # the hub ITSELF → the 4b class, not this one
+out="$(PI_EXTENSIONS_DIR="$FARMWT" bash "$CHECK" --repo "$HUB" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 1 "farm into a worktree of this hub → exit 1 (pre-fix: PASS, exit 0)"
+assert_eq "$(disorder_tok "$out")" "farm_worktree" "the ONLY disorder token is farm_worktree (hub is clean, on main, current)"
+assert_contains "$out" "$FARMWT/builtin-tools -> $WTLIVE/extensions/builtin-tools" "names the farmed entry and its worktree target"
+assert_contains "$out" "worktree branch: wt/live-649" "names the BRANCH the live runtime is executing"
+assert_contains "$out" "rm -f $FARMWT/builtin-tools && ln -s $HUB/extensions/builtin-tools $FARMWT/builtin-tools" "prints the repoint remedy for that entry"
+assert_contains "$out" "PI_EXTENSIONS_DIR" "names the sanctioned route for a deliberate preview"
+assert_not_contains "$out" "$FARMWT/other-tool" "a link into ANOTHER checkout's extensions is not this hub's worktree"
+assert_not_contains "$out" "$FARMWT/hub-tool" "a link into the hub itself stays the 4b class and is not double-named here"
+# The consequence that makes this a FAIL rather than a note: a reaped lane deletes the
+# worktree, git keeps the RECORD, the farm link DANGLES — and print-mode (`pi -p`,
+# every task child and harness lane) treats a failed extension load as FATAL (#602).
+rm -rf "$WTLIVE"
+if [ -e "$FARMWT/builtin-tools" ]; then bad "fixture precondition: the farm link should dangle after the worktree is reaped"; else ok "fixture precondition: a reaped worktree leaves the farm link DANGLING"; fi
+out="$(PI_EXTENSIONS_DIR="$FARMWT" bash "$CHECK" --repo "$HUB" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 1 "a REAPED worktree (dangling farm link) still exits 1"
+assert_eq "$(disorder_tok "$out")" "farm_worktree" "…and the token is still exactly farm_worktree"
+# Negative control for the class: a hub that merely HAS a worktree, which the farm does
+# not point into, is healthy — otherwise this token would red every hub with a worktree.
+ln -sfn "$HUB/extensions/builtin-tools" "$FARMWT/builtin-tools"
+out="$(PI_EXTENSIONS_DIR="$FARMWT" bash "$CHECK" --repo "$HUB" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 0 "a hub WITH a worktree that the farm does not point into still exits 0"
+assert_not_contains "$out" "farm_worktree" "…and never reports the token"
+# The DOMINANT fleet layout — `.worktrees/<name>` — must fire too. Asserted by substring,
+# not by exact token: git reports the containing `.worktrees/` as an untracked directory
+# (the #1919 filter matches the worktree itself, not its parent), so the hub is also dirty
+# here — and this class must COMPOSE with that, never be masked by it.
+WTNEST="$HUB/.worktrees/wt-nest-649"
+mkdir -p "$HUB/.worktrees"
+git -C "$HUB" worktree add -q "$WTNEST" -b wt/nest-649
+mkdir -p "$WTNEST/extensions/builtin-tools"
+ln -sfn "$WTNEST/extensions/builtin-tools" "$FARMWT/builtin-tools"
+out="$(PI_EXTENSIONS_DIR="$FARMWT" bash "$CHECK" --repo "$HUB" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 1 "a .worktrees/<name> target (the dominant layout) exits 1 too"
+assert_contains "$out" "farm_worktree" "…and is named even when the hub is ALSO dirty (the class composes)"
+assert_contains "$out" "worktree branch: wt/nest-649" "…naming the nested worktree's branch"
+ln -sfn "$HUB/extensions/builtin-tools" "$FARMWT/builtin-tools"
+rm -rf "$WTNEST"
+git -C "$HUB" worktree prune >/dev/null 2>&1 || true
+git -C "$HUB" branch -D wt/nest-649 >/dev/null 2>&1 || true
+rmdir "$HUB/.worktrees" 2>/dev/null || true
+git -C "$HUB" worktree prune >/dev/null 2>&1 || true
+git -C "$HUB" branch -D wt/live-649 >/dev/null 2>&1 || true
+rm -rf "$FARMWT" "$FIX/wt-foreign"
 
 # ── 5. Worktree resolution (D5): check from INSIDE a worktree ─────────────
 WT="$HUB/.worktrees/wt-test"
@@ -963,6 +1044,34 @@ assert_contains "$out" "PASS  $HN" "…printing PASS for it"
 git -C "$HN" worktree remove --force "$HN/café-wt" 2>/dev/null || true
 git -C "$HN" branch -q -D cafe-br 2>/dev/null || true
 
+# ── 12. #649 residual: the --gh-report leg carries the farm_worktree class ───
+# The token is re-derived in the report leg rather than carried in FAIL_LINES, so a new
+# class is exactly the place where the two sites drift: if the leg did not re-derive it,
+# the FILED issue would name `farm_worktree` with NO remedy in its body — an alert whose
+# recovery command is missing, which is worse than no alert.
+echo ""
+echo "== #649 residual: --gh-report carries the farm_worktree class =="
+HR="$FIX/hub649rep"
+git init -q -b main "$HR"; git -C "$HR" config user.email t@t; git -C "$HR" config user.name t
+touch "$HR/a.txt"; git -C "$HR" add .; git -C "$HR" commit -qm init
+git -C "$HR" remote add origin "https://github.com/daniel-ospina/tortoise.git"
+HRWT="$HR/wt-649rep"
+git -C "$HR" worktree add -q "$HRWT" -b wt/649rep
+mkdir -p "$HRWT/extensions/builtin-tools"
+FARMREP="$FIX/farm-649rep"; mkdir -p "$FARMREP"
+ln -s "$HRWT/extensions/builtin-tools" "$FARMREP/builtin-tools"
+: > "$GH_STUB_LOG"
+rm -f "$GH_EXISTING"
+out="$(PI_EXTENSIONS_DIR="$FARMREP" bash "$CHECK" --repo "$HR" --gh-report 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 1 "--gh-report with farm_worktree exits 1"
+assert_contains "$out" "opened hub-state issue" "…and files the hub-disorder issue"
+rep_body="$(cat "$GH_STUB_LOG" 2>/dev/null)"
+assert_contains "$rep_body" "farm_worktree" "…whose FILED body names the class"
+assert_contains "$rep_body" "ln -s $HR/extensions/builtin-tools" "…and carries the repoint remedy, not just stdout"
+assert_contains "$rep_body" "worktree branch: wt/649rep" "…naming the branch the live runtime was executing"
+rm -rf "$HRWT"; rm -rf "$FARMREP"
+
+# ── 13. End of suite ─────────────────────────────────────────────────────
 echo ""
 echo "hub-state-check.test.sh: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ] || exit 1

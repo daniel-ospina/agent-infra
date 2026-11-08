@@ -182,8 +182,10 @@ filter_registered_worktrees() { # $1=repo-root ; stdin=porcelain ; stdout=porcel
 # $8=`unlinked_worktrees` output for this hub — `T<TAB><dir>` / `M<TAB>` + record lines
 #    (a leading `!<n>` counts uncarryable entries), or empty when that class is absent (#1410)
 # $9=the composed disorder token, used only by the empty-guard at the end
+# $10=`farm_worktree_links` output for this hub — `entry<TAB>target<TAB>branch`, or
+#     empty when that class is absent (#649 residual)
 recovery_guide() {
-  local on_main="$1" dirty="$2" stale="${3:-}" repo="$4" branch="$5" upstream="${6:-}" push_remote="${7:-origin}" unlinked="${8:-}" disorder_token="${9:-}"
+  local on_main="$1" dirty="$2" stale="${3:-}" repo="$4" branch="$5" upstream="${6:-}" push_remote="${7:-origin}" unlinked="${8:-}" disorder_token="${9:-}" farm_wt="${10:-}"
   local lines=()
   local repo_canon
   repo_canon="$( (cd "$repo" 2>/dev/null && pwd -P) || printf '%s' "$repo" )"
@@ -341,6 +343,34 @@ recovery_guide() {
       lines+=("are NOT live and unmerged branch code is what runs. Return it to main (above).")
     fi
   fi
+  # #649 (residual) — a farm link into a WORKTREE of this hub. Independent of the
+  # off-main block above, and that independence is the point: this state is INVISIBLE
+  # to every other arm, because the hub itself can be clean, on main and current.
+  # Reported as a FAIL class rather than a note for its second consequence — when the
+  # lane is reaped the worktree disappears and every such link DANGLES, and print-mode
+  # (`pi -p`, i.e. every `task` child and every harness lane) treats a failed extension
+  # load as FATAL, so a reaped lane takes the whole dispatch path with it (#602 measured
+  # that same fatality from an orphaned farm file).
+  if [[ -n "$farm_wt" ]]; then
+    local farm_root_wt
+    farm_root_wt="$(extensions_farm_root)"
+    lines+=("")
+    lines+=("#649 — the live pi extension farm symlinks into a WORKTREE of this hub, not at")
+    lines+=("the hub itself: every running session executes that BRANCH's working tree.")
+    while IFS=$'\t' read -r n tgt br; do
+      [[ -n "$n" ]] || continue
+      lines+=("  $farm_root_wt/$n -> $tgt   (worktree branch: $br)")
+    done <<<"$farm_wt"
+    lines+=("Repoint each entry at this hub's own extensions — the checkout that must stay on")
+    lines+=("main, clean and current:")
+    while IFS=$'\t' read -r n tgt br; do
+      [[ -n "$n" ]] || continue
+      lines+=("  rm -f $farm_root_wt/$n && ln -s $repo/extensions/$n $farm_root_wt/$n")
+    done <<<"$farm_wt"
+    lines+=("Then restart pi. A deliberate preview of a branch's extension uses a SEPARATE")
+    lines+=("farm root (PI_EXTENSIONS_DIR), never the live one — the live farm is what every")
+    lines+=("session, lane and task child loads.")
+  fi
   # #431: an EMPTY array expands to an unbound variable under `set -u` on bash 3.2, so a
   # guide that produced no lines would abort its caller instead of reporting. Every class
   # above appends, but this keeps a future arm from turning "no guidance" into a crash.
@@ -473,6 +503,87 @@ live_extension_links() { # $1=hub
   # substitution, where a non-zero helper aborts the whole check before the guide is
   # printed — a silent guide loss. The `if …; fi` tail already returns 0; this makes
   # the contract explicit so a future arm cannot break it by accident.
+  return 0
+}
+
+# #649 (residual) — the worktrees of $1, as `physical-path<TAB>branch`, for the
+# farm-target comparison below. Sourced from `git worktree list --porcelain` so the
+# answer is GIT'S OWN: a path-prefix guess would miss a worktree created outside
+# `.worktrees/`, and the fleet does create them elsewhere.
+#
+# The MAIN worktree (the hub itself) is EXCLUDED. A farm link into `<hub>/extensions`
+# is the ORIGINAL #649 class (`live_extension_links`, named only when the hub is
+# off main); reporting it here too would name the same link twice, under two
+# different remedies, in one guide.
+#
+# A worktree whose directory was DELETED is still emitted when git still records it:
+# that is the reaped-lane state, and it is the one that makes a farm link DANGLE.
+# `physical_path` deliberately does not require existence — both sides of the
+# comparison are normalized through it, so a dangling pair still matches.
+#
+# ACCEPTED RESIDUAL: the transport is line/TAB delimited, like `unlinked_worktrees`,
+# so a worktree whose PATH contains a newline cannot be carried and is not named here
+# (that helper counts such records as uncarryable; this one simply misses them). It
+# fails toward silence, never toward a false FAIL, and a reaped lane still prunes the
+# record long before anyone names a worktree with a newline.
+hub_worktrees() { # $1=hub
+  local hub="$1" line p="" b="" rec phub
+  phub="$(physical_path "$hub")"
+  # `--porcelain` terminates each record with a BLANK line, so a synthetic trailing
+  # blank arrives via the extra `$'\n'` (here-string adds the first one) and the
+  # final record flushes through the same arm as every other. ALWAYS 0: the caller
+  # reads this through a command substitution under `set -e`.
+  while IFS= read -r line; do
+    case "$line" in
+      'worktree '*) p="${line#worktree }" ;;
+      'branch refs/heads/'*) b="${line#branch refs/heads/}" ;;
+      'branch '*)   b="${line#branch }" ;;
+      'detached')   b="detached" ;;
+      ''|' ')
+        if [ -n "$p" ]; then
+          rec="$(physical_path "$p")"
+          [ "$rec" = "$phub" ] || printf '%s\t%s\n' "$rec" "${b:-detached}"
+        fi
+        p=""; b="" ;;
+    esac
+  done <<<"$(git -C "$hub" worktree list --porcelain 2>/dev/null || true)"$'\n'
+  return 0
+}
+
+# #649 (residual) — farm links that resolve into a WORKTREE of $1 (never into $1
+# itself: that is `live_extension_links`). Emits `entry<TAB>target<TAB>branch`.
+#
+# WHY THIS IS ITS OWN CLASS: the hub can be clean, ON main and up to date, so every
+# other arm of this check — including the off-main #649 block — is silent while the
+# live runtime executes an in-flight branch's working tree. MEASURED 2026-11-08: a
+# clean on-main hub whose farm linked into `hub/.worktrees/live/extensions/…`
+# reported PASS and exited 0.
+farm_worktree_links() { # $1=hub
+  local hub="$1" farm wts e base target real d wt br
+  farm="$(extensions_farm_root)"
+  [ -d "$farm" ] || return 0
+  wts="$(hub_worktrees "$hub")"
+  [ -n "$wts" ] || return 0
+  for e in "$farm"/*; do
+    [ -L "$e" ] || continue
+    base="$(basename "$e")"
+    target="$(readlink "$e" 2>/dev/null || true)"
+    [ -n "$target" ] || continue
+    case "$target" in
+      /*) ;;
+      *)  target="$(physical_path "$(dirname "$e")")/$target" ;;
+    esac
+    real="$(physical_path "$target")"
+    d="$(physical_path "$(dirname "$real")")"
+    while IFS=$'\t' read -r wt br; do
+      [ -n "$wt" ] || continue
+      if [ "$d" = "$(physical_path "$wt/extensions")" ]; then
+        printf '%s\t%s\t%s\n' "$base" "$target" "$br"
+        break
+      fi
+    done <<<"$wts"
+  done
+  # ALWAYS 0 — same contract, and the same reason, as `live_extension_links`.
   return 0
 }
 
@@ -694,11 +805,19 @@ for repo_arg in "${REPOS[@]}"; do
   # at session start, which is the placement that cannot be forgotten.
   UNLINKED="$(unlinked_worktrees "$MAIN_REPO")"
 
+  # #649 (residual) — a farm link into a WORKTREE of THIS hub. Computed
+  # unconditionally (not only when off main): the hub being clean+on-main is exactly
+  # the state in which this class would otherwise be silent.
+  FARM_WT="$(farm_worktree_links "$MAIN_REPO")"
+
   disorder=""
   [[ $on_main -eq 0 ]] && disorder="off_main"
   [[ $dirty -eq 1 ]] && disorder="${disorder:+${disorder}+}dirty"
   [[ -n "$STALE" ]] && disorder="${disorder:+${disorder}+}${STALE}"
   [[ -n "$UNLINKED" ]] && disorder="${disorder:+${disorder}+}worktree_unlinked"
+  # Appended LAST so every earlier token keeps its contiguous position — the gh-report
+  # leg reads membership (`*dirty*`) and a PREFIX (`off_main*`), never a suffix.
+  [[ -n "$FARM_WT" ]] && disorder="${disorder:+${disorder}+}farm_worktree"
   # Freshness fields appear only when an upstream was resolvable (a detached /
   # off-main / no-upstream FAIL has nothing to report here).
   fresh_fields=""
@@ -709,7 +828,7 @@ for repo_arg in "${REPOS[@]}"; do
   else
     echo "FAIL  $MAIN_REPO (branch=$BRANCH, porcelain=$PORCELAIN_COUNT$fresh_fields)"
     echo "HUB_DISORDER=$disorder branch=$BRANCH repo=$MAIN_REPO porcelain_count=$PORCELAIN_COUNT$fresh_fields ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-    recovery_guide "$on_main" "$dirty" "$STALE" "$MAIN_REPO" "$BRANCH" "$UPSTREAM" "$UPSTREAM_REMOTE" "$UNLINKED" "$disorder" | sed 's/^/  /' 
+    recovery_guide "$on_main" "$dirty" "$STALE" "$MAIN_REPO" "$BRANCH" "$UPSTREAM" "$UPSTREAM_REMOTE" "$UNLINKED" "$disorder" "$FARM_WT" | sed 's/^/  /' 
     FAIL_LINES+=("$MAIN_REPO|$disorder|$BRANCH|$PORCELAIN_COUNT")
     FAIL=$((FAIL + 1))
   fi
@@ -758,7 +877,12 @@ if [[ $GH_REPORT -eq 1 && $FAIL -gt 0 ]]; then
       # check uses — a second implementation is how the two sites would drift.
       unlinked=""
       [[ "$disorder" == *worktree_unlinked* ]] && unlinked="$(unlinked_worktrees "$repo_path")"
-      guide="$(recovery_guide "$on_main" "$dirty" "$stale" "$repo_path" "$branch" "$upstream" "$upstream_remote" "$unlinked" "$disorder")"
+      # #649 (residual) is the same shape of fact — a filesystem observation about the
+      # farm and this hub — so it is re-derived with the SAME function, never carried
+      # in FAIL_LINES and never re-implemented here.
+      farm_wt=""
+      [[ "$disorder" == *farm_worktree* ]] && farm_wt="$(farm_worktree_links "$repo_path")"
+      guide="$(recovery_guide "$on_main" "$dirty" "$stale" "$repo_path" "$branch" "$upstream" "$upstream_remote" "$unlinked" "$disorder" "$farm_wt")"
       body="Hub-discipline check FAILED for **$repo_path** at $ts.
 
 - \`HUB_DISORDER=$disorder\` (branch=\`$branch\`, porcelain=$porcelain_count)
