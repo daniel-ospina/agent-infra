@@ -584,12 +584,16 @@ assert_not_contains "$_PRD_TPL" "the log and the verdict MOVE to" "pr-doctor tem
 # said "THREE readers open those canonical **files** BY NAME", which is half false: all three open
 # `pr-doctor.status.json` (heartbeat-loop.sh:851, objective.py's `pr_doctor_last_run` at :3264,
 # lib/fleet-inventory.sh's `_fleet_pr_doctor_bound` at :953) and NOTHING LIVE READS `pr-doctor.log` —
-# `scripts/` holds one appender (heartbeat-loop.sh:800), two places that print its path (:902/:906), and
-# prose. An operator reading "those canonical files" is promised a log consumer that does not exist,
-# which is the same wrong-place-to-look failure the paragraph exists to prevent, inverted. Both halves
-# are pinned: the correction itself (negative, so a re-inversion reds) and the log fact (positive).
+# TWO writers append to it (`pr-doctor.py`'s own `log()`, which `_log_path()` resolves to the canonical
+# `LOG_BASENAME`, and the heartbeat's launcher at :800 appending a child's stdout), two places print its
+# path (:902/:906), and the rest is prose. An operator reading "those canonical files" is promised a log
+# consumer that does not exist, which is the same wrong-place-to-look failure the paragraph exists to
+# prevent, inverted. An earlier version of this very comment said ONE appender — the count went stale the
+# same way the paragraph's did, so the corrected count is pinned too: the correction itself (negative, so a
+# re-inversion reds), the log fact (positive), and the writer count (positive).
 assert_not_contains "$_PRD_TPL" "canonical files BY NAME" "pr-doctor template: does NOT claim three readers open the canonical PAIR (round 45's overstatement)"
 assert_contains "$_PRD_TPL" "nothing live READS \`pr-doctor.log\`" "pr-doctor template: says out loud that the log has no live reader"
+assert_contains "$_PRD_TPL" "two things that WRITE it are" "pr-doctor template: pins the corrected writer count (two, not one appender)"
 # A visible checkout whose resolution produced NOTHING is a regression, not a host without one. Ask
 # the same three candidates install-launchd.sh:76-82 asks (the fixture's HOME is the fake one the run
 # used, so §13/§14's seeded checkouts cannot make this look resolved).
