@@ -3410,8 +3410,53 @@ test("#1339d: loop wiring — the verdict is re-validated against evidence acros
     "the live flag comes from the SAME read as the printed live age (a second `readMarkerAge` call could disagree with the age beside it)",
   );
   ok(src.includes("no life signs for ${Math.round(decMarkerAgeMs / 1000)}s"), "the cut headline prints the DECISION's age — the post-await re-read is what rendered '-1s'");
+  // The three completion/backstop payloads read `.ageMs` only (no `invalid`
+  // field). That is DELIBERATE, not an omission (#1339 review-6 P3): each takes
+  // `now = Date.now()` AT its own read, so `lastMarkerAt > now` there can only
+  // mean the WALL CLOCK stepped backwards — the case the decision-time flag
+  // already covers — whereas the tick-kill path reads AFTER an `await`, which is
+  // where a marker ingested inside the probe window makes the live read clamp.
+  // That scope is stated on `MarkerAgeReading.invalid` and in `load-policy.md`
+  // §6; the field's exact literal is already pinned to exactly one occurrence
+  // above, so no second pin is warranted (and a looser
+  // `"lastMarkerAgeInvalid="` count pin would be satisfiable by the docblock
+  // that explains the scope — the comment-satisfiable-pin class this test
+  // exists to close).
   equal(src.split("hbCtx.state.lastMarkerAt > 0 ? Date.now() - hbCtx.state.lastMarkerAt").length - 1, 0, "no site computes the marker age by hand any more — every reader goes through `readMarkerAge`");
   equal(src.split("hbCtx.state.lastMarkerAt > 0 ? now - hbCtx.state.lastMarkerAt : -1").length - 1, 0, "…neither on the tick clock");
+  // ⛔ THE TWO PINS ABOVE ARE SPELLING-BOUND, and a real revert of the backstop
+  // reader (the site whose comment claims "the single-reader invariant is only
+  // true if this site goes through it too") ends in `: Infinity`, so it matches
+  // NEITHER — measured (#1339 review-6): restoring
+  // `lastMarkerAt > 0 ? now - lastMarkerAt : Infinity` left 373/0 GREEN. This
+  // regex is the spelling-free form of the same invariant: any hand-rolled
+  // `lastMarkerAt > 0 ? <clock> - lastMarkerAt` ternary is caught whatever its
+  // false-branch is.
+  ok(
+    !/\blastMarkerAt > 0 \?\s*(?:Date\.now\(\)|now)\s*-/.test(src),
+    "no site computes the marker age by hand ANY MORE, in any spelling — a `: Infinity` / `: 0` false-branch does not exempt the raw difference from the single-reader rule (#1339 review-6 mutation: `: Infinity` survived the exact-literal pins above)",
+  );
+  ok(
+    src.includes("const backstopMarkerAge = readMarkerAge(hbCtx.state.lastMarkerAt, now).ageMs;") &&
+      src.includes("const markerAge = backstopMarkerAge < 0 ? Infinity : backstopMarkerAge;"),
+    "the backstop's freshness read goes through `readMarkerAge` and maps its `-1` SENTINEL to `Infinity` — so `stateFresh` never compares a threshold against a sentinel or a negative age (the pre-#1339 shape could go negative whenever a marker was ingested between the timer's `now` and the read)",
+  );
+  // ⛔ THE SUPPRESSION ITSELF (#1339 review-6 P2). Everything above pins the
+  // helpers, the guard's ARGUMENTS and the call's POSITION — and none of it
+  // asserts that a non-null `supersededBy` actually PREVENTS the kill. Measured:
+  // `if (supersededBy) {` → `if (false as boolean) {` (fully inert guard) and
+  // deleting the block's `return;` (the realistic refactor) BOTH left 373/0
+  // GREEN — so the fix could be removed entirely with the whole file's suite
+  // green, which is the false-PASS class this PR exists to close. Pinned below
+  // structurally: the gate exists once, its block RETURNS before the kill, and
+  // the block never reaches the tree kill.
+  equal(src.split("if (supersededBy) {").length - 1, 1, "exactly ONE suppression gate — the guard's verdict is what gates the kill, and a second gate elsewhere would be a different policy");
+  const suppressIdx = src.indexOf("if (supersededBy) {");
+  const suppressEnd = suppressIdx >= 0 ? src.indexOf("clearInterval(heartbeat);", suppressIdx) : -1;
+  const suppressBlock = suppressIdx >= 0 && suppressEnd > suppressIdx ? src.slice(suppressIdx, suppressEnd) : "";
+  ok(suppressEnd > suppressIdx, "the suppression returns BEFORE `clearInterval(heartbeat)` — the tick timer must stay armed so the clause re-decides (clearing it would turn a one-tick suppression into a dead detector)");
+  ok(/^\s+return;\s*$/m.test(suppressBlock), "the suppressed path RETURNS — without this `return;` the block only LOGS and the kill executes on the superseded verdict (`#1339 review-6 mutation 2b: 373/0 GREEN without it`)");
+  ok(!suppressBlock.includes("killTreeAndEscalate"), "…and never reaches `killTreeAndEscalate()` — a kill inside the suppression block is the false kill this change exists to stop");
 });
 
 test("getTaskBackstopMs — default tool-stall + 30min; env override; 0 = off", () => {

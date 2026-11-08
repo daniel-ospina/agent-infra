@@ -278,7 +278,13 @@ unconditionally.
   stepped backwards; the live read is taken AFTER the awaited probe, and that is
   the one where a marker ingested in the window is newer than `now`. Reporting
   only the decision's flag would print "valid" beside precisely the clamped live
-  age the flag exists to expose.
+  age the flag exists to expose. Both fields live on the TICK-KILL payload, and
+  that scope is deliberate (`#1339` review-6): it is the only reader taken after
+  an `await`. The completion (hard-cap, exit-cut) and backstop payloads read
+  `.ageMs` alone and capture `now = Date.now()` AT their own read, so a marker
+  timestamp ahead of `now` there can only mean the WALL CLOCK stepped backwards
+  — the case the decision-time flag already covers — while a marker ingested
+  inside the awaited probe is a tick-path condition by construction.
 - **Cut-gap bound (#1070):** the marker-gap cut deadline is a SECOND consumer of
   the same scale function. `effCutGap = getEffectiveCutGapMs(latched, load1)` —
   the derived base (`1.25 ×` tick interval, floor `15_000`) scaled 1x/2x/3x, with

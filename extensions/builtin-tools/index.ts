@@ -3005,9 +3005,9 @@ export interface HeartbeatKillDecision {
   /** #1339 review P2: the DECISION's `readMarkerAge().invalid`, so the kill
    * payload can distinguish a CLAMPED age from a genuinely fresh marker (#1339
    * exists because a negative age made this bug unreadable; a clamp that prints
-   * an indistinguishable `0` would repeat it one layer in). `readMarkerAge`'s
-   * docblock promises the flag is "reported for the caller to log" — this is
-   * that caller. */
+   * an indistinguishable `0` would repeat it one layer in). This is the caller
+   * that reports the flag (see `MarkerAgeReading.invalid` for why the
+   * completion/backstop payloads do not). */
   markerAgeInvalid?: boolean;
 }
 
@@ -3040,7 +3040,16 @@ export interface MarkerAgeReading {
   /** ms since the last parsed marker; `-1` = never (sentinel); `0` when the
    * raw difference was negative (invalid input, clamped). */
   ageMs: number;
-  /** True iff a marker timestamp lay in the future of `now` and was clamped. */
+  /** True iff a marker timestamp lay in the future of `now` and was clamped.
+   *
+   * Reported on the TICK-KILL payload (`decMarkerAgeInvalid=` /
+   * `lastMarkerAgeInvalid=`), which is the one reader taken after an `await`
+   * (`probeNetwork`) and therefore the only place a marker ingested inside that
+   * window can make a live read clamp. The completion/backstop payloads read
+   * `.ageMs` only and take `now` AT the read: a future timestamp there implies a
+   * WALL-CLOCK step backwards, which the decision's own flag already reports
+   * (#1339 review-6, P3 — stated here so the narrower reporting is a decision
+   * on the record, not an omission to re-discover). */
   invalid: boolean;
 }
 
