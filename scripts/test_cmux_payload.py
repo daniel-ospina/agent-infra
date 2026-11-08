@@ -1364,6 +1364,12 @@ def _cadence_home(tmp_path, screen_text, previous_line):
             echo "${FAKE_SESSION_SID:-}" ;;
           *read-screen*) cat "${FAKE_SCREEN_FILE:-/dev/null}" ;;
           *send*)
+            # FAKE_ENTER_REJECTED=1: this pane REFUSES the bare-Enter retry (payload exactly a
+            # bare newline) while accepting the payload send. A refused retry must still be reported
+            # as ATTEMPTED (#3795 review cycle 13, P2) -- the earlier `=no` arm made it read as
+            # never tried. (Backslash-n is doubled so PYTHON does not turn it into a real newline:
+            # the generated script compares against the two literal characters cmux is sent.)
+            case "$args" in *' \\n') [ -z "${FAKE_ENTER_REJECTED:-}" ] || exit 3 ;; esac
             if [ -n "${FAKE_SESSION_FILE:-}" ]; then printf '%s\\n' "$args" >>"$FAKE_SESSION_FILE"; fi
             echo "OK surface:19 workspace:19" ;;
           *) echo "" ;;
@@ -2217,9 +2223,10 @@ def test_cadence_nudge_submits_a_payload_left_in_the_composer_by_a_failed_enter(
 
     The adopted checker's own contract is the opposite action (`send_verified`: "the remedy is to
     submit in that pane, never to re-send"), so the floor now sends the bare terminating Enter the
-    raw-send arm has always used. The receipt says `re-submit-attempted=` — the ACT and its exit
-    status, never a delivery claim — so a retried Enter is distinguishable from one that was never
-    retried, and a reader is not invited to read it as "submitted" (#3795 review cycle 11, P2).
+    raw-send arm has always used. The receipt says `re-submit-attempted=yes rc=<n>` — the ACT and the
+    status the send returned, never a delivery claim — so a retried Enter is distinguishable from one
+    that was never retried, and a reader is not invited to read it as "submitted" (#3795 review
+    cycles 11 and 13, P2).
 
     DISCRIMINATOR: with the fix the fake cmux records a second `send` whose payload is the bare `\n`;
     pre-fix it records none. `delivered=` must stay `NOT-SUBMITTED` — the retried Enter is not proof.
@@ -2236,11 +2243,45 @@ def test_cadence_nudge_submits_a_payload_left_in_the_composer_by_a_failed_enter(
     assert "verdict=SUBMIT_FAILED" in appended, appended
     assert "delivered=NOT-SUBMITTED" in appended, (
         "a retried Enter was upgraded to a delivery claim it cannot support:\n" + appended)
-    assert "re-submit-attempted=yes" in appended, appended
+    assert "re-submit-attempted=yes rc=0" in appended, appended
     sends = sent.read_text(encoding="utf-8").splitlines() if sent.exists() else []
     assert any(line.rstrip().endswith(r" \n") for line in sends), (
         "the payload left in the composer was never submitted, so the next tick duplicates it:\n"
         + "\n".join(sends))
+
+
+def test_cadence_nudge_reports_a_REFUSED_enter_retry_as_an_attempt_with_its_status(tmp_path):
+    """⛔ `re-submit-attempted=no` REPORTED AN ATTEMPT AS AN ABSENCE (#3795 review cycle 13, P2).
+
+    The field used to be split on the retry's exit status (`yes`/`no`), but the retry is INVOKED on
+    every `SUBMIT_FAILED` verdict -- so a refused retry printed `no`, which reads as "not attempted":
+    a verdict on the act, minted from a status, which is the cycle-11 finding one field over. The
+    field now always reports the attempt and the status it returned (`re-submit-attempted=yes rc=<n>`).
+
+    MEASURED pre-fix on this fixture (the fake `cmux` refuses only the bare-`\n` send):
+    `delivered=NOT-SUBMITTED … verdict=SUBMIT_FAILED re-submit-attempted=no` -- for a retry that WAS
+    made. And the arm was mutation-invisible: deleting the whole `else` branch left the suite green.
+
+    DISCRIMINATOR: this arm reds if the status is dropped (`rc=0` hardcoded) or if the reporting is
+    split on the status again; `test_cadence_nudge_submits_a_payload_left_in_the_composer_by_a_failed_enter`
+    keeps the accepted-retry side (`rc=0`).
+    """
+    if not os.access(_FLOOR_PY, os.X_OK):
+        pytest.skip(f"{_FLOOR_PY} is not executable on this runner")
+    seed = _seeded_log(600)
+    home, bindir, screen, state = _cadence_home(
+        tmp_path, "the payload sits in the composer\n", seed)
+    sent = tmp_path / "SENT"
+    r = _run_cadence_nudge(home, bindir, screen, session=sent, stub_verdict="SUBMIT_FAILED",
+                           extra_env={"FAKE_ENTER_REJECTED": "1"})
+    assert r.returncode == 0, r.stdout + r.stderr
+    _n, appended = _new_nudge_lines(state, seed)
+    assert "verdict=SUBMIT_FAILED" in appended, appended
+    assert "delivered=NOT-SUBMITTED" in appended, (
+        "a refused Enter retry was upgraded to a delivery claim:\n" + appended)
+    assert "re-submit-attempted=yes rc=3" in appended, (
+        "a retry that cmux REFUSED was not reported as an attempt, or its status was lost:\n"
+        + appended)
 
 
 def test_cadence_nudge_does_not_re_submit_a_pane_only_verdict(tmp_path):

@@ -1034,9 +1034,9 @@ if [ -z "$_checker_broken" ]; then
     # the adopted checker forbids: `cmux_payload.py`'s `send_verified` docstring says the remedy is to
     # submit in that pane, NEVER to re-send, and the bare `'\n'` here is this file's own "submit what
     # is already typed" shape (the raw-send arm below has used it since before #1187).
-    #   A field is added to `diag=[…]` recording whether a bare-Enter retry was SENT --
-    # `re-submit-attempted=yes|no`, i.e. the ACT and its exit status -- so an operator can tell a
-    # retried Enter from one that was never retried. It is NOT a claim that the Enter landed: that
+    #   A field is added to `diag=[…]` recording the bare-Enter retry and its OUTCOME AS A
+    # MEASUREMENT -- `re-submit-attempted=yes rc=<n>` -- so an operator can tell that the retry was
+    # made, and what the send it made returned. It is NOT a claim that the Enter landed: that
     # inference is exactly what the block below retires. `delivered=` is deliberately NOT upgraded,
     # because nothing proves the retried Enter landed; the verdict stays `NOT-SUBMITTED` and the next
     # tick still retries.
@@ -1055,12 +1055,16 @@ if [ -z "$_checker_broken" ]; then
     # Enter again would submit whatever else a human has since typed into that pane. `PANE_ONLY` keeps
     # the pre-existing duplicate exposure, bounded the same way.
     if [ "$verdict" = "SUBMIT_FAILED" ]; then
-      # The value is the ACT and its status, never a delivery claim (#3795 review cycle 11, P2).
-      if cmux send --workspace "$ORCH_WS" --surface "$ORCH_SURFACE" '\n' >/dev/null 2>&1; then
-        _resubmit=" re-submit-attempted=yes"
-      else
-        _resubmit=" re-submit-attempted=no"
-      fi
+      # ⛔ THE ATTEMPT IS ALWAYS REPORTED, AND THE STATUS IS REPORTED WITH IT (#3795 review cycle 13,
+      # P2). This was `re-submit-attempted=yes|no`, split on this send's exit status -- so a retry that
+      # was INVOKED AND REFUSED printed `no`, i.e. "not attempted", which is a verdict on the act
+      # minted from a status. That is the cycle-11 finding one field over: the call below is made on
+      # EVERY `SUBMIT_FAILED` verdict, so the attempt is a fact this file witnessed, and the only thing
+      # the status can honestly say is what the send returned. A reader triaging `NOT-SUBMITTED` can
+      # then see `rc=0` (refused after the fact, submission still unproven) or a non-zero rc (the
+      # retry itself failed) instead of being steered away from a retry that happened.
+      cmux send --workspace "$ORCH_WS" --surface "$ORCH_SURFACE" '\n' >/dev/null 2>&1
+      _resubmit=" re-submit-attempted=yes rc=$?"
     fi
   fi
   # The checker's stderr is kept: a crashing or refused send must not vanish, or the operator sees
