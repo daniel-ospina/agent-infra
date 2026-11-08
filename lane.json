@@ -1,0 +1,23 @@
+{
+  "_ref": "refs/lanes/cmux.klane-1698-1794175653-p3657937-0bf9f738",
+  "_sha": "f2c8d9412b739a937c3bbd9487d22fcf01c90e28",
+  "artifacts": [],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 7800,
+  "exit_code": null,
+  "heartbeat_at": 1794179569,
+  "host": "cmux",
+  "issue": 1698,
+  "kind": "lane",
+  "lane_id": "cmux.klane-1698-1794175653-p3657937-0bf9f738",
+  "lease_until": 1794187369,
+  "pid": 3657937,
+  "reason": null,
+  "repo": "daniel-ospina/agent-infra",
+  "schema": 1,
+  "started_at": 1794175653,
+  "state": "RUNNING",
+  "tag": "1698",
+  "worktree": "/home/cmux/agent-infra/.worktrees/tm-1698"
+}
