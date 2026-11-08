@@ -267,10 +267,19 @@ each named in the journal as an unclassifiable summary or row
 of the three label words with no parsable total, and a per-file row whose trailing token is neither benign
 (`verdict`, `ok`, `LOCAL (declared)`, `SYMLINK (graded via its target)`) nor a class this pass knows —
 scanned on any **row** of two or more fields and for any **verdict-shaped token** (`[A-Za-z][A-Za-z0-9_.:! ()-]*`),
-because a vocabulary that drifts by a suffix (`drift_v2`, `drift.v2`) or a report that prints two-field
-rows is exactly the class this check exists for. A row is *a path at column 1 with no `PROG: text`
-prefix*: an indented line and a `phase | token` line are prose or wrapper chatter, not rows, and are
-skipped — otherwise a `tee` wrapper's own progress line would refuse a proven match. One
+because a vocabulary that drifts by a suffix (`drift_v2`, `drift.v2`, `drift:2`, `DRIFTED!`) or a report
+that prints two-field rows is exactly the class this check exists for. A row is *a path at column 1 with
+no `PROG: text` prefix*: an indented line, and a line whose first field carries a `PROG: ` prefix (a
+program name — it contains no `/` before the colon, unlike a repo-relative path), are prose or wrapper
+chatter, not rows, and are skipped — otherwise a `tee` wrapper's own progress line would refuse a proven
+match. The skip is a *skip*, not a stop: a real row further down the report is still scanned. Two
+boundaries are declared rather than implied, because the same bytes are read differently either side of
+them: (i) a colon-space inside a field-1 path that carries **no** `/` at all is read as a `PROG: ` prefix
+and skipped; (ii) a **sentence-final** token on a row-shaped line (`phase | done.`) is inside the class
+and is refused — `done.` and `DRIFTED!` are the same bytes, so refusing the first is the price of never
+certifying the second, which is the fail-closed direction. An empty verdict field is an unreadable row,
+not a non-row: a row printed with a trailing separator (`path | a | b |`) splits to zero fields after the
+last divider and is refused instead of dropped. One
 label word in prose is NOT a summary — a healthy copy that mentions a `stale` entry while matching still
 records a proven match. A checker that exits 0 printing **nothing** is refused too — the instrument
 prints a summary on every graded run, so a silent exit produced no evidence and is not a match. One
@@ -520,7 +529,7 @@ checkout can use the documented hatch. The same interaction is recorded for
 
 ## Tests
 
-`scripts/harness-apply-timer.test.sh` — 602 assertions, run by the
+`scripts/harness-apply-timer.test.sh` — 612 assertions, run by the
 `harness-apply-timer` shard of `run-bash-shards.sh`:
 
 | | |

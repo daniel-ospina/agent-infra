@@ -2540,6 +2540,97 @@ assert_contains "$OUT" "--quiet" \
 assert_contains "$(grep '^farm_n=' "$T/t24bv/state/harness-apply.status" 2>/dev/null || true)" "farm_n=not-graded" \
     "T24 control: and farm_n= says no grade was produced"
 
+# ⛔ A PROG PREFIX IS NOT A PATH WITH A COLON-SPACE IN IT (review round 35, measured: `$1 ~ /: /` alone is
+# not a prefix test — field 1 of a REAL row is the PATH, so a drifted file whose path carries a colon-space
+# was SKIPPED as wrapper chatter and the pass certified `farm: ok` / `farm_rows=none` / `farm_n=0` with the
+# name durable nowhere, a fail-open INVENTED by the over-block fix). Mutant that reds these rows: restore
+# `if ($1 ~ /: /) next` without the `&& $1 !~ /\//` narrowing.
+mk_origin t24bw; mk_clone t24bw
+REPO_P="$CLONE"; MODE_P=sync
+mkdir -p "$T/t24bw/home/.pi/agent/scripts"
+cat >"$T/t24bw/colon-path.sh" <<"FARM"
+#!/usr/bin/env bash
+printf 'check-farm-drift: OK — 5/5 sourced file(s) match the source at origin/main (sync).\n' >&2
+printf '%-46s | %-12s | %-12s | %s\n' 'docs/review: notes.md' aaaa11112222 bbbb33334444 drift >&2
+exit 0
+FARM
+chmod +x "$T/t24bw/colon-path.sh"
+OUT="$(HARNESS_APPLY_FARM_CHECKER="$T/t24bw/colon-path.sh" run_pass "$T/t24bw" 2>&1)"; RC=$?
+assert_eq "$RC" "24" "T24 control: a drifted row whose PATH carries a colon-space is refused, not skipped as a PROG prefix"
+assert_contains "$(cat "$T/t24bw/state/harness-apply-farm-rows.txt" 2>/dev/null || true)" "notes.md" \
+    "T24 control: with that path published, so the skip cannot swallow the name"
+
+# ⛔ AND EVERY PUNCTUATION THE CLASS ADDED IS PINNED (review round 35, measured: only `.` had a fixture —
+# `drift:2` and `DRIFTED!` were pinned by NOTHING, so dropping `:` or `!` from the class left the suite
+# green while those tokens again certified `farm: ok` with no artifact). One shape per fixture, because
+# the scan reports the FIRST unclassifiable token and a shared fixture would hide the second.
+mk_origin t24bx; mk_clone t24bx
+REPO_P="$CLONE"; MODE_P=sync
+mkdir -p "$T/t24bx/home/.pi/agent/scripts"
+cat >"$T/t24bx/colon-token.sh" <<"FARM"
+#!/usr/bin/env bash
+printf 'check-farm-drift: OK — 5/5 sourced file(s) match the source at origin/main (sync).\n' >&2
+printf '%-46s | %-12s | %-12s | %s\n' 'handmade.py' aaaa11112222 bbbb33334444 drift:2 >&2
+exit 0
+FARM
+chmod +x "$T/t24bx/colon-token.sh"
+OUT="$(HARNESS_APPLY_FARM_CHECKER="$T/t24bx/colon-token.sh" run_pass "$T/t24bx" 2>&1)"; RC=$?
+assert_eq "$RC" "24" "T24 control: an rc=0 report whose row token carries a COLON (drift:2) is refused (RED 24)"
+assert_contains "$(cat "$T/t24bx/state/harness-apply-farm-rows.txt" 2>/dev/null || true)" "handmade.py" \
+    "T24 control: and its name is published"
+
+mk_origin t24by; mk_clone t24by
+REPO_P="$CLONE"; MODE_P=sync
+mkdir -p "$T/t24by/home/.pi/agent/scripts"
+cat >"$T/t24by/bang-token.sh" <<"FARM"
+#!/usr/bin/env bash
+printf 'check-farm-drift: OK — 5/5 sourced file(s) match the source at origin/main (sync).\n' >&2
+printf '%-46s | %-12s | %-12s | %s\n' 'handmade.py' aaaa11112222 bbbb33334444 'DRIFTED!' >&2
+exit 0
+FARM
+chmod +x "$T/t24by/bang-token.sh"
+OUT="$(HARNESS_APPLY_FARM_CHECKER="$T/t24by/bang-token.sh" run_pass "$T/t24by" 2>&1)"; RC=$?
+assert_eq "$RC" "24" "T24 control: an rc=0 report whose row token ends in a BANG (DRIFTED!) is refused (RED 24)"
+assert_contains "$(cat "$T/t24by/state/harness-apply-farm-rows.txt" 2>/dev/null || true)" "handmade.py" \
+    "T24 control: and its name is published"
+
+# ⛔ AND A SKIP IS A SKIP, NOT A STOP — AND AN EMPTY VERDICT FIELD IS A ROW (review round 35, measured:
+# `next` -> `exit` on either skip left the suite GREEN, and the mutant certifies a drifted row that sits
+# AFTER the skipped line: rc=24 -> rc=0 / `farm: ok` / `farm_rows=none` / `farm_n=0`, no artifact. And a
+# row printed with a trailing separator (`a | b | c |`) splits to `NF=4` with an EMPTY `$NF`, matched no
+# clause, was silently dropped, and certified the same values). Mutants that red these rows: either skip
+# changed to `exit`; and deleting the `v == ""` arm.
+mk_origin t24bz; mk_clone t24bz
+REPO_P="$CLONE"; MODE_P=sync
+mkdir -p "$T/t24bz/home/.pi/agent/scripts"
+cat >"$T/t24bz/skip-then-row.sh" <<"FARM"
+#!/usr/bin/env bash
+printf 'check-farm-drift: OK — 5/5 sourced file(s) match the source at origin/main (sync).\n' >&2
+printf 'harness-apply: checking farm | starting\n' >&2
+printf '%-46s | %-12s | %-12s | %s\n' 'handmade.py' aaaa11112222 bbbb33334444 drift >&2
+exit 0
+FARM
+chmod +x "$T/t24bz/skip-then-row.sh"
+OUT="$(HARNESS_APPLY_FARM_CHECKER="$T/t24bz/skip-then-row.sh" run_pass "$T/t24bz" 2>&1)"; RC=$?
+assert_eq "$RC" "24" "T24 control: a drifted row AFTER a skipped phase line is still refused (the skip is not a stop)"
+assert_contains "$(cat "$T/t24bz/state/harness-apply-farm-rows.txt" 2>/dev/null || true)" "handmade.py" \
+    "T24 control: with that row's name published"
+
+mk_origin t24c1; mk_clone t24c1
+REPO_P="$CLONE"; MODE_P=sync
+mkdir -p "$T/t24c1/home/.pi/agent/scripts"
+cat >"$T/t24c1/trailing-pipe.sh" <<"FARM"
+#!/usr/bin/env bash
+printf 'check-farm-drift: OK — 5/5 sourced file(s) match the source at origin/main (sync).\n' >&2
+printf '%-46s | %-12s | %-12s |\n' 'docs/y.md' aaaa11112222 bbbb33334444 >&2
+exit 0
+FARM
+chmod +x "$T/t24c1/trailing-pipe.sh"
+OUT="$(HARNESS_APPLY_FARM_CHECKER="$T/t24c1/trailing-pipe.sh" run_pass "$T/t24c1" 2>&1)"; RC=$?
+assert_eq "$RC" "24" "T24 control: a row with an EMPTY verdict field (a trailing separator) is refused, not dropped"
+assert_contains "$OUT" "empty verdict field" \
+    "T24 control: and the journal says the verdict field was empty, not that no row was found"
+
 # ⛔ AND THE MIRROR: THE INSTRUMENT'S OWN BENIGN ROW TOKENS MUST NOT TRIP IT (review round 32). A healthy
 # copy prints `ok` rows and a `verdict` header; a farm with a declared local file prints
 # `LOCAL (declared)`, and a symlinked one `SYMLINK (graded via its target)`. Refusing those would block

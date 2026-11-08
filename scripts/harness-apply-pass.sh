@@ -1627,21 +1627,38 @@ if [ "$FARM_CHECK_ON" = "1" ]; then
         # two-field row entirely, and a token with a digit or an underscore (`drift_v2`, `NOT-LANDED2`) fell
         # outside the alphabetic class, so a report this pass could not read still certified a match with
         # every name durable nowhere — the exact class round 32 closed one shape over). Two fields is the
-        # minimum that can carry a verdict token, and the token class admits word characters; a token that
-        # is not even shaped like a verdict (a timing `3.2s`, a timestamp) is left alone so a wrapper's
-        # informational line cannot refuse a proven match.
+        # minimum that can carry a verdict token, and the token class admits word characters. A token that
+        # is not even shaped like a verdict because it does not START with a letter (a timing `3.2s`, a
+        # timestamp `12:04:33`) is left alone. ⛔ WHAT THE CLASS DOES NOT DO, stated rather than implied: once
+        # `.`/`:`/`!` were admitted (they are what a drifted vocabulary looks like — `drift.v2`, `drift:2`,
+        # `DRIFTED!`), a SENTENCE-final token on a row-shaped line (`phase | done.`) is in the class too and
+        # is refused. That is the fail-closed direction and it is not fixable by punctuation: `done.` and
+        # `DRIFTED!` are the same bytes, and refusing the first is the price of not certifying the second.
         # ⛔ AND ONLY A ROW IS A ROW (review round 34, measured: with `NF >= 2` alone, ANY two-field line
         # whose last field was word-shaped refused a PROVEN match — a healthy instrument's output plus a
         # wrapper's `harness-apply: checking farm | starting` phase line went from rc 0 to rc 24 with the
         # remedy blaming the checker's vocabulary, and the operator was sent to fix the one thing that was
         # not broken). A per-file row is a path at COLUMN 1 with no `PROG: text` prefix; a phase or prose
         # line is indented or carries that prefix, and is skipped before the token test.
+        # ⛔ AND THE PREFIX TEST IS NARROWED BY THE `/` (review round 35, measured: `$1 ~ /: /` alone is not
+        # a prefix test at all — field 1 of a REAL row is the PATH, so a drifted file whose path carries a
+        # colon-space (`docs/review: notes.md | a | b | drift`) was SKIPPED as chatter and certified `farm:
+        # ok` / `farm_rows=none` / `farm_n=0` with the name durable nowhere — a fail-open invented by the
+        # over-block fix). A `PROG: text` prefix is a program name, which carries no `/`; a repo-relative
+        # path at column 1 does. Residual, declared rather than implied: a colon-space inside a field-1
+        # path that carries no `/` at all is still read as a prefix, and is skipped.
         [ -n "$FARM_UNC0" ] || FARM_UNC0="$(printf '%s\n' "$FARM_OUT" | awk -F'|' '
             NF >= 2 {
                 if ($1 ~ /^[[:space:]]/) next
-                if ($1 ~ /: /) next
+                if ($1 ~ /: / && $1 !~ /\//) next
                 v = $NF
                 gsub(/^[[:space:]]+|[[:space:]]+$/, "", v)
+                # ⛔ AN EMPTY VERDICT FIELD IS AN UNREADABLE ROW, NOT A NON-ROW (review round 35, measured:
+                # a report row with a trailing separator (`docs/y.md | a | b |`) splits to `NF=4` with
+                # `$NF=""`; the empty token matched no clause, nothing was printed, and the row was
+                # silently dropped while the record certified `farm: ok` / `farm_n=0` with no artifact.)
+                # The instrument never emits a trailing separator, so nothing legitimate is caught here.
+                if (v == "") { print "(an empty verdict field)"; exit }
                 if (v == "verdict" || v == "ok") next
                 if (v == "LOCAL (declared)" || v == "SYMLINK (graded via its target)") next
                 if (v ~ /^(STALE|UNSOURCED|NOT-EXECUTABLE|DECLARED-BUT-ABSENT)$/) next
