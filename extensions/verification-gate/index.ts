@@ -492,7 +492,13 @@ function recoveryOnlyRoot(root: string): string {
 // the artifact AC (b) accepts in lieu of a task-tool contract change. Deduped per
 // (root, siblings) so a git-op-heavy session writes one record, not one per op;
 // reset at session_start (it is a session fact, like the block registry).
-let lastRootMismatch = "";
+// #1265 (review F5): a SET, not a single slot. The stated invariant is "once per
+// session per (root, siblings)", and a single slot only dedupes CONSECUTIVE
+// repeats — the hub/linked-worktree case #3255 exists for ALTERNATES roots (a bare
+// `git push` resolves the hub, `git -C <worktree>` resolves the worktree), so the
+// same pair was re-recorded on every alternation, unbounded. A session with three
+// worktrees (A verified, B and C not) records each of B and C exactly once.
+const recordedRootMismatches = new Set<string>();
 function diagnoseRootMismatch(root: string): void {
   const roots = bridgeRoots();
   const norm = normalizeWorktreeRoot(root);
@@ -519,8 +525,8 @@ function diagnoseRootMismatch(root: string): void {
   // an unrelated PASS and re-fire this record for an unchanged (root, siblings)
   // set. The fingerprint is on a SET, so it must not depend on array order.
   const fingerprint = `${norm}|${[...siblings].sort().join(",")}`;
-  if (fingerprint === lastRootMismatch) return;
-  lastRootMismatch = fingerprint;
+  if (recordedRootMismatches.has(fingerprint)) return;
+  recordedRootMismatches.add(fingerprint);
   appendJsonl({
     event: "gate_root_mismatch",
     extension: "verification-gate",
@@ -4479,7 +4485,7 @@ export default function (pi: ExtensionAPI) {
     lastBlockedCwd = null;
     lastBlockedFiles = [];
     blockedFilesByRoot.clear(); // #1660: block context is session-scoped (the bridge is the durable channel)
-    lastRootMismatch = ""; // #1265: the root-mismatch record is once per session per (root, siblings)
+    recordedRootMismatches.clear(); // #1265: the root-mismatch record is once per session per (root, siblings)
     lastVerifierNote = null;
     pendingRehash = null;
     pendingRehashFiles = [];

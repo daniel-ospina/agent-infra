@@ -5820,8 +5820,17 @@ async function main() {
     git(hub, "commit -m base");
     const wtA = join(hub, ".worktrees", "wt-1265-a");
     const wtB = join(hub, ".worktrees", "wt-1265-b");
+    // A THIRD worktree, also with no entries, so the ops can ALTERNATE roots.
+    // #1265 review F5: a single-slot dedupe only suppresses CONSECUTIVE repeats,
+    // and the hub/linked-worktree case #3255 exists for alternates — without a
+    // third root this row could not tell a Set from a single slot.
+    const wtC = join(hub, ".worktrees", "wt-1265-c");
     git(hub, `worktree add ${wtA} -b feat-1265-a`);
     git(hub, `worktree add ${wtB} -b feat-1265-b`);
+    git(hub, `worktree add ${wtC} -b feat-1265-c`);
+    mkdirSync(join(wtC, "src"), { recursive: true });
+    writeFileSync(join(wtC, "src", "c1265.ts"), "c\n");
+    git(wtC, "add src/c1265.ts");
     mkdirSync(join(wtA, "src"), { recursive: true });
     writeFileSync(join(wtA, "src", "a1265.ts"), "a\n");
     git(wtA, "add src/a1265.ts");
@@ -5833,6 +5842,7 @@ async function main() {
     // The bridge holds REAL, hash-matching entries for worktree A ONLY.
     const realA = realpathSync(wtA);
     const realB = realpathSync(wtB);
+    const realC = realpathSync(wtC);
     const bridgeDir = join(TEST_ROOT, ".pi", "agent", "verification");
     mkdirSync(bridgeDir, { recursive: true });
     writeFileSync(join(bridgeDir, "latest.json"), JSON.stringify({
@@ -5858,6 +5868,12 @@ async function main() {
     const prevCwd = process.cwd();
     let block1: any = undefined;
     let block2: any = undefined;
+    // #1265 review F5: alternate roots INSIDE the session (B -> C -> B), which is the
+    // shape a hub/linked-worktree session actually produces. A single-slot dedupe
+    // re-records B on the second visit; the stated invariant is "once per session per
+    // (root, siblings)", so B and C must each land exactly one record.
+    const opC = { type: "tool_call", toolName: "bash", input: { command: `cd ${realC} && git commit -m c1265`, cwd: realC } };
+    let blockC: any = undefined;
     process.env.PI_MODE = "print";
     process.env.TASK_HEARTBEAT = "1";
     try {
@@ -5866,6 +5882,8 @@ async function main() {
       await fire("session_start", {});
       block1 = await fire("tool_call", opB);
       block2 = await fire("tool_call", opB);
+      blockC = await fire("tool_call", opC);
+      await fire("tool_call", opB);
     } finally {
       console.log = origLog;
       process.chdir(prevCwd);
@@ -5916,9 +5934,12 @@ async function main() {
     // concatenating a second read would count every line twice.
     ok(block2 && block2.block === true, "1265a: the retry is still blocked (no verification happened)");
     const mismatch = audit.filter((l) => l.event === "gate_root_mismatch" && String(l.root ?? "") === realB);
-    equal(mismatch.length, 1, "1265a: the mismatch must be recorded exactly ONCE per session per (root, siblings) — not once per git op");
+    equal(mismatch.length, 1, "1265a: the mismatch must be recorded exactly ONCE per session per (root, siblings) — not once per git op, and not again after the root alternates away and back");
     equal(JSON.stringify(mismatch[0].verified_roots), JSON.stringify([realA]),
       "1265a: the record must name the sibling roots whose entries cannot be compared");
+    ok(blockC && blockC.block === true, "1265a: C's commit is blocked too (its own registry is empty)");
+    equal(audit.filter((l) => l.event === "gate_root_mismatch" && String(l.root ?? "") === realC).length, 1,
+      "1265a: the OTHER root records its mismatch once too — the dedupe is per (root, siblings), not a single global slot that the alternation resets");
 
     // AC (c): a worktree that had no entries becomes usable after ITS OWN PASS —
     // and only after it. No temp-path/sibling root is ever substituted.
