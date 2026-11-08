@@ -1938,15 +1938,41 @@ if [ -s "$T/refreshblock.sh" ] && grep -q 'refresh-candidates.sh' "$T/refreshblo
   n8="$(wc -c < "$BLR5/invoked" | tr -d ' ')"
   [ "$n8" = "1" ] && ok "orch-loop: rc=78 (a config refusal) is NOT retried in-cycle" \
                   || bad "orch-loop: rc=78 was retried $n8 times in one cycle — a config error looped"
-  # (b6) THE KNOBS ARE VALIDATED, not trusted. These feed `[ -ge ]` and `$(( ))`: an unvalidated
-  # `abc` makes the comparison an ERROR (read as false) and the cap silently misses — the one failure
-  # this block exists to prevent. A junk value must fall back to the shipped default, not to no cap.
+  # (b6) THE KNOBS ARE VALIDATED, not trusted — and the arm must be able to attribute its red to the
+  # guard it names (review round 2, F3). The first version drove `abc` against THREE redundant resets,
+  # so deleting the `case` screen left this arm GREEN (the length test and the `[ -ge ]` fallback each
+  # restored the default). Each knob now has exactly ONE rejecting guard, so `abc` measures THAT guard:
+  # remove it and `abc` survives to `[ "$_att" -ge "abc" ]`, which errors (read as false), the cap never
+  # fires, and the invoke count is no longer 3.
   BLR6="$T/retry6"; mkdir -p "$BLR6"; : > "$BLR6/candidates.txt"
   printf '#!/bin/bash\nprintf "x" >> "%s/invoked"\nrefresh_record_write() { :; }\nexit 1\n' "$BLR6" > "$BLR6/refresh-candidates.sh"
-  O="$BLR6" LOG="$BLR6/log" REFRESH_RETRY_BACKOFF_S=0 REFRESH_RETRY_MAX_ATTEMPTS=abc bash "$T/refreshblock.sh" >/dev/null 2>&1
+  O="$BLR6" LOG="$BLR6/log" REFRESH_RETRY_BACKOFF_S=0 REFRESH_RETRY_MAX_ATTEMPTS=abc \
+    REFRESH_RETRY_BUDGET_S=1 bash "$T/refreshblock.sh" >/dev/null 2>&1
   n9="$(wc -c < "$BLR6/invoked" | tr -d ' ')"
   [ "$n9" = "3" ] && ok "orch-loop: a junk REFRESH_RETRY_MAX_ATTEMPTS falls back to the default (3), not to no cap" \
                    || bad "orch-loop: REFRESH_RETRY_MAX_ATTEMPTS=abc gave $n9 attempt(s), expected the default 3"
+  # ...and the same guard is what rejects an OUT-OF-RANGE value, so the ceiling is real too.
+  BLR8="$T/retry8"; mkdir -p "$BLR8"; : > "$BLR8/candidates.txt"
+  printf '#!/bin/bash\nprintf "x" >> "%s/invoked"\nrefresh_record_write() { :; }\nexit 1\n' "$BLR8" > "$BLR8/refresh-candidates.sh"
+  O="$BLR8" LOG="$BLR8/log" REFRESH_RETRY_BACKOFF_S=0 REFRESH_RETRY_MAX_ATTEMPTS=99 \
+    bash "$T/refreshblock.sh" >/dev/null 2>&1
+  n99="$(wc -c < "$BLR8/invoked" | tr -d ' ')"
+  [ "$n99" = "3" ] && ok "orch-loop: an OVER-RANGE attempt cap is rejected by the same guard (99 -> default 3)" \
+                    || bad "orch-loop: REFRESH_RETRY_MAX_ATTEMPTS=99 gave $n99 attempt(s), expected the default 3"
+  # (b8) THE BUDGET IS WALL CLOCK, NOT THE SUM OF THE SLEEPS (review round 2, F1). The stub SLEEPS 2 s
+  # per pass and the backoff is 0, so a sleeps-only accumulator sees 0 + 0 <= 1 and retries, while a
+  # wall-clock deadline sees 2 s spent and refuses. That is the difference the finding is about: the
+  # pass's own runtime is what can walk it past the stale-lock guard, not the backoff.
+  BLR9="$T/retry9"; mkdir -p "$BLR9"; : > "$BLR9/candidates.txt"
+  printf '#!/bin/bash\nsleep 2\nprintf "x" >> "%s/invoked"\nrefresh_record_write() { :; }\nexit 1\n' "$BLR9" > "$BLR9/refresh-candidates.sh"
+  O="$BLR9" LOG="$BLR9/log" REFRESH_RETRY_BACKOFF_S=0 REFRESH_RETRY_BUDGET_S=1 \
+    bash "$T/refreshblock.sh" >/dev/null 2>&1
+  n9b="$(wc -c < "$BLR9/invoked" | tr -d ' ')"
+  [ "$n9b" = "1" ] && ok "orch-loop: the retry budget counts PASS RUNTIME, not just the sleeps (wall clock)" \
+                    || bad "orch-loop: a 2 s pass was retried against a 1 s budget ($n9b attempts) — the budget is summing sleeps only"
+  grep -q 'NOT retrying again: the 1s in-cycle retry budget is spent (2s of wall clock already spent on the attempts so far' "$BLR9/log" 2>/dev/null \
+    && ok "orch-loop: the budget refusal REPORTS the wall clock it measured, so a reader can audit the bound" \
+    || bad "orch-loop: the budget refusal does not report elapsed pass time — $(grep 'budget is spent' "$BLR9/log" 2>/dev/null | head -1)"
   # (b7) THE PER-DELAY CAP IS GRADED, not assumed. The backoff is set far ABOVE
   # `REFRESH_RETRY_MAX_DELAY_S`, so a passing arm proves the clamp ran and the LOGGED delay is the cap
   # (a delay that was merely short would pass a weaker assertion). The budget is raised out of the way
