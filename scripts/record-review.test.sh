@@ -5614,10 +5614,10 @@ STUB_PATCH_FAIL=1 STUB_BODY="PR body — no review evidence yet" STUB_COMMENTS_F
     run_record_633 "$PATCH_CMT_FAIL_PR" "$SHA" "$DC_CRUNS"
 assert_eq "$RECORD_RC" "5" \
     "14.1d(j3) a refused PATCH with a refused durable comment is still a NAMED failure (rc 5) [err: $(printf '%s' "$RECORD_ERR" | tr '\n' ' ')]"
-assert_contains "$RECORD_ERR" "NO SUCH LINE AT ALL means a write landed" \
-    "14.1d(j3) …and its pending-file paragraph says the ABSENCE of a persist warning IS dispositive — the bytes are on disk (capture live)"
+assert_contains "$RECORD_ERR" "Only NEITHER line appearing is dispositive" \
+    "14.1d(j3) …and its pending-file paragraph says the ABSENCE of a persist warning IS dispositive — the PRE-PATCH write landed and the bytes are on disk (capture live)"
 assert_not_contains "$RECORD_ERR" "tells you the file's contents" \
-    "14.1d(j3) …instead of telling an operator whose writes both landed that the file's contents cannot be known"
+    "14.1d(j3) …instead of telling an operator whose PRE-PATCH write landed that the file's contents cannot be known"
 rm -f "$PEND_CONF_DIR/pending"
 mkdir -p "$PEND_CONF_DIR/pending"   # restore the real directory for later vectors
 
