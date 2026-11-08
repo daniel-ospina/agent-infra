@@ -5521,8 +5521,10 @@ assert_contains "$RECORD_ERR" "could NOT persist the pending marker" \
     "14.1d(i) …the failed persist is reported (positive-first: the capture is live)"
 assert_not_contains "$RECORD_ERR" "The marker is also kept in" \
     "14.1d(i) …and the exit-0 message does NOT claim the marker is on disk — the 'NOT ON DISK' branch fires instead"
-assert_contains "$RECORD_ERR" "THIS RUN'S WRITE DID NOT LAND AND THIS RUN'S BODY COPY IS ON NO CHANNEL" \
+assert_contains "$RECORD_ERR" "THIS RUN PLACED NO BODY COPY ON ANY CHANNEL" \
     "14.1d(i) …naming the real, ATTEMPT-scoped state (this run's write did not land) instead of claiming the file is empty or that a flush would find nothing — both of which the deterministic marker falsifies"
+assert_not_contains "$RECORD_ERR" "THIS RUN'S BODY COPY IS ON NO CHANNEL" \
+    "14.1d(i) …and does NOT claim the body is empty: the body READ is exactly what failed, so its present contents are unobservable here"
 # ⛔ THE ROUND-9 INVARIANT ON THE EXIT-0 CAPTURE TOO (#3712 review round 10, P2).
 # The two negatives below already existed, but both read the rc-5 capture ($PERSIST_PR2);
 # the rc-0 arm's own line carried round 3's falsified denial until round 10 ("would find NOTHING for the
@@ -5560,6 +5562,8 @@ assert_contains "$RECORD_ERR" "is NOT thereby this run's evidence" \
     "14.1d(i) …and the exit-5 remedy scopes a flushed line to the marker's ANATOMY, not to this run — a delivered line naming the sha alone is not evidence, so the operator must read the WHOLE line. A DIFFERENT predicate from the row above on purpose: two assert_contains rows sharing one literal AND one capture can only ever redden in lockstep, so the second would add no discriminating power (#3712 review, finding 2)"
 assert_contains "$RECORD_ERR" "TRY --flush-pending" \
     "14.1d(i) …and still OFFERS the flush: an earlier run at the same head leaves byte-identical bytes, so denying it withdraws a remedy that works (round 9)"
+assert_contains "$RECORD_ERR" "findings/note, the diff and a signature" \
+    "14.1d(i) …and the identity test it hands the operator enumerates the SAME inputs as its exit-0 sibling, findings=/note= included — a not-clean marker splices both in, so a test naming only verdict+diff+sig admits a DIFFERENT run's open-findings record (#3712 review round 4)"
 assert_not_contains "$RECORD_ERR" "would find NOTHING" \
     "14.1d(i) …while never PREDICTING the flush's output, which depends on a file this run never read"
 assert_not_contains "$RECORD_ERR" "neither delivers these bytes" \
