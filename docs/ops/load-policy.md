@@ -205,6 +205,34 @@ unconditionally.
   self-reported sample, not a live reading. All four `Alive state:` diagnostics
   expose the raw pair, `effStreamAgeMs=` / `effToolAgeMs=`, and
   `everSawRealActivity=` for triage.
+- **The verdict may not outrun its own evidence (#1339).** The decision is a
+  pure function of a SNAPSHOT, but the kill path is not: the #318 network probe
+  is awaited between the decision and `killTreeAndEscalate()` (default ON,
+  timeout up to 9 s), and every `await` yields the event loop, which is exactly
+  where the child's `data` handlers run. So the kill path re-validates before
+  killing — if a marker OR a real output byte landed AFTER the snapshot, the
+  verdict is superseded and the kill is suppressed for one tick (logged once per
+  dispatch as `[task] <reason> kill suppressed — the child produced evidence
+  AFTER the decision snapshot`). `max-dispatch` is exempt (a wall-clock policy
+  cap, not an inference about progress). This can only DELAY a kill: a genuinely
+  wedged child emits nothing, both channels stay behind the snapshot, and the
+  next 10 s tick kills on unchanged evidence. Measured at this fix's head: a cut
+  reported `no life signs for -1s (marker gap exceeded 113s)` with
+  `lastMarkerAgeMs=-532` under `load1=190.62` — the child was ticking while the
+  kill ran.
+- **A marker age is never negative (#1339).** `readMarkerAge()` is the single
+  reader for it (decision, all four kill payloads, every headline). `-1` is the
+  "no marker was ever parsed" SENTINEL, never an age; a marker timestamp in the
+  FUTURE of the reader's clock is INVALID INPUT — it is clamped to 0 and flagged,
+  never compared against a threshold and never printed as a negative age (that is
+  how `no life signs for -2s` / `-1s` reached operators). Clamping here is not a
+  bound being clamped: #1070's "warn, never clamp" rule protects an operator's
+  bound, and this clamps a MEASUREMENT that has no valid value, toward "no
+  evidence of silence" (the fail-safe direction). The kill payload carries the
+  DECISION's own age as `decMarkerAgeMs=` beside the live `lastMarkerAgeMs=` —
+  the same decision-vs-live split #5389 established for the CPU pair, because a
+  marker can land in the awaited window and make a live-only read contradict the
+  headline it ships beside.
 - **Cut-gap bound (#1070):** the marker-gap cut deadline is a SECOND consumer of
   the same scale function. `effCutGap = getEffectiveCutGapMs(latched, load1)` —
   the derived base (`1.25 ×` tick interval, floor `15_000`) scaled 1x/2x/3x, with
