@@ -493,7 +493,8 @@ if grep -q '_seal_pat' "$GATE" && grep -q 'sealed12' "$GATE"; then ok "…and th
 # carries exactly one stamp, so a second is a self-contradicting artifact, not a tie to break by position.
 _INJ="**Base:** \`main\` → **head at write:** \`$(printf '%s' "$WT_HEAD" | cut -c1-12)\`"
 # TWO HEADER STAMPS: a newline in the lane-writable `state["worktree"]` value renders an injected stamp
-# line ABOVE the real one — the round-10/11 spelling, and the only duplicate a state value can produce.
+# line ABOVE the real one — the round-10/11 spelling. (A state value can ALSO inject a `## ` heading that
+# truncates the header before the real stamp; that spelling is refused by the truncated-header row below.)
 printf -- '- **Worktree:** `x\n- %s`\n- **Base:** `main` → **head at write:** `%s`\n## Files changed\n## Suites run\n## Could not do\n' "$_INJ" "$_SEALED_A" > "$WT/WORKTREE-REPORT.md"
 printf '{"version":1,"head_at_write":"%s","branch":"feat/2977-tm","suites":[{"n":1,"command":"x","exit":0,"finished_at":"2099-01-01T00:00:00Z"}]}\n' "$WT_HEAD" > "$WT/.worktree-report/state.json"
 drive 2 "INVALID: a report carrying TWO head-at-write stamps (a 'note --not-done' line reproducing the shape) is refused" STUB_OK=1 STUB_RC=0 STUB_STALE=0
@@ -514,6 +515,21 @@ printf -- '- **Base:** `x\nyyyy`\n## Files changed\n## Suites run\n## Could not 
 printf '{"version":1,"head_at_write":"%s","branch":"feat/2977-tm","suites":[{"n":1,"command":"x","exit":0,"finished_at":"2099-01-01T00:00:00Z"}]}\n' "$WT_HEAD" > "$WT/.worktree-report/state.json"
 drive 2 "INVALID: a header Base line split by a lane-writable value is refused, not read as an absent stamp" STUB_OK=1 STUB_RC=0 STUB_STALE=0
 case "$LAST_OUT" in *reason=report-header-base-line-was-split-or-malformed*) ok "…and it names the split header line" ;; *) bad "split-header reason: $LAST_OUT" ;; esac
+# ⛔ A HEADING INJECTED ABOVE THE STAMP IS THE SAME ATTACK ONE FIELD OVER (round-14 review, HIGH). The writer
+# renders `state["issue"]`/`["worktree"]`/`["branch"]` VERBATIM above the Base line, so a newline plus `## `
+# ends the header BEFORE the stamp: zero stamps, nothing to compare, and the cross-check — guarded on a
+# non-empty stamp — is skipped while the tool re-seals its own digest. Measured with the real writer: one
+# extra JSON field turned a forged `head_at_write` from rc=4 STALE into rc=0 PASS.
+printf -- '- **Worktree:** `x\n## Injected heading\n- **Base:** `main` → **head at write:** `%s`\n## Files changed\n## Suites run\n## Could not do\n' "$(printf '%s' "$WT_HEAD" | cut -c1-12)" > "$WT/WORKTREE-REPORT.md"
+printf '{"version":1,"head_at_write":"%s","branch":"feat/2977-tm","suites":[{"n":1,"command":"x","exit":0,"finished_at":"2099-01-01T00:00:00Z"}]}\n' "$WT_HEAD" > "$WT/.worktree-report/state.json"
+drive 2 "INVALID: a \`## \` heading injected above the stamp (header truncated before the Base line) is refused" STUB_OK=1 STUB_RC=0 STUB_STALE=0
+case "$LAST_OUT" in *reason=report-header-base-line-was-split-or-malformed*) ok "…and it names the header as split/truncated rather than reading the stamp as absent" ;; *) bad "truncated-header reason: $LAST_OUT" ;; esac
+case "$LAST_OUT" in *VERDICT=PASS*) bad "a truncated header let a forged state PASS (no stamp was found, so nothing was compared)" ;; *) ok "…and the missing stamp is not read as an older writer" ;; esac
+# CONTROL: the same report WITHOUT the injected heading keeps the stamp in the header and its state agrees,
+# so the row above is not a blanket refusal of every report with a body line.
+printf -- '- **Worktree:** `x`\n- **Base:** `main` → **head at write:** `%s`\n## Files changed\n## Suites run\n## Could not do\n' "$(printf '%s' "$WT_HEAD" | cut -c1-12)" > "$WT/WORKTREE-REPORT.md"
+drive 0 "CONTROL: the same header with no injected heading PASSES (the truncated-header arm does not over-block)" STUB_OK=1 STUB_RC=0 STUB_STALE=0
+_restore_state
 # ⛔ NO RECORDED OUTPUT AT ALL IS NOT EVIDENCE (round-13 review, MED): `init; run --cmd true; write` records
 # exit 0, no counts and a 0-byte log, and the consumer calls it VALID — the owner ruling says the verifier
 # must refuse a report that "claims tests without output", so this is the only refusal point.

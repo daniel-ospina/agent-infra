@@ -701,8 +701,10 @@ except Exception:
     _rlines = []
 _seal_pat = re.compile(r"^- \*\*Base:\*\* .*head at write:\*\* `([0-9a-f]{12})`.*$")
 _hdr = []
-for _rl in _rlines:
+_first_heading = -1
+for _i, _rl in enumerate(_rlines):
     if _rl.startswith("## "):
+        _first_heading = _i
         break
     _hdr.append(_rl)
 for _rl in _hdr:
@@ -711,6 +713,21 @@ for _rl in _hdr:
         _sealed_n += 1
         _sealed12 = _sm.group(1)
     elif _rl.startswith("- **Base:**"):
+        _seal_split = 1
+# ⛔ A HEADER TRUNCATED BEFORE THE BASE LINE IS THE SAME ATTACK AS A SPLIT BASE LINE (round-14 review, HIGH).
+# The writer renders `state["issue"]`, `state["worktree"]` and `state["branch"]` VERBATIM on their own header
+# lines ABOVE the Base line, so a newline plus `## ` inside ANY of them makes the FIRST heading land before
+# the stamp: the header stops early, `_sealed_n` is 0, `_seal_split` never sees a Base line at all, and the
+# cross-check — guarded on a non-empty stamp — is skipped while the tool re-seals its own digest. Measured
+# with the real writer: one extra JSON field and a `write` turned a forged `head_at_write` from rc=4 STALE
+# into rc=0 PASS, i.e. exactly the class the split-Base rule above closes, one field over.
+# The invariant that covers all three fields at once: THIS REPORT FORMAT HAS ITS Base LINE IN THE HEADER.
+# A document that carries a Base line at all, but whose first `## ` heading precedes it, has had its header
+# cut short by a lane-writable value. A report with NO Base line anywhere is an older writer (the arm keeps
+# abstaining, as it does for an absent stamp). A Base-shaped line in a suite log tail is BELOW the heading
+# and does not move the real one, so the honest flow is untouched.
+if _first_heading >= 0 and not any(_rl.startswith("- **Base:**") for _rl in _hdr):
+    if any(_rl.startswith("- **Base:**") for _rl in _rlines[_first_heading:]):
         _seal_split = 1
 # ⛔ NO RECORDED OUTPUT AT ALL IS NOT EVIDENCE (round-13 review, MED). The owner ruling this gate implements
 # refuses a report that "claims tests without output", and `run --cmd true` records a suite with exit 0, no
