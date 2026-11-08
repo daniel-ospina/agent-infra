@@ -575,7 +575,13 @@ assert_eq "$GATED_TEMPLATES1" "4" "the {{TORTOISE_REPO}}-gated inventory is acco
 # first is a claim, not a comment. The negative arms are the safe shape: they red only if the bug returns.
 _PRD_TPL="$(cat "$REPO_TEMPLATES/com.tortoise.pr-doctor.plist")"
 assert_contains "$_PRD_TPL" "each repo ALSO gets" "pr-doctor template: per-repo pairs are ADDITIONAL, not a replacement"
-assert_contains "$(tr 'A-Z' 'a-z' <<<"$_PRD_TPL")" "aggregate" "pr-doctor template: still states the SET aggregate lands on the canonical pair"
+# ⛔ NOT `grep -qi aggregate`: that needle is satisfied by the paragraph's own narration of the earlier
+# FALSE versions ("silent on the AGGREGATE", "the set's aggregate lands back on the canonical names"),
+# so deleting the operator-facing statement — or replacing it with round 44's inversion — left this arm
+# GREEN (measured, round 45: PASS=439 FAIL=0 with the fact gone). Pin the FACT's own wording, which
+# occurs once, and the rc semantics separately.
+assert_contains "$(tr 'A-Z' 'a-z' <<<"$_PRD_TPL")" "written with the set's aggregate verdict" "pr-doctor template: still states the SET aggregate lands on the canonical pair"
+assert_contains "$_PRD_TPL" '`rc` = the worst of the set' "pr-doctor template: still states the aggregate rc is the WORST of the set"
 assert_contains "$_PRD_TPL" "_fleet_pr_doctor_bound" "pr-doctor template: still names a reader that opens the canonical status file by name"
 assert_contains "$_PRD_TPL" "pr_doctor_last_run" "pr-doctor template: still names the beat's reader of the same canonical record"
 assert_not_contains "$_PRD_TPL" "NOT written at all" "pr-doctor template: does NOT claim the canonical pair is never written (round 44's inversion)"
@@ -584,8 +590,10 @@ assert_not_contains "$_PRD_TPL" "the log and the verdict MOVE to" "pr-doctor tem
 # said "THREE readers open those canonical **files** BY NAME", which is half false: all three open
 # `pr-doctor.status.json` (heartbeat-loop.sh:851, objective.py's `pr_doctor_last_run` at :3264,
 # lib/fleet-inventory.sh's `_fleet_pr_doctor_bound` at :953) and NOTHING LIVE READS `pr-doctor.log` —
-# `scripts/` holds one appender (heartbeat-loop.sh:800), two places that print its path (:902/:906), and
-# prose. An operator reading "those canonical files" is promised a log consumer that does not exist,
+# it has TWO writers — `pr-doctor.py`'s own `log()` (open(_log_path(), "a")) and the heartbeat launcher
+# appending a child's stdout (heartbeat-loop.sh:800) — and nothing reads it; the other references only
+# print its path (:902/:906) or are prose. An operator reading "those canonical files" is promised a log
+# consumer that does not exist,
 # which is the same wrong-place-to-look failure the paragraph exists to prevent, inverted. Both halves
 # are pinned: the correction itself (negative, so a re-inversion reds) and the log fact (positive).
 assert_not_contains "$_PRD_TPL" "canonical files BY NAME" "pr-doctor template: does NOT claim three readers open the canonical PAIR (round 45's overstatement)"
