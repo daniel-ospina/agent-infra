@@ -20,16 +20,29 @@
 // index.ts through module-load-hooks.mjs and drives the tool_call handler
 // against hermetic git fixtures, so it exercises the whole M2 path (classifier
 // hints → resolveRepoFromInv → session-cwd fallback → decideM2), not just the
-// probe. Every `F*` assertion below is RED before the fix; every `N*` ("no
-// loosening") assertion is the paired guard that must stay BLOCKED after it —
-// the fix must not turn an unreadable repo into a readable one, nor an
-// off-baseline commit into an allowed one.
+// probe. The PINS are `F0`, `F3` and `N3`×2 — measured RED with origin/main's
+// branch-ownership.mjs swapped back in (`18 passed, 4 failed` at this head); the
+// 12 unit rows in extensions/shared/test-branch-ownership.mjs are the other half.
+// `F1`/`F2` are BOTH-WAYS CONTROLS, not pins: they are green pre- AND post-fix (a
+// worktree session's own fallback already resolved, so they never exercised the
+// defect).
+// Every `N*` ("no loosening") assertion is the paired guard that must stay
+// BLOCKED after the fix — the fix must not turn an unreadable repo into a
+// readable one, nor an off-baseline commit into an allowed one.
+//
+// ⛔ The suite ISOLATES `$HOME` and `PI_SESSION_ID` (see SETUP below). The guard
+// reads the escape marker from `homedir()/.pi/agent/.allow-main-edits` and the
+// whole M2/M3 block returns early while a marker matching THIS session id is
+// active — so an inherited marker turns N2/N3 into three FALSE reds (measured
+// before the isolation: `18 passed, 3 failed`). A gate artifact that reds for
+// ambient reasons is how a real regression gets waved through as "the usual
+// flake".
 //
 // Zero-dep (`node:*` + the `git` binary), no `npm ci`.
 // Run: node extensions/main-worktree-guard/test-unborn-head.mjs
 import { execSync } from "node:child_process";
-import { mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { register, registerHooks, stripTypeScriptTypes } from "node:module";
@@ -85,7 +98,35 @@ async function main() {
   const savedHatch = new Map(HATCH_VARS.map((v) => [v, process.env[v]]));
   const savedAip = process.env.AGENT_INFRA_PATH;
   const savedLocks = process.env.AGENT_LOCKS_DIR;
+  const savedHome = process.env.HOME;
+  const savedSessionId = process.env.PI_SESSION_ID;
   const tmp = realpathSync(mkdtempSync(join(tmpdir(), "guard-2218-")));
+  // ── SETUP: ISOLATE HOME + the session id (review round 2, P1) ────────────
+  // THE MARKER IS A PARTIAL HATCH: `index.ts:5418-5420` returns `undefined` for
+  // the whole bash branch-ownership block while `readAllowMarkerState(
+  // _markerPath(), _currentSessionId(_ctx))` is true — `_markerPath()` is
+  // `homedir()/.pi/agent/.allow-main-edits` (`:504-505`, derived per call) and
+  // `_currentSessionId()` is `process.env.PI_SESSION_ID` (`:511-512`). A lane
+  // that minted the 15-minute hatch (exactly the population #2218 is about) is
+  // therefore in a state where N2 and N3 go red against a CORRECT fix: measured
+  // on the PRE-isolation file at this head, no source edit at all, marker matching
+  // the inherited id → `18 passed, 3 failed`. M4 runs BEFORE the marker bypass so
+  // N1/X1 survive it; the N3 worktree session is exempt from M4, so M2 is the only
+  // arm holding it.
+  // Repointing HOME (as test-discard-gate.mjs does) AND dropping the inherited
+  // session id breaks the pair; the operator's marker file is never touched —
+  // this suite only ever reads the marker. `homedir()` reads HOME per call, which
+  // is what `_markerPath()` relies on.
+  const home = join(tmp, "home");
+  mkdirSync(join(home, ".pi", "agent"), { recursive: true });
+  process.env.HOME = home;
+  delete process.env.PI_SESSION_ID;
+  const markerPath = join(homedir(), ".pi", "agent", ".allow-main-edits");
+  // Pins the isolation itself, so a future edit that drops it reds here instead
+  // of silently re-introducing the ambient false reds.
+  expectTrue("I1: the escape marker the guard will read lives in the fixture, not the operator's HOME",
+    markerPath === join(home, ".pi", "agent", ".allow-main-edits") && markerPath.startsWith(tmp),
+    markerPath);
   const prevCwd = process.cwd();
   const hub = join(tmp, "hub");
   const wt = join(tmp, "wt-session");
@@ -142,9 +183,12 @@ async function main() {
       f0 === undefined, `handler returned ${JSON.stringify(f0)}`);
 
     // ── F1: worktree session (NO baseline) commits in the zero-commit repo ──
-    // The reported symptom, in its exact shape. Pre-fix the probe nulled, M2's
-    // session-cwd fallback nulled with it, and the lane got "could not verify
-    // repo ownership (git read failed; fail-closed, #265)".
+    // A BOTH-WAYS CONTROL, not a pin: measured GREEN with origin/main's module
+    // swapped back in, for both spellings below. Pre-fix the probe nulled here
+    // too, but the worktree session's fallback still resolved and the ordinary
+    // worktree allow held — so this shape never reached the #265 refusal. Kept as
+    // the control proving the fresh-repo case creates no NEW refusal on a path
+    // that was already open, and does not regress post-fix.
     process.chdir(wt);
     const f1 = [];
     await quiet(async () => {
@@ -159,8 +203,9 @@ async function main() {
     }
 
     // ── F2: hub-rooted session (baseline recorded) commits in scratch ───────
-    // Same defect through the OTHER session geometry; the scratch repo is not
-    // the session's own repo, so the ordinary different-repo allow must hold.
+    // The other BOTH-WAYS CONTROL (green pre-fix too): the scratch repo is not
+    // the session's own repo, so the ordinary different-repo allow already held.
+    // It must keep holding — the fix may not turn it into a refusal.
     execSync("git checkout -q main", { cwd: hub, stdio: "ignore" });
     process.chdir(hub);
     await quiet(() => sessionStart({}, undefined));
@@ -287,11 +332,24 @@ async function main() {
     process.chdir(prevCwd);
     if (savedAip === undefined) delete process.env.AGENT_INFRA_PATH; else process.env.AGENT_INFRA_PATH = savedAip;
     if (savedLocks === undefined) delete process.env.AGENT_LOCKS_DIR; else process.env.AGENT_LOCKS_DIR = savedLocks;
+    if (savedHome === undefined) delete process.env.HOME; else process.env.HOME = savedHome;
+    if (savedSessionId === undefined) delete process.env.PI_SESSION_ID; else process.env.PI_SESSION_ID = savedSessionId;
     for (const [v, val] of savedHatch) { if (val === undefined) delete process.env[v]; else process.env[v] = val; }
     try { rmSync(tmp, { recursive: true, force: true }); } catch { /* best-effort */ }
   }
 }
 
 await main();
-console.log(`\n${fail === 0 ? "✅" : "❌"} test-unborn-head: ${pass} passed, ${fail} failed, ${skip} skipped`);
-process.exit(fail === 0 ? 0 : 1);
+// A WHOLE-SUITE skip is not a pass (review round 1, item 2). This branch is the
+// only whole-file skip and it asserts NOTHING, so exiting 0 there reports a green
+// step over zero assertions — the false-PASS shape a CI gate must not produce.
+// Reachability, measured: a Node WITHOUT the `stripTypeScriptTypes` export at all
+// fails at module LINK time (SyntaxError, exit 1 — already fail-closed), so this
+// branch is only reachable when the export exists but is not callable; simulated
+// by aliasing `node:module` to a shim exporting it as undefined → PRE-FIX `✅ 0
+// passed, 0 failed, 1 skipped` exit 0 (green over nothing), POST-FIX `❌ …` exit 1.
+// Partial skips elsewhere in this directory are unaffected (they still assert).
+const vacuous = skip > 0 && pass === 0;
+console.log(`\n${fail === 0 && !vacuous ? "✅" : "❌"} test-unborn-head: ${pass} passed, ${fail} failed, ${skip} skipped`);
+if (vacuous) console.log("❌ the whole suite was SKIPPED — zero assertions ran, so this is not a pass");
+process.exit(fail === 0 && !vacuous ? 0 : 1);
