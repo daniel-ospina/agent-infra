@@ -1611,7 +1611,7 @@ mkdir -p "$T/t24w/home/.pi/agent/scripts" "$T/t24w/state/harness-apply-farm-rows
 OUT="$(HARNESS_APPLY_FARM_CHECKER="$T/t24v/stub-other-vocab.sh" run_pass "$T/t24w" 2>&1)"; RC=$?
 assert_eq "$RC" "24" "T24 control: a zero-extraction drift with an unwritable artifact is still RED (24)"
 REC24W="$(cat "$T/t24w/state/harness-apply.status" 2>/dev/null || true)"
-assert_contains "$(grep '^detail=' <<<"$REC24W")" "its RAW output could not be persisted" \
+assert_contains "$(grep '^detail=' <<<"$REC24W")" "the instrument's RAW output could not be persisted" \
     "T24 control: and detail= says the RAW output could NOT be persisted, never that a file holds it"
 assert_contains "$OUT" "the RAW output could not be persisted" \
     "T24 control: with the journal saying the same"
@@ -1640,6 +1640,56 @@ assert_eq "$RC" "24" "T24 control: a relative checker under an inherited CDPATH 
 assert_contains "$OUT" "lives INSIDE the farm" \
     "T24 control: and it is the CONTAINMENT refusal, so the resolved path really landed inside the farm"
 assert_absent "$OUT" "farm: ok" "T24 control: and the farm did not grade itself ok through its own checker"
+
+# ⛔ A PARTIAL EXTRACTION MUST NOT CERTIFY COMPLETENESS (review round 10, reproduced). A farmed checker
+# whose verdict vocabulary this pass only partly knows yields a RED grade with SOME extracted rows —
+# and before this case existed the record said `farm_n=1` beside "1 row(s), every one named in
+# <file>" while the instrument reported 2 and the second file was named NOWHERE. The instrument's own
+# summary line is the check on the extraction: a partial set cannot satisfy it.
+mk_origin t24z; mk_clone t24z
+REPO_P="$CLONE"; MODE_P=sync
+mkdir -p "$T/t24z/home/.pi/agent/scripts"
+cat >"$T/t24z/stub-partial.sh" <<'FARM'
+#!/usr/bin/env bash
+printf 'a-stale.py | a | b | STALE\n' >&2
+printf 'b-newclass.py | a | b | BLOCKED-BY-DECL\n' >&2
+printf 'check-farm-drift: DRIFT — 2 stale (1 STALE, 1 in a class this pass does not know)\n'
+exit 1
+FARM
+chmod +x "$T/t24z/stub-partial.sh"
+OUT="$(HARNESS_APPLY_FARM_CHECKER="$T/t24z/stub-partial.sh" run_pass "$T/t24z" 2>&1)"; RC=$?
+assert_eq "$RC" "24" "T24 control: a PARTIALLY extracted drift is still RED (24)"
+ROWS24Z="$T/t24z/state/harness-apply-farm-rows.txt"
+assert_contains "$(head -1 "$ROWS24Z" 2>/dev/null || true)" "n=unparsed" \
+    "T24 control: the header says the extraction is UNPARSED — 1 of 2 matched is not a complete list"
+assert_contains "$(cat "$ROWS24Z" 2>/dev/null || true)" "b-newclass.py" \
+    "T24 control: and the file the extractor could not match is named in the published RAW output"
+REC24Z="$(cat "$T/t24z/state/harness-apply.status" 2>/dev/null || true)"
+assert_contains "$(grep '^farm_n=' <<<"$REC24Z")" "farm_n=unparsed" \
+    "T24 control: the record does not claim a count that certifies a truncated list"
+assert_contains "$(grep '^detail=' <<<"$REC24Z")" "matched only 1 of the 2 row(s)" \
+    "T24 control: and detail= says what was matched against what the instrument reported"
+assert_absent "$(grep '^detail=' <<<"$REC24Z")" "every one named in" \
+    "T24 control: and never certifies completeness for a partial extraction"
+
+# ⛔ THE DISARMED ARM ALSO RECORDS `action=none`, AND ONLY THE JOURNAL SAYS WHICH (review round 10).
+# Its rows fields are inherited from the `not-graded` default, so an edit that set `REC_FARM_ROWS=none`
+# there would make a pass that graded NOTHING record "the farm matched" — with the suite green.
+mk_origin t24y; mk_clone t24y
+REPO_P="$CLONE"; MODE_P=sync
+mkdir -p "$T/t24y/home/.pi/agent/scripts"
+printf 'x\n' >"$T/t24y/home/.pi/agent/scripts/pr-doctor.py"
+OUT="$(HARNESS_APPLY_FARM_CHECK=0 run_pass "$T/t24y" 2>&1)"; RC=$?
+assert_eq "$RC" "0" "T24 control: a DELIBERATELY disarmed farm check does not redden the pass"
+assert_contains "$OUT" "deliberately disarmed" \
+    "T24 control: and the journal says it was disarmed, not that there is no farm to grade"
+REC24Y="$(cat "$T/t24y/state/harness-apply.status" 2>/dev/null || true)"
+assert_contains "$REC24Y" "action=none" \
+    "T24 control: the record carries action=none — the same value a graded-clean pass writes"
+assert_contains "$(grep '^farm_rows=' <<<"$REC24Y")" "farm_rows=not-graded" \
+    "T24 control: and farm_rows= is what separates 'disarmed' from 'graded clean'"
+assert_contains "$(grep '^farm_n=' <<<"$REC24Y")" "farm_n=not-graded" \
+    "T24 control: with the count in the same state"
 
 # ── T26: the materialiser is TOLD which cell home to pin into (agent-infra#3593) ─────────────────
 # MEASURED on the `cmux` cell, 2026-11-06: this pass resolves CELL_HOME from $HOME (pass:195) and the

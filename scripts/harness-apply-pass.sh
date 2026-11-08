@@ -1412,21 +1412,37 @@ if [ "$FARM_CHECK_ON" = "1" ]; then
                 FARM_REMEDY="$(printf '%s\n' "$FARM_OUT" | sed -n '/^[[:space:]]*Next:/,$p' | head -8)"
                 # ⛔ "MATCHED BY THIS PASS'S EXTRACTOR", NOT "FROM THE INSTRUMENT" (review round 8). On the
                 # raw arm FARM_NROWS is 0 because THIS PASS's extractor matched nothing — the instrument
-                # did report rows, and this line was printed immediately above up to 12 of them.
+                # did report rows, and up to 12 of them are printed immediately BELOW this line.
                 log_line "farm: $REF ships different bytes than $FARM_DEST execute — $FARM_NROWS row(s) matched by this pass's extractor:"
-                # ⛔ AN EMPTY EXTRACTION IS NOT "EVERY FILE NAMED" (review round 5, reproduced). The
-                # row extractor's vocabulary is a COPY of the instrument's, and the checker this pass
-                # runs can be an OLDER FARMED copy whose rows it does not match — so a RED grade
-                # (rc 1|3) can yield ZERO extracted rows. Persisting that empty extraction published
-                # "0 row(s), every one named in <file>" over a file holding a header and nothing else:
-                # the one field that exists to NAME files would name none. The instrument's RAW output
-                # DOES carry the names, so that is what is published in this state, the header says the
-                # count is UNPARSED rather than zero, and every sentence below says "raw".
+                # ⛔ AN INCOMPLETE EXTRACTION IS NOT "EVERY FILE NAMED" (review rounds 5 and 10, both
+                # reproduced). The row extractor's vocabulary is a COPY of the instrument's, and the
+                # checker this pass runs can be an OLDER FARMED copy whose rows it does not match —
+                # so a RED grade (rc 1|3) can yield ZERO extracted rows, or a PARTIAL set. Both were
+                # published as "N row(s), every one named in <file>": the one field that exists to
+                # NAME files named fewer than the instrument reported, while positively certifying
+                # completeness (and the doc's own trust rule validates the truncated list, because
+                # header `n=` and `farm_n=` agree). The instrument's RAW output carries every name, so
+                # that is what is published when the extraction is not PROVEN complete, the header
+                # says `n=unparsed`, and every sentence below says "raw".
+                # The proof is the instrument's own summary — "DRIFT — <n> stale (…), <n>
+                # declared-but-absent, <n> unsourced" — which a partial extraction cannot satisfy.
+                FARM_EXPECT=""
+                _fx="$(printf '%s\n' "$FARM_OUT" | grep -m1 'DRIFT' || true)"
+                if [ -n "$_fx" ]; then
+                    _fa="$(printf '%s' "$_fx" | sed -n 's/.*[^0-9]\([0-9][0-9]*\) stale.*/\1/p')"
+                    _fb="$(printf '%s' "$_fx" | sed -n 's/.*[^0-9]\([0-9][0-9]*\) declared-but-absent.*/\1/p')"
+                    _fc="$(printf '%s' "$_fx" | sed -n 's/.*[^0-9]\([0-9][0-9]*\) unsourced.*/\1/p')"
+                    [ -n "$_fa" ] && FARM_EXPECT=$(( ${_fa:-0} + ${_fb:-0} + ${_fc:-0} ))
+                fi
+                unset _fx _fa _fb _fc
                 FARM_ROWS_RAW=0; PERSIST_BODY="$FARM_ROWS"
                 HDR_NOTE="n=$FARM_NROWS (the rows below are EXACTLY this run; farm_rows= in harness-apply.status is the currency indicator)"
                 if [ "$FARM_NROWS" -eq 0 ]; then
                     FARM_ROWS_RAW=1; PERSIST_BODY="$FARM_OUT"
                     HDR_NOTE="n=unparsed (NO row matched this pass's extractor — the instrument's RAW output follows verbatim; farm_n=unparsed says the count is UNKNOWN, not that nothing drifted)"
+                elif [ -n "$FARM_EXPECT" ] && [ "$FARM_NROWS" -lt "$FARM_EXPECT" ]; then
+                    FARM_ROWS_RAW=1; PERSIST_BODY="$FARM_OUT"
+                    HDR_NOTE="n=unparsed (this pass's extractor matched only $FARM_NROWS of the $FARM_EXPECT row(s) the instrument reports — the names it could not match are in the RAW output that follows verbatim; farm_n=unparsed)"
                 fi
                 # ⛔ EVERY ROW IS PERSISTED, NOT JUST THE EXCERPT (tortoise#10114 arm 2). The journal
                 # keeps a bounded human view, but the durable answer to "which files have drifted" is
@@ -1489,9 +1505,9 @@ if [ "$FARM_CHECK_ON" = "1" ]; then
                 done
                 if [ "$FARM_ROWS_RAW" = 1 ]; then
                     if [ "$FARM_ROWS_OK" = 1 ]; then
-                        log_line "farm:   no row matched this pass's extractor — the instrument's RAW output above is published in $REC_FARM_ROWS"
+                        log_line "farm:   the extraction was NOT PROVEN complete — the instrument's RAW output above is published in $REC_FARM_ROWS"
                     else
-                        log_line "farm:   no row matched this pass's extractor, and the RAW output could not be persisted ($REC_FARM_ROWS) — only the line(s) excerpted above are in this run's output, and any past the 12-line excerpt are named nowhere"
+                        log_line "farm:   the extraction was NOT PROVEN complete, and the RAW output could not be persisted ($REC_FARM_ROWS) — only the line(s) excerpted above are in this run's output, and any past the 12-line excerpt are named nowhere"
                     fi
                 fi
                 if [ "$FARM_NROWS" -gt 12 ]; then
@@ -1508,13 +1524,17 @@ if [ "$FARM_CHECK_ON" = "1" ]; then
                     log_line "farm:   $_row"
                 done
                 if [ "$FARM_ROWS_RAW" = 1 ] && [ "$FARM_ROWS_OK" = 1 ]; then
-                    FARM_ROW_SENTENCE="no row matched this pass's extractor, so the instrument's RAW output is published verbatim in $REC_FARM_ROWS"
+                    if [ "$FARM_NROWS" -eq 0 ]; then
+                        FARM_ROW_SENTENCE="no row matched this pass's extractor, so the instrument's RAW output is published verbatim in $REC_FARM_ROWS"
+                    else
+                        FARM_ROW_SENTENCE="this pass's extractor matched only $FARM_NROWS of the $FARM_EXPECT row(s) the instrument reports, so its RAW output is published verbatim in $REC_FARM_ROWS"
+                    fi
                 elif [ "$FARM_ROWS_OK" = 1 ]; then
                     FARM_ROW_SENTENCE="${FARM_NROWS} row(s), every one named in $REC_FARM_ROWS"
                 elif [ "$FARM_ROWS_RAW" = 1 ]; then
-                    FARM_ROW_SENTENCE="no row matched this pass's extractor and its RAW output could not be persisted ($REC_FARM_ROWS)"
+                    FARM_ROW_SENTENCE="the extraction was not proven complete and the instrument's RAW output could not be persisted ($REC_FARM_ROWS)"
                 else
-                    FARM_ROW_SENTENCE="${FARM_NROWS} row(s) from the instrument, and the full list could not be persisted ($REC_FARM_ROWS)"
+                    FARM_ROW_SENTENCE="${FARM_NROWS} row(s) matched by the extractor, and the full list could not be persisted ($REC_FARM_ROWS)"
                 fi
                 finish 0 24 "farm: DRIFT — $FARM_DEST is NOT the code $REF ships ($FARM_ROW_SENTENCE, with the instrument's own remedy — a stale copy, a layout move and an unsourced file do NOT all have the same fix)" ;;
             *)

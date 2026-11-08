@@ -115,10 +115,7 @@ dirty=0
 pin=ce987bb2c1de
 pin_tree=ce987bb2c1de
 drift=clean:current          <- the deployed-drift reading, `<state>:<token>` (`executes:<dir>` is the red one)
-farm_rows=none               <- `none` (farm matched — no list written by this pass, so any list on disk is not today's answer), `not-graded` (NO USABLE grade — see `action=`; TWO arms write `action=none`: a farmless host and a
-deliberately DISARMED check (`HARNESS_APPLY_FARM_CHECK=0`), so `action=` separates neither from a
-clean no-op — `farm_rows=` is the signal, and only the journal's `farm: SKIPPED` line says which),
-`unwritable`, or the FILE naming every drifting file
+farm_rows=none               <- `none` (farm matched), `not-graded` (NO USABLE grade), `unwritable` (rows write failed), or the FILE naming every drifting file
 farm_n=0                     <- rows the farm grade reported: a COUNT when graded (0 when the farm matched), `not-graded` when no grade was produced, `unparsed` when a RED grade's rows did not match this pass's extractor (the artifact's header reads `n=unparsed`; `0` would read as "nothing drifted")
 preserved=none
 remedy=none                  <- the ACTION for a refusal, never truncated (`detail=` is bounded at 240)
@@ -131,6 +128,11 @@ detail=current: the pin tree already names origin/main — head=ce987bb2c1de dep
 `detail` is the verdict sentence **plus the readings appended by the recorder**, so the line
 an operator (or the fleet instrument) reads can never carry numbers from before a move.
 `fetch=` and `behind=` are the two fields BOTH readers gate on.
+
+⛔ **`farm_rows=not-graded` CANNOT BE TOLD FROM A CLEAN NO-OP BY `action=`.** TWO arms write
+`action=none` — a farmless host and a deliberately DISARMED check (`HARNESS_APPLY_FARM_CHECK=0`) —
+which is the same value a pass that GRADED the farm and found it clean writes. `farm_rows=not-graded`
+is what separates them, and only the journal's `farm: SKIPPED` line says which of the two it was.
 
 ⛔ **`farm_rows=` EXISTS BECAUSE A COUNT IS NOT A NAME** (tortoise#10114 arm 2: "a scheduled
 check that names *each* drifting file"). The journal keeps a bounded human view — 12 rows, then
@@ -189,13 +191,16 @@ published *before* the record is the normal, honest shape: the artifact is stamp
 and `at=` seconds later, which is exactly why rule 2 permits `header ≤ at=` instead of demanding
 equality.)
 
-`farm_n=unparsed` on a RED (`action=farm-drift`, `rc=24`) record means the **extractor** matched no
-row while the instrument still reported drift — the installed `check-farm-drift.sh` is a copy whose
-row vocabulary this pass does not know (a farm that lags the ref). The artifact then carries the
-instrument's **RAW output** verbatim and its header reads `n=unparsed`; the DRIFT is still red and
-still recorded. The names are wherever the instrument printed them — in that file if it printed
-rows, in this run's own journal excerpt (at most the first 12 lines) if it printed none — so the
-record says "published verbatim" and never "every one named".
+`farm_n=unparsed` on a RED (`action=farm-drift`, `rc=24`) record means this pass's **extractor** could
+not account for every row the instrument reported — the installed `check-farm-drift.sh` is a copy
+whose row vocabulary this pass does not know (a farm that lags the ref), so it matched none or only
+some of them. The proof used is the instrument's own summary (`DRIFT — <n> stale …, <n>
+declared-but-absent, <n> unsourced`): when the extracted rows are fewer than that, the extraction is
+not complete and the artifact carries the instrument's **RAW output** verbatim, with `n=unparsed` in
+its header. The DRIFT is still red and still recorded. The names are wherever the instrument printed
+them — in that file whenever it published, and in this run's own journal excerpt (at most the first
+12 lines) only when the publish failed — so the record says "published verbatim" and never "every
+one named".
 
 `farm_rows=unwritable` means the rows write failed **while the record write still succeeded** — the
 drift is still red, `farm_n` still carries the count it had (or `unparsed` when the extraction parsed
