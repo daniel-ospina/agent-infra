@@ -5843,18 +5843,61 @@ async function main() {
 
     // A session rooted in B, whose own registry is EMPTY. process.cwd() is the
     // session root the handler resolves, so it is redirected for the duration.
+    //
+    // #1265 review: run this as a TASK CHILD (PI_MODE=print + TASK_HEARTBEAT=1,
+    // the pair builtin-tools injects). The pre-fix defect had TWO halves, and the
+    // second — `recovered > 0` suppressing the `else if (isTaskSubAgent())`
+    // zero-entry warning (#264 P2) — is only reachable in a sub-agent session. An
+    // interactive run leaves that half untested, so a revert that kept the
+    // foreign-root record would still look green here.
+    const prevMode = process.env.PI_MODE;
+    const prevHeartbeat = process.env.TASK_HEARTBEAT;
+    const captured: string[] = [];
+    const origLog = console.log;
+    const opB = { type: "tool_call", toolName: "bash", input: { command: `cd ${realB} && git commit -m b1265`, cwd: realB } };
     const prevCwd = process.cwd();
+    let block1: any = undefined;
+    let block2: any = undefined;
+    process.env.PI_MODE = "print";
+    process.env.TASK_HEARTBEAT = "1";
     try {
+      console.log = ((msg: string, ...rest: unknown[]) => { captured.push(String(msg)); origLog(msg, ...rest); }) as typeof console.log;
       process.chdir(realB);
       await fire("session_start", {});
+      block1 = await fire("tool_call", opB);
+      block2 = await fire("tool_call", opB);
     } finally {
+      console.log = origLog;
       process.chdir(prevCwd);
+      if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
+      if (prevHeartbeat === undefined) delete process.env.TASK_HEARTBEAT; else process.env.TASK_HEARTBEAT = prevHeartbeat;
     }
+
+    // The defect ITSELF, in the child's own transcript: pre-fix this printed
+    // "📂 Recovered 1 verified files from bridge" (A's count) and therefore never
+    // warned. Post-fix B recovers 0 and the #264 P2 warning is audible again.
+    ok(!captured.some((l) => /Recovered \d+ verified files from bridge/.test(l)),
+      `1265a: B must not claim a recovery count for a sibling's entries, got: ${captured.join(" | ")}`);
+    ok(captured.some((l) => l.includes("0 bridge-recovered files")),
+      `1265a: the #264 P2 zero-entry warning must be reachable when THIS worktree has none (pre-fix it was suppressed), got: ${captured.join(" | ")}`);
+    ok(captured.some((l) => l.includes("INSPECTION ONLY") && l.includes(realA) && l.includes(realB)),
+      `1265a: the inspection merge must be announced as INSPECTION ONLY and name both roots, got: ${captured.join(" | ")}`);
+    // R3: the REWORDED remedy is the change (#1265 measured three children that
+    // followed "cd into it" into a tree they did not own). Pin it — the block
+    // reason cannot carry it here, because the sibling holds a DIFFERENT path.
+    ok(captured.some((l) => l.includes("re-dispatch verification for THIS root") && l.includes(realB)),
+      `1265a: the mismatch remedy must be the followable one and name THIS root, got: ${captured.join(" | ")}`);
+    ok(captured.some((l) => l.includes("refused by design")),
+      `1265a: the mismatch remedy must state that adopting a sibling's entries is refused by design, got: ${captured.join(" | ")}`);
 
     const audit = readAuditLines();
     const forB = (e: string) => audit.filter((l) => l.event === e && String(l.root ?? "").endsWith("wt-1265-b") && String(l.session_cwd ?? "").startsWith(realB));
     equal(forB("gate_recovery").length, 0,
       "1265a: worktree B must NOT record a recovery count — pre-fix it merged A's entry and audited gate_recovery with A's count");
+    // The other half of the same defect: B has no entries of its own, so the
+    // durable zero-entry record must exist for B's own root.
+    equal(forB("gate_recovery_empty").length, 1,
+      "1265a: B's own root has no entries — exactly one durable gate_recovery_empty binds it (the pre-fix run skipped it)");
     equal(forB("gate_recovery_foreign_root").length, 1,
       "1265a: the inspection-only merge of A's entries must leave ONE durable record (AC b)");
     equal(String(forB("gate_recovery_foreign_root")[0].inspected_root), realA,
@@ -5863,17 +5906,16 @@ async function main() {
       "1265a: the record must carry the inspected count (A's single entry)");
 
     // AC (a): the op still FAILS CLOSED, and the diagnosis names THIS root.
-    const opB = { type: "tool_call", toolName: "bash", input: { command: `cd ${realB} && git commit -m b1265`, cwd: realB } };
-    const block1 = await fire("tool_call", opB);
     ok(block1 && block1.block === true, "1265a: B's commit must still be BLOCKED — A's entries are inert here (no fail-open)");
     ok(String(block1.reason).includes("src/b1265.ts"), "1265a: the block names B's own changed file");
     ok(!/src\/a1265\.ts/.test(String(block1.reason)), "1265a: the block must not import A's verified file into B's scope");
 
     // AC (b): exactly ONE durable root-mismatch record for this (root, siblings)
-    // pair, however many git ops run.
-    const block2 = await fire("tool_call", opB);
+    // pair, however many git ops run. ONE read of the log — `audit` above is
+    // already the post-op snapshot (both ops ran inside the guarded block), so
+    // concatenating a second read would count every line twice.
     ok(block2 && block2.block === true, "1265a: the retry is still blocked (no verification happened)");
-    const mismatch = audit.concat(readAuditLines()).filter((l) => l.event === "gate_root_mismatch" && String(l.root ?? "") === realB);
+    const mismatch = audit.filter((l) => l.event === "gate_root_mismatch" && String(l.root ?? "") === realB);
     equal(mismatch.length, 1, "1265a: the mismatch must be recorded exactly ONCE per session per (root, siblings) — not once per git op");
     equal(JSON.stringify(mismatch[0].verified_roots), JSON.stringify([realA]),
       "1265a: the record must name the sibling roots whose entries cannot be compared");

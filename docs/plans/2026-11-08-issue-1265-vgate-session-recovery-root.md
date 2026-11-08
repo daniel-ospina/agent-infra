@@ -9,26 +9,26 @@
 
 The issue's headline ("the gate adopts ANOTHER worktree's root as the git-op root") is **no longer
 true**: PR #1780 (merged, `26ad39a33`) makes `recoveryOnlyRoot` message-only and the git-op root has
-been the command's own cwd since the first #3255 attempt — `extensions/verification-gate/index.ts:4493-4502`
-never routes the git-op root through any bridge-derived helper, and
-`pickVerifiedRoot` is documented RECOVERY-ONLY.
+been the command's own cwd since the first #3255 attempt — the `tool_call` handler's git-op path never
+routes the git-op root through any bridge-derived helper (`const cwd = resolveGitRoot(cdPath ?? inputCwd)`),
+and `pickVerifiedRoot` is documented RECOVERY-ONLY.
 
 Two acceptance indicators in the issue are nevertheless still unmet at this head:
 
 1. **AC (b) — "the adoption/skip decision is visible to the parent (task return value or a shared
-   log), not only in child stderr."** `diagnoseRootMismatch` (`index.ts:487-500`) emits one
-   `console.log` and nothing else: no `appendJsonl`, no durable record. A task child's stdout is read
+   log), not only in child stderr."** `diagnoseRootMismatch` emits one `console.log` and nothing else:
+   no `appendJsonl`, no durable record. A task child's stdout is read
    only when the child is already dead, so this is exactly the "the parent sees *wedged*" failure the
    issue measures.
-2. **The neighbouring false signal (`:4388-4392`).** Session-start recovery is executed at the root
+2. **The neighbouring false signal (`session_start`).** Session-start recovery is executed at the root
    `recoveryOnlyRoot` hands back, so when this worktree has **no** entries and one same-repo sibling
    has them, `recovered` is the **sibling's** count and the child prints
-   `📂 Recovered N verified files from bridge`. Every one of those N is dropped at `:737`
-   (`parsed.root !== normRoot … foreign root — inert`), so the line claims verified state the session
-   does not have — and because `recovered > 0`, the `else if (isTaskSubAgent())` zero-entry warning at
-   `:4392` (the #264 P2 "every commit will block" signal, added *precisely* because the parent needs
-   it) never fires. A false PASS over a real block, in the one direction finding 1 says must not be
-   silent.
+   `📂 Recovered N verified files from bridge`. Every one of those N is dropped by
+   `recoverBridgeForRoot`'s `parsed.root !== normRoot` guard (`foreign root — inert`), so the line
+   claims verified state the session does not have — and because `recovered > 0`, the
+   `else if (isTaskSubAgent())` zero-entry warning (the #264 P2 "every commit will block" signal, added
+   *precisely* because the parent needs it) never fires. A false PASS over a real block, in the one
+   direction finding 1 says must not be silent.
 
 The narrow fix is therefore in **reporting**, not in root selection: the session's own root is the
 only root whose entries can cover this session's git ops, and the report must say so — durably.
@@ -43,9 +43,9 @@ only root whose entries can cover this session's git ops, and the report must sa
    risk of touching the dispatch return contract). AC (b) accepts "a **shared log**", and
    `~/.pi/agent/audit/gate-events.jsonl` already has readers in this repo (`scripts/registry-sync.sh`,
    `scripts/admin-merge.sh`, `extensions/review-enforcer`). Recorded as a named residual.
-3. **Change root selection back to adoption.** Refused flat: it re-opens the fail-open documented at
-   `index.ts:464-469` (a clean adopted tree yields an EMPTY scope, and the empty-scope path ALLOWS an
-   op carrying unverified content).
+3. **Change root selection back to adoption.** Refused flat: it re-opens the fail-open documented in
+   `pickVerifiedRoot`'s docblock (a clean adopted tree yields an EMPTY scope, and the empty-scope path
+   ALLOWS an op carrying unverified content).
 4. ✅ **Recover this worktree's own root first and report THAT count; merge the sibling's entries for
    INSPECTION only, record that decision durably, and give the root-mismatch diagnosis a durable
    record too.** Smallest change that satisfies AC (a), (b) and (c) without touching root selection
@@ -60,16 +60,17 @@ only root whose entries can cover this session's git ops, and the report must sa
 
 | Surface | Layer | Test |
 |---|---|---|
-| `session_start` handler (`:4368+`) | unit-of-behaviour | e2e scenario 1265a (real linked worktrees + real bridge) |
-| `diagnoseRootMismatch` → `tool_call` git-op path (`:4493`) | unit-of-behaviour | e2e scenario 1265a (block + audit record) |
+| `session_start` handler | unit-of-behaviour | e2e scenario 1265a (real linked worktrees + real bridge) |
+| `diagnoseRootMismatch` → `tool_call` git-op path | unit-of-behaviour | e2e scenario 1265a (block + audit record + reworded remedy) |
 | `appendJsonl` / `GateEventName` union (`extensions/shared/audit-log.ts`) | type + contract | type-only; readers tolerate unknown events by contract |
-| source pin "#3255 policy" (`index.test.ts:3769-3789`) | structural | updated pin |
-| `recoverBridgeForRoot` perf fast-path (`:723`) | regression | existing e2e scenario 16 (first_push mid-session bridge recovery) |
+| source pins ("#3255 policy" test in `index.test.ts`) | structural | updated pins (own-root count, durable-record root, remedy wording) |
+| `recoverBridgeForRoot` perf fast-path (`lastRecoveryMtime`) | regression | existing e2e scenario 16 (first_push mid-session bridge recovery) |
 
 ## Research
 
 See the `<!-- research: v1 -->` artifact (issue comment 6722549255). It settles:
-(a) the mechanism is `:4388` + `:737`, (b) the industry rule is *key by real path, report the miss,
+(a) the mechanism is `session_start`'s `recoveryOnlyRoot` call plus `recoverBridgeForRoot`'s foreign-root
+skip, (b) the industry rule is *key by real path, report the miss,
 never substitute a hit* (Turborepo `cacheDir` guidance; Bazel hermeticity), (c) on a busy box adoption
 is already unreachable (`pickVerifiedRoot` returns `null` at 2+ siblings — measured 12 agent-infra
 roots and 20+ tortoise roots in the live bridge), so this is the narrow one-sibling case.
@@ -78,12 +79,12 @@ roots and 20+ tortoise roots in the live bridge), so this is the narrow one-sibl
 
 | Call site / consumer | What it does there |
 |---|---|
-| `recoveryOnlyRoot(root)` — 1 call site, `index.ts:4388` (`session_start`) | names a same-repo sibling whose entries may be merged **for inspection**. Its return becomes `inspectRoot`; it never becomes a recovery *count* nor a git-op root. |
-| `recoverBridgeForRoot(normRoot)` — 2 call sites, `:4389` (session_start) and `:4502` (git-op mid-session recovery) | filters `parsed.root !== normRoot` (`:737`), so it only ever installs entries for the root it is given. Called at `ownRoot` first (count), then at `inspectRoot` (inspection only). |
-| `diagnoseRootMismatch(root)` — 1 call site, `:4493` (git-op path) | narrates a root mismatch; gains the durable `gate_root_mismatch` record + dedupe. Block decision untouched. |
+| `recoveryOnlyRoot(root)` — 1 call site, `session_start` | names a same-repo sibling whose entries may be merged **for inspection**. Its return becomes `inspectRoot`; it never becomes a recovery *count* nor a git-op root. |
+| `recoverBridgeForRoot(normRoot)` — **3** call sites: `session_start` twice (`ownRoot` = the count, `inspectRoot` = inspection only) and the git-op mid-session recovery path | filters `parsed.root !== normRoot` ("foreign root — inert"), so it only ever installs entries for the root it is given. |
+| `diagnoseRootMismatch(root)` — 1 call site, the git-op path | narrates a root mismatch; gains the durable `gate_root_mismatch` record + dedupe. Block decision untouched. |
 | `bridgeRoots()` | reads the bridge's PASS roots; unchanged. |
 | `gitCommonDir(root)` | same-repo test (`--git-common-dir`); unchanged. |
-| `appendJsonl(entry, file?)` — `extensions/shared/audit-log.ts` | appends to `~/.pi/agent/audit/gate-events.jsonl`; two new event names added to `GateEventName`. |
+| `appendJsonl(entry, file?)` — `extensions/shared/audit-log.ts` | appends to `~/.pi/agent/audit/gate-events.jsonl`; **four** new event names added to `GateEventName` (`gate_recovery`, `gate_recovery_empty`, `gate_recovery_foreign_root`, `gate_root_mismatch`). `gate_recovery` now carries the `root` it recovered for, so an inspection merge can never be read as an own-root count. |
 | readers of `gate-events.jsonl`: `scripts/registry-sync.sh`, `scripts/admin-merge.sh`, `extensions/review-enforcer` | they select by `event`/`reason` and must tolerate unknown events (documented contract in `audit-log.ts:20-24`); additive names are inert to them. |
 | `extensions/verification-gate/index.e2e.test.ts`, `index.test.ts` | run by `ci-main.yml` (`npx tsx …`) — no new file, so no CI-surface registration applies (this repo has no `config/ci-surfaces.yml`). |
 
@@ -106,10 +107,16 @@ roots and 20+ tortoise roots in the live bridge), so this is the narrow one-sibl
    emitted untyped — a pre-existing gap closed while adjacent).
    *Proves it:* typecheck (tsx import) + no reader regression (`registry-sync`/`admin-merge` untouched).
 4. **Tests**: e2e scenario 1265a appended to `index.e2e.test.ts` (the file's own sequential harness
-   with real `git worktree` pairs and a temp `HOME`); update the #3255 source pin in `index.test.ts`
-   to the new invariant ("recovery is never **counted** against an adopted root").
-5. **Verification**: full `index.test.ts` (baseline 317) + `index.e2e.test.ts` (baseline 119) must be
-   green; mutation proof — revert step 1 and 2 individually and show 1265a goes red.
+   with real `git worktree` pairs and a temp `HOME`), run as a TASK CHILD so the second half of the
+   defect (the suppressed #264 P2 zero-entry warning) is reachable; the "#3255 policy" pin in
+   `index.test.ts` extended with three structural pins — the own-root COUNT expression, the durable
+   `gate_recovery` record's `root` field, and the remedy wording (the un-followable `cd into it`
+   remedy must stay absent). `recoverBridgeForRoot`'s `gate_recovery` record now carries the `root`
+   it recovered for, so an inspection merge can never be read as an own-root count.
+5. **Verification**: full `index.test.ts` (baseline 317) + `index.e2e.test.ts` (baseline 119; 120 with
+   1265a) must be green; mutation proof — a PARTIAL revert (count from the inspected sibling while
+   keeping the foreign-root record) must turn 1265a red, and dropping the `root` field must turn the
+   source pin red.
 
 ## Rounds
 
@@ -126,9 +133,13 @@ Filled at PLAN-VERIFY close.
 - **R2** The new durable record floods the shared log (one line per git op) → caught by e2e 1265a:
   two identical blocked ops produce **exactly one** `gate_root_mismatch` line for that root.
 - **R3** The reworded diagnosis stops naming the correct root, or reintroduces the un-followable
-  remedy that led three children into another tree → caught by e2e 1265a's assertion that the block
-  reason names worktree B's **realpath** and the printed `Project root:` is B's.
-- **R4** The `lastRecoveryMtime`/`lastRecoveredRoot` fast path (`:723`) is disturbed so a
+  remedy that led three children into another tree → caught by e2e 1265a's captured console: the
+  mismatch remedy must say "re-dispatch verification for THIS root" naming worktree B's **realpath**,
+  and must state that adoption is refused by design. (The *block reason* does not carry a root in this
+  scenario — the sibling holds a DIFFERENT path, so `rootsHoldingPath` returns nothing to name; the
+  remedy line is the right evidence for R3.) Additionally pinned at source level in `index.test.ts`:
+  the old "re-run the op from the verified tree" wording must be absent.
+- **R4** The `lastRecoveryMtime`/`lastRecoveredRoot` fast path is disturbed so a
   mid-session bridge write is no longer seen → caught by the pre-existing e2e scenario 16
   (externally-written bridge recovered mid-session) staying green.
 - **R5** A consumer of `gate-events.jsonl` (registry-sync, admin-merge, review-enforcer) mis-reads the

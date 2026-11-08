@@ -513,7 +513,12 @@ function diagnoseRootMismatch(root: string): void {
       `Adopting another tree's entries is refused by design: they are keyed on that tree, so they are inert here, ` +
       `and an adopted clean tree yields an EMPTY scope that would ALLOW an op carrying unverified content.`,
   );
-  const fingerprint = `${norm}|${siblings.join(",")}`;
+  // #1265 review: SORT the sibling list. `bridgeRoots()` derives its order from
+  // `readBridge().verified_files`, which `writeBridge` re-snapshots from
+  // `verifiedSet` insertion order — so two sibling roots could swap places after
+  // an unrelated PASS and re-fire this record for an unchanged (root, siblings)
+  // set. The fingerprint is on a SET, so it must not depend on array order.
+  const fingerprint = `${norm}|${[...siblings].sort().join(",")}`;
   if (fingerprint === lastRootMismatch) return;
   lastRootMismatch = fingerprint;
   appendJsonl({
@@ -795,7 +800,13 @@ function recoverBridgeForRoot(normRoot: string): number {
     // #190 review: audit parity with gate_bypass — a silent verifiedSet
     // injection must leave a durable record (the bridge is a same-user trust
     // channel; any recovery is worth an audit entry).
-    appendJsonl({ event: "gate_recovery", extension: "verification-gate", recovered, session_cwd: process.cwd() });
+    // #1265 review: name the ROOT in the durable record too. `recoverBridgeForRoot`
+    // is now called for the session's own root AND (inspection only) for a
+    // same-repo sibling, so an emit without a root was byte-indistinguishable
+    // between "own root recovered N" and "a sibling's N were merged for
+    // inspection" — the false verified-state claim, in the durable half this PR
+    // exists to make truthful.
+    appendJsonl({ event: "gate_recovery", extension: "verification-gate", root: normRoot, recovered, session_cwd: process.cwd() });
   }
   return recovered;
 }
@@ -4419,7 +4430,8 @@ export default function (pi: ExtensionAPI) {
     // #1265: recover the SESSION'S OWN root first and report THAT count. The
     // sibling root `recoveryOnlyRoot` may name is merged for INSPECTION only: its
     // entries carry the sibling's root, so `recoverBridgeForRoot` drops every one
-    // of them at the git-op root filter (`:737` "foreign root — inert"). Counting
+    // of them at the git-op root filter (`recoverBridgeForRoot`'s
+    // `parsed.root !== normRoot` guard, "foreign root — inert"). Counting
     // them as "recovered for this worktree" was a false verified-state claim — and
     // because `recovered > 0` it also SKIPPED the `else if (isTaskSubAgent())`
     // zero-entry warning below, which exists precisely so a parent learns that
