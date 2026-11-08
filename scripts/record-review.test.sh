@@ -5298,7 +5298,7 @@ assert_eq "$(dc_posts "$DC_PR")" "0" "14.1d a comment already carrying the marke
 #      previously claimed "`-qxF`->`-qF` at the dedup read left the suite at
 #      PASS=921 FAIL=0". THERE IS NO GREP AT THE DEDUP READ — not anchored, not
 #      unanchored: the loop compares whole bodies with `[ "$_body" = "$marker" ]`
-#      (scripts/record-review.sh:1925), so that mutant does not exist and could not
+#      (scripts/record-review.sh:2468 — `grep -n '\[ "$_body" = "$marker" \]'`), so that mutant does not exist and could not
 #      have been measured. The mutant that actually makes (b2) meaningful is replacing
 #      that equality with a SUBSTRING test (`case "$_body" in *"$marker"*)`): it
 #      reddens (b2) — which expects 1 POST and would get 0.
@@ -5329,7 +5329,7 @@ fi
 #      The read hands the gate's own expression to `--jq`:
 #        .[] | "<assoc>\u001f<body | gsub("[\u001e\u001f]"; "")>" + "\u001e"
 #      BOTH halves are load-bearing: the strip because an UNSTRIPPED body can FORGE the
-#      frame (the recorder's own comment at :1894-1895 names the measured exploit), the
+#      frame (the recorder's own comment at :2437 — `grep -n 'could FORGE the frame'` — names the measured exploit), the
 #      `\u001e` because it is how records are split. NO OTHER VECTOR EXERCISES EITHER —
 #      every other fixture feeds the frame PRE-BUILT through $STUB_COMMENTS, so the
 #      recorder's expression is never evaluated and deleting the strip left the suite
@@ -6907,7 +6907,7 @@ S21_ROWS="$T/s21-rows"; mkdir -p "$S21_ROWS"
 # for a reason unrelated to its mutation (measured: 21.12's first pin). Prepared once here.
 S21_MUTDIR="$T/s21-mut"; mkdir -p "$S21_MUTDIR"
 cp -r "$SCRIPT_DIR/lib" "$S21_MUTDIR/lib"
-# SELF-CONTAINED digest fixtures (§11.13 unsets CC_SHA at :2623, and the §11.12 note is
+# SELF-CONTAINED digest fixtures (§11.13 unsets CC_SHA at :2974 — `grep -n 'unset CC_OUT CC_RC'` —, and the §11.12 note is
 # explicit that a section leaning on another's fixture is either an abort under `set -u`
 # or — worse — a silent comparison against bytes some other section computed). The
 # digest comes from the ONE shared normalizer, exactly as the producer and the GitHub
@@ -8850,10 +8850,10 @@ targets = sys.argv[2:]
 # ⛔ A WHOLE-FILE LEXER WAS BUILT AND REJECTED — with the measurement, not as a preference.
 # Carrying quote state across lines is the only way to close the multi-line hole, and on the
 # REAL recorder it desyncs at `$(` inside a double-quoted string, because `$(` resets quoting:
-# the awk program at record-review.sh:1680 ends a line inside a single-quoted string, and a
-# state machine that does not model `$(` re-opens a quote mid-program and flags the awk
-# comments at 1685-1734 as live backticks — 26 false REDs across 12 lines (that region plus a
-# second desync at 4331-4354) on the recorder. Modelling `$(`,
+# the awk program at record-review.sh:1846 (`grep -n 'EVIDENCE_BODY" | command awk'`) carries
+# its own comment block across lines (`sed -n '1851,1860p'`), so a lexer that does not model `$(`
+# re-opens a quote mid-program and reports those lines as live backticks — 26 false REDs over 12
+# lines in the prototype run (a COUNT, not a line map). Modelling `$(`,
 # `${`, `$'` and heredocs well enough to stay in sync is a bash lexer, which is a different
 # project from this vector. So the scope is DECLARED here instead of over-claimed: this
 # sweep bounds the shipped defect (a `"..."` message that runs its own backticks) on every
