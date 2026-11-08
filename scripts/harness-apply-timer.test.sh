@@ -1810,6 +1810,45 @@ OUT="$(PASS_UNDER_TEST="$PASS_PRE" run_pass_unit "$T/t26pf" 2>&1)"; RC=$?
 assert_eq "$RC" "25" "T26 control: the PRE-FIX pass never reaches predicate 4 (25, not 24) with the same drift"
 assert_absent "$OUT" "farm: DRIFT" "T26 control: so the farm grade this feature exists to emit is never printed"
 
+# ── T27: `$HERE` is CDPATH-IMMUNE, so the value every path beside this pass is built from is ONE line ──
+# ⛔ THE ONE CDPATH SITE THE SUITE DID NOT PIN (review round 11, closed here). `$HERE` is captured with
+# `CDPATH=` for the same reason as the other five sites: bash's `cd` PRINTS the resolved directory when
+# it resolves through an inherited CDPATH, so `$HERE` would hold TWO lines, and every path built from it
+# (`$HERE/cloud-cell-supervisor.sh`, `$HERE/orchestrator-harness/check-deployed-drift.sh`, `cd "$HERE"`)
+# would name a directory containing a newline. Round 11 concluded this could not be pinned because the
+# `case "$HERE"` farm-shape refusals are SUFFIX matches and a doubled value still ends with
+# `/.pi/agent/scripts` — true, but the refusals are not the only observable: the `deployed_drift=not-run`
+# line QUOTES `$HERE` (`harness-apply-pass.sh:720`), so the text that must follow it ON THE SAME LINE is
+# what a mangled value breaks. Hence the relative invocation under an inherited CDPATH below.
+say_case "T27 \$HERE is CDPATH-immune — a relative invocation under an inherited CDPATH stays ONE line"
+mk_origin t27; mk_clone t27; write_sync_stub
+REPO_P="$CLONE"; MODE_P=sync
+# The pass is COPIED into a directory whose name does not begin with `.`: `cd` ignores CDPATH when the
+# directory argument begins with `.`, so a `.pi/agent/scripts`-shaped dirname can never reach the hazard
+# at all — which is precisely why a farm-shaped fixture pins nothing.
+mkdir -p "$T/t27/fhx" "$T/t27/home/.pi/agent/state" "$T/t27/state" "$T/t27/nocheck"
+cp "${PASS_UNDER_TEST:-$PASS_SH}" "$T/t27/fhx/harness-apply-pass.sh"
+t27_run() { # <cdpath> — the pass by RELATIVE path from $T/t27, with an EXPLICIT CDPATH
+    ( cd "$T/t27" && CDPATH="$1" HARNESS_REPO="$REPO_P" HARNESS_REF=origin/main HARNESS_FETCH=1 \
+        HARNESS_APPLY_STATE_DIR="$T/t27/state" HARNESS_APPLY_MODE="" \
+        HARNESS_PIN="$T/t27/home/.pi/agent/state/HARNESS-PIN" HARNESS_PIN_FILE="$T/t27/home/.harness-path" \
+        HARNESS_PIN_DIR="$T/t27/home/harness" CELL_HOME="$T/t27/home" O="$T/t27/home/orchestrator" \
+        AGENT_INFRA_PATH= HARNESS_APPLY_SYNC_CMD="$T/sync-stub.sh" \
+        HARNESS_APPLY_DRIFT_CHECK=1 HARNESS_APPLY_DRIFT_DIR="$T/t27/nocheck" \
+        bash "fhx/harness-apply-pass.sh" --dry-run 2>&1 )
+}
+# ⛔ THE ASSERTION IS THE BOUNDARY, NOT THE PATH. `beside $T/t27/fhx` alone matches a TWO-LINE value as
+# well (its first line is that same string), so on its own it would pin nothing — the text that must
+# follow on the SAME line is `, in $O=`, and a doubled capture puts a newline there instead.
+OUT="$(t27_run "$T/t27" 2>&1)"
+assert_contains "$OUT" "beside $T/t27/fhx, in \$O=" \
+    "T27 an inherited CDPATH does not double \$HERE — the value is ONE line, so every path built from it resolves"
+# Control: the SAME fixture with no CDPATH. If this stops producing the same boundary, the row above is
+# passing for a reason other than the `CDPATH=` prefix and would no longer pin it.
+OUT="$(t27_run "" 2>&1)"
+assert_contains "$OUT" "beside $T/t27/fhx, in \$O=" \
+    "T27 control: the same boundary holds with no CDPATH at all (so the row above is not an artifact of the fixture)"
+
 echo
 echo "────────────────────────────────────────────────────────"
 echo "harness-apply: $PASS passed, $FAIL failed"
