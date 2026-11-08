@@ -367,7 +367,7 @@ printf '#!/bin/bash\nexit 0\n' > "$CELL/record-review.sh"; chmod +x "$CELL/recor
 mkdir -p "$CELL/lib"; printf '#!/usr/bin/env python3\n' > "$CELL/lib/diff-normalize.py"
 rm -f "$RECORDER" "$RECORDER_LIB" "$CELL/tmstate/up" "$CELL/tmstate/cmd"
 out="$(cell_start)"; rc=$?
-start_rc="$rc"          # the controller launch's own verdict; asserted at the end of this arm (above)
+start_rc="$rc"          # the controller launch's own verdict; asserted directly below — see the header
 [ -x "$RECORDER" ] && rc=0 || { rc=1; note "recorder=$([ -x "$RECORDER" ] && echo present || echo absent) start_rc=$start_rc out=$(printf '%s' "$out" | tail -3)"; }
 ck "start provisions record-review.sh from the checkout (start_rc=$start_rc)" $rc
 ck "start itself SUCCEEDED (the controller launch is not this suite's subject, but its exit status is the whole-start verdict; start_rc=$start_rc)" "$start_rc"
