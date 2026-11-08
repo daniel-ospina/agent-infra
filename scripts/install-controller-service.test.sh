@@ -3680,9 +3680,12 @@ PREF2_RC=0; PREF2_OUT="$(EXTRA_ENV="ORCH_SUPERVISOR=$SCRATCH_P/cloud-cell-superv
 # durable supervisor is the harness pin — which the refusal text RECOMMENDS but the candidate list never
 # proposed. ⛔ THE OTHER TWO CANDIDATES' CASE NARROWS WITH THIS LANDING'S `fleet_srcs` ENTRY (#1938), and the old wording here said the
 # opposite: `cloud-cell-supervisor.sh` IS farmed flat by `setup.sh`'s `fleet_srcs`, so a correctly-installed box
-# DOES hold `$HOME/.pi/agent/scripts/cloud-cell-supervisor.sh` — and `beside` then names THAT SAME directory,
-# because this installer is farmed into it too. The two collapse into ONE candidate. What survives is the case
-# this fixture builds: an install predating that entry, or a removed farmed copy (the `rm -f` below). So the pin
+# DOES hold `$HOME/.pi/agent/scripts/cloud-cell-supervisor.sh`. ⛔ BUT THE FARMED CANDIDATE AND `beside` ARE NOT
+# SYNONYMS: `beside` is derived from the RUNNING script, so they collapse into one candidate only when the
+# installer is invoked from its FARMED path. This fixture runs the CHECKOUT copy (`INST=${INST:-$HERE/…}`), so
+# `beside` here is the repo's sibling — a distinct third candidate — and the arm passes because the PIN precedes
+# it, not because nothing else was left. What survives as a real case is the one the `rm -f` below builds: an
+# install predating that entry, or a removed farmed copy. So the pin
 # is the candidate that saves a bring-up on a cell that HAS a durable supervisor.
 # `check_harness_pin` runs BEFORE `check_controller_service` in the bring-up, so
 # the pin is always there by the time this question is asked.
