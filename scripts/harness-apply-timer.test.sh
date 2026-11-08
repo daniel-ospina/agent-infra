@@ -1220,38 +1220,39 @@ OUT="$(FARM_RC=3 run_pass "$T/t24b" 2>&1)"; RC=$?
 assert_eq "$RC" "24" "T24 control: an unpaid-by-the-farm stale file is RED too, not an exemption"
 # Control 2: the SAME fixture with a matching farm (checker exits 0) keeps its normal verdict — the
 # leg is a gate, not a hard-coded failure.
-# ⛔ AND A CLEAN GRADE MUST DELETE THE ROWS ARTIFACT (tortoise#10114 arm 2). A persisted list that
-# survives a pass which found no drift is a reader trap: nothing in it says which run produced it, so
-# it reads exactly like today's answer. So yesterday's file is planted here and must be GONE.
+# ⛔ AND A CLEAN GRADE PUBLISHES NO LIST, WHILE THE OLD ONE STAYS SELF-DATING (tortoise#10114 arm 2,
+# review round 2). Round 1 asserted a clean grade DELETES the previous list; that delete was removed —
+# it fired on read-only verbs and could unlink a concurrent pass's file. The list stays, its header
+# dates it, and `farm_rows=none` is what says the list on disk is not today's answer.
 mkdir -p "$T/t24c/home/.pi/agent/scripts" "$T/t24c/state"; printf 'x\n' >"$T/t24c/home/.pi/agent/scripts/pr-doctor.py"
 printf 'file-from-yesterday.py | a | b | STALE\n' >"$T/t24c/state/harness-apply-farm-rows.txt"
 OUT="$(FARM_RC=0 run_pass "$T/t24c" 2>&1)"; RC=$?
 assert_contains "$OUT" "farm: ok" "T24 control: a matching farm is reported ok"
 assert_eq "$RC" "0" "T24 control: a matching farm leaves the normal verdict intact (exact rc, so a pass broken for an unrelated reason cannot pass this control)"
 if [ -f "$T/t24c/state/harness-apply-farm-rows.txt" ]; then
-    bad "T24 control: a CLEAN farm DELETES yesterday's rows list (a stale list is indistinguishable from today's)"
+    ok "T24 control: a CLEAN farm leaves an older list in place — the record, not the file's absence, says it is not current"
 else
-    ok "T24 control: a CLEAN farm DELETES yesterday's rows list (a stale list is indistinguishable from today's)"
+    bad "T24 control: a CLEAN farm must not DELETE the previous rows list (a concurrent pass's list can be unlinked, and a deleted list cannot be dated)"
 fi
 assert_contains "$(cat "$T/t24c/state/harness-apply.status" 2>/dev/null || true)" "farm_rows=none" \
-    "T24 control: and the record says so (`farm_rows=none`), not a path to a file that is gone"
+    "T24 control: and the record says the farm matched, so the file on disk is not today's answer"
 assert_contains "$(cat "$T/t24c/state/harness-apply.status" 2>/dev/null || true)" "farm_n=0" \
     "T24 control: with the row count at 0"
 # Control 3: no farm at all is SKIPPED with a named reason — a controller-only host farms nothing,
 # and reddening every such box would make the alarm worthless.
 mk_origin t24d; mk_clone t24d
 REPO_P="$CLONE"; MODE_P=sync
-# ⛔ AND A PASS THAT NEVER GRADES THE FARM MUST STILL CLEAR THE ARTIFACT (review finding). The rows
-# list is published at a fixed path, so a kill-switched or refused pass that left yesterday's file
-# there would be read as today's drift — with no record field naming it (`farm_rows=not-graded`).
+# ⛔ AND A PASS THAT NEVER GRADES THE FARM PUBLISHES NO LIST AND SAYS SO (review round 2). It must
+# not delete the previous one either (see t24c): `farm_rows=not-graded` is what stops a reader
+# treating the file on disk as today's drift.
 mkdir -p "$T/t24d/state"; printf 'file-from-yesterday.py | a | b | STALE\n' >"$T/t24d/state/harness-apply-farm-rows.txt"
 OUT="$(run_pass "$T/t24d" 2>&1)"; RC=$?
 assert_contains "$OUT" "farm: SKIPPED" "T24 control: an absent farm is SKIPPED by name, never silently passed"
 assert_eq "$RC" "0" "T24 control: an absent farm does not redden the pass (exact rc)"
 if [ -f "$T/t24d/state/harness-apply-farm-rows.txt" ]; then
-    bad "T24 control: a NOT-GRADED pass still deletes the rows artifact (a fixed-path list has no epoch)"
+    ok "T24 control: a NOT-GRADED pass leaves the previous list alone"
 else
-    ok "T24 control: a NOT-GRADED pass still deletes the rows artifact (a fixed-path list has no epoch)"
+    bad "T24 control: a NOT-GRADED pass must not DELETE the previous rows list"
 fi
 assert_contains "$(cat "$T/t24d/state/harness-apply.status" 2>/dev/null || true)" "farm_rows=not-graded" \
     "T24 control: and the record says this pass did not grade the farm — not `none`, which claims it did"
@@ -1420,8 +1421,12 @@ assert_contains "$OUT" "and 8 more row(s)" "T24 control: while the row excerpt s
 ROWS="$T/t24q/state/harness-apply-farm-rows.txt"
 if [ -f "$ROWS" ]; then ok "T24 control: the drift rows are PERSISTED to state, not only printed to the journal"
 else bad "T24 control: the drift rows are PERSISTED to state, not only printed to the journal (missing: $ROWS)"; fi
-assert_eq "$(grep -c . "$ROWS" 2>/dev/null | tr -d ' ')" "20" \
-    "T24 control: and the file holds ALL 20 rows — the count is never the answer, the names are"
+assert_eq "$(grep -c . "$ROWS" 2>/dev/null | tr -d ' ')" "21" \
+    "T24 control: and the file holds a HEADER plus ALL 20 rows — the count is never the answer, the names are"
+assert_contains "$(head -1 "$ROWS" 2>/dev/null || true)" "n=20" \
+    "T24 control: the header carries this run's row count, so a reader can date and size the list"
+assert_contains "$(head -1 "$ROWS" 2>/dev/null || true)" "ref=origin/main" \
+    "T24 control: and the ref it was graded against"
 assert_eq "$(grep -c 'file-19.py' "$ROWS" 2>/dev/null | tr -d ' ')" "1" \
     "T24 control: including the LAST row, which an excerpt can never show"
 assert_contains "$OUT" "ALL 20 are named in $ROWS" \

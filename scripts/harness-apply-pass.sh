@@ -279,16 +279,18 @@ REC_PIN="none"; REC_PIN_TREE="none"; REC_ACTION="none"; REC_DETAIL=""; REC_REMED
 # 30-row farm had 18 files that were COUNTED and never named anywhere durable. `not-graded` is the
 # truthful value on every path that never reached the farm block (a pre-flow refusal).
 REC_FARM_ROWS="not-graded"; REC_FARM_NROWS="not-graded"
-# ⛔ THE DRIFT ROWS ARTIFACT IS DELETED ON EVERY PASS, NOT ONLY ON A GRADED ONE (review finding).
-# It is published at a FIXED path, so anything left there is read as "today's drift" — and the passes
-# that never reach the farm block (HARNESS_APPLY_FARM_CHECK=0, every pre-flow refusal) would otherwise leave
-# yesterday's undated list behind with no record field pointing at it. Removing it here, before any
-# branch can exit, makes every exit path leave the artifact consistent with its record.
-# ⛔ ONLY THIS PASS'S OWN TEMP IS EVER REMOVED. A `$FARM_ROWS_FILE.tmp-*` glob would unlink a
-# CONCURRENT pass's in-flight temp (the timer fires while an operator may run the pass by hand, and
-# nothing serialises them), turning its successful write into a false `unwritable`.
+# ⛔ THE DRIFT ROWS ARTIFACT IS SELF-DATING AND IS NEVER DELETED BY A LATER PASS (review round 2).
+# Round 1 deleted it on every pass so a stale list could not be read as current — and that delete was
+# wrong three ways: it fired on the READ-ONLY verbs (`--print-status`, the readiness verb the timer
+# installer itself calls, would have destroyed the list its own record names), it sat below the seam
+# validations so those refusals still orphaned it, and a fixed-path delete can unlink a CONCURRENT
+# pass's just-published file between its write and its record (nothing serialises them; the timer
+# fires while an operator may run the pass by hand). So the artifact is WRITTEN WITH ITS OWN HEADER
+# (UTC, ref, dest, n) and left alone: a reader can always date it, and `farm_rows=` is the currency
+# indicator — `none`/`not-graded` means the list on disk is NOT today's answer.
+# ⛔ AND ONLY THIS PASS'S OWN TEMP IS EVER REMOVED: a `$FARM_ROWS_FILE.tmp-*` glob would unlink a
+# concurrent pass's in-flight temp and turn its successful write into a false `unwritable`.
 FARM_ROWS_FILE="$STATE_DIR/harness-apply-farm-rows.txt"
-rm -f "$FARM_ROWS_FILE" 2>/dev/null || true
 # ⛔ `REC_REMEDY` IS A FIELD FOR THE SAME REASON `preserved=` IS (review finding, #10114). Measured
 # on the deployed-drift refusal: its `detail=` is 706 characters and the word `Remedy:` begins at
 # offset 272 — so `cut -c1-240` DISCARDS THE ENTIRE REMEDY from the durable record. stderr still
@@ -332,9 +334,10 @@ write_record() { # <ok> <rc>
         # documented 23. `not-run` is also the truthful value there: those paths never reached the reading.
         printf 'drift=%s\n' "${DRIFT_STATE:-not-run}${DRIFT_TOKEN:+:$DRIFT_TOKEN}"
         # ⛔ `farm_rows=` NAMES THE FILE THAT NAMES EVERY DRIFTING FILE (tortoise#10114 arm 2). Besides
-        # a path it can be `none` (the farm matched, and the artifact was deleted), `unwritable` (the
-        # state dir could not be written — said out loud rather than silently leaving 18 files named
-        # nowhere) or `not-graded` (this pass never reached the farm block).
+        # a path it can be `none` (the farm matched — this pass wrote NO list, and whatever is on disk
+        # is not today's answer), `unwritable` (the rows write failed while this record still wrote:
+        # said out loud rather than silently leaving 18 files named nowhere) or `not-graded` (this pass
+        # never reached the farm block).
         printf 'farm_rows=%s\n' "$REC_FARM_ROWS"
         printf 'farm_n=%s\n' "$REC_FARM_NROWS"
         printf 'preserved=%s\n' "${PRESERVED_DIR:-none}"
@@ -1353,8 +1356,9 @@ if [ "$FARM_CHECK_ON" = "1" ]; then
         # (A `FARM_NAMED` short list was computed here and never read — the row extraction below owns
         # the predicate, so it was dead code plus a redundant `awk|head|paste` subprocess on the red
         # path. Removed in batch-ai2 review cycle 2, F7.)
-        # ⛔ THE ROWS ARTIFACT WAS ALREADY DELETED beside the record-field init, so a pass that finds no
-        # drift cannot leave yesterday's list behind — the deletion is not owned by this branch.
+        # ⛔ THIS BRANCH OWNS NO DELETION (review round 2). A pass that finds no drift writes no list;
+        # a pass that finds drift OVERWRITES it atomically with its own header. The previous list is
+        # deliberately left in place — see the artifact note beside the record-field init above.
         case "$FARM_RC" in
             0)
                 REC_FARM_ROWS=none; REC_FARM_NROWS=0
@@ -1400,7 +1404,14 @@ if [ "$FARM_CHECK_ON" = "1" ]; then
                 # that runs at `finish`, i.e. AFTER this write — a first pass on a fresh box would
                 # otherwise record `unwritable` on the one run that had drift to name.
                 mkdir -p "$STATE_DIR" 2>/dev/null || true
-                # ⛔ THE OUTCOME IS TRACKED SEPARATELY FROM THE VALUE (review finding). Branching the
+                # ⛔ ABSOLUTISE BEFORE PUBLISHING (review round 2). `HARNESS_APPLY_STATE_DIR` is not
+                # required to be absolute here, and a relative `farm_rows=` value is resolvable only
+                # from the pass's own cwd — useless to the fleet reader the field exists for.
+                if [ "${FARM_ROWS_FILE#/}" = "$FARM_ROWS_FILE" ]; then
+                    _sd="$(cd "$STATE_DIR" 2>/dev/null && pwd)" || _sd=""
+                    [ -n "$_sd" ] && FARM_ROWS_FILE="$_sd/harness-apply-farm-rows.txt"
+                fi
+                # ⛔ THE OUTCOME IS TRACKED SEPARATELY FROM THE VALUE (review round 1). Branching the
                 # messages on `case "$REC_FARM_ROWS" in /*)` decided "did it persist?" from the SHAPE
                 # of a path, and `HARNESS_APPLY_STATE_DIR` is not required to be absolute here — so a
                 # SUCCESSFUL write to a relative state dir reported itself as "could NOT be persisted"
@@ -1413,7 +1424,9 @@ if [ "$FARM_CHECK_ON" = "1" ]; then
                 # refuses that state up front and `[ -f ]` makes "persisted" mean "a readable file is
                 # at the path the record names", which is the only property a reader can rely on.
                 if [ ! -d "$FARM_ROWS_FILE" ] \
-                   && printf '%s\n' "$FARM_ROWS" >"$FARM_ROWS_FILE.tmp-$$" 2>/dev/null \
+                   && { printf '# harness-apply farm drift rows — %s — ref=%s dest=%s n=%s (the rows below are EXACTLY this run; farm_rows= in harness-apply.status is the currency indicator)\n' \
+                            "$(date -u +%FT%TZ)" "$REF" "$FARM_DEST" "$FARM_NROWS" >"$FARM_ROWS_FILE.tmp-$$" 2>/dev/null \
+                        && printf '%s\n' "$FARM_ROWS" >>"$FARM_ROWS_FILE.tmp-$$" 2>/dev/null; } \
                    && mv -f "$FARM_ROWS_FILE.tmp-$$" "$FARM_ROWS_FILE" 2>/dev/null \
                    && [ -f "$FARM_ROWS_FILE" ]; then
                     REC_FARM_ROWS="$FARM_ROWS_FILE"; FARM_ROWS_OK=1

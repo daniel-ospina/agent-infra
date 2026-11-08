@@ -115,7 +115,7 @@ dirty=0
 pin=ce987bb2c1de
 pin_tree=ce987bb2c1de
 drift=clean:current          <- the deployed-drift reading, `<state>:<token>` (`executes:<dir>` is the red one)
-farm_rows=none               <- `none` (farm matched, no artifact), `not-graded` (this pass never graded the farm), `unwritable`, or the FILE naming every drifting file
+farm_rows=none               <- `none` (farm matched — no list written by this pass, so any list on disk is not today's answer), `not-graded` (never graded), `unwritable`, or the FILE naming every drifting file
 farm_n=0                     <- rows the farm grade reported: a COUNT when graded (0 when the farm matched), `not-graded` otherwise
 preserved=none
 remedy=none                  <- the ACTION for a refusal, never truncated (`detail=` is bounded at 240)
@@ -136,10 +136,16 @@ on the `cmux` cell, 2026-11-07). Every row the instrument reports is therefore w
 to `${HARNESS_APPLY_STATE_DIR:-$HOME/.pi/agent/state}/harness-apply-farm-rows.txt`, and the record
 names that file.
 
-The artifact is **derived state, and every pass deletes it before it can exit** — including the
-passes that never grade the farm (the kill switch, every pre-flow refusal), because it is published
-at a fixed path and a list that outlives the condition it describes cannot be told from today's
-answer. `farm_rows=none` says a graded farm matched; `not-graded` says this pass did not look.
+The artifact lives at a **fixed path** and is **self-dating**: its first line carries the UTC
+timestamp, ref, dest and row count of the run that wrote it. No later pass deletes it, so a reader
+who opens it directly can always tell how old it is — and **`farm_rows=` is the currency
+indicator**, not the file's presence: `none` (a graded farm matched) and `not-graded` (this pass
+never looked — the switch is off, or a refusal exited first) both mean the list on disk is *not*
+today's answer. Deletion was tried and removed: it fired on the read-only verbs (`--print-status`,
+which the timer installer itself calls), it sat below the seam validations so those refusals still
+orphaned the list, and a fixed-path delete can unlink a concurrent pass's just-published file
+between its write and its record.
+
 `farm_rows=unwritable` means the rows write failed **while the record write still succeeded** — the
 drift is still red and still counted, `farm_n` is still the instrument's row count, but the names
 are not on disk, so the journal says so in as many words. (A state dir that is unwritable for the
