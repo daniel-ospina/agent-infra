@@ -199,8 +199,11 @@ _rs_nearest_existing_ancestor() {
   # chain holds a link that cannot be resolved, BEFORE the absence test, and answers 5 with an executable
   # interpreter (`absent`), with none (`unknown`) and through a loop (`other`) alike. Measured: every
   # unresolvable-link spelling answers 5 on both readers, and the rc-3 set is IDENTICAL between them and
-  # contains no UNRESOLVABLE link (43 of those rc-3 spellings do traverse a link that RESOLVES, and 3 is
-  # right for them — the remainder of the path is genuinely absent, so the sentence must not overclaim).
+  # contains no UNRESOLVABLE link. ⛔ AND IT MUST NOT OVERCLAIM THE OTHER WAY EITHER: rc 3 IS right for a
+  # spelling that traverses a link which RESOLVES, because then only the remainder is absent
+  # (`<a good link>/nope.conf` → 3). No COUNTS are quoted here on purpose — three independently built
+  # generators produced three different totals, so an integer would be a claim a reader cannot re-verify;
+  # the invariant is what matters, and it survived all three.
   # The old sentence was falsified by that arm and would teach the next lane to restore the 3.
   # A link that DOES resolve is still found by `-e` first, so the ordinary walk is untouched.
   while [ -n "$d" ] && [ "$d" != "/" ] && [ "$d" != "." ]; do

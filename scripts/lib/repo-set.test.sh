@@ -927,13 +927,13 @@ raw_lines = [l.rstrip('\n') for l in open(sys.argv[1], encoding='utf-8')]
 # FABRICATED one from `key \` + `{ value` inside a heredoc (a false RED) — both reproduced, both gone, and
 # each is pinned by a fixture line.
 # ⛔ WHAT THIS SCANNER IS AND IS NOT. It answers ONE question — which names does a VALID bash file define —
-# and it is not a bash parser. Two refinements were tried and removed rather than kept as pinned-looking
-# machinery, both because the only input that could exercise them is one bash REJECTS or one no arm can
-# distinguish: (i) an ODD-RUN backslash test (`probe() \\` is `syntax error near unexpected token`, rc 2, so
-# no valid script contains it); (ii) a "terminator followed by `;`" convenience (`INNER;` does NOT close a
-# heredoc in bash — measured, it warns "delimited by end-of-file" and the body runs on — so the convenience
-# was not convenience, it was a live disagreement). A heredoc terminator therefore closes only when it stands
-# ALONE, which is bash's own rule.
+# and it is not a bash parser. Two refinements were tried and removed for DIFFERENT reasons: (i) an ODD-RUN
+# backslash test — removed because bash REJECTS the only line that could exercise it (`probe() \\` is
+# `syntax error near unexpected token`, rc 2), so no valid script contains the shape; (ii) a "terminator
+# followed by `;`" convenience — removed because it was a live DISAGREEMENT with bash (`INNER;` does not
+# close a heredoc: bash warns "delimited by end-of-file" and the body runs on, so a body line leaked into the
+# scan as a definition). A heredoc terminator therefore closes only when it stands ALONE, which is bash's own
+# rule — and the fixture carries an `INNER2;` case, so the rule is pinned rather than merely stated.
 # REMAINING LIMIT, declared and not chased: a `<<` inside a quoted string is not modelled, so a file that
 # quotes one would hide the rest. No arm needs it and the reader contains none.
 lines = []
@@ -1058,6 +1058,28 @@ head_with_comment_between()
 {
   :
 }
+# ⛔ TWO LOAD-BEARING GUARDS HAD NO PIN, AND EACH CHANGES THE SCAN OF HUNDREDS OF VALID SCRIPTS (measured:
+# deleting them left ALL 246 arms green, while the `{`-on-the-next-line guard alone changes 282 of 446
+# repo scripts and `head`'s end-of-line anchor changes 129 — inventing `echo`, `printf`, `break`, `mkdir`,
+# `awk` as "definitions"). The same file already flags one 18-script guard as unpinned; these are 15x and
+# 7x that, so they get their own lines. None of them may be reported:
+#   * a bare command name followed by `:` (not a brace) — a `head` match that must NOT be claimed;
+#   * a command with arguments, then `{` on the next line — likewise;
+#   * a head followed by a line that CONTAINS `{` but does not start with it.
+bare_command_name
+:
+build_it --fast
+{
+  :
+}
+prefix_name
+echo x { :; }
+#   * and a heredoc whose terminator line is `INNER2;` — bash does NOT close it there (the body runs on), so
+#     the line after must not be scanned as code.
+cat <<'INNER2'
+INNER2;
+after_bad_terminator() { :; }
+INNER2
 FIXTURE
 _scan_fixture="$(python3 "$T/defs.py" "$T/defs-fixture.sh")"
 ck "f11f-0 …and every one of those spellings is really SEEN (brace on either line, any indent), while bare keywords followed by '{' are not counted" \
@@ -1641,9 +1663,10 @@ ck "j16s2 …while with a stat answer the ABSENT verdict IS stated as proof (bot
 # ⛔ AND THE ARM IS THE `unknown` PATH ONLY — ITS LABEL USED TO CLAIM THE GENERAL RULE (round 46 review, P2 —
 # measured): with the SHIPPED reader a symlink LOOP answers `other` → 5 through the errno arm (same verdict,
 # different arm), and a DANGLING link answers `absent` → 3 — which the ROUND-48 REVIEW FALSIFIED as a general
-# rule: NO spelling of a path whose chain holds an unresolvable link is absent — measured across hundreds of
-# generated spellings on both readers (two independent generators, 400 and 406), where the rc-3 set is
-# identical between them and contains no UNRESOLVABLE link. What
+# rule: NO spelling of a path whose chain holds an unresolvable link is absent — the rc-3 set contains no
+# UNRESOLVABLE link and is identical between the two readers. (No counts here on purpose: three independently
+# built generators gave three different totals, so an integer would be a claim nobody can re-verify. The
+# INVARIANT is what the sentence asserts, and it holds on every generator.) What
 # WAS wrong was the ANCESTOR spelling: `$T/dirlink/repos.conf` answered 3 with an interpreter and 5 without
 # one, so the better-equipped reader gave the more dangerous answer, and `j16t`/`j16t2` now pin the agreement
 # (this arm, `j16l`, is a COMPONENT fixture that asserts 5 — it never owned a claim about 3). So "never (3)" is true of THIS reader and this arm, not of symlinks in
