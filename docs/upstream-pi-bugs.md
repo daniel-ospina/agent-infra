@@ -1071,9 +1071,9 @@ Ink-based TUI with a large mounted output also burn under the same profile?
    every entry to build a fresh array per frame.
    **Landed upstream as of `pi` 1.2.0** — `getSessionStats()` now caches on
    `(session, sessionId, leafId, entryCount, limitsModel)`
-   (`dist/modes/interactive/components/footer.js:85-95`, whose own docstring
-   states the reason: "the footer renders on every frame"). See the re-measure
-   below; this is the one recommendation of the five that has shipped.
+   (`dist/modes/interactive/components/footer.js:77-95`, whose docstring at
+   `:77` states the reason: "the footer renders on every frame"). See the
+   re-measure below; this is the one recommendation of the five that has shipped.
 3. **Make frames cheap and windowed** (the issue's ask 2). Note the ask as
    filed — "make the idle path event-driven" — is **insufficient as stated and
    is not adopted here without re-derivation**: an animated indicator (`Working`
@@ -1120,10 +1120,11 @@ could resolve, **18 had no session directory at all** (nothing at
 `~/.pi/agent/sessions/--<cwd>--/`), and exactly **one** `.jsonl` in the whole
 sessions tree had been written in the previous 15 minutes. Silence therefore read
 `None` for 18 of 19 — the 09-16 predicate is a single-host artifact and cannot be
-the fleet's trip. (The probe's denominator is the 19 processes it could map, not
-the whole process table: the `rchar` windows below count **22–30** `pi`
-processes, including headless and ephemeral children that resolve no cwd at all
-— which is itself the point.)
+the fleet's trip. (The probe's denominator is the 19 processes whose cwd it could
+map, not the whole process table: the `rchar` windows below count **22–30** `pi`
+processes, so the probe's 19 is a subset of the live processes rather than all of
+them — which is itself the point: for the rest the predicate cannot even be
+evaluated.)
 
 The substitute is **`/proc/<pid>/io`'s `rchar`**, which needs no cooperation from
 `pi` and separates the two cases this issue conflates: *idle* (reads sit on a flat
@@ -1144,11 +1145,14 @@ epoch — the property the epoch analysis above found missing across windows.
 
 - **12 distinct idle TUI processes across the four windows, and the worst of them
   is 0.3% of a core** (11 of 12 at ≤ 0.2%). Their read rate sits in a narrow
-  **8–10.4 KB/s** band in every window — the idle samples the pid series below
-  quote read 8.4, 8 and 10 KB/s, and the 10.4 KB/s case is the exception two
-  bullets down — a fixed background poll, not input, so the floor is a stable
-  control rather than a per-process accident. It is a *band*, not a constant:
-  the spread is small but real, and one sample sits just above it.
+  **8–10 KB/s** band in every window — the idle samples the pid series below
+  quote read 8.4, 8 and 10 KB/s, and the 10.4 KB/s case three bullets down sits
+  just above it — a fixed background poll, not input, so the floor is a stable
+  control rather than a per-process accident. Two honest qualifications: it is a
+  *band*, not a constant; and it is a **read** floor, not by itself a classifier
+  — the working minimum in one window (10.4 KB/s) is just above the idle maximum
+  (10 KB/s), so the idle/working split is made by ΔCPU and `rchar` is the
+  corroborating signal, which is exactly what the next bullet tests.
 - **No window contained a process above 1% of a core with reads at that floor** —
   which is exactly the 09-16 defect signature (11 processes at 6.4–26.3% while
   silent for 1.0–209.5 min). Run as a filter over all four windows it returns
