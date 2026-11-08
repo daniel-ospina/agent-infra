@@ -148,6 +148,15 @@ That is how the sessions in #942 were recovered (`loop_liveness` located `01a09b
   consecutive reads remove the redraw case, not this one. A positive pi-footer check would close it and
   is the vocabulary `orchestrator-heartbeat.sh`'s `_shell_visible` owns — one source of truth beats a
   drifted second one, so it stays declared here.
+- **Declared residual (not closed):** the `--new` appearance proof cannot tell two pis in ONE cwd
+  apart. Proof (i) is realpath **identity** on the cwd read from the transcript — stricter than
+  containment, and the round-6 fix — but identity is not ATTRIBUTION: a `task` child is literally a
+  second pi in the lane's own directory ([fleet liveness](./fleet-liveness.md) records that state as
+  measured, together with a nine-lanes-one-cwd box), so a co-located lane or child that starts a
+  session inside the `--wait` window reads `CONFIRMED` for a relaunch that started nothing. Closing
+  it needs an identity the transcript does not carry (the pid that wrote the first record), which is
+  a session-lifecycle change rather than a guard here, so the window stays declared — read the exit-0
+  with it in mind, exactly like proof (ii)'s below.
 - **Declared residual (not closed):** the shell-prompt guard is a last-character test, so a live pi
   whose session record is stale (the documented record-only-dead class), not drawing `Working`, and
   whose last line happens to end in `$ % # ❯ »` would be mistaken for a shell. Three guards must miss

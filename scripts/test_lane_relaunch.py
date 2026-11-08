@@ -621,8 +621,13 @@ def _fold_argv(node):
 
 
 def test_no_destructive_verb_on_any_path(R, tmp_path):
-    """Every path the tool can take, every argv it builds, checked against the verb list. This is
-    the test that fails if someone 'fixes' the tool into `respawn-pane`."""
+    """Every path the tool can take, every argv it builds, checked against the verb list.
+
+    ⛔ THE BLOB ARM BELOW IS A BACKSTOP, NOT THE GUARD (review obs 1): `_forbidden_in` refuses before
+    any argv is recorded, so a forbidden verb cannot appear in `seen` unless the tripwire is gone — in
+    which case `fresh_sent`/`seen` still exist and the source scan is what reds. The tripwire's OWN
+    behaviour is pinned by `test_every_forbidden_verb_is_caught_by_the_tripwire` and
+    `test_the_tripwire_fires_on_a_REAL_path_before_any_send`."""
     path = _transcript(tmp_path)
     scenarios = [
         dict(ls=FakeLS(transcript=path), cmux=FakeCmux()),
@@ -692,7 +697,11 @@ def test_no_destructive_verb_on_any_path(R, tmp_path):
         assert seq[i + 1] in allowed, (
             "line %d builds the cmux verb %r, outside %s" % (node.lineno, seq[i + 1], sorted(allowed)))
         joined = " ".join(s for s in seq if s is not None)
-        for verb in ("respawn-pane", "close-workspace", "kill-pane"):
+        # ⛔ THE TABLE, NOT A HAND-SPELLED SUBSET (review obs 1, 2026-11-08): the literal triple that
+        # stood here missed `respawn_pane`, `close_workspace`, `kill_pane` and `terminal close` — the
+        # spellings the tool would grow first, since a rewrite reaching for the verb rarely types the
+        # hyphenated form. One table, shared with the tool, is the only version that cannot drift.
+        for verb in R.FORBIDDEN_VERBS:
             assert verb not in joined, (
                 "line %d builds a destructive verb: %r" % (node.lineno, joined))
     assert checked, "no cmux argv was bound by the source check — is the argv construction gone?"
@@ -727,10 +736,59 @@ def test_no_destructive_verb_on_any_path(R, tmp_path):
             continue
         if id(node) in defin or id(node) in docstrings:
             continue
-        for verb in ("respawn-pane", "close-workspace", "kill-pane"):
+        for verb in R.FORBIDDEN_VERBS:
             assert verb not in node.value, (
                 "a string constant outside a docstring spells a destructive verb (line %d): %r"
                 % (node.lineno, node.value))
+
+
+# ── the tripwire itself (review obs 1, 2026-11-08) ─────────────────────────────────────────────
+def test_every_forbidden_verb_is_caught_by_the_tripwire(R):
+    """⛔ THE SWEEP'S BLOB ARM CANNOT EXERCISE THE TRIPWIRE, WHICH IS WHAT MADE IT VACUOUS (review
+    obs 1). `_forbidden_in` refuses BEFORE an argv is recorded, so `seen` is clean by construction and
+    no assertion over it can red for a forbidden verb. The tripwire is what the PR's headline safety
+    claim rests on, so it is pinned directly: every verb in the table must be DETECTED, the real
+    launch shape must pass, and the table must not be quietly shortened.
+
+    Non-vacuity: `return ""` (delete the scan) reds the loop; dropping a spelling from
+    `FORBIDDEN_VERBS` reds the coverage arm below. That coverage arm states the concepts HERE rather
+    than deriving them from the same tuple, because a row that iterates the table cannot notice the
+    table shrinking.
+    """
+    for verb in R.FORBIDDEN_VERBS:
+        assert R._forbidden_in(["cmux", "send", "--workspace", "ws-1", "cd /x && " + verb]) == verb, (
+            "`_forbidden_in` did not catch %r" % verb)
+    assert R._forbidden_in(
+        ["cmux", "send", "--workspace", "ws-1", "cd /tmp/lane && /usr/bin/pi --session s-1\n"]) == "", (
+        "the tripwire refuses a legitimate launch line")
+    for concept, spellings in {"respawn": ("respawn-pane", "respawn_pane"),
+                               "close": ("close-workspace", "close_workspace"),
+                               "kill": ("kill-pane", "kill_pane")}.items():
+        for sp in spellings:
+            assert sp in R.FORBIDDEN_VERBS, (
+                "FORBIDDEN_VERBS lost the %s spelling %r" % (concept, sp))
+
+
+def test_the_tripwire_fires_on_a_REAL_path_before_any_send(R, tmp_path):
+    """The END-TO-END companion to the row above.
+
+    `_forbidden_in` substring-scans the whole payload INCLUDING the cwd (review obs 4 — fail-closed,
+    a note not a defect), so a lane whose worktree is named e.g. `close-workspace-test` reaches the
+    tripwire on an ordinary resume-arm run. That is the ONE path on which the tripwire is reachable
+    from outside the tool, so it is used to prove the refusal happens BEFORE anything is typed.
+
+    Non-vacuity: delete the `bad = _forbidden_in(argv)` / `if bad:` arm and the send proceeds —
+    `refused` False and `cmux.sent()` non-empty. Drop a spelling from `FORBIDDEN_VERBS` and the same
+    happens, so this row pins the table end-to-end, not just the scanner.
+    """
+    path = _transcript(tmp_path)
+    lane = tmp_path / "close-workspace-lane"
+    lane.mkdir()
+    cmux = FakeCmux()
+    obs = _run(R, FakeLS(transcript=path), cmux, cwd=str(lane))
+    assert obs["refused"] is True, obs
+    assert "REFUSING" in obs["reason"], obs
+    assert cmux.sent() == [], "a destructive-verb payload reached the pane: %r" % (cmux.calls,)
 
 
 # ── the reporting layer (review finding 1) ────────────────────────────────────────────────────
