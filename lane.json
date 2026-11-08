@@ -1,0 +1,21 @@
+{
+  "artifacts": [],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 7800,
+  "exit_code": null,
+  "heartbeat_at": 1794139549,
+  "host": "Daniels-MacBook-Air-new",
+  "issue": 3785,
+  "kind": "fixer",
+  "lane_id": "Daniels-MacBook-Air-new.kfixer-3785-1794139549-p17377-48453314",
+  "lease_until": 1794147349,
+  "pid": 17377,
+  "reason": null,
+  "repo": "daniel-ospina/agent-infra",
+  "schema": 1,
+  "started_at": 1794139549,
+  "state": "RUNNING",
+  "tag": "3785",
+  "worktree": "/Users/danielospina/Documents/GitHub/agent-infra"
+}
