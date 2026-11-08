@@ -704,10 +704,31 @@ ck "  …and \`gate\` covers the floor/gate work it names — a \`floor_emergenc
    "$(if [ "${_floor_in_gate:-no}" = "yes" ]; then echo 0; else echo 1; fi)"
 
 # 9.1d-iii: NO NAP SITE MAY BE DROPPED, and the count is derived from the NAPS the loop performs.
-_nap_n="$(printf '%s\n' "$_loop_nc" | grep -cE '^[[:space:]]*stg_nap_mark([[:space:]]|$)')"
-_loop_n="$(printf '%s\n' "$_loop_nc" | grep -cE '^[[:space:]]*(fork_free_sleep|sleep) ')"
-ck "every nap path calls stg_nap_mark (${_nap_n} nap_mark sites for ${_loop_n} sleep/fork_free_sleep lines — a path without one loses prev_wait)" \
-   "$(if [ "${_nap_n:-0}" -ge 3 ] && [ "${_nap_n:-0}" -ge "$(( ${_loop_n:-0} - 1 ))" ]; then echo 0; else echo 1; fi)"
+# ⛔ THE COUNT IS SCOPED TO THE CONTROLLER'S OWN LOOP, NOT TO THE WHOLE FILE (agent-infra#3762,
+# measured). `cascade_wait()` is a HELPER defined ABOVE `while true; do`, and its poll — `fork_free_sleep
+# "$poll" || sleep "$poll"` — is a cadence measurement, not a cycle nap: it returns the moment a slot
+# frees and has no `prev_wait` to carry. It was added by #3594, which took `_loop_n` from 4 to 5 while
+# `_nap_n` stayed 3, so `_nap_n >= _loop_n - 1` became `3 >= 4` and this arm reddened ON MAIN — a false
+# FAIL on a correct tree, for every branch off it, without grading a helper's poll as if it were a
+# cycle nap. The region is derived, never assumed: a file that loses its `while true; do` FAILS here
+# rather than silently counting every sleep in the file.
+# ⛔ WHAT THIS ARM DOES **NOT** PROVE, MEASURED RATHER THAN ASSUMED (review cycle 10, P2-1). An earlier
+# revision of this comment claimed "the slack of 1 is exactly the fork-starved site's TWO nap forms
+# sharing ONE mark". That is FALSE. The body holds 4 nap lines and 3 marks, so `_nap_n >= _loop_n - 1`
+# grants ONE FREE nap-line removal to ANY site: deleting the disk-held nap (`orch-loop.sh:4732`) or the
+# fork-starved nap (`:4624`) leaves this arm GREEN — those two are caught only by the sibling arm
+# asserting every `stg_nap_mark` samples `STG_WAIT_T0`; and moving the NORMAL-PATH nap (`:8877`,
+# `sleep … & wait $!`, the else branch) above the loop reddens NOTHING in this suite at all (measured:
+# 123 passed, 0 failed) — i.e. the controller could stop napping on its normal path and this arm would
+# still certify it. Filed as agent-infra#3763. The slack is a property of the count, not of the
+# fork-starved site, and a future author must not read the green as "no nap can be dropped".
+_loop_nap_region="$(printf '%s\n' "$_loop_nc" | awk '/^[[:space:]]*while true; do/{f=1} f')"
+_region_ok=1
+[ -n "$_loop_nap_region" ] || _region_ok=0
+_nap_n="$(printf '%s\n' "$_loop_nap_region" | grep -cE '^[[:space:]]*stg_nap_mark([[:space:]]|$)')"
+_loop_n="$(printf '%s\n' "$_loop_nap_region" | grep -cE '^[[:space:]]*(fork_free_sleep|sleep) ')"
+ck "every nap path calls stg_nap_mark (${_nap_n} nap_mark sites for ${_loop_n} sleep/fork_free_sleep lines inside the controller loop — a path without one loses prev_wait; loop region ${_region_ok})" \
+   "$(if [ "$_region_ok" -eq 1 ] && [ "${_nap_n:-0}" -ge 3 ] && [ "${_nap_n:-0}" -ge "$(( ${_loop_n:-0} - 1 ))" ]; then echo 0; else echo 1; fi)"
 
 # 9.1g THE READER REFUSES A GLOB AS A STAGE NAME.
 # ⛔ THESE ARMS PIN THE OBSERVABLE, NOT THE GUARD. The wanted name is validated AND used quoted, so the
