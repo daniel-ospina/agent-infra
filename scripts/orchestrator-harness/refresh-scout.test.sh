@@ -1862,7 +1862,9 @@ if [ -s "$T/refreshblock.sh" ] && grep -q 'refresh-candidates.sh' "$T/refreshblo
   # ⛔ `REFRESH_RETRY_BACKOFF_S=0` IS LOAD-BEARING HERE, NOT A SHORTCUT (agent-infra#3584): the shipped
   # default is a 30 s then 60 s in-cycle backoff, and this arm drives the block twice — 180 s of real
   # `sleep` for a property that has nothing to do with the delay. The delay itself, its doubling, the
-  # attempt cap and the total-sleep budget are graded in (b1)-(b6) below, with the clock stubbed.
+  # attempt cap and the total-sleep budget are graded in (b1)-(b11) below — with REAL delays in
+  # (b7)/(b8)/(b9)/(b10), not a stubbed clock: (b9) sleeps 10 s + 20 s on purpose, because a clock stub
+  # is what let the doubling go ungraded in the first place (review round 2, P3).
   BL2="$T/block2"; mkdir -p "$BL2"; : > "$BL2/candidates.txt"
   printf '#!/bin/bash\nprintf "x" >> "%s/invoked"\nrefresh_record_write() { :; }\nexit 1\n' "$BL2" > "$BL2/refresh-candidates.sh"
   O="$BL2" LOG="$BL2/log" REFRESH_RETRY_BACKOFF_S=0 bash "$T/refreshblock.sh" >/dev/null 2>&1
@@ -1922,8 +1924,25 @@ if [ -s "$T/refreshblock.sh" ] && grep -q 'refresh-candidates.sh' "$T/refreshblo
   [ "$n6" = "1" ] && ok "orch-loop: a delay that does not fit the retry budget is NOT slept (no attempt 2)" \
                    || bad "orch-loop: slept past the declared retry budget ($n6 attempts)"
   grep -q 'the 1s in-cycle retry budget is spent' "$BLR3/log" 2>/dev/null \
+    && grep -q 'stale-lock guard reaping this pass while it still runs' "$BLR3/log" 2>/dev/null \
     && ok "orch-loop: the budget refusal is REPORTED, naming the stale-lock guard it protects" \
-    || bad "orch-loop: the budget refusal is silent — $(grep 'TRANSIENT' "$BLR3/log" 2>/dev/null | tail -1)"
+    || bad "orch-loop: the budget refusal is silent or does not name the guard it protects — $(grep 'TRANSIENT' "$BLR3/log" 2>/dev/null | tail -1)"
+  # (b3b) THE BUDGET HAS A CEILING TIED TO THE GUARD, so a typo cannot re-create the very double-pass
+  # this block exists to prevent (review round 2, P2 — measured). The `case` above only rejects junk, so
+  # `3000` (one extra zero) was ACCEPTED and bought 2000 s of sleep against a 1200 s stale-lock window.
+  # The lever is REFRESH_STALE_LOCK_MIN itself: at 1 the guard is 60 s, so the effective budget must be
+  # `min(300, guard/2)` = 30 s and a 40 s backoff must be REFUSED on the FIRST attempt. Instant (no sleep
+  # is taken), and it distinguishes: without the ceiling the 3000 s budget accepts the sleep.
+  BLR11="$T/retry11"; mkdir -p "$BLR11"; : > "$BLR11/candidates.txt"
+  printf '#!/bin/bash\nprintf "x" >> "%s/invoked"\nrefresh_record_write() { :; }\nexit 1\n' "$BLR11" > "$BLR11/refresh-candidates.sh"
+  O="$BLR11" LOG="$BLR11/log" REFRESH_STALE_LOCK_MIN=1 REFRESH_RETRY_BACKOFF_S=40 \
+    REFRESH_RETRY_MAX_ATTEMPTS=3 REFRESH_RETRY_BUDGET_S=3000 bash "$T/refreshblock.sh" >/dev/null 2>&1
+  n11="$(wc -c < "$BLR11/invoked" | tr -d ' ')"
+  grep -q 'the 30s in-cycle retry budget is spent' "$BLR11/log" 2>/dev/null \
+    && ok "orch-loop: a budget at/past the stale-lock guard is REFUSED (3000 -> 30s against a 60s guard)" \
+    || bad "orch-loop: a 3000s budget survived against a 60s stale-lock guard — $(grep 'TRANSIENT' "$BLR11/log" 2>/dev/null | tail -1)"
+  [ "$n11" = "1" ] && ok "orch-loop: …and the over-guard budget makes ONE attempt, so nothing is slept" \
+                    || bad "orch-loop: the over-guard budget still made $n11 attempt(s)"
   # (b4) A PERMANENT REFUSAL IS NEVER RETRIED IN-CYCLE. rc=3 and rc=78 are verdicts about the BOX, not
   # the network; retrying them is the #1736 defect. (Arm (a) grades the across-cycle half.)
   BLR4="$T/retry4"; mkdir -p "$BLR4"; : > "$BLR4/candidates.txt"
@@ -1951,7 +1970,7 @@ if [ -s "$T/refreshblock.sh" ] && grep -q 'refresh-candidates.sh' "$T/refreshblo
   n9="$(wc -c < "$BLR6/invoked" | tr -d ' ')"
   [ "$n9" = "3" ] && ok "orch-loop: a junk REFRESH_RETRY_MAX_ATTEMPTS falls back to the default (3), not to no cap" \
                    || bad "orch-loop: REFRESH_RETRY_MAX_ATTEMPTS=abc gave $n9 attempt(s), expected the default 3"
-  # ...and the same guard is what rejects an OUT-OF-RANGE value, so the ceiling is real too.
+  # (b11) the same guard is what rejects an OUT-OF-RANGE value, so the ceiling is real too.
   BLR8="$T/retry8"; mkdir -p "$BLR8"; : > "$BLR8/candidates.txt"
   printf '#!/bin/bash\nprintf "x" >> "%s/invoked"\nrefresh_record_write() { :; }\nexit 1\n' "$BLR8" > "$BLR8/refresh-candidates.sh"
   O="$BLR8" LOG="$BLR8/log" REFRESH_RETRY_BACKOFF_S=0 REFRESH_RETRY_MAX_ATTEMPTS=99 \

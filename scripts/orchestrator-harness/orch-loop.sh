@@ -8811,7 +8811,8 @@ PY
       # attempt takes. And it cannot shorten a FIRST attempt that on its own outlives the guard — that
       # pre-existing exposure is the pass's, and is named in `refresh-candidates.sh` rather than papered
       # over here. The shipped defaults (30 + 60 s of sleep against a 300 s budget, under a 20 min guard)
-      # leave an order of magnitude of headroom for a pass that completes in its usual seconds.
+      # leave a factor of ~4 of headroom for a pass that completes in its usual seconds — ~1.8x at the
+      # ~6m20s pass the paragraph above cites, which is the honest figure, not "an order of magnitude".
       # ⛔ AND IT DOES NOT RETRY A PERMANENT VERDICT. rc=3 (NOT PROVISIONABLE) and rc=78 (a config
       # refusal) are facts about the BOX, not about the network; retrying them is the #1736 defect the
       # two `elif` arms below exist to prevent.
@@ -8841,6 +8842,23 @@ PY
       REFRESH_RETRY_BUDGET_S="${REFRESH_RETRY_BUDGET_S:-300}"
       case "$REFRESH_RETRY_BUDGET_S" in
         ''|*[!0-9]*|0[0-9]*|[0-9][0-9][0-9][0-9][0-9][0-9][0-9]*) REFRESH_RETRY_BUDGET_S=300 ;; esac
+      # ⛔ AND A CEILING DERIVED FROM THE GUARD IT PROTECTS (review round 2, P2 — measured). The shape
+      # above rejects JUNK; it cannot tell that a four-digit number is a TYPO rather than a choice, and
+      # that is precisely the failure this block exists to prevent. Measured on the shipped code:
+      # `REFRESH_RETRY_BUDGET_S=3000` — one extra zero, 4 digits, no leading zero, ACCEPTED — bought
+      # 2000 s of sleep against the 1200 s (20 min) `REFRESH_STALE_LOCK_MIN` window, i.e. exactly the
+      # "reaped by the NEXT cycle while STILL RUNNING" double-pass the lock exists to prevent. So the
+      # budget may not REACH the guard: at or past it the value falls back to `min(shipped default,
+      # half the guard)` rather than being silently shortened to the guard — a silent clamp would make
+      # the effective policy unnamed and let an operator believe a setting was honoured when it was not.
+      # This is the knob's SECOND guard and each class is still ATTRIBUTABLE: junk and leading zeros are
+      # the `case` above, a numeric value at/past the guard is this test. (The other three knobs have
+      # exactly one, per the note below.)
+      _budget_cap=$(( ${REFRESH_STALE_LOCK_MIN:-20} * 60 / 2 ))
+      [ "$_budget_cap" -gt 300 ] && _budget_cap=300
+      if [ "$REFRESH_RETRY_BUDGET_S" -ge "$(( ${REFRESH_STALE_LOCK_MIN:-20} * 60 ))" ]; then
+        REFRESH_RETRY_BUDGET_S="$_budget_cap"
+      fi
       # ⛔ THE RETRY BACKOFF IS DECLARED IN-BAND AS NOT-A-CYCLE-NAP, and the markers are load-bearing
       # (agent-infra#3584). `cycle-stages.test.sh` §9.1d-iii derives its nap population from the
       # `sleep`/`fork_free_sleep` lines inside the controller loop and requires every one of them to be
