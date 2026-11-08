@@ -195,15 +195,18 @@ _rs_nearest_existing_ancestor() {
   # traversable grandparent; what the caller does with the link is the caller's business, stated there.
   # ⛔ AND THE CALLER NOW REFUSES IT ON BOTH ROUTES (round 48 review, P2 — this note used to say the refusal
   # was the `unknown` path only, "because a DANGLING link is `absent`, whose 3 is correct"). THE STAT ANSWER
-  # DOES NOT DECIDE THE VERDICT ANY MORE: the ancestor-link arm in `repo_set_parse` claims every shape whose
-  # chain holds a link that cannot be resolved, BEFORE the absence test, and answers 5 with an executable
-  # interpreter (`absent`), with none (`unknown`) and through a loop (`other`) alike. Measured: every
-  # unresolvable-link spelling answers 5 on both readers, and the rc-3 set is IDENTICAL between them and
-  # contains no UNRESOLVABLE link. ⛔ AND IT MUST NOT OVERCLAIM THE OTHER WAY EITHER: rc 3 IS right for a
-  # spelling that traverses a link which RESOLVES, because then only the remainder is absent
-  # (`<a good link>/nope.conf` → 3). No COUNTS are quoted here on purpose — three independently built
-  # generators produced three different totals, so an integer would be a claim a reader cannot re-verify;
-  # the invariant is what matters, and it survived all three.
+  # DOES NOT DECIDE THE VERDICT ANY MORE: a shape whose chain holds a link that cannot be resolved is
+  # refused 5 before the absence test can see it. ⛔ BUT IT IS NOT ALWAYS THIS ARM THAT REFUSES IT (#3960
+  # review cycle 2, P3 — measured, and this sentence used to claim the opposite): a link LOOP answers
+  # `other` at `_rs_stat_kind`, and `denied|other` returns 5 from the ERRNO arm, which runs EARLIER — so the
+  # ancestor-link arm is the refusal route for `absent`-with-errno and for `unknown`, and the loop's 5 has
+  # the same verdict through a different arm. Measured: every unresolvable-link spelling answers 5 on both
+  # readers whatever the arm, and the rc-3 set is IDENTICAL between them and contains no UNRESOLVABLE link.
+  # ⛔ AND IT MUST NOT OVERCLAIM THE OTHER WAY EITHER: rc 3 IS right for a spelling that traverses a link
+  # which RESOLVES, because then only the remainder is absent (`<a good link>/nope.conf` → 3). No COUNTS are
+  # quoted here on purpose — three independently built generators produced three different totals, so an
+  # integer would be a claim a reader cannot re-verify; the invariant is what matters, and it survived all
+  # three.
   # The old sentence was falsified by that arm and would teach the next lane to restore the 3.
   # A link that DOES resolve is still found by `-e` first, so the ordinary walk is untouched.
   while [ -n "$d" ] && [ "$d" != "/" ] && [ "$d" != "." ]; do

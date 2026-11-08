@@ -927,29 +927,147 @@ raw_lines = [l.rstrip('\n') for l in open(sys.argv[1], encoding='utf-8')]
 # FABRICATED one from `key \` + `{ value` inside a heredoc (a false RED) — both reproduced, both gone, and
 # each is pinned by a fixture line.
 # ⛔ WHAT THIS SCANNER IS AND IS NOT. It answers ONE question — which names does a VALID bash file define —
-# and it is not a bash parser. Two refinements were tried and removed for DIFFERENT reasons: (i) an ODD-RUN
-# backslash test — removed because bash REJECTS the only line that could exercise it (`probe() \\` is
-# `syntax error near unexpected token`, rc 2), so no valid script contains the shape; (ii) a "terminator
-# followed by `;`" convenience — removed because it was a live DISAGREEMENT with bash (`INNER;` does not
-# close a heredoc: bash warns "delimited by end-of-file" and the body runs on, so a body line leaked into the
-# scan as a definition). A heredoc terminator therefore closes only when it stands ALONE, which is bash's own
-# rule — and the fixture carries an `INNER2;` case, so the rule is pinned rather than merely stated.
-# REMAINING LIMIT, declared and not chased: a `<<` inside a quoted string is not modelled, so a file that
-# quotes one would hide the rest. No arm needs it and the reader contains none.
+# and it is not a bash parser. A "terminator followed by `;`" convenience was tried and REMOVED because it
+# was a live DISAGREEMENT with bash (`INNER;` does not close a heredoc: bash warns "delimited by end-of-file"
+# and the body runs on, so a body line leaked into the scan as a definition); the fixture carries an
+# `INNER2;` case so that rule is pinned rather than merely stated.
+# ⛔ AND THE JOIN IS BASH'S JOIN, ON THE ONE POINT THAT MATTERS (#3960 review cycle 2, P2 — measured): a line
+# continues only on an ODD run of trailing backslashes. `echo a\\` (an EVEN run) is valid bash whose line ENDS
+# there, and stripping one backslash and joining anyway swallowed the real definition on the next line — a
+# FALSE PASS for the namespace arm, the same class as the phantom heredoc below. The note that used to sit
+# here justified removing an odd-run test by saying "bash REJECTS the only line that could exercise it";
+# `probe() \\` is indeed a syntax error, but it is the ODD case, and the live defect was the EVEN one on a
+# line bash accepts. Both directions are now pinned by a fixture line.
+# ⛔ THE OPENER IS FOUND BY A WALK, NOT BY A SUBSTRING SEARCH (#3960 review cycle 2, P2 — measured). A regex
+# over the whole line has no idea whether a `<<` sits in a comment or in an arithmetic expansion, and two
+# valid-bash shapes made it open a PHANTOM heredoc that swallowed the rest of the file — so the namespace arm
+# stayed GREEN with an out-of-namespace helper defined right there (a FALSE PASS), and a body line leaked
+# into the scan as a definition (a FALSE RED). `_openers` therefore walks the line with bash's own quoting,
+# comment and `$(( … ))` rules, and RECORDS EVERY opener in bash's order rather than only the first.
+# REMAINING LIMIT, declared and not chased: a `<<` inside a `$( … )` command substitution, inside `[[ … ]]`,
+# or spelled with a parameter expansion (`<<$X`) is not modelled. No arm needs any of them and the reader
+# contains none — and unlike the superseded note, this list is what the two false-PASS shapes above taught
+# the walk to EXCLUDE, so it is the residue of a measured search rather than a guess.
+def _odd_backslashes(s):
+    """True when s ends in a run of backslashes that bash reads as a line continuation."""
+    n = 0
+    while n < len(s) and s[len(s) - 1 - n] == '\\':
+        n += 1
+    return n % 2 == 1
+
+
+def _openers(line):
+    """Every heredoc opened on ONE logical line, in bash's order, as (delimiter, strip_tabs).
+
+    A comment ends at the newline (so a trailing `#` also ends the scan), a quoted delimiter keeps
+    its own quoting rules, and `$(( … ))` / `(( … ))` are arithmetic where `<<` is a shift.
+    """
+    out = []
+    i, n = 0, len(line)
+    quote = None
+    arith = 0
+    while i < n:
+        c = line[i]
+        if quote == "'":
+            if c == "'":
+                quote = None
+            i += 1
+            continue
+        if quote in ('"', '`'):
+            if c == '\\':
+                i += 2
+                continue
+            if c == quote:
+                quote = None
+            i += 1
+            continue
+        if c == '\\':
+            i += 2
+            continue
+        if c == '#' and (i == 0 or line[i - 1] in ' \t;|&('):
+            break
+        if c in ('"', "'", '`'):
+            quote = c
+            i += 1
+            continue
+        if arith:
+            if line.startswith('))', i):
+                arith -= 1
+                i += 2
+                continue
+            i += 1
+            continue
+        # `(( … ))` and `$(( … ))` alike: `$` is walked as an ordinary character, so the two parens
+        # that follow it open the arithmetic context. Inside it, `<<` is a SHIFT, never an opener.
+        if line.startswith('((', i):
+            arith += 1
+            i += 2
+            continue
+        if line.startswith('<<', i):
+            j = i + 2
+            if j < n and line[j] == '<':      # `<<<` is a here-STRING: it has no body
+                # ⛔ DECLARED NO-OP, not a pinned arm (#3960 review cycle 2): every `<<<` spelling yields an
+                # EMPTY delimiter below anyway, because the third `<` is never a delimiter word — so no
+                # fixture can discriminate this guard and none pretends to. It is kept because it states
+                # the intent at the point a reader would otherwise wonder, and the fixture's two `<<<`
+                # lines still pin the PROPERTY (a here-string never swallows the lines after it).
+                i = j + 1
+                continue
+            strip_tabs = False
+            if j < n and line[j] == '-':
+                strip_tabs = True
+                j += 1
+            while j < n and line[j] in ' \t':
+                j += 1
+            delim = ''
+            if j < n and line[j] in '\'"\\':
+                q = line[j]
+                j += 1
+                if q in ("'", '"'):          # a QUOTED delimiter may hold any character
+                    while j < n and line[j] != q:
+                        delim += line[j]
+                        j += 1
+                    j += 1
+                elif j < n:                    # `<<\WORD`: the backslash quotes ONE character
+                    delim = line[j]
+                    j += 1
+                while j < n and (line[j].isalnum() or line[j] in '_.-'):
+                    delim += line[j]
+                    j += 1
+            else:
+                while j < n and (line[j].isalnum() or line[j] in '_.-'):
+                    delim += line[j]
+                    j += 1
+            # ⛔ NO NUMERIC-DELIMITER EXEMPTION (review cycle 2): it existed for `$(( x << 15 ))`, which
+            # the arithmetic context above already skips, and it was WRONG about `cat <<123` — a real
+            # heredoc bash runs. The fixture pins the numeric spelling now.
+            if delim:
+                out.append((delim, strip_tabs))
+            i = j
+            continue
+        i += 1
+    return out
+
+
 lines = []
-_heredoc = None
+_pending = []       # heredocs whose BODIES are still to come, in bash's order
+_buf = None
 for _l in raw_lines:
-    if _heredoc is not None:
-        if _l.strip() == _heredoc:
-            _heredoc = None
+    if _pending:
+        _delim, _strip = _pending[0]
+        _cand = _l.lstrip('\t') if _strip else _l
+        if _cand == _delim:            # `<<-` permits leading TABS, nothing else permits anything
+            _pending.pop(0)
         continue
-    if lines and lines[-1].endswith('\\') and not lines[-1].lstrip().startswith('#'):
-        lines[-1] = lines[-1][:-1] + _l
-    else:
-        lines.append(_l)
-    _mh = re.search(r'<<-?\s*[\'\"]?([A-Za-z_][A-Za-z0-9_]*)', _l)
-    if _mh and not _l.lstrip().startswith('#'):
-        _heredoc = _mh.group(1)
+    _buf = _l if _buf is None else _buf + _l
+    if _odd_backslashes(_buf) and not _buf.lstrip().startswith('#'):
+        _buf = _buf[:-1]
+        continue
+    lines.append(_buf)
+    _pending.extend(_openers(_buf))
+    _buf = None
+if _buf is not None:
+    lines.append(_buf)
 defs = []
 for i, raw in enumerate(lines):
     if raw.lstrip().startswith('#'):
@@ -1026,8 +1144,14 @@ continued_name() \
   :
 }
 # ⛔ AND A COMMENT THAT *MENTIONS* AN OPENER MUST NOT OPEN ONE (measured: this guard changes the scan of 21
-# repo scripts and NO arm pinned it, so deleting it left the suite green). Without it, `NOTES` below starts
-# swallowing lines, and `after_notes_comment()` disappears from the scan.
+# of the 446 shebang-marked, `bash -n`-clean scripts in this repo and NO arm pinned it, so deleting it left
+# the suite green). Without it, `NOTES` below starts swallowing lines, and `after_notes_comment()` disappears
+# from the scan.
+# ⛔ THE POPULATION IS PART OF THE CLAIM. The same guard moves 20 of the 435 `git ls-files '*.sh'` files at
+# this head, so the integer MOVES with the population — which is exactly why the superseded "18 repo scripts"
+# was unverifiable, and why the population (not the number) is the reproducible half. Cycle 2 also measured
+# the shape it fails on: a TRAILING comment (`x=1  # see cat <<'NOTE'`) opened the phantom heredoc even where
+# the whole-line form was exempted, so the fixture carries that spelling too.
 # see cat <<'NOTES' in the wiki for why this is spelled out
 after_notes_comment() { :; }
 # ⛔ BOTH DIRECTIONS OF THE JOIN ARE PINNED HERE (round 48 review, P2 — measured). A comment ENDS at the
@@ -1058,11 +1182,14 @@ head_with_comment_between()
 {
   :
 }
-# ⛔ TWO LOAD-BEARING GUARDS HAD NO PIN, AND EACH CHANGES THE SCAN OF HUNDREDS OF VALID SCRIPTS (measured:
-# deleting them left ALL 246 arms green, while the `{`-on-the-next-line guard alone changes 282 of 446
-# repo scripts and `head`'s end-of-line anchor changes 129 — the two between them inventing `echo`, `printf`,
-# `break`, `mkdir`, `awk` as "definitions"). The same file already flags one 21-script guard as unpinned;
-# these are ~13x and ~6x that, so they get their own lines. None of them may be reported:
+# ⛔ TWO LOAD-BEARING GUARDS HAD NO PIN, AND EACH CHANGES THE SCAN OF HUNDREDS OF VALID SCRIPTS (measured at
+# this head over the 446 shebang-marked, `bash -n`-clean scripts: deleting them left ALL 246 arms green, while
+# the `{`-on-the-next-line guard alone changes 282 of them and `head`'s end-of-line anchor changes 129 — the
+# two between them inventing `echo`, `printf`, `break`, `mkdir`, `awk` as "definitions"). The same file
+# already flags one 21-script guard as unpinned; these are ~13x and ~6x that, so they get their own lines.
+# The integers are given WITH their population because they move with it (over `git ls-files '*.sh'`, 435
+# files, the same two mutants move 276 and 128); reproduce with the mutant, not the number. None of them may
+# be reported:
 #   * a bare command name followed by `:` (not a brace) — a `head` match that must NOT be claimed;
 #   * a command with arguments, then `{` on the next line — likewise;
 #   * a head followed by a line that CONTAINS `{` but does not start with it.
@@ -1101,10 +1228,65 @@ cat <<-'INNER3'
 	not_a_def_from_a_tab_heredoc() { :; }
 	INNER3
 real_after_tab_heredoc() { :; }
+# ⛔ THE OPENER IS FOUND BY A WALK, NOT A SEARCH (#3960 review cycle 2, P2 — measured). Each of these
+# shapes opened a PHANTOM heredoc and swallowed everything after it, so the namespace arm went GREEN with an
+# out-of-namespace helper defined right there (a FALSE PASS). None may open one, so these definitions MUST
+# be seen: an ARITHMETIC SHIFT, and a TRAILING COMMENT that mentions an opener.
+_rs_shift=$(( 1 << 3 ))
+_rs_depth=3
+_rs_cap=$(( 1 << _rs_depth ))
+_rs_note=1   # see cat <<'NOTES' in the handbook
+_rs_other='a <<b not an opener'
+after_arith_and_trailing_comment() { :; }
+# ⛔ A DELIMITER CLOSES ONLY ON THE EXACT LINE (#3960 review cycle 2, P2 — measured). `<<-` permits LEADING
+# TABS; plain `<<` permits nothing, not even a space. A space-padded terminator therefore does not close, so
+# the definition after it is still BODY and must NOT be reported; the tab-arm is pinned in the POSITIVE
+# direction, so `after_tabbed_terminator` MUST be reported.
+cat <<PADDED
+  PADDED
+still_body_after_space_padded_terminator() { :; }
+PADDED
+cat <<-'TABBED'
+	TABBED
+after_tabbed_terminator() { :; }
+TABBED
+# ⛔ AND THE DELIMITER TOKEN FOLLOWS BASH'S OWN QUOTING (#3960 review cycle 2, P2 — measured): `<<\EOD` is a
+# standard spelling whose body bash never runs, and TWO openers on ONE line read their bodies IN ORDER. The
+# single-opener model fabricated a definition out of each body, so only the trailing real definitions below
+# may be reported.
+cat <<\BSLASHED
+body_of_backslashed_opener() { :; }
+BSLASHED
+# …and a backslash-quoted delimiter is a WORD, so it keeps its own punctuation: the delimiter here is
+# `HY-PHEN`, not `HY`. Getting that wrong leaves the heredoc open forever (a silent swallow).
+cat <<\HY-PHEN
+body_of_hyphenated_backslashed_opener() { :; }
+HY-PHEN
+# …and a NUMERIC delimiter is a real heredoc bash runs, so its body must not be scanned as code.
+cat <<123
+body_of_numeric_delimiter() { :; }
+123
+# ⛔ A HERE-STRING IS NOT A HEREDOC (#3960 review cycle 2, P2 — measured). `<<<` takes a WORD and has NO body,
+# but with a QUOTED operand the `<<`-lookalike opened a phantom heredoc whose delimiter was the operand and
+# swallowed the rest. Both spellings must leave the scan intact, so this definition MUST be seen.
+grep -q x <<< 'quoted value'
+grep -q x <<<plain_word
+after_here_strings() { :; }
+cat <<ONE <<TWO
+body_of_first_opener() { :; }
+ONE
+body_of_second_opener() { :; }
+TWO
+after_two_openers() { :; }
+# ⛔ AN EVEN RUN OF BACKSLASHES IS NOT A CONTINUATION (#3960 review cycle 2, P2 — measured). `echo a\\` is
+# VALID bash whose line ends there, so the definition after it is a new command and MUST be seen; the join
+# stripped one backslash and continued anyway, which swallowed it (a FALSE PASS).
+echo a\\
+after_even_backslash_run() { :; }
 FIXTURE
 _scan_fixture="$(python3 "$T/defs.py" "$T/defs-fixture.sh")"
 ck "f11f-0 …and every one of those spellings is really SEEN (brace on either line, any indent), while bare keywords followed by '{' are not counted" \
-   '[ "$_scan_fixture" = "name_same_line name_func_kw indented_same_line name_next_line name_func_next continued_name after_notes_comment after_comment_continuation head_after_inline_comment head_with_comment_between indented_head_only head_then_blank real_after_tab_heredoc" ]'
+   '[ "$_scan_fixture" = "name_same_line name_func_kw indented_same_line name_next_line name_func_next continued_name after_notes_comment after_comment_continuation head_after_inline_comment head_with_comment_between indented_head_only head_then_blank real_after_tab_heredoc after_arith_and_trailing_comment after_tabbed_terminator after_here_strings after_two_openers after_even_backslash_run" ]'
 # ⛔ THE DEGRADED PATH MUST NOT CLAIM TO GRADE WHEN IT CANNOT NAME A REPO (review round 2, P1). The
 # doctor's REPO-only arm raises when the checkout's `origin` proves nothing — the TCC shape on the
 # default macOS install — so `f4`'s stub (which echoes argv) would pass on a wrapper that dies in
