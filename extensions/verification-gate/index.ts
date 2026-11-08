@@ -484,6 +484,15 @@ function recoveryOnlyRoot(root: string): string {
 // per-file hash mismatch (which reads as "the gate is broken" and invites a
 // bypass). This only NARRATES; the block/mismatch decision is unchanged and
 // stays fail-closed.
+//
+// #1265 AC (b): narration alone is not enough. A task child's stdout is only read
+// once the child is dead, so the parent's `task` return said "wedged" and the
+// next lane re-dispatched into the same tree (measured: three consecutive
+// children). The decision therefore lands in the SHARED durable audit log too —
+// the artifact AC (b) accepts in lieu of a task-tool contract change. Deduped per
+// (root, siblings) so a git-op-heavy session writes one record, not one per op;
+// reset at session_start (it is a session fact, like the block registry).
+let lastRootMismatch = "";
 function diagnoseRootMismatch(root: string): void {
   const roots = bridgeRoots();
   const norm = normalizeWorktreeRoot(root);
@@ -492,11 +501,29 @@ function diagnoseRootMismatch(root: string): void {
   if (mine === null) return;
   const siblings = roots.filter((r) => gitCommonDir(r) === mine);
   if (siblings.length === 0) return;
+  // The SAFE remedy comes FIRST. "re-run the op from the verified tree (cd into
+  // it)" used to lead, and it is not merely unhelpful — a task child that follows
+  // it walks into a tree it does not own (#1265 measured three children that did
+  // exactly that and died). The followable remedy is a verifier dispatch for THIS
+  // root; adoption is named as refused-by-design so nobody re-proposes it.
   console.log(
-    `[verification-gate] ⚠ #3255: this git op resolves to ${norm}, but the bridge holds verified entries for ` +
-      `${siblings.join(", ")} (same repo). Those are different trees, so hashes cannot be compared — ` +
-      `re-run the op from the verified tree (cd into it) or re-dispatch verification for ${norm} (#3255).`,
+    `[verification-gate] ⚠ #3255/#1265: this git op resolves to ${norm}, but the bridge holds verified entries for ` +
+      `${siblings.join(", ")} (same repo). Those are different trees, so hashes cannot be compared. ` +
+      `Remedy: re-dispatch verification for THIS root (${norm}) — the git-op root stays the command's own cwd. ` +
+      `Adopting another tree's entries is refused by design: they are keyed on that tree, so they are inert here, ` +
+      `and an adopted clean tree yields an EMPTY scope that would ALLOW an op carrying unverified content.`,
   );
+  const fingerprint = `${norm}|${siblings.join(",")}`;
+  if (fingerprint === lastRootMismatch) return;
+  lastRootMismatch = fingerprint;
+  appendJsonl({
+    event: "gate_root_mismatch",
+    extension: "verification-gate",
+    root: norm,
+    verified_roots: siblings,
+    subagent: isTaskSubAgent(),
+    session_cwd: process.cwd(),
+  });
 }
 
 // ── #1225/#1573 P0: the bridge is a SHARED, MULTI-ROOT registry ──────────
@@ -761,7 +788,10 @@ function recoverBridgeForRoot(normRoot: string): number {
     }
   }
   if (recovered > 0) {
-    console.log(`[verification-gate] 📂 Bridge recovery: merged ${recovered} verified files for this worktree`);
+    // #1265: name the ROOT. The blanket "for this worktree" was false whenever the
+    // caller passed a same-repo sibling for inspection — the count then described a
+    // different tree than the one the session's git ops resolve to.
+    console.log(`[verification-gate] 📂 Bridge recovery: merged ${recovered} verified files for ${normRoot}`);
     // #190 review: audit parity with gate_bypass — a silent verifiedSet
     // injection must leave a durable record (the bridge is a same-user trust
     // channel; any recovery is worth an audit entry).
@@ -4385,10 +4415,21 @@ export default function (pi: ExtensionAPI) {
     // #190: recover verification state from the bridge, root-filtered + stored-
     // hash match-or-drop. (Replaces the blind loader — the bridge now persists
     // compound keys with verifier-authoritative hashes.)
-    const sessionRoot = normalizeWorktreeRoot(recoveryOnlyRoot(resolveGitRoot(process.cwd())));
-    const recovered = recoverBridgeForRoot(sessionRoot);
+    //
+    // #1265: recover the SESSION'S OWN root first and report THAT count. The
+    // sibling root `recoveryOnlyRoot` may name is merged for INSPECTION only: its
+    // entries carry the sibling's root, so `recoverBridgeForRoot` drops every one
+    // of them at the git-op root filter (`:737` "foreign root — inert"). Counting
+    // them as "recovered for this worktree" was a false verified-state claim — and
+    // because `recovered > 0` it also SKIPPED the `else if (isTaskSubAgent())`
+    // zero-entry warning below, which exists precisely so a parent learns that
+    // every changed-file commit in a fresh worktree will block (#264 P2).
+    const ownRoot = normalizeWorktreeRoot(resolveGitRoot(process.cwd()));
+    const recovered = recoverBridgeForRoot(ownRoot);
+    const inspectRoot = normalizeWorktreeRoot(recoveryOnlyRoot(ownRoot));
+    const inspected = inspectRoot === ownRoot ? 0 : recoverBridgeForRoot(inspectRoot);
     if (recovered > 0) {
-      console.log(`[verification-gate] 📂 Recovered ${recovered} verified files from bridge`);
+      console.log(`[verification-gate] 📂 Recovered ${recovered} verified files from bridge for ${ownRoot}`);
     } else if (isTaskSubAgent()) {
       // #264 P2: bridge-absent (or stale) task-sub-agent session — the parent's
       // verified-file registry is not available here, so EVERY changed-file
@@ -4399,14 +4440,34 @@ export default function (pi: ExtensionAPI) {
       // #285 P1-A Surface 2: task-tool-aware instruction — a restricted
       // sub-agent cannot self-satisfy in-band; the block is final.
       const taskCapable = argvAllowsTask();
-      console.log(`[verification-gate] ⚠️ Sub-agent session started with 0 bridge-recovered files for root ${sessionRoot} — the parent's verified-file registry is not available to this session; every changed-file commit will block until VGATE verification is dispatched ${taskCapable ? "(in-band via the task tool)." : "by the parent session — this session is task-restricted, so return to the parent (the block is final)."}`);
-      appendJsonl({ event: "gate_recovery_empty", extension: "verification-gate", subagent: true, root: sessionRoot, session_cwd: process.cwd() });
+      console.log(`[verification-gate] ⚠️ Sub-agent session started with 0 bridge-recovered files for root ${ownRoot} — the parent's verified-file registry is not available to this session; every changed-file commit will block until VGATE verification is dispatched ${taskCapable ? "(in-band via the task tool)." : "by the parent session — this session is task-restricted, so return to the parent (the block is final)."}`);
+      appendJsonl({ event: "gate_recovery_empty", extension: "verification-gate", subagent: true, root: ownRoot, session_cwd: process.cwd() });
+    }
+    if (inspected > 0) {
+      // The sibling's entries ARE in `verifiedSet`, but inert for every op rooted
+      // here. Say that once, durably, instead of leaving the transcript's recovery
+      // line counting a foreign tree (#1265 AC (b): "a shared log", not child
+      // stdout alone).
+      console.log(
+        `[verification-gate] ↔ #1265: ${inspected} verified entr${inspected === 1 ? "y" : "ies"} recorded for ${inspectRoot} merged for INSPECTION ONLY — ` +
+          `they are keyed on that tree and are inert for git ops rooted at ${ownRoot}`,
+      );
+      appendJsonl({
+        event: "gate_recovery_foreign_root",
+        extension: "verification-gate",
+        root: ownRoot,
+        inspected_root: inspectRoot,
+        inspected,
+        subagent: isTaskSubAgent(),
+        session_cwd: process.cwd(),
+      });
     }
     lastRecoveryMtime = 0;
     vgateFailures = 0;
     lastBlockedCwd = null;
     lastBlockedFiles = [];
     blockedFilesByRoot.clear(); // #1660: block context is session-scoped (the bridge is the durable channel)
+    lastRootMismatch = ""; // #1265: the root-mismatch record is once per session per (root, siblings)
     lastVerifierNote = null;
     pendingRehash = null;
     pendingRehashFiles = [];

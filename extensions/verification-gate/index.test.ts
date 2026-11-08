@@ -3782,8 +3782,14 @@ test("#3255 policy: the git-op root is authoritative — adoption must never gat
     "the git-op root must come from the command's own cwd",
   );
   ok(
-    /const sessionRoot = normalizeWorktreeRoot\(recoveryOnlyRoot\(/.test(src),
-    "session-start bridge recovery is the one place adoption is permitted",
+    !/recoverBridgeForRoot\(\s*normalizeWorktreeRoot\(recoveryOnlyRoot/.test(src) &&
+      !/recoverBridgeForRoot\(recoveryOnlyRoot/.test(src),
+    "recovery must never be COUNTED against an adopted root — a sibling's entries are keyed on the " +
+      "sibling, so counting them claims verified state this session does not have (#1265 AC (b))",
+  );
+  ok(
+    /const ownRoot = normalizeWorktreeRoot\(resolveGitRoot\(process\.cwd\(\)\)\)/.test(src),
+    "session-start recovery must count the session's OWN root",
   );
 });
 

@@ -55,6 +55,16 @@ export const GATE_EVENT_NAMES = [
   "reviewer_preflight", // #2148: the reviewer requirement disclosed BEFORE the work (session_start → phase:"session_start", first push → phase:"first_push", refused op → phase:"block_recovery")
   "bridge_clear", // #561: scripts/vgate.sh clear — root-scoped bridge rewrite (type-documentation; vgate.sh appends raw JSONL)
   "review_spawn_no_verdict", // #2665: a reviewer spawn returned no verdict (attempt, NOT a dispatch)
+  "gate_recovery", // verification-gate: N verified entries were merged for the session's OWN root
+  "gate_recovery_empty", // verification-gate #264/#1265: a task child recovered ZERO entries for its own
+  //                          root — every changed-file commit will block until it self-verifies
+  "gate_recovery_foreign_root", // verification-gate #1265: a same-repo sibling's entries were merged for
+  //                               INSPECTION only. They carry the sibling's root, so they are inert for
+  //                               this session's git ops (index.ts's root filter) — the record exists so the
+  //                               non-adoption is durable and parent-readable, not only a child's stdout line
+  "gate_root_mismatch", // verification-gate #3255/#1265: a git op resolved to a root the bridge holds no
+  //                        entries for while a same-repo sibling has them — hashes cannot be compared. The
+  //                        block decision is unchanged; this is the durable half of the diagnosis (AC (b))
   // #3297: the argv-level gh shim (#984) was NOT LOADED on this box, so the admin-merge gate
   // refused to certify a merge. Recorded as an EVENT, not only as console prose: row 1 of
   // docs/ops/ACTIVATION-MATRIX.md promises a report can read the degraded state without

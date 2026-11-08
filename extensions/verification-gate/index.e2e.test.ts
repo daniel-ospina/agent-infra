@@ -5796,6 +5796,102 @@ async function main() {
       "1660x: src2/h8.ts is not under the named dir 'src' and must stay BLOCKED (pre-fix prefix match blessed it and the retry was allowed)");
   });
 
+  // ── #1265 (AC a/b/c) — the session's OWN root is what recovery counts, the
+  // non-adoption is durable, and a worktree that had no entries can be verified
+  // and used normally afterwards. ──
+  //
+  // PRE-FIX (measured by running this scenario against the pre-change source):
+  // session_start ran recovery at the root `recoveryOnlyRoot` handed back — the
+  // same-repo SIBLING — so a worktree with ZERO entries printed
+  // "📂 Recovered N verified files from bridge" with the sibling's count, audited
+  // `gate_recovery` for it, and (because the count was > 0) never reached the
+  // `else if (isTaskSubAgent())` zero-entry warning. Every one of those N entries
+  // is then dropped at the git-op root filter, so the claim is false AND the
+  // parent never learns every commit will block. The root-mismatch diagnosis was
+  // `console.log` only — nothing durable, nothing a parent can read.
+  test("scenario 1265a: recovery counts THIS worktree (not the sibling), the non-adoption is durable, and the worktree becomes usable after its own PASS", async () => {
+    const hub = join(TEST_ROOT, "repo-1265-hub");
+    mkdirSync(hub, { recursive: true });
+    git(hub, "init -b main");
+    git(hub, "config user.email e2e@test");
+    git(hub, "config user.name e2e");
+    writeFileSync(join(hub, "base1265.txt"), "b\n");
+    git(hub, "add base1265.txt");
+    git(hub, "commit -m base");
+    const wtA = join(hub, ".worktrees", "wt-1265-a");
+    const wtB = join(hub, ".worktrees", "wt-1265-b");
+    git(hub, `worktree add ${wtA} -b feat-1265-a`);
+    git(hub, `worktree add ${wtB} -b feat-1265-b`);
+    mkdirSync(join(wtA, "src"), { recursive: true });
+    writeFileSync(join(wtA, "src", "a1265.ts"), "a\n");
+    git(wtA, "add src/a1265.ts");
+    git(wtA, "commit -m work-a");
+    mkdirSync(join(wtB, "src"), { recursive: true });
+    writeFileSync(join(wtB, "src", "b1265.ts"), "b\n");
+    git(wtB, "add src/b1265.ts");
+
+    // The bridge holds REAL, hash-matching entries for worktree A ONLY.
+    const realA = realpathSync(wtA);
+    const realB = realpathSync(wtB);
+    const bridgeDir = join(TEST_ROOT, ".pi", "agent", "verification");
+    mkdirSync(bridgeDir, { recursive: true });
+    writeFileSync(join(bridgeDir, "latest.json"), JSON.stringify({
+      status: "PASS",
+      verified_files: [{ path: `${realA}::src/a1265.ts`, hash: sha("a\n") }],
+      timestamp: new Date().toISOString(),
+    }));
+
+    // A session rooted in B, whose own registry is EMPTY. process.cwd() is the
+    // session root the handler resolves, so it is redirected for the duration.
+    const prevCwd = process.cwd();
+    try {
+      process.chdir(realB);
+      await fire("session_start", {});
+    } finally {
+      process.chdir(prevCwd);
+    }
+
+    const audit = readAuditLines();
+    const forB = (e: string) => audit.filter((l) => l.event === e && String(l.root ?? "").endsWith("wt-1265-b") && String(l.session_cwd ?? "").startsWith(realB));
+    equal(forB("gate_recovery").length, 0,
+      "1265a: worktree B must NOT record a recovery count — pre-fix it merged A's entry and audited gate_recovery with A's count");
+    equal(forB("gate_recovery_foreign_root").length, 1,
+      "1265a: the inspection-only merge of A's entries must leave ONE durable record (AC b)");
+    equal(String(forB("gate_recovery_foreign_root")[0].inspected_root), realA,
+      "1265a: the record must name the sibling root it inspected");
+    equal(forB("gate_recovery_foreign_root")[0].inspected, 1,
+      "1265a: the record must carry the inspected count (A's single entry)");
+
+    // AC (a): the op still FAILS CLOSED, and the diagnosis names THIS root.
+    const opB = { type: "tool_call", toolName: "bash", input: { command: `cd ${realB} && git commit -m b1265`, cwd: realB } };
+    const block1 = await fire("tool_call", opB);
+    ok(block1 && block1.block === true, "1265a: B's commit must still be BLOCKED — A's entries are inert here (no fail-open)");
+    ok(String(block1.reason).includes("src/b1265.ts"), "1265a: the block names B's own changed file");
+    ok(!/src\/a1265\.ts/.test(String(block1.reason)), "1265a: the block must not import A's verified file into B's scope");
+
+    // AC (b): exactly ONE durable root-mismatch record for this (root, siblings)
+    // pair, however many git ops run.
+    const block2 = await fire("tool_call", opB);
+    ok(block2 && block2.block === true, "1265a: the retry is still blocked (no verification happened)");
+    const mismatch = audit.concat(readAuditLines()).filter((l) => l.event === "gate_root_mismatch" && String(l.root ?? "") === realB);
+    equal(mismatch.length, 1, "1265a: the mismatch must be recorded exactly ONCE per session per (root, siblings) — not once per git op");
+    equal(JSON.stringify(mismatch[0].verified_roots), JSON.stringify([realA]),
+      "1265a: the record must name the sibling roots whose entries cannot be compared");
+
+    // AC (c): a worktree that had no entries becomes usable after ITS OWN PASS —
+    // and only after it. No temp-path/sibling root is ever substituted.
+    await fire("tool_result", {
+      toolName: "task",
+      input: { prompt: `[VGATE] verify files: src/b1265.ts. Classification: backend. Project root: ${realB}` },
+      content: [{ type: "text", text: "## Verification Report\nAll good.\nPASS\n" }],
+    });
+    const retry = await fire("tool_call", opB);
+    equal(retry, undefined, "1265a: after B's OWN PASS the op is allowed — the worktree is usable again");
+    const bridgeAfter = readFileSync(join(bridgeDir, "latest.json"), "utf8");
+    ok(bridgeAfter.includes(`${realB}::src/b1265.ts`), "1265a: B's own entry is what unblocked it");
+    ok(bridgeAfter.includes(`${realA}::src/a1265.ts`), "1265a: A's entry is preserved (the bridge is per-root, not last-write-wins)");
+  });
+
 } // main: plugin loaded; tests run sequentially via runAll()
 
 main()
