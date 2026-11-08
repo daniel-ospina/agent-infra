@@ -749,12 +749,28 @@ _nap_unfenced="$(awk '
   /^[[:space:]]*# <<< END NOT-A-CYCLE-NAP/   {f=0; next}
   !f' <<<"$_loop_nap_region")"
 # The fences are COMMENT lines, so the split above needs the comment-preserving view (`_loop_tc`, not
-# `_loop_nc` — the same trap §9.1d-v records). The COUNTS then run on the comment-stripped view, so a
-# word in a comment can neither become a nap nor hide one.
+# `_loop_nc` — the same trap §9.1d-v records). The COUNTS then run on the CODE-ONLY view (`_nap_code`
+# below), so a word in a comment can neither become a nap nor hide one.
 printf '%s\n' "$_nap_unfenced" > "$TMP/nap-region.txt"
 printf '%s\n' "$_nap_fence" > "$TMP/nap-fenced.txt"
 _nap_region="$(_strip_tc "$TMP/nap-region.txt")"
 _nap_excl_body="$(_strip_tc "$TMP/nap-fenced.txt")"
+# ⛔ THE COUNTS RUN ON A CODE-ONLY VIEW, AND THAT IS TWO FIXES IN ONE (fresh-context review, P1+P2,
+# measured). First: `_strip_tc` removes only TRAILING comments, so a FULL-LINE comment survived into
+# `_nap_excl_body`, falsifying the claim two lines above — adding the comment
+# `# NB: the old shape was `if false; sleep 30 ; fi`` reddened a nap-free tree (127/1). Second, and
+# worse: every counter was LINE-POSITION dependent, so a boundary or a nap could be hidden by
+# prefixing ONE token. Measured — all four of these left `RESULT: 128 passed, 0 failed`:
+#   `) ; sleep 300 ; (`   ·   `: ) ; command sleep 3 ; (`   ·   `true ) ; (` + `\sleep 300`
+#   ·   `) ; command sleep 300 ; (` appended to the existing `done` line
+# So the view is comment-free AND string-literal-free (the TRANSIENT echo messages carry `(attempt ...)`
+# parens, which would otherwise read as openers), a nap is matched as a TOKEN ANYWHERE on a line (so
+# `command sleep`, `\sleep` and `sleep$IFS` all count), and the CLOSER is proven by the PARSER rather
+# than by a spelling: `f() { <body> }` fails `bash -n` on an unmatched `)`. Over-counting is the
+# fail-closed direction; UNDER-counting is the bypass, so every pattern errs wide on purpose.
+_nap_code="$(printf '%s\n' "$_nap_excl_body" | grep -vE '^[[:space:]]*#' | sed -E 's/"[^"]*"//g')"
+_nap_closers=0
+printf 'f() {\n%s\n}\n' "$_nap_excl_body" | bash -n 2>/dev/null || _nap_closers=1
 _region_ok=1
 [ -n "$_loop_nap_region" ] || _region_ok=0
 _nap_n="$(grep -cE '^[[:space:]]*stg_nap_mark([[:space:]]|$)' <<<"$_nap_region")"
@@ -782,10 +798,10 @@ ck "every nap path calls stg_nap_mark (${_nap_n} nap_mark sites for ${_loop_n} s
 # any line starting with `)` is a closer, and a nap counts anywhere it appears as a COMMAND on a line.
 _nap_beg_n="$(grep -cE '^[[:space:]]*# >>> BEGIN NOT-A-CYCLE-NAP' <<<"$_loop_nap_region")"
 _nap_end_n="$(grep -cE '^[[:space:]]*# <<< END NOT-A-CYCLE-NAP' <<<"$_loop_nap_region")"
-_nap_excl_sleeps="$(grep -cE '(^|[;&|])[[:space:]]*(fork_free_sleep|sleep)[[:space:]]' <<<"$_nap_excl_body")"
-_nap_excl_marks="$(grep -cE '^[[:space:]]*stg_nap_mark([[:space:]]|$)' <<<"$_nap_excl_body")"
-_nap_excl_openers="$(grep -cE '^[[:space:]]*\(' <<<"$_nap_excl_body")"
-_nap_excl_closers="$(grep -cE '^[[:space:]]*\)' <<<"$_nap_excl_body")"
+_nap_excl_sleeps="$(grep -cE '(^|[^[:alnum:]_])(fork_free_sleep|sleep)([^[:alnum:]_]|$)' <<<"$_nap_code")"
+_nap_excl_marks="$(grep -cE '(^|[^[:alnum:]_])stg_nap_mark([^[:alnum:]_]|$)' <<<"$_nap_code")"
+_nap_excl_openers="$(grep -cE '(^|[^[:alnum:]_$(])\(' <<<"$_nap_code")"
+_nap_excl_closers="$_nap_closers"
 _nap_prev_code="$(awk '
   /^[[:space:]]*# >>> BEGIN NOT-A-CYCLE-NAP/ { exit }
   /^[[:space:]]*$/ { next }
