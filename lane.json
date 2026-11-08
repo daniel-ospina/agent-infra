@@ -1,0 +1,42 @@
+{
+  "_ref": "refs/lanes/Daniels-MacBook-Air-new.klane-2834-1794152859-p58435-78bcccb8",
+  "_sha": "c04961ba8b77bbb8deb5abfc8120b522b13228d1",
+  "artifacts": [
+    {
+      "kind": "log",
+      "value": "/var/folders/lh/4zv9grjx0958bnrclvkt8dv40000gn/T/tmp.U7oO6RS4nu/O/logs/cloneref.log"
+    },
+    {
+      "kind": "branch",
+      "value": "trunk"
+    },
+    {
+      "kind": "sha",
+      "value": "7302935546f6bc992083c33892f536cf08d8823c"
+    },
+    {
+      "kind": "worktree",
+      "value": "/var/folders/lh/4zv9grjx0958bnrclvkt8dv40000gn/T/tmp.U7oO6RS4nu/wt5"
+    }
+  ],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 900,
+  "duration_s": 177,
+  "ended_at": 1794153036,
+  "exit_code": 0,
+  "heartbeat_at": 1794153036,
+  "host": "Daniels-MacBook-Air-new",
+  "issue": 2834,
+  "kind": "lane",
+  "lane_id": "Daniels-MacBook-Air-new.klane-2834-1794152859-p58435-78bcccb8",
+  "lease_until": 1794153936,
+  "pid": 58435,
+  "reason": null,
+  "repo": null,
+  "schema": 1,
+  "started_at": 1794152859,
+  "state": "DONE",
+  "tag": "2834",
+  "worktree": "/private/var/folders/lh/4zv9grjx0958bnrclvkt8dv40000gn/T/tmp.U7oO6RS4nu/wt5"
+}
