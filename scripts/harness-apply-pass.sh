@@ -276,7 +276,10 @@ dropin_cell_home() { # <unit-path> — the last CELL_HOME its drop-ins set, syst
     local unit="$1" base d g name out="" v
     base="${unit##*/}"
     local -a dirs=() names=()
-    for d in "${unit%/*}.d" "/run/systemd/system/$base.d" "/usr/lib/systemd/system/$base.d" \
+    # ⛔ `"${unit}.d"`, NOT `"${unit%/*}.d"`: the latter strips the FILE NAME and yields `<dir>.d`, so the
+    # unit's own drop-in directory was never read at all (caught by probing the function directly — the
+    # suite had no drop-in arm, which is why it shipped; it has one now).
+    for d in "${unit}.d" "/run/systemd/system/$base.d" "/usr/lib/systemd/system/$base.d" \
              ${HOME:+"$HOME/.config/systemd/user/$base.d"} "/etc/systemd/user/$base.d" \
              "/run/systemd/user/$base.d" "/usr/lib/systemd/user/$base.d"; do
         [ -d "$d" ] && dirs+=("$d")

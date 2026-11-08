@@ -1712,7 +1712,7 @@ read_env "$HERE/../templates/systemd/eldato-orchestrator.service" \
 # REAL template and then written as the controller's own unit — both sides of this leg are the artifacts.
 printf '[Service]\n' >"${T27}/controller-converged.service"
 printf '%s\n' "${ORCH_CONV[@]}" | sed 's/^/Environment=/' >>"${T27}/controller-converged.service"
-OUT="$(HARNESS_APPLY_CONTROLLER_UNIT="${T27}/controller-converged.service" run_under "${HA_CONV[@]}" --print-status)"; RC=$?
+OUT="$(run_under HARNESS_APPLY_CONTROLLER_UNIT="${T27}/controller-converged.service" "${HA_CONV[@]}" --print-status)"; RC=$?
 if [ "$RC" = "27" ]; then bad "T27 a CONVERGED box (both units on the durable home) is refused — the guard is a false positive";
 else ok "T27 a CONVERGED box is NOT refused (rc=$RC) — the guard fires only on the real disagreement"; fi
 assert_absent "$OUT" "REFUSED split-home" "T27 …and says nothing about a split"
@@ -1722,17 +1722,17 @@ assert_absent "$OUT" "REFUSED split-home" "T27 …and says nothing about a split
 # the controller's pinned `CELL_HOME` is the disagreement and it must still refuse.
 printf '[Service]\n' >"${T27}/controller-legacy.service"
 printf '%s\n' "${ORCH_ENV[@]}" | sed 's/^/Environment=/' >>"${T27}/controller-legacy.service"
-OUT="$(HARNESS_APPLY_CONTROLLER_UNIT="${T27}/controller-legacy.service" run_under "${HA_CONV[@]}")"; RC=$?
+OUT="$(run_under HARNESS_APPLY_CONTROLLER_UNIT="${T27}/controller-legacy.service" "${HA_CONV[@]}")"; RC=$?
 assert_eq "$RC" "27" "T27 the pass refuses when its OWN unit agrees but the CONTROLLER's does not (the shape a HOME-only guard misses)"
 assert_contains "$OUT" "the controller's unit pins CELL_HOME" "T27 and it names the controller as the side that disagrees"
 # ⛔ A VALUE THE PASS CANNOT RESOLVE IS CANNOT MEASURE, NOT A COMPARISON: an unrendered `{{CELL_HOME}}` must
 # not be string-compared, or every box whose unit renders late would be refused.
 printf '[Service]\nEnvironment=CELL_HOME={{CELL_HOME}}\n' >"${T27}/controller-unrendered.service"
-OUT="$(HARNESS_APPLY_CONTROLLER_UNIT="${T27}/controller-unrendered.service" run_under "${HA_CONV[@]}" --print-status)"; RC=$?
+OUT="$(run_under HARNESS_APPLY_CONTROLLER_UNIT="${T27}/controller-unrendered.service" "${HA_CONV[@]}" --print-status)"; RC=$?
 if [ "$RC" = "27" ]; then bad "T27 an UNRENDERED controller value was compared and refused — a placeholder is not a reading";
 else ok "T27 an unrendered controller value is CANNOT MEASURE and is never compared (rc=$RC)"; fi
 # ⛔ AND NO CONTROLLER UNIT AT ALL (a Mac) IS NOT A SPLIT — the guard never invents a home.
-OUT="$(HARNESS_APPLY_CONTROLLER_UNIT="${T27}/does-not-exist.service" run_under "${HA_CONV[@]}" --print-status)"; RC=$?
+OUT="$(run_under HARNESS_APPLY_CONTROLLER_UNIT="${T27}/does-not-exist.service" "${HA_CONV[@]}" --print-status)"; RC=$?
 if [ "$RC" = "27" ]; then bad "T27 a box with NO controller unit was refused — the guard invented a home";
 else ok "T27 a box with no controller unit (a Mac) is not refused (rc=$RC)"; fi
 # AND AN EXPLICIT `CELL_HOME` IS NEVER SECOND-GUESSED (`cell_home_resolve` step 1): the controller's own
@@ -1758,11 +1758,11 @@ assert_contains "$OUT" "split_home=" "T27 …while still reporting the split as 
 # the multi-assignment form is the row this PR's own comment documents. A guard that cannot measure
 # prints `split_home=none` and every reader infers agreement, which is worse than no guard.
 printf '[Service]\nEnvironment="CELL_HOME=%s"\n' "$T27/legacy-home" >"$T27/controller-quoted.service"
-OUT="$(HARNESS_APPLY_CONTROLLER_UNIT="$T27/controller-quoted.service" run_under "${HA_CONV[@]}")"; RC=$?
+OUT="$(run_under HARNESS_APPLY_CONTROLLER_UNIT="$T27/controller-quoted.service" "${HA_CONV[@]}")"; RC=$?
 assert_eq "$RC" "27" "T27 a QUOTED Environment=\"CELL_HOME=…\" is measured (systemd unquotes each line)"
 assert_contains "$OUT" "the controller's unit pins CELL_HOME" "T27 …and the quoted value is the one it names"
 printf '[Service]\nEnvironment=HOME=/tmp/whatever CELL_HOME=%s\n' "$T27/legacy-home" >"$T27/controller-multi.service"
-OUT="$(HARNESS_APPLY_CONTROLLER_UNIT="$T27/controller-multi.service" run_under "${HA_CONV[@]}")"; RC=$?
+OUT="$(run_under HARNESS_APPLY_CONTROLLER_UNIT="$T27/controller-multi.service" "${HA_CONV[@]}")"; RC=$?
 assert_eq "$RC" "27" "T27 a MULTI-ASSIGNMENT Environment= line is measured (it is a list, not a scalar)"
 # …and the unit NAME is not a constant: `install-controller-service.sh` renders and validates
 # `CONTROLLER_UNIT=<bare name>` and honours `CONTROLLER_SYSTEM_UNIT_DIR`.
@@ -1776,6 +1776,21 @@ printf '[Service]\nEnvironment=CELL_HOME=%s\n' "$T27/acct-home" >"$T27/units/eld
 OUT="$(run_under "${HA_CONV[@]}" CONTROLLER_UNIT=eldato-orchestrator-b CONTROLLER_SYSTEM_UNIT_DIR="$T27/units" --print-status)"; RC=$?
 if [ "$RC" = "27" ]; then bad "T27 the renamed-unit leg fires on agreement too — it measures the name, not the home";
 else ok "T27 a renamed unit that AGREES is not refused (rc=$RC) — the previous leg measures the home"; fi
+
+# ⛔ AND A DROP-IN, WHICH IS HOW THIS FLEET ACTUALLY PINS A HOME (`…/cell-self-pin.service.d/*.conf`).
+# The first cut of the reader built `"${unit%/*}.d"` — `<dir>.d` — so the unit's own drop-in directory was
+# never read, and no arm noticed because there was no drop-in arm. There is one now, and it also asserts
+# the ORDERING: a lexicographically LATER drop-in wins (systemd applies them in that order).
+mkdir -p "$T27/controller-dropin.service.d"
+printf '[Service]\nEnvironment=CELL_HOME=%s\n' "$T27/acct-home" >"$T27/controller-dropin.service"
+printf 'Environment=CELL_HOME=%s\n' "$T27/legacy-home" >"$T27/controller-dropin.service.d/50-legacy.conf"
+OUT="$(run_under HARNESS_APPLY_CONTROLLER_UNIT="$T27/controller-dropin.service" "${HA_CONV[@]}")"; RC=$?
+assert_eq "$RC" "27" "T27 a DROP-IN's CELL_HOME is read (the fleet's own mechanism for pinning a home)"
+assert_contains "$OUT" "the controller's unit pins CELL_HOME=$T27/legacy-home" "T27 …and the drop-in's value is the one that wins over the unit's"
+printf 'Environment=CELL_HOME=%s\n' "$T27/acct-home" >"$T27/controller-dropin.service.d/90-converged.conf"
+OUT="$(run_under HARNESS_APPLY_CONTROLLER_UNIT="$T27/controller-dropin.service" "${HA_CONV[@]}" --print-status)"; RC=$?
+if [ "$RC" = "27" ]; then bad "T27 a LATER drop-in did not win — systemd applies drop-ins in lexicographic order and last wins";
+else ok "T27 a lexicographically LATER drop-in wins (rc=$RC) — the order is systemd's, not the directory's"; fi
 
 echo
 echo "────────────────────────────────────────────────────────"
