@@ -309,6 +309,49 @@ def test_no_destructive_verb_on_any_path(R, tmp_path):
     assert not re.search(r'\[\s*"cmux"\s*,\s*"(respawn-pane|close-workspace|kill-pane)"', src)
 
 
+# ── the reporting layer (review finding 1) ────────────────────────────────────────────────────
+def test_missing_lane_status_is_a_named_refusal_not_a_crash(R):
+    """`pi-bootstrap` withholds `lane-status.py` by decision (#1553), so "drop the tool beside the
+    farmed heartbeat" is a natural install that leaves the imports absent. That must be a REFUSAL
+    that says so — not an exception, and never a silent DRY-RUN."""
+    def boom():
+        raise FileNotFoundError("lane-status.py")
+    orig = R._load_lane_status
+    R._load_lane_status = boom
+    try:
+        obs = R.relaunch("ws-1", runner=FakeCmux(), pi=sys.executable, cwd="/tmp")
+    finally:
+        R._load_lane_status = orig
+    assert obs["refused"] is True, obs
+    assert "no lane-status.py beside this tool" in obs["reason"]
+
+
+def test_main_reports_a_crash_as_error_never_dry_run(R, monkeypatch, capsys):
+    """The label ladder's `else` arm used to swallow the crash: an operator was told DRY-RUN and
+    handed exit 4 ("sent, but unconfirmed") for a run that read nothing and sent nothing."""
+    def boom(*_a, **_kw):
+        raise RuntimeError("boom")
+    monkeypatch.setattr(R, "relaunch", boom)
+    monkeypatch.setattr(sys, "argv", ["lane-relaunch.py", "--ws", "w-1"])
+    rc = R.main()
+    out = capsys.readouterr().out
+    assert rc not in (0, 3, 4), "a crash must not borrow REFUSED/OK/UNCONFIRMED's code: rc=%r" % rc
+    assert "ERROR" in out, out
+    assert "DRY-RUN" not in out, out
+    assert "[Nones]" not in out, out
+
+
+def test_session_id_is_quoted_in_the_payload(R, tmp_path):
+    """The residual from the review: cwd and pi were quoted, the operator-supplied id was not."""
+    path = _transcript(tmp_path)
+    cmux = FakeCmux()
+    obs = R.relaunch("ws-1", ls=FakeLS(session="a b; rm -rf x", transcript=path), runner=cmux,
+                     pi=sys.executable, cwd="/tmp/lane", sleep=lambda _s: None, clock=_clock())
+    line = cmux.sent()[0][-1]
+    assert obs["refused"] is False, obs
+    assert "--session 'a b; rm -rf x'" in line or '--session "a b; rm -rf x"' in line, line
+
+
 # ── R6: the regression that produced this issue — a remedy that does not exist ------------------
 def test_beat_remedy_names_a_script_that_exists():
     """`orchestrator-heartbeat.sh`'s DEAD LANES clause used to prescribe `recover-fleet / relaunch`
@@ -322,6 +365,13 @@ def test_beat_remedy_names_a_script_that_exists():
     assert "recover-fleet" not in clause, "the clause is back to naming `recover-fleet`, which does not exist"
     named = re.findall(r"scripts/[\w.\-/]+\.(?:py|sh)", clause)
     assert named, "the DEAD LANES clause names no script: %r" % (clause,)
+    # ⛔ THE CLASS, NOT ONE CLAUSE (review finding 2, 2026-11-08): the SAME dangling pointer survived
+    # in this file's own comment two lines above the clause the first fix touched, because the check
+    # only looked at one `[^"]*` window. Assert over the WHOLE file. §47 (`the board's §47` advice for
+    # a CHILD-STUCK verdict) is deliberately NOT asserted: it is pinned into six goldens and is not
+    # this change's to churn — scope here is §72, the relaunch mechanism.
+    assert "ORCHESTRATION-BOARD \u00a772" not in beat, (
+        "the heartbeat still credits the relaunch mechanism to a board doc that is on no box (§72)")
     for rel in named:
         assert os.path.exists(os.path.join(_REPO, rel)), "the beat names a nonexistent script: %s" % rel
 

@@ -52,6 +52,7 @@ EXIT
     0  CONFIRMED    the launch line was sent AND the session transcript advanced
     3  REFUSED      a guard refused; nothing was sent (the message names the guard)
     4  UNCONFIRMED  the line was sent (or the send failed) and no advance was observed
+    1  ERROR        the tool itself raised (never reported as DRY-RUN or UNCONFIRMED)
     2  usage error
 """
 from __future__ import annotations
@@ -182,7 +183,17 @@ def relaunch(ws, label="", cwd=None, session=None, pi=None, new=False, wait=45.0
         obs["elapsed_s"] = round(clock() - t0, 1)
         return obs
 
-    ls = ls or _load_lane_status()
+    # ⛔ A MISSING `lane-status.py` IS A NAMED REFUSAL, NOT A CRASH (review, P2). `pi-bootstrap`'s
+    # farm withholds `lane-status.py` deliberately (#1553), so dropping this tool beside the farmed
+    # heartbeat is a natural install that leaves the imported primitives absent — and the old code
+    # raised out of `main()`, which then printed "DRY-RUN" and exited 4: two false statements about a
+    # run that read nothing and sent nothing.
+    if ls is None:
+        try:
+            ls = _load_lane_status()
+        except Exception as exc:                                  # noqa: BLE001
+            return refuse("no lane-status.py beside this tool (%s) — the fleet's resolution "
+                          "primitives are not installed here; nothing sent" % exc.__class__.__name__)
 
     # ── 1. the pane must be READABLE. Unreadable is UNKNOWN, and UNKNOWN never gets a keystroke.
     try:
@@ -254,7 +265,7 @@ def relaunch(ws, label="", cwd=None, session=None, pi=None, new=False, wait=45.0
                       "that cannot resolve is the failure this tool exists to avoid" % (pi,))
 
     line = "cd %s && exec %s%s" % (shlex.quote(cwd), shlex.quote(pi),
-                                   (" --session %s" % sid) if sid else "")
+                                   (" --session %s" % shlex.quote(sid)) if sid else "")
     obs.update(action="relaunch-fresh" if fresh else "relaunch-session", line=line,
                cwd=cwd, sid=sid, session_file=path, pi=pi)
     argv = ["cmux", "send", "--workspace", ws, line + "\n"]
@@ -286,9 +297,10 @@ def relaunch(ws, label="", cwd=None, session=None, pi=None, new=False, wait=45.0
             # a fresh session has no transcript to advance: the transcript APPEARING is the proof.
             try:
                 sid_after = ls.resolve_session(ws)
+                appeared = bool(sid_after and ls.session_file(sid_after))
             except Exception:                                    # noqa: BLE001
-                sid_after = None
-            if sid_after and ls.session_file(sid_after):
+                appeared = False
+            if appeared:
                 obs.update(confirmed=True, sid=sid_after, reason="fresh session appeared")
                 break
         else:
@@ -329,24 +341,31 @@ def main() -> int:
     try:
         obs = relaunch(a.ws, a.label, a.cwd, a.session, a.pi, a.new, a.wait, a.dry_run)
     except Exception as exc:                                     # noqa: BLE001
-        obs = {"ws": a.ws, "confirmed": False, "refused": False, "sent": False,
+        # ⛔ A CRASH IS NOT A DRY RUN AND NOT AN UNCONFIRMED SEND. It must never inherit either
+        # label or exit 4, because the operator's next move is chosen on this line.
+        obs = {"ws": a.ws, "error": True, "confirmed": False, "refused": False, "sent": False,
+               "elapsed_s": 0.0,
                "reason": "relaunch RAISED %s: %s" % (exc.__class__.__name__, exc)}
 
     if a.json:
         print(json.dumps(obs, indent=2))
     else:
-        if obs.get("refused"):
+        if obs.get("error"):
+            label = "ERROR"
+        elif obs.get("refused"):
             label = "REFUSED"
         elif obs.get("confirmed"):
             label = "CONFIRMED"
-        elif obs.get("sent"):
-            label = "UNCONFIRMED"
-        else:
+        elif a.dry_run:
             label = "DRY-RUN"
+        else:
+            label = "UNCONFIRMED"
         print("%s %s [%ss] %s" % (label, obs.get("ws", a.ws), obs.get("elapsed_s"), obs.get("reason", "")))
         if a.dry_run and obs.get("line"):
             print("would send: " + obs["line"])
 
+    if obs.get("error"):
+        return 1
     if obs.get("refused"):
         return 3
     if obs.get("confirmed"):

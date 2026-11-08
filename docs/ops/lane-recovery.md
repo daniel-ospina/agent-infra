@@ -66,6 +66,7 @@ Exit codes are the answer, not the pixels:
 | `0` | **CONFIRMED** — the line was sent and the session transcript **advanced** |
 | `3` | **REFUSED** — a guard refused and nothing was sent; the message names the guard |
 | `4` | **UNCONFIRMED** — sent, but no transcript advance inside `--wait`; the message carries the pane tail |
+| `1` | **ERROR** — the tool itself raised. Never reported as DRY-RUN or as an unconfirmed send: the operator's next move is chosen on this line |
 
 The launch line it sends is the form the fleet's own recovery used to bring back 14 lanes (issue
 #942):
@@ -89,6 +90,7 @@ is destroyed.
 | the session record is unreadable | an unread read is not "no live pi" |
 | the resolved session has no transcript | #942 aggravating factor 2. `--new` is how you say "fresh session" deliberately |
 | no cwd / no `pi` binary | a launch line that cannot resolve is the failure this tool exists to avoid |
+| `lane-status.py` not importable | the fleet's resolution primitives are not installed beside the tool; nothing was read, so nothing may be sent |
 
 `--new` starts a fresh session (no `--session`), and is the only way to relaunch a lane whose
 transcript is genuinely gone.
@@ -112,6 +114,17 @@ That is how the sessions in #942 were recovered (`loop_liveness` located `01a09b
 - **On a build without `cmux sessions list`, the tool refuses** (exit 3). That is deliberate: the
   live-pi half of the guard cannot be answered, and a refusal is cheaper than typing into a live
   session. Use the manual form above on such a box, with the pane read as the only evidence.
+- **Missing imports are a refusal, not a crash.** `pi-bootstrap`'s farm withholds `lane-status.py`
+  deliberately (#1553), so dropping this tool beside the *farmed* heartbeat leaves its imported
+  primitives absent — the tool then refuses (exit 3) with a message saying so, rather than raising.
+  Run it from a repo checkout.
+- **Declared residual (not closed):** the shell-prompt guard is a last-character test, so a live pi
+  whose session record is stale (the documented record-only-dead class), not drawing `Working`, and
+  whose last line happens to end in `$ % # ❯ »` would be mistaken for a shell. Three guards must miss
+  at once, and pi draws its footer ending in the model/thinking level, not in a prompt character. A
+  footer-ABSENT check would close the window but would need a second copy of the footer vocabulary
+  that `orchestrator-heartbeat.sh`'s `_shell_visible` already owns — one source of truth beats a
+  drifted second one, so the window stays declared here rather than duplicated.
 - **The cmux CLI grammar drifts between builds** (`cmux send --workspace <ws>` on the Mac build vs
   `cmux terminal send <id>` on a cell). The tool uses the Mac/fleet form — the one every other script
   in this repo uses — and prints the exact argv it tried when the send fails.

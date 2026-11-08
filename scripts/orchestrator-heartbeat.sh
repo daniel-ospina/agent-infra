@@ -1119,7 +1119,10 @@ fi
 # DEAD PANES: NOT CAPACITY, AND NOT A DISPATCH. A dead lane still carries its LAST session
 # file, so the staleness test reads it as idle forever -- which is how the CAPACITY clause
 # came to offer two dead panes as "free" on 2026-10-03 and order a send into a bare login
-# shell. They need a RELAUNCH; the exact mechanism is in ORCHESTRATION-BOARD §72.
+# shell. They need a RELAUNCH -- scripts/lane-relaunch.py --ws <uuid> (it types the launch line into
+# the pane's own login shell; never respawn-pane, which DELETES the workspace when its command fails,
+# #942). The pre-fix text credited the mechanism to a board document that is on no box in this
+# fleet, and an instruction pointing at nothing is how an operator improvises.
 if [ "${N_DEAD:-0}" -gt 0 ]; then
   CAPTEXT="${CAPTEXT} ⛔ DEAD LANES — CONFIRMED BARE SHELL, no pi in the pane: ${DEAD}. These are NOT free capacity and are NOT dispatchable: a send into one would be typed into a BARE LOGIN SHELL and executed. They need a RELAUNCH via scripts/lane-relaunch.py --ws <uuid>, not an item. It types the launch line into the pane's OWN login shell (where the user's PATH lives); it never uses respawn-pane, which DELETES the workspace when its command fails (#942)."
 fi
