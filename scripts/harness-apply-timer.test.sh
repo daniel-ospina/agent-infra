@@ -2202,6 +2202,13 @@ printf '#!/usr/bin/env bash\nbash "$(dirname "$0")/inner/%s" "$@" 2>&1 | tee -a 
 printf '#!/usr/bin/env bash\nbash "$(dirname "$0")/inner/%s" "$@" 2>&1 | tee -a "$(dirname "$0")/log.txt"\n' healthy.sh >"$T/t24ap/wrap-healthy.sh"
 chmod +x "$T/t24ap/wrap-drifting.sh" "$T/t24ap/wrap-healthy.sh" "$T/t24ap/inner/drifting.sh" "$T/t24ap/inner/healthy.sh"
 OUT="$(HARNESS_APPLY_FARM_CHECKER="$T/t24ap/wrap-drifting.sh" run_pass "$T/t24ap" 2>&1)"; RC=$?
+# ⛔ THE REFUSAL CODE IS PINNED HERE, NEXT TO THE RUN THAT PRODUCES IT (review round 36, P3). 5bb754107
+# dropped this assertion without saying why, which left `RC` DEAD in this fixture: the next read of `$RC`
+# is the HEALTHY run 15 lines down, so the drifting wrapper's exit status was asserted nowhere and the
+# assignment looked live while pinning nothing. The contradiction arm's code is also pinned by the
+# 25-row `finish 0 24` mutant, so this row is redundant on purpose — a redundant pin costs one line and
+# an unasserted `RC` is the shape that makes a reader believe a status is checked when it is not.
+assert_eq "$RC" "24" "T24 control: a wrapper that exits 0 over a DRIFTING farm is RED (24), never a green pass"
 # ⛔ THIS RUN'S OUTPUT, KEPT: the STALE-allow-list pin below is about the DRIFTING arm, and reading the
 # healthy run's `$OUT` made that pin unfailable (review round 34, measured: dropping `STALE` from the
 # allow-list kept the suite green because the assertion looked at output that can never carry the phrase).
