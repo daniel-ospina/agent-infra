@@ -136,8 +136,10 @@ an operator (or the fleet instrument) reads can never carry numbers from before 
 check that names *each* drifting file"). The journal keeps a bounded human view — 12 rows, then
 "… and N more" — so on a 30-row farm 18 files were counted and named nowhere durable (measured
 on the `cmux` cell, 2026-11-07). Every row the instrument reports is therefore written, atomically,
-to `${HARNESS_APPLY_STATE_DIR:-$HOME/.pi/agent/state}/harness-apply-farm-rows.txt`, and the record
-names that file.
+to `${HARNESS_APPLY_STATE_DIR:-$HOME/.pi/agent/state}/harness-apply-farm-rows.txt` — absolutsed, so a
+relative `HARNESS_APPLY_STATE_DIR` still yields a path another process can open — and the record
+names that file. A state dir that refuses the write is the one state where no artifact exists: it is
+recorded as `farm_rows=unwritable` (below), never as a path that holds no list.
 
 The artifact lives at a **fixed path** and is **self-dating**: its first line carries the UTC
 timestamp, ref, dest and row count of the run that wrote it. No later pass deletes it, so a reader
@@ -167,9 +169,13 @@ strings, both UTC, NOT the header's UTC against the record's `epoch=`);
 - the header's `n=` must equal the record's `farm_n=`, **except** when the header reads
   `n=unparsed` — then `farm_n=unparsed` too, and the paragraph below governs.
 
-Those rules cannot separate two passes that produced the **same** row count in the same second-level
-timestamp; nothing in the artifact can, and claiming otherwise is worse than saying so. What they do
-rule out is the shape that matters: a list from before the record's own run.
+Those rules cannot separate two passes that produced the **same** row count inside this record's own
+publish→`finish` window (~3–4 s); nothing in the artifact can, and claiming otherwise is worse than
+saying so. What they do rule out is a list published **after** this record was written — a later pass
+that died between its publish and its `finish`, leaving its file where this record names it. (A list
+published *before* the record is the normal, honest shape: the artifact is stamped at publish time
+and `at=` seconds later, which is exactly why rule 2 permits `header ≤ at=` instead of demanding
+equality.)
 
 `farm_n=unparsed` on a RED (`action=farm-drift`, `rc=24`) record means the **extractor** matched no
 row while the instrument still reported drift — the installed `check-farm-drift.sh` is a copy whose

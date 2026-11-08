@@ -1401,7 +1401,10 @@ if [ "$FARM_CHECK_ON" = "1" ]; then
                 # line cut the remedy mid-word for exactly the classes whose remedy differs from
                 # "re-farm" (#10114 review round 8). Everything from the first `Next:` to EOF.
                 FARM_REMEDY="$(printf '%s\n' "$FARM_OUT" | sed -n '/^[[:space:]]*Next:/,$p' | head -8)"
-                log_line "farm: $REF ships different bytes than $FARM_DEST execute — $FARM_NROWS row(s) from the instrument:"
+                # ⛔ "MATCHED BY THIS PASS'S EXTRACTOR", NOT "FROM THE INSTRUMENT" (review round 8). On the
+                # raw arm FARM_NROWS is 0 because THIS PASS's extractor matched nothing — the instrument
+                # did report rows, and this line was printed immediately above up to 12 of them.
+                log_line "farm: $REF ships different bytes than $FARM_DEST execute — $FARM_NROWS row(s) matched by this pass's extractor:"
                 # ⛔ AN EMPTY EXTRACTION IS NOT "EVERY FILE NAMED" (review round 5, reproduced). The
                 # row extractor's vocabulary is a COPY of the instrument's, and the checker this pass
                 # runs can be an OLDER FARMED copy whose rows it does not match — so a RED grade

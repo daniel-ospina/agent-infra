@@ -1433,6 +1433,20 @@ assert_contains "$(head -1 "$ROWS" 2>/dev/null || true)" "n=20" \
     "T24 control: the header carries this run's row count, so a reader can date and size the list"
 assert_contains "$(head -1 "$ROWS" 2>/dev/null || true)" "ref=origin/main" \
     "T24 control: and the ref it was graded against"
+# ⛔ THE HEADER MUST NAME THE FARM IT GRADED AND BE DATED NO LATER THAN THE RECORD (review round 8).
+# The doc's trust procedure compares the header's `dest=` with the farm the record's `detail=` quotes,
+# and its `n=`/UTC with the record's `farm_n=`/`at=` — and NONE of those three tokens was pinned, so
+# dropping the timestamp (the "self-dating" property) or writing `dest=` from a different variable
+# left every assertion green while the documented procedure became false.
+assert_contains "$(head -1 "$ROWS" 2>/dev/null || true)" "dest=$T/t24q/home/.pi/agent/scripts" \
+    "T24 control: the header names the FARM it graded, so it can be compared with the record's detail="
+HDR_TS24Q="$(head -1 "$ROWS" 2>/dev/null | awk '{print $7}')"
+AT24Q="$(sed -n 's/^at=//p' "$T/t24q/state/harness-apply.status" 2>/dev/null | head -1)"
+if [ -n "$HDR_TS24Q" ] && [ -n "$AT24Q" ] && { [ "$HDR_TS24Q" \< "$AT24Q" ] || [ "$HDR_TS24Q" = "$AT24Q" ]; }; then
+    ok "T24 control: the header's UTC is not LATER than the record's at= — the artifact is published first, which is what makes the doc's rule 2 decidable"
+else
+    bad "T24 control: the header's UTC must be dated no later than the record's at= (got header '$HDR_TS24Q', record '$AT24Q') — an undated header, or a record written before the artifact, falsifies the doc's rule 2"
+fi
 assert_eq "$(grep -c 'file-19.py' "$ROWS" 2>/dev/null | tr -d ' ')" "1" \
     "T24 control: including the LAST row, which an excerpt can never show"
 assert_contains "$OUT" "ALL 20 are named in $ROWS" \
