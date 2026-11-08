@@ -1341,6 +1341,11 @@ if [ "$FARM_CHECK_ON" = "1" ]; then
         # there has a broken config, and calling that `SKIPPED` is the silent green this leg removes.
         if [ -n "${HARNESS_APPLY_FARM_DEST:-}" ]; then
             REC_ACTION=farm-unverifiable
+            # ⛔ EVERY REFUSAL CARRIES A REMEDY (review round 17, measured: all eight arms of this
+            # predicate wrote `remedy=none` while three of them lose their only action to the 240-byte
+            # `detail=` bound — "…install the CHECKER from a ref-c" — so the record named a defect and
+            # left nobody an action, the class this PR exists to remove).
+            REC_REMEDY="point HARNESS_APPLY_FARM_DEST at the farm this box executes (or unset it to accept the default), then re-run"
             finish 0 24 "farm: UNKNOWN — HARNESS_APPLY_FARM_DEST names $FARM_DEST, where nothing exists; an explicitly-configured farm that is not there is a misconfiguration, not a controller-only host"
         fi
         # ⛔ ...AND `$HERE` IS THE CHECK ON THE SKIP LINE'S OWN CLAIM. The unit prefers
@@ -1351,14 +1356,17 @@ if [ "$FARM_CHECK_ON" = "1" ]; then
         case "$HERE" in
             */.pi/agent/scripts|*/.pi/agent/scripts/)
                 REC_ACTION=farm-unverifiable
+                REC_REMEDY="set HARNESS_APPLY_FARM_DEST (or render CELL_HOME) to the farm this pass executes from ($HERE), then re-run"
                 finish 0 24 "farm: UNKNOWN — this pass executes FROM a farm ($HERE) but $FARM_DEST names nothing (CELL_HOME='$CELL_HOME'), so the directory that is really running was never graded; pin the farm (HARNESS_APPLY_FARM_DEST, or render CELL_HOME) instead of letting it default to a path with nothing at it" ;;
         esac
         log_line "farm: SKIPPED — no farm at $FARM_DEST (a host that executes nothing from there cannot be stale)"
     elif [ ! -d "$FARM_DEST" ]; then
         REC_ACTION=farm-unverifiable
+        REC_REMEDY="make $FARM_DEST a readable directory holding the scripts this box executes (repair or remove the dangling link), then re-run"
         finish 0 24 "farm: UNKNOWN — $FARM_DEST exists (or is a link) but is NOT a readable directory, so the scripts this box executes cannot be graded — a dangling record is not an absent farm"
     elif [ -z "$FARM_CHECKER" ] || [ ! -f "$FARM_CHECKER" ]; then
         REC_ACTION=farm-unverifiable
+        REC_REMEDY="point HARNESS_APPLY_FARM_CHECKER at a check-farm-drift.sh from a ref-consistent checkout, then re-run"
         finish 0 24 "farm: UNKNOWN — $FARM_DEST holds the scripts this box EXECUTES, but no check-farm-drift.sh could be found (looked in $REPO/scripts and $HERE) — cannot-verify is not a pass"
     else
         # `--ref "$REF" --no-pin-identity` deliberately. The fact under test is "are the farmed bytes
@@ -1391,6 +1399,7 @@ if [ "$FARM_CHECK_ON" = "1" ]; then
             # A link whose target cannot be located cannot be ruled outside the farm, so it refuses.
             _l="$(readlink "$FARM_CHECKER_T" 2>/dev/null)" || {
                 REC_ACTION=farm-unverifiable
+                REC_REMEDY="replace HARNESS_APPLY_FARM_CHECKER with a real file (not a link whose target cannot be read), then re-run"
                 finish 0 24 "farm: UNKNOWN — readlink failed on $FARM_CHECKER_T, so the checker's FINAL target cannot be resolved, and a copy that cannot be located cannot be ruled outside the farm"
             }
             case "$_l" in
@@ -1404,6 +1413,7 @@ if [ "$FARM_CHECK_ON" = "1" ]; then
         # `-L` STILL TRUE, i.e. with the same half-resolved path the failed-`readlink` arm now refuses.
         if [ -L "$FARM_CHECKER_T" ]; then
             REC_ACTION=farm-unverifiable
+            REC_REMEDY="replace HARNESS_APPLY_FARM_CHECKER with a real file (break the link cycle), then re-run"
             finish 0 24 "farm: UNKNOWN — $FARM_CHECKER is a symlink chain that did not resolve within 40 hops, so where it points cannot be established"
         fi
         FARM_CHECKER_REAL="$(CDPATH= cd "$(dirname "$FARM_CHECKER_T")" 2>/dev/null && pwd -P)/$(basename "$FARM_CHECKER_T")"
@@ -1419,11 +1429,13 @@ if [ "$FARM_CHECK_ON" = "1" ]; then
                 HERE_REAL="$(CDPATH= cd "$HERE" 2>/dev/null && pwd -P)"
                 if [ -n "$HERE_REAL" ] && [ "$HERE_REAL" != "$FARM_DEST_REAL" ]; then
                     REC_ACTION=farm-unverifiable
+                    REC_REMEDY="pin HARNESS_APPLY_FARM_DEST (or render CELL_HOME) to the farm the units execute ($HERE_REAL), then re-run"
                     finish 0 24 "farm: UNKNOWN — this pass executes FROM $HERE_REAL but grades $FARM_DEST_REAL; the farm that is really running was never graded — pin the farm (HARNESS_APPLY_FARM_DEST, or render CELL_HOME) to the one the units execute"
                 fi ;;
         esac
         if [ -n "$FARM_DEST_REAL" ] && [ "${FARM_CHECKER_REAL#"$FARM_DEST_REAL"/}" != "$FARM_CHECKER_REAL" ]; then
             REC_ACTION=farm-unverifiable
+            REC_REMEDY="install the CHECKER from a ref-consistent checkout (HARNESS_APPLY_FARM_CHECKER) so it is not a copy inside the farm it grades, then re-run"
             finish 0 24 "farm: UNKNOWN — the only check-farm-drift.sh found ($FARM_CHECKER) lives INSIDE the farm it would grade, and a copy that grades itself cannot answer whether it is stale — install the CHECKER from a ref-consistent checkout"
         fi
         FARM_OUT="$(bash "$FARM_CHECKER" --src "$REPO" --ref "$REF" --dest "$FARM_DEST" --no-pin-identity 2>&1)"
@@ -1613,6 +1625,11 @@ if [ "$FARM_CHECK_ON" = "1" ]; then
                         else
                             log_line "farm:   the extraction was NOT PROVEN complete — the excerpt above is the rows THIS PASS matched; the instrument's RAW output is published in $REC_FARM_ROWS"
                         fi
+                    elif [ "$FARM_RAW_WHY" = empty ]; then
+                        # ⛔ NO OUTPUT AND NO TEMP FILE IS NOT "RAW OUTPUT COULD NOT BE PERSISTED" (review
+                        # round 17, measured): with a directory at the rows path, a mute instrument printed
+                        # a sentence about raw output it never produced, over an excerpt of no lines.
+                        log_line "farm:   the instrument printed NO output for a red grade, and the header-only artifact could not be published ($REC_FARM_ROWS) — there is no name to lose"
                     else
                         log_line "farm:   the extraction was NOT PROVEN complete, and the RAW output could not be persisted ($REC_FARM_ROWS) — only the line(s) excerpted above are in this run's output, and any past the 12-line excerpt are named nowhere"
                     fi
@@ -1671,6 +1688,8 @@ if [ "$FARM_CHECK_ON" = "1" ]; then
                     # "… every one named in /tmp/meas2/state/h" — a path that does not exist, the exact
                     # defect fixed above for the raw arms. Threshold measured: farm+state ≥ 132 chars.
                     FARM_ROW_SENTENCE="${FARM_NROWS} row(s), every one named (see farm_rows=)"
+                elif [ "$FARM_ROWS_RAW" = 1 ] && [ "$FARM_RAW_WHY" = empty ]; then
+                    FARM_ROW_SENTENCE="the instrument printed NO output for a red grade, and the header-only artifact could not be published either (farm_rows= names the failure)"
                 elif [ "$FARM_ROWS_RAW" = 1 ]; then
                     FARM_ROW_SENTENCE="the instrument's RAW output could not be persisted (farm_rows= names the failure, not a file)"
                 else

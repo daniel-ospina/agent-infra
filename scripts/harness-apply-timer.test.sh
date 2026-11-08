@@ -1355,6 +1355,10 @@ cp "$PASS_SH" "$T/t24k/pass/harness-apply-pass.sh"
 OUT="$(PASS_SH="$T/t24k/pass/harness-apply-pass.sh" run_pass "$T/t24k" 2>&1)"; RC=$?
 assert_eq "$RC" "24" "T24 control: a farm with NO reachable instrument is RED, not a silent skip"
 assert_contains "$OUT" "no check-farm-drift.sh could be found" "T24 control: and it says the instrument could not be found"
+# ⛔ AND IT CARRIES A REMEDY (review round 17, measured: every `farm-unverifiable` arm wrote `remedy=none`
+# while three of them lose their only action to the 240-byte `detail=` bound — the class this PR removes).
+assert_contains "$(grep '^remedy=' <<<"$(cat "$T/t24k/state/harness-apply.status" 2>/dev/null)" 2>/dev/null)" "HARNESS_APPLY_FARM_CHECKER" \
+    "T24 control: the no-instrument refusal's remedy= names the seam to fix, never 'none'"
 
 # Control 11: a RELATIVE CELL_HOME must not resolve to a farm path with nothing at it and read green.
 # It did: `CELL_HOME=relative-cell` produced `relative-cell/.pi/agent/scripts`, hit the SKIPPED arm and
@@ -1397,6 +1401,8 @@ OUT="$(HARNESS_APPLY_FARM_CHECKER="$T/t24p/stub-ok.sh" \
     HARNESS_APPLY_FARM_DEST="$T/t24p/home2/.pi/agent/scripts" run_pass "$T/t24p" 2>&1)"; RC=$?
 assert_eq "$RC" "24" "T24 control: grading a different farm than the one this pass runs from is REFUSED"
 assert_contains "$OUT" "but grades" "T24 control: and it names both paths"
+assert_contains "$(grep '^remedy=' <<<"$(cat "$T/t24p/state/harness-apply.status" 2>/dev/null)" 2>/dev/null)" "pin HARNESS_APPLY_FARM_DEST" \
+    "T24 control: and its remedy= names the seam, so the refusal is actionable"
 # Control 14: the instrument's REMEDY survives a long row list — it is the LAST line it prints, so a
 # single `head -12` over rows+remedy cut it off at exactly the states that need it.
 mk_origin t24q; mk_clone t24q
@@ -2091,6 +2097,24 @@ assert_contains "$OUT" "printed NO output for a red grade" \
     "T24 control: and it is recorded as the no-output state, not as a list of names"
 assert_eq "$(tail -n +2 "$T/t24aj/state/harness-apply-farm-rows.txt" 2>/dev/null | wc -l | tr -d ' ')" "0" \
     "T24 control: with NO body line written — a whitespace-only row is not a name"
+
+# ⛔ NO OUTPUT *AND* NO TEMP FILE IS ITS OWN SENTENCE (review round 17, measured: with a directory at the
+# rows path, a mute instrument printed "the extraction was NOT PROVEN complete, and the RAW output could
+# not be persisted" over an instrument that printed NO raw output and an excerpt of NO lines). The
+# header-only publish failure now says what actually happened, in the journal and in `detail=`.
+mk_origin t24ak; mk_clone t24ak
+REPO_P="$CLONE"; MODE_P=sync
+mkdir -p "$T/t24ak/home/.pi/agent/scripts" "$T/t24ak/state/harness-apply-farm-rows.txt"
+printf '#!/usr/bin/env bash\nexit 1\n' >"$T/t24ak/stub-mute.sh"; chmod +x "$T/t24ak/stub-mute.sh"
+OUT="$(HARNESS_APPLY_FARM_CHECKER="$T/t24ak/stub-mute.sh" run_pass "$T/t24ak" 2>&1)"; RC=$?
+assert_eq "$RC" "24" "T24 control: a mute instrument with an unpublishable artifact is still RED (24)"
+assert_contains "$OUT" "printed NO output for a red grade, and the header-only artifact could not be published" \
+    "T24 control: and the journal does not claim raw output that never existed"
+REC24AK="$(cat "$T/t24ak/state/harness-apply.status" 2>/dev/null || true)"
+assert_absent "$(grep '^detail=' <<<"$REC24AK")" "RAW output could not be persisted" \
+    "T24 control: and detail= names the real failure, not a missing raw output"
+assert_contains "$(grep '^farm_rows=' <<<"$REC24AK")" "farm_rows=unwritable" \
+    "T24 control: with farm_rows= saying the header-only artifact could not be written"
 # ⛔ AND `remedy=` IS NEVER `none` ON A REFUSAL (review round 14, measured: the record promised "with
 # the instrument's own remedy" while emitting `remedy=none`, because this stub prints no `Next:` block).
 # A refusal that names a defect and leaves nobody an action is the class the `remedy=` field exists for.

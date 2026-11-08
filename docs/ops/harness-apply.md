@@ -182,7 +182,9 @@ removes another's file), but it is **not per-run**, and the header is what you c
   drift=…`) carry a `ref=` of their own that is the record's SHORT SHA, not the ref name; a reader who
   greps the last `ref=` compares the wrong token and rejects a correct artifact. Within that clause:
   the visible farm path must be a **prefix** of the header's `dest=`, and the visible fragment after
-  `is NOT the code ` must be a prefix of the header's `ref=`. Measured: a 60-char farm keeps
+  `is NOT the code ` **up to the next space** must be a prefix of the header's `ref=` (clip at that
+  space: a whole clause reads `origin/main ships — …`, which is LONGER than the ref and is not a prefix
+  of it — without the clip the test rejects the very records it exists to accept). Measured: a 60-char farm keeps
   `is NOT the code origin/main ships` whole; ~92 chars cuts it to `is NOT the code or`; ~120 cuts the
   farm path itself — the visible part agrees in all three, which is the decidable test. When the clause
   is cut, the header's `dest=`/`ref=` are authoritative; a `detail=` whose VISIBLE farm or ref
@@ -242,12 +244,17 @@ say exactly that and name the manual route (`read farm_rows= … and re-run chec
 `detail=` carries no remedy clause at all (it sat at the end of the bounded field and was cut
 mid-word) — `remedy=` is the only place the action appears, and it is never truncated.
 
-`farm_rows=unwritable` means the rows write failed **while the record write still succeeded** — the
-drift is still red, `farm_n` still carries the count it had (or `unparsed` when the extraction was
-**not proven complete** — a partial match counts here too, not only a total miss), but **no artifact is
-written by this pass**, so the journal says so in as many words and the rows past the 12-line excerpt
-are named nowhere durable. (A state dir that is unwritable for the
-record too leaves the PREVIOUS record in place: staleness, not a field, is that signal.)
+`farm_rows=unwritable` means the rows write failed **while the record write still succeeded**. On the
+DRIFT arms the drift is still red, `farm_n` still carries the count it had (or `unparsed` when the
+extraction was **not proven complete** — a partial match counts here too, not only a total miss), and
+the journal says in as many words that the rows past the 12-line excerpt are named nowhere durable. On
+the `farm-unknown` (rc=2) arm the field alone carries it: `farm_n=not-graded`, and the journal prints
+only its UNKNOWN line — a checker that printed rows before giving up had them captured, but nothing was
+ever excerpted and no artifact was written, so those names are durable nowhere (that is the price of a
+failed write on an arm with no grade to justify another one). When the instrument printed nothing at
+all, the journal says *that* instead of claiming a raw output could not be persisted. (A state dir that
+is unwritable for the record too leaves the PREVIOUS record in place: staleness, not a field, is that
+signal.)
 
 ⛔ **`detail=` IS BOUNDED, SO IT LEADS WITH THE DIAGNOSIS AND NO SENTENCE INLINES THE ARTIFACT PATH.** The
 field is cut at 240 bytes, so *what comes last is what gets lost*: with the farm path first, a 92-char
@@ -437,7 +444,7 @@ checkout can use the documented hatch. The same interaction is recorded for
 
 ## Tests
 
-`scripts/harness-apply-timer.test.sh` — 279 assertions, run by the
+`scripts/harness-apply-timer.test.sh` — 421 assertions, run by the
 `harness-apply-timer` shard of `run-bash-shards.sh`:
 
 | | |
