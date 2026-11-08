@@ -2149,9 +2149,12 @@ export type TaskChildState =
    * circuit breaker). Distinct from every state above: there is no pid to
    * probe and no transcript to read, so "it died" would be a false claim. */
   | "never-started"
-  /** A background dispatch's child is still running (`task_status` is the
-   * instrument for it). Present so the background result does not have to
-   * borrow a state that asserts an outcome nobody has observed yet. */
+  /** The child's process end has NOT been observed — a background dispatch
+   * (`task_status` is the instrument for it), or any settle that resolves while
+   * the child is still alive (the `onAbort`-after-`session_end` arm, which
+   * exists precisely so the lingering child is reaped later). Present so such a
+   * result does not have to borrow a state that asserts an outcome nobody has
+   * observed yet. */
   | "running";
 
 /** The canonical liveness field set, present on EVERY `task` result `details`
@@ -2202,6 +2205,14 @@ export interface TaskChildLivenessSnapshot {
   childMessagesSent: number | null;
 }
 
+/** #1208: the classifications that assert the child's life is OVER. A settle that reaches one of
+ * these while `exited` is false would contradict its own `childExited`, so it reports `running`
+ * instead. `killed` is deliberately absent (a kill signal precedes the OS's exit report). */
+const UNCONFIRMED_END_STATES: ReadonlySet<TaskChildState> = new Set<TaskChildState>([
+  "died-before-first-message",
+  "exited-no-result",
+]);
+
 /** #1208: build one snapshot from the evidence available at settle time.
  *
  * `spawnError` is its own arm: `proc.on("error")` composes a payload with `isError` and NO exit
@@ -2247,9 +2258,16 @@ export function childLivenessFor(i: {
   //
   // The `killed` state is deliberately NOT gated: a kill signal is sent BEFORE the OS reports the exit,
   // so `childExited: false` is the CORRECT and documented reading there (see the round-2 kill test).
-  // Only the death claim needs the end confirmed.
-  const childState =
-    classified === "died-before-first-message" && !i.exited ? "exited-no-result" : classified;
+  // Only a TERMINAL-OUTCOME claim needs the end confirmed.
+  //
+  // ⛔ `exited-no-result` IS SUCH A CLAIM TOO (review round 9, P2). Round 8 substituted it for
+  // `died-before-first-message` above and thereby replaced a false DEATH with a false EXIT: its own
+  // docstring says "the child ran (emitted messages) but no readable result came back", yet the arm
+  // that needs this gate reports `childMessagesSent: 0` and `childExited: false` beside it — three
+  // fields disagreeing in one payload, which is the same constraint-6 violation one value over. The
+  // vocabulary already has the truthful member: `running` asserts no outcome, and it is exactly the
+  // claim "the OS has not told us this child is gone".
+  const childState = !i.exited && UNCONFIRMED_END_STATES.has(classified) ? "running" : classified;
   return {
     childPid: typeof i.pid === "number" ? i.pid : null,
     childState,
@@ -5578,8 +5596,12 @@ export function formatCollectedRunHead(view: TaskCollectView): string {
   return `${icon} Background run ${view.run_id} finished — status: ${view.status}${exit}${view.reason ? ` [${view.reason}]` : ""}`;
 }
 
-/** Map a settled `spawnSubAgent` result to a terminal run status. */
-function classifyBackgroundOutcome(
+/** Map a settled `spawnSubAgent` result to a terminal run status.
+ *
+ * Exported for its own suite: it is pure, and the arm ORDER below is the fix (review round 9, P3) —
+ * without a direct test, reverting the order silently records a child that ran and died as
+ * `reason: "spawn-error"` ("pi never started") with nothing reddening. */
+export function classifyBackgroundOutcome(
   result: { content: any[]; details: Record<string, unknown> } | undefined,
 ): { status: TaskRunStatus; exitCode: number | null; reason?: string } {
   if (result === undefined) return { status: "failed", exitCode: null, reason: "zero-output" };

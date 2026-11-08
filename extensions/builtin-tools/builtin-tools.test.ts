@@ -12,7 +12,7 @@
  * node_modules/typebox. Created by CI setup or manually.
  */
 
-import { stripHtml, getPerplexityKey, augmentPath, PATH_EXTRA_DIRS, getPiInvocation, getSubAgentPath, resolveProviderModel, loadModelRegistry, getModelsJsonPath, getExitGraceMs, DEFAULT_EXIT_GRACE_MS, armExitWatchdog, getExitCompleteGraceMs, DEFAULT_EXIT_COMPLETE_GRACE_MS, armCompletionWatchdog, composeTaskResult, getFallbackModel, DEFAULT_FALLBACK_MODEL, connectionErrorDetected, shouldFallback, resolveProviderBaseUrl, HEARTBEAT_MARKER_PREFIX, HEARTBEAT_INTERVAL_MIN_MS, HEARTBEAT_INTERVAL_MAX_MS, DEFAULT_HEARTBEAT_INTERVAL_MS, DEFAULT_STREAM_STALL_MS, DEFAULT_TOOL_STALL_MS, DEFAULT_FIRST_MESSAGE_MS, clampHeartbeatIntervalMs, getHeartbeatIntervalMs, getStreamStallMs, getToolStallMs, getFirstMessageMs, createHeartbeatState, parseHeartbeatLine, flushHeartbeatResidue, flushHeartbeatLineBuf, ingestHeartbeatChunk, heartbeatKillDecision, HEARTBEAT_LINE_BUF_MAX, HEARTBEAT_TRACE_MAX, getTaskMaxDispatchMs, getTaskHardCapMs, DEFAULT_HARD_CAP_MS, loadScaledBound, getFirstOutputTimeoutMs, getSystemLoad, setLoad1Override, getLoad1, getCutGapMs, getEffectiveCutGapMs, getCpuStallMs, DEFAULT_CPU_STALL_MS, DEFAULT_PROGRESS_AGE_MS, getProgressAgeMs, classifyTaskExit, getTaskBackstopMs, DEFAULT_BACKSTOP_MARGIN_MS, DEFAULT_TASK_MODEL, renderRepoStateLine, renderMachineStateLine, countPiProcs, countPiInPsOutput, formatLoad1, probeSystemLoad, resolveTaskCwd, taskCwdRefusal, spawnSubAgent, resolveStreamStallMs, streamStallInertWarning, inFlightProgress, DEFAULT_SESSION_CEILING_MULT, resolveSessionCeiling, isDispatchSaturated, saturationNotice, dispatchSaturationRefusal, probeDispatchSaturation, probePiProcs, setPiProcsOverride, classifyChildLiveness, childMessagesSent, TASK_LIVENESS_DETAIL_KEYS, stampLivenessDefaults, childLivenessFor, exhaustionStatusFor } from "./index.js";
+import { stripHtml, getPerplexityKey, augmentPath, PATH_EXTRA_DIRS, getPiInvocation, getSubAgentPath, resolveProviderModel, loadModelRegistry, getModelsJsonPath, getExitGraceMs, DEFAULT_EXIT_GRACE_MS, armExitWatchdog, getExitCompleteGraceMs, DEFAULT_EXIT_COMPLETE_GRACE_MS, armCompletionWatchdog, composeTaskResult, getFallbackModel, DEFAULT_FALLBACK_MODEL, connectionErrorDetected, shouldFallback, resolveProviderBaseUrl, HEARTBEAT_MARKER_PREFIX, HEARTBEAT_INTERVAL_MIN_MS, HEARTBEAT_INTERVAL_MAX_MS, DEFAULT_HEARTBEAT_INTERVAL_MS, DEFAULT_STREAM_STALL_MS, DEFAULT_TOOL_STALL_MS, DEFAULT_FIRST_MESSAGE_MS, clampHeartbeatIntervalMs, getHeartbeatIntervalMs, getStreamStallMs, getToolStallMs, getFirstMessageMs, createHeartbeatState, parseHeartbeatLine, flushHeartbeatResidue, flushHeartbeatLineBuf, ingestHeartbeatChunk, heartbeatKillDecision, HEARTBEAT_LINE_BUF_MAX, HEARTBEAT_TRACE_MAX, getTaskMaxDispatchMs, getTaskHardCapMs, DEFAULT_HARD_CAP_MS, loadScaledBound, getFirstOutputTimeoutMs, getSystemLoad, setLoad1Override, getLoad1, getCutGapMs, getEffectiveCutGapMs, getCpuStallMs, DEFAULT_CPU_STALL_MS, DEFAULT_PROGRESS_AGE_MS, getProgressAgeMs, classifyTaskExit, getTaskBackstopMs, DEFAULT_BACKSTOP_MARGIN_MS, DEFAULT_TASK_MODEL, renderRepoStateLine, renderMachineStateLine, countPiProcs, countPiInPsOutput, formatLoad1, probeSystemLoad, resolveTaskCwd, taskCwdRefusal, spawnSubAgent, resolveStreamStallMs, streamStallInertWarning, inFlightProgress, DEFAULT_SESSION_CEILING_MULT, resolveSessionCeiling, isDispatchSaturated, saturationNotice, dispatchSaturationRefusal, probeDispatchSaturation, probePiProcs, setPiProcsOverride, classifyChildLiveness, childMessagesSent, TASK_LIVENESS_DETAIL_KEYS, stampLivenessDefaults, childLivenessFor, exhaustionStatusFor, classifyBackgroundOutcome } from "./index.js";
 import { dispatchUnkeyedSet } from "../shared/provider-failover.js";
 import { asyncRepoState } from "../repo-freshness.js";
 import builtinTools from "./index.js";
@@ -9085,15 +9085,35 @@ test("#1208: a KILLED zero-output settle keeps its measurement (review round 2, 
   parseHeartbeatLine("[task-heartbeat] tick nonce=nn tools=0 turn=1 stream_age_ms=0 tool_age_max_ms=0 saw_msg=1 saw_tool=0 progress=0", emptyTurnLoop, 1002);
   parseHeartbeatLine("[task-heartbeat] turn_end nonce=nn 1 content=0", emptyTurnLoop, 1003);
   const liveAfterAbort = childLivenessFor({ details: { exitCode: null }, hbState: emptyTurnLoop, pid: 4242, stdout: "", exited: false, killedByReason: false });
-  equal(liveAfterAbort.childState, "exited-no-result", "a child the OS has not reported gone is NOT dead — even with zero content-bearing turns");
-  equal(liveAfterAbort.childExited, false, "and the payload is self-consistent: no death claim beside `childExited: false`");
+  equal(liveAfterAbort.childState, "running", "a child the OS has not reported gone is NOT dead — and NOT `exited-no-result` either (round 9, P2: that state says it ran and ended)");
+  equal(liveAfterAbort.childExited, false, "and the payload is self-consistent: no terminal claim beside `childExited: false`");
   equal(liveAfterAbort.childMessagesSent, 0, "the zero-message measurement is still reported, so nothing is hidden");
+  // The EXIT-shaped half of the same gate: an UNKNOWN message count (no emitter) is `exited-no-result`
+  // once the child is gone, and `running` while it is not — so the fix cannot pass by gating only the
+  // death vocabulary.
+  const unkState = createHeartbeatState();
+  parseHeartbeatLine("[task-heartbeat] ready nonce=nn", unkState, 1000);
+  parseHeartbeatLine("[task-heartbeat] message_start nonce=nn", unkState, 1001);
+  parseHeartbeatLine("[task-heartbeat] turn_start nonce=nn 1", unkState, 1002);
+  parseHeartbeatLine("[task-heartbeat] tick nonce=nn tools=0 turn=1 stream_age_ms=0 tool_age_max_ms=0 saw_msg=1 saw_tool=0 progress=0", unkState, 1003);
+  equal(
+    childLivenessFor({ details: { exitCode: null }, hbState: unkState, pid: 4242, stdout: "", exited: false, killedByReason: false }).childState,
+    "running",
+    "an unconfirmed end is `running` whatever the message count says — the exit claim is gated too",
+  );
   // The positive control: the SAME child once the process end IS confirmed is the slow-start death —
   // this is the route the E2E empty-turn shim takes through `close`, so the fix cannot pass by
   // degrading every zero-message child to `exited-no-result`.
   const reapedEmptyTurnLoop = childLivenessFor({ details: { exitCode: 0 }, hbState: emptyTurnLoop, pid: 4242, stdout: "", exited: true, killedByReason: false });
   equal(reapedEmptyTurnLoop.childState, "died-before-first-message", "once the OS confirms the end, the zero-content E shape IS the death");
   equal(reapedEmptyTurnLoop.childExited, true, "and `childExited` now agrees with it");
+  // …and the exit-shaped twin once reaped keeps `exited-no-result`: the gate must not swallow the
+  // state it replaced on the arm where the end IS confirmed.
+  equal(
+    childLivenessFor({ details: { exitCode: 0 }, hbState: unkState, pid: 4242, stdout: "", exited: true, killedByReason: false }).childState,
+    "exited-no-result",
+    "a reaped child with an unprovable message count is still `exited-no-result`",
+  );
   // `null` is not `0`: with no emitter, "no attempt produced a message" is unprovable.
   equal(exhaustionStatusFor({ ...snap, childMessagesSent: null }), "failed", "unknown stays failed — a false death claim is the worse error");
   equal(exhaustionStatusFor(null), "failed", "no measurement at all (a pre-spawn refusal) stays failed");
@@ -9145,6 +9165,37 @@ test("#1208: the field set is PRESENT on arms where no child ever existed — ne
   equal(breakerRefusal.childPid, null, "no pid was ever assigned");
   equal(breakerRefusal.childExited, null, "nothing was seen alive, so `null` — never `false`");
   equal(breakerRefusal.childMessagesSent, null, "no count is knowable without a child");
+});
+
+// The durable run record's `reason` (review round 9, P3). `classifyBackgroundOutcome` persisted the
+// DURABLE cause of a background lane's death, and the arm order — a FAILED_TASK_STATUS before
+// `isError` — is a fix this PR made. It had no test of any kind: it was unexported and no suite drove
+// a background run to a death settle, so reverting the order left every suite green while a lane that
+// RAN AND DIED was durably recorded as `spawn-error` (which this module documents as "pi never
+// started"). Each row below fails if the order flips.
+test("#1208: a background lane that ran and died is recorded by STATUS, not as a spawn error", () => {
+  const died = classifyBackgroundOutcome({
+    content: [],
+    details: { status: "died-before-first-message", isError: true, exitCode: 0 },
+  });
+  equal(died.status, "failed", "a death settles the run as failed");
+  equal(died.reason, "died-before-first-message", "the DURABLE cause names the death — not `spawn-error`");
+  equal(died.exitCode, 0, "the measured exit code rides the record");
+  // The `isError` arm is still reachable and still its own answer: a payload with no terminal status
+  // (an exec that never ran) stays `spawn-error`, so the reorder cannot pass by deleting the arm.
+  const spawnErr = classifyBackgroundOutcome({ content: [], details: { isError: true } });
+  equal(spawnErr.status, "failed", "an exec failure is still a failure");
+  equal(spawnErr.reason, "spawn-error", "and it is still named as one");
+  const zero = classifyBackgroundOutcome(undefined);
+  equal(zero.reason, "zero-output", "a payload-less settle keeps its own reason");
+  // A kill outranks both — it is the parent's own action, not a death.
+  equal(
+    classifyBackgroundOutcome({ content: [], details: { killed: true, isError: true, status: "died-before-first-message" } }).reason,
+    "killed",
+    "a kill is recorded as a cut, never as a death the child chose",
+  );
+  const done = classifyBackgroundOutcome({ content: [], details: { exitCode: 0 } });
+  equal(done.status, "done", "a clean zero exit is a done run");
 });
 
 section("#1208: an EMPTY turn is not a message");
