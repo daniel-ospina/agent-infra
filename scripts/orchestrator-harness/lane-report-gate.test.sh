@@ -206,6 +206,16 @@ case "$LAST_OUT" in *"tool=$REPO/tools/worktree_report.py"*) ok "PASS names the 
 rm -f "$WT/.worktree-report/state.json"
 drive 7 "UNMEASURABLE: an ABSENT writer state kills both head witnesses, exactly as a corrupt one does" STUB_OK=1 STUB_RC=0 STUB_STALE=0
 case "$LAST_OUT" in *reason=writer-state-absent*) ok "…and it names the ABSENT state rather than returning a verdict about the report" ;; *) bad "absent-state reason: $LAST_OUT" ;; esac
+# ⛔ `reason=` MUST BE THE LAST LANE-INFLUENCED FIELD ON THIS LINE (round-22 review, P1). The carrier reads
+# the token with `##*reason=` — the LONGEST prefix, i.e. the LAST occurrence — and this was the one emit
+# that put a lane-chosen value AFTER it (`state=$wt/…`). A worktree path containing `reason=no-interpreter-…`
+# therefore made the extracted token the PATH TAIL, which matched no arm and fell to the box arm: a
+# lane-owned writer-state fault refused with no fix round. Move any field back after `reason=` and this reds.
+case "$LAST_OUT" in
+  *reason=writer-state-absent) ok "…and `reason=` is the LAST field, so a lane-chosen path cannot shadow the token" ;;
+  *reason=writer-state-absent\ *) bad "a field is rendered AFTER reason= on the writer-state line, so a lane-chosen path containing 'reason=' can shadow the token: $LAST_OUT" ;;
+  *) bad "the writer-state line does not end at its reason token: $LAST_OUT" ;;
+esac
 case "$LAST_OUT" in *VERDICT=PASS*) bad "an absent writer state was read as a PASS — deleting the witness was the cheapest bypass" ;; *) ok "…and it is not reported as PASS" ;; esac
 case "$LAST_OUT" in
   *"report_head=$WT_HEAD"*) bad "the refusal substituted the MERGING head for a report head it never read" ;;

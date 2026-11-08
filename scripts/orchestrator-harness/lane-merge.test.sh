@@ -362,6 +362,28 @@ mk7row_spoof 93 'fix/2977-reason=no-interpreter-at-or-above-python-3.12' writer-
 ck "a branch named to CONTAIN a box reason cannot move a LANE-fixable 7 into the no-round arm" \
    $([ "$RC" = 10 ] && [ "$(verdict_of 93 | cut -d' ' -f1)" = FIX_REQUIRED ] \
       && [ "$(cat "$OT/state/lanemerge-93.round" 2>/dev/null)" = 1 ] && echo 0 || echo 1)
+# ⛔ AND THE SAME SPOOF THROUGH A PATH FIELD IS SELF-DETECTING (round-22 review, P1). `##*reason=` takes the
+# LAST occurrence, so ANY lane-chosen value carrying the literal `reason=` anywhere on the line can win —
+# a worktree path is as lane-controlled as a branch name, and the gate's own writer-state line rendered
+# `state=$wt/…` AFTER the token (measured: worktree `…/lane-wt-reason=no-interpreter-…` → extracted token
+# was the path tail → box arm, 14, round 0). The ordering is fixed on the emit, and the carrier ALSO refuses
+# to hand the budget to a line it cannot read: more than one `reason=` is LANE-fixable by construction.
+mk7row_dup() { # mk7row_dup <pr> <worktree-containing-a-decoy> <real-reason>
+  new_o "$T/pr.tsv"
+  cp "$SCRIPT" "$OT/lane-merge.sh"
+  cat > "$OT/lane-report-gate.sh" <<LRGEOF
+lane_report_gate() { printf 'lane-report: VERDICT=UNMEASURABLE branch=feat/lane worktree=$2 tool=/t/report.py reason=writer-state-$3 state=$2/.worktree-report/state.json head=abc\\n'; return 7; }
+lane_report_remedy() { printf '  (remedy %s)\\n' "\${1:-}"; }
+LRGEOF
+  OUT="$(PATH="$BIN:$PATH" GH_LOG="$OT/gh.log" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 REPO_PATH="$GL" \
+        bash "$OT/lane-merge.sh" "$1" --repo o/r --branch feat/lane --pr-tsv "$T/pr-gate.tsv" --checks-tsv "$T/checks-gate.tsv" 2>&1)"; RC=$?
+}
+mk7row_dup 95 '/tmp/lane-wt-reason=no-interpreter-at-or-above-python-3.12' absent
+ck "a WORKTREE path carrying 'reason=' cannot buy the no-round arm — an ambiguous line is LANE-fixable" \
+   $([ "$RC" = 10 ] && [ "$(verdict_of 95 | cut -d' ' -f1)" = FIX_REQUIRED ] \
+      && [ "$(cat "$OT/state/lanemerge-95.round" 2>/dev/null)" = 1 ] && echo 0 || echo 1)
+ck "…and it SAYS the line is ambiguous rather than guessing a cause" \
+   $(grep -q 'reason=. tokens\|reason=. tokens\|cannot be read unambiguously' <<<"$OUT" && echo 0 || echo 1)
 # ⛔ AND THE BODY MUST NOT CONTRADICT ITSELF (round-21 review, P2). The rounds line rendered
 # "Rounds spent: 0/3 ("the loop is capped by design")" and the footer said "after a fix" under a box
 # arm whose next line says NOTHING YOU CAN PUSH. Both were measured on a run with rounds already spent.

@@ -888,8 +888,16 @@ print("%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s" % (
   # ⛔ ORDERED AFTER the `ok != 1` refusal ON PURPOSE: a report whose suites DID NOT PASS must read RED /
   # INVALID — those are verdicts about the evidence and are the more actionable answer. Only once the
   # consumer has said "the evidence passes" does an unreadable head binding become the deciding fault.
+  # ⛔ `reason=` IS THE LAST LANE-INFLUENCED FIELD ON THIS LINE, ON PURPOSE (round-22 review, P1). This
+  # is the ONE emit that rendered a lane-chosen value AFTER the token (`state=$wt/…`, and `$wt` is a
+  # worktree path the lane creates), and the carrier extracts the reason with `##*reason=` — the LAST
+  # occurrence. So a worktree path containing `reason=no-interpreter-…` made the extracted token the PATH
+  # TAIL: it matched no arm, fell to the box arm, and a lane-owned `writer-state-absent` refused with 14 /
+  # no round / "nothing you can push" instead of 10 / round 1. Measured end-to-end: identical fault, only
+  # the worktree path differing → 14/round-0 vs 10/round-1. The path is still named (twice), it just
+  # precedes the token now.
   if [ "$state_ok" != "ok" ]; then
-    _lrg_emit 7 UNMEASURABLE "branch=$branch worktree=$wt tool=$tool reason=writer-state-$state_ok state=$wt/.worktree-report/state.json head=$head"
+    _lrg_emit 7 UNMEASURABLE "branch=$branch worktree=$wt state=$wt/.worktree-report/state.json tool=$tool head=$head reason=writer-state-$state_ok"
     return 7
   fi
 

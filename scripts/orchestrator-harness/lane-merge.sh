@@ -1370,14 +1370,22 @@ if [ -n "${RESOLVED_BR// /}" ] && [ "$_lrg_skip" = 0 ]; then
     0)  log_line "lane-report: verified at head ${HEAD:0:12} — the report describes the tree being merged" ;;
     5|6) log_line "lane-report: NOT ENFORCED here (rc=$_lrg_rc) — an abstention, not a green: this box/repo cannot carry the check" ;;
     # ⛔ 7 IS A BAG, NOT A FAULT CLASS (round-20 review, P1), AND THE SPLIT IS BY REASON TOKEN, NOT BY
-    # SUBSTRING OF THE LINE (round-21 review, P1). The gate renders LANE-CHOSEN values before `reason=`
+    # SUBSTRING OF THE LINE (round-21 review, P1). The gate renders LANE-CHOSEN values on the same line
     # (`branch=$branch worktree=$wt … reason=…`), and a lane creates its own branch, so
     # `git check-ref-format --branch 'fix/2977-reason=no-interpreter-at-or-above-python-3.12'` is legal.
     # Matching the raw line therefore let a lane whose fault was `writer-state-absent` (lane-fixable)
     # select the BOX arm — no round spent, `BLOCKED_ATTEMPTS`, "nothing you can push" — and the 3-round
     # cap never fired for a fault the lane owned. Measured: same reason, only the branch differs →
-    # RC=14/round-none vs RC=10/round-1. So the reason VALUE is extracted (last `reason=` on the verdict
-    # line, cut at whitespace) and compared EXACTLY.
+    # RC=14/round-none vs RC=10/round-1. So the reason VALUE is extracted and compared EXACTLY.
+    # ⛔ TWO DEFENCES, BECAUSE ORDERING ALONE IS NOT ONE (round-22 review, P1). `##*reason=` takes the
+    # LAST occurrence, so ANY lane-chosen value carrying the literal `reason=` can win — a worktree PATH
+    # is as lane-controlled as a branch name, and one emit rendered `state=$wt/…` after the token
+    # (measured: worktree `…/lane-wt-reason=no-interpreter-…` → the extracted token was the path tail →
+    # box arm, 14, round 0). (a) `reason=` is now the LAST lane-influenced field on every emit, pinned by
+    # a gate-suite row; (b) the count of `reason=` tokens is checked, and anything but exactly ONE is
+    # LANE-fixable — so a future emit that reintroduces the ordering defect, and any spoof, costs the
+    # lane a round instead of buying it the no-round arm. The budget is the thing an attacker would want
+    # to preserve, so refusing to preserve it is the fail-safe polarity.
     # ⛔ THE LANE-CLEARABLE SET IS THE EXPLICIT LIST; every other 7 is the box/caller arm. That default
     # is deliberate: a NEW reason that a lane could clear would at worst hand off with the token printed
     # (recoverable, and the message says so), whereas defaulting the other way burns a lane's rounds on
@@ -1385,7 +1393,22 @@ if [ -n "${RESOLVED_BR// /}" ] && [ "$_lrg_skip" = 0 ]; then
     # `worktree-registered-but-unreadable`, and the three report/worktree-placement arms, whose remedies
     # are all one `git switch` or one `run` away (`lane_report_remedy 7`).
     7)  _lrg_line="$(printf '%s' "$_lrg_out" | tail -1)"
+        # ⛔ A LINE WITH MORE THAN ONE `reason=` IS AMBIGUOUS AND IS TREATED AS LANE-FIXABLE (round-22
+        # review, P1). Nothing in the gate promises the token is unique — every lane-chosen value is a
+        # candidate (`branch`, `worktree`, a path in `state=`), and a path or branch containing
+        # `reason=no-interpreter-…` makes `##*reason=` resolve to the PATH TAIL rather than the verdict.
+        # Fixing the ordering on all 32 emit sites is necessary but not sufficient, because a future emit
+        # can reintroduce it. So ambiguity is DETECTED: a spoof attempt then costs the lane a fix round
+        # instead of buying it the no-round arm, which is the fail-safe polarity (the round budget is the
+        # thing an attacker would want to preserve, and this refuses to preserve it).
+        _lrg_norsn="${_lrg_line//reason=/}"
+        _lrg_nrsn=$(( (${#_lrg_line} - ${#_lrg_norsn}) / 7 ))
         _lrg_rsn="${_lrg_line##*reason=}"; _lrg_rsn="${_lrg_rsn%%[[:space:]]*}"
+        if [ "$_lrg_nrsn" != 1 ]; then
+          log_line "⛔ lane-report: UNMEASURABLE (rc=7) — the verdict line carries $_lrg_nrsn 'reason=' tokens, so its cause cannot be read unambiguously. A LANE-chosen field (branch, worktree or a path) is spoofing the token. Treated as LANE-fixable so the round budget is never handed to a spoof."
+          lane_report_remedy 7 2>/dev/null || true
+          emit_fix FIX_REQUIRED "the lane report verdict line is ambiguous ($_lrg_nrsn reason= tokens): $_lrg_line"
+        fi
         case "$_lrg_rsn" in
           writer-state-*|worktree-registered-but-unreadable|evidence-present-on-this-box-but-no-worktree-is-registered-on-this-branch|worktree-at-this-head-is-not-registered-on-this-branch-and-holds-no-report|this-box-holds-the-report-for-this-branch-in-a-worktree-that-is-not-at-the-merging-head)
             log_line "⛔ lane-report: UNMEASURABLE (rc=7, reason=$_lrg_rsn) — a LANE-fixable condition, so a fix round is spent."
