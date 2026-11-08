@@ -1293,9 +1293,19 @@ export const CHECKPOINT_WHITESPACE_REJECT = /[^\S\u0020]|[\u200B-\u200D\u2060\u0
 //     +refs/heads/x:refs/heads/y` writes a LOCAL ref non-fast-forward, which is
 //     a discard of that ref's previous position, so `:` and `+` are outside the
 //     value classes. `git fetch` takes at most ONE bare token.
-//   * `git rebase <ref>` + `--continue|--abort|--skip` — C4/C3 prescribes
-//     `rebase` verbatim (`options=rebase`); the three continuation flags are
-//     what finishes or unwinds a rebase that hit a conflict.
+//   * `git rebase <ref>` + `--continue|--abort|--skip`, plus the ONE flag
+//     `--autostash` — C4/C3 prescribes `rebase` verbatim (`options=rebase`), and
+//     the three continuation flags are what finishes or unwinds a rebase that
+//     hit a conflict. `--autostash` is not a convenience: `git rebase` REFUSES
+//     to start on a dirty tree ("cannot rebase: You have unstaged changes"),
+//     and this checkpoint sits immediately BEFORE the step that commits the
+//     implementation — so at the moment C4 reports STALE the tree is dirty by
+//     construction, and without `--autostash` the prescribed remedy cannot run
+//     in exactly the state it is prescribed for (review round 3, F1). It is the
+//     mechanism the pre-commit framework uses for the same problem, git keeps
+//     the stash entry if the reapply conflicts, and it is a flag on the verb
+//     already prescribed rather than a new verb (`git commit`/`stash`/`checkout`
+//     stay blocked, so the remedy still cannot land or discard anything).
 //   * `git add PATHS` — stages a conflict resolution before `--continue`.
 //     Index-only; `git commit` stays blocked, so this can never land anything.
 //   * `edit` / `write` while a rebase is IN PROGRESS, TARGET-SCOPED — without
@@ -1324,7 +1334,7 @@ const _PATH = "[A-Za-z0-9_./@][A-Za-z0-9_./@-]*";
 export const CHECKPOINT_REMEDY_RE = new RegExp(
   "^git[ ]+(?:" +
     `(?:fetch|status|diff)(?:[ ]+${_REF})?` +
-    `|rebase[ ]+${_REF}` +
+    `|rebase[ ]+(?:--autostash[ ]+)?${_REF}` +
     "|rebase[ ]+--(?:continue|abort|skip)" +
     `|add[ ]+${_PATH}(?:[ ]+${_PATH})*` +
   ")$",
@@ -1421,11 +1431,40 @@ function nearestRealPath(p: string): string | null {
 //   * symlinks are resolved on the nearest existing ancestor, so a link inside
 //     the worktree cannot point the write back outside it.
 // Everything else still fails closed: a non-string/empty target is a BLOCK.
+// The paths git currently reports as UNMERGED in this checkout — the exact set
+// the stopped rebase is asking to be resolved. Empty when nothing is
+// conflicted, and empty on any failure (fail-closed: then no write is allowed).
+let conflictedProbeForTest: ((cwd: string) => string[]) | null = null;
+export function _setConflictedProbeForTest(fn: ((cwd: string) => string[]) | null): void {
+  if (process.env.NODE_ENV !== "test") return;
+  conflictedProbeForTest = fn;
+}
+export function conflictedPaths(cwd: string = process.cwd()): string[] {
+  if (conflictedProbeForTest) return conflictedProbeForTest(cwd);
+  try {
+    const out = execFileSync("git", ["ls-files", "-u", "--full-name"], {
+      cwd, encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"], timeout: 5000,
+    });
+    // `<mode> <sha> <stage>\t<path>` — one line per unmerged stage.
+    return out.split("\n").map((l) => l.slice(l.indexOf("\t") + 1).trim()).filter((l) => l !== "");
+  } catch {
+    return [];
+  }
+}
+
 export function checkpointWriteTargetAllowed(target: unknown, cwd: string = process.cwd()): boolean {
   if (typeof target !== "string" || target.trim() === "") return false;
   try {
     const root = realpathSync(cwd);
     const abs = resolve(cwd, target);
+    // THE CONTENT BOUND (review round 3, F2): only a path git currently reports
+    // as UNMERGED. A worktree-wide allowance reached the artefacts that DECIDE
+    // this gate — `scripts/parallel_work_check.py` (which mints the PASS token)
+    // and `enforcement/dangerous-ops.txt` — so "inside the checkout" was a
+    // bound on the wrong thing. A stopped rebase asks for its CONFLICTED files
+    // and nothing else; anything else is not remediation.
+    const conflicted = conflictedPaths(cwd).map((p) => resolve(cwd, p));
+    if (!conflicted.includes(abs)) return false;
     const ledgers = [tokenFile(), forceFile()].map((p) => resolve(cwd, p));
     if (ledgers.includes(abs)) return false;
     const real = nearestRealPath(abs);
@@ -2064,8 +2103,8 @@ export function gateGuidance(step: Step, mode: Mode = "gate"): string {
     const resolvedBin = bin || (infraPath && join(infraPath, "scripts", "parallel_work_check.sh"));
     if (!resolvedBin) {
       return `→ To proceed: set AGENT_INFRA_PATH (a required prerequisite per AGENTS.md), then run \`…/scripts/parallel_work_check.sh ${requiredPhase}\` until the verdict is CLEAR (writes the PASS token).
-→ If the checker reports STALE (behind origin/main), clear it first: \`git fetch\` then \`git rebase origin/main\`, then re-run the checker.
-→ If that rebase stops on a conflict, resolve it in place (edit/write are admitted while a rebase is in progress, for paths inside this worktree only), then \`git add\` and \`git rebase --continue\`.
+→ If the checker reports STALE (behind origin/main), clear it first: \`git fetch\`, then rebase, then re-run the checker. With uncommitted work (the normal case at this step) use \`git rebase --autostash origin/main\` — a plain rebase refuses to start on a dirty tree.
+→ If that rebase stops on a conflict, resolve the CONFLICTED file in place (edit/write are admitted while a rebase is in progress, for the unmerged paths only), then \`git add\` and \`git rebase --continue\`.
 → Escape tools available: read, loop_enforcer, and bash for the checker invocation or the stale-branch remedy (git fetch, git status, git diff, git rebase, git add)
 → If the check cannot CLEAR in this environment, the checkpoint is unpassable — end your turn and report`;
     }
@@ -2083,8 +2122,8 @@ export function gateGuidance(step: Step, mode: Mode = "gate"): string {
       ? " (note: the resolved path does not exist — check PARALLEL_CHECK_BIN / AGENT_INFRA_PATH)"
       : "";
     return `→ To proceed: run \`${enforcePrefix}${resolvedBin} ${requiredPhase}\`${ghostHint} until the verdict is CLEAR (writes the PASS token).
-→ If the checker reports STALE (behind origin/main), clear it first: \`git fetch\` then \`git rebase origin/main\`, then re-run the checker.
-→ If that rebase stops on a conflict, resolve it in place (edit/write are admitted while a rebase is in progress, for paths inside this worktree only), then \`git add\` and \`git rebase --continue\`.
+→ If the checker reports STALE (behind origin/main), clear it first: \`git fetch\`, then rebase, then re-run the checker. With uncommitted work (the normal case at this step) use \`git rebase --autostash origin/main\` — a plain rebase refuses to start on a dirty tree.
+→ If that rebase stops on a conflict, resolve the CONFLICTED file in place (edit/write are admitted while a rebase is in progress, for the unmerged paths only), then \`git add\` and \`git rebase --continue\`.
 → Escape tools available: read, loop_enforcer, and bash for the checker invocation or the stale-branch remedy (git fetch, git status, git diff, git rebase, git add)
 → If the check cannot CLEAR in this environment, the checkpoint is unpassable — end your turn and report`;
   }

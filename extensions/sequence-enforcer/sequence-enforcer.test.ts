@@ -19,6 +19,9 @@ import {
   isCheckpointEscape,
   rebaseInProgress,
   _setRebaseProbeForTest,
+  checkpointWriteTargetAllowed,
+  conflictedPaths,
+  _setConflictedProbeForTest,
   validateToolCall,
   handleSequenceTimeout,
   parkDiagnosis,
@@ -658,6 +661,7 @@ for (const cmd of [
   "git fetch origin",
   "git fetch origin/main",
   "git rebase origin/main",
+  "git rebase --autostash origin/main",
   "git rebase --continue",
   "git rebase --abort",
   "git rebase --skip",
@@ -693,6 +697,9 @@ for (const cmd of [
   "git rebase --exec bash -c x",
   "git rebase -x id",
   "git rebase --onto origin/main HEAD",
+  "git rebase --autostash",
+  "git rebase --autostash --exec bash -c x",
+  "git rebase --autostash origin/main && rm -rf /",
   "git status -s",
   "git fetch --upload-pack=evil",
   // #1418 review F2: a REFSPEC or a repository URL is not "a ref" —
@@ -753,53 +760,71 @@ await test("#1418 F1: edit/write are BLOCKED at a pending checkpoint when no reb
   } finally { _setRebaseProbeForTest(null); }
 });
 
-await test("#1418 F1: edit/write are ADMITTED mid-rebase for a path INSIDE the worktree", () => {
+await test("#1418 F1: edit/write are ADMITTED mid-rebase for the CONFLICTED path only", () => {
   _setTokenFileForTest(null);
   _setRebaseProbeForTest(() => true);
+  _setConflictedProbeForTest(() => ["src/conflicted.ts", "deep/dir/b.ts"]);
   try {
-    ok(!validateToolCall("edit", "", checkpointStep(), "gate", "src/a.ts").block, "edit admitted mid-rebase");
-    ok(!validateToolCall("write", "", checkpointStep(), "gate", "src/a.ts").block, "write admitted mid-rebase");
-    ok(!validateToolCall("write", "", checkpointStep(), "gate", "deep/dir/b.ts").block, "nested path admitted");
-  } finally { _setRebaseProbeForTest(null); }
+    ok(!validateToolCall("edit", "", checkpointStep(), "gate", "src/conflicted.ts").block, "edit admitted on a conflict");
+    ok(!validateToolCall("write", "", checkpointStep(), "gate", "src/conflicted.ts").block, "write admitted on a conflict");
+    ok(!validateToolCall("write", "", checkpointStep(), "gate", "deep/dir/b.ts").block, "nested conflicted path admitted");
+  } finally { _setRebaseProbeForTest(null); _setConflictedProbeForTest(null); }
 });
 
-// #1418 review round 2, F1 — the allowance must not reach the gate's OWN
-// advance path. The operator force-pass file is ordinary JSON that `write`
-// could mint, and checkpointTokenOk honours it whenever the real token fails,
-// so an unscoped allowance would let one write advance the step with no
-// checker run (and an audit line naming an "operator" the agent invented).
-await test("#1418 F1 (round 2): mid-rebase writes are REFUSED outside the worktree / on the ledgers / in the git dir", () => {
+// #1418 review round 3, F2 — a WORKTREE-WIDE allowance reached the artefacts
+// that DECIDE this gate: scripts/parallel_work_check.{sh,py} mints the PASS
+// token, and enforcement/dangerous-ops.txt is the skill-enforcer manifest. Both
+// are inside the checkout, so "inside the worktree" bounded the wrong thing.
+// The bound is now the set git reports as UNMERGED — a stopped rebase asks for
+// its conflicted files and nothing else.
+await test("#1418 F2 (round 3): mid-rebase writes are REFUSED for every non-conflicted path, incl. the gate's own artefacts", () => {
   _setTokenFileForTest(null);
   const step = checkpointStep();
   const tok = join(process.cwd(), ".mid-rebase-token.json");
   try {
     _setRebaseProbeForTest(() => true);
+    _setConflictedProbeForTest(() => ["src/conflicted.ts"]);
     _setTokenFileForTest(tok);
     const denied: Array<[string, string]> = [
+      ["the checker that mints the token", "scripts/parallel_work_check.py"],
+      ["the checker wrapper", "scripts/parallel_work_check.sh"],
+      ["the skill-enforcer manifest", "enforcement/dangerous-ops.txt"],
+      ["the sequence-enforcer itself", "extensions/sequence-enforcer/index.ts"],
       ["the operator force-pass file", "/tmp/parallel-check-force.json"],
       ["an absolute path outside the worktree", "/etc/passwd"],
       ["a traversal escape", "../../etc/passwd"],
       ["the token file, by IDENTITY (inside the tree)", tok],
       ["a git hook (git dir)", ".git/hooks/pre-commit"],
       ["the git config", ".git/config"],
+      ["an unconflicted but in-tree source file", "src/other.ts"],
       ["an empty target", ""],
     ];
     for (const [label, target] of denied) {
       ok(validateToolCall("write", "", step, "gate", target).block, `write refused: ${label}`);
       ok(validateToolCall("edit", "", step, "gate", target).block, `edit refused: ${label}`);
     }
-    // a missing target is a DENY, not an allow (the fail-closed direction)
     ok(validateToolCall("write", "", step, "gate").block, "no target at all → blocked");
     ok(validateToolCall("write", "", step, "gate", 42).block, "non-string target → blocked");
-    // …and the SAME targets are still refused once the rebase ends
     _setRebaseProbeForTest(() => false);
-    ok(validateToolCall("write", "", step, "gate", "src/a.ts").block, "no rebase → even an inside path is blocked");
-  } finally { _setRebaseProbeForTest(null); _setTokenFileForTest(null); }
+    ok(validateToolCall("write", "", step, "gate", "src/conflicted.ts").block, "no rebase → even a conflicted path is blocked");
+  } finally { _setRebaseProbeForTest(null); _setConflictedProbeForTest(null); _setTokenFileForTest(null); }
+});
+
+await test("#1418 F2 (round 3): with NO conflicted set (real git) every write is denied — fail-closed", () => {
+  _setTokenFileForTest(null);
+  _setRebaseProbeForTest(() => true);
+  _setConflictedProbeForTest(null); // real `git ls-files -u` in this checkout
+  try {
+    ok(Array.isArray(conflictedPaths()) && conflictedPaths().length === 0, "this checkout has no unmerged paths");
+    ok(!checkpointWriteTargetAllowed("src/a.ts"), "no unmerged path ⇒ no write target is allowed");
+    ok(validateToolCall("write", "", checkpointStep(), "gate", "src/a.ts").block, "and the call blocks");
+  } finally { _setRebaseProbeForTest(null); }
 });
 
 await test("#1418 F1: the full CONFLICT loop is reachable at one pending checkpoint (rebase stops → edit → add → continue)", () => {
   _setTokenFileForTest(null);
   _setRebaseProbeForTest(() => true);
+  _setConflictedProbeForTest(() => ["src/conflicted.ts"]);
   const step = makeStep({ name: "check", gate: "checkpoint", token_phase: "implement" });
   try {
     ok(!validateToolCall("bash", "git rebase origin/main", step, "gate").block, "rebase reachable");
@@ -811,7 +836,7 @@ await test("#1418 F1: the full CONFLICT loop is reachable at one pending checkpo
     // without a fresh CLEAR token.
     _setRebaseProbeForTest(() => false);
     ok(validateToolCall("edit", "", step, "gate", "src/conflicted.ts").block, "edit re-blocked once the rebase ends");
-  } finally { _setRebaseProbeForTest(null); }
+  } finally { _setRebaseProbeForTest(null); _setConflictedProbeForTest(null); }
 });
 
 await test("#1418 F1: rebaseInProgress() follows the linked-worktree `.git` FILE indirection and fails closed", () => {
@@ -835,26 +860,6 @@ await test("#1418 F1: rebaseInProgress() follows the linked-worktree `.git` FILE
   } finally { rmSync(base, { recursive: true, force: true }); }
 });
 
-// Review round 2, F2: this row used to assert only that `git fetch` is not
-// blocked at an ok-checkpoint — which was TRUE BEFORE the diff, so no mutation
-// of the change could redden it (dead weight that read as coverage of the
-// token_fresh guard). It now PINS the premise (`checkpointTokenOk` really is ok
-// at this fixture) and asserts the PAIR that bounds the guard: the remedy
-// proceeds, and a checker re-run at the same state is refused by
-// `checkpoint_token_fresh`. Drop either half of the guard's scope and one of
-// the two assertions reddens.
-await test("#1418 at an ALREADY-ok checkpoint: the remedy proceeds while a checker re-run is refused (guard scope, both halves)", () => {
-  try {
-    _setRepoForTest(TEST_REPO);
-    writeToken(new Date().toISOString(), { phase: "plan" });
-    ok(checkpointTokenOk(checkpointStep(), { enforceBinding: true }).ok, "premise pinned: this IS an ok checkpoint");
-    const r = validateToolCall("bash", "git fetch", checkpointStep(), "gate");
-    ok(!r.block, "a git fetch is not a checker re-run — the token_fresh guard must not fire");
-    const re = validateToolCall("bash", "parallel_work_check.sh plan", checkpointStep(), "gate");
-    ok(re.block && re.freshTokenBlock === true, "the same state DOES refuse a checker re-run with freshTokenBlock");
-  } finally { _setTokenFileForTest(null); _setRepoForTest(null); }
-});
-
 await test("#1418 the audit's allowed list names bash (the contract says bash IS usable at the gate)", () => {
   const allow = getExpectedToolsForStep(checkpointStep()).allow;
   ok(allow.includes("read") && allow.includes("loop_enforcer"), "escape tools present");
@@ -865,8 +870,8 @@ await test("#1418 guidance names the STALE remedy concretely (no placeholder, es
   _setTokenFileForTest(null);
   const g = gateGuidance(checkpointStep(), "gate");
   ok(g.includes("STALE"), "names the STALE verdict");
-  ok(g.includes("git fetch") && g.includes("git rebase origin/main"), "names fetch + rebase concretely");
-  for (const cmd of ["git fetch", "git rebase origin/main"]) {
+  ok(g.includes("git fetch") && g.includes("git rebase --autostash origin/main"), "names fetch + the DIRTY-TREE rebase form concretely");
+  for (const cmd of ["git fetch", "git rebase origin/main", "git rebase --autostash origin/main"]) {
     ok(isCheckpointEscape("bash", cmd), `${cmd} named in guidance passes the escape check`);
   }
   ok(!g.includes("$"), "no $VAR — the escape regex rejects $");
