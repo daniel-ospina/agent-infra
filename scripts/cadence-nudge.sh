@@ -536,10 +536,22 @@ else
   # ⛔ NOT A PIPE INTO `grep -q` (#3795 review cycle 3): under `set -o pipefail` the producer takes
   # SIGPIPE when grep exits early, the pipeline reports 141, and the capability test reads as ABSENT
   # on a good checker — the same class of false signal this file exists to catch.
-  _help=$(/usr/bin/python3 "$_verify" verify --help 2>/dev/null)
+  #
+  # ⛔ AND THE FAILURE IS SPLIT BY WHAT WAS MEASURED (#3795 review cycle 4, P2). Discarding the exit
+  # status made EVERY capability failure read as "predates --surface" — a claim about a version that
+  # was never established. A farm pass that stopped mid-write leaves a copy that raises on import,
+  # whose help exits non-zero with EMPTY stdout: that is a broken copy, not an old one, and the
+  # receipt now says which it saw. stderr is merged into the same read so the cause travels with it.
+  _help=$(/usr/bin/python3 "$_verify" verify --help 2>&1)
+  _hrc=$?
   case "$_help" in
     *--surface*) ;;
-    *) _checker_broken="stale farmed copy ($_verify) predates --surface, so it would refuse the argv before sending" ;;
+    *)
+      if [ "$_hrc" -ne 0 ]; then
+        _checker_broken="verify --help failed (rc=$_hrc): $(printf '%s' "$_help" | tr '\n' ' ' | tail -c 160)"
+      else
+        _checker_broken="stale farmed copy ($_verify) predates --surface, so it would refuse the argv before sending"
+      fi ;;
   esac
 fi
 if [ -z "$_checker_broken" ]; then
@@ -577,7 +589,10 @@ else
   if [ "$rc" -ne 0 ]; then
     cmux send --workspace "$ORCH_WS" --surface "$ORCH_SURFACE" '\n' >/dev/null 2>&1
   fi
-  verdict="NO-CHECKER"
+  # ⛔ `NO-USABLE-CHECKER`, NOT `NO-CHECKER` (#3795 review cycle 4, P2). This branch is also reached
+  # when the file EXISTS and cannot be used (stale, or broken), so the old token asserted an absence
+  # the box contradicted. `diag=[…]` still carries the measured reason.
+  verdict="NO-USABLE-CHECKER"
   delivered="UNVERIFIED"
   # ⛔ THE FAILED SEND'S OWN STDERR IS KEPT (#3795 review P2). This branch exists FOR a broken box, so
   # the cause it already holds — `cmux` refusing the send, or a usage error — is the most valuable
@@ -616,10 +631,13 @@ fi
 #                                                        TOTAL = 413 s
 # The governing boundary is the 450 s `cadence-timer.sh` interval — NOT the `-mmin +6` (360 s) takeover,
 # which can never protect: the next tick arrives at 450 s, by which time the lock is already older than
-# 6 min, so the takeover always fires. The number that must fit is therefore 413 s into the 450 s
-# timer: it does, with ~37 s to spare (the pre-#3795 path measured 368 s, so this retry spends 45 s of
-# an 82 s margin). Keep the retry cheap. Do not add another full retry budget, and do not "fix" the
-# sentinel by trusting `--timeout` — the overshoot is real and measured.
+# 6 min, so the takeover always fires.
+#
+# ⛔ AND 413 s IS THE VERIFICATION WINDOW ONLY (#3795 review cycle 4, P2). The lock is taken at the TOP
+# of this file and the pre-send work runs under it too: `goal-state.py` is bounded by its 20 s + 3 s
+# watchdog, and the `objective.py` reads have no timeout in this file. So the real tick budget is
+# 413 s + that work, inside 450 s — not "413 s with 37 s to spare". The margin is thin enough that a
+# future retry must not be added against it without re-measuring.
 printf '%s NUDGE at=%s delivered=%s (cadence-floor) gap=%sm queue=[%s] alerts=[] ask=[] verdict=%s%s\n' \
   "$(date '+%m-%d %H:%M:%S')" "$now" "$delivered" "$gap_min" "$q" "$verdict" "$_vdiag" >> "$LOG"
 # A failed verdict gets its own line TOO, so a reader scanning for `CADENCE-NUDGE` sees the failure
