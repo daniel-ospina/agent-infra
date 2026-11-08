@@ -1371,7 +1371,14 @@ if [ "$FARM_CHECK_ON" = "1" ]; then
         REC_ACTION=farm-unverifiable
         REC_REMEDY="make $FARM_DEST a readable directory holding the scripts this box executes (repair or remove the dangling link), then re-run"
         finish 0 24 "farm: UNKNOWN — $FARM_DEST exists (or is a link) but is NOT a readable directory, so the scripts this box executes cannot be graded — a dangling record is not an absent farm"
-    elif [ -z "$FARM_CHECKER" ] || [ ! -f "$FARM_CHECKER" ]; then
+    elif [ -z "$FARM_CHECKER" ] || { [ ! -f "$FARM_CHECKER" ] && [ ! -L "$FARM_CHECKER" ]; }; then
+        # ⛔ A SYMLINK THAT DOES NOT RESOLVE TO A FILE IS NOT YET A "NOT FOUND" (review round 20,
+        # measured). `-f` follows links, so a CYCLE made it false and this arm answered first — which
+        # left the hop-cap refusal below UNREACHABLE dead code (an inert enforcer: its condition could
+        # never fire while it looked like a guard) and told an operator with a cyclic link that the
+        # instrument "could not be found". A `-L` path is let through to the resolution loop, which is
+        # the only place that can tell a cycle from a dangling link; the `! -f` refusal after it keeps
+        # the dangling-link answer identical to the one this arm used to give.
         REC_ACTION=farm-unverifiable
         REC_REMEDY="point HARNESS_APPLY_FARM_CHECKER at a check-farm-drift.sh from a ref-consistent checkout, then re-run"
         finish 0 24 "farm: UNKNOWN — $FARM_DEST holds the scripts this box EXECUTES, but no check-farm-drift.sh could be found (looked in $REPO/scripts and $HERE) — cannot-verify is not a pass"
@@ -1422,6 +1429,15 @@ if [ "$FARM_CHECK_ON" = "1" ]; then
             REC_ACTION=farm-unverifiable
             REC_REMEDY="replace HARNESS_APPLY_FARM_CHECKER with a real file (break the link cycle), then re-run"
             finish 0 24 "farm: UNKNOWN — $FARM_CHECKER is a symlink chain that did not resolve within 40 hops, so where it points cannot be established"
+        fi
+        # ⛔ THE DANGLING-LINK ANSWER MOVED HERE, UNCHANGED (review round 20). The `! -f` refusal above
+        # could only be reached for a NON-link before this round, because a link was let through to the
+        # loop above it; a link whose target does not exist must still get the same "no checker could be
+        # found" sentence and remedy, not fall through to `bash` and be recorded as a bad grade.
+        if [ ! -f "$FARM_CHECKER_T" ]; then
+            REC_ACTION=farm-unverifiable
+            REC_REMEDY="point HARNESS_APPLY_FARM_CHECKER at a check-farm-drift.sh from a ref-consistent checkout, then re-run"
+            finish 0 24 "farm: UNKNOWN — $FARM_DEST holds the scripts this box EXECUTES, but no check-farm-drift.sh could be found (looked in $REPO/scripts and $HERE) — cannot-verify is not a pass"
         fi
         FARM_CHECKER_REAL="$(CDPATH= cd "$(dirname "$FARM_CHECKER_T")" 2>/dev/null && pwd -P)/$(basename "$FARM_CHECKER_T")"
         FARM_DEST_REAL="$(CDPATH= cd "$FARM_DEST" 2>/dev/null && pwd -P)"

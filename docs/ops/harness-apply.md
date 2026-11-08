@@ -244,7 +244,10 @@ cannot fix this") — so the record never names a defect and leaves nobody an ac
 printed no `Next:` block (a mis-worded farmed copy, or one that died after its rows) makes `remedy=`
 say exactly that and name the manual route (`read farm_rows= … and re-run check-farm-drift.sh`), and
 `detail=` carries no remedy clause at all (it sat at the end of the bounded field and was cut
-mid-word) — `remedy=` is the only place the action appears, and it is never truncated.
+mid-word) — `remedy=` is the only place the action appears, and it is never truncated. A checker seam
+that cannot be RESOLVED is a refusal of the same kind, with its own action: a link cycle is refused at
+40 hops (`break the link cycle`) and a link whose target is gone keeps the "no `check-farm-drift.sh`
+could be found" answer — neither is ever executed, and neither is reported as the OTHER one.
 
 `farm_rows=unwritable` means the rows write failed **while the record write still succeeded**. On the
 DRIFT arms the drift is still red, `farm_n` still carries the count it had (or `unparsed` when the
@@ -446,7 +449,7 @@ checkout can use the documented hatch. The same interaction is recorded for
 
 ## Tests
 
-`scripts/harness-apply-timer.test.sh` — 434 assertions, run by the
+`scripts/harness-apply-timer.test.sh` — 456 assertions, run by the
 `harness-apply-timer` shard of `run-bash-shards.sh`:
 
 | | |
