@@ -280,9 +280,11 @@ pin_root_of_this_box() {
 # is narrower than the version first written here, and the correction is the point: `cloud-cell-supervisor.sh`
 # USED to be in NO pi-bootstrap array, so on a fresh cell BOTH other candidates were absent and the install
 # refused outright. With the `fleet_srcs` entry this landing adds (#1938), `setup.sh` farms the supervisor FLAT to
-# `$HOME/.pi/agent/scripts/cloud-cell-supervisor.sh`, so a correctly-installed box DOES have it — and `beside`
-# then names the SAME directory, because this installer is farmed into that same `$DEST/scripts/`. The two
-# collapse into ONE candidate. What is left is the real reason the pin candidates stay: a box whose farm
+# `$HOME/.pi/agent/scripts/cloud-cell-supervisor.sh`, so a correctly-installed box DOES have it. ⛔ THE FARMED
+# CANDIDATE AND `beside` ARE NOT SYNONYMS: `beside` is derived from the RUNNING script, so they collapse into
+# one candidate ONLY when this installer is invoked from its FARMED path; an invocation from a CHECKOUT —
+# including the layer checkout the cell bring-up deliberately prefers — makes `beside` that checkout's sibling,
+# a genuinely distinct third candidate. The pin is tried first either way. What is left is the real reason the pin candidates stay: a box whose farm
 # predates that entry, or one whose farmed copy was removed, still has the pin and nothing else — and a cell
 # that HAS a durable supervisor must not be refused. This is the false block the soft preference exists to
 # prevent. ⛔ The old sentence here claimed the loss was "only the unmerged-code ExecStart because it falls
