@@ -486,14 +486,24 @@ if [ -f "$RECORD_FILE" ]; then
             # negative under `pipefail` would make a REGISTERED worktree look
             # unregistered on the destructive --apply path (#864).
             WT_LIST="$(git worktree list --porcelain 2>/dev/null)" || REG_CLAIMS=unknown
-            # ⛔ THE PATH LINE IS PINNED BY ITS TERMINATOR (#1393 R12-F2). An unpinned
-            # `*"worktree $WT_CANON"*` is a SUBSTRING test, so a record naming a directory that is a
-            # strict prefix of a registered worktree (`…/fix-801` vs `…/fix-801-slug`) read as
-            # REGISTERED — and IS_WT is exactly what makes the default run call it
-            # "ORPHANED (safe to remove)", the false PASS the paragraph below forbids. `worktree
-            # <path>` is never the last line of a porcelain block (HEAD/branch/locked follow), so the
-            # trailing newline is always present and pins the identity without narrowing a real match.
-            case "$(printf '%s\n' "$WT_LIST")" in
+            # ⛔ BOTH MATCHES BELOW ARE IDENTITY PINS, AND THE NEWLINE IS APPENDED OUTSIDE `$( )`
+            # (#1393 R12-F2). Two independent traps, both measured:
+            #
+            # (1) PREFIX vs IDENTITY. An unpinned `*"worktree $WT_CANON"*` is a SUBSTRING test, so a
+            #     record naming a directory that is a strict prefix of a registered worktree
+            #     (`…/fix-801` vs `…/fix-801-slug`) read as REGISTERED — and IS_WT is exactly what
+            #     makes the DEFAULT run call it "ORPHANED (safe to remove)", the false PASS the
+            #     paragraph below forbids.
+            # (2) THE NEWLINE MUST COME FROM OUTSIDE THE SUBSTITUTION. `$(printf '%s\n' "$WT_LIST")`
+            #     RE-STRIPS the newline it just added, so that form cannot match any line that is
+            #     LAST in the listing. The `branch` line IS last for the final block
+            #     (`git worktree list --porcelain` ends `branch …\n\n`, measured), so the
+            #     `printf`-inside form silently dropped REG_CLAIMS for the one worktree most likely
+            #     to be holding the branch: the dry run printed `ORPHANED (safe to remove)` while the
+            #     same sweep reported `KEPT by --apply` — a self-contradicting report, and a false
+            #     PASS (the ref itself survived, because `delete_branch_cas` re-enumerates).
+            #     `worktree <path>` is never last (HEAD/bare always follows), so one form serves both.
+            case "$WT_LIST"$'\n' in
                 *"worktree $WT_CANON"$'\n'*) IS_WT=true ;;
             esac
             # ⛔ A FAILED READ IS NOT "NOTHING CLAIMS IT" (round-8 F2, the G1 rule one layer up).
@@ -501,8 +511,10 @@ if [ -f "$RECORD_FILE" ]; then
             # not be read) was advertised by the DRY run as "ORPHANED (safe to remove)". The
             # classifier must agree with the destruction path — that is round-3 F3's rule, applied
             # to the read that can also fail.
-            # Trailing newline pinned so `refs/heads/t` cannot match `refs/heads/t/sub`.
-            case "$(printf '%s\n' "$WT_LIST")" in
+            # Trailing newline pinned so `refs/heads/t` cannot match `refs/heads/t/sub` — and
+            # appended OUTSIDE `$( )` for the reason spelled out above: the `printf`-inside form
+            # re-strips its own newline and then misses the LAST block's `branch` line.
+            case "$WT_LIST"$'\n' in
                 *"branch refs/heads/$BRANCH"$'\n'*) REG_CLAIMS=true ;;
             esac
         fi

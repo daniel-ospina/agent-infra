@@ -83,6 +83,27 @@ assert_contains "$LINE" '"repo":"local"' "record has repo"
 $RW done --dispatch d-801 >/dev/null
 assert_eq "$(wc -l < "$WORKTREES_RECORD" | tr -d ' ')" "0" "done removes the record"
 
+# 1b2. round-13 F3: the prune rewrite is FAIL-SAFE. An unreadable record file means the filter
+#      cannot run; the truncating form would replace the file with a PARTIAL temp file and lose the
+#      whole teardown trail. A failed filter must leave the file exactly as it was.
+$RW add --branch fix/fs-1 --worktree /tmp/wt-fs --dispatch d-fs --ts 2026-08-01T00:00:00Z >/dev/null
+$RW add --branch fix/fs-2 --worktree /tmp/wt-fs2 --dispatch d-fs --ts 2026-08-01T00:00:00Z >/dev/null
+assert_eq "$(wc -l < "$WORKTREES_RECORD" | tr -d ' ')" "2" "precondition: two records under one dispatch"
+if [ "$(id -u)" = 0 ]; then
+    echo "  ⏭️  skipped 1b2 (running as root — chmod 000 does not deny root's read)"
+else
+    chmod 000 "$WORKTREES_RECORD"
+    set +e
+    $RW done --dispatch d-fs --branch fix/fs-1 --worktree /tmp/wt-fs >/dev/null 2>&1
+    RC=$?
+    set -e
+    chmod 644 "$WORKTREES_RECORD"
+    assert_eq "$RC" "0" "done never fails the caller on an unreadable record file"
+    assert_eq "$(wc -l < "$WORKTREES_RECORD" | tr -d ' ')" "2" "a failed filter leaves the record file INTACT (no partial rewrite)"
+fi
+$RW done --dispatch d-fs >/dev/null
+assert_eq "$(wc -l < "$WORKTREES_RECORD" | tr -d ' ')" "0" "1b2 cruft cleared"
+
 # 1c. status reports counts and repo-filtering
 $RW add --branch fix/a --worktree /tmp/wt-a --dispatch d-a --repo local >/dev/null
 $RW add --branch fix/b --worktree /tmp/wt-b --dispatch d-b --repo other/repo >/dev/null
@@ -676,7 +697,11 @@ git -C "$FIX/pfx" add -A && git -C "$FIX/pfx" commit -qm pfx
 git branch fix/pfx-stale
 $RW add --branch fix/pfx-stale --worktree "$FIX/pfx" --dispatch d-prefix --ts 2026-08-01T00:00:00Z >/dev/null
 # The precondition: this dir is NOT registered, and only a substring test can say otherwise.
-assert_eq "$(git worktree list --porcelain | grep -cxF "worktree $FIX/pfx")" "0" \
+# ⛔ CANONICALIZE the fixture path (#1393 R13-F4): porcelain prints REALPATHS, so grepping for the
+# mktemp form reports 0 on macOS (/var/folders/… vs /private/var/…) whether or not the fixture is
+# right — a precondition that can never fail is not a precondition.
+PFX="$(cd "$FIX/pfx" && pwd -P)"
+assert_eq "$(git worktree list --porcelain | grep -cxF "worktree $PFX")" "0" \
   "precondition: the prefix dir is genuinely unregistered (0 exact matches)"
 OUT="$($SCAN 2>&1 || true)"
 assert_not_contains "$OUT" "ORPHANED (safe to remove)" "a strict-prefix dir is never advertised as safe to remove"
@@ -688,6 +713,45 @@ $RW done --dispatch d-prefix --branch fix/pfx-stale --worktree "$FIX/pfx" >/dev/
 git worktree remove --force "$FIX/pfx-slug" >/dev/null 2>&1 || true
 git branch -D fix/pfx-live >/dev/null 2>&1 || true
 git branch -D fix/pfx-stale >/dev/null 2>&1 || true
+
+# ── 2af. round-13 F2: the GHOST arm's prune is narrowed too. A ghost record (branch nowhere, dir
+#     provably absent) shares a dispatch with a registered DIRTY worktree; pruning the ghost by
+#     dispatch alone would erase the KEPT sibling's record. The `reap_record` site is pinned by 2ad;
+#     this is the OTHER site, and without it reverting `:456` left the suite fully green.
+git worktree add -q "$FIX/wt-ghost-sib" -b fix/ghost-sib
+ echo uncommitted > "$FIX/wt-ghost-sib/untracked.txt"
+$RW add --branch fix/ghost-shared --worktree "$FIX/never-ghost" --dispatch d-ghost-sib --ts 2026-08-01T00:00:00Z >/dev/null
+$RW add --branch fix/ghost-sib --worktree "$FIX/wt-ghost-sib" --dispatch d-ghost-sib --ts 2026-08-01T00:00:00Z >/dev/null
+OUT="$($SCAN --apply 2>&1 || true)"
+assert_contains "$OUT" "never existed" "the ghost record is still identified as a ghost"
+assert_eq "$(wc -l < "$WORKTREES_RECORD" | tr -d ' ')" "1" "a kept sibling survives the GHOST arm's prune"
+grep -qF '"branch":"fix/ghost-sib"' "$WORKTREES_RECORD" \
+  && ok "the GHOST arm's surviving record is the kept sibling" \
+  || bad "the GHOST arm pruned the kept sibling's record"
+[ -f "$FIX/wt-ghost-sib/untracked.txt" ] && ok "the dirty sibling tree survives the GHOST arm" || bad "the dirty sibling tree was removed"
+git show-ref --verify --quiet refs/heads/fix/ghost-sib && ok "the dirty sibling keeps its branch" || bad "the dirty sibling's branch was deleted"
+$RW done --dispatch d-ghost-sib --branch fix/ghost-sib --worktree "$FIX/wt-ghost-sib" >/dev/null
+git worktree remove --force "$FIX/wt-ghost-sib" >/dev/null 2>&1 || true
+git branch -D fix/ghost-sib >/dev/null 2>&1 || true
+
+# ── 2ag. round-13 F1: the registration pin must be able to match the LAST-listed worktree.
+#     `$(printf '%s\n' "$WT_LIST")` RE-STRIPS the newline it adds, so the pin missed any line that
+#     is last in the listing — and `branch` IS last for the final block. REG_CLAIMS then read false
+#     for the branch a LIVE worktree holds, and an absent dir was printed as `ORPHANED (safe to
+#     remove)` while the same sweep printed `KEPT by --apply` (a self-contradicting report).
+#     The live worktree is added LAST on purpose: that is what puts it in the final block.
+git branch fix/last-1
+$RW add --branch fix/last-1 --worktree "$FIX/never-last" --dispatch d-last --ts 2026-08-01T00:00:00Z >/dev/null
+# Sorted by PATH, so the fixture is named to land after every other registered worktree.
+git worktree add -q "$FIX/wt-zzz-last" fix/last-1
+assert_eq "$(git worktree list --porcelain | awk 'BEGIN{RS=""} END{print}' | tail -1)" "branch refs/heads/fix/last-1" \
+  "precondition: the branch is held by the LAST-listed worktree"
+OUT="$($SCAN 2>&1 || true)"
+assert_not_contains "$OUT" "ORPHANED (safe to remove)" "a branch held only by the LAST worktree is never 'safe to remove'"
+assert_contains "$OUT" "still claims this branch" "the classifier agrees with the CAS: a registration still claims it"
+$RW done --dispatch d-last --branch fix/last-1 --worktree "$FIX/never-last" >/dev/null
+git worktree remove --force "$FIX/wt-zzz-last" >/dev/null 2>&1 || true
+git branch -D fix/last-1 >/dev/null 2>&1 || true
 
 # ── Summary ───────────────────────────────────────────────────────────────
 echo ""
