@@ -56,8 +56,9 @@ export const GATE_EVENT_NAMES = [
   "bridge_clear", // #561: scripts/vgate.sh clear — root-scoped bridge rewrite (type-documentation; vgate.sh appends raw JSONL)
   "review_spawn_no_verdict", // #2665: a reviewer spawn returned no verdict (attempt, NOT a dispatch)
   "gate_recovery", // verification-gate: N verified entries were merged for `root` — the root the
-  //                   record NAMES, which is the discriminator (not the call site — three sites
-  //                   emit it). When `root` is NOT the caller's own root the merge is
+  //                   record NAMES, which is the discriminator (not the call site — THREE CALL
+  //                   SITES reach the ONE emit site, `index.ts` recoverBridgeForRoot). When
+  //                   `root` is NOT the caller's own root the merge is
   //                   INSPECTION-ONLY: it is paired with `gate_recovery_foreign_root` and the
   //                   entries are inert for git ops rooted elsewhere. When `root` IS the caller's
   //                   own root the merge is LIVE — it is the state that gates the op.

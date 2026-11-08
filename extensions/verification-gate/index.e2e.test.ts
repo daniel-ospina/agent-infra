@@ -5908,8 +5908,9 @@ async function main() {
     }
 
     // The defect ITSELF, in the child's own transcript: pre-fix this printed
-    // "📂 Recovered 1 verified files from bridge" (A's count) and therefore never
-    // warned. Post-fix B recovers 0 and the #264 P2 warning is audible again.
+    // "📂 Recovered 2 verified files from bridge" (A's count — the fixture holds TWO
+    // entries for A, one of them the shared path) and therefore never warned.
+    // Post-fix B recovers 0 and the #264 P2 warning is audible again.
     ok(!captured.some((l) => /Recovered \d+ verified files from bridge/.test(l)),
       `1265a: B must not claim a recovery count for a sibling's entries, got: ${captured.join(" | ")}`);
     ok(captured.some((l) => l.includes("0 bridge-recovered files")),
@@ -6005,7 +6006,18 @@ async function main() {
     equal(retry, undefined, "1265a: after B's OWN PASS the op is allowed — the worktree is usable again");
     const bridgeAfter = readFileSync(join(bridgeDir, "latest.json"), "utf8");
     ok(bridgeAfter.includes(`${realB}::src/b1265.ts`), "1265a: B's own entry is what unblocked it");
-    ok(bridgeAfter.includes(`${realA}::src/a1265.ts`), "1265a: A's entry is preserved (the bridge is per-root, not last-write-wins)");
+    // ⛔ SCOPED TO WHAT IT CHECKS (review F3). This row pins AC (c)'s END STATE — B's
+    // PASS does not erase the entry it never owned — and it CANNOT discriminate a
+    // snapshot revert on its own: the write passes `Array.from(verifiedSet.keys())`,
+    // which already holds A's keys (the inspection merge at session_start put them
+    // there), so a whole-file-snapshot `writeBridge` writes A too. Measured: filtering
+    // the caller's list to the writing root (both `pp.root === projectRoot` and the
+    // normalised form) leaves this row GREEN, because `writeBridge`'s own
+    // merge-with-existing (#1225/#1573) restores A regardless. The row that DOES
+    // discriminate the snapshot revert is scenario 21b (:955), whose writer's
+    // registry never held the foreign entry — do not read this row as covering that,
+    // and do not delete 21b on the strength of this one.
+    ok(bridgeAfter.includes(`${realA}::src/a1265.ts`), "1265a: B's PASS leaves A's entry in the bridge (AC c end state — see scenario 21b for the snapshot-revert discriminator)");
   });
 
 } // main: plugin loaded; tests run sequentially via runAll()
