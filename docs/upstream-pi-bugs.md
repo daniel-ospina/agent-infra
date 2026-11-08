@@ -1113,9 +1113,14 @@ below shows the processes above 5% reading at working rates rather than sitting 
 the idle floor. That is evidence *against* a silent-session burn, but it is not the
 transcript predicate: for those 18 the silence value is **unknown, not negative**.
 So what this section records is **the CPU
-signal firing and the burn being absent**, not the committed two-conjunct trigger
+signal firing and the burn being absent from these four windows for every process
+the labelling placed outside the idle set**, not the committed two-conjunct trigger
 having fired. It also records, more durably, a **better predicate pair**
-(ΔCPU + `rchar`) than the 09-16 table's transcript-age predicate.
+(ΔCPU + `rchar`) than the 09-16 table's transcript-age predicate. And note what
+that implies for the guard: **#1127 is ΔCPU joined to #469's `.jsonl` silence**, the
+very conjunct this box made unevaluable for 18 of 19 processes — so a guard keyed on
+it alone would be blind to most of the fleet, and `rchar` belongs in its second
+conjunct.
 
 **A method correction, forced by the data.** The 09-16 table keys "idle" on the
 age of the session `.jsonl`. That predicate is **not obtainable on a fleet box**:
@@ -1137,11 +1142,13 @@ the provider stream or the tool output). Be precise about which of the two carri
 the weight, though. This section's `idle` / `working` labels are **per window, not
 per process**, and the rule behind them is **not stated here** — so the read floor
 below describes the samples the labels mark, and is a corroborating signal rather
-than an independent classifier. That is why **ΔCPU makes the split and `rchar`
-corroborates it**: a read threshold cannot stand on its own when the label it would
-reproduce is itself unstated. ΔCPU
-comes from `/proc/<pid>/stat`'s `utime+stime` ticks (`USER_HZ=100`), i.e. the
-09-16 method (`ps -o time` twice) at 10 ms resolution. The main-thread vs
+than an independent classifier. (The same gap applies to the `TUI` / non-`TUI` split
+that the 12 and 37 counts are computed over: no test for it is recorded here either,
+so those counts are not re-derivable from this section. Named rather than left
+implicit.) That is why **ΔCPU makes the split and `rchar` corroborates it**: a read
+threshold cannot stand on its own when the label it would reproduce is itself
+unstated. ΔCPU comes from `/proc/<pid>/stat`'s `utime+stime` ticks (`USER_HZ=100`),
+i.e. the 09-16 method (`ps -o time` twice) at 10 ms resolution. The main-thread vs
 `V8Worker` split in the last bullet cannot come from those **process-level**
 totals, which sum every thread; it reads the same counters **per thread**
 (`/proc/<pid>/task/<tid>/stat`), identifying the worker pool by `comm`.
@@ -1155,7 +1162,8 @@ epoch — the property the epoch analysis above found missing across windows.
 | 09:27:15 (25 s) | 22 | 14 | 11.7 | 9 | **0.1** | 5 | 54.5 KB/s |
 | 09:27:40 (25 s) | 22 | 14 | 20.8 | 9 | **0.1** | 5 | 299.7 KB/s |
 
-**Result — the idle burn is absent, and every hot process is reading.**
+**Result — no process labelled idle was burning, and every hot process was
+reading.**
 
 - **12 distinct idle TUI processes across the four windows, and the worst value any
   of them shows while labelled idle is 0.3% of a core** (11 of 12 at ≤ 0.2%; pids
@@ -1182,8 +1190,9 @@ epoch — the property the epoch analysis above found missing across windows.
   1.0–209.5 min), and it does not recur here. Be clear about what it is though. The
   first conjunct is close to construction — no process above 1% is labelled idle
   under a ΔCPU split — but the second is a **measured** value: the lowest read rate
-  any labelled-working process showed in any window is **10.4 KB/s, ~10× the idle
-  floor**. So `NONE` is a real result about reads, not a tautology; what it says
+  any labelled-working process showed in any window is **10.4 KB/s — 0.4 KB/s above
+  the 10 KB/s maximum of the quoted idle samples, ≈4%**. So `NONE` is a real result
+  about reads, not a tautology; what it says
   nothing about is **transcript silence**, which is the quantity the committed
   trigger names. Within that scope it does establish that a *gross* recurrence of the
   09-16 signature is absent from these four windows. What it cannot do is separate a
@@ -1218,8 +1227,9 @@ epoch — the property the epoch analysis above found missing across windows.
 - **Main thread vs workers** (the report's caveat quantified, though *not* the
   size column, which stays missing below): on the processes that were busy, the
   main thread carried **0.61–1.00** of the ΔCPU and the `V8Worker` pool
-  **0.02–0.41** — ranges across those processes, not a single per-process split;
-  the remainder in each case is other threads. So the burn,
+  **0.02–0.41** — envelopes across those processes, not a single per-process split
+  and not jointly attained: each process's shares sum with its *other* threads to
+  1.00. So the burn,
   when it exists, is main-thread JS — consistent with the render-frame mechanism
   and *not* primarily collector throughput.
 
@@ -1241,7 +1251,10 @@ indistinguishable from one genuinely working. The 09-16 burners' read rates were
 **never measured** (that table recorded ΔCPU and `.jsonl` age only), so whether
 reads would have separated them here is *unknown*, not no. What it does
 mean operationally is that the **mechanical trip is
-still #1127** — a prose re-check answered once is still prose.
+still #1127** — a prose re-check answered once is still prose — and that #1127 must
+take `rchar` (or an equivalent) as its second conjunct: #469's `.jsonl` silence was
+unevaluable for 18 of 19 processes on this box, so a guard keyed on it alone is blind
+to most of the fleet.
 
 ### Mitigation available in agent-infra (the issue's ask 3)
 
