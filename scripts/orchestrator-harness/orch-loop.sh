@@ -8904,7 +8904,20 @@ PY
       # every arm green. The fence therefore starts AFTER `( _att=0`, and two arms pin that structure
       # (no `(`/`)` boundary inside it, an opener immediately before it).
       if [ -n "$REFRESH_SH" ]; then
-        ( _att=0; _t0="$(date +%s)"
+        # ⛔ `_t0` IS VALIDATED LIKE `_now`, AND THE FIRST READ IS THE ONE THAT BITES (fresh-context
+        # review, P2 — measured). Only `_now` was screened, so a failed FIRST read left `_t0` empty and
+        # bash read the empty VARIABLE as 0 in `$(( _now - _t0 ))` — the same empty-reads-as-a-value
+        # trap the `_now` screen exists for, one read later. Measured with a shim failing only the first
+        # `date +%s`: `the 300s in-cycle retry budget is spent (1794151021s of wall clock already
+        # spent …, + 0s wanted)`. The bound still held (one attempt), but the operator was sent to the
+        # wrong cause: this is the "cannot be MEASURED" condition and it must SAY so. Arm (b3d) drives
+        # both reads failing, so it cannot see this half; arm (b3f) fails only the first.
+        # It is read ABOVE the subshell rather than inside it so the fence below stays immediately
+        # interior to the backgrounded pass — `cycle-stages.test.sh` §9.1d-iii requires the nearest code
+        # line before the fence to OPEN that subshell, and an intervening assignment reds it (measured).
+        _t0="$(date +%s 2>/dev/null)"
+        case "$_t0" in ''|*[!0-9]*) _t0="" ;; esac
+        ( _att=0
           # >>> BEGIN NOT-A-CYCLE-NAP — the in-cycle retry backoff below (agent-infra#3584)
           while :; do
             _att=$(( _att + 1 ))
@@ -8934,7 +8947,7 @@ PY
             _now="$(date +%s 2>/dev/null)"
             case "$_now" in ''|*[!0-9]*) _now="" ;; esac
             _elapsed=""
-            if [ -n "$_now" ]; then _elapsed=$(( _now - _t0 )); fi
+            if [ -n "$_now" ] && [ -n "$_t0" ]; then _elapsed=$(( _now - _t0 )); fi
             if [ -z "$_elapsed" ] || [ "$_elapsed" -lt 0 ]; then
               echo "[refresh] TRANSIENT rc=$rc (attempt ${_att}/${REFRESH_RETRY_MAX_ATTEMPTS}) — NOT retrying again: the in-cycle retry budget cannot be MEASURED (the wall clock read failed or stepped backwards), and an unmeasurable budget is treated as SPENT rather than skipped — an unmeasured bound over the ${REFRESH_STALE_LOCK_MIN:-20}m stale-lock guard would be no bound at all, so the next cycle picks it up (agent-infra#3584)" >> "$LOG"
               break
