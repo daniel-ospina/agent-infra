@@ -1,0 +1,42 @@
+{
+  "_ref": "refs/lanes/cmux.klane-11083-1794139438-p1293931-c6293918",
+  "_sha": "03dc0468291d5ad097df1948831462994d77d2a3",
+  "artifacts": [
+    {
+      "kind": "log",
+      "value": "/tmp/cell-home/orchestrator/logs/lane-11083.log"
+    },
+    {
+      "kind": "branch",
+      "value": "feat/11083-tm"
+    },
+    {
+      "kind": "sha",
+      "value": "52ef349a7996384fc5efcb35d0dae85c76bbfe68"
+    },
+    {
+      "kind": "worktree",
+      "value": "/home/cmux/tortoise/.worktrees/tm-11083"
+    }
+  ],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 7800,
+  "duration_s": 7251,
+  "ended_at": 1794146689,
+  "exit_code": 143,
+  "heartbeat_at": 1794146689,
+  "host": "cmux",
+  "issue": 11083,
+  "kind": "lane",
+  "lane_id": "cmux.klane-11083-1794139438-p1293931-c6293918",
+  "lease_until": 1794154489,
+  "pid": 1293931,
+  "reason": "bound:exceeded-wallclock",
+  "repo": "daniel-ospina/tortoise",
+  "schema": 1,
+  "started_at": 1794139438,
+  "state": "FAILED",
+  "tag": "11083",
+  "worktree": "/home/cmux/tortoise/.worktrees/tm-11083"
+}
