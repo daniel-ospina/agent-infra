@@ -76,7 +76,15 @@ source_in() {
 # claimed to protect, so a NARROWED or BROKEN (c)/(d) would have left both GREEN — an inert gate living
 # inside the arms written to prevent inert gates. The real checks and the mutation arms now call the SAME
 # functions below, so a probe that stops discriminating reddens its own control.
-LEGACY_DEFAULT_RE='CELL_HOME="\${CELL_HOME:-/tmp/cell-home}"\|CELL_HOME:-/tmp/cell-home\|CELL_HOME="\${HOME:-/tmp/cell-home}"'
+# ⛔ A PATTERN THAT ONLY KNOWS THE FLAT FORM CERTIFIES NOTHING (review F3a, verified). The pre-#3453
+# default survives in NESTED shapes — `${CELL_HOME:-${SOME_SEAM:-/tmp/cell-home}}` — where the literal
+# sits one level deeper than any of the three alternatives the first cut carried. Measured:
+# `reap-abandoned-worktrees.sh:219` piped through that RE answered NO-MATCH while the arm's message said
+# "NO non-test script defaults CELL_HOME to the legacy path". The two alternatives below are
+# (1) ANY assignment whose name contains CELL_HOME and whose default reaches `/tmp/cell-home`, however
+# deeply nested, and (2) a bare `CELL_HOME…:-/tmp/cell-home` USED without an assignment (still a default
+# being taken). `e3b` is the control over shape (1): it must fire, or the widening did not take.
+LEGACY_DEFAULT_RE='[A-Za-z_]*CELL_HOME[A-Za-z_]*=.*:-/tmp/cell-home\|CELL_HOME[A-Za-z_]*:-/tmp/cell-home'
 
 # probe_legacy_default <file> — 0 iff the file carries the pre-#3453 legacy CELL_HOME assignment.
 probe_legacy_default() { grep -q "$LEGACY_DEFAULT_RE" "$1" 2>/dev/null; }
@@ -350,6 +358,19 @@ printf '\n── (d) THE CONSUMERS CONSUME IT ───────────�
 
 # Each of these renders a unit, builds a lane session, installs the layer, reaps the cell's disk, or
 # resolves a credential path — i.e. each one ANSWERS "what is this box's home?" and must not do it alone.
+# ⛔ A REMEMBERED LIST CANNOT CERTIFY "EVERY CONSUMER" (review F3b). Three files that answer the same
+# question sat outside it, and one of them returned /tmp/cell-home as a WORKER's HOME:
+#   · `harness-apply-pass.sh` — the pass the scheduled unit runs (it decides where the pin is written);
+#   · `harness-up` — the operator's re-pin (it decides which pin record it reads);
+#   · `reap-abandoned-worktrees.sh` — the disk reaper (its preserve-set names the home).
+# All three are in the list now. The ONE DECLARED EXCEPTION is
+# `scripts/orchestrator-harness/worker-terminal.sh:724` `wt_launcher_home`, which still probes
+# `/tmp/cell-home` as a credential home for a spawned worker. It is named here rather than silently
+# omitted: migrating it re-orders CREDENTIAL resolution for every worker spawn (the loop tries
+# `$HOME` then the cell home, each only when it actually holds a token), which is a credential-surface
+# change that belongs in its own change with its own review — not in a home-derivation diff. Its
+# behaviour is unchanged by this PR and is pre-existing; what changes here is that the sweep no longer
+# implies it is covered.
 for rel in \
   scripts/cell-self-pin.sh \
   scripts/cloud-cell-bringup.sh \
@@ -364,7 +385,10 @@ for rel in \
   pi-bootstrap/cell-install.sh \
   scripts/orchestrator-harness/key-gate.sh \
   scripts/orchestrator-harness/cloud-cell-doctor.sh \
-  scripts/orchestrator-harness/refresh-candidates.sh ; do
+  scripts/orchestrator-harness/refresh-candidates.sh \
+  scripts/harness-apply-pass.sh \
+  scripts/harness-up \
+  scripts/reap-abandoned-worktrees.sh; do
   f="$REPO_ROOT/$rel"
   if [ ! -f "$f" ]; then bad "d: $rel is missing from the tree"; continue; fi
   if ! probe_consumes_resolver "$f"; then
@@ -477,6 +501,27 @@ if probe_legacy_default "$REV"; then
   ok "e3 c1's pattern FIRES on the pre-#3453 assignment (it is not an inert grep)"
 else
   bad "e3 c1's pattern does not fire on the pre-#3453 assignment — c1 is inert"
+fi
+
+# e3b: THE NESTED-SEAM CONTROL (review F3a). The flat form above is the shape the FIRST cut knew. The
+# shape that escaped it is one seam deeper, and it was LIVE in this repo (`reap-abandoned-worktrees.sh`).
+# If the widening ever regresses to the three flat alternatives, this arm reddens — and it is the only
+# arm that can, because the flat arms cannot see the nested shape at all (measured NO-MATCH).
+NESTEDREV="$T/reverted-nested.sh"
+printf '#!/usr/bin/env bash\nCELL_HOME_DEFAULT="${CELL_HOME:-${REAP_AW_CELL_HOME_DEFAULT:-/tmp/cell-home}}"\n' >"$NESTEDREV"
+if probe_legacy_default "$NESTEDREV"; then
+  ok "e3b c1's pattern FIRES on the NESTED-SEAM default (the shape that escaped the flat alternatives)"
+else
+  bad "e3b c1's pattern does NOT fire on the nested-seam default — the widening regressed to the flat forms and c1 is certifying less than its message claims"
+fi
+# …and the polarity partner: a file that only NAMES the legacy home (in prose, or through a variable the
+# resolver owns) is not a DEFAULT, so a pattern that fired on every mention would be a false block.
+SAFEREV="$T/not-a-default.sh"
+printf '#!/usr/bin/env bash\n# the legacy home is /tmp/cell-home; we never default to it\nCELL_HOME="$(cell_home_resolve)"\n' >"$SAFEREV"
+if probe_legacy_default "$SAFEREV"; then
+  bad "e3b polarity: the pattern fires on a file that only MENTIONS the legacy home — it would false-block"
+else
+  ok "e3b polarity: a file that only MENTIONS the legacy home is not a default (no false block)"
 fi
 
 # e4: BOTH real probes must fire on the PRE-#3453 text of a real consumer. `deploy-crossbox.sh` carried

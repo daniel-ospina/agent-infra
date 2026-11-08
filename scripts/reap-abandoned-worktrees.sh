@@ -153,7 +153,32 @@
 set -uo pipefail
 
 SCRIPT_NAME="reap-abandoned-worktrees.sh"
-SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
+# ⛔ THE SELF PATH COUNTS ONLY WHEN IT NAMES THIS FILE — see `lib/cell-home.sh` §CONSUMERS. Under
+# `bash -s` (a piped start) `$0` is literally `bash`, so an unguarded `dirname` answers the CALLER's
+# working directory and this script would source a library out of it.
+_SELF="${BASH_SOURCE[0]:-}"; [ -f "$_SELF" ] || _SELF=""
+SELF_DIR=""
+[ -n "$_SELF" ] && SELF_DIR="$(cd "$(dirname "$_SELF")" 2>/dev/null && pwd)"
+# ── THE ONE HOME (agent-infra#3453) ──────────────────────────────────────────────────────────────
+# This script must not spell `/tmp/cell-home` itself: the one literal lives in `scripts/lib/cell-home.sh`
+# and every other shipped file names it through `CELL_HOME_LEGACY`. The pre-#3453 shape here was
+# `${REAP_AW_CELL_HOME_DEFAULT:-/tmp/cell-home}` — one seam deeper than the flat alternatives the sweep
+# in `lib/cell-home.test.sh` first carried, so it survived a green `c1` (review F3a, verified NO-MATCH).
+# FAIL-CLOSED like the `lib/live-paths.sh` block below, for the same reason: a home this script cannot
+# name is a guard it cannot enforce, and a silently-empty preserve-set is how `/tmp/cell-home` becomes
+# reapable (the measured #3278 defect this guard exists for).
+CELL_HOME_LIB=""
+for _cand in "$SELF_DIR/lib/cell-home.sh" "${HOME:-}/.pi/agent/scripts/lib/cell-home.sh" \
+             "${AGENT_INFRA_PATH:-}/scripts/lib/cell-home.sh"; do
+    [ -n "$_cand" ] && [ -r "$_cand" ] && { CELL_HOME_LIB="$_cand"; break; }
+    done
+if [ -z "$CELL_HOME_LIB" ]; then
+    printf '%s: ⛔ FAIL-CLOSED — lib/cell-home.sh not found (looked beside this script, in $HOME/.pi/agent/scripts/lib, and in $AGENT_INFRA_PATH/scripts/lib) — without it this script cannot name the cell home its preserve-set must protect\n' "$SCRIPT_NAME" >&2
+    printf 'SKIP reason=cell-home-library-missing\n'
+    exit 3
+fi
+# shellcheck source=lib/cell-home.sh
+. "$CELL_HOME_LIB" || { printf 'SKIP reason=cell-home-library-unreadable path=%s\n' "$CELL_HOME_LIB"; exit 3; }
 STATE_DIR="${REAP_AW_STATE_DIR:-${HOME:-}/.pi/agent/state}"
 LOG="${REAP_AW_LOG:-$STATE_DIR/reap-abandoned-worktrees.log}"
 LOCK_DIR="$STATE_DIR/reap-abandoned-worktrees.lock"
@@ -216,7 +241,9 @@ ROOTS="${REAP_AW_ROOTS:-/tmp}"
 # the exact shape #3278 measured (review round 7). It is a DEFAULT, not a second source of truth: an
 # exported `CELL_HOME` still wins, and a deliberately wrong value protects a different directory — the
 # same trade an operator already makes by setting `CELL_HOME`, so it adds no new hazard class.
-CELL_HOME_DEFAULT="${CELL_HOME:-${REAP_AW_CELL_HOME_DEFAULT:-/tmp/cell-home}}"
+# ⛔ THE LEGACY VALUE COMES FROM THE RESOLVER (`CELL_HOME_LEGACY`), NOT FROM A SECOND LITERAL here — see
+# the derivation block above and `lib/cell-home.sh`.
+CELL_HOME_DEFAULT="${CELL_HOME:-${REAP_AW_CELL_HOME_DEFAULT:-$CELL_HOME_LEGACY}}"
 DRY_RUN="${REAP_AW_DRY_RUN:-1}"
 BUDGET="${REAP_AW_BUDGET_SECONDS:-300}"
 GIT_TIMEOUT="${REAP_AW_GIT_TIMEOUT:-60}"
@@ -297,6 +324,11 @@ if [ "$PRINT_CONFIG" = 1 ]; then
     # The cell home the guard will protect even with `CELL_HOME` unset (the unit's shape). Reported
     # like the other effective bounds: a pass record must not hide what the guard was comparing.
     printf 'cell_home_default=%s\n' "$CELL_HOME_DEFAULT"
+    # ⛔ AND THE DERIVED HOME ITSELF (`cell_home_resolve`), reported next to the legacy guard reference
+    # so the operator can see BOTH readings and whether they differ — the state #3453 exists to remove.
+    # It is also the call that makes the `(d)` sweep able to certify that this file ASKS the resolver
+    # rather than answering "what is this box's home?" on its own (review F3b).
+    printf 'cell_home=%s\n' "$(cell_home_resolve)"
     printf 'mode=%s\n' "$([ "$DRY_RUN" = 1 ] && printf dry-run || printf apply)"
     exit 0
 fi
