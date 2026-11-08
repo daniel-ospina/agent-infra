@@ -568,6 +568,18 @@ repo_set_parse() {
     # it does.
     local stripped="$f"
     while [ "${stripped%/}" != "$stripped" ] && [ -n "$stripped" ]; do stripped="${stripped%/}"; done
+    # ⛔ `/` ONLY — AND `/.` WAS TRIED AND REMOVED (round 48, measured, twice). `/srv/state` and `/srv/./state`
+    # really are one directory, so `<a dangling link>/.` was a hole while absence was decided by the ancestor
+    # walk alone. That hole is now closed by the ANCESTOR-LINK ARM near the end of this function (it runs
+    # immediately BEFORE the absence claim — note that it is BELOW this comment, not above it; "above" here is
+    # where the LEAF arm lives, which is about a link at the path itself and does not close the `/.` hole).
+    # With that arm in place a `/.`-stripping loop changes NOTHING: every dot-suffixed spelling of a broken
+    # path answers 5 through the arm — measured by reverting the loop, which red NO arm and changed NO
+    # verdict on six spellings. Speculative code carrying a comment that calls it load-bearing is worse than
+    # no code, so it is gone, and this note is what stops the next lane re-adding it without a fixture that
+    # needs it.
+    # ⛔ NOT `_rs_norm_path` EITHER: it ABSOLUTISES, turning a RELATIVE `dang.conf/` into `/dang.conf`, which
+    # REGRESSES that spelling from 5 back to 3 (measured).
     # ⛔ THE ERRNO DECIDES WHEN IT CAN (review round 11, P2). `-e` false is false for EVERY stat failure,
     # and absence is only one of them — EXAMPLES, not an enumeration, so the list cannot go stale the way
     # the kind list beside it did: ENOENT, EACCES/EPERM (a TCC denial under a MODE-traversable ancestor),
@@ -628,6 +640,26 @@ repo_set_parse() {
       _rs_say 2 "repo-set:   process is allowed to follow it."
       return 5
     fi
+    # ⛔ AN UNRESOLVABLE LINK **ABOVE** THE SET IS THE SAME BROKEN STATE AS ONE AT IT, SO THE WALK'S LINK
+    # ARM NOW RUNS *BEFORE* THE ABSENCE CLAIM (round 48 review, P1 — measured). For `$T/dirlink/repos.conf`
+    # where `dirlink` points at a directory that is not there, `stat` answers ENOENT — so the `absent`
+    # disjunct below fired and the WITH-interpreter reader answered 3 (`does not exist`) while the
+    # no-interpreter reader answered 5 through this arm: the better-equipped reader gave the more dangerous
+    # answer, and the wrapper took its DEGRADE branch for a box whose mount is simply not there (the stow /
+    # chezmoi / unmounted-volume shape round 7 exists for). The doctrine is that an existing link which
+    # leads nowhere is BROKEN, not absent — it does not stop being true one component up.
+    # ⛔ THIS IS THE WALK'S OWN ARM, MOVED — NOT COPIED (measured: a duplicate left this one unreachable, so
+    # its message could never print and `j16l` — which pins that message — reddened while the verdict stayed
+    # right). One arm, one message, one sensor, and it fires for BOTH readers because `anc` is the link on
+    # both routes.
+    if [ -n "$anc" ] && [ -L "$anc" ] && [ ! -e "$anc" ]; then
+      _rs_say 2 "repo-set: INVALID — $f is not visible from here, because its nearest existing component is a symbolic link that cannot be resolved from here"
+      _rs_say 2 "repo-set:   (nearest existing: $anc). That is the BROKEN state, not the absent one:"
+      _rs_say 2 "repo-set:   nothing below an unresolvable link can be shown to exist OR to be absent."
+      _rs_say 2 "repo-set:   Do not create the file; check what that link points at, and whether this"
+      _rs_say 2 "repo-set:   process is allowed to follow it."
+      return 5
+    fi
     if [ "$kind" = absent ] || { [ "$kind" = unknown ] && [ ! -e "$stripped" ] && [ -n "$anc" ] && [ -d "$anc" ] && [ -x "$anc" ]; }; then
       # ⛔ "NO HOME TO RESOLVE" IS BROKEN (5), NOT ABSENT (3) (round 32, P2). With `HOME` unset the path
       # above is EMPTY, and calling that "this machine has named no repo" degrades the wrapper on a box
@@ -679,14 +711,6 @@ repo_set_parse() {
     #   * a nearest existing DIRECTORY that is not traversable (mode 000, the TCC shape). It IS a directory,
     #     so the not-a-directory causes are false about it and it needs its own sentence.
     #   * nothing examinable at all (empty `anc`) — declared below, with no arm.
-    if [ -n "$anc" ] && [ -L "$anc" ] && [ ! -e "$anc" ]; then
-      _rs_say 2 "repo-set: INVALID — $f is not visible from here, because its nearest existing component is a symbolic link that cannot be resolved from here"
-      _rs_say 2 "repo-set:   (nearest existing: $anc). That is the BROKEN state, not the absent one:"
-      _rs_say 2 "repo-set:   nothing below an unresolvable link can be shown to exist OR to be absent."
-      _rs_say 2 "repo-set:   Do not create the file; check what that link points at, and whether this"
-      _rs_say 2 "repo-set:   process is allowed to follow it."
-      return 5
-    fi
     if [ -n "$anc" ] && { [ ! -d "$anc" ] || { [ -e "$stripped" ] && [ ! -d "$stripped" ]; }; }; then
       # ⛔ AND THE GUIDANCE IS THE MEASURED ONE, NOT A LIST OF CANDIDATES: the walk has just established
       # that the nearest existing component is a FILE, so offering "launchd has no Full Disk Access" or

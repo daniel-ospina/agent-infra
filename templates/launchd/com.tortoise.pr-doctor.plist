@@ -141,7 +141,7 @@
 
          GH: PATH is the INSTALLER's PATH — launchd_path() in install-launchd.sh keeps the
          ambient order and only DROPS entries (anything that does not resolve, and any
-         */shims dir, #1719/#427). Nothing is prepended, so a job installed from a shell
+         */shims dir OR ANYTHING INSIDE ONE, #1719/#427). Nothing is prepended, so a job installed from a shell
          whose PATH had no gh-wrapper dir has no gh wrapper either: check the installer's
          PATH, not this file, when a launchd pass appears to bypass a PATH-installed
          wrapper. HOME stays the real home so the doctor's state dir is the fleet's, not

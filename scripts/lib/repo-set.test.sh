@@ -513,7 +513,14 @@ ck "f4 NO set + OR set DEGRADES: the single-repo form RUNS (stub executed, no ar
 ck "f4b ...and it says which repo it is grading, from the box own evidence" \
    'REPO_SET_FILE="$nofile" OR=daniel-ospina/tortoise HOME="$T" bash "$W/pr-doctor-machine.sh" 2>&1 >/dev/null | grep -q "in OR=daniel-ospina/tortoise"'
 ck "f5 …and the degradation is LOGGED every pass, with the file to create" \
-   'run_wrapper_err "$nofile" | grep -q "DEGRADED — NO-REPO-SET: $nofile does not exist"'
+   'run_wrapper_err "$nofile" | grep -q "DEGRADED — NO-REPO-SET: $nofile reported no usable repo set"'
+# ⛔ THE OPERATOR-FACING LINE CLAIMED A PROOF THE READER MAY HAVE DISCLAIMED (round 48 review, P3 —
+# measured). The reader says, on the no-stat route, that absence is the ancestor walk's INFERENCE and not a
+# proof — and one line later the wrapper printed `<path> does not exist` flat. The degrade line is now
+# neutral about existence, and this arm reds it back if the claim returns (it is not a wording preference:
+# the sentence and the evidence above it must agree).
+ck "f5b …and the degrade line asserts no existence proof the reader may have disclaimed" \
+   'run_wrapper_err "$nofile" | grep -q "DEGRADED — NO-REPO-SET" && ! run_wrapper_err "$nofile" | grep -q "DEGRADED — NO-REPO-SET: $nofile does not exist"'
 ck "f6 …and it names the line format so the fix is copy-paste" \
    'run_wrapper_err "$nofile" | grep -q "slug=OWNER/NAME checkout=/abs/checkout"'
 
@@ -909,7 +916,16 @@ defn = re.compile(r'^\s*(?:function\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*(?:\(\s*\))?\
 # Name only, brace on a later line — `name()` / `function name` then `{`.
 head = re.compile(r'^\s*(?:function\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*(?:\(\s*\))?\s*$')
 
-lines = [l.rstrip('\n') for l in open(sys.argv[1], encoding='utf-8')]
+raw_lines = [l.rstrip('\n') for l in open(sys.argv[1], encoding='utf-8')]
+# ⛔ A BACKSLASH CONTINUATION HID A REAL DEFINITION (round 48 review, P3 — measured): `name() \` and
+# `{ … }` on the next line is a genuine definition (`declare -F` lists it), but `head` requires
+# end-of-line after the name, so that spelling was never reported. Join continuations before scanning.
+lines = []
+for _l in raw_lines:
+    if lines and lines[-1].endswith('\\'):
+        lines[-1] = lines[-1][:-1] + _l.lstrip()
+    else:
+        lines.append(_l)
 defs = []
 for i, raw in enumerate(lines):
     if raw.lstrip().startswith('#'):
@@ -977,10 +993,18 @@ local
 {
   :
 }
+# ⛔ AND A BACKSLASH CONTINUATION IS STILL A DEFINITION (round 48 review, P3 — measured): `continued_name() \`
+# then `{ :; }` is listed by `declare -F`, but the scanner's brace-on-the-next-line branch required
+# end-of-line after the name, so this spelling was invisible while the arm's own comment promised "any
+# declaration style". The scanner joins continuations now; this line keeps that from being deleted silently.
+continued_name() \
+{
+  :
+}
 FIXTURE
 _scan_fixture="$(python3 "$T/defs.py" "$T/defs-fixture.sh")"
 ck "f11f-0 …and every one of those spellings is really SEEN (brace on either line, any indent), while bare keywords followed by '{' are not counted" \
-   '[ "$_scan_fixture" = "name_same_line name_func_kw indented_same_line name_next_line name_func_next" ]'
+   '[ "$_scan_fixture" = "name_same_line name_func_kw indented_same_line name_next_line name_func_next continued_name" ]'
 # ⛔ THE DEGRADED PATH MUST NOT CLAIM TO GRADE WHEN IT CANNOT NAME A REPO (review round 2, P1). The
 # doctor's REPO-only arm raises when the checkout's `origin` proves nothing — the TCC shape on the
 # default macOS install — so `f4`'s stub (which echoes argv) would pass on a wrapper that dies in
@@ -1517,6 +1541,24 @@ printf 'not a dir\n' > "$T/trailplainfile"; ln -s "$T/trailplainfile" "$T/trailf
 _o_tf="$(_rs_bound 30 env REPO_SET_FILE="$T/trailfilelink/" /bin/bash "$READER" check 2>&1)"; _rc_tf=$?
 ck "j16n2 …a link that RESOLVES to a FILE, spelled with a slash, keeps the not-a-directory cause — never 'cannot be resolved'" \
    '[ "$_rc_tf" = 5 ] && grep -q "must be a DIRECTORY" <<<"$_o_tf" && ! grep -q "cannot be resolved" <<<"$_o_tf"'
+# ⛔ AN UNRESOLVABLE LINK **ABOVE** THE SET WAS CERTIFIED ABSENT, AND THE TWO READERS DISAGREED (round 48
+# review, P1 — measured). `$T/dirlink/repos.conf`, where `dirlink` points at a directory that is not there,
+# answers ENOENT, so the `absent` disjunct fired and the WITH-interpreter reader said 3 while the
+# no-interpreter reader said 5 — the better-equipped reader gave the more dangerous answer, and the wrapper
+# degraded over a mount that is simply not there. Own fixture, both readers, because the whole finding is
+# that the two disagreed.
+ln -s "$T/nowhere-dir/sub" "$T/dirlink"
+_o_dl="$(_rs_bound 30 env REPO_SET_FILE="$T/dirlink/repos.conf" /bin/bash "$READER" check 2>&1)"; _rc_dl=$?
+# ⛔ THE NEEDLE MUST BE THE LINE THE READER ACTUALLY PRINTS (measured, and this arm shipped red once because
+# it was not): the cause is emitted by the walk's own arm, moved above the absence claim — "its nearest
+# existing component is a symbolic link that cannot be resolved from here". A needle from the abandoned
+# duplicate's wording ("above it cannot be resolved") greps for a sentence nothing emits, which makes the arm
+# a permanent red that discriminates nothing.
+ck "j16t a set BELOW an unresolvable link is BROKEN (5) — never 'does not exist' at the degrade code 3" \
+   '[ "$_rc_dl" = 5 ] && grep -q "nearest existing component is a symbolic link that cannot be resolved" <<<"$_o_dl" && ! grep -q "does not exist" <<<"$_o_dl"'
+_o_dl2="$(_rs_bound 30 env REPO_SET_FILE="$T/dirlink/repos.conf" /bin/bash "$NI/lib/repo-set.sh" check 2>&1)"; _rc_dl2=$?
+ck "j16t2 …and the no-stat reader agrees — the same path must not get 3 from one reader and 5 from the other" \
+   '[ "$_rc_dl2" = 5 ] && ! grep -q "does not exist" <<<"$_o_dl2"'
 # ⛔ THE ABSENT VERDICT MUST NOT CLAIM A PROOF IT DOES NOT HAVE (round 48 review, P3 — measured). The
 # `unknown` disjunct is an INFERENCE from a traversable ancestor and has no length or permission test, so a
 # set path over `PATH_MAX` (or one only Full Disk Access can see) with no runnable interpreter is told
@@ -1541,8 +1583,11 @@ ck "j16s2 …while with a stat answer the ABSENT verdict IS stated as proof (bot
 # exists.
 # ⛔ AND THE ARM IS THE `unknown` PATH ONLY — ITS LABEL USED TO CLAIM THE GENERAL RULE (round 46 review, P2 —
 # measured): with the SHIPPED reader a symlink LOOP answers `other` → 5 through the errno arm (same verdict,
-# different arm), and a DANGLING link answers `absent` → 3, which is CORRECT because nothing can exist below
-# a link whose target does not. So "never (3)" is true of THIS reader and this arm, not of symlinks in
+# different arm), and a DANGLING link answers `absent` → 3 — which the ROUND-48 REVIEW FALSIFIED as a general
+# rule: 3 is right only for the LEAF spelling, and even then only on the `unknown` route (`j16l` owns that).
+# One component up it was a measurably WRONG claim — `$T/dirlink/repos.conf` answered 3 with an interpreter
+# and 5 without one, so the better-equipped reader gave the more dangerous answer — `j16t`/`j16t2` pin the
+# agreement. So "never (3)" is true of THIS reader and this arm, not of symlinks in
 # general: `$NI` has no usable interpreter, `_rs_stat_kind` cannot answer, and the walk decides. Measured
 # before the fix, on this reader: rc 3 with `does not exist`. No privileges needed, so no `chmod 000` guard.
 ln -s "$T/linkloop2" "$T/linkloop"; ln -s "$T/linkloop" "$T/linkloop2"

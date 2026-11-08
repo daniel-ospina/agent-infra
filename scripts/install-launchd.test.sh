@@ -608,6 +608,11 @@ assert_contains "$_PRD_TPL" "two things that WRITE it are" "pr-doctor template: 
 # Both halves are pinned: the sentence that was false, and the one that replaced it.
 assert_contains "$_PRD_TPL" "PATH is the INSTALLER's PATH" "pr-doctor template: says which PATH the job gets — the installer's, not a curated one"
 assert_contains "$_PRD_TPL" "Nothing is prepended" "pr-doctor template: says the renderer DROPS only — the order it keeps is the ambient one"
+# ⛔ THE DROP RULE IS NARROWER THAN "a */shims dir" (round 48 review, P3 — measured): `launchd_path()`
+# matches `*/shims | */shims/*`, so an entry INSIDE a shims dir is dropped too. The prose said only the dir,
+# and nothing asserted the clause at all — reverting it to the narrower sentence red NO check. This is the
+# pin: the "inside one" half is the load-bearing part.
+assert_contains "$_PRD_TPL" "OR ANYTHING INSIDE ONE" "pr-doctor template: the shims drop covers entries INSIDE a shims dir, as launchd_path() does"
 assert_not_contains "$_PRD_TPL" "gh-wrapper dir first" "pr-doctor template: never claims a gh wrapper is placed first (install-launchd.sh does not do that)"
 # ⛔ AND THE THREE READERS IT NAMES MUST ACTUALLY EXIST (round 46 review, P2 — measured). The arms above
 # pin the paragraph's WORDING only, so renaming or deleting `_fleet_pr_doctor_bound` kept them GREEN while
