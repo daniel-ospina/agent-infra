@@ -296,7 +296,13 @@ delete_branch_cas() {
             [ -n "$p" ] || continue
             if [ "$lk" = 1 ]; then
                 wt_locked="${wt_locked:-$p}"
-            elif [ "$pr" = 1 ] || path_absent "$p"; then
+            elif path_absent "$p"; then
+                # ⛔ THE EVIDENCE IS `path_absent`, NOT THE `prunable` FLAG (round-8 F1). `prunable`
+                # fires while the DIRECTORY IS PRESENT — removing just its `.git` file does it —
+                # and the stale arm then told the operator "that directory is gone" about a
+                # directory that is right there, prescribing a `worktree remove --force` that
+                # fails rc=128 in that state. Asking the path instead sends that case to the
+                # `wt_live` arm, which refuses with the accurate diagnosis.
                 wt_stale="${wt_stale:-$p}"
             else
                 wt_live="${wt_live:-$p}"
@@ -464,15 +470,15 @@ if [ -f "$RECORD_FILE" ]; then
             # Capture, then classify in the SHELL — never `… | grep -qF`, whose false
             # negative under `pipefail` would make a REGISTERED worktree look
             # unregistered on the destructive --apply path (#864).
-            WT_LIST="$(git worktree list --porcelain 2>/dev/null || true)"
+            WT_LIST="$(git worktree list --porcelain 2>/dev/null)" || REG_CLAIMS=unknown
             case "$WT_LIST" in
                 *"worktree $WT_CANON"*) IS_WT=true ;;
             esac
-            # ⛔ A SURVIVING REGISTRATION MAKES `absent` AMBIGUOUS (round-7 F2). `rm -rf` of a
-            # worktree and a raw `mv` of a live one both leave a registration claiming the branch,
-            # so this record is NOT safe to remove — `--apply` refuses it. The classifier has to
-            # say the same thing, or the default run (what an operator and `extensions/auto-sync.ts`
-            # read) advertises as safe exactly the record the destructive path will not touch.
+            # ⛔ A FAILED READ IS NOT "NOTHING CLAIMS IT" (round-8 F2, the G1 rule one layer up).
+            # `|| true` left REG_CLAIMS=false, so a record `--apply` refuses (because the list could
+            # not be read) was advertised by the DRY run as "ORPHANED (safe to remove)". The
+            # classifier must agree with the destruction path — that is round-3 F3's rule, applied
+            # to the read that can also fail.
             # Trailing newline pinned so `refs/heads/t` cannot match `refs/heads/t/sub`.
             case "$(printf '%s\n' "$WT_LIST")" in
                 *"branch refs/heads/$BRANCH"$'\n'*) REG_CLAIMS=true ;;
@@ -487,7 +493,7 @@ if [ -f "$RECORD_FILE" ]; then
         case "$WT_STATE" in
             # ⛔ ABSENT IS ONLY "SAFE TO REMOVE" WHEN NOTHING STILL CLAIMS THE BRANCH (round-7 F2).
             # A surviving registration means stale-or-moved, which `--apply` refuses.
-            absent) [ "$REG_CLAIMS" = true ] && DIRTY_B=1 || DIRTY_B=0 ;;
+            absent) case "$REG_CLAIMS" in true|unknown) DIRTY_B=1 ;; *) DIRTY_B=0 ;; esac ;;
             # ⛔ AN EXISTING DIRECTORY GIT DOES NOT VOUCH FOR IS NOT "safe to remove" (round-3 F3).
             # `--apply` refuses it (the `is_wt` arm), but the DEFAULT run — the one an operator and
             # `extensions/auto-sync.ts` actually read — printed it as ORPHANED and said nothing to
@@ -503,7 +509,11 @@ if [ -f "$RECORD_FILE" ]; then
                 clean)
                     DIRTY_OUT="${DIRTY_OUT}  ⚠️  ORPHANED BUT DIRTY: branch=$BRANCH dir=$DIR — clean, but git does not vouch for it as a worktree of this repo, so its contents cannot be reaped safely\n" ;;
                 absent)
-                    DIRTY_OUT="${DIRTY_OUT}  ⚠️  ORPHANED BUT DIRTY: branch=$BRANCH dir=$DIR — state ABSENT, but a worktree registration still claims this branch: either a STALE registration or a worktree that was MOVED and is live. --apply refuses it — look for the tree before clearing anything\n" ;;
+                    if [ "$REG_CLAIMS" = unknown ]; then
+                        DIRTY_OUT="${DIRTY_OUT}  ⚠️  ORPHANED BUT DIRTY: branch=$BRANCH dir=$DIR — state ABSENT, but the worktree list could not be read, so whether a registration still claims this branch cannot be established. --apply refuses it\n"
+                    else
+                        DIRTY_OUT="${DIRTY_OUT}  ⚠️  ORPHANED BUT DIRTY: branch=$BRANCH dir=$DIR — state ABSENT, but a worktree registration still claims this branch: either a STALE registration or a worktree that was MOVED and is live. --apply refuses it — look for the tree before clearing anything\n"
+                    fi ;;
                 *)
                     DIRTY_OUT="${DIRTY_OUT}  ⚠️  ORPHANED BUT DIRTY: branch=$BRANCH dir=$DIR (uncommitted changes — review manually)\n" ;;
             esac

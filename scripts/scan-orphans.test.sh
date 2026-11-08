@@ -542,6 +542,48 @@ git worktree remove --force --force "$FIX/wt-dup-a" >/dev/null 2>&1 || true
 git worktree remove --force --force "$FIX/wt-dup-b" >/dev/null 2>&1 || true
 git branch -D fix/dup-1 >/dev/null 2>&1 || true
 
+# ── 2aa. round-8 F1: `prunable` can fire while the DIRECTORY IS PRESENT (remove only the worktree's
+#     `.git` file and the registration breaks, the tree and its files stay). The evidence must be
+#     `path_absent`, not the flag: the stale arm would otherwise announce "that directory is gone"
+#     about a directory that is right there, and prescribe a `worktree remove --force` that fails
+#     rc=128 in exactly that state.
+git worktree add -q "$FIX/wt-wip" -b fix/wip-1
+echo precious > "$FIX/wt-wip/wip.txt"
+$RW add --branch fix/wip-1 --worktree "$FIX/gone-wip" --dispatch d-wip --ts 2026-08-01T00:00:00Z >/dev/null
+rm -f "$FIX/wt-wip/.git"
+assert_eq "$(git worktree list --porcelain | grep -c 'prunable')" "1" "fixture: a PRESENT dir carries a prunable registration"
+assert_eq "$(cat "$FIX/wt-wip/wip.txt")" "precious" "fixture: the tree still holds its work"
+OUT="$($SCAN --apply --force-dirty 2>&1 || true)"
+git show-ref --verify --quiet refs/heads/fix/wip-1 && ok "a PRESENT tree behind a broken registration keeps its ref" || bad "the ref was deleted under a present tree"
+assert_contains "$OUT" "CHECKED OUT in a live worktree" "a present tree is diagnosed as PRESENT"
+assert_not_contains "$OUT" "while that directory is gone" "the diagnosis never calls a present directory gone"
+assert_eq "$(cat "$FIX/wt-wip/wip.txt")" "precious" "the tree's work is untouched"
+assert_eq "$(wc -l < "$WORKTREES_RECORD" | tr -d ' ')" "1" "the record is kept"
+# restore the linkage so the fixture can be removed cleanly, then deregister path-scoped
+printf 'gitdir: %s\n' "$REPO/.git/worktrees/wt-wip" > "$FIX/wt-wip/.git"
+git worktree remove --force --force "$FIX/wt-wip" >/dev/null 2>&1 || true
+git branch -D fix/wip-1 >/dev/null 2>&1 || true
+
+# ── 2ab. round-8 F2: a FAILED `git worktree list` read must not be reported as "nothing claims this
+#     branch". `--apply` already refuses that state (the CAS re-reads and returns 3); the DRY run —
+#     what an operator and `extensions/auto-sync.ts` read — advertised it as safe to remove.
+cat > "$FIX/shim/git" <<'EOS'
+#!/usr/bin/env bash
+case " $* " in
+  *" worktree list "*) exit 1 ;;
+esac
+exec "$GIT_WRAP_REAL" "$@"
+EOS
+chmod +x "$FIX/shim/git"
+git worktree add -q "$FIX/wt-unread" -b fix/unread-1
+$RW add --branch fix/unread-1 --worktree "$FIX/wt-unread" --dispatch d-unread --ts 2026-08-01T00:00:00Z >/dev/null
+rm -rf "$FIX/wt-unread"
+OUT="$(PATH="$FIX/shim:$PATH" GIT_WRAP_REAL="$REAL_GIT" $SCAN 2>&1 || true)"   # DRY RUN
+assert_not_contains "$OUT" "ORPHANED (safe to remove)" "an UNREADABLE worktree list is not advertised as safe to remove"
+assert_contains "$OUT" "worktree list could not be read" "the DRY run names the failed read as the reason"
+git worktree remove --force "$FIX/wt-unread" >/dev/null 2>&1 || true
+git branch -D fix/unread-1 >/dev/null 2>&1 || true
+
 # ── Summary ───────────────────────────────────────────────────────────────
 echo ""
 echo "=== scan-orphans.test.sh: $PASS passed, $FAIL failed ==="
