@@ -108,7 +108,17 @@ _lrg_worktree() {
 # lane_report_gate <repo-path> <branch> <head> — the decision table above.
 lane_report_gate() {
   local repo="${1:-}" branch="${2:-}" head="${3:-}" wt="" tool="" py="" out="" rc=0
-  local ok="" stale="" rules="" rec_head=""
+  local ok="" stale="" rules="" rec_head="" live_head=""
+
+  # ⛔ `head` IS THE WHOLE POINT OF THE GATE, SO AN EMPTY ONE CANNOT PASS ANY ARM (fresh review, P1).
+  # The first version took it as documentation: `head=` appeared in every message and in NO comparison,
+  # so the gate answered "is there a self-consistent report anywhere in this repo" rather than "does
+  # the report describe the tree being merged". Checked BEFORE the worktree arm so that a caller with
+  # no head cannot fall into an abstention that reads as tolerable.
+  if [ -z "$head" ]; then
+    _lrg_emit 7 UNMEASURABLE "branch=$branch reason=no-head-supplied-cannot-bind-the-report-to-a-commit"
+    return 7
+  fi
 
   wt="$(_lrg_worktree "$repo" "$branch")" || wt=""
   if [ -z "$wt" ]; then
@@ -186,13 +196,14 @@ try:
         rec = st.get("head_at_write") or ""
 except Exception:
     rec = ""
-print("%s|%s|%s|%s" % (
+print("%s|%s|%s|%s|%s" % (
     "1" if d.get("ok") is True else "0",
     "1" if d.get("head_moved_since_write") is True else "0",
     ",".join(str(r) for r in rules)[:400],
     rec,
+    d.get("head") or "",
 ))'
-  if ! IFS='|' read -r ok stale rules rec_head <<< "$("$py" -c "$_LRG_JSON_PY" "$out" "$wt/.worktree-report/state.json" 2>/dev/null)"; then
+  if ! IFS='|' read -r ok stale rules rec_head live_head <<< "$("$py" -c "$_LRG_JSON_PY" "$out" "$wt/.worktree-report/state.json" 2>/dev/null)"; then
     _lrg_emit 7 UNMEASURABLE "branch=$branch worktree=$wt tool=$tool reason=consumer-json-unusable check_rc=$rc head=$head"
     return 7
   fi
@@ -214,8 +225,25 @@ print("%s|%s|%s|%s" % (
     _lrg_emit 4 STALE "branch=$branch worktree=$wt report=$wt/WORKTREE-REPORT.md reason=head-moved-since-write report_head=${rec_head:-unknown} merging_head=$head"
     return 4
   fi
+  # ⛔ AND THE DIRECTION `head_moved_since_write` CANNOT SEE (fresh review, P1 — this is the finding
+  # that made the gate real). The writer compares the report against ITS OWN worktree. If the BRANCH
+  # advanced from somewhere else — a `fix-<PR>` or `adopt-fix.sh` push, or another box — the lane
+  # worktree stays at the older commit, `head_moved_since_write` stays FALSE, and the gate would PASS a
+  # report describing a tree one commit behind the head being merged: exactly the false green this file
+  # exists to refuse (measured twice on 2026-11-07). So the head is BOUND, in both directions:
+  #   * `rec_head` (the head the evidence was written at) must BE the head being merged;
+  #   * `live_head` (where the worktree actually is) must be too, or the evidence describes a tree that
+  #     is not the one on the branch.
+  if [ -n "$rec_head" ] && [ "$rec_head" != "$head" ]; then
+    _lrg_emit 4 STALE "branch=$branch worktree=$wt report=$wt/WORKTREE-REPORT.md reason=report-bound-to-another-head report_head=$rec_head merging_head=$head"
+    return 4
+  fi
+  if [ -n "$live_head" ] && [ "$live_head" != "$head" ]; then
+    _lrg_emit 4 STALE "branch=$branch worktree=$wt report=$wt/WORKTREE-REPORT.md reason=worktree-is-not-at-the-merging-head worktree_head=$live_head merging_head=$head"
+    return 4
+  fi
 
-  _lrg_emit 0 PASS "branch=$branch worktree=$wt report=$wt/WORKTREE-REPORT.md head=$head"
+  _lrg_emit 0 PASS "branch=$branch worktree=$wt report=$wt/WORKTREE-REPORT.md head=$head report_head=${rec_head:-$head}"
   return 0
 }
 
@@ -232,7 +260,7 @@ lane_report_remedy() {
          'python3 tools/worktree_report.py init --issue <N>, then run every suite through it (run --cmd <cmd>), then write.' ;;
     2) printf '  The evidence in the report does not hold up (a recorded log is missing, its hash does not\n  match, or a promised section is absent). Re-run the affected suite through the tool so the record\n  matches its log.\n' ;;
     3) printf '  The report RECORDS A FAILING SUITE. A green report is a precondition of merge: fix the failure and\n  re-run that suite through the tool (a lane whose own evidence says red may not merge).\n' ;;
-    4) printf '  The report was written at a DIFFERENT HEAD than the one being merged, so it certifies a tree nobody\n  is shipping. Re-run the suites AT THIS HEAD through the tool (do NOT just re-render):\n     python3 tools/worktree_report.py run --cmd <the exact command>   # for each suite, at this head\n' ;;
+    4) printf '  The report does not describe the tree being merged (it was written at another head, or the\n  lane worktree is not at the head on the branch — a push from another worktree/box moves the branch\n  and leaves your worktree behind). Re-run the suites AT THE HEAD ON THE BRANCH through the tool\n  (do NOT just re-render):\n     git -C <your worktree> status ; git log --oneline -1   # confirm you are at the PR head\n     python3 tools/worktree_report.py run --cmd <the exact command>   # for each suite\n' ;;
     7) printf '  The report exists but could not be VERIFIED (no interpreter, or the consumer failed / printed no\n  parseable JSON). An unreadable verification is not a pass: repair the consumer, then re-run.\n' ;;
     *) : ;;
   esac
