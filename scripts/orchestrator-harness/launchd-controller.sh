@@ -148,7 +148,15 @@ _shq() { local s="${1:-}" q="'"; printf "'%s'" "${s//$q/$q\\$q$q}"; }
 # THE PLIST'S KEY SET, VERBATIM. Keep it equal to `EnvironmentVariables` in launchd.plist.template —
 # `launchd-controller.test.sh` asserts that equality in both directions, so a key added to the
 # template cannot silently fail to reach the controller.
-CONTROLLER_ENV="PATH HOME OR REPO O HARNESS_PIN HARNESS_PIN_FILE HARNESS_PIN_DIR HARNESS_REPO HARNESS_MATERIALISER SCOPE MAX_LOAD MAX_LANES MAX_REVIEW MERGE_PRIORITY_AT MERGE_PRIORITY_MAX_AGE_MIN FUNNEL_MAX_AGE_MIN MAX_FIX MAX_FIX_TRIES MAX_RED_FIX MAX_RED_FIX_TRIES MIN_SWAP_FREE MIN_MEM_FREE_MB BATCH PRODUCT_FLOOR CYC UV_CACHE_DIR UV_LINK_MODE ORCH_ENTRY"
+CONTROLLER_ENV="PATH HOME OR REPO O HARNESS_PIN HARNESS_PIN_FILE HARNESS_PIN_DIR HARNESS_REPO HARNESS_MATERIALISER SCOPE MAX_LOAD MAX_LANES MAX_REVIEW MERGE_PRIORITY_AT MERGE_PRIORITY_MAX_AGE_MIN FUNNEL_MAX_AGE_MIN MAX_FIX MAX_FIX_TRIES MAX_RED_FIX MAX_RED_FIX_TRIES MIN_SWAP_FREE MIN_MEM_FREE_MB MEM_MIN_AVAIL_MB MEM_LANE_RESERVE_MB MEM_SPAWN_RESERVE_LANES BATCH PRODUCT_FLOOR CYC UV_CACHE_DIR UV_LINK_MODE ORCH_ENTRY"
+# ⛔ THE THREE MEM_* KEYS ARE FORWARDED, AND THEY WERE NOT (#2387). `launchd.plist.template` renders
+# `MEM_MIN_AVAIL_MB`, `MEM_LANE_RESERVE_MB` and `MEM_SPAWN_RESERVE_LANES` — the spawn gate's memory floor
+# and the two factors it is derived from — and this list did not carry them, so the pane never received
+# what the plist rendered and the floor fell back to whatever the loop's own default happened to be. That
+# is the "a rendered-but-dropped limit reverts to the loop's default without a word" failure this
+# variable's own section E exists to catch: the artifact states a limit, the process below it does not
+# have it, and neither says so. `install.sh:148` DERIVES MEM_MIN_AVAIL_MB from the other two when it is
+# unset, so dropping the pair while keeping the derived value would have been the same defect inverted.
 
 # ⛔ `ORCH_ENTRY` IS HERE BECAUSE THE TEMPLATE RENDERS IT — AND FOR THE SHADOWING HALF, NOT BECAUSE
 # THE PANE RE-RESOLVES (`#3243` review cycle-2 F3; the rationale was corrected after a review of #3333

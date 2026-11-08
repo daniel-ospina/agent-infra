@@ -88,6 +88,15 @@ pass restricted to that class can only publish refusals — the arm that actuall
 the staleness one. `CONFLICT_REBASE_INCLUDE_BEHIND=0` restricts a pass to the CONFLICTING
 class; `CONFLICT_REBASE_DRY_RUN=1` makes every pass a census with no side effects.
 
+**`pause` writes the directory the INSTALLED unit exports, not the one in your shell.** The systemd
+unit and the launchd plist both export `CONFLICT_REBASE_STATE`, so the timer's tick reads that path;
+`status`, `pause` and `resume` resolve it the same way (installed unit, then plist, then the ambient
+value, then the default) and print which directory they used and why. If your shell's
+`CONFLICT_REBASE_STATE` DISAGREES with the installed one, they **refuse** (rc 2) and name both paths
+instead of writing a brake the pass would never see — the failure that made `pause` print `paused`
+while the bot kept rebasing and pushing. On a box with nothing installed, the ambient value (or the
+default) is used, and the message says so.
+
 **Expect a ramp on the first day.** Every refusal publishes one label + one comment, so a
 queue of ~40 labelled PRs costs ~40 of each, at `--max 3` per 30-minute pass. That is the
 point (it converts "unknown ownership" into "needs a human"), but it is a visible event:
