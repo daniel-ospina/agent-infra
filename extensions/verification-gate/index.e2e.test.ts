@@ -5833,11 +5833,24 @@ async function main() {
     git(wtC, "add src/c1265.ts");
     mkdirSync(join(wtA, "src"), { recursive: true });
     writeFileSync(join(wtA, "src", "a1265.ts"), "a\n");
+    // #1265 review cycle 3: a path that A and B BOTH hold, BYTE-IDENTICAL. Without it the
+    // "no fail-open" row below was VACUOUS: A's entry was `src/a1265.ts` and B's commit
+    // `src/b1265.ts`, so B's lookup key could never intersect anything A contributes and B
+    // blocked under EVERY adoption mutant. Measured: re-keying the inspected sibling's
+    // entries onto the own root — R1's exact failure mode — left the whole suite green.
+    // With a shared, identical-bytes path the re-keyed digest MATCHES B's copy, so an
+    // adopting gate ALLOWS the op and `block1` reddens.
+    writeFileSync(join(wtA, "src", "shared1265.ts"), "s\n");
     git(wtA, "add src/a1265.ts");
+    git(wtA, "add src/shared1265.ts");
     git(wtA, "commit -m work-a");
     mkdirSync(join(wtB, "src"), { recursive: true });
+    // B's FIRST op touches ONLY the shared path, so its whole scope is satisfiable by an
+    // adopted A entry — that is what makes the fail-open row discriminating. `b1265.ts` is
+    // written here but staged AFTER that op, so it cannot mask the result.
+    writeFileSync(join(wtB, "src", "shared1265.ts"), "s\n");
     writeFileSync(join(wtB, "src", "b1265.ts"), "b\n");
-    git(wtB, "add src/b1265.ts");
+    git(wtB, "add src/shared1265.ts");
 
     // The bridge holds REAL, hash-matching entries for worktree A ONLY.
     const realA = realpathSync(wtA);
@@ -5847,7 +5860,10 @@ async function main() {
     mkdirSync(bridgeDir, { recursive: true });
     writeFileSync(join(bridgeDir, "latest.json"), JSON.stringify({
       status: "PASS",
-      verified_files: [{ path: `${realA}::src/a1265.ts`, hash: sha("a\n") }],
+      verified_files: [
+        { path: `${realA}::src/a1265.ts`, hash: sha("a\n") },
+        { path: `${realA}::src/shared1265.ts`, hash: sha("s\n") },
+      ],
       timestamp: new Date().toISOString(),
     }));
 
@@ -5901,8 +5917,10 @@ async function main() {
     ok(captured.some((l) => l.includes("INSPECTION ONLY") && l.includes(realA) && l.includes(realB)),
       `1265a: the inspection merge must be announced as INSPECTION ONLY and name both roots, got: ${captured.join(" | ")}`);
     // R3: the REWORDED remedy is the change — #1265's one worktree killed three consecutive
-    // children, and the FIRST followed "cd into it" into a tree it did not own. Pin it — the block
-    // reason cannot carry it here, because the sibling holds a DIFFERENT path.
+    // children, and the FIRST followed "cd into it" into a tree it did not own. Pin it. The
+    // block reason is NOT the evidence here even though it can now carry a root (block1 commits
+    // `src/shared1265.ts`, which A also holds, so `rootsHoldingPath` names a recorded root);
+    // R3 is about the REMEDY wording, which only the diagnosis line carries.
     ok(captured.some((l) => l.includes("re-dispatch verification for THIS root") && l.includes(realB)),
       `1265a: the mismatch remedy must be the followable one and name THIS root, got: ${captured.join(" | ")}`);
     ok(captured.some((l) => l.includes("refused by design")),
@@ -5938,12 +5956,16 @@ async function main() {
       "1265a: the inspection-only merge of A's entries must leave ONE durable record (AC b)");
     equal(String(forB("gate_recovery_foreign_root")[0].inspected_root), realA,
       "1265a: the record must name the sibling root it inspected");
-    equal(forB("gate_recovery_foreign_root")[0].inspected, 1,
-      "1265a: the record must carry the inspected count (A's single entry)");
+    equal(forB("gate_recovery_foreign_root")[0].inspected, 2,
+      "1265a: the record must carry the inspected count (A's two entries)");
 
     // AC (a): the op still FAILS CLOSED, and the diagnosis names THIS root.
+    // ⛔ THIS is the row that makes ADOPTION observable, and it is discriminating ONLY
+    // because `block1`'s scope is the path A and B share with identical bytes. Under the
+    // re-keying mutant `realB::src/shared1265.ts` exists with a digest of A's "s\n", which
+    // matches B's identical copy — so an adopting gate ALLOWS the op and this row reddens.
     ok(block1 && block1.block === true, "1265a: B's commit must still be BLOCKED — A's entries are inert here (no fail-open)");
-    ok(String(block1.reason).includes("src/b1265.ts"), "1265a: the block names B's own changed file");
+    ok(String(block1.reason).includes("src/shared1265.ts"), "1265a: the block names B's own changed file");
     ok(!/src\/a1265\.ts/.test(String(block1.reason)), "1265a: the block must not import A's verified file into B's scope");
 
     // AC (b): exactly ONE durable root-mismatch record for this (root, siblings)
@@ -5959,11 +5981,20 @@ async function main() {
     equal(audit.filter((l) => l.event === "gate_root_mismatch" && String(l.root ?? "") === realC).length, 1,
       "1265a: the OTHER root records its mismatch once too — the dedupe is per (root, siblings), not a single global slot that the alternation resets");
 
+    // B's SECOND op adds its OWN private file, `src/b1265.ts`, which no tree has verified.
+    // Blocked too, and the reason still names only files in B's own scope — A holds
+    // `a1265.ts` and `shared1265.ts`, and B is not committing either under this name.
+    git(wtB, "add src/b1265.ts");
+    const blockB2 = await fire("tool_call", opB);
+    ok(blockB2 && blockB2.block === true, "1265a: B's second op (its own private file) is blocked too");
+    ok(String(blockB2.reason).includes("src/b1265.ts"), "1265a: the block names B's own changed file");
+    ok(!/src\/a1265\.ts/.test(String(blockB2.reason)), "1265a: the block must not import A's verified file into B's scope");
+
     // AC (c): a worktree that had no entries becomes usable after ITS OWN PASS —
     // and only after it. No temp-path/sibling root is ever substituted.
     await fire("tool_result", {
       toolName: "task",
-      input: { prompt: `[VGATE] verify files: src/b1265.ts. Classification: backend. Project root: ${realB}` },
+      input: { prompt: `[VGATE] verify files: src/shared1265.ts src/b1265.ts. Classification: backend. Project root: ${realB}` },
       content: [{ type: "text", text: "## Verification Report\nAll good.\nPASS\n" }],
     });
     const retry = await fire("tool_call", opB);

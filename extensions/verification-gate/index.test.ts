@@ -3813,8 +3813,10 @@ test("#3255 policy: the git-op root is authoritative — adoption must never gat
   // (`root === realA` → 1): it counts 0 while the field is absent, so the pre-fix
   // shape reddens it. It is the ONLY durable detector for a wrong-root record — a
   // `root: normRoot → process.cwd()` mutant reddens it and no other durable/behavioural
-  // row (the source pin at :3822 reddens too, but that pins the literal, not the
-  // behaviour: measured `316 passed, 1 failed`, the one red being that pin's).
+  // row (the source pin "the durable gate_recovery record must name the root it recovered for"
+  // reddens too, but that pins the literal, not the behaviour: measured `316 passed, 1 failed`,
+  // the one red being that pin's). Pins are cited by ASSERTION MESSAGE, not line: a line number
+  // in this file has already drifted once under an edit to the comment above it.
   // ⛔ The own-root row this comment used to credit that coverage to was DELETED in
   // review cycle 5: it could not fail in either direction (pre-fix there is no `root`
   // field, and the bridge's only compound key is A's). Cycle 7 found this comment

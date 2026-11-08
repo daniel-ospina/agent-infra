@@ -200,8 +200,9 @@ reader contract. Filing a roster pin (emit-site `event:` literals ⊆ `GateEvent
 **Risk surface** — what this change can break, each with the check that would catch it:
 
 - **R1** The reordered recovery installs entries that let an op through, i.e. the change becomes the
-  fail-open it is meant to report → caught by e2e 1265a: after worktree A's entries are inspected,
-  worktree B's commit must still be `block === true`; only B's own PASS may allow it.
+  fail-open it is meant to report → caught by e2e 1265a's `block1` row: B commits a path it holds in
+  common with A, **byte-identical**, so an adopted (re-keyed) A entry would MATCH and allow the op;
+  `block1.block === true` therefore reddens under that mutant. Only B's own PASS may allow it.
 - **R2** The new durable record floods the shared log (one line per git op) → caught by e2e 1265a:
   two identical blocked ops produce **exactly one** `gate_root_mismatch` line for that root.
 - **R3** The reworded diagnosis stops naming the correct root, or reintroduces the un-followable
@@ -209,9 +210,11 @@ reader contract. Filing a roster pin (emit-site `event:` literals ⊆ `GateEvent
   not own (the three deaths are attributed in #1265 to per-worktree determinism, not to three separate
   followers) → caught by e2e 1265a's captured console: the
   mismatch remedy must say "re-dispatch verification for THIS root" naming worktree B's **realpath**,
-  and must state that adoption is refused by design. (The *block reason* does not carry a root in this
-  scenario — the sibling holds a DIFFERENT path, so `rootsHoldingPath` returns nothing to name; the
-  remedy line is the right evidence for R3.) Additionally pinned at source level in `index.test.ts`:
+  and must state that adoption is refused by design. (The *block reason* is not the right evidence
+  for R3 even though it can now carry a root: `block1` commits `src/shared1265.ts`, which A also
+  holds, so `rootsHoldingPath` DOES name a recorded root there — that line answers "why is this
+  unverified here", while R3 is about the *remedy* wording. The remedy line is the right evidence for
+  R3.) Additionally pinned at source level in `index.test.ts`:
   the rendered form `(cd into it)` must be absent from every message string — the historical mention
   in the docblock wraps across lines, so it does not match that pin.
 - **R4** The `lastRecoveryMtime`/`lastRecoveredRoot` fast path is disturbed so a
@@ -220,7 +223,8 @@ reader contract. Filing a roster pin (emit-site `event:` literals ⊆ `GateEvent
 - **R5** A consumer of `gate-events.jsonl` mis-reads the new names, or the changed `gate_recovery`
   payload (it now carries `root`) → **no production consumer PARSES this file**, so the only
   evidence obtainable is the inventory itself: `gateEventsFile()` has one production caller
-  (`appendJsonl`, `extensions/shared/audit-log.ts:98`); `scripts/vgate.sh` `tail`s it for a human in `status()` and
+  (`appendJsonl` in `extensions/shared/audit-log.ts` — cited by SYMBOL, not line: the line number
+  drifted twice under edits to that same file); `scripts/vgate.sh` `tail`s it for a human in `status()` and
   selects nothing; the other references are in-repo TEST helpers that read the file
   (`extensions/shared/audit-log.test.ts` — path + row schema, no `event` filter;
   `extensions/verification-gate/index.e2e.test.ts`'s `readAuditLines()`;
