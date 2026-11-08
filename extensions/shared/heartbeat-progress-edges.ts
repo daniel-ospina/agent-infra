@@ -875,10 +875,32 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     guardedBy:
       "scripts/orchestrator-harness/test-gates.sh — \"a snapshot OLDER than the age bound is NOT ownership (a claim published since would be invisible)\" drives the shipped reader with a snapshot 100000 s old and asserts UNOWNED; the value itself is asserted by THIS registry's forward check, not by the suite, because the suite ages the FILE rather than setting the bound",
     overrides: [
-      "''|*[!0-9]*|0*) CLAIM_SNAPSHOT_MAX_AGE=900 ;;",
+      "''|*[!0123456789]*|0*) CLAIM_SNAPSHOT_MAX_AGE=900 ;;",
       "[ \"${#CLAIM_SNAPSHOT_MAX_AGE}\" -le 9 ] || CLAIM_SNAPSHOT_MAX_AGE=900 ;;",
     ],
     note: "#2466 — how stale a claim snapshot may be and still be believed (900 s ≈ 3.75 cycles at the shipped CYC=240). THREE shapes reach `claim-unreadable` and the bound governs only the third: no file at all, a header whose own fetch field says `failed` (refused at ANY age, because that test is the `if` and the age test only the `elif` — the bound must never be read as re-admitting a failed read), and an `ok` header older than this bound. The second declaration is the is_limit-style coercion that drops a zero/overflowing value back to 900, so an overflowing bound cannot make `[ -gt ]` error and turn the age test FALSE — an errored test is FALSE, which here would fail OPEN by believing every snapshot forever; it is recorded so a third assignment cannot shadow the default unnoticed.",
+  },
+  {
+    name: "CLAIM_UNREADABLE_LEASE_MAX_AGE",
+    owners: ["scripts/orchestrator-harness/claims.sh"],
+    value: '"${CLAIM_UNREADABLE_LEASE_MAX_AGE:-18000}"',
+    axis: "reap",
+    guardedBy: NONE,
+    overrides: [
+      "''|*[!0123456789]*|0*) CLAIM_UNREADABLE_LEASE_MAX_AGE=18000 ;;",
+      "[ \"${#CLAIM_UNREADABLE_LEASE_MAX_AGE}\" -le 9 ] || CLAIM_UNREADABLE_LEASE_MAX_AGE=18000 ;;",
+      '&& CLAIM_UNREADABLE_LEASE_MAX_AGE="$_claim_floor_term"',
+      '&& CLAIM_UNREADABLE_LEASE_MAX_AGE="$CLAIM_UNREADABLE_LEASE_MAX_AGE_CEIL"',
+    ],
+    note: "#3203 — how old an UNPARSEABLE-lease claim may be before `claim_prune` may reap it. Registered on introduction because the reverse scan refused it: an unclassified stall-family bound is exactly how an unbounded bound reappears. TWO clamps and a floor, each a separate declaration and each recorded: the first drops a zero/overflowing value back to 18000 (an errored `[ -gt ]` test is FALSE, which would fail OPEN by trusting an unmeasurable age forever), the second caps at 9 digits, and the third RAISES the ceiling to the longest term this file can MINT (`CLAIM_ISSUE_TTL`/`CLAIM_BRANCH_TTL`/`CLAIM_TTL_MAX`, hard-capped at 30 days) — a ceiling below that can always fire INSIDE a live claim, i.e. it is a scheduled steal rather than a reaper.",
+  },
+  {
+    name: "CRP_MIN_AGE",
+    owners: ["scripts/orchestrator-harness/claim-reaper-pass.sh"],
+    value: '"${CLAIM_REAPER_MIN_AGE:-}"',
+    axis: "reap",
+    guardedBy: NONE,
+    note: "#2094 — the DELETION tool's own age floor, forwarded to `claim-reaper.py --min-age`. Registered because the reverse scan refused it as an unclassified reap-family declaration. The default is EMPTY on purpose: an unset floor means the reaper uses the .py's own bound rather than this wrapper inventing one, so the registered value is the forwarding expression, not a number.",
   },
   {
     name: "LANE_ARM_SNAPSHOT_MAX_AGE",
