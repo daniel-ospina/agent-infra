@@ -63,6 +63,11 @@ function skipped(name, why) {
 const SWEEP_MARK = "HUB WORKING TREE CHANGED UNDER YOU";
 const HATCH_VARS = ["AGENT_ALLOW_MAIN_EDITS", "ELDATO_ALLOW_MAIN_EDITS"];
 
+// Blocking sleep with no child process: the observation's burst gate is
+// wall-clock, so the one control that must provably reach `git status` needs a
+// real pause to be a pin rather than a no-op.
+const pause = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+
 async function main() {
   if (typeof stripTypeScriptTypes !== "function" ||
       (typeof register !== "function" && typeof registerHooks !== "function")) {
@@ -137,12 +142,6 @@ async function main() {
     gg("add -A && git commit -qm init", hub);
     gg(`worktree add -q -b feat "${wt}"`, hub);
 
-    // The incident's artifact shapes: four tracked edits (one tracked file
-    // here), one NEW untracked skill DIRECTORY, one NEW doc.
-    write(join(hub, "doc.md"), "v2 — a session's tracked edit\n");
-    inHub("skills/new-skill/SKILL.md", "---\nname: new-skill\n---\n");
-    inHub("docs/plans/plan.md", "# plan\n");
-
     mkdirSync(join(home, ".pi", "agent"), { recursive: true });
     for (const v of HATCH_VARS) delete process.env[v];
     process.env.HOME = home;
@@ -150,6 +149,28 @@ async function main() {
     process.env.AGENT_INFRA_PATH = hub;
     process.env.AGENT_LOCKS_DIR = join(tmp, "locks");
     process.env.SKILL_ENFORCER_DISABLED = "1";
+
+    // ── A0 (the E3 control, FIRST, so it is the property it names) ─────────
+    // A session that never observed dirt must never be accused of losing it.
+    // This has to run BEFORE the fixture dirties the hub (a fresh review of
+    // #718 caught the earlier placement: by then three untracked paths had been
+    // observed, `git clean` emitted a REAL sweep banner that the next `drain()`
+    // discarded, and the assertion then rode on a call the 1.5s burst gate
+    // skipped — a control that could not fail for the property it named). The
+    // pause defeats the burst gate so the second call provably reaches
+    // `git status` and the `previous.size === 0` early return.
+    process.chdir(hub);
+    await callFrom(hub);
+    drain();
+    pause(1600);
+    await callFrom(hub);
+    expect("A0/E3: a hub that was never dirty stays silent", sweeps(drain()).length, 0);
+
+    // The incident's artifact shapes: four tracked edits (one tracked file
+    // here), one NEW untracked skill DIRECTORY, one NEW doc.
+    write(join(hub, "doc.md"), "v2 — a session's tracked edit\n");
+    inHub("skills/new-skill/SKILL.md", "---\nname: new-skill\n---\n");
+    inHub("docs/plans/plan.md", "# plan\n");
 
     // ── B. the incident, end to end ────────────────────────────────────────
     // B1: a hub-rooted session starts on a DIRTY hub. Seeding the baseline must
@@ -224,7 +245,7 @@ async function main() {
     await callFrom(hub);
     expect("D1: a path APPEARING is not a sweep (no false accusation)", sweeps(drain()).length, 0);
 
-    // ── E. the negative controls: which sessions must stay silent ──────────
+    // ── E. the remaining negative controls ────────────────────────────────
     // E1 — a WORKTREE-rooted session. Every fleet lane is one of these; none of
     //      them may pay a `git status` per tool call or inherit hub noise. The
     //      hub's own paths are observed first from the hub, then swept, then
@@ -247,14 +268,6 @@ async function main() {
     const e2 = sweeps(drain());
     delete process.env.AGENT_ALLOW_MAIN_EDITS;
     expect("E2: the env hatch suppresses the banner (documented bypass contract)", e2.length, 0);
-
-    // E3 — a genuinely CLEAN hub. There is nothing to lose and nothing to say;
-    //      a session that never observed dirt must never be accused of losing it.
-    gg("clean -qfd", hub);
-    await callFrom(hub);
-    drain();
-    await callFrom(hub);
-    expect("E3: a hub that was never dirty stays silent", sweeps(drain()).length, 0);
   } finally {
     for (const [k, v] of savedEnv) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
     process.chdir(prevCwd);
