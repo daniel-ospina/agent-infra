@@ -356,6 +356,24 @@ else
 fi
 assert_contains "$out" "the target does not exist" "…saying only what it actually verified"
 rm -f "$FARMWT/unrelated-tool"
+# FAIL-CLOSED when the worktree list cannot rule a worktree OUT. With no worktree of this hub
+# recorded (pruned above) an EMPTY list is indistinguishable from an UNREADABLE one —
+# `hub_worktrees` returns 0 and prints nothing when `git worktree list` fails — and reading
+# that as "not a worktree" re-prints the non-converging chain this block exists to prevent
+# (MEASURED, review of PR #3780: with the guide-side call failing, relink=1/withheld=0). The
+# symlinked hub entry is the only shape that can hide a worktree resolution, so only it pays.
+mkdir -p "$FIX/stable-tool"
+ln -s "$FIX/stable-tool" "$HUB/extensions/stable-tool"
+ln -s "$HUB/nowhere/stable-tool" "$FARMWT/stable-tool"
+out="$(PI_EXTENSIONS_DIR="$FARMWT" bash "$CHECK" --repo "$HUB" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 1 "a dead entry with no worktree recorded still exits 1"
+if grep -qF "ln -s $HUB/extensions/stable-tool" <<<"$out"; then
+  bad "an EMPTY/unreadable worktree list must NOT license a relink (fail-closed)"
+else
+  ok "an EMPTY/unreadable worktree list withholds the relink (fail-closed)"
+fi
+assert_contains "$out" "could not be read" "…and names the unverified list as the reason"
+rm -f "$HUB/extensions/stable-tool" "$FARMWT/stable-tool"
 # Negative control for the class: a hub that merely HAS a worktree, which the farm does
 # not point into, is healthy — otherwise this token would red every hub with a worktree.
 ln -sfn "$HUB/extensions/builtin-tools" "$FARMWT/builtin-tools"

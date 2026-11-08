@@ -399,7 +399,7 @@ recovery_guide() {
     # But a hub entry that is a link onto a STABLE tree outside every worktree is fine and
     # MUST get the relink: withholding it there costs a hand-written command for no reason
     # and states a cause that is false on that box (also MEASURED in that review).
-    local hub_wt_exts="" hub_entry_dir
+    local hub_wt_exts="" hub_entry_dir hub_entry_in_wt
     while IFS=$'\t' read -r wt br; do
       [ -n "$wt" ] || continue
       hub_wt_exts+="$(physical_path "$wt/extensions")"$'\n'
@@ -411,16 +411,32 @@ recovery_guide() {
       # Paths are %q-quoted like every other paste-ready command here (:304, :310, :314),
       # where an unquoted path with a space was MEASURED to emit a chain that did nothing.
       hub_entry_dir=""
+      hub_entry_in_wt=0
       if [[ -d "$repo/extensions/$n" ]]; then
         hub_entry_dir="$(physical_path "$(dirname "$(physical_path "$repo/extensions/$n")")")"
       fi
-      if [[ -n "$hub_entry_dir" ]] && ! grep -qxF -- "$hub_entry_dir" <<<"$hub_wt_exts"; then
+      if [[ -n "$hub_entry_dir" ]]; then
+        if grep -qxF -- "$hub_entry_dir" <<<"$hub_wt_exts"; then
+          hub_entry_in_wt=1
+        elif [[ -z "$hub_wt_exts" && -L "$repo/extensions/$n" ]]; then
+          # ⛔ FAIL-CLOSED on an EMPTY list. `hub_worktrees` returns 0 and prints nothing when
+          # `git worktree list` FAILS, so "empty" means either "this hub has no worktree" or
+          # "the list could not be read" — and only the first is a licence to relink. Reading
+          # an unreadable list as "not a worktree" re-created the non-converging chain this
+          # block exists to prevent (MEASURED, review of PR #3780: with the guide's own call
+          # failing, relink=1/withheld=0; the fail-closed reading withholds it). A symlinked
+          # hub entry is the only shape that can hide a worktree resolution, so only it pays.
+          hub_entry_in_wt=1
+        fi
+      fi
+      if [[ -n "$hub_entry_dir" && "$hub_entry_in_wt" -eq 0 ]]; then
         lines+=("  rm -f $(printf '%q' "$farm_root_wt/$n") && ln -s $(printf '%q' "$repo/extensions/$n") $(printf '%q' "$farm_root_wt/$n")")
       elif [[ -L "$repo/extensions/$n" ]]; then
         lines+=("  rm -f $(printf '%q' "$farm_root_wt/$n")   # this hub's OWN extensions/$n is")
-        lines+=("  #   itself a link INTO A WORKTREE — a relink would recreate exactly the state")
-        lines+=("  #   above. Point extensions/$n at a real tree, then relink the farm entry onto")
-        lines+=("  #   it.")
+        lines+=("  #   itself a link INTO A WORKTREE (or the worktree list could not be read, and")
+        lines+=("  #   an unreadable list is never taken as 'not a worktree') — a relink could")
+        lines+=("  #   recreate exactly the state above. Point extensions/$n at a real tree, then")
+        lines+=("  #   relink the farm entry onto it.")
       else
         lines+=("  rm -f $(printf '%q' "$farm_root_wt/$n")   # this hub has NO extensions/$n to")
         lines+=("  #   point at, so a relink here would itself dangle — the entry is removed.")
