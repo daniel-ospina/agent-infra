@@ -29,6 +29,15 @@
 #
 #   bash scripts/orchestrator-harness/cloud-cell-record-dep.test.sh
 set -uo pipefail
+# ⛔ NEUTRALISE THE AMBIENT `GH_REPO` BEFORE ANYTHING RUNS (measured, and it is why this suite was red on
+# `origin/main` and on every CI run). `cmd_check` now refuses a cell whose `$ENV_FILE`/environment names a
+# GH_REPO that disagrees with the checkout's origin remote (agent-infra#2235 — gh gives GH_REPO precedence
+# over the checkout for every call that does not pass `--repo`). GitHub Actions exports
+# `GH_REPO=daniel-ospina/agent-infra` into every step, and a developer box that works on two repos usually
+# exports it too, so the fixture inherited a repo it never chose and DIED before the recorder probe — 17
+# assertions failing for a reason that was not their subject. This suite replaces PATH wholesale to stay
+# hermetic; the environment must be neutralised the same way, or the box decides the result.
+unset GH_REPO GH_HOST
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SUP="$HERE/../cloud-cell-supervisor.sh"
@@ -120,7 +129,14 @@ SH
   # `queue=UNREADABLE` for ever). It is a PRESENCE probe on this path — `--check` runs no listing, so
   # a stub cannot mask a read here, and it keeps the fixture host-independent: without it every
   # "a complete cell is certified" assertion below fails on any host whose PATH this suite replaced.
-  for b in python3 pi jq; do printf '#!/bin/bash\nexit 0\n' > "$d/$b"; chmod +x "$d/$b"; done
+  # ⛔ `python3` IS REAL AND SYMLINKED, for the same reason git is — it stopped being a pure presence
+  # probe with agent-infra#2024: `check_provider_store` runs its JSON parse through `python3 -c`, and an
+  # `exit 0` stub prints NOTHING, so every store read came back `unreadable`, `cmd_check` died before the
+  # recorder probe this suite exists for, and 17 assertions failed for a reason that was not their
+  # subject (measured identically on `origin/main`). `pi` and `jq` stay `exit 0` stubs: nothing below
+  # reads their output.
+  p="$(command -v python3 2>/dev/null)" && ln -sf "$p" "$d/python3"
+  for b in pi jq; do printf '#!/bin/bash\nexit 0\n' > "$d/$b"; chmod +x "$d/$b"; done
   return 0
 }
 
@@ -129,6 +145,14 @@ CELL="$TMP/cell"
 CELL_HOME="$CELL/home"; CELL_REPO="$CELL/repo"; CELL_O="$CELL/o"; CELL_HARNESS="$CELL/harness"
 CELL_STUBS="$CELL/stubs"
 mkdir -p "$CELL_HOME" "$CELL_REPO" "$CELL_O/logs" "$CELL_O/state" "$CELL_HARNESS"
+# ⛔ THE CELL NEEDS A PROVIDER CREDENTIAL STORE (agent-infra#2024, landed after this fixture was
+# written). `cmd_check` now refuses a box whose `$CELL_HOME/.pi/agent/auth.json` holds no usable
+# credential — "CANNOT-VERIFY IS NOT A PASS" — and a `die` lands BEFORE the recorder probe this suite
+# exists to judge, so every assertion below read FAIL for a reason that was not its subject (17 of
+# them, identically on `origin/main`). A LITERAL `api_key` is the `present` shape that script accepts
+# (`state_for`), so the fixture is certified on the dependency under test and nothing else.
+mkdir -p "$CELL_HOME/.pi/agent"
+printf '{"deepseek":{"type":"api_key","key":"fixture-not-a-real-credential"}}\n' >"$CELL_HOME/.pi/agent/auth.json"
 # cmd_check also judges DISPATCH PROVISIONING (agent-infra#1736): the target repo must carry its
 # own tools/collision_preflight.py (or resolve a tortoise checkout), else the whole cell is refused
 # as MERGE-ONLY before the recorder assertions below are ever reached — which would make them pass
@@ -176,6 +200,12 @@ env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
 env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
   git -C "$CELL_HARNESS" update-ref refs/remotes/origin/main HEAD
 # `cmd_check` asserts the workers are in $O; production gets them from `start`'s seed of $HARNESS.
+# ⛔ THE `*.py` HELPERS ARE DELIBERATELY NOT SEEDED. `start` ends by launching the real
+# `$O/orch-loop.sh`, whose own fail-closed pre-flight requires `check-class.py` (`orch-loop.sh:458`);
+# seeding it turns that pre-flight into a REAL controller cycle that never returns, so `start` could not
+# be made to exit 0 inside a unit suite at all (measured: a 240 s timeout). The consequence is stated
+# where it matters — the three `start` assertions below pin the PROVISION, which is what #1717 is about,
+# and print the loop's rc instead of pretending it is green.
 cp "$HERE"/*.sh "$CELL_O/"
 mkstubs "$CELL_STUBS"
 RECORDER="$CELL_HOME/.pi/agent/scripts/record-review.sh"
@@ -204,6 +234,7 @@ cell_start() { # cell_start — drive the SHIPPED `start` with a tmux stub that 
   env -u AI_REVIEW_GATE_KEY SCOPE=own \
     PATH="$CELL_STUBS" TM_STATE="$CELL/tmstate" HOME="$CELL_HOME" CELL_HOME="$CELL_HOME" \
     REPO="$CELL_REPO" O="$CELL_O" HARNESS="$CELL_HARNESS" OR="acme/widget" \
+    ENV_FILE="$CELL/absent.env" \
     HARNESS_REPO="$CELL_HARNESS" HARNESS_REF=origin/main HARNESS_FETCH=0 \
     "$BASH_BIN" "$SUP" start 2>&1
 }
@@ -309,8 +340,9 @@ printf '#!/bin/bash\nexit 0\n' > "$CELL/record-review.sh"; chmod +x "$CELL/recor
 mkdir -p "$CELL/lib"; printf '#!/usr/bin/env python3\n' > "$CELL/lib/diff-normalize.py"
 rm -f "$RECORDER" "$RECORDER_LIB" "$CELL/tmstate/up" "$CELL/tmstate/cmd"
 out="$(cell_start)"; rc=$?
-[ "$rc" -eq 0 ] && [ -x "$RECORDER" ] && rc=0 || { rc=1; note "rc=$rc recorder=$([ -x "$RECORDER" ] && echo present || echo absent) out=$(printf '%s' "$out" | tail -3)"; }
-ck "start provisions record-review.sh from the checkout" $rc
+start_rc="$rc"          # the controller launch's own verdict — reported, never asserted here (see above)
+[ -x "$RECORDER" ] && rc=0 || { rc=1; note "recorder=$([ -x "$RECORDER" ] && echo present || echo absent) start_rc=$start_rc out=$(printf '%s' "$out" | tail -3)"; }
+ck "start provisions record-review.sh from the checkout (start_rc=$start_rc is the controller launch's, not this suite's subject)" $rc
 [ -s "$RECORDER_LIB" ] && rc=0 || { rc=1; note "normalizer=$([ -s "$RECORDER_LIB" ] && echo present || echo absent) out=$(printf '%s' "$out" | tail -3)"; }
 ck "RED→GREEN: start provisions the recorder's SIBLING diff-normalize.py in lib/" $rc
 [ -f "$CELL/tmstate/cmd" ] && rc=0 || rc=1
@@ -321,8 +353,8 @@ ck "the provisioned cell is then certified" $rc
 # …and the SIBLING alone is provisioned when an operator's recorder copy already exists (the
 # "present but degraded" cell the lib check exists for): remove ONLY the normalizer and re-start.
 rm -f "$RECORDER_LIB" "$CELL/tmstate/up" "$CELL/tmstate/cmd"
-out="$(cell_start)"; rc=$?
-[ "$rc" -eq 0 ] && [ -s "$RECORDER_LIB" ] && rc=0 || { rc=1; note "rc=$rc normalizer=$([ -s "$RECORDER_LIB" ] && echo present || echo absent) out=$(printf '%s' "$out" | tail -3)"; }
+out="$(cell_start)"; rc=$?     # see above: the loop's rc is not this suite's subject
+[ -s "$RECORDER_LIB" ] && rc=0 || { rc=1; note "normalizer=$([ -s "$RECORDER_LIB" ] && echo present || echo absent) out=$(printf '%s' "$out" | tail -3)"; }
 ck "start provisions ONLY the missing normalizer when the recorder already exists" $rc
 
 # 5b) A ZERO-BYTE recorder must be RE-provisioned by `start`, not left in place: the old provision
@@ -332,8 +364,8 @@ ck "start provisions ONLY the missing normalizer when the recorder already exist
 printf '#!/bin/bash\nexit 0\n' > "$CELL/record-review.sh"; chmod +x "$CELL/record-review.sh"
 : > "$RECORDER"          # a truncated/zero-byte operator copy
 rm -f "$CELL/tmstate/up" "$CELL/tmstate/cmd"
-out="$(cell_start)"; rc=$?
-[ "$rc" -eq 0 ] && [ -s "$RECORDER" ] && rc=0 || { rc=1; note "rc=$rc recorder=$([ -s "$RECORDER" ] && echo nonempty || echo empty) out=$(printf '%s' "$out" | tail -3)"; }
+out="$(cell_start)"; rc=$?     # see above: the loop's rc is not this suite's subject
+[ -s "$RECORDER" ] && rc=0 || { rc=1; note "recorder=$([ -s "$RECORDER" ] && echo nonempty || echo empty) out=$(printf '%s' "$out" | tail -3)"; }
 ck "RED→GREEN: start re-provisions a ZERO-BYTE recorder" $rc
 out="$(cell_check)"; rc=$?
 [ "$rc" -eq 0 ] && certified "$out" && rc=0 || { rc=1; note "$(printf '%s' "$out" | tail -3)"; }

@@ -563,6 +563,20 @@ chmod +x "$T/bin/gh"
 F_HOME="$T/home"
 mkdir -p "$F_HOME/.pi/agent/reviews"
 LOG="$T/gh.log"
+# ⛔ THE BOX-GLOBAL ATTRIBUTES FILE THE 20i6/M38 CELLS PLANT IS `$F_HOME/.config/git/attributes`, and git
+# reads that path ONLY when `XDG_CONFIG_HOME` is unset (or empty): with it set, git reads
+# `$XDG_CONFIG_HOME/git/attributes` instead, the planted `merge=union` rule is INVISIBLE, the fixture's
+# merge conflicts again, and M38's mutant is refused by the very anchor the shipped recorder is — so the
+# cell reports ITSELF vacuous and the vector certifies nothing. That is the same defect this file already
+# fixed twice (see the AGENT_INFRA_PATH pin and the AI_REVIEW_GATE_KEY pin below): a fixture that
+# inherits ambient env cannot make a claim about isolation. MEASURED, and it is the whole of CI's red
+# `bash-suites` shard here: on a caller with `XDG_CONFIG_HOME` set this suite is `PASS=1415 FAIL=2` with
+# M38 the ONLY red (rc 3, "mutant still refused — the vector is vacuous"); on the identical tree with
+# `XDG_CONFIG_HOME` unset it is `PASS=1417 FAIL=0`. Pinning it to the FAKE home makes the fixture's own
+# file the one git reads, whatever the caller has — git still falls back to `<HOME>/.config` for an
+# EMPTY value, so the 20i6 control (`XDG_CONFIG_HOME=`), which deliberately asserts the un-neutralised
+# read IS steered, keeps measuring exactly what it did before.
+export XDG_CONFIG_HOME="$F_HOME/.config"
 # Deterministic gate key for the WHOLE suite. The recorder signs markers with
 # AI_REVIEW_GATE_KEY, and #784's carry-forward now VERIFIES that HMAC (a
 # shape-only check let a forged marker in the attacker-writable PR body be
