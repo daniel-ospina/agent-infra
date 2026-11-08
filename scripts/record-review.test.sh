@@ -5541,10 +5541,10 @@ assert_not_contains "$RECORD_ERR" "neither delivers these bytes" \
 # ⛔ THE EXIT-0 REMEDY ITSELF MUST BE PINNED, NOT ONLY ITS DENIALS (#3712 review at
 # `1dece6108`, FINDING 1 — the absent-mutation-leg class of agent-infra#3442).
 # Every row above on this capture is either a POSITIVE about a state that is still
-# true without the remedy (`:5526` — `rg -n 'THIS RUN PLACED NO BODY COPY ON ANY CHANNEL'`) or a
+# true without the remedy (`:5526` — `rg -n '^assert_contains .*THIS RUN PLACED NO BODY COPY'`) or a
 # NEGATIVE about a denial; deleting the remedy clause makes each negative MORE satisfied, so the
 # whole block stayed GREEN with the round-10 regression direction live. The label at `:5540`
-# (`rg -n 'it must be OFFERED in both arms'`) states the invariant and the comment above it
+# (`rg -n '^    "14\.1d\(i\) …nor denies'`) states the invariant and the comment above it
 # repeats it, but nothing enforced it on THIS arm — the only two positives on the offer read the
 # rc-5 capture (`:5589`/`:5591` — `rg -n 'assert_contains "\$RECORD_ERR" "(TRY --flush-pending|findings/note, the diff)'`
 # gives FOUR rows, the LAST TWO of which are this rc-5 capture's). These two are DIFFERENT
@@ -6907,7 +6907,7 @@ S21_ROWS="$T/s21-rows"; mkdir -p "$S21_ROWS"
 # for a reason unrelated to its mutation (measured: 21.12's first pin). Prepared once here.
 S21_MUTDIR="$T/s21-mut"; mkdir -p "$S21_MUTDIR"
 cp -r "$SCRIPT_DIR/lib" "$S21_MUTDIR/lib"
-# SELF-CONTAINED digest fixtures (§11.13 unsets CC_SHA at :2974 — `grep -n 'unset CC_OUT CC_RC'` —, and the §11.12 note is
+# SELF-CONTAINED digest fixtures (§11.13 unsets CC_SHA at :2974 — `grep -n '^unset CC_OUT CC_RC'` —, and the §11.12 note is
 # explicit that a section leaning on another's fixture is either an abort under `set -u`
 # or — worse — a silent comparison against bytes some other section computed). The
 # digest comes from the ONE shared normalizer, exactly as the producer and the GitHub
