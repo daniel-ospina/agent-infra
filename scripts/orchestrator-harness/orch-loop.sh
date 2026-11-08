@@ -2208,7 +2208,11 @@ _wreap_patterns() { printf 'run-%s.sh' "${1:-}"; }
 # subtrees summed, which is the only identity the tmux arm offers.
 # ⛔ OUR OWN ANCESTRY AND ITS DESCENDANTS ARE EXCLUDED: a forked subshell inherits argv verbatim, so the
 # probe can otherwise see itself and report the box's own work as the worker's (the self-count that made
-# `wt_live_holders` refuse every reap — wt-lifecycle.sh).
+# `wt_live_holders` refuse every reap — wt-lifecycle.sh). CAVEAT, stated because this file's doctrine is
+# that a comment must not claim more than the code does (review of PR #3756, P3): `own[]` is seeded with
+# `self` and closed over DESCENDANTS only — ANCESTORS of `self` are NOT excluded. No live worker is an
+# ancestor of the controller today, so this is latent, but a fixture that launched its "worker" as the
+# driving shell's parent would silently measure nothing.
 _wreap_cpu() {
   awk -v pats="$2" -v seeds="$3" -v self="$$" '
     function csec(t,   d, a, n, s) {
@@ -2263,7 +2267,7 @@ _wreap_pane_pid() {
   local n="${1:-}" p
   case "$n" in ''|*[!A-Za-z0-9-]*) return 0 ;; esac
   command -v tmux >/dev/null 2>&1 || return 0
-  p="$(tmux list-panes -t "=$n" -F '#{pane_pid}' 2>/dev/null | head -1)"
+  p="$( wt_bounded "${WT_PROBE_TIMEOUT:-15}" tmux list-panes -t "=$n" -F '#{pane_pid}' 2>/dev/null | head -1 )"
   case "$p" in ''|*[!0-9]*) return 0 ;; esac
   printf '%s' "$p"
 }
@@ -2408,10 +2412,17 @@ EOF
   # ONE process-table read per pass: the previous reading comes from the durable sample file, so the
   # delta is over controller time rather than over an instant (see `_WREAP_WINDOW_MIN`).
   if [ -n "$_wc" ]; then
-    local _now _tbl _cn _cf _ca _cm _pats _seed _pane _prev _pcpu _o _cpu _m _surf _v
+    local _now _tbl _cn _cf _ca _cm _pats _seed _pane _prev _pcpu _o _cpu _m _surf _v _census _census_ok _row _kind _kf
     _now="$(date +%s 2>/dev/null)" || _now=0
     is_num "${_now:-}" || _now=0
     _tbl="$(_wreap_ps)"
+    # ONE census read for the whole pass (see the surface resolution below). Empty ⇒ UNKNOWN for every
+    # candidate, which SPARES: a fault in the census is not a measurement of any worker.
+    _census=""; _census_ok=0
+    if declare -f wt_table >/dev/null 2>&1; then
+      _census="$( wt_table 2>/dev/null )" || _census=""
+      [ -n "$( printf '%s' "${_census:-}" | tr -d '[:space:]' )" ] && _census_ok=1
+    fi
     while IFS="$(printf '\t')" read -r _cn _cf _ca _cm; do
       [ -n "${_cn:-}" ] || continue
       _pats="$(_wreap_patterns "$_cn")"
@@ -2428,11 +2439,39 @@ EOF
       case "$_o" in
         *' '*) _m="${_o%% *}"; _cpu="${_o##* }" ;;
       esac
-      # The launcher's OWN answer to "is this worker's surface still there". `unknown` when the census
-      # cannot answer — which is not a licence to kill, only a reason not to use the surface as proof.
+      # ⛔ THE SURFACE IS READ FROM *ONE* CENSUS SNAPSHOT, AND AN UNREADABLE ONE IS `unknown` — NEVER
+      # `dead` (review of PR #3756, P1). This used to be `wt_alive "$_cn" && alive || dead`, and that is
+      # a FALSE PROOF: `wt_alive` (worker-terminal.sh) answers `st="" -> return 1`, and `st` is empty
+      # BOTH when the record's row says `dead` AND when `wt_table` printed NOTHING AT ALL. Those are
+      # different facts and only the first is evidence. The module says so elsewhere — `ai-drainer.sh`:
+      # "an empty table while records exist is a FAULT, not a quiet box" — and this gate turned the same
+      # fault into a DESTRUCTIVE one: `matched == 0` + `surf = dead` returns REAP from `_wreap_verdict`
+      # BEFORE any window is consulted, so an aborted census freed a live worker's record while printing
+      # "nothing is left to destroy". Measured 2026-11-08 with the shipped helpers: a census that aborts
+      # mid-pass makes `wt_alive fix-19` answer `rc=1 -> DEAD`.
+      # So: resolve THIS record's row from the one pass-wide snapshot, and treat a row that is ABSENT
+      # from a readable table as `unknown` too — the record vanished mid-pass, which is not evidence the
+      # worker died.
       _surf="unknown"
-      if declare -f wt_alive >/dev/null 2>&1; then
-        if wt_alive "$_cn"; then _surf="alive"; else _surf="dead"; fi
+      if [ "${_census_ok:-0}" = "1" ]; then
+        _row="$( printf '%s\n' "$_census" | awk -F"$(printf '\t')" -v n="$_cn" '$1==n{print $2; exit}' 2>/dev/null )"
+        case "${_row:-}" in
+          dead)
+            # ⛔ AND A `kind=tmux` RECORD IS ONLY *PROVEN* GONE IF THE CENSUS COULD SEE TMUX AT ALL.
+            # `wt_tmux_names` returns EMPTY when `command -v tmux` fails ("no binary ⇒ no tmux session
+            # can exist" — a SPAWN-time truth, not a REAP-time one), so a controller whose PATH lost
+            # tmux reads every live tmux worker as `dead` and would delete its record with no pid left
+            # to signal. Unanswerable is not gone; that is the whole polarity of this gate.
+            _kind=""; _kf="$( wt_dir 2>/dev/null )/worker-$_cn"
+            [ -f "$_kf" ] && _kind="$( sed -n 's/^kind=//p' "$_kf" 2>/dev/null | head -1 )"
+            if [ "${_kind:-}" = "tmux" ] && ! command -v tmux >/dev/null 2>&1; then
+              _surf="unknown"
+            else
+              _surf="dead"
+            fi ;;
+          alive|unknown) _surf="alive" ;;
+          *) _surf="unknown" ;;
+        esac
       fi
       # ⛔ THE VERDICT IS ALWAYS ASKED, INCLUDING WHEN THE PROBE READ NOTHING. An unreadable table
       # used to skip the call and default to UNKNOWN, so a record whose surface is PROVEN GONE could
@@ -2470,7 +2509,13 @@ EOF
       esac
       # The sample is written on EVERY arm that did not reap. On the two spare arms it IS the next
       # pass's window: a worker measuring flat keeps ageing its baseline, one that progresses resets it.
-      [ "$_v" = "0" ] || _wreap_note "$_cn" "$_now" "${_cpu:-0}" "${_m:-0}" "${_cm:-0}"
+      # ⛔ BUT AN UNMEASURED PASS IS NOT A READING (review of PR #3756, P3). When the probe could not read
+      # the table, `_cpu` is empty and `_m` is 0 — and writing `<now> 0 0` persisted a MEASUREMENT NOBODY
+      # TOOK, destroying the valid baseline the worker had. One unreadable pass then RESTARTS the idle
+      # window, so an intermittently failing probe spares for ever. Skip the note and KEEP the baseline.
+      if [ "$_v" != "0" ] && is_num "${_cpu:-}"; then
+        _wreap_note "$_cn" "$_now" "${_cpu:-0}" "${_m:-0}" "${_cm:-0}"
+      fi
     done <<EOF
 $_wc
 EOF

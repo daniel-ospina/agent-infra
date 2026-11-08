@@ -2833,6 +2833,18 @@ tmux() {
   esac
   return 0
 }
+# ⛔ THE CENSUS IS STUBBED AT `wt_tmux_names`, NOT AT `tmux` (review of PR #3756, P2 — MEASURED, and it
+# is the same trap the `rl*.sh` fixtures document). `wt_tmux_names` reads the session list through
+# `wt_bounded`, which `perl -e 'alarm shift; exec @ARGV'` — a shell FUNCTION named `tmux` is INVISIBLE to
+# that `exec`, so the `ls)` arm above is unreachable for the census and the surface answer came from THIS
+# HOST'S REAL tmux server. Measured 2026-11-08: with `tmux()` answering `STUB-SESSION-NAMES`, the census
+# still returned this box's live sessions (`cell-doctor`, `orch`). Consequence: on a controller box
+# holding a live session named `fix-77` — an ordinary PR-77 worker, i.e. the box type this suite runs on
+# — `wt_alive fix-77` read `alive`, the row SPARED, `KILLED` stayed empty and the row failed for a reason
+# having nothing to do with the reaper; and the suite header's "no tmux server" promise was false.
+# `wt_tmux_names` is called IN-SHELL, so stubbing IT is what actually controls the surface answer.
+# It lists NO session: this fixture's record is the "whose PANE is gone" case.
+wt_tmux_names() { return 0; }
 kill() { :; }
 SH
 # ── 15) a hung worker cannot hold a concurrency slot forever ────────────────────
@@ -2909,7 +2921,12 @@ if need "$TMP/reapw.sh" "reap_stale_workers() and its helpers are extracted from
   # ⛔ AND NO DEAD LINE BESIDE IT (review of PR #3756, P3). A `printf '1 %s 1\n' "…" > /dev/null` used to
   # sit here — its `%s` consumed the fixture's own path and the result went to /dev/null, a no-op in the
   # block whose subject is "a test that cannot fail is not a gate". Removed rather than left as decoration.
-  printf '1 0 1\n' > "$TMP/RW/state/wreap-fix-77"
+  # ⛔ THE BASELINE MUST SURVIVE THE INCARNATION GUARD, OR IT IS A DEAD LINE (review of PR #3756, P3 —
+  # measured). `_wreap_prev <name> <log-mtime>` DISCARDS a sample older than the worker's log mtime, and
+  # this fixture's log is `touch -t 202601010000` (epoch 1767225600) while the sample's epoch was `1` —
+  # so the line was thrown away and the row could never be "a hung worker on its second pass"; it passed
+  # on the surface route alone. An epoch one hour back is older than the window and newer than the log.
+  printf '%s 0 1\n' "$(( $(date +%s) - 3600 ))" > "$TMP/RW/state/wreap-fix-77"
   # shellcheck disable=SC1090
   . "$TMP/wtstub.sh"
   LOG="$TMP/RW/rw.log"; O="$TMP/RW"; WT_DIR="$TMP/RW/state"; STALE_MIN=1; WT_TABLE_TTL=0
@@ -2931,6 +2948,37 @@ if need "$TMP/reapw.sh" "reap_stale_workers() and its helpers are extracted from
   # nothing left to destroy, and that is the slot this reaper exists to free.
   case "$KILLED" in *fix-77*) rc=0 ;; *) rc=1; echo "      killed: [$KILLED]";; esac
   ck "a stale LEGACY tmux worker whose PANE is gone is still reaped out of the same census" $rc
+  # ⛔ AN UNREADABLE CENSUS IS NOT "THE SURFACE IS PROVEN GONE" (review of PR #3756, P1 — reproduced).
+  # `wt_alive` answers `st="" -> return 1`, and `st` is empty BOTH when the record's row says `dead` AND
+  # when `wt_table` printed NOTHING (a census that aborted mid-pass). The reaper used that boolean as its
+  # PROOF of death, so `matched == 0` + an empty table REAPED a live worker's record and logged "nothing
+  # is left to destroy". MEASURED on the pre-fix code: `wt_alive fix-19` answers `rc=1 -> DEAD` against a
+  # census that aborted, and the pass proceeds to close the record. This drive makes the census answer
+  # the phase-1 walk and then print NOTHING, and asserts the record SURVIVES.
+  # The abort is a FILE flag, not a shell variable: `wt_table` runs inside `$( )`, so a counter in the
+  # function's own scope never advances and the stub would answer every time (measured while writing it).
+  : > "$TMP/RW/logs/merge-999.log"; touch -t 202601010000 "$TMP/RW/logs/merge-999.log"
+  printf 'kind=terminal\nid=term_merge-999\nworkspace=ws_merge-999\ncwd=/tmp\n' > "$TMP/RW/state/worker-merge-999"
+  printf '%s 0 1\n' "$(( $(date +%s) - 3600 ))" > "$TMP/RW/state/wreap-merge-999"
+  cat > "$TMP/rwabort.sh" <<SH
+set -u
+. "$TMP/wtstub.sh"
+LOG="$TMP/RW/rwab.log"; O="$TMP/RW"; WT_DIR="$TMP/RW/state"; STALE_MIN=1; WT_TABLE_TTL=0
+_WREAP_WINDOW_MIN=0
+. "$HERE/worker-terminal.sh"
+# THE CENSUS ABORTS: the walk sees the record, every later read prints a perfectly valid EMPTY table.
+wt_table() {
+  if [ -f "$TMP/rwabort.once" ]; then return 0; fi
+  : > "$TMP/rwabort.once"
+  printf 'merge-999\talive\n'
+}
+. "$TMP/reapw.sh"
+reap_stale_workers; echo "closed=\$CLOSED killed=\$KILLED"
+SH
+  rm -f "$TMP/rwabort.once"; : > "$TMP/RW/rwab.log"
+  out="$(bash "$TMP/rwabort.sh" 2>&1)"
+  case "$out" in *merge-999*) rc=1; echo "      an ABORTED census was read as PROVEN GONE: $out";; *) rc=0 ;; esac
+  ck "an UNREADABLE census SPARES the worker — an empty table is a FAULT, never 'the worker is gone' (#2104 P1)" $rc
   # ⛔ NOT THE WORD `reap-worker` (review of PR #3756, P3). `reap_stale_workers` ALWAYS emits
   # `[reap-worker] wedged=…`, so the old assertion here was green with every per-candidate decision echo
   # deleted — the same vacuity a sibling fixture closed one commit earlier, reproduced in this row. Assert
