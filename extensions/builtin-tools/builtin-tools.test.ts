@@ -3184,6 +3184,17 @@ test("#1339b: the decision never evaluates a threshold against an invalid marker
   equal(otherClause.kill, true, "a clause that does not read the marker clock still fires");
   equal(otherClause.reason, "tool-stall");
   equal(otherClause.markerAgeMs, 0, "…and the payload still carries the CLAMPED 0, not the raw -532 (fails if the clamp is reverted)");
+  // #1339 review P2: the clamped `0` above is INDISTINGUISHABLE from a marker that
+  // landed exactly now, so a reader cannot tell "fresh" from "uncomputable". The
+  // flag `readMarkerAge` promises to report is carried on the DECISION, and the
+  // payload prints it, so the two cases are separable in the post-mortem.
+  equal(otherClause.markerAgeInvalid, true, "a clamped decision says so — otherwise the clamped 0 reads as a live marker");
+  equal(cut.markerAgeInvalid, false, "a genuinely stale marker is not flagged invalid (the flag is not a second clamp)");
+  equal(
+    heartbeatKillDecision(dinput({ now, lastLifeSignAt: now, state: cutClauseState(gap + 20_000, now), cutGapMs: gap })).markerAgeInvalid,
+    false,
+    "…and the ordinary past-timestamp path stays unflagged",
+  );
 });
 
 test("#1339e: supersedingEvidence — the guard asks each clause about ITS OWN clock", () => {
@@ -3278,10 +3289,34 @@ test("#1339d: loop wiring — the verdict is re-validated against evidence acros
   // catch it either (`false`/`0` satisfy `boolean`/`number`), and this repo has
   // no root tsconfig so that job self-skips. The channels are INERT without this
   // wiring, so the wiring is pinned.
-  ok(
-    src.includes("sessionEnded: hbCtx.state.sessionEnded,") && src.includes("toolsInFlight: hbCtx.state.toolsInFlight,"),
-    "the loop hands the guard LIVE scope-gate state, not constants — the session-end / tool-in-flight channels are inert without this wiring (cycle-3 review)",
-  );
+  //
+  // ⛔ BUT A WHOLE-FILE `src.includes()` IS NOT A PIN FOR A LINE THAT IS NOT
+  // UNIQUE. Measured (#1339 cycle-4 review): `lastLifeSignAt: lastHeartbeat,`
+  // occurs 3× in index.ts and `toolsInFlight: hbCtx.state.toolsInFlight,` 2×, so
+  // a global substring test stayed GREEN while the GUARD'S OWN argument was
+  // mutated to `now` — 373/0 with the byte channel firing on every tick and
+  // suppressing every kill for a whole dispatch. Each literal is therefore
+  // asserted INSIDE the guard's argument block, which is the only region where
+  // it is evidence of this wiring at all.
+  const guardCall = src.indexOf(": supersedingEvidence(decision.reason, now, {");
+  ok(guardCall > -1, "the guard is called with the channels object (this slice is the region every pin below reads)");
+  const guardArgs = guardCall > -1 ? src.slice(guardCall, src.indexOf("});", guardCall)) : "";
+  for (const [literal, why] of [
+    ["lastMarkerAt: hbCtx.state.lastMarkerAt,", "the marker channel reads live state"],
+    ["lastLifeSignAt: lastHeartbeat,", "the byte channel reads the live life-sign clock — `now` here fires the channel on every tick and suppresses every kill"],
+    ["lastProgressAt: hbCtx.state.lastProgressAt,", "the progress channel reads the clause's own clock"],
+    ["startedAt,", "the progress anchor is the dispatch's start, not a re-read"],
+    ["sessionEnded: hbCtx.state.sessionEnded,", "the #191 scope gate reads live state, never the constant `false`"],
+    ["toolsInFlight: hbCtx.state.toolsInFlight,", "the in-flight scope gate reads live state, never the constant `0`"],
+  ] as const) {
+    ok(guardArgs.includes(literal), `the guard's OWN channels object carries \`${literal.trim()}\` — ${why} (cycle-4 review: a global includes() is inert for a non-unique line)`);
+  }
+  // The BYTE channel is the only evidence path when no marker ever parses
+  // (`hbEnabled === false`, or a marker failing the nonce check → `lastMarkerAt`
+  // stays 0 forever), and `silence-threshold`'s clock IS `i.lastLifeSignAt` — so
+  // an inert byte channel restores the stale-verdict kill this change exists to
+  // stop, in exactly the configuration where nothing else can catch it.
+  equal(guardArgs.split("lastLifeSignAt:").length - 1, 1, "the guard passes exactly one byte channel (no shadowed second binding)");
   // The exemption is a WALL-CLOCK policy cap, not a liveness inference.
   ok(
     /decision\.reason === "max-dispatch"\s*\n\s*\? null\s*\n\s*: supersedingEvidence\(/.test(src),
@@ -3311,6 +3346,10 @@ test("#1339d: loop wiring — the verdict is re-validated against evidence acros
   // beside it, labelled. Both are clamped through the single reader.
   ok(src.includes("const decMarkerAgeMs = decision.markerAgeMs ?? -1;"), "the kill path exposes the decision's own marker age");
   ok(src.includes("decMarkerAgeMs=${decMarkerAgeMs}"), "the heartbeat-kill alive summary carries the decision-time age beside the live one (the #5389 pattern)");
+  ok(
+    src.includes("const decMarkerAgeInvalid = decision.markerAgeInvalid === true;") && src.includes("decMarkerAgeInvalid=${decMarkerAgeInvalid}"),
+    "the payload also carries the DECISION's invalid flag — `readMarkerAge` promises to report a clamped age, and a bare 0 cannot be told from a fresh marker (cycle-4 review)",
+  );
   ok(src.includes("no life signs for ${Math.round(decMarkerAgeMs / 1000)}s"), "the cut headline prints the DECISION's age — the post-await re-read is what rendered '-1s'");
   equal(src.split("hbCtx.state.lastMarkerAt > 0 ? Date.now() - hbCtx.state.lastMarkerAt").length - 1, 0, "no site computes the marker age by hand any more — every reader goes through `readMarkerAge`");
   equal(src.split("hbCtx.state.lastMarkerAt > 0 ? now - hbCtx.state.lastMarkerAt : -1").length - 1, 0, "…neither on the tick clock");

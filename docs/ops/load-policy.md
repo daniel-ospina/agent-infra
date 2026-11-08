@@ -211,8 +211,10 @@ unconditionally.
   timeout up to 9 s), and every `await` yields the event loop, which is exactly
   where the child's `data` handlers run. So the kill path re-validates before
   killing — if the fired clause's own premise changed after the snapshot, the
-  verdict is superseded and the kill is suppressed. Each clause is asked about
-  what IT reads (`supersedingEvidence`): `no-progress` is measured on
+  verdict is superseded and the kill is suppressed. `no-progress` is the one
+  clause whose clock is not a function of marker/byte arrival, so it — and only
+  it — is asked about what IT reads (`supersedingEvidence`): `no-progress` is
+  measured on
   `lastProgressAt`, which ticks and output bytes do NOT advance, so a marker
   inside the window cannot refute it — asking the marker/byte question there
   would restore the reset that clause exists to deny — and it is ALSO asked
@@ -220,7 +222,16 @@ unconditionally.
   stall clause may race a completed session) and a tool in flight (a DECLARED
   long operation, owned by the tool clauses), because both flip inside the
   window without moving any progress clock and the clause refuses to kill for
-  either. Every other reason is refuted by a marker or a real output byte. `max-dispatch` is exempt (a
+  either. Every other reason is refuted by a marker or a real output byte —
+  deliberately, because each of them is already gated on `stateFresh` or on
+  byte-arrival itself, so "a marker arrived" is never independent of what they
+  measure, and suppressing is the fail-safe direction (a live child is not
+  killed, and the clause re-decides on the next tick). Their decided quantities
+  are ages (`effStreamAge`, `effToolAge` = the child's frozen sample +
+  `markerAge`), which a fresh marker narrows rather than refutes, so a marker
+  landing inside EVERY probe window can delay such a clause past its bound; the
+  backstop there is `TASK_HARD_CAP_MS`. Comparing those ages against live values
+  is a known follow-up on #1339, not something this guard does. `max-dispatch` is exempt (a
   wall-clock policy cap, not an inference about progress).
   **The honest bound is not "one tick".** Suppression repeats for as long as
   the child keeps producing evidence newer than each tick's own snapshot, which
@@ -247,7 +258,10 @@ unconditionally.
   DECISION's own age as `decMarkerAgeMs=` beside the live `lastMarkerAgeMs=` —
   the same decision-vs-live split #5389 established for the CPU pair, because a
   marker can land in the awaited window and make a live-only read contradict the
-  headline it ships beside.
+  headline it ships beside. The flag `readMarkerAge()` returns is now reported,
+  not just promised: the payload carries `decMarkerAgeInvalid=`, because a
+  clamped `0` is otherwise indistinguishable from a marker that landed exactly
+  now — the same unreadability that hid the original bug.
 - **Cut-gap bound (#1070):** the marker-gap cut deadline is a SECOND consumer of
   the same scale function. `effCutGap = getEffectiveCutGapMs(latched, load1)` —
   the derived base (`1.25 ×` tick interval, floor `15_000`) scaled 1x/2x/3x, with
