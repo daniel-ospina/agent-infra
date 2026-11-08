@@ -6563,8 +6563,8 @@ if command -v gh >/dev/null 2>&1 && [ -n "$REPO" ]; then
     #     body READ failure does not imply a comment WRITE will fail. If that post
     #     verifiably succeeded, the marker IS visible to the required check (its
     #     comment arm) and this run is a success.
-    # Exit 5 is therefore named for the state that actually remains: the marker
-    # reached NEITHER channel, so CI cannot see the record.
+    # Exit 5 is therefore named for what THIS RUN delivered: the marker reached
+    # NEITHER channel. Whether an EARLIER run's copy already sits on one is NOT observable here.
     # ⛔ ONE PERSIST RESULT DECIDES EVERY SENTENCE BELOW THAT OFFERS THE FLUSH REMEDY
     # (#3168 review P2). The exit-0 message used to assert the marker "is also kept in
     # <pending file>" UNCONDITIONALLY — printed three lines after THIS site's own

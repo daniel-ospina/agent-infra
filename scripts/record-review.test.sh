@@ -5526,7 +5526,7 @@ assert_not_contains "$RECORD_ERR" "The marker is also kept in" \
 assert_contains "$RECORD_ERR" "THIS RUN PLACED NO BODY COPY ON ANY CHANNEL" \
     "14.1d(i) …naming the real, ATTEMPT-scoped state (this run's write did not land) instead of claiming the file is empty or that a flush would find nothing — both of which the deterministic marker falsifies"
 assert_not_contains "$RECORD_ERR" "THIS RUN'S BODY COPY IS ON NO CHANNEL" \
-    "14.1d(i) …and does NOT claim the body is empty: the body READ is exactly what failed, so its present contents are unobservable here"
+    "14.1d(i) …and the round-3 SPELLING is gone: 'BODY COPY IS ON NO CHANNEL' read as a claim about the body's CONTENTS, which this arm cannot observe, where 'PLACED NO BODY COPY' states only what THIS RUN did"
 # ⛔ THE ROUND-9 INVARIANT ON THE EXIT-0 CAPTURE TOO (#3712 review round 10, P2).
 # The two negatives below already existed, but both read the rc-5 capture ($PERSIST_PR2);
 # the rc-0 arm's own line carried round 3's falsified denial until round 10 ("would find NOTHING for the
@@ -5685,7 +5685,7 @@ mkdir -p "$PEND_CONF_DIR/pending"   # restore the real directory for later vecto
 # shape `marker_pending_write` uses — because keying on the 2nd would test the `.tmp` SOURCE,
 # which never ends in `.marker` and so never fires (measured: an earlier draft of this stub
 # matched nothing and the vector passed VACUOUSLY with counter 0). It is scoped to
-# `*/pending/*.marker`, so the recorder's other `mv` (:3501, into a mktemp path) is unaffected.
+# `*/pending/*.marker`, so the recorder's other `mv` (:3501, `command mv "$tmp" "$out"` — OUT of the mktemp) is unaffected.
 rm -f "$T/bin/mv"
 _MV_REAL="$(command -v mv)"
 _MV_COUNT="$T/mvcount-pending"
@@ -9131,11 +9131,17 @@ rm -f .gitattributes
 #      every ambient scan came back empty). The recorder's HOME here is the suite's FAKE home, which
 #      is exactly where a user-level attribute file lives.
 #    ⛔ `XDG_CONFIG_HOME=` ON THE VECTOR BELOW IS PART OF ITS PREMISE, NOT TIDINESS — the same
-#    measured class as M38. git reads that DEFAULT user-level attributes file only when this
-#    variable is UNSET; a runner exports it (`worker-terminal.test.sh:36`), so without the pin the
+#    measured class as M38. git resolves the DEFAULT user-level attributes file as
+#    `$XDG_CONFIG_HOME/git/attributes` when that variable holds a NON-EMPTY value, and falls back to
+#    `$HOME/.config/git/attributes` when it is unset OR EMPTY — which is why the pin is spelled
+#    `XDG_CONFIG_HOME=` (empty) and NOT `env -u XDG_CONFIG_HOME`: an empty value still falls back. A
+#    runner exports it (`worker-terminal.test.sh:36`), so with an inherited NON-EMPTY value the
 #    fixture is written where no git process looks and this vector silently degenerates into a
-#    duplicate of 20i3's plain-conflict case. The control on the next line has always pinned it;
-#    the vector did not.
+#    duplicate of 20i3's plain-conflict case. ⛔ `origin/main` ALSO pins it SUITE-WIDE —
+#    `export XDG_CONFIG_HOME="$F_HOME/.config"` (#3755), which this branch's older base predates —
+#    so this per-vector pin is belt-and-braces: it keeps the vector independent of that suite-level
+#    line rather than being the only thing carrying the fix. The control on the next line has always
+#    pinned it; the vector did not.
 mkdir -p "$F_HOME/.config/git"
 printf 'u.txt merge=union\n' > "$F_HOME/.config/git/attributes"
 _un_g=0
@@ -9751,15 +9757,22 @@ git config --unset merge.hidrv.driver 2>/dev/null || true
 #
 # ⛔ `XDG_CONFIG_HOME=` IS PART OF THIS CELL'S PREMISE, NOT TIDINESS (measured on a runner, #3712).
 #       git resolves the DEFAULT user-level attributes file as `$XDG_CONFIG_HOME/git/attributes`
-#       when that variable is set, and only falls back to `$HOME/.config/git/attributes` when it is
-#       not — so with an inherited value the fixture below is written somewhere git never reads,
-#       the mutant's raw `merge-tree` CONFLICTS again, and the cell refuses at 3 for a reason that
-#       has nothing to do with the guard it mutates: VACUOUS, reported against itself. The 20i6
-#       control above pins the same variable for exactly this reason; this cell must too. GitHub
-#       runners export `XDG_CONFIG_HOME=/home/runner/.config` (see
+#       when that variable holds a NON-EMPTY value, and falls back to `$HOME/.config/git/attributes`
+#       when it is unset OR EMPTY — which is why the pin is `XDG_CONFIG_HOME=` (empty) and NOT
+#       `env -u XDG_CONFIG_HOME`. With an inherited NON-EMPTY value the fixture below is written
+#       somewhere git never reads, the mutant's raw `merge-tree` CONFLICTS again, and the cell
+#       refuses at 3 for a reason that has nothing to do with the guard it mutates: VACUOUS,
+#       reported against itself. The 20i6 control above pins the same variable for exactly this
+#       reason; this cell must too. GitHub runners export
+#       `XDG_CONFIG_HOME=/home/runner/.config` (see
 #       `scripts/orchestrator-harness/worker-terminal.test.sh:36`), so an unpinned mutant is green
-#       on a dev box and red on CI — measured: `PASS=1453 FAIL=2`, with `20g M38` and the
-#       `MUTATION-MATRIX` rollup the two red rows and the assertion total unchanged at 1455.
+#       on a dev box and red on CI — measured on THIS branch's pre-#3755 base: `PASS=1453 FAIL=2`,
+#       with `20g M38` and the `MUTATION-MATRIX` rollup the two red rows, total unchanged at 1455.
+#       ⛔ THAT MEASUREMENT NO LONGER RE-DERIVES ON THE MERGED TREE, so do not quote it as current:
+#       `origin/main` pins the variable SUITE-WIDE (`export XDG_CONFIG_HOME="$F_HOME/.config"`,
+#       #3755), so after the merge this cell stays green even with this per-vector pin removed. The
+#       pin is kept as belt-and-braces — it makes the cell independent of that suite-level line —
+#       not as the thing carrying the fix.
 mkdir -p "$F_HOME/.config/git"
 printf 'u.txt merge=union\n' > "$F_HOME/.config/git/attributes"
 MUT="$(mk_mutant nonneutral '    want="$(delta_git_neutral "$root" merge-tree --write-tree "$p1" "$p2" 2>/dev/null)"' '    want="$(delta_git "$root" merge-tree --write-tree "$p1" "$p2" 2>/dev/null)"')"
