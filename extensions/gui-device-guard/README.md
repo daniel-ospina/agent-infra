@@ -48,6 +48,13 @@ human typing `open -a Safari` at their own prompt is not this bug.
 | `GUI_DEVICE_GUARD_ALLOW_MEDIA=1` | permit one deliberate real-device launch — still **recorded** |
 | `GUI_DEVICE_GUARD_DISABLED=1` | turn the guard off entirely (no ledger, no refusal) |
 
+The ledger is **append-only and not rotated**: one ~250-byte row per host GUI
+launch, written only by unattended runs. It is a diagnostic record, not an audit
+log — a lane that launches an app 100 times writes 100 rows, and nothing prunes
+them. That is a deliberate trade (a rotation scheme that deletes the row you need
+is worse than a file that grows by kilobytes), and it is stated here rather than
+discovered by whoever finds a large file.
+
 Reading the ledger — the lookup that was missing during the incident:
 
 ```bash
