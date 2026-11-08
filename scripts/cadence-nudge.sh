@@ -71,8 +71,11 @@ now=$(date +%s)
 # `gap=29852468m` (56 years) while still delivering. A check that computes a nonsense number and
 # proceeds anyway is the same shape as the gates this file exists to catch. Capture the digits with
 # an ANCHORED pattern that cannot match empty (`[0-9]\{1,\}` / `[0-9]+`), or not at all.
-# ⛔ THE DUE READ COUNTS EVERY ATTEMPT, NOT ONLY THE VERIFIED ONES — and the receipt it reads is
-# the SAME one this file writes. It used to require `delivered=yes`, which was correct only while
+# ⛔ THE DUE READ COUNTS EVERY ATTEMPT, NOT ONLY THE VERIFIED ONES — and the receipt it reads has the
+# same SHAPE this file writes, in the same log. (It is NOT written by this file alone:
+# `orchestrator-heartbeat.sh` writes the same shape beside it from a weaker predicate — see the note at
+# the send below. Counting those attempts is still what the floor wants: an attempt is an attempt.)
+# It used to require `delivered=yes`, which was correct only while
 # `delivered=yes` was written unconditionally (#1187): now that the field carries the checker's
 # verdict, requiring `yes` would make a run of unprovable verifications (`the orchestrator was
 # mid-turn, its transcript had not flushed`) look like NO nudge for a growing gap — so the floor
@@ -516,7 +519,18 @@ fi
 # certifies nothing is exactly the defect class this file's own delivery promise cannot afford.
 #
 # The verdict now comes from `scripts/lib/cmux_payload.py` (#1187, #1881) — the same checker the lane
-# dispatcher uses — so there is ONE definition of "delivered" in the fleet, not a second one here.
+# dispatcher (`orch-send.sh`) uses — so the floor and the dispatcher hold ONE definition of "delivered",
+# not two hand-rolled ones.
+#
+# ⛔ BUT THIS FILE IS NOT THE LOG'S ONLY PRODUCER, AND THE OTHER ONE IS NOT HONEST YET (measured, #3795
+# final review). `scripts/orchestrator-heartbeat.sh` writes `NUDGE at=… delivered=yes` into THE SAME LOG
+# (`:53`, same `$STATE/orchestrator-heartbeat.log`) from its OWN predicate: a grep of the WHOLE
+# transcript for the message's OPENING token (`:1435` `grep -q "HEARTBEAT ${TS}" "$of"`, where
+# `:67` sets `TS` and the message OPENS with `[HEARTBEAT ${TS}]`), with NO pre-send baseline. A heartbeat
+# truncated to its first sentence therefore still matches and still writes `delivered=yes` — the exact
+# prefix-passes defect #1187 measured. That is OUT OF SCOPE here (a separate caller, a separate change)
+# and is recorded on #1187 rather than silently implied to be fixed; do not read this file's receipt as
+# proof that every `delivered=yes` in the log was earned this way.
 #   VERIFIED      → delivered=yes          (tail appended to the pane's transcript after this send)
 #   PANE_ONLY     → delivered=NOT-SUBMITTED (on the surface, submission unproven)
 #   SUBMIT_FAILED → delivered=NOT-SUBMITTED (the terminating Enter failed)
