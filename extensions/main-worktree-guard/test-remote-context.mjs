@@ -1270,11 +1270,18 @@ if (typeof stripTypeScriptTypes !== "function" ||
       // exit 0 — the leg vanished and nothing named it, so the flag could hollow out the mutation
       // evidence with no red anywhere. These rows redden on that deletion, and on an EMPTIED
       // opt-out set (a mechanism with no exempted pin asserts nothing either).
+      // ⛔ AND THE FLAG IS BOUND TO THE MUTANT WHOSE FILTER IT PROTECTS (#3774 review round 2, P2).
+      // A COUNT is not a binding: measured, MOVING `optOutInvariant: true` one mutant down (onto
+      // "over-reach") left the suite at 345 passed / 0 failed, exit 0, while B4 stayed filtered
+      // out of the PRE-FIX mutant's `expectRed` — so the pin was re-checked only under a mutant it
+      // is trivially invariant under, never under the one the exemption claims it cannot
+      // discriminate. The row named "so the exemption leg RUNS" printed ✅ over exactly that hole.
+      const PRE_FIX_LABEL = "pre-fix (no remote boundary)";
       const optOutMutants = MUTANTS.filter((m) => m.optOutInvariant === true);
       const optedOut = PINNED.filter((x) => x.preFixDiscriminating === false);
-      expectTrue("M: exactly one mutant declares optOutInvariant, so the exemption leg RUNS",
-        optOutMutants.length === 1,
-        `${optOutMutants.length} mutants declare it — the leg below runs only when exactly one does`);
+      expectTrue("M: exactly one mutant declares optOutInvariant, AND it is the pre-fix mutant whose expectRed the exemption filters",
+        optOutMutants.length === 1 && optOutMutants[0].label === PRE_FIX_LABEL,
+        `${optOutMutants.length} mutant(s) declare it (${optOutMutants.map((m) => m.label).join("; ") || "none"}) — anywhere else, the pre-fix exemption is verified NOWHERE`);
       expectTrue("M: at least one pin is exempted, so the optOutInvariant leg asserts a real claim",
         optedOut.length > 0,
         "no pin carries `preFixDiscriminating: false` — the leg would assert nothing");
@@ -1293,6 +1300,12 @@ if (typeof stripTypeScriptTypes !== "function" ||
         expectTrue(`M0: the pin ${p.id} is GREEN on the unmutated module`, green,
           `unexpectedly ${blocked(r) ? "BLOCKED" : "allowed"}: ${reasonOf(r).split("\n")[0]}`);
       }
+
+      // Execution FLOOR for the invariance leg: a DECLARED flag is satisfied by a neutralised
+      // consumer. Measured: `if (mut.optOutInvariant) {` → `if (false) {` (`:1328`) gives 344
+      // passed / 0 failed, exit 0 — every row above still passes, the leg is simply gone. The
+      // count below is the difference between "the flag exists" and "the assertion ran".
+      let optOutLegRan = 0;
 
       for (const mut of MUTANTS) {
         const built = buildMutant(mut.label.replace(/[^a-z0-9]+/gi, "-"), mut.revert);
@@ -1329,6 +1342,7 @@ if (typeof stripTypeScriptTypes !== "function" ||
             for (const p of PINNED.filter((x) => x.preFixDiscriminating === false)) {
               const underMutant = await g.bash(mut.probe(p));
               const live = await real.bash(mut.probe(p));
+              optOutLegRan++;
               expectTrue(`M: ${p.id} is exempted as non-discriminating, and it IS invariant under ${mut.label}`,
                 blocked(underMutant) === blocked(live),
                 `it FLIPPED (pre-fix ${blocked(underMutant) ? "BLOCKED" : "allowed"}, live ${blocked(live) ? "BLOCKED" : "allowed"}) — this pin IS discriminating and must not be exempted`);
@@ -1338,6 +1352,9 @@ if (typeof stripTypeScriptTypes !== "function" ||
           rmSync(built.root, { recursive: true, force: true });
         }
       }
+      expectTrue("M: the opt-out invariance leg RE-RAN every exempted pin (an executed floor, not a declared flag)",
+        optOutLegRan === optedOut.length && optOutLegRan > 0,
+        `the leg re-ran ${optOutLegRan} of ${optedOut.length} exempted pin(s) — a neutralised consumer leaves every row above green`);
     }
   } finally {
     for (const [k, v] of savedEnv) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
