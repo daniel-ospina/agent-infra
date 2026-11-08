@@ -1588,6 +1588,56 @@ assert_contains "$(cat "$T/t24r/state/harness-apply.status" 2>/dev/null || true)
     "T24 control: while still carrying the instrument's row count"
 assert_contains "$OUT" "named NOWHERE durable" \
     "T24 control: and the journal says the elided rows are named nowhere, rather than implying they are on disk"
+# ⛔ AND THE CUT ARM OWNS THE ELIDED STATE ALONE (VGATE round 30, measured: widening the non-elided
+# sentence's gate from `-le 12` to any row count left the suite green, and the journal then printed
+# "the 15 row(s) above are in this run's output only" over the 12 rows it had printed — a false count
+# contradicted by the very next line — plus the failure stated twice). Each row pins ONE thing, measured
+# separately: dropping `&& [ "$FARM_NROWS" -le 12 ]` from that gate reds the FIRST row only (the extra
+# sentence does not match the `^farm:   file-` prefix, so the count below still reads 12), and the count
+# row is what pins the 12-line excerpt BOUND on the blocked path — the writable path's bound is t24q's.
+assert_absent "$OUT" "row(s) above are in this run's output only" \
+    "T24 control: and the non-elided sentence never fires on a >12-row run — the cut sentence owns this state"
+assert_eq "$(printf '%s\n' "$OUT" | grep -c '^farm:   file-' | tr -d ' ')" "12" \
+    "T24 control: with the excerpt printing exactly 12 rows, so no sentence can claim more were shown"
+# ⛔ A COMPLETE EXTRACTION IS NOT EXEMPT FROM THE DURABILITY SENTENCE (review round 30, measured: the
+# sentence lived only inside `if [ "$FARM_NROWS" -gt 12 ]`, so three stale files with the artifact path
+# blocked printed the rows and the remedy and NOTHING about durability — while the doc promised the
+# journal says in as many words that the names are durable nowhere, and a stale artifact from an earlier
+# pass stays at that fixed path with its own `n=3 (EXACTLY this run)` header). Mutant that reds these
+# rows: delete the `elif [ "$FARM_ROWS_OK" != 1 ]` branch.
+mk_origin t24bf; mk_clone t24bf
+REPO_P="$CLONE"; MODE_P=sync
+mkdir -p "$T/t24bf/home/.pi/agent/scripts" "$T/t24bf/state/harness-apply-farm-rows.txt"
+printf 'stale artifact from an EARLIER pass\n' >"$T/t24bf/state/harness-apply-farm-rows.txt/placeholder.txt"
+cat >"$T/t24bf/three-stale.sh" <<'FARM'
+#!/usr/bin/env bash
+printf '%-46s | %-12s | %-12s | %s\n' 'file' 'deployed' 'source' 'verdict' >&2
+i=1
+while [ "$i" -le 3 ]; do
+    printf '%-46s | %-12s | %-12s | %s\n' "stale-$i.py" aaaa11112222 bbbb33334444 STALE >&2
+    i=$((i + 1))
+done
+printf 'check-farm-drift: DRIFT — 3 stale (3 farm-declared — a re-run must fix these; 0 outside the farm), 0 declared-but-absent, 0 unsourced, of 3 deployed file(s) (3 sourced, 0 matching) against origin/main (sync).\n' >&2
+printf '   Next: re-run the farm from a ref-consistent checkout, then re-run this check.\n'
+exit 1
+FARM
+chmod +x "$T/t24bf/three-stale.sh"
+OUT="$(HARNESS_APPLY_FARM_CHECKER="$T/t24bf/three-stale.sh" run_pass "$T/t24bf" 2>&1)"; RC=$?
+assert_eq "$RC" "24" "T24 control: a complete 3-row extraction with an unwritable artifact is still RED (24)"
+# ⛔ ANCHORED ON THE JOURNAL'S OWN PHRASE (VGATE round 30, measured: `the full list could not be
+# persisted` also appears in the record's `detail=`, which reaches `$OUT`, so that row stayed green with
+# the whole branch deleted — the `(unwritable) — the` form is the journal's).
+assert_contains "$OUT" "could not be persisted (unwritable) — the" \
+    "T24 control: and the journal says the full list was not persisted, even though nothing was elided"
+assert_contains "$OUT" "in this run's output only" \
+    "T24 control: and that the rows above survive only in this run's output"
+assert_contains "$OUT" "a stale artifact may still sit at that path" \
+    "T24 control: and warns that an earlier pass's artifact is still at that path, so it is not read as this run's"
+assert_contains "$(grep '^farm_rows=' "$T/t24bf/state/harness-apply.status" 2>/dev/null || true)" "farm_rows=unwritable" \
+    "T24 control: while the record says unwritable"
+assert_contains "$(grep '^farm_n=' "$T/t24bf/state/harness-apply.status" 2>/dev/null || true)" "farm_n=3" \
+    "T24 control: and keeps the instrument's count, so the number is not lost with the file"
+
 # ⛔ AND THE TEMP NEVER LANDS *INSIDE* THAT DIRECTORY (round-1 review issue 3 — its uncovered mutant).
 # With only the trailing `[ -f ]`, `mv src dir` MOVES the temp into the directory (rc 0) and `[ -f dir ]`
 # then refuses it — so every row above stays green while the pass litters the operator's state dir with

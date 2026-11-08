@@ -293,7 +293,13 @@ could be found" answer — neither is ever executed, and neither is reported as 
 `farm_rows=unwritable` means the rows write failed **while the record write still succeeded**. On the
 DRIFT arms the drift is still red, `farm_n` still carries the count it had (or `unparsed` when the
 extraction was **not proven complete** — a partial match counts here too, not only a total miss), and
-the journal says in as many words that the rows past the 12-line excerpt are named nowhere durable. On
+the journal says in as many words that the rows are named nowhere durable: with more than 12 rows it
+names the cut only (`rows 13..N are named NOWHERE durable`), and with 12 or fewer — where the whole list
+was in the excerpt and nothing would otherwise be said — it says the full list could not be persisted and
+that the rows above are in this run's output only (a COMPLETE extraction is not exempt: the state that
+matters is the failed write, not the elision), plus that a stale artifact from an earlier pass may still
+sit at that path. The two states are exclusive: the `N>12` arm owns the cut, the `N<=12` arm owns the
+silence, so the journal never prints both and never counts rows it did not print. On
 the `farm-unknown` arm (any of the three producers — an instrument that gave up with its own exit 2, an
 `rc=0` that contradicts its report, or an `rc=0` that printed no verdict line) the field alone carries it: `farm_n=not-graded`, and the journal prints
 only its UNKNOWN line — a checker that printed rows before giving up had them captured, but nothing was
@@ -491,7 +497,7 @@ checkout can use the documented hatch. The same interaction is recorded for
 
 ## Tests
 
-`scripts/harness-apply-timer.test.sh` — 540 assertions, run by the
+`scripts/harness-apply-timer.test.sh` — 548 assertions, run by the
 `harness-apply-timer` shard of `run-bash-shards.sh`:
 
 | | |

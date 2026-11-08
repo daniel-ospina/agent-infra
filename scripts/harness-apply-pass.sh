@@ -458,9 +458,13 @@ publish_farm_rows() {   # $1 body, $2 header note → sets REC_FARM_ROWS, FARM_R
     # would record a path that holds no list. The `[ ! -d ]` pre-check refuses that state UP FRONT
     # (replacing it with `[ -n … ]` strands the temp inside the directory and reds T24r); the trailing
     # `[ -f ]` is DEFENCE IN DEPTH for the concurrent case and is stated as such (#3442).
-    # ⛔ AND IT IS UNPINNED BY CONSTRUCTION — this file's second DECLARED inert-defence site (the first
-    # is `$FARM_DEST_REAL`/`$HERE_REAL` on the `CDPATH=` legs, `:167-171`). Measured (review round 25):
-    # deleting `&& [ -f "$FARM_ROWS_FILE" ]` leaves the suite green. That is not an oversight — the only
+    # ⛔ AND IT IS UNPINNED BY CONSTRUCTION — one of this file's DECLARED inert-defence sites. The
+    # others, each measured to leave the suite green when deleted (review rounds 25 and 30):
+    #   * the `CDPATH=` on the `$FARM_DEST_REAL`/`$HERE_REAL` legs (`:167-171`),
+    #   * `[ -n "$HERE_REAL" ] &&` in the self-grade comparison (`:1490`),
+    #   * `[ -n "$FARM_DEST_REAL" ] &&` in the inside-the-farm containment test (`:1496`) — searched
+    #     for by the round-30 reviewer precisely because this list did not name it.
+    # Measured (review round 25): deleting `&& [ -f "$FARM_ROWS_FILE" ]` leaves the suite green. That is not an oversight — the only
     # state it can catch is a race (something replacing the published path with a directory between the
     # `rename` and this test), and a fixture cannot produce that race deterministically without stubbing
     # `mv`. It is kept because it is cheap and it is the one post-condition that cannot be forged, and it
@@ -1799,6 +1803,21 @@ if [ "$FARM_CHECK_ON" = "1" ]; then
                     else
                         log_line "farm:   the extraction was NOT PROVEN complete, and the RAW output could not be persisted ($REC_FARM_ROWS) — only the line(s) excerpted above are in this run's output, and any past the 12-line excerpt are named nowhere"
                     fi
+                elif [ "$FARM_ROWS_OK" != 1 ] && [ "$FARM_NROWS" -gt 0 ] && [ "$FARM_NROWS" -le 12 ]; then
+                    # ⛔ A FAILED PUBLISH IS NOT ONLY AN ELISION PROBLEM (review round 30, measured). The
+                    # durability sentence lived inside `if [ "$FARM_NROWS" -gt 12 ]`, so a COMPLETE
+                    # extraction of 3 rows with the artifact path blocked said nothing at all about
+                    # durability: the journal printed the rows, the remedy, and stopped — while the doc
+                    # promises the journal says in as many words that those names are durable nowhere,
+                    # and a reader who trusts it opens whatever an EARLIER pass left at the fixed path
+                    # (whose header is the previous run's, reading `n=3 (EXACTLY this run)`). The record
+                    # was right; the log was the surface that lied.
+                    # ⛔ AND IT OWNS ONLY THE NON-ELIDED STATE (VGATE round 30, measured): with more than
+                    # 12 rows the excerpt holds 12 and the `-gt 12` arm below says "rows 13..N are named
+                    # NOWHERE durable", so firing here too printed "the 15 row(s) above" over 12 printed
+                    # rows AND said the failure twice. The cut arm owns that state; this one owns the
+                    # state that has no other sentence.
+                    log_line "farm:   the full list could not be persisted ($REC_FARM_ROWS) — the $FARM_NROWS row(s) above are in this run's output only, and a stale artifact may still sit at that path"
                 fi
                 if [ "$FARM_NROWS" -gt 12 ]; then
                     # The count is NOT the answer (tortoise#10114 arm 2): the other rows are named, and
