@@ -56,11 +56,13 @@ pass=0; fail=0
 # success assertion KIND in this file, and #3760 DELETED them while nothing reddened: the file ends at
 # `[ "$fail" -eq 0 ]` and `run-bash-shards.sh` discovers by glob and reads only the exit code, so no count
 # pinned them. Restored lines are, on their own, exactly as deletable as they were the first time.
-# So the floor at the bottom checks them against TWO INDEPENDENT derivations from this file — an EXECUTED
-# count and a SOURCE binding — each compared with the number of arms that invoke `cell_start`. Deliberately
-# the same shape as the guard suite's `optOutLegRan` floor (`test-remote-context.mjs`): a DECLARED line is
-# satisfied by a neutralised consumer; an EXECUTED count is not. Precedent outside this repo: Jest's
-# `expect.assertions(n)` / `hasAssertions()`, whose counter is bumped by `expect()` itself.
+# So the floor at the bottom checks them against THREE INDEPENDENT derivations from this file — what each arm
+# CAPTURES, what the suite EXECUTED, and how each assertion BINDS its argument — plus one BEHAVIOURAL row that
+# proves the captured value is a real exit status and not a pinned constant. Each is compared with the number
+# of arms that invoke `cell_start`. Deliberately the same shape as the guard suite's `optOutLegRan` floor
+# (`test-remote-context.mjs`): a DECLARED line is satisfied by a neutralised consumer; an EXECUTED count is
+# not. Precedent outside this repo: Jest's `expect.assertions(n)` / `hasAssertions()`, whose counter is bumped
+# by `expect()` itself.
 # ⛔ THE COUNTER IS BUMPED BY THE ASSERTION PRIMITIVE, NOT BY A WRAPPER (#3774 review, P2 — measured). Jest's
 # counter is bumped by `expect()` itself, and that detail is the whole guard: a wrapper that bumps on entry
 # counts WRAPPER INVOCATIONS, so emptying the helper's body (one line) left `117 passed, 0 failed`, exit 0 —
@@ -68,9 +70,11 @@ pass=0; fail=0
 # the label kind, so the datum exists only when the assertion really ran. There is deliberately NO wrapper
 # function here: an indirection whose only job is to forward two arguments is the neutralisable consumer.
 # ⛔ AND A COUNT OF LABELS IS NOT A BINDING (#3774 review round 2, P1 — measured). With only the executed
-# count, `ck "…SUCCEEDED…" 0` graded every arm against the constant 0 and the suite stayed `120 passed, 0
-# failed`, exit 0 — the assertion present, the verdict gone. So the floor ALSO derives, from this file's
-# source, how many positive assertions bind `"$start_rc"`, and requires the two counts to agree.
+# count, `ck "…SUCCEEDED…" 0` graded every arm against the constant 0 and the suite stayed GREEN, exit 0
+# (`120 passed, 0 failed` at the head that measured it) — the assertion present, the verdict gone. So the
+# floor ALSO derives, from this file's source, how many positive assertions bind `"$start_rc"`, and requires
+# the counts to agree. There is no fixed number of greps below; each was added against a MEASURED edit that
+# slipped past the ones before it, and none was added speculatively.
 start_rc_asserted=0
 ck() { # ck <name> <0|1>
   case "$1" in *SUCCEEDED*) start_rc_asserted=$((start_rc_asserted + 1)) ;; esac
@@ -233,8 +237,8 @@ env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
 # `new-session)` case; this block's own rule is never to cite a line number) and never runs it, and service mode
 # (`cloud-cell-supervisor.sh` — the `exec bash "$HARNESS/orch-loop.sh"` arm) is not taken, so no loop can
 # hang. Measured on this fixture with the helper seeded: `start_rc=0` in ALL THREE arms and `118 passed /
-# 0 failed` either way IN THE FILE AS IT STOOD THEN — `120 passed / 0 failed` at this head, which adds the
-# executed floor's two rows and changes no arm's result.
+# 0 failed` either way IN THE FILE AS IT STOOD THEN — `121 passed / 0 failed` at this head, which adds the
+# executed floor's two rows, the behavioural non-zero row, and changes no arm's result.
 # ⛔ AND HERE IS THE REASON, IN ONE CLAUSE — because the paragraph above only REFUTES the old one and then
 # stops, which leaves a reader told that a justification exists and unable to find it (#3774 review, P2;
 # and “a premise stated without its reason” is precisely how the three deleted assertions happened):
@@ -242,7 +246,7 @@ env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
 # import the classifier, and that loop is never entered — the same two facts as above (the tmux stub does
 # not RUN what it records, and service mode is not taken). So the seeding question is FIXTURE WEIGHT, not
 # pass/fail: a seeded helper would be a file no assertion in this suite ever touches. Measured again at this
-# head, seeding is also harmless (`120 passed / 0 failed` seeded, `120 passed / 0 failed` unseeded), so this
+# head, seeding is also harmless (`121 passed / 0 failed` seeded, `121 passed / 0 failed` unseeded), so this
 # is a stated trade and not a premise the next cycle has to re-derive.
 # ⛔ SERVICE MODE IS PINNED OFF, NOT MERELY ABSENT (review P1 on #3774, measured). The sentence above used
 # to claim `ORCH_FOREGROUND` "is never set" — that was WRONG, and it mattered: the fixture does not set it
@@ -462,14 +466,23 @@ ck "the re-provisioned cell is then certified" $rc
 # 6) …and when there is nothing to provision FROM, `start` refuses rather than creating a cell that
 # can never merge. Non-vacuity: the same invocation WITHOUT the missing source succeeds above.
 rm -f "$RECORDER" "$CELL/record-review.sh" "$CELL/tmstate/up" "$CELL/tmstate/cmd"
-# start-arm: negative — this arm asserts the REFUSAL (`rc≠0`), so it carries no SUCCEEDED verdict. The
-# executed floor counts it from this marker; an arm with NEITHER this marker NOR a positive assertion
-# reddens that floor, which is how a new §6-shaped arm cannot land ungraded (`#3774 review round 2, P2`).
-out="$(cell_start)"; rc=$?
+# `start_rc` is captured HERE TOO, and the exemption marker sits on the SAME LINE as the call site it
+# exempts (#3774 review round 3, P2). A marker anywhere in the file would subtract from the arm count
+# without being bound to the arm it claims, so one stale marker left above a POSITIVE arm un-grades it
+# (measured: 119 passed, 0 failed, exit 0, with a positive arm carrying no whole-start verdict).
+unset start_rc
+out="$(cell_start)"; rc=$?; start_rc="$rc"     # start-arm: negative — this arm asserts the REFUSAL, not a success
 [ "$rc" -ne 0 ] && [ ! -f "$CELL/tmstate/cmd" ] && rc=0 || { rc=1; note "rc=$rc session=$([ -f "$CELL/tmstate/cmd" ] && echo created || echo none)"; }
 ck "start refuses (and creates no session) when the recorder cannot be provisioned" $rc
 case "$out" in *'cannot provision it from'*) rc=0 ;; *) rc=1; note "$(printf '%s' "$out" | tail -3)";; esac
 ck "the refusal names the provisioning failure" $rc
+# ⛔ THE BEHAVIOURAL HALF (#3774 review round 3, P2). The static binding grep proves the three success rows
+# NAME `"$start_rc"`; it cannot prove `start_rc` HOLDS a real rc. Measured: rewriting `start_rc="$rc"` to
+# `start_rc=0` (every argument left byte-identical) gave GREEN, exit 0, with all three
+# success rows grading a constant — the round-1 P1 defect reached from the ASSIGNMENT instead of the
+# argument. This row is the counter-price: it runs in the one arm where `start` MUST fail, and reads the
+# same captured `start_rc` the success rows read, so a pinned value cannot satisfy both.
+ck "the REFUSING start's rc is NON-ZERO (so a pinned start_rc cannot pass the success rows)" "$([ "$start_rc" -ne 0 ] && echo 0 || echo 1)"
 
 # ══ the merge worker: a record failure is TERMINAL, and it will not re-pay ══════════════════════
 HEAD="0123456789abcdef0123456789abcdef01234567"
@@ -1107,9 +1120,9 @@ ck "no controller park site writes parked-\$PR without its reason" $rc
 # #3760 deleted these three assertions and NOTHING reddened, and the restored lines are on their own
 # exactly as deletable — measured BEFORE this floor existed, neutralising only the three
 # `ck "…SUCCEEDED…" "$start_rc"` calls returned `115 passed, 0 failed`, exit 0, the identical #3760 state.
-# With the floor, that same edit reddens one row: `116 passed, 1 failed`, exit 1. So the expectation is
-# DERIVED from this file, not declared as a figure, and it is derived TWICE because one derivation cannot
-# cover both failure modes (both measured, below):
+# With the floor, that same edit reddens one row: `117 passed, 1 failed`, exit 1. So the expectation is
+# DERIVED from this file, not declared as a figure, and it is derived THREE ways plus one behavioural row,
+# because no single derivation covers both failure modes (every figure below MEASURED on this head):
 #   1. EXPECTED, from the CALL SITES. Every `cell_start` invocation is either a POSITIVE arm (captures
 #      `start_rc` and asserts it SUCCEEDED) or a declared NEGATIVE arm (the `# start-arm: negative` marker,
 #      §6). Derived from the call sites and NOT from the `unset start_rc` idiom (#3774 review round 2, P2):
@@ -1118,22 +1131,39 @@ ck "no controller park site writes parked-\$PR without its reason" $rc
 #   2. EXECUTED + BOUND. The first half is the counter `ck` bumps, which proves the assertion RAN. The second
 #      is a SOURCE grep for assertions that grade `"$start_rc"`, which proves the verdict was not replaced
 #      by a constant — `ck "…SUCCEEDED…" 0` still executes and still counts, so the counter alone cannot see
-#      it (#3774 review round 2, P1: that edit left `120 passed, 0 failed`, exit 0).
+#      it (#3774 review round 2, P1).
+#      The BEHAVIOURAL row — `the REFUSING start's rc is NON-ZERO`, in §6 where `start` MUST fail — closes the
+#      one thing no grep can see: a pinned ASSIGNMENT. A grep sees the argument's spelling; the counter sees
+#      the call; neither sees `start_rc=0` replacing `start_rc="$rc"`. Reading the same captured value in the
+#      one arm that must produce non-zero makes a pin unsatisfiable in both directions at once.
+#   3. CAPTURED. A third source grep requires every `cell_start` call site to capture `start_rc="$rc"`
+#      (`#3774 review round 3, P2`). Without it, pinning ONE arm's capture to `start_rc=0` — arguments and
+#      labels untouched — still graded a constant (measured: `121 passed, 0 failed`: the behavioural row
+#      read §6's OWN capture, which the per-arm pin did not touch).
+#   4. THE MARKER IS BOUND TO ITS SITE. `# start-arm: negative` must sit on the SAME LINE as the call site it
+#      exempts (`#3774 review round 3, P2`). As a file-wide count it subtracted from the expectation without
+#      being tied to any arm, so one stale marker above a POSITIVE arm un-graded it (measured: `119 passed, 0
+#      failed`, exit 0, with a positive arm carrying no whole-start verdict).
 # Derived rather than hard-coded on purpose: this file's labelling rule already records that a stated COUNT
 # re-stales, and a hard-coded 3 would have to be bumped by hand on the next arm. Adding an arm moves the
 # call-site side; adding it WITHOUT an assertion (or with a constant) moves nothing else, which is the point.
-# The `^[[:space:]]*out=` anchor keeps prose that merely MENTIONS the call out of the count.
-start_sites="$(grep -cE '^[[:space:]]*out="\$\(cell_start\)"' "$SELF" 2>/dev/null || true)"
-start_neg="$(grep -cE '^[[:space:]]*# start-arm: negative' "$SELF" 2>/dev/null || true)"
+# The `^[[:space:]]*[^#]*` prefix keeps prose that merely MENTIONS the call out of the count, while still
+# matching a call in ANY statement position (`out=$(...)`, `if out=$(...)`, ...): the earlier
+# `^[[:space:]]*out=` form counted a TEXTUAL shape, so an arm written `if out="$(cell_start)"; then` landed
+# ungraded and green (#3774 review round 3, P2, measured: `121 passed, 0 failed`).
+start_sites="$(grep -cE '^[[:space:]]*[^#]*\$\(cell_start\)' "$SELF" 2>/dev/null || true)"
+start_neg="$(grep -cE '\$\(cell_start\).*# start-arm: negative' "$SELF" 2>/dev/null || true)"
 case "$start_sites" in ''|*[!0-9]*) start_sites=-1 ;; esac
 case "$start_neg" in ''|*[!0-9]*) start_neg=-1 ;; esac
 start_arms=$((start_sites - start_neg))
 [ "$start_sites" -gt 0 ] && [ "$start_arms" -gt 0 ] && rc=0 || { rc=1; note "could not read the arm count from $SELF (got '$start_sites' cell_start call site(s), '$start_neg' declared negative) — an unverifiable floor FAILS CLOSED, it is not a pass"; }
 ck "the executed floor's expected count is readable ($start_arms positive arm(s), $start_neg negative, of $start_sites cell_start call site(s))" $rc
-start_bound="$(grep -cE '^[[:space:]]*ck ".*SUCCEEDED.*" "\$start_rc"[[:space:]]*$' "$SELF" 2>/dev/null || true)"
+start_bound="$(grep -cE '^[[:space:]]*ck ".*SUCCEEDED.*" "\$start_rc"[[:space:]]*(#.*)?$' "$SELF" 2>/dev/null || true)"
 case "$start_bound" in ''|*[!0-9]*) start_bound=-1 ;; esac
-[ "$start_bound" -eq "$start_arms" ] && [ "$start_rc_asserted" -eq "$start_arms" ] && rc=0 || { rc=1; note "$start_rc_asserted whole-start assertion(s) RAN and $start_bound BIND \$start_rc, for $start_arms positive arm(s) — a deleted assertion, a CONSTANT argument (the label still counts), or an arm added without one, leaves this row red"; }
-ck "every arm's whole-start verdict is ASSERTED (executed) AND BOUND (graded from \$start_rc, not a constant)" $rc
+start_capture="$(grep -cE '^[[:space:]]*[^#]*start_rc="\$rc"' "$SELF" 2>/dev/null || true)"
+case "$start_capture" in ''|*[!0-9]*) start_capture=-1 ;; esac
+[ "$start_bound" -eq "$start_arms" ] && [ "$start_rc_asserted" -eq "$start_arms" ] && [ "$start_capture" -eq "$start_sites" ] && rc=0 || { rc=1; note "$start_rc_asserted whole-start assertion(s) RAN, $start_bound BIND \$start_rc, $start_capture of $start_sites call site(s) CAPTURE start_rc=\$rc, for $start_arms positive arm(s) — a deleted assertion, a CONSTANT argument (the label still counts), a CONSTANT capture (the argument and label still match), or an arm added without one, leaves this row red"; }
+ck "every arm's whole-start verdict is CAPTURED (from rc), ASSERTED (executed) AND BOUND (graded from \$start_rc, not a constant)" $rc
 
 echo
 echo "==> $pass passed, $fail failed"
