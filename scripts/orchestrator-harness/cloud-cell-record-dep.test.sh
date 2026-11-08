@@ -204,10 +204,21 @@ env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
 # This block used to say that seeding `check-class.py` "turns the pre-flight into a REAL controller cycle
 # that never returns (measured: a 240 s timeout)", and on that premise three passing assertions were
 # deleted so that `start`'s rc was "reported, never asserted". The premise does NOT reproduce: the fixture's
-# tmux stub only RECORDS `new-session`'s argv (`:110-118`) and never runs it, `ORCH_FOREGROUND` is never
-# set, so service mode (`cloud-cell-supervisor.sh` — the `exec bash "$HARNESS/orch-loop.sh"` arm) is never
-# taken and no loop can hang. Measured on this fixture with the helper seeded: `start_rc=0` in ALL THREE
-# arms and 115 passed / 0 failed either way.
+# tmux stub only RECORDS `new-session`'s argv (`:110-118`) and never runs it, and service mode
+# (`cloud-cell-supervisor.sh` — the `exec bash "$HARNESS/orch-loop.sh"` arm) is not taken, so no loop can
+# hang. Measured on this fixture with the helper seeded: `start_rc=0` in ALL THREE arms and 118 passed /
+# 0 failed either way.
+# ⛔ SERVICE MODE IS PINNED OFF, NOT MERELY ABSENT (review P1 on #3774, measured). The sentence above used
+# to claim `ORCH_FOREGROUND` "is never set" — that was WRONG, and it mattered: the fixture does not set it
+# but did not NEUTRALISE it either, so it was INHERITED, and on a fleet cell it IS `1`
+# (`templates/systemd/eldato-orchestrator.service:62` `Environment=ORCH_FOREGROUND=1`, inherited by every
+# lane shell through the tmux server — `scripts/cloud-cell-quiesce.sh:279`). Under the inherited value the
+# foreground arm is taken, `orch-loop.sh` exits 78, and these very assertions go RED with `start_rc=78`
+# (measured: 115 passed / 3 failed here, against 115/0 for the pre-#3760 file) — i.e. the box would decide
+# the result, which is the same class this file already neutralises for `GH_REPO` at `:41`.
+# So `cell_start` now PINS `ORCH_FOREGROUND=0`, the idiom every other `start` caller already uses for exactly
+# this reason (`watchdog-loop.sh:1046`, `orchestrator-bringup.sh:1037`, `cloud-cell-quiesce.sh:286`, #2402),
+# and an inherited `=1` cannot ride in.
 # So the rc is ASSERTED again. It is the only whole-`start` success assertion in this suite, and without it
 # a `start` that provisions the recorder and then `die`s (a failing `cmd_check` after the seed, a failing
 # `start_doctor_loop`) passes every arm here — a regression this suite exists to catch, hiding behind a
@@ -237,7 +248,7 @@ cell_check() { # cell_check — drive the SHIPPED `check` under the fixture's st
 }
 cell_start() { # cell_start — drive the SHIPPED `start` with a tmux stub that records the session
   mkdir -p "$CELL/tmstate"
-  env -u AI_REVIEW_GATE_KEY SCOPE=own \
+  env -u AI_REVIEW_GATE_KEY SCOPE=own ORCH_FOREGROUND=0 \
     PATH="$CELL_STUBS" TM_STATE="$CELL/tmstate" HOME="$CELL_HOME" CELL_HOME="$CELL_HOME" \
     REPO="$CELL_REPO" O="$CELL_O" HARNESS="$CELL_HARNESS" OR="acme/widget" \
     ENV_FILE="$CELL/absent.env" \
@@ -349,7 +360,7 @@ out="$(cell_start)"; rc=$?
 start_rc="$rc"          # the controller launch's own verdict; asserted at the end of this arm (above)
 [ -x "$RECORDER" ] && rc=0 || { rc=1; note "recorder=$([ -x "$RECORDER" ] && echo present || echo absent) start_rc=$start_rc out=$(printf '%s' "$out" | tail -3)"; }
 ck "start provisions record-review.sh from the checkout (start_rc=$start_rc)" $rc
-ck "start itself SUCCEEDED (the controller launch is not this suite's subject, but its exit status is the whole-start verdict)" "$start_rc"
+ck "start itself SUCCEEDED (the controller launch is not this suite's subject, but its exit status is the whole-start verdict; start_rc=$start_rc)" "$start_rc"
 [ -s "$RECORDER_LIB" ] && rc=0 || { rc=1; note "normalizer=$([ -s "$RECORDER_LIB" ] && echo present || echo absent) out=$(printf '%s' "$out" | tail -3)"; }
 ck "RED→GREEN: start provisions the recorder's SIBLING diff-normalize.py in lib/" $rc
 [ -f "$CELL/tmstate/cmd" ] && rc=0 || rc=1
