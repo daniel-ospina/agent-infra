@@ -1229,16 +1229,18 @@ reading.**
   core** — the resolution at which a per-thread share is more than a handful of
   ticks — the main thread carried **0.610–0.876** of the process ΔCPU and the
   `V8Worker` pool **0.095–0.400**; within every row those two shares plus the
-  remaining threads land within **0.015** of 1 (0.936–1.015 across all four
-  windows). **An earlier revision of this bullet quoted 0.61–1.00 beside a single
-  0.41 `V8Worker` maximum and read the pair as a contradiction. That was an
-  artifact of the quoting, not a finding:** 1.00 came from samples at 0.0–0.1% of a
-  core, where a process's whole ΔCPU is one thread and the split is meaningless,
-  while 0.41 came from a *different* sample — so the pair described no single
-  population and the "0.61 + 0.41 > 1" impossibility dissolved once both ends were
-  read over one set. What remains is an overshoot of **at most 0.015**, which is
-  the process-level total (`/proc/<pid>/stat`) and the per-thread counters
-  (`/proc/<pid>/task/<tid>/stat`) being read a moment apart. The load-bearing
+  remaining threads land **between 0.936 and 1.015** — a residual of **−0.064 to
+  +0.015** against 1 across all four windows. **An earlier revision of this bullet
+  quoted 0.61–1.00 beside a single 0.41 `V8Worker` maximum and read the pair as a
+  contradiction. That was an artifact of the quoting, not a finding:** 1.00 came
+  from a sub-3% sample — the smallest at 0.0–0.1% of a core, where a process's
+  whole ΔCPU is at most a couple of ticks and the split is meaningless — while 0.41
+  came from a *different* sample, so the pair described no single population and the
+  "0.61 + 0.41 > 1" impossibility dissolved once both ends were read over one set.
+  The remaining residual is **not attributed**: read skew between the process total
+  (`/proc/<pid>/stat`) and the per-thread counters (`/proc/<pid>/task/<tid>/stat`)
+  bounds only the small end of it, and the −0.064 end would need a thread that
+  exited inside the window. Neither was measured. The load-bearing
   observation survives unchanged and is not weakened by the correction: the main
   thread carries the majority of ΔCPU in **every** sample at ≥3% of a core (its
   floor there is 0.610), so the burn, when it exists, is main-thread JS —
