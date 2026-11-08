@@ -944,9 +944,12 @@ GH_PROBE_CAUSE=""
 #     thing lost — the real 101-byte pacing note loses exactly `, source=stored)`;
 #   * from 171 bytes the VERDICT itself is gone, and the 320-byte cap permits 323.
 # (Both boundaries measured with this arm's own clause through the real `refresh_cause_brief`. An earlier
-# version of this paragraph quoted `… — nothing was sent, so NEI`, which only reproduces if the capture
-# is led by the 253-byte `gh-contended` line — a shape the paragraph ABOVE establishes production cannot
-# emit for this arm, so it was quoting a ghost.) The
+# version of this paragraph quoted `… — nothing was sent, so NEI`, which reproduces only when the capture
+# is led by the `gh-contended` note ALONE — the 244-byte note, i.e. WITHOUT `gate_note`'s `gh-gate: `
+# prefix (`:935` above defines that distinction; an earlier cut of this sentence said "the 253-byte
+# line" and was off by exactly the prefix). Either way it is a shape production cannot emit for this
+# arm — with the prefix the beat ends `… nothing was sen`, i.e. still inside the verdict — so the
+# paragraph was quoting a ghost both ways.) The
 # verdict and the question are FIXED-SIZE (245 bytes together, whatever the stderr says); the evidence
 # is the only variable-length part, AND the record keeps it whole — `GH_PROBE_CAUSE_MAX` below bounds
 # the evidence TAKE at 320 (`line` is cut there and the ASCII marker appended, so the take tops out 3

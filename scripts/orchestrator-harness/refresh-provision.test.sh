@@ -97,12 +97,13 @@
 #   the label against evidence production cannot emit (#3701 review, P2). ALL THREE captured notes are
 #   DERIVED from `scripts/gh-shim/gh` itself (with only the runtime figures substituted), so "verbatim"
 #   is a fact rather than a transcription.
-#   ⛔ AND THE CONSEQUENCE OF DERIVING IS THAT A REWORD DOES *NOT* RED A ROW — SAYING IT DID WAS WRONG
-#   (#3701 review round 18, P2, mutation-tested): rewording `gh:1874` or `gh:1485` leaves this suite at
-#   187/0, because the fixture and the assertion move TOGETHER. That is the property worth having — a
-#   hand-typed copy is the only way the fixture can go stale — but it is the opposite of a tripwire.
-#   ⛔ BUT "NOTHING REDS" IS ALSO TOO STRONG, and this paragraph's first cut swung from one extreme to
-#   the other (#3701 review round 19, P2, mutation-tested). Three kinds of wording ARE pinned:
+#   ⛔ AND THE CONSEQUENCE OF DERIVING IS THAT A REWORD CAN LEAVE THE SUITE GREEN — WHICH IS THE POINT,
+#   NOT A TRIPWIRE (#3701 review rounds 18-19, P2, mutation-tested). A reword that does not move a pinned
+#   figure or an anchor keeps fixture and assertion in step, so nothing reds and nothing SHOULD: a
+#   hand-typed copy is the only way this fixture can go stale. (An earlier cut of this paragraph said
+#   "a reword of any of them reds a row", and its replacement said the two untaken notes were "correctly
+#   ungraded" — both were wider than the mechanism, and the list below is the accurate version.)
+#   WHAT *IS* PINNED — three kinds of wording, and the list is exhaustive of what the rows touch:
 #     * the PACING note's words, because `(g)` asserts BY CONTENT that the record quotes them —
 #       rewording `gh:1479` reds `(g) …the record quotes the FIRST captured line`;
 #     * the figure `outlived this call's Nms wait budget` inside `gh:1874`, which the budget-agreement
