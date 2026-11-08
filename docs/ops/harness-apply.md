@@ -259,9 +259,16 @@ SAME three-label summary proof as the drift arm (one vocabulary, so the guard ca
 the branch it guards) — the summary half is what catches the class the row predicate does not know: a
 report whose rows read `drift`/`missing` is invisible to the extractor, so a `DRIFT — 2 stale, …` total
 beside an `rc=0` is the contradiction. A ZERO total is not one: a copy printing both verdict forms over a
-matching farm says `0 stale, 0 declared-but-absent, 0 unsourced`, and that stays a match. A checker
-that exits 0 printing **nothing** is refused too — the instrument always prints a summary, so a silent
-exit produced no evidence and is not a match. ⛔ **And output being
+matching farm says `0 stale, 0 declared-but-absent, 0 unsourced`, and that stays a match.
+**Absence of evidence is not a match either:** an `rc=0` report this pass cannot CLASSIFY is refused,
+because every other test on this arm fires only on something it can positively recognise. Two signals,
+each named in the journal as an unclassifiable summary or row
+(with a `remedy=` pointing at the checker's vocabulary, not at the farm): a pipe-free line carrying two
+of the three label words with no parsable total, and a per-file row whose trailing token is neither benign
+(`verdict`, `ok`, `LOCAL (declared)`, `SYMLINK (graded via its target)`) nor a class this pass knows. One
+label word in prose is NOT a summary — a healthy copy that mentions a `stale` entry while matching still
+records a proven match. A checker that exits 0 printing **nothing** is refused too — the instrument
+always prints a summary, so a silent exit produced no evidence and is not a match. ⛔ **And output being
 non-empty is not a report either:** a match is PROVEN by the instrument's own `OK —` line, so an `rc=0`
 whose output carries **no verdict** — the `bash inner "$@" 2>&1 | tee -a log` wrapper whose `inner` is
 missing, where `tee` supplies the 0 and the only output is bash's error line — is `farm-unknown`, never
@@ -503,7 +510,7 @@ checkout can use the documented hatch. The same interaction is recorded for
 
 ## Tests
 
-`scripts/harness-apply-timer.test.sh` — 573 assertions, run by the
+`scripts/harness-apply-timer.test.sh` — 584 assertions, run by the
 `harness-apply-timer` shard of `run-bash-shards.sh`:
 
 | | |

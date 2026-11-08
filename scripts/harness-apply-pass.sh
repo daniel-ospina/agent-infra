@@ -1604,6 +1604,39 @@ if [ "$FARM_CHECK_ON" = "1" ]; then
         # "the SAME three-label summary proof as the drift arm"; it did not. It does now: a summary whose
         # own total is non-zero says rows exist, and a status of 0 beside it is a contradiction.
         FARM_EXPECT0="$(farm_sum_count "$FARM_OUT" || true)"
+        # ⛔ ABSENCE OF EVIDENCE IS NOT A MATCH EITHER (review round 32, measured). Every test above fires
+        # on something this pass can POSITIVELY recognise, so a report it cannot classify on ANY axis was
+        # certified: measured with `OK — 5/5 …`, rows `handmade.py | … | drift` / `gone.py | … | missing`
+        # and `summary — 2 drift, 0 stale, 0 declared-but-absent, 0 unsourced`, the pass printed
+        # `farm: ok`, recorded `farm_rows=none farm_n=0`, wrote NO artifact — two drifting names durable
+        # nowhere — while the same bytes at `exit 1` were RED with both published. `farm_sum_count`'s
+        # closed vocabulary returns EMPTY for that summary and the row predicate returns EMPTY for those
+        # rows, and empty was read as "nothing to contradict" instead of "no evidence". Two signals:
+        #   * a SUMMARY line this pass cannot count (two of the three label words, no parsable total),
+        #   * a per-file ROW whose verdict token is neither benign nor a class it knows.
+        FARM_UNC0=""
+        if [ -z "$FARM_EXPECT0" ]; then
+            FARM_UNC0="$(printf '%s\n' "$FARM_OUT" | grep -E '^[^|]*$' | grep -ivE '^[^|]*: OK — ' \
+                | awk '{ l = tolower($0); n = 0
+                         if (l ~ /stale/) n++
+                         if (l ~ /declared-but-absent/) n++
+                         if (l ~ /unsourced/) n++
+                         if (n >= 2) { print "summary"; exit } }')"
+        fi
+        [ -n "$FARM_UNC0" ] || FARM_UNC0="$(printf '%s\n' "$FARM_OUT" | awk -F'|' '
+            NF >= 4 {
+                v = $NF
+                gsub(/^[[:space:]]+|[[:space:]]+$/, "", v)
+                if (v == "verdict" || v == "ok") next
+                if (v == "LOCAL (declared)" || v == "SYMLINK (graded via its target)") next
+                if (v ~ /^(STALE|UNSOURCED|NOT-EXECUTABLE|DECLARED-BUT-ABSENT)$/) next
+                # ⛔ THE PARENTHESISED BENIGN TOKENS MUST REACH THE ALLOW-LIST, NOT SLIP PAST IT
+                # (VGATE round 32, measured: the class matched only letters, spaces and dashes, so
+                # `LOCAL (declared)` and `SYMLINK (graded via its target)` fell through WITHOUT the
+                # skip — the allow-list entries for them could be deleted with the suite green. The
+                # regex now admits their shape, so the entries are what spares them.)
+                if (v ~ /^[A-Za-z][A-Za-z ()-]*$/) { print v; exit }
+            }')"
 
         # ⛔ AND A SILENT rc=0 IS NOT A MATCH (review round 24). The instrument always prints a summary,
         # so a checker that exits 0 with NO output produced no evidence at all. ⛔ AND NEITHER IS AN rc=0
@@ -1644,17 +1677,26 @@ if [ "$FARM_CHECK_ON" = "1" ]; then
                     log_line "farm: UNKNOWN — the checker exited 0 but printed NO verdict line (neither 'OK —' nor 'DRIFT —'), so nothing it printed can certify a match"
                     finish 0 24 "farm: UNKNOWN (check-farm-drift rc=0) — no readable grade (see farm_rows=), so a status of 0 is not a match for $FARM_DEST against $REF: the checker printed no verdict line at all"
                 fi
-                if [ "$FARM_NROWS0" -gt 0 ] || [ -n "$FARM_VERDICT0" ] || { [ -n "$FARM_EXPECT0" ] && [ "$FARM_EXPECT0" -gt 0 ]; }; then
+                if [ "$FARM_NROWS0" -gt 0 ] || [ -n "$FARM_VERDICT0" ] || { [ -n "$FARM_EXPECT0" ] && [ "$FARM_EXPECT0" -gt 0 ]; } || [ -n "$FARM_UNC0" ]; then
                     REC_ACTION=farm-unknown
                     publish_farm_rows "$FARM_OUT" "n=unparsed (NO GRADE — the checker exited 0 while reporting drift, so its exit status and its report contradict each other; this is its output verbatim, not a grade; farm_n=not-graded)"
                     REC_FARM_NROWS=not-graded
-                    REC_REMEDY="the checker exited 0 while reporting drift — point HARNESS_APPLY_FARM_CHECKER at check-farm-drift.sh itself (a wrapper that reports the pipeline's status hides the instrument's), then re-run"
+                    if [ -n "$FARM_UNC0" ]; then
+                        REC_REMEDY="the checker exited 0 while printing a report this pass cannot read (an unclassifiable ${FARM_UNC0}) — point HARNESS_APPLY_FARM_CHECKER at check-farm-drift.sh itself (a farmed copy whose vocabulary has moved on cannot be graded here), then re-run"
+                    else
+                        REC_REMEDY="the checker exited 0 while reporting drift — point HARNESS_APPLY_FARM_CHECKER at check-farm-drift.sh itself (a wrapper that reports the pipeline's status hides the instrument's), then re-run"
+                    fi
                     # ⛔ AND IT QUOTES THE EVIDENCE IT REFUSED ON (review round 29): with the summary
                     # half added, naming only "rows" would send the reader looking for rows the
                     # extractor never matched — the class whose vocabulary this pass does not know.
                     _v0="verdict: ${FARM_VERDICT0:-no DRIFT line}"
                     [ -n "$FARM_VERDICT0" ] || _v0="$_v0, rows only"
                     [ -n "$FARM_EXPECT0" ] && _v0="$_v0; summary reports $FARM_EXPECT0 row(s)"
+                    # ⛔ AND AN UNREADABLE REPORT IS ITS OWN REASON (review round 32): the two signals
+                    # above are "this pass could not classify it", not "it reported drift", and the
+                    # remedy differs — the reader must re-farm or fix the checker, not go looking for
+                    # drift rows that this vocabulary cannot name.
+                    [ -n "$FARM_UNC0" ] && _v0="$_v0; an unclassifiable ${FARM_UNC0} — this pass cannot count or grade it"
                     log_line "farm: UNKNOWN — the checker exited 0 but its output reports drift ($FARM_NROWS0 row(s) matched; $_v0); an exit status that contradicts its own report is not a grade"
                     unset _v0
                     # ⛔ NO `detail=` SENTENCE INLINES THE ARTIFACT PATH, AND THE POINTER MUST SURVIVE THE
