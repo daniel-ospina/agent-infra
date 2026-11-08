@@ -718,7 +718,33 @@ if (typeof stripTypeScriptTypes !== "function" ||
       local: "git pull --ff-only && make test",
       marker: "blocked" },
     { id: "B4", guard: "#709 piped payload",
+      // ⛔ THIS PIN CANNOT DISCRIMINATE THE PRE-FIX MUTANT, and that is MEASURED, not assumed.
+      // Under `no remote boundary` (mask = identity) the pre-fix guard ALLOWS this remote form
+      // too, so `expectRed` cannot hold it. The reason is structural, not a stale anchor: the
+      // pipe and its `bash -s` target live INSIDE the `sh -c` script, so there is no TOP-LEVEL
+      // pipe and no LOCAL stage head for the walk to gate. (That — not "the payload is an argument
+      // to printf" — is the decisive fact: `sh -c 'git checkout -- a.txt | bash -s'` puts a discard
+      // verb in command position and is STILL allowed in both worlds. The top-level pipe is what
+      // pre-fix sees, which is why the heredoc pin B4b below DOES flip.)
+      // What this pin IS is COVERAGE, and it is worth keeping: a fully-REMOTE pipeline must not be
+      // false-blocked. End-to-end mutation evidence for #709 is carried by B4b (the heredoc
+      // spelling, which flips) and by the pipe-family MASK mutants ("piped payload masked (local
+      // shell blinded)", "pipe head allow-list (shells only)", "pipe redirect target not skipped").
+      // ⛔ B16/B16r, B19 and the B21 stage-head allow-list are NOT offered here as discriminating
+      // #709 pins, and that is MEASURED (#3774 review, P2): a top-level pipe into a LOCAL shell is
+      // REFUSED under the pre-fix mask AND under the fixed one, so those pins cannot flip either —
+      // naming them as "discriminating" would send the next lane to re-add one to `expectRed` and
+      // reproduce exactly the red this change removes.
+      preFixDiscriminating: false,
       remote: `cmux vm exec cell-a -- sh -c 'printf "git checkout -- a.txt" | bash -s'`,
+      local: `printf 'git checkout -- a.txt' | bash -s`,
+      marker: "#709" },
+    { id: "B4b", guard: "#709 piped payload via a REMOTE heredoc",
+      // The #709 arm's DISCRIMINATING spelling (measured): `sh -s <<'EOS'` keeps the pipe at the
+      // top level of the payload the walk sees, so reverting the mask makes the pre-fix guard
+      // REFUSE the remote form again — while the real mask allows it, because the payload runs on
+      // the CELL. Same local twin as B4, so the pair still proves which guard the local form trips.
+      remote: `cmux vm exec cell-a -- sh -s <<'EOS'\nprintf "git checkout -- a.txt" | bash -s\nEOS`,
       local: `printf 'git checkout -- a.txt' | bash -s`,
       marker: "#709" },
     { id: "B5", guard: "ssh → #1919",
@@ -946,7 +972,15 @@ if (typeof stripTypeScriptTypes !== "function" ||
             "export function maskRemoteExecPayloads(command) {",
             "export function maskRemoteExecPayloads(command) {\n  return String(command ?? \"\"); // MUTANT: pre-fix identity",
           ),
-          expectRed: PINNED.filter((x) => !x.both).map((x) => x.id),
+          // ⛔ `preFixDiscriminating: false` on a pin is a CLAIM WITH A REASON, never a waiver:
+          // it says this pin's answer cannot change when the mask is reverted (see B4), so
+          // holding it here would assert evidence the mutant never produced. A pin may opt out
+          // ONLY for that structural reason, and the opt-out is ASSERTED rather than trusted: the
+          // `optOutInvariant` leg below re-runs every opted-out pin under this mutant and fails if
+          // its answer changed. `M0` still proves every pin GREEN on the unmutated module, so an
+          // exempted pin remains a live assertion (#3774).
+          optOutInvariant: true,
+          expectRed: PINNED.filter((x) => !x.both && x.preFixDiscriminating !== false).map((x) => x.id),
           check: (r) => blocked(r),                  // RED means "refused again"
           probe: (p) => p.remote,
         },
@@ -1229,6 +1263,34 @@ if (typeof stripTypeScriptTypes !== "function" ||
         },
       ];
 
+      // ⛔ THE EXEMPTION MECHANISM'S OWN ENABLEMENT IS ASSERTED (#3774 review, P2-1). The
+      // `optOutInvariant` leg below is the ONLY thing that turns a `preFixDiscriminating: false`
+      // declaration into evidence, and ONE line on ONE mutant enables it. Measured: deleting
+      // `optOutInvariant: true` from the pre-fix mutant left this suite at 341 passed / 0 failed,
+      // exit 0 — the leg vanished and nothing named it, so the flag could hollow out the mutation
+      // evidence with no red anywhere. These rows redden on that deletion, and on an EMPTIED
+      // opt-out set (a mechanism with no exempted pin asserts nothing either).
+      // ⛔ AND THE FLAG IS BOUND TO THE MUTANT WHOSE FILTER IT PROTECTS (#3774 review round 2, P2).
+      // A COUNT is not a binding: measured, MOVING `optOutInvariant: true` one mutant down (onto
+      // "over-reach") left the suite at 345 passed / 0 failed, exit 0, while B4 stayed filtered
+      // out of the PRE-FIX mutant's `expectRed` — so the pin was re-checked only under a mutant it
+      // is trivially invariant under, never under the one the exemption claims it cannot
+      // discriminate. The row named "so the exemption leg RUNS" printed ✅ over exactly that hole.
+      const PRE_FIX_LABEL = "pre-fix (no remote boundary)";
+      const optOutMutants = MUTANTS.filter((m) => m.optOutInvariant === true);
+      const optedOut = PINNED.filter((x) => x.preFixDiscriminating === false);
+      expectTrue("M: exactly one mutant declares optOutInvariant, AND it is the pre-fix mutant whose expectRed the exemption filters",
+        optOutMutants.length === 1 && optOutMutants[0].label === PRE_FIX_LABEL,
+        `${optOutMutants.length} mutant(s) declare it (${optOutMutants.map((m) => m.label).join("; ") || "none"}) — anywhere else, the pre-fix exemption is verified NOWHERE`);
+      expectTrue("M: at least one pin is exempted, so the optOutInvariant leg asserts a real claim",
+        optedOut.length > 0,
+        "no pin carries `preFixDiscriminating: false` — the leg would assert nothing");
+      for (const m of optOutMutants) {
+        expectTrue(`M: the ${m.label} mutant does NOT hold its exempted pins in expectRed`,
+          optedOut.every((p) => !m.expectRed.includes(p.id)),
+          `expectRed still holds ${optedOut.map((p) => p.id).join(", ")} — the exemption would be graded twice, against evidence the mutant never produced`);
+      }
+
       // The pins must be LIVE on the unmutated module first — a mutation whose
       // pin was already red proves nothing. `both:"block"` pins are GREEN only
       // when the command is REFUSED.
@@ -1238,6 +1300,12 @@ if (typeof stripTypeScriptTypes !== "function" ||
         expectTrue(`M0: the pin ${p.id} is GREEN on the unmutated module`, green,
           `unexpectedly ${blocked(r) ? "BLOCKED" : "allowed"}: ${reasonOf(r).split("\n")[0]}`);
       }
+
+      // Execution FLOOR for the invariance leg: a DECLARED flag is satisfied by a neutralised
+      // consumer. Measured: turning the `if (mut.optOutInvariant) {` gate below into `if (false) {`
+      // gives 344 passed / 0 failed, exit 0 — every row above still passes, the leg is simply gone.
+      // The count below is the difference between "the flag exists" and "the assertion ran".
+      let optOutLegRan = 0;
 
       for (const mut of MUTANTS) {
         const built = buildMutant(mut.label.replace(/[^a-z0-9]+/gi, "-"), mut.revert);
@@ -1263,10 +1331,30 @@ if (typeof stripTypeScriptTypes !== "function" ||
             expectTrue(`M: under ${mut.label}, pin ${id} goes RED (so the pin CAN fail)`,
               mut.check(r), `still ${blocked(r) ? "BLOCKED" : "allowed"} — this pin is not discriminating`);
           }
+          // ⛔ AN OPT-OUT IS EVIDENCE, NOT A WAIVER (#3774 review, P2). `preFixDiscriminating: false`
+          // is only legitimate when the pin's answer CANNOT change under this mutant, so ASSERT the
+          // invariance instead of trusting the declaration. Measured without this leg: adding the
+          // flag to B1 — a pin that demonstrably DOES flip — deleted B1's discrimination assertion
+          // silently, with ZERO failures and one assertion simply gone. The flag could therefore be
+          // used to hollow out the
+          // mutation evidence with no red anywhere.
+          if (mut.optOutInvariant) {
+            for (const p of PINNED.filter((x) => x.preFixDiscriminating === false)) {
+              const underMutant = await g.bash(mut.probe(p));
+              const live = await real.bash(mut.probe(p));
+              optOutLegRan++;
+              expectTrue(`M: ${p.id} is exempted as non-discriminating, and it IS invariant under ${mut.label}`,
+                blocked(underMutant) === blocked(live),
+                `it FLIPPED (pre-fix ${blocked(underMutant) ? "BLOCKED" : "allowed"}, live ${blocked(live) ? "BLOCKED" : "allowed"}) — this pin IS discriminating and must not be exempted`);
+            }
+          }
         } finally {
           rmSync(built.root, { recursive: true, force: true });
         }
       }
+      expectTrue("M: the opt-out invariance leg RE-RAN every exempted pin (an executed floor, not a declared flag)",
+        optOutLegRan === optedOut.length && optOutLegRan > 0,
+        `the leg re-ran ${optOutLegRan} of ${optedOut.length} exempted pin(s) — a neutralised consumer leaves every row above green`);
     }
   } finally {
     for (const [k, v] of savedEnv) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
