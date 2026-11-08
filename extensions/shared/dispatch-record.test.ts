@@ -132,6 +132,16 @@ case "$SCENARIO" in
   exit0-silent)
     exit 0
     ;;
+  exit0-e-shape)
+    # #5195 E shape: a child cycling turns that CARRY NO CONTENT, then exiting 0 with empty
+    # stdout. Proves zero messages, so it is reclassified died-before-first-message and IS
+    # an error — the one silent settle that must NOT be recorded as the clean-empty success.
+    m "ready nonce=$NONCE"
+    m "turn_start nonce=$NONCE 1"
+    m "tick nonce=$NONCE tools=0 turn=1 stream_age_ms=0 tool_age_max_ms=0 saw_msg=1 saw_tool=0 progress=0"
+    m "turn_end nonce=$NONCE 1 content=0"
+    exit 0
+    ;;
 esac
 sleep 120
 `;
@@ -570,6 +580,31 @@ test("#783 (review fix): a success-but-SILENT child records 'clean-empty', never
 	equal(rows[0].exitCode, 0, "the exit code is recorded as 0");
 });
 
+// ⛔ THE OTHER SILENT SETTLE (review round 10, P3). The fixture above emits NO markers, so its
+// message count is UNKNOWN (`exited-no-result`) and `clean-empty` is the honest label there. A
+// child that PROVES zero content-bearing turns is a different class: the payload says
+// `died-before-first-message` + `isError: true`, and the durable row used to say `clean-empty` —
+// which this module documents as a SUCCESS. One settle, two surfaces, contradictory claims.
+test("#1208: a PROVEN zero-message death is recorded as such, not as the 'clean-empty' success", async () => {
+	const d = await dispatch("exit0-e-shape", {});
+	ok(d.value !== undefined, "the non-clean arm still composes a payload");
+	const details = d.value!.details as Record<string, unknown>;
+	// The payload's half of the claim — asserted first so the row assertion below cannot pass by
+	// the payload silently keeping `exited-no-result` (i.e. by the death no longer being detected).
+	equal(details.childState, "died-before-first-message", "zero content-bearing turns is the slow-start death");
+	equal(details.childMessagesSent, 0, "zero is positive evidence, never `null` here");
+	equal(details.status, "died-before-first-message", "and the status names it");
+	equal(details.isError, true, "…and it is an error, so a parent stops");
+	const rows = outcomeRows(d.nonce);
+	equal(rows.length, 1, `exactly one row (got ${rows.length})`);
+	equal(
+		rows[0].reason,
+		"died-before-first-message",
+		"the DURABLE surface names the death — `clean-empty` is this module's word for a success settle",
+	);
+	equal(rows[0].exitCode, 0, "the measured exit code still rides the row");
+});
+
 test("silent child at the HARD CAP writes exactly ONE row — even though the close path re-settles as 'cut'", async () => {
 	const d = await dispatch("cap-silent", { extraParentEnv: { TASK_HARD_CAP_MS: "60000", TASK_BACKSTOP_MS: "0" } });
 	ok(d.elapsedMs >= 60_000, `waited out the 60s hard-cap floor (${d.elapsedMs}ms)`);
@@ -781,7 +816,12 @@ test("#783 review: the spawn-error settle records a row — the abnormal populat
 	// reason from the settle fails it.
 	const chokepoint = source.indexOf("if (opts?.reason)");
 	ok(chokepoint > 0, "the row gate still keys on opts.reason");
-	const spawn = source.indexOf('proc.on("error"');
+	// Anchor on the HANDLER LINE, not the bare call spelling: a doc comment that quotes
+	// `proc.on("error")` matched first and the probe then walked to the WRONG settle
+	// (measured: char 107789 vs the handler's 250973, so the assertion read the hard-cap
+	// settle and the spawn-error reason looked absent). A prose mention can never match
+	// the handler's own signature.
+	const spawn = source.indexOf('proc.on("error", (err: Error)');
 	ok(spawn > 0, "spawn-error handler present");
 	const spawnSettle = source.indexOf("doResolve(", spawn);
 	ok(spawnSettle > spawn, "spawn-error settle found");
@@ -795,7 +835,7 @@ test("#783 review: the spawn-error settle records a row — the abnormal populat
 test("attempt is threaded from retry() into every spawn leg (primary / failover / fallback)", () => {
 	ok(source.includes("retry((attempt) => spawnLeg(dispatchLeg, attempt), retryOptions)"), "primary leg threads attempt");
 	ok(source.includes("retry((attempt) => spawnLeg(leg, attempt), retryOptions)"), "failover leg threads attempt");
-	ok(source.includes("spawnSubAgent(fallbackModel, fallbackProvider, subAgentEnv, buildFbArgs(), signal, recordCtx(attempt), params.cwd, dispatchStreamStallMs)"), "fallback leg threads attempt");
+	ok(source.includes("spawnSubAgent(fallbackModel, fallbackProvider, subAgentEnv, buildFbArgs(), signal, recordCtx(attempt), params.cwd, dispatchStreamStallMs, livenessObserver)"), "fallback leg threads attempt");
 	ok(source.includes("const recordCtx = (attempt: number): DispatchRecordContext"), "recordCtx carries the identity");
 	ok(source.includes("const attempt = record?.attempt ?? 1;"), "missing metadata defaults to 1 (tsx does not typecheck)");
 	ok(
