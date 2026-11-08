@@ -767,6 +767,28 @@ build_grid() {
             "the controller; without it a cell dispatches nothing and the only signal is a quiet queue"
         probe_systemd_service "eldato-pr-repair.service" "must" "-" 0 \
             "the PR repair loop"
+        # ⛔ #2700's SUPPLY HALF HAD NO ROW AT ALL (review cycle 11, F2), and it is the clearest
+        # instance of this file's own defect class: `templates/systemd/eldato-worker-supply.service`
+        # SHIPS here, `scripts/install-worker-supply.sh` renders and installs it on Linux, and it
+        # carries no `.timer` — so the derivation loop below (`for tpl in "$SYS_TEMPLATES"/*.timer`)
+        # could not see it, and it was in neither of the two explicit lists (the services at :766/:768,
+        # `probe_recorded "claim-reaper"`, `probe_pin_actuators`). A cell whose supervisor was never
+        # installed, was disabled, or had given up printed `ACTIVATION COMPLETE` and exited 0 while the
+        # repair pool had no supply half: `pr-doctor` then classifies the queue and REFUSES every order
+        # (`16 order(s) no worker accepted and nothing was dispatched`, measured 2026-10-27 on the
+        # operator's Mac) with no row anywhere saying why.
+        # ⛔ WHY NO BEACON, when the supervisor does write a per-pass record at
+        # `$O/state/worker-supply.state` (`worker-supply.sh:134,445`): that record is `ts=`-keyed, and
+        # `probe_systemd_service`'s beacon arm reads the file's CONTENT as an epoch and coerces a
+        # non-numeric read to 0 — which would grade this row LATE for ever, the permanent false red this
+        # suite exists to prevent. A future author who wants the freshness axis must make that arm fall
+        # back to the file's mtime the way `probe_recorded` does; until then this row grades the three
+        # states the finding names. `ActiveState` is not a weak read here in the way `Type=simple`
+        # normally makes it one: the unit ships `Restart=always` with `StartLimitIntervalSec=300` /
+        # `StartLimitBurst=3` (its own header explains why those two live in `[Unit]`), so a start that
+        # can never succeed CONVERGES to `failed` inside ~5 min, which this probe grades FAILING.
+        probe_systemd_service "eldato-worker-supply.service" "must" "-" 0 \
+            "the repair pool's SUPPLY half (#2700): without it pr-doctor classifies the queue and refuses every order"
         # ⛔ THE PATHS ARE THE PASS'S OWN PATHS (review F5), and reading the wrong ones was a FALSE PASS
         # over the one class this file must never wave through: the arming record is
         # `$O/state/claim-reaper.armed` (`claim-reaper-pass.sh:63`, `CRP_STATE=$O/state`), and its pass

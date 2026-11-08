@@ -44,8 +44,14 @@ mkdir -p "$FHOME/.pi/agent/state" "$FHOME/.pi/agent/scripts" "$FHOME/Library/Lau
 # ── the fixture checkout: the SHIPPED templates, so the grid derives real rows ──────────────────
 cp "$REPO/templates/systemd/"*.service "$REPO/templates/systemd/"*.timer "$FROOT/templates/systemd/" 2>/dev/null
 cp "$REPO/templates/launchd/"*.plist "$FROOT/templates/launchd/" 2>/dev/null
+# ⛔ THE FIXTURE MUST SHIP THE INSTALLERS THE REAL TREE SHIPS, OR AN ARM CANNOT BE REACHED AT ALL (review
+# cycle 11, F1). `install-launchd.sh` was missing from this list, so `do_install`'s mac gate
+# (`[ -f "$ROOT/scripts/install-launchd.sh" ]`, activate-harness.sh:995) was FALSE in every case and its
+# whole body — the arming line and the call F2 was about — never executed. T12 then asserted an ABSENCE
+# over a log that arm could not write: an assertion that could not fail under any mutation of the code
+# it claimed to pin. With the stub present the arm runs, and T12's assertions are about the ARTIFACT.
 for f in install-harness-apply-timer.sh install-disk-reaper-timer.sh install-runner-autoscale-timer.sh \
-         install-conflict-rebase-timer.sh install-cell-timers.sh cell-self-pin.sh; do
+         install-conflict-rebase-timer.sh install-cell-timers.sh cell-self-pin.sh install-launchd.sh; do
     printf '#!/usr/bin/env bash\nprintf "%%s\\n" "%s $*" >>"$FX_INSTALL_LOG"\nexit 0\n' "$f" >"$FROOT/scripts/$f"
 done
 printf '#!/usr/bin/env bash\nprintf "%%s\\n" "install-drainer-timer.sh $*" >>"$FX_INSTALL_LOG"\nexit 0\n' \
@@ -213,6 +219,9 @@ arm_all() { # [stamp] — the stamp must be rendered in the ZONE the box prints 
     unit system "cell-self-pin.timer" "LoadState=loaded" "UnitFileState=disabled" "ActiveState=inactive" ""
     unit system "eldato-orchestrator.service" "LoadState=loaded" "UnitFileState=enabled" "ActiveState=active" "Result=success"
     unit system "eldato-pr-repair.service" "LoadState=loaded" "UnitFileState=enabled" "ActiveState=active" "Result=success"
+    # ⛔ AND THE REPAIR POOL'S SUPPLY HALF (#2700), which has NO `.timer` — the derivation loop cannot see
+    # it, so a fully-armed CELL fixture that omits it would red T1 on a row that is correctly required.
+    unit system "eldato-worker-supply.service" "LoadState=loaded" "UnitFileState=enabled" "ActiveState=active" "Result=success"
     # conflict-rebase is judged on its pass BEACON (its brake makes a tick a legitimate no-op), so a
     # fully-armed fixture must carry one or the row correctly reads NEVER-FIRED.
     mkdir -p "$FHOME/.pi/agent/state/conflict-rebase"
@@ -250,6 +259,7 @@ PLATFORM_SEAM="" SKIP_SEAM="" RUN --check
 assert_eq "$RC" 0 "T1 fully armed box exits 0"
 assert_contains "$OUT" 'ACTIVATION COMPLETE' "T1 summary names a complete activation"
 assert_contains "$OUT" 'eldato-conflict-rebase' "T1 the newly armed capability is a derived row (a shipped template cannot be forgotten)"
+assert_contains "$OUT" 'eldato-worker-supply.service' "T1 the supply half is a row on a healthy cell (it ships no .timer, so nothing derives it)"
 assert_contains "$OUT" 'OK' "T1 rows carry a verdict"
 
 # ── T2: NON-VACUITY — remove one unit and --check must name it and exit non-zero ──────────────
@@ -409,7 +419,8 @@ assert_contains "$OUT" 'ACTIVATION COMPLETE' "T12 and it says so"
 assert_absent "$OUT" 'com.eldato.runner-autoscale  must' "T12 the optional autoscale row is not graded must on a Mac"
 : >"$FX/install.log"
 RUN --install
-assert_absent "$(cat "$FX/install.log" 2>/dev/null || true)" 'install-launchd.sh --install' "T12 install-launchd.sh is never passed a verb it does not have"
+assert_contains "$(cat "$FX/install.log" 2>/dev/null || true)" 'install-launchd.sh' "T12 --install actually REACHED the launchd arm (the positive control the old assertion lacked)"
+assert_absent   "$(cat "$FX/install.log" 2>/dev/null || true)" 'install-launchd.sh --' "T12 install-launchd.sh is never passed a verb it does not have"
 
 # ── T13: a templates dir that exists but ships NO timers examined ZERO rows — never green ─────
 PLATFORM_SEAM="" SKIP_SEAM=""; EXTRA_ENV=()
@@ -687,6 +698,39 @@ PY
 RUN --check
 assert_eq "$RC" 1 "T24 an armed-in-the-repo reaper template FAILS a cell's run"
 assert_contains "$OUT" 'UNEXPECTED' "T24 and it is called out"
+# ⛔ RESTORE THE FIXTURE CHECKOUT: every later case runs against it, so leaving the reaper template
+# mutated made every subsequent `--check` red on T24's own finding — a suite whose cases only pass in
+# this file's order. (Found while adding T32, which needs a clean fixture to assert a GREEN box.)
+cp "$REPO/templates/launchd/com.tortoise.worktree-reaper.plist" "$FROOT/templates/launchd/"
+
+# ── T32: the repair pool's SUPPLY HALF is a row — an unarmed supervisor is never COMPLETE ────
+# `templates/systemd/eldato-worker-supply.service` ships here with its own Linux installer
+# (`scripts/install-worker-supply.sh`) and carries NO `.timer`, so the derivation loop could not see it
+# AND it was in no explicit list: a cell whose supervisor was never installed, was disabled, or had given
+# up printed `ACTIVATION COMPLETE` at rc 0 (review cycle 11, F2). ⛔ NON-VACUITY: deleting the row from
+# the cell branch takes the first case below to rc 0 with no named row, so this case is the row's only pin.
+PLATFORM_SEAM="" SKIP_SEAM=""; EXTRA_ENV=()
+arm_all
+rm -f "$FX/units/system/eldato-worker-supply.service"
+RUN --check
+assert_eq "$RC" 1 "T32 a cell with no worker-supply supervisor FAILS the run"
+assert_contains "$OUT" 'NOT ARMED: eldato-worker-supply.service' "T32 and the summary names the supply half"
+assert_absent "$OUT" 'ACTIVATION COMPLETE' "T32 never the success line"
+# The other two states the finding names, on the SAME row: installed-but-disabled, and — the shape a
+# crash-looping `Type=simple` unit converges to — enabled but FAILED.
+arm_all
+unit system "eldato-worker-supply.service" "LoadState=loaded" "UnitFileState=disabled" "ActiveState=inactive"
+RUN --check
+assert_eq "$RC" 1 "T32 an installed but DISABLED supervisor fails the run"
+assert_contains "$OUT" 'eldato-worker-supply.service is installed but NOT ENABLED' "T32 and it says which half is wrong"
+arm_all
+unit system "eldato-worker-supply.service" "LoadState=loaded" "UnitFileState=enabled" "ActiveState=failed"
+RUN --check
+assert_eq "$RC" 1 "T32 an ENABLED but FAILED supervisor fails the run"
+assert_contains "$OUT" 'eldato-worker-supply.service must      FAILING' "T32 graded FAILING, not merely named"
+arm_all
+RUN --check
+assert_eq "$RC" 0 "T32 and a supervisor that is enabled+active is green (the row is a gate, not a wall)"
 
 echo "activate-harness.test.sh — passed=$PASS failed=$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1

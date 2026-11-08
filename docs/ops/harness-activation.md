@@ -51,7 +51,7 @@ Sources cross-referenced: `templates/systemd/*.{service,timer}`, `templates/laun
 | 8 | **runner autoscale** `eldato-runner-autoscale.timer` | `scripts/install-runner-autoscale-timer.sh` | both | `state/ci-runner-gate.state` | **DISARMED by design** (`--dry-run`), `--arm` is a dated owner step (#2403) | yes — but deliberate |
 | 9 | **conflict rebase** `eldato-conflict-rebase.timer` | **`scripts/install-conflict-rebase-timer.sh` (NEW, this PR)** ← `templates/systemd/eldato-conflict-rebase.{service,timer}` + `templates/launchd/conflict-rebase/` | both | `state/conflict-rebase/timer.beat` + `last-failure` | **armed 2026-11-07** (owner instruction) | **yes — and it was: 0 boxes scheduled it** |
 | 10 | **PR repair** `eldato-pr-repair.service` | `scripts/install-repair-service.sh` | cells | unit `ActiveState` | **armed** (bring-up does not install it — see §6) | **yes** |
-| 11 | **worker supply** `eldato-worker-supply.service` | `scripts/install-worker-supply.sh` ← `templates/launchd/com.eldato.worker-supply.plist` (`KeepAlive`, no schedule) | mac | log mtime | **armed** | **yes** |
+| 11 | **worker supply** `eldato-worker-supply.service` (cells) / `com.eldato.worker-supply.plist` (mac) | `scripts/install-worker-supply.sh` ← `templates/systemd/eldato-worker-supply.service` — **Linux only; it REFUSES on Darwin** and points at the launchd half. The mac side is the launchd set in row 15, not this installer | cells (unit `ActiveState`, **row added by this PR**); mac (log mtime, via row 15) | unit `ActiveState` + `UnitFileState` | **armed** | **yes — and it was until the row existed**: the unit ships with no `.timer`, so the derivation loop could not see it and no explicit row named it; a cell with no supervisor printed `ACTIVATION COMPLETE` at rc 0 while `pr-doctor` refused every order |
 | 12 | **lane arm** `eldato-lane-arm.timer` | `scripts/install-lane-arm-timer.sh` | both | `state/lane-arm.log` | installs (the arm only MEASURES; its consumer is a controller) | yes |
 | 13 | **claim reaper** (controller's clock) | `scripts/cloud-cell-supervisor.sh` (`#2048`), pass = `scripts/orchestrator-harness/claim-reaper-pass.sh` | cells | `$O/state/claim-reaper.armed` (arming record) + `$O/state/claim-reaper.last` (pass record, written every pass) | **DISARMED unless `state/claim-reaper.armed` exists** (#2094 decision (e), #1678) | yes |
 | 14 | **portable scheduler** `fleet-schedule.py --loop` | `scripts/fleet-schedule.py --install`; bring-up `check_schedule` | cells | `state/fleet-schedule/tick` + per-job run stamps | **armed by bring-up** | **yes** — with no loop nothing on the cell is scheduled at all (#1864) |
@@ -162,7 +162,7 @@ armed and fresh · `1` a required row is not (`MISSING`/`NEVER-FIRED`/`FAILING`/
 * **Mac:** every top-level `templates/launchd/*.plist` is a row (that glob IS `install-launchd.sh`'s
   own declaration, so the two cannot drift), plus the four subdirectory plists that their own
   installers own.
-* **Rows that are not a template** (the controller, PR repair, the `fleet-schedule` loop, the claim
+* **Rows that are not a template** (the controller, PR repair, **worker supply**, the `fleet-schedule` loop, the claim
   reaper, the pin-actuator pair) are declared explicitly, because they have no template of their own.
 
 ### The four classes — because "not armed" is not one thing
@@ -362,13 +362,16 @@ Ordered, and every step is a verb that exists in this repo (nothing here is "rem
    (today: `eldato-conflict-rebase`, `eldato-ai-drainer`) and then **verifies every row**, naming
    anything that did not come up. A box is not done until this exits 0 (or every remaining row is an
    explained `UNARMED`/`SKIPPED`).
-   * ⛔ **`eldato-pr-repair.service` is a `must` row with NO install path anywhere** — `--install`
-   iterates `*.timer` templates only, `installer_for()` has no entry for it, and **bring-up does not
-   call `install-repair-service.sh` either** (verified). So on a fresh box that row can only go green
-   by hand, and step 3's "until this exits 0" is unreachable for it. That is a **declared gap**, listed
-   in §7, not a step you can follow.
+   * ⛔ **`eldato-pr-repair.service` and `eldato-worker-supply.service` are `must` rows with NO install
+     path anywhere** — `--install` iterates `*.timer` templates only, `installer_for()` has no entry for
+     either, and **bring-up does not call `install-repair-service.sh` or `install-worker-supply.sh`
+     either** (verified). So on a fresh box those two rows can only go green by hand, and step 3's
+     "until this exits 0" is unreachable for them. That is a **declared gap**, listed in §8, not a step
+     you can follow.
    * `eldato-orchestrator.service` **is** installed by bring-up (`check_controller_service`), so the
-   controller is fine on a fresh box; only PR repair is orphaned.
+   controller is fine on a fresh box; only PR repair and worker supply are orphaned. The supply row is
+   new in this PR and it **verifies**, it never installs: the capability shipped, was installable, and
+   nothing in the grid could see it missing (§1 row 11).
 4. **`bash scripts/activate-harness.sh --check`** — the read-back. Keep it in the rebuild checklist.
 
 **Not needed, and deliberately:** `eldato-runner-autoscale` (`--arm` is a dated owner step),
@@ -385,7 +388,7 @@ skip (row 11); a cell with no `keys.env` has no `MAX_LOAD` (row 9).
 
 ## 6. The launcher's own self-check, case by case
 
-`bash scripts/activate-harness.test.sh` — 109 assertions, hermetic (fixture HOME, fixture checkout,
+`bash scripts/activate-harness.test.sh` — 119 assertions, hermetic (fixture HOME, fixture checkout,
 fake `systemctl`/`launchctl`, a stubbed bot).
 
 | case | what it proves | why it exists |
@@ -401,7 +404,7 @@ fake `systemctl`/`launchctl`, a stubbed bot).
 | **T9** | an **armed** `optional` row that is broken (`OPTIONAL NOT OK: …`) while the exit stays 0; an intact one prints nothing | the `optional` class is a decision about the EXIT CODE, not about visibility — a broken optional row used to increment a counter nothing printed, and the "prints nothing" half is what proves the note is not always-on |
 | **T10** | a required timer stamped **6 days ago** is `LATE` **and the run exits 1**; the summary never says COMPLETE | nothing pinned `LATE` — the gate's primary verdict. A mutant that made every age "now" kept the suite fully green (review finding) |
 | **T11** | under `TZ=Asia/Tokyo` a freshly-fired box is green **and** a JST-stamped timer **2 h old** is still `LATE` | `LastTriggerUSec` renders in the **box's local zone**; parsing it as UTC makes the age negative east of UTC, clamps to 0, and **a dead timer reads OK**. The 2 h stamp is the only window that discriminates (it is over the 5400 s cadence and far under the 9 h offset) |
-| **T12** | a mac with every plist installed+loaded+`runs=3` reaches `ACTIVATION COMPLETE`, and the installer is never passed `--install` | no test drove a **green** mac grid, which is how two mac false-reds shipped (a broken plist read, and a verb `install-launchd.sh` does not have) |
+| **T12** | a mac with every plist installed+loaded+`runs=3` reaches `ACTIVATION COMPLETE`, the launchd arm is **actually reached** (the install log carries `install-launchd.sh`), and the installer is never passed `--install` | no test drove a **green** mac grid, which is how two mac false-reds shipped (a broken plist read, and a verb `install-launchd.sh` does not have). ⛔ The second half of that assertion was **vacuous** until review cycle 11: the fixture never created `install-launchd.sh`, so the arm's own `[ -f … ]` gate was false and the log line it asserted absent could not be written — restoring the `--install` defect left the suite green (measured). The positive control is what makes the absence attributable |
 | **T13** | a templates dir that exists but holds **no** `*.timer` exits **2** and says `examined ZERO` | "I examined nothing" was a pass — the same rule as the unmapped-template error, applied to the SET |
 | **T14** | an unsupported platform (`FreeBSD`) exits **2** and names it | the old `else` sent every non-Linux platform down the macOS grid |
 | **T15** | an **armed** claim reaper (record at `$O/state/…`) makes the run FAIL | the probe read `~/.pi/agent/state/…`, which nothing writes, so an armed #1678 deletion tool graded `UNARMED`, exit 0 |
@@ -420,6 +423,7 @@ fake `systemctl`/`launchctl`, a stubbed bot).
 | **T30** | a non-string `*_STATE` value is unreadable, never a `NEVER-FIRED` claim built from a Python repr | a malformed plist became a hard claim about whether any pass had ever completed |
 | **T31** | a unit whose period cannot be read says `cadence UNREADABLE … assumed 1800 s` on the OK row, and stays green | the disclosure was computed, passed as a parameter, and rendered by **none** of the four beacon emits — the only branch that row reaches — so an assumed bound printed identically to a measured one. A disclosure no state renders is not a disclosure |
 | **T31b–T31d** | the same disclosure appears on the `NEVER-FIRED` and `LATE` rows, and is **absent** when the period *was* read (`30min` ⇒ 8400 s, undressed) | after T31 the note was still a comment on three of four arms — and those are the states an operator actually meets (a freshly built box, a stopped one). The negative case is the other half: a disclosure printed always is as useless as one printed never. The `UNKNOWN-mtime` arm is the one use **no test can pin** (breaking `stat` portably is not a thing a fixture can do), and the code says so |
+| **T32** | the repair pool's **supply half** is a row on a cell: no supervisor ⇒ exit **1** + `NOT ARMED: eldato-worker-supply.service`; installed-but-**disabled** and enabled-but-**failed** each fail it; enabled+active is green | `templates/systemd/eldato-worker-supply.service` ships with its own Linux installer and carries no `.timer`, so the derivation loop could not see it and no explicit row named it — a cell with no supply half printed `ACTIVATION COMPLETE` at rc 0 while `pr-doctor` refused every order (review cycle 11, F2). Deleting the row takes the first case to rc 0, so the case is the row's only pin |
 
 ---
 
@@ -472,6 +476,12 @@ reconciliation would ship silently; the mutant is the defence, and this paragrap
 5. **`eldato-pr-repair.service` has no install path** anywhere in the rebuild (§5 step 3): no timer
    template, no `installer_for()` entry, and bring-up does not call `install-repair-service.sh`. The
    row is `must`, so a fresh box cannot reach a green grid without a hand step. Declared, not papered.
+   **The same is now true of `eldato-worker-supply.service`**, which this PR gave a row: its installer
+   exists (`scripts/install-worker-supply.sh`, Linux-only, it REFUSES on Darwin) but `--install` cannot
+   reach it (the cell branch iterates timer templates), bring-up does not call it, and it is not in
+   `pi-bootstrap/setup.sh`'s `fleet_srcs` — so on a cell it lives only inside a checkout. The row makes
+   that state VISIBLE on every `--check`; wiring it into `--install` is a separate change with its own
+   tests (it needs sudo, a rendered PATH and a unit write), not something to smuggle in with a row.
 6. **The launchd rows are this tool's own read, not `install-launchd.sh --status`'s** — two authorities
    for one set, and only this one measures freshness (§3). Reconciling them is a follow-up.
 7. **`AGE UNMEASURED` on a Mac is a known headroom:** `launchctl print` proves a job has run, but not
