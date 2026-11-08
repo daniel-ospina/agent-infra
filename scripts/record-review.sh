@@ -1511,7 +1511,7 @@ delta_git_neutral() { # <root> <git args…>
 delta_verify() { # <id: A..B[+artifact]> <head_sha> -> 0 = verified (sets DELTA_*)
   local id="$1" head="$2" range from to cover="" root="" tmp="" norm=""
   local authored="" newest="" n_authored=0 anchor="" dg_rc=0 base_sha="" base_ref=""
-  local merges_in_range="" evil="" evil_shas="" m="" parents="" pcount="" p1="" p2="" prest="" want="" actual="" cands="" mrc="" body_claim="" stated_from="" stated_to="" stated_sep="" _delta_tok="" E_OUT="" E_RC="" _scan="" _any="" _all_ok="" _sf="" _ss="" _st="" _straw="" _stcmp="" _ok="" _sfs="" _r="" _claim="" _toks="" _tok_rc=0 _tok="" _tsha="" _tipscan="" _tref="" _top="" _tiprel=0 _tisref="" _tosha="" _tipchain="" _elhs="" _erhs="" _elsha="" _ersha="" _eranges="" _drivers="" _dg_rc=0 _gitdir="" _gd_rc=0 _commondir="" _cd_rc=0 _attr_amb="" _wt_amb="" _ls_rc=0 _st_amb="" _st_rc=0 _ad="" _adrift="" _adr_rc=0
+  local merges_in_range="" evil="" evil_shas="" m="" parents="" pcount="" p1="" p2="" prest="" want="" actual="" cands="" mrc="" body_claim="" stated_from="" stated_to="" stated_sep="" _delta_tok="" E_OUT="" E_RC="" _scan="" _any="" _all_ok="" _sf="" _ss="" _st="" _straw="" _stcmp="" _ok="" _sfs="" _r="" _claim="" _toks="" _tok_rc=0 _tok="" _tsha="" _tipscan="" _tref="" _top="" _tiprel=0 _tisref="" _tosha="" _tipchain="" _lid=0 _rid=0 _elhs="" _erhs="" _elsha="" _ersha="" _eranges="" _drivers="" _dg_rc=0 _gitdir="" _gd_rc=0 _commondir="" _cd_rc=0 _attr_amb="" _wt_amb="" _ls_rc=0 _st_amb="" _st_rc=0 _ad="" _adrift="" _adr_rc=0
   range="${id%%+*}"
   [ "$range" != "$id" ] && cover="${id#*+}"
   from="${range%%..*}"; to="${range##*..}"
@@ -2048,6 +2048,12 @@ $m"
       { rec = rec $0 "\n" }
       END {
         gsub(/\\n/, "\n", rec)
+        # A TAB ARRIVES AS THE TWO CHARACTERS backslash-t (eighteenth cycle, P2 - MEASURED): the
+        # evidence body is read through `gh --jq @tsv`, which escapes a real tab that way, so the
+        # [[:space:]] tolerance never saw one and a tab-separated `HEAD^0..HEAD` recorded a signed
+        # `clean` while the space-separated spelling was refused. Un-escaping it makes the whitespace
+        # tolerance mean what it says, exactly as the newline un-escape above does for a split range.
+        gsub(/\\t/, "\t", rec)
         n = split(rec, L, "\n")
         # A LINE-BY-LINE STATE MACHINE, mirroring brief-gate.sh s own `ins`/`depth`: open on a
         # heading match, close on a heading at or above that depth (subsections stay inside), and
@@ -2535,7 +2541,7 @@ $m"
       # The operand carried the brace, so the brace IS the chain: keep it in `_top` and empty `_tref`,
       # which makes `${_tref}${_top}` the exact revision expression (`@{1}`) for the resolution below.
       case "$_tref" in
-        @\{*\}) _top="${_tref}"; _tref='' ;;
+        @\{*\}) _top="${_tref}${_top}"; _tref='' ;;
       esac
       _tipscan="${_tipscan#*"${BASH_REMATCH[0]}"}"
       _tisref=1
@@ -2615,6 +2621,19 @@ $m"
       case "$_erhs" in
         [Hh][Ee][Aa][Dd]) _erhs='HEAD' ;;
       esac
+      # ⛔ THE FRAME IS THE ATTESTED HEAD, NOT THIS CHECKOUT (eighteenth cycle, P1 — MEASURED): the
+      # equality below compared two shas resolved in the DELTA REPO, so when that checkout sat
+      # anywhere other than the attested head, `@{0}` and `HEAD~0` resolved to THAT commit and
+      # `@{0}..HEAD` recorded a signed `clean` over a range that is empty in the frame the artifact is
+      # about — the same text with the opposite verdict, decided by where a clone happens to be. Both
+      # endpoints are TIp SPELLINGS with identity-only chains ⇒ they denote the attested head itself,
+      # so the range is empty in EVERY frame, and this test needs no checkout at all.
+      _lid=0; _rid=0
+      [[ "$_elhs" =~ ^(HEAD|@|@\{0+\})((~0+|\^0+|\^\{[^}/]*\}|@\{0+\})*)$ ]] && _lid=1
+      [[ "$_erhs" =~ ^(HEAD|@|@\{0+\})$ ]] && _rid=1
+      if [ "$_lid" = 1 ] && [ "$_rid" = 1 ]; then
+        _tiprel=1; break
+      fi
       _elsha="$(delta_git "$root" rev-parse --verify "${_elhs}^{commit}" 2>/dev/null || true)"
       [ -n "$_elsha" ] || continue
       case "$_erhs" in

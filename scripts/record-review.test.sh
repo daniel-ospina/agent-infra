@@ -10027,6 +10027,50 @@ assert_eq "$RECORD_RC" "0" "20h66b …nor is a bare-@ identity position (@{0}) (
 assert_eq "$(delta_git "$DG" rev-parse --verify '@{0}^{commit}' 2>/dev/null || true)" \
     "$(delta_git "$DG" rev-parse --verify 'HEAD^{commit}' 2>/dev/null || true)" \
     "20h66b …and the fixture agrees: @{0} IS the head"
+
+# 20h67+ THE NINETEENTH CYCLE: THE NORMALISATION DROPPED THE CHAIN, AND THE EMPTY-RANGE VERDICT DEPENDED
+#        ON WHERE THE CHECKOUT SAT. Both were MEASURED by a fresh reviewer at 9f1fdfb38 while the suite
+#        was PASS=1512 FAIL=0 — the vectors below state the shapes it never spelled.
+# 20h67 A BRACE GROUP ON A BARE `@` MUST NOT EAT THE CHAIN BEHIND IT (P1). The normalisation assigned
+#       `_top` from the brace alone, discarding `BASH_REMATCH[3]`, so the selector behind `@{0}` was
+#       never classified: `@{0}~1..HEAD` recorded a SIGNED `clean` over `BASE..HEAD` while the artifact
+#       said it read HEAD~1. MEASURED at 9f1fdfb38: rc 0, record written.
+EH106=425332; rm -f "$(Q2 $EH106)"
+run_record_delta $EH106 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42533301" \
+    STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" \
+    STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
+I only actually reviewed @{0}~1..HEAD; the rest was not read."
+assert_eq "$RECORD_RC" "3" "20h67 a selector BEHIND a bare-@ brace group (@{0}~1..HEAD) is REFUSED (rc 3)"
+[ -f "$(Q2 $EH106)" ] && bad "20h67 FAIL-OPEN: the brace normalisation discarded the chain, so @{0}~1..HEAD recorded a signed clean" || ok "20h67 no record was written"
+EH107=425334; rm -f "$(Q2 $EH107)"
+run_record_delta $EH107 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42533501" \
+    STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" \
+    STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
+I only actually reviewed @{now}~1..HEAD; the rest was not read."
+assert_eq "$RECORD_RC" "3" "20h67b …and behind a tip-resolving position (@{now}~1..HEAD) (rc 3)"
+# 20h68 AN EMPTY RANGE IS EMPTY IN THE ATTESTED FRAME (P1). The equality compared two shas resolved in
+#       the DELTA REPO, so when that checkout was not at the attested head, `@{0}`/`HEAD~0` resolved to
+#       THAT commit and `@{0}..HEAD` recorded a signed `clean` — while the identical text was refused
+#       with the checkout detached at the head. One artifact, two verdicts, decided by where a clone
+#       happens to be. The cell below is frame-independent because both endpoints are tip SPELLINGS.
+EH108=425336; rm -f "$(Q2 $EH108)"
+run_record_delta $EH108 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42533701" \
+    STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" \
+    STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
+I only actually reviewed @{0}~0..HEAD; the rest was not read."
+assert_eq "$RECORD_RC" "3" "20h68 an identity-only chain on BOTH ends (@{0}~0..HEAD) is an EMPTY range (rc 3)"
+[ -f "$(Q2 $EH108)" ] && bad "20h68 FAIL-OPEN: @{0}~0..HEAD recorded a signed clean over an empty range" || ok "20h68 no record was written"
+# 20h69 A TAB-SEPARATED RANGE IS A RANGE (P2). The evidence body arrives through `gh --jq @tsv`, which
+#       escapes a real tab as backslash-t, and only the NEWLINE was un-escaped — so the arm's
+#       `[[:space:]]*` tolerance never saw a tab and the tab-separated spelling recorded a signed
+#       `clean` while the space-separated one was refused. MEASURED at 9f1fdfb38: rc 0, record written.
+EH109=425338; rm -f "$(Q2 $EH109)"
+run_record_delta $EH109 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42533901" \
+    STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" \
+    STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
+I only actually reviewed HEAD^0	..	HEAD; the rest was not read."
+assert_eq "$RECORD_RC" "3" "20h69 a TAB-separated empty range (HEAD^0<TAB>..<TAB>HEAD) is REFUSED (rc 3)"
+[ -f "$(Q2 $EH109)" ] && bad "20h69 FAIL-OPEN: the tab-separated spelling escaped the whitespace tolerance" || ok "20h69 no record was written"
 # 20h60 THE OPERAND IS A TOKEN, NOT A COLLIDING SUBSTRING (P2). `rev-parse` as a SUFFICIENT test
 #       re-opened the prose false block the fifteenth cycle closed: ANY literal that collides with
 #       a commit prefix refused the artifact. MEASURED at 1f32d7571 with `LIT=${DG_BASE:0:4}`
@@ -11014,8 +11058,8 @@ reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found."
 #       the arm while `HEAD@{1}..HEAD` is still refused, so 20h65/20h65b are ACCEPTED — a signed
 #       `clean` over an empty range, one character to the left of the spelling that is refused.
 MUT="$(mk_mutant bareatoperand '|[Hh][Ee][Aa][Dd]|@\{[^}]+\}|@)((~[0-9]*' '|[Hh][Ee][Aa][Dd]|@)((~[0-9]*')"
-mut_check "M52 a brace group on a BARE @ is an operand, not invisible" 425322 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42532301" accepted STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
-I only actually reviewed @{0}..HEAD; the rest was not read."
+mut_check "M52 a brace group on a BARE @ is an operand, not invisible" 425332 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42533301" accepted STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
+I only actually reviewed @{0}~1..HEAD; the rest was not read."
 # M53 — THE RESOLUTION IS THE AUTHORITY (eighteenth cycle, P2). Removing the resolve-and-compare skip
 #       makes the arm refuse on the SPELLING again, so 20h66's `HEAD@{now}` — a position git resolves
 #       to the very commit being attested — is REFUSED as "always NARROWER": a false sentence about an
@@ -11023,6 +11067,13 @@ I only actually reviewed @{0}..HEAD; the rest was not read."
 MUT="$(mk_mutant noresolveidentity '        [ -n "$_tipchain" ] && [ "$_tipchain" = "$_tosha" ] && continue' '        :')"
 mut_check "M53 a chain that RESOLVES to the attested head is the identity, not a narrowing" 425328 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42532901" refused STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="The tip was re-checked with HEAD@{now} before reading.
 reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found."
+# M54 — THE EMPTY-RANGE ARM'S BRACE OPERAND (nineteenth cycle, P2). The bare-`@` operand landed in BOTH
+#       arms, but only the TIP arm's occurrence was pinned; deleting just this one still lets
+#       `@{0}~0..HEAD` through, because the regex can no longer reach the brace at all. 20h68 is the
+#       vector, and it must then be ACCEPTED — a signed `clean` over an empty range.
+MUT="$(mk_mutant nilbraceoperand '|@\{[^}]+\}|@)((~0+|\^0+|' '|@)((~0+|\^0+|')"
+mut_check "M54 the EMPTY-RANGE arm carries the bare-@ brace operand too, not just the tip arm" 425336 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42533701" accepted STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
+I only actually reviewed @{0}~0..HEAD; the rest was not read."
 git checkout -q attr_lane >/dev/null 2>&1 || true
 # M8 (the tier arm) is RETIRED WITH ITS ARM: the unsigned local-record premise was a
 # forgery vector (review minted a signed `clean` from one `printf`), so there is no
