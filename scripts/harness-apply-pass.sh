@@ -258,11 +258,19 @@ done
 #         systemd.unit(5) applies drop-ins from `/etc`, `/run` AND `/usr/lib` "in lexicographic order,
 #         regardless of which of the directories they reside in", the higher-precedence directory winning
 #         a name collision. All of that is honoured below.
-# A value this file cannot resolve (`{{CELL_HOME}}` unrendered, a `%h` specifier) is CANNOT MEASURE and
-# is skipped — never compared, because a string comparison against a placeholder is not a reading.
+#   (F-G) WHITESPACE AROUND `=` IS IGNORED BY SYSTEMD, SO IT MUST BE IGNORED HERE.
+#         systemd.syntax(7): *"Each file is a plain text file divided into sections, with configuration
+#         entries in the style key = value. Whitespace immediately before or after the '=' is ignored."*
+#         The pattern was anchored at `Environment=`, so `Environment = CELL_HOME=/tmp/cell-home` — legal
+#         systemd, and the spelling an operator reaches for in a hand-written drop-in — parsed to NOTHING
+#         and the readings printed `split_home=none`, which every reader infers as agreement. This is the
+#         same fail-open as F-B, one character over, and `cell-home-migrate.sh` already honours the rule
+#         (its own `trim_tail` comment cites the same sentence) — two readers of one question disagreed.
 environment_cell_home() { # <file> — the CELL_HOME its Environment= lines set (last wins), or nothing
     local envlines token
-    envlines="$(sed -n 's/^[[:space:]]*Environment=//p' "$1" 2>/dev/null)"
+    # ⛔ `Environment[[:space:]]*=` and NOT `Environment=`: it still cannot match `EnvironmentFile=`
+    # (the `F` is neither blank nor `=`), so the near-miss that would make this a FALSE reading is out.
+    envlines="$(sed -n 's/^[[:space:]]*Environment[[:space:]]*=[[:space:]]*//p' "$1" 2>/dev/null)"
     [ -n "$envlines" ] || return 0
     token="$(printf '%s\n' "$envlines" | tr -d '"' | tr -s '[:space:]' '\n' \
                | sed -n 's/^CELL_HOME=//p' | tail -1)"
@@ -365,7 +373,6 @@ if [ -n "$CELL_HOME_LIB" ]; then
 else
   CELL_HOME="${CELL_HOME:-${HOME:?HOME is required}}"
 fi
-unset _CELL_HOME_EXPLICIT
 unset _CELL_HOME_EXPLICIT
 O="${O:-$CELL_HOME/orchestrator}"
 # ⛔ BOTH SPELLINGS, AND THE UNIT'S IS THE ONE THAT MATTERS IN PRODUCTION. The rendered systemd unit

@@ -1613,7 +1613,7 @@ render_unit_env() {
         -e "s|{{PASS}}|$PASS_SH|g" -e "s|{{PASS_DIR}}|${PASS_SH%/*}|g" \
         -e "s|{{PASS_REPO}}|${REPO_P:-$HERE/..}|g" -e "s|{{PASS_REF}}|origin/main|g" \
         -e "s|{{PASS_MODE}}||g" -e "s|{{ENV_FILE}}||g" -e "s|{{O}}||g" "$1" \
-      | sed -n 's/^Environment=\([A-Za-z_][A-Za-z0-9_]*\)=\(.\+\)$/\1=\2/p' \
+      | sed -n 's/^Environment=\([A-Za-z_][A-Za-z0-9_]*\)=\(.\{1,\}\)$/\1=\2/p' \
       | grep -v '{{'
 }
 # resolve_under <env assignments…> — the SAME resolver the pass sources, under exactly this environment.
@@ -1632,15 +1632,34 @@ run_under() { # <env assignments…> [extra args…] — the pass under exactly 
     # clone, so the fetch is hermetic, and the refusal precedes every mutation — nothing is touched.
     # ⛔ `HARNESS_FETCH=0` CANNOT BE USED HERE: a not-fetched pass refuses `cannot-verify` (23) BEFORE the
     # move section, so the split guard would never be reached and these arms would measure the fetch rule.
-    env -i "${_env[@]}" PATH="$ACCT27:/usr/bin:/bin:/usr/sbin:/sbin" HARNESS_APPLY_DRIFT_CHECK=0 \
+    # ⛔ `"${_arr[@]-}"` IS NOT OPTIONAL ON bash 3.2 (macOS — the other host this fleet runs). Under
+    # `set -u`, expanding an EMPTY array as `"${_args[@]}"` is an "unbound variable" ABORT, so EVERY
+    # acting-path leg (the ones with no extra arg — exactly the legs that measure the split refusal)
+    # died before the pass was ever started, and the suite reported them as ordinary assertion failures
+    # naming `_args[@]` rather than the cause. The `${arr[@]+"${arr[@]}"}` form expands to nothing when
+    # empty on both bash 3.2 and bash 5, so the same arms measure the same thing on both hosts.
+    env -i ${_env[@]+"${_env[@]}"} PATH="$ACCT27:/usr/bin:/bin:/usr/sbin:/sbin" HARNESS_APPLY_DRIFT_CHECK=0 \
         HARNESS_APPLY_FARM_CHECK=0 \
-        bash "${PASS_UNDER_TEST:-$PASS_SH}" "${_args[@]}" 2>&1
+        bash "${PASS_UNDER_TEST:-$PASS_SH}" ${_args[@]+"${_args[@]}"} 2>&1
 }
   # ⛔ NO `mapfile`: macOS ships bash 3.2 and CI parses every script with it (`bash32-parse`).
 read_env() { # <template> <HOME> <CELL_HOME> <state> — fills the global ENV_ARR
     ENV_ARR=()
     local _l
     while IFS= read -r _l; do ENV_ARR+=("$_l"); done < <(render_unit_env "$@")
+    # ⛔ AN EMPTY RENDER IS A NAMED FAILURE, NOT A CRASH: every arm below reads `"${ENV_ARR[@]}"`, and
+    # under `set -u` on bash 3.2 (macOS — the other host this fleet runs) an EMPTY array expansion is an
+    # "unbound variable" abort, so a render that produced nothing used to kill the suite with a message
+    # that names the array instead of the cause. The render regex also carried `\(.\+\)`, which BSD
+    # sed does not support in BRE — so on macOS this function returned NOTHING and every T27 arm was
+    # unrunnable, while GNU sed on the Linux cell rendered it happily. `\{1,\}` is POSIX BRE and works
+    # on both; this guard is what names the defect if it ever comes back.
+    # (…and it EXITS, because a bare `bad` would leave the arms below expanding an empty array, which
+    # aborts the suite with "unbound variable" — the message that hid this cause in the first place.)
+    if [ "${#ENV_ARR[@]}" -eq 0 ]; then
+        bad "T27 fixture: rendering $1 produced no Environment= line — the arms below cannot run (a host-class sed/set -u trap, not a product defect)"
+        exit 1
+    fi
 }
 read_env "$HERE/../templates/systemd/eldato-harness-apply.service" \
     "$T27/legacy-home" "$T27/legacy-home" "$T27/state"; HA_ENV=("${ENV_ARR[@]}")
@@ -1764,6 +1783,49 @@ assert_contains "$OUT" "the controller's unit pins CELL_HOME" "T27 …and the qu
 printf '[Service]\nEnvironment=HOME=/tmp/whatever CELL_HOME=%s\n' "$T27/legacy-home" >"$T27/controller-multi.service"
 OUT="$(run_under HARNESS_APPLY_CONTROLLER_UNIT="$T27/controller-multi.service" "${HA_CONV[@]}")"; RC=$?
 assert_eq "$RC" "27" "T27 a MULTI-ASSIGNMENT Environment= line is measured (it is a list, not a scalar)"
+# ⛔ AND THE THIRD SPELLING systemd ACCEPTS: WHITESPACE AROUND `=` IS IGNORED, SO A SPACED
+# `Environment = CELL_HOME=…` IS THE SAME DIRECTIVE. systemd.syntax(7): *"Whitespace immediately before or
+# after the '=' is ignored."* The reader was anchored at `Environment=`, so the spaced form — what an
+# operator writes by hand in a drop-in — parsed to NOTHING, `split_home` read `none`, and every reader
+# inferred agreement. Reproduced before the fix: `environment_cell_home` answered '' for all three spaced
+# spellings below while the migrate tool in this same PR already honoured the rule.
+printf '[Service]\nEnvironment = CELL_HOME=%s\n' "$T27/legacy-home" >"$T27/controller-spaced.service"
+OUT="$(run_under HARNESS_APPLY_CONTROLLER_UNIT="$T27/controller-spaced.service" "${HA_CONV[@]}")"; RC=$?
+assert_eq "$RC" "27" "T27 a SPACED 'Environment = CELL_HOME=…' is measured (systemd ignores whitespace around '=')"
+assert_contains "$OUT" "the controller's unit pins CELL_HOME=$T27/legacy-home" "T27 …and the spaced value is the one it names"
+# …and the other two spacings are the same directive too, so a fix for one is not a fix for the class.
+for _sep in 'Environment= CELL_HOME=' 'Environment =CELL_HOME='; do
+    printf '[Service]\n%s%s\n' "$_sep" "$T27/legacy-home" >"$T27/controller-spaced2.service"
+    OUT="$(run_under HARNESS_APPLY_CONTROLLER_UNIT="$T27/controller-spaced2.service" "${HA_CONV[@]}" --dry-run)"; RC=$?
+    assert_contains "$OUT" "would REFUSE split-home" "T27 '$_sep' is the same directive (whitespace on the other side of '=' is ignored too)"
+    assert_eq "$RC" "0" "T27 …and it is a READING on --dry-run, so the preview does not red the box"
+done
+# ⛔ THE POLARITY PAIR, WITHOUT WHICH THE ARM ABOVE WOULD FIRE ON ANY 'Environment =' LINE: a spaced
+# directive that AGREES is not a split, and an `EnvironmentFile=` is not an `Environment=` at all — a
+# reader widened to match both would refuse a converged box, or read a CELL_HOME out of a file path.
+printf '[Service]\nEnvironment = CELL_HOME=%s\n' "$T27/acct-home" >"$T27/controller-spaced-ok.service"
+OUT="$(run_under HARNESS_APPLY_CONTROLLER_UNIT="$T27/controller-spaced-ok.service" "${HA_CONV[@]}" --dry-run)"; RC=$?
+assert_contains "$OUT" "split_home=none" "T27 a SPACED directive that AGREES is not a split (the arm above measures the home, not the spelling)"
+printf '[Service]\nEnvironmentFile=%s\n' "$T27/legacy-home/keys.env" >"$T27/controller-envfile.service"
+OUT="$(run_under HARNESS_APPLY_CONTROLLER_UNIT="$T27/controller-envfile.service" "${HA_CONV[@]}" --dry-run)"; RC=$?
+assert_contains "$OUT" "split_home=none" "T27 'EnvironmentFile=' is NOT read as 'Environment=' (a widened reader must not invent a home)"
+# ⛔ NON-VACUITY FOR THE WHOLE SPACED LEG: revert ONLY that pattern in a copy of the pass and the same
+# spaced unit stops being measured at all. Without this row the arms above would be green on a tree whose
+# reader had regressed to the anchored form — the exact way this one shipped.
+PASS_SPACED="$MUT27/scripts/pass-spaced.sh"
+sed 's|Environment\[\[:space:\]\]\*=\[\[:space:\]\]\*//|Environment=//|' "$PASS_SH" >"$PASS_SPACED"
+if cmp -s "$PASS_SH" "$PASS_SPACED"; then
+    bad "T27 spatial control: the mutant is IDENTICAL to the pass — this control proves nothing"
+elif ! grep -qF "Environment[[:space:]]*=[[:space:]]*//p" "$PASS_SH"; then
+    bad "T27 spatial control: the fixed pattern is not in the pass — this control is stale"
+elif grep -qF "Environment[[:space:]]*=[[:space:]]*//p" "$PASS_SPACED"; then
+    bad "T27 spatial control: the mutated copy STILL carries the fixed pattern — the revert did not apply"
+else
+    ok "T27 spatial control: the mutant carries the anchored pre-fix pattern and not the fixed one"
+fi
+OUT="$(PASS_UNDER_TEST="$PASS_SPACED" run_under HARNESS_APPLY_CONTROLLER_UNIT="$T27/controller-spaced.service" "${HA_CONV[@]}" --dry-run)"; RC=$?
+assert_absent "$OUT" "would REFUSE split-home" "T27 spatial control: with the anchored pattern the SPACED unit is invisible — the arms above are what sees it"
+assert_contains "$OUT" "split_home=none" "T27 spatial control: …and the readings print no split at all (the fail-open F-G fixed)"
 # …and the unit NAME is not a constant: `install-controller-service.sh` renders and validates
 # `CONTROLLER_UNIT=<bare name>` and honours `CONTROLLER_SYSTEM_UNIT_DIR`.
 mkdir -p "$T27/units"
