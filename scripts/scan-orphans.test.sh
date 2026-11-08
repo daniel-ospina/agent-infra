@@ -16,6 +16,11 @@
 #           | dirty worktree listed separately + refused by --apply
 #           | --apply removes worktree+branch+record | ghost record pruned
 #           | unrecorded worktrees/branches listed (informational)
+#   #1393 destructive gates:
+#           | an unmeasurable tree is NEVER read as clean (G1)
+#           | dirt is checked whether or not git still registers the worktree (G2)
+#           | the branch delete is a compare-and-delete, never `git branch -D` (G3)
+#           | a surviving tree keeps its branch (G4)
 
 set -euo pipefail
 
@@ -179,15 +184,68 @@ $SCAN --apply >/dev/null 2>&1 || true
 git branch | grep -q fix/unrecorded-1 && ok "unrecorded branch survives" || bad "unrecorded branch deleted"
 
 # 2i. poisoned record (arbitrary dir, not a registered worktree) → --apply
-#     must NEVER delete it (P1 safety gate, review #216)
+#     must NEVER delete it, and must NEVER delete its branch either (#1393 G2+G4).
+#     The old behaviour removed the dir never but the BRANCH always — a tree that
+#     survives with its ref force-deleted is one of the two halves #1393 reported.
+#     An unregistered tree's state cannot be read at all, so the branch may be the
+#     only ref to work that is sitting in it.
 mkdir -p "$FIX/important-dir"
 echo precious > "$FIX/important-dir/data.txt"
 git branch fix/poison-1
 $RW add --branch fix/poison-1 --worktree "$FIX/important-dir" --dispatch d-poison --ts 2026-08-01T00:00:00Z >/dev/null
-$SCAN --apply >/dev/null 2>&1 || true
+OUT="$($SCAN --apply 2>&1 || true)"
 [ -f "$FIX/important-dir/data.txt" ] && ok "--apply never deletes an unregistered dir" || bad "--apply DELETED an arbitrary dir (P1!)"
-git branch | grep -q fix/poison-1 && bad "poison branch survives --apply" || ok "--apply still deletes the local-only branch"
-assert_eq "$(wc -l < "$WORKTREES_RECORD" | tr -d ' ')" "0" "--apply prunes the poison record"
+assert_contains "$OUT" "ORPHANED BUT DIRTY" "unregistered dir is not classified 'safe to remove'"
+assert_contains "$OUT" "state UNMEASURABLE" "unmeasured state is named as such, never as clean"
+git branch | grep -q fix/poison-1 && ok "unregistered record keeps its branch (tree survives => ref kept)" || bad "--apply deleted the branch of a surviving tree"
+assert_eq "$(wc -l < "$WORKTREES_RECORD" | tr -d ' ')" "1" "--apply keeps the record for a human to resolve"
+assert_contains "$OUT" "KEPT by --apply: 1 record(s)" "a sweep that kept something says so"
+#     --force-dirty does NOT authorize removing a directory git does not vouch for.
+$SCAN --apply --force-dirty >/dev/null 2>&1 || true
+[ -f "$FIX/important-dir/data.txt" ] && ok "--force-dirty leaves an unregistered dir alone" || bad "--force-dirty DELETED an unregistered dir"
+git branch | grep -q fix/poison-1 && ok "--force-dirty keeps its branch" || bad "--force-dirty deleted its branch"
+$RW done --dispatch d-poison >/dev/null
+git branch -D fix/poison-1 >/dev/null
+
+# 2j. a registered worktree whose removal FAILS → the branch is KEPT too (#1393 G4).
+#     `git worktree remove --force` can fail (permissions, a held file); the old code
+#     then deleted the branch anyway, and the surviving tree's uncommitted work lost
+#     its only ref. Simulated by making the worktree directory non-writable.
+if [ "$(id -u)" = 0 ]; then
+    echo "  ⏭️  skipped 2j (running as root — chmod cannot deny removal)"
+else
+    git worktree add -q "$FIX/wt-keep" -b fix/keep-1
+    $RW add --branch fix/keep-1 --worktree "$FIX/wt-keep" --dispatch d-keep --ts 2026-08-01T00:00:00Z >/dev/null
+    chmod a-w "$FIX/wt-keep"
+    OUT="$($SCAN --apply 2>&1 || true)"
+    chmod u+w "$FIX/wt-keep"
+    if [ -d "$FIX/wt-keep" ]; then
+        git branch | grep -q fix/keep-1 && ok "failed worktree removal keeps the branch" || bad "branch deleted although the tree survived"
+        assert_contains "$OUT" "KEPT tree+ref+record" "the refusal is named"
+        $RW done --dispatch d-keep >/dev/null
+        git worktree remove --force "$FIX/wt-keep" >/dev/null 2>&1 || true
+        git branch -D fix/keep-1 >/dev/null 2>&1 || true
+    else
+        # The removal succeeded anyway on this platform/permission model; assert the
+        # ordinary contract instead of pretending the scenario ran.
+        git branch | grep -q fix/keep-1 && bad "worktree removed but branch survived" || ok "removal path still deletes tree+branch"
+    fi
+fi
+
+# 2k. the ref delete is a COMPARE-AND-DELETE, never `git branch -D` (#1393 G3):
+#     a moved tip must be refused rather than destroyed. Exercises the primitive the
+#     script now relies on, on this git.
+git branch fix/cas-1
+git branch fix/cas-2
+CAS_OLD="$(git rev-parse fix/cas-1)"
+git checkout -q fix/cas-1 && echo moved >> file.txt && git commit -qam moved && git checkout -q main
+if git update-ref -d refs/heads/fix/cas-1 "$CAS_OLD" 2>/dev/null; then
+    bad "update-ref -d accepted a MOVED tip (the CAS this script relies on does not hold)"
+else
+    git show-ref --verify --quiet refs/heads/fix/cas-1 && ok "update-ref -d refuses a moved tip (CAS holds)" || bad "CAS refusal removed the ref anyway"
+fi
+git branch -D fix/cas-1 fix/cas-2 >/dev/null 2>&1 || true
+assert_not_contains "$(grep -vE '^[[:space:]]*#' scripts/scan-orphans.sh)" "git branch -D" "script never calls git branch -D"
 
 # ── Summary ───────────────────────────────────────────────────────────────
 echo ""
