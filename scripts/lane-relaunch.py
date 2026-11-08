@@ -245,6 +245,13 @@ def relaunch(ws, label="", cwd=None, session=None, pi=None, new=False, wait=45.0
         return refuse("session %r has NO transcript on disk — the stored resume target can be stale, "
                       "and resuming from it would start an EMPTY session that looks like a restore. "
                       "Pass --new to start a fresh session deliberately." % (sid,))
+    # ⛔ THE PRE-SEND BINDING IS THE BASELINE — KEEP IT (review round 2, P1). `--new` used to null
+    # `sid`/`path` here and then treat "a resolved session HAS a transcript" as proof, which is a
+    # STATE, not a transition: a dead lane whose recorded id still has a transcript on disk (the
+    # COMMON case — #942's aggravating factor 2 is that it sometimes does not) confirmed on the FIRST
+    # loop iteration, before any wait, from a binding that existed BEFORE the relaunch. Exit 0 is the
+    # operator's strongest signal, and it was saying "came back" about a session nothing had started.
+    pre_sid, pre_stat = sid, (_stat(path) if path else None)
     if new:
         sid, path, fresh = None, None, True
 
@@ -281,7 +288,7 @@ def relaunch(ws, label="", cwd=None, session=None, pi=None, new=False, wait=45.0
 
     # ── 7. ONE send, with the trailing newline: `cmux send` without it TYPES BUT NEVER SUBMITS
     # (#941), which is a silent dispatch no-op. The newline is part of the payload on purpose.
-    before = _stat(path) if path else None
+    before = pre_stat if fresh else (_stat(path) if path else None)
     rc, out, err = runner(argv)
     obs["sent"] = True
     if rc != 0:
@@ -297,9 +304,13 @@ def relaunch(ws, label="", cwd=None, session=None, pi=None, new=False, wait=45.0
             # a fresh session has no transcript to advance: the transcript APPEARING is the proof.
             try:
                 sid_after = ls.resolve_session(ws)
-                appeared = bool(sid_after and ls.session_file(sid_after))
+                after = _stat(ls.session_file(sid_after)) if sid_after else None
             except Exception:                                    # noqa: BLE001
-                appeared = False
+                sid_after, after = None, None
+            # A DIFFERENT binding is a transition by itself. The SAME binding proves nothing unless
+            # its transcript APPEARED or moved relative to the pre-send baseline (which is `None` when
+            # the pre-send id had no file — the arm's own motivating case).
+            appeared = bool(after) and (sid_after != pre_sid or after != pre_stat)
             if appeared:
                 obs.update(confirmed=True, sid=sid_after, reason="fresh session appeared")
                 break

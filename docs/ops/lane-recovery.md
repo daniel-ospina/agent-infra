@@ -93,7 +93,10 @@ is destroyed.
 | `lane-status.py` not importable | the fleet's resolution primitives are not installed beside the tool; nothing was read, so nothing may be sent |
 
 `--new` starts a fresh session (no `--session`), and is the only way to relaunch a lane whose
-transcript is genuinely gone.
+transcript is genuinely gone. Its confirmation is anchored to the **pre-send binding**: a different
+session id resolving to a transcript, or the same id's transcript appearing/advancing relative to the
+baseline. A recorded id whose transcript still exists on disk (the common shape) is therefore *not*
+proof on its own — that would report `CONFIRMED` for a session nothing had started.
 
 ### Identifying the real session
 

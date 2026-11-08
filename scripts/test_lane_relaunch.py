@@ -273,6 +273,67 @@ def test_new_starts_a_fresh_session_and_needs_no_transcript(R, tmp_path):
     assert obs["action"] == "relaunch-fresh"
 
 
+class ScriptLS(FakeLS):
+    """A lane-status whose answers CHANGE between calls, so a transition can be told from a state.
+
+    `resolve_session` returns the next scripted value (the last one repeats); `session_file` maps an
+    id to a path. This is the only way to express "the SAME id already had a transcript before the
+    send" — the shape that made the fresh arm report a false CONFIRMED (review round 2, P1).
+    """
+
+    def __init__(self, resolve_seq, files, **kw):
+        super().__init__(**kw)
+        self._seq = list(resolve_seq)
+        self._files = dict(files)
+
+    def resolve_session(self, ws):
+        if len(self._seq) > 1:
+            return self._seq.pop(0)
+        return self._seq[0]
+
+    def session_file(self, sid):
+        return self._files.get(sid)
+
+
+def test_new_does_not_confirm_from_a_binding_that_predates_the_send(R, tmp_path):
+    """The P1 from review round 2: `--new` on a lane whose RECORDED id still has a transcript on
+    disk — the common shape — used to print CONFIRMED (exit 0) on the FIRST loop iteration, from a
+    session nothing had started. A state is not a transition."""
+    stale = tmp_path / "old.jsonl"
+    stale.write_text("{}\n")
+    ls = ScriptLS(resolve_seq=["old", "old"], files={"old": str(stale)})
+    cmux = FakeCmux()          # the send "succeeds" and NOTHING changes on disk
+    obs = R.relaunch("ws-1", ls=ls, runner=cmux, pi=sys.executable, cwd="/tmp/lane", new=True,
+                     sleep=lambda _s: None, clock=_clock())
+    assert obs["sent"] is True, obs
+    assert obs["confirmed"] is False, "confirmed from the pre-send binding: %r" % (obs,)
+    assert cmux.sent()[0][-1].count("--session") == 0
+
+
+def test_new_confirms_when_the_binding_CHANGES(R, tmp_path):
+    """The transition that IS proof: a different id resolves to a real transcript."""
+    stale = tmp_path / "old.jsonl"
+    stale.write_text("{}\n")
+    fresh_f = tmp_path / "new.jsonl"
+    fresh_f.write_text("{}\n")
+    ls = ScriptLS(resolve_seq=["old", "new", "new"], files={"old": str(stale), "new": str(fresh_f)})
+    obs = R.relaunch("ws-1", ls=ls, runner=FakeCmux(), pi=sys.executable, cwd="/tmp/lane", new=True,
+                     sleep=lambda _s: None, clock=_clock())
+    assert obs["confirmed"] is True, obs
+    assert obs["sid"] == "new"
+
+
+def test_new_confirms_when_the_SAME_id_gets_a_transcript(R, tmp_path):
+    """The arm's motivating case: the recorded id had NO file (a stale resume target). The same id
+    resolving to a file that did not exist at the baseline is a real appearance."""
+    fresh_f = tmp_path / "old.jsonl"
+    ls = ScriptLS(resolve_seq=["old", "old"], files={})
+    cmux = FakeCmux(on_send=lambda: (fresh_f.write_text("{}\n"), ls._files.__setitem__("old", str(fresh_f))))
+    obs = R.relaunch("ws-1", ls=ls, runner=cmux, pi=sys.executable, cwd="/tmp/lane", new=True,
+                     sleep=lambda _s: None, clock=_clock())
+    assert obs["confirmed"] is True, obs
+
+
 def test_dry_run_sends_nothing_and_prints_the_line(R, tmp_path):
     path = _transcript(tmp_path)
     cmux = FakeCmux()
