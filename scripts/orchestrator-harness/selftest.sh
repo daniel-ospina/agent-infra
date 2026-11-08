@@ -2815,7 +2815,13 @@ cmux() {
 tmux() {
   case "${1:-}" in
     ls) for _s in fix-77; do case "$KILLED" in *"$_s"*) continue ;; esac; printf '%s\n' "$_s"; done ;;
-    list-panes) echo 4242 ;;
+    # ⛔ NO PANE FOR `fix-77` — THAT IS THE ASSERTION IT BACKS (“whose PANE is gone”), and it is not
+    # cosmetic. `_wreap_pane_pid` SEEDS the pid the #2104 gate sums, so a stub answering a pid let a
+    # STRANGER's process decide that row. MEASURED RED IN CI (bash-suites, selftest.sh, head d7ce5cfc6):
+    # on a runner where pid 4242 existed the seed matched, `matched` became 1, the verdict stopped being
+    # “surface PROVEN GONE”, and the corpse was SPARED — the log line read `killed: []`. It passed on a
+    # box where 4242 happened not to exist, i.e. the row was green for a reason unrelated to the reaper.
+    list-panes) case "${3:-}" in *=fix-77) : ;; *) echo 4242 ;; esac ;;
     kill-session) KILLED="$KILLED ${3#=}" ;;
   esac
   return 0
@@ -2932,6 +2938,13 @@ if need "$TMP/reapw.sh" "reap_stale_workers() and its helpers are extracted from
   # launcher, so this pin follows it to the file that now owns it.
   grep -q 'kill-session -t "=\$name"' "$HERE/worker-terminal.sh" && rc=0 || rc=1
   ck "the reaper uses exact session targets (=name), not prefix matches" $rc
+  # ⛔ AND THE FIXTURE'S "PANE IS GONE" REALLY IS GONE (see the stub's `list-panes`). Without this pin a
+  # later edit that answered a pid here would silently turn the row above into "a stranger's pid decides"
+  # — which is exactly how it read green on a box where that pid was free and red on the runner where it
+  # was not.
+  got="$( . "$TMP/wtstub.sh"; . "$TMP/reapw.sh"; _wreap_pane_pid fix-77 )"
+  [ -z "$got" ] && rc=0 || { rc=1; echo "      a GONE pane still resolved to pid [$got]"; }
+  ck "…and its PANE-GONE record resolves to NO pane pid (the premise the row above rests on)" $rc
   grep -q 'list-panes -t "=\$name"' "$HERE/worker-terminal.sh" && rc=0 || rc=1
   ck "the reaper resolves the pane pid with an exact target" $rc
   unset -f cmux tmux kill
