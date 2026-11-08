@@ -5150,12 +5150,13 @@ fi
 #     → :2482 :4186 :6501 :6613, plus a comment mention at :2356) and the
 #     same four PREDICATE sites are at head
 #     (`grep -n 'grep -qxF' scripts/record-review.sh` prints all four PREDICATE lines at head —
-#     CITE-CHECK: :2546 :4272 :6639 :6813, plus a comment mention at :2415; `14.1c-CITE` below
-#     re-derives these numbers, so they cannot rot silently): the only diff hunk at
-#     `post_marker()` (:2524) ADDS A COMMENT — the
+#     CITE-CHECK: :2546 :4272 :6641 :6815, plus a comment mention at :2415; `14.1c-CITE` below
+#     re-derives these numbers, so they cannot rot silently): in #3168's diff the only
+#     hunk at `post_marker()` (:2524) ADDS A COMMENT — this PR does not touch
+#     `post_marker()` at all — and the
 #     predicate line beside it (:2546) is CONTEXT, not a change.
 #     WHAT THE VECTOR BELOW ACTUALLY PINS: the BODY-APPEND site
-#     (`if ! grep -qxF -- "$MARKER" <<<"$BODY"`; on main at bd1b205d :6501 — at head CITE-CHECK: :6639). It is a
+#     (`if ! grep -qxF -- "$MARKER" <<<"$BODY"`; on main at bd1b205d :6501 — at head CITE-CHECK: :6641). It is a
 #     MAIN-REGRESSION pin — reverting this PR leaves 14.1c GREEN, and 14.10f is a
 #     main-regression pin for the same reason. Keeping them is right (main's
 #     anchoring should not silently regress); calling them evidence about this diff
@@ -5177,11 +5178,11 @@ fi
 #     evidence that a reader can check the claim. Prose rots silently: the comment block
 #     added above the persist site moved BOTH body-presence predicates by +9 and the numbers
 #     beside them stayed put — so the sentence went on *reading* correct while pointing at
-#     prose (measured: the two numbers said :6625 / :6770, where :6625 is "same class as the
-#     comment-side fix" and :6770 is the `#633 review finding 3` block; the predicates were
-#     :6634 / :6779). A sibling commit then moved them AGAIN, to :6639 / :6796, and its
-#     response was to delete the numbers — which removes the rot but also removes the reader's
-#     target. Both intents are kept here: the number stays, and it is CHECKED.
+#     prose (MEASURED, one commit per pair: the same two predicate cites read `:6625` / `:6770`
+#     at `dc7e3ae99`, `:6634` / `:6779` at `921109de2` and `:6639` / `:6796` at `17551325e` as
+#     comment blocks were added above them — at this head they are `:6641` / `:6815`). One
+#     lane's response was to delete the numbers — which removes the rot but also removes the
+#     reader's target. Both intents are kept here: the number stays, and it is CHECKED.
 #     Every head number printed FOR A BODY-PRESENCE PREDICATE is TAGGED `CITE-CHECK:`; the tagged
 #     numbers are parsed back OUT, each must land on a `grep -qxF` line, and the deduped set must
 #     EQUAL the executing sites — so a predicate added without a citation reddens too, and a stale
@@ -6031,13 +6032,14 @@ assert_eq "$REC_BEFORE_14B" "$(cat "$F_HOME/.pi/agent/reviews/daniel-ospina-agen
 #       not. `if command grep -qxF -- "$marker" <<<"$body"` is ALREADY `-qxF` on main
 #       (`git show bd1b205d:scripts/record-review.sh | grep -n 'grep -qxF'` — the sha is NAMED
 #       because `origin/main` moves and a bare "main :NNNN" rots the moment it does → :2482),
-#       and the only diff hunk at `post_marker()` (head :2524) ADDS A COMMENT above it — the
-#       predicate line (head :2546) is CONTEXT. Reverting this PR leaves this vector GREEN; it is kept
+#       and in #3168's diff the only hunk at `post_marker()` (head :2524) ADDS A COMMENT above
+#       it (this PR does not touch `post_marker()` at all) — the
+#       predicate line (head :2546) is CONTEXT. Reverting #3168 leaves this vector GREEN; it is kept
 #       because main's anchoring should not silently regress, and it is labelled so the
 #       next reader does not mistake it for evidence about this diff. The predicate must
 #       match the gate's line-anchored `^…$` admission, exactly like the three other
 #       sites already anchored on main (bd1b205d :4186 :6501 :6613) — the same four that the grep
-#       above prints at head, CITE-CHECK: :4272 :6639 :6813 (`14.1c-CITE` re-derives the triple).
+#       above prints at head, CITE-CHECK: :4272 :6641 :6815 (`14.1c-CITE` re-derives the triple).
 #       ⛔ ASSERTS THE TRANSPORT (a PATCH was issued), not the exit code: the destructive
 #       mutant also exited 0.
 if [ -n "${QB_LINE:-}" ]; then
