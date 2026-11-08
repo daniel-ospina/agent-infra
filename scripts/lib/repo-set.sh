@@ -899,11 +899,18 @@ _rs_origin_slug() {
     # sibling is PRESENT and `_rs_py_resolve` is empty, so the very next whole-set WARN says `or no python3
     # resolves` while this line said it could not see. A residue is for what is genuinely unaccounted for,
     # not for the one remaining named cause.
+    # ⛔ AND IT MUST NOT CLAIM THE CHILD "COULD BE RUN" EITHER (round 45, P2 — measured). The line said
+    # `produced no answer even though it could be run`, which is the SAME false-cause class one arm down:
+    # `_rs_py_resolve` non-empty proves RESOLUTION, never RUNNABILITY (`command -v` reports how the shell
+    # would resolve a name without invoking it; POSIX splits 126 `found but not invokable` from 127).
+    # Measured: a stale `python3` shim on `PATH` that exits 127 resolves, produces no stdout, and made
+    # this line assert it could be run — about the one interpreter that provably could not. The honest
+    # residue names no cause at all; the resolution-only claim lives in the named arm above.
     if [ -z "$(_rs_py_resolve 2>/dev/null)" ]; then
       printf '\tno python3 resolves here, so pr-doctor.py could not be RUN at all'
       return 0
     fi
-    printf '\tpr-doctor.py produced no answer even though it could be run, and this reader cannot see why'
+    printf '\tpr-doctor.py produced no answer, and this reader cannot see why'
     return 0
   fi
   printf '%s' "$out"

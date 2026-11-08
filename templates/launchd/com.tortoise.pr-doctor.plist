@@ -116,7 +116,11 @@
          `apply_repo(multi=True)` REASSIGNS the module-level names per repo, and
          `run_all_repos()` then calls `canonical_paths()` before recording, so the set's
          aggregate lands back on the canonical names. The inversion is worse than the
-         omission it replaced, because THREE readers open those canonical files BY NAME:
+         omission it replaced, because THREE readers open the canonical STATUS file by
+         name (the STATUS file, NOT the log: nothing live READS `pr-doctor.log` — one
+         place appends a child's stdout to it and the rest only print or mention the
+         path, which is why saying "those canonical files" would promise a log
+         consumer that does not exist):
          `scripts/heartbeat-loop.sh`, `scripts/objective.py`'s `pr_doctor_last_run`
          (which renders the same record into the beat) and
          `scripts/lib/fleet-inventory.sh`'s

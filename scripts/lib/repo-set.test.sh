@@ -31,7 +31,10 @@
 # state dir, config file or launchd domain is touched. External dependencies: `git`, and `python3` for
 # the doctored-doctor mutation fixtures (both are already required by the reader's own delegated
 # proofs, so the suite needs nothing a real box does not — INCLUDING NO `timeout`, which macOS does not
-# ship: `_rs_bound` below is the pure-bash substitute).
+# ship: `_rs_bound` below is the substitute). ⛔ "PURE-BASH" DESCRIBED THE RUNNER, NOT ITS PROOFS
+# (round 45 — the review caught this sentence contradicting the bound's own header further down):
+# `_rs_bound` is pure BASH, and it also calls `ps`, `awk` and `sleep`, all of which stock macOS and
+# Linux ship — and the bound's own `ps`-unavailable residual is written around that dependency.
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$HERE/../.." && pwd)"
 # `set -u` comes AFTER the two resolutions on purpose: a harness that streams the shard list into a
@@ -1872,6 +1875,23 @@ PYMI
 printf 'slug=o/n checkout=%s state=%s/st\n' "$T/tortoise" "$T" > "$T/nointerp.conf"
 ck "m46 sibling PRESENT + NO interpreter: the origin line names THAT, never 'cannot see why'" \
    'o="$(_rs_bound 30 env REPO_SET_FILE="$T/nointerp.conf" /bin/bash "$MI/lib/repo-set.sh" check 2>&1)"; grep -q "no python3 resolves here, so pr-doctor.py could not be RUN at all" <<<"$o" && ! grep -q "cannot see why" <<<"$o"'
+# ⛔ AND THE RESIDUE MUST NOT CLAIM THE CHILD "COULD BE RUN" EITHER (review round 45, P2 — measured).
+# m45 covers the sibling that will not LOAD; m46 covers no interpreter resolving. This is the third shape
+# the residue got wrong: `python3` RESOLVES but cannot EXEC — a stale shim that exits 127 — so
+# `_rs_py_resolve` is non-empty and the old line asserted the child "could be run" about the one
+# interpreter that provably could not. `command -v` reports how the shell would resolve a name WITHOUT
+# invoking it (POSIX splits 126 `found but not invokable` from 127), so resolution is never evidence of a
+# run. The `lib/` subdir is load-bearing for the same reason it is in m46 — it is the real layout
+# `_rs_doctor_py` resolves the sibling from, so the failure under test is the EXEC, not a missing doctor.
+# ⛔ THE `env` SCOPING IS LOAD-BEARING TOO: the helper needs `ps`/`sleep` from the AMBIENT path, so the
+# shim goes on the CHILD's PATH only. Measured: pre-fix the line reads "even though it could be run";
+# post-fix it reads "produced no answer, and this reader cannot see why".
+MP="$T/unrunnable-py"; mkdir -p "$MP/lib" "$MP/pybin"
+cp "$READER" "$MP/lib/repo-set.sh"; cp "$REPO_ROOT/scripts/pr-doctor.py" "$MP/pr-doctor.py"
+printf '#!/bin/sh\nexit 127\n' > "$MP/pybin/python3"; chmod +x "$MP/pybin/python3"
+printf 'slug=o/n checkout=%s state=%s/st\n' "$T/tortoise" "$T" > "$T/unrunnable.conf"
+ck "m47 python3 RESOLVES but cannot EXEC: the residue names NO cause — never 'could be run'" \
+   'o="$(_rs_bound 30 env PATH="$MP/pybin:$PATH" REPO_SET_FILE="$T/unrunnable.conf" /bin/bash "$MP/lib/repo-set.sh" check 2>&1)"; grep -q "cannot see why" <<<"$o" && ! grep -q "could be run" <<<"$o"'
 ck "m37 …while the SHIPPED doctor still REFUSES a genuinely different slug on the same checkout (rc 1)" \
    '[ "$(run_reader_rc "$T/nonorm-wrong.conf" check)" = 1 ]'
 ck "m38 …and with the shipped doctor the \`.git\` spelling is simply ACCEPTED, with no WARN" \
