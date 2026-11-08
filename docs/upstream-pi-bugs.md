@@ -1225,14 +1225,27 @@ reading.**
   CPU demand — this report says so above, and load 17.70 is not explained by any
   CPU share here; only the CPU comparison is made.)
 - **Main thread vs workers** (the report's caveat quantified, though *not* the
-  size column, which stays missing below): on the processes that were busy, the
-  main thread carried **0.61–1.00** of the ΔCPU; the `V8Worker` pool's largest
-  observed share was **0.41**. Those **cannot both be true of the same busy set**: a
-  0.61 main-thread floor leaves at most 0.39 for every other thread, so a 0.41
-  `V8Worker` maximum is arithmetically excluded — both are recorded as measured, they
-  do not add up, and one of the two must be wrong. The load-bearing observation is
-  the main-thread range: the burn, when it exists, is main-thread JS — consistent
-  with the render-frame mechanism and *not* primarily collector throughput.
+  size column, which stays missing below). Over the **26 busy samples at ≥3% of a
+  core** — the resolution at which a per-thread share is more than a handful of
+  ticks — the main thread carried **0.610–0.876** of the process ΔCPU and the
+  `V8Worker` pool **0.095–0.400**; within every row those two shares plus the
+  remaining threads land within **0.015** of 1 (0.936–1.015 across all four
+  windows). **An earlier revision of this bullet quoted 0.61–1.00 beside a single
+  0.41 `V8Worker` maximum and read the pair as a contradiction. That was an
+  artifact of the quoting, not a finding:** 1.00 came from samples at 0.0–0.1% of a
+  core, where a process's whole ΔCPU is one thread and the split is meaningless,
+  while 0.41 came from a *different* sample — so the pair described no single
+  population and the "0.61 + 0.41 > 1" impossibility dissolved once both ends were
+  read over one set. What remains is an overshoot of **at most 0.015**, which is
+  the process-level total (`/proc/<pid>/stat`) and the per-thread counters
+  (`/proc/<pid>/task/<tid>/stat`) being read a moment apart. The load-bearing
+  observation survives unchanged and is not weakened by the correction: the main
+  thread carries the majority of ΔCPU in **every** sample at ≥3% of a core (its
+  floor there is 0.610), so the burn, when it exists, is main-thread JS —
+  consistent with the render-frame mechanism and *not* primarily collector
+  throughput. Below that threshold the split is not claimed: at 0.7–1.3% of a
+  core a sample's whole ΔCPU is a few ticks, and the shares there range 0.32–1.00
+  for the main thread — the resolution limit, not a second finding.
 
 **What this settles, and what it does not.** What it **records** is narrower than
 an independent negative: **no process labelled idle on one Linux x86_64 fleet box
