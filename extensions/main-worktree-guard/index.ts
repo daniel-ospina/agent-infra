@@ -5094,8 +5094,28 @@ function _reportClassifierDegradation(ctx?: { ui?: { notify?: (msg: string, leve
     `   cause: ${reason}`,
     "",
   ];
+  // ── ORDER MATTERS: the DURABLE row is written FIRST, and each surface has its OWN try. ──
+  // #853 review (cycle 2, P3): with a single `try` around all three surfaces and the row LAST, a
+  // `ui.notify` that THREW skipped the row entirely — and because the pid is marked above, the loss
+  // was PERMANENT for the process: the one surface a report can read would never learn the session
+  // ran unguarded, while the banner suggested it could. A presentation surface must never be able to
+  // cost the machine-readable record. Each arm is isolated for the same reason.
+  try {
+    appendJsonl({
+      event: "guard_degraded",
+      extension: "main-worktree-guard",
+      reason: "classifier_load_failed",
+      error: reason,
+      session_cwd: process.cwd(),
+    });
+  } catch {
+    // appendJsonl is already fail-safe internally; this arm exists so the property is LOCAL and
+    // provable here too — a report must never change a verdict, including by throwing.
+  }
   try {
     console.warn(lines.join("\n"));
+  } catch { /* a console that throws must not cost the notify arm below */ }
+  try {
     // A warn line in a noisy startup log is exactly what nothing reads (#853). An INTERACTIVE
     // session also gets the SDK's error-level notification; a print-mode lane's own log carries
     // the banner above, so the surface is never absent — only one of the two applies.
@@ -5107,15 +5127,8 @@ function _reportClassifierDegradation(ctx?: { ui?: { notify?: (msg: string, leve
         "error"
       );
     }
-    appendJsonl({
-      event: "guard_degraded",
-      extension: "main-worktree-guard",
-      reason: "classifier_load_failed",
-      error: reason,
-      session_cwd: process.cwd(),
-    });
   } catch {
-    // A report must never change a verdict — including by throwing from here.
+    // The banner and the durable row above have already been delivered.
   }
 }
 

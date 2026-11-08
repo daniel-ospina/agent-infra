@@ -1056,14 +1056,18 @@ mod.default({ on(n, f) { if (!handlers.has(n)) handlers.set(n, []); handlers.get
 const start = handlers.get("session_start")?.[0];
 // Fire session_start TWICE: the report is once per session process, so a
 // /resume must not duplicate the banner or the audit row.
-const ctx = { ui: { notify: (msg, level) => notified.push({ msg, level }) } };
+const throwNotify = process.env.PROBE_THROW_NOTIFY === "1";
+const ctx = { ui: { notify: (msg, level) => {
+  if (throwNotify) throw new Error("injected ui.notify throw (#853 test)");
+  notified.push({ msg, level });
+} } };
 if (typeof start === "function") { await start({}, ctx); await start({}, ctx); }
 process.stdout.write(JSON.stringify({ warns, notified, registered: !!start, declaredEvents }) + "\\n");
 `;
 
   // Hermetic HOME per arm: the gate event lands in $HOME/.pi/agent/audit/
   // gate-events.jsonl, so each arm reads only the row it caused.
-  const runArm = ({ printMode = false, injectFailure = true, allowMainEdits = false } = {}) => {
+  const runArm = ({ printMode = false, injectFailure = true, allowMainEdits = false, throwNotify = false } = {}) => {
     const home = realpathSync(mkdtempSync(join(tmpdir(), "guard-degraded-home-")));
     const env = { ...process.env, HOME: home };
     // isPrintMode() reads env.PI_MODE first; argv here carries no -p/--print.
@@ -1075,6 +1079,7 @@ process.stdout.write(JSON.stringify({ warns, notified, registered: !!start, decl
     // early from (`index.ts:5164`). Kept as an ENV seam rather than a ctx stub so
     // the arm exercises the real `_isAllowMainEdits()` the handler consults.
     if (allowMainEdits) env.AGENT_ALLOW_MAIN_EDITS = "1";
+    if (throwNotify) env.PROBE_THROW_NOTIFY = "1"; else delete env.PROBE_THROW_NOTIFY;
     const out = spawnSync(process.execPath, ["--input-type=module", "-e", probe], {
       env, encoding: "utf8", timeout: 120_000, cwd: HERE,
     });
@@ -1191,7 +1196,11 @@ process.stdout.write(JSON.stringify({ warns, notified, registered: !!start, decl
       (hatched.parsed.warns ?? []).some((w) => w.includes("MAIN-WORKTREE GUARD — DEGRADED")) &&
       hatched.auditRows.filter((r) => r.event === "guard_degraded").length === 1,
     `parsed=${JSON.stringify(hatched.parsed ?? null).slice(0, 300)} audit=${JSON.stringify(hatched.auditRows).slice(0, 200)} stderr=${hatched.stderr}`);
-  expectTrue("C12b: the hatched arm really is hatched AND the call sits ABOVE the hatch return (source-order pin)",
+  // Its NAME states exactly what its body checks: the source ORDER. That the hatch arm really took
+  // the early return is proven BEHAVIOURALLY by C12 (move the call below it and C12 goes red —
+  // measured on a copy), not by reading the env back, which would only restate
+  // `_isAllowMainEdits()` (`index.ts:506` = `_getEnv("ALLOW_MAIN_EDITS") === "1"`).
+  expectTrue("C12b: the call sits ABOVE the escape-hatch return inside the session_start handler (source-order pin)",
     // C12 alone is only conclusive if the hatch was genuinely ON — otherwise it is
     // indistinguishable from the non-hatched arms. Reading the env back would just
     // restate `_isAllowMainEdits()` (`index.ts:506` = `_getEnv("ALLOW_MAIN_EDITS") === "1"`),
@@ -1206,6 +1215,22 @@ process.stdout.write(JSON.stringify({ warns, notified, registered: !!start, decl
       return callAt > handlerAt && hatchAt > handlerAt && callAt < hatchAt;
     })(),
     `handler=${INDEX_TS}: pi.on("session_start") / _reportClassifierDegradation / _isAllowMainEdits order — the report must come FIRST, before the escape-hatch return`);
+
+  // ── ORDER-INDEPENDENCE: a PRESENTATION surface that throws must not cost the durable row. ──
+  // Numbered C14/C14b: C13/C13b is the emit↔vocabulary pin, and two different assertions on one
+  // label is a report that cannot be cited.
+  // Before the fix the row was written AFTER `ui.notify` inside ONE try, so a throwing notify skipped
+  // it — and the per-pid dedupe made that loss PERMANENT for the process, leaving the machine-readable
+  // surface (the whole point of #853) silently absent while the banner implied otherwise.
+  const throwingNotify = runArm({ printMode: false, throwNotify: true });
+  expectTrue("C14: a THROWING ui.notify still leaves the durable `guard_degraded` row (written first, each surface its own try)",
+    !!throwingNotify.parsed &&
+      throwingNotify.auditRows.filter((r) => r.event === "guard_degraded").length === 1 &&
+      (throwingNotify.parsed.warns ?? []).some((w) => w.includes("MAIN-WORKTREE GUARD — DEGRADED")),
+    `parsed=${JSON.stringify(throwingNotify.parsed ?? null).slice(0, 200)} audit=${JSON.stringify(throwingNotify.auditRows).slice(0, 200)} stderr=${throwingNotify.stderr}`);
+  expectTrue("C14b: the throwing arm's session_start did NOT propagate the throw (a report never changes a verdict)",
+    !!throwingNotify.parsed && throwingNotify.parsed.registered === true && throwingNotify.status === 0,
+    `status=${throwingNotify.status} parsed=${JSON.stringify(throwingNotify.parsed ?? null).slice(0, 120)}`);
 }
 
 await partC();

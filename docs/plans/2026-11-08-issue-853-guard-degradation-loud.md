@@ -49,20 +49,27 @@ state without anyone parsing prose." (`extensions/review-enforcer/index.ts:9120`
 `_reportClassifierDegradation(ctx)` in `extensions/main-worktree-guard/index.ts`, called as the FIRST
 statement of the registered `session_start` handler:
 
-1. **A LOUD boxed banner** via `console.warn` naming the STATE, the consequence (bash git mutations
+1. **A durable `guard_degraded` event** in `~/.pi/agent/audit/gate-events.jsonl`
+   (`extension`, `reason`, `error`, `session_cwd`, `ts`), written **FIRST**, declared in the
+   `GateEventName` vocabulary in `extensions/shared/audit-log.ts` so a report matches on a recorded
+   name rather than a free string. ⛔ The vocabulary is **derived from a runtime `GATE_EVENT_NAMES`
+   array**, not a bare type union: `appendJsonl` takes an unconstrained `event` and no tsconfig covers
+   `extensions/` (they are type-stripped, never typechecked), so a bare union would be DOCUMENTATION
+   and removing a member would redden nothing — measured. With the array, membership is assertable:
+   deleting `"guard_degraded"` reddens `audit-log.test.ts` **and** Part C **C13**.
+2. **A LOUD boxed banner** via `console.warn` naming the STATE, the consequence (bash git mutations
    allowed; write/edit in a main checkout fails OPEN — #761), the **cause** (`_classifierLoadFailure`,
    recorded in the load `catch`), and the **remedy** (reinstall the extension tree; re-run
    `test-module-load.mjs`), plus the deliberate acceptance (`AGENT_ALLOW_MAIN_EDITS=1`).
-2. **`ctx.ui.notify(…, "error")`** in interactive sessions — a warn line in a noisy startup log is
+3. **`ctx.ui.notify(…, "error")`** in interactive sessions — a warn line in a noisy startup log is
    exactly what nothing reads.
-3. **A durable `guard_degraded` event** in `~/.pi/agent/audit/gate-events.jsonl`
-   (`extension`, `reason`, `error`, `session_cwd`, `ts`), declared in the `GateEventName` vocabulary in
-   `extensions/shared/audit-log.ts` so a report matches on a recorded name rather than a free string.
-   ⛔ The vocabulary is **derived from a runtime `GATE_EVENT_NAMES` array**, not a bare type union:
-   `appendJsonl` takes an unconstrained `event` and no tsconfig covers `extensions/` (they are
-   type-stripped, never typechecked), so a bare union would be DOCUMENTATION and removing a member
-   would redden nothing — measured. With the array, membership is assertable: deleting
-   `"guard_degraded"` reddens `audit-log.test.ts` **and** Part C **C13**.
+
+⛔ **THE ORDER IS THE POINT, and each surface gets its OWN `try`** (review cycle 2, P3). With one
+`try` around all three and the row LAST, a `ui.notify` that THREW skipped the row — and because the
+pid is marked before it, the loss was PERMANENT for the process: the only machine-readable surface
+would never learn the session ran unguarded, while the banner implied it could. A presentation
+surface must never be able to cost the durable record. Pinned by **C14** (a throwing `notify` still
+leaves exactly one row) and **C14b** (the throw does not propagate out of `session_start`).
 
 Properties that make it safe:
 
@@ -72,7 +79,8 @@ Properties that make it safe:
   `if (_isAllowMainEdits()) return;`).
 - **Once per session process** (`_classifierDegradedPids`), so `/resume` cannot spam the banner or
   duplicate the audit row.
-- **Never throws** — the whole report is wrapped: a report that throws would change a verdict.
+- **Never throws, and no surface can suppress another** — each of the three arms has its own `try`,
+  so a throw in one cannot cost the others; a report that throws would change a verdict.
 - **Print-mode lanes still get the banner and the event**; only the `ui.notify` arm is skipped
   (there is no UI). No surface is silent.
 
@@ -91,22 +99,29 @@ Properties that make it safe:
 
 ## Implementation steps (built — each with the test that proves it)
 
-1. `audit-log.ts` — add `"guard_degraded"` to `GateEventName` → `npx tsx extensions/shared/audit-log.test.ts` (5 passed).
+1. `audit-log.ts` — declare `"guard_degraded"` in the runtime `GATE_EVENT_NAMES` array the `GateEventName` type derives from → `npx tsx extensions/shared/audit-log.test.ts` (8 passed).
 2. `index.ts` — record the load failure in the `catch`; add `_reportClassifierDegradation`; wire it as
    the first `session_start` statement → `test-module-load.mjs` **C1-C6** (banner content, cause,
    remedy, dedupe, notify level) and **C7-C8** (event row + attribution).
-3. `test-module-load.mjs` — Part C child-process probe, four arms (interactive-degraded,
-   print-mode-degraded, healthy control, escape-hatch-on) → **C9** (print mode keeps banner + event,
-   no notify), **C11/C11b** (a healthy load reports nothing and really loaded the classifier),
-   **C12/C12b** (the report is NOT behind the escape-hatch return — behaviourally, plus a
+3. `test-module-load.mjs` — Part C child-process probe, five arms (interactive-degraded,
+   print-mode-degraded, healthy control, escape-hatch-on, throwing-notify) → **C9** (print mode keeps
+   banner + event, no notify), **C11/C11b** (a healthy load reports nothing and really loaded the
+   classifier), **C12/C12b** (the report is NOT behind the escape-hatch return — behaviourally, plus a
    source-order pin so a later refactor cannot silently move it under the hatch), **C13/C13b** (the
-   name the guard WRITES is a name the real module DECLARES — emit ↔ vocabulary, end-to-end).
-4. Mutation proof — every arm must be able to go RED, or it is a pin that cannot fail:
-   - delete the `session_start` wiring → **9 red** (C1-C9);
-   - delete only the `appendJsonl` block → **3 red** (C7-C9);
-   - move the call BELOW `if (_isAllowMainEdits()) return;` → **12 red** (C1-C9, C12, C12b);
-   - delete the `"guard_degraded"` vocabulary member → **C13 red + `audit-log.test.ts` red**.
-   All four restored.
+   name the guard WRITES is a name the real module DECLARES — emit ↔ vocabulary, end-to-end), and
+   **C14/C14b** (a throwing `ui.notify` still leaves the durable row, and does not propagate).
+   ⛔ The labels are disjoint on purpose: `C13` is the vocabulary pin, `C14` the ordering pin — a
+   report citing "C13" must name ONE assertion.
+4. Mutation proof — every arm must be able to go RED, or it is a pin that cannot fail. **All five
+   re-measured at this head against the 152-assertion baseline, not carried forward:**
+   - delete the `session_start` wiring → **13 red** (C1-C9, C12, C12b, C13, C14);
+   - delete only the durable row → **6 red** (C7, C8, C9, C12, C13, C14);
+   - restore the pre-fix ordering (row LAST, one shared `try`) → **1 red** (C14);
+   - move the call BELOW `if (_isAllowMainEdits()) return;` → **2 red** (C12, C12b);
+   - delete the `"guard_degraded"` vocabulary member → **C13 red + `audit-log.test.ts` 7/8**.
+   All restored. ⛔ The placement mutation reddens 2 arms, not 13: in a degraded session
+   `isWorktreeCwdWrite` is the fail-safe stub `() => false` (`index.ts:157`), so the non-hatched arms
+   still reach a call placed further down the handler — which is exactly why C12 had to be added.
 
 ## Out of scope — must NOT be raised
 
