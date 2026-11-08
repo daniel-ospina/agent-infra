@@ -604,7 +604,27 @@ ck "a classifier that cannot run → it STAMPS WAITING_CLASSIFIER (an unjudged h
    $([ "$RC" = 2 ] && [ "$(cat "$OT/state/lanemerge-61.lastdisp" 2>/dev/null)" = "WAITING_CLASSIFIER" ] \
       && [ "$(cut -d' ' -f1 "$OT/state/lanemerge-61.verdict" 2>/dev/null)" = WAITING_CLASSIFIER ] && echo 0 || echo 1)
 
-# ── 11c-sedecies. the budget hand-off has an arm per disposition it can actually find ──────────
+# ── 11c-septendecies. `O` MUST NOT BE REQUIRED IN THE ENVIRONMENT (fresh review, P1) ───────────
+# ⛔ THE GATE-SOURCING LOOP LANDED AT FILE SCOPE ABOVE THE `O` DEFAULT AND DIED ON `set -u`. `O` is
+# documented as optional (`O="${O:-$HOME/orchestrator}"`) but that default is set BELOW argv parsing,
+# so `"$O/lane-report-gate.sh"` raised `line 85: O: unbound variable` and exited **1** before a single
+# argument was read — an exit code outside this file's own contract (0/10/11/12/13/14/15/2), on the box
+# shape the header supports: `lane.sh` sets `O` WITHOUT `export`, and the brief hands the lane a literal
+# `$O/lane-merge.sh` path. Every other row in this suite exports `O`, which is exactly why none saw it.
+# The assertion is that argv parsing is REACHED: a bad flag must produce the documented 2, not 1.
+OUT="$(env -u O bash "$SCRIPT" --definitely-not-a-flag 2>&1)"; RC=$?
+ck "with `O` UNSET the script still reaches argv parsing (a bad flag is usage 2, not an unbound-variable 1)" \
+   $([ "$RC" = 2 ] && echo 0 || echo 1)
+case "$OUT" in
+  *"unbound variable"*) ck "…and it does not die on \$O under set -u" 1 ;;
+  *) ck "…and it does not die on \$O under set -u" 0 ;;
+esac
+# The same run with a VALID shape must not be refused by `O` either: `--help` names the usage contract.
+OUT="$(env -u O bash "$SCRIPT" --help 2>&1)"; RC=$?
+ck "…and `--help` with `O` unset exits 0 instead of 1" $([ "$RC" = 0 ] && echo 0 || echo 1)
+
+# ── 11c-octodecies. the budget hand-off has an arm per disposition it can actually find ────────
+────
 # ⛔ WITHOUT THIS the `WAITING_NO_VERDICT` arm was dead text: deleting it left ALL 63 green (measured),
 # so the hand-off still said "the merge chain has not resolved this PR" about chunks that had resolved
 # the question (nothing to fix) — and the same catch-all swallowed CHECKS/CLASSIFIER.

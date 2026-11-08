@@ -318,6 +318,18 @@ print(json.dumps({"ok": True, "rules": [], "suites": 1, "failing_suites": 0,
                   "head": head, "head_moved_since_write": False}))
 LIAR
 drive 3 "the worktree's OWN lying consumer does not grade it — the trusted checkout's consumer decides" STUB_OK=0 STUB_RC=3 STUB_FAILING=1
+# ⛔ THE SAME ESCAPE THROUGH THE `$repo` HALF (fresh review, P2). `lane-merge.sh` resolves the trusted
+# checkout itself and passes MAIN, so the row above held for that carrier by CONVENTION. `merge-one.sh`
+# passes `$REPO` straight from argv — and a lane that runs the deployed merge-one.sh from its own
+# worktree hands the gate the graded tree, so the liars above become the grader. The gate now resolves
+# the consumer from the repo's MAIN worktree, which makes the property hold for every carrier. Fed the
+# LANE worktree as `$repo`, the lying consumer there must STILL not decide.
+out="$(env STUB_OK=0 STUB_RC=3 STUB_FAILING=1 bash "$GATE" --check "$WT" "feat/2977-tm" "$WT_HEAD" 2>&1)"; rc=$?
+if [ "$rc" = 3 ]; then ok "a lane worktree passed as \$repo does not grade itself — the main worktree's consumer still decides (rc=$rc)"; else bad "the lane worktree graded itself when handed as \$repo: expected rc=3, got rc=$rc :: $out"; fi
+case "$out" in
+  *reason=recorded-suites-did-not-pass*) ok "…and the verdict is the MAIN worktree consumer's (its rule set), not the lane's liar" ;;
+  *) bad "the verdict did not come from the main worktree's consumer: $out" ;;
+esac
 # ⛔ AND A LANE CANNOT SUPPLY THE MISSING VERIFIER EITHER (fresh review, P1). A non-participant repo
 # normally gets 7 (report present, no writer). A lane that ADDS tools/worktree_report.py to its own
 # branch must not convert that into a PASS — the `$wt` fallback that allowed it is gone.
