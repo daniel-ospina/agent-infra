@@ -5568,6 +5568,27 @@ assert_not_contains "$RECORD_ERR" "would find NOTHING" \
     "14.1d(i) …while never PREDICTING the flush's output, which depends on a file this run never read"
 assert_not_contains "$RECORD_ERR" "neither delivers these bytes" \
     "14.1d(i) …and never asserting the flush cannot deliver these bytes — the marker is deterministic, so an earlier run at this head holds exactly them (round 9 falsified this)"
+# ⛔ THE EXIT-5 WHY-CLAUSE MAY NAME NO CAUSE THIS ARM CANNOT OBSERVE (#3712 review at
+# `0aca7410b`, finding F2 — the MISSING MUTATION LEG). `post_review_evidence_comment`
+# returns 1 for TWO different events: the comment READ failed (the post is then SKIPPED
+# by design — never attempted) and the POST itself was refused. This arm discards the
+# error text, so it cannot tell them apart and may name NEITHER. Main's wording did name
+# the POST — "the #1224 evidence COMMENT could not be posted either" — and that is the
+# misdirection the round-5 fix removes: a lane reading it goes hunting API permissions
+# instead of configuring the gate key. Until now NOTHING pinned it: restoring main's
+# sentence at the why-clause left EVERY row of this capture GREEN (measured in the PR
+# body), which is the absent-mutation-leg class of agent-infra#3442 — the fix was
+# invisible to the suite. These rows read the SAME already-live rc-5 capture as the rows
+# above (signed key ⇒ this arm is reached; persist failed ⇒ this branch is the one it
+# prints), so the coverage costs three rows and no new vector.
+# The two POSITIVE rows come first ON PURPOSE: the negative below cannot pass on a
+# capture that never reached the arm — it would also pass on an EMPTY string.
+assert_contains "$RECORD_ERR" "NO durable comment copy of its own" \
+    "14.1d(i) …and the exit-5 why-clause reports what THIS RUN published, not what the API did (#3712 F2)"
+assert_contains "$RECORD_ERR" "SKIPPED by design" \
+    "14.1d(i) …naming the never-ATTEMPTED branch as well as the refused one, because this arm cannot distinguish them and so may not pick one (#3712 F2)"
+assert_not_contains "$RECORD_ERR" "COMMENT could not be posted" \
+    "14.1d(i) …and never claims the comment POST was refused — that is unobservable here (RED when main's sentence is restored; #3712 F2)"
 # ⛔ THE SAME CLASS, ONE CALL FURTHER IN (#3712 review round 2, P3):
 # `post_review_evidence_comment` runs INSIDE this arm and, when its comment READ
 # fails too, used to print "The signed record AND THE BODY MARKER are unaffected" —
