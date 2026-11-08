@@ -8664,7 +8664,9 @@ test("#2242: probeDispatchSaturation reads ONE count through the injectable seam
   }
   // AFTER the teardown: a leaked override still reports the sentinel here.
   ok(probePiProcs() !== SENTINEL, "a cleared seam is INOPERATIVE — a leaked override would misreport piProcs in every wedge report");
-  equal(probePiProcs(), countPiProcs(), "with the seam cleared the live `ps` probe is read again");
+  // (No `probePiProcs() === countPiProcs()` row here on purpose — #2242 review round 4, P3: it
+  // compares two INDEPENDENT live `ps` reads, so it reddens on a churning fleet box through no
+  // fault of the code, and the SENTINEL row above already carries the mutant it was named after.)
 });
 
 test("#2242 WIRING: spawnSubAgent consults the preflight BEFORE any spawn, and the refusal is a FAILED status", () => {

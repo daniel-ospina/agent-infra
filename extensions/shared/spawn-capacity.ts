@@ -417,7 +417,22 @@ export function describeSpawnCapacity(
   // be a claim the ledger's own ATTEMPTS line contradicts (the #2349 discipline). Derived from
   // the attempts, not from `cls`, so a mixed ledger that holds BOTH a cut child and a saturation
   // refusal keeps the child wording it has earned.
-  const capacityRefusal = attempts.some((a) => a.outcome === "refused" && attemptClass(a) === "capacity");
+  //
+  // ⛔ `.some(refusal)` WAS THE WRONG PREDICATE, AND THE COMMENT ABOVE WAS THE LIE THAT HID IT
+  // (#2242 review round 4, P2). `attemptClass` files a `cut`/`failed` child as `capacity` too, so
+  // `spawnFaultClass` reports `capacity` — never `mixed` — for the ledger [cut child, sat refusal],
+  // and `.some(refusal)` is TRUE there. The renderer then told a lane "the dispatch was REFUSED
+  // before a child existed" and "there is no partial child output to distrust" in the SAME message
+  // whose ATTEMPTS line listed the CUT child — and the ledger is REACHABLE, not hypothetical:
+  // `review-enforcer` pushes every non-`verdict` outcome into one session-scoped span, so a wedged
+  // dispatch (cut, after it burns S) followed by a retry refused on the still-saturated box
+  // accumulates exactly that pair. The action line inverts `classifySpawnOutcome`'s own rule (a
+  // killed child's partial output is not a verdict, and the floor may not pretend it did) by
+  // inviting the lane to distrust nothing. The remedy (drain, then retry) survives — the EVIDENCE
+  // does not — so the predicate now requires the capacity class to hold ONLY pre-spawn refusals.
+  const capacityRefusal =
+    c.capacity &&
+    attempts.every((a) => attemptClass(a) !== "capacity" || a.outcome === "refused");
   // The remedy branch: the class that names the next ACTION. A breaker must be WAITED for before
   // anything else is worth trying, so it outranks a retry; with capacity present the load/retry
   // story is then the honest one. The per-class EVIDENCE lines below are emitted independently of

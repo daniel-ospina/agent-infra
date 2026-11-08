@@ -469,6 +469,27 @@ test("#2242: a `fleet-saturated` refusal is a CAPACITY fault — never 'fix the 
   ok(!/load-gate/.test(atCap), "the load-gate remedy is for a starved child, not a refused one");
 });
 
+test("#2242 review round 4: a MIXED ledger keeps the cut child's wording it earned", () => {
+  // THE ROW THE COMMENT IMPLIED AND NOBODY HAD (round-4 P2). `attemptClass` files BOTH a cut child
+  // and a saturation refusal as `capacity`, so `spawnFaultClass` says `capacity` — never `mixed` —
+  // and the old `.some(refused)` predicate fired on `[cut child, sat]`, telling a blocked lane
+  // "the dispatch was REFUSED before a child existed" and "there is no partial child output to
+  // distrust" in the same message whose ATTEMPTS line listed the CUT child. The pair is REACHABLE:
+  // `review-enforcer` pushes every non-`verdict` outcome into one session-scoped span, so
+  // cut-after-S then refused-on-the-still-saturated-box is #2242's own incident shape.
+  const sat: SpawnAttempt = { tool: "task", outcome: "refused", evidence: "status=fleet-saturated" };
+  const cutChild: SpawnAttempt = { tool: "task", outcome: "cut", evidence: "killed=true reason=stream-stall" };
+  const mixed = render([cutChild, sat]);
+  equal(spawnFaultClass([cutChild, sat]), "capacity", "precondition: this ledger is capacity, NOT mixed — which is why nothing else caught it");
+  ok(!/refused BEFORE a child existed/.test(mixed), `a mixed ledger keeps the child wording it earned: ${mixed.replace(/\n/g, " | ")}`);
+  ok(!/no partial child output to distrust/.test(mixed), "⛔ never covers a cut child's partial output — the rule classifySpawnOutcome's header states");
+  ok(!/REFUSED before a child existed/.test(mixed), "the ACTION line must not claim a pre-spawn refusal over a cut child");
+  ok(/cut child|child never returned a verdict/.test(mixed), "the cut child is still acknowledged somewhere in the message");
+  // Order-independence: the predicate must not depend on which attempt came first.
+  const reversed = render([sat, cutChild]);
+  ok(!/refused BEFORE a child existed/.test(reversed), "…and the same holds with the refusal first");
+});
+
 test("the refusal gloss is derived from the EVIDENCE, not assumed (review of #2665)", () => {
   const invalidReq = render([{ tool: "subagent", outcome: "refused", evidence: "results=[]" }]);
   ok(/invalid subagent REQUEST/.test(invalidReq), "results=[] is diagnosed as an invalid request");
