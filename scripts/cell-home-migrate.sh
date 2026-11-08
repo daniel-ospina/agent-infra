@@ -1053,18 +1053,53 @@ EOF
 # is always honoured (the resolver's rule 1, and the seam every hermetic suite uses); what is refused is
 # GUESSING it — from `root`, or from an account the graded units do not declare.
 unit_users() {
-  local dir f
+  local f
+  # ⛔ THE POPULATION IS THE UNITS THIS TOOL WOULD REPOINT — NOT EVERY UNIT systemd LOADS (review F1,
+  # measured on a live cell). Reading the whole population made every RELOCATED VENDOR UNIT a conflict:
+  # `systemctl enable` installs an `/etc` SYMLINK to the vendor's definition (`unit_files` grades
+  # symlinks on purpose), so on an ordinary Ubuntu cell the aliases
+  # `dbus-org.freedesktop.resolve1.service` -> `User=systemd-resolve` (home `/`) and
+  # `dbus-org.freedesktop.timesync1.service` -> `User=systemd-timesync` (home `/`) — plus
+  # `cmux-resource-stats.service` with `User=nobody` (home `/nonexistent`) — put three accounts in the
+  # conflict list of a box that was ALREADY CONVERGED. `check_derivation` then answered 3 for BOTH
+  # verbs: `--check` could never reach 0 (the PR's own acceptance criterion and the RECLAIM
+  # precondition) and `--apply` never reached a credential copy or a unit write, so the migration this
+  # tool exists to provide did not run on the box it targets. The RULE is untouched and still pinned by
+  # the i1/i4 arms — do not repoint a unit onto a home it does not run in. What was wrong is the SCOPE:
+  # an account's `User=` can only make a repoint wrong for a unit this tool will actually rewrite.
+  # ⛔ AND THE SAME WALK THE CHECK AND THE WRITER USE (review F3): `repoint_files` is the shared answer,
+  # so "which units would be repointed" and "whose `User=` decides" are one population.
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    awk '/^[[:space:]]*User=/ { v = $0; sub(/^[[:space:]]*User=[[:space:]]*/, "", v); sub(/[[:space:]]+$/, "", v); if (v != "") print v }' "$f" 2>/dev/null
+  done <<EOF
+$REPOINT_FILES
+EOF
+}
+
+# repoint_files — the subset of the graded population this tool WOULD REPOINT: the files whose scan
+# produces at least one record, i.e. at least one directive that still names the legacy home. Sets
+# $REPOINT_FILES (one path per line). ⛔ A FILE THAT MENTIONS THE LEGACY HOME IN A COMMENT IS NOT IN IT:
+# `unit_scan` is the authority, and it grades no comment (the projector's unchanged-projection rule is
+# what makes the record), so a comment cannot pull a vendor unit back into the derivation question.
+REPOINT_FILES=""
+repoint_files() {
+  local dir f st rec
+  REPOINT_FILES=""
   while IFS= read -r dir; do
     [ -n "$dir" ] && [ -d "$dir" ] || continue
-    # ⛔ THE SAME POPULATION WALK THE CHECK AND THE WRITER USE (review F3). This function had its own
-    # `find … 2>/dev/null` and its own `awk … 2>/dev/null`, so a dir it could not walk, or a unit it
-    # could not open, contributed NO `User=` — which `check_derivation` reads as "no conflicting
-    # account". Measurability is asserted by `check_derivation` before this runs; sharing `unit_files`
-    # keeps "which units declare a User=" and "which units get graded" the same population.
     unit_files "$dir"
     while IFS= read -r f; do
       [ -n "$f" ] || continue
-      awk '/^[[:space:]]*User=/ { v = $0; sub(/^[[:space:]]*User=[[:space:]]*/, "", v); sub(/[[:space:]]+$/, "", v); if (v != "") print v }' "$f" 2>/dev/null
+      probe_open "$f" || continue          # leg (0) has already refused an unreadable population
+      grep -q -- "$HOME_LEGACY" "$f" 2>/dev/null
+      st=$?
+      # A prefilter that could not run is not "no match"; leg (0) is the gate that names it, so here it
+      # only means "do not claim this file was ruled out" — it is left out of the SET, never read as clean.
+      [ "$st" = 0 ] || continue
+      rec="$(unit_scan "$f")"
+      [ -n "$rec" ] || continue
+      REPOINT_FILES="${REPOINT_FILES}${REPOINT_FILES:+$'\n'}$f"
     done <<EOF
 $UNIT_FILES
 EOF
@@ -1122,8 +1157,13 @@ EOF
   done <<EOF
 $(unit_dirs)
 EOF
-  # (ii) the graded units declare an account whose home is not the derived one: the derivation is not
-  #      the home they run as, so repointing them would move them off their own tree.
+  # (ii) a unit THIS TOOL WOULD REPOINT declares an account whose home is not the derived one: the
+  #      derivation is not the home that unit runs as, so repointing it would move it off its own tree.
+  #      ⛔ THE UNITS THIS TOOL WOULD REPOINT, NOT THE UNITS systemd LOADS (review F1) — see
+  #      `unit_users`. A vendor unit and its `systemctl enable` alias are graded (their directives are
+  #      part of the box's one-home story) but nothing here rewrites them, so their `User=` cannot make
+  #      the derivation wrong, and grading it refused a converged box.
+  repoint_files
   while IFS= read -r u; do
     [ -n "$u" ] || continue
     [ "$u" = "root" ] && continue                      # root units genuinely live in /root
@@ -1135,7 +1175,7 @@ EOF
 $(unit_users | awk '!s[$0]++')
 EOF
   if [ -n "$conflicts" ]; then
-    warn_line "  REFUSED: the derived durable home $HOME_DURABLE is not the home of the account the graded units run as:$conflicts. Refusing to repoint units onto a home they do not run in — name the home explicitly: CELL_HOME=<that account's home> $0 --apply"
+    warn_line "  REFUSED: the derived durable home $HOME_DURABLE is not the home of the account the units this tool would repoint run as:$conflicts. Refusing to repoint units onto a home they do not run in — name the home explicitly: CELL_HOME=<that account's home> $0 --apply"
     return 1
   fi
   return 0

@@ -347,7 +347,7 @@ _out="$(env -u CELL_HOME PATH="$STUBACCT:$PATH" CELL_HOME_LEGACY="$LEG" CELL_HOM
         CELL_HOME_MIGRATE_NO_RELOAD=1 bash "$TOOL" --check 2>&1)"; _rc=$?
 [ "$_rc" = 3 ] && ok "i4 units that declare an account which does NOT live in the derived home -> refused (rc 3)" \
   || bad "i4 a home that is not the units' account home was accepted (rc $_rc)"
-case "$_out" in *"not the home of the account the graded units run as"*) ok "i5 …naming the conflict, so the operator knows which home to pass" ;; *) bad "i5 the conflict is not named" ;; esac
+case "$_out" in *"not the home of the account the units this tool would repoint run as"*) ok "i5 …naming the conflict, so the operator knows which home to pass" ;; *) bad "i5 the conflict is not named" ;; esac
 # …and the SAME box converges when the operator names the home (an explicit CELL_HOME is always honoured).
 env -u CELL_HOME PATH="$STUBACCT:$PATH" CELL_HOME="$T/otherhome" CELL_HOME_LEGACY="$LEG" CELL_HOME_MIGRATE_UNIT_DIRS="$UNITS" \
   CELL_HOME_MIGRATE_NO_RELOAD=1 bash "$TOOL" --check >/dev/null 2>&1
@@ -383,6 +383,65 @@ else
     || bad "i8 a credential was written into the derived home before the population was known to be measurable"
 fi
 chmod 755 "$UNITS" 2>/dev/null
+
+printf '\n── (i-2) THE DERIVATION GRADES THE UNITS IT WOULD REPOINT, NOT EVERY UNIT systemd LOADS ────\n'
+# ⛔ THE FALSE BLOCK THIS SECTION EXISTS FOR (review F1, measured on a live cell). `systemctl enable`
+# installs an `/etc` SYMLINK to a vendor unit's definition, and `unit_files` grades symlinks ON PURPOSE
+# (a `systemctl link`ed unit is real drift) — so on an ordinary Ubuntu/Debian cell the graded population
+# contains `dbus-org.freedesktop.resolve1.service` (User=systemd-resolve, home `/`),
+# `dbus-org.freedesktop.timesync1.service` (User=systemd-timesync, home `/`) and
+# `cmux-resource-stats.service` (User=nobody, home `/nonexistent`). Reading `User=` from the WHOLE
+# population put those three accounts in the conflict list of a box that was ALREADY CONVERGED, so
+# `check_derivation` answered 3 for BOTH verbs: `--check` could never reach 0 (this PR's own acceptance
+# criterion #1 and the RECLAIM precondition) and `--apply` never reached a credential copy or a unit
+# write — the migration did not run on the box it targets.
+# ⛔ NO ARM COULD SEE IT: every arm above pins the population through the seam to units that declare
+# `User=cmux`/`User=root` (and i4 plants `User=ubuntu` on a unit the tool WOULD repoint), while a Mac has
+# no `/etc/systemd/system` at all — so the scope defect was invisible on both hosts.
+vend_stub() { # <dir> <cmux-home> — `id`/`getent` for a box whose population contains VENDOR units
+  mkdir -p "$1"
+  printf '#!/bin/sh\ncase "$1" in -u) echo 1000 ;; -un) echo cmux ;; *) exit 1 ;; esac\n' >"$1/id"
+  # The two foreign accounts a real cell's population carries, and the cell account's own home.
+  printf '#!/bin/sh\ncase "$1:$2" in\n  passwd:cmux) echo "cmux:x:1000:1000::%s:/bin/bash" ;;\n  passwd:ubuntu) echo "ubuntu:x:1001:1001::/home/ubuntu:/bin/bash" ;;\n  passwd:nobody) echo "nobody:x:65534:65534::/nonexistent:/usr/sbin/nologin" ;;\n  passwd:systemd-resolve) echo "systemd-resolve:x:991:991::/:/usr/sbin/nologin" ;;\nesac\n' "$2" >"$1/getent"
+  chmod +x "$1/id" "$1/getent"
+}
+# plant_vendor <units-dir> <target-dir> — the two shapes an enabled vendor unit really takes: a stray
+# definition and a `systemctl enable` ALIAS (a symlink) to a definition living outside the unit dir.
+plant_vendor() {
+  mkdir -p "$2"
+  printf '[Service]\nUser=nobody\nExecStart=/usr/bin/cmux-resource-stats\n' >"$1/cmux-resource-stats.service"
+  printf '[Service]\nUser=systemd-resolve\n' >"$2/resolved.service"
+  ln -s "$2/resolved.service" "$1/dbus-org.freedesktop.resolve1.service"
+}
+# The positive control first: on the SAME box with the SAME homes and credentials, the vendor
+# population they measured is present and the box still converges.
+mk_box "$T/vend"
+plant_vendor "$UNITS" "$T/vend/vendor"
+VSTUB="$T/vstub"; vend_stub "$VSTUB" "$DUR"
+# ⛔ THE DERIVED HOME IS THE ONE THE STUB ANSWERS, so every assertion below names `$DUR` and not a guess.
+_out="$(env -u CELL_HOME PATH="$VSTUB:$PATH" CELL_HOME_LEGACY="$LEG" CELL_HOME_MIGRATE_UNIT_DIRS="$UNITS" \
+        CELL_HOME_MIGRATE_NO_RELOAD=1 bash "$TOOL" --apply 2>&1)"; _rc=$?
+[ "$_rc" = 0 ] && ok "i9 a CONVERGED population that carries a vendor unit + its enable alias is not refused (--apply rc 0, was 3)" \
+  || bad "i9 the derivation was refused over a vendor unit the tool would never repoint (rc $_rc)"
+case "$(cat "$UNITS/app.service")" in
+  *"$DUR"*) ok "i10 …and the migration WIRED: the cell's own unit was repointed onto the derived home" ;;
+  *) bad "i10 nothing was repointed — the guard refused before the first write" ;;
+esac
+_out="$(env -u CELL_HOME PATH="$VSTUB:$PATH" CELL_HOME_LEGACY="$LEG" CELL_HOME_MIGRATE_UNIT_DIRS="$UNITS" \
+        CELL_HOME_MIGRATE_NO_RELOAD=1 bash "$TOOL" --check 2>&1)"; _rc=$?
+[ "$_rc" = 0 ] && ok "i11 …and --check answers 0 on that box, so the RECLAIM precondition is reachable again" \
+  || bad "i11 --check answered $_rc on a converged cell that carries a vendor unit — the precondition is unreachable"
+# ⛔ AND THE RULE SURVIVES: the population was NARROWED, not deleted. The SAME vendor population plus one
+# unit the tool WOULD repoint that declares a foreign-home account is still refused by name.
+mk_box "$T/vend2"
+plant_vendor "$UNITS" "$T/vend2/vendor"
+sed -i.bak 's/^User=.*/User=ubuntu/' "$UNITS/app.service" && rm -f "$UNITS/app.service.bak"
+VSTUB2="$T/vstub2"; vend_stub "$VSTUB2" "$DUR"
+_out="$(env -u CELL_HOME PATH="$VSTUB2:$PATH" CELL_HOME_LEGACY="$LEG" CELL_HOME_MIGRATE_UNIT_DIRS="$UNITS" \
+        CELL_HOME_MIGRATE_NO_RELOAD=1 bash "$TOOL" --check 2>&1)"; _rc=$?
+[ "$_rc" = 3 ] && ok "i12 …while a unit this tool WOULD repoint that declares a foreign-home account is STILL refused (rc 3)" \
+  || bad "i12 a repoint onto a home the unit does not run in was accepted (rc $_rc) — the rule was deleted, not scoped"
+case "$_out" in *ubuntu*) ok "i13 …and the refusal still names the account whose home conflicts" ;; *) bad "i13 the conflict account is not named" ;; esac
 
 printf '\n── (j) THE CREDENTIAL THAT IS ALSO A PROGRAM (review F3/P1) ─────────────────────────────\n'
 
@@ -1450,6 +1509,25 @@ else
   run_tool "$MUT26" --check >/dev/null 2>&1; _m26rc=$?
   [ "$_m26rc" = 0 ] && ok "g26 WITHOUT value grading an ENV_FILE pointing at the legacy home reads 'one home' (0) — k37 measures it" \
     || bad "g26 the mutant still reported drift (rc $_m26rc) — k37 is not measuring value grading"
+fi
+
+# g27: widen the derivation's `User=` population back to EVERY unit systemd loads (review F1) and i9-i11
+# must redden. Without this row the (i-2) arms would be green on a tree whose guard had silently gone back
+# to grading the whole population — which is exactly how the false block shipped.
+MUT27="$T/mutdir25/cell-home-migrate-users.sh"
+mkdir -p "$T/mutdir25/lib"; cp "$HERE/lib/cell-home.sh" "$T/mutdir25/lib/cell-home.sh"
+# the population expression itself, swapped for the pre-fix whole-population one
+sed 's#^\$REPOINT_FILES$#$UNIT_FILES#' "$TOOL" >"$MUT27"
+if cmp -s "$TOOL" "$MUT27"; then
+  bad "g27 the population mutation could not be applied — (i-2) is not checking the scope"
+else
+  mk_box "$T/g27"
+  plant_vendor "$UNITS" "$T/g27/vendor"
+  VSTUB27="$T/vstub27"; vend_stub "$VSTUB27" "$DUR"
+  env -u CELL_HOME PATH="$VSTUB27:$PATH" CELL_HOME_LEGACY="$LEG" CELL_HOME_MIGRATE_UNIT_DIRS="$UNITS" \
+    CELL_HOME_MIGRATE_NO_RELOAD=1 bash "$MUT27" --check >/dev/null 2>&1; _m27rc=$?
+  [ "$_m27rc" = 3 ] && ok "g27 WITH the whole population graded a vendor unit refuses a converged box (rc 3) — (i-2) measures the SCOPE" \
+    || bad "g27 the whole-population mutant answered $_m27rc — (i-2) is not measuring the scope"
 fi
 
 printf '\n── (h) argument handling ────────────────────────────────────────────────────────────\n'
