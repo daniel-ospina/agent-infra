@@ -1025,7 +1025,7 @@ continued_name() \
 {
   :
 }
-# ⛔ AND A COMMENT THAT *MENTIONS* AN OPENER MUST NOT OPEN ONE (measured: this guard changes the scan of 18
+# ⛔ AND A COMMENT THAT *MENTIONS* AN OPENER MUST NOT OPEN ONE (measured: this guard changes the scan of 21
 # repo scripts and NO arm pinned it, so deleting it left the suite green). Without it, `NOTES` below starts
 # swallowing lines, and `after_notes_comment()` disappears from the scan.
 # see cat <<'NOTES' in the wiki for why this is spelled out
@@ -1060,9 +1060,9 @@ head_with_comment_between()
 }
 # ⛔ TWO LOAD-BEARING GUARDS HAD NO PIN, AND EACH CHANGES THE SCAN OF HUNDREDS OF VALID SCRIPTS (measured:
 # deleting them left ALL 246 arms green, while the `{`-on-the-next-line guard alone changes 282 of 446
-# repo scripts and `head`'s end-of-line anchor changes 129 — inventing `echo`, `printf`, `break`, `mkdir`,
-# `awk` as "definitions"). The same file already flags one 18-script guard as unpinned; these are 15x and
-# 7x that, so they get their own lines. None of them may be reported:
+# repo scripts and `head`'s end-of-line anchor changes 129 — the two between them inventing `echo`, `printf`,
+# `break`, `mkdir`, `awk` as "definitions"). The same file already flags one 21-script guard as unpinned;
+# these are ~13x and ~6x that, so they get their own lines. None of them may be reported:
 #   * a bare command name followed by `:` (not a brace) — a `head` match that must NOT be claimed;
 #   * a command with arguments, then `{` on the next line — likewise;
 #   * a head followed by a line that CONTAINS `{` but does not start with it.
@@ -1080,10 +1080,31 @@ cat <<'INNER2'
 INNER2;
 after_bad_terminator() { :; }
 INNER2
+# ⛔ THREE MORE CONDITIONS, EACH UNPINNED UNTIL ITS OWN LINE EXISTED (measured — every one is a false-PASS
+# direction: a real definition goes invisible, or a body line is invented, while all 246 arms stay green):
+#   (d) an INDENTED head with the brace on the next line — pins `head`'s leading `\s*`, which the arm label
+#       "brace on either line, any indent" had claimed all along;
+#   (e) a head separated from its `{` by a BLANK line — pins the empty-line half of the later-lines skip (the
+#       comment-line half already had its own line);
+#   (f) a heredoc opened with `<<-` whose body holds a brace-looking line — pins the `-?` in the opener regex;
+#       without it the opener is never recognised and the body is scanned as code.
+  indented_head_only()
+{
+  :
+}
+head_then_blank()
+
+{
+  :
+}
+cat <<-'INNER3'
+	not_a_def_from_a_tab_heredoc() { :; }
+	INNER3
+real_after_tab_heredoc() { :; }
 FIXTURE
 _scan_fixture="$(python3 "$T/defs.py" "$T/defs-fixture.sh")"
 ck "f11f-0 …and every one of those spellings is really SEEN (brace on either line, any indent), while bare keywords followed by '{' are not counted" \
-   '[ "$_scan_fixture" = "name_same_line name_func_kw indented_same_line name_next_line name_func_next continued_name after_notes_comment after_comment_continuation head_after_inline_comment head_with_comment_between" ]'
+   '[ "$_scan_fixture" = "name_same_line name_func_kw indented_same_line name_next_line name_func_next continued_name after_notes_comment after_comment_continuation head_after_inline_comment head_with_comment_between indented_head_only head_then_blank real_after_tab_heredoc" ]'
 # ⛔ THE DEGRADED PATH MUST NOT CLAIM TO GRADE WHEN IT CANNOT NAME A REPO (review round 2, P1). The
 # doctor's REPO-only arm raises when the checkout's `origin` proves nothing — the TCC shape on the
 # default macOS install — so `f4`'s stub (which echoes argv) would pass on a wrapper that dies in
@@ -1660,18 +1681,18 @@ ck "j16s2 …while with a stat answer the ABSENT verdict IS stated as proof (bot
 # walk SKIPPED it and returned a traversable grandparent ABOVE the link. The caller reads a traversable
 # ancestor as proof of absence and answers code 3 — the one code the wrapper DEGRADES on — for a set that
 # exists.
-# ⛔ AND THE ARM IS THE `unknown` PATH ONLY — ITS LABEL USED TO CLAIM THE GENERAL RULE (round 46 review, P2 —
-# measured): with the SHIPPED reader a symlink LOOP answers `other` → 5 through the errno arm (same verdict,
-# different arm), and a DANGLING link answers `absent` → 3 — which the ROUND-48 REVIEW FALSIFIED as a general
-# rule: NO spelling of a path whose chain holds an unresolvable link is absent — the rc-3 set contains no
-# UNRESOLVABLE link and is identical between the two readers. (No counts here on purpose: three independently
-# built generators gave three different totals, so an integer would be a claim nobody can re-verify. The
-# INVARIANT is what the sentence asserts, and it holds on every generator.) What
-# WAS wrong was the ANCESTOR spelling: `$T/dirlink/repos.conf` answered 3 with an interpreter and 5 without
-# one, so the better-equipped reader gave the more dangerous answer, and `j16t`/`j16t2` now pin the agreement
-# (this arm, `j16l`, is a COMPONENT fixture that asserts 5 — it never owned a claim about 3). So "never (3)" is true of THIS reader and this arm, not of symlinks in
-# general: `$NI` has no usable interpreter, `_rs_stat_kind` cannot answer, and the walk decides. Measured
-# before the fix, on this reader: rc 3 with `does not exist`. No privileges needed, so no `chmod 000` guard.
+# ⛔ THIS ARM'S ROUTE, NOT A GENERAL RULE (round 46 review, P2; rewritten round 48 after the verdict changed
+# under it — measured): with the SHIPPED reader a symlink LOOP answers `other` → 5 through the errno arm
+# (same verdict, different arm), and a DANGLING link USED TO answer `absent` → 3 — WITHDRAWN in round 48: NO
+# spelling of a path whose chain holds an unresolvable link is absent, on either reader, and `j16r`/`j16t`
+# pin it. (No counts here on purpose: three independently built generators gave three different totals, so an
+# integer would be a claim nobody can re-verify; the invariant held on every one.)
+# What WAS wrong, and what this arm's neighbourhood is really about, was the ANCESTOR spelling:
+# `$T/dirlink/repos.conf` answered 3 with an interpreter and 5 without one, so the better-equipped reader
+# gave the more dangerous answer, and `j16t`/`j16t2` pin the agreement. ⛔ THIS ARM (`j16l`) IS A COMPONENT
+# fixture that asserts 5 and never owned a claim about 3. What is true of it ALONE is the ROUTE it exercises
+# — `$NI` has no usable interpreter, `_rs_stat_kind` cannot answer, and the walk decides — not the verdict,
+# which is 5 everywhere. No privileges needed, so no `chmod 000` guard.
 ln -s "$T/linkloop2" "$T/linkloop"; ln -s "$T/linkloop" "$T/linkloop2"
 _o_ll="$(_rs_bound 30 env REPO_SET_FILE="$T/linkloop/inside.conf" /bin/bash "$NI/lib/repo-set.sh" check 2>&1)"; _rc_ll=$?
 ck "j16l with NO stat answer, an unresolvable SYMLINK component is BROKEN (5) — never a proof of absence (3)" \
