@@ -15,6 +15,7 @@ LIVE pane, so every test here exists to prove a way it could act on something it
 Run: python3 -m pytest scripts/test_lane_relaunch.py -q
 """
 import importlib.util
+import json
 import os
 import re
 import sys
@@ -54,15 +55,38 @@ class FakeLS:
         self._cwd = cwd
         self._session_dir = session_dir or tempfile.mkdtemp(prefix="lane-sessions-")
 
-    # the two primitives the FRESH arm's baseline needs: `~/.pi/agent/sessions/<mangled cwd>/*.jsonl`
+    # ── the primitives the FRESH arm's baseline uses. ⛔ `parent_cwd`/`_same_dir` mirror the REAL
+    # semantics (read the transcript's own first record; compare realpaths) — they are not what is
+    # under test. `mangled()` is deliberately NOT provided: the tool must never derive a directory
+    # from it (review round 5, P1: `lane-status.mangled` turns `.` into `-`, pi keeps the dot, and
+    # every fleet lane lives in a dotted path).
     @property
     def SD(self):
         return os.path.dirname(self._session_dir)
 
-    def mangled(self, cwd):
-        return os.path.basename(self._session_dir)
+    def parent_cwd(self, path):
+        try:
+            with open(path, errors="ignore") as fh:
+                return json.loads(fh.readline()).get("cwd")
+        except Exception:
+            return None
+
+    @staticmethod
+    def _same_dir(a, b):
+        return bool(a) and bool(b) and os.path.realpath(a) == os.path.realpath(b)
+
+    def new_session(self, name, cwd="/tmp/lane"):
+        """Write a transcript where PI would write it, with the cwd in its first record."""
+        d = self._session_dir
+        os.makedirs(d, exist_ok=True)
+        p = os.path.join(d, name)
+        with open(p, "w") as fh:
+            fh.write(json.dumps({"type": "session", "id": name, "cwd": cwd}) + "\n")
+        return p
 
     def read_screen(self, ws, lines=14):
+        if isinstance(self._screen, list):
+            return self._screen.pop(0) if len(self._screen) > 1 else self._screen[0]
         return self._screen
 
     def ui_working(self, ws):
@@ -282,63 +306,66 @@ def test_new_starts_a_fresh_session_and_needs_no_transcript(R, tmp_path):
     assert obs["action"] == "relaunch-fresh"
 
 
-class ScriptLS(FakeLS):
-    """A lane-status whose answers CHANGE between calls, so a transition can be told from a state.
-
-    `resolve_session` returns the next scripted value (the last one repeats); `session_file` maps an
-    id to a path. This is the only way to express "the SAME id already had a transcript before the
-    send" — the shape that made the fresh arm report a false CONFIRMED (review round 2, P1).
-    """
-
-    def __init__(self, resolve_seq, files, **kw):
-        super().__init__(**kw)
-        self._seq = list(resolve_seq)
-        self._files = dict(files)
-
-    def resolve_session(self, ws):
-        if len(self._seq) > 1:
-            return self._seq.pop(0)
-        return self._seq[0]
-
-    def session_file(self, sid):
-        return self._files.get(sid)
-
-
-def test_new_does_not_confirm_from_a_binding_that_predates_the_send(R, tmp_path):
-    """The P1 from review round 2: `--new` on a lane whose RECORDED id still has a transcript on
-    disk — the common shape — used to print CONFIRMED (exit 0) on the FIRST loop iteration, from a
-    session nothing had started. A state is not a transition."""
-    ls = FakeLS(session="old", transcript=None)
-    os.makedirs(os.path.join(ls.SD, ls.mangled("/tmp/lane")), exist_ok=True)
-    stale = os.path.join(ls.SD, ls.mangled("/tmp/lane"), "old.jsonl")
-    open(stale, "w").write("{}\n")
-    cmux = FakeCmux()          # the send "succeeds" and NOTHING changes on disk
-    obs = R.relaunch("ws-1", ls=ls, runner=cmux, pi=sys.executable, cwd="/tmp/lane", new=True,
-                     sleep=lambda _s: None, clock=_clock())
-    assert obs["sent"] is True, obs
-    assert obs["confirmed"] is False, "confirmed from the pre-send binding: %r" % (obs,)
-    assert cmux.sent()[0][-1].count("--session") == 0
-
-
 def test_new_confirms_when_a_transcript_APPEARS(R):
-    """The REACHABLE proof for a fresh session (review round 4, P2): nothing in this fleet SETS a
-    resume binding for a pi started by typing into a shell, so the only evidence that cannot be faked
-    by a stale binding is a `*.jsonl` in the lane cwd's session directory that was not there before
-    the send."""
+    """Proof (i): a transcript that was NOT there before the send and whose OWN first record names
+    this cwd. The fixture writes the cwd into the record — it does not implement a naming rule, so
+    the row can actually disagree with the implementation (review round 5, P1)."""
     ls = FakeLS(transcript=None, session=None)
-    cmux = FakeCmux(on_send=lambda: open(
-        os.path.join(ls.SD, ls.mangled("/tmp/lane"), "2026-new.jsonl"), "w").write("{}\n"))
-    os.makedirs(os.path.join(ls.SD, ls.mangled("/tmp/lane")), exist_ok=True)
+    cmux = FakeCmux(on_send=lambda: ls.new_session("2026-new.jsonl"))
     obs = R.relaunch("ws-1", ls=ls, runner=cmux, pi=sys.executable, cwd="/tmp/lane", new=True,
                      sleep=lambda _s: None, clock=_clock())
     assert obs["confirmed"] is True, obs
     assert "appeared" in obs["reason"], obs
 
 
-def test_new_does_not_confirm_when_no_transcript_appears(R):
-    """The mirror: no file, no confirmation — UNCONFIRMED (exit 4), never a silent OK."""
+def test_new_does_not_count_a_transcript_from_ANOTHER_cwd(R):
+    """The cwd filter is the point: another lane starting a session must not confirm THIS relaunch."""
     ls = FakeLS(transcript=None, session=None)
-    os.makedirs(os.path.join(ls.SD, ls.mangled("/tmp/lane")), exist_ok=True)
+    cmux = FakeCmux(on_send=lambda: ls.new_session("other.jsonl", cwd="/tmp/somewhere-else"))
+    obs = R.relaunch("ws-1", ls=ls, runner=cmux, pi=sys.executable, cwd="/tmp/lane", new=True,
+                     sleep=lambda _s: None, clock=_clock())
+    assert obs["confirmed"] is False, obs
+    assert obs.get("stray_new_sessions") == 1, obs
+
+
+def test_new_does_not_confirm_on_a_transcript_that_predates_the_send(R):
+    """⛔ THE ROUND-2 P1, pinned HONESTLY: a transcript that already existed before the send (a dead
+    lane whose recorded id still has one — the common shape) is a STATE, not a transition."""
+    ls = FakeLS(session="old", transcript=None)
+    ls.new_session("old.jsonl")                  # present BEFORE the relaunch
+    cmux = FakeCmux()                            # the send succeeds and NOTHING changes
+    obs = R.relaunch("ws-1", ls=ls, runner=cmux, pi=sys.executable, cwd="/tmp/lane", new=True,
+                     sleep=lambda _s: None, clock=_clock())
+    assert obs["sent"] is True, obs
+    assert obs["confirmed"] is False, "confirmed from a pre-send transcript: %r" % (obs,)
+
+
+def test_new_confirms_when_the_pane_leaves_the_shell_prompt(R):
+    """Proof (ii) — and the one that does not depend on a transcript at all: pi creates its session
+    file LAZILY (`session-manager.js:691-715` assigns a path; the first write comes with the first
+    entry), so a fresh session with no prompt may leave no file. The pane leaving the shell prompt is
+    the transition, and it takes TWO consecutive reads so a redraw cannot confirm alone."""
+    ls = FakeLS(transcript=None, session=None,
+                screen=["dev@box repo % ", "pi tui line", "  /800k  -flash • high"])
+    obs = R.relaunch("ws-1", ls=ls, runner=FakeCmux(), pi=sys.executable, cwd="/tmp/lane", new=True,
+                     sleep=lambda _s: None, clock=_clock())
+    assert obs["confirmed"] is True, obs
+    assert "left the shell prompt" in obs["reason"], obs
+
+
+def test_new_does_not_confirm_on_a_SINGLE_non_prompt_read(R):
+    """Why the pane proof needs TWO consecutive reads: a redraw can leave one non-prompt frame. A
+    single frame is not evidence that pi owns the pane."""
+    ls = FakeLS(transcript=None, session=None,
+                screen=["dev@box repo % ", "  (redraw noise)  ", "dev@box repo % "])
+    obs = R.relaunch("ws-1", ls=ls, runner=FakeCmux(), pi=sys.executable, cwd="/tmp/lane", new=True,
+                     sleep=lambda _s: None, clock=_clock())
+    assert obs["confirmed"] is False, obs
+
+
+def test_new_stays_unconfirmed_while_the_pane_is_still_a_shell(R):
+    """The mirror: a launch line that failed leaves the prompt, so nothing is confirmed."""
+    ls = FakeLS(transcript=None, session=None, screen="dev@box repo % ")
     obs = R.relaunch("ws-1", ls=ls, runner=FakeCmux(), pi=sys.executable, cwd="/tmp/lane", new=True,
                      sleep=lambda _s: None, clock=_clock())
     assert obs["confirmed"] is False, obs

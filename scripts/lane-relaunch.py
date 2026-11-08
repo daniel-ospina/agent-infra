@@ -156,22 +156,41 @@ def _live_pi_record(ws, runner, timeout=45):
     return False
 
 
-def _transcripts(ls, cwd):
-    """{path} of every `*.jsonl` in the lane cwd's session directory — the pre-send BASELINE.
+def _transcripts(ls):
+    """{path} of every session transcript on the box — the pre-send BASELINE, taken by GLOB only.
 
-    None means the directory could not be read (no signal, never a false CONFIRM). pi writes a session
-    transcript under `~/.pi/agent/sessions/<mangled cwd>/`, so "a file that was not here before the
-    send" is the only evidence a *fresh* session has that does not depend on a resume binding — and
-    nothing in this fleet SETS a resume binding for a pi started by typing into a shell (the only
-    writer is `extensions/cmux-session.ts`'s `clearResumeBinding`; `lane-status.py:944-952` records
-    the measured consequence). Review round 4, P2: the binding-based check could therefore never
-    confirm a real `--new` relaunch and reported failure on a lane that had come back.
+    ⛔ NEVER KEYED ON A DIRECTORY-NAME MANGLING (review round 5, P1 — and it is the same
+    lossy-encode-as-exact-key class this file keeps meeting). `lane-status.mangled()` replaces BOTH
+    `/` and `.` with `-`; pi's own session dir replaces only `/`, `\\` and `:` and KEEPS the dot
+    (`dist/core/session-manager.js:293`). Measured: for `/home/cmux/agent-infra/.worktrees/tm-942`
+    the mangled form is `--home-cmux-agent-infra--worktrees-tm-942--`, and pi's real directory is
+    `--home-cmux-agent-infra-.worktrees-tm-942--`. Every fleet lane lives in a dotted path, so the
+    derived directory NEVER exists, `glob` returns `[]` (it does not raise), and the appearance
+    proof was DEAD rather than merely unlucky — silently, because the empty set reads as "nothing
+    appeared".
+
+    So the baseline is a cheap glob of the session root, and the cwd of a CANDIDATE is read from the
+    transcript's OWN first record (`lane-status.parent_cwd`, compared with `lane-status._same_dir`).
+    That is encoding-independent: it survives pi changing its naming scheme.
+
+    None means the root could not be read — no signal, never a false CONFIRM.
     """
     try:
-        d = os.path.join(ls.SD, ls.mangled(cwd))
-        return set(glob.glob(os.path.join(d, "*.jsonl")))
+        return set(glob.glob(os.path.join(ls.SD, "*", "*.jsonl")))
     except Exception:                                            # noqa: BLE001
         return None
+
+
+def _records_cwd(ls, path, cwd):
+    """True when this transcript's first record says it was started in `cwd`."""
+    try:
+        rec = ls.parent_cwd(path)
+        if not rec:
+            return False
+        same = getattr(ls, "_same_dir", None)
+        return bool(same(rec, cwd)) if same else os.path.realpath(rec) == os.path.realpath(cwd)
+    except Exception:                                            # noqa: BLE001
+        return False
 
 
 def _forbidden_in(argv) -> str:
@@ -318,7 +337,8 @@ def relaunch(ws, label="", cwd=None, session=None, pi=None, new=False, wait=45.0
     # ── 7. ONE send, with the trailing newline: `cmux send` without it TYPES BUT NEVER SUBMITS
     # (#941), which is a silent dispatch no-op. The newline is part of the payload on purpose.
     before = _stat(path) if path else None
-    pre_files = _transcripts(ls, cwd) if fresh else None
+    pre_files = _transcripts(ls) if fresh else None
+    non_prompt_reads = 0
     rc, out, err = runner(argv)
     obs["sent"] = True
     if rc != 0:
@@ -337,17 +357,33 @@ def relaunch(ws, label="", cwd=None, session=None, pi=None, new=False, wait=45.0
                 sid_after = ls.resolve_session(ws)
             except Exception:                                    # noqa: BLE001
                 sid_after = None
-            now_files = _transcripts(ls, cwd)
+            now_files = _transcripts(ls)
             new_files = sorted(now_files - pre_files) if (now_files is not None
                                                           and pre_files is not None) else []
-            # (i) a transcript that was NOT there before the send — the reachable proof; (ii) a
-            # DIFFERENT session id resolving to a real file — a binding transition, when one is left.
-            appeared = bool(new_files) or bool(sid_after and sid_after != pre_sid
-                                               and _stat(ls.session_file(sid_after)))
-            if appeared:
+            # (i) a transcript that was NOT there before the send, for THIS cwd. Bounded: only the
+            # candidates are opened, and only their first record.
+            hit = next((p for p in new_files[:5] if _records_cwd(ls, p, cwd)), None)
+            if hit:
                 obs.update(confirmed=True, sid=sid_after or pre_sid,
-                           reason=("fresh session appeared (%s)" % os.path.basename(new_files[0])
-                                   if new_files else "fresh session binding changed"))
+                           reason="fresh session appeared (%s)" % os.path.basename(hit))
+                break
+            if new_files[:5] and not hit:
+                obs["stray_new_sessions"] = len(new_files)
+            # (ii) the pane LEFT the shell prompt — a transition the pane itself proves, and the one
+            # signal that needs no transcript at all (pi creates its file lazily: `newSession` only
+            # assigns the path, `session-manager.js:691-715`; the first write comes with the first
+            # entry). Two CONSECUTIVE reads, so a redraw cannot confirm on its own.
+            try:
+                scr = ls.read_screen(ws, lines=14) or ""
+            except Exception:                                    # noqa: BLE001
+                scr = ""
+            if scr.strip() and not _has_prompt(scr):
+                non_prompt_reads += 1
+            else:
+                non_prompt_reads = 0
+            if non_prompt_reads >= 2:
+                obs.update(confirmed=True, sid=sid_after or pre_sid,
+                           reason="the pane left the shell prompt (pi took the pane)")
                 break
         else:
             now = _stat(path)

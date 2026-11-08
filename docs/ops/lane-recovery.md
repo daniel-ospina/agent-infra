@@ -103,12 +103,17 @@ lane's pi exits later the shell it ran under is still there. Nothing is destroye
 transcript is genuinely gone. Its confirmation is anchored to a **pre-send baseline** — never to a
 state that already existed:
 
-- **proof:** a `*.jsonl` transcript that was NOT in the lane cwd's session directory before the send
-  (or a different session id resolving to a real file). Nothing in this fleet SETS a resume binding
-  for a pi started by typing into a shell, so the transcript appearing is the only evidence a fresh
-  session can leave;
-- **not proof:** a recorded session id that still has a transcript on disk (the common shape). That
-  would report `CONFIRMED` for a session nothing had started.
+- **proof (i):** a `*.jsonl` transcript that was NOT present before the send **and whose own first
+  record names this lane's cwd**. The cwd is read from the transcript, never inferred from a directory
+  name — `lane-status.mangled()` turns `.` into `-` while pi keeps the dot (`/x/.worktrees/y` vs
+  pi's `/x/.worktrees/y` folder name), and every fleet lane lives in a dotted path, so a derived
+  directory name is not a key;
+- **proof (ii):** the pane **left the shell prompt** on two consecutive reads. pi creates its session
+  file lazily (the path is assigned at session start; the first write arrives with the first entry), so
+  a fresh session with no prompt yet may leave no file — the pane is then the only witness;
+- **not proof:** a recorded session id that still has a transcript on disk (the common shape), a
+  transcript from a different cwd, or a single non-prompt frame (a redraw). Each would report
+  `CONFIRMED` for a session nothing had started.
 
 ### Identifying the real session
 
