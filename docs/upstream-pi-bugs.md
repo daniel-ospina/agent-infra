@@ -1166,7 +1166,7 @@ epoch — the property the epoch analysis above found missing across windows.
   accident. Two honest qualifications. First, a cluster is not a constant: it is a
   *band*. Second, and decisive for how much it can carry, those four are **quoted
   samples from three pids**, not the population — there is no `max rchar (idle)`
-  column, so the idle-sample maximum used above ("idle max 10 KB/s") is the maximum
+  column, so the idle-sample maximum used above (10 KB/s) is the maximum
   of the quoted samples, **not**
   of all 37 idle process-windows, and one unquoted idle sample above 10.4 KB/s
   would close the gap entirely. The sample nearest it, pid 4076400 (the exception
@@ -1175,18 +1175,20 @@ epoch — the property the epoch analysis above found missing across windows.
   10.4 KB/s as that row's working minimum) — so the 0.4 KB/s separation is what the
   labelling records, and the membership rule behind the labels is unstated. That is
   exactly why **ΔCPU makes the split and `rchar` only corroborates**, and why the
-  next bullet is a consistency check on the labelling, not an independent test.
+  negative the next bullet reports is a **read-rate** result — genuinely measured,
+  but silent about the transcript predicate the trigger actually names.
 - **No window contained a process above 1% of a core with reads at that floor** —
   which is the 09-16 defect signature (11 processes at 6.4–26.3% while silent for
-  1.0–209.5 min), and it does not recur here. Be clear about what this is though: a
-  **consistency check on the labelling**, not independent evidence. The table's own
-  columns make it empty by construction (no process above 1% is labelled idle, and
-  no labelled working process reads below 10.4 KB/s), so `NONE` is entailed rather
-  than measured. What it does establish is that a *gross* recurrence of the 09-16
-  signature is absent from these four windows. It cannot do more than that: a
-  busy-and-silent process **reading at the floor** is exactly what this measurement
-  cannot separate from working, and that is a limit of the discriminator, not of
-  the window length — reason (d) below.
+  1.0–209.5 min), and it does not recur here. Be clear about what it is though. The
+  first conjunct is close to construction — no process above 1% is labelled idle
+  under a ΔCPU split — but the second is a **measured** value: the lowest read rate
+  any labelled-working process showed in any window is **10.4 KB/s, ~10× the idle
+  floor**. So `NONE` is a real result about reads, not a tautology; what it says
+  nothing about is **transcript silence**, which is the quantity the committed
+  trigger names. Within that scope it does establish that a *gross* recurrence of the
+  09-16 signature is absent from these four windows. What it cannot do is separate a
+  busy process whose reads sit in the *working* band from one genuinely working —
+  reason (d) below.
 - ΔCPU tracked `rchar` **in both directions, for the same pid, across windows**
   rather than following a constant cadence: pid 2324326 read
   `0.1%/8.4 KB/s → 2.8%/4 089 KB/s → 3.4%/9 841 KB/s → 5.5%/708 KB/s`, pid
@@ -1216,7 +1218,8 @@ epoch — the property the epoch analysis above found missing across windows.
 - **Main thread vs workers** (the report's caveat quantified, though *not* the
   size column, which stays missing below): on the processes that were busy, the
   main thread carried **0.61–1.00** of the ΔCPU and the `V8Worker` pool
-  **0.02–0.41**. So the burn,
+  **0.02–0.41** — ranges across those processes, not a single per-process split;
+  the remainder in each case is other threads. So the burn,
   when it exists, is main-thread JS — consistent with the render-frame mechanism
   and *not* primarily collector throughput.
 
@@ -1233,8 +1236,10 @@ observations are confounded exactly as the 09-16 confound analysis warns;
 (c) one of the five recommendations above **has shipped** in between (the footer
 memoisation, item 2), which is a plausible partial cause and is *not* demonstrated
 to be the cause; and (d) the discriminator has a **categorical blind spot** a longer
-window cannot fix — a process that is busy, silent and *reading at the floor* is
-indistinguishable from working, and that is the 09-16 signature itself. What it does
+window cannot fix — a busy process whose reads sit in the *working* band is
+indistinguishable from one genuinely working. The 09-16 burners' read rates were
+**never measured** (that table recorded ΔCPU and `.jsonl` age only), so whether
+reads would have separated them here is *unknown*, not no. What it does
 mean operationally is that the **mechanical trip is
 still #1127** — a prose re-check answered once is still prose.
 
