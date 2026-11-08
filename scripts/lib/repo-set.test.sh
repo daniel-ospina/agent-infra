@@ -949,10 +949,18 @@ raw_lines = [l.rstrip('\n') for l in open(sys.argv[1], encoding='utf-8')]
 # stayed GREEN with an out-of-namespace helper defined right there (a FALSE PASS), and a body line leaked
 # into the scan as a definition (a FALSE RED). `_openers` therefore walks the line with bash's own quoting,
 # comment and `$(( … ))` rules, and RECORDS EVERY opener in bash's order rather than only the first.
-# REMAINING LIMIT, declared and not chased: a `<<` inside a `$( … )` command substitution, inside `[[ … ]]`,
-# or spelled with a parameter expansion (`<<$X`) is not modelled. No arm needs any of them and the reader
-# contains none — and unlike the superseded note, this list is what the two false-PASS shapes above taught
-# the walk to EXCLUDE, so it is the residue of a measured search rather than a guess.
+# ⛔ DECLARED LIMITS, each a limit of a LINE-SHAPE model rather than an accident, and each in a KNOWN
+# direction. (i) `<<$X` — a delimiter spelled with a parameter expansion — is not modelled, so bash opens a
+# heredoc whose body this scans as code. (ii) a `$((` that NEVER closes leaves the residue of the file in
+# arithmetic, so definitions are MISSED: fail-closed, never a false PASS. (iii) the three definition
+# SPELLINGS the `defn`/`head` patterns cannot see — a SUB-SHELL body (`name() (`), a SECOND definition on
+# one line, and a name inside a MULTI-LINE quoted string (that one is INVENTED, not missed). ⛔ The list this
+# replaced was wrong in BOTH directions: it declared `$(( … ))` inside a `$( … )` substitution "not
+# modelled" when it IS (measured: `out=$(cat <<EOF … )` scans identically to bash), and `[[ a << b ]]`
+# when that spelling is a bash SYNTAX ERROR (`rc 2`) and so is vacuous. None of (i)–(iii) occurs in
+# `repo-set.sh`, the only file the namespace arm scans, and the closing sentence of the old note had the
+# arrow backwards — it said the unmodelled list was what the walk EXCLUDES, while the walk excludes
+# comments and arithmetic, which were never on it.
 def _odd_backslashes(s):
     """True when s ends in a run of backslashes that bash reads as a line continuation."""
     n = 0
@@ -961,16 +969,18 @@ def _odd_backslashes(s):
     return n % 2 == 1
 
 
-def _openers(line):
-    """Every heredoc opened on ONE logical line, in bash's order, as (delimiter, strip_tabs).
+def _strip_comment(line):
+    """`line` with a trailing comment removed — bash's rule: an unquoted `#` that starts a WORD.
 
-    A comment ends at the newline (so a trailing `#` also ends the scan), a quoted delimiter keeps
-    its own quoting rules, and `$(( … ))` / `(( … ))` are arithmetic where `<<` is a shift.
+    ⛔ A COMMENT ENDS AT THE NEWLINE HOWEVER MANY BACKSLASHES IT CARRIES (#3960 cycle 3, P2 — measured).
+    The join tested the RAW line, so `x=1  # note \\` was read as a continuation, the next line was
+    swallowed and a real definition went invisible (a FALSE PASS) — and inside a `cat <<EOF` body the
+    lost opener then invented a body line as a definition (a FALSE RED). Cutting the comment BEFORE the
+    continuation test is what makes the file's own "a comment ends at the newline" true of both the
+    whole-line and the trailing form, instead of only the whole-line one.
     """
-    out = []
     i, n = 0, len(line)
     quote = None
-    arith = 0
     while i < n:
         c = line[i]
         if quote == "'":
@@ -990,7 +1000,52 @@ def _openers(line):
             i += 2
             continue
         if c == '#' and (i == 0 or line[i - 1] in ' \t;|&('):
-            break
+            return line[:i]
+        if c in ('"', "'", '`'):
+            quote = c
+        i += 1
+    return line
+
+
+# ⛔ ARITHMETIC OUTLIVES THE LINE (#3960 cycle 3, P2 — measured): `$(( 1 +` may close on a LATER line with
+# no backslash, and a `<<` inside it is still a SHIFT. A per-line depth started every line at 0, so such a
+# shift reopened a phantom heredoc and swallowed the rest of the file (a FALSE PASS). The depth is carried
+# between logical lines now. An `arith` that never closes makes the residue of the file arithmetic — i.e.
+# definitions are MISSED, which is the fail-closed direction — and that is a declared limit, not a claim.
+_arith_depth = 0
+
+
+def _openers(line):
+    """Every heredoc opened on ONE logical line, in bash's order, as (delimiter, strip_tabs).
+
+    A comment ends at the newline — `_strip_comment` has already removed it, so this walk never sees one
+    and the comment RULE has exactly one definition in this file (it used to live here too, which is why
+    mutating either COPY left the fixture green). A quoted delimiter keeps its own quoting rules, and
+    `$(( … ))` / `(( … ))` are arithmetic where `<<` is a shift.
+    """
+    global _arith_depth
+    out = []
+    i, n = 0, len(line)
+    quote = None
+    arith = _arith_depth
+    while i < n:
+        c = line[i]
+        if quote == "'":
+            if c == "'":
+                quote = None
+            i += 1
+            continue
+        if quote in ('"', '`'):
+            if c == '\\':
+                i += 2
+                continue
+            if c == quote:
+                quote = None
+            i += 1
+            continue
+        if c == '\\':
+            i += 2
+            continue
         if c in ('"', "'", '`'):
             quote = c
             i += 1
@@ -1051,6 +1106,7 @@ def _openers(line):
             i = j
             continue
         i += 1
+    _arith_depth = arith
     return out
 
 
@@ -1065,11 +1121,11 @@ for _l in raw_lines:
             _pending.pop(0)
         continue
     _buf = _l if _buf is None else _buf + _l
-    if _odd_backslashes(_buf) and not _buf.lstrip().startswith('#'):
+    if _odd_backslashes(_strip_comment(_buf)):
         _buf = _buf[:-1]
         continue
     lines.append(_buf)
-    _pending.extend(_openers(_buf))
+    _pending.extend(_openers(_strip_comment(_buf)))
     _buf = None
 if _buf is not None:
     lines.append(_buf)
@@ -1148,14 +1204,15 @@ continued_name() \
 {
   :
 }
-# ⛔ AND A COMMENT THAT *MENTIONS* AN OPENER MUST NOT OPEN ONE (measured: this guard changes the scan of 21
-# of the 446 shebang-marked, `bash -n`-clean scripts in this repo and NO arm pinned it, so deleting it left
-# the suite green). Without it, `NOTES` below starts swallowing lines, and `after_notes_comment()` disappears
-# from the scan.
-# ⛔ THE POPULATION IS PART OF THE CLAIM. The same guard moves 20 of the 435 `git ls-files '*.sh'` files at
-# this head, so the integer MOVES with the population — which is exactly why the superseded "18 repo scripts"
-# was unverifiable, and why the population (not the number) is the reproducible half. Cycle 2 also measured
-# the shape it fails on: a TRAILING comment (`x=1  # see cat <<'NOTE'`) opened the phantom heredoc even where
+# ⛔ AND A COMMENT THAT *MENTIONS* AN OPENER MUST NOT OPEN ONE. Without it, `NOTES` below starts swallowing
+# lines, and `after_notes_comment()` disappears from the scan.
+# ⛔ THE POPULATION IS THE CLAIM, not the integer. At this head the guard moves 6 of the 435
+# `git ls-files '*.sh'` files; re-measure with the mutant, because the number MOVES with the population and
+# this comment has already carried three of them (18, then 21, then 20 — two of the populations quoted here
+# were not reproducible at any commit). ⛔ AND IT IS PINNED NOW: deleting it reds `f11f-0`. The note used to
+# say "deleting it left the suite green", which was true when it was written and is history rather than a
+# claim about this head — a stale caveat is the same defect as a stale number. Cycle 2 also measured the
+# shape it fails on: a TRAILING comment (`x=1  # see cat <<'NOTE'`) opened the phantom heredoc even where
 # the whole-line form was exempted, so the fixture carries that spelling too.
 # see cat <<'NOTES' in the wiki for why this is spelled out
 after_notes_comment() { :; }
@@ -1187,14 +1244,14 @@ head_with_comment_between()
 {
   :
 }
-# ⛔ TWO LOAD-BEARING GUARDS HAD NO PIN, AND EACH CHANGES THE SCAN OF HUNDREDS OF VALID SCRIPTS (measured at
-# this head over the 446 shebang-marked, `bash -n`-clean scripts: deleting them left ALL 246 arms green, while
-# the `{`-on-the-next-line guard alone changes 282 of them and `head`'s end-of-line anchor changes 129 — the
-# two between them inventing `echo`, `printf`, `break`, `mkdir`, `awk` as "definitions"). The same file
-# already flags one 21-script guard as unpinned; these are ~13x and ~6x that, so they get their own lines.
-# The integers are given WITH their population because they move with it (over `git ls-files '*.sh'`, 435
-# files, the same two mutants move 276 and 128); reproduce with the mutant, not the number. None of them may
-# be reported:
+# ⛔ TWO MORE GUARDS, AND EACH CHANGES THE SCAN OF HUNDREDS OF VALID SCRIPTS (measured at THIS head over the
+# 435 `git ls-files '*.sh'` files: `{`-on-the-next-line changes 283, `head`'s end-of-line anchor changes 130 —
+# the two between them inventing `echo`, `printf`, `break`, `mkdir`, `awk` as "definitions"). ⛔ EVERY figure
+# in this paragraph is a MUTANT measured over a NAMED population, and the mutant is the reproducible half:
+# earlier drafts quoted 282 / 129 / 21 / 18 from populations that do not reproduce at this head or any parent
+# (`446` is not the size of any set this tree has — it is 435 by `git ls-files '*.sh'` and 452 with shebang
+# detection), and the `~13x` / `~6x` ratios derived from them were wrong in both base and result. None of
+# them may be reported:
 #   * a bare command name followed by `:` (not a brace) — a `head` match that must NOT be claimed;
 #   * a command with arguments, then `{` on the next line — likewise;
 #   * a head followed by a line that CONTAINS `{` but does not start with it.
@@ -1288,10 +1345,30 @@ after_two_openers() { :; }
 # stripped one backslash and continued anyway, which swallowed it (a FALSE PASS).
 echo a\\
 after_even_backslash_run() { :; }
+# ⛔ A COMMENT IS NOT A CONTINUATION, even when it ENDS in a backslash (#3960 cycle 3, P2 — measured):
+# bash ends the comment at the newline, so the next line is a NEW command and this definition MUST be seen.
+# The join only exempted WHOLE-LINE comments, which lost it (a FALSE PASS).
+x_trailing=1  # a note ending in a backslash \
+after_backslash_comment() { :; }
+# ⛔ AND ARITHMETIC OUTLIVES THE LINE (#3960 cycle 3, P2 — measured): `$((` may close on a LATER line with
+# no backslash, and a `<<` inside it is still a SHIFT. The depth is carried across lines now, so the
+# definition after the closing `))` MUST be seen.
+_rs_ml=$(( 1 +
+   2 << 3 ))
+after_multiline_arith() { :; }
+# ⛔ THE BACKSLASH-QUOTED FORM QUOTES *ONE* CHARACTER (#3960 cycle 3, P3 — measured): `<<\!BANG` delimits
+# `!BANG`; collapsing that branch to a plain quote scan invents the body line as a definition.
+cat <<\!BANG
+body_of_bang_delimiter() { :; }
+!BANG
+# ⛔ AND AN ARITHMETIC CONTEXT CLOSES ON `))`, not `)` (#3960 cycle 3, P3 — measured): `$(( (a+b) << 3 ))`
+# closes on the doubled paren, and a single-`)` model reopens a phantom heredoc at the shift.
+_rs_pair=$(( ( _rs_shift + 1 ) << 3 ))
+after_paren_arith() { :; }
 FIXTURE
 _scan_fixture="$(python3 "$T/defs.py" "$T/defs-fixture.sh")"
 ck "f11f-0 …and every one of those spellings is really SEEN (brace on either line, any indent), while bare keywords followed by '{' are not counted" \
-   '[ "$_scan_fixture" = "name_same_line name_func_kw indented_same_line name_next_line name_func_next continued_name after_notes_comment after_comment_continuation head_after_inline_comment head_with_comment_between indented_head_only head_then_blank real_after_tab_heredoc after_arith_and_trailing_comment after_tabbed_terminator after_here_strings after_two_openers after_even_backslash_run" ]'
+   '[ "$_scan_fixture" = "name_same_line name_func_kw indented_same_line name_next_line name_func_next continued_name after_notes_comment after_comment_continuation head_after_inline_comment head_with_comment_between indented_head_only head_then_blank real_after_tab_heredoc after_arith_and_trailing_comment after_tabbed_terminator after_here_strings after_two_openers after_even_backslash_run after_backslash_comment after_multiline_arith after_paren_arith" ]'
 # ⛔ THE DEGRADED PATH MUST NOT CLAIM TO GRADE WHEN IT CANNOT NAME A REPO (review round 2, P1). The
 # doctor's REPO-only arm raises when the checkout's `origin` proves nothing — the TCC shape on the
 # default macOS install — so `f4`'s stub (which echoes argv) would pass on a wrapper that dies in
