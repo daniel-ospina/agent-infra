@@ -1618,6 +1618,29 @@ assert_contains "$OUT" "the RAW output could not be persisted" \
 assert_contains "$(grep '^farm_n=' <<<"$REC24W")" "farm_n=unparsed" \
     "T24 control: and the count is still unparsed, not a number the extraction never produced"
 
+# ── T24x: an inherited CDPATH must not smuggle a FARM-LOCAL checker past the containment refusal ──
+# MEASURED (review round 5): with a RELATIVE `HARNESS_APPLY_FARM_CHECKER` and a CDPATH that resolves its
+# directory, bash's `cd` PRINTED the resolved dir, so `$FARM_CHECKER_REAL` was a TWO-LINE string that
+# could never carry the `$FARM_DEST_REAL/` prefix — the containment test read a farm-local checker as
+# OUTSIDE the farm, executed it, and the farm GRADED ITSELF `farm: ok` at rc=0. That is the fail-open
+# shape this whole leg exists to remove, so it is pinned: relative checker + inherited CDPATH must still
+# be REFUSED. (The fix clears CDPATH on every captured `cd`, not just the rows-path absolutisation.)
+say_case "T24x an inherited CDPATH cannot smuggle a FARM-LOCAL checker past the containment refusal"
+mk_origin t24x; mk_clone t24x
+REPO_P="$CLONE"; MODE_P=sync
+mkdir -p "$T/t24x/farm-ish/.pi/agent/scripts"
+printf 'x\n' >"$T/t24x/farm-ish/.pi/agent/scripts/pr-doctor.py"
+printf '#!/usr/bin/env bash\nprintf "check-farm-drift: ok\\n"; exit 0\n' >"$T/t24x/farm-ish/.pi/agent/scripts/check-farm-drift.sh"
+chmod +x "$T/t24x/farm-ish/.pi/agent/scripts/check-farm-drift.sh"
+# The cwd makes "scripts/…" resolvable and CDPATH NAMES THE DIRECTORY IT LIVES IN — the exact pair that
+# made `cd` print. A `.`-prefixed or absolute checker path skips CDPATH entirely and would prove nothing.
+OUT="$(cd "$T/t24x/farm-ish/.pi/agent" && CDPATH="$T/t24x/farm-ish/.pi/agent" CELL_HOME_P="$T/t24x/farm-ish" \
+    HARNESS_APPLY_FARM_CHECKER="scripts/check-farm-drift.sh" run_pass "$T/t24x" 2>&1)"; RC=$?
+assert_eq "$RC" "24" "T24 control: a relative checker under an inherited CDPATH is REFUSED (24), not self-graded green"
+assert_contains "$OUT" "lives INSIDE the farm" \
+    "T24 control: and it is the CONTAINMENT refusal, so the resolved path really landed inside the farm"
+assert_absent "$OUT" "farm: ok" "T24 control: and the farm did not grade itself ok through its own checker"
+
 # ── T26: the materialiser is TOLD which cell home to pin into (agent-infra#3593) ─────────────────
 # MEASURED on the `cmux` cell, 2026-11-06: this pass resolves CELL_HOME from $HOME (pass:195) and the
 # pin records from it, then invoked the materialiser with NONE of them. The materialiser resolves the

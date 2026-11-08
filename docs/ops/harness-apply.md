@@ -154,8 +154,12 @@ timestamp, ref, dest and row count of the run that wrote it. No later pass delet
 who opens it directly can always tell how old it is — and **`farm_rows=` is the currency
 indicator**, not the file's presence: `none` (a graded farm matched) and `not-graded` (no usable
 grade was produced — the switch is off, there was **no farm to grade**, a refusal exited first, or
-the instrument's rc was unreadable, which `action=farm-unknown` names) both mean the list on disk is
-*not* today's answer. Deletion was tried and removed: it fired on the read-only verbs (`--print-status`,
+the instrument's rc was unreadable) both mean the list on disk is *not* today's answer. **`action=` is
+not the tie-breaker here**: it names the unreadable-rc case (`farm-unknown`) and the pre-flow
+refusals, but the DISARMED switch and the FARMLESS host BOTH carry `action=none` — the same value a
+clean no-op carries — so on those two the journal's own `farm: SKIPPED — …` line is the only thing
+that says which (and a deliberately disarmed farm gate is a P0 condition worth seeing, not a benign
+controller-only host). Deletion was tried and removed: it fired on the read-only verbs (`--print-status`,
 which the timer installer itself calls), it sat below the seam validations so those refusals still
 orphaned the list, and a fixed-path delete can unlink a concurrent pass's just-published file
 between its write and its record.

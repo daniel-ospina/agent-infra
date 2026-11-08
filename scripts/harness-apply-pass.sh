@@ -151,7 +151,15 @@ set -uo pipefail
 # `set -u` the unguarded form printed "BASH_SOURCE[0]: unbound variable" on EVERY tick, left $HERE empty
 # (silently degrading the repo-resolution fallback to `.`), and broke `--help` through the launcher. The
 # sibling artifact this launcher already runs carries the same note (scripts/disk-reaper.sh).
-HERE="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)"
+# ⛔ `CDPATH=` ON EVERY CAPTURED `cd` (review round 5). bash's `cd` PRINTS the resolved directory when it
+# resolves through an inherited CDPATH, so the captured value holds TWO lines — and every containment
+# test below then compares against a string containing a newline. Measured consequence (reproduced):
+# with a RELATIVE `HARNESS_APPLY_FARM_CHECKER` and a CDPATH that resolves its directory,
+# `$FARM_CHECKER_REAL` could never carry the `$FARM_DEST_REAL/` prefix, so a FARM-LOCAL checker read as
+# "outside the farm" and the farm GRADED ITSELF GREEN — the exact fail-open this leg exists to remove.
+# `$HERE` is the same hazard when this file is invoked by a relative path. The rows-path absolutisation
+# below already clears CDPATH for the same reason; these are the rest.
+HERE="$(CDPATH= cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)"
 
 log_line()  { printf '%s\n' "$*"; }
 err()  { printf '%s: %s\n' "${0##*/}" "$*" >&2; }
@@ -277,11 +285,12 @@ REC_PIN="none"; REC_PIN_TREE="none"; REC_ACTION="none"; REC_DETAIL=""; REC_REMED
 # ⛔ THE FARM ROWS ARE FIELDS, NOT PROSE (tortoise#10114 arm 2, review round 9). The acceptance arm is
 # "a scheduled check that NAMES EACH drifting file"; the journal excerpt below is bounded at 12 so a
 # 30-row farm had 18 files that were COUNTED and never named anywhere durable. `not-graded` means NO
-# USABLE GRADE was produced — the switch is off, there was NO FARM TO GRADE, a refusal exited first, or
-# the instrument's rc was unreadable. `action=` names which of those it can — but NOT the farmless
-# SKIPPED arm, where it is `none` (the same value a clean no-op carries), so there `farm_rows=` is the
-# only signal: the arm that cannot read a grade must not claim one, and must not look like a pass that
-# graded and found nothing.
+# USABLE GRADE was produced, and FOUR states produce it: the switch is off, there was NO FARM TO GRADE,
+# a pre-flow refusal exited first, or the instrument's rc was unreadable. `action=` names only the last
+# two (`farm-unknown`, or the refusal's own action): BOTH of the first two carry `action=none`, the same
+# value a clean no-op carries, so `farm_rows=` cannot split them either — the journal line is what does
+# (`farm: SKIPPED — HARNESS_APPLY_FARM_CHECK=0 (deliberately disarmed…)` vs `farm: SKIPPED — no farm at
+# …`). Neither may ever read like a pass that graded and found nothing to name.
 REC_FARM_ROWS="not-graded"; REC_FARM_NROWS="not-graded"
 # ⛔ THE DRIFT ROWS ARTIFACT IS SELF-DATING AND IS NEVER DELETED BY A LATER PASS (review round 2).
 # Round 1 deleted it on every pass so a stale list could not be read as current — and that delete was
@@ -1323,7 +1332,7 @@ if [ "$FARM_CHECK_ON" = "1" ]; then
             }
             case "$_l" in
                 /*) FARM_CHECKER_T="$_l" ;;
-                *) FARM_CHECKER_T="$(cd "$(dirname "$FARM_CHECKER_T")" 2>/dev/null && pwd -P)/$_l" ;;
+                *) FARM_CHECKER_T="$(CDPATH= cd "$(dirname "$FARM_CHECKER_T")" 2>/dev/null && pwd -P)/$_l" ;;
             esac
             _hops=$((_hops + 1))
         done
@@ -1334,8 +1343,8 @@ if [ "$FARM_CHECK_ON" = "1" ]; then
             REC_ACTION=farm-unverifiable
             finish 0 24 "farm: UNKNOWN — $FARM_CHECKER is a symlink chain that did not resolve within 40 hops, so where it points cannot be established"
         fi
-        FARM_CHECKER_REAL="$(cd "$(dirname "$FARM_CHECKER_T")" 2>/dev/null && pwd -P)/$(basename "$FARM_CHECKER_T")"
-        FARM_DEST_REAL="$(cd "$FARM_DEST" 2>/dev/null && pwd -P)"
+        FARM_CHECKER_REAL="$(CDPATH= cd "$(dirname "$FARM_CHECKER_T")" 2>/dev/null && pwd -P)/$(basename "$FARM_CHECKER_T")"
+        FARM_DEST_REAL="$(CDPATH= cd "$FARM_DEST" 2>/dev/null && pwd -P)"
         # ⛔ ...AND IT MUST BE THE FARM THIS PASS RUNS FROM. The `case "$HERE"` refusal above only fires
         # when `$FARM_DEST` names NOTHING; when it names a DIFFERENT farm that exists, the pass grades
         # that one and reports green over the farm it is executing (review round 7, reproduced with two
@@ -1344,7 +1353,7 @@ if [ "$FARM_CHECK_ON" = "1" ]; then
         # `$CELL_HOME/.pi/agent/scripts` — so this creates no false red where the box is consistent.
         case "$HERE" in
             */.pi/agent/scripts|*/.pi/agent/scripts/)
-                HERE_REAL="$(cd "$HERE" 2>/dev/null && pwd -P)"
+                HERE_REAL="$(CDPATH= cd "$HERE" 2>/dev/null && pwd -P)"
                 if [ -n "$HERE_REAL" ] && [ "$HERE_REAL" != "$FARM_DEST_REAL" ]; then
                     REC_ACTION=farm-unverifiable
                     finish 0 24 "farm: UNKNOWN — this pass executes FROM $HERE_REAL but grades $FARM_DEST_REAL; the farm that is really running was never graded — pin the farm (HARNESS_APPLY_FARM_DEST, or render CELL_HOME) to the one the units execute"
@@ -1449,9 +1458,14 @@ if [ "$FARM_CHECK_ON" = "1" ]; then
                 FARM_ROWS_OK=0
                 # ⛔ THE POST-CONDITION IS THE PUBLISHED PATH, NOT `mv`'s EXIT CODE (review finding).
                 # `mv src dir` where the artifact path is a DIRECTORY moves the tempfile INTO it and
-                # returns 0 — so an exit-code-only test records a path that holds no list. `[ -d ]`
-                # refuses that state up front and `[ -f ]` makes "persisted" mean "a readable file is
-                # at the path the record names", which is the only property a reader can rely on.
+                # returns 0, so an exit-code-only test would record a path that holds no list. The
+                # `[ ! -d ]` pre-check refuses that state UP FRONT (it is the one with an attributable
+                # mutant: replacing it with `[ -n … ]` strands the temp inside the directory and reds
+                # T24r); the trailing `[ -f ]` is DEFENCE IN DEPTH — with the pre-check and a
+                # same-directory `mv` no reachable state distinguishes it, so it is kept for the
+                # concurrent case (another pass replacing the published path between `mv` and the test)
+                # and stated as such rather than claimed as the guard that makes "persisted" mean
+                # "a readable file is at the named path" (#3442: an unattributed guard is not a guard).
                 if [ ! -d "$FARM_ROWS_FILE" ] \
                    && { printf '# harness-apply farm drift rows — %s — ref=%s dest=%s %s\n' \
                             "$(date -u +%FT%TZ)" "$REF" "$FARM_DEST" "$HDR_NOTE" >"$FARM_ROWS_FILE.tmp-$$" 2>/dev/null \
