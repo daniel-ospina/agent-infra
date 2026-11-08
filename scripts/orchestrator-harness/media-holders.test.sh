@@ -233,6 +233,45 @@ OUT="$(run_linux "$TWO/proc" "$TWO/dev/video*" "$ASOUND")"
 grep -q 'camera: HELD-BY(pid=200 comm=ffmpeg device='"$TWO"'/dev/video0 via='"$TWO"'/dev/by-id/cam' <<<"$OUT"
 check "F2f a SECOND holder is resolved too (the per-record hit, not the sticky found)" $? "$OUT"
 
+# F2g/F2h — the RESOLVER must not degrade to a string comparison (review P2).
+# `resolve_path` used to fall back to `printf '%s' "$1"`, i.e. the path UNRESOLVED,
+# so on a host where python3 is missing or failing the device-identity comparison
+# silently became the path-STRING comparison F2 was filed to remove: the holder
+# names a `/dev/v4l/by-id/…` alias, the alias matches no globbed node, it is not
+# "suspicious" (it IS in the device tree), the census is COMPLETE and UNREADABLE
+# stays 0 — so the script printed **FREE over a device the process provably held**.
+# ⛔ The fixture therefore models the REAL udev layout (the alias lives INSIDE the
+# device tree, not in a temp dir outside it, which arm 3 would flag as suspicious
+# and mask the fail-open).
+RESOLVER="$TMP/resolver"
+mkdir -p "$RESOLVER/dev/v4l/by-id" "$RESOLVER/proc/100/fd"
+ln -s /dev/zero "$RESOLVER/dev/video0"
+ln -s ../../video0 "$RESOLVER/dev/v4l/by-id/usb-cam-video-index0"
+ln -s "$RESOLVER/dev/v4l/by-id/usb-cam-video-index0" "$RESOLVER/proc/100/fd/7"
+printf 'electron\n' > "$RESOLVER/proc/100/comm"
+# F2g — the positive twin: with a WORKING resolver the alias is HELD-BY, so the
+#        row below cannot pass merely by abstaining on every input.
+OUT="$(run_linux "$RESOLVER/proc" "$RESOLVER/dev/video*" "$ASOUND")"
+grep -q 'camera: HELD-BY(pid=100 comm=electron device='"$RESOLVER"'/dev/video0 via='"$RESOLVER"'/dev/v4l/by-id/usb-cam-video-index0' <<<"$OUT"
+check "F2g a udev by-id alias INSIDE the device tree is HELD-BY (the F2h twin)" $? "$OUT"
+# F2h — a resolver that cannot run must ABSTAIN, not compare unresolved text.
+BROKENBIN="$TMP/brokenbin"
+mkdir -p "$BROKENBIN"
+cat > "$BROKENBIN/python3" <<'STUB'
+#!/usr/bin/env bash
+# A python3 that is present but FAILS — the shape of a stripped cell or a broken
+# interpreter, and the one the old `|| printf '%s' "$1"` fallback hid.
+exit 1
+STUB
+chmod +x "$BROKENBIN/python3"
+OUT="$(PATH="$BROKENBIN:$PATH" MH_PLATFORM=Linux MH_PROC="$RESOLVER/proc" \
+       MH_V4L_GLOB="$RESOLVER/dev/video*" MH_ASOUND_PCM="$ASOUND" bash "$SCRIPT" 2>&1)"
+grep -q 'camera: UNVERIFIABLE(device identity could not be RESOLVED' <<<"$OUT"
+check "F2h a FAILING resolver ⇒ UNVERIFIABLE(resolution…), never FREE" $? "$OUT"
+grep -qx 'camera: FREE' <<<"$OUT"
+check "F2h2 …and NOT the FREE it printed while the fallback compared raw text" \
+  "$([ "$?" -ne 0 ] && echo 0 || echo 1)" "$OUT"
+
 # ── F3 (review cycle 1) — `--ancestry --json` must survive a multi-line argv ──
 # The lane root's argv IS multi-line: `pi -p "<multi-line brief>"`. `json_str`
 # used to strip the control range and escape TAB only, so a literal LF passed

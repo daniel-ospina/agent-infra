@@ -82,6 +82,13 @@ const ROWS = [
   // stays record-only: that is the category-B rejection the scoping comment records.
   ["L9d open an explicit .app PATH", "open ./Build/DMeer.app", 1, "open", true],
   ["L9e open a bare .app in cwd is a path too", "open DMeer.app", 1, "open", true],
+  // ⛔ THE SAME BUNDLE IN ITS OTHER SPELLING (review P2). `open -a DMeer.app` and
+  // `open DMeer.app` name one bundle; the positional arm above and
+  // `appBundleBinary` both decide "is this a bundle" by the `.app` SUFFIX, so the
+  // `-a` arm judging only a `/` made the verdict depend on the spelling — a false
+  // PASS on the incident's own app, invisible to `select(.media)`. The twin that
+  // keeps this honest is L9a: `open -a Safari` (a NAME) stays record-only.
+  ["L9f open -a <bundle>.app is a bundle, not a name", "open -a DMeer.app", 1, "open", true],
   // L10 — headed browser runs can present a REAL device picker.
   ["L10a playwright --headed", "npx playwright test --headed", 1, "playwright", true],
   ["L10b PWDEBUG", "PWDEBUG=1 npx playwright test", 1, "playwright", true],
@@ -605,6 +612,37 @@ if (handler) {
   check("H14 handler: BLOCKS a launch after a comment carrying `<<`", Boolean(commented?.block),
     `block=${Boolean(commented?.block)}`);
   check("H14a …and WROTE its ledger row", ledgerRows().length === 1, `rows=${ledgerRows().length}`);
+
+  // ── H15 — a REMOVED cwd must never throw out of the pre-hook (review P1).
+  //         `laneContract()` reaches `process.cwd()`, which throws ENOENT once the
+  //         lane's worktree has been reaped; print mode short-circuits the guarded
+  //         copy in `isUnattended()`, so the throw landed in the handler and FAILED
+  //         the lane's own bash call while losing both halves of #2249. The fixture
+  //         is the real thing: chdir into a temp dir, delete it, and `process.cwd()`
+  //         throws `uv_cwd` (macOS and Linux both). Driven through the handler on
+  //         purpose — only the handler runs the unguarded call.
+  const GONE = mkdtempSync(join(tmpdir(), "gui-device-guard-gone-cwd-"));
+  laneMod._resetLaneContractForTest();
+  process.chdir(GONE);
+  rmSync(GONE, { recursive: true, force: true });
+  let cwdThrew = null;
+  try { process.cwd(); } catch (e) { cwdThrew = e; }
+  check("H15 fixture: process.cwd() throws once the cwd is removed", cwdThrew !== null,
+    String(cwdThrew));
+  resetLedger();
+  let goneResult = null;
+  let goneThrew = null;
+  try { goneResult = await drive("npm exec electron ."); } catch (e) { goneThrew = e; }
+  process.chdir(HERE);
+  const goneRows = ledgerRows();
+  laneMod._resetLaneContractForTest();
+  check("H15a handler: an unreadable cwd does NOT throw out of the tool_call pre-hook",
+    goneThrew === null, String(goneThrew));
+  check("H15b …and the launch is still BLOCKED (the refusal half)",
+    Boolean(goneResult?.block), `block=${Boolean(goneResult?.block)}`);
+  check("H15c …and its ledger row is written, naming the unreadable cwd",
+    goneRows.length === 1 && goneRows[0].cwd === "<cwd removed>",
+    `rows=${JSON.stringify(goneRows).slice(0, 200)}`);
 }
 
 // ── drift pins ─────────────────────────────────────────────────────────────

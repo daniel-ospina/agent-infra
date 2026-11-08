@@ -234,9 +234,18 @@ EOF
 # (absent on macOS, and the portability checker flags it), and `cd … && pwd -P`
 # resolves only the DIRECTORY, not a trailing symlink — which is the hop this
 # needs. python3 ships on both platforms and `os.path.realpath` is exact.
+#
+# ⛔ IT PRINTS NOTHING AND RETURNS NON-ZERO WHEN IT CANNOT RESOLVE (review P2).
+# The first cut fell back to `printf '%s' "$1"` — the path UNRESOLVED — so a host
+# with no working `python3` silently reverted the device-identity comparison (F2,
+# review cycle 3) back to the path-STRING comparison F2 was filed to remove: a
+# holder naming a standard `/dev/v4l/by-id/…` alias then matched no globbed node,
+# was not "suspicious" (it IS under /dev), the census was COMPLETE and `UNREADABLE`
+# stayed 0 — so the script printed **FREE over a device the process provably
+# held**. An unreadable read must never be reported as a definitive answer: the
+# caller abstains instead, which is the file's whole contract.
 resolve_path() {
-  python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$1" 2>/dev/null \
-    || printf '%s' "$1"
+  python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$1" 2>/dev/null
 }
 
 # pid_comm <pid> — a DISPLAY-only process name, stripped of every byte that could
@@ -255,13 +264,14 @@ pid_comm() {
 }
 
 linux_camera() {
-  local devs dev found=0 hit pid target real devreal base suspicious=""
+  local devs dev found=0 hit pid target real devreal base devroot unresolved="" suspicious=""
   devs="$(ls -d $MH_V4L_GLOB 2>/dev/null)"
   if [ -z "$devs" ]; then
     emit_device camera ABSENT "no video device (no $MH_V4L_GLOB)"
     return 0
   fi
   base="${MH_V4L_GLOB##*/}"      # e.g. `video*` — the NAME pattern we are looking for
+  devroot="${MH_V4L_GLOB%/*}"   # the device tree this census is about (normally /dev)
   linux_fd_census
   while IFS='|' read -r pid target; do
     [ -n "${pid:-}" ] || continue
@@ -291,11 +301,23 @@ linux_camera() {
     #    resolve the target and compare the RESOLVED path to the device list.
     if [ -c "$target" ]; then
       real="$(resolve_path "$target")"
+      # ⛔ A RESOLVER WE COULD NOT RUN IS AN ABSTENTION, NOT A COMPARISON. With the
+      # path unresolved the next loop would compare text to text, which is exactly
+      # the fail-open F2 removed — and it fails SILENTLY, so it is collected here
+      # and turned into UNVERIFIABLE below.
+      if [ -z "$real" ]; then
+        unresolved="$unresolved $target"
+        continue
+      fi
       for dev in $devs; do
         # BOTH SIDES RESOLVED: the holder may name an alias, and the GLOBBED path
         # may itself be a symlinked node (udev ships `by-id`/`by-path` links), so a
         # one-sided `readlink` would compare a resolved path to an unresolved one.
         devreal="$(resolve_path "$dev")"
+        if [ -z "$devreal" ]; then
+          unresolved="$unresolved $dev"
+          break
+        fi
         if [ "$real" = "$devreal" ]; then
           emit_device camera HELD-BY "pid=$pid comm=$(pid_comm "$pid") device=$dev via=$target"
           found=1
@@ -313,8 +335,13 @@ linux_camera() {
       case "${target##*/}" in
         $base|$base[0-9]*) suspicious="$suspicious $target" ;;
         *)
+          # A node inside the DEVICE TREE the census was asked about is named like
+          # a device, not like a foreign mount. `/dev` is that tree in production
+          # (it is where MH_V4L_GLOB points); `$devroot` is the same tree as the
+          # seam states it, so a fixture can model the real udev layout
+          # (`/dev/v4l/by-id/…`) without writing to /dev.
           case "$target" in
-            /dev/*) ;;
+            /dev/*|"$devroot"/*) ;;
             *) suspicious="$suspicious $target" ;;
           esac ;;
       esac
@@ -323,6 +350,10 @@ linux_camera() {
 $(printf '%s' "$HOLDERS")
 EOF
   [ "$found" -eq 1 ] && return 0
+  if [ -n "$unresolved" ]; then
+    emit_device camera UNVERIFIABLE "device identity could not be RESOLVED for:$unresolved — the resolver (python3 os.path.realpath) is missing or failing, so an alias cannot be told from a different device, and no free claim may rest on that read"
+    return 0
+  fi
   if [ -n "$suspicious" ]; then
     emit_device camera UNVERIFIABLE "character device(s) held that are NOT the globbed camera(s):$suspicious — an alias, a bind mount or a same-major/minor node can hide the camera, so no free claim"
     return 0

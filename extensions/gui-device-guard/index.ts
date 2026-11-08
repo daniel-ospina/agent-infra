@@ -817,14 +817,17 @@ function attachedShortArg(tok: string, letter: string): string | null {
  * bare flag), and the LAST of `letters` present in the cluster wins — so `-bna`
  * is `-b -n -a` and its argument is the next word, matching `-na`.
  */
-function clusterShortArg(tok: string, letters: readonly string[]): string | null {
+function clusterShortArg(
+  tok: string,
+  letters: readonly string[],
+): { letter: string; arg: string } | null {
   if (!tok.startsWith("-") || tok.startsWith("--")) return null;
   const body = tok.slice(1);
   let at = -1;
   for (const letter of letters) at = Math.max(at, body.lastIndexOf(letter));
   if (at < 0) return null;
   if (!/^[A-Za-z]*$/.test(body.slice(0, at))) return null;
-  return body.slice(at + 1);
+  return { letter: body[at], arg: body.slice(at + 1) };
 }
 
 /**
@@ -917,6 +920,12 @@ function classifySegment(
     const rest = toks.slice(index >= 0 ? index + 1 : cwi + 1);
     let app: string | null = null;
     let fromFlag = false;
+    // ⛔ WHICH option letter took the argument decides whether a trailing `.app`
+    // is a BUNDLE or part of an IDENTIFIER. `-b` takes a bundle ID, and
+    // `open -nb com.example.app` is a legitimate ID that ENDS in `.app` — reading
+    // the suffix there would turn a named-app launch into a media shape. Only `-a`
+    // (a name or a path) and the positional form can name a bundle.
+    let fromIdFlag = false;
     for (let i = 0; i < rest.length; i++) {
       const tok = rest[i];
       // ⛔ THE FLAG CLUSTER IS ONE PREDICATE, WITH THE `-` GUARD (round 7 P1-1 and
@@ -927,9 +936,10 @@ function classifySegment(
       if (flagArg !== null) {
         // An empty remainder means the argument is the NEXT token (`-a <app>`,
         // `-na <name>`); a non-empty one is the ATTACHED spelling (`-aDMeer`).
-        app = flagArg !== "" ? flagArg : (rest[i + 1] ?? null);
+        app = flagArg.arg !== "" ? flagArg.arg : (rest[i + 1] ?? null);
         if (app === null) continue; // a lone `-a` with nothing after it
         fromFlag = true;
+        fromIdFlag = flagArg.letter === "b";
         break;
       }
       if (tok.endsWith(".app")) {
@@ -947,7 +957,16 @@ function classifySegment(
       // same thing as running its `Contents/MacOS` binary (already `media: true`).
       // Leaving it `false` meant the README's own `select(.media)` lookup could
       // not find it. So: a PATH is a media claim, a NAME is not.
-      const isPath = !fromFlag || app.includes("/");
+      // ⛔ THE `.app` SUFFIX COUNTS TOO (round-N P2). `open -a DMeer.app` and
+      // `open DMeer.app` are the SAME bundle, and the positional arm above and
+      // `appBundleBinary` both decide "is this a bundle" by the SUFFIX. Judging
+      // only the `/` here made the verdict depend on the SPELLING: the bare name
+      // was `media: true` and refused, the `-a`-attached name `media: false` and
+      // allowed — a false PASS on the incident's own app, invisible to the
+      // README's `select(.media)` lookup. A NAME (`-a Safari`) is still not a
+      // path, so the recorded category-B rejection of "block every GUI launch"
+      // is untouched.
+      const isPath = !fromFlag || app.includes("/") || (!fromIdFlag && app.endsWith(".app"));
       return {
         rule: "open",
         app,
@@ -1190,6 +1209,34 @@ export function isUnattended(
 }
 
 /**
+ * `laneContract()`, made TOTAL — the pre-hook must never throw.
+ *
+ * ⛔ `deriveLaneContract` calls `process.cwd()` unguarded, which throws `ENOENT`
+ * once the lane's worktree has been reaped out from under it
+ * (`scripts/pi-reap-worktrees.sh`). `bash` keeps working in a deleted cwd, so the
+ * only visible symptom was an opaque `uv_cwd` failure of the lane's own command.
+ * An underivable contract is NOT evidence of a lane (the same call `isUnattended`
+ * already makes), and it is never an exception.
+ */
+function safeLane(): { lane: boolean; tag: string | null } {
+  try {
+    const contract = laneContract();
+    return { lane: contract.lane === true, tag: contract.tag ?? null };
+  } catch {
+    return { lane: false, tag: null };
+  }
+}
+
+/** `process.cwd()`, made TOTAL — a removed cwd is a recorded fact, not a throw. */
+function safeCwd(): string {
+  try {
+    return process.cwd();
+  } catch {
+    return "<cwd removed>";
+  }
+}
+
+/**
  * The block's reason — names the incident, the remedy that actually applies, and
  * the hatch.
  *
@@ -1250,7 +1297,16 @@ export default function guiDeviceGuard(pi: ExtensionAPI): void {
     if (findings.length === 0) return undefined;
 
     const recordPath = process.env[RECORD_ENV] || defaultRecordPath();
-    const lane = laneContract();
+    // ⛔ NEITHER OF THESE MAY THROW (review P1). `laneContract()` reaches
+    // `process.cwd()` (shared/headless-lane.ts), which throws `ENOENT` when the
+    // lane's cwd has been REMOVED — and print mode short-circuits the guarded
+    // copy in `isUnattended()`, so the throw lands here, in the pre-hook. A throw
+    // out of this hook FAILS the lane's own bash call and loses both halves of
+    // #2249 at once (no block, no ledger row) on a shape the guard is otherwise
+    // correct about. A lane we cannot derive is recorded as "not provably a
+    // lane", never as a crash; a cwd we cannot read is recorded as unreadable.
+    const lane = safeLane();
+    const cwd = safeCwd();
     let blocked: LaunchFinding | null = null;
 
     for (const finding of findings) {
@@ -1267,7 +1323,7 @@ export default function guiDeviceGuard(pi: ExtensionAPI): void {
           argv: finding.argv,
           media: finding.media,
           faked: finding.faked,
-          cwd: process.cwd(),
+          cwd,
           pid: process.pid,
           ppid: process.ppid,
           host: hostname(),
