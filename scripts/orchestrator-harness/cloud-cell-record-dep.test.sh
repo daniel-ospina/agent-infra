@@ -56,17 +56,23 @@ pass=0; fail=0
 # success assertion KIND in this file, and #3760 DELETED them while nothing reddened: the file ends at
 # `[ "$fail" -eq 0 ]` and `run-bash-shards.sh` discovers by glob and reads only the exit code, so no count
 # pinned them. Restored lines are, on their own, exactly as deletable as they were the first time.
-# So they go through `ck_start_succeeded`, which bumps a counter the floor at the bottom compares with the
-# number of arms that actually capture `start_rc`. Deliberately the same shape as the guard suite's
-# `optOutLegRan` floor (`test-remote-context.mjs`): a DECLARED line is satisfied by a neutralised consumer;
-# an EXECUTED count is not. Precedent outside this repo: Jest's `expect.assertions(n)` / `hasAssertions()`.
+# So they go through `ck_start_succeeded`, which the floor at the bottom compares with the number of arms
+# that actually capture `start_rc`. Deliberately the same shape as the guard suite's `optOutLegRan` floor
+# (`test-remote-context.mjs`): a DECLARED line is satisfied by a neutralised consumer; an EXECUTED count is
+# not. Precedent outside this repo: Jest's `expect.assertions(n)` / `hasAssertions()`.
+# ⛔ THE COUNTER IS BUMPED BY THE ASSERTION PRIMITIVE, NOT BY THE WRAPPER (#3774 review, P2 — measured). Jest's
+# counter is bumped by `expect()` itself, and that detail is the whole guard: bumping it inside
+# `ck_start_succeeded` counts WRAPPER INVOCATIONS, so removing the `ck "$1" "$2"` call from the helper's body
+# (one line) left `117 passed, 0 failed`, exit 0 — every whole-`start` assertion gone and the floor row
+# printed ✅. The bump therefore lives in `ck`, keyed on the label kind, so the datum exists only when the
+# assertion really ran.
 start_rc_asserted=0
 ck() { # ck <name> <0|1>
+  case "$1" in *SUCCEEDED*) start_rc_asserted=$((start_rc_asserted + 1)) ;; esac
   if [ "$2" -eq 0 ]; then printf '  \033[32mPASS\033[0m  %s\n' "$1"; pass=$((pass+1))
   else printf '  \033[31mFAIL\033[0m  %s\n' "$1"; fail=$((fail+1)); fi
 }
-ck_start_succeeded() { # ck_start_succeeded <label> <start_rc> — the whole-`start` verdict, and the floor's datum
-  start_rc_asserted=$((start_rc_asserted + 1))
+ck_start_succeeded() { # ck_start_succeeded <label> <start_rc> — the whole-`start` verdict; `ck` counts it
   ck "$1" "$2"
 }
 note() { printf '      %s\n' "$*"; }
@@ -223,17 +229,18 @@ env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
 # deleted so that `start`'s rc was "reported, never asserted". The premise does NOT reproduce: the fixture's
 # tmux stub only RECORDS `new-session`'s argv (`:110-118`) and never runs it, and service mode
 # (`cloud-cell-supervisor.sh` — the `exec bash "$HARNESS/orch-loop.sh"` arm) is not taken, so no loop can
-# hang. Measured on this fixture with the helper seeded: `start_rc=0` in ALL THREE arms and 118 passed /
-# 0 failed either way.
+# hang. Measured on this fixture with the helper seeded: `start_rc=0` in ALL THREE arms and `118 passed /
+# 0 failed` either way IN THE FILE AS IT STOOD THEN — `120 passed / 0 failed` at this head, which adds the
+# executed floor's two rows and changes no arm's result.
 # ⛔ AND HERE IS THE REASON, IN ONE CLAUSE — because the paragraph above only REFUTES the old one and then
 # stops, which leaves a reader told that a justification exists and unable to find it (#3774 review, P2;
 # and “a premise stated without its reason” is precisely how the three deleted assertions happened):
 # NOTHING IN THIS FIXTURE READS `check-class.py`. The controller loop is the only consumer that would
 # import the classifier, and that loop is never entered — the same two facts as above (the tmux stub does
 # not RUN what it records, and service mode is not taken). So the seeding question is FIXTURE WEIGHT, not
-# pass/fail: a seeded helper would be a file no assertion in this suite ever touches. Measured, seeding is
-# also harmless (118 passed / 0 failed), so this is a stated trade and not a premise the next cycle has to
-# re-derive.
+# pass/fail: a seeded helper would be a file no assertion in this suite ever touches. Measured again at this
+# head, seeding is also harmless (`120 passed / 0 failed` seeded, `120 passed / 0 failed` unseeded), so this
+# is a stated trade and not a premise the next cycle has to re-derive.
 # ⛔ SERVICE MODE IS PINNED OFF, NOT MERELY ABSENT (review P1 on #3774, measured). The sentence above used
 # to claim `ORCH_FOREGROUND` "is never set" — that was WRONG, and it mattered: the fixture does not set it
 # but did not NEUTRALISE it either, so it was INHERITED, and on a fleet cell it IS `1`
