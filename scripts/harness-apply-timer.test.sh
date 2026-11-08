@@ -1574,6 +1574,10 @@ mkdir -p "$T/t24u/home/.pi/agent/scripts"
 cat >"$T/t24u/stub-unknown.sh" <<'FARM'
 #!/usr/bin/env bash
 printf 'check-farm-drift: UNKNOWN — the two trees could not be compared\n' >&2
+# ⛔ THE INSTRUMENT CAN PRINT A REMEDY BEFORE IT GIVES UP, and the rc=2 arm used to drop it (review
+# round 16, measured: `remedy=none` beside an artifact holding this block, with the word `Next` nowhere
+# in the record — while the docs promise the record never names a defect and leaves nobody an action).
+printf '   Next: fix the declaration entries (each must name a path under scripts/), then re-run this.\n' >&2
 exit 2
 FARM
 chmod +x "$T/t24u/stub-unknown.sh"
@@ -1595,6 +1599,9 @@ assert_contains "$(head -1 "$T/t24u/state/harness-apply-farm-rows.txt" 2>/dev/nu
     "T24 control: and the artifact's own header says the grade failed, so nobody reads it as a verdict"
 assert_contains "$(grep '^farm_n=' <<<"$REC24U")" "farm_n=not-graded" \
     "T24 control: while the row count still says NO grade, never 'none', which claims the farm matched"
+# ⛔ AND THIS REFUSAL CARRIES THE REMEDY THE INSTRUMENT DID PRINT (review round 16, measured).
+assert_contains "$(grep '^remedy=' <<<"$REC24U")" "fix the declaration entries" \
+    "T24 control: the rc=2 refusal forwards the instrument's own Next: block, never the literal none"
 
 # ⛔ AND WHEN IT PRINTS NOTHING, `farm_rows=` STAYS `not-graded` (review round 13). The publish above is
 # conditional on there being output at all; without this fixture the condition could be dropped and
@@ -1608,6 +1615,8 @@ assert_eq "$RC" "24" "T24 control: a SILENT unreadable grade is still RED (24)"
 REC24U2="$(cat "$T/t24u2/state/harness-apply.status" 2>/dev/null || true)"
 assert_contains "$(grep '^farm_rows=' <<<"$REC24U2")" "farm_rows=not-graded" \
     "T24 control: and a checker that printed NOTHING gets no artifact named — there is no name to publish"
+assert_contains "$(grep '^remedy=' <<<"$REC24U2")" "no 'Next:' remedy" \
+    "T24 control: with the manual fallback in remedy=, never the literal none"
 
 # ⛔ ZERO EXTRACTED ROWS IS NOT "EVERY FILE NAMED" (review round 5, reproduced). The row extractor's
 # vocabulary is a COPY of the instrument's, so a FARMED checker whose rows it does not match yields a
@@ -2066,6 +2075,22 @@ assert_absent "$(grep '^detail=' <<<"$REC24AH")" "published verbatim" \
 # one state where the pass says no name exists). Mutant: unguard the body write.
 assert_eq "$(tail -n +2 "$T/t24ah/state/harness-apply-farm-rows.txt" 2>/dev/null | wc -l | tr -d ' ')" "0" \
     "T24 control: the mute artifact is a header and NOTHING else — no stray blank row for wc to count"
+
+# ⛔ AND A WHITESPACE-ONLY OUTPUT IS THE SAME STATE (review round 16, measured: the `empty` arm tested the
+# BLANK-STRIPPED population but persisted the UNSTRIPPED one, so a checker printing one 3-space line wrote
+# a stray body line into an artifact whose header says "there is no name in this file because none was
+# printed"). t24ah's stub prints nothing at all, so it never fed this branch.
+mk_origin t24aj; mk_clone t24aj
+REPO_P="$CLONE"; MODE_P=sync
+mkdir -p "$T/t24aj/home/.pi/agent/scripts"
+printf '#!/usr/bin/env bash\nprintf "   \\n" >&2\nexit 1\n' >"$T/t24aj/stub-blankonly.sh"
+chmod +x "$T/t24aj/stub-blankonly.sh"
+OUT="$(HARNESS_APPLY_FARM_CHECKER="$T/t24aj/stub-blankonly.sh" run_pass "$T/t24aj" 2>&1)"; RC=$?
+assert_eq "$RC" "24" "T24 control: a drift grade whose output is ONLY whitespace is still RED (24)"
+assert_contains "$OUT" "printed NO output for a red grade" \
+    "T24 control: and it is recorded as the no-output state, not as a list of names"
+assert_eq "$(tail -n +2 "$T/t24aj/state/harness-apply-farm-rows.txt" 2>/dev/null | wc -l | tr -d ' ')" "0" \
+    "T24 control: with NO body line written — a whitespace-only row is not a name"
 # ⛔ AND `remedy=` IS NEVER `none` ON A REFUSAL (review round 14, measured: the record promised "with
 # the instrument's own remedy" while emitting `remedy=none`, because this stub prints no `Next:` block).
 # A refusal that names a defect and leaves nobody an action is the class the `remedy=` field exists for.

@@ -176,14 +176,18 @@ removes another's file), but it is **not per-run**, and the header is what you c
 - the header's `ref=` and `dest=` are the **ref name and farm path this record's `detail=` quotes** —
   `detail=` reads `farm: DRIFT — <the arm sentence>; <dest> is NOT the code <ref> ships`, the same two
   variables (the record has NO `dest=` field of its own, and the record's `ref=` is the RESOLVED SHORT
-  SHA, a different value on purpose — do not compare those). ⛔ BOTH sit at the TAIL, which is what the
-  240-byte bound cuts, so compare **only the characters that are present**: the visible `dest=` must be
-  a **prefix** of the header's `dest=`, and the visible ref fragment must be a prefix of the header's
-  `ref=`. Measured: a 60-char farm keeps the ref whole, ~92 chars cuts it to a fragment (`or` of
-  `origin/main`), ~120 cuts the farm itself — in every case the visible part still agrees, which is the
-  decidable test. When `detail=` ends at the bound, the header's `dest=`/`ref=` are the authoritative
-  values; a `detail=` whose VISIBLE farm or ref DISAGREES is a different pass's and is what this rule
-  rejects. (The arm sentence leads `detail=` precisely so a truncation can never eat the diagnosis.)
+  SHA, a different value on purpose — do not compare those). ⛔ COMPARE ONLY THE ARM CLAUSE — the text
+  between `is NOT the code ` and the end of that clause — because BOTH values sit at the tail that the
+  240-byte bound cuts, and the readings `finish` appends AFTER them (`— head=… ref=<checkout sha> …
+  drift=…`) carry a `ref=` of their own that is the record's SHORT SHA, not the ref name; a reader who
+  greps the last `ref=` compares the wrong token and rejects a correct artifact. Within that clause:
+  the visible farm path must be a **prefix** of the header's `dest=`, and the visible fragment after
+  `is NOT the code ` must be a prefix of the header's `ref=`. Measured: a 60-char farm keeps
+  `is NOT the code origin/main ships` whole; ~92 chars cuts it to `is NOT the code or`; ~120 cuts the
+  farm path itself — the visible part agrees in all three, which is the decidable test. When the clause
+  is cut, the header's `dest=`/`ref=` are authoritative; a `detail=` whose VISIBLE farm or ref
+  DISAGREES is a different pass's and is what this rule rejects. (The arm sentence leads `detail=`
+  precisely so a truncation can never eat the diagnosis.)
 - the header's UTC must **not be later than** the record's `at=` (the artifact is published first,
 so a header timestamp *after* the record's own is the one cheap impossibility — compare same-format
 strings, both UTC, NOT the header's UTC against the record's `epoch=`);
@@ -229,7 +233,8 @@ declaration), so "no grade" never meant "nothing was reported": the file carries
 with a `NO GRADE` header, `farm_n=not-graded` still says no grade was produced, and `farm_rows=` stays
 `not-graded` only when the instrument printed nothing at all.
 
-`remedy=` carries the instrument's own `Next:` block on a drift refusal — the one actionable text it
+`remedy=` carries the instrument's own `Next:` block on ANY refusal that has one — the drift arms and
+the `farm-unknown` (rc=2) arm, which is the one that often prints it last — and the one actionable text it
 prints, which is per class ("re-run the farm", "declare it LOCAL, delete, or retire it", "a deploy
 cannot fix this") — so the record never names a defect and leaves nobody an action. A checker that
 printed no `Next:` block (a mis-worded farmed copy, or one that died after its rows) makes `remedy=`

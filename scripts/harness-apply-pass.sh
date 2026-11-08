@@ -1439,6 +1439,13 @@ if [ "$FARM_CHECK_ON" = "1" ]; then
         # ⛔ THIS BRANCH OWNS NO DELETION (review round 2). A pass that finds no drift writes no list;
         # a pass that finds drift OVERWRITES it atomically with its own header. The previous list is
         # deliberately left in place — see the artifact note beside the record-field init above.
+        # ⛔ ONE REMEDY EXTRACTION, FOR EVERY ARM THAT REFUSES (review round 16, measured). It used to
+        # live inside the `1|3` arm, so the `farm-unknown` (rc=2) refusal — the one that most often
+        # CARRIES a `Next:` block, because the instrument prints it before giving up — recorded
+        # `remedy=none` while its artifact held the block. Measured: a checker printing an UNSOURCED row,
+        # an UNKNOWN reason and `   Next: fix the declaration entries … then re-run this.` produced
+        # `action=farm-unknown` + `remedy=none`, with the word `Next` nowhere in the record.
+        FARM_REMEDY="$(printf '%s\n' "$FARM_OUT" | sed -n '/^[[:space:]]*Next:/,$p' | head -8)"
         case "$FARM_RC" in
             0)
                 REC_FARM_ROWS=none; REC_FARM_NROWS=0
@@ -1472,7 +1479,7 @@ if [ "$FARM_CHECK_ON" = "1" ]; then
                 # pi-bootstrap/farm-retired.txt; then re-run this."), so forwarding only the `Next:`
                 # line cut the remedy mid-word for exactly the classes whose remedy differs from
                 # "re-farm" (#10114 review round 8). Everything from the first `Next:` to EOF.
-                FARM_REMEDY="$(printf '%s\n' "$FARM_OUT" | sed -n '/^[[:space:]]*Next:/,$p' | head -8)"
+                # `FARM_REMEDY` is extracted ONCE, above the `case` (review round 16).
                 # ⛔ "MATCHED BY THIS PASS'S EXTRACTOR", NOT "FROM THE INSTRUMENT" (review round 8). On the
                 # raw arm FARM_NROWS is 0 because THIS PASS's extractor matched nothing — the instrument
                 # did report rows, and up to 12 of them are printed immediately BELOW this line.
@@ -1524,7 +1531,11 @@ if [ "$FARM_CHECK_ON" = "1" ]; then
                     # until VGATE round 14 — it was assigned after `publish_farm_rows` had already read
                     # the old one, so a silent instrument still published "the RAW output follows
                     # verbatim" over a header-only file).
-                    FARM_ROWS_RAW=1; PERSIST_BODY="$FARM_OUT"; FARM_RAW_WHY=empty
+                    # ⛔ AND ITS BODY IS EMPTY (review round 16, measured). The state is DEFINED as "no
+                    # blank-stripped line", but it persisted the UNSTRIPPED output — so a checker that
+                    # printed one whitespace-only line wrote a stray body line into the artifact that
+                    # says "no name in this file because none was printed", and `wc -l - 1` counted a row.
+                    FARM_ROWS_RAW=1; PERSIST_BODY=""; FARM_RAW_WHY=empty
                     HDR_NOTE="n=unparsed (the instrument printed NO output for a RED grade — farm_n=unparsed says the count is UNKNOWN, and there is no name in this file because none was printed)"
                 elif [ "$FARM_NROWS" -eq 0 ]; then
                     FARM_ROWS_RAW=1; PERSIST_BODY="$FARM_OUT"; FARM_RAW_WHY=zero
@@ -1699,6 +1710,13 @@ if [ "$FARM_CHECK_ON" = "1" ]; then
                 if [ -n "$(printf '%s\n' "$FARM_OUT" | grep -v '^[[:space:]]*$' || true)" ]; then
                     publish_farm_rows "$FARM_OUT" "n=unparsed (NO GRADE — the instrument exited $FARM_RC, so this is its output verbatim, not a complete list; farm_n=not-graded)"
                     REC_FARM_NROWS=not-graded
+                fi
+                # ⛔ AND ITS REMEDY, WHICH IS THE ONE THING THIS ARM OFTEN HAS (review round 16,
+                # measured: `remedy=none` beside an artifact holding the instrument's `Next:` block).
+                if [ -n "$FARM_REMEDY" ]; then
+                    REC_REMEDY="$FARM_REMEDY"
+                else
+                    REC_REMEDY="the instrument printed no 'Next:' remedy — read farm_rows= (or this run's output) and re-run check-farm-drift.sh by hand"
                 fi
                 # ⛔ `not-graded` STAYS HERE ON PURPOSE (review round 3): an UNREADABLE grade is not a
                 # grade, and the rows fields must never imply one. `action=farm-unknown` is the field
