@@ -8821,7 +8821,7 @@ test("#1208: no emitter at all → null (unknown), NEVER 0", () => {
   equal(childMessagesSent({ ...st, markerCount: 3 }), 0, "any parsed marker is evidence too");
 });
 
-test("#1208: turn_end counts completed turns; a streamed-but-unfinished turn floors at 1", () => {
+test("#1208: turn_end counts completed turns; the floor needs CONTENT evidence, not just stream activity", () => {
   const st = createHeartbeatState();
   ok(parseHeartbeatLine("[task-heartbeat] ready nonce=nn", st, 1000), "ready parses");
   equal(childMessagesSent(st), 0, "a child that has only initialized has sent nothing");
@@ -8832,13 +8832,49 @@ test("#1208: turn_end counts completed turns; a streamed-but-unfinished turn flo
   ok(parseHeartbeatLine("[task-heartbeat] turn_start nonce=nn 2", st, 1003), "second turn starts");
   ok(parseHeartbeatLine("[task-heartbeat] turn_end nonce=nn 2", st, 1004), "second turn ends");
   equal(childMessagesSent(st), 2, "two completed turns → 2");
-  // The floor: a turn that streamed content but never reached turn_end.
+
+  // THE FLOOR, content-bearing basis (review round 4, P1). `progress=1` is the child's
+  // content/tool evidence for the interval; with it, a turn that streamed and died before
+  // its turn_end still floors at 1 — never a false "sent nothing".
   const streaming = createHeartbeatState();
   parseHeartbeatLine("[task-heartbeat] ready nonce=nn", streaming, 1000);
   parseHeartbeatLine("[task-heartbeat] turn_start nonce=nn 1", streaming, 1001);
-  parseHeartbeatLine("[task-heartbeat] tick nonce=nn tools=0 turn=1 stream_age_ms=0 tool_age_max_ms=0 saw_msg=1 saw_tool=0", streaming, 1002);
+  parseHeartbeatLine("[task-heartbeat] tick nonce=nn tools=0 turn=1 stream_age_ms=0 tool_age_max_ms=0 saw_msg=1 saw_tool=0 progress=1", streaming, 1002);
   equal(streaming.messagesSent, 0, "no turn_end yet — the raw count stays 0");
-  equal(childMessagesSent(streaming), 1, "but a message WAS observed, so the reported count floors at 1 — never a false 'sent nothing'");
+  equal(childMessagesSent(streaming), 1, "content evidence observed, so the count floors at 1 — never a false 'sent nothing'");
+
+  // ⛔ The OLD floor was content-blind: `everSawMsg` is latched by a bare assistant
+  // `message_start` and by ANY `message_update` delta (task-heartbeat.ts says so itself), so a
+  // whitespace/retry-chatter loop answered "1 message sent" and read as a quiet success — the
+  // exact false PASS #1208 exists to close. Stream activity with NO content and NO tool is not
+  // evidence of a message; once a tick has been observed, the honest answer is zero.
+  const chatter = createHeartbeatState();
+  parseHeartbeatLine("[task-heartbeat] ready nonce=nn", chatter, 1000);
+  parseHeartbeatLine("[task-heartbeat] turn_start nonce=nn 1", chatter, 1001);
+  parseHeartbeatLine("[task-heartbeat] tick nonce=nn tools=0 turn=1 stream_age_ms=0 tool_age_max_ms=0 saw_msg=1 saw_tool=0 progress=0", chatter, 1002);
+  equal(chatter.turnSawMessage, true, "the content-blind latch DID fire (this is the shape that used to pass)");
+  equal(
+    childMessagesSent(chatter),
+    null,
+    "…but stream chatter is not a message: mid-turn and content-unprovable answers UNKNOWN, never '1 message sent'",
+  );
+
+  // The E shape is PROVABLE zero: every turn completed, none carried content. Nothing is mid-flight,
+  // so the parent is not guessing.
+  const emptyLoop = createHeartbeatState();
+  parseHeartbeatLine("[task-heartbeat] ready nonce=nn", emptyLoop, 1000);
+  parseHeartbeatLine("[task-heartbeat] turn_start nonce=nn 1", emptyLoop, 1001);
+  parseHeartbeatLine("[task-heartbeat] tick nonce=nn tools=0 turn=1 stream_age_ms=0 tool_age_max_ms=0 saw_msg=1 saw_tool=0 progress=0", emptyLoop, 1002);
+  parseHeartbeatLine("[task-heartbeat] turn_end nonce=nn 1 content=0", emptyLoop, 1003);
+  equal(emptyLoop.turnsCompleted, 1, "one completed turn");
+  equal(childMessagesSent(emptyLoop), 0, "completed empty turns are PROOF of zero — the E-shape loop is the death class");
+
+  // And with no stream activity at all the child never spoke: `ready`-then-exit is the headline
+  // slow-start death, so the answer is 0, not unknown.
+  const noTick = createHeartbeatState();
+  parseHeartbeatLine("[task-heartbeat] ready nonce=nn", noTick, 1000);
+  parseHeartbeatLine("[task-heartbeat] turn_start nonce=nn 1", noTick, 1001);
+  equal(childMessagesSent(noTick), 0, "never streamed anything → it never spoke → the zero-message death");
 });
 
 section("#1208: classifyChildLiveness — the death-before-first-message state is reachable one way only");
@@ -8998,7 +9034,18 @@ test("#1208: a KILLED zero-output settle keeps its measurement (review round 2, 
   );
   equal(snap.childMessagesSent, 0, "and the zero-message evidence survives (ask 2)");
   equal(snap.childExited, false, "the kill was just signalled: the OS has not reported the child gone");
-  equal(exhaustionStatusFor(snap), "died-before-first-message", "the exhaustion result names what was measured");
+  // ⛔ A KILL IS NOT A STARTUP DEATH (review round 4, P2). Naming a parent-cut child
+  // `died-before-first-message` put two contradictory claims in one payload (`status` = "it died on
+  // its own, re-dispatch it" vs `childState` = "the parent cut it, raise the bound") and
+  // `classifyBackgroundOutcome` persists `reason: d.status`, so the durable record accused the wrong
+  // party. The kill stays `failed`; `childState` names the cause.
+  equal(exhaustionStatusFor(snap), "failed", "a WATCHDOG KILL is not an autonomous startup death");
+  // The status DOES name the death when the child died on its own with zero content-bearing turns.
+  equal(
+    exhaustionStatusFor({ ...snap, childState: "died-before-first-message" }),
+    "died-before-first-message",
+    "a non-killed zero-message death is still named as such",
+  );
   // `null` is not `0`: with no emitter, "no attempt produced a message" is unprovable.
   equal(exhaustionStatusFor({ ...snap, childMessagesSent: null }), "failed", "unknown stays failed — a false death claim is the worse error");
   equal(exhaustionStatusFor(null), "failed", "no measurement at all (a pre-spawn refusal) stays failed");
@@ -9080,6 +9127,9 @@ const FAKE_PI_EMPTY_TURN_SHIM = `#!/bin/sh
 NONCE="${'${TASK_HEARTBEAT_NONCE:-}'}"
 echo "[task-heartbeat] ready nonce=$NONCE" >&2
 echo "[task-heartbeat] turn_start nonce=$NONCE 1" >&2
+# The tick is what makes ZERO positive evidence: one interval was observed and it reported no
+# content and no tool. Without it the parent has observed nothing and must answer unknown.
+echo "[task-heartbeat] tick nonce=$NONCE tools=0 turn=1 stream_age_ms=0 tool_age_max_ms=0 saw_msg=1 saw_tool=0 progress=0" >&2
 echo "[task-heartbeat] turn_end nonce=$NONCE 1 content=0" >&2
 exit 0
 `;
@@ -9109,6 +9159,10 @@ testAsync("#1208 (E2E): an EMPTY-TURN LOOP child is the zero-message death, not 
     equal(ld.childState, "died-before-first-message", "so the empty-turn loop is the slow-start death class");
     equal((looped as any).isError, true, "…and it stops a parent's default handling instead of reading as a quiet finish");
     ok(!String((looped as any).content?.[0]?.text).includes("exited with code 0\n"), "the bare composer sentence is not the whole result");
+    ok(
+      String((looped as any).content?.[0]?.text).includes("no content-bearing turn"),
+      "the header states the MEASURED fact (no content-bearing turn), not a count the arm does not have",
+    );
   } finally {
     process.env.PATH = savedPath;
     process.argv[1] = savedArgv1;

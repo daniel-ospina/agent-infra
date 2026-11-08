@@ -2209,7 +2209,7 @@ export interface TaskChildLivenessSnapshot {
  * nothing" (review round 2, P3). */
 export function childLivenessFor(i: {
   details: Record<string, unknown>;
-  hbState: Pick<HeartbeatState, "messagesSent" | "everSawMsg" | "sawReady" | "markerCount">;
+  hbState: Pick<HeartbeatState, "messagesSent" | "everSawMsg" | "sawReady" | "markerCount" | "lastProgressAt" | "turnsCompleted" | "turnActive">;
   pid: number | undefined;
   stdout: string;
   exited: boolean;
@@ -2248,9 +2248,19 @@ export function childLivenessFor(i: {
  * when every attempt resolved `undefined`, which needs a real watchdog kill. `0` messages is the
  * slow-start death and is named as such; `null` keeps `failed`, because with no heartbeat evidence
  * "no attempt produced a message" is not provable and a false death claim is the worse error.
- * (Review round 2, P2 — the tool layer used to stamp `never-started` for a child that DID run.) */
+ * (Review round 2, P2 — the tool layer used to stamp `never-started` for a child that DID run.)
+ *
+ * ⛔ A KILL IS NEVER A STARTUP DEATH (review round 4, P2). This arm is reachable ONLY through the
+ * payload-less watchdog kills (hard cap / backstop / heartbeat bound), so the snapshot it reads
+ * carries `childState: "killed"`. Naming that `died-before-first-message` would put two
+ * contradictory claims in ONE payload — `status` says "it died on its own, re-dispatch it" while
+ * `childState` says "the parent cut it, raise the bound" — and `classifyBackgroundOutcome`
+ * persists `reason: d.status`, so a lane the watchdog killed three times would be durably recorded
+ * as having died of its own accord. The kill stays `failed` and `childState` names the cause. */
 export function exhaustionStatusFor(snap: TaskChildLivenessSnapshot | null): "failed" | "died-before-first-message" {
-  return snap !== null && snap.childMessagesSent === 0 ? "died-before-first-message" : "failed";
+  if (snap === null) return "failed";
+  if (snap.childState === "killed") return "failed";
+  return snap.childMessagesSent === 0 ? "died-before-first-message" : "failed";
 }
 
 /** #1208: how many messages the child is known to have sent, or `null` when the
@@ -2264,21 +2274,50 @@ export function exhaustionStatusFor(snap: TaskChildLivenessSnapshot | null): "fa
  * the fleet reads as "stop, do not continue".
  *
  * The count is COMPLETED, CONTENT-BEARING turns (`turn_end` with `content=1`,
- * monotonic), floored at 1 when the content latch `everSawMsg` fired: a child
- * that streamed its first message and died before finishing that turn has still
- * sent something, and the floor keeps the "zero messages" claim honest without
- * inventing a count.
+ * monotonic).
  *
  * ⛔ A `turn_end` is NOT by itself a message: the E-shape child cycles
  * `turn_start`/`turn_end` producing nothing (#5195). Only a `content=1` turn — or
  * a legacy marker carrying no flag at all, read as content-bearing so version
- * skew degrades to the pre-#1208 behaviour — counts. */
+ * skew degrades to the pre-#1208 behaviour — counts.
+ *
+ * ⛔ THE FLOOR IS CONTENT-BEARING TOO (review round 4, P1). The floor exists for
+ * the child that streamed and died mid-turn before a `turn_end`, but it must not
+ * be built on `everSawMsg`: that latch is set by a bare assistant `message_start`
+ * and by ANY `message_update` delta with no content inspection (task-heartbeat.ts
+ * says so itself), so a whitespace/retry-chatter loop — exactly the #5195 E shape —
+ * would answer "1 message sent" and be classified a quiet success. `lastProgressAt`
+ * advances only on a completed tool or a tick whose `progress=1`, both of which are
+ * content/tool evidence, so it is the floor's honest basis.
+ *
+ * Residual, stated rather than hidden: a child that begins streaming real content
+ * and dies inside the final interval, before any tick could report `progress=1`,
+ * answers `0` (the tick evidence below). That window is bounded by one heartbeat
+ * interval; the alternative — trusting the content-blind latch — is a systematic
+ * false PASS on the E shape, which is the worse error. */
 export function childMessagesSent(
-  state: Pick<HeartbeatState, "messagesSent" | "everSawMsg" | "sawReady" | "markerCount">,
+  state: Pick<
+    HeartbeatState,
+    "messagesSent" | "everSawMsg" | "sawReady" | "markerCount" | "lastProgressAt" | "turnsCompleted" | "turnActive"
+  >,
 ): number | null {
   if (!state.sawReady && state.markerCount === 0) return null;
   if (state.messagesSent > 0) return state.messagesSent;
-  return state.everSawMsg ? 1 : 0;
+  // A content-bearing unit of work was observed before any `turn_end` (a completed tool, or a
+  // content-bearing progress tick): the child demonstrably said something.
+  if (state.lastProgressAt > 0) return 1;
+  // No stream activity of any kind: the child never spoke. `ready`-then-exit is the headline
+  // slow-start death this field exists to name, so this must stay 0 — not `null`.
+  if (!state.everSawMsg) return 0;
+  // Stream activity, but no content evidence. We can still prove zero when the child COMPLETED
+  // turns and none of them carried content (the #5195 E shape): every turn ended, so nothing is
+  // mid-flight, and every completed turn was empty.
+  if (state.turnsCompleted > 0 && !state.turnActive) return 0;
+  // Otherwise the activity sits in an UNFINISHED turn and the parent cannot separate real content
+  // from a whitespace/retry-chatter delta (`everSawMsg` is content-blind by construction). UNKNOWN is
+  // the only truthful answer: `1` is the false liveness this field exists to stop, and `0` would be a
+  // false death claim about a working child. `null` → `exited-no-result`, never `isError`.
+  return null;
 }
 
 /** #1208: the ONE child-liveness classifier. Ordered so the strongest claim
@@ -2380,6 +2419,12 @@ export interface HeartbeatState {
    * own `content` flag decides. Read it through `childMessagesSent()`, never
    * directly. */
   messagesSent: number;
+  /** #1208 (review round 4, P1): how many `turn_end` markers were seen AT ALL, content-bearing or
+   * not. `messagesSent` counts only the content-bearing ones; this counts the completions, and the
+   * difference is what lets `childMessagesSent()` prove "every completed turn was empty" instead of
+   * having to answer `null` for it. A turn that is still open (`turnActive`) is the one case that
+   * cannot be judged by this pair, because its content may simply not have arrived yet. */
+  turnsCompleted: number;
   /** ts of the first everSawRealActivity source (0 = none) — the parent's
    * time-to-first-observable-activity, comparable to the child's own
    * time-to-first-activity measured from session logs (#282 sweep). */
@@ -2448,6 +2493,7 @@ export function createHeartbeatState(): HeartbeatState {
     everSawMsg: false,
     everSawTool: false,
     messagesSent: 0,
+    turnsCompleted: 0,
     firstActivityAt: 0,
     toolsMaxInFlight: 0,
     activityTrace: [],
@@ -2622,6 +2668,9 @@ export function parseHeartbeatLine(
       break;
     case "turn_end": {
       state.turnActive = false;
+      // #1208: every completion counts here; whether it carried CONTENT is the separate question
+      // the marker's own flag answers below. (`messagesSent` = content-bearing completions.)
+      state.turnsCompleted += 1;
       // #1208: one COMPLETED, CONTENT-BEARING model turn = one message the child
       // emitted. `turn_end` alone is NOT sufficient: the E-shape child cycles
       // turn_start/turn_end producing nothing (#5195), so a bare count reports
@@ -4462,10 +4511,10 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
           details.status = "died-before-first-message";
           details.isError = true;
           const header =
-            `\u26d4 Sub-agent died before its first message \u2014 it completed 0 turns and returned no result ` +
+            `\u26d4 Sub-agent died before its first message \u2014 it completed no content-bearing turn and returned no result ` +
             `(pid ${details.childPid ?? "unknown"}, exit ${details.exitCode ?? "not recorded"}).\n\n` +
-            `This is NOT an empty answer. Nothing the child was asked to do was performed: no message was ` +
-            `ever emitted, so there is no verdict, no report and no "nothing to say" to read here. ` +
+            `This is NOT an empty answer. Nothing the child was asked to do produced a message with content, ` +
+            `so there is no verdict, no report and no "nothing to say" to read here. ` +
             `Re-dispatch it, or investigate the child's transcript before assuming the work happened.`;
           value = {
             content: [
