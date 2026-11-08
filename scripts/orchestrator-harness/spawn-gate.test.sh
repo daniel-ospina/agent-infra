@@ -2386,8 +2386,17 @@ ck "the fork instrument is re-seeded HEALTHY after the fork-refusal rig (else th
 # arm below already does.
 # ALL THREE cost terms are pinned to 0 (the #2721 split of `DISK_LANE_SELF_MB` out of the tree term):
 # an explicit 0 is honoured, so the headroom predicate cannot refuse ahead of the LOAD gate here.
+# ⛔ `--key-gate-off` ON ALL THREE ARMS (measured 2026-11-08, #3786): without it these arms inherit the BOX's
+# credential, so the gate order decided the verdict instead of the code. On a developer box
+# `$DEEPSEEK_API_KEY` exists, the KEY gate answers `ok`, and the LOAD/DISK/MEMORY gate is reached — green.
+# On the CI runner no credential exists, the KEY gate refuses 82 FIRST, and all seven arms below went red
+# (`lane.sh on a refused load exits 75 … (rc=82)`, `bash-suites (6)` and main's own `script-validate (6)`).
+# This is the exact failure mode the escape was built for — `lane.sh`'s own note: "a fixture that inherited
+# the box's own key would be a false GREEN on one box and a false RED on another (#3331)" — and these arms
+# stub `pi` through `$RIG/bin`, so the credential is not what they measure. Re-measured with the key unset:
+# 7 red before, 0 after.
 ( cd "$RREPO/.worktrees/fix-7" && O="$RO" MAX_LOAD=0 DISK_MIN_FREE_MB=1 DISK_LANE_TREE_MB=0 DISK_LANE_SELF_MB=0 DISK_LANE_RESERVE_MB=0 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" \
-    bash "$HERE/lane.sh" 9999 work daniel-ospina/agent-infra ) >/dev/null 2>&1; lrc=$?
+    bash "$HERE/lane.sh" --key-gate-off 9999 work daniel-ospina/agent-infra ) >/dev/null 2>&1; lrc=$?
 { [ "$lrc" -eq 75 ] && [ ! -s "$PI_LOG" ] && [ -s "$RO/logs/prompt-9999.txt" ]; }; rc=$?
 ck "lane.sh on a refused load exits 75, writes the prompt, and NEVER spawns (rc=$lrc)" $rc
 grep -q 'load gate refused' "$RO/logs/lane-9999.log"; rc=$?
@@ -2398,7 +2407,7 @@ ck "lane.sh NAMES the load gate on a load refusal" $rc
 : > "$PI_LOG"; : > "$RO/logs/lane-9999.log"
 ( cd "$RREPO/.worktrees/fix-7" && O="$RO" MAX_LOAD=999999999 DISK_MIN_FREE_MB=9999999 DISK_GATE_PATH="$RREPO" \
     PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" \
-    bash "$HERE/lane.sh" 9999 work daniel-ospina/agent-infra ) >/dev/null 2>&1; lrc2=$?
+    bash "$HERE/lane.sh" --key-gate-off 9999 work daniel-ospina/agent-infra ) >/dev/null 2>&1; lrc2=$?
 [ "$lrc2" -eq 77 ]; rc=$?
 ck "lane.sh on a DISK refusal exits 77 (got $lrc2) — not reported as a load refusal" $rc
 grep -q 'DISK gate refused' "$RO/logs/lane-9999.log"; rc=$?
@@ -2414,7 +2423,7 @@ ck "lane.sh NAMES the disk gate on a disk refusal" $rc
 # arm asserted a gate it never reached). `$RREPO`'s HEAD is `main`; lane.sh is told `work`.
 ( cd "$RREPO/.worktrees/fix-7" && O="$RO" MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 MEM_MIN_AVAIL_MB=999999999 \
     PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" \
-    bash "$HERE/lane.sh" 9999 work daniel-ospina/agent-infra ) >/dev/null 2>&1; lrc3=$?
+    bash "$HERE/lane.sh" --key-gate-off 9999 work daniel-ospina/agent-infra ) >/dev/null 2>&1; lrc3=$?
 [ "$lrc3" -eq 81 ]; rc=$?
 ck "lane.sh on a MEMORY refusal exits 81 (got $lrc3) — not reported as a load or disk refusal" $rc
 grep -q 'MEMORY gate refused' "$RO/logs/lane-9999.log"; rc=$?
