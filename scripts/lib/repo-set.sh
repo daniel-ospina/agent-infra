@@ -181,8 +181,20 @@ _rs_nearest_existing_ancestor() {
   # that is what these two `case` arms reproduce; the `*) break` also makes termination STRUCTURAL — every
   # iteration either shortens `d` (it contains a slash) or leaves the loop.
   case "$d" in */*) d="${d%/*}" ;; *) d="." ;; esac
+  # ⛔ AN UNRESOLVABLE SYMLINK COMPONENT IS *EXISTING*, NOT ABSENT (round 46, P2 — measured). `[ -e ]`
+  # FOLLOWS the link, so a component that is a symlink whose target cannot be resolved here answers FALSE
+  # and the walk SKIPS it, returning a traversable grandparent above the link. The caller then reads a
+  # traversable ancestor as proof of absence and answers code 3 for a set that EXISTS — the same
+  # degrade-code failure this whole function was rewritten to remove, reached by a different route. The
+  # shape is reachable without any exotic setup: a set path that goes THROUGH a link into `~/Documents`
+  # on a Mac with no Full Disk Access (the `-L` arm documents those users), on a box whose interpreter
+  # resolves but cannot execute, so `_rs_stat_kind` answers `unknown` and no errno ever arrives to name the
+  # denial. `[ -L ]` is true for an existing link REGARDLESS of its target, so the link becomes the nearest
+  # existing component and the caller REFUSES it as a broken state (5) instead of proving absence through
+  # what it could not resolve. A link that DOES resolve is still found by `-e` first, so the ordinary walk
+  # is untouched.
   while [ -n "$d" ] && [ "$d" != "/" ] && [ "$d" != "." ]; do
-    if [ -e "$d" ]; then printf '%s' "$d"; return 0; fi
+    if [ -e "$d" ] || [ -L "$d" ]; then printf '%s' "$d"; return 0; fi
     case "$d" in */*) d="${d%/*}" ;; *) break ;; esac
   done
   [ -e / ] && { printf '/'; return 0; }
@@ -191,9 +203,11 @@ _rs_nearest_existing_ancestor() {
 
 # _rs_py_resolve — the interpreter, resolved the same way the wrapper resolves it (`command -v python3`,
 # then the two absolute paths launchd needs when it has no PATH of its own). ⛔ ONE HOME FOR THAT ORDER
-# IN THIS FILE — THREE callers, `_rs_doctor_available`, `_rs_stat_kind` and `_rs_with_doctor`; none
-# carries its own loop (round 15, P2: `_rs_with_doctor` did; round 16, P2: this line then named only two
-# and omitted `_rs_stat_kind`).
+# IN THIS FILE, and its callers are enumerated by `grep -n '_rs_py_resolve' <this file>` — NOT by a count
+# in this sentence (round 15, P2: `_rs_with_doctor` carried its own loop; round 16, P2: this line then
+# named two and omitted `_rs_stat_kind`; round 46, P2: it said "THREE callers" and `_rs_origin_slug` made
+# it four). A list of the file's own call sites is exactly the thing that goes stale — same lesson as the
+# `_rs_bound` header.
 # ⛔ THE WRAPPER CARRIES THE SAME ORDER IN ITS OWN LINES, AND THAT IS AN ORDERING FACT, NOT A SECOND
 # AUTHORITY. `scripts/pr-doctor-machine.sh` resolves `$PY` BEFORE it sources this file — it has to,
 # because it refuses with its own message when no interpreter resolves, and it must do that before
@@ -201,7 +215,10 @@ _rs_nearest_existing_ancestor() {
 # the same three candidates in the same order in its own loop. After the source it never needs to: every
 # interpreter it wants is resolved by this one function, through `_rs_doctor_available`,
 # `_rs_with_doctor` or `_rs_stat_kind` (round 19, P2: this line named only the first two and so
-# contradicted the "THREE callers" list nine lines above).
+# contradicted the count the header used to carry; round 46, P2: that count said "THREE", the header is a
+# grep recipe now, and these are the three the AUTHORITY claim rests on — `_rs_origin_slug` is the fourth
+# caller and is NOT part of it, because it does not resolve the interpreter FOR anything: it renders the
+# residue that says the proof returned nothing).
 # ⛔ NO LINE NUMBERS IN THIS PARAGRAPH, DELIBERATELY (round 19, P2). It used to say "the loop is at
 # `:95-103`, the source is `:119`" — and those numbers were wrong twice in two rounds, once because the
 # wrapper moved and once because THIS PR added comment lines above them. A citation that goes stale
@@ -239,8 +256,16 @@ _rs_doctor_available() {
 # _rs_stat_kind <path> — `present` | `absent` | `denied` | `notdir` | `other` | `unknown`.
 # ⛔ `notdir` IS ITS OWN ANSWER AND THE ENUMERATION ABOVE IS THE CONTRACT (review round 44, P2): it was
 # added for `ENOTDIR` (a path component is a FILE) and left out of this line, which is the drift this file
-# keeps recording. `unknown` means the stat call itself was unavailable (no interpreter), NOT "some other
-# errno" — the walk below is what answers then.
+# keeps recording. `unknown` means the stat call produced NO USABLE ANSWER — no interpreter, an
+# interpreter that cannot execute, a NON-ZERO STATUS (whatever it printed), or a payload outside the six
+# values below. The last was reachable: a `python3` that runs and prints junk exited 0 and this function
+# answered the junk (round 46, P3 — measured with a shim printing `warning: shim deprecated`, which came
+# back as the "kind"). So the answer is VALIDATED against the enumeration rather than assumed: the enum
+# above is the contract, and a contract nothing checks is a comment.
+# ⛔ AN EMPTY ANSWER WAS THE SAME CLASS AND IS NORMALISED TOO (round 46, P3 — measured): a `python3` that
+# EXECUTES and prints nothing with status 0 answered the EMPTY STRING. No verdict changed — every caller
+# treats `unknown` as "no kind" and an empty answer fell through identically — which is why nothing
+# reddened; `j16o` and `j16p` are the arms that check the contract now.
 #
 # ⛔ `[ ! -e ]` DOES NOT MEAN "ABSENT", AND THE ANCESTOR WALK ALONE CANNOT TELL (review round 11, P2).
 # `-e` is false for EVERY stat failure, and absence (ENOENT) is only one of them — so what follows is
@@ -251,19 +276,14 @@ _rs_doctor_available() {
 # DEGRADES on a set that exists and is told to create it — the round-9 P2 this arm keeps trying to close,
 # surviving one errno over.
 # Bash cannot see the errno; python can, and the same interpreter is already resolved for the doctor.
-_rs_stat_kind() {
-  local p="${1:-}" py
-  py="$(_rs_py_resolve)"
-  [ -n "$py" ] || { printf 'unknown'; return 0; }
-  # ⛔ UTF-8 MODE HERE IS SYMMETRY, NOT A MEASURED FIX — said plainly because the first version of this
-  # comment claimed one and was FALSIFIED (round 41). It said a non-ASCII path "decodes to surrogate
-  # escapes that `os.stat` cannot open at all". Measured on this very heredoc: it opens fine. CPython's
-  # `fsencode` re-encodes surrogate escapes back to the original bytes, so `os.stat` round-trips and only
-  # STRING-SEMANTIC operations break — which is why the proof runner next door genuinely needed the
-  # prefix (`str.strip`/`re.split` see an NBSP as a non-space and the guards become no-ops) and this one
-  # does not. The prefix stays because the heredoc below is where a path comparison would one day be
-  # added, and a locale-dependent STRING compare here would fail silently as `unknown`.
-  PYTHONUTF8=1 "$py" - "$p" <<'PY_STAT' 2>/dev/null || printf 'unknown'
+#
+# ⛔ THE STAT PAYLOAD'S HEREDOC LIVES IN A FUNCTION BODY, NOT INSIDE `$( )` — BASH 3.2 CANNOT PARSE THE
+# OTHER SHAPE (measured, and the same defect this file's proof child was fixed for). macOS ships bash 3.2 as
+# /bin/bash, and that is what the launchd unit runs; `bash32-parse` parses every tracked `*.sh` with it. This
+# body happens to carry balanced quotes today, which is precisely why it would have been left alone until
+# someone edited one line of Python — so the capture below is a plain call, and the body can never be
+# reached by a substitution's quote scanner.
+_rs_stat_kind_child() { PYTHONUTF8=1 "$1" - "$2" <<'PY_STAT' 2>/dev/null
 import os, sys
 try:
     os.stat(sys.argv[1])
@@ -278,6 +298,28 @@ except OSError:
 else:
     print("present")
 PY_STAT
+}
+_rs_stat_kind() {
+  local p="${1:-}" py k
+  py="$(_rs_py_resolve)"
+  [ -n "$py" ] || { printf 'unknown'; return 0; }
+  # ⛔ UTF-8 MODE HERE IS SYMMETRY, NOT A MEASURED FIX — said plainly because the first version of this
+  # comment claimed one and was FALSIFIED (round 41). It said a non-ASCII path "decodes to surrogate
+  # escapes that `os.stat` cannot open at all". Measured on this very heredoc: it opens fine. CPython's
+  # `fsencode` re-encodes surrogate escapes back to the original bytes, so `os.stat` round-trips and only
+  # STRING-SEMANTIC operations break — which is why the proof runner next door genuinely needed the
+  # prefix (`str.strip`/`re.split` see an NBSP as a non-space and the guards become no-ops) and this one
+  # does not. The prefix stays because the heredoc is where a path comparison would one day be added, and
+  # a locale-dependent STRING compare there would fail silently as `unknown`.
+  k="$(_rs_stat_kind_child "$py" "$p")" || k=unknown
+  # ⛔ THE CONTRACT IS ENFORCED HERE, NOT MERELY DOCUMENTED (round 46, P3 — measured): an empty answer and a
+  # non-empty answer outside the six are the same defect — a `python3` that runs and prints junk exits 0 and
+  # would otherwise be returned as the kind, and no arm asserting the six values exists to catch it.
+  case "$k" in
+    present|absent|denied|notdir|other|unknown) ;;
+    *) k=unknown ;;
+  esac
+  printf '%s' "$k"
 }
 
 # _rs_norm_path <path> — the canonical SPELLING of a path, without touching the filesystem:
@@ -511,18 +553,9 @@ repo_set_parse() {
     # and absence is only one of them — EXAMPLES, not an enumeration, so the list cannot go stale the way
     # the kind list beside it did: ENOENT, EACCES/EPERM (a TCC denial under a MODE-traversable ancestor),
     # ENOTDIR (a component is a FILE — the `notdir` arm below), ENAMETOOLONG, EIO. Only ENOENT is absence.
-    # When no interpreter resolves, `unknown` falls back to the ancestor walk below and the narrower
-    # claim in its message ("we cannot see it") is the honest one.
+    # When `unknown` comes back, the ancestor walk below decides and the narrower claim in its message
+    # ("we cannot see it") is the honest one.
     case "$kind" in
-      # ⛔ `ENOTDIR` HAS NO ARM HERE, AND THAT IS THE FIX (round 45, P2 — measured). Round 44 gave it its own
-      # arm here; deleting that arm left the suite GREEN, because `notdir` then falls through to the walk
-      # below — which measures the SAME fact, in bash, with or without an interpreter — and prints the same
-      # refusal at the same code. Two code paths for one cause, the redundant one with no sensor behind it,
-      # and the comments beside them claiming the two matched "in the same words" when their tails did not
-      # (the arm said "fix the path above" while the fallback offered the launchd/TCC candidate the walk had
-      # just DISPROVED for that path). So the walk is the ONE authority: `j16k` (interpreter resolves) and
-      # `j16k2` (none) both pin `must be a DIRECTORY`, and a removal of that guidance reds either way.
-      # Same right-code/wrong-cause class as the FIFO parenthetical `j4b` fixes.
       denied|other)
         _rs_say 2 "repo-set: INVALID — $f cannot be STAT'd, and the failure is NOT "no such file""
         _rs_say 2 "repo-set:   (errno reported: $kind). That is the BROKEN state, not the absent one: this"
@@ -550,12 +583,29 @@ repo_set_parse() {
       _rs_say 2 "repo-set:     slug=OWNER/NAME checkout=/abs/checkout [state=/abs/state-dir]"
       return 3
     fi
+    # ⛔ THE WALK IS THE ONE AUTHORITY FOR THESE CAUSES (round 45, P2 — measured): with an interpreter the
+    # `ENOTDIR` shape answers `notdir` and falls through to here (no `case` arm claims it), and with none it
+    # answers `unknown` and lands here the same way. One path, one cause, one sensor behind it.
+    # ⛔ AND SEVERAL SHAPES REACH THIS POINT, SO ONE SENTENCE CANNOT DESCRIBE THEM ALL (round 46, P2 —
+    # measured: the untraversable-directory shape printed "neither is any directory above it" one line above
+    # `(nearest existing: /tmp/f1/den)`, which refutes it, in `j16f`'s OWN fixture). The walk's answer is one of:
+    #   * a SYMLINK that cannot be resolved here (`-L` true, `-e` false). It is returned as the nearest
+    #     existing component (round 46: `[ -e ]` used to SKIP it and hand back a traversable grandparent, so
+    #     absence was "proven" through the link — the degrade code for a set that exists). Nothing below an
+    #     unresolvable link can be shown to exist OR to be absent, so it is broken (5), never absent (3).
+    #   * a nearest existing component that is not a DIRECTORY — a file, a FIFO, or a link resolving to one.
+    #   * a nearest existing DIRECTORY that is not traversable (mode 000, the TCC shape). It IS a directory,
+    #     so the not-a-directory causes are false about it and it needs its own sentence.
+    #   * nothing examinable at all (empty `anc`) — declared below, with no arm.
+    if [ -n "$anc" ] && [ -L "$anc" ] && [ ! -e "$anc" ]; then
+      _rs_say 2 "repo-set: INVALID — $f is not visible from here, because its nearest existing component is a symbolic link that cannot be resolved from here"
+      _rs_say 2 "repo-set:   (nearest existing: $anc). That is the BROKEN state, not the absent one:"
+      _rs_say 2 "repo-set:   nothing below an unresolvable link can be shown to exist OR to be absent."
+      _rs_say 2 "repo-set:   Do not create the file; check what that link points at, and whether this"
+      _rs_say 2 "repo-set:   process is allowed to follow it."
+      return 5
+    fi
     if [ -n "$anc" ] && [ ! -d "$anc" ]; then
-      # ⛔ THE WALK IS THE ONE AUTHORITY FOR THIS CAUSE, AND THIS IS THE ONLY PLACE THAT SAYS SO (round 45,
-      # P2 — measured). It serves BOTH runs: with an interpreter `_rs_stat_kind` answers `notdir` and falls
-      # through to here (no `case` arm claims it above), and with none it answers `unknown` and lands here
-      # the same way. A set under a directory that exists but cannot be entered is the `else` below — a
-      # different case, and a different candidate.
       # ⛔ AND THE GUIDANCE IS THE MEASURED ONE, NOT A LIST OF CANDIDATES: the walk has just established
       # that the nearest existing component is a FILE, so offering "launchd has no Full Disk Access" or
       # "check the location and mode" would send the operator to a cause this code just DISPROVED. Every
@@ -566,8 +616,18 @@ repo_set_parse() {
       _rs_say 2 "repo-set:   Do not create the file; fix the path above."
       return 5
     fi
-    _rs_say 2 "repo-set: INVALID — $f is not visible from here, and neither is any directory above it"
-    _rs_say 2 "repo-set:   (nearest existing: ${anc:-none}). That is the BROKEN state, not the absent one:"
+    if [ -n "$anc" ]; then
+      _rs_say 2 "repo-set: INVALID — $f is not visible from here, because the nearest existing directory above it is not traversable from here"
+      _rs_say 2 "repo-set:   (nearest existing: $anc). That is the BROKEN state, not the absent one:"
+    else
+      # ⛔ THIS ARM HAS NO SENSOR AND IS NOT CLAIMED TO HAVE ONE (round 46). It runs only when `anc` is EMPTY,
+      # and the walk answers / whenever `[ -e / ]` — so no environment on any host this runs on reaches it,
+      # and a mutant that deletes it stays green. It is kept because the alternative is a fallthrough that
+      # prints the NOT-A-DIRECTORY cause for a shape nobody examined, and it is DECLARED rather than
+      # silently uncovered: the only way in is a box where even `/` cannot be tested.
+      _rs_say 2 "repo-set: INVALID — $f is not visible from here, and NO component above it could be examined"
+      _rs_say 2 "repo-set:   (nearest existing: none). That is the BROKEN state, not the absent one:"
+    fi
     _rs_say 2 "repo-set:   this box may well have named its repos and this process cannot see them (launchd"
     _rs_say 2 "repo-set:   has no Full Disk Access under ~/Documents). Do not create the file; check the"
     _rs_say 2 "repo-set:   location and mode of the path above."

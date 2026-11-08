@@ -1355,22 +1355,18 @@ ck "j-emptyrender an EMPTY render with a NON-EMPTY parse is INCOMPLETE (WARN), n
 # When it used `dirname`, the walk never ran, answered `/`, and a set that EXISTS behind a `chmod 000`
 # ancestor was reported `NO-REPO-SET … does not exist` at code **3** — the code the wrapper DEGRADES on, so
 # the box grades one repo instead of refusing. Guarded against root for the reason f48 gives.
-if [ "$(id -u)" = 0 ]; then
-  printf 'skip j16f/j16f2 (running as root: mode 000 does not deny)\n'
-else
-  ND="$T/no-dirname"; mkdir -p "$ND"
-  for b in sed awk tr grep printf id cat cut wc head mv rm mkdir ln chmod git date env basename uname; do
-    _p4="$(command -v "$b" 2>/dev/null)" && ln -sf "$_p4" "$ND/$b" 2>/dev/null
-  done
-  NI="$T/nointerp-dirname"; mkdir -p "$NI/lib"
-  # ⛔ THE `lib/` LAYOUT HERE IS NOT WHAT MAKES THIS ARM WORK, AND SAYING IT WAS WOULD BE A FALSE "MEASURED"
-  # (review round 44, P2 — the reviewer re-ran the arm with the reader at `$NI/repo-set.sh` and got the
-  # SAME rc 5: the absence arm returns during parse, before any delegated proof, so `_rs_doctor_py` is
-  # never consulted). The layout is used because it is the real one, and because the arms NEXT DOOR do
-  # need it: `j-emptyrender` passes VACUOUSLY without it (its guard only runs once a render happens) and
-  # `m46` REDS without it (it reads the "not found beside this reader" branch instead of its subject).
-  cp "$READER" "$NI/lib/repo-set.sh"; cp "$REPO_ROOT/scripts/pr-doctor.py" "$NI/pr-doctor.py"
-  python3 - "$NI/lib/repo-set.sh" <<'PYNID'
+# ⛔ THE NO-INTERPRETER READER IS BUILT OUTSIDE THE ROOT GUARD (round 46): the arms that need it for the
+# WALK's `unknown` path (`j16l`, `j16n`) depend on no mode bits at all, so tying their fixture to the
+# `chmod 000` guard would skip them on a root box for a reason that does not apply to them.
+NI="$T/nointerp-dirname"; mkdir -p "$NI/lib"
+# ⛔ THE `lib/` LAYOUT HERE IS NOT WHAT MAKES THE `j16f` ARMS WORK, AND SAYING IT WAS WOULD BE A FALSE "MEASURED"
+# (review round 44, P2 — the reviewer re-ran the arm with the reader at `$NI/repo-set.sh` and got the
+# SAME rc 5: the absence arm returns during parse, before any delegated proof, so `_rs_doctor_py` is
+# never consulted). The layout is used because it is the real one, and because the arms NEXT DOOR do
+# need it: `j-emptyrender` passes VACUOUSLY without it (its guard only runs once a render happens) and
+# `m46` REDS without it (it reads the "not found beside this reader" branch instead of its subject).
+cp "$READER" "$NI/lib/repo-set.sh"; cp "$REPO_ROOT/scripts/pr-doctor.py" "$NI/pr-doctor.py"
+python3 - "$NI/lib/repo-set.sh" <<'PYNID'
 import sys
 p = sys.argv[1]
 s = open(p, encoding='utf-8').read()
@@ -1378,6 +1374,13 @@ old = "for c in python3 /usr/bin/python3 /usr/local/bin/python3; do"
 assert s.count(old) == 1, s.count(old)
 open(p, "w", encoding='utf-8').write(s.replace(old, "for c in no-such-interp-xyz /no/such/python3; do", 1))
 PYNID
+if [ "$(id -u)" = 0 ]; then
+  printf 'skip j16f/j16f2 (running as root: mode 000 does not deny)\n'
+else
+  ND="$T/no-dirname"; mkdir -p "$ND"
+  for b in sed awk tr grep printf id cat cut wc head mv rm mkdir ln chmod git date env basename uname; do
+    _p4="$(command -v "$b" 2>/dev/null)" && ln -sf "$_p4" "$ND/$b" 2>/dev/null
+  done
   mkdir -p "$T/den2/den"
   printf 'slug=o/n checkout=%s state=%s/st\n' "$T/tortoise" "$T" > "$T/den2/den/repos.conf"
   chmod 000 "$T/den2/den"
@@ -1416,6 +1419,19 @@ PYNID
   _o_na2="$(_rs_bound 30 env REPO_SET_FILE="$T/notadir-anc2.conf/inside/repos.conf" /bin/bash "$NI/lib/repo-set.sh" check 2>&1)"; _rc_na2=$?
   ck "j16k2 …and with NO interpreter the walk's fallback names the FILE too (rc 5, not 'neither is any directory above it')" \
      '[ "$_rc_na2" = 5 ] && grep -q "is not a directory" <<<"$_o_na2" && grep -q "must be a DIRECTORY" <<<"$_o_na2" && grep -q "fix the path above" <<<"$_o_na2" && ! grep -q "neither is any directory above it" <<<"$_o_na2" && ! grep -q "check the" <<<"$_o_na2"'
+  # ⛔ THE UNTRAVERSABLE-DIRECTORY SHAPE HAD NO SENSOR, AND ITS MESSAGE REFUTED ITSELF (round 46, P2 —
+  # measured). Before this round ONE `else` served both "the ancestor is not a directory" and "the ancestor
+  # IS a directory that cannot be traversed", and printed "neither is any directory above it" followed one
+  # line later by `(nearest existing: <that directory>)` — in `j16f`'s own fixture, which asserts the rc and
+  # the `is not visible from here` prefix, so nothing reddened. With no interpreter `_rs_stat_kind` answers
+  # `unknown`, `-x` is false on a mode-000 ancestor, and the walk decides: this arm is that path.
+  mkdir -p "$T/den3/den/inner"
+  printf 'slug=o/n checkout=%s state=%s/st\n' "$T/tortoise" "$T" > "$T/den3/den/inner/repos.conf"
+  chmod 000 "$T/den3/den"
+  _o_tr="$(_rs_bound 30 env REPO_SET_FILE="$T/den3/den/inner/repos.conf" /bin/bash "$NI/lib/repo-set.sh" check 2>&1)"; _rc_tr=$?
+  chmod 755 "$T/den3/den"
+  ck "j16m a NON-TRAVERSABLE ancestor is named as such — never 'neither is any directory above it', which its own next line refutes" \
+     '[ "$_rc_tr" = 5 ] && grep -q "nearest existing directory above it is not traversable" <<<"$_o_tr" && ! grep -q "neither is any directory above it" <<<"$_o_tr" && ! grep -q "does not exist" <<<"$_o_tr"'
 fi
 # ⛔ THE REFUSAL NAMED A CAUSE THAT IS FALSE WHEN THE NEAREST EXISTING COMPONENT IS A FILE (round 44,
 # P2 — measured). `/etc/passwd/foo/repos.conf` was refused with "a permission denial on an ancestor … a path
@@ -1430,6 +1446,37 @@ printf 'slug=o/n checkout=%s state=%s/st\n' "$T/tortoise" "$T" > "$T/notadir-anc
 _o_na="$(_rs_bound 30 env REPO_SET_FILE="$T/notadir-anc.conf/inside/repos.conf" /bin/bash "$READER" check 2>&1)"; _rc_na=$?
 ck "j16k a FILE as the nearest existing ancestor names THAT — not 'neither is any directory above it'" \
    '[ "$_rc_na" = 5 ] && grep -q "is not a directory" <<<"$_o_na" && grep -q "must be a DIRECTORY" <<<"$_o_na" && grep -q "fix the path above" <<<"$_o_na" && ! grep -q "neither is any directory above it" <<<"$_o_na" && ! grep -q "check the" <<<"$_o_na"'
+# ⛔ AN UNRESOLVABLE SYMLINK COMPONENT USED TO PROVE ABSENCE (round 46, P2 — measured). The walk's only test
+# was `[ -e ]`, which FOLLOWS the link; a component whose target cannot be resolved answers FALSE, so the
+# walk SKIPPED it and returned a traversable grandparent ABOVE the link. The caller reads a traversable
+# ancestor as proof of absence and answers code 3 — the one code the wrapper DEGRADES on — for a set that
+# exists. No privileges needed: a symlink LOOP reproduces it on any host, which is why this arm is not tied
+# to the `chmod 000` guard. Measured before the fix: rc 3 with `does not exist`.
+ln -s "$T/linkloop2" "$T/linkloop"; ln -s "$T/linkloop" "$T/linkloop2"
+_o_ll="$(_rs_bound 30 env REPO_SET_FILE="$T/linkloop/inside.conf" /bin/bash "$NI/lib/repo-set.sh" check 2>&1)"; _rc_ll=$?
+ck "j16l a SYMLINK component that cannot be resolved is BROKEN (5) — never a proof of absence (3)" \
+   '[ "$_rc_ll" = 5 ] && grep -q "symbolic link that cannot be resolved" <<<"$_o_ll" && ! grep -q "does not exist" <<<"$_o_ll"'
+# ⛔ AND THE LINK ARM MUST NOT SWALLOW A LINK THAT DOES RESOLVE, TO A NON-DIRECTORY (measured, same round):
+# `-L` is true for that shape too, so an arm testing `-L` alone would replace the correct not-a-directory
+# cause with "cannot be resolved", which is false about a link whose target is right there.
+printf 'not a dir\n' > "$T/plainfile"; ln -s "$T/plainfile" "$T/filelink"
+_o_lf="$(_rs_bound 30 env REPO_SET_FILE="$T/filelink/inside.conf" /bin/bash "$NI/lib/repo-set.sh" check 2>&1)"; _rc_lf=$?
+ck "j16n …while a link that RESOLVES to a FILE keeps the not-a-directory cause (the link arm must not swallow it)" \
+   '[ "$_rc_lf" = 5 ] && grep -q "is not a directory" <<<"$_o_lf" && ! grep -q "cannot be resolved" <<<"$_o_lf"'
+# ⛔ AN ANSWER OUTSIDE THE SIX-VALUE CONTRACT (round 46, P3 — measured). `_rs_stat_kind`'s header calls its
+# six values THE CONTRACT, and nothing enforced it: a `python3` that EXECUTES and prints nothing with
+# status 0 answered the EMPTY STRING (the `||` only fires on a non-zero exit), and one that prints junk and
+# exits 0 answered the JUNK. No verdict changed — every caller treats `unknown` as "no kind" and those
+# values fell through the same branch — which is exactly why no arm reddened: a contract is only kept if
+# something checks it. Two arms, because they redden INDEPENDENTLY: special-casing the empty answer
+# (`${k:-unknown}`) leaves `j16p` red, and only a guard over the whole set greens both.
+MQ="$T/silent-py"; mkdir -p "$MQ/bin"
+printf '#!/bin/sh\nexit 0\n' > "$MQ/bin/python3"; chmod +x "$MQ/bin/python3"
+ck "j16o a \`python3\` that runs and returns NOTHING yields \`unknown\` — never an empty answer" \
+   '[ "$(PATH="$MQ/bin:$PATH" rs_call _rs_stat_kind /etc/passwd)" = unknown ]'
+printf '#!/bin/sh\necho "warning: shim deprecated"\nexit 0\n' > "$MQ/bin/python3"; chmod +x "$MQ/bin/python3"
+ck "j16p …and one that returns JUNK with status 0 yields \`unknown\` too — the six values are a contract, not a habit" \
+   '[ "$(PATH="$MQ/bin:$PATH" rs_call _rs_stat_kind /etc/passwd)" = unknown ]'
 # ⛔ A RELATIVE `REPO_SET_FILE` USED TO HANG THIS READER, AND NO ARM USED ONE (review-instrumented round 44).
 # Removing `dirname` from the ancestor walk left `${d%/*}`, which returns a SLASH-LESS name UNCHANGED — so
 # the walk re-tested the same string forever: `REPO_SET_FILE=repo.conf` gave rc 124 and no output, where the
