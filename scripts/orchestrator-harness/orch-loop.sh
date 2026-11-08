@@ -2125,8 +2125,129 @@ is_limit "${STALE_MIN:-}" || STALE_MIN=40
 # NOTHING and every hung worker held its slot until a human noticed. The census and wt_close() are the
 # same module the spawner uses, so "what the controller counts", "what it reaps" and "what it starts"
 # cannot disagree. The tmux sessions it used to kill are still covered: they are in the same census.
+#
+# ⛔ A WORKER IS NOT "SILENT" BECAUSE ONE HARNESS-WRITTEN LOG FILE STOPPED GROWING (agent-infra#2104).
+# The agent's own work — a 90-minute suite, a build, a long review, a read-only investigation — writes
+# NOTHING to that file, so `age > STALE_MIN*60` on it is not evidence of a hang: it is evidence that
+# nobody printed. MEASURED 2026-10-19 on the `cell-ai` box: this function closed a worker logged as
+# "silent 8287s" (2.3 h) while its agent had been running `bash`/`edit` calls for hours and held ~200
+# lines of uncommitted work — and the same sweep closed 7 other sessions in the same second, so this
+# was the detector's normal behaviour on a loaded box, not a one-off. The instrument could not answer
+# its own question: `pane_pid` was printed in the very line that killed it, and an ALIVE pane running
+# a working agent is exactly what "stale" is supposed to exclude.
+#
+# So a reap now requires TWO INDEPENDENT SIGNALS to be quiet at once — the log mtime **and** the
+# worker's own process tree — which is the conjunction the fleet's lane bound already declares
+# (`lane-bound.sh`: "NO OUTPUT GROWTH **and** NO CPU DELTA for the idle window"; either signal advancing
+# keeps a lane alive however long it runs). Three verdicts, and the polarity is the whole fix:
+#   ACTIVE  the worker's process subtree burned CPU inside the sample window  -> SPARE it, say so.
+#   IDLE    the tree is gone, or burned nothing                            -> reap (the slot is freeable).
+#   UNKNOWN the process table could not be read                            -> SPARE it. Assume active
+#           until proven idle: sparing a hung worker costs one slot until the next cycle, while killing
+#           a live one destroys work nothing records.
+# The CPU reading is the SHIPPED portable one, not a second implementation of it: `ps -o time=`
+# converted to centiseconds by the same awk shape `lane-bound.sh` uses, and summed over the worker's
+# whole SUBTREE with the same walk — because a lane's work happens in its children (a `pytest`, a
+# `uv sync`, a `find`), and the `pi` parent is flat while those burn the box.
+_WREAP_TOL_CS="${LANE_BOUND_CPU_TOL_CS:-10}"
+is_num "${_WREAP_TOL_CS:-}" || _WREAP_TOL_CS=10
+# The sample window. Deliberately short: it is a liveness probe under a bound that has ALREADY waited
+# STALE_MIN (40) minutes, so it only has to be longer than one scheduling quantum; a long window would
+# stall the whole controller cycle on a box whose load IS the fleet.
+_WREAP_WINDOW="${WREAP_WINDOW_S:-2}"
+is_num "${_WREAP_WINDOW:-}" || _WREAP_WINDOW=2
+# _wreap_ps — one process-table snapshot: pid, ppid, cpu time, and the command line (which is how a
+# worker is identified — see `_wreap_cpu`). Nothing here parses an mtime or a state file.
+_wreap_ps() { ps -Ao pid=,ppid=,time=,command= 2>/dev/null; }
+# _wreap_cpu <table> <name> <idpatterns> -> "<matched> <cpu_cs>", or NOTHING when the snapshot is
+# unreadable (the caller reads that as UNKNOWN, never as idle).
+#
+# A worker is identified by POSITIVE evidence in its own command line, one of: the log path its
+# launcher redirects into (`… >> $O/logs/<w>.log`, spawn-gate's `run_agent`), the run script the
+# launcher executes (`/bin/bash $O/state/run-<w>.sh`, worker-terminal's cmux arm), or its cmux
+# workspace name (`wt-<w>`). Any of the three names the worker and nothing else, and the caller passes
+# all three `<TAB>`-separated. ⛔ A NAME ALONE WOULD BE AMBIGUOUS (`fix-19` is a prefix of `fix-1949`),
+# which is why the patterns are whole paths/names and not the bare worker name.
+# ⛔ OUR OWN CHAIN IS EXCLUDED: a `$( )` / forked subshell inherits argv, so the probe's own ancestors
+# can carry a matched string and would then look like the worker it is measuring (the same self-count
+# that made `wt_live_holders` refuse every reap — wt-lifecycle.sh).
+_wreap_cpu() { # <table|-> <idpatterns>
+  awk -v pats="$2" -v self="$$" '
+    function csec(t,   d, a, n, s) {
+      d = 0
+      if (match(t, /^[0-9]+-/)) { d = substr(t, 1, RLENGTH - 1) + 0; t = substr(t, RLENGTH + 1) }
+      n = split(t, a, ":")
+      if (n >= 3)      s = a[n-2] * 3600 + a[n-1] * 60 + a[n]
+      else if (n == 2) s = a[n-1] * 60 + a[n]
+      else             s = a[n] + 0
+      return int(d * 8640000 + s * 100 + 0.5)
+    }
+    { pid[NR] = $1 + 0; par[NR] = $2 + 0; cs[NR] = csec($3)
+      cmd = $0
+      sub(/^[ \t]*[0-9]+[ \t]+[0-9]+[ \t]+[^ \t]+[ \t]+/, "", cmd)
+      c[NR] = cmd; n = NR }
+    END {
+      if (n == 0) exit 3                 # an empty table is UNREADABLE, never "nothing is running"
+      np = split(pats, P, "\t")
+      # our own ancestry, nearest-first: a forked child inherits the parent argv verbatim
+      own[self + 0] = 1
+      changed = 1
+      while (changed) {
+        changed = 0
+        for (i = 1; i <= n; i++) if (!(pid[i] in own) && (par[i] in own)) { own[pid[i]] = 1; changed = 1 }
+      }
+      matched = 0
+      for (i = 1; i <= n; i++) {
+        if (pid[i] in own) continue
+        for (k = 1; k <= np; k++) {
+          if (P[k] != "" && index(c[i], P[k]) > 0) { hit[i] = 1; matched++; break }
+        }
+      }
+      # the subtree: the children of a matched launcher ARE the work, so take every descendant
+      for (i = 1; i <= n; i++) if (hit[i]) inc[pid[i]] = 1
+      changed = 1
+      while (changed) {
+        changed = 0
+        for (i = 1; i <= n; i++) if (!(pid[i] in inc) && (par[i] in inc)) { inc[pid[i]] = 1; changed = 1 }
+      }
+      total = 0
+      for (i = 1; i <= n; i++) if (pid[i] in inc) total += cs[i]
+      printf "%d %d\n", matched, total + 0
+    }' "${1:-/dev/null}"
+}
+# _wreap_patterns <name> <logpath> -> the `<TAB>`-separated identity set for one worker.
+# Derived from the NAME and the LOG PATH alone, so the probe never depends on a record field that an
+# older harness may not have written: `fix-1949` -> `/…/logs/fix-1949.log`, `wt-fix-1949`,
+# `run-fix-1949.sh`. Every one of them is anchored (`/logs/`, `wt-`, `run-`…`.sh`) so a name that is a
+# PREFIX of another (`fix-19` / `fix-1949`) cannot match the wrong worker.
+_wreap_patterns() { printf '%s\t%s\t%s' "${2:-}" "wt-${1:-}" "run-${1:-}.sh"; }
+# _wreap_verdict <cpu_before> <cpu_after> <matched_before> <matched_after>
+#   0 REAP IT · 1 ACTIVE (spare) · 2 UNKNOWN (spare)
+_wreap_verdict() {
+  local b="${1:-}" a="${2:-}" mb="${3:-}" ma="${4:-}"
+  is_num "${b:-}" && is_num "${a:-}" && is_num "${mb:-}" && is_num "${ma:-}" || return 2
+  # Both counts zero ⇒ nothing on this box carries the worker's identity ⇒ nothing is running under
+  # it, so there is no CPU to burn and no work in flight. That is a PROVEN idle, not an unknown.
+  if [ "$mb" -eq 0 ] && [ "$ma" -eq 0 ]; then return 0; fi
+  # A worker that appears in the SECOND sample but not the first is not a still one: it started work
+  # between the samples. Anything other than "present and flat in both" is spared.
+  if [ "$mb" -eq 0 ] || [ "$ma" -eq 0 ]; then return 1; fi
+  # ⛔ A TOTAL THAT FELL IS NOT A FLAT ONE. Per-process CPU time is monotonic, so the SUM over a
+  # matched subtree can only go DOWN when the SET changed — a matched process exited and another
+  # appeared (a launcher restarting, a worker respawning between the samples). That is change, which
+  # is the opposite of idleness; reading it as `delta <= tol` would reap from a negative delta.
+  [ "$a" -ge "$b" ] || return 1
+  [ $(( a - b )) -le "${_WREAP_TOL_CS:-10}" ] || return 1
+  return 0
+}
 reap_stale_workers() {
   local s f age m _wm _wn=0 _wl=""
+  # Candidates for this pass, one row each: name, log path, identity patterns, age. The reap DECISION
+  # cannot be taken inside the census walk any more, because the positive-liveness gate needs TWO
+  # samples of the process table with a window between them, and that window must be paid ONCE for the
+  # whole pass — a per-candidate `sleep` would stall a loaded box's cycle by N x the window, and the
+  # census is usually empty.
+  local _wc=""
   while IFS="$(printf '\t')" read -r s _st; do
     case "$s" in ''|*[!A-Za-z0-9-]*) continue ;; esac
     # ⛔ `review-*` IS IN THIS LIST NOW (owner ruling 2026-11-04) AND IT WAS THE EXPENSIVE OMISSION.
@@ -2166,17 +2287,72 @@ reap_stale_workers() {
     _wm="$( _wedge_min 2>/dev/null )"; is_num "${_wm:-}" || _wm=80
     if [ "$age" -gt $(( _wm * 60 )) ]; then _wn=$(( _wn + 1 )); _wl="${_wl:+$_wl,}$s(${age}s)"; fi
     [ "$age" -gt $(( 10#${STALE_MIN} * 60 )) ] || continue
-    echo "[reap-worker] $s silent ${age}s -> closing its worker surface" >> "$LOG"
-    # ⛔ A KILL THAT CANNOT BE PROVEN IS NOT A KILL. wt_close() re-reads the surface after closing and
-    # returns non-zero if the worker is still there (or UNREADABLE); the record is then KEPT so the
-    # next cycle retries. Reporting "reaped" on the strength of the close call alone would free a slot
-    # that is still occupied — the exact arithmetic that let hung workers halve the caps.
-    if ! wt_close "$s"; then
-      echo "[reap-worker] $s could NOT be proven gone — record kept, retried next cycle" >> "$LOG"
-    fi
+    _wc="${_wc}${s}$(printf '\t')${f}$(printf '\t')${age}
+"
   done <<EOF
 $(wt_table)
 EOF
+  # ── PHASE 2: the POSITIVE-LIVENESS gate (agent-infra#2104) ────────────────────────────────────
+  # Nothing below is reached on an empty pass, and nothing is reaped until this gate says so. The
+  # three verdicts and their polarity are stated at `_wreap_verdict`; the short form is that a stale
+  # LOG is now only half of the evidence, and an unreadable process table spares rather than kills.
+  if [ -n "$_wc" ]; then
+    local _t1 _t2 _row _cn _cf _ca _pats _o _c1 _c2 _m1 _m2 _v
+    _t1="$(_wreap_ps)"
+    # Sample 1, per candidate. An unreadable snapshot (>rc 0) leaves the row UNKNOWN and it is skipped,
+    # never reaped — the probe's failure must not be read as the worker's idleness.
+    local _rows1=""
+    while IFS="$(printf '\t')" read -r _cn _cf _ca; do
+      [ -n "${_cn:-}" ] || continue
+      _pats="$(_wreap_patterns "$_cn" "$_cf")"
+      _c1=""; _m1=0
+      if [ -n "$_t1" ]; then
+        _o="$(printf '%s\n' "$_t1" | _wreap_cpu - "$_pats")" || _o=""
+        set -- $_o
+        if [ "$#" -ge 2 ]; then _m1="$1"; _c1="$2"; fi
+      fi
+      _rows1="${_rows1}${_cn}$(printf '\t')${_cf}$(printf '\t')${_ca}$(printf '\t')${_m1}$(printf '\t')${_c1}
+"
+    done <<EOF
+$_wc
+EOF
+    # ONE window for the pass, then sample 2. Only paid when something is a candidate at all.
+    [ -n "$_rows1" ] && sleep "${_WREAP_WINDOW:-2}"
+    _t2="$(_wreap_ps)"
+    while IFS="$(printf '\t')" read -r _cn _cf _ca _m1 _c1; do
+      [ -n "${_cn:-}" ] || continue
+      _pats="$(_wreap_patterns "$_cn" "$_cf")"
+      _c2=""; _m2=0
+      if [ -n "$_t2" ]; then
+        _o="$(printf '%s\n' "$_t2" | _wreap_cpu - "$_pats")" || _o=""
+        set -- $_o
+        if [ "$#" -ge 2 ]; then _m2="$1"; _c2="$2"; fi
+      fi
+      _v=2
+      if [ -n "${_c1:-}" ] && [ -n "${_c2:-}" ]; then
+        _wreap_verdict "$_c1" "$_c2" "$_m1" "$_m2"; _v=$?
+      fi
+      case "$_v" in
+        0)
+          echo "[reap-worker] $_cn silent ${_ca}s and its process tree burned no CPU over ${_WREAP_WINDOW:-2}s (matched=${_m2} cpu=${_c1}->${_c2}cs tol=${_WREAP_TOL_CS:-10}cs) -> closing its worker surface" >> "$LOG"
+          # ⛔ A KILL THAT CANNOT BE PROVEN IS NOT A KILL. wt_close() re-reads the surface after closing
+          # and returns non-zero if the worker is still there (or UNREADABLE); the record is then KEPT
+          # so the next cycle retries. Reporting "reaped" on the strength of the close call alone would
+          # free a slot that is still occupied — the exact arithmetic that let hung workers halve the caps.
+          if ! wt_close "$_cn"; then
+            echo "[reap-worker] $_cn could NOT be proven gone — record kept, retried next cycle" >> "$LOG"
+          fi ;;
+        1)
+          # ⛔ THIS LINE IS THE FIX. Before it, a worker logged as "silent 8287s" while its agent had
+          # been editing and running suites for hours was closed, and its uncommitted work went with it.
+          echo "[reap-worker] $_cn log idle ${_ca}s but its process tree is BURNING CPU (cpu=${_c1}->${_c2}cs, delta=$(( ${_c2:-0} - ${_c1:-0} ))cs > tol=${_WREAP_TOL_CS:-10}cs) — SPARED: a quiet log is not a hung worker (agent-infra#2104)" >> "$LOG" ;; 
+        *)
+          echo "[reap-worker] $_cn log idle ${_ca}s but its liveness could NOT be measured (process table unreadable, or the worker has no identity in it) — SPARED: assume-active-until-proven-idle (agent-infra#2104)" >> "$LOG" ;;
+      esac
+    done <<EOF
+$_rows1
+EOF
+  fi
   # ⛔ THE COUNT IS PRINTED EVEN WHEN IT IS ZERO-BOUND, because a silent reaper is the same defect
   # class as a silent threshold: an operator reading `lanes=0/25` beside an idle box must be able to
   # tell "nothing wedged" from "nothing looked". `find` over the logs is the only new cost and it is

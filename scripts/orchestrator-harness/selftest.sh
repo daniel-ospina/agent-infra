@@ -2827,6 +2827,24 @@ SH
 # 2026-10-12 while the caps (which count SESSIONS) reported the slot as busy.
 grep -q '^  reap_stale_workers$' "$LOOP" && rc=0 || rc=1
 ck "the reaper runs every cycle" $rc
+# ⛔ ONE HOME FOR THE REAPER'S DEPENDENCY SET (agent-infra#2104). This list has now been edited four
+# times — `file_mtime_epoch` (#1702), `worker_log_name` (2026-11-06), and the #2104 liveness probe's
+# four helpers — and EVERY omission produced a SILENT failure rather than an error: the missing
+# helper makes a `$( )` return empty, a guard swallows the result, and the reaper then either skips
+# every record or (for the probe) spares every one while still exiting 0. Keeping the list in one
+# function is what makes the next addition a one-line edit instead of a hunt through two extractors.
+# Nothing here sets a constant: the probe's `_WREAP_TOL_CS` / `_WREAP_WINDOW` are read through
+# `${X:-default}` everywhere, so an older `$O` copy that lacks them still behaves as documented.
+reapw_prelude() { # <loopfile> -> the shipped helpers, in dependency order
+  local L="$1"
+  grep -m1 '^is_num() {' "$L"
+  sed -n '/^file_mtime_epoch() {/,/^}/p' "$L"
+  sed -n '/^worker_log_name() {/,/^}/p' "$L"
+  sed -n '/^_wreap_ps() {/,/^}/p' "$L"
+  sed -n '/^_wreap_cpu() {/,/^}/p' "$L"
+  sed -n '/^_wreap_patterns() {/,/^}/p' "$L"
+  sed -n '/^_wreap_verdict() {/,/^}/p' "$L"
+}
 sed -n '/^reap_stale_workers() {/,/^}/p' "$LOOP" > "$TMP/reapw-body.sh"
 # The reaper now delegates the mtime probe to the shipped portable helper (#1702), so its unit is
 # the helper PLUS the reaper. Extracting the reaper alone leaves file_mtime_epoch undefined and the
@@ -2839,7 +2857,8 @@ sed -n '/^reap_stale_workers() {/,/^}/p' "$LOOP" > "$TMP/reapw-body.sh"
 # DIRECTORY — so `[ -f "$f" ] || continue` skipped every record and the reaper silently reaped
 # nothing: the same "helper missing ⇒ the guard swallows everything" failure this prelude's own
 # comment records for `file_mtime_epoch`. Adding a call to the reaper means adding it here.
-{ grep -m1 '^is_num() {' "$LOOP"; sed -n '/^file_mtime_epoch() {/,/^}/p' "$LOOP"; sed -n '/^worker_log_name() {/,/^}/p' "$LOOP"; cat "$TMP/reapw-body.sh"; } > "$TMP/reapw.sh"
+reapw_prelude "$LOOP" > "$TMP/reapw.sh"
+cat "$TMP/reapw-body.sh" >> "$TMP/reapw.sh"
 if need "$TMP/reapw.sh" "reap_stale_workers() and its file_mtime_epoch() helper are extracted from the shipped loop"; then
   mkdir -p "$TMP/RW/logs" "$TMP/RW/state"
   : > "$TMP/RW/logs/merge-999.log"; touch -t 202601010000 "$TMP/RW/logs/merge-999.log"
@@ -2875,6 +2894,83 @@ if need "$TMP/reapw.sh" "reap_stale_workers() and its file_mtime_epoch() helper 
   grep -q 'list-panes -t "=\$name"' "$HERE/worker-terminal.sh" && rc=0 || rc=1
   ck "the reaper resolves the pane pid with an exact target" $rc
   unset -f cmux tmux kill
+fi
+# ── 15b) a STALE LOG IS NOT A HUNG WORKER: the positive-liveness gate (agent-infra#2104) ───────
+# MEASURED 2026-10-19: this reaper closed a worker logged as "silent 8287s" (2.3 h) while its agent
+# had been running `bash`/`edit` calls for hours with ~200 lines of uncommitted work, and closed 7
+# other sessions in the same second. The single signal it read was one harness-written log file's
+# mtime, which an agent's own work never touches. Every assertion below drives the SHIPPED functions
+# extracted from the shipped loop — none re-implements the verdict it checks.
+if need "$TMP/reapw.sh" "the #2104 liveness probe is extracted from the shipped loop"; then
+  # (a) UNIT: the awk's identity match. A synthetic `ps` table carrying a name that is a PREFIX of
+  # the wanted one (fix-889 vs fix-88) and the wanted worker's own subtree.
+  cat > "$TMP/wr-table.txt" <<'TBL'
+    100     1  0:00.10 bash /x/state/run-fix-889.sh
+    101     1  0:00.10 bash /x/state/run-fix-88.sh
+    102   101  1:02.03 pytest /w
+    103     1  0:00.05 /nowhere/bin/pi --model m --no-session
+TBL
+  got="$( . "$TMP/reapw.sh"; _wreap_cpu "$TMP/wr-table.txt" "$(_wreap_patterns fix-88 /x/logs/fix-88.log)" )"
+  [ "$got" = "1 6213" ] && rc=0 || { rc=1; echo "      got '$got' want '1 6213'"; }
+  ck "#2104: the probe matches ONLY the wanted worker (a prefix name is not it) and sums its SUBTREE (got '$got')" $rc
+  # (b) UNIT: the identity set is anchored — the bare name never appears as a pattern, so `fix-19`
+  # cannot match `fix-1949`.
+  pats="$( . "$TMP/reapw.sh"; _wreap_patterns fix-19 /x/logs/fix-19.log )"
+  case "$pats" in *'wt-fix-19'*'run-fix-19.sh'*) rc=0 ;; *) rc=1 ;; esac
+  ck "#2104: the identity set is anchored on wt-/run-/.sh, not the bare name [$pats]" $rc
+  # (c) UNIT: the verdict table, including the two directions that would destroy work.
+  vrun() { ( . "$TMP/reapw.sh"; _wreap_verdict "$1" "$2" "$3" "$4" ); }
+  v="$(vrun 100 100 2 2)"; [ "$?" = "0" ] && [ -z "$v" ] && rc=0 || rc=1
+  ck "#2104: flat CPU on a PRESENT subtree is IDLE (a real hang is still reaped)" $rc
+  vrun 100 400 2 2; [ "$?" = "1" ] && rc=0 || { rc=1; echo "      rc=$?"; }
+  ck "#2104: the working subtree that burned CPU is ACTIVE — the 8287s case is spared" $rc
+  vrun 400 100 2 2; [ "$?" = "1" ] && rc=0 || { rc=1; echo "      rc=$?"; }
+  ck "#2104: a CPU total that FELL (the matched set changed) is change, not idleness" $rc
+  vrun 100 100 2 0; [ "$?" = "1" ] && rc=0 || { rc=1; echo "      rc=$?"; }
+  ck "#2104: a worker present in one sample and absent in the other is spared" $rc
+  vrun "" "" 0 0; [ "$?" = "2" ] && rc=0 || { rc=1; echo "      rc=$?"; }
+  ck "#2104: an UNMEASURED CPU is UNKNOWN, never idle" $rc
+  vrun 0 0 0 0; [ "$?" = "0" ] && rc=0 || { rc=1; echo "      rc=$?"; }
+  ck "#2104: nothing carrying the worker's identity at all is a PROVEN idle" $rc
+  unset -f vrun
+  # (d) END-TO-END on the SHIPPED reaper: a stale log with a LIVE, CPU-burning worker behind it is
+  # SPARED, and the operator is told why. This is the #2104 case, driven through the shipped code.
+  mkdir -p "$TMP/RL/logs" "$TMP/RL/state"
+  : > "$TMP/RL/logs/fix-88.log"; touch -t 202601010000 "$TMP/RL/logs/fix-88.log"
+  printf 'kind=tmux\ncwd=/tmp\n' > "$TMP/RL/state/worker-fix-88"
+  printf '#!/bin/sh\nwhile :; do :; done\n' > "$TMP/RL/state/run-fix-88.sh"
+  cat > "$TMP/rl.sh" <<SH
+set -u
+. "$TMP/wtstub.sh"
+LOG="$TMP/RL/rw.log"; O="$TMP/RL"; WT_DIR="$TMP/RL/state"; STALE_MIN=1; WT_TABLE_TTL=0
+_WREAP_WINDOW=1; _WREAP_TOL_CS=0
+. "$HERE/worker-terminal.sh"
+. "$TMP/reapw.sh"
+reap_stale_workers; echo "closed=\$CLOSED killed=\$KILLED"
+SH
+  sh "$TMP/RL/state/run-fix-88.sh" & busy=$!
+  out="$(bash "$TMP/rl.sh" 2>&1)"
+  kill -KILL "$busy" 2>/dev/null; wait "$busy" 2>/dev/null
+  case "$out" in *fix-88*) rc=1; echo "      closed/killed a LIVE worker: $out";; *) rc=0 ;; esac
+  ck "#2104: shipped reaper SPARES a worker whose log is stale but whose process tree is BURNING CPU" $rc
+  grep -q 'BURNING CPU' "$TMP/RL/rw.log" && rc=0 || { rc=1; echo "      log: $(cat "$TMP/RL/rw.log" 2>/dev/null)"; }
+  ck "#2104: and says so in the log, naming the CPU delta it spared on" $rc
+  # (e) END-TO-END: an UNREADABLE process table spares, never kills — assume-active-until-proven-idle.
+  cat > "$TMP/rl2.sh" <<SH
+set -u
+ps() { :; }                     # a blind probe: no rows at all
+. "$TMP/wtstub.sh"
+LOG="$TMP/RL/rw2.log"; O="$TMP/RL"; WT_DIR="$TMP/RL/state"; STALE_MIN=1; WT_TABLE_TTL=0
+. "$HERE/worker-terminal.sh"
+. "$TMP/reapw.sh"
+reap_stale_workers; echo "closed=\$CLOSED killed=\$KILLED"
+SH
+  : > "$TMP/RL/rw2.log"
+  out="$(bash "$TMP/rl2.sh" 2>&1)"
+  case "$out" in *fix-88*|*term_*) rc=1; echo "      blinded probe still reaped: $out";; *) rc=0 ;; esac
+  ck "#2104: a BLIND process probe spares the worker instead of reading 'unmeasurable' as 'idle'" $rc
+  grep -q 'could NOT be measured' "$TMP/RL/rw2.log" && rc=0 || rc=1
+  ck "#2104: and the log names the unmeasured liveness rather than a silent skip" $rc
 fi
 # the agent invocation is wall-clock bounded, portably (macOS has no timeout/gtimeout)
 sed -n '/^run_agent() {/,/^}/p' "$MERGE" > "$TMP/runagent.sh"
@@ -4182,7 +4278,7 @@ fi
 # The reaper driven with the GNU stat shape: the pre-fix copy ABORTS here (`age: unbound variable`,
 # rc 1) and kills nothing. Assert rc=0 AND the kill decision — stale reaped, fresh spared — so a
 # "fix" that simply stopped reaping cannot pass this.
-{ grep -m1 '^is_num() {' "$LOOP"; sed -n '/^file_mtime_epoch() {/,/^}/p' "$LOOP"; sed -n '/^worker_log_name() {/,/^}/p' "$LOOP"; sed -n '/^reap_stale_workers() {/,/^}/p' "$LOOP"; } > "$TMP/reapw-gnu.sh"
+{ reapw_prelude "$LOOP"; sed -n '/^reap_stale_workers() {/,/^}/p' "$LOOP"; } > "$TMP/reapw-gnu.sh"
 if need "$TMP/reapw-gnu.sh" "the reaper and its stat helper are extracted for the GNU-shape drive"; then
   mkdir -p "$TMP/RG/logs" "$TMP/RG/state"
   : > "$TMP/RG/logs/merge-999.log"; touch -t 202601010000 "$TMP/RG/logs/merge-999.log"
@@ -4395,8 +4491,12 @@ _ngrd_n="$(printf '%s\n' "$NGRD" | grep -cE '^is_(num|limit) "\$\{[A-Z_]+:')"
 # 19 -> 20 for the LANDING FLOOR (2026-11-03): `LANDING_FLOOR` feeds `[ "${OPEN_N}" -ge "$LF_M" ]` at
 # a dispatch decision, so an uncoerced typo would either disarm the WIP limit or error the test and
 # OPEN the gate — the same fail-open class as every coercion above.
-[ "$_ngrd_n" = "20" ] && rcn=0 || { rcn=1; echo "      expected 20 shipped coercions in the extraction, got $_ngrd_n"; }
-ck "all 20 shipped limit coercions are extracted (a definition alone is not an extraction)" $rcn
+# 20 -> 22 for the #2104 liveness probe (`_WREAP_TOL_CS`, `_WREAP_WINDOW`): both feed a `[ … -le ]` /
+# `sleep` in the reap decision, and an uncoerced typo makes that test ERROR — which reads FALSE, i.e.
+# "not idle", so the reaper would spare every worker for ever. That is the inert-enforcer direction
+# rather than the fail-open one, and it is still a bound silently disarmed by a typo.
+[ "$_ngrd_n" = "22" ] && rcn=0 || { rcn=1; echo "      expected 22 shipped coercions in the extraction, got $_ngrd_n"; }
+ck "all 22 shipped limit coercions are extracted (a definition alone is not an extraction)" $rcn
 # The CYC FLOOR is part of the same coercion block but is not an is_* line, so it is extracted by an
 # explicit pattern (P3, third review round, 2026-10-14). Without it in NGRD, `nlim` could not drive
 # CYC=0 and the floor assertion below would be RED on the FIXED file — a false negative that would
