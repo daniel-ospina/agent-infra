@@ -672,17 +672,20 @@ not in three months). Two documented ways it then survives:
 | `git gc` instead of prune | a freshly-dead record is **still listed** after `git gc` — it honours `gc.worktreePruneExpire`, default **3 months** |
 
 Remedy, scoped to **your own** record: `git worktree remove <path>` — it removes a record whose directory is
-gone (measured rc 0) and REFUSES on a tree that still has uncommitted work (`contains modified or untracked
-files`), so it cannot destroy one. On a LOCKED record it refuses (`cannot remove a locked working tree`), so
-run `git worktree unlock <path>` first — but do **not** chain the two with `&&`: `unlock` on an UNLOCKED
-record is itself `fatal: '<path>' is not locked`, which would skip the removal. `remove -f -f` overrides both
-the lock and the dirty guard (the only guard left), so it silently discards uncommitted work — use it only
-when you mean to.
+gone (measured rc 0) and REFUSES on a tree with uncommitted **tracked or untracked** changes (`contains
+modified or untracked files`). That guard does **not** cover **ignored** files: a `.env` or a `node_modules/`
+leaves `git status` clean, so `remove` succeeds and deletes them (measured rc 0). Check first with
+`git -C <path> status --porcelain --ignored`, which is what `scripts/stale-worktrees.sh` does before its own
+removals. On a LOCKED record `remove` refuses (`cannot remove a locked working tree`), so run
+`git worktree unlock <path>` first — but do **not** chain the two with `&&`: `unlock` on an UNLOCKED record
+is itself `fatal: '<path>' is not locked`, which would skip the removal. `remove -f -f` overrides both the
+lock and the dirty guard, so it discards uncommitted work — use it only when you mean to.
 ⛔ **Never run a bare `git worktree prune` as housekeeping.** It takes **no path argument**
-(`git worktree prune [-n] [-v] [--expire <expire>]`), so it cannot be scoped: it deregisters EVERY record
-whose directory is momentarily unstat-able — an unmounted volume, a permission blip — destroying an
-unrelated checkout whose files are still on disk. The measurement behind this ban is recorded at
-`scripts/stale-worktrees.sh:145-150`; `#1141`'s tracker entry does not carry it.
+(`git worktree prune [-n] [-v] [--expire <expire>]`) — **no path filter**, so within the repo it runs in it
+deregisters EVERY record whose directory is momentarily unstat-able (an unmounted volume, a permission blip),
+destroying an unrelated checkout whose files are still on disk. `-C <repo>` scopes it to one *repo*, which is
+how the gate-guarded `scripts/pi-reap-worktrees.sh` uses it; the measurement behind the ban is recorded at
+`scripts/stale-worktrees.sh:145-150`, and `#1141`'s tracker entry does not carry it.
 
 ## Search
 
