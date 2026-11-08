@@ -1106,8 +1106,9 @@ a manual re-measure "the next time any `pi` process exceeds ~5% of a core **with
 transcript silent > 120 s**" — a **two-conjunct** trigger. The **CPU half** of it
 fired on 2026-11-08 on a Linux fleet cell (x86_64, load 17.70, 22 days uptime,
 `pi` **1.2.0** — the report above probed **0.85.1** on macOS arm64). The silence
-conjunct **could be evaluated for only one of the 19 processes on that host** — the
-`.jsonl` predicate reads `None` for the other 18 (below) — and the read evidence
+conjunct **could be evaluated for only one of the 19 processes the sessions probe
+could map** — the `.jsonl` predicate reads `None` for the other 18 (below) — and the
+read evidence
 below shows the processes above 5% reading at working rates rather than sitting on
 the idle floor. That is evidence *against* a silent-session burn, but it is not the
 transcript predicate: for those 18 the silence value is **unknown, not negative**.
@@ -1165,7 +1166,8 @@ epoch — the property the epoch analysis above found missing across windows.
   accident. Two honest qualifications. First, a cluster is not a constant: it is a
   *band*. Second, and decisive for how much it can carry, those four are **quoted
   samples from three pids**, not the population — there is no `max rchar (idle)`
-  column, so "idle max 10 KB/s" below is the maximum of the quoted samples, **not**
+  column, so the idle-sample maximum used above ("idle max 10 KB/s") is the maximum
+  of the quoted samples, **not**
   of all 37 idle process-windows, and one unquoted idle sample above 10.4 KB/s
   would close the gap entirely. The sample nearest it, pid 4076400 (the exception
   below), reads 10.4 KB/s at **0.8% of a core**, and the table's own 09:26:50 row
@@ -1181,9 +1183,10 @@ epoch — the property the epoch analysis above found missing across windows.
   columns make it empty by construction (no process above 1% is labelled idle, and
   no labelled working process reads below 10.4 KB/s), so `NONE` is entailed rather
   than measured. What it does establish is that a *gross* recurrence of the 09-16
-  signature is absent from these four windows; a busy-and-silent process reading at
-  the floor is exactly what this measurement cannot separate from working, which is
-  the episodic limitation in (a) below.
+  signature is absent from these four windows. It cannot do more than that: a
+  busy-and-silent process **reading at the floor** is exactly what this measurement
+  cannot separate from working, and that is a limit of the discriminator, not of
+  the window length — reason (d) below.
 - ΔCPU tracked `rchar` **in both directions, for the same pid, across windows**
   rather than following a constant cadence: pid 2324326 read
   `0.1%/8.4 KB/s → 2.8%/4 089 KB/s → 3.4%/9 841 KB/s → 5.5%/708 KB/s`, pid
@@ -1217,18 +1220,22 @@ epoch — the property the epoch analysis above found missing across windows.
   when it exists, is main-thread JS — consistent with the render-frame mechanism
   and *not* primarily collector throughput.
 
-**What this settles, and what it does not.** It settles that **one Linux x86_64
-fleet box on `pi` 1.2.0 shows no idle `pi` spin in 105 s of windows**, and it
-supplies the
-missing discriminator for telling a burner from a worker. It does **not** settle
-that the defect is fixed, for three reasons this report's own analysis demands be
-stated: (a) the burn is **episodic** — windows this short cannot exclude a bursty
-offender, so a negative here is one epoch, not a lifetime rate; (b) the OS and
+**What this settles, and what it does not.** What it **records** is narrower than
+an independent negative: **no process labelled idle on one Linux x86_64 fleet box
+(`pi` 1.2.0) exceeded 0.3% of a core in 105 s of windows** — a direct consequence of
+the ΔCPU split rather than a free-standing measurement — and it supplies the missing
+discriminator for telling a burner from a worker. It does **not** settle that the
+defect is fixed, for four reasons this report's own analysis demands be stated:
+(a) the burn is **episodic** — windows this short cannot exclude a bursty offender,
+so a negative here is one epoch, not a lifetime rate; (b) the OS and
 version both moved (macOS arm64/0.85.1 → Linux x86_64/1.2.0), so the two
-observations are confounded exactly as the 09-16 confound analysis warns; and
+observations are confounded exactly as the 09-16 confound analysis warns;
 (c) one of the five recommendations above **has shipped** in between (the footer
 memoisation, item 2), which is a plausible partial cause and is *not* demonstrated
-to be the cause. What it does mean operationally is that the **mechanical trip is
+to be the cause; and (d) the discriminator has a **categorical blind spot** a longer
+window cannot fix — a process that is busy, silent and *reading at the floor* is
+indistinguishable from working, and that is the 09-16 signature itself. What it does
+mean operationally is that the **mechanical trip is
 still #1127** — a prose re-check answered once is still prose.
 
 ### Mitigation available in agent-infra (the issue's ask 3)
