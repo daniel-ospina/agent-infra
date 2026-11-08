@@ -1511,7 +1511,7 @@ delta_git_neutral() { # <root> <git args…>
 delta_verify() { # <id: A..B[+artifact]> <head_sha> -> 0 = verified (sets DELTA_*)
   local id="$1" head="$2" range from to cover="" root="" tmp="" norm=""
   local authored="" newest="" n_authored=0 anchor="" dg_rc=0 base_sha="" base_ref=""
-  local merges_in_range="" evil="" evil_shas="" m="" parents="" pcount="" p1="" p2="" prest="" want="" actual="" cands="" mrc="" body_claim="" stated_from="" stated_to="" stated_sep="" _delta_tok="" E_OUT="" E_RC="" _scan="" _any="" _all_ok="" _sf="" _ss="" _st="" _straw="" _stcmp="" _ok="" _sfs="" _r="" _claim="" _toks="" _tok_rc=0 _tok="" _tsha="" _tipscan="" _tref="" _top="" _tiprel=0 _tisref="" _tosha="" _tipchain="" _lid=0 _rid=0 _elhs="" _erhs="" _elsha="" _ersha="" _eranges="" _drivers="" _dg_rc=0 _gitdir="" _gd_rc=0 _commondir="" _cd_rc=0 _attr_amb="" _wt_amb="" _ls_rc=0 _st_amb="" _st_rc=0 _ad="" _adrift="" _adr_rc=0
+  local merges_in_range="" evil="" evil_shas="" m="" parents="" pcount="" p1="" p2="" prest="" want="" actual="" cands="" mrc="" body_claim="" stated_from="" stated_to="" stated_sep="" _delta_tok="" E_OUT="" E_RC="" _scan="" _any="" _all_ok="" _sf="" _ss="" _st="" _straw="" _stcmp="" _ok="" _sfs="" _r="" _claim="" _toks="" _tok_rc=0 _tok="" _tsha="" _tipscan="" _tref="" _top="" _tiprel=0 _tisref="" _tosha="" _tipchain="" _lid=0 _rid=0 _lrest="" _elhs="" _erhs="" _elsha="" _ersha="" _eranges="" _drivers="" _dg_rc=0 _gitdir="" _gd_rc=0 _commondir="" _cd_rc=0 _attr_amb="" _wt_amb="" _ls_rc=0 _st_amb="" _st_rc=0 _ad="" _adrift="" _adr_rc=0
   range="${id%%+*}"
   [ "$range" != "$id" ] && cover="${id#*+}"
   from="${range%%..*}"; to="${range##*..}"
@@ -2265,9 +2265,13 @@ $m"
       # matched NOTHING and every honest `BASE..HEAD` artifact was refused with "states a DIFFERENT
       # range … the body quotes …..Head" (measured while writing 20h52a, which is why that control
       # exists). The test is on the CASE-INSENSITIVE spelling instead.
+      # ⛔ A TIP SPELLING IS THE ATTESTED HEAD, NOT THIS CHECKOUT\'S (ninteenth cycle, P1 — MEASURED):
+      # resolving `HEAD` through the delta checkout made the arm\'s own recommended spelling
+      # (`reviewed delta:A..HEAD`, 20h52a) be refused as "states a DIFFERENT range" whenever that
+      # checkout sat anywhere but the attested head — a false block whose message accuses the artifact
+      # of a contradiction it never wrote. The tip is `$to` by definition here; no git call needed.
       case "$_stcmp" in
-        [Hh][Ee][Aa][Dd]) _stcmp="$(delta_git "$root" rev-parse --verify 'HEAD^{commit}' 2>/dev/null || true)" ;;
-        @) _stcmp="$(delta_git "$root" rev-parse --verify '@^{commit}' 2>/dev/null || true)" ;;
+        [Hh][Ee][Aa][Dd]|@) _stcmp="$to" ;;
       esac
       if [ -n "$_stcmp" ]; then
         case "$to" in "$_stcmp"*) _ok=1 ;; esac
@@ -2567,25 +2571,31 @@ $m"
       # NAMED one was refused with "RELATIVE TO THE TIP … always NARROWER", which is false about it —
       # the false-block class this file's own doctrine calls worse than the gap. `0+` states the rule
       # (a zero count is a zero count) instead of enumerating the spellings that happen to occur.
-      [[ "$_top" =~ ^((~0+|@\{0+\}|\^0+|\^\{[^}/]*\})+)$ ]] && continue
+      [[ "$_top" =~ ^((~0+|@\{0+\}|@\{now\}|\^0+|\^\{[^}/]*\})+)$ ]] && continue
       # ⛔ NO SELECTOR, NOTHING TO CLASSIFY. The chain group is `*` because a brace group on a bare `@`
       # IS the selector and arrives through the operand (normalised above); that also lets a bare
       # reference match, and a bare `HEAD` — or a sha merely QUOTED in prose — names no narrowing at
       # all. Only a chain can narrow, so an empty chain is prose by construction.
       [ -n "$_top" ] || continue
-      # ⛔ AND A CHAIN THAT *RESOLVES* TO THE ATTESTED HEAD IS THE IDENTITY TOO (eighteenth cycle, P2 —
-      # MEASURED at e4047ef3): the sentence above claimed `@{upstream}` is not a residual "because it
-      # RESOLVES", but nothing resolved anything — `_tref` being `HEAD` refused immediately, so
-      # `HEAD@{now}` (git returns the TIP) was refused as "always NARROWER", a NEW false block of the
-      # class this file calls worse than the gap. Resolution is the authority, as it is everywhere else
-      # in this file: equal to the attested head ⇒ identity, otherwise a narrowing.
-      if [ -n "$_tosha" ]; then
-        _tipchain="$(delta_git "$root" rev-parse --verify "${_tref}${_top}^{commit}" 2>/dev/null || true)"
-        [ -n "$_tipchain" ] && [ "$_tipchain" = "$_tosha" ] && continue
+      # ⛔ NO CHAIN IS RESOLVED THROUGH THE CHECKOUT AT ALL (nineteenth cycle, P1 — MEASURED TWICE).
+      # Resolving a chain with `git rev-parse` answered in the DELTA CHECKOUT frame, so a sha-spelled
+      # endpoint (`<head>~0..HEAD`) and a brace chain (`@{0}~1..HEAD`) flipped between "refused" and
+      # "signed clean" depending on which commit that checkout happened to sit on, while the identical
+      # artifact was refused with it detached at the head. The grammar test above is COMPLETE for
+      # everything this arm must accept (`~0+`, `^0+`, `^{<type>}`, `^{}`, `@{0+}`, `@{now}`), so nothing
+      # needs resolving: a chain that is not the identity narrows, and that verdict now holds in every
+      # frame because no checkout is consulted.
+      # A bare brace group that did NOT resolve to the attested head: a POSITION (numeric or dated)
+      # narrows, while a SYMBOLIC name (`@{upstream}`, `@{push}`) cannot narrow anything and must not be
+      # refused as though it did — MEASURED: `@{upstream}` prose was refused "always NARROWER" in every
+      # frame, which the sentence that called it resolved was measurably wrong about.
+      if [ -z "$_tref" ]; then
+        case "$_top" in
+          *[!0-9A-Za-z_].*|*[0-9]*) _tiprel=1; break ;;
+          *upstream*|*push*|*u\}) continue ;;
+          *) _tiprel=1; break ;;
+        esac
       fi
-      # A bare brace group that did NOT resolve to the attested head is a reflog position on the tip
-      # (or one that does not resolve at all) — either way it is not the identity, so it narrows.
-      [ -n "$_tref" ] || { _tiprel=1; break; }
       case "$_tref" in
         [Hh][Ee][Aa][Dd]|@) _tiprel=1; break ;;
       esac
@@ -2634,10 +2644,23 @@ $m"
       if [ "$_lid" = 1 ] && [ "$_rid" = 1 ]; then
         _tiprel=1; break
       fi
-      _elsha="$(delta_git "$root" rev-parse --verify "${_elhs}^{commit}" 2>/dev/null || true)"
+      # The attested frame again: a tip-rooted endpoint is `$to`, and only a NON-tip endpoint is
+      # resolved through the checkout (a sha is frame-independent by construction).
+      case "$_elhs" in
+        [Hh][Ee][Aa][Dd]*|@*)
+          # Split the tip token off and resolve only the REST against the attested head.
+          _lrest="${_elhs}"
+          case "$_lrest" in
+            [Hh][Ee][Aa][Dd]*) _lrest="${_lrest#HEAD}" ;;
+            @\{*\}) _lrest="@${_lrest#*\}}" ; _lrest="${_lrest#@}" ;;
+            @*) _lrest="${_lrest#@}" ;;
+          esac
+          _elsha="$(delta_git "$root" rev-parse --verify "${_tosha}${_lrest}^{commit}" 2>/dev/null || true)" ;;
+        *) _elsha="$(delta_git "$root" rev-parse --verify "${_elhs}^{commit}" 2>/dev/null || true)" ;;
+      esac
       [ -n "$_elsha" ] || continue
       case "$_erhs" in
-        @) _ersha="$(delta_git "$root" rev-parse --verify '@^{commit}' 2>/dev/null || true)" ;;
+        [Hh][Ee][Aa][Dd]|@) _ersha="$to" ;;
         *) _ersha="$(delta_git "$root" rev-parse --verify "${_erhs}^{commit}" 2>/dev/null || true)" ;;
       esac
       if [ "$_elsha" = "$_ersha" ] && [ "$_elsha" = "$to" ]; then

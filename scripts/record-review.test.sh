@@ -10985,18 +10985,19 @@ I only actually reviewed ${DG_HEAD}~1..${DG_HEAD}; the rest was not read."
 MUT="$(mk_mutant tokfloor "command grep -oE '[0-9a-fA-F]{4,40}'" "command grep -oE '[0-9a-fA-F]{7,40}'")"
 mut_check "M42 the token scan's floor is the parser's, not 7" 425254 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42525501" accepted STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
 I only actually reviewed ${DG_A1:0:6}–${DG_HEAD:0:6}; the rest was not read."
-# M43 — THE TIP'S RESOLUTION SET (fifteenth cycle P2). Restoring the pre-fix "resolve the RAW
-#       spelling" line leaves the accepted-but-unresolvable case exactly as it shipped, and 20h52e's
-#       HONEST `BASE..head` — which the parser accepts on purpose — is REFUSED: the direction that
-#       alone governs is acceptance, because the shipped vector's whole point is that this arm must
-#       not false-block a correct artifact.
-MUT="$(mk_mutant rawtip 'verify '\''HEAD^{commit}'\''' 'verify "${_straw}^{commit}"')"
-mut_check "M43 the tip is resolved by the CANONICAL token, not the raw spelling" 425278 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42527901" refused STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..head; no issues found."
+# M43 (THE TIP’S RESOLUTION SET) IS RETIRED WITH ITS ARM (nineteenth cycle). The arm it mutated
+#       — `rev-parse 'HEAD^{commit}'` as a raw-vs-canonical resolution of the tip — NO LONGER EXISTS:
+#       a tip spelling is simply `$to` (the attested head) at both comparison sites, because resolving it
+#       through the delta checkout is exactly the frame dependency a reviewer measured twice. There is
+#       no resolution left to get wrong, so there is nothing for a mutant to break. The capability it
+#       protected is pinned instead by the ACCEPTANCE vectors that reach that path: 20h52a
+#       (`delta:A..HEAD`) and 20h52e (an honest `BASE..head`), both of which redden if a tip spelling
+#       stops being accepted.
 # M44 — THE IDENTITY CHAIN (sixteenth cycle, P1 tail). Deleting the identity skip classifies every
 #       peel as a narrowing, which is 2aba1583a again: 20h53's `<sha>^{commit}` — this repo's OWN
 #       rev-parse spelling — is REFUSED. The skipped vector is the ACCEPTANCE half, which is the
 #       direction this rule alone decides.
-MUT="$(mk_mutant nopeelidentity '      [[ "$_top" =~ ^((~0+|@\{0+\}|\^0+|\^\{[^}/]*\})+)$ ]] && continue' '      :')"
+MUT="$(mk_mutant nopeelidentity '      [[ "$_top" =~ ^((~0+|@\{0+\}|@\{now\}|\^0+|\^\{[^}/]*\})+)$ ]] && continue' '      :')"
 mut_check "M44 a peel/^0/@{0} chain is the IDENTITY, not a narrowing" 425266 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42526701" refused STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="The base was verified with git rev-parse ${DG_BASE}^{commit} before reading.
 reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found."
 # M45 — THE CHAIN, NOT ONE SELECTOR (sixteenth cycle, P1). Narrowing the selector group back to a
@@ -11050,7 +11051,7 @@ I only actually reviewed HEAD@{yesterday}..HEAD; the rest was not read."
 #       single-zero spelling makes `HEAD^00`/`HEAD~00`/`HEAD@{00}` — which git resolves to the SAME
 #       commit — read as narrowings, so 20h63's honest artifact is REFUSED with a sentence that is
 #       false about it. This is the false-block direction, which this file calls the worse one.
-MUT="$(mk_mutant singlezeroidentity '^((~0+|@\{0+\}|\^0+|\^\{[^}/]*\})+)$' '^((~0|@\{0\}|\^0|\^\{[^}/]*\})+)$')"
+MUT="$(mk_mutant singlezeroidentity '^((~0+|@\{0+\}|@\{now\}|\^0+|\^\{[^}/]*\})+)$' '^((~0|@\{0\}|@\{now\}|\^0|\^\{[^}/]*\})+)$')"
 mut_check "M51 a zero COUNT is a zero count: leading-zero identities are not narrowings" 425314 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42531501" refused STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="The base was re-checked with git rev-parse HEAD^00 before reading.
 reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found."
 # M52 — A BRACE GROUP ON A BARE `@` IS AN OPERAND (eighteenth cycle, P1). Dropping `@\{[^}]+\}|` from
@@ -11060,13 +11061,13 @@ reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found."
 MUT="$(mk_mutant bareatoperand '|[Hh][Ee][Aa][Dd]|@\{[^}]+\}|@)((~[0-9]*' '|[Hh][Ee][Aa][Dd]|@)((~[0-9]*')"
 mut_check "M52 a brace group on a BARE @ is an operand, not invisible" 425332 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42533301" accepted STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
 I only actually reviewed @{0}~1..HEAD; the rest was not read."
-# M53 — THE RESOLUTION IS THE AUTHORITY (eighteenth cycle, P2). Removing the resolve-and-compare skip
-#       makes the arm refuse on the SPELLING again, so 20h66's `HEAD@{now}` — a position git resolves
-#       to the very commit being attested — is REFUSED as "always NARROWER": a false sentence about an
-#       honest artifact, the class this file calls worse than the gap.
-MUT="$(mk_mutant noresolveidentity '        [ -n "$_tipchain" ] && [ "$_tipchain" = "$_tosha" ] && continue' '        :')"
-mut_check "M53 a chain that RESOLVES to the attested head is the identity, not a narrowing" 425328 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42532901" refused STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="The tip was re-checked with HEAD@{now} before reading.
-reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found."
+# M53 (THE RESOLUTION IS THE AUTHORITY) IS RETIRED WITH ITS ARM (nineteenth cycle). The arm it mutated
+#       — the resolve-and-compare skip — has been REMOVED: resolving a chain through the delta
+#       checkout answered in that checkout’s frame, which flipped the same artifact between "refused"
+#       and "signed clean" depending on where the clone sat. The grammar test above now states every
+#       identity this arm accepts (`~0+`, `^0+`, `^{<type>}`, `^{}`, `@{0+}`, `@{now}`), so there is no
+#       resolution to mutate. Its capability is pinned by 20h66 (`HEAD@{now}` accepted) and 20h66b
+#       (`@{0}` accepted), which redden if a tip-resolving position starts being refused.
 # M54 — THE EMPTY-RANGE ARM'S BRACE OPERAND (nineteenth cycle, P2). The bare-`@` operand landed in BOTH
 #       arms, but only the TIP arm's occurrence was pinned; deleting just this one still lets
 #       `@{0}~0..HEAD` through, because the regex can no longer reach the brace at all. 20h68 is the
