@@ -8,8 +8,9 @@
 ## Confirmed problem
 
 The issue's headline ("the gate adopts ANOTHER worktree's root as the git-op root") is **no longer
-true**, and that is provable from this tree: PR #1780 (merged to `main` 2026-10-15, merge commit
-`26ad39a33`, which IS in this head's history — `compare/26ad39a33...main` reports `behind_by: 0`)
+true**, and that is provable from this tree: PR #1780 (squashed onto `main` 2026-10-15 as `26ad39a33` —
+SINGLE parent, so not a merge commit, which matters if you re-check it by hand; it IS in this head's
+history — `compare/26ad39a33...main` reports `behind_by: 0`)
 removed that claim from the log, `recoveryOnlyRoot` is **inspection-only** — its return never becomes a
 git-op root — the `tool_call` handler's git-op path is
 `const cwd = resolveGitRoot(cdPath ?? inputCwd)`, and `recoveryOnlyRoot` (which wraps `pickVerifiedRoot`)

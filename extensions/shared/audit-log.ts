@@ -82,8 +82,11 @@ export const GATE_EVENT_NAMES = [
   //                          parent must act (#285 P1-A) — "until it self-verifies" is unreachable for it.
   "gate_recovery_foreign_root", // verification-gate #1265: a same-repo sibling's entries were merged for
   //                               INSPECTION only. They carry the sibling's root, so they are inert for
-  //                               this session's git ops (index.ts's root filter) — the record exists so the
-  //                               non-adoption is durable and parent-readable, not only a child's stdout line
+  //                               git ops rooted at the SESSION'S OWN root (`index.ts`'s root filter) — a
+  //                               later op that `cd`s into the sibling resolves to the SIBLING's root,
+  //                               where those same entries are LIVE (that is the `gate_recovery` shape
+  //                               above, not this one). The record exists so the non-adoption is durable and
+  //                               parent-readable, not only a child's stdout line
   "gate_root_mismatch", // verification-gate #3255/#1265: a git op resolved to a root the bridge holds no
   //                        entries for while a same-repo sibling has them — hashes cannot be compared. The
   //                        block decision is unchanged; this is the durable half of the diagnosis (AC (b))
