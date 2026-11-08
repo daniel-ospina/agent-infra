@@ -598,6 +598,47 @@ When you encounter a **pre-existing bug** (not introduced by your current work),
   amend **before** pushing; if it is already pushed, post a correction note instead of silently
   force-pushing. Worked example: `skills/commit-workflow/workflow/02-commit-pr.md`.
 
+## ⛔ HARD RULE: Durable Paths — never park work under `/tmp`
+
+**`/tmp` is swept, and the sweep is silent.** macOS periodically clears `/tmp`/`/private/tmp`; a Linux
+cell clears it on reboot and its own reapers walk it. The rule is therefore **durable vs volatile**, not
+one literal path: `$TMPDIR` is a *different* directory (`/var/folders/…` on macOS) with its own cleanup
+policy (idle-based, days) — fine for a message file that lives seconds, **not** durable for a worktree or
+a plan.
+
+- **Worktrees go inside the repo**: `<repo>/.worktrees/<type>/<name>` (gitignored, survives what the OS
+does to `/tmp`). Never `/tmp/wt-*`, `/private/tmp/wt-*` or `$TMPDIR/wt-*`. Measured twice in one session
+(2026-10-12→13): `/tmp/wt-agent-infra` and `/tmp/wt-7860` vanished under live lanes, and the dispatch then
+failed `ENOENT (spawn cwd: …)` — a lost *directory* reported as a spawn bug (#1698).
+- **Durable artifacts** — the plan, the problem statement, review findings, a note you will still need —
+belong in `~/.pi/agent/state/`, the repo, or **the issue itself**. A `/tmp/*.md` is not recoverable from
+git because it was never committed; that is the same reasoning the commit-message rule above already
+applies to its own temp file.
+- **Ephemeral scratch is fine, and only that.** A self-removing scratch checkout (agent-infra:
+`scripts/scratch-worktree.sh run`, root `$SCRATCH_WORKTREE_ROOT`, **default `/tmp`**) is for a throwaway
+command — never the home of work you would have to recover.
+- **A `cwd` in a spawn failure is about the DIRECTORY, not the install.** `task()` names it (#1698):
+`⛔ THE SPAWN CWD DOES NOT EXIST … this is NOT a missing pi install`. Check the directory first.
+
+### A dead worktree record: `prune` handles it — unless the record is LOCKED
+
+Measured (git 2.43.0, 2026-11-08, one throwaway repo / three records): after `rm -rf` of a worktree
+directory, `git worktree list` marks the record `prunable` and a plain `git worktree prune` **removes it
+immediately** (`-v`: `gitdir file points to non-existent location`; plain prune expires *now*, not in
+three months). Two documented ways it then survives:
+
+| why it survived | measurement |
+|---|---|
+| **`git worktree lock`** | prune skips it **silently** — rc 0, no warning — and `git worktree remove --force` refuses (`cannot remove a locked working tree`). This is the one silent skip. |
+| `git gc` instead of prune | a freshly-dead record is **still listed** after `git gc` — it honours `gc.worktreePruneExpire`, default **3 months** |
+
+Remedy, and only with **your own** path: `git worktree unlock <path> && git worktree prune`, or
+`git worktree remove -f -f <path>`.
+⛔ **Never run a bare `git worktree prune` as housekeeping.** It has no path filter and deregisters EVERY
+record whose directory is momentarily unstat-able — an unmounted volume, a permission blip — destroying an
+unrelated checkout whose files are still on disk (#1141). Remove your own record:
+`git worktree remove --force <your path>`.
+
 ## Search
 
 A recursive search is the fleet's most expensive habit. An ignore-blind walk started at a repo root
