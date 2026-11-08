@@ -338,11 +338,13 @@ delete_branch_cas() {
     return 0
 }
 
-# reap_record <branch> <dir> <dispatch> <is_registered_worktree> <forced>
+# reap_record <branch> <dir> <dispatch> <is_registered_worktree> <forced> <reg_claims>
 # Prints one `     …` outcome line per decision. Returns 0 only when the record may be PRUNED, i.e.
 # the directory is provably gone AND the branch ref is gone; 1 when anything was kept (#1393 G4).
+# <reg_claims> is true|false|unknown — `unknown` means the worktree list could not be READ, which is
+# a different cause from "no registration claims it" and must not be reported as one (round-11 F1).
 reap_record() {
-    local br="$1" dir="$2" dispatch="$3" is_wt="$4" forced="$5" oid st dcas=0
+    local br="$1" dir="$2" dispatch="$3" is_wt="$4" forced="$5" reg_claims="${6:-false}" oid st dcas=0
 
     oid="$(branch_tip "$br")" || oid=""
 
@@ -369,6 +371,10 @@ reap_record() {
                 return 1 ;;
             *)
                 if [ "$is_wt" != true ]; then
+                    if [ "$reg_claims" = unknown ]; then
+                        printf '%b' "     ⚠️ KEPT tree+ref+record: '${dir}' is '${st}', but the worktree list could not be read — so whether git vouches for it as a worktree of this repo cannot be established, and nothing was removed. This is a READ failure, not a poisoned record: fix 'git worktree list' and re-run rather than clearing the record.\n"
+                        return 1
+                    fi
                     printf '%b' "     ⚠️ KEPT tree+ref+record: '${dir}' exists but git does not vouch for it as a worktree of this repo, so its contents cannot be reaped safely and this branch may be the only ref to them. Inspect it, then clear the record by hand (record-worktree.sh done --dispatch '${dispatch}').\n"
                     return 1
                 fi
@@ -516,7 +522,15 @@ if [ -f "$RECORD_FILE" ]; then
                 unmeasurable)
                     DIRTY_OUT="${DIRTY_OUT}  ⚠️  ORPHANED BUT DIRTY: branch=$BRANCH dir=$DIR — state UNMEASURABLE, not a readable checkout, so uncommitted work there cannot be ruled out\n" ;;
                 clean)
-                    DIRTY_OUT="${DIRTY_OUT}  ⚠️  ORPHANED BUT DIRTY: branch=$BRANCH dir=$DIR — clean, but git does not vouch for it as a worktree of this repo, so its contents cannot be reaped safely\n" ;;
+                    if [ "$REG_CLAIMS" = unknown ]; then
+                        # ⛔ A FAILED LIST READ IS NOT "git does not vouch for it" (round-11 F1). The
+                        # cause is the unreadable listing, not a non-registration, and the two have
+                        # different remedies — naming the wrong one told the operator to retire the
+                        # trail of a tree git DOES vouch for.
+                        DIRTY_OUT="${DIRTY_OUT}  ⚠️  ORPHANED BUT DIRTY: branch=$BRANCH dir=$DIR — clean, but the worktree list could not be read, so whether git vouches for it as a worktree of this repo cannot be established\n"
+                    else
+                        DIRTY_OUT="${DIRTY_OUT}  ⚠️  ORPHANED BUT DIRTY: branch=$BRANCH dir=$DIR — clean, but git does not vouch for it as a worktree of this repo, so its contents cannot be reaped safely\n"
+                    fi ;;
                 absent)
                     if [ "$REG_CLAIMS" = unknown ]; then
                         DIRTY_OUT="${DIRTY_OUT}  ⚠️  ORPHANED BUT DIRTY: branch=$BRANCH dir=$DIR — state ABSENT, but the worktree list could not be read, so whether a registration still claims this branch cannot be established. --apply refuses it\n"
@@ -528,7 +542,7 @@ if [ -f "$RECORD_FILE" ]; then
             esac
             if [ "$APPLY" = true ]; then
                 if [ "$FORCE_DIRTY" = true ]; then
-                    if reap_record "$BRANCH" "$DIR" "$DISPATCH" "$IS_WT" true; then :; else KEPT=$((KEPT + 1)); fi
+                    if reap_record "$BRANCH" "$DIR" "$DISPATCH" "$IS_WT" true "$REG_CLAIMS"; then :; else KEPT=$((KEPT + 1)); fi
                 else
                     # --apply was asked to remove it and refused (no --force-dirty): that is a KEEP,
                     # and a sweep that kept things must not read as a clean sweep (#1393).
@@ -539,7 +553,7 @@ if [ -f "$RECORD_FILE" ]; then
             ORPHANS=$((ORPHANS + 1))
             ORPHAN_OUT="${ORPHAN_OUT}  🧹 ORPHANED (safe to remove): branch=$BRANCH dir=$DIR dispatch=$DISPATCH\n"
             if [ "$APPLY" = true ]; then
-                if reap_record "$BRANCH" "$DIR" "$DISPATCH" "$IS_WT" false; then :; else KEPT=$((KEPT + 1)); fi
+                if reap_record "$BRANCH" "$DIR" "$DISPATCH" "$IS_WT" false "$REG_CLAIMS"; then :; else KEPT=$((KEPT + 1)); fi
             fi
         fi
     done < "$RECORD_FILE"

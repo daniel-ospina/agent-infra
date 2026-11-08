@@ -442,7 +442,10 @@ assert_eq "$(wc -l < "$WORKTREES_RECORD" | tr -d ' ')" "1" "the record is kept w
 OUT="$(PATH="$FIX/shim:$PATH" GIT_WRAP_REAL="$REAL_GIT" GIT_WRAP_REPO="$REPO" $SCAN --apply --force-dirty 2>&1 || true)"
 git show-ref --verify --quiet refs/heads/fix/tlist-1 && ok "the CAS itself refuses when the worktree list is unreadable" || bad "the CAS deleted a ref it could not prove was not checked out (live lane left unborn)"
 assert_contains "$OUT" "not checked out anywhere" "the CAS names ITS OWN reason, not the classifier's"
-( cd "$FIX/wt-live" && git status --porcelain >/dev/null 2>&1 ) && ok "the live lane holding that branch is not left unborn" || bad "the live lane was left on an unborn branch"
+# ⛔ `git status` SUCCEEDS in a worktree whose branch ref was deleted (measured: rc=0, "No commits
+# yet on <b>"), so the old body could not redden under the very mutation this block exists for
+# (round-11 F3). `rev-parse --verify HEAD` is the resolvability test: rc=1 exactly when unborn.
+( cd "$FIX/wt-live" && git rev-parse --verify --quiet HEAD >/dev/null ) && ok "the live lane holding that branch is not left unborn" || bad "the live lane was left on an unborn branch"
 assert_eq "$(wc -l < "$WORKTREES_RECORD" | tr -d ' ')" "1" "the record survives the CAS refusal"
 $RW done --dispatch d-tlist >/dev/null
 git worktree remove --force "$FIX/wt-live" >/dev/null 2>&1 || true
@@ -607,6 +610,32 @@ assert_not_contains "$OUT" "ORPHANED (safe to remove)" "an UNREADABLE worktree l
 assert_contains "$OUT" "worktree list could not be read" "the DRY run names the failed read as the reason"
 git worktree remove --force "$FIX/wt-unread" >/dev/null 2>&1 || true
 git branch -D fix/unread-1 >/dev/null 2>&1 || true
+
+# ── 2ac. round-11 F1: a FAILED `git worktree list` READ must not be reported as "git does not vouch
+#     for it". The tree here is registered and clean — only the listing failed. Naming the wrong cause
+#     tells the operator to retire the trail of a tree git DOES vouch for, and hides the real fault.
+cat > "$FIX/shim/git" <<'EOS'
+#!/usr/bin/env bash
+case " $* " in
+  *" worktree list "*) exit 1 ;;
+esac
+exec "$GIT_WRAP_REAL" "$@"
+EOS
+chmod +x "$FIX/shim/git"
+git worktree add -q "$FIX/wt-reg" -b fix/reg-1
+$RW add --branch fix/reg-1 --worktree "$FIX/wt-reg" --dispatch d-reg --ts 2026-08-01T00:00:00Z >/dev/null
+OUT="$(PATH="$FIX/shim:$PATH" GIT_WRAP_REAL="$REAL_GIT" $SCAN 2>&1 || true)"
+assert_not_contains "$OUT" "does not vouch for it" "a failed list read is not reported as a non-registration"
+assert_contains "$OUT" "worktree list could not be read" "the DRY run names the READ failure as the cause"
+OUT="$(PATH="$FIX/shim:$PATH" GIT_WRAP_REAL="$REAL_GIT" $SCAN --apply --force-dirty 2>&1 || true)"
+assert_not_contains "$OUT" "clear the record by hand" "the wrong remedy (retire the trail) is withheld for a read failure"
+assert_contains "$OUT" "fix 'git worktree list'" "the refusal names the actual fault and the action"
+git show-ref --verify --quiet refs/heads/fix/reg-1 && ok "a registered clean worktree keeps its ref when the list read fails" || bad "the ref was deleted"
+( cd "$FIX/wt-reg" && git rev-parse --verify --quiet HEAD >/dev/null ) && ok "the lane stays resolvable" || bad "the lane was left unborn"
+assert_eq "$(wc -l < "$WORKTREES_RECORD" | tr -d ' ')" "1" "the record is kept"
+$RW done --dispatch d-reg >/dev/null
+git worktree remove --force "$FIX/wt-reg" >/dev/null 2>&1 || true
+git branch -D fix/reg-1 >/dev/null 2>&1 || true
 
 # ── Summary ───────────────────────────────────────────────────────────────
 echo ""
