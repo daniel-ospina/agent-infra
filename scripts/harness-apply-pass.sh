@@ -161,7 +161,7 @@ set -uo pipefail
 # defeat `$REPO` resolution and any EXACT comparison against it). ⛔ THIS SITE **IS** PINNED — `T27` —
 # and the earlier note that it could not be was wrong about WHERE to look. The `case "$HERE"` farm-shape
 # refusals below are SUFFIX matches, so they cannot discriminate a doubled value; the observable that
-# does is the `deployed_drift=not-run` line (`:720`), which QUOTES `$HERE` — a two-line value pushes a
+# does is the `deployed_drift=not-run` line (`:856`), which QUOTES `$HERE` — a two-line value pushes a
 # newline into the text that must follow it on the same line. So T27 invokes this file by a RELATIVE
 # path from a cwd carrying `CDPATH` (the pair that makes `cd <dirname>` print) and asserts the boundary
 # after the quoted path: removing this `CDPATH=` reds that row and nothing else. Note the directory must
@@ -491,9 +491,9 @@ publish_farm_rows() {   # $1 body, $2 header note → sets REC_FARM_ROWS, FARM_R
     # `[ -f ]` is DEFENCE IN DEPTH for the concurrent case and is stated as such (#3442).
     # ⛔ AND IT IS UNPINNED BY CONSTRUCTION — one of this file's DECLARED inert-defence sites. The
     # others, each measured to leave the suite green when deleted (review rounds 25 and 30):
-    #   * the `CDPATH=` on the `$FARM_DEST_REAL`/`$HERE_REAL` legs (`:167-171`),
-    #   * `[ -n "$HERE_REAL" ] &&` in the self-grade comparison (`:1490`),
-    #   * `[ -n "$FARM_DEST_REAL" ] &&` in the inside-the-farm containment test (`:1496`) — searched
+    #   * the `CDPATH=` on the `$FARM_DEST_REAL`/`$HERE_REAL` legs (`:1516`, `:1525`),
+    #   * `[ -n "$HERE_REAL" ] &&` in the self-grade comparison (`:1526`),
+    #   * `[ -n "$FARM_DEST_REAL" ] &&` in the inside-the-farm containment test (`:1532`) — searched
     #     for by the round-30 reviewer precisely because this list did not name it.
     # Measured (review round 25): deleting `&& [ -f "$FARM_ROWS_FILE" ]` leaves the suite green. That is not an oversight — the only
     # state it can catch is a race (something replacing the published path with a directory between the
@@ -824,7 +824,7 @@ read_deployed_drift() {
         # executing harness, which is exactly the silent green this change exists to end.
         # `$O` is where the checker IS deployed, so it is the candidate that works in production.
         # ⛔ AND THE GOVERNED CHECKOUT IS A CANDIDATE (review P2, #10114). `$AGENT_INFRA_PATH` is DEAD
-        # under the scheduler — this file says so itself (:188: "under the scheduler — where there is no
+        # under the scheduler — this file says so itself (:225: "under the scheduler — where there is no
         # AGENT_INFRA_PATH and the farmed copy has no checkout beside it") — and `pi-bootstrap`'s
         # `fleet_srcs` farms THIS PASS WITHOUT the checker, so on a box whose `$O` carries no checker
         # candidates 1-4 all miss while the checker sits in `$REPO`, which the unit DOES export
@@ -973,7 +973,7 @@ case "$FETCH_STATE" in
     *) REC_ACTION=cannot-verify-fetch
        # Its `detail=` is ~250+ chars once the readings suffix is appended, so the 240-byte bound drops the
        # tail; `remedy=` is a FIELD so the REMEDY survives regardless (review round 3, finding 5).
-       # (`action=` is written on its own line at :278-279 and never depended on this — what the prose
+       # (`action=` is written on its own line at :383 and never depended on this — what the prose
        # bound was eating is the sentence a reader has to act on.)
        REC_REMEDY="restore the fetch (check the remote and egress), then re-run"
        finish 0 23 "REFUSED cannot-verify: no fresh fetch was made (fetch=$FETCH_STATE) in $REPO, so 'current' would mean 'current against the ref as of the LAST successful fetch' — the comparison this pass exists to make is not fresh. Nothing was touched." ;;
@@ -1538,7 +1538,7 @@ if [ "$FARM_CHECK_ON" = "1" ]; then
         FARM_RC=$?
         # The checker's own per-file vocabulary, matched on the FINAL column, and ONLY the four it
         # actually prints as a verdict. `MISSING` and `LOCAL (undeclared)` are not tokens it emits;
-        # `SYMLINK` IS printed (`check-farm-drift.sh:485`, "SYMLINK (graded via its target)") but that
+        # `SYMLINK` IS printed (`check-farm-drift.sh:486`, "SYMLINK (graded via its target)") but that
         # row is INFORMATIONAL — a healthy link — so matching the bare token would name a good file as
         # drift the moment the anchor is relaxed (#10114 review round 2).
         # (A `FARM_NAMED` short list was computed here and never read — the row extraction below owns
@@ -1627,50 +1627,38 @@ if [ "$FARM_CHECK_ON" = "1" ]; then
         # two-field row entirely, and a token with a digit or an underscore (`drift_v2`, `NOT-LANDED2`) fell
         # outside the alphabetic class, so a report this pass could not read still certified a match with
         # every name durable nowhere — the exact class round 32 closed one shape over). Two fields is the
-        # minimum that can carry a verdict token, and the token class admits word characters. A token that
-        # is not even shaped like a verdict because it does not START with a letter (a timing `3.2s`, a
-        # timestamp `12:04:33`) is left alone. ⛔ WHAT THE CLASS DOES NOT DO, stated rather than implied: once
-        # `.`/`:`/`!` were admitted (they are what a drifted vocabulary looks like — `drift.v2`, `drift:2`,
-        # `DRIFTED!`), a SENTENCE-final token on a row-shaped line (`phase | done.`) is in the class too and
-        # is refused. That is the fail-closed direction and it is not fixable by punctuation: `done.` and
-        # `DRIFTED!` are the same bytes, and refusing the first is the price of not certifying the second.
-        # ⛔ AND ONLY A ROW IS A ROW (review round 34, measured: with `NF >= 2` alone, ANY two-field line
-        # whose last field was word-shaped refused a PROVEN match — a healthy instrument's output plus a
-        # wrapper's `harness-apply: checking farm | starting` phase line went from rc 0 to rc 24 with the
-        # remedy blaming the checker's vocabulary, and the operator was sent to fix the one thing that was
-        # not broken). A per-file row is a path at COLUMN 1 with no `PROG: text` prefix; a phase or prose
-        # line is indented or carries that prefix, and is skipped before the token test.
-        # ⛔ AND THE PREFIX TEST IS NARROWED BY THE `/` (review round 35, measured: `$1 ~ /: /` alone is not
-        # a prefix test at all — field 1 of a REAL row is the PATH, so a drifted file whose path carries a
-        # colon-space (`docs/review: notes.md | a | b | drift`) was SKIPPED as chatter and certified `farm:
-        # ok` / `farm_rows=none` / `farm_n=0` with the name durable nowhere — a fail-open invented by the
-        # over-block fix). A `PROG: text` prefix is a program name, which carries no `/`; a repo-relative
-        # path at column 1 does. Residual, declared rather than implied: a colon-space inside a field-1
-        # path that carries no `/` at all is still read as a prefix, and is skipped.
+        # minimum that can carry a verdict token; a row with a trailing separator (`docs/y.md | a | b |`)
+        # splits to `NF=4` with an EMPTY last field, which is an unreadable row and not a non-row (round 35:
+        # the empty token matched no clause and the row was silently dropped while the record certified a
+        # match — the instrument never emits a trailing separator, so nothing legitimate is caught here).
+        # ⛔ AND A ROW IS A PATH, NOT A PHASE LINE, AND ITS VERDICT VOCABULARY IS CLOSED (review rounds
+        # 34-35, measured). The instrument RIGHT-PADS field 1 (printf with a 46-column width), so trailing
+        # spaces are trimmed FIRST — an anchored shape test over the raw field rejected every genuine row
+        # and the scan fell open. A row is then a first field with no whitespace, OR one carrying a `/`: a
+        # wrapper tag or phase line has spaces and no slash (`harness-apply: checking farm`,
+        # `12:00:03 harness-apply checking farm`, `[harness-apply] phase two`) and is skipped, while a
+        # repo-relative path is a row EVEN when its own name carries a colon-space (`docs/review: notes.md`)
+        # — round 34's prefix test skipped that row and certified a match with the name durable nowhere.
+        # Residual, declared rather than implied: a field-1 path carrying a SPACE and no `/` at all is still
+        # read as chatter.
+        # The token test is a CLOSED, case-sensitive allow-list of the instrument's OWN vocabulary, not a
+        # shape: as a block-list, `N/A`, `DRIFT/2`, `drift+1`, `x=y`, `#2` and `2-drift` all escaped it and
+        # certified `farm: ok` / `farm_rows=none` / `farm_n=0` with the drifting name durable nowhere. A new
+        # class now needs a deliberate edit here rather than another character-class patch.
+        # NOTE: no apostrophes in these comments — the awk program is single-quoted, and one closes it.
         [ -n "$FARM_UNC0" ] || FARM_UNC0="$(printf '%s\n' "$FARM_OUT" | awk -F'|' '
             NF >= 2 {
-                if ($1 ~ /^[[:space:]]/) next
-                if ($1 ~ /: / && $1 !~ /\//) next
+                f1 = $1
+                gsub(/[[:space:]]+$/, "", f1)
+                if (f1 ~ /[[:space:]]/ && f1 !~ /\//) next
                 v = $NF
                 gsub(/^[[:space:]]+|[[:space:]]+$/, "", v)
-                # ⛔ AN EMPTY VERDICT FIELD IS AN UNREADABLE ROW, NOT A NON-ROW (review round 35, measured:
-                # a report row with a trailing separator (`docs/y.md | a | b |`) splits to `NF=4` with
-                # `$NF=""`; the empty token matched no clause, nothing was printed, and the row was
-                # silently dropped while the record certified `farm: ok` / `farm_n=0` with no artifact.)
-                # The instrument never emits a trailing separator, so nothing legitimate is caught here.
                 if (v == "") { print "(an empty verdict field)"; exit }
                 if (v == "verdict" || v == "ok") next
                 if (v == "LOCAL (declared)" || v == "SYMLINK (graded via its target)") next
-                if (v ~ /^(STALE|UNSOURCED|NOT-EXECUTABLE|DECLARED-BUT-ABSENT)$/) next
-                # ⛔ THE PARENTHESISED BENIGN TOKENS MUST REACH THE ALLOW-LIST, NOT SLIP PAST IT
-                # (VGATE round 32, measured: the class matched only letters, spaces and dashes, so
-                # `LOCAL (declared)` and `SYMLINK (graded via its target)` fell through WITHOUT the
-                # skip — the allow-list entries for them could be deleted with the suite green. The
-                # regex now admits their shape, so the entries are what spares them.)
-                # `drift.v2`, `drift:2` and `DRIFTED!` are the same class as `drift_v2` — a vocabulary
-                # that drifted by a suffix (review round 34, measured: the class excluded `.`/`:`/`!`,
-                # so those tokens certified a match with both names durable nowhere).
-                if (v ~ /^[A-Za-z][A-Za-z0-9_.:! ()-]*$/) { print v; exit }
+                if (v == "STALE" || v == "UNSOURCED") next
+                if (v == "NOT-EXECUTABLE" || v == "DECLARED-BUT-ABSENT") next
+                print v; exit
             }')"
 
         # ⛔ AND A SILENT rc=0 IS NOT A MATCH (review round 24). The instrument always prints a summary,

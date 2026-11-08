@@ -266,23 +266,25 @@ each named in the journal as an unclassifiable summary or row
 (with a `remedy=` pointing at the checker's vocabulary, not at the farm): a pipe-free line carrying two
 of the three label words with no parsable total, and a per-file row whose trailing token is neither benign
 (`verdict`, `ok`, `LOCAL (declared)`, `SYMLINK (graded via its target)`) nor a class this pass knows —
-scanned on any **row** of two or more fields and for any **verdict-shaped token** (`[A-Za-z][A-Za-z0-9_.:! ()-]*`),
-because a vocabulary that drifts by a suffix (`drift_v2`, `drift.v2`, `drift:2`, `DRIFTED!`) or a report
-that prints two-field rows is exactly the class this check exists for. A row is *a path at column 1 with
-no `PROG: text` prefix*: an indented line, and a line whose first field carries a `PROG: ` prefix (a
-program name — it carries no `/` anywhere in field 1, unlike a repo-relative path), are prose or wrapper
-chatter, not rows, and are skipped — otherwise a `tee` wrapper's own progress line would refuse a proven
-match. The skip is a *skip*, not a stop: a real row further down the report is still scanned. Three
-boundaries are declared rather than implied, because the same bytes are read differently either side of
-them: (i) a colon-space inside a field-1 path that carries **no** `/` at all is read as a `PROG: ` prefix
-and skipped; (ii) a **sentence-final** token on a row-shaped line (`phase | done.`) is inside the class
-and is refused — `done.` and `DRIFTED!` are the same bytes, so refusing the first is the price of never
-certifying the second, which is the fail-closed direction; (iii) a **path-qualified** program prefix
-(`/usr/local/bin/harness-apply: checking farm | starting`) is NOT skipped, because field-1 shape alone
-cannot separate it from a path carrying a colon-space — it is refused, which is also what the check did
-before the skip existed, so it is the fail-closed price of closing (i). An empty verdict field is an unreadable row,
-not a non-row: a row printed with a trailing separator (`path | a | b |`) splits to zero fields after the
-last divider and is refused instead of dropped. One
+scanned on any **row** of two or more fields, because a vocabulary that drifts by a suffix (`drift_v2`,
+`drift.v2`, `drift:2`, `DRIFTED!`) or a report that prints two-field rows is exactly the class this check
+exists for. A row is *a first field that is a path*: the instrument right-pads that field, so
+the padding is trimmed first, and a phase line or wrapper tag — `harness-apply: checking farm`,
+`12:00:03 harness-apply checking farm`, `[harness-apply] phase two` — has whitespace in it and no `/`, so
+it is skipped rather than read as a row; a repo-relative path is a row even when its own name carries a
+colon-space (`docs/review: notes.md`), which the earlier prefix test skipped. The skip is a *skip*, not a
+stop: a real row further down the report is still scanned. Three boundaries are declared rather than
+implied, because the same bytes are read differently either side of them: (i) a field-1 path carrying a
+**space and no `/` at all** is read as chatter and skipped; (ii) a **sentence-final** token on a row-shaped
+line (`phase | done.`) is refused — `done.` and `DRIFTED!` are the same bytes, so refusing the first is
+the price of never certifying the second, which is the fail-closed direction; (iii) a **path-qualified**
+program prefix (`/usr/local/bin/harness-apply: checking farm | starting`) carries a `/`, so it is NOT
+skipped — it is refused, which is also what the check did before the skip existed, so it is the
+fail-closed price of closing (i). An empty verdict field is an unreadable row, not a non-row: a row printed
+with a trailing separator (`path | a | b |`) splits to an empty last field and is refused instead of
+dropped. The token vocabulary is **closed**, not blocked: anything outside the instrument's own eight
+tokens (a drifted class such as `NOT-LANDED2`, a shape such as `N/A`, `DRIFT/2`, `2-drift`, or a lowercase
+`stale`) is a report this pass cannot classify, so it is refused rather than certified. One
 label word in prose is NOT a summary — a healthy copy that mentions a `stale` entry while matching still
 records a proven match. A checker that exits 0 printing **nothing** is refused too — the instrument
 prints a summary on every graded run, so a silent exit produced no evidence and is not a match. One
@@ -296,8 +298,8 @@ missing, where `tee` supplies the 0 and the only output is bash's error line —
 `farm: ok`. Without that, `farm_rows=none` / `farm_n=0` would certify a farm that was never graded and
 `--print-status` would answer `status=ok` for it. A wrapper over a genuinely matching farm still passes
 (it prints the instrument's verdict), and prose/summary lines are never read as rows — the class token
-must END the line, the line must reach the row scan at all (a column-1 path, no `PROG: ` prefix), and a
-verdict-shaped token that is neither benign nor a known class is the thing the scan reports. The verdict probes are anchored on the instrument's LINE shape rather than on the bare token, because a
+must END the line, the line must reach the row scan at all (a first field with no whitespace in it, or one
+carrying a `/`), and a trailing token outside the instrument's closed vocabulary is what the scan reports. The verdict probes are anchored on the instrument's LINE shape rather than on the bare token, because a
 per-file ROW can carry either word — measured both ways: an unanchored `OK — ` certified a match over a
 report whose only "OK" was a filename, and an unanchored `DRIFT — ` refused a genuine match whose output
 merely mentioned the word. The anchor is **no pipe anywhere on the line** (`^[^|]*: OK — [^|]*$`), not
@@ -532,7 +534,7 @@ checkout can use the documented hatch. The same interaction is recorded for
 
 ## Tests
 
-`scripts/harness-apply-timer.test.sh` — 612 assertions, run by the
+`scripts/harness-apply-timer.test.sh` — 635 assertions, run by the
 `harness-apply-timer` shard of `run-bash-shards.sh`:
 
 | | |
