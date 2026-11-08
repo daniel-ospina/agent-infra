@@ -57,16 +57,22 @@ export const GATE_EVENT_NAMES = [
   "review_spawn_no_verdict", // #2665: a reviewer spawn returned no verdict (attempt, NOT a dispatch)
   "gate_recovery", // verification-gate: N verified entries were merged for `root` — the root the
   //                   record NAMES, which is the discriminator (not the call site — THREE CALL
-  //                   SITES reach the ONE emit site, `index.ts` recoverBridgeForRoot). When
-  //                   `root` is NOT the caller's own root the merge is
-  //                   INSPECTION-ONLY: it is paired with `gate_recovery_foreign_root` and the
-  //                   entries are inert for git ops rooted elsewhere. When `root` IS the caller's
-  //                   own root the merge is LIVE — it is the state that gates the op.
+  //                   SITES reach the ONE emit site, `index.ts` recoverBridgeForRoot). AT
+  //                   `session_start`, when `root` is NOT the session's own root the merge is
+  //                   INSPECTION-ONLY and it IS paired with `gate_recovery_foreign_root`; the
+  //                   entries are inert for git ops rooted elsewhere. When `root` IS the own root
+  //                   there, the merge is LIVE — it is the state that gates the op.
   //                   `session_start` has two call sites, own-root (LIVE) and inspected sibling
   //                   (INSPECTION-ONLY), and at most ONE of them emits: a sibling is only
   //                   inspected when the own root has no entries (`pickVerifiedRoot` returns null
-  //                   otherwise). The git-op path emits only the LIVE shape — it recovers for the
-  //                   op's own resolved cwd. So read `root`, never the count alone (#1265).
+  //                   otherwise).
+  //                   The git-op path is a THIRD call site and it emits only the LIVE shape, for
+  //                   the op's own resolved cwd — and it is NEVER paired with
+  //                   `gate_recovery_foreign_root`, because a hub session running
+  //                   `cd <linked-worktree> && git commit` legitimately recovers the worktree's
+  //                   entries with `root` != the session's root. So a session-keyed reader must
+  //                   NOT infer "inspection only" from `root` != its own root alone: inspection is
+  //                   the shape that emits BOTH rows. Read `root`, never the count alone (#1265).
   "gate_recovery_empty", // verification-gate #264/#1265: a task child recovered ZERO entries for its own
   //                          root — every changed-file commit will block until it self-verifies
   "gate_recovery_foreign_root", // verification-gate #1265: a same-repo sibling's entries were merged for

@@ -523,10 +523,13 @@ function diagnoseRootMismatch(root: string): void {
       `and an adopted clean tree yields an EMPTY scope that would ALLOW an op carrying unverified content.`,
   );
   // #1265 review: SORT the sibling list. `bridgeRoots()` derives its order from
-  // `readBridge().verified_files`, which `writeBridge` re-snapshots from
-  // `verifiedSet` insertion order — so two sibling roots could swap places after
-  // an unrelated PASS and re-fire this record for an unchanged (root, siblings)
-  // set. The fingerprint is on a SET, so it must not depend on array order.
+  // `readBridge().verified_files`, and `writeBridge` publishes the SURVIVORS in file
+  // order and then applies the writer's own keys — `merged.set(...)` keeps an
+  // existing key's POSITION, so the order only moves when an entry is dropped and
+  // later re-added: the writer prunes entries whose root is dead or whose file is
+  // gone at write time (`writeBridge`'s prune), so a sibling root that is pruned and
+  // then re-verified lands at the END of that array while the (root, siblings) SET is
+  // unchanged. The fingerprint is on a SET, so it must not depend on array order.
   const fingerprint = `${norm}|${[...siblings].sort().join(",")}`;
   if (recordedRootMismatches.has(fingerprint)) return;
   recordedRootMismatches.add(fingerprint);
@@ -4577,10 +4580,11 @@ export default function (pi: ExtensionAPI) {
     // #190: mid-session bridge recovery FIRST — defense-in-depth for the
     // incident's event-miss class (a merge that landed via another path, e.g.
     // a sub-agent's own tool_result handler, becomes visible at the next git
-    // op). Must run BEFORE the pendingRehash writeBridge snapshot: the rehash
-    // overwrites the bridge with the parent registry, which would destroy a
-    // sub-agent's freshly-written mid-session entry before recovery could
-    // merge it (review #214 ordering bug).
+    // op). Must run BEFORE the pendingRehash bridge write: that write's OWNER keys
+    // win in `writeBridge`'s merge (#1225), so a write built from the parent
+    // registry alone would replace a same-key entry the sub-agent had just written.
+    // Recovering first merges the sub-agent's entry into the in-memory registry, so
+    // the subsequent write carries it (review #214 ordering bug).
     recoverBridgeForRoot(normalizeWorktreeRoot(cwd));
 
     // #190: narrowed to the allowed commit's files (pendingRehashFiles) — only
