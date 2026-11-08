@@ -233,6 +233,10 @@ env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
 # a `start` that provisions the recorder and then `die`s (a failing `cmd_check` after the seed, a failing
 # `start_doctor_loop`) passes every arm here — a regression this suite exists to catch, hiding behind a
 # comment about a timeout that cannot happen.
+# ⛔ The BINDING is asserted too (#3774 review, P2-2): every capture is preceded by `unset start_rc`, so under
+# `set -u` a dropped `start_rc="$rc"` ABORTS instead of letting that arm's assertion grade the PREVIOUS arm's
+# `0`. Measured before the pin: deleting one arm's assignment left a `start` that dies only on the second
+# call green, with no failure anywhere.
 cp "$HERE"/*.sh "$CELL_O/"
 mkstubs "$CELL_STUBS"
 RECORDER="$CELL_HOME/.pi/agent/scripts/record-review.sh"
@@ -366,6 +370,8 @@ done
 printf '#!/bin/bash\nexit 0\n' > "$CELL/record-review.sh"; chmod +x "$CELL/record-review.sh"
 mkdir -p "$CELL/lib"; printf '#!/usr/bin/env python3\n' > "$CELL/lib/diff-normalize.py"
 rm -f "$RECORDER" "$RECORDER_LIB" "$CELL/tmstate/up" "$CELL/tmstate/cmd"
+unset start_rc          # ⛔ asserted, not inherited: a dropped `start_rc="$rc"` below must ABORT under
+                        # `set -u` instead of letting the NEXT arm grade this arm's stale value (#3774 review, P2-2)
 out="$(cell_start)"; rc=$?
 start_rc="$rc"          # the controller launch's own verdict; asserted directly below — see the header
 [ -x "$RECORDER" ] && rc=0 || { rc=1; note "recorder=$([ -x "$RECORDER" ] && echo present || echo absent) start_rc=$start_rc out=$(printf '%s' "$out" | tail -3)"; }
@@ -381,6 +387,7 @@ ck "the provisioned cell is then certified" $rc
 # …and the SIBLING alone is provisioned when an operator's recorder copy already exists (the
 # "present but degraded" cell the lib check exists for): remove ONLY the normalizer and re-start.
 rm -f "$RECORDER_LIB" "$CELL/tmstate/up" "$CELL/tmstate/cmd"
+unset start_rc          # see above: each arm's binding is asserted, never inherited across arms
 out="$(cell_start)"; rc=$?; start_rc="$rc"     # asserted below — see the header
 [ -s "$RECORDER_LIB" ] && rc=0 || { rc=1; note "normalizer=$([ -s "$RECORDER_LIB" ] && echo present || echo absent) out=$(printf '%s' "$out" | tail -3)"; }
 ck "start provisions ONLY the missing normalizer when the recorder already exists" $rc
@@ -393,6 +400,7 @@ ck "and that start SUCCEEDED (start_rc=$start_rc)" "$start_rc"
 printf '#!/bin/bash\nexit 0\n' > "$CELL/record-review.sh"; chmod +x "$CELL/record-review.sh"
 : > "$RECORDER"          # a truncated/zero-byte operator copy
 rm -f "$CELL/tmstate/up" "$CELL/tmstate/cmd"
+unset start_rc          # see above: each arm's binding is asserted, never inherited across arms
 out="$(cell_start)"; rc=$?; start_rc="$rc"     # asserted below — see the header
 [ -s "$RECORDER" ] && rc=0 || { rc=1; note "recorder=$([ -s "$RECORDER" ] && echo nonempty || echo empty) out=$(printf '%s' "$out" | tail -3)"; }
 ck "RED→GREEN: start re-provisions a ZERO-BYTE recorder" $rc

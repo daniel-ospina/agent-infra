@@ -1263,6 +1263,27 @@ if (typeof stripTypeScriptTypes !== "function" ||
         },
       ];
 
+      // ⛔ THE EXEMPTION MECHANISM'S OWN ENABLEMENT IS ASSERTED (#3774 review, P2-1). The
+      // `optOutInvariant` leg below is the ONLY thing that turns a `preFixDiscriminating: false`
+      // declaration into evidence, and ONE line on ONE mutant enables it. Measured: deleting
+      // `optOutInvariant: true` from the pre-fix mutant left this suite at 341 passed / 0 failed,
+      // exit 0 — the leg vanished and nothing named it, so the flag could hollow out the mutation
+      // evidence with no red anywhere. These rows redden on that deletion, and on an EMPTIED
+      // opt-out set (a mechanism with no exempted pin asserts nothing either).
+      const optOutMutants = MUTANTS.filter((m) => m.optOutInvariant === true);
+      const optedOut = PINNED.filter((x) => x.preFixDiscriminating === false);
+      expectTrue("M: exactly one mutant declares optOutInvariant, so the exemption leg RUNS",
+        optOutMutants.length === 1,
+        `${optOutMutants.length} mutants declare it — the leg below runs only when exactly one does`);
+      expectTrue("M: at least one pin is exempted, so the optOutInvariant leg asserts a real claim",
+        optedOut.length > 0,
+        "no pin carries `preFixDiscriminating: false` — the leg would assert nothing");
+      for (const m of optOutMutants) {
+        expectTrue(`M: the ${m.label} mutant does NOT hold its exempted pins in expectRed`,
+          optedOut.every((p) => !m.expectRed.includes(p.id)),
+          `expectRed still holds ${optedOut.map((p) => p.id).join(", ")} — the exemption would be graded twice, against evidence the mutant never produced`);
+      }
+
       // The pins must be LIVE on the unmutated module first — a mutation whose
       // pin was already red proves nothing. `both:"block"` pins are GREEN only
       // when the command is REFUSED.
