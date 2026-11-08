@@ -1034,9 +1034,12 @@ if [ -z "$_checker_broken" ]; then
     # the adopted checker forbids: `cmux_payload.py`'s `send_verified` docstring says the remedy is to
     # submit in that pane, NEVER to re-send, and the bare `'\n'` here is this file's own "submit what
     # is already typed" shape (the raw-send arm below has used it since before #1187).
-    #   The `re-submitted=` field is added to `diag=[…]` so the operator can tell an Enter that was
-    # repaired from one that is still stuck. `delivered=` is deliberately NOT upgraded: nothing proves
-    # the retried Enter landed, so the verdict stays `NOT-SUBMITTED` and the next tick still retries.
+    #   A field is added to `diag=[…]` recording whether a bare-Enter retry was SENT --
+    # `re-submit-attempted=yes|no`, i.e. the ACT and its exit status -- so an operator can tell a
+    # retried Enter from one that was never retried. It is NOT a claim that the Enter landed: that
+    # inference is exactly what the block below retires. `delivered=` is deliberately NOT upgraded,
+    # because nothing proves the retried Enter landed; the verdict stays `NOT-SUBMITTED` and the next
+    # tick still retries.
     # ⛔ AND THE FIELD IS NAMED FOR THE MEASUREMENT, NOT FOR A VERDICT (#3795 review cycle 11, P2).
     # It was `re-submitted=`, derived from this `cmux send`'s EXIT STATUS ALONE — the exact inference
     # this file retires ~200 lines above (`:846-858`: `cmux send` exited 0 over a 1,962-byte message
