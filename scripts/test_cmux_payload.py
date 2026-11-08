@@ -1330,6 +1330,13 @@ def _cadence_home(tmp_path, screen_text, previous_line):
     (scripts / "lib" / "beat-pair.sh").write_text(
         open(os.path.join(_SCRIPTS_DIR, "lib", "beat-pair.sh"), encoding="utf-8").read(),
         encoding="utf-8")
+    # The floor sources the fleet's ONE process-identity rule (#1178) for the lock predicate, and the
+    # farm ships it in `lib_srcs` (pi-bootstrap/setup.sh). Without it the predicate degrades to the
+    # fail-closed "unknown" answer and the dead-holder arm is unreachable, so the fixture must carry it
+    # exactly as a farmed box does.
+    (scripts / "lib" / "pid-identity.sh").write_text(
+        open(os.path.join(_SCRIPTS_DIR, "lib", "pid-identity.sh"), encoding="utf-8").read(),
+        encoding="utf-8")
     # The pane the floor sends to is READ from the tick, never hardcoded here.
     (scripts / "orchestrator-heartbeat.sh").write_text(
         'ORCH_WS="WS-FAKE"\nORCH_SURFACE="SURF-FAKE"\n', encoding="utf-8")
@@ -1666,43 +1673,75 @@ def test_cadence_nudge_dead_holder_arm_has_its_own_bound_and_its_own_words(tmp_p
     assert sent_b.exists(), "a provably-dead holder was not reclaimed at its own bound"
 
 
-def test_cadence_nudge_respects_the_reclaim_mutex_and_recovers_a_stale_one(tmp_path):
-    """⛔ THE RECLAIM IS SERIALISED BY A FIXED-NAME MUTEX (#3795 review cycle 4, P1).
+def test_cadence_nudge_reclaim_is_one_winner_over_a_stale_lock(tmp_path):
+    """⛔ THE RECLAIM TOKEN IS THE RECORD, AND CONTENTION OVER A STALE LOCK HAS EXACTLY ONE WINNER.
 
-    Judgement and reclaim happen inside one `mkdir` mutex, because that is the only primitive that
-    can be won exactly once. The previous version compared INODE NUMBERS after moving the directory,
-    which does not work: a re-created directory gets the freed inode straight back (measured 6/6), so
-    a descheduled contender moved the NEW live lock and found its check satisfied.
+    This replaced a fixed-name `mkdir` reclaim mutex (#3795 review cycle 6, P1). That mutex was
+    measured unsound: `mv`-ing it freed its NAME, so a contender's plain `mkdir` re-claimed it while
+    the process that moved it was still inside, and its `elif [ -e … ]` arm then deleted a FRESH
+    mutex a live holder still owned. Across 27 sixteen-contender trials 5 logged TWO OR MORE
+    `lock-reclaimed` lines — two processes inside a section whose banner called it exclusive — and
+    the conversion to a duplicate send is deterministic (`rmdir` always succeeds on the always-empty
+    dir, `rm -f "$LOCKPID"` removes the live holder's record, `mkdir` then succeeds for both).
 
-    Two arms: a live mutex blocks (and says so), and a mutex left behind by a killed run is reclaimed
-    so it cannot wedge the floor.
+    The token is now `rename(2)` of the record that was judged, so a loser's `mv` fails ENOENT. THE
+    DISCRIMINATOR IS THE PRECONDITION: the old burst test started from a CLEAN state, so no
+    contender ever entered the reclaim path and the mutex was mutation-invisible (deleting it
+    changed nothing). Here eight contenders start over a STALE lock, which is the only configuration
+    in which the reclaim token matters.
     """
-    # (a) a live mutex → skip, log, no send.
+    from concurrent.futures import ThreadPoolExecutor
+
     seed = _seeded_log(600)
     home, bindir, screen, state = _cadence_home(
-        tmp_path / "a", "the pane shows nothing relevant\n", seed)
-    (state / "cadence-nudge.lock.takeover").mkdir()
-    sent = tmp_path / "SENT_A"
+        tmp_path, "the pane shows nothing relevant\n", seed)
+    _lock(state, pid=999999, age_s=3600)      # stale: past the dead-holder bound, record names a dead pid
+    sent = tmp_path / "SENT"
+
+    def once(_i):
+        return _run_cadence_nudge(home, bindir, screen, session=sent)
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(once, range(8)))
+    for r in results:
+        assert r.returncode == 0, r.stdout + r.stderr
+    nudges, appended = _new_nudge_lines(state, seed)
+    assert len(nudges) == 1, f"{len(nudges)} heartbeats over one stale lock:\n{appended}"
+    assert appended.count("lock-reclaimed") == 1, (
+        "more than one process reclaimed the same stale lock — the reclaim token is not once-winnable:\n"
+        + appended)
+    # ...and nothing was left wedged for the next tick.
+    assert not (state / "cadence-nudge.lock.pid").exists(), "the winner left a stale pid record behind"
+    assert not (state / "cadence-nudge.lock").exists(), "the winner never released the lock"
+    assert not list(state.glob("cadence-nudge.lock.pid.doomed.*")), "a doomed record leaked"
+
+
+def test_cadence_nudge_a_leftover_reclaim_mutex_no_longer_wedges_the_floor(tmp_path):
+    """⛔ A `.takeover` LEFT BY A KILLED RUN MUST NOT STOP THE FLOOR (#3795 review cycle 6, P1).
+
+    This is the DETERMINISTIC arm for the reclaim rewrite. The previous fixed-name `mkdir` mutex was
+    reclaimed only when `find … -mmin +2` said it was stale, so a mutex left behind by a SIGKILLed run
+    held the floor until that clock expired — and if its mtime could not be read at all, for ever, with
+    a line that says "or a stale one is not yet expired". The mutex is gone: the reclaim token is a
+    `rename(2)` of the record that was judged, so no artifact of a previous run can outlive it.
+
+    The precondition is deliberately the shape that wedged the old code: a FRESH `.takeover` beside a
+    STALE lock. Pre-fix the run logs the mutex skip and sends nothing; post-fix the leftover is inert.
+    """
+    seed = _seeded_log(600)
+    home, bindir, screen, state = _cadence_home(
+        tmp_path, "the pane shows nothing relevant\n", seed)
+    (state / "cadence-nudge.lock.takeover").mkdir()      # fresh: the old code called this "held"
+    _lock(state, pid=999999, age_s=3600)                 # stale, and its record names a dead pid
+    sent = tmp_path / "SENT"
     r = _run_cadence_nudge(home, bindir, screen, session=sent)
     assert r.returncode == 0, r.stdout + r.stderr
-    assert not sent.exists(), "a live reclaim mutex was ignored"
+    assert sent.exists(), (
+        "a leftover reclaim mutex wedged the floor — the mutex has no owner left to release it")
     _n, appended = _new_nudge_lines(state, seed)
-    assert "lock-skip" in appended, appended
-    assert "mutex" in appended, appended
-
-    # (b) a STALE mutex (its owner was killed) → reclaimed, and the floor proceeds.
-    seed_b = _seeded_log(600)
-    home_b, bindir_b, screen_b, state_b = _cadence_home(
-        tmp_path / "b", "the pane shows nothing relevant\n", seed_b)
-    mutex = state_b / "cadence-nudge.lock.takeover"
-    mutex.mkdir()
-    t = time.time() - 600
-    os.utime(mutex, (t, t))
-    sent_b = tmp_path / "SENT_B"
-    r = _run_cadence_nudge(home_b, bindir_b, screen_b, session=sent_b)
-    assert r.returncode == 0, r.stdout + r.stderr
-    assert sent_b.exists(), (
-        "a stale reclaim mutex wedged the floor — the mutex has no owner left to release it")
+    assert "lock-reclaimed" in appended, appended
+    assert "mutex" not in appended, (
+        "the floor still speaks of a reclaim mutex it no longer has:\n" + appended)
 
 
 def test_cadence_nudge_cannot_be_made_to_write_a_forged_receipt_from_the_env(tmp_path):
@@ -1744,19 +1783,18 @@ def test_cadence_nudge_cannot_be_made_to_write_a_forged_receipt_from_the_env(tmp
 def test_cadence_nudge_lock_survives_a_concurrent_burst(tmp_path):
     """⛔ ONE HEARTBEAT FOR A WHOLE BURST (#3795 review cycle 3, P1).
 
-    The only creator and the only remover of `$LOCK` is the winner of the fixed-name
-    `$LOCK.takeover` `mkdir` mutex (`cadence-nudge.sh`, the lock block), so a burst cannot produce two
-    senders. Two earlier mechanisms are gone and this docstring used to describe the second of them:
-    delete-then-create (two contenders both sent, measured 19 ms apart), then rename-plus-INODE-check
-    — which does not work, because a re-created directory gets the freed inode straight back (measured
-    6/6), so a descheduled contender moved the live lock and found its check satisfied. The `mkdir`
-    mutex needs no identity proof at all; the inode result is why it exists.
+    The only creator and the only remover of `$LOCK` is the process that wins `mkdir "$LOCK"`, and a
+    reclaim is won by `rename(2)` of the record that was judged (`cadence-nudge.sh`, the lock block),
+    so a burst cannot produce two senders. Three earlier mechanisms are gone: delete-then-create (two
+    contenders both sent, measured 19 ms apart), rename-plus-INODE-check (does not work — a re-created
+    directory gets the freed inode straight back, measured 6/6), and a fixed-name `mkdir` reclaim
+    mutex (unsound — `mv` freed its name and it deleted a fresh mutex a live holder owned, measured in
+    5 of 27 trials).
 
-    LIMIT, stated rather than implied: this pins the burst invariant (N concurrent runs -> exactly one
-    heartbeat). It does NOT reproduce the deschedule window those mechanisms failed in, so it is not
-    proof that the mutex closes every race — that rests on `mkdir`'s atomicity plus the reviewers'
-    measurements of the earlier forms. `test_cadence_nudge_respects_the_reclaim_mutex_and_recovers_a_stale_one`
-    covers the mutex's own two arms.
+    LIMIT, stated rather than implied: this pins the burst invariant on a CLEAN start (N concurrent
+    runs -> exactly one heartbeat). The reclaim arm is pinned separately by
+    `test_cadence_nudge_reclaim_is_one_winner_over_a_stale_lock`, which is the configuration in which
+    the reclaim token actually decides anything — a clean-start burst never enters it.
     """
     from concurrent.futures import ThreadPoolExecutor
 

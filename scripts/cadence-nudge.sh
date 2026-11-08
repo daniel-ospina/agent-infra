@@ -62,6 +62,15 @@
 set -uo pipefail
 
 SCRIPTS="$HOME/.pi/agent/scripts"
+# ⛔ THE FLEET'S ONE PROCESS-IDENTITY RULE, SOURCED BEFORE THE LOCK BLOCK USES IT (#3795 review
+# cycle 6, P2). `scripts/lib/pid-identity.sh` ships in `pi-bootstrap/setup.sh`'s `lib_srcs`, i.e. it
+# lands in this same `lib/` directory on every farmed box. It is OPTIONAL here for the same reason
+# `beat-pair.sh` is: the floor must still beat on a partial deploy, and `_nudge_holder_state` degrades
+# to the fail-closed answer (unknown -> the ceiling) when it is absent.
+if [ -r "$SCRIPTS/lib/pid-identity.sh" ]; then
+  # shellcheck source=lib/pid-identity.sh
+  . "$SCRIPTS/lib/pid-identity.sh"
+fi
 STATE="$HOME/.pi/agent/state"
 LOG="$STATE/orchestrator-heartbeat.log"
 PULSE_MIN="${PULSE_MIN:-5}"
@@ -88,13 +97,13 @@ GRACE=0
 # bare age bound: a holder is reclaimed only by the absolute ceiling, a pid that is provably not this
 # script by the short grace, and an unidentifiable lock by the ceiling. See the rules there.
 LOCK="$STATE/cadence-nudge.lock"
-# ⛔ THE HOLDER'S PID LIVES BESIDE THE LOCK, NOT INSIDE IT. Two reasons, both load-bearing:
-#   * the lock DIRECTORY stays EMPTY, so `rmdir` still reclaims it. The previous version of this file
-#     reclaims a stale lock with a bare `rmdir`, which FAILS on a non-empty directory -- a pid file
-#     inside the lock would make a rollback to that version wedge the floor permanently (it would
-#     `rmdir`-fail, then `mkdir`-fail, then exit 0 for ever).
-#   * `rmdir` is the only operation that must succeed on reclaim, and keeping the dir empty makes the
-#     takeover atomic-ish instead of two-step.
+# ⛔ THE HOLDER'S RECORD LIVES BESIDE THE LOCK, NOT INSIDE IT, AND THE RECLAIM TOKEN IS THAT RECORD
+# (#3795 review cycle 6, P1). Three load-bearing reasons:
+#   * a pid file INSIDE the directory makes the previous version's bare `rmdir` reclaim FAIL
+#     permanently (it would `rmdir`-fail, then `mkdir`-fail, then exit 0 for ever);
+#   * an EMPTY directory is what lets `rm -rf "$LOCK"` clear a lock left by the intermediate version;
+#   * the reclaim is won by `rename(2)` of THIS FILE (rule 7 below): the object we move is exactly the
+#     object we judged, so judging and acting cannot straddle two different locks.
 LOCKPID="$LOCK.pid"
 # ⛔ THE TAKEOVER MUST NEVER RACE A LIVE NUDGE, AND MUST NEVER WEDGE FOREVER (#3795 review P1+P1).
 # Both halves were measured failures, in opposite directions:
@@ -115,12 +124,13 @@ LOCKPID="$LOCK.pid"
 # (`scripts/orchestrator-harness/auto-rail.sh:315-345`: "a pid is not an identity ... ALIVE non-matching
 # or unreadable pid is only reclaimable once the lock is OLDER than LOCK_AGE_GRACE ... the actuator was
 # permanently dead with a clean log"). Applied here:
-#   1. a pid is not an identity -- the holder's argv must CONTAIN this script's name
-#      (`ps -o args=`), so a RECYCLED pid does not read as a holder: a process that merely inherited the
-#      number cannot name this script. A process whose argv happens to NAME this file (an editor with
-#      it open, a wrapper) does still read as a holder -- a substring match, not equality -- and that
-#      residual is bounded by rule 3's ceiling. Stated rather than denied, which is the honesty
-#      `auto-rail.sh` applies to its own predicate;
+#   1. a pid is not an identity -- the holder's argv must have the SHAPE
+#      `<shell> <…/cadence-nudge.sh>` (`pid-identity.sh`'s rule, the same conjunction
+#      `cloud-cell-supervisor.sh:820-828` applies), AND the process must not have BEGUN after the
+#      record was written (`pid_began_after`). Both terms are needed: the shape alone does not survive
+#      pid recycling, and the age fence alone cannot tell a wrapper from the script. A process that
+#      merely NAMES this file in its argv (an editor with it open, `sleep 300 cadence-nudge.sh`) is
+#      therefore NOT a holder, which is the false positive the substring form shipped;
 #   2. a genuine live holder is not taken over by AGE alone; it is taken over only by the ABSOLUTE
 #      CEILING in rule 3. Every skip is LOGGED, because a silent skip is how the floor died once;
 #   3. a genuine live holder past the 20-min ceiling IS taken over -- bounded, because past 2.7
@@ -136,107 +146,176 @@ LOCKPID="$LOCK.pid"
 #      the intermediate version) is held to the CEILING: that is the arm where only the clock stands
 #      between a second contender and a live sender. MEASURED: with a short bound here, a holder whose
 #      pid write had failed was reclaimed mid-run and two receipts landed 4 s apart.
-#   7. JUDGING AND RECLAIMING HAPPEN INSIDE ONE EXCLUSIVE SECTION. A fixed-name `mkdir` mutex is the
-#      only thing that can be won exactly once; the winner judges `$LOCK` and, if stale, removes and
-#      re-creates it before releasing. That closes the window the previous version tried to close by
-#      comparing INODE NUMBERS after the fact -- which does not work: a re-created directory gets the
-#      freed inode straight back (measured 6/6 on ext4: `mkdir` -> `mv` away -> `rmdir` -> `mkdir`
-#      yields the SAME inode), so a contender that judged lock L1 and was descheduled before acting
-#      would move the live L2 and find its check satisfied. MEASURED with the inode form: two
-#      contenders both took the lock and both sent. An identity proof must use a value the filesystem
-#      cannot recycle -- the mutex makes the proof unnecessary.
-NUDGE_LOCK_CEILING_MIN=20      # naming nothing: only the clock protects a live sender
+#   7. THE RECLAIM IS ONE-WINNER ON THE RECORD THAT WAS JUDGED (#3795 review cycle 6, P1). This
+#      replaces a fixed-name `mkdir` RECLAIM MUTEX, and that mutex was UNSOUND -- measured two ways:
+#        * it FREED ITS OWN NAME. `mv "$TAKEOVER" …` makes the name available, so another contender's
+#          plain `mkdir` re-claims it while the process that moved it is still inside the section;
+#        * its `elif [ -e "$TAKEOVER" ]` arm then `rm -rf`'d the mutex it had just moved when that
+#          mutex turned out to be FRESH -- i.e. one a LIVE holder still owned.
+#      MEASURED on the pre-fix block: 5 of 27 sixteen-contender trials logged TWO OR MORE
+#      `lock-reclaimed` lines, i.e. two processes inside the section whose banner called it exclusive.
+#      The conversion to a duplicate SEND is deterministic: `rmdir "$LOCK"` always succeeds on the
+#      always-empty directory, `rm -f "$LOCKPID"` then removes the LIVE holder's own record, and
+#      `mkdir "$LOCK"` succeeds for the second process too -- so both send, and the first can no
+#      longer release (its record is gone, so its ownership-checked trap declines).
+#      The token is now `rename(2)` OF THE RECORD WE JUDGED. A loser's `mv` fails ENOENT, and the
+#      winner re-reads what it moved and GIVES IT BACK if it does not name the pid it judged -- so a
+#      judgement that straddled a newer lock cannot reclaim it. No mutex is needed: the record rename
+#      already is the once-winnable primitive, and no window exists in which the lock is free for a
+#      second acquisition to slip through.
+NUDGE_LOCK_CEILING_MIN=20      # naming nothing, or unreadable: only the clock protects a live sender
 NUDGE_LOCK_DEAD_MIN=10         # a pid that is provably gone: no reason to wait out the ceiling
 NUDGE_LOCK_GRACE_MIN=6         # alive but NOT this script: provably not the holder
-NUDGE_TAKEOVER_STALE_MIN=2     # the mutex is held for ~3 syscalls; older = its owner died
+# ⛔ THE HOLDER PREDICATE IS `scripts/lib/pid-identity.sh`'s DOCTRINE, NOT A SUBSTRING MATCH (#3795
+# review cycle 6, P2). That library is the fleet's ONE process-identity rule (#1178) and is farmed
+# beside this file (`pi-bootstrap/setup.sh`'s `lib_srcs`), so it is sourced immediately above. The two
+# in-tree lock predicates that already apply it are `orchestrator-bringup.sh`'s `lock_pid` and
+# `cloud-cell-supervisor.sh`'s `lock_controller_pid`; this file was a fourth hand-rolled copy, and it
+# had both of the defects those two were fixed for:
+#   * a SUBSTRING argument match reads `cadence-nudge.sh` in ANY argv, an editor's included -- the
+#     exact false positive the supervisor's own comment names. The shape is
+#     `<shell> <…/cadence-nudge.sh>`;
+#   * an EMPTY `ps` answer is not a death witness -- it is equally "the read failed". The library's
+#     contract is 0 holder / 1 positively not / 2 unknown, and 2 must reach the caller AS 2 so it can
+#     fail closed (#1178 C3: "a probe that conflated them would manufacture 'dead' out of a failed ps
+#     invocation"). Here "unknown" is HELD TO THE CEILING, never given the dead arm's shorter bound.
 _hpid=""
-_hpid_alive=0
-_nudge_holder_live() {      # rc 0 = a process that IS this script owns the lock; sets _hpid/_hpid_alive
-  _hpid=$(cat "$LOCKPID" 2>/dev/null | tr -cd '0-9')
-  _hpid_alive=0
-  [ -n "$_hpid" ] || return 1
-  # ⛔ NOT A PIPE INTO `grep -q` (#3795 review cycle 3, P2). `scripts/check-no-sigpipe-grep.sh` bans
-  # the idiom outright and cannot see this site (`ps` is not one of its recognised producers), and
-  # under `set -o pipefail` a large enough payload after the match makes the pipeline report 141 —
-  # which `|| return 1` would read as "not this script", i.e. NO HOLDER, failing OPEN in the
-  # duplicate-send direction. This file already uses the sanctioned here-string form at the due read;
-  # this is the same shape.
-  _pargs=$(ps -p "$_hpid" -o args= 2>/dev/null)
-  [ -n "$_pargs" ] && _hpid_alive=1
-  grep -q 'cadence-nudge[.]sh' <<<"$_pargs" || return 1
+_hstate=""
+_nudge_holder_state() {   # sets _hpid and _hstate ∈ absent|dead|unknown|present
+  _hpid=$(tr -cd '0-9' < "$LOCKPID" 2>/dev/null)
+  _hstate="unknown"
+  [ -n "$_hpid" ] || { _hstate="absent"; return 0; }
+  local _rc
+  if command -v pid_row >/dev/null 2>&1; then
+    # The library's three answers: a read that RAN and produced a table may witness absence, a read
+    # that FAILED may not.
+    if pid_row "$_hpid" >/dev/null 2>&1; then _rc=0; else _rc=$?; fi
+    case "$_rc" in
+      0) _hstate="present" ;;
+      1) _hstate="dead" ;;
+      *) _hstate="unknown" ;;
+    esac
+  else
+    # Degraded (library not farmed). `kill -0` proves PRESENCE reliably but a failure cannot be split
+    # into "no such process" (ESRCH) and "not our uid" (EPERM) from the shell, so a failure is
+    # UNKNOWN, never death. That costs the dead arm its short bound on such a box -- the lock is then
+    # held to the ceiling. Stated rather than implied: the fail-closed direction is the one this
+    # predicate must fail in.
+    if kill -0 "$_hpid" 2>/dev/null; then _hstate="present"; else _hstate="unknown"; fi
+  fi
   return 0
 }
-# ⛔ ONE FIXED-NAME MUTEX IS WHAT MAKES THE RECLAIM SAFE (rule 7). `mkdir` is the only operation
-# here that can be won exactly once, so the winner is the only process that looks at `$LOCK` and the
-# only one that may remove or re-create it. Judgement and action therefore can never straddle two
-# different locks, which is the window every previous version left open.
-TAKEOVER="$LOCK.takeover"
-if ! mkdir "$TAKEOVER" 2>/dev/null; then
-  # Either a reclaim is in flight right now (microseconds), or its owner died holding the mutex.
-  # ⛔ THE STALE MUTEX IS CLAIMED BY `mv`, NEVER BY `rmdir` (#3795 review cycle 5, P1). The previous
-  # form was `find` (is it stale?) then `rmdir` then `mkdir` -- three steps against a SHARED name, so
-  # a contender that read the OLD mutex as stale could `rmdir` the FRESH one another contender had
-  # just created, and both entered the section the banner below calls exclusive. MEASURED: 8
-  # contenders over a stale mutex produced 2-5 simultaneous owners in 17/20 trials and duplicate
-  # sends. `rename(2)` succeeds for exactly one contender, so only the winner removes anything.
-  if [ -n "$(find "$TAKEOVER" -maxdepth 0 -mmin +"$NUDGE_TAKEOVER_STALE_MIN" 2>/dev/null)" ]; then
-    if mv "$TAKEOVER" "$TAKEOVER.doomed.$$" 2>/dev/null; then
-      # ...and the directory we actually moved must ITSELF be stale. A contender that lost the read
-      # race can otherwise move a freshly created mutex; put it back rather than deleting a live
-      # holder's mutex. `rm -rf` covers a mutex left non-empty (a stray file inside it), which a bare
-      # `rmdir` could never remove -- that was a permanent skip.
-      if [ -n "$(find "$TAKEOVER.doomed.$$" -maxdepth 0 -mmin +"$NUDGE_TAKEOVER_STALE_MIN" 2>/dev/null)" ]; then
-        rm -rf "$TAKEOVER.doomed.$$" 2>/dev/null
-      elif [ -e "$TAKEOVER" ]; then
-        # Someone else already holds the name; leave their mutex alone and drop our copy.
-        rm -rf "$TAKEOVER.doomed.$$" 2>/dev/null
-      else
-        mv "$TAKEOVER.doomed.$$" "$TAKEOVER" 2>/dev/null
-      fi
-    fi
+_nudge_holder_is_ours() {  # rc 0 = _hpid is a live process that IS this script (SHAPE or NAME, plus AGE)
+  local _pargs _sh _arg _lm _brc
+  _pargs=$(ps -p "$_hpid" -o args= 2>/dev/null)
+  [ -n "$_pargs" ] || return 1
+  # ⛔ NOT A PIPE INTO `grep -q` (#3795 review cycle 3, P2). `scripts/check-no-sigpipe-grep.sh` bans
+  # that idiom and cannot see this site (`ps` is not one of its recognised producers); under
+  # `set -o pipefail` a large enough payload after the match makes the pipeline report 141, which
+  # `|| return 1` would read as "not this script" -- failing OPEN in the duplicate-send direction.
+  IFS=' ' read -r _sh _arg _ <<<"$_pargs"
+  # SHAPE first: `<shell> <…/cadence-nudge.sh>` is the exact form `cadence-timer.sh` invokes, and the
+  # form cloud-cell-supervisor.sh:820-822 requires. It is the FAST PATH, never the GATE.
+  case "${_sh##*/}" in bash|sh|dash|zsh|ksh) case "${_arg##*/}" in cadence-nudge.sh) return 0 ;; esac ;; esac
+  # ⛔ THE FALLBACK OVER-MATCHES ON PURPOSE, AND THE POLARITY IS THE WHOLE POINT. Under-matching is
+  # the DANGEROUS direction here: a live holder read as "foreign" gets the 6-min grace, which is
+  # SHORTER than this file's own ~413 s (6.9 min) critical section, so a run could be reclaimed
+  # mid-send -- the measured two-receipts-4s-apart failure. Over-matching (an editor with this file
+  # open reads as a holder) only holds the floor to the ceiling, which is fail-closed and bounded.
+  # A name in argv therefore counts; the FENCE below is what removes the case that actually bit.
+  grep -q 'cadence-nudge[.]sh' <<<"$_pargs" || return 1
+  # AGE FENCE: a process that BEGAN after the record was written cannot be the process the record
+  # names -- the recycled-pid case, which is the one that made the floor permanently dead with a
+  # clean log. It is the library's `pid_began_after` when the library is present.
+  _lm=$(date -r "$LOCKPID" +%s 2>/dev/null) || return 0   # cannot date the record -> not provably a
+  case "$_lm" in ''|*[!0-9]*) return 0 ;; esac            # recycled pid, so keep the fail-closed arm
+  if command -v pid_began_after >/dev/null 2>&1; then
+    if pid_began_after "$_hpid" "$_lm"; then _brc=0; else _brc=$?; fi
+    case "$_brc" in
+      1) return 0 ;;   # began BEFORE the record -> it may be the holder
+      *) return 1 ;;   # began after (recycled), or the age cannot be read -> not provably ours
+    esac
   fi
-  mkdir "$TAKEOVER" 2>/dev/null || {
-    printf '%s CADENCE-NUDGE lock-skip holder=none — another pass holds the reclaim mutex (or a stale one is not yet expired); this one made no attempt\n' \
-      "$(date '+%m-%d %H:%M:%S')" >> "$LOG"
-    exit 0
-  }
-fi
-# ── from here to the `rmdir "$TAKEOVER"` below, this process is alone with $LOCK ──
+  return 0
+}
 _lock_taken=0
 if [ -d "$LOCK" ]; then
-  if _nudge_holder_live; then
-    _bound=$NUDGE_LOCK_CEILING_MIN
-    _why="a nudge is still running (pid $_hpid)"
-    _holder="$_hpid"
-  elif [ "$_hpid_alive" = "1" ]; then
-    _bound=$NUDGE_LOCK_GRACE_MIN
-    _why="pid $_hpid is alive but is not this script (recycled or foreign)"
-    _holder="$_hpid"
-  elif [ -n "$_hpid" ]; then
-    # The pid is known and none of it is a process: its run was killed. Reclaimed well above the
+  _nudge_holder_state
+  if [ "$_hstate" = "dead" ]; then
+    # The pid is known and it is not a process: its run was killed. Reclaimed well above the
     # verification window and well below the ceiling (rule 5).
     _bound=$NUDGE_LOCK_DEAD_MIN
     _why="holder pid $_hpid is not running (its run was killed before it could release the lock)"
     _holder="none (pid $_hpid is dead)"
-  else
+  elif [ "$_hstate" = "unknown" ]; then
+    _bound=$NUDGE_LOCK_CEILING_MIN
+    _why="the holder could not be read (pid ${_hpid:-none} — a failed read is not a death witness)"
+    _holder="unreadable (pid ${_hpid:-none})"
+  elif [ "$_hstate" = "absent" ]; then
     # Naming nothing at all: no pid file, an empty/unreadable one, or one left inside the dir. Only
     # the clock protects a live sender here, so the bound is the CEILING (rule 6).
     _bound=$NUDGE_LOCK_CEILING_MIN
-    _why="no holder is named (no pid file, or an unreadable one)"
+    _why="no holder is named (no pid file, or an empty one)"
     _holder="none"
+  elif _nudge_holder_is_ours; then
+    _bound=$NUDGE_LOCK_CEILING_MIN
+    _why="a nudge is still running (pid $_hpid)"
+    _holder="$_hpid"
+  else
+    _bound=$NUDGE_LOCK_GRACE_MIN
+    _why="pid $_hpid is alive but is not this script (recycled or foreign)"
+    _holder="$_hpid"
   fi
   if [ -z "$(find "$LOCK" -maxdepth 0 -mmin +"$_bound" 2>/dev/null)" ]; then
     # Held. Say so on EVERY arm -- a silent skip is how the floor died with a clean log.
     printf '%s CADENCE-NUDGE lock-skip holder=%s bound=%sm — %s, so this pass made no attempt; the next tick retries (#1187).\n' \
       "$(date '+%m-%d %H:%M:%S')" "$_holder" "$_bound" "$_why" >> "$LOG"
-    rmdir "$TAKEOVER" 2>/dev/null
     exit 0
   fi
-  # Stale. Remove it and re-create it INSIDE the mutex, so no second contender can slip between the
-  # two steps. `"$LOCK/pid"` is cleared too, for a lock left by the intermediate version.
-  rm -f "$LOCK/pid" 2>/dev/null
-  rmdir "$LOCK" 2>/dev/null || rm -rf "$LOCK" 2>/dev/null
-  rm -f "$LOCKPID" 2>/dev/null
+  # STALE. Claim the reclaim by RENAMING THE RECORD WE WOKE UP FOR (rule 7). `rename(2)` succeeds for
+  # exactly one contender; a loser gets ENOENT and makes no attempt.
+  if [ -n "$_hpid" ]; then
+    if ! mv "$LOCKPID" "$LOCKPID.doomed.$$" 2>/dev/null; then
+      printf '%s CADENCE-NUDGE lock-skip holder=none — another pass reclaimed this lock first; this one made no attempt\n' \
+        "$(date '+%m-%d %H:%M:%S')" >> "$LOG"
+      exit 0
+    fi
+    # ⛔ VERIFY WHAT WE MOVED. A judgement can straddle: we read record L1 (dead pid), and before the
+    # rename another contender reclaimed L1 and wrote a LIVE record L2. The rename then wins L2. If
+    # what we moved does not name the pid we judged, give it BACK and leave -- reclaiming here is how
+    # a live holder's lock is stolen, and two senders leave the box.
+    _moved=$(tr -cd '0-9' < "$LOCKPID.doomed.$$" 2>/dev/null)
+    if [ "$_moved" != "$_hpid" ]; then
+      mv "$LOCKPID.doomed.$$" "$LOCKPID" 2>/dev/null
+      printf '%s CADENCE-NUDGE lock-skip holder=%s — the record changed between judging it and claiming it; this pass made no attempt\n' \
+        "$(date '+%m-%d %H:%M:%S')" "${_moved:-unknown}" >> "$LOG"
+      exit 0
+    fi
+    rm -f "$LOCKPID.doomed.$$" 2>/dev/null
+  else
+    # Naming nothing at all, so there is no record to rename and the token must be the directory. This
+    # arm is reachable only for a lock older than the 20-min ceiling that wrote no record at all (an
+    # old-format lock, or a run whose pid write failed).
+    # ⛔ ITS RESIDUAL, STATED: this arm's token is the directory, so a THIRD contender can re-create
+    # the name between our `mv` and our verify. The verify below still refuses to delete a directory
+    # that is now fresh, but with three contenders the restore can replace a fresh directory instead
+    # of the one we moved -- two senders in that corner. It is bounded and the consequence is a
+    # duplicate HEARTBEAT, which this file already declares not the dangerous duplicate a duplicate
+    # lane ORDER is. Every realistic arm writes its record before it sends, so it takes the arm above.
+    if ! mv "$LOCK" "$LOCK.doomed.$$" 2>/dev/null; then
+      printf '%s CADENCE-NUDGE lock-skip holder=none — another pass reclaimed this lock first; this one made no attempt\n' \
+        "$(date '+%m-%d %H:%M:%S')" >> "$LOG"
+      exit 0
+    fi
+    if [ -z "$(find "$LOCK.doomed.$$" -maxdepth 0 -mmin +"$_bound" 2>/dev/null)" ]; then
+      mv "$LOCK.doomed.$$" "$LOCK" 2>/dev/null
+      printf '%s CADENCE-NUDGE lock-skip holder=none — the lock was re-created between judging it and claiming it; this pass made no attempt\n' \
+        "$(date '+%m-%d %H:%M:%S')" >> "$LOG"
+      exit 0
+    fi
+    rm -rf "$LOCK.doomed.$$" 2>/dev/null
+  fi
+  rm -rf "$LOCK" 2>/dev/null
   printf '%s CADENCE-NUDGE lock-reclaimed bound=%sm — %s; taking the lock (#1187).\n' \
     "$(date '+%m-%d %H:%M:%S')" "$_bound" "$_why" >> "$LOG"
 fi
@@ -244,12 +323,11 @@ if mkdir "$LOCK" 2>/dev/null; then
   printf '%s\n' "$$" > "$LOCKPID" 2>/dev/null || true
   _lock_taken=1
 else
-  # Cannot happen while we hold the mutex unless the filesystem refused; say so rather than skipping
-  # silently.
-  printf '%s CADENCE-NUDGE lock-skip holder=none — the lock could not be created under the mutex; this pass made no attempt\n' \
+  # Someone took the lock between our reclaim and this `mkdir`, or the filesystem refused. Say so
+  # rather than skipping silently.
+  printf '%s CADENCE-NUDGE lock-skip holder=none — the lock could not be created after the reclaim; this pass made no attempt\n' \
     "$(date '+%m-%d %H:%M:%S')" >> "$LOG"
 fi
-rmdir "$TAKEOVER" 2>/dev/null
 [ "$_lock_taken" = "1" ] || exit 0
 # ⛔ AN OWNERSHIP-CHECKED TRAP (#3795 review P2). An unconditional `rm -f "$LOCKPID"` deletes whatever
 # pid is there -- if this run's own pid write failed and a later tick reclaimed the lock, this run's EXIT
@@ -781,7 +859,6 @@ fi
 # which exits BEFORE argparse validates the `--timeout` VALUE -- so `CADENCE_NUDGE_VERIFY_TIMEOUT=90s`
 # (the obvious human spelling of 90) passed the probe and then made the real call die in argparse,
 # before it could send. Validate the shape here, so the argv the probe covered is the argv that runs.
-_vtimeout=$(printf '%s' "${CADENCE_NUDGE_VERIFY_TIMEOUT:-90}" | tr -d '\r\n')
 # ⛔ THE VALUE IS SANITISED BEFORE IT CAN REACH A RECEIPT, NOT MERELY FLATTENED (#3795 review cycle 5,
 # P1). It is interpolated into `_checker_broken` -> `_cause` -> `_vdiag` -> BOTH receipt lines, so an
 # env value containing a newline split the receipt and let its second physical line be a byte-valid
@@ -789,7 +866,7 @@ _vtimeout=$(printf '%s' "${CADENCE_NUDGE_VERIFY_TIMEOUT:-90}" | tr -d '\r\n')
 # wrote a delivery receipt with no send at all (measured), and that same line then made the floor
 # compute a NEGATIVE gap and skip for ever.
 #   Flattening alone is NOT enough (measured): the injected text still lands INLINE in `diag=[…]`, and
-#   the due read is an UNANCHORED `.*NUDGE at=\([0-9]+\) delivered=` — so a `NUDGE at=… delivered=`
+#   the due read is an UNANCHORED `.*NUDGE at=\([0-9][0-9]*\) delivered=` — so a `NUDGE at=… delivered=`
 #   fragment anywhere on the line is read as a receipt. The echoed value is therefore reduced to the
 #   characters a timeout can legally contain, so no receipt-shaped token survives it at all.
 _vtimeout_raw="${CADENCE_NUDGE_VERIFY_TIMEOUT:-90}"
