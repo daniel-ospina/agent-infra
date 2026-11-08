@@ -9865,7 +9865,7 @@ run_record_delta $EH77 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42529101" \
     STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
 I only actually reviewed HEAD^0..HEAD; the rest was not read."
 assert_eq "$RECORD_RC" "3" "20h59 an EMPTY range at the head (HEAD^0..HEAD) is REFUSED (rc 3)"
-assert_contains "$RECORD_ERR" "RELATIVE TO THE TIP" "20h59 …and it says why: a range narrower than the one being recorded"
+assert_contains "$RECORD_ERR" "states an EMPTY range" "20h59 …and it says why: a range narrower than the one being recorded"
 [ -f "$(Q2 $EH77)" ] && bad "20h59 no record was written" || ok "20h59 no record was written"
 EH78=425292; rm -f "$(Q2 $EH78)"
 run_record_delta $EH78 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42529301" \
@@ -9873,7 +9873,7 @@ run_record_delta $EH78 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42529301" \
     STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
 I only actually reviewed HEAD^{commit}..HEAD; the rest was not read."
 assert_eq "$RECORD_RC" "3" "20h59b …and the same empty range written with a peel (rc 3)"
-assert_contains "$RECORD_ERR" "RELATIVE TO THE TIP" "20h59b the peel does not launder an empty range either"
+assert_contains "$RECORD_ERR" "states an EMPTY range" "20h59b the peel does not launder an empty range either"
 [ -f "$(Q2 $EH78)" ] && bad "20h59b no record was written" || ok "20h59b no record was written"
 
 # ════════════════════════════════════════════════════════════════════════════════════════════════
@@ -10109,6 +10109,120 @@ reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found."
 assert_eq "$RECORD_RC" "0" "20h61 a reflog position on a NON-tip ref is prose, not a tip-relative range (rc 0)"
 [ -f "$(Q2 $EH81)" ] || bad "20h61 …and a correct artifact was falsely blocked by one"
 
+# 20h70 A SYMBOLIC ENDPOINT IS DECIDED, NOT CARRIED (twentieth cycle). The residual declared at
+#       ff9ededd6 and twice before it: "with a branch or tag at the attested head, `tmp3698..HEAD`
+#       is an empty range and is accepted". The empty-range arm's grammar admitted hex, the tip's
+#       word and a brace group — so a REF NAME never entered it, and the NARROWEST claim there is
+#       (zero commits, offered as the evidence for a range that has commits) minted a signed
+#       `clean`. MEASURED on the pre-fix arm: `deltatip..HEAD` with `deltatip` at the attested head
+#       → accepted, no message. The decision taken here is the arm's own doctrine — admit the TOKEN
+#       and RESOLVE it — not another spelling test.
+git -C "$DG" branch -f deltatip "$DG_HEAD" >/dev/null 2>&1 || true
+git -C "$DG" tag -f deltatag "$DG_HEAD" >/dev/null 2>&1 || true
+git -C "$DG" branch -f deltabase "$DG_BASE" >/dev/null 2>&1 || true
+assert_eq "$(git -C "$DG" rev-parse 'deltatip^{commit}' 2>/dev/null || true)" "$DG_HEAD" "20h70 setup: the fixture has a BRANCH at the attested head (the vector would measure nothing otherwise)"
+assert_eq "$(git -C "$DG" rev-parse 'deltatag^{commit}' 2>/dev/null || true)" "$DG_HEAD" "20h70 setup: …and a TAG there too"
+EH110=425340; rm -f "$(Q2 $EH110)"
+run_record_delta $EH110 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42534101" \
+    STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" \
+    STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
+I only actually reviewed deltatip..HEAD; the rest was not read."
+assert_eq "$RECORD_RC" "3" "20h70 a SYMBOLIC endpoint at the attested head (deltatip..HEAD) is an EMPTY range — REFUSED (rc 3)"
+assert_contains "$RECORD_ERR" "states an EMPTY range" "20h70 …and the refusal names the claim it refused, not a tip-relative narrowing it never wrote"
+[ -f "$(Q2 $EH110)" ] && bad "20h70 FAIL-OPEN: a branch at the attested head laundered an empty range into a signed clean" || ok "20h70 no record was written"
+EH111=425342; rm -f "$(Q2 $EH111)"
+run_record_delta $EH111 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42534301" \
+    STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" \
+    STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
+I only actually reviewed deltatag..${DG_HEAD}; the rest was not read."
+assert_eq "$RECORD_RC" "3" "20h70b …and the same claim spelled with a TAG (and a sha on the right) (rc 3)"
+[ -f "$(Q2 $EH111)" ] && bad "20h70b FAIL-OPEN: a tag at the attested head laundered an empty range" || ok "20h70b no record was written"
+# THE FALSE-BLOCK CONTROLS. A token class that admits ref names must not refuse the ones that
+# narrow nothing: a ref at an ANCESTOR is not an empty range, and an UNRESOLVABLE word before dots
+# is prose (the arm resolves before it refuses, which is what makes this a meaning test).
+EH112=425344; rm -f "$(Q2 $EH112)"
+run_record_delta $EH112 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42534501" \
+    STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" \
+    STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
+I re-read deltabase..${DG_HEAD} end to end, which is the range being recorded."
+assert_eq "$RECORD_RC" "0" "20h70c a SYMBOLIC endpoint at an ANCESTOR (deltabase..head) is NOT an empty range (rc 0)"
+[ -f "$(Q2 $EH112)" ] || bad "20h70c …and an honest artifact naming a branch was falsely blocked by the operand class"
+EH113=425346; rm -f "$(Q2 $EH113)"
+run_record_delta $EH113 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42534701" \
+    STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" \
+    STUB_EVIDENCE_BODY="The names notes.txt..draft.md and out/x..out/y are file patterns, not commits.
+reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found."
+assert_eq "$RECORD_RC" "0" "20h70d a word before dots that resolves to NO commit is prose, not a range (rc 0)"
+[ -f "$(Q2 $EH113)" ] || bad "20h70d …and ordinary prose was falsely blocked by admitting ref names"
+
+# ══════════════════════════════════════════════════════════════════════════════════════════
+# 20j THE FRAME IS NOT THE CHECKOUT — THE CORPUS THAT COULD NOT SEE A FRAME BUG (twentieth cycle).
+#     ⛔ THE GAP THIS CLOSES, IN THE LAST REVIEW'S OWN WORDS: "the test corpus cannot see frame bugs
+#     at all. Every delta vector runs detached at the head. Until the fixture can also run detached
+#     elsewhere, this class is invisible to green suites — which is the single most useful thing to
+#     fix next." That is not a guess: FOUR review cycles of green suites coexisted with signed
+#     `clean` records over empty ranges precisely because the fixture's checkout position was the one
+#     position where a checkout-resolving arm answered correctly (round 4's headline finding). The
+#     property that closed it — no chain is resolved through the checkout — has no single line for a
+#     mutant to break, so it is pinned the only way it can be: the SAME bodies, run again with the
+#     checkout somewhere else, must produce the SAME verdicts.
+#     MEASURED on the pre-fix head (ff9ededd6^): in frame B the acceptance body was REFUSED (a false
+#     block accusing the artifact of a contradiction it never wrote) and `@{0}..HEAD` recorded a
+#     signed `clean` — one artifact, two verdicts, decided by where a clone sat.
+git -C "$DG" checkout -q --detach "$DG_A1" >/dev/null 2>&1 || bad "20j setup: cannot check out frame B"
+assert_eq "$(git -C "$DG" rev-parse HEAD 2>/dev/null || true)" "$DG_A1" "20j setup: frame B is a checkout that is NOT the attested head"
+assert_eq "$(git -C "$DG" rev-parse 'HEAD^{commit}' 2>/dev/null || true)" "$DG_A1" "20j setup: …so the fixture's own HEAD denotes another commit$([ "$DG_A1" != "$DG_HEAD" ] && printf '' || printf ' — AND IT DOES NOT, the vector is vacuous')"
+EH114=425348; rm -f "$(Q2 $EH114)"
+run_record_delta $EH114 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42534901" \
+    STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" \
+    STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..HEAD; no issues found."
+assert_eq "$RECORD_RC" "0" "20j1 frame B: the HONEST range with the tip spelled HEAD is ACCEPTED (rc 0) — a verdict must not depend on where the clone sits"
+[ -f "$(Q2 $EH114)" ] || bad "20j1 FRAME BUG: the arm refused an artifact that stated exactly the range being recorded"
+_RC_ACCEPT_B="$RECORD_RC"
+EH115=425350; rm -f "$(Q2 $EH115)"
+run_record_delta $EH115 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42535101" \
+    STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" \
+    STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
+I only actually reviewed @{0}..HEAD; the rest was not read."
+assert_eq "$RECORD_RC" "3" "20j2 frame B: an EMPTY range spelled @{0}..HEAD is REFUSED (rc 3)"
+[ -f "$(Q2 $EH115)" ] && bad "20j2 FRAME BUG: @{0} resolved to the CLONE's commit and the empty range recorded a signed clean" || ok "20j2 no record was written"
+_RC_EMPTY_B="$RECORD_RC"
+EH116=425352; rm -f "$(Q2 $EH116)"
+run_record_delta $EH116 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42535301" \
+    STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" \
+    STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
+I only actually reviewed ${DG_HEAD}~0..HEAD; the rest was not read."
+assert_eq "$RECORD_RC" "3" "20j3 frame B: an EMPTY range spelled <head>~0..HEAD is REFUSED (rc 3)"
+[ -f "$(Q2 $EH116)" ] && bad "20j3 FRAME BUG: the sha-spelled empty range flipped to accepted off the head" || ok "20j3 no record was written"
+EH117=425354; rm -f "$(Q2 $EH117)"
+run_record_delta $EH117 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42535501" \
+    STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" \
+    STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
+I only actually reviewed HEAD^{commit}..HEAD; the rest was not read."
+assert_eq "$RECORD_RC" "3" "20j4 frame B: an EMPTY range behind a peel is REFUSED (rc 3)"
+[ -f "$(Q2 $EH117)" ] && bad "20j4 FRAME BUG: the peel-laundered empty range flipped to accepted off the head" || ok "20j4 no record was written"
+# THE PROPERTY ITSELF: the same two bodies in FRAME A (detached at the attested head) must return
+# the SAME rc. Asserted as an equality, not as two expectations, so a future divergence reads as
+# "two verdicts" rather than as two unrelated reds.
+git -C "$DG" checkout -q --detach "$DG_HEAD" >/dev/null 2>&1 || bad "20j setup: cannot restore frame A"
+EH118=425356; rm -f "$(Q2 $EH118)"
+run_record_delta $EH118 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42535701" \
+    STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" \
+    STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..HEAD; no issues found."
+_RC_ACCEPT_A="$RECORD_RC"
+EH119=425358; rm -f "$(Q2 $EH119)"
+run_record_delta $EH119 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42535901" \
+    STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" \
+    STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
+I only actually reviewed @{0}..HEAD; the rest was not read."
+_RC_EMPTY_A="$RECORD_RC"
+assert_eq "$RECORD_RC" "$_RC_EMPTY_B" "20j5 the SAME empty range returns the SAME verdict in frame A and frame B — one artifact, one verdict"
+assert_eq "$_RC_ACCEPT_A" "$_RC_ACCEPT_B" "20j5b …and so does the honest acceptance body (a frame divergence reds HERE, naming two verdicts for one artifact)"
+assert_eq "$_RC_ACCEPT_A" "0" "20j5c …and both are the verdict the range itself calls for (accepted)"
+assert_eq "$_RC_EMPTY_A" "3" "20j5d …and both (refused) are the verdict an empty range calls for"
+
+# ⛔ THE FIXTURE MUST NOT LEAVE THE CHECKOUT WHERE THE FRAME VECTORS PUT IT: §20i below reads the
+#    worktree, and every later section assumes the branch choice this suite found on entry.
 git -C "$DG" checkout -q "$_prevbr" >/dev/null 2>&1 || true
 
 # ── 20i — THE DELTA PATH'S REPLACE/GRAFT POSTURE (review of this change, P1) ─────────
@@ -10997,7 +11111,7 @@ I only actually reviewed ${DG_A1:0:6}–${DG_HEAD:0:6}; the rest was not read."
 #       peel as a narrowing, which is 2aba1583a again: 20h53's `<sha>^{commit}` — this repo's OWN
 #       rev-parse spelling — is REFUSED. The skipped vector is the ACCEPTANCE half, which is the
 #       direction this rule alone decides.
-MUT="$(mk_mutant nopeelidentity '      [[ "$_top" =~ ^((~0+|@\{0+\}|@\{now\}|\^0+|\^\{[^}/]*\})+)$ ]] && continue' '      :')"
+MUT="$(mk_mutant nopeelidentity '      [[ "$_top" =~ ^(${_dident}+)$ ]] && continue' '      :')"
 mut_check "M44 a peel/^0/@{0} chain is the IDENTITY, not a narrowing" 425266 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42526701" refused STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="The base was verified with git rev-parse ${DG_BASE}^{commit} before reading.
 reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found."
 # M45 — THE CHAIN, NOT ONE SELECTOR (sixteenth cycle, P1). Narrowing the selector group back to a
@@ -11029,13 +11143,18 @@ I only actually reviewed HEAD@{1}..HEAD; the rest was not read."
 #       059e1e0e4 exactly: `HEAD~0..HEAD` matches no arm, and 20h61 records a SIGNED `clean` over an
 #       empty range. The cell is on the CHAIN, because that is the seam — the tip arm's identity test
 #       is M44's business and it already covered `~0`, which is precisely why the divergence survived.
-MUT="$(mk_mutant nilrangechain '((~0+|\^0+|\^\{[^}/]*\}|@\{0+\})*)' '((\^0+|\^\{[^}/]*\}|@\{0+\})*)')"
-mut_check "M48 the empty-range LHS chain includes \`~0\`, the same identity the tip arm honours" 425300 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42530101" accepted STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
-I only actually reviewed HEAD~0..HEAD; the rest was not read."
+# M48 (THE EMPTY-RANGE LHS CHAIN INCLUDES `~0`) IS RETIRED WITH ITS TWO LISTS (twentieth cycle). The arm
+#       it mutated — a SECOND enumeration of the identity notations, born alongside the tip arm's and
+#       drifting from it — NO LONGER EXISTS: both arms read ONE discriminator (`_dident`), so a one-sided
+#       edit cannot open a divergence, which is the defect M48 was written for (the seventeenth cycle's
+#       `~0` drift). MEASURED: with `~0+` removed from `_dident`, 20h61's `HEAD~0..HEAD` is STILL
+#       refused, because the TIP arm refuses `HEAD~0` as a narrowing independently — so the mutation
+#       cannot red anything, and a cell that cannot red is not a cell. The capability stays pinned by
+#       20h61/20h61b as REFUSAL vectors, and by M44/M51 which mutate the discriminator itself.
 # M49 — THE SEPARATOR IS `..` OR `...` (seventeenth cycle, P1). Narrowing it back to `\.\.` makes
 #       `HEAD^0...HEAD` invisible to the only arm that can refuse an empty range, so 20h61c records a
 #       signed `clean`. Anchored WITH the LHS chain so it cannot collide with the parser's `\.{2,3}`.
-MUT="$(mk_mutant tworangedots '@\{0+\})*)[[:space:]]*\.{2,3}[[:space:]]*' '@\{0+\})*)[[:space:]]*\.\.[[:space:]]*')"
+MUT="$(mk_mutant tworangedots '(${_dident}*)[[:space:]]*\.{2,3}[[:space:]]*' '(${_dident}*)[[:space:]]*\.\.[[:space:]]*')"
 mut_check "M49 the empty-range arm reads the SAME separator grammar as every other range reader" 425304 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42530501" accepted STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
 I only actually reviewed HEAD^0...HEAD; the rest was not read."
 # M50 — THE REFLOG TERM COVERS DATES, NOT JUST DIGITS (seventeenth cycle, P1; re-aimed in the
@@ -11051,7 +11170,7 @@ I only actually reviewed HEAD@{yesterday}..HEAD; the rest was not read."
 #       single-zero spelling makes `HEAD^00`/`HEAD~00`/`HEAD@{00}` — which git resolves to the SAME
 #       commit — read as narrowings, so 20h63's honest artifact is REFUSED with a sentence that is
 #       false about it. This is the false-block direction, which this file calls the worse one.
-MUT="$(mk_mutant singlezeroidentity '^((~0+|@\{0+\}|@\{now\}|\^0+|\^\{[^}/]*\})+)$' '^((~0|@\{0\}|@\{now\}|\^0|\^\{[^}/]*\})+)$')"
+MUT="$(mk_mutant singlezeroidentity '(~0+|\^0+|\^\{[^}/]*\}|@\{0+\}|@\{now\})' '(~0|\^0|\^\{[^}/]*\}|@\{0\}|@\{now\})')"
 mut_check "M51 a zero COUNT is a zero count: leading-zero identities are not narrowings" 425314 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42531501" refused STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="The base was re-checked with git rev-parse HEAD^00 before reading.
 reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found."
 # M52 — A BRACE GROUP ON A BARE `@` IS AN OPERAND (eighteenth cycle, P1). Dropping `@\{[^}]+\}|` from
@@ -11072,9 +11191,22 @@ I only actually reviewed @{0}~1..HEAD; the rest was not read."
 #       arms, but only the TIP arm's occurrence was pinned; deleting just this one still lets
 #       `@{0}~0..HEAD` through, because the regex can no longer reach the brace at all. 20h68 is the
 #       vector, and it must then be ACCEPTED — a signed `clean` over an empty range.
-MUT="$(mk_mutant nilbraceoperand '|@\{[^}]+\}|@)((~0+|\^0+|' '|@)((~0+|\^0+|')"
+#       ⛔ RE-ANCHORED IN THE TWENTIETH CYCLE: the operand grew a ref-name alternative after `@`, so
+#       the old anchor (`|@\{[^}]+\}|@)((~0+|`) no longer named this arm. The anchor now ends on the
+#       alternation's own closing pipe — a suffix the TIP arm's operand cannot share, because there
+#       the group is followed by `)((`, not by another alternative. (M22's rule: an anchor that names
+#       a suffix of another arm mutates the WRONG arm.)
+MUT="$(mk_mutant nilbraceoperand '|@\{[^}]+\}|@|' '|')"
 mut_check "M54 the EMPTY-RANGE arm carries the bare-@ brace operand too, not just the tip arm" 425336 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42533701" accepted STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
 I only actually reviewed @{0}~0..HEAD; the rest was not read."
+# M55 — A SYMBOLIC ENDPOINT IS A TOKEN, NOT PROSE (twentieth cycle). Removing the ref-name alternative
+#       from the EMPTY-RANGE operand restores the pre-fix grammar exactly (hex, the tip's word, a
+#       brace group), so `deltatip..HEAD` — a branch AT the attested head, i.e. zero commits — matches
+#       no arm and 20h70 records a SIGNED `clean`. The cell runs 20h70's own body, and the mutant must
+#       ACCEPT it. Anchored on the LHS occurrence only; the RHS one is followed by ` ]]`, not by `)~`.
+MUT="$(mk_mutant noerefname '|[A-Za-z][A-Za-z0-9_/-]*)(${_dident}*)' ')(${_dident}*)')"
+mut_check "M55 a SYMBOLIC endpoint is admitted as a TOKEN, so an empty range cannot hide behind a branch name" 425340 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42534101" accepted STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
+I only actually reviewed deltatip..HEAD; the rest was not read."
 git checkout -q attr_lane >/dev/null 2>&1 || true
 # M8 (the tier arm) is RETIRED WITH ITS ARM: the unsigned local-record premise was a
 # forgery vector (review minted a signed `clean` from one `printf`), so there is no

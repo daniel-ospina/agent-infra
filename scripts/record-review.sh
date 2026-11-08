@@ -1511,7 +1511,7 @@ delta_git_neutral() { # <root> <git args…>
 delta_verify() { # <id: A..B[+artifact]> <head_sha> -> 0 = verified (sets DELTA_*)
   local id="$1" head="$2" range from to cover="" root="" tmp="" norm=""
   local authored="" newest="" n_authored=0 anchor="" dg_rc=0 base_sha="" base_ref=""
-  local merges_in_range="" evil="" evil_shas="" m="" parents="" pcount="" p1="" p2="" prest="" want="" actual="" cands="" mrc="" body_claim="" stated_from="" stated_to="" stated_sep="" _delta_tok="" E_OUT="" E_RC="" _scan="" _any="" _all_ok="" _sf="" _ss="" _st="" _straw="" _stcmp="" _ok="" _sfs="" _r="" _claim="" _toks="" _tok_rc=0 _tok="" _tsha="" _tipscan="" _tref="" _top="" _tiprel=0 _tisref="" _tosha="" _tipchain="" _lid=0 _rid=0 _lrest="" _elhs="" _erhs="" _elsha="" _ersha="" _eranges="" _drivers="" _dg_rc=0 _gitdir="" _gd_rc=0 _commondir="" _cd_rc=0 _attr_amb="" _wt_amb="" _ls_rc=0 _st_amb="" _st_rc=0 _ad="" _adrift="" _adr_rc=0
+  local merges_in_range="" evil="" evil_shas="" m="" parents="" pcount="" p1="" p2="" prest="" want="" actual="" cands="" mrc="" body_claim="" stated_from="" stated_to="" stated_sep="" _delta_tok="" E_OUT="" E_RC="" _scan="" _any="" _all_ok="" _sf="" _ss="" _st="" _straw="" _stcmp="" _ok="" _sfs="" _r="" _claim="" _toks="" _tok_rc=0 _tok="" _tsha="" _tipscan="" _tref="" _top="" _tiprel=0 _tisref="" _tosha="" _tipchain="" _lid=0 _rid=0 _lrest="" _elhs="" _erhs="" _elsha="" _ersha="" _eranges="" _emptyrange="" _emptystated="" _dident="" _drivers="" _dg_rc=0 _gitdir="" _gd_rc=0 _commondir="" _cd_rc=0 _attr_amb="" _wt_amb="" _ls_rc=0 _st_amb="" _st_rc=0 _ad="" _adrift="" _adr_rc=0
   range="${id%%+*}"
   [ "$range" != "$id" ] && cover="${id#*+}"
   from="${range%%..*}"; to="${range##*..}"
@@ -2539,6 +2539,15 @@ $m"
     # the brace prepended to the chain, so the chain logic below sees `@{1}` exactly as it sees
     # `HEAD@{1}`.
     _tosha="$(delta_git "$root" rev-parse --verify "${to}^{commit}" 2>/dev/null || true)"
+    # ⛔ ONE DISCRIMINATOR FOR "THIS CHAIN SELECTS NOTHING", CARRIED BY BOTH ARMS (twentieth cycle).
+    # The tip arm and the empty-range arm each ENUMERATED the identity notations, and the two lists had
+    # ALREADY DRIFTED — `~0` was in one and not the other (the seventeenth cycle's P1), and `@{now}`
+    # was in the tip arm's identity test and in NEITHER of the other arm's list (found while fixing the
+    # bare-`@` brace split, which had been masking it by treating every `@{…}` as the tip). Two lists
+    # that must be kept in step is the spelling-enumeration failure this PR's own doctrine names, and
+    # the drift is not hypothetical: it happened twice. So the identity notation is stated ONCE here
+    # and both arms read it — adding a notation to one arm adds it to the other by construction.
+    _dident='(~0+|\^0+|\^\{[^}/]*\}|@\{0+\}|@\{now\})'
     _tipscan="$_claim"; _tiprel=0
     while [[ "$_tipscan" =~ (^|[^0-9A-Za-z_])([0-9a-fA-F]{4,40}|[Hh][Ee][Aa][Dd]|@\{[^}]+\}|@)((~[0-9]*|\^\{[^}]*\}|\^[0-9]*|@\{[^}]+\})*) ]]; do
       _tref="${BASH_REMATCH[2]}"; _top="${BASH_REMATCH[3]}"
@@ -2571,7 +2580,7 @@ $m"
       # NAMED one was refused with "RELATIVE TO THE TIP … always NARROWER", which is false about it —
       # the false-block class this file's own doctrine calls worse than the gap. `0+` states the rule
       # (a zero count is a zero count) instead of enumerating the spellings that happen to occur.
-      [[ "$_top" =~ ^((~0+|@\{0+\}|@\{now\}|\^0+|\^\{[^}/]*\})+)$ ]] && continue
+      [[ "$_top" =~ ^(${_dident}+)$ ]] && continue
       # ⛔ NO SELECTOR, NOTHING TO CLASSIFY. The chain group is `*` because a brace group on a bare `@`
       # IS the selector and arrives through the operand (normalised above); that also lets a bare
       # reference match, and a bare `HEAD` — or a sha merely QUOTED in prose — names no narrowing at
@@ -2621,8 +2630,21 @@ $m"
     # `HEAD^0...HEAD` and `HEAD...HEAD` were INVISIBLE to the only arm that can refuse an empty range.
     # Both are the same lesson as the arm above: a guard that enumerates spellings instead of stating
     # the grammar leaves a synonym outside it.
+    # ⛔ A SYMBOLIC ENDPOINT IS DECIDED HERE, NOT CARRIED (twentieth cycle — the residual declared at
+    # ff9ededd6 and twice before: "with a branch or tag at the attested head, `tmp3698..HEAD` is an
+    # empty range and is accepted"). The arm's grammar admitted only hex, the tip's word and a brace
+    # group, so a REF NAME never entered it and `tmp3698..HEAD` — an EMPTY range, i.e. the narrowest
+    # claim there is, offered as the evidence for a range that has commits — minted a signed `clean`.
+    # The decision: a ref name is a TOKEN like any other, and the arm already knows how to decide an
+    # endpoint it cannot read by spelling — RESOLVE it and COMPARE (`rev-parse` for a non-tip token is
+    # the existing second path; a sha is frame-independent, and so is the ref name's meaning in the
+    # repo the delta is read from). So the residual does not close by adding a spelling test, it
+    # closes by admitting the token. DECLARED REMAINDER: the token class carries no `.`, because a dot
+    # is the separator's own character and a class that ate it would make `a..b` ambiguous — so a ref
+    # name CONTAINING a dot (`v1.2.3..HEAD`) stays outside this arm. That is a smaller residual than
+    # "any symbolic ref", stated here rather than discovered later.
     _eranges="$_claim"
-    while [[ "$_eranges" =~ (^|[^0-9A-Za-z_])([0-9a-fA-F]{4,40}|[Hh][Ee][Aa][Dd]|@\{[^}]+\}|@)((~0+|\^0+|\^\{[^}/]*\}|@\{0+\})*)[[:space:]]*\.{2,3}[[:space:]]*([0-9a-fA-F]{4,40}|[Hh][Ee][Aa][Dd]|@) ]]; do
+    while [[ "$_eranges" =~ (^|[^0-9A-Za-z_])([0-9a-fA-F]{4,40}|[Hh][Ee][Aa][Dd]|@\{[^}]+\}|@|[A-Za-z][A-Za-z0-9_/-]*)(${_dident}*)[[:space:]]*\.{2,3}[[:space:]]*([0-9a-fA-F]{4,40}|[Hh][Ee][Aa][Dd]|@|[A-Za-z][A-Za-z0-9_/-]*) ]]; do
       _elhs="${BASH_REMATCH[2]}${BASH_REMATCH[3]}"; _erhs="${BASH_REMATCH[5]}"
       _eranges="${_eranges#*"${BASH_REMATCH[0]}"}"
       case "${_elhs:0:4}" in
@@ -2639,20 +2661,30 @@ $m"
       # endpoints are TIp SPELLINGS with identity-only chains ⇒ they denote the attested head itself,
       # so the range is empty in EVERY frame, and this test needs no checkout at all.
       _lid=0; _rid=0
-      [[ "$_elhs" =~ ^(HEAD|@|@\{0+\})((~0+|\^0+|\^\{[^}/]*\}|@\{0+\})*)$ ]] && _lid=1
-      [[ "$_erhs" =~ ^(HEAD|@|@\{0+\})$ ]] && _rid=1
+      [[ "$_elhs" =~ ^(HEAD|@|@\{0+\}|@\{now\})(${_dident}*)$ ]] && _lid=1
+      [[ "$_erhs" =~ ^(HEAD|@|@\{0+\}|@\{now\})$ ]] && _rid=1
       if [ "$_lid" = 1 ] && [ "$_rid" = 1 ]; then
-        _tiprel=1; break
+        _emptyrange=1; _emptystated="${_elhs}..${_erhs}"; break
       fi
       # The attested frame again: a tip-rooted endpoint is `$to`, and only a NON-tip endpoint is
       # resolved through the checkout (a sha is frame-independent by construction).
       case "$_elhs" in
         [Hh][Ee][Aa][Dd]*|@*)
           # Split the tip token off and resolve only the REST against the attested head.
+          # ⛔ A BRACE ON A BARE `@` IS THE TIP'S OWN REFLOG POSITION, AND ITS CONTENT IS THE
+          # POSITION, NOT DECORATION (twentieth cycle — FOUND BY 20h65b GOING RED). Stripping the
+          # brace left `_lrest` EMPTY, so `@{1}` was resolved as `$to` — the TIP — and the arm
+          # classified `@{1}..HEAD` as an EMPTY range. The verdict happened to stay a refusal (the
+          # TIP arm above refuses the same text as a narrowing), so only the MESSAGE exposed it: the
+          # artifact was told it had stated an empty range when it had stated a range an elder
+          # reflog position starts. A right answer for a wrong reason is what the next cycle finds,
+          # and a false sentence about the author's own text is the class this file calls worse than
+          # the gap. `HEAD@{1}` was already correct here (the `HEAD` split leaves `@{1}` intact); only
+          # the bare-`@` arm discarded it.
           _lrest="${_elhs}"
           case "$_lrest" in
+            @\{*\}) continue ;;
             [Hh][Ee][Aa][Dd]*) _lrest="${_lrest#HEAD}" ;;
-            @\{*\}) _lrest="@${_lrest#*\}}" ; _lrest="${_lrest#@}" ;;
             @*) _lrest="${_lrest#@}" ;;
           esac
           _elsha="$(delta_git "$root" rev-parse --verify "${_tosha}${_lrest}^{commit}" 2>/dev/null || true)" ;;
@@ -2664,9 +2696,19 @@ $m"
         *) _ersha="$(delta_git "$root" rev-parse --verify "${_erhs}^{commit}" 2>/dev/null || true)" ;;
       esac
       if [ "$_elsha" = "$_ersha" ] && [ "$_elsha" = "$to" ]; then
-        _tiprel=1; break
+        _emptyrange=1; _emptystated="${_elhs}..${_erhs}"; break
       fi
     done
+    # ⛔ THE REFUSAL NAMES WHICH CLAIM WAS REFUSED (twentieth cycle). An empty range is not
+    # "RELATIVE TO THE TIP" notation: `tmp3698..HEAD` writes two absolute endpoints, and telling its
+    # author the artifact stated a tip-relative narrowing would be a FALSE message about their own
+    # text — the class this file calls worse than the gap, and the one thing a refusing gate must
+    # never do. The two arms now share the flag but not the sentence.
+    if [ "$_emptyrange" = 1 ]; then
+        echo "   delta: the covering artifact '$cover' states an EMPTY range ('$_emptystated' — both endpoints resolve to the attested head ${to:0:12}…), so it names ZERO commits while the record would assert ${from:0:12}…..${to:0:12}…. An empty range is the narrowest claim there is, and it cannot be the evidence for a range that has commits. Nothing was written." >&2
+        echo "   → the claim must state the range it read as delta:${from:0:12}..${to:0:12}." >&2
+        return 1
+    fi
     if [ "$_tiprel" = 1 ]; then
         echo "   delta: the covering artifact '$cover' states a range RELATIVE TO THE TIP (<ref>~N / <ref>^N / <ref>@{N}) — that is always NARROWER than ${from:0:12}…..${to:0:12}…, so the record would assert a range the artifact excludes. Nothing was written." >&2
         echo "   → the claim must state the range it read as delta:${from:0:12}..${to:0:12}." >&2
