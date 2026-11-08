@@ -1417,6 +1417,10 @@ exit 1
 FARM
 chmod +x "$T/t24q/stub-checker.sh"
 OUT="$(HARNESS_APPLY_FARM_CHECKER="$T/t24q/stub-checker.sh" run_pass "$T/t24q" 2>&1)"; RC=$?
+# ⛔ THIS RUN'S OUTPUT, KEPT (review round 13, measured): t24r and t24s REASSIGN `$OUT` further down, so
+# the "counts ROWS, not prose" assertion that belongs to THIS fixture was reading t24s's pass — it passed
+# only because t24s reuses this stub. Reading the wrong run is the defect the file condemns at :376-380.
+OUT24Q="$OUT"
 assert_eq "$RC" "24" "T24 control: a 20-row drift is RED"
 assert_contains "$OUT" "re-run the farm from a ref-consistent checkout" \
     "T24 control: and the instrument's own REMEDY survives a long row list (it is its last line)"
@@ -1447,6 +1451,13 @@ assert_contains "$(head -1 "$ROWS" 2>/dev/null || true)" "ref=origin/main" \
 # left every assertion green while the documented procedure became false.
 assert_contains "$(head -1 "$ROWS" 2>/dev/null || true)" "dest=$T/t24q/home/.pi/agent/scripts" \
     "T24 control: the header names the FARM it graded, so it can be compared with the record's detail="
+# ⛔ AND `remedy=` CARRIES THE INSTRUMENT'S OWN REMEDY (review round 13, measured: it was `none` on every
+# farm-drift record, while `detail=` said "with the instrument's own remedy" — a refusal that names no
+# action, which the `remedy=` field's own comment argues against). The remedy is the ONE actionable line.
+assert_contains "$(grep '^remedy=' "$T/t24q/state/harness-apply.status" 2>/dev/null || true)" "re-run the farm from a ref-consistent checkout" \
+    "T24 control: the record's remedy= is the instrument's own remedy, never the literal none"
+assert_contains "$(grep '^remedy=' "$T/t24q/state/harness-apply.status" 2>/dev/null || true)" "declare it LOCAL, delete it, or retire it" \
+    "T24 control: including its CONTINUATION line, so the action clause is not cut mid-remedy"
 HDR_TS24Q="$(head -1 "$ROWS" 2>/dev/null | awk '{print $7}')"
 AT24Q="$(sed -n 's/^at=//p' "$T/t24q/state/harness-apply.status" 2>/dev/null | head -1)"
 if [ -n "$HDR_TS24Q" ] && [ -n "$AT24Q" ] && { [ "$HDR_TS24Q" \< "$AT24Q" ] || [ "$HDR_TS24Q" = "$AT24Q" ]; }; then
@@ -1520,7 +1531,7 @@ assert_contains "$(cat "$T/t24s/cwd/relstate/harness-apply-farm-rows.txt" 2>/dev
 # ⛔ THE COUNT MUST NOT COUNT PROSE. The instrument prints class-prose lines that contain the same
 # words as a row ("A STALE file is a copy …"), so a whole-line match reported 3 real rows as 7
 # (review round 8). 20 stub rows + 2 prose lines must still read as 20.
-assert_contains "$OUT" "20 row(s)" "T24 control: the row count counts ROWS, not the instrument's class prose"
+assert_contains "$OUT24Q" "20 row(s)" "T24 control: the row count counts ROWS, not the instrument's class prose"
 
 # ⛔ A SECOND DRIFT PASS REPLACES THE LIST, IT DOES NOT ACCUMULATE (review round 5). The artifact is
 # published by renaming a per-pid temp, and an in-place `>>` append instead would leave a reader with
@@ -1571,10 +1582,32 @@ assert_eq "$RC" "24" "T24 control: an UNREADABLE farm grade is RED (24), never a
 assert_contains "$OUT" "farm: UNKNOWN" "T24 control: and the line says the grade could not be read"
 REC24U="$(cat "$T/t24u/state/harness-apply.status" 2>/dev/null || true)"
 assert_contains "$REC24U" "action=farm-unknown" "T24 control: the record names the unreadable grade"
-assert_contains "$(grep '^farm_rows=' <<<"$REC24U")" "farm_rows=not-graded" \
-    "T24 control: and the rows field says NO grade — never 'none', which claims the farm matched"
+# ⛔ NO GRADE, BUT STILL A NAME (review round 13, reproduced). `check-farm-drift.sh` prints its per-file
+# rows BEFORE the exits that give up (:689 `matched -eq 0`, :699 mixed ungradeable), so "no grade" was
+# never the same claim as "nothing was reported": measured, 2 UNSOURCED rows then exit 2 recorded
+# `farm_rows=not-graded` and named both files NOWHERE. The rows file is published when the instrument
+# printed anything, and `farm_n=not-graded` still says no grade was produced.
+assert_contains "$(grep '^farm_rows=' <<<"$REC24U")" "farm_rows=$T/t24u/state/harness-apply-farm-rows.txt" \
+    "T24 control: and the rows field names the output the instrument DID print before giving up"
+assert_contains "$(cat "$T/t24u/state/harness-apply-farm-rows.txt" 2>/dev/null || true)" "could not be compared" \
+    "T24 control: with that output persisted verbatim (the header says NO GRADE, so it is not a complete list)"
+assert_contains "$(head -1 "$T/t24u/state/harness-apply-farm-rows.txt" 2>/dev/null || true)" "NO GRADE" \
+    "T24 control: and the artifact's own header says the grade failed, so nobody reads it as a verdict"
 assert_contains "$(grep '^farm_n=' <<<"$REC24U")" "farm_n=not-graded" \
-    "T24 control: with the row count in the same state"
+    "T24 control: while the row count still says NO grade, never 'none', which claims the farm matched"
+
+# ⛔ AND WHEN IT PRINTS NOTHING, `farm_rows=` STAYS `not-graded` (review round 13). The publish above is
+# conditional on there being output at all; without this fixture the condition could be dropped and
+# every silent-checker record would name a file holding a header and nothing else.
+mk_origin t24u2; mk_clone t24u2
+REPO_P="$CLONE"; MODE_P=sync
+mkdir -p "$T/t24u2/home/.pi/agent/scripts"
+printf '#!/usr/bin/env bash\nexit 2\n' >"$T/t24u2/stub-silent.sh"; chmod +x "$T/t24u2/stub-silent.sh"
+OUT="$(HARNESS_APPLY_FARM_CHECKER="$T/t24u2/stub-silent.sh" run_pass "$T/t24u2" 2>&1)"; RC=$?
+assert_eq "$RC" "24" "T24 control: a SILENT unreadable grade is still RED (24)"
+REC24U2="$(cat "$T/t24u2/state/harness-apply.status" 2>/dev/null || true)"
+assert_contains "$(grep '^farm_rows=' <<<"$REC24U2")" "farm_rows=not-graded" \
+    "T24 control: and a checker that printed NOTHING gets no artifact named — there is no name to publish"
 
 # ⛔ ZERO EXTRACTED ROWS IS NOT "EVERY FILE NAMED" (review round 5, reproduced). The row extractor's
 # vocabulary is a COPY of the instrument's, so a FARMED checker whose rows it does not match yields a
@@ -1945,6 +1978,54 @@ assert_contains "$(grep '^farm_n=' <<<"$REC24AF")" "farm_n=unparsed" \
     "T24 control: with farm_n= UNPARSED, never the 2 rows the extractor happened to match"
 assert_absent "$(grep '^detail=' <<<"$REC24AF")" "every one named" \
     "T24 control: and detail= never certifies a list built from an empty proof"
+
+# ⛔ THE RAW ARM'S OWN ELISION MUST BE PINNED (review round 13, measured: a mutant that persisted only
+# `head -12` of the raw body WHEN THE EXTRACTION WAS UNPROVEN passed the whole suite, because every
+# raw-arm fixture's output is ≤ 12 non-blank lines). A LAGGING FARM is exactly the shape that exceeds
+# it: 20 rows in a class this pass cannot match + the summary. The artifact must hold all 21, and the
+# elision line must say so; 9 files named nowhere durable is the defect this feature removes.
+mk_origin t24ag; mk_clone t24ag
+REPO_P="$CLONE"; MODE_P=sync
+mkdir -p "$T/t24ag/home/.pi/agent/scripts"
+cat >"$T/t24ag/stub-20unknown.sh" <<'FARM'
+#!/usr/bin/env bash
+i=1
+while [ "$i" -le 20 ]; do printf 'laggard-%s.py | a | b | IN-A-CLASS-THIS-PASS-CANNOT-EXTRACT
+' "$i" >&2; i=$((i+1)); done
+printf 'check-farm-drift: DRIFT — 20 stale (20 farm-declared — a re-run must fix these; 0 outside the farm), 0 declared-but-absent, 0 unsourced, of 20 deployed file(s) (20 sourced, 0 matching) against origin/main (sync) in %s.\n' "$PWD/src"
+exit 1
+FARM
+chmod +x "$T/t24ag/stub-20unknown.sh"
+OUT="$(HARNESS_APPLY_FARM_CHECKER="$T/t24ag/stub-20unknown.sh" run_pass "$T/t24ag" 2>&1)"; RC=$?
+assert_eq "$RC" "24" "T24 control: a 20-row drift this pass cannot extract is still RED (24)"
+ROWS24AG="$T/t24ag/state/harness-apply-farm-rows.txt"
+assert_eq "$(grep -c . "$ROWS24AG" 2>/dev/null | tr -d ' ')" "22" \
+    "T24 control: the artifact holds a header plus ALL 21 lines of the unproven output — never an excerpt"
+assert_contains "$(cat "$ROWS24AG" 2>/dev/null || true)" "laggard-20.py" \
+    "T24 control: including the LAST file, which an excerpt-persisting body would drop"
+assert_contains "$OUT" "9 more line(s) of the instrument's output — ALL 21 are named in" \
+    "T24 control: and the journal says 9 more of 21, all of them in the file"
+
+# ⛔ AN INSTRUMENT THAT PRINTS NOTHING IS ITS OWN STATE (review round 13, measured: the guard that skips
+# the excerpt was unasserted and survived; `printf '%s\n' ""` emits ONE blank line, so the journal grew
+# an empty `farm:   ` row and `detail=` still said "RAW output published verbatim" over a header-only
+# artifact). Pinned here: no blank excerpt row, the sentence says NO output, and the record does not
+# point a reader at names that were never printed.
+mk_origin t24ah; mk_clone t24ah
+REPO_P="$CLONE"; MODE_P=sync
+mkdir -p "$T/t24ah/home/.pi/agent/scripts"
+printf '#!/usr/bin/env bash\nexit 1\n' >"$T/t24ah/stub-mute.sh"; chmod +x "$T/t24ah/stub-mute.sh"
+OUT="$(HARNESS_APPLY_FARM_CHECKER="$T/t24ah/stub-mute.sh" run_pass "$T/t24ah" 2>&1)"; RC=$?
+assert_eq "$RC" "24" "T24 control: a drift grade with NO output is still RED (24), never a pass"
+assert_contains "$OUT" "printed NO output for a red grade" \
+    "T24 control: and the journal says the instrument printed nothing — the one fact it can state"
+assert_eq "$(printf '%s\n' "$OUT" | grep -c '^farm:   $' | tr -d ' ')" "0" \
+    "T24 control: with NO blank excerpt row (an empty body still prints one line if it is not guarded)"
+REC24AH="$(cat "$T/t24ah/state/harness-apply.status" 2>/dev/null || true)"
+assert_contains "$(grep '^farm_n=' <<<"$REC24AH")" "farm_n=unparsed" \
+    "T24 control: the count is UNPARSED, not 0, and not the farm-matched meaning"
+assert_absent "$(grep '^detail=' <<<"$REC24AH")" "published verbatim" \
+    "T24 control: and detail= never says output was published when none was printed"
 
 # ── T26: the materialiser is TOLD which cell home to pin into (agent-infra#3593) ─────────────────
 # MEASURED on the `cmux` cell, 2026-11-06: this pass resolves CELL_HOME from $HOME (pass:195) and the

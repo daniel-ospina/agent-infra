@@ -174,14 +174,19 @@ that path holds pass B's. The write is atomic (a reader never sees half a list, 
 removes another's file), but it is **not per-run**, and the header is what you can decide with:
 
 - the header's `ref=` and `dest=` are the **ref name and farm path this record's `detail=` quotes** —
-  `detail=` begins `farm: DRIFT — <dest> is NOT the code <ref> ships`, so the pair must appear there
-  verbatim (they are the same two variables; the record has NO `dest=` field of its own, and the
-  record's `ref=` is the RESOLVED SHORT SHA, a different value on purpose — do not compare those);
+  `detail=` reads `farm: DRIFT — <the arm sentence>; <dest> is NOT the code <ref> ships (…)`, so the
+  pair must appear there verbatim, after the arm sentence (they are the same two variables; the record
+  has NO `dest=` field of its own, and the record's `ref=` is the RESOLVED SHORT SHA, a different value
+  on purpose — do not compare those). The ARM SENTENCE leads because `detail=` is bounded and what
+  comes last is what gets lost, so on a very long farm path the `dest=` tail may itself be cut — the
+  header's `dest=` is then the value to trust;
 - the header's UTC must **not be later than** the record's `at=` (the artifact is published first,
 so a header timestamp *after* the record's own is the one cheap impossibility — compare same-format
 strings, both UTC, NOT the header's UTC against the record's `epoch=`);
-- the header's `n=` must equal the record's `farm_n=`, **except** when the header reads
-  `n=unparsed` — then `farm_n=unparsed` too, and the paragraph below governs.
+- the header's `n=` must equal the record's `farm_n=`, **except** when the header reads `n=unparsed`
+  — then `farm_n` is `unparsed` (the paragraph below governs), or `not-graded` when the header ALSO
+  says `NO GRADE` (the instrument exited 2, so the file holds its output verbatim and no grade exists —
+  see the `farm-unknown` paragraph below).
 
 Those rules cannot separate two passes that produced the **same** row count inside this record's own
 publish→`finish` window (~3–4 s); nothing in the artifact can, and claiming otherwise is worse than
@@ -208,6 +213,21 @@ most the first 12 lines: the rows this pass MATCHED when it matched any, the ins
 when it matched none) only when the publish failed — so the record says "published verbatim" and never
 "every one named".
 
+`farm_rows=<path>` with `n=unparsed` is ALSO written when the instrument printed **nothing** for a red
+grade: the artifact is a header and no body, and the record's `detail=` says so instead of claiming
+output was published. That is the one state where a published list can name no file — because the
+instrument named none.
+
+`farm_rows=<path>` is ALSO written on `action=farm-unknown` (`rc=24`, the instrument's own exit 2). The
+instrument prints its per-file rows BEFORE the exits that give up (`matched == 0`, a partly ungradeable
+declaration), so "no grade" never meant "nothing was reported": the file carries that output verbatim
+with a `NO GRADE` header, `farm_n=not-graded` still says no grade was produced, and `farm_rows=` stays
+`not-graded` only when the instrument printed nothing at all.
+
+`remedy=` carries the instrument's own `Next:` block on a drift refusal — the one actionable text it
+prints, which is per class ("re-run the farm", "declare it LOCAL, delete, or retire it", "a deploy
+cannot fix this") — so the record never names a defect and leaves nobody an action.
+
 `farm_rows=unwritable` means the rows write failed **while the record write still succeeded** — the
 drift is still red, `farm_n` still carries the count it had (or `unparsed` when the extraction was
 **not proven complete** — a partial match counts here too, not only a total miss), but **no artifact is
@@ -215,16 +235,16 @@ written by this pass**, so the journal says so in as many words and the rows pas
 are named nowhere durable. (A state dir that is unwritable for the
 record too leaves the PREVIOUS record in place: staleness, not a field, is that signal.)
 
-⛔ **`detail=` IS BOUNDED, SO NO SENTENCE IN IT NAMES A PATH.** The field is cut at 240 bytes, and the
-drift refusal's own prefix (the farm path plus the ref) already spends most of that: ANY sentence
-ending "… in <path>" was cut MID-FILENAME once the farm and state paths were long enough together
-(measured threshold: `len(farm) + len(state) ≥ 132`), so a reader of `detail=` (fleet-health,
-`--print-status`) got a path that does not exist. Every row sentence — including the complete one —
-therefore says "see `farm_rows=`", which is the field that carries the path (or `unwritable`) in the
-same record. The bound also truncates at a **byte** and used to land inside a
-multi-byte character — leaving one invalid UTF-8 sequence that made `grep '^detail='` classify the WHOLE
-record as binary and print nothing, so the truncation now stops at the last ASCII byte (a boundary a
-multi-byte sequence cannot straddle).
+⛔ **`detail=` IS BOUNDED, SO IT LEADS WITH THE DIAGNOSIS AND NO SENTENCE IN IT NAMES A PATH.** The
+field is cut at 240 bytes, so *what comes last is what gets lost*: with the farm path first, a 92-char
+farm pushed the arm sentence past the bound (`…; RAW output published verba`) and a very long one left
+nothing but a path — the record then stated no diagnosis at all. The arm sentence now comes FIRST and
+the farm path after it (the artifact's own `dest=` header is the authoritative copy of that path), and
+no sentence inlines the artifact path — they all say "see `farm_rows=`", which is the field that
+carries the path (or `unwritable`) in the same record. The bound also truncates at a **byte** and used
+to land inside a multi-byte character — leaving one invalid UTF-8 sequence that made
+`grep '^detail='` classify the WHOLE record as binary and print nothing, so the truncation now stops at
+the last ASCII byte (a boundary a multi-byte sequence cannot straddle).
 
 ⛔ `deployed` EXISTS BECAUSE THE CHECKOUT IS NOT THE DEPLOYMENT. A pin-per-commit cell
 never moves its checkout, so `behind` measured there would be permanently non-zero and

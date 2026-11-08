@@ -399,6 +399,42 @@ bounded() {
         { if (length($0) > n) { s = substr($0, 1, n); sub(/[^ -~]+$/, "", s); print s } else print }'
 }
 
+# ⛔ ONE PUBLISH PATH FOR EVERY ARM THAT HAS SOMETHING TO NAME (review round 13, reproduced). The
+# `farm-unknown` arm (instrument exit 2) ALSO prints per-file rows BEFORE it gives up — its
+# `matched -eq 0` and mixed-ungradeable exits come AFTER the per-file loop (check-farm-drift.sh:689,
+# :699) — so "no grade" was taken to mean "nothing was reported" and those names were dropped.
+# Measured: 2 UNSOURCED rows then exit 2 printed only the UNKNOWN reason, wrote no artifact, and named
+# both files NOWHERE. The write is atomic (temp + rename), REFUSES a directory at the published path,
+# and records its own outcome, so neither arm can drift from the other.
+publish_farm_rows() {   # $1 body, $2 header note → sets REC_FARM_ROWS, FARM_ROWS_OK
+    local _body="$1" _note="$2" _sd=""
+    mkdir -p "$STATE_DIR" 2>/dev/null || true
+    if [ "${FARM_ROWS_FILE#/}" = "$FARM_ROWS_FILE" ]; then
+        # ⛔ `CDPATH=` IS LOAD-BEARING (review round 3): bash's `cd` PRINTS the resolved directory when
+        # it resolves through an inherited CDPATH, so `_sd` would hold two lines and the "absolute"
+        # path would name a directory containing a newline.
+        _sd="$(CDPATH= cd "$STATE_DIR" 2>/dev/null && pwd)" || _sd=""
+        [ -n "$_sd" ] && FARM_ROWS_FILE="$_sd/harness-apply-farm-rows.txt"
+    fi
+    # ⛔ THE POST-CONDITION IS THE PUBLISHED PATH, NOT `mv`'s EXIT CODE. `mv src dir` where the
+    # artifact path is a DIRECTORY moves the tempfile INTO it and returns 0, so an exit-code-only test
+    # would record a path that holds no list. The `[ ! -d ]` pre-check refuses that state UP FRONT
+    # (replacing it with `[ -n … ]` strands the temp inside the directory and reds T24r); the trailing
+    # `[ -f ]` is DEFENCE IN DEPTH for the concurrent case and is stated as such (#3442).
+    FARM_ROWS_OK=0
+    if [ ! -d "$FARM_ROWS_FILE" ] \
+       && { printf '# harness-apply farm drift rows — %s — ref=%s dest=%s %s\n' \
+                "$(date -u +%FT%TZ)" "$REF" "$FARM_DEST" "$_note" >"$FARM_ROWS_FILE.tmp-$$" 2>/dev/null \
+            && printf '%s\n' "$_body" >>"$FARM_ROWS_FILE.tmp-$$" 2>/dev/null; } \
+       && mv -f "$FARM_ROWS_FILE.tmp-$$" "$FARM_ROWS_FILE" 2>/dev/null \
+       && [ -f "$FARM_ROWS_FILE" ]; then
+        REC_FARM_ROWS="$FARM_ROWS_FILE"; FARM_ROWS_OK=1
+    else
+        rm -f "$FARM_ROWS_FILE.tmp-$$" 2>/dev/null || true
+        REC_FARM_ROWS=unwritable
+    fi
+}
+
 # ── --print-status: the record answers "did it succeed", and STALENESS is an alarm ─────────────
 # ⛔ AN ENABLED TIMER THAT STOPPED FIRING MUST NOT READ AS A HEALTHY NO-OP. A pass whose pin already
 # equals the ref exits 0 and writes rc=0 every ten minutes; if the timer dies those records simply
@@ -1459,6 +1495,14 @@ if [ "$FARM_CHECK_ON" = "1" ]; then
                 # NEITHER the artifact NOR the record. A lagging farmed copy is exactly the premise this
                 # arm exists for, so an unparseable label means the proof is ABSENT, not that the class
                 # counted zero.
+                # ⛔ ONE POPULATION FOR "HOW MUCH OUTPUT IS THERE" (VGATE round 14, measured). The
+                # excerpt prints the blank-stripped population while the elision counted `grep -c .`
+                # over the RAW text — `grep -c .` counts a whitespace-only line, so 12 rows + one
+                # 3-space line + summary read as "and 3 more line(s)" while only 2 were withheld. The
+                # stripped population is computed ONCE here, before any decision reads it.
+                FARM_OUT_NB="$(printf '%s\n' "$FARM_OUT" | grep -v '^[[:space:]]*$' || true)"
+                FARM_OUT_LINES=0
+                [ -n "$FARM_OUT_NB" ] && FARM_OUT_LINES="$(printf '%s\n' "$FARM_OUT_NB" | grep -c . || true)"
                 FARM_EXPECT=""
                 _fx="$(printf '%s\n' "$FARM_OUT" | grep -m1 'DRIFT' || true)"
                 if [ -n "$_fx" ]; then
@@ -1472,7 +1516,14 @@ if [ "$FARM_CHECK_ON" = "1" ]; then
                 unset _fx _fa _fb _fc
                 FARM_ROWS_RAW=0; PERSIST_BODY="$FARM_ROWS"; FARM_RAW_WHY=""
                 HDR_NOTE="n=$FARM_NROWS (the rows below are EXACTLY this run; farm_rows= in harness-apply.status is the currency indicator)"
-                if [ "$FARM_NROWS" -eq 0 ]; then
+                if [ "$FARM_NROWS" -eq 0 ] && [ "$FARM_OUT_LINES" -eq 0 ]; then
+                    # ⛔ NO OUTPUT AT ALL IS ITS OWN STATE (review round 13; the note was DEAD CODE
+                    # until VGATE round 14 — it was assigned after `publish_farm_rows` had already read
+                    # the old one, so a silent instrument still published "the RAW output follows
+                    # verbatim" over a header-only file).
+                    FARM_ROWS_RAW=1; PERSIST_BODY="$FARM_OUT"; FARM_RAW_WHY=empty
+                    HDR_NOTE="n=unparsed (the instrument printed NO output for a RED grade — farm_n=unparsed says the count is UNKNOWN, and there is no name in this file because none was printed)"
+                elif [ "$FARM_NROWS" -eq 0 ]; then
                     FARM_ROWS_RAW=1; PERSIST_BODY="$FARM_OUT"; FARM_RAW_WHY=zero
                     HDR_NOTE="n=unparsed (NO row matched this pass's extractor — the instrument's RAW output follows verbatim; farm_n=unparsed says the count is UNKNOWN, not that nothing drifted)"
                 elif [ -z "$FARM_EXPECT" ]; then
@@ -1499,49 +1550,9 @@ if [ "$FARM_CHECK_ON" = "1" ]; then
                 # named in the record (`farm_rows=`) so it is reachable without reading the journal.
                 # A truncation that is only COUNTED is not a check that names each drifting file:
                 # measured on the `cmux` cell, 30 rows — 12 named, 18 counted, 0 named anywhere durable.
-                # The state dir is created HERE rather than assumed: `write_record` makes it too, but
-                # that runs at `finish`, i.e. AFTER this write — a first pass on a fresh box would
-                # otherwise record `unwritable` on the one run that had drift to name.
-                mkdir -p "$STATE_DIR" 2>/dev/null || true
-                # ⛔ ABSOLUTISE BEFORE PUBLISHING (review round 2). `HARNESS_APPLY_STATE_DIR` is not
-                # required to be absolute here, and a relative `farm_rows=` value is resolvable only
-                # from the pass's own cwd — useless to the fleet reader the field exists for.
-                if [ "${FARM_ROWS_FILE#/}" = "$FARM_ROWS_FILE" ]; then
-                    # ⛔ `CDPATH=` IS LOAD-BEARING (review round 3). bash's `cd` PRINTS the resolved
-                    # directory when it resolves through an inherited CDPATH, so `_sd` would hold two
-                    # lines and the "absolute" path would name a directory containing a newline — a
-                    # writable state dir then records `farm_rows=unwritable` and the list is lost.
-                    _sd="$(CDPATH= cd "$STATE_DIR" 2>/dev/null && pwd)" || _sd=""
-                    [ -n "$_sd" ] && FARM_ROWS_FILE="$_sd/harness-apply-farm-rows.txt"
-                fi
-                # ⛔ THE OUTCOME IS TRACKED SEPARATELY FROM THE VALUE (review round 1). Branching the
-                # messages on `case "$REC_FARM_ROWS" in /*)` decided "did it persist?" from the SHAPE
-                # of a path, and `HARNESS_APPLY_STATE_DIR` is not required to be absolute here — so a
-                # SUCCESSFUL write to a relative state dir reported itself as "could NOT be persisted"
-                # while `farm_rows=` named the file. One record contradicting itself is exactly the
-                # class this pass exists to remove.
-                FARM_ROWS_OK=0
-                # ⛔ THE POST-CONDITION IS THE PUBLISHED PATH, NOT `mv`'s EXIT CODE (review finding).
-                # `mv src dir` where the artifact path is a DIRECTORY moves the tempfile INTO it and
-                # returns 0, so an exit-code-only test would record a path that holds no list. The
-                # `[ ! -d ]` pre-check refuses that state UP FRONT (it is the one with an attributable
-                # mutant: replacing it with `[ -n … ]` strands the temp inside the directory and reds
-                # T24r); the trailing `[ -f ]` is DEFENCE IN DEPTH — with the pre-check and a
-                # same-directory `mv` no reachable state distinguishes it, so it is kept for the
-                # concurrent case (another pass replacing the published path between `mv` and the test)
-                # and stated as such rather than claimed as the guard that makes "persisted" mean
-                # "a readable file is at the named path" (#3442: an unattributed guard is not a guard).
-                if [ ! -d "$FARM_ROWS_FILE" ] \
-                   && { printf '# harness-apply farm drift rows — %s — ref=%s dest=%s %s\n' \
-                            "$(date -u +%FT%TZ)" "$REF" "$FARM_DEST" "$HDR_NOTE" >"$FARM_ROWS_FILE.tmp-$$" 2>/dev/null \
-                        && printf '%s\n' "$PERSIST_BODY" >>"$FARM_ROWS_FILE.tmp-$$" 2>/dev/null; } \
-                   && mv -f "$FARM_ROWS_FILE.tmp-$$" "$FARM_ROWS_FILE" 2>/dev/null \
-                   && [ -f "$FARM_ROWS_FILE" ]; then
-                    REC_FARM_ROWS="$FARM_ROWS_FILE"; FARM_ROWS_OK=1
-                else
-                    rm -f "$FARM_ROWS_FILE.tmp-$$" 2>/dev/null || true
-                    REC_FARM_ROWS=unwritable
-                fi
+                # The ONE write path lives in `publish_farm_rows` (the same function the `farm-unknown`
+                # arm uses, so the two can never drift apart).
+                publish_farm_rows "$PERSIST_BODY" "$HDR_NOTE"
                 # ⛔ `farm_n=unparsed` ON THE RAW ARM, NEVER `0` (review round 6). `farm_n=0` already
                 # means "the farm matched" in every other record, so a RED record carrying `0` reads as
                 # "zero rows drifted" — one field with two meanings is the class this pass deletes.
@@ -1566,11 +1577,13 @@ if [ "$FARM_CHECK_ON" = "1" ]; then
                     # nothing at all because `12 -gt 12` is false; 20 rows + 4 blanks printed 12 lines
                     # holding 10 rows and claimed "and 8 more line(s)". Blanks are dropped ONCE, in the
                     # population both the excerpt and the arithmetic read.
-                    FARM_EXCERPT="$(printf '%s\n' "$FARM_OUT" | grep -v '^[[:space:]]*$' || true)"
+                    FARM_EXCERPT="$FARM_OUT_NB"
                 fi
-                printf '%s\n' "$FARM_EXCERPT" | head -12 | while IFS= read -r _row; do
-                    log_line "farm:   $_row"
-                done
+                if [ -n "$FARM_EXCERPT" ]; then
+                    printf '%s\n' "$FARM_EXCERPT" | head -12 | while IFS= read -r _row; do
+                        log_line "farm:   $_row"
+                    done
+                fi
                 if [ "$FARM_ROWS_RAW" = 1 ]; then
                     if [ "$FARM_ROWS_OK" = 1 ]; then
                         # ⛔ THE EXCERPT ABOVE IS NOT THE RAW OUTPUT WHENEVER ANYTHING WAS EXTRACTED
@@ -1579,7 +1592,9 @@ if [ "$FARM_CHECK_ON" = "1" ]; then
                         # the same two-populations-in-one-block defect this round removed from the
                         # excerpt. It stays truthful only on the zero-extraction arm, where the
                         # excerpt fallback really is the instrument's output.
-                        if [ "$FARM_NROWS" -eq 0 ]; then
+                        if [ "$FARM_RAW_WHY" = empty ]; then
+                            log_line "farm:   the instrument printed NO output for a red grade — there is no name to publish, and NO output is not a pass"
+                        elif [ "$FARM_NROWS" -eq 0 ]; then
                             log_line "farm:   the extraction was NOT PROVEN complete — the instrument's RAW output above is published in $REC_FARM_ROWS"
                         else
                             log_line "farm:   the extraction was NOT PROVEN complete — the excerpt above is the rows THIS PASS matched; the instrument's RAW output is published in $REC_FARM_ROWS"
@@ -1602,7 +1617,7 @@ if [ "$FARM_CHECK_ON" = "1" ]; then
                     # counted in LINES (review round 11). `$FARM_NROWS - 12` is -12 here and never
                     # fired, so a 30-line raw output truncated to 12 said nothing at all about the
                     # other 18 lines and whether they were durable.
-                    _oline="$(printf '%s\n' "$FARM_EXCERPT" | grep -c . || true)"
+                    _oline="$FARM_OUT_LINES"
                     if [ "$_oline" -gt 12 ]; then
                         if [ "$FARM_ROWS_OK" = 1 ]; then
                             log_line "farm:   … and $((_oline - 12)) more line(s) of the instrument's output — ALL $_oline are named in $REC_FARM_ROWS"
@@ -1622,6 +1637,7 @@ if [ "$FARM_CHECK_ON" = "1" ]; then
                     # exist. `farm_rows=` in the same record carries the path, so the sentence names the
                     # FIELD instead.
                     case "$FARM_RAW_WHY" in
+                        empty)   FARM_ROW_SENTENCE="the instrument printed NO output for a red grade, so no drifting file is named anywhere" ;;
                         noproof) FARM_ROW_SENTENCE="its extraction is unproven (no readable or complete 'DRIFT' summary); RAW output published verbatim (see farm_rows=)" ;;
                         partial)
                             # ⛔ AN OVER-MATCH IS NOT A SHORTFALL (review round 12, measured): "matched
@@ -1646,9 +1662,25 @@ if [ "$FARM_CHECK_ON" = "1" ]; then
                 else
                     FARM_ROW_SENTENCE="${FARM_NROWS} row(s) matched, and the full list could not be persisted (farm_rows= names the failure, not a file)"
                 fi
-                finish 0 24 "farm: DRIFT — $FARM_DEST is NOT the code $REF ships ($FARM_ROW_SENTENCE, with the instrument's own remedy — a stale copy, a layout move and an unsourced file do NOT all have the same fix)" ;;
+                # ⛔ THE SENTENCE LEADS, THE PATH FOLLOWS (review round 13, measured). With the farm
+                # path first, a 92-char dest pushed the diagnosis past the 240-byte bound
+                # (`…; RAW output published verba`) and a 223-char dest left ONLY the path — the record
+                # then stated no diagnosis at all. The arm sentence is what a reader must never lose;
+                # the farm path it names is ALSO in the artifact's own `dest=` header.
+                REC_REMEDY="$FARM_REMEDY"
+                finish 0 24 "farm: DRIFT — $FARM_ROW_SENTENCE; $FARM_DEST is NOT the code $REF ships (with the instrument's own remedy — a stale copy, a layout move and an unsourced file do NOT all have the same fix)" ;;
             *)
                 REC_ACTION=farm-unknown
+                # ⛔ BUT WHAT IT DID PRINT IS STILL PUBLISHED (review round 13, reproduced). The
+                # instrument prints its per-file rows BEFORE the exits that give up (check-farm-drift.sh
+                # :689 `matched -eq 0`, :699 mixed ungradeable), so "no grade" never meant "nothing was
+                # reported": measured, 2 UNSOURCED rows then exit 2 was recorded as `farm_rows=not-graded`
+                # with both names durable NOWHERE. `action=farm-unknown` still says no grade was
+                # produced; the file now carries the instrument's output when it printed any.
+                if [ -n "$(printf '%s\n' "$FARM_OUT" | grep -v '^[[:space:]]*$' || true)" ]; then
+                    publish_farm_rows "$FARM_OUT" "n=unparsed (NO GRADE — the instrument exited $FARM_RC, so this is its output verbatim, not a complete list; farm_n=not-graded)"
+                    REC_FARM_NROWS=not-graded
+                fi
                 # ⛔ `not-graded` STAYS HERE ON PURPOSE (review round 3): an UNREADABLE grade is not a
                 # grade, and the rows fields must never imply one. `action=farm-unknown` is the field
                 # that says the farm WAS looked at and could not be read — the two together are the
