@@ -124,13 +124,20 @@ LOCKPID="$LOCK.pid"
 # (`scripts/orchestrator-harness/auto-rail.sh:315-345`: "a pid is not an identity ... ALIVE non-matching
 # or unreadable pid is only reclaimable once the lock is OLDER than LOCK_AGE_GRACE ... the actuator was
 # permanently dead with a clean log"). Applied here:
-#   1. a pid is not an identity -- the holder's argv must have the SHAPE
-#      `<shell> <…/cadence-nudge.sh>` (`pid-identity.sh`'s rule, the same conjunction
-#      `cloud-cell-supervisor.sh:820-828` applies), AND the process must not have BEGUN after the
-#      record was written (`pid_began_after`). Both terms are needed: the shape alone does not survive
-#      pid recycling, and the age fence alone cannot tell a wrapper from the script. A process that
-#      merely NAMES this file in its argv (an editor with it open, `sleep 300 cadence-nudge.sh`) is
-#      therefore NOT a holder, which is the false positive the substring form shipped;
+#   1. a pid is not an identity -- the holder's argv must NAME this script (`cadence-nudge.sh`, the
+#      same conjunction `cloud-cell-supervisor.sh:820-828` applies; the SHAPE
+#      `<shell> <…/cadence-nudge.sh>` is the FAST PATH, never the gate), AND the process must not have
+#      BEGUN after the record was written (`pid_began_after`). The two terms are needed for different
+#      failures: the name test rejects a pid that now belongs to something else entirely, the age
+#      fence rejects a pid RECYCLED onto a process that began later.
+#      ⛔ OVER-MATCHING IS DELIBERATE, AND IT IS WHY THE FALSE POSITIVE THE SUBSTRING FORM SHIPPED IS
+#      KEPT HERE (#3795 review cycle 7, P2 -- this rule used to claim the opposite of what the code
+#      does). A process that merely NAMES this file in its argv -- an editor with it open, `sleep 300
+#      cadence-nudge.sh` -- DOES read as a holder. The opposite error is the dangerous one: a live
+#      holder read as FOREIGN gets rule 4's 6-min grace, which is SHORTER than this file's own ~413 s
+#      critical section, so a run could be reclaimed mid-send. The over-match is fail-closed and
+#      bounded by rule 3's 20-min ceiling (its only cost is held ticks, never a duplicate send), and
+#      an undatable record also keeps the holder, for the same reason;
 #   2. a genuine live holder is not taken over by AGE alone; it is taken over only by the ABSOLUTE
 #      CEILING in rule 3. Every skip is LOGGED, because a silent skip is how the floor died once;
 #   3. a genuine live holder past the 20-min ceiling IS taken over -- bounded, because past 2.7
@@ -336,6 +343,23 @@ fi
 trap '_t=$(cat "$LOCKPID" 2>/dev/null | tr -cd "0-9"); if [ "$_t" = "$$" ]; then rm -f "$LOCKPID" 2>/dev/null; rmdir "$LOCK" 2>/dev/null; fi' EXIT
 
 now=$(date +%s)
+# ⛔ `now` IS THE TICK START, AND `NUDGE at=` ON THE RECEIPT IS THIS EXACT NUMBER (#3795 review
+# cycle 7, P2). Say it plainly, because two readers depend on knowing which instant it is: `gap_min`
+# below and `orchestrator-heartbeat.sh:475`'s rate limiter both measure TICK-TO-TICK intervals, not
+# beat-to-beat ones. Stamping the TICK is what keeps the field honest -- the number is the instant this
+# pass DECIDED to send, and the pre-send distance to the actual submit is bounded by this file's own
+# budget (~181 s of checker session resolution plus the goal-state/objective reads; the table at the
+# receipt totals 413 s of window inside a 450 s interval).
+# ⛔ ITS MEASURED CONSEQUENCE, STATED RATHER THAN IMPLIED: beat spacing is `450 s + δ_k − δ_(k−1)`,
+# where δ is that pre-send distance, so two adjacent beats can sit closer together than `PULSE_MIN`
+# (measured on a two-tick fixture: stamp gap 61 s while the real sends were 35 s apart) and can also
+# exceed the 9-min ceiling when δ moves the other way. NOT repaired by stamping the submit instant
+# instead: the verification TAIL (up to 138 s) runs AFTER the submit, so a post-verdict stamp is just
+# as wrong in the opposite direction, and the true instant is only knowable inside the checker. What
+# bounds the damage is stated, not hidden: the lock makes a concurrent second sender impossible, and
+# the consequence of the drift is a duplicate HEARTBEAT, which the receipt's residual note already
+# declares not the dangerous duplicate a duplicate lane ORDER is. Recorded on #1187 rather than
+# implied to be absent.
 # ⛔ THE FIRST VERSION OF THIS LINE WAS WRONG AND SILENTLY SO. It read:
 #     last=$(grep -o 'NUDGE at=[0-9]* delivered=yes' "$LOG" | tail -1 | grep -o '[0-9]*$')
 # The second grep is `[0-9]*$`, which matches the EMPTY STRING at the end of `...delivered=yes` --
@@ -953,12 +977,38 @@ if [ -z "$_checker_broken" ]; then
       PANE_ONLY|SUBMIT_FAILED) delivered="NOT-SUBMITTED" ;;
       *) delivered="UNVERIFIED" ;;
     esac
+    # ⛔ A `SUBMIT_FAILED` PAYLOAD IS STILL SITTING IN THE COMPOSER, SO SUBMIT IT -- DO NOT LEAVE IT FOR
+    # THE NEXT TICK TO DUPLICATE (#3795 review cycle 7, P2). The checker types the payload and then
+    # presses a SEPARATE Enter; when that Enter fails nothing is submitted, but the text is already in
+    # the input box. The receipt below still records the ATTEMPT (so the due read advances and this
+    # tick is not re-fired), and the old code therefore typed the WHOLE heartbeat again on the next
+    # due tick -- MEASURED on the real floor plus the real checker against a composer-modelling pane:
+    # one submitted message of 4261 bytes containing `[HEARTBEAT ` twice. That is precisely the action
+    # the adopted checker forbids: `cmux_payload.py`'s `send_verified` docstring says the remedy is to
+    # submit in that pane, NEVER to re-send, and the bare `'\n'` here is this file's own "submit what
+    # is already typed" shape (the raw-send arm below has used it since before #1187).
+    #   The `re-submitted=` field is added to `diag=[…]` so the operator can tell an Enter that was
+    # repaired from one that is still stuck. `delivered=` is deliberately NOT upgraded: nothing proves
+    # the retried Enter landed, so the verdict stays `NOT-SUBMITTED` and the next tick still retries.
+    # ⛔ ITS RESIDUALS, STATED: (a) if this Enter ALSO fails, the text stays and the duplicate below
+    # still happens once per due tick while the condition persists; (b) `PANE_ONLY` is deliberately NOT
+    # re-submitted -- there the Enter WAS attempted, so the composer may already be clear, and pressing
+    # Enter again would submit whatever else a human has since typed into that pane. `PANE_ONLY` keeps
+    # the pre-existing duplicate exposure, bounded the same way.
+    if [ "$verdict" = "SUBMIT_FAILED" ]; then
+      if cmux send --workspace "$ORCH_WS" --surface "$ORCH_SURFACE" '\n' >/dev/null 2>&1; then
+        _resubmit=" re-submitted=yes"
+      else
+        _resubmit=" re-submitted=no"
+      fi
+    fi
   fi
   # The checker's stderr is kept: a crashing or refused send must not vanish, or the operator sees
   # only a verdict with no cause (orch-send.sh makes the same call for the same reason).
   _vdiag=""
   [ -s "$_verr" ] && _vdiag=" diag=[$(tr '\n' ' ' <"$_verr" | tail -c 240)]"
   [ "$_verr" = /dev/null ] || rm -f "$_verr"
+  _vdiag="${_vdiag}${_resubmit:-}"
 else
   # No usable checker on this box. Send anyway (the floor's whole job) and record it as unverified.
   err=$(cmux send --workspace "$ORCH_WS" --surface "$ORCH_SURFACE" "$MSG\n" 2>&1)
@@ -1012,6 +1062,10 @@ fi
 # way out of the owner's 5-9 min band. Every attempt that reaches this point stamps `NUDGE at=`, and
 # the `delivered=` field carries the verdict, so the reader gets both facts and the cadence stays
 # bounded.
+# ⛔ THE VALUE STAMPED IS THE TICK START (`now`, captured immediately after the lock), NOT THE SUBMIT
+# INSTANT — the same number, and the same stated consequence, as the note on `now` near the top of this
+# file (#3795 review cycle 7, P2). Read that note before changing the field's meaning: it names the
+# measured band drift and why a submit-instant stamp is not the fix.
 #
 # ⛔ THE STAMP IS WRITTEN AFTER THE CHECK RETURNS, which is why the wording above says "reaches this
 # point" and not "every attempt" (#3795 review P2). A nudge KILLED inside the verification window

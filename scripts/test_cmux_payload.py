@@ -1487,6 +1487,39 @@ def test_a_failed_surface_read_that_still_prints_an_id_is_not_qualified(P):
         "an id out of a FAILED surface read was reported as the caller's own surface")
 
 
+def test_a_surface_read_with_no_readable_status_cannot_award_qualification(P):
+    """⛔ THE `returncode` DEFAULT IN `probe` IS THE SEND'S POLARITY, AND IT HAD NO PIN (#3795 review
+    cycle 7, P2).
+
+    `probe` reads `getattr(proc, "returncode", 1)` so that a `run` seam returning an object with no
+    exit status is a FAILED read. That comment announces an invariant, and a mutation of exactly that
+    default back to `0` left all 90 tests green: every fixture reaching `probe` used `_Proc`, which
+    always sets `returncode`, so the announced polarity was mutation-INVISIBLE. The identical polarity
+    at the payload send IS pinned
+    (`test_a_send_status_that_cannot_be_read_is_a_FAILURE_not_a_success`); this is its mirror, one arm
+    up. Without it, defaulting an unreadable status to success lets an id out of a read we could not
+    trust award a SURFACE QUALIFICATION, and `send_verified` then takes its transcript baseline from
+    another pane — the cross-pane mint this module exists to refuse.
+    """
+    sid = "01a0d648-4097-74b8-8cfd-3df3a071b463"
+
+    class _NoStatus:
+        stdout = sid + "\n"                 # a real id, but no readable exit status
+
+    def run(argv, timeout=None):
+        if argv[:3] == ["cmux", "surface", "resume"] and "--surface" in argv:
+            return _NoStatus()
+        if argv[:3] == ["cmux", "surface", "resume"]:
+            return _Proc(f"{sid}\n")
+        return _Proc("")
+
+    got, qualified = P._resolve_session_id_qualified(
+        "ws-1", run, sleep=_noop_sleep, surface="surf-9")
+    assert got == sid, got
+    assert qualified is False, (
+        "an id out of a read whose EXIT STATUS could not be read awarded a surface qualification")
+
+
 def test_a_workspace_only_caller_is_unchanged_by_the_qualification_rule(P):
     """The qualification rule must not move a caller that named NO surface (every pre-#3795 caller,
     including `orch-send.sh`): there is no other surface to be confused with, so its argv AND its
@@ -1939,6 +1972,68 @@ def test_cadence_nudge_reports_submit_failed_as_not_submitted(tmp_path):
     assert all("delivered=yes" not in line for line in nudges), appended
     assert "delivered=NOT-SUBMITTED" in appended, appended
     assert "verdict=SUBMIT_FAILED" in appended, appended
+
+
+def test_cadence_nudge_submits_a_payload_left_in_the_composer_by_a_failed_enter(tmp_path):
+    """⛔ `SUBMIT_FAILED` LEAVES THE PAYLOAD TYPED, SO THE FLOOR MUST SUBMIT IT, NOT RE-TYPE IT
+    (#3795 review cycle 7, P2).
+
+    The checker types the payload and presses a SEPARATE Enter. When that Enter fails nothing is
+    submitted and the text stays in the composer — but the receipt still records the ATTEMPT, so the
+    next due tick types the WHOLE heartbeat again on top of it. MEASURED pre-fix on the real floor +
+    the real checker against a composer-modelling pane: one submitted message of 4261 bytes with
+    `[HEARTBEAT ` in it twice.
+
+    The adopted checker's own contract is the opposite action (`send_verified`: "the remedy is to
+    submit in that pane, never to re-send"), so the floor now sends the bare terminating Enter the
+    raw-send arm has always used. The receipt says `re-submitted=` so a repaired Enter is
+    distinguishable from one that is still stuck.
+
+    DISCRIMINATOR: with the fix the fake cmux records a second `send` whose payload is the bare `\n`;
+    pre-fix it records none. `delivered=` must stay `NOT-SUBMITTED` — the retried Enter is not proof.
+    """
+    if not os.access(_FLOOR_PY, os.X_OK):
+        pytest.skip(f"{_FLOOR_PY} is not executable on this runner")
+    seed = _seeded_log(600)
+    home, bindir, screen, state = _cadence_home(
+        tmp_path, "the payload sits in the composer\n", seed)
+    sent = tmp_path / "SENT"
+    r = _run_cadence_nudge(home, bindir, screen, session=sent, stub_verdict="SUBMIT_FAILED")
+    assert r.returncode == 0, r.stdout + r.stderr
+    _n, appended = _new_nudge_lines(state, seed)
+    assert "verdict=SUBMIT_FAILED" in appended, appended
+    assert "delivered=NOT-SUBMITTED" in appended, (
+        "a retried Enter was upgraded to a delivery claim it cannot support:\n" + appended)
+    assert "re-submitted=yes" in appended, appended
+    sends = sent.read_text(encoding="utf-8").splitlines() if sent.exists() else []
+    assert any(line.rstrip().endswith(r" \n") for line in sends), (
+        "the payload left in the composer was never submitted, so the next tick duplicates it:\n"
+        + "\n".join(sends))
+
+
+def test_cadence_nudge_does_not_re_submit_a_pane_only_verdict(tmp_path):
+    """⛔ `PANE_ONLY` IS DELIBERATELY NOT RE-SUBMITTED (#3795 review cycle 7, P2), and this pins the
+    asymmetry so a later "why does SUBMIT_FAILED have an extra send?" cleanup cannot silently add
+    one.
+
+    `PANE_ONLY` means the tail is on the surface but submission is unproven, so the checker's Enter
+    WAS attempted — the composer may already be clear, and a second Enter would submit whatever else
+    a human has since typed into that pane. The duplicate exposure `PANE_ONLY` keeps is the
+    pre-existing one, stated in the code beside the fix.
+    """
+    if not os.access(_FLOOR_PY, os.X_OK):
+        pytest.skip(f"{_FLOOR_PY} is not executable on this runner")
+    seed = _seeded_log(600)
+    home, bindir, screen, state = _cadence_home(
+        tmp_path, "the payload sits in the composer\n", seed)
+    sent = tmp_path / "SENT"
+    r = _run_cadence_nudge(home, bindir, screen, session=sent, stub_verdict="PANE_ONLY")
+    assert r.returncode == 0, r.stdout + r.stderr
+    _n, appended = _new_nudge_lines(state, seed)
+    assert "verdict=PANE_ONLY" in appended, appended
+    assert "re-submitted=" not in appended, (
+        "PANE_ONLY pressed Enter a second time; its composer state is unknown, so that can submit "
+        "a human's draft:\n" + appended)
 
 
 @pytest.mark.parametrize("stub_verdict", ["GARBAGE", "VERIFIED\nOK"])
