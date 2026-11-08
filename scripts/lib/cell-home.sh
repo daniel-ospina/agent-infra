@@ -171,25 +171,55 @@ cell_home_project() { # <home> <value>
 # a PASS manufactured from a reading that never happened: `--check` answered 0 (the RECLAIM
 # precondition) and `--apply` reported "one home" over a unit it left naming the legacy home.
 #
-# So the test is inverted: the occurrence is a SIBLING only when the next character could CONTINUE a
-# filename component (`.`, `-`, `_`, or alphanumeric — `.bak`, `-2`, `d`). Everything else terminates a
-# path: `/`, the end of the line, whitespace, a quote, `,` `;` `:` `)` `$` `%` … and a colon-separated
-# `PATH=` list moves token by token (`$LEG/bin:$DUR/bin` has both occurrences followed by `/` or `:`).
+# ⛔ AND THE OCCURRENCE MUST BE A WHOLE PATH TOKEN, AT BOTH ENDS (review F5). The first cut of the fix
+# tested only what FOLLOWED the occurrence and treated "not `.`/`-`/`_`/alnum" as a terminator, which is
+# not the same thing: `~`, `+`, `#`, `@`, `(`, `!` are all legal filename continuations, so
+# `<legacy>~` was rebased to `<durable>~` — a path nobody has. It also never checked what PRECEDED the
+# occurrence, so `/opt/tools<legacy>/bin` became `/opt/tools<durable>/bin`, silently rewriting a FOREIGN
+# path. So the test is conservative on both sides:
+#   * START: the token must start at the beginning of the line, after `=`, whitespace, a quote, or one
+#     of `,` `;` `:` `(` — i.e. where a systemd path token really begins;
+#   * END: `/` (under the home), end of line, or one of whitespace `"` `'` `,` `;` `:` `)` `]`.
+# Anything else is a sibling (`.bak`, `-2`, `~`, `+old`) or a foreign prefix, and does NOT move.
+# A colon-separated list still moves token by token: `$LEG/bin:$DUR/bin` is `/`-terminated, and the
+# second `$LEG` in `PATH=$LEG:$OTHER` is preceded by `:`.
 #
 # `${line%%$pat*}` / `${line#*$pat}` are UNQUOTED ON PURPOSE: on bash 3.2 (macOS) a quoted alternative
 # inside `${…%%…}` splices the quote characters into the pattern (the same trap the migration records).
 # A printf builtin is the producer here, so no pipe exists to SIGPIPE (#841).
 cell_home_project_line() { # <home> <line>
-  local home="${1:-}" line="${2:-}" pat="$CELL_HOME_LEGACY" out="" head tail
+  local home="${1:-}" line="${2:-}" pat="$CELL_HOME_LEGACY" out="" head tail prev tok end
   [ -n "$home" ] && [ -n "$line" ] || { printf '%s\n' "$line"; return 0; }
   while :; do
     case "$line" in *"$pat"*) ;; *) out="$out$line"; break ;; esac
     head="${line%%$pat*}"        # everything before the FIRST occurrence
     tail="${line#*$pat}"         # everything after that occurrence
-    case "$tail" in
-      [-._[:alnum:]]*) out="$out$head$pat"  ;;  # continues the filename (-2, .bak, d): a SIBLING, not this home
-      *)               out="$out$head$home" ;;  # `/`, end of line, blank, quote, `,;:` … end the path
+    # ⛔ THE OCCURRENCE MUST BE A WHOLE PATH TOKEN — both ends are checked (review F5). Checking only the
+    # tail made `/opt/tools<legacy>/bin` rebase a FOREIGN path, and made `<legacy>~`, `<legacy>+old`,
+    # `<legacy>#1` (all legal filename continuations that are NOT our home) move, because "not one of
+    # `.` `-` `_` alnum" is not the same as "terminates a path". So: the token must START where a path
+    # token starts, and END at a separator or the end of the line.
+    prev=""
+    if [ -n "$out$head" ]; then prev="$out$head"; prev="${prev: -1}"; fi
+    tok=0
+    case "$prev" in
+      '') tok=1 ;;                                   # start of the line
+      '='|' '|'	'|'"'|"'"|','|';'|':'|'(') tok=1 ;;  # a value, an item-list separator, a quote
     esac
+    end=0
+    case "$tail" in
+      /*) end=1 ;;                                   # under the home: a component boundary
+      '') end=1 ;;                                   # end of the line
+      *)
+        case "${tail:0:1}" in
+          [[:space:]]|'"'|"'"|','|';'|':'|')'|']') end=1 ;;
+        esac ;;
+    esac
+    if [ "$tok" = 1 ] && [ "$end" = 1 ]; then
+      out="$out$head$home"
+    else
+      out="$out$head$pat"                            # a sibling or a foreign path: NOT this home
+    fi
     line="$tail"
   done
   printf '%s\n' "$out"

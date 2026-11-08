@@ -74,8 +74,18 @@ set -uo pipefail
 _SELF="${BASH_SOURCE[0]:-}"; [ -f "$_SELF" ] || _SELF=""     # under `bash -s` $0 is literally `bash` -> `.`
 SELF_DIR=""
 if [ -n "$_SELF" ]; then SELF_DIR="$(cd "$(dirname "$_SELF")" 2>/dev/null && pwd -P)"; fi
-CELL_HOME_LIB="${SELF_DIR:+$SELF_DIR/lib/cell-home.sh}"
-CELL_HOME_LIB="${CELL_HOME_LIB:-lib/cell-home.sh}"
+# ⛔ WITHOUT A SELF PATH THERE IS NO SIBLING TO TRUST (review F2). There used to be a RELATIVE fallback
+# here (`lib/cell-home.sh`), which is the one shape §CONSUMERS forbids: a piped start
+# (`bash -s < cell-home-migrate.sh`) has no file of its own, so the fallback resolved against the
+# working directory and SOURCED AND EXECUTED `$PWD/lib/cell-home.sh`. This is the tool whose own
+# printed remedy is `sudo -n env CELL_HOME=… bash $0 --apply`, i.e. the one most likely to be piped by
+# an operator, and `$PWD` (or `/tmp`) is the ordinary case. Refuse: 3 is the state the exit table
+# already reserved for a reading this tool cannot take.
+if [ -z "$SELF_DIR" ]; then
+  printf '%s: FATAL: no self path (a piped start) — refusing to source a resolver from the working directory ($PWD/lib/cell-home.sh would be executed). Run the file itself: bash scripts/cell-home-migrate.sh (agent-infra#3453)\n' "${0##*/}" >&2
+  exit 3
+fi
+CELL_HOME_LIB="$SELF_DIR/lib/cell-home.sh"
 if [ ! -r "$CELL_HOME_LIB" ]; then
   printf '%s: FATAL: %s is not readable — this tool will not derive a cell home from a guess. Run pi-bootstrap/setup.sh (its lib farm places the resolver) (agent-infra#3453)\n' "${0##*/}" "$CELL_HOME_LIB" >&2
   exit 3
@@ -200,6 +210,30 @@ describe() {
 mtime_of() { stat -c '%Y' "$1" 2>/dev/null || stat -f '%m' "$1" 2>/dev/null || printf '0'; }
 mode_of()  { stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1" 2>/dev/null || printf ''; }
 
+# durable_state <path> — 0 PRESENT, 1 ABSENT (a measurable reading), 3 CANNOT MEASURE (an ancestor
+# denies search, or the file cannot be opened). ⛔ THE DURABLE SIDE NEEDS THE SAME THREE-VALUED READ THE
+# LEGACY SIDE HAS (review F6): `[ -e "$f_dur" ]` answers "absent" for "I was not allowed to look", so a
+# durable home whose entries this account cannot search reported every credential as `durable MISSING`
+# — and with the legacy home already empty (the post-reclaim shape) `--check` answered 0, a PASS over
+# credentials it never stat'ed. A path whose parent is genuinely absent is ABSENT, never unmeasurable
+# (`cannot_traverse` draws that line and walks upward past levels that do not resolve).
+durable_state() {
+  local p="$1"
+  if [ -e "$p" ]; then
+    probe_open "$p" || return 3
+    return 0
+  fi
+  cannot_traverse "$p" && return 3
+  return 1
+}
+
+# owner_of <path> — "uid:gid" of an existing path, or nothing. Used so a ROOT run does not leave the
+# cell's credentials (or a rewritten unit) owned by root: `install`/`mv` otherwise stamp the invoker,
+# and the cell account then cannot read the credential this tool exists to make readable (review F7).
+owner_of() {
+  stat -c '%u:%g' "$1" 2>/dev/null || stat -f '%u:%g' "$1" 2>/dev/null || printf ''
+}
+
 # probe_open <file> — 0 iff this account can actually OPEN the file. ⛔ A REAL OPEN, NOT `[ -r ]`:
 # `[ -r ]` reads PERMISSION BITS, so it answers 1 for a mode-000 file even for an account that can read
 # it (root holds DAC_OVERRIDE) — the tool would then refuse a reading it actually takes, and print a
@@ -224,6 +258,9 @@ cannot_traverse() {
   done
   return 1
 }
+
+# durable_state needs `probe_open` and `cannot_traverse`, both defined below in this same header block;
+# bash resolves them at CALL time, and every call site is inside the credential legs further down.
 
 # credential_conflict <legacy> <durable> — 0 iff BOTH copies exist and the LEGACY one is NEWER.
 # ⛔ ONE PREDICATE, TWO MODES (review F1). `--check` and `--apply` disagreed about the same box: the
@@ -263,12 +300,22 @@ check_credentials() {
     # the ordinary drift this arm would otherwise report.
     case " $ENV_FILES " in
       *" $rel "*)
-        if [ -e "$f_dur" ]; then
+        durable_state "$f_dur"; st=$?
+        if [ "$st" = 3 ]; then
+          warn_line "  CANNOT MEASURE: $rel — the durable path $f_dur cannot be measured by $INVOKER (a parent directory denies search, or the file cannot be opened), so 'it assigns no volatile home' is not a reading this tool took"
+          unmeas=1
+        elif [ "$st" = 0 ]; then
           report_env_file "$rel" "$f_dur" "the DURABLE copy"; st=$?
           [ "$st" = 3 ] && unmeas=1
           [ "$st" = 1 ] && rc=1
         fi ;;
     esac
+    # ⛔ AN UNSEARCHABLE DURABLE PATH IS NOT "DURABLE MISSING" (review F6) — see `durable_state`.
+    durable_state "$f_dur"; st=$?
+    if [ "$st" = 3 ]; then
+      warn_line "  CANNOT MEASURE: $rel — the durable path $f_dur cannot be measured by $INVOKER (a parent directory denies search), so 'durable is missing' is not a reading this tool took"
+      unmeas=1; continue
+    fi
     if [ ! -e "$f_leg" ]; then
       note "  $rel: legacy MIA, durable $(describe "$f_dur")"
       continue
@@ -318,12 +365,22 @@ migrate_credentials() {
     # vanish with it (and the two modes must not disagree about the same box).
     case " $ENV_FILES " in
       *" $rel "*)
-        if [ -e "$f_dur" ]; then
+        durable_state "$f_dur"; st=$?
+        if [ "$st" = 3 ]; then
+          warn_line "  CANNOT MEASURE: $rel — the durable path $f_dur cannot be measured by $INVOKER (a parent directory denies search, or the file cannot be opened), so 'it assigns no volatile home' is not a reading this tool took"
+          unmeas=1
+        elif [ "$st" = 0 ]; then
           report_env_file "$rel" "$f_dur" "the DURABLE copy"; st=$?
           [ "$st" = 3 ] && unmeas=1
           [ "$st" = 1 ] && rc=1
         fi ;;
     esac
+    # ⛔ AN UNSEARCHABLE DURABLE PATH IS NOT "DURABLE MISSING" (review F6) — the two modes must agree.
+    durable_state "$f_dur"; st=$?
+    if [ "$st" = 3 ]; then
+      warn_line "  CANNOT MEASURE: $rel — the durable path $f_dur cannot be measured by $INVOKER (a parent directory denies search), so 'durable is missing' is not a reading this tool took; nothing was copied and nothing was ruled out"
+      unmeas=1; continue
+    fi
     [ -e "$f_leg" ] || continue
     if [ -e "$f_dur" ]; then
       note "  kept   $rel (durable copy exists — never overwritten)"
@@ -360,6 +417,11 @@ migrate_credentials() {
     # `install` copies bytes without ever putting them in this process's stdout; -m sets the mode in
     # the same syscall, so the file is never momentarily world-readable.
     if install -m "$mode" "$f_leg" "$f_dur" 2>/dev/null; then
+      # ⛔ A ROOT RUN MUST NOT LEAVE THE CELL'S CREDENTIAL OWNED BY ROOT (review F7). `install` stamps the
+      # invoker, and one of this tool's own remedies is `sudo -n env CELL_HOME=… bash $0 --apply`; the
+      # cell account must still be able to READ what this migration exists to make readable, and a later
+      # run would otherwise report the root-owned file as `kept`. The durable home's owner is the answer.
+      if [ "$INVOKER_UID" = 0 ] && [ -n "${DUR_OWNER:-}" ]; then chown "$DUR_OWNER" "$f_dur" 2>/dev/null || true; fi
       note "  copied $rel -> $f_dur (mode $mode; value not printed)"
     else
       warn_line "  COPY FAILED for $rel (from $f_leg) — refused rather than left half-written"
@@ -451,6 +513,17 @@ paths_in() {
 #     `ExecStart=` it re-bases two lines above. Both are the `;`-comment false block's class — the
 #     scanner's line classification disagreeing with systemd's parser — so the rule is structural: if a
 #     continuation is OPEN the name is the inherited one, otherwise it is `<Name>` after leading blanks.
+# trim_tail <string> — the string with trailing blanks removed. ⛔ systemd IGNORES WHITESPACE AROUND `=`
+# (`systemd.syntax(7)`: "Whitespace immediately before or after the `=` is ignored", confirmed with
+# `systemd-analyze verify`), so `Environment = HOME=<legacy>` is an `Environment=` directive. Deriving
+# the name from `${stripped%%=*}` kept the blank, the name matched no known directive, and the line was
+# graded UNHANDLED — a permanent false block on a shape systemd accepts (review F3).
+trim_tail() {
+  local v="${1:-}"
+  while :; do case "$v" in *[[:space:]]) v="${v%?}" ;; *) break ;; esac; done
+  printf '%s\n' "$v"
+}
+
 unit_scan() {
   local f="$1" n=0 line stripped dir projected miss p cont=""
   # ⛔ A FILE THAT CANNOT BE OPENED HAS NO RECORD ONLY IF YOU LET THE REDIRECT FAIL SILENTLY. `done < "$f"`
@@ -460,7 +533,12 @@ unit_scan() {
     printf '0\tUNMEASURABLE\t%s\t\n' "$f cannot be opened by $INVOKER (mode $(mode_of "$f")) — 'could not read' is not 'clear of the legacy home'"
     return 0
   fi
-  while IFS= read -r line; do
+  # ⛔ A LAST LINE WITHOUT A TRAILING NEWLINE IS STILL A LINE (review F1). `while IFS= read -r line`
+  # DROPS it, so a unit whose final directive carried the legacy home and no trailing `\n` produced NO
+  # record — `--check` answered 0 (the RECLAIM precondition) and `--apply` reported "one home" over a
+  # file it never rewrote. The writer already used the correct idiom (`|| [ -n "$line" ]`), so this is
+  # also a scanner/writer disagreement in the one dimension the file's doctrine says cannot exist.
+  while IFS= read -r line || [ -n "$line" ]; do
     n=$((n + 1))
     # ⛔ A COMMENT IS IGNORED BY systemd, SO IT NEITHER SETS NOR CLEARS THE CONTINUATION (review F2).
     if is_comment "$line"; then continue; fi
@@ -484,7 +562,7 @@ unit_scan() {
         case "$stripped" in
           *\\ )
             if [ -z "$cont" ]; then
-              case "$stripped" in [A-Za-z]*) cont="${stripped%%=*}" ;; esac
+              case "$stripped" in [A-Za-z]*) cont="$(trim_tail "${stripped%%=*}")" ;; esac
             fi ;;
           *) cont="" ;;
         esac
@@ -495,7 +573,7 @@ unit_scan() {
     if [ -n "$cont" ]; then
       dir="$cont"
     else
-      case "$stripped" in [A-Za-z]*) dir="${stripped%%=*}" ;; *) dir="" ;; esac
+      case "$stripped" in [A-Za-z]*) dir="$(trim_tail "${stripped%%=*}")" ;; *) dir="" ;; esac
     fi
     case "$dir" in
       "") printf '%s\tUNHANDLED\t%s\t\n' "$n" "$line"; cont=""; continue ;;
@@ -560,9 +638,29 @@ unit_files() {
          \( -name '*.service' -o -name '*.socket' -o -name '*.timer' -o -name '*.mount' -o -name '*.automount'
             -o -name '*.path' -o -name '*.swap' -o -name '*.target' -o -name '*.slice' -o -name '*.conf' \)
          \( -type f -o -type l \)
-         ! -name '*.pre-cell-home' )
-  UNIT_FILES="$(find "${args[@]}" 2>/dev/null | LC_ALL=C sort)"
+         ! -name '*.pre-cell-home'
+         # ⛔ AN ENABLEMENT ALIAS IS NOT A UNIT DEFINITION (review F4). `<target>.wants/<unit>` (and
+         # `.requires/`, `.upholds/`) is a SYMLINK to a unit defined elsewhere; grading it made the same
+         # unit graded twice, and the writer — which refuses symlinks by name — then refused the alias
+         # while repointing its target, so `--check` could answer 1 forever in an order-dependent way
+         # (`default.target.wants/x` sorts before `x` and is refused; `multi-user.target.wants/x` sorts
+         # after and is skipped). The definition itself is still graded, once.
+         ! -path '*.wants/*' ! -path '*.requires/*' ! -path '*.upholds/*' )
+  local raw f
+  raw="$(find "${args[@]}" 2>/dev/null | LC_ALL=C sort)"
   UNIT_FIND_ERR="$(find "${args[@]}" 2>&1 >/dev/null | LC_ALL=C sort -u)"
+  # ⛔ A DANGLING SYMLINK NAMES NOTHING systemd LOADS (review F4). It used to enter the population and be
+  # graded UNMEASURABLE, which is a PERMANENT exit 3 over a stale enablement link — removing the link was
+  # the only way to reach `--check` -> 0. `cannot_traverse` already draws this line for the credential
+  # leg: a path whose parent is genuinely absent is ABSENT (a measurable reading), not unmeasurable.
+  UNIT_FILES=""
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    if [ -L "$f" ] && [ ! -e "$f" ]; then continue; fi
+    UNIT_FILES="${UNIT_FILES}${UNIT_FILES:+$'\n'}$f"
+  done <<EOF
+$raw
+EOF
 }
 
 # unit_scan_all — every unit/drop-in under the declared dirs, one "<file>\t<record…>" line per hit.
@@ -736,8 +834,12 @@ EOF
           warn_line "  REFUSED $f — the rewrite left a line that still names $HOME_LEGACY (the writer and the scanner disagree); the original file was NOT touched"
           refused=$((refused + 1)); rc=1; continue
         fi
-        # Preserve the original mode and ownership, then swap in atomically.
+        # Preserve the original mode AND OWNERSHIP, then swap in atomically. `chown` is best effort: a
+        # non-root run owns the file it just made, and a root run puts the unit back under the account it
+        # was written for (review F7 — the comment claimed this and only `chmod` was done).
         chmod "$(mode_of "$f")" "$tmpdir" 2>/dev/null || true
+        _own="$(owner_of "$f")"
+        if [ -n "$_own" ]; then chown "$_own" "$tmpdir" 2>/dev/null || true; fi
         if mv -f "$tmpdir" "$f" 2>/dev/null; then
           note "  repointed $f (backup: $backup)"
           applied=$((applied + 1))
@@ -880,6 +982,8 @@ EOF
 }
 
 # ── MAIN ──────────────────────────────────────────────────────────────────────────────────────
+# The owner a ROOT run must stamp onto what it writes into the durable home (review F7).
+DUR_OWNER="$(owner_of "$HOME_DURABLE" 2>/dev/null || true)"
 note "cell-home-migrate: mode=$MODE"
 note "  durable home: $HOME_DURABLE  (derived by scripts/lib/cell-home.sh)"
 note "  legacy home:  $HOME_LEGACY   (never deleted by this tool)"

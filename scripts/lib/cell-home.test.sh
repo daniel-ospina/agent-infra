@@ -202,6 +202,20 @@ proj_line_in() { # <lib> <line> — run one line through the projector, with no 
   && ok "b8b4 …while a component that CONTINUES (.bak, -2/y, d) is still NOT this home" \
   || bad "b8b4 the wider terminator set now re-bases a sibling name (fabricated target)"
 
+# b8b5: THE OCCURRENCE MUST BE A WHOLE PATH TOKEN AT BOTH ENDS (review F5). A filename continuation that
+# is not `.`/`-`/`_`/alnum (`~`, `+`, `#`) is NOT this home, and a FOREIGN prefix is not a token start —
+# `/opt/tools<legacy>/bin` used to be rewritten to `/opt/tools<durable>/bin`, silently editing a path
+# that has nothing to do with the legacy home.
+[ "$(proj_line_in "$LIB" 'Environment=ARCH2=/tmp/cell-home~ X=/tmp/cell-home+old Y=/tmp/cell-home#1')" = 'Environment=ARCH2=/tmp/cell-home~ X=/tmp/cell-home+old Y=/tmp/cell-home#1' ] \
+  && ok "b8b5 …and a filename continuation that is not our sibling marker (~, +old, #1) is NOT this home" \
+  || bad "b8b5 a non-separator continuation was rebased — --apply would write a path nobody has"
+[ "$(proj_line_in "$LIB" 'Environment=TOOLDIR=/opt/tools/tmp/cell-home/bin')" = 'Environment=TOOLDIR=/opt/tools/tmp/cell-home/bin' ] \
+  && ok "b8b6 …and a FOREIGN prefix (/opt/tools/tmp/cell-home) is left alone: the occurrence does not START a token" \
+  || bad "b8b6 a foreign path was rewritten because the occurrence only LOOKED like a token"
+[ "$(proj_line_in "$LIB" 'ExecStart=/bin/sh -c \"cd /tmp/cell-home/state\"')" = 'ExecStart=/bin/sh -c \"cd /home/cmux/state\"' ] \
+  && ok "b8b7 …while a quoted INTERIOR token still moves (preceded by a quote/space, terminated by a quote)" \
+  || bad "b8b7 a quoted interior path was not rebased — a false unchanged line"
+
 # b9: the two projectors answer the SAME single token the same way — they are one rule with two arities,
 # so a future edit to either boundary reddens here instead of drifting into two opinions.
 _pl_tok=/tmp/cell-home/keys.env
@@ -214,8 +228,11 @@ _pl_tok=/tmp/cell-home/keys.env
 # space-separated cases STOP moving — otherwise b8b asserts a constant of the fixture, not the boundary
 # the migration depends on.
 MUTB="$T/mutboundary"; mkdir -p "$MUTB/lib"
-awk 'index($0, "[-._[:alnum:]]*)") > 0 { sub(/\[-\._\[:alnum:\]\]\*\)/, "*)"); print; next } { print }' \
-  "$LIB" >"$MUTB/lib/cell-home.sh"
+# the END-side separator set is what F5 added: replace it with a pattern no single character can match,
+# which restores the pre-fix rule (`/` or end-of-line only) without touching the surrounding structure.
+awk '
+  index($0, "[[:space:]]|") > 0 && !done { print "          XX) end=1 ;;"; done=1; next }
+  { print }' "$LIB" >"$MUTB/lib/cell-home.sh"
 if cmp -s "$LIB" "$MUTB/lib/cell-home.sh"; then
   bad "e7 the boundary mutation could not be applied — b8b is not checking the boundary rule"
 elif [ "$(proj_line_in "$MUTB/lib/cell-home.sh" 'Environment="HOME=/tmp/cell-home"')" = 'Environment="HOME=/home/cmux"' ]; then
@@ -352,6 +369,14 @@ _m="$(piped_start_marker "$REPO_ROOT/scripts/orchestrator-harness/key-gate.sh" "
 _m="$(piped_start_marker "$REPO_ROOT/scripts/cloud-cell-supervisor.sh" "$FIX/sup/x" "$FIX/sup/x/lib/cell-home.sh" "$FIX/mark-sup" --help)"
 [ "$_m" = 0 ] && ok "d7 …nor does a piped start of cloud-cell-supervisor.sh source \$PWD/lib/cell-home.sh (the ./lib shape)" \
   || bad "d7 a piped start of cloud-cell-supervisor.sh SOURCED \$PWD/lib/cell-home.sh — code execution from the working directory"
+
+# ⛔ THE MIGRATION TOOL ITSELF (review F2). It was the ONE consumer still carrying a RELATIVE resolver
+# fallback (`lib/cell-home.sh`), so a piped start resolved the resolver against the WORKING DIRECTORY and
+# sourced + executed `$PWD/lib/cell-home.sh`. It is also the tool whose own printed remedy is
+# `sudo -n env CELL_HOME=… bash $0 --apply`, i.e. the one an operator is most likely to pipe.
+_m="$(piped_start_marker "$REPO_ROOT/scripts/cell-home-migrate.sh" "$FIX/mig/x" "$FIX/mig/x/lib/cell-home.sh" "$FIX/mark-mig" --check)"
+[ "$_m" = 0 ] && ok "d8 …nor does a piped start of cell-home-migrate.sh source \$PWD/lib/cell-home.sh (it refuses with 3: there is no sibling to trust)" \
+  || bad "d8 a piped start of cell-home-migrate.sh SOURCED \$PWD/lib/cell-home.sh — code execution from the working directory"
 
 printf '\n── (e) NON-VACUITY (the arms must redden when the behaviour is reverted) ─────────────\n'
 

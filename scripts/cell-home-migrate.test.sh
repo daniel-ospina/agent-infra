@@ -619,6 +619,90 @@ case "$_out" in *symlink*) ok "k20 …and --apply REFUSES it by name instead of 
 [ -L "$UNITS/linked.service" ] && ok "k20b …so the link survives (systemctl link semantics preserved)" \
   || bad "k20b the writer replaced a symlink with a regular file"
 
+# ── F1: a LAST LINE WITHOUT A TRAILING NEWLINE is still a line ──────────────────────────────
+# `while IFS= read -r line` DROPS it, so a unit whose final directive carried the legacy home and had no
+# trailing newline produced no record: `--check` answered 0 (the RECLAIM precondition) and `--apply`
+# reported "one home" over a file it never rewrote. The writer already used the correct idiom, so this
+# was also a scanner/writer disagreement.
+mk_box "$T/nonl"
+run_tool "$TOOL" --apply >/dev/null 2>&1              # converge the fixture, so only the last line can drift
+printf 'Environment=PATH=/usr/bin\nEnvironment=HOME=%s' "$LEG" >>"$UNITS/app.service"   # NO trailing newline
+run_tool "$TOOL" --check >/dev/null 2>&1; _rc=$?
+[ "$_rc" = 1 ] && ok "k21 an UNTERMINATED last line naming the legacy home is DRIFT (--check 1, not a false one home)" \
+  || bad "k21 the last line without a trailing newline was invisible to the scanner (--check $_rc)"
+run_tool "$TOOL" --apply >/dev/null 2>&1; _rc=$?
+case "$(cat "$UNITS/app.service")" in
+  *"Environment=HOME=$DUR"*) ok "k21b …and --apply rewrites it (rc $_rc)" ;;
+  *) bad "k21b the unterminated line was never rewritten" ;;
+esac
+
+# ── F3: systemd ignores whitespace around `=` ───────────────────────────────────────────────
+# `systemd.syntax(7)`: "Whitespace immediately before or after the `=` is ignored"; `systemd-analyze
+# verify` agrees. Keeping the blank in the derived name matched no known directive, so the line was
+# graded UNHANDLED and refused forever — --check could never reach 0.
+mk_box "$T/ws"
+printf '[Service]\nEnvironment = HOME=%s\nExecStart = /bin/true\n' "$LEG" >"$UNITS/ws.service"
+_out="$(run_tool "$TOOL" --apply)"; _rc=$?
+[ "$_rc" = 0 ] && ok "k22 'Environment = HOME=<legacy>' (spaces around '=') converges (rc 0, no UNHANDLED record)" \
+  || bad "k22 a directive with spaces around '=' was refused ($_rc) — --check could never reach 0"
+grep -q "^Environment = HOME=$DUR$" "$UNITS/ws.service" \
+  && ok "k22b …and the value is repointed, keeping the spacing" \
+  || bad "k22b the spaced directive was not repointed"
+
+# ── F4: enablement aliases are not definitions, and a dangling link names nothing ────────────
+# `systemctl enable` writes `<target>.wants/<unit>` as a SYMLINK to a unit defined elsewhere. Grading it
+# made the definition graded twice, and the writer (which refuses symlinks by name) then refused the
+# alias while repointing its target — rc 1 forever, order-dependent on the unit's name.
+mk_box "$T/alias"
+run_tool "$TOOL" --apply >/dev/null 2>&1              # converge the fixture first
+# ⛔ THE NAME DECIDES THE OUTCOME UNDER THE BUG, so the fixture uses one that SORTS AFTER the alias dir:
+# the alias (`default.target.wants/zzz.service`) is then graded BEFORE its definition (`zzz.service`),
+# which is the order that refused the alias while repointing the target.
+printf '[Service]\nEnvironment=HOME=%s\n' "$LEG" >"$UNITS/zzz.service"
+mkdir -p "$UNITS/default.target.wants"
+ln -s "../zzz.service" "$UNITS/default.target.wants/zzz.service"
+_out="$(run_tool "$TOOL" --apply)"; _rc=$?
+[ "$_rc" = 0 ] && ok "k23 a <target>.wants/ enablement alias does not block --apply (rc 0; the definition is graded once)" \
+  || bad "k23 the alias was refused ($_rc) while its target was repointed — --check would never reach 0"
+case "$(cat "$UNITS/zzz.service")" in
+  *"Environment=HOME=$DUR"*) ok "k23b …and the unit DEFINITION it points at is still repointed" ;;
+  *) bad "k23b the definition was not repointed" ;;
+esac
+ln -s "../gone.service" "$UNITS/dangling.service"
+_out="$(run_tool "$TOOL" --check)"; _rc=$?
+[ "$_rc" = 0 ] && ok "k23c a DANGLING symlink is ABSENT, not CANNOT MEASURE (rc 0, no permanent exit 3)" \
+  || bad "k23c a dangling symlink made every run read CANNOT MEASURE (rc $_rc) — only deleting the link would recover"
+
+# ── F6: the DURABLE side needs the same three-valued read as the legacy side ─────────────────
+# `[ -e "$f_dur" ]` answers "absent" for "I could not look", so with the legacy home already reclaimed
+# (its credentials gone) `--check` reported every credential as `durable MISSING` and answered 0 — a PASS
+# over credentials it never stat'ed, on the reclaim precondition.
+mk_box "$T/dur"
+run_tool "$TOOL" --apply >/dev/null 2>&1              # converge the UNITS first (they are not what this arm is about)
+rm -f "$LEG/keys.env" "$LEG/.pi/agent/auth.json"      # the post-reclaim shape: legacy side empty
+chmod 600 "$DUR"                                      # …and the durable home cannot be searched
+# ⛔ THE GUARD MUST TEST TRAVERSAL, NOT LISTING: a mode-600 DIRECTORY still lets its owner READ the
+# names (`ls` works) while denying SEARCH, so `[ -e "$DUR/keys.env" ]` is the reading that matters.
+if ( : <"$DUR/keys.env" ) 2>/dev/null; then
+  ok "k24 SKIPS honestly: this account can still reach an entry in a mode-600 durable home"
+else
+  _out="$(run_tool "$TOOL" --check)"; _rc=$?
+  [ "$_rc" = 3 ] && ok "k24 an UNSEARCHABLE durable home is CANNOT MEASURE (3), never 'one home' over unread credentials" \
+    || bad "k24 an unsearchable durable home read as converged (rc $_rc)"
+fi
+chmod 755 "$DUR" 2>/dev/null
+
+# ── F5: a FOREIGN prefix and a filename continuation are NOT this home ──────────────────────
+mk_box "$T/anchor"
+run_tool "$TOOL" --apply >/dev/null 2>&1              # converge, so anything reported below is the new line
+printf 'Environment=TOOLDIR=/opt/tools%s/bin\nEnvironment=ARCH=%s~\n' "$LEG" "$LEG" >>"$UNITS/app.service"
+_out="$(run_tool "$TOOL" --check)"; _rc=$?
+[ "$_rc" = 0 ] && ok "k25 a foreign prefix (/opt/tools<legacy>/bin) and a sibling continuation (<legacy>~) are NOT ours (--check 0)" \
+  || bad "k25 the projector claimed a foreign path or a sibling continuation as the legacy home (rc $_rc)"
+grep -q "TOOLDIR=/opt/tools$LEG/bin" "$UNITS/app.service" \
+  && ok "k25b …and --apply left both BYTE FOR BYTE" \
+  || bad "k25b --apply rewrote a foreign prefix or a sibling continuation"
+
 # mut_sub <src> <dst> <function> <old-substring> <new> — replace ONE substring on the FIRST line of ONE
 # function that carries it. Scoped by function because several guards share a spelling; a control whose
 # mutation cannot be applied must fail loudly rather than silently grade the unmutated tool.
@@ -889,7 +973,12 @@ fi
 # `keys.env` then reads as "names no volatile home" again (0/1 instead of 3).
 mkdir -p "$T/mutdir11/lib"; cp "$HERE/lib/cell-home.sh" "$T/mutdir11/lib/cell-home.sh"
 MUT11="$T/mutdir11/cell-home-migrate.sh"
-mut_sub "$TOOL" "$MUT11" report_env_file 'if [ -e "$f" ] && ! probe_open "$f"; then' 'if false; then'
+# ⛔ BOTH PROBE LEGS, because the durable-side read (F6, `durable_state`) now catches the unreadable file
+# before `report_env_file` ever runs — removing only the latter would leave j9 green for the right
+# reason and this control would have nothing to say.
+mut_sub "$TOOL" "$T/mutdir11/m1.sh" durable_state 'probe_open "$p" || return 3' ':'
+mut_sub "$T/mutdir11/m1.sh" "$MUT11" report_env_file 'if [ -e "$f" ] && ! probe_open "$f"; then' 'if false; then'
+rm -f "$T/mutdir11/m1.sh"
 if cmp -s "$TOOL" "$MUT11"; then
   bad "g11 the env-file probe mutation could not be applied — j9 is not checking it"
 else
@@ -929,6 +1018,91 @@ else
   [ "$_m12brc" = 0 ] && ok "g12b WITHOUT *.socket a socket unit is invisible again (--check 0) — k17 measures the name set" \
     || bad "g12b the mutant still saw the .socket (rc $_m12brc) — k17 is not measuring it"
 fi
+# g13: drop the whitespace trim (F3) and k22 must redden — the spaced directive becomes UNHANDLED again.
+mkdir -p "$T/mutdir13/lib"; cp "$HERE/lib/cell-home.sh" "$T/mutdir13/lib/cell-home.sh"
+MUT13="$T/mutdir13/cell-home-migrate.sh"
+mut_sub "$TOOL" "$MUT13" unit_scan 'dir="$(trim_tail "${stripped%%=*}")"' 'dir="${stripped%%=*}"'
+if cmp -s "$TOOL" "$MUT13"; then
+  bad "g13 the whitespace-trim mutation could not be applied — k22 is not checking it"
+else
+  mk_box "$T/g13"
+  printf '[Service]\nEnvironment = HOME=%s\nExecStart = /bin/true\n' "$LEG" >"$UNITS/ws.service"
+  run_tool "$MUT13" --apply >/dev/null 2>&1; _m13rc=$?
+  case "$(cat "$UNITS/ws.service")" in
+    *"HOME=$LEG"*) [ "$_m13rc" != 0 ] && ok "g13 WITHOUT the trim 'Environment = …' is UNHANDLED/refused (rc $_m13rc) — k22 measures it" \
+        || bad "g13 the mutant answered 0 without repointing — k22 is ambiguous" ;;
+    *) bad "g13 the mutant still repointed the spaced directive — k22 is not measuring the trim" ;;
+  esac
+fi
+
+# g14: put enablement aliases back in the population (F4) and k23 must redden.
+mkdir -p "$T/mutdir14/lib"; cp "$HERE/lib/cell-home.sh" "$T/mutdir14/lib/cell-home.sh"
+MUT14="$T/mutdir14/cell-home-migrate.sh"
+mut_sub "$TOOL" "$MUT14" unit_files "! -path '*.wants/*' ! -path '*.requires/*' ! -path '*.upholds/*' )" ")"
+if cmp -s "$TOOL" "$MUT14"; then
+  bad "g14 the alias-exclusion mutation could not be applied — k23 is not checking it"
+else
+  mk_box "$T/g14"
+  run_tool "$TOOL" --apply >/dev/null 2>&1
+  printf '[Service]\nEnvironment=HOME=%s\n' "$LEG" >"$UNITS/zzz.service"
+  mkdir -p "$UNITS/default.target.wants"
+  ln -s "../zzz.service" "$UNITS/default.target.wants/zzz.service"
+  run_tool "$MUT14" --apply >/dev/null 2>&1; _m14rc=$?
+  [ "$_m14rc" != 0 ] && ok "g14 WITHOUT the exclusion the enablement alias is refused while its target is repointed (rc $_m14rc) — k23 measures it" \
+    || bad "g14 the mutant converged anyway — k23 is not measuring the alias exclusion"
+fi
+# g14b: a dangling symlink back in the population must turn every run into a permanent exit 3.
+MUT14b="$T/mutdir14/cell-home-migrate-nodangle.sh"
+mut_sub "$TOOL" "$MUT14b" unit_files 'if [ -L "$f" ] && [ ! -e "$f" ]; then continue; fi' ':'
+if cmp -s "$TOOL" "$MUT14b"; then
+  bad "g14b the dangling-link mutation could not be applied — k23c is not checking it"
+else
+  mk_box "$T/g14b"
+  run_tool "$TOOL" --apply >/dev/null 2>&1
+  ln -s "../gone.service" "$UNITS/dangling.service"
+  run_tool "$MUT14b" --check >/dev/null 2>&1; _m14brc=$?
+  [ "$_m14brc" = 3 ] && ok "g14b WITHOUT the dangling-link skip a stale alias makes --check a permanent 3 — k23c measures it" \
+    || bad "g14b the mutant answered $_m14brc — k23c is not measuring the skip"
+fi
+
+# g15: drop the unterminated-line idiom (F1) and k21 must redden.
+mkdir -p "$T/mutdir15/lib"; cp "$HERE/lib/cell-home.sh" "$T/mutdir15/lib/cell-home.sh"
+MUT15="$T/mutdir15/cell-home-migrate.sh"
+mut_sub "$TOOL" "$MUT15" unit_scan 'while IFS= read -r line || [ -n "$line" ]; do' 'while IFS= read -r line; do'
+if cmp -s "$TOOL" "$MUT15"; then
+  bad "g15 the read-loop mutation could not be applied — k21 is not checking it"
+else
+  mk_box "$T/g15"
+  run_tool "$TOOL" --apply >/dev/null 2>&1
+  printf 'Environment=PATH=/usr/bin\nEnvironment=HOME=%s' "$LEG" >>"$UNITS/app.service"   # no trailing newline
+  run_tool "$MUT15" --check >/dev/null 2>&1; _m15rc=$?
+  [ "$_m15rc" = 0 ] && ok "g15 WITHOUT the idiom an unterminated last line is invisible (--check 0) — k21 measures it" \
+    || bad "g15 the mutant still saw the last line (rc $_m15rc) — k21 is not measuring it"
+fi
+
+# g16: remove BOTH durable-side read guards (F6) and k24 must redden.
+mkdir -p "$T/mutdir16/lib"; cp "$HERE/lib/cell-home.sh" "$T/mutdir16/lib/cell-home.sh"
+MUT16="$T/mutdir16/cell-home-migrate.sh"
+mut_sub "$TOOL" "$T/mutdir16/m1.sh" durable_state 'probe_open "$p" || return 3' ':'
+mut_sub "$T/mutdir16/m1.sh" "$MUT16" durable_state 'cannot_traverse "$p" && return 3' ':'
+rm -f "$T/mutdir16/m1.sh"
+if cmp -s "$TOOL" "$MUT16"; then
+  bad "g16 the durable-side mutation could not be applied — k24 is not checking it"
+else
+  mk_box "$T/g16"
+  run_tool "$TOOL" --apply >/dev/null 2>&1
+  rm -f "$LEG/keys.env" "$LEG/.pi/agent/auth.json"
+  chmod 600 "$DUR"
+  if ( : <"$DUR/keys.env" ) 2>/dev/null; then
+    ok "g16 SKIPS honestly: this account can still reach an entry in a mode-600 durable home"
+  else
+    run_tool "$MUT16" --check >/dev/null 2>&1; _m16rc=$?
+    [ "$_m16rc" = 0 ] && ok "g16 WITHOUT the durable-side read guards an unsearchable durable home reads 'one home' (0) — k24 measures them" \
+      || bad "g16 the mutant answered $_m16rc — k24 is not measuring the guards"
+  fi
+  chmod 755 "$DUR" 2>/dev/null
+fi
+
 printf '\n── (h) argument handling ────────────────────────────────────────────────────────────\n'
 run_tool "$TOOL" --nonsense >/dev/null 2>&1 && bad "h1 an unknown argument is not refused" || ok "h1 an unknown argument is refused"
 run_tool "$TOOL" --help >/dev/null 2>&1 && ok "h2 --help exits 0" || bad "h2 --help exits non-zero"
