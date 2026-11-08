@@ -5958,6 +5958,17 @@ async function main() {
     // durable zero-entry record must exist for B's own root.
     equal(forB("gate_recovery_empty").length, 1,
       "1265a: B's own root has no entries — exactly one durable gate_recovery_empty binds it (the pre-fix run skipped it)");
+    // #1265 review: the REMEDY differs by class (a task-capable child self-verifies in-band; a
+    // task-restricted one is blocked for good and the parent must re-dispatch, #285 P1-A). A parent
+    // reading the log is deciding exactly that, so the class must be IN the row, not only in the
+    // child's stdout — which is the whole premise of AC (b). Pre-fix there is no field at all, so the
+    // typeof row reddens; the agreement row reddens if the field is ever written from anything other
+    // than the same `argvAllowsTask()` the console line is built from.
+    equal(typeof forB("gate_recovery_empty")[0].task_capable, "boolean",
+      "1265a: the durable empty row must carry task_capable — the remedy (wait vs parent re-dispatch) cannot be inferred from the log without it");
+    equal(forB("gate_recovery_empty")[0].task_capable,
+      captured.some((l) => l.includes("0 bridge-recovered files") && l.includes("in-band via the task tool")),
+      "1265a: task_capable must agree with the console line's remedy (in-band vs the block being final)");
     equal(forB("gate_recovery_foreign_root").length, 1,
       "1265a: the inspection-only merge of A's entries must leave ONE durable record (AC b)");
     equal(String(forB("gate_recovery_foreign_root")[0].inspected_root), realA,

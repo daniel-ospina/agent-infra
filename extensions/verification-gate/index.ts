@@ -4469,7 +4469,7 @@ export default function (pi: ExtensionAPI) {
       // sub-agent cannot self-satisfy in-band; the block is final.
       const taskCapable = argvAllowsTask();
       console.log(`[verification-gate] ⚠️ Sub-agent session started with 0 bridge-recovered files for root ${ownRoot} — the parent's verified-file registry is not available to this session; every changed-file commit will block until VGATE verification is dispatched ${taskCapable ? "(in-band via the task tool)." : "by the parent session — this session is task-restricted, so return to the parent (the block is final)."}`);
-      appendJsonl({ event: "gate_recovery_empty", extension: "verification-gate", subagent: true, root: ownRoot, session_cwd: process.cwd() });
+      appendJsonl({ event: "gate_recovery_empty", extension: "verification-gate", subagent: true, root: ownRoot, task_capable: taskCapable, session_cwd: process.cwd() });
     }
     if (inspected > 0) {
       // The sibling's entries ARE in `verifiedSet`, but inert for every op rooted

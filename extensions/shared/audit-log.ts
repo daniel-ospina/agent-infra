@@ -74,13 +74,12 @@ export const GATE_EVENT_NAMES = [
   //                   NOT infer "inspection only" from `root` != its own root alone: inspection is
   //                   the shape that emits BOTH rows. Read `root`, never the count alone (#1265).
   "gate_recovery_empty", // verification-gate #264/#1265: a task child recovered ZERO entries for its own
-  //                          root — every changed-file commit will block. The REMEDY differs by class, and
-  //                          the emit site records which one this is (`argvAllowsTask` in index.ts): a
-  //                          task-CAPABLE child blocks until it dispatches its own VGATE verification, while
-  //                          a task-RESTRICTED child blocks PERMANENTLY — it cannot self-satisfy in-band, so
-  //                          the parent must re-verify and re-dispatch (the block is final, #285 P1-A). "Until
-  //                          it self-verifies" is unreachable for the second class, which is why the row does
-  //                          not say it.
+  //                          root — every changed-file commit will block. The REMEDY differs by class and
+  //                          the row CARRIES the class (`task_capable`, from `argvAllowsTask`), because a
+  //                          parent reading this log is deciding exactly one thing — wait, or re-verify and
+  //                          re-dispatch. task_capable=true: the child blocks until it dispatches its own
+  //                          VGATE verification (in-band). task_capable=false: the block is FINAL and the
+  //                          parent must act (#285 P1-A) — "until it self-verifies" is unreachable for it.
   "gate_recovery_foreign_root", // verification-gate #1265: a same-repo sibling's entries were merged for
   //                               INSPECTION only. They carry the sibling's root, so they are inert for
   //                               this session's git ops (index.ts's root filter) — the record exists so the
