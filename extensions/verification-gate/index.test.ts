@@ -3809,9 +3809,15 @@ test("#3255 policy: the git-op root is authoritative — adoption must never gat
   // The DURABLE half must name its root too: `recoverBridgeForRoot` is called for
   // the own root AND (inspection only) for a sibling, so an emit without `root`
   // is indistinguishable between the two — restoring the false claim in
-  // gate-events.jsonl. The e2e assertion is the behavioural parity: it counts the
-  // record against the SIBLING root it must name (0 while the field is absent) and
-  // asserts no record claims the session's own root.
+  // gate-events.jsonl. The e2e behavioural parity is the A-KEYED row
+  // (`root === realA` → 1): it counts 0 while the field is absent, so the pre-fix
+  // shape reddens it. It is the ONLY durable detector for a wrong-root record — a
+  // `root: normRoot → process.cwd()` mutant reddens it and nothing else.
+  // ⛔ The own-root row this comment used to credit that coverage to was DELETED in
+  // review cycle 5: it could not fail in either direction (pre-fix there is no `root`
+  // field, and the bridge's only compound key is A's). Cycle 7 found this comment
+  // still describing it — do not re-add that row, and do not trade the A-keyed one
+  // away on the strength of a row that does not exist.
   ok(
     /event: "gate_recovery"[^}]*?root: normRoot/.test(src),
     "the durable gate_recovery record must name the root it recovered for",
