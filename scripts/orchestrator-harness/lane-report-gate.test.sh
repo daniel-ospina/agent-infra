@@ -47,6 +47,13 @@
 #     every report.
 # 10. THE VERIFIER IS THE TRUSTED CHECKOUT'S, not the merged worktree's (fresh review, P2): a lane can
 #     edit `tools/worktree_report.py` on its own branch, so preferring `$wt` would let it grade itself.
+#     Cycle 2 closed the two remaining doors: NO ambient env var may select the verifier (an `export`
+#     inherited through the chain defeated even the $O-pinned carrier), and the `$wt` FALLBACK is gone
+#     (a lane could ADD the writer to its PR and lift a non-participant repo's refusal).
+# 11. A MIS-GRADED OR UNREACHABLE REFUSAL IS A DEFECT TOO (cycle 2): an unusable repo path is 7, not a
+#     mergeable 6 abstention; a gate block NESTED in a never-true guard is inert while every anchor
+#     stays green, so the block must not be nested; and a future-dated merging head (a cross-box push)
+#     gets its own reason, because the re-run remedy cannot converge on it.
 set -u
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 GATE="$HERE/lane-report-gate.sh"
@@ -212,8 +219,24 @@ ln -sf "$(command -v git)" "$TMP/nopy/git" 2>/dev/null
 # ⛔ `bash` IS INVOKED BY ABSOLUTE PATH: `env PATH=… bash` resolves `bash` with the NEW PATH, so a
 # minimal PATH makes env itself fail (rc 127) instead of exercising the gate.
 BASH_ABS="$(command -v bash)"
-out="$(env STUB_OK=1 STUB_RC=0 PATH="$TMP/nopy" LANE_REPORT_GATE_PY=/nonexistent "$BASH_ABS" "$GATE" --check "$REPO" "feat/2977-tm" "$WT_HEAD" 2>&1)"; rc=$?
+out="$(env STUB_OK=1 STUB_RC=0 PATH="$TMP/nopy" "$BASH_ABS" "$GATE" --check "$REPO" "feat/2977-tm" "$WT_HEAD" 2>&1)"; rc=$?
 if [ "$rc" = 7 ]; then ok "NO INTERPRETER is UNMEASURABLE (rc=$rc) — an unreadable verification is not a pass"; else bad "no-interpreter: expected rc=7, got rc=$rc :: $out"; fi
+
+# ── 3b. NO AMBIENT ENV VAR MAY SELECT THE VERIFIER (fresh review, P1) ─────────────────────────────
+# The "disable it by ambient env" bypass: a lane runs lane-merge.sh itself, which forks the chain and
+# the $O-pinned merge-one.sh under plain inheritance, so one `export` reached the backstop carrier.
+# The seam is deleted; this row proves a liar named in the env cannot override the repo's consumer.
+LIAR="$TMP/liar_tool.py"
+printf 'import json,sys\nprint(json.dumps({"ok":True,"rules":[],"suites":1,"failing_suites":0,"head":"%s","head_moved_since_write":False}))\n' "$WT_HEAD" > "$LIAR"
+out="$(env STUB_OK=0 STUB_RC=3 STUB_FAILING=1 LANE_REPORT_GATE_TOOL="$LIAR" bash "$GATE" --check "$REPO" "feat/2977-tm" "$WT_HEAD" 2>&1)"; rc=$?
+if [ "$rc" = 3 ]; then ok "LANE_REPORT_GATE_TOOL in the ambient env is IGNORED — the repo's consumer still decides (rc=$rc)"; else bad "ambient LANE_REPORT_GATE_TOOL overrode the verifier: expected rc=3, got rc=$rc :: $out"; fi
+
+# ── 3c. AN UNUSABLE repo IS 7, NOT A 6 ABSTENTION (fresh review, P2) ─────────────────────────────
+mkdir -p "$TMP/plaindir"
+out="$(bash "$GATE" --check "$TMP/plaindir" "feat/2977-tm" "$WT_HEAD" 2>&1)"; rc=$?
+if [ "$rc" = 7 ]; then ok "a NON-GIT repo is UNMEASURABLE, not a 6 abstention (rc=$rc)"; else bad "non-git repo: expected rc=7, got rc=$rc :: $out"; fi
+out="$(bash "$GATE" --check "$TMP/no-such-path-xyz" "feat/2977-tm" "$WT_HEAD" 2>&1)"; rc=$?
+if [ "$rc" = 7 ]; then ok "a NONEXISTENT repo path is UNMEASURABLE, not a 6 abstention (rc=$rc)"; else bad "nonexistent repo: expected rc=7, got rc=$rc :: $out"; fi
 
 # ── 4. ABSENT / NO-CONSUMER / UNMEASURABLE-with-report ───────────────────────────────────────────
 mv "$WT/WORKTREE-REPORT.md" "$TMP/report.bak"
@@ -243,6 +266,12 @@ print(json.dumps({"ok": True, "rules": [], "suites": 1, "failing_suites": 0,
                   "head": head, "head_moved_since_write": False}))
 LIAR
 drive 3 "the worktree's OWN lying consumer does not grade it — the trusted checkout's consumer decides" STUB_OK=0 STUB_RC=3 STUB_FAILING=1
+# ⛔ AND A LANE CANNOT SUPPLY THE MISSING VERIFIER EITHER (fresh review, P1). A non-participant repo
+# normally gets 7 (report present, no writer). A lane that ADDS tools/worktree_report.py to its own
+# branch must not convert that into a PASS — the `$wt` fallback that allowed it is gone.
+mv "$REPO/tools/worktree_report.py" "$TMP/stub2.bak"
+drive 7 "a repo with NO writer abstains even when the lane worktree carries one (the merged tree cannot supply its grader)" STUB_OK=1 STUB_RC=0
+mv "$TMP/stub2.bak" "$REPO/tools/worktree_report.py"
 rm -f "$WT/tools/worktree_report.py"
 
 # ── 5. EXACT BRANCH MATCH (§6) — both mutant directions — the decoys sort FIRST in the walk ──
@@ -322,6 +351,23 @@ elif sed -n "$((co_head-3)),$((co_head-1))p" "$MERGE_ONE" | grep -qE 'MERGE_AUTH
 else
   ok "merge-one.sh's gate block is UNGUARDED (it runs on rail repos too)"
 fi
+# ⛔ LINE ORDER AND "NO MERGE_AUTHORITY NEARBY" ARE STILL SYNTACTIC (fresh review, P2): wrapping the
+# block in a never-true guard (`if false; then`), or in a config flag that defaults off, keeps every
+# anchor and every ordering while making the gate INERT — the cycle-1 finding one wrapper away. The
+# realistic instance is `if [ -n "${LANE_REPORT_ENFORCE:-}" ]; then`, so assert the block is not nested
+# in ANY conditional: the nearest preceding non-blank, non-comment line must not open a block.
+_guard_of() { # _guard_of <file> <head-line> — the nearest preceding code line
+  awk -v t="$2" 'NR<t { if ($0 ~ /^[[:space:]]*$/) next; if ($0 ~ /^[[:space:]]*#/) next; last=$0 } END { print last }' "$1"
+}
+lm_head="$(grep -nE '^_lrg_rc=0; _lrg_out=""$' "$LANE_MERGE" | head -1 | cut -d: -f1)"
+for _pair in "lane-merge.sh:$lm_head" "merge-one.sh:$co_head"; do
+  _f="${_pair%%:*}"; _ln="${_pair##*:}"
+  _g="$(_guard_of "$HERE/$_f" "$_ln")"
+  case "$_g" in
+    *'then') bad "$_f's gate block is NESTED (preceding code line: '$_g') — a guard that is never true makes the gate inert while every anchor stays green" ;;
+    *)       ok "$_f's gate block is not nested in a conditional (preceding code line: $(printf '%s' "$_g" | cut -c1-40))" ;;
+  esac
+done
 if [ -n "$co_rail" ] && sed -n "$((co_call)),$((co_rail))p" "$MERGE_ONE" | grep -qE '^[[:space:]]*exit 9 ;;'; then
   ok "merge-one.sh's refusal exits 9 between the call and the rail short-circuit"
 else
@@ -338,6 +384,30 @@ if grep -q 'lane-report-gate.sh' "$INSTALL"; then
 else
   bad "install.sh does not list lane-report-gate.sh — a \$O deployed without it breaks both carriers"
 fi
+
+# ── 9. A FUTURE-DATED MERGING HEAD IS A DIFFERENT FAULT (fresh review, P2) ─────────────────────
+# When the head was committed on a box whose clock is AHEAD, every honest run here is older than it,
+# so the laundering arm would refuse forever while printing a remedy (re-run) that cannot converge.
+# The gate must NAME it, so the remedy can say "re-push / wait", not "re-run".
+_future="$(date -u -v+1H +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d '+1 hour' +%Y-%m-%dT%H:%M:%SZ)"
+_now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+printf 'z\n' >> "$WT/f2" 2>/dev/null || printf 'z\n' > "$WT/f2"
+git -C "$WT" add f2 2>/dev/null || true
+GIT_COMMITTER_DATE="$_future" GIT_AUTHOR_DATE="$_future" git -C "$WT" commit -qm skewed 2>/dev/null || true
+NEWH="$(git -C "$WT" rev-parse HEAD)"
+printf '{"version":1,"head_at_write":"%s","branch":"feat/2977-tm","suites":[{"n":1,"command":"x","exit":0,"finished_at":"%s"}]}\n' "$NEWH" "$_now" > "$WT/.worktree-report/state.json"
+out="$(env STUB_OK=1 STUB_RC=0 bash "$GATE" --check "$REPO" "feat/2977-tm" "$NEWH" 2>&1)"; rc=$?
+if [ "$rc" = 4 ] && grep -q 'reason=merging-head-is-dated-ahead-of-this-box' <<<"$out"; then
+  ok "a future-dated merging head is STALE with its OWN reason (the re-run remedy cannot converge, so it is named)"
+else
+  bad "future-dated head: expected rc=4 + merging-head-is-dated-ahead-of-this-box, got rc=$rc :: $out"
+fi
+case "$(bash "$GATE" --remedy 4 2>&1)" in
+  *'RE-RUNNING WILL NOT HELP'*) ok "the code-4 remedy tells the lane that re-running cannot clear a clock-skewed head" ;;
+  *) bad "the code-4 remedy does not distinguish the clock-skew case" ;;
+esac
+git -C "$WT" reset --hard -q HEAD~1 2>/dev/null || true
+rm -f "$WT/f2" "$WT/.worktree-report/state.json"
 
 printf '\n%s passed, %s failed, %s skipped\n' "$PASS" "$FAIL" "$SKIP"
 [ "$FAIL" -eq 0 ] || exit 1
