@@ -494,11 +494,15 @@ function recoveryOnlyRoot(root: string): string {
 // reset at session_start (it is a session fact, like the block registry).
 // #1265 (review F5): a SET, not a single slot. The stated invariant is "once per
 // session per (root, siblings)", and a single slot only dedupes CONSECUTIVE
-// repeats — the hub/linked-worktree case #3255 exists for ALTERNATES roots (a bare
-// `git push` resolves the hub, `git -C <worktree>` resolves the worktree), so the
-// same pair was re-recorded on every alternation, unbounded. A session with three
-// worktrees (A verified, B and C not) records each of B and C exactly once, which
-// e2e 1265a now exercises by alternating B -> C -> B inside one session.
+// repeats — the hub/linked-worktree case #3255 exists for ALTERNATES roots, so the
+// same pair was re-recorded on every alternation, unbounded: a bare `git push`
+// resolves the hub, then `cd <worktree> && git commit` resolves the worktree (the
+// `cd` prefix via `extractCdPath`, or a differing `inputCwd`). ⛔ NOT `git -C`: that
+// is a REPO-REDIRECTING global (GIT_REDIRECT), `isGitOp` refuses the invocation as
+// foreign, and the tool_call handler returns before this function — so `-C` never
+// produces a mismatch record at all and cannot alternate anything here. A session
+// with three worktrees (A verified, B and C not) records each of B and C exactly
+// once, which e2e 1265a now exercises by alternating B -> C -> B inside one session.
 const recordedRootMismatches = new Set<string>();
 function diagnoseRootMismatch(root: string): void {
   const roots = bridgeRoots();
