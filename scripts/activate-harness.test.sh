@@ -30,6 +30,17 @@ assert_absent()   { case "${1:-}" in *"$2"*) bad "$3 (found: $2)"; printf '%s\n'
 # `command not found` to stderr and contributed NOTHING to PASS/FAIL, so that case's exit-polarity claim
 # never ran while the suite reported 98/98. An assertion helper that is not defined cannot fail.
 assert_exit()     { assert_eq "${RC:-?}" "$1" "$2"; }
+# ⛔ READ A ROW BY FIELD, NEVER BY PADDED TEXT (review P1-1/P2-6). `emit` renders the pretty table with
+# `printf '  %-24s %-9s %-12s %s\n'`, so the gap between name and class depends on the NAME'S LENGTH:
+# a 27-character name gets no padding at all and exactly one space, while a 22-character one gets two
+# plus the format's one. A literal carrying the wrong number of spaces cannot match any row the
+# program can print — including the row it was written to forbid, which is how two assertions in this
+# file came to be unable to fail under ANY mutation (measured, 119/0 with the defect restored).
+# `--tsv` is the machine contract (`emit` at activate-harness.sh:236): tab-separated, no field width,
+# plus ONE `SUMMARY` line. So a row's class or state is asked for where it lives.
+row_field() { # <tsv-output> <name> <field-number 1..4> -> the field, or empty when the row is absent
+    printf '%s\n' "${1:-}" | awk -F'\t' -v n="$2" -v f="$3" '$1 == n { print $f; exit }'
+}
 
 FX="$(mktemp -d "${TMPDIR:-/tmp}/activate-harness-test.XXXXXX")" || exit 1
 cleanup() { rm -rf "$FX"; }
@@ -418,7 +429,21 @@ arm_mac
 RUN --check
 assert_eq "$RC" 0 "T12 a fully-armed Mac is green"
 assert_contains "$OUT" 'ACTIVATION COMPLETE' "T12 and it says so"
-assert_absent "$OUT" 'com.eldato.runner-autoscale  must' "T12 the optional autoscale row is not graded must on a Mac"
+# ⛔ READ BY FIELD, AND THEREFORE REACHABLE (review P1-1). The assertion this replaces searched the
+# padded table for `com.eldato.runner-autoscale  must`; that name is 27 characters against a 24-column
+# field, so the emitted row carries ONE space and the literal's two could never match it. Restoring F7
+# — the mac sub-directory loop grading the optional `#2403` row as `must` — left the suite at 119/0.
+# Its consequence is the one F7 was filed for and the fixture cannot see on its own: `arm_mac` arms
+# everything, so on a Mac where the optional row is genuinely unarmed the grid reads `must`/`MISSING`,
+# `--install` can never reach ACTIVATION COMPLETE, and the only way to green it is the hand-run arming
+# step the class system exists to withhold. The class is now read from the machine contract.
+RUN --tsv
+assert_eq "$(row_field "$OUT" com.eldato.runner-autoscale 2)" "optional" \
+    "T12 the optional autoscale row is graded optional on a Mac (field-read, so a revert to 'must' reddens here)"
+assert_eq "$(row_field "$OUT" com.eldato.runner-autoscale 3)" "OK" \
+    "T12 and that row is genuinely present and OK — an absent row cannot satisfy the assertion above"
+assert_eq "$(row_field "$OUT" com.eldato.runner-autoscale 1)" "com.eldato.runner-autoscale" \
+    "T12 positive control: the row this case reads is the one the grid emitted (nothing else answers to it)"
 : >"$FX/install.log"
 RUN --install
 assert_contains "$(cat "$FX/install.log" 2>/dev/null || true)" 'install-launchd.sh' "T12 --install actually REACHED the launchd arm (the positive control the old assertion lacked)"
@@ -612,7 +637,21 @@ python3 -c 'import sys,os,time;os.utime(sys.argv[1],(time.time()-18000,)*2)' \
 RUN --check
 assert_contains "$OUT" 'eldato-conflict-rebase' "T27 a long-cadence box still has a row"
 assert_contains "$OUT" 'cadence allows 19200s' "T28 the bound follows the timer's period (2 x 120 min + 4800; the old constant 7200 would have called 5 h LATE)"
-assert_absent "$OUT" 'eldato-conflict-rebase must LATE' "T28 and a 5-hour-old beacon is inside a 120-minute cadence"
+# ⛔ FIELD-READ, AND PAIRED WITH A CONTROL THAT PROVES IT CAN FLIP (review P2-6). The literal this
+# replaces was `'eldato-conflict-rebase must LATE'`: that name is 22 characters, so `%-24s` pads two and
+# the format adds one — the real row carries THREE spaces — so it could not match, and it read as
+# "the 5-hour case is proven not-LATE" over nothing at all. The sibling `cadence allows 19200s` could
+# not cover for it either: that string is in the LATE detail too, so the pair passed together whatever
+# the state was. Now the STATE is the assertion, and the control below ages the same beacon past the
+# same bound and demands LATE — so the pair distinguishes the two outcomes instead of coinciding.
+RUN --tsv
+assert_eq "$(row_field "$OUT" eldato-conflict-rebase 3)" "OK" \
+    "T28 a 5-hour-old beacon is inside a 120-minute cadence (state field, not padded text)"
+python3 -c 'import sys,os,time;os.utime(sys.argv[1],(time.time()-20000,)*2)' \
+    "$FHOME/.pi/agent/state/conflict-rebase/timer.beat"
+RUN --tsv
+assert_eq "$(row_field "$OUT" eldato-conflict-rebase 3)" "LATE" \
+    "T28 control: 20000s is past the 19200s bound, and the same field says LATE — so the assertion above is reachable"
 # (b) a leading-zero period must still produce a row, and must never read as a complete grid
 PLATFORM_SEAM="" SKIP_SEAM=""; EXTRA_ENV=()
 arm_all
