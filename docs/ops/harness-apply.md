@@ -517,7 +517,7 @@ checkout can use the documented hatch. The same interaction is recorded for
 
 ## Tests
 
-`scripts/harness-apply-timer.test.sh` — 590 assertions, run by the
+`scripts/harness-apply-timer.test.sh` — 594 assertions, run by the
 `harness-apply-timer` shard of `run-bash-shards.sh`:
 
 | | |

@@ -2583,6 +2583,34 @@ assert_absent "$(grep '^farm_rows=' "$T/t24aw/state/harness-apply.status" 2>/dev
 assert_file "$T/t24aw/state/harness-apply-farm-rows.txt" \
     "T24 control: and it PUBLISHES what the checker printed — a refusal that names nobody is the arm-2 gap over again"
 
+# ⛔ THE --quiet DIAGNOSIS WAS UNPINNED (post-merge fresh-context review of #3802, P2 — measured: a
+# mutant deleting BOTH --quiet clauses — the `remedy=` and the log line — left the suite green at
+# 583/7, byte-identical to the unmodified-copy baseline). The refusal itself is right (a mute run
+# certifies nothing), but its whole value is NAMING THE FLAG, and nothing kept that. This fixture is the
+# documented seam's own output shape: --quiet suppresses the `OK —` summary because it is a
+# `log_line`, while `note —` lines are `say_err` and SURVIVE, so a real quiet run is exactly one
+# pipe-free prose line and rc=0. The arm asserts the diagnosis, not merely the refusal.
+mk_origin t24ay; mk_clone t24ay
+REPO_P="$CLONE"; MODE_P=sync
+mkdir -p "$T/t24ay/home/.pi/agent/scripts" "$T/t24ay/probe"
+printf 'x\n' >"$T/t24ay/home/.pi/agent/scripts/pr-doctor.py"
+cat >"$T/t24ay/probe/inner-quiet.sh" <<'FARM'
+#!/usr/bin/env bash
+# what `check-farm-drift.sh --quiet` prints on a HEALTHY farm: the `OK —` summary is a log_line (gone),
+# the `note —` lines are say_err (they stay). No pipe anywhere, so it is not a row either.
+printf 'check-farm-drift.sh: note — no pin record at /x/pin and no deadbeef: this is a FIRST INSTALL\n' >&2
+exit 0
+FARM
+printf '#!/usr/bin/env bash\nbash "$(dirname "$0")/inner-quiet.sh" "$@" 2>&1 | tee -a "$(dirname "$0")/log.txt"\n' >"$T/t24ay/probe/wrap.sh"
+chmod +x "$T/t24ay/probe/wrap.sh" "$T/t24ay/probe/inner-quiet.sh"
+OUT="$(HARNESS_APPLY_FARM_CHECKER="$T/t24ay/probe/wrap.sh" run_pass "$T/t24ay" 2>&1)"; RC=$?
+assert_eq "$RC" "24" "T24 control: a quiet (--quiet) run of the real instrument is RED (24) — it printed no verdict, so it certifies nothing"
+assert_contains "$OUT" "--quiet" "T24 control: …and the log line NAMES the flag, because 'a wrapper, a broken copy, or the instrument's own --quiet' is the diagnosis the operator needs (unpinned before this arm)"
+assert_contains "$(grep '^remedy=' "$T/t24ay/state/harness-apply.status" 2>/dev/null || true)" "WITHOUT --quiet" \
+    "T24 control: …and the remedy= field names it too — telling an operator who IS pointing at the instrument to point harder is the defect this diagnosis replaced"
+assert_absent "$(grep '^farm_rows=' "$T/t24ay/state/harness-apply.status" 2>/dev/null || true)" "farm_rows=none" \
+    "T24 control: …and it never records none (a quiet run is not-graded, never a match)"
+
 # ⛔ THE VERDICT MUST BE THE INSTRUMENT'S LINE, NOT THE TOKEN ANYWHERE (review round 26, measured). An
 # unanchored `grep 'OK — '` matched a per-file ROW carrying the token, so this report — drift in a foreign
 # vocabulary, no verdict line at all — certified `farm: ok` / `farm_rows=none` / `farm_n=0` with the
