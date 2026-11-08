@@ -3089,8 +3089,15 @@ export function decisionSnapshotStale(
 }
 
 /** The evidence channel that superseded a kill verdict, named so the operator
- * log can print the one delta that is real (#1339 review). */
-export type SupersedingChannel = "marker" | "bytes" | "progress";
+ * log can print the one delta that is real (#1339 review). The last two are
+ * SCOPE changes rather than clocks: they make a clause inapplicable without any
+ * timed quantity moving. */
+export type SupersedingChannel =
+  | "marker"
+  | "bytes"
+  | "progress"
+  | "session-end"
+  | "tool-in-flight";
 
 /**
  * #1339 (review) — WHICH clock displaced this verdict, if any.
@@ -3113,6 +3120,25 @@ export type SupersedingChannel = "marker" | "bytes" | "progress";
  * Returns `null` for "the verdict still stands". `max-dispatch` is exempt at
  * the call site (a wall-clock policy cap is not an inference about progress, so
  * no new evidence makes the dispatch younger) and is not handled here.
+ *
+ * ⛔ `no-progress` is NOT just "a different clock" — it also has two SCOPE
+ * gates that can flip inside the awaited window with `lastProgressAt`
+ * untouched, and the clause returns `kill: false` for both at that same
+ * instant (`heartbeatKillDecision`):
+ *
+ *  · `state.sessionEnded` — the `#191` early return, "no stall/silence clause
+ *    may race it and misclassify completed work as a partial-result kill". A
+ *    `session_end` marker sets it (and `lastMarkerAt`) but never touches
+ *    `lastProgressAt`.
+ *  · `state.toolsInFlight > 0` — the clause's declared SCOPE: an in-flight tool
+ *    is a DECLARED long operation owned by the tool clauses. `tool_start` sets
+ *    it, and again never touches `lastProgressAt`.
+ *
+ * Missing them is not a policy trade — the policy ("a wedge with no completed
+ * unit of work") is simply unreachable for an ended session or a running tool,
+ * so a kill executed here would contradict the clause's own gate at that very
+ * instant, and for `session_end` it would discard finished work as a
+ * partial-result kill (#1339 cycle-2 review, reproduced).
  */
 export function supersedingEvidence(
   reason: HeartbeatKillReason | undefined,
@@ -3122,9 +3148,16 @@ export function supersedingEvidence(
     lastLifeSignAt: number;
     lastProgressAt: number;
     startedAt: number;
+    /** `state.sessionEnded` at re-validation time (#191 scope gate). */
+    sessionEnded: boolean;
+    /** `state.toolsInFlight` at re-validation time (the clause's scope gate). */
+    toolsInFlight: number;
   },
 ): SupersedingChannel | null {
   if (reason === "no-progress") {
+    // The clause's OWN gates first, strongest first — see the docblock.
+    if (channels.sessionEnded) return "session-end";
+    if (channels.toolsInFlight > 0) return "tool-in-flight";
     // Same anchor the clause itself uses (`lastProgressAt > 0 ? … : startedAt`),
     // so "advanced" means the very quantity the clause measured has moved.
     const anchor = channels.lastProgressAt > 0 ? channels.lastProgressAt : channels.startedAt;
@@ -5155,6 +5188,8 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
               lastLifeSignAt: lastHeartbeat,
               lastProgressAt: hbCtx.state.lastProgressAt,
               startedAt,
+              sessionEnded: hbCtx.state.sessionEnded,
+              toolsInFlight: hbCtx.state.toolsInFlight,
             });
       if (supersededBy) {
         staleSuppressCount += 1;
@@ -5162,16 +5197,21 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
           staleSuppressLoggedAt = now;
           // Stated as "how much newer on the channel that actually fired", never
           // as an age and never for a channel that did not move: a negative age
-          // is what made this bug unreadable in the first place (#1339).
+          // is what made this bug unreadable in the first place (#1339). The two
+          // SCOPE channels have no timed delta, so they carry a label instead of
+          // a fabricated `+0ms`.
           const evidenceDelta =
             supersededBy === "marker"
               ? hbCtx.state.lastMarkerAt - now
               : supersededBy === "bytes"
                 ? lastHeartbeat - now
-                : (hbCtx.state.lastProgressAt > 0 ? hbCtx.state.lastProgressAt : startedAt) - now;
+                : supersededBy === "progress"
+                  ? (hbCtx.state.lastProgressAt > 0 ? hbCtx.state.lastProgressAt : startedAt) - now
+                  : null;
+          const evidence = evidenceDelta === null ? supersededBy : `${supersededBy} +${evidenceDelta}ms`;
           console.error(
-            `[task] ${decision.reason ?? "stall"} kill suppressed — the child produced evidence AFTER the decision snapshot ` +
-              `(${supersededBy} +${evidenceDelta}ms relative to the snapshot; ${staleSuppressCount} suppression(s) this dispatch); re-deciding on the next tick (#1339)`,
+            `[task] ${decision.reason ?? "stall"} kill suppressed — the verdict was refuted AFTER the decision snapshot ` +
+              `(${evidence} relative to the snapshot; ${staleSuppressCount} suppression(s) this dispatch); re-deciding on the next tick (#1339)`,
           );
         }
         return;

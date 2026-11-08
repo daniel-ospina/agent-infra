@@ -210,13 +210,17 @@ unconditionally.
   is awaited between the decision and `killTreeAndEscalate()` (default ON,
   timeout up to 9 s), and every `await` yields the event loop, which is exactly
   where the child's `data` handlers run. So the kill path re-validates before
-  killing — if the clock the fired clause READS moved after the snapshot, the
+  killing — if the fired clause's own premise changed after the snapshot, the
   verdict is superseded and the kill is suppressed. Each clause is asked about
-  its OWN clock (`supersedingEvidence`): `no-progress` is measured on
+  what IT reads (`supersedingEvidence`): `no-progress` is measured on
   `lastProgressAt`, which ticks and output bytes do NOT advance, so a marker
   inside the window cannot refute it — asking the marker/byte question there
-  would restore the reset that clause exists to deny. Every other reason is
-  refuted by a marker or a real output byte. `max-dispatch` is exempt (a
+  would restore the reset that clause exists to deny — and it is ALSO asked
+  about its own two scope gates, `session_end` (the `#191` early return: no
+  stall clause may race a completed session) and a tool in flight (a DECLARED
+  long operation, owned by the tool clauses), because both flip inside the
+  window without moving any progress clock and the clause refuses to kill for
+  either. Every other reason is refuted by a marker or a real output byte. `max-dispatch` is exempt (a
   wall-clock policy cap, not an inference about progress).
   **The honest bound is not "one tick".** Suppression repeats for as long as
   the child keeps producing evidence newer than each tick's own snapshot, which

@@ -3188,7 +3188,7 @@ test("#1339b: the decision never evaluates a threshold against an invalid marker
 
 test("#1339e: supersedingEvidence — the guard asks each clause about ITS OWN clock", () => {
   const snap = 5_000_000;
-  const base = { lastMarkerAt: 0, lastLifeSignAt: snap - 1, lastProgressAt: 0, startedAt: 1 };
+  const base = { lastMarkerAt: 0, lastLifeSignAt: snap - 1, lastProgressAt: 0, startedAt: 1, sessionEnded: false, toolsInFlight: 0 };
 
   // No-progress is measured on `lastProgressAt`, which ticks and bytes do NOT
   // advance (the clause's binding rule). A marker inside the awaited window is
@@ -3212,6 +3212,29 @@ test("#1339e: supersedingEvidence — the guard asks each clause about ITS OWN c
     supersedingEvidence("no-progress", snap, { ...base, lastProgressAt: snap }),
     null,
     "no-progress: progress AT the snapshot instant is not newer (equality is not staleness)",
+  );
+
+  // #1339 CYCLE-2 P1 — the clause's two SCOPE gates, which flip inside the
+  // awaited window with `lastProgressAt` UNTOUCHED. `heartbeatKillDecision`
+  // returns `kill:false` for both at that same instant (#191 early return;
+  // the clause's `toolsInFlight === 0` scope), so the guard must not execute a
+  // verdict the clause itself refuses. Measured before the fix: the kill ran in
+  // both cases, and for `session_end` it discarded FINISHED work as a
+  // partial-result kill.
+  equal(
+    supersedingEvidence("no-progress", snap, { ...base, sessionEnded: true, lastMarkerAt: snap + 1 }),
+    "session-end",
+    "no-progress: a session_end inside the window supersedes — #191 forbids ANY stall clause racing a completed session, and it moves no progress clock",
+  );
+  equal(
+    supersedingEvidence("no-progress", snap, { ...base, toolsInFlight: 1, lastMarkerAt: snap + 1 }),
+    "tool-in-flight",
+    "no-progress: a tool_start inside the window supersedes — an in-flight tool is a DECLARED long operation owned by the tool clauses, and it moves no progress clock either",
+  );
+  equal(
+    supersedingEvidence("no-progress", snap, { ...base, sessionEnded: true, toolsInFlight: 1 }),
+    "session-end",
+    "session_end outranks a concurrent tool_start (strongest gate first)",
   );
 
   // Every other reason is superseded by the marker/byte channels, and the
@@ -3263,8 +3286,12 @@ test("#1339d: loop wiring — the verdict is re-validated against evidence acros
   // The log must never print a delta for a channel that did not move — that was
   // the `marker +-45123ms` nonsense (#1339 review).
   ok(
-    src.includes("(${supersededBy} +${evidenceDelta}ms relative to the snapshot;"),
+    src.includes("(${evidence} relative to the snapshot;"),
     "the log names the channel that ACTUALLY fired and one positive delta, never an untouched channel's negative one",
+  );
+  ok(
+    src.includes('const evidence = evidenceDelta === null ? supersededBy : `${supersededBy} +${evidenceDelta}ms`;'),
+    "the two SCOPE channels (session-end / tool-in-flight) have no timed delta and print a LABEL, not a fabricated +0ms",
   );
   equal(src.split("staleDecisionSuppressLogged").length - 1, 0, "the permanent one-shot latch is gone (replaced by the rate-limited counter)");
   // The headline prints the DECISION's snapshot; the payload keeps the live read
