@@ -301,6 +301,59 @@ def test_a_missing_baseline_never_reaches_verified(P, tmp_path, monkeypatch):
     assert verdict == P.PANE_ONLY
 
 
+def test_a_workspace_only_fallback_can_never_mint_a_verified(P, tmp_path, monkeypatch):
+    """⛔ AN UNQUALIFIED BINDING MAY NOT AWARD A VERDICT (#3795 review P2).
+
+    When this box's `cmux` rejects `--surface`, the surface-qualified read FAILS and
+    `resolve_session_id` retries WORKSPACE-ONLY. That answer names the WORKSPACE's session, not this
+    surface's — the right pane only when the workspace holds one surface. On a multi-surface workspace
+    it can name a DIFFERENT pane's session, and `send_verified` would then take its baseline from, and
+    search for the payload tail inside, a transcript this send never wrote to.
+
+    The reachable shape is the one pinned here: no transcript exists for the named session when the
+    baseline is taken, so `may_await_new_file` is True and the tail search reopens at offset 0 over the
+    last 2 MB. The floor's tail marker is byte-identical on every tick, so the OTHER pane writing the
+    same heartbeat makes a copy satisfy the search — and the verdict becomes `VERIFIED` from bytes this
+    send never produced. That is exactly the outcome this module refuses for an empty read ("how a
+    VERIFIED gets minted from another pane's bytes"); a FAILED read is no better evidence of WHICH
+    session it is.
+
+    Fails on the pre-fix code: the fallback's id was used unconditionally, so the offset-0 window
+    matched the other pane's copy and the verdict was `VERIFIED`.
+    """
+    sid = "01a0d648-4097-74b8-8cfd-3df3a071b463"
+    home = tmp_path / "home"
+    sessions = home / ".pi" / "agent" / "sessions" / "proj"
+    sessions.mkdir(parents=True)
+    sess = sessions / f"2026-09-29T12-00-00Z-{sid}.jsonl"
+    # NO transcript for `sid` yet: that is what licenses the offset-0 window after the send.
+    monkeypatch.setenv("HOME", str(home))
+
+    def run(argv, timeout=None):
+        if argv[:3] == ["cmux", "surface", "resume"]:
+            if "--surface" in argv:
+                return _Proc("", returncode=2)      # this cmux does not know the flag
+            return _Proc(f"{sid}\n")                 # ...so it names ANOTHER surface's session
+        if argv[:2] == ["cmux", "send"]:
+            if argv[-1] != "\n":                     # a real submit, not the terminating Enter
+                # This send went to surf-9. The pane the fallback NAMED writes its own copy
+                # independently — the same cadence text, on another surface.
+                sess.write_text('{"type":"user","text":"' + LONG + '"}\n', encoding="utf-8")
+            return _Proc("OK")
+        if argv[:2] == ["cmux", "read-screen"]:
+            return _Proc("pane scrolled past the message")
+        return _Proc("")
+
+    verdict, _ = P.send_verified("ws-1", LONG, run=run, sleep=_noop_sleep,
+                                 timeout_s=0, surface="surf-9")
+    assert verdict != P.VERIFIED, (
+        "a workspace-only fallback answer certified a send to a surface it does not name — the "
+        "verified bytes came from another pane's transcript")
+    # It must also not be silently promoted past the value the module documents for an unknown id:
+    # `UNVERIFIED`/`PANE_ONLY` are the honest shapes, and both keep the operator's remedy intact.
+    assert verdict in (P.PANE_ONLY, P.UNVERIFIED), verdict
+
+
 def test_a_nonzero_enter_exit_is_a_dropped_enter(P):
     """⛔ A NON-ZERO EXIT IS NOT A SUCCESS (#1881 review P2). `_default_run` does not raise on a
     non-zero status, and `entered` was only cleared in the EXCEPT arm — so a `cmux` whose Enter
@@ -1234,8 +1287,17 @@ def test_verify_cli_forwards_a_surface(P, monkeypatch):
 #
 # The floor wrote `delivered=yes` UNCONDITIONALLY: `cmux send` returned OK, and the receipt was
 # printed with no reference to the exit code and no verification at all. Under #1187 that receipt
-# certified a pane that had received only a prefix — and the log is what the next reader (and
-# `session-postmortem.sh`) takes as the receipt. These drive the REAL script.
+# certified a pane that had received only a prefix — and the log is what the next reader takes as
+# the receipt. The readers that actually exist are named below, and this is a file whose subject is a
+# claim that must name its evidence — so do not grow the list without opening the file:
+#   * `scripts/cadence-nudge.sh:84` — the floor's own due read;
+#   * `scripts/orchestrator-heartbeat.sh:475` — the TICK's rate-limit clock (it reads `NUDGE at=`
+#     and ignores `delivered=`);
+#   * a human reading the log when a beat is missing.
+# NOT `scripts/session-postmortem.sh`: it turns a pi session `*.jsonl` into a retrospective and
+# contains no reference to this log, `NUDGE`, `delivered` or `$STATE` (verified: 0 matches). Naming it
+# was a claim about an evidence source that does not exist — the defect class this PR removes.
+# These tests drive the REAL script.
 
 _NUDGE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cadence-nudge.sh")
 _SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -1468,7 +1530,7 @@ def test_cadence_nudge_reports_submit_failed_as_not_submitted(tmp_path):
     assert "verdict=SUBMIT_FAILED" in appended, appended
 
 
-@pytest.mark.parametrize("stub_verdict", ["", "GARBAGE", "VERIFIED\nOK"])
+@pytest.mark.parametrize("stub_verdict", ["GARBAGE", "VERIFIED\nOK"])
 def test_cadence_nudge_never_certifies_an_unrecognised_checker_verdict(tmp_path, stub_verdict):
     """⛔ THE `case` DEFAULT MUST NOT BE `delivered=yes` (#3795 review P2). A checker that prints
     nothing, a token the floor has never heard of, or TWO lines must all land in the loud arm — the
@@ -1504,6 +1566,43 @@ def test_cadence_nudge_never_certifies_an_unrecognised_checker_verdict(tmp_path,
     assert f"verdict={expected}" in lines[0], (
         f"the stub printed {stub_verdict!r}; the receipt should carry verdict={expected}:\n{appended}")
     assert "NOT CERTIFIED" in appended, appended
+
+
+def test_cadence_nudge_writes_no_receipt_when_the_checker_printed_no_verdict(tmp_path):
+    """⛔ A PASS THAT NEVER REACHED A VERDICT MUST NOT STAMP `NUDGE at=` (#3795 review P1).
+
+    A checker that exits without printing a verdict never reached one — a pre-send crash, a refusal
+    inside argparse, a kill before its `print` — so nothing establishes that a beat was even
+    ATTEMPTED. Folding that into `delivered=UNVERIFIED` and then writing the receipt made the log
+    claim an attempt that produced no cmux call at all.
+
+    It is not this file's clock alone: `NUDGE at=` is also the TICK's rate-limit clock
+    (`orchestrator-heartbeat.sh:475` reads any `NUDGE at=`, `:1053` then exits before its own send).
+    An unearned stamp therefore suppressed BOTH beats while the log showed a regular cadence — the
+    false-PASS shape this whole change exists to remove, in the field the other clock reads.
+
+    `UNVERIFIED` keeps its documented meaning (a prefix, an unreadable pane, or a refused send — all
+    AFTER a send attempt). This third state is `NO-VERDICT` and writes no receipt.
+    """
+    if not os.access(_FLOOR_PY, os.X_OK):
+        pytest.skip(f"{_FLOOR_PY} is not executable on this runner")
+    seed = _seeded_log(600)
+    home, bindir, screen, state = _cadence_home(
+        tmp_path, "the pane shows nothing relevant\n", seed)
+    r = _run_cadence_nudge(home, bindir, screen, stub_verdict="")
+    assert r.returncode == 0, r.stdout + r.stderr
+    nudges, appended = _new_nudge_lines(state, seed)
+    # THE ASSERTION THAT MATTERS: no `NUDGE at=` line was written, so no clock advanced.
+    assert not nudges, (
+        "a pass that never reached a verdict stamped a receipt, advancing both the floor's due read "
+        f"and the tick's rate-limit clock:\n{appended}")
+    assert "delivered=yes" not in appended, appended
+    assert "verdict=NO-VERDICT" in appended, (
+        "the failure line should name the real state, not borrow `UNVERIFIED`:\n" + appended)
+    assert "NOT CERTIFIED" in appended, appended
+    # The failure line must NOT be shaped like a receipt: the due read matches
+    # `NUDGE at=<digits> delivered=`, so a line without `NUDGE at=` cannot be mistaken for an attempt.
+    assert "NUDGE at=" not in appended, appended
 
 
 # ── the `--surface` read: fall back on a FAILED read, never on an empty one (#3795 review P1) ──

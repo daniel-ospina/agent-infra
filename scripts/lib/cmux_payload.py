@@ -215,10 +215,14 @@ def screen_has_payload(screen: str | None, sent_text: str,
     return _pane_matches(screen, marker)
 
 
-def resolve_session_id(workspace: str, run, attempts: int = 3,
-                       retry_s: float = 0.5, sleep=time.sleep,
-                       surface: str | None = None) -> str | None:
-    """The pane's bound session id, or None when the pane does not NAME one.
+def _resolve_session_id_qualified(workspace: str, run, attempts: int = 3,
+                                  retry_s: float = 0.5, sleep=time.sleep,
+                                  surface: str | None = None) -> tuple[str | None, bool]:
+    """The pane's bound session id, or None when the pane does not NAME one -- PLUS whether that id
+    is bound to the SURFACE the caller asked for (`False` only on the workspace-only fallback below).
+
+    The second half exists because it decides whether a transcript read may award a verdict at all;
+    `resolve_session_id` is the public form and returns the id alone.
 
     ⛔ SPLIT FROM THE FILE LOOKUP (#1881 review P1). `resolve_session_file` used to answer None for
     three different things — cmux errored, the pane printed no id YET, and the id is known but no
@@ -244,7 +248,20 @@ def resolve_session_id(workspace: str, run, attempts: int = 3,
     NON-ZERO, this function then names no session, and the caller's best reachable verdict drops to
     `PANE_ONLY` — i.e. the floor would report `NOT-SUBMITTED` on every tick on a HEALTHY fleet. So a
     FAILED surface-qualified read retries once WORKSPACE-ONLY, which is exactly the pre-#3795
-    behaviour and can only ever be better than naming nothing.
+    behaviour.
+
+    ⛔ BUT AN UNQUALIFIED ANSWER MAY NOT AWARD A VERDICT (#3795 review P2). "Better than naming
+    nothing" is true for SENDING to the pane and false for CERTIFYING it. On a box whose cmux rejects
+    the flag, every surface-qualified read fails, so the retry names the WORKSPACE's session -- which
+    is the right pane only when the workspace holds one surface. When it holds several, that id can
+    belong to a DIFFERENT surface, and `send_verified` would then take its baseline from, and search
+    for the payload tail inside, another pane's transcript. The floor's tail marker is byte-identical
+    on every tick, so an OLD copy of the same message in that other transcript can satisfy the search
+    and mint `VERIFIED` from bytes this send never wrote -- precisely the outcome this module refuses
+    for an empty read two paragraphs above ("how a VERIFIED gets minted from another pane's bytes").
+    A FAILED read is no better evidence of WHICH session it is than an empty one, so the fallback's
+    answer is reported as UNQUALIFIED and `send_verified` denies it the transcript arms entirely. The
+    honest ceiling for evidence from an address the caller did not name is `PANE_ONLY`.
 
     ⛔ THE FALLBACK IS KEYED ON A FAILED READ, NEVER ON AN EMPTY ONE (#3795 review P1). `surface
     resume show` exits 0 with empty stdout for a pane that names no session — that is a real answer,
@@ -282,10 +299,26 @@ def resolve_session_id(workspace: str, run, attempts: int = 3,
         return None, read_ok
 
     session_id, read_ok = probe(surface)
+    qualified = True
     if session_id is None and surface and not read_ok:
         _warn("surface-qualified `surface resume show` gave no readable answer; "
               "retrying workspace-only (this cmux may not accept --surface)")
         session_id, _ = probe(None, budget=1)
+        qualified = False
+    return session_id, qualified
+
+
+def resolve_session_id(workspace: str, run, attempts: int = 3,
+                       retry_s: float = 0.5, sleep=time.sleep,
+                       surface: str | None = None) -> str | None:
+    """The pane's bound session id, or None when the pane does not NAME one.
+
+    The public form, and the only shape every pre-existing caller needs; the semantics, the fallback
+    and the reason the fallback is keyed on a FAILED read are documented on
+    `_resolve_session_id_qualified`, which also reports whether the id is the surface's OWN.
+    """
+    session_id, _ = _resolve_session_id_qualified(
+        workspace, run, attempts=attempts, retry_s=retry_s, sleep=sleep, surface=surface)
     return session_id
 
 
@@ -546,7 +579,16 @@ def send_verified(workspace: str, text: str, *, run=None, sleep=time.sleep,
     # by this send (or later) — only that case may reopen the search at offset 0. An id this read
     # could not obtain says nothing about whether a transcript existed, so it must never license the
     # 2 MB window: without a baseline the verdict stays below VERIFIED (PANE_ONLY at best).
-    session_id = resolve_session_id(workspace, run, sleep=sleep, surface=surface)
+    session_id, session_qualified = _resolve_session_id_qualified(
+        workspace, run, sleep=sleep, surface=surface)
+    # ⛔ AN UNQUALIFIED BINDING MAY NOT AWARD A TRANSCRIPT VERDICT (#3795 review P2). The workspace-only
+    # fallback names the WORKSPACE's session, not this surface's; using it to take a baseline (or to
+    # open the offset-0 window) lets another pane's bytes certify this send. Dropping the id here is
+    # the module's EXISTING "no id" path, whose verdict ceiling is already PANE_ONLY -- the honest
+    # ceiling for evidence from an address the caller did not name. The send itself is unaffected: the
+    # message still goes to `target`, which is the caller's own workspace+surface.
+    if not session_qualified:
+        session_id = None
     # ⛔ EXISTENCE IS A READ, NOT AN INFERENCE (#1881 review, rounds 4 and 5): `session_file_for`
     # answers None for "no file", "stat failed" AND "could not look", and only the FIRST of those may
     # reopen the search at offset 0. `session_files_state` reports unreadability as None, which never

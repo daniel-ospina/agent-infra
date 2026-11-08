@@ -21,11 +21,19 @@
 #   message is DUE before doing anything expensive, and if it is, send a CHEAP one now. A message that
 #   has already left cannot be killed by a later timeout.
 #
-# WHAT IT DOES. Reads the last DELIVERED nudge from the log (cheap, local). If one is not due, exits
-# immediately (the common case -- a few ms, so it never costs the pass anything). If one IS due, builds
-# a minimal heartbeat from CACHED/local state only -- NO network, NO `gh`, NO lane classification, so it
-# cannot be slow and cannot be killed -- and sends it as one atomic `text\n` call, then logs a NUDGE
-# line so the next pass sees it.
+# WHAT IT DOES. Reads the last NUDGE ATTEMPT from the log (cheap, local) -- every attempt stamps
+# `NUDGE at=`, and the `delivered=` field beside it carries the verdict for that attempt (see the note
+# above `last=` for why the read must not require `yes`). If one is not due, exits immediately (the
+# common case -- a few ms, so it never costs the pass anything). If one IS due, builds a minimal
+# heartbeat from CACHED/local state only -- NO network, NO `gh`, NO lane classification -- then sends it
+# through `lib/cmux_payload.py verify`, which types the payload and submits it as a SEPARATE Enter, and
+# finally logs a NUDGE line so the next pass sees it.
+#   ⛔ CHEAP IS THE DUE CHECK, NOT THE SEND (#3795 review P1). This paragraph used to promise the send
+#   could not be slow, and that it was "one atomic `text\n` call" -- the single-call-implies-delivery
+#   premise this change retires, and false about the code it describes. The verification window is
+#   bounded but NOT short: up to ~413 s of cmux reads and polls on a slow box (budget table at the
+#   receipt). That is why the lock at the top of this file is pid-guarded rather than age-guarded
+#   alone. Read this as a promise that a NOT-due pass is fast, never that a due one is.
 #
 # It deliberately does NOT try to be as informative as the tick. The tick still runs, still classifies
 # lanes, and still sends its own richer message when it survives. It no longer feeds a lane table --
@@ -54,14 +62,39 @@ GRACE=0
 # send), so a slow cmux can leave one nudge in flight when the next tick fires. Without a lock, both
 # would read the same "is it due?" answer from the log and both would send -- two messages seconds apart,
 # which is out-of-band in the over-frequent direction. The loser exits silently; the next tick retries.
-# A STALE lock (older than the interval, so a killed nudge cannot wedge the floor) is taken over -- that
-# is the same failure that stranded the loop on a dead pid file earlier today, so it is handled here.
+# A STALE lock (its holder has EXITED, or it is older than 6 min and names no pid, so a killed nudge
+# cannot wedge the floor) is taken over -- that is the same failure that stranded the loop on a dead pid
+# file earlier today, so it is handled here. A lock whose holder is still ALIVE is never taken over.
 LOCK="$STATE/cadence-nudge.lock"
-if [ -d "$LOCK" ] && [ -n "$(find "$LOCK" -maxdepth 0 -mmin +6 2>/dev/null)" ]; then
+# ⛔ THE TAKEOVER MUST NEVER RACE A LIVE NUDGE (#3795 review P1). An age bound alone cannot decide
+# this. The critical section now runs up to ~413 s of verification (budget table at the receipt) plus
+# unbounded pre-send work, so a nudge can still be typing at 360 s -- but `-mmin +6` said "stale" and
+# rmdir'd its lock. The second run then found no stamp from the in-flight run, read the PREVIOUS one,
+# judged itself DUE, and BOTH typed a full heartbeat seconds apart: out-of-band in the over-frequent
+# direction, which is the exact failure the attempt-counting due read was widened to prevent.
+# MEASURED on this PR's fixture (in-flight run + a 400 s-old lock): 4 cmux sends, two receipts 5 s
+# apart. Pre-change this could not produce two deliveries -- the critical section was one or two fast
+# calls, so a run that aged the lock past 360 s had not sent. Fix: the holder records its pid.
+#   - pid ALIVE  -> never taken over, whatever the clock says (the loser exits silently, like before).
+#   - pid DEAD   -> taken over IMMEDIATELY, which beats waiting out the age bound.
+#   - no pid     -> an older lock, or a run killed between `mkdir` and the write: fall back to the age
+#                   bound this always had, so a killed nudge still cannot wedge the floor.
+if [ -d "$LOCK" ]; then
+  _holder=$(cat "$LOCK/pid" 2>/dev/null || true)
+  case "$_holder" in
+    ''|*[!0-9]*) _holder="" ;;
+  esac
+  if [ -n "$_holder" ]; then
+    kill -0 "$_holder" 2>/dev/null && exit 0
+  elif [ -z "$(find "$LOCK" -maxdepth 0 -mmin +6 2>/dev/null)" ]; then
+    exit 0
+  fi
+  rm -f "$LOCK/pid" 2>/dev/null
   rmdir "$LOCK" 2>/dev/null
 fi
 mkdir "$LOCK" 2>/dev/null || exit 0
-trap 'rmdir "$LOCK" 2>/dev/null' EXIT
+printf '%s\n' "$$" > "$LOCK/pid" 2>/dev/null || true
+trap 'rm -f "$LOCK/pid" 2>/dev/null; rmdir "$LOCK" 2>/dev/null' EXIT
 
 now=$(date +%s)
 # ⛔ THE FIRST VERSION OF THIS LINE WAS WRONG AND SILENTLY SO. It read:
@@ -582,11 +615,19 @@ else
       fi ;;
   esac
 fi
+# ⛔ THE ENV DOOR IS VALIDATED, NOT TRUSTED (#3795 review P1). The probe above runs `verify --help`,
+# which exits BEFORE argparse validates the `--timeout` VALUE -- so `CADENCE_NUDGE_VERIFY_TIMEOUT=90s`
+# (the obvious human spelling of 90) passed the probe and then made the real call die in argparse,
+# before it could send. Validate the shape here, so the argv the probe covered is the argv that runs.
+_vtimeout="${CADENCE_NUDGE_VERIFY_TIMEOUT:-90}"
+case "$_vtimeout" in
+  ''|.|*[!0-9.]*|*.*.*) _checker_broken="CADENCE_NUDGE_VERIFY_TIMEOUT is not a positive number: '$_vtimeout'" ;;
+esac
 if [ -z "$_checker_broken" ]; then
   _verr=$(mktemp "${TMPDIR:-/tmp}/cadence-nudge-verify.XXXXXX") || _verr=/dev/null
   verdict=$(/usr/bin/python3 "$_verify" verify \
               --workspace "$ORCH_WS" --surface "$ORCH_SURFACE" \
-              --text="$MSG" --timeout "${CADENCE_NUDGE_VERIFY_TIMEOUT:-90}" \
+              --text="$MSG" --timeout "$_vtimeout" \
               2>"$_verr")
   # ⛔ THE VERDICT IS FLATTENED BEFORE IT IS MAPPED OR PRINTED (#3795 review cycle 2, P2). The
   # `case` below was already fail-closed on a multi-line verdict — an unrecognised shape falls to `*`
@@ -597,14 +638,37 @@ if [ -z "$_checker_broken" ]; then
   # (queue via `tr` at the due-read, the checker's stderr, the failed send's stderr); this is the
   # last unguarded one.
   verdict=$(printf '%s' "${verdict:-}" | tr '\n' ' ')
-  # A checker that crashed or was silent printed no verdict. That is NOT `VERIFIED`, and it must not
-  # fall through a `case` default that says so — name it explicitly instead.
-  [ -n "$verdict" ] || verdict="UNVERIFIED"
-  case "$verdict" in
-    VERIFIED) delivered="yes" ;;
-    PANE_ONLY|SUBMIT_FAILED) delivered="NOT-SUBMITTED" ;;
-    *) delivered="UNVERIFIED" ;;
-  esac
+  # ⛔ "NO VERDICT PRINTED" IS NOT AN ATTEMPT (#3795 review P1). A checker that crashed or was silent
+  # printed no verdict, which means it never reached one -- a pre-send crash, a refusal inside
+  # argparse, a kill before its `print`. Folding that into `UNVERIFIED` and then stamping `NUDGE at=`
+  # made the receipt claim an attempt that produced NO cmux call at all. That matters far beyond this
+  # file: `NUDGE at=` is also the TICK's rate-limit clock (`orchestrator-heartbeat.sh:475` reads any
+  # `NUDGE at=`, `:1053` then exits before its own send), so an unearned stamp suppressed BOTH beats
+  # while the log showed a perfectly regular cadence -- the false-PASS shape this whole change exists
+  # to remove, in the field the other clock reads. MEASURED (this PR's fixture, an invalid
+  # `CADENCE_NUDGE_VERIFY_TIMEOUT`): 0 cmux invocations, a receipt claiming an attempt, and the next
+  # tick declining to retry because its own unearned stamp said "attempted 0m ago".
+  #
+  # `UNVERIFIED` keeps its documented meaning (:537: a prefix, an unreadable pane, or a refused send --
+  # all AFTER a send attempt). This third state gets its own name and writes NO receipt (see below).
+  #
+  # Residual, stated because it is a real ambiguity: a checker killed between its `cmux send` and its
+  # `print` is indistinguishable from a pre-send failure, so this path may re-send once. That is the
+  # direction this file already chooses -- "a false UNVERIFIED costs a pane check; a false
+  # delivered=yes is how a lane sits idle believing it was woken" -- and a duplicate heartbeat is
+  # explicitly not the dangerous duplicate a duplicate lane ORDER is.
+  _no_verdict=0
+  if [ -z "$verdict" ]; then
+    verdict="NO-VERDICT"
+    delivered="NO-VERDICT"
+    _no_verdict=1
+  else
+    case "$verdict" in
+      VERIFIED) delivered="yes" ;;
+      PANE_ONLY|SUBMIT_FAILED) delivered="NOT-SUBMITTED" ;;
+      *) delivered="UNVERIFIED" ;;
+    esac
+  fi
   # The checker's stderr is kept: a crashing or refused send must not vanish, or the operator sees
   # only a verdict with no cause (orch-send.sh makes the same call for the same reason).
   _vdiag=""
@@ -632,7 +696,12 @@ else
   # guard produced when the two copies drifted, and a cause that certifies nothing inside a receipt is
   # the same defect class as the receipt itself.
   _cause="payload checker unavailable: $_checker_broken"
-  if [ -n "$err" ]; then
+  # ⛔ ONLY A FAILED SEND'S OUTPUT IS A "CAUSE" (#3795 review P2). `err` captures the send's SUCCESS
+  # banner as well as its failures, and appending it unconditionally made the field that exists to
+  # carry the cause present `cmux=[OK surface:19 workspace:19]` as one -- so an operator triaging
+  # `diag=` for why a beat was uncertified was shown "OK" and learned nothing, and a genuinely refused
+  # send was indistinguishable in shape from a successful one.
+  if [ "${rc:-1}" -ne 0 ] && [ -n "$err" ]; then
     _cause="$_cause; cmux=[$(printf '%s' "$err" | tr '\n' ' ' | tail -c 200)]"
   fi
   _vdiag=" diag=[$_cause] rc=${rc:-?}"
@@ -657,15 +726,25 @@ fi
 #   tail sentinel: `--timeout 90` PLUS one 45 s read-screen, because the deadline is tested AFTER the
 #   read, plus a final 3 s poll                               = 138 s
 #                                                        TOTAL = 413 s
-# The governing boundary is the 450 s `cadence-timer.sh` interval — NOT the `-mmin +6` (360 s) takeover,
-# which can never protect: the next tick arrives at 450 s, by which time the lock is already older than
-# 6 min, so the takeover always fires.
+# The governing boundary is the 450 s `cadence-timer.sh` interval. The `-mmin +6` (360 s) age bound is
+# NOT the protection it looks like -- this window exceeds it -- which is why the takeover at the top of
+# this file is PID-guarded: a live holder is never raced whatever the clock says, and a dead one is
+# taken over at once. An age-only takeover here produced two heartbeats 5 s apart.
 #
 # ⛔ AND 413 s IS THE VERIFICATION WINDOW ONLY (#3795 review cycle 4, P2). The lock is taken at the TOP
 # of this file and the pre-send work runs under it too: `goal-state.py` is bounded by its 20 s + 3 s
 # watchdog, and the `objective.py` reads have no timeout in this file. So the real tick budget is
 # 413 s + that work, inside 450 s — not "413 s with 37 s to spare". The margin is thin enough that a
 # future retry must not be added against it without re-measuring.
+# ⛔ A NO-VERDICT RUN WRITES NO RECEIPT (#3795 review P1). `NUDGE at=` is the claim that this tick
+# attempted a beat, and it is read by the tick's rate limiter as well as by this file's due read, so
+# stamping it for a pass that made no cmux call suppresses the next beat too. State the fact without
+# the claim, and let the next tick retry.
+if [ "${_no_verdict:-0}" = "1" ]; then
+  printf '%s CADENCE-NUDGE NOT CERTIFIED verdict=%s%s — the checker exited without printing a verdict, so this pass made no attempt to deliver; the next tick retries (#1187).\n' \
+    "$(date '+%m-%d %H:%M:%S')" "$verdict" "$_vdiag" >> "$LOG"
+  exit 0
+fi
 printf '%s NUDGE at=%s delivered=%s (cadence-floor) gap=%sm queue=[%s] alerts=[] ask=[] verdict=%s%s\n' \
   "$(date '+%m-%d %H:%M:%S')" "$now" "$delivered" "$gap_min" "$q" "$verdict" "$_vdiag" >> "$LOG"
 # A failed verdict gets its own line TOO, so a reader scanning for `CADENCE-NUDGE` sees the failure
