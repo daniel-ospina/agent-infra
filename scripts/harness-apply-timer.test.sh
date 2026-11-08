@@ -1229,8 +1229,7 @@ assert_eq "$RC" "24" "T24 control: an unpaid-by-the-farm stale file is RED too, 
 # Control 2: the SAME fixture with a matching farm (checker exits 0) keeps its normal verdict — the
 # leg is a gate, not a hard-coded failure.
 # ⛔ AND A CLEAN GRADE PUBLISHES NO LIST, WHILE THE OLD ONE STAYS SELF-DATING (tortoise#10114 arm 2,
-# review round 2). Round 1 asserted a clean grade DELETES the previous list; that delete was removed —
-# it fired on read-only verbs and could unlink a concurrent pass's file. The list stays, its header
+# review round 2). Round 1 asserted a clean grade DELETES the previous list; that delete was removed —# it fired on read-only verbs and could unlink a concurrent pass's file. The list stays, its header
 # dates it, and `farm_rows=none` is what says the list on disk is not today's answer.
 mkdir -p "$T/t24c/home/.pi/agent/scripts" "$T/t24c/state"; printf 'x\n' >"$T/t24c/home/.pi/agent/scripts/pr-doctor.py"
 printf 'file-from-yesterday.py | a | b | STALE\n' >"$T/t24c/state/harness-apply-farm-rows.txt"
@@ -1242,6 +1241,12 @@ printf 'file-from-yesterday.py | a | b | STALE\n' >"$T/t24c/state/harness-apply-
 OUT="$(FARM_CLEAN=1 run_pass "$T/t24c" 2>&1)"; RC=$?
 assert_contains "$OUT" "farm: ok" "T24 control: a matching farm is reported ok"
 assert_eq "$RC" "0" "T24 control: a matching farm leaves the normal verdict intact (exact rc, so a pass broken for an unrelated reason cannot pass this control)"
+# ⛔ THE ROWS ARTIFACT'S OWN LIFECYCLE — its own case label, because every row in the doc's Tests table
+# names a `say_case` the suite prints and a reader indexes the table by that label (measured: the doc
+# gained a `T24r` row that NO case carried, so it pointed at nothing). The controls below it are the
+# artifact's contract: every reported row is written, the list is never emptied by a later pass, and an
+# unpublished path is recorded rather than dropped.
+say_case "T24r the rows artifact's own lifecycle — every row written, and never emptied by a later pass"
 # ⛔ PRESENCE IS NOT THE PROPERTY (review: the promise is "self-dating and NEVER deleted", and a pass that
 # did `: >"$FARM_ROWS_FILE"` destroys yesterday's list while leaving the file present — every `-f` row
 # below stayed green under that truncation mutant, and stayed green on the pre-fix code too, which never
@@ -1575,6 +1580,12 @@ assert_contains "$(cat "$T/t24s/cwd/relstate/harness-apply.status" 2>/dev/null |
     "T24 control: and the record publishes an ABSOLUTE path (not one resolvable only from the pass's cwd, and not CDPATH-mangled)"
 assert_contains "$(cat "$T/t24s/cwd/relstate/harness-apply-farm-rows.txt" 2>/dev/null || true)" "n=20" \
     "T24 control: and that absolute path really holds the list"
+# ⛔ THE HEADER'S `n=` IS THE WRITER'S OWN ARITHMETIC, NOT EVIDENCE THAT A ROW WAS WRITTEN (measured: a
+# mutant that published a HEADER-ONLY artifact on the relative-state-dir path left this control, `farm_n=`
+# and the header's `n=20` all satisfied — "a count is not a name", the exact shape this PR removes). The
+# body rows are counted here, so that state reds.
+assert_eq "$(grep -c . "$T/t24s/cwd/relstate/harness-apply-farm-rows.txt" 2>/dev/null || true)" "21" \
+    "T24 control: and it really holds the rows — header PLUS all 20, not the header alone"
 # ⛔ THE COUNT MUST NOT COUNT PROSE. The instrument prints class-prose lines that contain the same
 # words as a row ("A STALE file is a copy …"), so a whole-line match reported 3 real rows as 7
 # (review round 8). 20 stub rows + 2 prose lines must still read as 20.
