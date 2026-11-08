@@ -4458,7 +4458,12 @@ SH
   # record with no measurable process). So the drive starts the worker in the CMUX-arm shape
   # (`bash $O/state/run-<w>.sh`, the identity `_wreap_patterns` matches) doing nothing — exactly the hung
   # worker this drive is about — and hands the gate a baseline older than its window.
-  printf '#!/bin/sh\nexec sleep 120\n' > "$TMP/RG/state/run-merge-999.sh"
+  # \u26d4 `exec` WOULD DESTROY THE IDENTITY IT IS THERE TO PROVIDE (measured). The gate identifies a
+  # cmux-arm worker by `run-<w>.sh` on its ARGV, and `exec sleep` REPLACES the process so the run script
+  # vanishes from the table (`ps` then shows only `sleep 120`). The cmux arm does not exec \u2014 the run
+  # script stays the process \u2014 so the fixture must not either. Without this the drive fails for a
+  # reason that has nothing to do with the GNU stat shape it exists to test.
+  printf '#!/bin/sh\nsleep 120\n' > "$TMP/RG/state/run-merge-999.sh"
   bash "$TMP/RG/state/run-merge-999.sh" & _gnu_worker=$!
   printf '%s 0 1\n' "$(( $(date +%s) - 3600 ))" > "$TMP/RG/state/wreap-merge-999"
   out="$(bash "$TMP/rg.sh" 2>&1)"
@@ -4476,7 +4481,9 @@ SH
   closed_list="$(printf '%s\n' "$out" | grep -o 'closed=.*' | sed 's/^closed= *//')"
   [ "$closed_list" = "term_merge-999" ] || { rc=1; echo "      closed exactly: '$closed_list'"; }
   ck "shipped reaper, GNU stat shape: completes (rc 0) and reaps exactly the stale worker" $rc
-  grep -q 'reap-worker' "$TMP/RG/rw.log" 2>/dev/null && rc=0 || rc=1
+  # \u26d4 THE KILL LINE, NOT THE WORD `reap-worker` (which the `wedged=0` summary also carries \u2014 measured,
+  # so this row passed while nothing was reaped, the vacuity this file exists to prevent).
+  grep -q 'burned no CPU across the window' "$TMP/RG/rw.log" 2>/dev/null && rc=0 || rc=1
   ck "shipped reaper, GNU stat shape: the kill is logged" $rc
 fi
 sed -n '/^load1() {/,/^}/p' "$LOOP" > "$TMP/load1.sh"
