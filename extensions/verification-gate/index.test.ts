@@ -37,6 +37,46 @@ function section(name: string) {
   console.log(`\n${name}:`);
 }
 
+// #1265: remove COMMENTS from a TypeScript source WITHOUT touching string or template
+// bodies. A regex like /\/\/.*$/ cannot tell a trailing comment from a ` // ` inside a
+// rendered template literal, and truncating that line MUZZLES a negative pin — measured:
+// `console.log(`… // legacy note (cd into it)`)` goes GREEN under a regex strip while the
+// gate still renders the banned remedy. Hence a small state scan: line comment, block
+// comment, and the three quote styles are the only states, and a backslash escapes the
+// next character inside a quote.
+function stripTsComments(source: string): string {
+  let out = "";
+  let i = 0;
+  while (i < source.length) {
+    const c = source[i];
+    const next = source[i + 1];
+    if (c === "/" && next === "/") {
+      while (i < source.length && source[i] !== "\n") i++;
+      continue;
+    }
+    if (c === "/" && next === "*") {
+      i += 2;
+      while (i < source.length && !(source[i] === "*" && source[i + 1] === "/")) i++;
+      i += 2;
+      continue;
+    }
+    if (c === '"' || c === "'" || c === "`") {
+      out += c;
+      i++;
+      while (i < source.length) {
+        if (source[i] === "\\") { out += source[i] + (source[i + 1] ?? ""); i += 2; continue; }
+        out += source[i];
+        if (source[i] === c) { i++; break; }
+        i++;
+      }
+      continue;
+    }
+    out += c;
+    i++;
+  }
+  return out;
+}
+
 // ── extractJson ──────────────────────────────────────
 
 section("extractJson — raw JSON");
@@ -3828,19 +3868,25 @@ test("#3255 policy: the git-op root is authoritative — adoption must never gat
   );
   // #1265 AC (b)/R3: "re-run the op from the verified tree (cd into it)" — the FIRST of three
   // consecutive children that died in one worktree followed it into a tree it did not own. The pin's
-  // SUBJECT is RENDERED output, so it is applied to the source with COMMENTS STRIPPED: a docblock must
-  // be free to quote the old remedy while explaining why it went (index.ts's #1265 note does), and a
-  // comment reflow changes no output. Before the strip this was green only because that historical
-  // mention happened to wrap mid-phrase — so a pure reflow of it reddened a pin whose message asserts a
-  // *rendered message* regressed (#1265 review). The behavioural half is e2e 1265a, which asserts the
-  // captured transcript never contains the phrase.
-  const srcCode = src
-    .replace(/\/\*[\s\S]*?\*\//g, " ")
-    .replace(/^\s*\/\/.*$/gm, " ")
-    .replace(/\s\/\/\s.*$/gm, " ");
+  // SUBJECT is RENDERED output, so it runs on the source with COMMENTS REMOVED (`stripTsComments` —
+  // comment-aware, so a ` // ` inside a template literal cannot truncate the line and muzzle the pin):
+  // a docblock must be free to quote the old remedy while explaining why it went (index.ts's #1265
+  // note does), and a comment reflow changes no output. Before this the pin was green only because
+  // that historical mention happened to wrap mid-phrase — a pure reflow of it reddened a pin whose
+  // message asserts a *rendered message* regressed (#1265 review). The behavioural half is e2e 1265a,
+  // which asserts the captured transcript never contains the phrase.
+  const srcCode = stripTsComments(src);
+  // POSITIVE CONTROL for the strip itself: a rendered occurrence hidden behind a ` // ` INSIDE a
+  // template literal must SURVIVE the strip (a regex strip truncated the line and left this pin
+  // green over a gate that still rendered the banned remedy — measured in review), while a real
+  // line comment must be removed. Without these two rows the strip is trusted, not tested.
+  ok(/\(cd into it\)/.test(stripTsComments("console.log(`remedy: // legacy note (cd into it)`);\n")),
+    "the comment stripper must KEEP a rendered template literal behind a ' // ' — it is not a comment, and clipping it muzzles the pin");
+  ok(!/\(cd into it\)/.test(stripTsComments("// real comment (cd into it)\n")),
+    "the comment stripper must REMOVE a real line comment");
   ok(
     !/\(cd into it\)/.test(srcCode),
-    "the un-followable 'cd into it' remedy must not come back in any rendered message (pinned on code, comments stripped) — the first child that followed it died in a tree it did not own",
+    "the un-followable 'cd into it' remedy must not come back in any rendered message (pinned on code, comments removed) — the first child that followed it died in a tree it did not own",
   );
   ok(
     /re-dispatch verification for THIS root/.test(src) && /refused by design/.test(src),

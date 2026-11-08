@@ -228,9 +228,10 @@ reader contract. Filing a roster pin (emit-site `event:` literals ⊆ `GateEvent
   holds, so `rootsHoldingPath` DOES name a recorded root there — that line answers "why is this
   unverified here", while R3 is about the *remedy* wording. The remedy line is the right evidence for
   R3.) Additionally pinned at source level in `index.test.ts`: the rendered form `(cd into it)` must be
-  absent from code with COMMENTS STRIPPED — the docblock deliberately quotes the old remedy while
-  explaining why it went, and a reflow of a comment changes no output, so stripping comments is what
-  makes the pin's subject (rendered output) match its mechanism. The behavioural half is e2e 1265a,
+  absent from code with COMMENTS REMOVED — the removal is comment-AWARE (`stripTsComments`), so a
+  docblock may quote the old remedy while explaining why it went, while a ` // ` inside a rendered
+  template literal neither clips the line nor muzzles the pin; the strip itself carries a positive
+  control (a rendered occurrence behind ` // ` must survive it). The behavioural half is e2e 1265a,
   which asserts the captured transcript never contains the phrase at all.
 - **R4** The `lastRecoveryMtime`/`lastRecoveredRoot` fast path is disturbed so a
   mid-session bridge write is no longer seen → caught by the pre-existing e2e scenario 16
