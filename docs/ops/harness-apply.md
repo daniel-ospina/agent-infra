@@ -136,10 +136,18 @@ an operator (or the fleet instrument) reads can never carry numbers from before 
 check that names *each* drifting file"). The journal keeps a bounded human view — 12 rows, then
 "… and N more" — so on a 30-row farm 18 files were counted and named nowhere durable (measured
 on the `cmux` cell, 2026-11-07). Every row the instrument reports is therefore written, atomically,
-to `${HARNESS_APPLY_STATE_DIR:-$HOME/.pi/agent/state}/harness-apply-farm-rows.txt` — absolutsed, so a
+to `${HARNESS_APPLY_STATE_DIR:-$HOME/.pi/agent/state}/harness-apply-farm-rows.txt` — absolutised, so a
 relative `HARNESS_APPLY_STATE_DIR` still yields a path another process can open — and the record
-names that file. A state dir that refuses the write is the one state where no artifact exists: it is
-recorded as `farm_rows=unwritable` (below), never as a path that holds no list.
+names that file.
+
+⛔ **`farm_rows=unwritable` IS A PATH-SPECIFIC REFUSAL, NOT AN UNWRITABLE STATE DIR.** The artifact and
+the record are staged in the SAME directory by the SAME technique, so a state dir that refuses writes
+fails the RECORD too: the pass exits 23, `write_record`'s staging fails, and the PREVIOUS record
+stands — that is a staleness signal, not a field, and it is stated again below. What actually produces
+`unwritable` is an artifact path that cannot be **published** while the record can (a directory sitting
+at the path, a failed rename). In that state there is no artifact *from this pass* — and whatever an
+earlier pass left at the fixed path is untouched, so the record naming `unwritable` is what tells a
+reader that the file on disk is not this run's list.
 
 The artifact lives at a **fixed path** and is **self-dating**: its first line carries the UTC
 timestamp, ref, dest and row count of the run that wrote it. No later pass deletes it, so a reader
@@ -187,10 +195,9 @@ record says "published verbatim" and never "every one named".
 
 `farm_rows=unwritable` means the rows write failed **while the record write still succeeded** — the
 drift is still red, `farm_n` still carries the count it had (or `unparsed` when the extraction parsed
-nothing), but **no artifact is written**, so the journal says so in as many words and the rows past
-the 12-line excerpt are named nowhere durable. (A state dir that is unwritable for the record too
-leaves the PREVIOUS record
-in place: staleness, not a field, is that signal.)
+nothing), but **no artifact is written by this pass**, so the journal says so in as many words and the
+rows past the 12-line excerpt are named nowhere durable. (A state dir that is unwritable for the
+record too leaves the PREVIOUS record in place: staleness, not a field, is that signal.)
 
 ⛔ `deployed` EXISTS BECAUSE THE CHECKOUT IS NOT THE DEPLOYMENT. A pin-per-commit cell
 never moves its checkout, so `behind` measured there would be permanently non-zero and
