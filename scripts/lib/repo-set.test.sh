@@ -544,7 +544,9 @@ ck "f11 a missing sibling reader is a NAMED farm gap, not a silent one-repo box"
 # simply older. A refusal that names the wrong cause is the class rounds 18/29/31/33 kept closing.
 ck "f11b an UNSOURCEABLE sibling reader (truncated) is refused BY NAME, with no 'command not found' noise" \
    'mv "$W/lib/repo-set.sh" "$W/lib/repo-set.sh.away"; head -n "$(grep -n "^repo_set_doctor_repos()" "$READER" | cut -d: -f1)" "$READER" > "$W/lib/repo-set.sh"; o="$(REPO_SET_FILE="$CONF" HOME="$T" bash "$W/pr-doctor-machine.sh" 2>&1)"; rc=$?; mv "$W/lib/repo-set.sh.away" "$W/lib/repo-set.sh"; [ "$rc" = 2 ] && grep -q "cannot be used by this wrapper" <<<"$o" && ! grep -qE "command not found|No such file or directory" <<<"$o" && ! grep -q "is not a usable repo set" <<<"$o"'
-# ⛔ THE SIBLING ARMS ALL GUARD `chmod 000` AGAINST ROOT (j1/j2, m13-m15, m18-m20, d-unreadable-checkout):
+# ⛔ THE SIBLING ARMS ALL GUARD `chmod 000` AGAINST ROOT — every such block in this file, and each names its
+# own arms in its own `skip` line rather than leaving a list here to go stale (review round 47, P3: this
+# parenthetical named nine arms while eleven blocks hid nineteen, including one it introduced):
 # root ignores DAC, so on a root box the source SUCCEEDS, the probes pass, the doctor runs and this arm
 # asserts rc 2 on an rc 0 run — a hard red on a correct tree. Non-root CI masks it, which is exactly the
 # kind of latent red that gets "fixed" by weakening the arm. Same guard, same reason.
@@ -1220,6 +1222,12 @@ if mkfifo "$T/fifoset" 2>/dev/null; then
   ck "j4b a FIFO at the config path is INVALID (5) — and the refusal states the RULE, not 'a directory'" \
      'o="$(run_reader "$T/fifoset" list)"; [ "$(run_reader_rc "$T/fifoset" list)" = 5 ] && grep -q "must be a regular file" <<<"$o" && ! grep -q "a directory at the config path" <<<"$o"'
   rm -f "$T/fifoset"
+else
+  # ⛔ A GUARDED ARM THAT PRINTS NOTHING IS AN ARM THAT LOOKS COVERED AND IS NOT (review round 47, P2 —
+  # measured by forcing this false: 234 passed, 0 failed, no skip line, nothing naming the missing arm).
+  # This was the only conditional arm in the file with no `else`, which is why it survived the round that
+  # fixed four others.
+  printf 'skip j4b (mkfifo is unavailable here, so there is no FIFO to test)\n'
 fi
 # ⛔ A DANGLING SYMLINK AT THE CONFIG PATH IS NOT "ABSENT" (review round 7, P2). `-e` follows the
 # link, so a dotfile manager whose target moved (stow/chezmoi) read as "this machine has named no
