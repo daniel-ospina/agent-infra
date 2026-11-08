@@ -722,13 +722,59 @@ ck "  …and \`gate\` covers the floor/gate work it names — a \`floor_emergenc
 # 123 passed, 0 failed) — i.e. the controller could stop napping on its normal path and this arm would
 # still certify it. Filed as agent-infra#3763. The slack is a property of the count, not of the
 # fork-starved site, and a future author must not read the green as "no nap can be dropped".
-_loop_nap_region="$(printf '%s\n' "$_loop_nc" | awk '/^[[:space:]]*while true; do/{f=1} f')"
+# ⛔ AND THE POPULATION EXCLUDES ONE DECLARED, BOUNDED NON-NAP BLOCK (agent-infra#3584, measured).
+# A `sleep` inside the controller loop is a nap only if the CYCLE waits on it. #3584 added an in-cycle
+# RETRY BACKOFF — `sleep "$_rd"` inside the BACKGROUNDED refresh-pass subshell — which the cycle waits
+# on for nothing, whose time sits inside the `refresh` stage rather than between cycles, and which
+# could not carry a `stg_nap_mark` even in principle (that helper writes a shell variable, and a
+# subshell's write dies with the subshell). The blanket rule charged it as a nap path and reddened a
+# CORRECT tree: measured pristine `main` 123 passed/0 failed, this branch 122/1, with the arm reading
+# `3 nap_mark sites for 5 sleep/fork_free_sleep lines`. Rather than widen the rule, `orch-loop.sh`
+# DECLARES the block between `>>> BEGIN NOT-A-CYCLE-NAP` and `<<< END NOT-A-CYCLE-NAP`, and the arms
+# below bound that declaration so it cannot become a place to hide a real nap:
+#   (a) the pair appears EXACTLY ONCE inside the loop region (a lost END would otherwise exclude the
+#       rest of the file, and a lost BEGIN silently re-counts the sleep — the main arm then reds);
+#   (b) the block holds AT MOST ONE sleep line, so wrapping a second nap in it reds (b);
+#   (c) the `_nap_n >= 3` floor above means a block drawn round the WHOLE loop empties `_nap_n` and
+#       reds the main arm instead of vacuously passing it.
+# This is the same doctrine as the `cascade_wait` scoping above: the rule is about CYCLE naps, and a
+# declaration is what lets a text-derived population tell the two apart.
+_loop_nap_region="$(printf '%s\n' "$_loop_tc" | awk '/^[[:space:]]*while true; do/{f=1} f')"
+_nap_fence="$(awk '
+  /^[[:space:]]*# >>> BEGIN NOT-A-CYCLE-NAP/ {f=1; next}
+  /^[[:space:]]*# <<< END NOT-A-CYCLE-NAP/   {f=0; next}
+  f' <<<"$_loop_nap_region")"
+_nap_unfenced="$(awk '
+  /^[[:space:]]*# >>> BEGIN NOT-A-CYCLE-NAP/ {f=1; next}
+  /^[[:space:]]*# <<< END NOT-A-CYCLE-NAP/   {f=0; next}
+  !f' <<<"$_loop_nap_region")"
+# The fences are COMMENT lines, so the split above needs the comment-preserving view (`_loop_tc`, not
+# `_loop_nc` — the same trap §9.1d-v records). The COUNTS then run on the comment-stripped view, so a
+# word in a comment can neither become a nap nor hide one.
+printf '%s\n' "$_nap_unfenced" > "$TMP/nap-region.txt"
+printf '%s\n' "$_nap_fence" > "$TMP/nap-fenced.txt"
+_nap_region="$(_strip_tc "$TMP/nap-region.txt")"
+_nap_excl_body="$(_strip_tc "$TMP/nap-fenced.txt")"
 _region_ok=1
 [ -n "$_loop_nap_region" ] || _region_ok=0
-_nap_n="$(printf '%s\n' "$_loop_nap_region" | grep -cE '^[[:space:]]*stg_nap_mark([[:space:]]|$)')"
-_loop_n="$(printf '%s\n' "$_loop_nap_region" | grep -cE '^[[:space:]]*(fork_free_sleep|sleep) ')"
+_nap_n="$(grep -cE '^[[:space:]]*stg_nap_mark([[:space:]]|$)' <<<"$_nap_region")"
+_loop_n="$(grep -cE '^[[:space:]]*(fork_free_sleep|sleep) ' <<<"$_nap_region")"
 ck "every nap path calls stg_nap_mark (${_nap_n} nap_mark sites for ${_loop_n} sleep/fork_free_sleep lines inside the controller loop — a path without one loses prev_wait; loop region ${_region_ok})" \
    "$(if [ "$_region_ok" -eq 1 ] && [ "${_nap_n:-0}" -ge 3 ] && [ "${_nap_n:-0}" -ge "$(( ${_loop_n:-0} - 1 ))" ]; then echo 0; else echo 1; fi)"
+
+# 9.1d-iii-b: THE NON-NAP DECLARATION IS BOUNDED, so it cannot be used to hide a nap. Every arm here
+# reds if the declaration is widened, duplicated or lost — the three ways the exclusion above could
+# become a hole instead of a fact about a subshell backoff.
+_nap_beg_n="$(grep -cE '^[[:space:]]*# >>> BEGIN NOT-A-CYCLE-NAP' <<<"$_loop_nap_region")"
+_nap_end_n="$(grep -cE '^[[:space:]]*# <<< END NOT-A-CYCLE-NAP' <<<"$_loop_nap_region")"
+_nap_excl_sleeps="$(grep -cE '^[[:space:]]*(fork_free_sleep|sleep) ' <<<"$_nap_excl_body")"
+_nap_excl_marks="$(grep -cE '^[[:space:]]*stg_nap_mark([[:space:]]|$)' <<<"$_nap_excl_body")"
+ck "the non-nap declaration is EXACTLY ONE bounded pair inside the loop (begin=${_nap_beg_n}, end=${_nap_end_n} — a lost end excludes the rest of the file)" \
+   "$(if [ "${_nap_beg_n:-0}" -eq 1 ] && [ "${_nap_end_n:-0}" -eq 1 ]; then echo 0; else echo 1; fi)"
+ck "  …and it holds AT MOST ONE sleep line, so a second nap cannot be parked in it (found ${_nap_excl_sleeps})" \
+   "$(if [ "${_nap_excl_sleeps:-9}" -le 1 ]; then echo 0; else echo 1; fi)"
+ck "  …and it holds NO stg_nap_mark, because a marked nap is not what it declares (found ${_nap_excl_marks})" \
+   "$(if [ "${_nap_excl_marks:-9}" -eq 0 ]; then echo 0; else echo 1; fi)"
 
 # 9.1g THE READER REFUSES A GLOB AS A STAGE NAME.
 # ⛔ THESE ARMS PIN THE OBSERVABLE, NOT THE GUARD. The wanted name is validated AND used quoted, so the

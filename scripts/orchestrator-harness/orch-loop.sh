@@ -8837,6 +8837,19 @@ PY
       REFRESH_RETRY_BUDGET_S="${REFRESH_RETRY_BUDGET_S:-300}"
       case "$REFRESH_RETRY_BUDGET_S" in
         ''|*[!0-9]*|0[0-9]*|[0-9][0-9][0-9][0-9][0-9][0-9][0-9]*) REFRESH_RETRY_BUDGET_S=300 ;; esac
+      # ⛔ THE RETRY BACKOFF IS DECLARED IN-BAND AS NOT-A-CYCLE-NAP, and the markers are load-bearing
+      # (agent-infra#3584). `cycle-stages.test.sh` §9.1d-iii derives its nap population from the
+      # `sleep`/`fork_free_sleep` lines inside the controller loop and requires every one of them to be
+      # paired with a `stg_nap_mark` — because an unmarked CYCLE nap loses `prev_wait`. This `sleep` is
+      # not a cycle nap in kind: it runs inside the BACKGROUNDED pass subshell below, so the cycle
+      # waits on nothing, its 30-90 s sit inside the refresh stage rather than between cycles, and a
+      # `stg_nap_mark` here could not even work (it writes a shell variable, and a subshell's write dies
+      # with it). Without the declaration the arm charged it as a nap path and reddened a correct tree
+      # (measured: pristine `main` 123 passed/0 failed, this branch 122/1 before the markers). The
+      # exclusion is not a licence: the suite bounds the declared block to ONE sleep line, so a second
+      # nap cannot be hidden here, and the `_nap_n >= 3` floor means a block wrapped round the whole
+      # loop reddens the arm instead of emptying it.
+      # >>> BEGIN NOT-A-CYCLE-NAP — the in-cycle retry backoff below (agent-infra#3584)
       if [ -n "$REFRESH_SH" ]; then
         ( _att=0; _t0="$(date +%s)"
           while :; do
@@ -8861,6 +8874,7 @@ PY
             echo "[refresh] TRANSIENT rc=$rc (attempt ${_att}/${REFRESH_RETRY_MAX_ATTEMPTS}) — retrying in ${_rd}s, on a SHORT BOUNDED BACKOFF INSIDE this cycle rather than at the next one (agent-infra#3584)" >> "$LOG"
             sleep "$_rd"
           done
+        # <<< END NOT-A-CYCLE-NAP
         rm -rf "$O/.refresh.lock"
         if [ "$rc" -eq 3 ]; then
           echo "[refresh] BLOCKED (permanent): this repo cannot be provisioned for dispatch — see the reason above. Not retrying (agent-infra#1736); fix it, then delete $O/.refresh-blocked" >> "$LOG"
