@@ -521,6 +521,15 @@ if [ -x /usr/bin/python3 ] && [ -f "$_verify" ]; then
               --workspace "$ORCH_WS" --surface "$ORCH_SURFACE" \
               --text="$MSG" --timeout "${CADENCE_NUDGE_VERIFY_TIMEOUT:-90}" \
               2>"$_verr")
+  # ⛔ THE VERDICT IS FLATTENED BEFORE IT IS MAPPED OR PRINTED (#3795 review cycle 2, P2). The
+  # `case` below was already fail-closed on a multi-line verdict — an unrecognised shape falls to `*`
+  # — but the RAW value was interpolated into both receipts, so `VERIFIED\nOK` split one receipt into
+  # two log lines and made the failure line read "NOT CERTIFIED … verdict=VERIFIED" / "OK — the nudge
+  # was NOT proven delivered": a self-contradicting receipt, in the one change whose subject is a
+  # receipt that must not overstate itself. Every other field on the line is already one-line-guarded
+  # (queue via `tr` at the due-read, the checker's stderr, the failed send's stderr); this is the
+  # last unguarded one.
+  verdict=$(printf '%s' "${verdict:-}" | tr '\n' ' ')
   # A checker that crashed or was silent printed no verdict. That is NOT `VERIFIED`, and it must not
   # fall through a `case` default that says so — name it explicitly instead.
   [ -n "$verdict" ] || verdict="UNVERIFIED"
@@ -547,10 +556,19 @@ else
   # the cause it already holds — `cmux` refusing the send, or a usage error — is the most valuable
   # line it could report; naming only what is MISSING leaves the operator to guess. `err` was
   # captured and never read.
+  # ⛔ EVERY MISSING PIECE IS DERIVED FROM ONE PLACE (#3795 review cycle 2, P2). This used to be a
+  # SECOND copy of the guard above: re-deriving `-f "$_verify"` / `-x /usr/bin/python3` here meant that
+  # any drift between the two copies produced `payload checker unavailable: ` with NOTHING named — a
+  # cause that certifies nothing, inside a receipt. The `else` arm is unreachable while the guard and
+  # this block agree, so instead of risking an empty cause it NAMES what it would have used.
   _missing=""
   [ -f "$_verify" ] || _missing="$_verify"
   [ -x /usr/bin/python3 ] || _missing="${_missing}${_missing:+ }/usr/bin/python3"
-  _cause="payload checker unavailable: $_missing"
+  if [ -n "$_missing" ]; then
+    _cause="payload checker unavailable: $_missing"
+  else
+    _cause="payload checker unusable: /usr/bin/python3 $_verify"
+  fi
   if [ -n "$err" ]; then
     _cause="$_cause; cmux=[$(printf '%s' "$err" | tr '\n' ' ' | tail -c 200)]"
   fi
@@ -566,10 +584,16 @@ fi
 #
 # ⛔ THE STAMP IS WRITTEN AFTER THE CHECK RETURNS, which is why the wording above says "reaches this
 # point" and not "every attempt" (#3795 review P2). A nudge KILLED inside the verification window
-# (`--timeout 90` plus up to three 45 s surface reads) has sent its message and stamped nothing, so
-# the next tick re-fires once the 6-minute lock takeover expires. That window is BOUNDED and stays
-# inside the band — the beat-pair timer is fire-and-forget at 450 s, so nothing else terminates it —
-# but the guarantee here is "bounded", not "impossible".
+# has sent its message and stamped nothing, so the next tick re-fires once the lock takeover expires.
+#
+# ⛔ AND THE WINDOW IS MEASURED, NOT ASSERTED "SAFE" (#3795 review cycle 2, P2 — the previous wording
+# understated it by ~2x, because session resolution is retried and the sentinel reads can outlast the
+# deadline). Worst case, with the `--surface` fallback now ONE shot: 3x45 s surface-qualified reads +
+# 1x45 s workspace-only retry + 45 s send + 45 s Enter + ~90 s tail sentinel = ~360 s, against a
+# 6-minute (`-mmin +6`) lock takeover and a 450 s `cadence-timer.sh` interval. The margin was always
+# thin — the pre-#3795 path was ~315 s — and this retry spends 45 s of it. That is bounded and no
+# worse in kind than what it replaces, but it is NOT "impossible": a slow-but-working cmux can still
+# let a second tick take the lock over. Keep the retry cheap; do not add another full retry budget.
 printf '%s NUDGE at=%s delivered=%s (cadence-floor) gap=%sm queue=[%s] alerts=[] ask=[] verdict=%s%s\n' \
   "$(date '+%m-%d %H:%M:%S')" "$now" "$delivered" "$gap_min" "$q" "$verdict" "$_vdiag" >> "$LOG"
 # A failed verdict gets its own line TOO, so a reader scanning for `CADENCE-NUDGE` sees the failure

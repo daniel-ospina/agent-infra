@@ -1339,6 +1339,12 @@ def test_cadence_nudge_does_not_report_a_prefix_as_delivered(tmp_path):
     """⛔ THE #1187 FALSE PASS AT THE FLOOR. The pane was never given the payload (the fake cmux
     answers OK and shows nothing, which is the measured shape: `OK` over a one-sentence prefix).
     Pre-fix this wrote `delivered=yes`; the log is the receipt, so it must not."""
+    # ⛔ THE CHECKER BRANCH MUST BE THE ONE UNDER TEST (#3795 review cycle 2, P2). Without this skip the
+    # test passes VACUOUSLY on a runner with no `/usr/bin/python3`: the NO-CHECKER branch also writes
+    # `delivered=UNVERIFIED` and `NOT CERTIFIED`, so both assertions hold while the `case` this test is
+    # about is never reached. `verdict=` is asserted below because NO-CHECKER cannot emit it.
+    if not os.access(_FLOOR_PY, os.X_OK):
+        pytest.skip(f"{_FLOOR_PY} is not executable on this runner")
     seed = _seeded_log(600)
     home, bindir, screen, state = _cadence_home(
         tmp_path, "the pane shows nothing relevant\n", seed)
@@ -1349,6 +1355,9 @@ def test_cadence_nudge_does_not_report_a_prefix_as_delivered(tmp_path):
     assert all("delivered=yes" not in line for line in nudges), (
         f"a delivery receipt the send did not earn:\n{appended}")
     assert "delivered=UNVERIFIED" in appended, appended
+    assert "verdict=UNVERIFIED" in appended, appended
+    assert "verdict=NO-CHECKER" not in appended, (
+        "the checker branch was never entered, so this test certified nothing:" + appended)
     assert "NOT CERTIFIED" in appended, "an uncertified send must be LOUD, not merely absent"
 
 
@@ -1417,6 +1426,8 @@ def test_cadence_nudge_reports_pane_only_as_not_submitted_and_names_the_verdict(
     """`PANE_ONLY` is not a delivery verdict (`cmux_payload.py`'s own contract): the tail is on the
     surface, submission is unproven. The receipt must not say `yes` — and must still say WHICH it
     was, since `NOT-SUBMITTED` is shared with `SUBMIT_FAILED`."""
+    if not os.access(_FLOOR_PY, os.X_OK):
+        pytest.skip(f"{_FLOOR_PY} is not executable on this runner")
     seed = _seeded_log(600)
     home, bindir, screen, state = _cadence_home(
         tmp_path, "the pane shows nothing relevant\n", seed)
@@ -1433,6 +1444,8 @@ def test_cadence_nudge_reports_pane_only_as_not_submitted_and_names_the_verdict(
 def test_cadence_nudge_reports_submit_failed_as_not_submitted(tmp_path):
     """The terminating Enter failed: submission was never attempted. Same receipt value as
     PANE_ONLY, and the verdict on the line is how a reader tells them apart."""
+    if not os.access(_FLOOR_PY, os.X_OK):
+        pytest.skip(f"{_FLOOR_PY} is not executable on this runner")
     seed = _seeded_log(600)
     home, bindir, screen, state = _cadence_home(
         tmp_path, "the payload sits in the composer\n", seed)
@@ -1450,6 +1463,10 @@ def test_cadence_nudge_never_certifies_an_unrecognised_checker_verdict(tmp_path,
     """⛔ THE `case` DEFAULT MUST NOT BE `delivered=yes` (#3795 review P2). A checker that prints
     nothing, a token the floor has never heard of, or TWO lines must all land in the loud arm — the
     whole point of the fix is that only a recognised `VERIFIED` buys a receipt."""
+    # Without this skip the three arms pass VACUOUSLY on a runner with no `/usr/bin/python3`, because
+    # the NO-CHECKER branch satisfies both assertions (#3795 review cycle 2, P2).
+    if not os.access(_FLOOR_PY, os.X_OK):
+        pytest.skip(f"{_FLOOR_PY} is not executable on this runner")
     seed = _seeded_log(600)
     home, bindir, screen, state = _cadence_home(
         tmp_path, "the pane shows nothing relevant\n", seed)
@@ -1459,6 +1476,17 @@ def test_cadence_nudge_never_certifies_an_unrecognised_checker_verdict(tmp_path,
     assert nudges, appended
     assert all("delivered=yes" not in line for line in nudges), (
         f"an unrecognised verdict ({stub_verdict!r}) bought a delivery receipt:\n{appended}")
+    assert "verdict=NO-CHECKER" not in appended, (
+        "the checker branch was never entered, so this arm certified nothing:" + appended)
+    # ⛔ ONE RECEIPT IS EXACTLY TWO LOG LINES (#3795 review cycle 2, P2). A multi-line verdict used to
+    # split the receipt, so the failure line read "NOT CERTIFIED … verdict=VERIFIED" / "OK — the nudge
+    # was NOT proven delivered" — a self-contradicting receipt. Measured PRE-flatten at 4 lines for this
+    # parametrisation, so the count is what discriminates; `splitlines()` cannot see a stray break.
+    lines = appended.strip().splitlines()
+    assert len(lines) == 2, (
+        f"the receipt was split across {len(lines)} log lines instead of 2:\n{appended}")
+    # ...and the flatten is visible: the break became a SPACE inside the one field that carries it.
+    assert "verdict=VERIFIED OK" in lines[1] or stub_verdict != "VERIFIED\nOK", appended
     assert "NOT CERTIFIED" in appended, appended
 
 

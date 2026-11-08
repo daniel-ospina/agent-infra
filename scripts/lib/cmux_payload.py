@@ -251,12 +251,18 @@ def resolve_session_id(workspace: str, run, attempts: int = 3,
     and falling back there could bind this send's verification to a DIFFERENT surface's transcript,
     which is how a `VERIFIED` gets minted from another pane's bytes. Only "the read did not happen"
     licenses the retry.
+    ⛔ AND THE RETRY IS ONE SHOT (#3795 review cycle 2, P2). The full attempt budget is the wrong
+    budget for a fallback: this runs only after every surface-qualified read already FAILED, and the
+    case it exists for — a cmux that does not know the flag — is deterministic, so three more 45 s
+    reads buy nothing while spending the floor's slack. Session resolution costs at most 3x45 s
+    qualified + 1x45 s fallback; a second full budget would put the whole verification window past
+    the lock takeover (`-mmin +6`) on a slow-but-working cmux.
     """
 
-    def probe(surface_arg: str | None) -> tuple[str | None, bool]:
+    def probe(surface_arg: str | None, budget: int | None = None) -> tuple[str | None, bool]:
         """`(session id or None, did any read actually SUCCEED)`."""
         read_ok = False
-        for attempt in range(max(1, attempts)):
+        for attempt in range(max(1, budget if budget is not None else attempts)):
             try:
                 proc = run(["cmux", "surface", "resume", "show", "--workspace", workspace,
                             *(["--surface", surface_arg] if surface_arg else [])],
@@ -271,7 +277,7 @@ def resolve_session_id(workspace: str, run, attempts: int = 3,
             for tok in out.replace("'", " ").split():
                 if len(tok) == 36 and tok.count("-") == 4:
                     return tok, True
-            if attempt + 1 < max(1, attempts):
+            if attempt + 1 < max(1, budget if budget is not None else attempts):
                 sleep(retry_s)
         return None, read_ok
 
@@ -279,7 +285,7 @@ def resolve_session_id(workspace: str, run, attempts: int = 3,
     if session_id is None and surface and not read_ok:
         _warn("surface-qualified `surface resume show` gave no readable answer; "
               "retrying workspace-only (this cmux may not accept --surface)")
-        session_id, _ = probe(None)
+        session_id, _ = probe(None, budget=1)
     return session_id
 
 
