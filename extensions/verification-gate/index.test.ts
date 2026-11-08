@@ -3827,12 +3827,20 @@ test("#3255 policy: the git-op root is authoritative — adoption must never gat
     "the durable gate_recovery record must name the root it recovered for",
   );
   // #1265 AC (b)/R3: "re-run the op from the verified tree (cd into it)" — the FIRST of three
-  // consecutive children that died in one worktree followed it into a tree it did not own. Pin the
-  // RENDERED form: the historical mention in the docblock wraps across lines, so it does not match —
-  // and any restored remedy that puts that phrase in output does.
+  // consecutive children that died in one worktree followed it into a tree it did not own. The pin's
+  // SUBJECT is RENDERED output, so it is applied to the source with COMMENTS STRIPPED: a docblock must
+  // be free to quote the old remedy while explaining why it went (index.ts's #1265 note does), and a
+  // comment reflow changes no output. Before the strip this was green only because that historical
+  // mention happened to wrap mid-phrase — so a pure reflow of it reddened a pin whose message asserts a
+  // *rendered message* regressed (#1265 review). The behavioural half is e2e 1265a, which asserts the
+  // captured transcript never contains the phrase.
+  const srcCode = src
+    .replace(/\/\*[\s\S]*?\*\//g, " ")
+    .replace(/^\s*\/\/.*$/gm, " ")
+    .replace(/\s\/\/\s.*$/gm, " ");
   ok(
-    !/\(cd into it\)/.test(src),
-    "the un-followable 'cd into it' remedy must not come back in any rendered message — the first child that followed it died in a tree it did not own",
+    !/\(cd into it\)/.test(srcCode),
+    "the un-followable 'cd into it' remedy must not come back in any rendered message (pinned on code, comments stripped) — the first child that followed it died in a tree it did not own",
   );
   ok(
     /re-dispatch verification for THIS root/.test(src) && /refused by design/.test(src),

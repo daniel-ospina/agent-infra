@@ -5926,6 +5926,11 @@ async function main() {
       `1265a: the mismatch remedy must be the followable one and name THIS root, got: ${captured.join(" | ")}`);
     ok(captured.some((l) => l.includes("refused by design")),
       `1265a: the mismatch remedy must state that adopting a sibling's entries is refused by design, got: ${captured.join(" | ")}`);
+    // R3's other half, and the only place it can be checked as RENDERED text: the
+    // pre-fix transcript put "(cd into it)" in the output the child acted on. The
+    // source-level pin in index.test.ts is a structural proxy; this is the behaviour.
+    ok(!captured.some((l) => l.includes("cd into it")),
+      `1265a: the un-followable "cd into it" remedy must not be rendered at all, got: ${captured.join(" | ")}`);
 
     const audit = readAuditLines();
     const forB = (e: string) => audit.filter((l) => l.event === e && String(l.root ?? "").endsWith("wt-1265-b") && String(l.session_cwd ?? "").startsWith(realB));
@@ -6014,7 +6019,7 @@ async function main() {
     // the caller's list to the writing root (both `pp.root === projectRoot` and the
     // normalised form) leaves this row GREEN, because `writeBridge`'s own
     // merge-with-existing (#1225/#1573) restores A regardless. The row that DOES
-    // discriminate the snapshot revert is scenario 21b (:955), whose writer's
+    // discriminate the snapshot revert is scenario 21b (:956), whose writer's
     // registry never held the foreign entry — do not read this row as covering that,
     // and do not delete 21b on the strength of this one.
     ok(bridgeAfter.includes(`${realA}::src/a1265.ts`), "1265a: B's PASS leaves A's entry in the bridge (AC c end state — see scenario 21b for the snapshot-revert discriminator)");

@@ -40,7 +40,9 @@ Two acceptance indicators in the issue are nevertheless still unmet at this head
    direction finding 1 says must not be silent.
 
 The narrow fix is therefore in **reporting**, not in root selection: the session's own root is the
-only root whose entries can cover this session's git ops, and the report must say so — durably.
+only root whose entries can cover git ops resolved **at this root** — a hub session running
+`cd <linked-worktree> && git commit` is legitimately covered by the *worktree's* entries, because the
+git-op root is the command's own cwd — and the report must say so — durably.
 
 ## Alternatives considered
 
@@ -100,7 +102,7 @@ only root whose entries can cover this session's git ops, and the report must sa
 | `session_start` handler | unit-of-behaviour | e2e scenario 1265a (real linked worktrees + real bridge) |
 | `diagnoseRootMismatch` → `tool_call` git-op path | unit-of-behaviour | e2e scenario 1265a (block + audit record + reworded remedy) |
 | `appendJsonl` / `GATE_EVENT_NAMES` vocabulary (`extensions/shared/audit-log.ts`) | type + contract | **documentation-only**: `appendJsonl` takes `Record<string, unknown>`, the repo has no `tsconfig.json`, and no test pins these four names — the edit cannot be enforced (see step 3) |
-| source pins ("#3255 policy" test in `index.test.ts`) | structural | five pins across this PR — own-root declaration, own-root COUNT, durable-record `root`, rendered-remedy absence, followable-remedy presence |
+| source pins ("#3255 policy" test in `index.test.ts`) | structural | six changed pin sites across this PR — five new pins (own-root declaration, own-root COUNT, durable-record `root`, rendered-remedy absence, followable-remedy presence) plus one INVERTED pre-existing pin; see Implementation step 4 |
 | `recoverBridgeForRoot` perf fast-path (`lastRecoveryMtime`) | regression | existing e2e scenario 16 (mid-session bridge recovery — externally-written bridge unblocks the commit) |
 
 ## Research
@@ -225,9 +227,11 @@ reader contract. Filing a roster pin (emit-site `event:` literals ⊆ `GateEvent
   for R3 even though it can now carry a root: `block1` commits `src/shared1265.ts`, which A also
   holds, so `rootsHoldingPath` DOES name a recorded root there — that line answers "why is this
   unverified here", while R3 is about the *remedy* wording. The remedy line is the right evidence for
-  R3.) Additionally pinned at source level in `index.test.ts`:
-  the rendered form `(cd into it)` must be absent from every message string — the historical mention
-  in the docblock wraps across lines, so it does not match that pin.
+  R3.) Additionally pinned at source level in `index.test.ts`: the rendered form `(cd into it)` must be
+  absent from code with COMMENTS STRIPPED — the docblock deliberately quotes the old remedy while
+  explaining why it went, and a reflow of a comment changes no output, so stripping comments is what
+  makes the pin's subject (rendered output) match its mechanism. The behavioural half is e2e 1265a,
+  which asserts the captured transcript never contains the phrase at all.
 - **R4** The `lastRecoveryMtime`/`lastRecoveredRoot` fast path is disturbed so a
   mid-session bridge write is no longer seen → caught by the pre-existing e2e scenario 16
   (externally-written bridge recovered mid-session) staying green.
