@@ -4415,10 +4415,45 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
       // the #796 population; #783 review closed that gap rather than documenting
       // it — the row needs nothing unavailable at that point, and `settled`
       // already guarantees exactly-once (no double row when `close` follows).
+      //
+      // ⛔ `died-before-first-message` IS ITS OWN ROW REASON (review round 10, P3). The settle-path
+      // labels above are chosen BEFORE the child is measured, so a slow-start death that exited 0
+      // with empty stdout was written as `clean-empty` — the label this block documents as a SUCCESS —
+      // while the payload on the SAME settle said `status: died-before-first-message`, `isError: true`,
+      // `childMessagesSent: 0`. One settle, two durable surfaces, contradictory claims — and the
+      // ledger is the surface a lane reader trusts longest. The row reason is now derived from the
+      // measurement, so the two cannot disagree.
       opts?: { reason?: string; exitCode?: number | null; keepCompletionWatchdog?: boolean; sweep?: boolean },
     ) => {
       if (settled) return;
       settled = true;
+      // ── #1208: child liveness, measured ONCE per settle — INCLUDING the settles that resolve
+      // `undefined` ────────────────────────────────────────────────────────────────────────────────
+      // ⛔ THE `undefined` SETTLES ARE THE ISSUE'S OWN CASE (review of this PR round 2, P2). Every
+      // zero-output kill — silence-threshold, cut-with-no-output, hard cap, backstop — resolves
+      // `undefined` so the retry wrapper can re-spawn, and the first cut of this change computed
+      // liveness only where a payload object existed. The retry-exhaustion result then stamped
+      // `never-started` / `childPid: null` for a child that DID exist, WAS killed, HAS a pid and HAS
+      // a transcript: a consumer would read "no child existed, fix the arguments" where the honest
+      // verdict is "a child ran and died before its first message — re-dispatch". The measurement is
+      // therefore taken BEFORE the payload branch and handed to the caller through the observer,
+      // so the evidence survives a resolution that carries no payload.
+      //
+      // ⛔ AND BEFORE THE OUTCOME ROW (review round 10, P3). The row's `reason` is a durable claim
+      // about what happened; deriving it from the settle path while the payload derived it from the
+      // measurement let ONE settle be `clean-empty` (documented as a success) in the ledger and a
+      // proven zero-message death in the result. The measurement is the single source for both.
+      const livenessSnapshot = childLivenessFor({
+        details: value && typeof value === "object" ? (value.details ?? {}) : {},
+        hbState: hbCtx.state,
+        pid: proc.pid,
+        stdout,
+        exited: proc.exitCode !== null || proc.signalCode !== null,
+        // The `undefined` settles carry no payload, so the kill is named by the REASON that
+        // settled them. `failed` / `clean-empty` / `spawn-error` are not kills.
+        killedByReason: opts?.reason !== undefined && !NON_KILL_SETTLE_REASONS.has(opts.reason),
+      });
+      observers?.onLiveness?.(livenessSnapshot);
       // #783 Task 4 — THE choke point, immediately after `settled = true`, and
       // deliberately NOT at the call sites. `finalize` is invoked
       // UNCONDITIONALLY from both proc.on("exit") (after the 2s grace) and
@@ -4431,7 +4466,12 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
       // would miss it, leaving that population uncountable).
       if (opts?.reason) {
         const transcriptPath = resolveTranscript();
-        const recordResult = writeOutcomeRow(opts.reason, opts.exitCode ?? null, transcriptPath);
+        // ⛔ THE MEASUREMENT OUTRANKS THE SETTLE PATH (review round 10, P3). A proven zero-message
+        // death is not "success", and `clean-empty` is the label this block documents as one. The
+        // row's reason is the SAME claim the payload makes, derived from the same snapshot.
+        const rowReason =
+          livenessSnapshot.childState === "died-before-first-message" ? "died-before-first-message" : opts.reason;
+        const recordResult = writeOutcomeRow(rowReason, opts.exitCode ?? null, transcriptPath);
         if (value && typeof value === "object") {
           const details: Record<string, unknown> = { ...(value.details ?? {}), transcriptPath };
           // Never name a path when nothing was written: an unwritable/full
@@ -4456,28 +4496,6 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
       // can land after this snapshot and be missed — fail-closed (no latch),
       // one bounded retry-cycle cost; genuine exhaustion deaths settle via
       // the exit/close paths where stderr has fully drained.
-      // ── #1208: child liveness, measured ONCE per settle — INCLUDING the settles that resolve
-      // `undefined` ────────────────────────────────────────────────────────────────────────────────
-      // ⛔ THE `undefined` SETTLES ARE THE ISSUE'S OWN CASE (review of this PR round 2, P2). Every
-      // zero-output kill — silence-threshold, cut-with-no-output, hard cap, backstop — resolves
-      // `undefined` so the retry wrapper can re-spawn, and the first cut of this change computed
-      // liveness only where a payload object existed. The retry-exhaustion result then stamped
-      // `never-started` / `childPid: null` for a child that DID exist, WAS killed, HAS a pid and HAS
-      // a transcript: a consumer would read "no child existed, fix the arguments" where the honest
-      // verdict is "a child ran and died before its first message — re-dispatch". The measurement is
-      // therefore taken BEFORE the payload branch and handed to the caller through the observer,
-      // so the evidence survives a resolution that carries no payload.
-      const livenessSnapshot = childLivenessFor({
-        details: value && typeof value === "object" ? (value.details ?? {}) : {},
-        hbState: hbCtx.state,
-        pid: proc.pid,
-        stdout,
-        exited: proc.exitCode !== null || proc.signalCode !== null,
-        // The `undefined` settles carry no payload, so the kill is named by the REASON that
-        // settled them. `failed` / `clean-empty` / `spawn-error` are not kills.
-        killedByReason: opts?.reason !== undefined && !NON_KILL_SETTLE_REASONS.has(opts.reason),
-      });
-      observers?.onLiveness?.(livenessSnapshot);
       if (value && typeof value === "object") {
         const marker = detectExhaustionMarker();
         const details: Record<string, unknown> = { ...(value.details ?? {}) };
@@ -4759,8 +4777,14 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
       // non-zero exit (cls === "failed"), and a SUCCESS-but-SILENT child that
       // exited 0 with empty stdout and no sessionEnded. Recording the latter
       // as `reason: "failed"` with `exitCode: 0` would be self-contradictory,
-      // so the label distinguishes them (`clean-empty`) — the payload itself
-      // is unchanged.
+      // so the label distinguishes them (`clean-empty`).
+      //
+      // ⛔ DOCUMENTED CLAIM, CORRECTED (review round 10, P3): this used to add "— the payload itself
+      // is unchanged". The payload IS what this PR changes on this arm: a silent child with zero
+      // content-bearing turns is reclassified `died-before-first-message` with `isError: true`. Only
+      // the LABEL is chosen here; `doResolve` derives BOTH the payload's status and the ledger row's
+      // reason from the same measurement, so `clean-empty` is reserved for the silent settle that is
+      // NOT a proven death.
       const output = stdout.trim();
       const text = output || stderrClean || `Sub-agent exited with code ${code}`;
       const extra = output ? (stderrClean ? `\n\n--- stderr ---\n${stderrClean}` : "") : "";
