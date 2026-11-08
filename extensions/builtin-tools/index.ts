@@ -3969,8 +3969,10 @@ export function resolveTaskCwd(cwd?: string | null): string {
  *
  * A target that does NOT exist, or an unreadable directory, is deliberately NOT
  * rejected here: those surface asynchronously (`ENOENT` / `EACCES`), which the
- * child's async `error` handler reports as `spawn-error` and which now name the
- * cwd. Returns an error message, or null when the target is spawnable.
+ * child's async `error` handler reports as `spawn-error` — through
+ * `describeSpawnFailure` below, which names a MISSING cwd as the cause rather
+ * than leaving `spawn`'s binary-shaped `ENOENT` to be misread (#1698).
+ * Returns an error message, or null when the target is spawnable.
  */
 export function taskCwdRefusal(cwd?: string | null): string | null {
   if (typeof cwd !== "string") return null; // omitted / null → process.cwd(), always spawnable
@@ -5144,9 +5146,65 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
       // false and left the class invisible to the #796 population. `reason`
       // only gates the row write and cannot change the resolution, and
       // `doResolve`'s `settled` latch keeps it exactly-once if `close` follows.
-      doResolve({ content: [{ type: "text", text: `Sub-agent failed: ${err.message} (spawn cwd: ${targetCwd})\n\n--- stderr ---\n${cleanStderr(stderr).slice(-4000)}` }], details: { model, provider, isError: true } }, { reason: "spawn-error" });
+      // #1698: `describeSpawnFailure` names a MISSING cwd as the cause —
+      // `err.message` alone says `spawn <binary> ENOENT`, which reads as a
+      // missing pi install rather than a swept worktree.
+      doResolve({ content: [{ type: "text", text: `Sub-agent failed: ${describeSpawnFailure(err, targetCwd)}\n\n--- stderr ---\n${cleanStderr(stderr).slice(-4000)}` }], details: { model, provider, isError: true } }, { reason: "spawn-error" });
     });
   });
+}
+
+/**
+ * #1698: is `p` ABSENT from the filesystem (rather than merely unreadable)?
+ *
+ * Only `ENOENT`/`ENOTDIR` answer yes. Every other failure — `EACCES`, `EPERM`,
+ * `ELOOP`, an I/O error on a stale network mount — means the path may well
+ * exist, so the caller must NOT claim it is missing. Fail-SAFE direction: an
+ * unrecognised error keeps the plain message (no cause claimed), because a
+ * WRONG "this directory was swept" sends the reader to rebuild a directory
+ * that is right there.
+ */
+function isAbsentPath(p: string): boolean {
+  try {
+    fs.statSync(p);
+    return false;
+  } catch (err) {
+    const code = (err as { code?: unknown } | null | undefined)?.code;
+    return code === "ENOENT" || code === "ENOTDIR";
+  }
+}
+
+/**
+ * #1698: the `spawn-error` message, with the MISSING-cwd cause named.
+ *
+ * `child_process.spawn` reports a cwd that does not exist as
+ * `spawn <binary> ENOENT` — measured (`node -e` with `cwd: /definitely/not/here`):
+ * `code: ENOENT`, `message: "spawn /usr/local/.../node ENOENT"`. The message names
+ * the EXECUTABLE, so a vanished worktree reads as "pi is not installed" and a
+ * reader spends calls hunting a spawn bug that does not exist. That is the
+ * measured cost on macOS, where `/tmp` is cleared under a live lane
+ * (`/tmp/wt-agent-infra`): the generic message cost two calls of diagnosis.
+ *
+ * So: when the errno is `ENOENT` AND the target directory is genuinely absent,
+ * say so and name the directory. When the cwd EXISTS, the plain message stands —
+ * then the missing thing really is the binary, and this must not contradict it.
+ * Total by construction: it never throws and never reads anything but the cwd it
+ * was handed.
+ */
+export function describeSpawnFailure(err: unknown, cwd: string): string {
+  // Read `.message` STRUCTURALLY (not `instanceof Error`): the settle path receives
+  // whatever the runtime handed it, and a cross-realm or plain-object error must
+  // still report what it said rather than degrade to `[object Object]`.
+  const fields = err as { message?: unknown; code?: unknown } | null | undefined;
+  const message =
+    typeof fields?.message === "string" && fields.message ? fields.message : String(err ?? "spawn failed");
+  const base = `${message} (spawn cwd: ${cwd})`;
+  if (fields?.code !== "ENOENT" || !isAbsentPath(cwd)) return base;
+  return (
+    `${base} — ⛔ THE SPAWN CWD DOES NOT EXIST. \`spawn\` reports a missing working directory as an ` +
+    `ENOENT naming the BINARY, so this is NOT a missing \`pi\` install: recreate ${cwd} ` +
+    `(a /tmp worktree swept by the OS is the usual cause) or re-dispatch with a durable cwd (#1698).`
+  );
 }
 
 /** The task-tool result `details` shapes this hook reads. Declared structurally
