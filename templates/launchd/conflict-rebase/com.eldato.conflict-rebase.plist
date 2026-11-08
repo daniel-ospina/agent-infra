@@ -1,0 +1,82 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- agent-infra-plist-version: 0.1.0 -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- eldato conflict-rebase — the SAME pass the Linux cells run on a systemd timer (#2698).
+         Scheduled here by scripts/install-conflict-rebase-timer.sh, which renders this file and
+         bootstraps it. ONE install verb, the platform's own scheduler (#2058).
+
+         WHY THIS FILE IS NOT IN templates/launchd/. scripts/install-launchd.sh installs EVERY
+         templates/launchd/*.plist with NO arguments and a DIFFERENT substitution set, and
+         pi-bootstrap/setup.sh runs it on every Darwin box; scripts/fleet-schedule.py reads the same
+         top-level glob on a cell. A copy there would render with its placeholders unresolved, be
+         SKIPPED with a warning, and the box would silently have no scheduled pass — or, on a cell
+         that also runs the systemd timer, TWO passes on one queue. The subdirectory keeps this file
+         out of both globs (templates/launchd/reaper/ and harness-apply/ set the same precedent).
+
+         NO PLACEHOLDER MAY APPEAR INSIDE AN XML COMMENT. A doubled dash is forbidden in XML text, so
+         an option flag written with its dashes here would make the installed plist unparseable,
+         launchd would refuse it, and the box would silently have no pass. The installer refuses a
+         rendered plist that does not parse, which is the read-back that makes this safe.
+
+         WHY THE ENTRY POINT IS THE CHECKOUT'S OWN PYTHON, NOT bash. macOS TCC is per-binary: a
+         launchd-spawned bash cannot read a script under ~/Documents, and a launchd-spawned git
+         cannot read a repo there. This pass is git worktree add plus git push against that checkout,
+         so an entry point of bash would fail closed every interval while launchctl list showed a
+         healthy job. The interpreter that holds the access reads the script and hands it to bash on
+         stdin (the same launcher install-disk-reaper-timer.sh and install-harness-apply-timer.sh
+         use). No usable interpreter is a REFUSAL at install time.
+
+         THIRTY MINUTES, matching the systemd timer. The pass is bounded by the repo's own
+         lib/bounded.sh and caps itself at CONFLICT_REBASE_MAX PRs per run.
+
+         No StandardOutPath/StandardErrorPath: the pass writes its own log and beacon under the state
+         dir, and an unbounded launchd-captured log is the symlink-truncation surface the reapers
+         already guard. -->
+    <key>Label</key>
+    <string>{{LABEL}}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{{PY_BIN}}</string>
+        <string>{{LAUNCHER}}</string>
+        <string>--script</string>
+        <string>{{TIMER}}</string>
+        <string>start</string>
+        <string>--once</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>{{HOME}}</string>
+        <key>PATH</key>
+        <string>{{PATH}}</string>
+        <!-- The checkout is PINNED, never resolved from the job's environment: a launchd job
+             inherits none of a login shell's rc files, so leaving it ambient would act on a different
+             tree and say so nowhere. -->
+        <key>CONFLICT_REBASE_CHECKOUT</key>
+        <string>{{CHECKOUT}}</string>
+        <key>CONFLICT_REBASE_REPO</key>
+        <string>{{REPO}}</string>
+        <key>CONFLICT_REBASE_MAX</key>
+        <string>{{MAX_PRS}}</string>
+        <key>CONFLICT_REBASE_INCLUDE_BEHIND</key>
+        <string>{{INCLUDE_BEHIND}}</string>
+        <key>CONFLICT_REBASE_STATE</key>
+        <string>{{STATE}}</string>
+    </dict>
+    <key>StartInterval</key>
+    <integer>{{INTERVAL_SEC}}</integer>
+    <!-- A pass AT LOAD as well as on the interval, so a freshly installed agent has a beacon within
+         seconds instead of after the first interval. -->
+    <key>RunAtLoad</key>
+    <true/>
+    <!-- A background pass: it must not compete with a lane for CPU or I/O. -->
+    <key>Nice</key>
+    <integer>10</integer>
+    <key>LowPriorityIO</key>
+    <true/>
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>

@@ -572,13 +572,15 @@ ck "(c) the probe is passed the state dir whose volume lanes fill (\$O), not the
    "$(case "$(cat "$TMP/capsh.argv" 2>/dev/null)" in *"$FIXCELL/orchestrator"*) echo 0 ;; *) echo 1 ;; esac)"
 rm -f "$FH/capacity.sh"
 # …and the default ceiling is PINNED EQUAL to that file's own, so the two instruments cannot drift.
-# ⛔ THE EXTRACTION FOLLOWS THE FILE'S OWN SHAPE, and the shape moved: `capacity.sh` now routes the
-# default through its integer seam (`cap_int_seam CAP_LPC_CEILING "${CAP_LPC_CEILING:-800}" 800`), so a
-# parser pinned to the OLD literal form matched nothing, `cap_const` came out empty, and this arm read
-# RED on a tree where both values are 800 — a stale parser, i.e. a false red on a GREEN tree (measured on
-# origin/main with both files byte-identical to this head). Passing an empty value is not "equal", so the
-# arm still fails closed if the literal ever disappears for real.
-cap_const="$(sed -n 's/^CAP_LPC_CEILING=.*CAP_LPC_CEILING:-\([0-9][0-9]*\)}.*/\1/p' "$HERE/orchestrator-harness/capacity.sh" 2>/dev/null | head -1)"
+# ⛔ PARSE THE NUMBER, NOT THE LINE SHAPE. This read was pinned to `CAP_LPC_CEILING="${CAP_LPC_CEILING:-N}"`,
+# and capacity.sh:286 later wrapped the default in `cap_int_seam CAP_LPC_CEILING "${CAP_LPC_CEILING:-800}" 800`
+# for the overflow/zero coercion — at which point the anchored pattern matched NOTHING, `cap_const` was
+# empty, and the assertion below read as a permanent RED on main (`up=800 capacity=`). A parse that
+# silently yields nothing is the same class as a check that cannot fail: it must find the default in
+# either shape, and the assertion still refuses an empty read. Passing an empty value is not "equal", so
+# the arm still fails closed if the literal ever disappears for real. (Both sides of the merge onto
+# origin/main fixed this same false red; this keeps the shape-independent parse, which is a superset.)
+cap_const="$(sed -n 's/^CAP_LPC_CEILING=.*CAP_LPC_CEILING:-\([0-9][0-9]*\).*/\1/p' "$HERE/orchestrator-harness/capacity.sh" 2>/dev/null | head -1)"
 up_const="$(sed -n 's/.*percpu="${HU_LOAD_PER_CPU:-\([0-9]*\)}".*/\1/p' "$UP" | head -1)"
 ck "(c) the load ceiling default equals capacity.sh's CAP_LPC_CEILING (up=$up_const capacity=$cap_const)" "$([ -n "$cap_const" ] && [ "$cap_const" = "$up_const" ] && echo 0 || echo 1)"
 # ⛔ THE REFUSAL: an unmeasurable box + a fixed cap must NOT answer with the cap. A Darwin-shaped arm
