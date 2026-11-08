@@ -1080,6 +1080,28 @@ jobs:
         # before anything reads it.
         # Zero-dep (`node:*` + the `git` binary), no `npm ci`, ~5s.
         run: node extensions/main-worktree-guard/test-command-position.mjs
+      - name: main-worktree-guard hub working-tree SWEEP detection (#718)
+        # #718 (2026-09-10): a session authored six artifacts in the shared hub
+        # — one new untracked skill DIRECTORY, four tracked SKILL.md edits, one
+        # new doc — and a concurrent session returned the hub to `main`. ALL SIX
+        # vanished, nothing warned the working session (it learned when an `edit`
+        # returned ENOENT ~1h later), and the work survived only because a sibling
+        # had coincidentally salvaged first.
+        # NO existing gate could see it, which is why this step exists: M1 (#265)
+        # compares the hub's BRANCH and the #350 inventory describes the hub's
+        # CURRENT state — after a sweep the hub is clean and on main, so every
+        # state check PASSES. This suite pins the missing discriminator: a
+        # per-session baseline of the dirty paths observed. Behavioral: loads the
+        # REAL index.ts through module-load-hooks.mjs, drives the tool_call
+        # handler against a hermetic hub, and performs the sweep OUT-OF-PROCESS
+        # (plain git/rm, exactly what a concurrent session does), then pins the
+        # negative controls that keep it from becoming noise — a worktree-rooted
+        # session is silent, the env hatch is silent, a never-dirty hub is
+        # silent, an APPEARING path is not a loss, and a path is reported once.
+        # Zero-dep (`node:*` + the `git` binary), no `npm ci`, ~2s. Its own step
+        # (the post-merge `extensions/*/test*.mjs` glob in ci-main.yml is not
+        # PR-triggered).
+        run: node extensions/main-worktree-guard/test-hub-sweep.mjs
       - name: main-worktree-guard nested-worktree hub gate (#1919)
         # `git worktree add 8779-optA` (a RELATIVE path) puts a registered
         # worktree INSIDE the repo root; git reports it as an untracked
