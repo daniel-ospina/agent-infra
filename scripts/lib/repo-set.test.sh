@@ -519,8 +519,13 @@ ck "f5 …and the degradation is LOGGED every pass, with the file to create" \
 # proof — and one line later the wrapper printed `<path> does not exist` flat. The degrade line is now
 # neutral about existence, and this arm reds it back if the claim returns (it is not a wording preference:
 # the sentence and the evidence above it must agree).
+# ⛔ THE PIPE WAS A FALSE-PASS IDIOM, not a style preference (#841/#864, `sigpipe-grep-guard` — it was red
+# on `main` from the round-44 merge and this file is one of the sites). `producer | grep -q` under `pipefail`
+# lets `grep -q` exit as soon as it matches, the producer dies of SIGPIPE, and the PIPELINE's status becomes
+# the failure — so a real "does not exist" claim could have slipped past the second half. Capturing the
+# output once and testing it in the shell removes the pipe entirely, and it stops running the wrapper twice.
 ck "f5b …and the degrade line asserts no existence proof the reader may have disclaimed" \
-   'run_wrapper_err "$nofile" | grep -q "DEGRADED — NO-REPO-SET" && ! run_wrapper_err "$nofile" | grep -q "DEGRADED — NO-REPO-SET: $nofile does not exist"'
+   'out="$(run_wrapper_err "$nofile")"; grep -q "DEGRADED — NO-REPO-SET" <<<"$out" && ! grep -q "DEGRADED — NO-REPO-SET: $nofile does not exist" <<<"$out"'
 ck "f6 …and it names the line format so the fix is copy-paste" \
    'run_wrapper_err "$nofile" | grep -q "slug=OWNER/NAME checkout=/abs/checkout"'
 
