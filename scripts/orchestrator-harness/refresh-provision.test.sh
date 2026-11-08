@@ -93,7 +93,13 @@
 #   (g10) the CREDENTIAL-LOOKUP timeout arm carries one too — the arm whose own `fix:` line names a
 #        hung credential helper, so the dropped stderr was exactly the diagnosis it recommends.
 #   (g11)/(g12) EVERY interpolating arm places `evidence=` LAST, checked in the SOURCE across all of
-#        them with a pinned floor, plus a per-arm row for the `nothing is stored` arm;
+#        them with a pinned floor, plus a per-arm row for the `credential lookup returned no token` arm;
+#   (g16) a credential lookup that FAILS is NOT an absence — `gh auth token` exits non-zero for a stored
+#        credential its helper cannot decrypt, so the record says UNKNOWN and carries the helper's line
+#        (the old clause asserted "nothing is stored" and quoted that very line in the same sentence);
+#   (g15) the ENV TOKEN must not reroute the stage from outside: an ambient `GH_TOKEN` in the runner's
+#        environment is cleared by `RP_CLEAR`, and the same name handed to the invocation IS used —
+#        measured before the clear existed: `GH_TOKEN=dummy` reddened both `(g10)` record rows;
 #   (g13) the `gh is not on PATH` arm names its OWN cause — driven by extracting the shipped
 #        `gh_probe_env` and running it in a bash whose PATH holds no `gh`, the one environment a seeded
 #        sandbox cannot produce (deleting that arm's clause left the suite green before this row);
@@ -323,8 +329,16 @@ OUT=""; RC=0
 # (`rp "$D" "" SCOUT_LOCK_STALE_SECS=5m`) because GNU `env` applies a KEY=VAL after `-u KEY`, so the
 # arm's own value is the one the pass sees; `OR_OPERATOR_DECLARED` is exported by `(h)` into the
 # suite's own environment precisely so its clear entry is load-bearing.
+# ⛔ `GH_TOKEN`/`GITHUB_TOKEN` ARE ON THIS LIST BECAUSE THEY REROUTE THE WHOLE PROVISION STAGE (#3701
+# review round 24, P2). `gh_probe_env` short-circuits the credential lookup when either is set
+# (`presence=env`), which SKIPS the `gh auth token` probe and every clause row that measures it — so on
+# a box that exports either one, `(g10)` measures the SUCCESS path and reports "a hung credential LOOKUP
+# is TRANSIENT" about a lookup that never ran. MEASURED before the clear was added: 179/16 in a
+# bash-5.2 container, and `GH_TOKEN=dummy` gave 177/18 with both `(g10)` record rows red. `(g15)` pins
+# the pair in both directions: an ambient token handed to the RUNNER must not reach the pass, and the
+# same token handed to the INVOCATION must be used (it is a credential gh itself honours).
 RP_CLEAR=(-u TORTOISE_REPO -u TORTOISE -u SCOUT_UV -u SCOUT_PY -u SCOUT_UV_EXTRAS
-          -u SCOUT_LOCK_STALE_SECS -u OR -u OR_OPERATOR_DECLARED)
+          -u SCOUT_LOCK_STALE_SECS -u OR -u OR_OPERATOR_DECLARED -u GH_TOKEN -u GITHUB_TOKEN)
 rp() {
   local dir="$1" script="${2:-$REFRESH}"
   if [ "$#" -ge 2 ]; then shift 2; else shift 1; fi
@@ -1124,16 +1138,14 @@ then
   ck "(g2) with the call-site interpolation reverted the pass STILL refuses (rc=$RC)" "$([ "$RC" -eq 1 ]; echo $?)"
   ck "(g2) …and its record falls back to the POINTER, so (g) is not vacuous" \
      "$(case "$GM_WHY" in *'refusal line above names which one'*) echo 0 ;; *) echo 1 ;; esac)"
-  # ⛔ AND IT MUST LOSE THE EVIDENCE SLOT ITSELF, not a token inside it (#3701 review round 9, P2). This
-  # row has now been inert twice: first it looked for `gh-contended`, then for the pacing note, and BOTH
-  # are impossible in the reverted record — the revert replaces the whole interpolation with a
-  # compile-time literal, so no capture content can appear either way. A row that cannot red is not a
-  # control. `evidence=` IS the thing the interpolation adds and the literal lacks, so THAT is the
-  # assertion: it reds if the revert stops reverting (anchor drift), which is the failure the control
-  # exists to catch.
-  ck "(g2) …and the reverted record has NO evidence= slot, which the live record does" \
-     "$(case "$GM_WHY" in *'evidence='*) echo 1 ;; *) echo 0 ;; esac)"
-  ck "(g2) …while the UNMUTATED record does have it, so the row above is not vacuous" \
+  # ⛔ AND THE ONE ROW THAT CAN RED IS THE LIVE RECORD'S (#3701 review round 24, P3). A row reading the
+  # REVERTED record for the `evidence=` slot looked like coverage and was DEAD WEIGHT: the mutant
+  # replaces the whole interpolation with a compile-time literal, so no capture content and no
+  # `evidence=` can reach that record by ANY route — if the anchor drifts instead, `mut()` fails and the
+  # `bad` branch above runs, so the `ck` rows are never evaluated at all. It is the LIVE record's slot
+  # that is the thing the interpolation adds and the pointer lacks, and deleting the interpolation
+  # reddens THIS row (measured).
+  ck "(g2) …and the LIVE record carries the evidence= slot the reverted pointer lacks" \
      "$(case "$G_WHY" in *'evidence='*) echo 0 ;; *) echo 1 ;; esac)"
 else
   bad "(g2) the non-vacuity control could not be produced"
@@ -1303,11 +1315,13 @@ ck "(g11) the sweep is not vacuous — it found $GEV_ARMS arm(s) interpolating e
 ck "(g11) every one of them places evidence= LAST (after it: $(printf '%s' "$GEV_BAD") offender(s)${GEV_TAIL})" \
    "$([ "$GEV_BAD" -eq 0 ]; echo $?)"
 
-# ⛔ AND THE `nothing is stored` ARM'S SLOT GETS ITS OWN ROW (#3701 review round 15, P2). `(g9)` and
-# `(g10)` pin the two timeout arms; this arm had no row at all, so deleting its interpolation was
-# invisible — the class those rows exist for, one arm over.
-GSTORE_LINE="$(grep -F 'nothing is stored for the host gh is configured for' "$REFRESH" | head -1)"
-ck "(g12) the 'nothing is stored' arm interpolates evidence= LAST" \
+# ⛔ AND THE `credential lookup returned no token` ARM'S SLOT GETS ITS OWN ROW (#3701 review round 15,
+# P2). `(g9)` and `(g10)` pin the two timeout arms; this arm had no row at all, so deleting its
+# interpolation was invisible — the class those rows exist for, one arm over. The anchor is the arm's
+# own VERDICT text, not its old `nothing is stored` wording: that wording WAS the round-24 P2, and
+# pinning the phrase would have made the over-claim look intended. `(g16)` is what forbids its return.
+GSTORE_LINE="$(grep -F 'the credential lookup returned no token, which does NOT establish absence' "$REFRESH" | head -1)"
+ck "(g12) the credential-lookup-failed arm interpolates evidence= LAST" \
    "$(case "$GSTORE_LINE" in *'evidence=$(gh_probe_evidence "$prc")"') echo 0 ;; *) echo 1 ;; esac)"
 
 # ⛔ (g13) THE `gh IS NOT ON PATH` ARM NAMES ITS OWN CAUSE (#3701 review round 23, P2). This arm had NO
@@ -1449,6 +1463,58 @@ ck "(g10) …and the RECORD carries the stderr naming the hung helper" \
    "$(case "$GBT_WHY" in *'No secret key'*) echo 0 ;; *) echo 1 ;; esac)"
 ck "(g10) …and names the question it could NOT answer (presence, not validity)" \
    "$(case "$GBT_WHY" in *'gh auth token'*) echo 0 ;; *) echo 1 ;; esac)"
+
+# ── (g16) A CREDENTIAL LOOKUP THAT FAILS IS NOT AN ABSENCE (#3701 review round 24, P2) ─────────────
+# ⛔ THE ARM'S OLD CLAUSE WAS `answer=NO — nothing is stored for the host gh is configured for`, AND THE
+# EXIT STATUS DOES NOT ESTABLISH THAT. `gh auth token` fails with a 1 for a credential that IS stored and
+# cannot be READ (gpg/keyring with no tty, a malformed `hosts.yml`, a denying keyring) just as it does
+# for an empty store. This fixture is `(g10)`'s stub failing FAST instead of hanging — the SAME evidence
+# (`gpg: decryption failed: No secret key`), one arm over — so the pre-fix record asserted an absence and
+# quoted, in one sentence, proof that a credential exists. MEASURED: this arm's absence row is ❌ on
+# `b48c727ae` and ✅ after the clause was corrected to UNKNOWN; the other three rows are reach/evidence
+# rows that stay green both ways and exist so the discriminator is read in the arm it names.
+mk_case gh_token_lookup_failed
+cat > "$D/bin/gh" <<'SH'
+#!/bin/bash
+case "$1 $2" in
+  "auth token") printf 'gh: gpg: decryption failed: No secret key\n' >&2; exit 1 ;;
+  *) printf '[]\n'; exit 0 ;;
+esac
+SH
+chmod +x "$D/bin/gh"
+rp "$D"
+GTF_WHY="$(rec why)"
+ck "(g16) a credential lookup that FAILS FAST still refuses as NOT PROVISIONABLE (rc=$RC, expected 3)" \
+   "$([ "$RC" -eq 3 ]; echo $?)"
+ck "(g16) …and the record does NOT assert an absence its exit status cannot establish" \
+   "$(case "$GTF_WHY" in *'nothing is stored'*|*'no credential is stored'*|*'answer=NO — nothing'*) echo 1 ;; *) echo 0 ;; esac)"
+ck "(g16) …and the record carries the helper's own line, which names the real fault" \
+   "$(case "$GTF_WHY" in *'No secret key'*) echo 0 ;; *) echo 1 ;; esac)"
+ck "(g16) …and names the question it could NOT answer (presence, not validity)" \
+   "$(case "$GTF_WHY" in *'gh auth token'*) echo 0 ;; *) echo 1 ;; esac)"
+
+# ── (g15) THE ENV TOKEN IS THE AMBIENT KNOB THAT REROUTES THE WHOLE STAGE (#3701 round 24, P2) ────
+# ⛔ `gh_probe_env` treats GH_TOKEN/GITHUB_TOKEN as PRESENCE and returns before the credential lookup, so
+# an ambient token in the RUNNER's environment silently converts every `(g*)` arm that drives the
+# `gh auth token` path into a measurement of the SUCCESS path — measured before `RP_CLEAR` cleared the
+# pair: `GH_TOKEN=dummy` turned both `(g10)` record rows red while the rc row still said
+# "a hung credential LOOKUP is TRANSIENT" about a lookup that never ran. The pair below is two-way, like
+# `(h)`/`(h2)`: handed to the RUNNER it must NOT reach the pass, and handed to the INVOCATION it must be
+# used — so neither side can pass by the mechanism being dead. The clause names `source=` on the rc=75
+# arm, which is what makes the path observable at all.
+mk_case gh_env_token_ambient
+mk_gh_budget_stub "$D" 75 "$SHIM_CAPTURE"
+GH_TOKEN=ambient-token rp "$D"
+GET_WHY="$(rec why)"
+ck "(g15) an AMBIENT exported GH_TOKEN does not reach the pass (rc=$RC)" "$([ "$RC" -eq 1 ]; echo $?)"
+ck "(g15) …so presence is still read from the CREDENTIAL STORE, not from the runner's ambient env" \
+   "$(case "$GET_WHY" in *'source=env'*) echo 1 ;; *'source=stored'*) echo 0 ;; *) echo 1 ;; esac)"
+mk_case gh_env_token_handed
+mk_gh_budget_stub "$D" 75 "$SHIM_CAPTURE"
+rp "$D" "" GH_TOKEN=handed-token
+GETH_WHY="$(rec why)"
+ck "(g15) …while the same name handed to the INVOCATION IS used, so the row above is not vacuous" \
+   "$(case "$GETH_WHY" in *'source=env'*) echo 0 ;; *) echo 1 ;; esac)"
 
 # ── (h5) THE FOURTH COPY OF THE ACCEPT LIST MUST NOT DRIFT ────────────────────────────────────────
 # ⛔ THE DRIFT THIS PINS WAS LIVE (review of #3188, P2). The predicate has FOUR copies: three here

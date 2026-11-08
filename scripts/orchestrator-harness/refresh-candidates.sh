@@ -1108,8 +1108,15 @@ gh_probe_env() {
   # DEAD PROXY a pure network fault prints exactly the same "The token in ~/.config/gh/hosts.yml is
   # invalid." as a revoked one — so any text match on "invalid"/"expired"/"authenticat" classifies an
   # outage as a credential failure and latches the permanent marker a human must clear (#1853 review).
-  # PRESENCE is `gh auth token`: an OFFLINE lookup of the stored credential (hosts.yml / the keyring),
-  # so its exit status is cause-independent. ⛔ ITS STDOUT IS THE TOKEN — it is discarded below and the
+  # PRESENCE is `gh auth token`: an OFFLINE lookup of the stored credential (hosts.yml / the keyring).
+  # ⛔ rc=0 IS presence — the lookup produced a token, so something IS stored. rc≠0 IS **NOT** ABSENCE,
+  # and saying so was this arm's over-claim (#3701 review round 24, P2): the lookup fails equally when a
+  # credential IS stored and its helper cannot decrypt it (`gh: gpg: decryption failed: No secret key` —
+  # the very failure the sibling timeout arm's `fix:` line names as the usual cause, and the shape the
+  # suite's `(g16)` stub reproduces), when the keyring denies access, or when `hosts.yml` is malformed.
+  # So rc≠0 establishes only that THIS LOOKUP returned no token, and the clause below says UNKNOWN and
+  # carries the helper's own line, which is what tells an operator whether to re-authenticate or to
+  # repair the store. ⛔ ITS STDOUT IS THE TOKEN — it is discarded below and the
   # captured stream is STDERR ONLY. The real idiom is `>/dev/null 2>"$GH_PROBE_ERR"` (stdout to
   # /dev/null, stderr to the capture file).
   # ⛔ AND THE DEPRECATED ORDER IS UNSAFE **HERE** WHILE IT WAS SAFE WHERE THE OLD SENTENCE SAT — the two
@@ -1149,6 +1156,14 @@ gh_probe_env() {
       return "$EXIT_TRANSIENT"
     fi
     if [ "$prc" -ne 0 ]; then
+      # ⛔ THE CLAUSE CLAIMS ONLY WHAT THE EXIT STATUS ESTABLISHES (#3701 review round 24, P2). It read
+      # `answer=NO — nothing is stored for the host gh is configured for`, which the arm cannot know:
+      # the SAME stub that proves the sibling timeout arm is genuine — `(g10)`'s `auth token` failing
+      # with `gpg: decryption failed: No secret key` — reaches THIS arm as soon as it fails FAST instead
+      # of hanging, and the record would then assert an absence AND quote, in the same sentence, evidence
+      # that a credential exists and could not be read. `(g16)` is that fixture; it reds if this wording
+      # goes back to asserting absence. The `*)` arm below already gets this right ("read its evidence
+      # before calling this auth or an outage"); this one classified.
       # ⛔ EVIDENCE CLOSES THIS ARM TOO (#3701 review round 12, P2). It used to sit MID-clause with
       # `question=` last, which broke the very invariant the sibling arm's comment above claims for
       # "every other arm". MEASURED by driving the REAL `refresh_cause_brief` (`orch-loop.sh:2559`,
@@ -1159,10 +1174,10 @@ gh_probe_env() {
       # the cut lands inside the evidence and never reaches `question=` at all. With the evidence moved
       # last it is whole at every length the take can produce (measured 150, 243, 320 and 330; the take
       # tops out at `rc=N: ` + 320 + `...`, so there is no length that reaches it).
-      GH_PROBE_CAUSE="answer=NO — nothing is stored for the host gh is configured for; question=is a gh credential STORED here (gh auth token); evidence=$(gh_probe_evidence "$prc")"
-      echo "[refresh] NOT PROVISIONABLE: gh has no credential STORED for the host it is configured for, in the environment the pre-flight runs in (HOME=$HOME) — its issue/PR surfaces cannot be read, so the pre-flight would answer from partial evidence and read every candidate as a collision (#1736)"
+      GH_PROBE_CAUSE="answer=UNKNOWN — the credential lookup returned no token, which does NOT establish absence (a stored credential its helper cannot decrypt fails here too); question=is a gh credential STORED here (gh auth token); evidence=$(gh_probe_evidence "$prc")"
+      echo "[refresh] NOT PROVISIONABLE: the gh credential lookup in the environment the pre-flight runs in (HOME=$HOME) returned no token (rc=$prc) — that does NOT establish that no credential exists: a stored credential its helper cannot decrypt (gpg/keyring with no tty) fails here too, and the line below names which. Either way its issue/PR surfaces cannot be read, so the pre-flight would answer from partial evidence and read every candidate as a collision (#1736)"
       printf '%s\n' "$terr" | sed -n '1,4p' | sed 's/^/[refresh]   /'
-      echo "[refresh]   fix: authenticate gh in THIS home (gh auth login --with-token <token>), or point HOME at the home that already holds the credentials; set GH_HOST to name a host other than the one gh is configured for, then re-run"
+      echo "[refresh]   fix: read the line above first — a decryption/helper failure means the token is STORED and unreadable, so repair THIS home's credential store (an unlocked gpg/keyring) instead of re-authenticating; if the store is genuinely empty, authenticate gh in THIS home (gh auth login --with-token <token>) or point HOME at the home that already holds the credentials; set GH_HOST to name a host other than the one gh is configured for, then re-run"
       gh_probe_err_cleanup
       return "$EXIT_NOT_PROVISIONABLE"
     fi
