@@ -1454,6 +1454,11 @@ assert_eq "$RC" "24" "T24 control: grading a different farm than the one this pa
 assert_contains "$OUT" "but grades" "T24 control: and it names both paths"
 assert_contains "$(grep '^remedy=' <<<"$(cat "$T/t24p/state/harness-apply.status" 2>/dev/null)" 2>/dev/null)" "pin HARNESS_APPLY_FARM_DEST" \
     "T24 control: and its remedy= names the seam, so the refusal is actionable"
+# ⛔ THE ROWS-ARTIFACT FIXTURES RE-OPEN THEIR OWN LABEL HERE (review round 24, measured): the farm-gate
+# heading above stops at `t24p`, and `t24q`-`t24w` are the artifact's lifecycle — all 20 rows written, the
+# raw arm, `unwritable`, `bounded()`. The doc's `T24r` row makes exactly those claims, so a reader
+# indexing the table by label must land on them here rather than 400 lines up under the farm gate.
+say_case "T24r the rows artifact's own lifecycle — every reported row is written, never emptied, and dated"
 # Control 14: the instrument's REMEDY survives a long row list — it is the LAST line it prints, so a
 # single `head -12` over rows+remedy cut it off at exactly the states that need it.
 mk_origin t24q; mk_clone t24q
