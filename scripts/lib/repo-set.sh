@@ -191,11 +191,17 @@ _rs_nearest_existing_ancestor() {
   # resolves but cannot execute, so `_rs_stat_kind` answers `unknown` and no errno ever arrives to name the
   # denial. `[ -L ]` is true for an existing link REGARDLESS of its target, so the link becomes the nearest
   # existing component and the caller REFUSES it as a broken state (5) instead of proving absence through
-  # what it could not resolve. ⛔ THAT REFUSAL IS THE `unknown` PATH ONLY (round 46 review, P2 — measured):
-  # when the stat call DOES answer, its errno arm names the cause first — a denied target is `denied` → 5,
-  # and a DANGLING link is `absent`, whose 3 is correct because nothing can exist below a link whose target
-  # does not. This function's job is to stop the walk from answering `-e`-false with a traversable
-  # grandparent; what the caller does with the link is the fallback's business, stated there.
+  # what it could not resolve. This function's job is to stop the walk from answering `-e`-false with a
+  # traversable grandparent; what the caller does with the link is the caller's business, stated there.
+  # ⛔ AND THE CALLER NOW REFUSES IT ON BOTH ROUTES (round 48 review, P2 — this note used to say the refusal
+  # was the `unknown` path only, "because a DANGLING link is `absent`, whose 3 is correct"). THE STAT ANSWER
+  # DOES NOT DECIDE THE VERDICT ANY MORE: the ancestor-link arm in `repo_set_parse` claims every shape whose
+  # chain holds a link that cannot be resolved, BEFORE the absence test, and answers 5 with an executable
+  # interpreter (`absent`), with none (`unknown`) and through a loop (`other`) alike. Measured: every
+  # unresolvable-link spelling answers 5 on both readers, and the rc-3 set is IDENTICAL between them and
+  # contains no UNRESOLVABLE link (43 of those rc-3 spellings do traverse a link that RESOLVES, and 3 is
+  # right for them — the remainder of the path is genuinely absent, so the sentence must not overclaim).
+  # The old sentence was falsified by that arm and would teach the next lane to restore the 3.
   # A link that DOES resolve is still found by `-e` first, so the ordinary walk is untouched.
   while [ -n "$d" ] && [ "$d" != "/" ] && [ "$d" != "." ]; do
     if [ -e "$d" ] || [ -L "$d" ]; then printf '%s' "$d"; return 0; fi
@@ -695,12 +701,12 @@ repo_set_parse() {
     # `(nearest existing: /tmp/f1/den)`, which refutes it, in `j16f`'s OWN fixture). The walk's answer is one of:
     #   * a SYMLINK that cannot be resolved here (`-L` true, `-e` false). It is returned as the nearest
     #     existing component (round 46: `[ -e ]` used to SKIP it and hand back a traversable grandparent, so
-    #     absence was "proven" through the link — the degrade code for a set that exists). ⛔ THIS ARM IS
-    #     REACHED ONLY WHEN NO STAT ANSWER CAME BACK (round 46 review, P2 — measured): with an executable
-    #     interpreter a denied target answers `denied` (the errno arm, also 5) and a DANGLING link answers
-    #     `absent`, which the absent test above turns into 3 — correct, because nothing can exist below a
-    #     link whose target does not. Here we could neither resolve the link NOR stat through it, so
-    #     neither existence nor absence is shown, and that is 5, never 3.
+    #     absence was "proven" through the link — the degrade code for a set that exists). ⛔ THIS ARM HAS
+    #     MOVED: it is now tested BEFORE the absence claim, so it fires on the `unknown` route AND on the
+    #     `absent`-with-errno route, and the `absent` test below can no longer turn a link into 3. The
+    #     earlier note here said the opposite ("reached only when no stat answer came back", because "a
+    #     DANGLING link answers `absent`, which the absent test above turns into 3 — correct") — that was
+    #     measured false in round 48 and is the reason a set spelled BELOW a dangling link degraded.
     #   * a nearest existing component that is not a DIRECTORY — a file, a FIFO, or a link resolving to one.
     #   * a TRAILING-SLASH path whose stripped spelling is an existing NON-directory (`<an existing set>/`).
     #     ⛔ THE WALK CANNOT SEE THAT COMPONENT: it strips the trailing slash and then starts at the PARENT,

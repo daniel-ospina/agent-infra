@@ -917,15 +917,39 @@ defn = re.compile(r'^\s*(?:function\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*(?:\(\s*\))?\
 head = re.compile(r'^\s*(?:function\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*(?:\(\s*\))?\s*$')
 
 raw_lines = [l.rstrip('\n') for l in open(sys.argv[1], encoding='utf-8')]
+
 # ⛔ A BACKSLASH CONTINUATION HID A REAL DEFINITION (round 48 review, P3 — measured): `name() \` and
 # `{ … }` on the next line is a genuine definition (`declare -F` lists it), but `head` requires
-# end-of-line after the name, so that spelling was never reported. Join continuations before scanning.
+# end-of-line after the name, so that spelling was never reported.
+# ⛔ AND THE JOIN MUST FOLLOW BASH IN THE TWO PLACES IT MATTERS (measured, same review): a COMMENT ENDS at
+# the newline however many backslashes it carries, and a HEREDOC BODY is never scanned. The naive join LOST a
+# real definition that followed a `\`-terminated comment line (a false PASS for the namespace arm) and
+# FABRICATED one from `key \` + `{ value` inside a heredoc (a false RED) — both reproduced, both gone, and
+# each is pinned by a fixture line.
+# ⛔ WHAT THIS SCANNER IS AND IS NOT. It answers ONE question — which names does a VALID bash file define —
+# and it is not a bash parser. Two refinements were tried and removed rather than kept as pinned-looking
+# machinery, both because the only input that could exercise them is one bash REJECTS or one no arm can
+# distinguish: (i) an ODD-RUN backslash test (`probe() \\` is `syntax error near unexpected token`, rc 2, so
+# no valid script contains it); (ii) a "terminator followed by `;`" convenience (`INNER;` does NOT close a
+# heredoc in bash — measured, it warns "delimited by end-of-file" and the body runs on — so the convenience
+# was not convenience, it was a live disagreement). A heredoc terminator therefore closes only when it stands
+# ALONE, which is bash's own rule.
+# REMAINING LIMIT, declared and not chased: a `<<` inside a quoted string is not modelled, so a file that
+# quotes one would hide the rest. No arm needs it and the reader contains none.
 lines = []
+_heredoc = None
 for _l in raw_lines:
-    if lines and lines[-1].endswith('\\'):
-        lines[-1] = lines[-1][:-1] + _l.lstrip()
+    if _heredoc is not None:
+        if _l.strip() == _heredoc:
+            _heredoc = None
+        continue
+    if lines and lines[-1].endswith('\\') and not lines[-1].lstrip().startswith('#'):
+        lines[-1] = lines[-1][:-1] + _l
     else:
         lines.append(_l)
+    _mh = re.search(r'<<-?\s*[\'\"]?([A-Za-z_][A-Za-z0-9_]*)', _l)
+    if _mh and not _l.lstrip().startswith('#'):
+        _heredoc = _mh.group(1)
 defs = []
 for i, raw in enumerate(lines):
     if raw.lstrip().startswith('#'):
@@ -1001,10 +1025,43 @@ continued_name() \
 {
   :
 }
+# ⛔ AND A COMMENT THAT *MENTIONS* AN OPENER MUST NOT OPEN ONE (measured: this guard changes the scan of 18
+# repo scripts and NO arm pinned it, so deleting it left the suite green). Without it, `NOTES` below starts
+# swallowing lines, and `after_notes_comment()` disappears from the scan.
+# see cat <<'NOTES' in the wiki for why this is spelled out
+after_notes_comment() { :; }
+# ⛔ BOTH DIRECTIONS OF THE JOIN ARE PINNED HERE (round 48 review, P2 — measured). A comment ENDS at the
+# newline however many backslashes it carries, so this definition must still be SEEN (the naive join
+# swallowed it, a false PASS for the namespace arm) — this note deliberately ENDS in a backslash \
+after_comment_continuation() { :; }
+# … and a backslash inside a HEREDOC BODY must never be JOINED, because the naive join fabricated a
+# definition named `key` out of the two lines below (a false RED).
+cat <<'INNER'
+key \
+{ value
+INNER
+# ⛔ AND THREE MORE CONDITIONS, EACH PINNED BY THE LINE THAT EXERCISES IT (measured — all three changed what the
+# namespace arm sees while every mutant stayed green):
+#   (a) an INLINE COMMENT after the head, which the trailing-comment strip removes — without the strip the
+#       definition is invisible;
+#   (b) a KEYWORD on the same line as `{`, which the KEYWORDS exclusion must reject — without it `until` is
+#       reported as a definition;
+#   (c) a COMMENT LINE between the head and its `{`, which the later-lines loop must skip — without the skip
+#       the definition is invisible.
+head_after_inline_comment() # note
+{
+  :
+}
+until { :; }
+head_with_comment_between()
+# explanation
+{
+  :
+}
 FIXTURE
 _scan_fixture="$(python3 "$T/defs.py" "$T/defs-fixture.sh")"
 ck "f11f-0 …and every one of those spellings is really SEEN (brace on either line, any indent), while bare keywords followed by '{' are not counted" \
-   '[ "$_scan_fixture" = "name_same_line name_func_kw indented_same_line name_next_line name_func_next continued_name" ]'
+   '[ "$_scan_fixture" = "name_same_line name_func_kw indented_same_line name_next_line name_func_next continued_name after_notes_comment after_comment_continuation head_after_inline_comment head_with_comment_between" ]'
 # ⛔ THE DEGRADED PATH MUST NOT CLAIM TO GRADE WHEN IT CANNOT NAME A REPO (review round 2, P1). The
 # doctor's REPO-only arm raises when the checkout's `origin` proves nothing — the TCC shape on the
 # default macOS install — so `f4`'s stub (which echoes argv) would pass on a wrapper that dies in
@@ -1584,10 +1641,12 @@ ck "j16s2 …while with a stat answer the ABSENT verdict IS stated as proof (bot
 # ⛔ AND THE ARM IS THE `unknown` PATH ONLY — ITS LABEL USED TO CLAIM THE GENERAL RULE (round 46 review, P2 —
 # measured): with the SHIPPED reader a symlink LOOP answers `other` → 5 through the errno arm (same verdict,
 # different arm), and a DANGLING link answers `absent` → 3 — which the ROUND-48 REVIEW FALSIFIED as a general
-# rule: 3 is right only for the LEAF spelling, and even then only on the `unknown` route (`j16l` owns that).
-# One component up it was a measurably WRONG claim — `$T/dirlink/repos.conf` answered 3 with an interpreter
-# and 5 without one, so the better-equipped reader gave the more dangerous answer — `j16t`/`j16t2` pin the
-# agreement. So "never (3)" is true of THIS reader and this arm, not of symlinks in
+# rule: NO spelling of a path whose chain holds an unresolvable link is absent — measured across hundreds of
+# generated spellings on both readers (two independent generators, 400 and 406), where the rc-3 set is
+# identical between them and contains no UNRESOLVABLE link. What
+# WAS wrong was the ANCESTOR spelling: `$T/dirlink/repos.conf` answered 3 with an interpreter and 5 without
+# one, so the better-equipped reader gave the more dangerous answer, and `j16t`/`j16t2` now pin the agreement
+# (this arm, `j16l`, is a COMPONENT fixture that asserts 5 — it never owned a claim about 3). So "never (3)" is true of THIS reader and this arm, not of symlinks in
 # general: `$NI` has no usable interpreter, `_rs_stat_kind` cannot answer, and the walk decides. Measured
 # before the fix, on this reader: rc 3 with `does not exist`. No privileges needed, so no `chmod 000` guard.
 ln -s "$T/linkloop2" "$T/linkloop"; ln -s "$T/linkloop" "$T/linkloop2"
