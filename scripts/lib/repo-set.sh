@@ -191,8 +191,12 @@ _rs_nearest_existing_ancestor() {
   # resolves but cannot execute, so `_rs_stat_kind` answers `unknown` and no errno ever arrives to name the
   # denial. `[ -L ]` is true for an existing link REGARDLESS of its target, so the link becomes the nearest
   # existing component and the caller REFUSES it as a broken state (5) instead of proving absence through
-  # what it could not resolve. A link that DOES resolve is still found by `-e` first, so the ordinary walk
-  # is untouched.
+  # what it could not resolve. ⛔ THAT REFUSAL IS THE `unknown` PATH ONLY (round 46 review, P2 — measured):
+  # when the stat call DOES answer, its errno arm names the cause first — a denied target is `denied` → 5,
+  # and a DANGLING link is `absent`, whose 3 is correct because nothing can exist below a link whose target
+  # does not. This function's job is to stop the walk from answering `-e`-false with a traversable
+  # grandparent; what the caller does with the link is the fallback's business, stated there.
+  # A link that DOES resolve is still found by `-e` first, so the ordinary walk is untouched.
   while [ -n "$d" ] && [ "$d" != "/" ] && [ "$d" != "." ]; do
     if [ -e "$d" ] || [ -L "$d" ]; then printf '%s' "$d"; return 0; fi
     case "$d" in */*) d="${d%/*}" ;; *) break ;; esac
@@ -596,8 +600,12 @@ repo_set_parse() {
     # `(nearest existing: /tmp/f1/den)`, which refutes it, in `j16f`'s OWN fixture). The walk's answer is one of:
     #   * a SYMLINK that cannot be resolved here (`-L` true, `-e` false). It is returned as the nearest
     #     existing component (round 46: `[ -e ]` used to SKIP it and hand back a traversable grandparent, so
-    #     absence was "proven" through the link — the degrade code for a set that exists). Nothing below an
-    #     unresolvable link can be shown to exist OR to be absent, so it is broken (5), never absent (3).
+    #     absence was "proven" through the link — the degrade code for a set that exists). ⛔ THIS ARM IS
+    #     REACHED ONLY WHEN NO STAT ANSWER CAME BACK (round 46 review, P2 — measured): with an executable
+    #     interpreter a denied target answers `denied` (the errno arm, also 5) and a DANGLING link answers
+    #     `absent`, which the absent test above turns into 3 — correct, because nothing can exist below a
+    #     link whose target does not. Here we could neither resolve the link NOR stat through it, so
+    #     neither existence nor absence is shown, and that is 5, never 3.
     #   * a nearest existing component that is not a DIRECTORY — a file, a FIFO, or a link resolving to one.
     #   * a nearest existing DIRECTORY that is not traversable (mode 000, the TCC shape). It IS a directory,
     #     so the not-a-directory causes are false about it and it needs its own sentence.

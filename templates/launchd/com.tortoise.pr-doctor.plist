@@ -119,9 +119,10 @@
          omission it replaced, because THREE readers open the canonical STATUS file by
          name (the STATUS file, NOT the log: nothing live READS `pr-doctor.log` — the
          two things that WRITE it are `pr-doctor.py`'s own `log()` and the heartbeat's
-         launcher appending a child's stdout, and every other reference only prints
-         or mentions the path — which is why saying "those canonical files" would
-         promise a log consumer that does not exist):
+         launcher appending a child's stdout. Nothing on a CODE path reads its
+         contents — tests assert on it, and an operator reads the last line with
+         `tail -1`; everything else merely prints or mentions the path — which is why
+         saying "those canonical files" would promise a log consumer that does not exist):
          `scripts/heartbeat-loop.sh`, `scripts/objective.py`'s `pr_doctor_last_run`
          (which renders the same record into the beat) and
          `scripts/lib/fleet-inventory.sh`'s

@@ -386,7 +386,7 @@ git -C "$T/no-origin" init -q 2>/dev/null
 mk_repo "$T/hidden" o/n
 chmod 000 "$T/hidden"
 if [ "$(id -u)" = 0 ]; then
-  printf 'skip d-unreadable-checkout (running as root: the chdir is permitted)\n'
+  printf 'skip d-unreadable-checkout, d-ancestor-denied (running as root: the chdir is permitted)\n'
 else
   printf 'slug=o/n checkout=%s\n' "$T/hidden" > "$T/unreadable-checkout.conf"
   o="$(run_reader "$T/unreadable-checkout.conf" check)"
@@ -1254,7 +1254,9 @@ ck "j11 …and the wrapper never announces a count for it" \
 ck "j12 the dangling-link message names OBSERVATION + candidates, not a proven cause" \
    'o="$(run_reader "$T/dangling.conf" list)"; grep -q "does not RESOLVE" <<<"$o" && grep -q "denies this process" <<<"$o" && ! grep -q "whose target does not exist" <<<"$o"'
 # and a link whose target EXISTS but is denied behind an ancestor must say so, not "target missing"
-if [ "$(id -u)" != 0 ]; then
+if [ "$(id -u)" = 0 ]; then
+  printf 'skip j13 (running as root: mode 000 does not deny)\n'
+else
   mkdir -p "$T/denied"
   printf 'slug=o/n checkout=%s\n' "$T/tortoise" > "$T/denied/target.conf"
   chmod 000 "$T/denied"
@@ -1375,7 +1377,7 @@ assert s.count(old) == 1, s.count(old)
 open(p, "w", encoding='utf-8').write(s.replace(old, "for c in no-such-interp-xyz /no/such/python3; do", 1))
 PYNID
 if [ "$(id -u)" = 0 ]; then
-  printf 'skip j16f/j16f2 (running as root: mode 000 does not deny)\n'
+  printf 'skip j16f/j16f2 (running as root: mode 000 does not deny)\n'  # and j16m, guarded separately below
 else
   ND="$T/no-dirname"; mkdir -p "$ND"
   for b in sed awk tr grep printf id cat cut wc head mv rm mkdir ln chmod git date env basename uname; do
@@ -1408,17 +1410,27 @@ else
   chmod 755 "$T/den2/den"
   ck "j16f2 …two hops up, so the loop's SHORTENING runs without \`dirname\` too (rc 5, never the degrade code)" \
      '[ "$_rc_dn2" = 5 ] && grep -q "INVALID — " <<<"$_o_dn2" && grep -q "is not visible from here" <<<"$_o_dn2" && ! grep -q "does not exist" <<<"$_o_dn2"'
-  # ⛔ THE FILE-ANCESTOR GUIDANCE NEEDS A SENSOR FOR ITS GUIDANCE, NOT JUST FOR ITS FIRST LINE (round 44 P2,
-  # sharpened by round 45's P2 — measured). Deleting the errno arm that used to serve this cause left the
-  # suite FULLY GREEN; so did keeping the two SHARED opening lines while substituting a different tail.
-  # "is not a directory" is printed by every shape of this message, so grepping it discriminates NOTHING.
-  # What only the measured guidance says is "must be a DIRECTORY" and "fix the path above"; the generic tail
-  # offers "check the location and mode" instead, which is FALSE here — the walk has just measured a FILE,
-  # so this is not a permission case. Both conjuncts are pinned, on both runs of this cause.
-  printf 'slug=o/n checkout=%s state=%s/st\n' "$T/tortoise" "$T" > "$T/notadir-anc2.conf"
+fi
+# ⛔ THE FILE-ANCESTOR GUIDANCE NEEDS A SENSOR FOR ITS GUIDANCE, NOT JUST FOR ITS FIRST LINE (round 44 P2,
+# sharpened by round 45's P2 — measured). Deleting the errno arm that used to serve this cause left the
+# suite FULLY GREEN; so did keeping the two SHARED opening lines while substituting a different tail.
+# "is not a directory" is printed by every shape of this message, so grepping it discriminates NOTHING.
+# What only the measured guidance says is "must be a DIRECTORY" and "fix the path above"; the generic tail
+# offers "check the location and mode" instead, which is FALSE here — the walk has just measured a FILE,
+# so this is not a permission case. Both conjuncts are pinned, on both runs of this cause.
+printf 'slug=o/n checkout=%s state=%s/st\n' "$T/tortoise" "$T" > "$T/notadir-anc2.conf"
   _o_na2="$(_rs_bound 30 env REPO_SET_FILE="$T/notadir-anc2.conf/inside/repos.conf" /bin/bash "$NI/lib/repo-set.sh" check 2>&1)"; _rc_na2=$?
   ck "j16k2 …and with NO interpreter the walk's fallback names the FILE too (rc 5, not 'neither is any directory above it')" \
      '[ "$_rc_na2" = 5 ] && grep -q "is not a directory" <<<"$_o_na2" && grep -q "must be a DIRECTORY" <<<"$_o_na2" && grep -q "fix the path above" <<<"$_o_na2" && ! grep -q "neither is any directory above it" <<<"$_o_na2" && ! grep -q "check the" <<<"$_o_na2"'
+# ⛔ `j16k2` LIVES ABOVE, OUTSIDE THE GUARD (round 46 review, P2 — measured): its fixture is a plain FILE
+# plus the already-outside `$NI` reader, so it needs no mode bits, and the guard was skipping it on a root
+# box for a reason that did not apply to it — one arm of the not-a-directory cause silently lost on root CI,
+# with a skip message that named two arms while four vanished.
+# ⛔ `j16m`'s fixture DOES need the denial (mode 000 makes `-x` false, and a root box cannot produce that), so
+# it carries its own guard rather than dragging `j16k2` with it.
+if [ "$(id -u)" = 0 ]; then
+  printf 'skip j16m (running as root: mode 000 does not deny)\n'
+else
   # ⛔ THE UNTRAVERSABLE-DIRECTORY SHAPE HAD NO SENSOR, AND ITS MESSAGE REFUTED ITSELF (round 46, P2 —
   # measured). Before this round ONE `else` served both "the ancestor is not a directory" and "the ancestor
   # IS a directory that cannot be traversed", and printed "neither is any directory above it" followed one
@@ -1450,11 +1462,16 @@ ck "j16k a FILE as the nearest existing ancestor names THAT — not 'neither is 
 # was `[ -e ]`, which FOLLOWS the link; a component whose target cannot be resolved answers FALSE, so the
 # walk SKIPPED it and returned a traversable grandparent ABOVE the link. The caller reads a traversable
 # ancestor as proof of absence and answers code 3 — the one code the wrapper DEGRADES on — for a set that
-# exists. No privileges needed: a symlink LOOP reproduces it on any host, which is why this arm is not tied
-# to the `chmod 000` guard. Measured before the fix: rc 3 with `does not exist`.
+# exists.
+# ⛔ AND THE ARM IS THE `unknown` PATH ONLY — ITS LABEL USED TO CLAIM THE GENERAL RULE (round 46 review, P2 —
+# measured): with the SHIPPED reader a symlink LOOP answers `other` → 5 through the errno arm (same verdict,
+# different arm), and a DANGLING link answers `absent` → 3, which is CORRECT because nothing can exist below
+# a link whose target does not. So "never (3)" is true of THIS reader and this arm, not of symlinks in
+# general: `$NI` has no usable interpreter, `_rs_stat_kind` cannot answer, and the walk decides. Measured
+# before the fix, on this reader: rc 3 with `does not exist`. No privileges needed, so no `chmod 000` guard.
 ln -s "$T/linkloop2" "$T/linkloop"; ln -s "$T/linkloop" "$T/linkloop2"
 _o_ll="$(_rs_bound 30 env REPO_SET_FILE="$T/linkloop/inside.conf" /bin/bash "$NI/lib/repo-set.sh" check 2>&1)"; _rc_ll=$?
-ck "j16l a SYMLINK component that cannot be resolved is BROKEN (5) — never a proof of absence (3)" \
+ck "j16l with NO stat answer, an unresolvable SYMLINK component is BROKEN (5) — never a proof of absence (3)" \
    '[ "$_rc_ll" = 5 ] && grep -q "symbolic link that cannot be resolved" <<<"$_o_ll" && ! grep -q "does not exist" <<<"$_o_ll"'
 # ⛔ AND THE LINK ARM MUST NOT SWALLOW A LINK THAT DOES RESOLVE, TO A NON-DIRECTORY (measured, same round):
 # `-L` is true for that shape too, so an arm testing `-L` alone would replace the correct not-a-directory
@@ -1535,7 +1552,9 @@ ck "j-doctor-seam-empty-is-not-set (an empty seam takes the sibling path, byte-i
 # ⛔ A CONFIG FILE BEHIND A DENIED ANCESTOR IS NOT "ABSENT" (review round 9, P2): `-e` is false for
 # every stat failure, so the plain-file arm read "does not exist" and the box DEGRADED — one repo
 # graded, and the operator told to create a file that is already there.
-if [ "$(id -u)" != 0 ]; then
+if [ "$(id -u)" = 0 ]; then
+  printf 'skip j18/j19 (running as root: mode 000 does not deny)\n'
+else
   mkdir -p "$T/deep/locked"
   printf 'slug=o/n checkout=%s\n' "$T/tortoise" > "$T/deep/locked/repos.conf"
   chmod 000 "$T/deep/locked"
@@ -1746,7 +1765,7 @@ ck "m12 …and so is m9's, so the PHYSICAL walk (not just any \`..\` folding) is
 # The fix does not REFUSE ("only a PROVEN fault refuses", "existence stays UNREQUIRED"): it makes the
 # identity unprovable, which must be LOUD — WARN STATE-UNVERIFIED, never silent assent.
 if [ "$(id -u)" = 0 ]; then
-  printf 'skip m13-m14 (running as root: mode 000 is still traversable)\n'
+  printf 'skip m13-m15 (running as root: mode 000 is still traversable)\n'
 else
   mkdir -p "$T/eaccs/a" "$T/eaccs/tgt" "$T/eaccs/b"
   ln -s "$T/eaccs/tgt" "$T/eaccs/a/link"

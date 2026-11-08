@@ -601,6 +601,19 @@ assert_not_contains "$_PRD_TPL" "the log and the verdict MOVE to" "pr-doctor tem
 assert_not_contains "$_PRD_TPL" "canonical files BY NAME" "pr-doctor template: does NOT claim three readers open the canonical PAIR (round 45's overstatement)"
 assert_contains "$_PRD_TPL" "nothing live READS \`pr-doctor.log\`" "pr-doctor template: says out loud that the log has no live reader"
 assert_contains "$_PRD_TPL" "two things that WRITE it are" "pr-doctor template: pins the corrected writer count (two, not one appender)"
+# ⛔ AND THE THREE READERS IT NAMES MUST ACTUALLY EXIST (round 46 review, P2 — measured). The arms above
+# pin the paragraph's WORDING only, so renaming or deleting `_fleet_pr_doctor_bound` kept them GREEN while
+# the operator-facing text named a function nobody can call — the drift this paragraph's own comment says
+# has already happened twice. These read the files the paragraph points at.
+_rd_missing=""
+grep -q '^_fleet_pr_doctor_bound()' "$SCRIPT_DIR/../scripts/lib/fleet-inventory.sh" || _rd_missing="$_rd_missing fleet-inventory.sh:_fleet_pr_doctor_bound"
+grep -q '^def pr_doctor_last_run(' "$SCRIPT_DIR/../scripts/objective.py" || _rd_missing="$_rd_missing objective.py:pr_doctor_last_run"
+grep -q 'pr-doctor\.status\.json' "$SCRIPT_DIR/../scripts/heartbeat-loop.sh" || _rd_missing="$_rd_missing heartbeat-loop.sh:pr-doctor.status.json"
+if [ -z "$_rd_missing" ]; then
+    ok "pr-doctor template: all three readers it names EXIST (status file, beat, inventory)"
+else
+    bad "pr-doctor template names reader(s) that do not exist — a renamed or deleted reader leaves the operator text pointing at a dead function:$_rd_missing"
+fi
 # A visible checkout whose resolution produced NOTHING is a regression, not a host without one. Ask
 # the same three candidates install-launchd.sh:76-82 asks (the fixture's HOME is the fake one the run
 # used, so §13/§14's seeded checkouts cannot make this look resolved).
