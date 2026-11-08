@@ -33,6 +33,13 @@ _T = os.path.join(tempfile.mkdtemp(prefix="lane-relaunch-t-"), "s-1.jsonl")
 with open(_T, "w") as _fh:
     _fh.write("{}\n")
 
+# ⛔ THE LAUNCH CWD MUST NOT DEPEND ON TEST ORDER (review round 5, P2). Several rows pass
+# `cwd="/tmp/lane"` and only passed because `_run` happens to create it as a side effect — so
+# `pytest -k <one of them>` failed on a clean box. The directory is part of the FIXTURE, created at
+# import time, so every row is self-sufficient in isolation as well as in the full run.
+LANE_CWD = "/tmp/lane"
+os.makedirs(LANE_CWD, exist_ok=True)
+
 
 @pytest.fixture(scope="module")
 def R():
@@ -230,6 +237,12 @@ def test_refuses_when_roster_rows_are_unparseable(R):
         "id=x pid=42 pid_exists=true workspace=WS-1\n",   # value changed: `true`, not `yes`
         "session=WS-1 state=live pid=42\n",              # keys renamed entirely
         "workspace WS-1 running\n",                        # not key=value at all
+        # ⛔ AN EMPTY `workspace=` VALUE MUST NOT RAISE (review round 5, P2). `.split()[0]` on an
+        # empty value raised IndexError, which escaped `relaunch()` and was reported as ERROR
+        # (exit 1) — a crash where this function's contract says UNKNOWN. The fleet's own parser of
+        # the same roster guards this shape (`orchestrator-heartbeat.sh:639-645`).
+        "id=x pid=1 pid_exists=no workspace=\n",
+        "id=x pid=1 pid_exists=no workspace=,\n",
     ):
         cmux = FakeCmux(record_out=roster)
         obs = _run(R, FakeLS(), cmux)
@@ -579,6 +592,38 @@ def test_transcripts_treats_an_UNREACHABLE_root_as_None_not_as_absent(R, monkeyp
     monkeypatch.setattr(os, "stat", enoent)
     assert R._transcripts(ls) == set(), "an ABSENT root is still an absence, not UNKNOWN"
     monkeypatch.setattr(os, "stat", real_stat)
+
+
+def test_new_reads_the_NEWEST_transcripts_not_the_first_five(R):
+    """⛔ THE CANDIDATE WINDOW IS A SAFETY PROPERTY, SO IT MUST BE PINNED (review round 5, P2).
+
+    `sorted(new_files)[:5]` kept the five that sort FIRST lexicographically, and a transcript
+    filename is a session uuid — so on a box where five other lanes appear inside `--wait`, the file
+    THIS relaunch created is the one dropped, and proof (i) silently degrades to proof (ii). The
+    ordering is not cosmetic: it is what "appeared after the send" means. Reverting to the old form
+    must go RED, which is exactly what this row does.
+    """
+    ls = FakeLS(transcript=None, session=None)
+
+    def take_over():
+        # FIVE other lanes start inside the window too, and they all sort BEFORE ours.
+        for i in range(5):
+            ls.new_session("aa%02d.jsonl" % i, cwd="/tmp/other-lane-%d" % i)
+        ours = ls.new_session("zz-ours.jsonl", cwd="/tmp/lane")
+        # Our transcript is the NEWEST by mtime, which is the property the tool must use. utime is
+        # explicit so the row cannot pass or fail on same-second timestamp luck.
+        now = 1_700_000_000
+        for i in range(5):
+            os.utime(os.path.join(ls._session_dir, "aa%02d.jsonl" % i), (now + i, now + i))
+        os.utime(ours, (now + 100, now + 100))
+        return ours
+
+    obs = R.relaunch("ws-1", ls=ls, runner=FakeCmux(on_send=take_over), pi=sys.executable,
+                     cwd="/tmp/lane", new=True, sleep=lambda _s: None, clock=_clock())
+    assert obs["confirmed"] is True, (
+        "the newest transcript was outside the candidate window, so a real fresh session went "
+        "unconfirmed: %r" % (obs,))
+    assert "fresh session appeared" in obs["reason"], obs
 
 
 def test_dry_run_has_its_own_exit_code_never_CONFIRMED(R, monkeypatch, capsys):

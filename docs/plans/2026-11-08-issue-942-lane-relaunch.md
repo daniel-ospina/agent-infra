@@ -68,8 +68,8 @@ on" is how the last two liveness defects were born.
 ## Tasks (all DONE; evidence inline)
 
 1. **DONE** `scripts/lane-relaunch.py` — the tool. Evidence:
-   `python3 -m pytest scripts/test_lane_relaunch.py -q` → **41 passed**.
-2. **DONE** `scripts/test_lane_relaunch.py` — 41 rows over the guard order, the send payload's
+   `python3 -m pytest scripts/test_lane_relaunch.py -q` → **45 passed**.
+2. **DONE** `scripts/test_lane_relaunch.py` — 45 rows over the guard order, the send payload's
    trailing newline, `--new`, `--dry-run`, the ADVANCE confirmation, and a **no-destructive-verb**
    sweep of every argv on every path (R4), plus its own rows over the `_forbidden_in` tripwire and a
    real-path refusal. Same command as (1).

@@ -771,7 +771,15 @@ for r in rows:
             # capacity (no reliable staleness read) and NOT dead (relaunching would kill it).
             cap_occ.append("%s(%dm,record-stale)" % (r["lane"], a))
         elif _shell_visible(_ws) is True:
-            cap_dead.append("%s(%dm)" % (r["lane"], a))   # bare shell -> relaunch is safe
+            # ⛔ APPEND THE ACTIONABLE HANDLE (review round 5, P2 — and it is the SAME owner ask
+            # recorded above, applied to the one list that still lacked it). The clause this PR
+            # rewrote prescribes `lane-relaunch.py --ws <uuid>`, but this list carried `lane(age)`
+            # only — so the operator could not form the prescribed command without first looking the
+            # workspace up, which is exactly the step the owner asked to remove. The FULL id, not
+            # the 8-char prefix the other lists use: `lane-relaunch.py` compares the whole uuid and
+            # hands it to `cmux send --workspace`, so a prefix would be an unusable handle. Empty
+            # brackets if unknown — never a guess, because a wrong handle types into another lane.
+            cap_dead.append("%s(%dm)[%s]" % (r["lane"], a, _ws or ""))   # bare shell -> relaunch is safe
         else:
             cap_occ.append("%s(%dm,unconfirmed)" % (r["lane"], a))
         continue

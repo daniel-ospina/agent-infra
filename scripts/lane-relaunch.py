@@ -164,7 +164,20 @@ def _live_pi_record(ws, runner, timeout=45):
                 our_row_unreadable = True
             continue
         recognised += 1
-        got = ln.split("workspace=")[1].split()[0].strip().strip(',').upper()
+        # ⛔ A ROW WE CANNOT PARSE IS UNKNOWN, NOT "NO LIVE pi" (review round 5, P2). An empty
+        # `workspace=` value made `.split()[0]` raise IndexError, which escaped `relaunch()` and was
+        # reported as ERROR (exit 1) — contradicting this function's own contract, and unlike the
+        # fleet's parser of the same roster (`orchestrator-heartbeat.sh:639-645`), which guards it.
+        try:
+            got = ln.split("workspace=")[1].split()[0].strip().strip(',').upper()
+        except IndexError:
+            our_row_unreadable = True
+            continue
+        if not got:
+            # `workspace=,` strips to empty: a row whose id we cannot read is a row we cannot rule
+            # out, so it is UNKNOWN rather than a "not ours".
+            our_row_unreadable = True
+            continue
         if got != want:
             continue
         # OUR row, in a shape we understand: its pid_exists value is the answer — but only the two
