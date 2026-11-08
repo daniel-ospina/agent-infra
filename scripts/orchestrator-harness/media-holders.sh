@@ -241,7 +241,7 @@ pid_comm() {
 }
 
 linux_camera() {
-  local devs dev found=0 pid target real devreal base suspicious=""
+  local devs dev found=0 hit pid target real devreal base suspicious=""
   devs="$(ls -d $MH_V4L_GLOB 2>/dev/null)"
   if [ -z "$devs" ]; then
     emit_device camera ABSENT "no video device (no $MH_V4L_GLOB)"
@@ -257,17 +257,22 @@ linux_camera() {
     # 0, and the script answered **FREE over a device the process provably held**.
     # `sudo fuser -v /dev/video0` and `sudo lsof /dev/video0` — the canonical
     # reads — identify holders by device identity, not by path text.
-    case "$target" in
-      *"/$base"|*"/$base"[0-9]*) ;;   # a name-matching path: fall through to resolve
-    esac
+    #
+    # ⛔ `hit` is PER RECORD, and that is not style: the outer `found` is sticky
+    # across pids, so testing it here made every pid AFTER the first holder skip the
+    # alias and unattributable arms — a flag that records a past state and is never
+    # revalidated, which is the exact shape this file exists to stop.
+    hit=0
     # 1. exact path match
     for dev in $devs; do
       if [ "$target" = "$dev" ]; then
         emit_device camera HELD-BY "pid=$pid comm=$(pid_comm "$pid") device=$dev"
         found=1
+        hit=1
+        break
       fi
     done
-    [ "$found" -eq 1 ] && continue
+    [ "$hit" -eq 1 ] && continue
     # 2. an ALIAS of a globbed device (udev `by-id`/`by-path`, a symlinked node):
     #    resolve the target and compare the RESOLVED path to the device list.
     if [ -c "$target" ]; then
@@ -280,10 +285,11 @@ linux_camera() {
         if [ "$real" = "$devreal" ]; then
           emit_device camera HELD-BY "pid=$pid comm=$(pid_comm "$pid") device=$dev via=$target"
           found=1
+          hit=1
           break
         fi
       done
-      [ "$found" -eq 1 ] && continue
+      [ "$hit" -eq 1 ] && continue
       # 3. a character device we CANNOT attribute: name-matching (a second node of
       #    the same major/minor) or outside /dev (a bind mount of the camera into a
       #    containerised cell). This is what stops a silent FREE — we say we cannot

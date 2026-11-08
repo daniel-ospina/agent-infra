@@ -199,6 +199,38 @@ OUT="$(run_linux "$INNOCUOUS/proc" "$INNOCUOUS/dev/video*" "$ASOUND")"
 grep -qx 'camera: FREE' <<<"$OUT"
 check "F2d an innocuous /dev/null holder still reads FREE (no blanket abstention)" $? "$OUT"
 
+# F2e — the arm F2c does NOT cover: a held character device whose NAME does not
+# match the camera pattern and which sits OUTSIDE /dev — a bind-mounted camera in a
+# containerised cell, or a reader in a chroot, names the device by its own path. It
+# cannot be attributed to a globbed node, so the only honest answer is UNVERIFIABLE.
+# Without this row the `case "$target" in /dev/*` arm could be deleted and the
+# suite would stay green while that census went back to claiming FREE.
+OUTSIDE="$TMP/outside"
+mkdir -p "$OUTSIDE/dev" "$OUTSIDE/proc/500/fd" "$OUTSIDE/run/mounts"
+ln -s /dev/zero "$OUTSIDE/dev/video0"
+ln -s /dev/null "$OUTSIDE/run/mounts/camnode"
+ln -s "$OUTSIDE/run/mounts/camnode" "$OUTSIDE/proc/500/fd/9"
+printf 'ffmpeg\n' > "$OUTSIDE/proc/500/comm"
+OUT="$(run_linux "$OUTSIDE/proc" "$OUTSIDE/dev/video*" "$ASOUND")"
+grep -q 'camera: UNVERIFIABLE(character device(s) held that are NOT the globbed camera' <<<"$OUT"
+check "F2e a held char device OUTSIDE /dev (a bind mount) ⇒ UNVERIFIABLE, not FREE" $? "$OUT"
+
+# F2f — EVERY holder is reported, not just the first. The per-record `hit` flag
+# replaced a test on the outer `found`, which is sticky: once pid 100 had matched, no
+# later pid was resolved, so pid 200's ALIASED hold vanished from the answer. (The
+# verdict still read HELD-BY, so only a two-holder row can catch this.)
+TWO="$TMP/two-holders"
+mkdir -p "$TWO/dev/by-id" "$TWO/proc/100/fd" "$TWO/proc/200/fd"
+ln -s /dev/zero "$TWO/dev/video0"
+ln -s ../video0 "$TWO/dev/by-id/cam"
+ln -s "$TWO/dev/video0" "$TWO/proc/100/fd/7"
+ln -s "$TWO/dev/by-id/cam" "$TWO/proc/200/fd/8"
+printf 'electron\n' > "$TWO/proc/100/comm"
+printf 'ffmpeg\n' > "$TWO/proc/200/comm"
+OUT="$(run_linux "$TWO/proc" "$TWO/dev/video*" "$ASOUND")"
+grep -q 'camera: HELD-BY(pid=200 comm=ffmpeg device='"$TWO"'/dev/video0 via='"$TWO"'/dev/by-id/cam' <<<"$OUT"
+check "F2f a SECOND holder is resolved too (the per-record hit, not the sticky found)" $? "$OUT"
+
 # ── F3 (review cycle 1) — `--ancestry --json` must survive a multi-line argv ──
 # The lane root's argv IS multi-line: `pi -p "<multi-line brief>"`. `json_str`
 # used to strip the control range and escape TAB only, so a literal LF passed

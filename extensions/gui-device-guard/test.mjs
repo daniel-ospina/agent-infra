@@ -190,6 +190,13 @@ const ROWS = [
   ["A22 xvfb-run wrapping ls", "xvfb-run -a ls", 0, null, false],
   ["A23 su -c with a benign body", 'su -c "ls"', 0, null, false],
   ["A24 an unlisted wrapper around a NON-launch", "eatmydata ls -la", 0, null, false],
+  // A25 is also a CRASH pin: a segment with NO command word at all (`FOO=1`, `sudo`
+  // alone, `nice -n 5`) makes `commandWordIndex` return -1, and the exec runner was
+  // read with that index — `basename(toks[-1])` threw `Cannot read properties of
+  // undefined` out of the `tool_call` pre-hook, i.e. EVERY lane's bash call failed
+  // on a bare assignment line. A thrown error fails this row, so the guard cannot
+  // be deleted again without the suite going red.
+  ["A25 a bare assignment segment (no command word) does not throw", "FOO=1", 0, null, false],
   ["A16 a comment is not argv", 'electron . # --use-fake-device-for-media-stream --use-fake-ui-for-media-stream', 1, "electron", true],
 ];
 

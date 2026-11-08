@@ -66,6 +66,18 @@
  *     not expanded: the token is `$APP` and the guard records it as an `open`
  *     launch with the unexpanded app name. Recording the SHAPE is still worth
  *     more than the exact string.
+ *   - A WRAPPER WORD the table above has never heard of, in front of a launch
+ *     word that no package-runner introduces (`xvfb-run -a electron`) is not
+ *     classified. This cannot be closed structurally: with no command database,
+ *     `grep -rn electron src/` and a wrapped bare launch are the same token
+ *     shape, so widening further would refuse the SEARCH. The list is deliberate
+ *     and finite — one word to add — and a runner-nested launch is caught behind
+ *     ANY wrapper (`xvfb-run -a npm exec electron .`), which is the shape a lane
+ *     actually writes.
+ *   - Declared OVER-FIRE: an UNQUOTED line that only PRINTS a runner launch
+ *     (`echo npm exec electron .`) is refused, because a runner anywhere in the
+ *     segment counts. Quoting it is the workaround, and `ALLOW_MEDIA=1` waives one
+ *     run — an over-fire is waivable, a miss is not.
  *   - The guard is a `tool_call` pre-hook on pi's `bash` tool. A process started
  *     by something that is not pi (`cron`, a systemd unit, a human shell) is not
  *     seen. The host-side read is `scripts/orchestrator-harness/media-holders.sh`
@@ -761,6 +773,7 @@ export function classifyLaunchCommand(command: string, depth = 0): LaunchFinding
     if (toks.length === 0) continue;
     const flags: { prefixSeen?: boolean } = {};
     const cwi = commandWordIndex(toks, flags);
+    if (cwi < 0) continue;
 
     // ⛔ THE MITIGATION IS READ FROM ARGV, NOT FROM SHELL TEXT (review cycle 2,
     // F2). Segments were never comment-stripped, so

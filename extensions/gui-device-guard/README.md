@@ -83,12 +83,23 @@ subcommands are headed **by default**, and a `PWDEBUG` exported in an earlier
 segment applies to the whole line.
 
 **Wrapper words are prefixes.** `setsid`, `caffeinate`, `arch`, `taskset`, `flock`,
-`script`, `chrt`, `unbuffer`, `prlimit`, `numactl`, `builtin`, `busybox` and
-`firejail` are recognised as prefixes, and a launch behind one is classified
+`script`, `chrt`, `unbuffer`, `prlimit`, `numactl`, `builtin`, `busybox`,
+`firejail`, `xvfb-run`, `dbus-run-session`, `strace`, `ltrace`, `valgrind`, `gdb`,
+`unshare`, `nsenter`, `systemd-run`, `watch`, `fakeroot`, `chroot`, `su` and
+`runuser` are recognised as prefixes, and a launch behind one is classified
 normally. Before that (`review cycle 3, F1`) they were read as the *command word*,
 so the launch behind them produced **no finding at all** — which is not "allow":
 the handler returns early on an empty list, so R1 did not record it either and the
 diagnosis half of #2249 vanished with the block.
+
+**A package-runner anywhere in the segment is a launch shape.** The table above
+cannot close that class — there is no command database, so a wrapper word it has
+never heard of is unrecognisable as a wrapper — but a runner does not need to be
+recognised: `npm exec`/`npx`/`pnpm dlx`/`yarn exec` is itself the announcement that
+the next word is a program, and it reads the same behind ANY prefix. So
+`xvfb-run -a npm exec electron .`, `strace -f npm exec electron .` and
+`eatmydata npm exec electron .` are classified without naming `xvfb-run`,
+`strace` or `eatmydata` anywhere (L19h/L19i name no wrapper at all).
 
 **Two spellings of one flag must not disagree.** Every value-taking option is
 closed in both spellings (`--user` as well as `-u`, `--signal=` as well as `-s`,
@@ -113,9 +124,17 @@ This is a residual list, not a completeness claim:
   `while read` loop that runs its input, and `node -e`/`python -c` bodies (only a
   literal `-c`-style **command string** is re-read). At the moment this hook sees
   the command those are data, not argv.
-- A wrapper word that is **not** in the list above behaves like a plain command:
-  its own arguments are not scanned. The list is deliberate and finite; adding one
-  is a one-word edit, and the `flock`-style command-flag case is one table row.
+- A wrapper word that is **not** in the list above, in front of a launch word
+  that is **not** brought in by a package-runner (`xvfb-run -a electron`) behaves
+  like a plain command: its own arguments are not scanned. That is the one gap the
+  structural rule cannot close — `grep -rn electron src/` and
+  `xvfb-run -a electron` are the same two tokens to a parser with no command
+  database, so widening further would refuse the search. The list is deliberate and
+  finite; adding one is a one-word edit.
+- **Over-fire, declared**: because a runner anywhere in the segment counts, an
+  UNQUOTED line that merely *prints* a runner launch — `echo npm exec electron .` —
+  is refused. Quoting it (`echo "npm exec electron ."`) is the workaround, and
+  `GUI_DEVICE_GUARD_ALLOW_MEDIA=1` waives one run. A miss is not waivable; this is.
 - A launch built from a shell variable (`APP=Electron; open -a "$APP"`) is
   recorded with the unexpanded name — the shape is kept, the string is not.
 - A process started by anything that is not `pi` (`cron`, systemd, a human
@@ -129,7 +148,7 @@ This is a residual list, not a completeness claim:
 ## Tests
 
 ```bash
-node extensions/gui-device-guard/test.mjs                    # 101 assertions, threat table L1–L18 + handler H1–H12
+node extensions/gui-device-guard/test.mjs                    # 115 assertions, threat table L1–L19 + handler H1–H12
 node extensions/gui-device-guard/test.mjs --classify 'npm exec electron .'
 ```
 
@@ -138,11 +157,18 @@ The suite loads the **real** `index.ts` through
 `tool_call` handler** — the #744/#697 lesson: a suite that imports only a helper
 stays green while `index.ts` is broken and the guard is inert in every session.
 Mutations are pinned, each attributable to the row it is about, all measured at
-ONE head: the Electron rule's `media` → `false` reds **39**; the wrapper recursion
-removed reds **6**; the wrapper WORDS removed reds **5**; the comment stripper
-removed reds **1** (L11d); the fail-safe word scan removed reds **3**; the
-quote-aware paren scan removed reds **1** (L17); honouring the fake switches on an
-`open` line reds **3** (L18b + H3b/H3c).
+ONE head: the Electron rule's `media` → `false` reds **47**; the wrapper recursion
+removed reds **8**; the wrapper WORDS removed reds **2**; the structural rule that
+reads a package-runner anywhere in the segment removed reds **2** (L19h/L19i); the
+comment stripper removed reds **1** (L11d); the fail-safe word scan removed reds
+**5**; the quote-aware paren scan removed reds **1** (L17); honouring the fake
+switches on an `open` line reds **3** (L18b + H3b/H3c).
+
+⛔ Deleting the `if (cwi < 0) continue;` guard does not print a red row — it makes
+the SUITE CRASH (`Cannot read properties of undefined`, from `basename(toks[-1])`),
+which is what it did in the wild: any bash call whose segment has no command word
+(`FOO=1`, `sudo` alone) threw out of the `tool_call` pre-hook and failed the lane's
+command. A25 pins it; a crash fails the row.
 
 ## Runbook
 
