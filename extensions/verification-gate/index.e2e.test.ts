@@ -5966,7 +5966,7 @@ async function main() {
     // matches B's identical copy — so an adopting gate ALLOWS the op and this row reddens.
     ok(block1 && block1.block === true, "1265a: B's commit must still be BLOCKED — A's entries are inert here (no fail-open)");
     ok(String(block1.reason).includes("src/shared1265.ts"), "1265a: the block names B's own changed file");
-    ok(!/src\/a1265\.ts/.test(String(block1.reason)), "1265a: the block must not import A's verified file into B's scope");
+    ok(!/src\/a1265\.ts/.test(String(block1.reason)), "1265a: the block must not carry A's entry for a path B did not change (src/a1265.ts)");
 
     // AC (b): exactly ONE durable root-mismatch record for this (root, siblings)
     // pair, however many git ops run. ONE read of the log — `audit` above is
@@ -5988,7 +5988,7 @@ async function main() {
     const blockB2 = await fire("tool_call", opB);
     ok(blockB2 && blockB2.block === true, "1265a: B's second op (its own private file) is blocked too");
     ok(String(blockB2.reason).includes("src/b1265.ts"), "1265a: the block names B's own changed file");
-    ok(!/src\/a1265\.ts/.test(String(blockB2.reason)), "1265a: the block must not import A's verified file into B's scope");
+    ok(!/src\/a1265\.ts/.test(String(blockB2.reason)), "1265a: the block must not carry A's entry for a path B did not change (src/a1265.ts)");
 
     // AC (c): a worktree that had no entries becomes usable after ITS OWN PASS —
     // and only after it. No temp-path/sibling root is ever substituted.
