@@ -35,6 +35,13 @@
 #       as "clean", so "I could not look" became "there is nothing there" — the fail-open shape the
 #       Product-Over-Process rule classes A. State is now one of `absent | clean | dirty |
 #       unmeasurable`, and `unmeasurable` is preserved exactly like `dirty`.
+#       ⛔ AND `absent` IS DECIDED BY EVIDENCE TOO (#3799 review, Finding 2). It used to be `[ -d ]`,
+#       which is false for ANY stat failure — EACCES on an unreadable parent, ENOTDIR, ELOOP, ESTALE
+#       on a dropped mount — so an unreachable tree read as "gone" and its ref was deleted while the
+#       tree sat on disk. `path_absent()` walks UP to a parent it can LIST; a stat of a child needs
+#       only search permission on its parent, so a listable parent plus a failed stat is ENOENT. An
+#       unlistable parent proves nothing, so its own absence is what gets established next. Anything
+#       that cannot be decided is `unmeasurable`, never `absent`.
 #
 #   G2  THE DIRT CHECK WAS GATED ON REGISTRATION. It only ran when git still confirmed the dir was a
 #       registered worktree of THIS repo — so a record whose registration was pruned (precisely what
@@ -47,6 +54,17 @@
 #       with `git update-ref -d <ref> <expected-oid>` (`orchestrator-harness/wt-lifecycle.sh`,
 #       `pi-reap-worktrees.sh`, `cleanup-stale-branches.sh`); this one now matches. A refused CAS
 #       (moved tip, held lock) KEEPS the record and says so.
+#       ⛔ AND THE CAS IS ONLY HALF OF WHY THE SIBLING IS SAFE (#3799 review, Finding 1). `-D` was
+#       ALSO carrying git's CHECKED-OUT refusal, which `update-ref -d` does not have: measured on git
+#       2.43, `-D` answered `cannot delete branch … used by worktree at …` (rc 1) while
+#       `update-ref -d` returned 0 and left that live lane on an UNBORN branch with the ref's reflog
+#       gone. Reachable here without contrivance: a record's `worktree` is an absolute path and the
+#       record file is per-USER, not per-box, so `dir=/old/path` (gone) + the branch checked out at a
+#       live `/new/path` (a lane that recreated its worktree, or two stale records for one branch)
+#       reaches the swap. The refusal is therefore re-asserted from a FRESH
+#       `git worktree list --porcelain` immediately before the swap, and a FAILED enumeration is a
+#       refusal — never an assumed "not checked out" (the sibling's shape,
+#       `cleanup-stale-branches.sh:2073-2099`, trailing-newline two-pattern match included).
 #
 #   G4  THE REF WAS DELETED EVEN WHEN THE TREE SURVIVED. The old --apply deleted the branch no
 #       matter what happened to the directory — including the `dir is not a registered worktree`
@@ -63,7 +81,9 @@
 # ⛔ WHAT --force-dirty DOES AND DOES NOT AUTHORIZE. It authorizes destroying UNCOMMITTED WORK in a
 # registered worktree — that is the documented cost of the flag and the operator asked for it. It
 # does NOT authorize removing a directory git does not vouch for (an unregistered dir is left alone,
-# with its branch, and the record is kept for a human), and it does not bypass G3/G4.
+# with its branch, and the record is kept for a human), it does not authorize removing a tree whose
+# state could not be READ (`unmeasurable` is "unknown", not "the cost you agreed to"), and it does
+# not bypass G3/G4.
 #
 # ⚠️ STILL NOT CHECKED, said plainly: `git worktree remove --force` also deletes IGNORED
 # (`!!`) entries, and `git status --porcelain` cannot see them. That gap is a DIFFERENT root with its
@@ -112,15 +132,48 @@ branch_local() { git show-ref --verify --quiet "refs/heads/$1" 2>/dev/null; }
 branch_remote() { git show-ref --verify --quiet "refs/remotes/origin/$1" 2>/dev/null; }
 branch_tip() { git rev-parse --verify --quiet "refs/heads/$1^{commit}" 2>/dev/null; }
 
+# path_there <path> — the entry exists as SOMETHING (dir, file, or a symlink however broken).
+# `[ -e ]` alone is not that test: it is FALSE for a dangling symlink, and false again for any stat
+# failure (Finding 2 of the #3799 review).
+path_there() { [ -e "$1" ] || [ -L "$1" ]; }
+
+# path_absent <path> — 0 ONLY on positive evidence of non-existence (#3799 review, Finding 2).
+# ⛔ `[ -d "$p" ]` IS NOT AN ABSENT TEST. It is false for ANY stat failure — EACCES on an unreadable
+# parent, ENOTDIR, ELOOP, ESTALE on a dropped network mount — and treating that as "nothing is there"
+# is the same "I could not look => there is nothing there" reasoning G1 removes, one layer earlier:
+# the ref would be deleted while the tree it belongs to is still on disk. So walk UP until a parent
+# can be LISTED; a stat of a child needs only search permission on its parent, so with a listable
+# parent a failed stat on the name means the name is not there. An unlistable parent proves nothing
+# about itself, so its own absence (recursively) is the next thing to establish.
+path_absent() {
+    local p="$1" parent
+    case "$p" in /*) ;; *) p="$PWD/$p" ;; esac
+    while :; do case "$p" in */) p="${p%/}" ;; *) break ;; esac; done
+    [ -n "$p" ] || return 1
+    while :; do
+        path_there "$p" && return 1          # reachable: not absent
+        parent="$(dirname -- "$p")"
+        [ "$parent" = "$p" ] && return 1     # walked to "/" and still unreachable: cannot decide
+        if ls -A -- "$parent" >/dev/null 2>&1; then
+            return 0                          # parent listable => the child's stat failure is ENOENT
+        fi
+        p="$parent"                           # parent unreachable: its absence would prove ours
+    done
+}
+
 # worktree_state <dir> -> absent | clean | dirty | unmeasurable
 # ⛔ A FAILED MEASUREMENT IS NEVER `clean` (#1393 G1). `git status` exits non-zero and prints nothing
 # when <dir> is not a readable checkout (a plain directory, or a linked worktree whose
 # `.git/worktrees/<name>` admin dir was pruned), and reading that empty output as "clean" turns
 # "I could not look" into "there is nothing there". The exit status decides, never the output.
+# ⛔ AND `absent` IS DECIDED BY EVIDENCE, NOT BY A FAILED STAT (#3799 review, Finding 2).
 worktree_state() {
     local dir="$1" out rc=0
     [ -n "$dir" ] || { printf 'absent'; return 0; }
-    [ -d "$dir" ] || { printf 'absent'; return 0; }
+    if ! path_there "$dir"; then
+        if path_absent "$dir"; then printf 'absent'; else printf 'unmeasurable'; fi
+        return 0
+    fi
     out="$(git -C "$dir" status --porcelain 2>/dev/null)" || rc=$?
     if [ "$rc" -ne 0 ]; then printf 'unmeasurable'; return 0; fi
     if [ -n "$out" ]; then printf 'dirty'; else printf 'clean'; fi
@@ -133,10 +186,27 @@ worktree_state() {
 # than destroyed. An empty <old> is an UNCONDITIONAL delete (verified, git 2.43), so a tip that could
 # not be read refuses instead of degrading to one. `update-ref -d` leaves `branch.<name>.*` config
 # behind where `-D` would drop it, so that is removed explicitly.
+#
+# ⛔ `update-ref -d` IS NOT `git branch -D`, SO IT DOES NOT INHERIT -D's CHECKED-OUT REFUSAL
+# (#3799 review, Finding 1 — measured on git 2.43: `-D` refused "used by worktree at …", `update-ref -d`
+# returned 0 and left that worktree on an UNBORN branch with the ref's reflog gone). -D was carrying a
+# guard the swap does not, so the guard is re-asserted here, from a FRESH enumeration immediately
+# before the swap — the branch could have been checked out in the window since classification. A
+# FAILED enumeration is a REFUSAL, never an assumed "not checked out". This is the sibling reaper's
+# shape (`cleanup-stale-branches.sh:2073-2099`), including its trailing-newline subtlety.
 delete_branch_cas() {
-    local br="$1" oid="$2"
+    local br="$1" oid="$2" wt_now=""
     branch_local "$br" || return 0          # already gone — nothing to delete, nothing lost
     [ -n "$oid" ] || return 1                # the classified tip was unreadable: no CAS, no delete
+    if ! wt_now="$(git worktree list --porcelain 2>/dev/null)"; then return 1; fi
+    # TWO patterns, not one: command substitution strips ALL trailing newlines, so when the target is
+    # the LAST entry in the listing its `branch refs/heads/<br>` line is not followed by one and the
+    # `…$'\n'*` alternative alone MISSES the very branch being deleted. The second alternative anchors
+    # at end-of-string; `*"…"` requires the string to END with the literal, so a longer name
+    # (`refs/heads/x/y` vs `refs/heads/x`) still does not match.
+    case "$wt_now" in
+        *"branch refs/heads/$br"$'\n'* | *"branch refs/heads/$br") return 1 ;;
+    esac
     git update-ref -d "refs/heads/$br" "$oid" 2>/dev/null || return 1
     git config --remove-section "branch.$br" 2>/dev/null || true
     return 0
@@ -150,28 +220,32 @@ reap_record() {
 
     oid="$(branch_tip "$br")" || oid=""
 
-    if [ -n "$dir" ] && [ -d "$dir" ]; then
-        if [ "$is_wt" != true ]; then
-            printf '%b' "     ⚠️ KEPT tree+ref+record: '$dir' exists but git does not vouch for it as a worktree of this repo, so its contents cannot be reaped safely and this branch may be the only ref to them. Inspect it, then clear the record by hand (record-worktree.sh done --dispatch '$dispatch').\n"
-            return 1
-        fi
-        if [ "$forced" != true ]; then
-            # ⛔ Re-measure IMMEDIATELY before the destructive call: the classification's read is a
-            # claim about a moment that has passed, and `--force` below suppresses git's own guard
-            # (#1393 G5, the #1105 window).
-            st="$(worktree_state "$dir")"
-            if [ "$st" != clean ]; then
-                printf '%b' "     ⚠️ KEPT tree+ref+record: state is '$st' at re-check (classification said clean) — refusing to remove. Re-run once nothing is writing there.\n"
-                return 1
-            fi
-        fi
-        if ! git worktree remove --force "$dir" 2>/dev/null; then
-            st="$(worktree_state "$dir")"
-            if [ -d "$dir" ]; then
-                printf '%b' "     ⚠️ KEPT tree+ref+record: 'git worktree remove' failed and the tree is still there (state now '$st') — the branch is kept because the tree may be the only copy of what it points at.\n"
-                return 1
-            fi
-        fi
+    if [ -n "$dir" ]; then
+        # ⛔ MEASURED HERE, AT THE REMOVAL WINDOW — not inherited from classification (#1393 G5). The
+        # classification's read describes a moment that has already passed by the time --apply acts,
+        # and the `--force` below suppresses git's own dirty guard, which is the only guard left.
+        st="$(worktree_state "$dir")"
+        case "$st" in
+            absent) : ;;                       # provably nothing on disk — the ref may be considered
+            unmeasurable)
+                printf '%b' "     ⚠️ KEPT tree+ref+record: '${dir}' cannot be reached or read (state 'unmeasurable'), so whether a tree is there — and what is in it — cannot be ruled out.\n"
+                return 1 ;;
+            *)
+                if [ "$is_wt" != true ]; then
+                    printf '%b' "     ⚠️ KEPT tree+ref+record: '${dir}' exists but git does not vouch for it as a worktree of this repo, so its contents cannot be reaped safely and this branch may be the only ref to them. Inspect it, then clear the record by hand (record-worktree.sh done --dispatch '${dispatch}').\n"
+                    return 1
+                fi
+                if [ "$st" != clean ] && [ "$forced" != true ]; then
+                    printf '%b' "     ⚠️ KEPT tree+ref+record: '${dir}' is '${st}' at the removal window — refusing to remove an uncommitted-work tree without --force-dirty. Re-run once nothing is writing there.\n"
+                    return 1
+                fi
+                if ! git worktree remove --force "$dir" 2>/dev/null; then
+                    if path_there "$dir"; then
+                        printf '%b' "     ⚠️ KEPT tree+ref+record: 'git worktree remove' failed and the tree is still there — the branch is kept because the tree may be the only copy of what it points at.\n"
+                        return 1
+                    fi
+                fi ;;
+        esac
     fi
 
     if ! delete_branch_cas "$br" "$oid"; then

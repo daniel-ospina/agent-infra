@@ -247,6 +247,107 @@ fi
 git branch -D fix/cas-1 fix/cas-2 >/dev/null 2>&1 || true
 assert_not_contains "$(grep -vE '^[[:space:]]*#' scripts/scan-orphans.sh)" "git branch -D" "script never calls git branch -D"
 
+# ── #3799 review, Finding 1: `update-ref -d` does NOT inherit `git branch -D`'s
+#    CHECKED-OUT refusal, so the swap must re-enumerate the worktrees itself.
+# ── 2l. the branch is checked out in a LIVE worktree at a DIFFERENT path than the
+#     record names (a lane that recreated its worktree). The record's dir is gone, so
+#     the old code deleted the ref under the live lane; the guard must keep it.
+git worktree add -q "$FIX/wt-moved" -b fix/moved-1
+echo wip > "$FIX/wt-moved/keep.txt"
+$RW add --branch fix/moved-1 --worktree "$FIX/gone-forever" --dispatch d-moved --ts 2026-08-01T00:00:00Z >/dev/null
+OUT="$($SCAN --apply 2>&1 || true)"
+git show-ref --verify --quiet refs/heads/fix/moved-1 && ok "a branch checked out in a live worktree is never CAS-deleted" || bad "the ref of a LIVE worktree's branch was deleted"
+assert_contains "$OUT" "could not be compare-deleted" "the checked-out refusal is named"
+assert_eq "$(wc -l < "$WORKTREES_RECORD" | tr -d ' ')" "1" "the record is kept when the ref is refused"
+$RW done --dispatch d-moved >/dev/null
+git worktree remove --force "$FIX/wt-moved" >/dev/null 2>&1 || true
+git branch -D fix/moved-1 >/dev/null 2>&1 || true
+
+# ── 2m. the CAS is inside reap_record, not only in the fixture (Finding 3 row): a
+#     wrapper `git` moves the ref at the moment the swap is attempted, so the classified
+#     tip is stale. A script that dropped the old-oid would delete the ref anyway.
+mkdir -p "$FIX/shim"
+REAL_GIT="$(command -v git)"
+cat > "$FIX/shim/git" <<'EOS'
+#!/usr/bin/env bash
+case " $* " in
+  *" update-ref -d "*)
+      "$GIT_WRAP_REAL" -C "$GIT_WRAP_REPO" branch -f "${3#refs/heads/}" main >/dev/null 2>&1 ;;
+esac
+exec "$GIT_WRAP_REAL" "$@"
+EOS
+chmod +x "$FIX/shim/git"
+git branch fix/cas-move
+git checkout -q fix/cas-move && echo x >> file.txt && git commit -qam x && git checkout -q main
+$RW add --branch fix/cas-move --worktree "$FIX/gone-too" --dispatch d-casmove --ts 2026-08-01T00:00:00Z >/dev/null
+OUT="$(PATH="$FIX/shim:$PATH" GIT_WRAP_REAL="$REAL_GIT" GIT_WRAP_REPO="$REPO" $SCAN --apply 2>&1 || true)"
+git show-ref --verify --quiet refs/heads/fix/cas-move && ok "a tip that MOVED inside the reap window is refused (CAS is in the script)" || bad "reap_record deleted a ref whose tip moved (unconditional update-ref)"
+assert_contains "$OUT" "could not be compare-deleted" "the in-window CAS refusal is named"
+$RW done --dispatch d-casmove >/dev/null
+git branch -D fix/cas-move >/dev/null 2>&1 || true
+
+# ── 2n. an UNREADABLE classified tip refuses rather than degrading to update-ref's
+#     unconditional form (Finding 3, the F15 guard). git 2.43 refuses to point a branch at a
+#     non-commit, so the unreadable tip is injected where it is read: a wrapper `git` that
+#     fails the ^{commit} peel.
+cat > "$FIX/shim/git" <<'EOS'
+#!/usr/bin/env bash
+case " $* " in
+  *" rev-parse --verify --quiet refs/heads/fix/noncommit^{commit} "*) exit 1 ;;
+esac
+exec "$GIT_WRAP_REAL" "$@"
+EOS
+chmod +x "$FIX/shim/git"
+git branch fix/noncommit
+$RW add --branch fix/noncommit --worktree "$FIX/gone-three" --dispatch d-noncommit --ts 2026-08-01T00:00:00Z >/dev/null
+OUT="$(PATH="$FIX/shim:$PATH" GIT_WRAP_REAL="$REAL_GIT" GIT_WRAP_REPO="$REPO" $SCAN --apply 2>&1 || true)"
+git show-ref --verify --quiet refs/heads/fix/noncommit && ok "an unreadable tip refuses (no unconditional delete)" || bad "an unreadable tip was deleted unconditionally"
+assert_contains "$OUT" "<unread-tip>" "the unread-tip refusal is named"
+$RW done --dispatch d-noncommit >/dev/null
+git branch -D fix/noncommit >/dev/null 2>&1 || true
+
+# ── 2o. G5: a tree that becomes DIRTY between classification and the removal window is
+#     KEPT. A wrapper `git` dirties the tree on the SECOND `status` call (the first is
+#     the classification, the second is reap_record's own read).
+rm -f "$FIX/status-count"
+cat > "$FIX/shim/git" <<'EOS'
+#!/usr/bin/env bash
+if [ "${1:-}" = "-C" ] && [ "${3:-}" = "status" ]; then
+  n=$(cat "$GIT_WRAP_COUNT" 2>/dev/null || echo 0); n=$((n+1)); printf '%s' "$n" > "$GIT_WRAP_COUNT"
+  [ "$n" -ge 2 ] && echo injected > "$GIT_WRAP_TREE/injected.txt"
+fi
+exec "$GIT_WRAP_REAL" "$@"
+EOS
+chmod +x "$FIX/shim/git"
+git worktree add -q "$FIX/wt-window" -b fix/window-1
+$RW add --branch fix/window-1 --worktree "$FIX/wt-window" --dispatch d-window --ts 2026-08-01T00:00:00Z >/dev/null
+OUT="$(PATH="$FIX/shim:$PATH" GIT_WRAP_REAL="$REAL_GIT" GIT_WRAP_REPO="$REPO" GIT_WRAP_COUNT="$FIX/status-count" GIT_WRAP_TREE="$FIX/wt-window" $SCAN --apply 2>&1 || true)"
+[ -d "$FIX/wt-window" ] && ok "a tree dirtied inside the removal window is not removed" || bad "a tree dirtied inside the window was force-removed"
+git show-ref --verify --quiet refs/heads/fix/window-1 && ok "...and its branch is kept" || bad "...but its branch was deleted"
+assert_contains "$OUT" "at the removal window" "the in-window re-measure is named"
+$RW done --dispatch d-window >/dev/null
+git worktree remove --force "$FIX/wt-window" >/dev/null 2>&1 || true
+git branch -D fix/window-1 >/dev/null 2>&1 || true
+
+# ── 2p. Finding 2: a path that cannot be STAT'ed is not `absent`. Parent chmod 000 →
+#     `[ -d ]`/`[ -e ]` are false while the tree is still there; `absent` would delete the
+#     ref of a tree that exists. It must read `unmeasurable` and be preserved.
+if [ "$(id -u)" = 0 ]; then
+    echo "  ⏭️  skipped 2p (running as root — chmod cannot make a path unstatable)"
+else
+    mkdir -p "$FIX/locked"
+    git branch fix/locked-1
+    $RW add --branch fix/locked-1 --worktree "$FIX/locked/child" --dispatch d-lock --ts 2026-08-01T00:00:00Z >/dev/null
+    chmod 000 "$FIX/locked"
+    OUT="$($SCAN --apply 2>&1 || true)"
+    chmod 755 "$FIX/locked"
+    assert_contains "$OUT" "state UNMEASURABLE" "an unreachable path is unmeasurable, never absent"
+    git show-ref --verify --quiet refs/heads/fix/locked-1 && ok "an unstatable tree keeps its branch" || bad "an unstatable tree's branch was deleted"
+    assert_eq "$(wc -l < "$WORKTREES_RECORD" | tr -d ' ')" "1" "an unstatable tree keeps its record"
+    $RW done --dispatch d-lock >/dev/null
+    git branch -D fix/locked-1 >/dev/null 2>&1 || true
+fi
+
 # ── Summary ───────────────────────────────────────────────────────────────
 echo ""
 echo "=== scan-orphans.test.sh: $PASS passed, $FAIL failed ==="
