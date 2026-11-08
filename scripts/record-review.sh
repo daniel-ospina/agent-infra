@@ -2444,7 +2444,7 @@ post_review_evidence_comment() { # <marker> <repo> <pr> -> 0 visible, 1 not
   have="$(command gh api "repos/$repo/issues/$pr/comments?per_page=100" --paginate \
     --jq '.[] | "\(.author_association)\u001f\(.body | gsub("[\u001e\u001f]"; ""))" + "\u001e"' 2>/dev/null)" || rc=$?
   if [ "$rc" -ne 0 ]; then
-    echo "⚠️ record-review: could not READ the PR comments (transient API failure?) — the #1224 evidence COMMENT was skipped. The signed record is unaffected. ⛔ This line makes NO CLAIM about the body marker: a persist is reported by the '⚠️ body-marker:' line THAT ATTEMPT printed, and it reports that attempt only — when it appears the bytes may still be on disk, because this function is called from an arm that can make TWO persist attempts and a later one prints NO line when it succeeds (#3712 review round 8). So no line decides the file's state, and certainly not this one. Re-run record-review.sh (idempotent) to retry the comment." >&2
+    echo "⚠️ record-review: could not READ the PR comments (transient API failure?) — the #1224 evidence COMMENT was skipped. The signed record is unaffected. ⛔ This line makes NO CLAIM about the body marker, and neither does the mere PRESENCE of a '⚠️ body-marker:' line: a line reports THAT ATTEMPT only, and a later attempt that succeeds prints no line, so an APPEARING line is not dispositive (this function is called from an arm that can make TWO — #3712 review round 8). What is dispositive is ABSENCE, and only where an attempt was made: no line from an arm that wrote means that arm's write landed, while where no attempt precedes, absence says nothing at all. This line decides neither. Re-run record-review.sh (idempotent) to retry the comment." >&2
     return 1
   fi
   # Split per RECORD (0x1e), then split association from body (0x1f), and require
@@ -6576,8 +6576,9 @@ if command -v gh >/dev/null 2>&1 && [ -n "$REPO" ]; then
     # follow-up 1). The pending file is keyed by (repo, PR) and `marker_pending_write`
     # OVERWRITES it, so what it holds on THIS run's failure is not observable here: an
     # earlier run may have left a marker, and because the marker text is DETERMINISTIC a
-    # same-head run with the same verdict AND the same `findings`/`note` leaves
-    # BYTE-IDENTICAL bytes — while a same-head run with a DIFFERENT verdict, or a not-clean
+    # same-head run with the same verdict, the same `findings`/`note` AND the same `diff=`
+    # (a base move changes that hash at an UNCHANGED head — #6072) leaves BYTE-IDENTICAL bytes
+    # — while a same-head run with a DIFFERENT verdict, or a not-clean
     # record with a different `findings`/`note` (both are spliced into the marker at
     # `findings=`/`note=`), leaves a marker that is not this run's. So no sentence
     # below may state the file's contents; each says WHICH bytes IT knows about, and a
@@ -6593,7 +6594,7 @@ if command -v gh >/dev/null 2>&1 && [ -n "$REPO" ]; then
       else
         # ⛔ NO PENDING-FILE CLAIM WHEN THE PERSIST FAILED: this run never read the file,
         # so the line names THIS RUN'S write and points at the deterministic marker instead.
-        echo "⚠️ record-review: could not read the PR body of $REPO#$PR (transient API failure / throttled token), so the BODY marker was NOT posted — but the #1224 evidence COMMENT WAS, and that is the copy the required check reads on a runner with no record store. The signed record at $FILE is unaffected. ⛔ THIS RUN'S WRITE DID NOT LAND AND THIS RUN'S BODY COPY IS ON NO CHANNEL — but that is NOT 'the file is empty': this run never read it, and the marker is DETERMINISTIC (a function of PR, verdict, head, diff, repo, key — no timestamp, no run id), so an EARLIER run at this SAME head may have left BYTE-IDENTICAL bytes. So TRY --flush-pending $PR ${REPO:-} — it delivers whatever the file holds, and a delivered line naming @ $SHA is NOT thereby this run's body copy (the marker also binds the verdict and, WHEN PRESENT, the diff and a signature, so read the WHOLE line). Only if it answers 'nothing pending', paste the line the ⚠️ warning reproduced, between its >>> markers, into the PR body by hand once gh is reachable (the durable comment is already the admitted evidence, so what is owed is the body copy and the 'edited' re-trigger, not the verdict)." >&2
+        echo "⚠️ record-review: could not read the PR body of $REPO#$PR (transient API failure / throttled token), so the BODY marker was NOT posted — but the #1224 evidence COMMENT WAS, and that is the copy the required check reads on a runner with no record store. The signed record at $FILE is unaffected. ⛔ THIS RUN'S WRITE DID NOT LAND AND THIS RUN'S BODY COPY IS ON NO CHANNEL — but that is NOT 'the file is empty': this run never read it, and the marker is DETERMINISTIC (a function of PR, verdict, head, diff, repo, key — plus findings/note, which a not-clean record splices in; no timestamp, no run id), so an EARLIER run at this SAME head may have left BYTE-IDENTICAL bytes. So TRY --flush-pending $PR ${REPO:-} — it delivers whatever the file holds, and a delivered line naming @ $SHA is NOT thereby this run's body copy (the marker also binds the verdict and, WHEN PRESENT, findings/note, the diff and a signature, so read the WHOLE line). Only if it answers 'nothing pending', paste the line the ⚠️ warning reproduced, between its >>> markers, into the PR body by hand once gh is reachable (the durable comment is already the admitted evidence, so what is owed is the body copy and the 'edited' re-trigger, not the verdict)." >&2
       fi
       exit 0
     fi
