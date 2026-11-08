@@ -1232,11 +1232,19 @@ printf 'file-from-yesterday.py | a | b | STALE\n' >"$T/t24c/state/harness-apply-
 OUT="$(FARM_RC=0 run_pass "$T/t24c" 2>&1)"; RC=$?
 assert_contains "$OUT" "farm: ok" "T24 control: a matching farm is reported ok"
 assert_eq "$RC" "0" "T24 control: a matching farm leaves the normal verdict intact (exact rc, so a pass broken for an unrelated reason cannot pass this control)"
+# ⛔ PRESENCE IS NOT THE PROPERTY (review: the promise is "self-dating and NEVER deleted", and a pass that
+# did `: >"$FARM_ROWS_FILE"` destroys yesterday's list while leaving the file present — every `-f` row
+# below stayed green under that truncation mutant, and stayed green on the pre-fix code too, which never
+# touched the path at all. So the planted LINE is read back: this is the control that discriminates.
 if [ -f "$T/t24c/state/harness-apply-farm-rows.txt" ]; then
     ok "T24 control: a CLEAN farm leaves an older list in place — the record, not the file's absence, says it is not current"
 else
     bad "T24 control: a CLEAN farm must not DELETE the previous rows list (a concurrent pass's list can be unlinked, and a deleted list cannot be dated)"
 fi
+assert_contains "$(cat "$T/t24c/state/harness-apply-farm-rows.txt" 2>/dev/null || true)" "file-from-yesterday.py" \
+    "T24 control: and the older list's ROWS are untouched — a pass that EMPTIES the file destroys the list as completely as deleting it"
+assert_eq "$(grep -c . "$T/t24c/state/harness-apply-farm-rows.txt" 2>/dev/null || true)" "1" \
+    "T24 control: at exactly the one planted row — so the row above cannot be satisfied by the pass having APPENDED to yesterday's list"
 assert_contains "$(cat "$T/t24c/state/harness-apply.status" 2>/dev/null || true)" "farm_rows=none" \
     "T24 control: and the record says the farm matched, so the file on disk is not today's answer"
 assert_contains "$(cat "$T/t24c/state/harness-apply.status" 2>/dev/null || true)" "farm_n=0" \
@@ -1257,6 +1265,12 @@ if [ -f "$T/t24d/state/harness-apply-farm-rows.txt" ]; then
 else
     bad "T24 control: a NOT-GRADED pass must not DELETE the previous rows list"
 fi
+# ⛔ SAME CONTENT AXIS AS t24c: the not-graded arm is where a "keep it or clear it?" edit is most likely
+# (the pass deliberately publishes nothing here), so the planted row is read back rather than trusted.
+assert_contains "$(cat "$T/t24d/state/harness-apply-farm-rows.txt" 2>/dev/null || true)" "file-from-yesterday.py" \
+    "T24 control: and a NOT-GRADED pass leaves yesterday's ROWS in it, not just the file"
+assert_eq "$(grep -c . "$T/t24d/state/harness-apply-farm-rows.txt" 2>/dev/null || true)" "1" \
+    "T24 control: still exactly the one planted row — nothing was appended and nothing was blanked"
 assert_contains "$(cat "$T/t24d/state/harness-apply.status" 2>/dev/null || true)" "farm_rows=not-graded" \
     "T24 control: and the record says this pass did not grade the farm — not 'none', which claims it did"
 # ⛔ AND ON THIS ARM `action=` IS `none`, THE SAME VALUE A CLEAN NO-OP CARRIES (review round 4). So the
