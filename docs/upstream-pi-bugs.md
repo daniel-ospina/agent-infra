@@ -1234,7 +1234,8 @@ reading.**
   quoted 0.61–1.00 beside a single 0.41 `V8Worker` maximum and read the pair as a
   contradiction. That was an artifact of the quoting, not a finding:** 1.00 came
   from a sub-3% sample — the smallest at 0.0–0.1% of a core, where a process's
-  whole ΔCPU is at most a couple of ticks and the split is meaningless — while 0.41
+  whole ΔCPU is at most **three ticks** (30 s window at `USER_HZ=100`) and the split
+  is meaningless — while 0.41
   came from a *different* sample, so the pair described no single population and the
   "0.61 + 0.41 > 1" impossibility dissolved once both ends were read over one set.
   The remaining residual is **not attributed**: read skew between the process total
@@ -1246,8 +1247,9 @@ reading.**
   floor there is 0.610), so the burn, when it exists, is main-thread JS —
   consistent with the render-frame mechanism and *not* primarily collector
   throughput. Below that threshold the split is not claimed: at 0.7–1.3% of a
-  core a sample's whole ΔCPU is a few ticks, and the shares there range 0.32–1.00
-  for the main thread — the resolution limit, not a second finding.
+  core a sample's whole ΔCPU is only **17–39 ticks** (25–30 s window, `USER_HZ=100`)
+  — coarse enough that a per-thread split is mostly noise — and the shares there
+  range 0.32–1.00 for the main thread: the resolution limit, not a second finding.
 
 **What this settles, and what it does not.** What it **records** is narrower than
 an independent negative: **no process labelled idle on one Linux x86_64 fleet box
