@@ -59,6 +59,11 @@ import { isPrintMode, isPrintModeEnv } from "../shared/print-mode.js";
 // after a pi upgrade, leaving the checkpoint gate inert while the extension
 // reported itself loaded.
 import { isToolCallEventType } from "../shared/tool-call-event.js";
+// #2242: ONE spawn-outcome classification for the whole harness (the `review-enforcer`
+// dispatch floor reads it too). A private copy here would drift, and the drift is silent:
+// a status this extension does not know reads as a completed dispatch, advancing a
+// verifier step with zero verdicts.
+import { classifySpawnOutcome } from "../shared/spawn-capacity.js";
 // #1419: the kill switch has ONE home. It used to be defined here and
 // referenced-but-never-imported in loop-enforcer, where every write raised
 // `ReferenceError` into a swallowed catch — the documented escape was inert.
@@ -2793,7 +2798,20 @@ function tokenStateLabel(reason: string): string {
     // A non-terminal collect (still running) and the background dispatch notice
     // both leave the count untouched, so the step cannot advance until the
     // verdict is reaped.
-    const verifierDetails = (event as { details?: { background?: boolean; terminal?: boolean; run_id?: string } }).details;
+    const verifierDetails = (event as {
+      details?: {
+        background?: boolean;
+        terminal?: boolean;
+        run_id?: string;
+        status?: unknown;
+        killed?: unknown;
+        fallbackStatus?: unknown;
+        failoverHalt?: unknown;
+        failoverHopSpawnFailed?: unknown;
+        isError?: unknown;
+        exitCode?: unknown;
+      };
+    }).details;
     // #1662 review: the pre-spawn refusal / halted-chain / invalid-session-id
     // results are built BEFORE the background branch, so they carry NO
     // `details.background` — a refused `task({ background: true })` would then
@@ -2820,6 +2838,47 @@ function tokenStateLabel(reason: string): string {
       if (isTerminalCollect && collectRunId) {
         if (targetSkill.countedCollects.has(collectRunId)) return undefined; // already counted — never advance twice
         targetSkill.countedCollects.add(collectRunId);
+      }
+      // ⛔ #2242 review (P1): a dispatch that produced NO VERDICT must not advance the
+      // verifier step. This branch used to read only `step.gate === "verifier"` and the
+      // background marker, so the OUTCOME of the dispatch never entered the accounting —
+      // a classification read here is the whole fix, and `shared/spawn-capacity.ts` is the
+      // one place that owns it (the `review-enforcer` floor reads the same function).
+      //
+      // Why it became reachable rather than latent: the blocking pre-spawn refusals were
+      // `invalid-cwd` (a code bug) and `circuit_open` (a breaker), neither of which a
+      // healthy lane hits routinely. #2242 added a BLOCKING refusal that fires on a
+      // measured, routine condition — `TASK_SESSION_CEILING_REFUSE=1` on a box at
+      // `8 × cores`, which is exactly the box on which a lane is most likely to be
+      // dispatching a reviewer. Flow was: `tool_call task` -> +1, `tool_result` with
+      // `details:{status:"fleet-saturated"}` -> -1 and `stepIndex++`, i.e. ONE refused
+      // reviewer dispatch satisfying a verifier step that requires a verdict — a gate
+      // reporting OK with zero verdicts, the Product-Over-Process class A false PASS.
+      //
+      // A pre-spawn refusal carries no `details.background`, so the marker read above
+      // cannot catch it; the status is the only evidence there is, and `classifySpawnOutcome`
+      // is the order-independent way to read it (it also consults the failover fields).
+      // This closes the pre-existing `invalid-cwd` / `circuit_open` hole at the same time.
+      // NOTE the counting asymmetry is deliberate: the count was INCREMENTED on the
+      // `tool_call`, and only the `tool_result` is seen here, so a no-verdict dispatch still
+      // decrements — it just does not ADVANCE the step. That is the correct pair: the
+      // reservation is released (the dispatch is over) while the step stays open for a real
+      // verdict, matching the `return undefined` shape of the still-waiting arm above.
+      const spawnOutcome = classifySpawnOutcome({
+        details: verifierDetails as Record<string, unknown> | undefined,
+        isError: (event as { isError?: unknown }).isError,
+      });
+      if (spawnOutcome.outcome !== "verdict") {
+        console.log(
+          `[sequence-enforcer] ⛔ dispatch produced NO verdict (${spawnOutcome.outcome}: ${spawnOutcome.evidence}) — the verifier step stays open (#2242)`,
+        );
+        auditLog("verifier-no-verdict", {
+          step: targetSkill.stepIndex,
+          outcome: spawnOutcome.outcome,
+          evidence: spawnOutcome.evidence,
+        });
+        targetSkill.reviewers.delete(targetSkill.stepIndex);
+        return undefined;
       }
       const current = targetSkill.reviewers.get(targetSkill.stepIndex) || 0;
       if (current > 0) {

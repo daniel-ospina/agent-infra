@@ -2992,6 +2992,82 @@ await test("#1662 review: a refused background dispatch does NOT advance the ver
   } finally { auditRelease(); }
 });
 
+await test("#2242: a BLOCKING `fleet-saturated` refusal does NOT advance the verifier step (no verdict, no advance)", async () => {
+  // ⛔ THE ROW THE REVIEW ASKED FOR (#2242 review, P1, category-A false PASS). The verifier
+  // branch of the tool_result handler read only `step.gate === "verifier"` and the background
+  // marker — never `details.status` — so ANY blocking pre-spawn refusal decremented the reviewer
+  // reservation and advanced the step with zero verdicts. That was latent while the only such
+  // refusals were `invalid-cwd` (a code bug) and `circuit_open` (a breaker); #2242 added one that
+  // fires on a MEASURED, routine condition (TASK_SESSION_CEILING_REFUSE=1 on a box at 8x cores) —
+  // exactly the box on which a lane is most likely to be dispatching a reviewer. One refused
+  // reviewer dispatch then SATISFIED a step that requires a verdict.
+  _resetStateForTest();
+  const { pi, handlers } = fakePi();
+  auditCapture();
+  try {
+    await withEnv(
+      { PI_MODE: "print", AGENT_SEQUENCE_MODE: "warn", AGENT_STATE_MACHINE: undefined, ELDATO_STATE_MACHINE: undefined },
+      async () => {
+        sequenceEnforcer(pi as any);
+        _pushSkillForTest("/repo/skills/sat-refused/SKILL.md", verifierSkillSteps(), 1);
+
+        // A BLOCKING dispatch (no `background` anywhere) — the shape that had no marker at all.
+        await handlers.tool_call!({ toolName: "task", input: { prompt: "review" } });
+        equal(_stackForTest()[0]!.reviewers.get(1), 1, "the dispatch attempt was counted");
+
+        await handlers.tool_result!({
+          toolName: "task",
+          details: {
+            model: "m",
+            provider: "p",
+            status: "fleet-saturated",
+            retryable: false,
+            error: "could not dispatch: fleet saturated at 88 sessions on 10 cores (ceiling 80)",
+            piProcs: 88,
+            cores: 10,
+            ceiling: 80,
+          },
+        });
+        equal(_stackForTest()[0]!.stepIndex, 1, "⛔ a refused dispatch must NOT satisfy the verifier step");
+        equal(
+          _stackForTest()[0]!.reviewers.get(1),
+          undefined,
+          "the reservation is RELEASED (the dispatch is over) while the step stays open for a real verdict",
+        );
+        // …and a REAL verdict afterwards still advances it, so the fix cannot deadlock the step.
+        // A CLEAN task success carries `{model, provider}` and NO `exitCode` (see
+        // `classifySpawnOutcome`: an emitted `exitCode` means a non-clean composition), so this is
+        // the shape a reviewer that actually reported arrives in.
+        await handlers.tool_call!({ toolName: "task", input: { prompt: "review" } });
+        await handlers.tool_result!({ toolName: "task", details: { model: "m", provider: "p" } });
+        equal(_stackForTest()[0]!.stepIndex, 2, "a genuine verdict still advances the step");
+      },
+    );
+  } finally { auditRelease(); }
+});
+
+await test("#2242: the pre-existing `invalid-cwd` / `circuit_open` blocking refusals are closed by the same classification", async () => {
+  // This hole predates #2242 — it is pinned here because the fix is shared, so a regression in
+  // one class cannot be excused as "the other status".
+  _resetStateForTest();
+  const { pi, handlers } = fakePi();
+  auditCapture();
+  try {
+    await withEnv(
+      { PI_MODE: "print", AGENT_SEQUENCE_MODE: "warn", AGENT_STATE_MACHINE: undefined, ELDATO_STATE_MACHINE: undefined },
+      async () => {
+        sequenceEnforcer(pi as any);
+        _pushSkillForTest("/repo/skills/cwd-refused/SKILL.md", verifierSkillSteps(), 1);
+        for (const status of ["invalid-cwd", "circuit_open"]) {
+          await handlers.tool_call!({ toolName: "task", input: { prompt: "review" } });
+          await handlers.tool_result!({ toolName: "task", details: { status, retryable: false } });
+          equal(_stackForTest()[0]!.stepIndex, 1, `a blocking \`${status}\` refusal must not advance the step`);
+        }
+      },
+    );
+  } finally { auditRelease(); }
+});
+
 await test("warn mode: sequence timer does NOT park a backdated checkpoint owner (park is gate/strict-only; re-arm persists)", async () => {
   _resetStateForTest();
   const { pi, handlers } = fakePi();
