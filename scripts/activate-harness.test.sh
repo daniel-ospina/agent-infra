@@ -46,7 +46,9 @@ cp "$REPO/templates/systemd/"*.service "$REPO/templates/systemd/"*.timer "$FROOT
 cp "$REPO/templates/launchd/"*.plist "$FROOT/templates/launchd/" 2>/dev/null
 # ⛔ THE FIXTURE MUST SHIP THE INSTALLERS THE REAL TREE SHIPS, OR AN ARM CANNOT BE REACHED AT ALL (review
 # cycle 11, F1). `install-launchd.sh` was missing from this list, so `do_install`'s mac gate
-# (`[ -f "$ROOT/scripts/install-launchd.sh" ]`, activate-harness.sh:995) was FALSE in every case and its
+# (`[ -f "$ROOT/scripts/install-launchd.sh" ]` — locate it by GREP, `grep -n 'install-launchd.sh" \]'`,
+# not by line: adding a row above moved it 995 → 1017 inside the very commit that cites it, cycle-12
+# P2-1, and a stale anchor is how a mutant-runner edits the wrong line) was FALSE in every case and its
 # whole body — the arming line and the call F2 was about — never executed. T12 then asserted an ABSENCE
 # over a log that arm could not write: an assertion that could not fail under any mutation of the code
 # it claimed to pin. With the stub present the arm runs, and T12's assertions are about the ARTIFACT.

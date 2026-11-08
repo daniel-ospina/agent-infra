@@ -482,6 +482,15 @@ reconciliation would ship silently; the mutant is the defence, and this paragrap
    `pi-bootstrap/setup.sh`'s `fleet_srcs` — so on a cell it lives only inside a checkout. The row makes
    that state VISIBLE on every `--check`; wiring it into `--install` is a separate change with its own
    tests (it needs sudo, a rendered PATH and a unit write), not something to smuggle in with a row.
+   ⛔ **AND THE ROW IS WEAKER THAN IT LOOKS — #3766.** It is judged on `ActiveState` alone, and
+   `worker-supply.sh --loop` is designed never to exit on a pass verdict (`refused`/`unreadable`/
+   `deferred` all continue — *"a loop that exits on a single rc=3 is a supply path that stops about the
+   first refusal it meets"*). So a supervisor that is enabled, active and re-offering **nothing** every
+   60 s reads exactly what a healthy one reads, while `pr-doctor` still refuses every order — the same
+   quiet repair pool this row exists to surface, one layer in. The beacon was NOT used because the
+   record is `ts=`-keyed and the beacon arm reads the file's CONTENT as an epoch (coercing `ts=…` to 0 →
+   permanent LATE); the fix is the record's **mtime**, the signal `probe_recorded` already falls back to.
+   Declared here with its issue number rather than left for a reader to rediscover.
 6. **The launchd rows are this tool's own read, not `install-launchd.sh --status`'s** — two authorities
    for one set, and only this one measures freshness (§3). Reconciling them is a follow-up.
 7. **`AGE UNMEASURED` on a Mac is a known headroom:** `launchctl print` proves a job has run, but not
