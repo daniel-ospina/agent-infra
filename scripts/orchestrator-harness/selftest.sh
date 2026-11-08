@@ -2815,13 +2815,20 @@ cmux() {
 tmux() {
   case "${1:-}" in
     ls) for _s in fix-77; do case "$KILLED" in *"$_s"*) continue ;; esac; printf '%s\n' "$_s"; done ;;
-    # ⛔ NO PANE FOR `fix-77` — THAT IS THE ASSERTION IT BACKS (“whose PANE is gone”), and it is not
-    # cosmetic. `_wreap_pane_pid` SEEDS the pid the #2104 gate sums, so a stub answering a pid let a
-    # STRANGER's process decide that row. MEASURED RED IN CI (bash-suites, selftest.sh, head d7ce5cfc6):
-    # on a runner where pid 4242 existed the seed matched, `matched` became 1, the verdict stopped being
-    # “surface PROVEN GONE”, and the corpse was SPARED — the log line read `killed: []`. It passed on a
-    # box where 4242 happened not to exist, i.e. the row was green for a reason unrelated to the reaper.
-    list-panes) case "${3:-}" in *=fix-77) : ;; *) echo 4242 ;; esac ;;
+    # ⛔ THE STUB ANSWERS NO PANE PID AT ALL — FOR ANY NAME (measured 2026-11-08, the reason this shard
+    # was red in CI and green on a dev box on an UNCHANGED commit). `_wreap_pane_pid` SEEDS the pid that
+    # #2104's `_wreap_cpu` counts as the worker and sums the subtree of, so a stub that FABRICATES a pid
+    # hands the verdict to whatever process the HOST happens to have at that number. Two measured costs
+    # of the fabricating stub, both `bash-suites`-red in CI behind a differently-named row:
+    #   • `fix-77` (the PANE-GONE row): a stranger at pid 4242 made `matched` 1, the verdict stopped
+    #     being "surface PROVEN GONE", and the corpse was SPARED — the job log reads `killed: []`.
+    #   • `merge-999` (the GNU-stat row, a `kind=terminal` worker that has no pane at all): the same
+    #     stranger was summed into that worker's CPU, so a flat worker read as "burning" and the drive
+    #     got `closed=''`.
+    # A fixture must not name a pid it does not own, and "no tmux session for this name" is exactly what a
+    # `kind=terminal` record and a PANE-GONE record both mean. Arms that DO want a pane pid set it in
+    # their own `tmux()` stub (`$BUSYPID`), which is where the identity belongs.
+    list-panes) : ;;
     kill-session) KILLED="$KILLED ${3#=}" ;;
   esac
   return 0
@@ -3095,6 +3102,15 @@ TBL
   mkdir -p "$TMP/RL/logs" "$TMP/RL/state"
   : > "$TMP/RL/logs/fix-88.log"; touch -t 202601010000 "$TMP/RL/logs/fix-88.log"
   printf 'kind=tmux\ncwd=/tmp\n' > "$TMP/RL/state/worker-fix-88"
+  # ⛔ THE HEREDOC IS UNQUOTED (it must expand $TMP and $HERE), SO EVERY BACKTICK IN THIS BODY IS A
+  # COMMAND SUBSTITUTION RUN AT BUILD TIME — IN THE SUITE'S OWN SHELL (measured 2026-11-08). The prose
+  # below used to carry raw backticks; `wt_tmux_names` is defined in that shell once worker-terminal.sh is
+  # sourced, so the substitution actually RAN and spliced this box's LIVE tmux session names into the
+  # generated script, which then died `syntax error near unexpected token '('` and reddened the five arms
+  # that drive it. On a runner with no tmux sessions the substitution is empty and the fixture survives,
+  # so the SAME commit was green in CI and red on a real controller box — a false PASS on the exact host
+  # type this suite runs on. Backticks in an unquoted heredoc are ESCAPED here, exactly as the prompt
+  # heredocs in lane.sh/fix-one.sh/merge-one.sh already do it.
   cat > "$TMP/rl.sh" <<SH
 set -u
 . "$TMP/wtstub.sh"
@@ -3110,15 +3126,22 @@ tmux() {
 LOG="$TMP/RL/rw.log"; O="$TMP/RL"; WT_DIR="$TMP/RL/state"; STALE_MIN=1; WT_TABLE_TTL=0
 _WREAP_WINDOW_MIN=0; _WREAP_TOL_CS=0
 . "$HERE/worker-terminal.sh"
-# ⛔ THE CENSUS IS STUBBED AT `wt_tmux_names`, NOT AT `tmux` (measured while writing this fixture):
-# `wt_tmux_names` runs the session list through `wt_bounded`, which `perl … exec @ARGV`s — a shell FUNCTION
-# named `tmux` is invisible to that exec, so a `tmux()` stub answered nothing and every record read
-# `dead` whatever the fixture intended. `wt_tmux_names` is called in-shell, so stubbing IT is what
+# ⛔ THE CENSUS IS STUBBED AT \`wt_tmux_names\`, NOT AT \`tmux\` (measured while writing this fixture):
+# \`wt_tmux_names\` runs the session list through \`wt_bounded\`, which \`perl … exec @ARGV\`s — a shell FUNCTION
+# named \`tmux\` is invisible to that exec, so a \`tmux()\` stub answered nothing and every record read
+# \`dead\` whatever the fixture intended. \`wt_tmux_names\` is called in-shell, so stubbing IT is what
 # actually controls the surface answer this arm depends on.
 wt_tmux_names() { printf 'fix-88\n'; return 0; }
 . "$TMP/reapw.sh"
 reap_stale_workers; echo "closed=\$CLOSED killed=\$KILLED"
 SH
+  # ⛔ THE GENERATED FIXTURE MUST BE A VALID SCRIPT, AND THAT IS ASSERTED DIRECTLY (measured
+  # 2026-11-08). Build-time substitution corrupts this file in ways no arm below can name: the arm it
+  # lands on fails for a reason unrelated to what it tests, and the reader debugs the reaper instead of
+  # the fixture. `bash -n` on the ARTIFACT catches any such corruption, whatever its cause — a stronger
+  # and less brittle guard than grepping this body for backticks.
+  bash -n "$TMP/rl.sh" 2>/dev/null && rc=0 || { rc=1; echo "      fixture does not parse: $(bash -n "$TMP/rl.sh" 2>&1 | head -1)"; }
+  ck "#2104: the rl.sh fixture PARSES (an unquoted heredoc is not corrupted at build time)" $rc
   # ⛔ THE PANE IS THE REAL TMUX SHAPE (`worker-terminal.sh:2020`: `bash -c '… cd <cwd> && …'`), NOT the
   # run script — the run script is a CMUX-arm artifact, and a fixture that starts one would let the
   # `run-<w>.sh` pattern do the identifying, which is exactly the vacuity the reviewer named. Here the
@@ -3150,6 +3173,8 @@ SH
   # (e) END-TO-END: an UNREADABLE process table spares a worker whose SURFACE IS STILL THERE —
   # assume-active-until-proven-idle. `WT_LS=alive` keeps the census answering "this worker exists", which
   # is what makes the spare the probe's own verdict rather than the census's.
+  # ⛔ BACKTICKS ESCAPED FOR THE SAME REASON AS `rl.sh` ABOVE: this heredoc is unquoted, so a raw
+  # backtick in the prose runs as a command substitution in the suite's own shell at build time.
   cat > "$TMP/rl2.sh" <<SH
 set -u
 ps() { :; }                     # a blind probe: no rows at all
@@ -3158,7 +3183,7 @@ LOG="$TMP/RL/rw2.log"; O="$TMP/RL"; WT_DIR="$TMP/RL/state"; STALE_MIN=1; WT_TABL
 _WREAP_WINDOW_MIN=0
 . "$HERE/worker-terminal.sh"
 # THE SURFACE ANSWER — the only thing that differs between the two arms below, and stubbed at
-# `wt_tmux_names` for the reason recorded in `rl.sh` (a `tmux()` function does not survive wt_bounded's exec).
+# \`wt_tmux_names\` for the reason recorded in \`rl.sh\` (a \`tmux()\` function does not survive wt_bounded's exec).
 wt_tmux_names() { [ "\${WT_LS:-}" = alive ] && printf '%s\n' fix-88; return 0; }
 tmux() {
   case "\${1:-}" in
@@ -3176,6 +3201,8 @@ SH
   : > "$TMP/RL/logs/fix-88.log"; touch -t 202601010000 "$TMP/RL/logs/fix-88.log"
   printf 'kind=tmux\ncwd=/tmp\n' > "$TMP/RL/state/worker-fix-88"
   printf '%s 0 1\n' "$(( $(date +%s) - 3600 ))" > "$TMP/RL/state/wreap-fix-88"
+  bash -n "$TMP/rl2.sh" 2>/dev/null && rc=0 || { rc=1; echo "      fixture does not parse: $(bash -n "$TMP/rl2.sh" 2>&1 | head -1)"; }
+  ck "#2104: the rl2.sh fixture PARSES (an unquoted heredoc is not corrupted at build time)" $rc
   : > "$TMP/RL/rw2.log"
   out="$(WT_LS=alive bash "$TMP/rl2.sh" 2>&1)"
   case "$out" in *fix-88*) rc=1; echo "      blinded probe still reaped: $out";; *) rc=0 ;; esac
