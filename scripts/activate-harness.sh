@@ -164,7 +164,11 @@ VERB="check"
 # one of the two boxes it exists for.
 ROWS=""
 
-say()  { printf '%s\n' "$*"; }
+# ⛔ NOT `say`. macOS ships /usr/bin/say (text-to-speech): a helper with that name that is ever missing
+# from a sliced-out fragment makes the shell read the banner ALOUD — a green run that spoke, which is
+# agent-infra#2910 and why tests/no-tts/run.sh scans the tree for the NAME rather than trusting a
+# convention. `act_say` cannot collide with anything on either platform.
+act_say() { printf '%s\n' "$*"; }
 warn() { printf '%s\n' "$*" >&2; }
 
 # ── scheduler plumbing ───────────────────────────────────────────────────────────────────────
@@ -747,8 +751,8 @@ build_grid() {
     ROWS=""
     ROW_N=0
     if [ "$TSV" = 0 ]; then
-        say "harness activation — platform=$ACT_PLATFORM host=$(hostname 2>/dev/null || echo '?') root=${ROOT:-<unresolved>}"
-        say ""
+        act_say "harness activation — platform=$ACT_PLATFORM host=$(hostname 2>/dev/null || echo '?') root=${ROOT:-<unresolved>}"
+        act_say ""
         printf '  %-24s %-9s %-12s %s\n' CAPABILITY CLASS STATE DETAIL
     fi
     if [ -z "$ROOT" ]; then
@@ -967,19 +971,19 @@ do_install() {
             # actually ran.
             case "$base" in
                 eldato-harness-apply)
-                    say "arming $base via scripts/install-harness-apply-timer.sh"
+                    act_say "arming $base via scripts/install-harness-apply-timer.sh"
                     bash "$ROOT/scripts/install-harness-apply-timer.sh" --install || { warn "activate-harness: $base installer FAILED"; failed=1; } ;;
                 eldato-disk-reaper)
-                    say "arming $base via scripts/install-disk-reaper-timer.sh"
+                    act_say "arming $base via scripts/install-disk-reaper-timer.sh"
                     bash "$ROOT/scripts/install-disk-reaper-timer.sh" --install || { warn "activate-harness: $base installer FAILED"; failed=1; } ;;
                 eldato-conflict-rebase)
-                    say "arming $base via scripts/install-conflict-rebase-timer.sh"
+                    act_say "arming $base via scripts/install-conflict-rebase-timer.sh"
                     bash "$ROOT/scripts/install-conflict-rebase-timer.sh" --install || { warn "activate-harness: $base installer FAILED"; failed=1; } ;;
                 eldato-controller-watchdog|eldato-objective-reminder)
-                    say "arming $base via scripts/install-cell-timers.sh"
+                    act_say "arming $base via scripts/install-cell-timers.sh"
                     bash "$ROOT/scripts/install-cell-timers.sh" --install || { warn "activate-harness: $base installer FAILED"; failed=1; } ;;
                 eldato-ai-drainer)
-                    say "arming $base via scripts/orchestrator-harness/install-drainer-timer.sh"
+                    act_say "arming $base via scripts/orchestrator-harness/install-drainer-timer.sh"
                     bash "$ROOT/scripts/orchestrator-harness/install-drainer-timer.sh" --install || { warn "activate-harness: $base installer FAILED"; failed=1; } ;;
                 *)
                     warn "activate-harness: $base is a MUST row with no runnable installer in this launcher — refusing to call this box armed"
@@ -995,7 +999,7 @@ do_install() {
             # which prints "ERROR: unknown argument" and exits 2 (verified — scripts/install-launchd.sh:1710).
             # So this call FAILED on every Mac, `failed=1` was set, and NOTHING in the launchd set was
             # ever armed through this launcher while the run printed an arming line (review F2).
-            say "arming the launchd set via scripts/install-launchd.sh (no argument = install)"
+            act_say "arming the launchd set via scripts/install-launchd.sh (no argument = install)"
             bash "$ROOT/scripts/install-launchd.sh" || { warn "activate-harness: install-launchd.sh FAILED"; failed=1; }
         fi
         # The plists in SUBDIRECTORIES are out of install-launchd.sh's glob on purpose; their own
@@ -1003,13 +1007,13 @@ do_install() {
         for base in harness-apply disk-reaper conflict-rebase; do
             case "$base" in
                 harness-apply)
-                    say "arming com.eldato.harness-apply via scripts/install-harness-apply-timer.sh"
+                    act_say "arming com.eldato.harness-apply via scripts/install-harness-apply-timer.sh"
                     bash "$ROOT/scripts/install-harness-apply-timer.sh" --install || { warn "activate-harness: harness-apply installer FAILED"; failed=1; } ;;
                 disk-reaper)
-                    say "arming com.eldato.disk-reaper via scripts/install-disk-reaper-timer.sh"
+                    act_say "arming com.eldato.disk-reaper via scripts/install-disk-reaper-timer.sh"
                     bash "$ROOT/scripts/install-disk-reaper-timer.sh" --install || { warn "activate-harness: disk-reaper installer FAILED"; failed=1; } ;;
                 conflict-rebase)
-                    say "arming com.eldato.conflict-rebase via scripts/install-conflict-rebase-timer.sh"
+                    act_say "arming com.eldato.conflict-rebase via scripts/install-conflict-rebase-timer.sh"
                     bash "$ROOT/scripts/install-conflict-rebase-timer.sh" --install || { warn "activate-harness: conflict-rebase installer FAILED"; failed=1; } ;;
             esac
             ran=$((ran + 1))
@@ -1049,9 +1053,9 @@ summarise() {
     if [ "$TSV" = 1 ]; then
         printf 'SUMMARY\tfail=%s\tunknown=%s\tok=%s\tunmeasured=%s\n' "$n_fail" "$n_unknown" "$n_ok" "$UNMEASURED_ROWS"
     else
-        say ""
+        act_say ""
         if [ "$n_fail" -gt 0 ]; then
-            say "ACTIVATION INCOMPLETE — $n_fail row(s) not armed and not optional; $n_ok ok, $n_unknown unreadable."
+            act_say "ACTIVATION INCOMPLETE — $n_fail row(s) not armed and not optional; $n_ok ok, $n_unknown unreadable."
             # Name them. A launcher that reports a count and no names is the fail-open shape.
             local IFS='
 '
@@ -1063,23 +1067,23 @@ summarise() {
             done
             unset IFS
         elif [ "$n_unknown" -gt 0 ]; then
-            say "ACTIVATION UNVERIFIED — $n_unknown row(s) could not be read (that is never a pass); $n_ok ok."
+            act_say "ACTIVATION UNVERIFIED — $n_unknown row(s) could not be read (that is never a pass); $n_ok ok."
         else
-            say "ACTIVATION COMPLETE — $n_ok row(s) armed and fresh."
+            act_say "ACTIVATION COMPLETE — $n_ok row(s) armed and fresh."
         fi
         # ⛔ A GREEN GRID IS NOT A CLAIM THAT EVERYTHING WAS MEASURED. This is the honest half of the
         # launchd freshness read: those rows are loaded and have run, but their AGE could not be read,
         # so "still firing" is unanswered. Printed rather than absorbed — a success line with no
         # qualifier is how a half-read grid becomes a certification.
         if [ "$UNMEASURED_ROWS" -gt 0 ]; then
-            say "NOTE: $UNMEASURED_ROWS row(s) are loaded and have run, but their FRESHNESS was unmeasurable (no readable log path in the plist) — 'still firing' is NOT certified for them."
+            act_say "NOTE: $UNMEASURED_ROWS row(s) are loaded and have run, but their FRESHNESS was unmeasurable (no readable log path in the plist) — 'still firing' is NOT certified for them."
         fi
         # ⛔ AN `optional` ROW IS NOT A ROW NOBODY READS. It does not fail the run (that is what the
         # class MEANS: armed here only by a dated owner decision — #2403's runner autoscale), but a
         # BROKEN optional row that is silently folded into a counter nothing prints is the same
         # "computed and never read" shape this repo keeps filing. It is named, not failed.
         if [ "$n_armed_optional" -gt 0 ]; then
-            say "NOTE: $n_armed_optional optional row(s) are NOT in an OK state (they are not required here, so this does not fail the run):"
+            act_say "NOTE: $n_armed_optional optional row(s) are NOT in an OK state (they are not required here, so this does not fail the run):"
             local IFS='
 '
             for line in $ROWS; do
@@ -1139,8 +1143,8 @@ LAUNCHD_TEMPLATES="${ACTIVATE_LAUNCHD_TEMPLATES_DIR:-${ROOT:+$ROOT/templates/lau
 
 if [ "$VERB" = "install" ] && [ "$SKIP_INSTALL" != "1" ]; then
     do_install; install_rc=$?
-    say ""
-    say "verifying after arming…"
+    act_say ""
+    act_say "verifying after arming…"
 else
     install_rc=0
 fi
