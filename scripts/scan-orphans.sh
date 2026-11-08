@@ -86,13 +86,18 @@
 #       directory removed with `rm -rf` — and ALSO one MOVED with a raw `mv` — leaves the same
 #       REGISTRATION behind, which `git worktree list --porcelain` keeps reporting at the OLD path,
 #       flagged `prunable`. git cannot tell the two apart, and they are not symmetric: clearing a
-#       stale registration saves an operator one `git worktree prune`, while clearing a moved one
+#       stale registration saves an operator one registration cleanup, while clearing a moved one
 #       SEVERS A LIVE LANE — `git worktree remove --force` returns 0 and the lane's `git status`
 #       then fails rc=128 (`not a git repository: …/.git/worktrees/<name>`), its unpushed commit
 #       goes unreachable, and the pruned record means nothing re-reports it. So the `absent` arm
 #       does NOT deregister, and the checked-out guard treats a `prunable`/absent-path entry as
-#       AMBIGUOUS: it keeps the ref, the record and the tree state, and names the explicit remedy
-#       (`git worktree prune`, after confirming nothing is live at the moved path). A `locked`
+#       AMBIGUOUS: it keeps the ref, the record and the tree state, and tells the operator to LOOK
+#       FOR THE TREE FIRST (`.git/worktrees/<name>/gitdir` names the path it expects, and
+#       `git worktree repair <new path>` is the moved case's remedy), clearing a registration only
+#       when its tree is genuinely gone and only that one path-scoped via `git worktree remove
+#       --force <path>`. ⛔ NEVER `git worktree prune`: this repo forbids it (#1141) — it has no
+#       path filter, so it deregisters EVERY worktree whose directory is missing, and on the moved
+#       case it destroys the recovery the operator was about to perform. A `locked`
 #       entry is live even when its directory is gone, because `git branch -D` refuses it too. A
 #       worktree that might still exist — `unmeasurable` — still refuses.
 #
@@ -270,8 +275,8 @@ delete_branch_cas() {
     # on git 2.43). Deleting a worktree directory and MOVING one with a raw `mv` leave the SAME
     # `prunable gitdir file points to non-existent location` entry at the OLD path — while a moved
     # lane is fully live at its new path (`git -C <new> status` rc=0). git cannot tell these apart,
-    # and the two outcomes are not symmetric: clearing a stale registration saves one `git worktree
-    # prune`, while clearing a moved one severs a live lane (its `status` then fails rc=128 with
+    # and the two outcomes are not symmetric: clearing a stale registration saves effort, while
+    # clearing a moved one severs a live lane (its `status` then fails rc=128 with
     # "not a git repository: …/.git/worktrees/<name>") and makes its unpushed commit unreachable.
     # Category A beats the friction, so this refuses BOTH and names the explicit remedy.
     # ⛔ A `locked` WORKTREE IS LIVE EVEN WHEN ITS DIRECTORY IS GONE (round-6 F2). `lock` exists for
@@ -306,7 +311,7 @@ delete_branch_cas() {
             return 2
         fi
         if [ -n "$wt_stale" ]; then
-            DCAS_REASON="a worktree registration ($wt_stale) still claims it while that directory is gone — git cannot tell a STALE registration from a worktree that was MOVED with 'mv', and the moved case is a live lane, so the ref is kept. Confirm nothing is live there, then clear the registration explicitly: 'git worktree prune'"
+            DCAS_REASON="a worktree registration ($wt_stale) still claims it while that directory is gone — git cannot tell a STALE registration from a worktree MOVED with 'mv', and the moved case is a live lane, so the ref is kept. Look for the tree BEFORE clearing anything: .git/worktrees/<name>/gitdir names the path it expects, and 'git worktree repair <new path>' recovers a moved one. Clear a registration only when its tree is genuinely gone, and only THAT one, path-scoped: 'git worktree remove --force <path>'. ⛔ Once the registration is cleared the next --apply WILL reclaim refs/heads/$br, so do not clear it until you are sure."
             return 2
         fi
     fi
@@ -342,7 +347,7 @@ reap_record() {
                 # …/.git/worktrees/<name>") and its unpushed commit goes unreachable, while the
                 # record is pruned so nothing re-reports it. That is #1393's own failure class, so
                 # the ref is left to `delete_branch_cas`, which refuses an ambiguous registration and
-                # names the explicit remedy (`git worktree prune`) rather than guessing.
+                # tells the operator to look for the tree first rather than guessing.
                 : ;;
             unmeasurable)
                 printf '%b' "     ⚠️ KEPT tree+ref+record: '${dir}' cannot be reached or read (state 'unmeasurable'), so whether a tree is there — and what is in it — cannot be ruled out.\n"
@@ -450,6 +455,8 @@ if [ -f "$RECORD_FILE" ]; then
         # repo — a crafted/poisoned record must never turn --apply into an
         # arbitrary-directory rm -rf (review #216).
         IS_WT=false
+        WT_LIST=""
+        REG_CLAIMS=false
         if [ -n "$DIR" ]; then
             # Canonicalize both sides: macOS /var → /private/var symlink; the
             # porcelain prints realpaths while the record may hold the /var form.
@@ -457,8 +464,18 @@ if [ -f "$RECORD_FILE" ]; then
             # Capture, then classify in the SHELL — never `… | grep -qF`, whose false
             # negative under `pipefail` would make a REGISTERED worktree look
             # unregistered on the destructive --apply path (#864).
-            case "$(git worktree list --porcelain 2>/dev/null || true)" in
+            WT_LIST="$(git worktree list --porcelain 2>/dev/null || true)"
+            case "$WT_LIST" in
                 *"worktree $WT_CANON"*) IS_WT=true ;;
+            esac
+            # ⛔ A SURVIVING REGISTRATION MAKES `absent` AMBIGUOUS (round-7 F2). `rm -rf` of a
+            # worktree and a raw `mv` of a live one both leave a registration claiming the branch,
+            # so this record is NOT safe to remove — `--apply` refuses it. The classifier has to
+            # say the same thing, or the default run (what an operator and `extensions/auto-sync.ts`
+            # read) advertises as safe exactly the record the destructive path will not touch.
+            # Trailing newline pinned so `refs/heads/t` cannot match `refs/heads/t/sub`.
+            case "$(printf '%s\n' "$WT_LIST")" in
+                *"branch refs/heads/$BRANCH"$'\n'*) REG_CLAIMS=true ;;
             esac
         fi
         # ⛔ Dirt is measured for EVERY existing directory, whether or not git still registers it as
@@ -468,7 +485,9 @@ if [ -f "$RECORD_FILE" ]; then
         WT_STATE="$(worktree_state "$DIR")"
         DIRTY_B=0
         case "$WT_STATE" in
-            absent) DIRTY_B=0 ;;
+            # ⛔ ABSENT IS ONLY "SAFE TO REMOVE" WHEN NOTHING STILL CLAIMS THE BRANCH (round-7 F2).
+            # A surviving registration means stale-or-moved, which `--apply` refuses.
+            absent) [ "$REG_CLAIMS" = true ] && DIRTY_B=1 || DIRTY_B=0 ;;
             # ⛔ AN EXISTING DIRECTORY GIT DOES NOT VOUCH FOR IS NOT "safe to remove" (round-3 F3).
             # `--apply` refuses it (the `is_wt` arm), but the DEFAULT run — the one an operator and
             # `extensions/auto-sync.ts` actually read — printed it as ORPHANED and said nothing to
@@ -483,6 +502,8 @@ if [ -f "$RECORD_FILE" ]; then
                     DIRTY_OUT="${DIRTY_OUT}  ⚠️  ORPHANED BUT DIRTY: branch=$BRANCH dir=$DIR — state UNMEASURABLE, not a readable checkout, so uncommitted work there cannot be ruled out\n" ;;
                 clean)
                     DIRTY_OUT="${DIRTY_OUT}  ⚠️  ORPHANED BUT DIRTY: branch=$BRANCH dir=$DIR — clean, but git does not vouch for it as a worktree of this repo, so its contents cannot be reaped safely\n" ;;
+                absent)
+                    DIRTY_OUT="${DIRTY_OUT}  ⚠️  ORPHANED BUT DIRTY: branch=$BRANCH dir=$DIR — state ABSENT, but a worktree registration still claims this branch: either a STALE registration or a worktree that was MOVED and is live. --apply refuses it — look for the tree before clearing anything\n" ;;
                 *)
                     DIRTY_OUT="${DIRTY_OUT}  ⚠️  ORPHANED BUT DIRTY: branch=$BRANCH dir=$DIR (uncommitted changes — review manually)\n" ;;
             esac

@@ -246,7 +246,10 @@ assert_not_contains "$(grep -vE '^[[:space:]]*#' scripts/scan-orphans.sh)" "git 
 git worktree add -q "$FIX/wt-moved" -b fix/moved-1
 echo wip > "$FIX/wt-moved/keep.txt"
 $RW add --branch fix/moved-1 --worktree "$FIX/gone-forever" --dispatch d-moved --ts 2026-08-01T00:00:00Z >/dev/null
-OUT="$($SCAN --apply 2>&1 || true)"
+# --force-dirty so the run reaches the CAS itself: the record's dir is gone but a registration
+# still claims the branch, so the classifier now routes this record to the DIRTY path (round-7 F2)
+# and a plain --apply refuses it before `delete_branch_cas` is ever consulted.
+OUT="$($SCAN --apply --force-dirty 2>&1 || true)"
 git show-ref --verify --quiet refs/heads/fix/moved-1 && ok "a branch checked out in a live worktree is never CAS-deleted" || bad "the ref of a LIVE worktree's branch was deleted"
 assert_contains "$OUT" "CHECKED OUT in a live worktree" "the checked-out refusal is named AS the checked-out refusal"
 assert_contains "$OUT" "$(cd "$FIX/wt-moved" && pwd -P)" "the refusal names the live worktree holding the branch"
@@ -460,41 +463,50 @@ EOS
 fi
 
 
-# ── 2v. round-6 F1: `prunable` is AMBIGUOUS, and the destructive reading must lose. A worktree
-#     whose DIRECTORY was `rm -rf`'d and one MOVED with a raw `mv` leave the SAME `prunable`
-#     registration at the OLD path; git cannot tell them apart. Reclaiming on that guess severs a
-#     live lane (2x pins that), so the ref, the record and the tree state are all KEPT and the
-#     refusal names BOTH possibilities plus the explicit remedy. Friction over silent destruction.
+# ── 2v. round-6 F1 / round-7 F2: `prunable` is AMBIGUOUS, and the destructive reading must lose.
+#     A worktree whose DIRECTORY was `rm -rf`'d and one MOVED with a raw `mv` leave the SAME
+#     `prunable` registration at the OLD path; git cannot tell them apart. Reclaiming on that guess
+#     severs a live lane (2x pins that), so the ref, the record and the tree state are all KEPT.
+#     The DRY run must say so too — it is what an operator and `auto-sync.ts` actually read — and
+#     the refusal must NOT name a bare `git worktree prune` (forbidden here, #1141: no path filter,
+#     it deregisters unrelated worktrees, and on the moved case it destroys the recovery).
 git worktree add -q "$FIX/wt-prunable" -b fix/prunable-1
 $RW add --branch fix/prunable-1 --worktree "$FIX/wt-prunable" --dispatch d-prunable --ts 2026-08-01T00:00:00Z >/dev/null
 rm -rf "$FIX/wt-prunable"
 git worktree list --porcelain | grep -q 'prunable' && ok "fixture: deleting the dir leaves a PRUNABLE registration" || bad "fixture lost the prunable registration (row cannot reach the state it claims to test)"
-OUT="$($SCAN --apply 2>&1 || true)"
+OUT="$($SCAN 2>&1 || true)"                                  # DRY: the mode operators read
+assert_not_contains "$OUT" "ORPHANED (safe to remove)" "the DRY run does not advertise an ambiguous record as safe to remove"
+assert_contains "$OUT" "a worktree registration still claims this branch" "the DRY run names the reason it is not safe"
+OUT="$($SCAN --apply 2>&1 || true)"                          # apply, no --force-dirty
 git show-ref --verify --quiet refs/heads/fix/prunable-1 && ok "an ambiguous (prunable) registration keeps its ref" || bad "the ref was deleted on the prunable guess"
+assert_eq "$(wc -l < "$WORKTREES_RECORD" | tr -d ' ')" "1" "the ambiguous record is kept"
+OUT="$($SCAN --apply --force-dirty 2>&1 || true)"            # --force-dirty reaches the CAS itself
+git show-ref --verify --quiet refs/heads/fix/prunable-1 && ok "--force-dirty does not override the ambiguity either" || bad "the ref was deleted on the prunable guess"
 assert_contains "$OUT" "STALE registration" "the refusal names the STALE half of the ambiguity"
 assert_contains "$OUT" "MOVED with" "the refusal names the MOVED half of the ambiguity"
-assert_contains "$OUT" "git worktree prune" "the refusal names the explicit remedy"
-assert_not_contains "$OUT" "CHECKED OUT in a live worktree" "an ambiguous registration is not asserted to be a live lane"
-assert_eq "$(wc -l < "$WORKTREES_RECORD" | tr -d ' ')" "1" "the ambiguous record is kept so the next pass re-reports it"
-git worktree prune >/dev/null 2>&1 || true
+assert_contains "$OUT" "worktree repair" "the refusal names the moved case's remedy"
+assert_contains "$OUT" "worktree remove --force" "the refusal names a PATH-SCOPED registration cleanup"
+assert_not_contains "$OUT" "worktree prune" "the refusal never names the banned bare prune (#1141)"
+assert_eq "$(wc -l < "$WORKTREES_RECORD" | tr -d ' ')" "1" "the ambiguous record stays kept after --force-dirty"
+git worktree remove --force "$FIX/wt-prunable" >/dev/null 2>&1 || true
 git branch -D fix/prunable-1 >/dev/null 2>&1 || true
 
 # ── 2x. round-6 F1, the case that makes the whole ambiguity matter: a worktree MOVED with a raw
 #     `mv` is LIVE at its new path while its OLD path reads `prunable`. Treating that as a phantom
-#     severing it — `git worktree remove --force <old>` returns 0 and the lane's `status` then fails
+#     severs it — `git worktree remove --force <old>` returns 0 and the lane's `status` then fails
 #     rc=128 — and its unpushed commit goes unreachable. The lane must survive with its git context
-#     intact. This is the fixture whose absence let the round-4 fix through.
+#     intact, even under --force-dirty. This is the fixture whose absence let the round-4 fix through.
 git worktree add -q "$FIX/wt-moved-away" -b fix/mv-1
 echo wip > "$FIX/wt-moved-away/lane-work.txt"
 ( cd "$FIX/wt-moved-away" && git add -A && git -c user.email=t@t -c user.name=t commit -qm "unpushed lane commit" )
 $RW add --branch fix/mv-1 --worktree "$FIX/wt-moved-away" --dispatch d-mv --ts 2026-08-01T00:00:00Z >/dev/null
 mv "$FIX/wt-moved-away" "$FIX/wt-moved-here"
 ( cd "$FIX/wt-moved-here" && git status --porcelain >/dev/null 2>&1 ) && ok "fixture: the moved lane is LIVE at its new path" || bad "fixture did not produce a live moved lane"
-OUT="$($SCAN --apply 2>&1 || true)"
+OUT="$($SCAN --apply --force-dirty 2>&1 || true)"
 ( cd "$FIX/wt-moved-here" && git status --porcelain >/dev/null 2>&1 ) && ok "a moved worktree keeps its git context (the lane is not severed)" || bad "the live lane was SEVERED (status failed after --apply)"
 git show-ref --verify --quiet refs/heads/fix/mv-1 && ok "a moved worktree's branch survives" || bad "the ref of a live moved lane was deleted"
 assert_eq "$(wc -l < "$WORKTREES_RECORD" | tr -d ' ')" "1" "a moved worktree's record is kept"
-git worktree prune >/dev/null 2>&1 || true
+git worktree remove --force --force "$FIX/wt-moved-away" >/dev/null 2>&1 || true
 rm -rf "$FIX/wt-moved-here"
 git branch -D fix/mv-1 >/dev/null 2>&1 || true
 
@@ -506,28 +518,28 @@ git worktree lock "$FIX/wt-locked"
 $RW add --branch fix/lock-1 --worktree "$FIX/wt-locked" --dispatch d-lock1 --ts 2026-08-01T00:00:00Z >/dev/null
 rm -rf "$FIX/wt-locked"
 git worktree list --porcelain | grep -q '^locked' && ok "fixture: the locked worktree lists as locked" || bad "fixture lost the locked registration"
-OUT="$($SCAN --apply 2>&1 || true)"
+OUT="$($SCAN --apply --force-dirty 2>&1 || true)"
 git show-ref --verify --quiet refs/heads/fix/lock-1 && ok "a LOCKED worktree's branch is kept" || bad "the ref of a locked worktree was deleted (broader than 'git branch -D')"
 assert_contains "$OUT" "LOCKED" "the refusal names the lock as the cause"
 assert_eq "$(wc -l < "$WORKTREES_RECORD" | tr -d ' ')" "1" "a locked worktree's record is kept"
 git worktree unlock "$FIX/wt-locked" >/dev/null 2>&1 || true
-git worktree prune >/dev/null 2>&1 || true
+git worktree remove --force --force "$FIX/wt-locked" >/dev/null 2>&1 || true
 git branch -D fix/lock-1 >/dev/null 2>&1 || true
 
 # ── 2z. round-6 F3: EVERY registration claiming the branch is examined, not just the first.
 #     `git worktree add --force <path> <branch>` really does register TWO worktrees on one branch,
-#     so an `exit` on the first match let a LIVE second entry hide behind a prunable first one and
-#     the ref was freed anyway. The live entry must win.
+#     so an `exit` on the first match let a LIVE second entry hide behind a prunable first one.
 git worktree add -q "$FIX/wt-dup-a" -b fix/dup-1
 git worktree add -q --force "$FIX/wt-dup-b" fix/dup-1
 $RW add --branch fix/dup-1 --worktree "$FIX/wt-dup-a" --dispatch d-dup --ts 2026-08-01T00:00:00Z >/dev/null
 rm -rf "$FIX/wt-dup-a"
 assert_eq "$(git worktree list --porcelain | grep -c 'branch refs/heads/fix/dup-1')" "2" "fixture: two registrations claim the same branch"
-OUT="$($SCAN --apply 2>&1 || true)"
+OUT="$($SCAN --apply --force-dirty 2>&1 || true)"
 git show-ref --verify --quiet refs/heads/fix/dup-1 && ok "a LIVE second registration protects the ref of a prunable first one" || bad "the ref was freed on the FIRST match with a live second registration present"
 assert_contains "$OUT" "CHECKED OUT in a live worktree" "the refusal names the live registration"
 assert_eq "$(wc -l < "$WORKTREES_RECORD" | tr -d ' ')" "1" "the record is kept when a live registration remains"
-git worktree prune >/dev/null 2>&1 || true
+git worktree remove --force --force "$FIX/wt-dup-a" >/dev/null 2>&1 || true
+git worktree remove --force --force "$FIX/wt-dup-b" >/dev/null 2>&1 || true
 git branch -D fix/dup-1 >/dev/null 2>&1 || true
 
 # ── Summary ───────────────────────────────────────────────────────────────
