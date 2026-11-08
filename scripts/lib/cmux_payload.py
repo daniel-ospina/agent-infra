@@ -275,7 +275,7 @@ def _resolve_session_id_qualified(workspace: str, run, attempts: int = 3,
     case it exists for — a cmux that does not know the flag — is deterministic, so three more 45 s
     reads buy nothing while spending the floor's slack. Session resolution costs at most 3x45 s
     qualified + 1x45 s fallback; a second full budget would push the whole verification window past
-    the floor's own tick budget (~413 s of a 450 s interval — see `cadence-nudge.sh`'s receipt budget),
+    the floor's own tick budget (~410 s of a 450 s interval — see `cadence-nudge.sh`'s receipt budget),
     and the floor's lock is now held by identity as well as age for exactly that reason.
     """
 

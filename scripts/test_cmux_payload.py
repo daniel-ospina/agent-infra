@@ -1631,6 +1631,80 @@ def test_cadence_nudge_holds_an_unidentifiable_lock_to_the_ceiling_not_the_grace
     assert "lock-skip" in appended and "bound=20m" in appended, appended
 
 
+def test_cadence_nudge_dead_holder_arm_has_its_own_bound_and_its_own_words(tmp_path):
+    """⛔ A DEAD HOLDER IS NOT "UNIDENTIFIABLE" (#3795 review cycle 4, P2).
+
+    The common crash — a nudge SIGKILLed in its ~410 s window — leaves the lock and a pid file naming
+    a dead pid. Classifying that with the "names nothing" arm held the floor for the full 20-min
+    ceiling (2.7 ticks) AND printed `holder=<pid> … no identifiable holder`, a line that names a
+    holder while denying it identifies one. It now has its own bound (10 min, above the window and
+    well under the ceiling) and its own words.
+    """
+    # (a) inside the dead bound: held, and the line says the holder is dead rather than unknown.
+    seed = _seeded_log(600)
+    home, bindir, screen, state = _cadence_home(
+        tmp_path / "a", "the pane shows nothing relevant\n", seed)
+    _lock(state, pid=999999, age_s=300)
+    sent = tmp_path / "SENT_A"
+    r = _run_cadence_nudge(home, bindir, screen, session=sent)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert not sent.exists(), "a 300 s lock was reclaimed before the dead bound"
+    _n, appended = _new_nudge_lines(state, seed)
+    assert "bound=10m" in appended, appended
+    assert "is not running" in appended, appended
+    assert "no identifiable holder" not in appended, (
+        "the line names a holder and denies identifying one in the same sentence:\n" + appended)
+
+    # (b) past the dead bound: reclaimed, well before the 20-min ceiling.
+    seed_b = _seeded_log(600)
+    home_b, bindir_b, screen_b, state_b = _cadence_home(
+        tmp_path / "b", "the pane shows nothing relevant\n", seed_b)
+    _lock(state_b, pid=999999, age_s=700)
+    sent_b = tmp_path / "SENT_B"
+    r = _run_cadence_nudge(home_b, bindir_b, screen_b, session=sent_b)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert sent_b.exists(), "a provably-dead holder was not reclaimed at its own bound"
+
+
+def test_cadence_nudge_respects_the_reclaim_mutex_and_recovers_a_stale_one(tmp_path):
+    """⛔ THE RECLAIM IS SERIALISED BY A FIXED-NAME MUTEX (#3795 review cycle 4, P1).
+
+    Judgement and reclaim happen inside one `mkdir` mutex, because that is the only primitive that
+    can be won exactly once. The previous version compared INODE NUMBERS after moving the directory,
+    which does not work: a re-created directory gets the freed inode straight back (measured 6/6), so
+    a descheduled contender moved the NEW live lock and found its check satisfied.
+
+    Two arms: a live mutex blocks (and says so), and a mutex left behind by a killed run is reclaimed
+    so it cannot wedge the floor.
+    """
+    # (a) a live mutex → skip, log, no send.
+    seed = _seeded_log(600)
+    home, bindir, screen, state = _cadence_home(
+        tmp_path / "a", "the pane shows nothing relevant\n", seed)
+    (state / "cadence-nudge.lock.takeover").mkdir()
+    sent = tmp_path / "SENT_A"
+    r = _run_cadence_nudge(home, bindir, screen, session=sent)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert not sent.exists(), "a live reclaim mutex was ignored"
+    _n, appended = _new_nudge_lines(state, seed)
+    assert "lock-skip" in appended, appended
+    assert "mutex" in appended, appended
+
+    # (b) a STALE mutex (its owner was killed) → reclaimed, and the floor proceeds.
+    seed_b = _seeded_log(600)
+    home_b, bindir_b, screen_b, state_b = _cadence_home(
+        tmp_path / "b", "the pane shows nothing relevant\n", seed_b)
+    mutex = state_b / "cadence-nudge.lock.takeover"
+    mutex.mkdir()
+    t = time.time() - 600
+    os.utime(mutex, (t, t))
+    sent_b = tmp_path / "SENT_B"
+    r = _run_cadence_nudge(home_b, bindir_b, screen_b, session=sent_b)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert sent_b.exists(), (
+        "a stale reclaim mutex wedged the floor — the mutex has no owner left to release it")
+
+
 def test_cadence_nudge_lock_survives_a_concurrent_burst(tmp_path):
     """⛔ ONE HEARTBEAT FOR A WHOLE BURST (#3795 review cycle 3, P1).
 
