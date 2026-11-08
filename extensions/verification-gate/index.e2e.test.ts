@@ -5917,12 +5917,19 @@ async function main() {
     // SIBLING-COUNTING revert is caught by the transcript assertions above
     // (`📂 Recovered N … for <ownRoot>`), NOT here — there is one emit site, so that
     // revert still leaves exactly one A-keyed record (the repeat call is short-
-    // circuited by the mtime guard). Filtering on B alone could never see either
-    // direction — that was a dead assertion.
+    // circuited by the mtime guard).
+    //
+    // ⛔ A `… root === realB … .length === 0` row sat here and was DELETED (review
+    // cycle 5, rule 3). It could not fail in EITHER direction: pre-fix there is no
+    // `root` field, so `"" === realB` is false and the count is 0 → green on the code
+    // it is named after; and no reversion-shaped mutation of this diff can produce a
+    // B-keyed record, because the only compound key in the bridge is A's, so
+    // `recoverBridgeForRoot(realB)` returns 0 whatever the code does. The property it
+    // named is covered twice already — by the transcript row above (the pre-fix
+    // "Recovered N verified files" line) and by this A-keyed row — and both redden
+    // under the mutants named in the PR's evidence comment.
     equal(audit.filter((l) => l.event === "gate_recovery" && String(l.root ?? "") === realA).length, 1,
       "1265a: the inspection merge must record exactly ONE gate_recovery against the SIBLING root it recovered for");
-    equal(audit.filter((l) => l.event === "gate_recovery" && String(l.root ?? "") === realB).length, 0,
-      "1265a: worktree B must claim NO recovery count of its own — a sibling's entries are not this session's verified state");
     // The other half of the same defect: B has no entries of its own, so the
     // durable zero-entry record must exist for B's own root.
     equal(forB("gate_recovery_empty").length, 1,
