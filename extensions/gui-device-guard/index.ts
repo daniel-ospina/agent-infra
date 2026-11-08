@@ -124,6 +124,23 @@ export function defaultRecordPath(): string {
 const PREFIXES = new Set([
   "!", "time", "sudo", "doas", "nohup", "command", "env", "exec",
   "nice", "ionice", "stdbuf", "timeout",
+  // ⛔ A WRAPPER IS A PREFIX EVEN WHEN THE TABLE HAS NEVER HEARD OF IT (review
+  // cycle 3, F1). `setsid`, `caffeinate`, `arch`, `taskset`, `flock`, `script`,
+  // `chrt` … were classified as the COMMAND WORD, so the launch behind them was
+  // invisible — and an empty finding list is not "allow": the handler returns
+  // early, so R1 did not RECORD it either, losing the diagnosis half of #2249 as
+  // well as the block. The tell, again: `env FOO=1 caffeinate npm exec electron .`
+  // fired (env is a prefix ⇒ the word scan ran) while bare `caffeinate …` did not.
+  "setsid", "caffeinate", "arch", "taskset", "flock", "script", "chrt",
+  "unbuffer", "prlimit", "numactl", "builtin", "busybox", "firejail",
+  // The next tier are the wrappers a LANE actually reaches for: a virtual
+  // display (`xvfb-run`), a tracer/debugger in front of the app, a namespace
+  // entry, a session bus, a user switch. Same tell as above — each was read as
+  // the command word, so `xvfb-run npm exec electron .` produced NO finding and
+  // therefore no ledger row either (#2249's diagnosis half).
+  "xvfb-run", "dbus-run-session", "strace", "ltrace", "valgrind", "gdb",
+  "unshare", "nsenter", "systemd-run", "watch", "fakeroot", "chroot",
+  "su", "runuser",
 ]);
 
 /**
@@ -149,6 +166,42 @@ const PREFIX_VALUE_FLAGS: Record<string, string[]> = {
   env: ["-u", "--unset", "-C", "--chdir", "-S", "--split-string"],
   stdbuf: ["-i", "--input", "-o", "--output", "-e", "--error"],
   timeout: ["-s", "--signal", "-k", "--kill-after"],
+  caffeinate: ["-t", "-w"],
+  arch: ["-arch", "-e", "--arch"],
+  taskset: ["-c", "--cpu-list", "-p", "--pid"],
+  chrt: ["-p", "--pid"],
+  prlimit: ["-p", "--pid", "-n", "--nproc", "-c", "--core", "-f", "--fsize"],
+  numactl: ["-i", "--interleave", "-m", "--membind", "-N", "--cpunodebind",
+    "-C", "--physcpubind", "-p", "--preferred"],
+  flock: ["-w", "--wait", "--timeout", "-E", "--conflict-exit-code"],
+  script: ["-t", "--timing"],
+  firejail: ["--profile", "--net", "--ip"],
+  // ⛔ `su`/`runuser` deliberately do NOT declare `-c` here: `-c` is the
+  // COMMAND-STRING flag handled by `COMMAND_STRING_FLAGS` below. Declaring it as
+  // a value flag would consume the command string as an ordinary argument, leave
+  // no command word at all, and turn a launch into nothing.
+  "xvfb-run": ["-n", "--server-num", "-s", "--server-args", "-f", "--auth-file", "-e", "--error-file"],
+  strace: ["-o", "-e", "-p", "-s", "-u", "-E"],
+  ltrace: ["-o", "-e", "-p"],
+  valgrind: ["--tool", "--log-file", "--suppressions"],
+  gdb: ["-x", "--eval-command", "-iex", "-cd"],
+  nsenter: ["-t", "--target", "-r", "--root", "-w", "--wd"],
+  "systemd-run": ["-u", "--unit", "-p", "--property", "--description", "-E", "--setenv"],
+  watch: ["-n", "--interval"],
+  chroot: ["--userspec", "--groups"],
+  su: ["-s", "--shell", "-g", "--group"],
+  runuser: ["-u", "--user", "-g", "--group", "-s", "--shell"],
+};
+
+/**
+ * Flags whose ARGUMENT is a COMMAND STRING (the shell's `-c`, `flock -c`,
+ * `script -c`). The parser used to special-case `bash -c` only; a `flock … -c
+ * "npm exec electron ."` was therefore invisible (review cycle 3, F1).
+ */
+const COMMAND_STRING_FLAGS: Record<string, string[]> = {
+  bash: ["-c"], sh: ["-c"], zsh: ["-c"], dash: ["-c"], ksh: ["-c"], ash: ["-c"],
+  busybox: ["-c"], flock: ["-c", "--command"], script: ["-c", "--command"],
+  su: ["-c", "--command", "--session-command"], runuser: ["-c", "--command"],
 };
 
 /**
@@ -376,6 +429,20 @@ export function tokenize(segment: string): string[] {
   return toks;
 }
 
+/**
+ * Strip the shell metacharacters a segment can begin with. `tokenize` does not
+ * split `(`/`{` from the word, so `(npm exec electron . &)` — the idiomatic way a
+ * lane BACKGROUNDS a GUI app — produced the token `(npm`, which matched no rule
+ * and left the declared `TRANSPARENT` entries for `(`/`{` unreachable (review
+ * cycle 3, F1). Only the FIRST token is normalised: a `(` later in a segment is
+ * part of an argument.
+ */
+function stripLeadingMetachars(tok: string): string {
+  let i = 0;
+  while (i < tok.length && "({$!".includes(tok[i])) i++;
+  return i === 0 ? tok : tok.slice(i);
+}
+
 /** `A=B` leading assignment (an env prefix, not a command word). */
 function isAssignment(tok: string): boolean {
   return /^[A-Za-z_][A-Za-z0-9_]*=/.test(tok);
@@ -394,6 +461,7 @@ function basename(p: string): string {
 function commandWordIndex(toks: string[], out?: { prefixSeen?: boolean }): number {
   let i = 0;
   let prefixSeen = false;
+  if (toks.length > 0) toks[0] = stripLeadingMetachars(toks[0]);
   while (i < toks.length) {
     const tok = toks[i];
     if (isAssignment(tok) || TRANSPARENT.has(tok)) {
@@ -530,11 +598,26 @@ export function extractSubstitutions(command: string): string[] {
       continue;
     }
     if (ch === "$" && command[i + 1] === "(") {
+      // ⛔ QUOTE STATE, NOT A BARE DEPTH COUNTER (review cycle 3, F3).
+      // `echo "$(echo ")"; npm exec electron .)"` closes the body early at the
+      // `)` inside the quoted string, the remainder is dropped, and the launch
+      // inside it was never classified — the same class the cycle-1 wrapper fix
+      // declared closed. Inside the body, `'…'` and `"…"` are skipped whole
+      // (with backslash escapes in double quotes), so a quoted paren is DATA.
       let depth = 0;
       let j = i + 1;
+      let quote: string | null = null;
       for (; j < command.length; j++) {
-        if (command[j] === "(") depth++;
-        else if (command[j] === ")") {
+        const cj = command[j];
+        if (quote !== null) {
+          if (cj === "\\" && quote === '"' && j + 1 < command.length) { j++; continue; }
+          if (cj === quote) quote = null;
+          continue;
+        }
+        if (cj === "'" || cj === '"') { quote = cj; continue; }
+        if (cj === "\\" && j + 1 < command.length) { j++; continue; }
+        if (cj === "(") depth++;
+        else if (cj === ")") {
           depth--;
           if (depth === 0) break;
         }
@@ -551,13 +634,25 @@ export function extractSubstitutions(command: string): string[] {
   return bodies;
 }
 
-/** The `-c <string>` argument of a shell invocation, or null. */
+/**
+ * The command-string argument of a wrapper that takes one — the shell's `-c`
+ * (also `-lc`, `-ec`, `-o pipefail -c`), `flock -c`, `script -c` — or null.
+ *
+ * ⛔ GENERALISED FROM THE SHELL-ONLY CASE (review cycle 3, F1): `flock /tmp/l -c
+ * "npm exec electron ."` was invisible because only `bash`-family heads were
+ * re-read. `COMMAND_STRING_FLAGS` names the flag per head, so a wrapper added
+ * later is one table row rather than a second branch.
+ */
 function shellCommandArg(toks: string[], headIndex: number): string | null {
+  const head = basename(toks[headIndex] ?? "");
+  const flags = COMMAND_STRING_FLAGS[head];
+  if (!flags) return null;
   for (let i = headIndex + 1; i < toks.length; i++) {
     const tok = toks[i];
-    // `-c`, `-lc`, `-ec`, `-o pipefail -c` … a short-flag cluster containing `c`.
-    if (/^-[A-Za-z]*c[A-Za-z]*$/.test(tok)) return toks[i + 1] ?? null;
-    if (tok === "--") return null;
+    if (tok === "--") continue;
+    if (flags.includes(tok)) return toks[i + 1] ?? null;
+    // A short-flag cluster containing `c` for the shell family only.
+    if (SHELLS.has(head) && /^-[A-Za-z]*c[A-Za-z]*$/.test(tok)) return toks[i + 1] ?? null;
   }
   return null;
 }
@@ -625,7 +720,10 @@ function classifySegment(
         app,
         argv: toks.join(" "),
         media: isPath,
-        faked,
+        // ⛔ `faked` is FORCED false for this rule: `open` does not forward
+        // Chromium switches, so a line that carries them is not a mitigation —
+        // honouring it was a false PASS (review cycle 3, minor, reproduced).
+        faked: false,
       };
     }
     return null;
@@ -663,7 +761,6 @@ export function classifyLaunchCommand(command: string, depth = 0): LaunchFinding
     if (toks.length === 0) continue;
     const flags: { prefixSeen?: boolean } = {};
     const cwi = commandWordIndex(toks, flags);
-    if (cwi < 0) continue;
 
     // ⛔ THE MITIGATION IS READ FROM ARGV, NOT FROM SHELL TEXT (review cycle 2,
     // F2). Segments were never comment-stripped, so
@@ -680,11 +777,23 @@ export function classifyLaunchCommand(command: string, depth = 0): LaunchFinding
       continue;
     }
 
+    // ⛔ A PACKAGE-RUNNER ANYWHERE IN THE SEGMENT IS A LAUNCH SHAPE, whatever
+    // heads the segment (review cycle 3, F1's CLASS rather than its instances).
+    // The wrapper table above cannot close this class — there is no command
+    // database, so a wrapper word it has never heard of is unrecognisable — but a
+    // runner does not need to be recognised as a WRAPPER: `npm exec`/`npx`/
+    // `pnpm dlx` is itself the announcement that the next word is a program, and
+    // that reads the same behind ANY prefix. `xvfb-run -a npm exec electron .`,
+    // `strace -f npx playwright test --headed` and `systemd-run --user npm exec
+    // electron .` were all `[]` (no block, no ledger row) before this. Rows
+    // L19h/L19i name no wrapper at all, so deleting this rule cannot stay green.
+    const runnerNested = toks.some((t, i) => i > 0 && RUNNERS.has(basename(t)));
+
     // R-failsafe: a PREFIX or an EXEC-style runner can swallow the command word
     // with a value-taking flag this table does not know (review cycle 2, F1:
-    // `sudo --user root electron .`). Only those two shapes are scanned, so a
-    // plain `rg electron .` is untouched.
-    if (flags.prefixSeen || execVerb) {
+    // `sudo --user root electron .`). Only those shapes are scanned, so a plain
+    // `rg electron .` is untouched.
+    if (flags.prefixSeen || execVerb || runnerNested) {
       const alt = launchWordIndex(toks, cwi + 1);
       if (alt >= 0 && alt !== cwi) {
         const rescued = classifySegment(toks, alt, faked, pwdebug);
@@ -695,13 +804,19 @@ export function classifyLaunchCommand(command: string, depth = 0): LaunchFinding
       }
     }
 
-    // R-wrapper: `bash -c "<cmd>"`, `sh -c …`, `sudo bash -lc …`, `eval …` —
-    // the command string is ARGV, so it is re-read rather than declared away
-    // (review cycle 1, F2: these were an UNDECLARED bypass of R2, and
-    // `AGENTS.md`/the runbooks hand lanes `bash -c` idioms routinely).
+    // R-wrapper: `bash -c "<cmd>"`, `sh -c …`, `sudo bash -lc …`, `flock … -c …`,
+    // `su -c …`, `eval …` — the command string is ARGV, so it is re-read rather
+    // than declared away (review cycle 1, F2: these were an UNDECLARED bypass of
+    // R2, and `AGENTS.md`/the runbooks hand lanes `bash -c` idioms routinely).
     if (depth < MAX_WRAPPER_DEPTH) {
       const head = basename(toks[cwi]);
-      const shellBody = SHELLS.has(head) ? shellCommandArg(toks, cwi) : null;
+      // ⛔ READ THE COMMAND STRING FROM THE WRAPPER, NOT FROM THE RESOLVED
+      // COMMAND WORD (review cycle 3, F1): in `flock /tmp/l -c "npm exec electron
+      // ."` the resolved word is the LOCK PATH, so asking it for a `-c` argument
+      // found nothing. `toks[0]` is the wrapper (already metachar-stripped by
+      // `commandWordIndex`); the `cwi` read stays as the fallback for
+      // `sudo bash -c "…"`, where the wrapper is `sudo` and the shell is `bash`.
+      const shellBody = shellCommandArg(toks, 0) ?? shellCommandArg(toks, cwi);
       const evalBody = head === "eval" ? toks.slice(cwi + 1).join(" ") : null;
       const nested = shellBody ?? evalBody;
       if (nested !== null && nested !== "") {
@@ -790,8 +905,35 @@ export function isUnattended(
   }
 }
 
-/** The block's reason — names the incident, the flags, and the hatch. */
+/**
+ * The block's reason — names the incident, the remedy that actually applies, and
+ * the hatch.
+ *
+ * ⛔ THE REMEDY IS PER-RULE (review cycle 3, minor). For every Electron/Playwright
+ * shape the fix is the two Chromium switches. For `open <path>.app` it is NOT:
+ * `open` does not forward Chromium switches, and appending them to the `open`
+ * argv made `faked` true and ALLOWED the launch while the app received nothing —
+ * a remedy that inverts the gate. So that rule names only the escape hatch.
+ */
 export function blockReason(finding: LaunchFinding, recordPath: string): string {
+  if (finding.rule === "open") {
+    return [
+      `[gui-device-guard] 🚫 Blocked: this run opens a GUI app BUNDLE, which can take the REAL camera/microphone (#2249).`,
+      ``,
+      `  app: ${finding.app}`,
+      `  argv: ${finding.argv}`,
+      ``,
+      `On 2026-10-21 a lane's Electron app held AVCaptureDevice, so Meet said "camera in use"`,
+      `five minutes before a customer call — and killing the APP did not help, because the live`,
+      `LANE relaunched it. Only killing the lane released the devices.`,
+      ``,
+      `There is no fake-capture switch to add here: \`open\` does not forward Chromium switches,`,
+      `so the only ways past this refusal are`,
+      `  · run the bundle's test harness with ${FAKE_FLAGS_HINT}, or`,
+      `  · ${ALLOW_MEDIA}=1 for one deliberate real-device launch (still recorded).`,
+      `Launch ledger: ${recordPath}`,
+    ].join("\n");
+  }
   return [
     `[gui-device-guard] 🚫 Blocked: this run launches a host GUI app that can take the REAL camera/microphone, and it did not ask for a fake device (#2249).`,
     ``,

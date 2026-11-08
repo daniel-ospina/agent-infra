@@ -76,11 +76,26 @@ want every GUI launch regardless, drop the filter: `jq -c '.' …`.
 
 ## Wrappers and substitutions are RE-READ, not declared away
 
-`bash -c "<cmd>"`, `sh -c`, `sudo bash -lc`, `eval …`, and the body of `$( … )`
-or backticks are **recursed into** (bounded to 3 levels) — the command string is
-argv and can be classified. Playwright's `codegen` and `open` subcommands are
-headed **by default**, and a `PWDEBUG` exported in an earlier segment applies to
-the whole line.
+`bash -c "<cmd>"`, `sh -c`, `sudo bash -lc`, `flock … -c "<cmd>"`, `eval …`, and
+the body of `$( … )` or backticks are **recursed into** (bounded to 3 levels) — the
+command string is argv and can be classified. Playwright's `codegen` and `open`
+subcommands are headed **by default**, and a `PWDEBUG` exported in an earlier
+segment applies to the whole line.
+
+**Wrapper words are prefixes.** `setsid`, `caffeinate`, `arch`, `taskset`, `flock`,
+`script`, `chrt`, `unbuffer`, `prlimit`, `numactl`, `builtin`, `busybox` and
+`firejail` are recognised as prefixes, and a launch behind one is classified
+normally. Before that (`review cycle 3, F1`) they were read as the *command word*,
+so the launch behind them produced **no finding at all** — which is not "allow":
+the handler returns early on an empty list, so R1 did not record it either and the
+diagnosis half of #2249 vanished with the block.
+
+**Two spellings of one flag must not disagree.** Every value-taking option is
+closed in both spellings (`--user` as well as `-u`, `--signal=` as well as `-s`,
+`--prefix` as well as `-p`), `--flag=value` is treated as self-contained, and a
+fail-safe word scan covers a flag nobody has seen yet — restricted to a segment
+that began with a prefix word or an *exec*-style runner, so `rg electron .` and
+`npm install electron` (an install, not a launch) stay clean.
 
 This was review cycle 1's **F2**: those shapes were measured as `[]` (no finding)
 while the header claimed completeness, and `bash -c` is a form `AGENTS.md` hands
@@ -96,8 +111,11 @@ This is a residual list, not a completeness claim:
   cannot tell them from a plain `node` run.
 - A command assembled at **run time** is invisible: `find … -exec`, `xargs`, a
   `while read` loop that runs its input, and `node -e`/`python -c` bodies (only a
-  literal `-c`-style **shell** string is re-read). At the moment this hook sees
+  literal `-c`-style **command string** is re-read). At the moment this hook sees
   the command those are data, not argv.
+- A wrapper word that is **not** in the list above behaves like a plain command:
+  its own arguments are not scanned. The list is deliberate and finite; adding one
+  is a one-word edit, and the `flock`-style command-flag case is one table row.
 - A launch built from a shell variable (`APP=Electron; open -a "$APP"`) is
   recorded with the unexpanded name — the shape is kept, the string is not.
 - A process started by anything that is not `pi` (`cron`, systemd, a human
@@ -111,7 +129,7 @@ This is a residual list, not a completeness claim:
 ## Tests
 
 ```bash
-node extensions/gui-device-guard/test.mjs                    # 85 assertions, threat table L1–L15 + handler H1–H11
+node extensions/gui-device-guard/test.mjs                    # 101 assertions, threat table L1–L18 + handler H1–H12
 node extensions/gui-device-guard/test.mjs --classify 'npm exec electron .'
 ```
 
@@ -119,10 +137,12 @@ The suite loads the **real** `index.ts` through
 `../main-worktree-guard/module-load-hooks.mjs` and drives the **real registered
 `tool_call` handler** — the #744/#697 lesson: a suite that imports only a helper
 stays green while `index.ts` is broken and the guard is inert in every session.
-Mutations are pinned, each attributable to the row it is about: turning the
-Electron rule's `media` to `false` reds **29**; removing the wrapper recursion
-reds **5**; removing the comment stripper reds **1** (L11d); removing the
-fail-safe word scan reds **2** (L15j/L15k).
+Mutations are pinned, each attributable to the row it is about, all measured at
+ONE head: the Electron rule's `media` → `false` reds **39**; the wrapper recursion
+removed reds **6**; the wrapper WORDS removed reds **5**; the comment stripper
+removed reds **1** (L11d); the fail-safe word scan removed reds **3**; the
+quote-aware paren scan removed reds **1** (L17); honouring the fake switches on an
+`open` line reds **3** (L18b + H3b/H3c).
 
 ## Runbook
 

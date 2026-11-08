@@ -152,6 +152,53 @@ OUT="$(run_linux "$PROC_HOSTILE_MIC" "$TMP/nonexistent-video*" "$ASOUND")"
 grep -q 'microphone: HELD-BY(pid=200 comm=Meet/Helper device=/dev/snd/pcmC0D0c)' <<<"$OUT"
 check "F1d the microphone path survives a '|' in comm too" $? "$OUT"
 
+# ── F2 (review cycle 3) — identity is a DEVICE, not a PATH STRING ───────────
+# Comparing the fd target to the globbed path as TEXT made a holder reached
+# through an alias invisible: the census was COMPLETE, UNREADABLE stayed 0, and the
+# script answered **FREE over a device a process provably held** — the fail-open
+# cycle-1 F1 fixed for `comm`, reached by a different route.
+# The fixture uses real character devices (/dev/zero as the "camera", /dev/null
+# as a DIFFERENT device) because `test -c` and `readlink -f` are the reads under
+# test: a regular file would make the row pass without exercising them.
+CAM_ALIAS="$TMP/alias"
+mkdir -p "$CAM_ALIAS/dev/by-id" "$CAM_ALIAS/proc/100/fd" "$CAM_ALIAS/proc/200/fd" "$CAM_ALIAS/other"
+ln -s /dev/zero "$CAM_ALIAS/dev/video0"
+ln -s ../video0 "$CAM_ALIAS/dev/by-id/cam"
+ln -s /dev/null "$CAM_ALIAS/other/video9"
+ln -s "$CAM_ALIAS/dev/by-id/cam" "$CAM_ALIAS/proc/100/fd/7"   # the CAMERA, via an alias
+ln -s /dev/null "$CAM_ALIAS/proc/200/fd/1"                     # innocuous: /dev/null
+printf 'electron\n' > "$CAM_ALIAS/proc/100/comm"
+printf 'bash\n' > "$CAM_ALIAS/proc/200/comm"
+OUT="$(run_linux "$CAM_ALIAS/proc" "$CAM_ALIAS/dev/video*" "$ASOUND")"
+grep -q 'camera: HELD-BY(pid=100 comm=electron device='"$CAM_ALIAS"'/dev/video0 via='"$CAM_ALIAS"'/dev/by-id/cam' <<<"$OUT"
+check "F2a a holder reached through an ALIAS is reported HELD-BY on the real device" $? "$OUT"
+grep -qx 'camera: FREE' <<<"$OUT"
+check "F2b …and the camera is NOT reported FREE (the fail-open this row exists for)" \
+  "$([ "$?" -ne 0 ] && echo 0 || echo 1)" "$OUT"
+
+# F2c — an unattributable character device must ABSTAIN, never FREE. This is a
+# node whose basename matches the camera pattern but which is a DIFFERENT device:
+# a second node of the same major/minor, or a bind mount, looks exactly like this.
+UNATTR="$TMP/unattributable"
+mkdir -p "$UNATTR/dev" "$UNATTR/proc/300/fd" "$UNATTR/aliasdev"
+ln -s /dev/zero "$UNATTR/dev/video0"
+ln -s /dev/null "$UNATTR/aliasdev/video9"
+ln -s "$UNATTR/aliasdev/video9" "$UNATTR/proc/300/fd/7"
+printf 'weird\n' > "$UNATTR/proc/300/comm"
+OUT="$(run_linux "$UNATTR/proc" "$UNATTR/dev/video*" "$ASOUND")"
+grep -q 'camera: UNVERIFIABLE(character device(s) held that are NOT the globbed camera' <<<"$OUT"
+check "F2c an unattributable camera-shaped character device ⇒ UNVERIFIABLE, not FREE" $? "$OUT"
+# F2d — the twin: ordinary innocuous nodes (the DRM tree, /dev/null) must NOT
+# degrade a clean read to UNVERIFIABLE, or the verb becomes useless.
+INNOCUOUS="$TMP/innocuous"
+mkdir -p "$INNOCUOUS/dev" "$INNOCUOUS/proc/400/fd"
+ln -s /dev/zero "$INNOCUOUS/dev/video0"
+ln -s /dev/null "$INNOCUOUS/proc/400/fd/1"
+printf 'Xorg\n' > "$INNOCUOUS/proc/400/comm"
+OUT="$(run_linux "$INNOCUOUS/proc" "$INNOCUOUS/dev/video*" "$ASOUND")"
+grep -qx 'camera: FREE' <<<"$OUT"
+check "F2d an innocuous /dev/null holder still reads FREE (no blanket abstention)" $? "$OUT"
+
 # ── F3 (review cycle 1) — `--ancestry --json` must survive a multi-line argv ──
 # The lane root's argv IS multi-line: `pi -p "<multi-line brief>"`. `json_str`
 # used to strip the control range and escape TAB only, so a literal LF passed

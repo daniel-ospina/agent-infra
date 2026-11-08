@@ -121,6 +121,43 @@ const ROWS = [
   // value-taking flag is skipped ONE word and the launch is never classified.
   ["L15j an UNKNOWN sudo flag (fail-safe word scan)", "sudo --some-future-flag value electron .", 1, "electron", true],
   ["L15k an UNKNOWN npm exec flag (fail-safe word scan)", "npm exec --some-future-flag value electron .", 1, "electron", true],
+  // ── L16 (review cycle 3, F1) — an UNKNOWN WRAPPER WORD must not hide the
+  //     launch. Every row was `[]` before: not "allow" but a silent SKIP, which
+  //     also lost the R1 ledger row (the handler returns early on an empty list),
+  //     so the diagnosis half of #2249 vanished with the block.
+  ["L16a setsid", "setsid npm exec electron .", 1, "electron", true],
+  ["L16b caffeinate", "caffeinate -i npm exec electron .", 1, "electron", true],
+  ["L16c arch", "arch -arm64 npm exec electron .", 1, "electron", true],
+  ["L16d taskset", "taskset -c 0 npm exec electron .", 1, "electron", true],
+  ["L16e flock -c <string>", 'flock /tmp/l -c "npm exec electron ."', 1, "electron", true],
+  ["L16f script (pass-through wrapper)", "script -q /dev/null npm exec electron .", 1, "electron", true],
+  ["L16g a BRACKETED backgrounded launch", "(npm exec electron . &)", 1, "electron", true],
+  // ── L17 (review cycle 3, F3) — a `)` inside a QUOTED string must not truncate
+  //     the substitution body: this command really does launch Electron.
+  ["L17 a quoted ')' inside a substitution", 'echo "$(echo ")"; npm exec electron .)"', 1, "electron", true],
+  // ── L18 — `open` does not forward Chromium switches, so a line that carries
+  //     them is NOT a mitigation (review cycle 3, minor: it used to allow).
+  ["L18 fake switches on an `open` line are not a mitigation",
+    "open ./Build/DMeer.app --use-fake-device-for-media-stream --use-fake-ui-for-media-stream",
+    1, "open", true],
+  // ── L19 (review cycle 3, F1's CLASS) — a wrapper word the table has never
+  //     heard of must not hide a launch. L16 named a few instances; these rows pin
+  //     the STRUCTURAL rule that closes the rest: a package-runner anywhere in the
+  //     segment is a launch shape whatever heads it (`runnerNested`), and a `-c`
+  //     wrapper that consumes its whole segment (`su -c "…"`, cwi === -1) is
+  //     still re-read. Every row was `[]` — no block AND no ledger row — before.
+  ["L19a xvfb-run + runner (a cell's headed-display idiom)", "xvfb-run -a npm exec electron .", 1, "electron", true],
+  ["L19b strace + runner", "strace -f npm exec electron .", 1, "electron", true],
+  ["L19c su -c <string> (the wrapper consumes the whole segment)", 'su -c "npm exec electron ."', 1, "electron", true],
+  ["L19d xvfb-run wrapping a BARE launch word", "xvfb-run -a electron .", 1, "electron", true],
+  ["L19e gdb --args wrapping a bare launch word", "gdb --args electron .", 1, "electron", true],
+  ["L19f xvfb-run + npx playwright --headed", "xvfb-run npx playwright test --headed", 1, "playwright", true],
+  ["L19g runuser -c <string>", 'runuser -u x -c "npm exec electron ."', 1, "electron", true],
+  // L19h/L19i name NO wrapper at all — they are the rows that pin the structural
+  // rule itself (a runner anywhere in the segment), so deleting that rule cannot
+  // leave the suite green. Any future wrapper word behaves like these.
+  ["L19h an UNLISTED wrapper word + runner (structural rule)", "eatmydata npm exec electron .", 1, "electron", true],
+  ["L19i a SECOND unlisted wrapper word + runner", "proxychains4 npm exec electron .", 1, "electron", true],
   // ── ALLOW rows: none of these may be refused ──────────────────────────────
   ["A1 plain grep", "grep -rn TODO src/", 0, null, false],
   ["A2 an ELECTRON MENTION inside quotes is not a launch", 'echo "npm exec electron ."', 0, null, false],
@@ -141,6 +178,18 @@ const ROWS = [
   ["A13 npm install electron is an INSTALL, not a launch", "npm install electron", 0, null, false],
   ["A14 npm exec --prefix= is the self-contained spelling", "npm exec --prefix=apps/web electron .", 1, "electron", true],
   ["A15 a plain argument naming electron stays clean", "rg electron .", 0, null, false],
+  // A17–A20 are the twins of L16/L17: widening the wrapper set must not make a
+  // benign wrapper or a benign quoted paren fire.
+  ["A17 caffeinate wrapping ls", "caffeinate -i ls", 0, null, false],
+  ["A18 setsid wrapping true", "setsid true", 0, null, false],
+  ["A19 a bracketed backgrounded ls", "(ls &)", 0, null, false],
+  ["A20 a quoted ')' in a benign substitution", 'echo "$(ls ")")"', 0, null, false],
+  // A21–A23 are the twins of L19: the runner-wide scan must not turn a plain
+  // search, a benign wrapper, or a benign `-c` body into a refusal.
+  ["A21 a search whose pattern NAMES the launch stays clean", "rg -n electron src/", 0, null, false],
+  ["A22 xvfb-run wrapping ls", "xvfb-run -a ls", 0, null, false],
+  ["A23 su -c with a benign body", 'su -c "ls"', 0, null, false],
+  ["A24 an unlisted wrapper around a NON-launch", "eatmydata ls -la", 0, null, false],
   ["A16 a comment is not argv", 'electron . # --use-fake-device-for-media-stream --use-fake-ui-for-media-stream', 1, "electron", true],
 ];
 
@@ -179,6 +228,17 @@ check(
 check(
   "L11c a fake switch in ANOTHER segment does not cover the launch",
   classify(`electron . && echo ${FAKE}`)[0].faked === false,
+);
+// L18b — `open` cannot forward Chromium switches, so their presence must NOT be
+// read as a mitigation (review cycle 3, minor: measured `faked: true`, i.e. the
+// remedy inverted the gate). Asserted on the FIELD, because the classify table
+// above only pins `media`.
+check(
+  "L18b fake switches on an `open` line leave faked === false",
+  (() => {
+    const f = classify(`open ./Build/DMeer.app ${FAKE}`);
+    return f.length === 1 && f[0].faked === false && f[0].media === true;
+  })(),
 );
 // L12 — a launch embedded after a separator is still a launch.
 check(
@@ -236,6 +296,23 @@ if (handler) {
       JSON.stringify(r).slice(0, 260),
     );
   }
+
+  // ── H3b (review cycle 3, minor) — the `open` remedy cannot be carried by
+  //         switches, so appending them must NOT unblock the launch.
+  resetLedger();
+  const openFaked = await drive(`open ./Build/DMeer.app ${FAKE}`);
+  check(
+    "H3b an `open` launch WITH the fake switches appended is STILL blocked",
+    Boolean(openFaked?.block),
+    JSON.stringify(openFaked ?? null).slice(0, 160),
+  );
+  check(
+    "H3c …and its reason offers the ALLOW_MEDIA hatch, not a switch `open` cannot forward",
+    typeof openFaked?.reason === "string" &&
+      openFaked.reason.includes("GUI_DEVICE_GUARD_ALLOW_MEDIA") &&
+      openFaked.reason.includes("does not forward"),
+    String(openFaked?.reason ?? "").slice(0, 200),
+  );
 
   // ── H4 — a RECORD-ONLY launch: the ledger keeps it, the tool call proceeds ─
   resetLedger();

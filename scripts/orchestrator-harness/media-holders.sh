@@ -216,6 +216,15 @@ EOF
   return 0
 }
 
+# resolve_path <path> — a portable realpath. `readlink -f` is a GNU extension
+# (absent on macOS, and the portability checker flags it), and `cd … && pwd -P`
+# resolves only the DIRECTORY, not a trailing symlink — which is the hop this
+# needs. python3 ships on both platforms and `os.path.realpath` is exact.
+resolve_path() {
+  python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$1" 2>/dev/null \
+    || printf '%s' "$1"
+}
+
 # pid_comm <pid> — a DISPLAY-only process name, stripped of every byte that could
 # re-frame a census record or produce a second line ("|", LF, CR, tab, other
 # controls). `/proc/<pid>/comm` is attacker-influenced-by-the-process, so it is
@@ -232,24 +241,72 @@ pid_comm() {
 }
 
 linux_camera() {
-  local devs dev found=0
+  local devs dev found=0 pid target real devreal base suspicious=""
   devs="$(ls -d $MH_V4L_GLOB 2>/dev/null)"
   if [ -z "$devs" ]; then
     emit_device camera ABSENT "no video device (no $MH_V4L_GLOB)"
     return 0
   fi
+  base="${MH_V4L_GLOB##*/}"      # e.g. `video*` — the NAME pattern we are looking for
   linux_fd_census
-  for dev in $devs; do
-    while IFS='|' read -r pid target; do
-      [ -n "$pid" ] || continue
-      [ "$target" = "$dev" ] || continue
-      emit_device camera HELD-BY "pid=$pid comm=$(pid_comm "$pid") device=$dev"
-      found=1
-    done <<EOF
+  while IFS='|' read -r pid target; do
+    [ -n "${pid:-}" ] || continue
+    # ── F2 (review cycle 3): identity is a DEVICE, not a STRING ───────────────
+    # Comparing the fd target to the globbed path as TEXT meant a holder reached
+    # through an alias was invisible: the census was COMPLETE, UNREADABLE stayed
+    # 0, and the script answered **FREE over a device the process provably held**.
+    # `sudo fuser -v /dev/video0` and `sudo lsof /dev/video0` — the canonical
+    # reads — identify holders by device identity, not by path text.
+    case "$target" in
+      *"/$base"|*"/$base"[0-9]*) ;;   # a name-matching path: fall through to resolve
+    esac
+    # 1. exact path match
+    for dev in $devs; do
+      if [ "$target" = "$dev" ]; then
+        emit_device camera HELD-BY "pid=$pid comm=$(pid_comm "$pid") device=$dev"
+        found=1
+      fi
+    done
+    [ "$found" -eq 1 ] && continue
+    # 2. an ALIAS of a globbed device (udev `by-id`/`by-path`, a symlinked node):
+    #    resolve the target and compare the RESOLVED path to the device list.
+    if [ -c "$target" ]; then
+      real="$(resolve_path "$target")"
+      for dev in $devs; do
+        # BOTH SIDES RESOLVED: the holder may name an alias, and the GLOBBED path
+        # may itself be a symlinked node (udev ships `by-id`/`by-path` links), so a
+        # one-sided `readlink` would compare a resolved path to an unresolved one.
+        devreal="$(resolve_path "$dev")"
+        if [ "$real" = "$devreal" ]; then
+          emit_device camera HELD-BY "pid=$pid comm=$(pid_comm "$pid") device=$dev via=$target"
+          found=1
+          break
+        fi
+      done
+      [ "$found" -eq 1 ] && continue
+      # 3. a character device we CANNOT attribute: name-matching (a second node of
+      #    the same major/minor) or outside /dev (a bind mount of the camera into a
+      #    containerised cell). This is what stops a silent FREE — we say we cannot
+      #    tell instead of inventing one. Innocuous nodes (/dev/null, the DRM tree,
+      #    ttys) never reach here because their basename does not match the pattern
+      #    and their path IS under /dev.
+      case "${target##*/}" in
+        $base|$base[0-9]*) suspicious="$suspicious $target" ;;
+        *)
+          case "$target" in
+            /dev/*) ;;
+            *) suspicious="$suspicious $target" ;;
+          esac ;;
+      esac
+    fi
+  done <<EOF
 $(printf '%s' "$HOLDERS")
 EOF
-  done
   [ "$found" -eq 1 ] && return 0
+  if [ -n "$suspicious" ]; then
+    emit_device camera UNVERIFIABLE "character device(s) held that are NOT the globbed camera(s):$suspicious — an alias, a bind mount or a same-major/minor node can hide the camera, so no free claim"
+    return 0
+  fi
   if [ "$UNREADABLE" -gt 0 ]; then
     emit_device camera UNVERIFIABLE "partial: $UNREADABLE process fd dir(s) unreadable in $MH_PROC — no free claim from a partial census"
     return 0

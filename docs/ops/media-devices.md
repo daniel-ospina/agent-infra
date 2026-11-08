@@ -113,14 +113,18 @@ a reason:
 
 | verdict | meaning |
 |---|---|
-| `HELD-BY(pid=… comm=… device=…)` | a reader **proved** an open handle |
+| `HELD-BY(pid=… comm=… device=…)` | a reader **proved** an open handle (an alias is resolved and reported as `via=`) |
 | `FREE` | the whole holder population was enumerated and no holder exists |
 | `ABSENT(<evidence>)` | the hardware is not present |
 | `UNVERIFIABLE(<why>)` | the read did not happen. **Never** read as "free" |
 
 ⛔ `FREE` is the only answer that rests on absence, and it may rest only on a
 **complete** census. A `/proc` scan that could not read another user's fd
-directory yields `UNVERIFIABLE(partial: N unreadable)`. The exit code is part of
+directory yields `UNVERIFIABLE(partial: N unreadable)` — and so does a process
+holding a camera-shaped character device that is **not** one of the globbed nodes
+(an alias, a bind mount, a second node with the same major/minor). Holder identity
+is compared as a **device**, not as a path string: the target and the globbed node
+are both resolved (`readlink -f`) before they are compared. The exit code is part of
 the answer: `2` means **cannot verify**, which is not the same as "nothing to
 report". Silence is not an acceptable answer to #2249; "I cannot tell you" is.
 
