@@ -420,19 +420,50 @@ farm_drift_rows() {
     printf '%s\n' "$1" | awk -F'|' '$NF ~ /(^|[[:space:]])(STALE|UNSOURCED|NOT-EXECUTABLE|DECLARED-BUT-ABSENT)[[:space:]]*$/'
 }
 
-# The instrument's own drift TOTAL, from its summary, and ONLY when all three labels parse — the same
-# proof the drift arm uses. Prints NOTHING when a label is absent or the summary is unparsable, so
-# "cannot prove" never degenerates to 0. Anchored on `<n> stale` because a per-file ROW can contain the
-# word DRIFT (measured: `DRIFT-log.txt | a | b | STALE` was taken as the summary, so a printed summary
-# two lines later was reported as ABSENT — `farm_n=unparsed` and a false reason).
+# The instrument's own drift TOTAL, from its VERDICT LINE, and ONLY when the proof is CLOSED — the same
+# proof the drift arm uses. Prints NOTHING when a label is absent, the line is not the verdict, or the
+# line carries a class this pass does not count, so "cannot prove" never degenerates to 0 and never
+# silently shrinks to the classes it knows.
+# ⛔ ANCHORED ON "NO PIPE ON THE LINE", NOT ON THE WORD (review round 31, measured twice): a per-file
+# ROW's first field is its PATH, so `grep -m1 '[0-9]* stale'` took a row for a file literally named
+# `3 stale.py` as the summary and reported a complete, parsable summary as ABSENT (over-block plus a
+# false reason: "no COMPLETE, parsable summary"). A ROW always carries its separators, a summary line
+# never does — the same invariant `FARM_VERDICT0` uses one level over — and it is the weaker anchor on
+# purpose: a lagging farmed copy may print its summary without the `PROG: DRIFT — ` prefix (or as
+# `PROG: summary — …`), and those lines must still prove or refute the extraction.
+# ⛔ AND THE VOCABULARY IS CLOSED (review round 31, measured): the total was built from the labels this
+# pass knows (`stale` + `declared-but-absent` + `unsourced`), so a report carrying a FOURTH class
+# (`3 not-landed`) excluded those rows from the numerator AND the denominator — `2 == 2` then took the
+# COMPLETE arm and certified "every one named" over a list that dropped three files the instrument
+# reported. An unrecognised `<n> <label>` component means the proof is ABSENT, exactly like an
+# unparsable one; the bookkeeping labels the instrument prints alongside are allow-listed by name.
 farm_sum_count() {
-    local _l="" _a="" _b="" _c=""
-    _l="$(printf '%s\n' "$1" | grep -m1 '[0-9][0-9]* stale' || true)"
+    local _l="" _a="" _b="" _c="" _bad=""
+    _l="$(printf '%s\n' "$1" | grep -E '^[^|]*$' | grep -m1 '[0-9][0-9]* stale' || true)"
     [ -n "$_l" ] || return 0
-    _a="$(printf '%s' "$_l" | sed -n 's/.*[^0-9]\([0-9][0-9]*\) stale.*/\1/p')"
-    _b="$(printf '%s' "$_l" | sed -n 's/.*[^0-9]\([0-9][0-9]*\) declared-but-absent.*/\1/p')"
-    _c="$(printf '%s' "$_l" | sed -n 's/.*[^0-9]\([0-9][0-9]*\) unsourced.*/\1/p')"
-    { [ -n "$_a" ] && [ -n "$_b" ] && [ -n "$_c" ]; } || return 0
+    # ⛔ THE COUNT MAY START THE LINE (review round 31, measured: the label seds required a NON-DIGIT
+    # before the number, so a copy that prints its summary without the `PROG: DRIFT — ` prefix — the
+    # count at column 1 — was reported as having printed no parsable summary at all, an over-block with a
+    # false reason over a summary that was printed and does parse). Two expressions per label: the
+    # start-of-line form and the preceded-by-anything form, in that order.
+    _a="$(printf '%s' "$_l" | sed -n -e 's/^\([0-9][0-9]*\) stale.*/\1/p' \
+                                     -e 's/.*[^0-9]\([0-9][0-9]*\) stale.*/\1/p')"
+    _b="$(printf '%s' "$_l" | sed -n -e 's/^\([0-9][0-9]*\) declared-but-absent.*/\1/p' \
+                                     -e 's/.*[^0-9]\([0-9][0-9]*\) declared-but-absent.*/\1/p')"
+    _c="$(printf '%s' "$_l" | sed -n -e 's/^\([0-9][0-9]*\) unsourced.*/\1/p' \
+                                     -e 's/.*[^0-9]\([0-9][0-9]*\) unsourced.*/\1/p')"
+    # ⛔ `_a` IS NOT A SEPARATE GATE. The pre-filter above ALREADY matched `<n> stale`, so a second test on
+    # the same occurrence can never fail — it was a guard whose condition could not be false (the
+    # "inert enforcer" class this file's own rules forbid). `_b`/`_c` are genuinely optional in the
+    # instrument's output, so they still gate the proof.
+    [ -n "$_a" ] || return 0
+    { [ -n "$_b" ] && [ -n "$_c" ]; } || return 0
+    _bad="$(printf '%s\n' "$_l" \
+        | grep -oE '[0-9][0-9]* [A-Za-z][A-Za-z-]*' \
+        | awk '{ print tolower($2) }' \
+        | grep -vxE 'stale|declared-but-absent|unsourced|farm-declared|outside|deployed|sourced|matching' \
+        || true)"
+    [ -n "$_bad" ] && return 0
     printf '%s' "$(( _a + _b + _c ))"
 }
 

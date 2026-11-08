@@ -224,7 +224,13 @@ vocabulary that names a healthy `ok`/`LOCAL`/`SYMLINK` row), when **no readable 
 all**, and when **any of the three labels did not parse** (an instrument that says `2 missing` instead
 of `2 declared-but-absent` would otherwise reduce the proof to the stale count alone, and certify a
 short list as complete) — an unprovable extraction is not a complete one, so "cannot prove it" takes
-the same door as "proved it wrong". Unproven, the artifact carries the instrument's **RAW output** verbatim, with
+the same door as "proved it wrong". The proof is also **closed**: a summary that carries a `<n> <label>`
+component this pass does not count (a fourth class, `3 not-landed`) makes it unprovable, because the sum
+is built from the three labels it knows — an unread fourth class would leave those rows out of numerator
+AND denominator and let `2 == 2` certify a list that dropped them. The summary is read from a line with
+**no pipe on it** (a row always carries its separators, so a farm file named `3 stale.py` is never taken
+for the summary), and it need not carry the instrument's `PROG: DRIFT — ` prefix: a lagging farmed copy
+that prints the same three labels on its own summary line still proves or refutes the extraction. Unproven, the artifact carries the instrument's **RAW output** verbatim, with
 `n=unparsed` in its header. The DRIFT is still red and still recorded. The names are wherever the
 instrument printed them — in that file whenever it published, and in this run's own journal excerpt (at
 most the first 12 lines: the rows this pass MATCHED when it matched any, the instrument's own output
@@ -497,7 +503,7 @@ checkout can use the documented hatch. The same interaction is recorded for
 
 ## Tests
 
-`scripts/harness-apply-timer.test.sh` — 548 assertions, run by the
+`scripts/harness-apply-timer.test.sh` — 573 assertions, run by the
 `harness-apply-timer` shard of `run-bash-shards.sh`:
 
 | | |
