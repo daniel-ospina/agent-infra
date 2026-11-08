@@ -426,12 +426,26 @@ exec "$GIT_WRAP_REAL" "$@"
 EOS
 chmod +x "$FIX/shim/git"
 git branch fix/tlist-1
+# A LIVE worktree elsewhere holds the branch: that is what makes the CAS guard's removal a real
+# fail-open (an unborn branch for a live lane), not a cosmetic difference.
+git worktree add -q "$FIX/wt-live" fix/tlist-1
 $RW add --branch fix/tlist-1 --worktree "$FIX/gone-four" --dispatch d-tlist --ts 2026-08-01T00:00:00Z >/dev/null
 OUT="$(PATH="$FIX/shim:$PATH" GIT_WRAP_REAL="$REAL_GIT" GIT_WRAP_REPO="$REPO" $SCAN --apply 2>&1 || true)"
 git show-ref --verify --quiet refs/heads/fix/tlist-1 && ok "an unreadable worktree list refuses the ref delete" || bad "the ref was deleted without establishing it was not checked out"
 assert_contains "$OUT" "worktree list could not be read" "the unreadable-list refusal is named"
 assert_eq "$(wc -l < "$WORKTREES_RECORD" | tr -d ' ')" "1" "the record is kept when the list is unreadable"
+# ⛔ AND THE GUARD ITSELF NEEDS ITS OWN ROW (round-10 finding). Since round-7 F2 an absent dir + an
+# unreadable list classifies DIRTY, so a PLAIN --apply never reaches `delete_branch_cas` — the three
+# assertions above are then satisfied by the CLASSIFIER's sentence, and deleting the CAS guard left
+# the suite fully green while `--apply --force-dirty` deleted a live lane's ref. The --force-dirty
+# leg reaches the CAS and asserts ITS OWN sentence.
+OUT="$(PATH="$FIX/shim:$PATH" GIT_WRAP_REAL="$REAL_GIT" GIT_WRAP_REPO="$REPO" $SCAN --apply --force-dirty 2>&1 || true)"
+git show-ref --verify --quiet refs/heads/fix/tlist-1 && ok "the CAS itself refuses when the worktree list is unreadable" || bad "the CAS deleted a ref it could not prove was not checked out (live lane left unborn)"
+assert_contains "$OUT" "not checked out anywhere" "the CAS names ITS OWN reason, not the classifier's"
+( cd "$FIX/wt-live" && git status --porcelain >/dev/null 2>&1 ) && ok "the live lane holding that branch is not left unborn" || bad "the live lane was left on an unborn branch"
+assert_eq "$(wc -l < "$WORKTREES_RECORD" | tr -d ' ')" "1" "the record survives the CAS refusal"
 $RW done --dispatch d-tlist >/dev/null
+git worktree remove --force "$FIX/wt-live" >/dev/null 2>&1 || true
 git branch -D fix/tlist-1 >/dev/null 2>&1 || true
 
 
