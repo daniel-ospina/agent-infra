@@ -17,7 +17,8 @@ RECOVERY-ONLY.
 
 > ⚠️ Measurement note: `git merge-base --is-ancestor 26ad39a33 origin/main` returns **1 in this
 > worktree** and is WRONG here — the clone is SHALLOW (`git rev-parse --is-shallow-repository` →
-> `true`, 50 commits reachable from `origin/main`), so ancestry cannot be resolved locally and
+> `true`; the boundary in `$(git rev-parse --git-path shallow)` includes `6580850cc`), so ancestry
+> cannot be resolved locally and
 > `git log -S` names the shallow boundary commit. Ask the API (`compare/<sha>...main`), not the shallow
 > clone.
 
@@ -183,7 +184,7 @@ marker is deliberately NOT `clean`; the residual class below is named rather tha
 | 1 | fresh-context plan reviewer | 6 (2×P1, 4×P2) | all applied — R5's false "readers" claim, "Proves it: typecheck" for an unenforced union, pin count, a citation that is not in `origin/main`, undefined ACs + unjustified remedy rewrite, the out-of-vocabulary marker |
 | 2 | fresh-context plan reviewer | 8 (2×P1, 6×P2) | all applied — the reader inventory corrected in the OTHER direction (test helpers do read the log), the `Set`/`sort` refinement restated as untested, the `#1780` citation rewritten (that rewrite was itself wrong — see cycle 4), the stale header enumeration stated as stale, `session_cwd` attribution corrected, "message-only" → "inspection-only", the #1265 measurement corrected (the FIRST of three dead children followed the `cd` remedy — not three), and the inverted prior pin counted |
 | 3 | fresh-context verification of the cycle-2 fixes (the deep-fix round the cap requires) | 7 (2×P1, 5×P2) | applied — R3's "three children" corrected; step 2's "the `Set` is untested" replaced with what the tests now DO discriminate (`03227c5a2` — `f192265b3` before the branch was rebased onto `main`; patch-id `5e9bcada`, identical — added worktree C and the B→C→B alternation; only the `.sort()` remains untested); the reader inventory corrected (twice, see cycle 4); the acceptance line scoped to the NAMED residual; the PR body's two falsehoods corrected plus the `[ADVERSARIAL-BOUND]` disclosure added |
-| 4 | fresh-context verification of the cycle-3 fixes | 4 (1×P1, 3×P2) | applied — **the cycle-2/3 `#1780` rewrite was FALSE and is reverted**: `26ad39a33` IS an ancestor of `origin/main` (`compare/26ad39a33...main` → `behind_by: 0`); the local `--is-ancestor` result and the `git log -S` attribution were SHALLOW-CLONE artifacts (50 commits reachable; `6580850cc` is the boundary commit). The Wiring table's reader row was a third instance still carrying the old inventory. The `gate_recovery` comment now discriminates by ROOT IDENTITY, not call site (three call sites emit it, two of them live). The PR body's "already reads"/R5-covered claims corrected. |
+| 4 | fresh-context verification of the cycle-3 fixes | 4 (1×P1, 3×P2) | applied — **the cycle-2/3 `#1780` rewrite was FALSE and is reverted**: `26ad39a33` IS an ancestor of `origin/main` (`compare/26ad39a33...main` → `behind_by: 0`); the local `--is-ancestor` result and the `git log -S` attribution were SHALLOW-CLONE artifacts (the shallow boundary is `6580850cc` — read it from `$(git rev-parse --git-path shallow)`, which a fetch cannot move, rather than from a commit COUNT, which drifts with every `origin/main` advance). The Wiring table's reader row was a third instance still carrying the old inventory. The `gate_recovery` comment now discriminates by ROOT IDENTITY, not call site (three call sites emit it, two of them live). The PR body's "already reads"/R5-covered claims corrected. |
 
 The same head was code-reviewed by a separate fresh context, which found one P2 in this diff: the
 `gate_recovery` comment in `audit-log.ts` described the inspection pairing as unconditional, when the
