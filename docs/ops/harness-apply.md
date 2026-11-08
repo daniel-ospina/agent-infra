@@ -115,7 +115,10 @@ dirty=0
 pin=ce987bb2c1de
 pin_tree=ce987bb2c1de
 drift=clean:current          <- the deployed-drift reading, `<state>:<token>` (`executes:<dir>` is the red one)
-farm_rows=none               <- `none` (farm matched — no list written by this pass, so any list on disk is not today's answer), `not-graded` (NO USABLE grade — see `action=`; on a farmless SKIPPED host `action=none`, so there `farm_rows=` itself is the signal), `unwritable`, or the FILE naming every drifting file
+farm_rows=none               <- `none` (farm matched — no list written by this pass, so any list on disk is not today's answer), `not-graded` (NO USABLE grade — see `action=`; TWO arms write `action=none`: a farmless host and a
+deliberately DISARMED check (`HARNESS_APPLY_FARM_CHECK=0`), so `action=` separates neither from a
+clean no-op — `farm_rows=` is the signal, and only the journal's `farm: SKIPPED` line says which),
+`unwritable`, or the FILE naming every drifting file
 farm_n=0                     <- rows the farm grade reported: a COUNT when graded (0 when the farm matched), `not-graded` when no grade was produced, `unparsed` when a RED grade's rows did not match this pass's extractor (the artifact's header reads `n=unparsed`; `0` would read as "nothing drifted")
 preserved=none
 remedy=none                  <- the ACTION for a refusal, never truncated (`detail=` is bounded at 240)
@@ -154,8 +157,10 @@ overlapping an operator's hand-run can leave pass A's record naming pass A's row
 that path holds pass B's. The write is atomic (a reader never sees half a list, and no pass ever
 removes another's file), but it is **not per-run**, and the header is what you can decide with:
 
-- the header's `ref=` must equal the record's `ref=`, and the header's `dest=` the farm the record
-graded;
+- the header's `ref=` and `dest=` are the **ref name and farm path this record's `detail=` quotes** —
+  `detail=` begins `farm: DRIFT — <dest> is NOT the code <ref> ships`, so the pair must appear there
+  verbatim (they are the same two variables; the record has NO `dest=` field of its own, and the
+  record's `ref=` is the RESOLVED SHORT SHA, a different value on purpose — do not compare those);
 - the header's UTC must **not be later than** the record's `at=` (the artifact is published first,
 so a header timestamp *after* the record's own is the one cheap impossibility — compare same-format
 strings, both UTC, NOT the header's UTC against the record's `epoch=`);
@@ -171,13 +176,14 @@ row while the instrument still reported drift — the installed `check-farm-drif
 row vocabulary this pass does not know (a farm that lags the ref). The artifact then carries the
 instrument's **RAW output** verbatim and its header reads `n=unparsed`; the DRIFT is still red and
 still recorded. The names are wherever the instrument printed them — in that file if it printed
-rows, in this run's own output if it printed none — so the record says "published verbatim" and
-never "every one named".
+rows, in this run's own journal excerpt (at most the first 12 lines) if it printed none — so the
+record says "published verbatim" and never "every one named".
 
 `farm_rows=unwritable` means the rows write failed **while the record write still succeeded** — the
 drift is still red, `farm_n` still carries the count it had (or `unparsed` when the extraction parsed
-nothing), but **no artifact is written**, so the journal says so in as many words and rows 13..N are
-named nowhere durable. (A state dir that is unwritable for the record too leaves the PREVIOUS record
+nothing), but **no artifact is written**, so the journal says so in as many words and the rows past
+the 12-line excerpt are named nowhere durable. (A state dir that is unwritable for the record too
+leaves the PREVIOUS record
 in place: staleness, not a field, is that signal.)
 
 ⛔ `deployed` EXISTS BECAUSE THE CHECKOUT IS NOT THE DEPLOYMENT. A pin-per-commit cell

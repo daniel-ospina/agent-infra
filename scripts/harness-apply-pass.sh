@@ -342,9 +342,10 @@ write_record() { # <ok> <rc>
         # is not today's answer), `unwritable` (the rows write failed while this record still wrote:
         # said out loud rather than silently leaving 18 files named nowhere) or `not-graded` (NO USABLE
         # GRADE was produced: the switch is off, there was no farm to grade, a refusal exited first, or
-        # the instrument's rc was unreadable — `action=` says which, EXCEPT on the farmless SKIPPED arm
-        # where it is `none`; there `farm_rows=` itself is the signal, because a farmless host must not
-        # read like a pass that graded and found nothing to name).
+        # the instrument's rc was unreadable). ⛔ `action=` DOES NOT NAME ALL OF THEM: the DISARMED arm
+        # and the farmless SKIPPED arm both write `action=none`, which is also what a graded-clean pass
+        # writes — there `farm_rows=` itself is the signal, and only the journal's `farm: SKIPPED` line
+        # says which of the two it was.
         printf 'farm_rows=%s\n' "$REC_FARM_ROWS"
         printf 'farm_n=%s\n' "$REC_FARM_NROWS"
         printf 'preserved=%s\n' "${PRESERVED_DIR:-none}"
@@ -1413,7 +1414,7 @@ if [ "$FARM_CHECK_ON" = "1" ]; then
                 HDR_NOTE="n=$FARM_NROWS (the rows below are EXACTLY this run; farm_rows= in harness-apply.status is the currency indicator)"
                 if [ "$FARM_NROWS" -eq 0 ]; then
                     FARM_ROWS_RAW=1; PERSIST_BODY="$FARM_OUT"
-                    HDR_NOTE="n=unparsed (NO row matched this pass's extractor — the instrument's RAW output follows verbatim; farm_n=0 says the count is UNKNOWN, not that nothing drifted)"
+                    HDR_NOTE="n=unparsed (NO row matched this pass's extractor — the instrument's RAW output follows verbatim; farm_n=unparsed says the count is UNKNOWN, not that nothing drifted)"
                 fi
                 # ⛔ EVERY ROW IS PERSISTED, NOT JUST THE EXCERPT (tortoise#10114 arm 2). The journal
                 # keeps a bounded human view, but the durable answer to "which files have drifted" is
@@ -1473,7 +1474,7 @@ if [ "$FARM_CHECK_ON" = "1" ]; then
                     if [ "$FARM_ROWS_OK" = 1 ]; then
                         log_line "farm:   no row matched this pass's extractor — the instrument's RAW output above is published in $REC_FARM_ROWS"
                     else
-                        log_line "farm:   no row matched this pass's extractor, and the RAW output could not be persisted ($REC_FARM_ROWS) — the files it names are in this run's own output above"
+                        log_line "farm:   no row matched this pass's extractor, and the RAW output could not be persisted ($REC_FARM_ROWS) — only the line(s) excerpted above are in this run's output, and any past the 12-line excerpt are named nowhere"
                     fi
                 fi
                 if [ "$FARM_NROWS" -gt 12 ]; then
@@ -1496,7 +1497,7 @@ if [ "$FARM_CHECK_ON" = "1" ]; then
                 elif [ "$FARM_ROWS_RAW" = 1 ]; then
                     FARM_ROW_SENTENCE="no row matched this pass's extractor and its RAW output could not be persisted ($REC_FARM_ROWS)"
                 else
-                    FARM_ROW_SENTENCE="${FARM_NROWS} row(s) above, and the full list could not be persisted ($REC_FARM_ROWS)"
+                    FARM_ROW_SENTENCE="${FARM_NROWS} row(s) from the instrument, and the full list could not be persisted ($REC_FARM_ROWS)"
                 fi
                 finish 0 24 "farm: DRIFT — $FARM_DEST is NOT the code $REF ships ($FARM_ROW_SENTENCE, with the instrument's own remedy — a stale copy, a layout move and an unsourced file do NOT all have the same fix)" ;;
             *)
