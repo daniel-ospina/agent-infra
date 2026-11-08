@@ -3487,8 +3487,8 @@ function _worktreeDiscardBlock(command: string, hatchActive = false): string | n
   // DOUBLE-APPLIED the cd and false-blocked `cd .. && bash noop.sh && git
   // checkout -- <clean file>`, reviewer P1). `writeCwd` (redirect targets) IS
   // the execution cwd.
-  const sets: { discs: ReturnType<typeof extractWorkingTreeDiscards>; baseCwd: string; writeCwd: string; script: string | null }[] = [
-    { discs: direct, baseCwd: sessionCwd, writeCwd: execCwd, script: null },
+  const sets: { discs: ReturnType<typeof extractWorkingTreeDiscards>; baseCwd: string; writeCwd: string; script: string | null; digest: string | null }[] = [
+    { discs: direct, baseCwd: sessionCwd, writeCwd: execCwd, script: null, digest: null },
   ];
   try {
     const seen = new Set<string>();
@@ -3602,7 +3602,7 @@ function _worktreeDiscardBlock(command: string, hatchActive = false): string | n
       // `git apply -R p.patch` and `git apply --reverse p.patch`.
       const disc = extractWorkingTreeDiscards(content) ?? [];
       if (disc.length) {
-        sets.push({ discs: disc, baseCwd: execCwd, writeCwd: execCwd, script: p });
+        sets.push({ discs: disc, baseCwd: execCwd, writeCwd: execCwd, script: p, digest: _sha256OfBody(content) });
       }
       // ⛔ A SANCTIONED script's BODY is AUDITED BYTES, so the #1228 body arm does not
       // apply to it. WHY THE TWO EXEMPTIONS ARE NOT ONE: M4's #1129 arm skips its whole walk
@@ -3669,7 +3669,7 @@ function _worktreeDiscardBlock(command: string, hatchActive = false): string | n
         // `apply` / `--reverse` is a whole-tree discard the old prefilter never matched.
         const disc = extractWorkingTreeDiscards(content) ?? [];
         if (disc.length) {
-          sets.push({ discs: disc, baseCwd: execCwd, writeCwd: execCwd, script: seed });
+          sets.push({ discs: disc, baseCwd: execCwd, writeCwd: execCwd, script: seed, digest: _sha256OfBody(content) });
         }
         // Same digest-keyed stand-down as the walk above — ONE predicate, both walks (a
         // sanctioned script reached through the command-position queue must not be gated by
@@ -3749,12 +3749,12 @@ function _worktreeDiscardBlock(command: string, hatchActive = false): string | n
             const vContent = readFileSync(real, "utf8");
             const expFile = _expRefusalForBody(real, vContent);
             if (expFile) return expFile;
-            sets.push({ discs: extractWorkingTreeDiscards(vContent) ?? [], baseCwd: execCwd, writeCwd: execCwd, script: val });
+            sets.push({ discs: extractWorkingTreeDiscards(vContent) ?? [], baseCwd: execCwd, writeCwd: execCwd, script: val, digest: _sha256OfBody(vContent) });
           }
         } catch { /* not a readable file — the payload arms below still apply */ }
       }
       if (val && !/[$`]/.test(val)) {
-        sets.push({ discs: extractWorkingTreeDiscards(val) ?? [], baseCwd: execCwd, writeCwd: execCwd, script: null });
+        sets.push({ discs: extractWorkingTreeDiscards(val) ?? [], baseCwd: execCwd, writeCwd: execCwd, script: null, digest: null });
         continue;
       }
     }
@@ -3771,14 +3771,14 @@ function _worktreeDiscardBlock(command: string, hatchActive = false): string | n
       if (sub !== payload && !/[$`]/.test(sub) && !/[{}]/.test(sub)) {
         const expSub = _expRefusal(sub);
         if (expSub) return expSub;
-        sets.push({ discs: extractWorkingTreeDiscards(sub) ?? [], baseCwd: execCwd, writeCwd: execCwd, script: null });
+        sets.push({ discs: extractWorkingTreeDiscards(sub) ?? [], baseCwd: execCwd, writeCwd: execCwd, script: null, digest: null });
         try {
           const sp = extractScriptPath(sub);
           if (sp && !/[$`]/.test(sp)) {
             const scContent = readFileSync(resolve(execCwd, sp), "utf8");
             const expSc = _expRefusalForBody(sp, scContent);
             if (expSc) return expSc;
-            sets.push({ discs: extractWorkingTreeDiscards(scContent) ?? [], baseCwd: execCwd, writeCwd: execCwd, script: sp });
+            sets.push({ discs: extractWorkingTreeDiscards(scContent) ?? [], baseCwd: execCwd, writeCwd: execCwd, script: sp, digest: _sha256OfBody(scContent) });
           }
         } catch { /* missing/unreadable — the substituted text's own discards still stand */ }
         continue;
@@ -3803,11 +3803,11 @@ function _worktreeDiscardBlock(command: string, hatchActive = false): string | n
         const eContent = readFileSync(resolve(execCwd, sp), "utf8");
         const expFile = _expRefusalForBody(sp, eContent);
         if (expFile) return expFile;
-        sets.push({ discs: extractWorkingTreeDiscards(eContent) ?? [], baseCwd: execCwd, writeCwd: execCwd, script: sp });
+        sets.push({ discs: extractWorkingTreeDiscards(eContent) ?? [], baseCwd: execCwd, writeCwd: execCwd, script: sp, digest: _sha256OfBody(eContent) });
       }
     } catch { /* missing/unreadable — the verb test below still applies */ }
     if (!_MENTIONS_DISCARD_VERB(payload)) continue;
-    sets.push({ discs: extractWorkingTreeDiscards(payload) ?? [], baseCwd: execCwd, writeCwd: execCwd, script: null });
+    sets.push({ discs: extractWorkingTreeDiscards(payload) ?? [], baseCwd: execCwd, writeCwd: execCwd, script: null, digest: null });
   }
 
   // `xargs -I<tok> … <shell> -c '<tok>'` — the placeholder token is ARBITRARY and
@@ -3892,7 +3892,7 @@ function _worktreeDiscardBlock(command: string, hatchActive = false): string | n
           // the inner script. Same rule as the nested-script walk.
           const expFile = _expRefusalForBody(sp, cContent);
           if (expFile) return expFile;
-          sets.push({ discs: extractWorkingTreeDiscards(cContent) ?? [], baseCwd: execCwd, writeCwd: execCwd, script: sp });
+          sets.push({ discs: extractWorkingTreeDiscards(cContent) ?? [], baseCwd: execCwd, writeCwd: execCwd, script: sp, digest: _sha256OfBody(cContent) });
         }
       } catch { /* missing/unreadable — the direct surface still gates */ }
       continue;
@@ -3916,7 +3916,7 @@ function _worktreeDiscardBlock(command: string, hatchActive = false): string | n
           // cannot read it, so the nested-script rule applies here too.
           const expCat = _expRefusalForBody(real, catContent);
           if (expCat) return expCat;
-          sets.push({ discs: extractWorkingTreeDiscards(catContent) ?? [], baseCwd: execCwd, writeCwd: execCwd, script: catPath });
+          sets.push({ discs: extractWorkingTreeDiscards(catContent) ?? [], baseCwd: execCwd, writeCwd: execCwd, script: catPath, digest: _sha256OfBody(catContent) });
           continue;
         }
       } catch { /* missing/unreadable → the verb test still applies */ }
@@ -3954,7 +3954,7 @@ function _worktreeDiscardBlock(command: string, hatchActive = false): string | n
         const expVal = _expRefusal(val);
         if (expVal) return expVal;
         if (!/[$`]/.test(val)) {
-          sets.push({ discs: extractWorkingTreeDiscards(val) ?? [], baseCwd: execCwd, writeCwd: execCwd, script: null });
+          sets.push({ discs: extractWorkingTreeDiscards(val) ?? [], baseCwd: execCwd, writeCwd: execCwd, script: null, digest: null });
           // #1885 — a readable payload that NAMES A SCRIPT is not code, it is an
           // invocation: `S=./undo.sh; bash -c $S` runs the file, and its body can
           // discard. Read it with the same predicates the command-position arm
@@ -3969,7 +3969,7 @@ function _worktreeDiscardBlock(command: string, hatchActive = false): string | n
                 const pContent = readFileSync(real, "utf8");
                 const expP = _expRefusalForBody(first, pContent);
                 if (expP) return expP;
-                sets.push({ discs: extractWorkingTreeDiscards(pContent) ?? [], baseCwd: execCwd, writeCwd: execCwd, script: first });
+                sets.push({ discs: extractWorkingTreeDiscards(pContent) ?? [], baseCwd: execCwd, writeCwd: execCwd, script: first, digest: _sha256OfBody(pContent) });
               }
             }
           } catch { /* not a readable executable file — the code probe above stands */ }
@@ -3990,14 +3990,14 @@ function _worktreeDiscardBlock(command: string, hatchActive = false): string | n
       if (sub !== bare && !/[$`]/.test(sub) && !/[{}]/.test(sub)) {
         const expSub = _expRefusal(sub);
         if (expSub) return expSub;
-        sets.push({ discs: extractWorkingTreeDiscards(sub) ?? [], baseCwd: execCwd, writeCwd: execCwd, script: null });
+        sets.push({ discs: extractWorkingTreeDiscards(sub) ?? [], baseCwd: execCwd, writeCwd: execCwd, script: null, digest: null });
         try {
           const sp = extractScriptPath(sub);
           if (sp && !/[$`]/.test(sp)) {
             const scContent = readFileSync(resolve(execCwd, sp), "utf8");
             const expSc = _expRefusalForBody(sp, scContent);
             if (expSc) return expSc;
-            sets.push({ discs: extractWorkingTreeDiscards(scContent) ?? [], baseCwd: execCwd, writeCwd: execCwd, script: sp });
+            sets.push({ discs: extractWorkingTreeDiscards(scContent) ?? [], baseCwd: execCwd, writeCwd: execCwd, script: sp, digest: _sha256OfBody(scContent) });
           }
         } catch { /* missing/unreadable — the substituted text's own discards still stand */ }
         continue;
@@ -4028,13 +4028,15 @@ function _worktreeDiscardBlock(command: string, hatchActive = false): string | n
   // argv) always carries `script: null` and is always gated, and a script
   // reached through a second hop keeps its OWN set, so `bash /tmp/wrapper.sh`
   // that sources the sanctioned file is still gated on everything the wrapper
-  // itself says. SAFETY — this is why a path-keyed exemption is safe HERE: a
-  // set's `script` is always the file the set's discards were READ from (the
-  // seed walk stores `realpathSync(resolve(execCwd, p))`'s content with `p`;
-  // every other push site reads the file it stores), so the exemption can only
-  // ever drop discards that came from the sanctioned file's OWN bytes. Naming
-  // the sanctioned path from elsewhere buys nothing — the content is still
-  // that file's, and a wrapper's own discards stay in the wrapper's set.
+  // itself says. SAFETY — a set's `script` is always the file the set's discards were
+  // READ from (the seed walk stores `realpathSync(resolve(execCwd, p))`'s content with
+  // `p`; every other push site reads the file it stores and carries that body's sha256
+  // alongside it), so the exemption can only ever drop discards that came from the
+  // sanctioned file's OWN bytes — and, since #2775, only when those bytes ARE the pinned
+  // ones. Naming the sanctioned path from elsewhere buys nothing — the content is still
+  // that file's, and a wrapper's own discards stay in the wrapper's set. ⛔ THE PATH ALONE
+  // WAS NOT ENOUGH (#2775): see the filter below for the measured fail-open that keyed on
+  // `rel` alone.
   // KEYING — a copy at the same relpath in another checkout is NOT
   // exempt (the anchor is the guard's own checkout, not a repo fingerprint and
   // not the invoking cwd); the hub's own `scripts/` spelling still matches when
@@ -4051,19 +4053,26 @@ function _worktreeDiscardBlock(command: string, hatchActive = false): string | n
   // one command (the bounded walk's `seen` set is local to the walk; the inline
   // `-c` / `$( )` push sites never consult it), which reported 2 / 2 for
   // `bash <s>; bash -c 'source <s>'` (review cycle-2 P2).
-  const exempted = new Map<string, { rel: string; discards: number; forms: Set<string> }>();
+  const exempted = new Map<string, { rel: string; via: "module-root" | "identity"; discards: number; forms: Set<string> }>();
   const gatedSets = sets.filter((s) => {
     if (s.script === null) return true; // the command's own argv is never exempt
-    // ⛔ PATH-ONLY, and therefore a KNOWN FAIL-OPEN (#2775) — same shape as the #1129 skip
-    // above: arm 1 of `_sanctionedScriptExemption` is path-keyed by spec, so a destructive
-    // script minted at a sanctioned relpath under the module's own root has its discards
-    // dropped from the set instead of being gated. Tracked as #2775 (with the measured
-    // reproduction); when it is closed, this decision must be keyed on the body's digest
-    // (`_sha256OfBody` + `_sanctionedScriptPin`), not on the path.
-    let rel: string | null = null;
-    // Fail closed on a probe failure: keep the set gated.
-    try { rel = _sanctionedScriptExemption(resolve(execCwd, s.script))?.rel ?? null; } catch { rel = null; }
-    if (rel === null) return true;
+    // ⛔ THE KEY IS THE BODY'S DIGEST, NOT THE PATH (#2775). This decision DROPS a discard
+    // verdict that was parsed out of a file, so it is a claim about BYTES, and
+    // `_sanctionedScriptExemption` alone is not enough: its arm 1 is PATH-ONLY by spec (the
+    // pre-existing `~/.pi/agent` anchor), and on a copy-deployed box the module root is not a
+    // git checkout, so an agent can mint a destructive script at a sanctioned relpath under
+    // it and have its discards dropped instead of gated (`_isAuditedSanctionedScript`'s
+    // docblock carries the measurement). `s.digest` is the sha256 of the very body these
+    // discards were parsed from (every push site stores the content it read WITH the set), so
+    // the narrowing pairs "the body I judged" with "the body I hashed" by construction — a
+    // re-read here would be a TOCTOU an agent can win by rewriting the file between the two.
+    let sa: { rel: string; via: "module-root" | "identity" } | null = null;
+    // Fail closed on a probe failure: keep the set gated. `null` digest = no body behind the
+    // set, which declines the exemption for the same reason a mismatch does.
+    try { sa = s.digest === null ? null : _auditedSanctionedExemption(resolve(execCwd, s.script), s.digest); } catch { sa = null; }
+    if (sa === null) return true;
+    const rel = sa.rel;
+    const via = sa.via;
     let real = resolve(execCwd, s.script);
     try { real = realpathSync(real); } catch { /* keep the lexical path as the key */ }
     const prev = exempted.get(real);
@@ -4076,7 +4085,7 @@ function _worktreeDiscardBlock(command: string, hatchActive = false): string | n
       prev.discards = Math.max(prev.discards, s.discs.length);
       for (const d of s.discs) prev.forms.add(d.form);
     } else {
-      exempted.set(real, { rel, discards: s.discs.length, forms: new Set(s.discs.map((d) => d.form)) });
+      exempted.set(real, { rel, via, discards: s.discs.length, forms: new Set(s.discs.map((d) => d.form)) });
     }
     return false;
   });
@@ -4087,6 +4096,11 @@ function _worktreeDiscardBlock(command: string, hatchActive = false): string | n
         event: "m5_script_exemption",
         extension: "main-worktree-guard",
         script: rows[0][1].rel,
+        // WHICH arm granted it, as M4's row already records (`#2332`): an operator must be
+        // able to tell a module-root exemption from a checkout one. `#2775` narrowed BOTH
+        // arms to the pinned bytes, so the row now also names an identity the agent cannot
+        // forge by writing a file.
+        sanctioned_via: rows[0][1].via,
         script_realpath: rows[0][0],
         scripts: rows.map(([, v]) => v.rel),
         sets_exempted: rows.length,
@@ -4495,12 +4509,28 @@ function _sanctionedScriptExemption(resolvedScript: string): { rel: string; via:
  *  site has the body in hand, and there is deliberately no disk-read fallback for a caller
  *  that does not, because that fallback is the defect this parameter exists to remove. */
 function _isAuditedSanctionedScript(resolved: string, bodyDigest: string): boolean {
+  return _auditedSanctionedExemption(resolved, bodyDigest) !== null;
+}
+
+/** #2775 — the exemption OBJECT, narrowed to the pinned bytes: `{ rel, via }` when `resolved`
+ *  is a sanctioned script whose body hashes to its pin, otherwise `null`.
+ *
+ *  This is `_isAuditedSanctionedScript`'s body with the verdict handed back instead of
+ *  flattened to a boolean, for the two call sites that must ALSO record WHICH arm granted the
+ *  relaxation (#2332's `sanctioned_via`) or name the relpath in an audit row. One predicate,
+ *  three consumers: a second implementation of "is this the audited script" is how the
+ *  path-keyed answer survived in one place and not another (#2775).
+ *
+ *  `bodyDigest` is the sha256 of the body the CALLER read — never a fresh read of the path,
+ *  for the TOCTOU reason `_isAuditedSanctionedScript`'s docblock gives. */
+function _auditedSanctionedExemption(resolved: string, bodyDigest: string): { rel: string; via: "module-root" | "identity" } | null {
   let real: string;
-  try { real = realpathSync(resolved); } catch { return false; }
+  try { real = realpathSync(resolved); } catch { return null; }
   const sa = _sanctionedScriptExemption(real);
-  if (sa === null) return false;
+  if (sa === null) return null;
   const want = _sanctionedScriptPin().sha256[sa.rel];
-  return typeof want === "string" && want.length === 64 && bodyDigest === want;
+  if (typeof want !== "string" || want.length !== 64) return null;
+  return bodyDigest === want ? sa : null;
 }
 
 /** The execution the exemption actually grants is leaf PLUS everything the leaf
@@ -4684,14 +4714,25 @@ function _backdoorBlock(command: string, execCwd?: string): string | null {
     // content walk (see SANCTIONED_SCRIPT_RELPATHS for why this is a named
     // list keyed on the guard's own checkout). Deliberate gate relaxation →
     // audited (best-effort, never blocks) so the exemption is observable.
-    // ⛔ THIS CALL SITE IS PATH-ONLY AND THEREFORE A KNOWN FAIL-OPEN (#2775): it takes
-    // `_sanctionedScriptExemption`'s arm 1, which is path-keyed by spec, so arbitrary bytes
-    // planted at a sanctioned relpath under the module's own root skip the walk — the very
-    // hole `_isAuditedSanctionedScript`'s docblock warns about, still open HERE. Not closed in
-    // the 2026-10-24 #1228 fix because tightening it blocks the mandated rail on every box
-    // whose copy-deployed `~/.pi/agent/scripts` is not yet refreshed to the pin. Tracked as
-    // #2775; the digest must be carried into this decision when it is closed.
-    const sanctionedMatch = _sanctionedScriptExemption(resolved);
+    // ⛔ THE DECISION IS A CLAIM ABOUT BYTES, SO THE DIGEST DECIDES (#2775).
+    // `_sanctionedScriptExemption` alone is the PATH answer: its arm 1 is path-keyed by spec
+    // (the pre-existing `~/.pi/agent` anchor, deliberately unchanged by #2332), and on a
+    // copy-deployed box the module root is not a git checkout — so an agent can create
+    // `<moduleRoot>/scripts/<sanctioned relpath>` with any body it likes and have this skip
+    // take the WHOLE content walk (measured 2026-10-24 and again 2026-11-08: the planted body
+    // was ALLOWED here and BLOCKED at any other path). The #1129 relaxation is therefore
+    // granted only for the pinned bytes, exactly as the #1228 body arm already requires.
+    //
+    // ⛔ WHY A DISK READ HERE IS CORRECT AND IS NOT THE FALLBACK `_isAuditedSanctionedScript`
+    // REFUSES: no body is in hand at this site — the walk it stands down has not read anything
+    // yet — so there is no "body I judged" to pair, and `_sha256Of` is the ONE read the
+    // decision is made from. The window between this read and the shell's own read of the same
+    // path is unchanged by this fix and is why the digest NARROWS the hole rather than closing
+    // it; it is the same window arm 2 has always had.
+    const sanctionedPath = _sanctionedScriptExemption(resolved);
+    const sanctionedMatch = sanctionedPath === null
+      ? null
+      : _auditedSanctionedExemption(resolved, _sha256Of(resolved) ?? "");
     if (sanctionedMatch) {
       try {
         // #1129 (code-review P2): record the REALPATH that matched, not just
