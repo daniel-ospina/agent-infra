@@ -31,7 +31,14 @@
 set -uo pipefail
 
 # ── HOME: the caller's if it is real, else the cell's ──────────────────────────────────────────────
-CELL_HOME="${CELL_HOME:-/tmp/cell-home}"
+# THE ONE HOME (agent-infra#3453): DERIVED by scripts/lib/cell-home.sh — this line used to default to
+# the legacy `/tmp/cell-home`, so the reaper graded a home no other unit gave its processes.
+CELL_HOME_LIB=""
+for _cand in "$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd -P)/lib/cell-home.sh" \
+             "$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/.." 2>/dev/null && pwd -P)/lib/cell-home.sh"; do
+  [ -r "$_cand" ] && { CELL_HOME_LIB="$_cand"; break; }
+done
+if [ -n "$CELL_HOME_LIB" ]; then . "$CELL_HOME_LIB"; CELL_HOME="$(cell_home_resolve)"; else CELL_HOME="${CELL_HOME:-${HOME:-}}"; fi
 if [ -z "${HOME:-}" ] || [ ! -d "${HOME:-}" ]; then
     if [ -d "$CELL_HOME" ]; then
         HOME="$CELL_HOME"

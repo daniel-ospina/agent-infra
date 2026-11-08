@@ -142,8 +142,19 @@ esac
 # (cloud-cell-supervisor.sh DOES honour `O=` in keys.env) — two surfaces disagreeing about which
 # directory holds the lock is the #1745 class, and it was found in review of #1856.
 O_ENV="${O:-}"
+# ⛔ CAPTURED BEFORE THE DEFAULT IS APPLIED: `CELL_HOME_ENV` must stay the ENVIRONMENT value only — it
+# is the evidence that this box was TOLD it is a cell (see the `PLATFORM` branch below).
 CELL_HOME_ENV="${CELL_HOME:-}"                 # only the ENVIRONMENT value is evidence of a cell
-CELL_HOME="${CELL_HOME:-/tmp/cell-home}"
+# ── THE ONE HOME (agent-infra#3453) — DERIVED, never defaulted to the legacy /tmp/cell-home ────────
+# The rule and its precedence live in `scripts/lib/cell-home.sh`. Absent resolver = an INCOMPLETE
+# install, so the fallback is `$HOME` (which on a compliant cell IS the one home) — never the legacy
+# volatile path, which is what this line used to default to.
+CELL_HOME_LIB=""
+for _cand in "$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd -P)/lib/cell-home.sh" \
+             "$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/.." 2>/dev/null && pwd -P)/lib/cell-home.sh"; do
+  [ -r "$_cand" ] && { CELL_HOME_LIB="$_cand"; break; }
+done
+if [ -n "$CELL_HOME_LIB" ]; then . "$CELL_HOME_LIB"; CELL_HOME="$(cell_home_resolve)"; else CELL_HOME="${CELL_HOME:-${HOME:-}}"; fi
 if [ "$PLATFORM" = "cell" ]; then
   # The cell's own home. `cloud-cell-bringup.sh` documents why it is not /home/ubuntu (which does not
   # exist on the image), so the default here is the one that script provisions.

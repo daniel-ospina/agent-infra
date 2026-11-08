@@ -24,7 +24,7 @@
 #   install-repair-service.sh [--install] [--dry-run] [--status] [--uninstall] [--help]
 #
 # Environment (all optional):
-#   CELL_HOME              default /tmp/cell-home        (the service user's HOME)
+#   CELL_HOME              default: DERIVED (the box's durable home — scripts/lib/cell-home.sh)
 #   O                      default $CELL_HOME/orchestrator
 #   ENV_FILE               default $CELL_HOME/keys.env
 #   PR_DOCTOR_REPO / GH_REPO      default daniel-ospina/tortoise
@@ -84,7 +84,17 @@ done
 TEMPLATES_DIR="${TEMPLATES_DIR:-$INFRA_ROOT/templates/systemd}"
 
 UNIT_NAME="eldato-pr-repair.service"
-CELL_HOME="${CELL_HOME:-/tmp/cell-home}"
+# ── THE ONE HOME (agent-infra#3453) — DERIVED, never defaulted to the legacy /tmp/cell-home ────────
+# This default used to be `/tmp/cell-home`: the unit this script renders then carried a HOME no other
+# cell unit agreed with, which is the two-home split that turned every lane's `git push` into a 403.
+# The rule lives in `scripts/lib/cell-home.sh`; a missing resolver falls back to `$HOME` (the one home on
+# a compliant cell), never to the legacy volatile path.
+CELL_HOME_LIB=""
+for _cand in "$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd -P)/lib/cell-home.sh" \
+             "$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/.." 2>/dev/null && pwd -P)/lib/cell-home.sh"; do
+  [ -r "$_cand" ] && { CELL_HOME_LIB="$_cand"; break; }
+done
+if [ -n "$CELL_HOME_LIB" ]; then . "$CELL_HOME_LIB"; CELL_HOME="$(cell_home_resolve)"; else CELL_HOME="${CELL_HOME:-${HOME:-}}"; fi
 O="${O:-$CELL_HOME/orchestrator}"
 ENV_FILE="${ENV_FILE:-$CELL_HOME/keys.env}"
 REPO_SLUG="${PR_DOCTOR_REPO:-${GH_REPO:-daniel-ospina/tortoise}}"

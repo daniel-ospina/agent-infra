@@ -111,7 +111,9 @@
 #   HARNESS_PIN           the SHA record file (default ${CELL_HOME:-$HOME}/.pi/agent/state/HARNESS-PIN)
 #   HARNESS_PIN_FILE      the PATH record (default $CELL_HOME/.harness-path)
 #   HARNESS_PIN_DIR       the pin root (default $CELL_HOME/harness)
-#   CELL_HOME             the cell's home (default $HOME)
+#   CELL_HOME             the cell's home (default: DERIVED by scripts/lib/cell-home.sh — the box's
+#                         durable home, never the legacy /tmp/cell-home; $HOME only when the resolver
+#                         is absent, e.g. a `bash -s` piped start with no sibling file)
 #   O                     the orchestrator state dir (default $CELL_HOME/orchestrator)
 #   HARNESS_MATERIALISER  the script that materialises a pin (default <repo>/scripts/cloud-cell-supervisor.sh)
 #   HARNESS_APPLY_MODE    pin|sync — force one path (default: pin when a pin record exists, else sync
@@ -192,7 +194,18 @@ while [ $# -gt 0 ]; do
     shift
 done
 
-CELL_HOME="${CELL_HOME:-${HOME:?HOME is required}}"
+# ── THE ONE HOME (agent-infra#3453) — DERIVED, not a bare $HOME spelled at the call site ────────
+# This pass hands CELL_HOME to the materialiser (`cloud-cell-supervisor.sh apply`), which resolves it
+# with `scripts/lib/cell-home.sh`; an un-derived `$HOME` here (e.g. `cmux vm exec`'s HOME=/home/ubuntu,
+# a directory that does not exist on the image) would pin and record under one home while the
+# supervisor resolves another — the two-home split #3453 removes, on the pass that advances the
+# harness. The rule and the ONLY literal live in `scripts/lib/cell-home.sh`; a copy without it (a
+# `bash -s` start has no BASH_SOURCE, so $HERE is empty) falls back to $HOME exactly as before.
+CELL_HOME_LIB=""
+for _cand in "$HERE/lib/cell-home.sh" "$HERE/../lib/cell-home.sh"; do
+  [ -r "$_cand" ] && { CELL_HOME_LIB="$_cand"; break; }
+done
+if [ -n "$CELL_HOME_LIB" ]; then . "$CELL_HOME_LIB"; CELL_HOME="$(cell_home_resolve)"; else CELL_HOME="${CELL_HOME:-${HOME:?HOME is required}}"; fi
 O="${O:-$CELL_HOME/orchestrator}"
 # ⛔ BOTH SPELLINGS, AND THE UNIT'S IS THE ONE THAT MATTERS IN PRODUCTION. The rendered systemd unit
 # and launchd plist export `HARNESS_APPLY_REPO` / `HARNESS_APPLY_REF` (they are the INSTALLER's seams);
@@ -1086,8 +1099,10 @@ if [ "$PASS_MODE" = pin ]; then
         #      leaves the running one untouched. Nothing else about `apply` changes.
         # ⛔ EVERY RESOLVED VALUE GOES TO THE CHILD ON ITS OWN COMMAND LINE, like the checker 400
         #      lines above (agent-infra#3593). The materialiser RESOLVES the same paths from ITS
-        #      defaults — `CELL_HOME="${CELL_HOME:-/tmp/cell-home}"` (cloud-cell-supervisor.sh:139),
-        #      then `HARNESS_PIN_DIR`/`HARNESS_PIN_FILE` from it — and a shell variable set HERE is
+        #      defaults — it used to be `CELL_HOME="${CELL_HOME:-/tmp/cell-home}"`
+        #      (cloud-cell-supervisor.sh; unified on the durable home by agent-infra#3453, which does
+        #      NOT remove the need for this line), then `HARNESS_PIN_DIR`/`HARNESS_PIN_FILE` from it —
+        #      and a shell variable set HERE is
         #      invisible to a child unless it is exported. Measured on a cell whose unit sets `HOME`
         #      and no `CELL_HOME`: this pass resolved `/home/cmux`, the materialiser pinned into
         #      `/tmp/cell-home/harness/<sha12>`, the re-read below saw no move and reported rc=25

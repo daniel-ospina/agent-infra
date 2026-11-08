@@ -72,7 +72,10 @@
 # workers past the #2721 wedge guard while reading healthy — the #2700 §1.2 shape, one level up.
 #
 # Environment (all optional; the service renders them):
-#   CELL_HOME              default /tmp/cell-home
+#   CELL_HOME              default: DERIVED (agent-infra#3453) — `$CELL_HOME`, else the account
+#                          home (`/home/cmux` on a cell), by scripts/lib/cell-home.sh. Never the
+#                          legacy `/tmp/cell-home`. `--help` prints this block, so it states the
+#                          derived default: setting CELL_HOME by hand is what re-creates the split.
 #   ENV_FILE               the credential file this pass sources with `set -a` before dispatching,
 #                          default $CELL_HOME/keys.env. ⛔ A UNIT DOES NOT INHERIT THE TMUX SERVER'S
 #                          ENVIRONMENT: without this every worker spawns credential-less and dies
@@ -112,7 +115,15 @@
 #      window instead of retrying. 4 is the same code `pr-doctor` uses for an uncaught exception.
 set -uo pipefail
 
-CELL_HOME="${CELL_HOME:-/tmp/cell-home}"
+# ── THE ONE HOME (agent-infra#3453) — DERIVED, never defaulted to the legacy /tmp/cell-home ────────
+# The rule lives in `scripts/lib/cell-home.sh`; the fallback is `$HOME` (on a compliant cell that IS the
+# one home), because a missing resolver is an incomplete install, not permission to pick the legacy path.
+CELL_HOME_LIB=""
+for _cand in "$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd -P)/lib/cell-home.sh" \
+             "$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/.." 2>/dev/null && pwd -P)/lib/cell-home.sh"; do
+  [ -r "$_cand" ] && { CELL_HOME_LIB="$_cand"; break; }
+done
+if [ -n "$CELL_HOME_LIB" ]; then . "$CELL_HOME_LIB"; CELL_HOME="$(cell_home_resolve)"; else CELL_HOME="${CELL_HOME:-${HOME:-}}"; fi
 O="${O:-$CELL_HOME/orchestrator}"
 SCRIPTS="${PR_REPAIR_SCRIPTS:-$CELL_HOME/.pi/agent/scripts}"
 # ⛔ THE REPO AND ITS CHECKOUT ARE ONE FACT, SO THEY ARE RESOLVED FROM ONE SEAM (agent-infra#3007).

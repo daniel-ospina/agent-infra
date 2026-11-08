@@ -176,7 +176,15 @@ SC=""   # from $REPO, once resolve_repo has settled it
 # wherever $HOME is already a writable directory (every laptop, and every cell whose controller the
 # supervisor started); a home that is absent, not a directory, or not writable is off-spec for this
 # harness and is replaced.
-CELL_HOME="${CELL_HOME:-/tmp/cell-home}"
+# ⛔ THE ONE HOME (agent-infra#3453): the old default here was the legacy `/tmp/cell-home`, so the home
+# this harness would CREATE and write `$O` into was one no other cell unit agreed with. Derived by
+# `scripts/lib/cell-home.sh` (`../lib/` from the harness dir — the same relative position in a
+# checkout, in a pinned harness worktree, and in the flat farm).
+CELL_HOME_LIB=""
+for _cand in "$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/.." 2>/dev/null && pwd -P)/lib/cell-home.sh"; do
+  [ -r "$_cand" ] && { CELL_HOME_LIB="$_cand"; break; }
+done
+if [ -n "$CELL_HOME_LIB" ]; then . "$CELL_HOME_LIB"; CELL_HOME="$(cell_home_resolve)"; else CELL_HOME="${CELL_HOME:-${HOME:-}}"; fi
 usable_home() { [ -n "${1:-}" ] && [ -d "$1" ] && [ -w "$1" ]; }
 # $1 = --create. Runs at LOAD, before anything else: the interpreter probe, uv's cache and the
 # pre-flight all resolve through $HOME. TWO candidates — the caller's $HOME, then $CELL_HOME (the

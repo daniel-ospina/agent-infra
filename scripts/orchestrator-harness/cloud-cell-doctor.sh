@@ -54,7 +54,15 @@
 
 set -uo pipefail
 
-CELL_HOME="${CELL_HOME:-/tmp/cell-home}"
+# ⛔ THE ONE HOME (agent-infra#3453): this used to default to the legacy `/tmp/cell-home`, which made
+# the candidate list name a home no other unit gave its processes — the two-home split whose symptom is
+# "the credential exists and `git push` still answers 403". Derived by `scripts/lib/cell-home.sh`
+# (sibling `lib/` in a checkout, `../lib/` in a pinned harness worktree and in the flat farm).
+CELL_HOME_LIB=""
+for _cand in "$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/.." 2>/dev/null && pwd -P)/lib/cell-home.sh"; do
+  [ -r "$_cand" ] && { CELL_HOME_LIB="$_cand"; break; }
+done
+if [ -n "$CELL_HOME_LIB" ]; then . "$CELL_HOME_LIB"; CELL_HOME="$(cell_home_resolve)"; else CELL_HOME="${CELL_HOME:-${HOME:-}}"; fi
 O="${O:-$CELL_HOME/orchestrator}"
 REPO="${REPO:-/tmp/cell}"
 OR="${OR:-}"

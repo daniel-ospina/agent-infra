@@ -580,8 +580,18 @@ case "$HU_OS" in
 esac
 
 # ── configuration: ONE resolution, the child never re-derives it ─────────────────────────────────
-CELL_HOME="${CELL_HOME:-}"
-[ -n "$CELL_HOME" ] || CELL_HOME="${HOME:-/tmp/cell-home}"
+# ⛔ THE ONE HOME (agent-infra#3453): the fallback here used to be the LEGACY volatile
+# `/tmp/cell-home`, so a run with `HOME` unset handed every child a home no other unit agreed with —
+# the split whose symptom is "the credential exists and `git push` still answers 403". The rule, the
+# precedence and the ONLY literal live in `scripts/lib/cell-home.sh`: a sibling in a checkout and in
+# the farm (`pi-bootstrap/setup.sh`'s `lib_srcs`), and a copy without it falls back to `$HOME` (the
+# one home on a compliant cell) — never the legacy path.
+CELL_HOME_LIB=""
+for _cand in "$SELF_PATH/lib/cell-home.sh" "$SELF_PATH/../lib/cell-home.sh"; do
+  [ -r "$_cand" ] && { CELL_HOME_LIB="$_cand"; break; }
+done
+if [ -n "$CELL_HOME_LIB" ]; then . "$CELL_HOME_LIB"; CELL_HOME="$(cell_home_resolve)"; else CELL_HOME="${CELL_HOME:-${HOME:-}}"; fi
+[ -n "$CELL_HOME" ] || die "neither CELL_HOME nor HOME is set, so the cell home cannot be derived — refusing to default it to the legacy /tmp/cell-home (agent-infra#3453)" 2
 O="${A_O:-${O:-}}"
 # ⛔ A TRAILING SLASH IS THE SAME DIRECTORY: one spelling reaches the rows, the delegation and the
 # drift check (a spelling difference is not a difference in what the box runs).
