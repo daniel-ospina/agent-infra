@@ -1,5 +1,5 @@
 <!-- research-path: https://github.com/daniel-ospina/agent-infra/issues/1265#issuecomment-6722549255 -->
-<!-- plan-review: cycles=3, status=capped, exit_reason=adversarial-capped, version=2.3.0 -->
+<!-- plan-review: cycles=4, status=capped, exit_reason=adversarial-capped, version=2.3.0 -->
 
 # #1265 — session-start recovery counts a *sibling* worktree's entries, and the non-adoption never reaches the parent
 
@@ -8,13 +8,18 @@
 ## Confirmed problem
 
 The issue's headline ("the gate adopts ANOTHER worktree's root as the git-op root") is **no longer
-true**, and that is provable from this tree rather than from a commit that is not in this branch's
-history: `recoveryOnlyRoot` is **inspection-only** — its return never becomes a git-op root and never
-becomes the reported count — the `tool_call` handler's git-op path is
+true**, and that is provable from this tree: PR #1780 (merged to `main` 2026-10-15, merge commit
+`26ad39a33`, which IS in this head's history — `compare/26ad39a33...main` reports `behind_by: 0`)
+removed that claim from the log, `recoveryOnlyRoot` is **inspection-only** — its return never becomes a
+git-op root and never becomes the reported count — the `tool_call` handler's git-op path is
 `const cwd = resolveGitRoot(cdPath ?? inputCwd)`, and `pickVerifiedRoot` is documented
-RECOVERY-ONLY. (The narration `"…the git-op root is NOT adopted"` reached `origin/main` in
-`6580850cc`, #3334.) PR #1780 **was** merged to `main` on 2026-10-15 (merge commit `26ad39a33`), but
-that commit is not an ancestor of today's `origin/main`, so it is not cited as this head's evidence.
+RECOVERY-ONLY.
+
+> ⚠️ Measurement note: `git merge-base --is-ancestor 26ad39a33 origin/main` returns **1 in this
+> worktree** and is WRONG here — the clone is SHALLOW (`git rev-parse --is-shallow-repository` →
+> `true`, 50 commits reachable from `origin/main`), so ancestry cannot be resolved locally and
+> `git log -S` names the shallow boundary commit. Ask the API (`compare/<sha>...main`), not the shallow
+> clone.
 
 Two acceptance indicators in the issue are nevertheless still unmet at this head:
 
@@ -112,7 +117,7 @@ roots and 20+ tortoise roots in the live bridge), so this is the narrow one-sibl
 | `bridgeRoots()` | reads the bridge's PASS roots; unchanged. |
 | `gitCommonDir(root)` | same-repo test (`--git-common-dir`); unchanged. |
 | `appendJsonl(entry, file?)` — `extensions/shared/audit-log.ts` | appends to `~/.pi/agent/audit/gate-events.jsonl`; **four** new event names added to `GateEventName` (`gate_recovery`, `gate_recovery_empty`, `gate_recovery_foreign_root`, `gate_root_mismatch`). `gate_recovery` carries the `root` it recovered for, so an inspection merge is **attributable** to the SIBLING root. It is not un-attributable by `session_cwd`: that field still names the inspecting session, so a session-keyed reader must select on `root`. |
-| `gate-events.jsonl` consumers | **no production consumer** — `gateEventsFile()` has one production caller (`appendJsonl`); the only readers are in-repo TEST helpers (`audit-log.test.ts`, `index.e2e.test.ts`'s `readAuditLines()`, `review-enforcer/index.test.ts`), each selecting by `event`. An external reader selects by `event`/`reason` and must tolerate unknown **fields** (`audit-log.ts` header); the header's `event —` line is a stale closed enumeration (pre-existing) that names none of the four new events. |
+| `gate-events.jsonl` consumers | **no production consumer PARSES it** — `gateEventsFile()` has one production caller (`appendJsonl`); `scripts/vgate.sh` `tail`s the log in `status()` (selects nothing); `registry-sync.sh` / `admin-merge.sh` mention it only in comments; readers are in-repo TEST helpers — `extensions/shared/audit-log.test.ts` (path + row schema, selects by NOTHING), `index.e2e.test.ts`'s `readAuditLines()`, `review-enforcer/index.test.ts`, `review-enforcer/index.spawn-evidence.test.ts` (the last three select by `event`). The header's `event —` line is a stale closed enumeration (pre-existing) that names none of the four new events. |
 | `extensions/verification-gate/index.e2e.test.ts`, `index.test.ts` | run by `ci-main.yml` (`npx tsx …`) — no new file, so no CI-surface registration applies (this repo has no `config/ci-surfaces.yml`). |
 
 ## Implementation steps
@@ -170,8 +175,9 @@ marker is deliberately NOT `clean`; the residual class below is named rather tha
 | Cycle | Reviewer | Issues | Disposition |
 |---|---|---|---|
 | 1 | fresh-context plan reviewer | 6 (2×P1, 4×P2) | all applied — R5's false "readers" claim, "Proves it: typecheck" for an unenforced union, pin count, a citation that is not in `origin/main`, undefined ACs + unjustified remedy rewrite, the out-of-vocabulary marker |
-| 2 | fresh-context plan reviewer | 8 (2×P1, 6×P2) | all applied — the reader inventory corrected in the OTHER direction (test helpers do read the log), the `Set`/`sort` refinement restated as untested, `#1780` replaced by the commit actually in `main` (`6580850cc`), the stale header enumeration stated as stale, `session_cwd` attribution corrected, "message-only" → "inspection-only", the #1265 measurement corrected (the FIRST of three dead children followed the `cd` remedy — not three), and the inverted prior pin counted |
-| 3 | fresh-context verification of the cycle-2 fixes (the deep-fix round the cap requires) | 7 (2×P1, 5×P2) | all applied — R3's "three children" corrected; step 2's "the `Set` is untested" replaced with what the tests now DO discriminate (`03227c5a2` — `f192265b3` before the branch was rebased onto `main`; patch-id `5e9bcada`, identical — added worktree C and the B→C→B alternation; only the `.sort()` remains untested); the reader inventory corrected a third time (`scripts/vgate.sh` `tail`s the file in `status()`, `audit-log.test.ts` selects by nothing, and a fourth test reader — `review-enforcer/index.spawn-evidence.test.ts` — added); #1780 restated (merged to `main` on 2026-10-15, but its merge commit is not in today's `origin/main`); the acceptance line scoped to the NAMED residual; the PR body's two falsehoods corrected in a comment plus the `[ADVERSARIAL-BOUND]` disclosure added |
+| 2 | fresh-context plan reviewer | 8 (2×P1, 6×P2) | all applied — the reader inventory corrected in the OTHER direction (test helpers do read the log), the `Set`/`sort` refinement restated as untested, the `#1780` citation rewritten (that rewrite was itself wrong — see cycle 4), the stale header enumeration stated as stale, `session_cwd` attribution corrected, "message-only" → "inspection-only", the #1265 measurement corrected (the FIRST of three dead children followed the `cd` remedy — not three), and the inverted prior pin counted |
+| 3 | fresh-context verification of the cycle-2 fixes (the deep-fix round the cap requires) | 7 (2×P1, 5×P2) | applied — R3's "three children" corrected; step 2's "the `Set` is untested" replaced with what the tests now DO discriminate (`03227c5a2` — `f192265b3` before the branch was rebased onto `main`; patch-id `5e9bcada`, identical — added worktree C and the B→C→B alternation; only the `.sort()` remains untested); the reader inventory corrected (twice, see cycle 4); the acceptance line scoped to the NAMED residual; the PR body's two falsehoods corrected plus the `[ADVERSARIAL-BOUND]` disclosure added |
+| 4 | fresh-context verification of the cycle-3 fixes | 4 (1×P1, 3×P2) | applied — **the cycle-2/3 `#1780` rewrite was FALSE and is reverted**: `26ad39a33` IS an ancestor of `origin/main` (`compare/26ad39a33...main` → `behind_by: 0`); the local `--is-ancestor` result and the `git log -S` attribution were SHALLOW-CLONE artifacts (50 commits reachable; `6580850cc` is the boundary commit). The Wiring table's reader row was a third instance still carrying the old inventory. The `gate_recovery` comment now discriminates by ROOT IDENTITY, not call site (three call sites emit it, two of them live). The PR body's "already reads"/R5-covered claims corrected. |
 
 The same head was code-reviewed by a separate fresh context, which found one P2 in this diff: the
 `gate_recovery` comment in `audit-log.ts` described the inspection pairing as unconditional, when the
@@ -231,9 +237,8 @@ reader contract. Filing a roster pin (emit-site `event:` literals ⊆ `GateEvent
 **Out of scope — must NOT be raised** (note, file, do not chase):
 - the `task` **return value** channel (a `builtin-tools` change) — named as a residual in the research
   artifact and followed up as its own issue;
-- root selection / adoption policy (the narration in today's `origin/main` came from `6580850cc`;
-  #1780's merge commit `26ad39a33` is not in that history; #1303's own correction records the keying as
-  intended);
+- root selection / adoption policy (#1780 settled the message — `26ad39a33` is in this head's
+  history; #1303's own correction records the keying as intended);
 - the `#1303` block-message root-naming work, and any prose preference about `#3255` numbering;
 - pre-existing defects outside this diff.
 
