@@ -175,12 +175,13 @@ removes another's file), but it is **not per-run**, and the header is what you c
 
 - the header's `ref=` and `dest=` are the **ref name and farm path this record's `detail=` quotes** —
   on the drift arms `detail=` reads `farm: DRIFT — <the arm sentence>; <dest> is NOT the code <ref>
-  ships`, and on the three `farm-unknown` arms it reads `… for <dest> against <ref> …` — the same two
-  variables either way (the record has NO `dest=` field of its own, and the record's `ref=` is the
-  RESOLVED SHORT SHA, a different value on purpose — do not compare those). ⛔ COMPARE ONLY THE CLAUSE
-  THAT QUOTES THEM — the text between `is NOT the code ` and the end of that clause on a drift arm, or
-  the `<dest> … against <ref>` clause on a `farm-unknown` arm — because BOTH values sit at the tail
-  that the
+  ships`; the `rc=0`-contradicts-its-report and `rc=0`-with-no-verdict arms read `… for <dest> against
+  <ref> …`; and the give-up arm (the instrument's own exit 2) reads `<dest> could not be graded against
+  <ref>` — the same two variables either way, in three different sentences (the record has NO `dest=`
+  field of its own, and the record's `ref=` is the RESOLVED SHORT SHA, a different value on purpose — do
+  not compare those). ⛔ COMPARE ONLY THE CLAUSE THAT QUOTES THEM — the text between `is NOT the code `
+  and the end of that clause on a drift arm, or the `<dest> … against <ref>` span on any `farm-unknown`
+  arm, whichever sentence that arm prints — because BOTH values sit at the tail that the
   240-byte bound cuts, and the readings `finish` appends AFTER them (`— head=… ref=<checkout sha> …
   drift=…`) carry a `ref=` of their own that is the record's SHORT SHA, not the ref name; a reader who
   greps the last `ref=` compares the wrong token and rejects a correct artifact. Within that clause:
@@ -486,7 +487,7 @@ checkout can use the documented hatch. The same interaction is recorded for
 
 ## Tests
 
-`scripts/harness-apply-timer.test.sh` — 526 assertions, run by the
+`scripts/harness-apply-timer.test.sh` — 532 assertions, run by the
 `harness-apply-timer` shard of `run-bash-shards.sh`:
 
 | | |

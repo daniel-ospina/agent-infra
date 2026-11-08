@@ -1484,6 +1484,12 @@ OUT="$(HARNESS_APPLY_FARM_CHECKER="$T/t24q/stub-checker.sh" run_pass "$T/t24q" 2
 # only because t24s reuses this stub. Reading the wrong run is the defect the file condemns at :376-380.
 OUT24Q="$OUT"
 assert_eq "$RC" "24" "T24 control: a 20-row drift is RED"
+# ⛔ AND THE PUBLISH RENAMES, IT DOES NOT COPY-IN-PLACE (review round 28, measured: replacing `mv -f` with
+# `cp -f` left the suite at its baseline, and every drift pass then left a
+# `harness-apply-farm-rows.txt.tmp-<pid>` in the state dir, never reaped, while the artifact was rewritten
+# in place rather than atomically replaced — so a concurrent reader could see a half-written list).
+assert_eq "$(ls -A "$T/t24q/state" 2>/dev/null | grep -c 'tmp-' || true)" "0" \
+    "T24 control: and the publish leaves NO temp file behind — it renamed, so a reader never sees a half list"
 assert_contains "$OUT" "re-run the farm from a ref-consistent checkout" \
     "T24 control: and the instrument's own REMEDY survives a long row list (it is its last line)"
 assert_contains "$OUT" "declare it LOCAL, delete it, or retire it" \
@@ -1539,6 +1545,38 @@ assert_contains "$(cat "$T/t24q/state/harness-apply.status" 2>/dev/null || true)
 # path is the cheapest honest way to make the rows write fail while the RECORD write still succeeds —
 # which is the only state that can produce `farm_rows=unwritable` at all (an unwritable state dir
 # fails the record too, and leaves the previous record as the signal).
+# ⛔ THE COMPLETENESS PROOF SUMS ALL THREE LABELS, AND THE `unsourced` TERM NEEDS A FIXTURE (review
+# round 28, measured: replacing `$(( _a + _b + _c ))` with `$(( _a + _b ))` left the suite green, and on
+# the REAL instrument with 1 stale + 1 declared-but-absent + 1 unsourced the record became
+# `farm_n=unparsed` with the header claiming "MORE than the 2 the instrument reports — its vocabulary is
+# too wide", i.e. a FALSE CAUSE on the class this directory calls its normal historical state). This farm
+# carries all three classes so the sum is 5 = 2 stale + 1 declared-but-absent + 2 unsourced.
+mk_origin t24bc; mk_clone t24bc
+REPO_P="$CLONE"; MODE_P=sync
+mkdir -p "$T/t24bc/home/.pi/agent/scripts"
+cat >"$T/t24bc/three-class.sh" <<'FARM'
+#!/usr/bin/env bash
+printf '%-46s | %-12s | %-12s | %s\n' 'file' 'deployed' 'source' 'verdict' >&2
+printf '%-46s | %-12s | %-12s | %s\n' 'stale-a.py' aaaa11112222 bbbb33334444 STALE >&2
+printf '%-46s | %-12s | %-12s | %s\n' 'stale-b.py' aaaa11112222 bbbb33334444 STALE >&2
+printf '%-46s | %-12s | %-12s | %s\n' 'absent.py' aaaa11112222 - DECLARED-BUT-ABSENT >&2
+printf '%-46s | %-12s | %-12s | %s\n' 'extra-a.py' aaaa11112222 - UNSOURCED >&2
+printf '%-46s | %-12s | %-12s | %s\n' 'extra-b.py' aaaa11112222 - UNSOURCED >&2
+printf 'check-farm-drift: DRIFT — 2 stale (2 farm-declared — a re-run must fix these; 0 outside the farm), 1 declared-but-absent, 2 unsourced, of 3 deployed file(s) (3 sourced, 2 matching) against origin/main (sync).\n' >&2
+exit 3
+FARM
+chmod +x "$T/t24bc/three-class.sh"
+OUT="$(HARNESS_APPLY_FARM_CHECKER="$T/t24bc/three-class.sh" run_pass "$T/t24bc" 2>&1)"; RC=$?
+assert_eq "$RC" "24" "T24 control: a three-class drift is RED (24)"
+assert_contains "$(head -1 "$T/t24bc/state/harness-apply-farm-rows.txt" 2>/dev/null || true)" "n=5" \
+    "T24 control: and the header's n= is the SUM of all three labels (2 stale + 1 absent + 2 unsourced), so the proof counts every class"
+assert_contains "$(grep '^farm_n=' "$T/t24bc/state/harness-apply.status" 2>/dev/null || true)" "farm_n=5" \
+    "T24 control: with farm_n=5 — a dropped label would leave the proof one short and the run unparsed"
+assert_contains "$(grep '^detail=' "$T/t24bc/state/harness-apply.status" 2>/dev/null || true)" "5 row(s), every one named" \
+    "T24 control: and detail= certifies the complete arm over all five"
+assert_eq "$(tail -n +2 "$T/t24bc/state/harness-apply-farm-rows.txt" 2>/dev/null | wc -l | tr -d ' ')" "5" \
+    "T24 control: with every one of the five rows named in the artifact — three classes, no silent drop"
+
 mk_origin t24r; mk_clone t24r
 REPO_P="$CLONE"; MODE_P=sync
 mkdir -p "$T/t24r/home/.pi/agent/scripts" "$T/t24r/state/harness-apply-farm-rows.txt"
@@ -2715,15 +2753,15 @@ assert_contains "$(grep '^farm_rows=' <<<"$REC24AK")" "farm_rows=unwritable" \
 # ⛔ AND `remedy=` IS NEVER `none` ON A REFUSAL (review round 14, measured: the record promised "with
 # the instrument's own remedy" while emitting `remedy=none`, because this stub prints no `Next:` block).
 # A refusal that names a defect and leaves nobody an action is the class the `remedy=` field exists for.
-assert_absent "$(grep '^remedy=' <<<"$REC24AH")" "remedy=none" \
+assert_absent "$(grep '^remedy=' <<<"$REC24AK")" "remedy=none" \
     "T24 control: a drift refusal never records remedy=none — this one names the manual fallback"
-assert_contains "$(grep '^remedy=' <<<"$REC24AH")" "no 'Next:' remedy" \
+assert_contains "$(grep '^remedy=' <<<"$REC24AK")" "no 'Next:' remedy" \
     "T24 control: and it says the instrument sent none, rather than inventing one"
 # ⛔ AND `detail=` DOES NOT REPEAT THE REMEDY (review round 14, measured). The clause sat at the very
 # end of a 240-byte field whose tail is what gets cut — 279 bytes, cut at 241, truncated mid-word — so
 # the remedy lives in `remedy=` only (untruncated by construction) and `detail=` stops at the ship
 # clause. Mutant that reds this row: append the clause after `$FARM_DEST` again.
-assert_absent "$(grep '^detail=' <<<"$REC24AH")" "with the instrument's own remedy" \
+assert_absent "$(grep '^detail=' <<<"$REC24AK")" "with the instrument's own remedy" \
     "T24 control: and detail= does not repeat the remedy at the end of a bounded field"
 
 # ⛔ THE ZERO-EXTRACTION ARM IS THE ONLY GUARD ON A RED GRADE WHOSE SUMMARY PARSES TO ZERO (review
