@@ -5555,8 +5555,8 @@ assert_contains "$RECORD_ERR" "THIS RUN WROTE NO PENDING COPY" \
 # run's write failed), never predict the flush's OUTPUT, and OFFER the flush in both arms
 # rather than denying it — an incorrect denial costs an operator the working one-command
 # remedy that this whole arm exists to point at.
-assert_contains "$RECORD_ERR" "THIS RUN WROTE NO PENDING COPY" \
-    "14.1d(i) …and the exit-5 remedy says what WAS observed — this run's write failed — instead of reporting the pending file's contents, which it never read"
+assert_contains "$RECORD_ERR" "is NOT thereby this run's evidence" \
+    "14.1d(i) …and the exit-5 remedy scopes a flushed line to the marker's ANATOMY, not to this run — a delivered line naming the sha alone is not evidence, so the operator must read the WHOLE line. A DIFFERENT predicate from the row above on purpose: two assert_contains rows sharing one literal AND one capture can only ever redden in lockstep, so the second would add no discriminating power (#3712 review, finding 2)"
 assert_contains "$RECORD_ERR" "TRY --flush-pending" \
     "14.1d(i) …and still OFFERS the flush: an earlier run at the same head leaves byte-identical bytes, so denying it withdraws a remedy that works (round 9)"
 assert_not_contains "$RECORD_ERR" "would find NOTHING" \
