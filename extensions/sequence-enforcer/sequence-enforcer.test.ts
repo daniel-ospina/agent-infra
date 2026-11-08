@@ -1135,6 +1135,15 @@ await test("#1418 F3 (round 6): the identity and git-dir bounds are resolved fro
     // the git dir is resolved from the top level as well (a subdir has no .git)
     _setConflictedProbeForTest(() => [".git/config"]);
     ok(!checkpointWriteTargetAllowed(join(repo, ".git", "config"), sub), "the git dir is refused from a subdir cwd");
+    // ⛔ THE ROW THAT ACTUALLY DISCRIMINATES THE IDENTITY BOUND (round 6, F3): with
+    // prev-`cwd`, `resolve(top, "scripts/...")` became `scripts/scripts/...`, so the
+    // grader was not recognised — and CONTAINMENT did not save it either, because
+    // with the top-level bug the containment root was the subdir and `scripts/` is
+    // INSIDE it. A cwd that CONTAINS the artefact is the only placement where the
+    // two bounds do not mask each other.
+    const scripts = join(repo, "scripts");
+    ok(!checkpointWriteTargetAllowed(grader, scripts), "cwd INSIDE scripts/: the grader is still refused by identity");
+    ok(!checkpointWriteTargetAllowed(join(repo, "enforcement", "dangerous-ops.txt"), scripts), "...and so is the manifest");
     // and a genuine conflict is still resolvable (the bound did not close the window)
     _setConflictedProbeForTest(() => ["x.ts"]);
     ok(checkpointWriteTargetAllowed(join(repo, "x.ts"), sub), "an ordinary conflict is writable from a subdir cwd");
