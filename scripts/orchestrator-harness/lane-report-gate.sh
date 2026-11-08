@@ -83,7 +83,14 @@ set -u
 # another repo's worktree (a PASS) for a branch and head belonging to the named repo. Same class as the
 # `PATH`/`PYTHONPATH` seams: an inherited variable choosing the subject of the verdict. The gate never
 # needs either — it always names its repo explicitly — so they are dropped once, at entry.
-unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_COMMON_DIR
+# ⛔ `GIT_COMMON_DIR` IS THE SAME SEAM AND WAS MISSED (round-8 review, P1). It retargets BOTH `worktree
+# list` enumerations — the branch's worktree AND the main-worktree the consumer is read from — and it also
+# retargets `resolve_trusted_checkout` in lane-merge.sh, i.e. the function this gate's provenance
+# disposition relies on. Measured: with a governed repo whose branch worktree had NO report, and a clone
+# holding a digest-valid report at the same head, `GIT_COMMON_DIR=<clone>/.git` turned
+# `VERDICT=ABSENT rc=1` into `VERDICT=PASS rc=0` — graded tree and verifier both from the other repo.
+# The list below then covers every documented git variable that relocates the repository.
 
 # _lrg_emit <code> <verdict> <key=value>… — one machine-readable line on stdout, then the code.
 _lrg_emit() {
@@ -105,10 +112,22 @@ _lrg_emit() {
 # class was unchanged and only the spelling moved. So the candidates are ABSOLUTE and the inherited
 # `PATH` is never consulted. A box that has python only somewhere exotic gets code 7 UNMEASURABLE
 # (an unreadable verification is not a pass), which is the honest answer, not a silent downgrade.
+# ⛔ VERSION-GATED, NOT FIRST-FOUND (round-8 review, P1). The consumer this gate exists to run
+# (`tools/worktree_report.py`, tortoise) REFUSES an interpreter below 3.12 by design and writes NOTHING
+# to stdout when it does, so the gate saw "no JSON" and returned 7 UNMEASURABLE — a refusal the lane
+# cannot remedy — on every box whose FIRST candidate is older. `/usr/bin/python3` is Apple's 3.9 on
+# macOS (and 3.9 on Debian 11 / Ubuntu 20.04), while the 3.12+ build sits at `/opt/homebrew/bin` or
+# `/usr/local/bin`, which were consulted AFTER it. The order is now irrelevant: each candidate is probed
+# for the floor and the first that SATISFIES it wins. The harness already solves this shape for
+# `collision_preflight.py`; this is the same rule (probe, refuse by name), and 7 is only returned when
+# NO candidate meets the floor.
 _lrg_py() {
   local c
-  for c in /usr/bin/python3 /usr/local/bin/python3 /opt/homebrew/bin/python3 /usr/bin/python; do
-    [ -x "$c" ] && { printf '%s' "$c"; return 0; }
+  for c in /opt/homebrew/bin/python3 /usr/local/bin/python3 /usr/bin/python3 /opt/homebrew/bin/python \
+           /usr/local/bin/python /usr/bin/python; do
+    [ -x "$c" ] || continue
+    "$c" -I -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 12) else 1)' 2>/dev/null \
+      && { printf '%s' "$c"; return 0; }
   done
   return 1
 }
@@ -124,8 +143,9 @@ _lrg_py() {
 #       the gate with a stubbed `git` on PATH over a SYNTHETIC repo and head, so an absolute pin
 #       bypasses the stub and took 66 of that suite's rows red. Closing it needs those fixtures rebuilt
 #       around a real repository, which is its own change — not a silent omission here. Until then a
-#       lane that sets `PATH` can substitute the git that reports the head; that is filed, and the two
-#       CARRIERS are the enforcement point (`lane-merge.sh` resolves its own trusted checkout).
+#       lane that sets `PATH` can substitute the git that reports the head. That is FILED (agent-infra
+#       #3789, which carries the measurement and the 66-row bar any fix must clear), and disclosed HERE
+#       so nobody reads the seam class as closed.
 unset -f git 2>/dev/null || true
 
 # _lrg_worktree <repo> <branch> — the worktree of <repo> checked out on <branch>, or nothing.
@@ -234,10 +254,12 @@ lane_report_gate() {
   # own main worktree as "main" — measured: a lane clone plus three files returned VERDICT=PASS over a
   # graded repo that was RED. main-of-a-clone is not main-of-the-governed-repo, and the gate has no
   # trusted notion of which repo is the subject: that binding belongs to the CALLER. `lane-merge.sh`
-  # discharges it by resolving its own trusted checkout; `merge-one.sh` cannot (it is handed a path), so
-  # it refuses when the checkout's `origin` is not the repo it was told to merge — see the origin-slug
-  # guard there. The residual (a same-repo clone whose working tree edits the consumer) is the lane's
-  # own tree and would be visible in the reviewed diff; it is NOT closed here.
+  # discharges it by resolving its own trusted checkout; `merge-one.sh` CANNOT — it takes `$REPO` from
+  # argv and has no origin/identity check of its own (round-8 review, P1: an earlier version of this
+  # comment claimed an "origin-slug guard" in merge-one.sh that does not exist; it was never written,
+  # and a disclosure that promises a control the code lacks is itself the bypass). The harness DOES ship
+  # the resolver this would need (`repo-target.sh`: `remote get-url origin` -> slug,
+  # `--git-common-dir` -> which checkout); wiring it into merge-one.sh is tracked, not done here.
   if _lrg_wl="$(git -C "$repo" worktree list --porcelain 2>/dev/null)" && [ -n "$_lrg_wl" ]; then
     while IFS= read -r _lrg_line; do
       case "$_lrg_line" in
@@ -282,7 +304,7 @@ lane_report_gate() {
     return 1
   fi
 
-  py="$(_lrg_py)" || { _lrg_emit 7 UNMEASURABLE "branch=$branch worktree=$wt tool=$tool reason=no-python-interpreter head=$head"; return 7; }
+  py="$(_lrg_py)" || { _lrg_emit 7 UNMEASURABLE "branch=$branch worktree=$wt tool=$tool reason=no-interpreter-at-or-above-python-3.12 head=$head"; return 7; }
 
   # ⛔ `-I` (ISOLATED MODE) IS PART OF THE SAME TRUST BOUNDARY AS THE ABSOLUTE INTERPRETER (round-6
   # review, P0). Pinning the interpreter path closes "which PROGRAM", not "which MODULES": `python3 -c`
@@ -464,6 +486,22 @@ print("%s|%s|%s|%s|%s|%s|%s|%s" % (
   #   * `rec_head` (the head the evidence was written at) must BE the head being merged;
   #   * `live_head` (where the worktree actually is) must be too, or the evidence describes a tree that
   #     is not the one on the branch.
+  # ⛔ THE STATE'S HEAD MUST AGREE WITH THE SEALED REPORT'S HEAD (round-8 review, P1). Everything above
+  # reads `head_at_write` from `state.json` — which carries NO digest; only `WORKTREE-REPORT.md` is
+  # sealed. So the "witness a re-render cannot move" was protected against RE-RENDERING but not against a
+  # two-field EDIT: changing `head_at_write` and the newest `finished_at` turned a measured
+  # `VERDICT=STALE rc=4` into `VERDICT=PASS rc=0` with the consumer still reporting VALID, while the
+  # sealed report went on naming the OLD head — a self-contradicting artifact, which this file's own
+  # header says must not be mergeable. The rendered report stamps the same fact (`- **head at write:**`
+  # `<12 hex>`), so the two halves are cross-checked here. An ABSENT stamp on either side does not
+  # refuse (an older writer, and "an empty witness never refuses" is this file's existing rule); a
+  # DISAGREEMENT is a falsified state and refuses.
+  _sealed12="$(sed -n 's/.*head at write:[^0-9a-f]*\([0-9a-f]\{12\}\).*/\1/p' "$wt/WORKTREE-REPORT.md" 2>/dev/null | head -1)"
+  if [ -n "$_sealed12" ] && [ -n "$rec_head" ] && \
+     [ "$(printf '%s' "$rec_head" | cut -c1-12)" != "$_sealed12" ]; then
+    _lrg_emit 4 STALE "branch=$branch worktree=$wt report=$wt/WORKTREE-REPORT.md reason=state-disagrees-with-the-sealed-report sealed_head=$_sealed12 state_head_at_write=$rec_head merging_head=$head"
+    return 4
+  fi
   if [ -n "$rec_head" ] && [ "$rec_head" != "$head" ]; then
     _lrg_emit 4 STALE "branch=$branch worktree=$wt report=$wt/WORKTREE-REPORT.md reason=report-bound-to-another-head report_head=$rec_head merging_head=$head"
     return 4

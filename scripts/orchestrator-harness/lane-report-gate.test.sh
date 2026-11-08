@@ -339,8 +339,9 @@ if [ "$_cf" = "HIJACKED" ]; then ok "CONTROL an exported git function DOES shado
 if grep -q 'unset -f git' "$GATE"; then ok "…and the gate clears the git function namespace explicitly (unset -f git)"; else bad "the gate no longer clears exported git functions"; fi
 # ⛔ THE DISCLOSURE PIN. The PATH residual must stay written down, with the reason its fix was reverted, or
 # the next reader will assume the seam class is fully closed (the file claims it for python).
-if grep -q 'A `git` EARLIER ON THE INHERITED `PATH`' "$GATE" && grep -q 'REVERTED' "$GATE" && grep -q '66 of that suite' "$GATE"; then
-  ok "…and the PATH-shim residual is DISCLOSED with the measured over-block that ruled out the obvious fix"
+if grep -q 'A `git` EARLIER ON THE INHERITED `PATH`' "$GATE" && grep -q 'REVERTED' "$GATE" \
+   && grep -q '66 of that suite' "$GATE" && grep -q '#3789' "$GATE"; then
+  ok "…and the PATH-shim residual is DISCLOSED with its over-block AND a tracker reference (#3789) — so filed is checkable"
 else
   bad "the git PATH-shim residual is no longer disclosed in the gate — an open P0 would read as closed"
 fi
@@ -373,6 +374,52 @@ if printf '%s\n' "$_lm_block" | grep -E 'verified at head' | grep -qE '^[[:space
   ok "…and 'verified at head' is emitted only from the 0) arm — the log cannot claim a verdict it did not get"
 else
   bad "the 'verified at head' line is not confined to the 0) arm of the verdict case"
+fi
+
+# ── 2g. GIT_COMMON_DIR IS THE SAME SEAM AS GIT_DIR (round-8 review, P1) ────────────────────
+# ⛔ It retargets BOTH `worktree list` enumerations — the branch's worktree AND the main worktree the
+# consumer is read from — and it also retargets `resolve_trusted_checkout` in lane-merge.sh, i.e. the
+# function the provenance disposition leans on. Measured: `GIT_COMMON_DIR=<clone>/.git` turned
+# VERDICT=ABSENT rc=1 into VERDICT=PASS rc=0, with graded tree and verifier both from the other repo.
+out="$(env STUB_OK=0 STUB_RC=3 STUB_FAILING=1 GIT_COMMON_DIR=/nonexistent/common bash "$GATE" --check "$REPO" "feat/2977-tm" "$WT_HEAD" 2>&1)"; rc=$?
+if [ "$rc" = 3 ]; then ok "…and an ambient GIT_COMMON_DIR cannot retarget the enumeration either (rc=$rc)"; else bad "GIT_COMMON_DIR retargeted the enumeration: expected rc=3, got rc=$rc :: $out"; fi
+
+# ── 2h. THE STATE MUST AGREE WITH THE SEALED REPORT (round-8 review, P1) ──────────────────
+# ⛔ `state.json` CARRIES NO DIGEST — only WORKTREE-REPORT.md is sealed — so a two-field EDIT (head_at_write
+# + the newest finished_at) laundered a STALE report into PASS while the sealed report still named the
+# old head: a self-contradicting artifact, which this file's header says must not be mergeable.
+_SEALED_A="aaaaaaaaaaaa"; _SEALED_B="bbbbbbbbbbbb"
+printf '## Files changed\n- **Base:** `main` → **head at write:** `%s`\n## Suites run\n## Could not do\n' "$_SEALED_A" > "$WT/WORKTREE-REPORT.md"
+printf '{"version":1,"head_at_write":"%s","branch":"feat/2977-tm","suites":[{"n":1,"command":"x","exit":0,"finished_at":"2099-01-01T00:00:00Z"}]}\n' "$_SEALED_B" > "$WT/.worktree-report/state.json"
+drive 4 "STALE: the state claims a head the SEALED report does not name (a falsified state is self-contradicting)" STUB_OK=1 STUB_RC=0 STUB_STALE=0
+case "$LAST_OUT" in *reason=state-disagrees-with-the-sealed-report*) ok "…and it names the disagreement rather than reporting a head binding" ;; *) bad "sealed-vs-state reason: $LAST_OUT" ;; esac
+case "$LAST_OUT" in *VERDICT=PASS*) bad "a state contradicting the sealed report was read as a PASS" ;; *) ok "…and it is not reported as PASS" ;; esac
+# CONTROL: when the two halves AGREE, the honest flow still passes.
+printf '## Files changed\n- **Base:** `main` → **head at write:** `%s`\n## Suites run\n## Could not do\n' "$(printf '%s' "$WT_HEAD" | cut -c1-12)" > "$WT/WORKTREE-REPORT.md"
+_restore_state
+drive 0 "CONTROL: a report whose sealed head AGREES with the state still PASSES" STUB_OK=1 STUB_RC=0 STUB_STALE=0
+# Restore the stanza-free report the baseline fixtures use, so later arms that re-point the head are not
+# judged against a stamp from this block.
+printf '## Files changed\n## Suites run\n## Could not do\n' > "$WT/WORKTREE-REPORT.md"
+
+# ── 2i. THE INTERPRETER IS VERSION-GATED, NOT FIRST-FOUND (round-8 review, P1) ─────────────
+# ⛔ The consumer REFUSES an interpreter below 3.12 by design and prints NOTHING when it does, so the gate
+# saw "no JSON" -> 7 -> a refusal the lane cannot remedy, on every box whose FIRST candidate is older
+# (macOS `/usr/bin/python3` is 3.9; the 3.12+ build sits under /opt/homebrew, which was consulted THIRD).
+_py_chosen="$(bash -c '. "$1" >/dev/null 2>&1; _lrg_py' _ "$GATE" 2>/dev/null)"
+if [ -n "$_py_chosen" ] && "$_py_chosen" -I -c 'import sys; raise SystemExit(0 if sys.version_info>=(3,12) else 1)' 2>/dev/null; then
+  ok "the resolved interpreter MEETS the consumer's 3.12 floor ($_py_chosen)"
+else
+  bad "the resolved interpreter does not meet the 3.12 floor (got '${_py_chosen:-none}') — every merge on an older-first box would be refused"
+fi
+# ⛔ THE FLOOR VALUE ITSELF IS PINNED, not just the fact that a probe exists. On a box where every
+# candidate is 3.12 (this CI cell) lowering the floor changes no outcome, so a behavioural arm alone
+# cannot see a `>= (0, 0)` mutant — measured: it stayed green. The floor must match the consumer's
+# documented requirement, so the literal is asserted.
+if grep -q 'sys.version_info' "$GATE" && grep -q '(3, 12)' "$GATE"; then
+  ok "…and the floor is probed per candidate at the consumer's documented 3.12, not assumed from the path"
+else
+  bad "the interpreter floor is not pinned at 3.12 (first-found or a lower floor is worst-first on macOS)"
 fi
 
 # The structural half: the resolver must not consult PATH at all. Kept deliberately BLUNT (any
