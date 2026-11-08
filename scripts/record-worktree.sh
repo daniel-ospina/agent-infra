@@ -9,7 +9,9 @@
 #
 # Usage:
 #   bash scripts/record-worktree.sh add --branch <b> --worktree <dir> [--dispatch <id>] [--ts <ISO>] [--repo <label>]
-#   bash scripts/record-worktree.sh done --dispatch <id>
+#   bash scripts/record-worktree.sh done --dispatch <id> [--branch <b>] [--worktree <dir>]
+#     --branch/--worktree narrow the prune to ONE record of that dispatch (a dispatch records
+#     several worktrees; without them `done` clears every record under the dispatch).
 #   bash scripts/record-worktree.sh status [--repo <label>]
 #
 # Env overrides (tests / unusual homes):
@@ -48,17 +50,41 @@ case "$MODE" in
     fi
     ;;
   done)
-    DISPATCH=""
+    DISPATCH=""; ONLY_BRANCH=""; ONLY_WORKTREE=""
     while [[ $# -gt 0 ]]; do
       case "$1" in
         --dispatch) DISPATCH="$2"; shift 2 ;;
+        --branch) ONLY_BRANCH="$2"; shift 2 ;;
+        --worktree) ONLY_WORKTREE="$2"; shift 2 ;;
         *) echo "unknown arg: $1" >&2; exit 1 ;;
       esac
     done
     [ -n "$DISPATCH" ] || { echo "missing --dispatch" >&2; exit 1; }
     if [ -f "$RECORD_FILE" ]; then
-      grep -v "\"dispatch\":\"$DISPATCH\"" "$RECORD_FILE" > "$RECORD_FILE.tmp" 2>/dev/null || true
-      mv "$RECORD_FILE.tmp" "$RECORD_FILE" 2>/dev/null || true
+      # ⛔ PRUNE BY THE RECORD'S OWN IDENTITY, NOT BY ITS DISPATCH ALONE (#1393 R12-F1).
+      # `--dispatch` is not an identity: one dispatch records SEVERAL worktrees, so a reaper that
+      # cleared one record erased every sibling record under the same dispatch — including a
+      # record the same sweep had just KEPT. The surviving dirty tree then lost the teardown trail
+      # whose whole purpose is to make the next sweep re-report it.
+      # `--branch`/`--worktree` narrow the prune to the ONE record the caller actually examined.
+      # Both are OPTIONAL, so without them this keeps its documented whole-dispatch meaning and
+      # every existing caller is unchanged.
+      # Keys are matched with their closing quote (`"branch":"x"` never matches `"branch":"xy"`),
+      # the same pinning the sibling scanners use.
+      # ⛔ FAIL-SAFE REWRITE: a filter that dies mid-write must LEAVE the file alone. Replacing it
+      # with a partial temp file would destroy the entire teardown trail — the one failure mode
+      # this file must never have.
+      if awk -v want_d="$DISPATCH" -v want_b="$ONLY_BRANCH" -v want_w="$ONLY_WORKTREE" '
+             {
+               hit = index($0, "\"dispatch\":\"" want_d "\"") > 0
+               if (hit && want_b != "") hit = index($0, "\"branch\":\"" want_b "\"") > 0
+               if (hit && want_w != "") hit = index($0, "\"worktree\":\"" want_w "\"") > 0
+               if (!hit) print
+             }' "$RECORD_FILE" > "$RECORD_FILE.tmp" 2>/dev/null; then
+        mv "$RECORD_FILE.tmp" "$RECORD_FILE" 2>/dev/null || true
+      else
+        rm -f "$RECORD_FILE.tmp" 2>/dev/null || true
+      fi
     fi
     ;;
   status)

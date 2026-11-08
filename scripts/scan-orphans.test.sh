@@ -637,6 +637,58 @@ $RW done --dispatch d-reg >/dev/null
 git worktree remove --force "$FIX/wt-reg" >/dev/null 2>&1 || true
 git branch -D fix/reg-1 >/dev/null 2>&1 || true
 
+# ── 2ad. round-12 F1: ONE DISPATCH IS NOT ONE RECORD. `record-worktree.sh done --dispatch`
+#     pruned EVERY line carrying that dispatch, so clearing one reaped record erased a sibling
+#     record the same sweep had just KEPT — the surviving dirty tree lost the teardown trail that
+#     makes the next sweep re-report it, while `--apply` still printed "KEPT by --apply: 1".
+#     Record A is reapable (dir never existed, branch local-only); record B is a registered DIRTY
+#     worktree, so the sweep keeps it. Both share ONE dispatch: A's prune must not take B's record.
+git branch fix/sib-a
+git worktree add -q "$FIX/wt-sib-b" -b fix/sib-b
+ echo uncommitted > "$FIX/wt-sib-b/untracked.txt"
+$RW add --branch fix/sib-a --worktree "$FIX/never-a" --dispatch d-shared --ts 2026-08-01T00:00:00Z >/dev/null
+$RW add --branch fix/sib-b --worktree "$FIX/wt-sib-b" --dispatch d-shared --ts 2026-08-01T00:00:00Z >/dev/null
+OUT="$($SCAN --apply 2>&1 || true)"
+assert_contains "$OUT" "KEPT by --apply: 1 record(s)" "the shared-dispatch sweep reports the record it kept"
+assert_eq "$(wc -l < "$WORKTREES_RECORD" | tr -d ' ')" "1" "a kept sibling record survives the prune of its dispatch-mate"
+grep -qF '"branch":"fix/sib-b"' "$WORKTREES_RECORD" \
+  && ok "the SURVIVING record is the kept one (fix/sib-b), not the reaped one" \
+  || bad "the surviving record is not fix/sib-b — the prune removed the wrong line"
+[ -f "$FIX/wt-sib-b/untracked.txt" ] && ok "the dirty sibling tree is still on disk" || bad "the dirty sibling tree was removed"
+git show-ref --verify --quiet refs/heads/fix/sib-b && ok "the dirty sibling keeps its branch" || bad "the dirty sibling's branch was deleted"
+$RW done --dispatch d-shared --branch fix/sib-b --worktree "$FIX/wt-sib-b" >/dev/null
+git worktree remove --force "$FIX/wt-sib-b" >/dev/null 2>&1 || true
+git branch -D fix/sib-b >/dev/null 2>&1 || true
+git branch -D fix/sib-a >/dev/null 2>&1 || true
+
+# ── 2ae. round-12 F2: the registration test was a SUBSTRING (`*"worktree $PATH"*`), so a record
+#     naming a directory that is a strict PREFIX of a registered worktree read as REGISTERED —
+#     and IS_WT is what makes the default run print "ORPHANED (safe to remove)", the exact false
+#     PASS the is_wt paragraph forbids. The recorded dir must measure `clean` to reach that arm
+#     (an unmeasurable dir is already DIRTY), so it is a CLEAN checkout of a DIFFERENT repo whose
+#     path is a strict prefix of the live worktree's path.
+git worktree add -q "$FIX/pfx-slug" -b fix/pfx-live
+git init -q -b main "$FIX/pfx"
+git -C "$FIX/pfx" config user.email test@test.test
+git -C "$FIX/pfx" config user.name "Test Runner"
+echo pfx > "$FIX/pfx/pfx.txt"
+git -C "$FIX/pfx" add -A && git -C "$FIX/pfx" commit -qm pfx
+git branch fix/pfx-stale
+$RW add --branch fix/pfx-stale --worktree "$FIX/pfx" --dispatch d-prefix --ts 2026-08-01T00:00:00Z >/dev/null
+# The precondition: this dir is NOT registered, and only a substring test can say otherwise.
+assert_eq "$(git worktree list --porcelain | grep -cxF "worktree $FIX/pfx")" "0" \
+  "precondition: the prefix dir is genuinely unregistered (0 exact matches)"
+OUT="$($SCAN 2>&1 || true)"
+assert_not_contains "$OUT" "ORPHANED (safe to remove)" "a strict-prefix dir is never advertised as safe to remove"
+assert_contains "$OUT" "ORPHANED BUT DIRTY" "a strict-prefix dir is classified DIRTY (git does not vouch for it)"
+$SCAN --apply >/dev/null 2>&1 || true
+[ -f "$FIX/pfx/pfx.txt" ] && ok "a strict-prefix dir is never removed" || bad "--apply REMOVED a dir git does not vouch for"
+git show-ref --verify --quiet refs/heads/fix/pfx-stale && ok "its branch is kept" || bad "its branch was deleted"
+$RW done --dispatch d-prefix --branch fix/pfx-stale --worktree "$FIX/pfx" >/dev/null
+git worktree remove --force "$FIX/pfx-slug" >/dev/null 2>&1 || true
+git branch -D fix/pfx-live >/dev/null 2>&1 || true
+git branch -D fix/pfx-stale >/dev/null 2>&1 || true
+
 # ── Summary ───────────────────────────────────────────────────────────────
 echo ""
 echo "=== scan-orphans.test.sh: $PASS passed, $FAIL failed ==="

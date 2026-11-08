@@ -402,7 +402,7 @@ reap_record() {
         printf '%b' "     ⚠️ KEPT ref+record: 'refs/heads/$br' was NOT deleted — ${DCAS_REASON:-the delete was refused}.\n"
         return 1
     fi
-    bash "$SCRIPT_DIR/record-worktree.sh" done --dispatch "$dispatch" >/dev/null 2>&1 || true
+    bash "$SCRIPT_DIR/record-worktree.sh" done --dispatch "$dispatch" --branch "$br" --worktree "$dir" >/dev/null 2>&1 || true
     if [ "$forced" = true ]; then
         printf '%b' "     removed (--force-dirty: uncommitted work was destroyed by request).\n"
     else
@@ -453,7 +453,7 @@ if [ -f "$RECORD_FILE" ]; then
             GHOSTS=$((GHOSTS + 1))
             GHOST_OUT="${GHOST_OUT}  👻 GHOST RECORDS: branch=$BRANCH dispatch=$DISPATCH (never existed)\n"
             if [ "$APPLY" = true ]; then
-                bash "$SCRIPT_DIR/record-worktree.sh" done --dispatch "$DISPATCH" >/dev/null 2>&1 || true
+                bash "$SCRIPT_DIR/record-worktree.sh" done --dispatch "$DISPATCH" --branch "$BRANCH" --worktree "$DIR" >/dev/null 2>&1 || true
                 GHOST_OUT="${GHOST_OUT}     pruned record.\n"
             fi
             continue
@@ -486,8 +486,15 @@ if [ -f "$RECORD_FILE" ]; then
             # negative under `pipefail` would make a REGISTERED worktree look
             # unregistered on the destructive --apply path (#864).
             WT_LIST="$(git worktree list --porcelain 2>/dev/null)" || REG_CLAIMS=unknown
-            case "$WT_LIST" in
-                *"worktree $WT_CANON"*) IS_WT=true ;;
+            # ⛔ THE PATH LINE IS PINNED BY ITS TERMINATOR (#1393 R12-F2). An unpinned
+            # `*"worktree $WT_CANON"*` is a SUBSTRING test, so a record naming a directory that is a
+            # strict prefix of a registered worktree (`…/fix-801` vs `…/fix-801-slug`) read as
+            # REGISTERED — and IS_WT is exactly what makes the default run call it
+            # "ORPHANED (safe to remove)", the false PASS the paragraph below forbids. `worktree
+            # <path>` is never the last line of a porcelain block (HEAD/branch/locked follow), so the
+            # trailing newline is always present and pins the identity without narrowing a real match.
+            case "$(printf '%s\n' "$WT_LIST")" in
+                *"worktree $WT_CANON"$'\n'*) IS_WT=true ;;
             esac
             # ⛔ A FAILED READ IS NOT "NOTHING CLAIMS IT" (round-8 F2, the G1 rule one layer up).
             # `|| true` left REG_CLAIMS=false, so a record `--apply` refuses (because the list could
