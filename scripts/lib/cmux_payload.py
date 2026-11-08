@@ -245,10 +245,12 @@ def _resolve_session_id_qualified(workspace: str, run, attempts: int = 3,
     caller of `cmux surface resume show` is WORKSPACE-ONLY (`orchestrator-heartbeat.sh:1425`,
     `ask-owner.py:1051`, `lane-status.py:968`, `lane-read.py:21`), and `--surface` is recorded as a
     flag of `send` / `read-screen` — not of the `resume` scope. A cmux that rejects the flag exits
-    NON-ZERO, this function then names no session, and the caller's best reachable verdict drops to
-    `PANE_ONLY` — i.e. the floor would report `NOT-SUBMITTED` on every tick on a HEALTHY fleet. So a
-    FAILED surface-qualified read retries once WORKSPACE-ONLY, which is exactly the pre-#3795
-    behaviour.
+    NON-ZERO, and the fallback below then asks the WORKSPACE form, which is the pre-#3795 behaviour.
+    ⛔ WHAT THAT FALLBACK BUYS IS NARROWER THAN IT LOOKS (#3795 review cycle 2, P2). It preserves THIS
+    FUNCTION's public contract — name the pane's session — and the send still reaches the pane. It does
+    NOT raise the *certification* ceiling for `send_verified`, which discards an unqualified id (next
+    paragraph), so a flag-rejecting box still caps at `PANE_ONLY`. The two facts are consistent and
+    must be read together: the retry buys availability, never proof.
 
     ⛔ BUT AN UNQUALIFIED ANSWER MAY NOT AWARD A VERDICT (#3795 review P2). "Better than naming
     nothing" is true for SENDING to the pane and false for CERTIFYING it. On a box whose cmux rejects
@@ -272,12 +274,13 @@ def _resolve_session_id_qualified(workspace: str, run, attempts: int = 3,
     budget for a fallback: this runs only after every surface-qualified read already FAILED, and the
     case it exists for — a cmux that does not know the flag — is deterministic, so three more 45 s
     reads buy nothing while spending the floor's slack. Session resolution costs at most 3x45 s
-    qualified + 1x45 s fallback; a second full budget would put the whole verification window past
-    the lock takeover (`-mmin +6`) on a slow-but-working cmux.
+    qualified + 1x45 s fallback; a second full budget would push the whole verification window past
+    the floor's own tick budget (~413 s of a 450 s interval — see `cadence-nudge.sh`'s receipt budget),
+    and the floor's lock is now held by identity as well as age for exactly that reason.
     """
 
     def probe(surface_arg: str | None, budget: int | None = None) -> tuple[str | None, bool]:
-        """`(session id or None, did any read actually SUCCEED)`."""
+        """`(session id or None, did the read that PRODUCED it actually succeed)`."""
         read_ok = False
         for attempt in range(max(1, budget if budget is not None else attempts)):
             try:
@@ -287,20 +290,40 @@ def _resolve_session_id_qualified(workspace: str, run, attempts: int = 3,
                 out = getattr(proc, "stdout", "") or ""
                 # A non-zero exit is a FAILED READ, not an empty answer. `_default_run` does not
                 # raise on one, so this is the only place that fact is available.
-                if getattr(proc, "returncode", 0) == 0:
+                this_read_ok = getattr(proc, "returncode", 0) == 0
+                if this_read_ok:
                     read_ok = True
             except Exception:                                  # noqa: BLE001
                 out = ""
+                this_read_ok = False
             for tok in out.replace("'", " ").split():
                 if len(tok) == 36 and tok.count("-") == 4:
-                    return tok, True
+                    # ⛔ THE FLAG MUST REPORT THE STATUS OF THE READ THAT YIELDED THE TOKEN (#3795
+                    # review cycle 2, P2). This returned a hardcoded `True`, so a cmux that errors on
+                    # `--surface` but still prints the WORKSPACE's id (rc=2) was reported as
+                    # surface-QUALIFIED -- and qualification is the one fact `send_verified` relies on
+                    # to deny the transcript arms. Measured: `qualified=True`, verdict `VERIFIED`, i.e.
+                    # an id out of a FAILED read certifying a send. The comment three lines up states
+                    # the rule this return was breaking; now it is the value, not the rule.
+                    return tok, this_read_ok
             if attempt + 1 < max(1, budget if budget is not None else attempts):
                 sleep(retry_s)
         return None, read_ok
 
     session_id, read_ok = probe(surface)
+    if session_id is not None:
+        # ⛔ A TOKEN OUT OF A **FAILED** READ IS NOT THIS SURFACE'S SESSION (#3795 review cycle 2, P2).
+        # The bug this closes was in `probe` (it returned a hardcoded `True`), but the value it returns
+        # is only consulted here, so the correction has to land here too: a cmux that errors on
+        # `--surface` and still prints the WORKSPACE's id hands back a real id from a read we know
+        # failed, and reporting it QUALIFIED lets `send_verified` take its baseline from — and search
+        # for the payload tail inside — another pane's transcript. The honest answer is "an id, from a
+        # read we could not trust"; the caller then refuses to certify from it.
+        #   When the caller named NO surface there is no other surface to confuse it with, so the
+        #   pre-existing behaviour stands exactly: every existing caller's qualification is unchanged.
+        return session_id, (read_ok if surface else True)
     qualified = True
-    if session_id is None and surface and not read_ok:
+    if surface and not read_ok:
         _warn("surface-qualified `surface resume show` gave no readable answer; "
               "retrying workspace-only (this cmux may not accept --surface)")
         session_id, _ = probe(None, budget=1)

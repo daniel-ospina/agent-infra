@@ -22,9 +22,11 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import shutil
 import stat
 import subprocess
 import textwrap
+import time
 
 import pytest
 
@@ -1289,10 +1291,12 @@ def test_verify_cli_forwards_a_surface(P, monkeypatch):
 # printed with no reference to the exit code and no verification at all. Under #1187 that receipt
 # certified a pane that had received only a prefix — and the log is what the next reader takes as
 # the receipt. The readers that actually exist are named below, and this is a file whose subject is a
-# claim that must name its evidence — so do not grow the list without opening the file:
-#   * `scripts/cadence-nudge.sh:84` — the floor's own due read;
-#   * `scripts/orchestrator-heartbeat.sh:475` — the TICK's rate-limit clock (it reads `NUDGE at=`
-#     and ignores `delivered=`);
+# claim that must name its evidence — so do not grow the list without opening the file. Cite them by
+# PATTERN, not by line number: this block already rotted once, in the very commit that added it, when
+# a header/lock edit above the due read shifted its number from 84 to 117.
+#   * `scripts/cadence-nudge.sh`, the `last=$(sed -n 's/.*NUDGE at=…` due read — the floor's own clock;
+#   * `scripts/orchestrator-heartbeat.sh`, the `LAST=$(grep -o 'NUDGE at=[0-9]*' "$LOG" …)` rate limit —
+#     the TICK's clock; it reads `NUDGE at=` and ignores `delivered=`;
 #   * a human reading the log when a beat is missing.
 # NOT `scripts/session-postmortem.sh`: it turns a pi session `*.jsonl` into a retrospective and
 # contains no reference to this log, `NUDGE`, `delivered` or `$STATE` (verified: 0 matches). Naming it
@@ -1403,6 +1407,199 @@ def _seeded_log(seconds_ago):
     import time as _t
     return ("NUDGE at=%d delivered=yes (cadence-floor) gap=1m queue=[] alerts=[] ask=[]\n"
             % (int(_t.time()) - seconds_ago))
+
+
+# ── the LOCK: who holds it, and how it may be reclaimed (#3795 review P1 + cycle 2 P1) ──────
+#
+# This block had NO test at all, and both defects in it were therefore mutation-invisible. They were
+# measured failures in OPPOSITE directions, so a test for one is worthless without the other:
+#   * age-only takeover RACED a live nudge — the critical section grew to ~413 s while the bound
+#     stayed at 360 s, so a second tick rmdir'd a lock whose owner was still typing and both sent a
+#     heartbeat seconds apart;
+#   * pid-only takeover WEDGED THE FLOOR FOREVER — a killed nudge leaves the pid file, a recycled pid
+#     then "is alive" for ever, every tick took the loser path, and nothing was written. Permanently
+#     dead with a clean log. (The repo already ruled on this shape: `auto-rail.sh` — "a pid is not an
+#     identity".)
+# The four arms below are the contract: a genuine live holder is not raced; a pid that is not this
+# script is not a holder; an unowned young lock is held (fail-closed on the mkdir→pid window); and a
+# genuine holder past the absolute ceiling IS reclaimed, so nothing can wedge the floor permanently.
+
+def _lock(state, pid=None, age_s=None, pid_inside=False):
+    """Create the floor's lock. `pid` goes to the SIBLING file (this version) or inside (old format)."""
+    lock = state / "cadence-nudge.lock"
+    lock.mkdir(exist_ok=True)
+    if pid is not None:
+        target = lock / "pid" if pid_inside else state / "cadence-nudge.lock.pid"
+        target.write_text(f"{pid}\n", encoding="utf-8")
+    if age_s is not None:
+        t = time.time() - age_s
+        os.utime(lock, (t, t))
+    return lock
+
+
+def _live_holder_that_is_not_a_nudge(tmp_path):
+    """A live pid whose argv does NOT name cadence-nudge.sh — a recycled or foreign pid."""
+    return subprocess.Popen(["sleep", "120"])
+
+
+def _live_holder_named_like_the_floor(tmp_path):
+    """A live process whose argv NAMES cadence-nudge.sh — what the identity check must accept.
+
+    `ps -o args=` must show the script name, so the binary is copied under that name rather than
+    re-exec'ing with a patched argv (bash 3.2 on macOS has no `exec -a`).
+    """
+    fake = tmp_path / "cadence-nudge.sh"
+    shutil.copy(shutil.which("sleep"), fake)
+    return subprocess.Popen([str(fake), "300"])
+
+
+def test_a_failed_surface_read_that_still_prints_an_id_is_not_qualified(P):
+    """⛔ A REAL ID OUT OF A **FAILED** READ IS STILL NOT THIS SURFACE'S (#3795 review cycle 2, P2).
+
+    `probe` returned a hardcoded `True` for the qualification flag, so a cmux that errors on
+    `--surface` (rc=2) and still prints the WORKSPACE's session id was reported as
+    surface-QUALIFIED — and that flag is the one fact `send_verified` relies on to deny the transcript
+    arms. Measured before the fix: `qualified=True`, verdict `VERIFIED` — an id out of a failed read
+    certifying a send. The empty-stdout shape was already pinned; this is the OTHER half, one fixture
+    attribute away.
+    """
+    sid = "01a0d648-4097-74b8-8cfd-3df3a071b463"
+
+    def run(argv, timeout=None):
+        if argv[:3] == ["cmux", "surface", "resume"] and "--surface" in argv:
+            # Errors, but still prints an id — the shape a partial/older cmux produces.
+            return _Proc(f"{sid}\n", returncode=2)
+        if argv[:3] == ["cmux", "surface", "resume"]:
+            return _Proc(f"{sid}\n")
+        return _Proc("")
+
+    got, qualified = P._resolve_session_id_qualified(
+        "ws-1", run, sleep=_noop_sleep, surface="surf-9")
+    assert got == sid, got
+    assert qualified is False, (
+        "an id out of a FAILED surface read was reported as the caller's own surface")
+
+
+def test_a_workspace_only_caller_is_unchanged_by_the_qualification_rule(P):
+    """The qualification rule must not move a caller that named NO surface (every pre-#3795 caller,
+    including `orch-send.sh`): there is no other surface to be confused with, so its argv AND its
+    qualification stay exactly as they were."""
+    sid = "01a0d648-4097-74b8-8cfd-3df3a071b463"
+    seen = []
+
+    def run(argv, timeout=None):
+        seen.append(list(argv))
+        if argv[:3] == ["cmux", "surface", "resume"]:
+            return _Proc(f"{sid}\n")
+        return _Proc("")
+
+    got, qualified = P._resolve_session_id_qualified("ws-1", run, sleep=_noop_sleep)
+    assert got == sid
+    assert qualified is True, "a workspace-only caller was downgraded by a surface-only rule"
+    assert all("--surface" not in argv for argv in seen), seen
+
+
+def test_cadence_nudge_does_not_race_a_live_holder_and_says_so(tmp_path):
+    """A genuine live nudge holds its lock: this tick must decline, SEND NOTHING, and LOG the skip.
+
+    The log line is half the contract: an invisible skip is how the floor died with a clean log.
+    """
+    seed = _seeded_log(600)
+    home, bindir, screen, state = _cadence_home(
+        tmp_path, "the pane shows nothing relevant\n", seed)
+    holder = _live_holder_named_like_the_floor(tmp_path)
+    try:
+        _lock(state, pid=holder.pid, age_s=60)        # young: well inside the ceiling
+        sent = tmp_path / "SENT"
+        r = _run_cadence_nudge(home, bindir, screen, session=sent)
+        assert r.returncode == 0, r.stdout + r.stderr
+        assert not sent.exists(), "raced a live holder and sent a second heartbeat"
+        nudges, appended = _new_nudge_lines(state, seed)
+        assert not nudges, "a skipped tick stamped a receipt:\n" + appended
+        assert "lock-held" in appended, (
+            "the skip was silent — an invisible skip is how the floor dies with a clean log:\n" + appended)
+    finally:
+        holder.terminate()
+        holder.wait(timeout=10)
+
+
+def test_cadence_nudge_reclaims_a_lock_whose_pid_is_not_a_nudge(tmp_path):
+    """⛔ THE P1: A RECYCLED OR FOREIGN PID MUST NOT WEDGE THE FLOOR FOR EVER.
+
+    `kill -0` proves a pid EXISTS, never that it is the nudge that wrote it. With a pid-only guard, an
+    unrelated long-lived process holding a recycled number silenced the floor permanently and
+    silently. The lock here is old AND its pid is alive, so only the identity check can save it.
+    """
+    seed = _seeded_log(600)
+    home, bindir, screen, state = _cadence_home(
+        tmp_path, "the pane shows nothing relevant\n", seed)
+    holder = _live_holder_that_is_not_a_nudge(tmp_path)
+    try:
+        # ⛔ THE AGE IS THE WHOLE POINT: 500 s is PAST the 360 s grace (so a pid-only guard's `elif`
+        # would not save it) and INSIDE the 20-min ceiling (so the bounded-reclaim arm does not rescue
+        # it either). Only the IDENTITY check can reclaim this lock. Measured: at 3600 s (past the
+        # ceiling) a pid-only guard also passes, which is exactly how a vacuous version of this test
+        # was caught.
+        _lock(state, pid=holder.pid, age_s=500)
+        sent = tmp_path / "SENT"
+        r = _run_cadence_nudge(home, bindir, screen, session=sent)
+        assert r.returncode == 0, r.stdout + r.stderr
+        assert sent.exists(), (
+            "a lock whose pid is a LIVE UNRELATED process wedged the floor — the permanently-dead-"
+            "with-a-clean-log state")
+    finally:
+        holder.terminate()
+        holder.wait(timeout=10)
+
+
+def test_cadence_nudge_reclaims_a_lock_past_the_ceiling_even_if_a_nudge_holds_it(tmp_path):
+    """A genuine holder is not raced — but it is not immortal either.
+
+    Past the absolute ceiling (2.7 timer intervals) its message is stale anyway, and a duplicate
+    heartbeat is explicitly not the dangerous duplicate a duplicate lane ORDER is. Without this arm a
+    genuinely hung checker would hold the floor for ever, which is the same wedge by another route.
+    """
+    seed = _seeded_log(600)
+    home, bindir, screen, state = _cadence_home(
+        tmp_path, "the pane shows nothing relevant\n", seed)
+    holder = _live_holder_named_like_the_floor(tmp_path)
+    try:
+        _lock(state, pid=holder.pid, age_s=60 * 40)    # far past the 20-min ceiling
+        sent = tmp_path / "SENT"
+        r = _run_cadence_nudge(home, bindir, screen, session=sent)
+        assert r.returncode == 0, r.stdout + r.stderr
+        assert sent.exists(), "a holder past the absolute ceiling wedged the floor for ever"
+    finally:
+        holder.terminate()
+        holder.wait(timeout=10)
+
+
+def test_cadence_nudge_lock_arms_for_an_unowned_lock(tmp_path):
+    """No pid file: HELD while young (fail-closed on the mkdir→pid window), reclaimed once stale.
+
+    Both halves matter. Dropping the young arm re-opens the concurrent-send race for a run killed
+    between `mkdir` and its pid write; dropping the stale arm makes such a lock (and an old-format
+    lock from the previous version) wedge the floor.
+    """
+    # (a) young, no pid → held, nothing sent.
+    seed = _seeded_log(600)
+    home, bindir, screen, state = _cadence_home(
+        tmp_path, "the pane shows nothing relevant\n", seed)
+    _lock(state, age_s=60)
+    sent_a = tmp_path / "SENT_A"
+    r = _run_cadence_nudge(home, bindir, screen, session=sent_a)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert not sent_a.exists(), "an unowned YOUNG lock was taken over — the mkdir→pid race is open"
+
+    # (b) stale, no pid (and the pid written INSIDE the dir by the intermediate version) → reclaimed.
+    seed_b = _seeded_log(600)
+    home_b, bindir_b, screen_b, state_b = _cadence_home(
+        tmp_path / "b", "the pane shows nothing relevant\n", seed_b)
+    _lock(state_b, pid=999999, age_s=3600, pid_inside=True)
+    sent_b = tmp_path / "SENT_B"
+    r = _run_cadence_nudge(home_b, bindir_b, screen_b, session=sent_b)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert sent_b.exists(), "a stale lock was never reclaimed — the floor is wedged"
 
 
 def test_cadence_nudge_does_not_report_a_prefix_as_delivered(tmp_path):
