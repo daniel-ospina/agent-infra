@@ -276,8 +276,9 @@ REC_HEAD=""; REC_REF=""; REC_BEHIND="unknown"; REC_AHEAD="unknown"; REC_DIRTY="u
 REC_PIN="none"; REC_PIN_TREE="none"; REC_ACTION="none"; REC_DETAIL=""; REC_REMEDY=""; PRESERVED_DIR=""; REC_DEPLOYED="unknown"
 # ⛔ THE FARM ROWS ARE FIELDS, NOT PROSE (tortoise#10114 arm 2, review round 9). The acceptance arm is
 # "a scheduled check that NAMES EACH drifting file"; the journal excerpt below is bounded at 12 so a
-# 30-row farm had 18 files that were COUNTED and never named anywhere durable. `not-graded` is the
-# truthful value on every path that never reached the farm block (a pre-flow refusal).
+# 30-row farm had 18 files that were COUNTED and never named anywhere durable. `not-graded` means NO
+# USABLE GRADE was produced — the switch is off, a refusal exited first, or the instrument's rc was
+# unreadable (`action=` distinguishes those; the arm that cannot read a grade must not claim one).
 REC_FARM_ROWS="not-graded"; REC_FARM_NROWS="not-graded"
 # ⛔ THE DRIFT ROWS ARTIFACT IS SELF-DATING AND IS NEVER DELETED BY A LATER PASS (review round 2).
 # Round 1 deleted it on every pass so a stale list could not be read as current — and that delete was
@@ -336,8 +337,9 @@ write_record() { # <ok> <rc>
         # ⛔ `farm_rows=` NAMES THE FILE THAT NAMES EVERY DRIFTING FILE (tortoise#10114 arm 2). Besides
         # a path it can be `none` (the farm matched — this pass wrote NO list, and whatever is on disk
         # is not today's answer), `unwritable` (the rows write failed while this record still wrote:
-        # said out loud rather than silently leaving 18 files named nowhere) or `not-graded` (this pass
-        # never reached the farm block).
+        # said out loud rather than silently leaving 18 files named nowhere) or `not-graded` (NO USABLE
+        # GRADE was produced: the switch is off, a refusal exited first, or the instrument's rc was
+        # unreadable — `action=` says which: `farm-unknown` vs `none`).
         printf 'farm_rows=%s\n' "$REC_FARM_ROWS"
         printf 'farm_n=%s\n' "$REC_FARM_NROWS"
         printf 'preserved=%s\n' "${PRESERVED_DIR:-none}"
@@ -1408,7 +1410,11 @@ if [ "$FARM_CHECK_ON" = "1" ]; then
                 # required to be absolute here, and a relative `farm_rows=` value is resolvable only
                 # from the pass's own cwd — useless to the fleet reader the field exists for.
                 if [ "${FARM_ROWS_FILE#/}" = "$FARM_ROWS_FILE" ]; then
-                    _sd="$(cd "$STATE_DIR" 2>/dev/null && pwd)" || _sd=""
+                    # ⛔ `CDPATH=` IS LOAD-BEARING (review round 3). bash's `cd` PRINTS the resolved
+                    # directory when it resolves through an inherited CDPATH, so `_sd` would hold two
+                    # lines and the "absolute" path would name a directory containing a newline — a
+                    # writable state dir then records `farm_rows=unwritable` and the list is lost.
+                    _sd="$(CDPATH= cd "$STATE_DIR" 2>/dev/null && pwd)" || _sd=""
                     [ -n "$_sd" ] && FARM_ROWS_FILE="$_sd/harness-apply-farm-rows.txt"
                 fi
                 # ⛔ THE OUTCOME IS TRACKED SEPARATELY FROM THE VALUE (review round 1). Branching the
@@ -1458,6 +1464,10 @@ if [ "$FARM_CHECK_ON" = "1" ]; then
                 fi ;;
             *)
                 REC_ACTION=farm-unknown
+                # ⛔ `not-graded` STAYS HERE ON PURPOSE (review round 3): an UNREADABLE grade is not a
+                # grade, and the rows fields must never imply one. `action=farm-unknown` is the field
+                # that says the farm WAS looked at and could not be read — the two together are the
+                # truth, and neither alone would be.
                 finish 0 24 "farm: UNKNOWN (check-farm-drift rc=$FARM_RC) — $FARM_DEST could not be graded against $REF, and cannot-verify is not a pass: $(printf '%s' "$FARM_OUT" | grep -m1 -iE 'unknown|cannot|refus' || printf 'no reason printed')" ;;
         esac
     fi

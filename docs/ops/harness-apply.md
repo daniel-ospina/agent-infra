@@ -115,7 +115,7 @@ dirty=0
 pin=ce987bb2c1de
 pin_tree=ce987bb2c1de
 drift=clean:current          <- the deployed-drift reading, `<state>:<token>` (`executes:<dir>` is the red one)
-farm_rows=none               <- `none` (farm matched — no list written by this pass, so any list on disk is not today's answer), `not-graded` (never graded), `unwritable`, or the FILE naming every drifting file
+farm_rows=none               <- `none` (farm matched — no list written by this pass, so any list on disk is not today's answer), `not-graded` (NO USABLE grade — see `action=`), `unwritable`, or the FILE naming every drifting file
 farm_n=0                     <- rows the farm grade reported: a COUNT when graded (0 when the farm matched), `not-graded` otherwise
 preserved=none
 remedy=none                  <- the ACTION for a refusal, never truncated (`detail=` is bounded at 240)
@@ -139,9 +139,9 @@ names that file.
 The artifact lives at a **fixed path** and is **self-dating**: its first line carries the UTC
 timestamp, ref, dest and row count of the run that wrote it. No later pass deletes it, so a reader
 who opens it directly can always tell how old it is — and **`farm_rows=` is the currency
-indicator**, not the file's presence: `none` (a graded farm matched) and `not-graded` (this pass
-never looked — the switch is off, or a refusal exited first) both mean the list on disk is *not*
-today's answer. Deletion was tried and removed: it fired on the read-only verbs (`--print-status`,
+indicator**, not the file's presence: `none` (a graded farm matched) and `not-graded` (no usable
+grade was produced — the switch is off, a refusal exited first, or the instrument's rc was
+unreadable, which `action=farm-unknown` names) both mean the list on disk is *not* today's answer. Deletion was tried and removed: it fired on the read-only verbs (`--print-status`,
 which the timer installer itself calls), it sat below the seam validations so those refusals still
 orphaned the list, and a fixed-path delete can unlink a concurrent pass's just-published file
 between its write and its record.

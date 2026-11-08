@@ -1450,6 +1450,30 @@ assert_contains "$(cat "$T/t24r/state/harness-apply.status" 2>/dev/null || true)
     "T24 control: while still carrying the instrument's row count"
 assert_contains "$OUT" "named NOWHERE durable" \
     "T24 control: and the journal says the elided rows are named nowhere, rather than implying they are on disk"
+# ⛔ A RELATIVE SEAM MUST STILL PUBLISH AN ABSOLUTE PATH (review round 3). Every fixture above reaches
+# the pass through `run_pass`, which pins an ABSOLUTE HARNESS_APPLY_STATE_DIR — so the absolutisation
+# was untested and reverting it kept this suite green. This case invokes the pass directly with a
+# RELATIVE state dir from a known cwd, and an inherited CDPATH, which is the pair that made bash's `cd`
+# print a SECOND line and turn the "absolute" path into garbage.
+mk_origin t24s; mk_clone t24s
+REPO_P="$CLONE"; MODE_P=sync
+mkdir -p "$T/t24s/home/.pi/agent/scripts" "$T/t24s/cwd"
+# ⛔ THE CDPATH ELEMENT MUST CONTAIN `relstate` ITSELF, not its grandparent (VGATE round 3, measured):
+# with CDPATH="$T/t24s" the `cd relstate` resolves through "." and bash prints NOTHING, so the fixture
+# stayed green on a pass whose `CDPATH=` prefix had been reverted. "$T/t24s/cwd" is the dir relstate
+# lives in, so the resolution really goes through CDPATH.
+OUT="$(cd "$T/t24s/cwd" && CDPATH="$T/t24s/cwd" HARNESS_REPO="$REPO_P" HARNESS_REF=origin/main HARNESS_FETCH=1 \
+    HARNESS_APPLY_STATE_DIR=relstate HARNESS_APPLY_MODE="" \
+    HARNESS_PIN="$T/t24s/home/.pi/agent/state/HARNESS-PIN" HARNESS_PIN_FILE="$T/t24s/home/.harness-path" \
+    HARNESS_PIN_DIR="$T/t24s/home/harness" CELL_HOME="$T/t24s/home" O="$T/t24s/home/orchestrator" \
+    HARNESS_APPLY_SYNC_CMD="$T/sync-stub.sh" HARNESS_APPLY_FARM_CHECKER="$T/t24q/stub-checker.sh" \
+    bash "${PASS_UNDER_TEST:-$PASS_SH}" 2>&1)"; RC=$?
+assert_eq "$RC" "24" "T24 control: a RELATIVE state dir still grades drift RED (24)"
+assert_contains "$(cat "$T/t24s/cwd/relstate/harness-apply.status" 2>/dev/null || true)" \
+    "farm_rows=$T/t24s/cwd/relstate/harness-apply-farm-rows.txt" \
+    "T24 control: and the record publishes an ABSOLUTE path (not one resolvable only from the pass's cwd, and not CDPATH-mangled)"
+assert_contains "$(cat "$T/t24s/cwd/relstate/harness-apply-farm-rows.txt" 2>/dev/null || true)" "n=20" \
+    "T24 control: and that absolute path really holds the list"
 # ⛔ THE COUNT MUST NOT COUNT PROSE. The instrument prints class-prose lines that contain the same
 # words as a row ("A STALE file is a copy …"), so a whole-line match reported 3 real rows as 7
 # (review round 8). 20 stub rows + 2 prose lines must still read as 20.
