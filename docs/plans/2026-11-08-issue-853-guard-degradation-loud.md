@@ -74,7 +74,7 @@ leaves exactly one row) and **C14b** (the throw does not propagate out of `sessi
 Properties that make it safe:
 
 - **Placed before every early return** in `session_start` — a degradation report that sat behind the
-  escape-hatch return (`index.ts:5177`) would be silent on the sessions that need it most. Pinned by
+  escape-hatch return (`index.ts:5218`) would be silent on the sessions that need it most. Pinned by
   **C12** (a hatched arm still gets the banner + the row) and **C12b** (source-order: the call precedes
   `if (_isAllowMainEdits()) return;`).
 - **Once per session process** (`_classifierDegradedPids`), so `/resume` cannot spam the banner or
@@ -88,10 +88,10 @@ Properties that make it safe:
 
 | Thing | Call site / importer / consumer | What it does there |
 |---|---|---|
-| `_reportClassifierDegradation` | `extensions/main-worktree-guard/index.ts:5142` — the only caller, first statement of `pi.on("session_start")` (`:5137`); its own definition is `:5072` | turns the degraded state into the banner + notify + event |
+| `_reportClassifierDegradation` | `extensions/main-worktree-guard/index.ts:5183` — the only caller, first statement of `pi.on("session_start")` (`:5178`); its own definition is `:5113` | turns the degraded state into the banner + notify + event |
 | `_classifierLoadFailure` | written in the classify-git load `catch` (`index.ts:399-404`, the write at `:402`); read only by `_reportClassifierDegradation` | carries the real load error into the banner and the event's `error` field |
 | `_classifierDegradedPids` | read+written only inside `_reportClassifierDegradation` | once-per-session-process dedupe (mirrors the existing pid-keyed `warnedDeviations`) |
-| `appendJsonl` (`extensions/shared/audit-log.ts`) | imported at `index.ts:147`; existing callers `:539`, `:4094`, `:4711`, `:5360`; new caller inside `_reportClassifierDegradation` at `:5104` | appends one JSONL row to `~/.pi/agent/audit/gate-events.jsonl`; already fail-safe (never throws) |
+| `appendJsonl` (`extensions/shared/audit-log.ts`) | imported at `index.ts:147`; existing callers `:539`, `:4103`, `:4752`, `:5401`; new caller inside `_reportClassifierDegradation` at `:5145` | appends one JSONL row to `~/.pi/agent/audit/gate-events.jsonl`; already fail-safe (never throws) |
 | `GateEventName` (`extensions/shared/audit-log.ts:72`) | the shape a report/replay MATCHES ON; `extensions/shared/audit-log.test.ts`; Part C `C13` | `GATE_EVENT_NAMES` (`:47-71`) is the runtime source and `GateEventName` (`:72`) is derived from it, so membership is ASSERTABLE (`appendJsonl` still takes `Record<string, unknown>`, so the type alone enforces nothing): deleting the member reddens `audit-log.test.ts` + `C13`. |
 | `isPrintMode()` (`extensions/shared/print-mode.ts`) | already imported at `index.ts:146`; new call site inside `_reportClassifierDegradation` | suppresses the `ui.notify` arm for headless lanes, which get the banner in their own log |
 | `module-load-hooks.mjs` (`resolve`/`load`) | imported by `test-module-load.mjs` Part B (in-process) and by the new Part C probe (child process) | Part C wraps `load` to make `classify-git.mjs` throw while evaluating — the ONE injection |
@@ -113,7 +113,11 @@ Properties that make it safe:
    ⛔ The labels are disjoint on purpose: `C13` is the vocabulary pin, `C14` the ordering pin — a
    report citing "C13" must name ONE assertion.
 4. Mutation proof — every arm must be able to go RED, or it is a pin that cannot fail. **All five
-   re-measured at this head against the 152-assertion baseline, not carried forward:**
+   re-measured at this head against the 152-assertion baseline, not carried forward** (every
+   `path:line` locator in this doc was re-measured at `d10888aad`, the head after `origin/main` was
+   merged in — the merge shifted `index.ts` lines, so the pre-merge numbers are all stale; the
+   placement mutant was re-run there and still reddens exactly **C12 + C12b**: `150 passed, 2 failed`
+   against the same 152 baseline):
    - delete the `session_start` wiring → **13 red** (C1-C9, C12, C12b, C13, C14);
    - delete only the durable row → **6 red** (C7, C8, C9, C12, C13, C14);
    - restore the pre-fix ordering (row LAST, one shared `try`) → **1 red** (C14);
