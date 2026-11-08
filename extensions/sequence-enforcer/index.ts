@@ -1015,18 +1015,19 @@ function auditLog(entry: Record<string, unknown>) {
  * reviewer's genuine verdict then read `current = 0`, skipped the advance block, and was silently
  * discarded (review round 5, P1).
  *
- * ⛔ `ts` IS REQUIRED, not decorative: `readEnforcementLog` below drops any row whose `ts` is not a
- * string into its `skipped` counter (`EnforcementLogEntry`, declared in THIS file at `:1046`, types
- * `ts` as a required `string`; the reader's admission test is at `:1119`), and `auditLog` does NOT
- * stamp it — so a row written without `ts` is on disk but unreadable, which is indistinguishable
- * from the event never having happened (review round 6, P1). Every other event row in this file
- * carries `ts` + `step_name`; this helper is the ONE place the no-verdict rows are written, so
- * neither can be forgotten again.
+ * ⛔ `ts` IS REQUIRED, not decorative: `readEnforcementLog` drops any row whose `ts` is not a string
+ * into its `skipped` counter, and `auditLog` does NOT stamp it — so a row written without `ts` is on
+ * disk but unreadable, which is indistinguishable from the event never having happened (review
+ * round 6, P1). The requirement is declared by the `EnforcementLogEntry` interface in THIS file,
+ * whose `ts` is a required `string`, and enforced by that reader's admission test. Every other event
+ * row in this file carries `ts` + `step_name`; this helper is the ONE place the no-verdict rows are
+ * written, so neither can be forgotten again.
  *
- * (Corrected in review round 7: this comment and the round-6 commit message cited an
- * `EnforcementLogEntry.ts` file that does not exist — the interface is inline in this file. The
- * requirement itself was verified; only the pointer was wrong, and a wrong pointer is what makes the
- * next reader re-derive the whole finding.) */
+ * ⛔ CITED BY SYMBOL, NOT BY LINE NUMBER, on purpose — and this is the second correction on this
+ * paragraph. Round 6 cited an `EnforcementLogEntry.ts` file that does not exist; round 7 replaced it
+ * with line numbers that the round-7 edit itself shifted by +6. A pointer that rots on the next
+ * edit reproduces the exact defect it was written to fix, silently, because a comment is the only
+ * consumer. Names cannot rot; numbers do. */
 function releaseReviewerReservation(skill: SkillState, stepName: string, outcome: string, evidence: string): void {
   auditLog({
     ts: new Date().toISOString(),
