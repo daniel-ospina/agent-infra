@@ -115,6 +115,8 @@ dirty=0
 pin=ce987bb2c1de
 pin_tree=ce987bb2c1de
 drift=clean:current          <- the deployed-drift reading, `<state>:<token>` (`executes:<dir>` is the red one)
+farm_rows=none               <- `none` (farm matched), `not-graded` (NO USABLE grade), `unwritable` (rows write failed), or the FILE naming every drifting file
+farm_n=0                     <- rows the farm grade reported: a COUNT when graded (0 when the farm matched), `not-graded` when no grade was produced, `unparsed` when a RED grade's completeness could not be PROVEN (rows did not match this pass's extractor, or no readable `DRIFT` summary was printed; the artifact's header reads `n=unparsed`; `0` would read as "nothing drifted")
 preserved=none
 remedy=none                  <- the ACTION for a refusal, never truncated (`detail=` is bounded at 240)
 action=none
@@ -126,6 +128,210 @@ detail=current: the pin tree already names origin/main — head=ce987bb2c1de dep
 `detail` is the verdict sentence **plus the readings appended by the recorder**, so the line
 an operator (or the fleet instrument) reads can never carry numbers from before a move.
 `fetch=` and `behind=` are the two fields BOTH readers gate on.
+
+⛔ **`farm_rows=not-graded` CANNOT BE TOLD FROM A CLEAN NO-OP BY `action=`.** TWO arms write
+`action=none` — a farmless host and a deliberately DISARMED check (`HARNESS_APPLY_FARM_CHECK=0`) —
+which is the same value a pass that GRADED the farm and found it clean writes. `farm_rows=not-graded`
+is what separates them, and only the journal's `farm: SKIPPED` line says which of the two it was.
+
+⛔ **`farm_rows=` EXISTS BECAUSE A COUNT IS NOT A NAME** (tortoise#10114 arm 2: "a scheduled
+check that names *each* drifting file"). The journal keeps a bounded human view — 12 rows, then
+"… and N more" — so on a 30-row farm 18 files were counted and named nowhere durable (measured
+on the `cmux` cell, 2026-11-07). Every row the instrument reports is therefore written, atomically,
+to `${HARNESS_APPLY_STATE_DIR:-$HOME/.pi/agent/state}/harness-apply-farm-rows.txt` — absolutised, so a
+relative `HARNESS_APPLY_STATE_DIR` still yields a path another process can open — and the record
+names that file.
+
+⛔ **`farm_rows=unwritable` IS A PATH-SPECIFIC REFUSAL, NOT AN UNWRITABLE STATE DIR.** The artifact and
+the record are staged in the SAME directory by the SAME technique, so a state dir that refuses writes
+fails the RECORD too: the pass exits 23, `write_record`'s staging fails, and the PREVIOUS record
+stands — that is a staleness signal, not a field, and it is stated again below. What actually produces
+`unwritable` is an artifact path that cannot be **published** while the record can (a directory sitting
+at the path, a failed rename). In that state there is no artifact *from this pass* — and whatever an
+earlier pass left at the fixed path is untouched, so the record naming `unwritable` is what tells a
+reader that the file on disk is not this run's list.
+
+The artifact lives at a **fixed path** and is **self-dating**: its first line carries the UTC
+timestamp, ref, dest and row count of the run that wrote it. No later pass deletes it, so a reader
+who opens it directly can always tell how old it is — and **`farm_rows=` is the currency
+indicator**, not the file's presence: `none` (a graded farm matched) and `not-graded` (no usable
+grade was produced — the switch is off, there was **no farm to grade**, a refusal exited first, or
+the instrument's rc was unreadable) both mean the list on disk is *not* today's answer. **`action=` is
+not the tie-breaker here**: it names the unreadable-rc case (`farm-unknown`) and the pre-flow
+refusals, but the DISARMED switch and the FARMLESS host BOTH carry `action=none` — the same value a
+clean no-op carries — so on those two the journal's own `farm: SKIPPED — …` line is the only thing
+that says which (and a deliberately disarmed farm gate is a P0 condition worth seeing, not a benign
+controller-only host). Deletion was tried and removed: it fired on the read-only verbs (`--print-status`,
+which the timer installer itself calls), it sat below the seam validations so those refusals still
+orphaned the list, and a fixed-path delete can unlink a concurrent pass's just-published file
+between its write and its record.
+
+⛔ **A CONCURRENT PASS CAN REPLACE THE FILE THIS RECORD NAMES — READ THE HEADER BEFORE YOU TRUST THE LIST.**
+The path is fixed and the publish is a last-writer-wins rename, while the record is written later
+(in `finish`, after the deployed readings, ~3–4 s of `check-deploy-drift` later), so a timer tick
+overlapping an operator's hand-run can leave pass A's record naming pass A's rows while the file at
+that path holds pass B's. The write is atomic (a reader never sees half a list, and no pass ever
+removes another's file), but it is **not per-run**, and the header is what you can decide with:
+
+- the header's `ref=` and `dest=` are the **ref name and farm path this record's `detail=` quotes** —
+  on the drift arms `detail=` reads `farm: DRIFT — <the arm sentence>; <dest> is NOT the code <ref>
+  ships`; the `rc=0`-contradicts-its-report and `rc=0`-with-no-verdict arms read `… for <dest> against
+  <ref> …`; and the give-up arm (the instrument's own exit 2) reads `<dest> could not be graded against
+  <ref>` — the same two variables either way, in three different sentences (the record has NO `dest=`
+  field of its own, and the record's `ref=` is the RESOLVED SHORT SHA, a different value on purpose — do
+  not compare those). ⛔ COMPARE ONLY THE CLAUSE THAT QUOTES THEM — the text between `is NOT the code `
+  and the end of that clause on a drift arm, or the `<dest> … against <ref>` span on any `farm-unknown`
+  arm, whichever sentence that arm prints — because BOTH values sit at the tail that the
+  240-byte bound cuts, and the readings `finish` appends AFTER them (`— head=… ref=<checkout sha> …
+  drift=…`) carry a `ref=` of their own that is the record's SHORT SHA, not the ref name; a reader who
+  greps the last `ref=` compares the wrong token and rejects a correct artifact. Within that clause:
+  the visible farm path must be a **prefix** of the header's `dest=`, and the visible fragment after
+  `is NOT the code ` **up to the next space** must be a prefix of the header's `ref=` (clip at that
+  space: a whole clause reads `origin/main ships — …`, which is LONGER than the ref and is not a prefix
+  of it — without the clip the test rejects the very records it exists to accept). WHERE the clause
+  breaks cannot be stated as a number: it depends on the ARM SENTENCE's own length (a longer arm starts
+  the clause later in the field) and on the farm path, so the ONE property to rely on is that the
+  visible part is always a PREFIX of the whole — the clause is either entire or cut from the right,
+  never altered in the middle. Compare the visible prefix and nothing else; when the clause is cut, the
+  header's `dest=`/`ref=` are authoritative. A `detail=` whose VISIBLE farm or ref
+  DISAGREES is a different pass's and is what this rule rejects. (The arm sentence leads `detail=`
+  precisely so a truncation can never eat the diagnosis.)
+- the header's UTC must **not be later than** the record's `at=` (the artifact is published first,
+so a header timestamp *after* the record's own is the one cheap impossibility — compare same-format
+strings, both UTC, NOT the header's UTC against the record's `epoch=`);
+- the header's `n=` must equal the record's `farm_n=`, **except** when the header reads `n=unparsed`
+  — then `farm_n` is `unparsed` (the paragraph below governs), or `not-graded` when the header ALSO
+  says `NO GRADE` (the instrument gave up with its own non-0/1/3 code — 2 is the common one — or the
+  checker's exit status contradicted its own report; either way the file holds its output verbatim and
+  no grade exists, so the header is the field that separates "not graded" from "graded, 2 rows" — see
+  the `farm-unknown` paragraph below).
+
+Those rules cannot separate two passes that produced the **same** row count inside this record's own
+publish→`finish` window (~3–4 s); nothing in the artifact can, and claiming otherwise is worse than
+saying so. What they do rule out is a list published **after** this record was written — a later pass
+that died between its publish and its `finish`, leaving its file where this record names it. (A list
+published *before* the record is the normal, honest shape: the artifact is stamped at publish time
+and `at=` seconds later, which is exactly why rule 2 permits `header ≤ at=` instead of demanding
+equality.)
+
+`farm_n=unparsed` on a RED (`action=farm-drift`, `rc=24`) record means this pass's **extractor** could
+not PROVE it accounted for every row the instrument reported — the installed `check-farm-drift.sh` is a
+copy whose row vocabulary this pass does not know (a farm that lags the ref), so it matched none of
+them, only some of them, or the proof itself was absent. The proof used is the instrument's own summary
+(`DRIFT — <n> stale …, <n> declared-but-absent, <n> unsourced`), and it cuts BOTH ways: the extraction
+is unproven when the extracted rows are **fewer** than that sum, when they are **more** (a widened
+vocabulary that names a healthy `ok`/`LOCAL`/`SYMLINK` row), when **no readable summary was printed at
+all**, and when **any of the three labels did not parse** (an instrument that says `2 missing` instead
+of `2 declared-but-absent` would otherwise reduce the proof to the stale count alone, and certify a
+short list as complete) — an unprovable extraction is not a complete one, so "cannot prove it" takes
+the same door as "proved it wrong". The proof is also **closed**: a summary that carries a `<n> <label>`
+component this pass does not count (a fourth class, `3 not-landed`) makes it unprovable, because the sum
+is built from the three labels it knows — an unread fourth class would leave those rows out of numerator
+AND denominator and let `2 == 2` certify a list that dropped them. The summary is read from a line with
+**no pipe on it** (a row always carries its separators, so a farm file named `3 stale.py` is never taken
+for the summary), and it need not carry the instrument's `PROG: DRIFT — ` prefix: a lagging farmed copy
+that prints the same three labels on its own summary line still proves or refutes the extraction. Unproven, the artifact carries the instrument's **RAW output** verbatim, with
+`n=unparsed` in its header. The DRIFT is still red and still recorded. The names are wherever the
+instrument printed them — in that file whenever it published, and in this run's own journal excerpt (at
+most the first 12 lines: the rows this pass MATCHED when it matched any, the instrument's own output
+when it matched none) only when the publish failed — so the record says "published verbatim" and never
+"every one named".
+
+`farm_rows=<path>` with `n=unparsed` is ALSO written when the instrument printed **nothing** for a red
+grade: the artifact is a header and **no body line at all** (an empty body writes none — a blank line
+would be a stray row for anyone sizing the list with `wc -l - 1`), and the record's `detail=` says so
+instead of claiming output was published. That is the one state where a published list can name no
+file — because the instrument named none. (A checker that exits 0 printing nothing at all is the same
+silence on a different arm: it records `farm_rows=not-graded` and publishes NO file, so "printed nothing"
+has one artifact outcome — none — rather than a header-only file claiming an output that never existed.)
+
+`action=farm-unknown` (`rc=24`) is also the answer when the checker's exit status CONTRADICTS its own
+report — `rc=0` over a report that names drift. `HARNESS_APPLY_FARM_CHECKER` is a seam, so a wrapper
+that reports the *pipeline's* status (`bash inner "$@" 2>&1 | tee -a log`) returns 0 over a drifting
+farm; the report wins over the status (the output is published with a `NO GRADE` header and `remedy=`
+names the wrapper), because an exit code that contradicts what it printed is not a grade. **`rc=0` is
+refused on the `DRIFT —` VERDICT, not on one of its counts** — a summary reading `DRIFT — 0 stale, 2
+declared-but-absent, 0 unsourced` is drift in a class a `stale`-only parse does not read, and a checker
+whose row vocabulary this pass does not match leaves the row half blind too, so counting `stale` alone
+would record `farm: ok` / `farm_rows=none` over two files the farm owes. The instrument prints `OK —` on a
+match, so the verdict line by itself is the contradiction. The row half uses the SAME predicate and the
+SAME three-label summary proof as the drift arm (one vocabulary, so the guard can never be weaker than
+the branch it guards) — the summary half is what catches the class the row predicate does not know: a
+report whose rows read `drift`/`missing` is invisible to the extractor, so a `DRIFT — 2 stale, …` total
+beside an `rc=0` is the contradiction. A ZERO total is not one: a copy printing both verdict forms over a
+matching farm says `0 stale, 0 declared-but-absent, 0 unsourced`, and that stays a match.
+**Absence of evidence is not a match either:** an `rc=0` report this pass cannot CLASSIFY is refused,
+because every other test on this arm fires only on something it can positively recognise. Two signals,
+each named in the journal as an unclassifiable summary or row
+(with a `remedy=` pointing at the checker's vocabulary, not at the farm): a pipe-free line carrying two
+of the three label words with no parsable total, and a per-file row whose trailing token is neither benign
+(`verdict`, `ok`, `LOCAL (declared)`, `SYMLINK (graded via its target)`) nor a class this pass knows. One
+label word in prose is NOT a summary — a healthy copy that mentions a `stale` entry while matching still
+records a proven match. A checker that exits 0 printing **nothing** is refused too — the instrument
+always prints a summary, so a silent exit produced no evidence and is not a match. ⛔ **And output being
+non-empty is not a report either:** a match is PROVEN by the instrument's own `OK —` line, so an `rc=0`
+whose output carries **no verdict** — the `bash inner "$@" 2>&1 | tee -a log` wrapper whose `inner` is
+missing, where `tee` supplies the 0 and the only output is bash's error line — is `farm-unknown`, never
+`farm: ok`. Without that, `farm_rows=none` / `farm_n=0` would certify a farm that was never graded and
+`--print-status` would answer `status=ok` for it. A wrapper over a genuinely matching farm still passes
+(it prints the instrument's verdict), and prose/summary lines are never read as rows (the class token
+must END the line). The verdict probes are anchored on the instrument's LINE shape rather than on the bare token, because a
+per-file ROW can carry either word — measured both ways: an unanchored `OK — ` certified a match over a
+report whose only "OK" was a filename, and an unanchored `DRIFT — ` refused a genuine match whose output
+merely mentioned the word. The anchor is **no pipe anywhere on the line** (`^[^|]*: OK — [^|]*$`), not
+merely "no pipe before the token": a row's FIRST field is its PATH, so a prefix-only anchor still let
+`weird: OK — x.py | … | DRIFTED` certify a match. A verdict line never contains a pipe; a row always does.
+
+`farm_rows=<path>` is ALSO written on `action=farm-unknown` — on all THREE producers: the arm where the
+instrument gives up (its own exit 2), the `rc=0`-contradicts-its-report arm, and the `rc=0`-with-no-verdict
+arm. All three publish under the same `NO GRADE` header, because a refusal that names nobody is the very
+gap this PR closes. On the give-up arm, the
+instrument prints its per-file rows BEFORE the exits that give up (`matched == 0`, a partly ungradeable
+declaration), so "no grade" never meant "nothing was reported": the file carries that output verbatim
+with a `NO GRADE` header, `farm_n=not-graded` still says no grade was produced, and `farm_rows=` stays
+`not-graded` only when the instrument printed nothing at all.
+
+`remedy=` carries the instrument's own `Next:` block on ANY refusal that has one — the drift arms and
+the give-up `farm-unknown` arm (rc=2), which is the one that often prints it last — and the one actionable text it
+prints, which is per class ("re-run the farm", "declare it LOCAL, delete, or retire it", "a deploy
+cannot fix this") — so the record never names a defect and leaves nobody an action. A checker that
+printed no `Next:` block (a mis-worded farmed copy, or one that died after its rows) makes `remedy=`
+say exactly that and name the manual route (`read farm_rows= … and re-run check-farm-drift.sh`), and
+`detail=` carries no remedy clause at all (it sat at the end of the bounded field and was cut
+mid-word) — `remedy=` is the only place the action appears, and it is never truncated. A checker seam
+that cannot be RESOLVED is a refusal of the same kind, with its own action: a link cycle is refused at
+40 hops (`break the link cycle`) and a link whose target is gone keeps the "no `check-farm-drift.sh`
+could be found" answer — neither is ever executed, and neither is reported as the OTHER one.
+
+`farm_rows=unwritable` means the rows write failed **while the record write still succeeded**. On the
+DRIFT arms the drift is still red, `farm_n` still carries the count it had (or `unparsed` when the
+extraction was **not proven complete** — a partial match counts here too, not only a total miss), and
+the journal says in as many words that the rows are named nowhere durable: with more than 12 rows it
+names the cut only (`rows 13..N are named NOWHERE durable`), and with 12 or fewer — where the whole list
+was in the excerpt and nothing would otherwise be said — it says the full list could not be persisted and
+that the rows above are in this run's output only (a COMPLETE extraction is not exempt: the state that
+matters is the failed write, not the elision), plus that a stale artifact from an earlier pass may still
+sit at that path. The two states are exclusive: the `N>12` arm owns the cut, the `N<=12` arm owns the
+silence, so the journal never prints both and never counts rows it did not print. On
+the `farm-unknown` arm (any of the three producers — an instrument that gave up with its own exit 2, an
+`rc=0` that contradicts its report, or an `rc=0` that printed no verdict line) the field alone carries it: `farm_n=not-graded`, and the journal prints
+only its UNKNOWN line — a checker that printed rows before giving up had them captured, but nothing was
+ever excerpted and no artifact was written, so those names are durable nowhere (that is the price of a
+failed write on an arm with no grade to justify another one). When the instrument printed nothing at
+all, the journal says *that* instead of claiming a raw output could not be persisted. (A state dir that
+is unwritable for the record too leaves the PREVIOUS record in place: staleness, not a field, is that
+signal.)
+
+⛔ **`detail=` IS BOUNDED, SO IT LEADS WITH THE DIAGNOSIS AND NO SENTENCE INLINES THE ARTIFACT PATH.** The
+field is cut at 240 bytes, so *what comes last is what gets lost*: with the farm path first, a 92-char
+farm pushed the arm sentence past the bound (`…; RAW output published verba`) and a very long one left
+nothing but a path — the record then stated no diagnosis at all. The arm sentence now comes FIRST and
+the farm path after it (the artifact's own `dest=` header is the authoritative copy of that path), and
+no sentence inlines the artifact path — they all say "see `farm_rows=`", which is the field that
+carries the path (or `unwritable`) in the same record. The bound also truncates at a **byte** and used
+to land inside a multi-byte character — leaving one invalid UTF-8 sequence that made
+`grep '^detail='` classify the WHOLE record as binary and print nothing, so the truncation now stops at
+the last ASCII byte (a boundary a multi-byte sequence cannot straddle).
 
 ⛔ `deployed` EXISTS BECAUSE THE CHECKOUT IS NOT THE DEPLOYMENT. A pin-per-commit cell
 never moves its checkout, so `behind` measured there would be permanently non-zero and
@@ -304,7 +510,7 @@ checkout can use the documented hatch. The same interaction is recorded for
 
 ## Tests
 
-`scripts/harness-apply-timer.test.sh` — 279 assertions, run by the
+`scripts/harness-apply-timer.test.sh` — 584 assertions, run by the
 `harness-apply-timer` shard of `run-bash-shards.sh`:
 
 | | |
@@ -325,6 +531,7 @@ checkout can use the documented hatch. The same interaction is recorded for
 | T13 | the cadence seam is validated (`abc`, `0`, `1441` refused); a value that does not divide the hour (7) is kept — the artifact states the cadence it keeps |
 | T14 | a **stale** record (including one dated in the FUTURE) is an alarm, a non-numeric staleness bound is refused, and no record at all is `never`, not success |
 | T24 | the **FARM** is graded against the ref: stale → **RED 24** naming the file, exit 3 (undeployable) is red too, a matching farm keeps the normal verdict, an **absent** farm is skipped by name while a **dangling** link reddens, an invalid seam value is refused *before* any move, and a checker living **inside** the farm it grades is refused rather than trusted |
+| T24r | the **rows artifact**'s own lifecycle: every reported row is written (header + all 20, including the last, which no excerpt can show), an **unwritable** artifact path is recorded as `unwritable` rather than silently dropped, a **clean** and a **not-graded** pass each LEAVE the previous list **with its rows intact** and say so in `farm_rows=` (presence is not the promise — `grep -c .` is asserted beside the planted line, so a pass that TRUNCATES the file reds, which a `[ -f ]` row cannot see) |
 | T26 | the materialiser is **TOLD which cell home to pin into**: under the rendered unit's own environment (`env -i`, `HOME` and no `CELL_HOME`) a stub that reproduces `cloud-cell-supervisor.sh`'s defaulting pins under the pass's own root and the farm grade is then reachable (**24**); reverted one edit, the same stub pins into the scratch default and the pass reports **25** "nothing moved this box" — never reaching predicate 4 (agent-infra#3593) |
 | T15 | a dirty **tracked symlink** is restored as a symlink, and the clean file it pointed at is byte-for-byte untouched (this repo tracks 34 symlinks; writing the blob through the link corrupted the target) |
 

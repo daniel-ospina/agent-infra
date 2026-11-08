@@ -151,7 +151,33 @@ set -uo pipefail
 # `set -u` the unguarded form printed "BASH_SOURCE[0]: unbound variable" on EVERY tick, left $HERE empty
 # (silently degrading the repo-resolution fallback to `.`), and broke `--help` through the launcher. The
 # sibling artifact this launcher already runs carries the same note (scripts/disk-reaper.sh).
-HERE="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)"
+# ⛔ `CDPATH=` ON EVERY CAPTURED `cd` (review round 5). bash's `cd` PRINTS the resolved directory when it
+# resolves through an inherited CDPATH, so the captured value holds TWO lines — and every containment
+# test below then compares against a string containing a newline. Measured consequence (reproduced):
+# with a RELATIVE `HARNESS_APPLY_FARM_CHECKER` and a CDPATH that resolves its directory,
+# `$FARM_CHECKER_REAL` could never carry the `$FARM_DEST_REAL/` prefix, so a FARM-LOCAL checker read as
+# "outside the farm" and the farm GRADED ITSELF GREEN — the exact fail-open this leg exists to remove.
+# `$HERE` is the same hazard when this file is invoked by a relative path (a two-line `$HERE` would
+# defeat `$REPO` resolution and any EXACT comparison against it). ⛔ THIS SITE **IS** PINNED — `T27` —
+# and the earlier note that it could not be was wrong about WHERE to look. The `case "$HERE"` farm-shape
+# refusals below are SUFFIX matches, so they cannot discriminate a doubled value; the observable that
+# does is the `deployed_drift=not-run` line (`:720`), which QUOTES `$HERE` — a two-line value pushes a
+# newline into the text that must follow it on the same line. So T27 invokes this file by a RELATIVE
+# path from a cwd carrying `CDPATH` (the pair that makes `cd <dirname>` print) and asserts the boundary
+# after the quoted path: removing this `CDPATH=` reds that row and nothing else. Note the directory must
+# NOT begin with `.` — `cd` ignores CDPATH for a `.`-prefixed argument, so no `.pi/agent/scripts`-shaped
+# dirname can reach the hazard, which is why a farm-shaped fixture pins nothing. (`$FARM_DEST_REAL`/
+# `$HERE_REAL` carry the prefix too, but both `cd` targets are already absolute — `$FARM_DEST` is refused
+# when relative and `$HERE` comes from `pwd` — so those two are inert defence.) ⛔ THE SYMLINK HOP
+# (`*)` in the loop below) IS THE SIXTH SITE AND IT IS PINNED TOO — `T24x2`, one site over from `T24x`:
+# a RELATIVE LINK checker inside the farm, run from a cwd carrying a CDPATH that resolves its directory,
+# resolved to a TWO-LINE `$FARM_CHECKER_T`, was read as OUTSIDE the farm, and GRADED ITSELF `farm: ok` at
+# rc=0. MEASURED at this head: dropping this `CDPATH=` reds TWO rows — `T24x2`'s containment row and its
+# "not the missing-instrument sentence" row — and leaves the rc and `farm: ok` rows green, because the
+# `[ ! -f "$FARM_CHECKER_T" ]` refusal added in review round 20 stops the two-line path before it can be
+# executed, so the wrong ANSWER replaces the wrong ACTION. Both red rows pin the prefix; the other two are
+# not pins for it and must not be counted as such.
+HERE="$(CDPATH= cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)"
 
 log_line()  { printf '%s\n' "$*"; }
 err()  { printf '%s: %s\n' "${0##*/}" "$*" >&2; }
@@ -274,9 +300,31 @@ fi
 # from "no pass has run", and that is the false-PASS shape this feature exists to remove.
 REC_HEAD=""; REC_REF=""; REC_BEHIND="unknown"; REC_AHEAD="unknown"; REC_DIRTY="unknown"
 REC_PIN="none"; REC_PIN_TREE="none"; REC_ACTION="none"; REC_DETAIL=""; REC_REMEDY=""; PRESERVED_DIR=""; REC_DEPLOYED="unknown"
+# ⛔ THE FARM ROWS ARE FIELDS, NOT PROSE (tortoise#10114 arm 2, review round 9). The acceptance arm is
+# "a scheduled check that NAMES EACH drifting file"; the journal excerpt below is bounded at 12 so a
+# 30-row farm had 18 files that were COUNTED and never named anywhere durable. `not-graded` means NO
+# USABLE GRADE was produced, and FOUR states produce it: the switch is off, there was NO FARM TO GRADE,
+# a pre-flow refusal exited first, or the instrument's rc was unreadable. `action=` names only the last
+# two (`farm-unknown`, or the refusal's own action): BOTH of the first two carry `action=none`, the same
+# value a clean no-op carries, so `farm_rows=` cannot split them either — the journal line is what does
+# (`farm: SKIPPED — HARNESS_APPLY_FARM_CHECK=0 (deliberately disarmed…)` vs `farm: SKIPPED — no farm at
+# …`). Neither may ever read like a pass that graded and found nothing to name.
+REC_FARM_ROWS="not-graded"; REC_FARM_NROWS="not-graded"
+# ⛔ THE DRIFT ROWS ARTIFACT IS SELF-DATING AND IS NEVER DELETED BY A LATER PASS (review round 2).
+# Round 1 deleted it on every pass so a stale list could not be read as current — and that delete was
+# wrong three ways: it fired on the READ-ONLY verbs (`--print-status`, the readiness verb the timer
+# installer itself calls, would have destroyed the list its own record names), it sat below the seam
+# validations so those refusals still orphaned it, and a fixed-path delete can unlink a CONCURRENT
+# pass's just-published file between its write and its record (nothing serialises them; the timer
+# fires while an operator may run the pass by hand). So the artifact is WRITTEN WITH ITS OWN HEADER
+# (UTC, ref, dest, n) and left alone: a reader can always date it, and `farm_rows=` is the currency
+# indicator — `none`/`not-graded` means the list on disk is NOT today's answer.
+# ⛔ AND ONLY THIS PASS'S OWN TEMP IS EVER REMOVED: a `$FARM_ROWS_FILE.tmp-*` glob would unlink a
+# concurrent pass's in-flight temp and turn its successful write into a false `unwritable`.
+FARM_ROWS_FILE="$STATE_DIR/harness-apply-farm-rows.txt"
 # ⛔ `REC_REMEDY` IS A FIELD FOR THE SAME REASON `preserved=` IS (review finding, #10114). Measured
 # on the deployed-drift refusal: its `detail=` is 706 characters and the word `Remedy:` begins at
-# offset 272 — so `cut -c1-240` DISCARDS THE ENTIRE REMEDY from the durable record. stderr still
+# offset 272 — so the 240-byte `detail=` bound DISCARDS THE ENTIRE REMEDY from the durable record. stderr still
 # showed it, which is exactly why it survived review: an operator reading a LIVE terminal sees the
 # remedy, and the operator reading the record (or fleet-health, or `--print-status`, or a lane on
 # the next day) sees a refusal that names no action. A refusal whose remedy is lost is a gate that
@@ -316,6 +364,17 @@ write_record() { # <ok> <rc>
         # no-checkout / unresolvable-ref pass exited 1 with NO record and no diagnostic instead of the
         # documented 23. `not-run` is also the truthful value there: those paths never reached the reading.
         printf 'drift=%s\n' "${DRIFT_STATE:-not-run}${DRIFT_TOKEN:+:$DRIFT_TOKEN}"
+        # ⛔ `farm_rows=` NAMES THE FILE THAT NAMES EVERY DRIFTING FILE (tortoise#10114 arm 2). Besides
+        # a path it can be `none` (the farm matched — this pass wrote NO list, and whatever is on disk
+        # is not today's answer), `unwritable` (the rows write failed while this record still wrote:
+        # said out loud rather than silently leaving 18 files named nowhere) or `not-graded` (NO USABLE
+        # GRADE was produced: the switch is off, there was no farm to grade, a refusal exited first, or
+        # the instrument's rc was unreadable). ⛔ `action=` DOES NOT NAME ALL OF THEM: the DISARMED arm
+        # and the farmless SKIPPED arm both write `action=none`, which is also what a graded-clean pass
+        # writes — there `farm_rows=` itself is the signal, and only the journal's `farm: SKIPPED` line
+        # says which of the two it was.
+        printf 'farm_rows=%s\n' "$REC_FARM_ROWS"
+        printf 'farm_n=%s\n' "$REC_FARM_NROWS"
         printf 'preserved=%s\n' "${PRESERVED_DIR:-none}"
         # ⛔ NOT TRUNCATED, and last, for the same reason as `preserved=` above: a remedy is the one
         # line a reader MUST be able to act on, so it is never at the mercy of a prose bound. Bounded
@@ -324,7 +383,7 @@ write_record() { # <ok> <rc>
         printf 'action=%s\n' "$REC_ACTION"
         printf 'lanes=none-signalled\n'
         printf 'fetch=%s\n' "${FETCH_STATE:-notfetched}"
-        printf 'detail=%s\n' "$(printf '%s' "$REC_DETAIL" | tr '\n' ' ' | cut -c1-240)"
+        printf 'detail=%s\n' "$(bounded "$(printf '%s' "$REC_DETAIL" | tr '\n' ' ')")"
     } >"$tmp" 2>/dev/null \
         || { rm -f "$tmp"; err "cannot stage the pass record in $STATE_DIR"; return 1; }
     mv -f "$tmp" "$RECORD" || { rm -f "$tmp"; err "cannot write the pass record at $RECORD"; return 1; }
@@ -333,6 +392,131 @@ write_record() { # <ok> <rc>
 }
 
 short() { [ -n "${1:-}" ] && printf '%s' "$1" | cut -c1-12; }
+
+# ⛔ A BOUNDED FIELD MUST STILL BE READABLE TEXT (review round 11, reproduced). `cut -c1-240` is
+# BYTE-oriented on GNU coreutils, so a multi-byte character straddling byte 240 is SPLIT and the record
+# then holds an invalid UTF-8 sequence — and `grep '^detail=' <record>`, which is how every key=value
+# reader (fleet-health, the suite's own assertions) reads the record, classifies the whole file as
+# BINARY and prints NOTHING for the pattern. Measured on a record whose byte 240 landed inside a
+# multi-byte character: `grep '^detail='` printed ``binary file matches`` on stderr and zero bytes on
+# stdout, so the one field that answers "what happened" read as ABSENT. (Which character straddles the
+# bound is an accident of the record's own length — do not read the sentence above as naming one.) So
+# the truncation stops at the
+# last ASCII byte: every multi-byte UTF-8 sequence is composed of bytes >= 0x80, so a prefix that ends
+# on an ASCII byte cannot split one — no locale, iconv or multibyte-aware `substr` required.
+bounded() {
+    printf '%s' "$1" | LC_ALL=C awk -v n=240 '
+        { if (length($0) > n) { s = substr($0, 1, n); sub(/[^ -~]+$/, "", s); print s } else print }'
+}
+
+# ⛔ ONE ROW VOCABULARY AND ONE SUMMARY PROOF, SHARED BY BOTH ARMS THAT READ A CHECKER'S OUTPUT (review
+# round 24, measured). The rc=0 contradiction check had grown its OWN row predicate (`NF>=4` and a
+# `stale`-only summary read) while the drift arm had another — so a report whose drift lay entirely in
+# the other two classes was refused at rc=3 and certified CLEAN at rc=0: measured with
+# `handmade-a.py | drift` rows and `DRIFT — 0 stale …, 0 declared-but-absent, 2 unsourced`, a `tee`
+# wrapper made the pass print `farm: ok` / `farm_rows=none` / `farm_n=0` and publish NO artifact, both
+# names durable nowhere. One predicate governs both branches now; there is no second copy to keep in step.
+farm_drift_rows() {
+    printf '%s\n' "$1" | awk -F'|' '$NF ~ /(^|[[:space:]])(STALE|UNSOURCED|NOT-EXECUTABLE|DECLARED-BUT-ABSENT)[[:space:]]*$/'
+}
+
+# The instrument's own drift TOTAL, from its VERDICT LINE, and ONLY when the proof is CLOSED — the same
+# proof the drift arm uses. Prints NOTHING when a label is absent, the line is not the verdict, or the
+# line carries a class this pass does not count, so "cannot prove" never degenerates to 0 and never
+# silently shrinks to the classes it knows.
+# ⛔ ANCHORED ON "NO PIPE ON THE LINE", NOT ON THE WORD (review round 31, measured twice): a per-file
+# ROW's first field is its PATH, so `grep -m1 '[0-9]* stale'` took a row for a file literally named
+# `3 stale.py` as the summary and reported a complete, parsable summary as ABSENT (over-block plus a
+# false reason: "no COMPLETE, parsable summary"). A ROW always carries its separators, a summary line
+# never does — the same invariant `FARM_VERDICT0` uses one level over — and it is the weaker anchor on
+# purpose: a lagging farmed copy may print its summary without the `PROG: DRIFT — ` prefix (or as
+# `PROG: summary — …`), and those lines must still prove or refute the extraction.
+# ⛔ AND THE VOCABULARY IS CLOSED (review round 31, measured): the total was built from the labels this
+# pass knows (`stale` + `declared-but-absent` + `unsourced`), so a report carrying a FOURTH class
+# (`3 not-landed`) excluded those rows from the numerator AND the denominator — `2 == 2` then took the
+# COMPLETE arm and certified "every one named" over a list that dropped three files the instrument
+# reported. An unrecognised `<n> <label>` component means the proof is ABSENT, exactly like an
+# unparsable one; the bookkeeping labels the instrument prints alongside are allow-listed by name.
+farm_sum_count() {
+    local _l="" _a="" _b="" _c="" _bad=""
+    _l="$(printf '%s\n' "$1" | grep -E '^[^|]*$' | grep -m1 '[0-9][0-9]* stale' || true)"
+    [ -n "$_l" ] || return 0
+    # ⛔ THE COUNT MAY START THE LINE (review round 31, measured: the label seds required a NON-DIGIT
+    # before the number, so a copy that prints its summary without the `PROG: DRIFT — ` prefix — the
+    # count at column 1 — was reported as having printed no parsable summary at all, an over-block with a
+    # false reason over a summary that was printed and does parse). Two expressions per label: the
+    # start-of-line form and the preceded-by-anything form, in that order.
+    _a="$(printf '%s' "$_l" | sed -n -e 's/^\([0-9][0-9]*\) stale.*/\1/p' \
+                                     -e 's/.*[^0-9]\([0-9][0-9]*\) stale.*/\1/p')"
+    _b="$(printf '%s' "$_l" | sed -n -e 's/^\([0-9][0-9]*\) declared-but-absent.*/\1/p' \
+                                     -e 's/.*[^0-9]\([0-9][0-9]*\) declared-but-absent.*/\1/p')"
+    _c="$(printf '%s' "$_l" | sed -n -e 's/^\([0-9][0-9]*\) unsourced.*/\1/p' \
+                                     -e 's/.*[^0-9]\([0-9][0-9]*\) unsourced.*/\1/p')"
+    # ⛔ `_a` IS NOT A SEPARATE GATE. The pre-filter above ALREADY matched `<n> stale`, so a second test on
+    # the same occurrence can never fail — it was a guard whose condition could not be false (the
+    # "inert enforcer" class this file's own rules forbid). `_b`/`_c` are genuinely optional in the
+    # instrument's output, so they still gate the proof.
+    [ -n "$_a" ] || return 0
+    { [ -n "$_b" ] && [ -n "$_c" ]; } || return 0
+    _bad="$(printf '%s\n' "$_l" \
+        | grep -oE '[0-9][0-9]* [A-Za-z][A-Za-z-]*' \
+        | awk '{ print tolower($2) }' \
+        | grep -vxE 'stale|declared-but-absent|unsourced|farm-declared|outside|deployed|sourced|matching' \
+        || true)"
+    [ -n "$_bad" ] && return 0
+    printf '%s' "$(( _a + _b + _c ))"
+}
+
+# ⛔ ONE PUBLISH PATH FOR EVERY ARM THAT HAS SOMETHING TO NAME (review round 13, reproduced). The
+# `farm-unknown` arm (instrument exit 2) ALSO prints per-file rows BEFORE it gives up — its
+# `matched -eq 0` and mixed-ungradeable exits come AFTER the per-file loop (check-farm-drift.sh:689,
+# :699) — so "no grade" was taken to mean "nothing was reported" and those names were dropped.
+# Measured: 2 UNSOURCED rows then exit 2 printed only the UNKNOWN reason, wrote no artifact, and named
+# both files NOWHERE. The write is atomic (temp + rename), REFUSES a directory at the published path,
+# and records its own outcome, so neither arm can drift from the other.
+publish_farm_rows() {   # $1 body, $2 header note → sets REC_FARM_ROWS, FARM_ROWS_OK
+    local _body="$1" _note="$2" _sd=""
+    mkdir -p "$STATE_DIR" 2>/dev/null || true
+    if [ "${FARM_ROWS_FILE#/}" = "$FARM_ROWS_FILE" ]; then
+        # ⛔ `CDPATH=` IS LOAD-BEARING (review round 3): bash's `cd` PRINTS the resolved directory when
+        # it resolves through an inherited CDPATH, so `_sd` would hold two lines and the "absolute"
+        # path would name a directory containing a newline.
+        _sd="$(CDPATH= cd "$STATE_DIR" 2>/dev/null && pwd)" || _sd=""
+        [ -n "$_sd" ] && FARM_ROWS_FILE="$_sd/harness-apply-farm-rows.txt"
+    fi
+    # ⛔ THE POST-CONDITION IS THE PUBLISHED PATH, NOT `mv`'s EXIT CODE. `mv src dir` where the
+    # artifact path is a DIRECTORY moves the tempfile INTO it and returns 0, so an exit-code-only test
+    # would record a path that holds no list. The `[ ! -d ]` pre-check refuses that state UP FRONT
+    # (replacing it with `[ -n … ]` strands the temp inside the directory and reds T24r); the trailing
+    # `[ -f ]` is DEFENCE IN DEPTH for the concurrent case and is stated as such (#3442).
+    # ⛔ AND IT IS UNPINNED BY CONSTRUCTION — one of this file's DECLARED inert-defence sites. The
+    # others, each measured to leave the suite green when deleted (review rounds 25 and 30):
+    #   * the `CDPATH=` on the `$FARM_DEST_REAL`/`$HERE_REAL` legs (`:167-171`),
+    #   * `[ -n "$HERE_REAL" ] &&` in the self-grade comparison (`:1490`),
+    #   * `[ -n "$FARM_DEST_REAL" ] &&` in the inside-the-farm containment test (`:1496`) — searched
+    #     for by the round-30 reviewer precisely because this list did not name it.
+    # Measured (review round 25): deleting `&& [ -f "$FARM_ROWS_FILE" ]` leaves the suite green. That is not an oversight — the only
+    # state it can catch is a race (something replacing the published path with a directory between the
+    # `rename` and this test), and a fixture cannot produce that race deterministically without stubbing
+    # `mv`. It is kept because it is cheap and it is the one post-condition that cannot be forged, and it
+    # is DECLARED here so that "every new guard has an attributable mutant" is not left standing as a
+    # claim this file contradicts.
+    FARM_ROWS_OK=0
+    # ⛔ AN EMPTY BODY WRITES NO BODY LINE (review round 15, measured): `printf '%s\n' ""` emits one
+    # BLANK line, so the mute-instrument artifact was a header plus a stray empty row — a reader sizing
+    # the list with `wc -l - 1` counted a row in the one state where the pass says no name exists.
+    if [ ! -d "$FARM_ROWS_FILE" ] \
+       && { printf '# harness-apply farm drift rows — %s — ref=%s dest=%s %s\n' \
+                "$(date -u +%FT%TZ)" "$REF" "$FARM_DEST" "$_note" >"$FARM_ROWS_FILE.tmp-$$" 2>/dev/null \
+            && { [ -z "$_body" ] || printf '%s\n' "$_body" >>"$FARM_ROWS_FILE.tmp-$$" 2>/dev/null; }; } \
+       && mv -f "$FARM_ROWS_FILE.tmp-$$" "$FARM_ROWS_FILE" 2>/dev/null \
+       && [ -f "$FARM_ROWS_FILE" ]; then
+        REC_FARM_ROWS="$FARM_ROWS_FILE"; FARM_ROWS_OK=1
+    else
+        rm -f "$FARM_ROWS_FILE.tmp-$$" 2>/dev/null || true
+        REC_FARM_ROWS=unwritable
+    fi
+}
 
 # ── --print-status: the record answers "did it succeed", and STALENESS is an alarm ─────────────
 # ⛔ AN ENABLED TIMER THAT STOPPED FIRING MUST NOT READ AS A HEALTHY NO-OP. A pass whose pin already
@@ -787,7 +971,7 @@ finish() { # <ok> <rc> <verdict-phrase>
 case "$FETCH_STATE" in
     ok) ;;
     *) REC_ACTION=cannot-verify-fetch
-       # Its `detail=` is ~250+ chars once the readings suffix is appended, so `cut -c1-240` drops the
+       # Its `detail=` is ~250+ chars once the readings suffix is appended, so the 240-byte bound drops the
        # tail; `remedy=` is a FIELD so the REMEDY survives regardless (review round 3, finding 5).
        # (`action=` is written on its own line at :278-279 and never depended on this — what the prose
        # bound was eating is the sentence a reader has to act on.)
@@ -995,7 +1179,7 @@ if [ "$PASS_MODE" = sync ] && [ "$RELATION" = behind ] && [ "$DIRTY_N" != "unkno
         preserve_dirty "$PRESERVED_DIR" || {
             REC_ACTION=refused-dirty
             # ⛔ THE REDDEST REFUSAL MUST NOT RECORD `remedy=none` (review finding 6). This `detail=` is
-            # 474 chars, so `cut -c1-240` lands mid-sentence and discards the action clause — the same
+            # 474 chars, so the 240-byte bound lands mid-sentence and discards the action clause — the same
             # class of loss the `remedy=` field exists to prevent, left on the one path that most needs it.
             REC_REMEDY="recover the work from $PRESERVED_DIR (changes.patch + changes.index.patch), fix the cause, then re-run"
             # ⛔ NOT "nothing was touched". Preservation and restore are one pass over the list, so a
@@ -1237,6 +1421,11 @@ if [ "$FARM_CHECK_ON" = "1" ]; then
         # there has a broken config, and calling that `SKIPPED` is the silent green this leg removes.
         if [ -n "${HARNESS_APPLY_FARM_DEST:-}" ]; then
             REC_ACTION=farm-unverifiable
+            # ⛔ EVERY REFUSAL CARRIES A REMEDY (review round 17, measured: all eight arms of this
+            # predicate wrote `remedy=none` while three of them lose their only action to the 240-byte
+            # `detail=` bound — "…install the CHECKER from a ref-c" — so the record named a defect and
+            # left nobody an action, the class this PR exists to remove).
+            REC_REMEDY="point HARNESS_APPLY_FARM_DEST at the farm this box executes (or unset it to accept the default), then re-run"
             finish 0 24 "farm: UNKNOWN — HARNESS_APPLY_FARM_DEST names $FARM_DEST, where nothing exists; an explicitly-configured farm that is not there is a misconfiguration, not a controller-only host"
         fi
         # ⛔ ...AND `$HERE` IS THE CHECK ON THE SKIP LINE'S OWN CLAIM. The unit prefers
@@ -1247,14 +1436,24 @@ if [ "$FARM_CHECK_ON" = "1" ]; then
         case "$HERE" in
             */.pi/agent/scripts|*/.pi/agent/scripts/)
                 REC_ACTION=farm-unverifiable
+                REC_REMEDY="set HARNESS_APPLY_FARM_DEST (or render CELL_HOME) to the farm this pass executes from ($HERE), then re-run"
                 finish 0 24 "farm: UNKNOWN — this pass executes FROM a farm ($HERE) but $FARM_DEST names nothing (CELL_HOME='$CELL_HOME'), so the directory that is really running was never graded; pin the farm (HARNESS_APPLY_FARM_DEST, or render CELL_HOME) instead of letting it default to a path with nothing at it" ;;
         esac
         log_line "farm: SKIPPED — no farm at $FARM_DEST (a host that executes nothing from there cannot be stale)"
     elif [ ! -d "$FARM_DEST" ]; then
         REC_ACTION=farm-unverifiable
+        REC_REMEDY="make $FARM_DEST a readable directory holding the scripts this box executes (repair or remove the dangling link), then re-run"
         finish 0 24 "farm: UNKNOWN — $FARM_DEST exists (or is a link) but is NOT a readable directory, so the scripts this box executes cannot be graded — a dangling record is not an absent farm"
-    elif [ -z "$FARM_CHECKER" ] || [ ! -f "$FARM_CHECKER" ]; then
+    elif [ -z "$FARM_CHECKER" ] || { [ ! -f "$FARM_CHECKER" ] && [ ! -L "$FARM_CHECKER" ]; }; then
+        # ⛔ A SYMLINK THAT DOES NOT RESOLVE TO A FILE IS NOT YET A "NOT FOUND" (review round 20,
+        # measured). `-f` follows links, so a CYCLE made it false and this arm answered first — which
+        # left the hop-cap refusal below UNREACHABLE dead code (an inert enforcer: its condition could
+        # never fire while it looked like a guard) and told an operator with a cyclic link that the
+        # instrument "could not be found". A `-L` path is let through to the resolution loop, which is
+        # the only place that can tell a cycle from a dangling link; the `! -f` refusal after it keeps
+        # the dangling-link answer identical to the one this arm used to give.
         REC_ACTION=farm-unverifiable
+        REC_REMEDY="point HARNESS_APPLY_FARM_CHECKER at a check-farm-drift.sh from a ref-consistent checkout, then re-run"
         finish 0 24 "farm: UNKNOWN — $FARM_DEST holds the scripts this box EXECUTES, but no check-farm-drift.sh could be found (looked in $REPO/scripts and $HERE) — cannot-verify is not a pass"
     else
         # `--ref "$REF" --no-pin-identity` deliberately. The fact under test is "are the farmed bytes
@@ -1287,11 +1486,12 @@ if [ "$FARM_CHECK_ON" = "1" ]; then
             # A link whose target cannot be located cannot be ruled outside the farm, so it refuses.
             _l="$(readlink "$FARM_CHECKER_T" 2>/dev/null)" || {
                 REC_ACTION=farm-unverifiable
+                REC_REMEDY="replace HARNESS_APPLY_FARM_CHECKER with a real file (not a link whose target cannot be read), then re-run"
                 finish 0 24 "farm: UNKNOWN — readlink failed on $FARM_CHECKER_T, so the checker's FINAL target cannot be resolved, and a copy that cannot be located cannot be ruled outside the farm"
             }
             case "$_l" in
                 /*) FARM_CHECKER_T="$_l" ;;
-                *) FARM_CHECKER_T="$(cd "$(dirname "$FARM_CHECKER_T")" 2>/dev/null && pwd -P)/$_l" ;;
+                *) FARM_CHECKER_T="$(CDPATH= cd "$(dirname "$FARM_CHECKER_T")" 2>/dev/null && pwd -P)/$_l" ;;
             esac
             _hops=$((_hops + 1))
         done
@@ -1300,10 +1500,20 @@ if [ "$FARM_CHECK_ON" = "1" ]; then
         # `-L` STILL TRUE, i.e. with the same half-resolved path the failed-`readlink` arm now refuses.
         if [ -L "$FARM_CHECKER_T" ]; then
             REC_ACTION=farm-unverifiable
+            REC_REMEDY="replace HARNESS_APPLY_FARM_CHECKER with a real file (break the link cycle), then re-run"
             finish 0 24 "farm: UNKNOWN — $FARM_CHECKER is a symlink chain that did not resolve within 40 hops, so where it points cannot be established"
         fi
-        FARM_CHECKER_REAL="$(cd "$(dirname "$FARM_CHECKER_T")" 2>/dev/null && pwd -P)/$(basename "$FARM_CHECKER_T")"
-        FARM_DEST_REAL="$(cd "$FARM_DEST" 2>/dev/null && pwd -P)"
+        # ⛔ THE DANGLING-LINK ANSWER MOVED HERE, UNCHANGED (review round 20). The `! -f` refusal above
+        # could only be reached for a NON-link before this round, because a link was let through to the
+        # loop above it; a link whose target does not exist must still get the same "no checker could be
+        # found" sentence and remedy, not fall through to `bash` and be recorded as a bad grade.
+        if [ ! -f "$FARM_CHECKER_T" ]; then
+            REC_ACTION=farm-unverifiable
+            REC_REMEDY="point HARNESS_APPLY_FARM_CHECKER at a check-farm-drift.sh from a ref-consistent checkout, then re-run"
+            finish 0 24 "farm: UNKNOWN — $FARM_DEST holds the scripts this box EXECUTES, but no check-farm-drift.sh could be found (looked in $REPO/scripts and $HERE) — cannot-verify is not a pass"
+        fi
+        FARM_CHECKER_REAL="$(CDPATH= cd "$(dirname "$FARM_CHECKER_T")" 2>/dev/null && pwd -P)/$(basename "$FARM_CHECKER_T")"
+        FARM_DEST_REAL="$(CDPATH= cd "$FARM_DEST" 2>/dev/null && pwd -P)"
         # ⛔ ...AND IT MUST BE THE FARM THIS PASS RUNS FROM. The `case "$HERE"` refusal above only fires
         # when `$FARM_DEST` names NOTHING; when it names a DIFFERENT farm that exists, the pass grades
         # that one and reports green over the farm it is executing (review round 7, reproduced with two
@@ -1312,14 +1522,16 @@ if [ "$FARM_CHECK_ON" = "1" ]; then
         # `$CELL_HOME/.pi/agent/scripts` — so this creates no false red where the box is consistent.
         case "$HERE" in
             */.pi/agent/scripts|*/.pi/agent/scripts/)
-                HERE_REAL="$(cd "$HERE" 2>/dev/null && pwd -P)"
+                HERE_REAL="$(CDPATH= cd "$HERE" 2>/dev/null && pwd -P)"
                 if [ -n "$HERE_REAL" ] && [ "$HERE_REAL" != "$FARM_DEST_REAL" ]; then
                     REC_ACTION=farm-unverifiable
+                    REC_REMEDY="pin HARNESS_APPLY_FARM_DEST (or render CELL_HOME) to the farm the units execute ($HERE_REAL), then re-run"
                     finish 0 24 "farm: UNKNOWN — this pass executes FROM $HERE_REAL but grades $FARM_DEST_REAL; the farm that is really running was never graded — pin the farm (HARNESS_APPLY_FARM_DEST, or render CELL_HOME) to the one the units execute"
                 fi ;;
         esac
         if [ -n "$FARM_DEST_REAL" ] && [ "${FARM_CHECKER_REAL#"$FARM_DEST_REAL"/}" != "$FARM_CHECKER_REAL" ]; then
             REC_ACTION=farm-unverifiable
+            REC_REMEDY="install the CHECKER from a ref-consistent checkout (HARNESS_APPLY_FARM_CHECKER) so it is not a copy inside the farm it grades, then re-run"
             finish 0 24 "farm: UNKNOWN — the only check-farm-drift.sh found ($FARM_CHECKER) lives INSIDE the farm it would grade, and a copy that grades itself cannot answer whether it is stale — install the CHECKER from a ref-consistent checkout"
         fi
         FARM_OUT="$(bash "$FARM_CHECKER" --src "$REPO" --ref "$REF" --dest "$FARM_DEST" --no-pin-identity 2>&1)"
@@ -1332,8 +1544,171 @@ if [ "$FARM_CHECK_ON" = "1" ]; then
         # (A `FARM_NAMED` short list was computed here and never read — the row extraction below owns
         # the predicate, so it was dead code plus a redundant `awk|head|paste` subprocess on the red
         # path. Removed in batch-ai2 review cycle 2, F7.)
+        # ⛔ THIS BRANCH OWNS NO DELETION (review round 2). A pass that finds no drift writes no list;
+        # a pass that finds drift OVERWRITES it atomically with its own header. The previous list is
+        # deliberately left in place — see the artifact note beside the record-field init above.
+        # ⛔ ONE REMEDY EXTRACTION, FOR EVERY ARM THAT REFUSES (review round 16, measured). It used to
+        # live inside the `1|3` arm, so the `farm-unknown` (rc=2) refusal — the one that most often
+        # CARRIES a `Next:` block, because the instrument prints it before giving up — recorded
+        # `remedy=none` while its artifact held the block. Measured: a checker printing an UNSOURCED row,
+        # an UNKNOWN reason and `   Next: fix the declaration entries … then re-run this.` produced
+        # `action=farm-unknown` + `remedy=none`, with the word `Next` nowhere in the record.
+        # ⛔ AND IT IS NOT CAPPED (review round 27, measured): this used to end `| head -8`, so a `Next:`
+        # block of ten actions recorded `remedy=` with the first eight and dropped the ninth and tenth —
+        # named NOWHERE, because `detail=` deliberately carries no remedy clause. The shipped instrument
+        # prints one or two lines today, which is why nothing failed: the cap bites the moment a class
+        # grows a line, and it is a cap on the ONE field the record exists to guarantee. `write_record`
+        # flattens NEWLINES (`tr`), so the field is still one line; length was never its bound.
+        FARM_REMEDY="$(printf '%s\n' "$FARM_OUT" | sed -n '/^[[:space:]]*Next:/,$p')"
+        # ⛔ THE EXIT CODE IS NOT THE GRADE — THIS PROCESS MAY NOT BE THE INSTRUMENT (review round 21,
+        # measured). `HARNESS_APPLY_FARM_CHECKER` is a documented seam, and an operator wrapper that
+        # reports the PIPELINE's status (`bash inner "$@" 2>&1 | tee -a log`) exits 0 no matter what
+        # the instrument said. Measured with such a wrapper over a checker printing one STALE row and
+        # `DRIFT — 1 stale …`: the pass recorded `action=none farm_rows=none farm_n=0` + `detail=current`
+        # and printed `farm: ok`, so the one drifting file the instrument named was durable NOWHERE
+        # while the record positively certified a match — the exact green-over-drift the whole predicate
+        # exists to remove, at the one arm that trusted its input absolutely. So a rc=0 that also
+        # reported drift is CONTRADICTORY, and a contradiction is not a grade: the output is published
+        # under a NO GRADE header and the pass refuses, exactly as an unreadable grade does.
+        # ⛔ THE SAME PREDICATE AND THE SAME PROOF AS THE DRIFT ARM (review round 24, measured: a
+        # private `NF>=4` row test plus a `stale`-only summary read certified a report CLEAN at rc=0
+        # whose drift was all `unsourced` — the drift arm refuses those same bytes at rc=1, so the guard
+        # was weaker than the arm it guards, for the class the instrument calls its normal historical
+        # state). Both halves now come from the shared helpers above.
+        FARM_ROWS0="$(farm_drift_rows "$FARM_OUT")"
+        FARM_NROWS0="$(printf '%s' "$FARM_ROWS0" | grep -c .)"
+        # ⛔ THE CONTRADICTION IS THE *VERDICT*, NOT ONE OF ITS COUNTS (review: the parse read only the
+        # `stale` count, so `rc=0` over `DRIFT — 0 stale …, 2 declared-but-absent, 0 unsourced` — drift
+        # this pass's row vocabulary did not match, which is the premise the whole extraction arm exists
+        # for — recorded `farm: ok` / `farm_rows=none` / `farm_n=0`. The instrument prints `OK — ` on a
+        # match and `DRIFT — ` otherwise, so the verdict line ALONE is the contradiction; summing three
+        # counts answers a narrower question than the one being asked.)
+        # ⛔ ANCHORED ON THE INSTRUMENT'S LINE SHAPE, NOT ON A BARE TOKEN (review round 26, measured).
+        # `grep 'OK — '` matched the token ANYWHERE, so a per-file row reading `OK — handmade-note.py`
+        # certified a match with the drifting file named durably nowhere — the very hazard this chain
+        # anchored away in `farm_sum_count` (`DRIFT-log.txt | …` read as the summary). Its mirror was
+        # worse: an unanchored `DRIFT — ` OVER-BLOCKED a legitimate match whose output merely contained
+        # the text. The instrument prints `check-farm-drift: OK — …` / `…: DRIFT — …` (PROG + ': '), and a
+        # VERDICT LINE CARRIES NO PIPE ANYWHERE while a per-file row always does — so the test is "no pipe
+        # on the whole line", `^[^|]*: … [^|]*$`, not merely "no pipe before the token": a row's FIRST
+        # field is its PATH, so `weird: OK — x.py | … | DRIFTED` matched a prefix-only anchor and certified
+        # a match with the drifting name durable nowhere (measured, review round 27).
+        FARM_VERDICT0="$(printf '%s\n' "$FARM_OUT" | sed -n '/^[^|]*: DRIFT — [^|]*$/{p;q;}')"
+        # ⛔ AND THE SUMMARY IS THE THIRD HALF — THE ROW PREDICATE ALONE IS BLIND TO IT (review round 29,
+        # measured). The row half matches only this pass's own class TOKENS, so a report whose rows use a
+        # word it does not know (`… | drift`, `… | missing`) is invisible there, and the three-label
+        # summary was never read on this arm at all — `farm_sum_count` was called ONCE, inside the `1|3`
+        # arm. Measured: the same bytes — an `OK — 5/5 …` line, two such rows, and
+        # `… — 2 stale, 0 declared-but-absent, 0 unsourced` — recorded `farm: ok` / `farm_rows=none` /
+        # `farm_n=0` at rc=0 and `rc=24` with both names published at rc=1. The doc claims this arm uses
+        # "the SAME three-label summary proof as the drift arm"; it did not. It does now: a summary whose
+        # own total is non-zero says rows exist, and a status of 0 beside it is a contradiction.
+        FARM_EXPECT0="$(farm_sum_count "$FARM_OUT" || true)"
+        # ⛔ ABSENCE OF EVIDENCE IS NOT A MATCH EITHER (review round 32, measured). Every test above fires
+        # on something this pass can POSITIVELY recognise, so a report it cannot classify on ANY axis was
+        # certified: measured with `OK — 5/5 …`, rows `handmade.py | … | drift` / `gone.py | … | missing`
+        # and `summary — 2 drift, 0 stale, 0 declared-but-absent, 0 unsourced`, the pass printed
+        # `farm: ok`, recorded `farm_rows=none farm_n=0`, wrote NO artifact — two drifting names durable
+        # nowhere — while the same bytes at `exit 1` were RED with both published. `farm_sum_count`'s
+        # closed vocabulary returns EMPTY for that summary and the row predicate returns EMPTY for those
+        # rows, and empty was read as "nothing to contradict" instead of "no evidence". Two signals:
+        #   * a SUMMARY line this pass cannot count (two of the three label words, no parsable total),
+        #   * a per-file ROW whose verdict token is neither benign nor a class it knows.
+        FARM_UNC0=""
+        if [ -z "$FARM_EXPECT0" ]; then
+            FARM_UNC0="$(printf '%s\n' "$FARM_OUT" | grep -E '^[^|]*$' | grep -ivE '^[^|]*: OK — ' \
+                | awk '{ l = tolower($0); n = 0
+                         if (l ~ /stale/) n++
+                         if (l ~ /declared-but-absent/) n++
+                         if (l ~ /unsourced/) n++
+                         if (n >= 2) { print "summary"; exit } }')"
+        fi
+        [ -n "$FARM_UNC0" ] || FARM_UNC0="$(printf '%s\n' "$FARM_OUT" | awk -F'|' '
+            NF >= 4 {
+                v = $NF
+                gsub(/^[[:space:]]+|[[:space:]]+$/, "", v)
+                if (v == "verdict" || v == "ok") next
+                if (v == "LOCAL (declared)" || v == "SYMLINK (graded via its target)") next
+                if (v ~ /^(STALE|UNSOURCED|NOT-EXECUTABLE|DECLARED-BUT-ABSENT)$/) next
+                # ⛔ THE PARENTHESISED BENIGN TOKENS MUST REACH THE ALLOW-LIST, NOT SLIP PAST IT
+                # (VGATE round 32, measured: the class matched only letters, spaces and dashes, so
+                # `LOCAL (declared)` and `SYMLINK (graded via its target)` fell through WITHOUT the
+                # skip — the allow-list entries for them could be deleted with the suite green. The
+                # regex now admits their shape, so the entries are what spares them.)
+                if (v ~ /^[A-Za-z][A-Za-z ()-]*$/) { print v; exit }
+            }')"
+
+        # ⛔ AND A SILENT rc=0 IS NOT A MATCH (review round 24). The instrument always prints a summary,
+        # so a checker that exits 0 with NO output produced no evidence at all. ⛔ AND NEITHER IS AN rc=0
+        # WHOSE OUTPUT CARRIES NO VERDICT (review round 25, measured): this check used to test only for
+        # an EMPTY output, so the wrapper shape this file's own comment names —
+        # `bash inner "$@" 2>&1 | tee -a log` — still certified a match when `inner` was MISSING, because
+        # `tee` supplies the 0 and the output is bash's `No such file or directory` line: non-empty,
+        # verdictless, and recorded `farm_rows=none` / `farm_n=0` / `farm: ok` — the values the doc
+        # defines as "the farm matched", over a farm that was never graded, with `--print-status`
+        # answering `status=ok`. A match is PROVEN by the instrument's own `OK —` line
+        # (`check-farm-drift.sh:706`), which it prints before exiting; anything else is a grade nobody
+        # can read, and it fails CLOSED. This SUBSUMES the emptiness test (empty output carries no
+        # verdict either), so the two are one condition rather than two that can drift apart.
+        # Case-insensitive because the suite's clean stubs print `check-farm-drift: ok — 0 stale …`.
+        FARM_OK0="$(printf '%s\n' "$FARM_OUT" | grep -Eim1 '^[^|]*: OK — [^|]*$')"
         case "$FARM_RC" in
             0)
+                if [ -z "$FARM_OK0" ] && [ "$FARM_NROWS0" -eq 0 ] && [ -z "$FARM_VERDICT0" ]; then
+                    # ⛔ A CHECKER THAT PROVED NOTHING CANNOT CERTIFY A MATCH. Its own arm, because its
+                    # own sentence: "reports drift" is false here, and a reader sent looking for drift
+                    # rows that were never printed is a second defect.
+                    REC_ACTION=farm-unknown
+                    # ⛔ IT PUBLISHES, LIKE ITS SIBLING (review round 26, measured): this arm refused
+                    # without publishing, so a checker that printed two file names with a foreign
+                    # verdict word — and no verdict line — left both names durable NOWHERE, which is
+                    # the acceptance arm (tortoise#10114 arm 2) lost inside `action=farm-unknown`.
+                    # `publish_farm_rows`'s own doctrine: "no grade" never meant "nothing was reported".
+                    # ⛔ AND SILENCE PUBLISHES NOTHING (review round 26, measured): an unguarded publish
+                    # wrote a HEADER-ONLY artifact for a checker that printed no output at all, whose own
+                    # note then claimed "this is its output verbatim" over nothing — while the give-up arm
+                    # records `farm_rows=not-graded` and writes no file for the same silence. One state,
+                    # one artifact outcome: a mute checker names no file because it printed none.
+                    if [ -n "$(printf '%s\n' "$FARM_OUT" | grep -v '^[[:space:]]*$' || true)" ]; then
+                        publish_farm_rows "$FARM_OUT" "n=unparsed (NO GRADE — the checker exited 0 without a verdict line, so nothing it printed can certify a match; this is its output verbatim, not a grade; farm_n=not-graded)"
+                        REC_FARM_NROWS=not-graded
+                    fi
+                    REC_REMEDY="the checker exited 0 without printing the instrument's 'OK —' line — point HARNESS_APPLY_FARM_CHECKER at check-farm-drift.sh itself (a wrapper or a broken copy that prints no verdict cannot certify a match), then re-run"
+                    log_line "farm: UNKNOWN — the checker exited 0 but printed NO verdict line (neither 'OK —' nor 'DRIFT —'), so nothing it printed can certify a match"
+                    finish 0 24 "farm: UNKNOWN (check-farm-drift rc=0) — no readable grade (see farm_rows=), so a status of 0 is not a match for $FARM_DEST against $REF: the checker printed no verdict line at all"
+                fi
+                if [ "$FARM_NROWS0" -gt 0 ] || [ -n "$FARM_VERDICT0" ] || { [ -n "$FARM_EXPECT0" ] && [ "$FARM_EXPECT0" -gt 0 ]; } || [ -n "$FARM_UNC0" ]; then
+                    REC_ACTION=farm-unknown
+                    publish_farm_rows "$FARM_OUT" "n=unparsed (NO GRADE — the checker exited 0 while reporting drift, so its exit status and its report contradict each other; this is its output verbatim, not a grade; farm_n=not-graded)"
+                    REC_FARM_NROWS=not-graded
+                    if [ -n "$FARM_UNC0" ]; then
+                        REC_REMEDY="the checker exited 0 while printing a report this pass cannot read (an unclassifiable ${FARM_UNC0}) — point HARNESS_APPLY_FARM_CHECKER at check-farm-drift.sh itself (a farmed copy whose vocabulary has moved on cannot be graded here), then re-run"
+                    else
+                        REC_REMEDY="the checker exited 0 while reporting drift — point HARNESS_APPLY_FARM_CHECKER at check-farm-drift.sh itself (a wrapper that reports the pipeline's status hides the instrument's), then re-run"
+                    fi
+                    # ⛔ AND IT QUOTES THE EVIDENCE IT REFUSED ON (review round 29): with the summary
+                    # half added, naming only "rows" would send the reader looking for rows the
+                    # extractor never matched — the class whose vocabulary this pass does not know.
+                    _v0="verdict: ${FARM_VERDICT0:-no DRIFT line}"
+                    [ -n "$FARM_VERDICT0" ] || _v0="$_v0, rows only"
+                    [ -n "$FARM_EXPECT0" ] && _v0="$_v0; summary reports $FARM_EXPECT0 row(s)"
+                    # ⛔ AND AN UNREADABLE REPORT IS ITS OWN REASON (review round 32): the two signals
+                    # above are "this pass could not classify it", not "it reported drift", and the
+                    # remedy differs — the reader must re-farm or fix the checker, not go looking for
+                    # drift rows that this vocabulary cannot name.
+                    [ -n "$FARM_UNC0" ] && _v0="$_v0; an unclassifiable ${FARM_UNC0} — this pass cannot count or grade it"
+                    log_line "farm: UNKNOWN — the checker exited 0 but its output reports drift ($FARM_NROWS0 row(s) matched; $_v0); an exit status that contradicts its own report is not a grade"
+                    unset _v0
+                    # ⛔ NO `detail=` SENTENCE INLINES THE ARTIFACT PATH, AND THE POINTER MUST SURVIVE THE
+                    # 240-BYTE BOUND (review round 23, measured twice): the sentence used to END in "published
+                    # in $REC_FARM_ROWS", which both inlined the path the doc forbids (and would have read
+                    # "published in unwritable" on a failed publish — a publication that never happened) AND
+                    # sat past the cut, so the record ended mid-word naming no file. Naming the diagnosis
+                    # FIRST and the field pointer immediately after it is what keeps the pointer inside the
+                    # bound; a pointer at the tail is lost at exactly the farms with the longest paths.
+                    finish 0 24 "farm: UNKNOWN (check-farm-drift rc=0) — the checker exited 0 while reporting drift (see farm_rows=), so its exit status and its report contradict each other; an unreadable grade is not a pass for $FARM_DEST against $REF"
+                fi
+                REC_FARM_ROWS=none; REC_FARM_NROWS=0
                 log_line "farm: ok — $FARM_DEST matches $REF" ;;
             1|3)
                 # 3 ("a deploy cannot fix it") is folded in on purpose: an UNSOURCED or
@@ -1357,27 +1732,273 @@ if [ "$FARM_CHECK_ON" = "1" ]; then
                 # whole-line grep counts prose as file rows — 3 real rows measured as "7 row(s)"
                 # (#10114 review round 8). The predicate below is the ONLY row extraction — there is no
                 # second copy to keep in step.
-                FARM_ROWS="$(printf '%s\n' "$FARM_OUT" | awk -F'|' '$NF ~ /(^|[[:space:]])(STALE|UNSOURCED|NOT-EXECUTABLE|DECLARED-BUT-ABSENT)[[:space:]]*$/')"
+                FARM_ROWS="$(farm_drift_rows "$FARM_OUT")"
                 FARM_NROWS="$(printf '%s' "$FARM_ROWS" | grep -c .)"
                 # ⛔ THE REMEDY IS A BLOCK, NOT A LINE. Two of the instrument's three remedies are TWO
                 # lines and the CONTINUATION carries the actions ("…, delete it, or retire it in
                 # pi-bootstrap/farm-retired.txt; then re-run this."), so forwarding only the `Next:`
                 # line cut the remedy mid-word for exactly the classes whose remedy differs from
                 # "re-farm" (#10114 review round 8). Everything from the first `Next:` to EOF.
-                FARM_REMEDY="$(printf '%s\n' "$FARM_OUT" | sed -n '/^[[:space:]]*Next:/,$p' | head -8)"
-                log_line "farm: $REF ships different bytes than $FARM_DEST execute — $FARM_NROWS row(s) from the instrument:"
-                printf '%s\n' "$FARM_ROWS" | head -12 | while IFS= read -r _row; do
-                    log_line "farm:   $_row"
-                done
+                # `FARM_REMEDY` is extracted ONCE, above the `case` (review round 16).
+                # ⛔ "MATCHED BY THIS PASS'S EXTRACTOR", NOT "FROM THE INSTRUMENT" (review round 8). On the
+                # raw arm FARM_NROWS is 0 because THIS PASS's extractor matched nothing — the instrument
+                # did report rows, and up to 12 of them are printed immediately BELOW this line.
+                log_line "farm: $REF ships different bytes than $FARM_DEST execute — $FARM_NROWS row(s) matched by this pass's extractor:"
+                # ⛔ AN INCOMPLETE EXTRACTION IS NOT "EVERY FILE NAMED" (review rounds 5 and 10, both
+                # reproduced). The row extractor's vocabulary is a COPY of the instrument's, and the
+                # checker this pass runs can be an OLDER FARMED copy whose rows it does not match —
+                # so a RED grade (rc 1|3) can yield ZERO extracted rows, or a PARTIAL set. Both were
+                # published as "N row(s), every one named in <file>": the one field that exists to
+                # NAME files named fewer than the instrument reported, while positively certifying
+                # completeness (and the doc's own trust rule validates the truncated list, because
+                # header `n=` and `farm_n=` agree). The instrument's RAW output carries every name, so
+                # that is what is published when the extraction is not PROVEN complete, the header
+                # says `n=unparsed`, and every sentence below says "raw".
+                # The proof is the instrument's own summary — "DRIFT — <n> stale (…), <n>
+                # declared-but-absent, <n> unsourced" — which a partial extraction cannot satisfy.
+                # ⛔ ALL THREE LABELS MUST PARSE, NOT JUST THE FIRST (review round 12, reproduced). The
+                # sum used `${_fb:-0}`/`${_fc:-0}`, so an instrument whose OTHER classes are labelled
+                # differently — `2 missing` instead of `2 declared-but-absent` — silently reduced the
+                # proof to the stale count alone: measured with 3 STALE + 2 DECLARED-BUT-ABSENT rows and
+                # the summary "3 stale …, 2 missing, 0 unsourced", matched 3 == expect 3 took the COMPLETE
+                # arm and published `farm_n=3` / "every one named in <file>" with the two absent names in
+                # NEITHER the artifact NOR the record. A lagging farmed copy is exactly the premise this
+                # arm exists for, so an unparseable label means the proof is ABSENT, not that the class
+                # counted zero.
+                # ⛔ ONE POPULATION FOR "HOW MUCH OUTPUT IS THERE" (VGATE round 14, measured). The
+                # excerpt prints the blank-stripped population while the elision counted `grep -c .`
+                # over the RAW text — `grep -c .` counts a whitespace-only line, so 12 rows + one
+                # 3-space line + summary read as "and 3 more line(s)" while only 2 were withheld. The
+                # stripped population is computed ONCE here, before any decision reads it.
+                FARM_OUT_NB="$(printf '%s\n' "$FARM_OUT" | grep -v '^[[:space:]]*$' || true)"
+                FARM_OUT_LINES=0
+                [ -n "$FARM_OUT_NB" ] && FARM_OUT_LINES="$(printf '%s\n' "$FARM_OUT_NB" | grep -c . || true)"
+                FARM_EXPECT="$(farm_sum_count "$FARM_OUT")"
+                FARM_ROWS_RAW=0; PERSIST_BODY="$FARM_ROWS"; FARM_RAW_WHY=""
+                HDR_NOTE="n=$FARM_NROWS (the rows below are EXACTLY this run; farm_rows= in harness-apply.status is the currency indicator)"
+                if [ "$FARM_NROWS" -eq 0 ] && [ "$FARM_OUT_LINES" -eq 0 ]; then
+                    # ⛔ NO OUTPUT AT ALL IS ITS OWN STATE (review round 13; the note was DEAD CODE
+                    # until VGATE round 14 — it was assigned after `publish_farm_rows` had already read
+                    # the old one, so a silent instrument still published "the RAW output follows
+                    # verbatim" over a header-only file).
+                    # ⛔ AND ITS BODY IS EMPTY (review round 16, measured). The state is DEFINED as "no
+                    # blank-stripped line", but it persisted the UNSTRIPPED output — so a checker that
+                    # printed one whitespace-only line wrote a stray body line into the artifact that
+                    # says "no name in this file because none was printed", and `wc -l - 1` counted a row.
+                    FARM_ROWS_RAW=1; PERSIST_BODY=""; FARM_RAW_WHY=empty
+                    HDR_NOTE="n=unparsed (the instrument printed NO output for a RED grade — farm_n=unparsed says the count is UNKNOWN, and there is no name in this file because none was printed)"
+                elif [ "$FARM_NROWS" -eq 0 ]; then
+                    FARM_ROWS_RAW=1; PERSIST_BODY="$FARM_OUT"; FARM_RAW_WHY=zero
+                    HDR_NOTE="n=unparsed (NO row matched this pass's extractor — the instrument's RAW output follows verbatim; farm_n=unparsed says the count is UNKNOWN, not that nothing drifted)"
+                elif [ -z "$FARM_EXPECT" ]; then
+                    # ⛔ AN ABSENT OR UNREADABLE PROOF IS NOT PROOF (review round 11, reproduced). The
+                    # branch below used to read `[ -n "$FARM_EXPECT" ] && …`, so an instrument that
+                    # printed its drift rows but NO readable `DRIFT — <n> stale …` summary fell through
+                    # to the COMPLETE arm: header "EXACTLY this run", `farm_n=<matched>`, detail "N
+                    # row(s), every one named in <file>" — over an extraction nothing had checked. A
+                    # re-worded or pre-summary farmed copy is exactly the premise this whole arm exists
+                    # for, so "cannot prove it" must take the same door as "proved it wrong".
+                    FARM_ROWS_RAW=1; PERSIST_BODY="$FARM_OUT"; FARM_RAW_WHY=noproof
+                    # ⛔ AND THE NOTE MUST NAME THE RIGHT DEFECT (review round 26, measured: this arm
+                    # covers TWO sub-states — no summary printed at all, and a summary this pass could
+                    # not PARSE (one of the three labels missing or unreadable) — and the note claimed the
+                    # first for both, so an artifact whose summary WAS printed told its reader "no readable
+                    # summary" while `detail=` said "no readable or complete". The wording covers both.)
+                    HDR_NOTE="n=unparsed (no COMPLETE, parsable 'DRIFT — <n> stale …, <n> declared-but-absent, <n> unsourced' summary (either none was printed or a label did not parse), so this pass cannot PROVE its $FARM_NROWS extracted row(s) are all of them — the instrument's output follows verbatim; farm_n=unparsed)"
+                elif [ "$FARM_NROWS" -ne "$FARM_EXPECT" ]; then
+                    FARM_ROWS_RAW=1; PERSIST_BODY="$FARM_OUT"; FARM_RAW_WHY=partial
+                    if [ "$FARM_NROWS" -lt "$FARM_EXPECT" ]; then
+                        HDR_NOTE="n=unparsed (this pass's extractor matched $FARM_NROWS row(s), the instrument reports $FARM_EXPECT — the names it could not match are in the RAW output that follows verbatim; farm_n=unparsed)"
+                    else
+                        HDR_NOTE="n=unparsed (this pass's extractor matched $FARM_NROWS row(s), MORE than the $FARM_EXPECT the instrument reports — its vocabulary is too wide, so a row it named may not be drift; the RAW output follows verbatim, farm_n=unparsed)"
+                    fi
+                fi
+                # ⛔ EVERY ROW IS PERSISTED, NOT JUST THE EXCERPT (tortoise#10114 arm 2). The journal
+                # keeps a bounded human view, but the durable answer to "which files have drifted" is
+                # this file, written atomically (temp + rename) so a reader never sees a half list, and
+                # named in the record (`farm_rows=`) so it is reachable without reading the journal.
+                # A truncation that is only COUNTED is not a check that names each drifting file:
+                # measured on the `cmux` cell, 30 rows — 12 named, 18 counted, 0 named anywhere durable.
+                # The ONE write path lives in `publish_farm_rows` (the same function the `farm-unknown`
+                # arm uses, so the two can never drift apart).
+                publish_farm_rows "$PERSIST_BODY" "$HDR_NOTE"
+                # ⛔ `farm_n=unparsed` ON THE RAW ARM, NEVER `0` (review round 6). `farm_n=0` already
+                # means "the farm matched" in every other record, so a RED record carrying `0` reads as
+                # "zero rows drifted" — one field with two meanings is the class this pass deletes.
+                # Nothing reads `farm_n` numerically (fleet-health parses key=value and ignores it), so
+                # the value is free to carry the truth: a count when the extraction parsed, `unparsed`
+                # when it did not, `not-graded` when no grade was produced.
+                if [ "$FARM_ROWS_RAW" = 1 ]; then REC_FARM_NROWS=unparsed; else REC_FARM_NROWS="$FARM_NROWS"; fi
+                # ⛔ THE JOURNAL EXCERPT IS THE EXTRACTED ROWS EVEN ON THE RAW ARM (review round 11).
+                # It used to `head -12` the PERSIST body, i.e. the instrument's RAW output — while the
+                # "… and N more" line below counted EXTRACTED rows, so a 34-line report whose drift rows
+                # came last printed twelve `ok`/header lines and then said "and 2 more row(s) — ALL 14
+                # are named in <file>". Two different populations in one journal block. The bounded
+                # human view is now always the rows THIS PASS matched; the file still carries everything
+                # (raw, when the extraction is unproven).
+                FARM_EXCERPT="$FARM_ROWS"
+                if [ "$FARM_NROWS" -eq 0 ]; then
+                    # ⛔ ONE POPULATION, ONE COUNT (review round 12, reproduced). The excerpt was
+                    # `head -12` of the raw output while the elision counted `grep -c .` — NON-BLANK
+                    # lines — and the real instrument prints a blank line before its summary
+                    # (check-farm-drift.sh:688). Measured: 11 rows + a blank + the summary (13 lines,
+                    # 12 non-blank) printed a 12-line excerpt that swallowed the summary, then said
+                    # nothing at all because `12 -gt 12` is false; 20 rows + 4 blanks printed 12 lines
+                    # holding 10 rows and claimed "and 8 more line(s)". Blanks are dropped ONCE, in the
+                    # population both the excerpt and the arithmetic read.
+                    FARM_EXCERPT="$FARM_OUT_NB"
+                fi
+                if [ -n "$FARM_EXCERPT" ]; then
+                    printf '%s\n' "$FARM_EXCERPT" | head -12 | while IFS= read -r _row; do
+                        log_line "farm:   $_row"
+                    done
+                fi
+                if [ "$FARM_ROWS_RAW" = 1 ]; then
+                    if [ "$FARM_ROWS_OK" = 1 ]; then
+                        # ⛔ THE EXCERPT ABOVE IS NOT THE RAW OUTPUT WHENEVER ANYTHING WAS EXTRACTED
+                        # (VGATE round 12, measured on the noproof arm): the excerpt is now ALWAYS the
+                        # rows this pass matched, so "the RAW output above" pointed at matched rows —
+                        # the same two-populations-in-one-block defect this round removed from the
+                        # excerpt. It stays truthful only on the zero-extraction arm, where the
+                        # excerpt fallback really is the instrument's output.
+                        if [ "$FARM_RAW_WHY" = empty ]; then
+                            log_line "farm:   the instrument printed NO output for a red grade — there is no name to publish, and NO output is not a pass"
+                        elif [ "$FARM_NROWS" -eq 0 ]; then
+                            log_line "farm:   the extraction was NOT PROVEN complete — the instrument's RAW output above is published in $REC_FARM_ROWS"
+                        else
+                            log_line "farm:   the extraction was NOT PROVEN complete — the excerpt above is the rows THIS PASS matched; the instrument's RAW output is published in $REC_FARM_ROWS"
+                        fi
+                    elif [ "$FARM_RAW_WHY" = empty ]; then
+                        # ⛔ NO OUTPUT AND NO TEMP FILE IS NOT "RAW OUTPUT COULD NOT BE PERSISTED" (review
+                        # round 17, measured): with a directory at the rows path, a mute instrument printed
+                        # a sentence about raw output it never produced, over an excerpt of no lines.
+                        log_line "farm:   the instrument printed NO output for a red grade, and the header-only artifact could not be published ($REC_FARM_ROWS) — there is no name to lose"
+                    else
+                        log_line "farm:   the extraction was NOT PROVEN complete, and the RAW output could not be persisted ($REC_FARM_ROWS) — only the line(s) excerpted above are in this run's output, and any past the 12-line excerpt are named nowhere"
+                    fi
+                elif [ "$FARM_ROWS_OK" != 1 ] && [ "$FARM_NROWS" -gt 0 ] && [ "$FARM_NROWS" -le 12 ]; then
+                    # ⛔ A FAILED PUBLISH IS NOT ONLY AN ELISION PROBLEM (review round 30, measured). The
+                    # durability sentence lived inside `if [ "$FARM_NROWS" -gt 12 ]`, so a COMPLETE
+                    # extraction of 3 rows with the artifact path blocked said nothing at all about
+                    # durability: the journal printed the rows, the remedy, and stopped — while the doc
+                    # promises the journal says in as many words that those names are durable nowhere,
+                    # and a reader who trusts it opens whatever an EARLIER pass left at the fixed path
+                    # (whose header is the previous run's, reading `n=3 (EXACTLY this run)`). The record
+                    # was right; the log was the surface that lied.
+                    # ⛔ AND IT OWNS ONLY THE NON-ELIDED STATE (VGATE round 30, measured): with more than
+                    # 12 rows the excerpt holds 12 and the `-gt 12` arm below says "rows 13..N are named
+                    # NOWHERE durable", so firing here too printed "the 15 row(s) above" over 12 printed
+                    # rows AND said the failure twice. The cut arm owns that state; this one owns the
+                    # state that has no other sentence.
+                    log_line "farm:   the full list could not be persisted ($REC_FARM_ROWS) — the $FARM_NROWS row(s) above are in this run's output only, and a stale artifact may still sit at that path"
+                fi
                 if [ "$FARM_NROWS" -gt 12 ]; then
-                    log_line "farm:   … and $((FARM_NROWS - 12)) more row(s) in the instrument's own output"
+                    # The count is NOT the answer (tortoise#10114 arm 2): the other rows are named, and
+                    # this line says where — an operator reading the journal must be able to get from
+                    # "18 more" to the 18 names without re-running the instrument by hand.
+                    if [ "$FARM_ROWS_OK" = 1 ]; then
+                        log_line "farm:   … and $((FARM_NROWS - 12)) more row(s) — ALL $FARM_NROWS are named in $REC_FARM_ROWS"
+                    else
+                        log_line "farm:   … and $((FARM_NROWS - 12)) more row(s) — the full list could NOT be persisted ($REC_FARM_ROWS), so rows 13..$FARM_NROWS are named NOWHERE durable"
+                    fi
+                elif [ "$FARM_NROWS" -eq 0 ]; then
+                    # ⛔ AND WHEN NOTHING WAS EXTRACTED THE EXCERPT IS RAW LINES, so the elision is
+                    # counted in LINES (review round 11). `$FARM_NROWS - 12` is -12 here and never
+                    # fired, so a 30-line raw output truncated to 12 said nothing at all about the
+                    # other 18 lines and whether they were durable.
+                    _oline="$FARM_OUT_LINES"
+                    if [ "$_oline" -gt 12 ]; then
+                        if [ "$FARM_ROWS_OK" = 1 ]; then
+                            log_line "farm:   … and $((_oline - 12)) more line(s) of the instrument's output — ALL $_oline are named in $REC_FARM_ROWS"
+                        else
+                            log_line "farm:   … and $((_oline - 12)) more line(s) of the instrument's output — the full output could NOT be persisted ($REC_FARM_ROWS), so lines 13..$_oline are named NOWHERE durable"
+                        fi
+                    fi
+                    unset _oline
                 fi
                 [ -n "$FARM_REMEDY" ] && printf '%s\n' "$FARM_REMEDY" | while IFS= read -r _row; do
                     log_line "farm:   $_row"
                 done
-                finish 0 24 "farm: DRIFT — $FARM_DEST is NOT the code $REF ships (${FARM_NROWS} row(s) above, with the instrument's own remedy — a stale copy, a layout move and an unsourced file do NOT all have the same fix)" ;;
+                if [ "$FARM_ROWS_RAW" = 1 ] && [ "$FARM_ROWS_OK" = 1 ]; then
+                    # ⛔ NO PATH IN THESE SENTENCES (review round 11). `detail=` is cut at 240, and the
+                    # prefix already spends ~106 chars on the farm + ref, so "… published verbatim in
+                    # <path>" was cut MID-FILENAME: key=value readers printed a path that does not
+                    # exist. `farm_rows=` in the same record carries the path, so the sentence names the
+                    # FIELD instead.
+                    case "$FARM_RAW_WHY" in
+                        empty)   FARM_ROW_SENTENCE="the instrument printed NO output for a red grade, so no drifting file is named anywhere" ;;
+                        noproof) FARM_ROW_SENTENCE="its extraction is unproven (no readable or complete 'DRIFT' summary); RAW output published verbatim (see farm_rows=)" ;;
+                        partial)
+                            # ⛔ AN OVER-MATCH IS NOT A SHORTFALL (review round 12, measured): "matched
+                            # only 5 of the 3 row(s)" told a reader 2 rows were MISSING when 2 EXTRA
+                            # were matched — the widened-vocabulary case, described backwards. The two
+                            # directions now have their own sentences.
+                            if [ "$FARM_NROWS" -lt "$FARM_EXPECT" ]; then
+                                FARM_ROW_SENTENCE="matched only $FARM_NROWS of the $FARM_EXPECT row(s) the instrument reports; its RAW output is published verbatim (see farm_rows=)"
+                            else
+                                FARM_ROW_SENTENCE="matched $FARM_NROWS row(s), MORE than the $FARM_EXPECT the instrument reports; its RAW output is published verbatim (see farm_rows=)"
+                            fi ;;
+                        *)       FARM_ROW_SENTENCE="no row matched this pass's extractor; its RAW output is published verbatim (see farm_rows=)" ;;
+                    esac
+                elif [ "$FARM_ROWS_OK" = 1 ]; then
+                    # ⛔ NO PATH HERE EITHER (review round 12, measured): with a 140-char farm path plus
+                    # the state path the prefix + sentence exceeded 240 and `detail=` ended
+                    # "… every one named in /tmp/meas2/state/h" — a path that does not exist, the exact
+                    # defect fixed above for the raw arms. Threshold measured: farm+state ≥ 132 chars.
+                    FARM_ROW_SENTENCE="${FARM_NROWS} row(s), every one named (see farm_rows=)"
+                elif [ "$FARM_ROWS_RAW" = 1 ] && [ "$FARM_RAW_WHY" = empty ]; then
+                    FARM_ROW_SENTENCE="the instrument printed NO output for a red grade, and the header-only artifact could not be published either (farm_rows= names the failure)"
+                elif [ "$FARM_ROWS_RAW" = 1 ]; then
+                    FARM_ROW_SENTENCE="the instrument's RAW output could not be persisted (farm_rows= names the failure, not a file)"
+                else
+                    FARM_ROW_SENTENCE="${FARM_NROWS} row(s) matched, and the full list could not be persisted (farm_rows= names the failure, not a file)"
+                fi
+                # ⛔ THE SENTENCE LEADS, THE PATH FOLLOWS (review round 13, measured). With the farm
+                # path first, a 92-char dest pushed the diagnosis past the 240-byte bound
+                # (`…; RAW output published verba`) and a 223-char dest left ONLY the path — the record
+                # then stated no diagnosis at all. The arm sentence is what a reader must never lose;
+                # the farm path it names is ALSO in the artifact's own `dest=` header.
+                # ⛔ NEVER PROMISE A REMEDY SOMEONE COULD NOT SEND (review round 14, measured). The
+                # sentence said "with the instrument's own remedy" UNCONDITIONALLY while
+                # `REC_REMEDY="$FARM_REMEDY"` is empty whenever the instrument printed no `Next:` block
+                # (a mis-worded farmed copy, or one that died after its rows) — and `write_record` then
+                # emitted `remedy=none`, i.e. a refusal that names a defect and leaves nobody an action,
+                # the very class the `remedy=` field exists to remove. Without a forwarded block the
+                # field says so and names the manual route.
+                # ⛔ AND THE CLAUSE IS NOT REPEATED IN `detail=` (review round 14, measured). It used to
+                # sit after `$FARM_DEST`, i.e. at the very end of a 240-byte field whose tail is what
+                # gets cut — measured: 279 bytes, cut at 241, the clause truncated mid-word, on a
+                # fixture whose farm path alone is 60 chars. The remedy is `remedy=`'s job, and that
+                # field is never truncated (it is bounded by construction, not by `cut`).
+                if [ -n "$FARM_REMEDY" ]; then
+                    REC_REMEDY="$FARM_REMEDY"
+                else
+                    REC_REMEDY="the instrument printed no 'Next:' remedy — read farm_rows= (or this run's excerpt) and re-run check-farm-drift.sh by hand"
+                fi
+                finish 0 24 "farm: DRIFT — $FARM_ROW_SENTENCE; $FARM_DEST is NOT the code $REF ships" ;;
             *)
                 REC_ACTION=farm-unknown
+                # ⛔ BUT WHAT IT DID PRINT IS STILL PUBLISHED (review round 13, reproduced). The
+                # instrument prints its per-file rows BEFORE the exits that give up (check-farm-drift.sh
+                # :689 `matched -eq 0`, :699 mixed ungradeable), so "no grade" never meant "nothing was
+                # reported": measured, 2 UNSOURCED rows then exit 2 was recorded as `farm_rows=not-graded`
+                # with both names durable NOWHERE. `action=farm-unknown` still says no grade was
+                # produced; the file now carries the instrument's output when it printed any.
+                if [ -n "$(printf '%s\n' "$FARM_OUT" | grep -v '^[[:space:]]*$' || true)" ]; then
+                    publish_farm_rows "$FARM_OUT" "n=unparsed (NO GRADE — the instrument exited $FARM_RC, so this is its output verbatim, not a complete list; farm_n=not-graded)"
+                    REC_FARM_NROWS=not-graded
+                fi
+                # ⛔ AND ITS REMEDY, WHICH IS THE ONE THING THIS ARM OFTEN HAS (review round 16,
+                # measured: `remedy=none` beside an artifact holding the instrument's `Next:` block).
+                if [ -n "$FARM_REMEDY" ]; then
+                    REC_REMEDY="$FARM_REMEDY"
+                else
+                    REC_REMEDY="the instrument printed no 'Next:' remedy — read farm_rows= (or this run's output) and re-run check-farm-drift.sh by hand"
+                fi
+                # ⛔ `not-graded` STAYS HERE ON PURPOSE (review round 3): an UNREADABLE grade is not a
+                # grade, and the rows fields must never imply one. `action=farm-unknown` is the field
+                # that says the farm WAS looked at and could not be read — the two together are the
+                # truth, and neither alone would be.
                 finish 0 24 "farm: UNKNOWN (check-farm-drift rc=$FARM_RC) — $FARM_DEST could not be graded against $REF, and cannot-verify is not a pass: $(printf '%s' "$FARM_OUT" | grep -m1 -iE 'unknown|cannot|refus' || printf 'no reason printed')" ;;
         esac
     fi
