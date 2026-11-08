@@ -8958,6 +8958,20 @@ testAsync("#1208 (E2E): a child that exits 0 with zero completed messages is a D
     equal(typeof dd.childPid, "number", "the pid is on the result (ask 1) — no `ps` guessing required");
     equal(dd.childExited, true, "the child is known to be gone");
     ok(TASK_LIVENESS_DETAIL_KEYS.every((k) => k in dd), `all of ${TASK_LIVENESS_DETAIL_KEYS.join(",")} are present`);
+    // ⛔ AND NOTHING ELSE IS (review round 11, P2). The composer writes this set THROUGH the
+    // exported list, so an extra `child*` literal added here would be a field the contract does not
+    // describe — the drift one direction, exactly as a missing member is the other.
+    ok(
+      Object.keys(dd)
+        .filter((k) => k.startsWith("child"))
+        .every((k) => (TASK_LIVENESS_DETAIL_KEYS as readonly string[]).includes(k)),
+      "the composer emits no liveness field the exported vocabulary does not name",
+    );
+    equal(
+      Object.keys(dd).filter((k) => k.startsWith("child")).length,
+      TASK_LIVENESS_DETAIL_KEYS.length,
+      "and exactly the declared members — the list is what the funnel emits",
+    );
     ok(String((died as any).content?.[0]?.text).includes("died before its first message"), "the text SAYS it, so the model cannot read it as an empty answer");
     // ⛔ THE COMPOSED TEXT SURVIVES THE REWRITE (review of this PR, P2 — the first cut REPLACED it).
     // On this arm stdout is empty, so the composer's text IS the child's cleaned stderr, and the arm
@@ -9121,6 +9135,56 @@ test("#1208: a KILLED zero-output settle keeps its measurement (review round 2, 
   const err = childLivenessFor({ details: { isError: true }, hbState: createHeartbeatState(), pid: 77, stdout: "", exited: false });
   equal(err.childState, "never-started", "a failed exec never created a child");
   equal(err.childExited, null, "`null` — not `false`: no child was ever seen alive");
+  // ⛔ AND IT CANNOT REPORT A PID (review round 11, P2). `spawn`'s ENOENT/EACCES shapes report
+  // `pid === undefined`, so the caller-supplied pid below is an input `doResolve` never feeds — and
+  // echoing it emitted `{childPid: 77, childState: "never-started"}`: a child that both exists and
+  // never existed, which is the pairing this field set exists to forbid one field over.
+  equal(err.childPid, null, "a child that never ran has no pid to report");
+});
+
+test("#1208: a completion-watchdog REAP is a parent kill, not a startup death (review round 11, P2)", () => {
+  // The shape `composeTaskResult` produces for the `sessionEnded` arm with `exitCode: null`, empty
+  // stdout and NO content-bearing turn: the session declared itself complete, and the completion
+  // watchdog reaped the lingering child. `killedAfterCompletion` is the evidence that the PARENT
+  // ended the process; without consulting it the snapshot claimed the child DIED DURING STARTUP
+  // (`died-before-first-message` + `isError`), i.e. a false death on a session that had already
+  // ended — and a parent answers a false death by re-dispatching a lane that simply said nothing.
+  const readyOnly = createHeartbeatState();
+  parseHeartbeatLine("[task-heartbeat] ready nonce=nn", readyOnly, 1000);
+  equal(childMessagesSent(readyOnly), 0, "the emitter ran and no turn completed: a PROVEN zero, not unknown");
+  const reaped = childLivenessFor({
+    details: { exitCode: null, killedAfterCompletion: true, exitWatchdog: "completion" },
+    hbState: readyOnly,
+    pid: 4242,
+    stdout: "",
+    exited: true,
+  });
+  equal(reaped.childState, "killed", "the parent reaped it — the kill is named, not a death on its own");
+  equal(reaped.childMessagesSent, 0, "and the zero-message evidence still survives");
+  // The other half: the flag must NOT overwrite a real completion. A reaped child that DID produce
+  // output is `completed`, and one that sent messages is `exited-no-result` — only the claim that
+  // would otherwise be "it died during startup" changes.
+  const reapedWithOutput = childLivenessFor({
+    details: { exitCode: null, killedAfterCompletion: true, exitWatchdog: "completion" },
+    hbState: readyOnly,
+    pid: 4242,
+    stdout: "the answer\n",
+    exited: true,
+  });
+  equal(reapedWithOutput.childState, "completed", "a reaped session that produced an answer is a completion");
+  const reapedWithTurns = childLivenessFor({
+    details: { exitCode: null, killedAfterCompletion: true, exitWatchdog: "completion" },
+    hbState: (() => {
+      const s = createHeartbeatState();
+      parseHeartbeatLine("[task-heartbeat] ready nonce=nn", s, 1000);
+      parseHeartbeatLine("[task-heartbeat] turn_end nonce=nn 1", s, 1001);
+      return s;
+    })(),
+    pid: 4242,
+    stdout: "",
+    exited: true,
+  });
+  equal(reapedWithTurns.childState, "exited-no-result", "a reaped session that sent a message is not a startup death either");
 });
 
 test("#1208: the retry-exhaustion arm is WIRED to the measured snapshot (source pin)", () => {
@@ -9165,6 +9229,23 @@ test("#1208: the field set is PRESENT on arms where no child ever existed — ne
   equal(breakerRefusal.childPid, null, "no pid was ever assigned");
   equal(breakerRefusal.childExited, null, "nothing was seen alive, so `null` — never `false`");
   equal(breakerRefusal.childMessagesSent, null, "no count is knowable without a child");
+  // ⛔ THE STAMP MUST BE APPLIED BY THE TOOL LAYER, NOT JUST EXIST (review round 11, P2). The rows
+  // above call the pure stamper directly, so deleting its application from any tool-layer arm left
+  // every assertion green while the contract broke on exactly the arms this half exists for. These
+  // pins are on the WIRING, one per construction site: the one choke point every spawned arm returns
+  // through, the post-spawn provider halt, and both invalid-session-id refusals.
+  ok(
+    source.includes("details: stampLivenessDefaults(value.details ?? {})"),
+    "the tool-result choke point stamps every spawned arm's details",
+  );
+  const degradedWrapper = source.slice(source.indexOf("const withSessionDegraded"), source.indexOf("const buildArgs"));
+  ok(/stampToolLiveness\(/.test(degradedWrapper), "the session-degraded wrapper routes through the stamp (its own details literal would otherwise bypass it)");
+  ok(source.includes("details: stampLivenessDefaults(halt.details)"), "the post-spawn provider halt is stamped");
+  equal(
+    (source.match(/stampLivenessDefaults\(\{ model, provider, status: "invalid-session-id"/g) ?? []).length,
+    2,
+    "both invalid-session-id refusals are stamped",
+  );
 });
 
 // The durable run record's `reason` (review round 9, P3). `classifyBackgroundOutcome` persisted the

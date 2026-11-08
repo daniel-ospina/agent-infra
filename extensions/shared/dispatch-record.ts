@@ -106,7 +106,15 @@ export interface DispatchOutcomeRow {
    * renderer had been corrected before; this aligns the row with it. */
   dirtyPaths: string[] | null;
   /** Why the attempt ended: "hard-cap" | "cut" | "backstop" | "failed" |
-   * "orphan-killed" | the heartbeat `decision.reason`.
+   * "clean-empty" | "died-before-first-message" | "orphan-killed" | the
+   * heartbeat `decision.reason`.
+   *
+   * `"died-before-first-message"` (#1208) is derived from the settle's liveness
+   * MEASUREMENT, not from the settle path, precisely so it cannot disagree with the
+   * payload: a slow-start death that exits 0 with empty stdout settles through the
+   * `clean-empty` path but is not a success, and a row labelled `clean-empty` beside
+   * `status: died-before-first-message` would be two contradictory durable claims
+   * for one settle.
    *
    * `"orphan-killed"` is the ONE reason written by the CHILD rather than the
    * parent: the #385 orphan watchdog fired because the parent disappeared, so
