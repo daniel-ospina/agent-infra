@@ -8581,6 +8581,18 @@ test("#2242: the ceiling is derived at 8x cores and an operator override is hono
     );
   }
   equal(DEFAULT_SESSION_CEILING_MULT, 8, "the derived multiplier is the documented 8x");
+  // ⛔ AN UNREAD CORE COUNT DERIVES NOTHING (review round 5, P2). `os.cpus()` is documented to
+  // return `[]` on some platforms/containers; coercing that to 1 would derive a confident ceiling of
+  // 8 from a measurement never taken, and with TASK_SESSION_CEILING_REFUSE=1 that false-BLOCKS every
+  // dispatch on a busy box — the fail-open/false-block pair the preflight exists to avoid.
+  ok(Number.isNaN(resolveSessionCeiling(0, {}).ceiling), "0 cores (os.cpus() -> []) derives NO ceiling, never 8");
+  ok(Number.isNaN(resolveSessionCeiling(Number.NaN, {}).ceiling), "NaN cores derives NO ceiling");
+  ok(Number.isNaN(resolveSessionCeiling(-4, {}).ceiling), "a negative core count derives NO ceiling");
+  deepEqual(
+    resolveSessionCeiling(0, { TASK_SESSION_CEILING: "13" }),
+    { ceiling: 13, source: "env" },
+    "an explicit ceiling needs no derivation, so unknown cores cannot veto an operator's number",
+  );
 });
 
 test("#2242: an UNMEASURED box is never called saturated", () => {
@@ -8598,6 +8610,12 @@ test("#2242: an UNMEASURED box is never called saturated", () => {
   // The two measured points, asserted as the calibration itself.
   equal(isDispatchSaturated({ piProcs: 24, cores: 16, ceiling: 8 * 16 }), false, "24 procs / 16 cores (36/36 healthy) is NOT saturated");
   equal(isDispatchSaturated({ piProcs: 88, cores: 10, ceiling: 8 * 10 }), true, "88 procs / 10 cores (5/5 wedges) IS saturated");
+  // An unknown CORE count is the second unread channel: a large process count alone never saturates.
+  equal(
+    isDispatchSaturated({ piProcs: 500, cores: 0, ceiling: resolveSessionCeiling(0, {}).ceiling }),
+    false,
+    "an unread core count derives no ceiling, so a saturated-looking count is not saturation",
+  );
 });
 
 test("#2242: the notice is silent on a healthy box and loud on a saturated one", () => {
@@ -8614,6 +8632,13 @@ test("#2242: the notice is silent on a healthy box and loud on a saturated one",
   // interpretable across boxes of different sizes (a 4-core and a 32-core box
   // are not comparable by raw process count).
   ok(String(line).includes("8.8x cores"), "the ratio is rendered against cores");
+  // An unread core count must render as unread — never as a confident `1 cores` with a ratio
+  // computed against a number nobody measured (review round 5, P2).
+  const unknownCores = saturationNotice({ piProcs: 20, cores: 0, ceiling: 13 }, {});
+  ok(unknownCores !== null, "an EXPLICIT ceiling can still fire when cores are unread");
+  ok(!String(unknownCores).includes("1 cores"), "never renders a fabricated `1 cores`");
+  ok(String(unknownCores).includes("unknown cores"), "names the unread core count as unknown");
+  ok(!String(unknownCores).includes("20.0x"), "no ratio is invented against an unmeasured core count");
 });
 
 test("#2242: the fast refusal is OPT-IN and says `could not dispatch: fleet saturated at N sessions`", () => {
@@ -8684,7 +8709,16 @@ test("#2242 WIRING: spawnSubAgent consults the preflight BEFORE any spawn, and t
   // The notice and the refusal must both come from the SAME probe — a second
   // `ps` read could disagree with the one the refusal acted on.
   const body = source.slice(source.indexOf("const saturation = probeDispatchSaturation();"));
-  const head = body.slice(0, body.indexOf("return new Promise"));
+  // ⛔ RE-ANCHOR, DO NOT SKIP (review round 5, P2). `body.indexOf(...)` returns -1 if the spawn
+  // promise is ever renamed, and `slice(0, -1)` then yields the REMAINDER OF THE FILE — so both
+  // rows below would pass for a probe that had moved to any position at all, including one AFTER
+  // the spawn. Assert the anchor is real first.
+  const promiseAt = body.indexOf("return new Promise");
+  ok(
+    promiseAt > 0,
+    "the spawn promise still follows the probe — the pre-spawn ordering pin must be re-anchored, not silently widened to the whole file",
+  );
+  const head = body.slice(0, promiseAt);
   ok(head.includes("saturationNotice(saturation)"), "the notice renders from that probe");
   ok(head.includes("dispatchSaturationRefusal(saturation)"), "the refusal decides from that same probe");
   // It must not touch a kill bound: load-policy §1 forbids shrinking one under

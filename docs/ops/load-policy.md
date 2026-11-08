@@ -532,7 +532,7 @@ through `probeDispatchSaturation()` → `resolveSessionCeiling()`:
 
 | knob | default | meaning |
 |---|---|---|
-| `TASK_SESSION_CEILING` | `8 × cores` | absolute live-`pi` count that counts as saturated. Honoured verbatim (#1070); `0` **disables** the preflight (a real value, the `LOAD_SUSPEND_THRESHOLD=0` shape); absent/garbage fails **closed** to the derived default |
+| `TASK_SESSION_CEILING` | `8 × cores` | absolute live-`pi` count that counts as saturated. Honoured verbatim (#1070); `0` **disables** the preflight (a real value, the `LOAD_SUSPEND_THRESHOLD=0` shape); absent/garbage fails **closed** to the derived default. An **unread** core count (`os.cpus()` returns `[]` in some containers) derives **no** ceiling and the preflight stays silent — a control may not act on a measurement it did not take |
 | `TASK_SESSION_CEILING_REFUSE` | unset | `1` turns the notice into a **fast refusal**: `could not dispatch: fleet saturated at N sessions`, in about a second, instead of spawning a child that will burn the bound |
 
 Over the ceiling the dispatch prints one line naming the count, the cores, the
@@ -556,13 +556,14 @@ about how many sessions the box held.
 
 **The refusal is a REFUSAL, in every consumer.** A pre-spawn refusal payload
 carries `details.status` and no `isError`, so every consumer that accounts for a
-dispatch has to classify it — and there are **three**, of three different shapes:
+dispatch has to classify it — and there are **four**, of four different shapes:
 
 | consumer | how it decides | what a missed status used to do |
 |---|---|---|
 | `builtin-tools` `FAILED_TASK_STATUS` | enumerates the vocabulary | report a refusal as a success |
 | `review-enforcer` dispatch floor | `classifySpawnOutcome` → `REFUSED_STATUS` | satisfy the >=1-dispatch floor for an **unreviewed push** |
 | `sequence-enforcer` verifier step | `classifySpawnOutcome` (was: nothing) | **advance a verifier step with zero verdicts** |
+| `verification-gate` `[VGATE]` handler | `classifySpawnOutcome` (was: nothing) | **record the prompt's files as VERIFIED with no verifier ever run** |
 
 The middle one is a re-enumeration, and a status missing from it falls through to
 two arms decided by **extension load order** (#2242 review round 1, category A).
@@ -573,3 +574,19 @@ and became routine the moment a refusal fired on a *measured* box condition.
 Both now read the one shared classifier, so a new status cannot be handled in one
 place and ignored in another; the two SETS still owe a row in their own suites,
 and any new *consumer* owes the classifier call.
+
+The fourth is the one that made the class **reachable from the knob itself**
+(#2242 review round 5). A refused `[VGATE]` dispatch carries non-empty content and
+no `details.background`, so it slipped past both existing guards and reached the
+#5724 fail-open prompt-merge — which, in an interactive orchestrator, marks every
+file named in the prompt as VERIFIED *without a verifier running*. Since
+`TASK_SESSION_CEILING_REFUSE=1` refuses every `[VGATE]` dispatch on a saturated
+box, the documented "fail fast" setting would have defeated the verification gate
+on exactly the box most likely to be dispatching a reviewer. It now classifies and
+leaves the gate BLOCKED, and it deliberately does **not** count as a `vgateFailures`
+strike: three counted refusals would trip the auto-bypass latch and switch the gate
+**off**, so a refusal must move the gate nowhere. The same distinction governs the
+reap view: a terminal `task_collect` carries the child's composed payload at
+`view.details`, so a consumer that classifies the view alone reads a signal-death
+child (`exitCode: null`) as its own `status: "done"` and counts a verdict for a
+reviewer that reported nothing — merge the payload the way `review-enforcer` does.

@@ -3381,7 +3381,16 @@ export function resolveSessionCeiling(
       return { ceiling: Math.max(1, Math.floor(n)), source: "env" };
     }
   }
-  const c = Number.isFinite(cores) && cores > 0 ? Math.floor(cores) : 1;
+  // ⛔ AN UNREAD CORE COUNT IS NOT "1 CORE" (review round 5, P2). `os.cpus()` is documented to
+  // return `[]` on some platforms/containers, and coercing that to 1 derives a confident ceiling of
+  // 8 — a safety control acting on a measurement it never took, which is the rule the sibling
+  // `readMachineCapacity` already follows (it treats `cores === 0` as UNKNOWN and renders
+  // `ratio=null`). Emit NaN instead: `isDispatchSaturated`'s `ceiling > 0` test is then false, so the
+  // preflight stays silent and refuses nothing — the same fail-safe direction as the `-1` `piProcs`
+  // sentinel, and it cannot false-BLOCK a busy box with `TASK_SESSION_CEILING_REFUSE=1`.
+  // An EXPLICIT `TASK_SESSION_CEILING` is still honoured above: the operator supplied the number, so
+  // no derivation from cores is involved.
+  const c = Number.isFinite(cores) && cores > 0 ? Math.floor(cores) : Number.NaN;
   return { ceiling: DEFAULT_SESSION_CEILING_MULT * c, source: "derived" };
 }
 
@@ -3413,7 +3422,16 @@ export function isDispatchSaturated(i: SaturationInput): boolean {
 }
 
 function saturationCores(i: SaturationInput): number {
-  return Number.isFinite(i.cores) && i.cores > 0 ? Math.floor(i.cores) : 1;
+  // Unknown stays unknown all the way to the rendered line — never a confident `1`.
+  return Number.isFinite(i.cores) && i.cores > 0 ? Math.floor(i.cores) : Number.NaN;
+}
+
+/** The cores half of the notice: a read count, or an explicit `unknown` — never a guessed 1. */
+function coresPhrase(cores: number): { text: string; ratio: (procs: number) => string } {
+  if (!Number.isFinite(cores)) {
+    return { text: "unknown cores", ratio: () => "ratio unknown (core count unread)" };
+  }
+  return { text: `${cores} cores`, ratio: (procs: number) => `${(procs / cores).toFixed(1)}x cores` };
 }
 
 /** #2242: the ONE loud line printed at dispatch when the box is at/above its
@@ -3425,12 +3443,11 @@ export function saturationNotice(
   env: Record<string, string | undefined> = process.env,
 ): string | null {
   if (!isDispatchSaturated(i)) return null;
-  const cores = saturationCores(i);
-  const ratio = (i.piProcs / cores).toFixed(1);
+  const cores = coresPhrase(saturationCores(i));
   const refusing = env.TASK_SESSION_CEILING_REFUSE === "1";
   return (
-    `[task] ⚠️ fleet saturated at dispatch: ${i.piProcs} live pi sessions on ${cores} cores ` +
-    `(${ratio}x cores, ceiling ${i.ceiling}) — a dispatch here may wedge on its SECOND model turn ` +
+    `[task] ⚠️ fleet saturated at dispatch: ${i.piProcs} live pi sessions on ${cores.text} ` +
+    `(${cores.ratio(i.piProcs)}, ceiling ${i.ceiling}) — a dispatch here may wedge on its SECOND model turn ` +
     `and then burn its whole inactivity bound (#2242). ` +
     (refusing
       ? `TASK_SESSION_CEILING_REFUSE=1 is set, so this dispatch is REFUSED before any spawn.`
@@ -3452,9 +3469,9 @@ export function dispatchSaturationRefusal(
 ): string | null {
   if (env.TASK_SESSION_CEILING_REFUSE !== "1") return null;
   if (!isDispatchSaturated(i)) return null;
-  const cores = saturationCores(i);
+  const cores = coresPhrase(saturationCores(i));
   return (
-    `could not dispatch: fleet saturated at ${i.piProcs} sessions on ${cores} cores ` +
+    `could not dispatch: fleet saturated at ${i.piProcs} sessions on ${cores.text} ` +
     `(ceiling ${i.ceiling}) — refusing in about a second rather than spawning a child that would ` +
     `burn its whole inactivity bound on the second model turn (#2242). Free capacity, or set ` +
     `TASK_SESSION_CEILING_REFUSE=0 to dispatch anyway.`

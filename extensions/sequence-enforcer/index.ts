@@ -2810,6 +2810,9 @@ function tokenStateLabel(reason: string): string {
         failoverHopSpawnFailed?: unknown;
         isError?: unknown;
         exitCode?: unknown;
+        /** The CHILD's composed payload on a terminal `task_collect` view — merged into the
+         * classification below so the child's own `killed`/`exitCode` are readable. */
+        details?: unknown;
       };
     }).details;
     // #1662 review: the pre-spawn refusal / halted-chain / invalid-session-id
@@ -2861,23 +2864,46 @@ function tokenStateLabel(reason: string): string {
       // This closes the pre-existing `invalid-cwd` / `circuit_open` hole at the same time.
       // NOTE the counting asymmetry is deliberate: the count was INCREMENTED on the
       // `tool_call`, and only the `tool_result` is seen here, so a no-verdict dispatch still
-      // decrements — it just does not ADVANCE the step. That is the correct pair: the
-      // reservation is released (the dispatch is over) while the step stays open for a real
+      // RELEASES one reservation — it just does not ADVANCE the step. That is the correct pair:
+      // the reservation is released (the dispatch is over) while the step stays open for a real
       // verdict, matching the `return undefined` shape of the still-waiting arm above.
+      // Release ONE, never all: see the decrement below (review round 5, P1).
+      const collectPayload =
+        isTerminalCollect && verifierDetails && typeof verifierDetails.details === "object" && verifierDetails.details !== null
+          ? (verifierDetails.details as Record<string, unknown>)
+          : null;
       const spawnOutcome = classifySpawnOutcome({
-        details: verifierDetails as Record<string, unknown> | undefined,
+        // ⛔ A terminal collect carries the CHILD's composed payload one level down, at
+        // `view.details` — and the classifier reads `exitCode` from the object it is HANDED. Passing
+        // the view alone means a child that died on a signal (`exitCode: null`) or exited 0 with no
+        // output reads as a `status:"done"` run and classifies as a VERDICT, advancing the step with
+        // zero verdicts (review round 5, P1 — the #2665 failure shape, in the one consumer whose
+        // whole purpose is to refuse it). Mirror `review-enforcer`'s floor: merge payload LAST so the
+        // child's own `killed`/`exitCode` win.
+        details: collectPayload
+          ? { ...(verifierDetails as Record<string, unknown>), ...collectPayload }
+          : (verifierDetails as Record<string, unknown> | undefined),
         isError: (event as { isError?: unknown }).isError,
       });
       if (spawnOutcome.outcome !== "verdict") {
         console.log(
           `[sequence-enforcer] ⛔ dispatch produced NO verdict (${spawnOutcome.outcome}: ${spawnOutcome.evidence}) — the verifier step stays open (#2242)`,
         );
-        auditLog("verifier-no-verdict", {
+        auditLog({
+          event: "verifier-no-verdict",
           step: targetSkill.stepIndex,
           outcome: spawnOutcome.outcome,
           evidence: spawnOutcome.evidence,
         });
-        targetSkill.reviewers.delete(targetSkill.stepIndex);
+        // ⛔ DECREMENT, never `delete` (review round 5, P1). `reviewers` is a COUNT of in-flight
+        // dispatches per step, not a boolean. `delete` released EVERY outstanding reservation, so
+        // with two reviewers in flight a single refusal zeroed the count, the SECOND reviewer's
+        // genuine verdict then read `current = 0`, the advance block was skipped, and that verdict
+        // was silently discarded — the step wedged forever with no explanation. This is the same
+        // arithmetic the verdict arm below already does.
+        const outstanding = (targetSkill.reviewers.get(targetSkill.stepIndex) ?? 0) - 1;
+        if (outstanding > 0) targetSkill.reviewers.set(targetSkill.stepIndex, outstanding);
+        else targetSkill.reviewers.delete(targetSkill.stepIndex);
         return undefined;
       }
       const current = targetSkill.reviewers.get(targetSkill.stepIndex) || 0;

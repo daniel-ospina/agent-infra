@@ -3034,6 +3034,15 @@ await test("#2242: a BLOCKING `fleet-saturated` refusal does NOT advance the ver
           undefined,
           "the reservation is RELEASED (the dispatch is over) while the step stays open for a real verdict",
         );
+        // ⛔ THE AUDIT ROW IS THE DURABLE EVIDENCE (review round 5, P1). `auditLog` takes ONE object,
+        // so the earlier `auditLog("verifier-no-verdict", {...})` spread a STRING: the row landed with
+        // no `event` key and none of step/outcome/evidence, i.e. the record of "a verifier dispatch
+        // produced no verdict" did not exist. Assert the fields, not just that something was written.
+        const row = auditEntries.find((x) => x.event === "verifier-no-verdict");
+        ok(row, "a `verifier-no-verdict` audit row is written (`auditLog` takes ONE object)");
+        equal(row!.step, 1, "the row names the step that stayed open");
+        equal(row!.outcome, "refused", "the row names the classification outcome");
+        ok(String(row!.evidence).includes("fleet-saturated"), `the row carries the evidence (got ${row!.evidence})`);
         // …and a REAL verdict afterwards still advances it, so the fix cannot deadlock the step.
         // A CLEAN task success carries `{model, provider}` and NO `exitCode` (see
         // `classifySpawnOutcome`: an emitted `exitCode` means a non-clean composition), so this is
@@ -3062,6 +3071,77 @@ await test("#2242: the pre-existing `invalid-cwd` / `circuit_open` blocking refu
           await handlers.tool_call!({ toolName: "task", input: { prompt: "review" } });
           await handlers.tool_result!({ toolName: "task", details: { status, retryable: false } });
           equal(_stackForTest()[0]!.stepIndex, 1, `a blocking \`${status}\` refusal must not advance the step`);
+        }
+      },
+    );
+  } finally { auditRelease(); }
+});
+
+await test("#2242 R5: a refusal with a SECOND reviewer still in flight releases only ITS reservation", async () => {
+  // ⛔ THE REGRESSION THE FIRST FIX INTRODUCED (review round 5, P1). Releasing with
+  // `reviewers.delete(...)` wipes EVERY outstanding reservation for the step, not just this
+  // dispatch's. With two reviewers in flight, one refusal zeroed the count and the SECOND
+  // reviewer's GENUINE verdict then read `current = 0`, skipped the advance block, and was silently
+  // discarded — the step wedged forever. It failed CLOSED, which is why nothing reddened: the cost
+  // was a lane re-dispatching reviewers blind, with no error to read. `reviewers` is a COUNT.
+  _resetStateForTest();
+  const { pi, handlers } = fakePi();
+  auditCapture();
+  try {
+    await withEnv(
+      { PI_MODE: "print", AGENT_SEQUENCE_MODE: "warn", AGENT_STATE_MACHINE: undefined, ELDATO_STATE_MACHINE: undefined },
+      async () => {
+        sequenceEnforcer(pi as any);
+        _pushSkillForTest("/repo/skills/sat-pair/SKILL.md", verifierSkillSteps(), 1);
+
+        await handlers.tool_call!({ toolName: "task", input: { prompt: "review one" } });
+        await handlers.tool_call!({ toolName: "task", input: { prompt: "review two" } });
+        equal(_stackForTest()[0]!.reviewers.get(1), 2, "both dispatches are counted");
+
+        // ONE of the two is refused: exactly one reservation is released, so the count is 1 — not absent.
+        await handlers.tool_result!({ toolName: "task", details: { status: "fleet-saturated", retryable: false } });
+        equal(_stackForTest()[0]!.reviewers.get(1), 1, "⛔ exactly ONE reservation is released, not all of them");
+        equal(_stackForTest()[0]!.stepIndex, 1, "the refusal still does not advance the step");
+
+        // The surviving reviewer's real verdict must still advance the step.
+        await handlers.tool_result!({ toolName: "task", details: { model: "m", provider: "p" } });
+        equal(_stackForTest()[0]!.stepIndex, 2, "⛔ the second reviewer's genuine verdict still advances the step");
+      },
+    );
+  } finally { auditRelease(); }
+});
+
+await test("#2242 R5: a terminal task_collect whose CHILD reported nothing does NOT advance the verifier step", async () => {
+  // ⛔ THE COMPOSED PAYLOAD IS ONE LEVEL DOWN (review round 5, P1). A collect view carries the child's
+  // payload at `view.details`, and `classifySpawnOutcome` reads `exitCode` from the object it is
+  // HANDED. Classifying the VIEW alone means a signal-death (`exitCode: null`) or clean-empty
+  // (`exitCode: 0`) child reads as the view's own `status: "done"` → a VERDICT → the step advances
+  // with zero verdicts, which is the exact #2665 false PASS the shared classifier exists to close.
+  _resetStateForTest();
+  const { pi, handlers } = fakePi();
+  auditCapture();
+  try {
+    await withEnv(
+      { PI_MODE: "print", AGENT_SEQUENCE_MODE: "warn", AGENT_STATE_MACHINE: undefined, ELDATO_STATE_MACHINE: undefined },
+      async () => {
+        sequenceEnforcer(pi as any);
+        _pushSkillForTest("/repo/skills/sat-collect/SKILL.md", verifierSkillSteps(), 1);
+        await handlers.tool_call!({ toolName: "task", input: { prompt: "review", background: true } });
+        for (const exitCode of [null, 0]) {
+          await handlers.tool_result!({
+            toolName: "task_collect",
+            details: {
+              run_id: `run-${String(exitCode)}`,
+              status: "done",
+              terminal: true,
+              details: { model: "m", provider: "p", exitCode },
+            },
+          });
+          equal(
+            _stackForTest()[0]!.stepIndex,
+            1,
+            `⛔ a child that reported nothing (exitCode=${String(exitCode)}) must not satisfy the verifier step`,
+          );
         }
       },
     );
