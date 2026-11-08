@@ -5782,13 +5782,13 @@ fi
 #     → :2482 :4186 :6501 :6613, plus a comment mention at :2356) and the
 #     same four PREDICATE sites are at head
 #     (`grep -n 'grep -qxF' scripts/record-review.sh` prints all four PREDICATE lines at head —
-#     CITE-CHECK: :2747 :4473 :6843 :7017, plus a comment mention at :2616; `14.1c-CITE` below
+#     CITE-CHECK: :3133 :4859 :7229 :7403, plus a comment mention at :3002; `14.1c-CITE` below
 #     re-derives these numbers, so they cannot rot silently): in #3168's diff the only
-#     hunk at `post_marker()` (:2725) ADDS A COMMENT — this PR does not touch
+#     hunk at `post_marker()` (:3111) ADDS A COMMENT — this PR does not touch
 #     `post_marker()` at all — and the
-#     predicate line beside it (CITE-CHECK: :2747) is CONTEXT, not a change.
+#     predicate line beside it (CITE-CHECK: :3133) is CONTEXT, not a change.
 #     WHAT THE VECTOR BELOW ACTUALLY PINS: the BODY-APPEND site
-#     (`if ! grep -qxF -- "$MARKER" <<<"$BODY"`; on main at bd1b205d :6501 — at head CITE-CHECK: :6843). It is a
+#     (`if ! grep -qxF -- "$MARKER" <<<"$BODY"`; on main at bd1b205d :6501 — at head CITE-CHECK: :7229). It is a
 #     MAIN-REGRESSION pin — reverting this PR leaves 14.1c GREEN, and 14.10f is a
 #     main-regression pin for the same reason. Keeping them is right (main's
 #     anchoring should not silently regress); calling them evidence about this diff
@@ -5814,7 +5814,7 @@ fi
 #     `:6625` / `:6770` at `dc7e3ae99`, `:6634` / `:6779` at `921109de2` and `:6639` / `:6796` at
 #     `17551325e` as comment blocks were added above them, while the CITES beside them still read
 #     `:6625` / `:6770` at all three — that divergence IS the rot this paragraph describes — and at
-#     this head the predicates are `:6843` / `:7017` — CITE-CHECK: :6843 :7017 — re-derived by the
+#     this head the predicates are `:7229` / `:7403` — CITE-CHECK: :7229 :7403 — re-derived by the
 #     guard below, like every other head cite of a predicate). One
 #     lane's response was to delete the numbers — which removes the rot but also removes the
 #     reader's target. Both intents are kept here: the number stays, and it is CHECKED.
@@ -6716,14 +6716,14 @@ assert_eq "$REC_BEFORE_14B" "$(cat "$F_HOME/.pi/agent/reviews/daniel-ospina-agen
 #       not. `if command grep -qxF -- "$marker" <<<"$body"` is ALREADY `-qxF` on main
 #       (`git show bd1b205d:scripts/record-review.sh | grep -n 'grep -qxF'` — the sha is NAMED
 #       because `origin/main` moves and a bare "main :NNNN" rots the moment it does → :2482),
-#       and in #3168's diff the only hunk at `post_marker()` (head :2725) ADDS A COMMENT above
+#       and in #3168's diff the only hunk at `post_marker()` (head :3111) ADDS A COMMENT above
 #       it (this PR does not touch `post_marker()` at all) — the
-#       predicate line (head :2747) is CONTEXT. Reverting #3168 leaves this vector GREEN; it is kept
+#       predicate line (head :3133) is CONTEXT. Reverting #3168 leaves this vector GREEN; it is kept
 #       because main's anchoring should not silently regress, and it is labelled so the
 #       next reader does not mistake it for evidence about this diff. The predicate must
 #       match the gate's line-anchored `^…$` admission, exactly like the three other
 #       sites already anchored on main (bd1b205d :4186 :6501 :6613) — the same four that the grep
-#       above prints at head, CITE-CHECK: :4473 :6843 :7017 (`14.1c-CITE` re-derives the triple).
+#       above prints at head, CITE-CHECK: :4859 :7229 :7403 (`14.1c-CITE` re-derives the triple).
 #       ⛔ ASSERTS THE TRANSPORT (a PATCH was issued), not the exit code: the destructive
 #       mutant also exited 0.
 if [ -n "${QB_LINE:-}" ]; then
@@ -10196,6 +10196,19 @@ run_record_delta $EH120 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42536101" \
 I only actually reviewed headroom..HEAD; the rest was not read."
 assert_eq "$RECORD_RC" "3" "20h71 a ref name that BEGINS with 'head', at the attested head, is still an EMPTY range — REFUSED (rc 3)"
 assert_contains "$RECORD_ERR" "states an EMPTY range" "20h71 …and the refusal is the empty-range one, not a sentence about a notation never written"
+# ⛔ THE NORMALISATION HALF IS PINNED BY SOURCE, AND THE REASON IS MEASURED (twenty-first cycle): its
+# behavioural mutant (`case "${_elhs:0:4}"`) is INVISIBLE on a case-insensitive filesystem — `git rev-parse
+# --verify 'HEADroom^{commit}'` resolves there, so the corrupted token still reaches the branch and a cell
+# anchored on it reports "mutant still refused" on macOS while reddening on Linux. A source assertion is
+# the honest cover for a guard whose mutant is host-dependent; `20h56` sets the precedent for the same
+# trade, and BOTH halves are named so a later edit cannot remove one and keep the other.
+_71r_src="$(command sed -n '/_elhs=\"\${BASH_REMATCH\[2\]}\${BASH_REMATCH\[3\]}"/,/_lid=0; _rid=0/p' "$RECORD")"
+# The assertions read the EXECUTING lines only: the arm's own comment QUOTES the removed spelling so a
+# later reader can see what was wrong, and a whole-block scan would redden on that quotation.
+_71r_code="$(printf '%s\n' "$_71r_src" | command grep -vE '^[[:space:]]*#')"
+assert_eq "$([ -n "$_71r_code" ] && echo live || echo dead)" "live" "20h71 prerequisite: the arm's executing lines were captured (an empty capture would pass both assertions below)"
+assert_contains "$_71r_code" "[Hh][Ee][Aa][Dd][~^@]*) _elhs=" "20h71 the tip normalisation is the WORD or the WORD PLUS A SELECTOR, not a prefix rewrite"
+assert_not_contains "$_71r_code" '_elhs:0:4' "20h71 …and the four-character prefix rewrite that laundered a ref name is GONE from the executing code"
 [ -f "$(Q2 $EH120)" ] && bad "20h71 FAIL-OPEN: a head-prefixed branch name laundered an empty range into a signed clean" || ok "20h71 no record was written"
 # THE FALSE-BLOCK CONTROL: narrowing the WORD test must not stop the arm admitting ref names — the
 # same `head…`-prefixed class, at an ANCESTOR, is the honest range and must stay accepted.
@@ -11326,14 +11339,20 @@ I only actually reviewed @{0}~0..HEAD; the rest was not read."
 MUT="$(mk_mutant noerefname '|[A-Za-z][A-Za-z0-9_/-]*)(${_dident}*)' ')(${_dident}*)')"
 mut_check "M55 a SYMBOLIC endpoint is admitted as a TOKEN, so an empty range cannot hide behind a branch name" 425340 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42534101" accepted STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
 I only actually reviewed deltatip..HEAD; the rest was not read."
-# M56 — A `head…` TOKEN IS THE TIP'S WORD ONLY WHEN A SELECTOR FOLLOWS IT (twenty-first cycle, P1).
-#       Widening the guard back to ANY `head*` token restores the pre-fix behaviour exactly: a branch
-#       called `headroom` at the attested head becomes `HEADroom`, its resolution fails, the arm
-#       `continue`s, and 20h71 records a SIGNED `clean` over an empty range. The cell runs 20h71's own
-#       body and the mutant must ACCEPT it. Anchored on `_elhs=`, which the omitted-endpoint arm's
-#       identical two-line case (there spelled `_olhs=`) cannot collide with.
-MUT="$(mk_mutant headprefix '[Hh][Ee][Aa][Dd][~^@]*) _elhs=' '[Hh][Ee][Aa][Dd]*) _elhs=')"
-mut_check "M56 a 'head…' token is the tip's WORD only with a selector after it — any other is a REF NAME" 425360 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42536101" accepted STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
+# M56 — THE TIP SPLIT MATCHES ONLY THE CANONICAL TIP TOKEN (twenty-first cycle, P1). Widening the split
+#       back to ANY `head…` token makes a REF NAME un-resolvable in the way the pre-fix arm did it: the
+#       branch `headroom` is taken for the word, `HEAD` is stripped from a token that does not carry it,
+#       the resolve of `${to}headroom` fails and the `continue` skips the range — so 20h71 records a
+#       SIGNED `clean`. The cell runs 20h71's own body and the mutant must ACCEPT it.
+#       ⛔ WHY THE SPLIT AND NOT THE NORMALISATION: the prefix-rewrite mutant (`${_elhs:0:4}` → `HEAD…`)
+#       CANNOT be measured on a case-INSENSITIVE filesystem — MEASURED on this box, `git rev-parse
+#       --verify 'HEADroom^{commit}'` RESOLVES (APFS folds the case), so the corrupted token still
+#       reaches the branch and the cell reported "mutant still refused" — a HOST artifact, not a live
+#       guard. The split mutation has no case dependence: it resolves `${to}headroom`, which is invalid
+#       on every filesystem. The normalisation half is pinned by the two source assertions in 20h71's
+#       block instead, which is the honest cover when the behavioural mutant is not reproducible.
+MUT="$(mk_mutant headsplit 'HEAD|HEAD[~^@]*|@*)' '[Hh][Ee][Aa][Dd]*|@*)')"
+mut_check "M56 the tip-arm SPLIT matches only the canonical tip token — a head-prefixed REF NAME is not the tip's word" 425360 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42536101" accepted STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
 I only actually reviewed headroom..HEAD; the rest was not read."
 # M57 — AN OMITTED ENDPOINT IS AN EMPTY RANGE WHEN THE OPERAND IS THE TIP (twenty-first cycle, P2).
 #       Emptying `_opends` disables the arm, which is exactly the pre-fix state: `@{0}..` matches no
