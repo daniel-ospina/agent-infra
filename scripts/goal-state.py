@@ -26,9 +26,21 @@ from __future__ import annotations
 import os
 import sys
 
-REPO = "/Users/danielospina/Documents/GitHub/tortoise"
+# ⛔ THE LOOPBACK IS SPELLED, NEVER NAMED — and this file is FARMED to every box
+# (`pi-bootstrap/setup.sh` `fleet_srcs`), so the spelling has to be right here or it is wrong
+# everywhere. `localhost` resolves `::1` BEFORE `127.0.0.1` on macOS; if a second FalkorDB is bound
+# on `::1:16379` — an ephemeral dev container, a re-created sandbox — this reader answers from THAT
+# near-empty instance and the failure is silent, because a bare connect succeeds against either
+# server (tortoise#6666, where a 1,263-node graph read as 25). `127.0.0.1` is the canonical
+# instance. Verified by reading back a point that must exist, never by connecting.
+#
+# `TORTOISE_REPO` overrides the checkout (the same convention `install-launchd.sh` resolves and the
+# `{{TORTOISE_REPO}}` placeholder renders): the literal below is one machine's path, and a farmed
+# copy runs on boxes that do not have it.
+REPO = os.environ.get("TORTOISE_REPO") or "/Users/danielospina/Documents/GitHub/tortoise"
 sys.path.insert(0, REPO)
-os.environ.setdefault("TORTOISE_DB_URI", "docker://:@localhost:16379/tortoise")
+# `setdefault`: an explicit URI always wins — this file must be pointable at a test graph.
+os.environ.setdefault("TORTOISE_DB_URI", "docker://:@127.0.0.1:16379/tortoise")
 
 TERMINAL = "met"          # a goal whose work is done
 NON_GATE = ("guideline",)  # owner #6792: a demoted target; can never block the queue
