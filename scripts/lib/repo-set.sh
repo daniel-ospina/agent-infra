@@ -277,12 +277,16 @@ _rs_doctor_available() {
 # surviving one errno over.
 # Bash cannot see the errno; python can, and the same interpreter is already resolved for the doctor.
 #
-# ⛔ THE STAT PAYLOAD'S HEREDOC LIVES IN A FUNCTION BODY, NOT INSIDE `$( )` — BASH 3.2 CANNOT PARSE THE
-# OTHER SHAPE (measured, and the same defect this file's proof child was fixed for). macOS ships bash 3.2 as
-# /bin/bash, and that is what the launchd unit runs; `bash32-parse` parses every tracked `*.sh` with it. This
-# body happens to carry balanced quotes today, which is precisely why it would have been left alone until
-# someone edited one line of Python — so the capture below is a plain call, and the body can never be
-# reached by a substitution's quote scanner.
+# ⛔ THE STAT PAYLOAD'S HEREDOC LIVES IN A FUNCTION BODY, BECAUSE THE CAPTURE BELOW PUTS IT INSIDE `$( )`.
+# ⛔ AND THE PRECISE bash-3.2 BEHAVIOUR, MEASURED WITH 3.2.57 (the version macOS ships as /bin/bash, which the
+# launchd unit runs, and what `bash32-parse` checks): a heredoc inside a command substitution PARSES while its
+# body is quote/backtick/paren balanced — this one is, so the wrapped form would pass the gate today — and an
+# unbalanced quote in that body DESYNCHRONISES the parse state for the REST OF THE FILE. The proof child's
+# `PY_PROOF` hit exactly that; the measured message and its distance are quoted ONCE, in the note above
+# `_rs_proof_child`, so this paragraph cannot drift from it. `scripts/check-bash32-parse.sh` states both
+# halves in its own header. So the body stays
+# out of the substitution: adding one apostrophe to the Python below must not be able to break the file
+# elsewhere, and the capture then only ever sees a plain call.
 _rs_stat_kind_child() { PYTHONUTF8=1 "$1" - "$2" <<'PY_STAT' 2>/dev/null
 import os, sys
 try:
@@ -552,7 +556,8 @@ repo_set_parse() {
     # ⛔ THE ERRNO DECIDES WHEN IT CAN (review round 11, P2). `-e` false is false for EVERY stat failure,
     # and absence is only one of them — EXAMPLES, not an enumeration, so the list cannot go stale the way
     # the kind list beside it did: ENOENT, EACCES/EPERM (a TCC denial under a MODE-traversable ancestor),
-    # ENOTDIR (a component is a FILE — the `notdir` arm below), ENAMETOOLONG, EIO. Only ENOENT is absence.
+    # ENOTDIR (a component is a FILE — the walk below is the one authority for that cause, since round 45
+    # deleted the `case` arm that used to own it), ENAMETOOLONG, EIO. Only ENOENT is absence.
     # When `unknown` comes back, the ancestor walk below decides and the narrower claim in its message
     # ("we cannot see it") is the honest one.
     case "$kind" in
@@ -837,14 +842,20 @@ _rs_doctor_py() {
 #   tags   (set_tag_collisions) repo-tag collisions across the whole set
 #   norm   (_normalize_slug)    one slug normalised
 #   origin (_origin_slug)       the slug a checkout's origin PROVES (the `else` arm)
-# ⛔ THE PROOF CHILD'S HEREDOC LIVES IN A FUNCTION BODY, NOT INSIDE `$( )` — BASH 3.2 CANNOT PARSE
-# THE OTHER SHAPE (measured). macOS ships bash 3.2 as /bin/bash, and the `bash32-parse` gate parses every
-# tracked `*.sh` with it. bash 3.2's `$( )` scanner does not understand here-documents: inside the
-# substitution it enters single-quote mode at the first apostrophe in the heredoc BODY (`wrapper's`,
-# `caller's`, ...) and never leaves, so the file fails to parse at EOF — "unexpected EOF while looking
-# for matching `\"'", thousands of lines from the cause, and only on the platform the fleet runs.
-# Wrapping this heredoc in `out="$( … )"` is what introduced that; the remediation the gate itself
-# names (#2248, #2930) is this one: keep the heredoc in a function body, make the capture a plain call.
+# ⛔ THE PROOF CHILD'S HEREDOC LIVES IN A FUNCTION BODY, NOT INSIDE `$( )` — AND THIS BODY IS WHY. bash 3.2's
+# `$( )` scanner does not follow here-document quoting: an unbalanced quote, backtick or parenthesis in the
+# body desynchronises the parse state for the REST OF THE FILE, so this body — full of apostrophes
+# (`wrapper's`, `caller's`, ...) — failed to parse at EOF. ⛔ THE MESSAGE IS QUOTED VERBATIM HERE AND NOWHERE
+# ELSE, because a near-miss is ungreppable (an earlier version rendered it with a double quote where bash
+# prints a backtick). bash 3.2.57 prints, on `4d5d395e`'s file:
+#
+#     unexpected EOF while looking for matching `"'
+#
+# 575 lines below the cause — opener at line 800, error at 1375 — and only on the platform the fleet runs
+# (macOS `/bin/bash`; `bash32-parse` is the gate). ⛔ AND THE SHAPE IS THE FIX, NOT A QUOTE AUDIT:
+# a body that happens to be quote/backtick/paren BALANCED does parse on 3.2 and is still wrong at RUNTIME, so
+# the gate's header names both halves. Keep the heredoc in a function body and make the capture a plain call
+# (the remediation the gate itself names, #2248, #2930).
 _rs_proof_child() {
   PYTHONUTF8=1 "$1" - "$2" "$3" "$4" <<'PY_PROOF' 2>/dev/null
 import importlib.util, sys
