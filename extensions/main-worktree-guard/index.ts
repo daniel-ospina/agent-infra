@@ -4430,10 +4430,18 @@ const _frameworkRoot: string | null = (() => {
  *  recorded deployment decision (#427, macOS TCC: "replacing farm symlink with
  *  real copy"; the repo copy is CI-tested while production mints execute the
  *  `~/.pi` copy) and the arm #1603/#1598 fixed the review RECORDER onto. Arm 2
- *  exists because that farm ships only a PARTIAL scripts surface: `admin-merge.sh`
- *  is not in it (#2176), so on a copy-deployed box the rail's only real home is
- *  `$AGENT_INFRA_PATH/scripts/` — a DIFFERENT root from the module's — and arm 1
- *  could never match it. Caught live 2026-10-22: the mandated rail was refused
+ *  exists because the rail is exec'd from a tree that is NOT the module's own:
+ *  a hub-rooted session runs `$AGENT_INFRA_PATH/scripts/admin-merge.sh`, and arm
+ *  1 resolves only the module's own root, so it can never reach that file.
+ *  ⛔ Corrected: this paragraph used to justify arm 2 by saying the farmed
+ *  `~/.pi/agent` copy ships a PARTIAL scripts surface that does not contain
+ *  `admin-merge.sh` (#2176). That is false as of #3531 — the rail joined
+ *  `merge_gate_srcs` and is farmed flat to `$DEST/scripts/admin-merge.sh`, and on
+ *  a copy-deployed box `_frameworkRoot` IS `~/.pi/agent`, so the FARMED copy is
+ *  arm-1 eligible now. The #2176 case is therefore the CHECKOUT, not the farm —
+ *  which is still exactly why arm 2 must exist, so do not delete it as
+ *  unjustified: without it the mandated rail is refused from every hub-rooted
+ *  session again. Caught live 2026-10-22: the mandated rail was refused
  *  from a hub-rooted session, i.e. the chokepoint that computes the failing set
  *  before an `--admin` merge was unrunnable, and the only routes left were the
  *  hatch or a bare `gh pr merge` that skips every comparison the rail makes
