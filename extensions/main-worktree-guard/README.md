@@ -1680,15 +1680,38 @@ detection gap and not a discipline gap.
 
 **The discriminator:** the only difference between "the hub is clean" and "the
 hub was erased" is a **baseline** — the dirty-path set THIS session observed. A
-path this session saw in `git status` and that is now absent did not commit
-itself out of existence; it was swept or reverted. So the per-session baseline
-(`baselines`, recorded at `session_start` for main-checkout sessions) is joined
-by the observed dirty-path set, and every `tool_call` diffs against it.
+path this session saw in `git status` and that is no longer there was swept or
+reverted. So the per-session baseline (`baselines`, recorded at `session_start`
+for main-checkout sessions) is joined by the observed dirty-path set, and every
+`tool_call` diffs against it.
 
-The banner names the vanished paths, the **reflog** entries that record *what*
-moved the tree (the incident's own evidence was `reset: moving to HEAD`), the
-salvage/backup routes, and #718's second finding: **a salvage is a MIXTURE of
-every session's tree**, so a restore must be scoped to the paths you authored,
+**Set membership is not absence.** `git status` establishes only that a path left
+the **uncommitted** set; `git add -A` and `git commit` move work into the
+index/HEAD and delete nothing (`?? docs/` even becomes `A  docs/plans/plan.md` —
+a collapsed untracked directory is re-listed per-file, so its own entry vanishes
+while the directory is untouched). The banner therefore names **two
+populations** with different advice, because its payload is a recovery
+instruction:
+
+- **truly absent** (nothing of it survives) — the sweep headline, and the
+  salvage-restore route with its contamination warning;
+- **still on disk** — reported as "no longer UNCOMMITTED — still ON DISK:
+  staged/committed elsewhere, or the edit was REVERTED — check `git status` /
+  `git log -1 --stat` BEFORE restoring". It is reported rather than dropped
+  because a `checkout -f` + `reset --hard` reverts a tracked edit and leaves the
+  file present, which is the incident's own shape (four tracked `SKILL.md`
+  edits); going silent there would hide the loss the arm exists for. A pure
+  collapse (`?? dir/` → `A  dir/f`) is a representation change, not a change of
+  state, and is not reported at all.
+
+The banner names the paths in each population, the **reflog** entries that
+record *what* moved the tree (the incident's own evidence was `reset: moving to
+HEAD`), the salvage routes **this repo actually writes**
+(`refs/wip/*` on origin, `refs/wip-local` — `scripts/bg-rescue-wip.sh:12-20`,
+`:396`; the pre-review banner pointed at `~/hub-backups`, which no tool in this
+repo creates and which `2>/dev/null` turned into a silent "no backups"), and
+#718's second finding: **a salvage is a MIXTURE of every session's tree**, so a
+restore must be scoped to the paths you authored,
 and must read the diff **contents** — `git diff --stat` line counts are not a
 contamination check (a reconciliation by line count looked plausible and passed
 while it re-imported another session's half-written edit). The banner also
@@ -1702,7 +1725,12 @@ signature (the git index, the HEAD reflog, the hub root: the surfaces every
 `checkout`/`reset`/`commit` writes, plus any path entering or leaving the tree)
 gates the `git status`, with a 1.5s burst ceiling so a subtler change (a file
 removed from inside an untracked directory) is still caught at the next tool
-call. Skips under the env hatch, matching the sibling #350 hygiene check.
+call. The `git status` carries `GIT_OPTIONAL_LOCKS=0` — the repo's own
+convention for a read-only git call in a **shared** tree
+(`scripts/bg-rescue-wip.sh:33-34`, `:243`): a plain `git status` rewrites the
+real index and takes `.git/index.lock`, which would fail a live sibling lane's
+next git command at exactly the frequency this arm samples. Skips under the env
+hatch, matching the sibling #350 hygiene check.
 
 **Declared residuals.** (a) Collapsed porcelain is used deliberately — an
 untracked DIRECTORY arrives as one `?? dir/` entry, exactly the artifact shape
@@ -1710,7 +1738,14 @@ the incident lost — so a file removed from inside an untracked directory that
 still has other entries is not reported as such (the 1.5s ceiling still re-reads
 and would report the directory if it emptied). (b) A path swept and re-created
 with identical content between two observations is invisible. (c) This is
-detection, not recovery: nothing here restores the work.
+detection, not recovery: nothing here restores the work. (d) A `git add -A` or
+`git commit` performed by a concurrent process on paths that were NOT collapsed
+reports them in the still-on-disk population: accurate (they are on disk and the
+banner says so) but possibly benign. It is not suppressed, because from git
+state alone a commit and a reverted edit are indistinguishable and only the
+second is a loss. (e) The dedupe set re-arms when a path is observed dirty
+again, so a path lost twice is reported twice — one banner per LOSS, not one per
+path per session.
 
 **Warn-only, always.** The arm has already happened by the time it can fire, and
 refusing the victim's next command would punish it for someone else's write.
@@ -2376,7 +2411,7 @@ marker fixes **guard-blocked** sessions only.
 
 | Suite | Command | Covers |
 |---|---|---|
-| `test.mjs` | `node extensions/main-worktree-guard/test.mjs` | `classify-git.mjs` + `branch-ownership.mjs` decision surfaces (pure functions). **3 KNOWN PRE-EXISTING REDS at this base** (identical at `origin/main`: `git worktree` detached at `d5c6dc753` gives 1904/3) — named so the next lane does not re-discover them: `bd runtime with set (unchecked-out) → recovery: block`, `bd runtime branch -D unchecked-out → recovery: block` (#1150 cwd-sensitive cases) and `X2: partial craft (two-way passes, porcelain disagrees) → rejected by cross-check` (#2964). None touches `maskRemoteExecPayloads` |
+| `test.mjs` | `node extensions/main-worktree-guard/test.mjs` | `classify-git.mjs` + `branch-ownership.mjs` decision surfaces (pure functions). **5 KNOWN PRE-EXISTING REDS at `871e455fe`** (re-measured 2026-11-10; the count is HEAD-BOUND — it was 3 at `d5c6dc753`, where the earlier note stopped, and the whole tree minus this PR's two edited files gives the identical 1902/5, so none is this PR's) — named so the next lane does not re-discover them: `bd runtime with set (unchecked-out) → recovery: block`, `bd runtime branch -D unchecked-out → recovery: block` (#1150 cwd-sensitive cases), and three `#1139` M5 sanctioned-exempt pins (one helper, the audit line, and the T6 fail-closed anchor) that `34d190c7f` (#2332) left stale. `X2: partial craft …` (#2964), previously listed here, is GREEN now. None touches `maskRemoteExecPayloads` |
 | `test-command-position.mjs` | `node extensions/main-worktree-guard/test-command-position.mjs` | **command POSITION for the `git` token (#1158)** — the highest-leverage false positive in the stack: an OPERAND `git` (`command -v git >/dev/null 2>&1 || exit 1`) started a phantom invocation whose "verb" was the next shell operator, so the canonical defensive idiom refused the whole script (`check-deployed-drift.sh`, `harness-refresh.sh`). Part A pins the predicate (operand shapes ALLOW; command-position, newline/`then`/pipe/`!`/subshell/case separators, path-qualified invocations, process substitution, and **every wrapper word in `SPAWNER_WORDS` — one fixture each** — still REFUSE); Part B the script-content verdict; Part C the REAL `tool_call` handler against a hermetic MAIN checkout (the idiom ALLOWED, the idiom beside a real destructive invocation STILL BLOCKED, `git status --porcelain` ALLOWED); Part D **measured pins of five KNOWN-FALSE shapes deliberately left unfixed** (`bash -n` noexec, a leading `~`, `<<<` whole-file co-occurrence, `join(" ")` prose rejoin, quoted `\|` alternation) each with a control, so the next lane inherits a map rather than a surprise |
 | `test-hub-sweep.mjs` | `node extensions/main-worktree-guard/test-hub-sweep.mjs` | **hub working-tree SWEEP detection (#718)** — the incident end to end, BEHAVIORAL: the REAL `index.ts` handler is driven against a hermetic hub and the sweep is performed OUT-OF-PROCESS (`git checkout -f` + `git reset --hard` + `rm`, exactly what a concurrent session does), then the suite pins that the banner fires, names the vanished TRACKED path and the vanished untracked DIRECTORIES, cites the issue, names the salvage/backup routes and the reflog, carries the "a salvage is a MIXTURE" contamination warning, keeps every row inside its box, and never refuses the victim's next command. Plus the negative controls that keep it from becoming noise: a worktree-rooted session is silent, the env hatch is silent, a hub that was never dirty is silent, a path APPEARING is not a loss, and one path is reported once (dedupe) |
 | `test-module-load.mjs` | `node extensions/main-worktree-guard/test-module-load.mjs` | **the `index.ts` LOAD path** — the wiring `test.mjs` cannot see |
