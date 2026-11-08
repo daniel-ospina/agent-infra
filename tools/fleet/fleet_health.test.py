@@ -420,6 +420,17 @@ def leg_harness_apply(mod):
     """
     import time as _time
     d = tempfile.mkdtemp(prefix="ha-record-")
+    # ⛔ A SECOND DIRECTORY, AND IT IS WHAT MAKES THE "no schedule" ARM HERMETIC (#3527). Popping
+    # `HARNESS_APPLY_STATE_DIR` does not isolate that arm — it RE-TARGETS it at the reader's DEFAULT,
+    # `~/.pi/agent/state/harness-apply.status`, and `harness_apply_record()` takes its no-record path
+    # only when THAT file is absent. On a box that actually runs the harness (a cell, a hub, the
+    # fleet's own runners) the file exists, so the arm read the HOST's record —
+    # "record is STALE: last pass 50174s ago (bound 3600s)" — and failed. Measured here: `123 passed,
+    # 1 failed`, the one failure being this arm; `origin/main`'s module behaves identically, so it is
+    # base-owned, and by the time it reached the self-hosted cell runners it made `verify`
+    # PERMANENTLY red for every PR: red-on-red, where a real regression in any arm behind it is
+    # indistinguishable from the known one.
+    empty = tempfile.mkdtemp(prefix="ha-empty-")
     keys = ("HARNESS_APPLY_STATE_DIR", "HARNESS_APPLY_STALE_SECONDS", "HARNESS_APPLY_SCHEDULE_ASSERT")
     saved = {k: os.environ.get(k) for k in keys}
     os.environ["HARNESS_APPLY_STATE_DIR"] = d
@@ -446,11 +457,19 @@ def leg_harness_apply(mod):
     try:
         if os.path.exists(path):
             os.remove(path)
-        # The "no schedule" arm must ALSO clear the state-dir seam: that variable is itself a
-        # schedule probe in the reader (`STATE_DIR` set ⇒ a scheduled box), so leaving it set would
-        # make this arm test the wrong branch and pass for the wrong reason.
-        os.environ.pop("HARNESS_APPLY_STATE_DIR", None)
+        # The "no schedule" arm must ALSO stay clear of the state-dir seam: that variable is itself a
+        # schedule probe in the reader (`STATE_DIR` set ⇒ a scheduled box), so leaving it alone would
+        # make this arm test the wrong branch and pass for the wrong reason. Pointing it at a directory
+        # that provably holds no record is safe — and the seam is honoured only because
+        # `_harness_apply_is_scheduled()` reads `HARNESS_APPLY_SCHEDULE_ASSERT` FIRST and returns on
+        # it, before any path probe, so the override (set below) already decides the branch.
+        os.environ["HARNESS_APPLY_STATE_DIR"] = empty
         os.environ["HARNESS_APPLY_SCHEDULE_ASSERT"] = "0"
+        # Pin the hermeticity itself, not just its outcome: the regression this exists for is the arm
+        # reading the HOST's record, and an outcome-only assertion silently passes on a fresh runner
+        # (which has no such file) while failing on every box we work on.
+        check(mod._harness_apply_status_path().startswith(empty),
+              "HARNESS: the no-record arm reads a directory that provably holds no record (#3527)")
         detail, alarm = mod.harness_apply_record()
         check(not alarm and "no harness-apply schedule" in detail,
               "HARNESS: no record and no schedule is NOT an alarm (a box without this job)")
@@ -527,6 +546,7 @@ def leg_harness_apply(mod):
             else:
                 os.environ[k] = v
         shutil.rmtree(d, ignore_errors=True)
+        shutil.rmtree(empty, ignore_errors=True)
 
 
 def leg_lane_census(mod):
