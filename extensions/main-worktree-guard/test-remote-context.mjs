@@ -1302,9 +1302,9 @@ if (typeof stripTypeScriptTypes !== "function" ||
       }
 
       // Execution FLOOR for the invariance leg: a DECLARED flag is satisfied by a neutralised
-      // consumer. Measured: `if (mut.optOutInvariant) {` → `if (false) {` (`:1328`) gives 344
-      // passed / 0 failed, exit 0 — every row above still passes, the leg is simply gone. The
-      // count below is the difference between "the flag exists" and "the assertion ran".
+      // consumer. Measured: turning the `if (mut.optOutInvariant) {` gate below into `if (false) {`
+      // gives 344 passed / 0 failed, exit 0 — every row above still passes, the leg is simply gone.
+      // The count below is the difference between "the flag exists" and "the assertion ran".
       let optOutLegRan = 0;
 
       for (const mut of MUTANTS) {
