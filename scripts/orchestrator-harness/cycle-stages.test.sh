@@ -749,8 +749,9 @@ _nap_unfenced="$(awk '
   /^[[:space:]]*# <<< END NOT-A-CYCLE-NAP/   {f=0; next}
   !f' <<<"$_loop_nap_region")"
 # The fences are COMMENT lines, so the split above needs the comment-preserving view (`_loop_tc`, not
-# `_loop_nc` — the same trap §9.1d-v records). The COUNTS then run on the CODE-ONLY view (`_nap_code`
-# below), so a word in a comment can neither become a nap nor hide one.
+# `_loop_nc` — the same trap §9.1d-v records). The COUNTS then run on CODE-ONLY views (`_nap_code` for
+# the fenced body, `_loop_code` for the population), so a word in a comment can neither become a nap
+# nor hide one.
 printf '%s\n' "$_nap_unfenced" > "$TMP/nap-region.txt"
 printf '%s\n' "$_nap_fence" > "$TMP/nap-fenced.txt"
 _nap_region="$(_strip_tc "$TMP/nap-region.txt")"
@@ -774,7 +775,20 @@ printf 'f() {\n%s\n}\n' "$_nap_excl_body" | bash -n 2>/dev/null || _nap_closers=
 _region_ok=1
 [ -n "$_loop_nap_region" ] || _region_ok=0
 _nap_n="$(grep -cE '^[[:space:]]*stg_nap_mark([[:space:]]|$)' <<<"$_nap_region")"
-_loop_n="$(grep -cE '^[[:space:]]*(fork_free_sleep|sleep) ' <<<"$_nap_region")"
+# ⛔ THE POPULATION COUNTER IS TOKEN-ANYWHERE TOO (fresh-context review, P1 — measured). `_loop_n`
+# stayed anchored at the START of the line, so the one view that decides whether a nap is IN the
+# population still missed a nap hidden behind a prefix token. Measured on this tree: inserting the
+# single line `: ; sleep 300` inside `while true; do` (a real 300 s nap on the CYCLE path, no
+# `stg_nap_mark`) left the suite at `RESULT: 128 passed, 0 failed`. The two fence counters above were
+# fixed and this one — grading the same class, in the same arm — was not, so "every pattern errs wide
+# on purpose" was false until this line changed.
+# ⛔ AND A NAIVE SWAP BREAKS A CORRECT TREE: the fork-starved nap in `orch-loop.sh` is ONE logical nap
+# over TWO physical lines (`fork_free_sleep $(( … )) \` / `|| sleep $(( … )) 2>/dev/null`), so
+# token-anywhere counts 5 for 4 naps and `_nap_n(3) >= 5-1` reds on correct code. Continuation lines
+# are therefore dropped BEFORE counting, which keys the count on the LOGICAL nap rather than on a
+# spelling — and a continuation line cannot host a nap of its own without a `||`/`&&` its parent lacks.
+_loop_code="$(grep -vE '^[[:space:]]*#' <<<"$_nap_region" | sed -E 's/"[^"]*"//g')"
+_loop_n="$(grep -vE '^[[:space:]]*(\|\||&&)' <<<"$_loop_code" | grep -cE '(^|[^[:alnum:]_])(fork_free_sleep|sleep)([^[:alnum:]_]|$)')"
 ck "every nap path calls stg_nap_mark (${_nap_n} nap_mark sites for ${_loop_n} sleep/fork_free_sleep lines inside the controller loop — a path without one loses prev_wait; loop region ${_region_ok})" \
    "$(if [ "$_region_ok" -eq 1 ] && [ "${_nap_n:-0}" -ge 3 ] && [ "${_nap_n:-0}" -ge "$(( ${_loop_n:-0} - 1 ))" ]; then echo 0; else echo 1; fi)"
 
