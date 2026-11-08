@@ -2760,12 +2760,19 @@ export function readMarkerAge(lastMarkerAt: number, now: number): MarkerAgeReadi
  * re-check after the await guards the SAME window for the promise's state and
  * simply never asked whether the EVIDENCE had moved.
  *
- * This can only ever DELAY a kill, never cause one, and it cannot delay it
- * indefinitely: a genuinely wedged child emits no marker and no bytes, so both
- * channels stay behind the snapshot and the next 10 s tick kills on unchanged
- * evidence. A child that keeps ticking is alive by definition (the tick timer
- * is the child's own event loop), and it stays bounded by `silence`, `cut`,
- * `tool-stall` and the hard cap.
+ * This can only ever DELAY a kill, never cause one. It also cannot delay it
+ * forever, but the honest bound is NOT "one tick": the suppression repeats for
+ * exactly as long as the child keeps producing evidence newer than each tick's
+ * OWN snapshot, and the byte channel never goes quiet on its own — a grandchild
+ * (MCP server) inherits the child's fd 2, so `onLifeSign` fires on ITS stderr
+ * too (a pre-existing property of that channel, `ingestHeartbeatChunk`, not of
+ * this guard). A suppressed clause is therefore bounded by the clause's own
+ * bound and, as the last resort, `TASK_HARD_CAP_MS` — not by the guard. What
+ * cannot happen is a kill executed on a verdict the child has already refuted.
+ *
+ * This predicate is the MARKER + BYTE half only. A clause whose own clock is
+ * neither of those must be asked about ITS clock — see `supersedingEvidence`,
+ * which is what the kill path actually calls.
  */
 export function decisionSnapshotStale(
   snapshotAt: number,
@@ -2773,6 +2780,57 @@ export function decisionSnapshotStale(
   lastLifeSignAt: number,
 ): boolean {
   return lastMarkerAt > snapshotAt || lastLifeSignAt > snapshotAt;
+}
+
+/** The evidence channel that superseded a kill verdict, named so the operator
+ * log can print the one delta that is real (#1339 review). */
+export type SupersedingChannel = "marker" | "bytes" | "progress";
+
+/**
+ * #1339 (review) — WHICH clock displaced this verdict, if any.
+ *
+ * The guard must ask about the SAME clock the fired clause reads, or it
+ * suppresses verdicts its own evidence cannot disprove. `no-progress` is the
+ * clause where that matters: its binding rule is that the clock is
+ * `lastProgressAt`, which advances ONLY on a completed unit of work — "ticks
+ * and turn boundaries do NOT advance it, so a child that keeps emitting them
+ * while completing nothing cannot reset this bound — the property no other
+ * clause has" (`heartbeatKillDecision`, the `no-progress` clause). A tick
+ * marker or a stray stderr byte landing inside the awaited probe window sets
+ * `lastMarkerAt`/`lastLifeSignAt` and leaves `lastProgressAt` untouched, so
+ * asking the marker/byte question would restore exactly the reset that clause
+ * exists to deny — the content-free loop / drip stream would survive to the
+ * hard cap. It is asked about progress instead, which is still the fail-safe
+ * direction: real work completing inside the window DOES disprove the verdict,
+ * and suppresses it.
+ *
+ * Returns `null` for "the verdict still stands". `max-dispatch` is exempt at
+ * the call site (a wall-clock policy cap is not an inference about progress, so
+ * no new evidence makes the dispatch younger) and is not handled here.
+ */
+export function supersedingEvidence(
+  reason: HeartbeatKillReason | undefined,
+  snapshotAt: number,
+  channels: {
+    lastMarkerAt: number;
+    lastLifeSignAt: number;
+    lastProgressAt: number;
+    startedAt: number;
+  },
+): SupersedingChannel | null {
+  if (reason === "no-progress") {
+    // Same anchor the clause itself uses (`lastProgressAt > 0 ? … : startedAt`),
+    // so "advanced" means the very quantity the clause measured has moved.
+    const anchor = channels.lastProgressAt > 0 ? channels.lastProgressAt : channels.startedAt;
+    return anchor > snapshotAt ? "progress" : null;
+  }
+  if (!decisionSnapshotStale(snapshotAt, channels.lastMarkerAt, channels.lastLifeSignAt)) {
+    return null;
+  }
+  // Name the channel that actually fired, so a log line can never print a
+  // negative delta for a channel that did not move (#1339 review: the first
+  // version printed `marker +-45123ms` when only bytes had arrived).
+  return channels.lastMarkerAt > snapshotAt ? "marker" : "bytes";
 }
 
 export interface HeartbeatDecisionInput {
@@ -4486,11 +4544,17 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
     // condition is per-dispatch, not per-tick — an unlatched warn would spam
     // every 10s decision tick).
     let cutInertWarned = false;
-    // #1339: one-shot latch for the stale-decision suppression below. The
+    // #1339: rate-limited log for the stale-decision suppression below. The
     // condition can recur every tick while a child ticks slowly under a load
     // storm (each tick's probe is awaited, and each tick the marker lands inside
-    // it), so an unlatched log would spam the parent's stderr on every tick.
-    let staleDecisionSuppressLogged = false;
+    // it), so an unlatched log would spam the parent's stderr on every tick —
+    // but a permanent one-shot hides exactly the recurrence the parent must see
+    // (#1339 review). One line per minute of continuous suppression, carrying
+    // the running count, is the bounded middle: the sibling `networkSuppressLogged`
+    // re-arms on transition for the same reason.
+    const STALE_SUPPRESS_RELOG_MS = 60_000;
+    let staleSuppressCount = 0;
+    let staleSuppressLoggedAt = 0;
     // #318: network-aware kill suppression — before honoring a stall-kill,
     // probe connectivity to the sub-agent's provider. When the network is
     // unreachable and the child is alive (fresh heartbeat markers), the
@@ -4659,21 +4723,40 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
       //
       // `max-dispatch` is exempt: it is a declared WALL-CLOCK policy cap, not an
       // inference about progress, so a fresh byte does not make the dispatch
-      // younger. Every other reason is a liveness inference and is superseded by
-      // a newer life sign. Fail-safe by construction: a genuinely wedged child
-      // emits nothing, so neither channel moves and the next tick kills on the
-      // same evidence (one 10 s interval of extra grace at most).
-      if (
-        decision.reason !== "max-dispatch" &&
-        decisionSnapshotStale(now, hbCtx.state.lastMarkerAt, lastHeartbeat)
-      ) {
-        if (!staleDecisionSuppressLogged) {
-          staleDecisionSuppressLogged = true;
-          // Stated as "how much newer", never as an age: a negative age is what
-          // made this bug unreadable in the first place (#1339).
+      // younger. Every other reason is a liveness inference, and each is
+      // re-validated against the clock THAT CLAUSE READS (`supersedingEvidence`:
+      // `no-progress` is measured on `lastProgressAt`, which ticks and bytes do
+      // NOT advance, so a marker inside the window cannot refute it).
+      //
+      // Fail-safe by construction: a genuinely wedged child emits nothing, so
+      // neither channel moves and the next tick kills on the same evidence. A
+      // child that keeps producing evidence IS the refutation — that is the whole
+      // point — and it stays bounded by its own clause and the hard cap.
+      const supersededBy =
+        decision.reason === "max-dispatch"
+          ? null
+          : supersedingEvidence(decision.reason, now, {
+              lastMarkerAt: hbCtx.state.lastMarkerAt,
+              lastLifeSignAt: lastHeartbeat,
+              lastProgressAt: hbCtx.state.lastProgressAt,
+              startedAt,
+            });
+      if (supersededBy) {
+        staleSuppressCount += 1;
+        if (staleSuppressLoggedAt === 0 || now - staleSuppressLoggedAt >= STALE_SUPPRESS_RELOG_MS) {
+          staleSuppressLoggedAt = now;
+          // Stated as "how much newer on the channel that actually fired", never
+          // as an age and never for a channel that did not move: a negative age
+          // is what made this bug unreadable in the first place (#1339).
+          const evidenceDelta =
+            supersededBy === "marker"
+              ? hbCtx.state.lastMarkerAt - now
+              : supersededBy === "bytes"
+                ? lastHeartbeat - now
+                : (hbCtx.state.lastProgressAt > 0 ? hbCtx.state.lastProgressAt : startedAt) - now;
           console.error(
             `[task] ${decision.reason ?? "stall"} kill suppressed — the child produced evidence AFTER the decision snapshot ` +
-              `(marker +${hbCtx.state.lastMarkerAt - now}ms, bytes +${lastHeartbeat - now}ms relative to the snapshot); re-deciding on the next tick (#1339)`,
+              `(${supersededBy} +${evidenceDelta}ms relative to the snapshot; ${staleSuppressCount} suppression(s) this dispatch); re-deciding on the next tick (#1339)`,
           );
         }
         return;

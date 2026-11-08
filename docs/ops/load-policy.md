@@ -210,13 +210,24 @@ unconditionally.
   is awaited between the decision and `killTreeAndEscalate()` (default ON,
   timeout up to 9 s), and every `await` yields the event loop, which is exactly
   where the child's `data` handlers run. So the kill path re-validates before
-  killing — if a marker OR a real output byte landed AFTER the snapshot, the
-  verdict is superseded and the kill is suppressed for one tick (logged once per
-  dispatch as `[task] <reason> kill suppressed — the child produced evidence
-  AFTER the decision snapshot`). `max-dispatch` is exempt (a wall-clock policy
-  cap, not an inference about progress). This can only DELAY a kill: a genuinely
-  wedged child emits nothing, both channels stay behind the snapshot, and the
-  next 10 s tick kills on unchanged evidence. Measured at this fix's head: a cut
+  killing — if the clock the fired clause READS moved after the snapshot, the
+  verdict is superseded and the kill is suppressed. Each clause is asked about
+  its OWN clock (`supersedingEvidence`): `no-progress` is measured on
+  `lastProgressAt`, which ticks and output bytes do NOT advance, so a marker
+  inside the window cannot refute it — asking the marker/byte question there
+  would restore the reset that clause exists to deny. Every other reason is
+  refuted by a marker or a real output byte. `max-dispatch` is exempt (a
+  wall-clock policy cap, not an inference about progress).
+  **The honest bound is not "one tick".** Suppression repeats for as long as
+  the child keeps producing evidence newer than each tick's own snapshot, which
+  for a marker/byte clause means "it is working" (the point of the fix), and is
+  bounded by that clause's own bound and, as the last resort,
+  `TASK_HARD_CAP_MS`. Note the byte channel is unauthenticated — a grandchild
+  MCP server inherits the child's fd 2, so its stderr also counts as a life sign
+  (`ingestHeartbeatChunk` → `onLifeSign`) — a pre-existing property of that
+  channel, not of this guard. The suppression is logged on the first occurrence
+  and then at most once a minute, carrying a running count, so a long
+  suppression is visible instead of silent. Measured at this fix's head: a cut
   reported `no life signs for -1s (marker gap exceeded 113s)` with
   `lastMarkerAgeMs=-532` under `load1=190.62` — the child was ticking while the
   kill ran.
