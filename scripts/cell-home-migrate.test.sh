@@ -53,9 +53,12 @@ mk_box() { # <dir> — returns the paths in NEW/DUR/LEG/UNITS
   printf 'github.com:\n  oauth_token: %s\n' "$SENTINEL" >"$DUR/.config/gh/hosts.yml"
   chmod 600 "$DUR/.config/gh/hosts.yml"
   # The drifting unit — the measured cell-4 shape, minus the directives that would make it unrunnable.
+  # ⛔ THE COMMENT CARRIES A LEGACY PATH FOLLOWED BY A `/` ON PURPOSE: that is the only shape a naive
+  # rewriter would touch, so the comment arm can VARY. With the path followed by a space the occurrence is
+  # never re-based and the arm passes whether or not the writer grades comments (review F3, `d4`).
   cat >"$UNITS/app.service" <<EOF
 [Service]
-# a COMMENT naming $LEG must not be graded (unit files carry paragraphs of measured history)
+# a COMMENT naming $LEG/state must not be graded (unit files carry paragraphs of measured history)
 User=cmux
 Environment=HOME=$LEG
 Environment=CELL_HOME=$LEG
@@ -146,6 +149,26 @@ _out="$(run_tool "$TOOL" --apply)"
 case "$_out" in *"LEGACY copy is NEWER"*) ok "b4 a legacy copy NEWER than the durable one is named as a CONFLICT" ;; *) bad "b4 the newer-legacy conflict is not reported" ;; esac
 [ "$_dur_before" = "$(cat "$DUR/keys.env")" ] && ok "b5 …and the durable copy is left EXACTLY as it was (no rollback)" || bad "b5 the durable copy was overwritten"
 
+# ⛔ THE TWO MODES MUST NOT DISAGREE ABOUT THE SAME BOX (fresh-context review F1). `--check` printed the
+# divergence warning and did NOT set rc, while `--apply` set it — so `--check` answered
+# "one home — nothing to do" over a box whose LEGACY credential was NEWER than the durable one. That is
+# the dangerous direction: `--check` -> 0 is the stated precondition for RECLAIMING the legacy home, so
+# the quiet half told an operator to delete the only copy of a rotated key. The fixture is deliberately
+# CONVERGED everywhere else (units migrated, every other credential present on both sides) so the red can
+# only come from the conflict leg itself — the hazard is per-file, and it must survive converged peers.
+mk_box "$T/newer"
+run_tool "$TOOL" --apply >/dev/null 2>&1     # converge units + copy the legacy-only auth.json
+run_tool "$TOOL" --check >/dev/null 2>&1 && ok "b6 the converged fixture first reads 0 (the polarity partner for b7/b8)" \
+  || bad "b6 fixture: the converged box does not read 0, so b7/b8 could not isolate the conflict"
+sleep 1; touch "$LEG/keys.env"               # ONLY keys.env diverges, and the LEGACY side is the newer one
+_out="$(run_tool "$TOOL" --check)"; _rc=$?
+case "$_out" in *"LEGACY copy is NEWER"*) ok "b7 --check NAMES the newer-legacy conflict" ;; *) bad "b7 --check does not report the newer-legacy conflict" ;; esac
+[ "$_rc" = 1 ] && ok "b8 …and --check exits 1 on it, so the reclaim precondition cannot read as met" \
+  || bad "b8 --check answered $_rc over a box whose legacy credential is NEWER than the durable one"
+run_tool "$TOOL" --apply >/dev/null 2>&1; _rc2=$?
+[ "$_rc2" = 1 ] && ok "b9 …and --apply agrees with --check on the same box (one predicate, two modes)" \
+  || bad "b9 --apply answered $_rc2 where --check answers 1 — the two modes disagree"
+
 printf '\n── (d) UNITS: repoint what runs, refuse what would not ─────────────────────────────\n'
 
 mk_box "$T/d"
@@ -161,6 +184,19 @@ _graded_body="$(grep -v '^[[:space:]]*#' "$UNITS/app.service" || true)"
 case "$_graded_body" in *"$LEG"*) bad "d3 the legacy path survived in a graded directive" ;; *) ok "d3 no graded directive still names the legacy home (comments excluded by design)" ;; esac
 grep -q "a COMMENT naming" "$UNITS/app.service" && ok "d4 …while the COMMENT naming the legacy home is untouched (a comment is not a directive)" \
   || bad "d4 the comment was altered (comments must not be graded)"
+# ⛔ THE COMMENT'S BYTES, AND A SHAPE THAT CAN VARY (review F3). The arm above asserted that a comment
+# containing the legacy path still existed — but the fixture's comment had the path followed by a SPACE,
+# which the boundary rule never re-bases, so the arm passed whether or not the writer graded comments: it
+# was dead weight. `_project_file` passed EVERY line through the projector while the scanner skipped `#`,
+# so an operator's measured history inside a root-owned unit was silently edited — and the edited comment
+# then read as a FALSE statement about the past. This arm compares the whole comment line.
+mk_box "$T/cmt"
+_cmt_before="$(grep '^# a COMMENT naming' "$UNITS/app.service")"
+run_tool "$TOOL" --apply >/dev/null 2>&1
+_cmt_after="$(grep '^# a COMMENT naming' "$UNITS/app.service")"
+[ -n "$_cmt_before" ] && [ "$_cmt_before" = "$_cmt_after" ] \
+  && ok "d4b …and the comment is BYTE-IDENTICAL after --apply (the writer does not rewrite what the scanner skips)" \
+  || bad "d4b the comment was rewritten: '$_cmt_after' (a comment is not a directive, in either direction)"
 [ -f "$UNITS/app.service.pre-cell-home" ] && ok "d5 a one-time backup is kept beside the rewritten file" || bad "d5 no backup was written"
 grep -q "Environment=HOME=$DUR" "$UNITS/app.service.d/env.conf" && ok "d6 a DROP-IN is repointed too (systemd merges both shapes)" \
   || bad "d6 the drop-in was not repointed"
@@ -231,8 +267,23 @@ case "$(cat "$UNITS/app.service")" in
   *) bad "d21 the sibling path was re-based (fabricated target: $(grep ARCHIVE "$UNITS/app.service" || true))" ;;
 esac
 
-printf '\n── (i) THE DERIVATION: the account the UNITS RUN AS, not the invoker (review F2) ────────\n'
+# ⛔ A `;` LINE IS THE OTHER COMMENT SPELLING (review F4). `systemd.syntax(7)`: "Empty lines and lines
+# beginning with `#` or `;` are ignored as comments." The scanner knew only `#`, so a unit whose measured
+# history sat behind `;` produced an UNHANDLED record — refused by name by `--apply`, and the box could
+# NEVER read `--check` -> 0 (the reclaim precondition) while its only "defect" was a comment. That is a
+# false block on a real box, and the tool's own header predicts the class for `#`.
+mk_box "$T/semi"
+run_tool "$TOOL" --apply >/dev/null 2>&1          # converge everything first
+printf '; legacy note: this used to exec %s/harness/run.sh\n' "$LEG" >>"$UNITS/app.service"
+_out="$(run_tool "$TOOL" --check)"; _rc=$?
+[ "$_rc" = 0 ] && ok "d22 a unit whose ONLY mention of the legacy home is a ';' comment reads converged (--check 0)" \
+  || bad "d22 a ';' comment was graded as a directive (--check $_rc) — such a unit can never reach one home"
+case "$_out" in
+  *UNHANDLED*) bad "d22b …and the ';' line is still reported as an un-rebasable directive" ;;
+  *) ok "d22b …and no UNHANDLED record is raised for it" ;;
+esac
 
+printf '\n── (i) THE DERIVATION: the account the UNITS RUN AS, not the invoker (review F2) ────────\n'
 # ⛔ THE DANGEROUS WRITE. `sudo` re-sets HOME to the target account's home and drops an ambient
 # CELL_HOME (`env_reset`), so the remedy this tool used to print — `sudo -n bash $0 --apply` — derived
 # /root: it created a THIRD home there with the cell's credentials in it and repointed every
@@ -410,6 +461,26 @@ EOF
     *"--state $LEG/state"*) ok "g5 WITHOUT the continuation inheritance the continuation keeps the legacy path — d18 measures it" ;;
     *) bad "g5 the mutant still converged the continuation — d18 is not measuring it" ;;
   esac
+fi
+
+# g6: NEUTRALISE THE CONFLICT PREDICATE and b4/b7/b8 must redden — i.e. those arms measure the SHARED
+# predicate (`credential_conflict`, called by both modes) rather than a fixture that could never produce a
+# conflict. This is the mutation for the F1 false PASS, where the guard simply did not exist in `--check`.
+MUT6="$T/mutdir6"; mkdir -p "$MUT6/lib"; cp "$HERE/lib/cell-home.sh" "$MUT6/lib/cell-home.sh"
+awk 'BEGIN{inb=0}
+  /^credential_conflict\(\) \{$/ { inb=1; print; next }
+  inb && /^}$/             { inb=0; print; next }
+  inb && index($0, "mtime_of") > 0 { print "  return 1"; next }
+  { print }' "$TOOL" >"$MUT6/cell-home-migrate.sh"
+if ! grep -q '^  return 1$' "$MUT6/cell-home-migrate.sh"; then
+  bad "g6 the conflict mutation could not be applied — b7/b8 are not checking the predicate"
+else
+  mk_box "$T/g6"
+  run_tool "$MUT6/cell-home-migrate.sh" --apply >/dev/null 2>&1
+  sleep 1; touch "$LEG/keys.env"
+  run_tool "$MUT6/cell-home-migrate.sh" --check >/dev/null 2>&1; _m6=$?
+  [ "$_m6" = 0 ] && ok "g6 WITHOUT the conflict predicate --check reads 0 over a NEWER legacy credential — b8 measures it" \
+    || bad "g6 the mutated tool still reported drift (rc $_m6) — b8 is not measuring the predicate"
 fi
 
 printf '\n── (h) argument handling ────────────────────────────────────────────────────────────\n'

@@ -102,10 +102,17 @@
 # candidate list this function builds pointed at a home no other cell unit agreed with — the split
 # whose symptom is "the credential IS on the box and `git push` still answers 403". Derived by
 # `scripts/lib/cell-home.sh` (`../lib/` from the harness dir: checkout, pinned worktree, flat farm).
+# ⛔ THE SELF PATH COUNTS ONLY WHEN IT NAMES THIS FILE — see `lib/cell-home.sh` §CONSUMERS. A PIPED
+# start (`bash -s`) has no `BASH_SOURCE` and its `$0` is LITERALLY `bash`, so `dirname "${BASH_SOURCE[0]:-$0}"`
+# answers `.` and the candidate becomes `<parent-of-CWD>/lib/cell-home.sh`: this gate then SOURCES code
+# out of a directory it does not own (measured here: a planted fixture sourced and ran, `cell_home_resolve`
+# came back command-not-found and `CELL_HOME` stayed empty). Guarded, a piped start has no sibling to
+# trust and takes the documented `$HOME` fallback below instead.
+_SELF="${BASH_SOURCE[0]:-}"; [ -f "$_SELF" ] || _SELF=""
+KG_SELF_DIR=""
+if [ -n "$_SELF" ]; then KG_SELF_DIR="$(cd "$(dirname "$_SELF")/.." 2>/dev/null && pwd -P)"; fi
 CELL_HOME_LIB=""
-for _cand in "$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/.." 2>/dev/null && pwd -P)/lib/cell-home.sh"; do
-  [ -r "$_cand" ] && { CELL_HOME_LIB="$_cand"; break; }
-done
+if [ -n "$KG_SELF_DIR" ] && [ -r "$KG_SELF_DIR/lib/cell-home.sh" ]; then CELL_HOME_LIB="$KG_SELF_DIR/lib/cell-home.sh"; fi
 if [ -n "$CELL_HOME_LIB" ]; then . "$CELL_HOME_LIB"; CELL_HOME="$(cell_home_resolve)"; else CELL_HOME="${CELL_HOME:-${HOME:-}}"; fi
 
 # The refusal carries its own status: 82 is unassigned elsewhere in this tree (70-83 are spawn-gate's,

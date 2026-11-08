@@ -733,8 +733,7 @@ assert_contains "$(cat "$T/t19b/out" 2>/dev/null || true)" "harness: mode=sync" 
 # THE HEADLINE OF ONE REVIEW ROUND, and it had no test: the pass used to warn on stderr and compare
 # against the stale remote-tracking ref, so a box that lost egress wrote `behind=0 action=none rc=0`,
 # went green in the unit, and raised no alarm anywhere — every signal saying "auto" while it aged.
-
-# ── T21: a FAILED fetch is cannot-verify, never "current" against a stale ref ────────────────say_case "T21 a failed fetch is cannot-verify, not current"
+say_case "T21 a failed fetch is cannot-verify, not current"
 mk_origin t21; mk_clone t21; write_sync_stub
 REPO_P="$CLONE"; MODE_P=sync
 # Move the origin away: `git fetch` cannot reach it, while `origin/main` STILL resolves locally to a

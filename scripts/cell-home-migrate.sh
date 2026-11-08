@@ -169,13 +169,28 @@ report_env_file() {
 describe() {
   local f="$1"
   [ -e "$f" ] || { printf 'MISSING'; return 0; }
-  # `stat` differs between GNU and BSD; these two formats are all this needs.
-  stat -c '%s bytes mode=%a mtime=%Y' "$f" 2>/dev/null \
-    || stat -f '%z bytes mode=%Lp mtime=%m' "$f" 2>/dev/null \
-    || printf 'present'
+  # `stat` differs between GNU and BSD; these two formats are all this needs. ⛔ THE TWO ARMS ARE ONE
+  # LOGICAL LINE ON PURPOSE: `check-portability-traps.sh` grades a GUARDED CHAIN by COMMAND UNIT, where
+  # `||` stays inside the unit and a `\`-continuation does not — so a chain split across lines reads as
+  # a bare GNU-only call and reds the portability gate. Written this way it IS the portable idiom the
+  # detector's header promises is clean, and it stays portable rather than baselined.
+  stat -c '%s bytes mode=%a mtime=%Y' "$f" 2>/dev/null || stat -f '%z bytes mode=%Lp mtime=%m' "$f" 2>/dev/null || printf 'present'
 }
 mtime_of() { stat -c '%Y' "$1" 2>/dev/null || stat -f '%m' "$1" 2>/dev/null || printf '0'; }
 mode_of()  { stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1" 2>/dev/null || printf ''; }
+
+# credential_conflict <legacy> <durable> — 0 iff BOTH copies exist and the LEGACY one is NEWER.
+# ⛔ ONE PREDICATE, TWO MODES (review F1). `--check` and `--apply` disagreed about the same box: the
+# migration set `rc=1` on a divergence and the check only PRINTED the warning, so `--check` answered
+# "one home — nothing to do" over a box whose legacy credential was NEWER than the durable one. That is
+# the dangerous direction — `--check` -> 0 is the stated precondition for RECLAIMING `/tmp/cell-home`,
+# so the quiet half told an operator to delete the only copy of a rotated key. The two modes cannot
+# disagree again because there is only one place that decides it.
+credential_conflict() {
+  local f_leg="$1" f_dur="$2"
+  [ -e "$f_leg" ] && [ -e "$f_dur" ] || return 1
+  [ "$(mtime_of "$f_leg")" -gt "$(mtime_of "$f_dur")" ]
+}
 
 check_credentials() {
   local rel f_leg f_dur rc=0
@@ -207,8 +222,11 @@ check_credentials() {
     note "  $rel: legacy $(describe "$f_leg") | durable $(describe "$f_dur")"
     # BOTH PRESENT. Never overwrite either one. If the legacy copy is NEWER that is a real hazard a
     # human has to settle — a rotated key on the legacy side would otherwise look converged.
-    if [ "$(mtime_of "$f_leg")" -gt "$(mtime_of "$f_dur")" ]; then
+    # ⛔ AND IT IS DRIFT, NOT A FOOTNOTE: the same predicate `--apply` uses, with `rc=1` here too, so the
+    # two modes answer the same box the same way (review F1).
+    if credential_conflict "$f_leg" "$f_dur"; then
       warn_line "  $rel: the LEGACY copy is NEWER than the durable one — the two homes have diverged. This tool will not pick a winner (that would silently roll back a rotation). Inspect both by hand (compare mtimes, then move the intended one into $HOME_DURABLE), then re-run."
+      rc=1
     fi
   done <<EOF
 $CRED_FILES
@@ -235,8 +253,9 @@ migrate_credentials() {
       note "  kept   $rel (durable copy exists — never overwritten)"
       # ⛔ THE SAME DIVERGENCE WARNING THE CHECK EMITS, EMITTED HERE TOO. `--apply` is the mode where a
       # silent "kept" would read as convergence: if the LEGACY copy is newer, the two homes have
-      # diverged and picking either one is an operator's decision, not this tool's.
-      if [ "$(mtime_of "$f_leg")" -gt "$(mtime_of "$f_dur")" ]; then
+      # diverged and picking either one is an operator's decision, not this tool's. The test is
+      # `credential_conflict`, the ONE place that decides it — the check calls it too.
+      if credential_conflict "$f_leg" "$f_dur"; then
         warn_line "  $rel: the LEGACY copy is NEWER than the durable one — the two homes have diverged. Nothing was written (a rotation would otherwise be rolled back). Inspect both by hand, then re-run."
         rc=1
       fi
@@ -280,6 +299,23 @@ EOF
 # file on disk that a restart reads, so "I did not recognise that line" must never read as "fine".
 UNIT_DIRECTIVES='Environment|EnvironmentFile|ExecStart|ExecStartPre|ExecStartPost|ExecStop|ExecStopPost|ExecReload|WorkingDirectory|RootDirectory|ReadWritePaths|ReadOnlyPaths|StandardOutput|StandardError|LogsDirectory|StateDirectory|CacheDirectory|RuntimeDirectory'
 
+# is_comment <line> — 0 iff systemd would IGNORE the line. `systemd.syntax(7)`: "Empty lines and lines
+# beginning with `#` or `;` are ignored as comments." ⛔ ONE ANSWER, TWO CALLERS: the scanner must not
+# grade a comment, and the writer must not rewrite one — the writer used to pass EVERY line through the
+# projector while the scanner skipped `#`, so an operator's measured history was silently edited (and
+# made to read as a FALSE statement about the past).
+is_comment() {
+  local l="${1:-}"
+  while :; do
+    case "$l" in
+      [[:space:]]*) l="${l#?}" ;;
+      *) break ;;
+    esac
+  done
+  case "$l" in ''|'#'*|';'*) return 0 ;; esac
+  return 1
+}
+
 # paths_in <line> — every absolute path token in a directive line. The separator set is `=`, whitespace,
 # quotes, `,`, `;` AND `:` — a `:` because `Environment=PATH=/a/bin:/usr/bin` is a PATH LIST and each
 # element has to be checked on its own: measured while writing this suite, a `:`-less split produced one
@@ -304,6 +340,10 @@ paths_in() {
 #     cell unit carries paragraphs of measured history that mention the legacy path by name. Grading
 #     prose would refuse every real unit — the false-block shape this repo treats as its own defect.
 #     (Nothing is hidden by skipping them: a comment does not run.)
+#     ⛔ BOTH SPELLINGS — `systemd.syntax(7)` also ignores lines beginning with `;`, and the tool graded
+#     only `#`. A unit whose measured history sits behind `;` was therefore reported UNHANDLED, refused
+#     by name, and the box could NEVER reach `--check` -> 0 (the reclaim precondition) while its only
+#     "defect" was a comment. `is_comment` is the one answer, used by the scanner AND the writer.
 #   * BACKSLASH CONTINUATIONS inherit the previous directive name, because systemd CONCATENATES the
 #     lines and expands C-style escapes — a continuation is the same directive, not a new one.
 #   * A SIBLING NAME IS NOT THIS HOME. The record test is "the projection CHANGES this line", not "the
@@ -315,7 +355,7 @@ unit_scan() {
   local f="$1" n=0 line dir projected miss p cont=""
   while IFS= read -r line; do
     n=$((n + 1))
-    case "$line" in ''|'#'*) cont=""; continue ;; esac
+    if is_comment "$line"; then cont=""; continue; fi
     # ⛔ THE PROJECTION IS THE LIB'S RULE, NOT A COPY OF IT. `cell_home_project_line` applies the
     # boundary rule (`/tmp/cell-home-2/x` and `/tmp/cell-home.bak` are not this home), and it is also
     # the record test: an unchanged projection means this line names no legacy home of OURS.
@@ -342,14 +382,22 @@ EOF
   done < "$f"
 }
 
-# _project_file <src> <dst> — <src> with every line passed through the SAME projector the scan uses.
-# The scan has already accepted the file (no UNHANDLED, every introduced target exists), so a line the
-# projector changes is a line the scan graded; anything else is copied byte for byte. A here-string-free
+# _project_file <src> <dst> — <src> with every GRADED line passed through the SAME projector the scan
+# uses. The scan has already accepted the file (no UNHANDLED, every introduced target exists), so a line
+# the projector changes is a line the scan graded; anything else is copied byte for byte. A here-string-free
 # bash loop on purpose: no external producer, no pipe (#841 SIGPIPE), and no second rewriting rule.
+# ⛔ A COMMENT IS NOT GRADED, SO IT IS NOT REWRITTEN (review F3). Passing every line through the
+# projector edited operator-authored prose inside a root-owned unit file — the comment then read as a
+# FALSE statement about measured history. `is_comment` is the scanner's own answer, so the writer and
+# the scanner still cannot disagree: a line the scanner skips is a line the writer copies verbatim.
 _project_file() {
   local src="$1" dst="$2" line
   : >"$dst" || return 1
   while IFS= read -r line || [ -n "$line" ]; do
+    if is_comment "$line"; then
+      printf '%s\n' "$line" >>"$dst" || return 1
+      continue
+    fi
     printf '%s\n' "$(cell_home_project_line "$HOME_DURABLE" "$line")" >>"$dst" || return 1
   done <"$src"
 }

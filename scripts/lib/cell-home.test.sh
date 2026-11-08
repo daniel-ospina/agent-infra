@@ -68,6 +68,36 @@ source_in() {
   env -i PATH="$STUB:/usr/bin:/bin:/usr/sbin:/sbin" "$@" bash -c ". \"\$1\"; $expr" _ "$lib" 2>/dev/null
 }
 
+# ── THE PROBES, AS FUNCTIONS — so the (e) arms grade the REAL probe on a mutant ───────────────
+# ⛔ THE INLINE DUPLICATE WAS ITSELF A DEFECT (fresh-context review F5). `e2` and `e4` re-spelled the
+# probe patterns inline and then asserted facts about text they had just written: `e2` built a file with
+# the resolver lines stripped and checked the strings were absent (true iff `sed` worked), and `e4`
+# printed a literal and grepped the same literal back. Neither verdict could vary with the probe it
+# claimed to protect, so a NARROWED or BROKEN (c)/(d) would have left both GREEN — an inert gate living
+# inside the arms written to prevent inert gates. The real checks and the mutation arms now call the SAME
+# functions below, so a probe that stops discriminating reddens its own control.
+LEGACY_DEFAULT_RE='CELL_HOME="\${CELL_HOME:-/tmp/cell-home}"\|CELL_HOME:-/tmp/cell-home\|CELL_HOME="\${HOME:-/tmp/cell-home}"'
+
+# probe_legacy_default <file> — 0 iff the file carries the pre-#3453 legacy CELL_HOME assignment.
+probe_legacy_default() { grep -q "$LEGACY_DEFAULT_RE" "$1" 2>/dev/null; }
+
+# probe_consumes_resolver <file> — 0 iff the file sources the resolver and calls it.
+probe_consumes_resolver() {
+  grep -q 'cell-home\.sh' "$1" 2>/dev/null && grep -q 'cell_home_resolve' "$1" 2>/dev/null
+}
+
+# probe_selfpath_guarded <file> — 0 iff the file carries the documented §CONSUMERS self-path guard
+# ("the self path counts only when it NAMES THE FILE BEING EXECUTED"). ⛔ A STRING PROBE FOR THE RESOLVER
+# IS NOT ENOUGH (review F2): `dirname "${BASH_SOURCE[0]:-$0}"` names `cell-home.sh` while a PIPED start
+# (`bash -s`, no `BASH_SOURCE`, `$0` literally `bash`) resolves it to `$PWD/lib/cell-home.sh` — the
+# consumer then SOURCES CODE FROM THE DIRECTORY IT WAS STARTED IN. Two consumers shipped exactly that
+# shape with this arm green, because the arm only asked whether the filename appeared.
+probe_selfpath_guarded() {
+  grep -qF '[ -f "$_SELF" ] || _SELF=""' "$1" 2>/dev/null && return 0
+  grep -qF '[ -f "$SELF_FILE" ] || SELF_FILE=""' "$1" 2>/dev/null && return 0
+  return 1
+}
+
 printf '\n── (a) PRECEDENCE ────────────────────────────────────────────────────────────────────\n'
 
 stub_account
@@ -167,9 +197,9 @@ printf '\n── (c) THE ONE LITERAL / NO LEGACY DEFAULTS ───────�
 # ⚠️ NO APOSTROPHE IN A COMMENT INSIDE `$( )`: bash matches the closing paren quote-aware but NOT
 # comment-aware, so an odd number of `'` in here makes the whole assignment a syntax error.
 legacy_defaults="$(
-  { grep -rn 'CELL_HOME="\${CELL_HOME:-/tmp/cell-home}"\|CELL_HOME:-/tmp/cell-home\|CELL_HOME="\${HOME:-/tmp/cell-home}"' \
+  { grep -rn "$LEGACY_DEFAULT_RE" \
          "$ROOT" "$REPO_ROOT/pi-bootstrap" --include='*.sh' --include='*.py' 2>/dev/null
-    grep -rn 'CELL_HOME="\${CELL_HOME:-/tmp/cell-home}"\|CELL_HOME:-/tmp/cell-home\|CELL_HOME="\${HOME:-/tmp/cell-home}"' \
+    grep -rn "$LEGACY_DEFAULT_RE" \
          "$ROOT" --include='harness-up' --include='harness-down' --include='gh' 2>/dev/null
   } | grep -v '\.test\.' | grep -v "^$LIB:" | grep -v ':[0-9]*:[[:space:]]*#' || true
 )"
@@ -212,10 +242,12 @@ for rel in \
   scripts/orchestrator-harness/refresh-candidates.sh ; do
   f="$REPO_ROOT/$rel"
   if [ ! -f "$f" ]; then bad "d: $rel is missing from the tree"; continue; fi
-  if grep -q 'cell-home\.sh' "$f" && grep -q 'cell_home_resolve' "$f"; then
-    ok "d: $rel sources the resolver and calls cell_home_resolve"
-  else
+  if ! probe_consumes_resolver "$f"; then
     bad "d: $rel does NOT consume the resolver — it still answers 'what is this box's home?' by itself"
+  elif ! probe_selfpath_guarded "$f"; then
+    bad "d: $rel consumes the resolver but does NOT guard its SELF PATH — a piped start would source \$PWD/lib/cell-home.sh (see lib/cell-home.sh §CONSUMERS)"
+  else
+    ok "d: $rel sources the resolver, calls cell_home_resolve, and guards the self path"
   fi
 done
 
@@ -247,6 +279,35 @@ for rel in pi-bootstrap/cell-install.sh scripts/disk-reaper-run.sh scripts/insta
     || bad "d5 $rel has NO empty-home refusal (a missing resolver would land in /)"
 done
 
+# ⛔ THE GUARD, MEASURED — NOT GREPPED (review F2). The arms above prove the resolver is NAMED and that
+# the guard line EXISTS. These prove the guard WORKS: the real file is driven through a REAL piped start
+# (`bash -s`) from a hostile working directory, with a `lib/cell-home.sh` planted exactly where the
+# pre-fix `dirname "${BASH_SOURCE[0]:-$0}"` looks, and the marker that hostile copy writes must NOT exist.
+# Both candidate shapes are covered: the `../lib` form (key-gate) and the `./lib` form (supervisor).
+# ⛔ SCRUBBED AND READ-ONLY: `env -i` plus a scratch CELL_HOME, so no real home, credential or unit is
+# read — and the only write is the marker that must never appear.
+piped_start_marker() {  # <file> <cwd> <hostile-lib> <marker> [script args…] -> '1' if the hostile copy RAN
+  local file="$1" cwd="$2" lib="$3" mark="$4"; shift 4
+  local to=""
+  command -v timeout >/dev/null 2>&1 && to="timeout 60"
+  mkdir -p "$(dirname "$lib")" "$cwd" "$T/pipe/ch"
+  printf '#!/bin/sh\ntouch %s\ncell_home_resolve() { printf %%s\\n %s; }\n' "$mark" "$T/pipe/ch" >"$lib"
+  rm -f "$mark"
+  # shellcheck disable=SC2086  # $to is a two-word prefix (`timeout 60`) when the host provides it
+  ( cd "$cwd" && env -i PATH="$STUB:/usr/bin:/bin:/usr/sbin:/sbin" HOME="$T/pipe/ch" \
+      CELL_HOME="$T/pipe/ch" CELL_HOME_LEGACY=/tmp/cell-home \
+      $to bash -s -- "$@" <"$file" >/dev/null 2>&1 )
+  [ -e "$mark" ] && printf 1 || printf 0
+}
+
+FIX="$T/pipe"
+_m="$(piped_start_marker "$REPO_ROOT/scripts/orchestrator-harness/key-gate.sh" "$FIX/kg/x" "$FIX/kg/lib/cell-home.sh" "$FIX/mark-kg")"
+[ "$_m" = 0 ] && ok "d6 a PIPED start of key-gate.sh does NOT source the resolver from \$PWD/../lib (the ../lib candidate shape)" \
+  || bad "d6 a piped start of key-gate.sh SOURCED \$PWD/../lib/cell-home.sh — code execution from the working directory"
+_m="$(piped_start_marker "$REPO_ROOT/scripts/cloud-cell-supervisor.sh" "$FIX/sup/x" "$FIX/sup/x/lib/cell-home.sh" "$FIX/mark-sup" --help)"
+[ "$_m" = 0 ] && ok "d7 …nor does a piped start of cloud-cell-supervisor.sh source \$PWD/lib/cell-home.sh (the ./lib shape)" \
+  || bad "d7 a piped start of cloud-cell-supervisor.sh SOURCED \$PWD/lib/cell-home.sh — code execution from the working directory"
+
 printf '\n── (e) NON-VACUITY (the arms must redden when the behaviour is reverted) ─────────────\n'
 
 # e1: a lib whose fleet default is the LEGACY path must make b1 answer the legacy home — that is what
@@ -263,38 +324,41 @@ else
   stub_account
 fi
 
-# e2: a consumer with its resolver lines removed must be reported as a non-consumer.
+# e2: a consumer with its resolver lines removed must make the REAL (d) probe answer "not a consumer".
+# ⛔ THE PROBE IS THE FUNCTION, NOT A RE-SPELLED PATTERN (review F5).
 MUTC="$T/mutconsumer.sh"
 sed '/cell-home\.sh/d; /cell_home_resolve/d' "$REPO_ROOT/scripts/deploy-crossbox.sh" >"$MUTC"
-if grep -q 'cell-home\.sh' "$MUTC" || grep -q 'cell_home_resolve' "$MUTC"; then
-  bad "e2 the consumer mutation could not be applied — the d-arm is not checking anything"
+if probe_consumes_resolver "$MUTC"; then
+  bad "e2 the (d) probe still calls a consumer it just saw stripped a consumer — it cannot detect a de-wired file"
+elif ! probe_consumes_resolver "$REPO_ROOT/scripts/deploy-crossbox.sh"; then
+  bad "e2 the (d) probe now REJECTS the shipped consumer — it is not a polarity, it is a stub"
 else
-  ok "e2 a consumer whose resolver lines are removed is DETECTED (the d-arm is not satisfied by any file)"
+  ok "e2 a consumer with its resolver lines removed is DETECTED by the real (d) probe, while the shipped file still passes it"
 fi
 
-# e3: the legacy-default grep must FIRE on a file that carries the old assignment — otherwise c1 passes
-# on a pattern that matches nothing (the classic inert gate).
+# e3: the legacy-default probe must FIRE on a file that carries the old assignment — otherwise c1 passes
+# on a pattern that matches nothing (the classic inert gate). Same pattern variable c1 uses.
 REV="$T/reverted.sh"
 printf '#!/usr/bin/env bash\nCELL_HOME="${CELL_HOME:-/tmp/cell-home}"\n' >"$REV"
-if grep -q 'CELL_HOME="${CELL_HOME:-/tmp/cell-home}"' "$REV"; then
+if probe_legacy_default "$REV"; then
   ok "e3 c1's pattern FIRES on the pre-#3453 assignment (it is not an inert grep)"
 else
   bad "e3 c1's pattern does not fire on the pre-#3453 assignment — c1 is inert"
 fi
 
-# e4: the consumer probe must FIRE on the PRE-#3453 text of a real consumer. `deploy-crossbox.sh` carried
+# e4: BOTH real probes must fire on the PRE-#3453 text of a real consumer. `deploy-crossbox.sh` carried
 # exactly `CELL_HOME="${CELL_HOME:-/tmp/cell-home}"` and no resolver source; reconstruct that shape and
-# prove the (c)+(d) probes both redden on it.
+# run the (c) and (d) PROBES on it — not an inline copy of their patterns.
 OLD="$T/old-crossbox.sh"
 {
   printf '#!/bin/bash\nset -uo pipefail\n'
   printf 'CELL_HOME="${CELL_HOME:-/tmp/cell-home}"\n'
   printf 'AI="${AI:-/tmp/cell-ai}"\n'
 } >"$OLD"
-if grep -q 'CELL_HOME="${CELL_HOME:-/tmp/cell-home}"' "$OLD" && ! grep -q 'cell-home\.sh' "$OLD"; then
-  ok "e4 the pre-#3453 consumer shape trips BOTH probes (legacy default AND no resolver)"
+if probe_legacy_default "$OLD" && ! probe_consumes_resolver "$OLD"; then
+  ok "e4 the pre-#3453 consumer shape trips BOTH real probes (legacy default AND no resolver)"
 else
-  bad "e4 the pre-#3453 consumer shape does not trip both probes"
+  bad "e4 the pre-#3453 consumer shape does not trip both probes — (c)/(d) are not measuring it"
 fi
 
 # e5: remove the empty-home refusal and d2 can no longer see it — the arm measures the GUARD, not the
@@ -308,6 +372,22 @@ else
   _m=$?
   [ "$_m" != 78 ] && ok "e5 WITHOUT the refusal the consumer no longer exits 78 (got rc $_m) — d2 measures the guard" \
     || bad "e5 the mutated consumer still exits 78 — d2 is not measuring the guard"
+fi
+
+# e6: the SAME hostile-cwd piped start, driven through the PRE-FIX self path. If the fixture cannot see a
+# consumer that reverted to `dirname "${BASH_SOURCE[0]:-$0}"`, then d7 is not measuring the guard — it is
+# measuring that a marker file was not created for some unrelated reason. This is the control that makes
+# d6/d7 a measurement (measured: WITH this mutation the marker IS created, for both shapes).
+MUTS="$T/mutself"; mkdir -p "$MUTS"
+awk 'BEGIN{done=0}
+  !done && index($0, "_SELF=\"${BASH_SOURCE[0]:-}\"") > 0 { print "_SELF=\"${BASH_SOURCE[0]:-$0}\""; done=1; next }
+  { print }' "$REPO_ROOT/scripts/cloud-cell-supervisor.sh" >"$MUTS/sup.sh"
+if ! grep -qF '_SELF="${BASH_SOURCE[0]:-$0}"' "$MUTS/sup.sh" || grep -qF '|| _SELF=""' "$MUTS/sup.sh"; then
+  bad "e6 the self-path mutation could not be applied — d7 is not checking the guard"
+else
+  _m="$(piped_start_marker "$MUTS/sup.sh" "$FIX/sup/m" "$FIX/sup/m/lib/cell-home.sh" "$FIX/mark-sup-mut" --help)"
+  [ "$_m" = 1 ] && ok "e6 WITH the pre-fix self path a piped start DOES source \$PWD/lib/cell-home.sh — d7 measures the guard" \
+    || bad "e6 the reverted self path did not reproduce the CWD source — d7 is not measuring the guard"
 fi
 
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"

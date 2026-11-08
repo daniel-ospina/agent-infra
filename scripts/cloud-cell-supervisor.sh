@@ -149,7 +149,15 @@ set -uo pipefail
 # already defaults on `$HOME` for the same reason — two different defaults for one home IS the skew.
 # A cell whose `$HOME` is not its durable home is refused by `cloud-cell-bringup.sh --check`, which
 # reads the passwd record itself rather than trusting this value.
-SUP_SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd -P)"
+# ⛔ THE SELF PATH COUNTS ONLY WHEN IT NAMES THIS FILE — see `lib/cell-home.sh` §CONSUMERS. Under a
+# PIPED start (`bash -s`) there is no `BASH_SOURCE` and `$0` is LITERALLY `bash`, so
+# `dirname "${BASH_SOURCE[0]:-$0}"` answers `.` and the candidate becomes `$PWD/lib/cell-home.sh` — this
+# supervisor then SOURCES the resolver out of the directory it happens to be started in (measured: a
+# planted `$PWD/lib/cell-home.sh` was sourced and executed). Guarded, a piped start has no sibling to
+# trust and takes the documented `$HOME` fallback below (with its exit-78 refusal when `$HOME` is unset).
+_SELF="${BASH_SOURCE[0]:-}"; [ -f "$_SELF" ] || _SELF=""
+SUP_SELF_DIR=""
+if [ -n "$_SELF" ]; then SUP_SELF_DIR="$(cd "$(dirname "$_SELF")" 2>/dev/null && pwd -P)"; fi
 CELL_HOME_LIB="${SUP_SELF_DIR:+$SUP_SELF_DIR/lib/cell-home.sh}"
 if [ -n "$CELL_HOME_LIB" ] && [ -r "$CELL_HOME_LIB" ]; then
   . "$CELL_HOME_LIB"
