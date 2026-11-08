@@ -9200,8 +9200,15 @@ testAsync("#1208 (E2E): an EMPTY-TURN LOOP child is the zero-message death, not 
     const headerAt = deathText.indexOf("died before its first message");
     const composerAt = deathText.indexOf("Sub-agent exited with code 0");
     ok(headerAt >= 0, "the death header is present in the text the parent reads");
+    // ⛔ NO ESCAPE HATCH (review round 7, P3). The first version of this line was
+    // `composerAt === -1 || headerAt < composerAt`, and that disjunct accepted EXACTLY the
+    // regression it exists to catch: a replacement (`text: header`) drops the composed sentence,
+    // so `composerAt === -1` and the predicate returned true. This child is exit 0 with empty
+    // stdout AND empty stderr, so its composer sentence is always
+    // `Sub-agent exited with code 0` — the composer MUST be present, and it must come after the
+    // header. Both halves are asserted, so neither a drop nor a reordering can pass.
     ok(
-      composerAt === -1 || headerAt < composerAt,
+      composerAt >= 0 && headerAt < composerAt,
       `the header PRECEDES the composer sentence — the composer text is kept BELOW it, never replaced by it (header@${headerAt}, composer@${composerAt})`,
     );
     ok(
