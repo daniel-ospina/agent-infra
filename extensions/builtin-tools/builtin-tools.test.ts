@@ -7462,6 +7462,56 @@ test("#1698: describeSpawnFailure is total — odd inputs never throw", () => {
   ok(describeSpawnFailure(enoentNoMessage, ghost).includes("DOES NOT EXIST"), "an errno-only object still gets the cause named");
 });
 
+// ⛔ THE CALL SITE, PINNED (review round 2, P2 — verified finding). The five rows
+// above test `describeSpawnFailure` DIRECTLY, so before this block the mutant
+// `:5152 → text: `Sub-agent failed: ${err.message} (spawn cwd: ${targetCwd})``
+// restored the entire #1698 defect and every one of them stayed GREEN: not one row
+// in this file referenced `Sub-agent failed`. An assertion that cannot fail under
+// the mutation that reverts the fix is the class #3442 names. Two rows, in the
+// order of strength this file already uses:
+//   (i)  SOURCE pin — deterministic, anchored, and it names the exact substitution;
+//   (ii) BEHAVIOURAL pin — the settle a failed dispatch actually reports. A
+//        nonexistent cwd is the one target `taskCwdRefusal` deliberately lets
+//        through (`:3977`), so this exercises the real path the fix exists for,
+//        with no child: `spawn` fails before exec.
+test("#1698: the spawn-error settle CALLS describeSpawnFailure (source pin — the call-site mutation)", () => {
+  ok(
+    source.includes("Sub-agent failed: ${describeSpawnFailure(err, targetCwd)}"),
+    "the settle composes its message through describeSpawnFailure (reverting this restores the #1698 defect)",
+  );
+  // The negative twin: the pre-fix form must be GONE, not merely accompanied. A
+  // bare `includes` on the new text would stay green if an old-shaped producer
+  // were added beside it.
+  ok(
+    !source.includes("Sub-agent failed: ${err.message} (spawn cwd: ${targetCwd})"),
+    "no producer still reports the raw errno with no cause named",
+  );
+});
+
+testAsync("#1698 (behavioural): a dispatch into a MISSING cwd settles with the cause named", async () => {
+  const ghost = join(tmpdir(), `t1698-settle-${process.pid}-${Math.random().toString(16).slice(2)}`);
+  // `process.argv[1] = undefined` makes getPiInvocation fall back to bare `pi`
+  // (cut-resume.integration.test.ts precedent) — irrelevant to the outcome here,
+  // because the cwd is missing, so `spawn` fails before any exec.
+  const prevArgv1 = process.argv[1];
+  (process.argv as unknown as string[])[1] = undefined as unknown as string;
+  try {
+    const res = await Promise.race([
+      spawnSubAgent("deepseek-v4-flash", "deepseek", {}, ["--version"], undefined, undefined, ghost),
+      new Promise<null>((r) => setTimeout(() => r(null), 20_000)),
+    ]);
+    ok(res !== null, "the dispatch SETTLES on a missing cwd (it must not hang the parent)");
+    const text = String((res as { content?: { text?: string }[] } | null)?.content?.[0]?.text ?? "");
+    ok(text.includes("Sub-agent failed"), `the settle message is composed: ${text}`);
+    ok(text.includes("DOES NOT EXIST"), `it names the missing cwd as the CAUSE — the wiring this row exists for: ${text}`);
+    ok(text.includes(ghost), `it names the directory: ${text}`);
+    ok(/NOT a missing `pi` install/.test(text), `it denies the reading the raw errno invites: ${text}`);
+    equal((res as { details?: { isError?: unknown } } | null)?.details?.isError, true, "still reported as an error, never a success");
+  } finally {
+    (process.argv as unknown as string[])[1] = prevArgv1;
+  }
+});
+
 // SOURCE PINS: the ONE resolved value feeds BOTH consumers (spawn + repo probe)
 // and the ledger row, and the schema exposes it to parents.
 test("#1071: the target cwd is wired through spawn + repo probe + ledger row (source pin)", () => {
