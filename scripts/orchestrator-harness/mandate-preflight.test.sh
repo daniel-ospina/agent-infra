@@ -55,6 +55,13 @@ trap 'rm -rf "$TMP"' EXIT
 mkstate() { rm -rf "$TMP/home"; mkdir -p "$TMP/home/.pi/agent/state"; }
 run()     { CELL_HOME="$TMP/home" bash "$HELPER" "$@"; }
 # seam_brief <file> — the MINIMAL brief that satisfies brief-gate.sh's schema, written statically.
+# ⛔ THE SCHEMA HAS GROWN TWICE SINCE THIS FIXTURE WAS WRITTEN, AND EACH TIME THE FIXTURE — not the gate —
+# was what went stale. `brief-gate.sh` gained the `## MUTATION ATTRIBUTION` / `NO NEW ASSERTIONS:`
+# requirement for the `reviewer` role in #3442/#3481 (0b1d1ec65), and the fixture below was never
+# updated: `run_agent` then refused EVERY dispatch in §E3 at the brief gate with exit 80, before the
+# mandate emit and before the launch, so 18 arms reddened on main and on every PR (#3786's red
+# `bash-suites (6)`; `script-validate (6)` on main's own head). The block is present here, at column 0,
+# so the fixture keeps satisfying the schema's CURRENT shape rather than a remembered one.
 # ⛔ Not produced by invoking the brief-gate helper from inside this suite (see the note at the seam
 # fixture): a nested script invocation under a variable path makes the working-tree guard refuse to run
 # this file at all, and the mandate arm is not the place to re-test brief-gate's own text.
@@ -72,6 +79,9 @@ WIP: keyless — test fixture: this brief is the subject of another suite, not a
 BRANCH: none — test fixture
 WORKTREE: none — test fixture
 PRIOR: no previous attempt — test fixture
+## MUTATION ATTRIBUTION
+NO NEW ASSERTIONS: test fixture — its subject is the mandate disclosure in the brief, not a diff; the suite
+that consumes it carries its own mutants, and a fixture with no diff has no assertion to attribute.
 BRIEF
 }
 
@@ -380,7 +390,14 @@ chmod 600 "$BRIEF1F" 2>/dev/null
 # file it had not read, the "gate that cannot redden" class §E's own header names. The predicate below
 # anchors only on HOW an assignment starts and on what a GUARDED one ends with, so nesting cannot hide a
 # line from it, and it is exercised by a control on each side (below) instead of being trusted.
-unguarded_subs() { grep -nE '^[[:space:]]+[A-Za-z_][A-Za-z0-9_]*=("|)?\$\(' | grep -vE '\|\|[[:space:]]*:[[:space:]]*$'; }
+# ⛔ `("|)?` IS NOT PORTABLE AND IT MADE THESE CONTROLS VACUOUS ON macOS (measured 2026-11-08, #3786).
+# BSD grep reads the EMPTY second alternative of `("|)` as an _empty (sub)expression_ and refuses the whole
+# pattern (`grep: empty (sub)expression`, rc=2) instead of matching it as GNU grep does, so `unguarded_subs`
+# answered NOTHING for every input on the one platform the fleet runs on: the four "IS reported" arms below
+# went red and the "is NOT reported" arms passed vacuously — a control that cannot redden, which is the
+# exact failure those arms exist to prevent. `="?` says the same thing (an OPTIONAL quote) in a form both
+# greps accept.
+unguarded_subs() { grep -nE '^[[:space:]]+[A-Za-z_][A-Za-z0-9_]*="?\$\(' | grep -vE '\|\|[[:space:]]*:[[:space:]]*$'; }
 UNGUARDED="$(awk '/^mandate_preflight_emit\(\)/,/^}/' "$HELPER" | unguarded_subs | sed 's/^/emit+/')"; [ -z "$UNGUARDED" ]; ck $? "every command-substitution assignment in the emit carries a guard against a set -e caller (unguarded:${UNGUARDED:- none})"
 # ── E1e-b / E1f-b / E1f-c: EVERY redirect failure is SUPPRESSED and RECORDED, not just swallowed ──────
 # E1e and E1f drove the same writes with `2>/dev/null`, so they could not see the defect those writes were
