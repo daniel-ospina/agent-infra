@@ -1,0 +1,42 @@
+{
+  "_ref": "refs/lanes/cmux.klane-2081-1794167779-p1568150-2f3a8ed3",
+  "_sha": "1fc8854c4eadc2d584487f04fc6b6ff5df43796b",
+  "artifacts": [
+    {
+      "kind": "log",
+      "value": "/tmp/cell-home/orchestrator/logs/lane-2081.log"
+    },
+    {
+      "kind": "branch",
+      "value": "feat/2081-tm"
+    },
+    {
+      "kind": "sha",
+      "value": "334a2d4b1ab9ac23c8c3843536884494c3527e16"
+    },
+    {
+      "kind": "worktree",
+      "value": "/home/cmux/tortoise/.worktrees/tm-2081"
+    }
+  ],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 7800,
+  "duration_s": 7253,
+  "ended_at": 1794175032,
+  "exit_code": 143,
+  "heartbeat_at": 1794175032,
+  "host": "cmux",
+  "issue": 2081,
+  "kind": "lane",
+  "lane_id": "cmux.klane-2081-1794167779-p1568150-2f3a8ed3",
+  "lease_until": 1794182832,
+  "pid": 1568150,
+  "reason": "bound:exceeded-wallclock",
+  "repo": "daniel-ospina/tortoise",
+  "schema": 1,
+  "started_at": 1794167779,
+  "state": "FAILED",
+  "tag": "2081",
+  "worktree": "/home/cmux/tortoise/.worktrees/tm-2081"
+}
