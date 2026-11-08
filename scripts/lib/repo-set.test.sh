@@ -1050,7 +1050,11 @@ _arith_depth = 0
 
 
 def _openers(line):
-    """Every heredoc opened on ONE logical line, in bash's order, as (delimiter, strip_tabs).
+    """Every heredoc opened on ONE logical line, in bash's order, as (delimiter, strip_tabs, quoted).
+
+    `quoted` is read from the FIRST character of the delimiter word (a quote, or a backslash), which is the
+    only spelling this walk models — and it is LOAD-BEARING, because bash joins a backslash-newline inside an
+    UNQUOTED here-document and does not inside a quoted one (see the body loop).
 
     A comment ends at the newline — `_strip_comment` has already removed it, so this walk never sees one
     and the comment RULE has exactly one definition in this file (it used to live here too, which is why
@@ -1114,7 +1118,9 @@ def _openers(line):
             while j < n and line[j] in ' \t':
                 j += 1
             delim = ''
+            quoted = False
             if j < n and line[j] in '\'"\\':
+                quoted = True
                 q = line[j]
                 j += 1
                 # ⛔ DECLARED NO-OP, not a pinned arm (round 48 review, P3 — measured): a quoted delimiter
@@ -1155,7 +1161,7 @@ def _openers(line):
             # and moves 0 of 435 files. It stays as the boundary for `cat <<` with nothing after it, which is
             # a bash syntax error rather than a construct to model.
             if delim:
-                out.append((delim, strip_tabs))
+                out.append((delim, strip_tabs, quoted))
             i = j
             continue
         i += 1
@@ -1165,11 +1171,27 @@ def _openers(line):
 
 lines = []
 _pending = []       # heredocs whose BODIES are still to come, in bash's order
+_body = None        # an UNQUOTED body line that ended in a continuation, waiting for its next line
 _buf = None
 for _l in raw_lines:
     if _pending:
-        _delim, _strip = _pending[0]
+        _delim, _strip, _quoted = _pending[0]
         _cand = _l.lstrip('\t') if _strip else _l
+        # ⛔ A BODY LINE ENDING IN A BACKSLASH IS JOINED BEFORE THE TERMINATOR TEST (round 48 review, P3 —
+        # measured): for an UNQUOTED delimiter bash removes each `\<newline>` "while reading the
+        # here-document, before the check for the ending delimiter", so `JOIN\` + `ED` CLOSES a `<<JOINED`
+        # heredoc and the line after it is a new command. Comparing raw lines left the opener pending
+        # forever, so the rest of the file became body and every definition below it vanished — a FALSE PASS
+        # in the namespace arm's own direction, which had no fixture and was not on the declared-limits list.
+        # ⛔ AND THE JOIN IS THE UNQUOTED PATH ONLY: with `<<'JQ'` the same `J\` + `Q` is LITERAL, the
+        # terminator never arrives there, and the next line is still body. Both directions are pinned, so the
+        # lazy fix — joining whatever ends in a backslash — reds `f11f-0` by inventing the quoted body's line.
+        if _body is not None:
+            _cand = _body + _cand
+            _body = None
+        if not _quoted and _odd_backslashes(_cand):
+            _body = _cand[:-1]
+            continue
         if _cand == _delim:            # `<<-` permits leading TABS, nothing else permits anything
             _pending.pop(0)
         continue
@@ -1432,6 +1454,26 @@ after_multiline_arith() { :; }
 cat <<\!BANG
 body_of_bang_delimiter() { :; }
 !BANG
+# ⛔ A BODY LINE ENDING IN A BACKSLASH IS JOINED BEFORE THE TERMINATOR TEST (round 48 review, P3 — measured):
+# for an UNQUOTED delimiter bash removes each `\<newline>` from the body "before the check for the ending
+# delimiter", so `JOIN\` + `ED` really closes this heredoc and the definition after it is a NEW command and
+# MUST be seen. It was not: the body loop compared RAW lines, the opener stayed pending, and everything below
+# was read as body — a FALSE PASS in the namespace arm's own direction, with no fixture and no entry on the
+# declared-limits list. ⛔ AND THE JOIN IS THE UNQUOTED PATH ONLY: with `<<'JQ'` the identical `J\` + `Q` is
+# LITERAL, the terminator never arrives there, and the next line is still BODY. Both directions are pinned,
+# so joining whatever ends in a backslash — the lazy fix — reds this arm by inventing `body_of_quoted_join`.
+cat <<JOINED
+body_of_joined_terminator() { :; }
+JOIN\
+ED
+after_joined_terminator() { :; }
+cat <<'JQ'
+body_of_quoted_join() { :; }
+J\
+Q
+still_body_of_quoted_join() { :; }
+JQ
+after_quoted_join() { :; }
 # ⛔ AND AN ARITHMETIC CONTEXT CLOSES ON `))`, not `)` (round 48 review, P3 — measured): `$(( (a+b) << 3 ))`
 # closes on the doubled paren, and a single-`)` model reopens a phantom heredoc at the shift.
 _rs_pair=$(( ( _rs_shift + 1 ) << 3 ))
@@ -1439,7 +1481,7 @@ after_paren_arith() { :; }
 FIXTURE
 _scan_fixture="$(python3 "$T/defs.py" "$T/defs-fixture.sh")"
 ck "f11f-0 …and every one of those spellings is really SEEN (brace on either line, any indent), while bare keywords followed by '{' are not counted" \
-   '[ "$_scan_fixture" = "name_same_line name_func_kw indented_same_line name_next_line name_func_next continued_name after_notes_comment after_comment_continuation head_after_inline_comment head_with_comment_between indented_head_only head_then_blank real_after_tab_heredoc after_arith_and_trailing_comment after_tabbed_terminator after_here_strings after_two_openers after_even_backslash_run after_backslash_comment after_multiline_arith after_paren_arith" ]'
+   '[ "$_scan_fixture" = "name_same_line name_func_kw indented_same_line name_next_line name_func_next continued_name after_notes_comment after_comment_continuation head_after_inline_comment head_with_comment_between indented_head_only head_then_blank real_after_tab_heredoc after_arith_and_trailing_comment after_tabbed_terminator after_here_strings after_two_openers after_even_backslash_run after_backslash_comment after_multiline_arith after_joined_terminator after_quoted_join after_paren_arith" ]'
 # ⛔ THE DEGRADED PATH MUST NOT CLAIM TO GRADE WHEN IT CANNOT NAME A REPO (review round 2, P1). The
 # doctor's REPO-only arm raises when the checkout's `origin` proves nothing — the TCC shape on the
 # default macOS install — so `f4`'s stub (which echoes argv) would pass on a wrapper that dies in
