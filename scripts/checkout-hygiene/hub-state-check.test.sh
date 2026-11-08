@@ -275,8 +275,21 @@ else
   ok "the remedy does not relink onto a hub entry that is itself a link"
 fi
 assert_contains "$out" "rm -f $FARMWT/looped-tool" "…it removes the farm entry and names the hub-side link to fix first"
-assert_contains "$out" "itself a LINK" "…and says WHY the relink is withheld"
+assert_contains "$out" "itself a link INTO A WORKTREE" "…and says WHY the relink is withheld"
 rm -f "$HUB/extensions/looped-tool" "$FARMWT/looped-tool"
+# …and the relink is NOT withheld when the hub's counterpart points at a STABLE tree outside
+# every worktree. Withholding it there costs the operator a hand-written command and states a
+# cause that is false on that box: `hub/extensions/<n> -> /stable/<n>` never recreates the
+# reported FAIL (MEASURED in review of PR #3780: that configuration PASSes after the relink).
+# The check must DECIDE from what the link resolves to, not from the mere fact that it IS one.
+mkdir -p "$FIX/stable-tool"
+ln -s "$FIX/stable-tool" "$HUB/extensions/stable-tool"
+ln -s "$FIX/nowhere-at-all/stable-tool" "$FARMWT/stable-tool"
+out="$(PI_EXTENSIONS_DIR="$FARMWT" bash "$CHECK" --repo "$HUB" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 1 "a dead farm entry whose hub counterpart is a STABLE link still exits 1"
+assert_contains "$out" "ln -s $HUB/extensions/stable-tool $FARMWT/stable-tool" \
+  "the relink IS printed for a hub entry that points at a stable tree (not withheld)"
+rm -f "$HUB/extensions/stable-tool" "$FARMWT/stable-tool"
 # The consequence that makes this a FAIL rather than a note: a reaped lane deletes the
 # worktree, git keeps the RECORD, the farm link DANGLES — and print-mode (`pi -p`,
 # every task child and harness lane) treats a failed extension load as FATAL (#602).

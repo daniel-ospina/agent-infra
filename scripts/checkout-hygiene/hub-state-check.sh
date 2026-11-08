@@ -355,9 +355,9 @@ recovery_guide() {
     local farm_root_wt
     farm_root_wt="$(extensions_farm_root)"
     lines+=("")
-    lines+=("#649 — the live pi extension farm symlinks into a WORKTREE of this hub, or into")
-    lines+=("a worktree that is GONE, so every running session executes (or fails to load)")
-    lines+=("that BRANCH's working tree instead of the hub's.")
+    lines+=("#649 — the live pi extension farm points into a WORKTREE of this hub, or at a")
+    lines+=("target that does not exist, so every running session executes THAT BRANCH's")
+    lines+=("working tree instead of the hub's — or the extension fails to load at all.")
     # ⛔ SINGLE QUOTES, deliberately — and this element is the one that makes it
     # load-bearing in the LIVE case too, not only once the link dangles. A backtick
     # span in a double-quoted element is not prose: bash runs it as a command
@@ -390,27 +390,37 @@ recovery_guide() {
         lines+=("  $farm_root_wt/$n -> $tgt   (worktree branch: $br)")
       fi
     done <<<"$farm_wt"
-    lines+=("Repoint each entry at this hub's own extensions — the checkout that must stay on")
-    lines+=("main, clean and current:")
+    lines+=("Repoint each LIVE entry at this hub's own extensions — the checkout that must")
+    lines+=("stay on main, clean and current — and REMOVE each dead one (its target is gone):")
+    # DECIDE, never assert: does this hub's own extensions/<n> itself resolve into a WORKTREE
+    # of this hub? `[ -d ]` follows symlinks, so a hub entry that is a link onto
+    # `<worktree>/extensions/…` makes the plain repoint reproduce the reported FAIL byte for
+    # byte — the operator pastes the same command forever (MEASURED, review of PR #3780).
+    # But a hub entry that is a link onto a STABLE tree outside every worktree is fine and
+    # MUST get the relink: withholding it there costs a hand-written command for no reason
+    # and states a cause that is false on that box (also MEASURED in that review).
+    local hub_wt_exts="" hub_entry_dir
+    while IFS=$'\t' read -r wt br; do
+      [ -n "$wt" ] || continue
+      hub_wt_exts+="$(physical_path "$wt/extensions")"$'\n'
+    done <<<"$(hub_worktrees "$repo")"
     while IFS=$'\t' read -r n tgt br; do
       [[ -n "$n" ]] || continue
-      # The remedy must never CREATE the state it is repairing, in EITHER direction.
       # (a) `ln -s` onto a path that does not exist leaves a DANGLING link — a wrong-tree
-      # link traded for a total dispatch outage. (b) `[ -d ]` FOLLOWS symlinks, so when
-      # the hub's own extensions/$n is ITSELF a link onto <worktree>/extensions/…, a
-      # relink reproduces the reported state byte for byte and the operator pastes the
-      # same command forever (MEASURED, review of PR #3780). So the relink is printed only
-      # for a real directory; a symlinked hub entry gets the removal plus the reason that
-      # has to be fixed FIRST. Paths are %q-quoted like every other paste-ready command
-      # here (:304, :310, :314), where an unquoted path with a space was MEASURED to emit
-      # a chain that silently did nothing.
-      if [[ -d "$repo/extensions/$n" && ! -L "$repo/extensions/$n" ]]; then
+      # link traded for a total dispatch outage, so the relink requires a real directory.
+      # Paths are %q-quoted like every other paste-ready command here (:304, :310, :314),
+      # where an unquoted path with a space was MEASURED to emit a chain that did nothing.
+      hub_entry_dir=""
+      if [[ -d "$repo/extensions/$n" ]]; then
+        hub_entry_dir="$(physical_path "$(dirname "$(physical_path "$repo/extensions/$n")")")"
+      fi
+      if [[ -n "$hub_entry_dir" ]] && ! grep -qxF -- "$hub_entry_dir" <<<"$hub_wt_exts"; then
         lines+=("  rm -f $(printf '%q' "$farm_root_wt/$n") && ln -s $(printf '%q' "$repo/extensions/$n") $(printf '%q' "$farm_root_wt/$n")")
       elif [[ -L "$repo/extensions/$n" ]]; then
         lines+=("  rm -f $(printf '%q' "$farm_root_wt/$n")   # this hub's OWN extensions/$n is")
-        lines+=("  #   itself a LINK — a relink would recreate exactly the state above. Point")
-        lines+=("  #   extensions/$n at a real tree (it must not resolve into a worktree), then")
-        lines+=("  #   relink the farm entry onto it.")
+        lines+=("  #   itself a link INTO A WORKTREE — a relink would recreate exactly the state")
+        lines+=("  #   above. Point extensions/$n at a real tree, then relink the farm entry onto")
+        lines+=("  #   it.")
       else
         lines+=("  rm -f $(printf '%q' "$farm_root_wt/$n")   # this hub has NO extensions/$n to")
         lines+=("  #   point at, so a relink here would itself dangle — the entry is removed.")
