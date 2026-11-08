@@ -1226,11 +1226,12 @@ reading.**
   CPU share here; only the CPU comparison is made.)
 - **Main thread vs workers** (the report's caveat quantified, though *not* the
   size column, which stays missing below): on the processes that were busy, the
-  main thread carried **0.61–1.00** of the ΔCPU and the `V8Worker` pool
-  **0.00–0.41** — envelopes across those processes, not a single per-process split
-  and not jointly attained: each process's shares sum with its *other* threads to
-  1.00, so the process at the main-thread maximum carries no worker share, and the
-  0.61 and 0.41 ends do not belong to the same process. So the burn,
+  main thread carried **0.61–1.00** of the ΔCPU; the `V8Worker` pool's largest
+  observed share was **0.41**. Those are two **separate envelopes over the busy set,
+  and they do not compose into one**: a 0.61 main-thread floor leaves at most 0.39
+  for every other thread, so the 0.41 maximum cannot belong to a process inside that
+  floor's population — the pair is recorded as measured, and it does not add up. The
+  load-bearing observation is the main-thread range: the burn,
   when it exists, is main-thread JS — consistent with the render-frame mechanism
   and *not* primarily collector throughput.
 
