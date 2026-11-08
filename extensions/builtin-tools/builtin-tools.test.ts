@@ -7462,6 +7462,42 @@ test("#1698: describeSpawnFailure is total — odd inputs never throw", () => {
   ok(describeSpawnFailure(enoentNoMessage, ghost).includes("DOES NOT EXIST"), "an errno-only object still gets the cause named");
 });
 
+// THE FAIL-SAFE DIRECTION, PINNED (review round 5, P3 — verified finding). The row
+// above exercises only `exists` and `absent`. The branch the `isAbsentPath` doc
+// comment spends six lines on — a path that EXISTS but whose `statSync` FAILS — was
+// asserted by comment only: `catch { return true; }` and dropping the `ENOTDIR` arm
+// both left every row GREEN. A directory the process cannot traverse (mode 000)
+// makes `statSync` on a child throw `EACCES` while the child is really there, so the
+// mutant `catch { return true; }` would append "the cwd does not exist" to a
+// directory sitting on disk — the misdiagnosis the guard exists to prevent.
+test("#1698: an existing cwd whose stat FAILS keeps the plain message (the fail-safe arm)", () => {
+  const parent = mkdtempSync(join(tmpdir(), "t1698-eacces-"));
+  const child = join(parent, "child");
+  mkdirSync(child);
+  // Mode bits deny nothing to uid 0, where the premise does not hold — declared
+  // rather than silently asserting a green row that measured nothing.
+  if (typeof process.getuid === "function" && process.getuid() === 0) return;
+  chmodSync(parent, 0o000);
+  try {
+    // The premise: the child EXISTS, and `statSync` on it still throws.
+    let threw = false;
+    try {
+      statSync(child);
+    } catch {
+      threw = true;
+    }
+    ok(threw, "premise — an untraversable parent makes statSync throw on a child that exists");
+    equal(
+      describeSpawnFailure({ code: "ENOENT", message: "spawn /x ENOENT" }, child),
+      `spawn /x ENOENT (spawn cwd: ${child})`,
+      "a stat failure that is NOT ENOENT/ENOTDIR claims nothing — the directory is still there",
+    );
+  } finally {
+    chmodSync(parent, 0o700);
+    rmSync(parent, { recursive: true, force: true });
+  }
+});
+
 // ⛔ THE CALL SITE, PINNED (review round 2, P2 — verified finding). The five rows
 // above test `describeSpawnFailure` DIRECTLY, so before this block the mutant
 // `:5152 → text: `Sub-agent failed: ${err.message} (spawn cwd: ${targetCwd})``
@@ -7497,7 +7533,12 @@ testAsync("#1698 (behavioural): a dispatch into a MISSING cwd settles with the c
   (process.argv as unknown as string[])[1] = undefined as unknown as string;
   try {
     const res = await Promise.race([
-      spawnSubAgent("deepseek-v4-flash", "deepseek", {}, ["--version"], undefined, undefined, ghost),
+      // No row in the operator's ledger for a test dispatch (#783 gate). Without
+      // this the settle writes a fake `spawn-error` dispatch-outcome row — with a
+      // `/tmp/t1698-settle-*` cwd and `dispatchId: null` — into the append-only
+      // operator audit ledger on EVERY run (measured: 3 such rows accrued in one
+      // session's test runs). Same rule as the `#1071` row below.
+      spawnSubAgent("deepseek-v4-flash", "deepseek", { DISPATCH_LEDGER: "0" }, ["--version"], undefined, undefined, ghost),
       new Promise<null>((r) => setTimeout(() => r(null), 20_000)),
     ]);
     ok(res !== null, "the dispatch SETTLES on a missing cwd (it must not hang the parent)");
