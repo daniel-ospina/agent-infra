@@ -274,6 +274,10 @@ def test_refuses_when_pane_unreadable(R):
     cmux = FakeCmux()
     obs = _run(R, FakeLS(screen="   \n  "), cmux)
     assert obs["refused"] is True
+    # ⛔ THE REASON, NOT JUST THE REFUSAL (review round-7 residual 7): a whitespace-only read is
+    # also not a shell prompt, so the prompt guard below refused it too and this row stayed green
+    # with its OWN guard deleted — a fail-closed masking, not a pin.
+    assert "UNREADABLE" in obs["reason"], obs
     assert cmux.sent() == []
 
 
@@ -408,6 +412,10 @@ def test_new_does_not_count_a_transcript_from_an_ANCESTOR_cwd(R):
     cmux = FakeCmux(on_send=lambda: ls.new_session("root.jsonl", cwd="/tmp"))
     obs = R.relaunch("ws-1", ls=ls, runner=cmux, pi=sys.executable, cwd="/tmp/lane", new=True,
                      sleep=lambda _s: None, clock=_clock())
+    # ⛔ `refused is False` (review round-7 residual 2): these rows call `relaunch` directly and
+    # `/tmp/lane` exists only as a side effect of `_run`, so in isolation their `confirmed is False`
+    # could be the CWD GUARD's answer rather than the cwd filter's. Pin the arm they name.
+    assert obs["refused"] is False, obs
     assert obs["confirmed"] is False, "an ancestor cwd confirmed the relaunch: %r" % (obs,)
 
 
@@ -417,6 +425,7 @@ def test_new_does_not_count_a_transcript_from_a_DESCENDANT_cwd(R):
     cmux = FakeCmux(on_send=lambda: ls.new_session("sub.jsonl", cwd="/tmp/lane/scripts"))
     obs = R.relaunch("ws-1", ls=ls, runner=cmux, pi=sys.executable, cwd="/tmp/lane", new=True,
                      sleep=lambda _s: None, clock=_clock())
+    assert obs["refused"] is False, obs
     assert obs["confirmed"] is False, obs
 
 
@@ -523,6 +532,7 @@ def test_new_does_not_confirm_on_a_transcript_that_predates_the_send(R):
     cmux = FakeCmux()                            # the send succeeds and NOTHING changes
     obs = R.relaunch("ws-1", ls=ls, runner=cmux, pi=sys.executable, cwd="/tmp/lane", new=True,
                      sleep=lambda _s: None, clock=_clock())
+    assert obs["refused"] is False, obs
     assert obs["sent"] is True, obs
     assert obs["confirmed"] is False, "confirmed from a pre-send transcript: %r" % (obs,)
 
@@ -547,6 +557,7 @@ def test_new_does_not_confirm_on_a_SINGLE_non_prompt_read(R):
                 screen=["dev@box repo % ", "  (redraw noise)  ", "dev@box repo % "])
     obs = R.relaunch("ws-1", ls=ls, runner=FakeCmux(), pi=sys.executable, cwd="/tmp/lane", new=True,
                      sleep=lambda _s: None, clock=_clock())
+    assert obs["refused"] is False, obs
     assert obs["confirmed"] is False, obs
 
 
