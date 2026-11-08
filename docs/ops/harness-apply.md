@@ -203,9 +203,10 @@ them — in that file whenever it published, and in this run's own journal excer
 one named".
 
 `farm_rows=unwritable` means the rows write failed **while the record write still succeeded** — the
-drift is still red, `farm_n` still carries the count it had (or `unparsed` when the extraction parsed
-nothing), but **no artifact is written by this pass**, so the journal says so in as many words and the
-rows past the 12-line excerpt are named nowhere durable. (A state dir that is unwritable for the
+drift is still red, `farm_n` still carries the count it had (or `unparsed` when the extraction was
+**not proven complete** — a partial match counts here too, not only a total miss), but **no artifact is
+written by this pass**, so the journal says so in as many words and the rows past the 12-line excerpt
+are named nowhere durable. (A state dir that is unwritable for the
 record too leaves the PREVIOUS record in place: staleness, not a field, is that signal.)
 
 ⛔ `deployed` EXISTS BECAUSE THE CHECKOUT IS NOT THE DEPLOYMENT. A pin-per-commit cell

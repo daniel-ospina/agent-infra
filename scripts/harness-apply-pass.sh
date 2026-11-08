@@ -157,8 +157,15 @@ set -uo pipefail
 # with a RELATIVE `HARNESS_APPLY_FARM_CHECKER` and a CDPATH that resolves its directory,
 # `$FARM_CHECKER_REAL` could never carry the `$FARM_DEST_REAL/` prefix, so a FARM-LOCAL checker read as
 # "outside the farm" and the farm GRADED ITSELF GREEN — the exact fail-open this leg exists to remove.
-# `$HERE` is the same hazard when this file is invoked by a relative path. The rows-path absolutisation
-# below already clears CDPATH for the same reason; these are the rest.
+# `$HERE` is the same hazard when this file is invoked by a relative path (a two-line `$HERE` would
+# defeat `$REPO` resolution and any EXACT comparison against it). ⛔ THIS SITE IS NOT PINNED, AND THE
+# SUITE CANNOT PIN IT AS WRITTEN: the `case "$HERE"` farm-shape refusals below are SUFFIX matches, so a
+# two-line value still ends with `/.pi/agent/scripts` and still matches — measured, removing this
+# `CDPATH=` reds no assertion (a relative-invocation fixture was written and thrown away rather than
+# shipped as a test that cannot fail). Keep the prefix anyway: it is one token, and the next exact
+# comparison or `cd "$HERE"` added here would depend on it. (`$FARM_DEST_REAL`/`$HERE_REAL` carry it
+# too, but both `cd` targets are already absolute — `$FARM_DEST` is refused when relative and `$HERE`
+# comes from `pwd` — so those two are inert defence.)
 HERE="$(CDPATH= cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)"
 
 log_line()  { printf '%s\n' "$*"; }
