@@ -25,7 +25,8 @@ import {
   rebaseFetchTarget,
   rebaseTargetToken,
   isAllowedRebaseTarget,
-  defaultBranchOf,
+  CHECKER_BASE_REF,
+  rebaseAddTargets,
   checkpointWriteTargetAllowed,
   conflictedPaths,
   _setConflictedProbeForTest,
@@ -671,20 +672,15 @@ const REMOTES = ["origin", "upstream"];
 for (const cmd of [
   "git fetch",
   "git fetch origin",
-  "git fetch origin/main",
   "git fetch upstream",
   "git rebase origin/main",
   "git rebase --autostash origin/main",
-  "git rebase upstream/main",
   "git rebase --continue",
   "git rebase --abort",
   "git rebase --skip",
   "git status",
   "git diff",
   "git diff origin/main",
-  "git add src/a.ts",
-  "git add src/a.ts src/b.ts",
-  "git add .",
 ]) {
   await test(`ALLOWED (remedy): ${cmd}`, () => {
     _setRemotesProbeForTest(() => REMOTES);
@@ -770,6 +766,13 @@ for (const cmd of [
   "git rebase evil",
   "git fetch origin/../../evil-bare",
   "git fetch origin//main",
+  "git fetch origin/main",               // round 7, F3: a REPOSITORY positional, not a ref
+  "git rebase upstream/main",            // round 7, F5: only the base C4 measures can clear C4
+  // round 7, F1 — `git rebase --continue` IS A COMMIT, so `git add` outside the
+  // unmerged set would stage and land the lane's uncommitted implementation.
+  "git add src/a.ts",
+  "git add .",
+  "git add --all",
 ]) {
   await test(`BLOCKED (not the remedy / code-exec vector): ${cmd.replace(/\n/g, "\\n").replace(/\t/g, "\\t")}`, () => {
     _setRemotesProbeForTest(() => REMOTES);
@@ -810,7 +813,7 @@ await test("#1418 F1 (round 5): `git fetch <path>` is refused, so the fetch→re
     ok(rebaseFetchTarget("git fetch  origin") === "origin", "doubled space after `fetch` still parses the token");
     _setRemotesProbeForTest(() => REMOTES);
     ok(isConfiguredFetchSource("origin"), "a configured remote is a source");
-    ok(isConfiguredFetchSource("origin/main"), "a ref on a configured remote is a source");
+    ok(!isConfiguredFetchSource("origin/main"), "a REPOSITORY positional with a slash is not (round 7, F3: git reads it as the path ./origin/main)");
     ok(!isConfiguredFetchSource("evil"), "a relative path is not");
     ok(!isConfiguredFetchSource("tmp/evil"), "a path whose first segment is not a remote is not");
     ok(!isConfiguredFetchSource("/tmp/evil"), "an absolute path is not");
@@ -836,7 +839,6 @@ await test("#1418 F1 (round 6): the rebase TARGET is bound to the ref C4 measure
     for (const cmd of [
       "git rebase origin/main",
       "git rebase --autostash origin/main",
-      "git rebase upstream/main",
       "git rebase --continue",
       "git rebase --abort",
       "git rebase --skip",
@@ -847,6 +849,7 @@ await test("#1418 F1 (round 6): the rebase TARGET is bound to the ref C4 measure
     for (const target of [
       "FETCH_HEAD",                 // the round-5 exploit's landing pad
       "origin/ai-3175",             // an agent-pushed lane branch
+      "upstream/main",              // round 7, F5: another remote cannot clear C4
       "upstream/feature",
       "refs/heads/main",
       "refs/remotes/origin/main",
@@ -866,11 +869,46 @@ await test("#1418 F1 (round 6): the rebase TARGET is bound to the ref C4 measure
     equal(rebaseTargetToken("git rebase origin/main"), "origin/main");
     equal(rebaseTargetToken("git rebase --autostash origin/main"), "origin/main");
     equal(rebaseTargetToken("git rebase --continue"), null, "a continuation flag is not a target");
-    ok(isAllowedRebaseTarget("origin/main"), "the base of a configured remote is allowed");
+    ok(isAllowedRebaseTarget("origin/main"), "the base C4 measures is allowed");
     ok(!isAllowedRebaseTarget("origin/ai-3175"), "another branch of the same remote is not");
+    ok(!isAllowedRebaseTarget("upstream/main"), "another remote is not (C4 measures origin/main only)");
     ok(!isAllowedRebaseTarget("evil/main"), "a non-remote prefix is not");
-    equal(defaultBranchOf("origin"), "main", "the fallback base is the checker's own (origin/main)");
+    equal(CHECKER_BASE_REF, "origin/main", "the bound is the checker's own base ref");
   } finally { _setRemotesProbeForTest(null); }
+});
+
+// #1418 review round 7, F1 — THE LANDING CHAIN. `git add` was unbounded and the
+// comment justified it with "`git commit` stays blocked, so this can never land
+// anything" — but `git rebase --continue` IS the commit. Composed, the two
+// admitted commands staged the lane's uncommitted implementation and committed
+// it, which is exactly the work this checkpoint holds back until CLEAR. `git add`
+// now carries the same UNMERGED bound as `git rm`.
+await test("#1418 F1 (round 7): `git add` outside the unmerged set is refused, so add→--continue cannot land the implementation", () => {
+  _setTokenFileForTest(null);
+  const step = makeStep({ name: "check", gate: "checkpoint", token_phase: "implement" });
+  try {
+    _setConflictedProbeForTest(() => ["shared.txt"]);
+    // the conflict resolution itself is admitted (that is what the escape is for)
+    ok(!validateToolCall("bash", "git add shared.txt", step, "gate").block, "staging the conflict resolution is the remedy");
+    ok(!validateToolCall("bash", "git  add shared.txt", step, "gate").block, "doubled space still parses (round 7, F4)");
+    ok(!validateToolCall("bash", "git   add shared.txt", step, "gate").block, "three spaces also parse — the OLD slice produced ['m','shared.txt'] here");
+    // the implementation is not
+    for (const cmd of [
+      "git add src_impl.txt",
+      "git add src_impl.txt another_impl.ts",
+      "git add .",
+      "git add shared.txt src_impl.txt",
+    ]) {
+      const r = validateToolCall("bash", cmd, step, "gate");
+      ok(r.block, `staging outside the unmerged set is refused: ${cmd}`);
+    }
+    const named = validateToolCall("bash", "git add src_impl.txt", step, "gate");
+    ok((named.reason || "").includes("UNMERGED"), `the refusal names the bound: ${named.reason}`);
+    ok((named.reason || "").includes("COMMIT"), "...and explains WHY (--continue is a commit)");
+    // the target extractor is capture-based, so three spaces cannot shift the parse
+    deepEqual(rebaseAddTargets("git   add shared.txt", process.cwd()), [resolve("shared.txt")], "three spaces parse to the same target");
+    deepEqual(rebaseAddTargets("git add", process.cwd()), null, "no targets is not a match");
+  } finally { _setConflictedProbeForTest(null); }
 });
 
 await test("#1418 the remedy is NOT phase-gated (a git command carries no phase — the wrong-phase guard must not fire)", () => {

@@ -1331,7 +1331,10 @@ export const CHECKPOINT_WHITESPACE_REJECT = /[^\S\u0020]|[\u200B-\u200D\u2060\u0
 //     already prescribed rather than a new verb (`git commit`/`stash`/`checkout`
 //     stay blocked, so the remedy still cannot land or discard anything).
 //   * `git add PATHS` — stages a conflict resolution before `--continue`.
-//     Index-only; `git commit` stays blocked, so this can never land anything.
+//     Index-only; `git commit` stays blocked — BUT `git rebase --continue` IS a
+//     commit, so `git add` is bounded to the UNMERGED set exactly like `git rm`
+//     (review round 7, F1): otherwise `git add .` + `--continue` lands the lane's
+//     uncommitted implementation, which is the work this checkpoint holds back.
 //   * `edit` / `write` while a rebase is IN PROGRESS, TARGET-SCOPED — without
 //     them the conflict path is the same circle one level deeper (review F1):
 //     `git rebase` only REPLAYS, `git add` only stages what is already on disk,
@@ -1380,13 +1383,40 @@ export const CHECKPOINT_REMEDY_RE = new RegExp(
 // delete/modify or rename/delete conflict, so it is admitted — but only for the
 // paths git currently reports as UNMERGED (`rebaseWriteTargets` below). That is
 // what keeps it from becoming a general "delete any tracked file" verb.
-export const CHECKPOINT_REMEDY_RM_RE = new RegExp(`^git[ ]+rm[ ]+${_PATH}(?:[ ]+${_PATH})*$`);
+// ⛔ `git add` IS BOUNDED TO THE UNMERGED SET, EXACTLY LIKE `git rm` (review round 7,
+// F1 — a P1 hole in the declared T3 class). The old comment said "Index-only;
+// `git commit` stays blocked, so this can never land anything", and that is FALSE:
+// **`git rebase --continue` IS the commit.** Measured: at a stopped rebase, the two
+// admitted commands `git add .` then `git rebase --continue` commit the lane's
+// uncommitted implementation — the exact work this checkpoint exists to hold back
+// until the checker is CLEAR. Staging is only needed for a CONFLICT resolution,
+// and a conflicted path is by definition unmerged, so the bound costs the remedy
+// nothing. (Residual, declared: content the lane WRITES into a conflicted file is
+// still carried into the replayed commit by `--continue` — inherent to conflict
+// resolution, and the step still cannot ADVANCE without a fresh CLEAR token.)
+export const CHECKPOINT_REMEDY_ADD_RE = new RegExp(`^git[ ]+add[ ]+(${_PATH}(?:[ ]+${_PATH})*)$`);
+export const CHECKPOINT_REMEDY_RM_RE = new RegExp(`^git[ ]+rm[ ]+(${_PATH}(?:[ ]+${_PATH})*)$`);
+
+// Targets captured from a `git add` / `git rm`, so a doubled space cannot shift the
+// parse (review round 7, F4 — the sibling of the fetch defect round 6 fixed).
+function remedyPathTargets(re: RegExp, command: unknown, cwd: string): string[] | null {
+  if (typeof command !== "string") return null;
+  const m = re.exec(command);
+  if (!m || m[1] === undefined) return null;
+  return m[1].split(" ").filter((p) => p !== "").map((p) => resolve(cwd, p));
+}
+export function rebaseAddTargets(command: unknown, cwd: string = process.cwd()): string[] | null {
+  return remedyPathTargets(CHECKPOINT_REMEDY_ADD_RE, command, cwd);
+}
+export function rebaseRmTargets(command: unknown, cwd: string = process.cwd()): string[] | null {
+  return remedyPathTargets(CHECKPOINT_REMEDY_RM_RE, command, cwd);
+}
 
 // #1418 (review round 5, F1): the `git fetch <remote>` token, so the decision
 // point can check it is a CONFIGURED remote. Lexically `git fetch evil` is
 // indistinguishable from `git fetch <a relative path>`, and that is precisely
 // the hole — a path is a fetch source that injects unreviewed commits.
-export const CHECKPOINT_REMEDY_FETCH_RE = new RegExp(`^git[ ]+fetch[ ]+${_REF}$`);
+export const CHECKPOINT_REMEDY_FETCH_RE = new RegExp(`^git[ ]+fetch[ ]+(${_REF})$`);
 export function rebaseFetchTarget(command: unknown): string | null {
   if (typeof command !== "string") return null;
   // Capture the token rather than slicing a fixed prefix (review round 6, F6):
@@ -1419,31 +1449,16 @@ function isPathShapedRef(token: string): boolean {
   return token.includes("..") || token.startsWith("/") || token.endsWith("/") || token.includes("//");
 }
 
-// The default branch of a configured remote, as git records it (`refs/remotes/<r>/HEAD`).
-// When it is not resolvable, fall back to `main` — the branch the checker itself
-// names (`pickaxe(..., "origin/main")`), so the remedy matches the verdict's own base.
-export function defaultBranchOf(remote: string, cwd: string = process.cwd()): string {
-  try {
-    const out = execFileSync("git", ["symbolic-ref", "--short", `refs/remotes/${remote}/HEAD`], {
-      cwd, encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"], timeout: 5000,
-    }).trim();
-    const i = out.indexOf("/");
-    if (i > 0 && i + 1 < out.length) return out.slice(i + 1);
-  } catch { /* no remote HEAD ref — fall through to the checker's own base */ }
-  return "main";
-}
-
-// The rebase target the remedy is allowed to name: `<configured-remote>/<that
-// remote's default branch>`. Everything else — `FETCH_HEAD`, `refs/heads/...`, a
-// bare branch, another branch of the same remote, a path spelling — is refused.
-export function isAllowedRebaseTarget(token: string, cwd: string = process.cwd()): boolean {
-  if (isPathShapedRef(token)) return false;
-  const slash = token.indexOf("/");
-  if (slash <= 0 || slash === token.length - 1) return false;
-  const remote = token.slice(0, slash);
-  const branch = token.slice(slash + 1);
-  if (!configuredRemotes(cwd).includes(remote)) return false;
-  return branch === defaultBranchOf(remote, cwd);
+// ⛔ THE BASE IS THE REF C4 MEASURES, LITERALLY (review round 7, F5). The checker
+// measures exactly one ref — `parallel_work_check.py:404`
+// `rev-list --count HEAD..origin/main` (and `:893/:922/:927/:934`) — so
+// `<remote>/<any default branch>` was still too broad: a lane with an `upstream`
+// remote could run an admitted rebase onto `upstream/main` that can never clear
+// C4. If the checker's base ever changes, this bound fails CLOSED (remedy
+// refused, escalate) rather than open.
+export const CHECKER_BASE_REF = "origin/main";
+export function isAllowedRebaseTarget(token: string): boolean {
+  return token === CHECKER_BASE_REF;
 }
 // The configured remote names for this checkout. Fail-closed: an unreadable git
 // dir yields [] and every `git fetch <token>` is refused (bare `git fetch` still
@@ -1470,15 +1485,12 @@ export function configuredRemotes(cwd: string = process.cwd()): string[] {
 // `evil` and `tmp/evil` all fail, which is the whole point (round 5, F1).
 export function isConfiguredFetchSource(token: string, cwd: string = process.cwd()): boolean {
   if (isPathShapedRef(token)) return false;
-  const remotes = configuredRemotes(cwd);
-  if (remotes.includes(token)) return true;
-  const slash = token.indexOf("/");
-  return slash > 0 && remotes.includes(token.slice(0, slash));
-}
-export function rebaseRmTargets(command: unknown, cwd: string = process.cwd()): string[] | null {
-  if (typeof command !== "string" || !CHECKPOINT_REMEDY_RM_RE.test(command)) return null;
-  const paths = command.slice("git rm ".length).split(" ").filter((p) => p !== "");
-  return paths.map((p) => resolve(cwd, p));
+  // A bare remote NAME only (review round 7, F3): `git fetch`'s first positional
+  // is a REPOSITORY, so `git fetch origin/main` is read by git as the PATH
+  // `./origin/main` (measured: "fatal: 'origin/main' does not appear to be a git
+  // repository"). A remote name cannot contain `/`, so a slash means a path.
+  if (token.includes("/")) return false;
+  return configuredRemotes(cwd).includes(token);
 }
 
 // #357 (d): non-bash escape tools + bash sole-command checker. Malformed bash
@@ -2568,16 +2580,24 @@ export function validateToolCall(
       // any other branch of the remote are not.
       const rebaseTarget = toolName === "bash" ? rebaseTargetToken(command) : null;
       if (rebaseTarget !== null && !isAllowedRebaseTarget(rebaseTarget)) {
-        return { block: true, reason: `⛔ checkpoint gate — \`git rebase\` is admitted only onto the base C4 measures: \`<remote>/<that remote's default branch>\` (e.g. \`origin/main\`). "${rebaseTarget}" is not that ref — a rebase onto content nobody reviewed is a way to rewrite the checker, so it is refused` };
+        return { block: true, reason: `⛔ checkpoint gate — \`git rebase\` is admitted only onto the base C4 measures, \`${CHECKER_BASE_REF}\`. "${rebaseTarget}" is not that ref — a rebase onto content nobody reviewed is a way to rewrite the checker, so it is refused` };
       }
-      // #1418 (round 4, F3): `git rm` is bounded to the UNMERGED set — the
-      // deletions a stopped rebase is actually asking about.
-      const rmTargets = toolName === "bash" ? rebaseRmTargets(command) : null;
-      if (rmTargets) {
+      // #1418 (round 7, F1): `git add` AND `git rm` are bounded to the UNMERGED SET.
+      // `git rm` needed it because it deletes (round 4, F3); `git add` needs it
+      // because **`git rebase --continue` is a commit** — so `git add .` followed by
+      // `--continue` stages and lands the lane's uncommitted implementation, the
+      // exact work this checkpoint holds back until the checker is CLEAR. Staging
+      // is only needed for a conflict resolution, and a conflicted path is unmerged.
+      const pathTargets = toolName === "bash"
+        ? (rebaseAddTargets(command) !== null ? { verb: "git add", paths: rebaseAddTargets(command)! }
+          : rebaseRmTargets(command) !== null ? { verb: "git rm", paths: rebaseRmTargets(command)! }
+          : null)
+        : null;
+      if (pathTargets) {
         const unmerged = conflictedPaths();
-        const stray = rmTargets.filter((t) => !unmerged.includes(t));
+        const stray = pathTargets.paths.filter((t) => !unmerged.includes(t));
         if (stray.length > 0) {
-          return { block: true, reason: `⛔ checkpoint gate — \`git rm\` is admitted only for an UNMERGED path during a rebase; not unmerged: ${stray.join(", ")}` };
+          return { block: true, reason: `⛔ checkpoint gate — \`${pathTargets.verb}\` is admitted only for an UNMERGED path during a rebase; not unmerged: ${stray.join(", ")}. Staging is the conflict resolution; \`git rebase --continue\` is a COMMIT, so staging anything else would land unreviewed work` };
         }
       }
       // #357 (Task 7): wrong-phase guard (checkpoint_token_fresh extension) —
