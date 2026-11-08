@@ -5910,8 +5910,16 @@ async function main() {
 
     const audit = readAuditLines();
     const forB = (e: string) => audit.filter((l) => l.event === e && String(l.root ?? "").endsWith("wt-1265-b") && String(l.session_cwd ?? "").startsWith(realB));
-    equal(forB("gate_recovery").length, 0,
-      "1265a: worktree B must NOT record a recovery count — pre-fix it merged A's entry and audited gate_recovery with A's count");
+    // The DURABLE half, asserted in the shape that CAN hold. `gate_recovery` now
+    // carries the root it recovered for, so the inspection merge is recorded
+    // against A and never against B. This is fail-able in both directions: with no
+    // `root` field (the pre-fix record) the A-keyed count is 0, and a partial
+    // revert that COUNTS the sibling emits it twice. Filtering on B alone could
+    // never see either — that was a dead assertion.
+    equal(audit.filter((l) => l.event === "gate_recovery" && String(l.root ?? "") === realA).length, 1,
+      "1265a: the inspection merge must record exactly ONE gate_recovery against the SIBLING root it recovered for");
+    equal(audit.filter((l) => l.event === "gate_recovery" && String(l.root ?? "") === realB).length, 0,
+      "1265a: worktree B must claim NO recovery count of its own — a sibling's entries are not this session's verified state");
     // The other half of the same defect: B has no entries of its own, so the
     // durable zero-entry record must exist for B's own root.
     equal(forB("gate_recovery_empty").length, 1,

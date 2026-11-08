@@ -497,7 +497,8 @@ function recoveryOnlyRoot(root: string): string {
 // repeats — the hub/linked-worktree case #3255 exists for ALTERNATES roots (a bare
 // `git push` resolves the hub, `git -C <worktree>` resolves the worktree), so the
 // same pair was re-recorded on every alternation, unbounded. A session with three
-// worktrees (A verified, B and C not) records each of B and C exactly once.
+// worktrees (A verified, B and C not) records each of B and C exactly once, which
+// e2e 1265a now exercises by alternating B -> C -> B inside one session.
 const recordedRootMismatches = new Set<string>();
 function diagnoseRootMismatch(root: string): void {
   const roots = bridgeRoots();
@@ -508,9 +509,11 @@ function diagnoseRootMismatch(root: string): void {
   const siblings = roots.filter((r) => gitCommonDir(r) === mine);
   if (siblings.length === 0) return;
   // The SAFE remedy comes FIRST. "re-run the op from the verified tree (cd into
-  // it)" used to lead, and it is not merely unhelpful — a task child that follows
-  // it walks into a tree it does not own (#1265 measured three children that did
-  // exactly that and died). The followable remedy is a verifier dispatch for THIS
+  // it)" used to lead, and it is not merely unhelpful — the FIRST of three
+  // consecutive children that died in one worktree followed it into a tree it did
+  // not own (issue #1265: "doing so is what the first child did, after which it too
+  // was killed"; the three deaths are attributed there to per-worktree
+  // determinism). The followable remedy is a verifier dispatch for THIS
   // root; adoption is named as refused-by-design so nobody re-proposes it.
   console.log(
     `[verification-gate] ⚠ #3255/#1265: this git op resolves to ${norm}, but the bridge holds verified entries for ` +

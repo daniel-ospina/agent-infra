@@ -1,5 +1,5 @@
 <!-- research-path: https://github.com/daniel-ospina/agent-infra/issues/1265#issuecomment-6722549255 -->
-<!-- plan-review: cycles=0, status=pending, version=2.3.0 -->
+<!-- plan-review: cycles=2, status=capped, exit_reason=adversarial-capped, version=2.3.0 -->
 
 # #1265 — session-start recovery counts a *sibling* worktree's entries, and the non-adoption never reaches the parent
 
@@ -8,10 +8,13 @@
 ## Confirmed problem
 
 The issue's headline ("the gate adopts ANOTHER worktree's root as the git-op root") is **no longer
-true**: PR #1780 (merged, `26ad39a33`) makes `recoveryOnlyRoot` message-only and the git-op root has
-been the command's own cwd since the first #3255 attempt — the `tool_call` handler's git-op path never
-routes the git-op root through any bridge-derived helper (`const cwd = resolveGitRoot(cdPath ?? inputCwd)`),
-and `pickVerifiedRoot` is documented RECOVERY-ONLY.
+true**, and that is provable from this tree rather than from a commit that is not in this branch's
+history: `recoveryOnlyRoot` is **inspection-only** — its return never becomes a git-op root and never
+becomes the reported count — the `tool_call` handler's git-op path is
+`const cwd = resolveGitRoot(cdPath ?? inputCwd)`, and `pickVerifiedRoot` is documented
+RECOVERY-ONLY. (The narration `"…the git-op root is NOT adopted"` reached `origin/main` in
+`6580850cc`, #3334. PR #1780 is an unmerged side branch in this tree, so it is **not** cited as this
+head's evidence.)
 
 Two acceptance indicators in the issue are nevertheless still unmet at this head:
 
@@ -41,15 +44,37 @@ only root whose entries can cover this session's git ops, and the report must sa
 2. **Make the parent read `gate-events.jsonl` in the `task` return value.** Deferred, not rejected:
    it is a `extensions/builtin-tools` change (a different extension, a different test surface, and a
    risk of touching the dispatch return contract). AC (b) accepts "a **shared log**", and
-   `~/.pi/agent/audit/gate-events.jsonl` already has readers in this repo (`scripts/registry-sync.sh`,
-   `scripts/admin-merge.sh`, `extensions/review-enforcer`). Recorded as a named residual.
+   `~/.pi/agent/audit/gate-events.jsonl` is that log. Note what this buys and what it does not:
+   **no PRODUCTION consumer of that file exists in this repo.** Its only readers are in-repo test
+   helpers — `extensions/shared/audit-log.test.ts` (which asserts `gateEventsFile()` itself),
+   `extensions/verification-gate/index.e2e.test.ts`'s `readAuditLines()`, and
+   `extensions/review-enforcer/index.test.ts` — and each of them filters by `event`; `gateEventsFile()`
+   has exactly one production caller, `appendJsonl`. So the record is durable and greppable by a
+   parent or a future reader, not consumed by a production instrument today. Recorded as a named
+   residual.
 3. **Change root selection back to adoption.** Refused flat: it re-opens the fail-open documented in
    `pickVerifiedRoot`'s docblock (a clean adopted tree yields an EMPTY scope, and the empty-scope path
    ALLOWS an op carrying unverified content).
 4. ✅ **Recover this worktree's own root first and report THAT count; merge the sibling's entries for
    INSPECTION only, record that decision durably, and give the root-mismatch diagnosis a durable
-   record too.** Smallest change that satisfies AC (a), (b) and (c) without touching root selection
-   or the block/mismatch decision (both stay fail-closed and byte-identical).
+   record too.** This does not touch root selection or the block/mismatch decision (both stay
+   fail-closed and unchanged). It also rewrites the mismatch remedy, which no AC literally demands:
+   that is justified on its own measurement — the previous text ("re-run the op from the verified tree
+   (cd into it)") **led the first of three consecutive children that died in that worktree into a tree
+   it did not own** (issue #1265: "doing so is what the first child did, after which it too was
+   killed"; the three deaths are attributed there to per-worktree determinism, not to three separate
+   followers of the remedy) — and it is the smallest edit that stops prescribing that path.
+
+### Acceptance criteria (the issue's, quoted so the plan can be checked against them)
+
+- **AC (a)** a git op in a worktree with no bridge entries **fails closed** with the correct root
+  named, and does not adopt another worktree's registry. *Already true at this head; the change must
+  not weaken it — e2e 1265a asserts B's commit stays `block === true` after A's entries were
+  inspected.*
+- **AC (b)** the adoption/skip decision is visible outside child stdout — "task return value **or a
+  shared log**". *This plan takes the shared-log arm.*
+- **AC (c)** a worktree that previously had no entries can be verified and used normally afterwards,
+  with no temp-path/sibling root ever substituted — e2e 1265a: only B's own PASS allows the op.
 
 ## Complexity + domains
 
@@ -62,8 +87,8 @@ only root whose entries can cover this session's git ops, and the report must sa
 |---|---|---|
 | `session_start` handler | unit-of-behaviour | e2e scenario 1265a (real linked worktrees + real bridge) |
 | `diagnoseRootMismatch` → `tool_call` git-op path | unit-of-behaviour | e2e scenario 1265a (block + audit record + reworded remedy) |
-| `appendJsonl` / `GateEventName` union (`extensions/shared/audit-log.ts`) | type + contract | type-only; readers tolerate unknown events by contract |
-| source pins ("#3255 policy" test in `index.test.ts`) | structural | updated pins (own-root count, durable-record root, remedy wording) |
+| `appendJsonl` / `GateEventName` union (`extensions/shared/audit-log.ts`) | type + contract | **documentation-only**: `appendJsonl` takes `Record<string, unknown>`, the repo has no `tsconfig.json`, and no roster pin exists — the union edit cannot be type-enforced (see step 3) |
+| source pins ("#3255 policy" test in `index.test.ts`) | structural | five pins across this PR — own-root declaration, own-root COUNT, durable-record `root`, rendered-remedy absence, followable-remedy presence |
 | `recoverBridgeForRoot` perf fast-path (`lastRecoveryMtime`) | regression | existing e2e scenario 16 (first_push mid-session bridge recovery) |
 
 ## Research
@@ -84,8 +109,8 @@ roots and 20+ tortoise roots in the live bridge), so this is the narrow one-sibl
 | `diagnoseRootMismatch(root)` — 1 call site, the git-op path | narrates a root mismatch; gains the durable `gate_root_mismatch` record + dedupe. Block decision untouched. |
 | `bridgeRoots()` | reads the bridge's PASS roots; unchanged. |
 | `gitCommonDir(root)` | same-repo test (`--git-common-dir`); unchanged. |
-| `appendJsonl(entry, file?)` — `extensions/shared/audit-log.ts` | appends to `~/.pi/agent/audit/gate-events.jsonl`; **four** new event names added to `GateEventName` (`gate_recovery`, `gate_recovery_empty`, `gate_recovery_foreign_root`, `gate_root_mismatch`). `gate_recovery` now carries the `root` it recovered for, so an inspection merge can never be read as an own-root count. |
-| readers of `gate-events.jsonl`: `scripts/registry-sync.sh`, `scripts/admin-merge.sh`, `extensions/review-enforcer` | they select by `event`/`reason` and must tolerate unknown events (documented contract in `audit-log.ts:20-24`); additive names are inert to them. |
+| `appendJsonl(entry, file?)` — `extensions/shared/audit-log.ts` | appends to `~/.pi/agent/audit/gate-events.jsonl`; **four** new event names added to `GateEventName` (`gate_recovery`, `gate_recovery_empty`, `gate_recovery_foreign_root`, `gate_root_mismatch`). `gate_recovery` carries the `root` it recovered for, so an inspection merge is **attributable** to the SIBLING root. It is not un-attributable by `session_cwd`: that field still names the inspecting session, so a session-keyed reader must select on `root`. |
+| `gate-events.jsonl` consumers | **no production consumer** — `gateEventsFile()` has one production caller (`appendJsonl`); the only readers are in-repo TEST helpers (`audit-log.test.ts`, `index.e2e.test.ts`'s `readAuditLines()`, `review-enforcer/index.test.ts`), each selecting by `event`. An external reader selects by `event`/`reason` and must tolerate unknown **fields** (`audit-log.ts` header); the header's `event —` line is a stale closed enumeration (pre-existing) that names none of the four new events. |
 | `extensions/verification-gate/index.e2e.test.ts`, `index.test.ts` | run by `ci-main.yml` (`npx tsx …`) — no new file, so no CI-surface registration applies (this repo has no `config/ci-surfaces.yml`). |
 
 ## Implementation steps
@@ -96,23 +121,38 @@ roots and 20+ tortoise roots in the live bridge), so this is the narrow one-sibl
    Report `recovered` as this worktree's count (naming the root); the `else if (isTaskSubAgent())`
    zero-entry warning is now reachable whenever this worktree has none. When `inspected > 0`, log that
    the entries are INSPECTION ONLY / inert here and append `gate_recovery_foreign_root`.
-   *Proves it:* e2e 1265a — no `gate_recovery` line for worktree B, one `gate_recovery_foreign_root`.
+   *Proves it:* e2e 1265a — exactly ONE `gate_recovery` keyed on **worktree A** (the sibling it
+   recovered for) and NONE keyed on B, one `gate_recovery_foreign_root`, and one durable
+   `gate_recovery_empty` for B (the #264 P2 signal the pre-fix run suppressed).
 2. **`diagnoseRootMismatch`**: keep the narration, put the **safe** remedy first
    ("re-dispatch verification for `<this root>`") and state that adopting another tree's entries is
    refused by design; append `gate_root_mismatch` once per `(root, siblings)` fingerprint, reset at
    `session_start`.
-   *Proves it:* e2e 1265a — two identical blocked ops produce exactly one record.
+   *Proves it:* e2e 1265a — two identical blocked ops produce exactly one record. The `Set`-of-
+   fingerprints memo and the `.sort()` on the sibling list are a **refinement with no test of its own**:
+   1265a has one sibling, so it exercises one fingerprint and a one-element sort, which a single-slot
+   memo would pass equally. Stated as untested rather than claimed as covered.
 3. **`extensions/shared/audit-log.ts`**: add `gate_recovery`, `gate_recovery_empty`,
    `gate_recovery_foreign_root`, `gate_root_mismatch` to `GateEventName` (the first two were already
    emitted untyped — a pre-existing gap closed while adjacent).
-   *Proves it:* typecheck (tsx import) + no reader regression (`registry-sync`/`admin-merge` untouched).
+   *Proves it:* **nothing type-enforces this** — `appendJsonl` takes `Record<string, unknown>`, the
+   repo has no `tsconfig.json`, and no roster pin exists (the union already carries names outside it,
+   recorded in the #634 plan). The edit is documentation: it **extends the union with four names**; the
+   header's `event —` enumeration at the top of the file was already stale (it lists seven names and
+   omits `reviewer_preflight`, `bridge_clear`, `review_spawn_no_verdict`, `gh_shim_degraded` too) and
+   stays stale here. A roster pin (emit-site `event:` literals ⊆ `GateEventName`) is the check that
+   could fail, and is NOT added here.
 4. **Tests**: e2e scenario 1265a appended to `index.e2e.test.ts` (the file's own sequential harness
    with real `git worktree` pairs and a temp `HOME`), run as a TASK CHILD so the second half of the
-   defect (the suppressed #264 P2 zero-entry warning) is reachable; the "#3255 policy" pin in
-   `index.test.ts` extended with three structural pins — the own-root COUNT expression, the durable
-   `gate_recovery` record's `root` field, and the remedy wording (the un-followable `cd into it`
-   remedy must stay absent). `recoverBridgeForRoot`'s `gate_recovery` record now carries the `root`
-   it recovered for, so an inspection merge can never be read as an own-root count.
+   defect (the suppressed #264 P2 zero-entry warning) is reachable; the "#3255 policy" test in
+   `index.test.ts` **gains five structural pins and inverts one prior pin** across this PR — the
+   own-root declaration, the own-root COUNT expression, the durable `gate_recovery` record's `root`
+   field, the absence of the rendered `cd into it` remedy, and the presence of the followable remedy
+   plus "refused by design"; and `origin/main`'s must-EXIST `sessionRoot` pin becomes a must-NOT-exist
+   pin (six changed pin sites, not five).
+   `recoverBridgeForRoot`'s
+   `gate_recovery` record now carries the `root` it recovered for, so an inspection merge is recorded
+   against the sibling root — never read as an own-root count.
 5. **Verification**: full `index.test.ts` (baseline 317) + `index.e2e.test.ts` (baseline 119; 120 with
    1265a) must be green; mutation proof — a PARTIAL revert (count from the inspected sibling while
    keeping the foreign-root record) must turn 1265a red, and dropping the `root` field must turn the
@@ -120,7 +160,20 @@ roots and 20+ tortoise roots in the live bridge), so this is the narrow one-sibl
 
 ## Rounds
 
-Filled at PLAN-VERIFY close.
+**Exit: `capped` — the adversarial bound (2 cycles) is spent, and both cycles found real defects.** This
+marker is deliberately NOT `clean`; the residual class below is named rather than closed.
+
+| Cycle | Reviewer | Issues | Disposition |
+|---|---|---|---|
+| 1 | fresh-context plan reviewer | 6 (2×P1, 4×P2) | all applied — R5's false "readers" claim, "Proves it: typecheck" for an unenforced union, pin count, a citation that is not in `origin/main`, undefined ACs + unjustified remedy rewrite, the out-of-vocabulary marker |
+| 2 | fresh-context plan reviewer | 8 (2×P1, 6×P2) | all applied — the reader inventory corrected in the OTHER direction (test helpers do read the log), the `Set`/`sort` refinement restated as untested, `#1780` replaced by the commit actually in `main` (`6580850cc`), the stale header enumeration stated as stale, `session_cwd` attribution corrected, "message-only" → "inspection-only", the #1265 measurement corrected (the FIRST of three dead children followed the `cd` remedy — not three), and the inverted prior pin counted |
+| 3 | fresh-context verification of the cycle-2 fixes | — | verdict recorded as the PR review comment on this PR |
+
+**Named residual (not closed):** R5 asks whether a consumer of `gate-events.jsonl` mis-reads the new
+names or the changed `gate_recovery` payload. There is no production consumer in this repo, so no test
+can go red for it; the evidence is an inventory of the in-repo test readers plus the header's
+reader contract. Filing a roster pin (emit-site `event:` literals ⊆ `GateEventName`) is the check that
+*could* fail and is left as follow-up work rather than smuggled into a reporting fix.
 
 ### Review Scope Contract
 **Class:** gate-enforcement
@@ -138,14 +191,22 @@ Filled at PLAN-VERIFY close.
   and must state that adoption is refused by design. (The *block reason* does not carry a root in this
   scenario — the sibling holds a DIFFERENT path, so `rootsHoldingPath` returns nothing to name; the
   remedy line is the right evidence for R3.) Additionally pinned at source level in `index.test.ts`:
-  the old "re-run the op from the verified tree" wording must be absent.
+  the rendered form `(cd into it)` must be absent from every message string — the historical mention
+  in the docblock wraps across lines, so it does not match that pin.
 - **R4** The `lastRecoveryMtime`/`lastRecoveredRoot` fast path is disturbed so a
   mid-session bridge write is no longer seen → caught by the pre-existing e2e scenario 16
   (externally-written bridge recovered mid-session) staying green.
-- **R5** A consumer of `gate-events.jsonl` (registry-sync, admin-merge, review-enforcer) mis-reads the
-  new event names → caught by those scripts' own suites
-  (`scripts/registry-sync.sh` / `admin-merge` tests) staying green; the additive-name contract is
-  documented in `audit-log.ts`.
+- **R5** A consumer of `gate-events.jsonl` mis-reads the new names, or the changed `gate_recovery`
+  payload (it now carries `root`) → **no PRODUCTION consumer exists in this repo**, so the only
+  evidence obtainable is the inventory itself: `gateEventsFile()` has one production caller
+  (`appendJsonl`, `audit-log.ts:81`); the other references are in-repo TEST helpers that read the file
+  (`extensions/shared/audit-log.test.ts`, `extensions/verification-gate/index.e2e.test.ts`'s
+  `readAuditLines()`, `extensions/review-enforcer/index.test.ts`), plus prose in
+  `scripts/vgate.sh`/`scripts/registry-sync.sh`/`scripts/admin-merge.sh`. Those helpers select by
+  `event`, so they are the closest thing to a regression check and they stay green.
+  `audit-log.ts`'s header binds a reader to tolerate unknown **fields**; its `event —` line is a stale
+  closed enumeration (pre-existing) that names none of the four new events. Recorded as a residual, not
+  as a passing test.
 
 **Threat classes** (gate-enforcement):
 - `T1 an op carrying unverified content is ALLOWED because recovery counted a foreign root` → covered
@@ -156,9 +217,10 @@ Filled at PLAN-VERIFY close.
 **Out of scope — must NOT be raised** (note, file, do not chase):
 - the `task` **return value** channel (a `builtin-tools` change) — named as a residual in the research
   artifact and followed up as its own issue;
-- root selection / adoption policy (#1780 settled the message; #1303's own correction records the
-  keying as intended);
+- root selection / adoption policy (the narration on `origin/main` came from `6580850cc`; #1780 is
+  an unmerged side branch, and #1303's own correction records the keying as intended);
 - the `#1303` block-message root-naming work, and any prose preference about `#3255` numbering;
 - pre-existing defects outside this diff.
 
-**Acceptance:** every `R<n>` has its named evidence, and no open item remains on the declared surface.
+**Acceptance:** every `R<n>` that is test-backed names a test that CAN fail (R1-R4), R5 is an
+inventory-backed residual stated as such, and no open item remains on the declared surface.

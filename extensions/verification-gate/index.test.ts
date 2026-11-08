@@ -3802,18 +3802,20 @@ test("#3255 policy: the git-op root is authoritative — adoption must never gat
   // The DURABLE half must name its root too: `recoverBridgeForRoot` is called for
   // the own root AND (inspection only) for a sibling, so an emit without `root`
   // is indistinguishable between the two — restoring the false claim in
-  // gate-events.jsonl. The e2e assertion that B records no `gate_recovery` is
-  // only fail-able while this field exists.
+  // gate-events.jsonl. The e2e assertion is the behavioural parity: it counts the
+  // record against the SIBLING root it must name (0 while the field is absent) and
+  // asserts no record claims the session's own root.
   ok(
     /event: "gate_recovery"[^}]*?root: normRoot/.test(src),
     "the durable gate_recovery record must name the root it recovered for",
   );
-  // #1265 AC (b)/R3: "re-run the op from the verified tree (cd into it)" led
-  // three task children into a tree they did not own. The followable remedy must
-  // stay first, and adoption must be named as refused by design.
+  // #1265 AC (b)/R3: "re-run the op from the verified tree (cd into it)" — the FIRST of three
+  // consecutive children that died in one worktree followed it into a tree it did not own. Pin the
+  // RENDERED form: the historical mention in the docblock wraps across lines, so it does not match —
+  // and any restored remedy that puts that phrase in output does.
   ok(
-    !/\(cd into it\) or re-dispatch verification for/.test(src),
-    "the un-followable 'cd into it' remedy must not come back — three children died following it",
+    !/\(cd into it\)/.test(src),
+    "the un-followable 'cd into it' remedy must not come back in any rendered message — the first child that followed it died in a tree it did not own",
   );
   ok(
     /re-dispatch verification for THIS root/.test(src) && /refused by design/.test(src),
