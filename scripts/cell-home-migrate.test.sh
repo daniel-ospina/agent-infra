@@ -20,6 +20,16 @@
 #   (e) `--apply` is idempotent, keeps a one-time backup, and NEVER deletes the legacy home
 #   (f) NON-VACUITY: each of (b)(d) is driven against a MUTATED COPY of the tool (§g) — without that,
 #       "the file was refused" could be satisfied by a tool that refused everything.
+#   (k) CANNOT MEASURE IS NOT A VERDICT: a unit this account cannot OPEN, a drop-in dir it cannot WALK,
+#       and a legacy credential path it cannot STAT are all exit 3 — never 0 ("one home") and never 1
+#       (ordinary drift), because `--check` -> 0 is the stated precondition for RECLAIMING the legacy
+#       home. The tool's own exit table reserved 3 for this class; nothing was raising it on the read
+#       that matters most, so an unread file read as a clean one.
+#   (k) A CONTINUATION BELONGS TO ITS LOGICAL LINE: an intermediate continuation line that names no
+#       legacy path, and a COMMENT between continued lines, both still converge — `systemd.syntax(7)`
+#       concatenates the lines and ignores a comment block after a backslash. Clearing the inherited
+#       directive name on either shape refused a unit the tool can perfectly well re-base, and made
+#       `--check` unreachable -> 0 for a reason the tool invented.
 #
 # HERMETIC: every path is under mktemp. The unit dirs come from the tool's own documented seam
 # (`CELL_HOME_MIGRATE_UNIT_DIRS`), the reload is disabled with `CELL_HOME_MIGRATE_NO_RELOAD=1`, and no
@@ -370,6 +380,122 @@ _out="$(run_tool "$TOOL" --apply)"; _rc=$?
 [ "$_rc" = 1 ] && ok "j8 …and --apply does not report convergence over it either (the two modes agree)" \
   || bad "j8 --apply answered $_rc while --check answers 1 on the same box"
 
+printf '\n── (k) CANNOT MEASURE IS NOT A VERDICT (review F1/F2) ───────────────────────────────\n'
+# ⛔ THE FALSE PASS THIS SECTION EXISTS FOR. `--check` -> 0 is the stated precondition for RECLAIMING the
+# legacy home, so a PASS manufactured from a reading that was never taken tells an operator to delete the
+# only copy of something. Three ways a read goes missing, all of them silent before this change:
+#   * the file cannot be OPENED (`grep -q … || continue` gave EACCES the same exit as "no match", and
+#     `done < "$f"` produced no record at all);
+#   * the population cannot be WALKED (find's stderr was thrown away, so a `.service.d` dir this account
+#     cannot read contributed no file and the dir read as "clear of the legacy home");
+#   * a legacy credential path cannot be STATed (`[ ! -e ]` is the same answer for "gone" and "denied").
+# The header's exit table already reserved 3 for exactly this class: "Never 0: 'could not read' is not
+# 'one home'." These arms take it at its word.
+
+# ⛔ THIS IS THE REVIEWER'S REPRODUCTION, not an approximation of it: a box that is ALREADY on one home
+# in every other respect, plus ONE unit that names the legacy home and that this account cannot open —
+# the shape of a root-owned unit carrying a secret in `Environment=`, graded by a `--check` run as the
+# cell account. Nothing else on the box drifts, so the ONLY thing between it and `--check` -> 0 (the
+# reclaim precondition) is the file that was never read.
+HIDDEN_BEFORE=""
+mk_hidden_box() { # <dir>
+  mk_box "$1"
+  run_tool "$TOOL" --apply >/dev/null 2>&1        # converge everything else
+  printf '[Service]\nEnvironment=HOME=%s\nExecStart=%s/harness/run.sh\n' "$LEG" "$LEG" >"$UNITS/hidden.service"
+  HIDDEN_BEFORE="$(cat "$UNITS/hidden.service")"
+  chmod 000 "$UNITS/hidden.service"
+}
+
+mk_hidden_box "$T/k1"
+# ⛔ A REAL OPEN IS THE HONEST PROBE, because `[ -r ]` reads permission BITS: an account holding
+# DAC_OVERRIDE (root) CAN open a mode-000 file, so only a real open answers "can this identity measure
+# it". Where the fixture cannot be blind to us, the leg says so instead of asserting nothing.
+if ( : <"$UNITS/hidden.service" ) 2>/dev/null; then
+  ok "k1 SKIPS the unreadable-unit legs honestly: this suite runs as an account that can open a mode-000 file, so the fixture cannot be unreadable to it"
+else
+  _out="$(run_tool "$TOOL" --check)"; _rc=$?
+  [ "$_rc" = 3 ] && ok "k1 a unit this account cannot OPEN -> --check is 3 (CANNOT MEASURE)" \
+    || bad "k1 --check answered $_rc over a unit it never read (0 = a PASS manufactured from an unread reading, 1 = misreported as ordinary drift)"
+  case "$_out" in *"CANNOT MEASURE"*"hidden.service"*) ok "k2 …naming the file whose reading could not be taken" ;; *) bad "k2 the unmeasurable unit is not named" ;; esac
+  case "$_out" in *"VERDICT: one home"*) bad "k3 the unreadable unit still produced 'VERDICT: one home' — the reclaim precondition would read as met" ;; *) ok "k3 …and it never answers 'one home' over a file it did not read" ;; esac
+  _out="$(run_tool "$TOOL" --apply)"; _rc=$?
+  [ "$_rc" = 3 ] && ok "k4 --apply is 3 over the same unit (it can be neither repointed nor ruled out)" \
+    || bad "k4 --apply answered $_rc over a unit it never read"
+  chmod 644 "$UNITS/hidden.service"
+  [ "$HIDDEN_BEFORE" = "$(cat "$UNITS/hidden.service")" ] && ok "k5 …and the file was left BYTE-FOR-BYTE intact" \
+    || bad "k5 the run modified a unit it could not read"
+fi
+chmod 644 "$UNITS/hidden.service" 2>/dev/null
+
+# The population leg: a drop-in DIR this account cannot walk used to contribute no file at all.
+mk_box "$T/k6"
+chmod 000 "$UNITS/app.service.d"
+if ( : <"$UNITS/app.service.d/env.conf" ) 2>/dev/null; then
+  ok "k6 SKIPS the un-walkable drop-in dir leg honestly: this account can open a file inside a mode-000 dir"
+else
+  _out="$(run_tool "$TOOL" --check)"; _rc=$?
+  [ "$_rc" = 3 ] && ok "k6 a drop-in dir this account cannot WALK -> --check is 3, not 'clear of the legacy home'" \
+    || bad "k6 --check answered $_rc over a population it could not walk"
+  case "$_out" in *"cannot be walked"*) ok "k7 …naming the population that could not be read" ;; *) bad "k7 the unwalkable population is not named" ;; esac
+fi
+chmod 755 "$UNITS/app.service.d" 2>/dev/null
+
+# The credential leg: `[ ! -e "$f_leg" ]` read an unsearchable legacy HOME as "legacy MIA" — i.e. the
+# credential half looked converged on a box where it was never looked at.
+mk_box "$T/k8"
+chmod 000 "$LEG"
+if ( : <"$LEG/keys.env" ) 2>/dev/null; then
+  ok "k8 SKIPS the unsearchable-legacy-home leg honestly: this account can read through a mode-000 dir"
+else
+  _out="$(run_tool "$TOOL" --check)"; _rc=$?
+  [ "$_rc" = 3 ] && ok "k8 a legacy home this account cannot SEARCH -> --check is 3 (a denied stat is not 'legacy MIA')" \
+    || bad "k8 --check answered $_rc while a legacy credential path could not be stat'ed"
+  case "$_out" in *"CANNOT MEASURE"*"keys.env"*) ok "k9 …naming the credential path it could not look at" ;; *) bad "k9 the unmeasurable credential is not named" ;; esac
+  case "$_out" in *"legacy MIA"*) bad "k9b …and it still reports the denied path as 'legacy MIA'" ;; *) ok "k9b …and it does NOT report the denied path as 'legacy MIA'" ;; esac
+fi
+chmod 755 "$LEG" 2>/dev/null
+
+# ── F2: a continuation belongs to its LOGICAL line ────────────────────────────────────────────
+# `systemd.syntax(7)`: "Lines ending in a backslash are concatenated with the following line … When a
+# comment line or lines follow a line ending with a backslash, the comment block is ignored, so the
+# continued line is concatenated with whatever follows the comment block." `d17` puts the legacy path in
+# the ONLY continuation line, so it passes with the inherited name cleared on every non-hit line. These
+# two fixtures are the shapes that cannot: an intermediate line that names no legacy path, and a comment
+# between the continued lines.
+mk_box "$T/k10"; mkdir -p "$DUR/state"
+cat >"$UNITS/app.service" <<EOF
+[Service]
+Environment=HOME=$LEG
+ExecStart=$LEG/harness/run.sh \\
+  --flag \\
+  --state $LEG/state
+EOF
+_out="$(run_tool "$TOOL" --apply)"; _rc=$?
+[ "$_rc" = 0 ] && ok "k10 a continued directive whose MIDDLE line names no legacy path converges (rc 0)" \
+  || bad "k10 the file was refused ($_rc) because the inherited directive name was dropped on the middle line"
+case "$(cat "$UNITS/app.service")" in
+  *"--state $DUR/state"*) ok "k11 …and its last continuation line IS repointed" ;;
+  *) bad "k11 the last continuation line still carries the legacy path: $(grep -- '--state' "$UNITS/app.service" || true)" ;;
+esac
+
+mk_box "$T/k12"; mkdir -p "$DUR/state"
+cat >"$UNITS/app.service" <<EOF
+[Service]
+Environment=HOME=$LEG
+ExecStart=$LEG/harness/run.sh \\
+# measured note naming $LEG/harness/run.sh must not be graded, and must not break the continuation either
+  --state $LEG/state
+EOF
+_out="$(run_tool "$TOOL" --apply)"; _rc=$?
+[ "$_rc" = 0 ] && ok "k12 a COMMENT between two continued lines does not break the continuation (rc 0)" \
+  || bad "k12 the comment ended the logical line, so the file could never converge ($_rc)"
+case "$(cat "$UNITS/app.service")" in
+  *"--state $DUR/state"*) ok "k13 …and the line after the comment is repointed" ;;
+  *) bad "k13 the continuation after the comment was not repointed" ;;
+esac
+grep -q "^# measured note naming $LEG/harness/run.sh" "$UNITS/app.service" \
+  && ok "k14 …while the comment itself is copied VERBATIM (ignored in both directions)" \
+  || bad "k14 the comment was rewritten or dropped"
 printf '\n── (g) NON-VACUITY: the refusals are the code, not the fixture ──────────────────────\n'
 
 # g1: remove the existence check from the tool and d11-d14 must fail — i.e. the arm above really is
@@ -481,6 +607,103 @@ else
   run_tool "$MUT6/cell-home-migrate.sh" --check >/dev/null 2>&1; _m6=$?
   [ "$_m6" = 0 ] && ok "g6 WITHOUT the conflict predicate --check reads 0 over a NEWER legacy credential — b8 measures it" \
     || bad "g6 the mutated tool still reported drift (rc $_m6) — b8 is not measuring the predicate"
+fi
+
+
+# g7: REVERT THE CANNOT-MEASURE GUARDS (the pre-fix shape: the prefilter's failure indistinguishable from
+# "no match", and the read redirect failing silently). k1-k5 must redden — that is what makes them a
+# measurement of the F1 fix rather than a fixture property.
+mkdir -p "$T/mutdir7/lib"; cp "$HERE/lib/cell-home.sh" "$T/mutdir7/lib/cell-home.sh"
+MUT7="$T/mutdir7/cell-home-migrate.sh"
+sed -e 's#^probe_open() { ( : <"$1" ) 2>/dev/null; }#probe_open() { return 0; }#' \
+    -e 's#^      if \[ "$st" -gt 1 \]; then#      if false; then#' "$TOOL" >"$MUT7"
+# The SAME converged-box fixture k1 uses, so the only thing that can move the rc is the hidden unit.
+mk_hidden_box "$T/g7"
+if cmp -s "$TOOL" "$MUT7"; then
+  bad "g7 the cannot-measure mutation could not be applied — k1-k5 are not checking the read guards"
+elif ( : <"$UNITS/hidden.service" ) 2>/dev/null; then
+  ok "g7 SKIPS honestly: this account can read a mode-000 unit, so no mutant can make the fixture unreadable"
+else
+  _m7="$(run_tool "$MUT7" --check)"; _m7rc=$?
+  case "$_m7" in *"VERDICT: one home"*) _m7said=1 ;; *) _m7said=0 ;; esac
+  [ "$_m7rc" = 0 ] && [ "$_m7said" = 1 ] \
+    && ok "g7 WITHOUT the read guards an OPEN-DENIED unit reads as 'one home' (rc 0) — k1/k3 measure the fix" \
+    || bad "g7 the mutated tool answered $_m7rc without a 'one home' verdict — k1 is not measuring the read guard"
+fi
+chmod 644 "$UNITS/hidden.service" 2>/dev/null
+
+# g8: REVERT THE CONTINUATION RULES to their pre-fix shape — the inherited name cleared on a comment and
+# on every non-hit line — and k10-k13 must redden. This is F2's exact regression, not the general
+# inheritance `g5` already covers.
+mkdir -p "$T/mutdir8/lib"; cp "$HERE/lib/cell-home.sh" "$T/mutdir8/lib/cell-home.sh"
+MUT8="$T/mutdir8/cell-home-migrate.sh"
+sed -e 's#^    if is_comment "\$line"; then continue; fi#    if is_comment "$line"; then cont=""; continue; fi#' "$TOOL" \
+  | awk 'index($0, "[A-Za-z]*) cont=") > 0 { print "          : ;;"; next } { print }' >"$MUT8"
+if cmp -s "$TOOL" "$MUT8"; then
+  bad "g8 the continuation mutation could not be applied — k10-k13 are not checking the logical line"
+else
+  mk_box "$T/g8"; mkdir -p "$DUR/state"
+  cat >"$UNITS/app.service" <<EOF
+[Service]
+Environment=HOME=$LEG
+ExecStart=$LEG/harness/run.sh \\
+  --flag \\
+  --state $LEG/state
+EOF
+  run_tool "$MUT8" --apply >/dev/null 2>&1; _m8rc=$?
+  case "$(cat "$UNITS/app.service")" in
+    *"--state $DUR/state"*) bad "g8 the mutant still converged the middle-line continuation — k10/k11 are not measuring it" ;;
+    *) [ "$_m8rc" != 0 ] && ok "g8 WITHOUT the logical-line rule the middle-line continuation is refused/left behind (rc $_m8rc) — k10/k11 measure it" \
+         || bad "g8 the mutant answered 0 without repointing the continuation — k10/k11 are ambiguous" ;;
+  esac
+  mk_box "$T/g8b"; mkdir -p "$DUR/state"
+  cat >"$UNITS/app.service" <<EOF
+[Service]
+Environment=HOME=$LEG
+ExecStart=$LEG/harness/run.sh \\
+# measured note
+  --state $LEG/state
+EOF
+  run_tool "$MUT8" --apply >/dev/null 2>&1; _m8brc=$?
+  case "$(cat "$UNITS/app.service")" in
+    *"--state $DUR/state"*) bad "g8b the mutant still converged through the comment — k12/k13 are not measuring it" ;;
+    *) [ "$_m8brc" != 0 ] && ok "g8b WITHOUT the comment rule the comment ends the logical line and the file is refused (rc $_m8brc) — k12/k13 measure it" \
+         || bad "g8b the mutant answered 0 through the comment — k12/k13 are ambiguous" ;;
+  esac
+fi
+
+# g9: THE POST-WRITE RE-GRADE (rule-3 note 2 from the review — it had NO arm). Two mutants of the writer,
+# differing ONLY in the post-condition:
+#   (a) a writer that does not project, WITH the re-grade  -> must REFUSE, original untouched;
+#   (b) the same writer with the re-grade deleted         -> must SWAP IN the un-projected file.
+# (b) is what makes (a) a measurement: without it, "the file was refused" could be any other refusal.
+mkdir -p "$T/mutdir9/lib"; cp "$HERE/lib/cell-home.sh" "$T/mutdir9/lib/cell-home.sh"
+_printf_proj='printf'
+MUT9="$T/mutdir9/cell-home-migrate.sh"
+awk 'index($0, "'"$_printf_proj"' \047%s\\n\047 \"$(cell_home_project_line") > 0 { print "    printf \047%s\\n\047 \"$line\" >>\"$dst\" || return 1"; next } { print }' \
+  "$TOOL" >"$MUT9"
+MUT9b="$T/mutdir9/cell-home-migrate-nopost.sh"
+awk 'index($0, "if [ -n \"$(unit_scan \"$tmpdir\")\" ]; then") > 0 { print "        if false; then"; next } { print }' \
+  "$MUT9" >"$MUT9b"
+if cmp -s "$TOOL" "$MUT9" || cmp -s "$MUT9" "$MUT9b"; then
+  bad "g9 the writer/ungraded mutations could not be applied — (d) does not measure the re-grade"
+else
+  mk_box "$T/g9"
+  _g9_before="$(cat "$UNITS/app.service")"
+  _out9="$(run_tool "$MUT9" --apply)"; _rc9=$?
+  case "$_out9" in
+    *"the writer and the scanner disagree"*) ok "g9 WITH the re-grade a writer that does not project is REFUSED by name — the swap never happens" ;;
+    *) bad "g9 an un-projected rewrite was not caught by the post-write re-grade (rc $_rc9)" ;;
+  esac
+  [ "$_g9_before" = "$(cat "$UNITS/app.service")" ] && ok "g9b …and the original unit is left BYTE-FOR-BYTE intact" \
+    || bad "g9b the refused rewrite still replaced the unit"
+  mk_box "$T/g9c"
+  run_tool "$MUT9b" --apply >/dev/null 2>&1; _rc9b=$?
+  case "$(cat "$UNITS/app.service")" in
+    *"$LEG/harness/run.sh"*) [ "$_rc9b" = 0 ] && ok "g9c WITH the re-grade DELETED the same writer swaps in a file that still names the legacy home — g9 measures the re-grade, not another guard" \
+        || bad "g9c the no-re-grade mutant refused anyway (rc $_rc9b) — g9's refusal is not attributable to the re-grade" ;;
+    *) bad "g9c the no-re-grade mutant did not write the un-projected file — g9 is ambiguous" ;;
+  esac
 fi
 
 printf '\n── (h) argument handling ────────────────────────────────────────────────────────────\n'

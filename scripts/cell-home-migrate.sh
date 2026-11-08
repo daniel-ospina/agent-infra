@@ -53,6 +53,15 @@
 #   3  CANNOT MEASURE — a reading this tool needs could not be taken (named on stderr), or the
 #      durable home cannot be derived for the account the UNITS RUN AS (a privileged invoking account
 #      derives `/root`; see `check_derivation`). Never 0: "could not read" is not "one home".
+#      ⛔ THE CLASS IS ENUMERATED, NOT ASPIRATIONAL: a unit/drop-in this account cannot OPEN, a unit
+#      DIR or drop-in dir whose population cannot be walked, and a legacy credential path this account
+#      cannot `stat` (an unsearchable ancestor) all land here. Each of them used to read as its
+#      opposite — "clear of the legacy home", or "legacy MIA" — i.e. a PASS manufactured from a read
+#      that was never taken, on the number that authorises RECLAIMING the legacy home.
+#   2  bad usage (an unknown argument)
+#   ⛔ 3 OUTRANKS 1: if any leg could not be measured the run is CANNOT MEASURE even when another leg
+#      also found drift, because "I could not look" and "I looked and it is drifted" are not the same
+#      report and only the first one forbids the reclaim.
 #
 # ── FIXTURE SEAMS (declared, not hidden) ────────────────────────────────────────────────────────
 #   CELL_HOME_MIGRATE_UNIT_DIRS   colon list of unit dirs to grade (default: the three below)
@@ -179,6 +188,31 @@ describe() {
 mtime_of() { stat -c '%Y' "$1" 2>/dev/null || stat -f '%m' "$1" 2>/dev/null || printf '0'; }
 mode_of()  { stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1" 2>/dev/null || printf ''; }
 
+# probe_open <file> — 0 iff this account can actually OPEN the file. ⛔ A REAL OPEN, NOT `[ -r ]`:
+# `[ -r ]` reads PERMISSION BITS, so it answers 1 for a mode-000 file even for an account that can read
+# it (root holds DAC_OVERRIDE) — the tool would then refuse a reading it actually takes, and print a
+# reason that is false for the identity that ran it. The open IS the measurement, so the message a
+# caller prints is true whoever invoked it.
+probe_open() { ( : <"$1" ) 2>/dev/null; }
+
+# cannot_traverse <path> — 0 iff an ANCESTOR directory exists but denies this account search, so
+# `[ -e <path> ]` cannot tell "absent" from "could not look". A path whose parent does not exist is
+# ABSENT (a measurable reading: nothing to converge), never unmeasurable.
+cannot_traverse() {
+  local d
+  d="$(dirname "$1")"
+  while [ -n "$d" ] && [ "$d" != "/" ] && [ "$d" != "." ]; do
+    # ⛔ AN ANCESTOR THAT DOES NOT RESOLVE IS NOT PROOF OF ABSENCE — when traversal is denied the
+    # whole tail of the path resolves to nothing, so the walk CARRIES ON UPWARD looking for a directory
+    # it can see and is not allowed to search. Stopping at the first unresolvable level reported
+    # `$LEGACY/.pi/agent/auth.json` as "legacy MIA" on exactly the box this guard exists for (measured:
+    # a mode-000 legacy home, `k9b`).
+    if [ -e "$d" ] && [ ! -x "$d" ]; then return 0; fi
+    d="$(dirname "$d")"
+  done
+  return 1
+}
+
 # credential_conflict <legacy> <durable> — 0 iff BOTH copies exist and the LEGACY one is NEWER.
 # ⛔ ONE PREDICATE, TWO MODES (review F1). `--check` and `--apply` disagreed about the same box: the
 # migration set `rc=1` on a divergence and the check only PRINTED the warning, so `--check` answered
@@ -193,13 +227,23 @@ credential_conflict() {
 }
 
 check_credentials() {
-  local rel f_leg f_dur rc=0
+  local rel f_leg f_dur rc=0 unmeas=0
   note "credentials (durable=$HOME_DURABLE legacy=$HOME_LEGACY)"
   [ -d "$HOME_LEGACY" ] || note "  legacy home is absent — nothing to converge (this box is already on one home)"
   while IFS= read -r rel; do
     [ -n "$rel" ] || continue
     f_leg="$HOME_LEGACY/$rel"
     f_dur="$HOME_DURABLE/$rel"
+    # ⛔ AN UNSEARCHABLE LEGACY PATH IS NOT "LEGACY MIA" (review F1). `[ ! -e "$f_leg" ]` is the same
+    # answer for "the file is gone" and for "I was not allowed to look" — and the second one read as
+    # "nothing to converge" on the box this fails on: a root-owned 0700 legacy home under a non-root
+    # `--check`. The durable side then looks converged and `--check` can reach 0 over a credential it
+    # never measured, which is the number that authorises reclaiming that very directory.
+    if [ ! -e "$f_leg" ] && cannot_traverse "$f_leg"; then
+      warn_line "  CANNOT MEASURE: $rel — a legacy path this account cannot look inside ($f_leg; a parent directory denies search to $INVOKER), so 'no legacy credential here' is not a reading this tool took"
+      unmeas=1
+      continue
+    fi
     # ⛔ THE CONTENT LEG RUNS FIRST AND INDEPENDENT OF THE LEGACY SIDE. The DURABLE file is what lanes
     # SOURCE, so a re-pointing assignment in it is drift whether or not a legacy copy still exists —
     # the legacy home is reclaimed later, and this check must not disappear with it. Names only, never
@@ -231,17 +275,26 @@ check_credentials() {
   done <<EOF
 $CRED_FILES
 EOF
+  if [ "$unmeas" = 1 ]; then return 3; fi      # ⛔ 3 outranks 1 — see the exit-code table
   return "$rc"
 }
 
 # The credential copy. Only when the durable side is MISSING; mode preserved from the source and
 # clamped to 600 for the two secret stores; contents never read, never echoed, never in argv.
 migrate_credentials() {
-  local rel f_leg f_dur rc=0 mode
+  local rel f_leg f_dur rc=0 unmeas=0 mode
   while IFS= read -r rel; do
     [ -n "$rel" ] || continue
     f_leg="$HOME_LEGACY/$rel"
     f_dur="$HOME_DURABLE/$rel"
+    # ⛔ THE SAME UNMEASURABLE LEG AS `--check`, so the two modes cannot disagree about one box (the
+    # lesson of the previous round's F1): "nothing to copy" and "I could not look" are different
+    # answers, and only one of them means the credential half converged.
+    if [ ! -e "$f_leg" ] && cannot_traverse "$f_leg"; then
+      warn_line "  CANNOT MEASURE: $rel — a legacy path this account cannot look inside ($f_leg; a parent directory denies search to $INVOKER); nothing was copied and nothing was ruled out"
+      unmeas=1
+      continue
+    fi
     # ⛔ THE CONTENT LEG RUNS FIRST AND INDEPENDENT OF THE LEGACY SIDE — same reason as `--check`: the
     # durable file is what lanes source, and the legacy home is reclaimed later, so this report must not
     # vanish with it (and the two modes must not disagree about the same box).
@@ -290,6 +343,7 @@ migrate_credentials() {
   done <<EOF
 $CRED_FILES
 EOF
+  if [ "$unmeas" = 1 ]; then return 3; fi      # ⛔ 3 outranks 1 — see the exit-code table
   return "$rc"
 }
 
@@ -345,22 +399,51 @@ paths_in() {
 #     by name, and the box could NEVER reach `--check` -> 0 (the reclaim precondition) while its only
 #     "defect" was a comment. `is_comment` is the one answer, used by the scanner AND the writer.
 #   * BACKSLASH CONTINUATIONS inherit the previous directive name, because systemd CONCATENATES the
-#     lines and expands C-style escapes — a continuation is the same directive, not a new one.
+#     lines and expands C-style escapes — a continuation is the same directive, not a new one. ⛔ THE
+#     INHERITANCE HOLDS FOR THE WHOLE LOGICAL LINE, so an INTERMEDIATE continuation line that does not
+#     itself name the home does not end it (review F2). `systemd.syntax(7)`: "Lines ending in a backslash
+#     are concatenated with the following line … When a comment line or lines follow a line ending with a
+#     backslash, the comment block is ignored, so the continued line is concatenated with whatever
+#     follows the comment block." So `ExecStart=<legacy>/run.sh \` + `--flag \` + `--state
+#     <legacy>/state` is ONE directive, and a comment between the continued lines changes nothing. Clearing
+#     the inherited name on a non-hit line (or on a comment) made the last line UNHANDLED: the whole file
+#     was refused by a diagnostic that was FALSE ("a directive this tool does not re-base" about a
+#     directive it rebases two lines above), and `--check` could never reach 0 on that box — the reclaim
+#     precondition blocked for a reason the tool made up.
 #   * A SIBLING NAME IS NOT THIS HOME. The record test is "the projection CHANGES this line", not "the
 #     line contains the legacy string": `/tmp/cell-home.bak` (an operator's pre-migration archive, and
 #     the same shape as this tool's own `<file>.pre-cell-home` backups) contains the legacy path as a
 #     PREFIX but is a different directory. Emitting a record for it made `--check` call a converged box
 #     drifted, and made `--apply` project it to `<home>.bak` — a target nobody has, refused by name.
+#   * AN UNREADABLE FILE IS A NAMED RECORD, NOT AN EMPTY SCAN — see `probe_open` and the guard below.
 unit_scan() {
   local f="$1" n=0 line dir projected miss p cont=""
+  # ⛔ A FILE THAT CANNOT BE OPENED HAS NO RECORD ONLY IF YOU LET THE REDIRECT FAIL SILENTLY. `done < "$f"`
+  # produced zero records for an unreadable unit, which the verdict then read as "clear of the legacy
+  # home" (review F1). The open is attempted here, so the caller gets a NAMED CANNOT-MEASURE record.
+  if ! probe_open "$f"; then
+    printf '0\tUNMEASURABLE\t%s\t\n' "$f cannot be opened by $INVOKER (mode $(mode_of "$f")) — 'could not read' is not 'clear of the legacy home'"
+    return 0
+  fi
   while IFS= read -r line; do
     n=$((n + 1))
-    if is_comment "$line"; then cont=""; continue; fi
+    # ⛔ A COMMENT IS IGNORED BY systemd, SO IT NEITHER SETS NOR CLEARS THE CONTINUATION (review F2).
+    if is_comment "$line"; then continue; fi
     # ⛔ THE PROJECTION IS THE LIB'S RULE, NOT A COPY OF IT. `cell_home_project_line` applies the
     # boundary rule (`/tmp/cell-home-2/x` and `/tmp/cell-home.bak` are not this home), and it is also
     # the record test: an unchanged projection means this line names no legacy home of OURS.
     projected="$(cell_home_project_line "$HOME_DURABLE" "$line")"
-    case "$projected" in "$line") cont=""; continue ;; esac
+    case "$projected" in
+      "$line")
+        # This line names no legacy home of ours — but it may still BE part of the logical line above, so
+        # the inherited directive name must survive it. Only a line that does NOT end in `\` ends the
+        # logical line; a fresh `<Name>=… \` line starts a new one and sets the name it will hand down.
+        case "$line" in
+          *\\ ) case "$line" in [A-Za-z]*) cont="${line%%=*}" ;; esac ;;
+          *)    cont="" ;;
+        esac
+        continue ;;
+    esac
     case "$line" in [A-Za-z]*) dir="${line%%=*}" ;; *) dir="$cont" ;; esac
     case "$dir" in
       "") printf '%s\tUNHANDLED\t%s\t\n' "$n" "$line"; cont=""; continue ;;
@@ -402,20 +485,54 @@ _project_file() {
   done <"$src"
 }
 
+# unit_files <dir> — the GRADED POPULATION of one unit dir, one path per line (sets $UNIT_FILES), plus
+# the traversal errors find reported (sets $UNIT_FIND_ERR). ⛔ ONE POPULATION RULE, TWO CONSUMERS: the
+# check and the writer both walk the unit dirs through this function, so one cannot see a file the other
+# misses. ⛔ AND A TRAVERSAL ERROR IS NOT AN EMPTY POPULATION (review F1): find's stderr used to be
+# thrown away (`2>/dev/null`), so a `<unit>.service.d` dir this account cannot read contributed NO file
+# at all and the dir then read as "clear of the legacy home" — the same false PASS as an unreadable
+# FILE, one level up.
+UNIT_FILES=""
+UNIT_FIND_ERR=""
+unit_files() {
+  local args
+  args=( "$1" -maxdepth 2 \( -name '*.service' -o -name '*.timer' -o -name '*.conf' \) -type f )
+  UNIT_FILES="$(find "${args[@]}" 2>/dev/null | LC_ALL=C sort)"
+  UNIT_FIND_ERR="$(find "${args[@]}" 2>&1 >/dev/null | LC_ALL=C sort -u)"
+}
+
 # unit_scan_all — every unit/drop-in under the declared dirs, one "<file>\t<record…>" line per hit.
 unit_scan_all() {
-  local dir f hit
+  local dir f hit st
   while IFS= read -r dir; do
     [ -n "$dir" ] && [ -d "$dir" ] || continue
+    unit_files "$dir"
+    if [ -n "$UNIT_FIND_ERR" ]; then
+      printf '%s\t0\tUNMEASURABLE\t%s\t\n' "$dir" "$dir: part of this population cannot be walked by $INVOKER ($(printf '%s' "$UNIT_FIND_ERR" | tr '\n' ' ')), so 'no unit here names the legacy home' is not a reading this tool took"
+    fi
     # A unit file, and any drop-in under `<unit>.service.d/*.conf` — the two shapes systemd merges.
     while IFS= read -r f; do
       [ -n "$f" ] || continue
-      grep -q -- "$HOME_LEGACY" "$f" 2>/dev/null || continue
+      # ⛔ THE PREFILTER'S STATUS IS THE DIFFERENCE BETWEEN "no match" AND "could not read" (review F1).
+      # `grep -q … || continue` gave EACCES the same exit as a clean file, so a unit this account cannot
+      # read silently became "clear of the legacy home" and `--check` answered 0 — the delete-the-live-
+      # directory false PASS, reached through the prefilter instead of through the verdict.
+      if ! probe_open "$f"; then
+        printf '%s\t0\tUNMEASURABLE\t%s\t\n' "$f" "$f: cannot be opened by $INVOKER (mode $(mode_of "$f")) — cannot tell whether it names the legacy home"
+        continue
+      fi
+      grep -q -- "$HOME_LEGACY" "$f" 2>/dev/null
+      st=$?
+      if [ "$st" -gt 1 ]; then
+        printf '%s\t0\tUNMEASURABLE\t%s\t\n' "$f" "$f: scanning it failed (grep status $st) — cannot tell whether it names the legacy home"
+        continue
+      fi
+      [ "$st" = 0 ] || continue
       hit="$(unit_scan "$f")"
       [ -n "$hit" ] || continue
       printf '%s\n' "$hit" | while IFS= read -r rec; do printf '%s\t%s\n' "$f" "$rec"; done
     done <<EOF
-$(find "$dir" -maxdepth 2 \( -name '*.service' -o -name '*.timer' -o -name '*.conf' \) -type f 2>/dev/null | LC_ALL=C sort)
+$UNIT_FILES
 EOF
   done <<EOF
 $(unit_dirs)
@@ -423,14 +540,23 @@ EOF
 }
 
 check_units() {
-  local scan
+  local scan cant=0
   note "units naming the legacy home ($HOME_LEGACY)"
   scan="$(unit_scan_all)"
   if [ -z "$scan" ]; then
     note "  none — every unit and drop-in directive is clear of the legacy home"
     return 0
   fi
+  # ⛔ A RECORD WHOSE READING COULD NOT BE TAKEN IS CANNOT-MEASURE, NEVER DRIFT AND NEVER CLEAR (review
+  # F1). It is detected from the RECORD TEXT and not from a flag, because `unit_scan_all` runs inside a
+  # command substitution: a counter incremented over there does not survive, and a verdict that loses
+  # its own unmeasurable count is the very defect this arm exists to prevent.
+  case "$scan" in *$'\tUNMEASURABLE\t'*) cant=1 ;; esac
   printf '%s\n' "$scan" | while IFS='	' read -r f n dir projected miss; do
+    if [ "$dir" = "UNMEASURABLE" ]; then
+      warn_line "  CANNOT MEASURE: $projected"
+      continue
+    fi
     if [ "$dir" = "UNHANDLED" ]; then
       warn_line "  $f:$n names the legacy home in a directive this tool does not re-base — fix or replace that file by hand:
       $projected"
@@ -451,15 +577,31 @@ check_units() {
   # (PR/issue #3453, "What is NOT in this PR" 1 and 3): an operator would delete the directory every
   # unit still names, i.e. `203/EXEC` on the next restart. UNHANDLED and `miss` stay a DISTINCT (louder)
   # class — they are refusals `--apply` cannot fix — but they are not the only kind of "not one home".
+  # ⛔ AND THE THIRD CLASS IS CANNOT MEASURE, WHICH IS NOT DRIFT: a file this tool could not open, or a
+  # population it could not walk, means the question "does anything here still name the legacy home" was
+  # never answered — exit 3, never 0 (a PASS manufactured from a read that was never taken) and never a
+  # plain 1 (which would read as "I looked, and it drifted").
+  if [ "$cant" = 1 ]; then
+    warn_line "  ⛔ 'could not read' is NOT 'one home': a unit or drop-in above could not be measured, so this run cannot certify the reclaim precondition on $HOME_LEGACY"
+    return 3
+  fi
   return 1
 }
 
 # The rewrite. One file at a time, atomically, with a one-time backup that preserves the mode.
 # Writes ONLY the projected lines of directives whose every projected path exists.
 migrate_units() {
-  local dir f n directive projected miss rec rc=0 applied=0 refused=0 backup tmpdir
+  local dir f n directive projected miss rec rc=0 applied=0 refused=0 cant=0 backup tmpdir
   while IFS= read -r dir; do
     [ -n "$dir" ] && [ -d "$dir" ] || continue
+    # ⛔ THE WRITER WALKS THE SAME POPULATION THE CHECK DOES (review F1): a dir find cannot traverse
+    # contributes no file, so "nothing to repoint here" would be a reading this tool never took — and
+    # the box would read converged on the very half that was skipped.
+    unit_files "$dir"
+    if [ -n "$UNIT_FIND_ERR" ]; then
+      warn_line "  CANNOT MEASURE: $dir — part of this population cannot be walked by $INVOKER ($(printf '%s' "$UNIT_FIND_ERR" | tr '\n' ' ')), so nothing under it could be repointed or ruled out"
+      cant=1
+    fi
     while IFS= read -r f; do
       [ -n "$f" ] || continue
       local scan; scan="$(unit_scan "$f")"
@@ -468,6 +610,14 @@ migrate_units() {
       # partially repointed unit is worse than an unmigrated one (it reads as migrated).
       local refuse=0
       while IFS='	' read -r n directive projected miss; do
+        # ⛔ A FILE THIS TOOL COULD NOT OPEN IS REFUSED AND REPORTED AS UNMEASURABLE, not skipped: an
+        # `install`/`cp`/`mv` on a file we cannot read would either fail late or write a unit nobody
+        # graded. `unit_scan` names it; this is where the run's exit class follows (3, not 0 and not a
+        # bare 1 — same reason as the check).
+        if [ "$directive" = "UNMEASURABLE" ]; then
+          warn_line "  CANNOT MEASURE: $projected (nothing written to $f)"
+          refuse=1; cant=1; break
+        fi
         if [ "$directive" = "UNHANDLED" ]; then
           warn_line "  REFUSED $f:$n — directive not re-based by this tool (nothing written to $f)"
           refuse=1; break
@@ -525,7 +675,7 @@ EOF
         rm -f "$tmpdir"; warn_line "  rewrite FAILED for $f — original left in place"; rc=1
       fi
     done <<EOF
-$(find "$dir" -maxdepth 2 \( -name '*.service' -o -name '*.timer' -o -name '*.conf' \) -type f 2>/dev/null | LC_ALL=C sort)
+$UNIT_FILES
 EOF
   done <<EOF
 $(unit_dirs)
@@ -546,6 +696,7 @@ EOF
     fi
     note "  ⛔ THE REWRITTEN UNITS KEEP THEIR OLD ENVIRONMENT UNTIL THEY RESTART. \`eldato-orchestrator.service\` spawns the lanes and needs a planned dispatcher window (agent-infra#3453) — this tool does not take it."
   fi
+  if [ "$cant" = 1 ]; then return 3; fi      # ⛔ 3 outranks 1 — see the exit-code table
   return "$rc"
 }
 
@@ -658,10 +809,20 @@ fi
 legacy_size="$(du -sh "$HOME_LEGACY" 2>/dev/null | awk 'NR==1{print $1}')"
 note "legacy home size: ${legacy_size:-UNREADABLE} (NOT reclaimed by this change — reclaim only after every unit repoints AND a lane proves push=OK + provider=OK from a clean shell with nothing sourced)"
 
+# ⛔ 3 OUTRANKS 1 (see the exit-code table). "I could not look" and "I looked and it drifted" are
+# different reports, and only the first one forbids the reclaim — collapsing them to 1 would let an
+# unreadable unit read as an ordinary drift that `--apply` can clean up.
 rc=0
-[ "$cred_rc" = 0 ] || rc=1
-[ "$units_rc" = 0 ] || rc=1
-if [ "$rc" = 0 ]; then
+for _leg_rc in "$cred_rc" "$units_rc"; do
+  case "$_leg_rc" in
+    0) ;;
+    3) rc=3 ;;
+    *) [ "$rc" = 3 ] || rc=1 ;;
+  esac
+done
+if [ "$rc" = 3 ]; then
+  note "VERDICT: CANNOT MEASURE — a reading this tool needs could not be taken (named above). This is NOT a verdict on the home: 'could not read' is not 'one home', so the reclaim precondition is NOT met."
+elif [ "$rc" = 0 ]; then
   note "VERDICT: one home — nothing to do"
 else
   note "VERDICT: drift found (see WARN lines above)"
