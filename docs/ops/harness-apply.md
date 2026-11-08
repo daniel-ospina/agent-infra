@@ -231,7 +231,9 @@ when it matched none) only when the publish failed — so the record says "publi
 grade: the artifact is a header and **no body line at all** (an empty body writes none — a blank line
 would be a stray row for anyone sizing the list with `wc -l - 1`), and the record's `detail=` says so
 instead of claiming output was published. That is the one state where a published list can name no
-file — because the instrument named none.
+file — because the instrument named none. (A checker that exits 0 printing nothing at all is the same
+silence on a different arm: it records `farm_rows=not-graded` and publishes NO file, so "printed nothing"
+has one artifact outcome — none — rather than a header-only file claiming an output that never existed.)
 
 `action=farm-unknown` (`rc=24`) is also the answer when the checker's exit status CONTRADICTS its own
 report — `rc=0` over a report that names drift. `HARNESS_APPLY_FARM_CHECKER` is a seam, so a wrapper
@@ -481,7 +483,7 @@ checkout can use the documented hatch. The same interaction is recorded for
 
 ## Tests
 
-`scripts/harness-apply-timer.test.sh` — 511 assertions, run by the
+`scripts/harness-apply-timer.test.sh` — 999 assertions, run by the
 `harness-apply-timer` shard of `run-bash-shards.sh`:
 
 | | |

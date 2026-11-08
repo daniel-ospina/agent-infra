@@ -1580,8 +1580,15 @@ if [ "$FARM_CHECK_ON" = "1" ]; then
                     # verdict word — and no verdict line — left both names durable NOWHERE, which is
                     # the acceptance arm (tortoise#10114 arm 2) lost inside `action=farm-unknown`.
                     # `publish_farm_rows`'s own doctrine: "no grade" never meant "nothing was reported".
-                    publish_farm_rows "$FARM_OUT" "n=unparsed (NO GRADE — the checker exited 0 without a verdict line, so nothing it printed can certify a match; this is its output verbatim, not a grade; farm_n=not-graded)"
-                    REC_FARM_NROWS=not-graded
+                    # ⛔ AND SILENCE PUBLISHES NOTHING (review round 26, measured): an unguarded publish
+                    # wrote a HEADER-ONLY artifact for a checker that printed no output at all, whose own
+                    # note then claimed "this is its output verbatim" over nothing — while the give-up arm
+                    # records `farm_rows=not-graded` and writes no file for the same silence. One state,
+                    # one artifact outcome: a mute checker names no file because it printed none.
+                    if [ -n "$(printf '%s\n' "$FARM_OUT" | grep -v '^[[:space:]]*$' || true)" ]; then
+                        publish_farm_rows "$FARM_OUT" "n=unparsed (NO GRADE — the checker exited 0 without a verdict line, so nothing it printed can certify a match; this is its output verbatim, not a grade; farm_n=not-graded)"
+                        REC_FARM_NROWS=not-graded
+                    fi
                     REC_REMEDY="the checker exited 0 without printing the instrument's 'OK —' line — point HARNESS_APPLY_FARM_CHECKER at check-farm-drift.sh itself (a wrapper or a broken copy that prints no verdict cannot certify a match), then re-run"
                     log_line "farm: UNKNOWN — the checker exited 0 but printed NO verdict line (neither 'OK —' nor 'DRIFT —'), so nothing it printed can certify a match"
                     finish 0 24 "farm: UNKNOWN (check-farm-drift rc=0) — no readable grade (see farm_rows=), so a status of 0 is not a match for $FARM_DEST against $REF: the checker printed no verdict line at all"
@@ -1692,7 +1699,12 @@ if [ "$FARM_CHECK_ON" = "1" ]; then
                     # re-worded or pre-summary farmed copy is exactly the premise this whole arm exists
                     # for, so "cannot prove it" must take the same door as "proved it wrong".
                     FARM_ROWS_RAW=1; PERSIST_BODY="$FARM_OUT"; FARM_RAW_WHY=noproof
-                    HDR_NOTE="n=unparsed (no readable 'DRIFT — <n> stale …' summary, so this pass cannot PROVE its $FARM_NROWS extracted row(s) are all of them — the instrument's RAW output follows verbatim; farm_n=unparsed)"
+                    # ⛔ AND THE NOTE MUST NAME THE RIGHT DEFECT (review round 26, measured: this arm
+                    # covers TWO sub-states — no summary printed at all, and a summary this pass could
+                    # not PARSE (one of the three labels missing or unreadable) — and the note claimed the
+                    # first for both, so an artifact whose summary WAS printed told its reader "no readable
+                    # summary" while `detail=` said "no readable or complete". The wording covers both.)
+                    HDR_NOTE="n=unparsed (no COMPLETE, parsable 'DRIFT — <n> stale …, <n> declared-but-absent, <n> unsourced' summary (either none was printed or a label did not parse), so this pass cannot PROVE its $FARM_NROWS extracted row(s) are all of them — the instrument's output follows verbatim; farm_n=unparsed)"
                 elif [ "$FARM_NROWS" -ne "$FARM_EXPECT" ]; then
                     FARM_ROWS_RAW=1; PERSIST_BODY="$FARM_OUT"; FARM_RAW_WHY=partial
                     if [ "$FARM_NROWS" -lt "$FARM_EXPECT" ]; then

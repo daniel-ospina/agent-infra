@@ -2154,10 +2154,42 @@ assert_contains "$OUT" "farm: ok" "T24 control: and it reports the match, rather
 assert_contains "$(grep '^farm_n=' "$T/t24ar/state/harness-apply.status" 2>/dev/null || true)" "farm_n=0" \
     "T24 control: with farm_n=0, the matched-farm truth — no phantom row"
 
+# ⛔ A SUMMARY THAT SATISFIES THE PRE-FILTER BUT NOT THE STALE LABEL IS STILL UNPROVEN (review round 26,
+# measured: deleting the `_a` requirement from `farm_sum_count` left the suite green at 510/0, because the
+# only fixture with an unparseable label — `5 fresh` — is rejected by the `<n> stale` pre-filter before the
+# label checks are reached). This fixture prints the stale count at COLUMN 1, which the pre-filter matches
+# and the label sed cannot parse, plus a verdict word the extractor does not know (`CHANGED`). Mutant that
+# reds these rows: drop the `_a` requirement.
+mk_origin t24az; mk_clone t24az
+REPO_P="$CLONE"; MODE_P=sync
+mkdir -p "$T/t24az/home/.pi/agent/scripts"
+cat >"$T/t24az/column1.sh" <<'FARM'
+#!/usr/bin/env bash
+printf '%-46s | %-12s | %-12s | %s\n' 'file' 'deployed' 'source' 'verdict' >&2
+printf '%-46s | %-12s | %-12s | %s\n' 'a.py' aaaa11112222 - UNSOURCED >&2
+printf '%-46s | %-12s | %-12s | %s\n' 'b.py' aaaa11112222 - UNSOURCED >&2
+printf '%-46s | %-12s | %-12s | %s\n' 'c.py' aaaa11112222 bbbb33334444 CHANGED >&2
+printf '1 stale (1 farm-declared — a re-run must fix these; 0 outside the farm), 0 declared-but-absent, 2 unsourced, of 5 deployed file(s) (5 sourced, 2 matching) against origin/main (sync).\n' >&2
+exit 3
+FARM
+chmod +x "$T/t24az/column1.sh"
+OUT="$(HARNESS_APPLY_FARM_CHECKER="$T/t24az/column1.sh" run_pass "$T/t24az" 2>&1)"; RC=$?
+assert_eq "$RC" "24" "T24 control: a summary whose stale count sits at column 1 is UNPROVEN, so the extraction stays raw (RED 24)"
+assert_contains "$(grep '^farm_n=' "$T/t24az/state/harness-apply.status" 2>/dev/null || true)" "farm_n=unparsed" \
+    "T24 control: and farm_n= is unparsed, never the 2 rows the extractor happened to match"
+assert_absent "$(grep '^detail=' "$T/t24az/state/harness-apply.status" 2>/dev/null || true)" "row(s), every one named" \
+    "T24 control: and detail= never certifies a list built on an unparseable count"
+assert_contains "$(cat "$T/t24az/state/harness-apply-farm-rows.txt" 2>/dev/null || true)" "c.py" \
+    "T24 control: while the file the extractor cannot class is still named in the published output"
+assert_contains "$(head -1 "$T/t24az/state/harness-apply-farm-rows.txt" 2>/dev/null || true)" "either none was printed or a label did not parse" \
+    "T24 control: and the header names BOTH sub-states, so an artifact whose summary WAS printed cannot claim none was"
+
 # ⛔ AND THE ROW HALF STANDS ON ITS OWN (review round 23, measured: deleting only `[ "$FARM_NROWS0" -gt 0 ] ||`
-# left the suite green at 475/0, because every other contradiction fixture ALSO prints a parseable
-# `DRIFT — N stale` summary — so the disjunction was pinned and neither operand was). This fixture's
-# summary carries no digit, so only the matched row can reveal the contradiction.
+# left the suite green, because every other contradiction fixture ALSO prints an anchorable
+# `PROG: DRIFT — ` verdict line — so the disjunction was pinned and neither operand was). This fixture's
+# summary carries neither a digit NOR the `PROG: DRIFT — ` shape (review round 26 measured that the
+# earlier version still printed the anchorable line, so the row half STILL had no mutant), so only the
+# matched ROW can reveal the contradiction.
 mk_origin t24as; mk_clone t24as
 REPO_P="$CLONE"; MODE_P=sync
 mkdir -p "$T/t24as/home/.pi/agent/scripts" "$T/t24as/inner"
@@ -2165,7 +2197,7 @@ cat >"$T/t24as/inner/unparsable-summary.sh" <<'FARM'
 #!/usr/bin/env bash
 printf '%-46s | %-12s | %-12s | %s\n' 'file' 'deployed' 'source' 'verdict' >&2
 printf '%-46s | %-12s | %-12s | %s\n' 'drift-a.py' aaaa11112222 bbbb33334444 STALE >&2
-printf 'check-farm-drift: DRIFT — some files are stale (see the rows above; a re-run must fix these).\n' >&2
+printf 'SUMMARY: 1 file drifted, counts unavailable (see the rows above; a re-run must fix these).\n' >&2
 exit 1
 FARM
 printf '#!/usr/bin/env bash\nbash "$(dirname "$0")/inner/unparsable-summary.sh" "$@" 2>&1 | tee -a "$(dirname "$0")/log.txt"\n' >"$T/t24as/wrap.sh"
@@ -2176,9 +2208,9 @@ assert_contains "$OUT" "exited 0 but its output reports drift" "T24 control: and
 # ⛔ AND THE LOG QUOTES THE EVIDENCE IT REFUSED ON (review round 24: the clause named a variable a rename
 # had deleted, so EVERY contradiction said it had nothing — the same misinformation the round removed from
 # the summary reader, reintroduced in the operator log). This fixture's summary parses to no count at all,
-# so quoting the VERDICT line is the only honest answer, and this row is what pins it.
-assert_contains "$OUT" "verdict: check-farm-drift: DRIFT — some files are stale" \
-    "T24 control: and the log quotes the verdict line that produced the refusal, even when its counts do not parse"
+# so the log can only name "no DRIFT line, rows only" — and that is what this row pins.
+assert_contains "$OUT" "no DRIFT line, rows only" \
+    "T24 control: and the log says it had no verdict line and only rows — the truth for this fixture"
 assert_contains "$(cat "$T/t24as/state/harness-apply-farm-rows.txt" 2>/dev/null || true)" "drift-a.py" \
     "T24 control: with the row durable in the published output"
 assert_contains "$(grep '^farm_n=' "$T/t24as/state/harness-apply.status" 2>/dev/null || true)" "farm_n=not-graded" \
@@ -2197,6 +2229,16 @@ assert_contains "$OUT" "printed NO verdict line" "T24 control: and the line says
 assert_absent "$OUT" "farm: ok" "T24 control: so the matched-farm sentence is never printed over no evidence"
 assert_contains "$(grep '^remedy=' "$T/t24au/state/harness-apply.status" 2>/dev/null || true)" "HARNESS_APPLY_FARM_CHECKER" \
     "T24 control: and remedy= names the seam to fix"
+# ⛔ AND SILENCE NAMES NO FILE (review round 26, measured: an unguarded publish wrote a HEADER-ONLY
+# artifact for a checker that printed nothing, whose note claimed "this is its output verbatim" over
+# nothing — while the same silence on the give-up arm records `farm_rows=not-graded` and writes no file).
+assert_contains "$(grep '^farm_rows=' "$T/t24au/state/harness-apply.status" 2>/dev/null || true)" "farm_rows=not-graded" \
+    "T24 control: and farm_rows= is not-graded — no artifact is named for a checker that printed no output"
+if [ -e "$T/t24au/state/harness-apply-farm-rows.txt" ]; then
+    bad "T24 control: a mute rc=0 checker must write NO artifact — a header-only file claims a publication that never happened"
+else
+    ok "T24 control: and no artifact file is written at all — silence produced no list to publish"
+fi
 
 # ⛔ ...AND THE OUTPUT BEING NON-EMPTY DOES NOT MAKE IT A REPORT (review round 25, measured). The
 # emptiness test above is not enough: the wrapper shape this file's own comment names —
