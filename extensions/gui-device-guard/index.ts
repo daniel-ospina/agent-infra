@@ -322,20 +322,6 @@ export function splitSegments(command: string): string[] {
 }
 
 /**
- * Blank out shell COMMENTS before segmentation.
- *
- * ⛔ A COMMENT IS NOT ARGV (review cycle 2, F2). Without this, an unquoted `#`
- * left the rest of the line as ordinary tokens, so
- *
- *     electron . # --use-fake-device-for-media-stream --use-fake-ui-for-media-stream
- *
- * produced `faked: true` and the launch was ALLOWED while Chromium received
- * neither switch — a false PASS in the one direction this guard exists to
- * prevent, and reachable by pasting the guard's OWN refusal text (which prints
- * both flags). Only an unquoted `#` that BEGINS A WORD is a comment: `a#b` is
- * one word, and a `#` inside single/double quotes or a heredoc body is data.
- */
-/**
  * Index of the `#` that starts a COMMENT on `line`, or -1.
  *
  * One rule, two readers: `stripComments` (which cuts the line there) and
@@ -352,6 +338,20 @@ function commentCutIndex(line: string, base: number, mask: boolean[]): number {
   return -1;
 }
 
+/**
+ * Blank out shell COMMENTS before segmentation.
+ *
+ * ⛔ A COMMENT IS NOT ARGV (review cycle 2, F2). Without this, an unquoted `#`
+ * left the rest of the line as ordinary tokens, so
+ *
+ *     electron . # --use-fake-device-for-media-stream --use-fake-ui-for-media-stream
+ *
+ * produced `faked: true` and the launch was ALLOWED while Chromium received
+ * neither switch — a false PASS in the one direction this guard exists to
+ * prevent, and reachable by pasting the guard's OWN refusal text (which prints
+ * both flags). Only an unquoted `#` that BEGINS A WORD is a comment: `a#b` is
+ * one word, and a `#` inside single/double quotes or a heredoc body is data.
+ */
 export function stripComments(command: string): string {
   if (!command.includes("#")) return command;
   const mask = unquotedMask(command);
@@ -395,9 +395,10 @@ export function stripComments(command: string): string {
  *
  * Declared residual: a `<<` inside an ARITHMETIC expansion (`$(( n << shift ))`)
  * is still read as a redirect, because the delimiter there (`shift`) is a legal
- * word. It is not closable without a real arithmetic grammar, it deletes DATA in
- * the safe direction only when no later line equals the variable name, and the
- * direction is stated rather than claimed complete.
+ * word. Closing it needs an arithmetic grammar this file does not have, and the
+ * direction it fails in is the one that must be SAID rather than implied: with no
+ * later line equal to the variable name, the following text is deleted and the
+ * guard fires LESS. Declared here, not claimed complete.
  */
 export function stripHeredocBodies(command: string): string {
   if (!command.includes("<<")) return command;
@@ -651,13 +652,6 @@ function appBundleBinary(tok: string): string | null {
 }
 
 /**
- * Classify one bash command line. Pure: no I/O, no env, no cwd — so the threat
- * table can drive every row, and the handler is the only thing that acts.
- *
- * Returns one finding per GUI launch found; an empty array means "not a host GUI
- * app launch" (allow, and record nothing).
- */
-/**
  * The bodies of every command substitution in a command line — `$( … )` and
  * `` ` … ` `` — that is NOT inside single quotes.
  *
@@ -724,15 +718,6 @@ export function extractSubstitutions(command: string): string[] {
 }
 
 /**
- * The command-string argument of a wrapper that takes one — the shell's `-c`
- * (also `-lc`, `-ec`, `-o pipefail -c`), `flock -c`, `script -c` — or null.
- *
- * ⛔ GENERALISED FROM THE SHELL-ONLY CASE (review cycle 3, F1): `flock /tmp/l -c
- * "npm exec electron ."` was invisible because only `bash`-family heads were
- * re-read. `COMMAND_STRING_FLAGS` names the flag per head, so a wrapper added
- * later is one table row rather than a second branch.
- */
-/**
  * The argument ATTACHED to a short option: `-cCMD`, `-lcCMD`, `-aAPP`.
  *
  * ⛔ AN ATTACHED ARGUMENT IS THE SAME ARGUMENT (review cycle 5, F1). `tokenize`
@@ -757,6 +742,15 @@ function attachedShortArg(tok: string, letter: string): string | null {
   return rest === "" ? null : rest;
 }
 
+/**
+ * The command-string argument of a wrapper that takes one — the shell's `-c`
+ * (also `-lc`, `-ec`, `-o pipefail -c`), `flock -c`, `script -c` — or null.
+ *
+ * ⛔ GENERALISED FROM THE SHELL-ONLY CASE (review cycle 3, F1): `flock /tmp/l -c
+ * "npm exec electron ."` was invisible because only `bash`-family heads were
+ * re-read. `COMMAND_STRING_FLAGS` names the flag per head, so a wrapper added
+ * later is one table row rather than a second branch.
+ */
 function shellCommandArg(toks: string[], headIndex: number): string | null {
   const head = basename(toks[headIndex] ?? "");
   const flags = COMMAND_STRING_FLAGS[head];
@@ -877,6 +871,18 @@ function classifySegment(
   return null;
 }
 
+/**
+ * Classify one bash command line. Pure: no I/O, no env, no cwd — so the threat
+ * table can drive every row, and the handler is the only thing that acts.
+ *
+ * Returns one finding per GUI launch found; an empty array means "not a host GUI
+ * app launch" (allow, and record nothing).
+ *
+ * ⛔ An empty list is NOT an "allow" verdict the handler can trust from a REMOTE
+ * shape it failed to parse — which is why every spelling the classifier cannot see
+ * is a finding against it, not a residual: the handler returns early on `[]`, so a
+ * miss loses the refusal AND the ledger row together (cycles 3, 4 and 5).
+ */
 export function classifyLaunchCommand(command: string, depth = 0): LaunchFinding[] {
   const findings: LaunchFinding[] = [];
   // Comments are removed BEFORE tokens are read, so a comment can never satisfy
