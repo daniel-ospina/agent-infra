@@ -555,12 +555,21 @@ The measurement is the same `ps` read the `Alive state:` machine line renders
 about how many sessions the box held.
 
 **The refusal is a REFUSAL, in every consumer.** A pre-spawn refusal payload
-carries `details.status` and no `isError`, so the review-enforcer's dispatch
-floor classifies it through its own re-enumeration
-(`extensions/shared/spawn-capacity.ts` `REFUSED_STATUS`) — and a status missing
-from that mirror falls through to two arms decided by **extension load order**,
-making a refused dispatch read as a *completed unit* that satisfies the
->=1-dispatch floor for an unreviewed push. That is a false PASS, not a
-bookkeeping slip: `fleet-saturated` is therefore in **both** sets
-(`FAILED_TASK_STATUS` and `REFUSED_STATUS`), each with a row in its own suite.
-Any future member of either set owes the same two edits.
+carries `details.status` and no `isError`, so every consumer that accounts for a
+dispatch has to classify it — and there are **three**, of three different shapes:
+
+| consumer | how it decides | what a missed status used to do |
+|---|---|---|
+| `builtin-tools` `FAILED_TASK_STATUS` | enumerates the vocabulary | report a refusal as a success |
+| `review-enforcer` dispatch floor | `classifySpawnOutcome` → `REFUSED_STATUS` | satisfy the >=1-dispatch floor for an **unreviewed push** |
+| `sequence-enforcer` verifier step | `classifySpawnOutcome` (was: nothing) | **advance a verifier step with zero verdicts** |
+
+The middle one is a re-enumeration, and a status missing from it falls through to
+two arms decided by **extension load order** (#2242 review round 1, category A).
+The third enumerated nothing at all until #2242's round 4: it decremented on any
+blocking `task` result regardless of outcome, which was latent while the only
+blocking refusals were `invalid-cwd` (a code bug) and `circuit_open` (a breaker)
+and became routine the moment a refusal fired on a *measured* box condition.
+Both now read the one shared classifier, so a new status cannot be handled in one
+place and ignored in another; the two SETS still owe a row in their own suites,
+and any new *consumer* owes the classifier call.
