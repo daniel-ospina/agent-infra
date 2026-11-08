@@ -55,7 +55,7 @@ import {
 } from "./index.js";
 import { isEnforcementBypassed } from "../shared/kill-switch.js";
 import { ok, equal, deepEqual } from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync, readFileSync, existsSync, chmodSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync, mkdirSync, readFileSync, existsSync, chmodSync, symlinkSync, realpathSync } from "node:fs";
 import { tmpdir, homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { execSync, execFileSync } from "node:child_process";
@@ -808,6 +808,116 @@ await test("#1418 F2 (round 3): mid-rebase writes are REFUSED for every non-conf
     _setRebaseProbeForTest(() => false);
     ok(validateToolCall("write", "", step, "gate", "src/conflicted.ts").block, "no rebase → even a conflicted path is blocked");
   } finally { _setRebaseProbeForTest(null); _setConflictedProbeForTest(null); _setTokenFileForTest(null); }
+});
+
+// #1418 review round 4, F1 — EACH DECLARED BOUND NEEDS ITS OWN DISCRIMINATING ROW.
+// Round 3 ordered the unmerged-set test FIRST, so every refused path below was
+// refused there and never reached the ledger / git-dir / containment checks —
+// deleting any of those left the suite green. Each row here seeds the refused
+// path INTO the conflicted set, so the ONLY thing that can refuse it is the
+// bound the row names.
+await test("#1418 F1 (round 4): each bound refuses INDEPENDENTLY of the unmerged set", () => {
+  _setTokenFileForTest(null);
+  _setRebaseProbeForTest(() => true);
+  const step = checkpointStep();
+  const tok = join(process.cwd(), ".mid-rebase-token.json");
+  try {
+    _setTokenFileForTest(tok);
+    // (a) the TOKEN ledger, refused by identity even though it IS the unmerged path
+    _setConflictedProbeForTest(() => [".mid-rebase-token.json"]);
+    ok(validateToolCall("write", "", step, "gate", tok).block, "ledger identity refuses an UNMERGED token path");
+    // (b) the FORCE-PASS ledger (NODE_ENV=test path), same way
+    const forceP = "/tmp/sequence-enforcer-test-none/force.json";
+    _setConflictedProbeForTest(() => [forceP]);
+    ok(validateToolCall("write", "", step, "gate", forceP).block, "ledger identity refuses an UNMERGED force-pass path");
+    // (c) the git dir
+    _setConflictedProbeForTest(() => [".git/config"]);
+    ok(validateToolCall("write", "", step, "gate", ".git/config").block, "git dir refuses an 'unmerged' .git path");
+    // (d) containment
+    _setConflictedProbeForTest(() => ["/etc/passwd"]);
+    ok(validateToolCall("write", "", step, "gate", "/etc/passwd").block, "containment refuses an outside 'unmerged' path");
+  } finally { _setRebaseProbeForTest(null); _setConflictedProbeForTest(null); _setTokenFileForTest(null); }
+});
+
+await test("#1418 F2 (round 4): a SYMLINK onto a ledger is refused through the canonical form", () => {
+  const base = mkdtempSync(join(tmpdir(), "ckpt-link-"));
+  try {
+    const tok = join(base, "token.json");
+    writeFileSync(tok, "{}");
+    const link = join(base, "innocent.ts");
+    symlinkSync(tok, link);
+    _setTokenFileForTest(tok);
+    _setRebaseProbeForTest(() => true);
+    _setConflictedProbeForTest(() => ["innocent.ts"]);
+    ok(validateToolCall("write", "", checkpointStep(), "gate", link).block, "the symlink is refused as the token file");
+    ok(!checkpointWriteTargetAllowed(link, base), "canonical identity, not lexical spelling");
+  } finally { _setRebaseProbeForTest(null); _setConflictedProbeForTest(null); _setTokenFileForTest(null); rmSync(base, { recursive: true, force: true }); }
+});
+
+await test("#1418 F1b (round 4): the HANDLER passes input.path to the allowance (the plumbing has its own row)", async () => {
+  _resetStateForTest();
+  const { pi, handlers } = fakePi();
+  auditCapture();
+  try {
+    await withEnv({ PI_MODE: "print", AGENT_SEQUENCE_MODE: "gate", AGENT_STATE_MACHINE: undefined, ELDATO_STATE_MACHINE: undefined }, async () => {
+      sequenceEnforcer(pi as any);
+      _pushSkillForTest("/repo/skills/check/SKILL.md", checkpointSkillSteps(), 0);
+      _setTokenFileForTest(null);
+      _setRebaseProbeForTest(() => true);
+      _setConflictedProbeForTest(() => ["src/conflicted.ts"]);
+      const allowed = await handlers.tool_call!({ toolName: "write", toolCallId: "w-ok", input: { path: "src/conflicted.ts", content: "x" } });
+      ok(!allowed || !allowed.block, "handler honours input.path for an unmerged target");
+      const denied = await handlers.tool_call!({ toolName: "write", toolCallId: "w-bad", input: { path: "scripts/parallel_work_check.py", content: "x" } });
+      ok(denied && denied.block, "handler refuses a non-unmerged target (so input.path really arrived)");
+      const noPath = await handlers.tool_call!({ toolName: "write", toolCallId: "w-nopath", input: {} });
+      ok(noPath && noPath.block, "a write with NO path is blocked (fail-closed)");
+    });
+  } finally { auditRelease(); _setRebaseProbeForTest(null); _setConflictedProbeForTest(null); _setTokenFileForTest(null); }
+});
+
+// #1418 review round 4, F3 — a delete/modify or rename/delete conflict is
+// resolved by REMOVING the path, and `git rm` was blocked while the guidance
+// told the lane to `git add` it back. Admitted, bounded to the UNMERGED set.
+await test("#1418 F3 (round 4): `git rm` is admitted for an UNMERGED path and refused for anything else", () => {
+  _setTokenFileForTest(null);
+  const step = makeStep({ name: "check", gate: "checkpoint", token_phase: "implement" });
+  try {
+    _setConflictedProbeForTest(() => ["src/gone.ts"]);
+    ok(!validateToolCall("bash", "git rm src/gone.ts", step, "gate").block, "rm of the unmerged path is the deletion resolution");
+    ok(!validateToolCall("bash", "git fetch", step, "gate").block, "the rest of the remedy is unaffected");
+    const stray = validateToolCall("bash", "git rm src/live.ts", step, "gate");
+    ok(stray.block, "rm of a NON-unmerged path is refused");
+    ok((stray.reason || "").includes("UNMERGED"), "the refusal names the bound");
+    ok(validateToolCall("bash", "git rm -rf src", step, "gate").block, "flags stay blocked (leading -)");
+    ok(validateToolCall("bash", "git rm src/gone.ts && rm -rf /", step, "gate").block, "chaining stays blocked");
+  } finally { _setConflictedProbeForTest(null); }
+});
+
+await test("#1418 F2 (round 4): conflictedPaths resolves git's --full-name output against the TOP LEVEL, not cwd", () => {
+  const base = mkdtempSync(join(tmpdir(), "ckpt-sub-"));
+  try {
+    const repo = join(base, "repo");
+    mkdirSync(repo, { recursive: true });
+    const g = (...a: string[]) => execFileSync("git", a, { cwd: repo, encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"] });
+    g("init", "-q", "-b", "main");
+    g("config", "user.email", "t@example.com");
+    g("config", "user.name", "t");
+    writeFileSync(join(repo, "x.ts"), "base\n");
+    g("add", ".");
+    g("commit", "-qm", "c1");
+    g("checkout", "-qb", "other");
+    writeFileSync(join(repo, "x.ts"), "other\n");
+    g("commit", "-qam", "c2");
+    g("checkout", "-q", "main");
+    writeFileSync(join(repo, "x.ts"), "main\n");
+    g("commit", "-qam", "c3");
+    try { g("merge", "other"); } catch { /* the conflict is the fixture */ }
+    const sub = join(repo, "sub");
+    mkdirSync(sub, { recursive: true });
+    const paths = conflictedPaths(sub); // cwd BELOW the repo root
+    equal(paths.length, 1, "one unmerged path");
+    equal(realpathSync(paths[0]!), realpathSync(join(repo, "x.ts")), "resolved against the TOP LEVEL, so a subdir cwd is not a different path");
+  } finally { rmSync(base, { recursive: true, force: true }); }
 });
 
 await test("#1418 F2 (round 3): with NO conflicted set (real git) every write is denied — fail-closed", () => {

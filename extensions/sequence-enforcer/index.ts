@@ -1337,8 +1337,26 @@ export const CHECKPOINT_REMEDY_RE = new RegExp(
     `|rebase[ ]+(?:--autostash[ ]+)?${_REF}` +
     "|rebase[ ]+--(?:continue|abort|skip)" +
     `|add[ ]+${_PATH}(?:[ ]+${_PATH})*` +
+    // #1418 (review round 4, F3): a `delete/modify` or `rename/delete` conflict
+    // is resolved by REMOVING the path. Without `git rm` the only exits were
+    // `git add` (keeps a file upstream deleted), `--skip` (drops the replayed
+    // commit) and `--abort` (back to STALE) — the issue's own headline, still
+    // true for that conflict class. Bounded exactly like `git add`, and (below)
+    // to the UNMERGED set, so it can never remove a live file.
+    `|rm[ ]+${_PATH}(?:[ ]+${_PATH})*` +
   ")$",
 );
+
+// #1418 (review round 4, F3): `git rm` is the DELETION resolution of a
+// delete/modify or rename/delete conflict, so it is admitted — but only for the
+// paths git currently reports as UNMERGED (`rebaseWriteTargets` below). That is
+// what keeps it from becoming a general "delete any tracked file" verb.
+export const CHECKPOINT_REMEDY_RM_RE = new RegExp(`^git[ ]+rm[ ]+${_PATH}(?:[ ]+${_PATH})*$`);
+export function rebaseRmTargets(command: unknown, cwd: string = process.cwd()): string[] | null {
+  if (typeof command !== "string" || !CHECKPOINT_REMEDY_RM_RE.test(command)) return null;
+  const paths = command.slice("git rm ".length).split(" ").filter((p) => p !== "");
+  return paths.map((p) => resolve(cwd, p));
+}
 
 // #357 (d): non-bash escape tools + bash sole-command checker. Malformed bash
 // input (non-string/missing command) is NOT the escape (fail-closed).
@@ -1431,58 +1449,127 @@ function nearestRealPath(p: string): string | null {
 //   * symlinks are resolved on the nearest existing ancestor, so a link inside
 //     the worktree cannot point the write back outside it.
 // Everything else still fails closed: a non-string/empty target is a BLOCK.
-// The paths git currently reports as UNMERGED in this checkout — the exact set
-// the stopped rebase is asking to be resolved. Empty when nothing is
-// conflicted, and empty on any failure (fail-closed: then no write is allowed).
+//
+// REVIEW ROUND 4 (F1) — EACH BOUND IS PINNED INDEPENDENTLY AND IN ITS OWN CHECK.
+// Round 3 put the unmerged-set test FIRST, which made the ledger / containment /
+// git-dir refusals unreachable for every refused row in the suite: deleting any
+// of them left the suite green (the same "a row no mutation can redden" class
+// round 2 found). The checks below therefore run in the order ledger → git dir →
+// containment → unmerged, and the suite seeds each refused path INTO the
+// conflicted set so every row exercises the bound it names (and only that one).
+
+// The paths git currently reports as UNMERGED in this checkout — ABSOLUTE, the
+// exact set a stopped rebase is asking to be resolved. Empty when nothing is
+// conflicted and empty on any failure (fail-closed: then no write is allowed).
+// ⛔ `--full-name` prints paths relative to the PROJECT TOP LEVEL, not to `cwd`
+// (review round 4, F2): resolving them against `cwd` denied the real file and
+// admitted a wrong one whose spelling happened to match from a subdirectory. The
+// toplevel is resolved once and the git output is joined to IT.
 let conflictedProbeForTest: ((cwd: string) => string[]) | null = null;
 export function _setConflictedProbeForTest(fn: ((cwd: string) => string[]) | null): void {
   if (process.env.NODE_ENV !== "test") return;
   conflictedProbeForTest = fn;
 }
-export function conflictedPaths(cwd: string = process.cwd()): string[] {
-  if (conflictedProbeForTest) return conflictedProbeForTest(cwd);
+export function repoTopLevel(cwd: string = process.cwd()): string | null {
   try {
-    const out = execFileSync("git", ["ls-files", "-u", "--full-name"], {
+    const out = execFileSync("git", ["rev-parse", "--show-toplevel"], {
       cwd, encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"], timeout: 5000,
+    }).trim();
+    return out === "" ? null : out;
+  } catch {
+    return null;
+  }
+}
+export function conflictedPaths(cwd: string = process.cwd()): string[] {
+  if (conflictedProbeForTest) return conflictedProbeForTest(cwd).map((p) => resolve(cwd, p));
+  try {
+    const top = repoTopLevel(cwd);
+    if (!top) return [];
+    // ⛔ RUN AT THE TOP LEVEL, not at `cwd` (measured: from a subdirectory git
+    // confines the listing to the pathspec = that subdirectory, so an unmerged
+    // file elsewhere in the tree is reported as NOT conflicted and the remedy is
+    // denied with a misleading reason). With cwd = toplevel, `--full-name`
+    // output is root-relative, which is exactly what `resolve(top, p)` expects.
+    const out = execFileSync("git", ["ls-files", "-u", "--full-name"], {
+      cwd: top, encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"], timeout: 5000,
     });
-    // `<mode> <sha> <stage>\t<path>` — one line per unmerged stage.
-    return out.split("\n").map((l) => l.slice(l.indexOf("\t") + 1).trim()).filter((l) => l !== "");
+    // `<mode> <sha> <stage>\t<path>` — one line per unmerged STAGE, so the same
+    // path repeats (up to three times); the set is what callers mean.
+    const seen = new Set<string>();
+    for (const line of out.split("\n")) {
+      const i = line.indexOf("\t");
+      if (i < 0) continue;
+      const rel = line.slice(i + 1).trim();
+      if (rel !== "") seen.add(resolve(top, rel));
+    }
+    return [...seen];
   } catch {
     return [];
   }
 }
 
+// The canonical form of a path that may not exist yet: the real path of its
+// nearest EXISTING ancestor, with the remaining components appended. Comparing
+// these (rather than a lexical `resolve()`) is what makes "the same FILE spelled
+// differently" — through a symlink, a `..`, or a different base — the same
+// refusal. Round 3 compared the ledgers lexically while containment used the
+// canonical form, so a symlink inside the tree could reach a ledger through one
+// bound and not the other (review round 4, F1.2).
+function canonicalPath(p: string): string {
+  const rest: string[] = [];
+  let cur = p;
+  for (let i = 0; i < 64; i++) {
+    try {
+      if (existsSync(cur)) return join(realpathSync(cur), ...rest.reverse());
+    } catch {
+      return p;
+    }
+    const up = dirname(cur);
+    if (up === cur) return p;
+    rest.push(basenamePart(cur));
+    cur = up;
+  }
+  return p;
+}
+function basenamePart(p: string): string {
+  const i = Math.max(p.lastIndexOf("/"), p.lastIndexOf("\\"));
+  return i >= 0 ? p.slice(i + 1) : p;
+}
+
 export function checkpointWriteTargetAllowed(target: unknown, cwd: string = process.cwd()): boolean {
   if (typeof target !== "string" || target.trim() === "") return false;
   try {
-    const root = realpathSync(cwd);
     const abs = resolve(cwd, target);
-    // THE CONTENT BOUND (review round 3, F2): only a path git currently reports
-    // as UNMERGED. A worktree-wide allowance reached the artefacts that DECIDE
-    // this gate — `scripts/parallel_work_check.py` (which mints the PASS token)
-    // and `enforcement/dangerous-ops.txt` — so "inside the checkout" was a
-    // bound on the wrong thing. A stopped rebase asks for its CONFLICTED files
-    // and nothing else; anything else is not remediation.
-    const conflicted = conflictedPaths(cwd).map((p) => resolve(cwd, p));
-    if (!conflicted.includes(abs)) return false;
-    const ledgers = [tokenFile(), forceFile()].map((p) => resolve(cwd, p));
-    if (ledgers.includes(abs)) return false;
-    const real = nearestRealPath(abs);
-    if (!real || !pathInside(real, root)) return false;
+    const real = canonicalPath(abs);
+    // 1. THE GATE'S LEDGERS, by canonical IDENTITY — the force-pass file is the
+    //    gate's own second advance path and the token file is the first, so even
+    //    an UNMERGED path that resolves onto one of them is refused.
+    const ledgers = [tokenFile(), forceFile()].map((p) => canonicalPath(resolve(cwd, p)));
+    if (ledgers.includes(real) || ledgers.includes(abs)) return false;
+    // 2. THE GIT DIR — hooks/config/refs are not conflict content, and a `.git`
+    //    write outlives the rebase window entirely. Both the `.git` the path
+    //    names (a FILE in a linked worktree, so the prefix check matters) and the
+    //    git dir it resolves to.
     const gitDir = resolveGitDir(cwd);
     if (gitDir) {
-      const realGit = nearestRealPath(gitDir);
-      // BOTH the `.git` the path names (a directory in a normal checkout, a
-      // FILE in a linked worktree — the prefix check covers both, and refuses
-      // `.git/hooks/...` even where that path cannot exist on disk) and the git
-      // dir it resolves to.
-      const dotGitAbs = resolve(cwd, ".git");
+      const realGit = canonicalPath(gitDir);
       if (
-        pathInside(abs, dotGitAbs) ||
+        pathInside(abs, resolve(cwd, ".git")) ||
         pathInside(abs, gitDir) ||
-        (realGit && pathInside(real, realGit))
+        pathInside(real, realGit)
       ) return false;
     }
+    // 3. CONTAINMENT — an interrupted rebase can only be conflicted on tracked
+    //    files, and a rebase never touches anything outside the checkout.
+    const root = canonicalPath(cwd);
+    if (!pathInside(real, root)) return false;
+    // 4. THE CONTENT BOUND (review round 3, F2): only a path git currently
+    //    reports as UNMERGED. A worktree-wide allowance reached the artefacts
+    //    that DECIDE this gate — `scripts/parallel_work_check.py` (which mints
+    //    the PASS token) and `enforcement/dangerous-ops.txt` — so "inside the
+    //    checkout" was a bound on the wrong thing.
+    const conflicted = conflictedPaths(cwd);
+    if (!conflicted.includes(abs) && !conflicted.includes(real)) return false;
     return true;
   } catch {
     return false;
@@ -2104,7 +2191,7 @@ export function gateGuidance(step: Step, mode: Mode = "gate"): string {
     if (!resolvedBin) {
       return `→ To proceed: set AGENT_INFRA_PATH (a required prerequisite per AGENTS.md), then run \`…/scripts/parallel_work_check.sh ${requiredPhase}\` until the verdict is CLEAR (writes the PASS token).
 → If the checker reports STALE (behind origin/main), clear it first: \`git fetch\`, then rebase, then re-run the checker. With uncommitted work (the normal case at this step) use \`git rebase --autostash origin/main\` — a plain rebase refuses to start on a dirty tree.
-→ If that rebase stops on a conflict, resolve the CONFLICTED file in place (edit/write are admitted while a rebase is in progress, for the unmerged paths only), then \`git add\` and \`git rebase --continue\`.
+→ If that rebase stops on a conflict, resolve the CONFLICTED path in place (edit/write are admitted while a rebase is in progress, for the unmerged paths only; a delete/modify conflict is resolved with \`git rm\` on that same path), then \`git add\` (or \`git rm\`) and \`git rebase --continue\`.
 → Escape tools available: read, loop_enforcer, and bash for the checker invocation or the stale-branch remedy (git fetch, git status, git diff, git rebase, git add)
 → If the check cannot CLEAR in this environment, the checkpoint is unpassable — end your turn and report`;
     }
@@ -2123,7 +2210,7 @@ export function gateGuidance(step: Step, mode: Mode = "gate"): string {
       : "";
     return `→ To proceed: run \`${enforcePrefix}${resolvedBin} ${requiredPhase}\`${ghostHint} until the verdict is CLEAR (writes the PASS token).
 → If the checker reports STALE (behind origin/main), clear it first: \`git fetch\`, then rebase, then re-run the checker. With uncommitted work (the normal case at this step) use \`git rebase --autostash origin/main\` — a plain rebase refuses to start on a dirty tree.
-→ If that rebase stops on a conflict, resolve the CONFLICTED file in place (edit/write are admitted while a rebase is in progress, for the unmerged paths only), then \`git add\` and \`git rebase --continue\`.
+→ If that rebase stops on a conflict, resolve the CONFLICTED path in place (edit/write are admitted while a rebase is in progress, for the unmerged paths only; a delete/modify conflict is resolved with \`git rm\` on that same path), then \`git add\` (or \`git rm\`) and \`git rebase --continue\`.
 → Escape tools available: read, loop_enforcer, and bash for the checker invocation or the stale-branch remedy (git fetch, git status, git diff, git rebase, git add)
 → If the check cannot CLEAR in this environment, the checkpoint is unpassable — end your turn and report`;
   }
@@ -2316,6 +2403,16 @@ export function validateToolCall(
       return { block: false };
     }
     if (isCheckpointEscape(toolName, command)) {
+      // #1418 (round 4, F3): `git rm` is bounded to the UNMERGED set — the
+      // deletions a stopped rebase is actually asking about.
+      const rmTargets = toolName === "bash" ? rebaseRmTargets(command) : null;
+      if (rmTargets) {
+        const unmerged = conflictedPaths();
+        const stray = rmTargets.filter((t) => !unmerged.includes(t));
+        if (stray.length > 0) {
+          return { block: true, reason: `⛔ checkpoint gate — \`git rm\` is admitted only for an UNMERGED path during a rebase; not unmerged: ${stray.join(", ")}` };
+        }
+      }
       // #357 (Task 7): wrong-phase guard (checkpoint_token_fresh extension) —
       // a checker bash whose phase ≠ this step's token_phase would write a
       // token that can NEVER satisfy this checkpoint → block with guidance
