@@ -49,9 +49,50 @@ fi
 . "$BOUNDED"
 trap 'tb_watchdogs_reap 2>/dev/null || true' EXIT
 
+# ⛔ `date -u -d "@<epoch>"` IS GNU-ONLY, and this file already paid for that class once (the
+# `timeout` note above). It was the whole of `status`'s timestamp: on a Mac cell `--status` printed
+# `last pass: 1794079255 (…) -> ?` — a HUMAN-READABLE field that silently became a question mark,
+# while every numeric check stayed green, so nothing ever reported it.
+# ⛔ AND IT CANNOT SOURCE THE SHIM. The repo's one date shim is scripts/lib/box.sh::box_epoch_to_iso,
+# but THIS FILE IS FARMED (`fleet_srcs`) and box.sh is deliberately not — the same constraint
+# scripts/cloud-cell-supervisor.sh records in scripts/portability-baseline.tsv for `box_ncpu`. A
+# sourced path that resolves in the checkout and 404s on every cell is exactly the
+# two-paths-that-look-alike defect; so probe the two mechanisms here, in box.sh's own order
+# (`date -r` is BSD, `date -d` is GNU). Degrade to the RAW EPOCH, never to `?`: a missing mechanism
+# should cost a format, never the datum.
+_iso() { # <epoch> -> ISO-8601Z on stdout, or the raw epoch when no mechanism could render it
+  local e="$1" out="" rt=""
+  # Non-numeric is not an epoch: hand it back untouched rather than inventing a date.
+  case "$e" in ''|*[!0-9]*) printf '%s\n' "$e"; return 0 ;; esac
+  # ⛔ GNU FIRST, AND THE BSD ARM IS ROUND-TRIP VERIFIED (review cycle-2 P1.2). The previous version
+  # tried `date -u -r "$e"` FIRST, and on coreutils `-r` means "reference FILE": when a file whose name
+  # looks like the epoch exists in the cwd, that arm SUCCEEDS and answers with the FILE's mtime. The
+  # ±86400 s plausibility window it was given cannot catch that, because a beacon written minutes ago is
+  # inside the window by construction — the guard was unfalsifiable for the only realistic input.
+  # Worse, the ISO arm's stdout was never captured, so on a real BSD `date` this function printed TWO
+  # lines (the ISO, then a stray bare epoch). So: `-d @` first (it cannot be confused with a file), and
+  # for the BSD arm demand an EXACT round-trip — a file mtime essentially never equals the epoch asked
+  # for. Contract unchanged: degrade to the raw epoch, never invent a value.
+  out="$(date -u -d "@$e" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)" || out=""
+  if [ -z "$out" ]; then
+    rt="$(date -u -r "$e" +%s 2>/dev/null)" || rt=""
+    case "$rt" in ''|*[!0-9]*) rt="" ;; esac
+    if [ -n "$rt" ] && [ "$rt" = "$e" ]; then
+      out="$(date -u -r "$e" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)" || out=""
+    fi
+  fi
+  printf '%s\n' "${out:-$e}"
+}
+
 SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
 BOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/conflict-rebase.py"
-STATE="${HOME}/.pi/agent/state/conflict-rebase"
+# ⛔ THE STATE DIR IS A SEAM, NOT A CONSTANT. The systemd unit and the launchd plist both EXPORT
+# CONFLICT_REBASE_STATE (so the scheduled pass, `status`, and activate-harness.sh read one directory),
+# and before this line the wrapper ignored it: the artifact said one path while the beacon, log, brake
+# and last-failure were written to another. A unit whose stated state dir is not the one its process
+# uses is the two-paths-that-look-alike defect the harness keeps removing — and a `pause` written to
+# the exported path would not have been seen by the pass that reads this one.
+STATE="${CONFLICT_REBASE_STATE:-${HOME}/.pi/agent/state/conflict-rebase}"
 PIDFILE="$STATE/timer.pid"
 BEACON="$STATE/timer.beat"
 LOG="$STATE/timer.log"
@@ -95,7 +136,24 @@ pass() {
 
 case "${1:-}" in
   start)
-    if [ "${2:-}" = "--once" ]; then pass once; exit $?; fi
+    if [ "${2:-}" = "--once" ]; then
+      # ⛔ THE BRAKE MUST HOLD ON THE SHAPE THE FLEET SCHEDULES. `pause` was honoured only by the
+      # detached-loop branch below, and `start --once` is exactly what a systemd timer / launchd job
+      # calls — so an operator's `pause` was IGNORED by the armed path, and the artifact that carries
+      # the brake (this file) would have read as if it worked. Measured 2026-11-07 while arming the
+      # timer (agent-infra#2698).
+      # Exit 0, not 1: a brake is a deliberate state, not a pass failure — a non-zero exit here would
+      # colour the unit red 48 times a day and teach the operator to ignore it.
+      # The beacon is deliberately NOT stamped: it means "a pass completed", and a paused tick that
+      # stamped it would be the same "the loop turned, so it must be healthy" false green this file's
+      # header rejects (see the END rc= note in pass()).
+      if [ -f "$STATE/PAUSED" ]; then
+        printf 'conflict-rebase-timer: PAUSED (%s exists) — no pass run; remove the file (or `%s resume`) to act\n' \
+          "$STATE/PAUSED" "$(basename "$SELF")"
+        exit 0
+      fi
+      pass once; exit $?
+    fi
     if [ -f "$PIDFILE" ]; then
       old="$(cat "$PIDFILE" 2>/dev/null || true)"
       if [ -n "$old" ] && kill -0 "$old" 2>/dev/null; then
@@ -132,7 +190,7 @@ case "${1:-}" in
     fi
     if [ -f "$BEACON" ]; then
       beat="$(cat "$BEACON")"; now="$(date +%s)"
-      echo "last pass: ${beat} ($(( now - beat ))s ago) -> $(date -u -d "@$beat" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || echo '?')"
+      echo "last pass: ${beat} ($(( now - beat ))s ago) -> $(_iso "$beat")"
     else
       echo "last pass: never"
     fi
