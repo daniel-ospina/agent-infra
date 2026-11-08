@@ -44,7 +44,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { homedir } from "node:os";
 import { execFileSync } from "node:child_process";
-import { existsSync, readFileSync, writeFileSync, appendFileSync, mkdirSync, unlinkSync, renameSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync, appendFileSync, mkdirSync, unlinkSync, renameSync, statSync } from "node:fs";
 import { resolve, join, dirname } from "node:path";
 import { isIP } from "node:net"; // #383 (Task 3, P3-1 FINAL mechanical): true IPv6 mirror — zero-dep builtin
 import { isPrintMode, isPrintModeEnv } from "../shared/print-mode.js";
@@ -1287,15 +1287,26 @@ export const CHECKPOINT_WHITESPACE_REJECT = /[^\S\u0020]|[\u200B-\u200D\u2060\u0
 //
 // The remedy set is POSITIVELY bounded to what the checker's own verdicts
 // prescribe — it is not a general widening of the hatch:
-//   * `git fetch` / `git status` / `git diff` — read-only (fetch moves remote
-//     refs only; it is what makes `behind` measurable in the first place).
+//   * `git fetch` / `git status` / `git diff` — read-only (fetch updates
+//     remote-tracking refs only; it is also what makes `behind` measurable).
+//     A REFSPEC or a repository URL is NOT admitted (review F2): `git fetch
+//     +refs/heads/x:refs/heads/y` writes a LOCAL ref non-fast-forward, which is
+//     a discard of that ref's previous position, so `:` and `+` are outside the
+//     value classes. `git fetch` takes at most ONE bare token.
 //   * `git rebase <ref>` + `--continue|--abort|--skip` — C4/C3 prescribes
 //     `rebase` verbatim (`options=rebase`); the three continuation flags are
-//     what finishes or unwinds a rebase that hit a conflict (without them the
-//     lane is stranded mid-rebase — the same circle, one level deeper).
-//   * `git add PATHS` — needed to stage a conflict resolution before
-//     `git rebase --continue`. Index-only; `git commit` stays blocked, so this
-//     can never land anything.
+//     what finishes or unwinds a rebase that hit a conflict.
+//   * `git add PATHS` — stages a conflict resolution before `--continue`.
+//     Index-only; `git commit` stays blocked, so this can never land anything.
+//   * `edit` / `write` while a rebase is IN PROGRESS — without them the conflict
+//     path is the same circle one level deeper (review F1): `git rebase` only
+//     REPLAYS, `git add` only stages what is already on disk, and no admitted
+//     command writes file content — so a lane stopped on a content conflict
+//     could only `--skip` (discard the commit), `--abort` (back to STALE), or
+//     stage the conflict MARKERS and continue. A rebase in progress is detected
+//     from the checkout (`rebase-merge/` or `rebase-apply/` in the git dir —
+//     the `.git` file indirection of a linked worktree is followed), so the
+//     allowance exists only inside the remediation window this escape opens.
 // NONE of these can advance the step: only a fresh phase-correct CLEAR token
 // can, and no admitted command can forge one. Value classes are the same
 // safe set the checker escape uses and reject a LEADING `-`, which is what
@@ -1303,8 +1314,8 @@ export const CHECKPOINT_WHITESPACE_REJECT = /[^\S\u0020]|[\u200B-\u200D\u2060\u0
 // `git fetch --upload-pack=…`, `git -c core.pager=…`), plus every shell
 // metacharacter. The whitespace pre-check above is shared, so tabs, newlines
 // and zero-width characters are rejected identically.
-const _REF = "[A-Za-z0-9_./@+:][A-Za-z0-9_./@:+-]*";
-const _PATH = "[A-Za-z0-9_./@+][A-Za-z0-9_./@:+-]*";
+const _REF = "[A-Za-z0-9_./@][A-Za-z0-9_./@-]*";
+const _PATH = "[A-Za-z0-9_./@][A-Za-z0-9_./@-]*";
 export const CHECKPOINT_REMEDY_RE = new RegExp(
   "^git[ ]+(?:" +
     `(?:fetch|status|diff)(?:[ ]+${_REF})?` +
@@ -1323,6 +1334,40 @@ export function isCheckpointEscape(toolName: string, command: unknown): boolean 
   if (typeof command !== "string") return false;
   if (CHECKPOINT_WHITESPACE_REJECT.test(command)) return false;
   return CHECKPOINT_ESCAPE_RE.test(command) || CHECKPOINT_REMEDY_RE.test(command);
+}
+
+// #1418 (review F1): is a rebase IN PROGRESS in this checkout? This is what
+// makes the conflict-resolution step of the remedy reachable, and it is
+// deliberately a FILESYSTEM read (no subprocess on the tool_call hot path):
+// git marks an unfinished rebase by leaving `rebase-merge/` or `rebase-apply/`
+// in the git dir, and removes it on `--continue`/`--abort`/completion.
+// A LINKED WORKTREE has a `.git` FILE (`gitdir: <path>`) rather than a
+// directory — the lanes this gate runs in are exactly that shape — so the
+// indirection is followed. Any failure (unreadable `.git`, no git dir, a
+// malformed gitdir line) returns FALSE: the allowance is fail-closed, and an
+// undetected rebase leaves the lane where it was before this change.
+let rebaseProbeForTest: (() => boolean) | null = null;
+export function _setRebaseProbeForTest(fn: (() => boolean) | null): void {
+  if (process.env.NODE_ENV !== "test") return;
+  rebaseProbeForTest = fn;
+}
+export function rebaseInProgress(cwd: string = process.cwd()): boolean {
+  if (rebaseProbeForTest) return rebaseProbeForTest();
+  const markers = ["rebase-merge", "rebase-apply"];
+  try {
+    let gitDir = resolve(cwd, ".git");
+    const st = statSync(gitDir, { throwIfNoEntry: false });
+    if (!st) return false;
+    if (st.isFile()) {
+      const gitdirLine = readFileSync(gitDir, "utf-8");
+      const m = /^gitdir:[ ]*(.+)$/m.exec(gitdirLine);
+      if (!m) return false;
+      gitDir = resolve(cwd, m[1]!.trim());
+    }
+    return markers.some((d) => existsSync(join(gitDir, d)));
+  } catch {
+    return false;
+  }
 }
 
 // #357 (Task 7): extract the checker's phase argument (the first positional arg
@@ -1940,6 +1985,7 @@ export function gateGuidance(step: Step, mode: Mode = "gate"): string {
     if (!resolvedBin) {
       return `→ To proceed: set AGENT_INFRA_PATH (a required prerequisite per AGENTS.md), then run \`…/scripts/parallel_work_check.sh ${requiredPhase}\` until the verdict is CLEAR (writes the PASS token).
 → If the checker reports STALE (behind origin/main), clear it first: \`git fetch\` then \`git rebase origin/main\`, then re-run the checker.
+→ If that rebase stops on a conflict, resolve it in place (edit/write are admitted while a rebase is in progress), then \`git add\` and \`git rebase --continue\`.
 → Escape tools available: read, loop_enforcer, and bash for the checker invocation or the stale-branch remedy (git fetch, git status, git diff, git rebase, git add)
 → If the check cannot CLEAR in this environment, the checkpoint is unpassable — end your turn and report`;
     }
@@ -1958,6 +2004,7 @@ export function gateGuidance(step: Step, mode: Mode = "gate"): string {
       : "";
     return `→ To proceed: run \`${enforcePrefix}${resolvedBin} ${requiredPhase}\`${ghostHint} until the verdict is CLEAR (writes the PASS token).
 → If the checker reports STALE (behind origin/main), clear it first: \`git fetch\` then \`git rebase origin/main\`, then re-run the checker.
+→ If that rebase stops on a conflict, resolve it in place (edit/write are admitted while a rebase is in progress), then \`git add\` and \`git rebase --continue\`.
 → Escape tools available: read, loop_enforcer, and bash for the checker invocation or the stale-branch remedy (git fetch, git status, git diff, git rebase, git add)
 → If the check cannot CLEAR in this environment, the checkpoint is unpassable — end your turn and report`;
   }
@@ -2018,13 +2065,15 @@ export function getExpectedToolsForStep(step: Step): { allow: string[]; block: R
   // checkpoint (issue #5039): token-gated — validateToolCall blocks everything
   // until a fresh phase-correct CLEAR token exists, EXCEPT the #357 (d) escape
   // (read/loop_enforcer/sole-command checker) plus the #1418 stale-branch
-  // remedy set (git fetch/status/diff/rebase/add). The allow list here mirrors
-  // the escape so audit entries reflect what an agent may actually use at the
-  // gate — it names the TOOLS reachable, and the `hint` field spells out the
-  // per-tool constraint (the same shape the verifier gate uses for `task`).
-  // Omitting `bash` here meant the audit told a stranded lane that only
-  // read+loop_enforcer were usable while the checker invocation it was being
-  // told to run was in fact permitted (#1418 comment thread).
+  // remedy set (git fetch/status/diff/rebase/add, and edit/write while a rebase
+  // is in progress). The allow list here mirrors the escape so audit entries
+  // reflect what an agent may actually use at the gate — it names the TOOLS
+  // reachable, and the `hint` field spells out the per-tool constraint (the
+  // same shape the verifier gate uses for `task`). Omitting `bash` here meant
+  // the audit told a stranded lane that only read+loop_enforcer were usable
+  // while the checker invocation it was being told to run was in fact
+  // permitted (#1418 comment thread). `edit`/`write` are NOT listed because
+  // they are conditional on a rebase being in progress; the hint says so.
   if (gate === "checkpoint") {
     return { allow: ["read", "loop_enforcer", "bash"], block: [] };
   }
@@ -2130,6 +2179,15 @@ export function validateToolCall(
     // No fresh token — the escape is the ONLY way out: read, loop_enforcer,
     // or the sole-command checker invocation (CLEAR-able). Everything else
     // fails closed with the token reason + escape guidance.
+    // #1418 (review F1): the conflict-resolution step of the remedy. `git
+    // rebase` only REPLAYS and `git add` only stages what is already on disk,
+    // so a rebase stopped on a content conflict has no reachable exit unless
+    // the agent can EDIT the file — it could otherwise only `--skip` (discard
+    // the commit), `--abort` (straight back to STALE), or stage the conflict
+    // markers. Bounded to the rebase window: outside it these stay blocked.
+    if ((toolName === "edit" || toolName === "write") && rebaseInProgress()) {
+      return { block: false };
+    }
     if (isCheckpointEscape(toolName, command)) {
       // #357 (Task 7): wrong-phase guard (checkpoint_token_fresh extension) —
       // a checker bash whose phase ≠ this step's token_phase would write a

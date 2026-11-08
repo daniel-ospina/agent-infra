@@ -17,6 +17,8 @@ import {
   getExpectedToolsForStep,
   gateGuidance,
   isCheckpointEscape,
+  rebaseInProgress,
+  _setRebaseProbeForTest,
   validateToolCall,
   handleSequenceTimeout,
   parkDiagnosis,
@@ -662,6 +664,9 @@ for (const cmd of [
   "git status",
   "git diff",
   "git diff origin/main",
+  "git fetch FETCH_HEAD",
+  "git rebase FETCH_HEAD",
+  "git rebase refs/heads/main",
   "git add src/a.ts",
   "git add src/a.ts src/b.ts",
   "git add .",
@@ -687,7 +692,18 @@ for (const cmd of [
   "git add --all",
   "git rebase --exec bash -c x",
   "git rebase -x id",
+  "git rebase --onto origin/main HEAD",
+  "git status -s",
   "git fetch --upload-pack=evil",
+  // #1418 review F2: a REFSPEC or a repository URL is not "a ref" —
+  // `git fetch +refs/heads/x:refs/heads/y` writes a LOCAL ref non-fast-forward
+  // (a discard of its previous position), and an arbitrary URL is a remote
+  // this repo never agreed to fetch from.
+  "git fetch +refs/heads/evil:refs/heads/main",
+  "git fetch +refs/heads/x:refs/heads/y",
+  "git fetch refs/heads/x:refs/heads/y",
+  "git fetch https://evil.example.com/repo",
+  "git rebase +refs/heads/x:refs/heads/y",
   "git -c core.pager=evil rebase origin/main",
   "git rebase origin/main && rm -rf /",
   "git fetch; rm -rf /",
@@ -721,6 +737,67 @@ await test("#1418 the full stale-branch loop closes at ONE pending checkpoint: S
     const r = validateToolCall("bash", cmd, step, "gate");
     ok(!r.block, `step of the remediation loop must be reachable: ${cmd} — ${r.reason}`);
   }
+});
+
+// #1418 review F1: the CONFLICT path of the remedy. `git rebase` only replays
+// and `git add` only stages what is on disk — so without an admitted WRITE, a
+// rebase stopped on a content conflict could only `--skip` (discard the
+// commit), `--abort` (straight back to the STALE state) or stage the conflict
+// markers. edit/write are admitted ONLY while a rebase is in progress.
+await test("#1418 F1: edit/write are BLOCKED at a pending checkpoint when no rebase is in progress", () => {
+  _setTokenFileForTest(null);
+  _setRebaseProbeForTest(() => false);
+  try {
+    ok(validateToolCall("edit", "a.ts", checkpointStep(), "gate").block, "edit blocked outside a rebase");
+    ok(validateToolCall("write", "a.ts", checkpointStep(), "gate").block, "write blocked outside a rebase");
+  } finally { _setRebaseProbeForTest(null); }
+});
+
+await test("#1418 F1: edit/write are ADMITTED at a pending checkpoint while a rebase is in progress", () => {
+  _setTokenFileForTest(null);
+  _setRebaseProbeForTest(() => true);
+  try {
+    ok(!validateToolCall("edit", "a.ts", checkpointStep(), "gate").block, "edit admitted mid-rebase");
+    ok(!validateToolCall("write", "a.ts", checkpointStep(), "gate").block, "write admitted mid-rebase");
+  } finally { _setRebaseProbeForTest(null); }
+});
+
+await test("#1418 F1: the full CONFLICT loop is reachable at one pending checkpoint (rebase stops → edit → add → continue)", () => {
+  _setTokenFileForTest(null);
+  _setRebaseProbeForTest(() => true);
+  const step = makeStep({ name: "check", gate: "checkpoint", token_phase: "implement" });
+  try {
+    ok(!validateToolCall("bash", "git rebase origin/main", step, "gate").block, "rebase reachable");
+    ok(!validateToolCall("edit", "src/conflicted.ts", step, "gate").block, "conflict resolution reachable");
+    ok(!validateToolCall("bash", "git add src/conflicted.ts", step, "gate").block, "staging reachable");
+    ok(!validateToolCall("bash", "git rebase --continue", step, "gate").block, "continuation reachable");
+    ok(!validateToolCall("bash", "parallel_work_check.sh implement", step, "gate").block, "checker re-run reachable");
+    // …and the allowance dies with the rebase: the step still cannot advance
+    // without a fresh CLEAR token.
+    _setRebaseProbeForTest(() => false);
+    ok(validateToolCall("edit", "src/conflicted.ts", step, "gate").block, "edit re-blocked once the rebase ends");
+  } finally { _setRebaseProbeForTest(null); }
+});
+
+await test("#1418 F1: rebaseInProgress() follows the linked-worktree `.git` FILE indirection and fails closed", () => {
+  const base = mkdtempSync(join(tmpdir(), "ckpt-rebase-"));
+  try {
+    const plain = join(base, "plain");
+    mkdirSync(join(plain, ".git", "rebase-merge"), { recursive: true });
+    ok(rebaseInProgress(plain), "a normal checkout with .git/rebase-merge → in progress");
+
+    const wtee = join(base, "wt");
+    const realGit = join(base, "main-git", "worktrees", "w1");
+    mkdirSync(join(realGit, "rebase-apply"), { recursive: true });
+    mkdirSync(wtee, { recursive: true });
+    writeFileSync(join(wtee, ".git"), `gitdir: ${realGit}\n`);
+    ok(rebaseInProgress(wtee), "a LINKED WORKTREE (.git is a file) resolves its gitdir → in progress");
+
+    const idle = join(base, "idle");
+    mkdirSync(join(idle, ".git"), { recursive: true });
+    ok(!rebaseInProgress(idle), "no rebase markers → false");
+    ok(!rebaseInProgress(join(base, "does-not-exist")), "no checkout at all → false (fail-closed, never throws)");
+  } finally { rmSync(base, { recursive: true, force: true }); }
 });
 
 await test("#1418 at an ALREADY-ok checkpoint the remedy proceeds (not the checker-fresh guard)", () => {
