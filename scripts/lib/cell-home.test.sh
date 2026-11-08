@@ -225,6 +225,28 @@ else
   bad "d-farm pi-bootstrap/setup.sh does NOT farm the resolver (every farmed consumer degrades to \$HOME)"
 fi
 
+# ⛔ AN EMPTY CELL_HOME IS THE FILESYSTEM ROOT, NOT A HOME (`O=/orchestrator`,
+# `SCRIPTS=/.pi/agent/scripts`, a layer installed at `/.pi/agent`). The d-arm above proves the resolver
+# is SOURCED when it is there; these arms cover what a consumer does when it is NOT, which is the half
+# that used to walk to `/` in seven of the twelve.
+NORES="$T/nores"; mkdir -p "$NORES/a" "$NORES/b"
+cp "$REPO_ROOT/scripts/orchestrator-harness/cloud-cell-doctor.sh" "$NORES/a/"
+cp "$REPO_ROOT/scripts/pr-repair-loop.sh" "$NORES/b/"
+_out="$(env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin bash "$NORES/a/cloud-cell-doctor.sh" status 2>&1)"; _rc=$?
+[ "$_rc" = 78 ] && ok "d2 a consumer with NO resolver and no HOME REFUSES (rc 78) — it does not compute O=/orchestrator" \
+  || bad "d2 the consumer carried on with an empty home (rc $_rc)"
+case "$_out" in *"refusing to default the cell home"*) ok "d3 …and the refusal names what it will not invent" ;; *) bad "d3 the refusal does not explain itself" ;; esac
+env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin bash "$NORES/b/pr-repair-loop.sh" --help >/dev/null 2>&1
+[ "$?" = 78 ] && ok "d4 …for SCRIPTS=…/… too (one rule, not a per-file opinion)" \
+  || bad "d4 the second consumer answered differently"
+for rel in pi-bootstrap/cell-install.sh scripts/disk-reaper-run.sh scripts/install-repair-service.sh \
+           scripts/pr-repair-loop.sh scripts/orchestrator-bringup.sh \
+           scripts/orchestrator-harness/cloud-cell-doctor.sh scripts/orchestrator-harness/refresh-candidates.sh; do
+  grep -q 'refusing to default the cell home' "$REPO_ROOT/$rel" \
+    && ok "d5 $rel carries the empty-home refusal" \
+    || bad "d5 $rel has NO empty-home refusal (a missing resolver would land in /)"
+done
+
 printf '\n── (e) NON-VACUITY (the arms must redden when the behaviour is reverted) ─────────────\n'
 
 # e1: a lib whose fleet default is the LEGACY path must make b1 answer the legacy home — that is what
@@ -273,6 +295,19 @@ if grep -q 'CELL_HOME="${CELL_HOME:-/tmp/cell-home}"' "$OLD" && ! grep -q 'cell-
   ok "e4 the pre-#3453 consumer shape trips BOTH probes (legacy default AND no resolver)"
 else
   bad "e4 the pre-#3453 consumer shape does not trip both probes"
+fi
+
+# e5: remove the empty-home refusal and d2 can no longer see it — the arm measures the GUARD, not the
+# shape of a script that would fail for some other reason.
+MUTD="$T/nores/mut"; mkdir -p "$MUTD"
+sed '/refusing to default the cell home/d' "$REPO_ROOT/scripts/orchestrator-harness/cloud-cell-doctor.sh" >"$MUTD/cloud-cell-doctor.sh"
+if cmp -s "$REPO_ROOT/scripts/orchestrator-harness/cloud-cell-doctor.sh" "$MUTD/cloud-cell-doctor.sh"; then
+  bad "e5 the refusal mutation could not be applied — d2 is not checking the guard"
+else
+  env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin bash "$MUTD/cloud-cell-doctor.sh" status >/dev/null 2>&1
+  _m=$?
+  [ "$_m" != 78 ] && ok "e5 WITHOUT the refusal the consumer no longer exits 78 (got rc $_m) — d2 measures the guard" \
+    || bad "e5 the mutated consumer still exits 78 — d2 is not measuring the guard"
 fi
 
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
