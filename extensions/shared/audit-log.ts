@@ -60,9 +60,12 @@ export const GATE_EVENT_NAMES = [
   //                   emit it). When `root` is NOT the caller's own root the merge is
   //                   INSPECTION-ONLY: it is paired with `gate_recovery_foreign_root` and the
   //                   entries are inert for git ops rooted elsewhere. When `root` IS the caller's
-  //                   own root the merge is LIVE — it is the state that gates the op. Both shapes
-  //                   occur at session_start (own root, then an inspected sibling) and at the
-  //                   git-op path (that op's own root), so read `root`, never the count alone (#1265).
+  //                   own root the merge is LIVE — it is the state that gates the op.
+  //                   `session_start` has two call sites, own-root (LIVE) and inspected sibling
+  //                   (INSPECTION-ONLY), and at most ONE of them emits: a sibling is only
+  //                   inspected when the own root has no entries (`pickVerifiedRoot` returns null
+  //                   otherwise). The git-op path emits only the LIVE shape — it recovers for the
+  //                   op's own resolved cwd. So read `root`, never the count alone (#1265).
   "gate_recovery_empty", // verification-gate #264/#1265: a task child recovered ZERO entries for its own
   //                          root — every changed-file commit will block until it self-verifies
   "gate_recovery_foreign_root", // verification-gate #1265: a same-repo sibling's entries were merged for

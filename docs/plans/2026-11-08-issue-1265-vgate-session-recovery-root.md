@@ -225,7 +225,10 @@ reader contract. Filing a roster pin (emit-site `event:` literals ⊆ `GateEvent
   (`extensions/shared/audit-log.test.ts` — path + row schema, no `event` filter;
   `extensions/verification-gate/index.e2e.test.ts`'s `readAuditLines()`;
   `extensions/review-enforcer/index.test.ts`;
-  `extensions/review-enforcer/index.spawn-evidence.test.ts` — the latter three select by `event`), plus
+  `extensions/review-enforcer/index.spawn-evidence.test.ts`;
+  `extensions/main-worktree-guard/test-module-load.mjs` — selects by
+  `event === "guard_degraded"` and is unaffected by the four new names — the latter four select by
+  `event`), plus
   comment-only mentions in `scripts/registry-sync.sh` and `scripts/admin-merge.sh`. Those helpers are
   the closest thing to a regression check and they stay green.
   `audit-log.ts`'s header binds a reader to tolerate unknown **fields**; its `event —` line is a stale
