@@ -1,0 +1,36 @@
+{
+  "artifacts": [
+    {
+      "kind": "log",
+      "value": "/tmp/ct-keep/O/logs/lane-104.log"
+    },
+    {
+      "kind": "sha",
+      "value": "e71d3561d85ee7bc2582d3b973d14cf3bfc186a1"
+    },
+    {
+      "kind": "worktree",
+      "value": "/tmp/ct-keep/lbwt"
+    }
+  ],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 605,
+  "duration_s": 204,
+  "ended_at": 1794132447,
+  "exit_code": 0,
+  "heartbeat_at": 1794132447,
+  "host": "Daniels-MacBook-Air-new",
+  "issue": 104,
+  "kind": "lane",
+  "lane_id": "Daniels-MacBook-Air-new.klane-104-1794132243-p30847-e675e817",
+  "lease_until": 1794133052,
+  "pid": 30847,
+  "reason": "cap-hit:rc=0",
+  "repo": "daniel-ospina/agent-infra",
+  "schema": 1,
+  "started_at": 1794132243,
+  "state": "FAILED",
+  "tag": "104",
+  "worktree": "/private/tmp/ct-keep/lbwt"
+}
