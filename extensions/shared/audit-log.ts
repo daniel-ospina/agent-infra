@@ -56,9 +56,11 @@ export const GATE_EVENT_NAMES = [
   "bridge_clear", // #561: scripts/vgate.sh clear — root-scoped bridge rewrite (type-documentation; vgate.sh appends raw JSONL)
   "review_spawn_no_verdict", // #2665: a reviewer spawn returned no verdict (attempt, NOT a dispatch)
   "gate_recovery", // verification-gate: N verified entries were merged for `root` — the root the
-  //                   record NAMES. When that root is not the session's own, the merge is
-  //                   INSPECTION-ONLY and also emits `gate_recovery_foreign_root`; the entries stay
-  //                   inert for git ops rooted elsewhere (#1265). Read `root`, never the count alone.
+  //                   record NAMES. Two different merges emit it: at SESSION START, a same-repo
+  //                   sibling's entries merged for inspection are paired with
+  //                   `gate_recovery_foreign_root` and stay inert for git ops rooted elsewhere;
+  //                   from the GIT-OP path the merge is for that op's own root and is LIVE (it is
+  //                   the state that gates the op). Read `root`, never the count alone (#1265).
   "gate_recovery_empty", // verification-gate #264/#1265: a task child recovered ZERO entries for its own
   //                          root — every changed-file commit will block until it self-verifies
   "gate_recovery_foreign_root", // verification-gate #1265: a same-repo sibling's entries were merged for

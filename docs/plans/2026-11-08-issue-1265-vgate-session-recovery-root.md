@@ -1,5 +1,5 @@
 <!-- research-path: https://github.com/daniel-ospina/agent-infra/issues/1265#issuecomment-6722549255 -->
-<!-- plan-review: cycles=2, status=capped, exit_reason=adversarial-capped, version=2.3.0 -->
+<!-- plan-review: cycles=3, status=capped, exit_reason=adversarial-capped, version=2.3.0 -->
 
 # #1265 — session-start recovery counts a *sibling* worktree's entries, and the non-adoption never reaches the parent
 
@@ -13,8 +13,8 @@ history: `recoveryOnlyRoot` is **inspection-only** — its return never becomes 
 becomes the reported count — the `tool_call` handler's git-op path is
 `const cwd = resolveGitRoot(cdPath ?? inputCwd)`, and `pickVerifiedRoot` is documented
 RECOVERY-ONLY. (The narration `"…the git-op root is NOT adopted"` reached `origin/main` in
-`6580850cc`, #3334. PR #1780 is an unmerged side branch in this tree, so it is **not** cited as this
-head's evidence.)
+`6580850cc`, #3334.) PR #1780 **was** merged to `main` on 2026-10-15 (merge commit `26ad39a33`), but
+that commit is not an ancestor of today's `origin/main`, so it is not cited as this head's evidence.
 
 Two acceptance indicators in the issue are nevertheless still unmet at this head:
 
@@ -44,14 +44,16 @@ only root whose entries can cover this session's git ops, and the report must sa
 2. **Make the parent read `gate-events.jsonl` in the `task` return value.** Deferred, not rejected:
    it is a `extensions/builtin-tools` change (a different extension, a different test surface, and a
    risk of touching the dispatch return contract). AC (b) accepts "a **shared log**", and
-   `~/.pi/agent/audit/gate-events.jsonl` is that log. Note what this buys and what it does not:
-   **no PRODUCTION consumer of that file exists in this repo.** Its only readers are in-repo test
-   helpers — `extensions/shared/audit-log.test.ts` (which asserts `gateEventsFile()` itself),
-   `extensions/verification-gate/index.e2e.test.ts`'s `readAuditLines()`, and
-   `extensions/review-enforcer/index.test.ts` — and each of them filters by `event`; `gateEventsFile()`
-   has exactly one production caller, `appendJsonl`. So the record is durable and greppable by a
-   parent or a future reader, not consumed by a production instrument today. Recorded as a named
-   residual.
+   `~/.pi/agent/audit/gate-events.jsonl` is that log. Note precisely what this buys: **no production
+   consumer PARSES that file.** Its readers are (a) `scripts/vgate.sh`, which `tail`s the last lines in
+   `status()` for a human (never parses, never selects by `event`), and (b) in-repo TEST helpers —
+   `extensions/shared/audit-log.test.ts` (asserts the path and the row schema; selects by NOTHING),
+   `extensions/verification-gate/index.e2e.test.ts`'s `readAuditLines()`,
+   `extensions/review-enforcer/index.test.ts`, and
+   `extensions/review-enforcer/index.spawn-evidence.test.ts` (these three select by `event`).
+   `gateEventsFile()` has exactly one production caller, `appendJsonl`. So the record is durable and
+   greppable by a parent or a future reader, and no shipping instrument can mis-read the new names.
+   Recorded as a named residual.
 3. **Change root selection back to adoption.** Refused flat: it re-opens the fail-open documented in
    `pickVerifiedRoot`'s docblock (a clean adopted tree yields an EMPTY scope, and the empty-scope path
    ALLOWS an op carrying unverified content).
@@ -128,10 +130,12 @@ roots and 20+ tortoise roots in the live bridge), so this is the narrow one-sibl
    ("re-dispatch verification for `<this root>`") and state that adopting another tree's entries is
    refused by design; append `gate_root_mismatch` once per `(root, siblings)` fingerprint, reset at
    `session_start`.
-   *Proves it:* e2e 1265a — two identical blocked ops produce exactly one record. The `Set`-of-
-   fingerprints memo and the `.sort()` on the sibling list are a **refinement with no test of its own**:
-   1265a has one sibling, so it exercises one fingerprint and a one-element sort, which a single-slot
-   memo would pass equally. Stated as untested rather than claimed as covered.
+   *Proves it:* e2e 1265a — two identical blocked ops produce exactly one record, **and the `Set` memo
+   is discriminated**: the scenario adds a third worktree C and alternates B → C → B inside one
+   session, asserting B and C each land exactly ONE `gate_root_mismatch` (a single-slot memo
+   re-records B on the return visit and reddens it). What is still NOT discriminated is the `.sort()`
+   on the sibling list — each (root, siblings) pair here has one sibling, so it sorts a one-element
+   list.
 3. **`extensions/shared/audit-log.ts`**: add `gate_recovery`, `gate_recovery_empty`,
    `gate_recovery_foreign_root`, `gate_root_mismatch` to `GateEventName` (the first two were already
    emitted untyped — a pre-existing gap closed while adjacent).
@@ -167,7 +171,12 @@ marker is deliberately NOT `clean`; the residual class below is named rather tha
 |---|---|---|---|
 | 1 | fresh-context plan reviewer | 6 (2×P1, 4×P2) | all applied — R5's false "readers" claim, "Proves it: typecheck" for an unenforced union, pin count, a citation that is not in `origin/main`, undefined ACs + unjustified remedy rewrite, the out-of-vocabulary marker |
 | 2 | fresh-context plan reviewer | 8 (2×P1, 6×P2) | all applied — the reader inventory corrected in the OTHER direction (test helpers do read the log), the `Set`/`sort` refinement restated as untested, `#1780` replaced by the commit actually in `main` (`6580850cc`), the stale header enumeration stated as stale, `session_cwd` attribution corrected, "message-only" → "inspection-only", the #1265 measurement corrected (the FIRST of three dead children followed the `cd` remedy — not three), and the inverted prior pin counted |
-| 3 | fresh-context verification of the cycle-2 fixes | — | verdict recorded as the PR review comment on this PR |
+| 3 | fresh-context verification of the cycle-2 fixes (the deep-fix round the cap requires) | 7 (2×P1, 5×P2) | all applied — R3's "three children" corrected; step 2's "the `Set` is untested" replaced with what the tests now DO discriminate (`03227c5a2` — `f192265b3` before the branch was rebased onto `main`; patch-id `5e9bcada`, identical — added worktree C and the B→C→B alternation; only the `.sort()` remains untested); the reader inventory corrected a third time (`scripts/vgate.sh` `tail`s the file in `status()`, `audit-log.test.ts` selects by nothing, and a fourth test reader — `review-enforcer/index.spawn-evidence.test.ts` — added); #1780 restated (merged to `main` on 2026-10-15, but its merge commit is not in today's `origin/main`); the acceptance line scoped to the NAMED residual; the PR body's two falsehoods corrected in a comment plus the `[ADVERSARIAL-BOUND]` disclosure added |
+
+The same head was code-reviewed by a separate fresh context, which found one P2 in this diff: the
+`gate_recovery` comment in `audit-log.ts` described the inspection pairing as unconditional, when the
+git-op call site's recovery is for that op's OWN root and is live (it is the state that gates the op).
+Scoped to `session_start` and the distinction stated.
 
 **Named residual (not closed):** R5 asks whether a consumer of `gate-events.jsonl` mis-reads the new
 names or the changed `gate_recovery` payload. There is no production consumer in this repo, so no test
@@ -186,7 +195,9 @@ reader contract. Filing a roster pin (emit-site `event:` literals ⊆ `GateEvent
 - **R2** The new durable record floods the shared log (one line per git op) → caught by e2e 1265a:
   two identical blocked ops produce **exactly one** `gate_root_mismatch` line for that root.
 - **R3** The reworded diagnosis stops naming the correct root, or reintroduces the un-followable
-  remedy that led three children into another tree → caught by e2e 1265a's captured console: the
+  remedy that the **first of the three children killed in that worktree** followed into a tree it did
+  not own (the three deaths are attributed in #1265 to per-worktree determinism, not to three separate
+  followers) → caught by e2e 1265a's captured console: the
   mismatch remedy must say "re-dispatch verification for THIS root" naming worktree B's **realpath**,
   and must state that adoption is refused by design. (The *block reason* does not carry a root in this
   scenario — the sibling holds a DIFFERENT path, so `rootsHoldingPath` returns nothing to name; the
@@ -197,13 +208,16 @@ reader contract. Filing a roster pin (emit-site `event:` literals ⊆ `GateEvent
   mid-session bridge write is no longer seen → caught by the pre-existing e2e scenario 16
   (externally-written bridge recovered mid-session) staying green.
 - **R5** A consumer of `gate-events.jsonl` mis-reads the new names, or the changed `gate_recovery`
-  payload (it now carries `root`) → **no PRODUCTION consumer exists in this repo**, so the only
+  payload (it now carries `root`) → **no production consumer PARSES this file**, so the only
   evidence obtainable is the inventory itself: `gateEventsFile()` has one production caller
-  (`appendJsonl`, `audit-log.ts:81`); the other references are in-repo TEST helpers that read the file
-  (`extensions/shared/audit-log.test.ts`, `extensions/verification-gate/index.e2e.test.ts`'s
-  `readAuditLines()`, `extensions/review-enforcer/index.test.ts`), plus prose in
-  `scripts/vgate.sh`/`scripts/registry-sync.sh`/`scripts/admin-merge.sh`. Those helpers select by
-  `event`, so they are the closest thing to a regression check and they stay green.
+  (`appendJsonl`, `audit-log.ts:81`); `scripts/vgate.sh` `tail`s it for a human in `status()` and
+  selects nothing; the other references are in-repo TEST helpers that read the file
+  (`extensions/shared/audit-log.test.ts` — path + row schema, no `event` filter;
+  `extensions/verification-gate/index.e2e.test.ts`'s `readAuditLines()`;
+  `extensions/review-enforcer/index.test.ts`;
+  `extensions/review-enforcer/index.spawn-evidence.test.ts` — the latter three select by `event`), plus
+  comment-only mentions in `scripts/registry-sync.sh` and `scripts/admin-merge.sh`. Those helpers are
+  the closest thing to a regression check and they stay green.
   `audit-log.ts`'s header binds a reader to tolerate unknown **fields**; its `event —` line is a stale
   closed enumeration (pre-existing) that names none of the four new events. Recorded as a residual, not
   as a passing test.
@@ -217,10 +231,12 @@ reader contract. Filing a roster pin (emit-site `event:` literals ⊆ `GateEvent
 **Out of scope — must NOT be raised** (note, file, do not chase):
 - the `task` **return value** channel (a `builtin-tools` change) — named as a residual in the research
   artifact and followed up as its own issue;
-- root selection / adoption policy (the narration on `origin/main` came from `6580850cc`; #1780 is
-  an unmerged side branch, and #1303's own correction records the keying as intended);
+- root selection / adoption policy (the narration in today's `origin/main` came from `6580850cc`;
+  #1780's merge commit `26ad39a33` is not in that history; #1303's own correction records the keying as
+  intended);
 - the `#1303` block-message root-naming work, and any prose preference about `#3255` numbering;
 - pre-existing defects outside this diff.
 
 **Acceptance:** every `R<n>` that is test-backed names a test that CAN fail (R1-R4), R5 is an
-inventory-backed residual stated as such, and no open item remains on the declared surface.
+inventory-backed residual stated as such, and no UN-NAMED open item remains on the declared surface
+(R5 is the named one).
