@@ -66,6 +66,7 @@ Exit codes are the answer, not the pixels:
 | `0` | **CONFIRMED** — the line was sent and the proof fired: the session transcript **advanced** (resume arm), or a **fresh session appeared / the pane left the shell prompt** (`--new` arm) |
 | `3` | **REFUSED** — a guard refused and nothing was sent; the message names the guard |
 | `4` | **UNCONFIRMED** — sent, but the proof did not fire inside `--wait`; the message carries the pane tail and names the signal that arm was actually watching |
+| `5` | **DRY-RUN** — `--dry-run`: nothing was sent. Deliberately NOT `0`, which means CONFIRMED ("sent AND proven") — a scripted caller reading `$?` must not be told the lane came back |
 | `1` | **ERROR** — the tool itself raised. Never reported as DRY-RUN or as an unconfirmed send: the operator's next move is chosen on this line |
 
 The launch line it sends is the form the fleet's own recovery used to bring back 14 lanes (issue

@@ -54,6 +54,7 @@ EXIT
     0  CONFIRMED    the launch line was sent AND the session transcript advanced
     3  REFUSED      a guard refused; nothing was sent (the message names the guard)
     4  UNCONFIRMED  the line was sent (or the send failed) and no advance was observed
+    5  DRY-RUN      --dry-run: NOTHING was sent, so 0 (CONFIRMED) would be a false PASS
     1  ERROR        the tool itself raised (never reported as DRY-RUN or UNCONFIRMED)
     2  usage error
 """
@@ -206,6 +207,17 @@ def _transcripts(ls):
     raises, so the distinction is real; an ABSENT root is still an empty set (no transcripts can
     pre-exist a directory that does not exist).
     """
+    # ⛔ AN ABSENT ROOT IS NOT THE SAME AS ONE WE COULD NOT REACH (review round 4, P2). `os.path.isdir`
+    # swallows EVERY `OSError` — EACCES on an untraversable parent, ESTALE/EIO on a network mount,
+    # ELOOP — not just ENOENT, so those read as a valid EMPTY baseline and re-opened the very
+    # false-CONFIRM this function exists to prevent. Only ENOENT is an absence; anything else is
+    # UNKNOWN.
+    try:
+        os.stat(ls.SD)
+    except FileNotFoundError:
+        return set()
+    except OSError:
+        return None
     try:
         if not os.path.isdir(ls.SD):
             return set()
@@ -340,12 +352,19 @@ def relaunch(ws, label="", cwd=None, session=None, pi=None, new=False, wait=45.0
     # ⛔ `--new` NEEDS NO RESUME TARGET, SO IT MUST NOT BE BLOCKED BY ONE (review round 3, P2).
     # `--new` is the documented escape hatch for "the stored resume target is broken"; refusing it
     # BECAUSE that target is broken blocks the remedy with the defect it remedies.
-    if not sid and not new:
+    # ⛔ BEST-EFFORT ON THE `--new` ARM (review rounds 3+4). `--new` needs no resume target, so a
+    # resolver that RAISES must not block it — that would refuse the remedy with the defect it
+    # remedies. But we still want the pre-launch identity as a SENTINEL, to recognise the stale id
+    # the resolver falls back to after the send (see `pre_sid` below). So: always try, refuse only on
+    # the resume arm.
+    if not sid:
         try:
             sid = ls.resolve_session(ws) or None
         except Exception as exc:                                 # noqa: BLE001
-            return refuse("session resolve RAISED (%s) — UNKNOWN; nothing sent"
-                          % exc.__class__.__name__)
+            if not new:
+                return refuse("session resolve RAISED (%s) — UNKNOWN; nothing sent"
+                              % exc.__class__.__name__)
+            sid = None                                           # --new proceeds without a baseline
     path = None
     if sid:
         try:
@@ -365,6 +384,12 @@ def relaunch(ws, label="", cwd=None, session=None, pi=None, new=False, wait=45.0
     # The nulling below is therefore what makes the fresh arm measure a TRANSITION — and the id it
     # discards is deliberately NOT carried into the result: reporting it would name a session the
     # operator asked to abandon (review round 3, P2).
+    # ⛔ `pre_sid` IS KEPT AS A SENTINEL, NOT AS A FALLBACK (review round 4, P1). `lane-status`'s
+    # real `resolve_session` falls back to the RECORDED id in `lane-sessions.json` — which this tool
+    # never writes — whenever the pane carries no cmux resume record, and that is exactly the state a
+    # manual relaunch leaves behind (`lane-status.py:957-961` says so). So `sid_after` alone can come
+    # back equal to the id `--new` was asked to abandon; the fresh arm must compare against it.
+    pre_sid = sid
     if new:
         sid, path, fresh = None, None, True
 
@@ -447,10 +472,13 @@ def relaunch(ws, label="", cwd=None, session=None, pi=None, new=False, wait=45.0
             cands = _newest_first(new_files, 5)
             hit = next((p for p in cands if _records_cwd(ls, p, cwd)), None)
             if hit:
-                # ⛔ `sid_after`, NOT `sid_after or pre_sid` (review round 3, P2): `pre_sid` is the
-                # id `--new` exists to ABANDON, so falling back to it reported a fresh relaunch as
-                # bound to the stale session. Unknown is `None`, which is honest.
-                obs.update(confirmed=True, sid=sid_after,
+                # ⛔ ONLY AN ID THAT IS GENUINELY NEW (review rounds 3+4, P2 then P1). `pre_sid` is
+                # the id `--new` exists to ABANDON, and the real resolver FALLS BACK to it — so
+                # neither `sid_after or pre_sid` nor a bare `sid_after` is correct: the id must be
+                # reported only when it differs from the one we were told to discard. Unknown is
+                # `None`, which is honest.
+                obs.update(confirmed=True,
+                           sid=(sid_after if sid_after and sid_after != pre_sid else None),
                            reason="fresh session appeared (%s)" % os.path.basename(hit))
                 break
             if cands and not hit:
@@ -468,10 +496,13 @@ def relaunch(ws, label="", cwd=None, session=None, pi=None, new=False, wait=45.0
             else:
                 non_prompt_reads = 0
             if non_prompt_reads >= 2:
-                # ⛔ `sid_after`, NOT `sid_after or pre_sid` (review round 3, P2): `pre_sid` is the
-                # id `--new` exists to ABANDON, so falling back to it reported a fresh relaunch as
-                # bound to the stale session. Unknown is `None`, which is honest.
-                obs.update(confirmed=True, sid=sid_after,
+                # ⛔ ONLY AN ID THAT IS GENUINELY NEW (review rounds 3+4, P2 then P1). `pre_sid` is
+                # the id `--new` exists to ABANDON, and the real resolver FALLS BACK to it — so
+                # neither `sid_after or pre_sid` nor a bare `sid_after` is correct: the id must be
+                # reported only when it differs from the one we were told to discard. Unknown is
+                # `None`, which is honest.
+                obs.update(confirmed=True,
+                           sid=(sid_after if sid_after and sid_after != pre_sid else None),
                            reason="the pane left the shell prompt (pi took the pane)")
                 break
         else:
@@ -549,7 +580,10 @@ def main() -> int:
     if obs.get("confirmed"):
         return 0
     if a.dry_run:
-        return 0
+        # ⛔ NOT 0 (review round 4, P2). 0 means CONFIRMED — "sent AND advanced" — and this run sent
+        # nothing. A caller that reads `$?` as the EXIT table says it should would be told the lane
+        # came back. Dry-run is its own answer.
+        return 5
     return 4
 
 

@@ -455,18 +455,53 @@ def test_new_is_not_blocked_when_the_RESUME_TARGET_is_unresolvable(R):
 
 
 def test_new_never_reports_the_STALE_id_it_was_asked_to_abandon(R):
-    """A confirmed `--new` used to report `sid_after or pre_sid`, i.e. the pre-launch id `--new`
-    exists to ABANDON, whenever the resolver could not yet name the new session (review round 3,
-    P2). Unknown must be None — naming the discarded session is a wrong answer, not a fallback."""
+    """A confirmed `--new` must never report the pre-launch id it was told to ABANDON.
+
+    ⛔ THE RESOLVER MUST BE LEFT ALONE HERE (review round 4, P1). The first version of this test
+    overrode `resolve_session` to return None, which is the one shape that cannot fail — and the
+    REAL resolver falls back to the RECORDED id in `lane-sessions.json` whenever the pane has no cmux
+    resume record (`lane-status.py:957-961`), which is exactly the state a manual relaunch leaves.
+    So the id it returns after `--new` can equal the stale one, and only a test that lets the fake
+    resolve to the stale id can see it. Both confirm arms are exercised.
+    """
+    for label, make in (
+        # appearance arm: a new transcript for this cwd shows up
+        ("appearance", lambda ls: FakeCmux(on_send=lambda: ls.new_session("new.jsonl"))),
+        # prompt-transition arm: the pane leaves the shell prompt, no transcript needed
+        ("prompt", lambda ls: FakeCmux()),
+    ):
+        ls = FakeLS(session="STALE-OLD", transcript=None,
+                    screen=["dev@box repo % ", "pi tui line", "  /800k  -flash • high"])
+        ls.resolve_session = lambda ws: "STALE-OLD"   # the REAL fallback: the recorded id
+        cmux = make(ls)
+        obs = R.relaunch("ws-1", ls=ls, runner=cmux, pi=sys.executable, cwd="/tmp/lane", new=True,
+                         sleep=lambda _s: None, clock=_clock())
+        assert obs["confirmed"] is True, (label, obs)
+        assert obs["sid"] != "STALE-OLD", (
+            "%s arm: a fresh relaunch was reported as bound to the session --new was asked to "
+            "abandon: %r" % (label, obs))
+
+
+def test_new_reports_a_genuinely_new_id(R):
+    """The positive control: when the resolver names a DIFFERENT session after the send, report it —
+    otherwise the fix would be "never report a sid", which is a different (and useless) answer.
+
+    The resolver is STATEFUL on purpose: the real one returns the recorded (pre-launch) id before the
+    relaunch and the new session's id once the pane carries a resume record. A constant fake cannot
+    tell "new" from "unchanged", which is the whole distinction under test.
+    """
     ls = FakeLS(session="STALE-OLD", transcript=None)
-    cmux = FakeCmux(on_send=lambda: ls.new_session("new.jsonl"))
-    ls.resolve_session = lambda ws: None          # the resolver cannot name the new session yet
-    ls._session = None
-    obs = R.relaunch("ws-1", ls=ls, runner=cmux, pi=sys.executable, cwd="/tmp/lane", new=True,
-                     sleep=lambda _s: None, clock=_clock())
+    state = {"sid": "STALE-OLD"}
+    ls.resolve_session = lambda ws: state["sid"]
+
+    def take_over():
+        state["sid"] = "FRESH-NEW"          # the relaunch happened: the binding moved
+        return ls.new_session("new.jsonl")
+
+    obs = R.relaunch("ws-1", ls=ls, runner=FakeCmux(on_send=take_over), pi=sys.executable,
+                     cwd="/tmp/lane", new=True, sleep=lambda _s: None, clock=_clock())
     assert obs["confirmed"] is True, obs
-    assert obs["sid"] != "STALE-OLD", (
-        "a fresh relaunch was reported as bound to the session --new was asked to abandon: %r" % (obs,))
+    assert obs["sid"] == "FRESH-NEW", obs
 
 
 def test_new_does_not_confirm_when_the_baseline_could_not_be_READ(R, tmp_path, monkeypatch):
@@ -522,6 +557,44 @@ def test_transcripts_returns_None_when_the_root_cannot_be_read(R, monkeypatch):
     monkeypatch.setattr(os, "scandir", boom)
     assert R._transcripts(ls) is None, "an UNREADABLE root must be None, not an empty set"
     monkeypatch.setattr(os, "scandir", real_scandir)
+
+
+def test_transcripts_treats_an_UNREACHABLE_root_as_None_not_as_absent(R, monkeypatch):
+    """⛔ `os.path.isdir` SWALLOWS EVERY `OSError` (review round 4, P2) — EACCES on an untraversable
+    parent, ESTALE/EIO on a network mount, ELOOP — so those read as a valid EMPTY baseline and
+    re-opened the false-CONFIRM this function exists to prevent. Only `ENOENT` is an absence."""
+    ls = FakeLS()
+    real_stat = os.stat
+
+    def stale(path, *a, **kw):
+        raise OSError(116, "Stale file handle")
+
+    monkeypatch.setattr(os, "stat", stale)
+    assert R._transcripts(ls) is None, (
+        "a root we could not REACH must be UNKNOWN, not an empty baseline")
+
+    def enoent(path, *a, **kw):
+        raise FileNotFoundError(2, "No such file or directory", str(path))
+
+    monkeypatch.setattr(os, "stat", enoent)
+    assert R._transcripts(ls) == set(), "an ABSENT root is still an absence, not UNKNOWN"
+    monkeypatch.setattr(os, "stat", real_stat)
+
+
+def test_dry_run_has_its_own_exit_code_never_CONFIRMED(R, monkeypatch, capsys):
+    """⛔ `--dry-run` returned 0, and 0 is CONFIRMED — "sent AND advanced" — in this tool's own EXIT
+    table (review round 4, P2). A scripted caller reading `$?` was told the lane came back by a run
+    that sent nothing."""
+    def fake(*_a, **_kw):
+        return {"ws": "w-1", "confirmed": False, "refused": False, "sent": False,
+                "reason": "dry run — nothing sent", "line": "cd /x && pi", "elapsed_s": 0.0}
+
+    monkeypatch.setattr(R, "relaunch", fake)
+    monkeypatch.setattr(sys, "argv", ["lane-relaunch.py", "--ws", "w-1", "--dry-run"])
+    rc = R.main()
+    out = capsys.readouterr().out
+    assert rc not in (0, 1, 3, 4), "dry-run borrowed another outcome's code: rc=%r" % rc
+    assert "DRY-RUN" in out, out
 
 
 def test_new_does_not_confirm_on_a_transcript_that_predates_the_send(R):

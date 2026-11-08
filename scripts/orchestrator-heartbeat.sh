@@ -1130,9 +1130,13 @@ fi
 # `lane-status.py`, which `pi-bootstrap/setup.sh:489-496` deliberately WITHHOLDS from the farm (#1553
 # — farming the repo copy would overwrite the live classifier with an older one), so a farm-relative
 # pointer would name a file that must not be there. `$AGENT_INFRA_PATH` is the checkout the operator
-# already has (AGENTS.md makes it a prerequisite) and is how `safe-send.sh:82` names `brief-gate.sh`
+# already has (AGENTS.md makes it a prerequisite) and is how `safe-send.sh:82` reaches its own gate
 # for exactly this reason. `test_lane_relaunch.py` derives the correct form from the farm arrays, so
 # if #1553 lands and the farm starts carrying it, the test moves with it instead of going stale.
+# ⛔ DO NOT SPELL THAT GATE'S FILENAME IN THIS FILE (review round 4, P1):
+# `scripts/orchestrator-harness/brief-gate.test.sh` keeps a census of every file that mentions it,
+# and an undeclared mention turns that census permanently RED — attributing nothing. A prose
+# reference is not a dispatch path and must not declare itself as one.
 if [ "${N_DEAD:-0}" -gt 0 ]; then
   CAPTEXT="${CAPTEXT} ⛔ DEAD LANES — CONFIRMED BARE SHELL, no pi in the pane: ${DEAD}. These are NOT free capacity and are NOT dispatchable: a send into one would be typed into a BARE LOGIN SHELL and executed. They need a RELAUNCH via \$AGENT_INFRA_PATH/scripts/lane-relaunch.py --ws <uuid>, not an item. (If AGENT_INFRA_PATH is unset, it is your agent-infra checkout — the tool is not farmed, because it imports lane-status.py, which #1553 withholds.) It types the launch line into the pane's OWN login shell (where the user's PATH lives); it never uses respawn-pane, which DELETES the workspace when its command fails (#942)."
 fi
