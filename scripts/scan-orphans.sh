@@ -35,13 +35,18 @@
 #       as "clean", so "I could not look" became "there is nothing there" — the fail-open shape the
 #       Product-Over-Process rule classes A. State is now one of `absent | clean | dirty |
 #       unmeasurable`, and `unmeasurable` is preserved exactly like `dirty`.
-#       ⛔ AND `absent` IS DECIDED BY EVIDENCE TOO (#3799 review, Finding 2). It used to be `[ -d ]`,
-#       which is false for ANY stat failure — EACCES on an unreadable parent, ENOTDIR, ELOOP, ESTALE
-#       on a dropped mount — so an unreachable tree read as "gone" and its ref was deleted while the
-#       tree sat on disk. `path_absent()` walks UP to a parent it can LIST; a stat of a child needs
-#       only search permission on its parent, so a listable parent plus a failed stat is ENOENT. An
-#       unlistable parent proves nothing, so its own absence is what gets established next. Anything
-#       that cannot be decided is `unmeasurable`, never `absent`.
+#       ⛔ AND `absent` IS DECIDED BY EVIDENCE TOO (#3799 review, Findings 2 and round-2 1). It used
+#       to be `[ -d ]`, which is false for ANY stat failure — EACCES on an unreadable parent,
+#       ENOTDIR, ELOOP, ESTALE on a dropped mount — so an unreachable tree read as "gone" and its ref
+#       was deleted while the tree sat on disk. `path_absent()` walks UP to a parent it can SEARCH;
+#       a stat of a child needs search (`x`) permission on its parent, so a searchable parent plus a
+#       failed stat on the name is ENOENT. An unsearchable parent proves nothing, so its own absence
+#       is what gets established next. ⛔ SEARCHABLE, NOT LISTABLE: `ls -A` succeeds on READ alone,
+#       and a `444` ancestor is listable while its children are unstatable — that inference (the
+#       first attempt at this fix) deleted the ref of a tree that was sitting right there, which is
+#       why the listing is now only a CROSS-CHECK (name visible + stat failed ⇒ cannot decide) and
+#       not the licence. Anything undecidable is `unmeasurable`, never `absent`. The same test
+#       decides GHOST, so an unreachable tree's record is not pruned as "never existed".
 #
 #   G2  THE DIRT CHECK WAS GATED ON REGISTRATION. It only ran when git still confirmed the dir was a
 #       registered worktree of THIS repo — so a record whose registration was pruned (precisely what
@@ -64,7 +69,11 @@
 #       reaches the swap. The refusal is therefore re-asserted from a FRESH
 #       `git worktree list --porcelain` immediately before the swap, and a FAILED enumeration is a
 #       refusal — never an assumed "not checked out" (the sibling's shape,
-#       `cleanup-stale-branches.sh:2073-2099`, trailing-newline two-pattern match included).
+#       `cleanup-stale-branches.sh:2073-2099`). ⛔ AND EVERY REFUSAL NAMES ITS OWN CAUSE (round-2
+#       Finding 2): one shared message said "the tip moved, or the ref is locked" even when the
+#       CHECKED-OUT guard was what fired, so the operator was told to hunt a competing committer
+#       instead of being told the branch belongs to a live lane — on a destructive path the message
+#       is the diagnosis the next actor inherits, so it names the worktree holding the branch.
 #
 #   G4  THE REF WAS DELETED EVEN WHEN THE TREE SURVIVED. The old --apply deleted the branch no
 #       matter what happened to the directory — including the `dir is not a registered worktree`
@@ -137,16 +146,24 @@ branch_tip() { git rev-parse --verify --quiet "refs/heads/$1^{commit}" 2>/dev/nu
 # failure (Finding 2 of the #3799 review).
 path_there() { [ -e "$1" ] || [ -L "$1" ]; }
 
-# path_absent <path> — 0 ONLY on positive evidence of non-existence (#3799 review, Finding 2).
+# path_absent <path> — 0 ONLY on positive evidence of non-existence (#3799 review, Findings 2 and
+# round-2 Finding 1).
 # ⛔ `[ -d "$p" ]` IS NOT AN ABSENT TEST. It is false for ANY stat failure — EACCES on an unreadable
 # parent, ENOTDIR, ELOOP, ESTALE on a dropped network mount — and treating that as "nothing is there"
 # is the same "I could not look => there is nothing there" reasoning G1 removes, one layer earlier:
-# the ref would be deleted while the tree it belongs to is still on disk. So walk UP until a parent
-# can be LISTED; a stat of a child needs only search permission on its parent, so with a listable
-# parent a failed stat on the name means the name is not there. An unlistable parent proves nothing
-# about itself, so its own absence (recursively) is the next thing to establish.
+# the ref would be deleted while the tree it belongs to is still on disk. So walk UP to a parent we
+# can SEARCH; a stat of a child needs only search (`x`) permission on its parent, so with a
+# searchable parent a failed stat on the name means the name is not there. An unsearchable parent
+# proves nothing about itself, so its own absence (recursively) is the next thing to establish.
+# ⛔ SEARCHABLE, NOT LISTABLE (round-2 Finding 1, measured). `ls -A` succeeds on **read** permission
+# alone, and a `444` (or `chmod a-x`, or `r`-without-`x` ACL) parent is listable while its children
+# are UNSTATABLE — so "listable" concluded ENOENT for a tree that was sitting right there, and the
+# ref was deleted under it. `[ -x ]` is the permission that actually licenses the inference. The
+# listing is kept only as a CROSS-CHECK: where it is readable and the name is right there, the stat
+# failure is something else (ESTALE on a dropped mount answers readdir while failing stat) and the
+# answer is "cannot decide".
 path_absent() {
-    local p="$1" parent
+    local p="$1" parent base listing
     case "$p" in /*) ;; *) p="$PWD/$p" ;; esac
     while :; do case "$p" in */) p="${p%/}" ;; *) break ;; esac; done
     [ -n "$p" ] || return 1
@@ -154,10 +171,16 @@ path_absent() {
         path_there "$p" && return 1          # reachable: not absent
         parent="$(dirname -- "$p")"
         [ "$parent" = "$p" ] && return 1     # walked to "/" and still unreachable: cannot decide
-        if ls -A -- "$parent" >/dev/null 2>&1; then
-            return 0                          # parent listable => the child's stat failure is ENOENT
+        if [ -x "$parent" ]; then            # SEARCHABLE => a failed stat of the child is ENOENT
+            base="$(basename -- "$p")"
+            if listing="$(ls -A -- "$parent" 2>/dev/null)"; then
+                # readable as well: if the name IS in the listing while stat failed, something other
+                # than ENOENT is going on and we cannot decide.
+                if printf '%s\n' "$listing" | grep -qxF -- "$base"; then return 1; fi
+            fi
+            return 0
         fi
-        p="$parent"                           # parent unreachable: its absence would prove ours
+        p="$parent"                           # parent unsearchable: its absence would prove ours
     done
 }
 
@@ -183,9 +206,9 @@ worktree_state() {
 # delete_branch_cas <branch> <expected-oid> — atomic compare-and-delete, NEVER `git branch -D`
 # (#1393 G3). `update-ref -d <ref> <old>` has GIT compare the ref's current value to <old> and remove
 # it in the SAME operation, so a tip that moved between classification and delete is refused rather
-# than destroyed. An empty <old> is an UNCONDITIONAL delete (verified, git 2.43), so a tip that could
-# not be read refuses instead of degrading to one. `update-ref -d` leaves `branch.<name>.*` config
-# behind where `-D` would drop it, so that is removed explicitly.
+# than destroyed. An empty <old> is an UNCONDITIONAL delete (verified, git 2.43 and re-measured in
+# round 2), so a tip that could not be read refuses instead of degrading to one. `update-ref -d`
+# leaves `branch.<name>.*` config behind where `-D` would drop it, so that is removed explicitly.
 #
 # ⛔ `update-ref -d` IS NOT `git branch -D`, SO IT DOES NOT INHERIT -D's CHECKED-OUT REFUSAL
 # (#3799 review, Finding 1 — measured on git 2.43: `-D` refused "used by worktree at …", `update-ref -d`
@@ -193,21 +216,41 @@ worktree_state() {
 # guard the swap does not, so the guard is re-asserted here, from a FRESH enumeration immediately
 # before the swap — the branch could have been checked out in the window since classification. A
 # FAILED enumeration is a REFUSAL, never an assumed "not checked out". This is the sibling reaper's
-# shape (`cleanup-stale-branches.sh:2073-2099`), including its trailing-newline subtlety.
+# shape (`cleanup-stale-branches.sh:2073-2099`).
+#
+# ⛔ EVERY REFUSAL NAMES ITS OWN CAUSE (round-2 Finding 2, measured). One shared message ("the tip
+# moved, or the ref is locked") told the operator two causes that were NOT the cause when the guard
+# that fired was the CHECKED-OUT one — on a destructive path the message IS the diagnosis the next
+# actor inherits, and "this branch belongs to a live lane" is the one thing it must say.
+#
+# Returns: 0 deleted (or already gone) · 1 the classified tip was unreadable · 2 the branch is
+# CHECKED OUT in a live worktree · 3 the CAS was refused / the worktree list was unreadable.
+# On non-zero, $DCAS_REASON carries the sentence reap_record prints.
 delete_branch_cas() {
-    local br="$1" oid="$2" wt_now=""
+    local br="$1" oid="$2" wt_now="" wt_here=""
+    DCAS_REASON=""
     branch_local "$br" || return 0          # already gone — nothing to delete, nothing lost
-    [ -n "$oid" ] || return 1                # the classified tip was unreadable: no CAS, no delete
-    if ! wt_now="$(git worktree list --porcelain 2>/dev/null)"; then return 1; fi
-    # TWO patterns, not one: command substitution strips ALL trailing newlines, so when the target is
-    # the LAST entry in the listing its `branch refs/heads/<br>` line is not followed by one and the
-    # `…$'\n'*` alternative alone MISSES the very branch being deleted. The second alternative anchors
-    # at end-of-string; `*"…"` requires the string to END with the literal, so a longer name
-    # (`refs/heads/x/y` vs `refs/heads/x`) still does not match.
-    case "$wt_now" in
-        *"branch refs/heads/$br"$'\n'* | *"branch refs/heads/$br") return 1 ;;
-    esac
-    git update-ref -d "refs/heads/$br" "$oid" 2>/dev/null || return 1
+    if [ -z "$oid" ]; then
+        DCAS_REASON="its classified tip could not be read (<unread-tip>), and an empty <old> turns 'update-ref -d' into an UNCONDITIONAL delete"
+        return 1
+    fi
+    if ! wt_now="$(git worktree list --porcelain 2>/dev/null)"; then
+        DCAS_REASON="the worktree list could not be read, so 'not checked out anywhere' cannot be established"
+        return 3
+    fi
+    # The path is parsed per line, so command substitution's stripped trailing newlines cannot hide
+    # the LAST entry of the listing (a `case` over the whole string needed two patterns for that).
+    wt_here="$(printf '%s\n' "$wt_now" | awk -v b="refs/heads/$br" '
+        /^worktree / { p = substr($0, 10) }
+        /^branch /   { if (substr($0, 8) == b) { print p; exit } }')"
+    if [ -n "$wt_here" ]; then
+        DCAS_REASON="it is CHECKED OUT in a live worktree ($wt_here), and deleting the ref would leave that lane on an unborn branch"
+        return 2
+    fi
+    if ! git update-ref -d "refs/heads/$br" "$oid" 2>/dev/null; then
+        DCAS_REASON="the compare-and-delete at $oid was refused — the tip moved since classification, or the ref is locked"
+        return 3
+    fi
     git config --remove-section "branch.$br" 2>/dev/null || true
     return 0
 }
@@ -216,7 +259,7 @@ delete_branch_cas() {
 # Prints one `     …` outcome line per decision. Returns 0 only when the record may be PRUNED, i.e.
 # the directory is provably gone AND the branch ref is gone; 1 when anything was kept (#1393 G4).
 reap_record() {
-    local br="$1" dir="$2" dispatch="$3" is_wt="$4" forced="$5" oid st
+    local br="$1" dir="$2" dispatch="$3" is_wt="$4" forced="$5" oid st dcas=0
 
     oid="$(branch_tip "$br")" || oid=""
 
@@ -248,8 +291,9 @@ reap_record() {
         esac
     fi
 
-    if ! delete_branch_cas "$br" "$oid"; then
-        printf '%b' "     ⚠️ KEPT ref+record: 'refs/heads/$br' could not be compare-deleted at ${oid:-<unread-tip>} (the tip moved, or the ref is locked) — nothing was deleted.\n"
+    delete_branch_cas "$br" "$oid" || dcas=$?
+    if [ "$dcas" -ne 0 ]; then
+        printf '%b' "     ⚠️ KEPT ref+record: 'refs/heads/$br' was NOT deleted — ${DCAS_REASON:-the delete was refused}.\n"
         return 1
     fi
     bash "$SCRIPT_DIR/record-worktree.sh" done --dispatch "$dispatch" >/dev/null 2>&1 || true
@@ -293,8 +337,13 @@ if [ -f "$RECORD_FILE" ]; then
         [ "$REC_EPOCH" -gt 0 ] && [ "$REC_EPOCH" -lt "$CUTOFF_EPOCH" ] && STALE=true
         [ -n "$DIR" ] && RECORDED_DIRS="$RECORDED_DIRS $DIR"
 
-        # GHOST: neither the branch nor the worktree dir ever existed
-        if ! branch_local "$BRANCH" && ! branch_remote "$BRANCH" && [ ! -d "$DIR" ]; then
+        # GHOST: neither the branch nor the worktree dir ever existed.
+        # ⛔ `[ ! -d ]` IS NOT "never existed" (round-2 Finding 1, same root at a second site): under an
+        # r-without-x ancestor an EXISTING dir is unstatable, so a real tree's record was classified
+        # "never existed" and PRUNED — erasing the trail for a tree that may hold uncommitted work.
+        # GHOST now requires the dir to be PROVABLY absent, not merely unreadable.
+        if ! branch_local "$BRANCH" && ! branch_remote "$BRANCH" &&
+           [ -n "$DIR" ] && ! path_there "$DIR" && path_absent "$DIR"; then
             GHOSTS=$((GHOSTS + 1))
             GHOST_OUT="${GHOST_OUT}  👻 GHOST RECORDS: branch=$BRANCH dispatch=$DISPATCH (never existed)\n"
             if [ "$APPLY" = true ]; then

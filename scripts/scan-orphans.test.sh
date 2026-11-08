@@ -257,7 +257,8 @@ echo wip > "$FIX/wt-moved/keep.txt"
 $RW add --branch fix/moved-1 --worktree "$FIX/gone-forever" --dispatch d-moved --ts 2026-08-01T00:00:00Z >/dev/null
 OUT="$($SCAN --apply 2>&1 || true)"
 git show-ref --verify --quiet refs/heads/fix/moved-1 && ok "a branch checked out in a live worktree is never CAS-deleted" || bad "the ref of a LIVE worktree's branch was deleted"
-assert_contains "$OUT" "could not be compare-deleted" "the checked-out refusal is named"
+assert_contains "$OUT" "CHECKED OUT in a live worktree" "the checked-out refusal is named AS the checked-out refusal"
+assert_contains "$OUT" "$FIX/wt-moved" "the refusal names the live worktree holding the branch"
 assert_eq "$(wc -l < "$WORKTREES_RECORD" | tr -d ' ')" "1" "the record is kept when the ref is refused"
 $RW done --dispatch d-moved >/dev/null
 git worktree remove --force "$FIX/wt-moved" >/dev/null 2>&1 || true
@@ -282,7 +283,7 @@ git checkout -q fix/cas-move && echo x >> file.txt && git commit -qam x && git c
 $RW add --branch fix/cas-move --worktree "$FIX/gone-too" --dispatch d-casmove --ts 2026-08-01T00:00:00Z >/dev/null
 OUT="$(PATH="$FIX/shim:$PATH" GIT_WRAP_REAL="$REAL_GIT" GIT_WRAP_REPO="$REPO" $SCAN --apply 2>&1 || true)"
 git show-ref --verify --quiet refs/heads/fix/cas-move && ok "a tip that MOVED inside the reap window is refused (CAS is in the script)" || bad "reap_record deleted a ref whose tip moved (unconditional update-ref)"
-assert_contains "$OUT" "could not be compare-deleted" "the in-window CAS refusal is named"
+assert_contains "$OUT" "compare-and-delete at" "the in-window CAS refusal is named as the CAS refusal"
 $RW done --dispatch d-casmove >/dev/null
 git branch -D fix/cas-move >/dev/null 2>&1 || true
 
@@ -346,6 +347,45 @@ else
     assert_eq "$(wc -l < "$WORKTREES_RECORD" | tr -d ' ')" "1" "an unstatable tree keeps its record"
     $RW done --dispatch d-lock >/dev/null
     git branch -D fix/locked-1 >/dev/null 2>&1 || true
+fi
+
+
+# ── 2q. Finding 1 of round 2: an ancestor that is LISTABLE but not SEARCHABLE (`444`, i.e. `r`
+#     without `x`) — `ls -A` succeeds while its children are unstatable, so "listable" is NOT
+#     evidence of non-existence. The tree is on disk and its ref must survive.
+if [ "$(id -u)" = 0 ]; then
+    echo "  ⏭️  skipped 2q (running as root — chmod cannot deny search)"
+else
+    mkdir -p "$FIX/readonly-parent/child"
+    echo precious > "$FIX/readonly-parent/child/data.txt"
+    git branch fix/ro-1
+    $RW add --branch fix/ro-1 --worktree "$FIX/readonly-parent/child" --dispatch d-ro --ts 2026-08-01T00:00:00Z >/dev/null
+    chmod 444 "$FIX/readonly-parent"
+    OUT="$($SCAN --apply 2>&1 || true)"
+    chmod 755 "$FIX/readonly-parent"
+    assert_contains "$OUT" "state UNMEASURABLE" "a listable-but-unsearchable ancestor is unmeasurable, never absent"
+    git show-ref --verify --quiet refs/heads/fix/ro-1 && ok "an r-without-x ancestor keeps the branch of the tree inside it" || bad "the ref was deleted under a tree that was still on disk"
+    assert_eq "$(wc -l < "$WORKTREES_RECORD" | tr -d ' ')" "1" "an r-without-x ancestor keeps the record"
+    $RW done --dispatch d-ro >/dev/null
+    git branch -D fix/ro-1 >/dev/null 2>&1 || true
+    rm -rf "$FIX/readonly-parent"
+fi
+
+# ── 2r. a GHOST is pruned only when the tree is PROVABLY absent (round-2 Finding 1, second
+#     site): an existing dir under an r-without-x ancestor must not lose its record.
+if [ "$(id -u)" = 0 ]; then
+    echo "  ⏭️  skipped 2r (running as root — chmod cannot deny search)"
+else
+    mkdir -p "$FIX/ghost-parent/child"
+    echo precious > "$FIX/ghost-parent/child/data.txt"
+    $RW add --branch fix/ghost-unreachable --worktree "$FIX/ghost-parent/child" --dispatch d-gh --ts 2026-08-01T00:00:00Z >/dev/null
+    chmod 444 "$FIX/ghost-parent"
+    OUT="$($SCAN --apply 2>&1 || true)"
+    chmod 755 "$FIX/ghost-parent"
+    assert_not_contains "$OUT" "never existed" "an unreachable tree is not called a ghost"
+    assert_eq "$(wc -l < "$WORKTREES_RECORD" | tr -d ' ')" "1" "the record of an unreachable tree is not pruned"
+    $RW done --dispatch d-gh >/dev/null
+    rm -rf "$FIX/ghost-parent"
 fi
 
 # ── Summary ───────────────────────────────────────────────────────────────
