@@ -40,6 +40,9 @@ set -uo pipefail
 unset GH_REPO GH_HOST
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Absolute self-path, resolved BEFORE any PATH replacement: the executed floor at the bottom READS this file
+# to derive its expected count, so a relative $0 would make that read depend on the caller's cwd.
+SELF="$HERE/$(basename "${BASH_SOURCE[0]}")"
 SUP="$HERE/../cloud-cell-supervisor.sh"
 MERGE="$HERE/merge-one.sh"
 # Resolved BEFORE any PATH replacement — the supervisor is invoked through it.
@@ -48,9 +51,23 @@ BASH_BIN="$(command -v bash)"
 [ -x "$MERGE" ] || { echo "❌ missing $MERGE"; exit 1; }
 
 pass=0; fail=0
+# ⛔ THE WHOLE-`start` VERDICT IS COUNTED, NOT JUST CHECKED (#3774 review, P2 — the finding this suite's own
+# thesis demands be closed). The three `ck "… SUCCEEDED …" "$start_rc"` calls are the ONLY whole-`start`
+# success assertion KIND in this file, and #3760 DELETED them while nothing reddened: the file ends at
+# `[ "$fail" -eq 0 ]` and `run-bash-shards.sh` discovers by glob and reads only the exit code, so no count
+# pinned them. Restored lines are, on their own, exactly as deletable as they were the first time.
+# So they go through `ck_start_succeeded`, which bumps a counter the floor at the bottom compares with the
+# number of arms that actually capture `start_rc`. Deliberately the same shape as the guard suite's
+# `optOutLegRan` floor (`test-remote-context.mjs`): a DECLARED line is satisfied by a neutralised consumer;
+# an EXECUTED count is not. Precedent outside this repo: Jest's `expect.assertions(n)` / `hasAssertions()`.
+start_rc_asserted=0
 ck() { # ck <name> <0|1>
   if [ "$2" -eq 0 ]; then printf '  \033[32mPASS\033[0m  %s\n' "$1"; pass=$((pass+1))
   else printf '  \033[31mFAIL\033[0m  %s\n' "$1"; fail=$((fail+1)); fi
+}
+ck_start_succeeded() { # ck_start_succeeded <label> <start_rc> — the whole-`start` verdict, and the floor's datum
+  start_rc_asserted=$((start_rc_asserted + 1))
+  ck "$1" "$2"
 }
 note() { printf '      %s\n' "$*"; }
 
@@ -208,6 +225,15 @@ env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
 # (`cloud-cell-supervisor.sh` — the `exec bash "$HARNESS/orch-loop.sh"` arm) is not taken, so no loop can
 # hang. Measured on this fixture with the helper seeded: `start_rc=0` in ALL THREE arms and 118 passed /
 # 0 failed either way.
+# ⛔ AND HERE IS THE REASON, IN ONE CLAUSE — because the paragraph above only REFUTES the old one and then
+# stops, which leaves a reader told that a justification exists and unable to find it (#3774 review, P2;
+# and “a premise stated without its reason” is precisely how the three deleted assertions happened):
+# NOTHING IN THIS FIXTURE READS `check-class.py`. The controller loop is the only consumer that would
+# import the classifier, and that loop is never entered — the same two facts as above (the tmux stub does
+# not RUN what it records, and service mode is not taken). So the seeding question is FIXTURE WEIGHT, not
+# pass/fail: a seeded helper would be a file no assertion in this suite ever touches. Measured, seeding is
+# also harmless (118 passed / 0 failed), so this is a stated trade and not a premise the next cycle has to
+# re-derive.
 # ⛔ SERVICE MODE IS PINNED OFF, NOT MERELY ABSENT (review P1 on #3774, measured). The sentence above used
 # to claim `ORCH_FOREGROUND` "is never set" — that was WRONG, and it mattered: the fixture does not set it
 # but did not NEUTRALISE it either, so it was INHERITED, and on a fleet cell it IS `1`
@@ -223,6 +249,14 @@ env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
 # So `cell_start` now PINS `ORCH_FOREGROUND=0`, the idiom every other `start` caller already uses for exactly
 # this reason (`watchdog-loop.sh:1046`, `orchestrator-bringup.sh:1037`, `cloud-cell-quiesce.sh:286`, #2402),
 # and an inherited `=1` cannot ride in.
+# ⛔ AND THE THIRD INPUT OF THAT SAME CLASS IS PINNED TOO (#3774 review, P2): `MIN_FREE_MB`. The paragraph
+# above is a claim about inherited inputs generally, and this one could still decide the result — the
+# supervisor reads it with an AMBIENT DEFAULT (`cloud-cell-supervisor.sh`'s
+# `MIN_FREE_MB="${MIN_FREE_MB:-500}"`) and `die`s below the floor (the `below the ${MIN_FREE_MB}MB floor`
+# line in `cmd_check_disk`), which BOTH `start` and `check` reach through that one call. Measured without
+# the pin: `MIN_FREE_MB=99999999 bash <this file>` reddens the whole-start assertion with `start_rc=1` plus
+# at least nine further failures — a red for a reason that is not this suite's subject. With `MIN_FREE_MB=1`
+# in both callers' `env` lines, an inherited floor cannot ride in, exactly as for `GH_REPO` at the top.
 # So the rc is ASSERTED again — the only whole-`start` success assertion KIND in this suite. There are three,
 # and they are the `ck "… SUCCEEDED …" "$start_rc"` calls: each passes the start's OWN rc, and each sits
 # directly BELOW a provision probe that asserts a DIFFERENT `$rc`. ⛔ That adjacency is why no line number is
@@ -250,11 +284,13 @@ mkdir -p "$(dirname "$RECORDER_LIB")"
 printf '#!/usr/bin/env python3\n' > "$RECORDER_LIB"; chmod +x "$RECORDER_LIB"
 
 cell_check() { # cell_check — drive the SHIPPED `check` under the fixture's stub PATH
+  # `MIN_FREE_MB=1`: same class as `-u OR` below and as `GH_REPO` at the top — `cmd_check_disk` enforces
+  # this floor with an ambient default, so it is PINNED rather than inherited (see the header).
   # ⛔ `-u OR` is agent-infra#1901's hermeticity requirement, not an aesthetic: `OR` is now a
   # VALIDATED input (the queue's repo, derived from the fixture checkout's remote unless declared),
   # so a developer's ambient OR would be held against this fixture's `acme/widget` remote and every
   # arm below would be decided by the queue refusal instead of the recorder probe it names.
-  env -u OR -u SCOPE -u AI_REVIEW_GATE_KEY \
+  env -u OR -u SCOPE -u AI_REVIEW_GATE_KEY MIN_FREE_MB=1 \
     PATH="$CELL_STUBS" HOME="$CELL_HOME" CELL_HOME="$CELL_HOME" REPO="$CELL_REPO" \
     O="$CELL_O" HARNESS="$CELL_HARNESS" ENV_FILE="$CELL/absent.env" \
     HARNESS_REPO="$CELL_HARNESS" HARNESS_REF=origin/main HARNESS_FETCH=0 \
@@ -262,7 +298,10 @@ cell_check() { # cell_check — drive the SHIPPED `check` under the fixture's st
 }
 cell_start() { # cell_start — drive the SHIPPED `start` with a tmux stub that records the session
   mkdir -p "$CELL/tmstate"
-  env -u AI_REVIEW_GATE_KEY SCOPE=own ORCH_FOREGROUND=0 \
+  # `ORCH_FOREGROUND=0` and `MIN_FREE_MB=1` are PINNED, not merely unset: both are inputs the shipped
+  # supervisor reads with an ambient default, so on a fleet cell (or a developer box) an inherited value
+  # would decide `start`'s rc and this suite would report a red about something that is not its subject.
+  env -u AI_REVIEW_GATE_KEY SCOPE=own ORCH_FOREGROUND=0 MIN_FREE_MB=1 \
     PATH="$CELL_STUBS" TM_STATE="$CELL/tmstate" HOME="$CELL_HOME" CELL_HOME="$CELL_HOME" \
     REPO="$CELL_REPO" O="$CELL_O" HARNESS="$CELL_HARNESS" OR="acme/widget" \
     ENV_FILE="$CELL/absent.env" \
@@ -376,7 +415,7 @@ out="$(cell_start)"; rc=$?
 start_rc="$rc"          # the controller launch's own verdict; asserted directly below — see the header
 [ -x "$RECORDER" ] && rc=0 || { rc=1; note "recorder=$([ -x "$RECORDER" ] && echo present || echo absent) start_rc=$start_rc out=$(printf '%s' "$out" | tail -3)"; }
 ck "start provisions record-review.sh from the checkout (start_rc=$start_rc)" $rc
-ck "start itself SUCCEEDED (the controller launch is not this suite's subject, but its exit status is the whole-start verdict; start_rc=$start_rc)" "$start_rc"
+ck_start_succeeded "start itself SUCCEEDED (the controller launch is not this suite's subject, but its exit status is the whole-start verdict; start_rc=$start_rc)" "$start_rc"
 [ -s "$RECORDER_LIB" ] && rc=0 || { rc=1; note "normalizer=$([ -s "$RECORDER_LIB" ] && echo present || echo absent) out=$(printf '%s' "$out" | tail -3)"; }
 ck "RED→GREEN: start provisions the recorder's SIBLING diff-normalize.py in lib/" $rc
 [ -f "$CELL/tmstate/cmd" ] && rc=0 || rc=1
@@ -391,7 +430,7 @@ unset start_rc          # see above: each arm's binding is asserted, never inher
 out="$(cell_start)"; rc=$?; start_rc="$rc"     # asserted below — see the header
 [ -s "$RECORDER_LIB" ] && rc=0 || { rc=1; note "normalizer=$([ -s "$RECORDER_LIB" ] && echo present || echo absent) out=$(printf '%s' "$out" | tail -3)"; }
 ck "start provisions ONLY the missing normalizer when the recorder already exists" $rc
-ck "and that start SUCCEEDED (start_rc=$start_rc)" "$start_rc"
+ck_start_succeeded "and that start SUCCEEDED (start_rc=$start_rc)" "$start_rc"
 
 # 5b) A ZERO-BYTE recorder must be RE-provisioned by `start`, not left in place: the old provision
 # ran only when the path was ABSENT, so a `cp` killed mid-write (or a full disk) would persist
@@ -404,7 +443,7 @@ unset start_rc          # see above: each arm's binding is asserted, never inher
 out="$(cell_start)"; rc=$?; start_rc="$rc"     # asserted below — see the header
 [ -s "$RECORDER" ] && rc=0 || { rc=1; note "recorder=$([ -s "$RECORDER" ] && echo nonempty || echo empty) out=$(printf '%s' "$out" | tail -3)"; }
 ck "RED→GREEN: start re-provisions a ZERO-BYTE recorder" $rc
-ck "and that start SUCCEEDED (start_rc=$start_rc)" "$start_rc"
+ck_start_succeeded "and that start SUCCEEDED (start_rc=$start_rc)" "$start_rc"
 out="$(cell_check)"; rc=$?
 [ "$rc" -eq 0 ] && certified "$out" && rc=0 || { rc=1; note "$(printf '%s' "$out" | tail -3)"; }
 ck "the re-provisioned cell is then certified" $rc
@@ -1049,6 +1088,23 @@ fi
 bare="$(grep -cE '>[[:space:]]*"\$O/state/parked-\$PR"' "$LOOP")"
 [ "$bare" = "0" ] && rc=0 || { rc=1; note "$bare controller site(s) still write parked-\$PR directly"; }
 ck "no controller park site writes parked-\$PR without its reason" $rc
+
+# ⛔ THE EXECUTED FLOOR FOR THE WHOLE-`start` ASSERTIONS (#3774 review, P2). This PR's own thesis is that
+# #3760 deleted these three assertions and NOTHING reddened, and the restored lines are on their own
+# exactly as deletable — measured: commenting out only the `ck_start_succeeded …` calls returns
+# `115 passed, 0 failed`, exit 0, the identical #3760 state. So the expectation is DERIVED from this file,
+# not declared as a figure: every arm that CAPTURES `start_rc` must also ASSERT it. `^[[:space:]]*unset start_rc`
+# is the capture marker (it opens each arm and is what makes a dropped binding abort under `set -u`), and it
+# is anchored so the prose that MENTIONS `unset start_rc` in the header cannot inflate the count.
+# Derived rather than hard-coded on purpose: this file's labelling rule already records that a stated COUNT
+# re-stales, and a hard-coded 3 would have to be bumped by hand on the next arm. Adding an arm moves both
+# sides together; DELETING an assertion moves only the counter, which is the whole point.
+start_arms="$(grep -c '^[[:space:]]*unset start_rc' "$SELF" 2>/dev/null || true)"
+case "$start_arms" in ''|*[!0-9]*) start_arms=-1 ;; esac
+[ "$start_arms" -gt 0 ] && rc=0 || { rc=1; note "could not read the arm count from $SELF (got '$start_arms') — an unverifiable floor FAILS CLOSED, it is not a pass"; }
+ck "the executed floor's expected count is readable ($start_arms arm(s) capture start_rc)" $rc
+[ "$start_rc_asserted" -eq "$start_arms" ] && [ "$start_rc_asserted" -gt 0 ] && rc=0 || { rc=1; note "$start_rc_asserted whole-start assertion(s) ran for $start_arms arm(s) that capture start_rc — a deleted assertion, or an arm added without one, leaves this row red"; }
+ck "every arm that captures start_rc also ASSERTS it (executed floor, not a declared line)" $rc
 
 echo
 echo "==> $pass passed, $fail failed"
