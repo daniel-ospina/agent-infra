@@ -66,7 +66,18 @@ bad()  { FAIL=$((FAIL+1)); printf 'FAIL %s\n' "$1"; }
 skip() { SKIP=$((SKIP+1)); printf 'SKIP %s\n' "$1"; }
 
 [ -f "$GATE" ] || { echo "❌ lane-report-gate.sh missing"; exit 1; }
-command -v python3 >/dev/null 2>&1 || { echo "SKIP lane-report-gate.test.sh — no python3 (the consumer is python)"; exit 0; }
+# ⛔ THE GUARD MUST USE THE GATE'S OWN FLOOR, NOT "python3 exists" (round-9 review, P2). The gate now
+# requires ≥ 3.12 (the shipped consumer refuses an older interpreter and prints nothing). On exactly the
+# hosts that motivated that floor — macOS `/usr/bin/python3` = 3.9, Debian 11 / Ubuntu 20.04 — this guard
+# passed while every row the gate could not run returned 7, i.e. ~38 FAILURES instead of its own
+# diagnosis, and the first wrong remedy a hurried reader reaches for is "lower the floor".
+_PY_OK=""
+for _c in python3 python /opt/homebrew/bin/python3 /usr/local/bin/python3 /usr/bin/python3; do
+  command -v "$_c" >/dev/null 2>&1 || continue
+  "$_c" -I -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 12) else 1)' 2>/dev/null \
+    && { _PY_OK="$_c"; break; }
+done
+[ -n "$_PY_OK" ] || { echo "SKIP lane-report-gate.test.sh — no interpreter >= 3.12 (the consumer refuses an older one and prints nothing; run it as 'uv run python ...')"; exit 0; }
 
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/lane-report-gate-test-XXXXXX")" || { echo "❌ mktemp"; exit 1; }
 trap 'rm -rf "$TMP"' EXIT
@@ -383,6 +394,31 @@ fi
 # VERDICT=ABSENT rc=1 into VERDICT=PASS rc=0, with graded tree and verifier both from the other repo.
 out="$(env STUB_OK=0 STUB_RC=3 STUB_FAILING=1 GIT_COMMON_DIR=/nonexistent/common bash "$GATE" --check "$REPO" "feat/2977-tm" "$WT_HEAD" 2>&1)"; rc=$?
 if [ "$rc" = 3 ]; then ok "…and an ambient GIT_COMMON_DIR cannot retarget the enumeration either (rc=$rc)"; else bad "GIT_COMMON_DIR retargeted the enumeration: expected rc=3, got rc=$rc :: $out"; fi
+
+# ── 2j. A REPLACE REF CANNOT FORGE THE COMMIT DATE (round-9 review, P1) ──────────────────
+# ⛔ `refs/replace/*` does not RELOCATE the repo (so the entry-time unsets cannot see it): it makes
+# `git log -1 --format=%cI <head>` return a SUBSTITUTED commit's date, forging the `predates` witness with
+# `state.json` untouched (`cmp` identical in the measurement). The ref lives in the common gitdir, is not
+# on the branch, and is invisible in the reviewed diff.
+if git -C "$WT" rev-parse --git-dir >/dev/null 2>&1; then
+  _base="$(git -C "$WT" rev-parse HEAD)"
+  _forged="$(GIT_COMMITTER_DATE=2010-01-01T00:00:00Z GIT_AUTHOR_DATE=2010-01-01T00:00:00Z \
+             git -C "$WT" commit-tree "$_base^{tree}" -p "$_base" -m forged 2>/dev/null)"
+  if [ -n "$_forged" ] && git -C "$WT" replace "$_base" "$_forged" 2>/dev/null; then
+    _seen="$(git -C "$WT" log -1 --format=%cI "$_base" 2>/dev/null)"
+    case "$_seen" in 2010-*) ok "CONTROL the replace ref DOES change what git reports for that commit — so the row below can fail" ;;
+                   *) bad "CONTROL the replace ref did not take effect ($_seen), so the row below cannot fail" ;; esac
+    # The state's witness would otherwise say STALE (finished long before the merging commit); with the
+    # forged date it would say PASS. The gate must not honour the replacement.
+    printf '{"version":1,"head_at_write":"%s","branch":"feat/2977-tm","suites":[{"n":1,"command":"x","exit":0,"finished_at":"2020-01-01T00:00:00Z"}]}\n' "$WT_HEAD" > "$WT/.worktree-report/state.json"
+    out="$(env STUB_OK=1 STUB_RC=0 STUB_STALE=0 bash "$GATE" --check "$REPO" "feat/2977-tm" "$WT_HEAD" 2>&1)"; rc=$?
+    if [ "$rc" = 4 ]; then ok "a refs/replace ref cannot forge the commit date the laundering arm reads (rc=$rc, still STALE)"; else bad "a replace ref forged the commit date: expected rc=4, got rc=$rc :: $out"; fi
+    git -C "$WT" replace -d "$_base" 2>/dev/null || true
+  else
+    ok "SKIPPED the replace-ref row (git replace unavailable in this fixture)"
+  fi
+  _restore_state
+fi
 
 # ── 2h. THE STATE MUST AGREE WITH THE SEALED REPORT (round-8 review, P1) ──────────────────
 # ⛔ `state.json` CARRIES NO DIGEST — only WORKTREE-REPORT.md is sealed — so a two-field EDIT (head_at_write

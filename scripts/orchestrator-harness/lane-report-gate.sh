@@ -84,6 +84,15 @@ set -u
 # `PATH`/`PYTHONPATH` seams: an inherited variable choosing the subject of the verdict. The gate never
 # needs either — it always names its repo explicitly — so they are dropped once, at entry.
 unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_COMMON_DIR
+# ⛔ `refs/replace/*` REWRITES THE OBJECTS THE GATE READS, SO IT FORGES THE SAME WITNESS WITHOUT AN
+# ENVIRONMENT VARIABLE (round-9 review, P1). The unsets above stop a repo being RELOCATED; a
+# `refs/replace/<head>` ref does not relocate anything — it makes `git log -1 --format=%cI <head>` below
+# return a SUBSTITUTED commit's date, so the `predates` (laundering) arm reads a forged commit time. The
+# ref lives in the common gitdir, is not on the branch, and is invisible in the reviewed diff. Measured:
+# with `state.json` byte-identical (`cmp` = IDENTICAL), planting one replace ref turned `VERDICT=STALE
+# rc=4` into `VERDICT=PASS rc=0`, and `GIT_NO_REPLACE_OBJECTS=1` turned it back. One variable, no fixture
+# impact (no fixture creates a replace ref).
+export GIT_NO_REPLACE_OBJECTS=1
 # ⛔ `GIT_COMMON_DIR` IS THE SAME SEAM AND WAS MISSED (round-8 review, P1). It retargets BOTH `worktree
 # list` enumerations — the branch's worktree AND the main-worktree the consumer is read from — and it also
 # retargets `resolve_trusted_checkout` in lane-merge.sh, i.e. the function this gate's provenance
@@ -123,8 +132,14 @@ _lrg_emit() {
 # NO candidate meets the floor.
 _lrg_py() {
   local c
-  for c in /opt/homebrew/bin/python3 /usr/local/bin/python3 /usr/bin/python3 /opt/homebrew/bin/python \
-           /usr/local/bin/python /usr/bin/python; do
+  # ⛔ ROOT-OWNED FIRST, now that the probe makes the order irrelevant (round-9 review, P2). The
+  # pre-probe version had to put homebrew first so a 3.12 build could be found; with the floor checked
+  # per candidate that reason is gone, and `/opt/homebrew/bin` + `/usr/local/bin` are USER-owned on the
+  # macOS layouts this list exists for — preferring them would put the verdict-computing program in a
+  # directory the lane's own user can replace. `/usr/bin/python3` is SIP/root-owned on macOS and root on
+  # Debian/Ubuntu, so it is preferred wherever it satisfies the floor.
+  for c in /usr/bin/python3 /usr/bin/python /opt/homebrew/bin/python3 /usr/local/bin/python3 \
+           /opt/homebrew/bin/python /usr/local/bin/python; do
     [ -x "$c" ] || continue
     "$c" -I -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 12) else 1)' 2>/dev/null \
       && { printf '%s' "$c"; return 0; }
@@ -401,7 +416,21 @@ except Exception:
 # runs any of those three commands presents `head_at_write = B` with evidence taken at A — and both
 # of the gate head witnesses then agree with the merge. The newest suite `finished_at` is NOT
 # re-stamped by a render, so "the newest suite finished BEFORE the merging commit was created" is the
-# one consumer-side witness that survives. ⛔ IT IS A SINGLE-CLOCK COMPARISON ONLY WHEN THE HEAD WAS
+# one witness that survives a RE-RENDER.
+# ⛔ IT DOES NOT SURVIVE AN EDIT, AND THAT IS DISCLOSED RATHER THAN IMPLIED (round-9 review, P0).
+# `finished_at` lives ONLY in `state.json`, which carries no digest — the sealed `WORKTREE-REPORT.md`
+# renders `Started:`/`Written:` and each suite command/exit, but NEVER the finish time of a suite (tortoise
+# `tools/worktree_report.py` render() ~:380-410; `finished_at` is only ever WRITTEN, at :575, and never
+# read back by `cmd_check`). So the consumer returns VALID on a fabricated timestamp BY CONSTRUCTION, and
+# the graded party owns that file: measured, changing this ONE value (`2020-01-01` -> `2099-01-01`) turned
+# `VERDICT=STALE rc=4` into `VERDICT=PASS rc=0` with the markdown sha256 unchanged. The round-8 sealed
+# cross-check covers `head_at_write` only, so what remains is: **`state.json` is attacker-owned except for
+# the fields cross-checked against the sealed report** (`head_at_write` today).
+# ⛔ THE DURABLE FIX IS WRITER-SIDE (render each suite finish time into the digest-covered markdown) and
+# is tracked in tortoise (#11551); a gate-side comparison against the sealed `Written:` stamp does NOT close it (a
+# value forged between the commit and the render passes). Until then this arm is a STALENESS signal that
+# is honest about being forgeable, not a tamper-proof witness — do not read the phrase "witness" above as
+# saying otherwise. ⛔ IT IS A SINGLE-CLOCK COMPARISON ONLY WHEN THE HEAD WAS
 # COMMITTED ON THIS BOX (fresh review, P2): a `fix-<PR>`/`adopt-fix` push or another box can stamp the
 # commit with a DIFFERENT clock, which is exactly the scenario the `live_head` arm exists for — so the
 # skew is measured and NAMED rather than assumed away (see `skew`). It adds no false positive of its
