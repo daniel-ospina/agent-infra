@@ -164,6 +164,16 @@ lane_report_gate() {
     _lrg_emit 6 NO-WORKTREE "branch=$branch reason=no-worktree-for-branch-on-this-box head=$head"
     return 6
   fi
+  # ⛔ A PRUNABLE REGISTRATION IS NOT EVIDENCE (fresh review, P2). `git worktree list --porcelain` keeps
+  # a stanza after the DIRECTORY is deleted (`prunable gitdir file points to non-existent location`), so
+  # the resolver returns a dead path and the gate then refused ABSENT on a file that cannot exist — with
+  # a remedy (`write one`) that is impossible in a worktree that is gone. The physical fact is the same
+  # one code 6 exists for: the lane's evidence is not reachable from this box. Checked HERE, once, for
+  # both the absent and the consumer arms.
+  if [ ! -d "$wt" ]; then
+    _lrg_emit 6 NO-WORKTREE "branch=$branch worktree=$wt reason=worktree-directory-is-gone head=$head"
+    return 6
+  fi
 
   # ⛔ THE CONSUMER IS RESOLVED BEFORE ABSENCE IS JUDGED, AND THIS ORDER IS LOAD-BEARING. The report's
   # FORMAT is the writer's (`tools/worktree_report.py`, shipped by the consumer repo). A repo that ships

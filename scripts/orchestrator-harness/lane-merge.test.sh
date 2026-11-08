@@ -269,6 +269,45 @@ ck "a REFUSED lane report → exit 10 FIX_REQUIRED (the lane re-runs in place; n
 ck "…and it is NOT BLOCKED_ATTESTATION/12 (that would hand off a report the lane fixes itself)" \
    $([ "$RC" != 12 ] && [ "$(verdict_of 42 | cut -d' ' -f1)" != BLOCKED_ATTESTATION ] && echo 0 || echo 1)
 
+# ── 11c-quinquies. THE GATE IS *REACHED* — the observable outcome, not a syntactic neighbour ──────
+# ⛔ THE SYNTACTIC PINS CANNOT PROVE REACHABILITY (fresh review, P2): wrapping the block in
+# `while false; do`, or extracting it into an uncalled function, keeps every anchor green while the
+# gate is inert. This row drives the SHIPPED script: a real repo, a real linked worktree on the branch,
+# a real consumer, and NO report → one FIX_REQUIRED round and NO chain. The abstention row proves the
+# audit half too (5/6 must be LOGGED as an abstention, never as a verification).
+GR="$T/gate-repo"; GL="$T/gate-lane"
+rm -rf "$GR" "$GL"; mkdir -p "$GR/tools"
+cat > "$GR/tools/worktree_report.py" <<'GEOF'
+import json, subprocess, sys
+wt = sys.argv[sys.argv.index("--worktree") + 1] if "--worktree" in sys.argv else "."
+head = subprocess.run(["git", "-C", wt, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+print(json.dumps({"ok": True, "rules": [], "suites": 1, "failing_suites": 0,
+                  "head": head, "head_moved_since_write": False}))
+GEOF
+printf 'x\n' > "$GR/f"
+git -C "$GR" init -q -b main 2>/dev/null || true
+git -C "$GR" add f tools/worktree_report.py
+git -C "$GR" -c user.email=t@t -c user.name=t commit -qm base
+git -C "$GR" worktree add -q -b feat/lane "$GL" main
+GHED="$(git -C "$GL" rev-parse HEAD)"
+printf 'allgood\tcompleted\tsuccess\t41\n' > "$T/checks-gate.tsv"
+
+new_o "$T/pr.tsv"
+printf 'open||%s|clean\n' "$GHED" > "$T/pr-gate.tsv"
+OUT="$(PATH="$BIN:$PATH" GH_LOG=/dev/null O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 REPO_PATH="$GL" \
+      bash "$SCRIPT" 90 --repo o/r --branch feat/lane --pr-tsv "$T/pr-gate.tsv" --checks-tsv "$T/checks-gate.tsv" 2>&1)"; RC=$?
+ck "an ABSENT lane report REFUSES the merge (exit 10 FIX_REQUIRED) and launches NO chain" \
+   $([ "$RC" = 10 ] && [ "$(verdict_of 90 | cut -d' ' -f1)" = FIX_REQUIRED ] \
+      && ! grep -q 'launched the merge chain' <<<"$OUT" && grep -q 'VERDICT=ABSENT' <<<"$OUT" && echo 0 || echo 1)
+
+# The abstention arm: no worktree for the branch on this box is 6, LOGGED, and the chain still gets the
+# PR. It must never read as a verification — that string is the entire justification for not refusing.
+new_o "$T/pr.tsv"
+OUT="$(PATH="$BIN:$PATH" GH_LOG=/dev/null O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 REPO_PATH="$GL" \
+      bash "$SCRIPT" 91 --repo o/r --branch feat/no-such-branch --pr-tsv "$T/pr-gate.tsv" --checks-tsv "$T/checks-gate.tsv" 2>&1)"; RC=$?
+ck "NO-WORKTREE (6) is an ABSTENTION: logged, never 'verified at head', and the chain still gets the PR" \
+   $([ "$RC" = 11 ] && grep -q 'abstention, not a green' <<<"$OUT" && ! grep -q 'verified at head' <<<"$OUT" && echo 0 || echo 1)
+
 # ── 11c-bis. the DURABLE marker wins even when the log has been rotated away ─────────────────────
 new_o "$T/pr21.tsv"
 printf '%s deadbeef %s\n' 999998 "$OT/logs/lane-merge-30.log" > "$OT/state/lanemerge-30.chain"

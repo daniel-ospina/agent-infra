@@ -1188,6 +1188,15 @@ rail_attempt() {
 # false PASS this issue exists to close. `7` (a report that exists but cannot be VERIFIED) DOES refuse:
 # an unreadable verification is not a pass.
 _lrg_rc=0; _lrg_out=""
+# ⛔ GATE ONLY ON A HEAD THE GATE CAN BIND (fresh review, P2). `HEAD` here comes from a SWALLOWED API
+# read (`:615`), so one rate-limit/network blip leaves it empty or malformed — and the file already has
+# the arm for that state further below (`park "could not resolve PR #$PR head …" ; exit 3`), which is
+# now DOWNSTREAM of this block. Gating first relabelled a transient read failure as a LANE REPORT fault:
+# exit 9 → `chain_verdict_from_log` → FIX_REQUIRED, telling the lane to re-run its suites and repair a
+# consumer, with no `parked-<PR>` written (defeating the #1717 mechanism). The other carrier already
+# applies this principle (lane-merge.sh skips the gate on an empty branch so the actionable refusal is
+# not outranked). A head the gate cannot bind is not a report defect.
+if [ -n "${HEAD:-}" ] && [ "${#HEAD}" -eq 40 ]; then
 _lrg_out="$(lane_report_gate "$REPO" "$BR" "${HEAD:-}" 2>&1)" || _lrg_rc=$?
 [ -n "$_lrg_out" ] && echo "[merge $PR] $_lrg_out" >> "$L.log"
 case "$_lrg_rc" in
@@ -1198,6 +1207,7 @@ case "$_lrg_rc" in
       echo "[merge $PR] LANE REPORT REFUSED (rc=$_lrg_rc): $(printf '%s' "$_lrg_out" | tail -1)" >&2
       exit 9 ;;
 esac
+fi
 
 if [ "$MERGE_AUTHORITY" = "rail" ]; then
   # RAIL MODE — the rail is the MERGE authority, and since agent-infra#1825 it is no longer an

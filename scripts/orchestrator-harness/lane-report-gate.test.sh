@@ -141,6 +141,9 @@ drive() {
 drive 0 "PASS: valid evidence at the head being merged" STUB_OK=1 STUB_RC=0 STUB_STALE=0
 case "$LAST_OUT" in *VERDICT=PASS*) ok "PASS is spelled VERDICT=PASS on the printed line" ;; *) bad "PASS line: $LAST_OUT" ;; esac
 case "$LAST_OUT" in *worktree="$WT "*) ok "PASS resolves the EXACT branch worktree, not a decoy" ;; *) bad "PASS resolved the wrong worktree: $LAST_OUT" ;; esac
+# ⛔ THE PASS LINE MUST NAME THE VERIFIER (fresh review, P2): provenance that nothing reads is a comment,
+# not a control, and it is the only thing that makes a wrong grader visible AFTER it changed a verdict.
+case "$LAST_OUT" in *"tool=$REPO/tools/worktree_report.py"*) ok "PASS names the verifier it used (tool=…)" ;; *) bad "PASS does not name the verifier: $LAST_OUT" ;; esac
 
 # ── 2. THE MEASURED DEFECT: rc 0 + a moved head is NOT a pass ────────────────────────────────────
 mkdir -p "$WT/.worktree-report"
@@ -230,6 +233,11 @@ LIAR="$TMP/liar_tool.py"
 printf 'import json,sys\nprint(json.dumps({"ok":True,"rules":[],"suites":1,"failing_suites":0,"head":"%s","head_moved_since_write":False}))\n' "$WT_HEAD" > "$LIAR"
 out="$(env STUB_OK=0 STUB_RC=3 STUB_FAILING=1 LANE_REPORT_GATE_TOOL="$LIAR" bash "$GATE" --check "$REPO" "feat/2977-tm" "$WT_HEAD" 2>&1)"; rc=$?
 if [ "$rc" = 3 ]; then ok "LANE_REPORT_GATE_TOOL in the ambient env is IGNORED — the repo's consumer still decides (rc=$rc)"; else bad "ambient LANE_REPORT_GATE_TOOL overrode the verifier: expected rc=3, got rc=$rc :: $out"; fi
+# ⛔ THE `_PY` HALF OF THE SAME SEAM (fresh review, P2): it chooses the program that computes ok/predates/
+# skew — i.e. EVERY arm — and was reachable through the same inheritance chain. Over genuinely RED
+# evidence it must change nothing.
+out="$(env STUB_OK=0 STUB_RC=3 STUB_FAILING=1 LANE_REPORT_GATE_PY=/bin/true bash "$GATE" --check "$REPO" "feat/2977-tm" "$WT_HEAD" 2>&1)"; rc=$?
+if [ "$rc" = 3 ]; then ok "LANE_REPORT_GATE_PY in the ambient env is IGNORED — RED evidence is still RED (rc=$rc)"; else bad "ambient LANE_REPORT_GATE_PY overrode the interpreter: expected rc=3, got rc=$rc :: $out"; fi
 
 # ── 3c. AN UNUSABLE repo IS 7, NOT A 6 ABSTENTION (fresh review, P2) ─────────────────────────────
 mkdir -p "$TMP/plaindir"
@@ -296,6 +304,19 @@ if [ "$rc" = 6 ]; then ok "NO-WORKTREE for feat/2977-ext (a reverse-prefix mutan
 out="$(env STUB_OK=1 STUB_RC=0 bash "$GATE" --check "$REPO" "feat/nobody-tm" deadbeef 2>&1)"; rc=$?
 if [ "$rc" = 6 ]; then ok "NO-WORKTREE: no worktree on this box for the branch (an abstention, not a pass) (rc=$rc)"; else bad "NO-WORKTREE: expected rc=6, got rc=$rc :: $out"; fi
 case "$out" in *VERDICT=NO-WORKTREE*) ok "NO-WORKTREE is spelled on the line, so a census can count abstentions" ;; *) bad "NO-WORKTREE line: $out" ;; esac
+# ⛔ A PRUNABLE REGISTRATION IS NOT EVIDENCE (fresh review, P2): `git worktree list --porcelain` keeps the
+# stanza after the directory is deleted, so a resolver that trusts it refuses ABSENT on a file that
+# cannot exist — with a remedy that is impossible in a worktree that is gone. It is 6, the code for
+# "the evidence is not reachable from here".
+git -C "$REPO" worktree add -q -b feat/gone "$TMP/gone" main 2>/dev/null || true
+rm -rf "$TMP/gone"
+out="$(bash "$GATE" --check "$REPO" "feat/gone" "$(git -C "$REPO" rev-parse HEAD)" 2>&1)"; rc=$?
+if [ "$rc" = 6 ] && grep -q 'reason=worktree-directory-is-gone' <<<"$out"; then
+  ok "a PRUNABLE worktree registration is NO-WORKTREE (6), not ABSENT with an impossible remedy (rc=$rc)"
+else
+  bad "prunable worktree: expected rc=6 + worktree-directory-is-gone, got rc=$rc :: $out"
+fi
+git -C "$REPO" worktree prune 2>/dev/null || true
 
 # ── 7. USAGE ─────────────────────────────────────────────────────────────────────────────────────
 out="$(bash "$GATE" 2>&1)"; rc=$?
@@ -363,9 +384,13 @@ lm_head="$(grep -nE '^_lrg_rc=0; _lrg_out=""$' "$LANE_MERGE" | head -1 | cut -d:
 for _pair in "lane-merge.sh:$lm_head" "merge-one.sh:$co_head"; do
   _f="${_pair%%:*}"; _ln="${_pair##*:}"
   _g="$(_guard_of "$HERE/$_f" "$_ln")"
+  # ⛔ A `*'then'`-ONLY MATCH IS A HEURISTIC THAT ENUMERATES THE WRAPPERS THE AUTHOR THOUGHT OF (fresh
+  # review, P2): `while false; do` and an extract-into-an-uncalled-function both left the suite green.
+  # Match every block opener that can make a top-level block unreachable-by-default.
   case "$_g" in
-    *'then') bad "$_f's gate block is NESTED (preceding code line: '$_g') — a guard that is never true makes the gate inert while every anchor stays green" ;;
-    *)       ok "$_f's gate block is not nested in a conditional (preceding code line: $(printf '%s' "$_g" | cut -c1-40))" ;;
+    *'then'|*' do'|*'() {'|*' {')
+      bad "$_f's gate block is NESTED or inside a definition (preceding code line: '$_g') — a wrapper that never runs makes the gate inert while every anchor stays green" ;;
+    *)  ok "$_f's gate block is not nested in a conditional or a definition (preceding code line: $(printf '%s' "$_g" | cut -c1-40))" ;;
   esac
 done
 if [ -n "$co_rail" ] && sed -n "$((co_call)),$((co_rail))p" "$MERGE_ONE" | grep -qE '^[[:space:]]*exit 9 ;;'; then
@@ -378,6 +403,31 @@ if sed -n "$((co_call)),$((co_call+8))p" "$MERGE_ONE" | grep -q 'park '; then
 else
   ok "merge-one.sh does not park on a report refusal (the remedy is a re-run at the same head)"
 fi
+# ⛔ THE ABSTENTION AUDIT STRING IS THE WHOLE JUSTIFICATION FOR NOT REFUSING (fresh review, P2). The
+# scoping decision makes 5/6 acceptable ONLY because they are logged "so a fleet-wide census can see how
+# much of the queue is actually covered" and are "never counted as a green". Nothing pinned that: both
+# carriers' abstention arms could be made SILENT, or made to print "verified at head …", with every
+# suite green. Pin the audit half here (the reachability half is the nesting row above).
+if grep -qE 'abstention, not a green' "$LANE_MERGE" && ! grep -qE 'verified at head .*5\|6' "$LANE_MERGE"; then
+  ok "lane-merge.sh's 5/6 arm still SAYS abstention and never claims a verification"
+else
+  bad "lane-merge.sh's abstention arm no longer names itself (or claims a verification)"
+fi
+if grep -qE 'LANE REPORT NOT ENFORCED' "$MERGE_ONE" && grep -qE 'ABSTENTION, not a green' "$MERGE_ONE"; then
+  ok "merge-one.sh's 5/6 arm still records NOT ENFORCED / ABSTENTION for the merge log"
+else
+  bad "merge-one.sh's abstention arm no longer records the audit string"
+fi
+# ⛔ A HEAD THE GATE CANNOT BIND IS NOT A REPORT DEFECT (fresh review, P2). `HEAD` comes from a swallowed
+# API read, so one gh blip would otherwise be RELABELLED as a lane-report fault: exit 9 → FIX_REQUIRED,
+# telling the lane to re-run suites, with no park — while the file's own arm for that state (park +
+# exit 3) sits DOWNSTREAM of the gate. The gate must run only on a 40-hex head.
+if grep -qE '^if \[ -n "\$\{HEAD:-\}" \] && \[ "\$\{#HEAD\}" -eq 40 \]; then$' "$MERGE_ONE"; then
+  ok "merge-one.sh gates only on a bindable 40-hex head (a transient gh failure parks, it is not a report fault)"
+else
+  bad "merge-one.sh runs the report gate on an empty/malformed head — a gh blip becomes a FIX_REQUIRED report fault"
+fi
+
 # The deployed set: a $O without the file makes every caller's `lane_report_gate` an unbound command.
 if grep -q 'lane-report-gate.sh' "$INSTALL"; then
   ok "install.sh's maintained shipped-set list carries lane-report-gate.sh"
