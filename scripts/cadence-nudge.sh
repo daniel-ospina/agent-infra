@@ -907,15 +907,24 @@ else
   # receipt now says which it saw. stderr is merged into the same read so the cause travels with it.
   _help=$(/usr/bin/python3 "$_verify" verify --help 2>&1)
   _hrc=$?
-  case "$_help" in
-    *--surface*) ;;
-    *)
-      if [ "$_hrc" -ne 0 ]; then
-        _checker_broken="verify --help failed (rc=$_hrc): $(printf '%s' "$_help" | tr '\n' ' ' | tail -c 160)"
-      else
-        _checker_broken="stale farmed copy ($_verify) predates --surface, so it would refuse the argv before sending"
-      fi ;;
-  esac
+  # ⛔ THE STATUS IS CONSULTED FIRST, THE FLAG ONLY SECOND (#3795 review cycle 10, P2). This read used
+  # to `case "$_help" in *--surface*) ;;` BEFORE looking at `$_hrc`, so a help invocation that FAILED
+  # but whose merged output happened to mention the flag passed the gate -- "the read failed" read as
+  # "the checker is usable", the exact polarity this file corrects twice elsewhere (`getattr(proc,
+  # "returncode", 1)` in `_resolve_session_id_qualified`, "an id out of a FAILED read is not this
+  # surface's session"). It is REACHABLE in the state this gate exists for: a farm pass that stopped
+  # mid-write leaves a copy whose `argparse` block is truncated, and Python reports the unclosed
+  # bracket AT THE LINE HOLDING IT — a line that contains the `--surface` flag. MEASURED on the
+  # fixture: `send=False` and NO `NUDGE at=` at all, i.e. the floor lost its one
+  # invariant (a heartbeat leaves even on a broken box) on a box whose checker is unusable.
+  if [ "$_hrc" -ne 0 ]; then
+    _checker_broken="verify --help failed (rc=$_hrc): $(printf '%s' "$_help" | tr '\n' ' ' | tail -c 160)"
+  else
+    case "$_help" in
+      *--surface*) ;;
+      *) _checker_broken="stale farmed copy ($_verify) predates --surface, so it would refuse the argv before sending" ;;
+    esac
+  fi
 fi
 # ⛔ THE ENV DOOR IS VALIDATED, NOT TRUSTED (#3795 review P1). The probe above runs `verify --help`,
 # which exits BEFORE argparse validates the `--timeout` VALUE -- so `CADENCE_NUDGE_VERIFY_TIMEOUT=90s`

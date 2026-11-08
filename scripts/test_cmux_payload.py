@@ -2336,6 +2336,49 @@ def test_cadence_nudge_still_sends_when_the_checker_predates_the_argv(tmp_path):
         "the checker ran anyway and its usage error became the receipt:" + appended)
 
 
+def test_cadence_nudge_still_sends_when_the_help_READ_fails_but_names_the_flag(tmp_path):
+    """⛔ A FAILED `--help` READ IS NOT A USABLE CHECKER, EVEN IF ITS OUTPUT NAMES THE FLAG
+    (#3795 review cycle 10, P2).
+
+    The capability gate tested `case "$_help" in *--surface*)` BEFORE consulting `$_hrc`, so a help
+    invocation that FAILED but whose merged output happened to contain `--surface` passed the gate —
+    "the read failed" read as "the checker is usable". That is the polarity this PR corrects twice
+    elsewhere, and it is reachable in the exact state the gate exists for: a farm pass that stopped
+    mid-write leaves a copy whose argparse block is truncated, and Python reports the unclosed bracket
+    AT THE LINE HOLDING IT, which is where the `--surface` flag is defined.
+
+    MEASURED pre-fix: `send=False` and NO `NUDGE at=` line at all — the floor lost its one invariant
+    (a heartbeat leaves even on a broken box) on a box whose checker cannot run.
+
+    DISCRIMINATOR: the flag-bearing FAILING help must take the raw-send path, and the receipt must name
+    the SyntaxError rather than a version claim about a checker that never parsed.
+    """
+    seed = _seeded_log(600)
+    home, bindir, screen, state = _cadence_home(
+        tmp_path, "the pane shows nothing relevant\n", seed)
+    # A truncated copy: it does NOT parse, and its failing help text still names the flag.
+    (home / ".pi" / "agent" / "scripts" / "lib" / "cmux_payload.py").write_text(
+        "import sys\n"
+        "if '--help' in sys.argv:\n"
+        "    sys.stderr.write('  File x, line 9\\n    p.add_argument(\"--surface\", default=None)'\n"
+        "                     'SyntaxError: ( was never closed\\n')\n"
+        "    sys.exit(1)\n"
+        "sys.exit(0)\n", encoding="utf-8")
+    sent = tmp_path / "SENT"
+    r = _run_cadence_nudge(home, bindir, screen, session=sent)
+    assert r.returncode == 0, r.stdout + r.stderr
+    nudges, appended = _new_nudge_lines(state, seed)
+    assert sent.exists(), (
+        "a checker whose help READ FAILED but named the flag suppressed the send — the floor's one "
+        "invariant is broken:\n" + appended)
+    assert nudges, appended
+    assert all("delivered=yes" not in line for line in nudges), appended
+    assert "verify --help failed" in appended, (
+        "a failed help read was not reported as a failure:\n" + appended)
+    assert "predates --surface" not in appended, (
+        "a checker that never parsed was described as merely OLD:\n" + appended)
+
+
 def test_resolve_session_id_does_not_fall_back_when_the_read_succeeded_but_named_no_session(P):
     """⛔ AN EMPTY ANSWER IS AN ANSWER (#3795 review P1). `surface resume show` exits 0 with empty
     stdout for a pane that names no session. Falling back there would let the workspace' OTHER
