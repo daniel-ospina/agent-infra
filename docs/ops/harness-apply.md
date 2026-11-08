@@ -116,7 +116,7 @@ pin=ce987bb2c1de
 pin_tree=ce987bb2c1de
 drift=clean:current          <- the deployed-drift reading, `<state>:<token>` (`executes:<dir>` is the red one)
 farm_rows=none               <- `none` (farm matched — no list written by this pass, so any list on disk is not today's answer), `not-graded` (NO USABLE grade — see `action=`; on a farmless SKIPPED host `action=none`, so there `farm_rows=` itself is the signal), `unwritable`, or the FILE naming every drifting file
-farm_n=0                     <- rows the farm grade reported: a COUNT when graded (0 when the farm matched), `not-graded` otherwise
+farm_n=0                     <- rows the farm grade reported: a COUNT when graded (0 when the farm matched), `not-graded` when no grade was produced, `unparsed` when a RED grade's rows did not match this pass's extractor (the artifact's header reads `n=unparsed`; `0` would read as "nothing drifted")
 preserved=none
 remedy=none                  <- the ACTION for a refusal, never truncated (`detail=` is bounded at 240)
 action=none
@@ -147,25 +147,38 @@ which the timer installer itself calls), it sat below the seam validations so th
 orphaned the list, and a fixed-path delete can unlink a concurrent pass's just-published file
 between its write and its record.
 
-⛔ **A CONCURRENT PASS CAN REPLACE THE FILE THIS RECORD NAMES — MATCH THE HEADER BEFORE YOU TRUST IT.**
+⛔ **A CONCURRENT PASS CAN REPLACE THE FILE THIS RECORD NAMES — READ THE HEADER BEFORE YOU TRUST THE LIST.**
 The path is fixed and the publish is a last-writer-wins rename, while the record is written later
-(in `finish`, after the deployed readings), so a timer tick overlapping an operator's hand-run can
-leave pass A's record naming pass A's rows while the file at that path holds pass B's. The write is
-atomic (a reader never sees half a list, and no pass ever removes another's file), but it is not
-*per-run*: before reading the list as this record's rows, check the header's `n=` and UTC against
-the record's `farm_n=` and `epoch=`. A mismatch is two passes, not a corrupt list.
+(in `finish`, after the deployed readings, ~3–4 s of `check-deploy-drift` later), so a timer tick
+overlapping an operator's hand-run can leave pass A's record naming pass A's rows while the file at
+that path holds pass B's. The write is atomic (a reader never sees half a list, and no pass ever
+removes another's file), but it is **not per-run**, and the header is what you can decide with:
 
-`farm_n=0` on a RED (`action=farm-drift`, `rc=24`) record means the **extractor** matched no row while
-the instrument still reported drift — the installed `check-farm-drift.sh` is a copy whose row
-vocabulary this pass does not know (a farm that lags the ref). The artifact then carries the
-instrument's **RAW output** and its header reads `n=unparsed`; the DRIFT is still red and still
-recorded, and the names are in that file verbatim rather than extracted.
+- the header's `ref=` must equal the record's `ref=`, and the header's `dest=` the farm the record
+graded;
+- the header's UTC must **not be later than** the record's `at=` (the artifact is published first,
+so a header timestamp *after* the record's own is the one cheap impossibility — compare same-format
+strings, both UTC, NOT the header's UTC against the record's `epoch=`);
+- the header's `n=` must equal the record's `farm_n=`, **except** when the header reads
+  `n=unparsed` — then `farm_n=unparsed` too, and the paragraph below governs.
+
+Those rules cannot separate two passes that produced the **same** row count in the same second-level
+timestamp; nothing in the artifact can, and claiming otherwise is worse than saying so. What they do
+rule out is the shape that matters: a list from before the record's own run.
+
+`farm_n=unparsed` on a RED (`action=farm-drift`, `rc=24`) record means the **extractor** matched no
+row while the instrument still reported drift — the installed `check-farm-drift.sh` is a copy whose
+row vocabulary this pass does not know (a farm that lags the ref). The artifact then carries the
+instrument's **RAW output** verbatim and its header reads `n=unparsed`; the DRIFT is still red and
+still recorded. The names are wherever the instrument printed them — in that file if it printed
+rows, in this run's own output if it printed none — so the record says "published verbatim" and
+never "every one named".
 
 `farm_rows=unwritable` means the rows write failed **while the record write still succeeded** — the
-drift is still red and still counted, `farm_n` is still the instrument's row count (or `0` with
-`n=unparsed` in the artifact's place), but the names are not on disk, so the journal says so in as
-many words. (A state dir that is unwritable for the record too leaves the PREVIOUS record in place:
-staleness, not a field, is that signal.)
+drift is still red, `farm_n` still carries the count it had (or `unparsed` when the extraction parsed
+nothing), but **no artifact is written**, so the journal says so in as many words and rows 13..N are
+named nowhere durable. (A state dir that is unwritable for the record too leaves the PREVIOUS record
+in place: staleness, not a field, is that signal.)
 
 ⛔ `deployed` EXISTS BECAUSE THE CHECKOUT IS NOT THE DEPLOYMENT. A pin-per-commit cell
 never moves its checkout, so `behind` measured there would be permanently non-zero and

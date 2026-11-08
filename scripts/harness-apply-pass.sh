@@ -1459,7 +1459,13 @@ if [ "$FARM_CHECK_ON" = "1" ]; then
                     rm -f "$FARM_ROWS_FILE.tmp-$$" 2>/dev/null || true
                     REC_FARM_ROWS=unwritable
                 fi
-                REC_FARM_NROWS="$FARM_NROWS"
+                # ⛔ `farm_n=unparsed` ON THE RAW ARM, NEVER `0` (review round 6). `farm_n=0` already
+                # means "the farm matched" in every other record, so a RED record carrying `0` reads as
+                # "zero rows drifted" — one field with two meanings is the class this pass deletes.
+                # Nothing reads `farm_n` numerically (fleet-health parses key=value and ignores it), so
+                # the value is free to carry the truth: a count when the extraction parsed, `unparsed`
+                # when it did not, `not-graded` when no grade was produced.
+                if [ "$FARM_ROWS_RAW" = 1 ]; then REC_FARM_NROWS=unparsed; else REC_FARM_NROWS="$FARM_NROWS"; fi
                 printf '%s\n' "$PERSIST_BODY" | head -12 | while IFS= read -r _row; do
                     log_line "farm:   $_row"
                 done
@@ -1484,7 +1490,7 @@ if [ "$FARM_CHECK_ON" = "1" ]; then
                     log_line "farm:   $_row"
                 done
                 if [ "$FARM_ROWS_RAW" = 1 ] && [ "$FARM_ROWS_OK" = 1 ]; then
-                    FARM_ROW_SENTENCE="no row matched this pass's extractor, so the instrument's RAW output — which names them — is in $REC_FARM_ROWS"
+                    FARM_ROW_SENTENCE="no row matched this pass's extractor, so the instrument's RAW output is published verbatim in $REC_FARM_ROWS"
                 elif [ "$FARM_ROWS_OK" = 1 ]; then
                     FARM_ROW_SENTENCE="${FARM_NROWS} row(s), every one named in $REC_FARM_ROWS"
                 elif [ "$FARM_ROWS_RAW" = 1 ]; then

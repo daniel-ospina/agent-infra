@@ -1579,6 +1579,30 @@ assert_contains "$(grep '^detail=' <<<"$REC24V")" "RAW output" \
     "T24 control: and detail= says the names are in the instrument's RAW output"
 assert_absent "$(grep '^detail=' <<<"$REC24V")" "every one named in" \
     "T24 control: and never claims the extractor named rows it did not match"
+# ⛔ THE COUNT FIELD MUST NOT SAY `0` HERE (review round 6). `farm_n=0` already means "the farm
+# matched" in every other record, so a RED record carrying it reads as "zero rows drifted" — and
+# nothing pinned the field on this arm, so `farm_n=not-graded` there reddened no row.
+assert_contains "$(grep '^farm_n=' <<<"$REC24V")" "farm_n=unparsed" \
+    "T24 control: the count field says UNPARSED, never 0 (which means the farm matched everywhere else)"
+# ...and the journal line must name the artifact, not stop at "no row matched" (unpinned until round 6).
+assert_contains "$OUT" "the instrument's RAW output above is published in" \
+    "T24 control: and the journal sends the reader to the artifact instead of ending at the diagnosis"
+
+# ⛔ RAW + UNWRITABLE IS ITS OWN SENTENCE (review round 6). Zero extracted rows AND a failed write
+# means NO artifact exists, so the persisted-raw wording would name a file that is not there — and
+# only the 20-row (non-raw) fixture drove the unwritable arm, so this compound arm was untested.
+mk_origin t24w; mk_clone t24w
+REPO_P="$CLONE"; MODE_P=sync
+mkdir -p "$T/t24w/home/.pi/agent/scripts" "$T/t24w/state/harness-apply-farm-rows.txt"
+OUT="$(HARNESS_APPLY_FARM_CHECKER="$T/t24v/stub-other-vocab.sh" run_pass "$T/t24w" 2>&1)"; RC=$?
+assert_eq "$RC" "24" "T24 control: a zero-extraction drift with an unwritable artifact is still RED (24)"
+REC24W="$(cat "$T/t24w/state/harness-apply.status" 2>/dev/null || true)"
+assert_contains "$(grep '^detail=' <<<"$REC24W")" "its RAW output could not be persisted" \
+    "T24 control: and detail= says the RAW output could NOT be persisted, never that a file holds it"
+assert_contains "$OUT" "the RAW output could not be persisted" \
+    "T24 control: with the journal saying the same"
+assert_contains "$(grep '^farm_n=' <<<"$REC24W")" "farm_n=unparsed" \
+    "T24 control: and the count is still unparsed, not a number the extraction never produced"
 
 # ── T26: the materialiser is TOLD which cell home to pin into (agent-infra#3593) ─────────────────
 # MEASURED on the `cmux` cell, 2026-11-06: this pass resolves CELL_HOME from $HOME (pass:195) and the
