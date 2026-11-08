@@ -242,8 +242,12 @@ refused on the `DRIFT —` VERDICT, not on one of its counts** — a summary rea
 declared-but-absent, 0 unsourced` is drift in a class a `stale`-only parse does not read, and a checker
 whose row vocabulary this pass does not match leaves the row half blind too, so counting `stale` alone
 would record `farm: ok` / `farm_rows=none` over two files the farm owes. The instrument prints `OK —` on a
-match, so the verdict line by itself is the contradiction. A wrapper over a genuinely matching farm still
-passes — the check reads the report, not the wrapper's shape.
+match, so the verdict line by itself is the contradiction. The row half uses the SAME predicate and the
+SAME three-label summary proof as the drift arm (one vocabulary, so the guard can never be weaker than
+the branch it guards), and a checker that exits 0 printing **nothing** is refused too — the instrument
+always prints a summary, so a silent exit produced no evidence and is not a match. A wrapper over a
+genuinely matching farm still passes, and prose/summary lines are never read as rows (the class token
+must END the line).
 
 `farm_rows=<path>` is ALSO written on `action=farm-unknown` — on the arm where the instrument gives up
 (its own exit 2), and on the `rc=0`-contradicts-its-report arm above, which publishes the output with the
@@ -466,7 +470,7 @@ checkout can use the documented hatch. The same interaction is recorded for
 
 ## Tests
 
-`scripts/harness-apply-timer.test.sh` — 491 assertions, run by the
+`scripts/harness-apply-timer.test.sh` — 501 assertions, run by the
 `harness-apply-timer` shard of `run-bash-shards.sh`:
 
 | | |
@@ -487,7 +491,7 @@ checkout can use the documented hatch. The same interaction is recorded for
 | T13 | the cadence seam is validated (`abc`, `0`, `1441` refused); a value that does not divide the hour (7) is kept — the artifact states the cadence it keeps |
 | T14 | a **stale** record (including one dated in the FUTURE) is an alarm, a non-numeric staleness bound is refused, and no record at all is `never`, not success |
 | T24 | the **FARM** is graded against the ref: stale → **RED 24** naming the file, exit 3 (undeployable) is red too, a matching farm keeps the normal verdict, an **absent** farm is skipped by name while a **dangling** link reddens, an invalid seam value is refused *before* any move, and a checker living **inside** the farm it grades is refused rather than trusted |
-| T24r | the **rows artifact**'s own lifecycle: every reported row is written (header + all 20, including the last, which no excerpt can show), an **unwritable** artifact path is recorded as `unwritable` rather than silently dropped, a **clean** and a **not-graded** pass each LEAVE the previous list **with its rows intact** and say so in `farm_rows=` (presence is not the promise — `grep -c .` is asserted beside the planted line, so a pass that TRUNCATES the file reds, which a `[ -f ]` row cannot see) |
+| T24 | the **rows artifact**'s own lifecycle: every reported row is written (header + all 20, including the last, which no excerpt can show), an **unwritable** artifact path is recorded as `unwritable` rather than silently dropped, a **clean** and a **not-graded** pass each LEAVE the previous list **with its rows intact** and say so in `farm_rows=` (presence is not the promise — `grep -c .` is asserted beside the planted line, so a pass that TRUNCATES the file reds, which a `[ -f ]` row cannot see) |
 | T26 | the materialiser is **TOLD which cell home to pin into**: under the rendered unit's own environment (`env -i`, `HOME` and no `CELL_HOME`) a stub that reproduces `cloud-cell-supervisor.sh`'s defaulting pins under the pass's own root and the farm grade is then reachable (**24**); reverted one edit, the same stub pins into the scratch default and the pass reports **25** "nothing moved this box" — never reaching predicate 4 (agent-infra#3593) |
 | T15 | a dirty **tracked symlink** is restored as a symlink, and the clean file it pointed at is byte-for-byte untouched (this repo tracks 34 symlinks; writing the blob through the link corrupted the target) |
 

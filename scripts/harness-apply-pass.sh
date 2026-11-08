@@ -409,6 +409,33 @@ bounded() {
         { if (length($0) > n) { s = substr($0, 1, n); sub(/[^ -~]+$/, "", s); print s } else print }'
 }
 
+# ⛔ ONE ROW VOCABULARY AND ONE SUMMARY PROOF, SHARED BY BOTH ARMS THAT READ A CHECKER'S OUTPUT (review
+# round 24, measured). The rc=0 contradiction check had grown its OWN row predicate (`NF>=4` and a
+# `stale`-only summary read) while the drift arm had another — so a report whose drift lay entirely in
+# the other two classes was refused at rc=3 and certified CLEAN at rc=0: measured with
+# `handmade-a.py | drift` rows and `DRIFT — 0 stale …, 0 declared-but-absent, 2 unsourced`, a `tee`
+# wrapper made the pass print `farm: ok` / `farm_rows=none` / `farm_n=0` and publish NO artifact, both
+# names durable nowhere. One predicate governs both branches now; there is no second copy to keep in step.
+farm_drift_rows() {
+    printf '%s\n' "$1" | awk -F'|' '$NF ~ /(^|[[:space:]])(STALE|UNSOURCED|NOT-EXECUTABLE|DECLARED-BUT-ABSENT)[[:space:]]*$/'
+}
+
+# The instrument's own drift TOTAL, from its summary, and ONLY when all three labels parse — the same
+# proof the drift arm uses. Prints NOTHING when a label is absent or the summary is unparsable, so
+# "cannot prove" never degenerates to 0. Anchored on `<n> stale` because a per-file ROW can contain the
+# word DRIFT (measured: `DRIFT-log.txt | a | b | STALE` was taken as the summary, so a printed summary
+# two lines later was reported as ABSENT — `farm_n=unparsed` and a false reason).
+farm_sum_count() {
+    local _l="" _a="" _b="" _c=""
+    _l="$(printf '%s\n' "$1" | grep -m1 '[0-9][0-9]* stale' || true)"
+    [ -n "$_l" ] || return 0
+    _a="$(printf '%s' "$_l" | sed -n 's/.*[^0-9]\([0-9][0-9]*\) stale.*/\1/p')"
+    _b="$(printf '%s' "$_l" | sed -n 's/.*[^0-9]\([0-9][0-9]*\) declared-but-absent.*/\1/p')"
+    _c="$(printf '%s' "$_l" | sed -n 's/.*[^0-9]\([0-9][0-9]*\) unsourced.*/\1/p')"
+    { [ -n "$_a" ] && [ -n "$_b" ] && [ -n "$_c" ]; } || return 0
+    printf '%s' "$(( _a + _b + _c ))"
+}
+
 # ⛔ ONE PUBLISH PATH FOR EVERY ARM THAT HAS SOMETHING TO NAME (review round 13, reproduced). The
 # `farm-unknown` arm (instrument exit 2) ALSO prints per-file rows BEFORE it gives up — its
 # `matched -eq 0` and mixed-ungradeable exits come AFTER the per-file loop (check-farm-drift.sh:689,
@@ -1494,19 +1521,35 @@ if [ "$FARM_CHECK_ON" = "1" ]; then
         # exists to remove, at the one arm that trusted its input absolutely. So a rc=0 that also
         # reported drift is CONTRADICTORY, and a contradiction is not a grade: the output is published
         # under a NO GRADE header and the pass refuses, exactly as an unreadable grade does.
-        # `NF>=4` is not decoration: without it a summary or class-prose line that happens to END in a
-        # class word ("…, 0 unsourced") would read as a row and refuse a healthy farm (over-block).
-        FARM_ROWS0="$(printf '%s\n' "$FARM_OUT" | awk -F'|' 'NF>=4 && $NF ~ /(^|[[:space:]])(STALE|UNSOURCED|NOT-EXECUTABLE|DECLARED-BUT-ABSENT)[[:space:]]*$/')"
+        # ⛔ THE SAME PREDICATE AND THE SAME PROOF AS THE DRIFT ARM (review round 24, measured: a
+        # private `NF>=4` row test plus a `stale`-only summary read certified a report CLEAN at rc=0
+        # whose drift was all `unsourced` — the drift arm refuses those same bytes at rc=1, so the guard
+        # was weaker than the arm it guards, for the class the instrument calls its normal historical
+        # state). Both halves now come from the shared helpers above.
+        FARM_ROWS0="$(farm_drift_rows "$FARM_OUT")"
         FARM_NROWS0="$(printf '%s' "$FARM_ROWS0" | grep -c .)"
         # ⛔ THE CONTRADICTION IS THE *VERDICT*, NOT ONE OF ITS COUNTS (review: the parse read only the
         # `stale` count, so `rc=0` over `DRIFT — 0 stale …, 2 declared-but-absent, 0 unsourced` — drift
         # this pass's row vocabulary did not match, which is the premise the whole extraction arm exists
         # for — recorded `farm: ok` / `farm_rows=none` / `farm_n=0`. The instrument prints `OK — ` on a
         # match and `DRIFT — ` otherwise, so the verdict line ALONE is the contradiction; summing three
-        # counts answers a narrower question than the one being asked.
+        # counts answers a narrower question than the one being asked.)
         FARM_VERDICT0="$(printf '%s\n' "$FARM_OUT" | sed -n '/DRIFT — /{p;q;}')"
+        # ⛔ AND A SILENT rc=0 IS NOT A MATCH (review round 24). The instrument always prints a summary,
+        # so a checker that exits 0 with NO output produced no evidence at all.
+        FARM_SILENT0=0
+        [ -n "$(printf '%s\n' "$FARM_OUT" | grep -v '^[[:space:]]*$' || true)" ] || FARM_SILENT0=1
         case "$FARM_RC" in
             0)
+                if [ "$FARM_SILENT0" = 1 ]; then
+                    # ⛔ A SILENT CHECKER CANNOT CERTIFY A MATCH (review round 24). The instrument always
+                    # prints a summary; an rc=0 with NO output is a seam that produced no evidence, and
+                    # `farm: ok` over no evidence is the same false pass as `farm: ok` over a drift report.
+                    REC_ACTION=farm-unknown
+                    REC_REMEDY="the checker exited 0 printing NOTHING — point HARNESS_APPLY_FARM_CHECKER at check-farm-drift.sh itself (a wrapper or a broken copy that prints no report cannot certify a match), then re-run"
+                    log_line "farm: UNKNOWN — the checker exited 0 but printed NO report, so nothing was graded"
+                    finish 0 24 "farm: UNKNOWN (check-farm-drift rc=0) — the checker printed NOTHING, so $FARM_DEST was never graded: a silent exit is not a match. Fix the seam (HARNESS_APPLY_FARM_CHECKER) and re-run"
+                fi
                 if [ "$FARM_NROWS0" -gt 0 ] || [ -n "$FARM_VERDICT0" ]; then
                     REC_ACTION=farm-unknown
                     publish_farm_rows "$FARM_OUT" "n=unparsed (NO GRADE — the checker exited 0 while reporting drift, so its exit status and its report contradict each other; this is its output verbatim, not a grade; farm_n=not-graded)"
@@ -1546,7 +1589,7 @@ if [ "$FARM_CHECK_ON" = "1" ]; then
                 # whole-line grep counts prose as file rows — 3 real rows measured as "7 row(s)"
                 # (#10114 review round 8). The predicate below is the ONLY row extraction — there is no
                 # second copy to keep in step.
-                FARM_ROWS="$(printf '%s\n' "$FARM_OUT" | awk -F'|' '$NF ~ /(^|[[:space:]])(STALE|UNSOURCED|NOT-EXECUTABLE|DECLARED-BUT-ABSENT)[[:space:]]*$/')"
+                FARM_ROWS="$(farm_drift_rows "$FARM_OUT")"
                 FARM_NROWS="$(printf '%s' "$FARM_ROWS" | grep -c .)"
                 # ⛔ THE REMEDY IS A BLOCK, NOT A LINE. Two of the instrument's three remedies are TWO
                 # lines and the CONTINUATION carries the actions ("…, delete it, or retire it in
@@ -1587,17 +1630,7 @@ if [ "$FARM_CHECK_ON" = "1" ]; then
                 FARM_OUT_NB="$(printf '%s\n' "$FARM_OUT" | grep -v '^[[:space:]]*$' || true)"
                 FARM_OUT_LINES=0
                 [ -n "$FARM_OUT_NB" ] && FARM_OUT_LINES="$(printf '%s\n' "$FARM_OUT_NB" | grep -c . || true)"
-                FARM_EXPECT=""
-                _fx="$(printf '%s\n' "$FARM_OUT" | grep -m1 'DRIFT' || true)"
-                if [ -n "$_fx" ]; then
-                    _fa="$(printf '%s' "$_fx" | sed -n 's/.*[^0-9]\([0-9][0-9]*\) stale.*/\1/p')"
-                    _fb="$(printf '%s' "$_fx" | sed -n 's/.*[^0-9]\([0-9][0-9]*\) declared-but-absent.*/\1/p')"
-                    _fc="$(printf '%s' "$_fx" | sed -n 's/.*[^0-9]\([0-9][0-9]*\) unsourced.*/\1/p')"
-                    if [ -n "$_fa" ] && [ -n "$_fb" ] && [ -n "$_fc" ]; then
-                        FARM_EXPECT=$(( _fa + _fb + _fc ))
-                    fi
-                fi
-                unset _fx _fa _fb _fc
+                FARM_EXPECT="$(farm_sum_count "$FARM_OUT")"
                 FARM_ROWS_RAW=0; PERSIST_BODY="$FARM_ROWS"; FARM_RAW_WHY=""
                 HDR_NOTE="n=$FARM_NROWS (the rows below are EXACTLY this run; farm_rows= in harness-apply.status is the currency indicator)"
                 if [ "$FARM_NROWS" -eq 0 ] && [ "$FARM_OUT_LINES" -eq 0 ]; then

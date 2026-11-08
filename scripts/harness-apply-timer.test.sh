@@ -2043,6 +2043,8 @@ OUT="$(HARNESS_APPLY_FARM_CHECKER="$T/t24ap/wrap-drifting.sh" run_pass "$T/t24ap
 assert_eq "$RC" "24" "T24 control: a wrapper that exits 0 over a DRIFTING farm is RED (24), never a green pass"
 assert_absent "$OUT" "farm: ok" "T24 control: and the pass does not print the matched-farm sentence over a report that names drift"
 assert_contains "$OUT" "exited 0 but its output reports drift" "T24 control: and it says WHY the exit status is not a grade"
+assert_contains "$OUT" "verdict: check-farm-drift: DRIFT — 1 stale" \
+    "T24 control: and the log quotes the verdict line, so the evidence behind the refusal is on the line"
 assert_absent "$(grep '^farm_n=' "$T/t24ap/state/harness-apply.status" 2>/dev/null || true)" "farm_n=0" \
     "T24 control: and farm_n= never says 0, which means the farm matched"
 assert_contains "$(grep '^farm_n=' "$T/t24ap/state/harness-apply.status" 2>/dev/null || true)" "farm_n=not-graded" \
@@ -2082,6 +2084,8 @@ chmod +x "$T/t24aq/wrap.sh" "$T/t24aq/inner/odd-vocab.sh"
 OUT="$(HARNESS_APPLY_FARM_CHECKER="$T/t24aq/wrap.sh" run_pass "$T/t24aq" 2>&1)"; RC=$?
 assert_eq "$RC" "24" "T24 control: rc=0 over a summary that reports DRIFT is RED — the SUMMARY half of the check, with no matched row to go on"
 assert_contains "$OUT" "exited 0 but its output reports drift" "T24 control: and it names the contradiction even though the extractor matched no row"
+assert_contains "$OUT" "verdict: check-farm-drift: DRIFT — 2 stale" \
+    "T24 control: and the log quotes the verdict line, so the evidence behind the refusal is on the line"
 assert_contains "$(cat "$T/t24aq/state/harness-apply-farm-rows.txt" 2>/dev/null || true)" "weird-a.py" \
     "T24 control: with the instrument's output published verbatim, so the odd vocabulary is still durable"
 assert_contains "$(grep '^farm_n=' "$T/t24aq/state/harness-apply.status" 2>/dev/null || true)" "farm_n=not-graded" \
@@ -2128,23 +2132,27 @@ assert_absent "$(grep '^detail=' "$T/t24at/state/harness-apply.status" 2>/dev/nu
 # `NF>=4 &&` from the extractor left the suite green, so the over-block this guard prevents was unpinned).
 # The class tokens are UPPERCASE (the regex is case-sensitive), so a lowercase `0 unsourced` tail proves
 # nothing — this fixture uses a genuine 3-FIELD line ending in an UPPERCASE class word, which is the
-# shape a farmed/hostile copy could print and which a row-count of `$NF` alone would read as drift.
-mk_origin t24ar; mk_clone t24ar
+# shape a farmed/hostile copy could print and which a row-count of `$NF` alone would read as drift.# ⛔ PROSE AND SUMMARY LINES MUST NOT BE READ AS ROWS (review round 24: the row predicate is now shared
+# with the drift arm, so the guard is "the class token must END the line, and be the UPPERCASE token the
+# instrument prints" rather than a field count). Mutants that red these rows: dropping the
+# `[[:space:]]*$` end anchor (a class word mid-line then matches), or matching case-insensitively (the
+# summary's lowercase `0 unsourced` tail then matches — round 22's fixture proved a lowercase tail proves
+# nothing, which is why this one uses the instrument's real shapes: an `ok` row, prose naming a class in
+# the middle, and a summary whose classes are all zero).mk_origin t24ar; mk_clone t24ar
 REPO_P="$CLONE"; MODE_P=sync
 mkdir -p "$T/t24ar/home/.pi/agent/scripts"
 cat >"$T/t24ar/prose-tail.sh" <<'FARM'
 #!/usr/bin/env bash
 printf '%-46s | %-12s | %-12s | %s\n' 'file' 'deployed' 'source' 'verdict' >&2
 printf '%-46s | %-12s | %-12s | %s\n' 'ok-1.py' aaaa11112222 aaaa11112222 ok >&2
-printf 'note | a | STALE\n' >&2
-printf 'summary-shape | n/a | UNSOURCED\n' >&2
-printf 'Anything left over is reported by class; today that is 0 unsourced\n' >&2
+printf 'A STALE file is a copy launchd will EXECUTE; a NOT-EXECUTABLE one it cannot run; 0 unsourced today\n' >&2
+printf 'class totals: 0 declared-but-absent, 0 unsourced\n' >&2
 printf 'check-farm-drift: ok — 0 stale (0 farm-declared; 0 outside the farm), 0 declared-but-absent, 0 unsourced, of 4 deployed file(s) (4 sourced, 2 matching) against origin/main (sync) in %s.\n' "$PWD/src"
 exit 0
 FARM
 chmod +x "$T/t24ar/prose-tail.sh"
 OUT="$(HARNESS_APPLY_FARM_CHECKER="$T/t24ar/prose-tail.sh" run_pass "$T/t24ar" 2>&1)"; RC=$?
-assert_eq "$RC" "0" "T24 control: a clean grade is NOT refused because a prose line ends in a class word (the 4-field row test)"
+assert_eq "$RC" "0" "T24 control: a clean grade is NOT refused because a prose line NAMES a class word — only a row whose LAST field is the class token counts"
 assert_contains "$OUT" "farm: ok" "T24 control: and it reports the match, rather than reading prose as drift"
 assert_contains "$(grep '^farm_n=' "$T/t24ar/state/harness-apply.status" 2>/dev/null || true)" "farm_n=0" \
     "T24 control: with farm_n=0, the matched-farm truth — no phantom row"
@@ -2168,10 +2176,53 @@ chmod +x "$T/t24as/wrap.sh" "$T/t24as/inner/unparsable-summary.sh"
 OUT="$(HARNESS_APPLY_FARM_CHECKER="$T/t24as/wrap.sh" run_pass "$T/t24as" 2>&1)"; RC=$?
 assert_eq "$RC" "24" "T24 control: rc=0 over a MATCHED ROW is RED even when the summary carries no parsable count — the ROW half of the check"
 assert_contains "$OUT" "exited 0 but its output reports drift" "T24 control: and it names the contradiction from the row alone"
+# ⛔ AND THE LOG QUOTES THE EVIDENCE IT REFUSED ON (review round 24: the clause named a variable a rename
+# had deleted, so EVERY contradiction said it had nothing — the same misinformation the round removed from
+# the summary reader, reintroduced in the operator log). This fixture's summary parses to no count at all,
+# so quoting the VERDICT line is the only honest answer, and this row is what pins it.
+assert_contains "$OUT" "verdict: check-farm-drift: DRIFT — some files are stale" \
+    "T24 control: and the log quotes the verdict line that produced the refusal, even when its counts do not parse"
 assert_contains "$(cat "$T/t24as/state/harness-apply-farm-rows.txt" 2>/dev/null || true)" "drift-a.py" \
     "T24 control: with the row durable in the published output"
 assert_contains "$(grep '^farm_n=' "$T/t24as/state/harness-apply.status" 2>/dev/null || true)" "farm_n=not-graded" \
     "T24 control: and no count claimed for a list the summary could not confirm"
+
+# ⛔ AND A SILENT rc=0 IS NOT A MATCH (review round 24). The instrument always prints a summary, so a
+# checker that exits 0 with NO output produced no evidence; `farm: ok` over it was the same false pass.
+mk_origin t24au; mk_clone t24au
+REPO_P="$CLONE"; MODE_P=sync
+mkdir -p "$T/t24au/home/.pi/agent/scripts"
+printf '#!/usr/bin/env bash\nexit 0\n' >"$T/t24au/mute-ok.sh"
+chmod +x "$T/t24au/mute-ok.sh"
+OUT="$(HARNESS_APPLY_FARM_CHECKER="$T/t24au/mute-ok.sh" run_pass "$T/t24au" 2>&1)"; RC=$?
+assert_eq "$RC" "24" "T24 control: a SILENT rc=0 checker is RED (24) — a silent exit is not a match"
+assert_contains "$OUT" "printed NOTHING" "T24 control: and the line says the checker printed no report"
+assert_absent "$OUT" "farm: ok" "T24 control: so the matched-farm sentence is never printed over no evidence"
+assert_contains "$(grep '^remedy=' "$T/t24au/state/harness-apply.status" 2>/dev/null || true)" "HARNESS_APPLY_FARM_CHECKER" \
+    "T24 control: and remedy= names the seam to fix"
+
+# ⛔ A PER-FILE ROW CONTAINING THE WORD DRIFT IS NOT THE SUMMARY (review round 24, measured:
+# `grep -m1 'DRIFT'` took `DRIFT-log.txt | a | b | STALE` as the summary line, so the real summary two
+# lines below was reported ABSENT — `farm_n=unparsed` and a false "no readable summary" reason, while
+# both names were still published verbatim).
+mk_origin t24av; mk_clone t24av
+REPO_P="$CLONE"; MODE_P=sync
+mkdir -p "$T/t24av/home/.pi/agent/scripts"
+cat >"$T/t24av/drift-named-row.sh" <<'FARM'
+#!/usr/bin/env bash
+printf '%-46s | %-12s | %-12s | %s\n' 'file' 'deployed' 'source' 'verdict' >&2
+printf '%-46s | %-12s | %-12s | %s\n' 'DRIFT-log.txt' aaaa11112222 bbbb33334444 STALE >&2
+printf '%-46s | %-12s | %-12s | %s\n' 'plain-a.py' aaaa11112222 bbbb33334444 STALE >&2
+printf 'check-farm-drift: DRIFT — 2 stale (2 farm-declared — a re-run must fix these; 0 outside the farm), 0 declared-but-absent, 0 unsourced, of 5 deployed file(s) (5 sourced, 2 matching) against origin/main (sync) in %s.\n' "$PWD/src"
+exit 1
+FARM
+chmod +x "$T/t24av/drift-named-row.sh"
+OUT="$(HARNESS_APPLY_FARM_CHECKER="$T/t24av/drift-named-row.sh" run_pass "$T/t24av" 2>&1)"; RC=$?
+assert_eq "$RC" "24" "T24 control: a row whose FILE NAME contains DRIFT still gets the summary read correctly (RED, 24)"
+assert_contains "$(grep '^farm_n=' "$T/t24av/state/harness-apply.status" 2>/dev/null || true)" "farm_n=2" \
+    "T24 control: and farm_n= is the real count, not unparsed — the summary WAS printed"
+assert_absent "$(head -1 "$T/t24av/state/harness-apply-farm-rows.txt" 2>/dev/null || true)" "no readable" \
+    "T24 control: and the header does not claim the summary was absent"
 
 # ⛔ A COMPLETE EXTRACTION OF MORE ROWS THAN THE EXCERPT CAN SHOW (review round 20). The excerpt/elision
 # pairing is where round 11's two-populations defect lived, and t24ab's 3 rows never reach the >12
