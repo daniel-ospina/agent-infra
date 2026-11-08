@@ -5970,16 +5970,20 @@ async function main() {
 
     // AC (b): exactly ONE durable root-mismatch record for this (root, siblings)
     // pair, however many git ops run. ONE read of the log — `audit` above is
-    // already the post-op snapshot (both ops ran inside the guarded block), so
-    // concatenating a second read would count every line twice.
+    // already the post-op snapshot (all FOUR ops ran inside the guarded block: three
+    // on B, one on C), so concatenating a second read would count every line twice.
     ok(block2 && block2.block === true, "1265a: the retry is still blocked (no verification happened)");
     const mismatch = audit.filter((l) => l.event === "gate_root_mismatch" && String(l.root ?? "") === realB);
     equal(mismatch.length, 1, "1265a: the mismatch must be recorded exactly ONCE per session per (root, siblings) — not once per git op, and not again after the root alternates away and back");
     equal(JSON.stringify(mismatch[0].verified_roots), JSON.stringify([realA]),
       "1265a: the record must name the sibling roots whose entries cannot be compared");
     ok(blockC && blockC.block === true, "1265a: C's commit is blocked too (its own registry is empty)");
+    // ⛔ SCOPED TO WHAT IT CHECKS. C is visited ONCE, so its count here is 1 under the
+    // single-slot mutant too (B→record, B→suppressed, C→record, B→record-again leaves
+    // C at 1) — the row below cannot discriminate that. The ALTERNATION claim belongs
+    // to the B row above, which is the only row that moves (B→2 under a single slot).
     equal(audit.filter((l) => l.event === "gate_root_mismatch" && String(l.root ?? "") === realC).length, 1,
-      "1265a: the OTHER root records its mismatch once too — the dedupe is per (root, siblings), not a single global slot that the alternation resets");
+      "1265a: C's own (root, siblings) pair records its mismatch exactly once too");
 
     // B's SECOND op adds its OWN private file, `src/b1265.ts`, which no tree has verified.
     // Blocked too, and the reason still names only files in B's own scope — A holds

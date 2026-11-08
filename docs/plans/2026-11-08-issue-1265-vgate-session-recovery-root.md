@@ -97,7 +97,7 @@ only root whose entries can cover this session's git ops, and the report must sa
 |---|---|---|
 | `session_start` handler | unit-of-behaviour | e2e scenario 1265a (real linked worktrees + real bridge) |
 | `diagnoseRootMismatch` → `tool_call` git-op path | unit-of-behaviour | e2e scenario 1265a (block + audit record + reworded remedy) |
-| `appendJsonl` / `GateEventName` union (`extensions/shared/audit-log.ts`) | type + contract | **documentation-only**: `appendJsonl` takes `Record<string, unknown>`, the repo has no `tsconfig.json`, and no roster pin exists — the union edit cannot be type-enforced (see step 3) |
+| `appendJsonl` / `GATE_EVENT_NAMES` vocabulary (`extensions/shared/audit-log.ts`) | type + contract | **documentation-only**: `appendJsonl` takes `Record<string, unknown>`, the repo has no `tsconfig.json`, and no test pins these four names — the edit cannot be enforced (see step 3) |
 | source pins ("#3255 policy" test in `index.test.ts`) | structural | five pins across this PR — own-root declaration, own-root COUNT, durable-record `root`, rendered-remedy absence, followable-remedy presence |
 | `recoverBridgeForRoot` perf fast-path (`lastRecoveryMtime`) | regression | existing e2e scenario 16 (mid-session bridge recovery — externally-written bridge unblocks the commit) |
 
@@ -119,7 +119,7 @@ roots and 20+ tortoise roots in the live bridge), so this is the narrow one-sibl
 | `diagnoseRootMismatch(root)` — 1 call site, the git-op path | narrates a root mismatch; gains the durable `gate_root_mismatch` record + dedupe. Block decision untouched. |
 | `bridgeRoots()` | reads the bridge's PASS roots; unchanged. |
 | `gitCommonDir(root)` | same-repo test (`--git-common-dir`); unchanged. |
-| `appendJsonl(entry, file?)` — `extensions/shared/audit-log.ts` | appends to `~/.pi/agent/audit/gate-events.jsonl`; **four** new event names added to `GateEventName` (`gate_recovery`, `gate_recovery_empty`, `gate_recovery_foreign_root`, `gate_root_mismatch`). `gate_recovery` carries the `root` it recovered for, so an inspection merge is **attributable** to the SIBLING root. It is not un-attributable by `session_cwd`: that field still names the inspecting session, so a session-keyed reader must select on `root`. |
+| `appendJsonl(entry, file?)` — `extensions/shared/audit-log.ts` | appends to `~/.pi/agent/audit/gate-events.jsonl`; **four** new event names added to the `GATE_EVENT_NAMES` array (`GateEventName` derives from it) (`gate_recovery`, `gate_recovery_empty`, `gate_recovery_foreign_root`, `gate_root_mismatch`). `gate_recovery` carries the `root` it recovered for, so an inspection merge is **attributable** to the SIBLING root. It is not un-attributable by `session_cwd`: that field still names the inspecting session, so a session-keyed reader must select on `root`. |
 | `gate-events.jsonl` consumers | **no production consumer PARSES it** — `gateEventsFile()` has one production caller (`appendJsonl`); `scripts/vgate.sh` `tail`s the log in `status()` (selects nothing); `registry-sync.sh` / `admin-merge.sh` mention it only in comments; readers are in-repo TEST helpers — `extensions/shared/audit-log.test.ts` (path + row schema, selects by NOTHING), `index.e2e.test.ts`'s `readAuditLines()`, `review-enforcer/index.test.ts`, `review-enforcer/index.spawn-evidence.test.ts`, `main-worktree-guard/test-module-load.mjs` (`event === "guard_degraded"` only, unaffected by the four new names — the last four select by `event`). The header's `event —` line is a stale closed enumeration (pre-existing) that names none of the four new events. |
 | `extensions/verification-gate/index.e2e.test.ts`, `index.test.ts` | run by `ci-main.yml` (`npx tsx …`) — no new file, so no CI-surface registration applies (this repo has no `config/ci-surfaces.yml`). |
 
@@ -142,18 +142,23 @@ roots and 20+ tortoise roots in the live bridge), so this is the narrow one-sibl
    ("re-dispatch verification for `<this root>`") and state that adopting another tree's entries is
    refused by design; append `gate_root_mismatch` once per `(root, siblings)` fingerprint, reset at
    `session_start`.
-   *Proves it:* e2e 1265a — two identical blocked ops produce exactly one record, **and the `Set` memo
+   *Proves it:* e2e 1265a — three blocked ops on the same root produce exactly one record, **and the `Set` memo
    is discriminated**: the scenario adds a third worktree C and alternates B → C → B inside one
    session, asserting B and C each land exactly ONE `gate_root_mismatch` (a single-slot memo
    re-records B on the return visit and reddens it). What is still NOT discriminated is the `.sort()`
    on the sibling list — each (root, siblings) pair here has one sibling, so it sorts a one-element
    list.
 3. **`extensions/shared/audit-log.ts`**: add `gate_recovery`, `gate_recovery_empty`,
-   `gate_recovery_foreign_root`, `gate_root_mismatch` to `GateEventName` (the first two were already
-   emitted untyped — a pre-existing gap closed while adjacent).
-   *Proves it:* **nothing type-enforces this** — `appendJsonl` takes `Record<string, unknown>`, the
-   repo has no `tsconfig.json`, and no roster pin exists (the union already carries names outside it,
-   recorded in the #634 plan). The edit is documentation: it **extends the union with four names**; the
+   `gate_recovery_foreign_root`, `gate_root_mismatch` to `GATE_EVENT_NAMES`, the runtime array that
+   `GateEventName` is derived from — `export type GateEventName = (typeof GATE_EVENT_NAMES)[number]`.
+   A name cannot be added to a derived TYPE; it is added to the ARRAY and the type follows. (The
+   first two were already emitted untyped — a pre-existing gap closed while adjacent.)
+   *Proves it:* **nothing type-enforces this** — `appendJsonl` takes `Record<string, unknown>` and the
+   repo has no `tsconfig.json`, so `tsx` runs without checking. The array IS runtime-assertable and
+   `audit-log.test.ts` asserts non-empty / no duplicates / snake_case plus two specific names
+   (`guard_degraded`, `gh_shim_degraded`) — none of our four, and no emit-site roster pin (a name
+   emitted outside the array cannot be caught; the vocabulary already carries such names, recorded in
+   the #634 plan). The edit is documentation: it **adds four array members**; the
    header's `event —` enumeration at the top of the file was already stale (it lists seven names and
    omits `reviewer_preflight`, `bridge_clear`, `review_spawn_no_verdict`, `gh_shim_degraded` too) and
    stays stale here. A roster pin (emit-site `event:` literals ⊆ `GateEventName`) is the check that
@@ -207,7 +212,8 @@ reader contract. Filing a roster pin (emit-site `event:` literals ⊆ `GateEvent
   common with A, **byte-identical**, so an adopted (re-keyed) A entry would MATCH and allow the op;
   `block1.block === true` therefore reddens under that mutant. Only B's own PASS may allow it.
 - **R2** The new durable record floods the shared log (one line per git op) → caught by e2e 1265a:
-  two identical blocked ops produce **exactly one** `gate_root_mismatch` line for that root.
+  three blocked ops on the same root produce **exactly one** `gate_root_mismatch` line for that root
+  (the third is the return visit AFTER alternating away to C, so a single-slot memo re-records it).
 - **R3** The reworded diagnosis stops naming the correct root, or reintroduces the un-followable
   remedy that the **first of the three children killed in that worktree** followed into a tree it did
   not own (the three deaths are attributed in #1265 to per-worktree determinism, not to three separate
