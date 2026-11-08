@@ -904,11 +904,15 @@ _rs_origin_slug() {
     # sibling is PRESENT and `_rs_py_resolve` is empty, so the very next whole-set WARN says `or no python3
     # resolves` while this line said it could not see. A residue is for what is genuinely unaccounted for,
     # not for the one remaining named cause.
+    # ⛔ AND THE RESIDUE MUST NOT CLAIM IT "COULD BE RUN" EITHER (round 45, P2 — measured): `python3` can
+    # RESOLVE and still fail to EXEC (a broken or blocked interpreter), and then the reader has verified
+    # nothing about whether the sibling could run. That shape reaches this line, so the sentence names no
+    # cause at all — `m47` pins it, and the named branch above is only for the case the reader can prove.
     if [ -z "$(_rs_py_resolve 2>/dev/null)" ]; then
       printf '\tno python3 resolves here, so pr-doctor.py could not be RUN at all'
       return 0
     fi
-    printf '\tpr-doctor.py produced no answer even though it could be run, and this reader cannot see why'
+    printf '\tpr-doctor.py produced no answer, and this reader cannot see why'
     return 0
   fi
   printf '%s' "$out"
