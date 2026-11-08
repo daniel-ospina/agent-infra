@@ -377,11 +377,13 @@ fi
 # evidence, after a pre-send baseline) and is recorded in `delivered=` beside every `NUDGE at=`. Leaving
 # the old sentence in place let the next editor of this tail cite the file's own doctrine to restore
 # `delivered=yes`-by-`$rc`, and made the new block below false about this file. On failure we log and
-# exit; the next pass retries, and the lock THIS FILE takes below (`$STATE/cadence-nudge.lock`) is what
-# prevents a pile-up. (It was previously attributed to `heartbeat-loop.sh`, which takes no such lock —
-# grep it: the only locks it mentions are its detached helpers'. Corrected while this paragraph was
-# already being rewritten, because a file arguing that a claim must name its evidence may not keep one
-# that names the wrong file.)
+# exit; the next pass retries, and the lock THIS FILE takes at its top (`$STATE/cadence-nudge.lock`, the
+# `mkdir` near the head of this file) is what prevents a pile-up. (It was previously attributed to
+# `heartbeat-loop.sh`, which takes no such lock — grep it: the only locks it mentions are its detached
+# helpers'. Corrected while this paragraph was already being rewritten, because a file arguing that a
+# claim must name its evidence may not keep one that names the wrong file. The first version of THIS
+# correction then said the lock is taken "below", which is the same error one direction over: the send
+# is at the bottom of the file and the lock at the top.)
 
 # ⛔ ONE MESSAGE, ONE LINE -- NO EMBEDDED NEWLINES (2026-10-05, owner report).
 # MEASURED DEFECT: the multi-line form of this message arrived as 5-6 SEPARATE turns in the pane.
