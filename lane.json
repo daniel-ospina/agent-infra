@@ -1,0 +1,38 @@
+{
+  "_ref": "refs/lanes/Daniels-MacBook-Air-new.klane-9-1794128011-p93759-c3f978eb",
+  "_sha": "3f9a3e85354d2e8324c47bd110e147cb48041adf",
+  "artifacts": [
+    {
+      "kind": "log",
+      "value": "/var/folders/lh/4zv9grjx0958bnrclvkt8dv40000gn/T/tmp.DYRNH7fD8u/O/logs/lane-9.log"
+    },
+    {
+      "kind": "sha",
+      "value": "bbbff6cfcd23adbe3663cb7ccfa446943d887957"
+    },
+    {
+      "kind": "worktree",
+      "value": "/var/folders/lh/4zv9grjx0958bnrclvkt8dv40000gn/T/tmp.DYRNH7fD8u/lbwt"
+    }
+  ],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 605,
+  "duration_s": 147,
+  "ended_at": 1794128158,
+  "exit_code": 0,
+  "heartbeat_at": 1794128158,
+  "host": "Daniels-MacBook-Air-new",
+  "issue": 9,
+  "kind": "lane",
+  "lane_id": "Daniels-MacBook-Air-new.klane-9-1794128011-p93759-c3f978eb",
+  "lease_until": 1794128763,
+  "pid": 93759,
+  "reason": null,
+  "repo": "daniel-ospina/agent-infra",
+  "schema": 1,
+  "started_at": 1794128011,
+  "state": "DONE",
+  "tag": "9",
+  "worktree": "/private/var/folders/lh/4zv9grjx0958bnrclvkt8dv40000gn/T/tmp.DYRNH7fD8u/lbwt"
+}
