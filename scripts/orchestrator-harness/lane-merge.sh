@@ -98,7 +98,11 @@ LANE_REPORT_GATE=""
 # `VERDICT=PASS` and launched the chain, while the deployed shape refused with `VERDICT=ABSENT`.
 # ⛔ WHY THIS IS NOT A P0: the MERGE is still refused, because the chain this script launches is always
 # `$O/merge-one.sh` (`chain-merge.sh`), which sources the gate from ITS OWN `$O` sibling and re-runs the
-# check. The loss is a false "verified" line plus a paid (~15-25 min) review on unverified evidence.
+# check. ⛔ THE COST IS NOT "A PAID REVIEW" — an earlier wording said that and it was measured false
+# (round-21 review, P2): merge-one.sh's gate block refuses with `exit 9` BEFORE `REV_STARTED=1`, so no
+# reviewer is bought and its own log line says so ("No review was bought and nothing was merged"). The
+# real chain-side cost is a FIX_REQUIRED verdict round. What this carrier loses is the false
+# "verified" line and whatever a lane does between seeing it and the chain's own refusal.
 # The class is the same one the gate's provenance comment names — the lane supplying the instrument —
 # tracked with its siblings in agent-infra#3789. `merge-one.sh` shares the lookup order.
 for _lrg in "$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)/lane-report-gate.sh" "${O:-$HOME/orchestrator}/lane-report-gate.sh"; do
@@ -734,7 +738,14 @@ post_handoff() { # post_handoff <verdict-token> <reason>
       printf -- '- Last failing check names observed: `%s`\n' "$(tr '\n' ',' < "$LAST_F" | sed 's/,$//')"
     fi
     _rs="$(round_of)"; [ "$_rs" -gt "$MAX_ROUNDS" ] && _rs="$MAX_ROUNDS"   # never render "4/3"
-    printf -- '- Rounds spent: %s/%s (the loop is capped by design — a lane in round 5 is a failure, not thoroughness).\n\n' "$_rs" "$MAX_ROUNDS"
+    # ⛔ THE BOX ARM MUST NOT RENDER A BUDGET IT DID NOT SPEND (round-21 review, P2). This line was
+    # unconditional, so a box-fault hand-off said `Rounds spent: 0/3` beside "the loop is capped by
+    # design" — implying this run spent the budget, which is exactly what the box arm exists to avoid.
+    if [ "${HANDOFF_NEXT:-}" = "box" ]; then
+      printf -- '- Rounds spent: %s/%s — this run spent NONE (a box/repo fault cannot be fixed by a push); rounds already spent by EARLIER runs: %s.\n\n' "$_rs" "$MAX_ROUNDS" "$_rs"
+    else
+      printf -- '- Rounds spent: %s/%s (the loop is capped by design — a lane in round 5 is a failure, not thoroughness).\n\n' "$_rs" "$MAX_ROUNDS"
+    fi
     # ⛔ THE BRANCH MUST BE RESOLVED, NOT A PLACEHOLDER (reviewer finding, P1, R11, measured): the brief's
     # own `--watch` call never passes `--branch`, so `${BR:-<branch>}` rendered the literal `<branch>` on
     # the documented supervision path — and merge-one feeds that argument into
@@ -776,8 +787,9 @@ post_handoff() { # post_handoff <verdict-token> <reason>
                    else merge_authority_unresolved_note; fi
                    [ "$_br" = "<branch>" ] && printf '(pass --branch: this checkout is not on a branch.)\n' ;;
           box)     printf 'Next: NOTHING you can push. The blocker is the BOX (or its lane-report state),\n'
-                   printf 'not this PR, and no fix round was spent — so re-run `%s/lane-merge.sh %s --repo %s`\n' "$O" "$PR" "$OR"
-                   printf 'once the box reason named above is repaired; it starts from round 0.\n' ;;
+                   printf 'not this PR, and THIS run spent no fix round — so re-run `%s/lane-merge.sh %s --repo %s`\n' "$O" "$PR" "$OR"
+                   printf 'once the box reason named above is repaired. Rounds already spent by earlier\n'
+                   printf 'runs are NOT refunded: the cap counts every round on this PR.\n' ;;
           # ⛔ NOT `--watch` (reviewer finding, P1, R11, measured: RC=13, same token, 0.455s, zero
           # supervision — the budget is what refused it, so chunk N+1 is charged before any work and
           # re-hands-off). A PLAIN run re-reads the PR and the checks, and its fix path re-arms the budget.
@@ -792,8 +804,15 @@ post_handoff() { # post_handoff <verdict-token> <reason>
     case "$tok" in
       BLOCKED_CLOSED)
         printf '\n_This PR is closed; re-running lane-merge.sh %s reports the same thing._\n' "$PR" ;;
+      # ⛔ THE BOX FOOTER CANNOT SAY "after a fix" (round-21 review, P2): it sat under the box arm and
+      # told the next holder to re-run "after a fix" on a fault whose whole point is that no fix exists,
+      # contradicting the arm's own "NOTHING you can push" two lines above.
       *)
-        printf '\n_Re-run with `%s/lane-merge.sh %s --repo %s` after a fix; a new head re-arms the PR._\n' "$O" "$PR" "$OR" ;;
+        if [ "${HANDOFF_NEXT:-}" = "box" ]; then
+          printf '\n_Re-run with `%s/lane-merge.sh %s --repo %s` once the BOX reason above is repaired — no push is involved._\n' "$O" "$PR" "$OR"
+        else
+          printf '\n_Re-run with `%s/lane-merge.sh %s --repo %s` after a fix; a new head re-arms the PR._\n' "$O" "$PR" "$OR"
+        fi ;;
     esac
   } > "$body"
   if gh api -X POST "repos/$OR/issues/$PR/comments" -F "body=@$body" >/dev/null 2>&1; then
@@ -1350,28 +1369,32 @@ if [ -n "${RESOLVED_BR// /}" ] && [ "$_lrg_skip" = 0 ]; then
   case "$_lrg_rc" in
     0)  log_line "lane-report: verified at head ${HEAD:0:12} — the report describes the tree being merged" ;;
     5|6) log_line "lane-report: NOT ENFORCED here (rc=$_lrg_rc) — an abstention, not a green: this box/repo cannot carry the check" ;;
-    # ⛔ 7 IS A BAG, NOT A FAULT CLASS (round-20 review, P1). The gate returns 7 for ~10 distinct
-    # reasons, and ONLY TWO of them are box faults: `no-interpreter-at-or-above-python-3.12` (and its
-    # attribution sibling `cannot-attribute-this-repos-lane-evidence-without-a-python-3-12-interpreter`)
-    # and `report-present-but-repo-ships-no-consumer`. The rest are LANE faults with a lane action —
-    # `writer-state-absent|corrupt`, `worktree-registered-but-unreadable`, the detached/moved-worktree
-    # arms, `evidence-present-on-this-box-but-no-worktree-is-registered-on-this-branch` — and the
-    # gate's own code-7 remedy names the action (re-run the suites through the tool, restore the
-    # branch in the worktree). Treating ALL of them as a box fault (round 19) handed the lane off with
-    # a message instructing a re-run the disposition had just made unavailable, and disagreed with the
-    # chain path, where `merge-one.sh` exits 9 and THIS script maps that to FIX_REQUIRED. So the split
-    # is by REASON: a box fault refuses WITHOUT spending a round (a push cannot change it, and burning
-    # the cap would leave the lane no round once the box was repaired), a lane fault spends the round
-    # it always did.
-    7)  case "$_lrg_out" in
-          *reason=no-interpreter-at-or-above-python-3.12*|*reason=cannot-attribute-this-repos-lane-evidence-without-a-python-3-12-interpreter*|*reason=report-present-but-repo-ships-no-consumer*)
-            log_line "⛔ lane-report: UNMEASURABLE (rc=7) — this BOX cannot verify the report. Not a PR fault: no fix round is spent, so a re-run after the box is repaired starts from round 0."
+    # ⛔ 7 IS A BAG, NOT A FAULT CLASS (round-20 review, P1), AND THE SPLIT IS BY REASON TOKEN, NOT BY
+    # SUBSTRING OF THE LINE (round-21 review, P1). The gate renders LANE-CHOSEN values before `reason=`
+    # (`branch=$branch worktree=$wt … reason=…`), and a lane creates its own branch, so
+    # `git check-ref-format --branch 'fix/2977-reason=no-interpreter-at-or-above-python-3.12'` is legal.
+    # Matching the raw line therefore let a lane whose fault was `writer-state-absent` (lane-fixable)
+    # select the BOX arm — no round spent, `BLOCKED_ATTEMPTS`, "nothing you can push" — and the 3-round
+    # cap never fired for a fault the lane owned. Measured: same reason, only the branch differs →
+    # RC=14/round-none vs RC=10/round-1. So the reason VALUE is extracted (last `reason=` on the verdict
+    # line, cut at whitespace) and compared EXACTLY.
+    # ⛔ THE LANE-CLEARABLE SET IS THE EXPLICIT LIST; every other 7 is the box/caller arm. That default
+    # is deliberate: a NEW reason that a lane could clear would at worst hand off with the token printed
+    # (recoverable, and the message says so), whereas defaulting the other way burns a lane's rounds on
+    # what no push can change — the round-19 defect. The evaluable set is `writer-state-*`,
+    # `worktree-registered-but-unreadable`, and the three report/worktree-placement arms, whose remedies
+    # are all one `git switch` or one `run` away (`lane_report_remedy 7`).
+    7)  _lrg_line="$(printf '%s' "$_lrg_out" | tail -1)"
+        _lrg_rsn="${_lrg_line##*reason=}"; _lrg_rsn="${_lrg_rsn%%[[:space:]]*}"
+        case "$_lrg_rsn" in
+          writer-state-*|worktree-registered-but-unreadable|evidence-present-on-this-box-but-no-worktree-is-registered-on-this-branch|worktree-at-this-head-is-not-registered-on-this-branch-and-holds-no-report|this-box-holds-the-report-for-this-branch-in-a-worktree-that-is-not-at-the-merging-head)
+            log_line "⛔ lane-report: UNMEASURABLE (rc=7, reason=$_lrg_rsn) — a LANE-fixable condition, so a fix round is spent."
             lane_report_remedy 7 2>/dev/null || true
-            HANDOFF_NEXT=box emit_blocked BLOCKED_ATTEMPTS "the lane report cannot be verified on this box (rc=7): $(printf '%s' "$_lrg_out" | tail -1)" ;;
+            emit_fix FIX_REQUIRED "the lane report could not be verified (rc=7, reason=$_lrg_rsn): $_lrg_line" ;;
           *)
-            log_line "⛔ lane-report: UNMEASURABLE (rc=7) — the report exists but its state/worktree cannot be read. That is a LANE-fixable condition, so a fix round is spent."
+            log_line "⛔ lane-report: UNMEASURABLE (rc=7, reason=$_lrg_rsn) — a BOX/REPO/CALLER fault. No fix round is spent: nothing a push does can clear it."
             lane_report_remedy 7 2>/dev/null || true
-            emit_fix FIX_REQUIRED "the lane report could not be verified (rc=7): $(printf '%s' "$_lrg_out" | tail -1)" ;;
+            HANDOFF_NEXT=box emit_blocked BLOCKED_ATTEMPTS "the lane report cannot be verified on this box (rc=7, reason=$_lrg_rsn): $_lrg_line" ;;
         esac ;;
     *)  log_line "⛔ lane-report: REFUSED (rc=$_lrg_rc) — the mandatory lane report does not support merging head ${HEAD:0:12}"
         lane_report_remedy "$_lrg_rc" 2>/dev/null || true
