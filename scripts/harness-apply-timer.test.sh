@@ -1706,7 +1706,9 @@ assert_contains "$(grep '^farm_n=' <<<"$REC24W")" "farm_n=unparsed" \
 # could never carry the `$FARM_DEST_REAL/` prefix — the containment test read a farm-local checker as
 # OUTSIDE the farm, executed it, and the farm GRADED ITSELF `farm: ok` at rc=0. That is the fail-open
 # shape this whole leg exists to remove, so it is pinned: relative checker + inherited CDPATH must still
-# be REFUSED. (The fix clears CDPATH on every captured `cd`, not just the rows-path absolutisation.)
+# be REFUSED. (The fix clears CDPATH on every captured `cd`, not just the rows-path absolutisation —
+# this case pins `$FARM_CHECKER_REAL`; `T24x2` below pins the SYMLINK HOP's `cd`, the site this one
+# cannot reach because its checker is a real file.)
 say_case "T24x an inherited CDPATH cannot smuggle a FARM-LOCAL checker past the containment refusal"
 mk_origin t24x; mk_clone t24x
 REPO_P="$CLONE"; MODE_P=sync

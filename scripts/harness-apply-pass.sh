@@ -168,7 +168,12 @@ set -uo pipefail
 # NOT begin with `.` — `cd` ignores CDPATH for a `.`-prefixed argument, so no `.pi/agent/scripts`-shaped
 # dirname can reach the hazard, which is why a farm-shaped fixture pins nothing. (`$FARM_DEST_REAL`/
 # `$HERE_REAL` carry the prefix too, but both `cd` targets are already absolute — `$FARM_DEST` is refused
-# when relative and `$HERE` comes from `pwd` — so those two are inert defence.)
+# when relative and `$HERE` comes from `pwd` — so those two are inert defence.) ⛔ THE SYMLINK HOP
+# (`*)` in the loop below) IS THE SIXTH SITE AND IT IS PINNED TOO — `T24x2`, one site over from `T24x`:
+# a RELATIVE LINK checker inside the farm, run from a cwd carrying a CDPATH that resolves its directory,
+# resolved to a TWO-LINE `$FARM_CHECKER_T`, was read as OUTSIDE the farm, and GRADED ITSELF `farm: ok` at
+# rc=0 (measured: dropping this `CDPATH=` reds T24x2's three rows and nothing else, while the same link
+# with no CDPATH stays refused — so those rows are about the prefix, not about the link's shape).
 HERE="$(CDPATH= cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)"
 
 log_line()  { printf '%s\n' "$*"; }
