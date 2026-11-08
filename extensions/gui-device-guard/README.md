@@ -108,6 +108,22 @@ fail-safe word scan covers a flag nobody has seen yet — restricted to a segmen
 that began with a prefix word or an *exec*-style runner, so `rg electron .` and
 `npm install electron` (an install, not a launch) stay clean.
 
+**A standalone shell operator is SEPARATION, not a command word.** `( electron .
+&)`, `{ electron . ; }` and `! electron .` are the spaced spellings of the shape
+`(npm exec electron . &)` reaches attached: the operator is its own token, it is
+dropped, and the launch at index 1 is classified normally. Before that, the token
+stripped to `""` and `""` was taken as the command word — **no finding and no
+ledger row**, i.e. both halves of #2249 skipped (`review cycle 4, F1`; the guard
+failed on the shape *next to* the one it pinned). `( )` and other operator-only
+segments hold no launch and are skipped.
+
+**`command -v` is a lookup, not a launch.** `command` is a prefix word, so the
+resolved "command word" was the *looked-up* name and `command -v electron` was
+refused — a false block on correct work, which is a defect in its own right
+(`review cycle 4, minor`). The query forms (`-v`, `-V`, `--help`, `--version`) do
+not execute, so they are not classified and not recorded; `command -p electron .`
+still runs and is classified as a launch.
+
 This was review cycle 1's **F2**: those shapes were measured as `[]` (no finding)
 while the header claimed completeness, and `bash -c` is a form `AGENTS.md` hands
 lanes routinely. Every one of them is now pinned in the suite (L13/L14) with an
@@ -148,7 +164,7 @@ This is a residual list, not a completeness claim:
 ## Tests
 
 ```bash
-node extensions/gui-device-guard/test.mjs                    # 115 assertions, threat table L1–L19 + handler H1–H12
+node extensions/gui-device-guard/test.mjs                    # 127 assertions, threat table L1–L20 + handler H1–H12
 node extensions/gui-device-guard/test.mjs --classify 'npm exec electron .'
 ```
 

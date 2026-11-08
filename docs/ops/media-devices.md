@@ -124,9 +124,21 @@ directory yields `UNVERIFIABLE(partial: N unreadable)` — and so does a process
 holding a camera-shaped character device that is **not** one of the globbed nodes
 (an alias, a bind mount, a second node with the same major/minor). Holder identity
 is compared as a **device**, not as a path string: the target and the globbed node
-are both resolved (`readlink -f`) before they are compared. The exit code is part of
-the answer: `2` means **cannot verify**, which is not the same as "nothing to
-report". Silence is not an acceptable answer to #2249; "I cannot tell you" is.
+are both resolved (`python3 -c 'os.path.realpath(…)'` — not `readlink -f`, which is
+a GNU extension the portability checker rejects and which the script therefore does
+not use) before they are compared. The exit code is part of the answer: `2` means
+**cannot verify**, which is not the same as "nothing to report". Silence is not an
+acceptable answer to #2249; "I cannot tell you" is.
+
+**Declared residual (review cycle 4, minor).** The census attributes a character
+device by `[ -c "$target" ]` from *the reader's* view, and an fd target that does
+not resolve there — a device bind-mounted into a container, existing only in the
+**holder's** mount namespace — is dropped from the census, so the answer can stay
+`FREE` over a holder. This is the same trade the script already makes explicitly
+elsewhere (abstaining on *every* unresolvable fd target would degrade on a deleted
+temp file, which is the common case), and it is recorded here rather than papered
+over: if you suspect a containerised holder, `--ancestry` and the holder's own
+namespace are the read, not this census.
 
 ## Runbook: the owner says the camera or mic is in use
 

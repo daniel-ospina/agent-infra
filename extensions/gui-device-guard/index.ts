@@ -230,7 +230,14 @@ const RUNNER_VALUE_FLAGS = [
 /** `timeout`'s own duration (`30`, `2.5s`, `1m`), or its `-s`\/`-k` value. */
 const TIMEOUT_DURATION = /^\d+(\.\d+)?[smhd]?$/;
 
-/** Shell grouping / control-flow words sit where a command word would. */
+/**
+ * Shell grouping / control-flow words sit where a command word would.
+ *
+ * `(`/`{` arrive as their OWN token only when the operator is SPACED; when it is
+ * attached (`(npm …`) `stripLeadingMetachars` normalises the token instead. Both
+ * spellings are now covered — the spaced one by `commandWordIndex`'s leading-token
+ * drop (review cycle 4, F1), which is why a bare `(`/`{` never reaches this set.
+ */
 const TRANSPARENT = new Set(["{", "}", "(", ")", "then", "do", "done", "fi", "else", "elif", "if", "while"]);
 
 /** Package-runners whose first PACKAGE argument is the thing being launched. */
@@ -448,6 +455,10 @@ export function tokenize(segment: string): string[] {
  * and left the declared `TRANSPARENT` entries for `(`/`{` unreachable (review
  * cycle 3, F1). Only the FIRST token is normalised: a `(` later in a segment is
  * part of an argument.
+ *
+ * ⛔ A token that is ONLY metacharacters strips to `""` — and `""` is not a
+ * command word, it is separation. `commandWordIndex` DROPS such a token instead
+ * of keeping it (review cycle 4, F1); see the note there.
  */
 function stripLeadingMetachars(tok: string): string {
   let i = 0;
@@ -471,9 +482,29 @@ function basename(p: string): string {
  * the segment holds no command word.
  */
 function commandWordIndex(toks: string[], out?: { prefixSeen?: boolean }): number {
+  // ⛔ AN OPERATOR TOKEN IS SEPARATION, NOT A COMMAND WORD (review cycle 4, F1).
+  // `stripLeadingMetachars` strips metacharacters from INSIDE a token, so a token
+  // that IS a metachar became `""` — and `""` was accepted as the command word.
+  // `classifySegment` then returned `null` for it, `prefixSeen` stayed false (the
+  // `PREFIXES` loop was never entered), and the hint at index 1 was never asked
+  // about: `( electron . &)`, `{ electron . ; }`, `! electron .` produced NO
+  // finding — which is not "allow", because the handler returns early on an empty
+  // list and R1 wrote no ledger row either. Both halves of #2249 skipped, on the
+  // SPACED spelling of the shape cycle 3 fixed only when attached (`(npm …`).
+  // Drop the token instead. Dropping is what makes the DECLARED entries
+  // reachable again: the token after a dropped `(` is `electron` (the case that
+  // was broken), and in a NESTED group (`( ( electron . &)`) it is `(` — which
+  // `TRANSPARENT` now actually sees, as its header has always claimed. The loop
+  // (rather than the single shift the review measured) is defence in depth for
+  // the metacharacters that are in NEITHER table (`$`), so a later edit to either
+  // table cannot re-open the hole; for `(`, `{` and `!` one shift is already
+  // sufficient, which is why L20e is green under both forms.
+  // An operator-only segment (`( )`) therefore returns -1.
+  while (toks.length > 0 && stripLeadingMetachars(toks[0]) === "") toks.shift();
+  if (toks.length === 0) return -1;
   let i = 0;
   let prefixSeen = false;
-  if (toks.length > 0) toks[0] = stripLeadingMetachars(toks[0]);
+  toks[0] = stripLeadingMetachars(toks[0]);
   while (i < toks.length) {
     const tok = toks[i];
     if (isAssignment(tok) || TRANSPARENT.has(tok)) {
@@ -481,6 +512,16 @@ function commandWordIndex(toks: string[], out?: { prefixSeen?: boolean }): numbe
       continue;
     }
     if (PREFIXES.has(tok)) {
+      // ⛔ `command -v` IS A LOOKUP, NOT A LAUNCH (review cycle 4, minor).
+      // `command` is a prefix word, so the resolved command word was the LOOKED-UP
+      // name and `command -v electron` was REFUSED — a false block on correct work,
+      // the direction README:114 calls a defect in its own right, and the one the
+      // comparable (Claude Code's bash permissions) explicitly exempts: "the query
+      // form `command -v` … looks up a command rather than running one". Nothing
+      // executes, so there is no launch to classify (and nothing to record).
+      if (tok === "command" && i + 1 < toks.length && /^(-v|-V|--help|--version)$/.test(toks[i + 1])) {
+        return -1;
+      }
       prefixSeen = true;
       const valueFlags = PREFIX_VALUE_FLAGS[tok] ?? [];
       i++;

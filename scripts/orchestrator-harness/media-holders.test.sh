@@ -158,8 +158,10 @@ check "F1d the microphone path survives a '|' in comm too" $? "$OUT"
 # script answered **FREE over a device a process provably held** — the fail-open
 # cycle-1 F1 fixed for `comm`, reached by a different route.
 # The fixture uses real character devices (/dev/zero as the "camera", /dev/null
-# as a DIFFERENT device) because `test -c` and `readlink -f` are the reads under
-# test: a regular file would make the row pass without exercising them.
+# as a DIFFERENT device) because `test -c` and the resolved-device comparison
+# (`resolve_path`, i.e. python3 `os.path.realpath` — NOT `readlink -f`, which the
+# portability checker rejects) are the reads under test: a regular file would make
+# the row pass without exercising them.
 CAM_ALIAS="$TMP/alias"
 mkdir -p "$CAM_ALIAS/dev/by-id" "$CAM_ALIAS/proc/100/fd" "$CAM_ALIAS/proc/200/fd" "$CAM_ALIAS/other"
 ln -s /dev/zero "$CAM_ALIAS/dev/video0"

@@ -21,7 +21,7 @@
 #
 # ── THE HONESTY CONTRACT ────────────────────────────────────────────────────
 # Silence is NOT an acceptable answer; "I cannot tell you" IS. So every device
-# answer is one of exactly five words, and the two that mean "unknown" say WHY:
+# answer is one of exactly four words, and the two that mean "unknown" say WHY:
 #
 #   HELD-BY(pid=<p> comm=<c> device=<d>)   a reader PROVED an open handle/claim
 #   FREE                                   a reader enumerated the whole holder

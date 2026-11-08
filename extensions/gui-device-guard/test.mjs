@@ -158,6 +158,23 @@ const ROWS = [
   // leave the suite green. Any future wrapper word behaves like these.
   ["L19h an UNLISTED wrapper word + runner (structural rule)", "eatmydata npm exec electron .", 1, "electron", true],
   ["L19i a SECOND unlisted wrapper word + runner", "proxychains4 npm exec electron .", 1, "electron", true],
+  // ── L20 (review cycle 4, F1) — a STANDALONE operator token is SEPARATION, not
+  //     a command word. `stripLeadingMetachars` only normalised a token's inside,
+  //     so a token that WAS `(`/`{`/`!` became "" and "" was taken as the command
+  //     word: no finding, and — because the handler returns early on an empty
+  //     list — no ledger row either. Every row here was `[]` before. L16g keeps
+  //     the ATTACHED spelling green; L20a is its spaced twin, so neither spelling
+  //     can regress alone.
+  ["L20a a SPACED bracketed backgrounded launch", "( electron . &)", 1, "electron", true],
+  ["L20b a spaced brace group", "{ electron . ; }", 1, "electron", true],
+  ["L20c a spaced bracketed playwright launch", "( playwright test --headed &)", 1, "playwright", true],
+  ["L20d a spaced `!` negation in front of the launch", "! electron .", 1, "electron", true],
+  // L20e is the NESTED spelling: once the outer operator is dropped, the inner
+  // `(` is token 0 and is skipped by `TRANSPARENT` — the entry the header has
+  // always declared and which cycle 3 measured as unreachable. It names a BARE
+  // launch word on purpose: with a package-runner inside, the structural rule
+  // rescues the segment and nesting would stay invisible either way.
+  ["L20e NESTED spaced brackets around a bare launch word", "( ( electron . &) &)", 1, "electron", true],
   // ── ALLOW rows: none of these may be refused ──────────────────────────────
   ["A1 plain grep", "grep -rn TODO src/", 0, null, false],
   ["A2 an ELECTRON MENTION inside quotes is not a launch", 'echo "npm exec electron ."', 0, null, false],
@@ -184,6 +201,16 @@ const ROWS = [
   ["A18 setsid wrapping true", "setsid true", 0, null, false],
   ["A19 a bracketed backgrounded ls", "(ls &)", 0, null, false],
   ["A20 a quoted ')' in a benign substitution", 'echo "$(ls ")")"', 0, null, false],
+  // A26–A27 are the ALLOW twins of L20: dropping a standalone operator token must
+  // not turn a benign group or a shell negation of a benign command into a
+  // refusal (the false-BLOCK direction is a defect in its own right).
+  ["A26 a spaced brace group around ls", "{ ls -la ; }", 0, null, false],
+  ["A27 a `!` negation of a benign command", "! ls -la", 0, null, false],
+  // A28/A29 are review cycle 4's minor: `command -v`/`-V` LOOKS UP a name, it does
+  // not run it — the comparable (Claude Code's bash permissions) exempts the query
+  // form explicitly, and refusing `command -v electron` was a false block.
+  ["A28 `command -v` is a lookup, not a launch", "command -v electron", 0, null, false],
+  ["A29 `command -V` is a lookup, not a launch", "command -V npm exec electron .", 0, null, false],
   // A21–A23 are the twins of L19: the runner-wide scan must not turn a plain
   // search, a benign wrapper, or a benign `-c` body into a refusal.
   ["A21 a search whose pattern NAMES the launch stays clean", "rg -n electron src/", 0, null, false],
@@ -425,6 +452,23 @@ if (handler) {
   check("H11 a failed ledger write returns false and WARNS (never silent)",
     wrote2 === false && warned2.length === 1 && /NOT recorded/.test(warned2[0]),
     `wrote2=${wrote2} warn=${JSON.stringify(warned2).slice(0, 200)} (first probe wrote=${wrote})`);
+
+  // ── H12 — review cycle 4, F1 measured through the REAL handler: a standalone
+  //         operator token produced no block AND no ledger row, so BOTH halves of
+  //         #2249 (the refusal and the diagnosis) were skipped together. Driven
+  //         through the handler on purpose — the classify table alone cannot see
+  //         the early-return path that lost the ledger row.
+  resetLedger();
+  const spaced = await drive("( electron . &)");
+  check("H12 handler: BLOCKS a standalone-`(` bracketed launch", Boolean(spaced?.block),
+    `block=${Boolean(spaced?.block)}`);
+  check("H12a …and WROTE its ledger row (the diagnosis half)", ledgerRows().length === 1,
+    `rows=${ledgerRows().length}`);
+  resetLedger();
+  const lookup = await drive("command -v electron");
+  check("H12b handler: `command -v electron` is ALLOWED and not recorded",
+    lookup === undefined && ledgerRows().length === 0,
+    `allowed=${lookup === undefined} rows=${ledgerRows().length}`);
 }
 
 // ── drift pins ─────────────────────────────────────────────────────────────
