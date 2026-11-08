@@ -5520,11 +5520,11 @@ assert_contains "$RECORD_ERR" "could NOT persist the pending marker" \
     "14.1d(i) …the failed persist is reported (positive-first: the capture is live)"
 assert_not_contains "$RECORD_ERR" "The marker is also kept in" \
     "14.1d(i) …and the exit-0 message does NOT claim the marker is on disk — the 'NOT ON DISK' branch fires instead"
-assert_contains "$RECORD_ERR" "THIS RUN'S BODY COPY WENT TO NEITHER THE BODY NOR THE PENDING FILE" \
-    "14.1d(i) …naming the real state — the two places THIS run owed a copy and delivered neither"
+assert_contains "$RECORD_ERR" "THIS RUN'S WRITE DID NOT LAND AND THIS RUN'S BODY COPY IS ON NO CHANNEL" \
+    "14.1d(i) …naming the real, ATTEMPT-scoped state (this run's write did not land) instead of claiming the file is empty or that a flush would find nothing — both of which the deterministic marker falsifies"
 # ⛔ THE ROUND-9 INVARIANT ON THE EXIT-0 CAPTURE TOO (#3712 review round 10, P2).
 # The two negatives below already existed, but both read the rc-5 capture ($PERSIST_PR2);
-# the rc-0 arm's own line kept round 3's falsified denial ("would find NOTHING for the
+# the rc-0 arm's own line carried round 3's falsified denial until round 10 ("would find NOTHING for the
 # marker this run owed … neither delivers these bytes") and stayed GREEN under a live
 # instance of the forbidden literal — the guard was never pointed at this stream. The
 # capture is the same one proved live by the two `assert_contains` above, so these cost
