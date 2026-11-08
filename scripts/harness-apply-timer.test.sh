@@ -2350,6 +2350,55 @@ assert_eq "$RC" "0" "T24 control: a real OK verdict plus prose that MENTIONS the
 assert_contains "$(grep '^farm_rows=' "$T/t24ay/state/harness-apply.status" 2>/dev/null || true)" "farm_rows=none" \
     "T24 control: and the record says the farm matched"
 
+# ⛔ THE SUMMARY IS THE THIRD HALF OF THE rc=0 CONTRADICTION CHECK (review round 29, measured: the arm
+# read the row predicate and the verdict line but NEVER the three-label summary — `farm_sum_count` was
+# called only inside the `1|3` arm — so the same bytes recorded `farm: ok` at rc=0 and RED at rc=1). The
+# rows here use a vocabulary this pass does not know (`drift`, `missing`), which is exactly why the row
+# half is blind and why the summary has to speak. Mutant that reds these rows: drop
+# `|| { [ -n "$FARM_EXPECT0" ] && [ "$FARM_EXPECT0" -gt 0 ]; }`.
+mk_origin t24bd; mk_clone t24bd
+REPO_P="$CLONE"; MODE_P=sync
+mkdir -p "$T/t24bd/home/.pi/agent/scripts"
+cat >"$T/t24bd/ok-line-over-drift.sh" <<'FARM'
+#!/usr/bin/env bash
+printf 'check-farm-drift: OK — 5/5 sourced file(s) match the source at origin/main (sync).\n' >&2
+printf '%-46s | %-12s | %-12s | %s\n' 'handmade.py' aaaa11112222 bbbb33334444 drift >&2
+printf '%-46s | %-12s | %-12s | %s\n' 'gone.py' aaaa11112222 - missing >&2
+printf 'check-farm-drift: summary — 2 stale, 0 declared-but-absent, 0 unsourced, of 5 deployed file(s).\n' >&2
+exit 0
+FARM
+chmod +x "$T/t24bd/ok-line-over-drift.sh"
+OUT="$(HARNESS_APPLY_FARM_CHECKER="$T/t24bd/ok-line-over-drift.sh" run_pass "$T/t24bd" 2>&1)"; RC=$?
+assert_eq "$RC" "24" "T24 control: an OK line over a summary that reports 2 stale rows is a CONTRADICTION (RED, 24)"
+assert_contains "$OUT" "summary reports 2 row(s)" \
+    "T24 control: and the journal quotes the summary, which is the half that fired"
+assert_contains "$(cat "$T/t24bd/state/harness-apply-farm-rows.txt" 2>/dev/null || true)" "handmade.py" \
+    "T24 control: with the first name the row vocabulary could not classify published durably"
+assert_contains "$(cat "$T/t24bd/state/harness-apply-farm-rows.txt" 2>/dev/null || true)" "gone.py" \
+    "T24 control: and the second, so a refusal still costs no name"
+assert_contains "$(grep '^farm_n=' "$T/t24bd/state/harness-apply.status" 2>/dev/null || true)" "farm_n=not-graded" \
+    "T24 control: while farm_n= says no grade was produced — the counts were never PROVEN against an extraction"
+
+# ⛔ AND THE MIRROR: A SUMMARY THAT REPORTS ZERO ROWS IS STILL A MATCH (review round 29). A copy that
+# prints both verdict forms must not be refused for saying 0 — the contradiction is a NON-ZERO total.
+# Mutant that reds this row: `-gt 0` → `-ge 0` (which refuses every healthy farm-shaped copy).
+mk_origin t24be; mk_clone t24be
+REPO_P="$CLONE"; MODE_P=sync
+mkdir -p "$T/t24be/home/.pi/agent/scripts"
+cat >"$T/t24be/ok-and-zero-summary.sh" <<'FARM'
+#!/usr/bin/env bash
+printf 'check-farm-drift: OK — 5/5 sourced file(s) match the source at origin/main (sync).\n' >&2
+printf 'check-farm-drift: summary — 0 stale, 0 declared-but-absent, 0 unsourced, of 5 deployed file(s).\n' >&2
+exit 0
+FARM
+chmod +x "$T/t24be/ok-and-zero-summary.sh"
+OUT="$(HARNESS_APPLY_FARM_CHECKER="$T/t24be/ok-and-zero-summary.sh" run_pass "$T/t24be" 2>&1)"; RC=$?
+assert_eq "$RC" "0" "T24 control: an OK line beside a ZERO-row summary is a MATCH — a zero total is not a contradiction"
+assert_contains "$(grep '^farm_n=' "$T/t24be/state/harness-apply.status" 2>/dev/null || true)" "farm_n=0" \
+    "T24 control: and the record says the farm matched, with no artifact owed"
+assert_contains "$(grep '^farm_rows=' "$T/t24be/state/harness-apply.status" 2>/dev/null || true)" "farm_rows=none" \
+    "T24 control: and farm_rows= names no artifact, because there was no row to name"
+
 # ⛔ A PER-FILE ROW CONTAINING THE WORD DRIFT IS NOT THE SUMMARY (review round 24, measured:
 # `grep -m1 'DRIFT'` took `DRIFT-log.txt | a | b | STALE` as the summary line, so the real summary two
 # lines below was reported ABSENT — `farm_n=unparsed` and a false "no readable summary" reason, while

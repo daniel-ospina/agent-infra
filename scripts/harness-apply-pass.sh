@@ -1559,6 +1559,16 @@ if [ "$FARM_CHECK_ON" = "1" ]; then
         # field is its PATH, so `weird: OK — x.py | … | DRIFTED` matched a prefix-only anchor and certified
         # a match with the drifting name durable nowhere (measured, review round 27).
         FARM_VERDICT0="$(printf '%s\n' "$FARM_OUT" | sed -n '/^[^|]*: DRIFT — [^|]*$/{p;q;}')"
+        # ⛔ AND THE SUMMARY IS THE THIRD HALF — THE ROW PREDICATE ALONE IS BLIND TO IT (review round 29,
+        # measured). The row half matches only this pass's own class TOKENS, so a report whose rows use a
+        # word it does not know (`… | drift`, `… | missing`) is invisible there, and the three-label
+        # summary was never read on this arm at all — `farm_sum_count` was called ONCE, inside the `1|3`
+        # arm. Measured: the same bytes — an `OK — 5/5 …` line, two such rows, and
+        # `… — 2 stale, 0 declared-but-absent, 0 unsourced` — recorded `farm: ok` / `farm_rows=none` /
+        # `farm_n=0` at rc=0 and `rc=24` with both names published at rc=1. The doc claims this arm uses
+        # "the SAME three-label summary proof as the drift arm"; it did not. It does now: a summary whose
+        # own total is non-zero says rows exist, and a status of 0 beside it is a contradiction.
+        FARM_EXPECT0="$(farm_sum_count "$FARM_OUT" || true)"
 
         # ⛔ AND A SILENT rc=0 IS NOT A MATCH (review round 24). The instrument always prints a summary,
         # so a checker that exits 0 with NO output produced no evidence at all. ⛔ AND NEITHER IS AN rc=0
@@ -1599,12 +1609,19 @@ if [ "$FARM_CHECK_ON" = "1" ]; then
                     log_line "farm: UNKNOWN — the checker exited 0 but printed NO verdict line (neither 'OK —' nor 'DRIFT —'), so nothing it printed can certify a match"
                     finish 0 24 "farm: UNKNOWN (check-farm-drift rc=0) — no readable grade (see farm_rows=), so a status of 0 is not a match for $FARM_DEST against $REF: the checker printed no verdict line at all"
                 fi
-                if [ "$FARM_NROWS0" -gt 0 ] || [ -n "$FARM_VERDICT0" ]; then
+                if [ "$FARM_NROWS0" -gt 0 ] || [ -n "$FARM_VERDICT0" ] || { [ -n "$FARM_EXPECT0" ] && [ "$FARM_EXPECT0" -gt 0 ]; }; then
                     REC_ACTION=farm-unknown
                     publish_farm_rows "$FARM_OUT" "n=unparsed (NO GRADE — the checker exited 0 while reporting drift, so its exit status and its report contradict each other; this is its output verbatim, not a grade; farm_n=not-graded)"
                     REC_FARM_NROWS=not-graded
                     REC_REMEDY="the checker exited 0 while reporting drift — point HARNESS_APPLY_FARM_CHECKER at check-farm-drift.sh itself (a wrapper that reports the pipeline's status hides the instrument's), then re-run"
-                    log_line "farm: UNKNOWN — the checker exited 0 but its output reports drift ($FARM_NROWS0 row(s) matched; verdict: ${FARM_VERDICT0:-no DRIFT line, rows only}); an exit status that contradicts its own report is not a grade"
+                    # ⛔ AND IT QUOTES THE EVIDENCE IT REFUSED ON (review round 29): with the summary
+                    # half added, naming only "rows" would send the reader looking for rows the
+                    # extractor never matched — the class whose vocabulary this pass does not know.
+                    _v0="verdict: ${FARM_VERDICT0:-no DRIFT line}"
+                    [ -n "$FARM_VERDICT0" ] || _v0="$_v0, rows only"
+                    [ -n "$FARM_EXPECT0" ] && _v0="$_v0; summary reports $FARM_EXPECT0 row(s)"
+                    log_line "farm: UNKNOWN — the checker exited 0 but its output reports drift ($FARM_NROWS0 row(s) matched; $_v0); an exit status that contradicts its own report is not a grade"
+                    unset _v0
                     # ⛔ NO `detail=` SENTENCE INLINES THE ARTIFACT PATH, AND THE POINTER MUST SURVIVE THE
                     # 240-BYTE BOUND (review round 23, measured twice): the sentence used to END in "published
                     # in $REC_FARM_ROWS", which both inlined the path the doc forbids (and would have read

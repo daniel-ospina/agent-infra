@@ -250,8 +250,12 @@ whose row vocabulary this pass does not match leaves the row half blind too, so 
 would record `farm: ok` / `farm_rows=none` over two files the farm owes. The instrument prints `OK —` on a
 match, so the verdict line by itself is the contradiction. The row half uses the SAME predicate and the
 SAME three-label summary proof as the drift arm (one vocabulary, so the guard can never be weaker than
-the branch it guards), and a checker that exits 0 printing **nothing** is refused too — the instrument
-always prints a summary, so a silent exit produced no evidence and is not a match. ⛔ **And output being
+the branch it guards) — the summary half is what catches the class the row predicate does not know: a
+report whose rows read `drift`/`missing` is invisible to the extractor, so a `DRIFT — 2 stale, …` total
+beside an `rc=0` is the contradiction. A ZERO total is not one: a copy printing both verdict forms over a
+matching farm says `0 stale, 0 declared-but-absent, 0 unsourced`, and that stays a match. A checker
+that exits 0 printing **nothing** is refused too — the instrument always prints a summary, so a silent
+exit produced no evidence and is not a match. ⛔ **And output being
 non-empty is not a report either:** a match is PROVEN by the instrument's own `OK —` line, so an `rc=0`
 whose output carries **no verdict** — the `bash inner "$@" 2>&1 | tee -a log` wrapper whose `inner` is
 missing, where `tee` supplies the 0 and the only output is bash's error line — is `farm-unknown`, never
@@ -487,7 +491,7 @@ checkout can use the documented hatch. The same interaction is recorded for
 
 ## Tests
 
-`scripts/harness-apply-timer.test.sh` — 532 assertions, run by the
+`scripts/harness-apply-timer.test.sh` — 540 assertions, run by the
 `harness-apply-timer` shard of `run-bash-shards.sh`:
 
 | | |
