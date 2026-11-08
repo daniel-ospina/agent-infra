@@ -5900,8 +5900,8 @@ async function main() {
       `1265a: the #264 P2 zero-entry warning must be reachable when THIS worktree has none (pre-fix it was suppressed), got: ${captured.join(" | ")}`);
     ok(captured.some((l) => l.includes("INSPECTION ONLY") && l.includes(realA) && l.includes(realB)),
       `1265a: the inspection merge must be announced as INSPECTION ONLY and name both roots, got: ${captured.join(" | ")}`);
-    // R3: the REWORDED remedy is the change (#1265 measured three children that
-    // followed "cd into it" into a tree they did not own). Pin it — the block
+    // R3: the REWORDED remedy is the change — #1265's one worktree killed three consecutive
+    // children, and the FIRST followed "cd into it" into a tree it did not own. Pin it — the block
     // reason cannot carry it here, because the sibling holds a DIFFERENT path.
     ok(captured.some((l) => l.includes("re-dispatch verification for THIS root") && l.includes(realB)),
       `1265a: the mismatch remedy must be the followable one and name THIS root, got: ${captured.join(" | ")}`);
