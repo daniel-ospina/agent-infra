@@ -170,8 +170,9 @@ EOF
 #           snapshot, so it is never in the set and still holds the pipe — the substitution blocks for the
 #           grandchild's lifetime (measured: 60 s against a 2 s bound). No arm's reader forks a detached
 #           child, so that is a residual of the technique, not of this suite.
-#       (b) With `ps` unavailable the descendant list is empty and only the parent is killed, which is the
-#           original inertness (measured: a 2 s bound returned after 20 s).
+#       (b) With `ps` OR `awk` unavailable the descendant list is empty (the collector is `ps -A -o
+#           pid=,ppid= | awk …`, so either one missing yields no rows) and only the parent is killed, which
+#           is the original inertness (measured: a 2 s bound returned after 20 s).
 #     Neither is observable from inside the suite, and NOTHING REDS if the tree kill is removed (measured:
 #     the mutant then blocked past 600 s) — the tree-kill is load-bearing with no sensor of its own.
 #     And a pid is TERM'd, waited on for 0.2 s, then KILL'd unconditionally: across that window a recycled

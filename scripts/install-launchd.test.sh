@@ -608,7 +608,7 @@ assert_contains "$_PRD_TPL" "two things that WRITE it are" "pr-doctor template: 
 _rd_missing=""
 grep -q '^_fleet_pr_doctor_bound()' "$SCRIPT_DIR/../scripts/lib/fleet-inventory.sh" || _rd_missing="$_rd_missing fleet-inventory.sh:_fleet_pr_doctor_bound"
 grep -q '^def pr_doctor_last_run(' "$SCRIPT_DIR/../scripts/objective.py" || _rd_missing="$_rd_missing objective.py:pr_doctor_last_run"
-grep -q 'pr-doctor\.status\.json' "$SCRIPT_DIR/../scripts/heartbeat-loop.sh" || _rd_missing="$_rd_missing heartbeat-loop.sh:pr-doctor.status.json"
+awk '!/^[[:space:]]*#/ && /pr-doctor\.status\.json/ { f=1 } END { exit !f }' "$SCRIPT_DIR/../scripts/heartbeat-loop.sh" || _rd_missing="$_rd_missing heartbeat-loop.sh:pr-doctor.status.json"
 if [ -z "$_rd_missing" ]; then
     ok "pr-doctor template: all three readers it names EXIST (status file, beat, inventory)"
 else
