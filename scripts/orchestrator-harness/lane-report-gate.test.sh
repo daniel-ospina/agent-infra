@@ -272,9 +272,28 @@ case "$LAST_OUT" in *reason=writer-state-missing-witness*) ok "…named missing-
 _restore_state
 drive 0 "CONTROL: a state carrying both witnesses still PASSES (the missing-witness rows are not a blanket refusal)" STUB_OK=1 STUB_RC=0 STUB_STALE=0
 
+# ── 1d. THE SUITES WITNESS CANNOT BE DELETED EITHER (round-27 review, P1) ─────────────────────────
+# Emptying the list is CHEAPER than deleting every `finished_at`, and it used to reach PASS(0): measured
+# on this fixture (merging head bound, conforming consumer), `suites=[{finished_at:2020}]` -> `STALE
+# rc=4` while the SAME state with `[]` -> `PASS rc=0`. `_have_suites` ("is a non-empty list") gated the
+# laundered-timestamp arm, the `predates` computation AND the no-output arm, so one edit turned off three
+# witnesses at once; `{}`, `null`, `0`, `"x"` and a MISSING key did the same. The writer records one
+# entry per `run`, so every one of those is a deleted witness rather than "no suites recorded".
+for _shape in '[]' '{}' 'null' '0' '"x"'; do
+  printf '{"version":1,"head_at_write":"%s","branch":"feat/2977-tm","worktree":"%s","suites":%s}\n' \
+    "$WT_HEAD" "$WT" "$_shape" > "$WT/.worktree-report/state.json"
+  drive 7 "UNMEASURABLE: suites=$_shape is a deleted witness, not 'no suites recorded'" STUB_OK=1 STUB_RC=0 STUB_STALE=0
+  case "$LAST_OUT" in *VERDICT=PASS*) bad "suites=$_shape reached PASS — clearing the list is the cheapest laundering edit" ;; *) ok "…and suites=$_shape is not reported as PASS" ;; esac
+done
+printf '{"version":1,"head_at_write":"%s","branch":"feat/2977-tm","worktree":"%s"}\n' \
+  "$WT_HEAD" "$WT" > "$WT/.worktree-report/state.json"
+drive 7 "UNMEASURABLE: no suites KEY at all is the same deleted witness" STUB_OK=1 STUB_RC=0 STUB_STALE=0
+_restore_state
+drive 0 "CONTROL: the honest one-suite state still PASSES, so 1d is not a blanket refusal" STUB_OK=1 STUB_RC=0 STUB_STALE=0
+
 # ── 2. THE MEASURED DEFECT: rc 0 + a moved head is NOT a pass ────────────────────────────────────
 mkdir -p "$WT/.worktree-report"
-printf '{"version":1,"head_at_write":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","branch":"feat/2977-tm","suites":[]}\n' \
+printf '{"version":1,"head_at_write":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","branch":"feat/2977-tm","suites":[{"n":1,"command":"x","exit":0,"finished_at":"2099-01-01T00:00:00Z"}]}\n' \
   > "$WT/.worktree-report/state.json"
 drive 4 "STALE: the consumer exits 0 but the report was written at another head" STUB_OK=1 STUB_RC=0 STUB_STALE=1
 # §7: both shas are named, and they DIFFER.

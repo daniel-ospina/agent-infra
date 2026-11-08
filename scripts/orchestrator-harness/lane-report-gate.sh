@@ -627,7 +627,22 @@ try:
             # value is not merely unsafe, it is unusable, so this is not a loosened check.
             state_ok = "missing-witness"
             rec = ""
-        elif _have_suites and newest is None:
+        elif not _have_suites:
+            # ⛔ DELETING EVERY SUITE IS THE SAME TAMPERING AS DELETING EVERY TIMESTAMP (round-27
+            # review, P1 — measured). `_have_suites` means "is a non-empty list", so a `suites` value of
+            # `[]`, `{}`, `null`, `0` or `"x"` — or no `suites` key at all — made all THREE downstream
+            # arms go dark at once: `state_ok` stayed "ok", `newest` stayed None so `predates` was never
+            # computed (the laundering arm at `newest is not None`), and the no-output arm skipped out at
+            # its own `isinstance(_recs, list) and _recs` guard. Measured against the suite fixture,
+            # merging head bound, conforming consumer: one suite with `finished_at=2020` gives STALE
+            # rc=4, and the SAME state with the list emptied gives PASS rc=0 (`{}` and `null` likewise).
+            # Emptying the list is the CHEAPER edit of the two, so the tampering round 7 closed was
+            # refused when spelled "delete every timestamp" and ACCEPTED when spelled "clear the list".
+            # The writer records this key with one entry per `run`, so its absence (or an empty or
+            # non-list value) is a witness that was DELETED, never one legitimately omitted — and a lane
+            # that ran no suite has no evidence to merge on, which is the whole subject of this gate.
+            state_ok = "missing-witness"
+        elif newest is None:
             state_ok = "missing-witness"
     else:
         state_ok = "corrupt"
