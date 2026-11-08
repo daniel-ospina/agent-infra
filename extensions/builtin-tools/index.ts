@@ -2228,15 +2228,31 @@ export function childLivenessFor(i: {
   // `childMessagesSent: 0`, and a consumer applying this PR's own rule ("0 messages is never a valid
   // empty answer") would have had to choose which field to disbelieve.
   const messagesSent = hasStdout ? Math.max(measured ?? 0, 1) : measured;
+  const classified = spawnError
+    ? "never-started"
+    : classifyChildLiveness({
+        killed: i.details.killed === true || i.killedByReason === true,
+        hasStdout,
+        messagesSent,
+      });
+  // ⛔ A DEATH CLAIM REQUIRES A CONFIRMED PROCESS END (review round 8, P3). `died-before-first-message`
+  // means "it died during startup", and every OTHER route to it settles through `exit`/`close`, where
+  // `proc.exitCode`/`signalCode` is set. The `onAbort`-after-`session_end` arm (index.ts:5025-5043)
+  // resolves a payload while the child is STILL ALIVE — it exists so the lingering child is reaped by
+  // the completion watchdog, and it passes no `reason`, so no kill clause fires. For an E-shape child
+  // (zero content-bearing turns, empty stdout) that arm produced
+  // `{childState: "died-before-first-message", childExited: false}`: `childState` asserting a death the
+  // same payload's `childExited` denies, and a parent told "it died during startup" about a child that
+  // had just emitted `session_end` and was running. Constraint 6 forbids exactly that pairing.
+  //
+  // The `killed` state is deliberately NOT gated: a kill signal is sent BEFORE the OS reports the exit,
+  // so `childExited: false` is the CORRECT and documented reading there (see the round-2 kill test).
+  // Only the death claim needs the end confirmed.
+  const childState =
+    classified === "died-before-first-message" && !i.exited ? "exited-no-result" : classified;
   return {
     childPid: typeof i.pid === "number" ? i.pid : null,
-    childState: spawnError
-      ? "never-started"
-      : classifyChildLiveness({
-          killed: i.details.killed === true || i.killedByReason === true,
-          hasStdout,
-          messagesSent,
-        }),
+    childState,
     childExited: spawnError ? null : i.exited,
     childMessagesSent: messagesSent,
   };
@@ -2256,7 +2272,18 @@ export function childLivenessFor(i: {
  * contradictory claims in ONE payload — `status` says "it died on its own, re-dispatch it" while
  * `childState` says "the parent cut it, raise the bound" — and `classifyBackgroundOutcome`
  * persists `reason: d.status`, so a lane the watchdog killed three times would be durably recorded
- * as having died of its own accord. The kill stays `failed` and `childState` names the cause. */
+ * as having died of its own accord. The kill stays `failed` and `childState` names the cause.
+ *
+ * ⛔ THE `died-before-first-message` RETURN BELOW IS DEFENSIVE-UNREACHABLE (review round 8, P3).
+ * DOCUMENTED CLAIM, CORRECTED: an earlier revision of this comment said `childMessagesSent === 0`
+ * "is named as such" here. It cannot be. `result.status === "failed"` means every attempt resolved
+ * `undefined`, and all three `doResolve(undefined, …)` sites (hard-cap:4586, heartbeat decision:4907,
+ * backstop:5002) pass a reason outside `NON_KILL_SETTLE_REASONS`, so `killedByReason` is true,
+ * `childState` is `"killed"`, and the line above returns `failed` first. A settle that could be
+ * `died-before-first-message` necessarily carried a payload — and then `retry()` returns `success`,
+ * so this arm is never entered. The branch is kept because dropping it would turn a future
+ * non-kill payload-less settle into a silent `undefined`; it is a fail-closed guard, NOT coverage,
+ * and the unit row that exercises it constructs its input directly. */
 export function exhaustionStatusFor(snap: TaskChildLivenessSnapshot | null): "failed" | "died-before-first-message" {
   if (snap === null) return "failed";
   if (snap.childState === "killed") return "failed";
@@ -6831,9 +6858,17 @@ export default function (pi: ExtensionAPI) {
         // #1208 (review round 2, P2): a child DID run — the last settle measured
         // its pid and its message count — so the terminal result names the
         // MEASURED state rather than the tool layer's `never-started` default.
-        // `childMessagesSent === 0` is positive evidence of the slow-start death
-        // and is named as such; `null` (no heartbeat evidence) keeps `failed`,
-        // because "no attempt ever produced a message" is not provable there.
+        // `null` (no heartbeat evidence) keeps `failed`, because "no attempt ever
+        // produced a message" is not provable there.
+        //
+        // ⛔ `childMessagesSent === 0` IS NOT NAMED AS THE DEATH ON THIS ARM (review
+        // round 8, P3 — the sentence that stood here claimed it was, and that was
+        // false). Every settle that reaches this arm is a watchdog kill, so
+        // `childState` is always `"killed"` and `exhaustionStatusFor` answers
+        // `failed` for it — which is the round-4 rule: a kill's remedy is "raise the
+        // bound", never "re-dispatch it". `exhaustionStatusFor`'s
+        // `died-before-first-message` branch is a fail-closed guard for a settle
+        // shape this arm does not currently receive.
         const snap = lastLiveness as TaskChildLivenessSnapshot | null;
         return withSessionDegraded({
           content: [{ type: "text", text: `❌ Sub-agent failed after ${result.retries} attempts with no output. Model may be hung or overloaded.` }],

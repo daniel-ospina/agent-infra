@@ -9063,11 +9063,37 @@ test("#1208: a KILLED zero-output settle keeps its measurement (review round 2, 
   // party. The kill stays `failed`; `childState` names the cause.
   equal(exhaustionStatusFor(snap), "failed", "a WATCHDOG KILL is not an autonomous startup death");
   // The status DOES name the death when the child died on its own with zero content-bearing turns.
+  // ⛔ THIS ROW IS A UNIT-LEVEL GUARD, NOT PRODUCTION COVERAGE (review round 8, P3). The input is
+  // constructed directly because no production path can hand this function a zero-message snapshot
+  // that is NOT `killed`: every payload-less settle is a watchdog kill, and every settle that carried
+  // a payload returns `success` from `retry()`, so the exhaustion arm is never entered for it. The
+  // branch is kept fail-closed (see its docstring) — it is not evidence that the arm names a death.
   equal(
     exhaustionStatusFor({ ...snap, childState: "died-before-first-message" }),
     "died-before-first-message",
-    "a non-killed zero-message death is still named as such",
+    "the fail-closed guard still names a non-killed zero-message death if one ever reaches it",
   );
+  // ⛔ A DEATH CLAIM NEEDS THE PROCESS END CONFIRMED (review round 8, P3). The `onAbort`-after-
+  // `session_end` arm resolves a payload while the child is STILL ALIVE (it exists precisely so the
+  // lingering child is still reaped) and passes no `reason`, so no kill clause fires. Before this fix
+  // an E-shape child on that arm produced `{childState: "died-before-first-message", childExited:
+  // false}` — a death claim the same payload's `childExited` denies (constraint 6), and a parent told
+  // "it died during startup" about a child that had just completed its session.
+  const emptyTurnLoop = createHeartbeatState();
+  parseHeartbeatLine("[task-heartbeat] ready nonce=nn", emptyTurnLoop, 1000);
+  parseHeartbeatLine("[task-heartbeat] turn_start nonce=nn 1", emptyTurnLoop, 1001);
+  parseHeartbeatLine("[task-heartbeat] tick nonce=nn tools=0 turn=1 stream_age_ms=0 tool_age_max_ms=0 saw_msg=1 saw_tool=0 progress=0", emptyTurnLoop, 1002);
+  parseHeartbeatLine("[task-heartbeat] turn_end nonce=nn 1 content=0", emptyTurnLoop, 1003);
+  const liveAfterAbort = childLivenessFor({ details: { exitCode: null }, hbState: emptyTurnLoop, pid: 4242, stdout: "", exited: false, killedByReason: false });
+  equal(liveAfterAbort.childState, "exited-no-result", "a child the OS has not reported gone is NOT dead — even with zero content-bearing turns");
+  equal(liveAfterAbort.childExited, false, "and the payload is self-consistent: no death claim beside `childExited: false`");
+  equal(liveAfterAbort.childMessagesSent, 0, "the zero-message measurement is still reported, so nothing is hidden");
+  // The positive control: the SAME child once the process end IS confirmed is the slow-start death —
+  // this is the route the E2E empty-turn shim takes through `close`, so the fix cannot pass by
+  // degrading every zero-message child to `exited-no-result`.
+  const reapedEmptyTurnLoop = childLivenessFor({ details: { exitCode: 0 }, hbState: emptyTurnLoop, pid: 4242, stdout: "", exited: true, killedByReason: false });
+  equal(reapedEmptyTurnLoop.childState, "died-before-first-message", "once the OS confirms the end, the zero-content E shape IS the death");
+  equal(reapedEmptyTurnLoop.childExited, true, "and `childExited` now agrees with it");
   // `null` is not `0`: with no emitter, "no attempt produced a message" is unprovable.
   equal(exhaustionStatusFor({ ...snap, childMessagesSent: null }), "failed", "unknown stays failed — a false death claim is the worse error");
   equal(exhaustionStatusFor(null), "failed", "no measurement at all (a pre-spawn refusal) stays failed");
