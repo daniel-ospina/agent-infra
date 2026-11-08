@@ -12,8 +12,8 @@ true**, and that is provable from this tree: PR #1780 (merged to `main` 2026-10-
 `26ad39a33`, which IS in this head's history — `compare/26ad39a33...main` reports `behind_by: 0`)
 removed that claim from the log, `recoveryOnlyRoot` is **inspection-only** — its return never becomes a
 git-op root and never becomes **this worktree's** recovery count — the `tool_call` handler's git-op path is
-`const cwd = resolveGitRoot(cdPath ?? inputCwd)`, and `pickVerifiedRoot` is documented
-RECOVERY-ONLY.
+`const cwd = resolveGitRoot(cdPath ?? inputCwd)`, and `recoveryOnlyRoot` (which wraps `pickVerifiedRoot`)
+is documented RECOVERY-ONLY (`index.ts`'s `// RECOVERY-ONLY.` block on `recoveryOnlyRoot`).
 
 > ⚠️ Measurement note: `git merge-base --is-ancestor 26ad39a33 origin/main` returns **1 in this
 > worktree** and is WRONG here — the clone is SHALLOW (`git rev-parse --is-shallow-repository` →
@@ -63,8 +63,10 @@ only root whose entries can cover this session's git ops, and the report must sa
    greppable by a parent or a future reader, and no shipping instrument can mis-read the new names.
    Recorded as a named residual.
 3. **Change root selection back to adoption.** Refused flat: it re-opens the fail-open documented in
-   `pickVerifiedRoot`'s docblock (a clean adopted tree yields an EMPTY scope, and the empty-scope path
-   ALLOWS an op carrying unverified content).
+   `recoveryOnlyRoot`'s RECOVERY-ONLY block (`index.ts`'s `// RECOVERY-ONLY.` comment, which carries
+   "This must NEVER be used to choose the git-op root … a clean adopted tree yields an empty diff
+   scope and the gate's empty-scope path ALLOWS an op carrying unverified content"). `pickVerifiedRoot`
+   is the pure decision it wraps and carries no fail-open note of its own.
 4. ✅ **Recover this worktree's own root first and report THAT count; merge the sibling's entries for
    INSPECTION only, record that decision durably, and give the root-mismatch diagnosis a durable
    record too.** This does not touch root selection or the block/mismatch decision (both stay
