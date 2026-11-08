@@ -2518,7 +2518,7 @@ guard_tools_dir() {
 # A cell is certified only by reading the ARTIFACT back. Every declared farm file must be
 # present AND byte-identical to the checkout (the repo copy is the copy that must run),
 # every guard must have landed, the deny must hold, and the tools/ namespace must be clean.
-GUARD_EXTENSIONS=(review-enforcer verification-gate main-worktree-guard search-guard audit-logger.ts shared)
+GUARD_EXTENSIONS=(review-enforcer verification-gate main-worktree-guard search-guard gui-device-guard audit-logger.ts shared)
 
 # shipped_content_matches <src-dir> <dst-dir> — every file in the SOURCE tree (minus
 # node_modules) must exist at the same relative path under the destination and be

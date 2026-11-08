@@ -212,6 +212,12 @@ jobs:
       - name: search-guard suite (threat table, handler-driven, non-vacuity)
         timeout-minutes: 5
         run: node extensions/search-guard/test.mjs
+      - name: gui-device-guard suite (#2249, threat table + handler-driven non-vacuity)
+        # Zero-dependency by contract: index.ts imports `node:` + `extensions/shared/`
+        # only, so this runs in the job that has NO `npm ci`. It drives the REAL
+        # registered `tool_call` handler — importing the classifier alone would stay
+        # green while index.ts was inert in every session (#744/#697).
+        run: node extensions/gui-device-guard/test.mjs
       - name: search-cost harness (corpus contract, both directions)
         timeout-minutes: 5
         run: bash tests/search-cost/run.sh
