@@ -483,7 +483,7 @@ checkout can use the documented hatch. The same interaction is recorded for
 
 ## Tests
 
-`scripts/harness-apply-timer.test.sh` — 999 assertions, run by the
+`scripts/harness-apply-timer.test.sh` — 518 assertions, run by the
 `harness-apply-timer` shard of `run-bash-shards.sh`:
 
 | | |
