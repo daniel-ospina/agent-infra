@@ -585,8 +585,10 @@ repo_set_parse() {
     # reaches it too, at the same rc with the same message. ⚠️ THAT IS THE POINT, SO THERE IS DELIBERATELY
     # NO NUMBER HERE: the rule is the BOUNDARY, not the list. The message below says "not a regular file"
     # because that is true of every kind including ones nobody has tried yet, and it goes stale only if
-    # the boundary itself moves. Only a directory was armed (`j3`/`j4`), so the old sentence asserted an
-    # unverified specific — the "right code, wrong cause" shape the `-L` arm above was rewritten to avoid.
+    # the boundary itself moves. Before this round only a directory was armed (`j3`/`j4`; this round adds
+    # `j4b`, a FIFO), so the old sentence asserted an unverified specific — the "right code, wrong cause"
+    # shape the `-L` arm above was rewritten to avoid. "Before this round" is load-bearing: written in the
+    # present tense it read as a statement about the head, where a FIFO now reaches this arm.
     # The rule, stated as the rule.
     _rs_say 2 "repo-set: INVALID — $f exists but is not a regular file (a repo set must be a regular file)."
     return 5
