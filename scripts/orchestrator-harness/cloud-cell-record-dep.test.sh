@@ -200,12 +200,18 @@ env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
 env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
   git -C "$CELL_HARNESS" update-ref refs/remotes/origin/main HEAD
 # `cmd_check` asserts the workers are in $O; production gets them from `start`'s seed of $HARNESS.
-# ⛔ THE `*.py` HELPERS ARE DELIBERATELY NOT SEEDED. `start` ends by launching the real
-# `$O/orch-loop.sh`, whose own fail-closed pre-flight requires `check-class.py` (`orch-loop.sh:458`);
-# seeding it turns that pre-flight into a REAL controller cycle that never returns, so `start` could not
-# be made to exit 0 inside a unit suite at all (measured: a 240 s timeout). The consequence is stated
-# where it matters — the three `start` assertions below pin the PROVISION, which is what #1717 is about,
-# and print the loop's rc instead of pretending it is green.
+# ⛔ THE `*.py` HELPERS ARE DELIBERATELY NOT SEEDED, AND THE REASON IS NOT A HANG (cycle-14, measured).
+# This block used to say that seeding `check-class.py` "turns the pre-flight into a REAL controller cycle
+# that never returns (measured: a 240 s timeout)", and on that premise three passing assertions were
+# deleted so that `start`'s rc was "reported, never asserted". The premise does NOT reproduce: the fixture's
+# tmux stub only RECORDS `new-session`'s argv (`:110-118`) and never runs it, `ORCH_FOREGROUND` is never
+# set, so service mode (`cloud-cell-supervisor.sh` — the `exec bash "$HARNESS/orch-loop.sh"` arm) is never
+# taken and no loop can hang. Measured on this fixture with the helper seeded: `start_rc=0` in ALL THREE
+# arms and 115 passed / 0 failed either way.
+# So the rc is ASSERTED again. It is the only whole-`start` success assertion in this suite, and without it
+# a `start` that provisions the recorder and then `die`s (a failing `cmd_check` after the seed, a failing
+# `start_doctor_loop`) passes every arm here — a regression this suite exists to catch, hiding behind a
+# comment about a timeout that cannot happen.
 cp "$HERE"/*.sh "$CELL_O/"
 mkstubs "$CELL_STUBS"
 RECORDER="$CELL_HOME/.pi/agent/scripts/record-review.sh"
@@ -340,9 +346,10 @@ printf '#!/bin/bash\nexit 0\n' > "$CELL/record-review.sh"; chmod +x "$CELL/recor
 mkdir -p "$CELL/lib"; printf '#!/usr/bin/env python3\n' > "$CELL/lib/diff-normalize.py"
 rm -f "$RECORDER" "$RECORDER_LIB" "$CELL/tmstate/up" "$CELL/tmstate/cmd"
 out="$(cell_start)"; rc=$?
-start_rc="$rc"          # the controller launch's own verdict — reported, never asserted here (see above)
+start_rc="$rc"          # the controller launch's own verdict; asserted at the end of this arm (above)
 [ -x "$RECORDER" ] && rc=0 || { rc=1; note "recorder=$([ -x "$RECORDER" ] && echo present || echo absent) start_rc=$start_rc out=$(printf '%s' "$out" | tail -3)"; }
-ck "start provisions record-review.sh from the checkout (start_rc=$start_rc is the controller launch's, not this suite's subject)" $rc
+ck "start provisions record-review.sh from the checkout (start_rc=$start_rc)" $rc
+ck "start itself SUCCEEDED (the controller launch is not this suite's subject, but its exit status is the whole-start verdict)" "$start_rc"
 [ -s "$RECORDER_LIB" ] && rc=0 || { rc=1; note "normalizer=$([ -s "$RECORDER_LIB" ] && echo present || echo absent) out=$(printf '%s' "$out" | tail -3)"; }
 ck "RED→GREEN: start provisions the recorder's SIBLING diff-normalize.py in lib/" $rc
 [ -f "$CELL/tmstate/cmd" ] && rc=0 || rc=1
@@ -353,9 +360,10 @@ ck "the provisioned cell is then certified" $rc
 # …and the SIBLING alone is provisioned when an operator's recorder copy already exists (the
 # "present but degraded" cell the lib check exists for): remove ONLY the normalizer and re-start.
 rm -f "$RECORDER_LIB" "$CELL/tmstate/up" "$CELL/tmstate/cmd"
-out="$(cell_start)"; rc=$?     # see above: the loop's rc is not this suite's subject
+out="$(cell_start)"; rc=$?; start_rc="$rc"     # asserted below — see the header
 [ -s "$RECORDER_LIB" ] && rc=0 || { rc=1; note "normalizer=$([ -s "$RECORDER_LIB" ] && echo present || echo absent) out=$(printf '%s' "$out" | tail -3)"; }
 ck "start provisions ONLY the missing normalizer when the recorder already exists" $rc
+ck "and that start SUCCEEDED (start_rc=$start_rc)" "$start_rc"
 
 # 5b) A ZERO-BYTE recorder must be RE-provisioned by `start`, not left in place: the old provision
 # ran only when the path was ABSENT, so a `cp` killed mid-write (or a full disk) would persist
@@ -364,9 +372,10 @@ ck "start provisions ONLY the missing normalizer when the recorder already exist
 printf '#!/bin/bash\nexit 0\n' > "$CELL/record-review.sh"; chmod +x "$CELL/record-review.sh"
 : > "$RECORDER"          # a truncated/zero-byte operator copy
 rm -f "$CELL/tmstate/up" "$CELL/tmstate/cmd"
-out="$(cell_start)"; rc=$?     # see above: the loop's rc is not this suite's subject
+out="$(cell_start)"; rc=$?; start_rc="$rc"     # asserted below — see the header
 [ -s "$RECORDER" ] && rc=0 || { rc=1; note "recorder=$([ -s "$RECORDER" ] && echo nonempty || echo empty) out=$(printf '%s' "$out" | tail -3)"; }
 ck "RED→GREEN: start re-provisions a ZERO-BYTE recorder" $rc
+ck "and that start SUCCEEDED (start_rc=$start_rc)" "$start_rc"
 out="$(cell_check)"; rc=$?
 [ "$rc" -eq 0 ] && certified "$out" && rc=0 || { rc=1; note "$(printf '%s' "$out" | tail -3)"; }
 ck "the re-provisioned cell is then certified" $rc
