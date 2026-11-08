@@ -1840,13 +1840,16 @@ assert_eq "$(grep '^detail=' "$T/t24w/state/harness-apply.status" 2>/dev/null | 
 # the VALUE, not the line: `detail=` adds 7 bytes, and the trailing multi-byte strip can leave the value
 # a byte or two under the bound.
 DET24W_LEN="$(sed -n 's/^detail=//p' "$T/t24w/state/harness-apply.status" 2>/dev/null | LC_ALL=C awk '{print length($0)}')"
-# ⛔ THE MULTI-BYTE BOUNDARY IS PINNED ON THE FUNCTION ITSELF, because NO FIXTURE CAN PIN IT (review
-# round 19, measured: restoring `cut -c1-240` left the suite at 422/0 — a path-length sweep across nine
-# lengths did not discriminate either, because every fixture's byte 240 happens to fall on ASCII). So
-# the SHIPPED `bounded()` is extracted from the pass under test into a temp script and driven with a
-# value whose byte 240 is the LEAD byte of a 3-byte character: a byte-wise cut ends the field on 0xE2
-# (not text), the shipped code drops that character whole and ends on ASCII. Extraction, not a copy —
-# so a regression in the pass's own function is what reddens this.
+# ⛔ THE MULTI-BYTE BOUNDARY IS PINNED ON THE FUNCTION ITSELF, AND T24y BELOW PINS ITS CALL SITE.
+# ⚠️ THE "NO FIXTURE CAN PIN IT" CLAIM IS CORRECTED (review round 31, measured). It read: "restoring
+# `cut -c1-240` left the suite at 422/0 — a path-length sweep across nine lengths did not discriminate
+# either, because every fixture's byte 240 happens to fall on ASCII". The measurement was right and the
+# conclusion was one step too far: EVERY THEN-EXISTING FIXTURE happened to put ASCII at byte 240, which
+# is a property of those fixtures, not of fixtures. A farm path carrying a RUN of 3-byte characters puts
+# a multi-byte character across byte 240 whatever the temp root's length, and then a cut at the bound and
+# `bounded()` disagree on BOTH readings of `cut -c` (T24y). This row stays because it is the only pin on
+# the FUNCTION: a regression INSIDE `bounded()` reds here even with the call site untouched. Extraction,
+# not a copy — so a regression in the pass's own function is what reddens this.
 {
     printf '%s\n' '#!/usr/bin/env bash'
     sed -n '/^bounded() {/,/^}/p' "${PASS_UNDER_TEST:-$PASS_SH}"
@@ -1871,6 +1874,86 @@ assert_contains "$OUT" "the RAW output could not be persisted" \
     "T24 control: with the journal saying the same"
 assert_contains "$(grep '^farm_n=' <<<"$REC24W")" "farm_n=unparsed" \
     "T24 control: and the count is still unparsed, not a number the extraction never produced"
+
+# ── T24y: the bound is pinned AT ITS CALL SITE, not only as a function ───────────────────────────
+# ⛔ A PIN ON THE FUNCTION IS NOT A PIN ON ITS USE (review round 31, P2 — MEASURED). `bounded()` was
+# pinned (the T24 control above), and so was `detail=`'s LENGTH — but reverting ONLY the call site
+# (`$(bounded …)` → `$(… | cut -c1-240)`, `bounded()` byte-identical) left the whole suite GREEN, so the
+# bound could come back silently. That is not cosmetic: with a byte cut at `:386`, a multi-byte
+# character straddling byte 240 leaves an invalid UTF-8 sequence in the record; `grep '^detail='` then
+# classifies the whole file as BINARY and prints nothing, and every key=value consumer — fleet-health,
+# `--print-status`, the installer's readiness leg — reads the field that answers "what happened" as
+# ABSENT while the suite reports a clean pass. It is the round-11 defect this PR fixes, re-openable with
+# no test going red.
+# ⛔ WHY EVERY EARLIER FIXTURE MISSED IT, AND WHY THIS ONE CANNOT: the other fixtures happen to put ASCII
+# at byte 240, and `cut -c`'s reading of `-c` differs by platform (GNU: BYTES, so a split character;
+# BSD/macOS: CHARACTERS, so up to 3x the bytes the bound promises). Both readings disagree with
+# `bounded()` once a RUN of 3-byte characters covers byte 240 — and a farm path can hold such a run
+# however long the temp root is, because the run is wider than the spread of plausible temp roots. So
+# this fixture ASSERTS the precondition it needs (that the run really does straddle the bound, measured
+# from the run's own UNBOUNDED sentence — which the mutation cannot reach, since it edits the bound and
+# not the sentence) instead of assuming it.
+# ⛔ AND THE PIN IS THE USE ITSELF: the record's `detail=` must EQUAL `bounded()` — extracted from the
+# pass under test — applied to the sentence that run printed. That fails for a `cut` at the call site,
+# for a dropped `tr '\n' ' '`, for a reordered pipeline, and for the bound being removed altogether.
+say_case "T24y the detail= bound is applied at its CALL SITE — a cut at the bound cannot come back unseen"
+mk_origin t24y; mk_clone t24y
+REPO_P="$CLONE"; MODE_P=sync
+# A run of 60 U+20AC (180 bytes) inside the farm's own path. The ASCII prefix before it is ~111 bytes of
+# sentence plus the temp root plus `t24y/`, so byte 240 lands INSIDE the run for any temp root from ~110
+# to ~230 characters. Built in a loop, not spelled out, so the count is one number to read and change.
+_EUR=""; _i=0; while [ "$_i" -lt 60 ]; do _EUR="$_EUR€"; _i=$((_i + 1)); done
+mkdir -p "$T/t24y/$_EUR/.pi/agent/scripts" "$T/t24y/state/harness-apply-farm-rows.txt"
+OUT="$(CELL_HOME_P="$T/t24y/$_EUR" HARNESS_APPLY_FARM_CHECKER="$T/t24v/stub-other-vocab.sh" \
+    run_pass "$T/t24y" 2>&1)"; RC=$?
+assert_eq "$RC" "24" "T24y the drift is still RED (24) over a multi-byte farm path"
+_RECY="$T/t24y/state/harness-apply.status"
+# The sentence this run PRINTED, UNBOUNDED: `finish` logs REC_DETAIL verbatim before `write_record`
+# bounds it into `detail=`, so this is the same value the call site is handed.
+_DETFULL="$(printf '%s\n' "$OUT" | grep -F 'farm: DRIFT — ' | head -1)"
+_DETFULL="farm: DRIFT — ${_DETFULL#*farm: DRIFT — }"
+_FULLLEN="$(printf '%s' "$_DETFULL" | LC_ALL=C wc -c | tr -d ' ')"
+_VAL="$(LC_ALL=C sed -n 's/^detail=//p' "$_RECY" 2>/dev/null)"
+_VALLEN="$(printf '%s' "$_VAL" | LC_ALL=C wc -c | tr -d ' ')"
+_EXP="$(bash "$T/bounded-extract.sh" "$_DETFULL" 2>/dev/null || true)"
+_EXPLEN="$(printf '%s' "$_EXP" | LC_ALL=C wc -c | tr -d ' ')"
+_B240="$(printf '%s' "$_DETFULL" | head -c 240 | tail -c 1 | LC_ALL=C od -An -tu1 | tr -d ' ')"
+# ── the fixture's own preconditions, measured (a fixture that cannot see the class is not a test) ──
+if [ -n "$_DETFULL" ] && [ "${_FULLLEN:-0}" -gt 240 ]; then
+    ok "T24y FIXTURE: the sentence this run printed is ${_FULLLEN} bytes — past the bound, so the call site really truncates here"
+else
+    bad "T24y FIXTURE: the sentence must exceed the 240-byte bound for this arm to exercise it (measured '${_FULLLEN:-none}') — the fixture, not the code, is what failed"
+fi
+if [ -n "${_B240:-}" ] && [ "$_B240" -ge 128 ]; then
+    ok "T24y FIXTURE: byte 240 of that sentence (0x$(printf '%02x' "$_B240")) is INSIDE a multi-byte character, so a cut at the bound MUST diverge from bounded() on either reading of `cut -c`"
+else
+    bad "T24y FIXTURE: byte 240 must fall inside the multi-byte run for this pin to bite (measured '${_B240:-none}'); lengthen _EUR or shorten the case-dir name — do NOT weaken the assertion"
+fi
+# ── the pin ──
+if [ "$_VAL" = "$_EXP" ]; then
+    ok "T24y the record's detail= IS bounded() applied to the sentence this run printed (${_VALLEN} bytes) — reverting the call site to a cut reddens this row"
+else
+    bad "T24y detail= must equal bounded() of the SAME sentence (record ${_VALLEN} bytes, bounded() ${_EXPLEN} bytes) — a cut at the call site splits a multi-byte character and makes the whole record grep-binary"
+fi
+if [ -n "$_VALLEN" ] && [ "$_VALLEN" -le 240 ]; then
+    ok "T24y …and the value stays within the 240-byte bound (${_VALLEN} bytes) — a char-wise cut over this run would exceed it"
+else
+    bad "T24y …detail='s value must not exceed 240 BYTES (measured '${_VALLEN:-none}') — `cut -c1-240` counts CHARACTERS on BSD, so the bound would hold 3x the bytes it promises"
+fi
+# The WHOLE run is dropped, not half of it: `bounded()` strips every trailing non-ASCII byte, so the
+# surviving value ends on the ASCII '/' that precedes the run. A cut leaves a fragment of one character
+# behind, which is the invalid sequence this pin exists to keep out of the record.
+assert_absent "$_VAL" "€" \
+    "T24y …and no fragment of the multi-byte run survives in the record — the character is dropped whole, not split"
+BLAST24Y="$(printf '%s' "$_VAL" | tail -c 1 | LC_ALL=C od -An -tu1 | tr -d ' ')"
+if [ -n "${BLAST24Y:-}" ] && [ "$BLAST24Y" -le 126 ]; then
+    ok "T24y …and its last byte (0x$(printf '%02x' "$BLAST24Y")) is ASCII, so `grep '^detail='` reads the record as TEXT"
+else
+    bad "T24y …the last byte of detail= must be ASCII (got 0x$(printf '%02x' "${BLAST24Y:-0}")) — otherwise a plain grep reports the whole record as binary"
+fi
+assert_eq "$(LC_ALL=C grep -c '^detail=' "$_RECY" 2>/dev/null)" "1" \
+    "T24y …and the field is reachable by a plain grep on the record itself"
+unset _EUR _i _RECY _DETFULL _FULLLEN _VAL _VALLEN _EXP _EXPLEN _B240 BLAST24Y
 
 # ── T24x: an inherited CDPATH must not smuggle a FARM-LOCAL checker past the containment refusal ──
 # MEASURED (review round 5): with a RELATIVE `HARNESS_APPLY_FARM_CHECKER` and a CDPATH that resolves its
