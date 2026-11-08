@@ -72,6 +72,102 @@ const detachState = readBranchState(MAIN);
 ok("readBranchState: detached → branch null", detachState && detachState.branch === null, JSON.stringify(detachState));
 git(MAIN, "checkout -q main");
 
+// ── #2218: an UNBORN HEAD is a READABLE repo, not an unverifiable one ──────
+// The single combined probe (`rev-parse --git-dir HEAD --abbrev-ref HEAD`)
+// exits 128 on a ZERO-COMMIT repo — `HEAD` is an ambiguous argument — so
+// readBranchState read a perfectly healthy fresh repo as unreadable, M2's
+// session-cwd fallback returned null too, and the FIRST commit in any fresh
+// repo was refused fail-closed (#265's message). A scratch/fixture/hermetic-hub
+// repo is exactly the shape that hits this, and the documented workaround — the
+// 15-minute escape marker — disables M2/M3 for real work. Every assertion here
+// fails on the pre-#2218 module.
+const FRESH = join(ROOT, "fresh-2218");
+execSync(`mkdir -p "${FRESH}"`, { stdio: "ignore" });
+execSync("git init -q -b main", { cwd: FRESH, stdio: "ignore" });
+execSync("git config user.email t@bo.local && git config user.name bo-test", { cwd: FRESH, stdio: "ignore" });
+writeFileSync(join(FRESH, "README.md"), "seed\n");
+execSync("git add -A", { cwd: FRESH, stdio: "ignore" });
+// Precondition: the repo IS readable and staging DID work — only HEAD is unborn.
+// (Without this the assertions below cannot distinguish "repo broken" from
+// "probe broken", which is the whole point of the issue.)
+ok("#2218 precondition: the zero-commit repo is readable (status rc 0)",
+  git(FRESH, "status --porcelain") === "A  README.md", git(FRESH, "status --porcelain"));
+
+const freshState = readBranchState(FRESH);
+ok("#2218 readBranchState: unborn HEAD returns a state, not null",
+  freshState !== null, String(freshState));
+ok("#2218 readBranchState: unborn branch name is read",
+  freshState?.branch === "main", JSON.stringify(freshState));
+ok("#2218 readBranchState: unborn head is null (no commit yet, not unknown)",
+  freshState?.head === null, JSON.stringify(freshState));
+ok("#2218 readBranchState: unborn gitDir is git's resolved admin dir",
+  freshState != null && freshState.gitDir === repoKey(FRESH), `${freshState?.gitDir} vs ${repoKey(FRESH)}`);
+ok("#2218 readBranchState: unborn HEAD with an explicit --git-dir override",
+  readBranchState(FRESH, join(FRESH, ".git"))?.branch === "main",
+  JSON.stringify(readBranchState(FRESH, join(FRESH, ".git"))));
+ok("#2218 readBranchState: a genuinely unreadable path is still null (fail-closed)",
+  readBranchState("/nonexistent/xyz-2218") === null);
+
+// The commit path resolves the repo through these two entry points; both used
+// to return null on the unborn probe and hand M2 an indeterminate target.
+const freshEff = resolveEffectiveRepo("git commit -qm base", FRESH, "commit");
+ok("#2218 resolveEffectiveRepo: a commit in a zero-commit repo resolves",
+  freshEff !== null, String(freshEff));
+ok("#2218 resolveEffectiveRepo: unborn repo is a MAIN checkout on its branch",
+  !!freshEff && freshEff.isWorktree === false && freshEff.isBare === false &&
+  freshEff.currentBranch === "main" && freshEff.repoKey === repoKey(FRESH) &&
+  freshEff.unresolvedTarget === false, JSON.stringify(freshEff));
+ok("#2218 resolveRepoFromInv: the classifier's hints resolve the unborn repo",
+  (() => {
+    const r = resolveRepoFromInv({ cdChain: [], cHints: [FRESH], gitDirHint: null, vars: {} }, MAIN);
+    return r != null && r.currentBranch === "main" && r.repoKey === repoKey(FRESH) && r.effectiveCwd === FRESH;
+  })());
+
+// M2 decisions on that state: the reported symptom is a SCRATCH repo (not the
+// session's own), which must be admitted; and the gate must still refuse the
+// same repo when it is off its recorded baseline.
+const freshBaseline = { repoKey: repoKey(FRESH), branch: "main", head: null, original: "main" };
+const m2Scratch = decideM2({
+  effectiveRepo: freshEff, baseline: null, currentBranch: freshEff?.currentBranch ?? null,
+  pushDst: null, pushTargets: null, verdict: "block:commit", allowActive: false,
+  sessionRepoKey: mainKey, effectiveIsAgentInfra: false,
+});
+ok("#2218 decideM2: a scratch zero-commit repo is ALLOWED (the reported block)",
+  m2Scratch === null, JSON.stringify(m2Scratch));
+ok("#2218 decideM2: on-baseline commit in the zero-commit repo is ALLOWED",
+  decideM2({
+    effectiveRepo: freshEff, baseline: freshBaseline, currentBranch: freshEff?.currentBranch ?? null,
+    pushDst: null, pushTargets: null, verdict: "block:commit", allowActive: false,
+  }) === null);
+const m2OffBase = decideM2({
+  effectiveRepo: freshEff, baseline: freshBaseline, currentBranch: "feat/someone-else",
+  pushDst: null, pushTargets: null, verdict: "block:commit", allowActive: false,
+});
+ok("#2218 decideM2: OFF-baseline commit in the zero-commit repo is still BLOCKED (no loosening)",
+  m2OffBase?.block === true, JSON.stringify(m2OffBase));
+
+// `git checkout --orphan <new>` is the OTHER way to reach an unborn HEAD in a
+// repo that HAS commits: the branch is named, the commit is gone. It must read
+// the same way — a named branch + null head — never as unreadable.
+git(OTHER, "checkout -q --orphan feat/orphan-2218");
+const orphanState = readBranchState(OTHER);
+ok("#2218 readBranchState: `checkout --orphan` reads branch + null head",
+  orphanState != null && orphanState.branch === "feat/orphan-2218" && orphanState.head === null,
+  JSON.stringify(orphanState));
+const orphanEff = resolveEffectiveRepo("git commit -qm x", OTHER, "commit");
+ok("#2218 resolveEffectiveRepo: orphaned HEAD resolves to the orphan branch",
+  orphanEff?.currentBranch === "feat/orphan-2218", JSON.stringify(orphanEff));
+const m2Orphan = decideM2({
+  effectiveRepo: orphanEff, baseline: { repoKey: repoKey(OTHER), branch: "main", head: null, original: "main" },
+  currentBranch: orphanEff?.currentBranch ?? null,
+  pushDst: null, pushTargets: null, verdict: "block:commit", allowActive: false,
+});
+ok("#2218 decideM2: an orphaned HEAD off its baseline is still BLOCKED",
+  m2Orphan?.block === true, JSON.stringify(m2Orphan));
+git(OTHER, "checkout -q -f main");
+ok("#2218 regression: the born repo still reports its head sha after restore",
+  /^[0-9a-f]{40}$/.test(String(readBranchState(OTHER)?.head)), JSON.stringify(readBranchState(OTHER)));
+
 // ── resolveEffectiveRepo (git-faithful matrix) ─────────────────────────────
 const wtGitDir = git(WT, "rev-parse --git-dir"); // absolute: <main>/.git/worktrees/wt-feat
 ok("resolveEffectiveRepo: plain commit in main", (() => {

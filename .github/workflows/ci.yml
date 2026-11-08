@@ -1007,6 +1007,26 @@ jobs:
         # Zero-dep (`node:*` + the `git` binary), no `npm ci`, ~6s. Its OWN step,
         # not a flag on the step above (the rule every suite in this job follows).
         run: node extensions/main-worktree-guard/test-m4-recovery-window.mjs
+      - name: main-worktree-guard unborn-HEAD first-commit gate (#2218)
+        # #2218: `git commit` was impossible in any freshly-initialised repo. The
+        # ownership probe is ONE combined `rev-parse --git-dir HEAD --abbrev-ref
+        # HEAD`, which exits 128 when HEAD is UNBORN (`HEAD` is an ambiguous
+        # argument), so a zero-commit repo read as UNVERIFIABLE and the
+        # first commit was refused fail-closed (#265's message). The workaround
+        # lanes reached for was the 15-minute escape marker — which disables
+        # M2/M3 for real work, i.e. the false block was teaching lanes to mint
+        # the hatch. Behavioral: loads the REAL index.ts through
+        # module-load-hooks.mjs, drives the tool_call handler over hermetic
+        # zero-commit fixtures, and pins BOTH polarities — the reported repro
+        # (non-repo-rooted session, and a session that STARTS in the fresh repo)
+        # is ALLOWED, while every off-baseline/unowned shape stays BLOCKED after
+        # the fix (the probe must not become a loosening).
+        # Zero-dep (`node:*` + the `git` binary), no `npm ci`, ~5s. Its OWN step,
+        # not a flag on the step above (the rule every suite in this job follows):
+        # the `extensions/*/test*.mjs` glob in ci-main.yml runs on the push lane
+        # only (`main`, plus `integration/**` since #3131 — never on a PR), so a
+        # per-PR step is the only thing that reads it before a merge.
+        run: node extensions/main-worktree-guard/test-unborn-head.mjs
       - name: main-worktree-guard discard-gate MUTATION evidence (#2161)
         # #2161 closed a fail-OPEN hole: an escaped quote inside an ANSI-C
         # `$'…'` word closed the word early, phantom-quoted the rest of the

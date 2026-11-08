@@ -4786,7 +4786,11 @@ const WHY = [
 // A lock-contended start (pendingBaseline → first-tool_call record) sets
 // original null → the #376 carve-out fails closed (the tree may already sit on
 // ANOTHER session's branch — not provably own).
-const baselines = new Map<number, { repoKey: string; branch: string | null; head: string; original: string | null }>();
+// `head` is `string | null` because #2218 made readBranchState report an UNBORN
+// HEAD as a readable repo (`head: null`). It is written, never read by a
+// decision (refreshed lazily at _rebaseline, "unused in decisions"), so the
+// null is inert — but the annotation must not claim a sha that may not exist.
+const baselines = new Map<number, { repoKey: string; branch: string | null; head: string | null; original: string | null }>();
 const warnedDeviations = new Map<number, Set<string>>();
 const pendingBaseline = new Set<number>(); // lock contended at session_start → record on first tool_call
 // Branches THIS pid renamed its own baseline to via the M3 rename carve-out,
