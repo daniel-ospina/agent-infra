@@ -100,10 +100,15 @@ lane's pi exits later the shell it ran under is still there. Nothing is destroye
 | `lane-status.py` not importable | the fleet's resolution primitives are not installed beside the tool; nothing was read, so nothing may be sent |
 
 `--new` starts a fresh session (no `--session`), and is the only way to relaunch a lane whose
-transcript is genuinely gone. Its confirmation is anchored to the **pre-send binding**: a different
-session id resolving to a transcript, or the same id's transcript appearing/advancing relative to the
-baseline. A recorded id whose transcript still exists on disk (the common shape) is therefore *not*
-proof on its own — that would report `CONFIRMED` for a session nothing had started.
+transcript is genuinely gone. Its confirmation is anchored to a **pre-send baseline** — never to a
+state that already existed:
+
+- **proof:** a `*.jsonl` transcript that was NOT in the lane cwd's session directory before the send
+  (or a different session id resolving to a real file). Nothing in this fleet SETS a resume binding
+  for a pi started by typing into a shell, so the transcript appearing is the only evidence a fresh
+  session can leave;
+- **not proof:** a recorded session id that still has a transcript on disk (the common shape). That
+  would report `CONFIRMED` for a session nothing had started.
 
 ### Identifying the real session
 

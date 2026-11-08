@@ -60,6 +60,7 @@ EXIT
 from __future__ import annotations
 
 import argparse
+import glob
 import json
 import os
 import shlex
@@ -153,6 +154,24 @@ def _live_pi_record(ws, runner, timeout=45):
         if got == want:
             return True
     return False
+
+
+def _transcripts(ls, cwd):
+    """{path} of every `*.jsonl` in the lane cwd's session directory — the pre-send BASELINE.
+
+    None means the directory could not be read (no signal, never a false CONFIRM). pi writes a session
+    transcript under `~/.pi/agent/sessions/<mangled cwd>/`, so "a file that was not here before the
+    send" is the only evidence a *fresh* session has that does not depend on a resume binding — and
+    nothing in this fleet SETS a resume binding for a pi started by typing into a shell (the only
+    writer is `extensions/cmux-session.ts`'s `clearResumeBinding`; `lane-status.py:944-952` records
+    the measured consequence). Review round 4, P2: the binding-based check could therefore never
+    confirm a real `--new` relaunch and reported failure on a lane that had come back.
+    """
+    try:
+        d = os.path.join(ls.SD, ls.mangled(cwd))
+        return set(glob.glob(os.path.join(d, "*.jsonl")))
+    except Exception:                                            # noqa: BLE001
+        return None
 
 
 def _forbidden_in(argv) -> str:
@@ -253,7 +272,7 @@ def relaunch(ws, label="", cwd=None, session=None, pi=None, new=False, wait=45.0
     # COMMON case — #942's aggravating factor 2 is that it sometimes does not) confirmed on the FIRST
     # loop iteration, before any wait, from a binding that existed BEFORE the relaunch. Exit 0 is the
     # operator's strongest signal, and it was saying "came back" about a session nothing had started.
-    pre_sid, pre_stat = sid, (_stat(path) if path else None)
+    pre_sid = sid
     if new:
         sid, path, fresh = None, None, True
 
@@ -298,7 +317,8 @@ def relaunch(ws, label="", cwd=None, session=None, pi=None, new=False, wait=45.0
 
     # ── 7. ONE send, with the trailing newline: `cmux send` without it TYPES BUT NEVER SUBMITS
     # (#941), which is a silent dispatch no-op. The newline is part of the payload on purpose.
-    before = pre_stat if fresh else (_stat(path) if path else None)
+    before = _stat(path) if path else None
+    pre_files = _transcripts(ls, cwd) if fresh else None
     rc, out, err = runner(argv)
     obs["sent"] = True
     if rc != 0:
@@ -311,18 +331,23 @@ def relaunch(ws, label="", cwd=None, session=None, pi=None, new=False, wait=45.0
     deadline = clock() + max(0.0, wait)
     while True:
         if fresh:
-            # a fresh session has no transcript to advance: the transcript APPEARING is the proof.
+            # A fresh session has no transcript to ADVANCE, so the proof is an APPEARANCE — measured
+            # against a baseline taken BEFORE the send, in the two forms that can actually occur.
             try:
                 sid_after = ls.resolve_session(ws)
-                after = _stat(ls.session_file(sid_after)) if sid_after else None
             except Exception:                                    # noqa: BLE001
-                sid_after, after = None, None
-            # A DIFFERENT binding is a transition by itself. The SAME binding proves nothing unless
-            # its transcript APPEARED or moved relative to the pre-send baseline (which is `None` when
-            # the pre-send id had no file — the arm's own motivating case).
-            appeared = bool(after) and (sid_after != pre_sid or after != pre_stat)
+                sid_after = None
+            now_files = _transcripts(ls, cwd)
+            new_files = sorted(now_files - pre_files) if (now_files is not None
+                                                          and pre_files is not None) else []
+            # (i) a transcript that was NOT there before the send — the reachable proof; (ii) a
+            # DIFFERENT session id resolving to a real file — a binding transition, when one is left.
+            appeared = bool(new_files) or bool(sid_after and sid_after != pre_sid
+                                               and _stat(ls.session_file(sid_after)))
             if appeared:
-                obs.update(confirmed=True, sid=sid_after, reason="fresh session appeared")
+                obs.update(confirmed=True, sid=sid_after or pre_sid,
+                           reason=("fresh session appeared (%s)" % os.path.basename(new_files[0])
+                                   if new_files else "fresh session binding changed"))
                 break
         else:
             now = _stat(path)

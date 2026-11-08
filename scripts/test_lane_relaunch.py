@@ -46,12 +46,21 @@ class FakeLS:
     guard order, and a fake that re-implemented the shared resolution would be testing itself."""
 
     def __init__(self, screen="dev@box repo % ", working=False, session="s-1", transcript=_T,
-                 cwd="/tmp/lane"):
+                 cwd="/tmp/lane", session_dir=None):
         self._screen = screen
         self._working = working
         self._session = session
         self._transcript = transcript
         self._cwd = cwd
+        self._session_dir = session_dir or tempfile.mkdtemp(prefix="lane-sessions-")
+
+    # the two primitives the FRESH arm's baseline needs: `~/.pi/agent/sessions/<mangled cwd>/*.jsonl`
+    @property
+    def SD(self):
+        return os.path.dirname(self._session_dir)
+
+    def mangled(self, cwd):
+        return os.path.basename(self._session_dir)
 
     def read_screen(self, ws, lines=14):
         return self._screen
@@ -299,9 +308,10 @@ def test_new_does_not_confirm_from_a_binding_that_predates_the_send(R, tmp_path)
     """The P1 from review round 2: `--new` on a lane whose RECORDED id still has a transcript on
     disk — the common shape — used to print CONFIRMED (exit 0) on the FIRST loop iteration, from a
     session nothing had started. A state is not a transition."""
-    stale = tmp_path / "old.jsonl"
-    stale.write_text("{}\n")
-    ls = ScriptLS(resolve_seq=["old", "old"], files={"old": str(stale)})
+    ls = FakeLS(session="old", transcript=None)
+    os.makedirs(os.path.join(ls.SD, ls.mangled("/tmp/lane")), exist_ok=True)
+    stale = os.path.join(ls.SD, ls.mangled("/tmp/lane"), "old.jsonl")
+    open(stale, "w").write("{}\n")
     cmux = FakeCmux()          # the send "succeeds" and NOTHING changes on disk
     obs = R.relaunch("ws-1", ls=ls, runner=cmux, pi=sys.executable, cwd="/tmp/lane", new=True,
                      sleep=lambda _s: None, clock=_clock())
@@ -310,28 +320,29 @@ def test_new_does_not_confirm_from_a_binding_that_predates_the_send(R, tmp_path)
     assert cmux.sent()[0][-1].count("--session") == 0
 
 
-def test_new_confirms_when_the_binding_CHANGES(R, tmp_path):
-    """The transition that IS proof: a different id resolves to a real transcript."""
-    stale = tmp_path / "old.jsonl"
-    stale.write_text("{}\n")
-    fresh_f = tmp_path / "new.jsonl"
-    fresh_f.write_text("{}\n")
-    ls = ScriptLS(resolve_seq=["old", "new", "new"], files={"old": str(stale), "new": str(fresh_f)})
-    obs = R.relaunch("ws-1", ls=ls, runner=FakeCmux(), pi=sys.executable, cwd="/tmp/lane", new=True,
-                     sleep=lambda _s: None, clock=_clock())
-    assert obs["confirmed"] is True, obs
-    assert obs["sid"] == "new"
-
-
-def test_new_confirms_when_the_SAME_id_gets_a_transcript(R, tmp_path):
-    """The arm's motivating case: the recorded id had NO file (a stale resume target). The same id
-    resolving to a file that did not exist at the baseline is a real appearance."""
-    fresh_f = tmp_path / "old.jsonl"
-    ls = ScriptLS(resolve_seq=["old", "old"], files={})
-    cmux = FakeCmux(on_send=lambda: (fresh_f.write_text("{}\n"), ls._files.__setitem__("old", str(fresh_f))))
+def test_new_confirms_when_a_transcript_APPEARS(R):
+    """The REACHABLE proof for a fresh session (review round 4, P2): nothing in this fleet SETS a
+    resume binding for a pi started by typing into a shell, so the only evidence that cannot be faked
+    by a stale binding is a `*.jsonl` in the lane cwd's session directory that was not there before
+    the send."""
+    ls = FakeLS(transcript=None, session=None)
+    cmux = FakeCmux(on_send=lambda: open(
+        os.path.join(ls.SD, ls.mangled("/tmp/lane"), "2026-new.jsonl"), "w").write("{}\n"))
+    os.makedirs(os.path.join(ls.SD, ls.mangled("/tmp/lane")), exist_ok=True)
     obs = R.relaunch("ws-1", ls=ls, runner=cmux, pi=sys.executable, cwd="/tmp/lane", new=True,
                      sleep=lambda _s: None, clock=_clock())
     assert obs["confirmed"] is True, obs
+    assert "appeared" in obs["reason"], obs
+
+
+def test_new_does_not_confirm_when_no_transcript_appears(R):
+    """The mirror: no file, no confirmation — UNCONFIRMED (exit 4), never a silent OK."""
+    ls = FakeLS(transcript=None, session=None)
+    os.makedirs(os.path.join(ls.SD, ls.mangled("/tmp/lane")), exist_ok=True)
+    obs = R.relaunch("ws-1", ls=ls, runner=FakeCmux(), pi=sys.executable, cwd="/tmp/lane", new=True,
+                     sleep=lambda _s: None, clock=_clock())
+    assert obs["confirmed"] is False, obs
+    assert obs["sent"] is True
 
 
 def test_dry_run_sends_nothing_and_prints_the_line(R, tmp_path):
@@ -447,7 +458,12 @@ def test_beat_remedy_names_a_script_that_exists():
     assert "ORCHESTRATION-BOARD \u00a772" not in beat, (
         "the heartbeat still credits the relaunch mechanism to a board doc that is on no box (§72)")
     for rel in named:
-        assert os.path.exists(os.path.join(_REPO, rel)), "the beat names a nonexistent script: %s" % rel
+        p = os.path.join(_REPO, rel)
+        assert os.path.exists(p), "the beat names a nonexistent script: %s" % rel
+        # ⛔ `exists` cannot tell "present" from "runnable", and every instruction names a BARE PATH
+        # (review round 4, P1: the tool shipped 100644 and the first command an operator runs after
+        # reading the beat was `Permission denied` — which puts `respawn-pane` back within reach).
+        assert os.access(p, os.X_OK), "the beat prescribes a bare path that is not executable: %s" % rel
 
 
 def test_safe_send_remedy_is_reachable():
