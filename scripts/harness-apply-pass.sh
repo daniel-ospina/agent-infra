@@ -1667,8 +1667,24 @@ if [ "$FARM_CHECK_ON" = "1" ]; then
                 # (`…; RAW output published verba`) and a 223-char dest left ONLY the path — the record
                 # then stated no diagnosis at all. The arm sentence is what a reader must never lose;
                 # the farm path it names is ALSO in the artifact's own `dest=` header.
-                REC_REMEDY="$FARM_REMEDY"
-                finish 0 24 "farm: DRIFT — $FARM_ROW_SENTENCE; $FARM_DEST is NOT the code $REF ships (with the instrument's own remedy — a stale copy, a layout move and an unsourced file do NOT all have the same fix)" ;;
+                # ⛔ NEVER PROMISE A REMEDY SOMEONE COULD NOT SEND (review round 14, measured). The
+                # sentence said "with the instrument's own remedy" UNCONDITIONALLY while
+                # `REC_REMEDY="$FARM_REMEDY"` is empty whenever the instrument printed no `Next:` block
+                # (a mis-worded farmed copy, or one that died after its rows) — and `write_record` then
+                # emitted `remedy=none`, i.e. a refusal that names a defect and leaves nobody an action,
+                # the very class the `remedy=` field exists to remove. Without a forwarded block the
+                # field says so and names the manual route.
+                # ⛔ AND THE CLAUSE IS NOT REPEATED IN `detail=` (review round 14, measured). It used to
+                # sit after `$FARM_DEST`, i.e. at the very end of a 240-byte field whose tail is what
+                # gets cut — measured: 279 bytes, cut at 241, the clause truncated mid-word, on a
+                # fixture whose farm path alone is 60 chars. The remedy is `remedy=`'s job, and that
+                # field is never truncated (it is bounded by construction, not by `cut`).
+                if [ -n "$FARM_REMEDY" ]; then
+                    REC_REMEDY="$FARM_REMEDY"
+                else
+                    REC_REMEDY="the instrument printed no 'Next:' remedy — read farm_rows= (or this run's excerpt) and re-run check-farm-drift.sh by hand"
+                fi
+                finish 0 24 "farm: DRIFT — $FARM_ROW_SENTENCE; $FARM_DEST is NOT the code $REF ships" ;;
             *)
                 REC_ACTION=farm-unknown
                 # ⛔ BUT WHAT IT DID PRINT IS STILL PUBLISHED (review round 13, reproduced). The

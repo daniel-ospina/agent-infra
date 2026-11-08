@@ -2026,6 +2026,19 @@ assert_contains "$(grep '^farm_n=' <<<"$REC24AH")" "farm_n=unparsed" \
     "T24 control: the count is UNPARSED, not 0, and not the farm-matched meaning"
 assert_absent "$(grep '^detail=' <<<"$REC24AH")" "published verbatim" \
     "T24 control: and detail= never says output was published when none was printed"
+# ⛔ AND `remedy=` IS NEVER `none` ON A REFUSAL (review round 14, measured: the record promised "with
+# the instrument's own remedy" while emitting `remedy=none`, because this stub prints no `Next:` block).
+# A refusal that names a defect and leaves nobody an action is the class the `remedy=` field exists for.
+assert_absent "$(grep '^remedy=' <<<"$REC24AH")" "remedy=none" \
+    "T24 control: a drift refusal never records remedy=none — this one names the manual fallback"
+assert_contains "$(grep '^remedy=' <<<"$REC24AH")" "no 'Next:' remedy" \
+    "T24 control: and it says the instrument sent none, rather than inventing one"
+# ⛔ AND `detail=` DOES NOT REPEAT THE REMEDY (review round 14, measured). The clause sat at the very
+# end of a 240-byte field whose tail is what gets cut — 279 bytes, cut at 241, truncated mid-word — so
+# the remedy lives in `remedy=` only (untruncated by construction) and `detail=` stops at the ship
+# clause. Mutant that reds this row: append the clause after `$FARM_DEST` again.
+assert_absent "$(grep '^detail=' <<<"$REC24AH")" "with the instrument's own remedy" \
+    "T24 control: and detail= does not repeat the remedy at the end of a bounded field"
 
 # ── T26: the materialiser is TOLD which cell home to pin into (agent-infra#3593) ─────────────────
 # MEASURED on the `cmux` cell, 2026-11-06: this pass resolves CELL_HOME from $HOME (pass:195) and the

@@ -174,7 +174,7 @@ that path holds pass B's. The write is atomic (a reader never sees half a list, 
 removes another's file), but it is **not per-run**, and the header is what you can decide with:
 
 - the header's `ref=` and `dest=` are the **ref name and farm path this record's `detail=` quotes** —
-  `detail=` reads `farm: DRIFT — <the arm sentence>; <dest> is NOT the code <ref> ships (…)`, so the
+  `detail=` reads `farm: DRIFT — <the arm sentence>; <dest> is NOT the code <ref> ships`, so the
   pair must appear there verbatim, after the arm sentence (they are the same two variables; the record
   has NO `dest=` field of its own, and the record's `ref=` is the RESOLVED SHORT SHA, a different value
   on purpose — do not compare those). The ARM SENTENCE leads because `detail=` is bounded and what
@@ -226,7 +226,11 @@ with a `NO GRADE` header, `farm_n=not-graded` still says no grade was produced, 
 
 `remedy=` carries the instrument's own `Next:` block on a drift refusal — the one actionable text it
 prints, which is per class ("re-run the farm", "declare it LOCAL, delete, or retire it", "a deploy
-cannot fix this") — so the record never names a defect and leaves nobody an action.
+cannot fix this") — so the record never names a defect and leaves nobody an action. A checker that
+printed no `Next:` block (a mis-worded farmed copy, or one that died after its rows) makes `remedy=`
+say exactly that and name the manual route (`read farm_rows= … and re-run check-farm-drift.sh`), and
+`detail=` carries no remedy clause at all (it sat at the end of the bounded field and was cut
+mid-word) — `remedy=` is the only place the action appears, and it is never truncated.
 
 `farm_rows=unwritable` means the rows write failed **while the record write still succeeded** — the
 drift is still red, `farm_n` still carries the count it had (or `unparsed` when the extraction was
