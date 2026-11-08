@@ -265,10 +265,17 @@ because every other test on this arm fires only on something it can positively r
 each named in the journal as an unclassifiable summary or row
 (with a `remedy=` pointing at the checker's vocabulary, not at the farm): a pipe-free line carrying two
 of the three label words with no parsable total, and a per-file row whose trailing token is neither benign
-(`verdict`, `ok`, `LOCAL (declared)`, `SYMLINK (graded via its target)`) nor a class this pass knows. One
+(`verdict`, `ok`, `LOCAL (declared)`, `SYMLINK (graded via its target)`) nor a class this pass knows —
+scanned on any row of **two or more fields** and for **any verdict-shaped token**, because a vocabulary
+that drifts by a suffix (`drift_v2`, `NOT-LANDED2`) or a report that prints two-field rows is exactly the
+class this check exists for. One
 label word in prose is NOT a summary — a healthy copy that mentions a `stale` entry while matching still
 records a proven match. A checker that exits 0 printing **nothing** is refused too — the instrument
-always prints a summary, so a silent exit produced no evidence and is not a match. ⛔ **And output being
+prints a summary on every graded run, so a silent exit produced no evidence and is not a match. One
+documented flag breaks that on purpose: **`--quiet` suppresses the `OK —` summary** (it is a
+`log_line`; the DRIFT summary is `say_err` and survives), so a seam that runs the instrument quiet
+cannot certify a match at all — the refusal names the flag in its `remedy=`, because the operator IS
+pointing at the instrument and telling them to point harder would not fix it. ⛔ **And output being
 non-empty is not a report either:** a match is PROVEN by the instrument's own `OK —` line, so an `rc=0`
 whose output carries **no verdict** — the `bash inner "$@" 2>&1 | tee -a log` wrapper whose `inner` is
 missing, where `tee` supplies the 0 and the only output is bash's error line — is `farm-unknown`, never
@@ -510,7 +517,7 @@ checkout can use the documented hatch. The same interaction is recorded for
 
 ## Tests
 
-`scripts/harness-apply-timer.test.sh` — 584 assertions, run by the
+`scripts/harness-apply-timer.test.sh` — 590 assertions, run by the
 `harness-apply-timer` shard of `run-bash-shards.sh`:
 
 | | |

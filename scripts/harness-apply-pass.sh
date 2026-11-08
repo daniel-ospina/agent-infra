@@ -1623,8 +1623,15 @@ if [ "$FARM_CHECK_ON" = "1" ]; then
                          if (l ~ /unsourced/) n++
                          if (n >= 2) { print "summary"; exit } }')"
         fi
+        # ⛔ AND THE ROW SCAN MUST COVER EVERY ROW SHAPE (review round 33, measured: `NF >= 4` skipped a
+        # two-field row entirely, and a token with a digit or an underscore (`drift_v2`, `NOT-LANDED2`) fell
+        # outside the alphabetic class, so a report this pass could not read still certified a match with
+        # every name durable nowhere — the exact class round 32 closed one shape over). Two fields is the
+        # minimum that can carry a verdict token, and the token class admits word characters; a token that
+        # is not even shaped like a verdict (a timing `3.2s`, a timestamp) is left alone so a wrapper's
+        # informational line cannot refuse a proven match.
         [ -n "$FARM_UNC0" ] || FARM_UNC0="$(printf '%s\n' "$FARM_OUT" | awk -F'|' '
-            NF >= 4 {
+            NF >= 2 {
                 v = $NF
                 gsub(/^[[:space:]]+|[[:space:]]+$/, "", v)
                 if (v == "verdict" || v == "ok") next
@@ -1635,7 +1642,7 @@ if [ "$FARM_CHECK_ON" = "1" ]; then
                 # `LOCAL (declared)` and `SYMLINK (graded via its target)` fell through WITHOUT the
                 # skip — the allow-list entries for them could be deleted with the suite green. The
                 # regex now admits their shape, so the entries are what spares them.)
-                if (v ~ /^[A-Za-z][A-Za-z ()-]*$/) { print v; exit }
+                if (v ~ /^[A-Za-z][A-Za-z0-9_ ()-]*$/) { print v; exit }
             }')"
 
         # ⛔ AND A SILENT rc=0 IS NOT A MATCH (review round 24). The instrument always prints a summary,
@@ -1673,8 +1680,8 @@ if [ "$FARM_CHECK_ON" = "1" ]; then
                         publish_farm_rows "$FARM_OUT" "n=unparsed (NO GRADE — the checker exited 0 without a verdict line, so nothing it printed can certify a match; this is its output verbatim, not a grade; farm_n=not-graded)"
                         REC_FARM_NROWS=not-graded
                     fi
-                    REC_REMEDY="the checker exited 0 without printing the instrument's 'OK —' line — point HARNESS_APPLY_FARM_CHECKER at check-farm-drift.sh itself (a wrapper or a broken copy that prints no verdict cannot certify a match), then re-run"
-                    log_line "farm: UNKNOWN — the checker exited 0 but printed NO verdict line (neither 'OK —' nor 'DRIFT —'), so nothing it printed can certify a match"
+                    REC_REMEDY="the checker exited 0 without printing the instrument's 'OK —' line — point HARNESS_APPLY_FARM_CHECKER at check-farm-drift.sh itself and run it WITHOUT --quiet (a wrapper, a broken copy, or the instrument's own --quiet, which suppresses the OK summary, cannot certify a match), then re-run"
+                    log_line "farm: UNKNOWN — the checker exited 0 but printed NO verdict line (neither 'OK —' nor 'DRIFT —'), so nothing it printed can certify a match (the instrument's own --quiet suppresses the OK summary)"
                     finish 0 24 "farm: UNKNOWN (check-farm-drift rc=0) — no readable grade (see farm_rows=), so a status of 0 is not a match for $FARM_DEST against $REF: the checker printed no verdict line at all"
                 fi
                 if [ "$FARM_NROWS0" -gt 0 ] || [ -n "$FARM_VERDICT0" ] || { [ -n "$FARM_EXPECT0" ] && [ "$FARM_EXPECT0" -gt 0 ]; } || [ -n "$FARM_UNC0" ]; then
