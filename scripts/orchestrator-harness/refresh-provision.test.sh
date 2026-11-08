@@ -92,6 +92,14 @@
 #        interpolation, not a production byte count, because a killed shim may flush nothing;
 #   (g10) the CREDENTIAL-LOOKUP timeout arm carries one too — the arm whose own `fix:` line names a
 #        hung credential helper, so the dropped stderr was exactly the diagnosis it recommends.
+#   (g11)/(g12) EVERY interpolating arm places `evidence=` LAST, checked in the SOURCE across all of
+#        them with a pinned floor, plus a per-arm row for the `nothing is stored` arm;
+#   (g13) the `gh is not on PATH` arm names its OWN cause — driven by extracting the shipped
+#        `gh_probe_env` and running it in a bash whose PATH holds no `gh`, the one environment a seeded
+#        sandbox cannot produce (deleting that arm's clause left the suite green before this row);
+#   (g14) a capture that fell back to the `/dev/null` sentinel is named UNAVAILABLE, never
+#        `no stderr written` — driven BOTH as a unit (the extracted `gh_probe_evidence`) and through the
+#        whole pass with an unwritable `TMPDIR`, so the sentinel is proven reachable in production.
 #   ⛔ The stub feeds the SHIM's string, not `gh-core-floor`: this call cannot receive a floor line
 #   (`gh-limit.py`'s `reaches_api()` is False for the meter), and a fixture asserting one would grade
 #   the label against evidence production cannot emit (#3701 review, P2). ALL THREE captured notes are
@@ -1301,6 +1309,74 @@ ck "(g11) every one of them places evidence= LAST (after it: $(printf '%s' "$GEV
 GSTORE_LINE="$(grep -F 'nothing is stored for the host gh is configured for' "$REFRESH" | head -1)"
 ck "(g12) the 'nothing is stored' arm interpolates evidence= LAST" \
    "$(case "$GSTORE_LINE" in *'evidence=$(gh_probe_evidence "$prc")"') echo 0 ;; *) echo 1 ;; esac)"
+
+# ⛔ (g13) THE `gh IS NOT ON PATH` ARM NAMES ITS OWN CAUSE (#3701 review round 23, P2). This arm had NO
+# row at all: `rp`/`rpc` always prepend a seeded `$dir/bin` carrying a `gh` stub, so `command -v gh`
+# succeeded in every sandbox, the arm was never entered, and deleting its `GH_PROBE_CAUSE=` assignment
+# left the suite at 187/0 — while the record degraded to the `NO CLAUSE RECORDED …` fallback, i.e. the
+# pointer-shaped outcome this whole change exists to delete, on the arm whose own log line says a cell
+# "could only MERGE (#1736)". Same class as (g12), one arm over — and (g11)'s sweep correctly does not
+# cover it (that arm carries no `evidence=` slot), which is exactly why it needs a row of its own.
+# The row drives the SHIPPED function body (EXTRACTED, not re-implemented) inside a bash whose PATH holds
+# no `gh` at all — the one environment a seeded sandbox cannot produce. No repo run, so it is hermetic.
+GNOPATH_FN="$T/gh-probe-env.fn"
+awk '/^gh_probe_env\(\)/{f=1} f{print} f&&/^}$/{exit}' "$REFRESH" > "$GNOPATH_FN"
+BASH_ABS="$(command -v bash)"
+mkdir -p "$T/no-gh-path"
+if [ -s "$GNOPATH_FN" ] && grep -q '^gh_probe_env()' "$GNOPATH_FN" && [ -n "$BASH_ABS" ]; then
+  GN_OUT="$(env -u GH_TOKEN -u GITHUB_TOKEN PATH="$T/no-gh-path" "$BASH_ABS" -c '
+    EXIT_NOT_PROVISIONABLE=3
+    . "$1" || exit 99
+    gh_probe_env >/dev/null 2>&1
+    printf "%s\n%s\n" "$?" "$GH_PROBE_CAUSE"
+  ' _ "$GNOPATH_FN" 2>&1)"
+  GN_RC="$(printf '%s\n' "$GN_OUT" | sed -n 1p)"
+  GN_CAUSE="$(printf '%s\n' "$GN_OUT" | sed -n 2p)"
+  ck "(g13) a box with no gh on PATH still refuses as NOT PROVISIONABLE (rc=${GN_RC:-none})" \
+     "$([ "$GN_RC" = 3 ]; echo $?)"
+  ck "(g13) …and the clause NAMES the precondition rather than falling to NO CLAUSE RECORDED" \
+     "$(case "$GN_CAUSE" in *'gh is not on PATH'*) echo 0 ;; *) echo 1 ;; esac)"
+else
+  bad "(g13) the gh_probe_env arm could not be extracted from $REFRESH (or bash was not resolvable) — the arm's clause is UNPINNED"
+fi
+
+# ⛔ (g14) A CAPTURE THAT FELL BACK TO `/dev/null` IS "UNAVAILABLE", NOT "no stderr written" (#3701
+# review round 23, P2). `gh_probe_bounded` sets `GH_PROBE_ERR=/dev/null` when `mktemp` fails, and
+# `[ -s /dev/null ]` is FALSE BY CONSTRUCTION — so before this row the clause said `no stderr written`
+# about a capture that never existed. That is a positive claim about the PRODUCER, and it is false: the
+# refusal wrote its stderr into the device node and it was discarded. The difference is the whole point
+# of a clause that claims only what its arm establishes.
+# The row drives the shipped `gh_probe_evidence` (extracted) with the sentinel, then the SAME function
+# with a real capture — the pair is what makes the branch discriminating rather than always-on.
+GEV_FN="$T/gh-probe-evidence.fn"
+awk '/^gh_probe_evidence\(\)/{f=1} f{print} f&&/^}$/{exit}' "$REFRESH" > "$GEV_FN"
+if [ -s "$GEV_FN" ] && grep -q '^gh_probe_evidence()' "$GEV_FN" && [ -n "$BASH_ABS" ]; then
+  GDEV_OUT="$(GH_PROBE_ERR=/dev/null "$BASH_ABS" -c '. "$1"; gh_probe_evidence 75' _ "$GEV_FN" 2>&1)"
+  printf 'gh: HTTP 403: API rate limit exceeded\n' > "$T/gev-capture"
+  GCONV_OUT="$(GH_PROBE_ERR="$T/gev-capture" "$BASH_ABS" -c '. "$1"; gh_probe_evidence 1' _ "$GEV_FN" 2>&1)"
+  ck "(g14) a /dev/null capture is named UNAVAILABLE (got: ${GDEV_OUT:0:40}…)" \
+     "$(case "$GDEV_OUT" in *'UNAVAILABLE'*) echo 0 ;; *) echo 1 ;; esac)"
+  ck "(g14) …and does NOT claim the refusal wrote no stderr" \
+     "$(case "$GDEV_OUT" in *'no stderr written'*) echo 1 ;; *) echo 0 ;; esac)"
+  ck "(g14) …and still carries the rc it was handed" \
+     "$(case "$GDEV_OUT" in *'rc=75'*) echo 0 ;; *) echo 1 ;; esac)"
+  ck "(g14) …while a REAL capture still quotes its line, so the branch discriminates (control)" \
+     "$(case "$GCONV_OUT" in *'HTTP 403'*) case "$GCONV_OUT" in *'UNAVAILABLE'*) echo 1 ;; *) echo 0 ;; esac ;; *) echo 1 ;; esac)"
+  # ⛔ AND THE SENTINEL IS REACHABLE IN PRODUCTION, not only by extraction. An unwritable `TMPDIR` makes
+  # `gh_probe_bounded`'s `mktemp` fail, which is the exact path that sets the sentinel — so this arm
+  # drives the WHOLE pass and reads the clause out of the real record. Without it the three rows above
+  # would be a unit test of a state production could never enter.
+  mk_case gh_capture_unavailable
+  mk_gh_budget_stub "$D" 75 "$SHIM_CAPTURE"
+  rp "$D" "" TMPDIR="$D/no-such-tmpdir-on-purpose"
+  GCU_WHY="$(rec why)"
+  ck "(g14) an unwritable TMPDIR reaches the sentinel in the REAL record (rc=$RC)" \
+     "$(case "$GCU_WHY" in *'stderr capture UNAVAILABLE'*) echo 0 ;; *) echo 1 ;; esac)"
+  ck "(g14) …and the record does not claim a silent producer on that path" \
+     "$(case "$GCU_WHY" in *'no stderr written'*) echo 1 ;; *) echo 0 ;; esac)"
+else
+  bad "(g14) gh_probe_evidence could not be extracted from $REFRESH — the /dev/null sentinel is UNPINNED"
+fi
 
 # ── (g8) THE EVIDENCE TAKE IS BOUNDED (#3701 round 4, P2) ─────────────────────────────────────────
 # ⛔ `GH_PROBE_CAUSE_MAX` is the ONLY bound on the stderr take, and NOTHING exercised it: deleting the

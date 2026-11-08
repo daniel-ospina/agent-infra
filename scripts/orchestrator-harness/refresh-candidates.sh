@@ -972,6 +972,17 @@ GH_PROBE_CAUSE=""
 GH_PROBE_CAUSE_MAX=320
 gh_probe_evidence() {  # <rc> — the measured answer, one line, or a named non-answer
   local rc="${1:-?}" line
+  # ⛔ THE `/dev/null` SENTINEL IS "CAPTURE UNAVAILABLE", NOT "NOTHING WAS WRITTEN" (#3701 review round 23,
+  # P2). `gh_probe_bounded` falls back to this sentinel when `mktemp` fails, and `[ -s /dev/null ]` is
+  # FALSE BY CONSTRUCTION — so without this branch the clause below would say `no stderr written` about a
+  # capture that never existed. stderr WAS written (into the device node) and then discarded, which is a
+  # statement about THIS BOX, not about the producer: the refusal's own words are simply unavailable. The
+  # difference matters because `no stderr written` is a positive claim about the refusal, and it is the
+  # claim an operator would reason from — the exact over-claim this file's scoping contract forbids.
+  if [ "${GH_PROBE_ERR:-}" = /dev/null ]; then
+    printf 'rc=%s, stderr capture UNAVAILABLE (mktemp failed, so the capture fell back to /dev/null and the refusal wrote there and was discarded — nothing about what it said is knowable here)' "$rc"
+    return 0
+  fi
   line="$( [ -s "${GH_PROBE_ERR:-/dev/null}" ] && awk 'NF{print; exit}' "$GH_PROBE_ERR" 2>/dev/null )"
   # An EMPTY stderr is NOT "nothing to say": the call failed and wrote no reason, and the rc is then
   # the whole of the evidence. Say that, instead of rendering an empty parenthetical.
