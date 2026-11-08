@@ -179,7 +179,14 @@ export interface ProgressDriver {
 export interface Exemption {
   /** Exact declared identifier to exempt. */
   symbol: string;
-  /** Why it is not a stall/liveness bound. REQUIRED, and must be substantive. */
+  /**
+   * The substantive reason this identifier is carved out. One of two admissible
+   * kinds: it is NOT a stall/liveness bound (a measurement, a retention floor),
+   * or it IS one whose declaration ARITY no single registry row can express — in
+   * which case the rationale must also name where the VALUE is pinned, since an
+   * exemption removes the declaration from the gate and nothing else. REQUIRED,
+   * and must be substantive.
+   */
   rationale: string;
   /** Who owns the decision. */
   owner: string;

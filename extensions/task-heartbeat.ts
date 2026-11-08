@@ -15,7 +15,12 @@
  *   [task-heartbeat] tool_start nonce=<n> <id> <name>   — tool_execution_start
  *   [task-heartbeat] tool_end nonce=<n> <id>            — tool_execution_end
  *   [task-heartbeat] turn_start nonce=<n> <n>           — turn_start
- *   [task-heartbeat] turn_end nonce=<n> <n>             — turn_end
+ *   [task-heartbeat] turn_end nonce=<n> <n> [content=<0|1>] — turn_end
+ *       `content` is #1208's proof that the turn produced something: it is
+ *       emitted only when `hasTurnContent` saw tool results or a non-whitespace
+ *       message. Omitted by an older emitter, which the parser reads as
+ *       content-bearing (the pre-#1208 reading), so version skew degrades to
+ *       yesterday's behaviour instead of inventing a false silence.
  *   [task-heartbeat] tick nonce=<n> tools=<n> turn=<0|1> stream_age_ms=<n>
  *                       tool_age_max_ms=<n> tool_updates=<0|1>
  *                       cpu_ms=<n> cpu_stall_ms=<n> cpu_advanced=<0|1>
@@ -196,8 +201,15 @@ export function formatTurnStart(nonce: string, turnIndex: number): string {
   return `${HEARTBEAT_MARKER_PREFIX} turn_start nonce=${nonce} ${turnIndex}`;
 }
 
-export function formatTurnEnd(nonce: string, turnIndex: number): string {
-  return `${HEARTBEAT_MARKER_PREFIX} turn_end nonce=${nonce} ${turnIndex}`;
+export function formatTurnEnd(nonce: string, turnIndex: number, hasContent?: boolean): string {
+  // #1208: `turn_end` fires for an EMPTY turn too (the E shape — a child cycling
+  // turn_start/turn_end producing nothing), so the marker alone cannot prove the
+  // child ever said anything. `content` is that proof, and it is the SAME
+  // `hasTurnContent` the #5195 progress clock uses — emitted as `0`/`1` rather
+  // than omitted so the parent can tell "empty turn" from "old emitter" (an
+  // absent flag is read as content-bearing, preserving pre-#1208 behaviour).
+  const flag = hasContent === undefined ? "" : ` content=${hasContent ? 1 : 0}`;
+  return `${HEARTBEAT_MARKER_PREFIX} turn_end nonce=${nonce} ${turnIndex}${flag}`;
 }
 
 export interface TickFields {
@@ -1622,8 +1634,9 @@ export default function (pi: ExtensionAPI) {
     // a unit of work. An empty turn (`toolResults` empty, no content) is NOT —
     // that is the empty-turn-loop shape (E), and marking it as progress is
     // precisely how it forged its way past every bound.
-    if (hasTurnContent(event)) progressSinceTick = true;
-    emit(formatTurnEnd(nonce, event.turnIndex));
+    const turnProducedContent = hasTurnContent(event);
+    if (turnProducedContent) progressSinceTick = true;
+    emit(formatTurnEnd(nonce, event.turnIndex, turnProducedContent));
   });
 
   pi.on("tool_execution_start", async (event) => {

@@ -12,7 +12,7 @@
  * node_modules/typebox. Created by CI setup or manually.
  */
 
-import { stripHtml, getPerplexityKey, augmentPath, PATH_EXTRA_DIRS, getPiInvocation, getSubAgentPath, resolveProviderModel, loadModelRegistry, getModelsJsonPath, getExitGraceMs, DEFAULT_EXIT_GRACE_MS, armExitWatchdog, getExitCompleteGraceMs, DEFAULT_EXIT_COMPLETE_GRACE_MS, armCompletionWatchdog, composeTaskResult, getFallbackModel, DEFAULT_FALLBACK_MODEL, connectionErrorDetected, shouldFallback, resolveProviderBaseUrl, HEARTBEAT_MARKER_PREFIX, HEARTBEAT_INTERVAL_MIN_MS, HEARTBEAT_INTERVAL_MAX_MS, DEFAULT_HEARTBEAT_INTERVAL_MS, DEFAULT_STREAM_STALL_MS, DEFAULT_TOOL_STALL_MS, DEFAULT_FIRST_MESSAGE_MS, clampHeartbeatIntervalMs, getHeartbeatIntervalMs, getStreamStallMs, getToolStallMs, getFirstMessageMs, createHeartbeatState, parseHeartbeatLine, flushHeartbeatResidue, flushHeartbeatLineBuf, ingestHeartbeatChunk, heartbeatKillDecision, HEARTBEAT_LINE_BUF_MAX, HEARTBEAT_TRACE_MAX, getTaskMaxDispatchMs, getTaskHardCapMs, DEFAULT_HARD_CAP_MS, loadScaledBound, getFirstOutputTimeoutMs, getSystemLoad, setLoad1Override, getLoad1, getCutGapMs, getEffectiveCutGapMs, getCpuStallMs, DEFAULT_CPU_STALL_MS, DEFAULT_PROGRESS_AGE_MS, getProgressAgeMs, classifyTaskExit, getTaskBackstopMs, DEFAULT_BACKSTOP_MARGIN_MS, DEFAULT_TASK_MODEL, renderRepoStateLine, renderMachineStateLine, countPiProcs, countPiInPsOutput, formatLoad1, probeSystemLoad, resolveTaskCwd, taskCwdRefusal, spawnSubAgent, resolveStreamStallMs, streamStallInertWarning, inFlightProgress, DEFAULT_SESSION_CEILING_MULT, resolveSessionCeiling, isDispatchSaturated, saturationNotice, dispatchSaturationRefusal, probeDispatchSaturation, probePiProcs, setPiProcsOverride } from "./index.js";
+import { stripHtml, getPerplexityKey, augmentPath, PATH_EXTRA_DIRS, getPiInvocation, getSubAgentPath, resolveProviderModel, loadModelRegistry, getModelsJsonPath, getExitGraceMs, DEFAULT_EXIT_GRACE_MS, armExitWatchdog, getExitCompleteGraceMs, DEFAULT_EXIT_COMPLETE_GRACE_MS, armCompletionWatchdog, composeTaskResult, getFallbackModel, DEFAULT_FALLBACK_MODEL, connectionErrorDetected, shouldFallback, resolveProviderBaseUrl, HEARTBEAT_MARKER_PREFIX, HEARTBEAT_INTERVAL_MIN_MS, HEARTBEAT_INTERVAL_MAX_MS, DEFAULT_HEARTBEAT_INTERVAL_MS, DEFAULT_STREAM_STALL_MS, DEFAULT_TOOL_STALL_MS, DEFAULT_FIRST_MESSAGE_MS, clampHeartbeatIntervalMs, getHeartbeatIntervalMs, getStreamStallMs, getToolStallMs, getFirstMessageMs, createHeartbeatState, parseHeartbeatLine, flushHeartbeatResidue, flushHeartbeatLineBuf, ingestHeartbeatChunk, heartbeatKillDecision, HEARTBEAT_LINE_BUF_MAX, HEARTBEAT_TRACE_MAX, getTaskMaxDispatchMs, getTaskHardCapMs, DEFAULT_HARD_CAP_MS, loadScaledBound, getFirstOutputTimeoutMs, getSystemLoad, setLoad1Override, getLoad1, getCutGapMs, getEffectiveCutGapMs, getCpuStallMs, DEFAULT_CPU_STALL_MS, DEFAULT_PROGRESS_AGE_MS, getProgressAgeMs, classifyTaskExit, getTaskBackstopMs, DEFAULT_BACKSTOP_MARGIN_MS, DEFAULT_TASK_MODEL, renderRepoStateLine, renderMachineStateLine, countPiProcs, countPiInPsOutput, formatLoad1, probeSystemLoad, resolveTaskCwd, taskCwdRefusal, spawnSubAgent, resolveStreamStallMs, streamStallInertWarning, inFlightProgress, DEFAULT_SESSION_CEILING_MULT, resolveSessionCeiling, isDispatchSaturated, saturationNotice, dispatchSaturationRefusal, probeDispatchSaturation, probePiProcs, setPiProcsOverride, classifyChildLiveness, childMessagesSent, TASK_LIVENESS_DETAIL_KEYS, stampLivenessDefaults, childLivenessFor, exhaustionStatusFor, classifyBackgroundOutcome } from "./index.js";
 import { dispatchUnkeyedSet } from "../shared/provider-failover.js";
 import { asyncRepoState } from "../repo-freshness.js";
 import builtinTools from "./index.js";
@@ -7415,8 +7415,8 @@ test("#1071: the task tool schema exposes `cwd` and threads it to every leg (sou
   // #1030 appended the dispatch's inactivity bound as the 8th argument, so
   // these pins name the whole argument list (that is their point: the leg
   // carries the target cwd — and now the bound resolved for the same dispatch).
-  ok(source.includes("spawnSubAgent(leg.model, leg.provider, subAgentEnv, buildArgs(leg), signal, recordCtx(attempt), params.cwd, dispatchStreamStallMs)"), "primary + failover-hop legs pass params.cwd");
-  ok(source.includes("spawnSubAgent(fallbackModel, fallbackProvider, subAgentEnv, buildFbArgs(), signal, recordCtx(attempt), params.cwd, dispatchStreamStallMs)"), "the provider-fallback leg passes params.cwd");
+  ok(source.includes("spawnSubAgent(leg.model, leg.provider, subAgentEnv, buildArgs(leg), signal, recordCtx(attempt), params.cwd, dispatchStreamStallMs, livenessObserver)"), "primary + failover-hop legs pass params.cwd (and the #1208 liveness observer)");
+  ok(source.includes("spawnSubAgent(fallbackModel, fallbackProvider, subAgentEnv, buildFbArgs(), signal, recordCtx(attempt), params.cwd, dispatchStreamStallMs, livenessObserver)"), "the provider-fallback leg passes params.cwd (and the #1208 liveness observer)");
   ok(!/\{\s*\n\s*cwd: process\.cwd\(\),/.test(source), "no spawn options block pins the parent cwd (scoped to the block — a whole-file negative match is over-broad and its failure message cannot name a real spawn site)");
 });
 
@@ -7572,6 +7572,20 @@ test("#1508 — the registered tool_result handler turns a failed child into isE
   // like every other member — the docstring's "exercises every member" claim is only true if this
   // row exists. Its shape is the pre-spawn payload: no exitCode, no isError, `retryable:false`.
   deepEqual(h({ toolName: "task", isError: false, details: { status: "fleet-saturated", retryable: false, piProcs: 88, cores: 10, ceiling: 80 } }), { isError: true }, "a refused dispatch (fleet saturated) is a failure");
+  // #1208: the slow-start death. Same rule as #2242 above — a member of the set is only
+  // "exercised" if this test has a row for it. This is also the ONLY route by which the flag
+  // actually reaches the caller: `finalizeExecutedToolCall` rebuilds the result from a field
+  // allow-list, so an `isError` on the object `execute()` returned is dropped (see the hook's own
+  // note) — the `tool_result` handler is what makes the model see the error.
+  //
+  // ⛔ THE ROW CARRIES `exitCode: 0` (review round 6, P3). It used to omit `exitCode` entirely,
+  // which is a shape production does not emit: the death payload is composed as
+  // `doResolve({..., details: { model, provider, exitCode: code }}, ...)` (index.ts:4722), and the
+  // PR's own E2E death IS exit 0. Without it the row never exercised the interaction that matters —
+  // that a `status` in FAILED_TASK_STATUS wins over a zero exit — so a refactor adding an early
+  // `exitCode === 0 → return undefined` would have left this row AND the `{ exitCode: 0 } → undefined`
+  // row green while production stopped flagging the silent death.
+  deepEqual(h({ toolName: "task", isError: false, details: { status: "died-before-first-message", childMessagesSent: 0, childState: "died-before-first-message", childExited: true, exitCode: 0 } }), { isError: true }, "a child that died before its first message is a FAILURE, never an empty success — even at exit 0");
   deepEqual(h({ toolName: "task", isError: false, details: { failoverHopSpawnFailed: true } }), { isError: true }, "a hop leg that never produced a result is a failure");
   equal(h({ toolName: "task", isError: false, details: { exitCode: null } }), undefined, "a null exit is a settle (composeTaskResult's own okExit contract)");
   equal(h({ toolName: "task", isError: false, details: { exitCode: 0 } }), undefined, "exit 0 is a settle");
@@ -8524,6 +8538,20 @@ section("#1662 — tool surface");
       refusal: null,
     });
     ok(String(unpersisted.content[0].text).includes("NOT persisted"), "a failed persist is surfaced in the text");
+    // #1208 (review round 5, P3): a handle with NO pid must not claim a live child. `proc.pid` is
+    // `undefined` synchronously when the exec itself fails (measured: `spawn('/definitely/not/here')`
+    // → `pid: undefined`, then an `ENOENT` error event), and no pre-spawn refusal covers that arm —
+    // those are checked before `spawn()` is reached. Unconditionally stamping `running` there gave
+    // `{ childPid: null, childState: "running", childExited: false }`: the self-contradiction this
+    // field set exists to prevent, claiming a child that was never created.
+    equal((unpersisted.details as any).childPid, null, "no pid");
+    equal((unpersisted.details as any).childState, "never-started", "no pid ⇒ nothing ran; `running` would be a false liveness claim");
+    equal((unpersisted.details as any).childExited, null, "and `null` — not `false`, which would assert it was seen alive");
+    // The positive control: a real pid IS still rendered as a running child, so the fix cannot
+    // pass by degrading every handle to `never-started`.
+    equal((res.details as any).childState, "running", "a handle with a real pid still names the live child");
+    equal((res.details as any).childExited, false, "…and it has not exited");
+    equal((res.details as any).childMessagesSent, null, "…with no message count knowable at dispatch");
     // The module must never reintroduce the camelCase field on the dispatch result.
     equal(/\breviewGate\s*:/.test(source), false, "no camelCase reviewGate field remains in the module");
     ok(source.includes("review_gate: handle.review_gate"), "the dispatch details read the handle's review_gate");
@@ -8790,6 +8818,487 @@ testAsync("#2242 WIRING: a saturated box + the opt-in REFUSES the dispatch with 
     source.includes("if (saturationRefusal"),
     "the refusal branch is gated on the decision function, which is a no-op without the opt-in",
   );
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// #1208 — child liveness is a FIELD on the task result, not prose
+// ═══════════════════════════════════════════════════════════════════════
+//
+// The defect: a child that died before its first message produced a result
+// structurally identical to "the child ran and had nothing to say", so a
+// parent reading an empty payload could read it as an answer. These tests pin
+// the replacement: every settled result carries `childPid` / `childState` /
+// `childExited` / `childMessagesSent`, and the zero-message death is a
+// DISTINCT result with `isError: true` — never an empty success.
+
+section("#1208: childMessagesSent — `0` is evidence, `null` is ignorance, and they never collapse");
+
+test("#1208: no emitter at all → null (unknown), NEVER 0", () => {
+  // The distinction the whole issue turns on. A box with TASK_HEARTBEAT_DISABLE=1
+  // (or a child too old to emit) reports nothing — which must not be read as
+  // "the child sent zero messages", or every dispatch there is classified dead.
+  const st = createHeartbeatState();
+  equal(childMessagesSent(st), null, "an emitter-less dispatch answers null, not a confident zero");
+  equal(childMessagesSent({ ...st, sawReady: true }), 0, "the emitter's `ready` is the evidence that makes 0 mean something");
+  equal(childMessagesSent({ ...st, markerCount: 3 }), 0, "any parsed marker is evidence too");
+});
+
+test("#1208: turn_end counts completed turns; the floor needs CONTENT evidence, not just stream activity", () => {
+  const st = createHeartbeatState();
+  ok(parseHeartbeatLine("[task-heartbeat] ready nonce=nn", st, 1000), "ready parses");
+  equal(childMessagesSent(st), 0, "a child that has only initialized has sent nothing");
+  ok(parseHeartbeatLine("[task-heartbeat] turn_start nonce=nn 1", st, 1001), "turn_start parses");
+  equal(childMessagesSent(st), 0, "turn_START is not a message — it fires before the provider call");
+  ok(parseHeartbeatLine("[task-heartbeat] turn_end nonce=nn 1", st, 1002), "turn_end parses");
+  equal(st.messagesSent, 1, "a completed turn increments the monotonic count");
+  ok(parseHeartbeatLine("[task-heartbeat] turn_start nonce=nn 2", st, 1003), "second turn starts");
+  ok(parseHeartbeatLine("[task-heartbeat] turn_end nonce=nn 2", st, 1004), "second turn ends");
+  equal(childMessagesSent(st), 2, "two completed turns → 2");
+
+  // THE FLOOR, content-bearing basis (review round 4, P1). `progress=1` is the child's
+  // content/tool evidence for the interval; with it, a turn that streamed and died before
+  // its turn_end still floors at 1 — never a false "sent nothing".
+  const streaming = createHeartbeatState();
+  parseHeartbeatLine("[task-heartbeat] ready nonce=nn", streaming, 1000);
+  parseHeartbeatLine("[task-heartbeat] turn_start nonce=nn 1", streaming, 1001);
+  parseHeartbeatLine("[task-heartbeat] tick nonce=nn tools=0 turn=1 stream_age_ms=0 tool_age_max_ms=0 saw_msg=1 saw_tool=0 progress=1", streaming, 1002);
+  equal(streaming.messagesSent, 0, "no turn_end yet — the raw count stays 0");
+  equal(childMessagesSent(streaming), 1, "content evidence observed, so the count floors at 1 — never a false 'sent nothing'");
+
+  // ⛔ The OLD floor was content-blind: `everSawMsg` is latched by a bare assistant
+  // `message_start` and by ANY `message_update` delta (task-heartbeat.ts says so itself), so a
+  // whitespace/retry-chatter loop answered "1 message sent" and read as a quiet success — the
+  // exact false PASS #1208 exists to close. Stream activity with NO content and NO tool is not
+  // evidence of a message; once a tick has been observed, the honest answer is zero.
+  const chatter = createHeartbeatState();
+  parseHeartbeatLine("[task-heartbeat] ready nonce=nn", chatter, 1000);
+  parseHeartbeatLine("[task-heartbeat] turn_start nonce=nn 1", chatter, 1001);
+  parseHeartbeatLine("[task-heartbeat] tick nonce=nn tools=0 turn=1 stream_age_ms=0 tool_age_max_ms=0 saw_msg=1 saw_tool=0 progress=0", chatter, 1002);
+  equal(chatter.turnSawMessage, true, "the content-blind latch DID fire (this is the shape that used to pass)");
+  equal(
+    childMessagesSent(chatter),
+    null,
+    "…but stream chatter is not a message: mid-turn and content-unprovable answers UNKNOWN, never '1 message sent'",
+  );
+
+  // The E shape is PROVABLE zero: every turn completed, none carried content. Nothing is mid-flight,
+  // so the parent is not guessing.
+  const emptyLoop = createHeartbeatState();
+  parseHeartbeatLine("[task-heartbeat] ready nonce=nn", emptyLoop, 1000);
+  parseHeartbeatLine("[task-heartbeat] turn_start nonce=nn 1", emptyLoop, 1001);
+  parseHeartbeatLine("[task-heartbeat] tick nonce=nn tools=0 turn=1 stream_age_ms=0 tool_age_max_ms=0 saw_msg=1 saw_tool=0 progress=0", emptyLoop, 1002);
+  parseHeartbeatLine("[task-heartbeat] turn_end nonce=nn 1 content=0", emptyLoop, 1003);
+  equal(emptyLoop.turnsCompleted, 1, "one completed turn");
+  equal(childMessagesSent(emptyLoop), 0, "completed empty turns are PROOF of zero — the E-shape loop is the death class");
+
+  // And with no stream activity at all the child never spoke: `ready`-then-exit is the headline
+  // slow-start death, so the answer is 0, not unknown.
+  const noTick = createHeartbeatState();
+  parseHeartbeatLine("[task-heartbeat] ready nonce=nn", noTick, 1000);
+  parseHeartbeatLine("[task-heartbeat] turn_start nonce=nn 1", noTick, 1001);
+  equal(childMessagesSent(noTick), 0, "never streamed anything → it never spoke → the zero-message death");
+});
+
+section("#1208: classifyChildLiveness — the death-before-first-message state is reachable one way only");
+
+test("#1208: the truth table", () => {
+  equal(classifyChildLiveness({ killed: true, hasStdout: true, messagesSent: 2 }), "killed", "a kill outranks everything else");
+  equal(classifyChildLiveness({ killed: true, hasStdout: false, messagesSent: 0 }), "killed", "a killed zero-message child is still a kill");
+  equal(classifyChildLiveness({ killed: false, hasStdout: true, messagesSent: 1 }), "completed", "a readable result is an answer");
+  equal(classifyChildLiveness({ killed: false, hasStdout: false, messagesSent: 1 }), "exited-no-result", "it ran, produced nothing readable");
+  equal(classifyChildLiveness({ killed: false, hasStdout: false, messagesSent: null }), "exited-no-result", "UNKNOWN is not 'sent nothing'");
+  equal(classifyChildLiveness({ killed: false, hasStdout: false, messagesSent: 0 }), "died-before-first-message", "positive zero-message evidence IS the slow-start death");
+});
+
+section("#1208 E2E: the REAL spawnSubAgent funnel stamps liveness on every settled result");
+
+// Two scripted children that differ ONLY in whether a turn completed. Same exit
+// code, same empty stdout — so any difference in the result is the liveness
+// field, which is exactly the discrimination the issue says was impossible.
+const FAKE_PI_LIVENESS_SHIM = `#!/bin/sh
+NONCE="${'${TASK_HEARTBEAT_NONCE:-}'}"
+echo "[task-heartbeat] ready nonce=$NONCE" >&2
+echo "[task-heartbeat] turn_start nonce=$NONCE 1" >&2
+if [ "$FAKE_PI_TURNS" = "1" ]; then
+  echo "[task-heartbeat] turn_end nonce=$NONCE 1" >&2
+fi
+exit 0
+`;
+
+testAsync("#1208 (E2E): a child that exits 0 with zero completed messages is a DISTINCT, non-zero result", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "t1208-liveness-"));
+  const shimDir = join(dir, "bin");
+  mkdirSync(shimDir, { recursive: true });
+  writeFileSync(join(shimDir, "pi"), FAKE_PI_LIVENESS_SHIM, { mode: 0o755 });
+  const savedPath = process.env.PATH ?? "";
+  const savedArgv1 = process.argv[1];
+  const savedLedger = process.env.DISPATCH_LEDGER;
+  try {
+    process.env.PATH = `${shimDir}:${savedPath}`;
+    process.argv[1] = undefined as unknown as string;
+    // Hermetic: never append outcome rows to the operator's ledger (#783 gate).
+    process.env.DISPATCH_LEDGER = "0";
+    const baseEnv: Record<string, string | undefined> = {
+      ...process.env,
+      PATH: process.env.PATH,
+      TASK_HEARTBEAT: "1",
+      DISPATCH_LEDGER: "0",
+    };
+    const args = ["-p", "--no-session", "do nothing"];
+
+    // THE DEATH: ready + turn_start, never a turn_end, exit 0, no stdout.
+    const died = await spawnSubAgent("deepseek-v4-flash", "deepseek", { ...baseEnv, FAKE_PI_TURNS: "0" }, args);
+    ok(died, "the dispatch settles with a result (it is not silently dropped)");
+    const dd = (died as any).details as Record<string, unknown>;
+    equal(dd.childMessagesSent, 0, "zero completed messages, as positive evidence");
+    equal(dd.childState, "died-before-first-message", "the distinct state the issue asks for");
+    equal(dd.status, "died-before-first-message", "…carried as a machine `status` a consumer can branch on");
+    equal(dd.isError, true, "…and as a failure in the load-order-independent form");
+    equal((died as any).isError, true, "…and flagged on the returned payload (the #1508 hook is what delivers it to the model — pi drops the field here)");
+    equal(typeof dd.childPid, "number", "the pid is on the result (ask 1) — no `ps` guessing required");
+    equal(dd.childExited, true, "the child is known to be gone");
+    ok(TASK_LIVENESS_DETAIL_KEYS.every((k) => k in dd), `all of ${TASK_LIVENESS_DETAIL_KEYS.join(",")} are present`);
+    ok(String((died as any).content?.[0]?.text).includes("died before its first message"), "the text SAYS it, so the model cannot read it as an empty answer");
+    // ⛔ THE COMPOSED TEXT SURVIVES THE REWRITE (review of this PR, P2 — the first cut REPLACED it).
+    // On this arm stdout is empty, so the composer's text IS the child's cleaned stderr, and the arm
+    // carries no details.stderr: replacing it deleted the only diagnostic the parent had.
+    ok(String((died as any).content?.[0]?.text).includes("Sub-agent exited with code 0"), "the composer's own text is still there, below the header");
+    ok(
+      String((died as any).content?.[0]?.text).indexOf("died before its first message") <
+        String((died as any).content?.[0]?.text).indexOf("Sub-agent exited with code 0"),
+      "the death header comes FIRST and the diagnostic follows",
+    );
+
+    // THE NEGATIVE TWIN: same exit, same empty stdout — one completed turn.
+    // It must NOT be an error and must NOT claim the child died silently.
+    const quiet = await spawnSubAgent("deepseek-v4-flash", "deepseek", { ...baseEnv, FAKE_PI_TURNS: "1" }, args);
+    ok(quiet, "the twin settles");
+    const qd = (quiet as any).details as Record<string, unknown>;
+    equal(qd.childMessagesSent, 1, "one completed turn is counted");
+    equal(qd.childState, "exited-no-result", "a child that DID send a message is not the death state");
+    equal(qd.isError, undefined, "a quiet-but-alive child is not turned into a failure");
+    equal((quiet as any).isError, undefined, "…and not into a tool-level error either");
+    ok(TASK_LIVENESS_DETAIL_KEYS.every((k) => k in qd), "the field set is present on the twin too — every result, not one arm");
+  } finally {
+    process.env.PATH = savedPath;
+    process.argv[1] = savedArgv1;
+    if (savedLedger === undefined) delete process.env.DISPATCH_LEDGER;
+    else process.env.DISPATCH_LEDGER = savedLedger;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+testAsync("#1208 (E2E): the rewrite keeps the child's STDERR diagnostic — and the failover layer can still see it", async () => {
+  // The fail-SILENT half of the reviewer's P2: `connectionErrorDetected` reads `details.stderr`
+  // and falls back to the CONTENT, so a rewrite that discarded the composed text would make
+  // #152's fallback and #476's markerless-hop branch blind to every startup death that carried a
+  // connection-error signature. This drives the real path with a child that emits nothing but a
+  // ready marker and a connection error on stderr, then exits 1.
+  const dir = mkdtempSync(join(tmpdir(), "t1208-diag-"));
+  const shimDir = join(dir, "bin");
+  mkdirSync(shimDir, { recursive: true });
+  writeFileSync(
+    join(shimDir, "pi"),
+    `#!/bin/sh\necho "[task-heartbeat] ready nonce=${'${TASK_HEARTBEAT_NONCE:-}'}" >&2\necho "Error: Connection error." >&2\nexit 1\n`,
+    { mode: 0o755 },
+  );
+  const savedPath = process.env.PATH ?? "";
+  const savedArgv1 = process.argv[1];
+  const savedLedger = process.env.DISPATCH_LEDGER;
+  try {
+    process.env.PATH = `${shimDir}:${savedPath}`;
+    process.argv[1] = undefined as unknown as string;
+    process.env.DISPATCH_LEDGER = "0";
+    const env: Record<string, string | undefined> = {
+      ...process.env,
+      PATH: process.env.PATH,
+      TASK_HEARTBEAT: "1",
+      DISPATCH_LEDGER: "0",
+    };
+    const res = await spawnSubAgent("deepseek-v4-flash", "deepseek", env, ["-p", "--no-session", "boom"]);
+    ok(res, "settles");
+    const text = String((res as any).content?.[0]?.text ?? "");
+    equal((res as any).details?.childState, "died-before-first-message", "the death state still fires (ready, no turn_end)");
+    ok(text.includes("Connection error"), `the child's own stderr survives the rewrite (got: ${text.slice(0, 200)})`);
+    equal(
+      connectionErrorDetected(res as any),
+      true,
+      "the failover detectors can still see the signature — this is the regression the rewrite caused",
+    );
+  } finally {
+    process.env.PATH = savedPath;
+    process.argv[1] = savedArgv1;
+    if (savedLedger === undefined) delete process.env.DISPATCH_LEDGER;
+    else process.env.DISPATCH_LEDGER = savedLedger;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("#1208: a KILLED zero-output settle keeps its measurement (review round 2, P2)", () => {
+  // The `undefined` settles (silence-threshold, cut-with-no-output, hard cap, backstop) carry no
+  // payload, so the first cut lost the pid and the zero-message evidence and the terminal result
+  // said `never-started` — "no child existed" — for a child that ran and was killed. That is a false
+  // claim in the direction that tells a parent to fix its arguments instead of re-dispatching.
+  const st = createHeartbeatState();
+  parseHeartbeatLine("[task-heartbeat] ready nonce=nn", st, 1000);
+  parseHeartbeatLine("[task-heartbeat] turn_start nonce=nn 1", st, 1001);
+  // ⛔ THE PRODUCTION INPUT for a zero-output kill: NO payload at all (`details: {}`, killed absent)
+  // plus the settle REASON naming the kill. An earlier revision of this test fed `{killed:true}`
+  // with no payload — a combination `doResolve` never produces — which green-lit the mislabel the
+  // round-3 review found (the kills that carry no payload were measured as "died on its own").
+  const snap = childLivenessFor({ details: {}, hbState: st, pid: 4242, stdout: "", exited: false, killedByReason: true });
+  equal(snap.childPid, 4242, "a killed child still has a pid — the measurement is not discarded");
+  equal(snap.childState, "killed", "the kill is named, not `never-started` and not `died on its own`");
+  equal(
+    childLivenessFor({ details: {}, hbState: st, pid: 4242, stdout: "", exited: true, killedByReason: false }).childState,
+    "died-before-first-message",
+    "the NEGATIVE twin: the same silent child that was NOT killed died on its own — the two are separable",
+  );
+  equal(snap.childMessagesSent, 0, "and the zero-message evidence survives (ask 2)");
+  equal(snap.childExited, false, "the kill was just signalled: the OS has not reported the child gone");
+  // ⛔ A KILL IS NOT A STARTUP DEATH (review round 4, P2). Naming a parent-cut child
+  // `died-before-first-message` put two contradictory claims in one payload (`status` = "it died on
+  // its own, re-dispatch it" vs `childState` = "the parent cut it, raise the bound") and
+  // `classifyBackgroundOutcome` persists `reason: d.status`, so the durable record accused the wrong
+  // party. The kill stays `failed`; `childState` names the cause.
+  equal(exhaustionStatusFor(snap), "failed", "a WATCHDOG KILL is not an autonomous startup death");
+  // The status DOES name the death when the child died on its own with zero content-bearing turns.
+  // ⛔ THIS ROW IS A UNIT-LEVEL GUARD, NOT PRODUCTION COVERAGE (review round 8, P3). The input is
+  // constructed directly because no production path can hand this function a zero-message snapshot
+  // that is NOT `killed`: every payload-less settle is a watchdog kill, and every settle that carried
+  // a payload returns `success` from `retry()`, so the exhaustion arm is never entered for it. The
+  // branch is kept fail-closed (see its docstring) — it is not evidence that the arm names a death.
+  equal(
+    exhaustionStatusFor({ ...snap, childState: "died-before-first-message" }),
+    "died-before-first-message",
+    "the fail-closed guard still names a non-killed zero-message death if one ever reaches it",
+  );
+  // ⛔ A DEATH CLAIM NEEDS THE PROCESS END CONFIRMED (review round 8, P3). The `onAbort`-after-
+  // `session_end` arm resolves a payload while the child is STILL ALIVE (it exists precisely so the
+  // lingering child is still reaped) and passes no `reason`, so no kill clause fires. Before this fix
+  // an E-shape child on that arm produced `{childState: "died-before-first-message", childExited:
+  // false}` — a death claim the same payload's `childExited` denies (constraint 6), and a parent told
+  // "it died during startup" about a child that had just completed its session.
+  const emptyTurnLoop = createHeartbeatState();
+  parseHeartbeatLine("[task-heartbeat] ready nonce=nn", emptyTurnLoop, 1000);
+  parseHeartbeatLine("[task-heartbeat] turn_start nonce=nn 1", emptyTurnLoop, 1001);
+  parseHeartbeatLine("[task-heartbeat] tick nonce=nn tools=0 turn=1 stream_age_ms=0 tool_age_max_ms=0 saw_msg=1 saw_tool=0 progress=0", emptyTurnLoop, 1002);
+  parseHeartbeatLine("[task-heartbeat] turn_end nonce=nn 1 content=0", emptyTurnLoop, 1003);
+  const liveAfterAbort = childLivenessFor({ details: { exitCode: null }, hbState: emptyTurnLoop, pid: 4242, stdout: "", exited: false, killedByReason: false });
+  equal(liveAfterAbort.childState, "running", "a child the OS has not reported gone is NOT dead — and NOT `exited-no-result` either (round 9, P2: that state says it ran and ended)");
+  equal(liveAfterAbort.childExited, false, "and the payload is self-consistent: no terminal claim beside `childExited: false`");
+  equal(liveAfterAbort.childMessagesSent, 0, "the zero-message measurement is still reported, so nothing is hidden");
+  // The EXIT-shaped half of the same gate: an UNKNOWN message count (no emitter) is `exited-no-result`
+  // once the child is gone, and `running` while it is not — so the fix cannot pass by gating only the
+  // death vocabulary.
+  const unkState = createHeartbeatState();
+  parseHeartbeatLine("[task-heartbeat] ready nonce=nn", unkState, 1000);
+  parseHeartbeatLine("[task-heartbeat] message_start nonce=nn", unkState, 1001);
+  parseHeartbeatLine("[task-heartbeat] turn_start nonce=nn 1", unkState, 1002);
+  parseHeartbeatLine("[task-heartbeat] tick nonce=nn tools=0 turn=1 stream_age_ms=0 tool_age_max_ms=0 saw_msg=1 saw_tool=0 progress=0", unkState, 1003);
+  equal(
+    childLivenessFor({ details: { exitCode: null }, hbState: unkState, pid: 4242, stdout: "", exited: false, killedByReason: false }).childState,
+    "running",
+    "an unconfirmed end is `running` whatever the message count says — the exit claim is gated too",
+  );
+  // The positive control: the SAME child once the process end IS confirmed is the slow-start death —
+  // this is the route the E2E empty-turn shim takes through `close`, so the fix cannot pass by
+  // degrading every zero-message child to `exited-no-result`.
+  const reapedEmptyTurnLoop = childLivenessFor({ details: { exitCode: 0 }, hbState: emptyTurnLoop, pid: 4242, stdout: "", exited: true, killedByReason: false });
+  equal(reapedEmptyTurnLoop.childState, "died-before-first-message", "once the OS confirms the end, the zero-content E shape IS the death");
+  equal(reapedEmptyTurnLoop.childExited, true, "and `childExited` now agrees with it");
+  // …and the exit-shaped twin once reaped keeps `exited-no-result`: the gate must not swallow the
+  // state it replaced on the arm where the end IS confirmed.
+  equal(
+    childLivenessFor({ details: { exitCode: 0 }, hbState: unkState, pid: 4242, stdout: "", exited: true, killedByReason: false }).childState,
+    "exited-no-result",
+    "a reaped child with an unprovable message count is still `exited-no-result`",
+  );
+  // `null` is not `0`: with no emitter, "no attempt produced a message" is unprovable.
+  equal(exhaustionStatusFor({ ...snap, childMessagesSent: null }), "failed", "unknown stays failed — a false death claim is the worse error");
+  equal(exhaustionStatusFor(null), "failed", "no measurement at all (a pre-spawn refusal) stays failed");
+  // The spawn-error arm (exec never ran) is `never-started`, not "it ran and produced nothing".
+  const err = childLivenessFor({ details: { isError: true }, hbState: createHeartbeatState(), pid: 77, stdout: "", exited: false });
+  equal(err.childState, "never-started", "a failed exec never created a child");
+  equal(err.childExited, null, "`null` — not `false`: no child was ever seen alive");
+});
+
+test("#1208: the retry-exhaustion arm is WIRED to the measured snapshot (source pin)", () => {
+  // The decision above is pure; this pins that the arm actually consumes it and carries the
+  // measurement, because the arm is only reachable through three real watchdog kills and no test
+  // in this suite pays for that.
+  ok(source.includes("status: exhaustionStatusFor(snap)"), "the exhaustion status comes from the measurement");
+  ok(source.includes("onLiveness: (snap) => { lastLiveness = snap; }"), "every leg reports its settle to the caller");
+  ok(source.includes("killedByReason: opts?.reason !== undefined && !NON_KILL_SETTLE_REASONS.has(opts.reason)"), "a payload-less kill is named by its settle reason");
+  ok(source.includes("...(lastLiveness ?? {}), ...halt.details"), "the post-spawn halt carries the measurement");
+  ok(source.includes("breakerNeverSpawned ? {} : (lastLiveness ?? {})"), "the breaker arm carries it when a child actually ran");
+  ok(source.includes("dispatchStreamStallMs, livenessObserver)"), "and every spawnLeg passes the observer");
+  ok(source.includes("...(snap ?? {})"), "the measured fields ride the terminal result");
+});
+
+test("#1208: the field set is PRESENT on arms where no child ever existed — never-started, not absent", () => {
+  // The other half of the reviewer's P2: the exported contract says the keys are present on every
+  // `task` result, and the tool-level arms (pre-spawn refusals, provider halts, the retry
+  // exhaustion result) carried NONE. `null`/`never-started` is a different CLAIM from a measured
+  // value — and a consumer that branches on absence is reconstructing the signal again.
+  const stamped = stampLivenessDefaults({ model: "m", provider: "p", status: "invalid-cwd" });
+  equal(stamped.childState, "never-started", "no child existed, and the field says so");
+  equal(stamped.childPid, null, "there is no pid to guess");
+  equal(stamped.childExited, null, "`null` — not `false`: no child was ever seen alive either");
+  equal(stamped.childMessagesSent, null, "no message count is knowable without a child");
+  ok(TASK_LIVENESS_DETAIL_KEYS.every((k) => k in stamped), "all keys present");
+  // ONLY fills absent keys: a measured value must never be overwritten by the tool layer.
+  // The field set never contradicts itself: stdout is proof of a message, so it floors the count.
+  const withOut = childLivenessFor({ details: {}, hbState: createHeartbeatState(), pid: 11, stdout: "some answer\n", exited: true });
+  equal(withOut.childState, "completed", "stdout is a completion");
+  equal(withOut.childMessagesSent, 1, "and a completion cannot carry `messagesSent: 0` (round-4 P3)");
+  const measured = stampLivenessDefaults({ childPid: 4242, childState: "completed", childExited: true, childMessagesSent: 3 });
+  equal(measured.childPid, 4242, "a measured pid survives");
+  equal(measured.childState, "completed", "a measured state survives");
+  equal(measured.childMessagesSent, 3, "a measured count survives");
+  // The circuit-open PRE-SPAWN refusal's value set (review round 5, P3). The arm's details literal
+  // carries no liveness key (the spread is gated empty at `retries === 0`), so the tool-level stamp
+  // supplies all four. THIS is the invariant the scope guard's comment used to mis-state as
+  // "adds NO key at all": the keys are present, and their VALUE is the refusal's.
+  const breakerRefusal = stampLivenessDefaults({ model: "m", provider: "p", status: "circuit_open", retries: 0 });
+  equal(breakerRefusal.childState, "never-started", "a never-spawned breaker is a refusal, not a measured snapshot");
+  equal(breakerRefusal.childPid, null, "no pid was ever assigned");
+  equal(breakerRefusal.childExited, null, "nothing was seen alive, so `null` — never `false`");
+  equal(breakerRefusal.childMessagesSent, null, "no count is knowable without a child");
+});
+
+// The durable run record's `reason` (review round 9, P3). `classifyBackgroundOutcome` persisted the
+// DURABLE cause of a background lane's death, and the arm order — a FAILED_TASK_STATUS before
+// `isError` — is a fix this PR made. It had no test of any kind: it was unexported and no suite drove
+// a background run to a death settle, so reverting the order left every suite green while a lane that
+// RAN AND DIED was durably recorded as `spawn-error` (which this module documents as "pi never
+// started"). Each row below fails if the order flips.
+test("#1208: a background lane that ran and died is recorded by STATUS, not as a spawn error", () => {
+  const died = classifyBackgroundOutcome({
+    content: [],
+    details: { status: "died-before-first-message", isError: true, exitCode: 0 },
+  });
+  equal(died.status, "failed", "a death settles the run as failed");
+  equal(died.reason, "died-before-first-message", "the DURABLE cause names the death — not `spawn-error`");
+  equal(died.exitCode, 0, "the measured exit code rides the record");
+  // The `isError` arm is still reachable and still its own answer: a payload with no terminal status
+  // (an exec that never ran) stays `spawn-error`, so the reorder cannot pass by deleting the arm.
+  const spawnErr = classifyBackgroundOutcome({ content: [], details: { isError: true } });
+  equal(spawnErr.status, "failed", "an exec failure is still a failure");
+  equal(spawnErr.reason, "spawn-error", "and it is still named as one");
+  const zero = classifyBackgroundOutcome(undefined);
+  equal(zero.reason, "zero-output", "a payload-less settle keeps its own reason");
+  // A kill outranks both — it is the parent's own action, not a death.
+  equal(
+    classifyBackgroundOutcome({ content: [], details: { killed: true, isError: true, status: "died-before-first-message" } }).reason,
+    "killed",
+    "a kill is recorded as a cut, never as a death the child chose",
+  );
+  const done = classifyBackgroundOutcome({ content: [], details: { exitCode: 0 } });
+  equal(done.status, "done", "a clean zero exit is a done run");
+});
+
+section("#1208: an EMPTY turn is not a message");
+
+// #5195's E shape: a child cycling turn_start/turn_end producing NOTHING. Counting
+// every `turn_end` reported "the child said something" for a child that said nothing,
+// classifying it `exited-no-result` (not an error) and leaving its empty payload
+// unflagged — the false-liveness direction this field exists to close.
+test("#1208: content=0 does not count, content=1 does, and a legacy flag-less marker still counts", () => {
+  const st = createHeartbeatState();
+  parseHeartbeatLine("[task-heartbeat] ready nonce=nn", st, 1000);
+  parseHeartbeatLine("[task-heartbeat] turn_start nonce=nn 1", st, 1001);
+  parseHeartbeatLine("[task-heartbeat] turn_end nonce=nn 1 content=0", st, 1002);
+  equal(st.messagesSent, 0, "an EMPTY turn is NOT a message — the E shape says nothing");
+  equal(childMessagesSent(st), 0, "…so an empty-turn loop is still the zero-message class");
+  parseHeartbeatLine("[task-heartbeat] turn_start nonce=nn 2", st, 1003);
+  parseHeartbeatLine("[task-heartbeat] turn_end nonce=nn 2 content=1", st, 1004);
+  equal(st.messagesSent, 1, "a content-bearing turn counts");
+  // Version skew: an OLDER child omits the flag entirely. Read as content-bearing (the
+  // pre-#1208 reading) so a mixed fleet degrades to yesterday's behaviour rather than
+  // classifying a working old child as dead.
+  parseHeartbeatLine("[task-heartbeat] turn_end nonce=nn 3", st, 1005);
+  equal(st.messagesSent, 2, "an absent flag is read as content-bearing — never a false silence");
+  // The child-side formatter emits the flag from the SAME `hasTurnContent` the #5195
+  // progress clock uses — one definition of "the turn produced something".
+  ok(childHb.formatTurnEnd("nn", 7, false).includes("content=0"), "formatTurnEnd(false) emits content=0");
+  ok(childHb.formatTurnEnd("nn", 7, true).includes("content=1"), "formatTurnEnd(true) emits content=1");
+  ok(!childHb.formatTurnEnd("nn", 7).includes("content="), "omitted ⇒ legacy shape (no flag), for old callers");
+});
+
+// The spawn-level consequence of the same defect: an EMPTY-TURN LOOP child (#5195 E)
+// completes turns that carry no content. Counting `turn_end` made it report "1 message
+// sent", classify `exited-no-result` and return NO error — so its empty payload read as
+// a quiet-but-finished child. With the flag it is the zero-message class: a distinct,
+// non-zero result.
+const FAKE_PI_EMPTY_TURN_SHIM = `#!/bin/sh
+NONCE="${'${TASK_HEARTBEAT_NONCE:-}'}"
+echo "[task-heartbeat] ready nonce=$NONCE" >&2
+echo "[task-heartbeat] turn_start nonce=$NONCE 1" >&2
+# The tick is what makes ZERO positive evidence: one interval was observed and it reported no
+# content and no tool. Without it the parent has observed nothing and must answer unknown.
+echo "[task-heartbeat] tick nonce=$NONCE tools=0 turn=1 stream_age_ms=0 tool_age_max_ms=0 saw_msg=1 saw_tool=0 progress=0" >&2
+echo "[task-heartbeat] turn_end nonce=$NONCE 1 content=0" >&2
+exit 0
+`;
+
+testAsync("#1208 (E2E): an EMPTY-TURN LOOP child is the zero-message death, not a quiet success", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "t1208-empty-turn-"));
+  const shimDir = join(dir, "bin");
+  mkdirSync(shimDir, { recursive: true });
+  writeFileSync(join(shimDir, "pi"), FAKE_PI_EMPTY_TURN_SHIM, { mode: 0o755 });
+  const savedPath = process.env.PATH ?? "";
+  const savedArgv1 = process.argv[1];
+  const savedLedger = process.env.DISPATCH_LEDGER;
+  try {
+    process.env.PATH = `${shimDir}:${savedPath}`;
+    process.argv[1] = undefined as unknown as string;
+    process.env.DISPATCH_LEDGER = "0";
+    const baseEnv: Record<string, string | undefined> = {
+      ...process.env,
+      PATH: process.env.PATH,
+      TASK_HEARTBEAT: "1",
+      DISPATCH_LEDGER: "0",
+    };
+    const looped = await spawnSubAgent("deepseek-v4-flash", "deepseek", baseEnv, ["-p", "--no-session", "spin"]);
+    ok(looped, "the dispatch settles");
+    const ld = (looped as any).details as Record<string, unknown>;
+    equal(ld.childMessagesSent, 0, "a completed turn with no content is NOT a message");
+    equal(ld.childState, "died-before-first-message", "so the empty-turn loop is the slow-start death class");
+    equal((looped as any).isError, true, "…and it stops a parent's default handling instead of reading as a quiet finish");
+    // ⛔ ORDERING, not substring absence (review round 6, P3). The previous assertion here was
+    // `!text.includes("exited with code 0\n")`, and it could NEVER fail: the composer text is
+    // `.join("\n").trim()`-ed before it is appended, so no composed sentence this arm can carry
+    // ever ends in a newline. Reverting the prepend back to a REPLACEMENT would leave
+    // `"Sub-agent exited with code 0"` — no trailing newline — and the assertion would still pass,
+    // so it did not test the property its message named. The property that IS the fix is that the
+    // header PRECEDES the composer text: present, and ahead of it.
+    const deathText = String((looped as any).content?.[0]?.text);
+    const headerAt = deathText.indexOf("died before its first message");
+    const composerAt = deathText.indexOf("Sub-agent exited with code 0");
+    ok(headerAt >= 0, "the death header is present in the text the parent reads");
+    // ⛔ NO ESCAPE HATCH (review round 7, P3). The first version of this line was
+    // `composerAt === -1 || headerAt < composerAt`, and that disjunct accepted EXACTLY the
+    // regression it exists to catch: a replacement (`text: header`) drops the composed sentence,
+    // so `composerAt === -1` and the predicate returned true. This child is exit 0 with empty
+    // stdout AND empty stderr, so its composer sentence is always
+    // `Sub-agent exited with code 0` — the composer MUST be present, and it must come after the
+    // header. Both halves are asserted, so neither a drop nor a reordering can pass.
+    ok(
+      composerAt >= 0 && headerAt < composerAt,
+      `the header PRECEDES the composer sentence — the composer text is kept BELOW it, never replaced by it (header@${headerAt}, composer@${composerAt})`,
+    );
+    ok(
+      String((looped as any).content?.[0]?.text).includes("no content-bearing turn"),
+      "the header states the MEASURED fact (no content-bearing turn), not a count the arm does not have",
+    );
+  } finally {
+    process.env.PATH = savedPath;
+    process.argv[1] = savedArgv1;
+    if (savedLedger === undefined) delete process.env.DISPATCH_LEDGER;
+    else process.env.DISPATCH_LEDGER = savedLedger;
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
   for (const t of asyncTests) await t();
