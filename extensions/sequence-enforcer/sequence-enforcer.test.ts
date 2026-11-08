@@ -911,6 +911,36 @@ await test("#1418 F1 (round 7): `git add` outside the unmerged set is refused, s
   } finally { _setConflictedProbeForTest(null); }
 });
 
+// #1418 review round 8, F1 — A DIRECTORY TARGET IS A PATHSPEC, NOT A PATH.
+// The round-7 bound compared STRINGS, so an unmerged path that is a DIRECTORY on
+// disk (a file/directory conflict) matched — and `git add <dir>` stages the whole
+// subtree, untracked files included. Measured on a real file/directory conflict:
+// `git add sub` staged `sub`, `sub/a.txt` and `sub~HEAD`, i.e. two files in no
+// unmerged stage. Combined with `git rebase --continue` (a commit) that lands
+// unreviewed work through a spelling the string bound cannot see.
+await test("#1418 F1 (round 8): a DIRECTORY target is refused — `git add <dir>` is a pathspec and stages the subtree", () => {
+  const base = mkdtempSync(join(tmpdir(), "ckpt-dirps-"));
+  const step = makeStep({ name: "check", gate: "checkpoint", token_phase: "implement" });
+  try {
+    const dir = join(base, "sub");
+    const file = join(base, "shared.txt");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "a.txt"), "untracked impl\n");
+    writeFileSync(file, "resolution\n");
+    _setTokenFileForTest(null);
+    // the unmerged set names the DIRECTORY path — exactly the file/directory shape
+    _setConflictedProbeForTest(() => [dir]);
+    const r = validateToolCall("bash", `git add ${dir}`, step, "gate");
+    ok(r.block, "`git add <dir>` is refused despite being in the unmerged set");
+    ok((r.reason || "").includes("DIRECTORY"), `the refusal names the pathspec bound: ${r.reason}`);
+    ok(validateToolCall("bash", `git add ${dir}/`, step, "gate").block, "a trailing slash does not launder it");
+    ok(validateToolCall("bash", `git rm ${dir}`, step, "gate").block, "`git rm <dir>` is refused too (git needs -r, which is blocked)");
+    // the honest, narrow command still works
+    _setConflictedProbeForTest(() => [file]);
+    ok(!validateToolCall("bash", `git add ${file}`, step, "gate").block, "a conflicted FILE is still stageable");
+  } finally { _setConflictedProbeForTest(null); _setTokenFileForTest(null); rmSync(base, { recursive: true, force: true }); }
+});
+
 await test("#1418 the remedy is NOT phase-gated (a git command carries no phase — the wrong-phase guard must not fire)", () => {
   const step = makeStep({ name: "check", gate: "checkpoint", token_phase: "implement" });
   const r = validateToolCall("bash", "git rebase origin/main", step, "gate");

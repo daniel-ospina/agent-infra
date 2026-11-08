@@ -1312,11 +1312,11 @@ export const CHECKPOINT_WHITESPACE_REJECT = /[^\S\u0020]|[\u200B-\u200D\u2060\u0
 //     origin/<any-branch>` reproduced the round-5 exploit against the real origin
 //     with no path trick at all: the fleet pushes hundreds of lane branches, and a
 //     branch carrying a rewritten checker became a minted token. The target is now
-//     the ref C4 actually measures — `<configured-remote>/<that remote's default
-//     branch>` (the checker hardcodes `origin/main` in its own pickaxe re-check,
-//     so this is derived from the verdict, not invented) — plus the three
-//     continuation flags. `FETCH_HEAD`, `refs/...` and arbitrary `<remote>/<branch>`
-//     are gone: a rebase onto a branch nobody reviewed is not a remedy.
+//     literally the ref C4 measures — `origin/main` (see CHECKER_BASE_REF, and the
+//     checker's own `rev-list --count HEAD..origin/main`) — plus the three
+//     continuation flags. `FETCH_HEAD`, `refs/...`, another branch of the same
+//     remote and another remote's `main` are gone: a rebase onto a ref C4 does not
+//     measure both fails to clear the verdict and is the forge itself.
 //   * `--autostash` is allowed on the rebase: C4/C3 prescribes `rebase` verbatim
 //     (`options=rebase`), and
 //     the three continuation flags are what finishes or unwinds a rebase that
@@ -1329,7 +1329,11 @@ export const CHECKPOINT_WHITESPACE_REJECT = /[^\S\u0020]|[\u200B-\u200D\u2060\u0
 //     mechanism the pre-commit framework uses for the same problem, git keeps
 //     the stash entry if the reapply conflicts, and it is a flag on the verb
 //     already prescribed rather than a new verb (`git commit`/`stash`/`checkout`
-//     stay blocked, so the remedy still cannot land or discard anything).
+//     stay blocked, so the remedy cannot land an ARBITRARY commit or move a ref
+//     arbitrarily — but be precise about what IS admitted: `git rebase origin/main`
+//     moves the branch ref to the base, and `git rebase --continue` CREATES the
+//     replayed commit. That is why `git add`/`git rm` are bounded to the unmerged
+//     set, and it is why the step cannot ADVANCE without a fresh CLEAR token).
 //   * `git add PATHS` — stages a conflict resolution before `--continue`.
 //     Index-only; `git commit` stays blocked — BUT `git rebase --continue` IS a
 //     commit, so `git add` is bounded to the UNMERGED set exactly like `git rm`
@@ -1504,9 +1508,15 @@ export function isCheckpointEscape(toolName: string, command: unknown): boolean 
   return CHECKPOINT_ESCAPE_RE.test(command) || CHECKPOINT_REMEDY_RE.test(command);
 }
 
-// #1418 (review F1): is a rebase IN PROGRESS in this checkout? This is what
-// makes the conflict-resolution step of the remedy reachable, and it is
-// deliberately a FILESYSTEM read (no subprocess on the tool_call hot path):
+// #1418 (review F1): is a rebase IN PROGRESS in this checkout? This is a
+// FILESYSTEM read (no subprocess) so the probe itself costs nothing — but it is
+// NOT true that the whole gate is subprocess-free: at a pending checkpoint the
+// write allowance calls `repoTopLevel`, `conflictedPaths` (`git ls-files -u`) and
+// (for a `git fetch` remedy) `git remote` (review round 8, F5 — this comment used
+// to imply otherwise, and the PR-body rationale for rejecting shape (a) leaned on
+// it). The real distinction from shape (a): shape (a) would need a staleness
+// subprocess on EVERY tool call, including every allowed one; this escape spawns
+// git only at a pending checkpoint, only for the admitted verbs.
 // git marks an unfinished rebase by leaving `rebase-merge/` or `rebase-apply/`
 // in the git dir, and removes it on `--continue`/`--abort`/completion.
 // A LINKED WORKTREE has a `.git` FILE (`gitdir: <path>`) rather than a
@@ -2585,15 +2595,30 @@ export function validateToolCall(
       // #1418 (round 7, F1): `git add` AND `git rm` are bounded to the UNMERGED SET.
       // `git rm` needed it because it deletes (round 4, F3); `git add` needs it
       // because **`git rebase --continue` is a commit** — so `git add .` followed by
-      // `--continue` stages and lands the lane's uncommitted implementation, the
-      // exact work this checkpoint holds back until the checker is CLEAR. Staging
-      // is only needed for a conflict resolution, and a conflicted path is unmerged.
+      // `--continue` stages and lands the lane's uncommitted implementation.
+      // ⛔ AND THE BOUND IS SEMANTIC, NOT LEXICAL (review round 8, F1): `git add`
+      // takes a PATHSPEC, so `git add <dir>` stages the whole subtree. With only the
+      // string comparison, an unmerged path that is a DIRECTORY on disk (a
+      // file/directory conflict) matched, and the two admitted commands
+      // `git add <dir>` + `git rebase --continue` landed every file under it —
+      // including untracked ones in no unmerged stage. Measured: `git add sub`
+      // staged `sub/a.txt` and `sub~HEAD`. A conflicted FILE is never a directory on
+      // disk, so refusing directory targets costs the remedy nothing; the
+      // file/directory class is resolved with `git rm`, and where that cannot
+      // express it, it is a declared residual (escalate).
       const pathTargets = toolName === "bash"
         ? (rebaseAddTargets(command) !== null ? { verb: "git add", paths: rebaseAddTargets(command)! }
           : rebaseRmTargets(command) !== null ? { verb: "git rm", paths: rebaseRmTargets(command)! }
           : null)
         : null;
       if (pathTargets) {
+        const dirTargets = pathTargets.paths.filter((t) => {
+          const st = lstatSync(t, { throwIfNoEntry: false });
+          return st !== undefined && st !== null && st.isDirectory();
+        });
+        if (dirTargets.length > 0) {
+          return { block: true, reason: `⛔ checkpoint gate — \`${pathTargets.verb}\` is admitted only for a conflicted FILE path; ${dirTargets.join(", ")} is a DIRECTORY on disk, so git reads it as a pathspec and stages the whole subtree (a file/directory conflict is resolved by \`git rm\` on the path, not by staging a tree)` };
+        }
         const unmerged = conflictedPaths();
         const stray = pathTargets.paths.filter((t) => !unmerged.includes(t));
         if (stray.length > 0) {
