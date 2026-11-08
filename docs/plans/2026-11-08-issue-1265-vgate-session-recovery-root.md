@@ -220,7 +220,7 @@ reader contract. Filing a roster pin (emit-site `event:` literals ⊆ `GateEvent
 - **R5** A consumer of `gate-events.jsonl` mis-reads the new names, or the changed `gate_recovery`
   payload (it now carries `root`) → **no production consumer PARSES this file**, so the only
   evidence obtainable is the inventory itself: `gateEventsFile()` has one production caller
-  (`appendJsonl`, `audit-log.ts:81`); `scripts/vgate.sh` `tail`s it for a human in `status()` and
+  (`appendJsonl`, `extensions/shared/audit-log.ts:98`); `scripts/vgate.sh` `tail`s it for a human in `status()` and
   selects nothing; the other references are in-repo TEST helpers that read the file
   (`extensions/shared/audit-log.test.ts` — path + row schema, no `event` filter;
   `extensions/verification-gate/index.e2e.test.ts`'s `readAuditLines()`;
