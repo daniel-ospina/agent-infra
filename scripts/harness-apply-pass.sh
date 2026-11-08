@@ -1542,7 +1542,15 @@ if [ "$FARM_CHECK_ON" = "1" ]; then
         # for — recorded `farm: ok` / `farm_rows=none` / `farm_n=0`. The instrument prints `OK — ` on a
         # match and `DRIFT — ` otherwise, so the verdict line ALONE is the contradiction; summing three
         # counts answers a narrower question than the one being asked.)
-        FARM_VERDICT0="$(printf '%s\n' "$FARM_OUT" | sed -n '/DRIFT — /{p;q;}')"
+        # ⛔ ANCHORED ON THE INSTRUMENT'S LINE SHAPE, NOT ON A BARE TOKEN (review round 26, measured).
+        # `grep 'OK — '` matched the token ANYWHERE, so a per-file row reading `OK — handmade-note.py`
+        # certified a match with the drifting file named durably nowhere — the very hazard this chain
+        # anchored away in `farm_sum_count` (`DRIFT-log.txt | …` read as the summary). Its mirror was
+        # worse: an unanchored `DRIFT — ` OVER-BLOCKED a legitimate match whose output merely contained
+        # the text. The instrument prints `check-farm-drift: OK — …` / `…: DRIFT — …` (PROG + ': '), and
+        # a per-file row always carries pipes, so `^[^|]*: ` separates the verdict from a row.
+        FARM_VERDICT0="$(printf '%s\n' "$FARM_OUT" | sed -n '/^[^|]*: DRIFT — /{p;q;}')"
+
         # ⛔ AND A SILENT rc=0 IS NOT A MATCH (review round 24). The instrument always prints a summary,
         # so a checker that exits 0 with NO output produced no evidence at all. ⛔ AND NEITHER IS AN rc=0
         # WHOSE OUTPUT CARRIES NO VERDICT (review round 25, measured): this check used to test only for
@@ -1556,7 +1564,7 @@ if [ "$FARM_CHECK_ON" = "1" ]; then
         # can read, and it fails CLOSED. This SUBSUMES the emptiness test (empty output carries no
         # verdict either), so the two are one condition rather than two that can drift apart.
         # Case-insensitive because the suite's clean stubs print `check-farm-drift: ok — 0 stale …`.
-        FARM_OK0="$(printf '%s\n' "$FARM_OUT" | grep -im1 'OK — ')"
+        FARM_OK0="$(printf '%s\n' "$FARM_OUT" | grep -Eim1 '^[^|]*: OK — ')"
         case "$FARM_RC" in
             0)
                 if [ -z "$FARM_OK0" ] && [ "$FARM_NROWS0" -eq 0 ] && [ -z "$FARM_VERDICT0" ]; then
@@ -1564,6 +1572,13 @@ if [ "$FARM_CHECK_ON" = "1" ]; then
                     # own sentence: "reports drift" is false here, and a reader sent looking for drift
                     # rows that were never printed is a second defect.
                     REC_ACTION=farm-unknown
+                    # ⛔ IT PUBLISHES, LIKE ITS SIBLING (review round 26, measured): this arm refused
+                    # without publishing, so a checker that printed two file names with a foreign
+                    # verdict word — and no verdict line — left both names durable NOWHERE, which is
+                    # the acceptance arm (tortoise#10114 arm 2) lost inside `action=farm-unknown`.
+                    # `publish_farm_rows`'s own doctrine: "no grade" never meant "nothing was reported".
+                    publish_farm_rows "$FARM_OUT" "n=unparsed (NO GRADE — the checker exited 0 without a verdict line, so nothing it printed can certify a match; this is its output verbatim, not a grade; farm_n=not-graded)"
+                    REC_FARM_NROWS=not-graded
                     REC_REMEDY="the checker exited 0 without printing the instrument's 'OK —' line — point HARNESS_APPLY_FARM_CHECKER at check-farm-drift.sh itself (a wrapper or a broken copy that prints no verdict cannot certify a match), then re-run"
                     log_line "farm: UNKNOWN — the checker exited 0 but printed NO verdict line (neither 'OK —' nor 'DRIFT —'), so nothing it printed can certify a match"
                     finish 0 24 "farm: UNKNOWN (check-farm-drift rc=0) — no readable grade (see farm_rows=), so a status of 0 is not a match for $FARM_DEST against $REF: the checker printed no verdict line at all"

@@ -252,11 +252,15 @@ missing, where `tee` supplies the 0 and the only output is bash's error line —
 `farm: ok`. Without that, `farm_rows=none` / `farm_n=0` would certify a farm that was never graded and
 `--print-status` would answer `status=ok` for it. A wrapper over a genuinely matching farm still passes
 (it prints the instrument's verdict), and prose/summary lines are never read as rows (the class token
-must END the line).
+must END the line). The verdict probes are anchored on the instrument's LINE shape (`<prog>: OK — `,
+`<prog>: DRIFT — `) rather than on the bare token, because a per-file ROW can carry either word —
+measured both ways: an unanchored `OK — ` certified a match over a report whose only "OK" was a filename,
+and an unanchored `DRIFT — ` refused a genuine match whose output merely mentioned the word.
 
-`farm_rows=<path>` is ALSO written on `action=farm-unknown` — on the arm where the instrument gives up
-(its own exit 2), and on the `rc=0`-contradicts-its-report arm above, which publishes the output with the
-same `NO GRADE` header. On the give-up arm, the
+`farm_rows=<path>` is ALSO written on `action=farm-unknown` — on all THREE producers: the arm where the
+instrument gives up (its own exit 2), the `rc=0`-contradicts-its-report arm, and the `rc=0`-with-no-verdict
+arm. All three publish under the same `NO GRADE` header, because a refusal that names nobody is the very
+gap this PR closes. On the give-up arm, the
 instrument prints its per-file rows BEFORE the exits that give up (`matched == 0`, a partly ungradeable
 declaration), so "no grade" never meant "nothing was reported": the file carries that output verbatim
 with a `NO GRADE` header, `farm_n=not-graded` still says no grade was produced, and `farm_rows=` stays
@@ -475,7 +479,7 @@ checkout can use the documented hatch. The same interaction is recorded for
 
 ## Tests
 
-`scripts/harness-apply-timer.test.sh` — 504 assertions, run by the
+`scripts/harness-apply-timer.test.sh` — 510 assertions, run by the
 `harness-apply-timer` shard of `run-bash-shards.sh`:
 
 | | |
@@ -496,7 +500,7 @@ checkout can use the documented hatch. The same interaction is recorded for
 | T13 | the cadence seam is validated (`abc`, `0`, `1441` refused); a value that does not divide the hour (7) is kept — the artifact states the cadence it keeps |
 | T14 | a **stale** record (including one dated in the FUTURE) is an alarm, a non-numeric staleness bound is refused, and no record at all is `never`, not success |
 | T24 | the **FARM** is graded against the ref: stale → **RED 24** naming the file, exit 3 (undeployable) is red too, a matching farm keeps the normal verdict, an **absent** farm is skipped by name while a **dangling** link reddens, an invalid seam value is refused *before* any move, and a checker living **inside** the farm it grades is refused rather than trusted |
-| T24 | the **rows artifact**'s own lifecycle: every reported row is written (header + all 20, including the last, which no excerpt can show), an **unwritable** artifact path is recorded as `unwritable` rather than silently dropped, a **clean** and a **not-graded** pass each LEAVE the previous list **with its rows intact** and say so in `farm_rows=` (presence is not the promise — `grep -c .` is asserted beside the planted line, so a pass that TRUNCATES the file reds, which a `[ -f ]` row cannot see) |
+| T24r | the **rows artifact**'s own lifecycle: every reported row is written (header + all 20, including the last, which no excerpt can show), an **unwritable** artifact path is recorded as `unwritable` rather than silently dropped, a **clean** and a **not-graded** pass each LEAVE the previous list **with its rows intact** and say so in `farm_rows=` (presence is not the promise — `grep -c .` is asserted beside the planted line, so a pass that TRUNCATES the file reds, which a `[ -f ]` row cannot see) |
 | T26 | the materialiser is **TOLD which cell home to pin into**: under the rendered unit's own environment (`env -i`, `HOME` and no `CELL_HOME`) a stub that reproduces `cloud-cell-supervisor.sh`'s defaulting pins under the pass's own root and the farm grade is then reachable (**24**); reverted one edit, the same stub pins into the scratch default and the pass reports **25** "nothing moved this box" — never reaching predicate 4 (agent-infra#3593) |
 | T15 | a dirty **tracked symlink** is restored as a symlink, and the clean file it pointed at is byte-for-byte untouched (this repo tracks 34 symlinks; writing the blob through the link corrupted the target) |
 

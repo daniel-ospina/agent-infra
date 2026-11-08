@@ -2128,17 +2128,14 @@ assert_contains "$(grep '^detail=' "$T/t24at/state/harness-apply.status" 2>/dev/
 assert_absent "$(grep '^detail=' "$T/t24at/state/harness-apply.status" 2>/dev/null || true)" "harness-apply-farm-rows.txt" \
     "T24 control: and it really inlines no artifact path"
 
-# ⛔ AND A NON-ROW LINE ENDING IN A CLASS WORD MUST NOT TRIP IT (review round 22, measured: deleting
-# `NF>=4 &&` from the extractor left the suite green, so the over-block this guard prevents was unpinned).
-# The class tokens are UPPERCASE (the regex is case-sensitive), so a lowercase `0 unsourced` tail proves
-# nothing — this fixture uses a genuine 3-FIELD line ending in an UPPERCASE class word, which is the
-# shape a farmed/hostile copy could print and which a row-count of `$NF` alone would read as drift.# ⛔ PROSE AND SUMMARY LINES MUST NOT BE READ AS ROWS (review round 24: the row predicate is now shared
+# ⛔ PROSE AND SUMMARY LINES MUST NOT BE READ AS ROWS (review round 24: the row predicate is now shared
 # with the drift arm, so the guard is "the class token must END the line, and be the UPPERCASE token the
 # instrument prints" rather than a field count). Mutants that red these rows: dropping the
 # `[[:space:]]*$` end anchor (a class word mid-line then matches), or matching case-insensitively (the
 # summary's lowercase `0 unsourced` tail then matches — round 22's fixture proved a lowercase tail proves
 # nothing, which is why this one uses the instrument's real shapes: an `ok` row, prose naming a class in
-# the middle, and a summary whose classes are all zero).mk_origin t24ar; mk_clone t24ar
+# the middle, and a summary whose classes are all zero).
+mk_origin t24ar; mk_clone t24ar
 REPO_P="$CLONE"; MODE_P=sync
 mkdir -p "$T/t24ar/home/.pi/agent/scripts"
 cat >"$T/t24ar/prose-tail.sh" <<'FARM'
@@ -2220,6 +2217,50 @@ assert_eq "$RC" "24" "T24 control: a wrapper whose inner script is MISSING is RE
 assert_contains "$OUT" "printed NO verdict line" "T24 control: and it names the missing VERDICT rather than treating the wrapper's error line as a report"
 assert_absent "$(grep '^farm_rows=' "$T/t24aw/state/harness-apply.status" 2>/dev/null || true)" "farm_rows=none" \
     "T24 control: and it never records none, which would certify a match over a farm that was never graded"
+assert_file "$T/t24aw/state/harness-apply-farm-rows.txt" \
+    "T24 control: and it PUBLISHES what the checker printed — a refusal that names nobody is the arm-2 gap over again"
+
+# ⛔ THE VERDICT MUST BE THE INSTRUMENT'S LINE, NOT THE TOKEN ANYWHERE (review round 26, measured). An
+# unanchored `grep 'OK — '` matched a per-file ROW carrying the token, so this report — drift in a foreign
+# vocabulary, no verdict line at all — certified `farm: ok` / `farm_rows=none` / `farm_n=0` with the
+# drifting file named durably nowhere: the hazard this chain anchored away in `farm_sum_count`, one token
+# over. A row always carries pipes and a verdict never does, so the anchor is `^[^|]*: OK — `.
+mk_origin t24ax; mk_clone t24ax
+REPO_P="$CLONE"; MODE_P=sync
+mkdir -p "$T/t24ax/home/.pi/agent/scripts" "$T/t24ax/inner"
+cat >"$T/t24ax/inner/ok-token-row.sh" <<'FARM'
+#!/usr/bin/env bash
+printf 'OK — handmade-note.py\n' >&2
+printf '%-46s | %-12s | %-12s | %s\n' 'drifted-a.py' aaaa11112222 bbbb33334444 DRIFTED >&2
+printf 'SUMMARY: 1 file drifted, counts unavailable\n' >&2
+exit 0
+FARM
+printf '#!/usr/bin/env bash\nbash "$(dirname "$0")/inner/ok-token-row.sh" "$@" 2>&1 | tee -a "$(dirname "$0")/log.txt"\n' >"$T/t24ax/wrap.sh"
+chmod +x "$T/t24ax/wrap.sh" "$T/t24ax/inner/ok-token-row.sh"
+OUT="$(HARNESS_APPLY_FARM_CHECKER="$T/t24ax/wrap.sh" run_pass "$T/t24ax" 2>&1)"; RC=$?
+assert_eq "$RC" "24" "T24 control: an OK-token inside a ROW is not a verdict — the report is RED, never a match"
+assert_contains "$OUT" "printed NO verdict line" "T24 control: and it says no verdict line was printed, because none was"
+assert_contains "$(cat "$T/t24ax/state/harness-apply-farm-rows.txt" 2>/dev/null || true)" "drifted-a.py" \
+    "T24 control: with the drifting name durable in the published output, not merely counted"
+
+# ⛔ AND THE ANCHOR DOES NOT OVER-BLOCK A REAL MATCH (the mirror the same review measured): the
+# instrument's `OK — ` line followed by prose that MENTIONS `DRIFT — ` is still a match, because the prose
+# line is not the instrument's verdict line. Refusing it would be a false red on a healthy farm.
+mk_origin t24ay; mk_clone t24ay
+REPO_P="$CLONE"; MODE_P=sync
+mkdir -p "$T/t24ay/home/.pi/agent/scripts" "$T/t24ay/inner"
+cat >"$T/t24ay/inner/ok-then-prose.sh" <<'FARM'
+#!/usr/bin/env bash
+printf 'check-farm-drift: OK — 2/2 sourced file(s) match the source at origin/main (sync).\n' >&2
+printf 'Note that a DRIFT — verdict is what this prints when the bytes do not match.\n' >&2
+exit 0
+FARM
+printf '#!/usr/bin/env bash\nbash "$(dirname "$0")/inner/ok-then-prose.sh" "$@" 2>&1 | tee -a "$(dirname "$0")/log.txt"\n' >"$T/t24ay/wrap.sh"
+chmod +x "$T/t24ay/wrap.sh" "$T/t24ay/inner/ok-then-prose.sh"
+OUT="$(HARNESS_APPLY_FARM_CHECKER="$T/t24ay/wrap.sh" run_pass "$T/t24ay" 2>&1)"; RC=$?
+assert_eq "$RC" "0" "T24 control: a real OK verdict plus prose that MENTIONS the drift word is still a MATCH, not a false red"
+assert_contains "$(grep '^farm_rows=' "$T/t24ay/state/harness-apply.status" 2>/dev/null || true)" "farm_rows=none" \
+    "T24 control: and the record says the farm matched"
 
 # ⛔ A PER-FILE ROW CONTAINING THE WORD DRIFT IS NOT THE SUMMARY (review round 24, measured:
 # `grep -m1 'DRIFT'` took `DRIFT-log.txt | a | b | STALE` as the summary line, so the real summary two
