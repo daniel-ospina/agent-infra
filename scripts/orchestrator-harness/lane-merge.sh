@@ -81,8 +81,16 @@ CHECKS_TSV=""; PR_TSV=""; MAX_ROUNDS_OVERRIDE=""
 # Sourced WITHOUT the `|| true` that pr-state.sh gets: a missing consumer for a gate is a harness defect
 # that must be loud, and `lane_report_gate` would then be an unbound command (set -u) at the one place
 # the lane is told it may merge.
+# ⛔ `$O` IS NOT YET DEFAULTED HERE (fresh review, P1 — it landed as a STARTUP BREAK). `set -u` is at :57
+# and `O="${O:-$HOME/orchestrator}"` is at :115, BELOW argv parsing, so referencing a bare `$O` in this
+# loop made the script die with `line 85: O: unbound variable` (exit 1) whenever `O` was not exported —
+# before a single argument was read, on the very box shape the header documents as supported (a lane
+# runs the deployed `$O/lane-merge.sh`; `lane.sh` sets `O` WITHOUT `export`). Exit 1 is not even in this
+# file's own exit-code contract, so the lane got an unmapped failure. The default is spelled INLINE here
+# rather than moving the block below :115: `LANE_REPORT_GATE` must be resolved before the argv loop
+# terminates the process on a bad flag.
 LANE_REPORT_GATE=""
-for _lrg in "$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)/lane-report-gate.sh" "$O/lane-report-gate.sh"; do
+for _lrg in "$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)/lane-report-gate.sh" "${O:-$HOME/orchestrator}/lane-report-gate.sh"; do
   [ -f "$_lrg" ] && { LANE_REPORT_GATE="$_lrg"; break; }
 done
 # shellcheck source=/dev/null

@@ -87,10 +87,19 @@ _lrg_emit() {
 # on a cell with no venv), so `python3` is the first choice and `python` the fallback. ⛔ NO
 # `LANE_REPORT_GATE_PY` OVERRIDE: an ambient variable that chooses the program which computes the
 # verdict replaces both python passes, INCLUDING the laundering witness — a bypass, not a seam.
+# ⛔ AND `PATH` IS THE SAME AMBIENT VARIABLE UNDER ANOTHER NAME (fresh review, P1). The no-seam rule
+# above was stated while this function resolved the interpreter with `command -v`, which walks the
+# INHERITED `PATH` — and a lane runs `lane-merge.sh` itself, which forks the chain (`nohup bash -c`)
+# and `chain-merge.sh` forks the `$O`-pinned `merge-one.sh`, all under plain environment inheritance.
+# `PATH=/tmp/shim:$PATH` with a two-branch `python3` therefore made every RED/INVALID report PASS
+# through BOTH python passes, i.e. exactly the bypass the override removal was meant to close — the
+# class was unchanged and only the spelling moved. So the candidates are ABSOLUTE and the inherited
+# `PATH` is never consulted. A box that has python only somewhere exotic gets code 7 UNMEASURABLE
+# (an unreadable verification is not a pass), which is the honest answer, not a silent downgrade.
 _lrg_py() {
   local c
-  for c in python3 python; do
-    command -v "$c" >/dev/null 2>&1 && { printf '%s' "$c"; return 0; }
+  for c in /usr/bin/python3 /usr/local/bin/python3 /opt/homebrew/bin/python3 /usr/bin/python; do
+    [ -x "$c" ] && { printf '%s' "$c"; return 0; }
   done
   return 1
 }
@@ -188,6 +197,22 @@ lane_report_gate() {
   # exactly the repos this decision names. A repo that ships the writer ships it in its checkout; a lane
   # that adds one is asking the graded tree to grade itself.
   tool="$repo/tools/worktree_report.py"
+  # ⛔ THE CONSUMER COMES FROM THE REPO'S MAIN WORKTREE, NOT FROM WHATEVER TREE THE CALLER NAMED
+  # (fresh review, P2). `lane-merge.sh` resolves this itself (`resolve_trusted_checkout`) and passes
+  # main, but `merge-one.sh` passes `$REPO` straight from argv, and a lane that runs the deployed
+  # `merge-one.sh` with its OWN worktree would then hand the gate the graded tree's own copy of the
+  # writer — the same self-grading escape the `$wt` fallback removal above closed, reached through the
+  # `$repo` half instead. Resolving it HERE makes the property hold for every carrier instead of being
+  # a convention each caller must remember. Falls back to `$repo` only when it cannot enumerate
+  # worktrees (a plain/non-git fixture, where `$repo` IS the tree).
+  if _lrg_wl="$(git -C "$repo" worktree list --porcelain 2>/dev/null)" && [ -n "$_lrg_wl" ]; then
+    while IFS= read -r _lrg_line; do
+      case "$_lrg_line" in
+        "worktree "*) _lrg_main="${_lrg_line#worktree }"; break ;;
+      esac
+    done <<< "$_lrg_wl"
+    [ -n "${_lrg_main:-}" ] && tool="$_lrg_main/tools/worktree_report.py"
+  fi
   [ -f "$tool" ] && [ -s "$tool" ] || tool=""
   if [ -z "$tool" ] || [ ! -f "$tool" ]; then
     # ⛔ AN AUDITED ABSTENTION, the same shape `gate-policy.sh` uses for the gate-policy probe: the
@@ -245,10 +270,26 @@ if not isinstance(rules, list):
 # describes.
 rec = ""
 newest = None
+# ⛔ AN UNREADABLE WRITER STATE IS UNMEASURABLE, NOT A PASS (fresh review, P2). `rec` (the recorded
+# head) and `newest` (the newest suite) are BOTH read from this file, so on any exception both head
+# witnesses below go dark — the `rec_head != head` arm and the laundering arm are both `[ -n … ]`-guarded
+# and simply do not run. The gate then PASSed on the consumer `ok`/`head_moved_since_write` alone,
+# which its own header says is insufficient, and printed `report_head=$head` because the emit line
+# defaulted the MISSING reading to the MERGING head — recording a head binding that was never read.
+# Worse, the lane controls this worktree, so `rm state.json` was a one-command way to delete both
+# witnesses. So a CORRUPT or ABSENT state cannot be read as a pass. The two are distinguished because
+# their remedies and their risk differ: an ABSENT file is what the suite models as an ordinary run
+# (the writer may hold its state elsewhere), so refusing it would over-block honest merges -- it is
+# RECORDED (`state=absent`) on the PASS line instead, which makes the missing witness countable rather
+# than silent. A file that EXISTS and will not parse is tampering with a witness that was there, and
+# is UNMEASURABLE (7), the code this file already reserves for "an unreadable verification is not a
+# pass".
+state_ok = "absent"
 try:
     with open(sys.argv[2], encoding="utf-8", errors="replace") as fh:
         st = json.load(fh)
     if isinstance(st, dict):
+        state_ok = "ok"
         rec = st.get("head_at_write") or ""
         _suites = st.get("suites")
         if isinstance(_suites, list):
@@ -262,7 +303,12 @@ try:
                     continue
                 if newest is None or _t > newest:
                     newest = _t
+    else:
+        state_ok = "corrupt"
+except FileNotFoundError:
+    state_ok = "absent"
 except Exception:
+    state_ok = "corrupt"
     rec = ""
 # ⛔ THE WITNESS A RE-RENDER CANNOT MOVE (fresh review, P0). `write_report` re-stamps `head_at_write`
 # on every `write`/`note`/idempotent `init`, so a lane that runs its suites at A, commits B, and then
@@ -298,7 +344,7 @@ if newest is not None and sys.argv[3]:
     except Exception:
         predates = ""
         skew = ""
-print("%s|%s|%s|%s|%s|%s|%s" % (
+print("%s|%s|%s|%s|%s|%s|%s|%s" % (
     "1" if d.get("ok") is True else "0",
     "1" if d.get("head_moved_since_write") is True else "0",
     ",".join(str(r) for r in rules)[:400],
@@ -306,14 +352,25 @@ print("%s|%s|%s|%s|%s|%s|%s" % (
     d.get("head") or "",
     predates,
     skew,
+    state_ok,
 ))'
-  if ! IFS='|' read -r ok stale rules rec_head live_head predates skew <<< "$("$py" -c "$_LRG_JSON_PY" "$out" "$wt/.worktree-report/state.json" "$commit_iso" 2>/dev/null)"; then
+  if ! IFS='|' read -r ok stale rules rec_head live_head predates skew state_ok <<< "$("$py" -c "$_LRG_JSON_PY" "$out" "$wt/.worktree-report/state.json" "$commit_iso" 2>/dev/null)"; then
     _lrg_emit 7 UNMEASURABLE "branch=$branch worktree=$wt tool=$tool reason=consumer-json-unusable check_rc=$rc head=$head"
     return 7
   fi
   # An empty parse is the SAME witness as a failed one: the python exits 0 having printed nothing only
   # when it could not read the object, and `read` on an empty string SUCCEEDS on bash 3.2.
   case "$ok" in 0|1) : ;; *) _lrg_emit 7 UNMEASURABLE "branch=$branch worktree=$wt tool=$tool reason=consumer-json-unusable check_rc=$rc head=$head"; return 7 ;; esac
+  # ⛔ A MISSING/CORRUPT WRITER STATE KILLS BOTH HEAD WITNESSES, SO IT CANNOT BE A PASS (fresh review,
+  # P2). Checked BEFORE the arms that consume it and before the consumer's own `ok` is trusted: with
+  # `rec_head`/`predates` empty, `ok:true` alone reads as green here, and the lane controls this
+  # worktree — `rm .worktree-report/state.json` would otherwise delete both witnesses in one command.
+  # The remedy is the ordinary re-run (the writer re-creates it), which is why this is 7 UNMEASURABLE
+  # rather than a STALE/INVALID verdict about evidence that half-exists.
+  if [ "$state_ok" = "corrupt" ]; then
+    _lrg_emit 7 UNMEASURABLE "branch=$branch worktree=$wt tool=$tool reason=writer-state-corrupt state=$wt/.worktree-report/state.json head=$head"
+    return 7
+  fi
 
   if [ "$ok" != "1" ]; then
     if [ "$rc" = "3" ]; then
@@ -362,7 +419,7 @@ print("%s|%s|%s|%s|%s|%s|%s" % (
   # ⛔ THE VERIFIER IS NAMED ON THE PASS LINE (fresh review, P2): without it the merge log records
   # "verified" with no provenance, so a consumer drawn from the wrong tree is invisible even after it
   # has made a difference.
-  _lrg_emit 0 PASS "branch=$branch worktree=$wt report=$wt/WORKTREE-REPORT.md head=$head report_head=${rec_head:-$head} tool=$tool"
+  _lrg_emit 0 PASS "branch=$branch worktree=$wt report=$wt/WORKTREE-REPORT.md head=$head report_head=${rec_head:-unknown} state=${state_ok:-absent} tool=$tool"
   return 0
 }
 

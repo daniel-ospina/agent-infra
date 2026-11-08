@@ -145,6 +145,36 @@ case "$LAST_OUT" in *worktree="$WT "*) ok "PASS resolves the EXACT branch worktr
 # not a control, and it is the only thing that makes a wrong grader visible AFTER it changed a verdict.
 case "$LAST_OUT" in *"tool=$REPO/tools/worktree_report.py"*) ok "PASS names the verifier it used (tool=…)" ;; *) bad "PASS does not name the verifier: $LAST_OUT" ;; esac
 
+# ── 1b. A MISSING WRITER STATE IS RECORDED, NEVER FABRICATED (fresh review, P2) ─┘──────────────
+# The PASS arm above runs with NO `state.json` — which is exactly what this suite models as an ordinary
+# run (the `worktree-behind` arm below deletes it for the same reason). The emit line used to default
+# the MISSING reading to the MERGING head (`report_head=${rec_head:-$head}`), so the merge log recorded
+# a head binding that was never read — in a design whose stated purpose is a countable census. The
+# absence is now NAMED, so the coverage can be counted instead of assumed.
+case "$LAST_OUT" in
+  *report_head=unknown*) ok "…and a missing writer state is named report_head=unknown, not the merging head" ;;
+  *) bad "PASS fabricated a report head it never read: $LAST_OUT" ;;
+esac
+case "$LAST_OUT" in
+  *"report_head=$WT_HEAD"*) bad "PASS substituted the MERGING head for a report head it did not read" ;;
+  *) ok "…never substituting the merging head for a head it did not read" ;;
+esac
+case "$LAST_OUT" in
+  *state=absent*) ok "…and the missing state is recorded as state=absent (countable, not silent)" ;;
+  *) bad "PASS did not record that the writer state was absent: $LAST_OUT" ;;
+esac
+# ── 1c. A CORRUPT WRITER STATE IS UNMEASURABLE, NOT A PASS (fresh review, P2) ──────────────────
+# ⛔ BOTH head witnesses are read out of this file, and both arms that consume them are `[ -n … ]`-guarded
+# — so on a parse failure they go DARK and `ok:true` alone reads as green. The lane owns this worktree,
+# so truncating the file was a one-command way to delete the two witnesses the PR calls P0. A file that
+# EXISTS and will not parse is tampering with a witness that was there: 7, never a verdict.
+mkdir -p "$WT/.worktree-report"
+printf 'not json at all{{{\n' > "$WT/.worktree-report/state.json"
+drive 7 "UNMEASURABLE: a writer state that exists but will not parse (both head witnesses are dark)" STUB_OK=1 STUB_RC=0 STUB_STALE=0
+case "$LAST_OUT" in *reason=writer-state-corrupt*) ok "…and it names the corrupt state instead of returning a verdict about it" ;; *) bad "corrupt-state reason: $LAST_OUT" ;; esac
+case "$LAST_OUT" in *VERDICT=PASS*) bad "a corrupt writer state was read as a PASS" ;; *) ok "…and it is not reported as PASS" ;; esac
+rm -f "$WT/.worktree-report/state.json"
+
 # ── 2. THE MEASURED DEFECT: rc 0 + a moved head is NOT a pass ────────────────────────────────────
 mkdir -p "$WT/.worktree-report"
 printf '{"version":1,"head_at_write":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","branch":"feat/2977-tm","suites":[]}\n' \
@@ -214,16 +244,30 @@ drive 2 "INVALID: the consumer's rules fail and it exits 1" STUB_OK=0 STUB_RC=1 
 case "$LAST_OUT" in *suite-log-hash-mismatch*) ok "INVALID names the failing rule the consumer reported" ;; *) bad "INVALID does not name the rule: $LAST_OUT" ;; esac
 drive 2 "POLARITY: exit 0 with ok:false is INVALID, not PASS" STUB_OK=0 STUB_RC=0
 drive 7 "UNMEASURABLE: the consumer's output is not JSON" STUB_RAW=not-json STUB_RC=0
-# §8 of the decision table: a report that exists but cannot be VERIFIED because no interpreter can run
-# the consumer is 7, never a pass and never an abstention. `command -v git` is the only external the
-# gate needs before it reaches this arm, so a minimal PATH is enough to drive it.
-mkdir -p "$TMP/nopy"
-ln -sf "$(command -v git)" "$TMP/nopy/git" 2>/dev/null
-# ⛔ `bash` IS INVOKED BY ABSOLUTE PATH: `env PATH=… bash` resolves `bash` with the NEW PATH, so a
-# minimal PATH makes env itself fail (rc 127) instead of exercising the gate.
-BASH_ABS="$(command -v bash)"
-out="$(env STUB_OK=1 STUB_RC=0 PATH="$TMP/nopy" "$BASH_ABS" "$GATE" --check "$REPO" "feat/2977-tm" "$WT_HEAD" 2>&1)"; rc=$?
-if [ "$rc" = 7 ]; then ok "NO INTERPRETER is UNMEASURABLE (rc=$rc) — an unreadable verification is not a pass"; else bad "no-interpreter: expected rc=7, got rc=$rc :: $out"; fi
+# ── 2c. THE INHERITED `PATH` CANNOT CHOOSE THE INTERPRETER (fresh review, P1) ─────────────────────
+# ⛔ THIS REPLACES AN ARM THAT COULD NO LONGER FAIL. The old row emptied `PATH` and asserted rc=7
+# ("no interpreter") — which only worked while `_lrg_py` resolved python with `command -v`. That is
+# exactly the bypass: `command -v` walks the INHERITED `PATH`, and a lane runs `lane-merge.sh` itself,
+# forking the chain and the `$O`-pinned `merge-one.sh` under plain environment inheritance, so
+# `PATH=/tmp/shim:$PATH` with a two-branch `python3` made every RED report PASS through both python
+# passes. The interpreter is now pinned to ABSOLUTE candidates and `PATH` is never consulted, so the
+# property to assert is not "absence is rc=7" (unsimulable on a box that HAS python) but the two
+# halves below: PATH cannot redirect it, and the function does not read PATH at all.
+SHIMDIR="$TMP/shim"; mkdir -p "$SHIMDIR"
+# The liar: prints the laundering-witness fields a PASS needs, whatever the consumer actually said.
+printf '#!/bin/sh\nprintf "1|0||%s|%s|0|0|ok\\n" "%s" "%s"\n' "$WT_HEAD" "$WT_HEAD" "$WT_HEAD" "$WT_HEAD" > "$SHIMDIR/python3"
+printf '#!/bin/sh\nprintf "1|0||%s|%s|0|0|ok\\n" "%s" "%s"\n' "$WT_HEAD" "$WT_HEAD" "$WT_HEAD" "$WT_HEAD" > "$SHIMDIR/python"
+chmod +x "$SHIMDIR/python3" "$SHIMDIR/python"
+# Negative control FIRST: prove the shim WOULD have flipped the verdict, so the arm can fail.
+_shim_wins="$(PATH="$SHIMDIR" /bin/sh -c 'command -v python3' 2>/dev/null)"
+if [ "$_shim_wins" = "$SHIMDIR/python3" ]; then ok "CONTROL the planted python3 IS what a PATH lookup returns ($_shim_wins) — so the arm below can fail"; else bad "CONTROL the planted shim is not reachable by a PATH lookup, so the arm below cannot fail"; fi
+out="$(env STUB_OK=0 STUB_RC=3 STUB_FAILING=1 PATH="$SHIMDIR:$PATH" bash "$GATE" --check "$REPO" "feat/2977-tm" "$WT_HEAD" 2>&1)"; rc=$?
+if [ "$rc" = 3 ]; then ok "a PATH-shimmed python3 does NOT flip genuinely RED evidence (rc=$rc) — the interpreter is pinned, not inherited"; else bad "PATH chose the interpreter: expected rc=3, got rc=$rc :: $out"; fi
+# The structural half: the resolver must not consult PATH at all. Kept deliberately BLUNT (any
+# `command -v` in the function body fails) — a precise pattern here is how the previous version of this
+# row matched nothing and stayed green over a mutant.
+_lrg_py_body="$(sed -n '/^_lrg_py()/,/^}/p' "$GATE")"
+if grep -q 'command -v' <<< "$_lrg_py_body"; then bad "_lrg_py still resolves the interpreter with command -v (a PATH lookup)"; else ok "_lrg_py never consults PATH — its candidates are absolute"; fi
 
 # ── 3b. NO AMBIENT ENV VAR MAY SELECT THE VERIFIER (fresh review, P1) ─────────────────────────────
 # The "disable it by ambient env" bypass: a lane runs lane-merge.sh itself, which forks the chain and
@@ -364,7 +408,7 @@ fi
 # != "rail" ]` keeps every line in order while skipping the gate on EXACTLY the repos the PR names as
 # the ones where the lane report is the only evidence. The block must be UNGUARDED, so assert the
 # lines immediately above it cannot be such a guard.
-co_head="$(grep -nE '^_lrg_rc=0; _lrg_out=""$' "$MERGE_ONE" | head -1 | cut -d: -f1)"
+co_head="$(grep -nE '^_lrg_rc=0; _lrg_out=""' "$MERGE_ONE" | head -1 | cut -d: -f1)"
 if [ -z "$co_head" ]; then
   bad "merge-one.sh: the gate block's first line is unrecognisable — the rail-guard assertion cannot read it"
 elif sed -n "$((co_head-3)),$((co_head-1))p" "$MERGE_ONE" | grep -qE 'MERGE_AUTHORITY'; then
@@ -380,7 +424,17 @@ fi
 _guard_of() { # _guard_of <file> <head-line> — the nearest preceding code line
   awk -v t="$2" 'NR<t { if ($0 ~ /^[[:space:]]*$/) next; if ($0 ~ /^[[:space:]]*#/) next; last=$0 } END { print last }' "$1"
 }
-lm_head="$(grep -nE '^_lrg_rc=0; _lrg_out=""$' "$LANE_MERGE" | head -1 | cut -d: -f1)"
+# ⛔ THE ANCHOR MUST BE ABLE TO MATCH, AND AN UNMATCHED ANCHOR MUST FAIL (fresh review, P2). The
+# pattern here was `^_lrg_rc=0; _lrg_out=""$`, but lane-merge.sh's real first line is
+# `_lrg_rc=0; _lrg_out=""; _lrg_skip=0` — the `$` made it match NOTHING, so `lm_head` was empty, the
+# guard lookup returned nothing, and the `case` fell to `*` and reported PASS with an EMPTY
+# `(preceding code line: )` in the message. Measured: wrapping lane-merge.sh's whole gate block in
+# `if false; then … fi` left this suite at 56 passed / 0 failed. An anchored pattern is only a guard if
+# its silence is a failure, so the empty case is now its own `bad` and the loop is skipped.
+lm_head="$(grep -nE '^_lrg_rc=0; _lrg_out=""' "$LANE_MERGE" | head -1 | cut -d: -f1)"
+if [ -z "$lm_head" ]; then
+  bad "lane-merge.sh: the gate block's first line is unrecognisable — the nesting assertion cannot read it"
+fi
 for _pair in "lane-merge.sh:$lm_head" "merge-one.sh:$co_head"; do
   _f="${_pair%%:*}"; _ln="${_pair##*:}"
   _g="$(_guard_of "$HERE/$_f" "$_ln")"
