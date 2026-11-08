@@ -124,6 +124,35 @@ run_pass() {
     bash "${PASS_UNDER_TEST:-$PASS_SH}" "$@"
 }
 
+# ⛔ acct_stub <dir> <home> — print a PATH entry whose `getent` answers <home> for the account lookup.
+# WHY THIS EXISTS (agent-infra#3453). The pass now DERIVES `CELL_HOME` instead of reading `$HOME`, and the
+# derivation's precedence puts the PASSWD record's home AHEAD of `$HOME`. The shipped unit sets HOME and
+# NOT CELL_HOME, so a fixture that overrides only HOME no longer controls the home the pass resolves: the
+# real account lookup answers the HOST's home (`/home/runner` on a CI runner, `/home/cmux` on a cell),
+# which escapes this suite's temp tree. MEASURED before this seam: 7 legs red on the `cmux` cell (T16 ×2,
+# T26 ×5, T26 reported `got '24'` because it tried to read the box's REAL pin record) and
+# `279 passed, 0 failed` on origin/main — i.e. a host assumption in the fixture, not a product defect.
+# Stubbing the account lookup is the SAME seam `scripts/lib/cell-home.test.sh` uses for the same reason,
+# and it keeps every arm below faithful to the ACTUAL unit artifact (HOME, no CELL_HOME).
+acct_stub() { # <dir> <home>
+    local d="$1" h="$2"
+    mkdir -p "$d" || return 1
+    {
+        printf '#!/usr/bin/env bash\n'
+        printf 'case "${1:-}" in\n'
+        printf '  passwd) printf "%%s:x:1000:1000::%s:/bin/bash\\n" "${2:-$(id -un)}" ;;\n' "$h"
+        printf 'esac\n'
+    } >"$d/getent"
+    chmod +x "$d/getent"
+    printf '%s\n' "$d"
+}
+
+# NON-VACUITY: the stub must BE the account lookup, or every arm that relies on it silently grades the
+# host instead of the fixture (the exact failure this seam exists to remove).
+assert_eq "$(PATH="$(acct_stub "$T/acct-selfcheck" "$T/acct-selfcheck-home"):$PATH" \
+  getent passwd "$(id -un)" | awk -F: 'NR==1{print $6}')" "$T/acct-selfcheck-home" \
+  "fixture: the account stub answers the fixture home, so no env -i arm below reads the HOST's home"
+
 mkdir -p "$T/home-directory"   # so $T itself is never an unset-HOME fallback
 
 # ── T1: a box AHEAD of main is REFUSED, with the ahead count ──────────────────────────────────
@@ -558,7 +587,7 @@ say_case "T16 the pass runs from the unit's own environment"
 mk_origin t16; mk_clone t16; write_sync_stub
 REPO_P="$CLONE"; MODE_P=sync
 mkdir -p "$T/t16/state" "$T/t16/home"
-OUT="$(env -i HOME="$T/t16/home" PATH="$PATH" \
+OUT="$(env -i HOME="$T/t16/home" PATH="$(acct_stub "$T/t16/acct" "$T/t16/home"):$PATH" \
     HARNESS_APPLY_REPO="$CLONE" HARNESS_APPLY_REF=origin/main HARNESS_APPLY_MODE=sync \
     HARNESS_APPLY_STATE_DIR="$T/t16/state" HARNESS_APPLY_SYNC_CMD="$T/sync-stub.sh" \
     bash "$PASS_SH" 2>&1)"; RC=$?
@@ -569,7 +598,7 @@ assert_contains "$REC16" "ref=$(printf '%s' "$(git -C "$T/o-t16" rev-parse main)
 assert_absent "$OUT" "no checkout resolved" "T16 the P0 refusal text is absent"
 # ... and the same environment still HONOURS the direct-run names, so an operator's own invocation and
 # a unit-rendered one cannot resolve two different repos.
-OUT="$(env -i HOME="$T/t16/home" PATH="$PATH" HARNESS_REPO="$CLONE" HARNESS_REF=origin/main \
+OUT="$(env -i HOME="$T/t16/home" PATH="$T/t16/acct:$PATH" HARNESS_REPO="$CLONE" HARNESS_REF=origin/main \
     HARNESS_APPLY_MODE=sync HARNESS_APPLY_STATE_DIR="$T/t16/state" \
     HARNESS_APPLY_SYNC_CMD="$T/sync-stub.sh" bash "$PASS_SH" 2>&1)"; RC=$?
 assert_eq "$RC" "0" "T16 the direct-run names (HARNESS_REPO/HARNESS_REF) still work"
@@ -666,7 +695,8 @@ REPO_P="$CLONE"; MODE_P=sync
 mkdir -p "$T/t19/state"
 PYLAN="$(command -v python3 2>/dev/null || printf '/usr/bin/python3')"
 LAUNCHER_PY="$HERE/pi-reap-worktrees-launchd.py"
-env -i HOME="$T/t19/home" PATH="$PATH" HARNESS_APPLY_REPO="$CLONE" HARNESS_APPLY_REF=origin/main \
+env -i HOME="$T/t19/home" PATH="$(acct_stub "$T/t19/acct" "$T/t19/home"):$PATH" \
+    HARNESS_APPLY_REPO="$CLONE" HARNESS_APPLY_REF=origin/main \
     HARNESS_APPLY_MODE=sync HARNESS_APPLY_STATE_DIR="$T/t19/state" \
     HARNESS_APPLY_SYNC_CMD="$T/sync-stub.sh" \
     "$PYLAN" "$LAUNCHER_PY" --script "$PASS_SH" >"$T/t19/out" 2>"$T/t19/err"; RC=$?
@@ -1434,7 +1464,7 @@ MAT
 # `run_pass_unit <case-dir>` — the pass under the rendered unit's environment.
 run_pass_unit() {
     local d="$1"; shift
-    local -a e=( HOME="$d/home" PATH="$PATH" TMPDIR="${TMPDIR:-/tmp}"
+    local -a e=( HOME="$d/home" PATH="$(acct_stub "$d/acct" "$d/home"):$PATH" TMPDIR="${TMPDIR:-/tmp}"
                  HARNESS_APPLY_REPO="$REPO_P" HARNESS_APPLY_REF=origin/main HARNESS_APPLY_MODE=
                  HARNESS_APPLY_STATE_DIR="$d/state" HARNESS_APPLY_DRIFT_CHECK=0 HARNESS_FETCH=1
                  HARNESS_APPLY_SYNC_CMD="$T/sync-stub.sh"

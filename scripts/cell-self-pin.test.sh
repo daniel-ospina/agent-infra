@@ -2606,11 +2606,24 @@ out="$(env -u CELL_HOME -u HARNESS -u HARNESS_PIN_FILE -u HARNESS_PIN_DIR -u HAR
   || bad "a render with CELL_HOME unset succeeded (rc=$rc) — it bakes an unconfirmed base into the unit: $out"
 # ⛔ AND IT NAMES THE DERIVED VALUE, not the pre-#3453 divergence. This arm used to assert the string
 # `/tmp/cell-home` — the LEGACY home the old message pointed at — which is now the one answer the resolver
-# must never produce. A test asserting a literal there would pin the defect in place, so it asserts the
-# DERIVED value instead (the fixture's HOME) and that the refusal cites the change that unified it.
+# must never produce. A test asserting a literal there would pin the defect in place.
+# ⛔ AND IT IS NOT A FIXTURE LITERAL EITHER. The first version of this arm asserted the fixture's
+# `$T/home` — which is WRONG ON EVERY REAL HOST, because the resolver's precedence puts the PASSWD
+# record's home AHEAD of `$HOME`: on a CI runner the derived value is `/home/runner`, on a cell
+# `/home/cmux`, never the temp-dir fixture home. So the arm read as a defect in the product and was a
+# host assumption in the test (measured: `505 ok, 1 failed` on the `cmux` cell, the one leg red).
+# The assertion is therefore against the value THE ONE RESOLVER ANSWERS for this same environment —
+# that IS the contract ("the refusal names the derived value"), it is host-independent, and it is
+# non-vacuous: on pre-#3453 code `lib/cell-home.sh` does not exist, so the derivation below yields
+# nothing and this leg still fails.
+derived=""; derived="$(cd "$T" && env -u CELL_HOME -u HOME_ORIG -u CELL_HOME_FLEET_DEFAULT \
+  PATH="$T/fakebin-none:$PATH" HOME="$T/home" \
+  bash -c '. "$1/lib/cell-home.sh" && cell_home_resolve' _ "$SELF" 2>/dev/null)"
+[ -n "$derived" ] && ok "…the derivation is READABLE (scripts/lib/cell-home.sh answers '$derived' in this env), so the assertion below measures the product and not an absent file" \
+  || bad "…scripts/lib/cell-home.sh did not answer a derived value in this env, so the arm below cannot measure anything"
 case "$out" in
-  *"$T/home"*) ok "…and the refusal names the DERIVED value it would have written (the fixture's home)" ;;
-  *) bad "…but the refusal does not name the derived value it refused over: $out" ;;
+  *"$derived"*) ok "…and the refusal names the DERIVED value it would have written ('$derived' — the resolver's answer, not a fixture literal)" ;;
+  *) bad "…but the refusal does not name the derived value '$derived' it refused over: $out" ;;
 esac
 case "$out" in
   *'3453'*) ok "…citing agent-infra#3453 as the reason the two sides now agree" ;;
