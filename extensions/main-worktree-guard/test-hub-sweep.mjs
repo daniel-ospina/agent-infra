@@ -64,8 +64,11 @@ const SWEEP_MARK = "HUB WORKING TREE CHANGED UNDER YOU";
 const HATCH_VARS = ["AGENT_ALLOW_MAIN_EDITS", "ELDATO_ALLOW_MAIN_EDITS"];
 
 // Blocking sleep with no child process: the observation's burst gate is
-// wall-clock, so the one control that must provably reach `git status` needs a
-// real pause to be a pin rather than a no-op.
+// wall-clock, so a control that must PROVABLY reach `git status` needs a real
+// pause to be a pin rather than a no-op. TWO controls need it (A0 and B2):
+// without it they can pass because `_hubSweepCheck` short-circuited before the
+// `git status` they purport to exercise — the non-vacuity defect a fresh review
+// found in B2 one round after the same defect had been fixed in A0.
 const pause = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 
 async function main() {
@@ -156,9 +159,14 @@ async function main() {
     // #718 caught the earlier placement: by then three untracked paths had been
     // observed, `git clean` emitted a REAL sweep banner that the next `drain()`
     // discarded, and the assertion then rode on a call the 1.5s burst gate
-    // skipped — a control that could not fail for the property it named). The
-    // pause defeats the burst gate so the second call provably reaches
-    // `git status` and the `previous.size === 0` early return.
+    // skipped — a control that could not fail for the property it named).
+    // ⛔ What it pins is the NEVER-DIRTY path end to end, NOT the
+    // `previous.size === 0` clause in particular: with `previous` empty the
+    // vanished set is empty whatever that clause does, so claiming the clause
+    // would be a stronger claim than the assertion earns (the chain's review,
+    // P3, was right about that). The mutant that reddens it is "warn on the
+    // FIRST observation". The pause defeats the burst gate so the second call
+    // provably reaches `git status`.
     process.chdir(hub);
     await callFrom(hub);
     drain();
@@ -180,6 +188,13 @@ async function main() {
     expect("B1: session_start on a dirty hub emits NO sweep banner", sweeps(drain()).length, 0);
 
     // B2: the session keeps working; the hub is unchanged. Still silent.
+    // ⛔ THE PAUSE IS LOAD-BEARING (a finding from the chain's own review of
+    // this PR). Without it this call lands inside the 1.5s burst window with an
+    // unchanged signature, `_hubSweepCheck` returns BEFORE `git status`, and the
+    // row passes whether or not an unchanged hub would be misreported as a
+    // sweep. With it, mutating `vanished` to the whole previous set reddens
+    // exactly this row.
+    pause(1600);
     await callFrom(hub);
     expect("B2: an unchanged dirty hub stays silent", sweeps(drain()).length, 0);
 
@@ -285,6 +300,17 @@ try {
 }
 
 console.log("");
+// ⛔ A WHOLE-SUITE SKIP IS NOT A PASS (blocking finding from the chain's review
+// of this PR). This suite's only whole-file skip is the loader-unavailable arm
+// above, which asserts NOTHING — exiting 0 there reports a green CI step over
+// zero assertions, the false-PASS shape a gate must not produce. Same fix and
+// same reasoning as the sibling `test-unborn-head.mjs:344-355` (pre-fix
+// `✅ 0 passed, 0 failed, 1 skipped` exit 0; post-fix `❌ …` exit 1).
+if (skip > 0 && pass === 0) {
+  console.log(`❌ test-hub-sweep: the whole suite was SKIPPED (${skip} skipped) — ` +
+    `a green step over ZERO assertions is a false PASS, not a pass`);
+  process.exit(1);
+}
 if (fail === 0) {
   console.log(`✅ test-hub-sweep: ${pass} passed, 0 failed, ${skip} skipped`);
   process.exit(0);
