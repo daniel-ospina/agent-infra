@@ -28,7 +28,8 @@
 #   install-worker-supply.sh --help
 #
 # Environment (all optional; tests override these):
-#   CELL_HOME              default $HOME (a cell's HOME is its own fact: CELL_HOME= also works)
+#   CELL_HOME              default: DERIVED — scripts/lib/cell-home.sh (a cell's HOME is a fact, not this
+#                          shell's variable; `CELL_HOME=` still wins). Rendered as `Environment=HOME=`.
 #   O                      the orchestrator state dir, default $CELL_HOME/orchestrator
 #   WORKER_SUPPLY_SCRIPT   the script the unit execs (see the candidate list in `resolve_script`)
 #   WORKER_SUPPLY_INTERVAL_S / _PREFIX / _MAX_REFILLS   the three bounds the unit renders
@@ -43,7 +44,25 @@ set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)"
 INFRA_ROOT="$(cd "$HERE/.." 2>/dev/null && pwd)"
 PLATFORM="${ELDATO_PLATFORM:-$(uname -s 2>/dev/null || printf unknown)}"
-CELL_HOME="${CELL_HOME:-$HOME}"
+# ── THE ONE HOME (agent-infra#3453) — DERIVED, never taken from this shell ────────────────────────
+# ⛔ THIS INSTALLER RENDERS A UNIT WHOSE `Environment=HOME=` THE PASS'S SPLIT GUARD MEASURES (review F1).
+# The pass compares the home its own unit exports against the home it derives and REFUSES every tick
+# (exit 27) while they disagree, so a renderer that answers "what is this box's home?" from `$HOME`
+# authors that disagreement itself — and on the channel the fleet reaches a cell through it is a real
+# one: `cmux vm exec` runs as `cmux` with `HOME=/home/ubuntu`, a directory the image does not create.
+# The rule lives in `scripts/lib/cell-home.sh`; this is the same consumer block the other installers use.
+CELL_HOME_LIB=""
+# ⛔ THE SELF PATH COUNTS ONLY WHEN IT NAMES THIS FILE — see `lib/cell-home.sh` §CONSUMERS.
+_SELF="${BASH_SOURCE[0]:-}"; [ -f "$_SELF" ] || _SELF=""     # under `bash -s` $0 is literally `bash` -> `.`
+if [ -n "$_SELF" ]; then
+  _SELF_DIR="$(cd "$(dirname "$_SELF")" 2>/dev/null && pwd -P)"
+  for _cand in "$_SELF_DIR/lib/cell-home.sh" "$_SELF_DIR/../lib/cell-home.sh"; do
+    [ -r "$_cand" ] && { CELL_HOME_LIB="$_cand"; break; }
+  done
+fi
+if [ -n "$CELL_HOME_LIB" ]; then . "$CELL_HOME_LIB"; CELL_HOME="$(cell_home_resolve)"; else CELL_HOME="${CELL_HOME:-${HOME:-}}"; fi
+# ⛔ AN EMPTY CELL_HOME IS NOT A HOME — it is the FILESYSTEM ROOT, and this file renders it into a unit.
+[ -n "$CELL_HOME" ] || { printf '  ❌ %s is not readable and neither CELL_HOME nor HOME is set — refusing to default the cell home (agent-infra#3453)\n' "${CELL_HOME_LIB:-lib/cell-home.sh}" >&2; exit 78; }
 O="${O:-$CELL_HOME/orchestrator}"
 SUDO="${SUDO:-sudo -n}"
 INTERVAL_S="${WORKER_SUPPLY_INTERVAL_S:-60}"

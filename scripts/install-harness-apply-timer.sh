@@ -61,6 +61,10 @@
 #   HARNESS_APPLY_REF        the ref to converge on (default origin/main)
 #   HARNESS_APPLY_MODE       pin|sync (default: decided by the pass — see its header)
 #   HARNESS_APPLY_STATE_DIR  the pass record/log dir the unit exports (default $HOME/.pi/agent/state)
+#   CELL_HOME                the cell's ONE home (default: DERIVED — scripts/lib/cell-home.sh). ⛔ It is
+#                            rendered as the unit's `Environment=HOME=`, because the home this unit runs
+#                            as and the home the pass derives are the SAME question, and the pass refuses
+#                            (exit 27) while they disagree (agent-infra#3453).
 #   HARNESS_APPLY_INTERVAL_MIN  minutes between passes (default 10; 1..1440)
 #   TEMPLATES_DIR            systemd template dir (default: this repo's templates/systemd)
 #   LAUNCHD_TEMPLATES_DIR    plist template dir (default: this repo's templates/launchd/harness-apply)
@@ -75,6 +79,27 @@
 #
 # Exit codes: 0 ok · 1 failure (named) · 2 usage.
 set -uo pipefail
+
+# ── THE ONE HOME (agent-infra#3453) — DERIVED, never defaulted to the legacy /tmp/cell-home ────────
+# ⛔ THIS INSTALLER IS ONE OF THE RENDERERS THE PASS'S SPLIT GUARD READS (review F1). The pass compares
+# this unit's `Environment=HOME=` against the home it derives, so a renderer that answers "what is this
+# box's home?" from `$HOME` does not merely produce a wrong unit — it makes the pass REFUSE every tick
+# (exit 27) over a disagreement its own installer authored, on the one channel the fleet reaches a cell
+# through: `cmux vm exec` runs as `cmux` with `HOME=/home/ubuntu`, a directory that is not created on the
+# image. The rule lives in `scripts/lib/cell-home.sh`; this block is the same consumer shape
+# `install-repair-service.sh` carries.
+CELL_HOME_LIB=""
+# ⛔ THE SELF PATH COUNTS ONLY WHEN IT NAMES THIS FILE — see `lib/cell-home.sh` §CONSUMERS.
+_SELF="${BASH_SOURCE[0]:-}"; [ -f "$_SELF" ] || _SELF=""     # under `bash -s` $0 is literally `bash` -> `.`
+if [ -n "$_SELF" ]; then
+  _SELF_DIR="$(cd "$(dirname "$_SELF")" 2>/dev/null && pwd -P)"
+  for _cand in "$_SELF_DIR/lib/cell-home.sh" "$_SELF_DIR/../lib/cell-home.sh"; do
+    [ -r "$_cand" ] && { CELL_HOME_LIB="$_cand"; break; }
+  done
+fi
+if [ -n "$CELL_HOME_LIB" ]; then . "$CELL_HOME_LIB"; CELL_HOME="$(cell_home_resolve)"; else CELL_HOME="${CELL_HOME:-${HOME:-}}"; fi
+# ⛔ AN EMPTY CELL_HOME IS NOT A HOME — it is the FILESYSTEM ROOT, and it is rendered into the unit.
+[ -n "$CELL_HOME" ] || { printf '%s: FATAL: %s is not readable and neither CELL_HOME nor HOME is set — refusing to default the cell home (agent-infra#3453)\n' "${0##*/}" "${CELL_HOME_LIB:-lib/cell-home.sh}" >&2; exit 78; }
 
 INFRA_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 if [ -z "${TEMPLATES_DIR:-}" ]; then
@@ -315,10 +340,17 @@ xml_sed_repl() {
         | sed -e 's/[&\\|]/\\&/g'
 }
 
-render() { # render <template> <dest>
-    local tpl="$1" dest="$2"
+render() { # render <template> <dest> [home]
+    # ⛔ THE THIRD ARGUMENT IS THE UNIT'S `HOME`, AND IT DEFAULTS TO `$HOME` (review F1). A systemd unit
+    # that exports `HOME=<the invoking shell's home>` is the SPLIT the pass's guard refuses: on a cell
+    # reached through `cmux vm exec` that value is `/home/ubuntu`, which does not exist, while the home
+    # every other unit runs as is the account's. The systemd branch therefore passes the DERIVED home;
+    # the launchd branch keeps `$HOME`, which on the host this fleet runs is the account's own home and
+    # is also what the plist's `{{HOME}}/…` EXECUTABLE PATHS must resolve to (they are not unit
+    # environments, and re-basing them onto a derivation would move the job's program, not its home).
+    local tpl="$1" dest="$2" _unit_home="${3:-$HOME}"
     sed -e "s|{{USER}}|$(xml_sed_repl "$(id -un)")|g" \
-        -e "s|{{HOME}}|$(xml_sed_repl "$HOME")|g" \
+        -e "s|{{HOME}}|$(xml_sed_repl "$_unit_home")|g" \
         -e "s|{{PATH}}|$(xml_sed_repl "$PATH")|g" \
         -e "s|{{STATE_DIR}}|$(xml_sed_repl "$STATE_DIR")|g" \
         -e "s|{{PASS}}|$(xml_sed_repl "$PASS")|g" \
@@ -437,7 +469,7 @@ do_install_systemd() {
     refuse_systemd_unsafe_values || return 1
 
     tmpd="$(mktemp -d "${TMPDIR:-/tmp}/harness-apply-unit.XXXXXX")" || { err "cannot create a temp dir"; return 1; }
-    render "$src_svc" "$tmpd/$UNIT_NAME.service" || { rm -rf "$tmpd"; return 1; }
+    render "$src_svc" "$tmpd/$UNIT_NAME.service" "$CELL_HOME" || { rm -rf "$tmpd"; return 1; }
     render "$src_tim" "$tmpd/$UNIT_NAME.timer" || { rm -rf "$tmpd"; return 1; }
     # A USER unit may not carry User= (systemd rejects it).
     if [ "$TARGET" = "user" ]; then

@@ -114,6 +114,28 @@ probe_selfpath_guarded() {
   return 1
 }
 
+# ── THE RENDERERS THAT BAKE A HOME INTO A UNIT (review F1) ────────────────────────────────────
+# ⛔ `probe_consumes_resolver` CANNOT SEE THIS DEFECT, AND THAT IS WHY IT SHIPPED. Four installers baked
+# `Environment=HOME=` into a unit out of `$HOME` while the pass's split guard compared that value against
+# the home it DERIVES — so on a cell reached through `cmux vm exec` (HOME=/home/ubuntu, a directory the
+# image does not create) the guard refused every tick over a disagreement the installer itself authored.
+# A file can source the resolver, call `cell_home_resolve`, pass every arm above — and still default the
+# home it RENDERS from `$HOME`, leaving the resolver as dead code. So the DERIVATION LINE and the
+# `{{HOME}}` SUBSTITUTION are graded directly, by the same functions the mutation arms call.
+#   (C) the home is ASSIGNED FROM the resolver — `CELL_HOME="$(cell_home_resolve)"` — the pre-fix files
+#       only ever had `CELL_HOME="${CELL_HOME:-$HOME}"`, so a file that merely MENTIONS the resolver in a
+#       comment (which is all `probe_consumes_resolver` asks) is not enough;
+#   (D) no `{{HOME}}` substitution is fed by the literal `$HOME` — the pre-fix render.
+# ⛔ (C) IS A FIXED STRING, NOT A RE. The first cut spelled the pre-fix derivation as a BRE with
+# `\{`/`\}`/`\$`, and in BRE `\{` opens an INTERVAL — so the pattern matched nothing and the control arm
+# said so (`e2b` red, "d3 is inert"). It is also NOT a grep for the old line being absent: every one of
+# these four files keeps a `CELL_HOME="${CELL_HOME:-${HOME:…}}"` fallback for the documented
+# resolver-absent case, and that fallback is correct. The question is which of the two WINS, and the
+# answer is the presence of the resolver assignment.
+SHELL_HOME_SUBST_RE='s|{{HOME}}|[^|"]*"\$HOME"'
+probe_home_from_resolver() { grep -qF 'CELL_HOME="$(cell_home_resolve)"' "$1" 2>/dev/null; }
+probe_home_subst_from_shell() { grep -q "$SHELL_HOME_SUBST_RE" "$1" 2>/dev/null; }
+
 printf '\n── (a) PRECEDENCE ────────────────────────────────────────────────────────────────────\n'
 
 stub_account
@@ -371,7 +393,16 @@ printf '\n── (d) THE CONSUMERS CONSUME IT ───────────�
 #   · `harness-apply-pass.sh` — the pass the scheduled unit runs (it decides where the pin is written);
 #   · `harness-up` — the operator's re-pin (it decides which pin record it reads);
 #   · `reap-abandoned-worktrees.sh` — the disk reaper (its preserve-set names the home).
-# All three are in the list now. The ONE DECLARED EXCEPTION is
+# All three are in the list now.
+# ⛔ AND THEN FOUR RENDERERS WERE STILL OUTSIDE IT (review F1): `install-controller-service.sh`,
+# `install-harness-apply-timer.sh`, `install-cell-timers.sh` and `install-worker-supply.sh` bake the home
+# into a unit's `Environment=HOME=` / `Environment=CELL_HOME=` — i.e. they PRODUCE the two readings the
+# pass's split guard compares — while answering "what is this box's home?" from `$HOME`. On the channel
+# the fleet reaches a cell through (`cmux vm exec`, HOME=/home/ubuntu, a directory the image does not
+# create) that rendered a split the guard then refused every tick over, with a printed remedy
+# (`cell-home-migrate.sh`) that grades only the LEGACY literal and therefore reported the box converged.
+# A no-op loop, authored by four files this pin did not know about. They are in the list now.
+# The ONE DECLARED EXCEPTION remains
 # `scripts/orchestrator-harness/worker-terminal.sh:724` `wt_launcher_home`, which still probes
 # `/tmp/cell-home` as a credential home for a spawned worker. It is named here rather than silently
 # omitted: migrating it re-orders CREDENTIAL resolution for every worker spawn (the loop tries
@@ -396,7 +427,11 @@ for rel in \
   scripts/orchestrator-harness/refresh-candidates.sh \
   scripts/harness-apply-pass.sh \
   scripts/harness-up \
-  scripts/reap-abandoned-worktrees.sh; do
+  scripts/reap-abandoned-worktrees.sh \
+  scripts/install-controller-service.sh \
+  scripts/install-harness-apply-timer.sh \
+  scripts/install-cell-timers.sh \
+  scripts/install-worker-supply.sh; do
   f="$REPO_ROOT/$rel"
   if [ ! -f "$f" ]; then bad "d: $rel is missing from the tree"; continue; fi
   if ! probe_consumes_resolver "$f"; then
@@ -412,6 +447,36 @@ if grep -q '^lib_srcs=.*cell-home\.sh' "$REPO_ROOT/pi-bootstrap/setup.sh"; then
   ok "d-farm pi-bootstrap/setup.sh declares cell-home.sh in its lib farm"
 else
   bad "d-farm pi-bootstrap/setup.sh does NOT farm the resolver (every farmed consumer degrades to \$HOME)"
+fi
+
+printf '\n── (d3) THE RENDERERS BAKE A DERIVED HOME, NOT THIS SHELL (review F1) ──────────────\n'
+# ⛔ THESE FOUR FILES PRODUCE THE TWO READINGS THE PASS'S SPLIT GUARD COMPARES, so each is a consumer in
+# the only sense that matters here: it ANSWERS "what is this box's home?" by writing it into a unit. They
+# were outside this pin, which is why a renderer answering that question from `$HOME` sat in the tree while
+# the guard refused its output forever — and the printed remedy (`cell-home-migrate.sh`) grades only the
+# LEGACY literal, so it reported such a box converged. A no-op loop.
+for rel in \
+  scripts/install-controller-service.sh \
+  scripts/install-harness-apply-timer.sh \
+  scripts/install-cell-timers.sh \
+  scripts/install-worker-supply.sh; do
+  f="$REPO_ROOT/$rel"
+  if [ ! -f "$f" ]; then bad "d3: $rel is missing from the tree"; continue; fi
+  if ! probe_home_from_resolver "$f"; then
+    bad "d3: $rel does not ASSIGN its CELL_HOME from the resolver — the unit it renders carries this shell's home, which is the split the pass refuses over"
+  elif probe_home_subst_from_shell "$f"; then
+    bad "d3: $rel substitutes {{HOME}} with the literal \$HOME — the rendered unit's HOME is this shell's, not the derivation's"
+  else
+    ok "d3: $rel takes the home it bakes into a unit from the derivation, never from this shell"
+  fi
+done
+# ⛔ AND THE SCHEDULED PASS'S UNIT IS THE ONE WHOSE `HOME` LEG THE PASS ITSELF READS, so its systemd render
+# must actually PASS the derived value into `render` — the two facts together are what close F1's split.
+# (Grounds: `harness-apply-pass.sh` puts the pass process's `HOME` against `cell_home_resolve`'s answer.)
+if grep -qF 'render "$src_svc" "$tmpd/$UNIT_NAME.service" "$CELL_HOME"' "$REPO_ROOT/scripts/install-harness-apply-timer.sh" 2>/dev/null; then
+  ok "d3 the harness-apply SYSTEMD render is handed the derived home (so its Environment=HOME= is the one home)"
+else
+  bad "d3 the harness-apply systemd render is NOT handed the derived home — the pass's own unit would export this shell's HOME, which its guard then refuses"
 fi
 
 # ⛔ AN EMPTY CELL_HOME IS THE FILESYSTEM ROOT, NOT A HOME (`O=/orchestrator`,
@@ -500,6 +565,46 @@ elif ! probe_consumes_resolver "$REPO_ROOT/scripts/deploy-crossbox.sh"; then
 else
   ok "e2 a consumer with its resolver lines removed is DETECTED by the real (d) probe, while the shipped file still passes it"
 fi
+
+# e2b: THE (d3) PROBES MUST DISCRIMINATE — otherwise the arms above are greps that match nothing, which
+# is the inert-gate shape this suite exists to catch. The pre-fix shapes are REPRODUCED here, not
+# remembered: both derivation spellings shipped in this tree (`install-cell-timers.sh` /
+# `install-worker-supply.sh` used the first; `install-controller-service.sh` used the second), and the
+# render spelling is `install-harness-apply-timer.sh`'s own.
+PRE1="$T/pre-default.sh"; printf '#!/usr/bin/env bash\nCELL_HOME="${CELL_HOME:-$HOME}"\n' >"$PRE1"
+PRE2="$T/pre-default2.sh"; printf '#!/usr/bin/env bash\nCELL_HOME="${CELL_HOME:-${HOME:?HOME is required}}"\n' >"$PRE2"
+PRE3="$T/pre-subst.sh"
+{ printf '#!/usr/bin/env bash\n'
+  printf '    sed -e "s|{{HOME}}|$(xml_sed_repl "$HOME")|g" "$tpl" >"$dest"\n'
+} >"$PRE3"
+if probe_home_from_resolver "$PRE1"; then
+  bad "e2b (d3) calls the pre-fix flat derivation (\${CELL_HOME:-\$HOME}) a resolver assignment — d3 is a stub"
+else
+  ok "e2b (d3) does NOT accept the pre-fix flat derivation (\${CELL_HOME:-\$HOME}) as a resolver assignment"
+fi
+if probe_home_from_resolver "$PRE2"; then
+  bad "e2b (d3) calls the pre-fix required-HOME spelling a resolver assignment — the shape install-controller-service.sh shipped is invisible"
+else
+  ok "e2b (d3) does NOT accept the pre-fix required-HOME spelling (\${CELL_HOME:-\${HOME:?…}})"
+fi
+if probe_home_subst_from_shell "$PRE3"; then
+  ok "e2b (d3) FIRES on the pre-fix render ({{HOME}} fed by the literal \$HOME)"
+else
+  bad "e2b (d3) does not fire on the pre-fix render — the {{HOME}} arm is a grep that matches nothing"
+fi
+# ⛔ AND IT MUST PASS WHAT SHIPPED, or it would be a gate nobody can satisfy and the next lane would
+# delete it rather than fix it. One arm per file, so a stub probe reddens instead of passing silently.
+_e2b_dirty=0
+for rel in scripts/install-controller-service.sh scripts/install-harness-apply-timer.sh \
+           scripts/install-cell-timers.sh scripts/install-worker-supply.sh; do
+  f="$REPO_ROOT/$rel"
+  if ! probe_home_from_resolver "$f" || probe_home_subst_from_shell "$f"; then
+    bad "e2b (d3) REJECTS the shipped $rel — the probe is not a polarity, it is a stub"
+    _e2b_dirty=1
+  fi
+done
+[ "$_e2b_dirty" = 1 ] || ok "e2b (d3) accepts all four shipped renderers AND rejects all three pre-fix shapes (the arm discriminates)"
+unset _e2b_dirty
 
 # e3: the legacy-default probe must FIRE on a file that carries the old assignment — otherwise c1 passes
 # on a pattern that matches nothing (the classic inert gate). Same pattern variable c1 uses.

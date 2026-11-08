@@ -119,8 +119,12 @@ unit_dirs() {
     return 0
   fi
   local d
+  # ⛔ `${HOME:+.config/…}`, NOT `${HOME:-}/.config/…` (review FOLLOW-UP 2): with `HOME` unset the `:-`
+  # form yields the ABSOLUTE `/.config/systemd/user`, a directory nobody has, which then enters the
+  # population walk as if an installer had chosen it. `:+` yields the empty string and the `[ -n "$d" ]`
+  # filter below drops it — the same spelling `reap-abandoned-worktrees.sh` already uses for this hazard.
   for d in "${SYSTEMD_UNIT_DIR:-}" "${CONTROLLER_SYSTEM_UNIT_DIR:-/etc/systemd/system}" \
-           "${CONTROLLER_USER_UNIT_DIR:-${HOME:-}/.config/systemd/user}"; do
+           "${CONTROLLER_USER_UNIT_DIR:-${HOME:+$HOME/.config/systemd/user}}"; do
     [ -n "$d" ] && printf '%s\n' "${d%/}"
   done | awk 'NF && !s[$0]++'
 }

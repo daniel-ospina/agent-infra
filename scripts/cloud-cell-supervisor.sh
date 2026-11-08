@@ -163,9 +163,17 @@ if [ -n "$CELL_HOME_LIB" ] && [ -r "$CELL_HOME_LIB" ]; then
   . "$CELL_HOME_LIB"
   CELL_HOME="$(cell_home_resolve)"
 else
-  CELL_HOME="${CELL_HOME:-${HOME:-}}"
-  [ -n "$CELL_HOME" ] || { printf '%s: FATAL: neither %s nor HOME is set, so the cell home cannot be derived — refusing to default it to the legacy /tmp/cell-home (agent-infra#3453)\n' "${0##*/}" "${CELL_HOME_LIB:-lib/cell-home.sh}" >&2; exit 78; }
-  printf '%s: warn: %s is not readable — using HOME as the cell home (%s). The DURABLE-home default is unavailable on this copy; run pi-bootstrap/setup.sh to place the resolver (agent-infra#3453)\n' "${0##*/}" "${CELL_HOME_LIB:-lib/cell-home.sh}" "$CELL_HOME" >&2
+  # ⛔ AN EXPLICIT `CELL_HOME` IS NOT A DEFAULT, AND MUST NOT BE REPORTED AS ONE (review FOLLOW-UP 1).
+  # This branch used to print "using HOME as the cell home" even when the box HAD named its home, so an
+  # operator who did the right thing was told it was defaulted — and then had no reason to look again
+  # when the RESOLVER went missing, which is the condition this warning exists to expose.
+  if [ -n "${CELL_HOME:-}" ]; then
+    printf '%s: warn: %s is not readable — keeping the CELL_HOME this box named (%s). The DURABLE-home resolver is unavailable on this copy; run pi-bootstrap/setup.sh to place it (agent-infra#3453)\n' "${0##*/}" "${CELL_HOME_LIB:-lib/cell-home.sh}" "$CELL_HOME" >&2
+  else
+    CELL_HOME="${HOME:-}"
+    [ -n "$CELL_HOME" ] || { printf '%s: FATAL: neither %s nor HOME is set, so the cell home cannot be derived — refusing to default it to the legacy /tmp/cell-home (agent-infra#3453)\n' "${0##*/}" "${CELL_HOME_LIB:-lib/cell-home.sh}" >&2; exit 78; }
+    printf '%s: warn: %s is not readable — using HOME as the cell home (%s). The DURABLE-home default is unavailable on this copy; run pi-bootstrap/setup.sh to place the resolver (agent-infra#3453)\n' "${0##*/}" "${CELL_HOME_LIB:-lib/cell-home.sh}" "$CELL_HOME" >&2
+  fi
 fi
 # ⛔ REPO HAS NO PATH DEFAULT (agent-infra#1935). This line used to be `REPO="${REPO:-/tmp/cell}"`,
 # and that path does not exist on the cloud cell: `start` died with `FATAL: no git repo at /tmp/cell`

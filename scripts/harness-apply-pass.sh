@@ -440,6 +440,7 @@ fi
 _CELL_HOME_EXPLICIT="${CELL_HOME:-}"
 SPLIT_HOME=""
 SPLIT_HOME_WHY=""
+SPLIT_HOME_SRC=""
 if [ -n "$CELL_HOME_LIB" ]; then
   . "$CELL_HOME_LIB"
   CELL_HOME="$(cell_home_resolve)"
@@ -449,15 +450,46 @@ if [ -n "$CELL_HOME_LIB" ]; then
   # `--print-status`/fleet-health reading the PREVIOUS tick as if it were this one, and `--dry-run`
   # "must not red a box (it changes nothing, including the exit contract)". The split is therefore a
   # READING on every verb, and a REFUSAL only on the acting one.
+  #
+  # ⛔ A `HOME` THAT DISAGREES IS A UNIT'S CLAIM ONLY WHEN A UNIT IS THE ONE CLAIMING IT (review F2). The
+  # premise of `SPLIT_HOME_WHY` — "the unit that starts this pass exports HOME=…" — holds only when a
+  # unit DID start this pass. An operator running it by hand in a `cmux vm exec` shell has
+  # `HOME=/home/ubuntu` and no unit in the picture, while the derived home is the passwd home `/home/cmux`
+  # — i.e. the home the controller reads, so the pin this run would write is the CORRECT one, yet the run
+  # refused (exit 27) with a diagnostic asserting a unit exported a value it never did. That is a false
+  # block AND a false statement, on the invocation shape this file's own header calls ordinary.
+  #
+  # THE MARKER IS THE UNIT'S OWN, NOT A GUESS: systemd sets `INVOCATION_ID` (and `JOURNAL_STREAM`) per
+  # activation for every service it starts, so their presence is what distinguishes "a unit exported
+  # this HOME" from "this shell's HOME". ⛔ IT IS A ONE-WAY MARKER, AND THE WEAKER DIRECTION IS THE
+  # SAFE ONE HERE: it can be INHERITED by a manual run inside a unit's shell (which then still refuses,
+  # as before), but a unit invocation does not omit it — so this cannot turn a real unit split into a
+  # warning. The leg that can genuinely MIS-PLACE a pin is the controller's, below, and that one refuses
+  # unconditionally on every invocation shape.
+  _unit_invoked=0
+  if [ -n "${INVOCATION_ID:-}" ] || [ -n "${JOURNAL_STREAM:-}" ]; then _unit_invoked=1; fi
   if [ -z "$_CELL_HOME_EXPLICIT" ] && [ -n "${HOME:-}" ] && [ "$HOME" != "$CELL_HOME" ]; then
-    SPLIT_HOME="$HOME"
-    SPLIT_HOME_WHY="the unit that starts this pass exports HOME=$HOME"
+    if [ "$_unit_invoked" = 1 ]; then
+      SPLIT_HOME="$HOME"
+      SPLIT_HOME_SRC="unit"
+      SPLIT_HOME_WHY="the unit that starts this pass exports HOME=$HOME"
+    else
+      # A READING, NEVER A REFUSAL — and worded as what it actually measured, so the operator is not told
+      # a unit said something it did not. Stderr, because it must not disturb a `--dry-run`/`--print-status`
+      # exit contract, and because the unit captures stderr into the tick's log.
+      printf '%s: note: the HOME of this process (%s) differs from the derived CELL_HOME (%s), and no unit started this run (no INVOCATION_ID/JOURNAL_STREAM) — a HOME set by a shell is not a claim made by a unit, so the pin goes under the DERIVED home (agent-infra#3453)\n' "${0##*/}" "$HOME" "$CELL_HOME" >&2
+    fi
   fi
-  # …and the controller's own home, which is the one a pin must land under.
+  unset _unit_invoked
+  # …and the controller's own home, which is the one a pin must land under. ⛔ RESOLVED EVEN WHEN THE
+  # `HOME` READING ABOVE ALREADY FIRED (review F2): the two are independent claims, and the controller's
+  # is the authoritative one — short-circuiting on `HOME` is what made a manual run's harmless reading
+  # silence (or, before, pre-empt) the leg that can really mis-place a pin.
   if [ -z "$SPLIT_HOME" ]; then
     _ctrl_home="$(split_home_controller)"
     if [ -n "$_ctrl_home" ] && [ "$_ctrl_home" != "$CELL_HOME" ]; then
       SPLIT_HOME="$_ctrl_home"
+      SPLIT_HOME_SRC="controller"
       SPLIT_HOME_WHY="the controller's unit pins CELL_HOME=$_ctrl_home"
     fi
     unset _ctrl_home
@@ -663,7 +695,7 @@ print_status() {
 # nothing (including its exit contract), so neither may exit 27 — but both must be able to SAY the split,
 # or an operator inspecting a box is the last to learn why it is red.
 if [ -n "$SPLIT_HOME" ]; then
-    log_line "split_home=$SPLIT_HOME derived=$CELL_HOME why=[$SPLIT_HOME_WHY] — two live homes on one box (agent-infra#3453); converge with cell-home-migrate.sh --check, then --apply"
+    log_line "split_home=$SPLIT_HOME derived=$CELL_HOME from=${SPLIT_HOME_SRC:-unknown} why=[$SPLIT_HOME_WHY] — two live homes on one box (agent-infra#3453); the refusal on the acting verb names the instrument that resolves it"
 fi
 
 if [ "$MODE" = "status" ]; then print_status; exit $?; fi
@@ -1282,7 +1314,23 @@ if [ -n "$SPLIT_HOME" ]; then
     fi
     REC_ACTION=refused-split-home
     REC_DETAIL="split home: $SPLIT_HOME_WHY but this pass derives CELL_HOME=$CELL_HOME"
-    REC_REMEDY="converge the box: bash scripts/cell-home-migrate.sh --check, then --apply (or set CELL_HOME explicitly if $SPLIT_HOME is the home this box's controller really reads)"
+    # ⛔ THE REMEDY MUST BE ABLE TO RESOLVE THE REFUSAL (review F1). This field used to send EVERY split
+    # to `cell-home-migrate.sh` — but that tool's whole graded population is the LEGACY literal, so on a
+    # box whose unit pins some OTHER wrong home (a stale `/home/ubuntu`, the measured `cmux vm exec`
+    # value, baked in by an older installer) it answers "one home — nothing to do", the operator's only
+    # printed remedy is a no-op, and the tick stays red forever. The remedy is now derived from WHERE the
+    # disagreement came from: the legacy literal → the migration really is the tool; any other home →
+    # the installer that rendered the unit, which is the thing that must be re-run.
+    case "$SPLIT_HOME" in
+      "$CELL_HOME_LEGACY")
+        REC_REMEDY="converge the box: bash scripts/cell-home-migrate.sh --check, then --apply (it repoints the legacy $CELL_HOME_LEGACY)" ;;
+      *)
+        if [ "$SPLIT_HOME_SRC" = controller ]; then
+          REC_REMEDY="re-render the controller's unit so it exports the ONE home: bash scripts/install-controller-service.sh --install (or set CELL_HOME explicitly if $SPLIT_HOME is the home this box's controller really reads). cell-home-migrate.sh grades only the legacy literal, so it reports this box converged"
+        else
+          REC_REMEDY="re-render this pass's own unit so it exports the ONE home: bash scripts/install-harness-apply-timer.sh --install (or set CELL_HOME explicitly if $SPLIT_HOME is the home this box's controller really reads). cell-home-migrate.sh grades only the legacy literal, so it reports this box converged"
+        fi ;;
+    esac
     err "REFUSED split-home: $SPLIT_HOME_WHY, but this pass derives CELL_HOME='$CELL_HOME' — two live homes on one box, so the pin this pass would write is not the pin the controller reads (agent-infra#3453)"
     # ⛔ NOT "nothing was touched" WITHOUT A QUALIFIER (review round-3 F6, measured): the fetch that
     # refreshed the ref already ran, and it writes `.git/FETCH_HEAD` and the remote-tracking ref. The

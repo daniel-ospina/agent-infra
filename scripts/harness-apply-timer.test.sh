@@ -1639,7 +1639,15 @@ run_under() { # <env assignments…> [extra args…] — the pass under exactly 
     # died before the pass was ever started, and the suite reported them as ordinary assertion failures
     # naming `_args[@]` rather than the cause. The `${arr[@]+"${arr[@]}"}` form expands to nothing when
     # empty on both bash 3.2 and bash 5, so the same arms measure the same thing on both hosts.
-    env -i ${_env[@]+"${_env[@]}"} PATH="$ACCT27:/usr/bin:/bin:/usr/sbin:/sbin" HARNESS_APPLY_DRIFT_CHECK=0 \
+    # ⛔ A UNIT INVOCATION CARRIES `INVOCATION_ID`, AND THE PASS NOW ASKS (review F2). The rendered
+    # `Environment=` lines below are the UNIT's environment, so the run they describe is a unit's run;
+    # systemd sets `INVOCATION_ID` (and `JOURNAL_STREAM`) per activation, and the pass uses exactly that
+    # to tell "a unit exported this HOME" from "this shell's HOME". Without it here the arms would
+    # exercise the MANUAL shape while claiming to measure the unit's — and the split they exist to grade
+    # would read as no split at all. The manual shape has its own arm below, which omits it.
+    local -a _marker=()
+    [ "${RUN_NO_UNIT:-0}" = 1 ] || _marker+=("INVOCATION_ID=0f3d2a1c0b9e4d6a8c7e5f4b3a2c1d0e")
+    env -i ${_env[@]+"${_env[@]}"} ${_marker[@]+"${_marker[@]}"} PATH="$ACCT27:/usr/bin:/bin:/usr/sbin:/sbin" HARNESS_APPLY_DRIFT_CHECK=0 \
         HARNESS_APPLY_FARM_CHECK=0 \
         bash "${PASS_UNDER_TEST:-$PASS_SH}" ${_args[@]+"${_args[@]}"} 2>&1
 }
@@ -1683,6 +1691,43 @@ assert_contains "$OUT" "REFUSED split-home" "T27 and the refusal says what it is
 assert_contains "$OUT" "CELL_HOME='$T27/acct-home'" "T27 naming the home it would have used"
 assert_contains "$OUT" "exports HOME=$T27/legacy-home" "T27 and the unit's home it would have diverged from"
 assert_contains "$OUT" "cell-home-migrate.sh" "T27 and the remedy, so the operator is not left to guess"
+# ⛔ AND THE REMEDY MUST BE ABLE TO RESOLVE THE REFUSAL (review F1). This one used to send EVERY split to
+# `cell-home-migrate.sh` — a tool whose whole graded population is the LEGACY literal, so on a box whose
+# unit pins some OTHER wrong home (a stale `/home/ubuntu`, the measured `cmux vm exec` value, baked in
+# by an older installer) it answers "one home — nothing to do" and the only printed remedy is a no-op
+# loop. The two arms below are a DISCRIMINATING PAIR on the one input that now decides the remedy: the
+# fixture's `$T27/legacy-home` is a wrong home that is NOT the legacy literal, and overriding
+# `CELL_HOME_LEGACY` to it makes the same run the legacy case.
+assert_contains "$OUT" "install-harness-apply-timer.sh" \
+    "T27 the remedy for a NON-legacy split names the installer that rendered this unit"
+assert_contains "$OUT" "reports this box converged" \
+    "T27 …and says the migration CANNOT resolve it, so the operator is not sent in a loop"
+OUT="$(run_under CELL_HOME_LEGACY="$T27/legacy-home" "${HA_ENV[@]}")"
+assert_contains "$OUT" "cell-home-migrate.sh --check" \
+    "T27 when the split IS the legacy literal the remedy is the migration (the tool that grades it)"
+assert_absent "$OUT" "reports this box converged" \
+    "T27 …and it does not warn the migration is useless for a home it really does grade"
+# ⛔ THE MANUAL SHAPE: THE SAME DISAGREEMENT WITH NO UNIT BEHIND IT (review F2). An operator running the
+# pass by hand in a `cmux vm exec` shell has `HOME=/home/ubuntu` and no unit in the picture, while the
+# derived home is the account's — the home the controller reads. So the pin that run would write is the
+# CORRECT one, and it used to refuse (27) with a diagnostic asserting "the unit that starts this pass
+# exports HOME=…" about a unit that does not exist. Fail-closed, so no wrong write — but a false block
+# plus a false statement, on the invocation shape the pass's own header documents as ordinary.
+OUT="$(RUN_NO_UNIT=1 HARNESS_APPLY_CONTROLLER_UNIT="$T27/absent.service" run_under "${HA_ENV[@]}")"; RC=$?
+if [ "$RC" = "27" ]; then
+    bad "T27 manual: a HAND-run pass still exits 27 over a HOME no unit exported (review F2's false block)"
+else
+    ok "T27 manual: a hand-run pass is NOT refused over a HOME no unit exported (rc=$RC)"
+fi
+assert_absent "$OUT" "REFUSED split-home" "T27 manual: …and nothing claims a unit exported a home it did not"
+assert_absent "$OUT" "the unit that starts this pass exports" "T27 manual: …and the false premise is gone from the output"
+assert_contains "$OUT" "no unit started this run" "T27 manual: …and the reading is stated as what it actually measured"
+# …AND THE UNIT SHAPE OF THE SAME ENVIRONMENT STILL REFUSES — otherwise the arm above would be satisfied
+# by deleting the guard instead of by scoping it, and a real unit split would go unwarned. This is the
+# polarity partner of the manual arm, on the SAME rendered environment, differing only in the marker.
+OUT="$(HARNESS_APPLY_CONTROLLER_UNIT="$T27/absent.service" run_under "${HA_ENV[@]}")"; RC=$?
+assert_eq "$RC" "27" "T27 a UNIT invocation with the SAME HOME still refuses (the manual arm is a scope, not a deletion)"
+assert_contains "$OUT" "the unit that starts this pass exports" "T27 …and a unit invocation may still say so, because it is true there"
 # ⛔ NON-VACUITY: the refusal is what stops it. Remove `exit 27` and the same environment runs — and the
 # home it runs with is the account's, i.e. the split F1 measured. Without this leg, T27 would be green
 # on a tree whose guard had been deleted.
