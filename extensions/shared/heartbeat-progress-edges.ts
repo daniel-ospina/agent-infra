@@ -136,6 +136,11 @@ export const OUT_OF_FAMILY_TERMS = [
   // above and its BEHAVIOUR pinned by origination-funnel.test.sh §5c (young ⇒ in flight, past the
   // bound ⇒ BLOCKED, unreadable `at=` ⇒ BLOCKED).
   "RUNNING_STALE_MIN",
+  // agent-infra#3584: the in-cycle TRANSIENT retry's ATTEMPT cap. `_ATTEMPTS` is not a bound suffix
+  // and carries no family token, so the name scan cannot see it — listed deliberately, with its
+  // value pinned by the registration above and its BEHAVIOUR pinned by refresh-scout.test.sh §7
+  // (b1) (3 attempts at the default, read off the invoke count) and (b2) (cap=1 makes exactly one).
+  "REFRESH_RETRY_MAX_ATTEMPTS",
   "DEFAULT_MAX_DISPATCH_MS",
   // #1167: the merge rail's two surviving re-run bounds. Their shell symbols
   // carry no stall-family token (the STALLED threshold is now the DERIVED
@@ -966,6 +971,62 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     guardedBy:
       "scripts/orchestrator-harness/origination-funnel.test.sh §5c — the reader's in-flight/dead split (see REFRESH_STALE_LOCK_MIN)",
     note: "DERIVED alias of REFRESH_STALE_LOCK_MIN, kept as its own symbol so the reader can be re-pointed without touching the lock guard. `inFamily` cannot see it (no family token in `RUNNING`), so it is registered rather than left to the reverse scan — the audit should know every bound the beat acts on.",
+  },
+  // agent-infra#3584 — the in-cycle TRANSIENT retry bounds. These are the actuation guard for the
+  // stall the issue measured: a `TRANSIENT` refresh refusal used to be retried only at the next
+  // cycle (15-161 min away, #3585), so a hiccup a 30 s retry clears cost HOURS of origination. The
+  // THREE `_S` knobs are seen by the reverse scan (`_S` is a bound suffix) and must be registered;
+  // `…_ATTEMPTS` is NOT (no family token), so it is registered DELIBERATELY on the
+  // `RUNNING_STALE_MIN` precedent: it is the runaway guard for exactly this failure mode, and a
+  // retry loop whose cap nothing audits is a bound nobody notices going missing.
+  {
+    name: "REFRESH_RETRY_MAX_ATTEMPTS",
+    owners: ["scripts/orchestrator-harness/orch-loop.sh"],
+    value: '"${REFRESH_RETRY_MAX_ATTEMPTS:-3}"',
+    overrides: [
+      "REFRESH_RETRY_MAX_ATTEMPTS=3",
+      "REFRESH_RETRY_MAX_ATTEMPTS=3",
+      "REFRESH_RETRY_MAX_ATTEMPTS=3",
+      "REFRESH_RETRY_MAX_ATTEMPTS=10",
+    ],
+    axis: "gate",
+    guardedBy:
+      "scripts/orchestrator-harness/refresh-scout.test.sh §7 (b1)/(b2)/(b6) — the shipped retry block is extracted VERBATIM and driven: an invoke count of 3 at the default, exactly 1 at cap=1, and the default restored when the knob is junk (`abc`)",
+    note: "attempt cap for the in-cycle retry of a TRANSIENT refresh (3 default, ceiling 10). The `_ATTEMPTS` suffix carries no family token so the reverse scan cannot see it — registered rather than left to the scan, and validated (`case … *[!0-9]*|0[0-9]*`) BEFORE the `[ -ge ]` it feeds, because an unvalidated `abc` makes that comparison an error read as false, i.e. a silently missed cap.",
+  },
+  {
+    name: "REFRESH_RETRY_BACKOFF_S",
+    owners: ["scripts/orchestrator-harness/orch-loop.sh"],
+    value: '"${REFRESH_RETRY_BACKOFF_S:-30}"',
+    overrides: ["REFRESH_RETRY_BACKOFF_S=30", "REFRESH_RETRY_BACKOFF_S=30"],
+    axis: "gate",
+    guardedBy:
+      "scripts/orchestrator-harness/refresh-scout.test.sh §7 (b1) — the retry line must name `attempt 1/3 … retrying in 0s`, so the delay and the attempt ordinal are read off the shipped block; (b3) proves the delay is REFUSED (not shortened) when it does not fit the budget; and (b7) drives REFRESH_RETRY_MAX_DELAY_S itself (backoff 1000 clamped to a 1 s cap), so the per-DELAY clamp is graded rather than assumed",
+    note: "first in-cycle backoff delay for a TRANSIENT refresh, DOUBLED per attempt and clamped by REFRESH_RETRY_MAX_DELAY_S. Suites set it to 0 so the policy is graded instead of slept through — which is also why it is a knob and not a literal.",
+  },
+  {
+    name: "REFRESH_RETRY_MAX_DELAY_S",
+    owners: ["scripts/orchestrator-harness/orch-loop.sh"],
+    value: '"${REFRESH_RETRY_MAX_DELAY_S:-120}"',
+    overrides: ["REFRESH_RETRY_MAX_DELAY_S=120", "REFRESH_RETRY_MAX_DELAY_S=120"],
+    axis: "gate",
+    guardedBy:
+      "scripts/orchestrator-harness/refresh-scout.test.sh §7 (b7) — the backoff is set ABOVE the cap and the arm asserts the LOGGED delay is the cap, so `[ \"$_rd\" -gt \"$REFRESH_RETRY_MAX_DELAY_S\" ]` is exercised; (b3)'s budget refusal reads the same clamped delay",
+    note: "per-delay cap on the doubled backoff, so raising REFRESH_RETRY_BACKOFF_S or the attempt cap cannot make one sleep unbounded. The TOTAL bound is REFRESH_RETRY_BUDGET_S, not this — this one only stops a single delay running away.",
+  },
+  {
+    name: "REFRESH_RETRY_BUDGET_S",
+    owners: ["scripts/orchestrator-harness/orch-loop.sh"],
+    value: '"${REFRESH_RETRY_BUDGET_S:-300}"',
+    overrides: [
+      "REFRESH_RETRY_BUDGET_S=300",
+      "REFRESH_RETRY_BUDGET_S=300",
+      "REFRESH_RETRY_BUDGET_S=300",
+    ],
+    axis: "gate",
+    guardedBy:
+      "scripts/orchestrator-harness/refresh-scout.test.sh §7 (b3) — with REFRESH_RETRY_BACKOFF_S=30 and the budget at 1 s the block makes exactly ONE attempt and logs `the 1s in-cycle retry budget is spent`, naming the stale-lock guard it protects",
+    note: "the TOTAL SLEEP the retries may spend in one cycle, checked BEFORE each sleep. This is a correctness bound, not politeness: REFRESH_STALE_LOCK_MIN clears `.refresh.lock` after 20 min, so a retrying pass that outlived it would be reaped by the NEXT cycle while STILL RUNNING — exactly the concurrent double-pass the lock exists to prevent. Checked before the sleep so no combination of the two per-delay knobs can walk past it; the shipped defaults sleep 30+60 = 90 s, an order of magnitude under the guard.",
   },
   // — retention axis —
   {

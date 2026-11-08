@@ -1947,6 +1947,20 @@ if [ -s "$T/refreshblock.sh" ] && grep -q 'refresh-candidates.sh' "$T/refreshblo
   n9="$(wc -c < "$BLR6/invoked" | tr -d ' ')"
   [ "$n9" = "3" ] && ok "orch-loop: a junk REFRESH_RETRY_MAX_ATTEMPTS falls back to the default (3), not to no cap" \
                    || bad "orch-loop: REFRESH_RETRY_MAX_ATTEMPTS=abc gave $n9 attempt(s), expected the default 3"
+  # (b7) THE PER-DELAY CAP IS GRADED, not assumed. The backoff is set far ABOVE
+  # `REFRESH_RETRY_MAX_DELAY_S`, so a passing arm proves the clamp ran and the LOGGED delay is the cap
+  # (a delay that was merely short would pass a weaker assertion). The budget is raised out of the way
+  # so the clamp, not the budget, is what this arm measures — (b3) is the arm that measures the budget.
+  BLR7="$T/retry7"; mkdir -p "$BLR7"; : > "$BLR7/candidates.txt"
+  printf '#!/bin/bash\nprintf "x" >> "%s/invoked"\nrefresh_record_write() { :; }\nexit 1\n' "$BLR7" > "$BLR7/refresh-candidates.sh"
+  O="$BLR7" LOG="$BLR7/log" REFRESH_RETRY_BACKOFF_S=1000 REFRESH_RETRY_MAX_DELAY_S=1 \
+    REFRESH_RETRY_MAX_ATTEMPTS=2 REFRESH_RETRY_BUDGET_S=10 bash "$T/refreshblock.sh" >/dev/null 2>&1
+  n7b="$(wc -c < "$BLR7/invoked" | tr -d ' ')"
+  grep -q 'TRANSIENT rc=1 (attempt 1/2) — retrying in 1s' "$BLR7/log" 2>/dev/null \
+    && ok "orch-loop: a backoff above REFRESH_RETRY_MAX_DELAY_S is CLAMPED to it (logged delay is the cap)" \
+    || bad "orch-loop: the per-delay cap did not run — $(grep 'TRANSIENT rc=1' "$BLR7/log" 2>/dev/null | head -1)"
+  [ "$n7b" = "2" ] && ok "orch-loop: the clamped delay still fits the budget, so the second attempt is made" \
+                   || bad "orch-loop: a clamped delay was wrongly refused ($n7b attempt(s), expected 2)"
   # (c) BOUND THE MARKER'S EVIDENCE TO THE CURRENT RUN (agent-infra#1853 review P2). $LOG is
   # append-only and never rotated, so a bare `grep 'NOT PROVISIONABLE' "$LOG"` would quote a
   # PREVIOUS cycle's refusal as this run's reason — presenting a cause that no longer fired. The
