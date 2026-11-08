@@ -2109,6 +2109,92 @@ export function classifyTaskExit(code: number | null, toolsInFlight: number): Ta
   return "success";
 }
 
+// ── #1208: child liveness as a FIELD on every task result ───────────────
+//
+// THE DEFECT this block exists to close: the task tool's own result was the
+// only liveness signal a parent got, and for a child that died before it could
+// emit its first message the result was structurally identical to "the child
+// ran and had nothing to say" — no pid, no message count, no terminal state.
+// The parent then had to go find the child's pid and `ps` for it, which is not
+// in the tool's contract and which the fleet got wrong repeatedly (measured
+// 2026-09-18: a dead child in every lane that dispatched; parents waiting on
+// panes long after the process was gone). Every consumer that could not do that
+// reconstruction — `lane-status.py`, `lane-actions.py`, the harness instruments
+// — rebuilt it from cwd matching, transcript mtimes and pane scrapes, and got
+// it wrong in BOTH directions (a live child read `CHILD-STUCK`; a working child
+// reported CUT while it went on to open a PR).
+//
+// So the fields ride the RESULT, on every path, composed at the one funnel every
+// in-spawn resolution passes through (`doResolve`) rather than at each of the
+// dozen call sites — a field set that has to be remembered at every composition
+// is the same "each consumer reconstructs it" defect with a shorter half-life.
+
+/** What the parent can now say about the child, as ONE value. The distinction
+ * that matters is `died-before-first-message` vs `completed`: an empty payload
+ * from the former is NOT an answer, and no amount of further waiting changes
+ * it. */
+export type TaskChildState =
+  /** A message was emitted and/or a readable result came back. */
+  | "completed"
+  /** The parent killed it (cut / hard cap / backstop / heartbeat bound). The
+   * partial output that rides the result is NOT a verdict. */
+  | "killed"
+  /** The child ran (emitted messages) but no readable result came back. */
+  | "exited-no-result"
+  /** The child produced ZERO completed messages: it died during startup and
+   * never said anything, so whatever rides the result must never be read as an
+   * empty answer. */
+  | "died-before-first-message";
+
+/** The canonical liveness field set, present on EVERY `task` result `details`
+ * (exported so a consumer imports the vocabulary instead of re-enumerating it,
+ * and so the suites assert against the same list the composer emits). */
+export const TASK_LIVENESS_DETAIL_KEYS = [
+  "childPid",
+  "childState",
+  "childExited",
+  "childMessagesSent",
+] as const;
+
+/** #1208: how many messages the child is known to have sent, or `null` when the
+ * child never ran the heartbeat emitter and the parent therefore has NO
+ * evidence either way.
+ *
+ * ⛔ `null` IS NOT `0`. `0` is positive evidence of a slow-start death; `null`
+ * means the question cannot be answered (an older/absent emitter, or
+ * TASK_HEARTBEAT_DISABLE=1 in the child). Collapsing them would classify every
+ * dispatch on a heartbeat-less box as dead — a false failure in the one place
+ * the fleet reads as "stop, do not continue".
+ *
+ * The count is COMPLETED turns (`turn_end`, monotonic), floored at 1 when the
+ * content latch `everSawMsg` fired: a child that streamed its first message and
+ * died before finishing that turn has still sent something, and the floor keeps
+ * the "zero messages" claim honest without inventing a count. */
+export function childMessagesSent(
+  state: Pick<HeartbeatState, "messagesSent" | "everSawMsg" | "sawReady" | "markerCount">,
+): number | null {
+  if (!state.sawReady && state.markerCount === 0) return null;
+  if (state.messagesSent > 0) return state.messagesSent;
+  return state.everSawMsg ? 1 : 0;
+}
+
+/** #1208: the ONE child-liveness classifier. Ordered so the strongest claim
+ * wins: a kill is a kill whatever else happened, a readable result is an
+ * answer, and "zero messages" is only reachable once both are excluded. */
+export function classifyChildLiveness(i: {
+  killed: boolean;
+  /** The child's OWN stdout came back (the composer's own fallback sentences
+   * such as `Sub-agent exited with code 0` do NOT count — they are the tool
+   * talking, not the child). */
+  hasStdout: boolean;
+  messagesSent: number | null;
+}): TaskChildState {
+  if (i.killed) return "killed";
+  if (i.hasStdout) return "completed";
+  if (i.messagesSent === 0) return "died-before-first-message";
+  return "exited-no-result";
+}
+
 /** Alive state parsed from [task-heartbeat] markers. Ticks overwrite the
  * per-event fields (self-healing if an event marker was lost). */
 export interface HeartbeatState {
@@ -2181,6 +2267,14 @@ export interface HeartbeatState {
   /** Session latch — tool activity was ever observed (tool_start/tool_end or
    * tick saw_tool=1). Distinct from per-turn turnSawTool (resets on turn_start). */
   everSawTool: boolean;
+  /** #1208: COMPLETED model turns observed via `turn_end` markers — the
+   * parent-side "did this child ever say anything" count. Monotonic and
+   * session-level (a child's turn resets cannot erase it), so `0` is positive
+   * evidence that NO turn ever ran to completion, which is the slow-start
+   * death. Deliberately NOT derived from ticks: `saw_msg=1` repeats on every
+   * tick of a turn, so a tick-derived counter measures ticks, not messages.
+   * Read it through `childMessagesSent()`, never directly. */
+  messagesSent: number;
   /** ts of the first everSawRealActivity source (0 = none) — the parent's
    * time-to-first-observable-activity, comparable to the child's own
    * time-to-first-activity measured from session logs (#282 sweep). */
@@ -2248,6 +2342,7 @@ export function createHeartbeatState(): HeartbeatState {
     firstTickAt: 0,
     everSawMsg: false,
     everSawTool: false,
+    messagesSent: 0,
     firstActivityAt: 0,
     toolsMaxInFlight: 0,
     activityTrace: [],
@@ -2422,6 +2517,10 @@ export function parseHeartbeatLine(
       break;
     case "turn_end":
       state.turnActive = false;
+      // #1208: one COMPLETED model turn = one message the child emitted. The
+      // only marker that proves a message finished end-to-end (turn_start
+      // fires before the provider call, so it proves nothing about output).
+      state.messagesSent += 1;
       // Mirror the child's outstanding-tools clear on turn_end (pi guarantees
       // all tools finalize before turn_end). Prevents a stale event counter
       // after a lost tool_end from causing a false tool-stall kill (code-
@@ -4082,8 +4181,14 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
       );
     };
 
+    // #1208: a settle payload may carry the tool-level `isError` flag (pi shows
+    // the model an error, and `tool_execution_end.isError` becomes true), which
+    // a child-liveness state can require. Declared here so `doResolve` is the
+    // only place that decides it — never a call site.
+    type TaskSettlePayload = { content: any[]; details: Record<string, unknown>; isError?: boolean };
+
     const doResolve = (
-      value: { content: any[]; details: Record<string, unknown> } | undefined,
+      value: TaskSettlePayload | undefined,
       // `reason` is the row discriminator. A row is written IFF `reason` is
       // provided, and the enumeration is exact (#783 review — the previous
       // "success → NO row" phrasing was false for `clean-empty`):
@@ -4178,8 +4283,53 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
         }
         if (hbCtx.state.everSawTool) details.sawTools = true;
         else if (hbEnabled && hbCtx.state.markerCount === 0) details.sawToolsUnknown = true;
-        if (Object.keys(details).length > 0) {
-          value = { ...value, details };
+        // ── #1208: child liveness as a FIELD, on every settled result ─────────
+        // Composed at this one funnel rather than at the dozen composition call
+        // sites: a field set that must be remembered at each of them is the same
+        // "every consumer reconstructs liveness for itself" defect the issue
+        // names, only with a shorter half-life. See TASK_LIVENESS_DETAIL_KEYS.
+        const messagesSent = childMessagesSent(hbCtx.state);
+        const childState = classifyChildLiveness({
+          killed: details.killed === true,
+          hasStdout: stdout.trim().length > 0,
+          messagesSent,
+        });
+        details.childPid = typeof proc.pid === "number" ? proc.pid : null;
+        details.childState = childState;
+        // "terminal status" (issue ask 1): whether the OS told us the child is
+        // gone. On the kill paths it is still false at settle time — the kill
+        // was just signalled — and saying so is the point: `childState: killed`
+        // with `childExited: false` is a child the parent believes is still
+        // dying, not one it proved dead.
+        details.childExited = proc.exitCode !== null || proc.signalCode !== null;
+        // `0` is positive evidence (no completed message ever); `null` means
+        // the child ran no heartbeat emitter and the parent knows nothing.
+        details.childMessagesSent = messagesSent;
+        value = { ...value, details };
+        if (childState === "died-before-first-message") {
+          // Issue asks 3 + 4: a DISTINCT result for the slow-start death, and a
+          // non-zero exit by default so a parent's default handling is to stop
+          // rather than to continue on a payload that means "nothing happened".
+          // Without this the parent got `Sub-agent exited with code 0` — the
+          // exact collapse the issue was filed for: a dead child's result read
+          // as a completed one.
+          details.status = "died-before-first-message";
+          details.isError = true;
+          value = {
+            content: [
+              {
+                type: "text",
+                text:
+                  `\u26d4 Sub-agent died before its first message \u2014 it completed 0 turns and returned no result ` +
+                  `(pid ${details.childPid ?? "unknown"}, exit ${details.exitCode ?? "not recorded"}).\n\n` +
+                  `This is NOT an empty answer. Nothing the child was asked to do was performed: no message was ` +
+                  `ever emitted, so there is no verdict, no report and no "nothing to say" to read here. ` +
+                  `Re-dispatch it, or investigate the child's transcript before assuming the work happened.`,
+              },
+            ],
+            details,
+            isError: true,
+          };
         }
       }
       // #271 settle-path sweep hook (round-3 F2): runs whenever the exit-settle
@@ -4780,7 +4930,7 @@ type TaskResultDetails = {
  * legitimises `DEFAULT_TOOL_STALL_MS` in §6. Dropping the keyword does not
  * weaken the set; it silently re-reds that contract as "documented but read by
  * nothing", which reads as a phantom knob to whoever hits it next. */
-export const FAILED_TASK_STATUS = new Set(["failed", "circuit_open", "invalid-cwd", "invalid-session-id", "fleet-saturated"]);
+export const FAILED_TASK_STATUS = new Set(["failed", "circuit_open", "invalid-cwd", "invalid-session-id", "fleet-saturated", "died-before-first-message"]);
 
 // ── #1662: background dispatch (returns-early) + status/collect seam ────────
 //
@@ -6192,7 +6342,7 @@ export default function (pi: ExtensionAPI) {
           };
         }
       }
-      type DispatchPayload = { content: any[]; details: Record<string, unknown> };
+      type DispatchPayload = { content: any[]; details: Record<string, unknown>; isError?: boolean };
       // #783 Task 1: a dispatch that could not persist a transcript is still a
       // dispatch (the tool result is real), but the degradation must be
       // visible AND non-retryable — a retry cannot fix an unwritable root.
@@ -6406,9 +6556,17 @@ export default function (pi: ExtensionAPI) {
       }
 
       if (result.status === "failed") {
+        // #1208 ask 4: NON-ZERO by default. `status: "failed"` is a machine
+        // field the review floor reads, but the MODEL saw an ordinary successful
+        // tool call whose text happened to say "failed" — so a parent's default
+        // handling was to keep going on a dispatch that never produced a
+        // terminal message. `isError` is what makes the default handling stop;
+        // `details.isError` is the same fact in the load-order-independent form
+        // `shared/spawn-capacity.ts` reads.
         return withSessionDegraded({
           content: [{ type: "text", text: `❌ Sub-agent failed after ${result.retries} attempts with no output. Model may be hung or overloaded.` }],
-          details: { model, provider, status: "failed", retries: result.retries, elapsedMs: result.elapsedMs },
+          details: { model, provider, status: "failed", retries: result.retries, elapsedMs: result.elapsedMs, isError: true },
+          isError: true,
         });
       }
 

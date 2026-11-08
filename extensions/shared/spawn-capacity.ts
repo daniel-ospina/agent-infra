@@ -88,7 +88,15 @@ export type SpawnOutcome = "verdict" | "refused" | "cut" | "failed";
  * read by nothing".
  */
 export const REFUSED_STATUS = new Set(["invalid-cwd", "invalid-session-id", "circuit_open", "fleet-saturated"]);
-const FAILED_STATUS = new Set(["failed"]);
+// ⛔ MIRROR of `builtin-tools`' FAILED_TASK_STATUS (#2242 review, P1). The drift row in
+// `spawn-capacity.test.ts` reads the producer's set as text and reddens by name on a member that
+// is missing here, so a new failure status cannot silently classify as a `verdict` (which would
+// satisfy the >=1-dispatch floor for an UNREVIEWED push).
+// `died-before-first-message` (#1208) is a FAILURE, not a refusal: a child WAS spawned and ran, it
+// just never emitted a message — so the payload is never a reviewer verdict, and the remedy is a
+// re-dispatch rather than a fix to the arguments. It also deliberately does NOT join
+// REFUSED_STATUS, whose members all mean "no child ever existed".
+const FAILED_STATUS = new Set(["failed", "died-before-first-message"]);
 const CUT_STATUS = new Set(["cut"]);
 
 /**
