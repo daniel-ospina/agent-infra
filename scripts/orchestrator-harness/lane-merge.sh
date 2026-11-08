@@ -403,10 +403,24 @@ PY
 }
 
 # ── chain supervision ────────────────────────────────────────────────────────────────────────────
-chain_pid() { awk '{print $1}' "$CHAIN_F" 2>/dev/null; }
-chain_head() { awk '{print $2}' "$CHAIN_F" 2>/dev/null; }
+# ⛔ COUNTER FILES ARE READ WITH A BUILTIN, INCLUDING HERE (round-25 review, P1). `round_of` and the
+# watch increment were converted, but the counters DESIDE whether a loop is bounded, and three of those
+# reads were still `cat`: a `cat` answering 0 for `*.headmoved` makes "pass 2" unreachable, and one
+# answering 0 for `*.apiretry` makes the refund unconditional, so WATCH_F is pinned at 0 and
+# BLOCKED_ATTEMPTS can never fire — measured on the shipped carrier with only PATH differing (control:
+# 13 after 81 runs; shimmed: 11 for ever, watch=0). A counter is a file read, not a seam: read it with
+# `IFS= read -r`, never a PATH-resolved program.
+_lm_readint() { # _lm_readint <file> — integer file contents, 0 when absent/blank/unusable
+  local _v=0
+  [ -f "$1" ] && { IFS= read -r _v < "$1" || true; }
+  [ -n "$_v" ] || _v=0
+  is_limit "$_v" || _v=0
+  printf '%s' "$_v"
+}
+chain_pid() { local _p=""; [ -f "$CHAIN_F" ] && { IFS= read -r _p < "$CHAIN_F" || true; }; printf '%s' "${_p%% *}"; }
+chain_head() { local _p=""; [ -f "$CHAIN_F" ] && { IFS= read -r _p < "$CHAIN_F" || true; }; _p="${_p#* }"; printf '%s' "${_p%% *}"; }
 chain_alive() { local p; p="$(chain_pid)"; [ -n "$p" ] && kill -0 "$p" 2>/dev/null; }
-chain_log() { local l; l="$(awk '{print $3}' "$CHAIN_F" 2>/dev/null)"; printf '%s' "${l:-$CHAIN_LOG}"; }
+chain_log() { local _p=""; [ -f "$CHAIN_F" ] && { IFS= read -r _p < "$CHAIN_F" || true; }; _p="${_p#* }"; _p="${_p#* }"; printf '%s' "${_p:-$CHAIN_LOG}"; }
 
 # resolve_trusted_checkout [lane-checkout] — the repo's MAIN worktree, the tree the chain must run from.
 #
@@ -507,7 +521,7 @@ fi
   # merging — permanently foreclosing the lane. merge-one.sh's own claim reaper clears exactly this
   # condition, so do the same test it does: read the pid and probe it.
   if [ -f "$O/state/mergeclaim-$PR.lock" ]; then
-    local opid; opid="$(cat "$O/state/mergeclaim-$PR.lock" 2>/dev/null || echo 0)"
+    local opid; opid="$(_lm_readint "$O/state/mergeclaim-$PR.lock")"
     case "${opid:-0}" in ''|*[!0-9]*) opid=0 ;; esac
     if [ "$opid" -gt 0 ] && kill -0 "$opid" 2>/dev/null; then
       # A LIVE owner (the controller's chain, or an earlier round of ours): never spawn a competitor.
@@ -1062,7 +1076,7 @@ if [ "$WATCH" -eq 1 ]; then
       # every pass meant a chain that never died left the lane cycling WAITING_HEAD_MOVED until its 3300s
       # wall clock ran out — a wait with no terminal state. One re-run is honest (the chain usually
       # finishes the old head); a SECOND is a stuck chain, and that is a hand-off with a name.
-      _hm=$(( $(cat "$O/state/lanemerge-$PR.headmoved" 2>/dev/null || echo 0) + 1 ))
+      _hm=$(( $(_lm_readint "$O/state/lanemerge-$PR.headmoved") + 1 ))
       printf '%s\n' "$_hm" > "$O/state/lanemerge-$PR.headmoved" 2>/dev/null || true
       log_line "… the PR head moved past the chain's head ($(chain_head) → ${HD}) — the chain is working"
       log_line "   a head that is no longer the tip (pass $_hm of 2)."
@@ -1123,10 +1137,10 @@ if [ "$WATCH" -eq 1 ]; then
           # refunds can never be the one that crosses the budget). So: at most MAX_WATCH refunds per
           # cycle; past that, the chunk is CHARGED and the honest hand-off becomes reachable.
           _ar="$O/state/lanemerge-$PR.apiretry"
-          _n_ar="$(cat "$_ar" 2>/dev/null || echo 0)"; is_limit "$_n_ar" || _n_ar=0
+          _n_ar="$(_lm_readint "$_ar")"
           if [ "$_n_ar" -lt "$MAX_WATCH" ]; then
             _n_ar=$(( _n_ar + 1 )); printf '%s\n' "$_n_ar" > "$_ar" 2>/dev/null || true
-            w="$(cat "$WATCH_F" 2>/dev/null || echo 0)"; is_limit "$w" || w=0
+            w="$(_lm_readint "$WATCH_F")"
             [ "$w" -gt 0 ] && printf '%s\n' "$(( w - 1 ))" > "$WATCH_F" 2>/dev/null
             log_line "… the API could not be read (retry $_n_ar/$MAX_WATCH this cycle) — no round and no chunk is spent"
           else

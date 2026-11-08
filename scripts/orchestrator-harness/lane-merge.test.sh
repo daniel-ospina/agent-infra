@@ -532,6 +532,33 @@ kill "$CH_PID" 2>/dev/null || true
 ck "a head-moved chain: pass 1 re-runs (11), pass 2 is TERMINAL (14) and names the pid — not an endless re-arm" \
    $([ "$RC1" = 11 ] && [ "$RC2" = 14 ] && [ "$(verdict_of 40 | cut -d' ' -f1)" = BLOCKED ] \
       && grep -q 'still bound to head oldhead' "$OT/state/lanemerge-40.verdict" && echo 0 || echo 1)
+# ⛔ THE HEAD-MOVED COUNTER IS A COUNTER, SO IT IS READ WITH A BUILTIN (round-25 review, P1). This was
+# `$(cat headmoved)`: a `cat` answering 0 for `*.headmoved` pins `_hm` at 1, so "pass 2" never arrives and
+# a chain stuck on an older head re-arms for ever while the same path truncates WATCH_F each pass —
+# measured on the carrier with only PATH differing (control: terminal at pass 2, headmoved=2; shimmed: 6
+# passes all rc=11, headmoved=1). The shim touches ONLY `*.headmoved`, so the rest of the carrier is
+# untouched and this row isolates the counter read.
+HMHIM="$T/hmshim"; rm -rf "$HMHIM"; mkdir -p "$HMHIM"
+cat > "$HMHIM/cat" <<'HSHIM'
+#!/usr/bin/env bash
+case "${1:-}" in
+  *.headmoved) printf '0\n' ;;
+  *) exec /bin/cat "$@" ;;
+esac
+HSHIM
+chmod +x "$HMHIM/cat"
+new_o "$T/junk-q2b.tsv"
+printf 'open||newhead1|clean\n' > "$T/pr-open2b.tsv"
+sleep 60 & CH_PID2=$!
+printf '%s oldhead %s\n' "$CH_PID2" "$OT/logs/lane-merge-43.log" > "$OT/state/lanemerge-43.chain"
+printf 'nothing here\n' > "$OT/logs/lane-merge-43.log"
+OUT="$(REPO_PATH="${REPO_PATH:-$RUN_REPO}" PATH="$HMHIM:$BIN:$PATH" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 \
+      bash "$SCRIPT" 43 --watch --repo o/r --pr-tsv "$T/pr-open2b.tsv" 2>&1)"; RC1=$?
+OUT2="$(PATH="$HMHIM:$BIN:$PATH" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 \
+      bash "$SCRIPT" 43 --watch --repo o/r --pr-tsv "$T/pr-open2b.tsv" 2>&1)"; RC2=$?
+kill "$CH_PID2" 2>/dev/null || true
+ck "a PATH-shimmed 'cat' cannot stop the head-moved bound from firing (pass 2 still TERMINAL)" \
+   $([ "$RC1" = 11 ] && [ "$RC2" = 14 ] && [ "$(verdict_of 43 | cut -d' ' -f1)" = BLOCKED ] && echo 0 || echo 1)
 
 # ── 11c-sexies. a LIVE lock is adopted: the record gets the LIVE pid and KEEPS the recorded head ─
 new_o "$T/junk-q3.tsv"
