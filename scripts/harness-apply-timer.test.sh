@@ -2631,6 +2631,70 @@ assert_contains "$OUT" "printed NO output for a red grade" \
 assert_eq "$(tail -n +2 "$T/t24aj/state/harness-apply-farm-rows.txt" 2>/dev/null | wc -l | tr -d ' ')" "0" \
     "T24 control: with NO body line written — a whitespace-only row is not a name"
 
+# ⛔ THE ELISION IS COUNTED IN THE BLANK-STRIPPED POPULATION (review round 27, measured: rewriting
+# `FARM_OUT_LINES` to count `"$FARM_OUT"` instead of `"$FARM_OUT_NB"` left the suite green at 518/0, and
+# with 12 unmatched rows + 2 whitespace lines the journal claimed `and 4 more line(s) … ALL 16 are named`
+# over an excerpt that printed 12 of 14 — a count that disagrees with its own excerpt). This fixture pins
+# the arithmetic: a header row + 12 unmatched rows + 2 whitespace lines + 1 summary = 16 raw lines, of
+# which 14 are non-blank, so exactly TWO are withheld and the excerpt printed 12 of them. Counting
+# `"$FARM_OUT"` instead of `"$FARM_OUT_NB"` says 16 and withholds 4 — the mutant these rows red on.
+mk_origin t24ba; mk_clone t24ba
+REPO_P="$CLONE"; MODE_P=sync
+mkdir -p "$T/t24ba/home/.pi/agent/scripts"
+cat >"$T/t24ba/twelve-plus-blanks.sh" <<'FARM'
+#!/usr/bin/env bash
+printf '%-46s | %-12s | %-12s | %s\n' 'file' 'deployed' 'source' 'verdict' >&2
+i=1
+while [ "$i" -le 12 ]; do
+    printf '%-46s | %-12s | %-12s | %s\n' "note-$i.py" aaaa11112222 bbbb33334444 CHANGED >&2
+    i=$((i + 1))
+done
+printf '   \n' >&2
+printf '   \n' >&2
+printf '1 stale (counts unavailable in this farmed copy).\n' >&2
+exit 3
+FARM
+chmod +x "$T/t24ba/twelve-plus-blanks.sh"
+OUT="$(HARNESS_APPLY_FARM_CHECKER="$T/t24ba/twelve-plus-blanks.sh" run_pass "$T/t24ba" 2>&1)"; RC=$?
+assert_eq "$RC" "24" "T24 control: 12 unmatched rows plus whitespace and an unparsable summary is RED (24)"
+assert_contains "$OUT" "… and 2 more line(s) of the instrument's output — ALL 14 are named in" \
+    "T24 control: and the elision counts the BLANK-STRIPPED population (14 lines, two withheld), not the raw 16"
+assert_absent "$OUT" "ALL 16 are named in" \
+    "T24 control: so the raw-line count never reaches the journal — the excerpt printed 12 of 14, not 12 of 16"
+assert_absent "$OUT" "and 4 more line(s)" \
+    "T24 control: and the withheld count is population minus the 12 excerpted, never raw minus 12"
+
+# ⛔ AND THE REMEDY IS NOT CAPPED (review round 27, measured: a `Next:` block of ten actions recorded
+# `remedy=` with the first eight, because the extraction ended `| head -8` — the ninth and tenth were
+# named NOWHERE, since `detail=` deliberately carries no remedy clause). Mutant that reds it: restore
+# `| head -8`.
+mk_origin t24bb; mk_clone t24bb
+REPO_P="$CLONE"; MODE_P=sync
+mkdir -p "$T/t24bb/home/.pi/agent/scripts"
+cat >"$T/t24bb/long-next.sh" <<'FARM'
+#!/usr/bin/env bash
+printf '%-46s | %-12s | %-12s | %s\n' 'file' 'deployed' 'source' 'verdict' >&2
+printf '%-46s | %-12s | %-12s | %s\n' 'gone.py' aaaa11112222 bbbb33334444 STALE >&2
+printf 'check-farm-drift: DRIFT — 1 stale, 0 declared-but-absent, 0 unsourced, of 1 deployed file(s) against origin/main (sync).\n' >&2
+printf '   Next:\n' >&2
+i=1
+while [ "$i" -le 10 ]; do
+    printf '     action%s — remedy line %s.\n' "$i" "$i" >&2
+    i=$((i + 1))
+done
+exit 3
+FARM
+chmod +x "$T/t24bb/long-next.sh"
+OUT="$(HARNESS_APPLY_FARM_CHECKER="$T/t24bb/long-next.sh" run_pass "$T/t24bb" 2>&1)"; RC=$?
+assert_eq "$RC" "24" "T24 control: a ten-action Next: block still grades RED (24)"
+REC24BB="$(cat "$T/t24bb/state/harness-apply.status" 2>/dev/null || true)"
+assert_contains "$(grep '^remedy=' <<<"$REC24BB")" "action10" \
+    "T24 control: and remedy= carries the LAST action of a ten-line block — the field is never capped"
+assert_contains "$(grep '^remedy=' <<<"$REC24BB")" "action1 " \
+    "T24 control: with the first action still there, so the block is forwarded, not replaced"
+assert_eq "$(grep -c 'action10' <<<"$REC24BB")" "1" \
+    "T24 control: and the remedy stays ONE record line — newlines are flattened, length was never its bound"
+
 # ⛔ NO OUTPUT *AND* NO TEMP FILE IS ITS OWN SENTENCE (review round 17, measured: with a directory at the
 # rows path, a mute instrument printed "the extraction was NOT PROVEN complete, and the RAW output could
 # not be persisted" over an instrument that printed NO raw output and an excerpt of NO lines). The

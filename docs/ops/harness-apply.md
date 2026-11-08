@@ -174,10 +174,13 @@ that path holds pass B's. The write is atomic (a reader never sees half a list, 
 removes another's file), but it is **not per-run**, and the header is what you can decide with:
 
 - the header's `ref=` and `dest=` are the **ref name and farm path this record's `detail=` quotes** —
-  `detail=` reads `farm: DRIFT — <the arm sentence>; <dest> is NOT the code <ref> ships`, the same two
-  variables (the record has NO `dest=` field of its own, and the record's `ref=` is the RESOLVED SHORT
-  SHA, a different value on purpose — do not compare those). ⛔ COMPARE ONLY THE ARM CLAUSE — the text
-  between `is NOT the code ` and the end of that clause — because BOTH values sit at the tail that the
+  on the drift arms `detail=` reads `farm: DRIFT — <the arm sentence>; <dest> is NOT the code <ref>
+  ships`, and on the three `farm-unknown` arms it reads `… for <dest> against <ref> …` — the same two
+  variables either way (the record has NO `dest=` field of its own, and the record's `ref=` is the
+  RESOLVED SHORT SHA, a different value on purpose — do not compare those). ⛔ COMPARE ONLY THE CLAUSE
+  THAT QUOTES THEM — the text between `is NOT the code ` and the end of that clause on a drift arm, or
+  the `<dest> … against <ref>` clause on a `farm-unknown` arm — because BOTH values sit at the tail
+  that the
   240-byte bound cuts, and the readings `finish` appends AFTER them (`— head=… ref=<checkout sha> …
   drift=…`) carry a `ref=` of their own that is the record's SHORT SHA, not the ref name; a reader who
   greps the last `ref=` compares the wrong token and rejects a correct artifact. Within that clause:
@@ -286,8 +289,8 @@ could be found" answer — neither is ever executed, and neither is reported as 
 DRIFT arms the drift is still red, `farm_n` still carries the count it had (or `unparsed` when the
 extraction was **not proven complete** — a partial match counts here too, not only a total miss), and
 the journal says in as many words that the rows past the 12-line excerpt are named nowhere durable. On
-the `farm-unknown` arm (either producer: an instrument that gave up with its own exit 2, or an `rc=0`
-that contradicts its report) the field alone carries it: `farm_n=not-graded`, and the journal prints
+the `farm-unknown` arm (any of the three producers — an instrument that gave up with its own exit 2, an
+`rc=0` that contradicts its report, or an `rc=0` that printed no verdict line) the field alone carries it: `farm_n=not-graded`, and the journal prints
 only its UNKNOWN line — a checker that printed rows before giving up had them captured, but nothing was
 ever excerpted and no artifact was written, so those names are durable nowhere (that is the price of a
 failed write on an arm with no grade to justify another one). When the instrument printed nothing at
@@ -483,7 +486,7 @@ checkout can use the documented hatch. The same interaction is recorded for
 
 ## Tests
 
-`scripts/harness-apply-timer.test.sh` — 518 assertions, run by the
+`scripts/harness-apply-timer.test.sh` — 526 assertions, run by the
 `harness-apply-timer` shard of `run-bash-shards.sh`:
 
 | | |

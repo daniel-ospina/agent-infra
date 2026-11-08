@@ -1518,7 +1518,13 @@ if [ "$FARM_CHECK_ON" = "1" ]; then
         # `remedy=none` while its artifact held the block. Measured: a checker printing an UNSOURCED row,
         # an UNKNOWN reason and `   Next: fix the declaration entries … then re-run this.` produced
         # `action=farm-unknown` + `remedy=none`, with the word `Next` nowhere in the record.
-        FARM_REMEDY="$(printf '%s\n' "$FARM_OUT" | sed -n '/^[[:space:]]*Next:/,$p' | head -8)"
+        # ⛔ AND IT IS NOT CAPPED (review round 27, measured): this used to end `| head -8`, so a `Next:`
+        # block of ten actions recorded `remedy=` with the first eight and dropped the ninth and tenth —
+        # named NOWHERE, because `detail=` deliberately carries no remedy clause. The shipped instrument
+        # prints one or two lines today, which is why nothing failed: the cap bites the moment a class
+        # grows a line, and it is a cap on the ONE field the record exists to guarantee. `write_record`
+        # flattens NEWLINES (`tr`), so the field is still one line; length was never its bound.
+        FARM_REMEDY="$(printf '%s\n' "$FARM_OUT" | sed -n '/^[[:space:]]*Next:/,$p')"
         # ⛔ THE EXIT CODE IS NOT THE GRADE — THIS PROCESS MAY NOT BE THE INSTRUMENT (review round 21,
         # measured). `HARNESS_APPLY_FARM_CHECKER` is a documented seam, and an operator wrapper that
         # reports the PIPELINE's status (`bash inner "$@" 2>&1 | tee -a log`) exits 0 no matter what
