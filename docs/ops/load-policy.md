@@ -222,22 +222,32 @@ unconditionally.
   stall clause may race a completed session) and a tool in flight (a DECLARED
   long operation, owned by the tool clauses), because both flip inside the
   window without moving any progress clock and the clause refuses to kill for
-  either. Every other reason is refuted by a marker or a real output byte —
-  deliberately, because each of them is already gated on `stateFresh` or on
-  byte-arrival itself, so "a marker arrived" is never independent of what they
-  measure, and suppressing is the fail-safe direction (a live child is not
-  killed, and the clause re-decides on the next tick). Their decided quantities
-  are ages (`effStreamAge`, `effToolAge` = the child's frozen sample +
-  `markerAge`), which a fresh marker narrows rather than refutes, so a marker
-  landing inside EVERY probe window can delay such a clause past its bound; the
-  backstop there is `TASK_HARD_CAP_MS`. Comparing those ages against live values
-  is a known follow-up on #1339, not something this guard does. `max-dispatch` is exempt (a
+  either. Every other reason is refuted by a marker or a real output byte, and
+  suppressing is the fail-safe direction (a live child is not killed, and the
+  clause re-decides on the next tick). The marker/byte question is the right one
+  for each of them, and the argument differs by group: `silence-threshold`
+  decides on `now - lastLifeSignAt` — the byte clock, so a byte IS its own
+  refutation — and `cut` decides on `markerAge`, so a fresh marker refutes it
+  outright. `zero-output` is NOT `stateFresh`-gated: it fires on ABSENCE latches
+  (`!hasOutput`, `!everSawWork`, `!sawReady`, past tier-1), and a marker proves
+  the child is running — a `tick` marker sets none of those latches, so here the
+  channel refutes a premise the clause does not measure directly (still
+  fail-safe: the child re-decides and is caught by `silence-threshold` at T, or
+  by `TASK_HARD_CAP_MS`). The AGE clauses — `stream-stall`, `tool-stall`,
+  `tool-silence`, `tool-dead`, `first-message-stall` — are `stateFresh`-gated
+  and decide on `effStreamAge`/`effToolAge` = the child's frozen sample +
+  `markerAge`, so a fresh marker NARROWS the decided age rather than refuting
+  it; those are the clauses whose own bound can be deferred for as long as
+  markers keep landing inside the probe window, and their backstop is
+  `TASK_HARD_CAP_MS`. Comparing those ages against live values is a tracked
+  follow-up on #1339, not something this guard does. `max-dispatch` is exempt (a
   wall-clock policy cap, not an inference about progress).
   **The honest bound is not "one tick".** Suppression repeats for as long as
   the child keeps producing evidence newer than each tick's own snapshot, which
-  for a marker/byte clause means "it is working" (the point of the fix), and is
-  bounded by that clause's own bound and, as the last resort,
-  `TASK_HARD_CAP_MS`. Note the byte channel is unauthenticated — a grandchild
+  for a marker/byte clause means "it is working" (the point of the fix). The
+  bound on the SUPPRESSION is `TASK_HARD_CAP_MS` — NOT the clause's own bound,
+  which is precisely what a suppression defers — and the hard cap is enforced by
+  its own timer, outside the decision path. Note the byte channel is unauthenticated — a grandchild
   MCP server inherits the child's fd 2, so its stderr also counts as a life sign
   (`ingestHeartbeatChunk` → `onLifeSign`) — a pre-existing property of that
   channel, not of this guard. The suppression is logged on the first occurrence
@@ -259,9 +269,16 @@ unconditionally.
   the same decision-vs-live split #5389 established for the CPU pair, because a
   marker can land in the awaited window and make a live-only read contradict the
   headline it ships beside. The flag `readMarkerAge()` returns is now reported,
-  not just promised: the payload carries `decMarkerAgeInvalid=`, because a
-  clamped `0` is otherwise indistinguishable from a marker that landed exactly
-  now — the same unreadability that hid the original bug.
+  not just promised: the payload carries `decMarkerAgeInvalid=` AND
+  `lastMarkerAgeInvalid=`, because a clamped `0` is otherwise indistinguishable
+  from a marker that landed exactly now — the same unreadability that hid the
+  original bug. The two are NOT redundant. The decision-time read is taken
+  before any yield (nothing can stamp a marker or a byte between the tick's `now`
+  and the synchronous decision), so it can only be invalid if the WALL CLOCK
+  stepped backwards; the live read is taken AFTER the awaited probe, and that is
+  the one where a marker ingested in the window is newer than `now`. Reporting
+  only the decision's flag would print "valid" beside precisely the clamped live
+  age the flag exists to expose.
 - **Cut-gap bound (#1070):** the marker-gap cut deadline is a SECOND consumer of
   the same scale function. `effCutGap = getEffectiveCutGapMs(latched, load1)` —
   the derived base (`1.25 ×` tick interval, floor `15_000`) scaled 1x/2x/3x, with

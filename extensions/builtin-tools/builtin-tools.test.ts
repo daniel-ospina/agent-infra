@@ -3294,12 +3294,28 @@ test("#1339d: loop wiring — the verdict is re-validated against evidence acros
   // UNIQUE. Measured (#1339 cycle-4 review): `lastLifeSignAt: lastHeartbeat,`
   // occurs 3× in index.ts and `toolsInFlight: hbCtx.state.toolsInFlight,` 2×, so
   // a global substring test stayed GREEN while the GUARD'S OWN argument was
-  // mutated to `now` — 373/0 with the byte channel firing on every tick and
-  // suppressing every kill for a whole dispatch. Each literal is therefore
-  // asserted INSIDE the guard's argument block, which is the only region where
-  // it is evidence of this wiring at all.
+  // mutated to `now`. The direction of that mutation is the one that HURTS, and
+  // it is the opposite of over-suppression (#1339c already pins it):
+  // `decisionSnapshotStale` is a STRICT `>` and the guard is called with
+  // `snapshotAt === now`, so `lastLifeSignAt: now` can never be `> now` — the
+  // byte channel is permanently INERT, the guard never supersedes, and the kill
+  // executes on the superseded verdict. That is the original #1339 false kill,
+  // in the configuration where no marker ever parses (`hbEnabled === false`, or
+  // a marker failing the nonce check). Each literal is therefore asserted INSIDE
+  // the guard's argument block, which is the only region where it is evidence of
+  // this wiring at all.
   const guardCall = src.indexOf(": supersedingEvidence(decision.reason, now, {");
   ok(guardCall > -1, "the guard is called with the channels object (this slice is the region every pin below reads)");
+  // FAIL-CLOSED on the FIRST-MATCH read above (#1339 cycle-4 review P3): every
+  // pin below is scoped to the FIRST occurrence, so a second re-validation added
+  // ABOVE the guard would silently become the region under test while the real
+  // guard's channels were mutated — the inert-pin class this test exists to
+  // close, restored one layer out. Exactly one call site is the premise.
+  equal(
+    src.split(": supersedingEvidence(decision.reason, now, {").length - 1,
+    1,
+    "exactly ONE re-validation call site — the region pins below resolve it by first match, so a second one added above would be read instead of the guard",
+  );
   const guardArgs = guardCall > -1 ? src.slice(guardCall, src.indexOf("});", guardCall)) : "";
   for (const [literal, why] of [
     ["lastMarkerAt: hbCtx.state.lastMarkerAt,", "the marker channel reads live state"],
@@ -3346,9 +3362,52 @@ test("#1339d: loop wiring — the verdict is re-validated against evidence acros
   // beside it, labelled. Both are clamped through the single reader.
   ok(src.includes("const decMarkerAgeMs = decision.markerAgeMs ?? -1;"), "the kill path exposes the decision's own marker age");
   ok(src.includes("decMarkerAgeMs=${decMarkerAgeMs}"), "the heartbeat-kill alive summary carries the decision-time age beside the live one (the #5389 pattern)");
+  // The pin below is scoped to the alive-summary TEMPLATE, not the file: a
+  // whole-file `src.includes()` for this literal is satisfiable by a COMMENT
+  // carrying the same text (#1339 cycle-4 review P2 — reproduced: deleting the
+  // field from the template and parking the literal in a `//` comment left
+  // 373/0 green). Selecting the region by FIRST MATCH is itself unsound here:
+  // THREE `const aliveSummary = ` templates exist (the hard-cap kill payload, the
+  // heartbeat-kill payload, the backstop), so the region is selected by CONTENT —
+  // `decToolCpuStallMs=` appears only in the heartbeat-kill summary — and the
+  // template count is pinned so a fourth cannot silently win the selection.
+  const aliveStarts = [...src.matchAll(/const aliveSummary = `Alive state: toolsInFlight=/g)].map((m) => m.index ?? -1);
+  equal(aliveStarts.length, 3, "three `Alive state:` templates exist (hard-cap / heartbeat-kill / backstop) — the selection below is by content, so the count is a premise");
+  const aliveTemplates = aliveStarts.map((s) => {
+    const e = s >= 0 ? src.indexOf("`;", s) : -1;
+    return e > s ? src.slice(s, e) : "";
+  });
+  const killSummaries = aliveTemplates.filter((t) => t.includes("decToolCpuStallMs="));
+  equal(killSummaries.length, 1, "exactly ONE template is the heartbeat-kill payload (`decToolCpuStallMs=` is its marker) — so the region pins below cannot read another kill path's summary");
+  const aliveSummarySrc = killSummaries[0] ?? "";
   ok(
-    src.includes("const decMarkerAgeInvalid = decision.markerAgeInvalid === true;") && src.includes("decMarkerAgeInvalid=${decMarkerAgeInvalid}"),
-    "the payload also carries the DECISION's invalid flag — `readMarkerAge` promises to report a clamped age, and a bare 0 cannot be told from a fresh marker (cycle-4 review)",
+    src.includes("const decMarkerAgeInvalid = decision.markerAgeInvalid === true;"),
+    "the decision's flag is read — `readMarkerAge` promises to report a clamped age to its caller, and this is that caller (cycle-4 review)",
+  );
+  equal(
+    aliveSummarySrc.split("decMarkerAgeInvalid=${decMarkerAgeInvalid}").length - 1,
+    1,
+    "the heartbeat-kill TEMPLATE prints the DECISION's invalid flag — `readMarkerAge` promises to report a clamped age, and a bare 0 cannot be told from a fresh marker (cycle-4 review)",
+  );
+  equal(
+    src.split("decMarkerAgeInvalid=${decMarkerAgeInvalid}").length - 1,
+    1,
+    "…and that literal exists NOWHERE else in the file, so a comment carrying it cannot satisfy the region pin",
+  );
+  equal(
+    aliveSummarySrc.split("lastMarkerAgeInvalid=${lastMarkerAgeInvalid}").length - 1,
+    1,
+    "the summary also prints the LIVE read's invalid flag — the decision-time read is taken before any yield and can only clamp on a backwards clock step, so the decision flag alone prints `false` beside exactly the clamped live age it exists to expose (cycle-4 review)",
+  );
+  equal(
+    src.split("lastMarkerAgeInvalid=${lastMarkerAgeInvalid}").length - 1,
+    1,
+    "…and that literal too exists nowhere else — the same comment-proofing as the decision flag",
+  );
+  ok(
+    src.includes("const liveMarkerAge = readMarkerAge(hbCtx.state.lastMarkerAt, now);") &&
+      src.includes("const lastMarkerAgeInvalid = liveMarkerAge.invalid;"),
+    "the live flag comes from the SAME read as the printed live age (a second `readMarkerAge` call could disagree with the age beside it)",
   );
   ok(src.includes("no life signs for ${Math.round(decMarkerAgeMs / 1000)}s"), "the cut headline prints the DECISION's age — the post-await re-read is what rendered '-1s'");
   equal(src.split("hbCtx.state.lastMarkerAt > 0 ? Date.now() - hbCtx.state.lastMarkerAt").length - 1, 0, "no site computes the marker age by hand any more — every reader goes through `readMarkerAge`");

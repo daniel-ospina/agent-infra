@@ -3178,18 +3178,34 @@ export function supersedingEvidence(
   // version printed `marker +-45123ms` when only bytes had arrived).
   //
   // ⛔ This branch is where the "ask the clause's OWN clock" rule STOPS, and the
-  // scope is deliberate rather than an omission: every reason that reaches here
-  // (`silence-threshold`, `stream-stall`, `tool-stall`, `tool-silence`,
-  // `tool-dead`, `cut`, `first-message-stall`, `zero-output`) is gated on
-  // `stateFresh` or on byte-arrival itself, so "a marker arrived" is never
-  // independent of what they measure — and suppressing is the FAIL-SAFE
-  // direction (a live child is not killed; the clause re-decides on the next
-  // tick). Their decided quantities are ages (`effStreamAge`, `effToolAge =
-  // frozen sample + markerAge`), which a fresh marker narrows rather than
-  // refutes, so a marker landing inside every probe window can delay such a
-  // clause past its bound; the backstop is `TASK_HARD_CAP_MS`. Comparing those
-  // quantities against live ones is a separate change (filed against #1339),
-  // not something this branch should start doing without its own test.
+  // scope is deliberate rather than an omission. The reasons that reach here
+  // fall into three groups, and the marker/byte question is the right one for
+  // each — stated per group, because a blanket rule would be false for some of
+  // them (#1339 cycle-4 review: the earlier "each is gated on `stateFresh` or on
+  // byte-arrival" covered `zero-output` only by accident and mis-described the
+  // age clauses):
+  //  · `silence-threshold` decides on `now - lastLifeSignAt`, which IS the byte
+  //    clock — a byte or a marker refutes it OUTRIGHT, so the question is the
+  //    clause's own.
+  //  · `cut` decides on `markerAge` — a fresh marker refutes it OUTRIGHT too.
+  //  · `zero-output` is NOT `stateFresh`-gated: it fires on ABSENCE latches
+  //    (`!hasOutput`, `!everSawWork`, `!sawReady`, past tier-1). A marker proves
+  //    the child is running, and a `tick` marker sets none of those latches, so
+  //    here the channel refutes a premise the clause does not measure directly.
+  //    Still FAIL-SAFE: the child re-decides and is caught by
+  //    `silence-threshold` at T, or by `TASK_HARD_CAP_MS`.
+  //  · the AGE clauses (`stream-stall`, `tool-stall`, `tool-silence`,
+  //    `tool-dead`, `first-message-stall`) are `stateFresh`-gated and decide on
+  //    `effStreamAge`/`effToolAge` = the child's frozen sample + `markerAge`, so
+  //    a fresh marker NARROWS the decided age rather than refuting it. Those are
+  //    therefore the clauses whose own bound can be deferred for as long as
+  //    markers keep landing inside the probe window; their backstop is
+  //    `TASK_HARD_CAP_MS`, NOT their own bound (defeating that bound is what the
+  //    suppression does). Comparing those ages against live values is a tracked
+  //    follow-up on #1339, not something this branch should start doing without
+  //    its own test.
+  // Suppressing is the FAIL-SAFE direction throughout: a live child is not
+  // killed, and the clause re-decides on the next tick.
   return channels.lastMarkerAt > snapshotAt ? "marker" : "bytes";
 }
 
@@ -5201,7 +5217,10 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
       // Fail-safe by construction: a genuinely wedged child emits nothing, so
       // neither channel moves and the next tick kills on the same evidence. A
       // child that keeps producing evidence IS the refutation — that is the whole
-      // point — and it stays bounded by its own clause and the hard cap.
+      // point. The bound on the SUPPRESSION is `TASK_HARD_CAP_MS`, NOT the
+      // clause's own bound: deferring that bound is exactly what a suppression
+      // does, and the hard cap is enforced by its own timer outside this path
+      // (#1339 cycle-4 review — "bounded by its own clause" was the over-claim).
       const supersededBy =
         decision.reason === "max-dispatch"
           ? null
@@ -5260,13 +5279,24 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
       // state — the probe may have moved it, which is exactly how the payload
       // came to print a NEGATIVE age beside a 951 s verdict. Both readings are
       // clamped through `readMarkerAge`.
-      const markerAgeMs = readMarkerAge(hbCtx.state.lastMarkerAt, now).ageMs;
+      const liveMarkerAge = readMarkerAge(hbCtx.state.lastMarkerAt, now);
+      const markerAgeMs = liveMarkerAge.ageMs;
       const decMarkerAgeMs = decision.markerAgeMs ?? -1;
       // #1339 review P2: `readMarkerAge` documents `invalid` as "reported for the
       // caller to log" — this is the caller. Without it a CLAMPED age prints as
       // an ordinary `0` and is indistinguishable from a marker that landed
       // exactly now, which is the same unreadability that hid the original bug.
       const decMarkerAgeInvalid = decision.markerAgeInvalid === true;
+      // …and the DECISION's flag alone is not enough (#1339 cycle-4 review). The
+      // decision-time read is taken before any yield — nothing can stamp a marker
+      // or output between the tick's `now` and the synchronous
+      // `heartbeatKillDecision` call — so that read can only be invalid if the
+      // WALL CLOCK stepped backwards. The clamped case this diagnostic exists for
+      // happens on the LIVE read above, taken AFTER the awaited probe, where a
+      // marker or byte ingested in the window is newer than `now`. Reporting only
+      // the decision's flag therefore prints "valid" beside precisely the clamped
+      // live age it exists to expose, one layer in from the original bug.
+      const lastMarkerAgeInvalid = liveMarkerAge.invalid;
       // #1070 item 1, applied to the HEADLINE as well as the payload. The
       // clauses below fire on the EFFECTIVE ages (`effStreamAge`/`effToolAge`
       // in heartbeatKillDecision = the frozen sample + markerAge), and §6 of
@@ -5282,7 +5312,7 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
       // therefore labelled apart, exactly as `streamAgeMs`/`effStreamAgeMs` above
       // already are: `toolCpuStallMs` is the live sample, `decToolCpuStallMs` is
       // the value the DECISION actually used.
-      const aliveSummary = `Alive state: toolsInFlight=${hbCtx.state.toolsInFlight} turnActive=${hbCtx.state.turnActive} streamAgeMs=${hbCtx.state.streamAgeMs} effStreamAgeMs=${effStreamAgeMs} toolAgeMaxMs=${hbCtx.state.toolAgeMaxMs} effToolAgeMs=${effToolAgeMs} toolCpuMs=${hbCtx.state.toolCpuMs} toolCpuStallMs=${hbCtx.state.toolCpuStallMs} toolCpuAdvanced=${hbCtx.state.toolCpuAdvanced} decToolCpuStallMs=${decision.toolCpuStallMs ?? -1} decMarkerAgeMs=${decMarkerAgeMs} decMarkerAgeInvalid=${decMarkerAgeInvalid} everSawRealActivity=${hbCtx.state.everSawRealActivity} lastMarkerAgeMs=${markerAgeMs} tickCount=${hbCtx.state.tickCount} markerCount=${hbCtx.state.markerCount} firstMarkerLagMs=${hbCtx.state.firstMarkerAt > 0 ? hbCtx.state.firstMarkerAt - startedAt : -1} firstTickLagMs=${hbCtx.state.firstTickAt > 0 ? hbCtx.state.firstTickAt - startedAt : -1} firstActivityLagMs=${hbCtx.state.firstActivityAt > 0 ? hbCtx.state.firstActivityAt - startedAt : -1} everSawMsg=${hbCtx.state.everSawMsg} everSawTool=${hbCtx.state.everSawTool} toolsMaxInFlight=${hbCtx.state.toolsMaxInFlight} trace=[${hbCtx.state.activityTrace.join(",")}] ${repoStateText()} ${machineStateText()}`;
+      const aliveSummary = `Alive state: toolsInFlight=${hbCtx.state.toolsInFlight} turnActive=${hbCtx.state.turnActive} streamAgeMs=${hbCtx.state.streamAgeMs} effStreamAgeMs=${effStreamAgeMs} toolAgeMaxMs=${hbCtx.state.toolAgeMaxMs} effToolAgeMs=${effToolAgeMs} toolCpuMs=${hbCtx.state.toolCpuMs} toolCpuStallMs=${hbCtx.state.toolCpuStallMs} toolCpuAdvanced=${hbCtx.state.toolCpuAdvanced} decToolCpuStallMs=${decision.toolCpuStallMs ?? -1} decMarkerAgeMs=${decMarkerAgeMs} decMarkerAgeInvalid=${decMarkerAgeInvalid} lastMarkerAgeInvalid=${lastMarkerAgeInvalid} everSawRealActivity=${hbCtx.state.everSawRealActivity} lastMarkerAgeMs=${markerAgeMs} tickCount=${hbCtx.state.tickCount} markerCount=${hbCtx.state.markerCount} firstMarkerLagMs=${hbCtx.state.firstMarkerAt > 0 ? hbCtx.state.firstMarkerAt - startedAt : -1} firstTickLagMs=${hbCtx.state.firstTickAt > 0 ? hbCtx.state.firstTickAt - startedAt : -1} firstActivityLagMs=${hbCtx.state.firstActivityAt > 0 ? hbCtx.state.firstActivityAt - startedAt : -1} everSawMsg=${hbCtx.state.everSawMsg} everSawTool=${hbCtx.state.everSawTool} toolsMaxInFlight=${hbCtx.state.toolsMaxInFlight} trace=[${hbCtx.state.activityTrace.join(",")}] ${repoStateText()} ${machineStateText()}`;
       const headlines: Record<string, string> = {
         "silence-threshold": `⚠️ Sub-agent reached silence threshold (${HEARTBEAT_TIMEOUT_MS / 1000}s). Partial results below — parent should decide: accept, re-dispatch, or escalate.`,
         // #5389 — the headline names the evidence on BOTH channels, because the
@@ -5344,7 +5374,16 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
       const backstopFire = () => {
         if (settled) return;
         const now = Date.now();
-        const markerAge = hbCtx.state.lastMarkerAt > 0 ? now - hbCtx.state.lastMarkerAt : Infinity;
+        // #1339 cycle-4 review (P3, pre-existing): this was the last hand-rolled
+        // marker age in the file, and it could go NEGATIVE — `lastMarkerAt > now`
+        // whenever a marker is ingested between the timer's `now` and this read —
+        // i.e. it compared a THRESHOLD (`freshWindowMs`) against an uncomputable
+        // age, contradicting `readMarkerAge`'s "never compared against a
+        // threshold". Fail-safe either way (a clamped 0 keeps `stateFresh` true,
+        // exactly as the negative raw value did), but the single-reader invariant
+        // is only true if this site goes through it too; `-1` = never.
+        const backstopMarkerAge = readMarkerAge(hbCtx.state.lastMarkerAt, now).ageMs;
+        const markerAge = backstopMarkerAge < 0 ? Infinity : backstopMarkerAge;
         const stateFresh = hbCtx.state.lastMarkerAt > 0 && markerAge <= freshWindowMs;
         if (stateFresh) {
           // healthy ticking agent — exempt by construction; re-arm for
