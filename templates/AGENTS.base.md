@@ -623,20 +623,23 @@ command — never the home of work you would have to recover.
 ### A dead worktree record: `prune` handles it — unless the record is LOCKED
 
 Measured (git 2.43.0, 2026-11-08, one throwaway repo / three records): after `rm -rf` of a worktree
-directory, `git worktree list` marks the record `prunable` and a plain `git worktree prune` **removes it
-immediately** (`-v`: `gitdir file points to non-existent location`; plain prune expires *now*, not in
-three months). Two documented ways it then survives:
+directory, `git worktree list` marks an **UNLOCKED** record `prunable` — a LOCKED one still reads `locked`
+and is never marked, which is why it is easy to miss — and a plain `git worktree prune` **removes the
+unlocked one immediately** (`-v`: `gitdir file points to non-existent location`; plain prune expires *now*,
+not in three months). Two documented ways it then survives:
 
 | why it survived | measurement |
 |---|---|
 | **`git worktree lock`** | prune skips it **silently** — rc 0, no warning — and `git worktree remove --force` refuses (`cannot remove a locked working tree`). This is the one silent skip. |
 | `git gc` instead of prune | a freshly-dead record is **still listed** after `git gc` — it honours `gc.worktreePruneExpire`, default **3 months** |
 
-Remedy, scoped to **your own** record: `git worktree unlock <path> && git worktree remove <path>` — that
-removes a locked record whose directory is gone (measured rc 0) and REFUSES on a tree that still has
-uncommitted work, so it cannot destroy one. Git's own message names the other arm: `remove -f -f`
-overrides the lock **and** the dirty guard (the only guard left), so it silently deletes uncommitted work —
-use it only when you mean to discard the tree.
+Remedy, scoped to **your own** record: `git worktree remove <path>` — it removes a record whose directory is
+gone (measured rc 0) and REFUSES on a tree that still has uncommitted work (`contains modified or untracked
+files`), so it cannot destroy one. On a LOCKED record it refuses (`cannot remove a locked working tree`), so
+run `git worktree unlock <path>` first — but do **not** chain the two with `&&`: `unlock` on an UNLOCKED
+record is itself `fatal: '<path>' is not locked`, which would skip the removal. `remove -f -f` overrides both
+the lock and the dirty guard (the only guard left), so it silently discards uncommitted work — use it only
+when you mean to.
 ⛔ **Never run a bare `git worktree prune` as housekeeping.** It takes **no path argument**
 (`git worktree prune [-n] [-v] [--expire <expire>]`), so it cannot be scoped: it deregisters EVERY record
 whose directory is momentarily unstat-able — an unmounted volume, a permission blip — destroying an
