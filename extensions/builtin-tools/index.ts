@@ -3202,8 +3202,8 @@ export function supersedingEvidence(
   //    markers keep landing inside the probe window; their backstop is
   //    `TASK_HARD_CAP_MS`, NOT their own bound (defeating that bound is what the
   //    suppression does). Comparing those ages against live values is a tracked
-  //    follow-up on #1339, not something this branch should start doing without
-  //    its own test.
+  //    follow-up (agent-infra#3814), not something this branch should start doing
+  //    without its own test.
   // Suppressing is the FAIL-SAFE direction throughout: a live child is not
   // killed, and the clause re-decides on the next tick.
   return channels.lastMarkerAt > snapshotAt ? "marker" : "bytes";

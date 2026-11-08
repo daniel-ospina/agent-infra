@@ -240,7 +240,7 @@ unconditionally.
   it; those are the clauses whose own bound can be deferred for as long as
   markers keep landing inside the probe window, and their backstop is
   `TASK_HARD_CAP_MS`. Comparing those ages against live values is a tracked
-  follow-up on #1339, not something this guard does. `max-dispatch` is exempt (a
+  follow-up (agent-infra#3814), not something this guard does. `max-dispatch` is exempt (a
   wall-clock policy cap, not an inference about progress).
   **The honest bound is not "one tick".** Suppression repeats for as long as
   the child keeps producing evidence newer than each tick's own snapshot, which
