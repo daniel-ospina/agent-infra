@@ -1101,14 +1101,23 @@ gh_probe_env() {
   # so its exit status is cause-independent. ⛔ ITS STDOUT IS THE TOKEN — it is discarded below and the
   # captured stream is STDERR ONLY. The real idiom is `>/dev/null 2>"$GH_PROBE_ERR"` (stdout to
   # /dev/null, stderr to the capture file).
-  # ⛔ AND `2>&1 >/dev/null` IS ALSO SAFE **HERE**, WHICH AN EARLIER REVISION OF THIS COMMENT CALLED A
-  # DEFECT (#3701 review round 21, P2 — and that revision was itself the mistake). Inside a COMMAND
-  # SUBSTITUTION the two orders are EQUIVALENT: `2>&1` points stderr at the capture pipe, then
-  # `>/dev/null` re-points only stdout, so stderr is captured and stdout is discarded — measured,
-  # `x="$(cmd 2>&1 >/dev/null)"` yields the stderr text and nothing from stdout. The order matters only
-  # at TOP LEVEL, where `2>&1` targets the real stdout and so duplicates stderr into the log — which is
-  # not the context this code is in. The code has always used the explicit form, which is clearer; the
-  # point is that the alternative was mislabelled, not that it was used.
+  # ⛔ AND THE DEPRECATED ORDER IS UNSAFE **HERE** WHILE IT WAS SAFE WHERE THE OLD SENTENCE SAT — the two
+  # contexts differ and getting that backwards is what three revisions of this comment did (#3701 review
+  # rounds 8, 21, 22). THE SITE: `gh_probe_bounded` captures by REDIRECTING A FILE at STATEMENT LEVEL
+  # (`:1017`, `:1021`, `:1024`: `… </dev/null >/dev/null 2>"$GH_PROBE_ERR"`), and both call sites are
+  # top-level (`gh_probe_bounded "$bound" "$@"` and `gh_probe_bounded "$GH_PROBE_TIMEOUT" gh auth
+  # token`, cited by CONTENT rather than by line — a line number here is moved by this very comment,
+  # which is the defect class this PR keeps hitting) — no command substitution anywhere on this path. At
+  # statement level `2>&1 >/dev/null` points stderr at the pass's REAL stdout (the log) and then sends stdout to
+  # /dev/null, so the token-free capture file stays EMPTY and the refusal text lands in the log: measured
+  # on the extracted function, shipped order → `rc=3 capture=[THE-SHIM-ERR]`; with the orders swapped →
+  # `capture=[]` and `THE-SHIM-ERR` on the log. WHAT THE OLD SENTENCE DESCRIBED was the pre-#1736 form,
+  # `terr="$(gh auth token 2>&1 >/dev/null)"`, where the same order IS safe — inside `$( )`, `2>&1`
+  # points stderr at the capture pipe and `>/dev/null` re-points only stdout, so stderr is captured and
+  # stdout discarded (measured: `x="$(cmd 2>&1 >/dev/null)"` yields the stderr text, nothing from
+  # stdout). So the old wording was right about ITS code and wrong once the capture moved into a file;
+  # this one is right about the CURRENT code and says so explicitly. The shipped form — `>/dev/null`
+  # first, then `2>` — is correct in BOTH contexts, which is why it is the one to keep.
   # ⛔ BOUNDED, STDIN CLOSED, AND A NON-ANSWER IS NOT AN ABSENCE (TOKEN_HANG_FIX). See the block above
   # `gh_probe_bounded`. MEASURED rc=142: an unbounded capture here is what stalled the funnel forever.
   if [ -z "$presence" ]; then
