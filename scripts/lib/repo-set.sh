@@ -243,10 +243,13 @@ _rs_doctor_available() {
 # errno" — the walk below is what answers then.
 #
 # ⛔ `[ ! -e ]` DOES NOT MEAN "ABSENT", AND THE ANCESTOR WALK ALONE CANNOT TELL (review round 11, P2).
-# `-e` is false for EVERY stat failure: ENOENT (absent), EACCES/EPERM (a denial — TCC denies at an
-# ancestor while that ancestor's MODE still reads traversable, which is exactly how the walk above gets
-# it wrong), ENAMETOOLONG, EIO. A denial read as absence means the box DEGRADES on a set that exists and
-# is told to create it — the round-9 P2 this arm keeps trying to close, surviving one errno over.
+# `-e` is false for EVERY stat failure, and absence (ENOENT) is only one of them — so what follows is
+# EXAMPLES, not an enumeration, and a new errno does not make it false: EACCES/EPERM (a denial — TCC
+# denies at an ancestor while that ancestor's MODE still reads traversable, which is exactly how the walk
+# above gets it wrong), ENOTDIR (a path component is a FILE — the `notdir` kind above, and the sharpest
+# demonstration that `-e` false is not absence), ENAMETOOLONG, EIO. A denial read as absence means the box
+# DEGRADES on a set that exists and is told to create it — the round-9 P2 this arm keeps trying to close,
+# surviving one errno over.
 # Bash cannot see the errno; python can, and the same interpreter is already resolved for the doctor.
 _rs_stat_kind() {
   local p="${1:-}" py
@@ -504,8 +507,10 @@ repo_set_parse() {
   if [ ! -e "$f" ]; then
     local anc kind; anc="$(_rs_nearest_existing_ancestor "$f")"
     kind="$(_rs_stat_kind "$f")"
-    # ⛔ THE ERRNO DECIDES WHEN IT CAN (review round 11, P2). `-e` false covers ENOENT, EACCES/EPERM
-    # (a TCC denial under a MODE-traversable ancestor), ENAMETOOLONG and EIO; only the first is absence.
+    # ⛔ THE ERRNO DECIDES WHEN IT CAN (review round 11, P2). `-e` false is false for EVERY stat failure,
+    # and absence is only one of them — EXAMPLES, not an enumeration, so the list cannot go stale the way
+    # the kind list beside it did: ENOENT, EACCES/EPERM (a TCC denial under a MODE-traversable ancestor),
+    # ENOTDIR (a component is a FILE — the `notdir` arm below), ENAMETOOLONG, EIO. Only ENOENT is absence.
     # When no interpreter resolves, `unknown` falls back to the ancestor walk below and the narrower
     # claim in its message ("we cannot see it") is the honest one.
     case "$kind" in
@@ -926,13 +931,10 @@ _rs_origin_slug() {
     # sibling is PRESENT and `_rs_py_resolve` is empty, so the very next whole-set WARN says `or no python3
     # resolves` while this line said it could not see. A residue is for what is genuinely unaccounted for,
     # not for the one remaining named cause.
-    # ⛔ AND IT MUST NOT CLAIM THE CHILD "COULD BE RUN" EITHER (round 45, P2 — measured). The line said
-    # `produced no answer even though it could be run`, which is the SAME false-cause class one arm down:
-    # `_rs_py_resolve` non-empty proves RESOLUTION, never RUNNABILITY (`command -v` reports how the shell
-    # would resolve a name without invoking it; POSIX splits 126 `found but not invokable` from 127).
-    # Measured: a stale `python3` shim on `PATH` that exits 127 resolves, produces no stdout, and made
-    # this line assert it could be run — about the one interpreter that provably could not. The honest
-    # residue names no cause at all; the resolution-only claim lives in the named arm above.
+    # ⛔ AND THE RESIDUE MUST NOT CLAIM IT "COULD BE RUN" EITHER (round 45, P2 — measured): `python3` can
+    # RESOLVE and still fail to EXEC (a broken or blocked interpreter), and then the reader has verified
+    # nothing about whether the sibling could run. That shape reaches this line, so the sentence names no
+    # cause at all — `m47` pins it, and the named branch above is only for the case the reader can prove.
     if [ -z "$(_rs_py_resolve 2>/dev/null)" ]; then
       printf '\tno python3 resolves here, so pr-doctor.py could not be RUN at all'
       return 0
