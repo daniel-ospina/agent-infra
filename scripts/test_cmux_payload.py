@@ -1486,7 +1486,7 @@ def test_cadence_nudge_never_certifies_an_unrecognised_checker_verdict(tmp_path,
     assert nudges, appended
     assert all("delivered=yes" not in line for line in nudges), (
         f"an unrecognised verdict ({stub_verdict!r}) bought a delivery receipt:\n{appended}")
-    assert "verdict=NO-CHECKER" not in appended, (
+    assert "payload checker unavailable" not in appended, (
         "the checker branch was never entered, so this arm certified nothing:" + appended)
     lines = appended.strip().splitlines()
     # ⛔ ONE RECEIPT IS EXACTLY TWO LOG LINES (#3795 review cycle 2, P2). A multi-line verdict used to
