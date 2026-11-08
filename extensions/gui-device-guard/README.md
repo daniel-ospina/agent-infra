@@ -117,6 +117,27 @@ ledger row**, i.e. both halves of #2249 skipped (`review cycle 4, F1`; the guard
 failed on the shape *next to* the one it pinned). `( )` and other operator-only
 segments hold no launch and are skipped.
 
+**An attached option argument is the same argument.** `bash -c"<cmd>"`
+(tokenised as one token, `-cnpm exec electron .`), `sh -c'<cmd>'`, `-lcCMD` and
+`flock -c"<cmd>"` are the attached spellings of the same flags and are re-read the
+same way; the argument is normalised from the **same** `COMMAND_STRING_FLAGS` table
+the separated form reads, so a wrapper added later gets both spellings at once.
+`open -a"Google Chrome"` / `open -aDMeer` were the same root on the record-only
+rule: **not** refused (a named app is recorded, `media: false`), but not recorded
+either — which lost R1, the diagnosis half of #2249 (`review cycle 5, F1`, rows
+L21a–L21h).
+
+**A `<<` inside a comment is DATA.** The heredoc scanner reads raw lines with the
+quote model, and `#` is not a quote character — so a comment merely *mentioning*
+the idiom (`# usage: write a file with cat <<EOF`) used to open a heredoc, find no
+terminator, and delete every following line: **no block and no ledger row** for the
+launch after it. The comment rule is now one helper (`commentCutIndex`) read by
+both the comment stripper and the heredoc scanner. The terminator rule itself is
+untouched — `EOF # done` genuinely does not terminate a heredoc in `sh`, so the
+text after it genuinely is data (A32 pins that side too), and a `<<` inside an
+arithmetic expansion (`$(( n << shift ))`) stays declared rather than claimed
+complete (`review cycle 5, F2`, rows L22a/L22b).
+
 **`command -v` is a lookup, not a launch.** `command` is a prefix word, so the
 resolved "command word" was the *looked-up* name and `command -v electron` was
 refused — a false block on correct work, which is a defect in its own right
@@ -141,12 +162,13 @@ This is a residual list, not a completeness claim:
   literal `-c`-style **command string** is re-read). At the moment this hook sees
   the command those are data, not argv.
 - A wrapper word that is **not** in the list above, in front of a launch word
-  that is **not** brought in by a package-runner (`xvfb-run -a electron`) behaves
-  like a plain command: its own arguments are not scanned. That is the one gap the
-  structural rule cannot close — `grep -rn electron src/` and
-  `xvfb-run -a electron` are the same two tokens to a parser with no command
-  database, so widening further would refuse the search. The list is deliberate and
-  finite; adding one is a one-word edit.
+  that is **not** brought in by a package-runner (`systemd-inhibit -w electron .`)
+  behaves like a plain command: its own arguments are not scanned. That is the one
+  gap the structural rule cannot close — `grep -rn electron src/` and
+  `systemd-inhibit -w electron .` are the same two tokens to a parser with no
+  command database, so widening further would refuse the search. The list is
+  deliberate and finite; adding one is a one-word edit. (`xvfb-run` USED to be the
+  example here and no longer is: it is in the list, pinned green as L19d.)
 - **Over-fire, declared**: because a runner anywhere in the segment counts, an
   UNQUOTED line that merely *prints* a runner launch — `echo npm exec electron .` —
   is refused. Quoting it (`echo "npm exec electron ."`) is the workaround, and
@@ -164,7 +186,7 @@ This is a residual list, not a completeness claim:
 ## Tests
 
 ```bash
-node extensions/gui-device-guard/test.mjs                    # 127 assertions, threat table L1–L20 + handler H1–H12
+node extensions/gui-device-guard/test.mjs                    # 146 assertions, threat table L1–L22 + handler H1–H14
 node extensions/gui-device-guard/test.mjs --classify 'npm exec electron .'
 ```
 
@@ -173,12 +195,15 @@ The suite loads the **real** `index.ts` through
 `tool_call` handler** — the #744/#697 lesson: a suite that imports only a helper
 stays green while `index.ts` is broken and the guard is inert in every session.
 Mutations are pinned, each attributable to the row it is about, all measured at
-ONE head: the Electron rule's `media` → `false` reds **47**; the wrapper recursion
+ONE head: the Electron rule's `media` → `false` reds **62**; the wrapper recursion
 removed reds **8**; the wrapper WORDS removed reds **2**; the structural rule that
 reads a package-runner anywhere in the segment removed reds **2** (L19h/L19i); the
 comment stripper removed reds **1** (L11d); the fail-safe word scan removed reds
 **5**; the quote-aware paren scan removed reds **1** (L17); honouring the fake
-switches on an `open` line reds **3** (L18b + H3b/H3c).
+switches on an `open` line reds **3** (L18b + H3b/H3c); refusing to normalise an
+ATTACHED short-option argument reds **8** (L21a–L21f, H13, H13a); removing the
+`open -a<name>` attached branch reds **3** (L21g, L21h, H13b); reading a commented
+`<<` as a heredoc again reds **4** (L22a, L22b, H14, H14a).
 
 ⛔ Deleting the `if (cwi < 0) continue;` guard does not print a red row — it makes
 the SUITE CRASH (`Cannot read properties of undefined`, from `basename(toks[-1])`),

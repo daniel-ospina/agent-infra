@@ -68,8 +68,8 @@
  *     launch with the unexpanded app name. Recording the SHAPE is still worth
  *     more than the exact string.
  *   - A WRAPPER WORD the table above has never heard of, in front of a launch
- *     word that no package-runner introduces (`xvfb-run -a electron`) is not
- *     classified. This cannot be closed structurally: with no command database,
+ *     word that no package-runner introduces (`systemd-inhibit -w electron .`) is
+ *     not classified. This cannot be closed structurally: with no command database,
  *     `grep -rn electron src/` and a wrapped bare launch are the same token
  *     shape, so widening further would refuse the SEARCH. The list is deliberate
  *     and finite — one word to add — and a runner-nested launch is caught behind
