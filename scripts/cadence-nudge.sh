@@ -670,8 +670,11 @@ printf '%s NUDGE at=%s delivered=%s (cadence-floor) gap=%sm queue=[%s] alerts=[]
   "$(date '+%m-%d %H:%M:%S')" "$now" "$delivered" "$gap_min" "$q" "$verdict" "$_vdiag" >> "$LOG"
 # A failed verdict gets its own line TOO, so a reader scanning for `CADENCE-NUDGE` sees the failure
 # without parsing the receipt above, and so the remedy is stated rather than implied. (It is NOT
-# backward compatible with the pre-#1187 `CADENCE-NUDGE rc=<n>` line, which this change removed — the
-# `rc=` in this line lives inside `diag=[…]`.)
+# backward compatible with the pre-#1187 `CADENCE-NUDGE rc=<n>` line, which this change removed: on the
+# no-usable-checker path the exit status is appended AFTER the closing bracket — `diag=[…] rc=<n>`, not
+# inside it (`_vdiag=" diag=[$_cause] rc=${rc:-?}"` above) — and on the checker path there is no `rc=`
+# FIELD at all, because the exit status of a checker that ran is not a delivery verdict (its stderr may
+# of course mention one).
 if [ "$delivered" != "yes" ]; then
   printf '%s CADENCE-NUDGE NOT CERTIFIED verdict=%s%s — the nudge was NOT proven delivered; check the orchestrator pane before assuming the beat arrived (#1187).\n' \
     "$(date '+%m-%d %H:%M:%S')" "$verdict" "$_vdiag" >> "$LOG"
