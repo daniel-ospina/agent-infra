@@ -252,6 +252,23 @@ OUT="$(REPO_PATH="${REPO_PATH:-$RUN_REPO}" PATH="$BIN:$PATH" O="$OT" HOME="$T/ho
 ck "a finished chain whose reviewer said ISSUES → exit 10 FIX_REQUIRED with a round spent (the fix list is the review)" \
    $([ "$RC" = 10 ] && [ "$(verdict_of 25 | cut -d' ' -f1)" = FIX_REQUIRED ] && [ "$(cat "$OT/state/lanemerge-25.round")" = 1 ] && echo 0 || echo 1)
 
+# ── 11c-quater. a REFUSED LANE REPORT is FIX_REQUIRED, never BLOCKED_ATTESTATION (#2977) ────────
+# ⛔ merge-one.sh exits 9 with NO `needsfix` marker on a report refusal — deliberately, because the
+# remedy (re-run the suites at this head) costs no push and a HEAD-keyed park would deadlock the
+# lane's own retry. Without the classifier arm the refusal fell through to the `*)` arm and reached
+# the lane as exit 12 "green and mergeable, but no signed review record exists for this head" — a
+# hand-off over something the lane fixes in place. DISCRIMINATOR: against the pre-fix classifier this
+# row exits 12, so it cannot pass by accident (it is the one arm the delete-it mutant reds).
+new_o "$T/pr17.tsv"
+printf '%s deadbeef %s\n' 999997 "$OT/logs/lane-merge-42.log" > "$OT/state/lanemerge-42.chain"
+printf '[merge 42] LANE REPORT REFUSED (rc=4) at head=abc123 — refusing to merge on a lane report that does not support this tree (#2977). No review was bought and nothing was merged.\n' > "$OT/logs/merge-42.log"
+OUT="$(REPO_PATH="${REPO_PATH:-$RUN_REPO}" PATH="$BIN:$PATH" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 \
+      bash "$SCRIPT" 42 --watch --repo o/r --pr-tsv "$T/pr4.tsv" 2>&1)"; RC=$?
+ck "a REFUSED lane report → exit 10 FIX_REQUIRED (the lane re-runs in place; no push, no hand-off)" \
+   $([ "$RC" = 10 ] && [ "$(verdict_of 42 | cut -d' ' -f1)" = FIX_REQUIRED ] && echo 0 || echo 1)
+ck "…and it is NOT BLOCKED_ATTESTATION/12 (that would hand off a report the lane fixes itself)" \
+   $([ "$RC" != 12 ] && [ "$(verdict_of 42 | cut -d' ' -f1)" != BLOCKED_ATTESTATION ] && echo 0 || echo 1)
+
 # ── 11c-bis. the DURABLE marker wins even when the log has been rotated away ─────────────────────
 new_o "$T/pr21.tsv"
 printf '%s deadbeef %s\n' 999998 "$OT/logs/lane-merge-30.log" > "$OT/state/lanemerge-30.chain"

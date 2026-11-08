@@ -1278,23 +1278,46 @@ done
 # to be merged, and a lane whose own evidence says that may not land. 5 and 6 are ABSTENTIONS (this box
 # or this repo cannot carry the check) and are logged, never treated as green: collapsing them into a
 # pass is how a gate reports coverage it does not have.
+#
+# ⛔ AN EMPTY BRANCH IS NOT GATED HERE, DELIBERATELY (fresh review, P1 — the guard must not outrank a
+# better refusal). `launch_chain` already refuses a missing branch with the ACTIONABLE remedy
+# (`WAITING_NO_BRANCH`, exit 2, "pass --branch <name>"), and the gate cannot bind a report to a branch
+# it was not given. Running it first would turn that exit 2 into a `FIX_REQUIRED` telling the lane to
+# fix CODE over a caller error. The empty-branch arm still refuses in the gate itself, which is where
+# merge-one.sh / chain-merge.sh / fix-one.sh reach it.
 _lrg_rc=0; _lrg_out=""
-if [ -n "$LANE_REPORT_GATE" ]; then
+if [ -z "${RESOLVED_BR// /}" ]; then
+  : # launch_chain owns the refusal below; nothing to gate, and no chain will launch.
+elif [ -n "$LANE_REPORT_GATE" ]; then
+  # ⛔ THE VERIFIER MUST NOT COME FROM THE TREE BEING MERGED (fresh review, P2). The gate resolves
+  # `tools/worktree_report.py` from the repo it is handed, and `$(pwd)` here is the LANE's own
+  # worktree on the branch under review — so a lane could edit the grader that grades it. A trusted
+  # (main) checkout is resolved here, once, exactly as `launch_chain` resolves it, so the gate's
+  # instrument comes from the tree nobody is merging. When no main worktree is reachable the lane
+  # checkout is passed (pre-existing behaviour): the gate then abstains (6) rather than passing.
+  _lrg_repo="${REPO_PATH:-$(pwd)}"
+  _lrg_trusted="$(resolve_trusted_checkout "$_lrg_repo" 2>/dev/null)" || _lrg_trusted=""
+  [ -n "$_lrg_trusted" ] && _lrg_repo="$_lrg_trusted"
   # ONE run, captured: the verdict line is the diagnosis, and running the gate twice to quote it would
   # pay two git/python invocations per merge for a message.
-  _lrg_out="$(lane_report_gate "${REPO_PATH:-$(pwd)}" "$RESOLVED_BR" "$HEAD" 2>&1)" || _lrg_rc=$?
+  _lrg_out="$(lane_report_gate "$_lrg_repo" "$RESOLVED_BR" "$HEAD" 2>&1)" || _lrg_rc=$?
   [ -n "$_lrg_out" ] && log_line "$_lrg_out"
 else
   log_line "lane-report: NOT CHECKED — lane-report-gate.sh is not deployed (looked beside this script and in \$O=$O). The mandatory lane report (#2977) is NOT verified on this box; redeploy the harness."
   _lrg_rc=5
 fi
-case "$_lrg_rc" in
-  0)  log_line "lane-report: verified at head ${HEAD:0:12} — the report describes the tree being merged" ;;
-  5|6) log_line "lane-report: NOT ENFORCED here (rc=$_lrg_rc) — an abstention, not a green: this box/repo cannot carry the check" ;;
-  *)  log_line "⛔ lane-report: REFUSED (rc=$_lrg_rc) — the mandatory lane report does not support merging head ${HEAD:0:12}"
-      lane_report_remedy "$_lrg_rc" 2>/dev/null || true
-      emit_fix FIX_REQUIRED "the lane report does not support this merge (rc=$_lrg_rc): $(printf '%s' "$_lrg_out" | tail -1)" ;;
-esac
+# ⛔ THE CASE RUNS ONLY WHEN THE GATE RAN: with no branch, `_lrg_rc` is 0 and this block would CLAIM a
+# verification that never happened. The branchless path falls straight through to `launch_chain`, which
+# refuses before anything merges.
+if [ -n "${RESOLVED_BR// /}" ]; then
+  case "$_lrg_rc" in
+    0)  log_line "lane-report: verified at head ${HEAD:0:12} — the report describes the tree being merged" ;;
+    5|6) log_line "lane-report: NOT ENFORCED here (rc=$_lrg_rc) — an abstention, not a green: this box/repo cannot carry the check" ;;
+    *)  log_line "⛔ lane-report: REFUSED (rc=$_lrg_rc) — the mandatory lane report does not support merging head ${HEAD:0:12}"
+        lane_report_remedy "$_lrg_rc" 2>/dev/null || true
+        emit_fix FIX_REQUIRED "the lane report does not support this merge (rc=$_lrg_rc): $(printf '%s' "$_lrg_out" | tail -1)" ;;
+  esac
+fi
 
 launch_chain "$HEAD" || exit 2
 log_line "… the merge chain owns PR #$PR now. Next: lane-merge.sh $PR --watch (bounded chunk; repeat)"

@@ -18,7 +18,9 @@
 #     both BE the head being merged, and an EMPTY head cannot pass any arm. ⛔ These rows exist because
 #     the reviewer's mutant — `head=` documented everywhere and compared nowhere — passed this suite.
 #  4. POLARITY BY CONTENT, NOT BY EXIT CODE ALONE: rc 0 with `ok: false` is INVALID, and unparseable
-#     output is UNMEASURABLE — an unreadable verification is never a pass.
+#     output is UNMEASURABLE — an unreadable verification is never a pass. Also UNMEASURABLE, not an
+#     abstention: an empty branch, an empty repo, and no interpreter (a missing input or an unrunnable
+#     verifier must never reach the most tolerant outcome the gate has).
 #  5. THE TWO ABSTENTIONS ARE NOT GREEN and are distinguishable: a repo that ships no writer is
 #     NO-CONSUMER (the gate cannot bind there), and a branch with no worktree on this box is
 #     NO-WORKTREE. Collapsing either into 0 is how a gate reports coverage it does not have.
@@ -34,6 +36,17 @@
 #     ON PROSE: `lane-merge.sh` mentions `lane_report_gate` in a COMMENT above its own call, so a
 #     `grep` for the identifier matched the comment and the reviewer's "delete the call" mutant left
 #     every row green. Each anchor below is a regex over the line that actually sources or calls.
+#     ⛔ AND THE DISPOSITION IS PINNED, NOT JUST THE CALL (fresh review, P1): deleting the refusal from
+#     both carriers left this suite 29/29 green, so a gate that runs, prints its verdict and is ignored
+#     passed. The code line that refuses (`emit_fix FIX_REQUIRED` / `exit 9`) and the rail ordering are
+#     asserted BETWEEN the call and the thing they protect.
+#  9. THE LAUNDERING ARM (fresh review, P0): `write_report` re-stamps `head_at_write` on every
+#     `write`/`note`/idempotent `init`, so a report whose suites ran at an older commit presents a
+#     matching recorded head. The newest suite `finished_at` is written only by `run`, so it is the one
+#     witness a re-render cannot move — and the control row proves the arm refuses the laundering, not
+#     every report.
+# 10. THE VERIFIER IS THE TRUSTED CHECKOUT'S, not the merged worktree's (fresh review, P2): a lane can
+#     edit `tools/worktree_report.py` on its own branch, so preferring `$wt` would let it grade itself.
 set -u
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 GATE="$HERE/lane-report-gate.sh"
@@ -155,12 +168,52 @@ out="$(env STUB_OK=1 STUB_RC=0 STUB_STALE=0 STUB_HEAD=bbbbbbbbbbbbbbbbbbbbbbbbbb
 if [ "$rc" = 4 ]; then ok "STALE: the WORKTREE is not at the head being merged (the shift no writer can see) (rc=$rc)"; else bad "worktree-behind: expected rc=4, got rc=$rc :: $out"; fi
 case "$out" in *reason=worktree-is-not-at-the-merging-head*) ok "…and it names that reason, not the writer's flag" ;; *) bad "worktree-behind reason: $out" ;; esac
 
+# ── 2c. AN UNUSABLE INPUT IS UNMEASURABLE, NEVER AN ABSTENTION (fresh review, P1) ────────────────
+# An empty branch made `_lrg_worktree` return 1, so the gate answered **6 NO-WORKTREE** — the code the
+# carriers log as "an abstention, not a green" and then MERGE ON. An ingress that cannot name the
+# branch must not get the gate's most tolerant outcome. Same rule the empty-`head` row above states.
+out="$(env STUB_OK=1 STUB_RC=0 bash "$GATE" --check "$REPO" "" "$WT_HEAD" 2>&1)"; rc=$?
+if [ "$rc" = 7 ]; then ok "EMPTY branch is UNMEASURABLE, not a 6 abstention (rc=$rc)"; else bad "empty branch: expected rc=7, got rc=$rc :: $out"; fi
+out="$(env STUB_OK=1 STUB_RC=0 bash "$GATE" --check "" "feat/2977-tm" "$WT_HEAD" 2>&1)"; rc=$?
+if [ "$rc" = 7 ]; then ok "EMPTY repo is UNMEASURABLE, not a 6 abstention (rc=$rc)"; else bad "empty repo: expected rc=7, got rc=$rc :: $out"; fi
+
+# ── 2d. THE LAUNDERING ARM (fresh review, P0) ────────────────────────────────────────────────────
+# `write_report` re-stamps `head_at_write` on every `write`/`note`/idempotent `init`, so a lane that
+# runs its suites at commit A, commits B, then runs any of those three commands presents a recorded
+# head of B with evidence from A. The suite's own `finished_at` is written ONLY by `run` and is not
+# touched by a render, so it is the witness that survives — and it must be load-bearing.
+printf '{"version":1,"head_at_write":"%s","branch":"feat/2977-tm","suites":[{"n":1,"command":"x","exit":0,"finished_at":"2020-01-01T00:00:00Z"}]}\n' "$WT_HEAD" > "$WT/.worktree-report/state.json"
+drive 4 "STALE: a re-rendered report whose suites finished BEFORE the merging commit existed" STUB_OK=1 STUB_RC=0 STUB_STALE=0
+case "$LAST_OUT" in *reason=evidence-not-produced-after-the-merging-commit*) ok "…and it names the laundering reason, not the writer's flag" ;; *) bad "predates reason: $LAST_OUT" ;; esac
+# The control that makes the row discriminating: evidence produced AFTER the commit (the honest
+# re-run at the merging head) must still PASS, so the arm refuses the laundering and not every report.
+printf '{"version":1,"head_at_write":"%s","branch":"feat/2977-tm","suites":[{"n":1,"command":"x","exit":0,"finished_at":"2099-01-01T00:00:00Z"}]}\n' "$WT_HEAD" > "$WT/.worktree-report/state.json"
+drive 0 "PASS: evidence finished AFTER the merging commit was created (the honest re-run at the head)"
+# ⛔ THE SAME-SECOND ROW (measured end-to-end before it was written): both clocks are SECOND
+# resolution, so a suite finished in the commit's own second is indistinguishable between the honest
+# and the laundering case. An ambiguous witness must not read as green, so equality refuses. Without
+# this row a `<` mutant passes the two rows above and lets a fast commit launder in the same second.
+HEAD_ISO="$(git -C "$WT" log -1 --format=%cI "$WT_HEAD")"
+printf '{"version":1,"head_at_write":"%s","branch":"feat/2977-tm","suites":[{"n":1,"command":"x","exit":0,"finished_at":"%s"}]}\n' "$WT_HEAD" "$HEAD_ISO" > "$WT/.worktree-report/state.json"
+drive 4 "STALE: evidence finished in the merging commit's OWN second (ambiguous, so it cannot pass)" STUB_OK=1 STUB_RC=0 STUB_STALE=0
+rm -f "$WT/.worktree-report/state.json"
+
 # ── 3. RED and INVALID, and polarity by CONTENT ──────────────────────────────────────────────────
 drive 3 "RED: valid evidence that records a failing suite (consumer exit 3)" STUB_OK=0 STUB_RC=3 STUB_FAILING=1
 drive 2 "INVALID: the consumer's rules fail and it exits 1" STUB_OK=0 STUB_RC=1 STUB_RULES=suite-log-hash-mismatch:unit
 case "$LAST_OUT" in *suite-log-hash-mismatch*) ok "INVALID names the failing rule the consumer reported" ;; *) bad "INVALID does not name the rule: $LAST_OUT" ;; esac
 drive 2 "POLARITY: exit 0 with ok:false is INVALID, not PASS" STUB_OK=0 STUB_RC=0
 drive 7 "UNMEASURABLE: the consumer's output is not JSON" STUB_RAW=not-json STUB_RC=0
+# §8 of the decision table: a report that exists but cannot be VERIFIED because no interpreter can run
+# the consumer is 7, never a pass and never an abstention. `command -v git` is the only external the
+# gate needs before it reaches this arm, so a minimal PATH is enough to drive it.
+mkdir -p "$TMP/nopy"
+ln -sf "$(command -v git)" "$TMP/nopy/git" 2>/dev/null
+# ⛔ `bash` IS INVOKED BY ABSOLUTE PATH: `env PATH=… bash` resolves `bash` with the NEW PATH, so a
+# minimal PATH makes env itself fail (rc 127) instead of exercising the gate.
+BASH_ABS="$(command -v bash)"
+out="$(env STUB_OK=1 STUB_RC=0 PATH="$TMP/nopy" LANE_REPORT_GATE_PY=/nonexistent "$BASH_ABS" "$GATE" --check "$REPO" "feat/2977-tm" "$WT_HEAD" 2>&1)"; rc=$?
+if [ "$rc" = 7 ]; then ok "NO INTERPRETER is UNMEASURABLE (rc=$rc) — an unreadable verification is not a pass"; else bad "no-interpreter: expected rc=7, got rc=$rc :: $out"; fi
 
 # ── 4. ABSENT / NO-CONSUMER / UNMEASURABLE-with-report ───────────────────────────────────────────
 mv "$WT/WORKTREE-REPORT.md" "$TMP/report.bak"
@@ -175,6 +228,22 @@ mv "$TMP/report.bak" "$WT/WORKTREE-REPORT.md"
 out="$(env STUB_OK=1 bash "$GATE" --check "$REPO" "feat/2977-tm" "$WT_HEAD" 2>&1)"; rc=$?
 if [ "$rc" = 7 ]; then ok "UNMEASURABLE: report present but no consumer to verify it (rc=$rc)"; else bad "report-present-no-consumer: expected rc=7, got rc=$rc :: $out"; fi
 mv "$TMP/stub.bak" "$REPO/tools/worktree_report.py"
+
+# ── 4b. THE VERIFIER COMES FROM THE TRUSTED CHECKOUT, NOT THE TREE BEING MERGED (fresh review, P2) ──
+# `$wt` is the LANE worktree on the branch under review, so a gate that preferred its copy of
+# `tools/worktree_report.py` would run a grader the graded tree supplies — the "rewrite the grader"
+# bypass. Plant a LYING consumer in the worktree and assert the trusted checkout's honest one still
+# decides (RED here); a first-preference-on-`$wt` mutant returns PASS and reds this row.
+mkdir -p "$WT/tools"
+cat > "$WT/tools/worktree_report.py" <<'LIAR'
+import json, subprocess, sys
+wt = sys.argv[sys.argv.index("--worktree") + 1] if "--worktree" in sys.argv else "."
+head = subprocess.run(["git", "-C", wt, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+print(json.dumps({"ok": True, "rules": [], "suites": 1, "failing_suites": 0,
+                  "head": head, "head_moved_since_write": False}))
+LIAR
+drive 3 "the worktree's OWN lying consumer does not grade it — the trusted checkout's consumer decides" STUB_OK=0 STUB_RC=3 STUB_FAILING=1
+rm -f "$WT/tools/worktree_report.py"
 
 # ── 5. EXACT BRANCH MATCH (§6) — both mutant directions — the decoys sort FIRST in the walk ──
 # ── 5. EXACT BRANCH MATCH (§6) — both mutant directions, and the decoys sort BEFORE the real worktree ──
@@ -226,8 +295,38 @@ if [ -n "$co_src" ] && [ -n "$co_call" ] && [ -n "$co_paid" ] && [ "$co_call" -l
 else
   bad "merge-one.sh wiring: source=${co_src:-none} call=${co_call:-none} paid=${co_paid:-none}"
 fi
-# The refusal must not park: a park is HEAD-keyed and the remedy is a re-run at the SAME head.
-if grep -qE '^[[:space:]]*exit 9 ;;\|^[[:space:]]*exit 9$' "$MERGE_ONE" && ! sed -n "$((co_call))p" "$MERGE_ONE" >/dev/null; then bad "merge-one.sh: the report refusal is not reachable"; fi
+# ⛔ THE REFUSAL MUST BE PINNED, NOT JUST THE CALL (fresh review, P1). Deleting the disposition
+# from BOTH carriers left this suite 29/29 green — a gate that runs, prints its verdict, and is
+# ignored. Assert the code line BETWEEN the call and the thing it protects, so a decorative gate
+# cannot pass, and pin the rail ordering (a check after the rail short-circuit skips every rail repo).
+if sed -n "$((lm_call)),$((lm_chain))p" "$LANE_MERGE" | grep -qE '^[[:space:]]*emit_fix FIX_REQUIRED '; then
+  ok "lane-merge.sh's refusal is a FIX_REQUIRED disposition between the call and launch_chain"
+else
+  bad "lane-merge.sh calls the gate but never refuses: no 'emit_fix FIX_REQUIRED' between line $lm_call and $lm_chain"
+fi
+co_rail="$(grep -nE '^if \[ "\$MERGE_AUTHORITY" = "rail" \]; then' "$MERGE_ONE" | head -1 | cut -d: -f1)"
+if [ -n "$co_rail" ] && [ "$co_call" -lt "$co_rail" ]; then
+  ok "merge-one.sh gates BEFORE the rail short-circuit (call line $co_call < rail line $co_rail)"
+else
+  bad "merge-one.sh: the gate call (${co_call:-none}) must precede the rail short-circuit (${co_rail:-none}) — a check after it skips every rail repo's merge"
+fi
+# ⛔ LINE ORDER ALONE IS NOT ENOUGH (fresh review, P1): wrapping the block in `if [ "$MERGE_AUTHORITY"
+# != "rail" ]` keeps every line in order while skipping the gate on EXACTLY the repos the PR names as
+# the ones where the lane report is the only evidence. The block must be UNGUARDED, so assert the
+# lines immediately above it cannot be such a guard.
+co_head="$(grep -nE '^_lrg_rc=0; _lrg_out=""$' "$MERGE_ONE" | head -1 | cut -d: -f1)"
+if [ -z "$co_head" ]; then
+  bad "merge-one.sh: the gate block's first line is unrecognisable — the rail-guard assertion cannot read it"
+elif sed -n "$((co_head-3)),$((co_head-1))p" "$MERGE_ONE" | grep -qE 'MERGE_AUTHORITY'; then
+  bad "merge-one.sh's gate block is guarded by MERGE_AUTHORITY — a rail-repo skip defeats the gate on every repo that needs it"
+else
+  ok "merge-one.sh's gate block is UNGUARDED (it runs on rail repos too)"
+fi
+if [ -n "$co_rail" ] && sed -n "$((co_call)),$((co_rail))p" "$MERGE_ONE" | grep -qE '^[[:space:]]*exit 9 ;;'; then
+  ok "merge-one.sh's refusal exits 9 between the call and the rail short-circuit"
+else
+  bad "merge-one.sh calls the gate but has no 'exit 9' refusal before the rail short-circuit"
+fi
 if sed -n "$((co_call)),$((co_call+8))p" "$MERGE_ONE" | grep -q 'park '; then
   bad "merge-one.sh PARKS on a report refusal — a HEAD-keyed park deadlocks the re-run that is the remedy"
 else

@@ -28,13 +28,21 @@
 # describe. So this gate is STRICTER THAN `$?`: a moved head REFUSES here. That is the consumer-side
 # judgement the writer left to us, not a reversal of the writer's decision.
 #
+# ⛔ AND STRICTER THAN THE RECORDED HEAD TOO, because `write_report` re-stamps `head_at_write` on every
+# `write`/`note`/idempotent `init` — so the recorded head is a witness a bare re-render can MOVE. The
+# one witness it cannot move is the newest suite's `finished_at` (written only by `run`): evidence that
+# finished before the merging commit was created cannot describe it, and that is refused as STALE.
+#
 # ── THE DECISION TABLE (the code IS the contract; `lane-report-gate.test.sh` pins every row) ─────
 #   0  PASS            report present, evidence valid, every recorded suite exit 0, head-bound
 #   1  ABSENT          a lane worktree for this branch exists and has NO report — silence
 #   2  INVALID         the evidence does not hold up (broken log hash, missing section, malformed state)
 #   3  RED             valid evidence that records a NON-ZERO suite exit — a lane saying its own tests
 #                      failed is not a pass
-#   4  STALE           the report was written at a different head than the one being merged
+#   4  STALE           the report does not describe the tree being merged: it was written at a
+#                      different head, the worktree is not at that head, or its suites finished
+#                      BEFORE the merging commit was created (a re-render re-stamps the recorded
+#                      head without re-running anything — see the laundering arm)
 #   5  NO-CONSUMER     the repo ships no `tools/worktree_report.py`, so no report of this format exists
 #                      to verify; NOT ENFORCED here, and said out loud (see the audit note below)
 #   6  NO-WORKTREE     no worktree for this branch on this box, so the lane's evidence is not reachable
@@ -119,6 +127,21 @@ lane_report_gate() {
     _lrg_emit 7 UNMEASURABLE "branch=$branch reason=no-head-supplied-cannot-bind-the-report-to-a-commit"
     return 7
   fi
+  # ⛔ THE SAME RULE APPLIES TO `repo` AND `branch`, AND IT WAS MISSING (fresh review, P1). An empty
+  # branch made `_lrg_worktree` return 1, so `wt` was empty and the gate answered **6 NO-WORKTREE** —
+  # the code the carriers log as "an abstention, not a green" and then MERGE ON. That is an ingress
+  # that cannot name the branch getting the gate's most tolerant outcome, which is the same fail-open
+  # the empty-head guard three lines up exists to close (merge-one.sh never validates `$BR`, and
+  # chain-merge.sh / fix-one.sh pass it straight from their own argv). An input the gate cannot use is
+  # UNMEASURABLE, never an abstention.
+  if [ -z "${branch// /}" ]; then
+    _lrg_emit 7 UNMEASURABLE "reason=no-branch-supplied-cannot-resolve-a-worktree head=$head"
+    return 7
+  fi
+  if [ -z "$repo" ]; then
+    _lrg_emit 7 UNMEASURABLE "branch=$branch reason=no-repo-supplied-cannot-resolve-a-worktree head=$head"
+    return 7
+  fi
 
   wt="$(_lrg_worktree "$repo" "$branch")" || wt=""
   if [ -z "$wt" ]; then
@@ -135,7 +158,13 @@ lane_report_gate() {
     tool="$LANE_REPORT_GATE_TOOL"
   else
     tool=""
-    for _cand in "$wt/tools/worktree_report.py" "$repo/tools/worktree_report.py"; do
+    # ⛔ `$repo` BEFORE `$wt` — the verifier must not come from the tree being merged (fresh review,
+    # P2). `$wt` is the LANE's worktree on the branch under review, so a lane can edit
+    # `tools/worktree_report.py` there and grade itself: the "rewrite the grader" bypass. `$repo` is
+    # the checkout the CALLER trusts (merge-one.sh passes the trusted checkout; lane-merge.sh resolves
+    # one before calling), so preferring it means the gate's instrument comes from the tree nobody is
+    # merging. The `$wt` fallback stays for a payload that genuinely ships the writer only there.
+    for _cand in "$repo/tools/worktree_report.py" "$wt/tools/worktree_report.py"; do
       [ -f "$_cand" ] && [ -s "$_cand" ] && { tool="$_cand"; break; }
     done
   fi
@@ -168,12 +197,17 @@ lane_report_gate() {
     *) _lrg_emit 7 UNMEASURABLE "branch=$branch worktree=$wt tool=$tool reason=consumer-produced-no-json check_rc=$rc head=$head"; return 7 ;;
   esac
 
+  # The merging commit's own creation time, read from the WORKTREE (which the head-binding arms below
+  # prove is AT the merging head by the time the predates arm is reached). Used as the one witness a
+  # bare re-render cannot move — see `predates` in the JSON pass.
+  commit_iso="$(git -C "$wt" log -1 --format=%cI "$head" 2>/dev/null)" || commit_iso=""
+
   # One python pass, because a hand-rolled grep over JSON is how a gate starts reading a nested key as
   # a top-level one. Prints `<ok>|<stale>|<rules>|<recorded head>`; empty fields are meaningful.
   # ⛔ `-c`, NOT A NESTED HEREDOC: a heredoc body is literal text, so a `<<PY` inside a `<<EOF` body
   # never runs as a program — it is the outer heredoc's DATA, the reader then gets garbage and this gate
   # would abstain on every lane that has a perfectly good report (found before it shipped).
-  _LRG_JSON_PY='import json, sys
+  _LRG_JSON_PY='import datetime, json, sys
 try:
     d = json.loads(sys.argv[1])
 except Exception:
@@ -189,21 +223,58 @@ if not isinstance(rules, list):
 # worktree). `head_at_write` lives in the writer state; it is the head the evidence actually
 # describes.
 rec = ""
+newest = None
 try:
     with open(sys.argv[2], encoding="utf-8", errors="replace") as fh:
         st = json.load(fh)
     if isinstance(st, dict):
         rec = st.get("head_at_write") or ""
+        _suites = st.get("suites")
+        if isinstance(_suites, list):
+            for _s in _suites:
+                _ts = _s.get("finished_at") if isinstance(_s, dict) else None
+                if not _ts:
+                    continue
+                try:
+                    _t = datetime.datetime.fromisoformat(str(_ts).replace("Z", "+00:00"))
+                except Exception:
+                    continue
+                if newest is None or _t > newest:
+                    newest = _t
 except Exception:
     rec = ""
-print("%s|%s|%s|%s|%s" % (
+# ⛔ THE WITNESS A RE-RENDER CANNOT MOVE (fresh review, P0). `write_report` re-stamps `head_at_write`
+# on every `write`/`note`/idempotent `init`, so a lane that runs its suites at A, commits B, and then
+# runs any of those three commands presents `head_at_write = B` with evidence taken at A — and both
+# of the gate head witnesses then agree with the merge. The newest suite `finished_at` is NOT
+# re-stamped by a render, so "the newest suite finished BEFORE the merging commit was created" is the
+# one consumer-side witness that survives. It is same-box on both sides (the commit committer date
+# and the suite clock are from the same lane box), so no cross-box skew enters it, and it adds no false
+# positive of its own: `rec_head != head` ALREADY refuses the ordinary test-then-commit order, because
+# a lane that never re-renders keeps `head_at_write` at the pre-commit head. `predates` is empty when
+# either side is unreadable, and an empty witness never refuses (the exact head bindings already do).
+# ⛔ `<=`, NOT `<`, AND THE EQUALITY IS THE POINT: both clocks are recorded at SECOND resolution, so a
+# commit made in the same second the last suite finished is indistinguishable between the honest
+# "ran after the commit" case and the laundering case (measured end-to-end: a commit at 06:54:17 and
+# a suite finished at 06:54:17 slipped a `<` comparison as a PASS). An ambiguous witness is never read
+# as green here — the same rule the writer applies to contradictory counts. The cost is one re-run
+# round for a lane whose suite happens to finish in the SAME second as the commit.
+predates = ""
+if newest is not None and sys.argv[3]:
+    try:
+        _c = datetime.datetime.fromisoformat(str(sys.argv[3]).replace("Z", "+00:00"))
+        predates = "1" if newest <= _c else "0"
+    except Exception:
+        predates = ""
+print("%s|%s|%s|%s|%s|%s" % (
     "1" if d.get("ok") is True else "0",
     "1" if d.get("head_moved_since_write") is True else "0",
     ",".join(str(r) for r in rules)[:400],
     rec,
     d.get("head") or "",
+    predates,
 ))'
-  if ! IFS='|' read -r ok stale rules rec_head live_head <<< "$("$py" -c "$_LRG_JSON_PY" "$out" "$wt/.worktree-report/state.json" 2>/dev/null)"; then
+  if ! IFS='|' read -r ok stale rules rec_head live_head predates <<< "$("$py" -c "$_LRG_JSON_PY" "$out" "$wt/.worktree-report/state.json" "$commit_iso" 2>/dev/null)"; then
     _lrg_emit 7 UNMEASURABLE "branch=$branch worktree=$wt tool=$tool reason=consumer-json-unusable check_rc=$rc head=$head"
     return 7
   fi
@@ -242,6 +313,14 @@ print("%s|%s|%s|%s|%s" % (
     _lrg_emit 4 STALE "branch=$branch worktree=$wt report=$wt/WORKTREE-REPORT.md reason=worktree-is-not-at-the-merging-head worktree_head=$live_head merging_head=$head"
     return 4
   fi
+  # ⛔ THE LAUNDERING ARM (fresh review, P0). `head_at_write` is re-stamped by a bare re-render, so the
+  # two arms above can both be satisfied by a report whose SUITES ran at an older commit. The newest
+  # suite's `finished_at` is written only by `run` and is never touched by a render, so evidence that
+  # finished before the merging commit existed cannot describe it.
+  if [ "$predates" = "1" ]; then
+    _lrg_emit 4 STALE "branch=$branch worktree=$wt report=$wt/WORKTREE-REPORT.md reason=evidence-not-produced-after-the-merging-commit report_head=${rec_head:-$head} merging_head=$head"
+    return 4
+  fi
 
   _lrg_emit 0 PASS "branch=$branch worktree=$wt report=$wt/WORKTREE-REPORT.md head=$head report_head=${rec_head:-$head}"
   return 0
@@ -260,7 +339,7 @@ lane_report_remedy() {
          'python3 tools/worktree_report.py init --issue <N>, then run every suite through it (run --cmd <cmd>), then write.' ;;
     2) printf '  The evidence in the report does not hold up (a recorded log is missing, its hash does not\n  match, or a promised section is absent). Re-run the affected suite through the tool so the record\n  matches its log.\n' ;;
     3) printf '  The report RECORDS A FAILING SUITE. A green report is a precondition of merge: fix the failure and\n  re-run that suite through the tool (a lane whose own evidence says red may not merge).\n' ;;
-    4) printf '  The report does not describe the tree being merged (it was written at another head, or the\n  lane worktree is not at the head on the branch — a push from another worktree/box moves the branch\n  and leaves your worktree behind). Re-run the suites AT THE HEAD ON THE BRANCH through the tool\n  (do NOT just re-render):\n     git -C <your worktree> status ; git log --oneline -1   # confirm you are at the PR head\n     python3 tools/worktree_report.py run --cmd <the exact command>   # for each suite\n' ;;
+    4) printf '  The report does not describe the tree being merged (it was written at another head, the\n  lane worktree is not at the head on the branch, or its evidence finished before that head was\n  created — a push from another worktree/box moves the branch and leaves your worktree behind).\n  Re-run the suites AT THE HEAD ON THE BRANCH through the tool (do NOT just re-render):\n     git -C <your worktree> status ; git log --oneline -1   # confirm you are at the PR head\n     python3 tools/worktree_report.py run --cmd <the exact command>   # for each suite\n  ⛔ `write`, `note` and a plain `init` re-render the report AND re-stamp the recorded head WITHOUT\n  re-running anything, so they turn a stale report into a green-looking one. Only `run` produces\n  evidence for the head you are merging.\n' ;;
     7) printf '  The report exists but could not be VERIFIED (no interpreter, or the consumer failed / printed no\n  parseable JSON). An unreadable verification is not a pass: repair the consumer, then re-run.\n' ;;
     *) : ;;
   esac
