@@ -217,7 +217,15 @@ _nudge_holder_is_ours() {  # rc 0 = _hpid is a live process that IS this script 
                           # otherwise NAME, then AGE -- see the two arms below, they are NOT one conjunction)
   local _pargs _sh _arg _lm _brc
   _pargs=$(ps -p "$_hpid" -o args= 2>/dev/null)
-  [ -n "$_pargs" ] || return 1
+  # ⛔ AN EMPTY ARGV IS NOT A DEATH WITNESS (#3795 review cycle 9, P2). This read used to be
+  # `[ -n "$_pargs" ] || return 1`, which mapped "the argv read failed" onto FOREIGN -- and FOREIGN is
+  # rule 4's 6-min grace, SHORTER than this file's own ~413 s critical section, so a live holder whose
+  # `ps` hiccuped would be reclaimed MID-SEND. The caller only reaches this function on the `present`
+  # arm of `_nudge_holder_state`, i.e. a SEPARATE read (`pid_row`, or `kill -0`) has already proven the
+  # pid exists and is live, and a live process always has an argv -- so an empty answer here can only
+  # be the READ failing. The whole file already rules this way one arm up (`_hstate=unknown` -> the
+  # CEILING) and in `auto-rail.sh`'s "when the lock cannot be dated it is HELD". Hold, therefore.
+  [ -n "$_pargs" ] || return 0
   # ⛔ NOT A PIPE INTO `grep -q` (#3795 review cycle 3, P2). `scripts/check-no-sigpipe-grep.sh` bans
   # that idiom and cannot see this site (`ps` is not one of its recognised producers); under
   # `set -o pipefail` a large enough payload after the match makes the pipeline report 141, which
@@ -250,9 +258,16 @@ _nudge_holder_is_ours() {  # rc 0 = _hpid is a live process that IS this script 
   case "$_lm" in ''|*[!0-9]*) return 0 ;; esac            # recycled pid, so keep the fail-closed arm
   if command -v pid_began_after >/dev/null 2>&1; then
     if pid_began_after "$_hpid" "$_lm"; then _brc=0; else _brc=$?; fi
+    # ⛔ THE LIBRARY'S THREE ANSWERS, AND `2` IS NOT `1` (#3795 review cycle 9, P2). `pid_began_after`
+    # is 0 = began after, 1 = did not, 2 = THE AGE CANNOT BE READ -- and this `case` folded 2 into
+    # "not provably ours", i.e. FOREIGN, i.e. the 6-min grace that is shorter than the send window.
+    # That is the same conflation `pid-identity.sh`'s own contract forbids ("a probe that conflated
+    # them would manufacture 'dead' out of a failed `ps` invocation", #1178 C3) and the same one the
+    # sibling `date -r` arm above already resolves the other way. Only an ANSWERED "began after"
+    # demotes; a question that could not be put holds the lock to the ceiling.
     case "$_brc" in
-      1) return 0 ;;   # began BEFORE the record -> it may be the holder
-      *) return 1 ;;   # began after (recycled), or the age cannot be read -> not provably ours
+      0) return 1 ;;   # answered: began AFTER the record -> recycled, not ours
+      *) return 0 ;;   # 1 = began before (ours); 2 = cannot tell -> HOLD, fail-closed
     esac
   fi
   return 0
@@ -311,30 +326,33 @@ if [ -d "$LOCK" ]; then
       exit 0
     fi
     rm -f "$LOCKPID.doomed.$$" 2>/dev/null
-  else
-    # Naming nothing at all, so there is no record to rename and the token must be the directory. This
-    # arm is reachable only for a lock older than the 20-min ceiling that wrote no record at all (an
-    # old-format lock, or a run whose pid write failed).
-    # ⛔ ITS RESIDUAL, STATED: this arm's token is the directory, so a THIRD contender can re-create
-    # the name between our `mv` and our verify. The verify below still refuses to delete a directory
-    # that is now fresh, but with three contenders the restore can replace a fresh directory instead
-    # of the one we moved -- two senders in that corner. It is bounded and the consequence is a
-    # duplicate HEARTBEAT, which this file already declares not the dangerous duplicate a duplicate
-    # lane ORDER is. Every realistic arm writes its record before it sends, so it takes the arm above.
-    if ! mv "$LOCK" "$LOCK.doomed.$$" 2>/dev/null; then
-      printf '%s CADENCE-NUDGE lock-skip holder=none — another pass reclaimed this lock first; this one made no attempt\n' \
-        "$(date '+%m-%d %H:%M:%S')" >> "$LOG"
-      exit 0
-    fi
-    if [ -z "$(find "$LOCK.doomed.$$" -maxdepth 0 -mmin +"$_bound" 2>/dev/null)" ]; then
-      mv "$LOCK.doomed.$$" "$LOCK" 2>/dev/null
-      printf '%s CADENCE-NUDGE lock-skip holder=none — the lock was re-created between judging it and claiming it; this pass made no attempt\n' \
-        "$(date '+%m-%d %H:%M:%S')" >> "$LOG"
-      exit 0
-    fi
-    rm -rf "$LOCK.doomed.$$" 2>/dev/null
   fi
-  rm -rf "$LOCK" 2>/dev/null
+  # ⛔ THE DIRECTORY IS CLAIMED BY RENAME IN BOTH ARMS, AND THE LIVE NAME IS NEVER `rm -rf`'d (#3795
+  # review cycle 9, P2). The record arm used to fall through to an unconditional `rm -rf "$LOCK"`, and
+  # that removed a directory it had NOT judged: once the record is renamed away the lock briefly has no
+  # record, so a second contender takes the NO-RECORD arm, judges the (still old) directory stale,
+  # renames it aside, removes it and re-creates it -- and the first process then deletes THAT fresh
+  # directory and `mkdir`s its own. Both send. That is the identical defect round 6 removed from the
+  # reclaim MUTEX ("`rm -rf`'d the mutex it had just moved when that mutex turned out to be FRESH"),
+  # one object up, and the old residual note falsely called the record arm the safe one.
+  #   `rename(2)` is the once-winnable primitive for the directory too: a loser's `mv` fails ENOENT and
+  # makes no attempt, and the winner refuses to remove what it moved unless it is still as old as it
+  # judged. The residual is unchanged and still stated: a THIRD contender can re-create the name
+  # between our `mv` and this verify, where the restore can replace a fresh directory instead of the
+  # one we moved -- two senders in that corner, bounded, and the consequence is a duplicate HEARTBEAT,
+  # which this file already declares not the dangerous duplicate a duplicate lane ORDER is.
+  if ! mv "$LOCK" "$LOCK.doomed.$$" 2>/dev/null; then
+    printf '%s CADENCE-NUDGE lock-skip holder=none — another pass reclaimed this lock first; this one made no attempt\n' \
+      "$(date '+%m-%d %H:%M:%S')" >> "$LOG"
+    exit 0
+  fi
+  if [ -z "$(find "$LOCK.doomed.$$" -maxdepth 0 -mmin +"$_bound" 2>/dev/null)" ]; then
+    mv "$LOCK.doomed.$$" "$LOCK" 2>/dev/null
+    printf '%s CADENCE-NUDGE lock-skip holder=none — the lock was re-created between judging it and claiming it; this pass made no attempt\n' \
+      "$(date '+%m-%d %H:%M:%S')" >> "$LOG"
+    exit 0
+  fi
+  rm -rf "$LOCK.doomed.$$" 2>/dev/null
   printf '%s CADENCE-NUDGE lock-reclaimed bound=%sm — %s; taking the lock (#1187).\n' \
     "$(date '+%m-%d %H:%M:%S')" "$_bound" "$_why" >> "$LOG"
 fi

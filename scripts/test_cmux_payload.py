@@ -1366,7 +1366,7 @@ def _cadence_home(tmp_path, screen_text, previous_line):
 
 
 def _run_cadence_nudge(home, bindir, screen, session=None, sid=None, checker=True,
-                       stub_verdict=None, verify_timeout=None):
+                       stub_verdict=None, verify_timeout=None, extra_env=None):
     env = dict(os.environ)
     env["HOME"] = str(home)
     env["PATH"] = f"{bindir}{os.pathsep}{env['PATH']}"
@@ -1382,6 +1382,8 @@ def _run_cadence_nudge(home, bindir, screen, session=None, sid=None, checker=Tru
         # The farmed copy lost its checker: the floor must still send, and must still refuse to
         # certify what it could not check.
         (home / ".pi" / "agent" / "scripts" / "lib" / "cmux_payload.py").unlink()
+    if extra_env:
+        env.update({k: str(v) for k, v in extra_env.items()})
     if stub_verdict is not None:
         # ⛔ DRIVE THE VERDICT MAPPING DIRECTLY (#3795 review P2). The `case` in the floor decides
         # what a `delivered=` value MEANS, and only the VERIFIED and UNVERIFIED arms were pinned. A
@@ -1775,6 +1777,155 @@ def test_cadence_nudge_a_leftover_reclaim_mutex_no_longer_wedges_the_floor(tmp_p
     assert "lock-reclaimed" in appended, appended
     assert "mutex" not in appended, (
         "the floor still speaks of a reclaim mutex it no longer has:\n" + appended)
+
+
+def _write_shim(bindir, name, body, real):
+    """A `PATH`/`PS_BIN` stand-in that fails ONE read and delegates everything else.
+
+    The body is pasted verbatim, NOT through `textwrap.dedent`: a multi-line body has no common
+    indentation with the wrapper lines, so dedent silently left the wrapper indented (harmless in
+    bash, but it reads as if the shim were conditional, and a future `set -e`-style body would not be).
+    """
+    f = bindir / name
+    f.write_text("#!/usr/bin/env bash\n" + body + "\nexec " + real + ' "$@"\n', encoding="utf-8")
+    f.chmod(f.stat().st_mode | stat.S_IEXEC)
+    return f
+
+
+def test_cadence_nudge_holds_the_lock_when_the_holder_argv_read_fails(tmp_path):
+    """⛔ AN EMPTY ARGV IS NOT A DEATH WITNESS (#3795 review cycle 9, P2).
+
+    `_nudge_holder_is_ours` read the holder's argv and returned "not this script" whenever the answer
+    was empty — but the caller only reaches it on the `present` arm of `_nudge_holder_state`, i.e. a
+    SEPARATE read has already proven the pid is live, and a live process always has an argv. So an
+    empty answer here can only be the READ failing, and mapping a failed read onto FOREIGN hands the
+    lock a 6-min grace that is SHORTER than this file's own ~413 s critical section — a live holder
+    reclaimed MID-SEND, which is the two-receipts-seconds-apart failure the lock exists to prevent.
+
+    DISCRIMINATOR: a live holder whose argv names this script, a 500 s-old lock. Pre-fix the failed read
+    made it FOREIGN (6-min bound) and 500 s > 360 s, so the floor RECLAIMED and SENT a second
+    heartbeat while the holder was still running. Post-fix it is a holder (20-min ceiling), so the tick
+    logs a `bound=20m` skip and sends nothing.
+    """
+    if not os.access(_FLOOR_PY, os.X_OK):
+        pytest.skip(f"{_FLOOR_PY} is not executable on this runner")
+    holder_dir = tmp_path / "holder"
+    holder_dir.mkdir()
+    holder = _live_holder_named_like_the_floor(holder_dir)
+    try:
+        seed = _seeded_log(600)
+        home, bindir, screen, state = _cadence_home(
+            tmp_path, "the pane shows nothing relevant\n", seed)
+        _write_shim(bindir, "ps", 'case "$*" in *"-o args="*) exit 1 ;; esac',
+                    shutil.which("ps") or "/bin/ps")
+        _lock(state, pid=holder.pid, age_s=500)      # past the 6-min grace, inside the 20-min ceiling
+        r = _run_cadence_nudge(home, bindir, screen)
+        assert r.returncode == 0, r.stdout + r.stderr
+        nudges, appended = _new_nudge_lines(state, seed)
+        assert not nudges, (
+            "a holder whose argv READ FAILED was reclaimed as foreign and a second heartbeat "
+            "left the box:\n" + appended)
+        assert "bound=20m" in appended, (
+            "a failed argv read was not held to the ceiling:\n" + appended)
+    finally:
+        holder.kill()
+        holder.wait()
+
+
+def test_cadence_nudge_holds_the_lock_when_the_holder_AGE_cannot_be_read(tmp_path):
+    """⛔ `pid_began_after`'s `2` IS NOT ITS `1` (#3795 review cycle 9, P2).
+
+    The library's contract is 0 = began after, 1 = did not, 2 = THE AGE CANNOT BE READ, and it says in
+    as many words that folding 2 into 1 manufactures evidence out of a failed read (#1178 C3). The lock
+    predicate folded 2 into "not provably ours" instead — FOREIGN, the 6-min grace, shorter than the
+    send window. Only an ANSWERED "began after" may demote; a question that could not be put must hold
+    the lock to the ceiling, which is what the sibling `date -r` arm already did.
+
+    DISCRIMINATOR: `PS_BIN` fails only `-o etime=` (so `pid_start_epoch` → rc 1 → `pid_began_after` →
+    rc 2) while the table read still works. Same 500 s lock as the arm above.
+    """
+    if not os.access(_FLOOR_PY, os.X_OK):
+        pytest.skip(f"{_FLOOR_PY} is not executable on this runner")
+    holder_dir = tmp_path / "holder"
+    holder_dir.mkdir()
+    holder = _live_holder_named_like_the_floor(holder_dir)
+    try:
+        seed = _seeded_log(600)
+        home, bindir, screen, state = _cadence_home(
+            tmp_path, "the pane shows nothing relevant\n", seed)
+        shimbin = tmp_path / "shimbin"
+        shimbin.mkdir()
+        ps_shim = _write_shim(shimbin, "ps", 'case "$*" in *"-o etime="*) exit 1 ;; esac',
+                              shutil.which("ps") or "/bin/ps")
+        _lock(state, pid=holder.pid, age_s=500)
+        r = _run_cadence_nudge(home, bindir, screen, extra_env={"PS_BIN": ps_shim})
+        assert r.returncode == 0, r.stdout + r.stderr
+        nudges, appended = _new_nudge_lines(state, seed)
+        assert not nudges, (
+            "an UNREADABLE holder age was read as foreign and a second heartbeat left the box:\n"
+            + appended)
+        assert "bound=20m" in appended, (
+            "an unreadable age was not held to the ceiling:\n" + appended)
+    finally:
+        holder.kill()
+        holder.wait()
+
+
+def test_cadence_nudge_never_deletes_a_lock_it_did_not_judge(tmp_path):
+    """⛔ THE RECLAIM MUST NOT `rm -rf` THE LIVE NAME (#3795 review cycle 9, P2).
+
+    The record arm renamed the RECORD aside and then unconditionally `rm -rf "$LOCK"` — a directory it
+    had not judged. Once the record is gone the lock briefly has no record, so a second contender takes
+    the no-record arm, judges the (still old) directory stale, renames it aside, removes it and
+    re-creates it; the first process then deleted THAT FRESH directory and took its own. Both send.
+    This is the defect round 6 removed from the reclaim MUTEX, one object up.
+
+    THE WINDOW IS INJECTED, NOT MODIFIED INTO THE SCRIPT: an `rm` shim that, on the first `rm` of a
+    `…doomed…` name (exactly the instruction the record arm runs between its two steps), creates the
+    fresh lock a second contender would have created, then delegates to the real `rm`. Deterministic,
+    and the script under test is untouched.
+
+    DISCRIMINATOR: post-fix the directory step renames instead, sees the fresh directory, puts it BACK
+    and exits with a `lock-skip`; pre-fix the fresh lock is gone and a second heartbeat is written.
+    """
+    if not os.access(_FLOOR_PY, os.X_OK):
+        pytest.skip(f"{_FLOOR_PY} is not executable on this runner")
+    seed = _seeded_log(3600)
+    home, bindir, screen, state = _cadence_home(
+        tmp_path, "the pane shows nothing relevant\n", seed)
+    lock = state / "cadence-nudge.lock"
+    lockpid = state / "cadence-nudge.lock.pid"
+    hook = tmp_path / "recreate-lock.sh"
+    # ⛔ `touch` IS LOAD-BEARING: the lock directory ALREADY EXISTS (it is the stale one being
+    # reclaimed), and `mkdir -p` on an existing directory does not move its mtime — so without the
+    # touch the "contender" would re-create a directory that still reads as 3600 s old, the freshness
+    # verify would pass, and the test would be measuring nothing.
+    hook.write_text(
+        "#!/usr/bin/env bash\n"
+        'rm -rf "$FAKE_LOCK"\n'
+        'mkdir -p "$FAKE_LOCK"\n'
+        'printf "999997\\n" > "$FAKE_LOCKPID"\n',
+        encoding="utf-8")
+    hook.chmod(hook.stat().st_mode | stat.S_IEXEC)
+    real_rm = shutil.which("rm") or "/bin/rm"
+    _write_shim(
+        bindir, "rm",
+        'case "$*" in *doomed*) if [ ! -e "$FAKE_HOOK_FIRED" ]; then '
+        '  : > "$FAKE_HOOK_FIRED"; exec_hook=1; fi ;; esac\n'
+        'if [ "${exec_hook:-0}" = "1" ]; then "$FAKE_HOOK"; fi',
+        real_rm)
+    _lock(state, pid=999999, age_s=3600)        # stale, record names a DEAD pid -> the record arm
+    r = _run_cadence_nudge(home, bindir, screen, extra_env={
+        "FAKE_HOOK": hook, "FAKE_HOOK_FIRED": tmp_path / "fired",
+        "FAKE_LOCK": lock, "FAKE_LOCKPID": lockpid})
+    assert r.returncode == 0, r.stdout + r.stderr
+    nudges, appended = _new_nudge_lines(state, seed)
+    assert not nudges, (
+        "the reclaim deleted a lock another contender had just created and sent a second "
+        "heartbeat:\n" + appended)
+    assert "re-created between judging it and claiming it" in appended, (
+        "the reclaim did not verify the directory it moved:\n" + appended)
+    assert lock.is_dir(), "the fresh lock a contender created was destroyed by the reclaim"
 
 
 def test_cadence_nudge_cannot_be_made_to_write_a_forged_receipt_from_the_env(tmp_path):
