@@ -394,9 +394,11 @@ short() { [ -n "${1:-}" ] && printf '%s' "$1" | cut -c1-12; }
 # BYTE-oriented on GNU coreutils, so a multi-byte character straddling byte 240 is SPLIT and the record
 # then holds an invalid UTF-8 sequence — and `grep '^detail=' <record>`, which is how every key=value
 # reader (fleet-health, the suite's own assertions) reads the record, classifies the whole file as
-# BINARY and prints NOTHING for the pattern. Measured: the t24w record's detail= was cut inside the
-# em dash of "farm: DRIFT —", `grep` printed ``binary file matches`` on stderr and zero bytes on
-# stdout, so the one field that answers "what happened" read as ABSENT. So the truncation stops at the
+# BINARY and prints NOTHING for the pattern. Measured on a record whose byte 240 landed inside a
+# multi-byte character: `grep '^detail='` printed ``binary file matches`` on stderr and zero bytes on
+# stdout, so the one field that answers "what happened" read as ABSENT. (Which character straddles the
+# bound is an accident of the record's own length — do not read the sentence above as naming one.) So
+# the truncation stops at the
 # last ASCII byte: every multi-byte UTF-8 sequence is composed of bytes >= 0x80, so a prefix that ends
 # on an ASCII byte cannot split one — no locale, iconv or multibyte-aware `substr` required.
 bounded() {

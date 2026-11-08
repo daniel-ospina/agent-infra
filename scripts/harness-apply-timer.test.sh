@@ -1690,6 +1690,28 @@ assert_eq "$(grep '^detail=' "$T/t24w/state/harness-apply.status" 2>/dev/null | 
 # the VALUE, not the line: `detail=` adds 7 bytes, and the trailing multi-byte strip can leave the value
 # a byte or two under the bound.
 DET24W_LEN="$(sed -n 's/^detail=//p' "$T/t24w/state/harness-apply.status" 2>/dev/null | LC_ALL=C awk '{print length($0)}')"
+# ⛔ THE MULTI-BYTE BOUNDARY IS PINNED ON THE FUNCTION ITSELF, because NO FIXTURE CAN PIN IT (review
+# round 19, measured: restoring `cut -c1-240` left the suite at 422/0 — a path-length sweep across nine
+# lengths did not discriminate either, because every fixture's byte 240 happens to fall on ASCII). So
+# the SHIPPED `bounded()` is extracted from the pass under test into a temp script and driven with a
+# value whose byte 240 is the LEAD byte of a 3-byte character: a byte-wise cut ends the field on 0xE2
+# (not text), the shipped code drops that character whole and ends on ASCII. Extraction, not a copy —
+# so a regression in the pass's own function is what reddens this.
+{
+    printf '%s\n' '#!/usr/bin/env bash'
+    sed -n '/^bounded() {/,/^}/p' "${PASS_UNDER_TEST:-$PASS_SH}"
+    printf '%s\n' 'bounded "$1"'
+} >"$T/bounded-extract.sh"
+_bpad="$(printf '%*s' 239 '' | tr ' ' a)"
+BOUT="$(bash "$T/bounded-extract.sh" "${_bpad}€XYZ" 2>/dev/null || true)"
+BLEN="$(printf '%s' "$BOUT" | LC_ALL=C wc -c | tr -d ' ')"
+BLAST="$(printf '%s' "$BOUT" | tail -c 1 | LC_ALL=C od -An -tu1 | tr -d ' ')"
+if [ "$BLEN" = "239" ] && [ -n "$BLAST" ] && [ "$BLAST" -le 126 ]; then
+    ok "T24 control: bounded() stops on a CHARACTER boundary — the 3-byte character straddling byte 240 is dropped whole (239 ASCII bytes), so the record stays readable text"
+else
+    bad "T24 control: bounded() must not split a multi-byte character at the bound (got ${BLEN} bytes, last byte 0x$(printf '%02x' "${BLAST:-0}")) — a byte-wise cut here makes the whole record grep-binary"
+fi
+unset _bpad BOUT BLEN BLAST
 if [ -n "$DET24W_LEN" ] && [ "$DET24W_LEN" -le 240 ] && [ "$DET24W_LEN" -ge 200 ]; then
     ok "T24 control: detail='s VALUE is held at the 240-byte bound (measured $DET24W_LEN bytes) — and this fixture is long enough to hit it"
 else
