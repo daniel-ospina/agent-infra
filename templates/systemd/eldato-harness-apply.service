@@ -34,6 +34,12 @@ Environment=HARNESS_APPLY_REF={{PASS_REF}}
 # present => pin, else the checkout's ./sync.sh => sync). The installer renders the POSITION rather
 # than hard-coding one, so a cell and a Mac can share one artifact.
 Environment=HARNESS_APPLY_MODE={{PASS_MODE}}
+# ⛔ THE CONTROLLER'S UNIT NAME, because the pass READS that unit to compare homes (agent-infra#3453):
+# `install-controller-service.sh` renders and validates `CONTROLLER_UNIT=<bare name>`, so a renamed
+# controller is a supported install — and a pass that assumed `eldato-orchestrator` would find nothing,
+# print `split_home=none`, and refuse nothing. Both units learn ONE fact. (launchd has no controller
+# unit at all, so the plist does not carry it: the reader treats "no unit" as cannot-measure.)
+Environment=CONTROLLER_UNIT={{CONTROLLER_UNIT}}
 # A background convergence, never a deadline: it must not compete with a lane for CPU or I/O.
 Nice=10
 IOSchedulingClass=idle
