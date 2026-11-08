@@ -428,7 +428,8 @@ if [ "$_n_reset" = 1 ]; then
 else
   bad "the gate block contains $_n_reset _lrg_rc=0 assignments — one of them can mask the verdict"
 fi
-if printf '%s\n' "$_lm_block" | grep -E 'verified at head' | grep -qE '^[[:space:]]*0\)'; then
+_lm_vh="$(printf '%s\n' "$_lm_block" | grep -E 'verified at head' || true)"
+if grep -qE '^[[:space:]]*0\)' <<<"$_lm_vh"; then
   ok "…and 'verified at head' is emitted only from the 0) arm — the log cannot claim a verdict it did not get"
 else
   bad "the 'verified at head' line is not confined to the 0) arm of the verdict case"
@@ -513,7 +514,8 @@ else
 fi
 # ⛔ AND THE IDIOM MUST STAY DELETED, not merely be unused: a future edit that reintroduces `sed -n` over
 # the report would pass the behavioural row only while the host happens to have a working sed.
-if grep -vE '^[[:space:]]*#' "$GATE" | grep -q 'sed -n'; then bad "the gate reintroduced a PATH-resolved \`sed -n\` over the report (the sealed cross-check is disableable again)"; else ok "no \`sed -n\` extractor remains in the executable part of the gate — the sealed stamp comes from the pinned interpreter pass"; fi
+_gate_code="$(grep -vE '^[[:space:]]*#' "$GATE" || true)"
+if grep -q 'sed -n' <<<"$_gate_code"; then bad "the gate reintroduced a PATH-resolved \`sed -n\` over the report (the sealed cross-check is disableable again)"; else ok "no \`sed -n\` extractor remains in the executable part of the gate — the sealed stamp comes from the pinned interpreter pass"; fi
 if grep -q '_seal_pat' "$GATE" && grep -q 'sealed12' "$GATE"; then ok "…and the stamp is extracted inside the isolated JSON pass (sealed12)"; else bad "the sealed stamp is not extracted in the isolated pass — the PATH disclosure would be false"; fi
 
 # ── 2h-3. A SECOND FULL-SHAPE STAMP IS REFUSED, NOT RESOLVED BY POSITION (round-13 review, LOW) ──
