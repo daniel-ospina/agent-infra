@@ -355,7 +355,12 @@ if [ -n "${REAP_AW_LIVE_PATHS:-}" ]; then
     }
     LIVE_PATHS_LIB="${REAP_AW_LIVE_PATHS}"
 else
-    for cand in "$SELF_DIR/lib/live-paths.sh" "${HOME:-}/.pi/agent/scripts/lib/live-paths.sh"; do
+    # ⛔ THE SAME `${VAR:+…}` RULE THIS FILE STATES 180 LINES ABOVE (review F-E): a piped start leaves
+    # `SELF_DIR` empty (`/lib/live-paths.sh`) and an unset HOME leaves `/.pi/…`, i.e. absolute paths no
+    # checkout owns. Fails closed either way, but a file that states a rule must not break it, or the
+    # next reader cannot tell which spelling is correct.
+    for cand in ${SELF_DIR:+"$SELF_DIR/lib/live-paths.sh"} \
+                ${HOME:+"$HOME/.pi/agent/scripts/lib/live-paths.sh"}; do
         [ -n "$cand" ] && [ -f "$cand" ] && { LIVE_PATHS_LIB="$cand"; break; }
     done
 fi

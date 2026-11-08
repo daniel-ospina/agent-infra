@@ -1666,17 +1666,38 @@ assert_contains "$OUT" "cell-home-migrate.sh" "T27 and the remedy, so the operat
 # ⛔ NON-VACUITY: the refusal is what stops it. Remove `exit 27` and the same environment runs — and the
 # home it runs with is the account's, i.e. the split F1 measured. Without this leg, T27 would be green
 # on a tree whose guard had been deleted.
-PASS_NOGUARD="$T27/pass-noguard.sh"
-sed '/^    exit 27$/d' "$PASS_SH" >"$PASS_NOGUARD"
+# ⛔ THREE THINGS THE FIRST CUT OF THIS CONTROL GOT WRONG (review F-D, all measured), and each one made
+# the arm unable to fail — the exact class this suite exists to catch, inside the arm written to prove
+# non-vacuity:
+#   1. it ran `--print-status`, a verb the F3 rule in THIS PR guarantees can never exit 27, so the
+#      assertion `RC != 27` was unfalsifiable by construction;
+#   2. the mutant copy had no `lib/cell-home.sh` sibling, so `CELL_HOME_LIB` was empty, the derivation
+#      never ran, `SPLIT_HOME` stayed empty and there was no split to observe at all;
+#   3. it deleted only the `exit 27` line, leaving the block that sets `REC_ACTION`/`REC_DETAIL` — a
+#      "mutant" that still does most of the work.
+# It now runs the ACTING path, against a mutant with the WHOLE refusal block removed, beside its own copy
+# of the resolver — and asserts the two facts that matter: it is not refused, and it proceeds.
+MUT27="$T27/mut27"; mkdir -p "$MUT27/scripts/lib"
+cp "$HERE/lib/cell-home.sh" "$MUT27/scripts/lib/cell-home.sh"
+PASS_NOGUARD="$MUT27/scripts/pass-noguard.sh"
+# The mutant neuters the SECOND `if [ -n "$SPLIT_HOME" ]` — the refusal; the first is the reading, which
+# must keep working so the control can still SEE the split. Counting beats pattern-matching on context,
+# which rots as the surrounding comments change.
+awk '
+  /^if \[ -n "\$SPLIT_HOME" \]; then$/ { n++; if (n == 2) { print "if false; then"; next } }
+  { print }' "$PASS_SH" >"$PASS_NOGUARD"
 if cmp -s "$PASS_SH" "$PASS_NOGUARD"; then
     bad "T27 control: the guard-removal mutant is IDENTICAL to the pass — this control proves nothing"
+elif [ "$(grep -c '^if false; then$' "$PASS_NOGUARD")" != "1" ]; then
+    bad "T27 control: the refusal guard was not neutered — the removal did not apply"
 else
-    ok "T27 control: the guard-removal mutant really drops only the refusal"
+    ok "T27 control: the mutant's refusal guard is neutered and its reading arm is intact"
 fi
-OUT="$(PASS_UNDER_TEST="$PASS_NOGUARD" run_under "${HA_ENV[@]}" --print-status)"; RC=$?
+OUT="$(PASS_UNDER_TEST="$PASS_NOGUARD" run_under "${HA_ENV[@]}")"; RC=$?
 if [ "$RC" = "27" ]; then bad "T27 control: the guard-less pass still exits 27 — the guard is not what refused";
-else ok "T27 control: WITHOUT the guard the same environment is NOT refused (rc=$RC)"; fi
+else ok "T27 control: WITHOUT the guard the same environment, on the ACTING path, is NOT refused (rc=$RC)"; fi
 assert_absent "$OUT" "REFUSED split-home" "T27 control: …and nothing says the homes disagree"
+assert_contains "$OUT" "split_home=$T27/legacy-home" "T27 control: …it still SEES the split as a reading, and acts anyway"
 assert_eq "$(resolve_under "${HA_ENV[@]}")" "$T27/acct-home" \
     "T27 control: …so it wrote under the account's home, not the controller's — F1's split, reproduced"
 # AND THE FALSE-POSITIVE ARM: a genuinely CONVERGED box must run normally. Review F1 was right that the
@@ -1730,6 +1751,31 @@ OUT="$(run_under "${HA_ENV[@]}" --print-status)"; RC=$?
 if [ "$RC" = "27" ]; then bad "T27 --print-status exited 27 — a record read must not take the acting path's refusal";
 else ok "T27 --print-status answers from the RECORD (rc=$RC) and never exits 27"; fi
 assert_contains "$OUT" "split_home=" "T27 …while still reporting the split as a READING"
+
+# ⛔ THE TWO SPELLINGS systemd REALLY USES, AND THE UNIT NAME IT REALLY READS (review F-B/F-C, both
+# reproduced): an `Environment=` line is UNQUOTED and split into a LIST of assignments, so a pattern
+# anchored at `Environment=CELL_HOME=` sees neither the quoted form nor the multi-assignment form — and
+# the multi-assignment form is the row this PR's own comment documents. A guard that cannot measure
+# prints `split_home=none` and every reader infers agreement, which is worse than no guard.
+printf '[Service]\nEnvironment="CELL_HOME=%s"\n' "$T27/legacy-home" >"$T27/controller-quoted.service"
+OUT="$(HARNESS_APPLY_CONTROLLER_UNIT="$T27/controller-quoted.service" run_under "${HA_CONV[@]}")"; RC=$?
+assert_eq "$RC" "27" "T27 a QUOTED Environment=\"CELL_HOME=…\" is measured (systemd unquotes each line)"
+assert_contains "$OUT" "the controller's unit pins CELL_HOME" "T27 …and the quoted value is the one it names"
+printf '[Service]\nEnvironment=HOME=/tmp/whatever CELL_HOME=%s\n' "$T27/legacy-home" >"$T27/controller-multi.service"
+OUT="$(HARNESS_APPLY_CONTROLLER_UNIT="$T27/controller-multi.service" run_under "${HA_CONV[@]}")"; RC=$?
+assert_eq "$RC" "27" "T27 a MULTI-ASSIGNMENT Environment= line is measured (it is a list, not a scalar)"
+# …and the unit NAME is not a constant: `install-controller-service.sh` renders and validates
+# `CONTROLLER_UNIT=<bare name>` and honours `CONTROLLER_SYSTEM_UNIT_DIR`.
+mkdir -p "$T27/units"
+printf '[Service]\nEnvironment=CELL_HOME=%s\n' "$T27/legacy-home" >"$T27/units/eldato-orchestrator-a.service"
+OUT="$(run_under "${HA_CONV[@]}" CONTROLLER_UNIT=eldato-orchestrator-a CONTROLLER_SYSTEM_UNIT_DIR="$T27/units")"; RC=$?
+assert_eq "$RC" "27" "T27 a RENAMED controller unit (CONTROLLER_UNIT + CONTROLLER_SYSTEM_UNIT_DIR) is measured"
+# ⛔ AND THE POLARITY: the same renamed unit pinning the SAME home is not a refusal, so the previous leg
+# measures the disagreement and not the name.
+printf '[Service]\nEnvironment=CELL_HOME=%s\n' "$T27/acct-home" >"$T27/units/eldato-orchestrator-b.service"
+OUT="$(run_under "${HA_CONV[@]}" CONTROLLER_UNIT=eldato-orchestrator-b CONTROLLER_SYSTEM_UNIT_DIR="$T27/units" --print-status)"; RC=$?
+if [ "$RC" = "27" ]; then bad "T27 the renamed-unit leg fires on agreement too — it measures the name, not the home";
+else ok "T27 a renamed unit that AGREES is not refused (rc=$RC) — the previous leg measures the home"; fi
 
 echo
 echo "────────────────────────────────────────────────────────"

@@ -244,23 +244,85 @@ done
 # A value this file cannot resolve (`{{CELL_HOME}}` unrendered, a `%h` specifier) is CANNOT MEASURE and
 # is skipped — never compared, because a string comparison against a placeholder is not a reading.
 # No controller unit at all (a Mac) means no comparison: this guard never invents a home.
+#
+# ⛔ TWO FAIL-OPEN DOORS THE FIRST CUT LEFT OPEN (review F-B/F-C, both verified). A guard that silently
+# measures NOTHING is worse than no guard, because the readings then print `split_home=none` and every
+# reader infers agreement.
+#   (F-B) `Environment=` IS A LIST, NOT A SCALAR. systemd.exec(5): each line is unquoted and "becomes a
+#         list of variable assignments" — `Environment="VAR1=word1 word2" VAR2=word3`. A pattern
+#         anchored at `Environment=CELL_HOME=` matches neither the QUOTED nor the MULTI-ASSIGNMENT form,
+#         and the multi-assignment form is literally the row this file's own comment documents. The line
+#         is now split into tokens first, so both parse.
+#   (F-C) THE UNIT NAME AND ITS DIRECTORIES ARE NOT CONSTANTS. `install-controller-service.sh` renders
+#         and validates `CONTROLLER_UNIT=<bare name>` and honours `CONTROLLER_SYSTEM_UNIT_DIR`, and
+#         systemd.unit(5) applies drop-ins from `/etc`, `/run` AND `/usr/lib` "in lexicographic order,
+#         regardless of which of the directories they reside in", the higher-precedence directory winning
+#         a name collision. All of that is honoured below.
+# A value this file cannot resolve (`{{CELL_HOME}}` unrendered, a `%h` specifier) is CANNOT MEASURE and
+# is skipped — never compared, because a string comparison against a placeholder is not a reading.
+environment_cell_home() { # <file> — the CELL_HOME its Environment= lines set (last wins), or nothing
+    local envlines token
+    envlines="$(sed -n 's/^[[:space:]]*Environment=//p' "$1" 2>/dev/null)"
+    [ -n "$envlines" ] || return 0
+    token="$(printf '%s\n' "$envlines" | tr -d '"' | tr -s '[:space:]' '\n' \
+               | sed -n 's/^CELL_HOME=//p' | tail -1)"
+    case "$token" in
+        ''|*'{'*|*%*) return 0 ;;   # an unrendered placeholder or a specifier is not a reading
+    esac
+    printf '%s\n' "$token"
+}
+
+dropin_cell_home() { # <unit-path> — the last CELL_HOME its drop-ins set, systemd's precedence order
+    local unit="$1" base d g name out="" v
+    base="${unit##*/}"
+    local -a dirs=() names=()
+    for d in "${unit%/*}.d" "/run/systemd/system/$base.d" "/usr/lib/systemd/system/$base.d" \
+             ${HOME:+"$HOME/.config/systemd/user/$base.d"} "/etc/systemd/user/$base.d" \
+             "/run/systemd/user/$base.d" "/usr/lib/systemd/user/$base.d"; do
+        [ -d "$d" ] && dirs+=("$d")
+    done
+    [ "${#dirs[@]}" -eq 0 ] && return 0
+    # ⛔ LEXICOGRAPHIC BY FILE NAME ACROSS ALL THE DIRECTORIES, with the first (highest-precedence)
+    # directory winning a collision — not "directory by directory", which would let a `/usr/lib` drop-in
+    # named `z.conf` override an `/etc` one named `a.conf`, reversing systemd's own order.
+    names="$(for d in "${dirs[@]}"; do for g in "$d"/*.conf; do [ -r "$g" ] && printf '%s\n' "${g##*/}"; done; done | LC_ALL=C sort -u)"
+    while IFS= read -r name; do
+        [ -n "$name" ] || continue
+        for d in "${dirs[@]}"; do
+            [ -r "$d/$name" ] || continue
+            v="$(environment_cell_home "$d/$name")"
+            [ -n "$v" ] && out="$v"
+            break   # the highest-precedence directory owns this NAME
+        done
+    done <<EOF
+$names
+EOF
+    [ -n "$out" ] && printf '%s\n' "$out"
+    return 0
+}
+
 split_home_controller() { # prints the controller's pinned CELL_HOME, or nothing when it cannot be measured
-    local f d v out=""
+    local f v out="" name
     local -a units=()
-    [ -n "${HARNESS_APPLY_CONTROLLER_UNIT:-}" ] && units=("$HARNESS_APPLY_CONTROLLER_UNIT")
-    if [ "${#units[@]}" -eq 0 ]; then
-        units=(/etc/systemd/system/eldato-orchestrator.service)
-        [ -n "${HOME:-}" ] && units+=("$HOME/.config/systemd/user/eldato-orchestrator.service")
+    if [ -n "${HARNESS_APPLY_CONTROLLER_UNIT:-}" ]; then
+        units=("$HARNESS_APPLY_CONTROLLER_UNIT")
+    else
+        # ⛔ THE NAME IS NOT ASSUMED: a renamed controller is a supported install.
+        name="${CONTROLLER_UNIT:-eldato-orchestrator}"
+        case "$name" in *.service) : ;; *) name="$name.service" ;; esac
+        for f in "${CONTROLLER_SYSTEM_UNIT_DIR:-/etc/systemd/system}" /etc/systemd/system \
+                 /run/systemd/system /usr/lib/systemd/system \
+                 ${HOME:+"$HOME/.config/systemd/user"} /etc/systemd/user \
+                 /run/systemd/user /usr/lib/systemd/user; do
+            units+=("$f/$name")
+        done
     fi
     for f in "${units[@]}"; do
         [ -r "$f" ] || continue
-        v="$(sed -n 's/^[[:space:]]*Environment=[[:space:]]*CELL_HOME=//p' "$f" | tail -1)"
-        case "$v" in ''|*'{'*|*%*) : ;; *) out="$v" ;; esac
-        for d in "$f".d/*.conf; do
-            [ -r "$d" ] || continue
-            v="$(sed -n 's/^[[:space:]]*Environment=[[:space:]]*CELL_HOME=//p' "$d" | tail -1)"
-            case "$v" in ''|*'{'*|*%*) : ;; *) out="$v" ;; esac
-        done
+        v="$(environment_cell_home "$f")"
+        [ -n "$v" ] && out="$v"
+        v="$(dropin_cell_home "$f")"
+        [ -n "$v" ] && out="$v"
         break   # the first READABLE controller unit wins: a box has one controller
     done
     [ -n "$out" ] && printf '%s\n' "$out"
@@ -1101,6 +1163,30 @@ preserve_dirty() { # <dest-dir>; prints what it saved; exit 1 if it cannot save 
     return 0
 }
 
+# ⛔ THE SPLIT REFUSES **HERE** — after the readings, THROUGH the record, and BEFORE THE FIRST MUTATION
+# (review F3 + F-A). Two placement errors were measured and both are fixed by this one position:
+#   · at the derivation (the first cut) it aborted `--print-status` and `--dry-run` and left the PREVIOUS
+#     tick's green record standing for up to `HARNESS_APPLY_STALE_SECONDS` (3600 s) while the unit was red;
+#   · after the dirty-preservation block (the second cut) it PRESERVED AND RESTORED the tree — rewriting
+#     tracked files to HEAD and removing move destinations — and then said "Nothing was touched". The
+#     default mode on the population this guard targets is exactly that path (an un-migrated box has no
+#     pin record under the derived home, carries `./sync.sh`, and is behind), so the false sentence was
+#     the common case, not an edge.
+# A refusal must precede every write, and its message must be true.
+if [ -n "$SPLIT_HOME" ]; then
+    if [ "$DRY_RUN" = 1 ]; then
+        log_line "dry-run: would REFUSE split-home — $SPLIT_HOME_WHY, and this pass derives CELL_HOME=$CELL_HOME; nothing was touched (a real run exits 27)"
+        exit 0
+    fi
+    REC_ACTION=refused-split-home
+    REC_DETAIL="split home: $SPLIT_HOME_WHY but this pass derives CELL_HOME=$CELL_HOME"
+    REC_REMEDY="converge the box: bash scripts/cell-home-migrate.sh --check, then --apply (or set CELL_HOME explicitly if $SPLIT_HOME is the home this box's controller really reads)"
+    err "REFUSED split-home: $SPLIT_HOME_WHY, but this pass derives CELL_HOME='$CELL_HOME' — two live homes on one box, so the pin this pass would write is not the pin the controller reads (agent-infra#3453)"
+    err "  Nothing was touched — this refusal precedes the dirty-preservation pass and every other write. $REC_REMEDY"
+    write_record 0 27 || exit 23
+    exit 27
+fi
+
 if [ "$PASS_MODE" = sync ] && [ "$RELATION" = behind ] && [ "$DIRTY_N" != "unknown" ] && [ "$DIRTY_N" -gt 0 ]; then
     if [ "$DRY_RUN" = 1 ]; then
         log_line "dry-run: would preserve $DIRTY_N dirty path(s) by name and then fast-forward"
@@ -1128,23 +1214,6 @@ fi
 # ⛔ A NO-OP WHEN THE PIN ALREADY NAMES THE REF TIP — that is the cadence requirement, and it is the
 # common case: every ten minutes on a box that is already current must change NOTHING and say so.
 ACT_RC=0
-# ⛔ THE SPLIT REFUSES HERE — AFTER the readings, BEFORE any mutation, and THROUGH the record (review F3).
-# Refusing at the derivation aborted `--print-status` and `--dry-run` and left the PREVIOUS tick's green
-# record standing for up to `HARNESS_APPLY_STALE_SECONDS` (3600 s = 6 cadences) while the unit was red —
-# the "record readers keep a stale green" rule this file states for every other refusal.
-if [ -n "$SPLIT_HOME" ]; then
-    if [ "$DRY_RUN" = 1 ]; then
-        log_line "dry-run: would REFUSE split-home — $SPLIT_HOME_WHY, and this pass derives CELL_HOME=$CELL_HOME; nothing was touched (a real run exits 27)"
-        exit 0
-    fi
-    REC_ACTION=refused-split-home
-    REC_DETAIL="split home: $SPLIT_HOME_WHY but this pass derives CELL_HOME=$CELL_HOME"
-    REC_REMEDY="converge the box: bash scripts/cell-home-migrate.sh --check, then --apply (or set CELL_HOME explicitly if $SPLIT_HOME is the home this box's controller really reads)"
-    err "REFUSED split-home: $SPLIT_HOME_WHY, but this pass derives CELL_HOME='$CELL_HOME' — two live homes on one box, so the pin this pass would write is not the pin the controller reads (agent-infra#3453)"
-    err "  Nothing was touched. $REC_REMEDY"
-    write_record 0 27 || exit 23
-    exit 27
-fi
 if [ "$DRY_RUN" = 1 ]; then
     # ⛔ A PREVIEW WRITES NO RECORD. `--dry-run` is documented as "change NOTHING", and rewriting the
     # pass record to `action=dry-run epoch=now` reset the staleness clock: a box whose timer had died
