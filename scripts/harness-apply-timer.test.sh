@@ -1809,24 +1809,81 @@ assert_contains "$OUT" "split_home=none" "T27 a SPACED directive that AGREES is 
 printf '[Service]\nEnvironmentFile=%s\n' "$T27/legacy-home/keys.env" >"$T27/controller-envfile.service"
 OUT="$(run_under HARNESS_APPLY_CONTROLLER_UNIT="$T27/controller-envfile.service" "${HA_CONV[@]}" --dry-run)"; RC=$?
 assert_contains "$OUT" "split_home=none" "T27 'EnvironmentFile=' is NOT read as 'Environment=' (a widened reader must not invent a home)"
-# ⛔ NON-VACUITY FOR THE WHOLE SPACED LEG: revert ONLY that pattern in a copy of the pass and the same
-# spaced unit stops being measured at all. Without this row the arms above would be green on a tree whose
-# reader had regressed to the anchored form — the exact way this one shipped.
+# ⛔ THE FOURTH SPELLING, AND THE ONE THAT SHIPPED (review F2, reproduced on this head).
+# systemd.syntax(7): *"Lines ending in a backslash are concatenated with the following line while reading
+# and the backslash is replaced by a space character"* — so
+#     Environment=HOME=/home/x \
+#     CELL_HOME=/tmp/other-home
+# is ONE directive in which the SECOND assignment wins (`Environment=` is LAST-WINS), while a
+# PHYSICAL-LINE reader never sees a second `Environment=` at all and measures nothing. `[]` is not "no
+# CELL_HOME": it becomes `split_home=none`, which every reader in this file infers as agreement — and on
+# the population this guard targets (the pass's own unit repointed, the controller's drop-in pinning the
+# home by hand) that is a green unit over a pin the controller never sees.
+# No shipped renderer emits a continuation and `cell-self-pin.sh` refuses one in the drop-ins IT
+# verifies — but that gate walks only the cell-self-pin population, while the controller's drop-ins are
+# exactly where an operator pins the home by hand.
+printf '[Service]\nEnvironment=HOME=%s \\\nCELL_HOME=%s\n' "$T27/acct-home" "$T27/legacy-home" >"$T27/controller-cont.service"
+OUT="$(run_under HARNESS_APPLY_CONTROLLER_UNIT="$T27/controller-cont.service" "${HA_CONV[@]}" --dry-run)"; RC=$?
+assert_contains "$OUT" "would REFUSE split-home" "T27 a BACKSLASH-CONTINUED Environment= is measured (it is ONE logical directive)"
+assert_contains "$OUT" "split_home=$T27/legacy-home" "T27 …and the continued assignment is the home it names (the second one wins)"
+assert_eq "$RC" "0" "T27 …and it is a READING on --dry-run, so the preview does not red the box"
+# …and the man page's OWN example: a COMMENT BLOCK between the continued lines is ignored, and the
+# continued line is concatenated with whatever follows the block.
+printf '[Service]\nEnvironment=HOME=%s \\\n# this line is ignored\n; this line is ignored too\nCELL_HOME=%s\n' \
+    "$T27/acct-home" "$T27/legacy-home" >"$T27/controller-contcomment.service"
+OUT="$(run_under HARNESS_APPLY_CONTROLLER_UNIT="$T27/controller-contcomment.service" "${HA_CONV[@]}" --dry-run)"
+assert_contains "$OUT" "would REFUSE split-home" "T27 a COMMENT BLOCK inside a continuation is ignored and the continuation survives (systemd.syntax(7)'s own example)"
+# ⛔ THE POLARITY PAIRS, WITHOUT WHICH THE ARMS ABOVE WOULD FIRE ON ANY BACKSLASH. A continuation that
+# AGREES is not a split…
+printf '[Service]\nEnvironment=HOME=%s \\\nCELL_HOME=%s\n' "$T27/legacy-home" "$T27/acct-home" >"$T27/controller-cont-ok.service"
+OUT="$(run_under HARNESS_APPLY_CONTROLLER_UNIT="$T27/controller-cont-ok.service" "${HA_CONV[@]}" --dry-run)"
+assert_contains "$OUT" "split_home=none" "T27 a CONTINUED assignment that AGREES is not a split (the arms above measure the home, not the backslash)"
+# …and the DIRECTIVE NAME COMES FROM THE LOGICAL LINE: this is ONE `ExecStart=` whose VALUE happens to
+# contain the text `Environment=CELL_HOME=…`, which systemd does not parse as an `Environment=`.
+printf '[Service]\nExecStart=/bin/echo --x \\\nEnvironment=CELL_HOME=%s\n' "$T27/legacy-home" >"$T27/controller-cont-foreign.service"
+OUT="$(run_under HARNESS_APPLY_CONTROLLER_UNIT="$T27/controller-cont-foreign.service" "${HA_CONV[@]}" --dry-run)"
+assert_contains "$OUT" "split_home=none" "T27 a continuation of ANOTHER directive is not read as Environment= (the name comes from the logical line)"
+# ⛔ NON-VACUITY FOR THE CONTINUATION LEG: revert ONLY the logical-line join in a copy of the pass and
+# the same fixture stops being measured at all — which is the pre-fix shape this finding is about.
+PASS_PHYS="$MUT27/scripts/pass-physical.sh"
+sed 's|^$(logical_lines "\$1")$|$(cat "$1")|' "$PASS_SH" >"$PASS_PHYS"
+if cmp -s "$PASS_SH" "$PASS_PHYS"; then
+    bad "T27 continuation control: the mutant is IDENTICAL to the pass — this control proves nothing"
+elif ! grep -qF '$(logical_lines "$1")' "$PASS_SH"; then
+    bad "T27 continuation control: the logical-line read is not in the pass — this control is stale"
+elif grep -qF '$(logical_lines "$1")' "$PASS_PHYS"; then
+    bad "T27 continuation control: the mutated copy STILL reads logical lines — the revert did not apply"
+else
+    ok "T27 continuation control: the mutant reads PHYSICAL lines and not the fixed logical ones"
+fi
+OUT="$(PASS_UNDER_TEST="$PASS_PHYS" run_under HARNESS_APPLY_CONTROLLER_UNIT="$T27/controller-cont.service" "${HA_CONV[@]}" --dry-run)"
+assert_absent "$OUT" "would REFUSE split-home" "T27 continuation control: reading PHYSICAL lines the continued CELL_HOME is invisible — the arms above are what sees it"
+assert_contains "$OUT" "split_home=none" "T27 continuation control: …and the readings print no split at all (F2's fail-open reproduced)"
+# ⛔ NON-VACUITY FOR THE WHOLE SPACED LEG: revert ONLY the whitespace tolerance in a copy of the pass and
+# the same spaced unit stops being measured at all. Without this row the arms above would be green on a
+# tree whose reader had regressed to the anchored form — the exact way this one shipped.
+# ⛔ THE MUTATION TARGETS THE RULE, NOT A LINE SHAPE (the reader was rewritten to consume LOGICAL lines
+# when the continuation hole was closed, so a mutation written against the old `sed` pattern became a
+# no-op — and a no-op mutant reports "identical to the pass", which is the control refusing rather than
+# proving). The rule here is the blank-skip between the directive NAME and the `=`, so the FIRST
+# `body="${body#?}"` blank-strip loop inside `environment_cell_home` is what gets neutered.
 PASS_SPACED="$MUT27/scripts/pass-spaced.sh"
-sed 's|Environment\[\[:space:\]\]\*=\[\[:space:\]\]\*//|Environment=//|' "$PASS_SH" >"$PASS_SPACED"
+awk '
+  /^environment_cell_home\(\)/ { inf=1 }
+  inf && !done && index($0, "while :; do case \"$body\" in [[:space:]]*") > 0 { print "        :"; done=1; next }
+  inf && /^}$/ { inf=0 }
+  { print }' "$PASS_SH" >"$PASS_SPACED"
 if cmp -s "$PASS_SH" "$PASS_SPACED"; then
     bad "T27 spatial control: the mutant is IDENTICAL to the pass — this control proves nothing"
-elif ! grep -qF "Environment[[:space:]]*=[[:space:]]*//p" "$PASS_SH"; then
-    bad "T27 spatial control: the fixed pattern is not in the pass — this control is stale"
-elif grep -qF "Environment[[:space:]]*=[[:space:]]*//p" "$PASS_SPACED"; then
-    bad "T27 spatial control: the mutated copy STILL carries the fixed pattern — the revert did not apply"
+elif [ "$(grep -c 'body="${body#?}"' "$PASS_SPACED")" -ge "$(grep -c 'body="${body#?}"' "$PASS_SH")" ]; then
+    bad "T27 spatial control: the blank-skip rule was not neutered — the revert did not apply"
 else
-    ok "T27 spatial control: the mutant carries the anchored pre-fix pattern and not the fixed one"
+    ok "T27 spatial control: the mutant drops ONE blank-skip rule and keeps the rest of the reader"
 fi
 assert_contains "$(run_under HARNESS_APPLY_CONTROLLER_UNIT="$T27/controller-spaced-mut.service" "${HA_CONV[@]}" --dry-run)" \
     "would REFUSE split-home" "T27 spatial control: on the FIXED tree the spaced unit IS measured (the pair's positive half)"
 OUT="$(PASS_UNDER_TEST="$PASS_SPACED" run_under HARNESS_APPLY_CONTROLLER_UNIT="$T27/controller-spaced-mut.service" "${HA_CONV[@]}" --dry-run)"; RC=$?
-assert_absent "$OUT" "would REFUSE split-home" "T27 spatial control: with the anchored pattern the SPACED unit is invisible — the arms above are what sees it"
+assert_absent "$OUT" "would REFUSE split-home" "T27 spatial control: without the rule the SPACED unit is invisible — the arms above are what sees it"
 assert_contains "$OUT" "split_home=none" "T27 spatial control: …and the readings print no split at all (the fail-open F-G fixed)"
 # …and the unit NAME is not a constant: `install-controller-service.sh` renders and validates
 # `CONTROLLER_UNIT=<bare name>` and honours `CONTROLLER_SYSTEM_UNIT_DIR`.

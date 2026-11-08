@@ -287,13 +287,71 @@ split_env_tokens() {
     printf '%s' "$out"
 }
 
+# logical_lines <file> — the file as systemd READS it: one LOGICAL line per output line.
+# ⛔ A BACKSLASH-CONTINUED DIRECTIVE IS ONE DIRECTIVE, AND A PHYSICAL-LINE READER CANNOT SEE IT
+# (review F2, measured on this head). systemd.syntax(7): *"Lines ending in a backslash are concatenated
+# with the following line while reading and the backslash is replaced by a space character"*, and *"When a
+# comment line or lines follow a line ending with a backslash, the comment block is ignored, so the
+# continued line is concatenated with whatever follows the comment block."* So
+#     Environment=HOME=/home/x \
+#     CELL_HOME=/tmp/other-home
+# is ONE directive in which the SECOND assignment wins (`Environment=` is last-wins), while the reader
+# below — reading physical lines — never saw a `CELL_HOME` at all. `[]` is not "no CELL_HOME": it became
+# `split_home=none` in the readings, and every reader infers agreement from that. On the population this
+# guard targets (T27's "pass agrees, controller disagrees" shape) the pass's own unit was repointed, so
+# the HOME leg is silent; the controller's drop-in pins `CELL_HOME` on a continuation line, so
+# `split_home_controller` measured NOTHING either; no refusal, so the tick wrote HARNESS-PIN,
+# `.harness-path` and the pin root under the derivation while the controller re-read ITS OWN record and
+# exited 10 — in `SuccessExitStatus`, a green unit over a pin the controller never sees.
+# It is the fourth spelling of one hole this file has closed three times (quoted/multi-assignment → F-B,
+# whitespace around `=` → F-G), and this tree's two other readers of the same question already agree on
+# the logical line: `cell-home-migrate.sh`'s `unit_scan` joins it, and `scripts/cell-self-pin.sh`
+# refuses the spelling by name. Joining is the fix here because a drop-in an OPERATOR wrote is not a
+# rendered unit — refusing it would leave the guard blind to the home that operator really pinned.
+# ⛔ A COMMENT OR EMPTY LINE IS SKIPPED AND NEITHER CLOSES A CONTINUATION (the same man page, above).
+# ⛔ THE DIRECTIVE NAME COMES FROM THE LOGICAL LINE, NOT FROM A PHYSICAL ONE: `ExecStart=/bin/foo \` +
+# `Environment=CELL_HOME=/x` is ONE `ExecStart=` whose VALUE contains that text, which systemd does not
+# parse as an `Environment=` — so joining happens BEFORE the name is matched, never after.
+logical_lines() { # <file>
+    local line acc="" stripped
+    [ -r "$1" ] || return 0
+    while IFS= read -r line || [ -n "$line" ]; do
+        stripped="$line"
+        while :; do case "$stripped" in [[:space:]]*) stripped="${stripped#?}" ;; *) break ;; esac; done
+        case "$stripped" in ''|'#'*|';'*) continue ;; esac
+        line="$stripped"
+        # trailing blanks are not part of the continuation marker
+        while :; do case "$line" in *[[:space:]]) line="${line%?}" ;; *) break ;; esac; done
+        case "$line" in
+            *\\ )
+                acc="$acc${line%?} "   # the backslash is replaced by a SPACE (systemd.syntax(7))
+                continue ;;
+        esac
+        printf '%s\n' "$acc$line"
+        acc=""
+    done <"$1" 2>/dev/null
+    [ -n "$acc" ] && printf '%s\n' "$acc"
+    return 0
+}
+
 environment_cell_home() { # <file> — the CELL_HOME its Environment= lines set (last wins), or nothing
-    local line tok out=""
+    local line body tok out=""
+    # ⛔ THE LINES ARE LOGICAL (review F2): a backslash continuation is part of THIS directive, so the
+    # CELL_HOME systemd would apply is the one measured here.
     while IFS= read -r line; do
         [ -n "$line" ] || continue
-        tok="$(split_env_tokens "$line" | sed -n 's/^CELL_HOME=//p' | tail -1)"
+        # `Environment` followed by optional blanks, then `=` — and NOT `EnvironmentFile=`/`UnsetEnvironment=`.
+        case "$line" in Environment*) ;; *) continue ;; esac
+        body="${line#Environment}"
+        while :; do case "$body" in [[:space:]]*) body="${body#?}" ;; *) break ;; esac; done
+        case "$body" in =*) body="${body#=}" ;; *) continue ;; esac
+        while :; do case "$body" in [[:space:]]*) body="${body#?}" ;; *) break ;; esac; done
+        [ -n "$body" ] || continue
+        tok="$(split_env_tokens "$body" | sed -n 's/^CELL_HOME=//p' | tail -1)"
         [ -n "$tok" ] && out="$tok"
-    done < <(sed -n 's/^[[:space:]]*Environment[[:space:]]*=[[:space:]]*//p' "$1" 2>/dev/null)
+    done <<EOF
+$(logical_lines "$1")
+EOF
     case "$out" in
         ''|*'{'*|*'%'*) return 0 ;;   # an unrendered placeholder or a specifier is not a reading
     esac
