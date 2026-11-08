@@ -1341,11 +1341,13 @@ else
     _p4="$(command -v "$b" 2>/dev/null)" && ln -sf "$_p4" "$ND/$b" 2>/dev/null
   done
   NI="$T/nointerp-dirname"; mkdir -p "$NI/lib"
-  # ⛔ THE READER LIVES IN A `lib/` SUBDIR BECAUSE `_rs_doctor_py` RESOLVES `dirname($BASH_SOURCE)/../pr-doctor.py`
-  # (review round 44, P2 — measured). Copying it beside the doctor at `$NI/repo-set.sh` makes it look for
-  # `$NI/../pr-doctor.py`, so this arm cannot see the sibling it copies — green for a reason it never
-  # claimed, and the reason `m46` below was RED until its own layout was fixed. `j-emptyrender` already
-  # carries the same note; this one used the wrong layout too.
+  # ⛔ THE `lib/` LAYOUT HERE IS NOT WHAT MAKES THIS ARM WORK, AND SAYING IT WAS WOULD BE A FALSE "MEASURED"
+  # (review round 44, P2 — a reviewer re-ran the arm with the reader at `$NI/repo-set.sh` and got the SAME
+  # rc 5: the absence arm returns during parse, before any delegated proof, so `_rs_doctor_py` is never
+  # consulted — a booby-trapped doctor recorded zero consultations while a parsing set fired the trap).
+  # The layout is used because it is the real one, and because the arms NEXT DOOR do need it:
+  # `j-emptyrender` passes VACUOUSLY without it (its guard only runs once a render happens) and `m46` REDS
+  # without it (it reads the "not found beside this reader" branch instead of its subject).
   cp "$READER" "$NI/lib/repo-set.sh"; cp "$REPO_ROOT/scripts/pr-doctor.py" "$NI/pr-doctor.py"
   python3 - "$NI/lib/repo-set.sh" <<'PYNID'
 import sys
@@ -1368,7 +1370,7 @@ PYNID
   _o_dn="$(_rs_bound 30 env REPO_SET_FILE="$T/den2/den/repos.conf" PATH="$ND" /bin/bash "$NI/lib/repo-set.sh" check 2>&1)"; _rc_dn=$?
   chmod 755 "$T/den2/den"
   ck "j16f no \`dirname\` must not disarm the absence proof (rc 5 INVALID, never the rc 3 the wrapper degrades on)" \
-     '[ "$_rc_dn" = 5 ] && ! grep -q "does not exist" <<<"$_o_dn"'
+     '[ "$_rc_dn" = 5 ] && grep -q "INVALID — " <<<"$_o_dn" && grep -q "is not visible from here" <<<"$_o_dn" && ! grep -q "does not exist" <<<"$_o_dn"'
   # ⛔ AND ONE MORE HOP, BECAUSE THE ARM ABOVE NEVER EXECUTES THE LOOP'S SHORTENING (review round 44, P2 —
   # measured by an instrument whose first mutant stayed green). `$T/den2/den` is `-e`-visible through its
   # own parent, so the walk returns on its FIRST test and a `dirname` reintroduced only in the shortening
@@ -1381,8 +1383,26 @@ PYNID
   _o_dn2="$(_rs_bound 30 env REPO_SET_FILE="$T/den2/den/sub/repos.conf" PATH="$ND" /bin/bash "$NI/lib/repo-set.sh" check 2>&1)"; _rc_dn2=$?
   chmod 755 "$T/den2/den"
   ck "j16f2 …two hops up, so the loop's SHORTENING runs without \`dirname\` too (rc 5, never the degrade code)" \
-     '[ "$_rc_dn2" = 5 ] && ! grep -q "does not exist" <<<"$_o_dn2"'
+     '[ "$_rc_dn2" = 5 ] && grep -q "INVALID — " <<<"$_o_dn2" && grep -q "is not visible from here" <<<"$_o_dn2" && ! grep -q "does not exist" <<<"$_o_dn2"'
+  # ⛔ AND THE WALK'S OWN FILE-ANCESTOR FALLBACK NEEDS A SENSOR (review round 44, P2 — measured): with no
+  # interpreter `_rs_stat_kind` answers `unknown`, so `ENOTDIR` never arrives as `notdir` and the walk
+  # decides. Reverting that branch to the single "neither is any directory above it" message left the suite
+  # FULLY GREEN while this path printed the previously falsified sentence — the same dead-sensor class as
+  # `j16k` had one branch up.
+  printf 'slug=o/n checkout=%s state=%s/st\n' "$T/tortoise" "$T" > "$T/notadir-anc2.conf"
+  _o_na2="$(_rs_bound 30 env REPO_SET_FILE="$T/notadir-anc2.conf/inside/repos.conf" /bin/bash "$NI/lib/repo-set.sh" check 2>&1)"; _rc_na2=$?
+  ck "j16k2 …and with NO interpreter the walk's fallback names the FILE too (rc 5, not 'neither is any directory above it')" \
+     '[ "$_rc_na2" = 5 ] && grep -q "is not a directory" <<<"$_o_na2" && ! grep -q "neither is any directory above it" <<<"$_o_na2"'
 fi
+# ⛔ THE REFUSAL NAMED A CAUSE THAT IS FALSE WHEN THE NEAREST EXISTING COMPONENT IS A FILE (review round 44,
+# P2 — measured). `/etc/passwd/foo/repos.conf` was refused with "a permission denial on an ancestor … a path
+# that is too long, or an I/O error", none of which is true: a COMPONENT IS A FILE. `_rs_stat_kind` folded
+# `ENOTDIR` into `other`; it has its own kind and its own arm now. Same right-code/wrong-cause class as the
+# FIFO parenthetical `j4b` fixes a few arms up.
+printf 'slug=o/n checkout=%s state=%s/st\n' "$T/tortoise" "$T" > "$T/notadir-anc.conf"
+_o_na="$(_rs_bound 30 env REPO_SET_FILE="$T/notadir-anc.conf/inside/repos.conf" /bin/bash "$READER" check 2>&1)"; _rc_na=$?
+ck "j16k a FILE as the nearest existing ancestor names THAT — not 'neither is any directory above it'" \
+   '[ "$_rc_na" = 5 ] && grep -q "is not a directory" <<<"$_o_na" && ! grep -q "neither is any directory above it" <<<"$_o_na"'
 # ⛔ A RELATIVE `REPO_SET_FILE` USED TO HANG THIS READER, AND NO ARM USED ONE (review-instrumented round 44).
 # Removing `dirname` from the ancestor walk left `${d%/*}`, which returns a SLASH-LESS name UNCHANGED — so
 # the walk re-tested the same string forever: `REPO_SET_FILE=repo.conf` gave rc 124 and no output, where the
