@@ -1401,6 +1401,20 @@ if [ "$FARM_CHECK_ON" = "1" ]; then
                 # "re-farm" (#10114 review round 8). Everything from the first `Next:` to EOF.
                 FARM_REMEDY="$(printf '%s\n' "$FARM_OUT" | sed -n '/^[[:space:]]*Next:/,$p' | head -8)"
                 log_line "farm: $REF ships different bytes than $FARM_DEST execute — $FARM_NROWS row(s) from the instrument:"
+                # ⛔ AN EMPTY EXTRACTION IS NOT "EVERY FILE NAMED" (review round 5, reproduced). The
+                # row extractor's vocabulary is a COPY of the instrument's, and the checker this pass
+                # runs can be an OLDER FARMED copy whose rows it does not match — so a RED grade
+                # (rc 1|3) can yield ZERO extracted rows. Persisting that empty extraction published
+                # "0 row(s), every one named in <file>" over a file holding a header and nothing else:
+                # the one field that exists to NAME files would name none. The instrument's RAW output
+                # DOES carry the names, so that is what is published in this state, the header says the
+                # count is UNPARSED rather than zero, and every sentence below says "raw".
+                FARM_ROWS_RAW=0; PERSIST_BODY="$FARM_ROWS"
+                HDR_NOTE="n=$FARM_NROWS (the rows below are EXACTLY this run; farm_rows= in harness-apply.status is the currency indicator)"
+                if [ "$FARM_NROWS" -eq 0 ]; then
+                    FARM_ROWS_RAW=1; PERSIST_BODY="$FARM_OUT"
+                    HDR_NOTE="n=unparsed (NO row matched this pass's extractor — the instrument's RAW output follows verbatim; farm_n=0 says the count is UNKNOWN, not that nothing drifted)"
+                fi
                 # ⛔ EVERY ROW IS PERSISTED, NOT JUST THE EXCERPT (tortoise#10114 arm 2). The journal
                 # keeps a bounded human view, but the durable answer to "which files have drifted" is
                 # this file, written atomically (temp + rename) so a reader never sees a half list, and
@@ -1435,9 +1449,9 @@ if [ "$FARM_CHECK_ON" = "1" ]; then
                 # refuses that state up front and `[ -f ]` makes "persisted" mean "a readable file is
                 # at the path the record names", which is the only property a reader can rely on.
                 if [ ! -d "$FARM_ROWS_FILE" ] \
-                   && { printf '# harness-apply farm drift rows — %s — ref=%s dest=%s n=%s (the rows below are EXACTLY this run; farm_rows= in harness-apply.status is the currency indicator)\n' \
-                            "$(date -u +%FT%TZ)" "$REF" "$FARM_DEST" "$FARM_NROWS" >"$FARM_ROWS_FILE.tmp-$$" 2>/dev/null \
-                        && printf '%s\n' "$FARM_ROWS" >>"$FARM_ROWS_FILE.tmp-$$" 2>/dev/null; } \
+                   && { printf '# harness-apply farm drift rows — %s — ref=%s dest=%s %s\n' \
+                            "$(date -u +%FT%TZ)" "$REF" "$FARM_DEST" "$HDR_NOTE" >"$FARM_ROWS_FILE.tmp-$$" 2>/dev/null \
+                        && printf '%s\n' "$PERSIST_BODY" >>"$FARM_ROWS_FILE.tmp-$$" 2>/dev/null; } \
                    && mv -f "$FARM_ROWS_FILE.tmp-$$" "$FARM_ROWS_FILE" 2>/dev/null \
                    && [ -f "$FARM_ROWS_FILE" ]; then
                     REC_FARM_ROWS="$FARM_ROWS_FILE"; FARM_ROWS_OK=1
@@ -1446,9 +1460,16 @@ if [ "$FARM_CHECK_ON" = "1" ]; then
                     REC_FARM_ROWS=unwritable
                 fi
                 REC_FARM_NROWS="$FARM_NROWS"
-                printf '%s\n' "$FARM_ROWS" | head -12 | while IFS= read -r _row; do
+                printf '%s\n' "$PERSIST_BODY" | head -12 | while IFS= read -r _row; do
                     log_line "farm:   $_row"
                 done
+                if [ "$FARM_ROWS_RAW" = 1 ]; then
+                    if [ "$FARM_ROWS_OK" = 1 ]; then
+                        log_line "farm:   no row matched this pass's extractor — the instrument's RAW output above is published in $REC_FARM_ROWS"
+                    else
+                        log_line "farm:   no row matched this pass's extractor, and the RAW output could not be persisted ($REC_FARM_ROWS) — the files it names are in this run's own output above"
+                    fi
+                fi
                 if [ "$FARM_NROWS" -gt 12 ]; then
                     # The count is NOT the answer (tortoise#10114 arm 2): the other rows are named, and
                     # this line says where — an operator reading the journal must be able to get from
@@ -1462,11 +1483,16 @@ if [ "$FARM_CHECK_ON" = "1" ]; then
                 [ -n "$FARM_REMEDY" ] && printf '%s\n' "$FARM_REMEDY" | while IFS= read -r _row; do
                     log_line "farm:   $_row"
                 done
-                if [ "$FARM_ROWS_OK" = 1 ]; then
-                    finish 0 24 "farm: DRIFT — $FARM_DEST is NOT the code $REF ships (${FARM_NROWS} row(s), every one named in $REC_FARM_ROWS, with the instrument's own remedy — a stale copy, a layout move and an unsourced file do NOT all have the same fix)"
+                if [ "$FARM_ROWS_RAW" = 1 ] && [ "$FARM_ROWS_OK" = 1 ]; then
+                    FARM_ROW_SENTENCE="no row matched this pass's extractor, so the instrument's RAW output — which names them — is in $REC_FARM_ROWS"
+                elif [ "$FARM_ROWS_OK" = 1 ]; then
+                    FARM_ROW_SENTENCE="${FARM_NROWS} row(s), every one named in $REC_FARM_ROWS"
+                elif [ "$FARM_ROWS_RAW" = 1 ]; then
+                    FARM_ROW_SENTENCE="no row matched this pass's extractor and its RAW output could not be persisted ($REC_FARM_ROWS)"
                 else
-                    finish 0 24 "farm: DRIFT — $FARM_DEST is NOT the code $REF ships (${FARM_NROWS} row(s) above, and the full list could not be persisted ($REC_FARM_ROWS), with the instrument's own remedy — a stale copy, a layout move and an unsourced file do NOT all have the same fix)"
-                fi ;;
+                    FARM_ROW_SENTENCE="${FARM_NROWS} row(s) above, and the full list could not be persisted ($REC_FARM_ROWS)"
+                fi
+                finish 0 24 "farm: DRIFT — $FARM_DEST is NOT the code $REF ships ($FARM_ROW_SENTENCE, with the instrument's own remedy — a stale copy, a layout move and an unsourced file do NOT all have the same fix)" ;;
             *)
                 REC_ACTION=farm-unknown
                 # ⛔ `not-graded` STAYS HERE ON PURPOSE (review round 3): an UNREADABLE grade is not a

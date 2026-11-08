@@ -1501,6 +1501,85 @@ assert_contains "$(cat "$T/t24s/cwd/relstate/harness-apply-farm-rows.txt" 2>/dev
 # (review round 8). 20 stub rows + 2 prose lines must still read as 20.
 assert_contains "$OUT" "20 row(s)" "T24 control: the row count counts ROWS, not the instrument's class prose"
 
+# ⛔ A SECOND DRIFT PASS REPLACES THE LIST, IT DOES NOT ACCUMULATE (review round 5). The artifact is
+# published by renaming a per-pid temp, and an in-place `>>` append instead would leave a reader with
+# rows from two different runs and no way to tell which are current — and it reddened nothing.
+mk_origin t24t; mk_clone t24t
+REPO_P="$CLONE"; MODE_P=sync
+mkdir -p "$T/t24t/home/.pi/agent/scripts"
+OUT="$(HARNESS_APPLY_FARM_CHECKER="$T/t24q/stub-checker.sh" run_pass "$T/t24t" 2>&1)"; RC=$?
+assert_eq "$RC" "24" "T24 control: a 20-row drift pass is RED (setup for the replace test)"
+assert_eq "$(grep -c . "$T/t24t/state/harness-apply-farm-rows.txt" 2>/dev/null | tr -d ' ')" "21" \
+    "T24 control: and publishes a header plus all 20 rows"
+cat >"$T/t24t/stub-3row.sh" <<'FARM'
+#!/usr/bin/env bash
+printf 'only-1.py | a | b | STALE\n' >&2
+printf 'only-2.py | a | b | STALE\n' >&2
+printf 'only-3.py | a | b | STALE\n' >&2
+exit 1
+FARM
+chmod +x "$T/t24t/stub-3row.sh"
+OUT="$(HARNESS_APPLY_FARM_CHECKER="$T/t24t/stub-3row.sh" run_pass "$T/t24t" 2>&1)"; RC=$?
+assert_eq "$RC" "24" "T24 control: a shorter second drift pass is RED too"
+assert_eq "$(grep -c . "$T/t24t/state/harness-apply-farm-rows.txt" 2>/dev/null | tr -d ' ')" "4" \
+    "T24 control: and the list is REPLACED (header + 3 rows), never appended to — an append leaves two runs' rows in one file"
+assert_contains "$(head -1 "$T/t24t/state/harness-apply-farm-rows.txt" 2>/dev/null || true)" "n=3" \
+    "T24 control: the header is the NEW run's, so a reader can tell whose rows these are"
+assert_absent "$(cat "$T/t24t/state/harness-apply-farm-rows.txt" 2>/dev/null || true)" "file-19.py" \
+    "T24 control: and no row from the previous run survives the replace"
+
+# ⛔ AN UNREADABLE GRADE IS NOT A GRADE (review round 5). Nothing read the rows fields on this arm, so
+# forcing `REC_FARM_ROWS=none` into it reddened no row — the record would have claimed the farm
+# MATCHED on a pass that could not read it at all.
+mk_origin t24u; mk_clone t24u
+REPO_P="$CLONE"; MODE_P=sync
+mkdir -p "$T/t24u/home/.pi/agent/scripts"
+cat >"$T/t24u/stub-unknown.sh" <<'FARM'
+#!/usr/bin/env bash
+printf 'check-farm-drift: UNKNOWN — the two trees could not be compared\n' >&2
+exit 2
+FARM
+chmod +x "$T/t24u/stub-unknown.sh"
+OUT="$(HARNESS_APPLY_FARM_CHECKER="$T/t24u/stub-unknown.sh" run_pass "$T/t24u" 2>&1)"; RC=$?
+assert_eq "$RC" "24" "T24 control: an UNREADABLE farm grade is RED (24), never a pass"
+assert_contains "$OUT" "farm: UNKNOWN" "T24 control: and the line says the grade could not be read"
+REC24U="$(cat "$T/t24u/state/harness-apply.status" 2>/dev/null || true)"
+assert_contains "$REC24U" "action=farm-unknown" "T24 control: the record names the unreadable grade"
+assert_contains "$(grep '^farm_rows=' <<<"$REC24U")" "farm_rows=not-graded" \
+    "T24 control: and the rows field says NO grade — never 'none', which claims the farm matched"
+assert_contains "$(grep '^farm_n=' <<<"$REC24U")" "farm_n=not-graded" \
+    "T24 control: with the row count in the same state"
+
+# ⛔ ZERO EXTRACTED ROWS IS NOT "EVERY FILE NAMED" (review round 5, reproduced). The row extractor's
+# vocabulary is a COPY of the instrument's, so a FARMED checker whose rows it does not match yields a
+# RED grade with 0 extracted rows — and persisting that empty extraction published "0 row(s), every
+# one named in <file>" over a header and nothing else. The instrument's RAW output carries the names,
+# so that is what is published, and the record must not claim the extraction named anything.
+mk_origin t24v; mk_clone t24v
+REPO_P="$CLONE"; MODE_P=sync
+mkdir -p "$T/t24v/home/.pi/agent/scripts"
+cat >"$T/t24v/stub-other-vocab.sh" <<'FARM'
+#!/usr/bin/env bash
+printf 'pr-doctor.py differs from the ref (STALE, in a vocabulary this pass does not extract)\n' >&2
+printf 'check-farm-drift: DRIFT — 1 stale\n'
+exit 1
+FARM
+chmod +x "$T/t24v/stub-other-vocab.sh"
+OUT="$(HARNESS_APPLY_FARM_CHECKER="$T/t24v/stub-other-vocab.sh" run_pass "$T/t24v" 2>&1)"; RC=$?
+assert_eq "$RC" "24" "T24 control: a drift whose rows the extractor cannot match is still RED"
+ROWS24V="$T/t24v/state/harness-apply-farm-rows.txt"
+assert_contains "$(head -1 "$ROWS24V" 2>/dev/null || true)" "n=unparsed" \
+    "T24 control: the header says the extraction parsed NOTHING (never n=0, which reads as 'nothing drifted')"
+assert_contains "$(cat "$ROWS24V" 2>/dev/null || true)" "pr-doctor.py differs from the ref" \
+    "T24 control: while the artifact carries the instrument's RAW output, which DOES name the file"
+REC24V="$(cat "$T/t24v/state/harness-apply.status" 2>/dev/null || true)"
+assert_contains "$(grep '^farm_rows=' <<<"$REC24V")" "farm_rows=$ROWS24V" \
+    "T24 control: the record still names the artifact"
+assert_contains "$(grep '^detail=' <<<"$REC24V")" "RAW output" \
+    "T24 control: and detail= says the names are in the instrument's RAW output"
+assert_absent "$(grep '^detail=' <<<"$REC24V")" "every one named in" \
+    "T24 control: and never claims the extractor named rows it did not match"
+
 # ── T26: the materialiser is TOLD which cell home to pin into (agent-infra#3593) ─────────────────
 # MEASURED on the `cmux` cell, 2026-11-06: this pass resolves CELL_HOME from $HOME (pass:195) and the
 # pin records from it, then invoked the materialiser with NONE of them. The materialiser resolves the

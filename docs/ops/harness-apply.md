@@ -147,10 +147,25 @@ which the timer installer itself calls), it sat below the seam validations so th
 orphaned the list, and a fixed-path delete can unlink a concurrent pass's just-published file
 between its write and its record.
 
+⛔ **A CONCURRENT PASS CAN REPLACE THE FILE THIS RECORD NAMES — MATCH THE HEADER BEFORE YOU TRUST IT.**
+The path is fixed and the publish is a last-writer-wins rename, while the record is written later
+(in `finish`, after the deployed readings), so a timer tick overlapping an operator's hand-run can
+leave pass A's record naming pass A's rows while the file at that path holds pass B's. The write is
+atomic (a reader never sees half a list, and no pass ever removes another's file), but it is not
+*per-run*: before reading the list as this record's rows, check the header's `n=` and UTC against
+the record's `farm_n=` and `epoch=`. A mismatch is two passes, not a corrupt list.
+
+`farm_n=0` on a RED (`action=farm-drift`, `rc=24`) record means the **extractor** matched no row while
+the instrument still reported drift — the installed `check-farm-drift.sh` is a copy whose row
+vocabulary this pass does not know (a farm that lags the ref). The artifact then carries the
+instrument's **RAW output** and its header reads `n=unparsed`; the DRIFT is still red and still
+recorded, and the names are in that file verbatim rather than extracted.
+
 `farm_rows=unwritable` means the rows write failed **while the record write still succeeded** — the
-drift is still red and still counted, `farm_n` is still the instrument's row count, but the names
-are not on disk, so the journal says so in as many words. (A state dir that is unwritable for the
-record too leaves the PREVIOUS record in place: staleness, not a field, is that signal.)
+drift is still red and still counted, `farm_n` is still the instrument's row count (or `0` with
+`n=unparsed` in the artifact's place), but the names are not on disk, so the journal says so in as
+many words. (A state dir that is unwritable for the record too leaves the PREVIOUS record in place:
+staleness, not a field, is that signal.)
 
 ⛔ `deployed` EXISTS BECAUSE THE CHECKOUT IS NOT THE DEPLOYMENT. A pin-per-commit cell
 never moves its checkout, so `behind` measured there would be permanently non-zero and
