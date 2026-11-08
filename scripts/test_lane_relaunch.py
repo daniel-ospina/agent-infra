@@ -14,6 +14,7 @@ LIVE pane, so every test here exists to prove a way it could act on something it
 
 Run: python3 -m pytest scripts/test_lane_relaunch.py -q
 """
+import ast
 import importlib.util
 import json
 import os
@@ -436,19 +437,81 @@ def test_no_destructive_verb_on_any_path(R, tmp_path):
         dict(ls=FakeLS(screen="no prompt here"), cmux=FakeCmux()),
         dict(ls=FakeLS(transcript=None), cmux=FakeCmux()),
         dict(ls=FakeLS(cwd=None), cmux=FakeCmux()),
+        # ⛔ THE `--new` ARM IS A PATH TOO (review finding 1, 2026-11-08). The sweep covered only the
+        # resume arm, so a destructive verb added inside the `fresh` branch kept this suite green —
+        # while the PR claims "every argv on every path". Both the refusal and the send side of the
+        # fresh arm are exercised here, because they build different argv.
+        dict(ls=FakeLS(transcript=path), cmux=FakeCmux(), new=True),
+        dict(ls=FakeLS(transcript=None), cmux=FakeCmux(), new=True),
+        dict(ls=FakeLS(working=True), cmux=FakeCmux(), new=True),
+        dict(ls=FakeLS(screen="no prompt here"), cmux=FakeCmux(), new=True),
+        dict(ls=FakeLS(cwd=None), cmux=FakeCmux(), new=True),
+        dict(ls=FakeLS(transcript=path), cmux=FakeCmux(on_send=lambda: None), new=True),
     ]
     seen = []
+    fresh_sent = 0
     for sc in scenarios:
-        cmux = sc["cmux"]
-        _run(R, sc["ls"], cmux)
+        cmux = sc.pop("cmux")
+        _run(R, sc.pop("ls"), cmux, **sc)
         seen.extend(cmux.calls)
+        fresh_sent += len([c for c in cmux.calls if c[:2] == ["cmux", "send"]])
     assert seen, "no argv was recorded — the test is vacuous"
+    # ⛔ NOT VACUOUS (review finding 1): the fresh arm must actually have REACHED the send. A sweep
+    # whose `--new` scenarios all refused would pass without ever building the fresh argv.
+    assert fresh_sent >= 2, "the `--new` arm never reached a send; the sweep is vacuous there"
     blob = "\n".join(" ".join(c) for c in seen)
     for verb in R.FORBIDDEN_VERBS:
         assert verb not in blob, "a forbidden verb was emitted: %s" % verb
-    # and the tool's own source names no such call site (a comment is fine, a call is not)
     src = open(_MINE).read()
-    assert not re.search(r'\[\s*"cmux"\s*,\s*"(respawn-pane|close-workspace|kill-pane)"', src)
+    # ⛔ VERB-BLIND, NOT LITERAL (review finding 1): the old check matched only the exact spelling
+    # `["cmux", "respawn-pane"`, so `"respawn" + "-pane"` walked straight through it. This asserts
+    # the SHAPE of every cmux call site instead: a constructed verb must still be a member of the
+    # allowed set, so an assembled or aliased destructive verb cannot pass.
+    call_sites = re.findall(r'\[\s*"cmux"\s*,\s*([^\]]+)\]', src)
+    assert call_sites, "no cmux call site found in the source — did the argv construction move?"
+    allowed = {"send", "sessions", "read-screen"}
+    for rest in call_sites:
+        m = re.match(r'\s*"([^"]*)"', rest)
+        assert m, (
+            "a cmux call site builds its verb from something other than a literal, so no test can "
+            "bound it: %r" % rest)
+        assert m.group(1) in allowed, (
+            "a cmux call site builds a verb outside %s: %r" % (sorted(allowed), m.group(1)))
+    # and no NON-docstring string constant anywhere may spell a destructive verb (an argv assembled
+    # over several statements has no `["cmux", …]` shape to match, so the shape check above alone
+    # would miss it). Docstrings and comments are excluded on purpose: they are prose ABOUT the
+    # hazard, which is the whole point of the file. The `FORBIDDEN_VERBS` table is excluded because
+    # it is the definition of the list, not a use of it.
+    tree = ast.parse(src)
+    defin = set()
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Assign)
+                and any(getattr(t, "id", None) == "FORBIDDEN_VERBS" for t in node.targets)):
+            for sub in ast.walk(node.value):
+                defin.add(id(sub))
+    docstrings = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            body = getattr(node, "body", None) or []
+            if (body and isinstance(body[0], ast.Expr)
+                    and isinstance(body[0].value, ast.Constant)
+                    and isinstance(body[0].value.value, str)):
+                docstrings.add(id(body[0].value))
+    # argparse's user-facing prose is the other legitimate channel for naming the hazard — an
+    # operator reading `--help` is exactly who must be told the tool never uses that verb.
+    for node in ast.walk(tree):
+        if isinstance(node, ast.keyword) and node.arg in ("description", "help", "epilog"):
+            for sub in ast.walk(node.value):
+                docstrings.add(id(sub))
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Constant) and isinstance(node.value, str)):
+            continue
+        if id(node) in defin or id(node) in docstrings:
+            continue
+        for verb in ("respawn-pane", "close-workspace", "kill-pane"):
+            assert verb not in node.value, (
+                "a string constant outside a docstring spells a destructive verb (line %d): %r"
+                % (node.lineno, node.value))
 
 
 # ── the reporting layer (review finding 1) ────────────────────────────────────────────────────
@@ -495,6 +558,38 @@ def test_session_id_is_quoted_in_the_payload(R, tmp_path):
 
 
 # ── R6: the regression that produced this issue — a remedy that does not exist ------------------
+def _farm_arrays():
+    """The names `pi-bootstrap/setup.sh` actually DELIVERS, plus the names it declares withheld.
+
+    R6 has two halves and the first one is not enough: a name that exists in the checkout is still
+    unreachable from a box where only the farmed copy of the message lives. This reads the farm so
+    the answer is DERIVED from what ships, never a hand list that can fall behind it.
+    """
+    src = open(os.path.join(_REPO, "pi-bootstrap", "setup.sh")).read()
+    farmed, withheld = set(), set()
+    # Anywhere, not line-anchored: `lane_root_srcs=` is declared inside a comment block, so an
+    # anchored pattern reads as empty and silently turns the whole derivation vacuous.
+    for m in re.finditer(r'(\w*_srcs)\s*=\s*\(([^)]*)\)', src):
+        name, body = m.group(1), m.group(2)
+        words = set(re.findall(r"[\w.\-/]+\.(?:py|sh)", body))
+        (withheld if "root" in name else farmed).update(words)
+    assert farmed, "read no farmed sources from pi-bootstrap/setup.sh — did the farm move?"
+    return farmed, withheld
+
+
+def _landing_form(name, farmed, withheld):
+    """The path idiom a FARMED consumer file must use to reach `name`.
+
+    A farmed file runs at `$HOME/.pi/agent/scripts`, so a bare repo-relative `scripts/x` resolves to
+    nothing there. If the name is in the farm, `$SCRIPTS/x` is right (the heartbeat's own directory).
+    If it is NOT farmed, `$SCRIPTS/x` is just as wrong as `scripts/x` — the honest answer is the
+    checkout the operator is told to have: `$AGENT_INFRA_PATH/scripts/x`.
+    """
+    if name in farmed:
+        return "$SCRIPTS/%s" % name
+    return "$AGENT_INFRA_PATH/scripts/%s" % name
+
+
 def test_beat_remedy_names_a_script_that_exists():
     """`orchestrator-heartbeat.sh`'s DEAD LANES clause used to prescribe `recover-fleet / relaunch`
     — neither exists in the repo or the farm — so the operator improvised, and the improvisation
@@ -521,10 +616,41 @@ def test_beat_remedy_names_a_script_that_exists():
         # (review round 4, P1: the tool shipped 100644 and the first command an operator runs after
         # reading the beat was `Permission denied` — which puts `respawn-pane` back within reach).
         assert os.access(p, os.X_OK), "the beat prescribes a bare path that is not executable: %s" % rel
+    # ⛔ AND IT MUST BE REACHABLE FROM WHERE THE MESSAGE LIVES (review finding 2, 2026-11-08). The
+    # clause is delivered to `$HOME/.pi/agent/scripts`, so a repo-relative `scripts/x` resolves to
+    # nothing there: the operator reads a remedy, types it, gets `No such file` — and improvises with
+    # the destructive verb, which is the entire defect of #942. The form is DERIVED from the farm
+    # arrays rather than written here, so it follows the delivery if #1553 ever farms the producer.
+    farmed, withheld = _farm_arrays()
+    for rel in named:
+        base = os.path.basename(rel)
+        want = _landing_form(base, farmed, withheld)
+        assert want in clause, (
+            "the DEAD LANES clause must name %r (it is %s by the farm), got: %r"
+            % (want, "farmed" if base in farmed else "NOT farmed", clause))
+        assert not re.search(r'(?<![/\w$.])scripts/%s' % re.escape(base), clause), (
+            "the clause names a bare repo-relative path for %r, which resolves to nothing on the "
+            "box that receives this message: %r" % (base, clause))
+    # Why the checkout form is required rather than "just farm the tool": the producer imports a
+    # module the farm withholds by decision (#1553), so farming it alone would ship a tool that
+    # cannot import. If that decision is ever reversed, this test says so instead of going stale.
+    assert "lane-status.py" in withheld, (
+        "lane-status.py is no longer declared withheld by the farm — if #1553 landed, re-derive the "
+        "landing form rather than assuming this test's premise")
 
 
 def test_safe_send_remedy_is_reachable():
-    """The same dangling pointer lived in `safe-send.sh`'s refusal message."""
+    """The same dangling pointer lived in `safe-send.sh`'s refusal message — and that file is farmed
+    too, so it carries the same reachability requirement as the beat."""
     s = open(os.path.join(_HERE, "safe-send.sh")).read()
     assert "ORCHESTRATION-BOARD 72" not in s, "safe-send still points at a board doc that is not on the box"
     assert "lane-relaunch.py" in s, "safe-send's refusal names no reachable relaunch"
+    # ⛔ Reachable FROM A FARMED BOX, not merely on disk (review finding 2): `safe-send.sh` is in
+    # `fleet_srcs`, so at runtime `dirname $0` is `$HOME/.pi/agent/scripts` and a bare `scripts/…`
+    # would name a directory that is not there. Same derived form as the beat.
+    farmed, withheld = _farm_arrays()
+    want = _landing_form("lane-relaunch.py", farmed, withheld)
+    assert want in s, "safe-send must name %r, the form reachable from where it runs" % want
+    assert not re.search(r'(?<![/\w$.])scripts/lane-relaunch\.py', s), (
+        "safe-send names a bare repo-relative path, which resolves to nothing on the box that "
+        "receives this message")

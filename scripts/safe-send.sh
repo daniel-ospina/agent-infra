@@ -126,9 +126,16 @@ if [ -n "$PSCREEN" ]; then
       if [ "$MODE" != "--force" ] || grep -qE '(%|\$|#)[[:space:]]*$' <<<"$PLAST"; then
         echo "REFUSED [$LABEL] $WS — NO pi IN THIS PANE (last line: $(printf '%s' "$PLAST" | tail -c 70))."
         echo "         A send here would be typed into a BARE LOGIN SHELL and EXECUTED."
-        echo "         Relaunch the lane first: scripts/lane-relaunch.py --ws <uuid> (types the launch"
-        echo "         line into the pane's own login shell; never respawn-pane, which DELETES the"
-        echo "         workspace when its command fails — #942). --force does NOT override this."
+        # ⛔ `$AGENT_INFRA_PATH/…`, not a bare `scripts/…` (review finding 2): this file is FARMED to
+        # `$HOME/.pi/agent/scripts`, where a repo-relative path resolves to nothing — and the tool
+        # cannot simply be farmed either, because it imports `lane-status.py`, which
+        # `pi-bootstrap/setup.sh:489-496` deliberately withholds from the farm (#1553). Same idiom as
+        # this file's own `brief-gate.sh` lookup at line 82.
+        echo "         Relaunch the lane first: \$AGENT_INFRA_PATH/scripts/lane-relaunch.py --ws <uuid>"
+        echo "         (types the launch line into the pane's own login shell; never respawn-pane, which"
+        echo "         DELETES the workspace when its command fails — #942). --force does NOT override this."
+        echo "         AGENT_INFRA_PATH is your agent-infra checkout; the tool is not farmed because it"
+        echo "         imports lane-status.py, which pi-bootstrap withholds by decision (#1553)."
         exit 3
       fi ;;
   esac

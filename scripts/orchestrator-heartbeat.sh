@@ -1119,12 +1119,22 @@ fi
 # DEAD PANES: NOT CAPACITY, AND NOT A DISPATCH. A dead lane still carries its LAST session
 # file, so the staleness test reads it as idle forever -- which is how the CAPACITY clause
 # came to offer two dead panes as "free" on 2026-10-03 and order a send into a bare login
-# shell. They need a RELAUNCH -- scripts/lane-relaunch.py --ws <uuid> (it types the launch line into
-# the pane's own login shell; never respawn-pane, which DELETES the workspace when its command fails,
-# #942). The pre-fix text credited the mechanism to a board document that is on no box in this
-# fleet, and an instruction pointing at nothing is how an operator improvises.
+# shell. They need a RELAUNCH -- $AGENT_INFRA_PATH/scripts/lane-relaunch.py --ws <uuid> (it types the
+# launch line into the pane's own login shell; never respawn-pane, which DELETES the workspace when
+# its command fails, #942). The pre-fix text credited the mechanism to a board document that is on no
+# box in this fleet, and an instruction pointing at nothing is how an operator improvises.
+# ⛔ `$AGENT_INFRA_PATH/…`, NOT a bare `scripts/…` AND NOT `$SCRIPTS/…` (review finding 2, 2026-11-08).
+# A bare repo-relative path resolves only from a checkout, and this file is FARMED to
+# `$HOME/.pi/agent/scripts` where `scripts/` resolves to nothing — the very defect this change
+# closes, one hop out. `$SCRIPTS/` is not the answer either: `lane-relaunch.py` imports
+# `lane-status.py`, which `pi-bootstrap/setup.sh:489-496` deliberately WITHHOLDS from the farm (#1553
+# — farming the repo copy would overwrite the live classifier with an older one), so a farm-relative
+# pointer would name a file that must not be there. `$AGENT_INFRA_PATH` is the checkout the operator
+# already has (AGENTS.md makes it a prerequisite) and is how `safe-send.sh:82` names `brief-gate.sh`
+# for exactly this reason. `test_lane_relaunch.py` derives the correct form from the farm arrays, so
+# if #1553 lands and the farm starts carrying it, the test moves with it instead of going stale.
 if [ "${N_DEAD:-0}" -gt 0 ]; then
-  CAPTEXT="${CAPTEXT} ⛔ DEAD LANES — CONFIRMED BARE SHELL, no pi in the pane: ${DEAD}. These are NOT free capacity and are NOT dispatchable: a send into one would be typed into a BARE LOGIN SHELL and executed. They need a RELAUNCH via scripts/lane-relaunch.py --ws <uuid>, not an item. It types the launch line into the pane's OWN login shell (where the user's PATH lives); it never uses respawn-pane, which DELETES the workspace when its command fails (#942)."
+  CAPTEXT="${CAPTEXT} ⛔ DEAD LANES — CONFIRMED BARE SHELL, no pi in the pane: ${DEAD}. These are NOT free capacity and are NOT dispatchable: a send into one would be typed into a BARE LOGIN SHELL and executed. They need a RELAUNCH via \$AGENT_INFRA_PATH/scripts/lane-relaunch.py --ws <uuid>, not an item. (If AGENT_INFRA_PATH is unset, it is your agent-infra checkout — the tool is not farmed, because it imports lane-status.py, which #1553 withholds.) It types the launch line into the pane's OWN login shell (where the user's PATH lives); it never uses respawn-pane, which DELETES the workspace when its command fails (#942)."
 fi
 # ⛔ OCCUPIED IS NOT DEAD, AND MUST NEVER CARRY THE RELAUNCH REMEDY. Measured 2026-10-04:
 # `DMeer - linkedin outreach` read `pid_exists=no` and was reported "NO pi PROCESS IN THE
