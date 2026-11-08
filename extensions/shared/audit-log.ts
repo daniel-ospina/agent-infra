@@ -54,7 +54,13 @@ export type GateEventName =
   // anyone parsing a log line, and a name outside this union is exactly the "written outside
   // the type a report reads" gap that ships green under `tsx` and reddens the first tree
   // that adds a tsconfig.
-  | "gh_shim_degraded";
+  | "gh_shim_degraded"
+  // #853: the main-worktree guard's own classifier FAILED TO LOAD, so every gate it backs is
+  // inert (the bash git guard non-blocking, the write/edit main-checkout gate fail-OPEN — #761).
+  // Same reason as `gh_shim_degraded` above: a degraded enforcement layer must be readable by a
+  // report, not only by whoever scrolls back through the session prose. This is the ONE surface
+  // that knows a session ran unguarded, so it may not be a `console.warn` nobody reads.
+  | "guard_degraded";
 // Resolved lazily per call (not at module load) so a $HOME change — tests,
 // alternate agent dirs — takes effect. Uses os.homedir(); never hardcoded.
 export function gateEventsFile(): string {
