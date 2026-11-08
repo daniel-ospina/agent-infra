@@ -95,10 +95,43 @@
 
          WHERE THE OUTPUT GOES. pr-doctor writes its own bounded pass log at
          $HOME/.pi/agent/state/pr-doctor.log and its PASS VERDICT at
-         .../pr-doctor.status.json; in the multi-repo (`all-repos`) mode the wrapper
+         .../pr-doctor.status.json. In the multi-repo (`all-repos`) mode this wrapper
          runs, each repo ALSO gets `pr-doctor.<owner>-<name>.log` and
-         `pr-doctor.<owner>-<name>.status.json` beside them, so one repo's verdict cannot
-         stand in for another's. The launchd capture below is the third surface and
+         `pr-doctor.<owner>-<name>.status.json` — one pair per repo, so one repo's
+         verdict cannot stand in for another's — AND, after the last repo, the
+         canonical pair is written with the SET's AGGREGATE verdict: a `repos` list
+         with one entry per repo and `rc` = the worst of the set, i.e. the one row
+         that names WHICH repo is red.
+         ⛔ SO SAY "ALSO", AND SAY WHAT THE AGGREGATE IS. Two earlier versions of this
+         paragraph were each half-true, and the second inverted the first: the original
+         said each repo "ALSO gets" a pair "beside them" — CORRECT about the pairs being
+         additional, and silent on the AGGREGATE, which is the fact an operator actually
+         needs — and the "correction" that replaced it then
+         went further and claimed the canonical pair is never created in this mode, with
+         the log and the verdict relocated onto the per-repo names instead. That is
+         FALSE, and it was measured false: a two-repo set writes BOTH per-repo pairs AND
+         BOTH canonical files, with the set's verdict in the canonical
+         `pr-doctor.status.json` (`repo` = "acme/alpha,acme/beta", `repos` = 2 rows,
+         `rc` = 2). The mechanism the old sentence half-saw is real but partial —
+         `apply_repo(multi=True)` REASSIGNS the module-level names per repo, and
+         `run_all_repos()` then calls `canonical_paths()` before recording, so the set's
+         aggregate lands back on the canonical names. The inversion is worse than the
+         omission it replaced, because THREE readers open the canonical STATUS file by
+         name (the STATUS file, NOT the log: nothing live READS `pr-doctor.log` — the
+         two things that WRITE it are `pr-doctor.py`'s own `log()` and the heartbeat's
+         launcher appending a child's stdout. Nothing on a CODE path reads its
+         contents — tests assert on it, and an operator reads the last line with
+         `tail -1`; everything else merely prints or mentions the path — which is why
+         saying "those canonical files" would promise a log consumer that does not exist):
+         `scripts/heartbeat-loop.sh`, `scripts/objective.py`'s `pr_doctor_last_run`
+         (which renders the same record into the beat) and
+         `scripts/lib/fleet-inventory.sh`'s
+         `_fleet_pr_doctor_bound`. A paragraph asserting the canonical files are never
+         created makes a live aggregate read as a phantom — the same "operator looks in
+         the wrong place" failure this paragraph exists to prevent, pointing the other
+         way. (The false claim is described here rather than quoted, so that a grep for
+         it in this template cannot match the very sentence that refutes it.) The launchd
+         capture below is the third surface and
          the one its own code names — a pass that dies before it can write either
          still leaves its crash text here (a launchd job's stderr is the only place
          an interpreter-level death lands), which is what makes an import error
@@ -106,9 +139,12 @@
          (`set: … grading N repo(s)`, or `DEGRADED — NO-REPO-SET …`) is on the same
          capture, which is what makes a box with no repo set visible instead of quiet.
 
-         GH: PATH carries the fleet's gh-wrapper dir first (rendered by
-         install-launchd.sh with the unreadable pi shim dir removed, #1719/#427), and
-         HOME stays the real home so the doctor's state dir is the fleet's, not
+         GH: PATH is the INSTALLER's PATH — launchd_path() in install-launchd.sh keeps the
+         ambient order and only DROPS entries (anything that does not resolve, and any
+         */shims dir OR ANYTHING INSIDE ONE, #1719/#427). Nothing is prepended, so a job installed from a shell
+         whose PATH had no gh-wrapper dir has no gh wrapper either: check the installer's
+         PATH, not this file, when a launchd pass appears to bypass a PATH-installed
+         wrapper. HOME stays the real home so the doctor's state dir is the fleet's, not
          launchd's.
 
          ⛔ THE REPO IS NOT NAMED HERE AT ALL ANY MORE (agent-infra#2281 §1). This unit used to
