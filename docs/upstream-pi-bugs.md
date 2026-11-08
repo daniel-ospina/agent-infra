@@ -1131,10 +1131,10 @@ The substitute is **`/proc/<pid>/io`'s `rchar`**, which needs no cooperation fro
 `pi` and — read alongside ΔCPU — separates the two cases this issue conflates:
 *idle* (reads sit on a flat floor) versus *legitimately working* (reads scale with
 the provider stream or the tool output). Be precise about which of the two carries
-the weight, though: the idle floor and the working minimum are only **0.4 KB/s
-apart** (quantified in the first result bullet below) — thin enough that no read
-threshold should be trusted as a stand-alone classifier, which is why **ΔCPU makes
-the split and `rchar` is the corroboration**. ΔCPU
+the weight, though: the idle floor and the working minimum are **at most 0.4 KB/s
+apart** (first result bullet below) — thin, and its survival depends on a
+membership rule this subsection never fixes, which is why **ΔCPU makes the split
+and `rchar` is the corroboration**. ΔCPU
 comes from `/proc/<pid>/stat`'s `utime+stime` ticks (`USER_HZ=100`), i.e. the
 09-16 method (`ps -o time` twice) at 10 ms resolution. The main-thread vs
 `V8Worker` split in the last bullet cannot come from those **process-level**
@@ -1152,20 +1152,23 @@ epoch — the property the epoch analysis above found missing across windows.
 
 **Result — the idle burn is absent, and every hot process is reading.**
 
-- **12 distinct idle TUI processes across the four windows, and the worst of them
-  is 0.3% of a core** (11 of 12 at ≤ 0.2%). Their read rate sits in a narrow
-  **8–10 KB/s** band in every window — the idle samples the pid series below
-  quote read 8.4, 8 and 10 KB/s, and the 10.4 KB/s case three bullets down sits
-  just above it — a fixed background poll, not input, so the floor is a stable
-  control rather than a per-process accident. Two honest qualifications: it is a
-  *band*, not a constant; and its separation from the working minimum is only
-  **0.4 KB/s** (working min 10.4 vs idle max 10, ≈4%) — thin enough that no read
-  threshold deserves to be the classifier on its own. The one sample that looks
-  like a counter-example, pid 4076400 (the exception below), reads 10.4 KB/s at
-  just **0.8% of a core**; it is **not** a member of the idle set — that set's
-  worst member is 0.3%, so a 0.8% process is not in it — and a near-floor ΔCPU
-  carrying a working read rate is precisely why **ΔCPU makes the split and `rchar`
-  only corroborates**. The next bullet tests that pairing directly.
+- **12 distinct idle TUI processes across the four windows, and the worst value any
+  of them shows while labelled idle is 0.3% of a core** (11 of 12 at ≤ 0.2%; pids
+  quoted below reach 5.2–7.0% in their *working* windows, which is why the label is
+  per window and not per process). Their idle read rate sits in a narrow **8–10
+  KB/s** band — the idle samples the pid series below quote read 8.4, 8 and 10
+  KB/s, and the 10.4 KB/s case three bullets down sits just above it — a fixed
+  background poll, not input, so the floor is a stable control rather than a
+  per-process accident. Two honest qualifications. First, it is a *band*, not a
+  constant. Second, and more important, **no read threshold here is safe on its
+  own**: the separation from the working minimum is 0.4 KB/s (working min 10.4 vs
+  idle max 10, ≈4%), and whether even that survives depends on a membership rule
+  this subsection never fixes — the borderline sample, pid 4076400 (the exception
+  below), reads 10.4 KB/s at just **0.8% of a core**, so a line drawn by ΔCPU puts
+  it inside the idle set (and the gap disappears), while one drawn by read rate
+  puts it outside (and the gap is 0.4 KB/s). That unresolvable dependence is
+  precisely why **ΔCPU makes the split and `rchar` only corroborates**, and the
+  next bullet tests that pairing directly.
 - **No window contained a process above 1% of a core with reads at that floor** —
   which is exactly the 09-16 defect signature (11 processes at 6.4–26.3% while
   silent for 1.0–209.5 min). Run as a filter over all four windows it returns
