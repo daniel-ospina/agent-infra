@@ -1958,6 +1958,22 @@ off macOS (it renders a launchd plist) — the portability that matters is `orch
    `(` `)` `{` `}` `"` `<` `>` `#` in a ref (only spaces are forbidden, and `${IFS}` supplies
    those), so a fork PR on `fix/x';touch${IFS}/tmp/x;#` achieved arbitrary command execution on the
    host holding the merge key. Reproduced before the fix; the self-test now pins the validator.
+10. **The gate a lane bypasses has a substitute, and the substitute is VERIFIED (#2977).**
+   Lanes run with `AGENT_SKIP_REVIEW_GATE`/`ELDATO_SKIP_VGATE` off by owner ruling (2026-10-28), so the
+   harness owes the equivalent guarantee: a durable per-lane report (`WORKTREE-REPORT.md`, tortoise#10220)
+   and a verifier that REFUSES to merge without it. `lane-report-gate.sh` is that verifier: it resolves
+   the lane worktree for the PR's branch, runs the repo's own consumer (`tools/worktree_report.py check
+   --json`), and refuses on **absent, invalid, red, or head-moved** evidence. `lane-merge.sh` runs it
+   before the paid chain; `merge-one.sh` runs it before the rail short-circuit and the reviewer.
+   ⛔ It is deliberately STRICTER than the consumer's `$?`: `check` EXITS 0 on a moved head (a recorded
+   decision whose docstring hands the judgement to "the consumer"), and two review rounds on 2026-11-07
+   were re-run because a report described a tree one commit behind the head being merged.
+   ⛔ Two outcomes ABSTAIN rather than refuse, and are logged as such (`5` = the repo ships no writer, so
+   no report of this format can exist; `6` = no worktree for this branch on this box, so the lane's
+   evidence is not reachable from here — measured 2026-11-08: 13 of 13 open tortoise PRs had none on the
+   hub). Refusing on either would stop every cross-box merge in the fleet; counting either as green would
+   be the false PASS the ruling exists to close. `7` (a report that exists and could not be VERIFIED)
+   refuses.
 
 ### 5.3 Untrusted input and worker containment — read before running this unattended
 
