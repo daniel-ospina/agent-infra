@@ -232,6 +232,40 @@ done
 # human-visible RED is the only surface that is not a log nobody reads, and `cell-home-migrate.sh` is
 # the named remedy. ⛔ An EXPLICIT CELL_HOME is an operator's answer and is never second-guessed
 # (`cell_home_resolve` step 1) — the refusal exists for the box where nothing said what the home is.
+# ⛔ THE HOME THAT MATTERS IS THE **CONTROLLER'S** (review F1, verified). Comparing this pass's own
+# `$HOME` with the derivation closes only ONE of the two shapes. When the pass's unit was repointed but
+# the CONTROLLER's was not — exactly what a `cell-home-migrate.sh --apply` leaves behind when rule 4
+# refuses a single unit — the pass sees `HOME == derivation`, refuses nothing, and writes a green pin set
+# (exit 10, in `SuccessExitStatus`) under a home the controller never reads. So the controller's own
+# pinned `CELL_HOME` is read too, and a disagreement is the same split.
+# ⛔ WHICH UNITS ARE "THE CONTROLLER" IS NAMED, NOT DISCOVERED: a glob over every unit in the directory
+# would call this pass's own sibling units controllers. Drop-ins are read because that is the documented
+# mechanism by which a box pins the home (`…/cell-self-pin.service.d/*.conf`), lexical order, last wins.
+# A value this file cannot resolve (`{{CELL_HOME}}` unrendered, a `%h` specifier) is CANNOT MEASURE and
+# is skipped — never compared, because a string comparison against a placeholder is not a reading.
+# No controller unit at all (a Mac) means no comparison: this guard never invents a home.
+split_home_controller() { # prints the controller's pinned CELL_HOME, or nothing when it cannot be measured
+    local f d v out=""
+    local -a units=()
+    [ -n "${HARNESS_APPLY_CONTROLLER_UNIT:-}" ] && units=("$HARNESS_APPLY_CONTROLLER_UNIT")
+    if [ "${#units[@]}" -eq 0 ]; then
+        units=(/etc/systemd/system/eldato-orchestrator.service)
+        [ -n "${HOME:-}" ] && units+=("$HOME/.config/systemd/user/eldato-orchestrator.service")
+    fi
+    for f in "${units[@]}"; do
+        [ -r "$f" ] || continue
+        v="$(sed -n 's/^[[:space:]]*Environment=[[:space:]]*CELL_HOME=//p' "$f" | tail -1)"
+        case "$v" in ''|*'{'*|*%*) : ;; *) out="$v" ;; esac
+        for d in "$f".d/*.conf; do
+            [ -r "$d" ] || continue
+            v="$(sed -n 's/^[[:space:]]*Environment=[[:space:]]*CELL_HOME=//p' "$d" | tail -1)"
+            case "$v" in ''|*'{'*|*%*) : ;; *) out="$v" ;; esac
+        done
+        break   # the first READABLE controller unit wins: a box has one controller
+    done
+    [ -n "$out" ] && printf '%s\n' "$out"
+    return 0
+}
 CELL_HOME_LIB=""
 if [ -n "$SELF_FILE" ]; then
   for _cand in "$HERE/lib/cell-home.sh" "$HERE/../lib/cell-home.sh"; do
@@ -239,18 +273,34 @@ if [ -n "$SELF_FILE" ]; then
   done
 fi
 _CELL_HOME_EXPLICIT="${CELL_HOME:-}"
+SPLIT_HOME=""
+SPLIT_HOME_WHY=""
 if [ -n "$CELL_HOME_LIB" ]; then
   . "$CELL_HOME_LIB"
   CELL_HOME="$(cell_home_resolve)"
+  # ⛔ RECORDED HERE, ACTED ON ONLY WHERE SOMETHING WOULD BE WRITTEN (review F3). The first cut refused
+  # at this line, which also reddened `--print-status` (a RECORD read) and `--dry-run` (a PREVIEW) —
+  # contradicting this file's own two recorded rules: a refusal that exits before `write_record` leaves
+  # `--print-status`/fleet-health reading the PREVIOUS tick as if it were this one, and `--dry-run`
+  # "must not red a box (it changes nothing, including the exit contract)". The split is therefore a
+  # READING on every verb, and a REFUSAL only on the acting one.
   if [ -z "$_CELL_HOME_EXPLICIT" ] && [ -n "${HOME:-}" ] && [ "$HOME" != "$CELL_HOME" ]; then
-    err "REFUSED split-home: this pass resolves CELL_HOME='$CELL_HOME' but the unit that starts it exports HOME='$HOME' — two live homes on one box, so the pin this pass would write is not the pin the controller reads (agent-infra#3453)"
-    err "  Nothing was touched. Converge the box first: bash scripts/cell-home-migrate.sh --check, then --apply"
-    err "  (or set CELL_HOME explicitly if '$HOME' is the home this box's controller really reads)"
-    exit 27
+    SPLIT_HOME="$HOME"
+    SPLIT_HOME_WHY="the unit that starts this pass exports HOME=$HOME"
+  fi
+  # …and the controller's own home, which is the one a pin must land under.
+  if [ -z "$SPLIT_HOME" ]; then
+    _ctrl_home="$(split_home_controller)"
+    if [ -n "$_ctrl_home" ] && [ "$_ctrl_home" != "$CELL_HOME" ]; then
+      SPLIT_HOME="$_ctrl_home"
+      SPLIT_HOME_WHY="the controller's unit pins CELL_HOME=$_ctrl_home"
+    fi
+    unset _ctrl_home
   fi
 else
   CELL_HOME="${CELL_HOME:-${HOME:?HOME is required}}"
 fi
+unset _CELL_HOME_EXPLICIT
 unset _CELL_HOME_EXPLICIT
 O="${O:-$CELL_HOME/orchestrator}"
 # ⛔ BOTH SPELLINGS, AND THE UNIT'S IS THE ONE THAT MATTERS IN PRODUCTION. The rendered systemd unit
@@ -443,6 +493,14 @@ print_status() {
         *) log_line "status=failed rc=${rc:-?} age=${age}s — a human must look"; printf '%s\n' "$body" | sed 's/^/  /'; return 3 ;;
     esac
 }
+
+# ⛔ THE SPLIT IS A READING ON EVERY VERB AND A REFUSAL ONLY ON THE ACTING ONE (review F3). A
+# `--print-status` answers "did the last pass succeed" from the RECORD and a `--dry-run` preview changes
+# nothing (including its exit contract), so neither may exit 27 — but both must be able to SAY the split,
+# or an operator inspecting a box is the last to learn why it is red.
+if [ -n "$SPLIT_HOME" ]; then
+    log_line "split_home=$SPLIT_HOME derived=$CELL_HOME why=[$SPLIT_HOME_WHY] — two live homes on one box (agent-infra#3453); converge with cell-home-migrate.sh --check, then --apply"
+fi
 
 if [ "$MODE" = "status" ]; then print_status; exit $?; fi
 
@@ -658,7 +716,7 @@ recompute_deployed() {
 # measured from the DEPLOYED commit. Printing only the checkout's made the log say `behind=1` on a box
 # whose record (correctly) said `behind=0` — two numbers for one box in one pass, and the log's was the
 # one an operator is told to trust.
-log_line "harness: mode=$PASS_MODE repo=$REPO ref=$REF fetch=$FETCH_STATE head=$(short "$HEAD_SHA") checkout_relation=$RELATION checkout_behind=$BEHIND ref_sha=$(short "$REF_SHA") dirty=$DIRTY_N pin=$REC_PIN pin_tree=$REC_PIN_TREE"
+log_line "harness: mode=$PASS_MODE repo=$REPO ref=$REF fetch=$FETCH_STATE head=$(short "$HEAD_SHA") checkout_relation=$RELATION checkout_behind=$BEHIND ref_sha=$(short "$REF_SHA") dirty=$DIRTY_N pin=$REC_PIN pin_tree=$REC_PIN_TREE split_home=${SPLIT_HOME:-none}"
 [ "$PASS_MODE" = pin ] && [ "$REC_PIN_TREE" != "none" ] && \
     log_line "harness: deployed=$REC_PIN_TREE (the tree the pin names — this is what the box RUNS; the checkout above is not moved by a pin advance)"
 
@@ -1070,6 +1128,23 @@ fi
 # ⛔ A NO-OP WHEN THE PIN ALREADY NAMES THE REF TIP — that is the cadence requirement, and it is the
 # common case: every ten minutes on a box that is already current must change NOTHING and say so.
 ACT_RC=0
+# ⛔ THE SPLIT REFUSES HERE — AFTER the readings, BEFORE any mutation, and THROUGH the record (review F3).
+# Refusing at the derivation aborted `--print-status` and `--dry-run` and left the PREVIOUS tick's green
+# record standing for up to `HARNESS_APPLY_STALE_SECONDS` (3600 s = 6 cadences) while the unit was red —
+# the "record readers keep a stale green" rule this file states for every other refusal.
+if [ -n "$SPLIT_HOME" ]; then
+    if [ "$DRY_RUN" = 1 ]; then
+        log_line "dry-run: would REFUSE split-home — $SPLIT_HOME_WHY, and this pass derives CELL_HOME=$CELL_HOME; nothing was touched (a real run exits 27)"
+        exit 0
+    fi
+    REC_ACTION=refused-split-home
+    REC_DETAIL="split home: $SPLIT_HOME_WHY but this pass derives CELL_HOME=$CELL_HOME"
+    REC_REMEDY="converge the box: bash scripts/cell-home-migrate.sh --check, then --apply (or set CELL_HOME explicitly if $SPLIT_HOME is the home this box's controller really reads)"
+    err "REFUSED split-home: $SPLIT_HOME_WHY, but this pass derives CELL_HOME='$CELL_HOME' — two live homes on one box, so the pin this pass would write is not the pin the controller reads (agent-infra#3453)"
+    err "  Nothing was touched. $REC_REMEDY"
+    write_record 0 27 || exit 23
+    exit 27
+fi
 if [ "$DRY_RUN" = 1 ]; then
     # ⛔ A PREVIEW WRITES NO RECORD. `--dry-run` is documented as "change NOTHING", and rewriting the
     # pass record to `action=dry-run epoch=now` reset the staleness clock: a box whose timer had died

@@ -163,6 +163,10 @@ this repo keeps deleting.
 | 23 | REFUSED unknown — the ref/repo/HEAD cannot be resolved, the materialiser failed, or the pin record could not be written | **red** |
 | 24 | `farm-drift` — the **FARM** (`$CELL_HOME/.pi/agent/scripts`, the directory this box *executes*) differs from the ref, owes files, or cannot be graded (a dangling link, a checker that lives inside the farm, an explicitly-named farm that is absent) — an **absent *default* farm is SKIPPED and the pass stays green**, because only then does "no farm" describe the host rather than the config | **red** |
 | 25 | behind, and this box has nothing that can advance it | **red** |
+| 27 | REFUSED `split-home` — this pass derives one cell home while the **unit that starts it** (`HOME=`) or the **controller's own unit** (`Environment=CELL_HOME=`) names another, so the pin it would write is not the pin the controller reads. Nothing is touched; the refusal names both homes and the remedy (`cell-home-migrate.sh --check`, then `--apply`). An **explicit `CELL_HOME` is never second-guessed**, and a controller value the pass cannot resolve (`{{CELL_HOME}}` unrendered, a `%h` specifier) or a box with **no controller unit at all** is *cannot-measure*, not a split. `--dry-run` and `--print-status` **never** take this exit: the preview reports `would REFUSE split-home` and stays 0, and the record read reports `split_home=` as a reading | **red** |
+
+⛔ **26 IS NOT FREE** — `harness-refresh.sh` already spends it (`REFUSED blocked`), so `split-home`
+takes 27 rather than giving one code two meanings (the ONE VOCABULARY rule above).
 
 A red tick is deliberate: those are states a **human** must resolve, and the unit colour
 is the only surface that reaches someone who is not tailing a log.

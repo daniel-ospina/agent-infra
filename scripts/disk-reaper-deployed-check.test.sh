@@ -74,7 +74,8 @@ command_not_found_handle() {
 [ -x "$CHECK" ] || { echo "  ❌ the checker is not executable: $CHECK"; echo "PASS=0 FAIL=1"; exit 1; }
 
 FILES="disk-reaper.sh disk-reaper-run.sh pi-cache-reap.sh reap-lane-venvs.sh pi-reap-worktrees.sh
-reap-abandoned-worktrees.sh reap-duplicate-installs.sh reap-runner-work.sh lib/bounded.sh lib/live-paths.sh"
+reap-abandoned-worktrees.sh reap-duplicate-installs.sh reap-runner-work.sh lib/bounded.sh
+lib/cell-home.sh lib/live-paths.sh"
 
 # ⛔ ONE EXIT TRAP CLEANS EVERYTHING THIS SUITE CREATES (review of #3422, P3). It leaked two ways: the
 # undefined-command record (a trap was removed here without a replacement) and every per-fixture temp

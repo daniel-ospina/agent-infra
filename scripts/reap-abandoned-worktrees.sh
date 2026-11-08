@@ -167,9 +167,19 @@ SELF_DIR=""
 # FAIL-CLOSED like the `lib/live-paths.sh` block below, for the same reason: a home this script cannot
 # name is a guard it cannot enforce, and a silently-empty preserve-set is how `/tmp/cell-home` becomes
 # reapable (the measured #3278 defect this guard exists for).
+# ⚠️ ACCEPTED TRADE (review F5): this block runs before argument parsing, so `--help`/`-h` also exits 3
+# on a box with no farmed library. The alternative — answering `--help` first — means the help text and
+# the guard's remedy have two copy sites to drift between, which is worse for a delegate whose only
+# scheduler is a timer. The failure NAMES the missing file and the three places it was looked for, so an
+# operator is never guessing.
 CELL_HOME_LIB=""
-for _cand in "$SELF_DIR/lib/cell-home.sh" "${HOME:-}/.pi/agent/scripts/lib/cell-home.sh" \
-             "${AGENT_INFRA_PATH:-}/scripts/lib/cell-home.sh"; do
+# ⛔ `${SELF_DIR:+…}` AND `${HOME:+…}` — AN EMPTY PREFIX MUST NOT BUILD AN ABSOLUTE PATH. `"$SELF_DIR/lib/…"`
+# with a piped start (no `SELF_DIR`) yields `/lib/cell-home.sh`, and `"${HOME:-}/.pi/…"` with no HOME
+# yields `/.pi/…`: absolute paths outside any checkout, exactly the shape §CONSUMERS forbids (review
+# F5). They still fail closed, but a candidate list must not propose a file no checkout can own.
+for _cand in ${SELF_DIR:+"$SELF_DIR/lib/cell-home.sh"} \
+             ${HOME:+"$HOME/.pi/agent/scripts/lib/cell-home.sh"} \
+             ${AGENT_INFRA_PATH:+"$AGENT_INFRA_PATH/scripts/lib/cell-home.sh"}; do
     [ -n "$_cand" ] && [ -r "$_cand" ] && { CELL_HOME_LIB="$_cand"; break; }
     done
 if [ -z "$CELL_HOME_LIB" ]; then

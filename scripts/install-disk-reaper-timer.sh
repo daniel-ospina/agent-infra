@@ -325,16 +325,19 @@ refuse_transient_target() {
         err "SYSTEMD_UNIT_DIR to a scratch dir when this is a test."
         return 1
     fi
-    # The unit PINS the three delegates beside $REAPER, so a missing one is a class that fails
+    # The unit PINS the delegates beside $REAPER, so a missing one is a class that fails
     # closed (exit 3, red) on every pass — name it at install time rather than after the fact.
+    # ⛔ `lib/cell-home.sh` is pinned for `reap-abandoned-worktrees.sh` since agent-infra#3453 (review
+    # F2): the delegate resolves it from `$SELF_DIR/lib/` and exits 3 without it, so leaving it out of
+    # this list is how the abandoned-worktree class dies on every pass with nothing saying so.
     for d in pi-cache-reap.sh reap-lane-venvs.sh pi-reap-worktrees.sh \
              reap-abandoned-worktrees.sh reap-duplicate-installs.sh reap-runner-work.sh \
-             lib/live-paths.sh; do
+             lib/live-paths.sh lib/cell-home.sh; do
         # #2542 adds the two new owners AND the census library they share. The library is in this list
         # rather than in the REFUSING arm below because a missing library breaks TWO classes, not the
         # pass: a red unit that names them is a worse failure than a refusal, but a silent one is worse
         # again — so it is named at install time, exactly like a missing delegate.
-        [ -f "${REAPER%/*}/$d" ] || err "WARNING: ${REAPER%/*}/$d is missing — the unit pins it, so $([ "${d%%/*}" = lib ] && printf 'the abandoned-worktree arm and the duplicate-install class' || printf 'that class') will fail closed (exit 3, red) every pass"
+        [ -f "${REAPER%/*}/$d" ] || err "WARNING: ${REAPER%/*}/$d is missing — the unit pins it, so $([ "${d%%/*}" = lib ] && printf 'every class that sources it' || printf 'that class') will fail closed (exit 3, red) every pass"
     done
     # ⛔ AND THE BOUNDED-EXECUTION LIBRARY, WHICH IS WORSE THAN A CLASS: both artifacts pin it, and
     # without it the WHOLE pass refuses at startup (exit 3, every hour) — no class runs at all. That is

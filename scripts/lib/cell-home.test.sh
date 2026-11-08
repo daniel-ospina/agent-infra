@@ -82,11 +82,19 @@ source_in() {
 # `reap-abandoned-worktrees.sh:219` piped through that RE answered NO-MATCH while the arm's message said
 # "NO non-test script defaults CELL_HOME to the legacy path". The two alternatives below are
 # (1) ANY assignment whose name contains CELL_HOME and whose default reaches `/tmp/cell-home`, however
-# deeply nested, and (2) a bare `CELL_HOME…:-/tmp/cell-home` USED without an assignment (still a default
-# being taken). `e3b` is the control over shape (1): it must fire, or the widening did not take.
-LEGACY_DEFAULT_RE='[A-Za-z_]*CELL_HOME[A-Za-z_]*=.*:-/tmp/cell-home\|CELL_HOME[A-Za-z_]*:-/tmp/cell-home'
+# deeply nested, and (2) a bare `CELL_HOME…` DEFAULT taken without an assignment (still a default being
+# taken). `e3b` is the control over shape (1): it must fire, or the widening did not take.
+# ⛔ SHAPE (2) CARRIES `[:]\{0,1\}[-=]`, NOT JUST `:-` (review F4, verified). `${CELL_HOME-/tmp/cell-home}`
+# and `${CELL_HOME:=/tmp/cell-home}` are DEFAULTS in exactly the sense this arm claims to catch — leaving
+# them out made "ANY … however deeply nested" an over-claim in a comment above a grep that could not
+# match them. `[:]` is what admits the `:=` form, and `\{0,1\}` is the POSIX spelling of "optional": BRE
+# has no `?` quantifier, and a literal `?` there silently turned the whole pattern into one that matched
+# nothing (caught by re-running `e3`/`e3b` after the edit — both went red).
+LEGACY_DEFAULT_RE='[A-Za-z_]*CELL_HOME[A-Za-z_]*=.*[:]\{0,1\}[-=]/tmp/cell-home\|CELL_HOME[A-Za-z_]*[:]\{0,1\}[-=]/tmp/cell-home'
 
-# probe_legacy_default <file> — 0 iff the file carries the pre-#3453 legacy CELL_HOME assignment.
+legacy_defaults_after_filter() { # <file…> — c1's OWN pipeline, so an arm below grades the INSTRUMENT
+  grep -Hn "$LEGACY_DEFAULT_RE" "$@" 2>/dev/null | grep -v ':[0-9]*:[[:space:]]*#' || true
+}
 probe_legacy_default() { grep -q "$LEGACY_DEFAULT_RE" "$1" 2>/dev/null; }
 
 # probe_consumes_resolver <file> — 0 iff the file sources the resolver and calls it.
@@ -514,14 +522,23 @@ if probe_legacy_default "$NESTEDREV"; then
 else
   bad "e3b c1's pattern does NOT fire on the nested-seam default — the widening regressed to the flat forms and c1 is certifying less than its message claims"
 fi
-# …and the polarity partner: a file that only NAMES the legacy home (in prose, or through a variable the
-# resolver owns) is not a DEFAULT, so a pattern that fired on every mention would be a false block.
+# …and the polarity partner, because the first cut's was VACUOUS (review F4, verified): its fixture
+# contained no `CELL_HOME` token at all, so it passed for the wrong reason. This fixture DOES carry the
+# expansion form, in a COMMENT line — the shape `c1` filters. So it asserts the FILTER on a file that
+# really contains the pattern, not the absence of text: the raw probe must fire (first leg) and c1's
+# pipeline must not (second leg).
+# ⛔ A TRAILING comment (`…  # never ${CELL_HOME:-/tmp/cell-home}`) IS STILL CAUGHT, and that is a
+# deliberate, recorded limit rather than a defect: telling a mention from a default inside a shell line
+# needs a shell parser, and stripping `#` to EOL would hide a real default that follows a quoted `#`.
+# No shipped file carries the trailing-comment shape (measured: c1's hit list is empty).
 SAFEREV="$T/not-a-default.sh"
-printf '#!/usr/bin/env bash\n# the legacy home is /tmp/cell-home; we never default to it\nCELL_HOME="$(cell_home_resolve)"\n' >"$SAFEREV"
-if probe_legacy_default "$SAFEREV"; then
-  bad "e3b polarity: the pattern fires on a file that only MENTIONS the legacy home — it would false-block"
+printf '#!/usr/bin/env bash\n# CELL_HOME never comes from ${CELL_HOME:-/tmp/cell-home} here\nCELL_HOME="$(cell_home_resolve)"\n' >"$SAFEREV"
+if ! probe_legacy_default "$SAFEREV"; then
+  bad "e3b polarity: the fixture does not carry the pattern, so this arm cannot measure the filter"
+elif [ -n "$(legacy_defaults_after_filter "$SAFEREV")" ]; then
+  bad "e3b polarity: c1's pipeline fires on a COMMENT line that mentions the legacy home — it would false-block"
 else
-  ok "e3b polarity: a file that only MENTIONS the legacy home is not a default (no false block)"
+  ok "e3b polarity: a comment that MENTIONS the legacy home is filtered while the raw probe still fires (the filter, not an absence of text)"
 fi
 
 # e4: BOTH real probes must fire on the PRE-#3453 text of a real consumer. `deploy-crossbox.sh` carried

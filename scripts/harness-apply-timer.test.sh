@@ -57,6 +57,14 @@ assert_file()     { if [ -f "$1" ]; then ok "$2"; else bad "$2 (missing file: $1
 say_case()        { echo; echo "── $* ──"; }
 
 T="$(mktemp -d "${TMPDIR:-/tmp}/harness-apply-test.XXXXXX")" || { echo "cannot create a temp dir"; exit 1; }
+# ⛔ THE CONTROLLER UNIT IS A HOST PATH, SO IT IS PINNED SHUT FOR THE WHOLE SUITE (review F1, measured).
+# `/etc/systemd/system/eldato-orchestrator.service` EXISTS on a cell and pins `CELL_HOME=/tmp/cell-home`,
+# so without this the split guard would red 11 arms on a cell and pass on a Mac — a host assumption, not
+# a product defect (the same class `HARNESS_APPLY_DRIFT_CHECK=0` and `acct_stub` remove). It is exported
+# so the INSTALLER's `--status`/`--dry-run` (which exec the pass with this shell's env) inherits it too;
+# the `env -i` arms below name it explicitly. T27 drives the seam with REAL rendered units, which is
+# where the behaviour is measured.
+export HARNESS_APPLY_CONTROLLER_UNIT="$T/no-controller.service"
 cleanup() { rm -rf "$T"; }
 trap cleanup EXIT
 
@@ -121,6 +129,7 @@ run_pass() {
     HARNESS_PIN="$d/home/.pi/agent/state/HARNESS-PIN" HARNESS_PIN_FILE="$d/home/.harness-path" \
     HARNESS_PIN_DIR="$d/home/harness" CELL_HOME="${CELL_HOME_P:-$d/home}" O="$d/home/orchestrator" \
     HARNESS_APPLY_SYNC_CMD="${HARNESS_APPLY_SYNC_CMD:-$T/sync-stub.sh}" \
+    HARNESS_APPLY_CONTROLLER_UNIT="${CONTROLLER_UNIT_P:-$T/no-controller.service}" \
     bash "${PASS_UNDER_TEST:-$PASS_SH}" "$@"
 }
 
@@ -587,7 +596,7 @@ say_case "T16 the pass runs from the unit's own environment"
 mk_origin t16; mk_clone t16; write_sync_stub
 REPO_P="$CLONE"; MODE_P=sync
 mkdir -p "$T/t16/state" "$T/t16/home"
-OUT="$(env -i HOME="$T/t16/home" PATH="$(acct_stub "$T/t16/acct" "$T/t16/home"):$PATH" \
+OUT="$(env -i HOME="$T/t16/home" PATH="$(acct_stub "$T/t16/acct" "$T/t16/home"):$PATH" HARNESS_APPLY_CONTROLLER_UNIT="$T/no-controller.service" \
     HARNESS_APPLY_REPO="$CLONE" HARNESS_APPLY_REF=origin/main HARNESS_APPLY_MODE=sync \
     HARNESS_APPLY_STATE_DIR="$T/t16/state" HARNESS_APPLY_SYNC_CMD="$T/sync-stub.sh" \
     bash "$PASS_SH" 2>&1)"; RC=$?
@@ -598,7 +607,7 @@ assert_contains "$REC16" "ref=$(printf '%s' "$(git -C "$T/o-t16" rev-parse main)
 assert_absent "$OUT" "no checkout resolved" "T16 the P0 refusal text is absent"
 # ... and the same environment still HONOURS the direct-run names, so an operator's own invocation and
 # a unit-rendered one cannot resolve two different repos.
-OUT="$(env -i HOME="$T/t16/home" PATH="$T/t16/acct:$PATH" HARNESS_REPO="$CLONE" HARNESS_REF=origin/main \
+OUT="$(env -i HOME="$T/t16/home" PATH="$T/t16/acct:$PATH" HARNESS_REPO="$CLONE" HARNESS_REF=origin/main HARNESS_APPLY_CONTROLLER_UNIT="$T/no-controller.service" \
     HARNESS_APPLY_MODE=sync HARNESS_APPLY_STATE_DIR="$T/t16/state" \
     HARNESS_APPLY_SYNC_CMD="$T/sync-stub.sh" bash "$PASS_SH" 2>&1)"; RC=$?
 assert_eq "$RC" "0" "T16 the direct-run names (HARNESS_REPO/HARNESS_REF) still work"
@@ -695,7 +704,7 @@ REPO_P="$CLONE"; MODE_P=sync
 mkdir -p "$T/t19/state"
 PYLAN="$(command -v python3 2>/dev/null || printf '/usr/bin/python3')"
 LAUNCHER_PY="$HERE/pi-reap-worktrees-launchd.py"
-env -i HOME="$T/t19/home" PATH="$(acct_stub "$T/t19/acct" "$T/t19/home"):$PATH" \
+env -i HOME="$T/t19/home" PATH="$(acct_stub "$T/t19/acct" "$T/t19/home"):$PATH" HARNESS_APPLY_CONTROLLER_UNIT="$T/no-controller.service" \
     HARNESS_APPLY_REPO="$CLONE" HARNESS_APPLY_REF=origin/main \
     HARNESS_APPLY_MODE=sync HARNESS_APPLY_STATE_DIR="$T/t19/state" \
     HARNESS_APPLY_SYNC_CMD="$T/sync-stub.sh" \
@@ -719,7 +728,7 @@ REPO_P="$CLONE"; MODE_P=sync
 mkdir -p "$T/t19b/state" "$T/t19b/cwd/lib"
 MARKER="$T/t19b/SOURCED-FROM-CWD"
 printf 'touch %s\n' "$MARKER" >"$T/t19b/cwd/lib/cell-home.sh"
-( cd "$T/t19b/cwd" && env -i HOME="$T/t19b/home" PATH="$(acct_stub "$T/t19b/acct" "$T/t19b/home"):$PATH" \
+( cd "$T/t19b/cwd" && env -i HOME="$T/t19b/home" PATH="$(acct_stub "$T/t19b/acct" "$T/t19b/home"):$PATH" HARNESS_APPLY_CONTROLLER_UNIT="$T/no-controller.service" \
     HARNESS_APPLY_REPO="$CLONE" HARNESS_APPLY_REF=origin/main \
     HARNESS_APPLY_MODE=sync HARNESS_APPLY_STATE_DIR="$T/t19b/state" \
     HARNESS_APPLY_SYNC_CMD="$T/sync-stub.sh" \
@@ -1501,6 +1510,14 @@ run_pass_unit() {
                  HARNESS_APPLY_REPO="$REPO_P" HARNESS_APPLY_REF=origin/main HARNESS_APPLY_MODE=
                  HARNESS_APPLY_STATE_DIR="$d/state" HARNESS_APPLY_DRIFT_CHECK=0 HARNESS_FETCH=1
                  HARNESS_APPLY_SYNC_CMD="$T/sync-stub.sh"
+                 # ⛔ THE CONTROLLER UNIT IS A HOST PATH, SO IT IS PINNED SHUT HERE (review F1).
+                 # `/etc/systemd/system/eldato-orchestrator.service` EXISTS on a cell and pins
+                 # `CELL_HOME=/tmp/cell-home`, so without this seam every arm below would inherit the
+                 # HOST's controller and the split guard would red 108 arms on a cell while passing on a
+                 # Mac — a host assumption, not a product defect (the same class `acct_stub` and
+                 # `HARNESS_APPLY_DRIFT_CHECK=0` exist to remove). T27 drives the seam explicitly with a
+                 # REAL rendered unit, which is where the behaviour is measured.
+                 HARNESS_APPLY_CONTROLLER_UNIT="${CONTROLLER_UNIT_P:-$T/no-controller.service}"
                  HARNESS_MATERIALISER="${MATERIALISER_P:-}"
                  STUB_REPO="$REPO_P" STUB_CELL_HOME_FALLBACK="${FALLBACK_P:-}" )
     [ -z "${FARM_CHECKER_P:-}" ] || e+=( HARNESS_APPLY_FARM_CHECKER="$FARM_CHECKER_P" )
@@ -1606,9 +1623,18 @@ resolve_under() {
         bash -c '. "$1/scripts/lib/cell-home.sh"; cell_home_resolve' _ "$HERE/.."
 }
 # run_under <env assignments…> — the pass under exactly this environment.
-run_under() {
-    env -i "$@" PATH="$ACCT27:/usr/bin:/bin:/usr/sbin:/sbin" HARNESS_APPLY_DRIFT_CHECK=0 \
-        bash "${PASS_UNDER_TEST:-$PASS_SH}" --print-status 2>&1
+run_under() { # <env assignments…> [extra args…] — the pass under exactly this environment.
+    local -a _env=() _args=()
+    while [ $# -gt 0 ]; do
+        case "$1" in *=*) _env+=("$1"); shift ;; *) _args+=("$1"); shift ;; esac
+    done
+    # No extra arg = the ACTING path (the split refusal lives there). The repo is the suite's own LOCAL
+    # clone, so the fetch is hermetic, and the refusal precedes every mutation — nothing is touched.
+    # ⛔ `HARNESS_FETCH=0` CANNOT BE USED HERE: a not-fetched pass refuses `cannot-verify` (23) BEFORE the
+    # move section, so the split guard would never be reached and these arms would measure the fetch rule.
+    env -i "${_env[@]}" PATH="$ACCT27:/usr/bin:/bin:/usr/sbin:/sbin" HARNESS_APPLY_DRIFT_CHECK=0 \
+        HARNESS_APPLY_FARM_CHECK=0 \
+        bash "${PASS_UNDER_TEST:-$PASS_SH}" "${_args[@]}" 2>&1
 }
   # ⛔ NO `mapfile`: macOS ships bash 3.2 and CI parses every script with it (`bash32-parse`).
 read_env() { # <template> <HOME> <CELL_HOME> <state> — fills the global ENV_ARR
@@ -1635,7 +1661,7 @@ OUT="$(run_under "${HA_ENV[@]}")"; RC=$?
 assert_eq "$RC" "27" "T27 so the pass REFUSES (27) rather than writing a pin its controller never reads"
 assert_contains "$OUT" "REFUSED split-home" "T27 and the refusal says what it is"
 assert_contains "$OUT" "CELL_HOME='$T27/acct-home'" "T27 naming the home it would have used"
-assert_contains "$OUT" "HOME='$T27/legacy-home'" "T27 and the unit's home it would have diverged from"
+assert_contains "$OUT" "exports HOME=$T27/legacy-home" "T27 and the unit's home it would have diverged from"
 assert_contains "$OUT" "cell-home-migrate.sh" "T27 and the remedy, so the operator is not left to guess"
 # ⛔ NON-VACUITY: the refusal is what stops it. Remove `exit 27` and the same environment runs — and the
 # home it runs with is the account's, i.e. the split F1 measured. Without this leg, T27 would be green
@@ -1647,25 +1673,63 @@ if cmp -s "$PASS_SH" "$PASS_NOGUARD"; then
 else
     ok "T27 control: the guard-removal mutant really drops only the refusal"
 fi
-OUT="$(PASS_UNDER_TEST="$PASS_NOGUARD" run_under "${HA_ENV[@]}")"; RC=$?
+OUT="$(PASS_UNDER_TEST="$PASS_NOGUARD" run_under "${HA_ENV[@]}" --print-status)"; RC=$?
 if [ "$RC" = "27" ]; then bad "T27 control: the guard-less pass still exits 27 — the guard is not what refused";
 else ok "T27 control: WITHOUT the guard the same environment is NOT refused (rc=$RC)"; fi
 assert_absent "$OUT" "REFUSED split-home" "T27 control: …and nothing says the homes disagree"
 assert_eq "$(resolve_under "${HA_ENV[@]}")" "$T27/acct-home" \
     "T27 control: …so it wrote under the account's home, not the controller's — F1's split, reproduced"
-# AND THE FALSE-POSITIVE ARM: a CONVERGED box (the unit's HOME IS the account's home) must run normally.
-# A refusal that fires on a healthy box would red every migrated cell, which is its own outage.
+# AND THE FALSE-POSITIVE ARM: a genuinely CONVERGED box must run normally. Review F1 was right that the
+# first cut of this leg was NOT a converged box: it rendered the PASS unit at the durable home while
+# leaving the CONTROLLER unit at the legacy one — a second split arm, not a polarity partner. A converged
+# box has BOTH units on the same durable home, and that is what is rendered here.
 read_env "$HERE/../templates/systemd/eldato-harness-apply.service" \
     "$T27/acct-home" "$T27/acct-home" "$T27/state"; HA_CONV=("${ENV_ARR[@]}")
-OUT="$(run_under "${HA_CONV[@]}")"; RC=$?
-if [ "$RC" = "27" ]; then bad "T27 a CONVERGED box (HOME == the account's home) is refused — the guard is a false positive";
+read_env "$HERE/../templates/systemd/eldato-orchestrator.service" \
+    "$T27/acct-home" "$T27/acct-home" "$T27/state"; ORCH_CONV=("${ENV_ARR[@]}")
+# The controller unit is a FILE the pass reads, so the seam is the file. `ORCH_CONV` is rendered from the
+# REAL template and then written as the controller's own unit — both sides of this leg are the artifacts.
+printf '[Service]\n' >"${T27}/controller-converged.service"
+printf '%s\n' "${ORCH_CONV[@]}" | sed 's/^/Environment=/' >>"${T27}/controller-converged.service"
+OUT="$(HARNESS_APPLY_CONTROLLER_UNIT="${T27}/controller-converged.service" run_under "${HA_CONV[@]}" --print-status)"; RC=$?
+if [ "$RC" = "27" ]; then bad "T27 a CONVERGED box (both units on the durable home) is refused — the guard is a false positive";
 else ok "T27 a CONVERGED box is NOT refused (rc=$RC) — the guard fires only on the real disagreement"; fi
 assert_absent "$OUT" "REFUSED split-home" "T27 …and says nothing about a split"
+# ⛔ THE SHAPE THE FIRST CUT MISSED (review F1, verified): the PASS unit was repointed but the
+# CONTROLLER's was not — exactly what `cell-home-migrate.sh --apply` leaves when rule 4 refuses a single
+# unit. Here `HOME == the derivation`, so a guard that compares only the pass's own `$HOME` sees nothing;
+# the controller's pinned `CELL_HOME` is the disagreement and it must still refuse.
+printf '[Service]\n' >"${T27}/controller-legacy.service"
+printf '%s\n' "${ORCH_ENV[@]}" | sed 's/^/Environment=/' >>"${T27}/controller-legacy.service"
+OUT="$(HARNESS_APPLY_CONTROLLER_UNIT="${T27}/controller-legacy.service" run_under "${HA_CONV[@]}")"; RC=$?
+assert_eq "$RC" "27" "T27 the pass refuses when its OWN unit agrees but the CONTROLLER's does not (the shape a HOME-only guard misses)"
+assert_contains "$OUT" "the controller's unit pins CELL_HOME" "T27 and it names the controller as the side that disagrees"
+# ⛔ A VALUE THE PASS CANNOT RESOLVE IS CANNOT MEASURE, NOT A COMPARISON: an unrendered `{{CELL_HOME}}` must
+# not be string-compared, or every box whose unit renders late would be refused.
+printf '[Service]\nEnvironment=CELL_HOME={{CELL_HOME}}\n' >"${T27}/controller-unrendered.service"
+OUT="$(HARNESS_APPLY_CONTROLLER_UNIT="${T27}/controller-unrendered.service" run_under "${HA_CONV[@]}" --print-status)"; RC=$?
+if [ "$RC" = "27" ]; then bad "T27 an UNRENDERED controller value was compared and refused — a placeholder is not a reading";
+else ok "T27 an unrendered controller value is CANNOT MEASURE and is never compared (rc=$RC)"; fi
+# ⛔ AND NO CONTROLLER UNIT AT ALL (a Mac) IS NOT A SPLIT — the guard never invents a home.
+OUT="$(HARNESS_APPLY_CONTROLLER_UNIT="${T27}/does-not-exist.service" run_under "${HA_CONV[@]}" --print-status)"; RC=$?
+if [ "$RC" = "27" ]; then bad "T27 a box with NO controller unit was refused — the guard invented a home";
+else ok "T27 a box with no controller unit (a Mac) is not refused (rc=$RC)"; fi
 # AND AN EXPLICIT `CELL_HOME` IS NEVER SECOND-GUESSED (`cell_home_resolve` step 1): the controller's own
 # unit sets it, and a migration or an operator naming the home must get that home.
-OUT="$(run_under "${ORCH_ENV[@]}")"; RC=$?
+OUT="$(run_under "${ORCH_ENV[@]}" --print-status)"; RC=$?
 if [ "$RC" = "27" ]; then bad "T27 an explicit CELL_HOME was second-guessed (refused) — step 1 must win";
 else ok "T27 an explicit CELL_HOME wins and is never second-guessed (rc=$RC)"; fi
+# ⛔ THE READ-ONLY VERBS MUST NOT RED (review F3, verified): the refusal belongs on the ACTING path only.
+# `--print-status` answers from the RECORD and `--dry-run` changes nothing (including its exit contract),
+# so both must be able to SAY the split without exiting 27 — otherwise an operator inspecting the box is
+# the last to learn why it is red, and the preview breaks its own documented promise.
+OUT="$(run_under "${HA_ENV[@]}" --dry-run)"; RC=$?
+assert_eq "$RC" "0" "T27 a SPLIT box's --dry-run still exits 0 (a preview must not red a box)"
+assert_contains "$OUT" "would REFUSE split-home" "T27 …and the preview still SAYS it would refuse, so the disclosure is not lost"
+OUT="$(run_under "${HA_ENV[@]}" --print-status)"; RC=$?
+if [ "$RC" = "27" ]; then bad "T27 --print-status exited 27 — a record read must not take the acting path's refusal";
+else ok "T27 --print-status answers from the RECORD (rc=$RC) and never exits 27"; fi
+assert_contains "$OUT" "split_home=" "T27 …while still reporting the split as a READING"
 
 echo
 echo "────────────────────────────────────────────────────────"
