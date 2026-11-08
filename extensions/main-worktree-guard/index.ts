@@ -139,7 +139,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { isToolCallEventType } from "@earendil-works/pi-coding-agent";
 import { execSync, execFileSync } from "node:child_process";
 import { resolve, dirname, join, relative, sep } from "node:path";
-import { realpathSync, existsSync, statSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
+import { realpathSync, existsSync, lstatSync, statSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { createHash } from "node:crypto";
@@ -1100,35 +1100,53 @@ function _hubReflogTail(hubTop: string): string[] {
 // contamination that a verifier caught only because it read the diff, while a
 // reconciliation by `git diff --stat` line counts looked plausible and passed.
 // Both belong in the warning, not in a doc nobody reads mid-incident.
-function _warnHubSweep(vanished: string[], hubTop: string): void {
+function _warnHubSweep(absent: string[], onDisk: string[], hubTop: string): void {
   const L = (t: string) =>
     "║  " + (t.length > 62 ? t.slice(0, 61) + "…" : t).padEnd(62) + "║";
-  const named = vanished.slice(0, HUB_SWEEP_MAX_NAMED).map((p) => L(`  • ${_truncatePath(p, 44)}`));
-  const more = vanished.length > HUB_SWEEP_MAX_NAMED
-    ? [L(`  … and ${vanished.length - HUB_SWEEP_MAX_NAMED} more`)]
-    : [];
+  const named = (list: string[]) => [
+    ...list.slice(0, HUB_SWEEP_MAX_NAMED).map((p) => L(`  • ${_truncatePath(p, 44)}`)),
+    ...(list.length > HUB_SWEEP_MAX_NAMED
+      ? [L(`  … and ${list.length - HUB_SWEEP_MAX_NAMED} more`)]
+      : []),
+  ];
   // RIGHT-truncate reflog lines: the `HEAD@{n}` prefix and the verb are the
   // information (a left-truncation would drop exactly those, #718's own evidence).
   const reflog = _hubReflogTail(hubTop).slice(0, 2).map((l) => L(`    ${l.length > 58 ? l.slice(0, 57) + "…" : l}`));
+  // Two POPULATIONS, because they are different propositions (#718 review round
+  // 3, P1). Set-membership in `git status` establishes only that a path left the
+  // UNCOMMITTED set; it does NOT establish that the path is gone. `git add -A`
+  // and `git commit` move work into the index/HEAD and delete nothing, so
+  // telling that reader the paths are "ABSENT" sends them to a salvage restore
+  // that re-imports stale pre-commit content into work already staged or
+  // committed — the exact contamination #718 point 3 exists to prevent.
   const lines = [
     "",
     "╔══════════════════════════════════════════════════════════════════╗",
     L("⚠️  HUB WORKING TREE CHANGED UNDER YOU (#718)"),
     "╠══════════════════════════════════════════════════════════════════╣",
-    L("Observed earlier this session, now ABSENT from the hub:"),
-    ...named,
-    ...more,
-    L(""),
-    L("A path cannot commit itself away: something REWROTE the shared"),
-    L("hub's working tree — a concurrent session/process swept it, or"),
-    L("a hub command in THIS session did (a salvage NAMES every path it"),
-    L("reverses, #854 — check your own tool output first)."),
+    ...(absent.length ? [
+      L("Observed earlier this session, now ABSENT from the hub:"),
+      ...named(absent),
+      L(""),
+    ] : []),
+    ...(onDisk.length ? [
+      L("Observed earlier, no longer UNCOMMITTED — still ON DISK:"),
+      ...named(onDisk),
+      L("  staged/committed elsewhere, or the edit was REVERTED —"),
+      L("  check `git status` / `git log -1 --stat` BEFORE restoring."),
+      L(""),
+    ] : []),
+    L("Something REWROTE the shared hub's working tree — a concurrent"),
+    L("session/process swept it, or a hub command in THIS session did (a"),
+    L("salvage NAMES every path it reverses, #854 — check your own tool"),
+    L("output first)."),
     L("─ What moved it (the reflog records the verb):"),
     L(`  git -C ${_truncatePath(hubTop, 40)} reflog -10`),
     ...reflog,
-    L("─ Where the work went:"),
+    L("─ Where the work went (the routes this repo actually writes):"),
     L("  git -C <hub> log --all --oneline --grep=salvage"),
-    L("  ls -t ~/hub-backups 2>/dev/null | head"),
+    L("  git -C <hub> ls-remote origin 'refs/wip/*'"),
+    L("  git -C <hub> for-each-ref refs/wip-local"),
     L(""),
     L("⚠️  A salvage is a MIXTURE of every session's tree. Restore"),
     L("   ONLY the paths you authored, and read the diff CONTENTS:"),
@@ -1139,6 +1157,26 @@ function _warnHubSweep(vanished: string[], hubTop: string): void {
   console.warn(lines.join("\n"));
 }
 
+// Is the path still on disk under the hub? `lstatSync` (not `existsSync`) so a
+// symlink counts as PRESENT — a symlink is content that still exists. An entry
+// this cannot parse, or one that escapes the hub, is treated as GONE: the safe
+// direction, because GONE is what warns.
+function _hubPathIsGone(hubTop: string, rel: string): boolean {
+  if (!rel || rel.startsWith("/") || rel.split(/[\\/]/).includes("..")) return true;
+  try { lstatSync(join(hubTop, rel)); return false; } catch { return true; }
+}
+
+// A collapsed untracked DIRECTORY that is now listed per-file is a porcelain
+// REPRESENTATION change, not a change of state: `?? docs/` becomes
+// `A  docs/plans/plan.md` the moment something stages it (git-status(1): `??`
+// is untracked, `A ` is staged), and the directory's own entry disappears while
+// the directory is untouched. Nothing was lost, so nothing is reported.
+function _porcelainCollapsed(rel: string, current: Set<string>): boolean {
+  if (!rel.endsWith("/")) return false;
+  for (const c of current) if (c.startsWith(rel)) return true;
+  return false;
+}
+
 // Diff the observed dirty-path set against the previous observation. Called by
 // _hubSweepCheck only; never throws (warn-only, and a stderr failure in a
 // session hook must never break a tool call).
@@ -1147,17 +1185,29 @@ function _observeHubTree(porcelain: string, hubTop: string): void {
   const current = _dirtyPathsFromPorcelain(porcelain);
   const previous = observedHubPaths.get(pid);
   observedHubPaths.set(pid, current);
+  let seen = warnedVanishedPaths.get(pid);
+  if (!seen) { seen = new Set<string>(); warnedVanishedPaths.set(pid, seen); }
+  // RE-ARM, never suppress forever (#718 review round 3, P2). A path observed
+  // dirty AGAIN has demonstrably been re-authored, so a later disappearance is
+  // a NEW loss. A permanent per-path-per-session `seen` made a repeat of the
+  // incident class a silent miss — the opposite of what this arm is for. One
+  // banner per LOSS is the requirement `C2` pins, not one per path per session.
+  // ⛔ This must run on EVERY observation, before any early return: the call that
+  // sees the path DIRTY is the one that re-arms it, and that call has nothing to
+  // report itself.
+  for (const p of current) seen.delete(p);
   // Nothing was ever observed dirty → nothing can have been lost. This is also
   // what keeps a legitimately-clean hub silent forever.
   if (!previous || previous.size === 0) return;
-  const vanished = [...previous].filter((p) => !current.has(p));
+  const vanished = [...previous].filter((p) => !current.has(p) && !_porcelainCollapsed(p, current));
   if (vanished.length === 0) return;
-  let seen = warnedVanishedPaths.get(pid);
-  if (!seen) { seen = new Set<string>(); warnedVanishedPaths.set(pid, seen); }
   const fresh = vanished.filter((p) => !seen.has(p));
   if (fresh.length === 0) return; // already reported — one banner per loss, not per tool call
   for (const p of fresh) seen.add(p);
-  _warnHubSweep(fresh, hubTop);
+  const absent: string[] = [];
+  const onDisk: string[] = [];
+  for (const p of fresh) (_hubPathIsGone(hubTop, p) ? absent : onDisk).push(p);
+  _warnHubSweep(absent, onDisk, hubTop);
 }
 
 // #718 detection entry point — hub-rooted sessions only; skipped under the env
@@ -1180,8 +1230,15 @@ function _hubSweepCheck(): void {
     if (sig !== null && sig === lastHubTreeSignature && now - lastHubSweepMs < HUB_SWEEP_MIN_MS) return;
     lastHubTreeSignature = sig;
     lastHubSweepMs = now;
+    // GIT_OPTIONAL_LOCKS=0 is the repo's own convention for a read-only git call
+    // in a SHARED tree (scripts/bg-rescue-wip.sh:33-34, :243): a plain `git
+    // status` rewrites the real index and takes `.git/index.lock`, which would
+    // make a LIVE lane's next git command fail at exactly the frequency this arm
+    // samples (#718 review round 3). It also keeps our own probe from perturbing
+    // the index signature the burst gate reads.
     const porcelain = execSync("git status --porcelain=v1", {
       cwd: hubTop, encoding: "utf-8", timeout: 5000,
+      env: { ...process.env, GIT_OPTIONAL_LOCKS: "0" },
     });
     _observeHubTree(porcelain, hubTop);
   } catch { /* warn-only — degrade silently, never blocks */ }

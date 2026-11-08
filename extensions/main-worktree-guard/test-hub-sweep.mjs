@@ -32,7 +32,7 @@
 //
 // Run: node extensions/main-worktree-guard/test-hub-sweep.mjs
 import { execSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { readFileSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -65,10 +65,10 @@ const HATCH_VARS = ["AGENT_ALLOW_MAIN_EDITS", "ELDATO_ALLOW_MAIN_EDITS"];
 
 // Blocking sleep with no child process: the observation's burst gate is
 // wall-clock, so a control that must PROVABLY reach `git status` needs a real
-// pause to be a pin rather than a no-op. TWO controls need it (A0 and B2):
-// without it they can pass because `_hubSweepCheck` short-circuited before the
-// `git status` they purport to exercise — the non-vacuity defect a fresh review
-// found in B2 one round after the same defect had been fixed in A0.
+// pause to be a pin rather than a no-op. The controls that need it (A0, B2, F1,
+// F2): without it they can pass because `_hubSweepCheck` short-circuited before
+// the `git status` they purport to exercise — the non-vacuity defect a fresh
+// review found in B2 one round after the same defect had been fixed in A0.
 const pause = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 
 async function main() {
@@ -221,7 +221,15 @@ async function main() {
       "docs/ not named");
     expectTrue("B3d: …citing the issue so the reader can find the class", banner.includes("#718"));
     expectTrue("B3e: …naming the recovery route (salvage) rather than only the loss",
-      banner.includes("--grep=salvage") && banner.includes("hub-backups"));
+      banner.includes("--grep=salvage") && banner.includes("refs/wip/"));
+    // Non-vacuity for the review's P2: the pre-fix banner pointed at
+    // `ls -t ~/hub-backups 2>/dev/null | head`, a path no tool in this repo ever
+    // creates (measured: `git grep hub-backups` finds ONLY this line and this
+    // assertion). Under `2>/dev/null` the wrong path prints nothing, which reads
+    // as "there are no backups" at the one moment the pointer must be
+    // actionable. The real route is `refs/wip/<slug>` (`bg-rescue-wip.sh:12-20`).
+    expectTrue("B3e2: …and NOT a backup path that no tool creates (`~/hub-backups`)",
+      !banner.includes("hub-backups"), "a route that does not exist is a silent false negative");
     expectTrue("B3f: …and the reflog, which records WHAT moved the tree",
       banner.includes("reflog"), "reflog not named");
     expectTrue("B3g: #718 point 3 — the contamination warning a salvage restore needs",
@@ -244,13 +252,21 @@ async function main() {
     rmSync(join(hub, "late.txt"), { force: true });
     await callFrom(hub);
     expect("C1: a second, DISTINCT loss is reported", sweeps(drain()).length, 1);
-    // Same path observed → swept → observed → swept again: already reported.
+    // The anti-spam PROPERTY, stated as itself: a path that is still gone has
+    // nothing new to report, so a stream of tool calls does not re-warn.
+    await callFrom(hub);
+    expect("C2: a path that STAYS absent is not re-reported on every tool call", sweeps(drain()).length, 0);
+    // Re-authored and swept again: this is a NEW loss and it must be reported.
+    // ⛔ Pre-fix `warnedVanishedPaths` was only ever ADDED to, so once a path had
+    // been reported the dedupe was permanent per path per session and a repeat of
+    // the incident class was a silent miss (#718 review round 3, P2).
     inHub("late.txt", "same file again\n");
     await callFrom(hub);
     drain();
     rmSync(join(hub, "late.txt"), { force: true });
     await callFrom(hub);
-    expect("C2: the SAME path is never reported twice (dedupe, no banner spam)", sweeps(drain()).length, 0);
+    expect("C3: a path RE-AUTHORED then swept again IS reported (dedupe is not permanent)",
+      sweeps(drain()).length, 1);
 
     // ── D. additions are not losses ────────────────────────────────────────
     inHub("added-a.txt", "a\n");
@@ -283,6 +299,58 @@ async function main() {
     const e2 = sweeps(drain());
     delete process.env.AGENT_ALLOW_MAIN_EDITS;
     expect("E2: the env hatch suppresses the banner (documented bypass contract)", e2.length, 0);
+
+    // ── F. SET MEMBERSHIP IS NOT ABSENCE (#718 review round 3, P1) ────────
+    // The banner's payload is a RECOVERY INSTRUCTION. `git add -A` and `git
+    // commit` delete nothing — they move work into the index/HEAD — so naming
+    // those paths "now ABSENT" sends the reader to a salvage restore that
+    // re-imports stale pre-commit content into work already staged. Both rows
+    // below redden on the pre-fix code (measured against it: staging emitted
+    // "now ABSENT from the hub: docs/" and a commit emitted the same heading for
+    // every committed path).
+    pause(1600);
+    inHub("keep/notes.md", "authored\n");
+    await callFrom(hub);
+    drain();
+    pause(1600);
+    gg("add -A", hub); // `?? keep/` COLLAPSES to `A  keep/notes.md`
+    await callFrom(hub);
+    expect("F1: a staged collapse (`?? dir/` → `A  dir/f`) is a representation change, not a loss",
+      sweeps(drain()).length, 0);
+
+    // A COMMIT moves the path out of the dirty set and into HEAD. It is still on
+    // disk, so it must be reported as "still ON DISK — maybe preserved", never as
+    // ABSENT; going silent instead would hide the incident's own shape, where a
+    // `checkout -f` + `reset --hard` REVERTS a tracked edit and the file remains.
+    // The pause is load-bearing: rewriting an EXISTING root file does not move the
+    // hub root's mtime, so the signature is unchanged and only the burst window
+    // stands between this call and the `git status` that must see doc.md.
+    pause(1600);
+    write(join(hub, "doc.md"), "v3 — a session's tracked edit\n");
+    await callFrom(hub);
+    drain();
+    pause(1600);
+    gg("commit -qam sibling-wip", hub);
+    await callFrom(hub);
+    const f2 = sweeps(drain());
+    expect("F2: a committed path is reported (a REVERTED edit looks identical)", f2.length, 1);
+    const f2b = f2[0] ?? "";
+    expectTrue("F2a: …and NAMED, so a reverted edit is not lost in a silent arm", f2b.includes("doc.md"),
+      f2.length ? "doc.md not named" : "no banner");
+    expectTrue("F2b: …and the banner does NOT claim it is ABSENT from the hub (it is on disk, in HEAD)",
+      !f2b.includes("ABSENT from the hub"), "the pre-fix false claim that triggers a bad restore");
+    expectTrue("F2c: …and it says what to check instead of restoring blind",
+      f2b.includes("ON DISK") && f2b.includes("REVERTED"), "the classification is missing from the banner");
+
+    // ── G. a read-only git call in a SHARED tree never takes `.git/index.lock`
+    // The repo's own convention (scripts/bg-rescue-wip.sh:33-34, :243, :342): a
+    // plain `git status` rewrites the real index and takes `.git/index.lock`,
+    // which makes a LIVE sibling lane's next git command fail. This arm samples
+    // up to once per 1.5s from every hub-rooted session, so it is precisely the
+    // frequency that makes the collision plausible (#718 review round 3).
+    const src = readFileSync(INDEX_TS, "utf-8");
+    expectTrue("G1: the hub `git status` carries GIT_OPTIONAL_LOCKS=0",
+      /GIT_OPTIONAL_LOCKS:\s*"0"/.test(src), "the shared-tree read-only convention is missing");
   } finally {
     for (const [k, v] of savedEnv) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
     process.chdir(prevCwd);
