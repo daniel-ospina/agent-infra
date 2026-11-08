@@ -643,6 +643,113 @@ await test("U+0020-not-rejected regression: the reject-set does NOT match a plai
   ok(CHECKPOINT_WHITESPACE_REJECT.test("\u200b"), "zero-width rejected");
 });
 
+// ── #1418: the stale-branch remedy must be reachable at the gate ───────
+// The circularity: the gate requires a CLEAR token; CLEAR requires
+// not-behind (C4); not-behind requires a rebase; the gate blocked the rebase.
+// These tests pin BOTH halves — the remedy set is admitted, everything that is
+// not the remedy stays fail-closed, and no admitted command can execute
+// arbitrary code.
+section("#1418 escape — the stale-branch remedy (git fetch/rebase) is admitted");
+
+for (const cmd of [
+  "git fetch",
+  "git fetch origin",
+  "git fetch origin/main",
+  "git rebase origin/main",
+  "git rebase --continue",
+  "git rebase --abort",
+  "git rebase --skip",
+  "git status",
+  "git diff",
+  "git diff origin/main",
+  "git add src/a.ts",
+  "git add src/a.ts src/b.ts",
+  "git add .",
+]) {
+  await test(`ALLOWED (remedy): ${cmd}`, () => {
+    const r = validateToolCall("bash", cmd, checkpointStep(), "gate");
+    ok(!r.block, `remedy command must not be blocked: ${r.reason}`);
+  });
+}
+
+for (const cmd of [
+  "git push",
+  "git commit -m x",
+  "git merge origin/main",
+  "git checkout main",
+  "git reset --hard origin/main",
+  "git clean -fd",
+  "git stash",
+  "git submodule update --init",
+  "git rebase HEAD~2",
+  "git status --porcelain",
+  "git add -A",
+  "git add --all",
+  "git rebase --exec bash -c x",
+  "git rebase -x id",
+  "git fetch --upload-pack=evil",
+  "git -c core.pager=evil rebase origin/main",
+  "git rebase origin/main && rm -rf /",
+  "git fetch; rm -rf /",
+  "git fetch && parallel_work_check.sh plan",
+  "git rebase origin/main\nrm -rf /",
+  "git rebase\torigin/main",
+  "cd /tmp && git rebase origin/main",
+]) {
+  await test(`BLOCKED (not the remedy / code-exec vector): ${cmd.replace(/\n/g, "\\n").replace(/\t/g, "\\t")}`, () => {
+    ok(validateToolCall("bash", cmd, checkpointStep(), "gate").block);
+  });
+}
+
+await test("#1418 the remedy is NOT phase-gated (a git command carries no phase — the wrong-phase guard must not fire)", () => {
+  const step = makeStep({ name: "check", gate: "checkpoint", token_phase: "implement" });
+  const r = validateToolCall("bash", "git rebase origin/main", step, "gate");
+  ok(!r.block, "remedy allowed regardless of the step's token_phase");
+  ok(!(r.reason || "").includes("would write phase"), "the wrong-phase guard did not fire on a git command");
+});
+
+await test("#1418 the full stale-branch loop closes at ONE pending checkpoint: STALE → fetch/rebase → checker → CLEAR", () => {
+  _setTokenFileForTest(null); // pending: no token at all (exactly what a STALE verdict leaves)
+  const step = makeStep({ name: "check", gate: "checkpoint", token_phase: "implement" });
+  const loop = [
+    "parallel_work_check.sh implement", // C4: STALE behind-origin → writes NO token
+    "git fetch",                        // remedy step 1
+    "git rebase origin/main",           // remedy step 2
+    "parallel_work_check.sh implement", // C4 now CLEAR → token written
+  ];
+  for (const cmd of loop) {
+    const r = validateToolCall("bash", cmd, step, "gate");
+    ok(!r.block, `step of the remediation loop must be reachable: ${cmd} — ${r.reason}`);
+  }
+});
+
+await test("#1418 at an ALREADY-ok checkpoint the remedy proceeds (not the checker-fresh guard)", () => {
+  try {
+    _setRepoForTest(TEST_REPO);
+    writeToken(new Date().toISOString(), { phase: "plan" });
+    const r = validateToolCall("bash", "git fetch", checkpointStep(), "gate");
+    ok(!r.block, "a git fetch is not a checker re-run — the token_fresh guard must not fire");
+  } finally { _setTokenFileForTest(null); _setRepoForTest(null); }
+});
+
+await test("#1418 the audit's allowed list names bash (the contract says bash IS usable at the gate)", () => {
+  const allow = getExpectedToolsForStep(checkpointStep()).allow;
+  ok(allow.includes("read") && allow.includes("loop_enforcer"), "escape tools present");
+  ok(allow.includes("bash"), "bash present — a stranded lane reading the audit must see the checker reachable");
+});
+
+await test("#1418 guidance names the STALE remedy concretely (no placeholder, escape-conformant)", () => {
+  _setTokenFileForTest(null);
+  const g = gateGuidance(checkpointStep(), "gate");
+  ok(g.includes("STALE"), "names the STALE verdict");
+  ok(g.includes("git fetch") && g.includes("git rebase origin/main"), "names fetch + rebase concretely");
+  for (const cmd of ["git fetch", "git rebase origin/main"]) {
+    ok(isCheckpointEscape("bash", cmd), `${cmd} named in guidance passes the escape check`);
+  }
+  ok(!g.includes("$"), "no $VAR — the escape regex rejects $");
+  ok(!g.includes("<") && !g.includes(">"), "no placeholder brackets — < > fail the escape");
+});
+
 await test("malformed bash events → fail-closed BLOCK, no throw (input:{} / undefined / 42 / null)", () => {
   const step = checkpointStep();
   // handler converts nullish → "" before validateToolCall (?? ""); 42 passes

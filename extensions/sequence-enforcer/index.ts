@@ -1276,14 +1276,53 @@ const CHECKPOINT_ESCAPE_RE = new RegExp(
 // Plain U+0020 must NOT match (regression-pinned).
 export const CHECKPOINT_WHITESPACE_REJECT = /[^\S\u0020]|[\u200B-\u200D\u2060\u0085]/u;
 
+// #1418: THE GATE MUST NEVER BLOCK THE REMEDY ITS OWN VERDICT PRESCRIBES.
+// The checker writes its PASS token ONLY on a CLEAR verdict, and C4 reports
+// `STALE behind-origin by N commit(s) options=rebase` on any branch main has
+// moved past — the normal state of a lane on an active repo. Before this
+// escape, that state was a closed loop: the gate required CLEAR, CLEAR
+// required not-behind, not-behind required a rebase, and the rebase was
+// blocked. Every stale branch escalated to a human; the lane's only other
+// exit was the end of its turn.
+//
+// The remedy set is POSITIVELY bounded to what the checker's own verdicts
+// prescribe — it is not a general widening of the hatch:
+//   * `git fetch` / `git status` / `git diff` — read-only (fetch moves remote
+//     refs only; it is what makes `behind` measurable in the first place).
+//   * `git rebase <ref>` + `--continue|--abort|--skip` — C4/C3 prescribes
+//     `rebase` verbatim (`options=rebase`); the three continuation flags are
+//     what finishes or unwinds a rebase that hit a conflict (without them the
+//     lane is stranded mid-rebase — the same circle, one level deeper).
+//   * `git add PATHS` — needed to stage a conflict resolution before
+//     `git rebase --continue`. Index-only; `git commit` stays blocked, so this
+//     can never land anything.
+// NONE of these can advance the step: only a fresh phase-correct CLEAR token
+// can, and no admitted command can forge one. Value classes are the same
+// safe set the checker escape uses and reject a LEADING `-`, which is what
+// keeps the flags that execute arbitrary commands out (`git rebase --exec`,
+// `git fetch --upload-pack=…`, `git -c core.pager=…`), plus every shell
+// metacharacter. The whitespace pre-check above is shared, so tabs, newlines
+// and zero-width characters are rejected identically.
+const _REF = "[A-Za-z0-9_./@+:][A-Za-z0-9_./@:+-]*";
+const _PATH = "[A-Za-z0-9_./@+][A-Za-z0-9_./@:+-]*";
+export const CHECKPOINT_REMEDY_RE = new RegExp(
+  "^git[ ]+(?:" +
+    `(?:fetch|status|diff)(?:[ ]+${_REF})?` +
+    `|rebase[ ]+${_REF}` +
+    "|rebase[ ]+--(?:continue|abort|skip)" +
+    `|add[ ]+${_PATH}(?:[ ]+${_PATH})*` +
+  ")$",
+);
+
 // #357 (d): non-bash escape tools + bash sole-command checker. Malformed bash
 // input (non-string/missing command) is NOT the escape (fail-closed).
+// #1418: + the stale-branch remedy set (see CHECKPOINT_REMEDY_RE above).
 export function isCheckpointEscape(toolName: string, command: unknown): boolean {
   if (toolName === "read" || toolName === "loop_enforcer") return true;
   if (toolName !== "bash") return false;
   if (typeof command !== "string") return false;
   if (CHECKPOINT_WHITESPACE_REJECT.test(command)) return false;
-  return CHECKPOINT_ESCAPE_RE.test(command);
+  return CHECKPOINT_ESCAPE_RE.test(command) || CHECKPOINT_REMEDY_RE.test(command);
 }
 
 // #357 (Task 7): extract the checker's phase argument (the first positional arg
@@ -1900,7 +1939,8 @@ export function gateGuidance(step: Step, mode: Mode = "gate"): string {
     const resolvedBin = bin || (infraPath && join(infraPath, "scripts", "parallel_work_check.sh"));
     if (!resolvedBin) {
       return `→ To proceed: set AGENT_INFRA_PATH (a required prerequisite per AGENTS.md), then run \`…/scripts/parallel_work_check.sh ${requiredPhase}\` until the verdict is CLEAR (writes the PASS token).
-→ Escape tools available: read, loop_enforcer
+→ If the checker reports STALE (behind origin/main), clear it first: \`git fetch\` then \`git rebase origin/main\`, then re-run the checker.
+→ Escape tools available: read, loop_enforcer, and bash for the checker invocation or the stale-branch remedy (git fetch, git status, git diff, git rebase, git add)
 → If the check cannot CLEAR in this environment, the checkpoint is unpassable — end your turn and report`;
     }
     // #383 (Task 3) State-1: ENFORCE-prefix emission for the start phase (C1 is
@@ -1917,7 +1957,8 @@ export function gateGuidance(step: Step, mode: Mode = "gate"): string {
       ? " (note: the resolved path does not exist — check PARALLEL_CHECK_BIN / AGENT_INFRA_PATH)"
       : "";
     return `→ To proceed: run \`${enforcePrefix}${resolvedBin} ${requiredPhase}\`${ghostHint} until the verdict is CLEAR (writes the PASS token).
-→ Escape tools available: read, loop_enforcer
+→ If the checker reports STALE (behind origin/main), clear it first: \`git fetch\` then \`git rebase origin/main\`, then re-run the checker.
+→ Escape tools available: read, loop_enforcer, and bash for the checker invocation or the stale-branch remedy (git fetch, git status, git diff, git rebase, git add)
 → If the check cannot CLEAR in this environment, the checkpoint is unpassable — end your turn and report`;
   }
   const { allow } = getExpectedToolsForStep(step);
@@ -1976,10 +2017,16 @@ export function getExpectedToolsForStep(step: Step): { allow: string[]; block: R
   }
   // checkpoint (issue #5039): token-gated — validateToolCall blocks everything
   // until a fresh phase-correct CLEAR token exists, EXCEPT the #357 (d) escape
-  // (read/loop_enforcer/sole-command checker). The allow list here mirrors the
-  // escape so audit entries reflect what an agent may actually use at the gate.
+  // (read/loop_enforcer/sole-command checker) plus the #1418 stale-branch
+  // remedy set (git fetch/status/diff/rebase/add). The allow list here mirrors
+  // the escape so audit entries reflect what an agent may actually use at the
+  // gate — it names the TOOLS reachable, and the `hint` field spells out the
+  // per-tool constraint (the same shape the verifier gate uses for `task`).
+  // Omitting `bash` here meant the audit told a stranded lane that only
+  // read+loop_enforcer were usable while the checker invocation it was being
+  // told to run was in fact permitted (#1418 comment thread).
   if (gate === "checkpoint") {
-    return { allow: ["read", "loop_enforcer"], block: [] };
+    return { allow: ["read", "loop_enforcer", "bash"], block: [] };
   }
   // No gate or unknown — standard work phase. Block destructive ops.
   return { allow: [], block: [GIT_OP, DESTRUCTIVE_MCP] };
@@ -2088,7 +2135,11 @@ export function validateToolCall(
       // a checker bash whose phase ≠ this step's token_phase would write a
       // token that can NEVER satisfy this checkpoint → block with guidance
       // (prevents the wrong-phase strand at a pending checkpoint).
-      if (toolName === "bash" && typeof command === "string") {
+      // #1418: only a CHECKER command carries a phase. A remedy command
+      // (`git fetch`) would otherwise yield the bogus phase "fetch" and be
+      // refused by the wrong-phase guard — reinstating the very block this
+      // escape exists to remove.
+      if (toolName === "bash" && typeof command === "string" && CHECKPOINT_ESCAPE_RE.test(command)) {
         const phase = checkpointEscapePhase(command);
         if (phase !== null && step.token_phase && phase !== step.token_phase) {
           return { block: true, reason: `⛔ checkpoint gate — step "${step.name}" requires phase "${step.token_phase}" but the checker would write phase "${phase}" — run \`parallel_work_check ${step.token_phase}\` instead` };
