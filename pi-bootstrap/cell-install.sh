@@ -222,9 +222,15 @@ if [ -n "$_SELF" ]; then SELF_DIR="$(cd "$(dirname "$_SELF")" && pwd)"; fi
 # pointed at. The rule and its precedence live in `scripts/lib/cell-home.sh`; a missing resolver falls
 # back to `$HOME` (the one home on a compliant cell), NEVER to the legacy path.
 CELL_HOME_LIB=""
-for _cand in "$SELF_DIR/../scripts/lib/cell-home.sh" "$SELF_DIR/lib/cell-home.sh"; do
-  [ -r "$_cand" ] && { CELL_HOME_LIB="$_cand"; break; }
-done
+# ⛔ WITHOUT A SELF PATH THERE IS NO SIBLING TO TRUST (review F6 round 5): with `SELF_DIR` empty these
+# candidates were `/../scripts/lib/cell-home.sh` and `/lib/cell-home.sh` — absolute paths OUTSIDE any
+# checkout. 11 of the other 13 consumer blocks already nest the loop inside the self-path guard; this one
+# (and `scripts/harness-up`) did not. A piped start now takes the documented `$HOME` fallback instead.
+if [ -n "$SELF_DIR" ]; then
+  for _cand in "$SELF_DIR/../scripts/lib/cell-home.sh" "$SELF_DIR/lib/cell-home.sh"; do
+    [ -r "$_cand" ] && { CELL_HOME_LIB="$_cand"; break; }
+  done
+fi
 if [ -n "$CELL_HOME_LIB" ]; then . "$CELL_HOME_LIB"; CELL_HOME="$(cell_home_resolve)"; else CELL_HOME="${CELL_HOME:-${HOME:-}}"; fi
 # ⛔ AN EMPTY CELL_HOME IS NOT A HOME — it is the FILESYSTEM ROOT (`O=/orchestrator`,
 # `SCRIPTS=/.pi/agent/scripts`, a layer installed at `/.pi/agent`). A missing resolver is the

@@ -170,12 +170,19 @@ warn_line() { printf 'WARN %s\n' "$*"; }
 volatile_home_assignments() {
   local f="$1"
   [ -r "$f" ] || return 0
-  awk -v dur="$HOME_DURABLE" -v vol="$CELL_HOME_VOLATILE_ROOTS" '
+  awk -v dur="$HOME_DURABLE" -v vol="$CELL_HOME_VOLATILE_ROOTS" -v leg="$HOME_LEGACY" '
     BEGIN { n = split(vol, roots, ":") }
     {
       line = $0
       if (line ~ /^[[:space:]]*#/) next
-      if (!match(line, /^[[:space:]]*(export[[:space:]]+)?(HOME|CELL_HOME)=/)) next
+      # ⛔ GRADE BY VALUE, NOT ONLY BY THE TWO NAMES (review F3 round 5). `HOME`/`CELL_HOME` are not the
+      # only assignments that re-select the home: the fleet sources its credential THROUGH `ENV_FILE`
+      # (`orchestrator-harness/lane-env.sh`, `cloud-cell-supervisor.sh`, `install-repair-service.sh`), so
+      # a durable `keys.env` carrying `ENV_FILE=<legacy>/keys.env` re-installs the split from inside the
+      # file this migration installed — and the name allow-list read it as "one home" on the number that
+      # authorises the reclaim. The rule this file already states about populations applies here too: a
+      # per-name list always lags the fleet.
+      if (!match(line, /^[[:space:]]*(export[[:space:]]+)?[A-Za-z_][A-Za-z0-9_]*=/)) next
       name = substr(line, RSTART, RLENGTH)
       sub(/^[[:space:]]*(export[[:space:]]+)?/, "", name)
       sub(/=$/, "", name)
@@ -184,6 +191,10 @@ volatile_home_assignments() {
       gsub(/^["\047]/, "", val); gsub(/["\047]$/, "", val)
       if (val == "" || val == dur) next
       if (substr(val, 1, 1) != "/") next
+      # (a) ANY name whose value points INTO the legacy home is the split, whatever it is called.
+      if (leg != "" && (val == leg || index(val, leg "/") == 1)) { if (!seen[name]++) print name; next }
+      # (b) HOME/CELL_HOME additionally catch any other VOLATILE root (they decide the home itself).
+      if (name != "HOME" && name != "CELL_HOME") next
       for (i = 1; i <= n; i++) {
         r = roots[i]
         if (r == "") continue
@@ -250,6 +261,30 @@ durable_state() {
 # and the cell account then cannot read the credential this tool exists to make readable (review F7).
 owner_of() {
   stat -c '%u:%g' "$1" 2>/dev/null || stat -f '%u:%g' "$1" 2>/dev/null || printf ''
+}
+
+# make_owned_dir <dir> — `mkdir -p`, and (as root) re-own EVERY level this call CREATED. ⛔ `mkdir -p`
+# can create several components; re-owning only the leaf left `<durable>/.pi` as `root:root 0700` with an
+# owned credential inside it, unreachable for the cell account, while the run printed "one home" (review
+# F1 round 5). `chown` on a level that already existed is deliberately NOT done: the operator's own
+# directories are not this tool's to re-own.
+make_owned_dir() {
+  local target="$1" d created=""
+  [ -n "$target" ] || return 1
+  d="$target"
+  while [ -n "$d" ] && [ "$d" != "/" ] && [ ! -d "$d" ]; do created="$d${created:+
+}$created"; d="$(dirname "$d")"; done
+  mkdir -p "$target" 2>/dev/null || return 1
+  [ "$INVOKER_UID" = 0 ] || return 0
+  [ -n "${DUR_OWNER:-}" ] || return 0
+  [ -n "$created" ] || return 0
+  while IFS= read -r d; do
+    [ -n "$d" ] || continue
+    chown "$DUR_OWNER" "$d" 2>/dev/null || return 3
+  done <<EOF
+$created
+EOF
+  return 0
 }
 
 # probe_open <file> — 0 iff this account can actually OPEN the file. ⛔ A REAL OPEN, NOT `[ -r ]`:
@@ -437,17 +472,13 @@ migrate_credentials() {
           rc=1; continue
         fi ;;
     esac
-    mkdir -p "$(dirname "$f_dur")" 2>/dev/null || { warn_line "  cannot create $(dirname "$f_dur") — $rel NOT copied"; rc=1; continue; }
-    # ⛔ A DIRECTORY THIS ROOT RUN CREATED MUST ALSO BELONG TO THE CELL ACCOUNT, or the credential inside
-    # it is unreadable for the same reason — and the FAILURE IS REPORTED, exactly like the file's own
-    # chown below (review F3 round 4). `|| true` here said "the guard exists" and then discarded its only
-    # signal: a root run under `umask 077` leaves `root:root 0700`, the cell account cannot traverse to
-    # the credential, and the run printed "one home".
-    if [ "$INVOKER_UID" = 0 ] && [ -n "${DUR_OWNER:-}" ]; then
-      if ! chown "$DUR_OWNER" "$(dirname "$f_dur")" 2>/dev/null; then
-        warn_line "  $rel: the directory $(dirname "$f_dur") could NOT be re-owned to $DUR_OWNER — $INVOKER's account may not be able to traverse to the credential"
-        rc=1
-      fi
+    # ⛔ `mkdir -p` CAN CREATE SEVERAL LEVELS AND ONLY THE LEAF WAS RE-OWNED (review F1 round 5): a root
+    # run under `umask 077` left `<durable>/.pi` as `root:root 0700` with a correctly-owned
+    # `.pi/agent/auth.json` inside — the cell account cannot traverse to it — and the run printed
+    # "one home". `make_owned_dir` records which levels it created and re-owns each one.
+    if ! make_owned_dir "$(dirname "$f_dur")"; then
+      warn_line "  cannot create or own $(dirname "$f_dur") — $rel NOT copied"
+      rc=1; continue
     fi
     # `install` copies bytes without ever putting them in this process's stdout; -m sets the mode in
     # the same syscall, so the file is never momentarily world-readable.
@@ -500,13 +531,36 @@ is_comment() {
   return 1
 }
 
-# paths_in <line> — every absolute path token in a directive line. The separator set is `=`, whitespace,
-# quotes, `,`, `;` AND `:` — a `:` because `Environment=PATH=/a/bin:/usr/bin` is a PATH LIST and each
-# element has to be checked on its own: measured while writing this suite, a `:`-less split produced one
-# token `/home/cmux/.local/bin:/usr/bin:/bin` that exists as nothing, so EVERY unit carrying a PATH (i.e.
-# every real unit) was refused with a "missing target" nobody could explain. Prints one per line.
+# paths_in <line> — every absolute path token in a directive line, as "<need>\t<path>".
+# ⛔ THE SEPARATOR SET IS THE PROJECTOR'S TOKEN-START SET (review F2 round 5): `=`, whitespace, quotes,
+# `,`, `;`, `:` and the shell metacharacters `>`, `<`, `|`, `&`, `(`. A `:` matters because
+# `Environment=PATH=/a/bin:/usr/bin` is a PATH LIST (measured: a `:`-less split produced one token that
+# exists as nothing, so EVERY real unit was refused). The metacharacters matter because the projector now
+# MOVES `>>$LEG/log` — and without them here the token did not start with `/`, was filtered out, the
+# `miss` list stayed empty, and `--apply` wrote a unit whose target does not exist (rule 4).
+# ⛔ AND A REDIRECT TARGET IS NOT AN EXECUTABLE: `>`, `<` mark a path the SHELL creates, so what must
+# exist is its PARENT DIRECTORY (`need=2`), not the file. Requiring the file refused every real redirect;
+# requiring nothing would write a unit that cannot start. A `|` / `(` target IS a command (`need=1`).
 paths_in() {
-  printf '%s' "$1" | tr ' \t"\047;,=:' '\n' | awk '/^\// && !s[$0]++'
+  printf '%s' "$1" | awk '
+    BEGIN { seps = " \t\"\047;,=:|&<>()" }
+    {
+      line = $0; cur = ""; prev = ""
+      for (i = 1; i <= length(line); i++) {
+        c = substr(line, i, 1)
+        if (index(seps, c) > 0) {
+          if (cur != "") { emit(prev, cur); cur = "" }
+          prev = c
+        } else { cur = cur c }
+      }
+      if (cur != "") emit(prev, cur)
+    }
+    function emit(sep, tok,   need) {
+      if (substr(tok, 1, 1) != "/") return
+      if (sep == ">" || sep == "<") need = 2
+      else need = 1
+      if (!seen[tok]++) printf "%d\t%s\n", need, tok
+    }'
 }
 
 # unit_scan <file> — one record per DIRECTIVE line that carries the legacy home:
@@ -636,11 +690,14 @@ unit_scan() {
     fi
     case "$stripped" in *\\ ) cont="$dir" ;; *) cont="" ;; esac
     miss=""
-    while IFS= read -r p; do
+    while IFS='	' read -r _need p; do
       [ -n "$p" ] || continue
       case "$p" in *'$'*|*'{'*|*'%'*) continue ;; esac   # systemd specifiers are not resolved here
       case "$p" in "$HOME_DURABLE"|"$HOME_DURABLE"/*) ;; *) continue ;; esac   # only what WE introduce
-      [ -e "$p" ] || miss="$miss $p"
+      case "$_need" in
+        2) [ -d "$(dirname "$p")" ] || miss="$miss $p" ;;   # a redirect target: its DIRECTORY must exist
+        *) [ -e "$p" ] || miss="$miss $p" ;;                # a command/binary/path: it must exist
+      esac
     done <<EOF
 $(paths_in "$projected")
 EOF
@@ -781,11 +838,22 @@ legacy_home_advisory() {
     # ⛔ A GRADED CREDENTIAL IS NOT "NOT GRADED" (review F5): the credentials section above already
     # measured it. Matched by ITERATING the list (newline-separated), not with a `case` on the raw value —
     # and by first component too, so `.pi` (which holds the graded `.pi/agent/auth.json`) is not libelled.
-    _graded=0
+    # ⛔ EXACT NAMES ONLY (review F4 round 5): a prefix match dropped `.pi` and `.config` ENTIRELY, so
+    # whatever else lives beside the graded credential (`sessions/`, editor backups) was neither graded nor
+    # surfaced — an omission on the one report an operator reads before `rm -rf`. A first component that
+    # CONTAINS graded children is reported as partially graded instead of being swallowed.
+    _graded=0; _partial=0
     for _c in $CRED_FILES; do
-      case "$_c" in "$name"|"$name"/*) _graded=1; break ;; esac
+      case "$_c" in
+        "$name") _graded=1; break ;;
+        "$name"/*) _partial=1 ;;
+      esac
     done
     [ "$_graded" = 1 ] && continue
+    if [ "$_partial" = 1 ]; then
+      printf 'ADVISORY %s\n' "  PARTIALLY graded — inspect the rest: $HOME_LEGACY/$name"
+      continue
+    fi
     printf 'ADVISORY %s\n' "  present in the legacy home and NOT graded by this tool (review before reclaiming): $HOME_LEGACY/$name"
   done
 }

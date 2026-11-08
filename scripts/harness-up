@@ -590,9 +590,14 @@ esac
 # the farm (`pi-bootstrap/setup.sh`'s `lib_srcs`), and a copy without it falls back to `$HOME` (the
 # one home on a compliant cell) — never the legacy path.
 CELL_HOME_LIB=""
-for _cand in "$SELF_PATH/lib/cell-home.sh" "$SELF_PATH/../lib/cell-home.sh"; do
-  [ -r "$_cand" ] && { CELL_HOME_LIB="$_cand"; break; }
-done
+# ⛔ WITHOUT A SELF PATH THERE IS NO SIBLING TO TRUST (review F6 round 5): an empty `SELF_PATH` built
+# `/lib/cell-home.sh` and `/../lib/cell-home.sh` — absolute paths outside any checkout. Nested inside the
+# guard, like the 11 sibling consumers, so a piped start takes the documented `$HOME` fallback.
+if [ -n "${SELF_PATH:-}" ]; then
+  for _cand in "$SELF_PATH/lib/cell-home.sh" "$SELF_PATH/../lib/cell-home.sh"; do
+    [ -r "$_cand" ] && { CELL_HOME_LIB="$_cand"; break; }
+  done
+fi
 if [ -n "$CELL_HOME_LIB" ]; then . "$CELL_HOME_LIB"; CELL_HOME="$(cell_home_resolve)"; else CELL_HOME="${CELL_HOME:-${HOME:-}}"; fi
 [ -n "$CELL_HOME" ] || die "neither CELL_HOME nor HOME is set, so the cell home cannot be derived — refusing to default it to the legacy /tmp/cell-home (agent-infra#3453)" 2
 O="${A_O:-${O:-}}"

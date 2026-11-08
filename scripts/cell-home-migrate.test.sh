@@ -841,6 +841,58 @@ else
 fi
 chmod 755 "$LEG" 2>/dev/null
 
+# ── F1/F5 (round 5): EVERY level `mkdir -p` created must be re-owned, and the failure is asserted ────
+# A `chown` stub that fails only for DIRECTORIES, plus the root stub, so the directory leg is the only
+# thing that can fail. The nested `.pi/agent` chain does not exist, so `mkdir -p` creates BOTH levels and
+# the invariant is that neither is left root-owned while the run still says "copied …".
+STUBCHD="$T/stubchowndir"; mkdir -p "$STUBCHD"
+printf '#!/bin/sh\nfor a in "$@"; do case "$a" in -*) ;; *) [ -d "$a" ] && exit 1 ;; esac; done\nexit 0\n' >"$STUBCHD/chown"
+chmod +x "$STUBCHD/chown"
+mk_box "$T/nest"
+rm -rf "$DUR/.pi"                                   # so the chain is CREATED by the copy
+_out="$(env CELL_HOME="$DUR" CELL_HOME_LEGACY="$LEG" CELL_HOME_MIGRATE_UNIT_DIRS="$UNITS" \
+        CELL_HOME_MIGRATE_NO_RELOAD=1 CELL_HOME_MIGRATE_FORCE_OWNER="4242:4242" \
+        PATH="$STUBCHD:$STUBROOT:$PATH" bash "$TOOL" --apply 2>&1)"; _rc=$?
+[ "$_rc" = 1 ] && ok "k35 a directory level this run created but could not re-own is a FAILURE (rc 1, not a silent 'one home')" \
+  || bad "k35 a root run left an un-ownable credential directory behind and reported rc $_rc"
+case "$_out" in *"cannot create or own"*) ok "k35b …naming the directory it could not take ownership of" ;; *) bad "k35b the ownership failure of a created directory is not reported" ;; esac
+
+# ── F2 (round 5): the EXISTENCE GUARD sees the same tokens the projector moves ───────────────────
+# `>`, `<`, `|`, `&`, `(` are token starts to the projector, so `>>$LEG/log` IS a path the writer moves.
+# `paths_in` did not split on them, the token did not start with `/`, the `miss` list stayed EMPTY — and
+# `--apply` wrote a unit whose redirect target does not exist (rule 4: never write a unit that would not
+# run; systemd fails a unit whose unprefixed ExecStartPost fails).
+mk_box "$T/redir"; rm -rf "$DUR/logs"
+printf '[Service]\nEnvironment=HOME=%s\nExecStartPost=/bin/sh -c "echo x >>%s/logs/run.log"\n' "$LEG" "$LEG" >"$UNITS/redir.service"
+_out="$(run_tool "$TOOL" --apply)"; _rc=$?
+[ "$_rc" = 1 ] && ok "k36 --apply REFUSES a redirect target whose durable counterpart does not exist (rc 1)" \
+  || bad "k36 the unit was written with a missing redirect target (rc $_rc) — rule 4 violated"
+case "$(cat "$UNITS/redir.service")" in
+  *"$LEG/logs"*) ok "k36b …and the original file is left untouched" ;;
+  *) bad "k36b the unit was half-written with a nonexistent target" ;;
+esac
+mkdir -p "$DUR/logs"
+run_tool "$TOOL" --apply >/dev/null 2>&1; _rc=$?
+[ "$_rc" = 0 ] && ok "k36c …while the same unit converges once the target EXISTS (the refusal is about the target, not the shape)" \
+  || bad "k36c the same unit was still refused with the target present (rc $_rc)"
+
+# ── F3 (round 5): content grading is by VALUE, not only by the HOME/CELL_HOME names ──────────────
+# The fleet sources its credential THROUGH `ENV_FILE` (`lane-env.sh`, `cloud-cell-supervisor.sh`,
+# `install-repair-service.sh`), so a durable `keys.env` naming the legacy home in `ENV_FILE` re-installs
+# the split from inside the file this migration installed.
+mk_box "$T/envfile"
+printf 'export HOME=%s\nENV_FILE=%s/keys.env\n' "$DUR" "$LEG" >"$DUR/keys.env"
+_out="$(run_tool "$TOOL" --check)"; _rc=$?
+[ "$_rc" = 1 ] && ok "k37 a durable keys.env whose ENV_FILE names the legacy home is DRIFT (CHECK 1, not a false one home)" \
+  || bad "k37 an ENV_FILE pointing at the legacy home read as converged (rc $_rc)"
+case "$_out" in *"ASSIGNS ENV_FILE"*) ok "k37b …and the report names ENV_FILE" ;; *) bad "k37b the assignment is not named" ;; esac
+
+# ── F4 (round 5): a partially-graded directory is SURFACED, not swallowed ────────────────────────
+mk_box "$T/part"; run_tool "$TOOL" --apply >/dev/null 2>&1
+mkdir -p "$LEG/.pi/agent/sessions"; printf 'x\n' >"$LEG/.pi/agent/sessions/s1.json"
+_out="$(run_tool "$TOOL" --check)"
+case "$_out" in *"PARTIALLY graded"*".pi"*) ok "k38 a directory holding a graded credential AND ungraded content is reported PARTIALLY graded" ;; *) bad "k38 the partially-graded directory is silently dropped from the advisory" ;; esac
+
 # mut_sub <src> <dst> <function> <old-substring> <new> — replace ONE substring on the FIRST line of ONE
 # function that carries it. Scoped by function because several guards share a spelling; a control whose
 # mutation cannot be applied must fail loudly rather than silently grade the unmutated tool.
@@ -1353,6 +1405,51 @@ else
     case "$_out23" in *"CANNOT LIST"*) bad "g23 the mutant still stated it could not list" ;; *) ok "g23 WITHOUT the failed-listing line silence reads as 'nothing ungraded' — k34b measures it" ;; esac
   fi
   chmod 755 "$LEG" 2>/dev/null
+fi
+
+# g24: revert the per-level directory ownership (round-5 F1) and k35 must redden — the created chain stays
+# root-owned while the run reports success.
+mkdir -p "$T/mutdir24/lib"; cp "$HERE/lib/cell-home.sh" "$T/mutdir24/lib/cell-home.sh"
+MUT24="$T/mutdir24/cell-home-migrate.sh"
+mut_sub "$TOOL" "$MUT24" make_owned_dir 'chown "$DUR_OWNER" "$d" 2>/dev/null || return 3' ':'
+if cmp -s "$TOOL" "$MUT24"; then
+  bad "g24 the directory-ownership mutation could not be applied — k35 is not checking it"
+else
+  mk_box "$T/g24"; rm -rf "$DUR/.pi"
+  env CELL_HOME="$DUR" CELL_HOME_LEGACY="$LEG" CELL_HOME_MIGRATE_UNIT_DIRS="$UNITS" \
+      CELL_HOME_MIGRATE_NO_RELOAD=1 CELL_HOME_MIGRATE_FORCE_OWNER="4242:4242" \
+      PATH="$STUBCHD:$STUBROOT:$PATH" bash "$MUT24" --apply >/dev/null 2>&1; _m24rc=$?
+  [ "$_m24rc" = 0 ] && ok "g24 WITHOUT the per-level chown the run reports success (rc 0) — k35 measures it" \
+    || bad "g24 the mutant still failed (rc $_m24rc) — k35 is not attributable to the per-level chown"
+fi
+
+# g25: drop the metacharacter separators from paths_in (round-5 F2) and k36 must redden — the redirect
+# target is then never checked and the unit is written.
+MUT25="$T/mutdir24/cell-home-migrate-paths.sh"
+# (the mutation is on the need CLASS, because `awk -v` eats the backslash escapes in the separator set)
+mut_sub "$TOOL" "$MUT25" paths_in 'if (sep == ">" || sep == "<") need = 2' 'if (sep == ">" || sep == "<") need = 1'
+if cmp -s "$TOOL" "$MUT25"; then
+  bad "g25 the paths_in mutation could not be applied — k36 is not checking it"
+else
+  mk_box "$T/g25"; mkdir -p "$DUR/logs"          # the DIRECTORY exists; the log FILE does not (normal)
+  printf '[Service]\nEnvironment=HOME=%s\nExecStartPost=/bin/sh -c "echo x >>%s/logs/run.log"\n' "$LEG" "$LEG" >"$UNITS/redir.service"
+  run_tool "$MUT25" --apply >/dev/null 2>&1; _m25rc=$?
+  [ "$_m25rc" != 0 ] && ok "g25 WITHOUT the redirect-target class a normal redirect target is refused as 'missing' (rc $_m25rc) — k36c measures it" \
+    || bad "g25 the mutant converged anyway — k36c is not measuring the need class"
+fi
+
+# g26: narrow the content leg back to the HOME/CELL_HOME names (round-5 F3) and k37 must redden.
+MUT26="$T/mutdir24/cell-home-migrate-names.sh"
+mut_sub "$TOOL" "$MUT26" volatile_home_assignments 'if (leg != "" && (val == leg || index(val, leg "/") == 1))' 'if (0 && (val == leg || index(val, leg "/") == 1))'
+if cmp -s "$TOOL" "$MUT26"; then
+  bad "g26 the content-leg mutation could not be applied — k37 is not checking it"
+else
+  mk_box "$T/g26"
+  run_tool "$TOOL" --apply >/dev/null 2>&1              # converge first, so only ENV_FILE can drift
+  printf 'export HOME=%s\nENV_FILE=%s/keys.env\n' "$DUR" "$LEG" >"$DUR/keys.env"
+  run_tool "$MUT26" --check >/dev/null 2>&1; _m26rc=$?
+  [ "$_m26rc" = 0 ] && ok "g26 WITHOUT value grading an ENV_FILE pointing at the legacy home reads 'one home' (0) — k37 measures it" \
+    || bad "g26 the mutant still reported drift (rc $_m26rc) — k37 is not measuring value grading"
 fi
 
 printf '\n── (h) argument handling ────────────────────────────────────────────────────────────\n'
