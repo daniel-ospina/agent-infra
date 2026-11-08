@@ -368,15 +368,23 @@ recovery_guide() {
     # line and spawned the next agent — a recursive agent-spawn loop (~1 session/20 s,
     # 24 live agents, load 18) that only a kill stopped. Single quotes make the
     # backticks literal text wherever this element is read.
-    lines+=('A link whose worktree is GONE therefore DANGLES, and print-mode (`pi -p` —')
+    lines+=('A farm entry whose target does not exist DANGLES, and print-mode (`pi -p` —')
     lines+=('every `task` child and every harness lane) treats a failed extension load as FATAL,')
-    lines+=('so a reaped lane takes the whole dispatch path with it, not just this checkout.')
+    lines+=('so a dead entry takes the whole dispatch path with it, not just this checkout.')
     while IFS=$'\t' read -r n tgt br; do
       [[ -n "$n" ]] || continue
       if [[ "$br" == DANGLING ]]; then
         lines+=("  $farm_root_wt/$n -> $tgt")
-        lines+=("      DANGLING — no worktree record remains (the lane was reaped and its")
-        lines+=("      record pruned), so the extension FAILS TO LOAD. This is FATAL, not")
+        # Say only what this check KNOWS. It resolves the link and finds no target; it
+        # cannot know WHY (a reaped lane's worktree, an unmounted volume, an extension
+        # not yet installed), and this text is what decides whether the operator hunts a
+        # lane or deletes a farm entry they still want. MEASURED (review, PR #3780): the
+        # earlier wording — "no worktree record remains (the lane was reaped…)" — was
+        # printed verbatim for `farm/unrelated-tool -> /tmp/nowhere-at-all/…`, a target
+        # this hub never owned; the FAIL is right, the diagnosed CAUSE was invented.
+        lines+=("      DANGLING — the target does not exist, so the extension FAILS TO LOAD.")
+        lines+=("      If it was a lane's worktree, the record is already pruned (nothing in git")
+        lines+=("      still explains it); either way the entry must go. This is FATAL, not")
         lines+=("      cosmetic.")
       else
         lines+=("  $farm_root_wt/$n -> $tgt   (worktree branch: $br)")
@@ -386,14 +394,23 @@ recovery_guide() {
     lines+=("main, clean and current:")
     while IFS=$'\t' read -r n tgt br; do
       [[ -n "$n" ]] || continue
-      # The remedy must never CREATE the state it is repairing: `ln -s` onto a path that
-      # does not exist leaves a DANGLING link, which print-mode treats as a failed
-      # extension load — a wrong-tree link traded for a total dispatch outage. So the
-      # relink is printed only when its target really exists. Paths are %q-quoted like
-      # every other paste-ready command here (:307, :310, :313), where an unquoted path
-      # with a space was MEASURED to emit a chain that silently did nothing.
-      if [[ -d "$repo/extensions/$n" ]]; then
+      # The remedy must never CREATE the state it is repairing, in EITHER direction.
+      # (a) `ln -s` onto a path that does not exist leaves a DANGLING link — a wrong-tree
+      # link traded for a total dispatch outage. (b) `[ -d ]` FOLLOWS symlinks, so when
+      # the hub's own extensions/$n is ITSELF a link onto <worktree>/extensions/…, a
+      # relink reproduces the reported state byte for byte and the operator pastes the
+      # same command forever (MEASURED, review of PR #3780). So the relink is printed only
+      # for a real directory; a symlinked hub entry gets the removal plus the reason that
+      # has to be fixed FIRST. Paths are %q-quoted like every other paste-ready command
+      # here (:304, :310, :314), where an unquoted path with a space was MEASURED to emit
+      # a chain that silently did nothing.
+      if [[ -d "$repo/extensions/$n" && ! -L "$repo/extensions/$n" ]]; then
         lines+=("  rm -f $(printf '%q' "$farm_root_wt/$n") && ln -s $(printf '%q' "$repo/extensions/$n") $(printf '%q' "$farm_root_wt/$n")")
+      elif [[ -L "$repo/extensions/$n" ]]; then
+        lines+=("  rm -f $(printf '%q' "$farm_root_wt/$n")   # this hub's OWN extensions/$n is")
+        lines+=("  #   itself a LINK — a relink would recreate exactly the state above. Point")
+        lines+=("  #   extensions/$n at a real tree (it must not resolve into a worktree), then")
+        lines+=("  #   relink the farm entry onto it.")
       else
         lines+=("  rm -f $(printf '%q' "$farm_root_wt/$n")   # this hub has NO extensions/$n to")
         lines+=("  #   point at, so a relink here would itself dangle — the entry is removed.")

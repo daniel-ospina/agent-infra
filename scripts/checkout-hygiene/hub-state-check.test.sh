@@ -258,6 +258,25 @@ assert_contains "$out" "rm -f $FARMWT/builtin-tools && ln -s $HUB/extensions/bui
 assert_contains "$out" "PI_EXTENSIONS_DIR" "names the sanctioned route for a deliberate preview"
 assert_not_contains "$out" "$FARMWT/other-tool" "a link into ANOTHER checkout's extensions is not this hub's worktree"
 assert_not_contains "$out" "$FARMWT/hub-tool" "a link into the hub itself stays the 4b class and is not double-named here"
+# NON-CONVERGENCE: the printed remedy must not reproduce the state it is repairing.
+# `[ -d ]` FOLLOWS symlinks, so a hub whose OWN `extensions/<entry>` is itself a link into
+# the worktree would be "repointed" onto itself — byte-identical link, same FAIL, and the
+# operator pastes the same command forever (MEASURED in review of PR #3780). The relink is
+# printed only for a real directory.
+ln -s "$WTLIVE/extensions/builtin-tools" "$HUB/extensions/looped-tool"
+ln -s "$HUB/extensions/looped-tool" "$FARMWT/looped-tool"
+out="$(PI_EXTENSIONS_DIR="$FARMWT" bash "$CHECK" --repo "$HUB" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 1 "a farm link through a LINKED hub entry still exits 1"
+assert_contains "$out" "farm_worktree" "…reported under farm_worktree"
+assert_contains "$out" "worktree branch: wt/live-649" "…naming the branch behind the hub's own link"
+if grep -qF "ln -s $HUB/extensions/looped-tool" <<<"$out"; then
+  bad "the remedy must NOT relink onto a hub entry that is itself a link (that never converges)"
+else
+  ok "the remedy does not relink onto a hub entry that is itself a link"
+fi
+assert_contains "$out" "rm -f $FARMWT/looped-tool" "…it removes the farm entry and names the hub-side link to fix first"
+assert_contains "$out" "itself a LINK" "…and says WHY the relink is withheld"
+rm -f "$HUB/extensions/looped-tool" "$FARMWT/looped-tool"
 # The consequence that makes this a FAIL rather than a note: a reaped lane deletes the
 # worktree, git keeps the RECORD, the farm link DANGLES — and print-mode (`pi -p`,
 # every task child and harness lane) treats a failed extension load as FATAL (#602).
@@ -308,6 +327,22 @@ else
 fi
 assert_contains "$out" "rm -f $FARMWT/nope-tool" "…it removes the entry instead"
 rm -f "$FARMWT/nope-tool"
+# The DANGLING text must state only what the check KNOWS. It resolves the link and finds
+# no target; it cannot know WHY (a reaped lane's worktree / an unmounted volume / an
+# extension not yet installed). MEASURED in review of PR #3780: an entry pointing at a
+# path this hub NEVER owned was told "no worktree record remains (the lane was reaped …)",
+# which sends the operator hunting a lane that never existed and back-diagnoses a cause the
+# check has no evidence for. The FAIL is right; the invented cause is not.
+ln -sfn "$FIX/never-a-worktree/x" "$FARMWT/unrelated-tool"
+out="$(PI_EXTENSIONS_DIR="$FARMWT" bash "$CHECK" --repo "$HUB" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 1 "a dangling entry that was never this hub's still exits 1 (a dead farm entry is fatal)"
+if grep -qF "lane was reaped" <<<"$out"; then
+  bad "the guide must NOT diagnose a cause it cannot know (it claimed a reaped lane)"
+else
+  ok "the guide states the missing target, not an invented cause"
+fi
+assert_contains "$out" "the target does not exist" "…saying only what it actually verified"
+rm -f "$FARMWT/unrelated-tool"
 # Negative control for the class: a hub that merely HAS a worktree, which the farm does
 # not point into, is healthy — otherwise this token would red every hub with a worktree.
 ln -sfn "$HUB/extensions/builtin-tools" "$FARMWT/builtin-tools"
