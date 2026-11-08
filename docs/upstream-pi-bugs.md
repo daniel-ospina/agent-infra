@@ -1114,7 +1114,7 @@ the idle floor. That is evidence *against* a silent-session burn, but it is not 
 transcript predicate: for those 18 the silence value is **unknown, not negative**.
 So what this section records is **the CPU
 signal firing and the burn being absent from these four windows for every process
-the labelling placed outside the idle set**, not the committed two-conjunct trigger
+the labelling placed *in* the idle set**, not the committed two-conjunct trigger
 having fired. It also records, more durably, a **better predicate pair**
 (ΔCPU + `rchar`) than the 09-16 table's transcript-age predicate. And note what
 that implies for the guard: **#1127 is ΔCPU joined to #469's `.jsonl` silence**, the
@@ -1227,9 +1227,10 @@ reading.**
 - **Main thread vs workers** (the report's caveat quantified, though *not* the
   size column, which stays missing below): on the processes that were busy, the
   main thread carried **0.61–1.00** of the ΔCPU and the `V8Worker` pool
-  **0.02–0.41** — envelopes across those processes, not a single per-process split
+  **0.00–0.41** — envelopes across those processes, not a single per-process split
   and not jointly attained: each process's shares sum with its *other* threads to
-  1.00. So the burn,
+  1.00, so the process at the main-thread maximum carries no worker share, and the
+  0.61 and 0.41 ends do not belong to the same process. So the burn,
   when it exists, is main-thread JS — consistent with the render-frame mechanism
   and *not* primarily collector throughput.
 
