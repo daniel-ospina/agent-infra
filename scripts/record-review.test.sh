@@ -9739,10 +9739,22 @@ git config --unset merge.hidrv.driver 2>/dev/null || true
 # M38 — THE ORACLE NEUTRALISATION (20i6). With the box-global attributes file in place, dropping the
 #       neutralised read lets the MACHINE's `merge=union` decide the answer: the hand resolution
 #       compares equal, the range becomes merge-only, and the cover naming A is enough.
+#
+# ⛔ `XDG_CONFIG_HOME=` IS PART OF THIS CELL'S PREMISE, NOT TIDINESS (measured on a runner, #3712).
+#       git resolves the DEFAULT user-level attributes file as `$XDG_CONFIG_HOME/git/attributes`
+#       when that variable is set, and only falls back to `$HOME/.config/git/attributes` when it is
+#       not — so with an inherited value the fixture below is written somewhere git never reads,
+#       the mutant's raw `merge-tree` CONFLICTS again, and the cell refuses at 3 for a reason that
+#       has nothing to do with the guard it mutates: VACUOUS, reported against itself. The 20i6
+#       control above pins the same variable for exactly this reason; this cell must too. GitHub
+#       runners export `XDG_CONFIG_HOME=/home/runner/.config` (see
+#       `scripts/orchestrator-harness/worker-terminal.test.sh:36`), so an unpinned mutant is green
+#       on a dev box and red on CI — measured: `PASS=1453 FAIL=2`, with `20g M38` and the
+#       `MUTATION-MATRIX` rollup the two red rows and the assertion total unchanged at 1455.
 mkdir -p "$F_HOME/.config/git"
 printf 'u.txt merge=union\n' > "$F_HOME/.config/git/attributes"
 MUT="$(mk_mutant nonneutral '    want="$(delta_git_neutral "$root" merge-tree --write-tree "$p1" "$p2" 2>/dev/null)"' '    want="$(delta_git "$root" merge-tree --write-tree "$p1" "$p2" 2>/dev/null)"')"
-mut_check "M38 the neutralised oracle" 425160 "$DG_UN_H" "delta:$DG_UN_L..$DG_UN_H+comment:42516001" accepted STUB_BASE_SHA="$DG_UN_B" STUB_EVIDENCE_AT="2025-08-15T00:00:00Z"
+mut_check "M38 the neutralised oracle" 425160 "$DG_UN_H" "delta:$DG_UN_L..$DG_UN_H+comment:42516001" accepted XDG_CONFIG_HOME= STUB_BASE_SHA="$DG_UN_B" STUB_EVIDENCE_AT="2025-08-15T00:00:00Z"
 rm -f "$F_HOME/.config/git/attributes"
 # M39 — THE ATTRIBUTES-DRIFT ARM (20i7). Dropping it re-accepts a TRACKED `.gitattributes` whose
 #       worktree copy steers the oracle — the P0 the previous commit introduced by removing `-m`.
