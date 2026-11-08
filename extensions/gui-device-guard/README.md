@@ -164,7 +164,10 @@ is a thing for `open` (`open -na "Google Chrome"` is `-n -a`, getopt clustering,
 the documented "named app, new instance" idiom), every letter before the option
 letter is a bare flag, and everything after it is the argument — or the next word
 when nothing follows. The predicate is `clusterShortArg`, the same shape
-`attachedShortArg` uses for the shells. Two defects lived in the previous inline
+`attachedShortArg` uses for the shells, and it reports **which letter** took the
+argument: `-b` takes a bundle ID, so `-b com.example.app` is an identifier even
+though it ends in `.app`, while `-a`/the positional form can name a bundle and a
+trailing `.app` there is a media claim (L9f). Two defects lived in the previous inline
 copy, in opposite directions (`round 7, P1-1 and P2-4`):
 
 - it never checked that the token **starts with `-`**, so any bare `<Name>.app`
@@ -242,7 +245,7 @@ This is a residual list, not a completeness claim:
 ## Tests
 
 ```bash
-node extensions/gui-device-guard/test.mjs                    # 177 assertions, threat table L1–L25 + handler H1–H14
+node extensions/gui-device-guard/test.mjs                    # 182 assertions, threat table L1–L25 + handler H1–H15
 node extensions/gui-device-guard/test.mjs --classify 'npm exec electron .'
 ```
 
@@ -251,7 +254,7 @@ The suite loads the **real** `index.ts` through
 `tool_call` handler** — the #744/#697 lesson: a suite that imports only a helper
 stays green while `index.ts` is broken and the guard is inert in every session.
 Mutations are pinned, each attributable to the row it is about, all measured at
-ONE head: the Electron rule's `media` → `false` reds **62**; the wrapper recursion
+ONE head: the Electron rule's `media` → `false` reds **74**; the wrapper recursion
 removed reds **8**; the wrapper WORDS removed reds **2**; the structural rule that
 reads a package-runner anywhere in the segment removed reds **2** (L19h/L19i); the
 comment stripper removed reds **1** (L11d); the fail-safe word scan removed reds
@@ -265,13 +268,32 @@ refusing a getopt CLUSTER reds **2** (L23d, L23e); reading a runner's payload
 verbatim instead of by package name reds **3** (L24e–L24g); removing `bun` from the
 runner set reds **2** (L24a, L24b); dropping the `env -S`/runner `-c` command-string
 rows reds **6** (L25a–L25f); ungating the fail-safe word scan from `sawFlag` reds
-**4** (A38–A41).
+**4** (A38–A41); reverting the pre-hook's `safeLane()`/`safeCwd()` to the raw
+`laneContract()`/`process.cwd()` reds **3** (H15a–H15c, with `ENOENT uv_cwd`);
+removing the `.app` suffix from the `open` predicate reds **1** (L9f).
 
 ⛔ Deleting the `if (cwi < 0) continue;` guard does not print a red row — it makes
 the SUITE CRASH (`Cannot read properties of undefined`, from `basename(toks[-1])`),
 which is what it did in the wild: any bash call whose segment has no command word
 (`FOO=1`, `sudo` alone) threw out of the `tool_call` pre-hook and failed the lane's
 command. A25 pins it; a crash fails the row.
+
+⛔ **The pre-hook must be TOTAL, not merely correct.** `laneContract()` reaches
+`process.cwd()`, which throws `ENOENT` once the lane's worktree has been reaped;
+print mode short-circuits the guarded copy in `isUnattended()`, so the throw landed
+in the enforcement path and failed the lane's own bash call while losing both
+halves of #2249 (no block, no ledger row). `safeLane()`/`safeCwd()` make both
+total: an underivable lane is recorded as "not provably a lane", an unreadable cwd
+as `<cwd removed>`. H15's fixture proves the throw is real (chdir into a temp dir,
+delete it, `process.cwd()` throws `uv_cwd`); H15a–H15c pin the handler's answer.
+
+⛔ **`-a <bundle>.app` is the same bundle as `<bundle>.app`.** The `-a`/positional
+arms now test the `.app` SUFFIX as well as a `/`, which is what the positional arm
+and `appBundleBinary` always did — otherwise `open -a DMeer.app` was `media: false`
+(recorded, never refused, invisible to the `select(.media)` lookup) while
+`open DMeer.app` was refused. The suffix test is **not** applied to `-b`, which
+takes a bundle ID and `open -nb com.example.app` legitimately ends in `.app`;
+`open -a Safari` stays record-only. Rows L9f, with L9a/L23e as the twins.
 
 ## Runbook
 

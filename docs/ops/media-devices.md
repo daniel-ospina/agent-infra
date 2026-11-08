@@ -126,7 +126,14 @@ holding a camera-shaped character device that is **not** one of the globbed node
 is compared as a **device**, not as a path string: the target and the globbed node
 are both resolved (`python3 -c 'os.path.realpath(…)'` — not `readlink -f`, which is
 a GNU extension the portability checker rejects and which the script therefore does
-not use) before they are compared. The exit code is part of the answer: `2` means
+not use) before they are compared. ⛔ If the resolver itself cannot run (`python3`
+missing or failing), the answer is `UNVERIFIABLE(device identity could not be
+RESOLVED for: …)` — **not** `FREE`. The first cut of that helper fell back to the
+path **unresolved**, which silently reverted the comparison to raw string equality:
+a holder naming a `/dev/v4l/by-id/…` alias matched no globbed node, was not
+"suspicious" (it *is* in the device tree), the census was complete and `UNREADABLE`
+stayed `0` — so the script printed `FREE` over a device the process provably held.
+An unreadable read is never a definitive answer. The exit code is part of the answer: `2` means
 **cannot verify**, which is not the same as "nothing to report". Silence is not an
 acceptable answer to #2249; "I cannot tell you" is.
 
