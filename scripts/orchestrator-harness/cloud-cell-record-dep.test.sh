@@ -215,11 +215,12 @@ env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
 # lane shell through the tmux server — `scripts/cloud-cell-quiesce.sh:279`). Under the inherited value the
 # foreground arm is taken, `orch-loop.sh` exits 78, and these very assertions go RED with `start_rc=78`
 # (measured: 115 passed / 3 failed here, against 115/0 for the pre-#3760 file) — i.e. the box would decide
-# the result, which is the same class this file already neutralises for `GH_REPO` at `:41`.
+# the result, which is the same class this file already neutralises for `GH_REPO` at `:40`.
 # So `cell_start` now PINS `ORCH_FOREGROUND=0`, the idiom every other `start` caller already uses for exactly
 # this reason (`watchdog-loop.sh:1046`, `orchestrator-bringup.sh:1037`, `cloud-cell-quiesce.sh:286`, #2402),
 # and an inherited `=1` cannot ride in.
-# So the rc is ASSERTED again. It is the only whole-`start` success assertion in this suite, and without it
+# So the rc is ASSERTED again — the only whole-`start` success assertion KIND in this suite (`:363`,
+# `:377`, `:389`), and without it
 # a `start` that provisions the recorder and then `die`s (a failing `cmd_check` after the seed, a failing
 # `start_doctor_loop`) passes every arm here — a regression this suite exists to catch, hiding behind a
 # comment about a timeout that cannot happen.

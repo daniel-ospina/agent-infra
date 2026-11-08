@@ -1301,7 +1301,8 @@ if (typeof stripTypeScriptTypes !== "function" ||
           // is only legitimate when the pin's answer CANNOT change under this mutant, so ASSERT the
           // invariance instead of trusting the declaration. Measured without this leg: adding the
           // flag to B1 — a pin that demonstrably DOES flip — deleted B1's discrimination assertion
-          // silently, at 335 passed / 0 failed. The flag could therefore be used to hollow out the
+          // silently, with ZERO failures and one assertion simply gone. The flag could therefore be
+          // used to hollow out the
           // mutation evidence with no red anywhere.
           if (mut.optOutInvariant) {
             for (const p of PINNED.filter((x) => x.preFixDiscriminating === false)) {
