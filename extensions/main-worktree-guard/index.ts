@@ -980,6 +980,205 @@ function _hubWipInventory(): { wip: { path: string; pattern: string }[] } | null
   }
 }
 
+// ── #718: hub working-tree SWEEP detection ─────────────────────────────────
+// Measured 2026-09-10 (#718): a session authored six artifacts in the shared
+// hub (`agent-infra` main checkout) and a concurrent session returned the hub
+// to `main`. NOTHING warned it — it learned when an `edit` came back ENOENT,
+// roughly an hour later, and the work survived only because a sibling happened
+// to run a salvage commit first. Recovery must not be a probabilistic function
+// of whether a sibling snapshotted.
+//
+// M1 (#265) catches a BRANCH change and the #350 inventory (#350) warns about
+// WIP that EXISTS. Neither can see a working tree rewritten while the branch
+// stayed `main` — `git reset --hard`, `git checkout -f`, a sibling's salvage
+// `rm`. Afterwards the hub is CLEAN and on main, so EVERY state check passes:
+// the loss is invisible by construction, which is why #718 is a detection gap
+// and not a discipline gap.
+//
+// The only thing that distinguishes "the hub is clean" from "the hub was
+// erased" is a BASELINE — the dirty-path set THIS session observed. A path
+// this session saw in `git status` and that is now absent did not commit
+// itself out of existence: it was swept or reverted.
+//
+// Sampling (this is the load-bearing design choice): the observation runs on
+// EVERY tool_call, behind a 1.5s burst throttle, for hub-ROOTED sessions only
+// — the population the incident covers. Worktree sessions (every fleet lane)
+// pay one `isWorktreeCwdWrite` call and nothing else. `git status
+// --porcelain=v1` on the 2026-11-08 hub measures ~20ms, which is far cheaper
+// than one missed edit, and sampling at the NEXT tool call is the entire point
+// (the incident's hour of silence is the defect).
+//
+// Collapsed porcelain is deliberate: an untracked DIRECTORY arrives as one
+// `?? dir/` entry — exactly the artifact shape the incident lost (`one new
+// untracked skill directory`) — while a per-file expansion over a large
+// untracked tree is unbounded. Documented residual: a single file removed from
+// INSIDE an untracked directory that still has other entries does not change
+// the collapsed entry, so THAT sub-case is not reported; a whole artifact
+// (the reported loss) is.
+const HUB_SWEEP_MIN_MS = 1500;      // burst ceiling: at most one status per 1.5s
+const HUB_SWEEP_MAX_NAMED = 8;      // paths named in the banner; the rest are counted
+const observedHubPaths = new Map<number, Set<string>>();  // pid → last observed dirty set
+const warnedVanishedPaths = new Map<number, Set<string>>(); // pid → already reported
+let lastHubSweepMs = 0;
+let lastHubTreeSignature: string | null = null;
+let cachedHubCommonDir: string | null | undefined; // undefined = not yet resolved
+
+// The hub's git-common dir (the shared `.git` — a worktree's own gitdir is not
+// this), resolved ONCE per process from the hub toplevel.
+function _hubCommonDir(hubTop: string): string | null {
+  if (cachedHubCommonDir !== undefined) return cachedHubCommonDir;
+  try {
+    cachedHubCommonDir = execSync("git rev-parse --path-format=absolute --git-common-dir", {
+      cwd: hubTop, encoding: "utf-8", timeout: 5000,
+    }).trim() || null;
+  } catch {
+    cachedHubCommonDir = null;
+  }
+  return cachedHubCommonDir;
+}
+
+// A cheap "may the working tree have changed?" signature: the index and the
+// HEAD reflog (every checkout/reset/commit writes one of them — the incident's
+// own evidence was `reset: moving to HEAD`) plus the hub ROOT (a path entered or
+// left the tree). Three `stat`s, no child process. `null` = UNVERIFIABLE, which
+// the caller reads as "changed" so a failed probe can never silence the check.
+function _hubTreeSignature(hubTop: string): string | null {
+  const common = _hubCommonDir(hubTop);
+  if (!common) return null;
+  const stamp = (p: string): string => {
+    try { const s = statSync(p); return `${s.mtimeMs}:${s.size}`; } catch { return "E"; }
+  };
+  return [stamp(join(common, "index")), stamp(join(common, "logs", "HEAD")), stamp(hubTop)].join("|");
+}
+
+// `git status --porcelain=v1` (collapsed) → the set of paths the hub reports as
+// not-committed. Rename/copy entries carry BOTH sides (`R  old -> new`) and both
+// are observed, so neither side's disappearance can be misread as a sweep.
+// Git's quoted spelling is unescaped; a path this cannot parse stays unmatched,
+// which fails toward SILENCE (no banner), never toward a false accusation.
+function _dirtyPathsFromPorcelain(porcelain: string): Set<string> {
+  const out = new Set<string>();
+  for (const raw of porcelain.split("\n")) {
+    if (!raw) continue;
+    const entry = raw.slice(3); // `XY <path>`: XY is 2 columns, path starts at 3
+    if (!entry) continue;
+    for (const side of entry.includes(" -> ") ? entry.split(" -> ") : [entry]) {
+      let p = side;
+      if (p.length > 1 && p.startsWith('"') && p.endsWith('"')) {
+        p = p.slice(1, -1).replace(/\\(.)/g, "$1");
+      }
+      if (p) out.add(p);
+    }
+  }
+  return out;
+}
+
+// The reflog is the forensic record of WHAT rewrote the tree: the incident's own
+// evidence was `reset: moving to HEAD` / `checkout: moving from <branch> to
+// main`. Bounded to the last 3 entries; only read on the warning path.
+function _hubReflogTail(hubTop: string): string[] {
+  try {
+    return execSync("git reflog -3 --format='%gd %gs'", {
+      cwd: hubTop, encoding: "utf-8", timeout: 5000,
+    }).split("\n").map((l) => l.trim()).filter(Boolean);
+  } catch {
+    return []; // no reflog (fresh init / bare) is not an error
+  }
+}
+
+// The banner. Warn-only, and it must be ACTIONABLE: #718's two other findings
+// are (a) recovery depended on a coincidental salvage and (b) restoring whole
+// files from a salvage re-imports EVERY session's half-written edit — the
+// contamination that a verifier caught only because it read the diff, while a
+// reconciliation by `git diff --stat` line counts looked plausible and passed.
+// Both belong in the warning, not in a doc nobody reads mid-incident.
+function _warnHubSweep(vanished: string[], hubTop: string): void {
+  const L = (t: string) =>
+    "║  " + (t.length > 62 ? t.slice(0, 61) + "…" : t).padEnd(62) + "║";
+  const named = vanished.slice(0, HUB_SWEEP_MAX_NAMED).map((p) => L(`  • ${_truncatePath(p, 44)}`));
+  const more = vanished.length > HUB_SWEEP_MAX_NAMED
+    ? [L(`  … and ${vanished.length - HUB_SWEEP_MAX_NAMED} more`)]
+    : [];
+  // RIGHT-truncate reflog lines: the `HEAD@{n}` prefix and the verb are the
+  // information (a left-truncation would drop exactly those, #718's own evidence).
+  const reflog = _hubReflogTail(hubTop).slice(0, 2).map((l) => L(`    ${l.length > 58 ? l.slice(0, 57) + "…" : l}`));
+  const lines = [
+    "",
+    "╔══════════════════════════════════════════════════════════════════╗",
+    L("⚠️  HUB WORKING TREE CHANGED UNDER YOU (#718)"),
+    "╠══════════════════════════════════════════════════════════════════╣",
+    L("Observed earlier this session, now ABSENT from the hub:"),
+    ...named,
+    ...more,
+    L(""),
+    L("A path cannot commit itself away: something REWROTE the shared"),
+    L("hub's working tree — a concurrent session/process swept it, or"),
+    L("a hub command in THIS session did (a salvage NAMES every path it"),
+    L("reverses, #854 — check your own tool output first)."),
+    L("─ What moved it (the reflog records the verb):"),
+    L(`  git -C ${_truncatePath(hubTop, 40)} reflog -10`),
+    ...reflog,
+    L("─ Where the work went:"),
+    L("  git -C <hub> log --all --oneline --grep=salvage"),
+    L("  ls -t ~/hub-backups 2>/dev/null | head"),
+    L(""),
+    L("⚠️  A salvage is a MIXTURE of every session's tree. Restore"),
+    L("   ONLY the paths you authored, and read the diff CONTENTS:"),
+    L("`git diff --stat` line counts are NOT a contamination check."),
+    "╚══════════════════════════════════════════════════════════════════╝",
+    "",
+  ];
+  console.warn(lines.join("\n"));
+}
+
+// Diff the observed dirty-path set against the previous observation. Called by
+// _hubSweepCheck only; never throws (warn-only, and a stderr failure in a
+// session hook must never break a tool call).
+function _observeHubTree(porcelain: string, hubTop: string): void {
+  const pid = process.pid;
+  const current = _dirtyPathsFromPorcelain(porcelain);
+  const previous = observedHubPaths.get(pid);
+  observedHubPaths.set(pid, current);
+  // Nothing was ever observed dirty → nothing can have been lost. This is also
+  // what keeps a legitimately-clean hub silent forever.
+  if (!previous || previous.size === 0) return;
+  const vanished = [...previous].filter((p) => !current.has(p));
+  if (vanished.length === 0) return;
+  let seen = warnedVanishedPaths.get(pid);
+  if (!seen) { seen = new Set<string>(); warnedVanishedPaths.set(pid, seen); }
+  const fresh = vanished.filter((p) => !seen.has(p));
+  if (fresh.length === 0) return; // already reported — one banner per loss, not per tool call
+  for (const p of fresh) seen.add(p);
+  _warnHubSweep(fresh, hubTop);
+}
+
+// #718 detection entry point — hub-rooted sessions only; skipped under the env
+// hatch (a deliberate solo session is the documented hatch contract, and
+// HUB_HYGIENE_THROTTLE_MS's sibling check is skipped there for the same reason).
+// Exported for nothing: called from session_start and every tool_call.
+function _hubSweepCheck(): void {
+  if (_isAllowMainEdits()) return;
+  try {
+    if (isWorktreeCwdWrite(resolve(process.cwd()))) return; // isolated — not this class
+    const hubTop = _cachedMainTopLevel();
+    if (!hubTop) return; // non-git cwd / unresolved: nothing to observe
+    // Two gates, and only the second costs a child process. An UNCHANGED
+    // signature inside the burst window means no git-level write and no entry
+    // added/removed at the hub root — nothing to observe yet. Once the window
+    // expires we observe regardless, which bounds every subtler change (a file
+    // removed from inside an untracked directory) to one tool call.
+    const now = Date.now();
+    const sig = _hubTreeSignature(hubTop);
+    if (sig !== null && sig === lastHubTreeSignature && now - lastHubSweepMs < HUB_SWEEP_MIN_MS) return;
+    lastHubTreeSignature = sig;
+    lastHubSweepMs = now;
+    const porcelain = execSync("git status --porcelain=v1", {
+      cwd: hubTop, encoding: "utf-8", timeout: 5000,
+    });
+    _observeHubTree(porcelain, hubTop);
+  } catch { /* warn-only — degrade silently, never blocks */ }
+}
+
 // Throttled periodic hub-hygiene check (#350): once per HUB_HYGIENE_THROTTLE_MS
 // re-scan the hub for untracked WIP and warn (path-deduped). NEVER per-command
 // — the time throttle keeps it off the bash hot path; the cache is only
@@ -5056,6 +5255,12 @@ export default function (pi: ExtensionAPI) {
     // resumed/reused process must not inherit a prior session's count.
     hubNewFileCounts.clear();
     warnedNewFileTargets.clear();
+    // #718: the working-tree baseline is per-SESSION too — a resumed session has
+    // not observed anything yet, so it must not inherit a prior tree's paths.
+    observedHubPaths.clear();
+    warnedVanishedPaths.clear();
+    lastHubSweepMs = 0;
+    lastHubTreeSignature = null;
     if (branchOwnership) {
       try {
         // Only main-checkout sessions get a baseline (worktrees are isolated).
@@ -5095,6 +5300,10 @@ export default function (pi: ExtensionAPI) {
       lastHubHygieneMs = Date.now();
       const inWorktree = isWorktreeCwdWrite(resolve(process.cwd()));
       if (inWorktree) return;
+      // #718: SEED the observed working-tree baseline. A session that starts on a
+      // dirty hub has observed those paths; their disappearance later is the
+      // sweep signal. (Idempotent: _hubSweepCheck records and returns.)
+      _hubSweepCheck();
       const currentBranch = getMainCheckoutBranch();
       // #73 dirty check stays on COLLAPSED porcelain (untracked dirs → one
       // `?? dir/` entry) — fast and robust on hubs with large untracked trees;
@@ -5173,6 +5382,11 @@ export default function (pi: ExtensionAPI) {
       _recordBaseline(pid); // BEFORE this tool_call's guard evaluation
     }
     _m1(pid);
+    // #718: re-observe the hub's working tree on EVERY tool call (hub-rooted
+    // sessions only; 1.5s burst throttle). The incident's defect was that the
+    // working session learned about the loss an hour later, at its next failing
+    // `edit` — so observation belongs here, not in a 6h-gated SessionStart job.
+    _hubSweepCheck();
 
     const isWrite = isToolCallEventType("write", event);
     const isEdit = isToolCallEventType("edit", event);
