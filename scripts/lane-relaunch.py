@@ -182,13 +182,20 @@ def _transcripts(ls):
 
 
 def _records_cwd(ls, path, cwd):
-    """True when this transcript's first record says it was started in `cwd`."""
+    """True when this transcript's first record says it was started in EXACTLY `cwd`.
+
+    ⛔ IDENTITY, NOT CONTAINMENT (review round 6, P2). The first version reused
+    `lane-status._same_dir`, which is a TOLERANT matcher:
+        ra == rb or ra.startswith(rb + os.sep) or rb.startswith(ra + os.sep)
+    Those prefix arms answer a DIFFERENT question (`find_child_session`'s "the child may live in a
+    subdirectory") and they are wrong here: a pi session starting in the repo root, in `$HOME`, or in
+    a subdirectory of the lane's own worktree — all of them normal, all of them likely inside a
+    45-second window — would confirm a `--new` relaunch that started nothing. `lane-status.py:1743`
+    answers this same identity question strictly, and so does this.
+    """
     try:
         rec = ls.parent_cwd(path)
-        if not rec:
-            return False
-        same = getattr(ls, "_same_dir", None)
-        return bool(same(rec, cwd)) if same else os.path.realpath(rec) == os.path.realpath(cwd)
+        return bool(rec) and os.path.realpath(rec) == os.path.realpath(cwd)
     except Exception:                                            # noqa: BLE001
         return False
 

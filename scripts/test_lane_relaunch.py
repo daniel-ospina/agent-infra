@@ -53,7 +53,11 @@ class FakeLS:
         self._session = session
         self._transcript = transcript
         self._cwd = cwd
-        self._session_dir = session_dir or tempfile.mkdtemp(prefix="lane-sessions-")
+        # ⛔ A PRIVATE ROOT (review round 6, note): `SD` is the PARENT of the session dir, so pointing
+        # it at /tmp made every row glob the real /tmp — and `stray_new_sessions == 1` then raced any
+        # other process writing /tmp/<dir>/*.jsonl between the two globs.
+        self._root = session_dir or tempfile.mkdtemp(prefix="lane-sessions-")
+        self._session_dir = os.path.join(self._root, "lane")
 
     # ── the primitives the FRESH arm's baseline uses. ⛔ `parent_cwd`/`_same_dir` mirror the REAL
     # semantics (read the transcript's own first record; compare realpaths) — they are not what is
@@ -73,7 +77,13 @@ class FakeLS:
 
     @staticmethod
     def _same_dir(a, b):
-        return bool(a) and bool(b) and os.path.realpath(a) == os.path.realpath(b)
+        """The REAL `lane-status._same_dir` semantics — tolerant of ancestor/descendant. The tool must
+        NOT use it for identity (review round 6, P2), and a fake that made it strict could not detect
+        that mistake."""
+        if not a or not b:
+            return False
+        ra, rb = os.path.realpath(a), os.path.realpath(b)
+        return ra == rb or ra.startswith(rb + os.sep) or rb.startswith(ra + os.sep)
 
     def new_session(self, name, cwd="/tmp/lane"):
         """Write a transcript where PI would write it, with the cwd in its first record."""
@@ -316,6 +326,26 @@ def test_new_confirms_when_a_transcript_APPEARS(R):
                      sleep=lambda _s: None, clock=_clock())
     assert obs["confirmed"] is True, obs
     assert "appeared" in obs["reason"], obs
+
+
+def test_new_does_not_count_a_transcript_from_an_ANCESTOR_cwd(R):
+    """The strictness that matters: a pi session that begins in an ANCESTOR of the lane's cwd (the repo
+    root, `$HOME`, the worktrees dir) is a different lane's business. `_same_dir` would call this a
+    match; identity does not."""
+    ls = FakeLS(transcript=None, session=None)
+    cmux = FakeCmux(on_send=lambda: ls.new_session("root.jsonl", cwd="/tmp"))
+    obs = R.relaunch("ws-1", ls=ls, runner=cmux, pi=sys.executable, cwd="/tmp/lane", new=True,
+                     sleep=lambda _s: None, clock=_clock())
+    assert obs["confirmed"] is False, "an ancestor cwd confirmed the relaunch: %r" % (obs,)
+
+
+def test_new_does_not_count_a_transcript_from_a_DESCENDANT_cwd(R):
+    """...and the mirror: a session started in a SUBDIRECTORY of the lane's cwd is not this relaunch."""
+    ls = FakeLS(transcript=None, session=None)
+    cmux = FakeCmux(on_send=lambda: ls.new_session("sub.jsonl", cwd="/tmp/lane/scripts"))
+    obs = R.relaunch("ws-1", ls=ls, runner=cmux, pi=sys.executable, cwd="/tmp/lane", new=True,
+                     sleep=lambda _s: None, clock=_clock())
+    assert obs["confirmed"] is False, obs
 
 
 def test_new_does_not_count_a_transcript_from_ANOTHER_cwd(R):

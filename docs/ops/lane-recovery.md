@@ -104,10 +104,11 @@ transcript is genuinely gone. Its confirmation is anchored to a **pre-send basel
 state that already existed:
 
 - **proof (i):** a `*.jsonl` transcript that was NOT present before the send **and whose own first
-  record names this lane's cwd**. The cwd is read from the transcript, never inferred from a directory
-  name — `lane-status.mangled()` turns `.` into `-` while pi keeps the dot (`/x/.worktrees/y` vs
-  pi's `/x/.worktrees/y` folder name), and every fleet lane lives in a dotted path, so a derived
-  directory name is not a key;
+  record names exactly this lane's cwd**. The cwd is read from the transcript, never inferred from a
+  directory name — `lane-status.mangled()` turns `.` into `-` while pi keeps the dot, and every fleet
+  lane lives in a dotted path, so a derived directory name is not a key. The comparison is
+  **identity, not containment**: a session started in an ancestor (the repo root, `$HOME`, the
+  worktrees dir) or a subdirectory of the lane's cwd is a different lane's business;
 - **proof (ii):** the pane **left the shell prompt** on two consecutive reads. pi creates its session
   file lazily (the path is assigned at session start; the first write arrives with the first entry), so
   a fresh session with no prompt yet may leave no file — the pane is then the only witness;
@@ -138,6 +139,12 @@ That is how the sessions in #942 were recovered (`loop_liveness` located `01a09b
   deliberately (#1553), so dropping this tool beside the *farmed* heartbeat leaves its imported
   primitives absent — the tool then refuses (exit 3) with a message saying so, rather than raising.
   Run it from a repo checkout.
+- **Declared residual (not closed):** proof (ii) — "the pane left the shell prompt" — is exactly the
+  state the `cmux send` Enter itself produces, so a launch line that fails *slowly* (a wrapper taking
+  longer than the poll interval to error) reads `CONFIRMED` for a command that is still running. Two
+  consecutive reads remove the redraw case, not this one. A positive pi-footer check would close it and
+  is the vocabulary `orchestrator-heartbeat.sh`'s `_shell_visible` owns — one source of truth beats a
+  drifted second one, so it stays declared here.
 - **Declared residual (not closed):** the shell-prompt guard is a last-character test, so a live pi
   whose session record is stale (the documented record-only-dead class), not drawing `Working`, and
   whose last line happens to end in `$ % # ❯ »` would be mistaken for a shell. Three guards must miss
