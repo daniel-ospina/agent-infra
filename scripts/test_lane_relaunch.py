@@ -316,6 +316,24 @@ def test_refuses_when_pi_missing(R, tmp_path):
     assert cmux.sent() == []
 
 
+def test_refuses_when_pi_is_not_an_executable_file(R, tmp_path):
+    """`os.path.exists` accepted a 0644 file and a DIRECTORY (review round 3, P2) and then sent a
+    launch line that provably cannot run — the exact failure this guard exists for. Same standard
+    the R6 test holds the prescribed remedy to."""
+    plain = tmp_path / "pi-plain"
+    plain.write_text("#!/bin/sh\n")
+    plain.chmod(0o644)
+    adir = tmp_path / "pi-dir"
+    adir.mkdir()
+    for pi in (str(plain), str(adir)):
+        cmux = FakeCmux()
+        obs = R.relaunch("ws-1", ls=FakeLS(), runner=cmux, pi=pi,
+                         cwd=str(tmp_path), sleep=lambda _s: None, clock=_clock())
+        assert obs["refused"] is True, (pi, obs)
+        assert "executable file" in obs["reason"], (pi, obs["reason"])
+        assert cmux.sent() == [], (pi, cmux.sent())
+
+
 # ── the happy path, and R5 ---------------------------------------------------------------------
 def _transcript(tmp_path):
     p = tmp_path / "s-1.jsonl"
@@ -410,6 +428,91 @@ def test_new_does_not_count_a_transcript_from_ANOTHER_cwd(R):
                      sleep=lambda _s: None, clock=_clock())
     assert obs["confirmed"] is False, obs
     assert obs.get("stray_new_sessions") == 1, obs
+
+
+def test_new_is_not_blocked_when_the_RESUME_TARGET_is_unresolvable(R):
+    """⛔ `--new` IS THE REMEDY FOR A BROKEN RESUME TARGET, so it must not be refused BECAUSE the
+    resume target is broken (review round 3, P2). It needs no session id at all."""
+    class Raising(FakeLS):
+        def resolve_session(self, ws):
+            raise RuntimeError("resolve blew up")
+
+    cmux = FakeCmux(on_send=lambda: None)
+    obs = R.relaunch("ws-1", ls=Raising(transcript=None, session=None), runner=cmux,
+                     pi=sys.executable, cwd="/tmp/lane", new=True,
+                     sleep=lambda _s: None, clock=_clock())
+    assert obs["refused"] is False, obs
+    assert cmux.sent(), "--new must reach the send even when the resume target cannot be resolved"
+
+
+def test_new_never_reports_the_STALE_id_it_was_asked_to_abandon(R):
+    """A confirmed `--new` used to report `sid_after or pre_sid`, i.e. the pre-launch id `--new`
+    exists to ABANDON, whenever the resolver could not yet name the new session (review round 3,
+    P2). Unknown must be None — naming the discarded session is a wrong answer, not a fallback."""
+    ls = FakeLS(session="STALE-OLD", transcript=None)
+    cmux = FakeCmux(on_send=lambda: ls.new_session("new.jsonl"))
+    ls.resolve_session = lambda ws: None          # the resolver cannot name the new session yet
+    ls._session = None
+    obs = R.relaunch("ws-1", ls=ls, runner=cmux, pi=sys.executable, cwd="/tmp/lane", new=True,
+                     sleep=lambda _s: None, clock=_clock())
+    assert obs["confirmed"] is True, obs
+    assert obs["sid"] != "STALE-OLD", (
+        "a fresh relaunch was reported as bound to the session --new was asked to abandon: %r" % (obs,))
+
+
+def test_new_does_not_confirm_when_the_baseline_could_not_be_READ(R, tmp_path, monkeypatch):
+    """⛔ THE ROUND-3 P1, and it is the SAME false CONFIRM through a different door.
+
+    `glob.glob` returns `[]` on an unreadable directory instead of raising, so the old baseline read
+    an unreadable root as an EMPTY one. If the root became readable before the post-send read, every
+    pre-existing transcript counted as "appeared" — exit 0 CONFIRMED for a session that existed
+    BEFORE the relaunch. An unreadable baseline must yield no signal at all, never a transition.
+    """
+    ls = FakeLS(session="old", transcript=None)
+    ls.new_session("old.jsonl")                  # present BEFORE the send, in the lane's own cwd
+    cmux = FakeCmux()                            # the send succeeds and NOTHING changes
+
+    real_listdir = os.listdir
+
+    def blind(path):
+        # the BASELINE walk is blinded; the post-send walk (a fresh call) works again
+        raise PermissionError(13, "Permission denied", str(path))
+
+    # Baseline = the first `_transcripts` call. Blind it, and only it.
+    calls = {"n": 0}
+    orig = R._transcripts
+
+    def first_call_blind(lsd):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return None                            # what an unreadable root must now yield
+        return orig(lsd)
+
+    monkeypatch.setattr(R, "_transcripts", first_call_blind)
+    obs = R.relaunch("ws-1", ls=ls, runner=cmux, pi=sys.executable, cwd="/tmp/lane", new=True,
+                     sleep=lambda _s: None, clock=_clock())
+    assert calls["n"] >= 2, "the baseline was never taken — the test would be vacuous"
+    assert obs.get("confirmed") is not True, (
+        "an unreadable baseline confirmed a pre-existing transcript as a TRANSITION: %r" % (obs,))
+
+
+def test_transcripts_returns_None_when_the_root_cannot_be_read(R, monkeypatch):
+    """`_transcripts` must DISTINGUISH absent from unreadable: `glob.glob` cannot (it returns `[]`),
+    which made the documented `None` arm dead code (review round 3, P1)."""
+    ls = FakeLS()
+    assert R._transcripts(ls) == set(), "an EMPTY-but-readable root is an empty baseline"
+    absent = FakeLS()
+    absent._session_dir = os.path.join(absent._root, "never-created")
+    absent._root = os.path.join(absent._root, "also-never-created")
+    assert R._transcripts(absent) == set(), "an ABSENT root holds no transcripts that could pre-exist"
+    real_scandir = os.scandir
+
+    def boom(path):
+        raise PermissionError(13, "Permission denied", str(path))
+
+    monkeypatch.setattr(os, "scandir", boom)
+    assert R._transcripts(ls) is None, "an UNREADABLE root must be None, not an empty set"
+    monkeypatch.setattr(os, "scandir", real_scandir)
 
 
 def test_new_does_not_confirm_on_a_transcript_that_predates_the_send(R):

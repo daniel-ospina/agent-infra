@@ -60,7 +60,6 @@ EXIT
 from __future__ import annotations
 
 import argparse
-import glob
 import json
 import os
 import shlex
@@ -191,15 +190,39 @@ def _transcripts(ls):
     proof was DEAD rather than merely unlucky — silently, because the empty set reads as "nothing
     appeared".
 
-    So the baseline is a cheap glob of the session root, and the cwd of a CANDIDATE is read from the
-    transcript's OWN first record (`lane-status.parent_cwd`, compared with `lane-status._same_dir`).
-    That is encoding-independent: it survives pi changing its naming scheme.
+    So the baseline is a cheap walk of the session root, and the cwd of a CANDIDATE is read from the
+    transcript's OWN first record (`lane-status.parent_cwd`, compared by EXACT cwd identity — see
+    `_records_cwd`; ⛔ never `_same_dir`, which is ancestor-tolerant and reopens the false CONFIRM
+    that function's own note closes). That is encoding-independent: it survives pi changing its
+    naming scheme.
 
-    None means the root could not be read — no signal, never a false CONFIRM.
+    None means the root could not be READ — no signal, never a false CONFIRM.
+
+    ⛔ `glob.glob` CANNOT DETECT THAT (review round 3, P1): it returns `[]` rather than raising on an
+    unreadable or absent directory, so a `try/except` around it is DEAD CODE and this function could
+    only ever return a set. An unreadable root then produced an EMPTY baseline instead of `None`,
+    and if the root became readable before the post-send read, EVERY pre-existing transcript counted
+    as "appeared" — a pre-existing session reported as a transition, exit 0 CONFIRMED. `os.scandir`
+    raises, so the distinction is real; an ABSENT root is still an empty set (no transcripts can
+    pre-exist a directory that does not exist).
     """
     try:
-        return set(glob.glob(os.path.join(ls.SD, "*", "*.jsonl")))
-    except Exception:                                            # noqa: BLE001
+        if not os.path.isdir(ls.SD):
+            return set()
+        out = set()
+        with os.scandir(ls.SD) as ents:
+            for ent in ents:
+                try:
+                    if not ent.is_dir():
+                        continue
+                    names = os.listdir(ent.path)
+                except OSError:
+                    return None
+                for name in names:
+                    if name.endswith(".jsonl"):
+                        out.add(os.path.join(ent.path, name))
+        return out
+    except OSError:
         return None
 
 
@@ -314,7 +337,10 @@ def relaunch(ws, label="", cwd=None, session=None, pi=None, new=False, wait=45.0
 
     # ── 4. the session must RESOLVE TO AN EXISTING TRANSCRIPT (#942 aggravating factor 2).
     sid, fresh = session, False
-    if not sid:
+    # ⛔ `--new` NEEDS NO RESUME TARGET, SO IT MUST NOT BE BLOCKED BY ONE (review round 3, P2).
+    # `--new` is the documented escape hatch for "the stored resume target is broken"; refusing it
+    # BECAUSE that target is broken blocks the remedy with the defect it remedies.
+    if not sid and not new:
         try:
             sid = ls.resolve_session(ws) or None
         except Exception as exc:                                 # noqa: BLE001
@@ -336,7 +362,9 @@ def relaunch(ws, label="", cwd=None, session=None, pi=None, new=False, wait=45.0
     # COMMON case — #942's aggravating factor 2 is that it sometimes does not) confirmed on the FIRST
     # loop iteration, before any wait, from a binding that existed BEFORE the relaunch. Exit 0 is the
     # operator's strongest signal, and it was saying "came back" about a session nothing had started.
-    pre_sid = sid
+    # The nulling below is therefore what makes the fresh arm measure a TRANSITION — and the id it
+    # discards is deliberately NOT carried into the result: reporting it would name a session the
+    # operator asked to abandon (review round 3, P2).
     if new:
         sid, path, fresh = None, None, True
 
@@ -351,10 +379,14 @@ def relaunch(ws, label="", cwd=None, session=None, pi=None, new=False, wait=45.0
                       % (cwd,))
 
     # ── 6. the binary. Typing a command that cannot resolve is the exact failure #942 is about.
+    # ⛔ EXECUTABLE, NOT MERELY PRESENT (review round 3, P2): `os.path.exists` accepts a 0644 file
+    # and a DIRECTORY, and the launch line it then sends provably cannot run. Same standard this
+    # change's own R6 test holds the prescribed remedy to.
     pi = pi or shutil.which("pi")
-    if not pi or not os.path.exists(pi):
-        return refuse("`pi` not found on this PATH (%r) — provide --pi <abs path>; a launch line "
-                      "that cannot resolve is the failure this tool exists to avoid" % (pi,))
+    if not pi or not os.path.isfile(pi) or not os.access(pi, os.X_OK):
+        return refuse("`pi` not found as an executable file on this PATH (%r) — provide --pi <abs "
+                      "path>; a launch line that cannot resolve is the failure this tool exists to "
+                      "avoid" % (pi,))
 
     # ⛔ NO `exec` (review round 3, P1 — and it is #942's own defect one process away). `exec` REPLACES
     # the pane's shell with pi, so when pi later exits (turn ends, /quit, crash) there is no shell left:
@@ -415,7 +447,10 @@ def relaunch(ws, label="", cwd=None, session=None, pi=None, new=False, wait=45.0
             cands = _newest_first(new_files, 5)
             hit = next((p for p in cands if _records_cwd(ls, p, cwd)), None)
             if hit:
-                obs.update(confirmed=True, sid=sid_after or pre_sid,
+                # ⛔ `sid_after`, NOT `sid_after or pre_sid` (review round 3, P2): `pre_sid` is the
+                # id `--new` exists to ABANDON, so falling back to it reported a fresh relaunch as
+                # bound to the stale session. Unknown is `None`, which is honest.
+                obs.update(confirmed=True, sid=sid_after,
                            reason="fresh session appeared (%s)" % os.path.basename(hit))
                 break
             if cands and not hit:
@@ -433,7 +468,10 @@ def relaunch(ws, label="", cwd=None, session=None, pi=None, new=False, wait=45.0
             else:
                 non_prompt_reads = 0
             if non_prompt_reads >= 2:
-                obs.update(confirmed=True, sid=sid_after or pre_sid,
+                # ⛔ `sid_after`, NOT `sid_after or pre_sid` (review round 3, P2): `pre_sid` is the
+                # id `--new` exists to ABANDON, so falling back to it reported a fresh relaunch as
+                # bound to the stale session. Unknown is `None`, which is honest.
+                obs.update(confirmed=True, sid=sid_after,
                            reason="the pane left the shell prompt (pi took the pane)")
                 break
         else:
