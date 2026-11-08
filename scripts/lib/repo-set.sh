@@ -575,9 +575,12 @@ repo_set_parse() {
     # either: it strips the trailing slash and then starts at the PARENT, so `anc` is a TRAVERSABLE
     # DIRECTORY and the ancestor test alone proves absence. With a stat answer the `notdir` errno now names
     # the cause (below); with none — `unknown`, the no-interpreter route — the stripped spelling is the
-    # ONLY evidence available, so it is tested before absence is claimed. Tested only on the `unknown`
-    # branch: `absent` (ENOENT) cannot have an existing stripped form, because ENOTDIR is the answer when
-    # it does.
+    # ONLY evidence available, so it is tested before absence is claimed.
+    # ⛔ AND IT IS NOT GATED ON `kind` (round 48 — measured, and this note used to claim the opposite): a
+    # dangling link spelled with a trailing slash answers `absent` (ENOENT), NOT ENOTDIR, and it very much
+    # has an existing stripped form. The stripped-spelling test therefore fires on the `absent` route as well
+    # as on `unknown`, which is precisely what `j16r` pins — gate it on `unknown` and that shape degrades to
+    # rc 3, the code the wrapper acts on.
     local stripped="$f"
     while [ "${stripped%/}" != "$stripped" ] && [ -n "$stripped" ]; do stripped="${stripped%/}"; done
     # ⛔ `/` ONLY — AND `/.` WAS TRIED AND REMOVED (round 48, measured, twice). `/srv/state` and `/srv/./state`
