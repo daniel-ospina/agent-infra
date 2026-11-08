@@ -765,16 +765,35 @@ ck "every nap path calls stg_nap_mark (${_nap_n} nap_mark sites for ${_loop_n} s
 # 9.1d-iii-b: THE NON-NAP DECLARATION IS BOUNDED, so it cannot be used to hide a nap. Every arm here
 # reds if the declaration is widened, duplicated or lost — the three ways the exclusion above could
 # become a hole instead of a fact about a subshell backoff.
+# ⛔ AND IT MUST NOT SPAN THE SUBSHELL BOUNDARY (fresh-context review, P2 — measured). The first
+# revision opened the fence BEFORE `if [ -n "$REFRESH_SH" ]; then`, so an outer-shell `sleep` inserted
+# between the fence and `while :; do` sat on the CYCLE path, was excluded from the population, and left
+# all arms GREEN — a real nap hidden by the exemption. So the structure is pinned, not just the counts:
+# the fence contains NO subshell opener and NO closer (it is strictly INTERIOR to the subshell), and the
+# nearest preceding code line is the opener itself. The pair is what makes "not a cycle nap" a
+# statement about the code rather than a label.
 _nap_beg_n="$(grep -cE '^[[:space:]]*# >>> BEGIN NOT-A-CYCLE-NAP' <<<"$_loop_nap_region")"
 _nap_end_n="$(grep -cE '^[[:space:]]*# <<< END NOT-A-CYCLE-NAP' <<<"$_loop_nap_region")"
 _nap_excl_sleeps="$(grep -cE '^[[:space:]]*(fork_free_sleep|sleep) ' <<<"$_nap_excl_body")"
 _nap_excl_marks="$(grep -cE '^[[:space:]]*stg_nap_mark([[:space:]]|$)' <<<"$_nap_excl_body")"
+_nap_excl_openers="$(grep -cE '^[[:space:]]*\(([[:space:]]|$)' <<<"$_nap_excl_body")"
+_nap_excl_closers=$(( $(grep -cE '^[[:space:]]*\)[[:space:]]*$' <<<"$_nap_excl_body") + $(grep -cE '([[:space:];]|^)\)[[:space:]]*&[[:space:]]*$' <<<"$_nap_excl_body") )) 
+_nap_prev_code="$(awk '
+  /^[[:space:]]*# >>> BEGIN NOT-A-CYCLE-NAP/ { exit }
+  /^[[:space:]]*$/ { next }
+  /^[[:space:]]*#/ { next }
+  { last=$0 }
+  END { print last }' <<<"$_loop_nap_region")"
 ck "the non-nap declaration is EXACTLY ONE bounded pair inside the loop (begin=${_nap_beg_n}, end=${_nap_end_n} — a lost end excludes the rest of the file)" \
    "$(if [ "${_nap_beg_n:-0}" -eq 1 ] && [ "${_nap_end_n:-0}" -eq 1 ]; then echo 0; else echo 1; fi)"
 ck "  …and it holds AT MOST ONE sleep line, so a second nap cannot be parked in it (found ${_nap_excl_sleeps})" \
    "$(if [ "${_nap_excl_sleeps:-9}" -le 1 ]; then echo 0; else echo 1; fi)"
 ck "  …and it holds NO stg_nap_mark, because a marked nap is not what it declares (found ${_nap_excl_marks})" \
    "$(if [ "${_nap_excl_marks:-9}" -eq 0 ]; then echo 0; else echo 1; fi)"
+ck "  …and it spans NO subshell boundary — no opener and no closer inside it (openers=${_nap_excl_openers}, closers=${_nap_excl_closers})" \
+   "$(if [ "${_nap_excl_openers:-9}" -eq 0 ] && [ "${_nap_excl_closers:-9}" -eq 0 ]; then echo 0; else echo 1; fi)"
+ck "  …and the nearest code line BEFORE it opens that subshell, so the fence is interior to the backgrounded pass ('${_nap_prev_code}')" \
+   "$(if [ "${_nap_prev_code:-x}" = x ]; then echo 1; elif [[ "${_nap_prev_code}" =~ ^[[:space:]]*\(([[:space:]]|$) ]]; then echo 0; else echo 1; fi)"
 
 # 9.1g THE READER REFUSES A GLOB AS A STAGE NAME.
 # ⛔ THESE ARMS PIN THE OBSERVABLE, NOT THE GUARD. The wanted name is validated AND used quoted, so the

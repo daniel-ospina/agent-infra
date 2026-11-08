@@ -299,9 +299,10 @@ UV="${SCOUT_UV:-uv}"
 
 # ── exit codes: TWO failure kinds, because the caller must act on them differently ────────────
 # `&` in orch-loop.sh discarded this script's status, so a bare non-zero was invisible. orch-loop
-# now reads the code: TRANSIENT is retried next cycle (a network/tool hiccup — retrying is
-# correct); NOT_PROVISIONABLE stops the retry loop and is surfaced loudly, because retrying cannot
-# help. Keep these in sync with orch-loop.sh's `-eq 3` handler.
+# now reads the code: TRANSIENT is retried INSIDE the same cycle on a short bounded backoff
+# (agent-infra#3584) and, if that budget is spent, again next cycle (a network/tool hiccup —
+# retrying is correct); NOT_PROVISIONABLE stops the retry loop and is surfaced loudly, because
+# retrying cannot help. Keep these in sync with orch-loop.sh's `-eq 3` handler.
 EXIT_TRANSIENT=1
 EXIT_NOT_PROVISIONABLE=3
 

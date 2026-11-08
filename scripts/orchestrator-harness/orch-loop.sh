@@ -8805,9 +8805,13 @@ PY
       # first version accumulated only `sleep` time, so three passes at ~6m20s each would have passed a
       # 300 s "budget" and tripped the guard anyway — the comment claimed a bound the code did not
       # implement. It is now measured from the FIRST attempt's start and includes the pass runtime, so
-      # what it protects is stated exactly: it bounds the WALL CLOCK the retries add. It cannot shorten
-      # a first attempt that on its own outlives the guard — that pre-existing exposure is the pass's,
-      # and is named in `refresh-candidates.sh` rather than papered over here.
+      # what it protects is stated exactly: it bounds the WALL CLOCK the retries add. ⛔ THE RESIDUAL IS
+      # ONE ATTEMPT'S RUNTIME, said out loud (review round 3, measured): the check runs BEFORE the sleep,
+      # so the worst case is `budget + one further pass runtime` — a retrying pass cannot cap how long an
+      # attempt takes. And it cannot shorten a FIRST attempt that on its own outlives the guard — that
+      # pre-existing exposure is the pass's, and is named in `refresh-candidates.sh` rather than papered
+      # over here. The shipped defaults (30 + 60 s of sleep against a 300 s budget, under a 20 min guard)
+      # leave an order of magnitude of headroom for a pass that completes in its usual seconds.
       # ⛔ AND IT DOES NOT RETRY A PERMANENT VERDICT. rc=3 (NOT PROVISIONABLE) and rc=78 (a config
       # refusal) are facts about the BOX, not about the network; retrying them is the #1736 defect the
       # two `elif` arms below exist to prevent.
@@ -8846,12 +8850,19 @@ PY
       # `stg_nap_mark` here could not even work (it writes a shell variable, and a subshell's write dies
       # with it). Without the declaration the arm charged it as a nap path and reddened a correct tree
       # (measured: pristine `main` 123 passed/0 failed, this branch 122/1 before the markers). The
-      # exclusion is not a licence: the suite bounds the declared block to ONE sleep line, so a second
-      # nap cannot be hidden here, and the `_nap_n >= 3` floor means a block wrapped round the whole
-      # loop reddens the arm instead of emptying it.
-      # >>> BEGIN NOT-A-CYCLE-NAP — the in-cycle retry backoff below (agent-infra#3584)
+      # exclusion is not a licence: the suite bounds the declared block to ONE sleep line, requires it
+      # to sit STRICTLY INSIDE the backgrounded subshell (no opener and no closer in the fence), and
+      # the `_nap_n >= 3` floor means a block wrapped round the whole loop reddens the arm instead of
+      # emptying it.
+      # ⛔ AND THE FENCE OPENS INSIDE THE SUBSHELL, NOT OUTSIDE IT (fresh-context review, P2 — measured).
+      # The first version put `BEGIN` before `if [ -n "$REFRESH_SH" ]; then`, so the fenced region
+      # spanned the subshell opener: an outer-shell `sleep` added between the fence and `while :; do`
+      # was excluded from the nap population while sitting on the CYCLE path — a real nap, hidden, with
+      # every arm green. The fence therefore starts AFTER `( _att=0`, and two arms pin that structure
+      # (no `(`/`)` boundary inside it, an opener immediately before it).
       if [ -n "$REFRESH_SH" ]; then
         ( _att=0; _t0="$(date +%s)"
+          # >>> BEGIN NOT-A-CYCLE-NAP — the in-cycle retry backoff below (agent-infra#3584)
           while :; do
             _att=$(( _att + 1 ))
             bash "$REFRESH_SH" 6 >> "$LOG" 2>&1; rc=$?
@@ -8874,7 +8885,7 @@ PY
             echo "[refresh] TRANSIENT rc=$rc (attempt ${_att}/${REFRESH_RETRY_MAX_ATTEMPTS}) — retrying in ${_rd}s, on a SHORT BOUNDED BACKOFF INSIDE this cycle rather than at the next one (agent-infra#3584)" >> "$LOG"
             sleep "$_rd"
           done
-        # <<< END NOT-A-CYCLE-NAP
+          # <<< END NOT-A-CYCLE-NAP
         rm -rf "$O/.refresh.lock"
         if [ "$rc" -eq 3 ]; then
           echo "[refresh] BLOCKED (permanent): this repo cannot be provisioned for dispatch — see the reason above. Not retrying (agent-infra#1736); fix it, then delete $O/.refresh-blocked" >> "$LOG"

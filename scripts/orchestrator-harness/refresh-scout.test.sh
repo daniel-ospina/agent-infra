@@ -1987,6 +1987,23 @@ if [ -s "$T/refreshblock.sh" ] && grep -q 'refresh-candidates.sh' "$T/refreshblo
     || bad "orch-loop: the per-delay cap did not run — $(grep 'TRANSIENT rc=1' "$BLR7/log" 2>/dev/null | head -1)"
   [ "$n7b" = "2" ] && ok "orch-loop: the clamped delay still fits the budget, so the second attempt is made" \
                    || bad "orch-loop: a clamped delay was wrongly refused ($n7b attempt(s), expected 2)"
+  # (b9) THE DOUBLING IS GRADED, not merely claimed (fresh-context review, P2 — measured). Every arm
+  # above drives BACKOFF=0 or BACKOFF=1, and `0 * 2 = 0` while a 1 s value is clamped by the per-delay
+  # cap — so DELETING the doubling loop from the shipped block left this suite at 469/0, i.e. the
+  # "backoff doubling from REFRESH_RETRY_BACKOFF_S" that the PR body, the commit message and the
+  # registry entry all assert was a claim nothing could lose. This arm sets a backoff that is neither 0
+  # nor at the cap and pushes both the cap and the budget out of the way, so the ONLY thing that can
+  # produce the second delay is the doubling: 10 s then 20 s.
+  BLR10="$T/retry10"; mkdir -p "$BLR10"; : > "$BLR10/candidates.txt"
+  printf '#!/bin/bash\nprintf "x" >> "%s/invoked"\nrefresh_record_write() { :; }\nexit 1\n' "$BLR10" > "$BLR10/refresh-candidates.sh"
+  O="$BLR10" LOG="$BLR10/log" REFRESH_RETRY_BACKOFF_S=10 REFRESH_RETRY_MAX_DELAY_S=999 \
+    REFRESH_RETRY_MAX_ATTEMPTS=3 REFRESH_RETRY_BUDGET_S=999 bash "$T/refreshblock.sh" >/dev/null 2>&1
+  grep -q 'TRANSIENT rc=1 (attempt 1/3) — retrying in 10s' "$BLR10/log" 2>/dev/null \
+    && ok "orch-loop: the first backoff is REFRESH_RETRY_BACKOFF_S (10s)" \
+    || bad "orch-loop: the first retry delay is not the configured backoff — $(grep 'TRANSIENT rc=1' "$BLR10/log" 2>/dev/null | head -1)"
+  grep -q 'TRANSIENT rc=1 (attempt 2/3) — retrying in 20s' "$BLR10/log" 2>/dev/null \
+    && ok "orch-loop: the backoff DOUBLES per attempt (10s then 20s, not 10s twice)" \
+    || bad "orch-loop: the backoff did not double — attempt 2 delay: $(grep 'attempt 2/3' "$BLR10/log" 2>/dev/null | head -1)"
   # (c) BOUND THE MARKER'S EVIDENCE TO THE CURRENT RUN (agent-infra#1853 review P2). $LOG is
   # append-only and never rotated, so a bare `grep 'NOT PROVISIONABLE' "$LOG"` would quote a
   # PREVIOUS cycle's refusal as this run's reason — presenting a cause that no longer fired. The

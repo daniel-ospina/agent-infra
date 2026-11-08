@@ -140,8 +140,8 @@ export const OUT_OF_FAMILY_TERMS = [
   // *and* a bound SUFFIX: the token is present (`REFRESH` contains `FRESH`), but `_ATTEMPTS` is not
   // in `SCAN_BOUND_SUFFIXES`, so the name scan cannot see it. Listed deliberately, with its value
   // pinned by the registration above and its BEHAVIOUR pinned by refresh-scout.test.sh §7
-  // (b1) (3 attempts at the default, read off the invoke count), (b2) (cap=1 makes exactly one) and
-  // (b6)/(b6b) (a junk and an over-range value are both rejected by ONE guard).
+  // (b1) (3 attempts with the cap at 3, read off the invoke count), (b2) (cap=1 makes exactly one) and
+  // (b6)+(b8) (a junk and an over-range value are both rejected by ONE guard).
   "REFRESH_RETRY_MAX_ATTEMPTS",
   "DEFAULT_MAX_DISPATCH_MS",
   // #1167: the merge rail's two surviving re-run bounds. Their shell symbols
@@ -988,7 +988,7 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     overrides: ["REFRESH_RETRY_MAX_ATTEMPTS=3"],
     axis: "gate",
     guardedBy:
-      "scripts/orchestrator-harness/refresh-scout.test.sh §7 (b1)/(b2)/(b6) — the shipped retry block is extracted VERBATIM and driven: an invoke count of 3 at the default, exactly 1 at cap=1, and the default restored when the knob is junk (`abc`)",
+      "scripts/orchestrator-harness/refresh-scout.test.sh §7 (b1)/(b2)/(b6)+(b8) — the shipped retry block is extracted VERBATIM and driven: an invoke count of 3 when the cap is 3, exactly 1 at cap=1, and the default restored when the knob is junk (`abc`) or over its ceiling (`99`)",
     note: "attempt cap for the in-cycle retry of a TRANSIENT refresh (3 default, legal range 1-10). `inFamily` cannot see it: the token is there (`REFRESH` contains `FRESH`) but `_ATTEMPTS` is not a bound suffix, so it is registered rather than left to the reverse scan. Validated by ONE `case` whose patterns reject junk, leading zeros AND out-of-range values (the second arm of `[1-9]|10` is the ceiling), so the check is the single authority — three redundant resets used to mean a suite arm could not attribute its red to this guard (review round 2, F3).",
   },
   {
@@ -998,7 +998,7 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     overrides: ["REFRESH_RETRY_BACKOFF_S=30"],
     axis: "gate",
     guardedBy:
-      "scripts/orchestrator-harness/refresh-scout.test.sh §7 (b1) — the retry line must name `attempt 1/3 … retrying in 0s`, so the delay and the attempt ordinal are read off the shipped block; (b3) proves the delay is REFUSED (not shortened) when it does not fit the budget; and (b7) drives REFRESH_RETRY_MAX_DELAY_S itself (backoff 1000 clamped to a 1 s cap), so the per-DELAY clamp is graded rather than assumed",
+      "scripts/orchestrator-harness/refresh-scout.test.sh §7 (b9) — a 10 s backoff is driven with BOTH the per-delay cap and the budget raised out of the way, and the arm asserts the LOGGED delays are `10s` then `20s`, so the DOUBLING itself is graded (deleting the doubling loop reds it, measured); (b3) proves the delay is REFUSED (not shortened) when it does not fit the budget; and (b7) drives REFRESH_RETRY_MAX_DELAY_S itself (backoff 1000 clamped to a 1 s cap), so the per-DELAY clamp is graded rather than assumed",
     note: "first in-cycle backoff delay for a TRANSIENT refresh, DOUBLED per attempt and clamped by REFRESH_RETRY_MAX_DELAY_S. Suites set it to 0 so the policy is graded instead of slept through — which is also why it is a knob and not a literal.",
   },
   {
@@ -1018,8 +1018,8 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     overrides: ["REFRESH_RETRY_BUDGET_S=300"],
     axis: "gate",
     guardedBy:
-      "scripts/orchestrator-harness/refresh-scout.test.sh §7 (b3) — with REFRESH_RETRY_BACKOFF_S=30 and the budget at 1 s the block makes exactly ONE attempt and logs `the 1s in-cycle retry budget is spent`, naming the stale-lock guard it protects",
-    note: "the TOTAL SLEEP the retries may spend in one cycle, checked BEFORE each sleep. This is a correctness bound, not politeness: REFRESH_STALE_LOCK_MIN clears `.refresh.lock` after 20 min, so a retrying pass that outlived it would be reaped by the NEXT cycle while STILL RUNNING — exactly the concurrent double-pass the lock exists to prevent. Checked before the sleep so no combination of the two per-delay knobs can walk past it; the shipped defaults sleep 30+60 = 90 s, an order of magnitude under the guard.",
+      "scripts/orchestrator-harness/refresh-scout.test.sh §7 (b3) and (b8) — with REFRESH_RETRY_BACKOFF_S=30 and the budget at 1 s the block makes exactly ONE attempt and logs `the 1s in-cycle retry budget is spent`, naming the stale-lock guard it protects; (b8) drives a stub that SLEEPS 2 s per pass against the same 1 s budget, so a sleeps-only accumulator (which would see 0 + 0 ≤ 1 and retry) reds, i.e. the bound is wall clock rather than the sum of the sleeps",
+    note: "the TOTAL WALL CLOCK the retries may add in one cycle, checked BEFORE each sleep. This is a correctness bound, not politeness: REFRESH_STALE_LOCK_MIN clears `.refresh.lock` after 20 min, so a retrying pass that outlived it would be reaped by the NEXT cycle while STILL RUNNING — exactly the concurrent double-pass the lock exists to prevent. ⛔ WHAT IT DOES AND DOES NOT BOUND (review round 3, measured rather than argued): it bounds the SLEEPS the retries add plus one further pass runtime — the residual is one attempt's own duration, which a retrying pass cannot cap and which a FIRST attempt already carries today (`refresh-candidates.sh:3244-3248` records that a single pass can cross the guard on its own). Worst case is therefore budget + one pass runtime, not budget alone; the shipped defaults (30 + 60 s of sleep, a 300 s budget) leave an order of magnitude of headroom under the guard for a pass that completes in the usual seconds.",
   },
   // — retention axis —
   {
