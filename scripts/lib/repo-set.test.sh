@@ -519,8 +519,17 @@ ck "f5 …and the degradation is LOGGED every pass, with the file to create" \
 # proof — and one line later the wrapper printed `<path> does not exist` flat. The degrade line is now
 # neutral about existence, and this arm reds it back if the claim returns (it is not a wording preference:
 # the sentence and the evidence above it must agree).
+# ⛔ NO PIPE INTO A QUIET grep (#841/#864) — and MEASURED, so the claim is not overstated. The guard
+# reports this shape, and it is the live occurrence `check-no-sigpipe-grep.sh` names on main. ⛔ BUT
+# THIS SUITE SETS `set -u` AND NOT `pipefail`, so the live false negative the guard exists for
+# (`grep -q` exiting at its first match, the producer taking SIGPIPE, `pipefail` turning the PIPELINE
+# non-zero) is NOT reachable in this file — the guard's own header classes exactly this as its accepted
+# producer-side over-block. What the change actually buys: the guard goes clean (main's red, inherited
+# by every PR's evaluated tree), and the wrapper is invoked ONCE per arm instead of once per grep.
+# Do not restate this as a live false-negative repair; the arm could not have red a healthy wrapper here.
+_f5b_err="$(run_wrapper_err "$nofile")"
 ck "f5b …and the degrade line asserts no existence proof the reader may have disclaimed" \
-   'run_wrapper_err "$nofile" | grep -q "DEGRADED — NO-REPO-SET" && ! run_wrapper_err "$nofile" | grep -q "DEGRADED — NO-REPO-SET: $nofile does not exist"'
+   'grep -q "DEGRADED — NO-REPO-SET" <<<"$_f5b_err" && ! grep -q "DEGRADED — NO-REPO-SET: $nofile does not exist" <<<"$_f5b_err"'
 ck "f6 …and it names the line format so the fix is copy-paste" \
    'run_wrapper_err "$nofile" | grep -q "slug=OWNER/NAME checkout=/abs/checkout"'
 
