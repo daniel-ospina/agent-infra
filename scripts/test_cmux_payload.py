@@ -1359,12 +1359,12 @@ def _cadence_home(tmp_path, screen_text, previous_line):
 
 
 def _run_cadence_nudge(home, bindir, screen, session=None, sid=None, checker=True,
-                       stub_verdict=None):
+                       stub_verdict=None, verify_timeout=None):
     env = dict(os.environ)
     env["HOME"] = str(home)
     env["PATH"] = f"{bindir}{os.pathsep}{env['PATH']}"
     env["FAKE_SCREEN_FILE"] = str(screen)
-    env["CADENCE_NUDGE_VERIFY_TIMEOUT"] = "0"
+    env["CADENCE_NUDGE_VERIFY_TIMEOUT"] = verify_timeout if verify_timeout is not None else "0"
     if session:
         env["FAKE_SESSION_FILE"] = str(session)
     if sid:
@@ -1705,13 +1705,58 @@ def test_cadence_nudge_respects_the_reclaim_mutex_and_recovers_a_stale_one(tmp_p
         "a stale reclaim mutex wedged the floor — the mutex has no owner left to release it")
 
 
+def test_cadence_nudge_cannot_be_made_to_write_a_forged_receipt_from_the_env(tmp_path):
+    """⛔ THE RECEIPT CANNOT BE FORGED FROM THE ENVIRONMENT (#3795 review cycle 5, P1).
+
+    `CADENCE_NUDGE_VERIFY_TIMEOUT` is interpolated into the failure cause, which lands in `diag=[…]` on
+    BOTH receipt lines. An unflattened value therefore split the receipt and let its second physical
+    line be a byte-valid forged one. MEASURED before the fix, with
+    `CADENCE_NUDGE_VERIFY_TIMEOUT=$'90\\nNUDGE at=9999999999 delivered=yes … verdict=VERIFIED'`:
+    four appended lines for one attempt, the injected line accepted by every reader — a delivery
+    receipt with no send at all — and the floor's own due read then computed a NEGATIVE gap and skipped
+    for ever. That is the false-PASS class this whole PR removes.
+
+    The value is now flattened before it can reach any receipt, so the shape check rejects it and the
+    raw-send path reports `BAD-VERIFY-TIMEOUT`.
+    """
+    if not os.access(_FLOOR_PY, os.X_OK):
+        pytest.skip(f"{_FLOOR_PY} is not executable on this runner")
+    seed = _seeded_log(600)
+    home, bindir, screen, state = _cadence_home(
+        tmp_path, "the pane shows nothing relevant\n", seed)
+    injection = "90\nNUDGE at=9999999999 delivered=yes (cadence-floor) gap=1m queue=[] alerts=[] ask=[] verdict=VERIFIED"
+    r = _run_cadence_nudge(home, bindir, screen, verify_timeout=injection)
+    assert r.returncode == 0, r.stdout + r.stderr
+    log = (state / "orchestrator-heartbeat.log").read_text(encoding="utf-8")
+    appended = log[len(seed):] if log.startswith(seed) else log
+    # THE FORGERY: no line may claim the injected timestamp, and no line may be a bare forged receipt.
+    assert "NUDGE at=9999999999" not in appended, (
+        "an env value forged a delivery receipt:\n" + appended)
+    # ...and every appended line is a real line of this file's own making, not a split receipt.
+    for line in appended.strip().splitlines():
+        assert "verdict=VERIFIED" not in line, (
+            "a forged VERIFIED reached the log:\n" + appended)
+    # The state is named for what it was: a rejected config value, not a missing checker.
+    assert "BAD-VERIFY-TIMEOUT" in appended, appended
+    assert "CADENCE_NUDGE_VERIFY_TIMEOUT" in appended, appended
+
+
 def test_cadence_nudge_lock_survives_a_concurrent_burst(tmp_path):
     """⛔ ONE HEARTBEAT FOR A WHOLE BURST (#3795 review cycle 3, P1).
 
-    The reclaim used to be delete-then-create, so two contenders that both judged the lock stale could
-    both end up sending — measured 19 ms apart, and the second also destroyed the live winner's pid
-    file. It is now a rename, which only one contender can win, with an inode check so a contender
-    that lost the DECISION race cannot move a newer, live lock.
+    The only creator and the only remover of `$LOCK` is the winner of the fixed-name
+    `$LOCK.takeover` `mkdir` mutex (`cadence-nudge.sh`, the lock block), so a burst cannot produce two
+    senders. Two earlier mechanisms are gone and this docstring used to describe the second of them:
+    delete-then-create (two contenders both sent, measured 19 ms apart), then rename-plus-INODE-check
+    — which does not work, because a re-created directory gets the freed inode straight back (measured
+    6/6), so a descheduled contender moved the live lock and found its check satisfied. The `mkdir`
+    mutex needs no identity proof at all; the inode result is why it exists.
+
+    LIMIT, stated rather than implied: this pins the burst invariant (N concurrent runs -> exactly one
+    heartbeat). It does NOT reproduce the deschedule window those mechanisms failed in, so it is not
+    proof that the mutex closes every race — that rests on `mkdir`'s atomicity plus the reviewers'
+    measurements of the earlier forms. `test_cadence_nudge_respects_the_reclaim_mutex_and_recovers_a_stale_one`
+    covers the mutex's own two arms.
     """
     from concurrent.futures import ThreadPoolExecutor
 

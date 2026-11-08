@@ -290,7 +290,12 @@ def _resolve_session_id_qualified(workspace: str, run, attempts: int = 3,
                 out = getattr(proc, "stdout", "") or ""
                 # A non-zero exit is a FAILED READ, not an empty answer. `_default_run` does not
                 # raise on one, so this is the only place that fact is available.
-                this_read_ok = getattr(proc, "returncode", 0) == 0
+                # ⛔ THE DEFAULT IS 1, NOT 0 (#3795 review cycle 5, P2). A status that cannot be read
+                # is a FAILURE — the same polarity `send_verified` uses for the payload send, and for the
+                # same reason: this flag gates the transcript arms, so defaulting an unreadable status to
+                # success would let an id out of a read we could not trust award a verdict. The module's
+                # documented API is the `run` seam, so a seam with no `returncode` is reachable.
+                this_read_ok = getattr(proc, "returncode", 1) == 0
                 if this_read_ok:
                     read_ok = True
             except Exception:                                  # noqa: BLE001

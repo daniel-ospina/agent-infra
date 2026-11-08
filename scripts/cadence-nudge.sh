@@ -23,13 +23,15 @@
 #
 # WHAT IT DOES. Reads the last NUDGE ATTEMPT from the log (cheap, local) -- every attempt that reaches
 # the receipt stamps `NUDGE at=`, and the `delivered=` field beside it carries the verdict for that
-# attempt (see the note above `last=` for why the read must not require `yes`). Two states stamp NO
-# receipt, both deliberately, and they recover on DIFFERENT clocks: a run whose checker printed no
-# verdict writes only the `NOT CERTIFIED` line and retries on the NEXT tick; a run KILLED inside the
-# verification window has sent and stamped nothing AND left its lock behind, so its retry waits for
-# that lock to be reclaimed (10 min if the pid is provably dead, the 20-min ceiling if nothing is
-# named -- see the lock rules below). Neither is counted as an attempt. If one is not due, exits
-# immediately (the common case -- a few ms, so it never costs the pass anything). If one IS due, builds
+# attempt (see the note above `last=` for why the read must not require `yes`). THREE states stamp NO
+# receipt, all deliberately, and they recover on DIFFERENT clocks:
+#   * the checker printed no verdict -> only the `NOT CERTIFIED` line, retried on the NEXT tick;
+#   * the run was killed WITH its EXIT trap (SIGTERM, rc=143) -> it releases the lock and writes
+#     nothing, so the next tick is DUE again and may RE-SEND;
+#   * the run was killed WITHOUT it (SIGKILL/OOM, rc=137) -> the lock survives, so the retry waits for
+#     that lock to be reclaimed (10 min if the pid is provably dead, the 20-min ceiling if nothing is
+#     named -- see the lock rules below).
+# None of them is counted as an attempt. If one is not due, exits immediately (the common case -- a few ms, so it never costs the pass anything). If one IS due, builds
 # a minimal heartbeat from CACHED/local state only -- NO network, NO `gh`, NO lane classification -- and
 # sends it by ONE OF TWO PATHS:
 #   * checker usable -- `lib/cmux_payload.py verify`, which types the payload and submits it as a
@@ -48,7 +50,7 @@
 #   ⛔ CHEAP IS THE DUE CHECK, NOT THE SEND (#3795 review P1). This paragraph used to promise the send
 #   could not be slow, and that it was "one atomic `text\n` call" -- the single-call-implies-delivery
 #   premise this change retires, false about the checker path, and still literally true only on the raw
-#   fallback. The verification window is bounded but NOT short: up to ~410 s of cmux reads and polls on
+#   fallback. The verification window is bounded but NOT short: up to ~413 s of cmux reads and polls on
 #   a slow box (budget table at the receipt). That is why the lock at the top of this file checks WHO
 #   holds it, and not only how old it is. Read this as a promise that a NOT-due pass is fast, never that
 #   a due one is.
@@ -96,7 +98,7 @@ LOCK="$STATE/cadence-nudge.lock"
 LOCKPID="$LOCK.pid"
 # ⛔ THE TAKEOVER MUST NEVER RACE A LIVE NUDGE, AND MUST NEVER WEDGE FOREVER (#3795 review P1+P1).
 # Both halves were measured failures, in opposite directions:
-#   * AGE-ONLY (the original) raced a live nudge. The critical section now runs up to ~410 s of
+#   * AGE-ONLY (the original) raced a live nudge. The critical section now runs up to ~413 s of
 #     verification (budget table at the receipt) plus pre-send work, so at 360 s (`-mmin +6`) a run
 #     could still be typing -- a second tick rmdir'd its lock, found no stamp from the in-flight run,
 #     read the PREVIOUS one, judged itself DUE, and BOTH typed a full heartbeat seconds apart
@@ -114,10 +116,11 @@ LOCKPID="$LOCK.pid"
 # or unreadable pid is only reclaimable once the lock is OLDER than LOCK_AGE_GRACE ... the actuator was
 # permanently dead with a clean log"). Applied here:
 #   1. a pid is not an identity -- the holder's argv must CONTAIN this script's name
-#      (`ps -o args=`), so a recycled or FOREIGN pid never reads as a holder. A substring match, not
-#      equality: a foreign process merely NAMED after this file (an editor with it open, a wrapper)
-#      still reads as a holder. That residual is bounded by rule 3's ceiling, and is stated here rather
-#      than denied -- the same honesty `auto-rail.sh` applies to its own predicate;
+#      (`ps -o args=`), so a RECYCLED pid does not read as a holder: a process that merely inherited the
+#      number cannot name this script. A process whose argv happens to NAME this file (an editor with
+#      it open, a wrapper) does still read as a holder -- a substring match, not equality -- and that
+#      residual is bounded by rule 3's ceiling. Stated rather than denied, which is the honesty
+#      `auto-rail.sh` applies to its own predicate;
 #   2. a genuine live holder is not taken over by AGE alone; it is taken over only by the ABSOLUTE
 #      CEILING in rule 3. Every skip is LOGGED, because a silent skip is how the floor died once;
 #   3. a genuine live holder past the 20-min ceiling IS taken over -- bounded, because past 2.7
@@ -125,7 +128,7 @@ LOCKPID="$LOCK.pid"
 #      duplicate a duplicate lane ORDER is (see the residual note at the receipt);
 #   4. a pid that is ALIVE but not this script (recycled, or foreign) is reclaimed at the SHORT grace:
 #      it is provably not the nudge that wrote it, so nothing is raced by reclaiming;
-#   5. a pid file naming a DEAD process is its own state, reclaimed at a bound above the ~410 s window
+#   5. a pid file naming a DEAD process is its own state, reclaimed at a bound above the ~413 s window
 #      and well under the ceiling: the holder is provably gone, so waiting the ceiling out buys nothing
 #      and costs 2.7 ticks. (SIGTERM runs the EXIT trap and releases the lock; SIGKILL/OOM does not,
 #      and that is this state.)
@@ -170,11 +173,30 @@ _nudge_holder_live() {      # rc 0 = a process that IS this script owns the lock
 TAKEOVER="$LOCK.takeover"
 if ! mkdir "$TAKEOVER" 2>/dev/null; then
   # Either a reclaim is in flight right now (microseconds), or its owner died holding the mutex.
+  # ⛔ THE STALE MUTEX IS CLAIMED BY `mv`, NEVER BY `rmdir` (#3795 review cycle 5, P1). The previous
+  # form was `find` (is it stale?) then `rmdir` then `mkdir` -- three steps against a SHARED name, so
+  # a contender that read the OLD mutex as stale could `rmdir` the FRESH one another contender had
+  # just created, and both entered the section the banner below calls exclusive. MEASURED: 8
+  # contenders over a stale mutex produced 2-5 simultaneous owners in 17/20 trials and duplicate
+  # sends. `rename(2)` succeeds for exactly one contender, so only the winner removes anything.
   if [ -n "$(find "$TAKEOVER" -maxdepth 0 -mmin +"$NUDGE_TAKEOVER_STALE_MIN" 2>/dev/null)" ]; then
-    rmdir "$TAKEOVER" 2>/dev/null
+    if mv "$TAKEOVER" "$TAKEOVER.doomed.$$" 2>/dev/null; then
+      # ...and the directory we actually moved must ITSELF be stale. A contender that lost the read
+      # race can otherwise move a freshly created mutex; put it back rather than deleting a live
+      # holder's mutex. `rm -rf` covers a mutex left non-empty (a stray file inside it), which a bare
+      # `rmdir` could never remove -- that was a permanent skip.
+      if [ -n "$(find "$TAKEOVER.doomed.$$" -maxdepth 0 -mmin +"$NUDGE_TAKEOVER_STALE_MIN" 2>/dev/null)" ]; then
+        rm -rf "$TAKEOVER.doomed.$$" 2>/dev/null
+      elif [ -e "$TAKEOVER" ]; then
+        # Someone else already holds the name; leave their mutex alone and drop our copy.
+        rm -rf "$TAKEOVER.doomed.$$" 2>/dev/null
+      else
+        mv "$TAKEOVER.doomed.$$" "$TAKEOVER" 2>/dev/null
+      fi
+    fi
   fi
   mkdir "$TAKEOVER" 2>/dev/null || {
-    printf '%s CADENCE-NUDGE lock-skip holder=none — another pass holds the reclaim mutex or a stale one is not yet expired; this one made no attempt\n' \
+    printf '%s CADENCE-NUDGE lock-skip holder=none — another pass holds the reclaim mutex (or a stale one is not yet expired); this one made no attempt\n' \
       "$(date '+%m-%d %H:%M:%S')" >> "$LOG"
     exit 0
   }
@@ -759,29 +781,43 @@ fi
 # which exits BEFORE argparse validates the `--timeout` VALUE -- so `CADENCE_NUDGE_VERIFY_TIMEOUT=90s`
 # (the obvious human spelling of 90) passed the probe and then made the real call die in argparse,
 # before it could send. Validate the shape here, so the argv the probe covered is the argv that runs.
-_vtimeout="${CADENCE_NUDGE_VERIFY_TIMEOUT:-90}"
+_vtimeout=$(printf '%s' "${CADENCE_NUDGE_VERIFY_TIMEOUT:-90}" | tr -d '\r\n')
+# ⛔ THE VALUE IS SANITISED BEFORE IT CAN REACH A RECEIPT, NOT MERELY FLATTENED (#3795 review cycle 5,
+# P1). It is interpolated into `_checker_broken` -> `_cause` -> `_vdiag` -> BOTH receipt lines, so an
+# env value containing a newline split the receipt and let its second physical line be a byte-valid
+# FORGED one: `CADENCE_NUDGE_VERIFY_TIMEOUT=$'90\nNUDGE at=9999999999 delivered=yes … verdict=VERIFIED'`
+# wrote a delivery receipt with no send at all (measured), and that same line then made the floor
+# compute a NEGATIVE gap and skip for ever.
+#   Flattening alone is NOT enough (measured): the injected text still lands INLINE in `diag=[…]`, and
+#   the due read is an UNANCHORED `.*NUDGE at=\([0-9]+\) delivered=` — so a `NUDGE at=… delivered=`
+#   fragment anywhere on the line is read as a receipt. The echoed value is therefore reduced to the
+#   characters a timeout can legally contain, so no receipt-shaped token survives it at all.
+_vtimeout_raw="${CADENCE_NUDGE_VERIFY_TIMEOUT:-90}"
+_vtimeout=$(printf '%s' "$_vtimeout_raw" | tr -d '\r\n')
+_vts_echo=$(printf '%s' "$_vtimeout" | tr -cd '0-9.' | cut -c1-20)
 case "$_vtimeout" in
-  ''|.|*[!0-9.]*|*.*.*) _checker_broken="CADENCE_NUDGE_VERIFY_TIMEOUT is not a positive number: '$_vtimeout'" ;;
+  ''|.|*[!0-9.]*|*.*.*) _checker_broken="CADENCE_NUDGE_VERIFY_TIMEOUT is not a positive number (digits and one dot only): got '${_vts_echo}'" ;;
 esac
 # ⛔ AND IT IS BOUNDED, NOT ONLY SHAPE-CHECKED (#3795 review cycle 2, P2). `verify --timeout` is a
 # DEADLINE, not a per-call bound (`cmux_payload.py` sets `deadline = monotonic() + timeout_s` and polls
 # it), so a large value holds this run -- and the lock -- well past the 450 s tick interval that the
-# whole 410 s budget is measured against. `999999999` passed a shape-only check and wedged the floor.
+# whole 413 s budget is measured against. `999999999` passed a shape-only check and wedged the floor.
 # The ceiling is the verification budget's own scale, so it cannot outlive the interval by more than a
-# little: the tail is `timeout + one 45 s read` and everything BEFORE it is ~275 s, so an accepted
-# 120 s gives 275 + 165 = 440 s — still inside 450. A value of `inf` (400 digits) is refused by the
-# length guard before `-gt` ever sees it.
-# ⛔ THE CEILING IS 120, NOT 300 (#3795 review cycle 4, P2). The first version capped at 300 and
+# little: the tail is `timeout + poll_s + one 45 s read` and everything BEFORE it is ~275 s, so 120 s
+# gives 275 + 168 = 443 s. A value of `inf` (400 digits) is refused by the length guard before `-gt`
+# ever sees it.# ⛔ THE CEILING IS 120, NOT 300 (#3795 review cycle 4, P2). The first version capped at 300 and
 # justified it with "300 s + one 45 s read still lands inside 450 s" — which is the TAIL ONLY. The
 # budget table at the receipt counts ~275 s of work BEFORE the tail, so an accepted 300 s put the
 # critical section at ~620 s: 1.4x the interval the cap exists to protect, with the next tick
 # correctly skipping and the beat drifting to ~15 min with nothing on the receipt naming the cause.
-# 275 + (120 + 45) = 440 s is the largest admitted value that actually fits.
+# 120 is the largest round value whose whole window still fits (443 s), and even that leaves the
+# pre-send work this file cannot bound (`objective.py` has no timeout) as the residual — see the
+# budget note at the receipt, which is the only place the two terms are added together.
 if [ -z "$_checker_broken" ]; then
   _vts_int="${_vtimeout%%.*}"
   [ -n "$_vts_int" ] || _vts_int=0
   if [ "${#_vts_int}" -gt 3 ] || [ "$_vts_int" -gt 120 ]; then
-    _checker_broken="CADENCE_NUDGE_VERIFY_TIMEOUT must be <= 120 s (the pre-tail work is ~275 s of a 450 s interval), got '$_vtimeout'"
+    _checker_broken="CADENCE_NUDGE_VERIFY_TIMEOUT must be <= 120 s (the pre-tail work is ~275 s of a 450 s interval), got '${_vts_echo}'"
   fi
 fi
 if [ -z "$_checker_broken" ]; then
@@ -909,10 +945,10 @@ fi
 #   3x45 s surface-qualified reads + 1 s of retry sleeps   = 136 s
 #   1x45 s workspace-only fallback read                    =  45 s
 #   45 s payload send + 2 s sleep + 45 s Enter + 2 s sleep  =  94 s
-#   tail sentinel: `--timeout 90` PLUS one 45 s read-screen, because the deadline is tested AFTER the
-#   read and the iteration that finds it returns immediately (there is NO extra poll -- an earlier
-#   version of this table counted a phantom 3 s one, #3795 review cycle 4)          = 135 s
-#                                                        TOTAL = 410 s
+#   tail sentinel: `--timeout 90` PLUS one `poll_s` (3 s) PLUS one 45 s read-screen, because the
+#   deadline is tested AFTER the read and the poll is paid on the iteration that has not yet crossed
+#   it (measured: 136.5 s max tail, so 138 is the bound, #3795 review cycle 5)        = 138 s
+#                                                        TOTAL = 413 s
 # The governing boundary is the 450 s `cadence-timer.sh` interval. An age bound alone is NOT the
 # protection it looks like -- this window exceeds any short one -- which is why the takeover at the top
 # of this file checks IDENTITY as well as age: a holder is reclaimed only by the 20-min ceiling (never
@@ -920,10 +956,10 @@ fi
 # not until the ceiling. An age-only takeover here produced two heartbeats 5 s apart; a pid-only one
 # killed the floor outright on a recycled pid.
 #
-# ⛔ AND 410 s IS THE VERIFICATION WINDOW ONLY (#3795 review cycle 4, P2). The lock is taken at the TOP
+# ⛔ AND 413 s IS THE VERIFICATION WINDOW ONLY (#3795 review cycle 4, P2). The lock is taken at the TOP
 # of this file and the pre-send work runs under it too: `goal-state.py` is bounded by its 20 s + 3 s
 # watchdog, and the `objective.py` reads have no timeout in this file. So the real tick budget is
-# 410 s + that work, inside 450 s — not "410 s with 40 s to spare". The margin is thin enough that a
+# 413 s + that work, inside 450 s — not "413 s with 37 s to spare". The margin is thin enough that a
 # future retry must not be added against it without re-measuring.
 # ⛔ A NO-VERDICT RUN WRITES NO RECEIPT (#3795 review P1). `NUDGE at=` is the claim that this pass
 # attempted a beat, and it is read by the tick's rate limiter as well as by this file's due read, so
