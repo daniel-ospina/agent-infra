@@ -283,16 +283,6 @@ check_credentials() {
     [ -n "$rel" ] || continue
     f_leg="$HOME_LEGACY/$rel"
     f_dur="$HOME_DURABLE/$rel"
-    # ⛔ AN UNSEARCHABLE LEGACY PATH IS NOT "LEGACY MIA" (review F1). `[ ! -e "$f_leg" ]` is the same
-    # answer for "the file is gone" and for "I was not allowed to look" — and the second one read as
-    # "nothing to converge" on the box this fails on: a root-owned 0700 legacy home under a non-root
-    # `--check`. The durable side then looks converged and `--check` can reach 0 over a credential it
-    # never measured, which is the number that authorises reclaiming that very directory.
-    if [ ! -e "$f_leg" ] && cannot_traverse "$f_leg"; then
-      warn_line "  CANNOT MEASURE: $rel — a legacy path this account cannot look inside ($f_leg; a parent directory denies search to $INVOKER), so 'no legacy credential here' is not a reading this tool took"
-      unmeas=1
-      continue
-    fi
     # ⛔ THE CONTENT LEG RUNS FIRST AND INDEPENDENT OF THE LEGACY SIDE. The DURABLE file is what lanes
     # SOURCE, so a re-pointing assignment in it is drift whether or not a legacy copy still exists —
     # the legacy home is reclaimed later, and this check must not disappear with it. Names only, never
@@ -317,6 +307,20 @@ check_credentials() {
       unmeas=1; continue
     fi
     if [ ! -e "$f_leg" ]; then
+      # ⛔ AN UNSEARCHABLE LEGACY PATH IS NOT "LEGACY MIA" (review F1). `[ ! -e "$f_leg" ]` is the same
+      # answer for "the file is gone" and for "I was not allowed to look" — and the second one read as
+      # "nothing to converge" on exactly the box this fails on: a root-owned 0700 legacy home under a
+      # non-root `--check`. The durable side then looks converged and `--check` reaches 0 over a
+      # credential it never measured, on the number that authorises reclaiming that very directory.
+      # ⛔ AND IT IS ASKED HERE, NOT ABOVE THE CONTENT LEG: the durable file is what lanes SOURCE, so it
+      # is graded whether or not the legacy side can be seen (the leg's own rule, one screen up). Placed
+      # above, the guard `continue`d past that grading and stopped measuring the one file that can put
+      # every lane back into the second home — found in self-review, pinned by `k9c`.
+      if cannot_traverse "$f_leg"; then
+        warn_line "  CANNOT MEASURE: $rel — a legacy path this account cannot look inside ($f_leg; a parent directory denies search to $INVOKER), so 'no legacy credential here' is not a reading this tool took"
+        unmeas=1
+        continue
+      fi
       note "  $rel: legacy MIA, durable $(describe "$f_dur")"
       continue
     fi
@@ -352,14 +356,6 @@ migrate_credentials() {
     [ -n "$rel" ] || continue
     f_leg="$HOME_LEGACY/$rel"
     f_dur="$HOME_DURABLE/$rel"
-    # ⛔ THE SAME UNMEASURABLE LEG AS `--check`, so the two modes cannot disagree about one box (the
-    # lesson of the previous round's F1): "nothing to copy" and "I could not look" are different
-    # answers, and only one of them means the credential half converged.
-    if [ ! -e "$f_leg" ] && cannot_traverse "$f_leg"; then
-      warn_line "  CANNOT MEASURE: $rel — a legacy path this account cannot look inside ($f_leg; a parent directory denies search to $INVOKER); nothing was copied and nothing was ruled out"
-      unmeas=1
-      continue
-    fi
     # ⛔ THE CONTENT LEG RUNS FIRST AND INDEPENDENT OF THE LEGACY SIDE — same reason as `--check`: the
     # durable file is what lanes source, and the legacy home is reclaimed later, so this report must not
     # vanish with it (and the two modes must not disagree about the same box).
@@ -381,7 +377,17 @@ migrate_credentials() {
       warn_line "  CANNOT MEASURE: $rel — the durable path $f_dur cannot be measured by $INVOKER (a parent directory denies search), so 'durable is missing' is not a reading this tool took; nothing was copied and nothing was ruled out"
       unmeas=1; continue
     fi
-    [ -e "$f_leg" ] || continue
+    if [ ! -e "$f_leg" ]; then
+      # ⛔ THE SAME UNMEASURABLE LEG AS `--check`, IN THE SAME PLACE — below the durable-side content leg,
+      # so the two modes agree about one box (the lesson of the previous round's F1) without either of
+      # them skipping the file lanes actually source: "nothing to copy" and "I could not look" are
+      # different answers, and only one of them means the credential half converged.
+      if cannot_traverse "$f_leg"; then
+        warn_line "  CANNOT MEASURE: $rel — a legacy path this account cannot look inside ($f_leg; a parent directory denies search to $INVOKER); nothing was copied and nothing was ruled out"
+        unmeas=1
+      fi
+      continue
+    fi
     if [ -e "$f_dur" ]; then
       note "  kept   $rel (durable copy exists — never overwritten)"
       # ⛔ THE SAME DIVERGENCE WARNING THE CHECK EMITS, EMITTED HERE TOO. `--apply` is the mode where a

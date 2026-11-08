@@ -522,6 +522,17 @@ else
     || bad "k8 --check answered $_rc while a legacy credential path could not be stat'ed"
   case "$_out" in *"CANNOT MEASURE"*"keys.env"*) ok "k9 …naming the credential path it could not look at" ;; *) bad "k9 the unmeasurable credential is not named" ;; esac
   case "$_out" in *"legacy MIA"*) bad "k9b …and it still reports the denied path as 'legacy MIA'" ;; *) ok "k9b …and it does NOT report the denied path as 'legacy MIA'" ;; esac
+  # ⛔ AND THE GUARD MUST NOT SHORT-CIRCUIT THE DURABLE-SIDE CONTENT LEG. The durable `keys.env` is what
+  # lanes SOURCE, so a re-pointing assignment in it is drift whether or not the legacy side can be seen
+  # — the leg's own rule, stated one screen above it. A guard placed ABOVE that leg `continue`s past it
+  # and stops grading the one file that can put every lane back into the second home; this arm is what
+  # makes such a placement red instead of quietly "safer".
+  printf 'export CELL_HOME=%s\n' "$LEG" >"$DUR/keys.env"; chmod 600 "$DUR/keys.env"
+  _out="$(run_tool "$TOOL" --check)"
+  case "$_out" in
+    *"keys.env: the DURABLE copy ASSIGNS"*) ok "k9c …while the DURABLE-side content leg still runs (a poisoned keys.env is named even with the legacy side blind)" ;;
+    *) bad "k9c the unmeasurable-legacy guard short-circuited the durable-side content leg" ;;
+  esac
 fi
 chmod 755 "$LEG" 2>/dev/null
 
