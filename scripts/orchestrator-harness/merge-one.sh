@@ -134,6 +134,16 @@ if [ -d "$O/gh-rest" ]; then PATH="$O/gh-rest:$PATH"; fi
 # so it does not need — and must not silently inherit — a permanent bypass.
 . "$SELF/gate-policy.sh" 2>/dev/null || { echo "[merge $PR] FATAL: $SELF/gate-policy.sh missing — refusing to run a lander that cannot say whether its gates are on" >&2; exit 78; }
 apply_gate_policy merge-one
+# ── THE MANDATORY LANE REPORT'S CONSUMER (#2977, owner ruling 2026-10-28) ─────────────────────────
+# The ruling keeps push/PR authority with the session gates bypassed BY DESIGN and moves the guarantee
+# to the harness: a durable per-lane report plus a verifier that refuses to merge on silence. The report
+# existed and NOTHING read it (measured 2026-11-07: `rg WORKTREE-REPORT merge-one.sh` -> 0 hits) while
+# the consumer repos' docs asserted the refusal existed — a doc promising a gate the code lacks is
+# itself the bypass. Sourced WITHOUT `|| true`, like gate-policy.sh above: a lander that cannot load
+# its evidence gate must not run pretending it has one.
+LANE_REPORT_GATE="$SELF/lane-report-gate.sh"
+[ -f "$LANE_REPORT_GATE" ] || LANE_REPORT_GATE="${O:-}/lane-report-gate.sh"
+. "$LANE_REPORT_GATE" 2>/dev/null || { echo "[merge $PR] FATAL: lane-report-gate.sh missing (looked in $SELF and \${O:-/nonexistent}) — refusing to run a lander whose evidence gate cannot load (#2977); redeploy: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o \"$O\"" >&2; exit 78; }
 # ⛔ A DIFFERENT HATCH, DELIBERATELY UNTOUCHED: main-edits is a declared escape for writing to a main
 # checkout, not a review bypass, and #2319 does not rule on it.
 export AGENT_ALLOW_MAIN_EDITS=1 ELDATO_ALLOW_MAIN_EDITS=1
@@ -1162,6 +1172,32 @@ rail_attempt() {
   # [railrefusal:end]
   exit 0
 }
+
+# ── THE MANDATORY LANE REPORT (#2977) — the evidence half of the gate substitution ──────────────
+# ⛔ IT RUNS HERE, BEFORE THE RAIL SHORT-CIRCUIT, because the short-circuit is the MERGE: a check placed
+# after `record_at_head` would skip every rail repo's merges — i.e. exactly the repos where a lane's own
+# report is the only evidence there is.
+# ⛔ IT DOES NOT `park`. A park is keyed to the HEAD, and the remedy for a stale/absent report costs NO
+# PUSH (re-run the suites at this head and re-write the report) — so parking would make the lane's own
+# re-run read `exit 5` (already parked at this head) and deadlock it into a hand-off. `exit 9` is
+# re-entrant by construction: the same head re-checks, and passes once the report is fixed.
+# ⛔ 5 AND 6 ARE ABSTENTIONS AND ARE LOGGED, NEVER SILENT: `5` = the repo ships no writer for this report
+# (no report of this format can exist there), `6` = no worktree for this branch on this box (the lane's
+# evidence is not reachable from here — measured: 13 of 13 open tortoise PRs had no worktree on the hub).
+# Refusing on either would stop every cross-box merge in the fleet; treating either as green would be the
+# false PASS this issue exists to close. `7` (a report that exists but cannot be VERIFIED) DOES refuse:
+# an unreadable verification is not a pass.
+_lrg_rc=0; _lrg_out=""
+_lrg_out="$(lane_report_gate "$REPO" "$BR" "${HEAD:-}" 2>&1)" || _lrg_rc=$?
+[ -n "$_lrg_out" ] && echo "[merge $PR] $_lrg_out" >> "$L.log"
+case "$_lrg_rc" in
+  0)  : ;;
+  5|6) echo "[merge $PR] LANE REPORT NOT ENFORCED (rc=$_lrg_rc) — an ABSTENTION, not a green: the mandatory lane report (#2977) was not verified for this merge" >> "$L.log" ;;
+  *)  echo "[merge $PR] LANE REPORT REFUSED (rc=$_lrg_rc) at head=${HEAD:-?} — refusing to merge on a lane report that does not support this tree (#2977). No review was bought and nothing was merged." >> "$L.log"
+      { lane_report_remedy "$_lrg_rc" 2>/dev/null || true; } >> "$L.log"
+      echo "[merge $PR] LANE REPORT REFUSED (rc=$_lrg_rc): $(printf '%s' "$_lrg_out" | tail -1)" >&2
+      exit 9 ;;
+esac
 
 if [ "$MERGE_AUTHORITY" = "rail" ]; then
   # RAIL MODE — the rail is the MERGE authority, and since agent-infra#1825 it is no longer an

@@ -66,6 +66,27 @@ CHECKS_TSV=""; PR_TSV=""; MAX_ROUNDS_OVERRIDE=""
 # at the point of use (never silently skipped).
 # shellcheck source=/dev/null
 . "$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)/pr-state.sh" 2>/dev/null || true
+# ── THE MANDATORY LANE REPORT'S CONSUMER (#2977, owner ruling 2026-10-28) ────────────────────
+# ⛔ THIS IS THE EVIDENCE HALF OF THE GATE SUBSTITUTION, AND IT IS GATED HERE BECAUSE THIS IS THE LANE'S
+# OWN CONVERSATION. The ruling keeps push/PR authority with the session gates bypassed BY DESIGN and
+# makes the harness supply the equivalent guarantee: a durable per-lane report (tortoise#10220) plus a
+# verifier that refuses to merge on silence. Measured 2026-11-07: nothing consumed the report, and the
+# one staleness signal it emits (`head_moved_since_write`) is a WARNING by a recorded decision whose
+# owner is "the consumer" — two of four review rounds that day were re-run because a report described a
+# tree one commit behind the head being merged, and `check` exited 0 both times.
+# ⛔ REFUSING HERE RATHER THAN ONLY INSIDE merge-one.sh IS NOT DUPLICATION: the remedy costs NO PUSH
+# (re-run the suites at this head and re-write the report), so parking at a head inside the chain would
+# deadlock the lane on its own `parked-<PR>` marker. Here it is one FIX_REQUIRED round and the lane can
+# clear it in place; the chain keeps its own refusal as the backstop for every other ingress.
+# Sourced WITHOUT the `|| true` that pr-state.sh gets: a missing consumer for a gate is a harness defect
+# that must be loud, and `lane_report_gate` would then be an unbound command (set -u) at the one place
+# the lane is told it may merge.
+LANE_REPORT_GATE=""
+for _lrg in "$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)/lane-report-gate.sh" "$O/lane-report-gate.sh"; do
+  [ -f "$_lrg" ] && { LANE_REPORT_GATE="$_lrg"; break; }
+done
+# shellcheck source=/dev/null
+[ -n "$LANE_REPORT_GATE" ] && . "$LANE_REPORT_GATE"
 lrow=""
 while [ $# -gt 0 ]; do
   # ⛔ A VALUE-LESS TRAILING FLAG USED TO SPIN FOREVER (landing-review P2, REPRODUCED). Seven arms ended
@@ -598,6 +619,12 @@ chain_verdict_from_log() { # chain_verdict_from_log <chain-log> [head]
     #     comment on an already-merged PR, and chain-merge re-ran merge-one.sh on it.
     # Both spellings are accepted on purpose: a `$O` deployed before the rename still writes the older
     # `NOT CLEAN or reviewer failed` line, and a lane reading its own box's log must not misclassify it.
+    # ⛔ THE MANDATORY LANE REPORT'S REFUSAL IS A FIX DUTY, NOT A BLOCK (#2977). merge-one.sh exits 9
+    # with no `needsfix` marker (it must not authorise a code-fixing agent for a report the LANE can fix
+    # in place, with no push), so without this arm a refused report classified UNKNOWN and reached the
+    # lane as BLOCKED_ATTESTATION (12) — "hand off, only a fresh reviewer can supply this" — about a
+    # report the lane itself can re-run. Same writer's-vocabulary rule as the patterns below.
+    if tail -n 300 "$mlog" 2>/dev/null | grep -qE '^\[merge [0-9]+\] LANE REPORT REFUSED'; then echo "FIX_REQUIRED"; return; fi
     if tail -n 300 "$mlog" 2>/dev/null | grep -qE 'NO VERDICT \(stall/crash/timeout|no needsfix marker|NOT CLEAN or reviewer failed'; then
       echo "REVIEW_NO_VERDICT"; return
     fi
@@ -1245,6 +1272,30 @@ done
 
 # Green + mergeable → launch the harness chain (fresh reviewer where the repo needs one, the repo's
 # own rail where it does not) and hand control to --watch.
+#
+# ── THE MANDATORY LANE REPORT (#2977) — BEFORE the chain, because the chain is PAID ────────────
+# A report that is absent, invalid, red or written at another head is not evidence for the tree about
+# to be merged, and a lane whose own evidence says that may not land. 5 and 6 are ABSTENTIONS (this box
+# or this repo cannot carry the check) and are logged, never treated as green: collapsing them into a
+# pass is how a gate reports coverage it does not have.
+_lrg_rc=0; _lrg_out=""
+if [ -n "$LANE_REPORT_GATE" ]; then
+  # ONE run, captured: the verdict line is the diagnosis, and running the gate twice to quote it would
+  # pay two git/python invocations per merge for a message.
+  _lrg_out="$(lane_report_gate "${REPO_PATH:-$(pwd)}" "$RESOLVED_BR" "$HEAD" 2>&1)" || _lrg_rc=$?
+  [ -n "$_lrg_out" ] && log_line "$_lrg_out"
+else
+  log_line "lane-report: NOT CHECKED — lane-report-gate.sh is not deployed (looked beside this script and in \$O=$O). The mandatory lane report (#2977) is NOT verified on this box; redeploy the harness."
+  _lrg_rc=5
+fi
+case "$_lrg_rc" in
+  0)  log_line "lane-report: verified at head ${HEAD:0:12} — the report describes the tree being merged" ;;
+  5|6) log_line "lane-report: NOT ENFORCED here (rc=$_lrg_rc) — an abstention, not a green: this box/repo cannot carry the check" ;;
+  *)  log_line "⛔ lane-report: REFUSED (rc=$_lrg_rc) — the mandatory lane report does not support merging head ${HEAD:0:12}"
+      lane_report_remedy "$_lrg_rc" 2>/dev/null || true
+      emit_fix FIX_REQUIRED "the lane report does not support this merge (rc=$_lrg_rc): $(printf '%s' "$_lrg_out" | tail -1)" ;;
+esac
+
 launch_chain "$HEAD" || exit 2
 log_line "… the merge chain owns PR #$PR now. Next: lane-merge.sh $PR --watch (bounded chunk; repeat)"
 exit 11
