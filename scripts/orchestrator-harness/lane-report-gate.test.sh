@@ -484,6 +484,20 @@ fi
 # the report would pass the behavioural row only while the host happens to have a working sed.
 if grep -vE '^[[:space:]]*#' "$GATE" | grep -q 'sed -n'; then bad "the gate reintroduced a PATH-resolved \`sed -n\` over the report (the sealed cross-check is disableable again)"; else ok "no \`sed -n\` extractor remains in the executable part of the gate — the sealed stamp comes from the pinned interpreter pass"; fi
 if grep -q '_seal_pat' "$GATE" && grep -q 'sealed12' "$GATE"; then ok "…and the stamp is extracted inside the isolated JSON pass (sealed12)"; else bad "the sealed stamp is not extracted in the isolated pass — the PATH disclosure would be false"; fi
+
+# ── 2h-3. A SECOND FULL-SHAPE STAMP IS REFUSED, NOT RESOLVED BY POSITION (round-13 review, LOW) ──
+# ⛔ THE WRITER DOES NOT PUT THE STAMP LAST. It renders `## Suites run` (commands verbatim) and
+# `## Could not do` (lane-supplied `note --not-done` text, verbatim) BELOW the real Base line, so a lane can
+# append a line that reproduces the anchored shape and, with the unkeyed digest re-sealed, make a STALE real
+# stamp agree with a forged state. Measured on the pre-fix gate: rc=4 STALE → rc=0 PASS. An honest report
+# carries exactly one stamp, so a second is a self-contradicting artifact, not a tie to break by position.
+_INJ="**Base:** \`main\` → **head at write:** \`$(printf '%s' "$WT_HEAD" | cut -c1-12)\`"
+printf '## Files changed\n- **Base:** `main` → **head at write:** `%s`\n## Suites run\n## Could not do\n- %s\n' "$_SEALED_A" "$_INJ" > "$WT/WORKTREE-REPORT.md"
+printf '{"version":1,"head_at_write":"%s","branch":"feat/2977-tm","suites":[{"n":1,"command":"x","exit":0,"finished_at":"2099-01-01T00:00:00Z"}]}\n' "$WT_HEAD" > "$WT/.worktree-report/state.json"
+drive 2 "INVALID: a report carrying TWO head-at-write stamps (a 'note --not-done' line reproducing the shape) is refused" STUB_OK=1 STUB_RC=0 STUB_STALE=0
+case "$LAST_OUT" in *reason=report-carries-more-than-one-head-at-write-stamp*) ok "…and it names the duplicate stamps rather than picking one by position" ;; *) bad "duplicate-stamp reason: $LAST_OUT" ;; esac
+case "$LAST_OUT" in *VERDICT=PASS*) bad "a duplicated stamp let a forged state PASS (the lane-authored line was read as sealed)" ;; *) ok "…and the injected stamp does not become the sealed head" ;; esac
+_restore_state
 # Restore the stanza-free report the baseline fixtures use, so later arms that re-point the head are not
 # judged against a stamp from this block.
 printf '## Files changed\n## Suites run\n## Could not do\n' > "$WT/WORKTREE-REPORT.md"
@@ -704,6 +718,34 @@ if [ "$rc" = 6 ]; then ok "CONTROL: evidence for no branch on this box still abs
 # detaches at another commit AND deletes its writer state still gets 6. The disclosure must stay in the file
 # (the same rule the consumer-provenance row above pins).
 if grep -q 'detaches at another commit AND deletes' "$GATE"; then ok "the off-branch residual (detach at another commit + delete the writer state) is DISCLOSED in the gate"; else bad "the off-branch residual is not disclosed — the arm would read as closing more than it does"; fi
+
+# ── 4i. THE CROSS-BOX ABSTENTION SURVIVES A BOX WITH NO 3.12 INTERPRETER (round-13 review, MED) ──
+# ⛔ RESOLVING THE INTERPRETER BEFORE LOOKING FOR A WRITER STATE turned every cross-box merge into a hard
+# refusal on exactly the host shapes this file documents (macOS `/usr/bin/python3` = 3.9, Debian 11,
+# Ubuntu 20.04): `_lrg_py` failed and short-circuited to 7 before any state was looked for, with a remedy
+# ("re-run the suites") the box cannot execute — the 13-of-13 shape, refused. The question code 6 turns on
+# is "does this box hold ANY evidence", and a `[ -f ]` test answers it, so it must be answered first.
+GATE_NOPY="$TMP/lane-report-gate-nopy.sh"
+python3 - "$GATE" "$GATE_NOPY" <<'PYX' 2>/dev/null || bad "fixture: could not build the no-interpreter gate copy"
+import sys
+src = open(sys.argv[1]).read().replace('_lrg_py() {', '_lrg_py_real() {', 1)
+marker = '\n# _lrg_worktree <repo> <branch>'
+assert marker in src
+src = src.replace(marker, '\n_lrg_py() { return 1; }\n' + marker, 1)
+open(sys.argv[2], 'w').write(src)
+PYX
+NOSTATE="$TMP/nostate"
+mkdir -p "$NOSTATE"; git -C "$NOSTATE" init -q -b main
+printf 'a\n' > "$NOSTATE/f"; git -C "$NOSTATE" add f; git -C "$NOSTATE" commit -qm one
+git -C "$NOSTATE" worktree add -q -b feat/elsewhere "$NOSTATE/.worktrees/lane" HEAD 2>/dev/null || bad "fixture: could not create the nostate worktree"
+_FAKE="0123456789abcdef0123456789abcdef01234567"
+out="$(bash "$GATE_NOPY" --check "$NOSTATE" "feat/absent" "$_FAKE" 2>&1)"; rc=$?
+if [ "$rc" = 6 ]; then ok "a box with NO usable interpreter and NO writer state still ABSTAINS with 6 — the cross-box merge is not refused (rc=$rc)"; else bad "a box with no interpreter over a repo holding no evidence produced rc=$rc (expected 6): $out"; fi
+out="$(bash "$GATE_NOPY" --check "$OFF" "feat/absent" "$_FAKE" 2>&1)"; rc=$?
+if [ "$rc" = 7 ]; then ok "…but the SAME box, over a repo that DOES hold writer state, is 7 UNMEASURABLE — an unreadable attribution of real evidence is not an abstention (rc=$rc)"; else bad "a holder with no interpreter produced rc=$rc (expected 7): $out"; fi
+case "$out" in *reason=cannot-attribute-this-repos-lane-evidence-without-a-python-3-12-interpreter*) ok "…and it names the interpreter, not the report" ;; *) bad "no-interpreter-holder reason: $out" ;; esac
+out="$(bash "$GATE" --check "$NOSTATE" "feat/absent" "$_FAKE" 2>&1)"; rc=$?
+if [ "$rc" = 6 ]; then ok "CONTROL: on a normal box the same no-evidence repo is also 6 (the row above is not asserting a blanket 7)"; else bad "no-evidence repo on a normal box: expected rc=6, got rc=$rc :: $out"; fi
 
 # ── 5. EXACT BRANCH MATCH (§6) — both mutant directions — the decoys sort FIRST in the walk ──
 # ── 5. EXACT BRANCH MATCH (§6) — both mutant directions, and the decoys sort BEFORE the real worktree ──

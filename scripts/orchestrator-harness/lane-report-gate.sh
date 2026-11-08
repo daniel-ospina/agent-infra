@@ -250,10 +250,25 @@ _lrg_stanza_paths() {
 # `.worktree-report/state.json` from that worktree leaves nothing that attributes the worktree to this
 # branch, and this arm answers 6 as it does for a genuine cross-box merge. Closing that needs a
 # lane-independent attribution (the same class as #3789's `git` seam), not another lane-owned file.
-# Returns 0 and prints the path when attributed, 2 when no interpreter can attribute at all.
+# Returns 0 and prints the path when attributed, 1 when no stanza holds a writer state at all (the
+# caller then keeps its ABSTENTION), 2 when a holder exists but no interpreter can read it.
+# ⛔ THE INTERPRETER IS RESOLVED ONLY AFTER A HOLDER IS FOUND (round-13 review, MED). Resolving it first
+# turned the CROSS-BOX abstention into a hard refusal on every box below the 3.12 floor — macOS
+# `/usr/bin/python3` is 3.9 — because `_lrg_py` failing short-circuited to 2 before any state was even
+# looked for. That is a refusal the box cannot remedy (its printed remedy is "re-run the suites") applied
+# to the 13-of-13 cross-box shape this file exists to keep mergeable. "An unreadable attribution is not an
+# abstention" applies to a box that HOLDS the evidence, not to one that holds nothing.
 _lrg_evidence_off_branch() {
-  local repo="$1" branch="$2" head="$3" p="" py="" kv="" b="" hw=""
+  local repo="$1" branch="$2" head="$3" p="" py="" kv="" b="" hw="" holders=""
   [ -n "$repo" ] || return 1
+  # Pass 1 — bash builtins only: which stanzas hold a writer state at all? No interpreter needed to answer
+  # "does this box hold any evidence", which is exactly the question code 6 turns on.
+  while IFS= read -r p; do
+    [ -n "$p" ] || continue
+    [ -f "$p/.worktree-report/state.json" ] && holders="$holders$p
+"
+  done <<< "$(_lrg_stanza_paths "$repo")"
+  [ -n "$holders" ] || return 1
   py="$(_lrg_py)" || return 2
   while IFS= read -r p; do
     [ -n "$p" ] || continue
@@ -287,7 +302,7 @@ print("%s\x1f%s" % (_b if isinstance(_b, str) else "", _h if isinstance(_h, str)
 # lane_report_gate <repo-path> <branch> <head> — the decision table above.
 lane_report_gate() {
   local repo="${1:-}" branch="${2:-}" head="${3:-}" wt="" tool="" py="" out="" rc=0
-  local ok="" stale="" rules="" rec_head="" live_head="" sealed12="" rec12="" _lrg_ev="" _lrg_ev_rc=0
+  local ok="" stale="" rules="" rec_head="" live_head="" sealed12="" rec12="" sealed_n="" _lrg_ev="" _lrg_ev_rc=0
 
   # ⛔ `head` IS THE WHOLE POINT OF THE GATE, SO AN EMPTY ONE CANNOT PASS ANY ARM (fresh review, P1).
   # The first version took it as documentation: `head=` appeared in every message and in NO comparison,
@@ -637,6 +652,7 @@ if newest is not None and sys.argv[3]:
 # shape and a first-match read would take the injected one. The writer emits exactly one real stamp, after
 # every lane-controlled field, so the LAST match is the real one.
 _sealed12 = ""
+_sealed_n = 0
 try:
     with open(sys.argv[4], encoding="utf-8", errors="replace") as _rf:
         _rlines = _rf.read().splitlines()
@@ -646,8 +662,11 @@ _seal_pat = re.compile(r"^- \*\*Base:\*\* .*head at write:\*\* `([0-9a-f]{12})`.
 for _rl in _rlines:
     _sm = _seal_pat.match(_rl)
     if _sm:
+        # EVERY match is counted: an honest report carries exactly one real stamp, and the lane-authored
+        # text the writer renders BELOW it can reproduce the shape (see the refusal in the caller).
+        _sealed_n += 1
         _sealed12 = _sm.group(1)
-print("%s|%s|%s|%s|%s|%s|%s|%s|%s|%s" % (
+print("%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s" % (
     "1" if d.get("ok") is True else "0",
     "1" if d.get("head_moved_since_write") is True else "0",
     ",".join(str(r) for r in rules)[:400],
@@ -658,8 +677,9 @@ print("%s|%s|%s|%s|%s|%s|%s|%s|%s|%s" % (
     state_ok,
     _sealed12,
     rec[:12],
+    _sealed_n,
 ))'
-  if ! IFS='|' read -r ok stale rules rec_head live_head predates skew state_ok sealed12 rec12 <<< "$("$py" -I -c "$_LRG_JSON_PY" "$out" "$wt/.worktree-report/state.json" "$commit_iso" "$wt/WORKTREE-REPORT.md" 2>/dev/null)"; then
+  if ! IFS='|' read -r ok stale rules rec_head live_head predates skew state_ok sealed12 rec12 sealed_n <<< "$("$py" -I -c "$_LRG_JSON_PY" "$out" "$wt/.worktree-report/state.json" "$commit_iso" "$wt/WORKTREE-REPORT.md" 2>/dev/null)"; then
     _lrg_emit 7 UNMEASURABLE "branch=$branch worktree=$wt tool=$tool reason=consumer-json-unusable check_rc=$rc head=$head"
     return 7
   fi
@@ -724,15 +744,22 @@ print("%s|%s|%s|%s|%s|%s|%s|%s|%s|%s" % (
   # write:** \`<12hex>\`` makes the position unambiguous. \u26d4 THE DIGEST IS NOT A SEAL AGAINST THE GRADED
   # PARTY EITHER (unkeyed sha256 stored in the same file): this cross-check is a SPEED BUMP that costs two
   # lane-owned files instead of one, not tamper-proofing — see the disclosure above, which says so.
-  # ⛔ THE LAST FULL-SHAPE LINE, NOT THE FIRST (round-11 review, P2). The writer renders the lane-owned
-  # `state["worktree"]` value VERBATIM on `- **Worktree:**` ABOVE the real stamp, so a newline in that
-  # value reproduces the anchored shape and a first-match read would take the injected one. The writer
-  # emits exactly one real stamp, after every lane-controlled field, so the LAST match is the real one —
-  # and BOTH the stamp and the state head's 12-hex prefix now come out of the pinned interpreter pass
-  # (fresh review, MED: `sed`/`tail`/`cut` were PATH-resolved programs computing this arm's verdict).
-  # (Not independently exploitable in a realistic flow — the worktree must really be at the merging head
-  # for the `live_head` arm, and an honest `write` stamps it — but the comment claimed an unambiguous
-  # position, and this is what makes that true.)
+  # ⛔ POSITION IS NOT THE CONTROL, AND THE OLD COMMENT THAT SAID IT WAS IS FALSE (round-13 review, LOW).
+  # The writer renders the real stamp in the Base line and then renders `## Suites run` (suite commands,
+  # verbatim) and `## Could not do` (lane-supplied `note --not-done` text, verbatim) BELOW it — so a lane
+  # can append a line that reproduces the anchored shape and, with the unkeyed digest re-sealed, make a
+  # stale real stamp agree with a forged `state.json`. "The LAST match is the real one" was never true of
+  # the writer's output. The control is COUNT, not order: an honest report carries EXACTLY ONE stamp, and
+  # a second one is refused as a self-contradicting artifact (INVALID) instead of being resolved by
+  # position. ⛔ WHAT REMAINS IS THE DIGEST'S LIMIT, NOT THIS ARM'S: the sha256 is unkeyed and stored in
+  # the same file, so a caller who rewrites the one real stamp line (or hand-writes the whole report) is
+  # at the same cost as forging two — the disclosure above says so, and this arm is a speed bump, not
+  # tamper-proofing. Both the stamp and the state head's 12-hex prefix come out of the pinned interpreter
+  # pass (round-12 review, MED: `sed`/`tail`/`cut` were PATH-resolved programs computing this verdict).
+  if [ "${sealed_n:-0}" -gt 1 ] 2>/dev/null; then
+    _lrg_emit 2 INVALID "branch=$branch worktree=$wt report=$wt/WORKTREE-REPORT.md reason=report-carries-more-than-one-head-at-write-stamp stamps=$sealed_n head=$head"
+    return 2
+  fi
   if [ -n "$sealed12" ] && [ -n "$rec12" ] && [ "$rec12" != "$sealed12" ]; then
     _lrg_emit 4 STALE "branch=$branch worktree=$wt report=$wt/WORKTREE-REPORT.md reason=state-disagrees-with-the-sealed-report sealed_head=$sealed12 state_head_at_write=$rec_head merging_head=$head"
     return 4
