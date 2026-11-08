@@ -1109,7 +1109,9 @@ fired on 2026-11-08 on a Linux fleet cell (x86_64, load 17.70, 22 days uptime,
 conjunct **could be evaluated for only one of the 19 processes on that host** — the
 `.jsonl` predicate reads `None` for the other 18 (below) — and the read evidence
 below shows the processes above 5% reading at working rates rather than sitting on
-the idle floor, i.e. **not** silent. So what this section records is **the CPU
+the idle floor. That is evidence *against* a silent-session burn, but it is not the
+transcript predicate: for those 18 the silence value is **unknown, not negative**.
+So what this section records is **the CPU
 signal firing and the burn being absent**, not the committed two-conjunct trigger
 having fired. It also records, more durably, a **better predicate pair**
 (ΔCPU + `rchar`) than the 09-16 table's transcript-age predicate.
@@ -1131,10 +1133,12 @@ The substitute is **`/proc/<pid>/io`'s `rchar`**, which needs no cooperation fro
 `pi` and — read alongside ΔCPU — separates the two cases this issue conflates:
 *idle* (reads sit on a flat floor) versus *legitimately working* (reads scale with
 the provider stream or the tool output). Be precise about which of the two carries
-the weight, though: the idle floor and the working minimum are **at most 0.4 KB/s
-apart** (first result bullet below) — thin, and its survival depends on a
-membership rule this subsection never fixes, which is why **ΔCPU makes the split
-and `rchar` is the corroboration**. ΔCPU
+the weight, though. This section's `idle` / `working` labels are **per window, not
+per process**, and the rule behind them is **not stated here** — so the read floor
+below describes the samples the labels mark, and is a corroborating signal rather
+than an independent classifier. That is why **ΔCPU makes the split and `rchar`
+corroborates it**: a read threshold cannot stand on its own when the label it would
+reproduce is itself unstated. ΔCPU
 comes from `/proc/<pid>/stat`'s `utime+stime` ticks (`USER_HZ=100`), i.e. the
 09-16 method (`ps -o time` twice) at 10 ms resolution. The main-thread vs
 `V8Worker` split in the last bullet cannot come from those **process-level**
@@ -1155,24 +1159,31 @@ epoch — the property the epoch analysis above found missing across windows.
 - **12 distinct idle TUI processes across the four windows, and the worst value any
   of them shows while labelled idle is 0.3% of a core** (11 of 12 at ≤ 0.2%; pids
   quoted below reach 5.2–7.0% in their *working* windows, which is why the label is
-  per window and not per process). Their idle read rate sits in a narrow **8–10
-  KB/s** band — the idle samples the pid series below quote read 8.4, 8 and 10
-  KB/s, and the 10.4 KB/s case three bullets down sits just above it — a fixed
-  background poll, not input, so the floor is a stable control rather than a
-  per-process accident. Two honest qualifications. First, it is a *band*, not a
-  constant. Second, and more important, **no read threshold here is safe on its
-  own**: the separation from the working minimum is 0.4 KB/s (working min 10.4 vs
-  idle max 10, ≈4%), and whether even that survives depends on a membership rule
-  this subsection never fixes — the borderline sample, pid 4076400 (the exception
-  below), reads 10.4 KB/s at just **0.8% of a core**, so a line drawn by ΔCPU puts
-  it inside the idle set (and the gap disappears), while one drawn by read rate
-  puts it outside (and the gap is 0.4 KB/s). That unresolvable dependence is
-  precisely why **ΔCPU makes the split and `rchar` only corroborates**, and the
-  next bullet tests that pairing directly.
+  per window and not per process). The four idle read samples the pid series below
+  quote are tightly clustered — 8.4, 8, 10 and 10 KB/s — a fixed background poll,
+  not input, so the floor looks like a stable control rather than a per-process
+  accident. Two honest qualifications. First, a cluster is not a constant: it is a
+  *band*. Second, and decisive for how much it can carry, those four are **quoted
+  samples from three pids**, not the population — there is no `max rchar (idle)`
+  column, so "idle max 10 KB/s" below is the maximum of the quoted samples, **not**
+  of all 37 idle process-windows, and one unquoted idle sample above 10.4 KB/s
+  would close the gap entirely. The sample nearest it, pid 4076400 (the exception
+  below), reads 10.4 KB/s at **0.8% of a core**, and the table's own 09:26:50 row
+  places that sample in the *working* set (8 idle / 6 working, worst idle 0.2%,
+  10.4 KB/s as that row's working minimum) — so the 0.4 KB/s separation is what the
+  labelling records, and the membership rule behind the labels is unstated. That is
+  exactly why **ΔCPU makes the split and `rchar` only corroborates**, and why the
+  next bullet is a consistency check on the labelling, not an independent test.
 - **No window contained a process above 1% of a core with reads at that floor** —
-  which is exactly the 09-16 defect signature (11 processes at 6.4–26.3% while
-  silent for 1.0–209.5 min). Run as a filter over all four windows it returns
-  `NONE`.
+  which is the 09-16 defect signature (11 processes at 6.4–26.3% while silent for
+  1.0–209.5 min), and it does not recur here. Be clear about what this is though: a
+  **consistency check on the labelling**, not independent evidence. The table's own
+  columns make it empty by construction (no process above 1% is labelled idle, and
+  no labelled working process reads below 10.4 KB/s), so `NONE` is entailed rather
+  than measured. What it does establish is that a *gross* recurrence of the 09-16
+  signature is absent from these four windows; a busy-and-silent process reading at
+  the floor is exactly what this measurement cannot separate from working, which is
+  the episodic limitation in (a) below.
 - ΔCPU tracked `rchar` **in both directions, for the same pid, across windows**
   rather than following a constant cadence: pid 2324326 read
   `0.1%/8.4 KB/s → 2.8%/4 089 KB/s → 3.4%/9 841 KB/s → 5.5%/708 KB/s`, pid
@@ -1191,12 +1202,14 @@ epoch — the property the epoch analysis above found missing across windows.
   The 10 s window is shorter than the 25–30 s discriminator windows above;
   `%` of one core is rate-normalised, so the pair is comparable *as a rate*, but
   this is the weakest window in the section against the bursty offender that
-  point (a) below names. And the box's load was **not `pi`'s**: the top consumers
+  point (a) below names. And the box's **CPU** was **not `pi`'s**: the top consumers
   were `bash` 99.9%, `python3` 96.3%, `bash` 63.1%, `python3` 16.9%, `bash`
   15.8%, `pytest` 7.3% — i.e. the fleet's own
   work. That further undercuts the "`pi` CPU → load → swap → reboot" chain from
   the *other* direction: against the CPU those six named consumers were using, `pi`
-  was **~13%** (38.2% vs 299.3% of one core), not the driver.
+  was **~13%** (38.2% vs 299.3% of one core), not the driver. (Load average is not
+  CPU demand — this report says so above, and load 17.70 is not explained by any
+  CPU share here; only the CPU comparison is made.)
 - **Main thread vs workers** (the report's caveat quantified, though *not* the
   size column, which stays missing below): on the processes that were busy, the
   main thread carried **0.61–1.00** of the ΔCPU and the `V8Worker` pool
