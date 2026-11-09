@@ -1081,7 +1081,7 @@ def _strip_comment(line):
     tell a future lane NOT to declare two members that lose a real definition.
     ⛔ AND THE SET APPEARS TWICE — the same `'_.-'` also sits on the QUOTED/backslash path, one branch up.
     There `-` is the pinned member and `.` and `_` are unpinned: `cat <<'A'.B` (the quoted delimiter closes
-    and concatenates) and `cat <<\A_B` (the backslash-escaped one) each lose the definition below them on
+    and concatenates) and `cat <<\\A_B` (the backslash-escaped one) each lose the definition below them on
     valid bash with the suite at 246/0 and 0 of the 438 files moving. So neither occurrence is "the pinned
     charset": each is pinned for ONE member, and the members the arms do not reach are declared here. A
     future lane reading "the charset is pinned" would skip exactly the two spellings above.
