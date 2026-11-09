@@ -34,6 +34,11 @@
 #      refusal); and a STALE [singleton] line from an earlier attempt followed by an unrelated death
 #      (69 — the log is append-only, so an unbounded witness would report a dead controller as a
 #      correct refusal for ever).
+#   J  the refusal WITNESS follows the resolved STATE DIR, not `$O` (fresh-context review of #3846, P2):
+#      `ORC_STATE_DIR` outranks `O` in `controller-state.sh`, so a wrapper watching `$O/logs/orch-loop.log`
+#      misses the `[singleton]` line and answers 69 for a correct refusal. The stub controller mirrors
+#      the shipped loop's rank-1 lookup, so this case also proves the key reaches the PANE (the server's
+#      own environment never carries it).
 #
 # HERMETIC: its own `TMUX_TMPDIR` (so it can never touch, count or reap a real session), its own
 # HOME, its own scratch `$O`, and a stub `orch-loop.sh`. No network. Run: bash launchd-controller.test.sh
@@ -466,6 +471,60 @@ if [ "$L_RC" -eq 74 ]; then
   ok "case I unjudged: an UNJUDGED refusal (rc=2) is propagated as 74, not flattened to 75"
 else
   bad "case I unjudged: exited $L_RC, want 74 — the two refusals share a code again"
+fi
+# ── J. the witness follows the RESOLVED state dir, not `$O` (fresh-context review of #3846, P2) ──
+# ⛔ `orch-loop.sh` ranks `ORC_STATE_DIR` ABOVE `O` (`controller-state.sh:95-97`) while `O` stays the tree
+# this wrapper execs `$O/orch-loop.sh` from — so a state dir named by a launcher moves the LOG while the
+# wrapper keeps watching `$O/logs/orch-loop.log`. It then finds no `[singleton]` line and answers 69 for
+# a CORRECT refusal: the false-crash framing the witness exists to remove, with `harness-up`'s
+# REFUSED-SINGLETON row unreachable. Reachable today by a hand-run with `ORC_STATE_DIR` exported, and by
+# a rendered plist value once `ORC_STATE_DIR` is forwarded.
+log_line "J. the refusal witness is read from the RESOLVED state dir (ORC_STATE_DIR), not from \$O"
+"$TMUX_BIN" kill-session -t "=$S" 2>/dev/null || true
+SD_O="$TMP/o-sd"; SD_STATE="$TMP/state-sd"; mkdir -p "$SD_O" "$SD_STATE/logs"
+cat > "$SD_O/orch-loop.sh" <<'SH'
+#!/bin/bash
+# Mirror the SHIPPED loop's own ranking (rank 1 = ORC_STATE_DIR, else the explicit `O`). The pane gets
+# ORC_STATE_DIR only from the wrapper's whitelist — the tmux SERVER was started from this suite's
+# environment, which does not carry it — so this stub also proves the hand-off.
+_S="${ORC_STATE_DIR:-$O}"
+mkdir -p "$_S/logs" 2>/dev/null
+echo "[singleton] rc=1 refused me=pid=$$@test state=$_S — HELD by live controller pid 999999" >> "$_S/logs/orch-loop.log" 2>/dev/null
+exit 75
+SH
+chmod +x "$SD_O/orch-loop.sh"
+M_ERR="$TMP/m.err"
+O="$SD_O" ORC_STATE_DIR="$SD_STATE" CONTROLLER_RESTART_FLOOR=2 bash "$TARGET" >"$TMP/m.out" 2>"$M_ERR" &
+M_PID=$!
+wait "$M_PID"; M_RC=$?
+if [ "$M_RC" -eq 75 ]; then
+  ok "case J: a refusal written to \$ORC_STATE_DIR is PROPAGATED as 75 (the witness follows the state dir)"
+else
+  bad "case J: the wrapper exited $M_RC, want 75 — it read the witness from \$O, so a correct refusal reads as a crash (stderr: $(head -2 "$M_ERR"))"
+fi
+if grep -q 'REFUSED to start' "$M_ERR"; then
+  ok "case J: it names the refusal and the log it read it from"
+else
+  bad "case J: no refusal line on stderr — the operator gets a crash framing"
+fi
+# ⛔ NON-VACUITY: the SAME scenario against a wrapper whose witness path is REVERTED to `$O` must answer
+# 69. Without this control the arm above would also pass on a build that never reads the log at all, and
+# on one whose log path happens to coincide with where the stub wrote.
+MUT_J="$TMP/j-mutant.sh"
+sed 's|^_LC_STATE=.*$|_LC_STATE="$O"|' "$TARGET" > "$MUT_J"
+if grep -qx '_LC_STATE="$O"' "$MUT_J"; then
+  "$TMUX_BIN" kill-session -t "=$S" 2>/dev/null || true
+  N_ERR="$TMP/n.err"
+  O="$SD_O" ORC_STATE_DIR="$SD_STATE" CONTROLLER_RESTART_FLOOR=2 bash "$MUT_J" >"$TMP/n.out" 2>"$N_ERR" &
+  N_PID=$!
+  wait "$N_PID"; N_RC=$?
+  if [ "$N_RC" -eq 69 ]; then
+    ok "case J non-vacuity: a witness pinned to \$O answers 69 for the same refusal (the arm measures the fix)"
+  else
+    bad "case J non-vacuity: the reverted-witness mutant exited $N_RC, want 69 — the arm above does not discriminate"
+  fi
+else
+  bad "case J non-vacuity: could not build the reverted-witness mutant — the control cannot run, so the arm above is unproven"
 fi
 export O="$TMP/o"
 "$TMUX_BIN" kill-session -t "=$S" 2>/dev/null || true

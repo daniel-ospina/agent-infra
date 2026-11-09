@@ -154,7 +154,22 @@ _shq() { local s="${1:-}" q="'"; printf "'%s'" "${s//$q/$q\\$q$q}"; }
 # touch the lock. That is the same false-PASS class as the silent `exit 0` this PR removes, mirrored.
 # So the byte offset is captured IMMEDIATELY BEFORE `new-session` and only the bytes THIS attempt
 # appended are searched. No marker file to leak, no `#{pane_dead_status}` tmux-version dependency.
-_LC_LOG="$O/logs/orch-loop.log"
+# ⛔ THE WITNESS LIVES IN THE STATE DIR, AND THE STATE DIR IS NOT ALWAYS `O` (fresh-context review of
+# #3846, P2). `orch-loop.sh` ranks `ORC_STATE_DIR` ABOVE `O` (`controller-state.sh:95-97`), so on an
+# instance that names one the loop appends `[singleton]` to `<ORC_STATE_DIR>/logs/orch-loop.log` —
+# while `$O` stays the SEEDED HARNESS ROOT this wrapper execs `$O/orch-loop.sh` from. Watching
+# `$O/logs/…` then finds nothing, and every CORRECT refusal reads as `did not come up within 10s` /
+# `died within 2s` → exit 69: precisely the false-crash framing the `[singleton]` witness exists to
+# remove (`harness-up`'s REFUSED-SINGLETON row could then never fire). This is reachable TODAY for a
+# hand-run (`ORC_STATE_DIR=/x bash launchd-controller.sh`), not only once the knob is plist-rendered.
+# ⛔ `_LC_STATE` IS NOT A SECOND COPY OF `orc_state_pick` — it cannot disagree with it here. Ranks 3
+# and 4 of that function are unreachable from this file: the wrapper ALWAYS hands the pane a non-empty
+# `O` (line 117 defaults it, and `CONTROLLER_ENV` forwards it), so the loop always resolves at rank 2,
+# `env:O`. The one way the wrapper's answer can differ is rank 1 — `ORC_STATE_DIR` — which is exactly
+# the name compared here. `O` itself stays the LOOP's home: `[ -r "$O/orch-loop.sh" ]` below is
+# deliberately unchanged, because that file lives in the harness root, not in the state dir.
+_LC_STATE="${ORC_STATE_DIR:-$O}"
+_LC_LOG="$_LC_STATE/logs/orch-loop.log"
 _LC_OFFSET=0
 _lc_mark_baseline() {
   _LC_OFFSET=0
@@ -179,7 +194,7 @@ _lc_refusal_exit() {
   local _rc="" _tail=""
   [ -f "$_LC_LOG" ] && _tail="$(tail -c "+$(( _LC_OFFSET + 1 ))" "$_LC_LOG" 2>/dev/null)"
   _rc="$(printf '%s\n' "$_tail" | sed -n 's/.*\[singleton\] rc=\([0-9][0-9]*\).*/\1/p' | head -1)"
-  _lc_err "'$S' controller REFUSED to start: this state dir already has a controller, or has a lock record that cannot be judged ([singleton] in $O/logs/orch-loop.log names the holder and the reason) — propagating the loop's own refusal code so launchd and harness-up report a REFUSAL, not a crash"
+  _lc_err "'$S' controller REFUSED to start: this state dir already has a controller, or has a lock record that cannot be judged ([singleton] in $_LC_LOG names the holder and the reason) — propagating the loop's own refusal code so launchd and harness-up report a REFUSAL, not a crash"
   if [ "${_rc:-}" = "2" ]; then exit 74; fi
   exit 75
 }
@@ -187,7 +202,17 @@ _lc_refusal_exit() {
 # THE PLIST'S KEY SET, VERBATIM. Keep it equal to `EnvironmentVariables` in launchd.plist.template —
 # `launchd-controller.test.sh` asserts that equality in both directions, so a key added to the
 # template cannot silently fail to reach the controller.
-CONTROLLER_ENV="PATH HOME OR REPO O HARNESS_PIN HARNESS_PIN_FILE HARNESS_PIN_DIR HARNESS_REPO HARNESS_MATERIALISER SCOPE MAX_LOAD MAX_LANES MAX_REVIEW MERGE_PRIORITY_AT MERGE_PRIORITY_MAX_AGE_MIN FUNNEL_MAX_AGE_MIN MAX_FIX MAX_FIX_TRIES MAX_RED_FIX MAX_RED_FIX_TRIES MIN_SWAP_FREE MIN_MEM_FREE_MB MEM_MIN_AVAIL_MB MEM_LANE_RESERVE_MB MEM_SPAWN_RESERVE_LANES BATCH PRODUCT_FLOOR CYC UV_CACHE_DIR UV_LINK_MODE ORCH_ENTRY ORC_CONTROLLER_ORIGIN"
+CONTROLLER_ENV="PATH HOME OR REPO O ORC_STATE_DIR HARNESS_PIN HARNESS_PIN_FILE HARNESS_PIN_DIR HARNESS_REPO HARNESS_MATERIALISER SCOPE MAX_LOAD MAX_LANES MAX_REVIEW MERGE_PRIORITY_AT MERGE_PRIORITY_MAX_AGE_MIN FUNNEL_MAX_AGE_MIN MAX_FIX MAX_FIX_TRIES MAX_RED_FIX MAX_RED_FIX_TRIES MIN_SWAP_FREE MIN_MEM_FREE_MB MEM_MIN_AVAIL_MB MEM_LANE_RESERVE_MB MEM_SPAWN_RESERVE_LANES BATCH PRODUCT_FLOOR CYC UV_CACHE_DIR UV_LINK_MODE ORCH_ENTRY ORC_CONTROLLER_ORIGIN"
+# ⛔ `ORC_STATE_DIR` IS FORWARDED BECAUSE THE WRAPPER ALREADY READS IT (fresh-context review of #3846,
+# P2). `_LC_STATE` above (`:157`) resolves the singleton witness from it, and `README.md`'s row calls it
+# "the way a launcher can name a state dir without impersonating the legacy variable" — so on the one
+# surface the #2095 incident happened on, a value the operator renders into the plist was STRIPPED
+# here before the pane saw it. That is the same presence-only-parity defect `ORC_CONTROLLER_ORIGIN` had
+# one line up, and `launchd-controller.test.sh` case E is what made both visible. Omitting it here is
+# strictly worse than omitting a ceiling: a MAX_LOAD that does not arrive is labelled `env` on `[cap]`,
+# while a state dir that does not arrive is a controller writing production's queue (the incident).
+# `launchd.plist.template` renders the key EMPTY, and an empty value is a MEANING: `orc_state_pick`
+# tests `[ -n "${ORC_STATE_DIR:-}" ]`, so empty resolves at rank 2 exactly like today.
 # ⛔ `ORC_CONTROLLER_ORIGIN` (#2095) is the same parity one line over, and it was added to the plist
 # WITHOUT being added here — which `launchd-controller.test.sh` case E caught at the exact moment it
 # would have shipped (a red in a file the change never opened). The key is what makes a `[cap]` line

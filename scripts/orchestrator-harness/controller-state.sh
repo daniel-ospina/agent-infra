@@ -149,7 +149,13 @@ orc_lock_reclaim() {
   got="$(orc_lock_pid "$tmp")"
   if [ "$got" != "$expected" ]; then
     # Somebody took the lock while we were judging it. Restore theirs and report the refusal.
-    mv -f "$tmp" "$lockf" 2>/dev/null || rm -f "$tmp" 2>/dev/null
+    # ⛔ RESTORE ONLY INTO A FREE PATH (fresh-context review of #3846, P3). `mv -f` REPLACES, so a
+    # three-starter interleaving — our restore landing after a THIRD starter has already created its
+    # own record — overwrote that winner's record with the earlier pid. The winner then believed it
+    # held the lock, its ownership-scoped release left the record alone, and the surviving record
+    # named a pid nobody owned. `[ -e ] ||` is the same fail-closed direction as the rest of this
+    # module: a path that is already taken belongs to its newer holder.
+    if [ -e "$lockf" ]; then rm -f "$tmp" 2>/dev/null; else mv -f "$tmp" "$lockf" 2>/dev/null || rm -f "$tmp" 2>/dev/null; fi
     return 1
   fi
   rm -f "$tmp" 2>/dev/null

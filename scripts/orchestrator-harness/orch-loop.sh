@@ -242,8 +242,8 @@ export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH
 # serialiser) — and a shim that is never resolved is an INERT layer: it reports protection and
 # provides none. Re-assert both here, adapter last so `$O/gh-rest` (which itself calls the same
 # helper) wins where it exists. Guarded by `-d`, so a box that ships neither is unchanged.
-if [ -d "$O/gh-limit" ]; then PATH="$O/gh-limit:$PATH"; fi
-if [ -d "$O/gh-rest" ]; then PATH="$O/gh-rest:$PATH"; fi
+if [ -d "${O_WORK:-$O}/gh-limit" ]; then PATH="${O_WORK:-$O}/gh-limit:$PATH"; fi
+if [ -d "${O_WORK:-$O}/gh-rest" ]; then PATH="${O_WORK:-$O}/gh-rest:$PATH"; fi
 # ── THE GATE DECISION IS MEASURED, NOT ASSUMED (agent-infra#2319) — see lane.sh for the full note.
 # The controller is a shell, but every child it spawns INHERITS its environment, so this export used to
 # be the fleet-wide permanent bypass even on carriers that also set it themselves.

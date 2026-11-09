@@ -80,8 +80,12 @@ export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH
 # serialiser) — and a shim that is never resolved is an INERT layer: it reports protection and
 # provides none. Re-assert both here, adapter last so `$O/gh-rest` (which itself calls the same
 # helper) wins where it exists. Guarded by `-d`, so a box that ships neither is unchanged.
-if [ -d "$O/gh-limit" ]; then PATH="$O/gh-limit:$PATH"; fi
-if [ -d "$O/gh-rest" ]; then PATH="$O/gh-rest:$PATH"; fi
+# ⛔ AND THE ROOTS ARE TWO NAMES NOW (#2095; review of #3846). `O` is the controller's STATE dir and
+# `O_WORK` is the harness root, so on an `ORC_STATE_DIR`/isolated instance the seeded adapters live
+# under the WORK root — reading `$O` here would leave a lane unthrottled and without the REST adapter
+# while every gate reports the layer present.
+if [ -d "${O_WORK:-$O}/gh-limit" ]; then PATH="${O_WORK:-$O}/gh-limit:$PATH"; fi
+if [ -d "${O_WORK:-$O}/gh-rest" ]; then PATH="${O_WORK:-$O}/gh-rest:$PATH"; fi
 # ── THE TERMINAL LINE: EVERY LANE LOG ENDS BY SAYING WHAT HAPPENED (agent-infra#3331) ─────────────
 # Measured 2026-11-02 on two cells: a lane's log simply STOPPED, and the dispatch record still said
 # "launched". A print-mode `pi` buffers, so a log that ends silently is indistinguishable from a lane
@@ -323,8 +327,10 @@ unset LANE_TARGET_ARG LANE_ISSUE_ARG LANE_BRANCH_ARG LANE_REPO_DIR_ARG LANE_OUT_
 # answers `0`. The file still owns the REST of PATH (its entries keep their order and reach the child);
 # only the two adapter directories are pinned back in front, which is the rule :64-65 already states.
 # A6 is untouched: it drives `lane-env.sh` directly and never runs this file.
-if [ -d "$O/gh-limit" ]; then PATH="$O/gh-limit:$PATH"; fi
-if [ -d "$O/gh-rest" ]; then PATH="$O/gh-rest:$PATH"; fi
+# The one substitution from :83-84 is the WORK ROOT (#2095, review of #3846): `O_WORK` when the
+# controller names a state dir, `$O` otherwise.
+if [ -d "${O_WORK:-$O}/gh-limit" ]; then PATH="${O_WORK:-$O}/gh-limit:$PATH"; fi
+if [ -d "${O_WORK:-$O}/gh-rest" ]; then PATH="${O_WORK:-$O}/gh-rest:$PATH"; fi
 
 # ── the reviewer requirement is disclosed BEFORE the work (#2148) ───────────────────────────────────
 # The ≥1-dispatch rule and the merge-registry gate are correct and both spoke ONLY at the finish line

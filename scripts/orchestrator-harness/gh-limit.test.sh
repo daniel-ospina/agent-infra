@@ -1169,12 +1169,12 @@ cp "$WRAPPER" "$TMP/cell/gh-limit/gh"
 # A REAL gh the caller had already placed FIRST — the thing the stanza has to outrank. It prints a
 # marker so the exec test proves the shim reached the real binary rather than re-entering itself.
 printf '#!/usr/bin/env bash\necho REAL-GH "$@"\n' > "$TMP/realbin/gh"; chmod +x "$TMP/realbin/gh"
-grep -E '^if \[ -d "\$O/gh-(limit|rest)" \]' "$HERE/orch-loop.sh" > "$TMP/stanza.sh"
+grep -E '^if \[ -d "\$\{[_A-Za-z0-9]+:-\$O\}/gh-(limit|rest)" \]' "$HERE/orch-loop.sh" > "$TMP/stanza.sh"
 ck "PATH: orch-loop.sh re-asserts BOTH seeded shim dirs after prepending the tool dirs" \
    "$([ "$(grep -c '^if ' "$TMP/stanza.sh")" -eq 2 ] && echo 0 || echo 1)"
 _l_export="$(grep -n '^export PATH=/opt/homebrew/bin:/usr/local/bin:\$PATH' "$HERE/orch-loop.sh" | cut -d: -f1 | head -1)"
-_l_limit="$(grep -n '^if \[ -d "\$O/gh-limit" \]' "$HERE/orch-loop.sh" | cut -d: -f1 | head -1)"
-_l_rest="$(grep -n '^if \[ -d "\$O/gh-rest" \]' "$HERE/orch-loop.sh" | cut -d: -f1 | head -1)"
+_l_limit="$(grep -nE '^if \[ -d "\$\{[_A-Za-z0-9]+:-\$O\}/gh-limit" \]' "$HERE/orch-loop.sh" | cut -d: -f1 | head -1)"
+_l_rest="$(grep -nE '^if \[ -d "\$\{[_A-Za-z0-9]+:-\$O\}/gh-rest" \]' "$HERE/orch-loop.sh" | cut -d: -f1 | head -1)"
 ck "PATH: the stanzas sit BELOW the tool-dir prepend (above it, the prepend shadows them again)" \
    "$([ -n "$_l_export" ] && [ -n "$_l_limit" ] && [ -n "$_l_rest" ] \
       && [ "$_l_export" -lt "$_l_limit" ] && [ "$_l_limit" -lt "$_l_rest" ] && echo 0 || echo 1)"
@@ -1201,13 +1201,19 @@ for _f in "$HERE"/*.sh; do
   # ⛔ BOTH STANZAS. Asserting only `$O/gh-limit` left `$O/gh-rest` unprotected: deleting it from
   # merge-one.sh kept the suite green, i.e. #1959's REST adapter could vanish from the merge worker's
   # PATH (the state in which NO PR COULD MERGE) with nothing failing (found in review round 4).
-  grep -q '^if \[ -d "\$O/gh-limit" \]' "$_f" || pop="$pop $_b:no-limit-stanza"
-  grep -q '^if \[ -d "\$O/gh-rest" \]' "$_f" || pop="$pop $_b:no-rest-stanza"
+  # ⛔ AND THE ROOT IS THE WORK ROOT (#2095). `O` is the controller's STATE dir on an
+  # `ORC_STATE_DIR`/isolated instance, so every gh-calling script now resolves BOTH shim dirs as
+  # `${<VAR>:-$O}` — the work root when the controller names one, `$O` otherwise, i.e. byte-identical
+  # on every pre-#2095 box. The stanza is the PROTECTED PROPERTY and the spelling is now part of it:
+  # accepting the bare `$O` form would let a converted file be reverted to the resolution that finds
+  # neither adapter on exactly the instances this change creates (review of #3846).
+  grep -qE '^if \[ -d "\$\{[_A-Za-z0-9]+:-\$O\}/gh-limit" \]' "$_f" || pop="$pop $_b:no-limit-stanza"
+  grep -qE '^if \[ -d "\$\{[_A-Za-z0-9]+:-\$O\}/gh-rest" \]' "$_f" || pop="$pop $_b:no-rest-stanza"
 done
 # `nonblocking-dispatch.sh` calls no gh itself but SPAWNS a whole worker session in-process, so its
 # PATH IS the worker's PATH — the same rule applies for a reason the loop above cannot see.
-grep -q '^if \[ -d "\$O/gh-limit" \]' "$HERE/nonblocking-dispatch.sh" || pop="$pop nonblocking-dispatch.sh:no-limit-stanza"
-grep -q '^if \[ -d "\$O/gh-rest" \]' "$HERE/nonblocking-dispatch.sh" || pop="$pop nonblocking-dispatch.sh:no-rest-stanza"
+grep -qE '^if \[ -d "\$\{[_A-Za-z0-9]+:-\$O\}/gh-limit" \]' "$HERE/nonblocking-dispatch.sh" || pop="$pop nonblocking-dispatch.sh:no-limit-stanza"
+grep -qE '^if \[ -d "\$\{[_A-Za-z0-9]+:-\$O\}/gh-rest" \]' "$HERE/nonblocking-dispatch.sh" || pop="$pop nonblocking-dispatch.sh:no-rest-stanza"
 pop="${pop# }"
 ck "PATH: every gh-calling (or worker-spawning) harness script re-asserts BOTH seeded dirs [$pop]" \
    "$([ -z "$pop" ] && echo 0 || echo 1)"

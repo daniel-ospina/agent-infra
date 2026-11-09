@@ -210,6 +210,30 @@ case "$(cat "$T/acq5")" in
   *) ck "§2 an empty record was not reclaimed — got '$(cat "$T/acq5")'" 1 ;;
 esac
 
+# ⛔ THE RECLAIM RESTORE MUST NOT OVERWRITE A LATER WINNER (fresh-context review of #3846, P3).
+# Three starters interleaved: we judged record 111 stale, and while we were judging, a THIRD starter
+# created its own record at the same path. The restore's job is to put the DISPLACED record back — but
+# `mv -f` REPLACES, so the unfixed code swapped the winner's record for the judged pid and returned a
+# refusal, leaving a record nobody owns (the winner's ownership-scoped release then leaves it alone).
+# `orc_lock_pid` is overridden IN THIS SUBSHELL so the read that decides "somebody else took it" also
+# lets that third starter win the path: deterministic, with no race to lose. The discriminator is the
+# surviving record, not rc — both shapes return 1.
+LKR="$T/lkr"; mkdir -p "$LKR"
+printf '111\n' > "$LKR/.orch.lock"
+( . "$MOD"
+  orc_lock_pid() { printf '333\n' > "$LKR/.orch.lock"; printf '%s\n' 222; }
+  orc_lock_reclaim "$LKR/.orch.lock" 111; printf 'rc=%s\n' "$?" ) > "$T/rcl1" 2>&1
+[ "$(cat "$T/rcl1")" = "rc=1" ] \
+  && ck "§2 a contested reclaim still reports the refusal (rc 1)" 0 \
+  || ck "§2 a contested reclaim returned '$(cat "$T/rcl1")', wanted rc=1" 1
+[ "$(cat "$LKR/.orch.lock")" = "333" ] \
+  && ck "§2 the reclaim restore did NOT overwrite a later winner's record (it only fills a free path)" 0 \
+  || ck "§2 the reclaim restore OVERWROTE a later winner's record — got '$(cat "$LKR/.orch.lock" 2>/dev/null)', wanted 333" 1
+case "$(ls "$LKR"/.orch.lock.reclaim.* 2>/dev/null)" in
+  '') ck "§2 …and it leaves no reclaim temp file beside the record" 0 ;;
+  *)  ck "§2 …and it left a reclaim temp file beside the record: $(ls "$LKR"/.orch.lock.reclaim.* 2>/dev/null | tr '\n' ' ')" 1 ;;
+esac
+
 # ─────────────────────────────────────────────────────────────────────────────────────────────────
 say "§3 FAIL CLOSED — an unjudgeable record is a refusal, not a guess"
 # The age is unreadable when `ps` cannot answer. `PS_BIN` is the seam the fleet's own suites use
@@ -413,6 +437,12 @@ if need "$LOOP" "the shipped orch-loop.sh"; then
   # ⛔ AND NO CODE PATH IS STILL BUILT FROM `$O`. The review named these five sites; each pair is
   # "the old resolution must be GONE" + "the work-root one must be THERE", so deleting the fix reddens
   # the first arm and a half-applied fix reddens the second.
+  # ⛔ THE CHAIN SPAWN IS THE SIXTH, AND IT IS THE ONE A HALF-APPLIED FIX LEFT GREEN (fresh-context
+  # review of #3846, P1): `dispatch-merge.sh` was converted at :35/:483/:520 and line :526 — three lines
+  # below a converted sibling — still handed the CHAIN a state-dir path. That pane dies 127 while
+  # `wt_spawn` answers 0 (worker-terminal.sh's pre-check runs `$envpfx`, not `$cmd`), so the dispatch
+  # BOOKS `chain-<N>` as spawned, no review/record/merge ever runs, and the issue claim is held for its
+  # 4h lease because `chain-merge.sh`'s EXIT trap never fires.
   while IFS='|' read -r _f _bad _good; do
     [ -n "$_f" ] || continue
     if grep -qF -- "$_bad" "$HERE/$_f" 2>/dev/null; then
@@ -426,6 +456,7 @@ if need "$LOOP" "the shipped orch-loop.sh"; then
 fix-one.sh|bash "$O/merge-one.sh"|bash "${_FIX_MOD_DIR:-$O}/merge-one.sh"
 chain-merge.sh|bash "$O/merge-one.sh"|bash "${_CM_WORK:-$O}/merge-one.sh"
 dispatch-merge.sh|bash '$O/lane.sh'|bash '${_DM_WORK:-$O}/lane.sh'
+dispatch-merge.sh|bash '$O/chain-merge.sh'|bash '${_DM_WORK:-$O}/chain-merge.sh'
 stall-fix.sh|DISP="$O/nonblocking-dispatch.sh"|DISP="${_SF_WORK:-$O}/nonblocking-dispatch.sh"
 merge-one.sh|if [ -n "${HEAD:-}" ] && [ -f "$O/claims.sh" ]; then|if [ -n "${HEAD:-}" ] && [ -f "$_M1_MOD/claims.sh" ]; then
 PAIRS

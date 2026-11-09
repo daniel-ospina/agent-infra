@@ -377,7 +377,13 @@ workers_maybe_live() {
 #                        or the adapter is never reached (this file's `start` builds exactly that order
 #                        in both carriers — :4103 for the service-mode export, :4131 for the tmux
 #                        string; `lane.sh:83-84` re-asserts it for lanes).
-WORKER_ENV_NAMES="AI_REVIEW_GATE_KEY HOME O DEEPSEEK_API_KEY PATH"
+#   O_WORK             — the HARNESS ROOT, which is a SEPARATE name from `O` (the state dir) since
+#                        #2095. Every worker resolves its own modules (`claims.sh`, `repo-authority.sh`,
+#                        `merge-one.sh`) from it, so a worker that crosses this second tmux boundary
+#                        without it falls back to `$O` — where those files do not exist — and loses
+#                        the landing/head claims SILENTLY (the duplicate-merge exclusion) while the
+#                        cell keeps reporting RUNNING.
+WORKER_ENV_NAMES="AI_REVIEW_GATE_KEY HOME O O_WORK DEEPSEEK_API_KEY PATH"
 
 log_line() { printf '%s %s\n' "$(date -u +%FT%TZ)" "$*"; }
 

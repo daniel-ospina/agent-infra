@@ -766,7 +766,7 @@ ck "(d) a CLEAN exit (0) is NAMED EXITED-CLEAN, not DIED [$launchd_row]" \
    "$(case "$launchd_row" in *EXITED-CLEAN*) echo 0 ;; *) echo 1 ;; esac)"
 ck "(d) …and it does NOT claim every attempt is failing [$(printf '%s' "$launchd_row" | cut -c1-200)]" \
    "$(case "$launchd_row" in ""|*"every attempt is failing"*) echo 1 ;; *) echo 0 ;; esac)"
-ck "(d) …and it points at launchd.OUT, which is where 'already running' is written [$(printf '%s' "$launchd_row" | cut -c1-200)]" \
+ck "(d) …and it points at launchd.OUT, which is where the controller's own output is written [$(printf '%s' "$launchd_row" | cut -c1-200)]" \
    "$(case "$launchd_row" in *launchd.out*launchd.err*|*launchd.err*) echo 1 ;; *launchd.out*) echo 0 ;; *) echo 1 ;; esac)"
 # ⛔ AND IT MUST NOT READ A HISTORICAL `[singleton]` LINE AS THIS RUN'S VERDICT (fresh-context review of
 # #3846). `orch-loop.log` is APPEND-ONLY and never rotated, so a line from an earlier refusal is

@@ -681,7 +681,10 @@ else
   bad "fix-one.sh does not reap its worktree"
 fi
 # ORDER matters: reaping before the re-review would make the reviewer re-sync a fresh env.
-if [ -n "$(awk '/^bash "\$O\/merge-one.sh"/{m=NR} /reap_lane_venv "\$WT"/{r=NR} END{if (m && r && r > m) print "ok"}' "$HARNESS/fix-one.sh")" ]; then
+# ⛔ THE ROOT MAY BE THE WORK ROOT (#2095): the chain is `bash "${_FIX_MOD_DIR:-$O}/merge-one.sh"` when
+# a state dir is separated from the harness root, so the pin accepts `$O` and `${<VAR>:-$O}` and
+# nothing else — a reorder still reddens.
+if [ -n "$(awk '/^bash "(\$O|\$\{[_A-Za-z0-9]+:-\$O\})\/merge-one.sh"/{m=NR} /reap_lane_venv "\$WT"/{r=NR} END{if (m && r && r > m) print "ok"}' "$HARNESS/fix-one.sh")" ]; then
   ok "fix-one.sh reaps AFTER the merge chain (the re-review costs nothing then)"
 else
   bad "fix-one.sh reaps before the merge chain — the re-review would re-sync the env"

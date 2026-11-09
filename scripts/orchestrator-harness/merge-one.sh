@@ -126,8 +126,14 @@ export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH
 # serialiser) — and a shim that is never resolved is an INERT layer: it reports protection and
 # provides none. Re-assert both here, adapter last so `$O/gh-rest` (which itself calls the same
 # helper) wins where it exists. Guarded by `-d`, so a box that ships neither is unchanged.
-if [ -d "$O/gh-limit" ]; then PATH="$O/gh-limit:$PATH"; fi
-if [ -d "$O/gh-rest" ]; then PATH="$O/gh-rest:$PATH"; fi
+# ⛔ AND THE ROOTS ARE TWO NAMES NOW (#2095; review of #3846 — the same class as :46-54). `O` is the
+# controller's STATE dir and `O_WORK` is the harness root, so on an `ORC_STATE_DIR`/isolated instance
+# `$O/gh-limit` and `$O/gh-rest` do not exist and BOTH adapters silently vanish — an INERT layer of
+# exactly the kind this block exists to prevent, on the worker that lands every PR. `_M1_MOD` is
+# declared at :164, after this point, so the work root is read from `O_WORK` directly; unset, it IS
+# `$O` (the pre-#2095 behaviour).
+if [ -d "${O_WORK:-$O}/gh-limit" ]; then PATH="${O_WORK:-$O}/gh-limit:$PATH"; fi
+if [ -d "${O_WORK:-$O}/gh-rest" ]; then PATH="${O_WORK:-$O}/gh-rest:$PATH"; fi
 # ── THE GATE DECISION IS MEASURED, NOT ASSUMED (agent-infra#2319) — see lane.sh for the full note.
 # ⛔ A REVIEWER STILL NEEDS THE GATES OFF? No: the reviewer is the thing that SATISFIES them. It
 # commits nothing and merges through `admin-merge.sh` (a shell rail that reads the head-bound record),

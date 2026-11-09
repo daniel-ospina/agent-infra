@@ -113,6 +113,21 @@
     <string>__REPO__</string>
     <key>O</key>
     <string>__O__</string>
+    <!-- ⛔ THE STATE DIR CAN BE NAMED SEPARATELY (agent-infra#2095; fresh-context review of #3846, P2).
+         `O` above is BOTH this box's state dir and the tree `launchd-controller.sh` execs `orch-loop.sh`
+         from, so on a launchd box the two could not be separated at all — and this is the surface the
+         5 h 15 m incident happened on. `ORC_STATE_DIR` outranks `O` in `controller-state.sh:95-97`,
+         and `launchd-controller.sh` forwards it to the pane and reads the `[singleton]` refusal witness
+         from the SAME resolved dir, so naming one moves the queue, the log and the `.orch.lock`
+         singleton together.
+         ⛔ EMPTY IS A MEANING, AND IT IS TODAY'S BEHAVIOUR: `orc_state_pick` tests
+         `[ -n "${ORC_STATE_DIR:-}" ]`, so an empty value ranks `O` first and every existing render
+         behaves byte-identically. Do not delete this key to "clean it up": `install.sh` RE-RENDERS
+         this plist from this template on every install, so a key added to the INSTALLED copy by hand
+         is wiped by the next `install.sh` — the override has to be shipped here, empty, to be
+         durable. -->
+    <key>ORC_STATE_DIR</key>
+    <string></string>
 
     <!-- ── THE PIN (agent-infra#2215 / #2231) ──────────────────────────────────────────────────────
          The same three records the cells read, so this box answers "which harness am I on?" the same

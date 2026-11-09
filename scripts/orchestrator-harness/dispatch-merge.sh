@@ -209,8 +209,8 @@ export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH
 # through them. `fix-one.sh` carries the identical pair for the same reason; adapter last so
 # `$O/gh-rest` (which itself calls the same helper) wins where it exists. `-d`-guarded, so a box
 # shipping neither is unchanged.
-if [ -d "$O/gh-limit" ]; then PATH="$O/gh-limit:$PATH"; fi
-if [ -d "$O/gh-rest" ]; then PATH="$O/gh-rest:$PATH"; fi
+if [ -d "${_DM_WORK:-$O}/gh-limit" ]; then PATH="${_DM_WORK:-$O}/gh-limit:$PATH"; fi
+if [ -d "${_DM_WORK:-$O}/gh-rest" ]; then PATH="${_DM_WORK:-$O}/gh-rest:$PATH"; fi
 # ── the worker launcher (worker-terminal.sh) ─────────────────────────────────────────────────────
 # Lanes and chains are WORKERS, so they are started by the same module orch-loop.sh uses — a durable
 # terminal where the cmux daemon answers, tmux (with an explicit HOME + keys.env contract) where it does
@@ -523,7 +523,7 @@ for N in "$@"; do
   # the fragment — reding a registered shard and losing the only witness to the "stop the lane BEFORE
   # releasing the claim" ordering. Same rule as `${_lan-}` below: every variable this branch reads
   # must be safe when unset.
-  if wt_spawn "chain-$N" "${REPO_ABS:-$REPO}" "CHAIN_CLAIM_COMMIT='$chain_gen' bash '$O/chain-merge.sh' '${REPO_ABS:-$REPO}' '$OR' $N '$BR'"; then
+  if wt_spawn "chain-$N" "${REPO_ABS:-$REPO}" "CHAIN_CLAIM_COMMIT='$chain_gen' bash '${_DM_WORK:-$O}/chain-merge.sh' '${REPO_ABS:-$REPO}' '$OR' $N '$BR'"; then
     CHAIN_IDS="$CHAIN_IDS $N"   # the disk arm must not release a claim a live chain holds (round 3, P3)
     echo "        chain-$N (review->record->merge)${HARNESS_TOKEN:+ [harness=$HARNESS_TOKEN]}"
   else

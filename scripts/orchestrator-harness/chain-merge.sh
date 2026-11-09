@@ -13,8 +13,11 @@ export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH
 # serialiser) — and a shim that is never resolved is an INERT layer: it reports protection and
 # provides none. Re-assert both here, adapter last so `$O/gh-rest` (which itself calls the same
 # helper) wins where it exists. Guarded by `-d`, so a box that ships neither is unchanged.
-if [ -d "$O/gh-limit" ]; then PATH="$O/gh-limit:$PATH"; fi
-if [ -d "$O/gh-rest" ]; then PATH="$O/gh-rest:$PATH"; fi
+# ⛔ AND THE ADAPTERS LIVE UNDER THE WORK ROOT (#2095; review of #3846) — `_CM_WORK`, not `$O`, which
+# is the STATE dir since this change. Reading `$O` would drop both adapters exactly on the instances
+# this PR creates, while every gate still reports the layer present.
+if [ -d "${_CM_WORK:-$O}/gh-limit" ]; then PATH="${_CM_WORK:-$O}/gh-limit:$PATH"; fi
+if [ -d "${_CM_WORK:-$O}/gh-rest" ]; then PATH="${_CM_WORK:-$O}/gh-rest:$PATH"; fi
 LOG="$O/logs/chain-$N.log"
 echo "[chain $N] waiting for PR on $BR $(date)" > "$LOG"
 # The instant THIS chain started. It is the epoch every capacity-refusal record is compared
