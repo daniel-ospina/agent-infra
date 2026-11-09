@@ -389,7 +389,8 @@ was 14 working of 76 resident, and `zombie=` is in the same line so a box full o
 - **Cloud cell** — `check` → `stop` → `start`. `start` runs `apply` (fetch `origin/main`, write an
   immutable `<sha12>/` snapshot, move the pin, stamp) before launching. Never hand-edit a file inside a
   snapshot: it destroys the per-file provenance proof. ⛔ **`check` first, always:** it is the read-only
-  pre-flight, and since agent-infra#2093 `stop` refuses the same unusable pairs `start` refuses — so a
+  pre-flight, and since agent-infra#2093 `stop` refuses the same unusable pairs `start` refuses — it
+  just also requires that the state dir has something a stop would end — so a
   wrong `OR`/`REPO` pair now surfaces at step 1 instead of leaving the box stopped and unrefreshed. ⛔
   **On a snapshot that includes #2093.** On an older snapshot this claim does not hold as written: there
   `stop` has no gate, and the safety is `check`'s alone — which has always refused, so the sequence is

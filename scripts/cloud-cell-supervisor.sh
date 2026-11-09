@@ -89,10 +89,11 @@
 # not re-implemented: `stop` calls `assert_queue_target` itself, so the verbs cannot drift into the
 # #1745 shape (one verb blesses what the next refuses).
 # ⛔ `stop` STAYS ANSWERABLE, which is the whole reason the refusal is narrow. It refuses only when
-# (a) the pair is not usable AND (b) this state dir has something a stop would actually END. Stopping
-# a cell that is already down loses nothing, and an operator who means to stop a misconfigured box
-# anyway types `stop --force` — the refusal names that flag. `status` is unchanged: it reports the
-# pair and never refuses.
+# (a) the pair is not usable AND (b) this state dir has something a stop would actually END. Stopping a
+# cell with NONE of those legs loses nothing; ⛔ a cell that is already DOWN but still carries
+# `state/roles/.desired` is not that case — the marker IS one of the legs, so it needs `--force` too.
+# An operator who means to stop a misconfigured box anyway types `stop --force` — the refusal names that
+# flag. `status` is unchanged: it reports the pair and never refuses.
 # ⛔ The gate is NOT weakened by any of this: `check`/`start` still refuse the pair outright.
 #
 # Prereqs on the cell (see cloud-cell-bringup.sh --check):
@@ -539,7 +540,7 @@ assert_repo() { # [$1 = the asking verb, so a `stop` refusal carries its own tai
   # string unvalidated: a checkout directory named with a quote would close the quote in
   # `REPO='$REPO'` and the rest would be parsed as shell. This is the same class as the `$HARNESS`
   # re-check below, which exists for exactly this reason (a value that changes after the guard).
-  safe_argv "$REPO" || die "\$REPO must not contain a quote or shell metacharacter: $REPO"
+  safe_argv "$REPO" || die "\$REPO must not contain a quote or shell metacharacter: $REPO.${verb:+ $(queue_refusal_suffix "$verb" "Set REPO to a checkout path with no quote or shell metacharacter")}"
   # A DERIVED checkout changes the queue target (resolve_queue_target reads its origin), so re-derive
   # OR before anything asserts the pair.
   resolve_queue_target || true; OR="$QUEUE_REPO"
@@ -4302,8 +4303,9 @@ unit_stop_effect_verdict() { # <unit>
 # ⛔ WHY THIS EXISTS AT ALL (agent-infra#2093). `stop` is the verb an operator reaches for on a box
 # that is wrong — that is the doctrine this file already applies to `status` and to
 # orchestrator-bringup.sh's stop ("REPORT, never die"). So the new pre-flight is deliberately NARROW:
-# it refuses only when there is something to lose. Stopping a cell that is already down loses nothing
-# and must stay answerable, while stopping a LIVE one on an unusable pair is the exact action that
+# it refuses only when there is something to lose. Stopping a cell with NONE of the legs below loses
+# nothing and must stay answerable (⛔ a DOWN cell that still carries `.desired` is NOT such a cell —
+# the marker is the first leg), while stopping a LIVE one on an unusable pair is the exact action that
 # left lane-1 un-deployable.
 # ⛔ Conservative in the REFUSAL direction: a read that cannot be made counts as "something is
 # running". The two errors are not symmetric — a refused stop on an idle box costs one flag, a stop

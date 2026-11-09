@@ -138,9 +138,11 @@ step "wip-sweep: ${SWEEP:-<none found — WORK ON THIS BOX WILL NOT BE ARCHIVED>
 #    leaves the fix-*/merge-*/chain-* sessions (and their claim leases) behind.
 # ⛔ --force (agent-infra#2093): this script's whole verb is "end every controller on this box", and
 # it sweeps with `tmux kill-server` + `pkill` immediately below whatever the supervisor answers. The
-# supervisor's new queue-target pre-flight refuses `stop` on a mismatch WHILE a controller is live (so
-# the documented `stop` → `start` deploy cannot strand a box), which is exactly the state this script
-# is run in — pass the flag rather than letting a guard this script does not rely on change its path.
+# supervisor's new pre-flight refuses `stop` on a queue/checkout pair it cannot use (mismatch, invalid,
+# unreadable, underivable) WHENEVER this state dir has something a stop would end — the `.desired`
+# marker, a provably-own session, a doctor loop, or a controller pid — which is exactly the state this
+# script runs in (so the documented `stop` → `start` deploy cannot strand a box). Pass the flag rather
+# than letting a guard this script does not rely on change its path.
 [ -n "$SW" ] && bash "$SW" stop --force >/dev/null 2>&1 || true
 tmux kill-server >/dev/null 2>&1 || true
 sleep 2

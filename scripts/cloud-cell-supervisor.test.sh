@@ -3114,16 +3114,19 @@ esac
 [ "$(sgen "$S3")" = 4 ] \
   && ok "stop: the stop generation was bumped (an in-flight start is fenced, as before)" \
   || bad "stop did not bump the generation on a matched pair (got '$(sgen "$S3")')"
-#  (3b) mismatched pair but NOTHING RUNNING -> stop answers. Stopping a cell that is already down
-#  loses nothing, and `stop` is the verb an operator reaches for on a box that is wrong (the same
-#  doctrine `status` and orchestrator-bringup.sh's stop already carry).
+#  (3b) mismatched pair but NOTHING RUNNING -> stop answers. This fixture is an EMPTY state dir (no
+#  `.desired`, no session, no doctor loop, no controller pid) — a cell with NONE of those legs loses
+#  nothing, and `stop` is the verb an operator reaches for on a box that is wrong (the same doctrine
+#  `status` and orchestrator-bringup.sh's stop already carry). ⛔ A cell that is already DOWN but still
+#  carries `.desired` is NOT this fixture: the marker is the first leg, so that one refuses and needs
+#  `--force` (see the comment above `stop_would_end_something`).
 S4="$Q/st2093-idle"; rm -rf "$S4"; mkdir -p "$S4/o"
 qverb stop "$Q/agent-repo" "$S4" daniel-ospina/tortoise
 [ "$Q_RC" -eq 0 ] && ok "stop: an IDLE mismatched box still answers (nothing to lose; no false block)" \
                   || bad "stop refused an idle box on a broken pair (rc=$Q_RC): $Q_OUT"
 case "$Q_OUT" in
   *"DIFFERENT repos"*) bad "the pre-flight fired with nothing to stop: $Q_OUT" ;;
-  *) ok "stop: the pre-flight is narrow — it only protects a live controller" ;;
+  *) ok "stop: the pre-flight is narrow — this idle box has nothing a stop would end, so it is not refused" ;;
 esac
 
 #  (3c) A PEER SESSION IS NOT EVIDENCE OF OURS (review P2, #1856's recorded decision). `SESSION` is
@@ -3159,7 +3162,7 @@ case "$Q_OUT" in
   *) bad "(3c) the kill path did not report an ownership failure — it either signalled a session it cannot prove, or refused for an UNRELATED reason (rc=$Q_RC): $Q_OUT" ;;
 esac
 [ -f "$S4B/up" ] \
-  && ok "…and stop did not reach the kill path (rc=$Q_RC) — the PEER session's 'up' marker survives, so the machine-scoped name was never signalled" \
+  && ok "…and the KILL path left the PEER session ALONE (rc=$Q_RC, its 'up' marker survives) — a machine-scoped name it cannot prove was never signalled" \
   || bad "stop KILLED a session it cannot prove it owns (the peer's 'up' marker is gone) — the #1856 ownership proof is missing from the kill path (rc=$Q_RC): $Q_OUT"
 #  (3d) THE POSITIVE CONTROL for (3c): the same live-session shape whose pane DOES name this state dir
 #  must still refuse — otherwise (3c) could be satisfied by deleting the session leg entirely, which
