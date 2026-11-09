@@ -5307,6 +5307,28 @@ EV_REF="comment:42499401" run_record_ev 424994 STUB_EVIDENCE_BODY="## Review —
 $VACUITY_BLOCK"
 assert_eq "$RECORD_RC" "3" "13m6s not-covered=<n> is not coverage evidence either — refused with the NUMERIC spelling too (rc 3)"
 [ ! -f "$(Q2 424994)" ] && ok "13m6s no record minted from not-covered=<n>" || bad "13m6s minted from not-covered=<n>"
+# ⛔ AND THE BOUNDARY MUST EXCLUDE `_` TOO, NOT JUST `-` (third review of this PR, measured at
+# `13d6073dd`). `_` IS an identifier character, and excluding only `-` left every field name ENDING in
+# `covered` usable as self-supplied coverage evidence: `not_covered=13`, `Not_Covered=13` and
+# `all_covered=13` all read `covered=13`, compared EQUAL to `threats=13`, and MINted `clean`. Same class
+# as `uncovered=`, one character over — which is exactly why the boundary excludes both, and why 13m6t
+# (emptying `_ab_lb`) reddens these rows too.
+_m6s=0
+while IFS= read -r _m6s_body; do
+    _m6s=$((_m6s + 1)); _m6s_pr=$((424998 + _m6s))
+    rm -f "$(Q2 $_m6s_pr)"
+    EV_REF="comment:${_m6s_pr}01" run_record_ev "$_m6s_pr" STUB_EVIDENCE_BODY="## Review — THREAT SURFACE COVERED
+
+${_m6s_body}
+
+$VACUITY_BLOCK"
+    assert_eq "$RECORD_RC" "3" "13m6s '${_m6s_body#\[ADVERSARIAL-BOUND\] cycles=2 }' is not coverage evidence — refused (rc 3)"
+    [ ! -f "$(Q2 $_m6s_pr)" ] && ok "13m6s no record minted from the underscore-prefixed field ($_m6s)" || bad "13m6s minted from an underscore-prefixed field ($_m6s)"
+done <<'M6SFIELDS'
+[ADVERSARIAL-BOUND] cycles=2 threats=13 not_covered=13 residuals=filed
+[ADVERSARIAL-BOUND] cycles=2 threats=13 Not_Covered=13 residuals=filed
+[ADVERSARIAL-BOUND] cycles=2 threats=13 all_covered=13 residuals=filed
+M6SFIELDS
 # The MIRROR: an honest disclosure that says ZERO uncovered beside a real equal pair must ACCEPT —
 # before the anchor it was refused as an ambiguity the line never declared.
 rm -f "$(Q2 424995)"
@@ -5344,6 +5366,66 @@ $VACUITY_BLOCK"
     assert_eq "$RECORD_RC" "0" "13m6t control: on the SAME mutant a plain equal-count marker still ACCEPTS (rc 0) — the pin broke the anchor, not the arm"
 else
     bad "13m6t could not build the unanchored-extractor mutant (binds='${_m6t_binds:-?}') — the pin did not run"
+fi
+
+# 13m6u — AN EMPTY `residuals=` MUST NOT SWALLOW THE NEXT FIELD (third review of this PR, measured at
+# `13d6073dd`). The extractor allows a space after the `=` — `residuals= none` is what a human types —
+# and `residuals=[[:space:]]*[^[:space:]]*` let that space-crossing continue into the NEXT token, so
+# `… threats=13 residuals= covered=13` extracted ONE value, `covered=13`, which carries a digit and so
+# passed the numeric filed branch: an EMPTY field minting a clean record, falsifying this arm's own
+# "an EMPTY value still refuses" claim. A residuals VALUE never contains `=`, so a value that does is a
+# swallowed field, not a value — it is treated as EMPTY, which refuses. 13m6v makes that load-bearing.
+rm -f "$(Q2 425001)"
+EV_REF="comment:42500101" run_record_ev 425001 STUB_EVIDENCE_BODY="## Review — THREAT SURFACE COVERED
+
+[ADVERSARIAL-BOUND] cycles=2 threats=13 residuals= covered=13
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13m6u an EMPTY residuals= that would swallow the next field= token is refused (rc 3)"
+[ ! -f "$(Q2 425001)" ] && ok "13m6u no record minted from an empty residuals= that swallowed a field" || bad "13m6u minted from an empty residuals= that swallowed a field"
+# The trailing-empty control: no token to swallow, so the value grammar itself must refuse it —
+# proving 13m6u's row is about the SWALLOW and not merely about "empty values refuse".
+rm -f "$(Q2 425002)"
+EV_REF="comment:42500201" run_record_ev 425002 STUB_EVIDENCE_BODY="## Review
+
+[ADVERSARIAL-BOUND] cycles=2 threats=13 covered=13 residuals=
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13m6u control: a trailing EMPTY residuals= is still refused (rc 3)"
+# And the legitimate spaced values must still accept — the guard must not eat `residuals= none`.
+rm -f "$(Q2 425003)"
+EV_REF="comment:42500301" run_record_ev 425003 STUB_EVIDENCE_BODY="## Review — THREAT SURFACE COVERED
+
+[ADVERSARIAL-BOUND] cycles=2 threats=13 covered=13 residuals= none
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "0" "13m6u control: 'residuals= none' (the human spelling) still ACCEPTS (rc 0) [err: $(printf '%s' "$RECORD_ERR" | tr '\n' ' ')]"
+
+# 13m6v — MUTATION PIN (attribution for the EMPTY-field guard). 13m6u asserts the swallowed-field body
+# refuses; this pin proves the GUARD is what refuses it — with the guard replaced by `:` the identical
+# body must ACCEPT — and the control, on the SAME mutant, an ordinary `residuals=none` body must still
+# ACCEPT (the pin disabled the guard, not the arm).
+_m6v_mut="$T/record-review.mut1889h.sh"
+command sed 's@^[[:space:]]*if grep -qF .=. <<<"$_ab_v"; then _ab_v=""; fi@            :@' "$RECORD" > "$_m6v_mut"
+_m6v_binds=$(command diff "$RECORD" "$_m6v_mut" 2>/dev/null | command grep -c '^< ' || true)
+if [ "${_m6v_binds:-0}" = "1" ] && ! command grep -qF 'then _ab_v=""; fi' "$_m6v_mut" \
+   && bash -n "$_m6v_mut" 2>/dev/null && ! cmp -s "$_m6v_mut" "$RECORD"; then
+    _m6v_pr=425004
+    rm -f "$(Q2 $_m6v_pr)"
+    EV_REF="comment:${_m6v_pr}01" run_record_ev "$_m6v_pr" RECORD="$_m6v_mut" \
+        STUB_EVIDENCE_BODY="[ADVERSARIAL-BOUND] cycles=2 threats=13 residuals= covered=13
+
+$VACUITY_BLOCK"
+    assert_eq "$RECORD_RC" "0" "13m6v MUTATION: with the EMPTY-field guard disabled the swallowed field MINTS clean (rc 0) — 13m6u is load-bearing"
+    _m6v_pr=425005
+    rm -f "$(Q2 $_m6v_pr)"
+    EV_REF="comment:${_m6v_pr}01" run_record_ev "$_m6v_pr" RECORD="$_m6v_mut" \
+        STUB_EVIDENCE_BODY="[ADVERSARIAL-BOUND] cycles=2 threats=13 covered=13 residuals=none
+
+$VACUITY_BLOCK"
+    assert_eq "$RECORD_RC" "0" "13m6v control: on the SAME mutant residuals=none still ACCEPTS (rc 0) — the pin disabled the guard, not the arm"
+else
+    bad "13m6v could not build the empty-field-guard mutant (binds='${_m6v_binds:-?}') — the pin did not run"
 fi
 
 # 13g3 — the marker veto must be anchored to a LINE START, not to position 0. The
@@ -5700,13 +5782,13 @@ fi
 #     → :2482 :4186 :6501 :6613, plus a comment mention at :2356) and the
 #     same four PREDICATE sites are at head
 #     (`grep -n 'grep -qxF' scripts/record-review.sh` prints all four PREDICATE lines at head —
-#     CITE-CHECK: :2736 :4462 :6832 :7006, plus a comment mention at :2605; `14.1c-CITE` below
+#     CITE-CHECK: :2747 :4473 :6843 :7017, plus a comment mention at :2616; `14.1c-CITE` below
 #     re-derives these numbers, so they cannot rot silently): in #3168's diff the only
-#     hunk at `post_marker()` (:2714) ADDS A COMMENT — this PR does not touch
+#     hunk at `post_marker()` (:2725) ADDS A COMMENT — this PR does not touch
 #     `post_marker()` at all — and the
-#     predicate line beside it (CITE-CHECK: :2736) is CONTEXT, not a change.
+#     predicate line beside it (CITE-CHECK: :2747) is CONTEXT, not a change.
 #     WHAT THE VECTOR BELOW ACTUALLY PINS: the BODY-APPEND site
-#     (`if ! grep -qxF -- "$MARKER" <<<"$BODY"`; on main at bd1b205d :6501 — at head CITE-CHECK: :6832). It is a
+#     (`if ! grep -qxF -- "$MARKER" <<<"$BODY"`; on main at bd1b205d :6501 — at head CITE-CHECK: :6843). It is a
 #     MAIN-REGRESSION pin — reverting this PR leaves 14.1c GREEN, and 14.10f is a
 #     main-regression pin for the same reason. Keeping them is right (main's
 #     anchoring should not silently regress); calling them evidence about this diff
@@ -5732,7 +5814,7 @@ fi
 #     `:6625` / `:6770` at `dc7e3ae99`, `:6634` / `:6779` at `921109de2` and `:6639` / `:6796` at
 #     `17551325e` as comment blocks were added above them, while the CITES beside them still read
 #     `:6625` / `:6770` at all three — that divergence IS the rot this paragraph describes — and at
-#     this head the predicates are `:6832` / `:7006` — CITE-CHECK: :6832 :7006 — re-derived by the
+#     this head the predicates are `:6843` / `:7017` — CITE-CHECK: :6843 :7017 — re-derived by the
 #     guard below, like every other head cite of a predicate). One
 #     lane's response was to delete the numbers — which removes the rot but also removes the
 #     reader's target. Both intents are kept here: the number stays, and it is CHECKED.
@@ -6634,14 +6716,14 @@ assert_eq "$REC_BEFORE_14B" "$(cat "$F_HOME/.pi/agent/reviews/daniel-ospina-agen
 #       not. `if command grep -qxF -- "$marker" <<<"$body"` is ALREADY `-qxF` on main
 #       (`git show bd1b205d:scripts/record-review.sh | grep -n 'grep -qxF'` — the sha is NAMED
 #       because `origin/main` moves and a bare "main :NNNN" rots the moment it does → :2482),
-#       and in #3168's diff the only hunk at `post_marker()` (head :2714) ADDS A COMMENT above
+#       and in #3168's diff the only hunk at `post_marker()` (head :2725) ADDS A COMMENT above
 #       it (this PR does not touch `post_marker()` at all) — the
-#       predicate line (head :2736) is CONTEXT. Reverting #3168 leaves this vector GREEN; it is kept
+#       predicate line (head :2747) is CONTEXT. Reverting #3168 leaves this vector GREEN; it is kept
 #       because main's anchoring should not silently regress, and it is labelled so the
 #       next reader does not mistake it for evidence about this diff. The predicate must
 #       match the gate's line-anchored `^…$` admission, exactly like the three other
 #       sites already anchored on main (bd1b205d :4186 :6501 :6613) — the same four that the grep
-#       above prints at head, CITE-CHECK: :4462 :6832 :7006 (`14.1c-CITE` re-derives the triple).
+#       above prints at head, CITE-CHECK: :4473 :6843 :7017 (`14.1c-CITE` re-derives the triple).
 #       ⛔ ASSERTS THE TRANSPORT (a PATCH was issued), not the exit code: the destructive
 #       mutant also exited 0.
 if [ -n "${QB_LINE:-}" ]; then

@@ -1956,7 +1956,8 @@ off macOS (it renders a launchd plist) — the portability that matters is `orch
    seventh described below (a count pair that cannot be identified):
    (i) a value that merely MENTIONS `none`
    (`none,#12`, `none-filed`, `noneX`); (ii) an unsubstituted template (`<#N,…|none>`); (iii) a
-   marker with **no** `residuals=` field; (iv) a **contradictory disclosure** — when the marker line
+   marker with **no** `residuals=` field — or one whose value is EMPTY, including a field that would
+   otherwise swallow the next `field=` token; (iv) a **contradictory disclosure** — when the marker line
    ALSO carries `threats=N` and `covered=M` and the two DIFFER, the artifact itself admits a declared
    class went uncovered, and that refuses regardless of the value (`threats=17 covered=15` is a
    contradiction, not a clean exit); (v) a **FILED list with no counts** — its legality rests on
@@ -1974,10 +1975,15 @@ off macOS (it renders a launchd plist) — the portability that matters is `orch
    the message names the ambiguity. The comparison is NUMERIC, so `threats=09 covered=9` is equal rather
    than a false contradiction, and a space after the `=` (`residuals= none`) is accepted. Each count
    field is matched with a LEFT BOUNDARY, so `uncovered=13` and `not-covered=13` are NOT coverage
-   evidence: before this round's review the extractor was an unanchored substring, so a marker that
+   evidence: the extractor was an unanchored substring, so a marker that
    declared every class **UNCOVERED** (`threats=13 uncovered=13 residuals=filed`) minted `clean` — the
    one fail-open the contradiction guard exists to prevent — and, in mirror, an honest
-   `covered=13 uncovered=0` was refused as "MORE THAN ONE count value".
+   `covered=13 uncovered=0` was refused as "MORE THAN ONE count value". The boundary excludes BOTH
+   identifier characters, `-` and `_`: excluding only `-` left `not_covered=13`, `Not_Covered=13` and
+   `all_covered=13` supplying their own `covered=13` (measured in review, same class one character
+   over). And an **EMPTY** `residuals=` whose value would swallow the next `field=` token
+   (`… threats=13 residuals= covered=13`) is treated as empty, which REFUSES — a residuals value never
+   contains `=`, so a value that does is a swallowed field, not a value.
    ⛔ **THE REMAINING SEAM, stated rather than hidden:** the capped emission
    (`skills/code-review/references/fixer-loop.md` §"PR comment prefix") is
    `threats=<K> covered=<K> residuals=<#N,…|none>` — equal counts BY CONSTRUCTION, and its own prose

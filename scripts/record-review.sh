@@ -1264,9 +1264,11 @@ verify_review_evidence() { # <ref> <head_sha> [polarity] -> 0 = verified
         # that excludes an identifier character (`-` included, for `not-covered=`). The boundary is
         # consumed by `grep -o`, which is harmless: the digit stage below re-extracts `[0-9]+`.
         # ⛔ ONE DEFINITION OF THE BOUNDARY, so the two extractors cannot drift and a mutation pin can
-        # remove it with a one-token edit (`_ab_lb=`). It is `[^-[:alnum:]]` rather than `[^[:alnum:]]`
-        # so `not-covered=` does not qualify either.
-        _ab_lb='(^|[^-[:alnum:]])'
+        # remove it with a one-token edit (`_ab_lb=`). It excludes `_` AND `-` because BOTH are
+        # identifier characters, and excluding only `-` was not enough: `not_covered=13`,
+        # `Not_Covered=13` and `all_covered=13` still matched `covered=13` and minted `clean` (found in
+        # the SECOND review of this PR, measured — the same class as `uncovered=`, one character over).
+        _ab_lb='(^|[^-_[:alnum:]])'
         _ab_tset="$(printf '%s' "$_ab_line" | grep -oiE "${_ab_lb}threats=[0-9]+" | grep -oE '[0-9]+' \
           | while IFS= read -r _ab_num; do printf '%s\n' "$((10#${_ab_num}))"; done \
           | sort -u | tr '\n' ' ' | sed 's/^ *//; s/ *$//' || true)"
@@ -1291,6 +1293,15 @@ verify_review_evidence() { # <ref> <head_sha> [polarity] -> 0 = verified
           [ -n "$_ab_f" ] || continue
           _ab_n=$((_ab_n + 1)); _ab_seen="$_ab_f"
           _ab_v="${_ab_f#*=}"
+          # (ii-d) AN EMPTY `residuals=` MUST NOT SWALLOW THE NEXT FIELD (measured, second review of
+          # this PR). The extractor allows a space after the `=` (`residuals= none` is the spelling a
+          # human types), and `residuals=[[:space:]]*[^[:space:]]*` lets that space-crossing continue
+          # into the NEXT token: `… threats=13 residuals= covered=13` extracted ONE value,
+          # `covered=13`, which carries a digit and so passed branch (ii-b) — an EMPTY field minting a
+          # clean record, falsifying this arm's own "an EMPTY value still refuses" claim. A residuals
+          # VALUE never contains `=`, so a value that does is a swallowed field, not a value: it is
+          # treated as EMPTY (which refuses) rather than guessed at.
+          if grep -qF '=' <<<"$_ab_v"; then _ab_v=""; fi
           _ab_ok=0
           # (ii) the documented TERSE clean value: exactly `none`, case-insensitive, up to a delimiter.
           grep -qiE '^residuals=[[:space:]]*none[,.:;)]*$' <<<"$_ab_f" && _ab_ok=1
