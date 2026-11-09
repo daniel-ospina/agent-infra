@@ -284,6 +284,23 @@ ck "B3 an ABSENT resolver is reported and never refuses the lane (rc=$rc3) — a
 grep -q '\[gh-auth\] UNAVAILABLE' "$TMP/b3.log"; rc=$?
 ck "B3b …and the log names it, rather than leaving the lane to discover it at its first gh call" $rc
 
+# B3c: with the module ABSENT and the read failing, the refusal must not claim a credential it never
+# resolved. Pre-change this arm could not exist; it exists because the first cut of this change printed
+# "the lane's gh IS credentialed (state=unknown)" whenever `gh_auth_cause` could not speak.
+: > "$PI_LOG"; gh_install 81 15 "bug" "a normal issue" all-fail
+( cd "$WT" && env -u GH_CONFIG_DIR -u XDG_CONFIG_HOME -u GH_TOKEN -u GITHUB_TOKEN \
+    O="$O" KIND=bg TAG=2517 HOME="$LANE_HOME" PATH="$O/gh-rest:$TMP/bin:$PATH" \
+    MAX_LOAD=999999 DISK_MIN_FREE_MB=1 DISK_GATE_PATH="$TMP" LANE_TIMEOUT=5 \
+    bash -c '. "$1" >/dev/null 2>&1 || exit 78; unset -f gh_auth_log gh_auth_cause gh_auth_resolve gh_auth_ensure; run_agent 5 "$2" "$3" "bg ${TAG:-}"' \
+    _ "$SG" "$TMP/b3c.log" "$BRIEF" ) >/dev/null 2>&1
+rc3c=$?
+[ "$rc3c" -eq 74 ]; rc=$?
+ck "B3c an absent resolver + a failed read is still HELD (rc=$rc3c), so the gate keeps its teeth" $rc
+grep -q 'IS credentialed' "$TMP/b3c.log" && rc=1 || rc=0
+ck "B3c2 …and the refusal does NOT claim a credential it never resolved (no 'IS credentialed')" $rc
+grep -q 'could NOT be resolved either' "$TMP/b3c.log"; rc=$?
+ck "B3c3 …it names the unresolved state and points at the lane's own gh, rather than guessing" $rc
+
 # B4: the falsifier in the ratio direction — a credential present and a genuine overshoot still HOLDS,
 # with the RATIO remedy (the pre-change tree printed that remedy on the wrong arm, so both arms are
 # asserted separately here).
