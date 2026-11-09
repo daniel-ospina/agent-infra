@@ -155,8 +155,23 @@ _pid_prog_is_loop() {
     [ $# -gt 0 ] || return 3
     prog="${1##*/}"
     [ "$prog" = "$LOOP_NAME" ] && return 0     # executed directly: argv[0] IS the loop
+    # ⛔ ONE ARM PER INTERPRETER, NOT ONE `|`-SEPARATED PATTERN (#1867 review P3, round 7).
+    # `extensions/main-worktree-guard` reads a script's body before running it, and its
+    # piped-producer arm splits quote-aware on the vertical bar — so an arm that lists the five
+    # interpreters on one pattern reads as a PIPELINE whose consumer is a shell, the file's own
+    # backticked prose then looks like an expansion feeding that shell, and the WHOLE body becomes
+    # unreadable: every verb of this launcher (`start`, `check`, `status`, `--help`) was refused
+    # before its first line ran, from any agent session in any checkout. The documented path in
+    # docs/ops/heartbeat-launch-path.md was therefore unrunnable by exactly the audience it is
+    # written for, and the suite could not see it because it reaches this file through a VARIABLE
+    # (`bash "$LAUNCH"`), which that arm does not resolve. The same bar-free spelling is used in
+    # `started_by_launchd`, and it must stay that way in COMMENTS too — the guard reads those.
     case "$prog" in
-        bash|sh|dash|ksh|zsh) ;;
+        bash) ;;
+        sh) ;;
+        dash) ;;
+        ksh) ;;
+        zsh) ;;
         *) return 2 ;;                          # a different program — not ours, whatever its args
     esac
     shift
@@ -246,7 +261,8 @@ started_by_launchd() {
     local label="${XPC_SERVICE_NAME:-}"
     [ -n "$label" ] || return 1
     case "$label" in
-        0|application.*) return 1 ;;
+        0) return 1 ;;
+        application.*) return 1 ;;
     esac
     return 0
 }
@@ -283,6 +299,19 @@ EOF
         die "REFUSING: heartbeat loop not found at $LOOP (set HEARTBEAT_PI_AGENT_DIR, or farm scripts/)"
     fi
 
+    # ⛔ THE KILL FILE IS CHECKED FIRST, BEFORE THE ALREADY-RUNNING BRANCH (#1867 review P3, round 7).
+    # It used to sit below it, so with a live loop in the pidfile AND the kill file present, `start`
+    # answered `already running` rc=0 — about the one window where the kill file actually does
+    # anything: the loop exits at the TOP of its next pass, this loop is launched-once with no timer,
+    # and nothing restarts it. The operator was told it runs and it will not. Asking the kill-file
+    # question first also makes the block's other claim true ("enforcing it here makes that
+    # impossible to get wrong") in both states, not just the stopped one.
+    if [ -f "$KILLFILE" ]; then
+        die "REFUSING: $KILLFILE is present — the loop exits at the top of its next pass, and this loop
+  is launched-once (no timer restarts it).
+  Resume with:  rm -f $KILLFILE && bash $0 start"
+    fi
+
     # Already running is success, not a second copy. Read the pid AND prove it is the LOOP: a pidfile
     # whose pid is dead is a stale record, and relaunching over it is correct — but it must say so,
     # because a silent "already running" over a dead process is the same false PASS one layer down.
@@ -311,14 +340,9 @@ EOF
         fi
     fi
 
-    # ⛔ THE KILL FILE IS CHECKED HERE, NOT LEFT TO THE LOOP. The loop exits at the TOP of its next
-    # pass when the kill file is present, so a `start` without the `rm` prints "started" and then
-    # dies in the same pass — the documented resume is "the rm AND the start". Enforcing it here
-    # makes that impossible to get wrong, and the message names the one command that fixes it.
-    if [ -f "$KILLFILE" ]; then
-        die "REFUSING: $KILLFILE is present — the loop would exit on its first pass.
-  Resume with:  rm -f $KILLFILE && bash $0 start"
-    fi
+    # ⛔ THE KILL FILE USED TO BE CHECKED HERE — see the block above `pid_is_loop`'s diagnosis; the
+    # refusal now runs BEFORE the already-running branch, which is the only place it can cover both
+    # states.
 
     local cmd
     # ⛔ NO `setsid` (#1867 review P0). macOS ships no `setsid` binary — a fact this repo states in
@@ -354,10 +378,8 @@ EOF
     # that arm could never fire and read as a guard that was only decoration. The launch is verified
     # below by the ARTEFACT the loop leaves (pidfile + `kill -0`), which is a real proof, and a LOOP
     # that is missing is refused further up by name.
-    ( cd "$SELF_DIR" && LOOP_DETACHED=1 nohup bash "$LOOP" >>"$STATE/heartbeat-launch.log" 2>&1 & )
-
-    # ⛔ THE STALE RECORD IS REMOVED HERE, NOT AT THE DIAGNOSIS (#1867 review P2, round 6) — for two
-    # reasons, and the first one is why this is not cosmetic:
+    # ⛔ THE STALE RECORD IS REMOVED BEFORE THE FORK, NOT AFTER IT (#1867 review P2/P3, rounds 6-7) —
+    # for three reasons:
     #   · leaving it in place let the poll below PROVE THE LAUNCH with a pid that was already there. If
     #     the loop died before writing its own pidfile (a bad cwd, a SIGKILL, a missing interpreter),
     #     the poll found the stranger's pid, `kill -0` succeeded, and `start` printed
@@ -365,9 +387,13 @@ EOF
     #     told it runs. At this point ident is 1 or 2 (0 returned above, 3 refused), so the record is
     #     provably NOT the loop and removing it is not data loss.
     #   · removing it at the DIAGNOSIS would be wrong too: that block runs BEFORE the `--dry-run`
-    #     return below, so a dry run would delete the operator's pidfile and erase the evidence
-    #     `status` is about to be asked for. Removal belongs where the launch is.
+    #     return, so a dry run would delete the operator's pidfile and erase the evidence `status` is
+    #     about to be asked for. Removal belongs where the launch is.
+    #   · AFTER the fork it was a race with the loop's own write: the real loop writes its pidfile a
+    #     moment later (`heartbeat-loop.sh`, after its PATH pin), and a parent that removed the file
+    #     after forking could delete the FRESH record. Before the fork, there is nothing to race.
     rm -f "$PIDFILE"
+    ( cd "$SELF_DIR" && LOOP_DETACHED=1 nohup bash "$LOOP" >>"$STATE/heartbeat-launch.log" 2>&1 & )
 
     # ⛔ THE POLL PROVES THE **LOOP**, NOT A PID (#1867 review P2, round 6). It used `kill -0` alone,
     # which is the same liveness-is-not-identity error §"PROCESS IDENTITY" above exists to remove — and

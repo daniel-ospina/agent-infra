@@ -197,6 +197,20 @@ assert_contains "$OUT" "HEARTBEAT-OFF" "§4 …and names the file that is stoppi
 assert_contains "$OUT" "rm -f" "§4 …and gives the one command that resumes it"
 assert_not_contains "$OUT" "started (pid" "§4 …and does NOT claim it started"
 
+# ⛔ AND THE KILL-FILE QUESTION COMES FIRST, BEFORE "ALREADY RUNNING" (#1867 review P3, round 7). The
+# refusal sat BELOW the already-running branch, so with a live loop in the pidfile AND the kill file
+# present, `start` answered `already running` rc=0 — about the one window where the kill file actually
+# does anything: the loop exits at the top of its next pass and nothing restarts it (launched-once, no
+# timer). §4 above only covers the stopped case, so no row reddened.
+R="$(newroot s4b)"
+P="$(loop_pid)"; printf '%s\n' "$P" > "$R/agent/state/heartbeat-loop.pid"
+: > "$R/agent/state/HEARTBEAT-OFF"
+OUT="$(run "$R" -- start)"; RC=$?
+assert_eq "$RC" "1" "§4b a LIVE loop plus the kill file is a REFUSAL (rc=1), not 'already running' rc=0"
+assert_contains "$OUT" "HEARTBEAT-OFF" "§4b …naming the kill file"
+assert_not_contains "$OUT" "already running" "§4b …and 'already running' is NOT claimed about a loop that exits on its next pass"
+assert_contains "$OUT" "rm -f" "§4b …and prints the one command that resumes it"
+
 # ⛔ A LIVE PID IS THE EVIDENCE, NOT THE FILE. "already running" over a DEAD pid would be the same
 # false PASS one layer down, so the three cases are asserted separately: the LOOP (idempotent), a
 # DEAD pid (stale), and a RECYCLED LIVE pid that is NOT the loop (also stale — and the one `kill -0`
@@ -542,6 +556,16 @@ assert_eq "$RC" "1" "§16c a launch that left NO pidfile is a DRIFT even when th
 assert_not_contains "$OUT" "started (pid" "§16c …and 'heartbeat loop started' is never printed over it"
 assert_not_contains "$OUT" "already running" "§16c …nor 'already running' — the record was named stale and removed"
 assert_contains "$OUT" "DRIFT" "§16c …the verdict is DRIFT, naming the launch it could not verify"
+# ⛔ AND THE STALE RECORD IS GONE (#1867 review P2, round 7). Without this removal the poll below reads
+# the stranger's pid on its FIRST round and reports the launch with it — the comment above says so, and
+# until this row nothing measured it: the identity check alone kept the suite green, so deleting the
+# removal reddened NOTHING. Now it does, and it is the removal (before the fork, so it cannot race the
+# loop's own write) that the row names.
+if [ -f "$R/agent/state/heartbeat-loop.pid" ]; then
+    bad "§16c …and the stale record was REMOVED at the launch (it still names pid $(tr -dc '0-9' < "$R/agent/state/heartbeat-loop.pid" 2>/dev/null)) — left in place, the poll can prove a launch with it"
+else
+    ok "§16c …and the stale record was REMOVED at the launch, so the poll had nothing to mistake for the loop"
+fi
 
 # ⛔ AND A FLAG CLUSTER THAT ENDS IN `o` TAKES THE NEXT WORD (#1867 review P2, round 6).
 # `bash -euo pipefail <script>` is the canonical strict-mode spelling of the shape the predicate's
