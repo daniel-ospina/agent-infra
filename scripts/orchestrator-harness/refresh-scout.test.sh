@@ -3212,6 +3212,14 @@ echo 'GraphQL: API rate limit already exceeded for user ID 81560491.' >&2
 exit 1
 SH
 chmod +x "$D/bin/gh"
+# ⛔ ONE SEEDED DISPATCHED ROW, SO THE REAPER'S WINDOWS ARE ACTUALLY ASKED (agent-infra#1984).
+# The pass now SKIPS a window whose reader is empty (`.open_iss` is read only by the dispatched reap,
+# `.pr_brs` by the reap and the checked classification), so a fixture with no `dispatched.txt` — which
+# is what `mk_case` gives — issues ZERO listing requests. That is the bound working, not the transport
+# under test; this case grades the TRANSPORT, so it must have a row to reap. The row cannot be
+# un-blacklisted here: the stub answers no open window and no PR branches, and its fallthrough refuses
+# every GraphQL verb, so the targeted re-check cannot answer either and the row is KEPT (fail-closed).
+printf '77\n' > "$D/o/dispatched.txt"
 rf "$D" refresh GH_LOG="$D/gh-calls"
 [ "$RC" -eq 0 ] && ok "starved-graphql: the pass SUCCEEDS on REST (rc=0) — a starved bucket is not a broken box" \
                || bad "starved-graphql: rc=$RC (want 0) — REST answered and the pass still refused — output: $OUT"

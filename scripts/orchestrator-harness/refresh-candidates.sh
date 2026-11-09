@@ -2832,18 +2832,86 @@ rest_list() {
 # distinguishable from "the answer is none" (PRESENT but EMPTY). The reaper refuses the whole pass
 # unless both are present; a genuinely empty list is still a valid answer and still reaps.
 lists_transport_note
+# ── A LISTING NOBODY READS IS NOT A FREE QUESTION (agent-infra#1984) ───────────────────────────
+# The two listings below are the REAPER's inputs, and nothing else reads them: `.open_iss` is
+# consumed only by the dispatched reap, `.pr_brs` by the dispatched reap and the checked
+# classification. A pass whose `dispatched.txt` and `checked.txt` are both empty therefore spends
+# both windows (10 core requests at the 500-row bound) on a question that cannot change any answer.
+# That is exactly the shape #1984 exists to remove: the refresh runs WHENEVER THE BACKLOG IS SHORT,
+# i.e. in the stall it exists to fix, and the pass that has nothing to reap is the most common one.
+#
+# ⛔ THE BOUND IS DERIVED FROM WHAT THE REAPER CAN USE, NOT FROM A SMALLER TASTE (the issue's own
+# acceptance, #1984): a pass over `agent-infra` with an empty `dispatched.txt` issues ZERO listing
+# requests; a non-empty one issues at most one request per row it serves. `rest_list` pages at 100
+# rows, so `--limit 100*n` is n pages: the windows below are sized to the rows that read them and
+# clamped to the 500 the shipped behaviour has always used, so a pass at or above five rows behaves
+# EXACTLY as before and a smaller one costs less without ever costing more.
+#
+# ⛔ WHAT A NARROWER PR WINDOW COSTS, AND WHY IT CANNOT UN-BLACKLIST ON IT. `has_pr` is a REGEX
+# against the PR head refs in `.pr_brs`; a PR outside the window reads exactly like no PR at all,
+# and "no PR" is what releases a dispatched entry back into the queue (#1705: a duplicate lane for
+# work that already had one). So when the PR window is narrower than the shipped 500 the pass says
+# so, and the reap REFUSES to un-blacklist on a PR-absence fact read from it: those rows take the
+# window-blind path instead (KEPT, or settled only by the issue's own CLOSED state — the same
+# fail-closed arm the saturated 500-row window already uses). A narrower window can therefore only
+# ever make the pass keep MORE, never release more.
+#
+# The counts are read from the FILES the reap will rewrite, before it runs, so a listing is skipped
+# only when the file it serves is genuinely empty. UNREADABLE COUNTS AS 1, never as 0: a blacklist
+# this pass cannot read is not an empty one, and skipping the listings on it would be that inference.
+_reap_rows_in() {  # <file> → non-blank rows; unreadable/unparseable ⇒ 1 (never "nothing to do")
+  _rr_f="$1"
+  if [ ! -e "$_rr_f" ]; then printf '0'; return 0; fi
+  if [ ! -r "$_rr_f" ]; then printf '1'; return 0; fi
+  _rr_n="$(awk 'NF { n++ } END { printf "%d", n+0 }' "$_rr_f" 2>/dev/null)"
+  case "$_rr_n" in
+    ''|*[!0-9]*) printf '1' ;;
+    *) printf '%s' "$_rr_n" ;;
+  esac
+  return 0
+}
+# `rest_list` charges one request per 100-row page, so a page count IS a limit. Clamped to
+# [100, 500]: below 100 the provider caps per_page anyway (a "1-row limit" is still one page), and
+# 500 is the window every earlier pass used.
+_reap_window() {  # <rows> → a limit that is at most one page per row, never more than 500
+  _rw_n="$1"
+  _rw_l=$(( _rw_n * 100 ))
+  [ "$_rw_l" -lt 100 ] && _rw_l=100
+  [ "$_rw_l" -gt 500 ] && _rw_l=500
+  printf '%s' "$_rw_l"
+}
+DISP_ROWS="$(_reap_rows_in "$O/dispatched.txt")"
+CK_ROWS="$(_reap_rows_in "$O/checked.txt")"
+# `.open_iss` serves the dispatched reap alone.
+[ "$DISP_ROWS" -eq 0 ] && REAP_OPEN_LIMIT=0 || REAP_OPEN_LIMIT="$(_reap_window "$DISP_ROWS")"
+# `.pr_brs` serves BOTH halves, so it is skipped only when BOTH are empty.
+PR_ROWS=$(( DISP_ROWS + CK_ROWS ))
+[ "$PR_ROWS" -eq 0 ] && REAP_PR_LIMIT=0 || REAP_PR_LIMIT="$(_reap_window "$PR_ROWS")"
+# The reap reads these to tell "we did not ask" from "the read failed" — the two are the same
+# ABSENT file on disk, and reporting one as the other is the #1705/#1736 class in a log line.
+export REAP_OPEN_LIMIT REAP_PR_LIMIT
 # The stage is set HERE, before the first network read of the pass: from this point a failure is about
 # the LISTING (a gh/tier/jq read), not about provisioning, and the record must say which.
-refresh_stage list "rest_list issues/pulls --repo $OR (open-issue + PR-branch listings)"
-if ! rest_list issues --repo "$OR" --state open --limit 500 --jq '.[].number' > "$O/.open_iss" 2>"$O/.list-err"; then
+refresh_stage list "rest_list issues/pulls --repo $OR (open-issue + PR-branch listings, REAP_OPEN_LIMIT=$REAP_OPEN_LIMIT REAP_PR_LIMIT=$REAP_PR_LIMIT)"
+if [ "$REAP_OPEN_LIMIT" -eq 0 ]; then
+  echo "[refresh] listings: the open-issue window is NOT requested — dispatched.txt names no rows, and it is that window's only consumer (#1984); a pass that has nothing to reap cannot answer differently for having read it"
+elif ! rest_list issues --repo "$OR" --state open --limit "$REAP_OPEN_LIMIT" --jq '.[].number' > "$O/.open_iss" 2>"$O/.list-err"; then
   rm -f "$O/.open_iss"
   echo "[refresh] WARN: open-issue listing FAILED — reaping pass will be skipped (an unreadable listing is not an empty one)"
   [ -s "$O/.list-err" ] && sed -n '1,2p' "$O/.list-err" | sed 's/^/[refresh]   /'
 fi
-if ! rest_list pulls --repo "$OR" --state all --limit 500 --jq '.[]|.head.ref' > "$O/.pr_brs" 2>"$O/.list-err"; then
-  rm -f "$O/.pr_brs"
-  echo "[refresh] WARN: PR listing FAILED — reaping pass will be skipped (an unreadable listing is not an empty one)"
-  [ -s "$O/.list-err" ] && sed -n '1,2p' "$O/.list-err" | sed 's/^/[refresh]   /'
+if [ "$REAP_PR_LIMIT" -eq 0 ]; then
+  echo "[refresh] listings: the PR-branch window is NOT requested — dispatched.txt and checked.txt both name no rows, and nothing else reads it (#1984)"
+else
+  if ! rest_list pulls --repo "$OR" --state all --limit "$REAP_PR_LIMIT" --jq '.[]|.head.ref' > "$O/.pr_brs" 2>"$O/.list-err"; then
+    rm -f "$O/.pr_brs"
+    echo "[refresh] WARN: PR listing FAILED — reaping pass will be skipped (an unreadable listing is not an empty one)"
+    [ -s "$O/.list-err" ] && sed -n '1,2p' "$O/.list-err" | sed 's/^/[refresh]   /'
+  elif [ "$REAP_PR_LIMIT" -lt 500 ]; then
+    # ⛔ SAID OUT LOUD, because it changes what the ANSWER means: a PR outside this window is
+    # indistinguishable from no PR, and "no PR" is what releases a dispatch back into the queue.
+    echo "[refresh] listings: the PR-branch window is NARROWED to ${REAP_PR_LIMIT} rows (it serves ${PR_ROWS} row(s); the shipped window is 500), so a PR outside it is NOT evidence of 'no PR' — no dispatched entry is un-blacklisted on that reading this pass (#1984)"
+  fi
 fi
 rm -f "$O/.list-err"
 # ── NOTHING THIS PASS DID NOT CLASSIFY MAY BE READ AS THIS PASS'S CLASSIFICATION (agent-infra#2183)
@@ -2951,6 +3019,28 @@ except OSError as exc:
 # justification this change exists to remove. The guard is therefore SPLIT by what each half reads.
 have_open = os.path.exists(os.path.join(O, ".open_iss"))
 have_pr = os.path.exists(os.path.join(O, ".pr_brs"))
+# ── "WE DID NOT ASK" IS NOT "THE READ FAILED" (agent-infra#1984) ──────────────────────────
+# Both are the same ABSENT file on disk, and the caller now skips a listing when the rows that
+# read it are empty — so the caller states, per listing, whether it asked at all (`0` = it did
+# not). ABSENT + asked ⇒ the read failed ⇒ the fail-closed arm below. ABSENT + not asked ⇒ there
+# is nothing to decide, and reporting it as an unreadable listing would be the #1705/#1736 class
+# arriving through a log line: an operator would go looking for a broken reader that never ran.
+# A missing/blank marker means the caller did not say (the extracted-body fixtures run this file
+# directly), and that is read as the historical behaviour: the listings were asked for.
+_REAP_OPEN_LIMIT = (os.environ.get("REAP_OPEN_LIMIT") or "").strip()
+_REAP_PR_LIMIT = (os.environ.get("REAP_PR_LIMIT") or "").strip()
+_open_not_asked = _REAP_OPEN_LIMIT == "0"
+_pr_not_asked = _REAP_PR_LIMIT == "0"
+# ⛔ A PR WINDOW NARROWER THAN THE SHIPPED 500 IS NOT EVIDENCE OF "NO PR" (agent-infra#1984).
+# `has_pr` is a regex over the head refs the window returned; a PR outside it is indistinguishable
+# from no PR, and "no PR" is exactly what releases a dispatched entry back into the queue. So on a
+# narrowed window that arm is refused and the row takes the window-blind path instead (KEPT, or
+# settled only by its own CLOSED state) — a narrower window can make this pass keep MORE, never
+# release more. An absent marker reads as the full window, i.e. unchanged behaviour.
+_pr_limit = int(_REAP_PR_LIMIT) if _REAP_PR_LIMIT.isdigit() else 500
+_pr_window_narrow = _pr_limit < 500
+have_open = have_open or _open_not_asked
+have_pr = have_pr or _pr_not_asked
 # PRESENT BUT UNDECODABLE IS THE ABSENT CASE (see `lines()`): existence is not readability, and the
 # guard below is the one place that turns "I could not read this listing" into "do not decide on it".
 _open_rows = lines(".open_iss") if have_open else []
@@ -2959,10 +3049,18 @@ if _open_rows is None:
     have_open = False; _open_rows = []
 if _pr_rows is None:
     have_pr = False; _pr_rows = []
-if not have_open or not have_pr:
+if _open_not_asked or _pr_not_asked:
+    print("[reap] NOT REQUESTED: %s — the row(s) that read it are empty this pass, so the window "
+          "was not asked for and nothing is decided from it (#1984). This is a deliberate skip, "
+          "NOT an unreadable listing%s"
+          % (" ".join(f for f, skip in ((".open_iss", _open_not_asked), (".pr_brs", _pr_not_asked)) if skip),
+             "; the checked classification still runs" if (_open_not_asked and not _pr_not_asked) else ""))
+if (not have_open and not _open_not_asked) or (not have_pr and not _pr_not_asked):
     print("[reap] SKIPPED: %s not readable — an unreadable listing is not an empty one; the "
           "dispatched blacklist is untouched%s"
-          % (" ".join(f for f, ok in ((".open_iss", have_open), (".pr_brs", have_pr)) if not ok),
+          % (" ".join(f for f, ok, skip in ((".open_iss", have_open, _open_not_asked),
+                                            (".pr_brs", have_pr, _pr_not_asked))
+                   if not ok and not skip),
              "; the checked classification still runs" if (not have_open and have_pr) else ""))
 # ⛔ THE CHECKED CLASSIFICATION CANNOT RULE OUT A PR WITHOUT `.pr_brs`, so it refuses the WHOLE
 # classification rather than releasing on the facts it happens to have. Same polarity as #1705,
@@ -2975,6 +3073,13 @@ if not have_pr:
     raise SystemExit(0)
 open_iss = {l for l in _open_rows if l}
 brs = [l for l in _pr_rows if l]
+if _pr_window_narrow:
+    # Named once, with the consequence, rather than left to a reader to infer from a smaller
+    # failure count: this is the ONE place the narrowed window changes a verdict.
+    print("[reap] the PR-branch window is NARROWED to %d rows, so a PR outside it is not evidence "
+          "of 'no PR' (#1984) — no dispatched entry is un-blacklisted on that reading this pass; "
+          "a row that would have been released is KEPT or settled by its own CLOSED state instead"
+          % _pr_limit)
 # ⛔ AN UNREADABLE SESSION LIST IS NOT "NO LANES" (review E-P3, cycle 2). `tmux ls`'s exit status was
 # discarded and every failure collapsed into `out = ""`, so a tmux that could not answer silently
 # REMOVED the `lane` keep fact — moving live lanes toward release, which is the duplicate-dispatch
@@ -3097,7 +3202,11 @@ if have_open and _disp_ok:
         has_pr = any(re.search(r"(^|[-/])%s([-/]|$)" % re.escape(n), b) for b in brs)
         if has_pr:
             keep.append(n); continue
-        if n in open_iss:
+        # ⛔ A NARROWED WINDOW CANNOT PROVE "NO PR" (agent-infra#1984). The row goes to the
+        # window-blind arm instead of `reaped`, which is the polarity that can only ever KEEP more:
+        # it is settled only by its own authoritative CLOSED state, never by an absence read from a
+        # window the pass chose to make smaller. At the shipped 500-row window this line is inert.
+        if n in open_iss and not _pr_window_narrow:
             reaped.append(n)
         else:
             _window_blind.append(n)

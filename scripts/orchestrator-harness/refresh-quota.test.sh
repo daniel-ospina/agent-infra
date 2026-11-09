@@ -80,6 +80,11 @@ echo "==> refresh-candidates core-quota contract ($HERE)"
 #   here as 20) + 5 cached candidates (1 each) = ~30. The pre-fix pass pays the rebuild SIX times
 #   (~125 here, 130 measured live). 40 is the ceiling: it leaves room for the fixture's variance and
 #   still reds ANY regression that rebuilds the board more than once per pass.
+# ⛔ THE LISTING TERM IS NOW 0 IN THIS FIXTURE, DELIBERATELY AND SAID OUT LOUD (#1984): a case whose
+# `dispatched.txt` and `checked.txt` are both empty no longer asks the reaper's two windows at all
+# (the `idle-reap:` case below asserts the ZERO). The ceiling is an UPPER bound, so it still measures
+# what it was built to measure — the board rebuild — and the `spent > 0` arm below keeps it from
+# passing on a stub that charges nothing.
 CORE_CEILING=40
 BOARD_COST=20        # modeled per-rebuild cost, from the measured 130/6 = 21.7 calls per rebuild
 CACHED_COST=1        # a cache hit costs no board read
@@ -393,8 +398,14 @@ mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
 # A `tmux` stub, so "no live lane" is a fact of the fixture rather than of the host: the reaper asks
 # `tmux ls` for `lane-<issue>` sessions, and an ambient session on a real box would keep the entry.
 printf '#!/bin/bash\nexit 0\n' > "$D/bin/tmux"; chmod +x "$D/bin/tmux"
-printf '41\n' > "$D/o/dispatched.txt"
-printf '41\n' > "$D/o/checked.txt"
+# ⛔ FIVE ROWS, NOT ONE, AND THE NUMBER IS THE FIXTURE'S CONTRACT WITH THE SHIPPED WINDOW (#1984).
+# `rest_list` pages at 100 rows, so the shipped pass now sizes each reaper window to the rows it
+# serves — one row ⇒ a 100-row window, which is NARROWER than the shipped 500 and is therefore not
+# evidence of "no PR". That guard is graded by the `row-bounded:` case below; THIS case grades the
+# standard window (a row open, no PR, no lane ⇒ un-blacklisted), so it must run above the five-row
+# knee where the window is still the full 500. Seeding one row here silently changed what this case
+# measured — the same trap the `open-rows` seam two paragraphs up was added for.
+for _r in 41 42 43 44 45; do printf '%s\n' "$_r" >> "$D/o/dispatched.txt"; printf '%s\n' "$_r" >> "$D/o/checked.txt"; done
 rf "$D" refresh COLLISION_PREFLIGHT_CORE_RESERVE=40
 spent_dry=$(( 20 - $(cat "$D/core") ))
 [ "$RC" -eq 1 ] && ok "unaffordable: refuses TRANSIENTLY (rc=1, retried next cycle) rather than exiting 0" \
@@ -638,6 +649,110 @@ else
     bad "truncation-stale: with the .pool-sat reset deleted the clip did NOT persist — the check above is not grading the reset"
   fi
 fi
+
+# ── 8) A PASS WITH NOTHING TO REAP ISSUES **ZERO** LISTING REQUESTS (agent-infra#1984) ────────
+# The refresh runs WHENEVER THE BACKLOG IS SHORT — i.e. in the stall it exists to fix — and the two
+# windows below are the REAPER's inputs alone. `.open_iss` is read only by the dispatched reap;
+# `.pr_brs` by the dispatched reap and the checked classification. So when `dispatched.txt` and
+# `checked.txt` are both empty the windows cannot change any answer, and a pass that spends 10 core
+# requests asking them is spending on a question no reader exists for. That is the issue's own
+# acceptance line: "a pass over `agent-infra` with an empty `dispatched.txt` issues ZERO listing
+# requests".
+# ⛔ ASSERTED ON THE WIRE, NOT ON A LOG LINE. The stub records every `gh api -i` it serves in
+# `gh.argv`, so "no listing was asked for" is a fact about the requests rather than about a sentence
+# the script could print while still calling. The TIER listings still run (they build the pool) —
+# they carry `labels=`, which is what separates them from the reaper's unlabelled window.
+mk_case idle-reap 1000
+mk_gh "$D" "$(rows 2)"
+mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+rf "$D" refresh
+idle_pulls="$(grep -cE '^repos/[^ ]*/pulls\?' "$D/bin/gh.argv" 2>/dev/null | tr -d ' ')"
+idle_open="$(grep -E '^repos/[^ ]*/issues\?' "$D/bin/gh.argv" 2>/dev/null | grep -vc 'labels=')"
+idle_tiers="$(grep -cE '^repos/[^ ]*/issues\?.*labels=' "$D/bin/gh.argv" 2>/dev/null | tr -d ' ')"
+[ "$RC" -eq 0 ] && ok "idle-reap: the pass still SUCCEEDS with nothing to reap (rc=0) — the windows are not what makes it run" \
+              || bad "idle-reap: rc=$RC (want 0) — output: $OUT"
+[ "${idle_tiers:-0}" -ge 1 ] || bad "idle-reap: the TIER listings never ran — the zero below would then be a property of a refused pass, not of the reap bound"
+[ "${idle_pulls:-1}" = "0" ] && ok "idle-reap: ZERO PR-branch listing requests (both row files are empty, so nothing reads the window)" \
+                            || bad "idle-reap: $idle_pulls PR listing(s) were still issued for an empty blacklist — $(grep -oE 'pulls\?[^ ]*' "$D/bin/gh.argv" 2>/dev/null | head -1)"
+[ "${idle_open:-1}" = "0" ] && ok "idle-reap: ZERO unlabelled open-issue listing requests (dispatched.txt is that window's only consumer)" \
+                           || bad "idle-reap: $idle_open unlabelled open-issue listing(s) were still issued — $(grep -E '^repos/[^ ]*/issues\?' "$D/bin/gh.argv" 2>/dev/null | grep -v 'labels=' | head -1)"
+case "$OUT" in
+  *"the open-issue window is NOT requested"*) ok "idle-reap: the skipped window is NAMED in the log, with its reason" ;;
+  *) bad "idle-reap: the pass does not say the window was deliberately not asked for — output: $OUT" ;;
+esac
+case "$OUT" in
+  *"the PR-branch window is NOT requested"*) ok "idle-reap: the PR window's skip is NAMED too, and for its own reason (both row files empty)" ;;
+  *) bad "idle-reap: the PR window's deliberate skip is not reported — output: $OUT" ;;
+esac
+# ⛔ "WE DID NOT ASK" MUST NOT BE REPORTED AS "THE READ FAILED" (#1705/#1736 through a log line).
+# The two are the same ABSENT file on disk, and an operator reading "not readable" would go hunting a
+# broken reader that never ran.
+case "$OUT" in
+  *"[reap] NOT REQUESTED:"*) ok "idle-reap: the reap reports a DELIBERATE skip by name" ;;
+  *) bad "idle-reap: no '[reap] NOT REQUESTED:' line — the skip is indistinguishable from a failure — output: $OUT" ;;
+esac
+case "$OUT" in
+  *"[reap] SKIPPED:"*) bad "idle-reap: the reap printed an UNREADABLE-listing skip for a window it deliberately did not ask for — that sends an operator after a reader that never ran" ;;
+  *) ok "idle-reap: no 'not readable' skip is printed for a window that was never requested" ;;
+esac
+# Non-vacuity: the SAME fixture with one row then asks for both windows, so the zero above is the
+# empty blacklist rather than a stub that records nothing.
+mk_case idle-reap-control 1000
+mk_gh "$D" "$(rows 2)"
+mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+printf '99\n' > "$D/o/dispatched.txt"
+rf "$D" refresh
+ctl_pulls="$(grep -cE '^repos/[^ ]*/pulls\?' "$D/bin/gh.argv" 2>/dev/null | tr -d ' ')"
+[ "${ctl_pulls:-0}" -ge 1 ] && ok "idle-reap: NON-VACUITY — one dispatched row brings the PR window back ($ctl_pulls request(s)), so the zero above measures the bound" \
+                             || bad "idle-reap: with a seeded dispatched.txt NO PR listing was issued either — the zero above grades the stub, not the pass"
+
+# ── 9) THE WINDOW IS SIZED TO THE ROWS IT SERVES — AND A NARROW ONE CANNOT UN-BLACKLIST ────────
+# `rest_list` pages at 100 rows, so a window sized to the rows that read it is at most one request
+# per row (the issue's second acceptance line), clamped to the 500 every earlier pass used — a pass
+# with five or more rows behaves exactly as before.
+# ⛔ AND THE NARROWER WINDOW IS NOT EVIDENCE OF "NO PR". `has_pr` is a regex over the head refs the
+# window returned, and "no PR" is what releases a dispatched entry back into the queue — the
+# duplicate-lane class (#1705). So on a narrowed window that arm is REFUSED: the row is KEPT (or
+# settled only by its own CLOSED state). This case seeds exactly the shape that would be released
+# under the old reading — #41 is OPEN and no PR branch matches it — and asserts it SURVIVES.
+mk_case row-bounded 1000
+mk_gh "$D" "$(rows 2)" "" "$(rows 6)"      # .open_iss = issues 41..46, .pr_brs = no branches
+mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+printf '#!/bin/bash\nexit 0\n' > "$D/bin/tmux"; chmod +x "$D/bin/tmux"
+printf '41\n' > "$D/o/dispatched.txt"
+rf "$D" refresh
+rb_pulls="$(grep -cE '^repos/[^ ]*/pulls\?' "$D/bin/gh.argv" 2>/dev/null | tr -d ' ')"
+rb_open="$(grep -E '^repos/[^ ]*/issues\?' "$D/bin/gh.argv" 2>/dev/null | grep -vc 'labels=')"
+[ "${rb_pulls:-0}" = "1" ] && ok "row-bounded: one dispatched row costs ONE PR-window request — the window is sized to the rows that read it" \
+                            || bad "row-bounded: $rb_pulls PR listing request(s) for one row (want 1) — the window is not bounded by its readers"
+[ "${rb_open:-0}" = "1" ] && ok "row-bounded: one dispatched row costs ONE open-issue request" \
+                           || bad "row-bounded: $rb_open open-issue listing request(s) for one row (want 1)"
+# At most one page per row: nothing asks for a second page of either window.
+rb_page2="$(grep -cE '^repos/[^ ]*/(issues|pulls)\?[^ ]*page=2' "$D/bin/gh.argv" 2>/dev/null | tr -d ' ')"
+[ "${rb_page2:-1}" = "0" ] && ok "row-bounded: no window paged past ONE page for a one-row pass" \
+                            || bad "row-bounded: $rb_page2 listing(s) asked for page=2 — the window is still the fixed 500-row shape"
+case "$OUT" in
+  *"the PR-branch window is NARROWED to 100 rows"*) ok "row-bounded: the narrowed window is NAMED, with the consequence (a miss is not 'no PR')" ;;
+  *) bad "row-bounded: the narrowed window is not disclosed — output: $OUT" ;;
+esac
+case "$(tr '\n' ' ' < "$D/o/dispatched.txt" 2>/dev/null)" in
+  *41*) ok "row-bounded: #41 is KEPT — open with no PR branch, but read from a window narrower than the shipped 500, so the pass refuses to un-blacklist on it (#1705)" ;;
+  *) bad "row-bounded: #41 was UN-BLACKLISTED from a narrowed window — a PR outside the window reads exactly like no PR, and that releases a dispatch into a duplicate lane" ;;
+esac
+
+# ── 10) THE GUARD IS WHAT SETTLES IT, NOT THE FIXTURE: THE SAME ROW AT FIVE ROWS IS RELEASED ──
+# Without this the case above would pass on a pass that reaps NOTHING anywhere. Same seed, same stub,
+# same narrowing, only the row count differs — which is exactly the term the bound turns on.
+mk_case row-bounded-control 1000
+mk_gh "$D" "$(rows 2)" "" "$(rows 6)"
+mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+printf '#!/bin/bash\nexit 0\n' > "$D/bin/tmux"; chmod +x "$D/bin/tmux"
+for _r in 41 42 43 44 45; do printf '%s\n' "$_r" >> "$D/o/dispatched.txt"; done
+rf "$D" refresh
+case "$(tr '\n' ' ' < "$D/o/dispatched.txt" 2>/dev/null)" in
+  *41*) bad "row-bounded: with FIVE rows — the full 500-row window, i.e. the shipped behaviour — #41 was still KEPT, so the case above proves nothing about the narrower window" ;;
+  *) ok "row-bounded: NON-VACUITY — at five rows the window is the shipped 500 and #41 IS released, so the KEEP above is the narrowed window's guard" ;;
+esac
 
 echo
 echo "  $PASS passed, $FAIL failed"

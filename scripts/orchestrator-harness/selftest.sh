@@ -2010,6 +2010,14 @@ case "${GH_MODE:-}" in
 esac
 SH
   chmod +x "$A/gh"
+  # ⛔ EACH ARM SEEDS A DISPATCHED ROW, SO THE CAPTURE IS ACTUALLY ASKED FOR (agent-infra#1984).
+  # The shipped pass SKIPS a listing whose reader is empty — `.open_iss` is read only by the dispatched
+  # reap, `.pr_brs` by the reap and the checked classification — so an empty `$O` issues ZERO listing
+  # requests, and both arms below would then grade the SKIP instead of the capture (the "successful
+  # empty listing leaves an EMPTY .pr_brs" arm red, the two absence arms green for the wrong reason).
+  # The row is only there to make the window worth asking; the arms grade what the READ does.
+  printf '77\n' > "$A/fail/dispatched.txt"
+  printf '77\n' > "$A/ok/dispatched.txt"
   ( PATH="$A:$PATH" GH_MODE=fail O="$A/fail" OR="acme/widget" bash "$TMP/acq.sh" ) > "$TMP/acq-fail.out" 2>&1
   [ ! -e "$A/fail/.pr_brs" ] && rc=0 || rc=1
   ck "shipped capture: a FAILED PR listing leaves NO .pr_brs (absence, not an empty answer)" $rc
