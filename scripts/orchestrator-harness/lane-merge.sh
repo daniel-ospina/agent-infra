@@ -432,7 +432,10 @@ if [ -n "${LANE_MERGE_MAX_WATCH:-}" ] && is_limit "${LANE_MERGE_MAX_WATCH:-}"; t
   # but it is never silent about breaking the invariant above, because the next reader would take the
   # bound at face value.
   MAX_WATCH="$LANE_MERGE_MAX_WATCH"
-  [ "$MAX_WATCH" -le "$MAX_WATCH_FIT" ] || say_err "lane-merge: LANE_MERGE_MAX_WATCH=$MAX_WATCH exceeds what LANE_TIMEOUT=${LANE_WALL_S}s affords after the check wait (${WAIT_S_DESIGN}s) and the implementation reserve (${IMPL_RESERVE_S}s) — $MAX_WATCH_FIT chunk(s) fit; honouring the override, but the lane's wall clock ends the phase first."
+  # ⛔ NOT ON A LANE WITH NO WALL CLOCK: the sentence below says "the lane's wall clock ends the phase
+  # first", which is FALSE when `LANE_TIMEOUT=0` (review cycle 15, P3 — measured: a pinned lane printed that
+  # warning and, two lines later, "no wall ceiling is enforced for this lane").
+  [ "$LANE_WALL_S" -eq 0 ] || [ "$MAX_WATCH" -le "$MAX_WATCH_FIT" ] || say_err "lane-merge: LANE_MERGE_MAX_WATCH=$MAX_WATCH exceeds what LANE_TIMEOUT=${LANE_WALL_S}s affords after the check wait (${WAIT_S_DESIGN}s) and the implementation reserve (${IMPL_RESERVE_S}s) — $MAX_WATCH_FIT chunk(s) fit; honouring the override, but the lane's wall clock ends the phase first."
 fi
 PHASE_F="$O/state/lanemerge-$PR.phase"   # "this lane IS in its merge phase" (chain-merge waits on it)
 ROUND_F="$O/state/lanemerge-$PR.round"
@@ -1255,7 +1258,15 @@ if [ "$WATCH" -eq 1 ]; then
     # the operator line says which of the two it got.
     if [ "$LANE_WALL_S" -eq 0 ]; then
       if is_limit "${LANE_BACKSTOP_S:-}" && [ "${LANE_BACKSTOP_S:-0}" -gt 0 ]; then
-        _backstop_fit=$(( (LANE_BACKSTOP_S - _hb_margin) / _fit_poll ))
+        # ⛔ AND IT IS THE BACKSTOP THAT IS *LEFT*, NOT THE WHOLE OF IT (review cycle 15, P2 — MEASURED:
+        # deriving from the untouched backstop gave a lane with 100 s of its backstop remaining the SAME 22
+        # chunks as a fresh lane — 2640 s of supervision against a clock that ends in 100 s, so lane-bound.sh
+        # TERMed it mid-supervision with no verdict and no hand-off. That is the very outcome this PR calls
+        # "strictly worse than the bound it replaces" for the check wait, and it was reachable only because
+        # the finite-wall sibling below subtracts the elapsed time and this branch did not.
+        _bt_left=$(( LANE_BACKSTOP_S - _hb_margin ))
+        if [ -n "$_watch_elapsed" ]; then _bt_left=$(( _bt_left - _watch_elapsed )); fi
+        _backstop_fit=$(( _bt_left / _fit_poll ))
         [ "$_backstop_fit" -ge 1 ] || _backstop_fit=1
         _mw_rt="$_backstop_fit"
       else
@@ -1626,14 +1637,23 @@ if [ "$LANE_WALL_S" -eq 0 ]; then
   # read 10s while the line printed IMMEDIATELY ABOVE it said the wait was capped at 10s, and this line
   # claimed nothing had clamped it). ⛔ AND IT STATES WHAT HAPPENS TO THE SUPERVISION AXIS, which is no
   # longer "floored at one chunk" — see the re-derivation in the `--watch` branch.
-  if is_limit "${LANE_BACKSTOP_S:-}" && [ "${LANE_BACKSTOP_S:-0}" -gt 0 ]; then
+  # ⛔ THE PIN IS READ THROUGH A VARIABLE RATHER THAN WITH AN ARITHMETIC DEFAULT: the suite forbids a
+  # digit default on this name, because that is exactly how a literal allowance default creeps back in.
+  _mw_pin="${LANE_MERGE_MAX_WATCH:-}"
+  if is_limit "$_mw_pin" && [ "$_mw_pin" -eq 0 ]; then
+    # ⛔ A PIN OF ZERO IS "NO COUNTER", NOT "ZERO CHUNKS" (review cycle 15, P3 — measured: this branch
+    # called it "a FINITE 0 chunk(s)" while the code admitted the 1000th chunk, because 0 switches the
+    # budget block off). Labelling an unbounded allowance FINITE is the defect class this file keeps fixing.
+    _watch_basis_note="an explicit LANE_MERGE_MAX_WATCH=0, which DISABLES the supervision counter"
+    _watch_supervision_note="UNBOUNDED (there is no counter to spend)"
+  elif is_limit "${LANE_BACKSTOP_S:-}" && [ "${LANE_BACKSTOP_S:-0}" -gt 0 ]; then
     _watch_basis_note="lane-bound.sh's own backstop (LANE_BACKSTOP_S=${LANE_BACKSTOP_S}s), because the wall axis (LANE_TIMEOUT) is OFF"
     _backstop_chunks=$(( (LANE_BACKSTOP_S - _hb_margin) / _fit_poll )); [ "$_backstop_chunks" -ge 1 ] || _backstop_chunks=1
     # ⛔ A PINNED `LANE_MERGE_MAX_WATCH` OVERRIDES THIS NUMBER (review cycle 14, observation 2 — measured:
     # `LANE_BACKSTOP_S=3600 LANE_MERGE_MAX_WATCH=2` printed "a FINITE 29 chunk(s)" while the real allowance
     # was 2). An operator line that states a number the code will not use is the class this branch fixes.
     if is_limit "${LANE_MERGE_MAX_WATCH:-}"; then
-      _watch_supervision_note="a FINITE ${LANE_MERGE_MAX_WATCH} chunk(s), because LANE_MERGE_MAX_WATCH pins it (the backstop would allow ${_backstop_chunks})"
+      _watch_supervision_note="a FINITE ${LANE_MERGE_MAX_WATCH} chunk(s), because LANE_MERGE_MAX_WATCH pins it"
     else
       _watch_supervision_note="a FINITE ${_backstop_chunks} chunk(s) derived from it, further capped by the watchdog allowance when that is smaller"
     fi

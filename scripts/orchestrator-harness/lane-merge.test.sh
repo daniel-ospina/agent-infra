@@ -801,7 +801,7 @@ ck "a classifier that cannot run → it STAMPS WAITING_CLASSIFIER (an unjudged h
 # `$O/lane-merge.sh` path. Every other row in this suite exports `O`, which is exactly why none saw it.
 # The assertion is that argv parsing is REACHED: a bad flag must produce the documented 2, not 1.
 OUT="$(env -u O bash "$SCRIPT" --definitely-not-a-flag 2>&1)"; RC=$?
-ck "with `O` UNSET the script still reaches argv parsing (a bad flag is usage 2, not an unbound-variable 1)" \
+ck "with O UNSET the script still reaches argv parsing (a bad flag is usage 2, not an unbound-variable 1)" \
    $([ "$RC" = 2 ] && echo 0 || echo 1)
 case "$OUT" in
   *"unbound variable"*) ck "…and it does not die on \$O under set -u" 1 ;;
@@ -809,10 +809,9 @@ case "$OUT" in
 esac
 # The same run with a VALID shape must not be refused by `O` either: `--help` names the usage contract.
 OUT="$(env -u O bash "$SCRIPT" --help 2>&1)"; RC=$?
-ck "…and `--help` with `O` unset exits 0 instead of 1" $([ "$RC" = 0 ] && echo 0 || echo 1)
+ck "…and --help with O unset exits 0 instead of 1" $([ "$RC" = 0 ] && echo 0 || echo 1)
 
 # ── 11c-octodecies. the budget hand-off has an arm per disposition it can actually find ────────
-────
 # ⛔ WITHOUT THIS the `WAITING_NO_VERDICT` arm was dead text: deleting it left ALL 63 green (measured),
 # so the hand-off still said "the merge chain has not resolved this PR" about chunks that had resolved
 # the question (nothing to fix) — and the same catch-all swallowed CHECKS/CLASSIFIER.
@@ -1697,8 +1696,38 @@ OUT="$(REPO_PATH="${REPO_PATH:-$RUN_REPO}" PATH="$BIN:$PATH" GH_LOG="$T/gh.log" 
       LANE_MERGE_INTERVAL=5 LANE_MERGE_WAIT=6 LANE_MERGE_POLL=5 \
       LANE_TIMEOUT=0 LANE_BACKSTOP_S=3600 LANE_MERGE_MAX_WATCH=2 \
       bash "$SCRIPT" 52 --repo o/r --pr-tsv "$T/pr4.tsv" --checks-tsv "$T/checks-inflight.tsv" 2>&1)"; RC=$?
-ck "the LANE_TIMEOUT=0 line reports the PINNED allowance (2 chunks) rather than the backstop's 29, so it never states a number the re-derivation will not use" \
-   $(grep -q 'a FINITE 2 chunk(s), because LANE_MERGE_MAX_WATCH pins it' <<<"$OUT" && ! grep -q 'a FINITE 29 chunk(s)' <<<"$OUT" && echo 0 || echo 1)
+# ⛔ AND THE SUITE'S OWN `ck` DESCRIPTIONS GET THE SAME SCAN (review cycle 15 — MEASURED: two of them
+# carried a backtick inside double quotes, so running the suite printed 'O: command not found' and
+# '--help: command not found' to stderr, and the word was DELETED from the description the operator reads.
+# The arm for the script existed; the prose was not covered, which is the same class one layer out.)
+_self="${BASH_SOURCE[0]}"
+# ⛔ AT ANY INDENTATION: six `ck` call sites are inside case arms, and a column-0-only scan left them
+# uncovered (review cycle 15, observation — measured: 0 of the six carry a backtick today, so this is a
+# closed gap rather than a fixed defect).
+_self_hits="$(grep -E '^[[:space:]]*ck "' "$_self" || true)"
+ck "no ck description in THIS suite carries a backtick inside its double quotes, at any indentation (it would run as a command and be deleted from the text, printing 'command not found')" \
+   $(! grep -qF "$_btick" <<<"$_self_hits" && echo 0 || echo 1)
+ck "the LANE_TIMEOUT=0 line reports the PINNED allowance (2 chunks) rather than a backstop-derived figure, so it never states a number the re-derivation will not use" \
+   $(grep -q 'a FINITE 2 chunk(s), because LANE_MERGE_MAX_WATCH pins it' <<<"$OUT" && ! grep -q 'derived from it' <<<"$OUT" && echo 0 || echo 1)
+# ⛔ AND A PIN OF ZERO IS "NO COUNTER", NOT "ZERO CHUNKS" (review cycle 15, P3 — measured: the line called
+# it "a FINITE 0 chunk(s)" while the code admitted the 1000th chunk).
+new_o "$T/pr4.tsv"
+OUT="$(REPO_PATH="${REPO_PATH:-$RUN_REPO}" PATH="$BIN:$PATH" GH_LOG="$T/gh.log" O="$OT" HOME="$T/home" \
+      LANE_MERGE_INTERVAL=5 LANE_MERGE_WAIT=6 LANE_MERGE_POLL=5 \
+      LANE_TIMEOUT=0 LANE_BACKSTOP_S=3600 LANE_MERGE_MAX_WATCH=0 \
+      bash "$SCRIPT" 53 --repo o/r --pr-tsv "$T/pr4.tsv" --checks-tsv "$T/checks-inflight.tsv" 2>&1)"; RC=$?
+ck "a PINNED allowance of 0 is reported as UNBOUNDED, not as 'a FINITE 0 chunk(s)' — zero disables the counter, so the line must not call it finite" \
+   $(grep -q 'UNBOUNDED (there is no counter to spend)' <<<"$OUT" && ! grep -q 'a FINITE 0 chunk(s)' <<<"$OUT" && echo 0 || echo 1)
+# ⛔ AND THE BACKSTOP BRANCH SUBTRACTS THE LANE'S ELAPSED TIME, like its finite-wall sibling (review cycle
+# 15, P2 — measured: a lane with 100 s of backstop left got 22 chunks = 2640 s of supervision, so
+# lane-bound.sh TERMed it mid-supervision with no verdict). 3400 s spent of a 3600 s backstop leaves
+# (3600-3400-10)/120 = 1 chunk, so chunk 2 is refused; without the subtraction it would be 29.
+printf '1\n' > "$OT/state/lanemerge-54.watch"
+OUT="$(REPO_PATH="${REPO_PATH:-$RUN_REPO}" PATH="$BIN:$PATH" GH_LOG=/dev/null O="$OT" HOME="$T/home" \
+      LANE_TIMEOUT=0 LANE_BACKSTOP_S=3600 LANE_MERGE_ELAPSED_S=3400 LANE_MERGE_WAIT=0 LANE_MERGE_POLL=0 LANE_BOUND_IDLE_S=0 \
+      bash "$SCRIPT" 54 --watch --repo o/r --pr-tsv "$T/pr-fit.tsv" 2>&1)"; RC=$?
+ck "the backstop-derived allowance counts only what is LEFT of the backstop: (3600-3400-10)/120 = 1 chunk, so the 2nd is refused (the un-subtracted branch would admit 29)" \
+   $([ "$RC" = 13 ] && grep -q '1 --watch chunks spent' <<<"$OUT" && echo 0 || echo 1)
 
 # ⛔ THE RE-INVOCATION PATH (review round 3, P2 — verified): the documented resume omits `--issue` and
 # recovers it from `$O/state/lanemerge-<pr>.issue`. Resolving the heartbeat target BEFORE that recovery
