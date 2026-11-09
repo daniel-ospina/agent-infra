@@ -34,8 +34,43 @@ if [ ! -d "$REPO" ]; then echo "orch-loop: FATAL REPO=$REPO does not exist" >&2;
 # wrong-repo WARN went to stderr only, because the guard below saw an EMPTY `$O` and skipped the log
 # append. stderr on a launchd box is launchd.err: that is the invisible failure the append exists to
 # prevent (review round 3).
+# ⛔ WHETHER THE CALLER *SET* O IS CAPTURED BEFORE THE DEFAULT (agent-infra#2095). The line below is
+# a DEFAULT, and a defaulted value is indistinguishable from a supplied one afterwards — which is the
+# whole reason a proof copy started with `bash /tmp/orc-proof/orch-loop.sh` silently adopted
+# PRODUCTION's state dir and log for 5 h 15 m while applying its own derived MAX_LOAD=100 against the
+# plist's 250. `controller-state.sh` needs the difference to decide the state dir; this is the seam
+# that preserves it.
+_ORC_ENV_O="${O:-}"
 O="${O:-$HOME/orchestrator}"
 _HERE_RS="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)"
+# ── WHICH STATE DIR, AND WHETHER THIS INSTANCE MAY RUN AT ALL (agent-infra#2095) ─────────────────
+# Both answers live in one module because they are one question: an instance that does not know which
+# state dir it owns cannot take that dir's lock, and two instances that each think the lock is theirs
+# are two controllers on one PR queue. Fail CLOSED when the module is absent — a controller without
+# its own state guard is exactly the shape that ran unsupervised for five hours.
+for _cs_cand in "$O/controller-state.sh" "${_HERE_RS:-}/controller-state.sh"; do
+  [ -f "$_cs_cand" ] && { . "$_cs_cand"; break; }
+done
+if ! command -v orc_state_pick >/dev/null 2>&1; then
+  echo "orch-loop: FATAL controller-state.sh is missing or stale (no orc_state_pick) — looked in $O and ${_HERE_RS:-<unresolved>}. Refusing to run a controller that cannot decide its own state dir or guard its own singleton; fix: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o $O" >&2
+  exit 78
+fi
+# Sets ORC_STATE_RESOLVED and ORC_STATE_SRC as GLOBALS (never `$( )`: `[cap]` has to read them).
+orc_state_pick "${_HERE_RS:-}" "$_ORC_ENV_O"
+O="$ORC_STATE_RESOLVED"
+ORC_INSTANCE="$(orc_instance_id "$O" "${_HERE_RS:-unknown}")"
+# ⛔ SAY IT OUT LOUD, ONCE, AND ON THE `console` SIDE TOO. The incident needed `ps` archaeology
+# because NOTHING in either controller's log named the state dir it was writing or the fact that it
+# had adopted production as a DEFAULT rather than because a unit told it to. A derived (isolated)
+# state dir also goes to stderr: a proof run whose parent was captured is precisely the case where
+# the operator must learn it is NOT driving production before it reads any of its own output.
+mkdir -p "$O/logs" 2>/dev/null || true
+echo "[state] dir=$O src=$ORC_STATE_SRC ctl=$ORC_INSTANCE" >> "$O/logs/orch-loop.log" 2>/dev/null || true
+case "$ORC_STATE_SRC" in
+  derived:isolated*)
+    echo "[orch-loop] NOT driving production: state dir is $O ($ORC_STATE_SRC). PRODUCTION state ($ORC_PROD_STATE) is untouched by this instance. Set O=<dir> or ORC_STATE_DIR=<dir> to address a state dir explicitly." >&2
+    echo "[state] ISOLATED: this instance does NOT drive production; see $O/logs/orch-loop.log" >> "$O/logs/orch-loop.log" 2>/dev/null || true ;;
+esac
 # The directory of the RUNNING script, named once: `resolve_refresh_sh` looks beside the loop for a
 # refresh that can write the pass record this loop reads (agent-infra#2308), and the SEED-SKEW line
 # names it as the copy the controller itself runs. `_HERE_RS` already resolved it for repo-slug.sh.
@@ -228,8 +263,16 @@ is_limit "${_NCPU:-}"    || _NCPU=4
 # `[ "$L" -ge 0 ]` is always true, so the load gate CLOSES and the box dispatches nothing, forever.
 # install.sh carries the identical line (P3, fifth review round, 2026-10-14).
 [ "${_NCPU:-0}" -ge 1 ] || _NCPU=4
+# ⛔ AND THE NUMBER CARRIES ITS PROVENANCE, because a ceiling whose ORIGIN is invisible is the other
+# half of agent-infra#2095: two instances printed `load=N/<their own ceiling>` into ONE log and no
+# line said which ceiling was the unit's and which was the copy's, so the divergence had to be
+# inferred from a plist read hours later. `_ORC_ENV_MAX_LOAD` is captured before the default for the
+# same reason `_ORC_ENV_O` is.
+_ORC_ENV_MAX_LOAD="${MAX_LOAD:-}"
 MAX_LOAD="${MAX_LOAD:-$(( 10#$_NCPU * 10 ))}"
-is_limit "${MAX_LOAD:-}" || MAX_LOAD=$(( 10#$_NCPU * 10 )); is_limit "${MAX_LOAD:-}" || MAX_LOAD=40
+MAX_LOAD_SRC="$(orc_max_load_src "$_ORC_ENV_MAX_LOAD" "${ORC_CONTROLLER_ORIGIN:-}")"
+if ! is_limit "${MAX_LOAD:-}"; then MAX_LOAD=$(( 10#$_NCPU * 10 )); MAX_LOAD_SRC="repair:derived:cores"; fi
+is_limit "${MAX_LOAD:-}" || { MAX_LOAD=40; MAX_LOAD_SRC="repair:default40"; }
 # ⛔ CAPACITY, NOT A LANE COUNT (owner ruling, 2026-10-17): "dispatch should be gated on capacity,
 # not on number of lanes. max lanes 8 is too low. that needs to be configured to 2.5x the number of
 # CPUs". Both numbers in play were LANE COUNTS that no hardware decided: the shipped default was a
@@ -2068,13 +2111,33 @@ esac
 # [refresh-check:end]
 
 LOCKF="$O/.orch.lock"
-acq() { ( set -o noclobber; echo $$ > "$LOCKF" ) 2>/dev/null; }
-if ! acq; then
-  OPID="$(cat "$LOCKF" 2>/dev/null || echo 0)"
-  if [ "${OPID:-0}" -gt 0 ] && kill -0 "$OPID" 2>/dev/null; then echo "[orch-loop] already running (pid $OPID)"; exit 0; fi
-  rm -f "$LOCKF"
-  acq || { echo "[orch-loop] lock race — exiting"; exit 0; }
-fi
+# ⛔ THE REFUSAL IS LOUD AND NON-ZERO, AND THE HOLDER TEST IS AN IDENTITY TEST (agent-infra#2095).
+# Three false-PASS mechanisms lived in the five lines this replaces:
+#   * `echo "already running"` then `exit 0` — a second controller exiting ZERO is indistinguishable
+#     from a healthy no-op, so launchd, a cell supervisor and a human all read "fine";
+#   * `kill -0 "$OPID"` as the WHOLE holder test — a recycled pid satisfies it, and on this fleet the
+#     recycled target is a PEER repo's controller running the same shared harness path, so the shape
+#     matches too (#1178/#2402);
+#   * `rm -f "$LOCKF"` before re-creating — an unconditional delete that could remove a LIVE holder's
+#     record when two starters judged the same stale pid at once.
+# The decision (acquire / held / unjudged) and its evidence live in `controller-state.sh`, so the
+# loop, the suites and any future caller cannot form different opinions about who owns this state dir.
+orc_singleton_acquire "$LOCKF"; ORC_SINGLETON_RC=$?
+case "$ORC_SINGLETON_RC" in
+  0) : ;;
+  *)
+    # ⛔ 75, NOT 0, AND THE NAME OF THE HOLDER GOES ON EVERY SURFACE. `exit 0` was the false PASS:
+    # under launchd KeepAlive a silent zero reads as "the controller ran and found nothing to do". A
+    # non-zero exit is what makes a launchd throttle, a cell supervisor's `status` and a human's
+    # `echo $?` agree that this instance did NOT run.
+    _orc_refusal="[singleton] refused me=$ORC_INSTANCE state=$O state_src=$ORC_STATE_SRC max_load=$MAX_LOAD src=$MAX_LOAD_SRC — $ORC_SINGLETON_WHY"
+    echo "[orch-loop] $_orc_refusal" >&2
+    echo "$_orc_refusal" >> "$LOG" 2>/dev/null || true
+    if [ "$ORC_SINGLETON_RC" = "2" ]; then
+      echo "[orch-loop] the record at $LOCKF could not be judged (contents: '$(orc_lock_pid "$LOCKF" 2>/dev/null)'). Nothing was removed: an unreadable record is not a dead one. Next: read that pid's identity with 'ps -o pid=,etime=,command= -p <pid>'; if no controller of $O is running, rm -f '$LOCKF' and start again." >&2
+    fi
+    exit 75 ;;
+esac
 # ⛔ THE SIGNAL HANDLERS ONLY TERMINATE — THE LOCK IS RELEASED BY THE `EXIT` TRAP ALONE.
 # Was `trap 'rm -f "$LOCKF"' EXIT INT TERM`, and for INT/TERM a handler that RETURNS does NOT
 # terminate: bash RESUMES the interrupted command loop, so the documented stop path
@@ -2090,7 +2153,12 @@ fi
 # (measured), which is fail-closed — `acq()` reclaims a dead pid.
 trap 'exit 143' TERM
 trap 'exit 130' INT
-trap 'rm -f "$LOCKF"' EXIT
+# ⛔ OWNERSHIP-SCOPED RELEASE (agent-infra#2095). The shipped trap was `rm -f "$LOCKF"`, which is safe
+# only while nothing else can have written the record between acquire and exit. After a reclaim race
+# (or an operator's manual `rm -f` followed by a fresh start) it is not: the exiting instance would
+# delete the NEW holder's record, and the next start would co-run with it. `orc_singleton_release`
+# removes the record only when it names THIS pid.
+trap 'orc_singleton_release "$LOCKF"' EXIT
 
 # ── THE FORK-FREE TIMER IS OPENED HERE, WHILE THE BOX CAN STILL FORK (agent-infra#2293) ─────────
 # The starved path must wait without spawning, and `mkfifo`/`exec` themselves spawn/CREATE — so both
@@ -7609,7 +7677,7 @@ PY
   # ⛔ `lanes=<live>/<total>` and `zombie=<n>` (#2163). The TOTAL is the field that makes a leak
   # visible: `lanes=14/25` still reads "full" while `lanes=14/76` says the box is carrying 62 finished
   # residents. `max_lanes=` keeps the ceiling the gate applies, so no reader has to infer it.
-  echo "[cap] load=$L/$MAX_LOAD lanes=${LANES_DISPLAY:-?}/$LANES_TOTAL max_lanes=$MAX_LANES zombie=$ZOMBIES lanes_src=${LANES_SOURCE:-unset} mem_avail=${MEMAVAIL_MB}M/${MIN_MEM_FREE_MB}M swap_free=${SWFREE}M/${MIN_SWAP_FREE}M open=${OPEN_N:-?}@${OR:-?} unowned=${UPN:-?} last_land=${LAND_AGE:-?}m review_slots=${MR:-?} fix_slots=${MF:-?}" >> "$LOG"
+  echo "[cap] load=$L/$MAX_LOAD lanes=${LANES_DISPLAY:-?}/$LANES_TOTAL max_lanes=$MAX_LANES zombie=$ZOMBIES lanes_src=${LANES_SOURCE:-unset} mem_avail=${MEMAVAIL_MB}M/${MIN_MEM_FREE_MB}M swap_free=${SWFREE}M/${MIN_SWAP_FREE}M open=${OPEN_N:-?}@${OR:-?} unowned=${UPN:-?} last_land=${LAND_AGE:-?}m review_slots=${MR:-?} fix_slots=${MF:-?} ctl=${ORC_INSTANCE:-?} state_src=${ORC_STATE_SRC:-?} max_load_src=${MAX_LOAD_SRC:-?}" >> "$LOG"
   # Four gates. swap_total=0 => swap uninitialised (fresh boot), NOT pressure — allow.
   # Name the binding gate: an earlier version logged "skipped (load=…)" while load was never
   # consulted, so a lanes-bound or swap-bound stall looked like a load stall.
