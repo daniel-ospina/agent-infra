@@ -333,9 +333,32 @@ WAIT_S_DESIGN="$WAIT_S"
 # ⛔ AND A STALE TOKEN MUST NOT COUNT AS THIS LANE'S. The file is per-ISSUE and outlives the run that
 # wrote it, so a LATER invocation (the controller's merge step re-running this script for a PR whose
 # lane has exited) would otherwise read a token from a dead run, compute an elapsed larger than the
-# whole clock, and clamp the wait to 0 — handing off instantly instead of resuming. The token's pid is
-# therefore required to be ALIVE: a live lane.sh is the proof that the token describes a run in
-# flight. A token from the future (clock skew, another box) is unknown for the same reason.
+# whole clock, and clamp the wait to 0 — handing off instantly instead of resuming. A token from the
+# future (clock skew, another box) is unknown for the same reason.
+# ⛔ AND LIVENESS IS NOT IDENTITY (review, P3 — verified on this tree, BOTH directions). The
+# first cut required the token's pid to be merely ALIVE (`kill -0`), and that is wrong twice: a
+# RECYCLED pid (any same-user process) makes a DEAD run's age read as this lane's — measured, an
+# epoch 100000 s old clamped a live wait to 0 — and a NEWER dispatch of the same issue RE-STAMPS
+# this per-ISSUE file, so an OLDER still-live lane reads the newer epoch, UNDER-states its elapsed and
+# the clamp goes inert (the "the epoch over-states the start" argument only holds for a run's OWN
+# token). The identity that actually holds is "the shell that stamped this token leads to me":
+# `lane.sh` → `run_agent` → `lane-bound.sh watch` → `pi` → this tool call. So the token's pid is
+# required to be an ANCESTOR. A controller re-running this script for a PR is not under a lane and
+# correctly gets "unknown", which is the disclosed unclamped path.
+pid_is_ancestor() { # pid_is_ancestor <pid>
+  local want="${1:-}" cur="$$" n=0
+  case "$want" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$want" -gt 0 ] || return 1
+  while [ "$n" -lt 24 ]; do
+    cur="$(ps -o ppid= -p "$cur" 2>/dev/null | tr -d ' ')"
+    # An unreadable or non-numeric PARENT ends the walk as "not an ancestor", never as a match.
+    case "$cur" in ''|*[!0-9]*) return 1 ;; esac
+    [ "$cur" -gt 0 ] || return 1
+    if [ "$cur" = "$want" ]; then return 0; fi
+    n=$(( n + 1 ))
+  done
+  return 1
+}
 lane_elapsed_s() {
   local now tok lpid ep
   now="$(date +%s)"
@@ -357,10 +380,7 @@ lane_elapsed_s() {
   [ "${#ep}" -le 12 ] || return 0
   [ "$ep" -gt 0 ] || return 0                 # `printf 0` when lane.sh's `date` failed
   [ "$ep" -le "$now" ] || return 0            # a future stamp is a clock we cannot reason about
-  case "$lpid" in ''|*[!0-9]*) return 0 ;; esac
-  is_limit "$lpid" || return 0
-  [ "$lpid" -gt 0 ] || return 0
-  kill -0 "$lpid" 2>/dev/null || return 0      # nobody is running: this token is stale
+  pid_is_ancestor "$lpid" || return 0          # a token that is not THIS run's is not this lane's age
   printf '%s' "$(( now - ep ))"
 }
 # The divisor is floored at the shipped chunk length: LANE_MERGE_POLL=0 is a legitimate value (a chunk

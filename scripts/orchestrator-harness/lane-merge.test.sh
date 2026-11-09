@@ -1516,12 +1516,24 @@ WAIT_S=60 POLL_S=5 run 41 --issue 41 --repo o/r --pr-tsv "$T/pr4.tsv" --checks-t
 ck "the RUN TOKEN lane.sh stamps is read as the lane's elapsed (10-digit epoch accepted, live pid accepted) → the same 10 s cap" \
    $([ "$RC" = 11 ] && grep -q 'CAPPED at 10s' <<<"$OUT" && grep -q 'already spent 7180s' <<<"$OUT" && echo 0 || echo 1)
 # …and a token from a run that is OVER must not clamp a later invocation to 0 (the file is per-ISSUE and
-# outlives the run that wrote it), so the pid in it is required to be alive.
+# outlives the run that wrote it), so the pid in it is required to be THIS run's ANCESTOR — not merely
+# a live process. Two arms: a DEAD pid, and a LIVE pid that is not in the chain that leads here.
 new_o "$T/pr4.tsv"
 printf '%s.%s.%s\n' 44 999999 "$(( $(date +%s) - 7180 ))" > "$OT/logs/lane-44.owner"
 WAIT_S=0 POLL_S=5 run 44 --issue 44 --repo o/r --pr-tsv "$T/pr4.tsv" --checks-tsv "$T/checks-inflight.tsv"
 ck "a STALE run token (its pid is dead) is not read as this lane's elapsed — the wait is disclosed as unclamped instead of being clamped to 0 by a finished run" \
    $([ "$RC" = 11 ] && grep -q 'NOT clamped to what is left of LANE_WALL_S' <<<"$OUT" && echo 0 || echo 1)
+# —and LIVENESS IS NOT IDENTITY (review, P3 — verified): a pid that is merely ALIVE need not be
+# the run that stamped the token, so a RECYCLED pid would hand a dead run's age to a live lane. The test
+# is ANCESTRY; here the token names a LIVE pid that is this suite's own sibling, so it is not in the
+# chain that leads to lane-merge.sh.
+new_o "$T/pr4.tsv"
+sleep 60 & FOREIGN_PID=$!
+printf '%s.%s.%s\n' 45 "$FOREIGN_PID" "$(( $(date +%s) - 7180 ))" > "$OT/logs/lane-45.owner"
+WAIT_S=0 POLL_S=5 run 45 --issue 45 --repo o/r --pr-tsv "$T/pr4.tsv" --checks-tsv "$T/checks-inflight.tsv"
+disown "$FOREIGN_PID" 2>/dev/null; kill "$FOREIGN_PID" 2>/dev/null; wait "$FOREIGN_PID" 2>/dev/null
+ck "a token naming a LIVE but NON-ANCESTOR pid (a recycled pid) is not read as this lane's elapsed — ancestry, not liveness, decides" \
+   $([ "$RC" = 11 ] && grep -q 'NOT clamped to what is left of LANE_WALL_S' <<<"$OUT" && ! grep -q 'CAPPED at' <<<"$OUT" && echo 0 || echo 1)
 # (4) ⛔ THE CAP'S FLOOR MUST NEVER OUT-REACH THE CAP (review finding, P3 — verified). The old floor
 # `[ "$WAIT_S" -ge "$POLL_S" ] || WAIT_S="$POLL_S"` RAISED the capped wait back to a poll chunk when the
 # allowance was smaller than one, i.e. it returned the value it exists to stay under. With a 15 s
