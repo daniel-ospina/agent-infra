@@ -45,7 +45,7 @@
 #   LANE_CONTAINER_GIT_BIN      git     (default: git)
 #   LANE_CONTAINER_SHA1_BIN     sha1sum (default: sha1sum)
 #   LANE_CONTAINER_DATE_BIN     date    (default: date)
-#   LANE_CONTAINER_REPO         repo whose worktrees own `fdb-lane-*` (default: $REPO, else $PWD)
+#   LANE_CONTAINER_REPO         repo whose worktrees own `fdb-lane-*` (no default: see REPO below)
 #   LANE_CONTAINER_CLAIM_SNAPSHOT   path to the claims snapshot TSV (default: $O/state/claims-snapshot)
 #   LANE_CONTAINER_MIN_AGE      age floor, seconds (default 14400)
 #   LANE_CONTAINER_DRY_RUN      1 = report only (default), 0 = armed
@@ -71,7 +71,18 @@ READ_TIMEOUT="${LANE_CONTAINER_READ_TIMEOUT:-60}"
 MIN_AGE="${LANE_CONTAINER_MIN_AGE:-14400}"
 DRY="${LANE_CONTAINER_DRY_RUN:-1}"
 NOW="${LANE_CONTAINER_NOW:-}"
-REPO="${LANE_CONTAINER_REPO:-${REPO:-$PWD}}"
+REPO="${LANE_CONTAINER_REPO:-${REPO:-}}"
+# ⛔ REPO HAS NO PATH DEFAULT (agent-infra#1974). This line used to read
+# `REPO="${LANE_CONTAINER_REPO:-${REPO:-$PWD}}"`, and the gate that forbids a private default
+# (`check-single-source.sh`'s REPO arm) calls the `$PWD` spelling the WORST of the shapes it refuses:
+# under launchd `$PWD` is `/`, a REAL directory that is not a repo, so the pass got past every
+# existence check and died later as "not a git repository: /", nowhere near the cause. The cwd is now
+# a CANDIDATE to the box's ONE resolver, which uses it only after PROVING it is a git checkout, says
+# which value it derived, and otherwise refuses by name. A `--repo` DECLARES a checkout and clears the
+# candidate list, so `--repo ""` is a refusal rather than a licence to use the invoker's cwd
+# (agent-infra#1974 point 3: a declared value is never replaced by a derived one).
+REPO_CANDIDATES="$PWD"
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 CLAIM_SNAP="${LANE_CONTAINER_CLAIM_SNAPSHOT:-${O:-$HOME/orchestrator}/state/claims-snapshot}"
 LOG="${LANE_CONTAINER_LOG:-${HOME:-/tmp}/.pi/agent/state/lane-container-reap.log}"
 
@@ -100,7 +111,8 @@ Usage:
 
   --dry-run     report only (the default)
   --apply       arm deletion (or env LANE_CONTAINER_DRY_RUN=0)
-  --repo PATH   repo whose worktrees own fdb-lane-* containers (default: \$REPO, else \$PWD)
+  --repo PATH   repo whose worktrees own fdb-lane-* containers (no default; a proven checkout of the
+                box's REPO, else the invoking cwd when THAT is a checkout)
   --min-age S   age floor in seconds (default 14400)
 
 A container is removed ONLY when ALL three proofs hold: it is older than the age floor; no process's
@@ -405,7 +417,7 @@ main() {
         case "$1" in
             --apply) DRY_RUN=0; APPLY=1 ;;
             --dry-run) DRY_RUN=1; APPLY=0 ;;
-            --repo) REPO="${2:-}"; shift ;;
+            --repo) REPO="${2:-}"; REPO_CANDIDATES=""; shift ;;
             --min-age) MIN_AGE="${2:-$MIN_AGE}"; shift ;;
             --json) JSON=1 ;;
             -h|--help) usage; return 0 ;;
@@ -415,6 +427,25 @@ main() {
     done
     is_num "$MIN_AGE" || { printf '%s: --min-age must be a positive integer\n' "$SCRIPT_NAME" >&2; return 2; }
     [ "$DRY" = "0" ] && { DRY_RUN=0; APPLY=1; }
+
+    # ── REPO: the box's value, through the ONE resolver (`repo-slug.sh`) ──────────────────────────
+    # Located beside this script first (a checkout), then flat ($O, and the farm at
+    # ~/.pi/agent/scripts) — an entry counts only if it actually DEFINES `resolve_repo`, so a stale
+    # copy cannot shadow a good one and leave the consolidation silently inert.
+    for _rsl in "$SELF_DIR/repo-slug.sh" "$SELF_DIR/orchestrator-harness/repo-slug.sh" \
+                "${AGENT_INFRA_PATH:-}/scripts/orchestrator-harness/repo-slug.sh"; do
+        [ -n "$_rsl" ] && [ -f "$_rsl" ] || continue
+        # shellcheck disable=SC1090
+        . "$_rsl" 2>/dev/null || continue
+        command -v resolve_repo >/dev/null 2>&1 && break
+        unset -f resolve_repo 2>/dev/null || true
+    done
+    if command -v resolve_repo >/dev/null 2>&1; then
+        REPO="$(resolve_repo)" || return $?
+    elif [ -z "$REPO" ]; then
+        printf '%s: REPO is unset and repo-slug.sh (the ONE resolver) was not found beside this script (%s) or in $AGENT_INFRA_PATH — pass --repo <checkout>\n' "$SCRIPT_NAME" "$SELF_DIR" >&2
+        return 2
+    fi
 
     local dlist raw self pstable wtfile snap
     dlist="$(mktemp "${TMPDIR:-/tmp}/lcd.XXXXXX")"

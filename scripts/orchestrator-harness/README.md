@@ -1173,27 +1173,37 @@ export REPO=$HOME/eldato/tortoise        # REQUIRED: the target repo's local mai
                                          # any other machine: REPO missing -> the controller dies
                                          # at startup and crash-loops under KeepAlive; REPO wrong
                                          # but existing -> the refresh aborts every cycle while
-                                         # the controller keeps beating. ⛔ SEVEN shipped SHELL
-                                         # scripts still carry a REPO default of their own — the
-                                         # complete grep over `*.sh`, `retired/` and `*.test.sh`
-                                         # excluded:
-                                         # refresh-candidates.sh:18, report.sh:24,
-                                         # cloud-cell-supervisor.sh:93,
-                                         # deploy-crossbox.sh:23,
-                                         # pi-reap-worktrees.sh:1174 (`${REPO:-$PWD}`),
-                                         # stale-worktrees.sh:35 (`REPO="$PWD"`) and
-                                         # stale-main-triage.sh:16 (`${1:-$PWD}`). The `$PWD`
-                                         # three are the worst shape: $PWD is `/` under launchd,
-                                         # so the default resolves to a real non-repo directory
-                                         # and fails later as `not a git repository: /` instead
-                                         # of at the REPO boundary. ⛔ TWO of the same class are not
+                                         # the controller keeps beating. ⛔ NO SHIPPED SHELL SCRIPT
+                                         # CARRIES A REPO PATH DEFAULT ANY MORE (agent-infra#1974,
+                                         # #3833) — the complete grep over `*.sh`, `retired/` and
+                                         # `*.test.sh` excluded. The seven this passage used to
+                                         # list are all resolved now: `report.sh` (24) and
+                                         # `deploy-crossbox.sh` (23) read
+                                         # `REPO="$(resolve_repo)"`, and
+                                         # `refresh-candidates.sh` (18),
+                                         # `cloud-cell-supervisor.sh` (93),
+                                         # `pi-reap-worktrees.sh` (1174),
+                                         # `stale-worktrees.sh` (35),
+                                         # `stale-main-triage.sh` (16) — plus
+                                         # `worktree-hygiene-sweep.sh`, `lane-container-reap.sh`
+                                         # and `cloud-cell-doctor.sh` — carry
+                                         # `REPO="${REPO:-}"`, i.e. an explicit NO DEFAULT that
+                                         # cannot invent a path. The `$PWD` three were the worst
+                                         # shape: $PWD is `/` under launchd, so the default
+                                         # resolved to a real non-repo directory and failed later
+                                         # as `not a git repository: /` instead of at the REPO
+                                         # boundary — which is why the cwd is now a CANDIDATE
+                                         # that must PROVE itself through `repo-slug.sh`'s
+                                         # `resolve_repo` rather than a value used because
+                                         # nothing was set. `check-single-source.sh`'s REPO arm
+                                         # reds a re-introduced default, so this cannot drift
+                                         # back silently. ⛔ TWO of the same class are not
                                          # shell scripts, and they are the rawest form of it — a
                                          # hardcoded home with NO env override, used only to import
                                          # the SDK: `goal-state.py:29`
                                          # (`REPO = "/Users/<someone>/Documents/GitHub/tortoise"`)
                                          # and `seed-goal-map.py:29` (the same literal passed straight
-                                         # to `sys.path.insert`). Tracked separately. #1977 covers
-                                         # the first and the third; the other five are untracked. So export REPO in
+                                         # to `sys.path.insert`). Tracked separately (#1977). So export REPO in
                                          # the daemon AND the session env (#1935).
 export O=$HOME/orchestrator              # the harness state directory
 export SCOPE=own                         # drain scope: auto (default) | own | broad.

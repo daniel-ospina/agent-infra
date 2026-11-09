@@ -155,12 +155,40 @@ derive_or() {
 # carries NO default of its own: it reads the operator's value, PROVES it is a git checkout, and
 # otherwise refuses with the two supported ways to set it.
 #
+# ⛔ THE RESOLUTION ORDER IS THE ONE agent-infra#1974 STATES: environment → a DERIVATION THAT MUST
+# PROVE ITSELF → refuse. `$REPO_CANDIDATES` is the middle arm, and it is NOT a default:
+#   * a DEFAULT is a value used because nothing was set — the defect. `$PWD`, `/tmp/cell` and a home
+#     directory are all accepted by a default with no evidence behind them, which is why the pass
+#     then dies far from the cause ("not a git repository: /").
+#   * a CANDIDATE is a path offered for INSPECTION. It is used only if it PROVES it is a git checkout
+#     (git env scrubbed, exactly as below) — and, when a queue target `$OR` is declared, only if its
+#     `origin` NAMES that target, through `derive_or` above rather than a second copy of the URL
+#     predicate. A path that proves nothing is skipped silently; a path that proves the WRONG repo is
+#     skipped the same way, so the derivation cannot land this box on another repo's queue (#1901).
+#
+# ⛔ THE CANDIDATE LIST IS NEWLINE-DELIMITED, ONE PATH PER LINE — NOT SPACE-DELIMITED. It used to be
+# iterated as `for _cand in $REPO_CANDIDATES`, and that made a checkout whose path contains a SPACE
+# unrepresentable (fresh-context review of #3833, F1 — measured): `worktree-hygiene-sweep.sh` composes
+# `"$TORTOISE_REPO $PWD"`, so `/Volumes/My Passport/agent-infra` split into two candidates, neither
+# proved, and the pass refused while the operator stood in a real checkout — a REGRESSION, because the
+# old `REPO="$PWD"` was quoted and worked. This repo treats such paths as ordinary. So callers compose
+#   REPO_CANDIDATES="$(printf '%s\n' "$a" "$b")"
+# and this function reads them with `while IFS= read -r` (no word splitting, no globbing). RESIDUAL: a
+# path containing a NEWLINE cannot be expressed in this channel; nothing here produces one, and the
+# proof below still fails CLOSED (the entry is skipped), never open.
+# Two candidates that BOTH prove are a refusal, not a coin toss: a device-local choice between two
+# checkouts of one repo is unrecoverable downstream, so the operator is asked.
+# A caller that sets nothing keeps the old behaviour exactly (refuse by name), which is why the three
+# original call sites — report.sh, pi-reap-worktrees.sh, deploy-crossbox.sh — are untouched.
+#
 # Contract: rc 0 and the canonicalized path on stdout; rc 2 and a refusal on STDERR (2 = "the
 # operator's value is absent or wrong", the same code `derive_or` uses for a bad `OR` pin — one
 # vocabulary for configuration errors). stdout carries the VALUE ONLY, so callers write
 #   REPO="$(resolve_repo)" || exit $?
 # and never have to parse a message out of a path. ⛔ Call it BARE — not inside a function that must
 # survive the refusal: the refusal is the caller's `exit`, because a subshell could not end the pass.
+# The ONE thing it may print on stderr on SUCCESS is which candidate it derived, because a value the
+# operator did not type must be visible in the log the pass writes.
 #
 # ⛔ `refresh-candidates.sh` ALSO DEFINES A `resolve_repo`, AND THAT IS NOT A SECOND COPY OF THIS RULE.
 # Its resolver (line ~255) answers "is this checkout PROVISIONABLE for the DECLARED queue target
@@ -169,9 +197,62 @@ derive_or() {
 # Neither may be dropped in favour of the other: one is the box's config check, the other is the
 # queue/checkout pairing check (#1901).
 resolve_repo() {
-  local repo="${REPO:-}" top=""
+  local repo="${REPO:-}" top="" _cand _c _seen="" _hits="" _n=0
   # ⛔ SET-BUT-EMPTY IS "UNSET", NOT A REASON TO FALL BACK. A blank line in a plist or a keys.env is
   # an operator typo; treating it as "nothing was set" is how a typo becomes a silent default.
+  if [ -z "$repo" ] && [ -n "${REPO_CANDIDATES:-}" ]; then
+    # ⛔ DERIVATION (the middle arm of the #1974 order). Every candidate must PROVE itself before it
+    # is used, and the proof is the ONLY reason a path is acceptable here.
+    # ⛔ `read -r` FROM A HERE-STRING, NEVER `for _cand in $REPO_CANDIDATES` (F1 above): a here-string
+    # preserves the bytes (no word splitting, no backslash processing) and the loop body still runs in
+    # THIS shell, so the assignments below survive it — a pipe would put them in a subshell and the
+    # derivation would be silently discarded.
+    while IFS= read -r _cand; do
+      [ -n "$_cand" ] || continue
+      [ -d "$_cand" ] || continue
+      # PROOF 1 — it IS a checkout. The git env is scrubbed for the reason stated below: an ambient
+      # `GIT_DIR` would forge a checkout for any directory at all.
+      top="$(env -u GIT_DIR -u GIT_WORK_TREE -u GIT_COMMON_DIR -u GIT_INDEX_FILE \
+             git -C "$_cand" rev-parse --show-toplevel 2>/dev/null)" || continue
+      [ -n "$top" ] || continue
+      # PROOF 2 — only when a queue target is declared: its origin NAMES that target. `derive_or` is
+      # the one URL parser on this file's shelf; repeating the arm list here is how the four copies
+      # drifted (#3188) and what `refresh-provision.test.sh`'s `(h5)` exists to catch.
+      # ⛔ COMPARED FOLDED, LIKE EVERY OTHER SLUG COMPARISON IN THIS FILE (fresh-context review of
+      # #3833, F2 — verified). GitHub slugs are CASE-INSENSITIVE — this file states it at :104 and
+      # folds in `repo_identity_fold` / the identity walker below — so a raw `=` here was the only
+      # case-sensitive slug test in the file: a candidate whose origin is
+      # `https://github.com/Premise-Labs/agent-infra.git` against an `OR=premise-labs/agent-infra`
+      # pinned in keys.env (a SUPPORTED form: an explicit `OR` wins) failed the proof, nothing proved,
+      # and the operator was told to set REPO on a checkout that is correct. #1974 §1's "names exactly
+      # $OR" is about WHICH REPO, never about letter case, so folding delivers the decision rather than
+      # departing from it.
+      if [ -n "${OR:-}" ]; then
+        [ "$(repo_identity_fold "$(derive_or "$_cand" 2>/dev/null)")" = "$(repo_identity_fold "$OR")" ] || continue
+      fi
+      # ⛔ THE DEDUPE KEY IS THE CANONICAL PATH, NOT THE STRING (the same rule `pwd -P` already applies
+      # to the value this function returns). A checkout offered twice — the real path and a symlink to
+      # it — is ONE candidate; keying on the raw string made it two hits and refused a box that had
+      # only one checkout, which is the false block a fail-closed arm must still not produce.
+      _c="$( cd "$_cand" 2>/dev/null && pwd -P )" || _c="$_cand"
+      [ -n "$_c" ] || continue
+      case " $_seen " in *" $_c "*) continue ;; esac
+      _seen="$_seen $_c"
+      _hits="$_hits$_c
+"
+    done <<<"$REPO_CANDIDATES"
+    _n="$(printf '%s' "$_hits" | grep -c .)"
+    case "$_n" in
+      1) repo="$(printf '%s' "$_hits" | head -1)"
+         echo "REPO is unset — using $repo (a candidate that proved it is a checkout${OR:+ of $OR})" >&2 ;;
+      0) : ;;   # nothing proved itself: fall through to the refusal below, which names the remedy
+      *) echo "REPO is unset and $_n candidate checkouts qualify${OR:+ for $OR}:" >&2
+         printf '%s' "$_hits" | sed 's/^/       /' >&2
+         echo "  refusing to choose between them — set REPO to the one this box should work." >&2
+         _resolve_repo_remedy
+         return 2 ;;
+    esac
+  fi
   if [ -z "$repo" ]; then
     echo "REPO is unset — the harness has no default for it, on purpose: every default it ever carried" >&2
     echo "was a path that is true on ONE machine and absent on the next, and \$PWD is not even stable." >&2
