@@ -473,11 +473,20 @@ printf '%s\n' "$CP" > "$C/o/.orch.lock"          # AFTER the process started —
 # ⛔ THE ARM'S OWN PRECONDITION, REPORTED NOT ASSUMED: if a width-limited read of that pid ALREADY carries
 # the `orch-loop.sh` token, this host's `ps` is ignoring `COLUMNS` and the arm below cannot witness
 # anything — say so instead of banking a green that proves nothing (the vacuity class of rule 3).
+# ⛔ AND THE PRECONDITION MUST BE ATTRIBUTABLE, NOT A BANKED PASS (fresh review of #1985, P3). This arm
+# used to end in `ck "…" 0`, a hardcoded pass in the `*)` branch — so it reported "the plant IS
+# width-truncated" also when the read produced NO ROW AT ALL (`ps` failed, or the stub raced away), i.e.
+# it asserted a measurement it had not taken. The three cases are now distinct: NO ROW is unattributable
+# and SKIPS, a row that still carries the token means this host's `ps` ignores `COLUMNS` and SKIPS, and
+# the arm PASSES only for a row that EXISTS and LACKS the token — re-tested here rather than banked, so
+# a future edit cannot turn the attribution back into a literal.
 # ⛔ NO `grep -q` IN A PIPELINE (#841/#864): the row is CAPTURED and tested in the shell.
 _WIDTH_ROW="$(COLUMNS=20 ps -axo pid=,stat=,command= 2>/dev/null | awk -v p="$CP" '$1 == p')"
 case "$_WIDTH_ROW" in
+  '') skip "11: the width-limited read returned NO row for the plant (ps failed, or the stub exited), so the truncation cannot be observed here" ;;
   *orch-loop.sh*) skip "11: this host's ps ignores COLUMNS, so the truncation the arm exists for cannot be staged here" ;;
-  *) ck "11: the plant IS width-truncated without -ww (the arm exercises the hazard, not a simulated one)" 0 ;;
+  *) ck "11: the plant IS width-truncated without -ww (the arm exercises the hazard, not a simulated one)" \
+       "$(want "$_WIDTH_ROW" 'orch-loop.sh' && echo 1 || echo 0)" ;;
 esac
 run_drv O="$C/o" COLUMNS=20
 ck "11: a LIVE loop-shaped owner is still REFUSED under COLUMNS=20 (not reclaimed, not started over)" \
