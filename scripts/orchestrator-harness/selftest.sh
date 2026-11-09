@@ -5456,7 +5456,11 @@ if need "$TMP/lockblock.sh" "the lock+trap block is extracted from the shipped o
   out="$(bash "$LK/acquire.sh" 2>&1)"
   case "$out" in *ACQUIRED*) rc=0;; *) rc=1; echo "      got '$out'";; esac
   ck "a stale lock (dead pid) is reclaimed by the next start" $rc
-  printf '#!/bin/bash\ntrap "exit 0" TERM INT\nwhile :; do sleep 1; done\n' > "$LK/orch-loop.sh"
+  # ⛔ THE STUB IS SELF-BOUNDED (60s), because it is a process literally named `orch-loop.sh` and this
+  # repo's arms read the process table by that shape: if this suite is killed between the spawn and the
+  # `kill -9` below, an unbounded stub would still be running when a LATER arm pgrep's for a controller
+  # — a leak that reads as a live owner. 60s is far longer than the 0.4s the assertion needs.
+  printf '#!/bin/bash\ntrap "exit 0" TERM INT\nfor _ in $(seq 1 60); do sleep 1; done\n' > "$LK/orch-loop.sh"
   chmod +x "$LK/orch-loop.sh"
   bash "$LK/orch-loop.sh" >/dev/null 2>&1 & owner=$!
   sleep 0.4                                   # the lock is written AFTER the owner exists (real order)
