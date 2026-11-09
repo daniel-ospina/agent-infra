@@ -312,6 +312,20 @@ assert_eq "$RC" "1" "§9d a stranger that only MENTIONS the loop is DRIFT (1), n
 assert_not_contains "$OUT" "OK    loop alive" "§9d …and the OK line the old predicate printed is gone"
 assert_contains "$OUT" "recycled pid" "§9d …with the identity as the stated reason"
 
+# ⛔ AND A NARROW COLUMN CANNOT CUT THE IDENTITY OUT FROM UNDER THE PREDICATE (#1867 review P2,
+# round 6). `ps -o command=` reads a WIDTH-LIMITED column — procps truncates `args` to `$COLUMNS`,
+# BSD/macOS truncates unless `-w` — and truncation cuts the LAST token, which is the script operand
+# the predicate matches. The loop then reads as a shorter string, `_pid_prog_is_loop` answers the
+# definite negative 2 (not 3), and `check` DRIFTs a healthy heartbeat / `start` forks a SECOND loop.
+# The truncating read is the fail-open direction, so the row varies COLUMNS instead of arguing.
+R="$(newroot c2e)"
+P="$(loop_pid)"; printf '%s\n' "$P" > "$R/agent/state/heartbeat-loop.pid"
+printf '[{"lane":"a","degraded":false}]\n' > "$R/agent/state/lane-status.last.json"
+OUT="$(run "$R" COLUMNS=20 -- check)"; RC=$?
+assert_eq "$RC" "0" "§9e a NARROW column (COLUMNS=20) still reads the argv in full (ps -ww), so the loop is OK"
+assert_contains "$OUT" "OK    loop alive" "§9e …and the OK line is printed, not a recycled-pid DRIFT"
+assert_not_contains "$OUT" "recycled pid" "§9e …and the loop is never mistaken for a stranger"
+
 # …and the third answer: the process table could not be read, so neither verdict is available. This
 # is the arm `check` must NOT collapse into "not running" (DRIFT would tell the operator to launch a
 # SECOND loop over a live one) or into OK (the false pass this file exists to remove).
@@ -458,15 +472,23 @@ echo '── 16. start LAUNCHES on a box with no working setsid (macOS) ──'
 # shimmed, so a fix that works here is a fix on the Mac — and `( … ) &` plus `LOOP_DETACHED=1` is the
 # portable detach the portability rule names.
 #
-# The stand-in loop is the launcher's whole contract: it leaves the pidfile the launcher verifies.
-# (The real loop would run a fleet pass; `kill -0` is all this launcher asks of a pid.)
+# The stand-in loop is the launcher's whole contract: it leaves the pidfile the launcher verifies AND
+# it keeps identifying as the loop while it lives (#1867 review P2, round 6).
 R="$(newroot s16)"
 mkdir -p "$R/agent/scripts"
 cat > "$R/agent/scripts/heartbeat-loop.sh" <<'SH'
 #!/usr/bin/env bash
 mkdir -p "$HEARTBEAT_PI_AGENT_DIR/state"
 printf '%s\n' "$$" > "$HEARTBEAT_PI_AGENT_DIR/state/heartbeat-loop.pid"
-exec sleep 60
+# ⛔ NO `exec` (#1867 review P2, round 6). The launcher now verifies the pid it polled is the LOOP, by
+# argv — and `exec sleep 60` REPLACES that argv with `sleep 60`: the process stays alive, so the old
+# `kill -0` poll was happy and the identity check correctly is not. The stand-in has to keep its own
+# argv, which is what the real loop does (`bash …/heartbeat-loop.sh` for its whole life) — so the sleep
+# is a CHILD, and the trap is what keeps it from outliving the suite's `kill`.
+sleep 60 &
+_standin_child=$!
+trap 'kill "$_standin_child" 2>/dev/null; exit 0' TERM INT
+wait "$_standin_child"
 SH
 chmod +x "$R/agent/scripts/heartbeat-loop.sh"
 NOSETSID="$T/nosetsid-bin"; mkdir -p "$NOSETSID"
@@ -496,6 +518,44 @@ OUT="$(env HEARTBEAT_PI_AGENT_DIR="$R/agent" bash "$LAUNCH" start --dry-run 2>&1
 assert_eq "$RC" "0" "§16b start --dry-run exits 0"
 assert_not_contains "$OUT" "setsid" "§16b …and prints NO setsid — the printed command is the one that runs"
 assert_contains "$OUT" "LOOP_DETACHED=1 nohup bash" "§16b …it prints the portable detach instead"
+
+# ⛔ THE POLL PROVES THE **LOOP**, NOT A PID (#1867 review P2, round 6). It accepted `kill -0` alone,
+# so a stale pidfile naming a LIVE stranger satisfied it: the loop below dies BEFORE writing its own
+# pidfile (the shape a bad cwd, a SIGKILL or a missing interpreter leaves), and `start` still printed
+# `heartbeat loop started (pid <the stranger>)` and returned 0 — the launched-once heartbeat dead, the
+# operator told it runs, which is the exact failure this file's header says it exists to remove.
+# The stale record is provably not ours (identity 2), so it is removed before the launch and the poll
+# then proves the launch or nothing.
+R="$(newroot s16c)"
+mkdir -p "$R/agent/scripts" "$R/agent/state"
+cat > "$R/agent/scripts/heartbeat-loop.sh" <<'SH'
+#!/usr/bin/env bash
+# a loop that dies before it writes a pidfile — it must NOT read as a completed launch
+exit 9
+SH
+chmod +x "$R/agent/scripts/heartbeat-loop.sh"
+P="$(stranger_pid "$R/agent/scripts/heartbeat-loop.sh")"; printf '%s\n' "$P" > "$R/agent/state/heartbeat-loop.pid"
+S16C="$T/s16c-start.out"
+HEARTBEAT_PI_AGENT_DIR="$R/agent" bash "$LAUNCH" start >"$S16C" 2>&1; RC=$?
+OUT="$(cat "$S16C" 2>/dev/null || true)"
+assert_eq "$RC" "1" "§16c a launch that left NO pidfile is a DRIFT even when the stale record named a LIVE pid (rc=1)"
+assert_not_contains "$OUT" "started (pid" "§16c …and 'heartbeat loop started' is never printed over it"
+assert_not_contains "$OUT" "already running" "§16c …nor 'already running' — the record was named stale and removed"
+assert_contains "$OUT" "DRIFT" "§16c …the verdict is DRIFT, naming the launch it could not verify"
+
+# ⛔ AND A FLAG CLUSTER THAT ENDS IN `o` TAKES THE NEXT WORD (#1867 review P2, round 6).
+# `bash -euo pipefail <script>` is the canonical strict-mode spelling of the shape the predicate's
+# contract DOES claim (`bash <loop>`); shifting one word made `pipefail` the "script operand" and the
+# answer 2 ("a different program") over a live loop — the duplicate-launch / false-DRIFT pair again.
+R="$(newroot s16d)"
+bash -euo pipefail -c 'while :; do sleep 1; done' heartbeat-loop.sh >/dev/null 2>&1 &
+P="$!"; printf '%s\n' "$P" >> "$T/livepids"
+printf '%s\n' "$P" > "$R/agent/state/heartbeat-loop.pid"
+OUT="$(env HEARTBEAT_PI_AGENT_DIR="$R/agent" bash "$LAUNCH" status 2>&1)"
+assert_contains "$OUT" "alive: yes" "§16d 'bash -euo pipefail <loop>' is recognised as the loop (the cluster's flag argument is not the operand)"
+OUT="$(run "$R" -- start --dry-run)"; RC=$?
+assert_contains "$OUT" "already running" "§16d …so start does not fork a SECOND loop over it"
+assert_eq "$RC" "0" "§16d …the idempotent path, rc=0"
 
 echo ""
 if [ "$FAIL" -eq 0 ]; then

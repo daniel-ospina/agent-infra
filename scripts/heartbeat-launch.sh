@@ -135,8 +135,8 @@ die() { printf '%s\n' "$*" >&2; exit 1; }
 # `start` printed "already running" and launched NOTHING — the two false PASSes this predicate exists
 # to remove, back one layer down. The shapes that ARE the loop, and nothing else:
 #   · `<loop>`                          — executed directly through its shebang;
-#   · `bash <loop>`, `bash -eu <loop>`  — what the launcher starts (`/bin/bash "$LOOP"`) and what the
-#                                          loop's own detach uses (`/bin/bash "$0"`);
+#   · `bash <loop>`, `bash -eu <loop>`  — what the launcher starts (`nohup bash "$LOOP"`, below) and
+#                                          what the loop's own detach uses (`/bin/bash "$0"`);
 #   · `bash -c <payload> <name>`        — `<name>` is the process's own argv[0], i.e. the name its
 #                                          caller gave it (`exec -a` looks the same), and it is the
 #                                          shape this suite's stand-in uses.
@@ -174,7 +174,19 @@ _pid_prog_is_loop() {
                 [ $# -ge 2 ] || return 3
                 shift 2 ;;
             --) shift; break ;;
-            -*) shift ;;                        # a flag that takes no separate argument
+            --*) shift ;;                       # a long option takes no separate word
+            -*)
+                # ⛔ A SHORT CLUSTER THAT ENDS IN `o`/`O` TAKES THE NEXT WORD (#1867 review P2, round 6).
+                # `bash -euo pipefail <loop>` is the canonical strict-mode spelling of the shape this
+                # predicate claims to recognise, and shifting ONE word made `pipefail` the "script
+                # operand": the token became `pipefail`, the comparison failed, and the answer was 2
+                # ("a different program") over a live loop — the duplicate-launch / false-DRIFT pair
+                # again. Only a SHORT cluster is treated this way; a long option (`--noprofile`) matches
+                # the `--*` arm above and is shifted on its own.
+                case "$1" in
+                    *o|*O) [ $# -ge 2 ] || return 3; shift 2 ;;
+                    *) shift ;;
+                esac ;;
             *)  break ;;
         esac
     done
@@ -187,7 +199,19 @@ pid_is_loop() { # <pid> → 0 the loop · 1 no such process · 2 a DIFFERENT pro
     local p="${1:-}" argv prc
     [ -n "$p" ] || return 1
     kill -0 "$p" 2>/dev/null || return 1
-    argv="$(ps -p "$p" -o command= 2>/dev/null)" || return 3
+    # ⛔ `-ww`, ALWAYS (#1867 review P2, round 6). `ps -o command=` reads a width-limited column:
+    # procps truncates `args` to `$COLUMNS`, and BSD truncates unless `-w` is given — and truncation cuts
+    # the LAST token, which is exactly the script operand the predicate matches. A loop started from a
+    # deep worktree path then reads as "…/deep/nest", the predicate answers the definite negative 2
+    # ("a different program") instead of 3, and every caller acts on it: `check` DRIFTs a healthy
+    # heartbeat, `status` says "another process — a recycled pid", `start` forks a SECOND loop (double
+    # nudges, racing state writes, one loop orphaned). This repo already recorded the trap and the fix
+    # twice — `scripts/ci_runner_pool.sh:771-775` ("a truncated argv makes the suffix match … MISS a
+    # LIVE listener … then start a SECOND listener") and `scripts/orchestrator-harness/
+    # harness-refresh.sh:585-597` (`COLUMNS=40 ps -o command=` → 41 bytes, 305 bytes with `-ww`). The
+    # widening flag is the WHOLE fix: the truncating read is fail-open in the dangerous direction, and
+    # no amount of care below can recover the bytes it never printed.
+    argv="$(ps -ww -p "$p" -o command= 2>/dev/null)" || return 3
     [ -n "$argv" ] || return 3        # a live pid with no readable argv is NOT evidence of the loop
     # Word-split the command line WITHOUT globbing it: an argv token containing `*` or `?` must not
     # expand into filenames and change the answer.
@@ -332,17 +356,45 @@ EOF
     # that is missing is refused further up by name.
     ( cd "$SELF_DIR" && LOOP_DETACHED=1 nohup bash "$LOOP" >>"$STATE/heartbeat-launch.log" 2>&1 & )
 
-    local i upid=""
+    # ⛔ THE STALE RECORD IS REMOVED HERE, NOT AT THE DIAGNOSIS (#1867 review P2, round 6) — for two
+    # reasons, and the first one is why this is not cosmetic:
+    #   · leaving it in place let the poll below PROVE THE LAUNCH with a pid that was already there. If
+    #     the loop died before writing its own pidfile (a bad cwd, a SIGKILL, a missing interpreter),
+    #     the poll found the stranger's pid, `kill -0` succeeded, and `start` printed
+    #     `heartbeat loop started (pid <stranger>)` rc=0 — the launched-once heartbeat dead, the operator
+    #     told it runs. At this point ident is 1 or 2 (0 returned above, 3 refused), so the record is
+    #     provably NOT the loop and removing it is not data loss.
+    #   · removing it at the DIAGNOSIS would be wrong too: that block runs BEFORE the `--dry-run`
+    #     return below, so a dry run would delete the operator's pidfile and erase the evidence
+    #     `status` is about to be asked for. Removal belongs where the launch is.
+    rm -f "$PIDFILE"
+
+    # ⛔ THE POLL PROVES THE **LOOP**, NOT A PID (#1867 review P2, round 6). It used `kill -0` alone,
+    # which is the same liveness-is-not-identity error §"PROCESS IDENTITY" above exists to remove — and
+    # here it was worse than a mislabel: a stale pidfile naming a LIVE stranger satisfied it, so the
+    # message "heartbeat loop started (pid N)" could name a process this launcher never started.
+    # `pid_is_loop` answers 0 only for the loop's program position; 3 (cannot tell) keeps polling and
+    # then fails closed, never success.
+    local i upid="" ident=1
     for i in 1 2 3 4 5 6 7 8 9 10; do
         sleep 0.5
         if [ -f "$PIDFILE" ]; then
             upid="$(tr -dc '0-9' < "$PIDFILE" 2>/dev/null)"
-            if [ -n "$upid" ] && kill -0 "$upid" 2>/dev/null; then
-                note "heartbeat loop started (pid $upid) — verify with: bash $0 check"
-                return 0
+            if [ -n "$upid" ]; then
+                pid_is_loop "$upid"; ident=$?
+                if [ "$ident" = 0 ]; then
+                    note "heartbeat loop started (pid $upid) — verify with: bash $0 check"
+                    return 0
+                fi
             fi
         fi
     done
+    if [ "$ident" = 2 ]; then
+        die "DRIFT: $PIDFILE names pid ${upid:-<none>}, which is alive but is NOT $LOOP_NAME, 5s after the launch — the loop is NOT running (see $STATE/heartbeat-launch.log)"
+    fi
+    if [ "$ident" = 3 ]; then
+        die "DRIFT: $PIDFILE names pid ${upid:-<none>} and the process table could not be read, so the launch cannot be verified — a launched-once loop that is not verified is not started (see $STATE/heartbeat-launch.log)"
+    fi
     die "DRIFT: the loop did not leave a live pidfile at $PIDFILE after 5s (see $STATE/heartbeat-launch.log)"
 }
 
