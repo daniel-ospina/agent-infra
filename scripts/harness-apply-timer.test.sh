@@ -2339,8 +2339,9 @@ assert_contains "$(grep '^farm_n=' "$T/t24ar/state/harness-apply.status" 2>/dev/
 # pre-filter before the label checks are reached). HISTORY, because the mechanics moved twice: round 31
 # gave `_a`'s sed a start-of-line form, so this fixture's column-1 stale count now PARSES (the count is
 # readable, and the ROW carries the verdict word `CHANGED`, which is what refuses the report); and the
-# pass's own note records that `_a` is no longer a separate gate at all, so the round-26 mutant ("drop
-# the `_a` requirement") is a NO-OP at this head. What reds these rows now: adding `CHANGED` to
+# pass's own note records that `_a` can never fail (the `<n> stale` pre-filter already matched it), so
+# deleting that test changes no verdict — measured — and the round-26 mutant ("drop the `_a`
+# requirement") is a NO-OP at this head. What reds these rows now: adding `CHANGED` to
 # `farm_drift_rows`' class alternation — NOT to the rc=0 closed allow-list, which this fixture never
 # reaches because it exits 3 — or dropping the start-of-line expression from `_a`'s sed.
 mk_origin t24az; mk_clone t24az
@@ -2720,8 +2721,8 @@ unset _tok _safe
 # ⛔ AND THE MIRROR: THE INSTRUMENT'S OWN BENIGN ROW TOKENS MUST NOT TRIP IT (review round 32). A healthy
 # copy prints `ok` rows and a `verdict` header; a farm with a declared local file prints
 # `LOCAL (declared)`, and a symlinked one `SYMLINK (graded via its target)`. Refusing those would block
-# every healthy farm, so the class set is explicit. Mutant that reds these rows: widen the unknown-row
-# test to any alphabetic trailing field without the benign allow-list.
+# every healthy farm, so the allow-list is explicit. Mutant that reds these rows: DELETE the benign
+# entries (`verdict`/`ok`, `LOCAL (declared)`, `SYMLINK (graded via its target)`) from it.
 mk_origin t24bp; mk_clone t24bp
 REPO_P="$CLONE"; MODE_P=sync
 mkdir -p "$T/t24bp/home/.pi/agent/scripts"
@@ -2781,7 +2782,9 @@ unset _tok _safe
 # proved end-to-end against the REAL instrument that stripping `PROG: DRIFT — ` left the pass recording
 # farm_n=unparsed with the header claiming no parsable summary — an over-block with a false reason). A
 # lagging farmed copy that prints the counts on its own line proves the extraction just as well. Mutant
-# that reds these rows: drop the `^\([0-9][0-9]*\) <label>` expression from any label sed.
+# that reds these rows: drop the `^\([0-9][0-9]*\) stale` start-of-line expression from `_a`'s sed — the
+# OTHER two labels lead with `stale` in this fixture, so their start-of-line forms are never the one that
+# matched (t24bl/t24bm order those labels first and pin those forms instead).
 mk_origin t24bk; mk_clone t24bk
 REPO_P="$CLONE"; MODE_P=sync
 mkdir -p "$T/t24bk/home/.pi/agent/scripts"
@@ -2968,7 +2971,7 @@ assert_contains "$(cat "$T/t24bd/state/harness-apply-farm-rows.txt" 2>/dev/null 
 assert_contains "$(grep '^farm_n=' "$T/t24bd/state/harness-apply.status" 2>/dev/null || true)" "farm_n=not-graded" \
     "T24 control: while farm_n= says no grade was produced — the counts were never PROVEN against an extraction"
 
-# ⛔ AND THE SUMMARY ALONE MUST DO IT (review round 36, measured: t24bd's rows carry `drift`/`missing`,
+# ⛔ AND THE SUMMARY ALONE MUST DO IT (review round 38, measured: t24bd's rows carry `drift`/`missing`,
 # which the closed row vocabulary also refuses, so that fixture cannot tell the two operands apart and the
 # summary half alone was UNPINNED — deleting `|| { [ -n "$FARM_EXPECT0" ] && [ "$FARM_EXPECT0" -gt 0 ]; }`
 # left the suite green). Here every row is BENIGN (`ok`), so the summary is the ONLY signal that can
