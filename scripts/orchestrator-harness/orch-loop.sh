@@ -2470,7 +2470,13 @@ _orch_argv_is_loop_flagged() { # shellcheck disable=SC2086
   case "${1##*/}" in bash|sh|dash|zsh) ;; *) return 1 ;; esac
   case "$2" in -*) ;; +*) ;; *) return 1 ;; esac          # token 2 must be a shell OPTION, either polarity
   for _t in "$@"; do                                # ORDERED: a `-c` before the script is #1856's wrapper
-    case "$_t" in -c|--command|-[!-]*c*) return 1 ;; esac
+    # ⛔ `+c` IS THE SAME TOKEN IN THE OTHER POLARITY, and leaving it out made the rule inconsistent with
+    # its own premise (fresh review of #3865 at f8604c74c, P3; MEASURED: `bash +c 'echo X'` and
+    # `bash +cx 'echo X'` both EXECUTE the string — as does `dash +c '…'`). So `bash +c "…;
+    # /abs/orch-loop.sh"` answered CANNOT-TELL and would need a human `rm -f`, while the `-c` spelling of
+    # the SAME argv reclaims. Fail-closed, so no safety loss — but a refusal the stated rule says cannot
+    # happen, which is the kind of drift that turns a rule into folklore. Both polarities now exempt.
+    case "$_t" in -c|--command|-[!-]*c*|+c|+[!-]*c*) return 1 ;; esac
     case "${_t##*/}" in orch-loop.sh) return 0 ;; esac
   done
   return 1

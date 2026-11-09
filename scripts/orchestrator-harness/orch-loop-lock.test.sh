@@ -54,7 +54,12 @@
 #      P2): a controller started with a shell OPTION (`bash -x …/orch-loop.sh`) is neither the canonical
 #      shape nor provably a non-controller, so it must refuse rather than be reclaimed out from under a
 #      live owner. BOTH option polarities count (§16c: `bash +o errexit …`), and `-c` wrappers stay
-#      RECLAIMED — #1856 decided they are not controllers (4c, §17).
+#      RECLAIMED — #1856 decided they are not controllers (4c, §17, and §17b for the `+c` spelling).
+#  17. ⭐ THE TRAP PIN IS AN INVARIANT, NOT A SPELLING, AND IT CANNOT BE ANSWERED BY A COMMENT (§9b):
+#      one `^trap` line mentioning the lock, its signal list EXACTLY `EXIT` (matched per WHOLE token, so
+#      `SIGEXIT` — which bash REJECTS, installing no trap — reds instead of reading as `EXIT`), and it
+#      removes `$LOCKF` on COMMENT-STRIPPED text (so a trailing comment naming the command cannot answer
+#      it). Stated false REDs: a trailing suffix after the signals, and a double-quoted removal spelling.
 #
 # ⛔ THE SUBJECT IS THE REAL `orch-loop.sh`, NOT A RE-IMPLEMENTATION. The lock block lives in a marked
 # section (`# [orchlock:begin] … # [orchlock:end]`), which this suite EXTRACTS with `sed` and runs as
@@ -140,34 +145,69 @@ ck "the EXIT trap that releases the lock sits BELOW the section (the block runs 
 # is the EXIT-only form.
 # ⛔ BUT IT PINS THE INVARIANT, NOT A BYTE-EXACT STRING (MEASURED against main's #3843/#2028, which
 # EXTENDED the trap to also run `gh_bound_cleanup`): that extension is legitimate — the lock is still
-# released FIRST, and still only on EXIT — while a literal `-qxF` match REDS on it. So the assertion is
-# the invariant: ONE `^trap` line mentioning $LOCKF, whose SIGNAL LIST is exactly `EXIT`, and which
-# removes $LOCKF. Adding work to an EXIT trap stays legal; adding INT/TERM to the signal list does not.
-# MEASURED: `EXIT INT TERM` → TRAP_SIGS="EXIT INT TERM" ≠ "EXIT" → RED.
-LOCK_TRAPS="$(grep -E '^trap .*LOCKF' "$SUBJECT" 2>/dev/null)"
-# ⛔ THE SIGNAL LIST IS WHAT ENDS THE LINE, PARSED WITHOUT ASSUMING A QUOTING STYLE (fresh review of this
-# repair, P3 — MEASURED: `sed -e "s/^trap '[^']*' //"` is blind to a DOUBLE-QUOTED trap, e.g.
-# `trap "rm -f \"$0\"" EXIT` — the style `scripts/conflict-rebase-timer.sh:254` itself writes — because
-# the pattern requires a leading single quote; TRAP_SIGS then became the WHOLE LINE and the arm went RED
-# while the invariant held. That direction is fail-closed (no spelling can WIDEN the list past `EXIT`),
-# but the red carried the WRONG DIAGNOSIS: it points the next maintainer at #1715 when nothing is wrong
-# there.)
-# Shell syntax puts the signals LAST, so they are the trailing run of signal words whatever quoting the
-# command uses. A line that yields no such run yields an empty TRAP_SIGS → ≠ `EXIT` → RED, which keeps
-# the fail-closed default.
-# ⚠️ STATED LIMIT, so it is not discovered as a bug: a trap line carrying a TRAILING SUFFIX after the
+# released FIRST, and still only on EXIT — while a literal `-qxF` match REDS on it.
+#
+# trap_pin <the trap text> — 0 when the invariant holds for THAT TEXT. Factored out so §9c can drive the
+# pin itself over the spellings that have already defeated it once (a pin nobody tests is how this one
+# shipped a false PASS twice).
+#   * ONE line may mention $LOCKF,
+#   * its signal list is EXACTLY `EXIT`, matched per WHOLE TOKEN,
+#   * it removes $LOCKF, checked on COMMENT-STRIPPED text.
+# ⛔ WHOLE TOKEN, NOT A SUFFIX (fresh review of #3865 at f8604c74c, P2 — false PASS, MEASURED: a regex
+# without a left boundary read `trap 'rm -f "$LOCKF"' SIGEXIT` as `TRAP_SIGS=EXIT` and left the suite
+# GREEN, while bash REJECTS `SIGEXIT` (`trap: SIGEXIT: invalid signal specification`) and installs NO
+# trap — so the lock is never released, the very invariant this arm asserts).
+# ⛔ COMMENT-STRIPPED `rm` CHECK (same review, P3 — false PASS, MEASURED: grepping the RAW line let
+# `trap 'true' EXIT  # … rm -f "$LOCKF" there` satisfy it while the trap removes nothing. `^trap`
+# anchoring stops a WHOLE-LINE comment, not a trailing one).
+# ⚠️ STATED false RED, so it is not found as a bug: a trap line carrying a TRAILING SUFFIX after the
 # signals (`trap "rm -f '$tmp'" EXIT 2>/dev/null || true`, the form `scripts/record-review.sh:3753`
-# writes) yields NO trailing signal run → empty → RED. That is fail-closed and correct-ish (the signals
-# are no longer the last thing on the line, so this pin no longer reads them), and the subject's own
-# trap carries no suffix — but it is a RED with the #1715 diagnosis, so the limit is named here rather
-# than left to be found. The `rm -f "$LOCKF"` check below is likewise spelling-dependent: a
-# double-quoted trap writes `rm -f \"\$LOCKF\"` and would RED it. Both are false-RED-only.
-TRAP_SIGS="$(printf '%s' "$LOCK_TRAPS" | sed -e 's/[[:space:]]*#.*$//' \
-  | grep -oE '(EXIT|INT|TERM|HUP|QUIT|ERR|DEBUG|RETURN|0)([[:space:]]+(EXIT|INT|TERM|HUP|QUIT|ERR|DEBUG|RETURN|0))*$' 2>/dev/null)"
-[ "$(grep -c . <<<"$LOCK_TRAPS")" = 1 ] \
-  && [ "$TRAP_SIGS" = "EXIT" ] \
-  && grep -qF 'rm -f "$LOCKF"' <<<"$LOCK_TRAPS"
+# writes) yields no trailing signal run → empty → RED. Fail-closed: a false RED with the #1715
+# diagnosis, never a false GREEN. The subject's own trap is single-quoted with no suffix.
+# ⛔ AND THE REMOVAL IS MATCHED ON A BACKSLASH-NORMALISED COPY, so a DOUBLE-QUOTED trap (which spells it
+# `rm -f \"\$LOCKF\"`) PASSES instead of reding — that was the second half of the quoting blind spot.
+trap_pin() {
+  local _lt="$1" _cmd _flat _sigs
+  _cmd="$(printf '%s' "$_lt" | sed -e 's/[[:space:]]*#.*$//')"
+  _flat="$(printf '%s' "$_cmd" | sed -e 's/\\//g')"
+  _sigs="$(printf '%s\n' "$_cmd" | awk '
+    BEGIN { n = split("EXIT INT TERM HUP QUIT ERR DEBUG RETURN 0", sig, " "); for (i = 1; i <= n; i++) ok[sig[i]] = 1 }
+    { out = ""; for (i = NF; i >= 1; i--) { if (!($i in ok)) break; out = $i (out == "" ? "" : " " out) } ; print out }
+  ')"
+  [ "$(grep -c . <<<"$_lt")" = 1 ] && [ "$_sigs" = "EXIT" ] && grep -qF 'rm -f "$LOCKF"' <<<"$_flat"
+}
+LOCK_TRAPS="$(grep -E '^trap .*LOCKF' "$SUBJECT" 2>/dev/null)"
+trap_pin "$LOCK_TRAPS"
 ck "the lock is released by ONE trap and its signal list is EXACTLY 'EXIT' (a returning INT/TERM handler deleted it while the loop lived — #1715)" $?
+# ── 9c) THE PIN ITSELF, DRIVEN OVER THE SPELLINGS THAT DEFEATED IT ────────────────────────────────
+# A pin that is never driven against its own near-misses is how this arm shipped a false PASS twice
+# (2026-11-09: the comment-match, then the `SIGEXIT` and trailing-comment ones). Each row is a
+# hand-written trap text with the verdict the INVARIANT requires; the last two are the false PASSes the
+# fresh review of f8604c74c measured on the shipped arms.
+echo "── 9c. the trap pin's own verdicts (invariant, not spelling)"
+_traprow() { # <expected:0|1> <trap text> <label>
+  local _want="$1" _txt="$2" _got=1
+  trap_pin "$_txt" && _got=0
+  [ "$_got" = "$_want" ]
+  ck "9c: $3" $?   # ⛔ `$3`, NOT `$_3`: `_3` is no variable at all, so `set -u` aborted the whole suite here
+}
+_traprow 0 "trap 'rm -f \"\$LOCKF\"' EXIT" \
+  "the shipped form PASSES (one EXIT-only releaser)"
+_traprow 0 "trap 'rm -f \"\$LOCKF\"; command -v x >/dev/null 2>&1 && x' EXIT" \
+  "an EXIT trap extended with more cleanup PASSES (the invariant, not a byte match)"
+_traprow 1 "trap 'rm -f \"\$LOCKF\"' EXIT INT TERM" \
+  "the #1715 revert REDS (a returning INT/TERM handler)"
+_traprow 1 "trap 'rm -f \"\$LOCKF\"' SIGEXIT" \
+  "a SUFFIX signal name REDS (bash REJECTS SIGEXIT and installs no trap — it must not read as EXIT)"
+_traprow 1 "trap 'true' EXIT  # the release now lives in cleanup(): rm -f \"\$LOCKF\" there" \
+  "a trailing COMMENT naming the command REDS (a comment cannot answer a structural pin)"
+_traprow 1 "trap 'rm -f \"\$LOCKF\"' EXIT
+trap 'rm -f \"\$LOCKF\"' EXIT" \
+  "TWO trap lines RED (one releaser)"
+_traprow 0 'trap "rm -f \"$LOCKF\"; x" EXIT' \
+  "a DOUBLE-QUOTED trap PASSES (both halves of the quoting blind spot: signals AND the removal)"
+# (the quoting-agnostic extraction and its stated limits live in `trap_pin` above — this arm and §9c
+# both drive it, so the pin has exactly one implementation and it is itself under test.)
 okc "acq() still takes the lock with set -o noclobber (unchanged primitive)" \
   grep -qF 'acq() { ( set -o noclobber; echo $$ > "$LOCKF" ) 2>/dev/null; }' "$SUBJECT"
 okc_not "the OLD liveness-only reclaim is GONE (it must not survive beside the new verdict)" \
@@ -888,6 +928,18 @@ ck "17: a '-c' wrapper with an OPTION in front of it is still RECLAIMED (not ref
    "$(ran && [ "$RC" -eq 0 ] && echo 0 || echo 1)"
 pkill -P "$WP" 2>/dev/null
 kill -9 "$WP" 2>/dev/null
+# and the `+c` SPELLING of the same token (fresh review of #3865 at f8604c74c, P3: the exemption was
+# `-`-only, so `bash +c "…; <loop>"` — which MEASURABLY executes the string — was refused as ambiguous
+# while its `-c` twin reclaimed, contradicting the rule this PR states for both polarities)
+mkcase; CASE_DIR="$C"
+bash +c "for _ in \$(seq 1 60); do sleep 1; done; $C/peer/orch-loop.sh" >/dev/null 2>&1 &
+ZP=$!; KIDS="$KIDS $ZP"; sleep 0.4
+printf '%s\n' "$ZP" > "$C/o/.orch.lock"
+run_drv O="$C/o"
+ck "17b: a '+c' wrapper is RECLAIMED too (the exemption holds for BOTH polarities)" \
+   "$(ran && [ "$RC" -eq 0 ] && echo 0 || echo 1)"
+pkill -P "$ZP" 2>/dev/null
+kill -9 "$ZP" 2>/dev/null
 
 # ── recap ───────────────────────────────────────────────────────────────────────────────────────
 echo
