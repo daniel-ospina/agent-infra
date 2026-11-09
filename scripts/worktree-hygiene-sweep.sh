@@ -127,7 +127,9 @@ REPO="${REPO:-}"
 # ⛔ THE OPERATOR VARIABLE IS AN INPUT OF THE DERIVATION — OFFERED ALONE, NEVER AS A CO-EQUAL
 # CANDIDATE BESIDE THE CWD (fresh-context review of #3833, F2, and #3849 review round 1, where the
 # RECORDED review grades it P1: "### P1 — scripts/worktree-hygiene-sweep.sh:126 — $TORTOISE_REPO stops
-# being a *proven* candidate and becomes a *deciding* value". The independently-dispatched review of
+# being a *proven* candidate and becomes a *deciding* value, so resolve_repo's $OR identity proof no
+# longer applies to it" (quoted whole — a truncated quote closed as if complete is the class this
+# comment is apologising for). The independently-dispatched review of
 # the same head graded it P2; both name this one finding, and the round is named here because the
 # grade is not what carries it — the measurement below is).
 # WHY NOT BESIDE `$PWD` (F2): #1974 §1 names `$TORTOISE_REPO`/`$TORTOISE` as an INPUT, and before
