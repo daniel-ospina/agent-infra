@@ -317,8 +317,9 @@ RC=$?
 ck $([ "$RC" -eq 2 ] && echo 0 || echo 1) "a LOST pin is UNKNOWN even when CELL_HOME names a different home (rc=$RC)"
 ck $(grep -q 'OK — ' "$OUT" && echo 1 || echo 0) "...and prints no OK verdict (the CELL_HOME root mismatch was a false PASS)"
 ck $(grep -q "$C24/.harness-path" "$ERR" && echo 0 || echo 1) "...and names the record it actually read ($C24/.harness-path)"
-# ...and the OTHER root the repo's writers use. `harness-apply-pass.sh:183-184` co-roots BOTH records
-# at $CELL_HOME while `orchestrator-harness/install.sh:741` roots the DIR record at $HOME, so a pin at
+# ...and the OTHER root the repo's writers use. `harness-apply-pass.sh`'s `HARNESS_PIN`/`HARNESS_PIN_FILE`
+# defaults co-root BOTH records at $CELL_HOME while `orchestrator-harness/install.sh`'s `HARNESS_PIN_FILE`
+# default roots the DIR record at $HOME, so a pin at
 # $HOME with the tree at $CELL_HOME (which is what `pi-bootstrap/setup.sh` produces when CELL_HOME is
 # set) must ALSO be seen as a pin on record, not as a first install. Testing only the derived root
 # would just MOVE the false PASS — the review measured exactly that (rc=2 on base, rc=0 on a one-root

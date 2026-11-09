@@ -142,8 +142,28 @@ esac
 # (cloud-cell-supervisor.sh DOES honour `O=` in keys.env) — two surfaces disagreeing about which
 # directory holds the lock is the #1745 class, and it was found in review of #1856.
 O_ENV="${O:-}"
+# ⛔ CAPTURED BEFORE THE DEFAULT IS APPLIED: `CELL_HOME_ENV` must stay the ENVIRONMENT value only — it
+# is the evidence that this box was TOLD it is a cell (see the `PLATFORM` branch below).
 CELL_HOME_ENV="${CELL_HOME:-}"                 # only the ENVIRONMENT value is evidence of a cell
-CELL_HOME="${CELL_HOME:-/tmp/cell-home}"
+# ── THE ONE HOME (agent-infra#3453) — DERIVED, never defaulted to the legacy /tmp/cell-home ────────
+# The rule and its precedence live in `scripts/lib/cell-home.sh`. Absent resolver = an INCOMPLETE
+# install, so the fallback is `$HOME` (which on a compliant cell IS the one home) — never the legacy
+# volatile path, which is what this line used to default to.
+CELL_HOME_LIB=""
+# ⛔ THE SELF PATH COUNTS ONLY WHEN IT NAMES THIS FILE — see `lib/cell-home.sh` §CONSUMERS.
+_SELF="${BASH_SOURCE[0]:-}"; [ -f "$_SELF" ] || _SELF=""     # under `bash -s` $0 is literally `bash` -> `.`
+if [ -n "$_SELF" ]; then
+  _SELF_DIR="$(cd "$(dirname "$_SELF")" 2>/dev/null && pwd -P)"
+  for _cand in "$_SELF_DIR/lib/cell-home.sh" "$_SELF_DIR/../lib/cell-home.sh"; do
+    [ -r "$_cand" ] && { CELL_HOME_LIB="$_cand"; break; }
+  done
+fi
+if [ -n "$CELL_HOME_LIB" ]; then . "$CELL_HOME_LIB"; CELL_HOME="$(cell_home_resolve)"; else CELL_HOME="${CELL_HOME:-${HOME:-}}"; fi
+# ⛔ AN EMPTY CELL_HOME IS NOT A HOME — it is the FILESYSTEM ROOT (`O=/orchestrator`,
+# `SCRIPTS=/.pi/agent/scripts`, a layer installed at `/.pi/agent`). A missing resolver is the
+# incomplete-install case the resolver's header names, so it is the SAME refusal the sibling
+# consumers already make (exit 78, EX_CONFIG) instead of a silent walk to `/`.
+[ -n "$CELL_HOME" ] || { printf '%s: FATAL: %s is not readable and neither CELL_HOME nor HOME is set — refusing to default the cell home (agent-infra#3453)\n' "${0##*/}" "${CELL_HOME_LIB:-lib/cell-home.sh}" >&2; exit 78; }
 if [ "$PLATFORM" = "cell" ]; then
   # The cell's own home. `cloud-cell-bringup.sh` documents why it is not /home/ubuntu (which does not
   # exist on the image), so the default here is the one that script provisions.

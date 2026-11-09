@@ -98,7 +98,7 @@ the pass and not in `apply`.
 ## The record, and who reads it
 
 One `key=value` per line, written atomically to
-`${HARNESS_APPLY_STATE_DIR:-$HOME/.pi/agent/state}/harness-apply.status`:
+`${HARNESS_APPLY_STATE_DIR:-$CELL_HOME/.pi/agent/state}/harness-apply.status`:
 
 ```
 mode=pin
@@ -138,7 +138,7 @@ is what separates them, and only the journal's `farm: SKIPPED` line says which o
 check that names *each* drifting file"). The journal keeps a bounded human view — 12 rows, then
 "… and N more" — so on a 30-row farm 18 files were counted and named nowhere durable (measured
 on the `cmux` cell, 2026-11-07). Every row the instrument reports is therefore written, atomically,
-to `${HARNESS_APPLY_STATE_DIR:-$HOME/.pi/agent/state}/harness-apply-farm-rows.txt` — absolutised, so a
+to `${HARNESS_APPLY_STATE_DIR:-$CELL_HOME/.pi/agent/state}/harness-apply-farm-rows.txt` — absolutised, so a
 relative `HARNESS_APPLY_STATE_DIR` still yields a path another process can open — and the record
 names that file.
 
@@ -397,6 +397,10 @@ this repo keeps deleting.
 | 23 | REFUSED unknown — the ref/repo/HEAD cannot be resolved, the materialiser failed, or the pin record could not be written | **red** |
 | 24 | `farm-drift` — the **FARM** (`$CELL_HOME/.pi/agent/scripts`, the directory this box *executes*) differs from the ref, owes files, or cannot be graded (a dangling link, a checker that lives inside the farm, an explicitly-named farm that is absent) — an **absent *default* farm is SKIPPED and the pass stays green**, because only then does "no farm" describe the host rather than the config | **red** |
 | 25 | behind, and this box has nothing that can advance it | **red** |
+| 27 | REFUSED `split-home` — this pass derives one cell home while the **unit that starts it** (`HOME=`) or the **controller's own unit** (`Environment=CELL_HOME=`) names another, so the pin it would write is not the pin the controller reads. Nothing in the **worktree** is touched — the refusal precedes the dirty-preservation pass and every other write (the `git fetch` that refreshed the ref has already run); it names both homes and the remedy **for the home the disagreement came from**: the legacy literal → `cell-home-migrate.sh --check`, then `--apply`; **any other home** → the installer that rendered the unit (`install-controller-service.sh --install` / `install-harness-apply-timer.sh --install`), because the migration's whole graded population is the legacy literal and it would report that box `one home — nothing to do`, leaving the tick red forever. An **explicit `CELL_HOME` is never second-guessed**, and *cannot-measure* is not a split. The two shapes differ and are reported differently. A box with **no controller unit at all** leaves only the pass's OWN `HOME=` leg above — which still refuses on its own **on systemd**, where the invocation marker exists (`install-harness-apply-timer.sh --install` alone is such a box; when that unit still names the legacy literal the migration grades it, which is why the refusal sends it there) — so the CONTROLLER half has nothing to compare, and when that leg names the derived home too the acting verbs and `--dry-run` read `split_home=none` (no unit, no claim) while the **record read stays silent** for that shape (`--print-status` prints a `split_home=` line only for a measured split or an unmeasurable one). A unit that was **read** whose `CELL_HOME` the pass cannot interpret (`{{CELL_HOME}}` unrendered, a `%h` specifier) reads `split_home=unmeasurable` on every verb — a leg that ran and could not be measured never prints as one that found agreement. `--dry-run` and `--print-status` **never** take this exit: the preview reports `would REFUSE split-home` and stays 0, and the record read reports `split_home=` as a reading | **red** |
+
+⛔ **26 IS NOT FREE** — `harness-refresh.sh` already spends it (`REFUSED blocked`), so `split-home`
+takes 27 rather than giving one code two meanings (the ONE VOCABULARY rule above).
 
 A red tick is deliberate: those are states a **human** must resolve, and the unit colour
 is the only surface that reaches someone who is not tailing a log.

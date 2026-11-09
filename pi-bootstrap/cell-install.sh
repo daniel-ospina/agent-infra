@@ -172,16 +172,18 @@
 #                        CERTIFIED.
 #   --help               print this header.
 #
-#   ENV  CELL_HOME    the cell home (default /tmp/cell-home; the cell's real HOME)
+#   ENV  CELL_HOME    the cell home (default: DERIVED — the box's durable home, see
+#                     scripts/lib/cell-home.sh; it used to default to /tmp/cell-home)
 #        INFRA_ROOT  the agent-infra checkout to install FROM. When unset it is resolved
 #                    from this script's own checkout, then AGENT_INFRA_PATH, $HARNESS/..
 #                    and $CELL_HOME/agent-infra, and the script FAILS if none of them is a
 #                    checkout — a cell that cannot receive the layer must not be certified.
-#                    An AMBIENT candidate must also be OWNED BY THIS USER: the cell's HOME is
-#                    a fixed path under a world-writable /tmp (/tmp/cell-home), so
-#                    'checkout-shaped' is not a trust signal by itself — whoever can
-#                    pre-create that path would choose the extensions and farmed scripts
-#                    that pi then EXECUTES. Pass INFRA_ROOT explicitly to override.
+#                    An AMBIENT candidate must also be OWNED BY THIS USER: a CELL_HOME an
+#                    operator points at a world-writable /tmp (the legacy `/tmp/cell-home` still
+#                    exists on a box mid-migration — agent-infra#3453) is not a trust signal, so
+#                    'checkout-shaped' is not one either — whoever can pre-create that path would
+#                    choose the extensions and farmed scripts that pi then EXECUTES. Pass INFRA_ROOT
+#                    explicitly to override.
 #        AGENT_GH_SHIM_DIR  a PREFERENCE, not an override, and it decides ONE HALF of a
 #                    two-part contract. --verify checks (1) the INSTALLED copy
 #                    ($CELL_HOME/.pi/agent/scripts/gh-shim), on its own and unconditionally:
@@ -208,8 +210,33 @@
 
 set -uo pipefail
 
-SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CELL_HOME="${CELL_HOME:-/tmp/cell-home}"
+# ⛔ THE SELF PATH COUNTS ONLY WHEN IT NAMES THIS FILE — see `scripts/lib/cell-home.sh` §CONSUMERS.
+_SELF="${BASH_SOURCE[0]:-}"; [ -f "$_SELF" ] || _SELF=""     # under `bash -s` $0 is literally `bash` -> `.`
+SELF_DIR=""
+if [ -n "$_SELF" ]; then SELF_DIR="$(cd "$(dirname "$_SELF")" && pwd)"; fi
+# ── THE ONE HOME (agent-infra#3453) — DERIVED, never defaulted to the legacy /tmp/cell-home ────────
+# ⛔ THIS IS THE LINE THAT DECIDED WHERE A FRESH CELL'S OPERATIONAL LAYER LANDS, and it used to land
+# it in `/tmp/cell-home` — a volatile home, and the SECOND home on a box whose account home is
+# `/home/cmux`. That is the origin of the split whose symptom is `git push` answering 403 while `gh`
+# reads work: the layer (and the credential resolution under it) lived somewhere the spawning unit never
+# pointed at. The rule and its precedence live in `scripts/lib/cell-home.sh`; a missing resolver falls
+# back to `$HOME` (the one home on a compliant cell), NEVER to the legacy path.
+CELL_HOME_LIB=""
+# ⛔ WITHOUT A SELF PATH THERE IS NO SIBLING TO TRUST (review F6 round 5): with `SELF_DIR` empty these
+# candidates were `/../scripts/lib/cell-home.sh` and `/lib/cell-home.sh` — absolute paths OUTSIDE any
+# checkout. 11 of the other 13 consumer blocks already nest the loop inside the self-path guard; this one
+# (and `scripts/harness-up`) did not. A piped start now takes the documented `$HOME` fallback instead.
+if [ -n "$SELF_DIR" ]; then
+  for _cand in "$SELF_DIR/../scripts/lib/cell-home.sh" "$SELF_DIR/lib/cell-home.sh"; do
+    [ -r "$_cand" ] && { CELL_HOME_LIB="$_cand"; break; }
+  done
+fi
+if [ -n "$CELL_HOME_LIB" ]; then . "$CELL_HOME_LIB"; CELL_HOME="$(cell_home_resolve)"; else CELL_HOME="${CELL_HOME:-${HOME:-}}"; fi
+# ⛔ AN EMPTY CELL_HOME IS NOT A HOME — it is the FILESYSTEM ROOT (`O=/orchestrator`,
+# `SCRIPTS=/.pi/agent/scripts`, a layer installed at `/.pi/agent`). A missing resolver is the
+# incomplete-install case the resolver's header names, so it is the SAME refusal the sibling
+# consumers already make (exit 78, EX_CONFIG) instead of a silent walk to `/`.
+[ -n "$CELL_HOME" ] || { printf '%s: FATAL: %s is not readable and neither CELL_HOME nor HOME is set — refusing to default the cell home (agent-infra#3453)\n' "${0##*/}" "${CELL_HOME_LIB:-lib/cell-home.sh}" >&2; exit 78; }
 DEST="$CELL_HOME/.pi/agent"
 MODE="${1:---install}"
 
@@ -229,8 +256,9 @@ graph_key_from_env_file() { # <file> [<variable>] -> its value
   local f="$1" v="${2:-TORTOISE_MCP_API_KEY}"
   [ -f "$f" ] || return 1
   # ⛔ SOURCING A FILE IS CODE EXECUTION, SO THE FILE MUST BELONG TO THE USER RUNNING THIS. One
-  # candidate is `$CELL_HOME/keys.env`, and `CELL_HOME` defaults to `/tmp/cell-home` — a path under
-  # a WORLD-WRITABLE parent. Without this gate an unprivileged local user could plant that file and
+  # candidate is `$CELL_HOME/keys.env`, and `$CELL_HOME` may be a path under a WORLD-WRITABLE parent
+  # (the LEGACY `/tmp/cell-home` still exists on boxes mid-migration: agent-infra#3453). Without this
+  # gate an unprivileged local user could plant that file and
   # get arbitrary shell run as whoever provisions the cell (root, on a fresh box), from a script
   # whose every comment says the file is operator-pushed and mode 600. `-O` is the portable owner
   # test (bash 3.2/macOS: `stat -c` does not exist there); the mode test refuses anything group- or
@@ -1637,10 +1665,11 @@ resolve_infra_root() {
     fi
     explicit=0
   done
-  # The AMBIENT candidates must additionally be owned by the user running this script. The
-  # cell's HOME is a fixed path under a world-writable /tmp (/tmp/cell-home), so a
-  # checkout-shaped tree appearing there may have been planted by another local user — and
-  # everything under it is installed and then EXECUTED by pi (merge-one.sh runs the farmed
+  # The AMBIENT candidates must additionally be owned by the user running this script. A CELL_HOME
+  # can be a fixed path under a world-writable /tmp — the legacy `/tmp/cell-home` still exists on a box
+  # mid-migration, and an operator may point CELL_HOME anywhere (agent-infra#3453) — so a
+  # checkout-shaped tree appearing there may have been planted by another local user: everything under
+  # it is installed and then EXECUTED by pi (merge-one.sh runs the farmed
   # record-review.sh directly). The two paths above are the ones the operator chose to run
   # from.
   #
