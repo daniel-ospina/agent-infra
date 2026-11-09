@@ -372,7 +372,8 @@ export O="${O:-$HOME/orchestrator}"
 # dirs stay LAST IN THE LIST, so they keep the tail rank the same list gave them on `main`.
 # ⛔ THE LIST IS BUILT IN ORDER AND PREPENDED ONCE (#1867 review P1 residual). Prepending each entry
 # inside the loop installs the list REVERSED — the last entry wins the front — which put
-# `/opt/homebrew/bin` ahead of `$HOME/.pi/agent/shims` (`scripts/capacity-transfer.test.sh:48`: on a
+# `/opt/homebrew/bin` ahead of `$HOME/.pi/agent/shims`
+# (`scripts/orchestrator-harness/capacity-transfer.test.sh:48`: on a
 # brew Mac `gh` IS `/opt/homebrew/bin/gh`) and disarmed the `gh` shim's #984 admin-merge guard and
 # #1910 pacing gate for every child of this loop, while the pin LOOKED installed. Appending the
 # entries in list order to an accumulator and prepending that ONE string keeps the first-listed dir
@@ -416,7 +417,17 @@ for _path_dir in \
     _pin_rest="$_pruned"
 done
 unset _path_dir _pin_dir _pruned _oldifs
-PATH="$_pin_prefix$_pin_rest"
+# ⛔ NO TRAILING SEPARATOR WHEN THE TAIL IS EMPTY (#1867 review P3, round 7). `_pin_prefix` always ends
+# in `:`, so appending an EMPTY `_pin_rest` produced `…:shims::/usr/local/bin:…` — a double colon is an
+# EMPTY PATH COMPONENT, i.e. the CWD, which is the exact hazard the pass above says it drops. The
+# inputs that reach it: a caller whose whole PATH is already the pinned dirs, or an empty PATH. (An
+# INTERIOR empty component was always handled — dropped by the same pass — so only an all-pinned or
+# empty PATH could do this.)
+if [ -n "$_pin_rest" ]; then
+    PATH="$_pin_prefix$_pin_rest"
+else
+    PATH="${_pin_prefix%:}"
+fi
 unset _pin_prefix _pin_rest
 # ⛔ APPEND, NEVER PREPEND (#1867 review P1). These five dirs were PREPENDED by an earlier version of
 # this line, which moved `/usr/local/bin` and `/usr/bin` AHEAD of the entries the loop above pins —

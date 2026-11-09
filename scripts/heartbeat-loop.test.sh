@@ -856,6 +856,30 @@ else
   fail "15b. the pinned PATH has the shim dir at rank ${S15B:-0} and homebrew at rank ${B15B:-0} — the pin did not force the order"
 fi
 
+# ⛔ AND AN ALL-PINNED INHERITED PATH MUST NOT REINTRODUCE AN EMPTY COMPONENT (#1867 review P3, round 7).
+# The prefix always ends in `:`; appending an EMPTY tail produced `…shims::/usr/local/bin:…`, and a
+# double colon is an empty PATH component — the CWD — which is the hazard the same block's comment
+# says it drops. The inputs that reach it: a caller whose whole PATH is already the pinned dirs, or
+# an empty PATH.
+FIX15C="$(mkfix pinrank3 0)"
+mkdir -p "$FIX15C/home/bin" "$FIX15C/home/.pi/agent/bin" "$FIX15C/home/.pi/agent/shims" "$FIX15C/home/.local/bin"
+cat > "$FIX15C/agent/scripts/orchestrator-heartbeat.sh" <<SH
+#!/bin/bash
+printf '%s\n' "\$PATH" > "$FIX15C/path"
+exit 0
+SH
+RUN_PASS_PATH="$FIX15C/home/bin:$FIX15C/home/.pi/agent/bin:$FIX15C/home/.pi/agent/shims:$FIX15C/home/.local/bin"
+run_pass "$FIX15C"
+unset RUN_PASS_PATH
+P15C="$(cat "$FIX15C/path" 2>/dev/null)"
+if [ -z "$P15C" ]; then
+  fail "15c. the pin row produced no PATH to inspect — nothing was measured"
+elif [ "${P15C#:}" != "$P15C" ] || [ "${P15C%:}" != "$P15C" ] || [ "${P15C#*::}" != "$P15C" ]; then
+  fail "15c. the pinned PATH carries an EMPTY component (the cwd): $P15C"
+else
+  pass "15c. a PATH made entirely of pinned dirs yields no empty component (the cwd is not silently added)"
+fi
+
 if [ "$failures" -eq 0 ]; then
   echo "✅ heartbeat-loop suite passed (${checks} assertions)"
   exit 0
