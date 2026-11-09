@@ -3190,6 +3190,27 @@ else
     bad "§18 NO sub-directory template exists in $REPO_TEMPLATES — the recursion rows proved nothing"
 fi
 
+# ⛔ AND THE SET IS A REAL WALK, NOT "FLAT OR EXACTLY ONE DIR DOWN" (#1867 review P2, round 7). The
+# heading, `is_declared`'s comment and docs/ops/heartbeat-launch-path.md all said ANY depth / "resolved
+# recursively", while the code was two fixed globs. A template at
+# `templates/launchd/<group>/<sub>/x.plist` was therefore reported UNMANAGED — with
+# `launchctl bootout … && rm -f …` printed as the remedy — the same harm the P1 above was raised for,
+# closed for one level while the comment claimed all of them. This row is the claim's own test: a
+# template THREE levels down must be DECLARED, and a future narrowing of the walk reds it.
+mkdir -p "$TEMPLATES/group/sub"
+printf '%s\n' \
+    '<?xml version="1.0" encoding="UTF-8"?>' \
+    '<plist version="1.0"><dict>' \
+    '<key>Label</key><string>com.eldato.nested</string>' \
+    '<key>ProgramArguments</key><array><string>/bin/bash</string><string>/x/nested.sh</string></array>' \
+    '</dict></plist>' > "$TEMPLATES/group/sub/com.eldato.nested.plist"
+seed_stray_plist com.eldato.nested
+OUT="$(run_stray_status)"; RC=$?
+assert_eq "$RC" "0" "§18b a template THREE levels down is DECLARED — the declared set is a walk, not two globs"
+assert_not_contains "$OUT" "com.eldato.nested" "§18b ...so no bootout+rm advice is aimed at a job this repo ships"
+rm -f "$TEMPLATES/group/sub/com.eldato.nested.plist" "$STRAY_HOME/Library/LaunchAgents/com.eldato.nested.plist"
+rmdir "$TEMPLATES/group/sub" "$TEMPLATES/group" 2>/dev/null || true
+
 # ⛔ AND "I COULD NOT LOOK" IS NOT "NOTHING TO REPORT" (#1867 review P2). An AGENTS_DIR that exists
 # but cannot be enumerated used to produce no rows, and no rows read as a CLEAN box: `--status`
 # exited 0 from an instrument that looked at nothing. It must answer UNKNOWN (2) instead — the same

@@ -1638,12 +1638,20 @@ status_job() {
 # instrument's healthy state on the reference Mac was a hard FAILING row. A job declared one
 # directory down IS described by this repo; the question the caller asks is "is this label in the
 # declared set?", and the declared set is this directory's templates wherever they sit.
+#
+# ⛔ AND "WHEREVER THEY SIT" MEANS A WALK (#1867 review P2, round 7). Two fixed globs are "flat, or
+# exactly ONE directory down", while this heading, `is_declared`'s comment and
+# docs/ops/heartbeat-launch-path.md all said "ANY depth" / "resolved recursively". A template at
+# `templates/launchd/<group>/<sub>/x.plist` would therefore be reported UNMANAGED — with
+# `launchctl bootout … && rm -f …` printed as its remedy — which is precisely the harm the P1 above
+# was raised for, closed for one level while the comment claimed all of them. The claim and the code
+# now agree, and §18b pins a template THREE levels down so a future narrowing reds.
 declared_labels() {
     local template
-    for template in "$TEMPLATES_DIR"/*.plist "$TEMPLATES_DIR"/*/*.plist; do
-        [ -f "$template" ] || continue
+    while IFS= read -r template; do
+        [ -n "$template" ] || continue
         basename "$template" .plist
-    done
+    done < <(find "$TEMPLATES_DIR" -type f -name '*.plist' 2>/dev/null | LC_ALL=C sort)
 }
 
 is_declared() { # $1 = label → 0 when a template in the declared set (any depth) describes it
@@ -1692,7 +1700,9 @@ unmanaged_plists() {
     for installed in "$AGENTS_DIR"/com.eldato.*.plist "$AGENTS_DIR"/com.tortoise.*.plist; do
         [ -f "$installed" ] || continue
         label="$(basename "$installed" .plist)"
-        # Declared anywhere in the template tree — flat, or one directory down — is declared.
+        # Declared anywhere in the template tree — at ANY depth, which `declared_labels` walks — is
+        # declared. (This said "flat, or one directory down" while the walk was two fixed globs; both
+        # the walk and this sentence are the same question, so they move together.)
         is_declared "$label" && continue
         # A RETIRED label is deliberately template-less: it is DECLARED and it is removed by
         # retire_pass on the next install, so it is not "unmanaged" — it is pending retirement.
