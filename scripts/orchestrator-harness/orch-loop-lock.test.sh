@@ -138,16 +138,29 @@ if [ -f "$LIB_PID" ] && [ -f "$LIB_REG" ]; then
   B_START="$(extract_fn "$LIB_PID" pid_start_epoch | norm_fn)"
   [ -n "$A_START" ] && [ "$A_START" = "$B_START" ]
   ck "the age mirror's CODE is identical to pid-identity.sh:pid_start_epoch" $?
-  # ⛔ THE TOKEN RULES ARE THE PINNED PART, NOT THE WHOLE BODY (fresh review of #1985, P1). The READ
+  # ⛔ THE TOKEN-RULES TAIL IS THE PINNED PART, NOT THE WHOLE BODY (fresh review of #1985, P1). The READ
   # arms deliberately differ: in a REPORTING consumer a false "not the owner" degrades a row to
   # STOPPED, while HERE the caller answers it by DELETING a live owner's lock (#1715), so the loop's
   # read is three-valued (`_orch_lock_probe`) and the canonical one is not. What must never drift are
   # the two argv TOKEN rules (#1856: a looser ANY-token match accepts a non-controller).
-  token_rules() { grep -E "##\*/|-ge 2" | sed -e 's/[[:space:]]\+$//' -e '/^[[:space:]]*#/d'; }
-  A_LOOP="$(extract_fn "$SUBJECT" _orch_argv_is_loop | token_rules)"
-  B_LOOP="$(extract_fn "$LIB_REG" registry_pid_is_controller | token_rules)"
+  # ⛔ AN INCLUDE-FILTERED EXCERPT IS NOT A PIN (fresh review of #1985, round 3, MEASURED): filtering to
+  # lines carrying `##*/` or `-ge 2` compared only what the filter kept, so RE-ADDING the #1856 loose arm
+  # (`case "$*" in *orch-loop.sh*) return 0 ;; esac`) to the mirror left the pin GREEN. The compared
+  # span is therefore everything from the `set --` line to the closing brace — unfiltered, so an added
+  # line reds it — with the one deliberate difference (the canonical reads its argv from `$c`, the
+  # mirror from its parameters) normalised away.
+  tail_from_set() { awk '/set -- /{p=1} p{print}' | sed -e 's/set -- \$\*/set -- ARGV/' -e 's/set -- \$c/set -- ARGV/' -e 's/[[:space:]]\+$//' -e '/^[[:space:]]*$/d' -e '/^[[:space:]]*#/d'; }
+  A_LOOP="$(extract_fn "$SUBJECT" _orch_argv_is_loop | tail_from_set)"
+  B_LOOP="$(extract_fn "$LIB_REG" registry_pid_is_controller | tail_from_set)"
   [ -n "$A_LOOP" ] && [ "$A_LOOP" = "$B_LOOP" ]
-  ck "the argv-shape mirror's TOKEN RULES are identical to orchestrator-registry.sh:registry_pid_is_controller" $?
+  ck "the argv-shape mirror's TOKEN-RULES TAIL is identical to orchestrator-registry.sh:registry_pid_is_controller" $?
+  # ⛔ AND NOTHING MAY SIT ABOVE THE RULES. The tail comparison starts at `set --`, so a line inserted
+  # BEFORE it (the #1856 loose arm the predecessor pin missed) is outside the compared span — MEASURED:
+  # re-adding `case "$*" in *orch-loop.sh*) return 0 ;; esac` above `set --` left the tail pin green
+  # (only driving arm 4c caught it). So the body is pinned by SHAPE as well: exactly the five rule lines.
+  A_BODY_N="$(extract_fn "$SUBJECT" _orch_argv_is_loop | sed -e '1d' -e '$d' -e '/^[[:space:]]*#/d' -e '/^[[:space:]]*$/d' | wc -l | tr -d ' ')"
+  [ "$A_BODY_N" = "5" ]
+  ck "the argv-shape mirror is EXACTLY the five rule lines — nothing can hide above the rules (found ${A_BODY_N})" $?
   _a="$(sed -n 's/^ORCH_LOCK_START_SLACK_SECONDS="\${ORCH_LOCK_START_SLACK_SECONDS:-\([0-9]*\)}"/\1/p' "$SUBJECT" | head -1)"
   _b="$(sed -n 's/^PID_START_SLACK_SECONDS="\${PID_START_SLACK_SECONDS:-\([0-9]*\)}"/\1/p' "$LIB_PID" | head -1)"
   [ -n "${_a:-}" ] && [ "$_a" = "$_b" ]
@@ -265,6 +278,20 @@ ck "4b: a live pid that is not an orch-loop.sh is not an owner (it starts and ru
    "$(ran && [ "$RC" -eq 0 ] && echo 0 || echo 1)"
 kill -9 "$SP" 2>/dev/null
 
+# ── 4c) an argv that MENTIONS the script is NOT an invocation (#1856) ────────────────────────────
+# `bash -c "sleep 300; /abs/orch-loop.sh"` is a non-controller that LOOKS like one to any-token matching.
+# The drift pin above catches the loose arm statically; this arm catches it BEHAVIOURALLY, which is what a
+# mutation reader trusts. A fresh lock, so only the shape can decide.
+echo "── 4c. an argv that merely MENTIONS orch-loop.sh is not an owner (#1856)"
+mkcase; CASE_DIR="$C"
+bash -c "sleep 300; $C/peer/orch-loop.sh" >/dev/null 2>&1 &
+MP=$!; KIDS="$KIDS $MP"; sleep 0.4
+printf '%s\n' "$MP" > "$C/o/.orch.lock"
+run_drv O="$C/o"
+ck "4c: a process that only MENTIONS the script does not own the lock (it starts and runs)" \
+   "$(ran && [ "$RC" -eq 0 ] && echo 0 || echo 1)"
+kill -9 "$MP" 2>/dev/null
+
 # ── 5) ⭐ a PEER controller that began AFTER the lock → reclaim (shape cannot discriminate) ──────
 # On this fleet the recycled target is a PEER repo's controller: same basename, same shared harness
 # path, so the argv shape matches PERFECTLY. The age fence is the half that answers (#1178/#1856).
@@ -274,7 +301,7 @@ PP="$(spawn_loop "$C/peer")"; KIDS="$KIDS $PP"; sleep 0.2
 printf '%s\n' "$PP" > "$C/o/.orch.lock"
 touch -t 202001010000 "$C/o/.orch.lock" 2>/dev/null || touch -d '2020-01-01 00:00:00' "$C/o/.orch.lock"
 run_drv O="$C/o"
-ck "5: a shape-matching peer controller from BEFORE… does not block a start (the age half discriminates)" \
+ck "5: a shape-matching peer controller that began AFTER the lock does not block a start (the age half discriminates)" \
    "$(ran && [ "$RC" -eq 0 ] && echo 0 || echo 1)"
 kill -9 "$PP" 2>/dev/null
 
