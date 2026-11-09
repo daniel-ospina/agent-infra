@@ -294,15 +294,24 @@ SNAP=/tmp/cell-home/harness/bed278f4bbb1   # the versioned snapshot the cell is 
 SUP=$SNAP/scripts/cloud-cell-supervisor.sh
 
 # 1. PRE-FLIGHT. Read-only: stops nothing, starts nothing, writes nothing.
-#    Expect the MERGE-INERT refusal here — that is the fix working, and the controller is still up.
+#    Expect the #1901 refusal here — "the QUEUE and the CHECKOUT name DIFFERENT repos …" — which is that
+#    snapshot's wording. ⛔ Do NOT expect the MERGE-INERT label at this step: `bed278f4` predates #2093
+#    (`git show bed278f4bbb1:scripts/cloud-cell-supervisor.sh` has no MERGE-INERT in its mismatch die), so
+#    the label appears only after step 4 lands a #2093 snapshot — see step 6.
+#    Either way the controller is still up: the refusal is a pre-flight, on both snapshots.
 bash $SUP check
 
 # 2. REPAIR the pair — pick ONE. The refusal prints both, with the values filled in.
 cp /tmp/cell-home/keys.env /tmp/cell-home/keys.env.bak-$(date -u +%Y%m%dT%H%M%SZ)
 # (a) let the queue follow the checkout — the repair that cannot be wrong about WHICH side is stale:
-sed -i '/^OR=/d' /tmp/cell-home/keys.env
+sed -i -E '/^[[:space:]]*(export[[:space:]]+|declare -x[[:space:]]+)?OR[[:space:]]*=/d' /tmp/cell-home/keys.env
 # (b) …or point the CHECKOUT at the repo the queue names (a different repo on disk — here agent-infra):
-#     sed -i 's|^REPO=.*|REPO=/tmp/cell-ai|' /tmp/cell-home/keys.env
+#     sed -i -E 's|^[[:space:]]*(export[[:space:]]+)?REPO[[:space:]]*=.*|REPO=/tmp/cell-ai|' /tmp/cell-home/keys.env
+# ⛔ THE ANCHOR COVERS WHAT A CELL'S keys.env ACTUALLY CARRIES. `export OR=<owner/name>` is the measured
+# cell shape (`lane.sh`), and `declare -x OR=` is "exactly what `export -p > keys.env` writes"
+# (`lane-env.sh`); a bare `^OR=` sed matches neither, exits 0 having edited nothing, and hands the
+# operator back an identical refusal with no new information. The supervisor's own reader for the same
+# question is equally wide (`sup_env_file_carries`).
 
 # 3. PRE-FLIGHT AGAIN. Must print: ok: queue <owner/repo> == checkout <path> (origin <url>) — derived
 bash $SUP check
@@ -312,6 +321,10 @@ bash $SUP stop
 bash $SUP start
 
 # 5. PROVE it moved: §4 — a real `[dispatch]` line, not just `[cap]`.
+
+# 6. Only NOW does the label exist: `check` on the #2093 snapshot prints the MERGE-INERT wording, and
+#    `stop` refuses the pair the same way. The box is repaired by then, so this is confirmation, not a
+#    second gate — but it is how you tell "the fix is deployed" from "the fix is absent".
 ```
 
 ⛔ **`sed '/^OR=/d'` is the repair for a box whose `OR` is the thing that is wrong** — lane-1's case: its
@@ -358,9 +371,11 @@ was 14 working of 76 resident, and `zombie=` is in the same line so a box full o
 - **Cloud cell** — `check` → `stop` → `start`. `start` runs `apply` (fetch `origin/main`, write an
   immutable `<sha12>/` snapshot, move the pin, stamp) before launching. Never hand-edit a file inside a
   snapshot: it destroys the per-file provenance proof. ⛔ **`check` first, always:** it is the read-only
-  pre-flight, and since agent-infra#2093 `stop` refuses the same unusable pairs `start` refuses — so a
-  wrong `OR`/`REPO` pair now surfaces at step 1 instead of leaving the box stopped and unrefreshed. The
-  repair sequence for a mismatch box is in §3.2.
+  pre-flight, and on a snapshot that includes agent-infra#2093 `stop` refuses the same unusable pairs
+  `start` refuses — so a wrong `OR`/`REPO` pair surfaces at step 1 instead of leaving the box stopped and
+  unrefreshed. On a **pre-#2093** snapshot the step-1 safety is `check`'s alone (it has always refused),
+  and `stop` will still strand the box: run `stop` ONLY after `check` passes. The repair sequence for a
+  mismatch box is in §3.2.
 - **Mac** — do **not** use `deploy-mac-orchestrator.sh` phase B on a launchd-loaded box. Two measured
   consequences: its `nohup bash "$O/orch-loop.sh"` child **inherits the operator shell's TCC grant**, so
   it dispatches while the durable launchd job cannot (a false PASS reported as success); and it does
