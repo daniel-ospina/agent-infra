@@ -4844,6 +4844,12 @@ assert_eq "$RECORD_RC" "3" "13m6c an [ADVERSARIAL-BOUND] with no residuals= fiel
 
 # 13m6d — near-miss VALUES must refuse, or the field is a rubber stamp: a residuals list appended to
 # the clean word, a suffix on it, and the UNSUBSTITUTED template a lane copies without filling in.
+# ⛔ THE COUNTS ARE EQUAL ON PURPOSE (#3829 F1). These bodies used to carry `covered=15 threats=17`,
+# which is ALSO the shape arm (iv) refuses as a contradiction — so the refusal was over-determined and
+# relaxing only the exact-value predicate left all four rows GREEN: the row could not tell "the value
+# check works" from "the counts disagree" (agent-infra#3442 rule 2, attributable catch). With
+# `threats=17 covered=17` no contradiction exists, so axis (ii) is the ONLY reason to refuse — and
+# 13m6j pins that attribution by relaxing axis (ii) alone.
 _m6d=0
 for _m6d_val in 'none,#12' 'none-filed' 'none#12' '<#N,…|none>'; do
     _m6d=$((_m6d + 1)); _m6d_pr=$((424861 + _m6d))
@@ -4851,7 +4857,7 @@ for _m6d_val in 'none,#12' 'none-filed' 'none#12' '<#N,…|none>'; do
     EV_REF="comment:${_m6d_pr}01" run_record_ev "$_m6d_pr" \
         STUB_EVIDENCE_BODY="## Review
 
-[ADVERSARIAL-BOUND] cycles=2 threats=17 covered=15 residuals=${_m6d_val}
+[ADVERSARIAL-BOUND] cycles=2 threats=17 covered=17 residuals=${_m6d_val}
 
 $VACUITY_BLOCK"
     assert_eq "$RECORD_RC" "3" "13m6d residuals='${_m6d_val}' is not the clean value — refused (rc 3)"
@@ -4953,6 +4959,48 @@ $VACUITY_BLOCK"
     assert_eq "$RECORD_RC" "3" "13m6g MUTATION: without the clean-form branch a residuals=none marker is REFUSED (rc 3) — 13m6b is load-bearing"
 else
     bad "13m6g could not build the mutant copy — the pin did not run"
+fi
+
+# 13m6j — MUTATION PIN (attribution for axis (ii), #3829 F1). 13m6d asserts that a near-miss
+# `residuals=` value refuses; this pin proves the EXACT-VALUE predicate at `record-review.sh` is what
+# refuses it. With that one predicate relaxed to `^residuals=.*$` — everything else untouched — the
+# same 13m6d-shaped body must be ACCEPTED (vector A). Before 13m6d's bodies dropped the
+# `covered=15 threats=17` counts this vector would have been REFUSED, because arm (iv) refuses that
+# shape on its own and the row passed for the wrong reason — so vector B pins the over-determination
+# itself: on the SAME mutant, the pre-fix counts refuse while the equal counts accept. Re-adding the
+# counts to 13m6d would therefore redden this pin, not silently re-shadow the four rows.
+# Built from THIS script into $T, never edited in place.
+_m6j_mut="$T/record-review.mut1889c.sh"
+command sed 's#^[[:space:]]*grep -qiE .\^residuals=.*$#            true#' "$RECORD" > "$_m6j_mut"
+if ! command grep -qF "grep -qiE '^residuals=" "$_m6j_mut" && ! cmp -s "$_m6j_mut" "$RECORD"; then
+    _m6j_pr=424882
+    rm -f "$(Q2 $_m6j_pr)"
+    EV_REF="comment:${_m6j_pr}01" run_record_ev "$_m6j_pr" RECORD="$_m6j_mut" \
+        STUB_EVIDENCE_BODY="[ADVERSARIAL-BOUND] cycles=2 threats=17 covered=17 residuals=none,#12 — residuals filed
+
+$VACUITY_BLOCK"
+    assert_eq "$RECORD_RC" "0" "13m6j MUTATION A: with the exact-value predicate relaxed a near-miss residuals= value is ACCEPTED (rc 0) — 13m6d is load-bearing"
+    # Vector B — the SAME mutant, only the counts differ, and the verdict flips. That IS the
+    # over-determination: with unequal counts the row would have been green while axis (ii) was dead,
+    # which is exactly what #3829 F1 measured.
+    _m6j_pr=424883
+    rm -f "$(Q2 $_m6j_pr)"
+    EV_REF="comment:${_m6j_pr}01" run_record_ev "$_m6j_pr" RECORD="$_m6j_mut" \
+        STUB_EVIDENCE_BODY="[ADVERSARIAL-BOUND] cycles=2 threats=17 covered=15 residuals=none,#12 — residuals filed
+
+$VACUITY_BLOCK"
+    assert_eq "$RECORD_RC" "3" "13m6j MUTATION B: with UNEQUAL counts the same near-miss value still refuses on the same mutant — the pre-fix shadowing, which is why 13m6d carries threats=covered"
+    # Vector C — and the trap is not merely described: the §13m6d loop body must NOT reintroduce the
+    # unequal counts, because that is the root F1 names. Reads THIS file at run time, so a future edit
+    # that "restores" a realistic-looking count reddens HERE instead of silently re-shadowing the
+    # four rows (agent-infra#3442 rule 2: the catch must be attributable).
+    if command grep -qE 'covered=1[5] residuals=\$\{_m6d_val\}' "${BASH_SOURCE[0]}"; then
+        bad "13m6j the §13m6d loop body carries UNEQUAL counts — it is over-determined by arm (iv) again, so its four rows cannot tell axis (ii) from a contradiction (#3829 F1)"
+    else
+        ok "13m6j the §13m6d loop body carries threats=covered, so axis (ii) is the only reason those four rows refuse"
+    fi
+else
+    bad "13m6j could not build the axis-(ii) mutant copy — the pin did not run"
 fi
 
 # 13g3 — the marker veto must be anchored to a LINE START, not to position 0. The
