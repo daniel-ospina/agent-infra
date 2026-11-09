@@ -7675,6 +7675,19 @@ testAsync("#783/T2: asyncRepoState reads branch/headSha/dirty/paths from a real 
     deepEqual(dirty!.paths, ["a.txt"], "the changed path is reported");
     equal(dirty!.headSha, clean!.headSha, "headSha unchanged by a worktree edit");
 
+    // #2105 review P2 — the SAME coverage gap the sync twin had: `?? a.txt` is the
+    // one porcelain shape with NO leading space. The shape every dirty worktree
+    // actually has is ` M path` (X column is a space), so pin that here too. This
+    // reader was already argv-form and never trimmed, so it is a GUARANTEE rather
+    // than a bug fix — and it is what makes the two readers provably agree.
+    rmSync(join(dir, "a.txt"), { force: true });
+    writeFileSync(join(dir, "tracked.txt"), "v1\n");
+    execSync("git add tracked.txt && git -c user.email=t@t -c user.name=t commit -q -m add-t", { cwd: dir });
+    writeFileSync(join(dir, "tracked.txt"), "v2\n");
+    const trackedChange = await asyncRepoState(dir);
+    equal(trackedChange!.dirty, true, "a TRACKED modification is seen");
+    deepEqual(trackedChange!.paths, ["tracked.txt"], "…and its path is not truncated");
+
     execSync("git checkout -q --detach", { cwd: dir });
     const detached = await asyncRepoState(dir);
     equal(detached!.branch, null, "detached HEAD → branch=null (worktree is the recovery key)");
