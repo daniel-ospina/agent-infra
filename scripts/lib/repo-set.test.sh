@@ -1071,15 +1071,29 @@ def _strip_comment(line):
         the faithful one: this guard's failure direction is a FALSE PASS on a definition bash really makes.
         It moves 0 of the 438 files and the KEYWORDS set is pinned in aggregate (emptying the set reds the
         suite), but the exclusion itself is unpinned, so it is declared here too.
-      * THE DEFINITION NAME CHARSET `[A-Za-z_][A-Za-z0-9_]` (the `defn` and `head` patterns) — the digits
-        member is the BIGGEST undeclared false pass in this scanner: drop it and the suite stays at 246/0,
-        nothing moves in the fixture, and **56 of the 438 files lose 209 distinct names** — every one of them
-        digit-bearing, most of them defined with a same-line brace in their own file, so ground truth and the
-        baseline both find them and the mutant LOSES them (`f10() { :; }` + `bash -n` rc 0 + `declare -F`
-        listing `f10` is the minimal shape; a digit-named fixture line is what would pin this, and none
-        exists). `head`'s copy of the charset is inert on this population (0 files), which is why the SET
-        rather than the occurrence is declared. ⛔ The 209 is measured, not estimated — re-measure it before
-        quoting this bullet, and note it is names, not files.
+      * THE DEFINITION NAME CHARSET `[A-Za-z_][A-Za-z0-9_]` (the `defn` and `head` patterns) — TWO OF ITS
+        MEMBERS ARE UNDECLARED FALSE PASSES, the uppercase range and the digits, and WHICH ONE IS BIGGEST
+        DEPENDS ON THE METRIC, so both are given with theirs. (Lowercase and `_` complete the set; this note
+        makes no claim about them beyond that they were not the members found unpinned.) (a) Uppercase `A-Z`, by FILES: drop it from the FIRST class and 86 of the 438
+        files move, losing 19 names; drop it from the SECOND class and 92 move, losing 40 — suite 246/0 and
+        fixture 24 in both cases, so neither is discriminable here. `PASS() { :; }` at
+        `scratch-worktree.test.sh:52` is the minimal shape (`bash -n` rc 0, bash defines `PASS`, the mutant
+        loses it). Of the 19 from the first class, 16 are real definitions and 3 (`BEGIN`, `END`, `NF`) are
+        names this scanner already invents from awk programs — and `RUN` is NOT one of the artifacts,
+        it is `RUN() {` in three real files, which is why this split is stated as 16/3 and not 15/4.
+        (b) Digits `0-9`, by NAMES: drop it and the suite stays at 246/0, nothing moves in the fixture, and
+        56 of the 438 files lose 209 distinct names — all of them digit-bearing, most defined with a same-line
+        brace in their own file, so ground truth and the baseline both find them and the mutant LOSES them
+        (`f10() { :; }` + `bash -n` rc 0 + `declare -F` listing `f10` is the minimal shape).
+        ⛔ Both are measured, not estimated, and both are FALSE PASSES: a digit-named or uppercase-named
+        fixture line is what would pin either, and none exists. `head`'s copies of both classes are inert on
+        this population (0 files), which is why the SET is declared and not one occurrence.
+      * the `function` WORD TEST (`re.match(r'function[ \t]', ...)`) — mutant it to a bare
+        `startswith('function')` and the suite stays at 246/0 with 0 of the 438 files moving, but a
+        valid-bash file containing `function_helper` followed by `{ :; }` is then reported as a DEFINITION
+        named `function_helper`, which bash never defines (an INVENTED name, i.e. the direction the
+        namespace arm fails closed on). Declared rather than pinned because no real script here carries the
+        spelling; the shape is the fixture to write.
       * the trailing flush (`if _buf is not None`) — a file ENDING mid-continuation (`last_def() { :; }`
         followed by a single backslash AND a newline) drops the last definition, a FALSE PASS; the shape is
         valid bash. Moves 0. The same bytes WITHOUT the trailing newline are not a fixture: `bash -n`
@@ -1439,9 +1453,10 @@ continued_name() \
 # scan of 6 of the `git ls-files '*.sh'` files (435 at the head that measured this; 438 now) — an earlier
 # revision of THIS note called that "20" and
 # an even earlier one "21". ⛔ THOSE DELTAS ARE THE PART THAT DID NOT REPRODUCE, and the "446" was a
-# DEFINITION rather than a count: it reproduces only as 435 `*.sh` PLUS the 11 tracked extensionless
-# scripts whose shebang names bash, which is not the population this note named ("shebang-marked,
-# `bash -n`-clean" — 452). So the mutant and the population are the reproducible half and the delta follows
+# DEFINITION rather than a count: it reproduces only as 435 `*.sh` PLUS the tracked extensionless scripts
+# whose shebang names BASH — 11 at this head, of 17 such scripts counting the `sh`-shebanged ones — which
+# is not the population this note named ("shebang-marked, `bash -n`-clean"). So the mutant and the
+# population are the reproducible half and the delta follows
 # from them; the old numbers are withdrawn, not replaced. Cycle 2 also measured the SHAPE it fails on: a
 # TRAILING comment (`x=1  # see cat <<'NOTE'`) opened the phantom heredoc even where the whole-line form
 # was exempted, so the fixture carries that spelling too.
