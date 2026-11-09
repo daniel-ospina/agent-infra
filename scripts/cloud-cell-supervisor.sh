@@ -1781,7 +1781,11 @@ queue_state_text() {
   case "$QUEUE_STATE" in
     derived)     printf 'ok — derived from the checkout' ;;
     explicit)    printf 'ok — OR matches the checkout' ;;
-    mismatch)    printf 'MISMATCH — start/check refuse, and stop refuses while a controller is live (MERGE-INERT, agent-infra#1901)' ;;
+    # ⛔ "WHILE A CONTROLLER IS LIVE" DESCRIBED THE WRONG LEG (review P3): the `.desired` marker alone
+    # refuses `stop` with no live controller anywhere, and it is the leg `stop` removes FIRST. The summary
+    # must name the gate's own condition, not one example of it — the enumeration lives in
+    # `stop_would_end_something`.
+    mismatch)    printf 'MISMATCH — start/check refuse, and stop refuses while this state dir has something a stop would end (marker, provable own session, doctor loop, or controller pid) (MERGE-INERT, agent-infra#1901)' ;;
     nocheckout)  printf 'NO CHECKOUT — REPO is not set; start/check derive one or refuse (agent-infra#1935)' ;;
     unreadable)  printf 'UNREADABLE — the checkout has no origin remote; start/check refuse' ;;
     underivable) printf 'UNDERIVABLE — origin is not https/http/ssh/scp-like naming <owner>/<repo>; start/check refuse' ;;

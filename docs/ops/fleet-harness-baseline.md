@@ -313,7 +313,9 @@ SUP=$SNAP/scripts/cloud-cell-supervisor.sh
 #    how an operator reads "fix absent" as "nothing to fix".
 bash $SUP check
 
-# 2. REPAIR the pair — pick ONE. On a post-#2093 snapshot the refusal prints both, with the values filled in.
+# 2. REPAIR the pair — pick ONE. On a post-#2093 snapshot the refusal PRINTS (a) with the values filled in, and
+#    names (b) as prose — (b) repoints the checkout at a different repo on disk, so the supervisor will not
+#    spell the command out for you.
 cp /tmp/cell-home/keys.env /tmp/cell-home/keys.env.bak-$(date -u +%Y%m%dT%H%M%SZ)
 # (a) let the queue follow the checkout — the repair that cannot be wrong about WHICH side is stale.
 #     ⛔ THE PREFIX IS OPTIONAL ON PURPOSE: a cell's keys.env carries the EXPORTED form as often as the
@@ -345,8 +347,9 @@ case: its `OR` names agent-infra while `REPO` is a tortoise tree, and that cell'
 checkout says. (The command is the `sed -E` in step 2 (a) above, not a bare `^OR=` anchor: a `keys.env`
 written `export OR=…` or `declare -x OR=…` is common enough that the narrow form silently edits nothing.)
 If the intent is the opposite — the box MUST work agent-infra PRs — use (b), because then the *checkout* is
-what is stale. Nothing in the supervisor can decide that for you, which is why the refusal prints both and
-the repair is not automated: `stop` refusing is the guard, and picking the direction is the operator's call.
+what is stale. Nothing in the supervisor can decide that for you, which is why the refusal prints (a) and
+names (b) in prose, and the repair is not automated: `stop` refusing is the guard, and picking the
+direction is the operator's call.
 
 ### 3.3 Not deployed for scheduling reasons, not for correctness
 
