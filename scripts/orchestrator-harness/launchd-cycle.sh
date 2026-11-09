@@ -560,8 +560,18 @@ lc_assert_stable() {
 # session-owned during a single day). Prints the pid, or nothing. Exists so a start can REFUSE instead
 # of manufacturing a restart storm: launchd's copy exits immediately on the lock, and `KeepAlive=true`
 # then relaunches it for as long as the
-# foreign controller lives. `kill -0` is the only liveness test used — the lock's mere presence proves
+# foreign controller lives. `kill -0` is the only test used here — the lock's mere presence proves
 # nothing, because orch-loop.sh's EXIT trap is the only thing that removes it.
+# ⛔ LIVENESS IS NOT IDENTITY, AND THIS READ IS THE ONE THAT STILL SETTLES FOR IT (fresh review of
+# agent-infra#1985, P2). Since #1985 the loop itself reclaims its lock on IDENTITY (alive AND an
+# `orch-loop.sh` invocation AND not begun after the lock), so a lock naming a RECYCLED pid no longer
+# blocks the loop — but this function still answers "a foreign controller holds it" from `kill -0`
+# alone, so `install.sh --start/--restart` refuses to launch over a recycled pid and the message
+# promises an exit that would not happen. ⛔ THE FIX IS NOT FORGED HERE: a fourth copy of the identity
+# predicate in this 6.9k-line farmed script is exactly the unpinned-extra-copy defect (#1178/#2629),
+# and `$O` is a flat seed with no `scripts/lib/` to source. It is recorded, with this file:line, on
+# agent-infra#3660 (the same reading in another revival verb) — until it lands, the refusal's own text
+# names the recycled-pid remedy so a human is not sent down the wrong path.
 lc_foreign_controller() {
   local lock
   # ⛔ THE SAME `-f` GUARD `lc_hb_value` NEEDS, ON THE SIBLING READ, ON THE BRANCH THAT RUNS WHEN THE JOB
@@ -582,7 +592,7 @@ lc_restart() {
   if [ -z "$pid" ]; then
     lock="$(lc_foreign_controller "$O")"
     if [ -n "$lock" ]; then
-      lc_err "❌ refusing to start $label: a controller started OUTSIDE launchd already holds $O/.orch.lock (pid $lock), so launchd's copy would exit at once and KeepAlive would relaunch it forever. Next: stop it (pkill -f \"[b]ash $O/orch-loop.sh\", then verify with pgrep -fl '[o]rch-loop' and only then rm -f $O/.orch.lock), then re-run"
+      lc_err "❌ refusing to start $label: a controller started OUTSIDE launchd already holds $O/.orch.lock (pid $lock), so launchd's copy would exit at once and KeepAlive would relaunch it forever. Next: stop it (pkill -f \"[b]ash $O/orch-loop.sh\", then verify with pgrep -fl '[o]rch-loop' and only then rm -f $O/.orch.lock), then re-run. If that pid is NOT really a controller (a RECYCLED pid — check `ps -o command= -p $lock`), the lock is stale: just rm -f $O/.orch.lock and re-run (agent-infra#3660)"
       return 1
     fi
   fi
@@ -665,7 +675,7 @@ lc_ensure() {
   if [ -z "$pid" ]; then
     lock="$(lc_foreign_controller "$O")"
     if [ -n "$lock" ]; then
-      lc_err "❌ refusing to start $label: a controller started OUTSIDE launchd already holds $O/.orch.lock (pid $lock), so launchd's copy would exit at once and KeepAlive would relaunch it forever. Next: stop it (pkill -f \"[b]ash $O/orch-loop.sh\", then verify with pgrep -fl '[o]rch-loop' and only then rm -f $O/.orch.lock), then re-run"
+      lc_err "❌ refusing to start $label: a controller started OUTSIDE launchd already holds $O/.orch.lock (pid $lock), so launchd's copy would exit at once and KeepAlive would relaunch it forever. Next: stop it (pkill -f \"[b]ash $O/orch-loop.sh\", then verify with pgrep -fl '[o]rch-loop' and only then rm -f $O/.orch.lock), then re-run. If that pid is NOT really a controller (a RECYCLED pid — check `ps -o command= -p $lock`), the lock is stale: just rm -f $O/.orch.lock and re-run (agent-infra#3660)"
       return 1
     fi
   fi
