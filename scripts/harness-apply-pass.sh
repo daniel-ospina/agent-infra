@@ -456,7 +456,6 @@ farm_sum_count() {
     # the same occurrence can never fail — it was a guard whose condition could not be false (the
     # "inert enforcer" class this file's own rules forbid). `_b`/`_c` are genuinely optional in the
     # instrument's output, so they still gate the proof.
-    [ -n "$_a" ] || return 0
     { [ -n "$_b" ] && [ -n "$_c" ]; } || return 0
     _bad="$(printf '%s\n' "$_l" \
         | grep -oE '[0-9][0-9]* [A-Za-z][A-Za-z-]*' \
