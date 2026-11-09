@@ -296,6 +296,11 @@ PY
         *) return 0 ;;
       esac
     }
+    # ⛔ THE SHIPPED ARM CHAIN CALLS `gh_bounded`, NOT `gh` (agent-infra#2028). A TRANSPARENT PASS-THROUGH
+    # on purpose: the bound is graded by `gh-bound.test.sh` against the real block, and repeating it in
+    # this rig would make the suite depend on `scripts/lib/bounded.sh` on the runner. The name is pinned —
+    # without it the CI-rerun path answers nothing and the double-act disclosure below never prints.
+    gh_bounded() { gh "$@"; }
     # ⛔ NEUTRALISE THE HOST'S OWN TMUX (measured, agent-infra#2653 round 11): `wt_table` counts
     # worker-named tmux sessions that have no record of their own, so on a box where the controller is
     # RUNNING this suite's census was `9 fixture lanes + the box's live merge-*/fix-* sessions` — the
@@ -393,6 +398,12 @@ PY
     # the mergeability probe IS the routing decision, so the stub must answer it (a stub that prints
     # nothing makes the arm read MSTAT="" and fall through — silently grading the wrong path).
     gh() { echo "GH $*" >> "$TMP/gspy"; case "$*" in *mergeable*) echo CONFLICTING ;; esac; return 0; }
+    # ⛔ THE EXTRACTED BLOCK READS `mergeable` THROUGH THE SHIPPED `gh_bounded` (agent-infra#2028).
+    # A TRANSPARENT PASS-THROUGH here on purpose: the bound itself is graded by `gh-bound.test.sh`
+    # against the real block, and repeating it in every rig would make these suites depend on
+    # `scripts/lib/bounded.sh` on the runner. The name is pinned — a rename leaves the read
+    # unresolved (MSTAT empty) and every CONFLICTING arm below RED, which is what happened.
+    gh_bounded() { gh "$@"; }
     PATH="$TMP/bin-tmuxnone:$PATH"   # see the file stub at the top: the host's live sessions must not leak
     sess() { return 1; }; claim_live() { return 1; }; can_spawn() { return 0; }
     refund_bailed_fixer() { return 0; }; park_ctrl() { return 0; }
@@ -443,6 +454,7 @@ drive_rows() {
       return 0
     }
     gh() { echo "GH $*" >> "$TMP/gspy"; case "$*" in *mergeable*) echo "$MSTAT" ;; esac; return 0; }
+    gh_bounded() { gh "$@"; }   # the shipped bound is graded by gh-bound.test.sh (agent-infra#2028)
     sess() { return 1; }; claim_live() { return 1; }; can_spawn() { return 0; }
     refund_bailed_fixer() { return 0; }; park_ctrl() { return 0; }
     . "$TMP/shq.sh"
