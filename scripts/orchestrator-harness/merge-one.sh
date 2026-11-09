@@ -156,9 +156,15 @@ cd "$REPO" || exit 1
 # which merge authority it has. REQ in the environment is an operator override; capture it ONCE
 # (REQ is overwritten below with the resolved value).
 _M1_HERE="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)"
-if [ -f "$O/repo-authority.sh" ]; then . "$O/repo-authority.sh"
+# ⛔ THE WORK ROOT, DEFINED BEFORE ANYTHING READS A SCRIPT (fresh-context review of #3846, P1). The
+# controller exports `O` = its STATE dir and `O_WORK` = the harness root, and the two differ whenever a
+# state dir is named (`ORC_STATE_DIR`) or a copy is isolated. Everything this file SOURCES OR EXECUTES
+# lives in the work root; everything it WRITES (`logs/`, `state/`) stays on `$O`. `_M1_HERE` remains the
+# last-resort home for a box whose `$O` predates a module.
+_M1_MOD="${O_WORK:-$O}"
+if [ -f "$_M1_MOD/repo-authority.sh" ]; then . "$_M1_MOD/repo-authority.sh"
 elif [ -f "$_M1_HERE/repo-authority.sh" ]; then . "$_M1_HERE/repo-authority.sh"
-else echo "[merge $PR] FATAL repo-authority.sh not found (looked in $O and ${_M1_HERE:-<unresolved>}) — refusing to run without the per-repo merge contract" >> "$L.log"; exit 1; fi
+else echo "[merge $PR] FATAL repo-authority.sh not found (looked in $_M1_MOD and ${_M1_HERE:-<unresolved>}) — refusing to run without the per-repo merge contract" >> "$L.log"; exit 1; fi
 # ⚠️ review round 3: a PRESENT but stale/partial repo-authority.sh sources cleanly, yields
 # REQ="" (read as `rail`), and the refusal below never fires — the resolver must actually exist.
 command -v resolve_required_checks >/dev/null 2>&1 && command -v merge_authority >/dev/null 2>&1 \
@@ -181,9 +187,9 @@ if command -v ensure_agent_gh_real >/dev/null 2>&1; then ensure_agent_gh_real ||
 # missing: this file's job is to merge, and refusing to merge because the RECORD of a refusal cannot
 # be written would turn a new observability path into an outage. The refusal path says so loudly
 # instead (see the [railrefusal] block) — a silent degrade is the failure mode that matters here.
-if [ -f "$O/rail-refusal.sh" ]; then . "$O/rail-refusal.sh"
+if [ -f "$_M1_MOD/rail-refusal.sh" ]; then . "$_M1_MOD/rail-refusal.sh"
 elif [ -f "$_M1_HERE/rail-refusal.sh" ]; then . "$_M1_HERE/rail-refusal.sh"
-else echo "[merge $PR] ⚠️ rail-refusal.sh not found (looked in $O and ${_M1_HERE:-<unresolved>}) — a rail refusal will NOT be recorded, so no red-fixer can be spawned from it" >> "$L.log"; fi
+else echo "[merge $PR] ⚠️ rail-refusal.sh not found (looked in $_M1_MOD and ${_M1_HERE:-<unresolved>}) — a rail refusal will NOT be recorded, so no red-fixer can be spawned from it" >> "$L.log"; fi
 command -v rail_refusal_record >/dev/null 2>&1 || echo "[merge $PR] ⚠️ rail-refusal.sh is stale/partial (no rail_refusal_record) — a rail refusal will NOT be recorded" >> "$L.log"
 
 # ── the RESEARCH contract for the reviewer's brief (#2258) ───────────────────────────────────────
@@ -769,9 +775,7 @@ if ! is_limit "${REVIEW_TIMEOUT:-1800}"; then
   REVIEW_TIMEOUT=1800
 fi
 
-# ⛔ `$O_WORK` FIRST (fresh-context review of #3846, P1) — same rule as `repo-authority.sh` three lines
-# up: the controller exports `O` = its STATE dir and `O_WORK` = the harness root.
-_M1_MOD="${O_WORK:-$O}"
+# `_M1_MOD` (the work root) is resolved at the top of this file, before the first module is sourced.
 if [ -f "$_M1_MOD/claims.sh" ]; then
   # shellcheck source=/dev/null
   . "$_M1_MOD/claims.sh"
@@ -864,15 +868,19 @@ if [ -f "$_M1_MOD/claims.sh" ]; then
     # nothing would fence its release on the HEAD claim's commit.
     PR_RESOLVED=1
   else
-    echo "[merge $PR] landing claim UNAVAILABLE: $O/claims.sh defines no claim_pr_acquire (it predates agent-infra#1952) — proceeding WITHOUT the per-PR exclusion, so a peer landing this PR at another head is NOT excluded. Re-provision $O/claims.sh (install.sh seeds it)" >> "$L.log"
+    echo "[merge $PR] landing claim UNAVAILABLE: $_M1_MOD/claims.sh defines no claim_pr_acquire (it predates agent-infra#1952) — proceeding WITHOUT the per-PR exclusion, so a peer landing this PR at another head is NOT excluded. Re-provision $_M1_MOD/claims.sh (install.sh seeds it)" >> "$L.log"
   fi
   # The EXIT trap that releases the LANDING claim was widened ABOVE, before the acquire — see the
   # comment there. Any exit from here on (including the head-claim refusal below and every
   # refusal/park after it) runs it; nothing is installed at this point on purpose.
 fi
 
-if [ -n "${HEAD:-}" ] && [ -f "$O/claims.sh" ]; then
+if [ -n "${HEAD:-}" ] && [ -f "$_M1_MOD/claims.sh" ]; then
   # claims.sh and CLAIM_LEASE were resolved in the landing block above; nothing is re-sourced here.
+  # ⛔ THE GUARD READS THE SAME HOME THE LANDING BLOCK SOURCED ($_M1_MOD, fresh-context review of
+  # #3846, P1). Testing `$O/claims.sh` here while the landing block sourced the work-root copy made the
+  # head claim silently SKIP on a state-dir instance — the module loaded, the guard said it was absent,
+  # and `claim_acquire` never ran.
   claim_acquire "$REPO" "$PR" "$HEAD" "$CLAIM_LEASE" >/dev/null
   CROSS_RC=$?
   case "$CROSS_RC" in
@@ -1138,7 +1146,7 @@ rail_attempt() {
   # binds evidence to the sha being merged (the landing `pr-<N>` key carries no head).
   if ( cd "$REPO" && \
        CLAIM_ACTION_HEAD_TOKEN="${CROSS_OWN:-}" \
-       CLAIM_ACTION_CLAIMS_SH="$O/claims.sh" \
+       CLAIM_ACTION_CLAIMS_SH="$_M1_MOD/claims.sh" \
        CLAIM_ACTION_REPO="$REPO" \
        bash "$RAIL" "$PR" --repo "$OR" -- --squash ) >> "$L.log" 2>&1; then
     echo "[merge $PR] MERGED via the rail (attempt $RC_N) $(date)" >> "$L.log"
