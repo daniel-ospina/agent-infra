@@ -100,7 +100,13 @@ run() { # <root> [ENV=VAL ...] -- <args...>
     local envs=()
     while [ "${1:-}" != "--" ] && [ $# -gt 0 ]; do envs+=("$1"); shift; done
     shift || true
-    env -u XPC_SERVICE_NAME HEARTBEAT_PI_AGENT_DIR="$root/agent" "${envs[@]}" bash "$LAUNCH" "$@" 2>&1
+    # ⛔ `${envs[@]+"${envs[@]}"}`, NOT `"${envs[@]}"` — this suite is `set -u`, and on bash 3.2
+    # (which is `/bin/bash` on the macOS this change exists for) expanding an EMPTY array under
+    # `set -u` is an "unbound variable" FATAL, not an empty list. The bare form therefore killed
+    # every `run` call that passes no ENV=VAL — 22 of 60 assertions — while the same suite was
+    # green on Linux's bash 5, so CI could not see it. The braced form is the repo's idiom for this
+    # (see scripts/checkout-hygiene/provider-latency-tripwire.test.sh:62). Do not "simplify" it.
+    env -u XPC_SERVICE_NAME HEARTBEAT_PI_AGENT_DIR="$root/agent" ${envs[@]+"${envs[@]}"} bash "$LAUNCH" "$@" 2>&1
 }
 
 echo "── 1-3. The launchd refusal (§1867) ──"
@@ -302,7 +308,14 @@ case "${1:-}" in
     -r) _epoch="${2:-}"
         case "$_epoch" in ''|*[!0-9]*) exit 1 ;; esac
         shift 2
-        exec /bin/date -u -d "@$_epoch" "$@" ;;
+        # ⛔ FORMAT THE EPOCH WITH THE *HOST'S* LADDER, NOT WITH GNU's. This shim used to `exec`
+        # `/bin/date -u -d "@$epoch"` unconditionally — so on macOS, the very platform the two rows
+        # below exist for, `/bin/date` has no `-d`, the shim exited 1 and BOTH timestamps read
+        # `<unreadable>`: the test asserted the launcher is portable while being GNU-only itself.
+        # CI could not see it (Linux bash has `-d`), which is why this is a comment and not a row.
+        /bin/date -u -r "$_epoch" "$@" 2>/dev/null && exit 0
+        /bin/date -u -d "@$_epoch" "$@" 2>/dev/null && exit 0
+        exit 1 ;;
 esac
 exit 1
 SH
