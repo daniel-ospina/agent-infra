@@ -467,7 +467,7 @@ for rel in \
   elif probe_home_subst_from_shell "$f"; then
     bad "d3: $rel substitutes {{HOME}} with the literal \$HOME — the rendered unit's HOME is this shell's, not the derivation's"
   else
-    ok "d3: $rel takes the home it bakes into a unit from the derivation, never from this shell"
+    ok "d3: $rel feeds {{HOME}} from the derived home ($rel's renderer takes the value from the resolver, never from this shell)"
   fi
 done
 # ⛔ AND THE SCHEDULED PASS'S UNIT IS THE ONE WHOSE `HOME` LEG THE PASS ITSELF READS, so its systemd render
@@ -477,6 +477,29 @@ if grep -qF 'render "$src_svc" "$tmpd/$UNIT_NAME.service" "$CELL_HOME"' "$REPO_R
   ok "d3 the harness-apply SYSTEMD render is handed the derived home (so its Environment=HOME= is the one home)"
 else
   bad "d3 the harness-apply systemd render is NOT handed the derived home — the pass's own unit would export this shell's HOME, which its guard then refuses"
+fi
+# ⛔ AND THE LAUNCHD CALL, WHICH THE ROW ABOVE DOES NOT COVER (review F3). The `d3` loop's two probes grade
+# a renderer's SPELLING (that it sources the resolver and does not substitute the literal `$HOME`), and
+# the systemd row grades one call site. Neither sees a second `render` call that omits the home argument
+# and therefore falls back to `$HOME` — which is exactly how the plist kept exporting the invoking
+# shell's home while the comment beside it claimed the field fed "executable paths". The plist's only
+# `{{HOME}}` is `EnvironmentVariables → HOME`, so this arm and the shape arm below are the pair that make
+# the launchd exception unnecessary rather than merely re-documented.
+if grep -qF 'render "$src_plist" "$tmpd/$LABEL.plist" "$CELL_HOME"' "$REPO_ROOT/scripts/install-harness-apply-timer.sh" 2>/dev/null; then
+  ok "d3 the harness-apply LAUNCHD render is likewise handed the derived home — no render call falls back to this shell"
+else
+  bad "d3 the harness-apply launchd render is NOT handed the derived home — a Darwin install would bake this shell's home into EnvironmentVariables→HOME, where a documented CELL_HOME override cannot reach it"
+fi
+# ⛔ THE SHAPE THE COMMENT MUST DESCRIBE (review F3): the plist's `{{HOME}}` is the JOB'S ENVIRONMENT, not
+# an executable path. Pinned so the ground cannot silently become false again — if this template ever
+# grows a `{{HOME}}`-built program path, the arm reds and the render's contract has to be re-argued.
+PLIST="$REPO_ROOT/templates/launchd/harness-apply/com.eldato.harness-apply.plist"
+if [ ! -f "$PLIST" ]; then
+  bad "d3: the launchd template is missing from the tree, so the render contract above is unpinned"
+elif [ "$(grep -cF '{{HOME}}' "$PLIST")" = "1" ] && grep -A1 -F '<key>HOME</key>' "$PLIST" | grep -qF '<string>{{HOME}}</string>'; then
+  ok "d3 the plist's only {{HOME}} is EnvironmentVariables→HOME (so deriving it moves the job's home, not its program)"
+else
+  bad "d3 the plist carries {{HOME}} somewhere other than EnvironmentVariables→HOME — the launchd render's ground must be re-checked before it is described"
 fi
 
 # ⛔ AN EMPTY CELL_HOME IS THE FILESYSTEM ROOT, NOT A HOME (`O=/orchestrator`,

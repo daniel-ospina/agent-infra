@@ -358,13 +358,21 @@ xml_sed_repl() {
 }
 
 render() { # render <template> <dest> [home]
-    # ⛔ THE THIRD ARGUMENT IS THE UNIT'S `HOME`, AND IT DEFAULTS TO `$HOME` (review F1). A systemd unit
-    # that exports `HOME=<the invoking shell's home>` is the SPLIT the pass's guard refuses: on a cell
-    # reached through `cmux vm exec` that value is `/home/ubuntu`, which does not exist, while the home
-    # every other unit runs as is the account's. The systemd branch therefore passes the DERIVED home;
-    # the launchd branch keeps `$HOME`, which on the host this fleet runs is the account's own home and
-    # is also what the plist's `{{HOME}}/…` EXECUTABLE PATHS must resolve to (they are not unit
-    # environments, and re-basing them onto a derivation would move the job's program, not its home).
+    # ⛔ THE THIRD ARGUMENT IS THE UNIT'S `HOME`, AND **BOTH** BRANCHES PASS THE DERIVED ONE (review F1,
+    # review F3). A unit that exports `HOME=<the invoking shell's home>` is the SPLIT the pass's guard
+    # refuses: on a cell reached through `cmux vm exec` that value is `/home/ubuntu`, which does not
+    # exist, while the home every other unit runs as is the account's.
+    # ⛔ THE LAUNCHD BRANCH USED TO KEEP `$HOME`, AND THE GROUND GIVEN FOR IT WAS FALSE (review F3). This
+    # comment claimed the plist's `{{HOME}}` fed EXECUTABLE PATHS that "must resolve" to the account's
+    # home. It does not: `templates/launchd/harness-apply/com.eldato.harness-apply.plist` carries
+    # `{{HOME}}` in exactly one place — `EnvironmentVariables → HOME` — which IS the job's environment and
+    # therefore the very field this derivation exists to feed; the executable paths are `{{PY_BIN}}`,
+    # `{{LAUNCHER}}` and `{{PASS}}`, each resolved to an absolute path by its own resolver and none of them
+    # built from `{{HOME}}`, so re-basing `{{HOME}}` moves no program. Keeping `$HOME` therefore meant a
+    # documented `CELL_HOME=<…>` override (the resolver's precedence 1) silently did not reach a Darwin
+    # install, and the plist exported one home while `HARNESS_APPLY_STATE_DIR` was derived from it.
+    # `$HOME` survives only as the default for a template that names no home at all (none does today), so
+    # a caller that forgets the argument degrades to the old behaviour rather than to an empty value.
     local tpl="$1" dest="$2" _unit_home="${3:-$HOME}"
     sed -e "s|{{USER}}|$(xml_sed_repl "$(id -un)")|g" \
         -e "s|{{HOME}}|$(xml_sed_repl "$_unit_home")|g" \
@@ -570,7 +578,7 @@ do_install_launchd() {
     resolve_launcher || return 1
 
     tmpd="$(mktemp -d "${TMPDIR:-/tmp}/harness-apply-plist.XXXXXX")" || { err "cannot create a temp dir"; return 1; }
-    render "$src_plist" "$tmpd/$LABEL.plist" || { rm -rf "$tmpd"; return 1; }
+    render "$src_plist" "$tmpd/$LABEL.plist" "$CELL_HOME" || { rm -rf "$tmpd"; return 1; }
     # ⛔ A PLIST THAT DOES NOT PARSE IS NOT INSTALLED. A placeholder inside an XML COMMENT renders a
     # doubled dash into it, which is forbidden there — the disk-reaper installer measured exactly this
     # and the box silently had no job while the installer said OK.
