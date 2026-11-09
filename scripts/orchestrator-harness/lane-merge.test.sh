@@ -1570,6 +1570,17 @@ OUT="$(PATH="$BIN:$PATH" GH_LOG="$T/gh.log" O="$OT" HOME="$T/home" LANE_MERGE_IN
 ck "--status emits NOTHING but the verdict record even when the cap conditions hold (no cap chatter on a read-only query, got: $(printf '%s' "$OUT" | tr '\n' '|'))" \
    $([ "$RC" = 0 ] && ! grep -q 'CAPPED at' <<<"$OUT" && echo 0 || echo 1)
 
+# ⛔ NO BACKTICK INSIDE A DOUBLE-QUOTED MESSAGE (review cycle 11, P2 — verified by RUNNING the line).
+# In `say_err "…` a backtick is COMMAND SUBSTITUTION, not text: a "`--watch`" in the LANE_TIMEOUT=0 disclosure
+# EXECUTED `--watch`, emitted `--watch: command not found` to stderr and DELETED the word from the message —
+# so the operator-facing line shipped corrupted, and `bash -n` cannot see it. A prefix-grep arm cannot either,
+# which is why this arm is generic: EVERY say_err in the file is scanned for a backtick.
+_btick="$(printf '\140')"
+ck "no say_err message carries a backtick inside its double quotes (it would run as COMMAND SUBSTITUTION and silently delete the word from the operator-facing line)" \
+   $(! grep 'say_err "' "$SCRIPT" | grep -qF "$_btick" && echo 0 || echo 1)
+ck "the LANE_TIMEOUT=0 disclosure still states that --watch supervision stays FINITE (so it cannot read as 'this lane has no bounds at all')" \
+   $(grep -q 'ONLY THE CHECK WAIT IS UNBOUNDED HERE' "$SCRIPT" && echo 0 || echo 1)
+
 # ⛔ THE RE-INVOCATION PATH (review round 3, P2 — verified): the documented resume omits `--issue` and
 # recovers it from `$O/state/lanemerge-<pr>.issue`. Resolving the heartbeat target BEFORE that recovery
 # found no `lane-<issue>.log`, capped the wait to `IDLE_BOUND_S - margin` and left the wall clamp inert.

@@ -525,8 +525,9 @@ fi
 # ⛔ THE SECOND TARGET IS ANOTHER PROCESS'S STALL DETECTOR, STATED RATHER THAN HIDDEN (review, P3 —
 # verified). `$O/logs/fix-$PR.log` is the log a FIXER's own `lane-bound.sh --log` watches, so appending
 # this wait's heartbeats to it is progress evidence for whoever that watchdog is supervising: a genuinely
-# stalled fixer for the SAME PR would keep reading as alive while this merge phase runs. The shape needs
-# both a re-invocation without `--issue` AND a concurrently live fixer on that PR — which the per-PR
+# stalled fixer for the SAME PR would keep reading as alive while this merge phase runs. The branch is
+# taken on a re-invocation without `--issue` OR with one whose `lane-<issue>.log` does not exist (a lane run
+# from another `$O`), AND with a concurrently live fixer on that PR — which the per-PR
 # claim is what normally prevents — so this is a narrow disclosed edge rather than a live defect.
 # Closing it properly means preferring a target only THIS invocation's watchdog reads (or probing the
 # claim before falling back); neither is done here, and `LANE_MERGE_HB` is the way to be explicit.
@@ -1555,7 +1556,12 @@ _wait_elapsed_note=""
 # `TimeoutSec=0` disables the timeout, and `systemd#9556` is the bug filed when `0s` was read as a
 # zero-second budget instead — the same misreading fixed here.)
 if [ "$LANE_WALL_S" -eq 0 ]; then
-  say_err "lane-merge: LANE_TIMEOUT=0 is the documented 'wall axis OFF' value (unbounded), not a zero-second budget — the ${WAIT_S}s check wait is NOT clamped, and no wall ceiling is enforced for this lane. Reading it as 0 would hand off WAITING_CHECKS on the first poll for ever (#3850 review, P2). ⛔ ONLY THE CHECK WAIT IS UNBOUNDED HERE: the `--watch` supervision allowance is still a FINITE ${MAX_WATCH} chunk(s) (${MAX_WATCH} x ${POLL_S}s), derived by the same arithmetic from a clock that is now 0, so the floor at :391 is what it is — do not read this line as 'this lane has no bounds at all'."
+  # ⛔ NO BACKTICKS INSIDE THIS MESSAGE (review, P2 — verified by running it): in a DOUBLE-QUOTED
+  # string a backtick is COMMAND SUBSTITUTION, so a "`--watch`" here executed `--watch`, printed
+  # "command not found" to stderr and DELETED the word from the line — corrupting the one message a
+  # LANE_TIMEOUT=0 operator reads, on the exact path this branch exists to fix. `bash -n` passes and a
+  # prefix-grep arm cannot see it, so `lane-merge.test.sh` now pins "no backtick in any say_err".
+  say_err "lane-merge: LANE_TIMEOUT=0 is the documented 'wall axis OFF' value (unbounded), not a zero-second budget — the ${WAIT_S}s check wait is NOT clamped, and no wall ceiling is enforced for this lane. Reading it as 0 would hand off WAITING_CHECKS on the first poll for ever (#3850 review, P2). ⛔ ONLY THE CHECK WAIT IS UNBOUNDED HERE: the --watch supervision allowance is still a FINITE ${MAX_WATCH} chunk(s) (${MAX_WATCH} x ${POLL_S}s), derived by the same arithmetic from a clock that is now 0 and floored at one chunk — do not read this line as 'this lane has no bounds at all'."
 elif [ -n "$_lane_elapsed" ]; then
   _wall_left=$(( LANE_WALL_S - _lane_elapsed - _hb_margin ))
   [ "$_wall_left" -ge 0 ] || _wall_left=0
@@ -1565,7 +1571,13 @@ elif [ -n "$_lane_elapsed" ]; then
     say_err "lane-merge: the check wait is CAPPED at ${WAIT_S}s${_wait_elapsed_note}. Uncapped it would out-live lane-bound.sh's ${LANE_WALL_S}s wall ceiling, which TERMs the lane with NO verdict file and no WAITING_CHECKS hand-off (#3584 review, P1)."
   fi
 else
-  say_err "lane-merge: this lane's elapsed wall-clock time could not be resolved (no live run token at \$O/logs/lane-${ISSUE:-<issue>}.owner and LANE_MERGE_ELAPSED_S is unset), so the ${WAIT_S}s check wait is NOT clamped to what is left of LANE_WALL_S=${LANE_WALL_S}s. A lane that entered its merge phase late can be TERMed mid-wait with no verdict (#3584 review, P1). Set LANE_MERGE_ELAPSED_S=<seconds>, or run the lane with --issue, to make the clamp apply."
+  # ⛔ THIS MESSAGE IS THE ONE AN OPERATOR ACTUALLY READS, SO IT GETS THE SAME CORRECTION THE CODE GOT
+  # (review, P2 — verified): it said "no live run token" and offered "--issue" as an equivalent remedy.
+  # Both were wrong once the test became ANCESTRY: a token can exist, be readable and name a LIVE pid and
+  # still be rejected for being a non-ancestor (an operator would check `kill -0`, see it alive, and have no
+  # way to reconcile that with the message), and `--issue` is what makes the token FINDABLE — it is not
+  # what makes it apply, because a controller re-running this script is not under a lane.
+  say_err "lane-merge: this lane's elapsed wall-clock time could not be resolved — no run token OF THIS LANE at \$O/logs/lane-${ISSUE:-<issue>}.owner (absent, unreadable, future-dated, or naming a pid that is not an ANCESTOR of this script) and LANE_MERGE_ELAPSED_S is unset — so the ${WAIT_S}s check wait is NOT clamped to what is left of LANE_WALL_S=${LANE_WALL_S}s, and a lane that entered its merge phase late can be TERMed mid-wait with no verdict (#3584 review, P1). ⛔ THE REMEDY IS LANE_MERGE_ELAPSED_S=<seconds>; --issue only makes the token findable, and a token whose pid is not this script's ancestor is never read as this lane's age."
 fi
 _wait_t0="$(date +%s)"
 deadline=$(( _wait_t0 + WAIT_S ))
