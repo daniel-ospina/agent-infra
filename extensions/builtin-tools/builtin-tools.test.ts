@@ -7465,8 +7465,8 @@ test("#1698: describeSpawnFailure is total — odd inputs never throw", () => {
 // THE FAIL-SAFE DIRECTION, PINNED (review round 5, P3 — verified finding). The row
 // above exercises only `exists` and `absent`. The branch the `isAbsentPath` doc
 // comment spends six lines on — a path that EXISTS but whose `statSync` FAILS — was
-// asserted by comment only: `catch { return true; }` and dropping the `ENOTDIR` arm
-// both left every row GREEN. A directory the process cannot traverse (mode 000)
+// asserted by comment only: `catch { return true; }` left every `#1698` row GREEN
+// before this one. A directory the process cannot traverse (mode 000)
 // makes `statSync` on a child throw `EACCES` while the child is really there, so the
 // mutant `catch { return true; }` would append "the cwd does not exist" to a
 // directory sitting on disk — the misdiagnosis the guard exists to prevent.
@@ -7501,8 +7501,8 @@ test("#1698: an existing cwd whose stat FAILS keeps the plain message (the fail-
 // ⛔ THE OTHER HALF OF THE SAME GUARD (review round 5, P3 — the `ENOTDIR` arm). The
 // row above pins the catch: a failure that is neither `ENOENT` nor `ENOTDIR` must
 // claim nothing. But `isAbsentPath` accepts the PAIR, and dropping `ENOTDIR` from it
-// (`return code === "ENOENT"`) left every row GREEN — measured, mutant applied to the
-// real `index.ts`: the only row that reddens is this one. The arm is not decorative:
+// (`return code === "ENOENT"`) reddened NO row before this one existed — measured on
+// the real `index.ts`; now this is the only row that reddens. The arm is not decorative:
 // a target whose ancestor is a FILE cannot exist, so the cause IS the missing cwd and
 // must be named — an `ENOENT`-only guard sends that dispatch back to reading
 // "spawn <binary> ENOENT" with no cause at all, which is the #1698 defect again for
