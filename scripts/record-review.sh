@@ -1508,10 +1508,58 @@ delta_git_neutral() { # <root> <git args…>
   return "$rc"
 }
 
+# ── A CASE VARIANT OF THE TIP WORD IS A REF NAME WHEN THE REPO HAS ONE (twenty-third review cycle) ──
+# git ref names are case-SENSITIVE, so `head`, `Head` and `hEaD` are three DIFFERENT strings from
+# `HEAD`, and git resolves a lowercase spelling to the tip ONLY because no ref of that name exists.
+# Every endpoint arm in this file normalises a four-character case variant to the tip word, so that an
+# honest `delta:A..head` (the spelling 20h52a recommends) is readable at all — but normalising WITHOUT
+# asking the repo INVENTS an endpoint. MEASURED, the class-5 defect one arm over from where it was
+# already fixed (the parser arm resolves and compares): with a tag `Head` at an orphan-child commit —
+# neither the head nor on its lineage, so `Head..HEAD` spans the whole main line and is emphatically
+# NOT empty — `I re-read Head..HEAD, i.e. from the ref 'Head' up to the head.` was refused rc 3 as
+# "states an EMPTY range (… both endpoints resolve to the attested head)", and `I re-read Head.. end to
+# end.` was refused the same way with `HEAD..HEAD (the endpoint is omitted, so it defaults to the
+# head)`. Both refusals were false about the artifact in two ways at once — the range was not empty,
+# and its left endpoint was not the attested head — which is the false-block-and-false-sentence class
+# this file records as worse than the gap, and it was the one place where the arms still disagreed
+# about what an endpoint is. So the decision is git's, exactly as in the parser arm: resolve the raw
+# token; leave it ALONE when a ref of that exact case-sensitive name exists (the resolution below then
+# reads the ref the author actually wrote), and substitute the tip word when it does not — which is
+# the only case in which the variant means the tip. A case-variant token carrying selectors
+# (`Head^{commit}`, `head~1`) is decided by its FOUR-CHARACTER operand for the same reason: the
+# selectors are git's grammar and a ref name may not contain `~`, `^` or `@{`.
+# DECLARED REMAINDER, stated rather than left to be discovered: this decision covers every token whose
+# characters are in the arms' ref alphabet (alphanumerics, `_`, `-`, `/`). A ref name CONTAINING `@`
+# (`head@1`, `mid@1` — legal per git-check-ref-format) still does not enter the two ref-name arms,
+# because `@` is also the tip's own BRACE syntax and a class that ate it would make `HEAD@{1}`
+# indistinguishable from a name. Such a claim is still REFUSED end to end — the parser's continuation
+# class treats `@` as a name character unless it opens a brace, so `BASE..head@1` fails to parse and
+# takes the "cannot parse" refusal — and beside an honest range it is the same DECLARED symbolic-ref
+# residual as `..mid-ref` (20h73c). What the arms owe is one shared decision for the tokens they
+# admit, and they now have it.
+_tipvariant() { # <token> -> the token, with a tip-word case variant normalised to HEAD when no such ref
+  case "$1" in
+    HEAD|@) printf '%s' "$1" ;;
+    [Hh][Ee][Aa][Dd])
+      if delta_git "$root" rev-parse --verify "$1^{commit}" >/dev/null 2>&1; then
+        printf '%s' "$1"
+      else
+        printf 'HEAD'
+      fi ;;
+    [Hh][Ee][Aa][Dd][~^@]*)
+      if delta_git "$root" rev-parse --verify "${1:0:4}^{commit}" >/dev/null 2>&1; then
+        printf '%s' "$1"
+      else
+        printf 'HEAD%s' "${1:4}"
+      fi ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
+
 delta_verify() { # <id: A..B[+artifact]> <head_sha> -> 0 = verified (sets DELTA_*)
   local id="$1" head="$2" range from to cover="" root="" tmp="" norm=""
   local authored="" newest="" n_authored=0 anchor="" dg_rc=0 base_sha="" base_ref=""
-  local merges_in_range="" evil="" evil_shas="" m="" parents="" pcount="" p1="" p2="" prest="" want="" actual="" cands="" mrc="" body_claim="" stated_from="" stated_to="" stated_sep="" _delta_tok="" E_OUT="" E_RC="" _scan="" _any="" _all_ok="" _sf="" _ss="" _st="" _straw="" _stcmp="" _ok="" _sfs="" _r="" _claim="" _toks="" _tok_rc=0 _tok="" _tsha="" _tipscan="" _tref="" _top="" _tiprel=0 _tisref="" _tosha="" _tipchain="" _svsh="" _tsel="" _lid=0 _rid=0 _lrest="" _rrest="" _elhs="" _erhs="" _elsha="" _ersha="" _eranges="" _opends="" _olhs="" _olrest="" _olid=0 _osha="" _emptyrange="" _emptystated="" _estated="" _dident="" _drivers="" _dg_rc=0 _gitdir="" _gd_rc=0 _commondir="" _cd_rc=0 _attr_amb="" _wt_amb="" _ls_rc=0 _st_amb="" _st_rc=0 _ad="" _adrift="" _adr_rc=0
+  local merges_in_range="" evil="" evil_shas="" m="" parents="" pcount="" p1="" p2="" prest="" want="" actual="" cands="" mrc="" body_claim="" stated_from="" stated_to="" stated_sep="" _delta_tok="" E_OUT="" E_RC="" _scan="" _any="" _all_ok="" _sf="" _ss="" _st="" _straw="" _stcmp="" _sbrace="" _sin="" _ok="" _sfs="" _r="" _claim="" _toks="" _tok_rc=0 _tok="" _tsha="" _tipscan="" _tref="" _top="" _tiprel=0 _tisref="" _tosha="" _tipchain="" _svsh="" _tv="" _tsel="" _lid=0 _rid=0 _lrest="" _rrest="" _elhs="" _erhs="" _elsha="" _ersha="" _eranges="" _opends="" _olhs="" _olrest="" _olid=0 _osha="" _emptyrange="" _emptystated="" _estated="" _dident="" _drivers="" _dg_rc=0 _gitdir="" _gd_rc=0 _commondir="" _cd_rc=0 _attr_amb="" _wt_amb="" _ls_rc=0 _st_amb="" _st_rc=0 _ad="" _adrift="" _adr_rc=0
   range="${id%%+*}"
   [ "$range" != "$id" ] && cover="${id#*+}"
   from="${range%%..*}"; to="${range##*..}"
@@ -2248,26 +2296,59 @@ $m"
     # at a mid commit, while the identical claim spelled `..mid-ref` was refused (rc 3). The only
     # difference between the two rows was the first four characters of a REF NAME, which is the
     # spelling-enumeration failure this file exists to end — and the token scan below already states
-    # the rule the arm was breaking (a token is a WHOLE token). The continuation class is the one the
-    # tip arm's own operand boundary uses, WIDENED by `-` and `/` because those are the two characters
-    # that make a git ref name: `head-mid`, `head/3698` and `HEADER` are ref names, while `head~1`,
-    # `head^` and `head@{1}` are the WORD plus a selector (git-check-ref-format forbids `~`, `^` and
-    # `@{` in a ref name — the twenty-first cycle's rule, taken from the empty-range arm and applied
-    # here).
-    while [[ "$_scan" =~ ([0-9a-fA-F]{4,40})[[:space:]]*(\.{2,3})[[:space:]]*([0-9a-fA-F]{4,40}|[Hh][Ee][Aa][Dd]|@)([^0-9A-Za-z_/-]|$) ]]; do
+    # the rule the arm was breaking (a token is a WHOLE token).
+    # ⛔ THE CONTINUATION CLASS IS GIT'S REF-NAME GRAMMAR, NOT "THE WORD CHARACTERS PLUS TWO"
+    # (twenty-third review cycle, P1 — MEASURED, and the first version of the fix was wrong in
+    # exactly the way it accused the old code of being wrong). The class used to be `[^0-9A-Za-z_/-]`,
+    # justified here as "`-` and `/` are the two characters that make a git ref name" — a FALSE
+    # sentence: `git-check-ref-format` forbids only `~`, `^`, `:`, `?`, `*`, `[`, `\`, space and
+    # control characters, so `+ = , ! $ % & ' ( ) ; < > @` are all legal INSIDE a name. MEASURED with a
+    # branch `head+1` at a mid commit: `delta:<BASE>..head+1` recorded rc 0 with
+    # `"delta_range":"<BASE>..<HEAD>"` — a signed `clean` over the commits the artifact excluded —
+    # while the identical claim on a ref not named `head…` (`..mid+2`, same commit) was refused rc 3.
+    # So the class now admits EVERY ref-legal character that can continue a name in running prose:
+    # alphanumerics, `_`, `/`, `-`, and `+ = $ % ! & @` (the last closes `head@{1}`, which had been
+    # read as the bare tip word plus a discarded selector).
+    # DECLARED REMAINDER, stated rather than discovered: `, ; : ( ) < > ' "` still TERMINATE the token,
+    # so a ref whose name continues with one of them (`head,1`, `head'1`) reads as the tip word
+    # followed by punctuation. That is a CHOICE against the other error, not an oversight: those are
+    # precisely the characters that end a sentence or a quoted token, and an artifact that writes
+    # `reviewed delta:<BASE>..HEAD;` / `..HEAD,` / `..HEAD)` / `"delta:<BASE>..HEAD"` is the ordinary
+    # honest form this arm must accept — refusing them would be the false-block class this file
+    # records as worse than the gap. A "maximal ref-legal run then resolve" rule cannot split them
+    # either: `;` is ref-legal, so that rule reads `..HEAD;` as a ref named `HEAD;`.
+    # ⛔ A BRACE ON THE TIP IS A SELECTOR, NOT PART OF THE NAME — AND IT IS DECIDED, NOT IGNORED
+    # (twenty-third review cycle, found by the commit verifier, MEASURED). `@` had to join the
+    # continuation class to close `head@1` (a legal ref name), but the tip's OWN reflog syntax starts
+    # with `@` too: `..HEAD@{0}` and `..HEAD@{now}` — the identity spellings this file protects
+    # elsewhere (20h53/20h53b, 20h66: "an honest artifact that merely NAMED one was refused … which is
+    # false about it") — stopped matching at all and were refused as "cannot parse". The boundary
+    # therefore admits `@{…}` as a GROUP, and the group is then decided by the SAME rule the tip arm
+    # above applies to a chain: `@{now}` and a pure-zero count are the attested head itself; any other
+    # POSITION (`@{1}`, `@{00}0…`, a dated brace) is an ELDER commit, i.e. the claim ends somewhere
+    # other than the head and is refused as a different range; a name continuing with `@` and NO brace
+    # (`head@1`) still does not match, which is what keeps that ref name a name.
+    # A symbolic brace (`@{upstream}`, `@{push}`) is refused HERE, unlike the tip arm, and the
+    # asymmetry is deliberate: there the brace is prose the artifact merely mentioned, while here it
+    # is the ENDPOINT of the stated range — an endpoint this code cannot evaluate is not a verified
+    # endpoint, which is the same rule that refuses an unresolvable `HEAD`.
+    while [[ "$_scan" =~ ([0-9a-fA-F]{4,40})[[:space:]]*(\.{2,3})[[:space:]]*([0-9a-fA-F]{4,40}|[Hh][Ee][Aa][Dd]|@)(@\{[^}]*\}|[^0-9A-Za-z_/+=$%!&@-]|$) ]]; do
       _sf="$(printf '%s' "${BASH_REMATCH[1]}" | command tr 'A-F' 'a-f')"
       _ss="${BASH_REMATCH[2]}"
-      # ⛔ THE RAW SPELLING IS KEPT FOR THE MESSAGE ONLY — NEVER FOR RESOLUTION (fifteenth review
-      # cycle, P2 — MEASURED at 2aba1583a: the arm accepts the SIXTEEN case variants of the tip
-      # (`[Hh][Ee][Aa][Dd]`), but resolved the RAW spelling, and git ref names are case-sensitive —
+      # ⛔ ONE SPELLING, NOT TWO: THE RAW TOKEN IS BOTH WHAT DECIDES AND WHAT THE MESSAGE QUOTES
+      # (fifteenth review cycle, P2 — MEASURED at 2aba1583a: the arm accepts the SIXTEEN case variants
+      # of the tip (`[Hh][Ee][Aa][Dd]`), but resolved the TR'D spelling, which is not a name git has —
       # `rev-parse 'HEAD^{commit}'` rc 0, `'head^{commit}'` and `'Head^{commit}'` BOTH rc 128 with
       # "Needed a single revision". So an honest `reviewed delta:<BASE>..head` fell through to
       # `_ok=0` and was refused as "states a DIFFERENT range", whose only remedy is re-wording an
       # evidence comment that must postdate the head — i.e. the full re-review the seventh cycle's
       # P2 names as worse than the gap. The spelling it ACCEPTS and the spelling it can RESOLVE were
       # two different sets; a case arm that widens one without widening the other is a false block
-      # generator. Resolution therefore uses the CANONICAL token, and the raw spelling survives only
-      # in the refusal message (where quoting the artifact verbatim is the point).
+      # generator. Eleven cycles of fixes widened the RESOLUTION SET here, and the `tr`'d copy became
+      # the defect below because it is a LOSSIER spelling — it turns `HEAD` into `Head`, a name the
+      # repo may actually carry. So the two sets are now the same one: the arm accepts the raw token
+      # and resolves the raw token, case-SENSITIVELY, and quotes it back in the refusal where
+      # verbatim is the point.
       _straw="${BASH_REMATCH[3]}"
       _st="$(printf '%s' "$_straw" | command tr 'A-F' 'a-f')"
       # Advance PAST this match so the next iteration cannot re-match a suffix of it.
@@ -2278,7 +2359,9 @@ $m"
       # `H` (it is outside A-F), so `HEAD` normalises to `Head` — a `case` arm written `head|@`
       # matched NOTHING and every honest `BASE..HEAD` artifact was refused with "states a DIFFERENT
       # range … the body quotes …..Head" (measured while writing 20h52a, which is why that control
-      # exists). The test is on the CASE-INSENSITIVE spelling instead.
+      # exists). The test is on the RAW spelling (see the twenty-third cycle below), which is neither
+      # the `tr`'d copy nor a case-insensitive comparison: `HEAD` is the tip by NAME, and `head` is a
+      # DIFFERENT name that git resolves to the tip only when no ref of its own exists.
       # ⛔ A TIP SPELLING IS THE ATTESTED HEAD, NOT THIS CHECKOUT\'S (ninteenth cycle, P1 — MEASURED):
       # resolving `HEAD` through the delta checkout made the arm\'s own recommended spelling
       # (`reviewed delta:A..HEAD`, 20h52a) be refused as "states a DIFFERENT range" whenever that
@@ -2293,12 +2376,41 @@ $m"
       # repo. Resolving it first answers the question git itself would answer, and leaves the
       # fifteenth cycle's false-block fix intact: where no such ref exists, `rev-parse` fails and the
       # token IS the tip word (an honest lowercase `..head` stays accepted, 20h73d).
-      case "$_stcmp" in
-        HEAD|@) _stcmp="$to" ;;
-        [Hh][Ee][Aa][Dd])
-          _svsh="$(delta_git "$root" rev-parse --verify "${_stcmp}^{commit}" 2>/dev/null || true)"
-          if [ -n "$_svsh" ]; then _stcmp="$_svsh"; else _stcmp="$to"; fi ;;
-      esac
+      # ⛔ THE TIP DECISION IS MADE ON THE RAW SPELLING, CASE-SENSITIVELY (twenty-third review cycle, P1 —
+      # MEASURED). `_stcmp` is the `tr 'A-F' 'a-f'` COPY used for the hex prefix compare below, and the
+      # tip test used to run on it — where `HEAD` normalises to `Head`. So the canonical spelling never
+      # reached the `HEAD|@)` arm and was RESOLVED like a variant instead of being the tip by
+      # definition. With a ref named `Head` anywhere in the delta repo, the ordinary honest artifact
+      # `reviewed delta:<BASE>..HEAD` was refused as "states a DIFFERENT range" — MEASURED rc 3, a false
+      # block whose message accuses the artifact of a contradiction it never wrote, in a repo where git
+      # itself has NO ambiguity (`rev-parse HEAD` reads the pseudo-ref; `rev-parse Head` reads the tag:
+      # they are different, case-sensitive names). The decision therefore runs on `_straw`, the spelling
+      # the artifact actually wrote: `HEAD`/`@` are the tip by definition, and only a genuine VARIANT is
+      # resolved — against its own spelling, never a lowercased copy.
+      _sbrace=""
+      # `:-` because a MUTANT that removes the group must measure the arm, not die on `set -u`: the
+      # matrix's whole value is that a cell which cannot build its mutant REDDENS rather than passing
+      # silently, and an unbound-index abort would have reported "mutant still refused" — a vacuous
+      # pass wearing the shape of a load-bearing one (M60, measured).
+      case "${BASH_REMATCH[4]:-}" in '@{'*) _sbrace="${BASH_REMATCH[4]}" ;; esac
+      if [ -n "$_sbrace" ]; then
+        # The brace is part of the CLAIM (so the refusal quotes it) and it decides the endpoint.
+        _straw="${_straw}${_sbrace}"
+        _sin="${_sbrace#@\{}"; _sin="${_sin%\}}"
+        case "$_sin" in
+          now) _stcmp="$to" ;;
+          *[!0-9]*) _stcmp='' ;;
+          *[1-9]*) _stcmp='' ;;
+          *) _stcmp="$to" ;;
+        esac
+      else
+        case "$_straw" in
+          HEAD|@) _stcmp="$to" ;;
+          [Hh][Ee][Aa][Dd])
+            _svsh="$(delta_git "$root" rev-parse --verify "${_straw}^{commit}" 2>/dev/null || true)"
+            if [ -n "$_svsh" ]; then _stcmp="$_svsh"; else _stcmp="$to"; fi ;;
+        esac
+      fi
       if [ -n "$_stcmp" ]; then
         case "$to" in "$_stcmp"*) _ok=1 ;; esac
       fi
@@ -2632,7 +2744,12 @@ $m"
         esac
       fi
       case "$_tref" in
-        [Hh][Ee][Aa][Dd]|@) _tiprel=1; break ;;
+        HEAD|@) _tiprel=1; break ;;
+        [Hh][Ee][Aa][Dd])
+          # a case VARIANT is the tip's word only when the repo has no ref of that exact name — the
+          # same decision `_tipvariant` makes for the other arms (twenty-third review cycle, P2)
+          _tv="$(_tipvariant "$_tref")"
+          case "$_tv" in HEAD) _tiprel=1; break ;; esac ;;
       esac
       # ⛔ A RESOLVABLE OPERAND IS NOT A NARROWING — THE COMMIT ITS SELECTS IS (twenty-second review
       # cycle, TWO P2s — MEASURED, both FALSE BLOCKS with a false sentence). This test used to be
@@ -2695,8 +2812,18 @@ $m"
     # is the separator's own character and a class that ate it would make `a..b` ambiguous — so a ref
     # name CONTAINING a dot (`v1.2.3..HEAD`) stays outside this arm. That is a smaller residual than
     # "any symbolic ref", stated here rather than discovered later.
+    # ⛔ THE OPERAND IS THE WHOLE RUN, LEADING DIGIT INCLUDED (twenty-third review cycle, P1 —
+    # MEASURED). The ref-name alternative was `[A-Za-z][A-Za-z0-9_/-]*` — LETTER-initial — so a ref
+    # name that begins with a digit was never admitted as an operand: the engine skipped past it and
+    # matched a SUFFIX of it (`3698-fix..` → `fix`), `rev-parse fix` found nothing, and the `continue`
+    # walked past the only range this arm can refuse. MEASURED with branch `3698-fix` at the attested
+    # head (i.e. `3698-fix..` is `3698-fix..HEAD`, an EMPTY range, 0 commits against 2 in the recorded
+    # range): rc 0, signed `clean`, while the same claim on a letter-initial ref (`fixtip..`, 20h76)
+    # was refused rc 3. `2026-11-08-notes` — a name shape this repo's own lanes produce — behaved
+    # identically. Leading digits are not a declared remainder; they were an undeclared hole, and a
+    # digit-initial alternative closes it for the whole class rather than for the examples measured.
     _eranges="$_claim"
-    while [[ "$_eranges" =~ (^|[^0-9A-Za-z_])([0-9a-fA-F]{4,40}|[Hh][Ee][Aa][Dd]|@\{[^}]+\}|@|[A-Za-z][A-Za-z0-9_/-]*)(${_dident}*)[[:space:]]*\.{2,3}[[:space:]]*([0-9a-fA-F]{4,40}|[Hh][Ee][Aa][Dd]|@|[A-Za-z][A-Za-z0-9_/-]*)((~[0-9]*|\^\{[^}]*\}|\^[0-9]*|@\{[^}]+\})*) ]]; do
+    while [[ "$_eranges" =~ (^|[^0-9A-Za-z_])([0-9a-fA-F]{4,40}|[Hh][Ee][Aa][Dd]|@\{[^}]+\}|@|[A-Za-z0-9_][A-Za-z0-9_/-]*)(${_dident}*)[[:space:]]*\.{2,3}[[:space:]]*([0-9a-fA-F]{4,40}|[Hh][Ee][Aa][Dd]|@|[A-Za-z0-9_][A-Za-z0-9_/-]*)((~[0-9]*|\^\{[^}]*\}|\^[0-9]*|@\{[^}]+\})*) ]]; do
       _elhs="${BASH_REMATCH[2]}${BASH_REMATCH[3]}"; _erhs="${BASH_REMATCH[5]}${BASH_REMATCH[6]}"
       _eranges="${_eranges#*"${BASH_REMATCH[0]}"}"
       # ⛔ THE REFUSAL QUOTES WHAT WAS WRITTEN, NOT A RECONSTRUCTION OF IT (twenty-second cycle, P2 —
@@ -2723,14 +2850,12 @@ $m"
       # `~`, `^` or `@{` (git-check-ref-format), so those continuations are the ONLY ones that make a
       # `head…` token the tip's WORD; every other `head…` token is a REF NAME and is left to the
       # resolution below, which already decides every token the arm cannot read by spelling.
-      case "$_elhs" in
-        [Hh][Ee][Aa][Dd]) _elhs='HEAD' ;;
-        [Hh][Ee][Aa][Dd][~^@]*) _elhs="HEAD${_elhs:4}" ;;
-      esac
-      case "$_erhs" in
-        [Hh][Ee][Aa][Dd]) _erhs='HEAD' ;;
-        [Hh][Ee][Aa][Dd][~^@]*) _erhs="HEAD${_erhs:4}" ;;
-      esac
+      # ⛔ A CASE VARIANT IS A REF NAME UNTIL THE REPO SAYS OTHERWISE — the twenty-third cycle's P2,
+      # measured on this arm pair: a tag `Head` at another commit was rewritten to the tip word here
+      # and the claim refused as an EMPTY range that was neither empty nor tip-rooted. `_tipvariant`
+      # asks git, exactly as the parser arm does; the resolution below then reads whatever it returns.
+      _elhs="$(_tipvariant "$_elhs")"
+      _erhs="$(_tipvariant "$_erhs")"
       # ⛔ THE FRAME IS THE ATTESTED HEAD, NOT THIS CHECKOUT (eighteenth cycle, P1 — MEASURED): the
       # equality below compared two shas resolved in the DELTA REPO, so when that checkout sat
       # anywhere other than the attested head, `@{0}` and `HEAD~0` resolved to THAT commit and
@@ -2827,15 +2952,17 @@ $m"
     # offered as evidence for a range that has commits. The arm already resolves every token it
     # cannot read by spelling (`*)` below), so admitting the token is the whole fix — the same one the
     # 20th cycle took one arm over, not another spelling test.
-    while [[ "$_opends" =~ (^|[^0-9A-Za-z_])([0-9a-fA-F]{4,40}|[Hh][Ee][Aa][Dd]|@\{[^}]+\}|@|[A-Za-z][A-Za-z0-9_/-]*)(${_dident}*)\.\.([^0-9A-Za-z_.]|$) ]]; do
+    # ⛔ THE OPERAND IS THE WHOLE RUN HERE TOO, LEADING DIGIT INCLUDED (twenty-third review cycle, P1 —
+    # MEASURED): letter-initial alternatives left `3698-fix..` (= `3698-fix..HEAD`, an EMPTY range)
+    # matched as the suffix `fix`, unresolved, and walked past by the `continue` below — rc 0 with a
+    # signed `clean`. See the two-endpoint arm above for the measurement and the class argument.
+    while [[ "$_opends" =~ (^|[^0-9A-Za-z_])([0-9a-fA-F]{4,40}|[Hh][Ee][Aa][Dd]|@\{[^}]+\}|@|[A-Za-z0-9_][A-Za-z0-9_/-]*)(${_dident}*)\.\.([^0-9A-Za-z_.]|$) ]]; do
       _olhs="${BASH_REMATCH[2]}${BASH_REMATCH[3]}"
       _opends="${_opends#*"${BASH_REMATCH[0]}"}"
-      # The same word-or-word-plus-selector rule as the two-endpoint arm above: a ref name that
-      # merely BEGINS with `head` is a ref name, not the tip's word (git-check-ref-format).
-      case "$_olhs" in
-        [Hh][Ee][Aa][Dd]) _olhs='HEAD' ;;
-        [Hh][Ee][Aa][Dd][~^@]*) _olhs="HEAD${_olhs:4}" ;;
-      esac
+      # The same word-or-word-plus-selector rule as the two-endpoint arm above, and the same git-decided
+      # case variant (`Head..` with a tag `Head` at another commit is not `HEAD..`): `_tipvariant`
+      # normalises only when the repo has no ref of that exact name (twenty-third cycle, P2).
+      _olhs="$(_tipvariant "$_olhs")"
       # The identity test comes first, exactly as in the two-endpoint arm: `HEAD`/`@`/`@{0}`/`@{now}`
       # WITH an identity-only chain denote the attested head itself, so `@{0}..` — the spelling this
       # arm was measured on — must not fall into the tip-split below (which strips a leading `@` and

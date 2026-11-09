@@ -5782,13 +5782,13 @@ fi
 #     → :2482 :4186 :6501 :6613, plus a comment mention at :2356) and the
 #     same four PREDICATE sites are at head
 #     (`grep -n 'grep -qxF' scripts/record-review.sh` prints all four PREDICATE lines at head —
-#     CITE-CHECK: :3209 :4935 :7305 :7479, plus a comment mention at :3078; `14.1c-CITE` below
+#     CITE-CHECK: :3336 :5062 :7432 :7606, plus a comment mention at :3205; `14.1c-CITE` below
 #     re-derives these numbers, so they cannot rot silently): in #3168's diff the only
-#     hunk at `post_marker()` (:3187) ADDS A COMMENT — this PR does not touch
+#     hunk at `post_marker()` (:3314) ADDS A COMMENT — this PR does not touch
 #     `post_marker()` at all — and the
-#     predicate line beside it (CITE-CHECK: :3209) is CONTEXT, not a change.
+#     predicate line beside it (CITE-CHECK: :3336) is CONTEXT, not a change.
 #     WHAT THE VECTOR BELOW ACTUALLY PINS: the BODY-APPEND site
-#     (`if ! grep -qxF -- "$MARKER" <<<"$BODY"`; on main at bd1b205d :6501 — at head CITE-CHECK: :7305). It is a
+#     (`if ! grep -qxF -- "$MARKER" <<<"$BODY"`; on main at bd1b205d :6501 — at head CITE-CHECK: :7432). It is a
 #     MAIN-REGRESSION pin — reverting this PR leaves 14.1c GREEN, and 14.10f is a
 #     main-regression pin for the same reason. Keeping them is right (main's
 #     anchoring should not silently regress); calling them evidence about this diff
@@ -5814,7 +5814,7 @@ fi
 #     `:6625` / `:6770` at `dc7e3ae99`, `:6634` / `:6779` at `921109de2` and `:6639` / `:6796` at
 #     `17551325e` as comment blocks were added above them, while the CITES beside them still read
 #     `:6625` / `:6770` at all three — that divergence IS the rot this paragraph describes — and at
-#     this head the predicates are `:7305` / `:7479` — CITE-CHECK: :7305 :7479 — re-derived by the
+#     this head the predicates are `:7432` / `:7606` — CITE-CHECK: :7432 :7606 — re-derived by the
 #     guard below, like every other head cite of a predicate). One
 #     lane's response was to delete the numbers — which removes the rot but also removes the
 #     reader's target. Both intents are kept here: the number stays, and it is CHECKED.
@@ -6716,14 +6716,14 @@ assert_eq "$REC_BEFORE_14B" "$(cat "$F_HOME/.pi/agent/reviews/daniel-ospina-agen
 #       not. `if command grep -qxF -- "$marker" <<<"$body"` is ALREADY `-qxF` on main
 #       (`git show bd1b205d:scripts/record-review.sh | grep -n 'grep -qxF'` — the sha is NAMED
 #       because `origin/main` moves and a bare "main :NNNN" rots the moment it does → :2482),
-#       and in #3168's diff the only hunk at `post_marker()` (head :3187) ADDS A COMMENT above
+#       and in #3168's diff the only hunk at `post_marker()` (head :3314) ADDS A COMMENT above
 #       it (this PR does not touch `post_marker()` at all) — the
-#       predicate line (head :3209) is CONTEXT. Reverting #3168 leaves this vector GREEN; it is kept
+#       predicate line (head :3336) is CONTEXT. Reverting #3168 leaves this vector GREEN; it is kept
 #       because main's anchoring should not silently regress, and it is labelled so the
 #       next reader does not mistake it for evidence about this diff. The predicate must
 #       match the gate's line-anchored `^…$` admission, exactly like the three other
 #       sites already anchored on main (bd1b205d :4186 :6501 :6613) — the same four that the grep
-#       above prints at head, CITE-CHECK: :4935 :7305 :7479 (`14.1c-CITE` re-derives the triple).
+#       above prints at head, CITE-CHECK: :5062 :7432 :7606 (`14.1c-CITE` re-derives the triple).
 #       ⛔ ASSERTS THE TRANSPORT (a PATCH was issued), not the exit code: the destructive
 #       mutant also exited 0.
 if [ -n "${QB_LINE:-}" ]; then
@@ -10212,7 +10212,11 @@ _71r_src="$(command sed -n '/_elhs=\"\${BASH_REMATCH\[2\]}\${BASH_REMATCH\[3\]}"
 # later reader can see what was wrong, and a whole-block scan would redden on that quotation.
 _71r_code="$(printf '%s\n' "$_71r_src" | command grep -vE '^[[:space:]]*#')"
 assert_eq "$([ -n "$_71r_code" ] && echo live || echo dead)" "live" "20h71 prerequisite: the arm's executing lines were captured (an empty capture would pass both assertions below)"
-assert_contains "$_71r_code" "[Hh][Ee][Aa][Dd][~^@]*) _elhs=" "20h71 the tip normalisation is the WORD or the WORD PLUS A SELECTOR, not a prefix rewrite"
+assert_contains "$_71r_code" '_elhs="$(_tipvariant "$_elhs")"' "20h71 the tip normalisation is ONE decision shared by the arms, not a per-arm case rewrite"
+_71r_tv="$(command sed -n '/^_tipvariant()/,/^}/p' "$RECORD" | command grep -vE '^[[:space:]]*#')"
+assert_eq "$([ -n "$_71r_tv" ] && echo live || echo dead)" "live" "20h71 prerequisite: the shared tip-variant decision was captured (an empty capture would pass below)"
+assert_contains "$_71r_tv" 'rev-parse --verify "$1^{commit}"' "20h71 …and it ASKS THE REPO about the exact case-sensitive name before normalising a case variant to the tip"
+assert_contains "$_71r_tv" '[Hh][Ee][Aa][Dd][~^@]*)' "20h71 …covering the word AND the word plus a selector, the class git-check-ref-format makes exclusive"
 assert_not_contains "$_71r_code" '_elhs:0:4' "20h71 …and the four-character prefix rewrite that laundered a ref name is GONE from the executing code"
 [ -f "$(Q2 $EH120)" ] && bad "20h71 FAIL-OPEN: a head-prefixed branch name laundered an empty range into a signed clean" || ok "20h71 no record was written"
 # THE FALSE-BLOCK CONTROL: narrowing the WORD test must not stop the arm admitting ref names — the
@@ -10448,6 +10452,136 @@ run_record_delta $EH141 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42539901" \
 I only actually reviewed headroom..; the rest was not read."
 assert_eq "$RECORD_RC" "3" "20h76b …and the same claim spelled with a 'head'-prefixed ref name (headroom..) (rc 3)"
 [ -f "$(Q2 $EH141)" ] && bad "20h76b FAIL-OPEN: a 'head'-prefixed ref name escaped the omitted-endpoint arm" || ok "20h76b no record was written"
+
+# 20h77 THE CONTINUATION CLASS IS GIT'S REF ALPHABET, NOT "WORD CHARACTERS PLUS TWO" (P1 — MEASURED).
+#       The parser's right-hand boundary was `[^0-9A-Za-z_/-]`, justified in the source as "`-` and `/`
+#       are the two characters that make a git ref name" — false: `git-check-ref-format` forbids only
+#       `~ ^ : ? * [ \` and space, so `+ = , ! $ % & ' ( ) ; < > @` are all legal INSIDE a name. So the
+#       boundary still terminated the token inside a legal ref and `head+1` (a branch at a MID commit)
+#       was truncated to the tip: `delta:<BASE>..head+1` recorded rc 0 with `"delta_range":"<BASE>..
+#       <HEAD>"` — a signed `clean` over the commits the artifact excluded — while the identical claim
+#       on a ref not named `head…` (`..mid+2`, same commit) was refused rc 3. `+ = $ % ! & @` are now
+#       continuations. 20h77b is the CONTROL and it is why the class cannot be widened by swallowing
+#       everything ref-legal: `; . , )` and quoting TERMINATE a token, and the ordinary honest
+#       artifact writes exactly those after its range.
+git -C "$DG" branch -f 'head+1' "$DG_A1" >/dev/null 2>&1 || true
+git -C "$DG" branch -f 'head@1' "$DG_A1" >/dev/null 2>&1 || true
+assert_eq "$(git -C "$DG" rev-parse 'head+1^{commit}' 2>/dev/null || true)" "$DG_A1" "20h77 setup: the fixture has a BRANCH named 'head+1' at a MID commit (git-check-ref-format: legal)"
+assert_eq "$(git -C "$DG" rev-parse 'head@1^{commit}' 2>/dev/null || true)" "$DG_A1" "20h77c setup: …and one named 'head@1' (the '@' continuation the tip's own brace syntax needs)"
+assert_eq "$([ "$DG_A1" != "$DG_HEAD" ] && echo mid || echo head)" "mid" "20h77 setup: those commits are NOT the attested head (otherwise the rows below are vacuous)"
+EH142=425400; rm -f "$(Q2 $EH142)"
+run_record_delta $EH142 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42540101" \
+    STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" \
+    STUB_EVIDENCE_BODY="I only actually reviewed delta:${DG_BASE}..head+1; the rest was not read."
+assert_eq "$RECORD_RC" "3" "20h77 a right endpoint whose REF NAME continues with '+' is not read as the tip — REFUSED (rc 3)"
+assert_contains "$RECORD_ERR" "cannot parse" "20h77 …and it gets the same refusal a non-'head' name gets, not a silent tip"
+[ -f "$(Q2 $EH142)" ] && bad "20h77 FAIL-OPEN: a '+' continuing a legal ref name was truncated to the tip and a signed clean covered the wide range" || ok "20h77 no record was written"
+EH143=425402; rm -f "$(Q2 $EH143)"
+run_record_delta $EH143 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42540301" \
+    STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" \
+    STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}, which is the whole delta (nothing else was skipped); no issues found."
+assert_eq "$RECORD_RC" "0" "20h77b CONTROL: a tip spelling followed by ordinary PUNCTUATION ('..<HEAD>,') is still the tip — ACCEPTED (rc 0)"
+[ -f "$(Q2 $EH143)" ] || bad "20h77b …a continuation class that swallowed prose punctuation would false-block the ordinary honest artifact (the error the class must not trade for)"
+EH144=425404; rm -f "$(Q2 $EH144)"
+run_record_delta $EH144 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42540501" \
+    STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" \
+    STUB_EVIDENCE_BODY="I only actually reviewed delta:${DG_BASE}..head@1; the rest was not read."
+assert_eq "$RECORD_RC" "3" "20h77c …and a name continuing with '@' is refused too — pre-fix head@{1} read as the bare tip word with its selector discarded (rc 3)"
+[ -f "$(Q2 $EH144)" ] && bad "20h77c FAIL-OPEN: an '@'-continuing ref name was truncated to the tip" || ok "20h77c no record was written"
+# ⛔ BUT `@` IS ALSO THE TIP'S OWN BRACE SYNTAX, AND THAT IS DECIDED, NOT SWALLOWED (twenty-third cycle,
+#       found by the commit verifier). Widening the continuation class to `@` made every `..HEAD@{…}`
+#       endpoint UNPARSEABLE — including `@{0}` and `@{now}`, the IDENTITY spellings this file protects
+#       (20h53/20h53b, 20h66: an artifact that merely NAMED one must not be told its range is wrong).
+#       The boundary now admits `@{…}` as a GROUP and decides it: identity braces are the attested
+#       head, any other POSITION is an elder commit (a narrowing written as an endpoint), and a
+#       symbolic brace is refused because an endpoint this code cannot evaluate is not a verified one.
+EH150=425416; rm -f "$(Q2 $EH150)"
+run_record_delta $EH150 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42541701" \
+    STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" \
+    STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..HEAD@{0}, which is the same commit; no issues found."
+assert_eq "$RECORD_RC" "0" "20h77d an IDENTITY reflog brace on the tip (..HEAD@{0}) is the attested head — ACCEPTED (rc 0)"
+[ -f "$(Q2 $EH150)" ] || bad "20h77d …and the identity spelling was made unparseable by the '@' continuation class (a false block)"
+EH151=425418; rm -f "$(Q2 $EH151)"
+run_record_delta $EH151 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42541901" \
+    STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" \
+    STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..HEAD@{1}, which is the previous tip position; no issues found."
+assert_eq "$RECORD_RC" "3" "20h77e …while an ELDER reflog position on the tip (..HEAD@{1}) ends somewhere else — REFUSED (rc 3)"
+assert_contains "$RECORD_ERR" "HEAD@{1}" "20h77e …and the refusal quotes the claim WITH its brace, not a reconstruction that drops it"
+[ -f "$(Q2 $EH151)" ] && bad "20h77e FAIL-OPEN: a reflog position was read as the tip and the older endpoint recorded as the wide range" || ok "20h77e no record was written"
+
+# 20h78 A REF NAME THAT BEGINS WITH A DIGIT (P1 — MEASURED). Both ref-name arms carried the
+#       LETTER-initial alternative `[A-Za-z][A-Za-z0-9_/-]*`, so a name beginning with a digit never
+#       entered the arm: the engine skipped past the run, matched a SUFFIX of it (`3698-fix..` →
+#       `fix`), resolved nothing, and `continue`d past the only range the arm can refuse. With the
+#       branch at the attested head, `3698-fix..` IS `3698-fix..HEAD` — 0 commits against 2 in the
+#       recorded range — and it recorded rc 0 with a signed `clean`, while the identical claim on a
+#       letter-initial ref (`fixtip..`, 20h76) was refused rc 3. `2026-11-08-notes` is the shape this
+#       repo's own lanes produce. Leading digits were not a declared remainder; they were a hole.
+git -C "$DG" branch -f '3698-fix' "$DG_HEAD" >/dev/null 2>&1 || true
+git -C "$DG" branch -f '2026-11-08-notes' "$DG_HEAD" >/dev/null 2>&1 || true
+assert_eq "$(git -C "$DG" rev-parse '3698-fix^{commit}' 2>/dev/null || true)" "$DG_HEAD" "20h78 setup: a DIGIT-initial branch sits AT the attested head (git-check-ref-format: legal)"
+assert_eq "$(git -C "$DG" rev-list --count '3698-fix..' 2>/dev/null || true)" "0" "20h78 setup: …so \`3698-fix..\` names ZERO commits — the narrowest claim there is"
+assert_eq "$([ "$(git -C "$DG" rev-list --count "$DG_BASE..$DG_HEAD" 2>/dev/null || true)" -gt 0 ] && echo commits || echo empty)" "commits" "20h78 setup: …against a recorded range that HAS commits (otherwise the vector measures nothing)"
+EH145=425406; rm -f "$(Q2 $EH145)"
+run_record_delta $EH145 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42540701" \
+    STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" \
+    STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
+I only actually reviewed 3698-fix..; the rest was not read."
+assert_eq "$RECORD_RC" "3" "20h78 an omitted endpoint on a DIGIT-initial ref at the attested head (3698-fix..) is an EMPTY range — REFUSED (rc 3)"
+assert_contains "$RECORD_ERR" "states an EMPTY range" "20h78 …and the refusal names the empty range, as the letter-initial control (20h76) does"
+[ -f "$(Q2 $EH145)" ] && bad "20h78 FAIL-OPEN: a digit-initial ref name was matched as a SUFFIX, resolved nothing, and an empty range minted a signed clean" || ok "20h78 no record was written"
+EH146=425408; rm -f "$(Q2 $EH146)"
+run_record_delta $EH146 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42540901" \
+    STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" \
+    STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
+I only actually reviewed 2026-11-08-notes..; the rest was not read."
+assert_eq "$RECORD_RC" "3" "20h78b …and the same for the date-shaped name this repo's lanes produce (2026-11-08-notes..) (rc 3)"
+[ -f "$(Q2 $EH146)" ] && bad "20h78b FAIL-OPEN: a date-shaped digit-initial ref escaped the omitted-endpoint arm" || ok "20h78b no record was written"
+EH147=425410; rm -f "$(Q2 $EH147)"
+run_record_delta $EH147 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42541101" \
+    STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" \
+    STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
+I only actually reviewed 3698-fix..HEAD; the rest was not read."
+assert_eq "$RECORD_RC" "3" "20h78c …and the TWO-endpoint spelling (3698-fix..HEAD) is refused by the other arm, so both arms admit the name"
+[ -f "$(Q2 $EH147)" ] && bad "20h78c FAIL-OPEN: the two-endpoint arm still skipped a digit-initial ref name" || ok "20h78c no record was written"
+
+# 20h79 A CASE VARIANT IS A REF NAME WHEN THE REPO HAS ONE (P2 — MEASURED, both arms). The two
+#       ref-name arms rewrote ANY four-character case variant of the tip to `HEAD` WITHOUT asking the
+#       repo — the class-5 defect the parser arm had already been fixed for (20h73d/20h73e). With a
+#       tag `Head` at an ORPHAN-CHILD commit (neither the head nor on its lineage, so `Head..HEAD`
+#       spans the whole main line and is emphatically not empty), an honest claim naming that ref was
+#       refused rc 3 as "states an EMPTY range … both endpoints resolve to the attested head" — false
+#       about the artifact in two ways at once, and the one place where the arms still disagreed about
+#       what an endpoint is. The decision is now git's, exactly as in the parser arm: resolve, and
+#       leave the token alone when a ref of that exact case-sensitive name exists.
+git -C "$DG" tag -f Head "$_dg_orphan2" >/dev/null 2>&1 || true
+assert_eq "$(git -C "$DG" rev-parse 'Head^{commit}' 2>/dev/null || true)" "$_dg_orphan2" "20h79 setup: a TAG whose name is a case variant of the tip exists, at the ORPHAN CHILD"
+_dg_hd=0; git -C "$DG" merge-base --is-ancestor "$_dg_orphan2" "$DG_HEAD" 2>/dev/null || _dg_hd=$?
+assert_eq "$_dg_hd" "1" "20h79 setup: …which is on no lineage of the attested head, so Head..HEAD is NOT an empty range"
+EH148=425412; rm -f "$(Q2 $EH148)"
+run_record_delta $EH148 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42541301" \
+    STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" \
+    STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
+I re-read Head..HEAD, i.e. from the ref 'Head' up to the head."
+assert_eq "$RECORD_RC" "0" "20h79 a case variant that IS a ref name is read as that ref, not rewritten to the tip — ACCEPTED (rc 0)"
+[ -f "$(Q2 $EH148)" ] || bad "20h79 …and an honest artifact was refused as an EMPTY range whose endpoints were neither empty nor tip-rooted (the false-block-and-false-sentence class)"
+EH149=425414; rm -f "$(Q2 $EH149)"
+run_record_delta $EH149 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42541501" \
+    STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" \
+    STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
+I re-read Head.. end to end."
+assert_eq "$RECORD_RC" "0" "20h79b …and the same in the OMITTED-endpoint arm (Head..), which rewrote it identically (rc 0)"
+[ -f "$(Q2 $EH149)" ] || bad "20h79b …and an honest omitted-endpoint claim on that ref was refused as HEAD..HEAD"
+# ⛔ THE TAG IS REMOVED AGAIN, DELIBERATELY: a ref named `Head` in the fixture is a LANDMINE for every
+# later vector that spells the tip, and leaving it behind is how a green corpus starts measuring the
+# fixture instead of the code. The cells that need it (M67/M68) CREATE IT THEMSELVES, on their own
+# terms — a terse `git tag -f Head` beside them rather than an inheritance from 200 lines up.
+git -C "$DG" tag -d Head >/dev/null 2>&1 || true
+assert_eq "$(git -C "$DG" rev-parse --verify 'Head^{commit}' >/dev/null 2>&1 && echo present || echo absent)" "absent" "20h79c the fixture does not keep a ref named 'Head' — a later tip-spelling vector must not inherit it"
+# THE OTHER DIRECTION IS 20h73e, and it must SURVIVE: where a ref of the variant's exact name DOES
+# exist at a non-head commit, the claim is a DIFFERENT range and is refused (rc 3). 20h73e runs that
+# row against the parser arm with the tag `head`; M61 pins it. So the resolution is not a widening —
+# it is the repo's own answer in both directions.
 # THE FALSE-BLOCK CONTROL for the widened operand class is 20h72c (`deltabase..` = the honest range,
 # rc 0) and 20h70d (`notes.txt..draft.md` = file patterns, rc 0): both run BEFORE this block, against
 # the SAME widened arm, so a token class that refuses an ancestor or a word that resolves to no
@@ -11407,7 +11541,7 @@ git -C "$DG" checkout -q pr >/dev/null 2>&1 || true
 #       ALONE decides: ACCEPTANCE. Without the `HEAD`/`@` alternatives the parser cannot see
 #       `BASE..HEAD` at all, the pair is never compared, `_any` stays 0, and an HONEST artifact is
 #       refused with "does not STATE the range" — a false block on the one spelling this arm adds.
-MUT="$(mk_mutant notipspell '[[:space:]]*([0-9a-fA-F]{4,40}|[Hh][Ee][Aa][Dd]|@)([^0-9A-Za-z_/-]|$) ]]; do' '[[:space:]]*([0-9a-fA-F]{4,40})([^0-9A-Za-z_/-]|$) ]]; do')"
+MUT="$(mk_mutant notipspell '[[:space:]]*([0-9a-fA-F]{4,40}|[Hh][Ee][Aa][Dd]|@)(@\{[^}]*\}|[^0-9A-Za-z_/+=$%!&@-]|$) ]]; do' '[[:space:]]*([0-9a-fA-F]{4,40})(@\{[^}]*\}|[^0-9A-Za-z_/+=$%!&@-]|$) ]]; do')"
 mut_check "M40 the tip spelling on the right of a parsed range" 425258 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42525901" refused STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..HEAD; no issues found."
 # M41 — THE TIP-RELATIVE SHAPE. Narrowing the shape test back to the literal `HEAD`/`head`/`@`
 #       list restores the pre-fix state exactly, so 20h50's `<head-sha>~1..<head-sha>` must be
@@ -11531,7 +11665,7 @@ I only actually reviewed @{0}~0..HEAD; the rest was not read."
 #       brace group), so `deltatip..HEAD` — a branch AT the attested head, i.e. zero commits — matches
 #       no arm and 20h70 records a SIGNED `clean`. The cell runs 20h70's own body, and the mutant must
 #       ACCEPT it. Anchored on the LHS occurrence only; the RHS one is followed by ` ]]`, not by `)~`.
-MUT="$(mk_mutant noerefname '|[A-Za-z][A-Za-z0-9_/-]*)(${_dident}*)' ')(${_dident}*)')"
+MUT="$(mk_mutant noerefname '|[A-Za-z0-9_][A-Za-z0-9_/-]*)(${_dident}*)' ')(${_dident}*)')"
 mut_check "M55 a SYMBOLIC endpoint is admitted as a TOKEN, so an empty range cannot hide behind a branch name" 425340 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42534101" accepted STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
 I only actually reviewed deltatip..HEAD; the rest was not read."
 # M56 — THE TIP SPLIT MATCHES ONLY THE CANONICAL TIP TOKEN (twenty-first cycle, P1). Widening the split
@@ -11592,14 +11726,14 @@ fi
 # M60 — THE PARSER'S RIGHT-HAND TOKEN BOUNDARY (P1). Removing the continuation group restores the
 #       prefix match exactly, so `..HEADER` — a ref NAME at a mid commit — is truncated to the tip,
 #       compared as `$to`, and the narrowed claim is ACCEPTED with a signed `clean`. 20h73b's body.
-MUT="$(mk_mutant notipboundary '([0-9a-fA-F]{4,40}|[Hh][Ee][Aa][Dd]|@)([^0-9A-Za-z_/-]|$) ]]; do' '([0-9a-fA-F]{4,40}|[Hh][Ee][Aa][Dd]|@) ]]; do')"
+MUT="$(mk_mutant notipboundary '([0-9a-fA-F]{4,40}|[Hh][Ee][Aa][Dd]|@)(@\{[^}]*\}|[^0-9A-Za-z_/+=$%!&@-]|$) ]]; do' '([0-9a-fA-F]{4,40}|[Hh][Ee][Aa][Dd]|@) ]]; do')"
 mut_check "M60 a tip spelling is a WHOLE token — the parser's right-hand boundary" 425378 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42537901" accepted STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="I only actually reviewed delta:${DG_BASE}..HEADER; the rest was not read."
 # M61 — THE CASE VARIANT IS RESOLVED, NOT ASSUMED (P1, second half). Rewriting the variant to the tip
 #       without asking the repo is the pre-fix arm: with a TAG named `head` at a mid commit, the claim
 #       `..head` covers the WIDE range. 20h73e's body (the tag exists by then — 20h73e creates it).
-MUT="$(mk_mutant nocasevariant '        [Hh][Ee][Aa][Dd])
-          _svsh="$(delta_git "$root" rev-parse --verify "${_stcmp}^{commit}" 2>/dev/null || true)"
-          if [ -n "$_svsh" ]; then _stcmp="$_svsh"; else _stcmp="$to"; fi ;;' '        [Hh][Ee][Aa][Dd]) _stcmp="$to" ;;')"
+MUT="$(mk_mutant nocasevariant '          [Hh][Ee][Aa][Dd])
+            _svsh="$(delta_git "$root" rev-parse --verify "${_straw}^{commit}" 2>/dev/null || true)"
+            if [ -n "$_svsh" ]; then _stcmp="$_svsh"; else _stcmp="$to"; fi ;;' '          [Hh][Ee][Aa][Dd]) _stcmp="$to" ;;')"
 mut_check "M61 a case variant of the tip is RESOLVED first — a mid-commit ref of that name is a DIFFERENT range" 425384 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42538501" accepted STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..head; no issues found."
 # M62/M63 — THE OPERAND'S ANCESTRY IS MEASURED, NOT ASSUMED (P2 x2). Collapsing the discriminator
 #       back to "any resolved operand narrows" is the pre-fix arm: the acceptance vectors are the ones
@@ -11618,9 +11752,41 @@ reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found."
 # M64 — A REF NAME IS AN OPERAND IN THE OMITTED-ENDPOINT ARM TOO (P1). Removing the ref-name
 #       alternative restores the arm that decided the SAME claim the other way: `deltatip..` (a branch
 #       at the attested head) matches nothing and mints a signed `clean` over the wide range. 20h76.
-MUT="$(mk_mutant noomittedrefname '|@|[A-Za-z][A-Za-z0-9_/-]*)(${_dident}*)\.\.([^0-9A-Za-z_.]|$) ]]; do' '|@)(${_dident}*)\.\.([^0-9A-Za-z_.]|$) ]]; do')"
+MUT="$(mk_mutant noomittedrefname '|@|[A-Za-z0-9_][A-Za-z0-9_/-]*)(${_dident}*)\.\.([^0-9A-Za-z_.]|$) ]]; do' '|@)(${_dident}*)\.\.([^0-9A-Za-z_.]|$) ]]; do')"
 mut_check "M64 a REF NAME is an endpoint in the OMITTED-endpoint arm, not only in the two-endpoint one" 425396 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42539701" accepted STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
 I only actually reviewed deltatip..; the rest was not read."
+# M65 — THE CONTINUATION CLASS IS REF-ALPHABET, NOT PUNCTUATION (P1, twenty-third cycle). Narrowing the
+#       boundary back to `[^0-9A-Za-z_/-]` restores the pre-fix parser: `..head+1` — a branch at a MID
+#       commit — is truncated to the tip, compared as `$to`, and the narrowed claim is ACCEPTED with a
+#       signed `clean`. 20h77's body, and 20h77b is the control that keeps the fix from being widened
+#       into a false block.
+MUT="$(mk_mutant notiprefalpha '([0-9a-fA-F]{4,40}|[Hh][Ee][Aa][Dd]|@)(@\{[^}]*\}|[^0-9A-Za-z_/+=$%!&@-]|$) ]]; do' '([0-9a-fA-F]{4,40}|[Hh][Ee][Aa][Dd]|@)(@\{[^}]*\}|[^0-9A-Za-z_/-]|$) ]]; do')"
+mut_check "M65 a ref-legal continuation ('+') keeps the token a NAME — the parser's continuation class" 425400 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42540101" accepted STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="I only actually reviewed delta:${DG_BASE}..HEAD+1; the rest was not read."
+# M66 — A DIGIT-INITIAL REF NAME IS AN OPERAND (P1, twenty-third cycle). Restoring the letter-initial
+#       alternative makes the arm skip `3698-fix..` (matching the suffix `fix`, resolving nothing,
+#       `continue`ing) and mint a signed `clean` over an EMPTY range. 20h78's body.
+MUT="$(mk_mutant nodigitoperand '|@|[A-Za-z0-9_][A-Za-z0-9_/-]*)(${_dident}*)\.\.([^0-9A-Za-z_.]|$) ]]; do' '|@|[A-Za-z][A-Za-z0-9_/-]*)(${_dident}*)\.\.([^0-9A-Za-z_.]|$) ]]; do')"
+mut_check "M66 a ref name is an operand whatever its first character — the digit-initial class in the omitted-endpoint arm" 425406 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42540701" accepted STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
+I only actually reviewed 3698-fix..; the rest was not read."
+# M67/M68 — A CASE VARIANT IS DECIDED BY THE REPO, IN THE REF-NAME ARMS TOO (P2, twenty-third cycle).
+#       Replacing the `_tipvariant` call with the unconditional rewrite is the pre-fix arm: with the tag
+#       `Head` at an orphan-child commit, `Head..HEAD` (a range that spans the whole main line) is
+#       rewritten to `HEAD..HEAD` and refused as EMPTY. Both cells must REFUSE under the mutant and
+#       ACCEPT at head, and they are the acceptance direction because a refusal vector cannot see a
+#       widened arm (the M62 precedent).
+MUT="$(mk_mutant nocasevariantlhs '_elhs="$(_tipvariant "$_elhs")"' 'case "$_elhs" in [Hh][Ee][Aa][Dd]) _elhs="HEAD" ;; esac')"
+if git -C "$DG" rev-parse --verify 'Head^{commit}' >/dev/null 2>&1; then bad "M67 prerequisite: the fixture already carries a ref named 'Head' — 20h79c asserts it does not, so this cell creates its own"; fi
+git -C "$DG" tag -f Head "$_dg_orphan2" >/dev/null 2>&1 || true
+mut_check "M67 a case variant in the two-endpoint arm is a REF NAME when one of that name exists" 425412 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42541301" refused STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
+I re-read Head..HEAD, i.e. from the ref 'Head' up to the head."
+MUT="$(mk_mutant nocasevariantends '_olhs="$(_tipvariant "$_olhs")"' 'case "$_olhs" in [Hh][Ee][Aa][Dd]) _olhs="HEAD" ;; esac')"
+mut_check "M68 …and the same in the OMITTED-endpoint arm (Head..)" 425414 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42541501" refused STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
+I re-read Head.. end to end."
+# M69 — A BRACE ON THE TIP IS A SELECTOR, AND IT IS DECIDED (twenty-third cycle). Removing the brace
+#       group from the boundary makes `..HEAD@{0}` unparseable again — the identity spelling the fix
+#       restores — so the cell must REFUSE under the mutant and the shipped vector accepts.
+MUT="$(mk_mutant nobraceboundary '(@\{[^}]*\}|[^0-9A-Za-z_/+=$%!&@-]|$) ]]; do' '([^0-9A-Za-z_/+=$%!&@-]|$) ]]; do')"
+mut_check "M69 an IDENTITY reflog brace on the tip is the attested head — the brace is a selector group, not a name character" 425416 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42541701" refused STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..HEAD@{0}, which is the same commit; no issues found."
 # ⛔ THE EMPTY-RANGE ARM'S RIGHT-HAND SELECTOR AND THE QUOTE-THE-TEXT MESSAGE (P2) HAVE NO CELL, AND
 #       THAT IS STATED RATHER THAN LEFT TO A LATER READER: reverting either one still REFUSES the same
 #       claim (the tip arm catches `HEAD..HEAD~1`), so no rc-based cell can distinguish them — a cell
