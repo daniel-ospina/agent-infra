@@ -1,0 +1,11 @@
+name: fixture caller-bound-empty — a fully bounded callee
+on:
+  workflow_call:
+jobs:
+  inner:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: work
+        timeout-minutes: 5
+        run: echo hi

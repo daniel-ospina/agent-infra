@@ -1,0 +1,10 @@
+name: fixture caller-bound-empty — a call job whose bound is EMPTY
+on:
+  pull_request:
+jobs:
+  calls-inner:
+    # The schema rejects the KEY, so an empty value fails the run just as a valid one does. If the guard
+    # reads this as a validity test instead of a presence test, the bound falls through and the file is
+    # certified GREEN through the callee — a false pass (review finding, P3).
+    uses: ./.github/workflows/callee.yml
+    timeout-minutes:

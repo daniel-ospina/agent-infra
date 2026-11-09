@@ -91,6 +91,12 @@
 #      everywhere and still pass.
 # 34. REFUSAL — a `--root` with no `.github/workflows` is exit 2 with a NAMED reason (ENOENT). The header
 #      claims this refusal and no arm exercised it; a mutant replaced it with a raw node:fs stack.
+# 35. FIXTURE — a CALL job's bound is refused on PRESENCE, not on its value: an EMPTY value is rejected by
+#      GitHub's caller schema too, and reading it as a validity test certified the file through the callee.
+# 36. FIXTURES — three NOTE gates that must not fire on the wrong shape: a 0-step job gets no step-budget
+#      note, a step bound EQUAL to J is still "unreachable", and a fully step-bounded job gets no JOB note.
+# 37. FIXTURE + USAGE — the zero-step violation wording (no empty `()`), `--root` with no value, and an
+#      unknown argument: all exit 2 rather than silently auditing something else.
 #
 # HERMETIC: fixtures + temp copies only; no network, no gh, no clock. The live tree is READ, never
 # written (the temp copy is where the mutations land).
@@ -542,6 +548,48 @@ rc=$?
 grep -q 'REFUSING — cannot read' "$ERR" && ok "the refusal is NAMED, not a raw node stack" \
   || no "the missing directory surfaced as an unnamed failure"
 grep -q 'ENOENT' "$ERR" && ok "the reason is carried (ENOENT)" || no "the errno is not reported"
+
+echo "== 35. FIXTURE: a CALL job's bound is refused on PRESENCE, not on its value being valid"
+# Arm 8 plants a VALID value, which satisfies both a presence test and a validity test. An empty value is
+# rejected by GitHub's caller schema just the same — and reading it as a validity test let it fall through
+# and certify the file GREEN through the callee (review finding, P3, mutant M15 stayed green).
+run_case caller-bound-empty
+[ "$rc" -eq 1 ] && ok "caller-bound-empty (empty bound on a call job) → rc 1" \
+  || no "caller-bound-empty → rc $rc, expected 1 (a call-job bound fell through and certified via the callee)"
+grep -q 'declares timeout-minutes on a reusable-workflow CALL job' "$ERR" \
+  && ok "the finding names the call-job schema" || no "the call-job refusal does not fire"
+
+echo "== 36. FIXTURE: three NOTE gates that must not fire on the wrong shape"
+run_case job-no-steps-expression
+[ "$rc" -eq 0 ] && ok "job-no-steps-expression (0 steps, expression J) → rc 0" \
+  || no "job-no-steps-expression → rc $rc, expected 0 (a 0-step job has no step budget to check)"
+grep -q 'EXPRESSION job bound' "$OUT" \
+  && no "a 0-step job is told 'every step carries a bound'" \
+  || ok "no step-budget note is emitted for a job with NO steps"
+run_case job-bound-stranded-equal
+[ "$rc" -eq 0 ] && ok "job-bound-stranded-equal (step bound = J) → rc 0" || no "job-bound-stranded-equal → rc $rc, expected 0"
+grep -q '1 step bound(s) here are at or above 20 min and can never fire' "$OUT" \
+  && ok "the equality edge IS reported ('at or above', so >= not >)" \
+  || no "a step bound EQUAL to the job bound is not reported as unreachable"
+run_case job-bound-all-steps-bounded
+[ "$rc" -eq 0 ] && ok "job-bound-all-steps-bounded → rc 0" || no "job-bound-all-steps-bounded → rc $rc, expected 0"
+grep -q 'is bounded only at the JOB level' "$OUT" \
+  && no "a fully step-bounded job is told it is 'bounded only at the JOB level'" \
+  || ok "no JOB-level note on a job whose every step is bounded"
+
+echo "== 37. FIXTURE + USAGE: the zero-step violation wording, and the two usage refusals"
+run_case no-bound-no-steps
+[ "$rc" -eq 1 ] && ok "no-bound-no-steps → rc 1" || no "no-bound-no-steps → rc $rc, expected 1"
+grep -q 'declares no timeout-minutes at all' "$ERR" && ok "the violation fires" || no "the violation does not fire"
+grep -q 'NOT every step is bounded either ()' "$ERR" \
+  && no "the zero-step violation emits an empty parenthetical" \
+  || ok "the zero-step arm uses its own wording, not an empty ()"
+node "$GUARD" --root >"$OUT" 2>"$ERR"; rc=$?
+[ "$rc" -eq 2 ] && ok "--root with no value → rc 2" || no "--root with no value → rc $rc, expected 2 (it audited something else)"
+grep -q -- '--root needs a directory' "$ERR" && ok "the refusal names the flag" || no "the refusal does not name the flag"
+node "$GUARD" --bogus >"$OUT" 2>"$ERR"; rc=$?
+[ "$rc" -eq 2 ] && ok "an unknown argument → rc 2" || no "an unknown argument → rc $rc, expected 2"
+grep -q 'unknown argument' "$ERR" && ok "the refusal names the argument" || no "the refusal does not name the argument"
 
 echo
 if [ "$fail" -eq 0 ]; then
