@@ -144,6 +144,27 @@ That is contention, not staleness. Splitting `MEMORY.md`, deriving `run-bash-sha
 (#2609 says the same), and regenerating `workflow-lock.json` mechanically (#1170) removes
 the queue's actual cause. A rebase bot cannot.
 
+**Update 2026-11 (#1955):** the lock row is FIXED, not worked around, and the fix is not
+a regeneration lane (#1170's option 3). `scripts/workflow-lock.json` was one file holding
+one hash per workflow, so two branches editing a locked workflow always rewrote the same
+line — even in different jobs, and neither side's value is right for the merged tree. The
+lock is now region-keyed (`scripts/workflow-lock.d/`, one file per top-level key and per
+job), so two branches editing different regions touch different FILES and merge clean with
+the merged lock already green. Reproduced both ways before and after: the cross-job case
+conflicts on the lock alone before, and merges clean after; the same-job case still
+conflicts, on the real content plus that one region — which is the irreducible bound (a
+per-branch record of current content is wrong at the merge result whenever both sides
+change the same region).
+
+Two details a conflicted branch does NOT need to reason about, and one it does. (1) The
+lock is `scripts/workflow-lock.d/` — a surviving `scripts/workflow-lock.json` is the
+modify/delete conflict this change leaves behind, nothing reads it, and both the check and
+`--update-lock` now name it and remove it. (2) Each region file records its
+predecessor/successor region name beside its digest, because a digest set cannot see a
+whole-block MOVE. (3) The consequence, if the conflict involves re-ordering or adding a
+region: the entries on either side of it move too, so expect 2–3 region files in that
+case rather than one — still less than "every edit to this workflow rewrites one line".
+
 ## Re-measurement (independent, 2 h later, on a different population)
 
 The decision above rests on one sample, so it was re-taken at 2026-10-24T17:00Z by a

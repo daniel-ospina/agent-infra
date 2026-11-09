@@ -919,7 +919,10 @@ BOUNCE_TAIL = (
 
 
 REGISTRY = f"{HOME}/.pi/agent/state/lane-registry.tsv"
-CMUX_DISPATCH = f"{HOME}/Documents/GitHub/tortoise/tools/cmux_dispatch.py"
+# ⛔ NO `CMUX_DISPATCH` CONSTANT HERE (#1957): it named a path into ANOTHER checkout and nothing in
+# this module read it (measured: the only occurrence of the name was its own assignment). See the same
+# note in `turn-end.py`; the live send path is `safe-send.sh`, which RESOLVES the producer from an
+# ordered candidate list (`scripts/lib/cmux-dispatch-path.sh`).
 
 
 def _iso(e):

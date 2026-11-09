@@ -76,12 +76,13 @@
 /scripts/check-staged-skill-frontmatter.mjs @daniel-ospina
 
 # Pin-gate wiring surfaces (#666/#675). check-workflow-lock.mjs byte-hashes the
-# pin-gate workflows against workflow-lock.json — the content lock that replaced
-# modelling GitHub Actions execution semantics. workflow-yaml.mjs is the
+# pin-gate workflows against the region-keyed lock in workflow-lock.d/ (#1955) —
+# the content lock that replaced modelling GitHub Actions execution semantics.
+# workflow-yaml.mjs is the
 # dependency-free YAML reader the lock and the wiring guard both parse with; a
 # weakened reader is a weakened guard (its fail-open was #675's P1).
 /scripts/check-workflow-lock.mjs          @daniel-ospina
-/scripts/workflow-lock.json               @daniel-ospina
+/scripts/workflow-lock.d/                  @daniel-ospina
 /scripts/workflow-yaml.mjs                @daniel-ospina
 
 # Review-record writer + the in-session gates that consume its verdict

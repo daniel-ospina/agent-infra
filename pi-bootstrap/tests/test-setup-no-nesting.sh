@@ -394,6 +394,12 @@ check_fleet_srcs_farmed() {
 #       a file from ANOTHER checkout — `session-postmortem.sh:27` (eldato's `scripts/`) and
 #       `safe-send.sh:146` (tortoise's `tools/cmux_dispatch.py`), which is WHY this form is
 #       directory-agnostic. The farm cannot deliver these, so they are DISCLOSED, never silently absorbed.
+#       ⛔ BOTH live instances have now LEFT this class by being FIXED, not by the form narrowing: #1921
+#       vendored the postmortem producer as a `lib:` sibling, and #1957 replaced `safe-send.sh`'s single
+#       absolute literal with an ordered CANDIDATE LIST (`scripts/lib/cmux-dispatch-path.sh`) whose first
+#       entry is the FARM DESTINATION — so the derivation now reports `script:cmux_dispatch.py`
+#       (undelivered here, disclosed with an owner) instead of a `foreign:` path one box happens to have.
+#       The form stays: the class can reappear in any farmed consumer, and a path DOCUMENTED counts.
 #
 # ⛔ ONE CLASSIFIER, NOT SIX. Every form whose match is a BARE RELATIVE NAME funnels it through
 # `_producer_kind` (F4, F4b, F4c, F5, F7, F8), so `lib/<n>` means `lib:` and `<sub>/<n>` means `other:` in all
@@ -453,11 +459,18 @@ LANE_PRODUCERS_STATE_RESIDUAL="lane-confirm.py:#1797 lane-triage.py:#1553 lane-v
 # was replaced by a one-line "not found" note, on every box but the owner's (#1921) — #1921 VENDORED
 # that producer as `scripts/lib/transcript-patterns.sh` and the consumer now resolves it as a SIBLING,
 # so the site is gone and with it the `foreign:postmortem.sh` entry: the producer is `lib:` now, not
-# foreign. `safe-send.sh:146` runs a CROSS-CHECKOUT `…/tortoise/tools/cmux_dispatch.py` — and this
+# foreign. `safe-send.sh:146` ran a CROSS-CHECKOUT `…/tortoise/tools/cmux_dispatch.py` — and this
 # class's first form required the
 # parent directory to be `scripts/`, so that one was invisible while the line above claimed the class was
-# complete: the widening is #1957's, and it is why the form is directory-agnostic now.
-LANE_PRODUCERS_FOREIGN_RESIDUAL="cmux_dispatch.py:#1957 orch-loop.sh:#2413"
+# complete: the widening is #1899's (PR #1958), and it is why the form is directory-agnostic now.
+# ⛔ #1957 then REMOVED that site — the second member to leave this class by being FIXED: the consumer
+# resolves the producer from an ordered candidate list (`scripts/lib/cmux-dispatch-path.sh`) whose first
+# entry is the FARM DESTINATION, so the derivation reports `script:cmux_dispatch.py` (delivered by no
+# array HERE, disclosed in `LANE_PRODUCERS_EXEMPT` with #1957 — the same disposition `ai_pr_status.py`
+# has, because this repo does not contain the file and no array can carry it). A missing producer is now
+# REFUSED with the full list of paths tried, in place of running an interpreter against a literal that
+# only one box happened to have.
+LANE_PRODUCERS_FOREIGN_RESIDUAL="orch-loop.sh:#2413"
 # `orch-loop.sh` joined this class on 2026-11-06 with agent-infra#2413 (PR #3413). It is NOT a delivered
 # producer and NOT a farm gap this PR can close: the entry comes from `watchdog-loop.sh`'s own MEASURED
 # example of where the controller lives on a Mac — `bash /home/cmux/harness/<sha>/scripts/
@@ -521,7 +534,7 @@ LANE_PRODUCERS_FOREIGN_RESIDUAL="cmux_dispatch.py:#1957 orch-loop.sh:#2413"
 # `setup.sh` then delivers. That was the in-file "natural remedy for a false block is to widen the
 # exemption list, i.e. to weaken the gate" hazard firing for real. The branch now consults every flat
 # array `FARM_ARRAYS` names.
-LANE_PRODUCERS_EXEMPT="lane-status.py:#1553 heartbeat-loop.sh:#1553 install-ci-runner-x64.sh:#2403 runner_autoscale.py:#2403 repo-target.sh:#3174 ai_pr_status.py:#2413"
+LANE_PRODUCERS_EXEMPT="lane-status.py:#1553 heartbeat-loop.sh:#1553 install-ci-runner-x64.sh:#2403 runner_autoscale.py:#2403 repo-target.sh:#3174 ai_pr_status.py:#2413 cmux_dispatch.py:#1957"
 # A ROOT of the derivation rather than a producer found by it: `heartbeat-loop.sh` is run by a launchd job
 # on the owner's box (no plist template in this repo names it; the label `com.tortoise.heartbeat-loop`
 # appears only in a comment at scripts/lane-status.py:41) and NO farmed consumer execs it (measured at
@@ -662,10 +675,10 @@ script:reap-lane-venvs.sh script:record-review.sh script:registry-sync.sh script
 script:runner_autoscale.py script:session-postmortem.sh script:tortoise_graph_client.py
 script:turn-classify.py script:turn-end.py script:undelivered-answers.py script:venv-real-cost.py
 script:watch-truncation.sh script:wip-sweep.sh
-lib:beat-pair.sh lib:bounded.sh lib:cmux_payload.py lib:diff-normalize.py lib:live-paths.sh
+lib:beat-pair.sh lib:bounded.sh lib:cmux-dispatch-path.sh lib:cmux_payload.py lib:diff-normalize.py lib:live-paths.sh
 lib:pid-identity.sh lib:transcript-patterns.sh
 state:lane-confirm.py state:lane-triage.py state:lane-verdict.py
-foreign:cmux_dispatch.py foreign:orch-loop.sh
+script:cmux_dispatch.py foreign:orch-loop.sh
 other:orchestrator-harness/brief-gate.sh other:orchestrator-harness/capacity.sh
 other:orchestrator-harness/cloud-cell-doctor.sh
 "
@@ -782,7 +795,15 @@ other:orchestrator-harness/cloud-cell-doctor.sh
 #
 # `lib:transcript-patterns.sh` joined on 2026-10-17 (#1921) and `foreign:postmortem.sh` LEFT in the
 # same landing, which is the derivation doing its job: the exec site did not vanish, it CHANGED KIND —
-# the consumer now execs a sibling that `lib_srcs` farms, and the old foreign reference is gone. A
+# the consumer now execs a sibling that `lib_srcs` farms, and the old foreign reference is gone.
+# ⛔ THE SAME THING HAPPENED AGAIN IN #1957, and it is the reason `script:cmux_dispatch.py` is here and
+# `foreign:cmux_dispatch.py` is not: `scripts/safe-send.sh` stopped naming one checkout's absolute path
+# and now resolves the producer from an ordered candidate list in `scripts/lib/cmux-dispatch-path.sh`
+# (a new `lib:` entry, DELIVERED by `lib_srcs`) whose FIRST candidate is the farm destination. So the
+# derivation sees the producer at `$DEST/scripts/cmux_dispatch.py` — a place a delivery CAN arrive, and
+# one this repo cannot fill (the file is tortoise's) — which is exactly the `LANE_PRODUCERS_EXEMPT`
+# disposition `ai_pr_status.py` already has. ⛔ It is NOT a delivery and NOT a re-pin: nothing here farms
+# it, and the consumer refuses loudly (naming every path it tried) when no candidate exists.
 # agent-infra#1874 (the lane-table dispatcher's retirement) removed FIVE entries in one landing, and
 # each was verified against the CODE rather than accepted from the diff — the pin's own warning:
 #   * `script:queue-dispatch.py` — the file MOVED to `scripts/orchestrator-harness/retired/`; it is
@@ -961,9 +982,14 @@ _producer_scan() { # <file> -> "<kind>:<name>" lines
     | sed -E 's|^\$\{?[A-Z_]+\}?/||' | while IFS= read -r line; do _producer_kind "$line" state; done
   # F6 — an ABSOLUTE path OUTSIDE the agent dir: another checkout's file. ANY directory, not just `scripts/`:
   # the first version of this form hardcoded `<…>/scripts/<n>` and therefore could not see
-  # `scripts/safe-send.sh:146`, which runs `…/tortoise/tools/cmux_dispatch.py` — a producer in a DIFFERENT
+  # `scripts/safe-send.sh:146`, which ran `…/tortoise/tools/cmux_dispatch.py` — a producer in a DIFFERENT
   # checkout, in no farm array, undisclosed, while the gate printed `DECLARED-FOREIGN: … 1` as if that were the
   # whole class (#1957). A cross-checkout `tools/`, `bin/` or `lib/` is the same failure as `scripts/`.
+  # ⛔ NO LIVE SITE USES THIS FORM TODAY (#1957 removed the last one — safe-send.sh now resolves the
+  # producer from a candidate list, so the entry it contributes is `script:cmux_dispatch.py` at the FARM
+  # DESTINATION). It is KEPT for the same reason F8 is: the class can reappear in any farmed consumer, and
+  # a scanner that had to be re-widened to see it would report `0 undelivered-and-undisclosed` meanwhile —
+  # #1899's own failure shape. Its probe below (`foreign:orch-loop.sh`) keeps it non-inert.
   # BOTH agent dirs are excluded — F3 owns `agent/scripts/<n>` and `agent/state/<p>`, so the state producer
   # (`lane-confirm.py`, orchestrator-heartbeat.sh:336) does not also surface here as a duplicate `foreign:`.
   { grep -ohE '/(Users|home)/[A-Za-z0-9_./-]+/[A-Za-z0-9_-]+\.(py|sh)' "$f" 2>/dev/null || true; } \

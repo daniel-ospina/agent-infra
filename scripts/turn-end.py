@@ -102,7 +102,13 @@ MARK_DIR = f"{STATE}/turn-end"
 KILL = f"{STATE}/HEARTBEAT-OFF"
 NUDGE_KILL = f"{STATE}/LANE-NUDGE-OFF"
 LOCK = f"{STATE}/turn-end.lock"
-CMUX_DISPATCH = (f"{HOME}/Documents/GitHub/tortoise/tools/cmux_dispatch.py")
+# ⛔ NO `CMUX_DISPATCH` CONSTANT HERE (#1957). This module used to define
+# `f"{HOME}/Documents/GitHub/tortoise/tools/cmux_dispatch.py"` — a path into ANOTHER checkout, and a
+# DEAD one: nothing in this file ever read it (measured: the only occurrence of the name was its own
+# assignment). A dead copy of that literal is not harmless, it is a decoy — it tells the next reader
+# this nudger dispatches through tortoise's tool, and it carries the same Mac-shaped assumption that
+# made `safe-send.sh`'s send path dead on every box but the owner's. The live send path is
+# `safe-send.sh`, which now RESOLVES the producer (`scripts/lib/cmux-dispatch-path.sh`).
 
 # A lane must have been quiet this long before we speak. Below it, a lane that has
 # simply paused between tool calls would be interrupted.

@@ -199,7 +199,7 @@ jobs:
         # ci-main.yml's extension leg said so outright ("pipeline-compliance.yml
         # is also PR-triggered, but runs no test suite"). That line is now stale,
         # and this step is what makes it so; it is not corrected here because
-        # ci-main.yml is pinned in scripts/workflow-lock.json and a comment
+        # ci-main.yml is pinned in scripts/workflow-lock.d/ and a comment
         # tweak would force a lock re-derivation. (Cited by its TEXT, not by a
         # line number: the coordinate had already rotted from :98 to :55-56 to
         # :155 as its neighbours moved, and a number that rots argues for the
