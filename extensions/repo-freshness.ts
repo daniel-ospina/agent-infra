@@ -48,7 +48,7 @@
 // extension.
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { execSync } from "node:child_process";
+import { execFileSync, execSync } from "node:child_process";
 import { existsSync, realpathSync } from "node:fs";
 import { isPrintMode } from "./shared/print-mode.js";
 import { execFileAsync, type ExecFn } from "./session-checks.js";
@@ -180,6 +180,54 @@ export function aheadCount(cwd: string, branch: string): number {
 
 export function repoClean(cwd: string): boolean {
   return tryGit(cwd, "status --porcelain") === "";
+}
+
+/**
+ * #2105 P1 — the REPORT-TIME reader, and it is deliberately a SEPARATE mechanism
+ * from `git()` above.
+ *
+ * `git()` interpolates `repo` into an `/bin/sh` command string
+ * (`` `git -C "${repo}" ${args}` ``). That is safe only while every `repo` is a
+ * path this module chose. `syncRepoState` broke that assumption: its `cwd` is the
+ * `task` tool's CALLER-SUPPLIED `cwd`, so a cwd containing `$(…)`, backticks or
+ * `;` was shell-expanded **in the parent process** — the one holding the fleet's
+ * credentials — on the first read that happens after a child has settled
+ * (child → parent execution). `taskCwdRefusal` rejects only NUL and
+ * non-directories, so the metacharacters reached the shell intact.
+ *
+ * The fix is the MECHANISM, not a denylist: argv form has no shell, so there is
+ * nothing to enumerate and nothing to escape. `asyncRepoState` always probed the
+ * same value this way (`exec("git", ["-C", cwd, …])` → `execFile`); this makes
+ * the sync twin match it.
+ *
+ * ⛔ NO `.trim()` HERE, for the second half of the same finding. `git()` trims,
+ * and porcelain-v1 `-z` entries are `XY<space>PATH\0` where `X` is a SPACE for
+ * every unstaged change. Trimming ate the `X` column of the FIRST entry only, so
+ * `parsePorcelainZ`'s `slice(3)` was one character out of alignment
+ * (`" M a.txt"` → `".txt"`), and a worktree whose sole change was a 1-character
+ * path parsed to `[]` → `dirty=false`. That is precisely the fabricated clean
+ * this whole change exists to prevent, so the reader returns stdout VERBATIM and
+ * each caller trims only the scalar fields it knows are line-oriented.
+ *
+ * `maxBuffer` matches `execFileAsync`'s 32 MiB. `execSync`'s 1 MiB default could
+ * throw on a tree the size of this repo's, turning an observed tree into
+ * `dirty=unknown` (fail-safe, but a silent loss of the reading).
+ */
+function gitArgv(cwd: string, args: string[], opts: { timeout?: number } = {}): string {
+  return execFileSync("git", ["-C", cwd, ...args], {
+    encoding: "utf-8",
+    timeout: opts.timeout ?? 10_000,
+    maxBuffer: 32 * 1024 * 1024,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+}
+
+function tryGitArgv(cwd: string, args: string[], opts: { timeout?: number } = {}): string | null {
+  try {
+    return gitArgv(cwd, args, opts);
+  } catch {
+    return null;
+  }
 }
 
 /** Shell-quote a path for execSync interpolation (single-quote wrap + escape). */
@@ -355,7 +403,13 @@ export interface RepoState {
 
 /** Parse `git status --porcelain -z`: entries are `XY<space>PATH`,
  * NUL-terminated; rename/copy entries are followed by a second NUL-terminated
- * ORIG_PATH which must not be counted as a changed path. */
+ * ORIG_PATH which must not be counted as a changed path.
+ *
+ * ⛔ THE INPUT MUST BE UNTRIMMED (#2105 review P2). `X` is a SPACE for every
+ * unstaged change, so a trimmed string loses the first entry's `X` column and
+ * `slice(3)` returns a truncated path — `" M a.txt"` → `".txt"`, and a sole
+ * 1-character path (`" M a"` → `"M a"`, length 3) falls under the `length < 4`
+ * guard and disappears entirely, yielding `[]` ⇒ a confident `dirty=false`. */
 export function parsePorcelainZ(out: string): string[] {
   const parts = out.split("\0");
   const paths: string[] = [];
@@ -438,15 +492,18 @@ export async function asyncRepoState(
  */
 export function syncRepoState(cwd: string, now: number = Date.now()): RepoState | null {
   const opts = { timeout: 5_000 };
-  const branchRaw = tryGit(cwd, "branch --show-current", opts);
-  const shaRaw = tryGit(cwd, "rev-parse HEAD", opts);
-  const statusRaw = tryGit(cwd, "status --porcelain -z", opts);
+  // #2105 P1/P2 — ARGV form, never the shell: `cwd` is the `task` tool's
+  // caller-supplied path. No `.trim()` on the status read — see `gitArgv`. The
+  // scalar fields are line-oriented and ARE trimmed.
+  const branchRaw = tryGitArgv(cwd, ["branch", "--show-current"], opts);
+  const shaRaw = tryGitArgv(cwd, ["rev-parse", "HEAD"], opts);
+  const statusRaw = tryGitArgv(cwd, ["status", "--porcelain", "-z"], opts);
   // Nothing readable at all → UNKNOWN (never a clean tree).
   if (branchRaw === null && shaRaw === null && statusRaw === null) return null;
   const paths = statusRaw === null ? null : parsePorcelainZ(statusRaw);
   return {
-    branch: branchRaw ? branchRaw : null,
-    headSha: shaRaw ? shaRaw : null,
+    branch: branchRaw ? branchRaw.trim() : null,
+    headSha: shaRaw ? shaRaw.trim() : null,
     dirty: paths === null ? null : paths.length > 0,
     paths,
     observedAt: now,
@@ -467,7 +524,10 @@ export function syncRepoState(cwd: string, now: number = Date.now()): RepoState 
 export function countCommitsBetween(cwd: string, from: string, to: string): number | null {
   const hex = /^[0-9a-f]{7,64}$/i;
   if (!hex.test(from) || !hex.test(to)) return null;
-  const out = tryGit(cwd, `rev-list --count ${from}..${to}`, { timeout: 5_000 });
+  // #2105 P1 — argv form for the same reason as `syncRepoState`: `cwd` comes from
+  // the report path's caller-supplied path. The hex test stays as a second lock,
+  // not as the mechanism.
+  const out = tryGitArgv(cwd, ["rev-list", "--count", `${from}..${to}`], { timeout: 5_000 });
   if (out === null) return null;
   const n = Number(out.trim());
   return Number.isInteger(n) && n >= 0 ? n : null;

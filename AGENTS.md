@@ -488,7 +488,10 @@ This is bounded hard, and a lane that reads it as a general licence has read it 
   the child's OWN worktree are authoritative; a verdict from any instrument is not. The report now
   reads the tree **at report time** and withholds its verdict when the head moved
   (`verdictWithheld=stale-snapshot` / `VERDICT WITHHELD — snapshot is stale`), and a child that has
-  never begun a turn reads `not-started`, never `wedged`. **The rule survives the fix.**
+  never begun a turn reads `not-started`, never `wedged` — **while it is emitting markers**. The
+  qualifier is not a loophole: a child emitting nothing at all is the silence class (that is the
+  watchdog's own `tier-1 zero-output` parity), so it still reads `wedged` at the silence bound and
+  must not be excused as "not started". **The rule survives the fix.**
   "Not started" (nothing was ever in flight) and "stalled" (something was in flight and stopped)
   have **opposite** correct responses — wait or reassign for the first, kill for the second — so
   never treat them as the same event.

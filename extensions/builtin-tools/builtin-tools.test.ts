@@ -71,6 +71,7 @@ import { dirname, join, resolve } from "node:path";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const source = readFileSync(resolve(__dirname, "index.ts"), "utf-8");
+const repoFreshSource = readFileSync(resolve(__dirname, "../repo-freshness.ts"), "utf-8");
 
 let passed = 0;
 let failed = 0;
@@ -2648,13 +2649,32 @@ test("E12: ready + no turn — not tier-1-killed; ticks stop → silence at T; t
   // `no-progress` — a LONGER window, i.e. the wait the issue asks for — so this
   // asserts the SUPPRESSION and then proves the class is still bounded by
   // moving the same state past X.
+  //
+  // ⛔ THE SUPPRESSION IS CONDITIONAL ON ITS SUBSTITUTE BEING ARMED (#2105
+  // review P2). `no-progress` is gated on `progressAgeMs > 0`, so suppressing
+  // stream-stall unconditionally left NO bound below the 6 h hard cap for an
+  // operator who set `TASK_PROGRESS_AGE_MS=0`. The case below therefore supplies
+  // an ARMED bound (`progressAgeMs` > 0, anchor at `startedAt` so X has not
+  // elapsed yet) — production's default shape.
   const st2 = createHeartbeatState();
   st2.sawReady = true;
   st2.everSawWork = false; // only ready seen — no turn ever
   st2.streamAgeMs = S + 1;
   st2.lastMarkerAt = 3_000_000;
-  const dFlow = heartbeatKillDecision(dinput({ now: 3_000_010, lastLifeSignAt: 3_000_000, hasOutput: false, state: st2 }));
-  equal(dFlow.kill, false, "a never-started child is NOT cut as wedged at S (#2105)");
+  const dFlow = heartbeatKillDecision(
+    dinput({ now: 3_000_010, startedAt: 3_000_000, lastLifeSignAt: 3_000_000, hasOutput: false, state: st2, progressAgeMs: 60_000 }),
+  );
+  equal(dFlow.kill, false, "a never-started child is NOT cut as wedged at S (#2105) while the substitute bound is armed");
+  // ⛔ AND THE ARMED CASE IS NOT A LOOPHOLE: with the substitute DISABLED
+  // (`progressAgeMs: 0`, i.e. `TASK_PROGRESS_AGE_MS=0`) the OLD stream-stall
+  // bound must still cut. Without this, the only bound left on the class is the
+  // 6 h hard cap — a silent 20 min → 6 h widening. This case FAILS on the
+  // pre-fix code, which suppressed unconditionally.
+  const dDisabled = heartbeatKillDecision(
+    dinput({ now: 3_000_010, startedAt: 0, lastLifeSignAt: 3_000_000, hasOutput: false, state: st2, progressAgeMs: 0 }),
+  );
+  equal(dDisabled.kill, true, "TASK_PROGRESS_AGE_MS=0 must NOT remove the only bound on a never-started child");
+  equal(dDisabled.reason, "stream-stall", "…the stream-stall bound still applies when no-progress is disabled");
   // BOUNDED TWIN: the same never-started state is still bounded, by X.
   const dX = heartbeatKillDecision(
     dinput({ now: 3_000_010, startedAt: 0, lastLifeSignAt: 3_000_000, hasOutput: false, state: st2, progressAgeMs: 60_000 }),
@@ -5991,8 +6011,15 @@ test("#783 §6.6: dispatch outcome row preserves UNKNOWN dirtyPaths as null (nev
   // call site coalesced `?? []` and the row type declared `string[]` — so the
   // JSONL row asserted "zero dirty paths" for a tree nobody observed.
   const src = readFileSync(resolve(__dirname, "index.ts"), "utf-8");
-  ok(src.includes("dirtyPaths: repoState?.paths ?? null"), "the row must carry null (UNKNOWN)");
-  ok(!src.includes("dirtyPaths: repoState?.paths ?? []"), "the laundering form must be gone");
+  // #2105 review P2 moved the row onto the SETTLE-TIME read (`settleState`), so
+  // this pins the SHAPE — the field carries `?? null`, never `?? []` — rather than
+  // the name of the variable it reads from. The anti-laundering check is written
+  // against the field, so it cannot be satisfied by renaming the reader.
+  const dirtyIdx = src.indexOf("dirtyPaths:");
+  ok(dirtyIdx > 0, "the row carries a dirtyPaths field");
+  const dirtyField = src.slice(dirtyIdx, dirtyIdx + 120);
+  ok(/dirtyPaths: \w+\?\.paths \?\? null/.test(dirtyField), "the row must carry null (UNKNOWN)");
+  ok(!/\?\? \[\]/.test(dirtyField), "the laundering form must be gone");
   const rec = readFileSync(resolve(__dirname, "../shared/dispatch-record.ts"), "utf-8");
   ok(rec.includes("dirtyPaths: string[] | null;"), "the row type must admit null");
 });
@@ -7740,10 +7767,83 @@ testAsync("#2105: syncRepoState reads a REAL repo (branch/headSha/dirty/paths) a
     const dirty = syncRepoState(dir);
     equal(dirty!.dirty, true, "an untracked file is seen");
     deepEqual(dirty!.paths, ["dirty.txt"], "and named");
+
+    // ⛔ THE SHAPE EVERY DIRTY WORKTREE ACTUALLY HAS (#2105 review P2). Porcelain
+    // `-z` writes ` M x.txt` — the X column is a SPACE for every unstaged change.
+    // The reader used to `.trim()` its stdout, which ate that column for the FIRST
+    // entry only, so `slice(3)` returned a truncated path (".txt"). The existing
+    // untracked fixture (`?? dirty.txt`) has no leading space, which is why it
+    // could not see the defect. This case FAILS on the pre-fix code.
+    rmSync(join(dir, "dirty.txt"), { force: true }); // untracked fixture is a SEPARATE case above
+    writeFileSync(join(dir, "x.txt"), "v1\n");
+    execSync("git add x.txt && git -c user.email=t@t -c user.name=t commit -q -m add-x", { cwd: dir });
+    writeFileSync(join(dir, "x.txt"), "v2\n");
+    const tracked = syncRepoState(dir);
+    equal(tracked!.dirty, true, "a TRACKED modification is seen, not just an untracked one");
+    deepEqual(tracked!.paths, ["x.txt"], "its path survives the space-X column (no trim, no truncation)");
+
+    // …and the narrow FALSE-CLEAN the trim produced: a 1-character path as the
+    // tree's ONLY change parsed to `[]` ⇒ `dirty=false` — the fabricated clean
+    // this whole change exists to prevent.
+    execSync("git checkout -- x.txt", { cwd: dir });
+    writeFileSync(join(dir, "a"), "v1\n");
+    execSync("git add a && git -c user.email=t@t -c user.name=t commit -q -m add-a", { cwd: dir });
+    writeFileSync(join(dir, "a"), "v2\n");
+    const oneChar = syncRepoState(dir);
+    deepEqual(oneChar!.paths, ["a"], "a 1-character path survives the read");
+    equal(oneChar!.dirty, true, "…so the tree is never reported clean from a read that lost it");
+
     equal(syncRepoState(join(dir, "does-not-exist")), null, "an unreadable tree is UNKNOWN (null), not a clean one");
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+testAsync("#2105 P1: syncRepoState never puts the caller-supplied cwd through a shell (child→parent execution)", async () => {
+  // `cwd` here is the `task` tool's CALLER-SUPPLIED path: a child agent has shell
+  // access, so it can `mkdir` a directory with metacharacters in its name and pass
+  // it as `task({ cwd })`. Before this fix the report-time read reached git as
+  // execSync(`git -C "${repo}" …`) — and `$(…)` IS expanded inside double quotes —
+  // so the CHILD chose a command run in the PARENT process. `taskCwdRefusal`
+  // rejects only NUL/non-directories, so the metacharacters arrived intact.
+  //
+  // `$(>file)` is a bare redirection: it creates `file` relative to the git
+  // process's cwd (the parent's), so no `/` is needed in the directory name.
+  const root = mkdtempSync(join(tmpdir(), "t2105-inj-"));
+  const sentinel = `pi2105_inj_${process.pid}_${Date.now()}`;
+  const sentinelPath = join(process.cwd(), sentinel);
+  try {
+    const evil = join(root, `dol$(${">"}${sentinel})`);
+    mkdirSync(evil);
+    const state = syncRepoState(evil);
+    equal(existsSync(sentinelPath), false, "the caller-supplied cwd must never be shell-expanded in the parent");
+    equal(state, null, "an unreadable path stays UNKNOWN (null), never a confident clean");
+  } finally {
+    rmSync(sentinelPath, { force: true });
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("#2105 P1: the report-time reader is ARGV-form, never a shell string (source pin)", () => {
+  // The mechanism is the fix: a denylist of metacharacters would be a new
+  // enumeration to defeat. Assert the shell-free reader exists and that the
+  // report path uses it.
+  ok(
+    repoFreshSource.includes('execFileSync("git", ["-C", cwd, ...args]'),
+    "one shell-free (argv) reader exists for the report path",
+  );
+  const syncBody = repoFreshSource.slice(
+    repoFreshSource.indexOf("export function syncRepoState"),
+    repoFreshSource.indexOf("export function countCommitsBetween"),
+  );
+  ok(syncBody.includes('tryGitArgv(cwd, ["status", "--porcelain", "-z"]'), "the status read is argv-form");
+  ok(!/\btryGit\(/.test(syncBody), "no shell-form reader remains in syncRepoState");
+  // …and the argv reader must NOT trim: porcelain `-z` X column is a space.
+  const argvBody = repoFreshSource.slice(
+    repoFreshSource.indexOf("function gitArgv"),
+    repoFreshSource.indexOf("function tryGitArgv"),
+  );
+  ok(!/\.trim\(\)/.test(argvBody), "the argv reader returns stdout VERBATIM (a trim misaligns porcelain -z)");
 });
 
 testAsync("#2105: countCommitsBetween counts what landed since the snapshot, and refuses a non-hex ref", async () => {
@@ -8639,7 +8739,15 @@ test("#2105: the kill headline names NEVER STARTED and routes to reassign (sourc
   // awaited network probe — the #5389 live/decision split).
   ok(source.includes("if (decision.notStarted === true)"), "the override is gated on the decision's snapshot");
   ok(source.includes("⛔ Sub-agent NEVER STARTED"), "the headline names the condition");
-  ok(/NEVER STARTED[\s\S]{0,400}WAIT or REASSIGN/.test(source), "…and routes to wait/reassign, not retry");
+  ok(/NEVER STARTED[\s\S]{0,400}REASSIGN/.test(source), "…and routes to REASSIGN, not retry");
+  // ⛔ NOT "WAIT" (#2105 review P3): this headline is composed on the KILL path,
+  // so by the time the parent reads it the child is already dead. "WAIT" is an
+  // instruction nobody can follow. This assertion FAILS on the pre-fix text
+  // ("WAIT or REASSIGN").
+  ok(
+    !/NEVER STARTED[\s\S]{0,400}\bWAIT\b/.test(source),
+    "the kill headline must not tell the parent to WAIT for a child it has just cut",
+  );
   // Every Alive state report carries the token, so a post-mortem can tell the
   // two conditions apart instead of inferring it from tickCount.
   const aliveTemplates = source.match(/Alive state: toolsInFlight=[^\n]*/g) ?? [];
@@ -8649,6 +8757,32 @@ test("#2105: the kill headline names NEVER STARTED and routes to reassign (sourc
   }
   ok(source.includes('const notStartedText = (): string => `notStarted=${isNotYetStarted(hbCtx.state)}`;'), "one predicate, shared with the watchdog and the status view");
   ok(source.includes("decNotStarted=${decision.notStarted === true}"), "the kill payload keeps the DECISION's snapshot beside the live read");
+});
+
+test("#2105 P2: the durable dispatch-outcome row reads the tree AT SETTLE, not at spawn (source pin)", () => {
+  // The row's own comment says "Only values known AT SETTLE are recorded", and the
+  // ledger is APPEND-ONLY, so a spawn-time snapshot written there is the incident's
+  // false clean persisted forever ("7 commits landed" + `dirty=false`) in the file
+  // ledger consumers read. `repoState` is assigned once at spawn and never
+  // re-read, so using it here asserted the opposite of the comment. This pin FAILS
+  // on the pre-fix code, which interpolated `repoState?.…` into every field.
+  const start = source.indexOf("const writeOutcomeRow =");
+  ok(start > 0, "the row writer exists");
+  const rowBody = source.slice(start, source.indexOf("dirtyPaths:", start) + 40);
+  ok(rowBody.includes("syncRepoState(targetCwd)"), "the row reads the tree when it is written");
+  ok(!/repoState\?\./.test(rowBody), "no spawn-time snapshot field survives in the row");
+  ok(rowBody.includes("settleState?.headSha"), "headSha comes from the settle read");
+  ok(rowBody.includes("settleState?.paths"), "dirtyPaths comes from the settle read");
+});
+
+test("#2105 P2: a disabled no-progress bound still names a bound that will act (source pin)", () => {
+  // `task_status` used to interpolate `getProgressAgeMs() / 60_000` unconditionally,
+  // printing "the no-progress window (0 min)" — a claim a reader will act on that
+  // was false. With the suppression now conditional on the substitute being armed,
+  // a disabled no-progress bound means stream-stall is what cuts the child.
+  ok(source.includes("const notStartedBounded = notStarted && i.progressAgeMs > 0;"), "the suppression is gated on its substitute being ARMED");
+  ok(source.includes("!notStartedBounded && effStreamAge > i.streamStallMs"), "…and stream-stall still owns the class when it is not");
+  ok(source.includes("TASK_PROGRESS_AGE_MS=0 disables the no-progress window"), "the status note names the bound that actually acts");
 });
 
 test("#1662: a nonce MISMATCH is not a life sign (foreign writer on the child's fd 2)", () => {

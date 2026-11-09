@@ -3445,6 +3445,20 @@ export function heartbeatKillDecision(
   // "has not begun" state is a property of this decision rather than a second
   // inference made at a different clause (see `isNotYetStarted`).
   const notStarted = isNotYetStarted(st);
+  // #2105 review P2 — the suppression below is only safe while the SUBSTITUTE
+  // bound is ARMED. `no-progress` is gated on `i.progressAgeMs > 0` (`:3546`),
+  // and `getProgressAgeMs()` returns 0 for an explicit `TASK_PROGRESS_AGE_MS=0`
+  // (a documented disable valve). With it disabled, suppressing stream-stall for
+  // a not-started child left NO bound below the 6 h hard cap (silence needs
+  // `lastLifeSignAt` to go stale, which ticks keep refreshing; `cut` needs
+  // `toolsInFlight > 0`; `first-message-stall` needs `turnActive`, which
+  // `isNotYetStarted` excludes by construction). On `main` that class was cut at
+  // S = 20 min, so the suppression was a silent 20 min → 6 h widening in a
+  // supported configuration. Keeping `notStarted` pure for the payload/headline
+  // and gating the CLAUSE on the armed substitute means: with the valve pulled,
+  // the old 20-min bound still applies and no operator knob removes the only
+  // bound on the class.
+  const notStartedBounded = notStarted && i.progressAgeMs > 0;
   const kill = (reason: HeartbeatKillReason): HeartbeatKillDecision => ({
     kill: true,
     reason,
@@ -3749,7 +3763,12 @@ export function heartbeatKillDecision(
   //    `silence-threshold` still owns a child that emits nothing at all. The
   //    kill it eventually composes names the condition instead of calling it a
   //    wedge (see the `not-started` headline at the kill site).
-  if (stateFresh && st.toolsInFlight === 0 && !notStarted && effStreamAge > i.streamStallMs) {
+  //
+  //    ⛔ AND ONLY WHILE THAT SUBSTITUTE IS ARMED (`notStartedBounded`): with
+  //    `TASK_PROGRESS_AGE_MS=0` the no-progress clause is inert, so the
+  //    suppression must not apply either — otherwise this clause stops bounding
+  //    the class at all and the 6 h hard cap becomes the only limit.
+  if (stateFresh && st.toolsInFlight === 0 && !notStartedBounded && effStreamAge > i.streamStallMs) {
     return kill("stream-stall");
   }
 
@@ -4796,6 +4815,16 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
     // via a follow-up row).
     const writeOutcomeRow = (reason: string, exitCode: number | null, transcriptPath: string | null): RecordWriteResult => {
       if (!dispatchLedgerEnabled(subAgentEnv)) return { ok: false, path: "", skipped: true };
+      // #2105 review P2 — the comment above is the contract, so READ AT SETTLE.
+      // `repoState` is the SPAWN-time snapshot (`asyncRepoState`, assigned once at
+      // :4664 and never re-read); persisting it here wrote
+      // `headSha=<spawn sha> dirty=false` for a child that had since committed
+      // seven times — the incident's false clean, in the append-only ledger that
+      // outlives the report and is read by every ledger consumer. #2105's ask 1
+      // ("never emit `dirty=false` from a cached snapshot") is not limited to the
+      // human renderer. This runs once per settle, so it costs what the report
+      // costs. Unreadable ⇒ `null`, never a confident clean.
+      const settleState = syncRepoState(targetCwd);
       return recordDispatchOutcome(
         buildDispatchOutcomeRow({
           dispatchId: hbNonce || null,
@@ -4803,16 +4832,16 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
           childSessionId,
           attempt,
           cwd: targetCwd,
-          branch: repoState?.branch ?? null,
-          headSha: repoState?.headSha ?? null,
-          dirty: repoState?.dirty ?? null,
+          branch: settleState?.branch ?? null,
+          headSha: settleState?.headSha ?? null,
+          dirty: settleState?.dirty ?? null,
           // MUST stay null when the status probe failed, not `[]` (#783 §6.6
           // review): repo-freshness returns `paths: null` for UNKNOWN
           // deliberately ("A failed status probe MUST NOT become a confident
           // `dirty=false`"), and `?? []` laundered that UNKNOWN back into a
           // confident "zero dirty paths" for any machine consumer of the JSONL
           // row. The human renderer was already correct; this aligns the row.
-          dirtyPaths: repoState?.paths ?? null,
+          dirtyPaths: settleState?.paths ?? null,
           reason,
           toolAgeMaxMs: hbCtx.state.toolAgeMaxMs,
           toolsInFlight: hbCtx.state.toolsInFlight,
@@ -5552,13 +5581,20 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
       // content-free loop or a stalled stream" invites exactly that retry. This
       // text says what is true (nothing hung; the child never began), names the
       // bound that acted (the LONGER no-progress window, not the stream-stall
-      // wedge), and routes to reassign. Gated on the DECISION's snapshot, never
+      // wedge), and routes to reassign.
+      //
+      // ⛔ REASSIGN, NOT "WAIT or REASSIGN" (#2105 review P3). This headline is
+      // composed on the KILL path (`decision.kill === true` — the abnormal-exit
+      // composer is invoked with `{ killed: true, reason: "no-progress" }`), so by
+      // the time the parent reads it the child is already dead. "WAIT" is then not
+      // an instruction anyone can follow — an orchestrator taking it literally
+      // waits for a run that will never progress. Gated on the DECISION's snapshot, never
       // on live state — the network probe is awaited between the two and a
       // `turn_start` inside that window makes live state say "started" (#5389's
       // live/decision split, applied here).
       if (decision.notStarted === true) {
         headlines["no-progress"] =
-          `⛔ Sub-agent NEVER STARTED — no turn, no tool and no message for ${Math.round((decision.progressAgeMs ?? hbThresholds.progressAgeMs) / 1000)}s since dispatch (bound ${Math.round(hbThresholds.progressAgeMs / 1000)}s, TASK_PROGRESS_AGE_MS). Nothing hung: the child never began work, so this is spawn latency under load, not a wedge. Partial results below — parent should WAIT or REASSIGN; re-dispatching on the same box pays the same startup latency again.`;
+          `⛔ Sub-agent NEVER STARTED — no turn, no tool and no message for ${Math.round((decision.progressAgeMs ?? hbThresholds.progressAgeMs) / 1000)}s since dispatch (bound ${Math.round(hbThresholds.progressAgeMs / 1000)}s, TASK_PROGRESS_AGE_MS). Nothing hung: the child never began work, so this is spawn latency under load, not a wedge. Partial results below — parent should REASSIGN the work; re-dispatching into the same box pays the same startup latency again.`;
       }
       // #282: first-message-stall triage line — every clause-4 kill is a
       // never-worked session by construction (#279 gate); record the run's
@@ -6096,13 +6132,23 @@ export function evaluateTaskRunStatus(
       // reason (see the field's note), and it can never be `terminal`, so a
       // poller keyed on `task_collect` is unaffected — it will reap the run when
       // the no-progress bound (a LONGER window than S) or the hard cap acts.
+      // #2105 review P2 — name the bound that will ACTUALLY act. With
+      // `TASK_PROGRESS_AGE_MS=0` (the documented disable valve) `no-progress` is
+      // inert, and — since `notStartedBounded` no longer suppresses it — the
+      // stream-stall bound is what cuts the child. Printing "the no-progress window
+      // (0 min)" there is a claim a reader will act on and it is false.
+      const progressBoundMs = getProgressAgeMs();
+      const boundNote =
+        progressBoundMs > 0
+          ? `The bound that will act on it is the no-progress window (${Math.round(progressBoundMs / 60_000)} min), not the stream-stall bound.`
+          : `TASK_PROGRESS_AGE_MS=0 disables the no-progress window, so the bound that will act on it is the stream-stall bound (${Math.round(streamStallMs / 60_000)} min).`;
       if (heartbeat.not_started) {
         return {
           ...base,
           status: "not-started",
           terminal: false,
           alive,
-          note: `not yet started — no turn, no tool and no message in ${Math.round(effStreamAge / 60_000)} min since dispatch (process is up: ${heartbeat.ticks} tick(s), ${heartbeat.markers} marker(s)). This is not a wedge: WAIT, or reassign the work. The bound that will act on it is the no-progress window (${Math.round(getProgressAgeMs() / 60_000)} min), not the stream-stall bound.`,
+          note: `not yet started — no turn, no tool and no message in ${Math.round(effStreamAge / 60_000)} min since dispatch (process is up: ${heartbeat.ticks} tick(s), ${heartbeat.markers} marker(s)). This is not a wedge: WAIT, or reassign the work. ${boundNote}`,
         };
       }
       return { ...base, status: "wedged", terminal: false, alive, note: `stream idle over the stream-stall bound (${Math.round(streamStallMs / 60_000)} min)` };
