@@ -2890,6 +2890,15 @@ PR_ROWS=$(( DISP_ROWS + CK_ROWS ))
 # The reap reads these to tell "we did not ask" from "the read failed" — the two are the same
 # ABSENT file on disk, and reporting one as the other is the #1705/#1736 class in a log line.
 export REAP_OPEN_LIMIT REAP_PR_LIMIT
+# ⛔ "THE WINDOW WAS SMALL" AND "THE WINDOW WAS CLIPPED" ARE DIFFERENT FACTS, AND ONLY THE SECOND
+# MAKES ABSENCE WORTHLESS (fresh review of #1984, P1). The limit is OUR choice; whether the provider
+# ended the collection is ITS answer. `rest_list` publishes that answer as `REST_WINDOW_FILLED` (its
+# own contract at the helper: the flag "a caller that reads ABSENCE from the answer as evidence MUST
+# test"), so a 100-row window whose collection ENDED still proves "no PR" — which is why a guard keyed
+# only on the limit suppressed the dead-lane retry on every pass with four or fewer rows, and printed a
+# narrowed-window warning over a COMPLETE answer. Both facts are recorded here; the decision is made
+# once, in the reap, from BOTH.
+PR_WINDOW_CLIPPED=0
 # The stage is set HERE, before the first network read of the pass: from this point a failure is about
 # the LISTING (a gh/tier/jq read), not about provisioning, and the record must say which.
 refresh_stage list "rest_list issues/pulls --repo $OR (open-issue + PR-branch listings, REAP_OPEN_LIMIT=$REAP_OPEN_LIMIT REAP_PR_LIMIT=$REAP_PR_LIMIT)"
@@ -2913,13 +2922,26 @@ else
     rm -f "$O/.pr_brs"
     echo "[refresh] WARN: PR listing FAILED — reaping pass will be skipped (an unreadable listing is not an empty one)"
     [ -s "$O/.list-err" ] && sed -n '1,2p' "$O/.list-err" | sed 's/^/[refresh]   /'
-  elif [ "$REAP_PR_LIMIT" -lt 500 ]; then
-    # ⛔ SAID OUT LOUD, because it changes what the ANSWER means: a PR outside this window is
-    # indistinguishable from no PR, and "no PR" is what releases a dispatch back into the queue.
-    echo "[refresh] listings: the PR-branch window is NARROWED to ${REAP_PR_LIMIT} rows (it serves ${PR_ROWS} row(s); the shipped window is 500), so a PR outside it is NOT evidence of 'no PR' — no dispatched entry is un-blacklisted on that reading this pass (#1984)"
+  else
+    # `rest_list` resets this at ENTRY, so a value read here is THIS call's, never the previous tier's.
+    if [ "${REST_WINDOW_FILLED:-0}" = "1" ]; then PR_WINDOW_CLIPPED=1; fi
+    if [ "$REAP_PR_LIMIT" -lt 500 ]; then
+      # ⛔ SAID OUT LOUD, because it changes what the ANSWER means: a PR outside a NARROWED window is
+      # indistinguishable from no PR, and "no PR" is what releases a dispatch back into the queue. The
+      # CLIPPED case is named separately, and ONLY it withdraws the evidence — a narrowed window whose
+      # collection ENDED answers the question completely, and saying otherwise sends an operator after
+      # a truncation that did not happen.
+      if [ "$PR_WINDOW_CLIPPED" -eq 1 ]; then
+        echo "[refresh] listings: the PR-branch window is NARROWED to ${REAP_PR_LIMIT} rows (it serves ${PR_ROWS} row(s); the shipped window is 500) AND the provider ended it with a next page still advertised, so a head ref outside it was NOT read — no entry is released on a PR-absence read from it this pass (#1984)"
+      else
+        echo "[refresh] listings: the PR-branch window is NARROWED to ${REAP_PR_LIMIT} rows (it serves ${PR_ROWS} row(s); the shipped window is 500) and the provider ENDED the collection inside it, so it is a COMPLETE answer for this pass (#1984)"
+      fi
+    fi
   fi
 fi
 rm -f "$O/.list-err"
+# The CLIPPED fact travels with the limits, so no consumer has to infer it from the limit again.
+export REAP_PR_CLIPPED="$PR_WINDOW_CLIPPED"
 # ── NOTHING THIS PASS DID NOT CLASSIFY MAY BE READ AS THIS PASS'S CLASSIFICATION (agent-infra#2183)
 # ⛔ TRUNCATED AT PASS START, AS AN EXPLICIT LIST — never a `checked-*` glob, which would also delete
 # `state/checked-release-cursor` on every pass and silently reduce the release rotation to "always
@@ -3037,13 +3059,23 @@ _REAP_OPEN_LIMIT = (os.environ.get("REAP_OPEN_LIMIT") or "").strip()
 _REAP_PR_LIMIT = (os.environ.get("REAP_PR_LIMIT") or "").strip()
 _open_not_asked = _REAP_OPEN_LIMIT == "0"
 _pr_not_asked = _REAP_PR_LIMIT == "0"
-# ⛔ A PR WINDOW NARROWER THAN THE SHIPPED 500 IS NOT EVIDENCE OF "NO PR" (agent-infra#1984).
-# `has_pr` is a regex over the head refs the window returned; a PR outside it is indistinguishable
-# from no PR, and "no PR" is exactly what releases a dispatched entry back into the queue. So on a
-# narrowed window that arm is refused and the row takes the window-blind path instead (KEPT, or
-# settled only by its own CLOSED state) — a narrower window can make this pass keep MORE, never
-# release more. An absent marker reads as the full window, i.e. unchanged behaviour.
+# ⛔ WHEN IS A MISS IN `.pr_brs` EVIDENCE OF "NO PR"? (agent-infra#1984; fresh review P1.)
+# `has_pr` is a regex over the head refs a WINDOW returned. A head ref outside that window is
+# indistinguishable from no PR, and "no PR" is exactly what releases a dispatched entry back into
+# the queue (#1705's duplicate lane) — so the question is not how big the window was, it is whether
+# the provider ENDED the collection inside it. Two facts decide that, and BOTH are needed:
+#   * `REAP_PR_CLIPPED` (from `rest_list`'s own `REST_WINDOW_FILLED`): the window ended FULL with a
+#     next page still advertised, so rows exist that were NOT read. Absence is then not evidence.
+#   * the LIMIT asked for. At the shipped 500 this pass reads exactly what every earlier pass read,
+#     so its coverage is the SAME accepted residual the file already states (`:3340`: a 500-row
+#     window and a PR whose head ref does not name the issue) — withholding the release arm there
+#     would not repair that residual, it would silently retire the dead-lane retry instead.
+# So: a CLIPPED window narrower than the shipped one withholds the evidence; a narrowed window whose
+# collection ended is a COMPLETE answer and proves "no PR" as well as a 500-row one would have; and
+# the shipped 500 behaves exactly as before. An absent marker reads as the full window (unchanged).
 _pr_limit = int(_REAP_PR_LIMIT) if _REAP_PR_LIMIT.isdigit() else 500
+_pr_clipped = (os.environ.get("REAP_PR_CLIPPED") or "").strip() == "1"
+_pr_window_blind = (not _pr_not_asked) and _pr_clipped and _pr_limit < 500
 # ⛔ "NOT ASKED" IS NOT A ZERO-ROW WINDOW: the marker `0` means the caller declined to ask, so the
 # narrowing line below must not claim a 0-row window was read. Only an ACTUAL narrowing counts.
 _pr_window_narrow = (not _pr_not_asked) and _pr_limit < 500
@@ -3081,13 +3113,14 @@ if not have_pr:
     raise SystemExit(0)
 open_iss = {l for l in _open_rows if l}
 brs = [l for l in _pr_rows if l]
-if _pr_window_narrow:
+if _pr_window_blind:
     # Named once, with the consequence, rather than left to a reader to infer from a smaller
-    # failure count: this is the ONE place the narrowed window changes a verdict.
-    print("[reap] the PR-branch window is NARROWED to %d rows, so a PR outside it is not evidence "
-          "of 'no PR' (#1984) — no dispatched entry is un-blacklisted on that reading this pass; "
-          "a row that would have been released is KEPT or settled by its own CLOSED state instead"
-          % _pr_limit)
+    # failure count: this is the ONE place the clipped window changes a verdict.
+    print("[reap] the PR-branch window is NARROWED to %d rows AND CLIPPED (a next page was still "
+          "advertised), so a head ref outside it is not evidence of 'no PR' (#1984) — nothing is "
+          "released on that reading this pass: a dispatched entry that would have been "
+          "un-blacklisted is KEPT or settled by its own CLOSED state instead, and a checked entry "
+          "whose only keep fact is its PR branch is KEPT and named" % _pr_limit)
 # ⛔ AN UNREADABLE SESSION LIST IS NOT "NO LANES" (review E-P3, cycle 2). `tmux ls`'s exit status was
 # discarded and every failure collapsed into `out = ""`, so a tmux that could not answer silently
 # REMOVED the `lane` keep fact — moving live lanes toward release, which is the duplicate-dispatch
@@ -3214,7 +3247,7 @@ if have_open and _disp_ok:
         # window-blind arm instead of `reaped`, which is the polarity that can only ever KEEP more:
         # it is settled only by its own authoritative CLOSED state, never by an absence read from a
         # window the pass chose to make smaller. At the shipped 500-row window this line is inert.
-        if n in open_iss and not _pr_window_narrow:
+        if n in open_iss and not _pr_window_blind:
             reaped.append(n)
         else:
             _window_blind.append(n)
@@ -3482,6 +3515,21 @@ for n in _cksrc:
         kept.append((n, "pr"))
     elif n in live:
         kept.append((n, "lane"))
+    elif _pr_window_blind:
+        # ⛔ THE SAME PREDICATE AT THE SECOND READER (#1984, fresh review P1b). `pr_ref` is a regex
+        # over the SAME window `has_pr` reads, so a clipped window makes this "no PR" fact missing
+        # for the same reason — and a missing keep fact here RELEASES. Releasing is only a bounded
+        # cost (one re-judge) and the shipped 500 already accepts it, but a window this pass CHOSE to
+        # clip is not the shipped residual: the entry is KEPT, and its reason is a row the operator
+        # line prints it as `pr-unknown`), so it is a STATED deficit rather than an invisible
+        # suppression. Bounded by construction: the window is only narrowed when the row files total
+        # four or fewer, so at most four entries can be held this way on any pass.
+        # ⛔ THE REASON IS `pr-unknown`, NOT A NEW COUNTER: the dispatch line's checked breakdown has
+        # one bucket per fact plus `unknown` for a reason it does not map, and adding a ninth counter
+        # would change the funnel's field set for a condition this narrow. `unknown` is the
+        # documented fallback ("an UNMAPPED reason lands in `unknown` rather than vanishing, so the
+        # counters always sum"), and the cause is written verbatim in `state/checked-kept`.
+        kept.append((n, "pr-unknown"))
     else:
         releasable.append(n)
 # ⛔ THIS DOES NOT REWRITE checked.txt BEYOND THE PRE-EXISTING `dispatched.txt` DROP ABOVE. It
@@ -3490,10 +3538,11 @@ for n in _cksrc:
 # an entry the registry keeps never has to be put back.
 publish("checked-kept", "".join("%s\t%s\n" % (n, r) for n, r in kept))
 publish("checked-release-candidates", "".join(n + "\n" for n in dict.fromkeys(releasable)))
-print("[reap] checked: %d entr(ies) — dispatched=%d queued=%d pr=%d lane=%d releasable=%d"
+print("[reap] checked: %d entr(ies) — dispatched=%d queued=%d pr=%d lane=%d pr-unknown=%d releasable=%d"
       % (len(kept) + len(releasable),
          sum(1 for _, r in kept if r == "dispatched"), sum(1 for _, r in kept if r == "queued"),
          sum(1 for _, r in kept if r == "pr"), sum(1 for _, r in kept if r == "lane"),
+         sum(1 for _, r in kept if r == "pr-unknown"),
          len(releasable)))
 
 # ── landed.txt: a REPORTED decision, never a second blacklist (tortoise#8560/#8625/#8629) ─────
