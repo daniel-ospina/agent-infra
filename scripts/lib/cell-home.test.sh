@@ -570,10 +570,17 @@ fi
 # an executable path. Pinned so the ground cannot silently become false again — if this template ever
 # grows a `{{HOME}}`-built program path, the arm reds and the render's contract has to be re-argued.
 PLIST="$REPO_ROOT/templates/launchd/harness-apply/com.eldato.harness-apply.plist"
-# ⛔ NO PIPE INTO A QUIET GREP (the `sigpipe-grep` idiom ban, #841/#864): a non-quiet `grep -A1` piped
-# into `grep -qF` takes SIGPIPE once the consumer exits on its first match, so under `pipefail` the
-# answer can be "not found" for a line that IS there — the false PASS this suite exists to prevent,
-# inside the suite itself. Capture the producer and test the captured text in the shell instead.
+# ⛔ NO PIPE INTO A QUIET GREP (the `sigpipe-grep` idiom ban, #841/#864): the guard bans the SHAPE
+# unconditionally, and this arm carried it — a non-quiet `grep -A1` producer piped into a quiet `grep -qF`
+# consumer, which exits on its first match. ⛔ THE RUNTIME CONSEQUENCE HERE IS THE OPPOSITE OF A FALSE PASS,
+# and the first version of this comment said false pass — it is worth keeping the correction, because the
+# direction is what decides whether the idiom is a hole or a nuisance: `grep -qF` exits 0 ONLY on a genuine
+# match, so under `pipefail` a producer that took SIGPIPE can only ADD a failure to this arm — the shipped
+# plist would report `bad`. (Neither condition is even live on this box: this suite sets only `set -u`
+# (`:37`), the shard runner execs each suite as a fresh `bash` with no exported `SHELLOPTS`, and the
+# plist's producer writes two short lines — far below the window the class needs.) So what the idiom cost
+# here was a SHAPE the guard reds on and a plist that is right being called wrong; capture the producer and
+# test the captured text in the shell, which is also the guard's own canonical GOOD form.
 _plist_home=""
 [ -f "$PLIST" ] && _plist_home="$(grep -A1 -F '<key>HOME</key>' "$PLIST" 2>/dev/null || true)"
 if [ ! -f "$PLIST" ]; then
