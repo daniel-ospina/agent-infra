@@ -2927,7 +2927,9 @@ assert_contains "$OUT" "no template change and no content comparison can" "§18 
 # A RETIRED label is deliberately template-less — it is DECLARED and removed by retire_pass. It must
 # NOT be reported as unmanaged, or every box that installed the pre-retirement jobs would cry wolf.
 rm -f "$STRAY_HOME/Library/LaunchAgents/com.eldato.heartbeat.plist"
-cp "$REPO_TEMPLATES/RETIRED" "$STRAY_HOME/Library/LaunchAgents/" 2>/dev/null || true
+# (The RETIRED manifest is NOT copied into LaunchAgents: nothing reads it from there. It was, and that
+# line read as the setup for the arm below while `retired_labels` actually reads the TEMPLATES copy
+# seeded by the fixture's `cp -R` — a misleading fixture, deleted rather than left to mislead.)
 cat > "$STRAY_HOME/Library/LaunchAgents/com.eldato.hub-state-check.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -2941,6 +2943,84 @@ OUT="$(run_stray_status)"; RC=$?
 set -e
 assert_eq "$RC" "0" "§18 a RETIRED label is NOT unmanaged (it is declared, and retire_pass removes it)"
 assert_not_contains "$OUT" "UNMANAGED" "§18 ... so no false alarm on a box that installed the pre-retirement jobs"
+
+# ⛔ THE BLIND JOB'S OWN LABEL IS NOW DECLARED (#1867 review P1), and that entry IS the remediation.
+# `com.tortoise.heartbeat-loop` is the hand-installed launchd job that ran scripts/heartbeat-loop.sh
+# (no template in this repo ever named it — pi-bootstrap/tests/test-setup-no-nesting.sh records the
+# same fact). Before this entry the diagnosis shipped and the removal did not: `--uninstall`
+# iterates TEMPLATES, so no command in this repo could remove it, and `--status` stayed red until a
+# human hand-deleted the plist. Adding it to RETIRED makes `retire_pass` unload + remove it on the
+# next install (and on --uninstall), so the box goes green in the same change that diagnoses it.
+assert_contains "$(cat "$REPO_TEMPLATES/RETIRED" 2>/dev/null || echo MISSING)" "com.tortoise.heartbeat-loop" \
+    "§18 RETIRED declares the blind heartbeat's label (com.tortoise.heartbeat-loop)"
+cat > "$STRAY_HOME/Library/LaunchAgents/com.tortoise.heartbeat-loop.plist" <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>Label</key><string>com.tortoise.heartbeat-loop</string>
+<key>ProgramArguments</key><array><string>/bin/bash</string><string>/x/heartbeat-loop.sh</string></array>
+<key>StartInterval</key><integer>120</integer>
+</dict></plist>
+PLIST
+set +e
+OUT="$(run_stray_status)"; RC=$?
+set -e
+assert_eq "$RC" "0" "§18 the blind job is NOT unmanaged once RETIRED declares it (retire_pass removes it)"
+assert_not_contains "$OUT" "UNMANAGED" "§18 ... so the box goes green in the same change that diagnosed it"
+rm -f "$STRAY_HOME/Library/LaunchAgents/com.tortoise.heartbeat-loop.plist"
+
+# ⛔ A JOB ANOTHER INSTALLER OF THIS REPO OWNS IS NOT UNMANAGED (#1867 review P1). The harness
+# controller `com.eldato.orchestrator-loop` is rendered by scripts/orchestrator-harness/install.sh
+# from its OWN template — deliberately not in this directory, because that installer owns its
+# lifecycle. Flagging it made `--status` exit 1 FOREVER on the reference Mac layout, and the caller
+# that gates on it hard-FAILs: scripts/fleet-schedule.py → `FAIL … SCHEDULE NOT VERIFIED` →
+# activate-harness.sh → `fleet-schedule … FAILING`. A drift instrument whose healthy state is red is
+# one an operator learns to ignore, or silences by deleting a plist the controller needs.
+cat > "$STRAY_HOME/Library/LaunchAgents/com.eldato.orchestrator-loop.plist" <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>Label</key><string>com.eldato.orchestrator-loop</string>
+<key>ProgramArguments</key><array><string>/bin/bash</string><string>/x/launchd-controller.sh</string></array>
+<key>StartInterval</key><integer>300</integer>
+</dict></plist>
+PLIST
+set +e
+OUT="$(run_stray_status)"; RC=$?
+set -e
+assert_eq "$RC" "0" "§18 a job the HARNESS installer owns is NOT unmanaged (no permanent red on the reference Mac)"
+assert_not_contains "$OUT" "com.eldato.orchestrator-loop" "§18 ... and is not even named as unmanaged"
+
+# ⛔ AND THE DECLARATION IS DRIFT-GATED, not a second hardcoded list. The exclusion above is only
+# honest while the declaring installers still install that label: read THEIR declaration and pin
+# this file to it, so a renamed controller label cannot leave a stale exemption behind.
+HARNESS_DECL="$(grep -hE '^(BASE_)?LABEL="com\.eldato\.orchestrator-loop"' \
+    "$SCRIPT_DIR/orchestrator-harness/install.sh" "$SCRIPT_DIR/orchestrator-bringup.sh" 2>/dev/null || true)"
+if [ -n "$HARNESS_DECL" ]; then
+    ok "§18 the declaring installers still name com.eldato.orchestrator-loop (the drift gate has something to check)"
+else
+    bad "§18 neither scripts/orchestrator-harness/install.sh nor scripts/orchestrator-bringup.sh declares com.eldato.orchestrator-loop — re-anchor OWNED-BY-OTHER-INSTALLERS"
+fi
+assert_contains "$(cat "$REPO_TEMPLATES/OWNED-BY-OTHER-INSTALLERS" 2>/dev/null || echo MISSING)" "com.eldato.orchestrator-loop" \
+    "§18 OWNED-BY-OTHER-INSTALLERS declares the label those installers install"
+
+# The alarm still fires for a job NOBODY declares — the exclusion list must not have blunted it.
+cat > "$STRAY_HOME/Library/LaunchAgents/com.eldato.hand-installed.plist" <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>Label</key><string>com.eldato.hand-installed</string>
+<key>ProgramArguments</key><array><string>/bin/bash</string><string>/x/mystery.sh</string></array>
+</dict></plist>
+PLIST
+set +e
+OUT="$(run_stray_status)"; RC=$?
+set -e
+assert_eq "$RC" "1" "§18 control: a job NOBODY declares is still UNMANAGED (the exemptions did not blunt the alarm)"
+assert_contains "$OUT" "com.eldato.hand-installed" "§18 ... and is named"
+assert_contains "$OUT" "launchctl bootout" "§18 ... with the exact command that removes it (the missing remediation)"
+rm -f "$STRAY_HOME/Library/LaunchAgents/com.eldato.hand-installed.plist"
+rm -f "$STRAY_HOME/Library/LaunchAgents/com.eldato.orchestrator-loop.plist"
 
 
 echo "  PASS=$PASS FAIL=$FAIL"

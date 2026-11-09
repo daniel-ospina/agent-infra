@@ -87,9 +87,26 @@ die() { printf '%s\n' "$*" >&2; exit 1; }
 # ── THE LAUNCHD WITNESS ─────────────────────────────────────────────────────────────────────────
 # `XPC_SERVICE_NAME` is set by launchd IN THE JOB'S OWN ENVIRONMENT, to the job's label. That makes
 # it an in-process witness of "a launchd job spawned me" — it needs no ancestry walk, no `launchctl`
-# call, and it is inherited by exactly the processes this refusal is meant to stop. An interactive
-# shell (and a cmux pane, and tmux, and systemd on Linux) does not have it.
-started_by_launchd() { [ -n "${XPC_SERVICE_NAME:-}" ]; }
+# call, and it is inherited by exactly the processes this refusal is meant to stop.
+#
+# ⛔ PRESENCE IS NOT THE WITNESS — THE LABEL IS (#1867 review P1). macOS sets this variable in the
+# process tree of any GUI app as well, with a LaunchServices SENTINEL instead of a job label: a
+# Terminal/iTerm shell commonly carries `XPC_SERVICE_NAME=0`, and an app-launched shell carries
+# `application.<bundle-id>.<uuid>`. A bare non-empty test therefore REFUSED IN THE VERY SHELL THE
+# REFUSAL MESSAGE TELLS THE OPERATOR TO USE — a cmux pane lives under a GUI terminal — which is the
+# blind-heartbeat false signal mirrored, and it reds every pane of the machine this file ships to.
+# The established discriminator (several independent implementations converged on it) is label
+# SHAPE: reject the two GUI sentinels, accept a real launchd label.
+# ⛔ AND THE POLARITY STAYS FAIL-CLOSED: only those two sentinels are allow-listed, so an
+# UNRECOGNISED value still refuses. Widening this allow-list is how the gate stops gating.
+started_by_launchd() {
+    local label="${XPC_SERVICE_NAME:-}"
+    [ -n "$label" ] || return 1
+    case "$label" in
+        0|application.*) return 1 ;;
+    esac
+    return 0
+}
 
 # ── START ──────────────────────────────────────────────────────────────────────────────────────
 cmd_start() {
@@ -146,7 +163,16 @@ EOF
     fi
 
     local cmd
-    printf -v cmd '%s' "LOOP_DETACHED=1 nohup setsid bash \"$LOOP\" >>\"$STATE/heartbeat-launch.log\" 2>&1 &"
+    # ⛔ NO `setsid` (#1867 review P0). macOS ships no `setsid` binary — a fact this repo states in
+    # three places of its own (`check-portability-traps.sh`:204's `setsid-absent-on-macos` rule and
+    # its detector arm; `VENDOR.md`; and the loop's own portable detach) — so the ONE documented
+    # launch path could not start the loop on the ONLY platform this file exists for. Measured:
+    # `nohup: failed to run command 'setsid': No such file or directory`, then the 5 s wait and a
+    # DRIFT. `( … ) &` is the portable detach that rule names, and it is exactly what
+    # `heartbeat-loop.sh`'s own self-detach already uses. `LOOP_DETACHED=1` is what makes one fork
+    # correct here, so no session leader is needed.
+    # The dry-run string must print EXACTLY this command, or it prints one that fails.
+    printf -v cmd '%s' "LOOP_DETACHED=1 nohup bash \"$LOOP\" >>\"$STATE/heartbeat-launch.log\" 2>&1 &"
 
     if [ "$dry" = 1 ]; then
         say "DRY RUN — would execute (from a cmux-attributed shell):"
@@ -165,8 +191,12 @@ EOF
     # detaches the real loop and exits, leaving a pidfile naming a grandchild nobody tracked. With
     # the marker set, the process THIS script starts in its own session IS the loop, so the pid we
     # verify is the pid that writes the pidfile.
-    ( cd "$SELF_DIR" && LOOP_DETACHED=1 nohup setsid bash "$LOOP" >>"$STATE/heartbeat-launch.log" 2>&1 & ) || \
-        die "launch failed: could not exec $LOOP"
+    # ⛔ PORTABLE DETACH, NOT `setsid` — see the dry-run arm above for the measurement.
+    # ⛔ AND NO `|| die` HERE: a backgrounded subshell in `( )` exits 0 whatever its child does, so
+    # that arm could never fire and read as a guard that was only decoration. The launch is verified
+    # below by the ARTEFACT the loop leaves (pidfile + `kill -0`), which is a real proof, and a LOOP
+    # that is missing is refused further up by name.
+    ( cd "$SELF_DIR" && LOOP_DETACHED=1 nohup bash "$LOOP" >>"$STATE/heartbeat-launch.log" 2>&1 & )
 
     local i upid=""
     for i in 1 2 3 4 5 6 7 8 9 10; do
@@ -192,6 +222,28 @@ cmd_stop() {
 }
 
 # ── STATUS (informational) ────────────────────────────────────────────────────────────────────
+# ── A FILE MTIME, PORTABLE (#1867 review P2) ────────────────────────────────────────────────────
+# `date -r FILE` means "use FILE as the reference" on GNU and "seconds since epoch" on BSD/macOS,
+# so passing a PATH failed on the only platform that has the defect and `status` printed
+# `<unreadable>` for BOTH timestamps — from the verb the docs table says answers "how stale is the
+# last pass?". This file is otherwise explicitly macOS-aware about this class of bug (`cut
+# --output-delimiter` below), so it reads the epoch with the GNU-then-BSD ladder the portability gate
+# blesses (`stat -c %Y || stat -f %m`) and formats it the same way round (`date -d @…` || `date -r`).
+mtime_iso() { # $1 = file → ISO-8601 mtime, or "<unreadable>"
+    local f="$1" epoch=""
+    [ -f "$f" ] || { printf '%s' '<unreadable>'; return 0; }
+    # GNU stat prints the FILESYSTEM LISTING for `-f %m` and exits non-zero, so the BSD arm only
+    # answers when the GNU one declined — the guard below rejects anything that is not all digits.
+    epoch="$(stat -c %Y "$f" 2>/dev/null || stat -f %m "$f" 2>/dev/null)" || true
+    case "$epoch" in
+        ''|*[!0-9]*) printf '%s' '<unreadable>'; return 0 ;;
+    esac
+    # ⛔ THE PAIR MUST SIT IN ONE COMMAND UNIT: the portability gate reads a GNU/BSD fallback as
+    # portable only when the `||` counterpart is in the SAME unit, and a `\`-newline continuation
+    # ends the unit — the check reported this file as a NEW `date-d-gnu` trap until it was one line.
+    date -d "@$epoch" '+%Y-%m-%dT%H:%M:%S%z' 2>/dev/null || date -r "$epoch" '+%Y-%m-%dT%H:%M:%S%z' 2>/dev/null || printf '%s' '<unreadable>'
+}
+
 cmd_status() {
     local upid="" alive="no"
     if [ -f "$PIDFILE" ]; then
@@ -202,17 +254,55 @@ cmd_status() {
     say "loop path: $LOOP"
     say "state dir: $STATE"
     if [ -f "$LOG" ]; then
-        say "last pass: $(date -r "$LOG" '+%Y-%m-%dT%H:%M:%S%z' 2>/dev/null || echo '<unreadable>') ($LOG)"
+        say "last pass: $(mtime_iso "$LOG") ($LOG)"
     else
         say "last pass: <never — no $LOG>"
     fi
     if [ -s "$SNAP" ]; then
-        say "fleet read: $(date -r "$SNAP" '+%Y-%m-%dT%H:%M:%S%z' 2>/dev/null || echo '<unreadable>') ($SNAP)"
+        say "fleet read: $(mtime_iso "$SNAP") ($SNAP)"
     else
         say "fleet read: <none published>"
     fi
     [ -f "$KILLFILE" ] && say "kill file: PRESENT ($KILLFILE) — the loop will exit/not run"
     return 0
+}
+
+# ⛔ THE SNAPSHOT READER LIVES IN A FUNCTION BODY, NOT INLINE IN A `$( … )` (#2930, #2248). bash 3.2
+# — macOS's /bin/bash, and the fleet's runtime platform — does not know about here-documents inside a
+# command substitution: it walks the body as CODE, one unbalanced quote desynchronises the parse for
+# the REST OF THE FILE, and it can EXECUTE the here-doc's words (measured: a script that died at
+# source time while its supervisor logged it alive). `check-bash32-parse.sh` runs the real 3.2 parser
+# and reported THIS file at line 304 with `unexpected EOF while looking for matching '` — a required
+# check, so the function form is not a style choice. The body stays quoted (`<<'PY'`) so nothing in it
+# expands, and the verdict contract is unchanged: one line on stdout, exit code carrying DRIFT/UNKNOWN.
+_check_reader() { # $1 = snapshot path, $2 = max age (s) → one verdict line on stdout
+    python3 - "$1" "$2" <<'PY'
+import json, os, sys, time
+path, max_age = sys.argv[1], int(sys.argv[2])
+try:
+    rows = json.load(open(path))
+except Exception as exc:                       # noqa: BLE001 — any read failure is "cannot answer"
+    print("UNKNOWN\tunparseable fleet snapshot: %s" % exc)
+    raise SystemExit(2)
+if not isinstance(rows, list):
+    print("UNKNOWN\tfleet snapshot is not a row list")
+    raise SystemExit(2)
+age = int(time.time() - os.path.getmtime(path))
+if not rows:
+    # ⛔ AN EMPTY SNAPSHOT IS NOT A HEALTHY FLEET. `degraded` is a PER-ROW flag, so on an empty row
+    # set `any(...)` is vacuously False — the same trap lane-status.py's own publisher documents.
+    print("DRIFT\tempty fleet snapshot (%ds old) — zero rows is a failed read, not a quiet fleet" % age)
+    raise SystemExit(1)
+if age > max_age:
+    print("DRIFT\tfleet read is STALE: %ds old, bound %ds" % (age, max_age))
+    raise SystemExit(1)
+bad = sum(1 for r in rows if isinstance(r, dict) and r.get("degraded"))
+if bad:
+    print("DRIFT\t%d/%d rows DEGRADED — the fleet roster could not be read, so this is not a fleet read"
+          % (bad, len(rows)))
+    raise SystemExit(1)
+print("OK\tfleet read fresh (%ds old) and non-degenerate (%d rows, 0 degraded)" % (age, len(rows)))
+PY
 }
 
 # ── CHECK — THE BEHAVIOUR PROBE ────────────────────────────────────────────────────────────────
@@ -253,34 +343,7 @@ cmd_check() {
 
     # ONE reader, and it FAILS CLOSED: an unparseable snapshot is UNKNOWN, never "no degraded rows".
     local report
-    report="$(python3 - "$SNAP" "$MAX_AGE" <<'PY' 2>&1
-import json, os, sys, time
-path, max_age = sys.argv[1], int(sys.argv[2])
-try:
-    rows = json.load(open(path))
-except Exception as exc:                       # noqa: BLE001 — any read failure is "cannot answer"
-    print("UNKNOWN\tunparseable fleet snapshot: %s" % exc)
-    raise SystemExit(2)
-if not isinstance(rows, list):
-    print("UNKNOWN\tfleet snapshot is not a row list")
-    raise SystemExit(2)
-age = int(time.time() - os.path.getmtime(path))
-if not rows:
-    # ⛔ AN EMPTY SNAPSHOT IS NOT A HEALTHY FLEET. `degraded` is a PER-ROW flag, so on an empty row
-    # set `any(...)` is vacuously False — the same trap lane-status.py's own publisher documents.
-    print("DRIFT\tempty fleet snapshot (%ds old) — zero rows is a failed read, not a quiet fleet" % age)
-    raise SystemExit(1)
-if age > max_age:
-    print("DRIFT\tfleet read is STALE: %ds old, bound %ds" % (age, max_age))
-    raise SystemExit(1)
-bad = sum(1 for r in rows if isinstance(r, dict) and r.get("degraded"))
-if bad:
-    print("DRIFT\t%d/%d rows DEGRADED — the fleet roster could not be read, so this is not a fleet read"
-          % (bad, len(rows)))
-    raise SystemExit(1)
-print("OK\tfleet read fresh (%ds old) and non-degenerate (%d rows, 0 degraded)" % (age, len(rows)))
-PY
-)"
+    report="$(_check_reader "$SNAP" "$MAX_AGE" 2>&1)"
     local prc=$?
     # `prc` is the python verdict; a heredoc that failed to run at all (127/126) is UNKNOWN.
     case "$prc" in

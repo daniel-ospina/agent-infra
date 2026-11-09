@@ -43,7 +43,10 @@
 #
 # `--status` also reports an INSTALLED plist with NO template as UNMANAGED and exits
 # non-zero: that was the blind heartbeat's exact shape — a job on the box that the
-# declared set no longer describes, invisible to every content-drift comparison.
+# declared set no longer describes, invisible to every content-drift comparison. Two
+# classes are declared elsewhere and are NOT reported: labels in RETIRED (pending
+# retirement) and labels in OWNED-BY-OTHER-INSTALLERS (another installer of this repo
+# owns them — the harness controller), so the alarm stays about jobs nobody declares.
 #
 # Usage:
 #   install-launchd.sh               install/refresh all templates (idempotent)
@@ -1623,6 +1626,13 @@ status_job() {
 # Scoped to the labels this repo can plausibly own (`com.eldato.*`, `com.tortoise.*`) so a box's
 # own unrelated LaunchAgents are not this installer's business — the same boundary the rest of the
 # file uses when it probes for an eldato domain.
+#
+# ⛔ TWO DECLARED EXCLUSIONS, both load-bearing and both about NOT crying wolf:
+#   · a label in `RETIRED` is deliberately template-less — it is DECLARED and `retire_pass` removes
+#     it, so it is pending retirement, not unmanaged;
+#   · a label in `OWNED-BY-OTHER-INSTALLERS` is installed by ANOTHER surface of this repo (the
+#     harness controller), which is not this installer's set to describe.
+# Without the second, the reference Mac layout is red forever (#1867 review P1).
 unmanaged_plists() {
     local installed label have_template=0
     [ -d "$AGENTS_DIR" ] || return 0
@@ -1635,6 +1645,9 @@ unmanaged_plists() {
         # A RETIRED label is deliberately template-less: it is DECLARED and it is removed by
         # retire_pass on the next install, so it is not "unmanaged" — it is pending retirement.
         is_retired "$label" && continue
+        # Declared and owned by another installer of THIS repo — not this directory's set, and a
+        # red here would be a permanent false alarm on the reference layout.
+        is_foreign "$label" && continue
         printf '%s\n' "$label"
     done
 }
@@ -1681,6 +1694,47 @@ retired_labels() {
         esac
         printf '%s\n' "$label"
     done < "$manifest"
+}
+
+# ── LABELS ANOTHER INSTALLER IN THIS REPO OWNS (#1867 review P1) ────────────────────────────────
+# `unmanaged_plists` asks "is this job described by the declared set?", and the declared set is
+# THIS directory. But this repo installs launchd jobs from a SECOND surface: the harness controller
+# `com.eldato.orchestrator-loop` is rendered by `scripts/orchestrator-harness/install.sh` from its
+# OWN template, outside `templates/launchd/` — deliberately, because that installer owns its
+# lifecycle through `launchd-cycle.sh`. Flagging it made the honest answer on the reference Mac a
+# PERMANENT red: `--status` rc=1 → `scripts/fleet-schedule.py` prints `SCHEDULE NOT VERIFIED` →
+# `activate-harness.sh` reports `fleet-schedule … FAILING`. An instrument whose healthy state is red
+# is one an operator learns to ignore, or "fixes" by deleting a plist the controller needs.
+#
+# ⛔ THE LIST IS DECLARED, NOT GUESSED, and it is drift-gated: `install-launchd.test.sh` §18 asserts
+# every label in this manifest still matches the declaring installer's own `LABEL=`/`BASE_LABEL=`
+# line, so the two cannot quietly disagree. Resolution mirrors `cmux_manifest` (TEMPLATES_DIR first,
+# then the checkout's own copy) so an env-overridden template dir — the test fixture — still finds
+# it, and a farmed run still falls back to the tree it came from.
+foreign_manifest() {
+    if [ -f "$TEMPLATES_DIR/OWNED-BY-OTHER-INSTALLERS" ]; then
+        printf '%s\n' "$TEMPLATES_DIR/OWNED-BY-OTHER-INSTALLERS"
+    elif [ -f "$INFRA_ROOT/templates/launchd/OWNED-BY-OTHER-INSTALLERS" ]; then
+        printf '%s\n' "$INFRA_ROOT/templates/launchd/OWNED-BY-OTHER-INSTALLERS"
+    fi
+}
+
+foreign_labels() {
+    local manifest label
+    manifest="$(foreign_manifest)"
+    [ -n "$manifest" ] || return 0
+    while IFS= read -r label; do
+        case "$label" in
+            ""|"#"*) continue ;;
+        esac
+        printf '%s\n' "$label"
+    done < "$manifest"
+}
+
+is_foreign() { # $1 = label → 0 when another installer in this repo owns it
+    # Capture, then grep a here-string — never `foreign_labels | grep -q` (#864's SIGPIPE shape).
+    [ -n "$1" ] || return 1
+    grep -qxF -- "$1" <<<"$(foreign_labels || true)"
 }
 
 # ── THE cmux LAUNCH-PATH GATE (#1867) ────────────────────────────────────────────────────────────
@@ -1887,9 +1941,13 @@ if [ "${1:-}" = "--status" ]; then
         while IFS= read -r _lbl; do
             [ -n "$_lbl" ] || continue
             echo "    $_lbl ($AGENTS_DIR/$_lbl.plist)" >&2
+            echo "      remove: launchctl bootout gui/$(id -u) \"$AGENTS_DIR/$_lbl.plist\" && rm -f \"$AGENTS_DIR/$_lbl.plist\"" >&2
         done <<<"$unmanaged"
         echo "    Not described by this repo, so no template change and no content comparison can" >&2
-        echo "    reach it. Inspect it, then either add a template or uninstall it." >&2
+        echo "    reach it. Add a template, or remove the job with the command above." >&2
+        echo "    (A job another installer of this repo owns belongs in templates/launchd/" >&2
+        echo "     OWNED-BY-OTHER-INSTALLERS; a job that should go away belongs in RETIRED, which" >&2
+        echo "     retire_pass removes on the next install — no hand-deletion.)" >&2
         status_rc=1
     fi
     if [ -n "$(retired_labels)" ]; then

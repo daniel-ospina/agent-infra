@@ -1,0 +1,31 @@
+# templates/launchd/OWNED-BY-OTHER-INSTALLERS — launchd labels THIS REPO installs from a surface
+# other than `scripts/install-launchd.sh`'s template set (#1867 review P1).
+#
+# WHY THIS FILE EXISTS
+# --------------------
+# `install-launchd.sh --status` reports any installed `com.eldato.*` / `com.tortoise.*` plist with no
+# template as UNMANAGED and exits non-zero. That instrument is right, but its declared set is ONE
+# directory, and this repo installs launchd jobs from a second surface: the harness controller
+# `com.eldato.orchestrator-loop`, rendered by `scripts/orchestrator-harness/install.sh` from
+# `scripts/orchestrator-harness/launchd.plist.template` and cycled through `launchd-cycle.sh` — it is
+# deliberately NOT in this directory, because that installer owns its own lifecycle.
+#
+# Flagging it made `--status` exit 1 forever on the reference Mac layout, and the caller that gates on
+# it hard-FAILs: `scripts/fleet-schedule.py` → `FAIL … SCHEDULE NOT VERIFIED` →
+# `activate-harness.sh` → `fleet-schedule … FAILING`. A drift instrument whose healthy state is red
+# is one an operator learns to ignore — or silences by deleting a plist the controller needs.
+#
+# WHAT BELONGS HERE
+# -----------------
+# A label that (a) matches the UNMANAGED scope, (b) is installed by another installer in THIS repo,
+# and (c) therefore has no template here. A job that should be GONE belongs in `RETIRED` instead
+# (that is a removal). A job nobody declares is exactly what UNMANAGED is for — do not add it here
+# to quiet the alarm.
+#
+# ⛔ DRIFT-GATED: `scripts/install-launchd.test.sh` §18 asserts every entry below still matches the
+# declaring installer's own `LABEL=` / `BASE_LABEL=` line, so this file cannot silently drift from
+# the installer it describes. Remove an entry when its installer stops installing it.
+#
+#   com.eldato.orchestrator-loop   ← scripts/orchestrator-harness/install.sh (BASE_LABEL)
+#                                   also scripts/orchestrator-bringup.sh (LABEL)
+com.eldato.orchestrator-loop

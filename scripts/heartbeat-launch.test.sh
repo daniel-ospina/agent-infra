@@ -113,6 +113,21 @@ OUT="$(env -u XPC_SERVICE_NAME HEARTBEAT_PI_AGENT_DIR="$R/agent" bash "$LAUNCH" 
 assert_eq "$RC" "0" "§3 with no launchd witness, start --dry-run is ALLOWED (rc=0)"
 assert_not_contains "$OUT" "REFUSING" "§3 …and nothing is refused"
 
+# ⛔ THE OTHER HALF OF THE WITNESS (#1867 review P1). macOS ALSO sets `XPC_SERVICE_NAME` in the
+# process tree of GUI apps, where the value is a LaunchServices SENTINEL rather than a launchd label:
+# `0` (a Terminal/iTerm shell) and `application.<bundle-id>.<uuid>` (an app-launched shell). A bare
+# non-empty test refused in BOTH — including a cmux pane, which is the very shell the refusal
+# message tells the operator to run `start` from — so the gate closed on the fix. Both must be
+# ALLOWED, and §1/§2 above keep proving a REAL label still refuses: the polarity is fail-closed
+# (only these two sentinels are allow-listed), not "anything unfamiliar is fine".
+R="$(newroot s2b)"
+OUT="$(env HEARTBEAT_PI_AGENT_DIR="$R/agent" XPC_SERVICE_NAME=0 bash "$LAUNCH" start --dry-run 2>&1)"; RC=$?
+assert_eq "$RC" "0" "§3b XPC_SERVICE_NAME=0 (an ordinary Terminal shell) is NOT launchd — allowed"
+assert_not_contains "$OUT" "REFUSING" "§3b …and nothing is refused"
+OUT="$(env HEARTBEAT_PI_AGENT_DIR="$R/agent" XPC_SERVICE_NAME=application.com.apple.Terminal.9F2C bash "$LAUNCH" start --dry-run 2>&1)"; RC=$?
+assert_eq "$RC" "0" "§3b an application.<bundle-id>.<uuid> sentinel (an app-launched shell) — allowed too"
+assert_not_contains "$OUT" "REFUSING" "§3b …and nothing is refused"
+
 echo "── 4-6. start: the kill file, liveness, and --dry-run ──"
 
 R="$(newroot s3)"
@@ -219,6 +234,92 @@ assert_not_contains "$(grep -n '/Users/' "$LAUNCH" | grep -v '^[0-9]*:#' || true
 OUT="$(env -u HOME -u XPC_SERVICE_NAME HEARTBEAT_PI_AGENT_DIR="$T/nohome/agent" bash "$LOOP" 2>&1)"; RC=$?
 assert_eq "$RC" "2" "§14 an unset HOME makes the loop REFUSE (2) instead of silently exiting 0"
 assert_contains "$OUT" "REFUSING" "§14 …and the refusal says so on stderr"
+
+echo ""
+echo "── 15. status timestamps are READABLE on macOS too ──"
+
+# ⛔ `date -r FILE` IS GNU-ONLY SEMANTICS (#1867 review P2). GNU reads `-r` as "use FILE as the
+# reference"; BSD/macOS reads it as "seconds since epoch", so passing a PATH failed and `status`
+# printed `<unreadable>` for BOTH timestamps — from the verb the docs table says answers "how stale
+# is the last pass?", on the one platform that has the defect. This arm emulates BSD `date` in a
+# PATH shim (no `-d` at all; `-r` accepts only an epoch), so the GNU-only call cannot accidentally
+# pass just because this host is Linux. Pre-change code prints `<unreadable>` here; the portable
+# ladder (`stat -c %Y || stat -f %m`, then `date -d @… || date -r …`) answers.
+BSDBIN="$T/bsdbin"; mkdir -p "$BSDBIN"
+cat > "$BSDBIN/date" <<'SH'
+#!/usr/bin/env bash
+# BSD `date`, just enough of it: `-d` does not exist, and `-r` takes SECONDS SINCE EPOCH, not a path.
+case "${1:-}" in
+    -d) exit 1 ;;
+    -r) _epoch="${2:-}"
+        case "$_epoch" in ''|*[!0-9]*) exit 1 ;; esac
+        shift 2
+        exec /bin/date -u -d "@$_epoch" "$@" ;;
+esac
+exit 1
+SH
+chmod +x "$BSDBIN/date"
+R="$(newroot s15)"
+printf 'a pass\n' > "$R/agent/state/orchestrator-heartbeat.log"
+printf '[{"lane":"a","degraded":false}]\n' > "$R/agent/state/lane-status.last.json"
+OUT="$(PATH="$BSDBIN:$PATH" HEARTBEAT_PI_AGENT_DIR="$R/agent" bash "$LAUNCH" status 2>&1)"; RC=$?
+assert_eq "$RC" "0" '§15 status exits 0 on a box whose date is BSD'
+assert_not_contains "$OUT" "<unreadable>" '§15 …and both timestamps are READABLE (no GNU-only date -r <path>)'
+assert_contains "$OUT" "last pass: 20" "§15 …the last-pass line carries a real ISO timestamp"
+
+echo ""
+echo '── 16. start LAUNCHES on a box with no working setsid (macOS) ──'
+
+# ⛔ THE P0 THIS ARM PINS (#1867 review). macOS ships no `setsid` binary — `check-portability-traps.sh`
+# says so twice (the rule and its detector arm), VENDOR.md says so, and the loop's own detach never
+# used one — so `start`, the ONE documented launch path, could not start the loop on the ONLY
+# platform this file exists for: `nohup: failed to run command 'setsid': No such file or
+# directory`, 5 s of waiting, `DRIFT`. Measured by the reviewer on a PATH without setsid (rc=1) with
+# the same args and setsid present as the control (rc=0).
+#
+# A `setsid` that FAILS is how this Linux host emulates macOS's absent one: it is deterministic here
+# and indistinguishable to the caller (`nohup` reports the same failure). Nothing else on PATH is
+# shimmed, so a fix that works here is a fix on the Mac — and `( … ) &` plus `LOOP_DETACHED=1` is the
+# portable detach the portability rule names.
+#
+# The stand-in loop is the launcher's whole contract: it leaves the pidfile the launcher verifies.
+# (The real loop would run a fleet pass; `kill -0` is all this launcher asks of a pid.)
+R="$(newroot s16)"
+mkdir -p "$R/agent/scripts"
+cat > "$R/agent/scripts/heartbeat-loop.sh" <<'SH'
+#!/usr/bin/env bash
+mkdir -p "$HEARTBEAT_PI_AGENT_DIR/state"
+printf '%s\n' "$$" > "$HEARTBEAT_PI_AGENT_DIR/state/heartbeat-loop.pid"
+exec sleep 60
+SH
+chmod +x "$R/agent/scripts/heartbeat-loop.sh"
+NOSETSID="$T/nosetsid-bin"; mkdir -p "$NOSETSID"
+printf '#!/usr/bin/env bash\n# a FAILING setsid is macOS having no setsid binary at all\nexit 127\n' > "$NOSETSID/setsid"
+chmod +x "$NOSETSID/setsid"
+# ⛔ OUTPUT GOES TO A FILE, NOT `$( … )`. Measured on this box: capturing the launcher's output in a
+# command substitution reaped the detached child within 200 ms (foreground and `bash -c` captures keep
+# it), so a `$( )` here would test the CAPTURE's lifecycle rather than the launcher's detach — and it
+# would report the child dead on a fixed script. The documented operator invocation is foreground.
+S16_OUT="$T/s16-start.out"
+PATH="$NOSETSID:$PATH" HEARTBEAT_PI_AGENT_DIR="$R/agent" bash "$LAUNCH" start >"$S16_OUT" 2>&1; RC=$?
+OUT="$(cat "$S16_OUT" 2>/dev/null || true)"
+assert_eq "$RC" "0" "§16 start SUCCEEDS with no setsid on the box (the macOS launch path)"
+assert_contains "$OUT" "heartbeat loop started (pid" "§16 …and reports the pid it verified"
+SP="$(tr -dc '0-9' < "$R/agent/state/heartbeat-loop.pid" 2>/dev/null)"
+if [ -n "$SP" ] && kill -0 "$SP" 2>/dev/null; then
+    ok "§16 …and the pid in the pidfile is ALIVE (the artefact, not the exit code)"
+    printf '%s\n' "$SP" >> "$T/livepids"
+else
+    bad "§16 …and the pid in the pidfile is ALIVE (got: ${SP:-none})"
+fi
+kill "$SP" 2>/dev/null || true
+# The dry run must print the SAME command the real one runs — a dry run that prints a `setsid` line
+# is a launcher that tells an operator to run the thing that fails on their machine.
+R="$(newroot s16b)"
+OUT="$(env HEARTBEAT_PI_AGENT_DIR="$R/agent" bash "$LAUNCH" start --dry-run 2>&1)"; RC=$?
+assert_eq "$RC" "0" "§16b start --dry-run exits 0"
+assert_not_contains "$OUT" "setsid" "§16b …and prints NO setsid — the printed command is the one that runs"
+assert_contains "$OUT" "LOOP_DETACHED=1 nohup bash" "§16b …it prints the portable detach instead"
 
 echo ""
 if [ "$FAIL" -eq 0 ]; then

@@ -75,6 +75,23 @@ Matching is by **repo-relative suffix**, not absolute prefix: the gate is a prop
 so `$HOME/.pi/agent/scripts/heartbeat-loop.sh` (the farmed copy a plist would actually name) and
 `<worktree>/scripts/heartbeat-loop.sh` both refuse.
 
+Two label classes are **declared** and therefore never reported as `UNMANAGED`, because an alarm that
+is red on a healthy box is one operators learn to ignore:
+
+- `templates/launchd/RETIRED` — pending retirement; `retire_pass` unloads and removes it. The blind
+  job itself (`com.tortoise.heartbeat-loop`, hand-installed, no template ever named it) is listed
+  there, so **the same change that diagnoses it removes it** — otherwise `--status` stayed red until
+  a human hand-deleted a plist, since `--uninstall` iterates templates and nothing describes it.
+- `templates/launchd/OWNED-BY-OTHER-INSTALLERS` — installed by **another surface of this repo**. The
+  harness controller `com.eldato.orchestrator-loop` is rendered by
+  `scripts/orchestrator-harness/install.sh` from its own template, so it is not this installer's set
+  to describe; flagging it made `--status` exit 1 forever on the reference Mac, and
+  `scripts/fleet-schedule.py` turns that into `SCHEDULE NOT VERIFIED`. The list is drift-gated by
+  `install-launchd.test.sh` §18, which pins every entry to the declaring installer's own `LABEL=`.
+
+A job **nobody** declares is still `UNMANAGED`, and the report now names the exact command that
+removes it.
+
 ## ⛔ What is NOT the fix
 
 **Do not relax `automation.socketControlMode` from `cmuxOnly` to `automation`.** That widens "only

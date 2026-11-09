@@ -39,11 +39,11 @@ fi
 # A loop that cannot say which home it runs in must refuse loudly: every path it publishes is
 # derived from this root.
 if [ -z "${HOME:-}" ] || [ ! -d "$HOME" ]; then
-    if [ -n "${STATE:-}" ]; then mkdir -p "$STATE" 2>/dev/null || true; fi
-    if [ -n "${STATE:-}" ] && [ -d "$STATE" ]; then
-        printf '%s LOOP REFUSING to start: HOME=%s is unset or not a directory — every state path\n' \
-            "$(date '+%m-%d %H:%M:%S')" "${HOME:-<unset>}" >> "$LOG" 2>/dev/null || true
-    fi
+    # ⛔ STDERR ONLY, AND THAT IS THE HONEST FORM (#1867 review). The "durable log" half that used
+    # to sit here was DEAD: `STATE`/`LOG` are assigned further down this file and no caller exports
+    # them, so `${STATE:-}` was always empty at this point — and if a caller ever DID export STATE,
+    # the `>> "$LOG"` under `set -u` would abort with rc=1 instead of the promised 2. The refusal
+    # itself is the part that works, and it is pinned (rc=2 + "REFUSING"), so it stays exactly that.
     echo "heartbeat-loop: REFUSING to start: HOME=${HOME:-<unset>} is unset or not a directory" >&2
     exit 2
 fi
@@ -382,7 +382,8 @@ export O="${O:-$HOME/orchestrator}"
 # ⛔ NO LITERAL USER HOME (#1867). Every home-relative entry is derived from `$HOME` and appended
 # only when it exists; the absolutist list this replaced (`/Users/danielospina/bin:…`) was correct
 # on exactly one machine and produced a PATH full of non-directories everywhere else. The system
-# tail is kept as-is because those paths are the same on macOS and on the Linux cells.
+# dirs are APPENDED as the TAIL, because those paths are the same on macOS and on the Linux cells
+# and they must never outrank anything above them in this list.
 for _path_dir in \
     "$HOME/bin" \
     "/Applications/cmux.app/Contents/Resources/bin" \
@@ -393,9 +394,18 @@ for _path_dir in \
     [ -d "$_path_dir" ] || continue
     case ":$PATH:" in *":$_path_dir:"*) continue ;; esac
     PATH="$_path_dir:$PATH"
-done
+ done
 unset _path_dir
-export PATH="/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
+# ⛔ APPEND, NEVER PREPEND (#1867 review P1). These five dirs were PREPENDED by an earlier version of
+# this line, which moved `/usr/local/bin` and `/usr/bin` AHEAD of the entries the loop above pins —
+# so every child's bare `gh` resolved to the raw binary and NOT to `~/.pi/agent/shims/gh`. That shim
+# is load-bearing, not a convenience wrapper: its header calls it "the argv-level admin-merge guard
+# (#984)" and "THE FLEET COURTESY GATE (#1910)", and `:3-10` of THIS file records the measured
+# consequence of losing it ("every telemetry read returned empty and the fleet read '0 open PRs /
+# VERDICT=STALLED' while 100 PRs were open"). Appending reproduces the pre-change precedence
+# (shims before homebrew/system) on both platforms, and the comment above now states what the code
+# actually does.
+export PATH="$PATH:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 export CMUX_QUIET=1     # the deprecation notice otherwise PREFIXES --json output
 
 # ⛔ REPO EVIDENCE FOR THE DETACHED PASS, PINNED HERE BECAUSE THIS LOOP *IS* THE LAUNCHER (agent-infra#2280).
