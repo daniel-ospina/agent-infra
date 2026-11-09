@@ -2848,6 +2848,14 @@ esac
 qsup status "$Q/agent-repo" "$Q/st-status-bad" OR=daniel-ospina/tortoise
 [ "$Q_RC" -eq 0 ] && ok "status: a MISMATCH is reported, not refused (it must stay answerable)" \
                   || bad "status exited $Q_RC on a mismatch — the operator loses the diagnostic"
+# ⛔ …AND THE VERDICT MUST DESCRIBE THE CODE, NOT ONE OF ITS FOUR LEGS (review P3): a box that is DOWN
+# but still carries `.desired` refuses `stop` with no controller live, so "while a controller is live"
+# told an operator the opposite of what `stop` does. Pin the wider condition so the overstatement
+# cannot drift back.
+case "$Q_OUT" in
+  *"MISMATCH"*"anything a stop would end"*) ok "status: the mismatch line names the condition stop actually applies (not 'while a controller is live')" ;;
+  *) bad "(9b) status's mismatch line does not name the condition 'stop' applies, so an operator on a down-but-.desired box is told 'stop' will work and is then refused: $Q_OUT" ;;
+esac
 case "$Q_OUT" in
   *"queue: daniel-ospina/tortoise @ $Q/agent-repo"*"MISMATCH"*) ok "status: the mismatch line carries both values and the verdict" ;;
   *) bad "status's mismatch line does not name both sides — $Q_OUT" ;;
@@ -2971,11 +2979,20 @@ say_case "the deploy sequence is pre-flight-gated, not only its last step (agent
 # generation (`stop`'s second write), and a session the tmux double reports as up. ⛔ No `orch-loop.sh`
 # process exists for it, so `stop`'s OWNERSHIP checks are what a `--force` arm reaches after the gate —
 # which is exactly the proof `--force` got PAST the gate.
+# ⛔ THE PANE PROOF IS LOAD-BEARING, NOT DECORATION (review P2 at the end of #2093). `cmd_stop`'s kill
+# path refuses to signal a machine-scoped session name it cannot prove it owns (#1856, `sup:4415`), and
+# the proof it reads is the session's own pane command naming `$O`. Without `$1/pane` that proof FAILS
+# on the PRE-FIX supervisor too — it dies at the ownership check before `tmux kill-session` is ever
+# reached, so `$S1/up` survived the mutant AND the fix, and "NOTHING LOST: the controller session was
+# not killed" could not vary (measured: it printed ✅ on `origin/main`'s supervisor). Seeding the pane is
+# what makes main's `stop` actually reach `tmux kill-session`, which removes `$S/up` in the double, so
+# the row now reddens on exactly the code the change removes.
 seed_started_cell() { # <state dir>
   mkdir -p "$1/o/state/roles" || return 1
   : > "$1/o/state/roles/.desired" || return 1
   printf '3\n' > "$1/o/state/roles/.stop-generation" || return 1
   : > "$1/up" || return 1
+  printf "bash -lc O='%s' orch-loop.sh\n" "$1/o" > "$1/pane" || return 1
 }
 sgen() { cat "$1/o/state/roles/.stop-generation" 2>/dev/null; }
 
@@ -3042,9 +3059,15 @@ esac
 [ -f "$S1/up" ] \
   && ok "NOTHING LOST: the controller session was not killed" \
   || bad "stop killed the controller session on a refused stop"
+# ⛔ "NOTHING WAS STOPPED" MUST ALSO COVER THE SESSION CLAIM (review P2, second half). The refusal
+# says nothing was stopped, so ANY line asserting the controller session was cleared is the same false
+# claim — and on the pre-fix supervisor it is exactly what the refused stop prints before dying at
+# `start`, having already killed the session (measured on `origin/main`: "cleared this state dir's
+# leftover session …"). Left out of the bad set, this row could not vary; with it, the row reddens on
+# the code the change removes instead of confirming it.
 case "$Q_OUT" in
-  *"controller stopped"*|*"doctor loop stopped"*|*"not running"*) bad "stop reported a stopped cell although it refused: $Q_OUT" ;;
-  *) ok "stop never claims the cell was stopped" ;;
+  *"controller stopped"*|*"doctor loop stopped"*|*"not running"*|*"cleared this state dir's leftover session"*) bad "stop reported a stopped/cleared cell although it refused: $Q_OUT" ;;
+  *) ok "stop never claims the cell was stopped (or its session cleared)" ;;
 esac
 
 # (2) INDICATOR (a): the DOCUMENTED deploy (`stop` -> `start`) on this box leaves it exactly as found —
@@ -3071,7 +3094,7 @@ esac
 # must not refuse a MATCHED pair. Two arms, because both are ways the new gate could false-block:
 #  (3a) matched pair, started cell -> stop proceeds (the gate stays silent).
 S3="$Q/st2093-ok"; rm -rf "$S3"; mkdir -p "$S3"; seed_started_cell "$S3"
-rm -f "$S3/up"   # a cell that is started-but-down: stop has a target (the marker) and no session to kill
+rm -f "$S3/up" "$S3/pane"   # a cell that is started-but-down: stop has a target (the marker) and no session to kill
 qverb stop "$Q/tortoise-repo" "$S3" ''
 [ "$Q_RC" -eq 0 ] && ok "stop: a MATCHED pair still stops normally (rc=0 — no false block)" \
                   || bad "stop FALSE-BLOCKED a matched pair (rc=$Q_RC): $Q_OUT"

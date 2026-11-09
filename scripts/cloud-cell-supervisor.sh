@@ -1781,11 +1781,12 @@ queue_state_text() {
   case "$QUEUE_STATE" in
     derived)     printf 'ok — derived from the checkout' ;;
     explicit)    printf 'ok — OR matches the checkout' ;;
-    # ⛔ "WHILE A CONTROLLER IS LIVE" DESCRIBED THE WRONG LEG (review P3): the `.desired` marker alone
-    # refuses `stop` with no live controller anywhere, and it is the leg `stop` removes FIRST. The summary
-    # must name the gate's own condition, not one example of it — the enumeration lives in
-    # `stop_would_end_something`.
-    mismatch)    printf 'MISMATCH — start/check refuse, and stop refuses while this state dir has something a stop would end (marker, provable own session, doctor loop, or controller pid) (MERGE-INERT, agent-infra#1901)' ;;
+    # ⛔ NAME THE CONDITION THE CODE APPLIES, NOT ONE OF ITS LEGS (review P3, both lanes). The old text said
+    # "while a controller is live", but `stop_would_end_something` refuses on more than that: the FIRST leg
+    # is `$ROLES_DIR/.desired`, which a box that is DOWN (OOM, reboot, an earlier partial stop) still
+    # carries — exactly the state this PR's own doc §3.2 names. The line therefore names the gate's own
+    # condition, and enumerates the legs the code reads, so it cannot be read as one example of them.
+    mismatch)    printf 'MISMATCH — start/check refuse, and stop refuses while this state dir has anything a stop would end (marker, provable own session, doctor loop, or controller pid) — MERGE-INERT, agent-infra#1901' ;;
     nocheckout)  printf 'NO CHECKOUT — REPO is not set; start/check derive one or refuse (agent-infra#1935)' ;;
     unreadable)  printf 'UNREADABLE — the checkout has no origin remote; start/check refuse' ;;
     underivable) printf 'UNDERIVABLE — origin is not https/http/ssh/scp-like naming <owner>/<repo>; start/check refuse' ;;
