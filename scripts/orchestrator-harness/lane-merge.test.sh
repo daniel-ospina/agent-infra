@@ -1127,6 +1127,58 @@ LM_GOT2="$(head -n 1 "$T/chain-repo.txt" 2>/dev/null)"
 ck "a PATH-shimmed 'awk' cannot hand the chain the lane's own checkout (got: ${LM_GOT2:-<nothing>})" \
    $([ -n "$LM_GOT2" ] && [ "$(cd "$LM_GOT2" && pwd -P)" = "$(cd "$LMFR" && pwd -P)" ] && echo 0 || echo 1)
 
+# ── 11c-nonies-b. THE MERGE AUTHORITY IS FOUND WHEN THE STATE DIR IS NOT THE HARNESS ROOT (#2095) ──
+# ⛔ THE FINDING (fresh-context review of #3846, P1). `orch-loop.sh` now exports `O` = the controller's
+# STATE dir and `O_WORK` = the harness root. `launch_chain` started from `chain="$O/merge-one.sh"` and
+# accepted the beside-file copy ONLY when `_d` equalled `$O` — so on the documented `ORC_STATE_DIR`
+# arrangement, and on every `derived:isolated(<copy>)` instance, `$O/merge-one.sh` could not exist, `_d`
+# was the harness root, and EVERY lane exited 2 before any merge work, with a code `lane.sh`'s table does
+# not map and a remedy (`deploy-harness --o $O`) that installs a harness INTO the state dir.
+# ⛔ AND HALF A FIX WOULD RE-OPEN #3789. "Trust `O_WORK`" is not available: a lane can set `O_WORK`
+# itself. So the fallback needs BOTH that the copy beside the running script IS the declared harness root
+# AND that the root is a MAIN worktree — a lane's own `.worktrees/<lane>` checkout is a LINKED one. Both
+# arms below are driven from real git trees, because the distinction under test IS a git property.
+HAR_ROOT="$T/harness-root"; HAR_WT="$T/harness-lane-wt"
+rm -rf "$HAR_ROOT" "$HAR_WT" "$T/harness-chain.txt" "$T/tampered-chain.txt"
+mkdir -p "$HAR_ROOT"
+git -C "$HAR_ROOT" init -q
+cp "$SCRIPT" "$HAR_ROOT/lane-merge.sh"
+[ -f "$HERE/pr-state.sh" ] && cp "$HERE/pr-state.sh" "$HAR_ROOT/" >/dev/null 2>&1 || true
+printf '#!/usr/bin/env bash\nprintf "HARNESS-CHAIN\\n" >> "%s/harness-chain.txt"\nexit 0\n' "$T" > "$HAR_ROOT/merge-one.sh"
+chmod +x "$HAR_ROOT/merge-one.sh" "$HAR_ROOT/lane-merge.sh"
+git -C "$HAR_ROOT" add -A
+git -C "$HAR_ROOT" -c user.email=t@t -c user.name=t commit -qm "seeded harness root"
+# The state dir a split box keeps its state in: NO merge-one.sh, which is the whole point.
+SD_SPLIT="$T/state-dir-split"; rm -rf "$SD_SPLIT"; mkdir -p "$SD_SPLIT/state" "$SD_SPLIT/logs"
+new_o "$T/junk-q56.tsv"          # a throwaway $OT so mk_chain's fixture does not run for this case
+printf 'open||spl56|clean\n' > "$T/pr-open56.tsv"
+OUT="$(REPO_PATH="$RUN_REPO" PATH="$BIN:$PATH" GH_LOG="$T/gh.log" O="$SD_SPLIT" O_WORK="$HAR_ROOT" HOME="$T/home" T="$T" \
+      LANE_MERGE_INTERVAL=5 LANE_MERGE_WAIT=0 LANE_MERGE_POLL=0 \
+      bash "$HAR_ROOT/lane-merge.sh" 56 --repo o/r --pr-tsv "$T/pr-open56.tsv" --checks-tsv "$T/checks-green.tsv" 2>&1)"; RC=$?
+sleep 1
+ck "a split state dir finds the merge authority in the controller-declared harness root (rc=$RC, not the unmapped 2)" \
+   $([ "$RC" != "2" ] && [ -s "$T/harness-chain.txt" ] && echo 0 || echo 1)
+ck "…and the chain that runs is the harness root's own merge-one.sh" \
+   $(grep -qx 'HARNESS-CHAIN' "$T/harness-chain.txt" 2>/dev/null && echo 0 || echo 1)
+# NEGATIVE (the #3789 half): the lane edits `merge-one.sh` in ITS OWN linked worktree, copies the script
+# there too, and points `O_WORK` at it. `_d` and `O_WORK` then AGREE — value equality alone would accept
+# it — so the main-worktree test is the only thing standing between the lane and its own merge gate.
+printf '#!/usr/bin/env bash\nprintf "TAMPERED-CHAIN\\n" >> "%s/tampered-chain.txt"\nexit 0\n' "$T" > "$T/tampered-merge-one.sh"
+chmod +x "$T/tampered-merge-one.sh"
+git -C "$HAR_ROOT" worktree add -q "$HAR_WT" -b feat/56-tm
+cp "$T/tampered-merge-one.sh" "$HAR_WT/merge-one.sh"
+cp "$HAR_ROOT/lane-merge.sh" "$HAR_WT/lane-merge.sh"
+chmod +x "$HAR_WT/lane-merge.sh" "$HAR_WT/merge-one.sh"
+printf 'open||spl57|clean\n' > "$T/pr-open57.tsv"
+OUT="$(REPO_PATH="$RUN_REPO" PATH="$BIN:$PATH" GH_LOG="$T/gh.log" O="$SD_SPLIT" O_WORK="$HAR_WT" HOME="$T/home" T="$T" \
+      LANE_MERGE_INTERVAL=5 LANE_MERGE_WAIT=0 LANE_MERGE_POLL=0 \
+      bash "$HAR_WT/lane-merge.sh" 57 --repo o/r --pr-tsv "$T/pr-open57.tsv" --checks-tsv "$T/checks-green.tsv" 2>&1)"; RC=$?
+sleep 1
+ck "a lane that points O_WORK at its OWN linked worktree is still refused (exit 2, rc=$RC) — #3789 intact" \
+   $([ "$RC" = "2" ] && echo 0 || echo 1)
+ck "…and the TAMPERED merge gate never ran" \
+   $([ ! -e "$T/tampered-chain.txt" ] && echo 0 || echo 1)
+
 # ── 11c-nonies-a. THE HAND-OFF'S PRINTED REMEDY NAMES THE SAME TREE (landing review F1, P1) ──────────
 # ⛔ F1 WAS REINTRODUCED AS DOCUMENTATION. `launch_chain` refuses to run the chain from a lane worktree —
 # merge-one.sh resolves the merge authority as `$REPO/scripts/admin-merge.sh` and that rail resolves its

@@ -867,8 +867,39 @@ resolve_trusted_checkout() {
 # silent for ~15-25 minutes, which reads as a wedged lane to every liveness instrument we have.
 # ⛔ AND IT WILL NOT DOUBLE-REVIEW: merge-one.sh takes state/mergeclaim-<PR>.lock first, so a chain
 # the controller already spawned owns the PR and ours exits without paying a second reviewer.
+# _lm_is_main_worktree <dir> — 0 when <dir> is its repo's MAIN worktree, never a LINKED one.
+# ⛔ THIS IS THE SECOND HALF OF #3789's IDENTITY TEST, NOT A REPLACEMENT FOR IT (fresh-context review
+# of #3846, P1). The anti-bypass rule is "a lane must not merge its PR through ITS OWN edited merge
+# gate", and the realistic shape of that attack is a lane editing `merge-one.sh` inside its own
+# `.worktrees/tm-<N>` checkout and having the beside-file fallback pick it up. A linked worktree is
+# exactly what a lane checkout is (`--git-dir` is `<common>/worktrees/<name>`, `--git-common-dir` is
+# the shared dir), so this predicate refuses it while accepting the operator-seeded harness root.
+# Fail-closed on anything it cannot read: an unreadable tree is not evidence of trust.
+_lm_is_main_worktree() {
+  local d="${1:-}" gd="" common=""
+  [ -n "$d" ] && [ -d "$d" ] || return 1
+  git -C "$d" rev-parse --git-dir >/dev/null 2>&1 || return 1
+  gd="$(git -C "$d" rev-parse --absolute-git-dir 2>/dev/null)" || return 1
+  common="$(git -C "$d" rev-parse --git-common-dir 2>/dev/null)" || return 1
+  [ -n "$gd" ] && [ -n "$common" ] || return 1
+  common="$(cd "$d" 2>/dev/null && cd "$common" 2>/dev/null && pwd -P)" || return 1
+  [ -n "$common" ] || return 1
+  [ "$gd" = "$common" ]
+}
+
 launch_chain() {
-  local head="$1" chain="$O/merge-one.sh"
+  local head="$1" chain="$O/merge-one.sh" _d="" _o_canon="" _root=""
+  # ⛔ `$O` IS THE CONTROLLER'S STATE DIR, AND THE HARNESS ROOT IS A SEPARATE NAME (#2095; fresh-context
+  # review of #3846, P1). Since this PR, `orch-loop.sh` exports `O` = the state dir and `O_WORK` = the
+  # harness root; on the documented `ORC_STATE_DIR` arrangement, and on every `derived:isolated(<copy>)`
+  # instance, `<state>/merge-one.sh` cannot exist and the identity test below compared against a
+  # directory the harness never lives in — so EVERY lane on such a box exited 2 before any merge work,
+  # with an exit code `lane.sh`'s table does not even map (`:580-591` lists 0/10/15/11/12/13/14) and a
+  # remedy (`deploy-harness --o $O`) that would install a whole harness INTO the state dir, undoing the
+  # split. `$O/merge-one.sh` is still tried FIRST: the operator-seeded runtime keeps exact priority, so
+  # no existing box changes behaviour by one byte.
+  _o_canon="$(cd "$O" 2>/dev/null && pwd -P)" || _o_canon="$O"
+  _root="$(cd "${O_WORK:-$O}" 2>/dev/null && pwd -P)" || _root=""
   # ⛔ THE FALLBACK MUST RESOLVE TO THE SAME TREE AS $O, NOT WHEREVER THIS FILE WAS INVOKED. $O's copy
 # is the operator-seeded authority precisely so a lane cannot choose its own gate — and the natural
 # way for a lane to run this script is the checkout copy (`scripts/orchestrator-harness/lane-merge.sh`
@@ -876,19 +907,31 @@ launch_chain() {
 # branch merge its PR through ITS version of the merge gate. Refuse instead: the lane's remedy is to
 # sync the harness, which is safe.
 if [ ! -f "$chain" ]; then
-  _d="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-  if [ "$_d" = "$(cd "$O" 2>/dev/null && pwd)" ]; then
+  _d="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+  if [ "$_d" = "$_o_canon" ]; then
+    # TODAY'S PATH, UNCHANGED: the state dir IS the seeded runtime.
+    chain="$_d/merge-one.sh"
+  elif [ -n "$_root" ] && [ "$_d" = "$_root" ] && [ -f "$_root/merge-one.sh" ] && _lm_is_main_worktree "$_d"; then
+    # THE CONTROLLER-DECLARED HARNESS ROOT (#2095). Three conditions, and the last is what keeps
+    # #3789 intact: a lane CAN set `O_WORK` itself, so the value alone is not identity — the copy
+    # beside the running script must be THAT tree, and that tree must be a MAIN worktree, which a
+    # lane's own `.worktrees/<lane>` checkout (or a copy of the script inside it) never is.
     chain="$_d/merge-one.sh"
   else
-    say_err "lane-merge: $O/merge-one.sh is missing and the copy beside this script ($_d) is not the"
-    say_err "  harness $O — refusing to select the merge authority from a checkout that may be a lane's"
-    say_err "  own branch. Redeploy it: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o $O"
+    say_err "lane-merge: no merge authority found — looked in $O/merge-one.sh and in the harness root"
+    say_err "  ${_root:-<unresolved>}/merge-one.sh; the copy beside this script ($_d) is neither the"
+    say_err "  state dir ($_o_canon) nor a MAIN worktree of the controller-declared harness root,"
+    say_err "  so it may be a lane's own branch. Refusing to select the merge authority from it."
+    say_err "  If this box keeps its state elsewhere, the harness root must be the tree the controller"
+    say_err "  runs from (a main checkout, exported as O_WORK); the remedy is to re-seed THAT tree:"
+    say_err "  bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o ${_root:-$O}"
     exit 2
   fi
 fi
   if [ ! -f "$chain" ]; then
-    say_err "lane-merge: merge-one.sh not found (looked in $O and beside this script) — refusing to"
-    say_err "            hand-roll a merge; redeploy the harness (bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o $O)"
+    say_err "lane-merge: merge-one.sh not found (looked in $O, the harness root ${_root:-<unresolved>}, and"
+    say_err "            beside this script) — refusing to hand-roll a merge; redeploy the harness"
+    say_err "            (bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o ${_root:-$O})"
     return 1
   fi
   # ⛔ THE CHECKOUT THE CHAIN RUNS FROM IS RESOLVED, NEVER INHERITED (landing-review F1). Resolved here,
