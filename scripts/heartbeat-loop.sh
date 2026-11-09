@@ -377,9 +377,21 @@ export O="${O:-$HOME/orchestrator}"
 # #1910 pacing gate for every child of this loop, while the pin LOOKED installed. Appending the
 # entries in list order to an accumulator and prepending that ONE string keeps the first-listed dir
 # furthest front, shims ahead of homebrew/system, and the system dirs appended below as the tail —
-# the precedence `main`'s single literal had. (Nothing is added twice: an entry already on PATH is
-# skipped, and the shim dir is the one entry that must never be omitted.)
+# the precedence `main`'s single literal had.
+#
+# ⛔ AND "ALREADY ON PATH" IS NOT "ALREADY IN FRONT" (#1867 review P2, round 6). The pin skipped any
+# entry already present (`case ":$PATH:" in *":$_path_dir:"*) continue`), which preserves that
+# entry's INHERITED rank — so a caller whose PATH already carried `/opt/homebrew/bin` BEFORE
+# `$HOME/.pi/agent/shims` (a brew Mac's interactive shell, or any caller that exported COLUMNS/PATH
+# from a login profile) got exactly the precedence this block exists to prevent: both dirs skipped,
+# only the three absent ones prepended, and a child's bare `gh` still resolved to the raw binary.
+# The block's own comment says the shim dir "must never be omitted"; the skip arm omitted it. A pinned
+# dir is now ALWAYS prepended, and its inherited occurrences are STRIPPED from the tail, so rank is
+# forced rather than assumed. Empty PATH components (which mean the cwd) are dropped by the same
+# pass — they are the one entry a caller never sees, and `.` on a PATH is a hazard, not a setting.
 _pin_prefix=""
+_pin_rest="$PATH"
+_oldifs="$IFS"
 for _path_dir in \
     "$HOME/bin" \
     "/Applications/cmux.app/Contents/Resources/bin" \
@@ -388,12 +400,24 @@ for _path_dir in \
     "$HOME/.local/bin" \
     "/opt/homebrew/bin"; do
     [ -d "$_path_dir" ] || continue
-    case ":$PATH:" in *":$_path_dir:"*) continue ;; esac
     _pin_prefix="$_pin_prefix$_path_dir:"
- done
-unset _path_dir
-if [ -n "$_pin_prefix" ]; then PATH="$_pin_prefix$PATH"; fi
-unset _pin_prefix
+    _pruned=""
+    IFS=':'
+    # Globbing OFF around the split: a PATH component containing `*` or `?` must be copied, not expanded
+    # against the cwd — the same reason `pid_is_loop` does it in `heartbeat-launch.sh`.
+    set -f
+    for _pin_dir in $_pin_rest; do
+        [ -n "$_pin_dir" ] || continue
+        [ "$_pin_dir" = "$_path_dir" ] && continue
+        _pruned="${_pruned:+$_pruned:}$_pin_dir"
+    done
+    set +f
+    IFS="$_oldifs"
+    _pin_rest="$_pruned"
+done
+unset _path_dir _pin_dir _pruned _oldifs
+PATH="$_pin_prefix$_pin_rest"
+unset _pin_prefix _pin_rest
 # ⛔ APPEND, NEVER PREPEND (#1867 review P1). These five dirs were PREPENDED by an earlier version of
 # this line, which moved `/usr/local/bin` and `/usr/bin` AHEAD of the entries the loop above pins —
 # so every child's bare `gh` resolved to the raw binary and NOT to `~/.pi/agent/shims/gh`. That shim

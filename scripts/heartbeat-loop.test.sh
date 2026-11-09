@@ -153,7 +153,11 @@ mkfix() {
 # one-pass exit is gone and the suite must fail rather than hang CI forever.
 run_pass() {
   local d="$1"
+  # ⛔ `RUN_PASS_PATH` LETS ONE CASE CHOOSE THE INHERITED PATH (#1867 review P2, round 6). The pin's
+  # whole job is to OVERRIDE an inherited rank, so a case that wants to prove it must be able to
+  # hand the loop a PATH of its own; every other case takes `$PATH` unchanged.
   ( HOME="$d/home" HEARTBEAT_PI_AGENT_DIR="$d/agent" LOOP_DETACHED=1 HEARTBEAT_PASS_ONCE=1 \
+      PATH="${RUN_PASS_PATH:-$PATH}" \
       /bin/bash "$LOOP" >/dev/null 2>&1 ) &
   local pid=$! wd
   # ⛔ KILL THE GROUP, NOT THE SUBSHELL. `kill "$wd"` reaped the watchdog subshell and orphaned the
@@ -816,6 +820,40 @@ if [ "$SHIM_RANK" -gt 0 ] && [ "$BREW_RANK" -gt 0 ] && [ "$SHIM_RANK" -lt "$BREW
   pass "15. the shim dir outranks homebrew ($SHIM_RANK < $BREW_RANK) — list order is not installed reversed"
 else
   fail "15. the shim dir does NOT outrank homebrew (shim=$SHIM_RANK brew=$BREW_RANK) — the pin is installed REVERSED"
+fi
+
+# ⛔ AND "ALREADY ON PATH" IS NOT "ALREADY IN FRONT" (#1867 review P2, round 6). The pin SKIPPED any
+# entry already present, which preserves that entry's INHERITED rank. So on the very box this pin
+# exists for — a brew Mac whose login PATH already carries /opt/homebrew/bin BEFORE
+# $HOME/.pi/agent/shims — both dirs were skipped, only the absent ones were prepended, and the raw
+# `gh` still won: the #984 admin-merge guard and #1910 pacing gate inert for every child, while the
+# block's own comment said the shim dir "must never be omitted". §15 above cannot see this by
+# construction: it inherits the RUNNER's PATH, which carries neither dir, so both are always absent
+# and only the list order is graded. Here the inherited PATH carries BOTH, brew first.
+FIX15B="$(mkfix pinrank2 0)"
+mkdir -p "$FIX15B/home/bin" "$FIX15B/home/.pi/agent/bin" "$FIX15B/home/.pi/agent/shims" "$FIX15B/home/.local/bin"
+cp "$PINROOT/shim-gh" "$FIX15B/home/.pi/agent/shims/gh"
+cat > "$FIX15B/agent/scripts/orchestrator-heartbeat.sh" <<SH
+#!/bin/bash
+{ command -v gh; printf '%s\n' "\$PATH"; } > "$FIX15B/gh-resolved" 2>&1
+exit 0
+SH
+RUN_PASS_PATH="$PINROOT/opt/homebrew/bin:$FIX15B/home/.pi/agent/shims:/usr/local/bin:/usr/bin:/bin"
+run_pass "$FIX15B"
+unset RUN_PASS_PATH
+RES15B="$(sed -n 1p "$FIX15B/gh-resolved" 2>/dev/null)"
+PATH15B="$(sed -n 2p "$FIX15B/gh-resolved" 2>/dev/null)"
+if [ "$RES15B" = "$FIX15B/home/.pi/agent/shims/gh" ]; then
+  pass "15b. an INHERITED shim dir behind homebrew is MOVED to the front, not skipped — bare 'gh' is the shim"
+else
+  fail "15b. the inherited PATH put homebrew ahead of the shims and the pin skipped both, so bare 'gh' resolved to [${RES15B:-<none>}] — the shim is SHADOWED on the exact box the pin exists for"
+fi
+S15B="$(rank_of "$PATH15B" "$FIX15B/home/.pi/agent/shims")"
+B15B="$(rank_of "$PATH15B" "$PINROOT/opt/homebrew/bin")"
+if [ "$S15B" -gt 0 ] && [ "$B15B" -gt 0 ] && [ "$S15B" -lt "$B15B" ]; then
+  pass "15b. …and each dir appears once, shim ahead of homebrew (ranks $S15B / $B15B) — forced, not inherited"
+else
+  fail "15b. the pinned PATH has the shim dir at rank ${S15B:-0} and homebrew at rank ${B15B:-0} — the pin did not force the order"
 fi
 
 if [ "$failures" -eq 0 ]; then
