@@ -21,12 +21,16 @@
 #      silently widened to the toplevel); a symlinked checkout is ONE path. Plus the git-env scrub:
 #      an ambient `GIT_DIR`/`GIT_WORK_TREE` cannot forge a checkout — with the premise that raw
 #      `git -C` DOES accept that forgery asserted alongside, so the arm cannot pass vacuously.
+#   A′ the DERIVATION arm (`$REPO_CANDIDATES`): a candidate is used only if it PROVES itself, the value
+#      derived is ANNOUNCED, two candidates that both prove are REFUSED by name, and the candidate
+#      list is NEWLINE-delimited so a checkout whose path contains a SPACE survives transport (it
+#      used to be word-split, which refused a box standing in a real checkout — #3833 review F1).
 #   B  the three call sites resolve through it: report.sh, pi-reap-worktrees.sh (both the `--repo` arm
 #      AND the box's inherited `$REPO`) and deploy-crossbox.sh each REFUSE a bogus/absent repo in
 #      their own loud words, none falls back to `$HOME/eldato/tortoise`, `/tmp/cell-ai` or `$PWD`, and
 #      report.sh still exits 0 read-only on a real fixture (the property that made it safe to run
 #      while the loop is working is preserved, not traded away).
-#   M  `--mutation-proof`: the anti-vacuity gate. Five mutations are applied to a THROWAWAY copy of
+#   M  `--mutation-proof`: the anti-vacuity gate. Six mutations are applied to a THROWAWAY copy of
 #      this tree and each must make the arms above go RED. A suite that stays green when the resolver
 #      is reverted is a finding against the suite, so the proof ships with it.
 #
@@ -59,10 +63,17 @@ cleanup() { chmod -R u+rwX "$T" 2>/dev/null; rm -rf "$T" 2>/dev/null; }
 trap cleanup EXIT INT TERM
 
 REAL="$T/real"; PLAIN="$T/plain"; NOPE="$T/nope-does-not-exist"; LINK="$T/one-checkout"
-mkdir -p "$REAL/sub" "$PLAIN"
+# ⛔ A CHECKOUT UNDER A DIRECTORY WITH A SPACE IN ITS NAME (fixture for A16). This repo calls that
+# shape ORDINARY, and it is the one the space-joined candidate list could not represent.
+SPACED="$T/space dir/repo"
+mkdir -p "$REAL/sub" "$PLAIN" "$SPACED"
 git init -q "$REAL" || { echo "repo-slug.test.sh: cannot git init a fixture" >&2; exit 2; }
+git init -q "$SPACED" || { echo "repo-slug.test.sh: cannot git init the space-path fixture" >&2; exit 2; }
 ln -s "$REAL" "$LINK"
 canon() { ( cd "$1" 2>/dev/null && pwd -P ); }
+# The ONE transport for a candidate list: one path per LINE, so a space is part of a path, not a
+# separator (#3833 review F1). Every arm that offers two candidates composes them through this.
+one_per_line() { printf '%s\n' "$@"; }
 
 # The runner: a separate process, so `resolve_repo` runs in the shell that SOURCED it (the shipped
 # calling convention) and the caller's own `REPO` cannot leak into the next arm.
@@ -161,20 +172,27 @@ ck "A10 a candidate that proves is DERIVED and named, never silent (rc=$rr_rc ->
 
 # A11 A DIRECTORY THAT EXISTS BUT IS NOT A CHECKOUT IS NOT A CANDIDATE. This is the `$PWD` defect
 # verbatim: `/` (and any plain directory) exists, so a `-d` test alone would adopt it.
-rr -u REPO_CANDIDATES -u OR REPO_CANDIDATES="$NOPE $PLAIN"
-{ [ "$rr_rc" -eq 2 ] && [ -z "$rr_out" ] && err_has 'REPO is unset'; }
-ck "A11 a non-checkout candidate (a plain dir, a missing path) is NOT adopted (rc=$rr_rc)" $?
+# ⛔ "NOT ADOPTED" MEANS NO ANNOUNCEMENT AND AN EMPTY STDOUT — not merely rc 2 (fresh-context review of
+# #3833, F2 — measured). Asserting only `rc=2 + empty stdout + 'REPO is unset'` left this arm GREEN with
+# PROOF 1 (`rev-parse --show-toplevel`) deleted, because the resolver then ADOPTED the plain directory,
+# SAID so (“using /tmp/…/tplain”), and the declared-value validation refused it afterwards: same three
+# observables, opposite behaviour. The discriminator is the absence of the announcement, so it is
+# asserted here, with A10 keeping the positive control (a real checkout DOES announce).
+rr -u REPO_CANDIDATES -u OR REPO_CANDIDATES="$(one_per_line "$NOPE" "$PLAIN")"
+{ [ "$rr_rc" -eq 2 ] && [ -z "$rr_out" ] && err_has 'REPO is unset' && ! err_has 'using ' \
+  && ! err_has 'is not a git checkout'; }
+ck "A11 a non-checkout candidate (a plain dir, a missing path) is NOT adopted, and nothing is announced as derived (rc=$rr_rc)" $?
 
 # A12 THE SAME CHECKOUT OFFERED TWICE IS ONE CANDIDATE (raw path + a symlink to it). Keyed on the raw
 # string this was two "hits" and refused a box that had one checkout — a false block, which matters
 # even in a fail-closed arm.
-rr -u REPO_CANDIDATES -u OR REPO_CANDIDATES="$REAL $LINK"
+rr -u REPO_CANDIDATES -u OR REPO_CANDIDATES="$(one_per_line "$REAL" "$LINK")"
 { [ "$rr_rc" -eq 0 ] && [ "$rr_out" = "$RREAL" ]; }
 ck "A12 one checkout reached by two spellings is ONE candidate, not a coin toss (rc=$rr_rc)" $?
 
 # A13 TWO DISTINCT CHECKOUTS THAT BOTH PROVE: refused, and BOTH are named so the operator can pick.
 REAL2="$T/real2"; git init -q "$REAL2" || bad "A13 fixture could not be created"
-rr -u REPO_CANDIDATES -u OR REPO_CANDIDATES="$REAL $REAL2"
+rr -u REPO_CANDIDATES -u OR REPO_CANDIDATES="$(one_per_line "$REAL" "$REAL2")"
 { [ "$rr_rc" -eq 2 ] && [ -z "$rr_out" ] && err_has "$RREAL" && err_has "$(canon "$REAL2")"; }
 ck "A13 two checkouts that both prove are REFUSED, with both named (rc=$rr_rc)" $?
 
@@ -212,6 +230,19 @@ git -C "$REAL" remote set-url origin https://github.com/acme/widget.git 2>/dev/n
 rr -u REPO_CANDIDATES -u OR REPO="$NOPE" REPO_CANDIDATES="$REAL"
 { [ "$rr_rc" -eq 2 ] && [ -z "$rr_out" ] && err_has "$NOPE" && err_has 'not a git checkout'; }
 ck "A15 a DECLARED bogus REPO is refused by value, never swapped for a good candidate (rc=$rr_rc)" $?
+
+# A16 A CHECKOUT WHOSE PATH CONTAINS A SPACE IS DERIVED, NOT SPLIT (#3833 review F1 — a REGRESSION).
+# The candidate list used to be iterated unquoted (`for _cand in $REPO_CANDIDATES`), so
+# `worktree-hygiene-sweep.sh`'s `"$TORTOISE_REPO $PWD"` turned `/Volumes/My Passport/agent-infra` into
+# TWO candidates, neither proved, and the pass refused while the operator stood in a real checkout. The
+# old `REPO="$PWD"` was quoted and worked, so that is a regression, not a limitation.
+# The premise is asserted alongside: the candidate really does contain a space, so the arm cannot pass
+# on a fixture that silently lost it.
+case "$SPACED" in *' '*) true ;; *) false ;; esac
+ck "A16 premise: the fixture checkout's path contains a SPACE ($SPACED)" $?
+rr -u REPO_CANDIDATES -u OR REPO_CANDIDATES="$(one_per_line "$NOPE" "$SPACED")"
+{ [ "$rr_rc" -eq 0 ] && [ "$rr_out" = "$(canon "$SPACED")" ] && err_has 'using'; }
+ck "A16 a checkout whose path contains a SPACE is derived whole, never word-split (rc=$rr_rc -> $rr_out)" $?
 
 echo
 echo "== B. the three wrong call sites resolve through it, and still refuse loudly =="
@@ -417,6 +448,13 @@ open(p, "w").write(s.replace(old, new))
     m5_st=$?   # captured before the `$(…)` in the message — see A7 (#3054 review, P1)
     ck "M5 a REPO default spelled REPO=\"$_m5\" reddens check-single-source.sh (rc=$mut_rc): $(printf '%s' "$mut_red" | head -1 | cut -c1-100)" "$m5_st"
   done
+  # M6 — THE CANDIDATE TRANSPORT REVERTED TO WORD SPLITTING (#3833 review F1). This is the shipped
+  # pre-fix shape, so A16 must red: it is the arm that exists to keep a space in a path representable.
+  mut_copy
+  mut_edit "$MUTDIR/orchestrator-harness/repo-slug.sh" 'while IFS= read -r _cand; do' 'for _cand in $REPO_CANDIDATES; do'
+  mut_edit "$MUTDIR/orchestrator-harness/repo-slug.sh" 'done <<<"$REPO_CANDIDATES"' 'done'
+  mut_run "M6 the candidate list is word-split again (a space in a path refuses a real checkout)" "A16"
+
   rm -rf "$T/mut"
 elif [ "${1:-}" = "--mutation-proof" ]; then
   echo

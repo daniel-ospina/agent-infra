@@ -133,7 +133,7 @@ _b() { # <label> <script> [args…]
   local label="$1" scr="$2"; shift 2
   local out rc
   out="$(run_bare "$NOTREPO" "$scr" "$@")"; rc=$?
-  if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q 'REPO'; then
+  if [ "$rc" -ne 0 ] && grep -q 'REPO' <<<"$out"; then
     ok "B  $label: refuses (rc=$rc) and names REPO"
   else
     bad "B  $label: rc=$rc, and the output does not name REPO — $out"
@@ -151,7 +151,7 @@ _b_or() {
   local out rc
   out="$( ( cd "$NOTREPO" && env -u REPO HOME="${TMPDIR:-/tmp}" OR="acme/widget" \
     bash "$HERE/cloud-cell-doctor.sh" merge 2>&1 ) )"; rc=$?
-  if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q 'REPO'; then
+  if [ "$rc" -ne 0 ] && grep -q 'REPO' <<<"$out"; then
     ok "B  cloud-cell-doctor.sh merge (with \$OR set): refuses (rc=$rc) and names REPO"
   else
     bad "B  cloud-cell-doctor.sh merge (with \$OR set): rc=$rc — $out"
@@ -163,7 +163,7 @@ _b_or
 # state while it read no checkout is the same defect one layer down.
 _doc_out="$( ( cd "$NOTREPO" && env -u REPO -u OR -u ENV_FILE -u CELL_HOME -u O HOME="${TMPDIR:-/tmp}" \
   bash "$HERE/cloud-cell-doctor.sh" hygiene 2>&1 ) )"; _doc_rc=$?
-if [ "$_doc_rc" -eq 3 ] && printf '%s' "$_doc_out" | grep -qi 'no checkout'; then
+if [ "$_doc_rc" -eq 3 ] && grep -qi 'no checkout' <<<"$_doc_out"; then
   ok "B6 cloud-cell-doctor.sh hygiene: rc 3 cannot-verify naming the checkout (rc=$_doc_rc)"
 else
   bad "B6 cloud-cell-doctor.sh hygiene: rc=$_doc_rc — expected 3 with 'no checkout' — $_doc_out"
@@ -178,7 +178,7 @@ _c() { # <label> <script> [args…]
   local label="$1" scr="$2"; shift 2
   local out
   out="$(run_bare "$CHECKOUT" "$scr" "$@")"
-  if printf '%s' "$out" | grep -q "using $CANON"; then
+  if grep -q "using $CANON" <<<"$out"; then
     ok "C  $label: derived $CANON and said so"
   else
     bad "C  $label: did not derive the cwd checkout — $out"
@@ -195,7 +195,7 @@ _c "lane-container-reap.sh"  "$HERE/lane-container-reap.sh" --dry-run
 git -C "$CHECKOUT" remote add origin https://github.com/acme/widget.git 2>/dev/null || true
 _out="$( ( cd "$CHECKOUT" && env -u REPO HOME="${TMPDIR:-/tmp}" OR="acme/gadget" \
   AGENT_INFRA_PATH= bash "$HERE/../stale-worktrees.sh" 2>&1 ) )"; _rc=$?
-if [ "$_rc" -ne 0 ] && ! printf '%s' "$_out" | grep -q "using $CANON"; then
+if [ "$_rc" -ne 0 ] && ! grep -q "using $CANON" <<<"$_out"; then
   ok "C5 the cwd checkout of ANOTHER repo is refused when \$OR names a different one (rc=$_rc)"
 else
   bad "C5 a checkout whose origin is not the declared \$OR was adopted (rc=$_rc) — $_out"
@@ -209,21 +209,21 @@ echo "== D. a DECLARED value is never replaced by a derived one (#1974 point 3) 
 # alternative is a sweep that silently owns whatever directory the invoker stood in. A declared value
 # is an ASSERTION, and quietly substituting for it is how a controller lands on the wrong repo.
 _out="$(run_bare "$CHECKOUT" "$HERE/../stale-worktrees.sh" --repo "")"; _rc=$?
-if [ "$_rc" -ne 0 ] && ! printf '%s' "$_out" | grep -q "using $CANON"; then
+if [ "$_rc" -ne 0 ] && ! grep -q "using $CANON" <<<"$_out"; then
   ok "D1 stale-worktrees.sh --repo \"\": REFUSED, cwd not substituted (rc=$_rc)"
 else
   bad "D1 stale-worktrees.sh --repo \"\" fell back to the cwd (rc=$_rc) — $_out"
 fi
 
 _out="$(run_bare "$CHECKOUT" "$HERE/../worktree-hygiene-sweep.sh" --preflight --repo "")"; _rc=$?
-if [ "$_rc" -ne 0 ] && ! printf '%s' "$_out" | grep -q "using $CANON"; then
+if [ "$_rc" -ne 0 ] && ! grep -q "using $CANON" <<<"$_out"; then
   ok "D2 worktree-hygiene-sweep.sh --repo \"\": REFUSED, cwd not substituted (rc=$_rc)"
 else
   bad "D2 worktree-hygiene-sweep.sh --repo \"\" fell back to the cwd (rc=$_rc) — $_out"
 fi
 
 _out="$(run_bare "$CHECKOUT" "$HERE/lane-container-reap.sh" --repo "" --dry-run)"; _rc=$?
-if [ "$_rc" -ne 0 ] && ! printf '%s' "$_out" | grep -q "using $CANON"; then
+if [ "$_rc" -ne 0 ] && ! grep -q "using $CANON" <<<"$_out"; then
   ok "D3 lane-container-reap.sh --repo \"\": REFUSED, cwd not substituted (rc=$_rc)"
 else
   bad "D3 lane-container-reap.sh --repo \"\" fell back to the cwd (rc=$_rc) — $_out"
@@ -232,7 +232,7 @@ fi
 # D4 A DECLARED PATH THAT DOES NOT EXIST is the operator's refusal, BY VALUE — never a fallback to the
 # (perfectly good) cwd checkout they happen to be standing in.
 _out="$(run_bare "$CHECKOUT" "$HERE/../stale-worktrees.sh" --repo "$NOTREPO/x")"; _rc=$?
-if [ "$_rc" -ne 0 ] && printf '%s' "$_out" | grep -q 'not a git checkout'; then
+if [ "$_rc" -ne 0 ] && grep -q 'not a git checkout' <<<"$_out"; then
   ok "D4 a declared-but-bogus --repo is refused by value with the cwd available (rc=$_rc)"
 else
   bad "D4 a declared-but-bogus --repo was not refused by value (rc=$_rc) — $_out"
@@ -249,7 +249,7 @@ for _s in stale-worktrees.sh stale-main-triage.sh; do
   # no repo-slug.sh anywhere it looks, and AGENT_INFRA_PATH empty
   _out="$( cd "$CHECKOUT" && env -u REPO -u OR -u ENV_FILE -u CELL_HOME -u O AGENT_INFRA_PATH= \
     HOME="${TMPDIR:-/tmp}" bash "$FARM/$_s" 2>&1 )"; _rc=$?
-  if [ "$_rc" -ne 0 ] && printf '%s' "$_out" | grep -q 'REPO is unset'; then
+  if [ "$_rc" -ne 0 ] && grep -q 'REPO is unset' <<<"$_out"; then
     ok "D5 $_s (farm copy, no library, nothing declared): refuses naming REPO (rc=$_rc)"
   else
     bad "D5 $_s (farm copy, no library, nothing declared): rc=$_rc — $_out"
@@ -257,7 +257,7 @@ for _s in stale-worktrees.sh stale-main-triage.sh; do
   # A DECLARED value must proceed to the LOCAL validation, not be refused for the absent library.
   _out="$( cd "$NOTREPO" && env -u REPO -u OR -u ENV_FILE -u CELL_HOME -u O AGENT_INFRA_PATH= \
     HOME="${TMPDIR:-/tmp}" bash "$FARM/$_s" --repo "$CHECKOUT" 2>&1 )"; _rc=$?
-  if [ "$_rc" -eq 0 ] && ! printf '%s' "$_out" | grep -q 'was not found beside this script'; then
+  if [ "$_rc" -eq 0 ] && ! grep -q 'was not found beside this script' <<<"$_out"; then
     ok "D6 $_s (farm copy, no library, --repo declared): runs, never refused for the absent library"
   else
     bad "D6 $_s (farm copy, no library, --repo declared): rc=$_rc — $_out"
@@ -279,7 +279,7 @@ if [ -f "$GATE" ]; then
   cp -a "$HERE/." "$NCOPY/scripts/orchestrator-harness/"
   printf '#!/bin/bash\nREPO="${REPO:-/tmp/cell}"\n' > "$NCOPY/scripts/orchestrator-harness/zz-planted.sh"
   _nout="$(env -u O -u CELL_HOME bash "$NCOPY/scripts/orchestrator-harness/check-single-source.sh" 2>&1)"; _nrc=$?
-  if [ "$_nrc" -ne 0 ] && printf '%s' "$_nout" | grep -q 'zz-planted.sh'; then
+  if [ "$_nrc" -ne 0 ] && grep -q 'zz-planted.sh' <<<"$_nout"; then
     ok "N1 a planted REPO=\${REPO:-/tmp/cell} REDS the gate on a shipped script (rc=$_nrc)"
   else
     bad "N1 the gate did not red a planted default (rc=$_nrc) — $_nout"

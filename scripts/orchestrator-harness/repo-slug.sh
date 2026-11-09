@@ -165,6 +165,17 @@ derive_or() {
 #     `origin` NAMES that target, through `derive_or` above rather than a second copy of the URL
 #     predicate. A path that proves nothing is skipped silently; a path that proves the WRONG repo is
 #     skipped the same way, so the derivation cannot land this box on another repo's queue (#1901).
+#
+# ⛔ THE CANDIDATE LIST IS NEWLINE-DELIMITED, ONE PATH PER LINE — NOT SPACE-DELIMITED. It used to be
+# iterated as `for _cand in $REPO_CANDIDATES`, and that made a checkout whose path contains a SPACE
+# unrepresentable (fresh-context review of #3833, F1 — measured): `worktree-hygiene-sweep.sh` composes
+# `"$TORTOISE_REPO $PWD"`, so `/Volumes/My Passport/agent-infra` split into two candidates, neither
+# proved, and the pass refused while the operator stood in a real checkout — a REGRESSION, because the
+# old `REPO="$PWD"` was quoted and worked. This repo treats such paths as ordinary. So callers compose
+#   REPO_CANDIDATES="$(printf '%s\n' "$a" "$b")"
+# and this function reads them with `while IFS= read -r` (no word splitting, no globbing). RESIDUAL: a
+# path containing a NEWLINE cannot be expressed in this channel; nothing here produces one, and the
+# proof below still fails CLOSED (the entry is skipped), never open.
 # Two candidates that BOTH prove are a refusal, not a coin toss: a device-local choice between two
 # checkouts of one repo is unrecoverable downstream, so the operator is asked.
 # A caller that sets nothing keeps the old behaviour exactly (refuse by name), which is why the three
@@ -192,7 +203,11 @@ resolve_repo() {
   if [ -z "$repo" ] && [ -n "${REPO_CANDIDATES:-}" ]; then
     # ⛔ DERIVATION (the middle arm of the #1974 order). Every candidate must PROVE itself before it
     # is used, and the proof is the ONLY reason a path is acceptable here.
-    for _cand in $REPO_CANDIDATES; do
+    # ⛔ `read -r` FROM A HERE-STRING, NEVER `for _cand in $REPO_CANDIDATES` (F1 above): a here-string
+    # preserves the bytes (no word splitting, no backslash processing) and the loop body still runs in
+    # THIS shell, so the assignments below survive it — a pipe would put them in a subshell and the
+    # derivation would be silently discarded.
+    while IFS= read -r _cand; do
       [ -n "$_cand" ] || continue
       [ -d "$_cand" ] || continue
       # PROOF 1 — it IS a checkout. The git env is scrubbed for the reason stated below: an ambient
@@ -205,7 +220,7 @@ resolve_repo() {
       # drifted (#3188) and what `refresh-provision.test.sh`'s `(h5)` exists to catch.
       # ⛔ COMPARED FOLDED, LIKE EVERY OTHER SLUG COMPARISON IN THIS FILE (fresh-context review of
       # #3833, F2 — verified). GitHub slugs are CASE-INSENSITIVE — this file states it at :104 and
-      # folds in `repo_identity_fold` / `repo_identity_scan` — so a raw `=` here was the only
+      # folds in `repo_identity_fold` / the identity walker below — so a raw `=` here was the only
       # case-sensitive slug test in the file: a candidate whose origin is
       # `https://github.com/Premise-Labs/agent-infra.git` against an `OR=premise-labs/agent-infra`
       # pinned in keys.env (a SUPPORTED form: an explicit `OR` wins) failed the proof, nothing proved,
@@ -225,7 +240,7 @@ resolve_repo() {
       _seen="$_seen $_c"
       _hits="$_hits$_c
 "
-    done
+    done <<<"$REPO_CANDIDATES"
     _n="$(printf '%s' "$_hits" | grep -c .)"
     case "$_n" in
       1) repo="$(printf '%s' "$_hits" | head -1)"

@@ -129,7 +129,10 @@ REPO="${REPO:-}"
 # PROVING it is a git checkout (and, when a queue target `$OR` is declared, that its `origin` names
 # that target), and says which value it derived. `$PWD` failed precisely because nothing proved it —
 # under launchd `$PWD` is `/`, a real directory that is not a repo.
-REPO_CANDIDATES="${TORTOISE_REPO:-${TORTOISE:-}} $PWD"
+# ⛔ ONE PATH PER LINE (`repo-slug.sh` reads the list with `read -r`, never word-splitting): a checkout
+# under a directory with a space in its name is ORDINARY in this repo, and a space-joined list split it
+# into two candidates that could never prove themselves (fresh-context review of #3833, F1).
+REPO_CANDIDATES="$(printf '%s\n' "${TORTOISE_REPO:-${TORTOISE:-}}" "$PWD")"
 ENGINE=""
 AGED_DAYS=7
 BACKUP_DIR="${HYGIENE_BACKUP_DIR:-$HOME/orchestrator/state/reaped-patches}"

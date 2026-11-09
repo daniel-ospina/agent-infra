@@ -556,7 +556,7 @@ script:install-ci-runner-x64.sh script:heartbeat-loop.sh script:lane-actions.py 
 script:lane-status.py script:lane-watchdog.py script:merge-queue.py script:objective.py
 script:orchestrator-heartbeat.sh script:pi-reap-worktrees-launchd.py script:pi-reap-worktrees.sh
 script:pr-doctor-trigger.py script:pr-doctor.py script:pr-repair-loop.sh script:publish-live-workspaces.py
-script:record-review.sh script:repo-target.sh script:runner_autoscale.py script:session-postmortem.sh script:tortoise_graph_client.py
+script:record-review.sh script:repo-slug.sh script:repo-target.sh script:runner_autoscale.py script:session-postmortem.sh script:tortoise_graph_client.py
 script:turn-classify.py
 script:turn-end.py script:undelivered-answers.py script:venv-real-cost.py script:watch-truncation.sh
 script:wip-sweep.sh script:bg-rescue-wip.sh
@@ -564,7 +564,30 @@ lib:beat-pair.sh lib:bounded.sh lib:cmux_payload.py lib:diff-normalize.py lib:li
 lib:pid-identity.sh lib:transcript-patterns.sh
 state:lane-confirm.py state:lane-triage.py state:lane-verdict.py
 foreign:cmux_dispatch.py foreign:orch-loop.sh
-other:orchestrator-harness/brief-gate.sh other:orchestrator-harness/capacity.sh"
+other:orchestrator-harness/brief-gate.sh other:orchestrator-harness/capacity.sh
+other:orchestrator-harness/repo-slug.sh"
+# `script:repo-slug.sh` AND `other:orchestrator-harness/repo-slug.sh` joined on 2026-11-09
+# (agent-infra#1974, PR #3833): five shipped scripts that used to carry a private REPO PATH DEFAULT now
+# source the ONE resolver instead  — `stale-worktrees.sh`, `stale-main-triage.sh`,
+# `worktree-hygiene-sweep.sh`, `lane-container-reap.sh` and `cloud-cell-doctor.sh` all locate
+# `repo-slug.sh` beside themselves (`$SCRIPT_DIR/orchestrator-harness/…`, then `$SCRIPT_DIR/…`, then
+# `$AGENT_INFRA_PATH`). `worktree-hygiene-sweep.sh` is FARMED by `fleet_srcs`, so its sibling resolver
+# is a producer a farmed consumer execs.
+#   * BOTH spellings appear because the consumers deliberately offer BOTH layouts: the nested
+#     `scripts/orchestrator-harness/repo-slug.sh` (a checkout, and `deploy-mac-orchestrator.sh`'s whole-
+#     directory archive into `$O`) and the flat `scripts/repo-slug.sh` (the farm layout). They are not a
+#     duplicate declaration of one file — they are the two destinations the callers actually look in.
+#   * IT IS DELIVERED, so this is a re-pin of the derived population, NOT a `LANE_PRODUCERS_EXEMPT`
+#     entry: `pi-bootstrap/setup.sh`'s `fleet_srcs` now carries `repo-slug.sh` flat into
+#     `$DEST/scripts/repo-slug.sh` — the exact path `$SCRIPT_DIR/repo-slug.sh` asks for — which is what
+#     makes a farmed `worktree-hygiene-sweep.sh` able to resolve its target checkout AT ALL. Before the
+#     farm entry, a farmed copy reached its "repo-slug.sh was not found" refusal on every run: the
+#     consumer shipped without the resolver it calls (#1552/#1899).
+#   * The other entries in THIS RE-PIN'S ADDED list (`admin-merge.sh`, `cloud-cell-doctor.sh`,
+#     `cloud-cell-supervisor.sh`, `install-controller-service.sh`, `fleet-schedule.py`, …) were already
+#     drifting BEFORE this branch and are deliberately NOT blessed here: a lane re-pins what it moved,
+#     and re-cutting the whole population would record 12 producers nobody in this change verified
+#     against the CODE. They remain visible as the gate's own ADDED list until their owners re-pin.
 # `script:ai_pr_status.py` joined on 2026-11-04 with agent-infra#2413 (PR #3413), and it is a DISCLOSED
 # GAP rather than a delivery. Not a farm change: `objective-reminder.sh` became a FARMED consumer for
 # the first time in that PR (its template used to exec the checkout, which launchd cannot read under
