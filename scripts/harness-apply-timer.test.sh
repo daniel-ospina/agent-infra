@@ -2262,7 +2262,7 @@ FARM
 printf '#!/usr/bin/env bash\nbash "$(dirname "$0")/inner/odd-vocab.sh" "$@" 2>&1 | tee -a "$(dirname "$0")/log.txt"\n' >"$T/t24aq/wrap.sh"
 chmod +x "$T/t24aq/wrap.sh" "$T/t24aq/inner/odd-vocab.sh"
 OUT="$(HARNESS_APPLY_FARM_CHECKER="$T/t24aq/wrap.sh" run_pass "$T/t24aq" 2>&1)"; RC=$?
-assert_eq "$RC" "24" "T24 control: rc=0 over a summary that reports DRIFT is RED — the SUMMARY half of the check, with no matched row to go on"
+assert_eq "$RC" "24" "T24 control: rc=0 over a report that prints a DRIFT verdict line is RED — the VERDICT operand fires here, not the summary (the summary half is pinned by t24c5)"
 assert_contains "$OUT" "exited 0 but its output reports drift" "T24 control: and it names the contradiction even though the extractor matched no row"
 assert_contains "$OUT" "verdict: check-farm-drift: DRIFT — 2 stale" \
     "T24 control: and the log quotes the verdict line, so the evidence behind the refusal is on the line"
@@ -2334,7 +2334,7 @@ assert_contains "$OUT" "farm: ok" "T24 control: and it reports the match, rather
 assert_contains "$(grep '^farm_n=' "$T/t24ar/state/harness-apply.status" 2>/dev/null || true)" "farm_n=0" \
     "T24 control: with farm_n=0, the matched-farm truth — no phantom row"
 
-# ⛔ A SUMMARY THE PRE-FILTER READS BUT THE PROOF CANNOT CLOSE IS STILL UNPROVEN (review round 26,
+# ⛔ A SUMMARY THAT PARSES IS NOT A MATCH WHEN THE ROW ITSELF CANNOT BE CLASSED (review round 26,
 # measured: the only fixture with an unparseable label — `5 fresh` — is rejected by the `<n> stale`
 # pre-filter before the label checks are reached). HISTORY, because the mechanics moved twice: round 31
 # gave `_a`'s sed a start-of-line form, so this fixture's column-1 stale count now PARSES (the count is
@@ -2696,10 +2696,13 @@ assert_absent "$(grep '^remedy=' "$T/t24c2/state/harness-apply.status" 2>/dev/nu
 # alphabetic `stale` sits inside EVERY one of those classes, so no reshaping of the class can re-admit it
 # — only MEMBERSHIP can refuse it, which is what the closed vocabulary now does for all three. Any
 # trailing token outside the instrument's own vocabulary is now a refusal, and each token is its own run
-# because the scan exits on the first hit. Mutant that reds the `stale` row — the only token here refused
-# by MEMBERSHIP ALONE (`drift:2`/`DRIFTED!` are duplicated by t24bx/t24by, so their allow-list mutant
-# reds both blocks and proves neither): `if (v == "stale") next` in the allow-list — measured 648 passed
-# / 2 failed, exactly this row's two assertions.
+# because the scan exits on the first hit. Mutant that reds the `stale` row: `if (v == "stale") next` in
+# the allow-list — measured 648 passed / 2 failed, exactly this row's two assertions. `stale` is refused
+# by MEMBERSHIP ALONE, unlike `drift:2`/`DRIFTED!` — the old block-list refused those on SHAPE, and
+# t24bx/t24by duplicate them, so their allow-list mutant reds both blocks and proves neither. The rest of
+# this fixture's out-of-vocabulary tokens (`stale;`, `N/A`, `drift+1`, `x=y`, `#2`, `2-drift`, `DRIFT/2`)
+# are membership-only too — `stale` is called out because the OTHER two of the three above are the ones
+# that are duplicated, not because it is the only membership-only token here.
 mk_origin t24c3; mk_clone t24c3
 REPO_P="$CLONE"; MODE_P=sync
 mkdir -p "$T/t24c3/home/.pi/agent/scripts"
