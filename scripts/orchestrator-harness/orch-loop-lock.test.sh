@@ -28,6 +28,9 @@
 #   9. structural + DRIFT pins: the block sits above the EXIT trap, the trap is the only releaser,
 #      `acq` keeps `noclobber`, the old liveness-only line is GONE, and both mirror bodies plus the
 #      slack are IDENTICAL to the canonical declarations they were copied from (#1178/#1856).
+#  10. an exported `COLUMNS` cannot change any answer above (#2926): a width-truncated process read
+#      would turn a LIVE loop-shaped owner into "provably NOT the owner" and DELETE its lock, so §11
+#      re-drives the refusal arms with `COLUMNS=20` — the witness #2926 requires of every `-ww` fix.
 #
 # ⛔ THE SUBJECT IS THE REAL `orch-loop.sh`, NOT A RE-IMPLEMENTATION. The lock block lives in a marked
 # section (`# [orchlock:begin] … # [orchlock:end]`), which this suite EXTRACTS with `sed` and runs as
@@ -110,8 +113,8 @@ ck "the EXIT trap that releases the lock sits BELOW the section (the block runs 
 LOCK_TRAPS="$(grep -E '^trap .*LOCKF' "$SUBJECT" 2>/dev/null)"
 # ⛔ `-qxF`, NOT `-qF`: a SUBSTRING match accepts `trap 'rm -f "$LOCKF"' EXIT INT TERM`, which is the
 # very regression this arm exists for (MEASURED on the first fix of this arm — the revert stayed green).
-[ "$(printf '%s\n' "$LOCK_TRAPS" | grep -c .)" = 1 ] \
-  && printf '%s\n' "$LOCK_TRAPS" | grep -qxF "trap 'rm -f \"\$LOCKF\"' EXIT"
+[ "$(grep -c . <<<"$LOCK_TRAPS")" = 1 ] \
+  && grep -qxF "trap 'rm -f \"\$LOCKF\"' EXIT" <<<"$LOCK_TRAPS"
 ck "the lock is released by ONE trap and it is EXACTLY the EXIT-only form (a returning INT/TERM handler deleted it while the loop lived — #1715)" $?
 okc "acq() still takes the lock with set -o noclobber (unchanged primitive)" \
   grep -qF 'acq() { ( set -o noclobber; echo $$ > "$LOCKF" ) 2>/dev/null; }' "$SUBJECT"
@@ -433,6 +436,49 @@ touch -t 202001010000 "$C/o/.orch.lock" 2>/dev/null || touch -d '2020-01-01 00:0
 run_drv O="$C/o"
 ck "8b: pid 0 is not an owner (kill -0 0 hits OUR process group) — the loop runs" \
    "$(ran && [ "$RC" -eq 0 ] && echo 0 || echo 1)"
+
+# ── 11) AN EXPORTED `COLUMNS` MUST NOT TURN A LIVE OWNER INTO "PROVABLY NOT THE OWNER" (#2926) ────
+# ⛔ THE WITNESS #2926 REQUIRES OF EVERY `-ww` FIX: set `COLUMNS` and require the ANSWER to be unchanged.
+# `ps(1)` honours `COLUMNS` FIRST even when stdout is a pipe, so without `-ww` the command column is cut
+# and the PATH TOKEN — last on the line — is the first casualty. `${2##*/}` then stops equalling
+# `orch-loop.sh`, `_orch_lock_verdict` answers 1 = "provably NOT the owner", and the caller answers rc 1 by
+# DELETING the lock: a LIVE controller loses it and a second controller sweeps the same queue (#1715).
+# MEASURED ON THIS HOST (procps-ng 4.0.4), by deleting `-ww` from a copy of the subject and re-running this
+# suite: `PASS=51 FAIL=3` — the three arms below red; with the fix `PASS=54 FAIL=0`. The peer's directory
+# name is long on purpose: it reproduces #2926's own live shape, where the truncated tail is the
+# `orch-loop.sh` token.
+echo "── 11. an exported COLUMNS does not change the answer: a live owner is still refused (#2926)"
+mkcase; CASE_DIR="$C"
+mkdir -p "$C/a-very-long-directory-name-for-the-COLUMNS-witness/orchestrator-harness"
+CP="$(spawn_loop "$C/a-very-long-directory-name-for-the-COLUMNS-witness/orchestrator-harness")"; KIDS="$KIDS $CP"; sleep 0.4
+printf '%s\n' "$CP" > "$C/o/.orch.lock"          # AFTER the process started — the real write order
+# ⛔ THE ARM'S OWN PRECONDITION, REPORTED NOT ASSUMED: if a width-limited read of that pid ALREADY carries
+# the `orch-loop.sh` token, this host's `ps` is ignoring `COLUMNS` and the arm below cannot witness
+# anything — say so instead of banking a green that proves nothing (the vacuity class of rule 3).
+# ⛔ NO `grep -q` IN A PIPELINE (#841/#864): the row is CAPTURED and tested in the shell.
+_WIDTH_ROW="$(COLUMNS=20 ps -axo pid=,stat=,command= 2>/dev/null | awk -v p="$CP" '$1 == p')"
+case "$_WIDTH_ROW" in
+  *orch-loop.sh*) skip "11: this host's ps ignores COLUMNS, so the truncation the arm exists for cannot be staged here" ;;
+  *) ck "11: the plant IS width-truncated without -ww (the arm exercises the hazard, not a simulated one)" 0 ;;
+esac
+run_drv O="$C/o" COLUMNS=20
+ck "11: a LIVE loop-shaped owner is still REFUSED under COLUMNS=20 (not reclaimed, not started over)" \
+   "$(ran && echo 1 || echo 0)"
+ck "11: …and the refusal still NAMES the live pid under COLUMNS=20" \
+   "$(want "$OUT" "already running (pid $CP)" && echo 0 || echo 1)"
+ck "11: …and the owner's lock is UNTOUCHED under COLUMNS=20 (the truncation deletes it without -ww)" \
+   "$( [ "$(lock_pid "$C/o/.orch.lock")" = "$CP" ] && echo 0 || echo 1 )"
+kill -9 "$CP" 2>/dev/null
+# The other direction, so the arm cannot be satisfied by refusing everything: the SAME wide read must
+# still let the #1985 acceptance case through (a live NON-controller pid, stale lock) under COLUMNS=20.
+mkcase; CASE_DIR="$C"
+NP="$(spawn_sleep)"; KIDS="$KIDS $NP"; sleep 0.2
+printf '%s\n' "$NP" > "$C/o/.orch.lock"
+touch -t 202001010000 "$C/o/.orch.lock" 2>/dev/null || touch -d '2020-01-01 00:00:00' "$C/o/.orch.lock"
+run_drv O="$C/o" COLUMNS=20
+ck "11: a stale lock over a live NON-controller is still RECLAIMED under COLUMNS=20 (the fix is not a blanket refusal)" \
+   "$(ran && [ "$RC" -eq 0 ] && echo 0 || echo 1)"
+kill -9 "$NP" 2>/dev/null
 
 # ── recap ───────────────────────────────────────────────────────────────────────────────────────
 echo

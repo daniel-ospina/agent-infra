@@ -650,18 +650,34 @@ assert_not_contains "$out" "pkill -f [b]ash" "…and never prints the bare ERE t
 # argument with `printf '%s\n' "$*"`, so a BACKTICKED snippet inside the double-quoted message is
 # COMMAND-SUBSTITUTED while the argument is built, not printed. The recycled-pid remedy read
 # `check \`ps -o command= -p $lock\``, so the operator was told to run a command whose text had
-# already been executed and discarded — worst exactly in the case the sentence exists for (a dead pid,
-# where `ps` prints nothing and the message rendered `check )`). Off-`macOS` this arm still runs: the
-# refusal path is pure string building. Both start paths must keep the LITERAL command.
+# already been executed and discarded. Off-`macOS` this arm still runs: the refusal path is pure
+# string building. Both start paths must keep the LITERAL command.
+# ⛔ AND THE NEGATIVE HALF MUST BE THE MUTANT'S OWN RENDER (fresh review of #1985, P3 — MEASURED). The
+# two `assert_not_contains "RECYCLED pid — check )"` arms this replaces COULD NOT FAIL: both fixtures lock
+# `$$`, which is ALIVE, so the pre-fix substitution did not render the emptied `check )` form at all — it
+# rendered `check <this shell's cmdline>)`, and `check )` is only reachable from a DEAD pid, which no
+# start path here locks (a dead lock holder returns from `lc_foreign_controller` before the refusal).
+# So the dying text is DERIVED from the mutant's own read below: with the escaping reverted, the message
+# carries exactly `RECYCLED pid — check $SELF_LOCK_CMD`. MEASURED by removing the two `\`` escapes from a
+# copy of `launchd-cycle.sh`: these arms red (`FAIL`) and pass again with the fix.
+SELF_LOCK_CMD="$(ps -o command= -p $$ 2>/dev/null)"
 assert_contains "$out" '`ps -o command= -p' "the recycled-pid remedy survives as a LITERAL command, not a substitution"
-assert_not_contains "$out" "RECYCLED pid — check )" "…and never renders the emptied 'check )' form"
+if [ -n "$SELF_LOCK_CMD" ]; then
+  assert_not_contains "$out" "RECYCLED pid — check $SELF_LOCK_CMD" "…and never renders the SUBSTITUTED form (the cmdline the pid read returned)"
+else
+  skipd "…never renders the substituted form: this host's ps printed no cmdline for \$\$, so the mutant's own render cannot be staged"
+fi
 # the same message is reachable from lc_ensure (the other start path)
 fresh
 printf '%s\n' "$$" > "$T/o/.orch.lock"
 out="$( . "$LIB"; lc_ensure "$LABEL" "$T/o/x.plist" "$T/o" 1 2 2>&1 )"; rc=$?
 assert_contains "$out" 'pkill -f "[b]ash'  "the lc_ensure refusal keeps the quoted scoped pattern too"
 assert_contains "$out" '`ps -o command= -p' "…and its recycled-pid remedy is a LITERAL command too"
-assert_not_contains "$out" "RECYCLED pid — check )" "…not the emptied 'check )' form"
+if [ -n "$SELF_LOCK_CMD" ]; then
+  assert_not_contains "$out" "RECYCLED pid — check $SELF_LOCK_CMD" "…not the SUBSTITUTED form either"
+else
+  skipd "…not the substituted form either: this host's ps printed no cmdline for \$\$, so the mutant's own render cannot be staged"
+fi
 rm -f "$T/o/.orch.lock"
 
 echo "-- D5. the staleness bound tracks the CELL's cycle, not a constant"

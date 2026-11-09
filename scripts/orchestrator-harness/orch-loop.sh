@@ -2150,7 +2150,15 @@ _orch_ps_start_epoch() {
 _orch_lock_probe() {
   local p="${1:-}" t row stat cmd
   case "$p" in ''|*[!0-9]*) return 1 ;; esac
-  t="$("${PS_BIN:-/bin/ps}" -axo pid=,stat=,command= 2>/dev/null)" || return 2
+  # ⛔ `-ww`, BECAUSE `COLUMNS` OVERRIDES THE SAFE DEFAULT (#2926). A command substitution is not a
+  # tty, so this read would normally be width-independent — but `ps(1)` checks `COLUMNS` FIRST, and an
+  # exported COLUMNS TRUNCATES the command column. The path token is the LAST thing on the line, so it
+  # is cut mid-name, `${2##*/}` stops equalling `orch-loop.sh`, and the verdict becomes "PROVABLY NOT
+  # the owner" over a LIVE owner whose lock is then deleted — the worst direction of the eight reads
+  # #2926 tracks. `-ww` is unlimited on procps and "at least 131 columns" on BSD ps, so it raises the
+  # ceiling and never lowers it; it cannot narrow an already-unlimited read. Witnessed by
+  # `orch-loop-lock.test.sh` §11, which re-drives the refusal arms under `COLUMNS=20`.
+  t="$("${PS_BIN:-/bin/ps}" -ww -axo pid=,stat=,command= 2>/dev/null)" || return 2
   # ⛔ AN EMPTY TABLE IS UNREADABLE, NOT EMPTY: the probing process itself appears in any real table,
   # so a read that "succeeds" and prints nothing never witnesses absence (#1178 C3).
   case "$t" in *[![:space:]]*) ;; *) return 2 ;; esac
