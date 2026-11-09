@@ -289,16 +289,36 @@ fi
 
 # ─────────────────────────────────────────────────────────────────────────────────────────────────
 say "§6 the provenance tokens a [cap] line needs"
-( . "$MOD"; orc_max_load_src "250" "" ; orc_max_load_src "250" "/Library/LaunchDaemons/x.plist"; orc_max_load_src "" "" ) > "$T/src"
-[ "$(sed -n 1p "$T/src")" = "env" ] \
-  && ck "§6 an env-supplied MAX_LOAD is labelled 'env'" 0 \
-  || ck "§6 env MAX_LOAD label — got '$(sed -n 1p "$T/src")'" 1
-[ "$(sed -n 2p "$T/src")" = "plist(/Library/LaunchDaemons/x.plist)" ] \
-  && ck "§6 a plist-supplied MAX_LOAD names the plist it came from" 0 \
-  || ck "§6 plist MAX_LOAD label — got '$(sed -n 2p "$T/src")'" 1
-[ "$(sed -n 3p "$T/src")" = "derived:cores" ] \
-  && ck "§6 a DERIVED MAX_LOAD says so (this is the 100-vs-250 divergence, made visible)" 0 \
-  || ck "§6 derived MAX_LOAD label — got '$(sed -n 3p "$T/src")'" 1
+# ⛔ DRIVEN FROM THE SHIPPED LINES, not from a model of them: the MAX_LOAD provenance block is
+# extracted out of `orch-loop.sh` and run in a bare shell with a substituted core probe, exactly the
+# way selftest.sh drives the lane derivation. A copy of the rule here would pass on a loop whose own
+# block had been deleted (the vacuity this repo's suites keep having to remove).
+if need "$LOOP" "the shipped orch-loop.sh"; then
+  maxload_drv() { # <env MAX_LOAD or ''> <origin or ''> <core probe> -> '<MAX_LOAD>|<MAX_LOAD_SRC>'
+    local e="$1" o="$2" p="$3"
+    { echo 'set -uo pipefail'
+      grep -F 'is_num() {' "$LOOP"; grep -F 'is_limit() {' "$LOOP"
+      printf 'sysctl() { printf "%%s\\n" %s; }\n' "'$p'"
+      sed -n '/^_NCPU=/,/^MAX_LANES=/p' "$LOOP"
+      printf 'printf "%%s|%%s" "$MAX_LOAD" "$MAX_LOAD_SRC"'
+    } > "$T/maxload-drive.sh"
+    if [ -n "$e" ]; then env MAX_LOAD="$e" ORC_CONTROLLER_ORIGIN="$o" bash "$T/maxload-drive.sh" 2>&1
+    else env -u MAX_LOAD ORC_CONTROLLER_ORIGIN="$o" bash "$T/maxload-drive.sh" 2>&1; fi
+  }
+  [ "$(maxload_drv "250" "" "10")" = "250|env" ] \
+    && ck "§6 an env-supplied MAX_LOAD is labelled 'env'" 0 \
+    || ck "§6 env MAX_LOAD label — got '$(maxload_drv "250" "" "10")'" 1
+  [ "$(maxload_drv "250" "/Library/LaunchDaemons/x.plist" "10")" = "250|plist(/Library/LaunchDaemons/x.plist)" ] \
+    && ck "§6 a plist-supplied MAX_LOAD names the plist it came from" 0 \
+    || ck "§6 plist MAX_LOAD label — got '$(maxload_drv "250" "/Library/LaunchDaemons/x.plist" "10")'" 1
+  [ "$(maxload_drv "" "" "10")" = "100|derived:cores" ] \
+    && ck "§6 a DERIVED MAX_LOAD says so (this is the 100-vs-250 divergence, made visible)" 0 \
+    || ck "§6 derived MAX_LOAD — got '$(maxload_drv "" "" "10")'" 1
+  case "$(maxload_drv "0x" "" "10")" in
+    "100|repair:"*) ck "§6 an unusable MAX_LOAD is REPAIRED and labelled as repaired (not 'env')" 0 ;;
+    *) ck "§6 an unusable MAX_LOAD is mislabelled — got '$(maxload_drv "0x" "" "10")'" 1 ;;
+  esac
+fi
 ( . "$MOD"; ORC_STATE_RESOLVED="$T/x"; orc_instance_id "$T/x" "/tmp/orc-proof" ) > "$T/id"
 case "$(cat "$T/id")" in
   "pid=$$@orc-proof#"*) ck "§6 the instance token names the PID and WHICH COPY it is (the incident's discriminator)" 0 ;;

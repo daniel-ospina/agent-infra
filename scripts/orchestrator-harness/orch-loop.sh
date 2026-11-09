@@ -285,7 +285,18 @@ is_limit "${_NCPU:-}"    || _NCPU=4
 # same reason `_ORC_ENV_O` is.
 _ORC_ENV_MAX_LOAD="${MAX_LOAD:-}"
 MAX_LOAD="${MAX_LOAD:-$(( 10#$_NCPU * 10 ))}"
-MAX_LOAD_SRC="$(orc_max_load_src "$_ORC_ENV_MAX_LOAD" "${ORC_CONTROLLER_ORIGIN:-}")"
+# ⛔ PURE SHELL, NO FUNCTION CALL, and that is a constraint rather than a style choice: selftest.sh's
+# lane-derivation driver EXTRACTS the `^_NCPU=` .. `^MAX_REVIEW=` range and runs it in a bare shell to
+# prove MAX_LANES is derived (and that a pin is not recomputed). A `$(orc_max_load_src …)` in here
+# would print `command not found` into that driver's captured stdout and turn a correct MAX_LANES into
+# a red. The provenance is therefore derived from the two inputs directly.
+if [ -z "$_ORC_ENV_MAX_LOAD" ]; then
+  MAX_LOAD_SRC="derived:cores"
+elif [ -n "${ORC_CONTROLLER_ORIGIN:-}" ]; then
+  MAX_LOAD_SRC="plist(${ORC_CONTROLLER_ORIGIN})"
+else
+  MAX_LOAD_SRC="env"
+fi
 if ! is_limit "${MAX_LOAD:-}"; then MAX_LOAD=$(( 10#$_NCPU * 10 )); MAX_LOAD_SRC="repair:derived:cores"; fi
 is_limit "${MAX_LOAD:-}" || { MAX_LOAD=40; MAX_LOAD_SRC="repair:default40"; }
 # ⛔ CAPACITY, NOT A LANE COUNT (owner ruling, 2026-10-17): "dispatch should be gated on capacity,

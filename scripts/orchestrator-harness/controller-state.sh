@@ -268,15 +268,8 @@ orc_instance_id() {
   printf 'pid=%s@%s#%s\n' "$$" "${where##*/}" "$(printf '%s' "$state" | cksum 2>/dev/null | cut -d' ' -f1)"
 }
 
-# orc_max_load_src <input as the caller found it> <origin hint> — WHICH input decided MAX_LOAD.
-# `plist(<origin>)` when the launchd render says so (`ORC_CONTROLLER_ORIGIN`), `env` when some other
-# environment set it, `derived:cores` when the loop computed it. The point is not the label: it is
-# that a `[cap]` line printed `load=158/100` while the plist said 250, and NOTHING in the line said
-# the number in force had been derived by the copy rather than set by the unit.
-orc_max_load_src() {
-  if [ -n "${1:-}" ]; then
-    if [ -n "${2:-}" ]; then printf 'plist(%s)\n' "$2"; else printf 'env\n'; fi
-    return 0
-  fi
-  printf 'derived:cores\n'
-}
+# orc_max_load_src is deliberately NOT a function here: see the `MAX_LOAD_SRC` block in
+# `orch-loop.sh`. selftest.sh's lane-derivation driver extracts the `^_NCPU=` … `^MAX_REVIEW=` range
+# and runs it in a bare shell, so a `$(orc_max_load_src …)` there would print `command not found` into
+# a driver that is asserting on MAX_LANES. The ranking rule (env → derived) lives with the one caller
+# that uses it, and `controller-state.test.sh` §6 drives the SHIPPED lines rather than a copy.
