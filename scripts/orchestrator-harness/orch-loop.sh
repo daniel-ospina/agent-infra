@@ -525,10 +525,12 @@ gh_bounded() {
   # and three kills blind the cycle. That is #2028's own fix-direction #2 ("never sleep inside a
   # substitution; the backoff belongs to the cycle, not inside `$( )`") — truncating the sleep is not
   # removing it.
-  # The repo's documented contract for exactly this caller class is `GH_LIMIT_NO_WAIT` (`gh-limit.py:219-224`,
-  # `git grep GH_LIMIT_NO_WAIT`: the eight heartbeat tools use `setdefault`, `lander.sh:609,734` and
-  # `cloud-cell-supervisor.sh:2913` pass it per call). Under it the layer records the limit and answers
-  # AT ONCE, and `budget = min(LOCK_TIMEOUT, NO_WAIT_LOCK_S) if NO_WAIT` (`gh-limit.py:721`) also bounds
+  # The repo's documented contract for exactly this caller class is `GH_LIMIT_NO_WAIT` (`gh-limit.py`'s
+  # NO_WAIT: "1 = never sleep in-process" — the eight heartbeat .py tools set it via `setdefault`, and
+  # the shell callers in this tree pass it per call: `lander.sh` on its `gh api rate_limit` read, its
+  # two `gh api graphql` reads and its `rerun-failed-jobs` POST, and `cloud-cell-supervisor.sh` on its
+  # `gh --version` probe). Under it the layer records the limit and answers
+  # AT ONCE, and `acquire_lock`'s `budget = min(LOCK_TIMEOUT, NO_WAIT_LOCK_S) if NO_WAIT` also bounds
   # the LOCK wait to 5 s — which is why this sets ONE variable and lets the layer keep its own default
   # rather than freezing a copy of it here.
   # ⛔ PER CALL, NOT EXPORTED FOR THE CONTROLLER: the controller spawns lanes, fixers and reviewers, and a
@@ -4524,7 +4526,7 @@ sweep_defer_until() {
 # since recovered from is not one to defer for. `GH_LIMIT_STALE_S` is the cycle's own 900 s window and
 # the default here matches it, so this helper stays self-contained for the extraction-driven suite.
 gh_limit_recorded_until() {
-  local f rec kv at="" until="" recovered="" age
+  local f rec kv at="" until="" recovered="" bucket="" age
   f="${GH_LIMIT_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/gh-limit}/last-limit"
   [ -f "$f" ] || return 0
   rec="$(cat "$f" 2>/dev/null)" || return 0
@@ -4534,9 +4536,20 @@ gh_limit_recorded_until() {
       at=*)        at="${kv#at=}" ;;
       until=*)     until="${kv#until=}" ;;
       recovered=*) recovered="${kv#recovered=}" ;;
+      bucket=*)    bucket="${kv#bucket=}" ;;
     esac
   done
   is_num "${at:-}" && is_num "${until:-}" && [ "$until" -gt 0 ] || return 0
+  # ⛔ THE RECORD IS ONE PER BOX, NOT ONE PER BUCKET (`record_limit` replaces `last-limit` —
+  # gh-limit.py says so in as many words, "one record per box, by design"), and the layer writes it
+  # OUTSIDE the box lock. So between the sweep's own refusal and this read, a concurrent GRAPHQL
+  # refusal can replace a core one — and a graphql primary exhaustion's `until=` is that bucket's
+  # reset, up to an hour out. Deferring the REST sweep on it would stop merges on a box whose `core`
+  # has quota, and the header path this companion backstops can never do that (a header belongs to
+  # the response's own bucket). Only a `core` observation may defer the sweep; anything else falls
+  # back to the now+60 floor. A record with no `bucket=` predates the field and is treated as core,
+  # which is the bucket every pre-#2137 record was written for.
+  [ "${bucket:-core}" = "core" ] || return 0
   if is_num "${recovered:-}" && [ "$recovered" -ge "$at" ]; then return 0; fi
   age=$(( $(date +%s) - at ))
   { [ "$age" -ge 0 ] && [ "$age" -le "${GH_LIMIT_STALE_S:-900}" ]; } || return 0

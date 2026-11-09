@@ -227,6 +227,21 @@ if need "$T/quota.sh" "the sweep-quota helper block"; then
   [ "$got" -le $(( now + 3610 )) ] \
     && ok "sweep_defer_until_recorded: the recorded window keeps the same 1h ceiling as the header path" \
     || bad "sweep_defer_until_recorded returned a runaway '$got'"
+  # ⛔ THE RECORD IS ONE PER BOX, NOT ONE PER BUCKET, and the layer writes it outside the box lock. A
+  # GRAPHQL refusal (the `gh pr` calls) must therefore never defer the REST sweep: its window is that
+  # bucket's, and core may have quota — the header path this backstops cannot make that mistake.
+  printf 'at=%s bucket=graphql reset=0 attempts=1 waited=0 status=403 kind=primary until=%s remaining=0 recovered=0\n' \
+    "$now" "$(( now + 3000 ))" > "$T/ghlimit/last-limit"
+  got="$(sweep_defer_until_recorded '')"
+  [ "$got" -le $(( now + 70 )) ] \
+    && ok "sweep_defer_until_recorded: another BUCKET's refusal does not defer the REST sweep (one record per box, so the bucket is checked)" \
+    || bad "sweep_defer_until_recorded let a graphql window defer the core sweep ('$got')"
+  printf 'at=%s bucket=core reset=0 attempts=1 waited=0 status=403 kind=primary until=%s remaining=0 recovered=0\n' \
+    "$now" "$(( now + 3000 ))" > "$T/ghlimit/last-limit"
+  got="$(sweep_defer_until_recorded '')"
+  [ "$got" -ge $(( now + 2990 )) ] \
+    && ok "sweep_defer_until_recorded: …while a CORE refusal still defers it (the control half — the bucket check is not vacuous)" \
+    || bad "sweep_defer_until_recorded ignored a core record ('$got')"
   unset GH_LIMIT_DIR
 fi
 
