@@ -1459,11 +1459,17 @@ ck "the check wait is bounded by the WATCHDOG's progress allowance too, not only
      && grep -q '>> "$HB_F"' "$SCRIPT" && echo 0 || echo 1)
 # (1) the heartbeat the watchdog reads. Pre-fix this file wrote NOTHING: `log_line` is stdout, and a `-p`
 # lane's stdout reaches no log, so the wait was silent for its whole length.
+# ⛔ "EVERY POLL" MUST BE ASSERTED AS REPETITION, NOT AS PRESENCE (verified by mutation — this arm passed
+# a ONE-SHOT heartbeat): with `WAIT_S=2` the loop iterates exactly ONCE, so `grep -q` is satisfied by a
+# heartbeat written a single time, which would leave the lane silent for ~5370 s and get it TERM'd as
+# `stalled` at 2700 s — the precise defect this block exists to close. So the wait is long enough for
+# several iterations (12 s at `LANE_MERGE_INTERVAL=5` = 3 polls) and the assertion counts them. Mutating
+# the write to happen once reds THIS arm and nothing else.
 new_o "$T/pr4.tsv"
 : > "$T/hb-38.log"
-WAIT_S=2 LANE_MERGE_HB="$T/hb-38.log" run 38 --repo o/r --pr-tsv "$T/pr4.tsv" --checks-tsv "$T/checks-inflight.tsv"
-ck "the check wait writes a WATCHDOG-VISIBLE heartbeat every poll (LANE_MERGE_HB) — an unhearted wait is killed as 'stalled' with no verdict" \
-   $([ "$RC" = 11 ] && grep -q '\[lane-merge\] heartbeat' "$T/hb-38.log" && echo 0 || echo 1)
+WAIT_S=12 LANE_MERGE_HB="$T/hb-38.log" run 38 --repo o/r --pr-tsv "$T/pr4.tsv" --checks-tsv "$T/checks-inflight.tsv"
+ck "the check wait writes a WATCHDOG-VISIBLE heartbeat on EVERY poll, not once (LANE_MERGE_HB; >=2 over 3 polls) — a one-shot heartbeat leaves the wait silent and it is killed as 'stalled' with no verdict" \
+   $([ "$RC" = 11 ] && [ "$(grep -c '\[lane-merge\] heartbeat' "$T/hb-38.log")" -ge 2 ] && echo 0 || echo 1)
 # …and the target is DISCOVERED without any operator wiring when the lane's own log exists (`--issue` →
 # `$O/logs/lane-<issue>.log`, the file `lane.sh` writes and `run_agent` hands the watchdog as `--log`).
 new_o "$T/pr4.tsv"
