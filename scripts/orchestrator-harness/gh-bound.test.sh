@@ -83,13 +83,13 @@ GH_MODE=err gh_bounded api rate_limit >/dev/null 2>"$O/err"; printf 'rc_err=%s e
 merged="$(GH_MODE=both gh_bounded pr checks 7 2>&1)"; printf 'rc_both=%s merged=%s\n' "$?" "$(printf '%s' "$merged" | tr '\n' '|')"
 SH
 out="$(PATH="$T/bin:$PATH" GH_CALLS="$T/A.calls" GH_BOUND_S=1 run_rig "$A/rig.sh" "$T/oa" "$HERE" 2>&1)"
-echo "$out" | grep -qx 'rc=0' && ok "success path: status preserved (0)" || bad "success path: rc was not 0 — got: $(echo "$out" | sed -n 1p)"
-echo "$out" | grep -qx 'out={"ok":1,"argv":"pr view 7 --repo o/r --json state"}' \
+grep -qx 'rc=0' <<<"$out" && ok "success path: status preserved (0)" || bad "success path: rc was not 0 — got: $(echo "$out" | sed -n 1p)"
+grep -qx 'out={"ok":1,"argv":"pr view 7 --repo o/r --json state"}' <<<"$out" \
   && ok "success path: stdout is the child's OWN bytes, unchanged (the call sites parse it)" \
   || bad "success path: stdout was rewritten — got: $(echo "$out" | sed -n 2p)"
-echo "$out" | grep -qx 'rc_err=7 err=boom' && ok "failure path: the child's status AND stderr reach the caller untouched" \
+grep -qx 'rc_err=7 err=boom' <<<"$out" && ok "failure path: the child's status AND stderr reach the caller untouched" \
   || bad "failure path: rc/stderr were not passed through — got: $(echo "$out" | sed -n 3p)"
-echo "$out" | grep -q 'rc_both=3 merged=out|warn' \
+grep -q 'rc_both=3 merged=out|warn' <<<"$out" \
   && ok "merged 2>&1 is unaltered: no diagnostic of ours rides a caller's parsed bytes" \
   || bad "merged 2>&1 was contaminated — got: $(echo "$out" | sed -n 4p)"
 grep -q '^\[bound\] gh calls bounded at 1s' "$T/oa/logs/orch-loop.log" 2>/dev/null \
@@ -105,12 +105,12 @@ out="$(gh_bounded api rate_limit 2>/dev/null)"; rc=$?
 printf 'rc=%s elapsed=%s out=%s\n' "$rc" "$(( $(date +%s) - t0 ))" "$out"
 SH
 out="$(PATH="$T/bin:$PATH" GH_CALLS="$T/B.calls" GH_MODE=hang GH_HANG_S=30 GH_BOUND_S=1 run_rig "$B/rig.sh" "$T/ob" "$HERE" 2>&1)"
-echo "$out" | grep -q '^rc=124 ' && ok "hang: a gh call past the bound returns rc=124, not the hang's duration" \
+grep -q '^rc=124 ' <<<"$out" && ok "hang: a gh call past the bound returns rc=124, not the hang's duration" \
   || bad "hang: the call did not answer 124 — got: $out"
 el="$(echo "$out" | sed -n 's/.*elapsed=\([0-9]*\).*/\1/p')"
 { [ -n "$el" ] && [ "$el" -le 4 ]; } && ok "hang: it cost about the 1 s bound (${el}s), not the 30 s hang" \
   || bad "hang: costing ${el:-?}s — the bound did not bound"
-echo "$out" | grep -q 'out=$' && ok "hang: a killed call yields EMPTY output (never a fabricated answer)" \
+grep -q 'out=$' <<<"$out" && ok "hang: a killed call yields EMPTY output (never a fabricated answer)" \
   || bad "hang: a killed call produced output: $out"
 grep -q 'hit the 1s bound and was killed' "$T/ob/logs/orch-loop.log" 2>/dev/null \
   && ok "hang: the kill is recorded in the log, naming the bound that fired" \
@@ -134,7 +134,7 @@ gh_bounded pr view 4 >/dev/null 2>&1; rc2=$?
 printf 'after-reset: rc=%s calls=%s\n' "$rc2" "$(grep -c . "${GH_CALLS:-/dev/null}" 2>/dev/null || echo 0)"
 SH
 out="$(PATH="$T/bin:$PATH" GH_CALLS="$T/C.calls" GH_MODE=hang GH_HANG_S=10 GH_BOUND_TRIP=2 GH_BOUND_S=1 run_rig "$C/rig.sh" "$T/oc" "$HERE" 2>&1)"
-echo "$out" | grep -q 'trip: rc=124' && ok "trip: past GH_BOUND_TRIP a call still answers 124 (a refused read, not a hang)" \
+grep -q 'trip: rc=124' <<<"$out" && ok "trip: past GH_BOUND_TRIP a call still answers 124 (a refused read, not a hang)" \
   || bad "trip: a tripped call did not answer 124 — got: $out"
 echo "$out" | sed -n 's/^trip: rc=124 elapsed=\([0-9]*\) .*/\1/p' | grep -qx 0 \
   && ok "trip: the tripped call cost 0 s — it spawned no gh at all" \
@@ -144,7 +144,7 @@ af="$(echo "$out" | sed -n 's/^trip: rc=124 elapsed=[0-9]* before=[0-9]* after=\
 { [ -n "$bf" ] && [ -n "$af" ] && [ "$bf" = "$af" ]; } \
   && ok "trip: the stub gh was NOT invoked by the tripped call ($bf calls before and after)" \
   || bad "trip: the tripped call still reached gh (before=$bf after=$af)"
-echo "$out" | grep -q '^after-reset: rc=124 calls=' && af2="$(echo "$out" | sed -n 's/^after-reset: rc=[0-9]* calls=\([0-9]*\).*/\1/p')" \
+grep -q '^after-reset: rc=124 calls=' <<<"$out" && af2="$(echo "$out" | sed -n 's/^after-reset: rc=[0-9]* calls=\([0-9]*\).*/\1/p')" \
   && [ "${af2:-0}" -gt "${af:-0}" ] && ok "reset: an emptied counter re-arms the bound (the cycle top can reset it with a builtin)" \
   || bad "reset: emptying the counter did not re-arm the bound — got: $out"
 
@@ -156,7 +156,7 @@ out="$(gh_bounded pr view 7 2>/dev/null)"; rc=$?
 printf 'rc=%s s=%s trip=%s out=%s\n' "$rc" "$GH_BOUND_S" "$GH_BOUND_TRIP" "$out"
 SH
 out="$(PATH="$T/bin:$PATH" GH_CALLS="$T/D.calls" GH_BOUND_S=abc GH_BOUND_TRIP=0 run_rig "$D/rig.sh" "$T/od" "$HERE" 2>&1)"
-echo "$out" | grep -q '^rc=0 s=120 trip=3 ' \
+grep -q '^rc=0 s=120 trip=3 ' <<<"$out" \
   && ok "knobs: GH_BOUND_S=abc falls back to 120 s and the call still RUNS (never rc=125 for the whole cycle)" \
   || bad "knobs: an unparseable GH_BOUND_S was not repaired — got: $out"
 grep -q 'GH_BOUND_S=abc does not parse' "$T/od/logs/orch-loop.log" 2>/dev/null \
@@ -171,9 +171,9 @@ printf 'off=%s\n' "${GH_BOUND_OFF:-unset}"
 out="$(GH_MODE=ok gh_bounded pr view 9 2>/dev/null)"; printf 'rc=%s out=%s\n' "$?" "$out"
 SH
 out="$(PATH="$T/bin:$PATH" HOME="$T/nohome" GH_CALLS="$T/E.calls" run_rig "$E/rig.sh" "$T/oe" "$T/nolib" 2>&1)"
-echo "$out" | grep -qx 'off=1' && ok "degraded: no bounded.sh names itself (\$GH_BOUND_OFF=1) instead of refusing to run" \
+grep -qx 'off=1' <<<"$out" && ok "degraded: no bounded.sh names itself (\$GH_BOUND_OFF=1) instead of refusing to run" \
   || bad "degraded: GH_BOUND_OFF was not set — got: $out"
-echo "$out" | grep -q '^rc=0 out={"ok":1' && ok "degraded: calls still work (the bound is lost, the controller is not)" \
+grep -q '^rc=0 out={"ok":1' <<<"$out" && ok "degraded: calls still work (the bound is lost, the controller is not)" \
   || bad "degraded: a call failed — got: $out"
 [ -s "$T/oe/state/gh-bound" ] && ok "degraded: state/gh-bound records it, so a reader can see the box is unbounded" \
   || bad "degraded: state/gh-bound was not written — the degradation is invisible"
