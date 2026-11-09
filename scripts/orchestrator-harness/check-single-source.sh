@@ -582,6 +582,16 @@ repo_path_default_hits() {
       #   RESIDUAL: `&& REPO=/tmp/x` / `|| REPO="$AMBIENT"` — an assignment behind a separator — is not
       #   graded here. The RUNTIME is unaffected (`resolve_repo` refuses any value that is not a
       #   checkout), so what is lost is the coverage of the gate, not the safety of the box.
+      #   ⛔ RESIDUAL 2 — THE CANDIDATE CHANNEL, and do NOT read "the debt list is empty" as "nothing
+      #   invents a path" (fresh-context review of #3833, minor note). Since #1974 the shipped scripts
+      #   offer the cwd as a CANDIDATE via `REPO_CANDIDATES=<newline-delimited paths>`, which this arm
+      #   does not examine at all (it grades only lines matching `^REPO=`). A per-machine path planted
+      #   there reds nothing here. It is bounded by `resolve_repo`, which accepts a candidate ONLY after
+      #   `rev-parse --show-toplevel` proves it (and, with `$OR` declared, that its origin names that
+      #   target) — so a planted candidate can never make a pass SWEEP the wrong directory; the worst it
+      #   buys is a derivation that refuses (fail-closed). Grading the channel would mean parsing a
+      #   value whose whole point is to be a list, and this arm states that a gate which refuses
+      #   honest trees gets switched off; so it is named, not half-implemented.
       if (ln !~ /^REPO=/) next
       val = ln
       sub(/^REPO=/, "", val)                              # the value, without the assignment

@@ -268,9 +268,14 @@ eq "$(cat "$RM_LOG")" "cap9664-pg" "docker rm -f was the exact removal"
 
 # K. A REPO THAT IS NOT A CHECKOUT IS REFUSED, not swept (fresh-context review of #3833: the git stub's
 # `STUB_IS_CHECKOUT=0` arm models exactly this shape and NOTHING set it, so the branch was dead and the
-# fixture's own honesty claim was unexercised). This is the arm the resolver's proof exists to make: a
-# directory that cannot prove it is a checkout must never reach a `docker rm -f`, and the refusal must
-# name the value that is wrong rather than the library that is absent.
+# fixture's own honesty claim was unexercised). ⛔ THE ATTRIBUTION IS THE DECLARED-VALUE VALIDATION, not
+# the derivation's proof (fresh-context review of #3833, minor note — corrected): `run_reaper` exports
+# `LANE_CONTAINER_REPO="$REPO"`, so `resolve_repo` takes the DECLARED arm and never enters the candidate
+# loop; `STUB_IS_CHECKOUT=0` is what its `rev-parse --show-toplevel` answers there.
+# The property is the one that matters either way: a directory that cannot prove it is a checkout must
+# never reach a `docker rm -f`, and the refusal must name the value that is wrong rather than the
+# library that is absent. The DERIVED arm's refusal shape is covered for real by
+# `repo-checkout-required.test.sh` §B/§D3 and `repo-slug.test.sh` A11/A16.
 echo " K. a REPO that is NOT a checkout is refused and sweeps nothing"
 printf 'cap9664-pg\trunning\n' > "$T/docker.list"
 : > "$T/ps.fixture"

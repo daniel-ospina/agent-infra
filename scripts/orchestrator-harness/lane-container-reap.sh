@@ -112,7 +112,7 @@ Usage:
   --dry-run     report only (the default)
   --apply       arm deletion (or env LANE_CONTAINER_DRY_RUN=0)
   --repo PATH   repo whose worktrees own fdb-lane-* containers (no default; a proven checkout of the
-#                 box's REPO, else the invoking cwd when THAT is a checkout)
+                box's REPO, else the invoking cwd when THAT is a checkout)
   --min-age S   age floor in seconds (default 14400)
 
 A container is removed ONLY when ALL three proofs hold: it is older than the age floor; no process's
