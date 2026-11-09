@@ -1146,7 +1146,11 @@ rail_attempt() {
   # binds evidence to the sha being merged (the landing `pr-<N>` key carries no head).
   if ( cd "$REPO" && \
        CLAIM_ACTION_HEAD_TOKEN="${CROSS_OWN:-}" \
-       CLAIM_ACTION_CLAIMS_SH="$_M1_MOD/claims.sh" \
+       # ⛔ `${_M1_MOD:-$O}` IS SELF-SUFFICIENT ON PURPOSE: this block is EXTRACTED and DRIVEN by
+       # `test-gates.sh` from a range that starts far below `_M1_MOD`'s assignment, so a bare
+       # `$_M1_MOD` is unbound there — under `set -u` the subshell dies at the expansion and the `if`
+       # silently takes the "rail FAILED" branch, i.e. the rail is never invoked at all.
+       CLAIM_ACTION_CLAIMS_SH="${_M1_MOD:-$O}/claims.sh" \
        CLAIM_ACTION_REPO="$REPO" \
        bash "$RAIL" "$PR" --repo "$OR" -- --squash ) >> "$L.log" 2>&1; then
     echo "[merge $PR] MERGED via the rail (attempt $RC_N) $(date)" >> "$L.log"

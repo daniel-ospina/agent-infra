@@ -768,6 +768,13 @@ ck "(d) …and it does NOT claim every attempt is failing [$(printf '%s' "$launc
    "$(case "$launchd_row" in ""|*"every attempt is failing"*) echo 1 ;; *) echo 0 ;; esac)"
 ck "(d) …and it points at launchd.OUT, which is where 'already running' is written [$(printf '%s' "$launchd_row" | cut -c1-200)]" \
    "$(case "$launchd_row" in *launchd.out*launchd.err*|*launchd.err*) echo 1 ;; *launchd.out*) echo 0 ;; *) echo 1 ;; esac)"
+# ⛔ AND IT MUST NOT READ A HISTORICAL `[singleton]` LINE AS THIS RUN'S VERDICT (fresh-context review of
+# #3846). `orch-loop.log` is APPEND-ONLY and never rotated, so a line from an earlier refusal is
+# PERMANENT — and this row used to say "a 0 here with a [singleton] line … is the same refusal", which
+# tells an operator that a CLEAN exit was a refusal for ever after one loud day. A stale line can never
+# be a verdict; the row has to point at the line's own `me=`/`rc=` and its age instead.
+ck "(d) …and it does NOT read a stale [singleton] line as this run's verdict [$(printf '%s' "$launchd_row" | cut -c1-240)]" \
+   "$(case "$launchd_row" in *"IS NOT THE VERDICT OF THIS RUN"*) echo 0 ;; *) echo 1 ;; esac)"
 # ⛔ 75 IS A REFUSAL, AND IT MUST NOT READ AS A DEATH (agent-infra#2095). Without its own arm exit 75
 # fell through to `DIED … every attempt is failing`, which under KeepAlive repeats for ever on a
 # CORRECT refusal — the same class as the false-green the old silent `exit 0` produced, in the other
