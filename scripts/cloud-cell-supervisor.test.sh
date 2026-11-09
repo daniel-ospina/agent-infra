@@ -5792,8 +5792,8 @@ esac
 # (d2) THE SIBLING LAYER'S MODE — the SAME false PASS, one layer up (fresh review, P2). `check`'s
 #      gh-limit probe was `PATH="$O/gh-limit:$PATH" gh --version`, and `gh` there is a NAME: with a
 #      mode-`-x` `$O/gh-limit/gh` the kernel SKIPS it (EACCES), the search continues, and the probe was
-#      answered by `$O/gh-rest/gh` or the stub in `$QT/bin` — rc=0 certifying a box whose rate-limit
-#      layer is INERT, while the adapter three lines below had already been fixed for this exact class.
+#      answered by `$O/gh-rest/gh` or the stub in `$QT/bin` — rc=0 certifying a box whose gh-limit SHIM
+#      is unrunnable, while the adapter three lines below had already been fixed for this exact class.
 #      ⛔ NON-VACUITY, MEASURED: the mode arm is GREEN on the pre-fix probe (a `PATH` lookup cannot see
 #      the mode at all) and the 127 arm is reached by name as readily as by path — which is precisely
 #      why neither assertion existed, and why the fix needs both.
@@ -5803,7 +5803,7 @@ esac
 chmod -x "$QT/o/gh-limit/gh"
 g2039 check
 [ "$QT_RC" -ne 0 ] && ok "check REFUSES a gh-limit layer that is PRESENT but NOT EXECUTABLE (PATH skips it and answers from another gh)" \
-                   || bad "check certified a non-executable gh-limit shim — gh resolves PAST it, so every call bypasses the layer while this box reports it as installed (#1988)"
+                   || bad "check certified a non-executable gh-limit shim — gh resolves PAST it, so the shim is never run (only the adapter's route through \$O/gh-limit.py serialises) while this box reports it as installed (#1988)"
 case "$QT_OUT" in
   *"gh-limit layer at $QT/o/gh-limit/gh is PRESENT but NOT EXECUTABLE"*) ok "…naming the mode, so the operator is not sent to debug the layer's own logic" ;;
   *) bad "the non-executable gh-limit refusal is not named: $(printf '%s' "$QT_OUT" | tail -3 | tr '\n' ' ')" ;;

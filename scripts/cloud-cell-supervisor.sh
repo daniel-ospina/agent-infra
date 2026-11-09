@@ -288,7 +288,7 @@ workers_maybe_live() {
 #                        Without it only the controller would be served. ORDER MATTERS: the adapter
 #                        routes every call through the same `$O/gh-limit.py`, so it must resolve first
 #                        or the adapter is never reached (this file's `start` builds exactly that order
-#                        in both carriers — :4101 for the service-mode export, :4129 for the tmux
+#                        in both carriers — :4103 for the service-mode export, :4131 for the tmux
 #                        string; `lane.sh:83-84` re-asserts it for lanes).
 WORKER_ENV_NAMES="AI_REVIEW_GATE_KEY HOME O DEEPSEEK_API_KEY PATH"
 
@@ -2422,8 +2422,8 @@ seed_and_stamp() {
   # and the cell dispatched NOTHING for as long as the refusal lasted, while the REST budget sat at
   # 1952/5000 and the log said only `FAILED rc=1 (transient — retried next cycle)`. `install.sh` seeds
   # this adapter on the Mac and puts it first on the daemon PATH (`install.sh:789-884`); the cell path
-  # seeded its LIMIT layer and never the adapter, so the two platforms diverged on exactly the surface that
-  # decides whether a GraphQL exhaustion degrades the cycle or stops it.
+  # seeded its LIMIT layer and never the adapter, so the two platforms diverged on which reads reach
+  # REST — and that is the divergence, NOT stop-vs-degrade: the open-PR read is still GraphQL (#2143).
   # ⛔ SAME `$O/gh-limit.py` SIBLING AS THE MAC, and that is not a coincidence: the adapter resolves
   # its limit layer as `$SELF_DIR/../gh-limit.py`, which for `$O/gh-rest/gh` IS `$O/gh-limit.py` — the
   # file the block above seeds. So a cell that gets this adapter keeps #1988's serialisation (measured
@@ -3115,14 +3115,16 @@ cmd_check() {
   # `gh` "through the very PATH the session will get". It was wrong twice over. (1) `gh` there is a
   # NAME: with a mode-`-x` `$O/gh-limit/gh` the kernel SKIPS the candidate (EACCES) and CONTINUES the
   # search, so the probe was answered by `$O/gh-rest/gh` or the real binary and rc=0 certified a box
-  # whose rate-limit layer is INERT — the identical false PASS the adapter block below was fixed for
-  # (and the same mechanism mise/asdf document as shim fall-through). (2) It is not the session's PATH
-  # either: `start` leads with `$O/gh-rest` (:4101, :4129), so no `PATH=` form answers about the order
-  # this box will ever have. The MODE is therefore required (and named), and the layer is executed BY
-  # PATH — the same rule, applied three lines early because the adapter probe sits one layer down.
+  # whose gh-limit SHIM is unrunnable — still serialised when the adapter gave that answer (it routes
+  # through the same `$O/gh-limit.py`), unguarded when the real binary did. That is the identical
+  # false PASS the adapter block below was fixed for, and the same mechanism mise/asdf document as
+  # shim fall-through. (2) It is not the session's PATH either: `start` leads with `$O/gh-rest`
+  # (:4103, :4131), so no `PATH=` form answers about the order this box will ever have. The MODE is
+  # therefore required (and named), and the layer is executed BY PATH — the same rule, applied three
+  # lines early because the adapter probe sits one layer down.
   if [ -f "$O/gh-limit/gh" ] && [ -f "$O/gh-limit.py" ]; then
     [ -x "$O/gh-limit/gh" ] \
-      || die "the gh-limit layer at $O/gh-limit/gh is PRESENT but NOT EXECUTABLE — the shell SKIPS it and resolves gh to $O/gh-rest/gh or the real binary, so EVERY gh call in the session bypasses the layer while this box would report it as installed (#1988). Remedy: chmod +x it, or re-seed with '$0 start'."
+      || die "the gh-limit layer at $O/gh-limit/gh is PRESENT but NOT EXECUTABLE — the shell SKIPS it and resolves gh PAST it: to $O/gh-rest/gh when the adapter is deployed, where calls are still serialised through the same $O/gh-limit.py, or to the real binary when it is not, where NOTHING is serialised or backed off. Either way this box would report a layer it cannot run (#1988). Remedy: chmod +x it, or re-seed with '$0 start'."
     # ⛔ `NO_WAIT` ON THE PROBE. Without it a box with one gh hanging in flight makes `check` wait up
     # to the layer's 600 s lock budget — and `check` is the diagnostic an operator runs BECAUSE the
     # box looks stuck. `gh --version` needs no lock at all, but the lock is taken before the child is
