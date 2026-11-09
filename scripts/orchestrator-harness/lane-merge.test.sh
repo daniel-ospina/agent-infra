@@ -1428,6 +1428,60 @@ OUT="$(REPO_PATH="${REPO_PATH:-$RUN_REPO}" PATH="$BIN:$PATH" GH_LOG=/dev/null O=
       bash "$SCRIPT" 40 --watch --repo o/r --pr-tsv "$T/pr-fit.tsv" 2>&1)"; RC=$?
 ck "…and one chunk EARLIER the derived cap does NOT refuse it (the bound is REACHABLE by the lane that owns it, not always-already-spent)" \
    $([ "$RC" = 11 ] && [ "$(verdict_of 40 | cut -d' ' -f1)" = WAITING_CHAIN_ABSENT ] && echo 0 || echo 1)
+# ⛔ AND THE ALLOWANCE MUST BE WHAT THE CLOCK ACTUALLY LEFT, NOT THE WORST CASE'S SHARE (#3850 review,
+# P2 — verified by arithmetic against this repo's own declared chain budgets). The design operand sizes the
+# allowance against the FULL 5400 s check wait, but supervision is paid after the wait, from whatever clock
+# remains — so a lane whose checks settled early got the worst case's 7 chunks (840 s) while thousands of
+# seconds still stood. 840 s is BELOW the chain this loop supervises: `merge-one.sh` budgets its reviewer at
+# `REVIEW_TIMEOUT` = 1800 s and leases the PR claim for 3000 s (`claims.sh:166`), and `chain-merge.sh` waits
+# 1890 s for the merge phase — so the lane handed off `BLOCKED_ATTEMPTS … chain was STILL RUNNING` over a
+# chain that was legitimately still reviewing, and `WATCH_F` only rewinds on a fix round or a head move.
+# The arm drives the DERIVED-FLOOR path first: 7 chunks seeded, chunk 8 arrives with an UNRESOLVABLE lane
+# clock (no `--issue`, no seam) — the design floor must still refuse it, or supervision becomes unbounded
+# for a controller re-run that is not under a lane at all. This row PASSES PRE-FIX and is here as the
+# regression guard that keeps the raise below honest.
+new_o "$T/pr-fit.tsv"
+printf '7\n' > "$OT/state/lanemerge-46.watch"
+OUT="$(REPO_PATH="${REPO_PATH:-$RUN_REPO}" PATH="$BIN:$PATH" GH_LOG=/dev/null O="$OT" HOME="$T/home" \
+      LANE_MERGE_WAIT=5400 LANE_MERGE_POLL=120 \
+      bash "$SCRIPT" 46 --watch --repo o/r --pr-tsv "$T/pr-fit.tsv" 2>&1)"; RC=$?
+ck "with NO resolvable lane clock the supervision allowance stays the 7-chunk design floor — chunk 8 is still refused (a controller re-run is not granted unbounded supervision)" \
+   $([ "$RC" = 13 ] && [ "$(verdict_of 46 | cut -d' ' -f1)" = BLOCKED_ATTEMPTS ] && echo 0 || echo 1)
+# …and with the SAME 7 spent chunks and a RESOLVED clock, chunk 8 must be ADMITTED: at elapsed 1000 s the
+# remaining-clock fit is `(7200 − 1000 − 120)/120 = 50`, clamped by the watchdog's 2700 s allowance to 22 —
+# still far above 7, and still inside both bounds. Pre-fix this row reds (MAX_WATCH stayed 7 → exit 13),
+# which is the non-vacuity of the raise.
+new_o "$T/pr-fit.tsv"
+printf '7\n' > "$OT/state/lanemerge-47.watch"
+OUT="$(REPO_PATH="${REPO_PATH:-$RUN_REPO}" PATH="$BIN:$PATH" GH_LOG=/dev/null O="$OT" HOME="$T/home" \
+      LANE_MERGE_WAIT=5400 LANE_MERGE_POLL=120 LANE_MERGE_ELAPSED_S=1000 \
+      bash "$SCRIPT" 47 --watch --repo o/r --pr-tsv "$T/pr-fit.tsv" 2>&1)"; RC=$?
+ck "a lane whose checks settled EARLY gets supervision sized to the clock it has LEFT (chunk 8 admitted rather than refused against the worst-case wait) — the false 'chain was STILL RUNNING' blocker" \
+   $([ "$RC" = 11 ] && [ "$(verdict_of 47 | cut -d' ' -f1)" = WAITING_CHAIN_ABSENT ] && echo 0 || echo 1)
+# ⛔ AND THE RAISE MUST NOT OUT-REACH THE WATCHDOG (#3850 review, P2 — the second of the two bounds).
+# `--watch` writes NO heartbeat, so a chunk sequence longer than `IDLE_BOUND_S` is killed as `stalled` with
+# no verdict; the smaller bound therefore WINS. `(200 − 10)/120 = 1` chunk here, against a design floor of
+# `(7200 − 0 − 900)/120 = 52`: the watchdog's 1 must be taken, not the floor's 52.
+new_o "$T/pr-fit.tsv"
+printf '1\n' > "$OT/state/lanemerge-48.watch"
+OUT="$(REPO_PATH="${REPO_PATH:-$RUN_REPO}" PATH="$BIN:$PATH" GH_LOG=/dev/null O="$OT" HOME="$T/home" \
+      LANE_MERGE_WAIT=0 LANE_MERGE_POLL=120 LANE_BOUND_IDLE_S=200 LANE_MERGE_ELAPSED_S=1000 \
+      bash "$SCRIPT" 48 --watch --repo o/r --pr-tsv "$T/pr-fit.tsv" 2>&1)"; RC=$?
+ck "…but supervision is CLAMPED by the watchdog's allowance when that is smaller (200 s allowance → 1 chunk), so the raised allowance can never get the lane killed as 'stalled' with no verdict" \
+   $([ "$RC" = 13 ] && [ "$(verdict_of 48 | cut -d' ' -f1)" = BLOCKED_ATTEMPTS ] && echo 0 || echo 1)
+# ⛔ AND `--watch` MUST NOT EMIT THE CHECK-WAIT CAP (#3850 review, P3 — verified). The cap block had no
+# `WATCH` conjunct, so a `--watch` invocation — which returns inside its chunk loop and never reaches the
+# check wait — read a multi-line `CAPPED at …s` say_err about a wait it was never going to sit through, and
+# mutated `WAIT_S` for no consumer. The `--status` guard cannot cover this (both paths share module scope).
+# Conditions here are the cap's own: no heartbeat target (no `--issue`, no lane log), and the shipped
+# 5400 s wait above a 2700 s allowance. Pre-fix this row reds on the `CAPPED at` clause.
+new_o "$T/pr-fit.tsv"
+printf '0\n' > "$OT/state/lanemerge-49.watch"
+OUT="$(REPO_PATH="${REPO_PATH:-$RUN_REPO}" PATH="$BIN:$PATH" GH_LOG=/dev/null O="$OT" HOME="$T/home" \
+      LANE_MERGE_WAIT=5400 LANE_MERGE_POLL=120 \
+      bash "$SCRIPT" 49 --watch --repo o/r --pr-tsv "$T/pr-fit.tsv" 2>&1)"; RC=$?
+ck "a --watch chunk emits NO check-wait cap chatter about a wait it never sits through (the runtime limit is scoped to the path that runs the wait)" \
+   $([ "$RC" = 11 ] && [ "$(verdict_of 49 | cut -d' ' -f1)" = WAITING_CHAIN_ABSENT ] && ! grep -q 'CAPPED at' <<<"$OUT" && echo 0 || echo 1)
 new_o "$T/pr4.tsv"
 printf '20\n' > "$OT/state/lanemerge-32.watch"
 printf '15\n' > "$OT/state/lanemerge-32.apiretry"
