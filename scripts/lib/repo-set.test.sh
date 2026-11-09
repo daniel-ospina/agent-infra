@@ -1062,7 +1062,8 @@ def _openers(line):
     SECOND one — a `re.sub` that cuts at the first whitespace-preceded `#` — which is whitespace-anchored and
     quote-BLIND, so the two disagree on a line like `echo "a #b"` (untouched there, truncated to `echo "a`
     here). Neither is a redundant copy: delete `_strip_comment` and the walk opens phantom heredocs (6 of the
-    435 files change and the fixture loses 17 names); delete that `re.sub` and `f11f-0` reds by losing
+    437 files change and the fixture loses 18 names — `after_bare_word_brace` among them, which is why this
+    number is one more than the 17 measured before this fixture grew); delete that `re.sub` and `f11f-0` reds by losing
     `head_after_inline_comment`. This walk owns NEITHER; a quoted delimiter keeps its own quoting rules, and
     `$(( … ))` / `(( … ))` are arithmetic where `<<` is a shift.
     """
@@ -1236,11 +1237,21 @@ for i, raw in enumerate(lines):
     # `{ … }` is a COMMAND followed by a GROUP COMMAND, and nothing is defined — `echo_one` + `{ :; }` is
     # `bash -n` rc 0 with `declare -F` listing only the real definition, while `head` (which makes BOTH the
     # parens and the keyword optional) reported `echo_one`. That is an INVENTED name — the fail-closed
-    # direction, so not the dangerous one, but still a claim about a name bash never defined. The guard below
-    # is bash's own rule and costs nothing: it moves 0 of the 435 `git ls-files '*.sh'` files and leaves the
-    # fixture scan identical, so it is PINNED rather than declared (revert it and `f11f-0` reds on
-    # `bare_word_then_brace`, which is a command, not a definition).
-    if '(' not in s and not s.lstrip().startswith('function'):
+    # direction, so not the dangerous one, but still a claim about a name bash never defined.
+    # ⛔ AND THE KEYWORD IS A WORD, NOT A PREFIX (round 48 re-review, P3 — measured): `startswith('function')`
+    # admitted `function_helper`, `functions` and `functional`, which are BARE WORDS — `bash -n` rc 0 and
+    # `declare -F` listing only the real definition, while the scanner printed each one as a definition. That
+    # is the same invented name this guard exists to refuse, so the test is the reserved word followed by
+    # whitespace, which is how bash reads it.
+    # ⛔ ITS COST IS MEASURED, NOT "NOTHING" (round 48 re-review, P3 — measured over the 437
+    # `git ls-files '*.sh'` files at this head): the name SET never moves, but 4 files' ORDERED scan does —
+    # `scripts/disk-reaper.sh` and scripts/orchestrator-harness/{capacity-transfer,pr-sickness,repo-slug}.test.sh
+    # each lose one DUPLICATE report of a bare word that is also defined properly (`check_peer_locks`,
+    # `lbgh_clear`, `reset_all`, `rr`). So: 0 name sets move, 4 of 437 ordered scans move. On the fixture the
+    # guard removes nothing except the invention itself — reverted, the fixture scan gains ONLY
+    # `bare_word_then_brace`. It is PINNED (revert it and `f11f-0` reds on that name, a command and not a
+    # definition).
+    if '(' not in s and not re.match(r'function[ \t]', s.lstrip()):
         continue
     for later in lines[i+1:]:
         t = later.strip()
@@ -1342,14 +1353,18 @@ head_with_comment_between()
 {
   :
 }
-# ⛔ TWO LOAD-BEARING GUARDS HAD NO PIN, AND EACH CHANGES THE SCAN OF VALID SCRIPTS (measured: deleting either
-# left ALL 246 arms green at the head that measured this, while its mutant alone moves the scan of the repo's
-# own `*.sh` files — between them inventing `echo`, `printf`, `mkdir`, `awk`, `shift` as "definitions").
+# ⛔ TWO LOAD-BEARING GUARDS HAD NO PIN, AND THE TWO MUTANTS ARE NOT THE SAME SHAPE (measured, round 48
+# re-review, at this head over the 437 `git ls-files '*.sh'` files): deleting `head`'s end-of-line anchor
+# INVENTS names — 133 of them across 66 of those files; deleting the next-line-brace branch HIDES names on the
+# FIXTURE ONLY (6 of them: `name_next_line`, `name_func_next`, `head_after_inline_comment`,
+# `head_with_comment_between`, `indented_head_only`, `head_then_blank`) and moves 0 of the repo's own files.
+# Between them they invent `echo`, `printf` and `mkdir` as "definitions" — `awk` and `shift` did NOT appear in
+# either mutant when this was re-measured and must not be named.
 # ⛔ NO COUNT AND NO "HUNDREDS" IS WRITTEN HERE, AND THE REASON IS MEASURED RATHER THAN STYLISTIC. The
 # sentence in this very position used to say both guards move "hundreds of the repo's own scripts" and then
 # re-measured them at 130 and 4 four lines later — the paragraph refuting its own header. It is worse than
 # that now: two measurements of the SAME two mutants at this SAME head disagreed — 130 and 4 files in one,
-# 124 and 0 in the other, over the same 435 `git ls-files '*.sh'` files — and earlier drafts quoted
+# 124 and 0 in the other, over the same `git ls-files '*.sh'` population (435 then, 437 now) — and earlier drafts quoted
 # 283 / 282 / 276 / 21 / 18 / 20 from populations that are not the size of any set this tree has. ⛔ AND THE
 # NAME LIST DID NOT SURVIVE EITHER: `break` was named here as one of the invented definitions and appears in
 # NEITHER measurement. What survives every measurement is the DIRECTION — deleting the anchor INVENTS names,
