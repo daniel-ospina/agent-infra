@@ -1040,9 +1040,14 @@ def _strip_comment(line):
       * `_openers`' IN-QUOTE escape (`if c == '\\': i += 2` inside that state) — a separate condition from
         the outside-quote escape below; `echo "a \" # b" ; cat <<EOF` + a body invents the body line, and
         it moves 1 file (`rank-queue.test.sh`, losing 15 names).
-      * AND THREE MORE OF THE SAME CLASS, named so this list is not read as exhaustive: `_openers`'
-        single-quote CLOSE, and `_strip_comment`'s single-quote close and its in-quote escape. Each
-        separates on a valid-bash input and each moves 0 of the 438 files.
+      * AND FOUR MORE OF THE SAME CLASS, named so this list is not read as exhaustive: `_openers`'
+        single-quote CLOSE, and `_strip_comment`'s single-quote close, its in-quote escape, and — the one
+        that is a FALSE PASS rather than noise — its DOUBLE-quote CLOSE (`if c == quote: quote = None`).
+        That last one over `echo "a" # cat <<NOPE` followed by a real definition: ground truth and the
+        baseline both find the definition, and deleting the close loses it, because the `#` stops being a
+        comment and a phantom `NOPE` heredoc swallows the definition below it. It is the same shape pinned
+        for `head_after_inline_comment`, one quote character over. Each of the four separates on a
+        valid-bash input, moves 0 of the 438 files and leaves the suite at 246/0.
       * the head-branch KEYWORD exclusion (`if not m or m.group(1) in KEYWORDS` on the NEXT-LINE path) —
         delete it and a valid-bash input `local ()` + `{ :; }` is FOUND instead of missed, so the mutant is
         the faithful one: this guard's failure direction is a FALSE PASS on a definition bash really makes.
