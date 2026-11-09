@@ -70,7 +70,11 @@ starts it must therefore name a checkout (`#1553` owns whether the loop should k
   or its last read is DEGRADED. A **recycled** pid (alive, but not the loop) is DRIFT too: it says
   `recycled pid` rather than `OK loop alive`.
 - **2 UNKNOWN** — the probe could not answer (no `python3`, no state dir, unreadable process
-  table). **Never a pass.**
+  table, or a `HEARTBEAT_CHECK_MAX_AGE` that is not a positive whole number of seconds). **Never a
+  pass** — and a malformed bound is reported as what it is: a typo in the VARIABLE, named by name.
+  Before that check existed the bound went straight into the reader's `int(...)`, the traceback was
+  captured onto the same stream as the verdict, and rc 1 was accepted as a genuine **DRIFT** — so an
+  operator who mistyped a number was told the fleet read was stale.
 
 An empty snapshot is **not** a healthy fleet: `degraded` is a *per-row* flag, so on zero rows
 `any(...)` is vacuously false — the same trap `lane-status.py`'s own publisher documents.
@@ -104,15 +108,36 @@ is red on a healthy box is one operators learn to ignore:
   job itself (`com.tortoise.heartbeat-loop`, hand-installed, no template ever named it) is listed
   there, so **the same change that diagnoses it removes it** — otherwise `--status` stayed red until
   a human hand-deleted a plist, since `--uninstall` iterates templates and nothing describes it.
-- `templates/launchd/OWNED-BY-OTHER-INSTALLERS` — installed by **another surface of this repo**. The
-  harness controller `com.eldato.orchestrator-loop` is rendered by
-  `scripts/orchestrator-harness/install.sh` from its own template, so it is not this installer's set
-  to describe; flagging it made `--status` exit 1 forever on the reference Mac, and
-  `scripts/fleet-schedule.py` turns that into `SCHEDULE NOT VERIFIED`. The list is drift-gated by
-  `install-launchd.test.sh` §18, which pins every entry to the declaring installer's own `LABEL=`.
+- `templates/launchd/OWNED-BY-OTHER-INSTALLERS` — installed, **or adopted and supervised**, by
+  another surface of this repo. Three labels are there today, each with its declaring surface named
+  in the manifest:
+  - `com.eldato.orchestrator-loop` — rendered by `scripts/orchestrator-harness/install.sh` from its
+    own template, so it is not this installer's set to describe;
+  - `com.eldato.lane-arm` — written by `scripts/install-lane-arm-timer.sh`, which spells its launchd
+    label only as an inline plist body (its `LABEL=eldato-lane-arm` is the **systemd** unit name),
+    and documented as installed on both platforms;
+  - `com.eldato.orchestrator-stack` — the supervision job a box already carries. No installer here
+    writes its plist: `scripts/orchestrator-bringup.sh` **adopts** it rather than rendering over it,
+    and it is the default target of `scripts/orchestrator-harness/watchdog-loop.sh`.
 
-A job **nobody** declares is still `UNMANAGED`, and the report now names the exact command that
-removes it.
+  The list is drift-gated by `install-launchd.test.sh` §18 **in both directions and against every
+  spelling**: each entry must still have a declaring surface (a `LABEL=`/`BASE_LABEL=` assignment, a
+  `${LABEL:-com.…}` default, an inline `<string>com.…</string>` plist label, a literal
+  `Library/LaunchAgents/<label>.plist` path, or a `LABEL="com.eldato.${UNIT_NAME#eldato-}"` resolved
+  against that installer's own `UNIT_NAME=`), **and** every label an installer in this repo writes
+  into `LaunchAgents` must be a template, RETIRED, or listed here. The second direction is the one
+  that does harm: a gate that only catches a *stale* entry cannot notice a **missing** one.
+
+A job **nobody** declares is still `UNMANAGED` — but the report is no longer a delete order. It names
+the four answers in order (add a template / declare it in `OWNED-BY-OTHER-INSTALLERS` / retire it /
+it is nobody's) and prints the `bootout && rm -f` command last, per label, under *"only after
+checking that nothing of yours supervises the label"*. That change came from the second finding: the
+old wording opened each line with that command, and for `com.eldato.lane-arm` and
+`com.eldato.orchestrator-stack` the remedy offered for a live job of this repo's own was to delete it.
+
+`fleet-schedule.py --verify` counts all four failure wordings (`NOT INSTALLED`, `DRIFTED`,
+`not loaded`, `UNMANAGED`, `UNKNOWN`), so a run that fails only on the new two prints
+`SCHEDULE NOT VERIFIED — N launchd job(s) …` with a truthful N instead of `0`.
 
 ## ⛔ What is NOT the fix
 
