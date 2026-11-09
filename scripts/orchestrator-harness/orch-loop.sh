@@ -88,6 +88,11 @@ fi
 # Where the WORKER scripts live. Named separately from `O` (state) because the two can now differ; the
 # `$O/state/argv-*`, `$O/.batch` and `$O/candidates.txt` arguments stay `$O` — they ARE state.
 O_WORK="$ORC_WORK_ROOT"
+# ⛔ AND EXPORT IT (review of #3846, P1). `export O` below hands every child the STATE dir, and the
+# workers resolve their own modules from `$O` — so without this a worker sees a state dir that holds no
+# scripts at all and silently loses claims and the per-repo merge contract. `fix-one.sh` and
+# `merge-one.sh` prefer `$O_WORK` when it is set, which is the harness root.
+export O_WORK
 # ⛔ AND `O` MUST BE EXPORTED, or the isolation is a claim the children contradict (fresh-context review
 # of #3846, P1 — the second one, and the sharper). Three DIRECT children re-default `O` themselves —
 # `harness-refresh.sh`, `refresh-candidates.sh` (`:212`) and `dispatch-merge.sh` (`:13`) — each with
@@ -2401,15 +2406,26 @@ orc_singleton_acquire "$LOCKF"; ORC_SINGLETON_RC=$?
 case "$ORC_SINGLETON_RC" in
   0) : ;;
   *)
+    # ⛔ `rc=` IS IN THE LINE ON PURPOSE: it is the only durable record of WHICH refusal this was, and
+    # the launchd wrapper propagates that distinction (74 UNJUDGED / 75 HELD) to launchd and to
+    # `harness-up`, whose two rows have opposite remedies. A line without the code made the wrapper
+    # collapse them, and `harness-up` then told the operator not to touch a lock that was the problem.
     # ⛔ 75, NOT 0, AND THE NAME OF THE HOLDER GOES ON EVERY SURFACE. `exit 0` was the false PASS:
     # under launchd KeepAlive a silent zero reads as "the controller ran and found nothing to do". A
     # non-zero exit is what makes a launchd throttle, a cell supervisor's `status` and a human's
     # `echo $?` agree that this instance did NOT run.
-    _orc_refusal="[singleton] refused me=$ORC_INSTANCE state=$O state_src=$ORC_STATE_SRC max_load=$MAX_LOAD src=$MAX_LOAD_SRC — $ORC_SINGLETON_WHY"
+    _orc_refusal="[singleton] rc=$ORC_SINGLETON_RC refused me=$ORC_INSTANCE state=$O state_src=$ORC_STATE_SRC max_load=$MAX_LOAD src=$MAX_LOAD_SRC — $ORC_SINGLETON_WHY"
     echo "[orch-loop] $_orc_refusal" >&2
     echo "$_orc_refusal" >> "$LOG" 2>/dev/null || true
+    # ⛔ TWO REFUSALS, TWO EXIT CODES, BECAUSE THEY HAVE OPPOSITE REMEDIES (fresh-context review of
+    # #3846). HELD (rc 1) means a controller of this state dir owns it: do nothing, the box is fine.
+    # UNJUDGED (rc 2) means the record could not be read or dated: somebody has to LOOK, and possibly
+    # remove it. Collapsing both into 75 made the launchd row assert the HELD story — "this state dir
+    # already has a controller, which is the singleton working" — and tell the operator NOT to touch
+    # the lock, while the loop's own text said the opposite. 74 is UNJUDGED and has its own row.
     if [ "$ORC_SINGLETON_RC" = "2" ]; then
       echo "[orch-loop] the record at $LOCKF could not be judged (contents: '$(orc_lock_pid "$LOCKF" 2>/dev/null)'). Nothing was removed: an unreadable record is not a dead one. Next: read that pid's identity with 'ps -o pid=,etime=,command= -p <pid>'; if no controller of $O is running, rm -f '$LOCKF' and start again." >&2
+      exit 74
     fi
     exit 75 ;;
 esac
@@ -5824,9 +5840,19 @@ while true; do
   # ── cross-box claim snapshot (agent-infra#1709 recs 1-3) ─────────────────────
   # ONE fetch refreshes every claim ref, so claim_live() answers "is another box on this?"
   # from a local file. Per-PR network calls would be 2 x N round trips per cycle.
-  if [ -f "$O/claims.sh" ]; then
+  # ⛔ TWO HOMES, LIKE EVERY SIBLING MODULE (fresh-context review of #3846, P1). This was the ONE
+  # module-resolution site with no beside-the-loop fallback, and it is the load-bearing one: with the
+  # documented `ORC_STATE_DIR` (or a case-4 isolated instance, whose `$O` is an empty temp dir) the
+  # snapshot never loads, the sweep abstains, every PR reads `claim-unreadable` and NOTHING is spawned
+  # while `[cap]` keeps printing a healthy line. That is verbatim the "reports healthy and can dispatch
+  # nothing" class the O_WORK block above exists to remove, one module over from the four it fixed.
+  _claims_home=""
+  if [ -f "$O/claims.sh" ]; then _claims_home="$O"
+  elif [ -n "${_HERE_RS:-}" ] && [ -f "$_HERE_RS/claims.sh" ]; then _claims_home="$_HERE_RS"
+  fi
+  if [ -n "$_claims_home" ]; then
     # shellcheck source=/dev/null
-    . "$O/claims.sh"
+    . "$_claims_home/claims.sh"
     # ⛔ CLAIM_REPO IS STILL SET EXPLICITLY HERE (agent-infra#1996). launchd starts the job at cwd `/`
     # and macOS DENIES the read of it, so a relative registry resolves against a cwd that cannot even
     # be read: every git call inside claims.sh then fails, and the snapshot came back empty with live
@@ -5915,7 +5941,7 @@ while true; do
     # exactly as if it were alone on the repo, which is the duplicate dispatch this whole mechanism
     # exists to prevent. It is now the loud, named abstention: nothing is selected until the one-line
     # remedy is run. `refresh-candidates.sh --check` refuses the same state up front.
-    echo "[claims] ⛔ claim-unreadable: no registry at $O/claims.sh — every PR reads claim-unreadable, so NOTHING is spawned or armed this cycle (silence is not freedom); fix: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o ${O:-~/orchestrator}" >> "$LOG"
+    echo "[claims] ⛔ claim-unreadable: no registry at $O/claims.sh or ${_HERE_RS:-?}/claims.sh — every PR reads claim-unreadable, so NOTHING is spawned or armed this cycle (silence is not freedom); fix: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o ${O:-~/orchestrator}" >> "$LOG"
   fi
 
   stg_mark claims
@@ -9144,7 +9170,7 @@ PY
         # the duplicate-dispatch shape the issue claim exists for — it cannot take the claim AND it
         # cannot see a peer's. The cost of abstaining is one command and one cycle of delay; the cost
         # of dispatching is two lanes on one issue.
-        echo "[dispatch] #$ISS NOT dispatched — claim-unreadable: no registry at $O/claims.sh, so this box can neither take the issue claim nor see a peer's; an absent registry is not evidence of freedom. Fix: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o ${O:-~/orchestrator}" >> "$LOG"
+        echo "[dispatch] #$ISS NOT dispatched — claim-unreadable: no registry at $O/claims.sh or ${_HERE_RS:-?}/claims.sh, so this box can neither take the issue claim nor see a peer's; an absent registry is not evidence of freedom. Fix: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o ${O:-~/orchestrator}" >> "$LOG"
         continue
       fi
       # ⛔ THE BATCH CAP IS THE CASCADE'S, NOT `BATCH` (owner ruling 2026-11-04). `BATCH` was the

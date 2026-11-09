@@ -666,6 +666,8 @@ case "${LAUNCHD_MODE:-running}" in
   # controller of this state dir holds `.orch.lock`. KeepAlive relaunches it every ThrottleInterval,
   # so a `DIED … every attempt is failing` row would be a permanent FALSE-RED on a healthy box.
   refused-singleton) printf '\tstate = spawn scheduled\n\tlast exit code = 75\n\truns = 9\n'; exit 0 ;;
+  # An UNJUDGED refusal: the lock record exists but cannot be read or dated. OPPOSITE REMEDY to 75.
+  refused-unjudged) printf '\tstate = spawn scheduled\n\tlast exit code = 74\n\truns = 4\n'; exit 0 ;;
   # Loaded with no process AND no exit data at all: the row may not invent one.
   no-data) printf '\tstate = spawn scheduled\n'; exit 0 ;;
   *) printf '\tstate = running\n\tpid = 4242\n'; exit 0 ;;
@@ -792,6 +794,19 @@ ck "(d) control: exit 128 is still DIED, not REFUSED-SINGLETON [$launchd_row]" \
    "$(case "$launchd_row" in *DIED*|*"last exit 128"*) case "$launchd_row" in *REFUSED-SINGLETON*) echo 1 ;; *) echo 0 ;; esac ;; *) echo 1 ;; esac)"
 ck "(d) control: …and it still says every attempt is failing [$(printf '%s' "$launchd_row" | cut -c1-200)]" \
    "$(case "$launchd_row" in *"every attempt is failing"*) echo 0 ;; *) echo 1 ;; esac)"
+
+# ⛔ UNJUDGED IS ITS OWN ROW, BECAUSE ITS REMEDY IS THE OPPOSITE (fresh-context review of #3846). 75 says
+# the holder is the authority and the lock must be left alone; 74 says the record could not be read, so
+# somebody has to look and may remove it. One row for both tells the operator the wrong thing.
+OUT="$( cd "$TMP" && PATH="$TMP/darwinbin:$TMP:$PATH" HOME="$TMP/home" CELL_HOME="$CELL" \
+        HARNESS_PIN_DIR="$PINROOT" HARNESS_PIN_FILE="$CELL/.harness-path" HARNESS_UP_OS=Darwin \
+        LAUNCHD_MODE=refused-unjudged HU_PS="$TMP/ps-probe" PS_TABLE="$TMP/ps-pinned" HU_LOADAVG_FILE="$TMP/load" \
+        bash "$UP" status --repo "$REPO_FIX" --harness "$PIN_TREE" --no-fetch 2>&1 )"; RC=$?
+launchd_row="$(printf '%s\n' "$OUT" | grep -E '^launchd ' | head -1)"
+ck "(d) an UNJUDGED refusal (exit 74) is NAMED REFUSED-UNJUDGED, not folded into the 75 row [$launchd_row]" \
+   "$(case "$launchd_row" in *REFUSED-UNJUDGED*) case "$launchd_row" in *REFUSED-SINGLETON*) echo 1 ;; *) echo 0 ;; esac ;; *) echo 1 ;; esac)"
+ck "(d) …and it gives the OPPOSITE remedy — investigate, and removing the record IS allowed when nothing holds it [$(printf '%s' "$launchd_row" | cut -c1-240)]" \
+   "$(case "$launchd_row" in *"rm -f"*|*"rm -f"*) echo 0 ;; *) echo 1 ;; esac)"
 
 # ⛔ `runs = 0` SETTLES "NEVER KICKED" even with no exit code — the count is not discarded when the
 # code is absent (review cycle 2).

@@ -145,18 +145,42 @@ fi
 # sourcing that file would EXECUTE the controller, which is the thing this file is here to launch.
 _shq() { local s="${1:-}" q="'"; printf "'%s'" "${s//$q/$q\\$q$q}"; }
 
-# _lc_refused — 0 when the loop REFUSED at startup (a `[singleton]` line in its log), 1 otherwise.
-# ⛔ THE WITNESS IS THE ARTIFACT THE LOOP ALREADY WRITES, not `#{pane_dead_status}`: that is a
-# tmux-version dependency this launcher does not otherwise carry, and a refusal can happen before a
-# pane is even addressable. `harness-up` keys its `REFUSED-SINGLETON` row on this wrapper's exit code,
-# so a refusal that is swallowed here is a permanent false-red on a healthy box (agent-infra#2095).
+# ⛔ THE WITNESS MUST BE BOUND TO THIS ATTEMPT (fresh-context review of #3846, P1 — reproduced by
+# reading the writers). `orch-loop.log` is APPEND-ONLY and never rotated or truncated (every writer
+# uses `>>`; nothing under `scripts/` truncates it), so a `[singleton]` line from an EARLIER refusal
+# stays in the file for the life of the state dir. An unbounded `grep` therefore reported "refused"
+# for every later early death — a half-synced `$O` (exit 78), missing worker scripts (78), `REPO`
+# unset (78) — i.e. a DEAD controller described as a correct refusal, with the instruction not to
+# touch the lock. That is the same false-PASS class as the silent `exit 0` this PR removes, mirrored.
+# So the byte offset is captured IMMEDIATELY BEFORE `new-session` and only the bytes THIS attempt
+# appended are searched. No marker file to leak, no `#{pane_dead_status}` tmux-version dependency.
+_LC_LOG="$O/logs/orch-loop.log"
+_LC_OFFSET=0
+_lc_mark_baseline() {
+  _LC_OFFSET=0
+  [ -f "$_LC_LOG" ] && _LC_OFFSET="$(wc -c < "$_LC_LOG" 2>/dev/null | tr -d '[:space:]')"
+  case "${_LC_OFFSET:-}" in ''|*[!0-9]*) _LC_OFFSET=0 ;; esac
+  return 0
+}
 _lc_refused() {
-  [ -f "$O/logs/orch-loop.log" ] && grep -q '\[singleton\]' "$O/logs/orch-loop.log" 2>/dev/null
+  local _lc_tail=""
+  [ -f "$_LC_LOG" ] || return 1
+  _lc_tail="$(tail -c "+$(( _LC_OFFSET + 1 ))" "$_LC_LOG" 2>/dev/null)"
+  grep -q '\[singleton\]' <<<"$_lc_tail"
 }
 # _lc_refusal_exit — say the refusal and exit 75. One copy, so the two early-death arms cannot drift
 # into one that reports a refusal as a crash and one that does not.
 _lc_refusal_exit() {
-  _lc_err "'$S' controller REFUSED to start: this state dir already has a controller ([singleton] in $O/logs/orch-loop.log names the holder) — exiting 75 so launchd and harness-up report a REFUSAL, not a crash"
+  # ⛔ THE REFUSAL'S OWN CODE IS PROPAGATED (74 UNJUDGED / 75 HELD). Opposite remedies: 75 says the
+  # holder is the authority and the lock must be left alone; 74 says the record could not be read or
+  # dated, so somebody has to look and may remove it. `orch-loop.sh` writes `[singleton] rc=<n>` for
+  # exactly this reason — collapsing the two here would undo the distinction the loop just made, and
+  # `harness-up` would assert the 75 story on a 74 state.
+  local _rc="" _tail=""
+  [ -f "$_LC_LOG" ] && _tail="$(tail -c "+$(( _LC_OFFSET + 1 ))" "$_LC_LOG" 2>/dev/null)"
+  _rc="$(printf '%s\n' "$_tail" | sed -n 's/.*\[singleton\] rc=\([0-9][0-9]*\).*/\1/p' | head -1)"
+  _lc_err "'$S' controller REFUSED to start: this state dir already has a controller, or has a lock record that cannot be judged ([singleton] in $O/logs/orch-loop.log names the holder and the reason) — propagating the loop's own refusal code so launchd and harness-up report a REFUSAL, not a crash"
+  if [ "${_rc:-}" = "2" ]; then exit 74; fi
   exit 75
 }
 
@@ -239,6 +263,8 @@ if ! "$TMUX_BIN" has-session -t "=$S" 2>/dev/null; then
     exit 78
   fi
   # /usr/bin/env is absolute: the pane's shell resolves it BEFORE the forwarded PATH is in effect.
+  # The refusal witness is scoped to what THIS launch writes (see `_lc_refused`).
+  _lc_mark_baseline
   "$TMUX_BIN" new-session -d -s "$S" \
     "exec /usr/bin/env$ENV_PREFIX /bin/bash $(_shq "$O/orch-loop.sh")" || exit $?
   # ⛔ A CREATE THAT "SUCCEEDED" IS NOT A CONTROLLER, AND THE TWO WAYS THIS LIES ARE OPPOSITE.
