@@ -2330,14 +2330,20 @@ else
   # consequence: a refusal must exit BEFORE the review (nothing paid), and a success must leave the
   # PR-wide ref RELEASED on the way out (a claim that outlives its worker freezes the PR for the
   # whole lease — strictly worse than the duplicate it prevents).
-  _ls="$(grep -n '^if \[ -f "\$O/claims.sh" \]; then' "$MERGE" | head -1 | cut -d: -f1)"
+  _ls="$(grep -n '^if \[ -f "\$_M1_MOD/claims.sh" \]; then' "$MERGE" | head -1 | cut -d: -f1)"
   # ⛔ THE END ANCHOR IS THE NEXT BLOCK, NOT THE TRAP LINE. Anchoring the extraction on the trap made
   # a MISSING trap read as "could not extract" — the right verdict for the wrong reason, and it
   # named the extraction rather than the defect. The head-claim block always follows, so that is the
   # boundary; the trap itself is then asserted separately, by name.
-  _lh="$(grep -nF 'if [ -n "${HEAD:-}" ] && [ -f "$O/claims.sh" ]; then' "$MERGE" | head -1 | cut -d: -f1)"
+  _lh="$(grep -nF 'if [ -n "${HEAD:-}" ] && [ -f "$_M1_MOD/claims.sh" ]; then' "$MERGE" | head -1 | cut -d: -f1)"
   if [ -n "$_ls" ] && [ -n "$_lh" ] && [ "$_ls" -lt "$_lh" ]; then
-    { sed -n '/^release_pr_claim_bounded() {/,/^}/p' "$MERGE"
+    # ⛔ `_M1_MOD` IS PREPENDED, NOT ASSUMED (fresh-context review of #3846). The shipped landing block
+    # resolves its module home from `$_M1_MOD` (the work root, declared ABOVE the extracted range), so
+    # the driven fragment needs that name bound — otherwise every arm below reads `[ -f "/claims.sh" ]`,
+    # skips the block, and PASSES BY ABSENCE. Binding it to the sandbox's own `O` is what the drivers
+    # below already intend.
+    { echo '_M1_MOD="${_M1_MOD:-$O}"'
+      sed -n '/^release_pr_claim_bounded() {/,/^}/p' "$MERGE"
       sed -n "${_ls},$((_lh - 1))p" "$MERGE"; } > "$TMP/landdrive.sh"
   else
     : > "$TMP/landdrive.sh"
