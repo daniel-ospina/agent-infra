@@ -5807,7 +5807,29 @@ case ":$QPATH:" in
   *) bad "the service-mode controller's PATH does not lead with the adapter: [$QPATH]" ;;
 esac
 
-# (g) MIRROR, NOT OVERLAY — a harness that stops shipping the adapter must not leave a live copy behind
+# (g) THE STALENESS LINE — replacing a DIFFERENT adapter is SAID, the way `install.sh` says it. This
+#     branch had no arm on the first push (review observation), so a mutant that deleted it stayed
+#     green; a silent replacement is the state an operator cannot distinguish from "nothing changed".
+printf '#!/bin/bash\nexit 0\n' > "$QT/o/gh-rest/gh"   # DIFFERENT bytes, still runnable
+g2039 apply
+case "$QT_OUT" in
+  *"replacing a DIFFERENT $QT/o/gh-rest/gh"*) ok "apply SAYS when it replaces a different \$O/gh-rest/gh (no silent swap)" ;;
+  *) bad "a differing adapter was replaced silently: $(printf '%s' "$QT_OUT" | tail -3 | tr '\n' ' ')" ;;
+esac
+
+# (h) ADAPTER PRESENT, LIMIT HELPER ABSENT — the green path must not claim a serialisation it does not
+#     have (#1988). Same arm shape as the deploy-side clause, and the state is reachable: `install.sh`
+#     itself calls a missing helper survivable (the adapter fails open with a warning).
+rm -f "$QT/o/gh-limit.py"
+g2039 check
+case "$QT_OUT" in
+  *"its limit layer is $QT/o/gh-limit.py"*) bad "check claims a limit layer that is ABSENT — the operator would believe the box is serialised" ;;
+  *"gh-limit.py is ABSENT"*) ok "check says the limit layer is ABSENT rather than claiming it, and still certifies the adapter" ;;
+  *) bad "the adapter-without-helper state is not reported: $(printf '%s' "$QT_OUT" | tail -3 | tr '\n' ' ')" ;;
+esac
+g2039 apply >/dev/null 2>&1   # restore the pair for the mirror arm below
+
+# (i) MIRROR, NOT OVERLAY — a harness that stops shipping the adapter must not leave a live copy behind
 #     (the rule the *.sh workers and the gh-limit pair already follow).
 rm -f "$QT/tmuxup"
 git -C "$QT/ai" rm -r -q scripts/orchestrator-harness/gh-rest
@@ -5829,7 +5851,25 @@ case "$QT_OUT" in
   *) bad "no warning that the pin ships no adapter" ;;
 esac
 
-# (h) PARITY PIN (#2039, the issue's own property 4): the adapter is not a cell-only artifact, so every
+# (j) THE THIRD INSTALLER'S HELPER IS DEFINED BEFORE EITHER BRANCH (review finding, P2, on the first
+#     push — it was a REAL hole): bash defines a function only when its defining command RUNS, so a
+#     helper written inside the `gh-limit` branch is `command not found` for a harness that ships the
+#     adapter WITHOUT the pair — and `deploy-crossbox.sh` is `set -uo pipefail` with no `-e`, so the
+#     deploy did not die: it printed "seeded the gh REST adapter" over an EMPTY `$O/gh-rest` and
+#     started the controller with a non-existent dir leading PATH. That is the #2039 defect plus a
+#     false success line, on the one install path with no `check` verb behind it. Pinned by LINE
+#     ORDER — the rule this suite already uses in its #2315 arms — so the hoist cannot be undone.
+DC39="$HERE/deploy-crossbox.sh"
+_dc_def="$(grep -n '^_seed_one() {' "$DC39" 2>/dev/null | head -1 | cut -d: -f1)"
+_dc_branch="$(grep -n '^if \[ -f "\$H/gh-limit/gh"' "$DC39" 2>/dev/null | head -1 | cut -d: -f1)"
+[ -n "$_dc_def" ] && [ -n "$_dc_branch" ] \
+  && ok "deploy-crossbox.sh still has a top-level _seed_one and a gh-limit branch to order it before (found at :${_dc_def}/:${_dc_branch})" \
+  || bad "could not locate _seed_one and the gh-limit branch in deploy-crossbox.sh — this arm would otherwise pass vacuously (def='$_dc_def' branch='$_dc_branch')"
+[ -n "$_dc_def" ] && [ -n "$_dc_branch" ] && [ "$_dc_def" -lt "$_dc_branch" ] \
+  && ok "…and it is defined BEFORE the branch, so the adapter seed works on a harness that ships gh-rest/gh without the limit pair" \
+  || bad "deploy-crossbox.sh defines _seed_one INSIDE the gh-limit branch (def=$_dc_def branch=$_dc_branch) — a harness with the adapter but no limit pair then seeds NOTHING and logs success"
+
+# (k) PARITY PIN (#2039, the issue's own property 4): the adapter is not a cell-only artifact, so every
 #     installer that seeds the shared limit helper must seed it too. That divergence IS the defect — the
 #     cell seeded `gh-limit.py` and never `gh-rest/gh` — so it is pinned by SWEEPING the shipped
 #     installers rather than by naming them: adding a fourth cell install path that forgets the adapter

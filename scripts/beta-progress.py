@@ -253,7 +253,10 @@ def gh(*args):
 # (ONE function for all of them). Where the workspace has the gh layer's REST
 # adapter (`$O/gh-rest`, #1959) the OPEN read is already served over REST — `number,title,headRefName`
 # are all in its PR_FIELDS — but `mergedAt` is NOT, so the MERGED read delegates to the real gh,
-# which is GRAPHQL. On the cells there is no `$O/gh-rest` (#1978), so EVERY read is GraphQL.
+# which is GRAPHQL. On the cells `$O/gh-rest` is absent unless the pinned harness ships it AND the
+# installer seeded it — `cloud-cell-supervisor.sh start`/`check` and `deploy-crossbox.sh` do seed it
+# since #2039, so a cell whose pin carries the adapter serves the OPEN read over REST too; a cell
+# whose pin predates it (`check` warns) stays on GraphQL for every read.
 # Under fleet concurrency GraphQL is refused on the SECONDARY limit while the primary budget is
 # nearly untouched (measured 2026-10-19: core 1599/5000, graphql 4612/5000, one REST call
 # answering in 0.43 s with 17 concurrent gh clients on the same box), and the beat printed

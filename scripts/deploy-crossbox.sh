@@ -138,14 +138,22 @@ cp -p "$H"/*.sh "$O"/ || die "seed failed"
 # ⛔ STAGE-THEN-RENAME. Both files are EXECUTED by every gh call on the live cell, and a plain `cp`
 # truncates before it writes — a call in that window would run `python3` on half a file. The
 # supervisor seeds the same pair this way for the same reason.
+# ⛔ AND THE HELPER IS DEFINED **OUTSIDE** THE BRANCH — review finding, P2, and it was a real hole: as
+# written below inside the `if`, bash defines the function only when its command RUNS, so a harness
+# that ships `gh-rest/gh` while the limit PAIR is missing (a state `install.sh:806-821` calls
+# legitimate and survivable — the adapter fails open with a warning) reached the adapter block with
+# `_seed_one: command not found`; `set -uo pipefail` has no `-e`, so the deploy did not die, printed
+# "seeded the gh REST adapter" over an EMPTY `$O/gh-rest`, and started the controller with a
+# non-existent dir leading its PATH — i.e. the #2039 defect this seed exists to remove, plus a false
+# success line over it (#2041's shape). Same hoist as `cloud-cell-supervisor.sh:2352`.
+_seed_one() {  # <src> <dest>
+  local _src="$1" _dst="$2" _tmp="$O/.seed-$(basename "$2").$$"
+  cp -p "$_src" "$_tmp" || { rm -f "$_tmp"; die "cannot stage $(basename "$_dst") into $O"; }
+  chmod +x "$_tmp"      || { rm -f "$_tmp"; die "cannot chmod $(basename "$_dst")"; }
+  mv -f "$_tmp" "$_dst" || { rm -f "$_tmp"; die "cannot install $_dst"; }
+}
 if [ -f "$H/gh-limit/gh" ] && [ -f "$H/gh-limit.py" ]; then
   mkdir -p "$O/gh-limit" || die "cannot create $O/gh-limit"
-  _seed_one() {  # <src> <dest>
-    local _src="$1" _dst="$2" _tmp="$O/.seed-$(basename "$2").$$"
-    cp -p "$_src" "$_tmp" || { rm -f "$_tmp"; die "cannot stage $(basename "$_dst") into $O"; }
-    chmod +x "$_tmp"      || { rm -f "$_tmp"; die "cannot chmod $(basename "$_dst")"; }
-    mv -f "$_tmp" "$_dst" || { rm -f "$_tmp"; die "cannot install $_dst"; }
-  }
   _seed_one "$H/gh-limit/gh" "$O/gh-limit/gh"
   _seed_one "$H/gh-limit.py" "$O/gh-limit.py"
   log_line "seeded the gh-limit layer (serialised gh; path=$O/gh-limit)"
@@ -174,7 +182,14 @@ log_line "seeded $O with $(ls "$O"/*.sh | wc -l | tr -d ' ') scripts (claims.sh 
 if [ -f "$H/gh-rest/gh" ]; then
   mkdir -p "$O/gh-rest" || die "cannot create $O/gh-rest"
   _seed_one "$H/gh-rest/gh" "$O/gh-rest/gh"
-  log_line "seeded the gh REST adapter (path=$O/gh-rest; its limit layer is $O/gh-limit.py)"
+  # ⛔ THE LIMIT CLAUSE IS CONDITIONAL (review finding, same block): on the path where the `gh-limit`
+  # `else` above just REMOVED `$O/gh-limit.py`, "its limit layer is $O/gh-limit.py" was a false
+  # sentence in the one log an operator has. Same shape as `cloud-cell-supervisor.sh`'s check line.
+  if [ -f "$O/gh-limit.py" ]; then
+    log_line "seeded the gh REST adapter (path=$O/gh-rest; its limit layer is $O/gh-limit.py)"
+  else
+    log_line "seeded the gh REST adapter (path=$O/gh-rest) — but $O/gh-limit.py is ABSENT, so its calls are NOT serialised or backed off (#1988)"
+  fi
 else
   if [ -e "$O/gh-rest/gh" ]; then
     rm -f "$O/gh-rest/gh" || die "cannot remove the stale gh-rest adapter from $O"
