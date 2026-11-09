@@ -1,0 +1,21 @@
+{
+  "artifacts": [],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 605,
+  "exit_code": null,
+  "heartbeat_at": 1794188501,
+  "host": "Daniels-MacBook-Air-new",
+  "issue": 9,
+  "kind": "lane",
+  "lane_id": "Daniels-MacBook-Air-new.klane-9-1794188501-p39793-5252c04a",
+  "lease_until": 1794189106,
+  "pid": 39793,
+  "reason": null,
+  "repo": "daniel-ospina/agent-infra",
+  "schema": 1,
+  "started_at": 1794188501,
+  "state": "RUNNING",
+  "tag": "9",
+  "worktree": "/private/var/folders/lh/4zv9grjx0958bnrclvkt8dv40000gn/T/tmp.h27MQOFxAk/lbwt"
+}
