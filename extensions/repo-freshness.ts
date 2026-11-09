@@ -345,6 +345,12 @@ export interface RepoState {
   /** Porcelain paths (a rename/copy contributes only its new path); null when
    * the status probe failed (unknown, not "no paths"). */
   paths: string[] | null;
+  /** #2105: when this state was READ (epoch ms). Optional only so that the
+   * pre-existing call sites and fixtures that construct a `RepoState` literal
+   * keep compiling — every probe in this module stamps it. A snapshot with no
+   * `observedAt` is UNKNOWN-AGED, which a report must treat as "cannot prove
+   * this is current", never as "fresh" (see `repoStateReportText`). */
+  observedAt?: number;
 }
 
 /** Parse `git status --porcelain -z`: entries are `XY<space>PATH`,
@@ -369,13 +375,17 @@ export function parsePorcelainZ(out: string): string[] {
  * synchronous readers above use `execSync` (tryGit); running them per tick
  * would block the parent's event loop every 10s mid-dispatch.
  *
+ * #2105: the CACHE IS NOT CURRENT STATE. This snapshot is what the tree looked
+ * like at spawn; every report renders what it looks like NOW, through
+ * `syncRepoState` (see that function for the incident and the rule).
+ *
  * Returns null when nothing could be determined (git missing, not a repo,
  * aborted) — callers render `unknown`, never throw. `exec` is a test seam
  * (defaults to session-checks' `execFileAsync`, which takes an AbortSignal).
  */
 export async function asyncRepoState(
   cwd: string,
-  opts: { signal?: AbortSignal; exec?: ExecFn } = {},
+  opts: { signal?: AbortSignal; exec?: ExecFn; observedAt?: number } = {},
 ): Promise<RepoState | null> {
   const exec = opts.exec ?? execFileAsync;
   const run = (args: string[]) =>
@@ -398,10 +408,69 @@ export async function asyncRepoState(
       headSha: shaRes.code === 0 ? shaRes.stdout.trim() || null : null,
       dirty: paths === null ? null : paths.length > 0,
       paths,
+      observedAt: opts.observedAt ?? Date.now(),
     };
   } catch {
     return null;
   }
+}
+
+/**
+ * #2105 — the REPORT-TIME repo-state read: the same fields as `asyncRepoState`,
+ * read synchronously at the instant a report is emitted.
+ *
+ * WHY THIS EXISTS AT ALL. `asyncRepoState` is probed ONCE at spawn and cached
+ * (#783 Task 2, to keep git off the 10 s heartbeat), and the cached value was
+ * then rendered as CURRENT state in every `Alive state:` wedge report. Measured
+ * on three workers in one session: the report said `dirty=false dirtyPaths=0
+ * headSha=<spawn sha>` while the worktree held modified files and the branch had
+ * advanced — on one of them the worker had committed SEVEN commits (#2105). The
+ * report was a snapshot of another moment presented as the present, and its
+ * effect is the worst possible one: a lane reads "nothing here" and discards
+ * finished work as a failed attempt.
+ *
+ * WHY SYNC IS ACCEPTABLE HERE. `machineStateText()` beside it already samples
+ * `ps`/load synchronously at Report time, and this runs only when an abnormal
+ * exit or a cut is composed — never per tick. The timeout is deliberately short
+ * (5 s per git call): a report must never be held hostage by a pathological
+ * repository, and an unreadable tree degrades to `unknown`, never to a
+ * confident clean.
+ */
+export function syncRepoState(cwd: string, now: number = Date.now()): RepoState | null {
+  const opts = { timeout: 5_000 };
+  const branchRaw = tryGit(cwd, "branch --show-current", opts);
+  const shaRaw = tryGit(cwd, "rev-parse HEAD", opts);
+  const statusRaw = tryGit(cwd, "status --porcelain -z", opts);
+  // Nothing readable at all → UNKNOWN (never a clean tree).
+  if (branchRaw === null && shaRaw === null && statusRaw === null) return null;
+  const paths = statusRaw === null ? null : parsePorcelainZ(statusRaw);
+  return {
+    branch: branchRaw ? branchRaw : null,
+    headSha: shaRaw ? shaRaw : null,
+    dirty: paths === null ? null : paths.length > 0,
+    paths,
+    observedAt: now,
+  };
+}
+
+/**
+ * #2105 — how many commits the branch gained between a snapshot's head and the
+ * head observed at report time (`git rev-list --count FROM..TO`).
+ *
+ * This is the number the incident was missing: the report said "nothing
+ * happened" while SEVEN commits had landed. It is diagnostic only — it never
+ * decides anything — so every failure returns `null` rather than a fabricated
+ * zero. The two shas are validated as hex before interpolation (they come from
+ * a parsed `rev-parse HEAD`, but a shell-interpolated value is quoted by
+ * construction here, not by trust).
+ */
+export function countCommitsBetween(cwd: string, from: string, to: string): number | null {
+  const hex = /^[0-9a-f]{7,64}$/i;
+  if (!hex.test(from) || !hex.test(to)) return null;
+  const out = tryGit(cwd, `rev-list --count ${from}..${to}`, { timeout: 5_000 });
+  if (out === null) return null;
+  const n = Number(out.trim());
+  return Number.isInteger(n) && n >= 0 ? n : null;
 }
 
 /** Default branch checked out in any worktree ≠ current checkout → true.
