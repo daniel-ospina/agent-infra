@@ -194,15 +194,21 @@ if need "$T/quota.sh" "the sweep-quota helper block"; then
   got="$(sweep_defer_until "$raw")"
   [ "$got" -le $(( now + 3610 )) ] && ok "sweep_defer_until: an absurd reset is capped at 1h" \
                                     || bad "sweep_defer_until returned a runaway '$got'"
-  # ⛔ A BOUNDED `GH_LIMIT_NO_WAIT` REFUSAL CARRIES NO HEADERS AT ALL (agent-infra#2028 review P1).
-  # `GH_LIMIT_NO_WAIT` is what stops the in-call sleep — NOT the once-a-minute cadence, which is the
-  # floor this record's `until=` writes; the companion below reads the layer's recorded `until=` when
-  # the response carries none. **What the record can be:**
-  # `marker_until` writes the real `reset` only for `kind=primary` (or a `retry-after` window) and
-  # `now+BASE_WAIT` for `secondary`/`unclassified` — so BOTH shapes are graded below, and the
-  # `secondary` row is the control that keeps the `primary` row from being read as a benefit on the
-  # `NO_WAIT` path (agent-infra#2028 review round 2, finding 1). Every case below is driven from a
-  # fixture `GH_LIMIT_DIR`, never the runner's own cache.
+  # ⛔ WHAT THE `NO_WAIT` PATH ACTUALLY DEFERS ON (agent-infra#2028 review rounds 3 and 4 — the
+  # "60 s floor / re-attempts once a minute" claim this file used to carry was FALSIFIED).
+  # `GH_LIMIT_NO_WAIT` stops the in-call sleep. It does NOT decide the cadence. The LAYER's
+  # classification is headers-less on this path (`-i`/`--paginate` refuse the conditional plan), so the
+  # LAYER's record really is `marker_until`'s window — real `reset` for `kind=primary`/`retry-after`,
+  # `now+BASE_WAIT` (60 s) for `secondary`/`unclassified`. **But the CALLER's `raw` is not the layer's
+  # classification:** on a refusal the layer writes the child's FRAMED stdout through, so a sweep
+  # invoked with `-i` hands `sweep_defer_until_recorded` a status line and the full header block
+  # (measured 2026-11-09: `gh api --paginate -i` on a non-2xx emits `HTTP/2.0 422 …` plus
+  # `X-Ratelimit-Reset` on stdout). The header arm therefore returns FIRST and the record is never
+  # read — the deferral is the RESPONSE's reset, floored at 60 s and capped at 1 h. The rows below
+  # grade both halves, and the call-site row is what makes the corrected prose a property:
+  # a `secondary` record with a FRAMED body must take the HEADER's reset (upward), not the floor.
+  # The record branch reaches only a refusal carrying no reset header at all (`raw` empty). Every case
+  # below is driven from a fixture `GH_LIMIT_DIR`, never the runner's own cache.
   mkdir -p "$T/ghlimit"; export GH_LIMIT_DIR="$T/ghlimit"
   rec() { printf 'at=%s bucket=core reset=0 attempts=1 waited=0 status=403 kind=%s until=%s remaining=0 recovered=%s\n' "$1" "${4:-primary}" "$2" "${3:-0}" > "$T/ghlimit/last-limit"; }
   rec "$now" "$(( now + 3000 ))"
@@ -223,6 +229,19 @@ if need "$T/quota.sh" "the sweep-quota helper block"; then
   [ "$got" -le $(( now + 140 )) ] \
     && ok "sweep_defer_until_recorded: a response header WINS over a later recorded window (this response's truth, not the last one's)" \
     || bad "sweep_defer_until_recorded let a stale record overrule the response headers ('$got')"
+  # ⛔ THE CALL-SITE ROW (agent-infra#2028 review round 4, finding 2). The record in place here is the
+  # `secondary` one at `until=now+60` from the row above — i.e. exactly what the layer writes for a
+  # headers-less `NO_WAIT` refusal — while `raw` is the `-i` FRAMED body the sweep actually receives on
+  # a rate-limit 403. The old prose claimed this deferred on the 60 s floor and re-attempted once a
+  # minute; the code takes the header's reset. The row above cannot settle it (its ceiling of
+  # `now+140` is satisfied by a 60 s floor too), so THIS one asserts the window is taken UPWARD to the
+  # header and reds on any mutant that reads the record instead of the header.
+  rec "$now" "$(( now + 60 ))" 0 secondary
+  raw="$(printf 'HTTP/2.0 403 Forbidden\r\nX-Ratelimit-Limit: 5000\r\nX-Ratelimit-Remaining: 0\r\nX-Ratelimit-Reset: %s\r\nContent-Type: application/json\r\n\r\n{"message":"API rate limit exceeded"}' "$(( now + 900 ))")"
+  got="$(sweep_defer_until_recorded "$raw")"
+  [ "$got" -ge $(( now + 880 )) ] && [ "$got" -le $(( now + 920 )) ] \
+    && ok "sweep_defer_until_recorded: with an \`-i\`-FRAMED 403 body (what the sweep receives) the deferral is the HEADER's reset, not the 60s floor the paired secondary record carries — the call site does NOT re-attempt once a minute" \
+    || bad "sweep_defer_until_recorded used the record's floor over the framed response's reset ('$got', want ~$(( now + 900 )), floor was now+60)"
   rec "$(( now - 1800 ))" "$(( now + 3000 ))"
   got="$(sweep_defer_until_recorded '')"
   [ "$got" -le $(( now + 70 )) ] \

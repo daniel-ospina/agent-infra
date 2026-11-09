@@ -4857,19 +4857,33 @@ gh_limit_recorded_until() {
 }
 # sweep_defer_until_recorded <raw-response> -> sweep_defer_until, PLUS the layer's own window when the
 # response carried no rate-limit headers at all.
-# ⛔ WHAT THIS ACTUALLY BUYS, AND WHAT IT DOES NOT (measured — #2028 review round 2, finding 1). The
+# ⛔ WHAT THIS ACTUALLY BUYS, AND WHAT IT DOES NOT (measured — #2028 review rounds 2 and 4). The
 # record's `until=` is the LAYER's classification of its last refusal: `marker_until` yields the real
 # `reset` only for `kind=primary` (or a `retry-after` window), and `now+BASE_WAIT` — 60 s — for a
 # `secondary`/`unclassified` one. A `NO_WAIT` refusal, which is the shape the sweeps now get, has no
-# headers to classify, so it IS `secondary`/`unclassified`: its record is the now+60 floor and this
-# companion adds NOTHING on that path. What `GH_LIMIT_NO_WAIT` closed is the layer's own IN-CALL sleep
-# (an attempt no longer pins a substitution for ~7 min — #2028 fix-direction #2), NOT the "re-attempts a
-# spent bucket once a minute" cadence: that deferral is the 60 s floor and the cadence is unchanged
-# (see the residual below). The helper pays only when the last recorded CORE
-# observation was a `primary`/`retry-after` refusal written by a DIFFERENT core call that did reach the
-# headers; then the window outlives this refusal and the box need not re-attempt.
-# Residual, stated rather than overstated: a `NO_WAIT` refusal defers on the 60 s floor and re-attempts
-# once a minute until the layer's own window clears it. That path is bounded and now cheap.
+# headers to classify at the LAYER, so there the record is the now+60 floor and this companion adds
+# NOTHING. What `GH_LIMIT_NO_WAIT` closed is the layer's own IN-CALL sleep (an attempt no longer pins a
+# substitution for ~7 min — #2028 fix-direction #2); the attempt is simply cheap now.
+# ⛔ BUT THE APPLIED DEFERRAL IS THE RESPONSE'S, NOT THE RECORD'S, and that is why this companion is
+# nearly always a no-op at the only call site. The sweep passes `-i` (see the sweep call below), so the
+# layer's `classify()` sees no headers (`gh-limit.py` refuses `-i`/`--paginate` when building the
+# conditional plan, and `run_attempt` returns empty headers) — but on a refusal it still writes the
+# child's FRAMED stdout through on its NO_WAIT refusal branch (`if res.out: sys.stdout.buffer.write(res.out)`),
+# and `-i` frames whatever the response was. So the caller's `raw` — not the layer's classification —
+# carries the status line and the full header block. Measured 2026-11-09:
+#   gh api --paginate -i … on a non-2xx -> stdout begins `HTTP/2.0 422 …` and carries
+#   `X-Ratelimit-Reset` (and `X-Ratelimit-Remaining`).
+# The header arm below therefore returns FIRST and `gh_limit_recorded_until` is never called on that
+# path: the deferral is that response's `x-ratelimit-reset`/`retry-after`, floored at 60 s and capped
+# at 1 h by `sweep_defer_until`. The record branch reaches only a refusal that carries no reset header
+# at all (a shim/EX_TEMPFAIL, a timeout, a no-response failure — `raw` empty); there it pays only when
+# the last recorded CORE observation was a `primary`/`retry-after` refusal written by a DIFFERENT core
+# call that did reach the headers, and then the window outlives this refusal.
+# Residual, stated rather than overstated — and it is the OPPOSITE of "once a minute": because a header
+# always WINS (`A header always WINS` below), a SECONDARY refusal's `x-ratelimit-reset` is adopted as
+# the sweep's deferral, up to the 1 h ceiling. That is the shape #2137 refuses INSIDE the layer (the
+# reset of a secondary/unclassified refusal is not a recovery time), so the caller can park this cell
+# for much longer than the layer would have floored it at. Bounded and cheap now; not benign.
 # A header always WINS: it is this response's truth, while the record is the last one's — so the record
 # is consulted only when the response carries neither `retry-after` nor `x-ratelimit-reset`, and the
 # result keeps the same now+3600 ceiling the header path applies.
