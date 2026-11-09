@@ -1315,7 +1315,8 @@ continued_name() \
 # ⛔ AND A COMMENT THAT *MENTIONS* AN OPENER MUST NOT OPEN ONE, AND IT IS PINNED BY THE TWO LINES BELOW
 # (round 48 review, P2 — measured at this head): delete the `#` suppression and the scan truncates after
 # `continued_name`, so `after_notes_comment()` disappears and `f11f-0` reds at 245/1. It also moves the
-# scan of 6 of the 435 `git ls-files '*.sh'` files — an earlier revision of THIS note called that "20" and
+# scan of 6 of the `git ls-files '*.sh'` files (435 at the head that measured this; 437 now) — an earlier
+# revision of THIS note called that "20" and
 # an even earlier one "21". ⛔ THOSE DELTAS ARE THE PART THAT DID NOT REPRODUCE, and the "446" was a
 # DEFINITION rather than a count: it reproduces only as 435 `*.sh` PLUS the 11 tracked extensionless
 # scripts whose shebang names bash, which is not the population this note named ("shebang-marked,
@@ -1353,28 +1354,24 @@ head_with_comment_between()
 {
   :
 }
-# ⛔ ONE OF THESE TWO GUARDS IS STILL UNPINNED, AND THE TWO MUTANTS ARE NOT THE SAME SHAPE (measured, round 48
-# re-review, at this head over the 437 `git ls-files '*.sh'` files).
-#   * DELETING `head`'s END-OF-LINE ANCHOR HAS NO PIN. The mutant that removes it leaves the suite at
-#     246 passed / 0 failed — every arm green — while over the repo it INVENTS 133 names across 66 of the 437
-#     files. A guard whose removal reds nothing is the inert-enforcer shape this file exists to catch, so this
-#     one is still OWED a fixture line that changes under it. Until then it is DECLARED, not pinned.
-#   * DELETING THE NEXT-LINE-BRACE BRANCH IS PINNED (revert it and `f11f-0` reds, 245 passed / 1 failed). It
-#     HIDES names on the FIXTURE ONLY — 6 of them (`name_next_line`, `name_func_next`,
+# ⛔ ONE OF THESE TWO GUARDS IS STILL UNPINNED, AND THE TWO MUTANTS ARE NOT THE SAME SHAPE. Measured at
+# this head over the 437 `git ls-files '*.sh'` files; re-measure rather than copy any number below.
+#   * DELETING `head`'s END-OF-LINE ANCHOR HAS NO PIN: the suite stays at 246 passed / 0 failed — every arm
+#     green — while the mutant INVENTS 133 names. They appear in 63 of the 437 files; 3 more change only by a
+#     DUPLICATE report of a name the file already had (the ordered scan moves, the name set does not). That is
+#     the inert-enforcer shape this file exists to catch, so this guard is still OWED a fixture line that
+#     changes under it. Until then it is DECLARED, not pinned.
+#   * DELETING THE NEXT-LINE-BRACE BRANCH IS PINNED: revert it and `f11f-0` reds (245 passed / 1 failed). It
+#     invents NOTHING and HIDES names on the FIXTURE ONLY — 6 of them (`name_next_line`, `name_func_next`,
 #     `head_after_inline_comment`, `head_with_comment_between`, `indented_head_only`, `head_then_blank`) — and
 #     moves 0 of the repo's own files.
-#   * THE BARE-WORD GUARD ABOVE IS PINNED too (revert it and `f11f-0` reds on `bare_word_then_brace`).
-# Between the two mutants they invent `echo`, `printf` and `mkdir` as "definitions". ⛔ `awk` and `shift` were
-# named here before and appear in NEITHER mutant at this head — do not re-add them without a measurement.
-# ⛔ EVERY NUMBER IN THIS COMMENT IS THIS HEAD'S AND NONE OF THE OLDER ONES REPRODUCES — re-measure, never
-# copy. The sentence in this position used to say both guards move "hundreds of the repo's own scripts" and then
-# re-measured them at 130 and 4 four lines later, refuting its own header. Two further quoted pairs (130/4 and
-# 124/0) came from a population of 435 `*.sh` files and reproduce NEITHER number here, where the population is
-# 437 and the two mutants measure 66 and 0; earlier drafts also quoted 283 / 282 / 276 / 21 / 18 / 20 from
-# populations that are not the size of any set this tree has, and `break` was named as an invented definition
-# in neither measurement. What survives every measurement is the DIRECTION — deleting the anchor INVENTS
-# names, deleting the next-line branch HIDES them — so delete a guard, run the suite, run the mutant over
-# `git ls-files '*.sh'`, and read the delta yourself. None of these may be reported:
+#   * THE BARE-WORD GUARD ABOVE IS PINNED too: revert it and `f11f-0` reds on `bare_word_then_brace`
+#     (245 passed / 1 failed).
+# Of the five names an earlier revision quoted as invented (`echo`, `printf`, `mkdir`, `awk`, `shift`), only
+# `echo`, `printf` and `mkdir` are invented here — by the ANCHOR mutant alone, among its 133; the next-line
+# mutant invents nothing. `awk` and `shift` appear in neither, so do not re-add a name without a measurement.
+# ⛔ WHAT SURVIVES IS THE DIRECTION — deleting the anchor INVENTS names, deleting the next-line branch HIDES
+# them — so delete a guard, run the suite, run the mutant over `git ls-files '*.sh'`, and read the delta yourself. None of these may be reported:
 #   * a bare command name followed by `:` (not a brace) — a `head` match that must NOT be claimed;
 #   * a command with arguments, then `{` on the next line — likewise;
 #   * a head followed by a line that CONTAINS `{` but does not start with it.
