@@ -280,9 +280,15 @@ first irreversible act (dropping `state/roles/.desired`, bumping the stop genera
 killing the controller). On this box the refusal therefore lands at step 1, with everything still running.
 The refusal names the queue target, the checkout, the checkout's **actual origin**, and the one-line fix,
 and it is labelled **MERGE-INERT** — the state `check` and `status` report too. It is deliberately narrow:
-`stop` refuses only when the pair is unusable **and** this state dir has something a stop would end, so a
-box that is already down can still be stopped, and `stop --force` exists for an operator who means to stop
-a misconfigured box anyway (`cloud-cell-quiesce.sh` passes it: its sweep stops everything regardless).
+`stop` refuses only when the pair is unusable **and** this state dir has something a stop would end. ⛔
+What counts as "something" is the code's answer, not a slogan: a desired-state marker (`state/roles/.desired`),
+a **provably-own** controller session (proven by the session's own pane command, because `SESSION` is a
+machine-scoped name — a neighbour cell's `orch` session is not evidence, #1856), a doctor loop, or a
+controller pid. So **a box with none of those can still be stopped** — including one that is already down
+but still carries `.desired`, which does need `--force`; the marker leg is deliberately read as-is, since
+a stop that cannot be redone costs the cell and its leases while a refused stop costs one flag. `stop
+--force` exists for an operator who means to stop a misconfigured box anyway (`cloud-cell-quiesce.sh`
+passes it: its sweep stops everything regardless).
 
 **The repair sequence — no source reading required.** From “running `bed278f4`, cannot merge” to “current
 sha, can merge”, on the box. It is the deploy recipe of §5 with the pre-flight and the repair in front of
@@ -294,15 +300,28 @@ SNAP=/tmp/cell-home/harness/bed278f4bbb1   # the versioned snapshot the cell is 
 SUP=$SNAP/scripts/cloud-cell-supervisor.sh
 
 # 1. PRE-FLIGHT. Read-only: stops nothing, starts nothing, writes nothing.
-#    Expect the MERGE-INERT refusal here — that is the fix working, and the controller is still up.
+#    Expect a QUEUE-vs-CHECKOUT refusal here, with the controller still up — that is the point of the
+#    step. ⛔ WHICH refusal depends on the snapshot you are running, and this recipe names a PRE-#2093
+#    one on purpose: `bed278f4` predates the fix, so its `check` prints the #1901 wording ("the QUEUE
+#    and the CHECKOUT name DIFFERENT repos: …") with no `MERGE-INERT` label and no one-line fix. The
+#    `MERGE-INERT` label and the copy-pasteable repair appear on a snapshot that INCLUDES #2093 — i.e.
+#    on the re-run in step 3, after step 4 has moved the pin. Expecting a token the box cannot print is
+#    how an operator reads "fix absent" as "nothing to fix".
 bash $SUP check
 
-# 2. REPAIR the pair — pick ONE. The refusal prints both, with the values filled in.
+# 2. REPAIR the pair — pick ONE. On a post-#2093 snapshot the refusal prints both, with the values filled in.
 cp /tmp/cell-home/keys.env /tmp/cell-home/keys.env.bak-$(date -u +%Y%m%dT%H%M%SZ)
-# (a) let the queue follow the checkout — the repair that cannot be wrong about WHICH side is stale:
-sed -i '/^OR=/d' /tmp/cell-home/keys.env
-# (b) …or point the CHECKOUT at the repo the queue names (a different repo on disk — here agent-infra):
-#     sed -i 's|^REPO=.*|REPO=/tmp/cell-ai|' /tmp/cell-home/keys.env
+# (a) let the queue follow the checkout — the repair that cannot be wrong about WHICH side is stale.
+#     ⛔ THE PREFIX IS OPTIONAL ON PURPOSE: a cell's keys.env carries the EXPORTED form as often as the
+#     plain one (`export -p > keys.env` writes `declare -x OR=…`; `export OR=…` is what the harness's own
+#     lane notes describe), and a bare `^OR=` anchor matches NEITHER — it exits 0 having edited nothing
+#     and step 3 refuses again, which is the dead end this recipe exists to remove. Verify after:
+#     `grep -n 'OR' /tmp/cell-home/keys.env` must show no `OR=` line at all.
+sed -i -E '/^[[:space:]]*(export[[:space:]]+|declare[[:space:]]+-x[[:space:]]+)?OR[[:space:]]*=/d' /tmp/cell-home/keys.env
+grep -n 'OR=' /tmp/cell-home/keys.env || echo 'ok: no OR line left — the queue now derives from the checkout'
+# (b) …or point the CHECKOUT at the repo the queue names (a different repo on disk — here agent-infra).
+#     Same prefix rule, for the same reason:
+#     sed -i -E 's|^[[:space:]]*(export[[:space:]]+|declare[[:space:]]+-x[[:space:]]+)?REPO[[:space:]]*=.*|REPO=/tmp/cell-ai|' /tmp/cell-home/keys.env
 
 # 3. PRE-FLIGHT AGAIN. Must print: ok: queue <owner/repo> == checkout <path> (origin <url>) — derived
 bash $SUP check
@@ -314,8 +333,10 @@ bash $SUP start
 # 5. PROVE it moved: §4 — a real `[dispatch]` line, not just `[cap]`.
 ```
 
-⛔ **`sed '/^OR=/d'` is the repair for a box whose `OR` is the thing that is wrong** — lane-1's case: its
-`OR` names agent-infra while `REPO` is a tortoise tree, and that cell's work is whatever its checkout says.
+⛔ **Deleting the `OR` line is the repair for a box whose `OR` is the thing that is wrong** — lane-1's
+case: its `OR` names agent-infra while `REPO` is a tortoise tree, and that cell's work is whatever its
+checkout says. (The command is the `sed -E` in step 2 (a) above, not a bare `^OR=` anchor: a `keys.env`
+written `export OR=…` or `declare -x OR=…` is common enough that the narrow form silently edits nothing.)
 If the intent is the opposite — the box MUST work agent-infra PRs — use (b), because then the *checkout* is
 what is stale. Nothing in the supervisor can decide that for you, which is why the refusal prints both and
 the repair is not automated: `stop` refusing is the guard, and picking the direction is the operator's call.
@@ -359,8 +380,11 @@ was 14 working of 76 resident, and `zombie=` is in the same line so a box full o
   immutable `<sha12>/` snapshot, move the pin, stamp) before launching. Never hand-edit a file inside a
   snapshot: it destroys the per-file provenance proof. ⛔ **`check` first, always:** it is the read-only
   pre-flight, and since agent-infra#2093 `stop` refuses the same unusable pairs `start` refuses — so a
-  wrong `OR`/`REPO` pair now surfaces at step 1 instead of leaving the box stopped and unrefreshed. The
-  repair sequence for a mismatch box is in §3.2.
+  wrong `OR`/`REPO` pair now surfaces at step 1 instead of leaving the box stopped and unrefreshed. ⛔
+  **On a snapshot that includes #2093.** On an older snapshot this claim does not hold as written: there
+  `stop` has no gate, and the safety is `check`'s alone — which has always refused, so the sequence is
+  still safe, but the refusal comes from step 1 rather than from `stop`. The repair sequence for a
+  mismatch box is in §3.2.
 - **Mac** — do **not** use `deploy-mac-orchestrator.sh` phase B on a launchd-loaded box. Two measured
   consequences: its `nohup bash "$O/orch-loop.sh"` child **inherits the operator shell's TCC grant**, so
   it dispatches while the durable launchd job cannot (a false PASS reported as success); and it does

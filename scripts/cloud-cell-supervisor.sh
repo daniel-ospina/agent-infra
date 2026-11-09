@@ -515,9 +515,10 @@ resolve_repo() {
 
 # ONE actionable line, on the verbs that cannot work without a checkout. `status` deliberately does
 # not call it: it is the verb an operator runs to DISCOVER this, so it must still answer.
-assert_repo() {
+assert_repo() { # [$1 = the asking verb, so a `stop` refusal carries its own tail]
+  local verb="${1:-}"
   if ! resolve_repo; then
-    die "REPO is not set and no single checkout could be derived from ${REPO_SEEN:-the provisioning candidates} — set REPO=<a checkout of the repo this cell should work> (e.g. in $ENV_FILE), or clone it to /tmp/cell"
+    die "REPO is not set and no single checkout could be derived from ${REPO_SEEN:-the provisioning candidates} — set REPO=<a checkout of the repo this cell should work> (e.g. in $ENV_FILE), or clone it to /tmp/cell.${verb:+ $(queue_refusal_suffix "$verb" nofix)}"
   fi
   # ⛔ THE GUARD MUST SEE THE VALUE THAT IS INTERPOLATED, not only the one the OPERATOR passed
   # (agent-infra#1935 review). `cmd_start` validates REPO before this derives it — and skips an
@@ -1695,7 +1696,12 @@ assert_queue_target() {
   # ⛔ REPO first: with no checkout, every QUEUE_STATE below is a SYMPTOM, and the old message read
   # `cannot read the QUEUE … 'git -C  remote get-url origin' returned no URL` — an error about an
   # empty path. The cause is the missing checkout, so name it.
-  [ -n "$REPO" ] || assert_repo
+  # ⛔ AND THE ASKING VERB GOES WITH IT (review P3). This leg dies INSIDE assert_repo(), which is why it
+  # used to be the one unusable state whose refusal carried no `stop` tail — so an operator on a cell
+  # whose keys.env is missing (a plausible reason to be stopping it) learned nothing about `--force`, on
+  # the one verb whose default is destructive and which cannot be redone. Every other state gets the
+  # suffix below; this one now does too.
+  [ -n "$REPO" ] || assert_repo "$verb"
   case "$QUEUE_STATE" in
     derived|explicit) return 0 ;;
   esac
@@ -1704,11 +1710,20 @@ assert_queue_target() {
   # repair path that does not require reading this source. Removing the `OR` line lets the queue
   # follow the checkout, which is the repair that cannot be wrong about which side is stale — the
   # other direction (repointing $REPO) is a different repo on disk and is named as prose only.
-  # ⛔ The value may also arrive as an exported `OR` rather than a line in $ENV_FILE (both reach this
-  # shell: $ENV_FILE is sourced, and an ambient export is inherited). The message names BOTH, because a
-  # `sed` that silently changed nothing would send the operator back to a refusal with no new
-  # information — the exact dead end this issue is about.
-  local onefix="ONE-LINE FIX: let the queue follow the checkout — sed -i '/^OR=/d' '$ENV_FILE' (drop the OR export instead if that is where yours is set) — after which the queue derives from the checkout and targets '$QUEUE_DERIVED'; to point the cell at '$QUEUE_DECLARED' instead, $needs"
+  # ⛔ THE ANCHOR IS THE WHOLE FIX, AND A BARE `^OR=` WAS A SILENT NO-OP (review P1). A cell's
+  # `keys.env` is operator-pushed, and the EXPORTED form is the normal one: `export OR=<owner/name>` is
+  # what orchestrator-harness/lane.sh records as a MEASURED fact about a cell's keys.env, and
+  # `export -p > keys.env` writes `declare -x OR=…` (lane-env.sh names that shape). `^OR=` matches
+  # NEITHER, and GNU sed exits 0 having edited nothing — so the operator re-ran `check` into the
+  # IDENTICAL refusal, which is the dead end this whole string exists to avoid. The prefix is therefore
+  # optional in exactly the forms this repo already accepts for "the env file carries KEY": this file's
+  # own `sup_env_file_carries` reads `^[[:space:]]*(export[[:space:]]+)?KEY[[:space:]]*=`, so the repair
+  # now covers what the reader reads (the #1745 two-authorities class, in the repair path).
+  # ⛔ The value may also arrive as an AMBIENT export rather than a line in $ENV_FILE (both reach this
+  # shell: $ENV_FILE is sourced, and an ambient export is inherited). The message names that case too,
+  # because the `sed` cannot touch it and would otherwise send the operator straight back to the same
+  # refusal with no new information.
+  local onefix="ONE-LINE FIX: let the queue follow the checkout — sed -i -E '/^[[:space:]]*(export[[:space:]]+|declare[[:space:]]+-x[[:space:]]+)?OR[[:space:]]*=/d' '$ENV_FILE' (that form covers a plain, an 'export OR=' and a 'declare -x OR=' line; if OR is exported by your shell rather than written in the file, drop that export) — after which the queue derives from the checkout and targets '$QUEUE_DERIVED'; to point the cell at '$QUEUE_DECLARED' instead, $needs"
   case "$QUEUE_STATE" in
     mismatch)
       die "the QUEUE and the CHECKOUT name DIFFERENT repos — this box is MERGE-INERT: the queue targets '$QUEUE_DECLARED' (OR) but $REPO is a checkout of '$QUEUE_DERIVED' (origin $QUEUE_REMOTE). A controller on this pair dispatches $QUEUE_DECLARED PRs from a $QUEUE_DERIVED tree: its candidate pre-flight cannot run there, every candidate comes back unqueryable, and every '$QUEUE_DECLARED' merge looks for that repo's merge rail inside a '$QUEUE_DERIVED' checkout and refuses — so the queue never advances while every other observable reads green (agent-infra#1901, #1764). $onefix.${verb:+ $(queue_refusal_suffix "$verb")}"
@@ -1732,10 +1747,17 @@ assert_queue_target() {
 # declines to START something, so "refused" is the whole story; `stop` declined to END something, and
 # an operator reading that must be told, in the message, both that nothing was stopped and how to
 # stop anyway (agent-infra#2093).
+# $1 = the asking verb. $2 (optional) selects the REPAIR CLAUSE: "nofix" is passed by assert_repo(),
+# which reaches `die` BEFORE any ONE-LINE FIX exists — its own message names the repair (set REPO, or
+# clone the checkout), so a tail pointing at "the fix above" would send the operator hunting for a line
+# that was never printed. One tail, one `--force` escape, no second copy of the prose.
 queue_refusal_suffix() {
+  local repair="Repair the pair with the fix above, then run 'stop' → 'start'"
+  [ "${2:-}" = nofix ] \
+    && repair="Set REPO to a checkout of the repo this cell should work (the message above says how), then run 'stop' → 'start'"
   case "$1" in
     stop)
-      printf '%s' "NOTHING WAS STOPPED: this is the pre-flight for the deploy sequence, because 'start' refuses this same pair and a box stopped under it cannot be refreshed — that is how lane-1 was left on an 8-day-old sha with no way forward (agent-infra#2093). Repair the pair with the fix above, then run 'stop' → 'start'. To stop this box anyway (it will not be startable until the pair is repaired): $0 stop --force"
+      printf '%s' "NOTHING WAS STOPPED: this is the pre-flight for the deploy sequence, because 'start' refuses this same pair and a box stopped under it cannot be refreshed — that is how lane-1 was left on an 8-day-old sha with no way forward (agent-infra#2093). $repair. To stop this box anyway (it will not be startable until the pair is repaired): $0 stop --force"
       ;;
     *) printf '' ;;
   esac
@@ -4153,10 +4175,23 @@ unit_stop_effect_verdict() { # <unit>
 # ⛔ Conservative in the REFUSAL direction: a read that cannot be made counts as "something is
 # running". The two errors are not symmetric — a refused stop on an idle box costs one flag, a stop
 # that could not be redone costs the cell and its claim leases.
+# ⛔ AND THE SESSION LEG NEEDS THE OWNERSHIP PROOF THE KILL PATH ALREADY INSISTS ON (review P2).
+# `SESSION` is MACHINE-SCOPED (`orch` by default) — one name for every state dir on the box — so
+# "a session with this name exists" is NOT evidence that it holds THIS state dir's controller. That is
+# #1856's recorded decision, carried 200 lines below at the kill (`session_names_own_state_dir` before
+# any `kill-session`, and the measured reproduction with a tmux stub: repo B's stop TERMed repo A's
+# live loop and reported success). A bare `has-session` here would therefore refuse `stop` on a cell
+# that is already down for ITSELF merely because a PEER state dir's `orch` session is up, and the
+# refusal would point at a session this state dir does not own — contradicting this gate's own declared
+# narrowness ("it refuses only when there is something to lose"). Semantically the proof is required,
+# not merely conservative: a session this state dir cannot prove it owns is one `stop` will REFUSE to
+# kill, so it is not something a stop would end. The conservative direction is kept where it belongs —
+# an unreadable process table still counts as "something is running" on the pid legs below, and those
+# legs see any controller actually alive regardless of which session it lives in.
 stop_would_end_something() {
   local p
   [ -f "$ROLES_DIR/.desired" ] && return 0        # the marker `stop` removes FIRST
-  tmux has-session -t "$SESSION" 2>/dev/null && return 0
+  tmux has-session -t "$SESSION" 2>/dev/null && session_names_own_state_dir "$SESSION" && return 0
   sup_loop_alive && return 0                       # doctor loop, or its in-flight restart child
   p="$(owned_controller_pids 2>/dev/null)" || return 0   # unreadable table: assume yes
   [ -n "$p" ] && return 0
