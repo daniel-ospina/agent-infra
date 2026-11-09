@@ -98,6 +98,15 @@ What the controller now does (`orch-loop.sh`, the `# BEGIN gh-bound` block):
   because several sites parse `--json` output and two merge `2>&1` before parsing.
 - The trip counter is reset at the cycle top with a BUILTIN truncation (`:` + a redirect), never `rm`:
   that line sits above `fork_gate`, where a failed fork terminates the controller (#2293).
+- **The internal watchdog's scratch dir is made ONCE, in the parent, and reaped on exit.** Nine of the
+  block's sixteen call sites are captured (`x="$(gh_bounded …)"`), and on a host whose watchdog
+  resolves to the internal one (macOS — no `timeout`, no `gtimeout`) `tb_bound_tmp` would run INSIDE
+  that substitution's subshell: the assignment dies with the child, so no caller-level cleanup can see
+  it. Measured at the pre-fix head: **one orphaned empty `bounded.XXXXXX` per captured call**, for the
+  life of a process that outlives a month of cycles. That is the defect `bounded.sh` documents on
+  `disk-reaper.sh`'s scratch, with the same fix (create it in the PARENT; every probe reuses it,
+  because a subshell inherits the variable), and `gh_bound_cleanup` — called from the controller's
+  `EXIT` trap — removes it. Hosts that resolved a real `timeout` make no scratch at all.
 - **Each call is also `GH_LIMIT_NO_WAIT=1`**, set for that one child and then put back (set-ness
   included, so a caller's own value survives). The bound alone is not enough: the layer this `gh`
   resolves through (`gh-limit.py`) sleeps INSIDE the call — 60/120/240 s per refusal attempt, so a

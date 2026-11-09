@@ -248,6 +248,32 @@ grep -q 'TB_TIMEOUT_FORCE_INTERNAL=1' "$T/oh/logs/orch-loop.log" 2>/dev/null \
   && ok "bad pin: the log names the remedy that does work (the internal watchdog)" \
   || bad "bad pin: the log names no remedy"
 
+# Case I — ONE scratch dir for the whole controller, and it is reaped (agent-infra#2028 review note).
+# Nine of the block's sixteen call sites are CAPTURED, and on a host whose watchdog resolves to the
+# INTERNAL one (macOS: no GNU `timeout`, no `gtimeout`) every `tb_watchdog` creates `TB_BOUND_TMP` with
+# `tb_bound_tmp` INSIDE that substitution's SUBSHELL — the assignment dies with the subshell, so no
+# caller-side cleanup can see it. MEASURED pre-fix: one orphaned empty `bounded.XXXXXX` per captured
+# call, for the life of a process that outlives a month of cycles. `bounded.sh`'s own documented fix
+# (disk-reaper.sh) is to create it in the PARENT, which is what the block now does.
+I="$T/I"; rig "$I/rig.sh"; mkdir -p "$T/itmp"
+cat >> "$I/rig.sh" <<'SH'
+for i in 1 2 3 4 5 6; do printf '%s' "$(gh_bounded pr view "$i" 2>/dev/null)" >/dev/null; done
+printf 'dirs-after-calls=%s\n' "$(ls -1d "${TMPDIR:-/tmp}"/bounded.* 2>/dev/null | wc -l | tr -d ' ')"
+gh_bound_cleanup
+printf 'dirs-after-cleanup=%s\n' "$(ls -1d "${TMPDIR:-/tmp}"/bounded.* 2>/dev/null | wc -l | tr -d ' ')"
+SH
+out="$(PATH="$T/bin:$PATH" TMPDIR="$T/itmp" TB_TIMEOUT_FORCE_INTERNAL=1 GH_BOUND_S=5 run_rig "$I/rig.sh" "$T/oi" "$HERE" 2>&1)"
+grep -qx 'dirs-after-calls=1' <<<"$out" \
+  && ok "scratch: 6 captured calls share ONE scratch dir the parent created (pre-fix: one orphaned dir per call)" \
+  || bad "scratch: the parent did not pre-create TB_BOUND_TMP — got $(echo "$out" | sed -n 1p) (want dirs-after-calls=1)"
+grep -qx 'dirs-after-cleanup=0' <<<"$out" \
+  && ok "scratch: the EXIT-trap helper reaps it (a month-long controller leaves nothing behind)" \
+  || bad "scratch: gh_bound_cleanup did not remove the dir — got: $(echo "$out" | sed -n 2p)"
+case "$(grep -n '^trap .*LOCKF' "$LOOP" | grep 'EXIT')" in
+  *gh_bound_cleanup*) ok "scratch: the controller's EXIT trap calls gh_bound_cleanup (the helper is not dead code)" ;;
+  *) bad "scratch: the EXIT trap does not reap the scratch dir — a killed controller leaves it behind" ;;
+esac
+
 # Case F — STRUCTURAL, and the one that keeps the fix from rotting: no gh call in the shipped loop may
 # bypass the bound. The pre-fix tree fails this on 16 sites; a new unbounded call site fails it too.
 UNBOUNDED="$(awk '{ line=$0; sub(/^[ \t]+/,"",line); if (line ~ /^#/) next;

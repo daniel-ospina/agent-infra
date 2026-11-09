@@ -491,6 +491,35 @@ else
     "$GH_BOUND_HOW" "$_ghb_fix" >> "$LOG" 2>/dev/null || true
 fi
 unset _ghb_bad _ghb_fix
+# gh_bound_cleanup — reap the ONE scratch dir the internal watchdog uses; called from the
+# controller's EXIT trap. A no-op on a host that resolved GNU `timeout`/`gtimeout` (no scratch is ever
+# made there) and on the DEGRADED path (bounded.sh never sourced), so the trap can call it
+# unconditionally under `set -u`.
+gh_bound_cleanup() {
+  [ -n "${TB_BOUND_TMP:-}" ] || return 0
+  command -v tb_bound_cleanup >/dev/null 2>&1 && tb_bound_cleanup
+  return 0
+}
+# ⛔ ONE SCRATCH DIR FOR THE WHOLE CONTROLLER, CREATED IN THE PARENT — MEASURED, NOT ASSUMED. Nine of
+# this block's sixteen call sites are CAPTURED (`x="$(gh_bounded …)"`), and on a host whose watchdog
+# resolves to the INTERNAL one (no GNU `timeout`, no `gtimeout` — macOS, i.e. the daemon host) every
+# `tb_watchdog` run creates `TB_BOUND_TMP` with `tb_bound_tmp` INSIDE that substitution's SUBSHELL.
+# The assignment then dies with the subshell, so no caller-side cleanup can ever see it, and the parent
+# keeps no record to reap: MEASURED at this head, 8 captured calls -> 8 orphaned empty
+# `bounded.XXXXXX` directories, one per call, for the life of a process that `bounded.sh` itself notes
+# "outlives a month of cycles". `bounded.sh` names this exact defect and its fix on `disk-reaper.sh`'s
+# own scratch — "CREATE THE PROBE SCRATCH IN THE PARENT … a subshell inherits the parent's variable,
+# so creating it here means every probe reuses THIS directory and `tb_bound_cleanup` can actually reap
+# it" — so the block does the same: ONE dir, made here while the controller can still fork and while an
+# unwritable TMPDIR is still reportable, inherited by every call. Sharing it is safe because
+# `tb_watchdog` names its sentinel/done files from the COMMAND's own pid (`$pid`, "unique per call in
+# this shell AND across subshells" — the reason that naming was chosen), each call removes its own two
+# files, and `disk-reaper.sh` already shares one dir across concurrent probes.
+if [ "${TB_TIMEOUT_KIND:-}" = "internal" ] && command -v tb_bound_tmp >/dev/null 2>&1; then
+  if ! tb_bound_tmp; then
+    printf '[bound] ⚠️ no writable TMPDIR — the internal watchdog runs WITHOUT its sentinel, so a bound that fires cannot be told from a command that died 137 on its own; every call re-creates the attempt (agent-infra#2028)\n' >> "$LOG" 2>/dev/null || true
+  fi
+fi
 # gh_trips_read — how many calls have hit the bound in the CURRENT cycle. `read` with a redirect is a
 # BUILTIN, so this costs no fork inside the `$( )` call sites below.
 gh_trips_read() {
@@ -2263,7 +2292,11 @@ fi
 # (measured), which is fail-closed — `acq()` reclaims a dead pid.
 trap 'exit 143' TERM
 trap 'exit 130' INT
-trap 'rm -f "$LOCKF"' EXIT
+# ⛔ AND THE SCRATCH DIR IS REAPED HERE TOO. `gh_bound_cleanup` (defined in the gh-bound block) removes
+# the ONE `bounded.*` dir the internal watchdog inherited, so a controller that lives for a month does
+# not leave it behind for the next boot to find. It is a `command -v`-guarded no-op on every host that
+# resolved a real `timeout` and on the DEGRADED path.
+trap 'rm -f "$LOCKF"; command -v gh_bound_cleanup >/dev/null 2>&1 && gh_bound_cleanup' EXIT
 
 # ── THE FORK-FREE TIMER IS OPENED HERE, WHILE THE BOX CAN STILL FORK (agent-infra#2293) ─────────
 # The starved path must wait without spawning, and `mkfifo`/`exec` themselves spawn/CREATE — so both
