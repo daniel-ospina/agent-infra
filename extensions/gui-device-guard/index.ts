@@ -352,13 +352,42 @@ export function splitSegments(command: string): string[] {
  * One rule, two readers: `stripComments` (which cuts the line there) and
  * `stripHeredocBodies` (which must not read a `<<` that lives in a comment).
  * Duplicating it is the #966 defect — a second copy of a parse rule.
+ *
+ * ⛔ THE SET IS BASH'S METACHARACTERS, NOT A GUESS AT THEM (round 10, blocking).
+ * The predecessor list was ";&|(" and omitted `)`, so `(npm exec electron .)# <both
+ * fake switches>` read the switches as ARGV and reported `faked: true` — this
+ * guard's one forbidden direction — while real bash discarded them:
+ *
+ *     $ bash -c '(echo RAN)# --ignored-flag'   →  RAN
+ *
+ * Bash recognises a comment when a word beginning with `#` starts a TOKEN, and its
+ * metacharacters are blanks plus `| & ; ( ) < >` (GNU Bash manual, Comments; POSIX
+ * XCU token-recognition rule 10) — the same set the repo's own comparables use:
+ * `shell-quote` keys comment recognition off its metacharacter set, and bash's own
+ * lexer assembles the token first and has no predecessor table at all. That list is
+ * closed, so it cannot grow; what it must NOT do is call a character a boundary when
+ * the character is itself QUOTED or ESCAPED — `echo x\)#c` prints `x)#c`, one word,
+ * so `#` there is data. Hence the two guards below, not just a wider `.includes`.
  */
+const WORD_BOUNDARY = ";&|()<>";
+
+/** Is the character at `j` (unquoted) itself escaped by a preceding backslash? */
+function isEscaped(line: string, j: number, base: number, mask: boolean[]): boolean {
+  let n = 0;
+  for (let k = j - 1; k >= 0 && line[k] === "\\" && mask[base + k] === true; k--) n++;
+  return n % 2 === 1;
+}
+
 function commentCutIndex(line: string, base: number, mask: boolean[]): number {
   for (let i = 0; i < line.length; i++) {
     if (line[i] !== "#") continue;
     if (mask[base + i] !== true) continue;             // quoted: data, not a comment
-    const prev = i === 0 ? " " : line[i - 1];
-    if (/\s/.test(prev) || ";&|(".includes(prev)) return i;
+    // Start of input/line, after a blank, or after an UNQUOTED, UNESCAPED operator.
+    if (i === 0) return i;
+    const prev = line[i - 1];
+    if (mask[base + i - 1] !== true) continue;         // glued to a closing quote
+    if (isEscaped(line, i - 1, base, mask)) continue;   // `x\)#` is one word
+    if (/\s/.test(prev) || WORD_BOUNDARY.includes(prev)) return i;
   }
   return -1;
 }

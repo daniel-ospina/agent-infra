@@ -318,6 +318,27 @@ const ROWS = [
   //     are file arguments to `open` (the false PASS cycle 3 fixed).
   ["L26a open a bundle with the switches AFTER `--args`", `open ./Build/DMeer.app --args ${FAKE}`, 1, "open", true],
   ["L26b …and the un-forwarded twin (switches BEFORE `--args`)", `open ./Build/DMeer.app ${FAKE} --args`, 1, "open", true],
+  // ── L27 (round 10, BLOCKING) — a comment begins after ANY bash metacharacter, and
+  //     `)` was missing from the predecessor set. `(npm exec electron .)# <both fake
+  //     switches>` therefore read the switches as ARGV and reported `faked: true` —
+  //     this guard's one forbidden direction — while real bash discarded them:
+  //         $ bash -c '(echo RAN)# --ignored-flag'   →   RAN
+  //     So it was a false PASS of exactly the shape cycle 2's F2 closed for `;`. The
+  //     `)`-after-`<<` half is the same one-character gap on R1's side: the heredoc
+  //     opened, deleted the rest of the input, and the launch was neither blocked nor
+  //     recorded. L27b is the mirror that pins the ESCAPE guard: bash reads `x\)#` as
+  //     ONE word (`echo x\)#c` prints `x)#c`), so `#` there is data and the launch after
+  //     the `;` must still be seen — a wider `.includes` without it would cut the line.
+  ["L27a a fake switch in a comment after `)` is not a mitigation (was faked:true)",
+    `(npm exec electron .)# ${FAKE}`, 1, "electron", true],
+  ["L27b a `<<` inside a comment after `)` is not a heredoc (was [])",
+    "(true)# cat <<EOF\nnpm exec electron .", 1, "electron", true],
+  ["L27c …and an ESCAPED `)#` is data, so the launch after the `;` is still read",
+    "echo a\\)#; npm exec electron .", 1, "electron", true],
+  ["A42 the ALLOW twin of L27b: a benign line after a commented `<<`",
+    "(true)# cat <<EOF\nls", 0, null, false],
+  ["A43 the ALLOW twin of L27c: an escaped `)#` with a benign tail",
+    "echo a\\)#; ls -la", 0, null, false],
   // ── A34–A41 — ALLOW twins for L24/L25 AND for round 7's P2-5 over-fire. The
   //     fail-safe word scan is now gated on the prefix having SKIPPED A FLAG: with
   //     no flag between the prefix and the command word, nothing could have
@@ -386,6 +407,18 @@ check(
   (() => {
     const f = classify(`electron . # ${FAKE}`);
     return f.length === 1 && f[0].faked === false;
+  })(),
+);
+// L11f — the same invariant one character over, on the FIELD (round 10, blocking).
+// A16/L11d already pin `faked`, and the classify row L27a's count/rule/media columns
+// were ALREADY satisfied by the defect (it fired, with `media: true`), so only the
+// field says whether the comment was read as ARGV. Bash's metacharacter set includes
+// `)`, so `)#` starts a comment and the switches are data.
+check(
+  "L11f a fake switch in a comment after `)` is not a mitigation (faked === false)",
+  (() => {
+    const f = classify(`(npm exec electron .)# ${FAKE}`);
+    return f.length === 1 && f[0].faked === false && f[0].media === true;
   })(),
 );
 check(

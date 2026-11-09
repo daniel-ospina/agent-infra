@@ -193,6 +193,20 @@ text after it genuinely is data (A32 pins that side too), and a `<<` inside an
 arithmetic expansion (`$(( n << shift ))`) stays declared rather than claimed
 complete (`review cycle 5, F2`, rows L22a/L22b).
 
+**A comment begins after ANY bash metacharacter — including `)`.** `commentCutIndex`
+kept a hand-written predecessor list (`;&|(`) that was narrower than bash's own
+word-start rule, so `(npm exec electron .)# <both fake switches>` read the switches
+as ARGV and reported `faked: true` — a **false PASS in the one direction this guard
+exists to prevent** — while real bash discarded them:
+`bash -c '(echo RAN)# --ignored-flag'` prints `RAN`. It was the identical false PASS
+review cycle 2 closed for `;`, left open for one character, and the same gap cost
+R1's half too: a commented `<<` after `)` opened a heredoc and deleted the rest of
+the input, so the launch was **neither blocked nor recorded**. The predicate now
+uses bash's closed metacharacter set (blanks plus `;&|()<>`; GNU Bash manual,
+Comments; POSIX XCU token-recognition rule 10) and refuses to call a predecessor a
+boundary when it is itself QUOTED or ESCAPED — `echo x\)#c` prints `x)#c`, one word,
+so `#` there is data (`round 10`, rows L27a–L27c, A42/A43, and the field pin L11f).
+
 **`command -v` is a lookup, not a launch.** `command` is a prefix word, so the
 resolved "command word" was the *looked-up* name and `command -v electron` was
 refused — a false block on correct work, which is a defect in its own right
@@ -274,7 +288,12 @@ runner set reds **2** (L24a, L24b); dropping the `env -S`/runner `-c` command-st
 rows reds **6** (L25a–L25f); ungating the fail-safe word scan from `sawFlag` reds
 **4** (A38–A41); reverting the pre-hook's `safeLane()`/`safeCwd()` to the raw
 `laneContract()`/`process.cwd()` reds **3** (H15a–H15c, with `ENOENT uv_cwd`);
-removing the `.app` suffix from the `open` predicate reds **1** (L9f).
+removing the `.app` suffix from the `open` predicate reds **1** (L9f); dropping `)`
+from the comment predecessor set (the round-10 blocking defect) reds **2** (L11f and,
+on the heredoc half, L27b — L27a's count/rule/media columns were already satisfied
+by the defect, so it is the record-half twin: it reds if the fix over-cuts and
+reports nothing); deleting the escape guard that the wider set needs reds **1**
+(L27c — without it `x\)#` is cut as a comment and the launch after the `;` is lost).
 
 ⛔ **The `-` prefix guard in `clusterShortArg` has NO attributable red, and is not
 claimed as covered.** Dropping `!tok.startsWith("-")` reds **0** rows, because a
