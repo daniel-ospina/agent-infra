@@ -147,6 +147,54 @@ rr REPO="$PLAIN" GIT_WORK_TREE="$REAL"
 ck "A9b an ambient GIT_WORK_TREE cannot forge one either (rc=$rr_rc)" $?
 
 echo
+echo "== A′. the DERIVATION arm: a candidate is used only if it PROVES itself (agent-infra#1974) =="
+
+# ⛔ THE PROPERTY, NOT A NICER DEFAULT. #1974's resolution order is `environment → derived-with-proof
+# → refuse`, and the middle arm is what these arms pin: a plain directory, a path that does not exist
+# and a checkout of the WRONG repo are all refused, so "derives" is not a synonym for "guesses".
+
+# A10 ONE candidate that proves: used, canonicalized, ONE line of stdout, and SAID OUT LOUD on stderr
+# (a value the operator did not type must be visible in the log the pass writes).
+rr -u REPO_CANDIDATES -u OR REPO_CANDIDATES="$REAL"
+{ [ "$rr_rc" -eq 0 ] && one_line "$rr_out" && [ "$rr_out" = "$RREAL" ] && err_has 'REPO is unset' && err_has 'using'; }
+ck "A10 a candidate that proves is DERIVED and named, never silent (rc=$rr_rc -> $rr_out)" $?
+
+# A11 A DIRECTORY THAT EXISTS BUT IS NOT A CHECKOUT IS NOT A CANDIDATE. This is the `$PWD` defect
+# verbatim: `/` (and any plain directory) exists, so a `-d` test alone would adopt it.
+rr -u REPO_CANDIDATES -u OR REPO_CANDIDATES="$NOPE $PLAIN"
+{ [ "$rr_rc" -eq 2 ] && [ -z "$rr_out" ] && err_has 'REPO is unset'; }
+ck "A11 a non-checkout candidate (a plain dir, a missing path) is NOT adopted (rc=$rr_rc)" $?
+
+# A12 THE SAME CHECKOUT OFFERED TWICE IS ONE CANDIDATE (raw path + a symlink to it). Keyed on the raw
+# string this was two "hits" and refused a box that had one checkout — a false block, which matters
+# even in a fail-closed arm.
+rr -u REPO_CANDIDATES -u OR REPO_CANDIDATES="$REAL $LINK"
+{ [ "$rr_rc" -eq 0 ] && [ "$rr_out" = "$RREAL" ]; }
+ck "A12 one checkout reached by two spellings is ONE candidate, not a coin toss (rc=$rr_rc)" $?
+
+# A13 TWO DISTINCT CHECKOUTS THAT BOTH PROVE: refused, and BOTH are named so the operator can pick.
+REAL2="$T/real2"; git init -q "$REAL2" || bad "A13 fixture could not be created"
+rr -u REPO_CANDIDATES -u OR REPO_CANDIDATES="$REAL $REAL2"
+{ [ "$rr_rc" -eq 2 ] && [ -z "$rr_out" ] && err_has "$RREAL" && err_has "$(canon "$REAL2")"; }
+ck "A13 two checkouts that both prove are REFUSED, with both named (rc=$rr_rc)" $?
+
+# A14 PROOF 2 — a DECLARED queue target decides which checkout this box may adopt (#1901). Without
+# it, `$PWD` in the wrong checkout silently queues another repo's work.
+git -C "$REAL" remote add origin https://github.com/acme/widget.git 2>/dev/null || true
+rr -u REPO_CANDIDATES -u OR REPO_CANDIDATES="$REAL" OR="acme/widget"
+{ [ "$rr_rc" -eq 0 ] && [ "$rr_out" = "$RREAL" ]; }
+ck "A14 a candidate whose origin NAMES the declared \$OR is adopted (rc=$rr_rc)" $?
+rr -u REPO_CANDIDATES -u OR REPO_CANDIDATES="$REAL" OR="acme/gadget"
+{ [ "$rr_rc" -eq 2 ] && [ -z "$rr_out" ] && err_has 'REPO is unset'; }
+ck "A14b a candidate whose origin names ANOTHER repo is refused, not adopted (rc=$rr_rc)" $?
+
+# A15 THE #1974 RULE ITSELF (point 3): a DECLARED value is never replaced by a derived one. A bogus
+# `$REPO` plus a perfectly good candidate is still the operator's refusal, by the value they named.
+rr -u REPO_CANDIDATES -u OR REPO="$NOPE" REPO_CANDIDATES="$REAL"
+{ [ "$rr_rc" -eq 2 ] && [ -z "$rr_out" ] && err_has "$NOPE" && err_has 'not a git checkout'; }
+ck "A15 a DECLARED bogus REPO is refused by value, never swapped for a good candidate (rc=$rr_rc)" $?
+
+echo
 echo "== B. the three wrong call sites resolve through it, and still refuse loudly =="
 
 # report.sh needs a harness-shaped `$O` and REAL is a checkout (it was `$HOME/eldato/tortoise` before,

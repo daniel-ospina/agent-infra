@@ -186,7 +186,7 @@ derive_or() {
 # Neither may be dropped in favour of the other: one is the box's config check, the other is the
 # queue/checkout pairing check (#1901).
 resolve_repo() {
-  local repo="${REPO:-}" top="" _cand _seen="" _hits="" _n=0
+  local repo="${REPO:-}" top="" _cand _c _seen="" _hits="" _n=0
   # ⛔ SET-BUT-EMPTY IS "UNSET", NOT A REASON TO FALL BACK. A blank line in a plist or a keys.env is
   # an operator typo; treating it as "nothing was set" is how a typo becomes a silent default.
   if [ -z "$repo" ] && [ -n "${REPO_CANDIDATES:-}" ]; then
@@ -194,8 +194,6 @@ resolve_repo() {
     # is used, and the proof is the ONLY reason a path is acceptable here.
     for _cand in $REPO_CANDIDATES; do
       [ -n "$_cand" ] || continue
-      case " $_seen " in *" $_cand "*) continue ;; esac   # the same dir offered twice is one candidate
-      _seen="$_seen $_cand"
       [ -d "$_cand" ] || continue
       # PROOF 1 — it IS a checkout. The git env is scrubbed for the reason stated below: an ambient
       # `GIT_DIR` would forge a checkout for any directory at all.
@@ -208,7 +206,15 @@ resolve_repo() {
       if [ -n "${OR:-}" ]; then
         [ "$(derive_or "$_cand" 2>/dev/null)" = "$OR" ] || continue
       fi
-      _hits="$_hits$_cand
+      # ⛔ THE DEDUPE KEY IS THE CANONICAL PATH, NOT THE STRING (the same rule `pwd -P` already applies
+      # to the value this function returns). A checkout offered twice — the real path and a symlink to
+      # it — is ONE candidate; keying on the raw string made it two hits and refused a box that had
+      # only one checkout, which is the false block a fail-closed arm must still not produce.
+      _c="$( cd "$_cand" 2>/dev/null && pwd -P )" || _c="$_cand"
+      [ -n "$_c" ] || continue
+      case " $_seen " in *" $_c "*) continue ;; esac
+      _seen="$_seen $_c"
+      _hits="$_hits$_c
 "
     done
     _n="$(printf '%s' "$_hits" | grep -c .)"
