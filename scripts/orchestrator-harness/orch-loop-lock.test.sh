@@ -55,16 +55,26 @@
 #      shape nor provably a non-controller, so it must refuse rather than be reclaimed out from under a
 #      live owner. BOTH option polarities count (§16c: `bash +o errexit …`), and `-c` wrappers stay
 #      RECLAIMED — #1856 decided they are not controllers (4c, §17, and §17b for the `+c` spelling).
-#  17. ⭐ THE TRAP PIN IS AN INVARIANT, NOT A SPELLING, AND IT CANNOT BE ANSWERED BY A COMMENT (§9b):
-#      one `^trap` line mentioning the lock, its signal list EXACTLY `EXIT` (matched per WHOLE token, so
-#      `SIGEXIT` — which bash REJECTS, installing no trap — reds instead of reading as `EXIT`), and it
-#      removes `$LOCKF` on COMMENT-STRIPPED text (so a trailing comment naming the command cannot answer
-#      it). Stated false RED: a trailing suffix after the signals. (`SIGEXIT` is NOT in that list and is
-#      not a false RED at all — bash REJECTS it and installs no trap, so it must red; a DOUBLE-QUOTED
-#      trap including the removal PASSES, which is what §9c row 7 pins. Only the UNQUOTED-variable
-#      spelling `rm -f $LOCKF` reds the removal clause, and the subject does not use it.)
-#      AND THE RELEASING TRAP MUST BE THE ONLY `EXIT` TRAP: a later `trap … EXIT` REPLACES it, so the
-#      lock would never be removed while both traps are spelled correctly.
+#  9d. ⭐ THE TRAP PINS ARE INVARIANTS, NOT SPELLINGS, AND NEITHER CAN BE ANSWERED BY A COMMENT (§9b):
+#      one trap REGISTRATION line — ANY indentation, and `builtin`/`command` prefixed, because a
+#      registration written inside an `if`/`case`/function is indented by construction — mentions the
+#      lock, its signal list is EXACTLY `EXIT` (matched per WHOLE token, so `SIGEXIT` — which bash
+#      REJECTS, installing no trap — reds instead of reading as `EXIT`; matched CASE-INSENSITIVELY and
+#      with `0` read as `EXIT`, because bash installs the EXIT trap for `exit` and `0` alike, MEASURED),
+#      and its FIRST command word is `rm -f "$LOCKF"` on COMMENT-STRIPPED text (so a trailing comment
+#      naming the command cannot answer it, and a trap that merely SPELLS the removal — an `echo` or `:`
+#      prefix — does not either). Stated false REDs: a trailing suffix after the signals, and a trap
+#      whose removal is not its first command (`trap 'cd /x; rm -f "$LOCKF"' EXIT`). (`SIGEXIT` is NOT
+#      in that list and is not a false RED at all — bash REJECTS it and installs no trap, so it must
+#      red; a DOUBLE-QUOTED trap including the removal PASSES, and so does a BRACE spelling `${LOCKF}`,
+#      both pinned in §9d.)
+#      AND THE RELEASING TRAP MUST BE THE ONLY `EXIT` TRAP: a later `EXIT`-family REGISTRATION REPLACES
+#      it, so the lock would never be removed while every trap is spelled correctly — so that arm
+#      counts REGISTRATIONS, not lines matching `^trap … EXIT`.
+#      AND EVERY `INT`/`TERM` HANDLER TERMINATES: the lock-releasing filter is `grep LOCKF`, so a
+#      RETURNING handler that releases the lock through a FUNCTION (`trap 'release_lock' INT`) is
+#      invisible to it — that is the #1715 class — while the subject's own handlers both terminate
+#      (`trap 'exit 143' TERM`, `trap 'exit 130' INT`), so the property is assertable in one arm.
 #
 # ⛔ THE SUBJECT IS THE REAL `orch-loop.sh`, NOT A RE-IMPLEMENTATION. The lock block lives in a marked
 # section (`# [orchlock:begin] … # [orchlock:end]`), which this suite EXTRACTS with `sed` and runs as
@@ -140,7 +150,11 @@ ck "LOCKF is defined ONCE in the whole loop (no split identity of the lock path)
 # so the COMMENT that documents the #1715 regression — `# Was trap 'rm -f "$LOCKF"' EXIT INT TERM` —
 # satisfied it. That is a false PASS on a structural pin, and it is why this arm stayed GREEN when
 # main's #3843 extended the trap. Anchored at `^trap`, no comment can answer it.)
-TRAP_L="$(grep -nE '^trap .*LOCKF' "$SUBJECT" 2>/dev/null | head -1 | cut -d: -f1)"
+# ⛔ LEADING WHITESPACE IS ALLOWED (`^[[:space:]]*trap`): a trap moved INSIDE an `if`/`case`/function is
+# indented by construction, and under a column-0 anchor it was invisible to this arm AND to the two
+# below it — a false GREEN, which is the direction that matters (fresh review of #3865 at 062ff3ca, P2).
+# A `#`-prefixed line still cannot match, so the comment false PASS this anchor was added for stays shut.
+TRAP_L="$(grep -nE '^[[:space:]]*trap .*LOCKF' "$SUBJECT" 2>/dev/null | head -1 | cut -d: -f1)"
 [ -n "$TRAP_L" ] && [ "$TRAP_L" -gt "$END_L" ]
 ck "the EXIT trap that releases the lock sits BELOW the section (the block runs first)" $?
 # ⛔ THE ARM MUST RED ON THE EXACT #1715 REVERT, AND THE FIRST FORM DID NOT (fresh review of #1985,
@@ -152,12 +166,12 @@ ck "the EXIT trap that releases the lock sits BELOW the section (the block runs 
 # EXTENDED the trap to also run `gh_bound_cleanup`): that extension is legitimate — the lock is still
 # released FIRST, and still only on EXIT — while a literal `-qxF` match REDS on it.
 #
-# trap_pin <the trap text> — 0 when the invariant holds for THAT TEXT. Factored out so §9c can drive the
+# trap_pin <the trap text> — 0 when the invariant holds for THAT TEXT. Factored out so §9d can drive the
 # pin itself over the spellings that have already defeated it once (a pin nobody tests is how this one
 # shipped a false PASS twice).
 #   * ONE line may mention $LOCKF,
 #   * its signal list is EXACTLY `EXIT`, matched per WHOLE TOKEN,
-#   * it removes $LOCKF, checked on COMMENT-STRIPPED text.
+#   * `rm -f "$LOCKF"` is its FIRST command word, checked on COMMENT-STRIPPED text.
 # ⛔ WHOLE TOKEN, NOT A SUFFIX (fresh review of #3865 at f8604c74c, P2 — false PASS, MEASURED: a regex
 # without a left boundary read `trap 'rm -f "$LOCKF"' SIGEXIT` as `TRAP_SIGS=EXIT` and left the suite
 # GREEN, while bash REJECTS `SIGEXIT` (`trap: SIGEXIT: invalid signal specification`) and installs NO
@@ -171,17 +185,62 @@ ck "the EXIT trap that releases the lock sits BELOW the section (the block runs 
 # diagnosis, never a false GREEN. The subject's own trap is single-quoted with no suffix.
 # ⛔ AND THE REMOVAL IS MATCHED ON A BACKSLASH-NORMALISED COPY, so a DOUBLE-QUOTED trap (which spells it
 # `rm -f \"\$LOCKF\"`) PASSES instead of reding — that was the second half of the quoting blind spot.
-trap_pin() {
-  local _lt="$1" _cmd _flat _sigs
-  _cmd="$(printf '%s' "$_lt" | sed -e 's/[[:space:]]*#.*$//')"
-  _flat="$(printf '%s' "$_cmd" | sed -e 's/\\//g')"
-  _sigs="$(printf '%s\n' "$_cmd" | awk '
-    BEGIN { n = split("EXIT INT TERM HUP QUIT ERR DEBUG RETURN 0", sig, " "); for (i = 1; i <= n; i++) ok[sig[i]] = 1 }
-    { out = ""; for (i = NF; i >= 1; i--) { if (!($i in ok)) break; out = $i (out == "" ? "" : " " out) } ; print out }
-  ')"
-  [ "$(grep -c . <<<"$_lt")" = 1 ] && [ "$_sigs" = "EXIT" ] && grep -qF 'rm -f "$LOCKF"' <<<"$_flat"
+# ⛔ AND THE REMOVAL MUST BE THE TRAP'S FIRST COMMAND WORD, NOT A SUBSTRING (fresh review of #3865,
+# P3 — false PASS, MEASURED: a bare substring test left the suite GREEN for `trap 'echo rm -f "$LOCKF"'
+# EXIT` and `trap ': rm -f "$LOCKF"' EXIT`, neither of which removes anything. Requiring `rm` to be the
+# FIRST word also pins the property the extension of this trap relies on — the lock is released FIRST —
+# which the pin previously did not assert. Stated false RED: a trap whose removal is not first
+# (`trap 'cd /x; rm -f "$LOCKF"' EXIT`) REDS; fail-closed, and the subject releases first.)
+# ⛔ AND A BRACE SPELLING IS NORMALISED (same review, P3 — MEASURED: `trap 'rm -f "${LOCKF}"' EXIT`
+# is a CORRECT trap and it RED, an undisclosed false RED for a form shellcheck recommends).
+# ⛔ ONE IMPLEMENTATION OF "WHICH SIGNALS DOES THIS REGISTRATION NAME?" — driven by the single-trap pin
+# AND by the whole-file ONLY-EXIT scan, so the two can never disagree about what `EXIT` is.
+#   * WHOLE TOKEN, not a suffix: `SIGEXIT` is not `EXIT` (bash rejects it and installs nothing).
+#   * NOT CASE-SENSITIVE, and `0` IS `EXIT`: MEASURED, `bash -c 'trap "echo INSTALLED" exit'` prints
+#     INSTALLED, `trap … 0` installs the same handler. A pin that reds a CORRECT trap for spelling the
+#     invariant differently is an undisclosed false RED (fresh review of #3865 at 062ff3ca, P3).
+_TRAP_SIGS_AWK='
+  BEGIN { n = split("EXIT INT TERM HUP QUIT ERR DEBUG RETURN 0", sig, " ")
+          for (i = 1; i <= n; i++) { ok[sig[i]] = 1; ok[tolower(sig[i])] = 1 } }
+  { out = ""
+    for (i = NF; i >= 1; i--) {
+      t = $i; tl = tolower(t)
+      if (!(t in ok) && !(tl in ok)) break
+      if (tl == "exit" || t == "0") t = "EXIT"; else t = toupper(t)
+      out = t (out == "" ? "" : " " out)
+    }
+    print out " :: " $0 }'
+# trap_regs <text> — one "<NORMALISED SIGS> :: <registration>" line per `trap` REGISTRATION in <text>.
+# ⛔ A REGISTRATION, NOT A LINE THAT STARTS WITH `t` (fresh review of #3865 at 062ff3ca, P2 — false
+# PASS, MEASURED: the previous `grep -E '^trap .* EXIT'` counted only a COLUMN-0, literal-uppercase
+# `EXIT`, so `  trap 'true' EXIT` (the indented shape an `if`/`case` extension takes),
+# `builtin trap 'true' EXIT` and `trap 'true' 0` each left the suite at PASS=121 FAIL=0 — every one of
+# them REPLACES the releaser, so the lock was never removed). ⏳ STATED LIMITS (not silently missed): a
+# registration whose command word is BUILT (`eval "trap …"`, a `trap` word assembled in a variable) is
+# not matched; asserting the handler bash actually INSTALLED (`trap -p EXIT`) would be stricter still and
+# is the follow-up shape if one of those ever appears.
+trap_regs() {
+  printf '%s\n' "$1" \
+    | sed -e 's/[[:space:]]*#.*$//' \
+    | grep -E '^[[:space:]]*((builtin|command)[[:space:]]+)?trap[[:space:]]' \
+    | awk "$_TRAP_SIGS_AWK"
 }
-LOCK_TRAPS="$(grep -E '^trap .*LOCKF' "$SUBJECT" 2>/dev/null)"
+# exit_trap_count <text> — how many EXIT-family trap REGISTRATIONS the text contains.
+exit_trap_count() {
+  trap_regs "$1" | grep -c '^EXIT :: ' || true
+}
+trap_pin() {
+  local _lt="$1" _cmd _flat _regs _sigs _body
+  _cmd="$(printf '%s' "$_lt" | sed -e 's/[[:space:]]*#.*$//')"
+  _flat="$(printf '%s' "$_cmd" | sed -e 's/\\//g' -e 's/${LOCKF}/$LOCKF/g')"
+  _regs="$(trap_regs "$_lt")"
+  _sigs="${_regs%% :: *}"
+  _body="${_flat#*trap }"; _body="${_body#\'}"; _body="${_body#\"}"
+  set -- $_body
+  [ "${1:-}" = "rm" ] || return 1
+  [ "$(grep -c . <<<"$_regs")" = 1 ] && [ "$_sigs" = "EXIT" ] && grep -qF 'rm -f "$LOCKF"' <<<"$_flat"
+}
+LOCK_TRAPS="$(grep -E '^[[:space:]]*trap .*LOCKF' "$SUBJECT" 2>/dev/null)"
 trap_pin "$LOCK_TRAPS"
 ck "the lock is released by ONE trap and its signal list is EXACTLY 'EXIT' (a returning INT/TERM handler deleted it while the loop lived — #1715)" $?
 # ⛔ AND IT MUST BE THE ONLY `EXIT` TRAP, BECAUSE A LATER ONE REPLACES IT (fresh review of #3865 at
@@ -190,20 +249,41 @@ ck "the lock is released by ONE trap and its signal list is EXACTLY 'EXIT' (a re
 # "echo SECOND" EXIT'` prints only `SECOND` — so the lock is never removed. The pin above counts only
 # traps that MENTION `$LOCKF`, which is exactly the shape a lane adding a second trap line does not
 # touch, and this PR's own prose invites extending the EXIT trap.)
-EXIT_TRAPS="$(grep -E '^trap .* EXIT' "$SUBJECT" 2>/dev/null)"
-[ "$(grep -c . <<<"$EXIT_TRAPS")" = 1 ]
-ck "the releasing trap is the ONLY 'EXIT' trap (a second 'trap ... EXIT' REPLACES the first, so the lock is never removed)" $?
-# ── 9c) THE PIN ITSELF, DRIVEN OVER THE SPELLINGS THAT DEFEATED IT ────────────────────────────────
+# ⛔ AND IT COUNTS REGISTRATIONS, NOT `^trap … EXIT` LINES (fresh review of #3865 at 062ff3ca, P2 —
+# false PASS, MEASURED on the real subject with each mutant inserted after the releaser: an INDENTED
+# second trap, a `builtin trap`, and `trap 'true' 0` all left the suite at `PASS=121 FAIL=0` while
+# bash REPLACED the releaser — `bash -c 'trap "echo FIRST" EXIT; trap "echo SECOND" 0'` prints only
+# SECOND — so the lock was never removed and this arm, the one written to catch exactly that, was green.
+# `exit_trap_count` is driven over all four spellings in §9d, so the near-misses are witnesses, not prose.)
+ALL_TRAPS="$(trap_regs "$(cat "$SUBJECT")")"
+EXIT_TRAPS="$(exit_trap_count "$(cat "$SUBJECT")")"
+[ "$EXIT_TRAPS" = 1 ]
+ck "the releasing trap is the ONLY 'EXIT' trap (a second EXIT-family registration REPLACES the first, so the lock is never removed)" $?
+# ⛔ AND A RETURNING `INT`/`TERM` HANDLER IS THE #1715 CLASS, AND THE `LOCKF` FILTER CANNOT SEE IT (fresh
+# review of #3865 at 062ff3ca, P3 — MEASURED: `release_lock() { rm -f "$LOCKF"; }; trap 'release_lock'
+# INT` is dropped by every `grep … LOCKF` above, so trap_pin answered GREEN while a RETURNING INT handler
+# deleted the lock and left the loop alive — the exact regression #1715 is named after). The subject's own
+# handlers TERMINATE (`trap 'exit 143' TERM`, `trap 'exit 130' INT`, orch-loop.sh:2592-2593), so assert it
+# over every registration whose signal list carries INT or TERM, wherever the command word lives.
+_BAD_TERM="$(printf '%s\n' "$ALL_TRAPS" | awk -F' :: ' '
+  { n = split($1, a, " ")
+    for (i = 1; i <= n; i++) if (a[i] == "INT" || a[i] == "TERM") { if ($2 !~ /exit/) print; next } }')"
+[ -z "$_BAD_TERM" ]
+ck "every INT/TERM trap handler TERMINATES (a RETURNING handler releases the lock while the loop lives — and one reached through a function is invisible to the LOCKF filter)" $?
+# ── 9d) THE PIN ITSELF, DRIVEN OVER THE SPELLINGS THAT DEFEATED IT ────────────────────────────────
+# ⛔ 9d, NOT 9c: the DRIFT PINS section below already owns "9c", and a cross-reference at §14v ("the
+# drift pin in §9c") referred to it — two differently-numbered sections under one number is a quality
+# gate whose own sections cannot be cited unambiguously (fresh review of #3865).
 # A pin that is never driven against its own near-misses is how this arm shipped a false PASS twice
 # (2026-11-09: the comment-match, then the `SIGEXIT` and trailing-comment ones). Each row is a
-# hand-written trap text with the verdict the INVARIANT requires; the last two are the false PASSes the
-# fresh review of f8604c74c measured on the shipped arms.
-echo "── 9c. the trap pin's own verdicts (invariant, not spelling)"
+# hand-written trap text with the verdict the INVARIANT requires; every row below is one a mutant or a
+# past defect actually defeated.
+echo "── 9d. the trap pin's own verdicts (invariant, not spelling)"
 _traprow() { # <expected:0|1> <trap text> <label>
   local _want="$1" _txt="$2" _got=1
   trap_pin "$_txt" && _got=0
   [ "$_got" = "$_want" ]
-  ck "9c: $3" $?   # ⛔ `$3`, NOT `$_3`: `_3` is no variable at all, so `set -u` aborted the whole suite here
+  ck "9d: $3" $?   # ⛔ `$3`, NOT `$_3`: `_3` is no variable at all, so `set -u` aborted the whole suite here
 }
 _traprow 0 "trap 'rm -f \"\$LOCKF\"' EXIT" \
   "the shipped form PASSES (one EXIT-only releaser)"
@@ -215,13 +295,88 @@ _traprow 1 "trap 'rm -f \"\$LOCKF\"' SIGEXIT" \
   "a SUFFIX signal name REDS (bash REJECTS SIGEXIT and installs no trap — it must not read as EXIT)"
 _traprow 1 "trap 'true' EXIT  # the release now lives in cleanup(): rm -f \"\$LOCKF\" there" \
   "a trailing COMMENT naming the command REDS (a comment cannot answer a structural pin)"
+_traprow 1 "trap 'echo rm -f \"\$LOCKF\"' EXIT" \
+  "an ECHO prefix REDS (a trap that only SPELLS the removal removes nothing — was a false PASS)"
+_traprow 1 "trap ': rm -f \"\$LOCKF\"' EXIT" \
+  "a COLON prefix REDS (same class: the removal is never executed)"
+_traprow 0 "trap 'rm -f \"\${LOCKF}\"' EXIT" \
+  "a BRACE spelling PASSES (a correct trap shellcheck would recommend — was an undisclosed false RED)"
+_traprow 0 "trap 'rm -f \"\$LOCKF\"' EXIT  # a returning handler was EXIT INT TERM" \
+  "a comment naming a SIGNAL PASSES — this row is green ONLY because the comment is stripped first"
 _traprow 1 "trap 'rm -f \"\$LOCKF\"' EXIT
 trap 'rm -f \"\$LOCKF\"' EXIT" \
   "TWO trap lines RED (one releaser)"
 _traprow 0 'trap "rm -f \"$LOCKF\"; x" EXIT' \
   "a DOUBLE-QUOTED trap PASSES (both halves of the quoting blind spot: signals AND the removal)"
-# (the quoting-agnostic extraction and its stated limits live in `trap_pin` above — this arm and §9c
+_traprow 0 "trap 'rm -f \"\$LOCKF\"' exit" \
+  "a LOWERCASE exit PASSES (bash installs the EXIT trap — a false RED until the pin normalised case)"
+_traprow 0 "trap 'rm -f \"\$LOCKF\"' 0" \
+  "a ZERO signal PASSES (0 IS the EXIT signal — the same arm reading it as not-EXIT was an undisclosed false RED)"
+_traprow 0 "  trap 'rm -f \"\$LOCKF\"' EXIT" \
+  "an INDENTED releaser PASSES (a registration inside an if/case is indented by construction)"
+_traprow 0 "builtin trap 'rm -f \"\$LOCKF\"' EXIT" \
+  "a builtin-prefixed releaser PASSES (the same builtin, and the ONLY-EXIT scan must see it)"
+# (the quoting-agnostic extraction and its stated limits live in `trap_pin` above — this arm and §9d
 # both drive it, so the pin has exactly one implementation and it is itself under test.)
+# ⛔ AND THE ONLY-EXIT ARM IS DRIVEN OVER ITS OWN NEAR-MISSES (fresh review of #3865 at 062ff3ca, P2):
+# every row below left the SHIPPED arm GREEN while bash REPLACED the releaser — a false GREEN in the one
+# direction that matters (the lock is then never removed). The spec is bash's: a later EXIT-family trap
+# REPLACES the installed handler (`bash -c 'trap "echo FIRST" EXIT; trap "echo SECOND" 0'` prints only
+# SECOND, MEASURED), and the signal may be spelled `EXIT`, `exit` or `0`.
+echo "── 9d. the ONLY-EXIT scan's own verdicts (a registration, not a lexeme)"
+_exitrow() { # <expected registration count> <text> <label>
+  local _want="$1" _txt="$2" _got
+  _got="$(exit_trap_count "$_txt")"
+  [ "$_got" = "$_want" ]
+  ck "9d: $3 (count=$_got, want=$_want)" $?
+}
+_REL="trap 'rm -f \"\$LOCKF\"' EXIT"
+_exitrow 1 "$_REL" \
+  "the shipped shape is ONE EXIT registration"
+_exitrow 2 "$_REL
+trap 'true' EXIT" \
+  "a second COLUMN-0 registration REPLACES the releaser (the mutant the ledger cites)"
+_exitrow 2 "$_REL
+  trap 'true' EXIT" \
+  "an INDENTED second registration is still a registration — was a false PASS"
+_exitrow 2 "$_REL
+builtin trap 'true' EXIT" \
+  "a builtin-prefixed second registration is still a registration — was a false PASS"
+_exitrow 2 "$_REL
+command trap 'true' EXIT" \
+  "a command-prefixed second registration is still a registration — was a false PASS"
+_exitrow 2 "$_REL
+trap 'true' 0" \
+  "a 0-signal second registration REPLACES the releaser — was a false PASS"
+_exitrow 2 "$_REL
+trap 'true' exit" \
+  "a LOWERCASE exit second registration REPLACES the releaser — was a false PASS"
+_exitrow 1 "$_REL
+# trap 'true' EXIT" \
+  "a COMMENTED-OUT registration is not a registration (no false RED on a correct tree)"
+_exitrow 1 "$_REL
+trap 'exit 143' TERM
+trap 'exit 130' INT" \
+  "the subject's OWN three registrations are ONE EXIT and none of the others (the shipped shape)"
+# ⛔ AND THE INT/TERM TERMINATION ARM IS DRIVEN THE SAME WAY, over the indirection that defeated the
+# LOCKF filter: a RETURNING INT handler that releases the lock through a FUNCTION removes the lock and
+# leaves the loop alive, which is #1715 spelled in code the `grep … LOCKF` cannot see.
+_term_bad() { # <text> -> non-empty when a registration with INT/TERM does not terminate
+  printf '%s\n' "$(trap_regs "$1")" | awk -F' :: ' '
+    { n = split($1, a, " ")
+      for (i = 1; i <= n; i++) if (a[i] == "INT" || a[i] == "TERM") { if ($2 !~ /exit/) print; next } }'
+}
+_TERMROW_OK="$_REL
+trap 'exit 143' TERM
+trap 'exit 130' INT"
+_TERMROW_BAD="$_REL
+release_lock() { rm -f \"\$LOCKF\"; }
+trap 'release_lock' INT
+trap 'exit 143' TERM"
+[ -z "$(_term_bad "$_TERMROW_OK")" ]
+ck "9d: the subject's own INT/TERM handlers all TERMINATE (the arm's positive control)" $?
+[ -n "$(_term_bad "$_TERMROW_BAD")" ]
+ck "9d: a RETURNING INT handler that releases the lock through a FUNCTION is CAUGHT (it is invisible to the LOCKF filter)" $?
 okc "acq() still takes the lock with set -o noclobber (unchanged primitive)" \
   grep -qF 'acq() { ( set -o noclobber; echo $$ > "$LOCKF" ) 2>/dev/null; }' "$SUBJECT"
 okc_not "the OLD liveness-only reclaim is GONE (it must not survive beside the new verdict)" \

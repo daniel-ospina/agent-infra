@@ -2482,8 +2482,12 @@ _orch_argv_is_loop_flagged() { # shellcheck disable=SC2086
     # rule names). LONG options are NOT the family (`--rcfile FILE` leaves the script as an argument, so
     # `--*` falls through to the ambiguous answer), and a short cluster only means `-c` when it carries a
     # literal `c` — `-o pipefail`, `-x`, `+o errexit` do not.
+    # ⛔ `--command` IS DEFENSIVE, NOT A CLAIM THAT A SHELL TAKES IT (fresh review of #3865, P3 —
+    # MEASURED: bash 5.2 and dash both REJECT it, `bash: --command: invalid option`, so the branch is
+    # unreachable today and no arm drives it). It is kept — and labelled — so that a future shell's long
+    # spelling is not silently treated as ambiguous, which is the fail-closed direction.
     case "$_t" in
-      --command) return 1 ;;                                              # the LONG spelling of -c
+      --command) return 1 ;;
       --*) ;;                                                             # any other long option: not the family
       -c|-*c*|+c|+*c*) return 1 ;;                                        # short cluster carrying `c`
     esac
