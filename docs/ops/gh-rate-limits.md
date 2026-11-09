@@ -133,9 +133,10 @@ What the controller now does (`orch-loop.sh`, the `# BEGIN gh-bound` block):
   Measured 2026-11-09: `gh api --paginate -i` on a non-2xx emits `HTTP/2.0 422 …` plus
   `X-Ratelimit-Reset` on **stdout**. So `sweep_defer_until_recorded` returns from its HEADER arm
   first (`orch-loop.sh:4893-4896`) and never reads the record: on a real refused request the
-  deferral is that response's `x-ratelimit-reset` / `retry-after`, floored at the layer's base wait
-  and held to the sweep's own 1 h ceiling (`orch-loop.sh:4802-4814`) — **not** a once-a-minute
-  retry. **The record branch is narrower than it looks, and its own reachability is part of the
+  deferral is that response's `x-ratelimit-reset` / `retry-after`, floored at the sweep's OWN 60 s
+  (`orch-loop.sh:4802-4814` — both bounds are literals in `sweep_defer_until`, NOT the layer's
+  operator-configurable `GH_LIMIT_BASE_WAIT` at `gh-limit.py:216`, so raising that knob does not
+  move this floor) and held to the sweep's own 1 h ceiling — **not** a once-a-minute retry. **The record branch is narrower than it looks, and its own reachability is part of the
   claim:** the call site defers ONLY on a failure `sweep_fail_kind` classifies `rate-limit`
   (`orch-loop.sh:5893`, `:4778-4796`), so the shape that can reach it is a `rate-limit` refusal
   whose response carried no reset — `x-ratelimit-remaining: 0` with no `x-ratelimit-reset`, or a
@@ -189,13 +190,17 @@ What the controller now does (`orch-loop.sh`, the `# BEGIN gh-bound` block):
   seen alike. All of it is graded by ONE fixture, so each is a pinned property rather than prose: the
   multi-line arm, the one-line `case`, the `while`/`until` heads, the `time`/`exec` wrappers, and
   `x="$(gh api …)"` (incl. the `orch-loop.sh:4910` shape) MUST red; an already-bounded arm,
-  `pattern="a) gh api"`, a literal `) gh` in prose, and an already-bounded capture MUST NOT. What is
+  `pattern="a) gh api"` (and its SINGLE-quoted spelling `pattern='a) gh api'`), a literal `) gh` in
+  prose, and an already-bounded capture MUST NOT. What is
   still out of its reach is a call hidden behind a variable, in `eval`, inside a python heredoc, in a
   BACKTICK substitution (the alternation anchors on `$(`,
-  not on a backtick), or behind a WRAPPER WORD the group does not carry — the group holds only `time`
-  and `exec`, so `env`, `nice`, `sudo`, `timeout`, `xargs`, `nohup` and `stdbuf` are unmodelled
+  not on a backtick), or behind a WRAPPER WORD the group does not carry. Of the wrapper words it
+  carries only `time` and `exec` — its other members are the keywords `if`/`then`/`elif`/`while`/
+  `until`/`!`/`do`/`else` — so `env`, `nice`, `timeout`, `xargs`, `nohup` and `stdbuf` are unmodelled
   whether or not an assignment follows (`env gh api …` and `env GH_TOKEN=x gh api …` are equally
-  invisible; measured). No such site exists today
+  invisible; measured). `sudo` is the sole exception, and it errs CLOSED: the group is not
+  word-anchored, so its `do` alternative matches the tail of `sudo ` and `sudo gh api …` REDS — a
+  false positive at worst, never a silent pass (measured). No such site exists today
   (independently re-derived over the file: every remaining `gh` is a string literal, the
   `command gh` pass-through, or the `tb_timeout … gh` argv
   inside `gh_bounded`), so this is a stated limit, not a live bypass.

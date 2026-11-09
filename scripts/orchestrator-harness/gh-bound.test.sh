@@ -309,12 +309,15 @@ esac
 #     and `exec` wrappers — so `until gh api …` / `time gh api …` passed this assertion GREEN while
 #     the row's message said every command position was caught (agent-infra#2028 review round 5).
 #     All four are in the group now, and rows 13–15 grade them. The residual is the whole WRAPPER
-#     CLASS, not one spelling of it: the group carries only `time` and `exec`, so `env`, `nice`,
-#     `sudo`, `timeout`, `xargs`, `nohup` and `stdbuf` are unmodelled whether or NOT an assignment
-#     follows — measured at this head (`env gh api …`, `env GH_TOKEN=x gh api …` and `nice gh api …`
-#     are all invisible; `exec gh api …` reports). That class is named beside `variable` / `eval` /
-#     python heredoc / backtick in the runbook's stated limits, so the remaining gap is disclosed,
-#     not implied closed.
+#     CLASS, not one spelling of it: of the wrapper words the group carries only `time` and `exec`
+#     (its other members are the keywords `if`/`then`/`elif`/`while`/`until`/`!`/`do`/`else`), so
+#     `env`, `nice`, `timeout`, `xargs`, `nohup` and `stdbuf` are unmodelled whether or NOT an
+#     assignment follows — measured at this head (`env gh api …`, `env GH_TOKEN=x gh api …` and
+#     `nice gh api …` are all invisible; `exec gh api …` reports). `sudo` is the sole exception, and
+#     it errs CLOSED: the group is not word-anchored, so `do` matches the tail of `sudo ` and
+#     `sudo gh api …` REDS (measured) — a false positive at worst, never a silent pass. That class is
+#     named beside `variable` / `eval` / python heredoc / backtick in the runbook's stated limits, so
+#     the remaining gap is disclosed, not implied closed.
 _unbounded_scan() {
   awk '
   # code(<line>) -> the line with its LITERAL text REMOVED: single-quote spans in full, and the
@@ -389,6 +392,10 @@ $UNBOUNDED"
 #      must not open a span; valid bash, so round 6's under-report could ship)
 #  17  the same, escaped double quote (`it\"s`)                     -> MUST (same channel)
 #  18  an ANSI-C `$'a\'b'` quote (`\'` escapes INSIDE that span)     -> MUST (state A, same class)
+#  19  a SINGLE-quoted literal carrying `) gh` (`pattern='a) gh api …'`) -> MUST NOT: property 2's
+#      other spelling, state `S`. Without this row nothing pins single-quote stripping, so deleting
+#      that state is undetected — its absence fails CLOSED (a literal would start red-ing), which is
+#      why it is a row here rather than a finding; with it, property 2 holds for BOTH spellings.
 printf '%s\n' \
   'core) gh api repos/o/r/pulls' \
   '  other) gh_bounded api repos/o/r' \
@@ -407,10 +414,11 @@ printf '%s\n' \
   'exec gh api repos/o/r' \
   "echo it\\'s; gh api repos/o/r" \
   "echo it\\\"s; gh api repos/o/r" \
-  "echo \$'a\\'b'; gh api repos/o/r" > "$T/casearm.sh"
+  "echo \$'a\\'b'; gh api repos/o/r" \
+  "pattern='a) gh api repos/o/r'" > "$T/casearm.sh"
 CASEARM="$(_unbounded_scan "$T/casearm.sh")"
 if [ "$(awk -F: '{print $1}' <<<"$CASEARM" | tr '\n' ' ')" = "1 3 6 7 8 9 10 13 14 15 16 17 18 " ]; then
-  ok "structural: every command position IS caught — both \`case\` layouts, the \`while\`/\`until\` loop heads, the \`time\`/\`exec\` wrappers, a \`\$( … gh …)\` substitution inside a double-quoted span (incl. the pre-fix capture idiom from orch-loop.sh:4910), AND an ESCAPED quote (\`it\\'s\`) or an ANSI-C \`\$'…'\` span around it — while a literal \`) gh\` and an already-bounded call do not red it: the blind spot is closed, not documented"
+  ok "structural: every command position IS caught — both \`case\` layouts, the \`while\`/\`until\` loop heads, the \`time\`/\`exec\` wrappers, a \`\$( … gh …)\` substitution inside a double-quoted span (incl. the pre-fix capture idiom from orch-loop.sh:4910), AND an ESCAPED quote (\`it\\'s\`) or an ANSI-C \`\$'…'\` span around it — while a literal \`) gh\` in DOUBLE or SINGLE quotes and an already-bounded call do not red it: the blind spot is closed, not documented"
 else
   bad "structural: a command position is UNSCANNED — scan said '${CASEARM:-<nothing>}' (want lines 1, 3, 6, 7, 8, 9, 10, 13, 14, 15, 16, 17 and 18 only)"
 fi
