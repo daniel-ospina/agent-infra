@@ -1,0 +1,40 @@
+{
+  "artifacts": [
+    {
+      "kind": "log",
+      "value": "/tmp/tmp.iQUXobbdpj/fix.log"
+    },
+    {
+      "kind": "branch",
+      "value": "feat/2159-tm"
+    },
+    {
+      "kind": "sha",
+      "value": "dc300b9cb14bc00463928e623cb52dda6b19ccb8"
+    },
+    {
+      "kind": "worktree",
+      "value": "/home/cmux/agent-infra/.worktrees/tm-2159"
+    }
+  ],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 605,
+  "duration_s": 27,
+  "ended_at": 1794249329,
+  "exit_code": 0,
+  "heartbeat_at": 1794249329,
+  "host": "cmux",
+  "issue": 42,
+  "kind": "fixer",
+  "lane_id": "cmux.kfixer-42-1794249302-p1668285-657c1db9",
+  "lease_until": 1794249934,
+  "pid": 1668285,
+  "reason": null,
+  "repo": "daniel-ospina/agent-infra",
+  "schema": 1,
+  "started_at": 1794249302,
+  "state": "DONE",
+  "tag": "42",
+  "worktree": "/home/cmux/agent-infra/.worktrees/tm-2159"
+}
