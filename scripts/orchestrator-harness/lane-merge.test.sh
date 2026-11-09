@@ -1309,9 +1309,11 @@ ck "a TOTAL-only response is NOT a green head (0 check-runs = nothing measured, 
 
 # ── 18. the SUPERVISION BUDGET is sized to what the LANE can actually SPEND, and re-armed (E1) ────
 # ⛔ THE OLD INVARIANT WAS SATISFIED BY MAKING THE TWO SIDES EQUAL (landing review, P1, verified):
-# 1500 (WAIT_S) + 15 x 120 (MAX_WATCH x POLL) = 3300 = lane.sh's LANE_TIMEOUT, so the merge phase
-# consumed the WHOLE wall clock and left EXACTLY ZERO for the lane's implementation, its commits, its
-# pushes and opening the PR. With any real implementation time the lane was killed at 3300s still
+# 1500 (WAIT_S) + 15 x 120 (MAX_WATCH x POLL) = 3300 = the 3300 s LANE_TIMEOUT of the day, so the merge
+# phase consumed the WHOLE wall clock and left EXACTLY ZERO for the lane's implementation, its commits, its
+# pushes and opening the PR. (That literal is gone — agent-infra#2888 gave the wall ONE default,
+# `LANE_BACKSTOP_S` = 7200, so the same inequality is now written against 7200 throughout.) With any real
+# implementation time the lane was killed at 3300s still
 # inside its merge phase — neither bound was ever reached by the lane that OWNS them, no verdict was
 # written, no hand-off comment was posted, and the only signal was lane.sh's "NO merge-phase verdict"
 # line. The BLOCKED_ATTEMPTS / "supervision budget spent" path was unreachable in production.
@@ -1345,6 +1347,51 @@ _ir="$(sed -n 's/.*LANE_MERGE_IMPL_RESERVE:-*\([0-9]*\)}.*/\1/p' "$SCRIPT" | hea
 [ -n "$_ps" ] && [ -n "$_lt" ] && [ -n "$_ws" ] && [ -n "$_ir" ] && _mw=$(( (_lt - _ws - _ir) / _ps )) || _mw=0
 ck "WAIT_S ($_ws) + MAX_WATCH x POLL ($_mw x $_ps) + IMPL_RESERVE ($_ir) = $(( ${_ws:-0} + ${_mw:-0} * ${_ps:-0} + ${_ir:-0} )) ≤ lane-merge.sh's OWN LANE_WALL_S ($_lt) — by ARITHMETIC across the two files, with a NON-ZERO implementation reserve" \
    $([ -n "$_mw" ] && [ "${_ir:-0}" -gt 0 ] && [ "${_mw:-0}" -ge 1 ] && [ $(( ${_ws:-0} + ${_mw:-0} * ${_ps:-0} + ${_ir:-0} )) -le "$_lt" ] && echo 0 || echo 1)
+# ⛔ AND THE CHECK WAIT MUST BE ABLE TO REACH A COMPLETING CI (agent-infra#3584). The arithmetic above is
+# satisfied by ANY positive `_ws` — including one SMALLER than the fastest real CI pass, which is the
+# shipped defect this arm exists to keep out: at 1500 s the wait was BELOW the measured minimum (1623 s),
+# so `INFLIGHT` never reached 0, the loop always expired into `WAITING_CHECKS`, and the file's own success
+# path ("tail in flight == 0 → launch the chain") fired zero times. A bound no completing run can reach is
+# an inert guard, and no arithmetic asserts it away.
+# The floor is MEASURED, and the window is part of it (round-2 review, P1 — verified). Completed
+# non-cancelled non-main `ci.yml` runs on daniel-ospina/agent-infra over the runs endpoint's 1000-run cap
+# as measured 2026-11-09: n=212 · min 1623 s · p50 3837 s · p90 4960 s · p95 5612 s · max 7968 s.
+# 4800 s clears the FASTEST measured day's p95 (11-09: 4565 s) and is 3.2x the bound this arm exists to
+# keep out.
+# ⛔ THE CLAIM IS STATED NO STRONGER THAN THE DATA SUPPORTS, TWICE OVER.
+#   (a) NOT A PERCENTAGE (review cycle 3, P2): a share of a SLIDING window rots — an earlier draft said
+#       "88.2 %" and the same query re-run hours later measured 87.7 %, because new runs push old ones out
+#       of the endpoint's 1000-run cap. The MINIMUM does not rot that way, so the floor is argued from it.
+#   (b) NOT "covered no completing run" (review cycle 4, P2): 1623 s is the RUN's own duration, while the
+#       loop's deadline starts at PROCESS START — at merge-phase entry, AFTER the push. So the bound a lane
+#       must survive is `run duration - entry latency`, and 123 s of margin means a lane entering late
+#       COULD have seen `INFLIGHT == 0` inside 1500 s. What the data supports is that 1500 s sat below the
+#       fastest run and 2.5x under the median, so the success path only fired for lanes that entered
+#       late — and the deployed record shows it did not: 2 x `WAITING_CHECKS … after 1500s` (#10302,
+#       #2973) and 0 x MERGED. That empirical record is what makes 1500 s a defect rather than a tight fit.
+# The floor is deliberately NOT the three-day p95 (5612 s): no wait above 5460 s fits this lane's clock at
+# all (see the arithmetic ceiling in lane-merge.sh), so a floor there could never be satisfied and would
+# red on every correct tree. The residual above 5400 s is stated in the script; it is not this arm's to
+# close.
+ck "the per-round check wait ($_ws s) is not back under the measured distribution (floor 4800 s; the old 1500 s sat below the fastest measured run of 1623 s and 2.5x under the median, and the deployed record shows it produced zero merges) — a wait below it can only succeed for a lane that entered its merge phase late" \
+   $([ -n "$_ws" ] && [ "${_ws:-0}" -ge 4800 ] && echo 0 || echo 1)
+# ⛔ AND THE OTHER SIDE MUST NOT BE STARVED IN THE SAME EDIT (round-2 review, P2). The two bounds are paid
+# out of ONE clock, so raising the wait without a floor on what it leaves would trade a wait that cannot
+# finish for a supervision budget that cannot supervise: `MAX_WATCH` floors at 1 chunk, so a wait raised
+# to 6100 s would still pass the arithmetic arm above (`_mw` = 1, 6100 + 120 + 900 = 7120 ≤ 7200) while
+# leaving a single 120 s `--watch` call — a supervision allowance that exists only formally. 7 chunks is
+# the SHIPPED allowance (it is what the 3300 s clock afforded at a 1500 s wait, and what the 7200 s clock
+# affords at the 5400 s wait), so it is the regression floor: a future edit that eats it must raise
+# LANE_BACKSTOP_S (which raises `_mw`) rather than quietly convert supervision into waiting.
+# ⛔ THE EXAMPLE VALUES ARE CHECKED, NOT ASSUMED — AND BOTH EARLIER DRAFTS WERE WRONG (review cycles 2 and
+# 3, verified by mutation on copies): 6300 s reds this arm's own ARITHMETIC sibling (`_mw` = 0, which its
+# `-ge 1` refuses), so 6300 demonstrates nothing at all. 6100 s passes the arithmetic and this arm is the
+# one that NAMES the cause — but it does NOT isolate it: at `_mw` = 1 several chunk-accounting arms (the
+# WAITING_API refund, the LOAD-overwrite case, the charged-chunk case) also red, because they need more
+# than one chunk to exercise. That is the suite being STRICTER than a single-arm claim, and what is
+# corrected here is the claim, not the arm.
+ck "the derived supervision allowance ($_mw chunks) is not starved — raising the check wait on one clock must not reduce --watch to a single chunk" \
+   $([ -n "$_mw" ] && [ "${_mw:-0}" -ge 7 ] && echo 0 || echo 1)
 # ⛔ AND THE ARITHMETIC IS NOT THE RUNTIME (this suite's own lesson: a source-shape assertion passes on a
 # script whose runtime lost the property). Drive the DERIVED cap through --watch with a SHRUNK
 # LANE_TIMEOUT: 1500 - 0 (check wait) - 900 (reserve) = 600s / 120s = 5 chunks, so chunk 6 is refused
