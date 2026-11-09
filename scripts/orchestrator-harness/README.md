@@ -2501,16 +2501,50 @@ to a sibling that happens to share the wrapper. See §6.5.1b.
 
 ```text
 [scope] open=24 -> BROAD (auto)             ← or (pinned SCOPE=own) / (pinned SCOPE=broad)
-[cap] load=7/100 lanes=4/12 max_lanes=25 zombie=0 lanes_src=census mem_avail=11761M/512M swap_free=588M/600M   ← every gate names its ceiling
+[cap] load=7/100 lanes=4/12 max_lanes=25 zombie=0 lanes_src=census mem_avail=11761M/512M swap_free=588M/600M disk_free=41230M/8144M disk_headroom=ok disk_src=report   ← every gate names its ceiling
 [dispatch] load=7 lanes=4 -> 4429 4489
 [refresh] queue=READ(7) — every priority tier was READ; 7 candidate(s) listed (agent-infra#1931)
 [refresh] +#4508 CLEAN -> backlog
 #8219 FAILED:ai-review-gate          ← per-PR verdict for the required checks
 #8192 fixer attempt 1                ← routed to a fixer, not a re-record
 ...
-[cap] load=104/100 lanes=4/12 max_lanes=25 zombie=8 lanes_src=census mem_avail=11890M/512M swap_free=588M/600M
+[cap] load=104/100 lanes=4/12 max_lanes=25 zombie=8 lanes_src=census mem_avail=11890M/512M swap_free=588M/600M disk_free=179M/8144M disk_headroom=no disk_src=report
 [dispatch] skipped (load=104>=max_load=100)   ← and WHY, naming the binding gate
 ```
+
+### `disk_free=` / `disk_headroom=` — the capacity the box does not have (agent-infra#2159)
+
+`[cap]` carried `load`, `lanes`, `max_lanes`, `mem_avail` and `swap_free` and **no disk figure and no
+per-lane cost**, so a cell holding six LIVE worktrees at ~1.1 GB each on a 32 GB disk sat at **179 MB
+free** while its line advertised `lanes=0/20` — and an orchestrator acting on that line filled it into
+the wall (four `merge-*` lanes then died with 0-byte logs: the log write itself failed). The datum was
+never missing — `spawn-gate.sh` measures free space and one lane's cost on every admission and appends
+both to `state/disk.tsv` — it simply was not on the line an operator reads.
+
+The three fields, and the two rules that make them trustworthy:
+
+| field | meaning |
+|---|---|
+| `disk_free=<free>M/<need>M` | MiB free on the volume holding `$REPO`, against what ONE more lane needs — `max(tree, self) + reserve`, the pre-start seam's bound (`disk_worktree_need`). Read as the pair `mem_avail=<free>M/<floor>M` already is |
+| `disk_headroom=ok\|no\|unknown` | `no` = the next lane does **not** fit at this reading; `unknown` = the probe could not answer (never coerced to a number) |
+| `disk_src=report\|absent` | where the reading came from. `absent` = no `spawn-gate.sh` with `--disk-report` was found (deploy skew), and the cycle says so in one `[disk] CANNOT-VERIFY` line |
+
+⛔ **IT IS A REPORT, NOT A FIFTH GATE, AND THAT IS THE RECORDED DECISION.** The controller's gate
+vector states it: *"DISK is not repeated here because the spawn point (`spawn-gate.sh`) is its ONE
+implementation"*. So `[cap]` ADVERTISES the constraint and does not duplicate the refusal — the
+refusal that matters happens upstream of every lane checkout (`wt_provision` → `disk_admit`, exit 77)
+and at the spawn point (`DISK-NOHEADROOM`). Adding a second disk gate here would be the duplication
+agent-infra#1178 forbids.
+
+⛔ **ONE MEASUREMENT.** The figure comes from `spawn-gate.sh --disk-report`, which prints the fields
+`disk_admit` just measured — the controller runs **no `df` of its own**. A second reading is a reading
+whose report can disagree with the verdict beside it (#2721's own defect). The pairing is pinned by
+`cap-disk-report.test.sh` (the report's `free`/`need` are asserted equal to `--disk-admit`'s on the
+same stubbed fixture).
+
+⚠️ **Stated limit:** the volume measured is the one `$REPO` lives on. A lane provisioned onto a
+different mount would be judged on the repo's volume — the same limit the supervisor's `check` states,
+and the shipped topology (lanes under `<repo>/.worktrees`) does not split them.
 
 ⛔ **`backlog=0` alone is never a clearance** (agent-infra#1931). The cycle line carries the pool's
 READ state beside it, and `EMPTY` is the only form that means "no work":
@@ -5237,6 +5271,7 @@ pressure. A `tree` the OPERATOR states for the cell is honoured on both sides.
 | `run_agent` (live dispatch) | immediately before the agent starts | `REFUSED … DISK-NOHEADROOM` (unchanged, fail-OPEN on an unreadable probe) |
 | `wt_provision` → `wt_disk_admit` (PRE-START) | before `git worktree add`, i.e. before anything is created | `REFUSED-DISK(free=…, need=…, box=…; free_mb=, need_mb=)`, return **4** |
 | `spawn-gate.sh --disk-admit <target>` (the VERB) | from a dispatcher that is not this tree's shell code | same lines, exit 0/77/64 |
+| `spawn-gate.sh --disk-report <target>` (the REPORT verb) | from a caller that PRINTS capacity rather than deciding it (`orch-loop.sh`'s `[cap]` line) | one parseable row, `[disk-report] <STATE> <free|?> <need> tree= self= reserve= box= target=`, exit **0** (a report is not a gate) — the fields `disk_admit` just measured, so the printed figure cannot disagree with the verdict |
 
 rc **4** is mapped by each caller to what ITS surface can express: `fix-one.sh` refunds the attempt
 and exits **77** (`AGENT_DISK_REFUSED`); `adopt-fix.sh` exits **77**; `dispatch-merge.sh` releases the
