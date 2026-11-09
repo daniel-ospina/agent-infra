@@ -46,11 +46,13 @@
 # declared set no longer describes, invisible to every content-drift comparison. The
 # declared set is resolved RECURSIVELY (`templates/launchd/*/label.plist` counts — the
 # four repo templates that ship one directory down are this repo's own jobs, not
-# strays, #1867 review P1). Two classes are declared elsewhere and are NOT reported:
-# labels in RETIRED (pending retirement) and labels in OWNED-BY-OTHER-INSTALLERS
-# (another installer of this repo owns them — the harness controller), so the alarm
-# stays about jobs nobody declares. Exit codes: 0 clean · 1 UNMANAGED found · 2 the
-# installed set could NOT be enumerated (UNKNOWN, never a pass — #1867 review P2).
+# strays, #1867 review P1). Three classes are declared elsewhere and are NOT reported:
+# labels in RETIRED (pending retirement), labels in OWNED-BY-OTHER-INSTALLERS (another
+# surface of this repo installs or adopts them — every installer in `scripts/`, and the
+# box's own adopted controller job), so the alarm stays about jobs nobody declares.
+# Exit codes for `--status`: 0 clean · 1 UNMANAGED found · 2 the installed set could NOT
+# be enumerated (UNKNOWN, never a pass — #1867 review P2). `2` is ALSO the global usage
+# code; see the second Exit-codes line below the env list, which spells both.
 #
 # Usage:
 #   install-launchd.sh               install/refresh all templates (idempotent)
@@ -85,6 +87,14 @@
 #                            shim on PATH so nothing reaches the real domain)
 #
 # Exit codes: 0 = ok (or clean skip), 1 = failure (loud), 2 = usage error.
+# ⛔ AND `--status` REUSES 2 FOR A THIRD MEANING, so it is spelled here as well as in the
+# UNMANAGED paragraph above (#1867 review P3): for THAT verb the three codes are 0 clean ·
+# 1 UNMANAGED found · 2 the installed set could NOT be enumerated (UNKNOWN, never a pass).
+# The two readings of `2` cannot be confused in practice — `usage()` exits before any work
+# starts and never prints a status body, while the UNKNOWN arm prints and exits 2 from a
+# completed run — but a caller reading only this line would be told the wrong thing, and the
+# one caller that gates on the code (`scripts/fleet-schedule.py`) treats any non-zero as
+# `SCHEDULE NOT VERIFIED` either way. Read the VERB's own line when the distinction matters.
 set -uo pipefail
 
 INFRA_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -1657,9 +1667,13 @@ is_declared() { # $1 = label → 0 when a template in the declared set (any dept
 # ⛔ TWO DECLARED EXCLUSIONS, both load-bearing and both about NOT crying wolf:
 #   · a label in `RETIRED` is deliberately template-less — it is DECLARED and `retire_pass` removes
 #     it, so it is pending retirement, not unmanaged;
-#   · a label in `OWNED-BY-OTHER-INSTALLERS` is installed by ANOTHER surface of this repo (the
-#     harness controller), which is not this installer's set to describe.
-# Without the second, the reference Mac layout is red forever (#1867 review P1).
+#   · a label in `OWNED-BY-OTHER-INSTALLERS` is DECLARED by ANOTHER surface of this repo — an
+#     installer in `scripts/install-*.sh`, the harness installer, or (the one shape that is not an
+#     installer at all) the controller job a box already carries and `scripts/orchestrator-bringup.sh`
+#     ADOPTS. None of them is this installer's set to describe.
+# Without the second, the reference Mac layout is red forever (#1867 review P1) — and the remedy
+# this command prints for a stray is a DELETION, so a missing declaration is not a cosmetic false
+# alarm: it aims `launchctl bootout … && rm -f …` at a live job of this repo's own.
 # Returns 0 when the installed set was enumerated (rows on stdout, possibly none), 2 when it could
 # NOT be — "I could not look" is a different answer from "nothing to report", and the caller must be
 # able to tell them apart (see the UNKNOWN arm in --status, #1867 review P2).
@@ -1744,11 +1758,17 @@ retired_labels() {
 # `activate-harness.sh` reports `fleet-schedule … FAILING`. An instrument whose healthy state is red
 # is one an operator learns to ignore, or "fixes" by deleting a plist the controller needs.
 #
-# ⛔ THE LIST IS DECLARED, NOT GUESSED, and it is drift-gated: `install-launchd.test.sh` §18 asserts
-# every label in this manifest still matches the declaring installer's own `LABEL=`/`BASE_LABEL=`
-# line, so the two cannot quietly disagree. Resolution mirrors `cmux_manifest` (TEMPLATES_DIR first,
-# then the checkout's own copy) so an env-overridden template dir — the test fixture — still finds
-# it, and a farmed run still falls back to the tree it came from.
+# ⛔ THE LIST IS DECLARED, NOT GUESSED, and it is drift-gated IN BOTH DIRECTIONS: §18 of
+# `install-launchd.test.sh` asserts (1) that every entry still has a declaring surface in this repo —
+# matched against ALL the spellings those surfaces use, because one of them spells its label ONLY as an
+# inline `<string>com.…</string>` plist body plus a literal `Library/LaunchAgents/<label>.plist` path
+# (`scripts/install-lane-arm-timer.sh`: its `LABEL=eldato-lane-arm` is the systemd unit name) — and (2)
+# the REVERSE, that every label an installer here writes into `LaunchAgents` is a template, RETIRED, or
+# declared here. A gate that can only catch a STALE entry cannot catch the direction that does harm: a
+# MISSING one, which prints a deletion command for a live job.
+# Resolution mirrors `cmux_manifest` (TEMPLATES_DIR first, then the checkout's own copy) so an
+# env-overridden template dir — the test fixture — still finds it, and a farmed run still falls back to
+# the tree it came from.
 foreign_manifest() {
     if [ -f "$TEMPLATES_DIR/OWNED-BY-OTHER-INSTALLERS" ]; then
         printf '%s\n' "$TEMPLATES_DIR/OWNED-BY-OTHER-INSTALLERS"
@@ -1991,13 +2011,19 @@ if [ "${1:-}" = "--status" ]; then
         while IFS= read -r _lbl; do
             [ -n "$_lbl" ] || continue
             echo "    $_lbl ($AGENTS_DIR/$_lbl.plist)" >&2
-            echo "      remove: launchctl bootout gui/$(id -u) \"$AGENTS_DIR/$_lbl.plist\" && rm -f \"$AGENTS_DIR/$_lbl.plist\"" >&2
         done <<<"$unmanaged"
-        echo "    Not described by this repo, so no template change and no content comparison can" >&2
-        echo "    reach it. Add a template, or remove the job with the command above." >&2
-        echo "    (A job another installer of this repo owns belongs in templates/launchd/" >&2
-        echo "     OWNED-BY-OTHER-INSTALLERS; a job that should go away belongs in RETIRED, which" >&2
-        echo "     retire_pass removes on the next install — no hand-deletion.)" >&2
+        echo "    None of these is described by this repo, so no template change and no content comparison can" >&2
+        echo "    reach one. DECIDE before acting — three declarations are not a deletion:" >&2
+        echo "      · a job this repo ships        → add a template under templates/launchd/" >&2
+        echo "      · another surface here owns it → templates/launchd/OWNED-BY-OTHER-INSTALLERS" >&2
+        echo "      · a job that should go away    → templates/launchd/RETIRED, which retire_pass" >&2
+        echo "                                       removes on the next install (no hand-deletion)" >&2
+        echo "      · a job nobody declares        → remove it, but ONLY after checking nothing of" >&2
+        echo "                                       yours supervises the label:" >&2
+        while IFS= read -r _lbl; do
+            [ -n "$_lbl" ] || continue
+            echo "          launchctl bootout gui/$(id -u) \"$AGENTS_DIR/$_lbl.plist\" && rm -f \"$AGENTS_DIR/$_lbl.plist\"" >&2
+        done <<<"$unmanaged"
         status_rc=1
     fi
     if [ -n "$(retired_labels)" ]; then

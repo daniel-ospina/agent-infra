@@ -3002,39 +3002,137 @@ OUT="$(run_stray_status)"; RC=$?
 set -e
 assert_eq "$RC" "0" "§18 a job the HARNESS installer owns is NOT unmanaged (no permanent red on the reference Mac)"
 assert_not_contains "$OUT" "com.eldato.orchestrator-loop" "§18 ... and is not even named as unmanaged"
+rm -f "$STRAY_HOME/Library/LaunchAgents/com.eldato.orchestrator-loop.plist"
 
-# ⛔ AND THE DECLARATION IS DRIFT-GATED, not a second hardcoded list. The exclusion above is only
-# honest while the declaring installers still install that label: read THEIR declaration and pin
-# this file to it, so a renamed controller label cannot leave a stale exemption behind.
-HARNESS_DECL="$(grep -hE '^(BASE_)?LABEL="com\.eldato\.orchestrator-loop"' \
-    "$SCRIPT_DIR/orchestrator-harness/install.sh" "$SCRIPT_DIR/orchestrator-bringup.sh" 2>/dev/null || true)"
-if [ -n "$HARNESS_DECL" ]; then
-    ok "§18 the declaring installers still name com.eldato.orchestrator-loop (the drift gate has something to check)"
-else
-    bad "§18 neither scripts/orchestrator-harness/install.sh nor scripts/orchestrator-bringup.sh declares com.eldato.orchestrator-loop — re-anchor OWNED-BY-OTHER-INSTALLERS"
-fi
-assert_contains "$(cat "$REPO_TEMPLATES/OWNED-BY-OTHER-INSTALLERS" 2>/dev/null || echo MISSING)" "com.eldato.orchestrator-loop" \
-    "§18 OWNED-BY-OTHER-INSTALLERS declares the label those installers install"
+# ⛔ TWO MORE LABELS THIS REPO INSTALLS OR ADOPTS, each found the same way (#1867 review P1, round 4).
+# The exemption list had exactly one entry, so `--status` on a box carrying either of these went RED and
+# — worse than a false alarm — printed `launchctl bootout … && rm -f …` as the remedy for a live job:
+#   · com.eldato.lane-arm          — scripts/install-lane-arm-timer.sh writes it into LaunchAgents on
+#                                    macOS; docs/ops/harness-activation.md row 12 lists it as installed
+#                                    on "both" platforms, and pi-bootstrap/setup.sh farms the installer.
+#   · com.eldato.orchestrator-stack — the supervision job a box already carries, ADOPTED by
+#                                    scripts/orchestrator-bringup.sh and the DEFAULT target of
+#                                    scripts/orchestrator-harness/watchdog-loop.sh:129. No installer
+#                                    here writes its plist, which is exactly why UNMANAGED was literally
+#                                    true for it — and why the printed delete advice was indefensible.
+# Red under the mutant that drops either entry: rc=1, the label named, the bootout line printed.
+for _owned in com.eldato.lane-arm com.eldato.orchestrator-stack; do
+    seed_stray_plist "$_owned"
+    set +e
+    OUT="$(run_stray_status)"; RC=$?
+    set -e
+    assert_eq "$RC" "0" "§18 '$_owned' is declared elsewhere in this repo — NOT unmanaged, no permanent red"
+    assert_not_contains "$OUT" "$_owned" "§18 ... and no bootout+rm advice is aimed at '$_owned'"
+    rm -f "$STRAY_HOME/Library/LaunchAgents/$_owned.plist"
+    set +e
+    OUT="$(run_stray_status)"; RC=$?
+    set -e
+    assert_eq "$RC" "0" "§18 control: removing '$_owned' leaves the box clean (the row above was not a stuck red)"
+done
 
-# ...and the gate reads EVERY entry, not one hardcoded label (#1867 review note). The manifest's own
-# header claims "every entry below still matches the declaring installer's own LABEL=/BASE_LABEL=
-# line"; grepping a single literal made that claim broader than the gate — a second entry added
-# tomorrow would have been exempted with no row to notice it. Resolve the exemption against the
-# installers in this repo, entry by entry.
-FOREIGN_ENTRIES="$(grep -vE '^[[:space:]]*(#|$)' "$REPO_TEMPLATES/OWNED-BY-OTHER-INSTALLERS" 2>/dev/null || true)"
+# ⛔ AND THE DECLARATION IS DRIFT-GATED, not a second hardcoded list, IN BOTH DIRECTIONS, and
+# against EVERY SPELLING an installer in this repo uses (#1867 review P1/P2, round 4).
+#
+# The round-3 gate asked only the STALE question — "does this exempted label still get declared?" —
+# with a regex that saw only `LABEL="com.…"` assignment lines. Both halves were wrong, and both let
+# real jobs through:
+#   · DIRECTION: an exemption list that can only drift stale cannot notice a MISSING exemption. That
+#     is the P1 this section exists for — a label the repo installs, never exempted, reported as
+#     UNMANAGED with `launchctl bootout … && rm -f …` printed as the remedy for it.
+#   · SPELLING: `install-lane-arm-timer.sh` never writes `LABEL="com.eldato.lane-arm"` — its
+#     `LABEL=eldato-lane-arm` is the SYSTEMD unit name, and the launchd label exists only as an
+#     inline plist body (`<key>Label</key><string>com.eldato.lane-arm</string>`) plus a literal
+#     `Library/LaunchAgents/com.eldato.lane-arm.plist` path. `watchdog-loop.sh` writes its label only
+#     as a `${LABEL:-com.eldato.orchestrator-stack}` default. A `LABEL=`-only grep sees NEITHER, so a
+#     reverse gate built on it would have missed the very label that motivated this.
+#
+# `installed_labels_in_repo` therefore derives the population the other way — every
+# com.eldato.*/com.tortoise.* label an installer here writes into LaunchAgents, in any of the four
+# spellings — and the rows below assert each one is a template (flat OR one dir down), RETIRED, or
+# listed in OWNED-BY-OTHER-INSTALLERS. That is the direction that reds when an entry goes missing.
+# STATED LIMIT: the two greps read LITERAL labels; a label assembled at runtime from something other
+# than `UNIT_NAME` (which is resolved below) would not be enumerated. Every label this repo installs
+# today is reached by one of the five arms — the population row below pins that `com.eldato.lane-arm`
+# is in it, so a gate that stopped seeing it cannot pass silently.
+installed_labels_in_repo() {
+    local f unit
+    for f in "$SCRIPT_DIR"/install-*.sh "$SCRIPT_DIR"/orchestrator-bringup.sh \
+             "$SCRIPT_DIR"/orchestrator-harness/install.sh \
+             "$SCRIPT_DIR"/orchestrator-harness/watchdog-loop.sh \
+             "$SCRIPT_DIR"/orchestrator-harness/launchd-cycle.sh; do
+        [ -f "$f" ] || continue
+        # ⛔ NOT A SUITE. `scripts/install-*.sh` matches this very file's siblings' fixtures —
+        # `install-launchd.test.sh` seeds `com.eldato.tccprobe` / `com.eldato.hand-installed` plists as
+        # FIXTURES, and a suite is not a declaring surface: including it made the reverse gate demand
+        # an exemption for a label that exists only inside a test's scratch home.
+        case "$f" in *.test.sh) continue ;; esac
+        # (1) LABEL="com.…" / BASE_LABEL="com.…" assignments and ${LABEL:-com.…} defaults.
+        grep -hoE '(BASE_)?LABEL="(\$\{(BASE_)?LABEL:-)?com\.(eldato|tortoise)\.[A-Za-z0-9._-]+' "$f" \
+            | grep -oE 'com\.(eldato|tortoise)\.[A-Za-z0-9._-]+' || true
+        # (2) an inline plist body — the spelling lane-arm uses and nothing else does.
+        grep -hoE '<key>Label</key><string>com\.(eldato|tortoise)\.[A-Za-z0-9._-]+</string>' "$f" \
+            | sed -E 's:.*<string>(.*)</string>:\1:' || true
+        # (3) a literal installed-plist path.
+        grep -hoE 'Library/LaunchAgents/com\.(eldato|tortoise)\.[A-Za-z0-9._-]+\.plist' "$f" \
+            | sed -E 's:.*LaunchAgents/::; s:\.plist$::' || true
+        # (4) LABEL="com.eldato.${UNIT_NAME#eldato-}" — resolved against THIS file's own UNIT_NAME=.
+        # Four installers spell it this way; none of them would be enumerated without this arm, and
+        # all four are template-backed, so leaving them out would have made the reverse gate quietly
+        # narrower than its claim.
+        if grep -qF 'com.eldato.${UNIT_NAME#eldato-}' "$f"; then
+            unit="$(grep -m1 -oE '^UNIT_NAME="eldato-[A-Za-z0-9._-]+"' "$f" | sed -E 's/.*"eldato-//; s/"$//' || true)"
+            [ -n "$unit" ] && printf 'com.eldato.%s\n' "$unit"
+        fi
+    done | LC_ALL=C sort -u
+}
+
+TEMPLATE_LABELS="$( { for _tpl in "$REPO_TEMPLATES"/*.plist "$REPO_TEMPLATES"/*/*.plist; do
+                        [ -f "$_tpl" ] || continue
+                        basename "$_tpl" .plist
+                    done; } | LC_ALL=C sort -u)"
+RETIRED_LABELS="$(grep -vE '^[[:space:]]*(#|$)' "$REPO_TEMPLATES/RETIRED" 2>/dev/null | LC_ALL=C sort -u || true)"
+FOREIGN_ENTRIES="$(grep -vE '^[[:space:]]*(#|$)' "$REPO_TEMPLATES/OWNED-BY-OTHER-INSTALLERS" 2>/dev/null | LC_ALL=C sort -u || true)"
 if [ -n "$FOREIGN_ENTRIES" ]; then
     ok "§18 OWNED-BY-OTHER-INSTALLERS has entries for the drift gate to check (not a vacuous loop)"
 else
     bad "§18 OWNED-BY-OTHER-INSTALLERS is empty — the drift rows below would prove nothing"
 fi
-DECLARED_IN_REPO="$(grep -hE '^(BASE_)?LABEL="com\.[A-Za-z0-9._-]+"' \
-    "$SCRIPT_DIR"/install-*.sh "$SCRIPT_DIR"/orchestrator-bringup.sh \
-    "$SCRIPT_DIR"/orchestrator-harness/*.sh 2>/dev/null || true)"
+
+# (A) NO ENTRY IS STALE — every exemption still has a declaring surface, in ANY spelling.
+DECLARED_IN_REPO="$(installed_labels_in_repo || true)"
+if printf '%s\n' "$DECLARED_IN_REPO" | grep -qxF 'com.eldato.lane-arm'; then
+    ok "§18 the population is read from the installers, and it includes the inline-plist label (com.eldato.lane-arm)"
+else
+    bad "§18 installed_labels_in_repo MISSED com.eldato.lane-arm — the reverse gate below would be looking at a narrower population than it claims"
+fi
 while IFS= read -r _foreign; do
     [ -n "$_foreign" ] || continue
-    assert_contains "$DECLARED_IN_REPO" "LABEL=\"$_foreign\"" \
-        "§18 the exemption '$_foreign' is still declared by an installer in this repo (not stale)"
+    if printf '%s\n' "$DECLARED_IN_REPO" | grep -qxF "$_foreign"; then
+        ok "§18 the exemption '$_foreign' still has a declaring surface in this repo (not stale)"
+    else
+        bad "§18 the exemption '$_foreign' has NO declaring installer/spelling in this repo — re-anchor OWNED-BY-OTHER-INSTALLERS"
+    fi
 done <<<"$FOREIGN_ENTRIES"
+
+# (B) NO INSTALLED LABEL IS UNDECLARED — the direction that actually does harm, because the remedy
+# `--status` prints for an undeclared label is a deletion.
+INSTALLED_IN_REPO="$(installed_labels_in_repo || true)"
+if [ -n "$INSTALLED_IN_REPO" ]; then
+    ok "§18 the reverse-direction gate has a population to check (not a vacuous loop)"
+else
+    bad "§18 installed_labels_in_repo found NO labels at all — the reverse gate below proves nothing"
+fi
+while IFS= read -r _installed; do
+    [ -n "$_installed" ] || continue
+    if printf '%s\n' "$TEMPLATE_LABELS" | grep -qxF "$_installed" \
+       || printf '%s\n' "$RETIRED_LABELS" | grep -qxF "$_installed" \
+       || printf '%s\n' "$FOREIGN_ENTRIES" | grep -qxF "$_installed"; then
+        ok "§18 '$_installed' is installed by this repo AND declared (template / RETIRED / OWNED-BY-OTHER-INSTALLERS)"
+    else
+        bad "§18 '$_installed' is installed into ~/Library/LaunchAgents by an installer in this repo but declared NOWHERE — --status would report it UNMANAGED and print a bootout+rm remedy for a live job"
+    fi
+done <<<"$INSTALLED_IN_REPO"
+
 
 # ⛔ AND A TEMPLATE ONE DIRECTORY DOWN IS STILL DECLARED (#1867 review P1). This repo ships four
 # launchd templates in SUB-directories — conflict-rebase/, harness-apply/, reaper/, runner-autoscale/
