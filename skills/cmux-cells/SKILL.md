@@ -280,8 +280,14 @@ derived first and refuses there — so it is the test seam's twin of this arm, s
 **rc=2, a read that did not resolve** (`UNREADABLE open-PR count` / `UNREADABLE landing rate` — each carries "(the gh read
 failed)"; a third line, `UNREADABLE landing counts for …`, guards counts that do not parse, but `land_backlog_lands` returns
 1 on any read failure and otherwise prints two integers it built itself, so that guard **cannot fire today** — do not
-diagnose a 74 as a parse problem) — box-local, so fixing that box's gh chain clears them and **a re-dispatch to a healthy box does clear them**, even
-though the gate prints the ratio remedy text for it too. A P0-blocker or a base-red repair is **exempt by evidence** and dispatches under the hold — **when the exemption read
+diagnose a 74 as a parse problem) — **env-local, NOT box-local, and the gate now names which cause it is.** Two arms: (a) the gh chain failed while the
+lane's gh IS credentialed — fix that box's chain; (b) **no credential at all resolved for the lane**, because nothing set
+`GH_CONFIG_DIR` while `HOME` is redirected to the cell home (agent-infra#2509) — measured on `pi-cell-4` and `pi-cell-5`,
+**byte-identical refusals**, so **a re-dispatch to another healthy box does NOT clear it**: every cell redirects `HOME` the
+same way. Since #2509 `spawn-gate.sh` resolves the config dir BEFORE the gate (`gh-auth.sh`: `GH_CONFIG_DIR`, then
+`$XDG_CONFIG_HOME/gh`, then the lane's `keys.env`, then the ACCOUNT home's `~/.config/gh`, per gh's own documented order) and
+the refusal prints the CREDENTIAL remedy instead of the ratio one when that is the cause — do not act on `land/fix the open
+PRs` for it. If it still refuses, read the lane's `[gh-auth] state=…` line against `gh auth status` under the lane's `HOME`. A P0-blocker or a base-red repair is **exempt by evidence** and dispatches under the hold — **when the exemption read
 itself succeeds**; on the rc=2 arm it fails with the same gh chain, so a P0 *is* held until the chain is fixed (the
 gate's refusal line says so). **Idling on its own changes none of them**: for 73
 and 77 the release *is* a lane draining, so the drain has to actually complete rather than just pass time — which is why the
