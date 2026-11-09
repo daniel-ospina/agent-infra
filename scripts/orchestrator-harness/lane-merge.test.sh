@@ -1451,9 +1451,12 @@ ck "a NEW fix round also clears apiretry / headmoved / lastdisp (a stale disposi
 # These arms pin both halves of the fix: the heartbeat the watchdog needs, and the self-cap that keeps an
 # unhearted wait from out-reaching the bound that would kill the lane UNLABELLED (`lane.sh`'s
 # "NO merge-phase verdict", no PR comment, no resumable counter) — strictly worse than the 1500 s bound.
+# ⛔ THE THIRD CLAUSE IS ANCHORED TO CODE, NOT TO PROSE (review round 3, P3 — verified): `grep heartbeat`
+# matched a dozen COMMENTS and therefore could not fail with the runtime block deleted. It now matches the
+# append that actually produces the signal.
 ck "the check wait is bounded by the WATCHDOG's progress allowance too, not only by this file's clock (the measured 2700 s idle bound is named, and an unhearted wait CAPS itself instead of out-reaching it)" \
    $(grep -q 'LANE_BOUND_IDLE_S:-2700' "$SCRIPT" && grep -q 'the check wait is CAPPED at' "$SCRIPT" \
-     && grep -q 'heartbeat' "$SCRIPT" && echo 0 || echo 1)
+     && grep -q '>> "$HB_F"' "$SCRIPT" && echo 0 || echo 1)
 # (1) the heartbeat the watchdog reads. Pre-fix this file wrote NOTHING: `log_line` is stdout, and a `-p`
 # lane's stdout reaches no log, so the wait was silent for its whole length.
 new_o "$T/pr4.tsv"
@@ -1532,6 +1535,16 @@ OUT="$(PATH="$BIN:$PATH" GH_LOG="$T/gh.log" O="$OT" HOME="$T/home" LANE_MERGE_IN
       bash "$SCRIPT" 99 --status 2>&1)"; RC=$?
 ck "--status emits NOTHING but the verdict record even when the cap conditions hold (no cap chatter on a read-only query, got: $(printf '%s' "$OUT" | tr '\n' '|'))" \
    $([ "$RC" = 0 ] && ! grep -q 'CAPPED at' <<<"$OUT" && echo 0 || echo 1)
+
+# ⛔ THE RE-INVOCATION PATH (review round 3, P2 — verified): the documented resume omits `--issue` and
+# recovers it from `$O/state/lanemerge-<pr>.issue`. Resolving the heartbeat target BEFORE that recovery
+# found no `lane-<issue>.log`, capped the wait to `IDLE_BOUND_S - margin` and left the wall clamp inert.
+new_o "$T/pr4.tsv"
+printf '44\n' > "$OT/state/lanemerge-44.issue"
+: > "$OT/logs/lane-44.log"
+WAIT_S=6 POLL_S=5 LANE_BOUND_IDLE_S=5 run 44 --repo o/r --pr-tsv "$T/pr4.tsv" --checks-tsv "$T/checks-inflight.tsv"
+ck "a re-invocation with NO --issue resolves the issue from its state file BEFORE it looks for a heartbeat target — so it gets the lane's own log and the FULL wait, not a silent 2660 s cap" \
+   $([ "$RC" = 11 ] && grep -q '\[lane-merge\] heartbeat' "$OT/logs/lane-44.log" && ! grep -q 'CAPPED at' <<<"$OUT" && echo 0 || echo 1)
 
 # ── 19. an EMPTY PR read must not blank the head or read as merged (E7) ────────────────────────
 new_o "$T/pr25.tsv"

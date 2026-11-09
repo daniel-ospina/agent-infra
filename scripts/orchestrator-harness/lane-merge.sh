@@ -321,41 +321,6 @@ HB_F="${LANE_MERGE_HB:-}"
 # whether a log file happened to exist (7 chunks with a heartbeat, 30 without), and the documented
 # arithmetic row would describe only one of the two worlds.
 WAIT_S_DESIGN="$WAIT_S"
-if [ -z "$HB_F" ]; then
-  if [ -n "${ISSUE:-}" ] && [ -f "$O/logs/lane-$ISSUE.log" ]; then HB_F="$O/logs/lane-$ISSUE.log"
-  elif [ -f "$O/logs/fix-$PR.log" ]; then HB_F="$O/logs/fix-$PR.log"
-  fi
-fi
-# The watchdog's allowance, resolved the way `lane-bound.sh` resolves it. This script is never handed the
-# flag, so env → default is the whole chain here — and the default is THEIRS, not a second copy of it.
-# ⛔ THE RESIDUAL, MEASURED RATHER THAN ASSUMED: the heartbeat only counts if it lands in the file the
-# watchdog is watching (`--log`), and the mirror above only sees env → default. MEASURED 2026-11-09 —
-# `--idle 60` passed as a FLAG (invisible to this mirror) left the cap inert; and a heartbeat written to
-# a file OTHER than `--log` left `bytes_delta=0` and the lane was still killed as `stalled` (8 heartbeat
-# lines written, none of them read). Both are safe, not silent: the first because spawn-gate passes no
-# `--idle` (the leg this mirrors), the second because the cap fires when discovery finds nothing. The
-# one path that can still be wrong is a caller passing `--log` somewhere OTHER than the two discovered
-# paths AND `--idle` explicitly — it gets neither arm, and this line is why that is a known edge rather
-# than an oversight.
-IDLE_BOUND_S="${LANE_BOUND_IDLE_S:-2700}"; is_limit "$IDLE_BOUND_S" || IDLE_BOUND_S=2700
-# Two polls of headroom, so the first heartbeat lands before the bound can fire; floored so a tiny
-# LANE_MERGE_INTERVAL cannot make the cap degenerate.
-_hb_margin=$(( INTERVAL * 2 )); [ "$_hb_margin" -ge 10 ] || _hb_margin=10
-# ⛔ THIS IS A RUNTIME LIMIT ON A REAL WAIT, SO `--status` MUST NOT PAY FOR IT (review finding, P3 —
-# verified). `--status` is documented "no network, no writes" and exits at :452, BELOW this block, so on
-# the pre-fix tree a read-only status query emitted the cap's multi-line `say_err` about a wait it was
-# never going to sit through. Nothing here can change a `--status` answer, so it does not run for one.
-if [ "$STATUS" -eq 0 ] && [ -z "$HB_F" ] && [ "$IDLE_BOUND_S" -gt 0 ] && [ "$WAIT_S" -ge "$IDLE_BOUND_S" ]; then
-  # ⛔ THE ALLOWANCE IS AN UPPER BOUND, AND THE OLD FLOOR MADE IT A LOWER ONE (review finding, P3 —
-  # verified by arithmetic). `[ "$WAIT_S" -ge "$POLL_S" ] || WAIT_S="$POLL_S"` RAISED the capped wait
-  # back to one poll chunk whenever the allowance was SMALLER than a chunk — with
-  # `LANE_BOUND_IDLE_S=120` and the shipped 120 s poll that is `WAIT_S=120 >= 120`, i.e. the "cap"
-  # lands ON the bound it exists to stay strictly under and the guard stops guarding. The floor is 0
-  # now: a wait of 0 is a labelled hand-off on the first poll, which is the right answer when the
-  # allowance cannot fit one (the loop's own `[ "$now" -ge "$deadline" ]` test terminates it).
-  WAIT_S=$(( IDLE_BOUND_S - _hb_margin )); [ "$WAIT_S" -ge 0 ] || WAIT_S=0
-  say_err "lane-merge: no watchdog-visible heartbeat target (nothing at \$O/logs/lane-${ISSUE:-<issue>}.log or \$O/logs/fix-$PR.log, and LANE_MERGE_HB is unset) — the check wait is CAPPED at ${WAIT_S}s, below lane-bound.sh's ${IDLE_BOUND_S}s progress allowance. An uncapped wait would be killed as 'stalled' before it could write its hand-off verdict (#3584 review, P1). Set LANE_MERGE_HB, or run the lane with --issue, to get the full wait."
-fi
 # ── how much of the LANE's wall clock is already spent ────────────────────────────────────────────
 # ⛔ THE WAIT NEEDS THIS AND MUST NOT GUESS IT (#3584 review, P1 — see the clamp at the deadline).
 # `run_agent` arms `lane-bound.sh`'s WALL ceiling around the lane's `pi` with `LANE_BACKSTOP_S`, so the
@@ -522,6 +487,49 @@ fi
 # Persist the key on the first round; re-read it when a later invocation was not given one.
 [ -n "${ISSUE:-}" ] && printf '%s\n' "$ISSUE" > "$O/state/lanemerge-$PR.issue" 2>/dev/null
 [ -z "${ISSUE:-}" ] && ISSUE="$(cat "$O/state/lanemerge-$PR.issue" 2>/dev/null || true)"
+# ⛔ AND THIS BLOCK RUNS **AFTER** THE ISSUE IS RECOVERED, NOT AT MODULE SCOPE (review round 3, P2 —
+# verified). `ISSUE` is not always given on the command line: the documented RE-INVOCATION path — the
+# one the PR names as the remaining step between a green PR and `merged` — omits `--issue` and recovers
+# it from `$O/state/lanemerge-<pr>.issue` a few lines above. Resolving the heartbeat target before that
+# recovery found no `lane-<issue>.log`, silently capped the wait to `IDLE_BOUND_S - margin` (2660 s,
+# BELOW the measured lane-visible median of 4062 s) and made the wall clamp inert (no issue -> no run
+# token). The cap is still a RUNTIME limit, so `WAIT_S_DESIGN` above keeps the supervision invariant's
+# operand and neither value can feed back into it.
+if [ -z "$HB_F" ]; then
+  if [ -n "${ISSUE:-}" ] && [ -f "$O/logs/lane-$ISSUE.log" ]; then HB_F="$O/logs/lane-$ISSUE.log"
+  elif [ -f "$O/logs/fix-$PR.log" ]; then HB_F="$O/logs/fix-$PR.log"
+  fi
+fi
+# The watchdog's allowance, resolved the way `lane-bound.sh` resolves it. This script is never handed the
+# flag, so env → default is the whole chain here — and the default is THEIRS, not a second copy of it.
+# ⛔ THE RESIDUAL, MEASURED RATHER THAN ASSUMED: the heartbeat only counts if it lands in the file the
+# watchdog is watching (`--log`), and the mirror above only sees env → default. MEASURED 2026-11-09 —
+# `--idle 60` passed as a FLAG (invisible to this mirror) left the cap inert; and a heartbeat written to
+# a file OTHER than `--log` left `bytes_delta=0` and the lane was still killed as `stalled` (8 heartbeat
+# lines written, none of them read). Both are safe, not silent: the first because spawn-gate passes no
+# `--idle` (the leg this mirrors), the second because the cap fires when discovery finds nothing. The
+# one path that can still be wrong is a caller passing `--log` somewhere OTHER than the two discovered
+# paths AND `--idle` explicitly — it gets neither arm, and this line is why that is a known edge rather
+# than an oversight.
+IDLE_BOUND_S="${LANE_BOUND_IDLE_S:-2700}"; is_limit "$IDLE_BOUND_S" || IDLE_BOUND_S=2700
+# Two polls of headroom, so the first heartbeat lands before the bound can fire; floored so a tiny
+# LANE_MERGE_INTERVAL cannot make the cap degenerate.
+_hb_margin=$(( INTERVAL * 2 )); [ "$_hb_margin" -ge 10 ] || _hb_margin=10
+# ⛔ THIS IS A RUNTIME LIMIT ON A REAL WAIT, SO `--status` MUST NOT PAY FOR IT (review finding, P3 —
+# verified). `--status` is documented "no network, no writes" and exits at :452, BELOW this block, so on
+# the pre-fix tree a read-only status query emitted the cap's multi-line `say_err` about a wait it was
+# never going to sit through. Nothing here can change a `--status` answer, so it does not run for one.
+if [ "$STATUS" -eq 0 ] && [ -z "$HB_F" ] && [ "$IDLE_BOUND_S" -gt 0 ] && [ "$WAIT_S" -ge "$IDLE_BOUND_S" ]; then
+  # ⛔ THE ALLOWANCE IS AN UPPER BOUND, AND THE OLD FLOOR MADE IT A LOWER ONE (review finding, P3 —
+  # verified by arithmetic). `[ "$WAIT_S" -ge "$POLL_S" ] || WAIT_S="$POLL_S"` RAISED the capped wait
+  # back to one poll chunk whenever the allowance was SMALLER than a chunk — with
+  # `LANE_BOUND_IDLE_S=120` and the shipped 120 s poll that is `WAIT_S=120 >= 120`, i.e. the "cap"
+  # lands ON the bound it exists to stay strictly under and the guard stops guarding. The floor is 0
+  # now: a wait of 0 is a labelled hand-off on the first poll, which is the right answer when the
+  # allowance cannot fit one (the loop's own `[ "$now" -ge "$deadline" ]` test terminates it).
+  WAIT_S=$(( IDLE_BOUND_S - _hb_margin )); [ "$WAIT_S" -ge 0 ] || WAIT_S=0
+  say_err "lane-merge: no watchdog-visible heartbeat target (nothing at \$O/logs/lane-${ISSUE:-<issue>}.log or \$O/logs/fix-$PR.log, and LANE_MERGE_HB is unset) — the check wait is CAPPED at ${WAIT_S}s, below lane-bound.sh's ${IDLE_BOUND_S}s progress allowance. An uncapped wait would be killed as 'stalled' before it could write its hand-off verdict (#3584 review, P1). Set LANE_MERGE_HB, or run the lane with --issue, to get the full wait."
+fi
 printf '%s %s\n' "${ISSUE:-}" "$(date +%s)" > "$PHASE_F" 2>/dev/null || true
 
 # ── the two reads (injectable) ───────────────────────────────────────────────────────────────────
