@@ -390,11 +390,56 @@ if need "$LOOP" "the shipped orch-loop.sh"; then
   grep -q '^export O_WORK$' "$LOOP" \
     && ck "§7 the harness root is EXPORTED as O_WORK (workers resolve their modules from it)" 0 \
     || ck "§7 O_WORK is not exported — a worker on a state-dir instance loses claims and the merge contract" 1
-  for _w in fix-one.sh merge-one.sh; do
-    grep -q '_FIX_MOD_DIR\|_M1_MOD' "$HERE/$_w" 2>/dev/null \
-      && ck "§7 $_w prefers \$O_WORK for its own modules" 0 \
-      || ck "§7 $_w resolves its modules from \$O alone — it loses them on a state-dir instance" 1
+  # ⛔ EVERY WORKER RESOLVES ITS **CODE** FROM THE WORK ROOT, NOT FROM `$O` (#3846 review, P1). `$O` is
+  # the STATE dir, so a script path built from it cannot exist on the documented `ORC_STATE_DIR`
+  # arrangement. Each file carries ONE `_X_WORK="${O_WORK:-$O}"` line, DRIVEN here rather than grepped
+  # for by name — so a revert to `_X_WORK="$O"` reddens instead of still matching a variable name.
+  for _w in chain-merge.sh dispatch-merge.sh stall-fix.sh refresh-candidates.sh nonblocking-dispatch.sh; do
+    _wkline="$(grep -m1 -E '^_[A-Z][A-Z_]*_WORK="\$\{O_WORK:-\$O\}"' "$HERE/$_w" 2>/dev/null)"
+    if [ -z "$_wkline" ]; then
+      ck "§7 $_w declares a work root (\${O_WORK:-\$O})" 1
+      continue
+    fi
+    _wkvar="${_wkline%%=*}"
+    outw="$(O=/state-dir O_WORK=/work-root bash -c 'set -u; eval "$1"; eval "printf %s \"\${$2}\""' _ "$_wkline" "$_wkvar" 2>&1)"
+    [ "$outw" = "/work-root" ] \
+      && ck "§7 $_w takes its work root from O_WORK when the controller exports it" 0 \
+      || ck "§7 $_w resolved its work root as '$outw' — a script path built from \$O cannot exist on a state-dir instance" 1
+    outw2="$(env -u O_WORK O=/state-dir bash -c 'set -u; eval "$1"; eval "printf %s \"\${$2}\""' _ "$_wkline" "$_wkvar" 2>&1)"
+    [ "$outw2" = "/state-dir" ] \
+      && ck "§7 $_w still uses \$O when O_WORK is unset (a hand-started worker is unchanged)" 0 \
+      || ck "§7 $_w changed behaviour for a caller that never set O_WORK — got '$outw2'" 1
   done
+  # ⛔ AND NO CODE PATH IS STILL BUILT FROM `$O`. The review named these five sites; each pair is
+  # "the old resolution must be GONE" + "the work-root one must be THERE", so deleting the fix reddens
+  # the first arm and a half-applied fix reddens the second.
+  while IFS='|' read -r _f _bad _good; do
+    [ -n "$_f" ] || continue
+    if grep -qF -- "$_bad" "$HERE/$_f" 2>/dev/null; then
+      ck "§7 $_f still resolves CODE from \$O ('$_bad') — that path cannot exist on a state-dir instance" 1
+    elif grep -qF -- "$_good" "$HERE/$_f" 2>/dev/null; then
+      ck "§7 $_f resolves that code from the work root ('$_good')" 0
+    else
+      ck "§7 $_f names NEITHER the old nor the work-root resolution — expected '$_good'" 1
+    fi
+  done <<'PAIRS'
+fix-one.sh|bash "$O/merge-one.sh"|bash "$_FIX_MOD_DIR/merge-one.sh"
+chain-merge.sh|bash "$O/merge-one.sh"|bash "$_CM_WORK/merge-one.sh"
+dispatch-merge.sh|bash '$O/lane.sh'|bash '$_DM_WORK/lane.sh'
+stall-fix.sh|DISP="$O/nonblocking-dispatch.sh"|DISP="$_SF_WORK/nonblocking-dispatch.sh"
+merge-one.sh|if [ -n "${HEAD:-}" ] && [ -f "$O/claims.sh" ]; then|if [ -n "${HEAD:-}" ] && [ -f "$_M1_MOD/claims.sh" ]; then
+PAIRS
+  # ⛔ AND THE DISPATCH ARM MUST READ THE SAME HOME THE SWEEP LOADED. It tested `$O/claims.sh` while the
+  # sweep sourced `$_claims_home`, so on a state-dir instance the registry was LOADED and the guard
+  # said absent — no issue claim was taken, and the refusal named a remedy that cannot help.
+  grep -q '\[ -n "${_claims_home:-}" \] && declare -f claim_issue_acquire' "$LOOP" \
+    && ck "§7 the DISPATCH arm takes its issue claim from the same two-home resolution as the sweep" 0 \
+    || ck "§7 the dispatch arm still tests \$O/claims.sh — the registry is loaded and the guard calls it absent" 1
+  # ⛔ AND THE SPAWN GATE'S FORK FLOOR IS NOT SILENTLY OFF. Its resolver searched `$O` (now the STATE
+  # dir) and "beside me" (no harness for the installed `pi` shim), so the work root has its own name.
+  grep -q '"${O_WORK:-}"' "$HERE/spawn-gate.sh" \
+    && ck "§7 spawn-gate searches the work root for capacity.sh (its fork floor is not silently off)" 0 \
+    || ck "§7 spawn-gate does not search O_WORK — on a state-dir instance its fork floor is silently OFF" 1
 fi
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
