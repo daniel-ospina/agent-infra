@@ -2990,6 +2990,232 @@ export interface HeartbeatKillDecision {
    * true iff the kill fired and no REAL output ever arrived (#5926 retry
    * preservation). */
   resolveUndefined: boolean;
+  /** #1339: the marker age THIS DECISION was taken on (ms; `-1` = no marker),
+   * snapshotted exactly like `progressAgeMs` and `toolCpuStallMs` above.
+   *
+   * The kill path is not instantaneous: the #318 network probe is awaited
+   * BEFORE the kill runs (default ON, timeout up to 9 s), and every `await`
+   * yields the event loop, which is where the child's `data` handlers run. So
+   * a marker can land between this decision and the headline that describes it.
+   * Reading `lastMarkerAt` again after the await made the payload contradict
+   * its own verdict — measured: `no life signs for -1s (marker gap exceeded
+   * 113s)` with `lastMarkerAgeMs=-532`, load1=190.62 (#1339). The headline
+   * therefore prints THIS value, and the loop re-validates it before killing. */
+  markerAgeMs?: number;
+  /** #1339 review P2: the DECISION's `readMarkerAge().invalid`, so the kill
+   * payload can distinguish a CLAMPED age from a genuinely fresh marker (#1339
+   * exists because a negative age made this bug unreadable; a clamp that prints
+   * an indistinguishable `0` would repeat it one layer in). This is the caller
+   * that reports the flag (see `MarkerAgeReading.invalid` for why the
+   * completion/backstop payloads do not). */
+  markerAgeInvalid?: boolean;
+}
+
+/**
+ * #1339 — THE reader for the marker age. Every decision, headline and
+ * diagnostic goes through it so a nonsensical age can never be printed or
+ * compared against a threshold.
+ *
+ * Two pieces of invalid input, handled differently and deliberately:
+ *
+ *  · `lastMarkerAt <= 0` — no marker was ever parsed. `-1` is a SENTINEL
+ *    meaning "never", never an age; the clauses express the condition with
+ *    `stateFresh` (which requires `lastMarkerAt > 0`), not with this number.
+ *  · `lastMarkerAt > now` — the marker timestamp is in the FUTURE of the clock
+ *    the caller captured. This is not "negative silence": it happens whenever
+ *    a marker is ingested after `now` was snapshot and before the age is read
+ *    — i.e. inside the awaited kill path (`probeNetwork`), or across any other
+ *    yield. Measured on a live cut: `lastMarkerAgeMs=-532` beside `no life
+ *    signs for -1s` (`retry`-class false kill, load1=190.62). A threshold
+ *    comparison against a negative age is meaningless, so the age is clamped
+ *    to 0 and `invalid` is reported for the caller to log.
+ *
+ * Clamping here does NOT contradict #1070's "warn, never clamp" rule: that
+ * rule protects an operator's BOUND (`stream_stall_ms`, the cut gap) from being
+ * silently rescaled. This clamps a MEASUREMENT that has no valid value, and it
+ * clamps toward "no evidence of silence", the fail-safe direction — a child is
+ * never killed on an age the parent could not compute.
+ */
+export interface MarkerAgeReading {
+  /** ms since the last parsed marker; `-1` = never (sentinel); `0` when the
+   * raw difference was negative (invalid input, clamped). */
+  ageMs: number;
+  /** True iff a marker timestamp lay in the future of `now` and was clamped.
+   *
+   * Reported on the TICK-KILL payload (`decMarkerAgeInvalid=` /
+   * `lastMarkerAgeInvalid=`), which is the one reader taken after an `await`
+   * (`probeNetwork`) and therefore the only place a marker ingested inside that
+   * window can make a live read clamp. The completion/backstop payloads read
+   * `.ageMs` only and take `now` AT the read: a future timestamp there implies a
+   * WALL-CLOCK step backwards, which the decision's own flag already reports
+   * (#1339 review-6, P3 — stated here so the narrower reporting is a decision
+   * on the record, not an omission to re-discover). */
+  invalid: boolean;
+}
+
+export function readMarkerAge(lastMarkerAt: number, now: number): MarkerAgeReading {
+  if (!(lastMarkerAt > 0)) return { ageMs: -1, invalid: false };
+  const raw = now - lastMarkerAt;
+  if (raw < 0) return { ageMs: 0, invalid: true };
+  return { ageMs: raw, invalid: false };
+}
+
+/**
+ * #1339 — is the kill decision STALE?
+ *
+ * True iff either liveness channel observed something AFTER the instant the
+ * decision was computed (`snapshotAt`): a parsed heartbeat marker, or any real
+ * output byte (`lastLifeSignAt`, which the stdout handler and every stderr
+ * chunk advance). The decision is an inference that the child is not making
+ * progress; evidence stamped after the snapshot contradicts that premise, so
+ * the verdict must not be executed.
+ *
+ * WHY THIS EXISTS AT ALL. `heartbeatKillDecision` is pure and its inputs are a
+ * snapshot, but the kill path is not: the #318 network probe is awaited
+ * (default ON, `networkProbeTimeoutMs` up to 9 s) between the decision and
+ * `killTreeAndEscalate()`. Every `await` yields the event loop, and that is
+ * exactly where the child's `data` handlers run — so the child could prove
+ * itself alive and be killed a millisecond later on the superseded verdict.
+ * Measured (#1339 re-measurement on this box, session `01a1a95c`): the child
+ * emitted markers during the probe (`lastMarkerAgeMs=-532`) while the harness
+ * cut it for "no life signs for 951s". The pre-existing `settled`/`exitCode`
+ * re-check after the await guards the SAME window for the promise's state and
+ * simply never asked whether the EVIDENCE had moved.
+ *
+ * This can only ever DELAY a kill, never cause one. It also cannot delay it
+ * forever, but the honest bound is NOT "one tick": the suppression repeats for
+ * exactly as long as the child keeps producing evidence newer than each tick's
+ * OWN snapshot, and the byte channel never goes quiet on its own — a grandchild
+ * (MCP server) inherits the child's fd 2, so `onLifeSign` fires on ITS stderr
+ * too (a pre-existing property of that channel, `ingestHeartbeatChunk`, not of
+ * this guard). A suppressed clause is therefore bounded by the clause's own
+ * bound and, as the last resort, `TASK_HARD_CAP_MS` — not by the guard. What
+ * cannot happen is a kill executed on a verdict the child has already refuted.
+ *
+ * This predicate is the MARKER + BYTE half only. A clause whose own clock is
+ * neither of those must be asked about ITS clock — see `supersedingEvidence`,
+ * which is what the kill path actually calls.
+ */
+export function decisionSnapshotStale(
+  snapshotAt: number,
+  lastMarkerAt: number,
+  lastLifeSignAt: number,
+): boolean {
+  return lastMarkerAt > snapshotAt || lastLifeSignAt > snapshotAt;
+}
+
+/** The evidence channel that superseded a kill verdict, named so the operator
+ * log can print the one delta that is real (#1339 review). The last two are
+ * SCOPE changes rather than clocks: they make a clause inapplicable without any
+ * timed quantity moving. */
+export type SupersedingChannel =
+  | "marker"
+  | "bytes"
+  | "progress"
+  | "session-end"
+  | "tool-in-flight";
+
+/**
+ * #1339 (review) — WHICH clock displaced this verdict, if any.
+ *
+ * For the ONE clause whose clock is not a function of marker/byte arrival, the
+ * guard asks about that clause's own clock: `no-progress` is the clause where
+ * that matters, because its binding rule is that the clock is
+ * `lastProgressAt`, which advances ONLY on a completed unit of work — "ticks
+ * and turn boundaries do NOT advance it, so a child that keeps emitting them
+ * while completing nothing cannot reset this bound — the property no other
+ * clause has" (`heartbeatKillDecision`, the `no-progress` clause). A tick
+ * marker or a stray stderr byte landing inside the awaited probe window sets
+ * `lastMarkerAt`/`lastLifeSignAt` and leaves `lastProgressAt` untouched, so
+ * asking the marker/byte question would restore exactly the reset that clause
+ * exists to deny — the content-free loop / drip stream would survive to the
+ * hard cap. It is asked about progress instead, which is still the fail-safe
+ * direction: real work completing inside the window DOES disprove the verdict,
+ * and suppresses it.
+ *
+ * Returns `null` for "the verdict still stands". `max-dispatch` is exempt at
+ * the call site (a wall-clock policy cap is not an inference about progress, so
+ * no new evidence makes the dispatch younger) and is not handled here.
+ *
+ * ⛔ `no-progress` is NOT just "a different clock" — it also has two SCOPE
+ * gates that can flip inside the awaited window with `lastProgressAt`
+ * untouched, and the clause returns `kill: false` for both at that same
+ * instant (`heartbeatKillDecision`):
+ *
+ *  · `state.sessionEnded` — the `#191` early return, "no stall/silence clause
+ *    may race it and misclassify completed work as a partial-result kill". A
+ *    `session_end` marker sets it (and `lastMarkerAt`) but never touches
+ *    `lastProgressAt`.
+ *  · `state.toolsInFlight > 0` — the clause's declared SCOPE: an in-flight tool
+ *    is a DECLARED long operation owned by the tool clauses. `tool_start` sets
+ *    it, and again never touches `lastProgressAt`.
+ *
+ * Missing them is not a policy trade — the policy ("a wedge with no completed
+ * unit of work") is simply unreachable for an ended session or a running tool,
+ * so a kill executed here would contradict the clause's own gate at that very
+ * instant, and for `session_end` it would discard finished work as a
+ * partial-result kill (#1339 cycle-2 review, reproduced).
+ */
+export function supersedingEvidence(
+  reason: HeartbeatKillReason | undefined,
+  snapshotAt: number,
+  channels: {
+    lastMarkerAt: number;
+    lastLifeSignAt: number;
+    lastProgressAt: number;
+    startedAt: number;
+    /** `state.sessionEnded` at re-validation time (#191 scope gate). */
+    sessionEnded: boolean;
+    /** `state.toolsInFlight` at re-validation time (the clause's scope gate). */
+    toolsInFlight: number;
+  },
+): SupersedingChannel | null {
+  if (reason === "no-progress") {
+    // The clause's OWN gates first, strongest first — see the docblock.
+    if (channels.sessionEnded) return "session-end";
+    if (channels.toolsInFlight > 0) return "tool-in-flight";
+    // Same anchor the clause itself uses (`lastProgressAt > 0 ? … : startedAt`),
+    // so "advanced" means the very quantity the clause measured has moved.
+    const anchor = channels.lastProgressAt > 0 ? channels.lastProgressAt : channels.startedAt;
+    return anchor > snapshotAt ? "progress" : null;
+  }
+  if (!decisionSnapshotStale(snapshotAt, channels.lastMarkerAt, channels.lastLifeSignAt)) {
+    return null;
+  }
+  // Name the channel that actually fired, so a log line can never print a
+  // negative delta for a channel that did not move (#1339 review: the first
+  // version printed `marker +-45123ms` when only bytes had arrived).
+  //
+  // ⛔ This branch is where the "ask the clause's OWN clock" rule STOPS, and the
+  // scope is deliberate rather than an omission. The reasons that reach here
+  // fall into three groups, and the marker/byte question is the right one for
+  // each — stated per group, because a blanket rule would be false for some of
+  // them (#1339 cycle-4 review: the earlier "each is gated on `stateFresh` or on
+  // byte-arrival" covered `zero-output` only by accident and mis-described the
+  // age clauses):
+  //  · `silence-threshold` decides on `now - lastLifeSignAt`, which IS the byte
+  //    clock — a byte or a marker refutes it OUTRIGHT, so the question is the
+  //    clause's own.
+  //  · `cut` decides on `markerAge` — a fresh marker refutes it OUTRIGHT too.
+  //  · `zero-output` is NOT `stateFresh`-gated: it fires on ABSENCE latches
+  //    (`!hasOutput`, `!everSawWork`, `!sawReady`, past tier-1). A marker proves
+  //    the child is running, and a `tick` marker sets none of those latches, so
+  //    here the channel refutes a premise the clause does not measure directly.
+  //    Still FAIL-SAFE: the child re-decides and is caught by
+  //    `silence-threshold` at T, or by `TASK_HARD_CAP_MS`.
+  //  · the AGE clauses (`stream-stall`, `tool-stall`, `tool-silence`,
+  //    `tool-dead`, `first-message-stall`) are `stateFresh`-gated and decide on
+  //    `effStreamAge`/`effToolAge` = the child's frozen sample + `markerAge`, so
+  //    a fresh marker NARROWS the decided age rather than refuting it. Those are
+  //    therefore the clauses whose own bound can be deferred for as long as
+  //    markers keep landing inside the probe window; their backstop is
+  //    `TASK_HARD_CAP_MS`, NOT their own bound (defeating that bound is what the
+  //    suppression does). Comparing those ages against live values is a tracked
+  //    follow-up (agent-infra#3814), not something this branch should start doing
+  //    without its own test.
+  // Suppressing is the FAIL-SAFE direction throughout: a live child is not
+  // killed, and the clause re-decides on the next tick.
+  return channels.lastMarkerAt > snapshotAt ? "marker" : "bytes";
 }
 
 export interface HeartbeatDecisionInput {
@@ -3139,10 +3365,18 @@ export function inFlightProgress(
 export function heartbeatKillDecision(
   i: HeartbeatDecisionInput,
 ): HeartbeatKillDecision {
+  const st = i.state;
+  // #1339: ONE clamped read, taken before the first clause, so every kill below
+  // carries the age it was actually decided on (`markerAgeMs`) and no clause or
+  // headline can ever consume a negative age. See `readMarkerAge` for why a
+  // future timestamp is invalid input rather than "negative silence".
+  const ageReading = readMarkerAge(st.lastMarkerAt, i.now);
   const kill = (reason: HeartbeatKillReason): HeartbeatKillDecision => ({
     kill: true,
     reason,
     resolveUndefined: !i.hasOutput,
+    markerAgeMs: ageReading.ageMs,
+    markerAgeInvalid: ageReading.invalid,
   });
 
   // #191: the child declared the session complete (session_end marker) — the
@@ -3174,8 +3408,7 @@ export function heartbeatKillDecision(
     return kill("zero-output");
   }
 
-  const st = i.state;
-  const markerAge = st.lastMarkerAt > 0 ? i.now - st.lastMarkerAt : 0;
+  const markerAge = ageReading.ageMs < 0 ? 0 : ageReading.ageMs;
   const stateFresh =
     st.lastMarkerAt > 0 &&
     markerAge <= Math.max(2 * i.heartbeatTimeoutMs, 2 * i.intervalMs);
@@ -4651,7 +4884,7 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
         doResolve(undefined, { sweep: true, reason: "hard-cap" });
         return;
       }
-      const markerAgeMs = hbCtx.state.lastMarkerAt > 0 ? Date.now() - hbCtx.state.lastMarkerAt : -1;
+      const markerAgeMs = readMarkerAge(hbCtx.state.lastMarkerAt, Date.now()).ageMs;
       doResolve(composeAbnormalExit(
         { model, provider, killed: true, reason: "hard-cap", hardCapMs: getTaskHardCapMs() },
         {
@@ -4752,7 +4985,9 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
         // #271 cut composition (F10): resolveUndefined = !hasOutput — a
         // zero-partial cut stays retryable by the retry wrapper, mirroring
         // the kill-clause contract.
-        const markerAgeMs = hbCtx.state.lastMarkerAt > 0 ? Date.now() - hbCtx.state.lastMarkerAt : -1;
+        // #1339: clamped through the one reader — this composition runs on the
+        // EXIT path, where the last `now` may already be stale.
+        const markerAgeMs = readMarkerAge(hbCtx.state.lastMarkerAt, Date.now()).ageMs;
         const aliveSummary = `Alive state: toolsInFlight=${hbCtx.state.toolsInFlight} turnActive=${hbCtx.state.turnActive} streamAgeMs=${hbCtx.state.streamAgeMs} effStreamAgeMs=${hbCtx.state.streamAgeMs + (markerAgeMs > 0 ? markerAgeMs : 0)} toolAgeMaxMs=${hbCtx.state.toolAgeMaxMs} effToolAgeMs=${hbCtx.state.toolAgeMaxMs + (markerAgeMs > 0 ? markerAgeMs : 0)} toolCpuMs=${hbCtx.state.toolCpuMs} toolCpuStallMs=${hbCtx.state.toolCpuStallMs} toolCpuAdvanced=${hbCtx.state.toolCpuAdvanced} everSawRealActivity=${hbCtx.state.everSawRealActivity} lastMarkerAgeMs=${markerAgeMs} tickCount=${hbCtx.state.tickCount} markerCount=${hbCtx.state.markerCount} firstMarkerLagMs=${hbCtx.state.firstMarkerAt > 0 ? hbCtx.state.firstMarkerAt - startedAt : -1} firstTickLagMs=${hbCtx.state.firstTickAt > 0 ? hbCtx.state.firstTickAt - startedAt : -1} firstActivityLagMs=${hbCtx.state.firstActivityAt > 0 ? hbCtx.state.firstActivityAt - startedAt : -1} everSawMsg=${hbCtx.state.everSawMsg} everSawTool=${hbCtx.state.everSawTool} toolsMaxInFlight=${hbCtx.state.toolsMaxInFlight} trace=[${hbCtx.state.activityTrace.join(",")}] ${repoStateText()} ${machineStateText()}`;
         const headline = "⚠️ Sub-agent was cut — process exited mid-tool / no life signs. Partial results below — parent should decide: accept, re-dispatch, or escalate.";
         doResolve(
@@ -4806,6 +5041,17 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
     // condition is per-dispatch, not per-tick — an unlatched warn would spam
     // every 10s decision tick).
     let cutInertWarned = false;
+    // #1339: rate-limited log for the stale-decision suppression below. The
+    // condition can recur every tick while a child ticks slowly under a load
+    // storm (each tick's probe is awaited, and each tick the marker lands inside
+    // it), so an unlatched log would spam the parent's stderr on every tick —
+    // but a permanent one-shot hides exactly the recurrence the parent must see
+    // (#1339 review). One line per minute of continuous suppression, carrying
+    // the running count, is the bounded middle: the sibling `networkSuppressLogged`
+    // re-arms on transition for the same reason.
+    const STALE_SUPPRESS_RELOG_MS = 60_000;
+    let staleSuppressCount = 0;
+    let staleSuppressLoggedAt = 0;
     // #318: network-aware kill suppression — before honoring a stall-kill,
     // probe connectivity to the sub-agent's provider. When the network is
     // unreachable and the child is alive (fresh heartbeat markers), the
@@ -4961,6 +5207,67 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
       // the kill path against a settled/exited child — treeKill on a
       // recycled pid would signal an unrelated process tree (#318 review).
       if (settled || proc.exitCode !== null) return;
+      // #1339: the SAME window, asked about EVIDENCE rather than about the
+      // promise. `decision` was computed from a snapshot at `now`; the probe was
+      // awaited after it, so the child's `data` handlers have had the event loop
+      // and may have stamped a marker or a byte AFTER that snapshot. Evidence
+      // newer than the snapshot disproves the verdict's premise ("this child is
+      // not making progress") and must never be executed on: re-decide on the
+      // next 10 s tick with the evidence the child actually produced. Measured
+      // false kill this fixes: `no life signs for -1s (marker gap exceeded
+      // 113s)`, `lastMarkerAgeMs=-532`, load1=190.62 — the child was ticking
+      // while the kill ran (session `01a1a95c`, 2026-11-05T02:16:58Z).
+      //
+      // `max-dispatch` is exempt: it is a declared WALL-CLOCK policy cap, not an
+      // inference about progress, so a fresh byte does not make the dispatch
+      // younger. Every other reason is a liveness inference, and each is
+      // re-validated against the clock THAT CLAUSE READS (`supersedingEvidence`:
+      // `no-progress` is measured on `lastProgressAt`, which ticks and bytes do
+      // NOT advance, so a marker inside the window cannot refute it).
+      //
+      // Fail-safe by construction: a genuinely wedged child emits nothing, so
+      // neither channel moves and the next tick kills on the same evidence. A
+      // child that keeps producing evidence IS the refutation — that is the whole
+      // point. The bound on the SUPPRESSION is `TASK_HARD_CAP_MS`, NOT the
+      // clause's own bound: deferring that bound is exactly what a suppression
+      // does, and the hard cap is enforced by its own timer outside this path
+      // (#1339 cycle-4 review — "bounded by its own clause" was the over-claim).
+      const supersededBy =
+        decision.reason === "max-dispatch"
+          ? null
+          : supersedingEvidence(decision.reason, now, {
+              lastMarkerAt: hbCtx.state.lastMarkerAt,
+              lastLifeSignAt: lastHeartbeat,
+              lastProgressAt: hbCtx.state.lastProgressAt,
+              startedAt,
+              sessionEnded: hbCtx.state.sessionEnded,
+              toolsInFlight: hbCtx.state.toolsInFlight,
+            });
+      if (supersededBy) {
+        staleSuppressCount += 1;
+        if (staleSuppressLoggedAt === 0 || now - staleSuppressLoggedAt >= STALE_SUPPRESS_RELOG_MS) {
+          staleSuppressLoggedAt = now;
+          // Stated as "how much newer on the channel that actually fired", never
+          // as an age and never for a channel that did not move: a negative age
+          // is what made this bug unreadable in the first place (#1339). The two
+          // SCOPE channels have no timed delta, so they carry a label instead of
+          // a fabricated `+0ms`.
+          const evidenceDelta =
+            supersededBy === "marker"
+              ? hbCtx.state.lastMarkerAt - now
+              : supersededBy === "bytes"
+                ? lastHeartbeat - now
+                : supersededBy === "progress"
+                  ? (hbCtx.state.lastProgressAt > 0 ? hbCtx.state.lastProgressAt : startedAt) - now
+                  : null;
+          const evidence = evidenceDelta === null ? supersededBy : `${supersededBy} +${evidenceDelta}ms`;
+          console.error(
+            `[task] ${decision.reason ?? "stall"} kill suppressed — the verdict was refuted AFTER the decision snapshot ` +
+              `(${evidence} relative to the snapshot; ${staleSuppressCount} suppression(s) this dispatch); re-deciding on the next tick (#1339)`,
+          );
+        }
+        return;
+      }
       clearInterval(heartbeat);
       // #208: treeKill — the direct child's grandchildren (nested pi, MCP
       // server pairs) would otherwise survive as orphans holding worktrees.
@@ -4979,7 +5286,28 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
         return;
       }
 
-      const markerAgeMs = hbCtx.state.lastMarkerAt > 0 ? now - hbCtx.state.lastMarkerAt : -1;
+      // #1339: the DECISION's snapshot, not a post-await re-read of the live
+      // state — the probe may have moved it, which is exactly how the payload
+      // came to print a NEGATIVE age beside a 951 s verdict. Both readings are
+      // clamped through `readMarkerAge`.
+      const liveMarkerAge = readMarkerAge(hbCtx.state.lastMarkerAt, now);
+      const markerAgeMs = liveMarkerAge.ageMs;
+      const decMarkerAgeMs = decision.markerAgeMs ?? -1;
+      // #1339 review P2: `readMarkerAge` documents `invalid` as "reported for the
+      // caller to log" — this is the caller. Without it a CLAMPED age prints as
+      // an ordinary `0` and is indistinguishable from a marker that landed
+      // exactly now, which is the same unreadability that hid the original bug.
+      const decMarkerAgeInvalid = decision.markerAgeInvalid === true;
+      // …and the DECISION's flag alone is not enough (#1339 cycle-4 review). The
+      // decision-time read is taken before any yield — nothing can stamp a marker
+      // or output between the tick's `now` and the synchronous
+      // `heartbeatKillDecision` call — so that read can only be invalid if the
+      // WALL CLOCK stepped backwards. The clamped case this diagnostic exists for
+      // happens on the LIVE read above, taken AFTER the awaited probe, where a
+      // marker or byte ingested in the window is newer than `now`. Reporting only
+      // the decision's flag therefore prints "valid" beside precisely the clamped
+      // live age it exists to expose, one layer in from the original bug.
+      const lastMarkerAgeInvalid = liveMarkerAge.invalid;
       // #1070 item 1, applied to the HEADLINE as well as the payload. The
       // clauses below fire on the EFFECTIVE ages (`effStreamAge`/`effToolAge`
       // in heartbeatKillDecision = the frozen sample + markerAge), and §6 of
@@ -4995,7 +5323,7 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
       // therefore labelled apart, exactly as `streamAgeMs`/`effStreamAgeMs` above
       // already are: `toolCpuStallMs` is the live sample, `decToolCpuStallMs` is
       // the value the DECISION actually used.
-      const aliveSummary = `Alive state: toolsInFlight=${hbCtx.state.toolsInFlight} turnActive=${hbCtx.state.turnActive} streamAgeMs=${hbCtx.state.streamAgeMs} effStreamAgeMs=${effStreamAgeMs} toolAgeMaxMs=${hbCtx.state.toolAgeMaxMs} effToolAgeMs=${effToolAgeMs} toolCpuMs=${hbCtx.state.toolCpuMs} toolCpuStallMs=${hbCtx.state.toolCpuStallMs} toolCpuAdvanced=${hbCtx.state.toolCpuAdvanced} decToolCpuStallMs=${decision.toolCpuStallMs ?? -1} everSawRealActivity=${hbCtx.state.everSawRealActivity} lastMarkerAgeMs=${markerAgeMs} tickCount=${hbCtx.state.tickCount} markerCount=${hbCtx.state.markerCount} firstMarkerLagMs=${hbCtx.state.firstMarkerAt > 0 ? hbCtx.state.firstMarkerAt - startedAt : -1} firstTickLagMs=${hbCtx.state.firstTickAt > 0 ? hbCtx.state.firstTickAt - startedAt : -1} firstActivityLagMs=${hbCtx.state.firstActivityAt > 0 ? hbCtx.state.firstActivityAt - startedAt : -1} everSawMsg=${hbCtx.state.everSawMsg} everSawTool=${hbCtx.state.everSawTool} toolsMaxInFlight=${hbCtx.state.toolsMaxInFlight} trace=[${hbCtx.state.activityTrace.join(",")}] ${repoStateText()} ${machineStateText()}`;
+      const aliveSummary = `Alive state: toolsInFlight=${hbCtx.state.toolsInFlight} turnActive=${hbCtx.state.turnActive} streamAgeMs=${hbCtx.state.streamAgeMs} effStreamAgeMs=${effStreamAgeMs} toolAgeMaxMs=${hbCtx.state.toolAgeMaxMs} effToolAgeMs=${effToolAgeMs} toolCpuMs=${hbCtx.state.toolCpuMs} toolCpuStallMs=${hbCtx.state.toolCpuStallMs} toolCpuAdvanced=${hbCtx.state.toolCpuAdvanced} decToolCpuStallMs=${decision.toolCpuStallMs ?? -1} decMarkerAgeMs=${decMarkerAgeMs} decMarkerAgeInvalid=${decMarkerAgeInvalid} lastMarkerAgeInvalid=${lastMarkerAgeInvalid} everSawRealActivity=${hbCtx.state.everSawRealActivity} lastMarkerAgeMs=${markerAgeMs} tickCount=${hbCtx.state.tickCount} markerCount=${hbCtx.state.markerCount} firstMarkerLagMs=${hbCtx.state.firstMarkerAt > 0 ? hbCtx.state.firstMarkerAt - startedAt : -1} firstTickLagMs=${hbCtx.state.firstTickAt > 0 ? hbCtx.state.firstTickAt - startedAt : -1} firstActivityLagMs=${hbCtx.state.firstActivityAt > 0 ? hbCtx.state.firstActivityAt - startedAt : -1} everSawMsg=${hbCtx.state.everSawMsg} everSawTool=${hbCtx.state.everSawTool} toolsMaxInFlight=${hbCtx.state.toolsMaxInFlight} trace=[${hbCtx.state.activityTrace.join(",")}] ${repoStateText()} ${machineStateText()}`;
       const headlines: Record<string, string> = {
         "silence-threshold": `⚠️ Sub-agent reached silence threshold (${HEARTBEAT_TIMEOUT_MS / 1000}s). Partial results below — parent should decide: accept, re-dispatch, or escalate.`,
         // #5389 — the headline names the evidence on BOTH channels, because the
@@ -5017,7 +5345,7 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
         // indistinguishable here — rather than asserting a cause the parent
         // cannot prove, which is the same discipline clause 1's headline uses.
         "no-progress": `⛔ Sub-agent completed no work for ${Math.round((decision.progressAgeMs ?? hbThresholds.progressAgeMs) / 1000)}s with no tool in flight (bound ${Math.round(hbThresholds.progressAgeMs / 1000)}s, TASK_PROGRESS_AGE_MS) — a content-free loop or a stalled stream; the two are indistinguishable from here. Partial results below — parent should decide: accept, re-dispatch, or escalate.`,
-        "cut": `⚠️ Sub-agent was cut — no life signs for ${Math.round(markerAgeMs / 1000)}s (marker gap exceeded ${Math.round(effCutGapMs / 1000)}s). Partial results below — parent should decide: accept, re-dispatch, or escalate.`,
+        "cut": `⚠️ Sub-agent was cut — no life signs for ${Math.round(decMarkerAgeMs / 1000)}s (marker gap exceeded ${Math.round(effCutGapMs / 1000)}s) — the age the DECISION read; the live read beside it is lastMarkerAgeMs. Partial results below — parent should decide: accept, re-dispatch, or escalate.`,
       };
       // #282: first-message-stall triage line — every clause-4 kill is a
       // never-worked session by construction (#279 gate); record the run's
@@ -5057,7 +5385,16 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
       const backstopFire = () => {
         if (settled) return;
         const now = Date.now();
-        const markerAge = hbCtx.state.lastMarkerAt > 0 ? now - hbCtx.state.lastMarkerAt : Infinity;
+        // #1339 cycle-4 review (P3, pre-existing): this was the last hand-rolled
+        // marker age in the file, and it could go NEGATIVE — `lastMarkerAt > now`
+        // whenever a marker is ingested between the timer's `now` and this read —
+        // i.e. it compared a THRESHOLD (`freshWindowMs`) against an uncomputable
+        // age, contradicting `readMarkerAge`'s "never compared against a
+        // threshold". Fail-safe either way (a clamped 0 keeps `stateFresh` true,
+        // exactly as the negative raw value did), but the single-reader invariant
+        // is only true if this site goes through it too; `-1` = never.
+        const backstopMarkerAge = readMarkerAge(hbCtx.state.lastMarkerAt, now).ageMs;
+        const markerAge = backstopMarkerAge < 0 ? Infinity : backstopMarkerAge;
         const stateFresh = hbCtx.state.lastMarkerAt > 0 && markerAge <= freshWindowMs;
         if (stateFresh) {
           // healthy ticking agent — exempt by construction; re-arm for
@@ -5073,7 +5410,7 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
           doResolve(undefined, { sweep: true, reason: "backstop" });
           return;
         }
-        const markerAgeMs = hbCtx.state.lastMarkerAt > 0 ? now - hbCtx.state.lastMarkerAt : -1;
+        const markerAgeMs = readMarkerAge(hbCtx.state.lastMarkerAt, now).ageMs;
         const aliveSummary = `Alive state: toolsInFlight=${hbCtx.state.toolsInFlight} turnActive=${hbCtx.state.turnActive} streamAgeMs=${hbCtx.state.streamAgeMs} effStreamAgeMs=${hbCtx.state.streamAgeMs + (markerAgeMs > 0 ? markerAgeMs : 0)} toolAgeMaxMs=${hbCtx.state.toolAgeMaxMs} effToolAgeMs=${hbCtx.state.toolAgeMaxMs + (markerAgeMs > 0 ? markerAgeMs : 0)} toolCpuMs=${hbCtx.state.toolCpuMs} toolCpuStallMs=${hbCtx.state.toolCpuStallMs} toolCpuAdvanced=${hbCtx.state.toolCpuAdvanced} everSawRealActivity=${hbCtx.state.everSawRealActivity} lastMarkerAgeMs=${markerAgeMs} tickCount=${hbCtx.state.tickCount} markerCount=${hbCtx.state.markerCount} firstMarkerLagMs=${hbCtx.state.firstMarkerAt > 0 ? hbCtx.state.firstMarkerAt - startedAt : -1} firstTickLagMs=${hbCtx.state.firstTickAt > 0 ? hbCtx.state.firstTickAt - startedAt : -1} firstActivityLagMs=${hbCtx.state.firstActivityAt > 0 ? hbCtx.state.firstActivityAt - startedAt : -1} everSawMsg=${hbCtx.state.everSawMsg} everSawTool=${hbCtx.state.everSawTool} toolsMaxInFlight=${hbCtx.state.toolsMaxInFlight} trace=[${hbCtx.state.activityTrace.join(",")}] ${repoStateText()} ${machineStateText()}`;
         doResolve(composeAbnormalExit(
           { model, provider, killed: true, reason: "cut", backstop: true, heartbeatTimeout: HEARTBEAT_TIMEOUT_MS },
