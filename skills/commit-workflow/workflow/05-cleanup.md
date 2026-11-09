@@ -28,9 +28,18 @@ directory still orphans it. Judge the hazard from the **process table**, never f
 `scripts/cleanup-worktree.sh` therefore refuses when a live process holds the target by cwd/exe
 (exit 3, naming the holder), and also when the process table cannot be read — a census that cannot
 run proves nothing about whether a session is standing in the tree. **Teardown is then DEFERRED, not
-lost**: `scripts/pi-reap-worktrees.sh` reaps the directory once nothing holds it (its `--aged-days`
-floor, default 7, is the only delay), which is the same #1105 "a live process holds it, so it is not
-yet garbage" rule the reapers already use.
+lost**: `scripts/pi-reap-worktrees.sh` reclaims the directory once nothing holds it (its `--aged-days`
+floor, default 7, is the delay), which is the same #1105 "a live process holds it, so it is not yet
+garbage" rule the reapers already use.
+
+⛔ **What "not lost" does and does not promise.** A lane-rooted session now *always* takes the
+deferral path (the census sees its own session), so for the common case the teardown happens later —
+by the reaper, or by a fresh session that is not rooted in the tree. The reaper reclaims exactly the
+trees this step would have removed, because both sides use the **same** ignored-artifact allowlist
+(`IGNORED_REGENERABLE`, `scripts/pi-reap-worktrees.sh:810`). A worktree carrying anything that list
+does not cover (`.env`, `data/`, a nested `dist/`) is refused here AND preserved by the reaper: it
+stays for an operator. That is the safe direction, and it is why the deferral is not a licence to
+leave dirt behind.
 
 ```bash
 # Detect if running in a worktree
@@ -65,11 +74,18 @@ whose worktree convention *requires* a real dependency tree (a hardlinked `node_
 #878) is refused on its **expected** state, so passing `--force` every time would erode the flag
 exactly where it matters.
 
-So ignored-only dirt gets a **closed** allowance: when every ignored entry sits inside a regenerable
-artifact directory (dependency trees, caches, build outputs — the list is `REGENERABLE_DIRS` in the
-script), the removal proceeds without `--force` and says what it is destroying. Any tracked or
-untracked change, and any ignored file outside that list (`.env`, `data/`, a local database), still
-refuses unless `--force`.
+So ignored-only dirt gets a **closed** allowance: when every ignored entry is a regenerable artifact
+**name** — the fleet's own `IGNORED_REGENERABLE` list (`scripts/pi-reap-worktrees.sh:810`: tool-scoped
+dependency trees and caches, `node_modules`, `.venv`, `__pycache__`, `htmlcov`, `*.egg-info`, …,
+matched on the basename) — the removal proceeds without `--force` and says what it is destroying. Any
+tracked or untracked change, and any ignored file outside that list (`.env`, `data/`, and the
+*generic* names `dist/`, `build/`, `target/`, `.next/`, `.cache`, `coverage`, `output`, which are
+operator data in a nested position), still refuses unless `--force`.
+
+⛔ **Do not widen that list here.** It is a recorded fleet decision with a measurement behind it
+(the 2026-10-11 sweep: 49 of 261 live worktrees carried a non-regenerable entry, `website/apps/
+dashboard/dist/` named). Widening it is a **reopen** of the `pi-reap-worktrees.sh` decision, argued in
+its own home — never a side effect of a teardown script.
 
 ### Merged-branch cleanup (post-merge, #193)
 

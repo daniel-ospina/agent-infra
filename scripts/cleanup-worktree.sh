@@ -40,11 +40,35 @@
 # real `node_modules/` (a hardlinked dependency tree — DMeer's, #878) refuses
 # on the EXPECTED state, so the ceremony passed `--force` every time — which
 # erodes the flag exactly where it matters, since the worktree holding a real
-# `.env` looks identical to that guard. So: when EVERY ignored entry sits inside
-# a REGENERABLE artifact directory (dependency trees, caches, build outputs),
-# the removal proceeds without `--force` and SAYS what it is destroying. Any
+# `.env` looks identical to that guard. So: when EVERY ignored entry is a
+# regenerable artifact NAME (dependency trees and tool-scoped caches), the
+# removal proceeds without `--force` and SAYS what it is destroying. Any
 # tracked/untracked change, and any ignored file outside that list (`.env`,
 # `data/`, a local database), still refuses unless `--force`.
+#
+# ⛔ THE LIST IS NOT MINE TO CHOOSE — it is the fleet's recorded decision, and it
+# is exactly `IGNORED_REGENERABLE` (`scripts/pi-reap-worktrees.sh:810`), matched
+# the same way (on the BASENAME, so a nested `tortoise/__pycache__/` counts,
+# every name being tool-scoped). That file's header carries the measurement and
+# the reasons: `dist/`, `build/`, `target/`, `.next/` are NOT allowlisted
+# ("over-preserving is the safe direction"), and `.cache` is DELIBERATELY absent
+# because a generic name tolerates a NESTED `src/.cache/`, which is operator
+# data. The 2026-10-11 sweep over 294 live worktrees found 49 carrying a
+# non-regenerable entry, and `website/apps/dashboard/dist/` is the concrete
+# example — a broader list here would silently destroy exactly that.
+#
+# ADOPTING THE SAME LIST BUYS AN INVARIANT, which is the other half of the fix:
+# anything this script removes WITHOUT `--force` is also something the reaper
+# (`scripts/pi-reap-worktrees.sh`) would reclaim, and anything this script
+# refuses or defers is also something the reaper preserves. So the deferral
+# promoted in the header above is backed by a tool that agrees with it; a
+# broader list would make the ceremony destroy what the backstop would have
+# saved.
+#
+# The fleet-mandated lane-evidence entries (`.worktree-report/`, the gitignored
+# `scripts` pointer) are deliberately NOT here: the reaper tolerates them because
+# it ARCHIVES them first, and this script has no archive step — so it keeps
+# treating them as dirt the operator must accept.
 #
 # NOTE: the dirty guard covers tracked + untracked AND ignored files
 # (`git status --porcelain` + `--ignored=traditional`): `git worktree remove`
@@ -62,10 +86,17 @@
 #
 # Exit codes:
 #   0  removed (or nothing to remove)
-#   1  DIRTY or non-regenerable ignored files — refused, `--force` to override
-#   3  a live process holds the tree, or the process census could not be read —
-#      DEFERRED (never overridable: the remedy is to run it from a session that
-#      is not rooted there, or let the reaper take it)
+#   1  DIRTY, non-regenerable ignored files, or an unreadable worktree status —
+#      refused; `--force` overrides all three (it is the operator saying "destroy
+#      uncommitted and ignored-only work", including work we could not enumerate)
+#   3  REFUSED because the tree cannot be PROVEN safe to remove, with the remedy in
+#      the message. Three causes, none overridable, because none of them is about
+#      work you agreed to destroy:
+#        a. a live process holds the tree  → DEFERRED; run it from a session not
+#           rooted there, or let `scripts/pi-reap-worktrees.sh` take it
+#        b. the process census could not be read → DEFERRED, same remedies
+#        c. the worktree path cannot be resolved (moved / mount gone) → diagnose
+#           with `scripts/scan-orphans.sh`
 
 set -euo pipefail
 
@@ -129,7 +160,8 @@ trap 'rm -rf "$CENSUSDIR" 2>/dev/null || true' EXIT
 
 if ! lp_census "$CENSUSDIR"; then
   echo "⚠️  cannot prove $WT is free of live processes: the process table could not be read (mechanism=${LP_CENSUS_MECH:-none}) — skipping removal (branch $BRANCH kept)."
-  echo "   removing a directory a session is standing in leaves that session with no shell at all; it is reaped later by scripts/pi-reap-worktrees.sh"
+  echo "   removing a directory a session is standing in leaves that session with no shell at all. DEFERRED, not lost:"
+  echo "   scripts/pi-reap-worktrees.sh reclaims it once nothing holds it (a tree carrying protected dirt stays for an operator)."
   exit 3
 fi
 
@@ -137,8 +169,9 @@ if lp_path_held "$CENSUSDIR/live-paths.tsv" "$WT_CANON"; then
   echo "⚠️  worktree $WT is HELD by a live process (${LP_HOLD_WHY}) — skipping removal (branch $BRANCH kept)."
   echo "   If that process is YOUR session, this is expected and correct: removing the directory your session"
   echo "   stands in leaves it with no working directory, so every later command fails. Teardown is DEFERRED,"
-  echo "   not lost — scripts/pi-reap-worktrees.sh removes it once nothing holds it (and the ceremony's Steps 4-5"
-  echo "   still run). To remove it now, run this from a session rooted somewhere else."
+  echo "   not lost — scripts/pi-reap-worktrees.sh reclaims it once nothing holds it (a tree carrying dirt this"
+  echo "   script would refuse stays for an operator — the reaper uses the same ignored-artifact allowlist), and"
+  echo "   the ceremony's Steps 4-5 still run. To remove it now, run this from a session rooted elsewhere."
   exit 3
 fi
 
@@ -154,42 +187,69 @@ fi
 # fail-open on exactly the `.env` this guard exists for. A failed read is now a
 # refusal: an unread status proves nothing about what removal would destroy.
 if ! ST="$(git -C "$WT" status --porcelain --ignored=traditional 2>&1)"; then
-  echo "⚠️  cannot read the status of $WT (${ST:-no output}) — skipping removal (branch $BRANCH kept)."
-  exit 1
+  if $FORCE; then
+    echo "⚠️  cannot read the status of $WT (${ST:-no output}) — removing with --force as instructed (unknown dirt will be DESTROYED)"
+    ST=""
+  else
+    echo "⚠️  cannot read the status of $WT (${ST:-no output}) — skipping removal (branch $BRANCH kept)."
+    echo "   an unread status cannot prove the tree is clean; pass --force to remove it anyway"
+    exit 1
+  fi
 fi
-REAL_DIRT="$(printf '%s\n' "$ST" | awk '$0 != "" && $0 !~ /^!! /')"
-IGNORED_ALL="$(printf '%s\n' "$ST" | awk '/^!! / { sub(/^!! /, ""); print }')"
+# ⛔ HERE-STRINGS, NOT PIPES. `printf … | fn` puts a live writer on the pipe, and a
+# reader that exits early (as `_not_regenerable` does on the first offender) takes
+# the writer down with SIGPIPE — under `pipefail` that made the assignment non-zero,
+# and the former `|| VAR=""` remedy then DISCARDED an offender it had already
+# captured, removing a `.env` arm without `--force` (fresh review of this PR, P1;
+# reproduced: `X="$(printf … | f)" || X=""` → `X=[]`, the same pipeline with `|| :`
+# → `X=[line-0-…]`). A here-string is backed by a temp file, so there is no writer
+# to kill — the shape `scripts/check-no-sigpipe-grep.sh` documents for this repo.
+REAL_DIRT="$(awk '$0 != "" && $0 !~ /^!! /' <<<"$ST")"
+IGNORED_ALL="$(awk '/^!! / { sub(/^!! /, ""); print }' <<<"$ST")"
 
-# Directory names whose contents are rebuilt from the lockfile/manifest, so
-# destroying them destroys no authored work. ⛔ Deliberately a CLOSED list: a
-# `.env`, a local database, `data/`, `logs/` are ignored files that are NOT
-# regenerable, and they must keep refusing.
-REGENERABLE_DIRS="node_modules .venv venv __pycache__ .pytest_cache .mypy_cache .ruff_cache .tox .cache dist build target .next .turbo .parcel-cache coverage htmlcov .gradle .nuxt .svelte-kit output"
+# The fleet's ONE ignored-regenerable allowlist — `IGNORED_REGENERABLE`
+# (`scripts/pi-reap-worktrees.sh:810`), adopted verbatim rather than re-chosen:
+# every name is TOOL-SCOPED, so a nested match is still provably regenerable, and
+# the generic names (`dist`, `build`, `target`, `.next`, `.cache`, `coverage`,
+# `output`, …) are deliberately ABSENT there because in a nested position they are
+# operator data (see the header, and that file's measurement of
+# `website/apps/dashboard/dist/`). `*.egg-info` is a suffix rule, as there.
+REGENERABLE_NAMES=" __pycache__ .pytest_cache .mypy_cache .ruff_cache .tox .DS_Store node_modules .venv .ci-selection .longmemeval_cache .wrangler .playwright-mcp .ipynb_checkpoints htmlcov :memory: "
 
 # _not_regenerable — stdin: repo-relative paths, one per line. Prints the first
-# path that is NOT inside a regenerable directory; rc 0 when it printed one,
-# rc 1 when every path is regenerable. `*.egg-info` is matched as a suffix
-# because the name carries the package.
+# path that is NOT a regenerable artifact; rc 0 when it printed one, rc 1 when
+# every path is. Matched on the BASENAME, exactly like the reaper's
+# `is_regenerable_ignored()`, so a nested `tortoise/__pycache__/` counts and a
+# nested `src/.cache/` (or `website/apps/dashboard/dist/`) does not.
+#
+# ⛔ `--ignored=traditional` COLLAPSES: when an ignore rule makes a whole subtree
+# ignored and that subtree carries no tracked file, git reports the outermost
+# directory (`!! pkg/`, not `!! pkg/__pycache__/`), so the basename names a parent
+# and the entry is REFUSED. That is the safe direction — the same input shape the
+# reaper preserves — and it is why no attempt is made here to un-collapse the path
+# with `--ignored=matching` or a second read: the conservative answer is the one
+# that keeps operator data.
 _not_regenerable() {
-  awk -v names="$REGENERABLE_DIRS" '
-    BEGIN { n = split(names, a, " "); for (i = 1; i <= n; i++) ok[a[i]] = 1 }
+  awk -v names="$REGENERABLE_NAMES" '
     {
       p = $0
       sub(/\/$/, "", p)
       if (p == "") next
-      m = split(p, c, "/")
-      allowed = 0
-      for (i = 1; i <= m; i++) {
-        if (c[i] in ok || c[i] ~ /\.egg-info$/) { allowed = 1; break }
-      }
-      if (!allowed) { print p; bad = 1; exit }
+      base = p
+      sub(/^.*\//, "", base)
+      if (base ~ /\.egg-info$/) next
+      if (index(names, " " base " ") > 0) next
+      print p; bad = 1; exit
     }
     END { exit(bad ? 0 : 1) }'
 }
 
 IGNORED_OFFENDER=""
 if [ -n "$IGNORED_ALL" ]; then
-  IGNORED_OFFENDER="$(printf '%s\n' "$IGNORED_ALL" | _not_regenerable)" || IGNORED_OFFENDER=""
+  # ⛔ `|| :`, NEVER `|| IGNORED_OFFENDER=""`. The latter is the P1 above: it
+  # overwrites an already-captured offender with the empty string on ANY non-zero
+  # status, so a `.env` arm was removed without `--force`.
+  IGNORED_OFFENDER="$(_not_regenerable <<<"$IGNORED_ALL")" || :
 fi
 
 if [ -n "$REAL_DIRT" ] || [ -n "$IGNORED_OFFENDER" ]; then
@@ -204,7 +264,7 @@ if [ -n "$REAL_DIRT" ] || [ -n "$IGNORED_OFFENDER" ]; then
     exit 1
   fi
 elif [ -n "$IGNORED_ALL" ]; then
-  echo "ℹ️  worktree $WT holds only regenerable ignored artifacts ($(printf '%s\n' "$IGNORED_ALL" | wc -l | tr -d ' ') entries, e.g. dependency trees / build outputs) — removing without --force"
+  echo "ℹ️  worktree $WT holds only regenerable ignored artifacts ($(awk 'END { print NR }' <<<"$IGNORED_ALL") entries: dependency trees / tool caches from the fleet's allowlist) — removing without --force"
 fi
 
 git worktree remove "$WT" $([ "$FORCE" = "true" ] && printf '%s' "--force")

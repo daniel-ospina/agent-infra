@@ -31,6 +31,22 @@
 #   ignored-regenerable      node_modules/ only (DMeer's hardlinked dependency
 #                            tree, #878): removes WITHOUT --force, because a flag
 #                            passed every single time is not a deliberate signal.
+#                            The allowlist IS the reaper's IGNORED_REGENERABLE
+#                            (scripts/pi-reap-worktrees.sh:810), so nested
+#                            tool-scoped names are tolerated and the GENERIC
+#                            names it deliberately excludes are not.
+#   ignored-generic-nested   website/apps/dashboard/dist/ and src/.cache/ — the
+#                            two cases the reaper's own header measures — must
+#                            still REFUSE: `dist`/`build`/`target`/`.next`/`.cache`
+#                            are operator data in a nested position (recorded
+#                            decision; widening that list is a reopen, not a fix).
+#   ignored-offender-large   `.env` PLUS thousands of individually-listed ignored
+#                            files: the offender capture must survive a producer a
+#                            reader exits early on (the SIGPIPE-shaped fail-open a
+#                            fresh review found as P1).
+#   status-unreadable        `git status` failing is a REFUSAL, not "clean" (and
+#                            `--force` — the operator accepting destruction — still
+#                            removes): the arm that was INERT before it had a row.
 #   ignored-not-regenerable  `.env` only: still refuses. The allowance is a closed
 #                            list of rebuilt-from-manifest artifacts, never "all
 #                            ignored files".
@@ -74,7 +90,8 @@ git init --bare -q "$T/origin.git"
 git init -q "$T/repo"
 git -C "$T/repo" config user.name t
 git -C "$T/repo" config user.email t@example.invalid
-printf 'node_modules/\n.env\n' > "$T/repo/.gitignore"
+# ignored-only dirt inside a CLOSED list of regenerable artifacts.
+printf 'node_modules/\n__pycache__/\n.env\n*.log\nwebsite/apps/dashboard/dist/\nsrc/.cache/\n' > "$T/repo/.gitignore"
 echo base > "$T/repo/tracked.txt"
 git -C "$T/repo" add .gitignore tracked.txt
 git -C "$T/repo" commit -q -m init
@@ -167,10 +184,41 @@ echo "── ignored, regenerable (node_modules/): no --force needed ───�
 W="$(mk_wt regenerable)"
 mkdir -p "$W/node_modules/left-pad"
 echo code > "$W/node_modules/left-pad/index.js"
+# A NESTED tool-scoped cache is tolerated too (the reaper's basename rule). The
+# tracked file in `pkg/` is what makes git report `pkg/__pycache__/` instead of
+# collapsing to `!! pkg/` (traditional mode names the outermost fully-ignored dir).
+mkdir -p "$W/pkg" && echo 'print(1)' > "$W/pkg/mod.py"
+git -C "$W" add pkg/mod.py && git -C "$W" commit -qm "add pkg"
+mkdir -p "$W/pkg/__pycache__" && echo x > "$W/pkg/__pycache__/m.pyc"
 run_sut feat/regenerable
 assert_rc 0 "$RC" "node_modules-only worktree exits 0 without --force"
 assert_contains "$OUT" "only regenerable ignored artifacts" "removal discloses the allowance it used"
 if [ -e "$W" ]; then bad "regenerable-only worktree left in place"; else ok "regenerable-only worktree removed"; fi
+
+echo "── ignored, GENERIC name at depth (dist/): still refuses ─────────────"
+W="$(mk_wt generic)"
+mkdir -p "$W/website/apps/dashboard"
+echo '<html>' > "$W/website/apps/dashboard/index.html"
+git -C "$W" add website/apps/dashboard/index.html && git -C "$W" commit -qm "add dash"
+mkdir -p "$W/website/apps/dashboard/dist/assets"
+echo bundle > "$W/website/apps/dashboard/dist/assets/app.js"
+run_sut feat/generic
+assert_rc 1 "$RC" "nested dist/ exits 1 (the fleet allowlist excludes generic names)"
+assert_contains "$OUT" "not regenerable: website/apps/dashboard/dist" "refusal names the offending dist/ path"
+if wt_registered "$W"; then ok "nested dist/ worktree kept"; else bad "nested dist/ worktree deregistered"; fi
+run_sut feat/generic --force
+assert_rc 0 "$RC" "nested dist/ with --force exits 0"
+
+# ⛔ `src/.cache/` is the case the reaper's header names explicitly, so pin it too.
+W="$(mk_wt cache)"
+mkdir -p "$W/src" && echo 'x = 1' > "$W/src/app.py"
+git -C "$W" add src/app.py && git -C "$W" commit -qm "add src"
+mkdir -p "$W/src/.cache" && echo op > "$W/src/.cache/state.bin"
+run_sut feat/cache
+assert_rc 1 "$RC" "nested .cache/ exits 1 (generic name, operator data)"
+assert_contains "$OUT" "not regenerable: src/.cache" "refusal names the nested .cache path"
+run_sut feat/cache --force
+assert_rc 0 "$RC" "nested .cache/ with --force exits 0"
 
 echo "── ignored, NOT regenerable (.env): still refuses ────────────────────"
 W="$(mk_wt secret)"
@@ -182,6 +230,56 @@ if wt_registered "$W"; then ok ".env worktree kept"; else bad ".env worktree der
 run_sut feat/secret --force
 assert_rc 0 "$RC" ".env worktree with --force exits 0"
 if [ -e "$W" ]; then bad "--force left the .env worktree in place"; else ok "--force removed the .env worktree"; fi
+
+# ⛔ THE SIGPIPE SHAPE (fresh review, P1): a `.env` FIRST (so an early-exiting reader
+# stops on line 1) beside thousands of individually-listed ignored files, i.e. far more
+# than a pipe buffer left queued. Under the old `printf | _not_regenerable || VAR=""`
+# form the producer died of SIGPIPE, `pipefail` made the assignment non-zero, and the
+# `||` WIPED the already-captured `.env` — removing the worktree without `--force`.
+# With the here-string there is no writer to kill, so the refusal must hold.
+echo "── ignored, .env + a large ignored set: the offender capture survives ──"
+W="$(mk_wt bigset)"
+printf 'TOKEN=xyz\n' > "$W/.env"
+# ⛔ THE PRECONDITION IS QUEUED BYTES, AND IT IS MEASURED. A writer only takes SIGPIPE
+# when more than the pipe capacity (~64 KiB on Linux, 16 KiB on macOS) is still queued
+# after the reader stops on line 1 — and the reader's own read-ahead absorbs a few
+# hundred KiB before that. Measured on this box: 159 KB and 318 KB do NOT fire, 594 KB
+# does. So the fixture uses long names (fewer inodes, more bytes) and ASSERTS the byte
+# volume, because a count alone would make the row vacuous (it did: at 2,500 short names
+# the mutant below stayed green).
+( cd "$W" && awk 'BEGIN { pad = ""; for (j = 0; j < 185; j++) pad = pad "y"; for (i = 0; i < 4000; i++) printf "f-%05d-%s.log\n", i, pad }' | xargs touch ) 2>/dev/null || true
+IGN_BYTES="$(git -C "$W" status --porcelain --ignored=traditional | wc -c | tr -d ' ')"
+if [ "$IGN_BYTES" -gt 400000 ]; then ok "fixture: $IGN_BYTES bytes of ignored entries queued (well past a pipe buffer)"; else bad "fixture: only $IGN_BYTES bytes queued — the SIGPIPE shape was NOT built, so this row would be vacuous"; fi
+run_sut feat/bigset
+assert_rc 1 "$RC" ".env beside a large ignored set still exits 1"
+assert_contains "$OUT" "not regenerable: .env" "the captured offender survived a large ignored set"
+assert_absent "$OUT" "only regenerable ignored artifacts" "the allowance was NOT granted (that is the fail-open)"
+if wt_registered "$W"; then ok ".env + large ignored set worktree kept"; else bad "worktree removed without --force — FAIL-OPEN"; fi
+run_sut feat/bigset --force
+assert_rc 0 "$RC" ".env + large ignored set with --force exits 0"
+
+echo "── an unreadable status is a refusal, and --force still removes ───────"
+W="$(mk_wt nostatus)"
+mkdir -p "$T/bin"
+GIT_REAL="$(command -v git)"
+cat > "$T/bin/git" <<SHIM
+#!/usr/bin/env bash
+for a in "\$@"; do
+  if [ "\$a" = status ]; then echo "fatal: simulated status failure" >&2; exit 128; fi
+done
+exec "$GIT_REAL" "\$@"
+SHIM
+chmod +x "$T/bin/git"
+RC=0
+OUT="$(cd "$T/repo" && PATH="$T/bin:$PATH" bash "$SUT" feat/nostatus 2>&1)" || RC=$?
+assert_rc 1 "$RC" "a failed git status read exits 1 (refusal, not 'clean')"
+assert_contains "$OUT" "cannot read the status" "the refusal names the unreadable status"
+assert_contains "$OUT" "pass --force to remove it anyway" "the refusal names the override"
+if wt_registered "$W"; then ok "worktree kept when the status cannot be read"; else bad "worktree removed without a status read — FAIL-OPEN"; fi
+RC=0
+OUT="$(cd "$T/repo" && PATH="$T/bin:$PATH" bash "$SUT" feat/nostatus --force 2>&1)" || RC=$?
+assert_rc 0 "$RC" "an unreadable status with --force exits 0 (the operator accepted destruction)"
+if [ -e "$W" ]; then bad "--force left the unreadable-status worktree in place"; else ok "--force removed it despite the unreadable status"; fi
 
 echo "── moved/unresolvable worktree: refused with the instrument named ────"
 W="$(mk_wt moved)"
