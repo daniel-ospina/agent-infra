@@ -12,7 +12,7 @@
  * node_modules/typebox. Created by CI setup or manually.
  */
 
-import { stripHtml, getPerplexityKey, augmentPath, PATH_EXTRA_DIRS, getPiInvocation, getSubAgentPath, resolveProviderModel, loadModelRegistry, getModelsJsonPath, getExitGraceMs, DEFAULT_EXIT_GRACE_MS, armExitWatchdog, getExitCompleteGraceMs, DEFAULT_EXIT_COMPLETE_GRACE_MS, armCompletionWatchdog, composeTaskResult, getFallbackModel, DEFAULT_FALLBACK_MODEL, connectionErrorDetected, shouldFallback, resolveProviderBaseUrl, HEARTBEAT_MARKER_PREFIX, HEARTBEAT_INTERVAL_MIN_MS, HEARTBEAT_INTERVAL_MAX_MS, DEFAULT_HEARTBEAT_INTERVAL_MS, DEFAULT_STREAM_STALL_MS, DEFAULT_TOOL_STALL_MS, DEFAULT_FIRST_MESSAGE_MS, clampHeartbeatIntervalMs, getHeartbeatIntervalMs, getStreamStallMs, getToolStallMs, getFirstMessageMs, createHeartbeatState, parseHeartbeatLine, flushHeartbeatResidue, flushHeartbeatLineBuf, ingestHeartbeatChunk, heartbeatKillDecision, HEARTBEAT_LINE_BUF_MAX, HEARTBEAT_TRACE_MAX, getTaskMaxDispatchMs, getTaskHardCapMs, DEFAULT_HARD_CAP_MS, loadScaledBound, getFirstOutputTimeoutMs, getSystemLoad, setLoad1Override, getLoad1, getCutGapMs, getEffectiveCutGapMs, getCpuStallMs, DEFAULT_CPU_STALL_MS, DEFAULT_PROGRESS_AGE_MS, getProgressAgeMs, classifyTaskExit, getTaskBackstopMs, DEFAULT_BACKSTOP_MARGIN_MS, DEFAULT_TASK_MODEL, renderRepoStateLine, renderMachineStateLine, countPiProcs, countPiInPsOutput, formatLoad1, probeSystemLoad, resolveTaskCwd, taskCwdRefusal, spawnSubAgent, resolveStreamStallMs, streamStallInertWarning, inFlightProgress, DEFAULT_SESSION_CEILING_MULT, resolveSessionCeiling, isDispatchSaturated, saturationNotice, dispatchSaturationRefusal, probeDispatchSaturation, probePiProcs, setPiProcsOverride, classifyChildLiveness, childMessagesSent, TASK_LIVENESS_DETAIL_KEYS, stampLivenessDefaults, childLivenessFor, exhaustionStatusFor, classifyBackgroundOutcome } from "./index.js";
+import { stripHtml, getPerplexityKey, augmentPath, PATH_EXTRA_DIRS, getPiInvocation, getSubAgentPath, resolveProviderModel, loadModelRegistry, getModelsJsonPath, getExitGraceMs, DEFAULT_EXIT_GRACE_MS, armExitWatchdog, getExitCompleteGraceMs, DEFAULT_EXIT_COMPLETE_GRACE_MS, armCompletionWatchdog, composeTaskResult, getFallbackModel, DEFAULT_FALLBACK_MODEL, connectionErrorDetected, shouldFallback, resolveProviderBaseUrl, HEARTBEAT_MARKER_PREFIX, HEARTBEAT_INTERVAL_MIN_MS, HEARTBEAT_INTERVAL_MAX_MS, DEFAULT_HEARTBEAT_INTERVAL_MS, DEFAULT_STREAM_STALL_MS, DEFAULT_TOOL_STALL_MS, DEFAULT_FIRST_MESSAGE_MS, clampHeartbeatIntervalMs, getHeartbeatIntervalMs, getStreamStallMs, getToolStallMs, getFirstMessageMs, createHeartbeatState, parseHeartbeatLine, flushHeartbeatResidue, flushHeartbeatLineBuf, ingestHeartbeatChunk, heartbeatKillDecision, HEARTBEAT_LINE_BUF_MAX, HEARTBEAT_TRACE_MAX, getTaskMaxDispatchMs, getTaskHardCapMs, DEFAULT_HARD_CAP_MS, loadScaledBound, getFirstOutputTimeoutMs, getSystemLoad, setLoad1Override, getLoad1, getCutGapMs, getEffectiveCutGapMs, getCpuStallMs, DEFAULT_CPU_STALL_MS, DEFAULT_PROGRESS_AGE_MS, getProgressAgeMs, classifyTaskExit, getTaskBackstopMs, DEFAULT_BACKSTOP_MARGIN_MS, DEFAULT_TASK_MODEL, renderRepoStateLine, renderMachineStateLine, countPiProcs, countPiInPsOutput, formatLoad1, probeSystemLoad, resolveTaskCwd, taskCwdRefusal, spawnSubAgent, resolveStreamStallMs, streamStallInertWarning, inFlightProgress, DEFAULT_SESSION_CEILING_MULT, resolveSessionCeiling, isDispatchSaturated, saturationNotice, dispatchSaturationRefusal, probeDispatchSaturation, probePiProcs, setPiProcsOverride, classifyChildLiveness, childMessagesSent, TASK_LIVENESS_DETAIL_KEYS, stampLivenessDefaults, childLivenessFor, exhaustionStatusFor, classifyBackgroundOutcome, readMarkerAge, decisionSnapshotStale, supersedingEvidence } from "./index.js";
 import { dispatchUnkeyedSet } from "../shared/provider-failover.js";
 import { asyncRepoState } from "../repo-freshness.js";
 import builtinTools from "./index.js";
@@ -3090,9 +3090,13 @@ test("E271i: loop↔decision fresh-window coupling + the far tail's ungated owne
   equal(hcGuardConds.slice().sort().join(" | "), "!hasOutput | settled", "the callback's guards are EXACTLY `settled` and `!hasOutput` — a freshness term folded into one of them is caught whatever its spelling");
   ok(!/stateFresh|freshWindowMs|HEARTBEAT_TIMEOUT_MS|heartbeatTimeoutMs|getHeartbeatIntervalMs|clampHeartbeatIntervalMs|HEARTBEAT_INTERVAL_MS|TASK_HEARTBEAT_INTERVAL_MS|DEFAULT_HEARTBEAT|intervalMs|hbThresholds|cutGapMs/.test(hcBody), "…and no freshness expression may appear in the callback OUTSIDE those `if` headers (a `switch`, ternary or `||`-shaped gate) — the condition pin cannot see those. A denylist can never be complete (cycle 6's set was itself narrower than cycle 4's: it had dropped `hbThresholds`, which is what caught a `hbThresholds.heartbeatTimeoutMs` fold); the MARKER-clock family below is pinned POSITIVELY instead, because it cannot be listed here at all");
   // The marker clock cannot go in the denylist: the callback reads
-  // `hbCtx.state.lastMarkerAt` TWICE on its one report declaration, and the
-  // `markerAgeMs` local six times in the same report. Positive pins instead:
-  equal(hcBody.split("hbCtx.state.lastMarkerAt").length - 1, 2, "the callback reads the marker clock exactly twice — both on the single report declaration. A THIRD read is a freshness gate on the far tail (this is the read a `markerAgeMs`/`lastMarkerAt`-based gate needs)");
+  // `hbCtx.state.lastMarkerAt` on its one report declaration, through the single
+  // clamped reader. Positive pins instead:
+  equal(hcBody.split("hbCtx.state.lastMarkerAt").length - 1, 1, "the callback reads the marker clock exactly ONCE — on the single report declaration, through `readMarkerAge` (#1339). A SECOND read is a freshness gate on the far tail (this is the read a `markerAgeMs`/`lastMarkerAt`-based gate needs)");
+  ok(
+    /const markerAgeMs = readMarkerAge\(hbCtx\.state\.lastMarkerAt, [^\n]*\)\.ageMs;/.test(hcBody),
+    "that one read goes through `readMarkerAge` (#1339) — the raw `now - lastMarkerAt` shape can go NEGATIVE, and a negative age printed in a far-tail payload is exactly the defect #1339 measured",
+  );
   ok(/const markerAgeMs = [^;]+;\s*doResolve\(composeAbnormalExit\(/.test(hcBody), "the marker-age local flows STRAIGHT into the resolve — nothing (not even a ternary) may sit between them, which is how the far tail would become freshness-gated without adding an `if` header");
   // The order pin reads the guard with the SAME whitespace-tolerant regex as the
   // presence check: an exact-literal `indexOf` returned -1 on a reformatted guard
@@ -3125,6 +3129,341 @@ test("E271f: exit taxonomy — null → cut, 0+tools>0 → cut, 0+tools=0 → su
   equal(classifyTaskExit(0, 0), "success", "clean exit with no tools in flight is success");
   equal(classifyTaskExit(1, 0), "failed", "non-zero exit is failed (existing)");
   equal(classifyTaskExit(2, 3), "failed", "non-zero exit with tools in flight is still failed (tool-stall semantics)");
+});
+
+section("#1339 — a kill verdict must agree with the evidence, and no age may be negative");
+
+test("#1339a: readMarkerAge — one reader, sentinel for 'never', CLAMP for 'future' (source of the -1s headline)", () => {
+  // Measured upstream (#1208 B2): `no life signs for -2s`, and re-measured on
+  // this box (#1339): `no life signs for -1s (marker gap exceeded 113s)` beside
+  // `lastMarkerAgeMs=-532`. A negative age is not a measurement of silence.
+  deepEqual(readMarkerAge(0, 1_000_000), { ageMs: -1, invalid: false }, "no marker ever parsed → the -1 SENTINEL, not an age (stateFresh carries the condition)");
+  deepEqual(readMarkerAge(-5, 1_000_000), { ageMs: -1, invalid: false }, "any non-positive timestamp is the sentinel, never a negative age");
+  deepEqual(readMarkerAge(999_000, 1_000_000), { ageMs: 1_000, invalid: false }, "an ordinary past timestamp is the plain difference");
+  deepEqual(readMarkerAge(1_000_000, 1_000_000), { ageMs: 0, invalid: false }, "exactly now is 0, not invalid");
+  deepEqual(readMarkerAge(1_000_532, 1_000_000), { ageMs: 0, invalid: true }, "a FUTURE timestamp is INVALID INPUT, clamped to 0 and flagged — this is the exact -532ms reading from the live cut");
+});
+
+test("#1339b: the decision never evaluates a threshold against an invalid marker age (fail-safe: no kill)", () => {
+  const now = 10_000_000;
+  const gap = 37_500;
+  // Positive CONTROL: the same stale marker in the PAST is a cut, and the
+  // decision reports the age it used.
+  const stale = cutClauseState(gap + 20_000, now);
+  const cut = heartbeatKillDecision(dinput({ now, lastLifeSignAt: now, state: stale, cutGapMs: gap }));
+  equal(cut.kill, true, "control: markers genuinely stale past the gap still cut (the detector is not disarmed)");
+  equal(cut.reason, "cut");
+  equal(cut.markerAgeMs, gap + 20_000, "the decision carries the marker age it actually used (#1339 snapshot, printed by the headline)");
+
+  // The DEFECT shape: the marker timestamp is in the FUTURE of the decision
+  // clock (it was ingested after `now` was taken, inside the awaited kill path).
+  // NOTE (#1339 review): the `cut` clause is `markerAge > cutGapMs`, so a raw
+  // NEGATIVE age would be LESS than the gap and could not fire it either way —
+  // asserting `kill === false` here proves nothing about the clamp. What the
+  // clamp actually buys is that no consumer ever receives the negative number,
+  // so THAT is what is pinned: the decision carries 0, not -532.
+  const future = cutClauseState(gap + 20_000, now);
+  future.lastMarkerAt = now + 532;
+  const invalid = heartbeatKillDecision(dinput({ now, lastLifeSignAt: now, state: future, cutGapMs: gap }));
+  equal(invalid.kill, false, "a marker timestamp in the future is not silence past the gap (it is not silence at all)");
+  equal(invalid.markerAgeMs, undefined, "no kill → no decision age to report");
+  ok(
+    readMarkerAge(future.lastMarkerAt, now).ageMs === 0,
+    "the clamp is what turns the measured -532ms into 0 — this is the assertion the raw-difference revert fails (#1339 review: the earlier `kill === false` legs passed even with the clamp reverted)",
+  );
+
+  // And the snapshot the headline prints is the clamped one, never the raw
+  // negative difference — where a kill IS taken (a different clause), the
+  // reported age must still be a non-negative value.
+  const futureHung = cutClauseState(gap + 20_000, now);
+  futureHung.lastMarkerAt = now + 532;
+  futureHung.toolAgeMaxMs = 21_600_001;
+  const otherClause = heartbeatKillDecision(
+    dinput({ now, lastLifeSignAt: now, state: futureHung, cutGapMs: gap, toolStallMs: 21_600_000 }),
+  );
+  equal(otherClause.kill, true, "a clause that does not read the marker clock still fires");
+  equal(otherClause.reason, "tool-stall");
+  equal(otherClause.markerAgeMs, 0, "…and the payload still carries the CLAMPED 0, not the raw -532 (fails if the clamp is reverted)");
+  // #1339 review P2: the clamped `0` above is INDISTINGUISHABLE from a marker that
+  // landed exactly now, so a reader cannot tell "fresh" from "uncomputable". The
+  // flag `readMarkerAge` promises to report is carried on the DECISION, and the
+  // payload prints it, so the two cases are separable in the post-mortem.
+  equal(otherClause.markerAgeInvalid, true, "a clamped decision says so — otherwise the clamped 0 reads as a live marker");
+  equal(cut.markerAgeInvalid, false, "a genuinely stale marker is not flagged invalid (the flag is not a second clamp)");
+  equal(
+    heartbeatKillDecision(dinput({ now, lastLifeSignAt: now, state: cutClauseState(gap + 20_000, now), cutGapMs: gap })).markerAgeInvalid,
+    false,
+    "…and the ordinary past-timestamp path stays unflagged",
+  );
+});
+
+test("#1339e: supersedingEvidence — the guard asks each clause about ITS OWN clock", () => {
+  const snap = 5_000_000;
+  const base = { lastMarkerAt: 0, lastLifeSignAt: snap - 1, lastProgressAt: 0, startedAt: 1, sessionEnded: false, toolsInFlight: 0 };
+
+  // No-progress is measured on `lastProgressAt`, which ticks and bytes do NOT
+  // advance (the clause's binding rule). A marker inside the awaited window is
+  // therefore NOT a refutation of it — the content-free loop stays killable.
+  equal(
+    supersedingEvidence("no-progress", snap, { ...base, lastMarkerAt: snap + 1, lastLifeSignAt: snap + 1 }),
+    null,
+    "no-progress: a marker AND a byte after the snapshot do not refute a verdict about WORK COMPLETED — suppressing here re-opens the hole the clause exists to close",
+  );
+  equal(
+    supersedingEvidence("no-progress", snap, { ...base, lastProgressAt: snap + 1 }),
+    "progress",
+    "no-progress: real work completing inside the window DOES refute it (fail-safe direction preserved)",
+  );
+  equal(
+    supersedingEvidence("no-progress", snap, { ...base, lastProgressAt: 0, startedAt: snap + 1 }),
+    "progress",
+    "no-progress: the anchor falls back to `startedAt` exactly as the clause does — a dispatch that started inside the window has not had its bound yet",
+  );
+  equal(
+    supersedingEvidence("no-progress", snap, { ...base, lastProgressAt: snap }),
+    null,
+    "no-progress: progress AT the snapshot instant is not newer (equality is not staleness)",
+  );
+
+  // #1339 CYCLE-2 P1 — the clause's two SCOPE gates, which flip inside the
+  // awaited window with `lastProgressAt` UNTOUCHED. `heartbeatKillDecision`
+  // returns `kill:false` for both at that same instant (#191 early return;
+  // the clause's `toolsInFlight === 0` scope), so the guard must not execute a
+  // verdict the clause itself refuses. Measured before the fix: the kill ran in
+  // both cases, and for `session_end` it discarded FINISHED work as a
+  // partial-result kill.
+  equal(
+    supersedingEvidence("no-progress", snap, { ...base, sessionEnded: true, lastMarkerAt: snap + 1 }),
+    "session-end",
+    "no-progress: a session_end inside the window supersedes — #191 forbids ANY stall clause racing a completed session, and it moves no progress clock",
+  );
+  equal(
+    supersedingEvidence("no-progress", snap, { ...base, toolsInFlight: 1, lastMarkerAt: snap + 1 }),
+    "tool-in-flight",
+    "no-progress: a tool_start inside the window supersedes — an in-flight tool is a DECLARED long operation owned by the tool clauses, and it moves no progress clock either",
+  );
+  equal(
+    supersedingEvidence("no-progress", snap, { ...base, sessionEnded: true, toolsInFlight: 1 }),
+    "session-end",
+    "session_end outranks a concurrent tool_start (strongest gate first)",
+  );
+
+  // Every other reason is superseded by the marker/byte channels, and the
+  // returned channel NAMES the one that fired so the log cannot print a
+  // negative delta for a channel that did not move (#1339 review).
+  for (const reason of ["cut", "silence-threshold", "stream-stall", "tool-silence", "tool-dead", "tool-stall", "first-message-stall", "zero-output"] as const) {
+    equal(supersedingEvidence(reason, snap, base), null, `${reason}: a silent child (both channels behind the snapshot) leaves the verdict standing`);
+    equal(supersedingEvidence(reason, snap, { ...base, lastMarkerAt: snap + 1 }), "marker", `${reason}: a marker after the snapshot supersedes, and is NAMED`);
+    equal(supersedingEvidence(reason, snap, { ...base, lastLifeSignAt: snap + 1 }), "bytes", `${reason}: a byte after the snapshot supersedes, and is NAMED`);
+    equal(supersedingEvidence(reason, snap, { ...base, lastMarkerAt: snap + 1, lastLifeSignAt: snap + 1 }), "marker", `${reason}: the marker is named first when both fired`);
+  }
+});
+
+test("#1339c: decisionSnapshotStale — evidence newer than the snapshot supersedes the verdict", () => {
+  const snap = 5_000_000;
+  equal(decisionSnapshotStale(snap, 0, snap - 1), false, "a silent child (no marker, last byte before the snapshot) does NOT supersede — the kill stands");
+  equal(decisionSnapshotStale(snap, snap - 1_000, snap - 1), false, "both channels behind the snapshot → not stale (the ordinary wedge)");
+  equal(decisionSnapshotStale(snap, snap, snap - 1), false, "a marker at the snapshot instant is not NEWER — equality is not staleness (a child ticking exactly at the decision is still the verdict's evidence)");
+  equal(decisionSnapshotStale(snap, snap + 1, snap - 1), true, "a marker AFTER the snapshot supersedes the verdict");
+  equal(decisionSnapshotStale(snap, 0, snap + 1), true, "a real output BYTE after the snapshot supersedes it too — the byte channel is independent of markers");
+  equal(decisionSnapshotStale(snap, snap + 1, snap + 1), true, "both channels newer");
+});
+
+test("#1339d: loop wiring — the verdict is re-validated against evidence across the awaited probe (source-scan)", () => {
+  const src = readFileSync(resolve(__dirname, "index.ts"), "utf-8");
+  // The guard is the ONLY consumer of `supersedingEvidence` in the loop, and it
+  // must sit between the post-await `settled`/exit re-check and the tree kill —
+  // the window it protects is exactly that gap.
+  const guardIdx = src.indexOf("supersedingEvidence(decision.reason, now, {");
+  ok(guardIdx > -1, "the kill path re-validates the decision against the marker, byte AND progress clocks");
+  const settledIdx = src.indexOf("if (settled || proc.exitCode !== null) return;");
+  const killIdx = src.indexOf("killTreeAndEscalate();", settledIdx);
+  ok(settledIdx > -1 && settledIdx < guardIdx, "the evidence re-check follows the post-await settled re-check (the same await window, asked about evidence)");
+  ok(guardIdx < killIdx, "the evidence re-check precedes the tree kill — a stale verdict must never be executed");
+  // #1339 CYCLE-3 P2 — the SAME class that produced the cycle-2 P1, one layer
+  // out: `supersedingEvidence` was pinned but the two lines that hand it LIVE
+  // scope-gate state were not, so replacing them with the constants
+  // `false`/`0` restored the P1 (a `session_end`/`tool_start` inside the awaited
+  // window stops superseding a `no-progress` kill → finished work discarded as a
+  // partial-result kill) and left all 373 tests green. A typecheck would not
+  // catch it either (`false`/`0` satisfy `boolean`/`number`), and this repo has
+  // no root tsconfig so that job self-skips. The channels are INERT without this
+  // wiring, so the wiring is pinned.
+  //
+  // ⛔ BUT A WHOLE-FILE `src.includes()` IS NOT A PIN FOR A LINE THAT IS NOT
+  // UNIQUE. Measured (#1339 cycle-4 review): `lastLifeSignAt: lastHeartbeat,`
+  // occurs 3× in index.ts and `toolsInFlight: hbCtx.state.toolsInFlight,` 2×, so
+  // a global substring test stayed GREEN while the GUARD'S OWN argument was
+  // mutated to `now`. The direction of that mutation is the one that HURTS, and
+  // it is the opposite of over-suppression (#1339c already pins it):
+  // `decisionSnapshotStale` is a STRICT `>` and the guard is called with
+  // `snapshotAt === now`, so `lastLifeSignAt: now` can never be `> now` — the
+  // byte channel is permanently INERT, the guard never supersedes, and the kill
+  // executes on the superseded verdict. That is the original #1339 false kill,
+  // in the configuration where no marker ever parses (`hbEnabled === false`, or
+  // a marker failing the nonce check). Each literal is therefore asserted INSIDE
+  // the guard's argument block, which is the only region where it is evidence of
+  // this wiring at all.
+  const guardCall = src.indexOf(": supersedingEvidence(decision.reason, now, {");
+  ok(guardCall > -1, "the guard is called with the channels object (this slice is the region every pin below reads)");
+  // FAIL-CLOSED on the FIRST-MATCH read above (#1339 cycle-4 review P3): every
+  // pin below is scoped to the FIRST occurrence, so a second re-validation added
+  // ABOVE the guard would silently become the region under test while the real
+  // guard's channels were mutated — the inert-pin class this test exists to
+  // close, restored one layer out. Exactly one call site is the premise.
+  equal(
+    src.split(": supersedingEvidence(decision.reason, now, {").length - 1,
+    1,
+    "exactly ONE re-validation call site — the region pins below resolve it by first match, so a second one added above would be read instead of the guard",
+  );
+  const guardArgs = guardCall > -1 ? src.slice(guardCall, src.indexOf("});", guardCall)) : "";
+  for (const [literal, why] of [
+    ["lastMarkerAt: hbCtx.state.lastMarkerAt,", "the marker channel reads live state"],
+    ["lastLifeSignAt: lastHeartbeat,", "the byte channel reads the live life-sign clock — `now` here fires the channel on every tick and suppresses every kill"],
+    ["lastProgressAt: hbCtx.state.lastProgressAt,", "the progress channel reads the clause's own clock"],
+    ["startedAt,", "the progress anchor is the dispatch's start, not a re-read"],
+    ["sessionEnded: hbCtx.state.sessionEnded,", "the #191 scope gate reads live state, never the constant `false`"],
+    ["toolsInFlight: hbCtx.state.toolsInFlight,", "the in-flight scope gate reads live state, never the constant `0`"],
+  ] as const) {
+    ok(guardArgs.includes(literal), `the guard's OWN channels object carries \`${literal.trim()}\` — ${why} (cycle-4 review: a global includes() is inert for a non-unique line)`);
+  }
+  // The BYTE channel is the only evidence path when no marker ever parses
+  // (`hbEnabled === false`, or a marker failing the nonce check → `lastMarkerAt`
+  // stays 0 forever), and `silence-threshold`'s clock IS `i.lastLifeSignAt` — so
+  // an inert byte channel restores the stale-verdict kill this change exists to
+  // stop, in exactly the configuration where nothing else can catch it.
+  equal(guardArgs.split("lastLifeSignAt:").length - 1, 1, "the guard passes exactly one byte channel (no shadowed second binding)");
+  // The exemption is a WALL-CLOCK policy cap, not a liveness inference.
+  ok(
+    /decision\.reason === "max-dispatch"\s*\n\s*\? null\s*\n\s*: supersedingEvidence\(/.test(src),
+    "`max-dispatch` is exempt: a fresh byte does not make a policy-capped dispatch younger",
+  );
+  // Rate-limited, NOT one-shot: a permanent latch hides exactly the recurrence
+  // the parent must see (#1339 review).
+  ok(src.includes("let staleSuppressCount = 0;"), "the suppressions are COUNTED per dispatch, so the log can report the running total");
+  ok(
+    src.includes("now - staleSuppressLoggedAt >= STALE_SUPPRESS_RELOG_MS"),
+    "the suppression log RE-ARMS (bounded to one line per minute) — a one-shot latch would report a wedge suppressed for hours only once",
+  );
+  ok(src.includes("${staleSuppressCount} suppression(s) this dispatch"), "the log carries the count, not just the first occurrence");
+  ok(src.includes("re-deciding on the next tick (#1339)"), "the suppression states what happens next, so the operator does not read it as a lost kill");
+  // The log must never print a delta for a channel that did not move — that was
+  // the `marker +-45123ms` nonsense (#1339 review).
+  ok(
+    src.includes("(${evidence} relative to the snapshot;"),
+    "the log names the channel that ACTUALLY fired and one positive delta, never an untouched channel's negative one",
+  );
+  ok(
+    src.includes('const evidence = evidenceDelta === null ? supersededBy : `${supersededBy} +${evidenceDelta}ms`;'),
+    "the two SCOPE channels (session-end / tool-in-flight) have no timed delta and print a LABEL, not a fabricated +0ms",
+  );
+  equal(src.split("staleDecisionSuppressLogged").length - 1, 0, "the permanent one-shot latch is gone (replaced by the rate-limited counter)");
+  // The headline prints the DECISION's snapshot; the payload keeps the live read
+  // beside it, labelled. Both are clamped through the single reader.
+  ok(src.includes("const decMarkerAgeMs = decision.markerAgeMs ?? -1;"), "the kill path exposes the decision's own marker age");
+  ok(src.includes("decMarkerAgeMs=${decMarkerAgeMs}"), "the heartbeat-kill alive summary carries the decision-time age beside the live one (the #5389 pattern)");
+  // The pin below is scoped to the alive-summary TEMPLATE, not the file: a
+  // whole-file `src.includes()` for this literal is satisfiable by a COMMENT
+  // carrying the same text (#1339 cycle-4 review P2 — reproduced: deleting the
+  // field from the template and parking the literal in a `//` comment left
+  // 373/0 green). Selecting the region by FIRST MATCH is itself unsound here:
+  // THREE `const aliveSummary = ` templates exist (the hard-cap kill payload, the
+  // heartbeat-kill payload, the backstop), so the region is selected by CONTENT —
+  // `decToolCpuStallMs=` appears only in the heartbeat-kill summary — and the
+  // template count is pinned so a fourth cannot silently win the selection.
+  const aliveStarts = [...src.matchAll(/const aliveSummary = `Alive state: toolsInFlight=/g)].map((m) => m.index ?? -1);
+  equal(aliveStarts.length, 3, "three `Alive state:` templates exist (hard-cap / heartbeat-kill / backstop) — the selection below is by content, so the count is a premise");
+  const aliveTemplates = aliveStarts.map((s) => {
+    const e = s >= 0 ? src.indexOf("`;", s) : -1;
+    return e > s ? src.slice(s, e) : "";
+  });
+  const killSummaries = aliveTemplates.filter((t) => t.includes("decToolCpuStallMs="));
+  equal(killSummaries.length, 1, "exactly ONE template is the heartbeat-kill payload (`decToolCpuStallMs=` is its marker) — so the region pins below cannot read another kill path's summary");
+  const aliveSummarySrc = killSummaries[0] ?? "";
+  ok(
+    src.includes("const decMarkerAgeInvalid = decision.markerAgeInvalid === true;"),
+    "the decision's flag is read — `readMarkerAge` promises to report a clamped age to its caller, and this is that caller (cycle-4 review)",
+  );
+  equal(
+    aliveSummarySrc.split("decMarkerAgeInvalid=${decMarkerAgeInvalid}").length - 1,
+    1,
+    "the heartbeat-kill TEMPLATE prints the DECISION's invalid flag — `readMarkerAge` promises to report a clamped age, and a bare 0 cannot be told from a fresh marker (cycle-4 review)",
+  );
+  equal(
+    src.split("decMarkerAgeInvalid=${decMarkerAgeInvalid}").length - 1,
+    1,
+    "…and that literal exists NOWHERE else in the file, so a comment carrying it cannot satisfy the region pin",
+  );
+  equal(
+    aliveSummarySrc.split("lastMarkerAgeInvalid=${lastMarkerAgeInvalid}").length - 1,
+    1,
+    "the summary also prints the LIVE read's invalid flag — the decision-time read is taken before any yield and can only clamp on a backwards clock step, so the decision flag alone prints `false` beside exactly the clamped live age it exists to expose (cycle-4 review)",
+  );
+  equal(
+    src.split("lastMarkerAgeInvalid=${lastMarkerAgeInvalid}").length - 1,
+    1,
+    "…and that literal too exists nowhere else — the same comment-proofing as the decision flag",
+  );
+  ok(
+    src.includes("const liveMarkerAge = readMarkerAge(hbCtx.state.lastMarkerAt, now);") &&
+      src.includes("const lastMarkerAgeInvalid = liveMarkerAge.invalid;"),
+    "the live flag comes from the SAME read as the printed live age (a second `readMarkerAge` call could disagree with the age beside it)",
+  );
+  ok(src.includes("no life signs for ${Math.round(decMarkerAgeMs / 1000)}s"), "the cut headline prints the DECISION's age — the post-await re-read is what rendered '-1s'");
+  // The three completion/backstop payloads read `.ageMs` only (no `invalid`
+  // field). That is DELIBERATE, not an omission (#1339 review-6 P3): each takes
+  // `now = Date.now()` AT its own read, so `lastMarkerAt > now` there can only
+  // mean the WALL CLOCK stepped backwards — the case the decision-time flag
+  // already covers — whereas the tick-kill path reads AFTER an `await`, which is
+  // where a marker ingested inside the probe window makes the live read clamp.
+  // That scope is stated on `MarkerAgeReading.invalid` and in `load-policy.md`
+  // §6; the field's exact literal is already pinned to exactly one occurrence
+  // above, so no second pin is warranted (and a looser
+  // `"lastMarkerAgeInvalid="` count pin would be satisfiable by the docblock
+  // that explains the scope — the comment-satisfiable-pin class this test
+  // exists to close).
+  equal(src.split("hbCtx.state.lastMarkerAt > 0 ? Date.now() - hbCtx.state.lastMarkerAt").length - 1, 0, "no site computes the marker age by hand any more — every reader goes through `readMarkerAge`");
+  equal(src.split("hbCtx.state.lastMarkerAt > 0 ? now - hbCtx.state.lastMarkerAt : -1").length - 1, 0, "…neither on the tick clock");
+  // ⛔ THE TWO PINS ABOVE ARE SPELLING-BOUND, and a real revert of the backstop
+  // reader (the site whose comment claims "the single-reader invariant is only
+  // true if this site goes through it too") ends in `: Infinity`, so it matches
+  // NEITHER — measured (#1339 review-6): restoring
+  // `lastMarkerAt > 0 ? now - lastMarkerAt : Infinity` left 373/0 GREEN. This
+  // regex is the spelling-free form of the same invariant: any hand-rolled
+  // `lastMarkerAt > 0 ? <clock> - lastMarkerAt` ternary is caught whatever its
+  // false-branch is.
+  ok(
+    !/\blastMarkerAt > 0 \?\s*(?:Date\.now\(\)|now)\s*-/.test(src),
+    "no hand-rolled `lastMarkerAt > 0 ? <clock> - lastMarkerAt` ternary survives — a `: Infinity` / `: 0` false-branch does not exempt the raw difference from the single-reader rule (#1339 review-6 mutation: `: Infinity` survived the exact-literal pins above). The pattern recognises the `Date.now()` and `now` clocks ONLY; a RENAMED clock is caught by the positive pin below instead, which is spelling-free (#1339 re-review P3b — this message used to claim \"in any spelling\", which overstated the pattern)",
+  );
+  // ⛔ A POSITIVE `src.includes()` IS SATISFIABLE BY A COMMENTED-OUT COPY (#1339
+  // re-review P3a — measured: commenting both lines out and writing
+  // `const markerAge = Infinity;` left the suite GREEN). Positive presence
+  // claims are therefore asked of a COMMENT-STRIPPED projection, so prose
+  // cannot stand in for code. The naive strip is the one `#1339`'s wiring block
+  // above already uses (`code`), for exactly this reason.
+  const code = src.replace(/\/\/[^\n]*/g, "").replace(/\/\*[\s\S]*?\*\//g, "");
+  ok(
+    code.includes("const backstopMarkerAge = readMarkerAge(hbCtx.state.lastMarkerAt, now).ageMs;") &&
+      code.includes("const markerAge = backstopMarkerAge < 0 ? Infinity : backstopMarkerAge;"),
+    "the backstop's freshness read goes through `readMarkerAge` and maps its `-1` SENTINEL to `Infinity` — so `stateFresh` never compares a threshold against a sentinel or a negative age (the pre-#1339 shape could go negative whenever a marker was ingested between the timer's `now` and the read)",
+  );
+  // ⛔ THE SUPPRESSION ITSELF (#1339 review-6 P2). Everything above pins the
+  // helpers, the guard's ARGUMENTS and the call's POSITION — and none of it
+  // asserts that a non-null `supersededBy` actually PREVENTS the kill. Measured:
+  // `if (supersededBy) {` → `if (false as boolean) {` (fully inert guard) and
+  // deleting the block's `return;` (the realistic refactor) BOTH left 373/0
+  // GREEN — so the fix could be removed entirely with the whole file's suite
+  // green, which is the false-PASS class this PR exists to close. Pinned below
+  // structurally: the gate exists once, its block RETURNS before the kill, and
+  // the block never reaches the tree kill.
+  equal(src.split("if (supersededBy) {").length - 1, 1, "exactly ONE suppression gate — the guard's verdict is what gates the kill, and a second gate elsewhere would be a different policy");
+  const suppressIdx = src.indexOf("if (supersededBy) {");
+  const suppressEnd = suppressIdx >= 0 ? src.indexOf("clearInterval(heartbeat);", suppressIdx) : -1;
+  const suppressBlock = suppressIdx >= 0 && suppressEnd > suppressIdx ? src.slice(suppressIdx, suppressEnd) : "";
+  ok(suppressEnd > suppressIdx, "the suppression returns BEFORE `clearInterval(heartbeat)` — the tick timer must stay armed so the clause re-decides (clearing it would turn a one-tick suppression into a dead detector)");
+  ok(/^\s+return;\s*$/m.test(suppressBlock), "the suppressed path RETURNS — without this `return;` the block only LOGS and the kill executes on the superseded verdict (`#1339 review-6 mutation 2b: 373/0 GREEN without it`)");
+  ok(!suppressBlock.includes("killTreeAndEscalate"), "…and never reaches `killTreeAndEscalate()` — a kill inside the suppression block is the false kill this change exists to stop");
 });
 
 test("getTaskBackstopMs — default tool-stall + 30min; env override; 0 = off", () => {
