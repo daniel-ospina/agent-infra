@@ -93,6 +93,13 @@ jobs:
   script-validate:
     if: inputs.script-validate
     runs-on: ubuntu-latest
+    # #2055 — no bounded job in this file until now, and it is a REUSABLE shipped to consumers, so a
+    # hang lands in someone else's queue. Derivation: measured in-repo as ci.yml's `ci / script-validate`
+    # (this repo calls node-ci.yml): p50 0.1 / p90 0.2 / max 0.2 min over 10 runs (2026-11-09). That
+    # is this repo's one package; a consumer's `script-validate` walks its own script tree, so the
+    # bound is sized as a ceiling rather than at 10x: 30 min (~150x the measured max) still ends a
+    # pathological run and cannot false-block a large consumer.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - name: Validate Node.js scripts
@@ -112,6 +119,9 @@ jobs:
   skill-lint:
     if: inputs.skill-lint
     runs-on: ubuntu-latest
+    # #2055 — measured in-repo as ci-main.yml's `skill-lint`: p50 0.1 / p90 0.1 / max 0.2 min over 12
+    # runs. One frontmatter parse per skill file; 20 min is a ceiling for a consumer with thousands.
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - name: Validate skill YAML frontmatter
@@ -129,6 +139,10 @@ jobs:
 
   typecheck:
     runs-on: ubuntu-latest
+    # #2055 — measured in-repo as ci-main.yml's `extension-tests / typecheck`: p50 0.1 / p90 0.2 / max
+    # 0.2 min over 12 runs. A consumer's `tsc` over a real package is far heavier than that stub, so
+    # the bound is a ceiling: 30 min.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -156,6 +170,10 @@ jobs:
 
   lint:
     runs-on: ubuntu-latest
+    # #2055 — measured in-repo as ci-main.yml's `extension-tests / lint`: p50 0.1 / p90 0.2 / max 0.2
+    # min over 12 runs; a linter is cheaper than a typechecker, and 20 min is a ceiling for a
+    # consumer's tree.
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -194,6 +212,12 @@ jobs:
     # interpolation of the command (a quoted interpolation breaks any
     # command containing quotes — the failure-accumulator case).
     runs-on: ubuntu-latest
+    # #2055 — the longest job in this file, and the one a consumer's real suite runs in. Measured
+    # in-repo as ci-main.yml's `extension-tests / unit-test` (ci-main calls THIS file): p50 14.9 /
+    # p90 17.4 / max 17.8 min over 12 runs (2026-11-09), i.e. a genuine `npm test`, not a stub. 45 min
+    # is ~2.5x that max — enough for runner variance and a heavier consumer package, and it ends a
+    # suite that never finishes instead of leaving it to the platform's 6-hour default.
+    timeout-minutes: 45
     if: inputs.test-command != '' || inputs.test-glob != ''
     steps:
       - uses: actions/checkout@v4

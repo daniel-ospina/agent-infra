@@ -83,6 +83,14 @@ jobs:
 
   auto-file-on-failure:
     runs-on: ubuntu-latest
+    # #2055 — the sibling `enforce-skills` job has carried a 10 min bound since it was written; its
+    # two followers did not. This one runs only on `failure() && !cancelled()`, so a hang here is
+    # invisible by construction: the gate above already red, and this job would simply never finish.
+    # Measured over 14 completed runs: skipped in every one (it has not had to file since 2026-11-0x),
+    # so there is no p90 to cite — the work is a handful of `gh` calls (search for an open issue, then
+    # create or comment). 15 min matches the sibling of its `gh`-calling twin below and bounds a
+    # throttled retry loop.
+    timeout-minutes: 15
     needs: [enforce-skills]
     if: failure() && !cancelled()
     steps:
@@ -132,6 +140,9 @@ jobs:
 
   close-on-success:
     runs-on: ubuntu-latest
+    # #2055 — measured over 14 completed runs (2026-11-09): p50 12 s, p90 14 s, max 14 s (it closes
+    # the open "main broken" issue when the nightly gate goes green again). 15 min is ~64x the max.
+    timeout-minutes: 15
     needs: [enforce-skills]
     if: success()
     steps:

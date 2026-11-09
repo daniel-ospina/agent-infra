@@ -75,6 +75,12 @@ jobs:
   pipeline-compliance:
     name: Pipeline compliance gate
     runs-on: ubuntu-latest
+    # #2055 — the consumer copy of the repo's ONLY required check: unbounded, a hang here holds a
+    # consumer's queue with no bound at all. The live `agent-infra` copy of this job measured 9 s of
+    # work and carries a 20 min bound for that reason; the same number is used here so a consumer's
+    # copy cannot be the one without a bound. A job bound is a backstop (`cancelled`, which this
+    # repo's rail reads NON-RED) — it ends the hold and names the job, it is not the red.
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - name: Run pipeline compliance gate

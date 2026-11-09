@@ -1,0 +1,4 @@
+name: fixture jobs not a mapping
+on:
+  pull_request:
+jobs: nonsense

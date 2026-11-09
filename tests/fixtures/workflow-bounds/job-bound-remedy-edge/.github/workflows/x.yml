@@ -1,0 +1,15 @@
+name: fixture the remedy edge — a step budget one minute short of the ceiling
+on:
+  pull_request:
+jobs:
+  edge-359:
+    # Σ = 359 against a 20-min job bound. The remedy in the pre-359 fix said "Raise the job bound above 359
+    # and below 360" — and NO INTEGER lies strictly between 359 and 360, so the message prescribed an edit
+    # that cannot exist. The branch must fall through to "the step bounds are what must come down"
+    # (review finding, P3 — the previous condition was `knownSum < 360`, which let 359 take the raise arm).
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: nearly the whole ceiling in one step
+        timeout-minutes: 359
+        run: echo hi

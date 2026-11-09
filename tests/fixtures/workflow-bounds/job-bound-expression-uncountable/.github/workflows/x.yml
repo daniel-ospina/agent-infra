@@ -1,0 +1,22 @@
+name: fixture a job bound above an uncomputable step budget
+on:
+  workflow_call:
+    inputs:
+      step_timeout:
+        type: number
+jobs:
+  bound-under-uncountable:
+    # The numeric subtotal (200) is safely under the 300-min job bound, so this job is accepted — but
+    # the guard must SAY that the expression bound's share could not be checked, rather than certifying
+    # a sum it never computed (the class this rule was filed for, on the job-bound branch).
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+        timeout-minutes: 100
+      - name: an unevaluable bound
+        timeout-minutes: ${{ inputs.step_timeout }}
+        run: echo hi
+      - name: another bounded step
+        timeout-minutes: 100
+        run: echo hi

@@ -1,0 +1,16 @@
+name: fixture a step-only job whose bounds sum to EXACTLY the platform ceiling
+on:
+  pull_request:
+jobs:
+  sums-to-exactly-360:
+    # 180 + 180 = 360. The rule is "Σ must be BELOW 360", so equality must be REFUSED: the platform's
+    # implicit 360-minute cancel arrives at exactly the moment the second step bound would fire, so it
+    # pre-empts it. A `>` instead of a `>=` would certify this job green (review finding, P3 — every
+    # other ceiling fixture sums to 400, so the boundary itself was unpinned).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        timeout-minutes: 180
+      - name: the tail bound fires at the same instant the job is cancelled
+        timeout-minutes: 180
+        run: echo hi

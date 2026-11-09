@@ -1,0 +1,24 @@
+name: fixture bad values
+on:
+  pull_request:
+jobs:
+  zero:
+    runs-on: ubuntu-latest
+    timeout-minutes: 0
+    steps:
+      - uses: actions/checkout@v4
+  noninteger:
+    runs-on: ubuntu-latest
+    timeout-minutes: abc
+    steps:
+      - uses: actions/checkout@v4
+  empty:
+    runs-on: ubuntu-latest
+    timeout-minutes:
+    steps:
+      - uses: actions/checkout@v4
+  negative:
+    runs-on: ubuntu-latest
+    timeout-minutes: -5
+    steps:
+      - uses: actions/checkout@v4

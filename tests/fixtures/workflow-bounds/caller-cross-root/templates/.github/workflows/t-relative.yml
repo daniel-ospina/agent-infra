@@ -1,0 +1,10 @@
+name: fixture caller-cross-root — a TEMPLATE job calling a template SIBLING relatively
+on:
+  workflow_call:
+jobs:
+  calls-local:
+    # `./` names the CALLER's own root. When the caller is a TEMPLATE, that is `templates/`, not the repo
+    # root — so this resolves to templates/.github/workflows/callee-local.yml. Rooting it at the repo root
+    # (the absolute-slug rule) reported a present sibling as "does not exist": a false violation, and the
+    # one shape that discriminates the `rooted` flag in this root (review finding, P2).
+    uses: ./.github/workflows/callee-local.yml

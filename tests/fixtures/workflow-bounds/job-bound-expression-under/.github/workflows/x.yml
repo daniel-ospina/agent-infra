@@ -1,0 +1,22 @@
+name: fixture job-bound-expression-under — an EXPRESSION job bound over a subtotal WELL under the ceiling
+on:
+  workflow_dispatch:
+    inputs:
+      cap:
+        type: number
+        default: 60
+jobs:
+  expr-under:
+    runs-on: ubuntu-latest
+    # A legitimate shape: the guard cannot evaluate J, but the numeric subtotal (30) is far below the 360
+    # ceiling, so the ceiling does not bite and the job is ACCEPTED with a NOTE. This is the paired half of
+    # job-bound-expression-ceiling: without it, the fix for that finding could false-block every
+    # expression-bounded job whose steps are bounded (review finding, P2).
+    timeout-minutes: ${{ inputs.cap }}
+    steps:
+      - name: first
+        timeout-minutes: 20
+        run: echo hi
+      - name: second
+        timeout-minutes: 10
+        run: echo hi

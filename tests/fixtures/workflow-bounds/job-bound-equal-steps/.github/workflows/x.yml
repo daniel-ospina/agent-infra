@@ -1,0 +1,14 @@
+name: fixture a job bound EQUAL to its single step bound
+on:
+  pull_request:
+jobs:
+  bound-equal-to-step:
+    # J = 20 and Σ = 20. The rule is "Σ must be BELOW min(J, 360)", so equality must be REFUSED: the job
+    # is cancelled at the same instant the step bound would fire. A `>` instead of a `>=` would certify it
+    # (review finding, P3 — the only job-bound fixture was J=20 over Σ=40, so the boundary was unpinned).
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: a bound that fires exactly when the job is cancelled
+        timeout-minutes: 20
+        run: echo hi

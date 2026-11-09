@@ -1,0 +1,6 @@
+name: fixture unparseable
+on:
+  pull_request:
+jobs:
+  broken:
+    runs-on: [ubuntu-latest
