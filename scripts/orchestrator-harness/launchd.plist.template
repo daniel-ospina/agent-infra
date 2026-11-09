@@ -144,6 +144,15 @@
          pin it explicitly to override, and check swap headroom before raising it by hand. -->
     <key>MAX_LOAD</key>
     <string>__MAX_LOAD__</string>
+    <!-- ⛔ WHO SET THE CEILING, so `[cap]` can say it (agent-infra#2095). A proof copy of this loop
+         ran for 5 h 15 m applying its own DERIVED MAX_LOAD=100 while this unit said 250, and the
+         `[cap]` line carried no provenance at all — so the divergence had to be reconstructed from
+         the plist hours later. With this key the loop labels an environment-supplied MAX_LOAD as
+         `plist(launchd)` and a computed one as `derived:cores`; the two are then told apart in the
+         line that reports the ceiling in force. The value is the SOURCE CLASS, not a path: the
+         controller does not re-read this plist, and a stale path would be a claim it cannot verify. -->
+    <key>ORC_CONTROLLER_ORIGIN</key>
+    <string>launchd</string>
     <key>MAX_LANES</key>
     <string>__MAX_LANES__</string>
     <key>MAX_REVIEW</key>
