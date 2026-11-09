@@ -762,11 +762,21 @@ git -C "$F/harness" add -A
 git -C "$F/harness" commit -q -m "section 8 fixture harness"
 CC_REF="$(git -C "$F/harness" rev-parse HEAD)"
 CC_OUT=''; CC_RC=0
+# ⛔ EVERY `check` INVOCATION IN THIS FILE NEUTRALISES THE DISK TERMS, INCLUDING THE ONES THAT ARE
+# NOT ABOUT THE DISK (fresh review round 8, P1). `check` now refuses a cell that cannot fit ONE lane,
+# and the binding bound is the pre-start seam's ~8 GB — so on a runner with less than that free, an
+# arm like ":1641 a linked-worktree REPO is accepted" would report its `ok` by falling THROUGH a disk
+# refusal it never looked at (it asserts only the absence of "no git repo at"). That is a host-decided
+# success, the exact shape `disk-admission.test.sh`'s §J census forbids: `MIN_FREE_MB=500` keeps the
+# shipped floor (the arms below still assert the floor where they mean to), and the three lane terms
+# set to an EXPLICIT 0 (which the shipped gate honours) take the lane-fit arm out of every arm whose
+# subject is something else. §(h2)/§(h3) opt back in through `prov()`.
 cellcheck() {
   # $1 = PROBE_RC, $2 = TORTOISE_REPO to make AMBIENT in the supervisor's own shell ('' = none).
   # `TORTOISE=` is cleared so the alias cannot make an unforeseen case look like the one under test.
   CC_OUT="$(PROBE_RC="$1" TORTOISE_REPO="${2:-}" TORTOISE= CELL_HOME="$F/home" ENV_FILE="$F/keys.env" SESSION="ai1736-check-$$" \
-            O="$F/o" REPO="$F/repo" HARNESS="$F/harness" HARNESS_REPO="$AI" HARNESS_FETCH=0 HARNESS_REF="$CC_REF" PATH="$F/bin:$PATH" bash "$SUP" check 2>&1)"
+            O="$F/o" REPO="$F/repo" HARNESS="$F/harness" HARNESS_REPO="$AI" HARNESS_FETCH=0 HARNESS_REF="$CC_REF" PATH="$F/bin:$PATH" \
+            MIN_FREE_MB=500 DISK_MIN_FREE_MB=500 DISK_LANE_TREE_MB=0 DISK_LANE_SELF_MB=0 DISK_LANE_RESERVE_MB=0 bash "$SUP" check 2>&1)"
   CC_RC=$?
 }
 cellcheck 3
@@ -956,7 +966,8 @@ rm -f "$AUTH"
 CC_OUT="$(PROBE_RC=0 TORTOISE_REPO= TORTOISE= CELL_HOME="$F/home" ENV_FILE="$F/keys.env" SESSION="ai2024-zai-$$" \
           PI_LANE_PROVIDER=zai \
           O="$F/o" REPO="$F/repo" HARNESS="$F/harness" HARNESS_REPO="$AI" HARNESS_FETCH=0 HARNESS_REF="$CC_REF" \
-          PATH="$F/bin:$PATH" bash "$SUP" check 2>&1)"; CC_RC=$?
+          PATH="$F/bin:$PATH" MIN_FREE_MB=500 DISK_MIN_FREE_MB=500 DISK_LANE_TREE_MB=0 DISK_LANE_SELF_MB=0 DISK_LANE_RESERVE_MB=0 \
+          bash "$SUP" check 2>&1)"; CC_RC=$?
 [ "$CC_RC" -ne 0 ] && ok "check REFUSES an UNLISTED lane provider with no stored credential and no keys.env key" \
                    || bad "check certified a box with no credential for PI_LANE_PROVIDER=zai (rc=$CC_RC)"
 case "$CC_OUT" in
@@ -1115,14 +1126,19 @@ PH=""; PPATH=""; PREF=""; PROV_OUT=''; PROV_RC=0
 prov() {
   local sub="$1"; shift
   rm -f "$P/tmuxup"
+  # ⛔ THE FOUR DISK TERMS STAY ON ONE LINE, WITH `bash "$SUP"` — do NOT re-wrap them across
+  # continuations (fresh review round 8, P1 — MEASURED as CI-red on `bash-suites (3)`).
+  # `disk-admission.test.sh`'s §J census reads this file for a suite that DRIVES the pre-start seam
+  # (`wt_provision`) and requires an EFFECTIVE four-term neutralisation *on one line*; it is line-based
+  # (`provision_neutralises_effectively`), so the identical, genuinely-effective env prefix spread over
+  # three continuation lines reads as ABSENT. Measured shape: with the terms wrapped, §J reported this
+  # suite as a seam driver with no neutralisation and reddened `disk-admission.test.sh`; the terms are
+  # unchanged here, only their line placement is.
   PROV_OUT="$(PATH="${PPATH:+$PPATH:}$P/bin:$PATH" PROV_TMUX_UP="$P/tmuxup" \
-              MIN_FREE_MB="${PROV_FLOOR-500}" DISK_MIN_FREE_MB="${PROV_DISK_FLOOR:-}" \
-              DISK_LANE_TREE_MB="${PROV_TREE-0}" DISK_LANE_SELF_MB="${PROV_SELF-0}" \
-              DISK_LANE_RESERVE_MB="${PROV_RESERVE-0}" \
               CELL_HOME="$P/home" ENV_FILE="$P/keys.env" SESSION="ai1745-$$" \
               O="$P/o" REPO="${PROV_REPO:-$P/repo}" HARNESS_REPO="$AI" HARNESS_FETCH=0 HARNESS_REF="${PREF:-origin/main}" \
               HARNESS_PIN_DIR="$P/pin" HARNESS_PIN_FILE="$P/home/.harness-path" HARNESS="$PH" \
-              bash "$SUP" "$sub" "$@" 2>&1)"
+              MIN_FREE_MB="${PROV_FLOOR-500}" DISK_MIN_FREE_MB="${PROV_DISK_FLOOR:-}" DISK_LANE_TREE_MB="${PROV_TREE-0}" DISK_LANE_SELF_MB="${PROV_SELF-0}" DISK_LANE_RESERVE_MB="${PROV_RESERVE-0}" bash "$SUP" "$sub" "$@" 2>&1)"
   PROV_RC=$?
 }
 
@@ -1465,10 +1481,21 @@ gate_worktree_need_ovr() { # gate_worktree_need_ovr <SELF_MB> <floor-mb> -> the 
   env -u MIN_FREE_MB -u DISK_LANE_TREE_MB -u DISK_LANE_RESERVE_MB DISK_LANE_SELF_MB="$1" \
     DISK_MIN_FREE_MB="${2:-500}" bash -c 'set -u; . "$1" >/dev/null 2>&1 || exit 3; disk_worktree_need' _ "$GATE" 2>/dev/null
 }
+gate_lane_costs() { # gate_lane_costs <target> <floor-mb> -> "<tree> <self> <reserve>", per spawn-gate.sh
+  env -u MIN_FREE_MB -u DISK_LANE_TREE_MB -u DISK_LANE_SELF_MB -u DISK_LANE_RESERVE_MB \
+    DISK_MIN_FREE_MB="$2" bash -c 'set -u; . "$1" >/dev/null 2>&1 || exit 3; disk_lane_costs "$2"' _ "$GATE" "$1" 2>/dev/null
+}
 PROV_FLOOR=500; PROV_TREE=; PROV_SELF=; PROV_RESERVE=    # the SHIPPED derivation, no overrides
 REF_PLAIN="$(gate_need "$P/repo" 500)"
 case "${REF_PLAIN:-}" in
   ''|*[!0-9]*) bad "could not read spawn-gate.sh's own lane requirement (got '${REF_PLAIN:-}') — every arm below would be vacuous"; REF_PLAIN=2064 ;;
+esac
+# The CLASS and TERMS the live arm charges for this fixture, straight out of the shipped gate — the
+# reference the mirror's classifier is graded against below.
+REF_PLAIN_TERMS="$(gate_lane_costs "$P/repo" 500)"
+read -r REF_PLAIN_TREE REF_PLAIN_SELF REF_PLAIN_RES <<<"${REF_PLAIN_TERMS:-}"
+case "${REF_PLAIN_TREE}${REF_PLAIN_SELF}${REF_PLAIN_RES}" in
+  ''|*[!0-9]*) bad "could not read spawn-gate.sh's own PLAIN lane costs (got '${REF_PLAIN_TERMS:-}')"; REF_PLAIN_TREE=64; REF_PLAIN_SELF=64; REF_PLAIN_RES=2000 ;;
 esac
 [ "$REF_PLAIN" -gt 500 ]; rc=$?
 [ "$rc" -eq 0 ] && ok "spawn-gate.sh's LIVE arm requirement for a NON-python target is ${REF_PLAIN}MB, strictly ABOVE the 500MB floor — the band this change closes is real" \
@@ -1509,6 +1536,20 @@ case "$PROV_OUT" in
   *"ONE lane needs ${REF_BIND}MB"*) ok "…and reports the requirement it admitted on" ;;
   *) bad "check did not report the requirement it used — $PROV_OUT" ;;
 esac
+# ⛔ THE CLASSIFIER HALF IS PINNED BEHAVIOURALLY, NOT BY THE ASSERTION'S PROSE (fresh review round 8,
+# P2 — MEASURED). `need = max(live, seam)` and the seam charges the PYTHON class unconditionally, so
+# `need == seam` in EVERY configuration: a `sup_python_target` mutant (markers ignored, or every target
+# read as python) moves no refusal/pass boundary, and the boundary arms beside it stayed green under
+# both.
+# What DOES move is the class and the terms the verdict prints — so that is what is graded here, against
+# `disk_lane_costs`'s own answer for the same fixture. Measured pre-fix: `sup_python_target() { return 1; }`
+# printed `[plain]: 2064MB` for the PYTHON fixture and `{ return 0; }` printed `[python]: 8144MB` for
+# the plain one; each reddens exactly one of these two arms.
+case "$PROV_OUT" in
+  *"[plain]: ${REF_PLAIN}MB = max(tree ${REF_PLAIN_TREE}, self ${REF_PLAIN_SELF})MB + ${REF_PLAIN_RES}MB reserve"*)
+     ok "…and it prints the PLAIN class with spawn-gate.sh's own plain terms (${REF_PLAIN_TREE}/${REF_PLAIN_SELF} + ${REF_PLAIN_RES}) — the classifier is load-bearing, not a log decoration" ;;
+  *) bad "the live arm's printed class/terms do not match the shipped gate's PLAIN derivation (want '[plain]: ${REF_PLAIN}MB = max(tree ${REF_PLAIN_TREE}, self ${REF_PLAIN_SELF})MB + ${REF_PLAIN_RES}MB reserve') — $PROV_OUT" ;;
+esac
 # ⛔ A PYTHON TARGET MUST BE DISCRIMINATED FROM A PLAIN ONE. This is the half that made the measured
 # cells unable to work (a tortoise lane materialises ~6GB of venv on a cold cache; an agent-infra
 # worktree installs nothing). A mirror that stopped reading package-manager markers would answer the
@@ -1520,6 +1561,11 @@ REF_PY="$(gate_need "$P/pyrepo" 500)"
 [ "${REF_PY:-0}" -gt "$REF_PLAIN" ]; rc=$?
 [ "$rc" -eq 0 ] && ok "a PYTHON target costs more than a plain one at the same floor (${REF_PY}MB vs ${REF_PLAIN}MB) — the derivation is target-specific" \
                 || bad "the python target was not discriminated (${REF_PY:-?} vs ${REF_PLAIN}) — the marker set or the constants are not applied"
+REF_PY_TERMS="$(gate_lane_costs "$P/pyrepo" 500)"
+read -r REF_PY_TREE REF_PY_SELF REF_PY_RES <<<"${REF_PY_TERMS:-}"
+case "${REF_PY_TREE}${REF_PY_SELF}${REF_PY_RES}" in
+  ''|*[!0-9]*) bad "could not read spawn-gate.sh's own PYTHON lane costs (got '${REF_PY_TERMS:-}')"; REF_PY_TREE=350; REF_PY_SELF=6144; REF_PY_RES=2000 ;;
+esac
 PROV_REPO="$P/pyrepo"
 mkdf "$P/pybelow" $(( (REF_PY - 1) * 1024 ))
 PPATH="$P/pybelow"; prov check
@@ -1529,6 +1575,13 @@ mkdf "$P/pyat" $(( REF_PY * 1024 ))
 PPATH="$P/pyat"; prov check
 [ "$PROV_RC" -eq 0 ] && ok "check PASSES a python-target cell AT its lane cost (no false block on a cell that really can work)" \
                      || bad "check: FALSE BLOCK of a python cell at exactly ${REF_PY}MB — $PROV_OUT"
+# …and the class it PRINTED for that fixture is the python one, with the gate's own python terms. This is
+# the arm that reddens when the marker classifier stops reading markers (or reads every target as python).
+case "$PROV_OUT" in
+  *"[python]: ${REF_PY}MB = max(tree ${REF_PY_TREE}, self ${REF_PY_SELF})MB + ${REF_PY_RES}MB reserve"*)
+     ok "…and it prints the PYTHON class with spawn-gate.sh's own python terms (${REF_PY_TREE}/${REF_PY_SELF} + ${REF_PY_RES}) — a mirror that stopped reading markers cannot pass this" ;;
+  *) bad "the live arm did NOT print the python class/terms for a python fixture (want '[python]: ${REF_PY}MB = max(tree ${REF_PY_TREE}, self ${REF_PY_SELF})MB + ${REF_PY_RES}MB reserve') — the classifier is inert — $PROV_OUT" ;;
+esac
 PROV_REPO=""
 
 # ⛔ THE REFUSAL MUST PRINT THE **EFFECTIVE** TERMS (review round 7, Issue 2). `DISK_LANE_SELF_MB` is
@@ -1638,7 +1691,9 @@ PH="$(cat "$P/home/.harness-path" 2>/dev/null)"
 git -C "$P/repo" worktree add -q --detach "$P/repowt" HEAD 2>/dev/null || true
 PROV_OUT="$(PATH="$P/bin:$PATH" CELL_HOME="$P/home" ENV_FILE="$P/keys.env" SESSION="ai1745-$$" \
             O="$P/o" REPO="$P/repowt" HARNESS_REPO="$AI" HARNESS_FETCH=0 \
-            HARNESS_PIN_FILE="$P/home/.harness-path" HARNESS="$PH" bash "$SUP" check 2>&1)"
+            HARNESS_PIN_FILE="$P/home/.harness-path" HARNESS="$PH" \
+            MIN_FREE_MB=500 DISK_MIN_FREE_MB=500 DISK_LANE_TREE_MB=0 DISK_LANE_SELF_MB=0 DISK_LANE_RESERVE_MB=0 \
+            bash "$SUP" check 2>&1)"
 PROV_RC=$?
 case "$PROV_OUT" in
   *"no git repo at"*|*"is not a git checkout"*) bad "check FALSE-BLOCKED a linked-worktree REPO" ;;
@@ -2174,6 +2229,7 @@ D2_OUT=''; D2_RC=0
 D2_OUT="$(env -u HARNESS CELL_HOME="$D2/home" ENV_FILE="$D2/keys.env" SESSION="ai1745-pinres-$$" \
           O="$D2/o" REPO="$D2/repo" HARNESS_REPO="$AI" HARNESS_FETCH=0 HARNESS_REF=origin/main \
           HARNESS_PIN_DIR="$D2/pin" HARNESS_PIN_FILE="$D2/home/.harness-path" \
+          MIN_FREE_MB=500 DISK_MIN_FREE_MB=500 DISK_LANE_TREE_MB=0 DISK_LANE_SELF_MB=0 DISK_LANE_RESERVE_MB=0 \
           bash "$SUP" check 2>&1)"; D2_RC=$?
 [ "$D2_RC" -ne 0 ] && ok "check REFUSED: it looked at the RECORDED pin (absent), not the sibling harness" \
                    || bad "check silently fell back to the sibling harness while the record named a pin — $D2_OUT"
@@ -2206,6 +2262,7 @@ E_OUT=''; E_RC=0
 E_OUT="$(PATH="$P/bin:$PATH" CELL_HOME="$E/home" ENV_FILE="$E/keys.env" SESSION="ai1745-cv-$$" O="$E/o" REPO="$E/repo" \
          HARNESS_REPO="$AI" HARNESS_FETCH=0 HARNESS_REF=origin/main HARNESS_PIN_DIR="$E/pin" \
          HARNESS_PIN_FILE="$E/home/.harness-path" HARNESS="$E/h/scripts/orchestrator-harness" \
+         MIN_FREE_MB=500 DISK_MIN_FREE_MB=500 DISK_LANE_TREE_MB=0 DISK_LANE_SELF_MB=0 DISK_LANE_RESERVE_MB=0 \
          bash "$SUP" check 2>&1)"; E_RC=$?
 [ "$E_RC" -ne 0 ] && ok "check REFUSED a harness whose cleanliness cannot be verified" \
                   || bad "check PASSED a harness whose 'git status' cannot run — cannot-verify read as clean: $E_OUT"
@@ -2618,7 +2675,9 @@ do
   T7D_OUT="$(env -u REPO Q_STATE="$T7D/st-$T7D_N" PATH="$Q/bin:$PATH" CELL_HOME="$Q/home" \
              ENV_FILE="$Q/keys.env" OR=acme/trailslash SESSION="ai3188-$T7D_N-$$" O="$T7D/o-$T7D_N" \
              WORKDIR="$t7d_repo" HARNESS="$Q/harness" HARNESS_REPO="$AI" HARNESS_FETCH=0 \
-             HARNESS_REF="$Q_REF" bash "$SUP" check 2>&1)"; T7D_RC=$?
+             HARNESS_REF="$Q_REF" \
+             MIN_FREE_MB=500 DISK_MIN_FREE_MB=500 DISK_LANE_TREE_MB=0 DISK_LANE_SELF_MB=0 DISK_LANE_RESERVE_MB=0 \
+             bash "$SUP" check 2>&1)"; T7D_RC=$?
   case "$T7D_OUT" in
     *"REPO was not set — using $t7d_real"*)
       ok "(7d) the auto-derive adopts a checkout whose origin is '$t7d_spelling' (trailing slash = same repo)" ;;
@@ -2651,7 +2710,9 @@ git -C "$T7D/other" remote set-url origin "https://github.com/acme/something-els
 T7D_OUT="$(env -u REPO Q_STATE="$T7D/st-other" PATH="$Q/bin:$PATH" CELL_HOME="$Q/home" \
            ENV_FILE="$Q/keys.env" OR=acme/trailslash SESSION="ai3188-other-$$" O="$T7D/o-other" \
            WORKDIR="$T7D/other" HARNESS="$Q/harness" HARNESS_REPO="$AI" HARNESS_FETCH=0 \
-           HARNESS_REF="$Q_REF" bash "$SUP" check 2>&1)"; T7D_RC=$?
+           HARNESS_REF="$Q_REF" \
+           MIN_FREE_MB=500 DISK_MIN_FREE_MB=500 DISK_LANE_TREE_MB=0 DISK_LANE_SELF_MB=0 DISK_LANE_RESERVE_MB=0 \
+           bash "$SUP" check 2>&1)"; T7D_RC=$?
 [ "$T7D_RC" -ne 0 ] && ok "(7d) the trailing-slash shape naming ANOTHER repo is still REFUSED" \
                    || bad "(7d) adopted a trailing-slash origin that names another repo — $T7D_OUT"
 case "$T7D_OUT" in
@@ -3978,7 +4039,9 @@ qcheck() { qcheck_pin "$Q/pin"; }
 qcheck_pin() { # $1 = HARNESS_PIN_DIR
   QQ_OUT="$(PATH="$Q/bin:$PATH" CELL_HOME="$Q/home" ENV_FILE="$Q/keys.env" SESSION="ai1852-$$" \
             O="$Q/o" REPO="$Q/repo" HARNESS="$QH" HARNESS_REPO="$AI" HARNESS_FETCH=0 HARNESS_REF="$QREF" \
-            HARNESS_PIN_DIR="$1" HARNESS_PIN_FILE="$Q/home/.harness-path" bash "$SUP" check 2>&1)"
+            HARNESS_PIN_DIR="$1" HARNESS_PIN_FILE="$Q/home/.harness-path" \
+            MIN_FREE_MB=500 DISK_MIN_FREE_MB=500 DISK_LANE_TREE_MB=0 DISK_LANE_SELF_MB=0 DISK_LANE_RESERVE_MB=0 \
+            bash "$SUP" check 2>&1)"
   QQ_RC=$?
 }
 
@@ -4480,7 +4543,9 @@ git -C "$D3/we'ird" remote set-url origin https://github.com/acme/widget.git
 D3_OUT=''; D3_RC=0
 D3_OUT="$(env -u REPO Q_STATE="$D3/st" PATH="$D3Q/bin:$PATH" CELL_HOME="$D3Q/home" ENV_FILE="$D3Q/keys.env" \
          OR=acme/widget SESSION="ai1935-$$" O="$D3/o" WORKDIR="$D3/we'ird" HARNESS="$D3Q/harness" HARNESS_REPO="$AI" \
-         HARNESS_FETCH=0 HARNESS_REF="$Q_REF" bash "$SUP" check 2>&1)"; D3_RC=$?
+         HARNESS_FETCH=0 HARNESS_REF="$Q_REF" \
+         MIN_FREE_MB=500 DISK_MIN_FREE_MB=500 DISK_LANE_TREE_MB=0 DISK_LANE_SELF_MB=0 DISK_LANE_RESERVE_MB=0 \
+         bash "$SUP" check 2>&1)"; D3_RC=$?
 [ "$D3_RC" -ne 0 ] && ok "check REFUSED a DERIVED checkout path carrying a quote" \
                    || bad "check ACCEPTED a derived REPO carrying a quote — it would be interpolated into the tmux command string: $D3_OUT"
 case "$D3_OUT" in
@@ -4494,7 +4559,9 @@ git -C "$D3/fine" remote set-url origin https://github.com/acme/widget.git
 D4_OUT=''; D4_RC=0
 D4_OUT="$(env -u REPO Q_STATE="$D3/st2" PATH="$D3Q/bin:$PATH" CELL_HOME="$D3Q/home" ENV_FILE="$D3Q/keys.env" \
          OR=acme/widget SESSION="ai1935b-$$" O="$D3/o2" WORKDIR="$D3/fine" HARNESS="$D3Q/harness" HARNESS_REPO="$AI" \
-         HARNESS_FETCH=0 HARNESS_REF="$Q_REF" bash "$SUP" check 2>&1)"; D4_RC=$?
+         HARNESS_FETCH=0 HARNESS_REF="$Q_REF" \
+         MIN_FREE_MB=500 DISK_MIN_FREE_MB=500 DISK_LANE_TREE_MB=0 DISK_LANE_SELF_MB=0 DISK_LANE_RESERVE_MB=0 \
+         bash "$SUP" check 2>&1)"; D4_RC=$?
 D3F_REAL="$(cd "$D3/fine" && pwd -P)"
 case "$D4_OUT" in
   *"REPO was not set — using $D3F_REAL"*) ok "the control case DERIVES a quote-free checkout (the guard is not a general refusal)" ;;
