@@ -516,8 +516,13 @@ resolve_repo() {
 # ONE actionable line, on the verbs that cannot work without a checkout. `status` deliberately does
 # not call it: it is the verb an operator runs to DISCOVER this, so it must still answer.
 assert_repo() {
+  # ⛔ $1 IS THE ASKING VERB, AND ONLY `stop` NEEDS IT (review P3, #2093). Every other verb declines to
+  # START something, so its refusal is the whole story; `stop` declined to END something, and an
+  # operator reading that must be told nothing was stopped and how to stop anyway. This leg was the ONE
+  # queue-unusable path that reached `die` without the suffix — so on a cell whose `keys.env` is missing
+  # (a plausible reason to be stopping it) the new pre-flight refused with no way past it.
   if ! resolve_repo; then
-    die "REPO is not set and no single checkout could be derived from ${REPO_SEEN:-the provisioning candidates} — set REPO=<a checkout of the repo this cell should work> (e.g. in $ENV_FILE), or clone it to /tmp/cell"
+    die "REPO is not set and no single checkout could be derived from ${REPO_SEEN:-the provisioning candidates} — set REPO=<a checkout of the repo this cell should work> (e.g. in $ENV_FILE), or clone it to /tmp/cell.${1:+ $(queue_refusal_suffix "$1")}"
   fi
   # ⛔ THE GUARD MUST SEE THE VALUE THAT IS INTERPOLATED, not only the one the OPERATOR passed
   # (agent-infra#1935 review). `cmd_start` validates REPO before this derives it — and skips an
@@ -1695,7 +1700,7 @@ assert_queue_target() {
   # ⛔ REPO first: with no checkout, every QUEUE_STATE below is a SYMPTOM, and the old message read
   # `cannot read the QUEUE … 'git -C  remote get-url origin' returned no URL` — an error about an
   # empty path. The cause is the missing checkout, so name it.
-  [ -n "$REPO" ] || assert_repo
+  [ -n "$REPO" ] || assert_repo "$verb"
   case "$QUEUE_STATE" in
     derived|explicit) return 0 ;;
   esac
@@ -1708,7 +1713,15 @@ assert_queue_target() {
   # shell: $ENV_FILE is sourced, and an ambient export is inherited). The message names BOTH, because a
   # `sed` that silently changed nothing would send the operator back to a refusal with no new
   # information — the exact dead end this issue is about.
-  local onefix="ONE-LINE FIX: let the queue follow the checkout — sed -i '/^OR=/d' '$ENV_FILE' (drop the OR export instead if that is where yours is set) — after which the queue derives from the checkout and targets '$QUEUE_DERIVED'; to point the cell at '$QUEUE_DECLARED' instead, $needs"
+  # ⛔ AND THE PATTERN MATCHES EVERY SHAPE THE FILE ITSELF COUNTS AS AN `OR` LINE (review P1, #2093).
+  # A column-0 `^OR=` anchor is NOT that shape: `sup_env_file_carries` (`grep -Eq
+  # "^[[:space:]]*(export[[:space:]]+)?$1[[:space:]]*="`) accepts the indented and `export OR=` forms,
+  # `lane-env.sh` names `declare -x OR=` as "exactly what `export -p > keys.env` writes", and
+  # `lane.sh` records the measured cell shape as `export OR=<owner/name>`. On those a `^OR=` sed matches
+  # nothing, exits 0 anyway (GNU sed's status does not depend on a match), and the operator is returned
+  # to an identical refusal — the dead end the paragraph above exists to prevent. So the anchor is the
+  # file's OWN reader's, and the `declare -x` form the writer emits is covered too.
+  local onefix="ONE-LINE FIX: let the queue follow the checkout — sed -i -E '/^[[:space:]]*(export[[:space:]]+|declare -x[[:space:]]+)?OR[[:space:]]*=/d' '$ENV_FILE' (this matches the column-0, indented, 'export OR=' and 'declare -x OR=' shapes alike; drop an ambient OR export yourself if that is where yours is set) — after which the queue derives from the checkout and targets '$QUEUE_DERIVED'; to point the cell at '$QUEUE_DECLARED' instead, $needs"
   case "$QUEUE_STATE" in
     mismatch)
       die "the QUEUE and the CHECKOUT name DIFFERENT repos — this box is MERGE-INERT: the queue targets '$QUEUE_DECLARED' (OR) but $REPO is a checkout of '$QUEUE_DERIVED' (origin $QUEUE_REMOTE). A controller on this pair dispatches $QUEUE_DECLARED PRs from a $QUEUE_DERIVED tree: its candidate pre-flight cannot run there, every candidate comes back unqueryable, and every '$QUEUE_DECLARED' merge looks for that repo's merge rail inside a '$QUEUE_DERIVED' checkout and refuses — so the queue never advances while every other observable reads green (agent-infra#1901, #1764). $onefix.${verb:+ $(queue_refusal_suffix "$verb")}"
@@ -3997,8 +4010,16 @@ unit_stop_effect_verdict() { # <unit>
 # that could not be redone costs the cell and its claim leases.
 stop_would_end_something() {
   local p
+  # ⛔ "SOMETHING A STOP WOULD END" MUST BE SOMETHING **THIS STATE DIR** OWNS (review P2, #2093).
+  # `$SESSION` is a MACHINE-SCOPED NAME (`orch` by default) — one name for every state dir on the box —
+  # and this file already carries that as a recorded decision with its own reproduction (#1856, see the
+  # kill path below): "a session with this name exists" is NOT evidence that THIS repo's controller is
+  # in it. The kill path honours it; this pre-flight did not, so a cell that is already down for itself
+  # but sees a PEER's `orch` session would be refused `stop` with "NOTHING WAS STOPPED … repair the
+  # pair", pointing at a session it does not own — a false block that contradicts the narrowness this
+  # function exists for, twice over (its own comment below and `#2093`'s doc). Proven, or not counted.
   [ -f "$ROLES_DIR/.desired" ] && return 0        # the marker `stop` removes FIRST
-  tmux has-session -t "$SESSION" 2>/dev/null && return 0
+  tmux has-session -t "$SESSION" 2>/dev/null && session_names_own_state_dir "$SESSION" && return 0
   sup_loop_alive && return 0                       # doctor loop, or its in-flight restart child
   p="$(owned_controller_pids 2>/dev/null)" || return 0   # unreadable table: assume yes
   [ -n "$p" ] && return 0

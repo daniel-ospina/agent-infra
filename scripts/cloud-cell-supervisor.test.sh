@@ -2215,6 +2215,12 @@ case "${1:-}" in
     : > "$S/up"; printf '%s\n' "$cmd" > "$S/cmd"
     exit 0 ;;
   ls) exit 0 ;;
+  # ⛔ STATEFUL, LIKE EVERY OTHER tmux DOUBLE IN THIS SUITE (review P2, #2093). Without this arm a
+  # `kill-session` fell through to `*) exit 0` above, so `$S/up` survived ANY stop — which made the
+  # §12b assertion "NOTHING LOST: the controller session was not killed" INERT: it passed on the
+  # pre-fix code, on the post-fix code, and on every mutant of #2093, while carrying the strongest claim
+  # the change exists to establish. A double that cannot be killed cannot prove a kill did not happen.
+  kill-session) rm -f "$S/up"; exit 0 ;;
   *) exit 0 ;;
 esac
 SH
@@ -2490,7 +2496,7 @@ esac
 # …and it hands over the ONE-LINE fix as a command, not a description: Required #3 of #2093 is a repair
 # path that does not require reading the supervisor's source.
 case "$Q_OUT" in
-  *"sed -i '/^OR=/d' '$Q/keys.env'"*) ok "check's refusal carries a copy-pasteable one-line fix (the exact ENV_FILE, not a placeholder)" ;;
+  *"sed -i -E '/^[[:space:]]*(export[[:space:]]+|declare -x[[:space:]]+)?OR[[:space:]]*=/d' '$Q/keys.env'"*) ok "check's refusal carries a copy-pasteable one-line fix (the exact ENV_FILE, not a placeholder)" ;;
   *) bad "check's refusal does not carry the one-line fix — $Q_OUT" ;;
 esac
 
@@ -2678,7 +2684,7 @@ case "$Q_OUT" in
   *) bad "stop's refusal does not name MERGE-INERT — $Q_OUT" ;;
 esac
 case "$Q_OUT" in
-  *"sed -i '/^OR=/d' '$Q/keys.env'"*) ok "stop's refusal carries the one-line fix, with this cell's real ENV_FILE" ;;
+  *"sed -i -E '/^[[:space:]]*(export[[:space:]]+|declare -x[[:space:]]+)?OR[[:space:]]*=/d' '$Q/keys.env'"*) ok "stop's refusal carries the one-line fix, with this cell's real ENV_FILE" ;;
   *) bad "stop's refusal does not carry a copy-pasteable fix — $Q_OUT" ;;
 esac
 # …and it says, in the message, that the refusal is a pre-flight and how to override it. A stop that
@@ -2772,6 +2778,108 @@ esac
 [ "$(sgen "$S5")" = 4 ] \
   && ok "stop --force bumps the generation (an in-flight start is still fenced)" \
   || bad "stop --force did not bump the generation (got '$(sgen "$S5")')"
+
+# (4b) THE ONE-LINE FIX MUST MATCH EVERY SHAPE A CELL'S keys.env ACTUALLY CARRIES (review P1, #2093).
+# The first version anchored at `^OR=`, which matches a COLUMN-0 line only — while this file's own
+# reader for the same question (`sup_env_file_carries`) accepts `[[:space:]]*(export )?OR=`, `lane.sh`
+# records the measured cell shape as `export OR=<owner/name>`, and `lane-env.sh` names `declare -x OR=`
+# as "exactly what `export -p > keys.env` writes". On those the repair `sed` matched nothing, EXITED 0
+# anyway (GNU sed's status does not depend on a match), and sent the operator back to an identical
+# refusal — the dead end the message exists to prevent, and Required #3 of the issue failing on the
+# documented shape. So the arm does not grep the printed string for a shape: it EXECUTES it against a
+# keys.env in each real form and asserts the OR line is gone. A message that merely LOOKS wider would
+# still pass a grep, which is how the defect shipped in the first place.
+_fix_line() { printf '%s' "$1" | sed -n "s/.*ONE-LINE FIX: let the queue follow the checkout — \(sed -i[^;]*\) (this matches.*/\1/p"; }
+mkdir -p "$Q/st2093-fixmsg/o"
+qverb check "$Q/agent-repo" "$Q/st2093-fixmsg" daniel-ospina/tortoise
+Q_FIX="$(_fix_line "$Q_OUT")"
+[ -n "$Q_FIX" ] && ok "the refusal prints a runnable sed (extracted from the message, not grepped)" \
+                || bad "could not extract a runnable repair command from the refusal: $Q_OUT"
+# ⛔ THE COMMAND IS RUN **AS PRINTED**, ON THE FILE IT NAMES. The printed message interpolates
+# `$ENV_FILE` (the supervisor's own variable), so the command names `$Q/keys.env` literally — there is
+# no placeholder to substitute. An earlier version of this arm rewrote a `$ENV_FILE` token that is not
+# in the string, so the `sed` edited `$Q/keys.env` while the assertions read a DIFFERENT file: all four
+# shapes «failed» against good code, and the surviving-REPO conjunct passed vacuously on a sed that had
+# touched nothing. So: seed the file the command targets, run it verbatim, restore.
+cp "$Q/keys.env" "$Q/keys.env.st2093-bak"
+for _shape in 'OR=daniel-ospina/tortoise' 'export OR=daniel-ospina/tortoise' '  export OR=daniel-ospina/tortoise' 'declare -x OR="daniel-ospina/tortoise"'; do
+  printf 'REPO=%s\n%s\nAI_REVIEW_GATE_KEY=stub\n' "$Q/agent-repo" "$_shape" > "$Q/keys.env"
+  eval "$Q_FIX" >/dev/null 2>&1
+  grep -Eq '^[[:space:]]*(export[[:space:]]+|declare -x[[:space:]]+)?OR[[:space:]]*=' "$Q/keys.env" \
+    && bad "the printed one-line fix did NOT remove the OR line in the shape [$_shape] — the operator is sent back to an identical refusal" \
+    || ok "the printed one-line fix removes the OR line written as [$_shape]"
+  # ⛔ DISCRIMINATING, not a survivor check: the REPO line AND the unrelated key must BOTH still be
+  # there, so a `sed` that deleted the file (or died on parse) cannot pass this arm.
+  { grep -q '^REPO=' "$Q/keys.env" && grep -q '^AI_REVIEW_GATE_KEY=stub$' "$Q/keys.env"; } \
+    && ok "…and leaves the REPO line and the other keys alone in that shape" \
+    || bad "the one-line fix damaged the rest of keys.env for [$_shape] — it must touch OR only"
+done
+# NON-VACUITY CONTROL: the anchor this arm replaced (`^OR=`, column 0 only) must NOT remove the exported
+# shape. Without this, a suite that only ever exercises `OR=` at column 0 would stay green on the defect.
+printf 'REPO=%s\nexport OR=daniel-ospina/tortoise\n' "$Q/agent-repo" > "$Q/keys.env"
+sed -i '/^OR=/d' "$Q/keys.env" 2>/dev/null
+grep -Eq '^[[:space:]]*(export[[:space:]]+)?OR[[:space:]]*=' "$Q/keys.env" \
+  && ok "control: the pre-fix column-0 anchor really does NOT match the exported shape (the arm is not vacuous)" \
+  || bad "control failed: the old ^OR= anchor removed an 'export OR=' line, so this arm cannot distinguish the fix from the defect"
+cp "$Q/keys.env.st2093-bak" "$Q/keys.env"; rm -f "$Q/keys.env.st2093-bak"
+
+# (4c) A SESSION THIS STATE DIR DOES NOT OWN IS NOT "SOMETHING TO LOSE" (review P2, #2093). `$SESSION`
+# is machine-scoped (`orch` by default) — one name for every state dir on the box, which this file
+# carries as a recorded decision with its own reproduction (#1856: prove the session holds something
+# this state dir owns BEFORE killing). Without that proof in the pre-flight, a cell that is already down
+# for itself but sees a PEER's `orch` session is refused `stop` with "repair the pair", pointing at a
+# session it does not own — a false block on the one verb an operator reaches for on a box that is
+# wrong. The assertion is deliberately the GATE's silence, not rc=0: `stop` refuses an unproven peer
+# kill for its own (correct) reason, and grading that would be grading #1856, not this change.
+S7="$Q/st2093-peer"; rm -rf "$S7"; mkdir -p "$S7/o/state/roles"; : > "$S7/up"   # a session, NOT ours; no marker
+qverb stop "$Q/agent-repo" "$S7" daniel-ospina/tortoise
+case "$Q_OUT" in
+  *"DIFFERENT repos"*|*"MERGE-INERT"*|*"NOTHING WAS STOPPED"*)
+    bad "the queue pre-flight fired on a session this state dir does not own (a PEER's \$SESSION) — a false block, contradicting #1856's own rule: $Q_OUT" ;;
+  *) ok "stop: the queue pre-flight ignores a session it cannot prove is this state dir's (#1856)" ;;
+esac
+
+# (4d) THE ONE QUEUE-UNUSABLE PATH THAT REACHED `die` WITHOUT THE `stop` SUFFIX (review P3, #2093).
+# `assert_queue_target` begins `[ -n "$REPO" ] || assert_repo`, and `assert_repo` used to die on its own
+# line — no "NOTHING WAS STOPPED", no `stop --force` — so on a cell whose `keys.env` is missing (a
+# plausible reason to be stopping it) the new pre-flight declined to act with no way past it. Every other
+# unusable state carries the suffix, so the asymmetry was invisible from the mismatch-only arm above.
+# ⛔ HERMETICITY: the fixture needs REPO underivable, and `resolve_repo` always probes a hardcoded
+# `/tmp/cell`. On a box where that IS a checkout the fixture would derive a repo and the arm would assert
+# nothing, so say so out loud instead of reporting a pass it did not earn.
+if git -C /tmp/cell rev-parse --git-dir >/dev/null 2>&1; then
+  printf '  ℹ️  (4d) NOT RUN: /tmp/cell is a git checkout on this box, so REPO is derivable and the\n      underivable-REPO fixture is not hermetic here (this is not a pass).\n'
+else
+  S4D="$Q/st2093-norepo"; rm -rf "$S4D"; mkdir -p "$S4D/nowork"
+  seed_started_cell "$S4D" || bad "fixture: could not seed a started-cell state dir for (4d)"
+  : > "$Q/keys-norepo.env"
+  Q_OUT="$(env -u REPO -u OR -u WORKDIR Q_STATE="$S4D" PATH="$Q/bin:$PATH" CELL_HOME="$S4D/nowork" \
+           ENV_FILE="$Q/keys-norepo.env" SESSION="ai2093-norepo-$$" O="$S4D/o" \
+           HARNESS="$Q/harness" HARNESS_REPO="$AI" HARNESS_FETCH=0 HARNESS_REF="$Q_REF" \
+           bash "$SUP" stop 2>&1)"; Q_RC=$?
+  [ "$Q_RC" -ne 0 ] && ok "stop (4d): an underivable REPO is refused" \
+                    || bad "stop (4d) returned 0 with no derivable checkout — it stopped a box it cannot restart"
+  case "$Q_OUT" in
+    *"no single checkout could be derived"*)
+      ok "stop (4d): …and the refusal is the derivation, not an unrelated precondition" ;;
+    *) bad "stop (4d) refused for an UNRELATED reason, so the suffix arms below prove nothing: $Q_OUT" ;;
+  esac
+  # ⛔ THE FIX, ASSERTED TWICE BECAUSE THE MESSAGE MUST BE ACTIONABLE, NOT MERELY INFORMATIVE: an
+  # operator who meant to stop a misconfigured box needs to be told nothing was stopped AND the verb
+  # that gets past it. Pre-fix, `assert_repo`'s die carried neither.
+  case "$Q_OUT" in
+    *"NOTHING WAS STOPPED"*) ok "stop (4d): the derivation refusal says NOTHING WAS STOPPED (it did not act)" ;;
+    *) bad "stop (4d) refused to derive REPO without saying nothing was stopped — the operator cannot tell a pre-flight from a half-done stop: $Q_OUT" ;;
+  esac
+  case "$Q_OUT" in
+    *"stop --force"*) ok "stop (4d): …and it names `stop --force`, so the refusal is not a dead end" ;;
+    *) bad "stop (4d) names NO way past the refusal — the exact dead end #2093 Required #3 exists to close: $Q_OUT" ;;
+  esac
+  # …and the refusal really was a PRE-FLIGHT: the marker `stop` removes first is still there.
+  [ -f "$S4D/o/state/roles/.desired" ] \
+    && ok "stop (4d): the refused derivation dropped nothing (the .desired marker is intact)" \
+    || bad "a refused derivation REMOVED .desired — the gate is not ahead of the first irreversible act"
+fi
 
 # (5) A malformed command line is refused, not silently treated as a plain `stop`: a typo'd flag must
 # not become "stop the box" on the one verb whose default is destructive.
