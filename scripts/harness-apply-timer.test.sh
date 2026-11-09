@@ -2690,9 +2690,12 @@ assert_absent "$(grep '^remedy=' "$T/t24c2/state/harness-apply.status" 2>/dev/nu
 # BLOCK-list of token shapes, so `N/A`, `drift+1`, `x=y`, `#2`, `2-drift`, `DRIFT/2` and `stale;` all
 # escaped it and certified `farm: ok` / `farm_rows=none` / `farm_n=0` with the drifting name durable
 # nowhere; `drift:2` and `DRIFTED!` were already refused by that block-list, and a lowercase `stale`
-# matches every historical class — those three are listed because NARROWING the block-list re-admits them
-# (widening it only refuses more), and because the closed vocabulary refuses them on MEMBERSHIP, not shape). Any trailing token outside the instrument's own
-# vocabulary is now a refusal, and each token is its own run because the scan exits on the first hit.
+# matches every historical class. Those three are listed for two DIFFERENT reasons: NARROWING the
+# block-list re-admits `drift:2` and `DRIFTED!` (widening it only refuses more), while a purely
+# alphabetic `stale` sits inside EVERY one of those classes, so no reshaping of the class can re-admit it
+# — only MEMBERSHIP can refuse it, which is what the closed vocabulary now does for all three. Any
+# trailing token outside the instrument's own vocabulary is now a refusal, and each token is its own run
+# because the scan exits on the first hit.
 mk_origin t24c3; mk_clone t24c3
 REPO_P="$CLONE"; MODE_P=sync
 mkdir -p "$T/t24c3/home/.pi/agent/scripts"
