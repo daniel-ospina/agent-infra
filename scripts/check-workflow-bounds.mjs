@@ -407,9 +407,11 @@ function main() {
                 `pre-empts the red step that actually hung. ` +
                 // The remedy must be one that EXISTS. `knownSum < 359` is the exact test, not `< 360`:
                 // at knownSum === 359 no INTEGER job bound lies strictly between it and the 360 ceiling
-                // (review finding, P3 — the 359 edge fell between the two branches). An expression job
-                // bound cannot be "raised" at all, so the remedy there is the step bounds.
-                (!verdict.expression && knownSum < PLATFORM_CEILING_MIN - 1
+                // (review finding, P3 — the 359 edge fell between the two branches).
+                // No `!verdict.expression` guard here: an expression J reaches this violation only when
+                // `knownSum >= 360`, where `knownSum < 359` is already false — so the conjunct was dead
+                // (review finding, P3, mutant m15 stayed green). An expression J cannot be raised anyway.
+                (knownSum < PLATFORM_CEILING_MIN - 1
                   ? `Raise the job bound above ${knownSum} and below ${PLATFORM_CEILING_MIN}, or lower the tail step bounds.`
                   : `No job bound can sit above ${knownSum} inside the platform's ${PLATFORM_CEILING_MIN}-minute ceiling, so the step bounds are what must come down.`)
             );

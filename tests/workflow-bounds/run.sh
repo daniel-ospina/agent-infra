@@ -86,6 +86,11 @@
 #      Σ = 400. The ceiling that actually covers the job is 360, so the step bounds are unreachable and the
 #      job must be REFUSED. Dropping the `verdict.inert` term from the ceiling expression — i.e. treating
 #      the ceiling as J — certifies it green with only the "inert" note, and NOTHING pinned that term.
+# 33. FIXTURE — the RAISE remedy must be EMITTED when raising is an edit that exists (J = 20, Σ = 40).
+#      Arm 26 asserted only its ABSENCE at the Σ = 359 edge, so the branch could become "no bound fits"
+#      everywhere and still pass.
+# 34. REFUSAL — a `--root` with no `.github/workflows` is exit 2 with a NAMED reason (ENOENT). The header
+#      claims this refusal and no arm exercised it; a mutant replaced it with a raw node:fs stack.
 #
 # HERMETIC: fixtures + temp copies only; no network, no gh, no clock. The live tree is READ, never
 # written (the temp copy is where the mutations land).
@@ -512,6 +517,31 @@ run_case caller-broken-callee
 grep -q 'the call is broken, so nothing inside it can be bounded' "$ERR" \
   && ok "the finding is NAMED as a broken call, not an unreadable file" \
   || no "the broken callee is not named as such"
+
+echo "== 33. FIXTURE: the RAISE remedy is actually emitted when raising is the edit that exists"
+# Arm 26 asserts the ABSENCE of the raise text at the Σ = 359 edge; nothing asserted its PRESENCE, so the
+# branch could degrade into "No job bound can sit above N" for every job — a false prescription where
+# J in (Σ, 360) does exist (review finding, P3, mutant m8 stayed green).
+run_case job-bound-below-steps
+[ "$rc" -eq 1 ] && ok "job-bound-below-steps (J 20, Σ 40) → rc 1" || no "job-bound-below-steps → rc $rc, expected 1"
+grep -q 'Raise the job bound above 40 and below 360' "$ERR" \
+  && ok "the remedy offers the raise, which is an edit that exists for Σ = 40" \
+  || no "the remedy does NOT offer the raise, so it prescribes something false"
+grep -q 'No job bound can sit above 40' "$ERR" \
+  && no "the remedy claims no bound fits above 40, but J in (40,360) exists" \
+  || ok "…and it does NOT claim no bound fits above 40"
+
+echo "== 34. REFUSAL: a --root with no .github/workflows is exit 2, not a pass"
+# The header names this as one of the fail-closed refusals and no arm exercised it — the loss under a
+# mutant was not a false pass (the readdir throws, rc 1) but the documented exit-2 + named-reason
+# contract, replaced by a raw node:fs stack (review finding, P3, mutant m12 stayed green).
+mkdir -p "$TMPROOT/bare-root" # a root with no .github/ at all
+node "$GUARD" --root "$TMPROOT/bare-root" >"$OUT" 2>"$ERR"
+rc=$?
+[ "$rc" -eq 2 ] && ok "a root with no .github/workflows → rc 2" || no "bare root → rc $rc, expected 2"
+grep -q 'REFUSING — cannot read' "$ERR" && ok "the refusal is NAMED, not a raw node stack" \
+  || no "the missing directory surfaced as an unnamed failure"
+grep -q 'ENOENT' "$ERR" && ok "the reason is carried (ENOENT)" || no "the errno is not reported"
 
 echo
 if [ "$fail" -eq 0 ]; then
