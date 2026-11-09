@@ -51,7 +51,11 @@ orc_canon() {
   local p="${1:-}" d
   [ -n "$p" ] || return 1
   d="$(cd "$p" 2>/dev/null && pwd -P)" && { printf '%s\n' "$d"; return 0; }
-  # Not (yet) a directory: canonicalise the deepest existing parent, then re-attach the tail.
+  # Not (yet) a directory: it is only made ABSOLUTE, not resolved — there is no parent walk here.
+  # ⛔ Say what the code does: an absolute path is printed verbatim (so two spellings of a path that
+  # does not exist yet compare UNEQUAL and the caller takes the isolated branch, i.e. it fails closed);
+  # a relative one is anchored on the caller's cwd. A tail-reattach after the deepest existing parent
+  # was never implemented, and a comment claiming it sent a reader looking for code that is not here.
   case "$p" in
     /*) printf '%s\n' "$p" ;;
     *)  printf '%s/%s\n' "$(pwd -P 2>/dev/null || pwd)" "$p" ;;
@@ -64,7 +68,9 @@ orc_canon() {
 orc_state_slug() {
   local c="${1:-unknown}" base sum
   base="$(printf '%s' "$c" | tr -c 'A-Za-z0-9._-' '_' | sed 's/__*$//' | cut -c1-40)"
-  base="${base##*/}"
+  # (No basename strip here on purpose: the `tr` above already turned every `/` — and every other
+  # non-[A-Za-z0-9._-] byte — into `_`, so a `base="${base##*/}"` would be a no-op the reader would
+  # have to prove. The slug is readable PREFIX + checksum, not a path, and never contains a slash.)
   sum="$(printf '%s' "$c" | cksum 2>/dev/null | cut -d' ' -f1)"
   [ -n "$sum" ] || sum="0"
   printf '%s-%s\n' "${base:-copy}" "$sum"

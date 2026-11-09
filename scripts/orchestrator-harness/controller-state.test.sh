@@ -119,6 +119,18 @@ esac
   && ck "§1 a trailing slash and a symlinked spelling resolve to the SAME state dir" 0 \
   || ck "§1 path spelling changed the state dir — got '$(cat "$T/o6")'" 1
 
+# ⛔ THE SLUG IS A NAME, NOT A PATH (fresh-context review of #3846, cosmetic). `orc_state_slug`
+# sanitises EVERY non-[A-Za-z0-9._-] byte to `_` — `/` included — so a copy's path can never create a
+# NESTED state dir: the isolated dir must stay a DIRECT child of `ORC_ISOLATED_ROOT`. This is the
+# property a `base="${base##*/}"` in `orc_state_slug` used to LOOK like it was providing; the
+# sanitising `tr` provides it, the dead line is gone, and this arm is what makes the claim checkable
+# rather than a comment (a sanitising regression puts the state dir one level down, under a
+# directory named after part of the copy's path).
+( orc_state_pick "$T/deep/er/still/proof" ""; printf '%s\n' "$ORC_STATE_RESOLVED" ) > "$T/o7"
+[ "$(dirname "$(cat "$T/o7")")" = "$ORC_ISOLATED_ROOT" ] \
+  && ck "§1 an isolated state dir is a DIRECT child of the isolated root (the slug is a name, not a path)" 0 \
+  || ck "§1 the isolated state dir escaped the isolated root — got '$(cat "$T/o7")'" 1
+
 # ⛔ AND THE RESOLVED DIR MUST BE EXPORTED (fresh-context review of #3846, P1). Three of the loop's
 # DIRECT children re-default `O` themselves (`harness-refresh.sh`, `refresh-candidates.sh`,
 # `dispatch-merge.sh`, each with `O="${O:-$HOME/orchestrator}"`), so an instance whose state dir is not
