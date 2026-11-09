@@ -1024,7 +1024,9 @@ def _strip_comment(line):
       * the trailing flush (`if _buf is not None`) — a file ENDING mid-continuation (`last_def() { :; }`
         followed by a single backslash AND a newline) drops the last definition, a FALSE PASS; the shape is
         valid bash. Moves 0. The same bytes WITHOUT the trailing newline are not a fixture: `bash -n`
-        accepts them while EXECUTING them errors, so ground truth and the baseline disagree there.
+        accepts them and `bash <file>` RUNS them with no error, but SOURCING them raises a syntax error at
+        the dangling backslash — so ground truth (nothing defined) and the baseline (it prints the name)
+        disagree there. ⛔ "EXECUTING errors" was wrong here until it was measured: only `source` does.
 
     PINNED, and the one case worth naming because it looks like the five above: the delimiter charset
     `_.-` on the PLAIN path moves 3 files but also truncates the four `EOF*` delimiters in `repo-set.sh`,
@@ -1169,8 +1171,8 @@ def _openers(line):
                 # ⛔ DECLARED NO-OP, not a pinned arm (round 48 review, P3 — measured): a quoted delimiter
                 # holding a character OUTSIDE [A-Za-z0-9_.-] (e.g. `<<'A,B'`) is the only spelling that tells
                 # this branch from the fallback loop below, and no fixture line carries one — deleting the
-                # branch leaves the suite at 246/0 and changes the scan of 0 of 435 `git ls-files '*.sh'`
-                # files. Declared rather than pinned because a pin here would encode a spelling no real
+                # branch leaves the suite at 246/0 and changes the scan of 0 of the `git ls-files '*.sh'`
+                # population it was measured over (435 then, 437 at this head) Declared rather than pinned because a pin here would encode a spelling no real
                 # script uses; if one ever appears, this note is the fixture to write.
                 if q in ("'", '"'):          # a QUOTED delimiter may hold any character
                     while j < n and line[j] != q:
@@ -1201,7 +1203,8 @@ def _openers(line):
             # ⛔ DECLARED NO-OP (round 48 review, P3 — measured): every opener the walk can produce on a
             # fixture or repo line yields a non-empty delimiter, because `#` blocks the whole-line form and
             # the trailing-comment strip runs before the walk. Deleting this test leaves the suite at 246/0
-            # and moves 0 of 435 files. It stays as the boundary for `cat <<` with nothing after it, which is
+            # and moves 0 of the `git ls-files '*.sh'` population it was measured over (435 then, 437 at
+            # this head). It stays as the boundary for `cat <<` with nothing after it, which is
             # a bash syntax error rather than a construct to model.
             if delim:
                 out.append((delim, strip_tabs, quoted))
@@ -1252,8 +1255,9 @@ for i, raw in enumerate(lines):
     # ⛔ DECLARED NO-OP, and structurally so (round 48 review, P3 — measured): a whole-line comment cannot
     # reach a definition here, because `defn` opens with `^\s*(?:function\s+)?([A-Za-z_]...)` and `#` is not
     # a name character — measured directly: `#foo() {`, `  # foo() {`, `#a(){`, `#!/bin/bash` all fail
-    # `defn.match` with this skip removed. Deleting it leaves the suite at 246/0 and moves 0 of 435
-    # `git ls-files '*.sh'` files. Kept as the read-aloud statement of intent, not as a guard; do not cite
+    # `defn.match` with this skip removed. Deleting it leaves the suite at 246/0 and moves 0 of the
+    # `git ls-files '*.sh'` population (435 when measured, 437 at this head). Kept as the read-aloud
+    # statement of intent, not as a guard; do not cite
     # it as pinned.
     if raw.lstrip().startswith('#'):
         continue
@@ -1352,7 +1356,7 @@ continued_name() \
 # ⛔ AND A COMMENT THAT *MENTIONS* AN OPENER MUST NOT OPEN ONE, AND IT IS PINNED BY THE TWO LINES BELOW
 # (round 48 review, P2 — measured at this head): delete the `#` suppression and the scan truncates after
 # `continued_name`, so `after_notes_comment()` disappears and `f11f-0` reds at 245/1. It also moves the
-# scan of 6 of the `git ls-files '*.sh'` files (435 at the head that measured this; 437 now) — an earlier
+# scan of 6 of the `git ls-files '*.sh'` files (435 at the head that measured this; 438 now) — an earlier
 # revision of THIS note called that "20" and
 # an even earlier one "21". ⛔ THOSE DELTAS ARE THE PART THAT DID NOT REPRODUCE, and the "446" was a
 # DEFINITION rather than a count: it reproduces only as 435 `*.sh` PLUS the 11 tracked extensionless
