@@ -76,11 +76,12 @@ The limit above is why the bound belongs at the call site, and the shell call si
 - the `[res]` line's `gh api rate_limit` probe left a `gh` child alive for **2h 08m** with 0.01 s CPU
   and **no open sockets** — it never got as far as a response, so no HTTP-layer timeout could have
   helped — while the supervisor reported the controller `running` and its heartbeat was 2 h stale;
-- `ps` showed **eight** `bash orch-loop.sh` processes 23-43 minutes old, which was ONE controller plus
-  its substitution subshells. **A subshell inherits argv**, so `pgrep -f orch-loop.sh` counts the loop
-  plus every `$( … )` it is running: it is NOT a duplicate-controller check and killing the "surplus"
-  kills in-flight work. For "how many controllers are there", read `.orch.lock`'s pid or count
-  processes whose PARENT is the supervisor (#1856/#1859, `scripts/lib/fleet-inventory.sh`).
+- `ps` showed **eight** `bash orch-loop.sh` processes aged from ~20 minutes to over two hours, which
+  was ONE controller plus its substitution subshells. **A subshell inherits argv**, so
+  `pgrep -f orch-loop.sh` counts the loop plus every `$( … )` it is running: it is NOT a
+  duplicate-controller check and killing the "surplus" kills in-flight work. For "how many controllers
+  are there", read `.orch.lock`'s pid or count processes whose PARENT is the supervisor
+  (#1856/#1859, `scripts/lib/fleet-inventory.sh`).
 
 What the controller now does (`orch-loop.sh`, the `# BEGIN gh-bound` block):
 
