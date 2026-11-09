@@ -3092,9 +3092,10 @@ _pr_not_asked = _REAP_PR_LIMIT == "0"
 #   * `REAP_PR_CLIPPED` (from `rest_list`'s own `REST_WINDOW_FILLED`): the window ended FULL with a
 #     next page still advertised, so rows exist that were NOT read. Absence is then not evidence.
 #   * the LIMIT asked for. At the shipped 500 this pass reads exactly what every earlier pass read,
-#     so its coverage is the SAME accepted residual the file already states (`:3340`: a 500-row
-#     window and a PR whose head ref does not name the issue) — withholding the release arm there
-#     would not repair that residual, it would silently retire the dead-lane retry instead.
+#     so its coverage is the SAME accepted residual the file already states (the checked half's
+#     `STATED RESIDUAL:` note: a 500-row window and a PR whose head ref does not name the issue) —
+#     withholding the release arm there would not repair that residual, it would silently retire the
+#     dead-lane retry instead.
 # So: a CLIPPED window narrower than the shipped one withholds the evidence; a narrowed window whose
 # collection ended is a COMPLETE answer and proves "no PR" as well as a 500-row one would have; and
 # the shipped 500 behaves exactly as before. An absent marker reads as the full window (unchanged).
@@ -3189,23 +3190,28 @@ if not _disp_ok:
           "nothing is reaped and the file is left exactly as it was")
     _disp_rows = []
 # ── THE CAPPED WINDOW IS NOT AN ANSWER, SO THE ENTRIES IT CANNOT REACH ARE ASKED DIRECTLY ──────
-# ⛔ `.open_iss` IS `--limit 500` created-DESC against a repo with 1371 open issues (measured
-# 2026-10-30, daniel-ospina/tortoise), so it is PERMANENTLY saturated: every issue older than the 500
-# newest OPEN ones is absent from it for ever. The reap below reads that absence as "cannot prove it
-# is open" — the right polarity for the CLOSED question, and the WRONG one for the RELEASE question,
+# ⛔ `.open_iss` IS A created-DESC WINDOW — `--limit 500`, or the rows-sized bound when a pass serves
+# four or fewer (#1984, see the listing block) — against a repo with 1371 open issues (measured
+# 2026-10-30, daniel-ospina/tortoise). At the shipped 500 it is PERMANENTLY saturated: every issue
+# older than the 500 newest OPEN ones is absent from it for ever. On a one-to-four-row pass the window
+# is 100–400 rows instead, which widens this exposure by exactly that factor (that trade is disclosed
+# on the listing block's `NARROWED` line, not silently taken). The reap below reads that absence as
+# "cannot prove it is open" — the right polarity for the CLOSED question, and the WRONG one for the RELEASE question,
 # because it makes the suppression PERMANENT: an abandoned dispatch falls out of the window, is never
 # dropped from `dispatched.txt`, therefore never leaves `checked.txt`, therefore is SKIPPED by every
 # later pass and never re-enters `candidates.txt` (which the dispatch cycle prunes of dispatched ids).
 # The issue stays open, nobody works it, and the one line an operator reads counts it as `dispatched`.
 # MEASURED on the live box: the shipped reap released NOTHING (0 releasable of 384) while 169 of the
 # 203 entries in `dispatched.txt` were outside the window. Of the 12 asked in the first bounded pass,
-# ALL were OPEN — and `.pr_brs` is as saturated as `.open_iss` (4142 PRs exist, 500 visible), so "no PR"
-# is NOT a fact this pass can read: 7 of those 12 turned out to have head-ref-naming MERGED PRs outside
-# the window (verified: #1789 → PR 8041, #2107 → PR 8128, both MERGED, both issues still OPEN).
+# ALL were OPEN — and `.pr_brs` is as saturated as `.open_iss` (4142 PRs exist; 500 visible at the
+# shipped bound, 100–400 on a one-to-four-row pass), so "no PR" is NOT a fact this pass can read: 7
+# of those 12 turned out to have head-ref-naming MERGED PRs outside the window (verified: #1789 →
+# PR 8041, #2107 → PR 8128, both MERGED, both issues still OPEN).
 # ⛔ SO ONLY A **CLOSED** ISSUE IS RELEASED. An OPEN, window-blind entry is KEPT and NAMED. The reason is
-# in this file's own words: the LANDED verdict comes ONLY from the issue's own CLOSED state (`:4552-4559`,
-# tortoise#8625), so an OPEN issue whose PR merged reads **CLEAN** in the pre-flight and is re-queued —
-# a lane re-implementing shipped work (#8560/#7174). The reap may end SILENCE; it may not cause a
+# in this file's own words: the LANDED verdict comes ONLY from the issue's own CLOSED state (the
+# landed-prune block's own contract below, tortoise#8625), so an OPEN issue whose PR merged reads
+# **CLEAN** in the pre-flight and is re-queued — a lane re-implementing shipped work (#8560/#7174).
+# The reap may end SILENCE; it may not cause a
 # requeue. What it therefore delivers is (a) every CLOSED entry reclaimed, (b) the OPEN class COUNTED and
 # NAMED on the operator line every pass, rotated so the whole class is named over time — a stated deficit
 # instead of an invisible permanent suppression. Closing that half needs the PR question answered
@@ -3354,9 +3360,10 @@ if have_open and _disp_ok:
         _askedset = set(_asked)
         # ⛔ ONLY A **CLOSED** ISSUE IS RELEASED. An OPEN one is KEPT and NAMED, however abandoned it
         # looks, and the reason is measured in this file's own words: the LANDED verdict comes ONLY from
-        # the issue's own state being CLOSED (`:4552-4559`, tortoise#8625), so an OPEN issue whose PR was
-        # merged reads **CLEAN** in the pre-flight and is re-queued — a lane re-implementing shipped
-        # work, which is the #8560/#7174 class this whole reap exists to prevent. The window-blind "no PR"
+        # the issue's own state being CLOSED (the landed-prune block's contract below, tortoise#8625), so
+        # an OPEN issue whose PR was merged reads **CLEAN** in the pre-flight and is re-queued — a lane
+        # re-implementing shipped work, which is the #8560/#7174 class this whole reap exists to
+        # prevent. The window-blind "no PR"
         # fact cannot tell the two apart, so the reap must not act on it: silence is what it may end, a
         # requeue is what it may not cause. Named on the line instead of dropped, counted, and rotated.
         # ⛔ A CLOSED ENTRY IS ONLY RECLAIMED WHEN ITS QUEUE ROW IS ALREADY GONE. `dispatched.txt` is the
@@ -3502,7 +3509,8 @@ if have_open and _disp_ok:
 #                            goes away — unbounded evidence. The pre-flight's own branch/PR COLLISION
 #                            already refuses to queue such an issue, TTL-bounded by the collision
 #                            ledger, which is the right home for a fact that expires.
-# STATED RESIDUAL: `.pr_brs` is the same 500-row window, and a PR whose head ref does not embed the
+# STATED RESIDUAL: `.pr_brs` is a created-DESC WINDOW (500 rows, or the rows-sized bound when a pass
+# serves four or fewer — see the listing block), and a PR whose head ref does not embed the
 # issue number never matches — both make the `pr` keep fact MISSING for old or oddly-named PRs, which
 # releases the entry and buys ONE re-judge (the pre-flight then answers COLLISION for a live PR). A
 # cost, not a correctness guarantee, and it is bounded by the release cap in the bash filter.
