@@ -1058,59 +1058,56 @@ EOF
 # GUESSING it — from `root`, or from an account the graded units do not declare.
 unit_users() {
   local f
-  # ⛔ THE POPULATION IS THE UNITS THIS TOOL WOULD REPOINT — NOT EVERY UNIT systemd LOADS (review F1,
-  # measured on a live cell). Reading the whole population made every RELOCATED VENDOR UNIT a conflict:
-  # `systemctl enable` installs an `/etc` SYMLINK to the vendor's definition (`unit_files` grades
-  # symlinks on purpose), so on an ordinary Ubuntu cell the aliases
-  # `dbus-org.freedesktop.resolve1.service` -> `User=systemd-resolve` (home `/`) and
-  # `dbus-org.freedesktop.timesync1.service` -> `User=systemd-timesync` (home `/`) — plus
-  # `cmux-resource-stats.service` with `User=nobody` (home `/nonexistent`) — put three accounts in the
-  # conflict list of a box that was ALREADY CONVERGED. `check_derivation` then answered 3 for BOTH
-  # verbs: `--check` could never reach 0 (the PR's own acceptance criterion and the RECLAIM
-  # precondition) and `--apply` never reached a credential copy or a unit write, so the migration this
-  # tool exists to provide did not run on the box it targets. The RULE is untouched and still pinned by
-  # the i1/i4 arms — do not repoint a unit onto a home it does not run in. What was wrong is the SCOPE:
-  # an account's `User=` can only make a repoint wrong for a unit this tool will actually rewrite.
-  # ⛔ AND THE SAME WALK THE CHECK AND THE WRITER USE (review F3): `repoint_files` is the shared answer,
-  # so "which units would be repointed" and "whose `User=` decides" are one population.
+  # ⛔ THE POPULATION IS EVERY UNIT THIS TOOL GRADES — NOT ONLY THE ONES IT WOULD REPOINT (review F1
+  # round 3, closing the round-2 narrowing). The round-2 fix answered "whose `User=` decides" from
+  # `$REPOINT_FILES` — the files whose scan still yields a record — and that set is EMPTY on a converged
+  # box, which is exactly the state `--apply` produces. So the guard became VACUOUS precisely where it
+  # matters: `check_derivation` then returned 0 for ANY derived home the invoking account's passwd record
+  # answers (bar a root invoker and a home that does not exist), and `main` runs the CREDENTIAL half first
+  # — so `--apply` copied `keys.env` / `.pi/agent/auth.json` into a third home, printed `VERDICT: one
+  # home` and exited 0, and a follow-up `--check` then also read 0 because the durable side now held the
+  # copies. That 0 is the stated precondition for RECLAIMING `/tmp/cell-home` (`:44-49`, `:899`): the tool
+  # could move the only copy of the cell's credentials into an account the units do not run as and then
+  # authorise deleting the source. Reachable whenever the invoking account is not the units' account and
+  # its passwd home EXISTS (`cmux` units repaired from an `ubuntu` operator path, a CI/runner account).
+  # ⛔ SO THE POPULATION GOES BACK TO THE WHOLE GRADED WALK — and the FALSE BLOCK the round-2 narrowing
+  # was answering is excluded by ACCOUNT instead of by UNIT (see `is_cell_home`). That is the difference
+  # that matters: a vendor unit's account (`systemd-resolve`/`systemd-timesync`/`nobody`) is not a home a
+  # cell could be, while a cell account is — and the converged state must not be able to silence the
+  # second one. `$GRADED_FILES` is filled by leg (0) of `check_derivation`, the same walk the writer uses.
   while IFS= read -r f; do
     [ -n "$f" ] || continue
     awk '/^[[:space:]]*User=/ { v = $0; sub(/^[[:space:]]*User=[[:space:]]*/, "", v); sub(/[[:space:]]+$/, "", v); if (v != "") print v }' "$f" 2>/dev/null
   done <<EOF
-$REPOINT_FILES
+$GRADED_FILES
 EOF
 }
 
-# repoint_files — the subset of the graded population this tool WOULD REPOINT: the files whose scan
-# produces at least one record, i.e. at least one directive that still names the legacy home. Sets
-# $REPOINT_FILES (one path per line). ⛔ A FILE THAT MENTIONS THE LEGACY HOME IN A COMMENT IS NOT IN IT:
-# `unit_scan` is the authority, and it grades no comment (the projector's unchanged-projection rule is
-# what makes the record), so a comment cannot pull a vendor unit back into the derivation question.
-REPOINT_FILES=""
-repoint_files() {
-  local dir f st rec
-  REPOINT_FILES=""
-  while IFS= read -r dir; do
-    [ -n "$dir" ] && [ -d "$dir" ] || continue
-    unit_files "$dir"
-    while IFS= read -r f; do
-      [ -n "$f" ] || continue
-      probe_open "$f" || continue          # leg (0) has already refused an unreadable population
-      grep -q -- "$HOME_LEGACY" "$f" 2>/dev/null
-      st=$?
-      # A prefilter that could not run is not "no match"; leg (0) is the gate that names it, so here it
-      # only means "do not claim this file was ruled out" — it is left out of the SET, never read as clean.
-      [ "$st" = 0 ] || continue
-      rec="$(unit_scan "$f")"
-      [ -n "$rec" ] || continue
-      REPOINT_FILES="${REPOINT_FILES}${REPOINT_FILES:+$'\n'}$f"
-    done <<EOF
-$UNIT_FILES
-EOF
-  done <<EOF
-$(unit_dirs)
-EOF
+# is_cell_home <home> — 0 when that passwd home is a home a CELL could actually be, i.e. a REAL,
+# EXISTING directory. ⛔ THIS IS THE EXCLUSION THAT REPLACES THE ROUND-2 POPULATION NARROWING, and it is
+# deliberately about the ACCOUNT, not about the file: the three accounts that false-blocked a converged
+# live cell (review F1 round 2, measured) are `systemd-resolve` (home `/`), `systemd-timesync` (home `/`)
+# and `nobody` (home `/nonexistent`) — vendor units an ordinary Ubuntu/Debian box carries as
+# `systemctl enable` aliases. None of them is a cell home: `/` is the root of the filesystem and
+# `/nonexistent` is the conventional "no home" answer. Excluding them keeps a converged box at
+# `--check` 0 (the acceptance criterion and the RECLAIM precondition) WITHOUT returning to the vacuous
+# repoint-set population — a unit the tool never rewrites can still name the account the cell runs as.
+# A home that is empty or absent cannot be verified as the units' home either, so it is not a conflict;
+# it is reported by nothing here because `--check` already grades the derived home's existence.
+is_cell_home() {
+  case "${1:-}" in '' | /) return 1 ;; esac
+  [ -d "$1" ] || return 1
+  return 0
 }
+
+# ⛔ `repoint_files` USED TO LIVE HERE AND IS GONE (review F1 round 3). It answered "which files
+# would this run rewrite" by scanning every unit for a surviving legacy record, and it had exactly one
+# caller — leg (ii) of `check_derivation`. Grading `User=` from that set is what made the derivation
+# guard vacuous on a converged box (nothing survives a scan there, so the set was empty and any
+# derivation passed), and once leg (ii) reads the whole graded walk the set had no caller left. Its
+# behaviour is not lost: "would this run rewrite this file" is `unit_scan`, which `migrate_units` calls
+# directly on the same walk this guard uses.
+GRADED_FILES=""
 
 # account_home <user> — that account's passwd home, or nothing when it cannot be resolved (a unit whose
 # `User=` is still the unrendered `{{USER}}` template, a numeric uid, a user that does not exist here).
@@ -1142,6 +1139,10 @@ check_derivation() {
   # write happened before `migrate_units` could report that the population was never walkable. This gate
   # runs in the CURRENT shell (no command substitution), which is why it uses `unit_files` directly
   # instead of asking `unit_users` — a flag set inside `$( )` does not survive.
+  # ⛔ AND IT IS WHERE THE `unit_users` POPULATION IS COLLECTED (review F1 round 3): `$GRADED_FILES` is
+  # the very walk this gate already had to take, so leg (ii) grades exactly the population leg (0)
+  # proved measurable — one walk, one population, no second source of truth to drift.
+  GRADED_FILES=""
   while IFS= read -r d; do
     [ -n "$d" ] && [ -d "$d" ] || continue
     unit_files "$d"
@@ -1155,31 +1156,34 @@ check_derivation() {
         warn_line "  REFUSED: $f cannot be opened by $INVOKER (mode $(mode_of "$f")), so 'the units declare no other account' is not a reading this tool took. Refusing BEFORE any write; name the home explicitly: CELL_HOME=<the units account's home> $0 $MODE"
         return 1
       fi
+      GRADED_FILES="${GRADED_FILES}${GRADED_FILES:+$'\n'}$f"
     done <<EOF
 $UNIT_FILES
 EOF
   done <<EOF
 $(unit_dirs)
 EOF
-  # (ii) a unit THIS TOOL WOULD REPOINT declares an account whose home is not the derived one: the
-  #      derivation is not the home that unit runs as, so repointing it would move it off its own tree.
-  #      ⛔ THE UNITS THIS TOOL WOULD REPOINT, NOT THE UNITS systemd LOADS (review F1) — see
-  #      `unit_users`. A vendor unit and its `systemctl enable` alias are graded (their directives are
-  #      part of the box's one-home story) but nothing here rewrites them, so their `User=` cannot make
-  #      the derivation wrong, and grading it refused a converged box.
-  repoint_files
+  # (ii) a graded unit declares an account whose home is not the derived one: the derivation is not the
+  #      home this box runs its units as, so acting on it would move them (and their credentials) off
+  #      their own tree. ⛔ THE ACCOUNT, NOT THE FILE (review F1 round 3): the round-2 population — the
+  #      units this tool WOULD repoint — is EMPTY on a converged box, which made this leg vacuous on
+  #      exactly the state `--apply` produces (see `unit_users`). Reading the whole graded population
+  #      restores it, and the false block that narrowing was answering is excluded by ACCOUNT instead
+  #      (`is_cell_home`): a vendor unit's `/` or `/nonexistent` home is not a home a cell could be, a
+  #      cell account's is.
   while IFS= read -r u; do
     [ -n "$u" ] || continue
     [ "$u" = "root" ] && continue                      # root units genuinely live in /root
     h="$(account_home "$u")" || continue
     [ -n "$h" ] || continue
     [ "$h" = "$HOME_DURABLE" ] && continue
+    is_cell_home "$h" || continue                     # `/`, '' and a non-directory home are not cell homes
     conflicts="$conflicts $u($h)"
   done <<EOF
 $(unit_users | awk '!s[$0]++')
 EOF
   if [ -n "$conflicts" ]; then
-    warn_line "  REFUSED: the derived durable home $HOME_DURABLE is not the home of the account the units this tool would repoint run as:$conflicts. Refusing to repoint units onto a home they do not run in — name the home explicitly: CELL_HOME=<that account's home> $0 --apply"
+    warn_line "  REFUSED: the derived durable home $HOME_DURABLE is not the home of the account the units this tool grades run as:$conflicts. Refusing to repoint units onto a home they do not run in — name the home explicitly: CELL_HOME=<that account's home> $0 --apply"
     return 1
   fi
   return 0

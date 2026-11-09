@@ -347,7 +347,7 @@ _out="$(env -u CELL_HOME PATH="$STUBACCT:$PATH" CELL_HOME_LEGACY="$LEG" CELL_HOM
         CELL_HOME_MIGRATE_NO_RELOAD=1 bash "$TOOL" --check 2>&1)"; _rc=$?
 [ "$_rc" = 3 ] && ok "i4 units that declare an account which does NOT live in the derived home -> refused (rc 3)" \
   || bad "i4 a home that is not the units' account home was accepted (rc $_rc)"
-case "$_out" in *"not the home of the account the units this tool would repoint run as"*) ok "i5 …naming the conflict, so the operator knows which home to pass" ;; *) bad "i5 the conflict is not named" ;; esac
+case "$_out" in *"not the home of the account the units this tool grades run as"*) ok "i5 …naming the conflict, so the operator knows which home to pass" ;; *) bad "i5 the conflict is not named" ;; esac
 # …and the SAME box converges when the operator names the home (an explicit CELL_HOME is always honoured).
 env -u CELL_HOME PATH="$STUBACCT:$PATH" CELL_HOME="$T/otherhome" CELL_HOME_LEGACY="$LEG" CELL_HOME_MIGRATE_UNIT_DIRS="$UNITS" \
   CELL_HOME_MIGRATE_NO_RELOAD=1 bash "$TOOL" --check >/dev/null 2>&1
@@ -401,8 +401,16 @@ printf '\n── (i-2) THE DERIVATION GRADES THE UNITS IT WOULD REPOINT, NOT EVE
 vend_stub() { # <dir> <cmux-home> — `id`/`getent` for a box whose population contains VENDOR units
   mkdir -p "$1"
   printf '#!/bin/sh\ncase "$1" in -u) echo 1000 ;; -un) echo cmux ;; *) exit 1 ;; esac\n' >"$1/id"
-  # The two foreign accounts a real cell's population carries, and the cell account's own home.
-  printf '#!/bin/sh\ncase "$1:$2" in\n  passwd:cmux) echo "cmux:x:1000:1000::%s:/bin/bash" ;;\n  passwd:ubuntu) echo "ubuntu:x:1001:1001::/home/ubuntu:/bin/bash" ;;\n  passwd:nobody) echo "nobody:x:65534:65534::/nonexistent:/usr/sbin/nologin" ;;\n  passwd:systemd-resolve) echo "systemd-resolve:x:991:991::/:/usr/sbin/nologin" ;;\nesac\n' "$2" >"$1/getent"
+  # ⛔ THE VENDOR ACCOUNTS' HOMES ARE THE MEASURED ONES AND THEY MUST STAY UNREAL (review F1 round 3):
+  # `systemd-resolve`/`systemd-timesync` answer `/` and `nobody` answers `/nonexistent`, which is what
+  # makes them excludable BY ACCOUNT (`is_cell_home`) instead of by unit. The cell account's home is the
+  # durable home the arm asserts on.
+  # ⛔ AND `ubuntu`'s HOME MUST **EXIST** (review F1 round 3): the surviving conflict is "an account the
+  # units run as whose passwd home is a REAL, DIFFERENT directory", and a non-existent home is not a
+  # conflict any more. With `/home/ubuntu` this arm would pass for the wrong reason on a host without
+  # that path — it would be excluded, not graded — so the fixture OWNS the directory.
+  mkdir -p "$1/otherhome"
+  printf '#!/bin/sh\ncase "$1:$2" in\n  passwd:cmux) echo "cmux:x:1000:1000::%s:/bin/bash" ;;\n  passwd:ubuntu) echo "ubuntu:x:1001:1001::%s:/bin/bash" ;;\n  passwd:nobody) echo "nobody:x:65534:65534::/nonexistent:/usr/sbin/nologin" ;;\n  passwd:systemd-resolve) echo "systemd-resolve:x:991:991::/:/usr/sbin/nologin" ;;\nesac\n' "$2" "$1/otherhome" >"$1/getent"
   chmod +x "$1/id" "$1/getent"
 }
 # plant_vendor <units-dir> <target-dir> — the two shapes an enabled vendor unit really takes: a stray
@@ -442,6 +450,54 @@ _out="$(env -u CELL_HOME PATH="$VSTUB2:$PATH" CELL_HOME_LEGACY="$LEG" CELL_HOME_
 [ "$_rc" = 3 ] && ok "i12 …while a unit this tool WOULD repoint that declares a foreign-home account is STILL refused (rc 3)" \
   || bad "i12 a repoint onto a home the unit does not run in was accepted (rc $_rc) — the rule was deleted, not scoped"
 case "$_out" in *ubuntu*) ok "i13 …and the refusal still names the account whose home conflicts" ;; *) bad "i13 the conflict account is not named" ;; esac
+
+printf '\n── (i-3) THE GUARD IS NOT VACUOUS ON A CONVERGED BOX (review F1 round 3) ─────────────\n'
+# ⛔ THE STATE THAT SILENCED THE GUARD. The round-2 fix graded `User=` from the files whose scan still
+# yields a record — i.e. the files this tool WOULD REPOINT — and that set is EMPTY on a converged box,
+# which is exactly what `--apply` produces. So on a converged box `check_derivation` returned 0 for ANY
+# derived home the invoking account's passwd record answers (bar a root invoker and a home that does not
+# exist), and `main` runs the CREDENTIAL half FIRST: `--apply` copied `keys.env` and
+# `.pi/agent/auth.json` into a THIRD home, printed `VERDICT: one home` and exited 0 — and a follow-up
+# `--check` then read 0 as well, because the durable side now held the copies. That 0 is the stated
+# precondition for reclaiming the legacy home, so the tool could move the only copy of the cell's
+# credentials to an account the units do not run as and then authorise deleting the source.
+# ⛔ THE SHAPE THE PREVIOUS REVIEW MEASURED, and the one no arm produced: units CONVERGED, and a
+# derivation that is NOT their account home. `$CEL/units` never mentions the legacy home after the
+# convergence step below, so the repoint set is empty by construction — asserted, not assumed (i15).
+CEL="$T/converged"
+mk_box "$CEL"
+run_tool "$TOOL" --apply >/dev/null 2>&1                # converge the units (explicit CELL_HOME)
+# ⛔ THE FIXTURE'S OWN PREMISE, asserted before the arms that depend on it: the box really is converged,
+# so "nothing would be repointed" is a reading and not this suite's hope. It must be asserted BEFORE the
+# durable credentials are removed below — a missing durable credential is drift, and the arm would then
+# be measuring that instead of the population.
+_out="$(run_tool "$TOOL" --check)"; _rc=$?
+[ "$_rc" = 0 ] && ok "i14 the fixture premise: the units are CONVERGED before the derivation arms run (--check 0) — so no file would be repointed" \
+  || bad "i14 the fixture is not converged (--check $_rc), so the vacuity arms below would prove nothing"
+rm -f "$DUR/keys.env" "$DUR/.pi/agent/auth.json"       # …and leave the durable side MISSING them again
+mkdir -p "$CEL/inv-home"                                # the invoker's real, DIFFERENT home
+# The invoker is `ubuntu` (home `$CEL/inv-home`); the units run as `cmux` (home `$DUR`).
+mkdir -p "$CEL/stub"
+printf '#!/bin/sh\ncase "$1" in -u) echo 1001 ;; -un) echo ubuntu ;; *) exit 1 ;; esac\n' >"$CEL/stub/id"
+printf '#!/bin/sh\ncase "$1:$2" in\n  passwd:cmux) echo "cmux:x:1000:1000::%s:/bin/bash" ;;\n  passwd:ubuntu) echo "ubuntu:x:1001:1001::%s:/bin/bash" ;;\nesac\n' "$DUR" "$CEL/inv-home" >"$CEL/stub/getent"
+chmod +x "$CEL/stub/id" "$CEL/stub/getent"
+_out="$(env -u CELL_HOME PATH="$CEL/stub:$PATH" CELL_HOME_LEGACY="$LEG" CELL_HOME_MIGRATE_UNIT_DIRS="$UNITS" \
+        CELL_HOME_MIGRATE_NO_RELOAD=1 bash "$TOOL" --apply 2>&1)"; _rc=$?
+[ "$_rc" = 3 ] && ok "i15 a CONVERGED box + a derivation that is NOT the units' account home is REFUSED (rc 3, not an accepted third home)" \
+  || bad "i15 the derivation guard was vacuous on a converged box (rc $_rc) — the credential half then acts on a home the units do not run in"
+case "$_out" in *"cmux($DUR)"*) ok "i16 …and the refusal names the units' account and its real home" ;; *) bad "i16 the refusal does not name the account the units run as (rc $_rc): $_out" ;; esac
+if [ ! -e "$CEL/inv-home/keys.env" ] && [ ! -e "$CEL/inv-home/.pi/agent/auth.json" ]; then
+  ok "i17 …and NO credential was copied into the derived third home, so the secret never left the cell account"
+else
+  bad "i17 the credential half wrote the cell's secrets into $CEL/inv-home BEFORE the derivation was refused"
+fi
+case "$_out" in *"one home"*) bad "i17b the refused run still reported 'one home'";; *) ok "i17b …and the run did not report the RECLAIM verdict it did not earn" ;; esac
+# The control: the SAME box converges when the operator NAMES the home — the guard is about GUESSING it.
+env -u CELL_HOME PATH="$CEL/stub:$PATH" CELL_HOME="$DUR" CELL_HOME_LEGACY="$LEG" CELL_HOME_MIGRATE_UNIT_DIRS="$UNITS" \
+  CELL_HOME_MIGRATE_NO_RELOAD=1 bash "$TOOL" --apply >/dev/null 2>&1; _rc=$?
+[ "$_rc" = 0 ] && [ -e "$DUR/.pi/agent/auth.json" ] \
+  && ok "i18 …while an EXPLICIT CELL_HOME for that account is honoured (rc 0, credentials restored) — the guard is a scope, not a deletion" \
+  || bad "i18 the sanctioned explicit-CELL_HOME path was refused too (rc $_rc) — the guard would block the fix it documents"
 
 printf '\n── (j) THE CREDENTIAL THAT IS ALSO A PROGRAM (review F3/P1) ─────────────────────────────\n'
 
@@ -1511,23 +1567,49 @@ else
     || bad "g26 the mutant still reported drift (rc $_m26rc) — k37 is not measuring value grading"
 fi
 
-# g27: widen the derivation's `User=` population back to EVERY unit systemd loads (review F1) and i9-i11
-# must redden. Without this row the (i-2) arms would be green on a tree whose guard had silently gone back
-# to grading the whole population — which is exactly how the false block shipped.
+# g27: make `is_cell_home` accept EVERY home (the round-2 state, where the exclusion did not exist) and
+# i9-i11 must redden. Without this row the (i-2) arms would be green on a tree whose exclusion had been
+# widened to nothing — a guard that refuses every converged cell that carries a vendor unit.
 MUT27="$T/mutdir25/cell-home-migrate-users.sh"
 mkdir -p "$T/mutdir25/lib"; cp "$HERE/lib/cell-home.sh" "$T/mutdir25/lib/cell-home.sh"
-# the population expression itself, swapped for the pre-fix whole-population one
-sed 's#^\$REPOINT_FILES$#$UNIT_FILES#' "$TOOL" >"$MUT27"
+# the whole predicate, replaced by a constant "every home is a cell home" (awk, not `sed c\`: the
+# replacement is multi-line and BSD sed spells `c\` differently from GNU sed)
+awk '/^is_cell_home\(\) \{$/ { print "is_cell_home() { return 0; }"; skip = 1; next }
+     skip && /^\}$/ { skip = 0; next }
+     !skip' "$TOOL" >"$MUT27"
 if cmp -s "$TOOL" "$MUT27"; then
-  bad "g27 the population mutation could not be applied — (i-2) is not checking the scope"
+  bad "g27 the exclusion mutation could not be applied — (i-2) is not checking the account exclusion"
 else
   mk_box "$T/g27"
   plant_vendor "$UNITS" "$T/g27/vendor"
   VSTUB27="$T/vstub27"; vend_stub "$VSTUB27" "$DUR"
   env -u CELL_HOME PATH="$VSTUB27:$PATH" CELL_HOME_LEGACY="$LEG" CELL_HOME_MIGRATE_UNIT_DIRS="$UNITS" \
     CELL_HOME_MIGRATE_NO_RELOAD=1 bash "$MUT27" --check >/dev/null 2>&1; _m27rc=$?
-  [ "$_m27rc" = 3 ] && ok "g27 WITH the whole population graded a vendor unit refuses a converged box (rc 3) — (i-2) measures the SCOPE" \
-    || bad "g27 the whole-population mutant answered $_m27rc — (i-2) is not measuring the scope"
+  [ "$_m27rc" = 3 ] && ok "g27 WITHOUT the account exclusion a vendor account (home / or /nonexistent) refuses a converged box (rc 3) — (i-2) measures the EXCLUSION" \
+    || bad "g27 the no-exclusion mutant answered $_m27rc — (i-2) is not measuring the exclusion"
+fi
+
+# g28: empty the population `unit_users` reads (the round-2 narrowing, `$REPOINT_FILES` — empty on a
+# converged box) and (i-3) must redden. This is the row that makes i15 a measurement of the VACUITY
+# rather than an assertion that happens to hold: with the population emptied, the converged fixture's
+# foreign derivation is accepted again and the credential half acts on it.
+MUT28="$T/mutdir25/cell-home-migrate-vacuous.sh"
+# the population expression itself, swapped for the converged-box-empty one
+sed 's#^\$GRADED_FILES$##' "$TOOL" >"$MUT28"
+if cmp -s "$TOOL" "$MUT28"; then
+  bad "g28 the vacuity mutation could not be applied — (i-3) is not checking the population"
+else
+  mk_box "$T/g28"
+  run_tool "$MUT28" --apply >/dev/null 2>&1            # converge with the mutant itself (explicit CELL_HOME)
+  rm -f "$DUR/keys.env" "$DUR/.pi/agent/auth.json"
+  mkdir -p "$T/g28/inv-home" "$T/g28/stub"
+  printf '#!/bin/sh\ncase "$1" in -u) echo 1001 ;; -un) echo ubuntu ;; *) exit 1 ;; esac\n' >"$T/g28/stub/id"
+  printf '#!/bin/sh\ncase "$1:$2" in\n  passwd:cmux) echo "cmux:x:1000:1000::%s:/bin/bash" ;;\n  passwd:ubuntu) echo "ubuntu:x:1001:1001::%s:/bin/bash" ;;\nesac\n' "$DUR" "$T/g28/inv-home" >"$T/g28/stub/getent"
+  chmod +x "$T/g28/stub/id" "$T/g28/stub/getent"
+  env -u CELL_HOME PATH="$T/g28/stub:$PATH" CELL_HOME_LEGACY="$LEG" CELL_HOME_MIGRATE_UNIT_DIRS="$UNITS" \
+    CELL_HOME_MIGRATE_NO_RELOAD=1 bash "$MUT28" --apply >/dev/null 2>&1; _m28rc=$?
+  [ "$_m28rc" = 0 ] && ok "g28 WITH the population emptied a converged box ACCEPTS the foreign derivation (rc 0) — i15 measures the VACUITY" \
+    || bad "g28 the emptied-population mutant answered $_m28rc — i15 is not measuring the population read"
 fi
 
 printf '\n── (h) argument handling ────────────────────────────────────────────────────────────\n'
