@@ -935,6 +935,14 @@ await test("#1418 F1 (round 8): a DIRECTORY target is refused — `git add <dir>
     ok((r.reason || "").includes("DIRECTORY"), `the refusal names the pathspec bound: ${r.reason}`);
     ok(validateToolCall("bash", `git add ${dir}/`, step, "gate").block, "a trailing slash does not launder it");
     ok(validateToolCall("bash", `git rm ${dir}`, step, "gate").block, "`git rm <dir>` is refused too (git needs -r, which is blocked)");
+    // ⛔ AND THE MESSAGE MUST NOT PRESCRIBE THE COMMAND THIS CHECK REFUSES (review
+    // round 9, F4). It used to say a file/directory conflict "is resolved by
+    // `git rm` on the path" — twelve words before the same check refused
+    // `git rm <dir>`. A lane following it loops on the refusal, and three
+    // consecutive blocks PARK the checkpoint.
+    const rmReason = validateToolCall("bash", `git rm ${dir}`, step, "gate").reason || "";
+    ok(!rmReason.includes("is resolved by `git rm`"), `the refusal no longer prescribes the refused command: ${rmReason}`);
+    ok(/escalate/i.test(rmReason), `...and it names the honest exit (escalate): ${rmReason}`);
     // the honest, narrow command still works
     _setConflictedProbeForTest(() => [file]);
     ok(!validateToolCall("bash", `git add ${file}`, step, "gate").block, "a conflicted FILE is still stageable");
@@ -1022,8 +1030,14 @@ await test("#1418 F2 (round 3): mid-rebase writes are REFUSED for every non-conf
     }
     ok(validateToolCall("write", "", step, "gate").block, "no target at all → blocked");
     ok(validateToolCall("write", "", step, "gate", 42).block, "non-string target → blocked");
+    // ⛔ THE WINDOW IS "rebase in progress OR an unmerged path exists" (review
+    // round 9, F2), so the no-rebase arm alone is NOT a refusal. This row used to
+    // assert "no rebase ⇒ even a conflicted path is blocked", which pins the
+    // INVERTED state an autostash reapply leaves behind (see the F2 row below).
     _setRebaseProbeForTest(() => false);
-    ok(validateToolCall("write", "", step, "gate", "src/conflicted.ts").block, "no rebase → even a conflicted path is blocked");
+    ok(!validateToolCall("write", "", step, "gate", "src/conflicted.ts").block, "no rebase but an UNMERGED path → the conflicted path is writable (round 9, F2)");
+    _setConflictedProbeForTest(() => []);
+    ok(validateToolCall("write", "", step, "gate", "src/conflicted.ts").block, "no rebase AND no unmerged path → blocked, as before");
   } finally { _setRebaseProbeForTest(null); _setConflictedProbeForTest(null); _setTokenFileForTest(null); }
 });
 
@@ -1256,6 +1270,46 @@ await test("#1418 F2 (round 4): conflictedPaths resolves git's --full-name outpu
   } finally { rmSync(base, { recursive: true, force: true }); }
 });
 
+// #1418 review round 9, F1 — GIT'S OUTPUT IS SEMANTIC, SO THE PARSE MAY NOT BE
+// LEXICAL. `git ls-files -u` C-QUOTES a non-ASCII path by default
+// (`core.quotepath`), so the set held `"men\303\272 caf\303\251.txt"` — a spelling
+// that does not exist on disk. Consequence, measured: the REAL conflicted file was
+// refused as "not unmerged" (edit/write blocked — the exact stranding #1418
+// removes) while the quoted junk path was ADMITTED. `-z` never quotes.
+await test("#1418 F1 (round 9): a C-QUOTED non-ASCII conflict resolves to the REAL file, never to git's escape", () => {
+  const base = mkdtempSync(join(tmpdir(), "ckpt-quote-"));
+  try {
+    const repo = join(base, "repo");
+    mkdirSync(repo, { recursive: true });
+    const g = (...a: string[]) => execFileSync("git", a, { cwd: repo, encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"] });
+    g("init", "-q", "-b", "main");
+    g("config", "user.email", "t@example.com");
+    g("config", "user.name", "t");
+    const name = "men\u00fa caf\u00e9.txt"; // the non-ASCII name IS the fixture
+    writeFileSync(join(repo, name), "base\n");
+    g("add", ".");
+    g("commit", "-qm", "c1");
+    g("checkout", "-qb", "other");
+    writeFileSync(join(repo, name), "other\n");
+    g("commit", "-qam", "c2");
+    g("checkout", "-q", "main");
+    writeFileSync(join(repo, name), "main\n");
+    g("commit", "-qam", "c3");
+    try { g("merge", "other"); } catch { /* the conflict is the fixture */ }
+    // NON-VACUITY: the fixture really is quoted without `-z`. If git ever stops
+    // quoting by default this row would go inert, and an inert row reads as green.
+    ok(g("ls-files", "-u", "--full-name").includes('"'), "the fixture is C-quoted by git without -z (so -z is what the row measures)");
+    const paths = conflictedPaths(repo);
+    equal(paths.length, 1, "one unmerged path");
+    equal(realpathSync(paths[0]!), realpathSync(join(repo, name)), "the set holds the REAL path, not the quoted spelling");
+    ok(!paths.some((x) => x.includes("\\303")), "no C-quote escape leaks into the set");
+    // the composite: the file the lane must repair is writable, and the quoted
+    // junk spelling — which is NOT the conflict — is refused.
+    ok(checkpointWriteTargetAllowed(join(repo, name), repo), "the REAL conflicted file is writable (this was the blocked half)");
+    ok(!checkpointWriteTargetAllowed(join(repo, '"men\\303\\272 caf\\303\\251.txt"'), repo), "git's QUOTED spelling is not an unmerged path");
+  } finally { rmSync(base, { recursive: true, force: true }); }
+});
+
 await test("#1418 F2 (round 3): with NO conflicted set (real git) every write is denied — fail-closed", () => {
   _setTokenFileForTest(null);
   _setRebaseProbeForTest(() => true);
@@ -1278,10 +1332,16 @@ await test("#1418 F1: the full CONFLICT loop is reachable at one pending checkpo
     ok(!validateToolCall("bash", "git add src/conflicted.ts", step, "gate").block, "staging reachable");
     ok(!validateToolCall("bash", "git rebase --continue", step, "gate").block, "continuation reachable");
     ok(!validateToolCall("bash", "parallel_work_check.sh implement", step, "gate").block, "checker re-run reachable");
-    // …and the allowance dies with the rebase: the step still cannot advance
-    // without a fresh CLEAR token.
+    // …and the allowance dies once NEITHER arm holds. It does NOT die with the
+    // rebase alone (review round 9, F2): an autostash reapply conflict leaves
+    // `UU` paths with no `rebase-merge/` marker, and the content fix must stay
+    // reachable there. Nothing can LAND what is written in that state either —
+    // `git rebase --continue` has no rebase to continue and `git commit` is
+    // blocked — so the step still cannot advance without a fresh CLEAR token.
     _setRebaseProbeForTest(() => false);
-    ok(validateToolCall("edit", "", step, "gate", "src/conflicted.ts").block, "edit re-blocked once the rebase ends");
+    ok(!validateToolCall("edit", "", step, "gate", "src/conflicted.ts").block, "the UNMERGED arm alone keeps the conflict writable (round 9, F2)");
+    _setConflictedProbeForTest(() => []);
+    ok(validateToolCall("edit", "", step, "gate", "src/conflicted.ts").block, "edit re-blocked once no rebase and no unmerged path remain");
   } finally { _setRebaseProbeForTest(null); _setConflictedProbeForTest(null); }
 });
 
@@ -1322,6 +1382,43 @@ await test("#1418 guidance names the STALE remedy concretely (no placeholder, es
   }
   ok(!g.includes("$"), "no $VAR — the escape regex rejects $");
   ok(!g.includes("<") && !g.includes(">"), "no placeholder brackets — < > fail the escape");
+  // #1418 (review round 9, F3): `git rebase --continue` runs git's COMMIT step,
+  // which may open an editor — no TTY means it fails ("Terminal is dumb, but
+  // EDITOR unset") or hangs in one, so the documented sequence would stop one
+  // command short of the remedy on exactly the conflict path it exists for. The
+  // escape must NOT be widened to supply it (an env prefix is the
+  // `git -c core.pager=…` vector this PR closes), so the hint states the
+  // PRECONDITION and names the honest exit.
+  ok(g.includes("GIT_EDITOR=true"), "the hint names the no-op editor the environment must supply");
+  ok(/editor/i.test(g) && /no TTY/i.test(g), "…and says WHY (a commit step that wants an editor, no TTY)");
+  ok(/end your turn and report/i.test(g), "…and names the honest exit when the environment cannot supply one");
+  ok(!/^GIT_EDITOR=true git/im.test(g), "it does NOT prescribe an env PREFIX on the command (sole-command only)");
+});
+
+// #1418 review round 9, F2 — THE STATE THE PR'S OWN NEWLY-ADMITTED FLAG CREATES.
+// `git rebase --autostash` finishes its replay and THEN the stash reapply conflicts
+// (measured on git 2.43.0: rc=0, "Applying autostash resulted in conflicts", NO
+// `rebase-merge/` marker, index `UU`). Gating the content fix on
+// `rebaseInProgress()` alone refused the WRITE while admitting the blanket
+// `git add` that stages the conflict MARKERS — exactly inverted, and the checker
+// has no conflict-marker check. The window is now "rebasing OR unmerged".
+await test("#1418 F2 (round 9): an autostash-reapply conflict has UNMERGED paths but NO rebase — the content fix must still be admitted", () => {
+  _setTokenFileForTest(null);
+  _setRebaseProbeForTest(() => false);            // measured: no rebase-merge/ dir
+  _setConflictedProbeForTest(() => ["s.txt"]);    // measured: index UU
+  const step = makeStep({ name: "check", gate: "checkpoint", token_phase: "implement" });
+  try {
+    ok(!validateToolCall("edit", "", step, "gate", "s.txt").block, "edit admitted on the unmerged path with no rebase in progress");
+    ok(!validateToolCall("write", "", step, "gate", "s.txt").block, "write admitted too");
+    ok(!validateToolCall("bash", "git add s.txt", step, "gate").block, "staging still admitted (it was ALREADY admitted — that is the inversion)");
+    // the WIDENING IS NOT AN OPENING: a non-conflicted path is still refused in
+    // exactly this state, and nothing can COMMIT what is written (no rebase to
+    // continue; `git commit` is blocked), so the step cannot advance.
+    ok(validateToolCall("edit", "", step, "gate", "src/impl.ts").block, "a NON-conflicted path is still refused");
+    ok(validateToolCall("bash", "git commit -m x", step, "gate").block, "`git commit` stays blocked");
+    _setConflictedProbeForTest(() => []);
+    ok(validateToolCall("edit", "", step, "gate", "s.txt").block, "with neither arm holding, the write is blocked again (fail-closed)");
+  } finally { _setRebaseProbeForTest(null); _setConflictedProbeForTest(null); _setTokenFileForTest(null); }
 });
 
 await test("malformed bash events → fail-closed BLOCK, no throw (input:{} / undefined / 42 / null)", () => {

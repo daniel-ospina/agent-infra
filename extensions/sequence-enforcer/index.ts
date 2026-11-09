@@ -1630,16 +1630,32 @@ export function conflictedPaths(cwd: string = process.cwd()): string[] {
     // file elsewhere in the tree is reported as NOT conflicted and the remedy is
     // denied with a misleading reason). With cwd = toplevel, `--full-name`
     // output is root-relative, which is exactly what `resolve(top, p)` expects.
-    const out = execFileSync("git", ["ls-files", "-u", "--full-name"], {
+    // ⛔ `-z`, BECAUSE GIT'S OUTPUT IS SEMANTIC AND A LINE PARSE IS LEXICAL (review
+    // round 9, F1). Without `-z` git C-QUOTES any path it considers
+    // unrepresentable — every non-ASCII byte becomes an escape like `\303\272` —
+    // so the set held the QUOTED spelling and `resolve(top, …)` built a path that
+    // does not exist. Measured on a real conflict (git 2.43.0): `menú café.txt`
+    // came back as `"men\303\272 caf\303\251.txt"`, so the REAL file was refused as
+    // "not unmerged" (edit/write blocked — the exact stranding #1418 removes)
+    // while the quoted junk path was ADMITTED. `-z` never quotes and is
+    // NUL-delimited, so any byte is safe in a path — including the newline that
+    // would split a line-based read.
+    // (A space-named path resolves correctly here but cannot be STAGED: `_PATH`
+    // admits no space, so `git add`/`git rm` cannot express it. Declared
+    // residual — the content fix (edit/write) is the part this row restores.)
+    const out = execFileSync("git", ["ls-files", "-u", "-z", "--full-name"], {
       cwd: top, encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"], timeout: 5000,
     });
-    // `<mode> <sha> <stage>\t<path>` — one line per unmerged STAGE, so the same
+    // `<mode> <sha> <stage>\t<path>\0` — one entry per unmerged STAGE, so the same
     // path repeats (up to three times); the set is what callers mean.
     const seen = new Set<string>();
-    for (const line of out.split("\n")) {
-      const i = line.indexOf("\t");
+    for (const entry of out.split("\0")) {
+      if (entry === "") continue;
+      const i = entry.indexOf("\t");
       if (i < 0) continue;
-      const rel = line.slice(i + 1).trim();
+      // ⛔ NO `.trim()`: with `-z` the path is exact, and a path may legally END
+      // in a space — trimming would silently rewrite the target.
+      const rel = entry.slice(i + 1);
       if (rel !== "") seen.add(resolve(top, rel));
     }
     return [...seen];
@@ -2364,7 +2380,9 @@ export function gateGuidance(step: Step, mode: Mode = "gate"): string {
     if (!resolvedBin) {
       return `→ To proceed: set AGENT_INFRA_PATH (a required prerequisite per AGENTS.md), then run \`…/scripts/parallel_work_check.sh ${requiredPhase}\` until the verdict is CLEAR (writes the PASS token).
 → If the checker reports STALE (behind origin/main), clear it first: \`git fetch\`, then rebase, then re-run the checker. With uncommitted work (the normal case at this step) use \`git rebase --autostash origin/main\` — a plain rebase refuses to start on a dirty tree.
-→ If that rebase stops on a conflict, resolve the CONFLICTED path in place (edit/write are admitted while a rebase is in progress, for the unmerged paths only; a delete/modify conflict is resolved with \`git rm\` on that same path), then \`git add\` (or \`git rm\`) and \`git rebase --continue\`.
+→ If that rebase stops on a conflict, resolve the CONFLICTED path in place (edit/write are admitted while a rebase is in progress OR while a path is unmerged, for the unmerged paths only; a delete/modify or rename/delete conflict is resolved with \`git rm\` on that FILE path), then \`git add\` (or \`git rm\`) and \`git rebase --continue\`.
+→ ⛔ \`git rebase --continue\` runs git's COMMIT step, which may open an editor: with no TTY it fails ("Terminal is dumb, but EDITOR unset") or hangs in one. If that happens the ENVIRONMENT must supply a no-op editor (GIT_EDITOR=true) — an env PREFIX on the command is NOT admitted — and if it cannot, this checkpoint is unpassable in this session: end your turn and report.
+→ A conflict on a DIRECTORY path (a file/directory conflict) cannot be resolved through this escape at all — end your turn and report it.
 → Escape tools available: read, loop_enforcer, and bash for the checker invocation or the stale-branch remedy (git fetch, git status, git diff, git rebase, git add, git rm)
 → If the check cannot CLEAR in this environment, the checkpoint is unpassable — end your turn and report`;
     }
@@ -2383,7 +2401,9 @@ export function gateGuidance(step: Step, mode: Mode = "gate"): string {
       : "";
     return `→ To proceed: run \`${enforcePrefix}${resolvedBin} ${requiredPhase}\`${ghostHint} until the verdict is CLEAR (writes the PASS token).
 → If the checker reports STALE (behind origin/main), clear it first: \`git fetch\`, then rebase, then re-run the checker. With uncommitted work (the normal case at this step) use \`git rebase --autostash origin/main\` — a plain rebase refuses to start on a dirty tree.
-→ If that rebase stops on a conflict, resolve the CONFLICTED path in place (edit/write are admitted while a rebase is in progress, for the unmerged paths only; a delete/modify conflict is resolved with \`git rm\` on that same path), then \`git add\` (or \`git rm\`) and \`git rebase --continue\`.
+→ If that rebase stops on a conflict, resolve the CONFLICTED path in place (edit/write are admitted while a rebase is in progress OR while a path is unmerged, for the unmerged paths only; a delete/modify or rename/delete conflict is resolved with \`git rm\` on that FILE path), then \`git add\` (or \`git rm\`) and \`git rebase --continue\`.
+→ ⛔ \`git rebase --continue\` runs git's COMMIT step, which may open an editor: with no TTY it fails ("Terminal is dumb, but EDITOR unset") or hangs in one. If that happens the ENVIRONMENT must supply a no-op editor (GIT_EDITOR=true) — an env PREFIX on the command is NOT admitted — and if it cannot, this checkpoint is unpassable in this session: end your turn and report.
+→ A conflict on a DIRECTORY path (a file/directory conflict) cannot be resolved through this escape at all — end your turn and report it.
 → Escape tools available: read, loop_enforcer, and bash for the checker invocation or the stale-branch remedy (git fetch, git status, git diff, git rebase, git add, git rm)
 → If the check cannot CLEAR in this environment, the checkpoint is unpassable — end your turn and report`;
   }
@@ -2567,10 +2587,23 @@ export function validateToolCall(
     // so a rebase stopped on a content conflict has no reachable exit unless
     // the agent can EDIT the file — it could otherwise only `--skip` (discard
     // the commit), `--abort` (straight back to STALE), or stage the conflict
-    // markers. Bounded to the rebase window: outside it these stay blocked.
+    // markers.
+    // ⛔ THE WINDOW IS "A REBASE IS IN PROGRESS **OR A PATH IS UNMERGED**" (review
+    // round 9, F2). `rebaseInProgress()` ALONE is false in a conflict state this
+    // escape's OWN newly-admitted flag produces: `git rebase --autostash`
+    // completes the replay and then the STASH REAPPLY conflicts. Measured on git
+    // 2.43.0 — rc=0, "Applying autostash resulted in conflicts", NO `rebase-merge/`
+    // marker, index `UU s.txt`. So the content fix was REFUSED while the blanket
+    // `git add` (which stages the conflict MARKERS) was ADMITTED — exactly
+    // inverted, and the checker has no conflict-marker check to catch it.
+    // The widened predicate widens nothing that carries the safety argument: the
+    // target is STILL bounded by `checkpointWriteTargetAllowed` (identity, git
+    // dir, containment, and the UNMERGED set), and with no rebase in progress no
+    // admitted command can COMMIT what was written — `git rebase --continue` has
+    // nothing to continue, and `git commit`/`push` stay blocked.
     if (
       (toolName === "edit" || toolName === "write") &&
-      rebaseInProgress() &&
+      (rebaseInProgress() || conflictedPaths().length > 0) &&
       checkpointWriteTargetAllowed(targetPath)
     ) {
       return { block: false };
@@ -2604,8 +2637,10 @@ export function validateToolCall(
       // including untracked ones in no unmerged stage. Measured: `git add sub`
       // staged `sub/a.txt` and `sub~HEAD`. A conflicted FILE is never a directory on
       // disk, so refusing directory targets costs the remedy nothing; the
-      // file/directory class is resolved with `git rm`, and where that cannot
-      // express it, it is a declared residual (escalate).
+      // file/directory class cannot be resolved through this escape AT ALL — the
+      // check below refuses a directory for `git add` and `git rm` alike, so the
+      // guidance must say ESCALATE rather than prescribe the command it just
+      // refused (review round 9, F4).
       const pathTargets = toolName === "bash"
         ? (rebaseAddTargets(command) !== null ? { verb: "git add", paths: rebaseAddTargets(command)! }
           : rebaseRmTargets(command) !== null ? { verb: "git rm", paths: rebaseRmTargets(command)! }
@@ -2617,7 +2652,12 @@ export function validateToolCall(
           return st !== undefined && st !== null && st.isDirectory();
         });
         if (dirTargets.length > 0) {
-          return { block: true, reason: `⛔ checkpoint gate — \`${pathTargets.verb}\` is admitted only for a conflicted FILE path; ${dirTargets.join(", ")} is a DIRECTORY on disk, so git reads it as a pathspec and stages the whole subtree (a file/directory conflict is resolved by \`git rm\` on the path, not by staging a tree)` };
+          // ⛔ DO NOT PRESCRIBE THE COMMAND THIS CHECK REFUSES (review round 9,
+          // F4). The message used to say a file/directory conflict "is resolved by
+          // `git rm` on the path" — while this same check refuses `git rm <dir>`
+          // (pinned by the round-8 row). A stranded lane following it loops on the
+          // same refusal, and three consecutive blocks park the checkpoint.
+          return { block: true, reason: `⛔ checkpoint gate — \`${pathTargets.verb}\` is admitted only for a conflicted FILE path; ${dirTargets.join(", ")} is a DIRECTORY on disk, so git reads it as a pathspec and stages the whole subtree. A file/directory conflict cannot be resolved through this escape (\`git rm\` on a directory is refused too — it needs a tree flag) — end your turn and report it (escalate); do not retry the same command` };
         }
         const unmerged = conflictedPaths();
         const stray = pathTargets.paths.filter((t) => !unmerged.includes(t));
