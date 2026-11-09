@@ -321,7 +321,16 @@ This is a residual list, not a completeness claim:
   `electron . <both fake switches>/tmp/log` was refused with its own mitigation in
   argv. And the `&` of `2>&1` is not a command separator — splitting there cut the
   launch out of its own segment (`round 12`, rows L50a–L50c, L51a/L51b1, allow twin
-  A73).
+  A73). The same strip is applied where the heredoc predicate reads its segment, so a
+  leading redirect cannot hide the SHELL that consumes the body either
+  (`2>/dev/null bash <<'EOF'` — L52a/L52b).
+- A LINE CONTINUATION is joined BEFORE the heredoc scan, because the operator can sit
+  on the continued line: `bash \` + newline + `<<'EOF'` and `bash <<<\` + newline +
+  `'electron .'` both hand a body to `bash` (measured), and the scan used to see only
+  the raw line — the body was blanked as data, losing block AND row (L53a/L53b). A
+  continuation at the end of a COMMENT is still not a continuation, which is why the
+  join tracks the comment state itself (`# note \` + newline + a launch RUNS the
+  launch — A74).
 - A LINE CONTINUATION (`\` + newline) is NOT a command separator: bash deletes it
   before word splitting, so
   `npm exec electron . \` + `--use-fake-device-for-media-stream --use-fake-ui-for-media-stream`
@@ -403,7 +412,7 @@ This is a residual list, not a completeness claim:
 ## Tests
 
 ```bash
-node extensions/gui-device-guard/test.mjs                    # 300 assertions, threat table L1–L51 + handler H1–H15
+node extensions/gui-device-guard/test.mjs                    # 306 assertions, threat table L1–L53 + handler H1–H15
 node extensions/gui-device-guard/test.mjs --classify 'npm exec electron .'
 ```
 
@@ -414,8 +423,8 @@ stays green while `index.ts` is broken and the guard is inert in every session.
 Mutations are pinned, each attributable to the row it is about, all measured at
 ONE head (**this** head — re-measured, not carried over: the counts are the output
 of running the mutant against `test.mjs`, and the assertion total is
-`300 = 230 ROWS + 14 APP_ROWS + 56 explicit \`check()\` calls`): the Electron
-rule's `media` → `false` reds **125**; the wrapper recursion
+`306 = 235 ROWS + 14 APP_ROWS + 57 explicit \`check()\` calls`): the Electron
+rule's `media` → `false` reds **130**; the wrapper recursion
 removed reds **8**; the wrapper WORDS removed reds **2**; the structural rule that
 reads a package-runner anywhere in the segment removed reds **2** (L19h/L19i); the
 comment stripper removed reds **2** (L11d and L11f — re-measured at this head; the
@@ -444,7 +453,8 @@ by the defect, so it is the record-half twin: it reds if the fix over-cuts and
 reports nothing); deleting the escape guard that the wider set needs reds **1**
 (L27c — without it `x\)#` is cut as a comment and the launch after the `;` is lost);
 removing the shell-STDIN recursion (a heredoc/here-string fed to a shell, the
-round-11 blocking defect) reds **19** (L28a–L28f, L29a–L29f, L35a/L36a/L36b/L37a/L38a/L42a/L47a —
+round-11 blocking defect) reds **23** (L28a–L28f, L29a–L29f, L35a/L36a/L36b/L37a/L38a/L42a/L47a, L52a/L52b,
+L53a/L53b —
 the body is deleted as data, so there is no block AND no ledger row); treating an unquoted
 `<<<word` as a heredoc
 opener reds **1** (L28h — the phantom heredoc deletes the rest of the input);
@@ -485,7 +495,12 @@ written, and the continued headed run lost block AND row); treating an attached 
 cluster reds **7** (L44b, L44c, the corrected P2-4 identity and four identity twins);
 NOT removing redirects from the word list reds **5** (L50a, L50b, L51a, L51b1 — a
 leading redirect became the command word, and a redirect glued to `--headed` or to the
-fake switches hid them); and splitting on the `&` of `2>&1` reds **1** (L50c); dropping `electron-forge` from the electron head test reds **5**
+fake switches hid them); splitting on the `&` of `2>&1` reds **1** (L50c); NOT stripping redirects in
+`lineFeedsShell` reds **3** (L35a, L52a, L52b — the redirect became the shell's
+command word, so a body the shell runs was blanked as data); joining continuations
+AFTER the heredoc scan reds **5** (L48b, L48c, L48a1, L53a, L53b); and ignoring the
+comment state while joining reds **1** (A74 — `# note \` + newline + a launch RUNS
+the launch); dropping `electron-forge` from the electron head test reds **5**
 (L31a–L31e); removing the PROCESS-substitution arm (`<( … )` / `>( … )`, the
 round-12 review's second P2) reds **3** (L32a–L32c, and A55 stays green because the
 double-quoted spelling never was a substitution); dropping the inner-binary term from

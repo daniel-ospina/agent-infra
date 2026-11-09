@@ -734,14 +734,13 @@ function shellExecutesStdin(rawToks: string[]): boolean {
   for (let depth = 0; depth < 3; depth++) {
     const cwi = commandWordIndex(toks);
     if (cwi >= 0) {
-      // ⛔ A SHELL GLUED TO ITS REDIRECT IS STILL THE COMMAND WORD (round-12 review,
-      // P2). `tokenize` never splits `<<` off a word, so `bash<<'EOF'` arrives as ONE
-      // token, `basename` reads `bash<<EOF`, it misses `SHELLS`, and the body was
-      // blanked as data: `bash<<'EOF'` + a launch was `[]` while the SPACED twin fired
-      // — and real bash runs the body either way (`bash <<'EOF'|tee` and `bash<<'EOF'|
-      // tee` both printed it). Truncating at the operator is what `tokenize` would
-      // have done had the redirect been spaced.
-      const head = basename(toks[cwi].split("<<")[0]);
+      // ⛔ A SHELL GLUED TO ITS REDIRECT IS STILL THE COMMAND WORD (`bash<<'EOF'`):
+      // `tokenize` never splits `<<` off a word, so the token arrives whole and
+      // `basename` would miss `SHELLS`. `stripRedirections` (applied by every caller
+      // through `words()`) already cuts a word at its first `<`/`>`, so the operator
+      // can no longer hide the shell — that is why this reads the plain basename now
+      // instead of splitting on `<<` a second time (one rule, one place).
+      const head = basename(toks[cwi]);
       if (head !== "" && SHELLS.has(head)) {
         for (let i = cwi + 1; i < toks.length; i++) {
           if (/^-[A-Za-z]*c[A-Za-z]*$/.test(toks[i]) || toks[i] === "--command") return false;
@@ -759,7 +758,7 @@ function shellExecutesStdin(rawToks: string[]): boolean {
     const at = Math.max(text.lastIndexOf("$("), text.lastIndexOf("<("), text.lastIndexOf("`"));
     if (at < 0) return false;
     const inner = text[at] === "`" ? text.slice(at + 1) : text.slice(at + 2);
-    const next = tokenize(inner).map(stripTrailingMetachars);
+    const next = stripRedirections(tokenize(inner)).map(stripTrailingMetachars);
     if (next.length === 0) return false;
     toks = next;
   }
@@ -798,10 +797,16 @@ function lineFeedsShell(line: string, cut: number, offset: number): boolean {
   // the last segment is then the safe (over-reading) answer.
   if (at < 0) at = segs.length - 1;
   if (at < 0) return false;
-  if (shellExecutesStdin(tokenize(segs[at].text))) return true;
+  // ⛔ A LEADING REDIRECT IS NOT THE COMMAND WORD HERE EITHER (round-12 review,
+  // ninth pass): `2>/dev/null bash <<'EOF'` fed a body to `bash`, but this predicate
+  // read the redirect as the command word, said "not a shell", and blanked the body
+  // as data — losing the block AND the ledger row, one fix away from the main pass
+  // that already strips redirections.
+  const words = (text: string) => stripRedirections(tokenize(text));
+  if (shellExecutesStdin(words(segs[at].text))) return true;
   for (let k = at; k + 1 < segs.length; k++) {
     if (!segs[k].pipeToNext) return false;
-    if (shellExecutesStdin(tokenize(segs[k + 1].text))) return true;
+    if (shellExecutesStdin(words(segs[k + 1].text))) return true;
   }
   return false;
 }
@@ -1700,8 +1705,26 @@ function joinLineContinuations(text: string): string {
   let out = "";
   let sq = false;
   let dq = false;
+  // ⛔ A `\\` AT THE END OF A COMMENT IS NOT A CONTINUATION (measured: `# c \\` +
+  // newline + `echo two` RUNS `echo two`). The comment state is tracked here because
+  // the join now runs BEFORE `stripComments` — the heredoc scan needs the joined line.
+  let comment = false;
   for (let i = 0; i < text.length; i++) {
     const ch = text[i];
+    if (ch === "\n") {
+      comment = false;
+      out += ch;
+      continue;
+    }
+    if (comment) {
+      out += ch;
+      continue;
+    }
+    if (!sq && !dq && ch === "#" && (i === 0 || /\s/.test(text[i - 1]))) {
+      comment = true;
+      out += ch;
+      continue;
+    }
     if (!sq && ch === "\\") {
       const nx = text[i + 1];
       if (nx === "\n") {
@@ -1740,10 +1763,16 @@ export function classifyLaunchCommand(command: string, depth = 0): LaunchFinding
   // blocking). The scan and the blanking are ONE pass, so the body a rule must read
   // is collected by the same predicate that decides whether it is data — a second
   // parse of `<<` is the #966 defect.
-  const heredocs = splitShellStdin(command);
+  // ⛔ CONTINUATIONS ARE JOINED BEFORE THE HEREDOC SCAN (round-12 review, ninth
+  // pass). The scan ran on the RAW text, so `bash \` + newline + `<<'EOF'` left the
+  // operator on a line whose only token was `<<EOF` — no shell, body blanked as data
+  // — and `bash <<<\` + newline + `'electron .'` matched the BACKSLASH as the
+  // here-string operand. bash joins first (measured: both spellings run the body).
+  const joined = joinLineContinuations(command);
+  const heredocs = splitShellStdin(joined);
   // Comments are removed BEFORE tokens are read, so a comment can never satisfy
   // the fake-capture mitigation (review cycle 2, F2).
-  const body = joinLineContinuations(stripComments(heredocs.cleaned));
+  const body = stripComments(heredocs.cleaned);
 
   // ⛔ A `PWDEBUG` EXPORTED IN AN EARLIER SEGMENT STILL APPLIES (review cycle 1,
   // F2: `export PWDEBUG=1; npx playwright test` used to classify as `[]` because

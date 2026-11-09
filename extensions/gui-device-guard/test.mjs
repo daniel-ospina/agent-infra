@@ -645,6 +645,19 @@ const ROWS = [
   //        predicate saw `--headed>/tmp/pw.log` and lost the headed run.
   ["L51a a redirect glued to `--headed` does not hide the headed run (was [])",
     "npx playwright test --headed>/tmp/pw.log", 1, "playwright", true],
+  // ── L52–L53 (round-12 review, ninth pass) — the two ORDER-OF-OPERATION gaps the
+  //     previous fixes left behind: a leading redirect on the SHELL side of a heredoc,
+  //     and a continuation BEFORE the heredoc operator.
+  ["L52a a leading redirect does not hide the shell that reads a heredoc (was [])",
+    "2>/dev/null bash <<'EOF'\nnpm exec electron .\nEOF", 1, "electron", true],
+  ["L52b …nor in front of a here-string (was [])",
+    "2>/dev/null bash <<<'npm exec electron .'", 1, "electron", true],
+  ["L53a a line continuation between the shell and its heredoc operator (was [])",
+    "bash \\\n<<'EOF'\nnpm exec electron .\nEOF", 1, "electron", true],
+  ["L53b …and between `<<<` and its operand (was [])",
+    "bash <<<\\\n'npm exec electron .'", 1, "electron", true],
+  ["A74 the ALLOW twin: a continuation in a COMMENT starts a new command, it does not\n    join one (bash RUNS the next line, so the launch there is still read)",
+    "# note \\\nelectron .", 1, "electron", true],
   //   L30c: tab completion appends a slash to directories, and `open
   //         ./Build/DMeer.app/` — the incident's own app — matched none of the three
   //         bundle tests while the `-a` spelling of the SAME token was refused.
@@ -761,6 +774,10 @@ check(
 check(
   "L51b1 both fake switches are recognised when a redirect is glued to the last one",
   (() => { const f = classify(`electron . ${FAKE}>/tmp/log`); return f.length === 1 && f[0].faked === true; })(),
+);
+check(
+  "L51b2 …and when a leading redirect precedes the launch",
+  (() => { const f = classify(`2>/dev/null electron . ${FAKE}`); return f.length === 1 && f[0].faked === true; })(),
 );
 // L11d — the mitigation must be ARGV, not COMMENT text (review cycle 2, F2).
 check(
