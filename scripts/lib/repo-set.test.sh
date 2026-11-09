@@ -1003,6 +1003,43 @@ def _odd_backslashes(s):
 def _strip_comment(line):
     """`line` with a trailing comment removed — bash's rule: an unquoted `#` that starts a WORD.
 
+    ⛔ NO GUARD IN THIS SCANNER IS UNDECLARED ANY MORE, BUT FIVE ARE LOAD-BEARING AND UNPINNED — DECLARED
+    HERE, BECAUSE "EVERY GUARD IS PINNED OR DECLARED" WAS FALSE UNTIL EVERY GUARD WAS MUTATED ONE AT A TIME
+    (baseline 246/0; population `git ls-files '*.sh'`, which was 435 when that sweep ran and is 437 now).
+
+    LOAD-BEARING, UNPINNED — a VALID-bash input separates the guard from its mutant (`bash -n` rc 0, and
+    `declare -F` agrees with the BASELINE and not with the mutant), NO fixture line carries that input, and
+    the mutant leaves the suite at 246/0:
+      * `_strip_comment` quote-open, below — `echo 'a # b' ; cat <<EOF` plus a body: the mutant scans the
+        body as code, a FALSE RED. Moves 0 files.
+      * `_strip_comment` word set (` \t;|&(`) — `x=1;# note cat <<NOPE` loses the very next definition, a
+        FALSE PASS. Moves 0 files.
+      * `_openers` DOUBLE-quote state — `echo "a <<b"` then a real heredoc loses every definition after it.
+        This one is NOT hypothetical: it moves 5 files and invents `pass` in `pr-path-reads.test.sh`, so
+        the namespace arm's own direction is exposed — and it is still unpinned, because no arm scans that
+        population.
+      * `_openers` backslash escape — it takes the escape and the OPENER on ONE logical line to separate it:
+        `echo \" ; cat <<EOF` plus a body invents the body line (FALSE RED). A two-line spelling does not
+        discriminate, because `quote` is per-call and an unclosed quote carries nowhere. Moves 0.
+      * the trailing flush (`if _buf is not None`) — a file ENDING mid-continuation (`last_def() { :; }`
+        followed by a single backslash AND a newline) drops the last definition, a FALSE PASS; the shape is
+        valid bash. Moves 0. The same bytes WITHOUT the trailing newline are not a fixture: `bash -n`
+        accepts them while EXECUTING them errors, so ground truth and the baseline disagree there.
+
+    PINNED, and the one case worth naming because it looks like the five above: the delimiter charset
+    `_.-` on the PLAIN path moves 3 files but also truncates the four `EOF*` delimiters in `repo-set.sh`,
+    losing 14 of its 26 definitions — so `_reader_defs_n` drops below the floor and `f11f` reds at 245/1.
+    The suite DOES catch that one; do not "declare" it.
+
+    NO-OP AT THIS HEAD — no input in this repo or in the fixture separates them, and each moves 0 files:
+    `_strip_comment`'s SINGLE-quote state, its DOUBLE-quote state, and its backslash escape.
+
+    ⛔ SO THIS IS A DECLARATION, NOT A PIN, and it says so: writing the five shapes above into `FIXTURE` is
+    the work that turns them into pins — until then a lane that "simplifies" one of those five is removing
+    bash-faithfulness that only the fixture would catch. Each shape is written out by name rather than
+    counted, because the names are what survives a new head — and the population numbers above are already
+    two files stale, which is the argument for the shape and against the count.
+
     ⛔ A COMMENT ENDS AT THE NEWLINE HOWEVER MANY BACKSLASHES IT CARRIES (round 48 review, P2 — measured).
     The join tested the RAW line, so `x=1  # note \\` was read as a continuation, the next line was
     swallowed and a real definition went invisible (a FALSE PASS) — and inside a `cat <<EOF` body the
@@ -1370,6 +1407,10 @@ head_with_comment_between()
 # Of the five names an earlier revision quoted as invented (`echo`, `printf`, `mkdir`, `awk`, `shift`), only
 # `echo`, `printf` and `mkdir` are invented here — by the ANCHOR mutant alone, among its 133; the next-line
 # mutant invents nothing. `awk` and `shift` appear in neither, so do not re-add a name without a measurement.
+# ⛔ `break` WAS IN AN EARLIER REVISION OF THIS LIST AND IS INVENTED BY NO MUTANT — withdrawn BY NAME here
+# rather than dropped silently, which is the only way a withdrawn claim stops being re-added (re-measured at
+# this head: none of the anchor mutant's 133 invented names, the next-line branch's 0, or the bare-word
+# guard's 0 is `break`).
 # ⛔ WHAT SURVIVES IS THE DIRECTION — deleting the anchor INVENTS names, deleting the next-line branch HIDES
 # them — so delete a guard, run the suite, run the mutant over `git ls-files '*.sh'`, and read the delta yourself. None of these may be reported:
 #   * a bare command name followed by `:` (not a brace) — a `head` match that must NOT be claimed;
