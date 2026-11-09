@@ -534,6 +534,41 @@ const ROWS = [
     "flock electron .", 1, "electron", true],
   ["A63 the ALLOW twin: a wrapper positional must not make every later word a launch",
     "flock /tmp/l.lock ls", 0, null, false],
+  // ── L40–L43 (round-12 review, fifth pass) — a GLUED grouping operator, `chroot`,
+  //     a line with TWO heredocs, and `$'…'` quoting in a delimiter.
+  //   L40: `tokenize` splits on whitespace only, and `)` is a bash METACHARACTER.
+  //        Only LEADING metachars were normalised, so `(open X.app)` compared
+  //        `.app)` against the bundle tests, `--headed)` against HEADED_FLAGS, and
+  //        the fake switches against their own spellings — one bug, both
+  //        directions: a miss (no block, no row) and a FALSE BLOCK on mitigated work.
+  ["L40a a GLUED grouping `)` does not hide an `open` (was [])",
+    "(open ./Build/DMeer.app)", 1, "open", true],
+  ["L40b …nor a HEADED Playwright run (was [])",
+    "(npx playwright test --headed)", 1, "playwright", true],
+  ["L40c …including a `&&` list inside the grouping (was [])",
+    "(cd app && npx playwright test --headed)", 1, "playwright", true],
+  ["A64 the ALLOW twin: a benign command in a glued grouping stays clean",
+    "(ls)", 0, null, false],
+  //   L41: `chroot NEWROOT [COMMAND …]` — a listed wrapper whose leading positional
+  //        is not the command, so the launch behind it vanished.
+  ["L41a `chroot ROOT electron .` — the root is a positional, not the command (was [])",
+    "chroot /tmp/root electron .", 1, "electron", true],
+  ["A65 the ALLOW twin: the same wrapper with a benign payload",
+    "chroot /tmp/root ls", 0, null, false],
+  //   L42: a line can open SEVERAL heredocs and their bodies arrive in order. Only
+  //        the LAST `<<` was located, so `bash <<A; cat <<B` fed A's body — the one
+  //        bash EXECUTES — to the void.
+  ["L42a two heredocs on one line: the FIRST body is the one the shell reads (was [])",
+    "bash <<A; cat <<B\nnpm exec electron .\nA\nx\nB", 1, "electron", true],
+  ["A66 the ALLOW twin: both bodies are `cat` data",
+    "cat <<A; cat <<B\nopen ./Build/DMeer.app\nA\nx\nB", 0, null, false],
+  //   L43: `$'…'` / `$"…"` are QUOTE FORMS, so `$` must not survive quote removal.
+  //        `<<$'EOF'` became the delimiter `$EOF`, found no terminator, and swallowed
+  //        the rest of the input — including the launch after the real `EOF` line.
+  ["L43a `<<$'EOF'` is the delimiter `EOF`, so the tail is still scanned (was [])",
+    "cat <<$'EOF'\nhi\nEOF\nnpm exec electron .", 1, "electron", true],
+  ["A67 the ALLOW twin: a benign body under `$'…'` quoting stays data",
+    "cat <<$'EOF'\nopen ./Build/DMeer.app\nEOF", 0, null, false],
   //   L30c: tab completion appends a slash to directories, and `open
   //         ./Build/DMeer.app/` — the incident's own app — matched none of the three
   //         bundle tests while the `-a` spelling of the SAME token was refused.
@@ -612,6 +647,13 @@ check(
 check(
   "L11b HALF the switches is not a mitigation (one flag is not enough)",
   (() => { const f = classify(`electron . ${mod.FAKE_DEVICE_FLAG}`); return f.length === 1 && f[0].faked === false; })(),
+);
+// ⛔ THE MITIGATION SURVIVES A GLUED GROUPING (round-12 review, fifth pass): with
+// `)` stuck to the last switch, the fake flags did not match and a REQUESTED
+// mitigation turned into a BLOCK. Bash strips the paren; so must the guard.
+check(
+  "L11b1 both fake switches are recognised INSIDE a glued grouping `)`",
+  (() => { const f = classify(`(electron . ${FAKE})`); return f.length === 1 && f[0].faked === true; })(),
 );
 // L11d — the mitigation must be ARGV, not COMMENT text (review cycle 2, F2).
 check(

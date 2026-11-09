@@ -287,6 +287,11 @@ const PREFIX_POSITIONALS: Record<string, number> = {
   taskset: 1,
   chrt: 1,
   script: 1,
+  // `chroot NEWROOT [COMMAND …]` — the root is a positional, the command follows
+  // it (round-12 review, P2: `chroot /tmp/root electron .` was `[]` while
+  // `chroot --userspec=0:0 /tmp/root electron .` was refused — the same launch,
+  // one flag apart; `unshare … chroot $ROOT /echo` proved the payload runs).
+  chroot: 1,
 };
 
 /**
@@ -765,6 +770,15 @@ function heredocDelimiter(raw: string): string | null {
   let i = 0;
   while (i < raw.length) {
     const ch = raw[i];
+    // ⛔ `$'…'` AND `$"…"` ARE QUOTE FORMS, NOT EXPANSION (round-12 review, P2).
+    // `$` was kept literally, so `<<$'EOF'` produced the delimiter `$EOF`, found no
+    // terminator, and swallowed the rest of the input — including the launch after
+    // the real `EOF` line (measured: `cat <<$'EOF'` terminates at `EOF` and runs the
+    // next line). ANSI-C and locale quoting are quote removal like any other.
+    if (ch === "$" && (raw[i + 1] === "'" || raw[i + 1] === '"')) {
+      i++;
+      continue;
+    }
     if (ch === "'") {
       const end = raw.indexOf("'", i + 1);
       if (end < 0) return null;
@@ -825,9 +839,7 @@ export function splitShellStdin(command: string): ShellStdin {
     }
     const re = /<<(-?)\s*(\S+)/g;
     let m: RegExpExecArray | null;
-    let delim: string | null = null;
-    let delimOffset = 0;
-    let stripTabs = false;
+    const pending: { word: string; offset: number; stripTabs: boolean }[] = [];
     while ((m = re.exec(line)) !== null) {
       // ⛔ A `<<` THAT IS PART OF `<<<` IS A HERE-STRING, not a heredoc: otherwise
       //    `bash <<<EOF` opened a heredoc with delimiter `EOF` and swallowed the
@@ -840,30 +852,35 @@ export function splitShellStdin(command: string): ShellStdin {
       if (cut !== -1 && m.index > cut) continue;
       const word = heredocDelimiter(m[2]);
       if (word === null) continue; // `<<<` and a bare `<<` with no usable word
-      delim = word;
-      delimOffset = m.index;
-      stripTabs = m[1] === "-";
+      pending.push({ word, offset: m.index, stripTabs: m[1] === "-" });
     }
-    if (delim === null) continue;
-    // Consume body lines through the terminator (which is kept: it carries no command).
-    const body: string[] = [];
+    if (pending.length === 0) continue;
+    // ⛔ A LINE CAN OPEN SEVERAL HEREDOCS, AND THE BODIES ARRIVE IN ORDER (round-12
+    // review, P2). Only the LAST `<<` on the line was located, so
+    // `bash <<A; cat <<B` sent A's body to the void and B's body was located
+    // instead — the body bash actually feeds to `bash` became DATA, and the launch
+    // inside it lost BOTH the refusal and the ledger row (measured: that line
+    // prints A's body, then B's). Each operator consumes its own body, in
+    // appearance order, exactly as the shell does.
     let j = li + 1;
-    while (j < lines.length && lines[j].replace(/^\t+/, "") !== delim) {
-      out.push("");
-      // `<<-` strips leading TABS from the body at execution time, so the program
-      // the shell runs is the tab-stripped text — not the source bytes.
-      body.push(stripTabs ? lines[j].replace(/^\t+/, "") : lines[j]);
-      j++;
+    for (const p of pending) {
+      const body: string[] = [];
+      while (j < lines.length && lines[j].replace(/^\t+/, "") !== p.word) {
+        out.push("");
+        // `<<-` strips leading TABS from the body at execution time, so the program
+        // the shell runs is the tab-stripped text — not the source bytes.
+        body.push(p.stripTabs ? lines[j].replace(/^\t+/, "") : lines[j]);
+        j++;
+      }
+      if (body.length > 0 && lineFeedsShell(line, cut, p.offset)) {
+        programs.push(body.join("\n"));
+      }
+      if (j < lines.length) {
+        out.push(""); // the terminator line carries no command
+        j++;
+      }
     }
-    if (delim !== null && body.length > 0 && lineFeedsShell(line, cut, delimOffset)) {
-      programs.push(body.join("\n"));
-    }
-    if (j < lines.length) {
-      out.push("");
-      li = j;
-    } else {
-      li = lines.length;
-    }
+    li = j - 1;
   }
   return { cleaned: out.join("\n"), programs };
 }
@@ -929,6 +946,29 @@ function stripLeadingMetachars(tok: string): string {
   let i = 0;
   while (i < tok.length && "({$!".includes(tok[i])) i++;
   return i === 0 ? tok : tok.slice(i);
+}
+
+/**
+ * Strip a TRAILING bash metacharacter from a token.
+ *
+ * ⛔ `tokenize` SPLITS ON WHITESPACE ONLY, AND BASH'S GROUPING OPERATORS ARE
+ * METACHARACTERS, NOT SPACES (round-12 review, P1). Only the FIRST token's
+ * leading metachars were normalised, so a command wrapped in parentheses carried
+ * the `)` on its LAST token and every exact-token predicate compared against the
+ * glued spelling:
+ *   - `(open ./Build/DMeer.app)` — `.app)` failed the suffix test AND both bundle
+ *     regexes, so the launch produced NO finding AND no ledger row;
+ *   - `(npx playwright test --headed)` — `--headed)` failed `HEADED_FLAGS`, so a
+ *     HEADED run was allowed;
+ *   - `(electron . --use-fake-… --use-fake-ui-…)` — the fake flags did not match,
+ *     so a MITIGATED run was refused: the false-block direction, in the same bug.
+ * Bash itself strips the parenthesis (`bash -c '(open ./Build/DMeer.app)'` passes
+ * `./Build/DMeer.app` as `$1`), so the guard must too.
+ */
+function stripTrailingMetachars(tok: string): string {
+  let end = tok.length;
+  while (end > 0 && ";&|()<>".includes(tok[end - 1])) end--;
+  return end === tok.length ? tok : tok.slice(0, end);
 }
 
 /** `A=B` leading assignment (an env prefix, not a command word). */
@@ -1532,7 +1572,11 @@ export function classifyLaunchCommand(command: string, depth = 0): LaunchFinding
   const pwdebug = /(?:^|[\s;|&])(?:export\s+)?PWDEBUG=(?!0\b|false\b)/.test(body);
 
   for (const segment of splitSegments(body)) {
-    const toks = tokenize(segment);
+    // ⛔ A TRAILING `)`/`;`/`&` IS A METACHARACTER, NOT A WORD CHARACTER (round-12
+    // review, P1): `(open X.app)` must segment exactly like `open X.app`. Leading
+    // metachars are stripped by `commandWordIndex`; trailing ones are stripped
+    // here, ONCE, so every predicate sees the word bash sees.
+    const toks = tokenize(segment).map(stripTrailingMetachars);
     if (toks.length === 0) continue;
     const flags: { sawFlag?: boolean; payloadStart?: number } = {};
     const cwi = commandWordIndex(toks, flags);
