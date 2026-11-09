@@ -1,0 +1,21 @@
+{
+  "artifacts": [],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 7800,
+  "exit_code": null,
+  "heartbeat_at": 1794188160,
+  "host": "cmux",
+  "issue": 2518,
+  "kind": "lane",
+  "lane_id": "cmux.klane-2518-1794188160-p3487441-2acf8064",
+  "lease_until": 1794195960,
+  "pid": 3487441,
+  "reason": null,
+  "repo": "daniel-ospina/tortoise",
+  "schema": 1,
+  "started_at": 1794188160,
+  "state": "RUNNING",
+  "tag": "2518",
+  "worktree": "/home/cmux/tortoise/.worktrees/tm-2518"
+}
