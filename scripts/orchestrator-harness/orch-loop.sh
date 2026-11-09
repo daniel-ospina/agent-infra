@@ -297,8 +297,12 @@ elif [ -n "${ORC_CONTROLLER_ORIGIN:-}" ]; then
 else
   MAX_LOAD_SRC="env"
 fi
-if ! is_limit "${MAX_LOAD:-}"; then MAX_LOAD=$(( 10#$_NCPU * 10 )); MAX_LOAD_SRC="repair:derived:cores"; fi
-is_limit "${MAX_LOAD:-}" || { MAX_LOAD=40; MAX_LOAD_SRC="repair:default40"; }
+# ⛔ TWO COERCIONS ON ONE LINE, AND IT MUST STAY ONE LINE. selftest.sh's `NGRD` extraction picks up
+# coercion lines by an ANCHORED `^is_limit "${MAX_LOAD:` pattern, pins their EXACT COUNT (22) and then
+# EVALUATES what it extracted to drive them (`nlim`, `maxload_probe`). Splitting these two repairs
+# changes the count AND drops the derive-to-cores step out of that driver, so `nlim abc` comes back 40
+# instead of 100 — a false RED in a suite asserting on this very block.
+is_limit "${MAX_LOAD:-}" || { MAX_LOAD=$(( 10#$_NCPU * 10 )); MAX_LOAD_SRC="repair:derived:cores"; }; is_limit "${MAX_LOAD:-}" || { MAX_LOAD=40; MAX_LOAD_SRC="repair:default40"; }
 # ⛔ CAPACITY, NOT A LANE COUNT (owner ruling, 2026-10-17): "dispatch should be gated on capacity,
 # not on number of lanes. max lanes 8 is too low. that needs to be configured to 2.5x the number of
 # CPUs". Both numbers in play were LANE COUNTS that no hardware decided: the shipped default was a
