@@ -2120,7 +2120,10 @@ ORCH_LOCK_START_SLACK_SECONDS="${ORCH_LOCK_START_SLACK_SECONDS:-5}"
 #   `1.5` → "syntax error: invalid arithmetic operator" → the ENCLOSING `if ! acq` COMPOUND IS ABORTED,
 #           so the block neither refuses nor reclaims: the newcomer prints STARTED with NO lock of its
 #           own while the LIVE owner's lock stays on disk — and its EXIT trap then deletes THAT lock
-#           (two controllers on one PR queue, #1715, plus a third-party deletion of a live lock)
+#           (two controllers on one PR queue, #1715, plus a third-party deletion of a live lock).
+#           ⛔ THAT WAS THE PRE-FIX BEHAVIOUR of a fault inside the verdict; the containment for the
+#           NEXT one is the subshell transport at the verdict's call site (see its comment) — this
+#           validation stays the FIRST line because it stops that fault happening at all.
 #   `abc` → "unbound variable" → the controller DIES at the lock check naming neither the variable nor
 #           the remedy (the cryptic-stop class #1985 exists to end)
 #   `08`  → "value too great for base" — ⛔ ALL-DIGITS AND STILL FATAL: bash reads a leading zero as
@@ -2130,6 +2133,11 @@ ORCH_LOCK_START_SLACK_SECONDS="${ORCH_LOCK_START_SLACK_SECONDS:-5}"
 case "$ORCH_LOCK_START_SLACK_SECONDS" in ''|*[!0-9]*) ORCH_LOCK_START_SLACK_SECONDS=5 ;; esac
 # ⛔ LEADING ZEROS STRIPPED TEXTUALLY, never normalised through `$(( ))`: `08` is all-digits and an
 # OCTAL ERROR in arithmetic (measured above), so the strip is what closes that half of the class.
+# ⛔ WHAT THIS STRIP DOES, EXACTLY — it NORMALISES, it does not REJECT (fresh review of #1985, P3;
+# MEASURED on this block, 11 values): `08` becomes **8** and `007` becomes **7**, and BOTH are KEPT,
+# because both are inside the bound below. The fallback to the documented 5 s covers only a value that
+# is NOT all-digits (`1.5`, `abc`, empty) or is wider than 60; an all-digit value with leading zeros is
+# neither, and no arm observes the resulting value unless §14's value rows run.
 while [ "${#ORCH_LOCK_START_SLACK_SECONDS}" -gt 1 ] \
       && [ "${ORCH_LOCK_START_SLACK_SECONDS#0}" != "$ORCH_LOCK_START_SLACK_SECONDS" ]; do
   ORCH_LOCK_START_SLACK_SECONDS="${ORCH_LOCK_START_SLACK_SECONDS#0}"
@@ -2255,13 +2263,26 @@ if ! acq; then
   # Digits only, like `orchestrator-bringup.sh:lock_pid`: a lock carrying `abc` reached `[ abc -gt 0 ]`
   # — an ERRORED test, which is FALSE, which reclaimed it — so the read is sanitised before any test.
   OPID="$(tr -dc '0-9' 2>/dev/null < "$LOCKF")"
-  # ⛔ THE VERDICT AND ITS CAPTURE ARE TWO STATEMENTS, NOT ONE `;`-JOINED LINE (fresh review of #1985,
-  # nit): as one compound, ANY fault in the verdict — the arithmetic-expansion class F1 measured, or a
-  # future one — aborts the whole `if ! acq` and the lock decision is skipped ENTIRELY, which is why
-  # that fault ran a second controller rather than landing in a branch. Split, the fault stops at the
-  # verdict and `_OV` carries its status into the branches below.
-  _orch_lock_verdict "${OPID:-0}" "$LOCKF"
-  _OV=$?
+  # ⛔ THE VERDICT RUNS IN A SUBSHELL AND TRANSPORTS ITS ANSWER THROUGH STDOUT — A STATEMENT SPLIT DOES
+  # NOT CONTAIN ANYTHING (fresh review of #1985, P3; MEASURED, both shapes). `v; _OV=$?` and `v`⏎`_OV=$?`
+  # are the SAME AND-OR list, so a bash ARITHMETIC fault inside the verdict does not stop at the
+  # verdict — it aborts the whole `if ! acq` compound (no refusal, no CANNOT-TELL, no reclaim log, no
+  # `rm`) and execution then continues PAST it: the newcomer prints STARTED with NO lock of its own
+  # while the live owner's lock stays on disk, and its EXIT trap later deletes THAT lock (#1715).
+  # ⛔ A PLAIN `( verdict ); _OV=$?` CONTAINS THE FAULT BUT IS NOT A FIX: it mints rc **1**, which is
+  # the RECLAIM answer — the destructive direction (MEASURED). So the verdict reports its rc AND its
+  # reason on stdout from inside the subshell, and a substitution that produced NO result (the fault
+  # aborted it) is mapped to 2 = CANNOT-TELL, which refuses LOUDLY. The input validation above stays
+  # the FIRST line of defence; this is the containment for a fault it cannot know about, which is the
+  # shape the slack fault arrived in.
+  _OVR="$( _orch_lock_verdict "${OPID:-0}" "$LOCKF"; printf '%s\t%s' "$?" "${ORCH_LOCK_WHY:-}" )"
+  _OV="${_OVR%%"$TAB"*}"
+  ORCH_LOCK_WHY="${_OVR#*"$TAB"}"
+  case "${_OV:-}" in
+    0|1|2) ;;
+    *) _OV=2
+       [ -n "${_OVR:-}" ] || ORCH_LOCK_WHY="the ownership verdict itself faulted: it produced NO result, so nothing about the owner was established" ;;
+  esac
   if [ "$_OV" = 0 ]; then echo "[orch-loop] already running (pid $OPID)"; exit 0; fi
   if [ "$_OV" = 2 ]; then
     _MSG="[orch-loop] CANNOT-TELL: lock $LOCKF names pid ${OPID:-none} and ${ORCH_LOCK_WHY:-the owner cannot be identified}, so a RECYCLED pid cannot be ruled out — a second controller is refused (agent-infra#1715). If no controller is running: rm -f $LOCKF (agent-infra#1985)"

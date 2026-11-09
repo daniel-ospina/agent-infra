@@ -42,6 +42,13 @@
 #      Linux `ps` blank-argvs a zombie (`[bash] <defunct>`), so the SHAPE arm already answers there
 #      and this branch is load-bearing on the launchd host; §13 stages the shape with a `PS_BIN`
 #      shim, the same idiom §7/7b/7c use, so the arm can actually go red.
+#  14. the env slack seam is VALIDATED before arithmetic, and — because a guard whose only witness is a
+#      refusal cannot tell "fell back to 5" from "normalised to 8" — §14v observes the RESULTING value
+#      for every shape (fresh review of #1985, P3: `08` is stripped to `8`, it does NOT fall back to 5).
+#  15. ⭐ A FAULT INSIDE THE VERDICT DOES NOT SKIP THE LOCK DECISION (fresh review of #1985, P3): the
+#      verdict is called in a subshell and transports its answer through stdout, so a fault it cannot
+#      contain lands in CANNOT-TELL instead of aborting the whole `if ! acq` compound — which is what
+#      made the newcomer run with NO lock while the live owner's lock stayed on disk.
 #
 # ⛔ THE SUBJECT IS THE REAL `orch-loop.sh`, NOT A RE-IMPLEMENTATION. The lock block lives in a marked
 # section (`# [orchlock:begin] … # [orchlock:end]`), which this suite EXTRACTS with `sed` and runs as
@@ -651,6 +658,72 @@ run_drv O="$C/o" ORCH_LOCK_START_SLACK_SECONDS=30
 ck "14: a VALID slack (30) still reclaims a peer that began after the lock (the guard is not a blanket clamp)" \
    "$(ran && [ "$RC" -eq 0 ] && echo 0 || echo 1)"
 kill -9 "$WSP" 2>/dev/null
+
+# ── 14v) THE RESULTING SLACK VALUE, OBSERVED — NOT JUST THE REFUSAL ─────────────────────────────────
+# ⛔ A GUARD WITNESSED ONLY BY ITS REFUSAL CANNOT TELL ITS TWO OUTCOMES APART (fresh review of #1985,
+# P3; MEASURED). Every §14 row above asserts that the block REFUSES, which the code does both when the
+# seam is "fixed" and when it is merely harmless — so the evidence record could claim `08`
+# "falls back to the documented 5 s" while the code STRIPS it to **8** and keeps it (8 is inside the
+# bound). It does, and did. What the seam produces is therefore read directly: the same extracted
+# block with one probe line appended, driven with no lock so the block runs straight through and the
+# value survives to be printed. Each row reds on the guard that owns it — delete the strip and `08` prints
+# `08`; delete the digit guard and `1.5` prints `1.5`; delete the bound and `61`/20-digit print as-is.
+# The fallback value is the DOCUMENTED 5, so the two shapes are distinguishable in one row each.
+echo "── 14v. the slack value the block actually keeps: normalisation vs fallback, observed"
+SECTION_SLACK="$TMP/section-slack-value.sh"
+{ cat "$SECTION"; printf 'printf "SLACK=%%s\\n" "$ORCH_LOCK_START_SLACK_SECONDS"\n'; } > "$SECTION_SLACK"
+grep -qF 'printf "SLACK=%s\n"' "$SECTION_SLACK"
+ck "14v: the fixture really appends a probe that prints the RESULTING slack (the row is not a restatement of §14)" $?
+slack_row() { # slack_row <raw|UNSET> <expected resulting value>
+  mkcase "$SECTION_SLACK"; CASE_DIR="$C"
+  if [ "$1" = UNSET ]; then run_drv O="$C/o"; else run_drv O="$C/o" "ORCH_LOCK_START_SLACK_SECONDS=$1"; fi
+  ck "14v: ORCH_LOCK_START_SLACK_SECONDS='$1' → slack '$2' (the value kept, not just the refusal)" \
+     "$(want "$OUT" "SLACK=$2" && echo 0 || echo 1)"
+}
+# The normalisation rows: all-digits with leading zeros, KEPT (inside the bound) after a textual strip.
+slack_row 08 8
+slack_row 007 7
+# The fallback rows: not all-digits, empty, or wider than the fence → the documented 5.
+slack_row 1.5 5
+slack_row abc 5
+slack_row "" 5
+slack_row UNSET 5
+slack_row 61 5
+slack_row 99999999999999999999 5
+# The other direction: valid values reach the fence UNCHANGED, so this is not a blanket clamp.
+slack_row 60 60
+slack_row 30 30
+slack_row 0 0
+
+# ── 15) ⭐ A FAULT INSIDE THE VERDICT MUST NOT SKIP THE LOCK DECISION ──────────────────────────────
+# ⛔ MEASURED ON THE PRE-FIX BLOCK WITH THIS EXACT FIXTURE: an arithmetic-expansion fault inside
+# `_orch_lock_verdict` prints its error, then — because `v; _OV=$?` and `v`⏎`_OV=$?` are the SAME
+# AND-OR list — the whole `if ! acq` body is ABORTED. No refusal, no CANNOT-TELL, no reclaim log, no
+# `rm`; execution continues PAST the compound and the driver prints `STARTED` with NO lock of its own
+# while the live owner's lock stays on disk (its EXIT trap then deletes THAT lock — #1715). The
+# statement split the earlier comment praised could not contain anything, and a plain
+# `( verdict ); _OV=$?` would mint rc 1 = RECLAIM, the destructive direction. The fix transports the
+# verdict's rc AND reason through stdout and maps "produced nothing" to 2 = CANNOT-TELL. The fault is
+# INJECTED into the extracted copy (the mutant the contract asks for), never into the subject.
+echo "── 15. ⭐ a fault INSIDE the verdict lands in CANNOT-TELL instead of skipping the lock decision"
+mkcase; CASE_DIR="$C"
+SECTION_FAULT="$C/section-verdict-fault.sh"
+awk '/^_orch_lock_verdict\(\) \{/{print; print "  _INJECTED_FAULT=$(( 1 + 1.5 ))"; next} {print}' "$SECTION" > "$SECTION_FAULT"
+grep -qF '_INJECTED_FAULT=$((' "$SECTION_FAULT"
+ck "15: the fixture really injects an arithmetic fault INSIDE the verdict (the arm is not a copy of 7)" $?
+mkcase "$SECTION_FAULT"; CASE_DIR="$C"
+FTP="$(spawn_loop "$C/peer")"; KIDS="$KIDS $FTP"; sleep 0.4
+printf '%s\n' "$FTP" > "$C/o/.orch.lock"        # AFTER the process started — the real write order
+run_drv O="$C/o"
+ck "15: a fault in the verdict does not let the newcomer run with NO lock (the lock decision is not skipped)" \
+   "$(ran && echo 1 || echo 0)"
+ck "15: …it lands in CANNOT-TELL, naming the pid and the lock (a refusal a human can act on)" \
+   "$(want "$ERR" "CANNOT-TELL" && want "$ERR" "$FTP" && want "$ERR" ".orch.lock" && echo 0 || echo 1)"
+ck "15: …the live owner's lock is UNTOUCHED (the half that #1715 turns on)" \
+   "$( [ "$(lock_pid "$C/o/.orch.lock")" = "$FTP" ] && echo 0 || echo 1)"
+ck "15: …and it does not KILL the controller (rc=0 — the #1985 cryptic-stop class)" \
+   "$( [ "$RC" -eq 0 ] && echo 0 || echo 1)"
+kill -9 "$FTP" 2>/dev/null
 
 # ── recap ───────────────────────────────────────────────────────────────────────────────────────
 echo
