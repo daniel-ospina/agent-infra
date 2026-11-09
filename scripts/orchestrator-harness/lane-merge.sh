@@ -169,16 +169,22 @@ is_limit "$MAX_ROUNDS" || { say_err "lane-merge: LANE_MERGE_MAX_ROUNDS='$MAX_ROU
 # size a decision and you will be arguing about a sliding window; quote the order of magnitude, the ratio or
 # the min/max, and the claim survives the next run.
 # ⛔ THE DAYS ARE NOT INTERCHANGEABLE, which is why the population is quoted WHOLE rather than as the
-# newest day: on the run-duration clock the slowest day's p95/max are 6836 s / 7968 s and the fastest
-# day's are 4565 s / (>=4725 s). ⛔ AND THE FASTEST DAY'S MAX IS A LOWER BOUND, NOT A MEASURED CEILING
-# (review cycle 5, P3 — the newest day is still FILLING, so its max grows under you: 4725 s at the first
-# read, 4872 s a few hours later). The slowest day's figures — the ones this argument actually rests on —
-# are exact and stable.
-# ⛔ AND PER-DAY COUNTS ARE DELIBERATELY NOT QUOTED (review cycle 3, P2 — verified). A per-day count moves
-# with the bucketing key (`created_at` vs `run_started_at` differs by one across a midnight boundary: the
-# same population buckets 92/67/53 one way and 91/67/54 the other), and a count that depends on which
-# clock you group by is not a measurement. The per-day p95/max above DO reproduce under either key, so
-# they are what this block states.
+# newest day: on the run-duration clock the slowest day's p95 runs ~6836 s (re-measured 6838/6840 s by
+# `created_at`/`run_started_at` bucketing — so quote it as a bound, ~6.8 h) and its max 7968 s is EXACT
+# (the same run every read). The fastest day's p95 measured ~4565 s on the first read and 4708 s later, so
+# it is quoted as `~4565 s` with its max marked a LOWER BOUND, not a ceiling (the newest day is still
+# FILLING: 4725 s at the first read, 4872 s a few hours later; re-read now 5067 s). ⛔ AND THIS PARAGRAPH
+# EARLIER SAID THE SLOWEST DAY'S FIGURES WERE "EXACT AND STABLE", WHICH THE SAME QUERY REFUTES (review
+# cycle 13, P3 — 6836 -> 6838/6840 s) and which contradicted the paragraph directly above it: only the MAX
+# is stable, and only because it is one identified run. The argument rests on that max and on the ORDERING
+# of the two clocks (lane-visible slower than run duration), both of which reproduce on every read.
+# ⛔ AND PER-DAY COUNTS ARE DELIBERATELY NOT QUOTED (review cycle 3, P2 — verified), and the illustration
+# that used to sit here is itself the evidence: it read "92/67/53 one way and 91/67/54 the other", which
+# SUMS TO 212 while this block states the population is 209 — so those numbers were never from the stated
+# population (review cycle 13, P3). The direction they were illustrating DOES reproduce (a run crosses
+# midnight and changes bucket with the key); a concrete count does not, which is exactly why a count that
+# depends on which clock you group by is not a measurement. The per-day max above reproduces under either
+# key, so that is what this block states.
 # ⛔ THE WINDOW IS PART OF THE MEASUREMENT, and the first draft of this block got that wrong (round-2
 # review, P1 — verified). It quoted the newest ~1 day only (n=83: p95 4521, max 4960) and claimed the new
 # bound covered 100 % of the population. It does not: the 11-07 day is materially slower, so a one-day
@@ -289,8 +295,27 @@ POLL_S="${LANE_MERGE_POLL:-120}";      is_limit "$POLL_S" || POLL_S=120      # o
 # The trade is deliberate. 40 chunks of supervision over a check wait that can never be satisfied is
 # supervision of a phase that never starts; 7 chunks over a wait that reaches the merge phase is
 # supervision that actually runs. Raising LANE_BACKSTOP_S buys more chunks without touching this bound.
+# ⛔ AND THE COST IS A MEASURED FALSE-BLOCK TAIL, NOT A HYPOTHETICAL (review, P3 — verified against this
+# box's `state/walltime.tsv`). The 840 s is CUMULATIVE per PR (`state/lanemerge-<pr>.watch`), and the chain
+# it now supervises dispatches a fresh reviewer under `REVIEW_TIMEOUT=1800`. Measured over n=54 reviewer
+# runs: min 162 s · p50 316 s · p90 431 s · max 1352 s — so about 1 in 54 (2 %) exceeds 840 s and will end
+# in exit 13 "budget spent; the chain was still running" where `origin/main` would have supervised for
+# 4800 s. That is a labelled hand-off, never a false pass — but it is a NEW false-block tail that this
+# change creates by making the chain reachable at all, so it is stated rather than absorbed. The remedy,
+# if it binds in practice, is to size MAX_WATCH from the chain's own reviewers (`REVIEW_TIMEOUT`) on a
+# gate repo instead of from the leftover clock.
 IMPL_RESERVE_S="${LANE_MERGE_IMPL_RESERVE:-900}"; is_limit "$IMPL_RESERVE_S" || IMPL_RESERVE_S=900
 LANE_WALL_S="${LANE_TIMEOUT:-${LANE_BACKSTOP_S:-7200}}"; is_limit "$LANE_WALL_S" || LANE_WALL_S=7200
+# ⛔ THE ARMED CEILING IS NOT NECESSARILY THIS FILE'S OPERAND (review, P3 — verified against
+# `spawn-gate.sh`'s `lane_wall_bound`): `run_agent` arms `min(caller_bound, LANE_BOUND_WALL_S)` for every
+# POSITIVE `LANE_BOUND_WALL_S`, and that knob is documented as a CEILING REDUCER. Mirroring only
+# `LANE_TIMEOUT`/`LANE_BACKSTOP_S` therefore computed a clamp against a clock the lane does not have:
+# with `LANE_BOUND_WALL_S=3600` a lane entering its merge phase at elapsed 3000 s was clamped to 4160 s of
+# wait, TERMed at 3600 s, and wrote NO verdict — the unlabelled kill the clamp exists to prevent. A `0` here
+# is "wall axis OFF", which `lane_wall_bound` REFUSES to reduce to, so it is not applied either.
+if is_limit "${LANE_BOUND_WALL_S:-}" && [ "${LANE_BOUND_WALL_S:-0}" -gt 0 ] && [ "$LANE_BOUND_WALL_S" -lt "$LANE_WALL_S" ]; then
+  LANE_WALL_S="$LANE_BOUND_WALL_S"
+fi
 INTERVAL="${LANE_MERGE_INTERVAL:-20}"; is_limit "$INTERVAL" || INTERVAL=20
 [ "$INTERVAL" -ge 5 ] || INTERVAL=20
 
@@ -567,6 +592,19 @@ IDLE_BOUND_S="${LANE_BOUND_IDLE_S:-2700}"; is_limit "$IDLE_BOUND_S" || IDLE_BOUN
 # Two polls of headroom, so the first heartbeat lands before the bound can fire; floored so a tiny
 # LANE_MERGE_INTERVAL cannot make the cap degenerate.
 _hb_margin=$(( INTERVAL * 2 )); [ "$_hb_margin" -ge 10 ] || _hb_margin=10
+# ⛔ THE MARGIN IS SIZED TO A POLL *SLEEP*, NOT TO A CHECK *READ*, AND THAT IS A DISCLOSED RESIDUAL
+# (review, P2 — verified by reading the adapter, NOT fixed here). The loop reads this head's checks at the
+# TOP of each iteration and tests the deadline AFTER it, so the hand-off lands `read_latency + <=intervals`
+# after the deadline. `checks_read` shells out to `gh`, which is the REST adapter → `gh-limit.py`, whose
+# retry path can SLEEP 60/120/240 s on top of its shim budget — far more than this margin. A throttled
+# final read can therefore push the labelled hand-off PAST the wall (or past the idle allowance) and the
+# watchdog TERMs the lane mid-hand-off: no verdict, no WAITING_CHECKS, the same unlabelled outcome this
+# branch's P1 closed on the common path. ⛔ NOT A REGRESSION (`origin/main` had no clamp at all, so every
+# late lane died that way); the class is SHRUNK, not closed. Bounded fix, not taken here because it is a
+# loop-restructure on a gate path and deserves its own review: test the deadline BEFORE the read on
+# iterations after the first, keeping "one last look" while taking the read off the critical path — or run
+# `checks_read` under a bounded runner. ⛔ AND THE MARGIN CANNOT SIMPLY GROW TO 60 s+: it is spent out of
+# the SAME 60 s of slack (`7140 + 60 = 7200`), so the fix is the read's placement, not the number.
 # ⛔ THIS IS A RUNTIME LIMIT ON A REAL WAIT, SO `--status` MUST NOT PAY FOR IT (review finding, P3 —
 # verified). `--status` is documented "no network, no writes" and exits ABOVE this block, so a read-only
 # status query never emits the cap's multi-line `say_err` about a wait it was never going to sit
