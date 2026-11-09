@@ -3434,11 +3434,18 @@ test("#1339d: loop wiring — the verdict is re-validated against evidence acros
   // false-branch is.
   ok(
     !/\blastMarkerAt > 0 \?\s*(?:Date\.now\(\)|now)\s*-/.test(src),
-    "no site computes the marker age by hand ANY MORE, in any spelling — a `: Infinity` / `: 0` false-branch does not exempt the raw difference from the single-reader rule (#1339 review-6 mutation: `: Infinity` survived the exact-literal pins above)",
+    "no hand-rolled `lastMarkerAt > 0 ? <clock> - lastMarkerAt` ternary survives — a `: Infinity` / `: 0` false-branch does not exempt the raw difference from the single-reader rule (#1339 review-6 mutation: `: Infinity` survived the exact-literal pins above). The pattern recognises the `Date.now()` and `now` clocks ONLY; a RENAMED clock is caught by the positive pin below instead, which is spelling-free (#1339 re-review P3b — this message used to claim \"in any spelling\", which overstated the pattern)",
   );
+  // ⛔ A POSITIVE `src.includes()` IS SATISFIABLE BY A COMMENTED-OUT COPY (#1339
+  // re-review P3a — measured: commenting both lines out and writing
+  // `const markerAge = Infinity;` left the suite GREEN). Positive presence
+  // claims are therefore asked of a COMMENT-STRIPPED projection, so prose
+  // cannot stand in for code. The naive strip is the one `#1339`'s wiring block
+  // above already uses (`code`), for exactly this reason.
+  const code = src.replace(/\/\/[^\n]*/g, "").replace(/\/\*[\s\S]*?\*\//g, "");
   ok(
-    src.includes("const backstopMarkerAge = readMarkerAge(hbCtx.state.lastMarkerAt, now).ageMs;") &&
-      src.includes("const markerAge = backstopMarkerAge < 0 ? Infinity : backstopMarkerAge;"),
+    code.includes("const backstopMarkerAge = readMarkerAge(hbCtx.state.lastMarkerAt, now).ageMs;") &&
+      code.includes("const markerAge = backstopMarkerAge < 0 ? Infinity : backstopMarkerAge;"),
     "the backstop's freshness read goes through `readMarkerAge` and maps its `-1` SENTINEL to `Infinity` — so `stateFresh` never compares a threshold against a sentinel or a negative age (the pre-#1339 shape could go negative whenever a marker was ingested between the timer's `now` and the read)",
   );
   // ⛔ THE SUPPRESSION ITSELF (#1339 review-6 P2). Everything above pins the
