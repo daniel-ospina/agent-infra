@@ -3099,15 +3099,18 @@ else
 fi
 
 # (A) NO ENTRY IS STALE — every exemption still has a declaring surface, in ANY spelling.
+# ⛔ HERE-STRINGS, NEVER `printf … | grep -q` (#841/#864): a piped `grep -q` can exit at its first match
+# while the producer is still writing, the producer dies of SIGPIPE, and under `pipefail` the pipeline's
+# status inverts — the verdict reads false while the pattern WAS found.
 DECLARED_IN_REPO="$(installed_labels_in_repo || true)"
-if printf '%s\n' "$DECLARED_IN_REPO" | grep -qxF 'com.eldato.lane-arm'; then
+if grep -qxF -- 'com.eldato.lane-arm' <<<"$DECLARED_IN_REPO"; then
     ok "§18 the population is read from the installers, and it includes the inline-plist label (com.eldato.lane-arm)"
 else
     bad "§18 installed_labels_in_repo MISSED com.eldato.lane-arm — the reverse gate below would be looking at a narrower population than it claims"
 fi
 while IFS= read -r _foreign; do
     [ -n "$_foreign" ] || continue
-    if printf '%s\n' "$DECLARED_IN_REPO" | grep -qxF "$_foreign"; then
+    if grep -qxF -- "$_foreign" <<<"$DECLARED_IN_REPO"; then
         ok "§18 the exemption '$_foreign' still has a declaring surface in this repo (not stale)"
     else
         bad "§18 the exemption '$_foreign' has NO declaring installer/spelling in this repo — re-anchor OWNED-BY-OTHER-INSTALLERS"
@@ -3124,9 +3127,9 @@ else
 fi
 while IFS= read -r _installed; do
     [ -n "$_installed" ] || continue
-    if printf '%s\n' "$TEMPLATE_LABELS" | grep -qxF "$_installed" \
-       || printf '%s\n' "$RETIRED_LABELS" | grep -qxF "$_installed" \
-       || printf '%s\n' "$FOREIGN_ENTRIES" | grep -qxF "$_installed"; then
+    if grep -qxF -- "$_installed" <<<"$TEMPLATE_LABELS" \
+       || grep -qxF -- "$_installed" <<<"$RETIRED_LABELS" \
+       || grep -qxF -- "$_installed" <<<"$FOREIGN_ENTRIES"; then
         ok "§18 '$_installed' is installed by this repo AND declared (template / RETIRED / OWNED-BY-OTHER-INSTALLERS)"
     else
         bad "§18 '$_installed' is installed into ~/Library/LaunchAgents by an installer in this repo but declared NOWHERE — --status would report it UNMANAGED and print a bootout+rm remedy for a live job"
