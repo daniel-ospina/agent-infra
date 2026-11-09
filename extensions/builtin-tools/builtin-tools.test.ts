@@ -7757,6 +7757,37 @@ test("#2105: a failed read at report time proves NO negative — unknown, never 
   ok(!line.includes("dirty=false"), "the cached snapshot is NEVER rendered as current state");
 });
 
+test("#2105: a PARTIAL read (status failed, head readable) still withholds the verdict", () => {
+  // ⛔ THE COMMON UNREADABLE CASE, not the rare one (#2105 review P2).
+  // `syncRepoState` returns a state while ANY of its three reads succeeds, so this
+  // is the shape a tree has when `git status` alone fails — `index.lock` held by
+  // the very commit the child is making, or the 5 s status timeout on a tree this
+  // repo's size. The FIELDS were safe; the TOKEN said `verdictWithheld=none`,
+  // i.e. "a verdict was given", for a tree nobody observed.
+  const partialAt = (headSha: string) => ({ branch: "feat/x", headSha, dirty: null, paths: null, observedAt: 9_000 });
+
+  // (a) unmoved head + failed status: the plain partial read.
+  const quiet = repoStateReportText(RS_SNAP, "/wt", 9_000, { probe: () => partialAt(RS_SNAP.headSha), countCommits: () => 0 });
+  ok(quiet.includes("verdictWithheld=state-unreadable"), "a tree whose status never ran withholds the verdict");
+  ok(!quiet.includes("verdictWithheld=none"), "…so the token can NEVER say 'no verdict withheld' over an unknown field");
+  ok(quiet.includes("dirty=unknown dirtyPaths=unknown"), "the fields stay UNKNOWN, never a fabricated clean");
+  ok(!quiet.includes("dirty=false"), "no cached clean is rendered as current state");
+  ok(quiet.includes("repoStateSource=fresh"), "the source is named; the failure is in the status read, not the reader");
+  ok(!quiet.includes("snapshotHeadSha="), "an unmoved head invents no staleness beside the refusal");
+
+  // (b) moved head AND failed status — the reviewer's own fixture shape. The
+  // unreadable refusal WINS (a moved head does not make the tree observable),
+  // and BOTH readable-head facts survive, so nothing is silently dropped.
+  const both = repoStateReportText(RS_SNAP, "/wt", 9_000, { probe: () => partialAt("b".repeat(40)), countCommits: () => 7 });
+  ok(both.includes("verdictWithheld=state-unreadable"), "the unreadable tree is the primary refusal, even when the head also moved");
+  ok(!both.includes("verdictWithheld=stale-snapshot"), "…and it does not launder itself into the stale token");
+  ok(both.includes(`headSha=${"b".repeat(40)}`), "the observed head survives — an observed fact is not withheld with the verdict");
+  ok(both.includes(`snapshotHeadSha=${"a".repeat(40)}`), "the moved snapshot head is still named");
+  ok(both.includes("commitsSinceSnapshot=7"), "…with the commit count, because both heads WERE readable");
+  ok(both.includes("the head ALSO moved"), "the human sentence states both facts, not just the one the token names");
+  ok(!both.includes("\n"), "never a newline — the Alive state line stays single-line");
+});
+
 test("#2105: repoStateSnapshotStale — a moved head only, never a missing one", () => {
   equal(repoStateSnapshotStale(RS_SNAP, RS_NOW), true, "two known, different heads ⇒ stale");
   equal(repoStateSnapshotStale(RS_SNAP, { ...RS_NOW, headSha: RS_SNAP.headSha }), false, "same head ⇒ not stale");

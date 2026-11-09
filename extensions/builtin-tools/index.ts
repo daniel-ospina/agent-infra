@@ -4007,6 +4007,41 @@ export function repoStateReportText(
   const stale = repoStateSnapshotStale(snapshot, observed);
   const parts = [renderRepoStateLine(observed, cwd), "repoStateSource=fresh", `repoStateAt=${now}`];
   if (snapHead && snapshotAgeMs !== null) parts.push(`snapshotAgeMs=${snapshotAgeMs}`);
+  // #2105 review P2 — a PARTIALLY unreadable tree is not a verdict either, and it
+  // is the COMMON unreadable case, not the rare one. `syncRepoState` returns a
+  // state as long as ONE of its three reads succeeds, so `status` failing ALONE
+  // leaves a readable branch/head with `dirty=unknown dirtyPaths=unknown` — and
+  // the causes are the incident's own shape: `index.lock` held by the very commit
+  // the child is making, or the 5 s timeout on a tree this repo's size, while
+  // `rev-parse`/`branch` answer in milliseconds. The FIELDS were already safe
+  // (`unknown`, never `dirty=false`); the TOKEN was not — it said "no verdict
+  // withheld" for a tree nobody observed, so a consumer routing on
+  // `verdictWithheld` was told a verdict had been given.
+  //
+  // PRECEDENCE: this refusal WINS over `stale-snapshot`. "I could not observe the
+  // tree" is the more fundamental refusal — a moved head does not make the tree
+  // facts observable — and a reader must not have to infer that from a
+  // `stale-snapshot` token whose sentence promises fresh tree facts. Nothing is
+  // lost: the moved head is still reported below, with its commit count, because
+  // BOTH heads were read successfully.
+  if (observed.paths === null) {
+    const movedFrom = stale && snapHead && observed.headSha ? snapHead : null;
+    const movedTo = movedFrom ? observed.headSha : null;
+    if (movedFrom && movedTo) {
+      const commits = (opts.countCommits ?? countCommitsBetween)(cwd, movedFrom, movedTo);
+      parts.push(`snapshotHeadSha=${movedFrom}`);
+      parts.push(`commitsSinceSnapshot=${commits === null ? "unknown" : commits}`);
+    }
+    parts.push("verdictWithheld=state-unreadable");
+    parts.push(
+      "(tree status could not be read at report time — dirty/dirtyPaths above are UNKNOWN, not clean; do not treat this report as evidence that nothing happened" +
+        (movedFrom && movedTo
+          ? `; the head ALSO moved ${movedFrom.slice(0, 12)} -> ${movedTo.slice(0, 12)} after the probe, so the snapshot is stale as well`
+          : "") +
+        ")",
+    );
+    return parts.join(" ");
+  }
   if (stale && snapHead && observed.headSha) {
     const commits = (opts.countCommits ?? countCommitsBetween)(cwd, snapHead, observed.headSha);
     parts.push(`snapshotHeadSha=${snapHead}`);
