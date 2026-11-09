@@ -259,13 +259,15 @@ import { fileURLToPath } from "node:url";
 import { PI_VERSION_PIN } from "./frontmatter-fixtures.mjs";
 import { parseWorkflowYaml, WorkflowYamlError } from "./workflow-yaml.mjs";
 import {
+  LEGACY_LOCK_REL,
   LOCKED_FILES,
   LOCK_VERSION,
   UNLOCKED_WORKFLOWS,
+  VERSION_FILE,
   hashLockedFiles,
-  hashLockedRegions,
   lockFindings,
   lockPath,
+  lockRegionEntries,
   lockRegions,
   regionPath,
   readLock,
@@ -969,6 +971,13 @@ const REQUIRED_TESTS = Object.freeze([
   "two regions of one workflow live in TWO lock files, so one edit moves exactly one of them (#1955)",
   "the region split is a PARTITION of the workflow bytes — every byte is covered exactly once (#1955)",
   "a region the lock no longer covers is RED and names the prune remedy (#1955)",
+  // #3828 review round — the fail-opens the fresh-context reviewer found in the
+  // region-keyed lock, plus the shape guard the dead constants promised.
+  "a whole-block MOVE is RED — the lock commits region ORDER, not just the set (#1955 P1)",
+  "the lock VERSION is read from disk, not fabricated — a wrong or missing marker is RED (#1955 P2-2)",
+  "a reintroduced legacy scripts/workflow-lock.json is RED, and --update-lock removes it (#1955 P2b)",
+  "--update-lock prunes unexpected entries LOUDLY instead of crashing (#1955 P3-3)",
+  "a lock entry that is not the recorded shape is RED, never silently accepted (#1955 P3-1)",
   "head-ref mode runs the structural assertions and does NOT apply the content lock",
   "head-ref mode is RED for an empty or comments-only ci.yml / node-ci.yml (#675 P1-1)",
   "the GitHub blob decode fails CLOSED on encoding 'none' or a lossy decode (#675 P1-1)",
@@ -1046,8 +1055,11 @@ const REQUIRED_TESTS = Object.freeze([
 // stub-keyed bound. All four are in the roster above as well, so deleting one by
 // name is RED independently of this floor. #843 cycle 3: 120 → 121 — the
 // behavioural workflow-lock test, also in the roster. #858: 121 → 123 — the
-// `--head-ref` usage-error test and the `=` spelling test, both in the roster.)
-const MIN_EXPECTED_PASSING = 123;
+// `--head-ref` usage-error test and the `=` spelling test, both in the roster.
+// #3828: 123 → 132 — the five region-lock findings the fresh-context review
+// raised (region ORDER, the on-disk VERSION marker, the inert legacy lock, the
+// crashing prune, the entry-shape guard); every one is in the roster above.)
+const MIN_EXPECTED_PASSING = 132;
 
 let finalized = false;
 function finalize() {
@@ -2041,7 +2053,7 @@ function makeLockFixture(overrides = {}) {
 
 /** The lock object `lockFindings` consumes, built from `dir`'s current bytes. */
 function liveLock(dir) {
-  return { version: LOCK_VERSION, files: hashLockedRegions(dir) };
+  return { version: LOCK_VERSION, files: lockRegionEntries(dir) };
 }
 
 /** Append raw bytes to a file in a lock fixture. */
@@ -2203,6 +2215,203 @@ test("a region the lock no longer covers is RED and names the prune remedy (#195
   assert.deepEqual(lockFindings(dir, readLock(dir)), []);
 });
 
+// #3828 review P1 — the digest SET cannot see a MOVE. Two branches that swap two
+// whole job blocks leave every region's bytes identical and the name set
+// identical, so only the recorded neighbours (prev/next) can red it. Before this
+// test existed, a 35-line permutation of `ci.yml` was GREEN and `--update-lock`
+// on the reordered tree produced no change at all — the move was invisible to the
+// check AND to the remedy.
+test("a whole-block MOVE is RED — the lock commits region ORDER, not just the set (#1955 P1)", () => {
+  const dir = makeLockFixture();
+  writeLockFile(dir);
+  const before = lockFiles(dir);
+  const rel = ".github/workflows/ci.yml";
+  const text = fs.readFileSync(path.join(dir, rel), "utf8");
+  const lines = text.split("\n");
+  const starts = [];
+  lines.forEach((line, i) => {
+    if (/^ {2}[A-Za-z0-9_.-]+:\s*$/.test(line)) starts.push(i);
+  });
+  assert.ok(starts.length > 3, `the fixture must have several job blocks, saw ${starts.length}`);
+  // Every block from index 1 on is a JOB block (the `jobs:` line itself sits in
+  // block 0, which starts at `on:`'s first two-space key). Swap the last two.
+  const blocks = starts.map((start, i) =>
+    lines.slice(start, i + 1 < starts.length ? starts[i + 1] : lines.length)
+  );
+  const last = blocks.length - 1;
+  [blocks[last - 1], blocks[last]] = [blocks[last], blocks[last - 1]];
+  const permuted = lines.slice(0, starts[0]).concat(...blocks).join("\n");
+  assert.notEqual(permuted, text, "the fixture move must actually change the file's bytes");
+  fs.writeFileSync(path.join(dir, rel), permuted);
+
+  const findings = lockFindings(dir, readLock(dir));
+  assert.ok(
+    findings.length > 0,
+    "permuting two whole job blocks changed the file's bytes; a lock that reports GREEN cannot " +
+      "be a content lock (the whole-file hash this replaced saw this edit)"
+  );
+  assert.ok(
+    findings.some((m) => /different POSITION/.test(m)),
+    `expected a POSITION finding, got: ${findings.join("; ")}`
+  );
+
+  // ...and re-locking must NOTICE the move, or nothing could ever catch it.
+  const relocked = writeLockFile(dir);
+  const after = lockFiles(dir);
+  const changed = [...after.keys()].filter((k) => before.get(k) !== after.get(k));
+  assert.ok(
+    changed.length >= 2,
+    `--update-lock must move the entries around the moved block, saw: ${JSON.stringify(changed)}`
+  );
+  assert.deepEqual(lockFindings(dir, relocked), [], "the re-locked tree must be GREEN");
+});
+
+// #3828 review P2-2 — `readLock` used to build the version field itself, so the
+// caller's assertion compared a constant to itself and the version branch of
+// `lockFindings` was unreachable from the CLI. The marker is now a file on disk.
+test("the lock VERSION is read from disk, not fabricated — a wrong or missing marker is RED (#1955 P2-2)", () => {
+  const dir = makeLockFixture();
+  writeLockFile(dir);
+  const versionFile = path.join(lockPath(dir), VERSION_FILE);
+  assert.equal(
+    readLock(dir).version,
+    LOCK_VERSION,
+    "readLock must parse the marker writeLockFile wrote"
+  );
+  const green = spawnSync(process.execPath, [CHECK_LOCK, "--root", dir], { encoding: "utf8" });
+  assert.equal(green.status, 0, `the fresh fixture must be GREEN: ${green.stderr}`);
+
+  for (const bad of [null, "1\n", "two\n"]) {
+    if (bad === null) fs.rmSync(versionFile, { force: true });
+    else fs.writeFileSync(versionFile, bad);
+    const findings = lockFindings(dir, readLock(dir));
+    assert.ok(
+      findings.some((m) => /version/.test(m)),
+      `a lock whose marker is ${JSON.stringify(bad)} must be RED on version, got ${JSON.stringify(findings)}`
+    );
+    const res = spawnSync(process.execPath, [CHECK_LOCK, "--root", dir], { encoding: "utf8" });
+    assert.equal(
+      res.status,
+      1,
+      `the CLI must exit 1 for marker ${JSON.stringify(bad)}, got ${res.status}`
+    );
+    assert.match(res.stderr, /version/);
+  }
+  writeLockFile(dir);
+  assert.deepEqual(lockFindings(dir, readLock(dir)), [], "--update-lock must restore the marker");
+});
+
+// #3828 review P2b — this change DELETES scripts/workflow-lock.json, so a branch
+// cut before it carries a modification to that file: a modify/delete conflict
+// whose natural resolution is "keep the lock file". Keeping it used to leave an
+// authoritative-looking lock that nothing read, forever.
+test("a reintroduced legacy scripts/workflow-lock.json is RED, and --update-lock removes it (#1955 P2b)", () => {
+  const dir = makeLockFixture();
+  writeLockFile(dir);
+  assert.deepEqual(lockFindings(dir, readLock(dir)), [], "the fixture must start GREEN");
+  const legacy = path.join(dir, LEGACY_LOCK_REL);
+  fs.writeFileSync(legacy, '{"version":1,"files":{".github/workflows/ci.yml":"deadbeef"}}\n');
+
+  const findings = lockFindings(dir, readLock(dir));
+  assert.equal(
+    findings.length,
+    1,
+    `a reintroduced legacy lock must be LOUD, expected one finding, got: ${findings.join("; ")}`
+  );
+  assert.match(findings[0], /scripts\/workflow-lock\.json/);
+  assert.match(findings[0], /--update-lock/);
+  const res = spawnSync(process.execPath, [CHECK_LOCK, "--root", dir], { encoding: "utf8" });
+  assert.equal(res.status, 1, `the CLI must be RED while the legacy lock exists, got ${res.status}`);
+
+  const relocked = writeLockFile(dir);
+  assert.ok(!fs.existsSync(legacy), "--update-lock must remove the legacy lock it reports");
+  assert.ok(
+    relocked.pruned.includes(LEGACY_LOCK_REL),
+    `--update-lock must SAY it pruned the legacy lock, saw: ${JSON.stringify(relocked.pruned)}`
+  );
+  assert.deepEqual(lockFindings(dir, readLock(dir)), []);
+});
+
+// #3828 review P3-3 — `lockFindings` prints "prune it with --update-lock" for an
+// unexpected entry, so that command must be able to remove one. It threw
+// ERR_FS_EISDIR on a nested directory, and silently deleted a plain non-region
+// file with no output at all.
+test("--update-lock prunes unexpected entries LOUDLY instead of crashing (#1955 P3-3)", () => {
+  const dir = makeLockFixture();
+  writeLockFile(dir);
+  const regionDirAbs = path.join(lockPath(dir), ".github/workflows/ci.yml");
+  const nested = path.join(regionDirAbs, "jobs.nested");
+  fs.mkdirSync(nested, { recursive: true });
+  fs.writeFileSync(path.join(nested, "stray.txt"), "x\n");
+  const readme = path.join(regionDirAbs, "README.md");
+  fs.writeFileSync(readme, "what these files are\n");
+
+  const findings = lockFindings(dir, readLock(dir));
+  assert.equal(
+    findings.length,
+    2,
+    `expected one finding per unexpected entry, got: ${findings.join("; ")}`
+  );
+  for (const msg of findings) assert.match(msg, /--update-lock/);
+
+  const res = spawnSync(process.execPath, [CHECK_LOCK, "--update-lock", "--root", dir], {
+    encoding: "utf8",
+  });
+  assert.equal(
+    res.status,
+    0,
+    `--update-lock must exit 0 on an unexpected directory, got ${res.status}: ${res.stderr}`
+  );
+  assert.ok(!fs.existsSync(nested), "--update-lock must prune the nested directory");
+  assert.ok(!fs.existsSync(readme), "--update-lock must prune the non-region file");
+  assert.match(
+    res.stdout,
+    /pruned .*jobs\.nested/,
+    "--update-lock must SAY it pruned the directory, not delete it silently"
+  );
+  assert.match(
+    res.stdout,
+    /pruned .*README\.md/,
+    "--update-lock must SAY it pruned the file, not delete it silently"
+  );
+  assert.deepEqual(lockFindings(dir, readLock(dir)), []);
+});
+
+// #3828 review P3-1 — SHA256_RE and REGION_NAME_RE were declared and never
+// called, which reads as two validations that do not exist. The entry parser now
+// APPLIES them, and this pins that it does: the order-blind bare-digest shape
+// must be refused rather than read as "a hash with no neighbours".
+test("a lock entry that is not the recorded shape is RED, never silently accepted (#1955 P3-1)", () => {
+  const dir = makeLockFixture();
+  writeLockFile(dir);
+  const file = regionPath(dir, ".github/workflows/ci.yml", "jobs.ci");
+  const good = fs.readFileSync(file, "utf8");
+  const [sha, prev, next] = good.trim().split(/\s+/);
+  assert.equal(
+    good.trim().split(/\s+/).length,
+    3,
+    `every entry must be <sha256> <prev> <next>, saw: ${JSON.stringify(good)}`
+  );
+
+  fs.writeFileSync(file, `${sha}\n`);
+  let findings = lockFindings(dir, readLock(dir));
+  assert.equal(findings.length, 1, `expected one shape finding, got: ${findings.join("; ")}`);
+  assert.match(findings[0], /not the recorded shape/);
+
+  fs.writeFileSync(file, "not-a-digest - -\n");
+  findings = lockFindings(dir, readLock(dir));
+  assert.equal(findings.length, 1, `a non-hex digest must be a SHAPE finding: ${findings.join("; ")}`);
+  assert.match(findings[0], /not the recorded shape/);
+
+  fs.writeFileSync(file, `${"0".repeat(64)} ${prev} ${next}\n`);
+  findings = lockFindings(dir, readLock(dir));
+  assert.equal(findings.length, 1, `a wrong digest with right neighbours is a CONTENT finding: ${findings.join("; ")}`);
+  assert.match(findings[0], /changed in region/);
+
+  writeLockFile(dir);
+  assert.deepEqual(lockFindings(dir, readLock(dir)), []);
+});
+
 test("the default CLI exits 1 on a mismatch, naming the file and the remedy", () => {
   const dir = makeLockFixture();
   writeLockFile(dir);
@@ -2317,7 +2526,7 @@ test("lockFindings: a non-object lock is RED with the --update-lock remedy (#675
 });
 test("lockFindings: a version mismatch is RED with the --update-lock remedy (#675 P2-e)", () => {
   const dir = makeLockFixture();
-  const findings = lockFindings(dir, { version: 1, files: hashLockedRegions(dir) });
+  const findings = lockFindings(dir, { version: 1, files: lockRegionEntries(dir) });
   assert.equal(findings.length, 1, `expected one finding, got ${findings.length}`);
   assert.match(findings[0], /version/);
   assert.match(findings[0], /--update-lock/);
@@ -2331,7 +2540,7 @@ test("lockFindings: a lock with no `files` mapping is RED (#675 P2-e)", () => {
 });
 test("lockFindings: an uncovered expected path is RED (#675 P2-e)", () => {
   const dir = makeLockFixture();
-  const files = hashLockedRegions(dir);
+  const files = lockRegionEntries(dir);
   delete files[".github/workflows/node-ci.yml"];
   const findings = lockFindings(dir, { version: LOCK_VERSION, files });
   assert.equal(findings.length, 1, `expected one finding, got ${findings.length}`);
@@ -2340,7 +2549,7 @@ test("lockFindings: an uncovered expected path is RED (#675 P2-e)", () => {
 });
 test("lockFindings: an unexpected extra path is RED (#675 P2-e)", () => {
   const dir = makeLockFixture();
-  const files = hashLockedRegions(dir);
+  const files = lockRegionEntries(dir);
   files[".github/workflows/extra.yml"] = { top: "0".repeat(64) };
   const findings = lockFindings(dir, { version: LOCK_VERSION, files });
   assert.equal(findings.length, 1, `expected one finding, got ${findings.length}`);
