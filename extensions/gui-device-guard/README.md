@@ -353,9 +353,10 @@ This is a residual list, not a completeness claim:
   document is read, and the TERMINATOR IS COMPARED against the joined text: `<<EOF` …
   `EO\` + newline + `F` ends the here-document and the launch after it RUNS, which the
   raw comparison did not see — the rest of the command, launch included, was swallowed
-  as body (L60). `<<-` strips the leading tabs of each DOCUMENT line only, so a
-  continuation line keeps its tab and `EO\`+tab+`F` is NOT a terminator (allow twin
-  A81). (2) The BACKSLASH COLLAPSE (`\\`, `\$`, `` \` ``) applies to the BODY the
+  as body (L60). `<<-` strips the leading tabs of the ASSEMBLED line — after the join —
+  so a tab that lands MID-line survives (`EO\`+tab+`F` is not a terminator, allow twin
+  A81) while one that lands LEADING is stripped and DOES terminate (`\` + tab + `EOF`
+  — L61), and a SPACE before it makes it non-leading again (allow twin A83). (2) The BACKSLASH COLLAPSE (`\\`, `\$`, `` \` ``) applies to the BODY the
   consuming shell receives, NOT to the comparison — `<<A$B` is not terminated by a body
   line `A\$B` (allow twin A82) — so `sh <<EOF` with `echo a \\` hands the shell
   `echo a \` + newline + `electron .`, which its own continuation join turns into one
@@ -456,7 +457,7 @@ This is a residual list, not a completeness claim:
 ## Tests
 
 ```bash
-node extensions/gui-device-guard/test.mjs                    # 325 assertions, threat table L1–L60 + handler H1–H15
+node extensions/gui-device-guard/test.mjs                    # 327 assertions, threat table L1–L61 + handler H1–H15
 node extensions/gui-device-guard/test.mjs --classify 'npm exec electron .'
 ```
 
@@ -467,8 +468,8 @@ stays green while `index.ts` is broken and the guard is inert in every session.
 Mutations are pinned, each attributable to the row it is about, all measured at
 ONE head (**this** head — re-measured, not carried over: the counts are the output
 of running the mutant against `test.mjs`, and the assertion total is
-`325 = 254 ROWS + 14 APP_ROWS + 57 explicit \`check()\` calls`): the Electron
-rule's `media` → `false` reds **142**; the wrapper recursion
+`327 = 256 ROWS + 14 APP_ROWS + 57 explicit \`check()\` calls`): the Electron
+rule's `media` → `false` reds **143**; the wrapper recursion
 removed reds **8**; the wrapper WORDS removed reds **4** (L45a + L56a–L56c); the structural rule that
 reads a package-runner anywhere in the segment removed reds **2** (L19h/L19i); the
 comment stripper removed reds **2** (L11d and L11f — re-measured at this head; the
@@ -552,9 +553,10 @@ model at the RAW line's base instead of the joined text's offsets reds **1** (A7
 matching an UNQUOTED heredoc's terminator against the raw line again reds **1** (L60);
 dropping the `\\`/`\$`/`` \` `` collapse from an unquoted body reds **1** (A79); and
 joining a QUOTED body — or failing to notice that its delimiter was quoted — reds
-**3** (L54a/L54b, A80); tab-stripping a continuation line again (the `<<-` rule) reds
-**1** (A81); and comparing the terminator AFTER the body's backslash collapse reds
-**1** (A82);
+**3** (L54a/L54b, A80); applying the `<<-` tab strip BEFORE the join instead of to the
+assembled line reds **1** (L61), stripping tabs MID-line reds **1** (A81), and
+stripping leading SPACES as well reds **1** (A83);
+comparing the terminator AFTER the body's backslash collapse reds **1** (A82);
 and reading `watch`'s operand from token 0 again reds **3**
 (L56a–L56c); dropping `electron-forge` from the electron head test reds **5**
 (L31a–L31e); removing the PROCESS-substitution arm (`<( … )` / `>( … )`, the

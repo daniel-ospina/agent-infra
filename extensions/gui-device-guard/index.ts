@@ -1081,9 +1081,13 @@ export function splitShellStdin(command: string): ShellStdin {
     for (const p of pending) {
       const body: string[] = [];
       while (j < lines.length) {
-        // `<<-` strips leading TABS from the body at execution time, so the program
-        // the shell runs is the tab-stripped text — not the source bytes.
-        const tabfree = (k: number) => (p.stripTabs ? lines[k].replace(/^\t+/, "") : lines[k]);
+        // ⛔ `<<-` STRIPS THE LEADING TABS OF THE ASSEMBLED LOGICAL LINE, i.e. AFTER
+        // continuation removal (round-12 review, fourteenth pass, P0). Not of each
+        // physical line — a tab that lands MID-line survives (`\tEO\` + `\tF` assembles
+        // to `EO\tF`, measured) — and not of the first physical line only either: a
+        // bare `\` followed by `\tEOF` assembles to a TAB-LED `EOF`, which bash accepts
+        // as the terminator and runs the launch after it (measured; the guard returned
+        // [] — no block, no row). So the strip happens once, on the joined text.
         // ⛔ AN UNQUOTED DELIMITER MAKES THIS A DIFFERENT DOCUMENT (round-12 review,
         // twelfth pass, P0). bash removes `\` + newline while reading the document, and
         // the TERMINATOR IS MATCHED AGAINST THE JOINED TEXT: `EO\` + newline + `F` ends
@@ -1093,24 +1097,27 @@ export function splitShellStdin(command: string): ShellStdin {
         // to the comparison (`<<A$B` is not terminated by a body line `A\$B` —
         // measured, allow twin A82). A QUOTED delimiter is literal and is matched raw,
         // terminator included (L54).
-        let text = tabfree(j);
+        let text = lines[j];
         let end = j;
         if (!p.quoted) {
           for (;;) {
             const nx = end + 1;
             if (nx >= lines.length) break;
-            // ⛔ `<<-` STRIPS THE LEADING TABS OF THE LOGICAL LINE, NOT OF ITS
-            // CONTINUATION (round-12 review, thirteenth pass, P2): the tab on a
-            // continuation line survives the join — bash's own warning calls the
-            // document `body\nEO\tF\n…` — so stripping it here made `EO\`+`\tF`
-            // look like `EOF`, ended a document bash leaves OPEN, and refused a
-            // launch bash treats as data (measured, allow twin A81).
+            // ⛔ THE CONTINUATION LINE IS APPENDED RAW — the `<<-` tab strip is
+            // applied later, to the ASSEMBLED line (round-12 review, P2). Stripping
+            // here made `EO\`+`\tF` look like `EOF`, ended a document bash leaves OPEN,
+            // and refused a launch bash treats as data (measured: `cat` prints the
+            // body line as `EO<TAB>F`, allow twin A81).
             const joined = joinContinuedLine(text, lines[nx]);
             if (joined === null) break;
             text = joined;
             end = nx;
           }
         }
+        // The `<<-` strip, on the ASSEMBLED line (see above) — it applies to a QUOTED
+        // document too, since tab stripping is a property of the operator, not of
+        // expansion.
+        if (p.stripTabs) text = text.replace(/^\t+/, "");
         if (text === p.word) break; // the terminator
         for (let k = j; k <= end; k++) out.push("");
         body.push(p.quoted ? text : unquoteHeredocBackslashes(text));

@@ -737,15 +737,28 @@ const ROWS = [
   //        Classifying the raw body instead OVER-blocked (measured).
   ["A79 the ALLOW twin: an unquoted body's `\\\\` collapses to `\\`, so the inner shell joins",
     "sh <<EOF\necho a \\\\\nelectron .\nEOF", 0, null, false],
-  //   A81: `<<-` strips the leading tabs of each DOCUMENT LINE, not of a CONTINUATION
-  //        line — bash keeps that tab, so `EO\` + tab + `F` is not the terminator and
-  //        the document runs to end-of-input, leaving the launch as data (measured).
+  //   A81: the `<<-` strip is applied to the ASSEMBLED line, so a tab that lands in the
+  //        MIDDLE of it survives — `EO\` + tab + `F` assembles to `EO<TAB>F`, not the
+  //        terminator, so the document runs to end-of-input and the launch is data
+  //        (measured: `cat` prints `EO<TAB>F`).
   ["A81 the ALLOW twin: `<<-` does not strip a continuation line's tab, so `EO\`+tab+`F` is no terminator",
     "cat <<-EOF\n\tbody\n\tEO\\\n\tF\nnpm exec electron .", 0, null, false],
   //   A82: the backslash COLLAPSE is body-only — the terminator is compared BEFORE it,
   //        so a body line `A\$B` does not terminate `<<A$B` (measured).
   ["A82 the ALLOW twin: the terminator is compared before the body's backslash collapse",
     "cat <<A$B\nline\nA\\$B\nnpm exec electron .", 0, null, false],
+  //   L61: `<<-` strips the leading tabs of the ASSEMBLED logical line — a bare `\` whose
+  //        continuation line starts with a TAB therefore assembles to a TAB-LED `EOF`,
+  //        which bash ACCEPTS as the terminator and then runs the launch after it
+  //        (measured). Stripping only the first physical line left the document open and
+  //        swallowed the launch as data: no block, no row.
+  ["L61 `<<-` strips the leading tabs of the ASSEMBLED terminator line (`\\` + tab + `EOF`) (was [])",
+    "cat <<-EOF\n\tbody\n\\\n\tEOF\nnpm exec electron .", 1, "electron", true],
+  //   A83: the twin that keeps the strip honest — a SPACE before the continuation's tab
+  //        means the tab is not LEADING, so the terminator is not recognised and the
+  //        document runs to end-of-input (measured: `cat` prints ` \tEOF`).
+  ["A83 the ALLOW twin: a space before the continuation's tab keeps the tab non-leading",
+    "cat <<-EOF\n\tbody\n \\\n\tEOF\nnpm exec electron .", 0, null, false],
   //   L30c: tab completion appends a slash to directories, and `open
   //         ./Build/DMeer.app/` — the incident's own app — matched none of the three
   //         bundle tests while the `-a` spelling of the SAME token was refused.
