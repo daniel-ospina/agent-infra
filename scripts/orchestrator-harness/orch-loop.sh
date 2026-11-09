@@ -88,6 +88,19 @@ fi
 # Where the WORKER scripts live. Named separately from `O` (state) because the two can now differ; the
 # `$O/state/argv-*`, `$O/.batch` and `$O/candidates.txt` arguments stay `$O` — they ARE state.
 O_WORK="$ORC_WORK_ROOT"
+# ⛔ AND `O` MUST BE EXPORTED, or the isolation is a claim the children contradict (fresh-context review
+# of #3846, P1 — the second one, and the sharper). Three DIRECT children re-default `O` themselves —
+# `harness-refresh.sh`, `refresh-candidates.sh` (`:212`) and `dispatch-merge.sh` (`:13`) — each with
+# `O="${O:-$HOME/orchestrator}"`, i.e. PRODUCTION. So an isolated instance printed "PRODUCTION state is
+# untouched by this instance" and then had its refresh rewrite production's `candidates.txt`/`.pool`/
+# `state/refresh-last`, and had `dispatch-merge.sh` write production's `.dispatched-ids` and prune its
+# `dispatched.txt`. The documented `ORC_STATE_DIR` arrangement was worse in the other direction: the
+# loop read `$O/candidates.txt` from the new dir while the refresh wrote it into the old one, so the box
+# reported `[cap]`/`[state]` healthy with an empty queue and dispatched nothing.
+# `worker-terminal.sh:1804` already emits `export O=…` in its env snapshot for exactly this reason ("a
+# worker falling back to $HOME/orchestrator is how a box silently runs a different harness") — the
+# worker path was covered and these three were not.
+export O
 # ⛔ SAY IT OUT LOUD, ONCE, AND ON THE `console` SIDE TOO. The incident needed `ps` archaeology
 # because NOTHING in either controller's log named the state dir it was writing or the fact that it
 # had adopted production as a DEFAULT rather than because a unit told it to. A derived (isolated)

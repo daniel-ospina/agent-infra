@@ -649,8 +649,9 @@ case "${LAUNCHD_MODE:-running}" in
   crashloop) printf '\tstate = spawn scheduled\n\tlast exit code = 128\n\truns = 7\n'; exit 0 ;;
   # NO launch count at all: the row may print the code and must invent no count.
   died) printf '\tstate = spawn scheduled\n\tlast exit code = 128\n'; exit 0 ;;
-  # A CLEAN exit with a climbing launch count: `orch-loop.sh`'s "already running" path does `exit 0`,
-  # so KeepAlive relaunches it cleanly, for ever. This must NOT read as a crash.
+  # A CLEAN exit with a climbing launch count: a job that ends normally is relaunched by KeepAlive,
+  # for ever. This must NOT read as a crash. (The lock-refusal case used to land here; since
+  # agent-infra#2095 it exits 75 and has its own `refused-singleton` row below.)
   clean-exit) printf '\tstate = spawn scheduled\n\tlast exit code = 0\n\truns = 7\n'; exit 0 ;;
   # Loaded, no process, and launchd has NEVER launched it (runs = 0 settles "never kicked").
   never-started) printf '\tstate = spawn scheduled\n\truns = 0\n'; exit 0 ;;

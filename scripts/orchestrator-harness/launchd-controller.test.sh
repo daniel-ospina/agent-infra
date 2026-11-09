@@ -27,6 +27,10 @@
 #      a runner without it.
 #   H  an EMPTY plist value is a MEANING, not an absence: `install.sh` renders OR empty on purpose
 #      (#2040: "derive it from $REPO's origin"), so forwarding only NON-EMPTY values loses it
+#   I  a singleton REFUSAL is PROPAGATED as the wrapper's own exit 75 (agent-infra#2095) — the plist's
+#      program is `orch-pin-exec.sh`, so launchd sees THIS wrapper's code and never the loop's, and
+#      `harness-up`'s REFUSED-SINGLETON row was unreachable without it. Plus the control: a plain
+#      early death is still 69, so the arm cannot pass by labelling everything a refusal.
 #
 # HERMETIC: its own `TMUX_TMPDIR` (so it can never touch, count or reap a real session), its own
 # HOME, its own scratch `$O`, and a stub `orch-loop.sh`. No network. Run: bash launchd-controller.test.sh
@@ -359,6 +363,58 @@ if [ "$D_ELAPSED" -ge $(( FLOOR_S + 2 )) ]; then
 else
   bad "case D: returned after ${D_ELAPSED}s with a ${FLOOR_S}s floor and a ~4 s session — the floor did NOT engage (a floorless build would land here)"
 fi
+
+# ── I. a REFUSAL is propagated, not reported as a crash (agent-infra#2095) ───────────────────────
+# ⛔ WHY THIS ARM EXISTS. The plist's program is `orch-pin-exec.sh`, so launchd's `last exit code` is
+# THIS WRAPPER's, and `harness-up` grew a `REFUSED-SINGLETON` row keyed on 75. Without propagation the
+# wrapper answered 69 for anything that died inside 2 s — exactly what a refusal looks like — so the
+# row could never fire and a CORRECT refusal read as `DIED … every attempt is failing` for ever.
+# A stubbed `harness-up` proves the row's wording; only this arm proves the code ever arrives.
+log_line "I. a [singleton] REFUSAL is propagated as 75, not swallowed as 69"
+"$TMUX_BIN" kill-session -t "=$S" 2>/dev/null || true
+REFUSAL_O="$TMP/o-refusal"; mkdir -p "$REFUSAL_O/logs"
+cat > "$REFUSAL_O/orch-loop.sh" <<'SH'
+#!/bin/bash
+# A controller that refuses at startup: it writes the line the shipped loop writes and exits 75.
+mkdir -p "$O/logs" 2>/dev/null
+echo "[singleton] refused me=pid=$$@test state=$O — HELD by live controller pid 999999" >> "$O/logs/orch-loop.log" 2>/dev/null
+exit 75
+SH
+chmod +x "$REFUSAL_O/orch-loop.sh"
+I_ERR="$TMP/i.err"
+O="$REFUSAL_O" CONTROLLER_RESTART_FLOOR=2 bash "$TARGET" >"$TMP/i.out" 2>"$I_ERR" &
+I_PID=$!
+wait "$I_PID"; I_RC=$?
+if [ "$I_RC" -eq 75 ]; then
+  ok "case I: a refusal (the loop wrote [singleton] and exited 75) is PROPAGATED as 75"
+else
+  bad "case I: the wrapper exited $I_RC, want 75 — a refusal would be reported as a crash (stderr: $(head -2 "$I_ERR"))"
+fi
+if grep -q 'REFUSED to start' "$I_ERR"; then
+  ok "case I: it SAYS the refusal is a refusal, naming the holder's log"
+else
+  bad "case I: no refusal line on stderr — the operator gets a crash framing"
+fi
+# ⛔ NON-VACUITY CONTROL: the same path must still report a genuine early death as 69. Without this,
+# a wrapper that answered 75 for everything would pass the two checks above.
+DEAD_O="$TMP/o-dead"; mkdir -p "$DEAD_O/logs"
+cat > "$DEAD_O/orch-loop.sh" <<'SH'
+#!/bin/bash
+exit 1
+SH
+chmod +x "$DEAD_O/orch-loop.sh"
+"$TMUX_BIN" kill-session -t "=$S" 2>/dev/null || true
+J_ERR="$TMP/j.err"
+O="$DEAD_O" CONTROLLER_RESTART_FLOOR=2 bash "$TARGET" >"$TMP/j.out" 2>"$J_ERR" &
+J_PID=$!
+wait "$J_PID"; J_RC=$?
+if [ "$J_RC" -eq 69 ]; then
+  ok "case I control: a loop that dies with NO [singleton] line still exits 69 (no refusal is invented)"
+else
+  bad "case I control: exited $J_RC, want 69 — a plain early death is now labelled something else"
+fi
+export O="$TMP/o"
+"$TMUX_BIN" kill-session -t "=$S" 2>/dev/null || true
 
 # ── summary ────────────────────────────────────────────────────────────────────────────────────
 log_line "RESULT: $PASS passed, $FAIL failed, $SKIP skipped"

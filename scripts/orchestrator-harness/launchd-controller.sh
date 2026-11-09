@@ -145,6 +145,21 @@ fi
 # sourcing that file would EXECUTE the controller, which is the thing this file is here to launch.
 _shq() { local s="${1:-}" q="'"; printf "'%s'" "${s//$q/$q\\$q$q}"; }
 
+# _lc_refused — 0 when the loop REFUSED at startup (a `[singleton]` line in its log), 1 otherwise.
+# ⛔ THE WITNESS IS THE ARTIFACT THE LOOP ALREADY WRITES, not `#{pane_dead_status}`: that is a
+# tmux-version dependency this launcher does not otherwise carry, and a refusal can happen before a
+# pane is even addressable. `harness-up` keys its `REFUSED-SINGLETON` row on this wrapper's exit code,
+# so a refusal that is swallowed here is a permanent false-red on a healthy box (agent-infra#2095).
+_lc_refused() {
+  [ -f "$O/logs/orch-loop.log" ] && grep -q '\[singleton\]' "$O/logs/orch-loop.log" 2>/dev/null
+}
+# _lc_refusal_exit — say the refusal and exit 75. One copy, so the two early-death arms cannot drift
+# into one that reports a refusal as a crash and one that does not.
+_lc_refusal_exit() {
+  _lc_err "'$S' controller REFUSED to start: this state dir already has a controller ([singleton] in $O/logs/orch-loop.log names the holder) — exiting 75 so launchd and harness-up report a REFUSAL, not a crash"
+  exit 75
+}
+
 # THE PLIST'S KEY SET, VERBATIM. Keep it equal to `EnvironmentVariables` in launchd.plist.template —
 # `launchd-controller.test.sh` asserts that equality in both directions, so a key added to the
 # template cannot silently fail to reach the controller.
@@ -243,11 +258,22 @@ if ! "$TMUX_BIN" has-session -t "=$S" 2>/dev/null; then
     _w=$(( _w + 1 ))
   done
   if ! "$TMUX_BIN" has-session -t "=$S" 2>/dev/null; then
+    _lc_refused && _lc_refusal_exit
     _lc_err "'$S' did not come up within 10s of new-session — see the pane output above"
     exit 69
   fi
   sleep 2
   if ! "$TMUX_BIN" has-session -t "=$S" 2>/dev/null; then
+    # ⛔ A SINGLETON REFUSAL IS NOT A DEATH, AND launchd CANNOT SEE THE DIFFERENCE WITHOUT THIS (P1,
+    # fresh-context review of #3846). The plist's program is `orch-pin-exec.sh`, which runs THIS wrapper,
+    # so the job's `last exit code` is the WRAPPER's — and the wrapper used to answer 69 for anything
+    # that died inside 2 s, which is exactly what a refusal looks like (`orch-loop.sh` now exits 75
+    # before any cycle work). The loop's own 75 was therefore discarded, and the shipped
+    # `harness-up` row for it could never fire: a correct refusal still read as `DIED … every attempt is
+    # failing`, for ever, on a healthy box. The witness is the artifact the loop already writes — a
+    # `[singleton]` line in its log — rather than `#{pane_dead_status}`, which is a tmux-version
+    # dependency this launcher does not otherwise carry.
+    _lc_refused && _lc_refusal_exit
     _lc_err "'$S' died within 2s of starting — see the pane output above"
     exit 69
   fi
@@ -273,7 +299,10 @@ if [ "$_LIVED" -lt "$RESTART_FLOOR" ]; then sleep $(( RESTART_FLOOR - _LIVED ));
 
 # ⛔ SAY HOW LONG IT RAN. Exiting 0 after a controller that died in two seconds is indistinguishable
 # in launchd.err from an idle box; the lifetime is the one datum that separates them. It stays exit 0
-# because a controller that exits AT ONCE is a legitimate state (`orch-loop.sh` exits 0 when another
-# controller holds the lock), so this is a diagnostic, not a verdict.
+# because a controller that ends normally is a legitimate state, so this is a diagnostic, not a
+# verdict. ⛔ THE REFUSAL IS NO LONGER ONE OF THOSE STATES (agent-infra#2095): `orch-loop.sh` exits 75
+# when another controller holds the lock and this wrapper PROPAGATES it above (a `[singleton]` line in
+# the loop's log is the witness), because otherwise the wrapper's own exit code hid the refusal from
+# launchd and from every row `harness-up` prints.
 _lc_err "the '$S' controller session ended after ${_LIVED}s (exit 0)"
 exit 0

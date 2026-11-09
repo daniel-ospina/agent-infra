@@ -1465,8 +1465,8 @@ hp_launchd_dead_text() { # <label>
     printf 'NEVER-STARTED (%s is loaded with NO process and launchd reports 0 launches — it has never been kicked; start it: launchctl kickstart -k gui/%s/%s)' \
       "$label" "$(id -u)" "$label"
   elif [ "$lexit" = "0" ]; then
-    printf 'EXITED-CLEAN (last exit 0%s — a KeepAlive job is relaunched on its ThrottleInterval, so a job that STAYS here is exiting IMMEDIATELY rather than crashing; read %s/logs/launchd.out)' \
-      "$seen" "$O"
+    printf 'EXITED-CLEAN (last exit 0%s — a KeepAlive job is relaunched on its ThrottleInterval, so a job that STAYS here is exiting IMMEDIATELY rather than crashing. If the loop REFUSED because this state dir already has a controller it exits 75 and lands on the REFUSED-SINGLETON row instead; a 0 here with a [singleton] line in %s/logs/orch-loop.log is the same refusal seen through a wrapper that outlived the 2 s probe; read %s/logs/launchd.out)' \
+      "$seen" "$O" "$O"
   elif [ "$lexit" = "75" ]; then
     # ⛔ 75 IS A DELIBERATE REFUSAL, NOT A CRASH (agent-infra#2095). `orch-loop.sh` used to print
     # "already running (pid N)" and `exit 0` — the false PASS this row was written around — and a
