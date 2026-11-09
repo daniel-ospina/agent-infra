@@ -31,6 +31,17 @@
 #  10. an exported `COLUMNS` cannot change any answer above (#2926): a width-truncated process read
 #      would turn a LIVE loop-shaped owner into "provably NOT the owner" and DELETE its lock, so §11
 #      re-drives the refusal arms with `COLUMNS=20` — the witness #2926 requires of every `-ww` fix.
+#  12. ⭐ THE PROBE'S THREE UNKNOWN CLOSURES ARE ASSERTED, not merely written (fresh review of #1985,
+#      P2): a table that OMITS a signallable pid, an EMPTY table, and a row whose argv column is
+#      unreadable must each answer CANNOT-TELL and leave the lock alone. MEASURED on the pre-fix
+#      suite: deleting any of the three left `PASS=54 FAIL=0` — the two that close a FAIL-OPEN were
+#      invisible to CI, which is the mutant leg being ABSENT rather than the arm being wrong (#3442).
+#  13. a ZOMBIE row answers "not the owner" even when its command column still carries the original
+#      argv (fresh review of #1985, P2): `kill -0` SUCCEEDS on a zombie, so without this arm a lock
+#      whose owner was killed-but-unreaped stops the box forever — the symptom #1985 opened with. On
+#      Linux `ps` blank-argvs a zombie (`[bash] <defunct>`), so the SHAPE arm already answers there
+#      and this branch is load-bearing on the launchd host; §13 stages the shape with a `PS_BIN`
+#      shim, the same idiom §7/7b/7c use, so the arm can actually go red.
 #
 # ⛔ THE SUBJECT IS THE REAL `orch-loop.sh`, NOT A RE-IMPLEMENTATION. The lock block lives in a marked
 # section (`# [orchlock:begin] … # [orchlock:end]`), which this suite EXTRACTS with `sed` and runs as
@@ -479,6 +490,167 @@ run_drv O="$C/o" COLUMNS=20
 ck "11: a stale lock over a live NON-controller is still RECLAIMED under COLUMNS=20 (the fix is not a blanket refusal)" \
    "$(ran && [ "$RC" -eq 0 ] && echo 0 || echo 1)"
 kill -9 "$NP" 2>/dev/null
+
+# ── 12) THE PROBE'S UNKNOWN CLOSURES MUST BE ASSERTED, NOT MERELY WRITTEN ────────────────────────
+# ⛔ EACH OF THE THREE GUARDS BELOW EARNED ITS OWN ARM BY DISAPPEARING QUIETLY (fresh review of #1985,
+# P2; MEASURED: deleting any one of them from a copy at this head left the pre-fix suite at
+# `PASS=54 FAIL=0`). They are the closures of the same fail-open the doctrine exists for: `_orch_lock_probe`
+# answers rc 1 = ABSENT, and the caller answers ABSENT by DELETING the lock, so a read that merely could
+# not see the owner must never be minted into "provably not the owner" (#1715). Each arm is driven
+# through the `PS_BIN` shim the §7 family already uses, and each one reds on the named mutant.
+echo "── 12. the probe's UNKNOWN closures: an unreadable read never becomes a reclaimed lock"
+# 12a) the table READ fine but OMITS a pid that `kill -0` can still signal → UNKNOWN, not ABSENT.
+# Mutant that reds this arm: `kill -0 "$p" 2>/dev/null && return 2` deleted from the row-absent branch
+# — then an incomplete/hidepid/shimmed table reclaims a LIVE owner's lock.
+mkcase; CASE_DIR="$C"
+cat > "$C/bin/ps-omits" <<'PSSHIM4'
+#!/bin/bash
+# A NON-EMPTY table that does not carry the owner's row (an incomplete read, a hidepid table, a shim).
+case "$*" in
+  *etime*) echo 10:00; exit 0 ;;
+  *-axo*)  printf '      1 Ss   bash /tmp/other/orch-loop.sh\n'; exit 0 ;;
+esac
+exit 1
+PSSHIM4
+chmod +x "$C/bin/ps-omits"
+OP="$(spawn_loop "$C/peer")"; KIDS="$KIDS $OP"; sleep 0.4
+printf '%s\n' "$OP" > "$C/o/.orch.lock"
+run_drv O="$C/o" PS_BIN="$C/bin/ps-omits"
+ck "12a: a table that omits a pid we CAN signal is UNKNOWN, not absent (it refuses)" "$(ran && echo 1 || echo 0)"
+ck "12a: …and says CANNOT-TELL naming the pid" \
+   "$(want "$ERR" "CANNOT-TELL" && want "$ERR" "$OP" && echo 0 || echo 1)"
+ck "12a: …and the live owner's lock is UNTOUCHED" \
+   "$( [ "$(lock_pid "$C/o/.orch.lock")" = "$OP" ] && echo 0 || echo 1 )"
+kill -9 "$OP" 2>/dev/null
+# 12b) the read "succeeded" and printed an EMPTY table → unreadable, never absence (#1178 C3). The
+# owner here is genuinely DEAD, which is what makes this arm attributable: with the guard deleted the
+# empty table falls through to `kill -0` (fails, the pid is gone) and reclaims. Mutant that reds it:
+# `case "$t" in *[![:space:]]*) ;; *) return 2 ;; esac` deleted.
+mkcase; CASE_DIR="$C"
+cat > "$C/bin/ps-empty" <<'PSSHIM5'
+#!/bin/bash
+# Answers the AGE read, and "succeeds" on the table read while printing NOTHING.
+case "$*" in
+  *etime*) echo 10:00; exit 0 ;;
+  *-axo*)  exit 0 ;;
+esac
+exit 1
+PSSHIM5
+chmod +x "$C/bin/ps-empty"
+EP="$(spawn_loop "$C/peer")"; KIDS="$KIDS $EP"; sleep 0.4
+printf '%s\n' "$EP" > "$C/o/.orch.lock"
+kill -9 "$EP" 2>/dev/null; sleep 0.3               # dead, so only the empty-table guard can refuse
+run_drv O="$C/o" PS_BIN="$C/bin/ps-empty"
+ck "12b: an EMPTY table is UNREADABLE, not empty — it refuses instead of reclaiming" "$(ran && echo 1 || echo 0)"
+ck "12b: …and says CANNOT-TELL" "$(want "$ERR" "CANNOT-TELL" && echo 0 || echo 1)"
+ck "12b: …and the lock is left in place for a human" \
+   "$( [ "$(lock_pid "$C/o/.orch.lock")" = "$EP" ] && echo 0 || echo 1 )"
+# 12c) the row is PRESENT but its command column is unreadable → UNKNOWN (never "not an orch-loop.sh").
+# Mutant that reds it: `[ -n "$cmd" ] || return 2` deleted — an unreadable argv then reads as a
+# non-controller and the lock is deleted.
+mkcase; CASE_DIR="$C"
+cat > "$C/bin/ps-nocmd" <<'PSSHIM6'
+#!/bin/bash
+# The row for pid 1 carries a STAT column and no argv at all.
+case "$*" in
+  *etime*) echo 10:00; exit 0 ;;
+  *-axo*)  printf '      1 Ss\n'; exit 0 ;;
+esac
+exit 1
+PSSHIM6
+chmod +x "$C/bin/ps-nocmd"
+printf '1\n' > "$C/o/.orch.lock"
+run_drv O="$C/o" PS_BIN="$C/bin/ps-nocmd"
+ck "12c: a row whose argv cannot be read is UNKNOWN, not 'not a controller' (it refuses)" \
+   "$(ran && echo 1 || echo 0)"
+ck "12c: …and says CANNOT-TELL" "$(want "$ERR" "CANNOT-TELL" && echo 0 || echo 1)"
+ck "12c: …and the lock naming that pid is NOT removed" \
+   "$( [ "$(lock_pid "$C/o/.orch.lock")" = "1" ] && echo 0 || echo 1 )"
+
+# ── 13) A ZOMBIE CANNOT HOLD A LOCK, EVEN IF ITS ARGV SURVIVES THE READ ──────────────────────────
+# ⛔ THE HOST THAT NEEDS THIS IS NOT THIS ONE. Linux's `ps` does not keep a zombie's argv — the row is
+# `[bash] <defunct>`, so the SHAPE arm already answers "not the owner" and `Z` changes no outcome here.
+# But `kill -0` SUCCEEDS on a zombie, so on any `ps(1)` that hands back the ORIGINAL argv (the macOS/
+# launchd host this suite's README calls the loop's production host) the shape and age arms BOTH say
+# OWNER and only this branch reclaims — i.e. deleting it restores "a lock owned by a killed-but-unreaped
+# controller stops the box forever", the exact symptom #1985 opened with. MEASURED: deleting the `Z*`
+# case from a copy at this head left the pre-fix suite at `PASS=54 FAIL=0`, so the arm is staged through
+# the `PS_BIN` shim idiom — a zombie row whose command column keeps `bash …/orch-loop.sh`.
+echo "── 13. a ZOMBIE row whose argv still reads as a controller: reclaim (a zombie holds no lock)"
+mkcase; CASE_DIR="$C"
+cat > "$C/bin/ps-zombie" <<'PSSHIM7'
+#!/bin/bash
+# A zombie whose argv SURVIVED the read: stat Z, command still `<shell> <…/orch-loop.sh>`, and an age
+# old enough that the age fence calls it a non-owner only if the Z arm fails to answer first.
+case "$*" in
+  *etime*) echo 10:00; exit 0 ;;
+  *-axo*)  printf '      1 Z    bash /tmp/zombie/orch-loop.sh\n'; exit 0 ;;
+esac
+exit 1
+PSSHIM7
+chmod +x "$C/bin/ps-zombie"
+printf '1\n' > "$C/o/.orch.lock"                     # written now, so the age fence alone says OWNER
+run_drv O="$C/o" PS_BIN="$C/bin/ps-zombie"
+ck "13: a ZOMBIE is not an owner even with a loop-shaped argv (the box starts instead of stopping forever)" \
+   "$(ran && [ "$RC" -eq 0 ] && echo 0 || echo 1)"
+ck "13: the reclaim is LOGGED (never silent)" \
+   "$(want "$(cat "$C/o/logs/orch-loop.log")" "provably NOT the owner" && echo 0 || echo 1)"
+ck "13: the zombie's lock is replaced by the newcomer's own pid" \
+   "$( [ "$(lock_pid "$C/o/.orch.lock")" = "$(printf '%s\n' "$OUT" | sed -n 's/.*STARTED pid=\([0-9]*\).*/\1/p')" ] && echo 0 || echo 1 )"
+
+# ── 14) THE ENV SLACK SEAM IS VALIDATED BEFORE ARITHMETIC — the one input to the decision that is
+# TRUSTED (fresh review of #1985, P1) ───────────────────────────────────────────────────────────
+# ⛔ WHY THIS IS A FAIL-OPEN AND NOT A COSMETIC EDGE. `ORCH_LOCK_START_SLACK_SECONDS` reaches
+# `$(( lt + … ))` inside a `set -u` shell. MEASURED on the pre-fix block, with a LIVE loop-shaped owner
+# in the lock (the exact OWNER case): `1.5` and `08` produce a bash ARITHMETIC ERROR, which ABORTS the
+# enclosing `if ! acq` compound — no refusal, no CANNOT-TELL, no reclaim log, no `rm` — so the newcomer
+# prints STARTED with NO lock of its own while the live owner's lock stays on disk, and its EXIT trap
+# then deletes THAT lock (two controllers, #1715). `abc` kills the controller outright with "unbound
+# variable", naming neither the variable nor the remedy. ⛔ `08` IS ALL-DIGITS: a digits-only guard is
+# not enough, which is why the shipped fix also strips leading zeros textually.
+# The drift pin in §9c compares the slack VALUE; nothing there drives a non-numeric value, so the
+# guard could be deleted again with CI silent — this arm is the missing leg.
+echo "── 14. the env slack seam: an invalid value falls back to the documented 5 s, never to no lock"
+for _BADSLACK in 1.5 08 abc; do
+  mkcase; CASE_DIR="$C"
+  BADP="$(spawn_loop "$C/peer")"; KIDS="$KIDS $BADP"; sleep 0.4
+  printf '%s\n' "$BADP" > "$C/o/.orch.lock"        # AFTER the process started — the real write order
+  run_drv O="$C/o" "ORCH_LOCK_START_SLACK_SECONDS=$_BADSLACK"
+  ck "14: ORCH_LOCK_START_SLACK_SECONDS='$_BADSLACK' still REFUSES a live owner (it does not skip the lock)" \
+     "$(ran && echo 1 || echo 0)"
+  ck "14: …'$_BADSLACK' still NAMES the live pid in the refusal" \
+     "$(want "$OUT" "already running (pid $BADP)" && echo 0 || echo 1)"
+  ck "14: …'$_BADSLACK' leaves the live owner's lock UNTOUCHED" \
+     "$( [ "$(lock_pid "$C/o/.orch.lock")" = "$BADP" ] && echo 0 || echo 1 )"
+  ck "14: …'$_BADSLACK' does not KILL the controller (rc=0 — the #1985 cryptic-stop class)" \
+     "$( [ "$RC" -eq 0 ] && echo 0 || echo 1 )"
+  ck "14: …'$_BADSLACK' leaks NO shell fault (no arithmetic/unbound error anywhere in the run)" \
+     "$(want "$ERR" "rror" && echo 1 || echo 0)"
+  kill -9 "$BADP" 2>/dev/null
+done
+# An ABSURD value (20 digits) is capped by the length test — reported as DEFENSIVE, not as a witnessed
+# arm: MEASURED on the guard-removed mutant, bash's arithmetic WRAPS the overflow silently, so this arm
+# stays green there and the length guard has no attributable mutant. It is kept because the value would
+# otherwise reach `[ -le ]` as an "integer expression expected" error on stderr.
+mkcase; CASE_DIR="$C"
+HUGE="$(spawn_loop "$C/peer")"; KIDS="$KIDS $HUGE"; sleep 0.4
+printf '%s\n' "$HUGE" > "$C/o/.orch.lock"
+run_drv O="$C/o" ORCH_LOCK_START_SLACK_SECONDS=99999999999999999999
+ck "14: an ABSURD (20-digit) slack is capped to the default and still refuses a live owner (defensive — no mutant witnesses the length test)" \
+   "$(ran && echo 1 || echo 0)"
+ck "14: …and leaves the live owner's lock alone" \
+   "$( [ "$(lock_pid "$C/o/.orch.lock")" = "$HUGE" ] && echo 0 || echo 1 )"
+kill -9 "$HUGE" 2>/dev/null
+# The other direction, so this cannot be satisfied by a guard that clamps EVERYTHING: a valid widened
+# slack must still reach the fence and still reclaim a peer that began after the lock.
+mkcase; CASE_DIR="$C"
+WSP="$(spawn_loop "$C/peer")"; KIDS="$KIDS $WSP"; sleep 0.2
+printf '%s\n' "$WSP" > "$C/o/.orch.lock"
+touch -t 202001010000 "$C/o/.orch.lock" 2>/dev/null || touch -d '2020-01-01 00:00:00' "$C/o/.orch.lock"
+run_drv O="$C/o" ORCH_LOCK_START_SLACK_SECONDS=30
+ck "14: a VALID slack (30) still reclaims a peer that began after the lock (the guard is not a blanket clamp)" \
+   "$(ran && [ "$RC" -eq 0 ] && echo 0 || echo 1)"
+kill -9 "$WSP" 2>/dev/null
 
 # ── recap ───────────────────────────────────────────────────────────────────────────────────────
 echo

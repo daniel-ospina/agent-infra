@@ -2112,6 +2112,33 @@ LOCKF="$O/.orch.lock"
 # `orch-loop-lock.test.sh` pins both bodies and the slack to the canonical declarations, so drift
 # reddens CI instead of becoming a wrong reclaim.
 ORCH_LOCK_START_SLACK_SECONDS="${ORCH_LOCK_START_SLACK_SECONDS:-5}"
+# ⛔ VALIDATED BEFORE IT REACHES ARITHMETIC, BECAUSE AN UNVALIDATED READ FAILS OPEN — AND HERE THE
+# OPEN DIRECTION IS THE DESTRUCTIVE ONE. This seam is the ONLY input to the reclaim decision that comes
+# from the environment, and `$(( lt + … ))` below is evaluated inside a `set -u` shell. MEASURED on the
+# extracted block (a LIVE, loop-shaped owner in the lock, the exact `OWNER` case):
+#   unset → `already running (pid N)` (refused, correct)
+#   `1.5` → "syntax error: invalid arithmetic operator" → the ENCLOSING `if ! acq` COMPOUND IS ABORTED,
+#           so the block neither refuses nor reclaims: the newcomer prints STARTED with NO lock of its
+#           own while the LIVE owner's lock stays on disk — and its EXIT trap then deletes THAT lock
+#           (two controllers on one PR queue, #1715, plus a third-party deletion of a live lock)
+#   `abc` → "unbound variable" → the controller DIES at the lock check naming neither the variable nor
+#           the remedy (the cryptic-stop class #1985 exists to end)
+#   `08`  → "value too great for base" — ⛔ ALL-DIGITS AND STILL FATAL: bash reads a leading zero as
+#           OCTAL, so a digits-only guard is NOT enough (`10#`, or the textual strip below, is)
+# The fleet's own copy of this same fence validates the same seam and documents the same reason
+# (scripts/lib/fleet-inventory.sh:_fleet_lock_owner). Fail to the documented default instead.
+case "$ORCH_LOCK_START_SLACK_SECONDS" in ''|*[!0-9]*) ORCH_LOCK_START_SLACK_SECONDS=5 ;; esac
+# ⛔ LEADING ZEROS STRIPPED TEXTUALLY, never normalised through `$(( ))`: `08` is all-digits and an
+# OCTAL ERROR in arithmetic (measured above), so the strip is what closes that half of the class.
+while [ "${#ORCH_LOCK_START_SLACK_SECONDS}" -gt 1 ] \
+      && [ "${ORCH_LOCK_START_SLACK_SECONDS#0}" != "$ORCH_LOCK_START_SLACK_SECONDS" ]; do
+  ORCH_LOCK_START_SLACK_SECONDS="${ORCH_LOCK_START_SLACK_SECONDS#0}"
+ done
+# A slack wider than the fence itself is not a setting, it is a defeat of the fence; the length test
+# comes FIRST so an absurd value is capped instead of reaching `[ -le ]` as an "integer expression
+# expected" error. Same bound as fleet-inventory.sh's copy of this fence.
+{ [ "${#ORCH_LOCK_START_SLACK_SECONDS}" -le 2 ] && [ "$ORCH_LOCK_START_SLACK_SECONDS" -le 60 ]; } \
+  || ORCH_LOCK_START_SLACK_SECONDS=5
 # The one literal this block needs for field parsing: `awk` separates the `stat` column from the argv
 # with a TAB, and the reassembled argv contains no TAB by construction (awk's fields split on whitespace).
 TAB="$(printf '\t')"
@@ -2183,6 +2210,10 @@ _orch_lock_probe() {
 # loop.sh"` — a non-controller — and a caller that merely MENTIONS the path (an editor, a grep) is not a
 # controller either (#1856 review). `orch-loop-lock.test.sh` pins these two rules to the canonical
 # declaration; only the READ arms above are deliberately different (see their header).
+# ⚠ THE CANONICAL'S ONE DOCUMENTED BLIND SPOT IS INHERITED HERE AND IS NOT FIXED BY THESE RULES:
+# `orchestrator-registry.sh` records "NOT handled on purpose: a state dir containing a space" — `set --
+# $*` word-splits, so such a path arrives as two tokens. A future reader who relaxes `safe_argv`
+# upstream must know this copy inherits the same caveat rather than silently diverging.
 _orch_argv_is_loop() { # shellcheck disable=SC2086
   set -- $*
   [ "$#" -ge 2 ] || return 1
@@ -2224,7 +2255,13 @@ if ! acq; then
   # Digits only, like `orchestrator-bringup.sh:lock_pid`: a lock carrying `abc` reached `[ abc -gt 0 ]`
   # — an ERRORED test, which is FALSE, which reclaimed it — so the read is sanitised before any test.
   OPID="$(tr -dc '0-9' 2>/dev/null < "$LOCKF")"
-  _orch_lock_verdict "${OPID:-0}" "$LOCKF"; _OV=$?
+  # ⛔ THE VERDICT AND ITS CAPTURE ARE TWO STATEMENTS, NOT ONE `;`-JOINED LINE (fresh review of #1985,
+  # nit): as one compound, ANY fault in the verdict — the arithmetic-expansion class F1 measured, or a
+  # future one — aborts the whole `if ! acq` and the lock decision is skipped ENTIRELY, which is why
+  # that fault ran a second controller rather than landing in a branch. Split, the fault stops at the
+  # verdict and `_OV` carries its status into the branches below.
+  _orch_lock_verdict "${OPID:-0}" "$LOCKF"
+  _OV=$?
   if [ "$_OV" = 0 ]; then echo "[orch-loop] already running (pid $OPID)"; exit 0; fi
   if [ "$_OV" = 2 ]; then
     _MSG="[orch-loop] CANNOT-TELL: lock $LOCKF names pid ${OPID:-none} and ${ORCH_LOCK_WHY:-the owner cannot be identified}, so a RECYCLED pid cannot be ruled out — a second controller is refused (agent-infra#1715). If no controller is running: rm -f $LOCKF (agent-infra#1985)"
