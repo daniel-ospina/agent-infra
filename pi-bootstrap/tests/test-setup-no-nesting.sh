@@ -650,24 +650,25 @@ check_farm_arrays() { # <repo-root> <label>
 # Format: `kind:name`, kind ∈ script | lib | state | foreign | other.
 LANE_PRODUCERS_CANONICAL="
 script:admin-merge.sh script:ai_pr_status.py script:ask-owner.py script:beta-progress.py
-script:cadence-nudge.sh script:cloud-cell-doctor.sh script:cloud-cell-supervisor.sh script:disk-reaper-run.sh
-script:disk-reaper.sh script:fleet-cost-report.sh script:fleet-schedule.py script:goal-state.py
-script:harness-apply-pass.sh script:heartbeat-loop.sh script:install-ci-runner-x64.sh
-script:install-controller-service.sh script:lane-actions.py script:lane-guard.py script:lane-scan-fallback.sh
-script:lane-status.py script:lane-watchdog.py script:merge-queue.py script:objective.py
-script:orchestrator-heartbeat.sh script:pi-cache-reap.sh script:pi-reap-worktrees-launchd.py
-script:pi-reap-worktrees.sh
+script:bg-rescue-wip.sh script:cadence-nudge.sh script:cloud-cell-doctor.sh script:cloud-cell-supervisor.sh
+script:conflict-rebase-timer.sh script:conflict-rebase.py script:disk-reaper-run.sh script:disk-reaper.sh
+script:fleet-cost-report.sh script:fleet-schedule.py script:goal-state.py script:harness-apply-pass.sh
+script:heartbeat-loop.sh script:install-ci-runner-x64.sh script:install-controller-service.sh
+script:lane-actions.py script:lane-guard.py script:lane-scan-fallback.sh script:lane-status.py
+script:lane-watchdog.py script:merge-queue.py script:objective.py script:orchestrator-heartbeat.sh
+script:pi-cache-reap.sh script:pi-reap-worktrees-launchd.py script:pi-reap-worktrees.sh
 script:pr-doctor-trigger.py script:pr-doctor.py script:pr-repair-loop.sh script:publish-live-workspaces.py
-script:bg-rescue-wip.sh script:reap-lane-venvs.sh script:record-review.sh script:registry-sync.sh
-script:repo-target.sh script:runner_autoscale.py script:session-postmortem.sh
-script:tortoise_graph_client.py script:turn-classify.py script:turn-end.py
-script:undelivered-answers.py script:venv-real-cost.py script:watch-truncation.sh
-script:wip-sweep.sh
+script:reap-lane-venvs.sh script:record-review.sh script:registry-sync.sh script:repo-target.sh
+script:runner_autoscale.py script:session-postmortem.sh script:tortoise_graph_client.py
+script:turn-classify.py script:turn-end.py script:undelivered-answers.py script:venv-real-cost.py
+script:watch-truncation.sh script:wip-sweep.sh
 lib:beat-pair.sh lib:bounded.sh lib:cmux_payload.py lib:diff-normalize.py lib:live-paths.sh
 lib:pid-identity.sh lib:transcript-patterns.sh
 state:lane-confirm.py state:lane-triage.py state:lane-verdict.py
-foreign:cmux_dispatch.py foreign:orch-loop.sh other:orchestrator-harness/brief-gate.sh
-other:orchestrator-harness/capacity.sh other:orchestrator-harness/cloud-cell-doctor.sh"
+foreign:cmux_dispatch.py foreign:orch-loop.sh
+other:orchestrator-harness/brief-gate.sh other:orchestrator-harness/capacity.sh
+other:orchestrator-harness/cloud-cell-doctor.sh
+"
 # RE-CUT 2026-11-07 (computed by `--cut`, never hand-typed): NINE PIN LINES added, NONE removed,
 # covering EIGHT distinct files — the doctor appears twice, as `script:cloud-cell-doctor.sh` (the flat
 # `$DEST/scripts/` location) and as `other:orchestrator-harness/cloud-cell-doctor.sh` (the $O payload).
@@ -717,6 +718,26 @@ other:orchestrator-harness/capacity.sh other:orchestrator-harness/cloud-cell-doc
 # `pi-cache-reap.sh`, `reap-lane-venvs.sh`, `registry-sync.sh` (all members of `fleet_srcs`).
 # The closure already scanned the three cell scripts as producers, so farming them adds no new
 # producers — it only DELIVERS the ones the adjacent consumer calls.
+#
+# RE-CUT 2026-11-09 (computed by `--cut`, never hand-typed): TWO entries added, NONE removed —
+# `script:conflict-rebase-timer.sh` and `script:conflict-rebase.py`. Neither is this PR's producer:
+# they arrive from `main` (agent-infra#2698 / #3760, `9ff6cf0bc`), which added BOTH to
+# `pi-bootstrap/setup.sh`'s `fleet_srcs` — and that entry is what makes each exec site below
+# resolvable from a farm, so the derivation sees them for the first time. The re-cut happened at this
+# PR's REBASE onto that main, and the ORDER of the literal above changed with it because `--cut`
+# regenerates the whole block from the DERIVED population; the set-diff against the pre-rebase pin is
+# exactly `{added: the two names, removed: none}`, and that diff is the review artifact.
+# Verified against the CODE, not the diff (#1899):
+#   · `conflict-rebase-timer.sh` — the rendered unit's `ExecStart=/bin/bash {{TIMER}} start --once`
+#     (templates/systemd/eldato-conflict-rebase.service) is fed by `install-conflict-rebase-timer.sh`'s
+#     candidate loop, whose second entry is `${HOME}/.pi/agent/scripts/conflict-rebase-timer.sh` — the
+#     F3 agent-dir form, i.e. THIS array's destination, so the scan can follow it;
+#   · `conflict-rebase.py` — its `$SELF_DIR` sibling in that wrapper:
+#     `BOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/conflict-rebase.py"`.
+# Both are DELIVERED by the same `fleet_srcs` entry that put the wrapper on the box (setup.sh states
+# the reason in its own comment: farming the wrapper without the bot installs a unit whose every tick
+# exits 127 while `list-timers` reads green), so this is a re-pin of the derived population, NOT a
+# `LANE_PRODUCERS_EXEMPT` entry — an exemption would claim a deliverable producer is withheld.
 #
 # `script:harness-apply-pass.sh` joined on 2026-10-23 (PR #2427): the harness-apply timer's unit and
 # its plist exec the pass (`install-harness-apply-timer.sh` renders both from templates/), so it is a
