@@ -118,6 +118,20 @@ loop_pid() {
     printf '%s' "$!"
 }
 
+# A LIVE process that merely MENTIONS the loop in its ARGV (#1867 review P2, round 5) — the shape the
+# first predicate could not tell from the loop itself: `tail -f …/heartbeat-loop.sh`, a pager, an
+# editor, `grep heartbeat-loop.sh`, `git log -- …/heartbeat-loop.sh`. Any of those holding a REUSED pid
+# number read as a healthy heartbeat, so `start` said "already running" and launched NOTHING (the loop
+# is launched-once, there is no timer to notice) and `check` returned `0 OK`. `cat` blocked on a fifo
+# keeps the process alive with an arbitrary argument list and is NOT an interpreter, so the stranger
+# here is a genuine one rather than a second instance of the same stand-in.
+stranger_pid() { # <path-to-mention-in-argv> → echoes the pid
+    [ -p "$T/fifo" ] || mkfifo "$T/fifo" 2>/dev/null || true
+    cat "$T/fifo" "$1" >/dev/null 2>&1 &
+    printf '%s\n' "$!" >> "$T/livepids"
+    printf '%s' "$!"
+}
+
 run() { # <root> [ENV=VAL ...] -- <args...>
     local root="$1"; shift
     local envs=()
@@ -210,6 +224,21 @@ assert_not_contains "$OUT" "already running" "§5b …and 'already running' is N
 OUT="$(env HEARTBEAT_PI_AGENT_DIR="$R/agent" bash "$LAUNCH" status 2>&1)"
 assert_contains "$OUT" "another process" "§5b status's 'alive:' column says the pid is someone else, not 'yes'"
 
+# ⛔ A STRANGER THAT NAMES THE LOOP IS STILL A STRANGER (#1867 review P2, round 5). The predicate
+# matched `$LOOP_NAME` in ANY argv token, so a `tail -f`, a pager, an editor or a `grep` that happened
+# to hold the stale pid number read as the loop — and both failures §5b exists to remove came back:
+# `start` printed "already running" and launched NOTHING, `check` returned `0 OK`, `status` said
+# `alive: yes`. Identity is the PROGRAM position (argv[0], or the script an interpreter runs), never
+# "the name appears somewhere".
+R="$(newroot s5d)"
+P="$(stranger_pid "$R/agent/scripts/heartbeat-loop.sh")"; printf '%s\n' "$P" > "$R/agent/state/heartbeat-loop.pid"
+OUT="$(run "$R" -- start --dry-run)"; RC=$?
+assert_eq "$RC" "0" "§5d a stranger whose ARGUMENT names the loop does not block the launch"
+assert_contains "$OUT" "stale pidfile" "§5d …it is named STALE, not trusted"
+assert_not_contains "$OUT" "already running" "§5d …and 'already running' is NOT claimed over it"
+OUT="$(env HEARTBEAT_PI_AGENT_DIR="$R/agent" bash "$LAUNCH" status 2>&1)"
+assert_contains "$OUT" "another process" "§5d status does not report a name-mentioning stranger as the loop either"
+
 R="$(newroot s5)"
 printf '999999\n' > "$R/agent/state/heartbeat-loop.pid"
 OUT="$(run "$R" -- start --dry-run)"; RC=$?
@@ -271,6 +300,17 @@ assert_eq "$RC" "1" "§9b a RECYCLED pid is DRIFT (1), never OK — a stranger h
 assert_contains "$OUT" "NOT running" "§9b …and the line says the loop is not running"
 assert_contains "$OUT" "recycled pid" "§9b …and names the recycled pid as the reason"
 assert_not_contains "$OUT" "OK    loop alive" "§9b …and never prints the OK line it used to"
+
+# ⛔ AND THE SAME FOR A STRANGER THAT MENTIONS THE LOOP (#1867 review P2, round 5). This is the exact
+# false PASS the reviewer reproduced: `tail -f …/heartbeat-loop.sh` holding the pidfile's number made
+# `check` answer `OK loop alive` rc=0 over a heartbeat that was not running at all.
+R="$(newroot c2d)"
+P="$(stranger_pid "$R/agent/scripts/heartbeat-loop.sh")"; printf '%s\n' "$P" > "$R/agent/state/heartbeat-loop.pid"
+printf '[{"lane":"a","degraded":false}]\n' > "$R/agent/state/lane-status.last.json"
+OUT="$(run "$R" -- check)"; RC=$?
+assert_eq "$RC" "1" "§9d a stranger that only MENTIONS the loop is DRIFT (1), never OK"
+assert_not_contains "$OUT" "OK    loop alive" "§9d …and the OK line the old predicate printed is gone"
+assert_contains "$OUT" "recycled pid" "§9d …with the identity as the stated reason"
 
 # …and the third answer: the process table could not be read, so neither verdict is available. This
 # is the arm `check` must NOT collapse into "not running" (DRIFT would tell the operator to launch a

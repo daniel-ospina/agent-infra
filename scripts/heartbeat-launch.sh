@@ -125,18 +125,82 @@ die() { printf '%s\n' "$*" >&2; exit 1; }
 #
 # Matching is by BASENAME for the same reason `fleet_pid_argv_names` is deliberately weak: a loop
 # started from a checkout before the farm landed, or from another path, is still THIS loop, and
-# refusing to recognise it would relaunch a duplicate. A stranger with a different argv is not.
+# refusing to recognise it would relaunch a duplicate.
+#
+# ⛔ AND THE MATCH IS BY **PROGRAM POSITION**, NOT "THE NAME APPEARS SOMEWHERE IN THE ARGV" (#1867
+# review P2, round 5). The first form accepted `$LOOP_NAME` in ANY argv token, so a stranger that
+# merely MENTIONS the loop — `tail -f …/heartbeat-loop.sh`, a pager, an editor, `grep
+# heartbeat-loop.sh`, `git log -- …/heartbeat-loop.sh` — read as the loop whenever the stale pidfile's
+# number had been reused by one of them. Measured: `check` returned `0 OK` over a `tail -f`, and
+# `start` printed "already running" and launched NOTHING — the two false PASSes this predicate exists
+# to remove, back one layer down. The shapes that ARE the loop, and nothing else:
+#   · `<loop>`                          — executed directly through its shebang;
+#   · `bash <loop>`, `bash -eu <loop>`  — what the launcher starts (`/bin/bash "$LOOP"`) and what the
+#                                          loop's own detach uses (`/bin/bash "$0"`);
+#   · `bash -c <payload> <name>`        — `<name>` is the process's own argv[0], i.e. the name its
+#                                          caller gave it (`exec -a` looks the same), and it is the
+#                                          shape this suite's stand-in uses.
+# Everything else is a DIFFERENT process (2). An interpreter invocation whose script operand cannot
+# be located is 3 ("cannot tell") — never 0, because guessing "it is the loop" IS the false PASS.
 LOOP_NAME="$(basename "$LOOP")"
+
+# _pid_prog_is_loop <argv words…> → 0 the loop · 2 a different program · 3 cannot tell.
+# ⛔ `ps -o command=` HAS ALREADY LOST THE QUOTING, so a `-c` payload arrives as MANY words. That is
+# why the `-c` arm reads the LAST word instead of "one word after the payload": for `bash -c
+# '<payload>' <name>` the name is the final one, and the residual — an interpreter whose payload ends
+# with our basename — is a far narrower window than "any argument anywhere" (the shape that produced
+# the measured false PASS has `cat`/`tail`/`grep` as its program, which is rejected below).
+_pid_prog_is_loop() {
+    local prog last
+    [ $# -gt 0 ] || return 3
+    prog="${1##*/}"
+    [ "$prog" = "$LOOP_NAME" ] && return 0     # executed directly: argv[0] IS the loop
+    case "$prog" in
+        bash|sh|dash|ksh|zsh) ;;
+        *) return 2 ;;                          # a different program — not ours, whatever its args
+    esac
+    shift
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -c)
+                # Only the LAST word can be the argv[0] the caller set (see above).
+                shift
+                [ $# -gt 0 ] || return 3
+                prog=""
+                for last in "$@"; do prog="$last"; done
+                [ "${prog##*/}" = "$LOOP_NAME" ] && return 0
+                return 2 ;;
+            -o|-O|+o|+O|--rcfile|--init-file)
+                [ $# -ge 2 ] || return 3
+                shift 2 ;;
+            --) shift; break ;;
+            -*) shift ;;                        # a flag that takes no separate argument
+            *)  break ;;
+        esac
+    done
+    [ $# -gt 0 ] || return 3
+    [ "${1##*/}" = "$LOOP_NAME" ] && return 0
+    return 2
+}
+
 pid_is_loop() { # <pid> → 0 the loop · 1 no such process · 2 a DIFFERENT process holds the pid · 3 cannot tell
-    local p="${1:-}" argv tok
+    local p="${1:-}" argv prc
     [ -n "$p" ] || return 1
     kill -0 "$p" 2>/dev/null || return 1
     argv="$(ps -p "$p" -o command= 2>/dev/null)" || return 3
     [ -n "$argv" ] || return 3        # a live pid with no readable argv is NOT evidence of the loop
-    for tok in $argv; do
-        case "${tok##*/}" in "$LOOP_NAME") return 0 ;; esac
-    done
-    return 2
+    # Word-split the command line WITHOUT globbing it: an argv token containing `*` or `?` must not
+    # expand into filenames and change the answer.
+    set -f
+    # shellcheck disable=SC2086
+    set -- $argv
+    set +f
+    _pid_prog_is_loop "$@"; prc=$?
+    case "$prc" in
+        0) return 0 ;;
+        3) return 3 ;;
+        *) return 2 ;;
+    esac
 }
 
 # ── THE LAUNCHD WITNESS ─────────────────────────────────────────────────────────────────────────
