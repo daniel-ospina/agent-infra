@@ -229,7 +229,11 @@ This is a residual list, not a completeness claim:
 - A command assembled at **run time** is invisible: `find … -exec`, `xargs`, a
   `while read` loop that runs its input, and `node -e`/`python -c` bodies (only a
   literal `-c`-style **command string** is re-read). At the moment this hook sees
-  the command those are data, not argv.
+  the command those are data, not argv. Same class, same reason: a heredoc body
+  fed to a **non-shell** interpreter (`python <<EOF`) and a shell started by a
+  **flag** (`sudo -s <<EOF`, `su` with no `-c`). A body fed to a stdin-program
+  shell (`bash`/`sh`/`zsh`/… with no `-c`) **is** read, and a body behind `-c` is
+  that script's data — L28a–L28h pin both directions.
 - A wrapper word that is **not** in the list above, in front of a launch word
   that is **not** brought in by a package-runner (`systemd-inhibit -w electron .`)
   behaves like a plain command: its own arguments are not scanned. That is the one
@@ -259,7 +263,7 @@ This is a residual list, not a completeness claim:
 ## Tests
 
 ```bash
-node extensions/gui-device-guard/test.mjs                    # 190 assertions, threat table L1–L26 + handler H1–H15
+node extensions/gui-device-guard/test.mjs                    # 208 assertions, threat table L1–L28 + handler H1–H15
 node extensions/gui-device-guard/test.mjs --classify 'npm exec electron .'
 ```
 
@@ -268,7 +272,10 @@ The suite loads the **real** `index.ts` through
 `tool_call` handler** — the #744/#697 lesson: a suite that imports only a helper
 stays green while `index.ts` is broken and the guard is inert in every session.
 Mutations are pinned, each attributable to the row it is about, all measured at
-ONE head: the Electron rule's `media` → `false` reds **74**; the wrapper recursion
+ONE head (**this** head — re-measured, not carried over: the counts are the output
+of running the mutant against `test.mjs`, and the assertion total is
+`208 = 150 ROWS + 5 APP_ROWS + 53 explicit \`check()\` calls`): the Electron
+rule's `media` → `false` reds **86**; the wrapper recursion
 removed reds **8**; the wrapper WORDS removed reds **2**; the structural rule that
 reads a package-runner anywhere in the segment removed reds **2** (L19h/L19i); the
 comment stripper removed reds **1** (L11d); the fail-safe word scan removed reds
@@ -293,7 +300,19 @@ from the comment predecessor set (the round-10 blocking defect) reds **2** (L11f
 on the heredoc half, L27b — L27a's count/rule/media columns were already satisfied
 by the defect, so it is the record-half twin: it reds if the fix over-cuts and
 reports nothing); deleting the escape guard that the wider set needs reds **1**
-(L27c — without it `x\)#` is cut as a comment and the launch after the `;` is lost).
+(L27c — without it `x\)#` is cut as a comment and the launch after the `;` is lost);
+removing the shell-STDIN recursion (a heredoc/here-string fed to a shell, the
+round-11 blocking defect) reds **6** (L28a–L28f — the body is deleted as data, so
+there is no block AND no ledger row); treating an unquoted `<<<word` as a heredoc
+opener reds **1** (L28h — the phantom heredoc deletes the rest of the input);
+reading the body behind `bash -c` as a program reds **1** (A46, the ALLOW twin that
+keeps the fix from over-firing on the fleet's own idiom).
+
+⛔ **The `<<<`-is-not-a-heredoc guard has no attributable red of its OWN, and is not
+claimed as covered on its own.** Dropping it leaves L28g GREEN, because the body
+the phantom heredoc swallows is still collected and reaches the recursion; what it
+catches is only the NON-shell line (L28h), which is the red the guard owns. It is
+disclosed rather than glossed, like the `clusterShortArg` term below.
 
 ⛔ **The `-` prefix guard in `clusterShortArg` has NO attributable red, and is not
 claimed as covered.** Dropping `!tok.startsWith("-")` reds **0** rows, because a

@@ -62,7 +62,12 @@
  *   - A command assembled at RUN time is not visible: `find … -exec`, `xargs`,
  *     a `while read` loop that runs its input, and `node -e`/`python -c` bodies
  *     (only a literal `-c`-style SHELL string is re-read). Those are DATA, not
- *     argv, at the moment this hook sees the command.
+ *     argv, at the moment this hook sees the command. The same class covers the
+ *     two spellings a heredoc/here-string fix cannot reach: a body fed to a
+ *     NON-shell interpreter (`python <<EOF`) and a shell started by a FLAG
+ *     (`sudo -s <<EOF`, `su` with no `-c`) — neither resolves a stdin-program
+ *     SHELL as a command word. A body fed to `bash`/`sh`/`zsh`/… IS read (round
+ *     11), and a body behind `-c` is that script's DATA (A46).
  *   - A GUI launch built by a shell variable (`APP=Electron; open -a "$APP"`) is
  *     not expanded: the token is `$APP` and the guard records it as an `open`
  *     launch with the unexpanded app name. Recording the SHAPE is still worth
@@ -447,15 +452,90 @@ export function stripComments(command: string): string {
  * delimiter): `EOF # done` really does not terminate a heredoc in `sh`, so the
  * text after it really is data, and A32/A33 pin both directions.
  *
+ * ⛔ A BODY IS DATA FOR `cat` AND THE PROGRAM FOR A SHELL (round 11, blocking).
+ * The blanking above is unconditional, which is right for `cat` / `git commit -F -
+ * -` (A3, A31) and WRONG when the command word is a SHELL: a shell with no command
+ * operand (or with `-s`) reads and EXECUTES its standard input, and the heredoc /
+ * here-string IS that input (GNU Bash Reference Manual §3.6 — Here Documents and
+ * Here Strings both redirect standard input; §Invoking Bash — `-s` reads commands
+ * from standard input). So
+ *
+ *     bash <<'EOF'
+ *     npm exec electron .
+ *     EOF
+ *
+ * was `[]`: the body was deleted before any rule saw it, and the handler returns
+ * early on `[]`, so the refusal AND the ledger row were lost together — the exact
+ * double loss cycles 3, 4 and 5 treated as blocking, and the same shape those
+ * cycles closed for `bash -c "…"` (the command string IS argv). The body here is
+ * not even a residual: `stripHeredocBodies` already locates the delimiter and its
+ * body, so what was missing is a conditional, not a grammar.
+ *
+ * The exception is `-c`: `bash -c 'script' <<EOF` RUNS the string and hands the
+ * body to it as DATA, so a body behind a command-string flag is never a program.
+ * A46 pins that direction, so the fix cannot over-fire on the fleet's own idiom.
+ *
  * Declared residual: a `<<` inside an ARITHMETIC expansion (`$(( n << shift ))`)
  * is still read as a redirect, because the delimiter there (`shift`) is a legal
  * word. Closing it needs an arithmetic grammar this file does not have, and the
  * direction it fails in is the one that must be SAID rather than implied: with no
  * later line equal to the variable name, the following text is deleted and the
  * guard fires LESS. Declared here, not claimed complete.
+ *
+ * Declared residual: the SHELL-FED body is read only for a stdin-program SHELL —
+ * `bash`/`sh`/`zsh`/… as the command word with no `-c`. A shell started by a FLAG
+ * (`sudo -s`, `su` with no `-c`) is not resolved as a command word; a heredoc fed
+ * to another interpreter (`python <<EOF`) is the same class the module header
+ * already declares for `node -e`/`python -c` — the program is not in argv.
  */
-export function stripHeredocBodies(command: string): string {
-  if (!command.includes("<<")) return command;
+export interface ShellStdin {
+  /** The command with every heredoc body blanked — what the argv rules segment. */
+  cleaned: string;
+  /** Bodies a shell will EXECUTE from stdin, in source order, for re-classification. */
+  programs: string[];
+}
+
+/** The two LITERAL `<<<` operand forms: a quoted string, or one bare word. */
+const HERESTRING = /<<<\s*(?:'([^']*)'|"((?:[^"\\]|\\.)*)"|(\S+))/g;
+
+/** Undo the backslash escapes `tokenize` would have applied inside `"…"`. */
+function unescapeDouble(s: string): string {
+  return s.replace(/\\(.)/g, "$1");
+}
+
+/**
+ * Does this SEGMENT name a shell that will EXECUTE its standard input?
+ *
+ * `-c` (in any cluster: `-c`, `-lc`, `-ec`) is the exception — the shell runs the
+ * ARGUMENT and passes stdin to that script as data, so the body is not a program.
+ * `-s` is the explicit "read commands from standard input" spelling and needs no
+ * special case: a shell with no `-c` reads stdin anyway.
+ */
+function shellExecutesStdin(toks: string[]): boolean {
+  const cwi = commandWordIndex(toks);
+  if (cwi < 0) return false;
+  if (!SHELLS.has(basename(toks[cwi]))) return false;
+  for (let i = cwi + 1; i < toks.length; i++) {
+    if (/^-[A-Za-z]*c[A-Za-z]*$/.test(toks[i]) || toks[i] === "--command") return false;
+  }
+  return true;
+}
+
+/**
+ * Does the LINE that carries this redirect feed a shell? The redirect binds to the
+ * segment it appears in — the LAST one on the line, so `cat x | bash <<EOF` asks
+ * about `bash` (yes: the body reaches bash's stdin) and `cat <<EOF | bash` ALSO
+ * asks about the last segment (yes, and correctly: bash reads the piped body).
+ */
+function lineFeedsShell(line: string, cut: number): boolean {
+  const head = cut === -1 ? line : line.slice(0, cut);
+  const segs = splitSegments(head);
+  if (segs.length === 0) return false;
+  return shellExecutesStdin(tokenize(segs[segs.length - 1]));
+}
+
+export function splitShellStdin(command: string): ShellStdin {
+  if (!command.includes("<<")) return { cleaned: command, programs: [] };
   const lines = command.split("\n");
   const mask = unquotedMask(command);
   // Offsets of each line's start, so the quote model can be consulted per char.
@@ -466,29 +546,51 @@ export function stripHeredocBodies(command: string): string {
     at += line.length + 1;
   }
   const out: string[] = [];
+  const programs: string[] = [];
   for (let li = 0; li < lines.length; li++) {
     const line = lines[li];
     out.push(line);
     const base = starts[li];
     const cut = commentCutIndex(line, base, mask);
+    const shellFed = lineFeedsShell(line, cut);
+    // ── here-STRING (`<<<`): its operand is the shell's stdin too, and `tokenize`
+    //    folds `<<<"npm exec …"` into ONE token, so nothing else ever looks at it.
+    for (const m of line.matchAll(HERESTRING)) {
+      if (mask[base + m.index] !== true) continue;          // a quoted `<<<` is data
+      if (cut !== -1 && m.index > cut) continue;             // a commented `<<<` is data
+      const operand = m[1] ?? (m[2] === undefined ? m[3] : unescapeDouble(m[2])) ?? "";
+      if (operand === "" || !shellFed) continue;
+      programs.push(operand);
+    }
     const re = /<<(-?)\s*(['"]?)([A-Za-z_][A-Za-z0-9_]*)\2/g;
     let m: RegExpExecArray | null;
     let delim: string | null = null;
+    let stripTabs = false;
     while ((m = re.exec(line)) !== null) {
+      // ⛔ A `<<` THAT IS PART OF `<<<` IS A HERE-STRING, not a heredoc: otherwise
+      //    `bash <<<EOF` opened a heredoc with delimiter `EOF` and swallowed the
+      //    rest of the input.
+      if (m.index > 0 && line[m.index - 1] === "<") continue;
       const idx = base + m.index;
       if (mask[idx] === false) continue; // quoted `<<` inside a string, not a redirect
       // ⛔ A COMMENTED `<<` IS DATA (review cycle 5, F2) — see the header. It used
       // to delete every following line, which lost the block AND the ledger row.
       if (cut !== -1 && m.index > cut) continue;
       delim = m[3];
+      stripTabs = m[1] === "-";
     }
     if (delim === null) continue;
     // Consume body lines through the terminator (which is kept: it carries no command).
+    const body: string[] = [];
     let j = li + 1;
     while (j < lines.length && lines[j].replace(/^\t+/, "") !== delim) {
       out.push("");
+      // `<<-` strips leading TABS from the body at execution time, so the program
+      // the shell runs is the tab-stripped text — not the source bytes.
+      body.push(stripTabs ? lines[j].replace(/^\t+/, "") : lines[j]);
       j++;
     }
+    if (shellFed && body.length > 0) programs.push(body.join("\n"));
     if (j < lines.length) {
       out.push("");
       li = j;
@@ -496,7 +598,12 @@ export function stripHeredocBodies(command: string): string {
       li = lines.length;
     }
   }
-  return out.join("\n");
+  return { cleaned: out.join("\n"), programs };
+}
+
+/** The blanking half of `splitShellStdin`, kept as the name its callers know. */
+export function stripHeredocBodies(command: string): string {
+  return splitShellStdin(command).cleaned;
 }
 
 /** Whitespace split that honours `'…'`, `"…"` and backslash escapes. */
@@ -1048,9 +1155,14 @@ function classifySegment(
  */
 export function classifyLaunchCommand(command: string, depth = 0): LaunchFinding[] {
   const findings: LaunchFinding[] = [];
+  // ⛔ A SHELL FED BY A HEREDOC / HERE-STRING RUNS ITS STDIN AS A PROGRAM (round 11,
+  // blocking). The scan and the blanking are ONE pass, so the body a rule must read
+  // is collected by the same predicate that decides whether it is data — a second
+  // parse of `<<` is the #966 defect.
+  const heredocs = splitShellStdin(command);
   // Comments are removed BEFORE tokens are read, so a comment can never satisfy
   // the fake-capture mitigation (review cycle 2, F2).
-  const body = stripComments(stripHeredocBodies(command));
+  const body = stripComments(heredocs.cleaned);
 
   // ⛔ A `PWDEBUG` EXPORTED IN AN EARLIER SEGMENT STILL APPLIES (review cycle 1,
   // F2: `export PWDEBUG=1; npx playwright test` used to classify as `[]` because
@@ -1171,6 +1283,15 @@ export function classifyLaunchCommand(command: string, depth = 0): LaunchFinding
   if (depth < MAX_WRAPPER_DEPTH) {
     for (const sub of extractSubstitutions(body)) {
       findings.push(...classifyLaunchCommand(sub, depth + 1));
+    }
+  }
+  // R-stdin: the body of a heredoc/here-string a SHELL will execute. Same bounded
+  // recursion the `-c` argument uses, and for the same reason: the program is in the
+  // command string the hook received, so it is argv the classifier must read —
+  // returning `[]` here loses the refusal AND the ledger row together.
+  if (depth < MAX_WRAPPER_DEPTH) {
+    for (const program of heredocs.programs) {
+      findings.push(...classifyLaunchCommand(program, depth + 1));
     }
   }
   return findings;

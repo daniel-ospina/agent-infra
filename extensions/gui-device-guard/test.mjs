@@ -339,6 +339,41 @@ const ROWS = [
     "(true)# cat <<EOF\nls", 0, null, false],
   ["A43 the ALLOW twin of L27c: an escaped `)#` with a benign tail",
     "echo a\\)#; ls -la", 0, null, false],
+  // ── L28 (round 11, BLOCKING) — a heredoc or here-string fed to a SHELL is its
+  //     PROGRAM, not its data. `stripHeredocBodies` blanked EVERY body, so
+  //
+  //         bash <<'EOF'\n npm exec electron . \nEOF
+  //
+  //     was `[]`: no refusal AND no ledger row (the handler returns early on `[]`),
+  //     the exact double loss cycles 3, 4 and 5 treated as blocking — and the same
+  //     shape they closed for `bash -c "…"`, where the command string is argv.
+  //     GNU Bash Reference Manual §3.6: Here Documents AND Here Strings redirect
+  //     standard input; a shell with no command operand (or with `-s`) reads and
+  //     executes its program from that input. The body is not a residual either: the
+  //     scanner already LOCATED it, so the fix is a conditional, not a grammar.
+  //     A44–A47 are the ALLOW twins — including A46, the `-c` gate that keeps the
+  //     fix from over-firing: `bash -c 'script' <<EOF` runs the ARGUMENT and hands
+  //     the body to that script as DATA.
+  ["L28a a heredoc fed to a shell IS its program (was [])",
+    "bash <<'EOF'\nnpm exec electron .\nEOF", 1, "electron", true],
+  ["L28b the same through `sh`", "sh <<EOF\nelectron .\nEOF", 1, "electron", true],
+  ["L28c `bash -s` (the explicit read-stdin spelling)",
+    "bash -s <<'EOF'\nnpm exec electron .\nEOF", 1, "electron", true],
+  ["L28d a here-STRING operand is stdin too (tokenize folds it into ONE token)",
+    'bash <<< "npm exec electron ."', 1, "electron", true],
+  ["L28e the same body behind a prefix", "sudo bash <<'EOF'\nelectron .\nEOF", 1, "electron", true],
+  ["L28f a heredoc body PIPED into the shell", "cat <<EOF | bash\nelectron .\nEOF", 1, "electron", true],
+  ["L28g an unquoted `<<<word` is a here-string, not a heredoc opener (it used to swallow the rest)",
+    "bash <<<EOF\nnpm exec electron .", 1, "electron", true],
+  ["L28h …and on a NON-shell line it must not delete the rest of the input either",
+    "cat <<<EOF\ntrue; npm exec electron .", 1, "electron", true],
+  ["A44 the ALLOW twin of L28a: a benign heredoc body stays data",
+    "bash <<'EOF'\nls -la\nEOF", 0, null, false],
+  ["A45 the ALLOW twin of L28d: a benign here-string", 'bash <<< "ls -la"', 0, null, false],
+  ["A46 `bash -c` runs its ARGUMENT; the heredoc body is that script's DATA",
+    "bash -c 'ls' <<EOF\nnpm exec electron .\nEOF", 0, null, false],
+  ["A47 a `cat` heredoc body naming the launch stays data (the A31 twin, re-pinned)",
+    "cat > /tmp/n.md <<'EOF'\nelectron .\nEOF", 0, null, false],
   // ── A34–A41 — ALLOW twins for L24/L25 AND for round 7's P2-5 over-fire. The
   //     fail-safe word scan is now gated on the prefix having SKIPPED A FLAG: with
   //     no flag between the prefix and the command word, nothing could have
@@ -644,15 +679,11 @@ if (handler) {
   //         break the lane over a full disk (#2249: "silence is not an
   //         acceptable answer").
   resetLedger();
-  const warned = [];
-  const wrote = mod.recordLaunch(
-    { event: "host-app-launch", ts: "t", issue: 2249, decision: "record", rule: "open",
-      app: "Safari", argv: "open -a Safari", media: false, faked: false, cwd: "/",
-      pid: 1, ppid: 0, host: "h", lane: false, tag: null },
-    join(FIX, "a-file-not-a-dir"),
-    (m) => warned.push(m),
-  );
-  // The parent path is a regular file, so mkdir must fail.
+  // ⛔ ONE probe, not two (round 11, review note). The first probe wrote to
+  // `join(FIX, "a-file-not-a-dir")` — whose PARENT is the temp dir that exists — so it
+  // SUCCEEDED, asserted nothing (its `wrote` value appeared only in a detail string),
+  // and the comment above the surviving probe described the probe that was dropped.
+  // The failure arm is the one below: the parent path is a regular FILE, so mkdir fails.
   const unwritable = join(FIX, "blocker");
   writeFileSync(unwritable, "x");
   const warned2 = [];
@@ -665,7 +696,7 @@ if (handler) {
   );
   check("H11 a failed ledger write returns false and WARNS (never silent)",
     wrote2 === false && warned2.length === 1 && /NOT recorded/.test(warned2[0]),
-    `wrote2=${wrote2} warn=${JSON.stringify(warned2).slice(0, 200)} (first probe wrote=${wrote})`);
+    `wrote2=${wrote2} warn=${JSON.stringify(warned2).slice(0, 200)}`);
 
   // ── H12 — review cycle 4, F1 measured through the REAL handler: a standalone
   //         operator token produced no block AND no ledger row, so BOTH halves of
