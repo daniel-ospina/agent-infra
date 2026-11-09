@@ -1168,6 +1168,11 @@ rerun_drive() { # <block-file> <ciq_push_ok rc> -> "rerun=<yes|no> withheld=<yes
     ciq_verdict() { printf 'deep(queued=99 running=1 runners=2 ceiling=4 state=fresh age=0s)'; }
     dispreplace() { printf 'DISPREPLACE %s %s\n' "$1" "$5" >> "$LOG"; }
     gh() { printf 'GH %s\n' "$*" >> "$GSPY"; return 0; }
+    # ⛔ THE EXTRACTED BLOCK CALLS `gh_bounded`, NOT `gh` (agent-infra#2028). A TRANSPARENT
+    # PASS-THROUGH on purpose: the bound is graded by `gh-bound.test.sh` against the real block, and
+    # repeating it in every rig would make these suites depend on `scripts/lib/bounded.sh` on the
+    # runner. The name is pinned — without it every read below answers nothing.
+    gh_bounded() { gh "$@"; }
     # shellcheck disable=SC1090
     . "$1" >> "$LOG" 2>&1
     _rr=no; grep -q 'run rerun' "$GSPY" && _rr=yes
