@@ -180,10 +180,19 @@ ck "the EXIT trap that releases the lock sits BELOW the section (the block runs 
 # ⛔ COMMENT-STRIPPED `rm` CHECK (same review, P3 — false PASS, MEASURED: grepping the RAW line let
 # `trap 'true' EXIT  # … rm -f "$LOCKF" there` satisfy it while the trap removes nothing. `^trap`
 # anchoring stops a WHOLE-LINE comment, not a trailing one).
-# ⚠️ STATED false RED, so it is not found as a bug: a trap line carrying a TRAILING SUFFIX after the
-# signals (`trap "rm -f '$tmp'" EXIT 2>/dev/null || true`, the form `scripts/record-review.sh:3753`
-# writes) yields no trailing signal run → empty → RED. Fail-closed: a false RED with the #1715
-# diagnosis, never a false GREEN. The subject's own trap is single-quoted with no suffix.
+# ⛔ AND A TRAILING SUFFIX AFTER THE SIGNALS IS PARSED, NOT DROPPED (fresh review of #3865 at
+# 000d86dcd, P2 — false GREEN, MEASURED: the parse read the signal list as an END-OF-LINE run, so
+# `trap "rm -f '$tmp'" EXIT 2>/dev/null || true` — the form `scripts/record-review.sh:3753` writes —
+# yielded an EMPTY list, and an empty list was read as "not this family" rather than as "unknown".
+# This pin REDed on it (fail-closed), but the ONLY-EXIT scan and the INT/TERM arm silently DROPPED the
+# same registration: ONE spelling, two answers, and the drop is the fail-OPEN direction. `trap_regs`
+# now parses FORWARD from the `trap` word and accepts a run that ends at EOL, a separator, or a
+# redirection, so the suffix cannot hide the list; a list it still cannot recover emits `UNKNOWN` and
+# is RED here and in the arms below. This row PASSES now that it is READ.
+# ⚠️ STATED false RED, so it is not found as a bug: the ACTION's own text cannot be told apart from
+# the signal list without full shell word-splitting, so a trap ACTION containing a signal lookalike
+# terminated by `;`/`)` (`trap 'case $x in INT) …' EXIT`) reads as that signal. Fail-closed — a false
+# RED, never a false GREEN. The subject's actions name no signal.
 # ⛔ AND THE REMOVAL IS MATCHED ON A BACKSLASH-NORMALISED COPY, so a DOUBLE-QUOTED trap (which spells it
 # `rm -f \"\$LOCKF\"`) PASSES instead of reding — that was the second half of the quoting blind spot.
 # ⛔ AND THE REMOVAL MUST BE THE TRAP'S FIRST COMMAND WORD, NOT A SUBSTRING (fresh review of #3865,
@@ -200,16 +209,42 @@ ck "the EXIT trap that releases the lock sits BELOW the section (the block runs 
 #   * NOT CASE-SENSITIVE, and `0` IS `EXIT`: MEASURED, `bash -c 'trap "echo INSTALLED" exit'` prints
 #     INSTALLED, `trap … 0` installs the same handler. A pin that reds a CORRECT trap for spelling the
 #     invariant differently is an undisclosed false RED (fresh review of #3865 at 062ff3ca, P3).
+# ⛔ FORWARD, FROM THE `trap` WORD — NOT BACKWARD FROM END-OF-LINE (fresh review of #3865 at
+# 000d86dcd, P2). A backward scan assumes the signal list is the LAST thing on the line; bash does not
+# require it. A trailing redirection / `;` / `||` — the house style at `scripts/record-review.sh:3753`
+# — broke the scan immediately and it emitted an EMPTY list, which the consumers read as "not this
+# family". So: locate the `trap` word, then take the first maximal run of signal tokens that ENDS a
+# registration (end of line, a shell separator, or a redirection). Field splitting ignores quotes, so a
+# quoted signal word cannot match; a list still unrecoverable is `UNKNOWN`, which the arms below RED.
 _TRAP_SIGS_AWK='
   BEGIN { n = split("EXIT INT TERM HUP QUIT ERR DEBUG RETURN 0", sig, " ")
           for (i = 1; i <= n; i++) { ok[sig[i]] = 1; ok[tolower(sig[i])] = 1 } }
-  { out = ""
-    for (i = NF; i >= 1; i--) {
-      t = $i; tl = tolower(t)
-      if (!(t in ok) && !(tl in ok)) break
-      if (tl == "exit" || t == "0") t = "EXIT"; else t = toupper(t)
-      out = t (out == "" ? "" : " " out)
+  { start = 0
+    for (i = 1; i <= NF; i++) if (tolower($i) == "trap") { start = i; break }
+    out = ""
+    i = start + 1
+    while (out == "" && i <= NF) {
+      w = $i
+      if (w ~ /[;&|)]$/) sub(/[;&|)]+$/, "", w)
+      wl = tolower(w)
+      if (!(w in ok) && !(wl in ok)) { i++; continue }
+      run = ""; j = i; lastsep = 0
+      while (j <= NF) {
+        u = $j; sep = 0
+        if (u ~ /[;&|)]$/) { sub(/[;&|)]+$/, "", u); sep = 1 }
+        ul = tolower(u)
+        if (!(u in ok) && !(ul in ok)) break
+        if (ul == "exit" || u == "0") u = "EXIT"; else u = toupper(u)
+        run = run (run == "" ? "" : " ") u
+        lastsep = sep
+        j++
+      }
+      nxt = (j <= NF) ? $j : ""
+      boundary = (lastsep || nxt == "" || nxt ~ /^([0-9]*[<>]|[;&|)])/) ? 1 : 0
+      if (boundary) { out = run; break }
+      i = (j <= NF) ? j + 1 : j
     }
+    if (out == "") out = "UNKNOWN"
     print out " :: " $0 }'
 # trap_regs <text> — one "<NORMALISED SIGS> :: <registration>" line per `trap` REGISTRATION in <text>.
 # ⛔ A REGISTRATION, NOT A LINE THAT STARTS WITH `t` (fresh review of #3865 at 062ff3ca, P2 — false
@@ -231,18 +266,24 @@ exit_trap_count() {
   trap_regs "$1" | grep -c '^EXIT :: ' || true
 }
 # trap_reg_total <text> — how many trap registrations sit at a COMMAND POSITION anywhere in the text:
-# line start, after `;`/`&&`/`||`/`(`/`{`, or after `then`/`do`. This exists so the per-LINE scan above
-# cannot be defeated by a second registration that simply does not start its line (fresh review of
-# #3865 at 6a8fcc33f, P2 — false PASS, MEASURED: `trap '…' EXIT; trap 'true' EXIT`,
-# `[ -d "$O/state" ] && trap 'true' EXIT` and `_run_cleanup && trap 'true' EXIT` each left the suite at
-# `PASS=141 FAIL=0` while bash REPLACED the releaser, so the lock was never removed — the ONLY-EXIT arm,
-# the one written for exactly that, was green because `trap_regs` is anchored at `^[[:space:]]*`.
-# An accounting arm compares this count against the number of lines `trap_regs` matched, so a line the
-# per-line scan cannot see — or one carrying two registrations — is a RED, not a blind spot.
+# line start, after `;`/`&&`/`||`/`(`/`{`, or after a keyword that OPENS a command (`then`, `do`, `else`,
+# `elif`, `while`, `until`) or a negation (`!`). Trailing `\`+newline continuations are JOINED first, so a
+# registration split across a line break is still one logical line. This exists so the per-LINE scan
+# above cannot be defeated by a second registration that simply does not start its line (fresh review of
+# #3865, P2 — false PASS, MEASURED: `trap '…' EXIT; trap 'true' EXIT`, `[ -d "$O/state" ] && trap 'true'
+# EXIT` and `_run_cleanup && trap 'true' EXIT` each left the suite green while bash REPLACED the releaser,
+# so the lock was never removed — and a FIRST version of this predicate still missed `else trap …`, `! trap
+# …` and a backslash-continued registration, which the next review measured at `PASS=142 FAIL=0`).
+# An accounting arm compares this count against the number of lines the per-line scan matched, so a line
+# it cannot see — or one carrying two registrations — is a RED, not a blind spot.
+# ⏳ STATED RESIDUAL (not silently missed): a registration whose command word is BUILT (`eval "trap …"`, a
+# `trap` token held in a variable) defeats both scans. Asserting the handler bash actually INSTALLED
+# (`trap -p EXIT`) is the stricter shape and the follow-up if one ever appears in the subject.
 trap_reg_total() {
   printf '%s\n' "$1" \
     | sed -e 's/[[:space:]]*#.*$//' \
-    | grep -oE '(^|[;&|({]|then|do)[[:space:]]*((builtin|command)[[:space:]]+)?trap[[:space:]]' \
+    | awk '{ while ($0 ~ /\\$/ && (getline nxt) > 0) { sub(/\\$/, "", $0); $0 = $0 " " nxt } ; print }' \
+    | grep -oE '(^|[;&|({]|then|do|else|elif|while|until|!)[[:space:]]*((builtin|command)[[:space:]]+)?trap[[:space:]]' \
     | grep -c . || true
 }
 trap_pin() {
@@ -256,7 +297,18 @@ trap_pin() {
   [ "${1:-}" = "rm" ] || return 1
   [ "$(grep -c . <<<"$_regs")" = 1 ] && [ "$_sigs" = "EXIT" ] && grep -qF 'rm -f "$LOCKF"' <<<"$_flat"
 }
-LOCK_TRAPS="$(grep -E '^[[:space:]]*((builtin|command)[[:space:]]+)?trap .*LOCKF' "$SUBJECT" 2>/dev/null)"
+# ⛔ EVERY SCAN RUNS ON CONTINUATION-JOINED TEXT (fresh review of #3865, P2 — false PASS, MEASURED:
+# `trap 'true' \` + newline + `  EXIT` installs a SECOND EXIT trap that REPLACES the releaser, and the
+# per-LINE scan saw only a `trap 'true' \` fragment whose signals do not parse, so neither the ONLY-EXIT
+# arm nor the accounting arm red while the lock is never removed. Joining trailing `\`+newline first
+# makes the registration one logical line that BOTH scans can read, which is what makes their agreement
+# mean the same thing.)
+trap_join() {
+  printf '%s\n' "$1" \
+    | awk '{ while ($0 ~ /\\$/ && (getline nxt) > 0) { sub(/\\$/, "", $0); $0 = $0 " " nxt } ; print }'
+}
+TRAP_TEXT="$(trap_join "$(cat "$SUBJECT")")"
+LOCK_TRAPS="$(trap_join "$(grep -E '^[[:space:]]*((builtin|command)[[:space:]]+)?trap .*LOCKF' "$SUBJECT" 2>/dev/null)")"
 trap_pin "$LOCK_TRAPS"
 ck "the lock is released by ONE trap and its signal list is EXACTLY 'EXIT' (a returning INT/TERM handler deleted it while the loop lived — #1715)" $?
 # ⛔ AND IT MUST BE THE ONLY `EXIT` TRAP, BECAUSE A LATER ONE REPLACES IT (fresh review of #3865 at
@@ -271,8 +323,8 @@ ck "the lock is released by ONE trap and its signal list is EXACTLY 'EXIT' (a re
 # bash REPLACED the releaser — `bash -c 'trap "echo FIRST" EXIT; trap "echo SECOND" 0'` prints only
 # SECOND — so the lock was never removed and this arm, the one written to catch exactly that, was green.
 # `exit_trap_count` is driven over all four spellings in §9d, so the near-misses are witnesses, not prose.)
-ALL_TRAPS="$(trap_regs "$(cat "$SUBJECT")")"
-EXIT_TRAPS="$(exit_trap_count "$(cat "$SUBJECT")")"
+ALL_TRAPS="$(trap_regs "$TRAP_TEXT")"
+EXIT_TRAPS="$(exit_trap_count "$TRAP_TEXT")"
 [ "$EXIT_TRAPS" = 1 ]
 ck "the releasing trap is the ONLY 'EXIT' trap (a second EXIT-family registration REPLACES the first, so the lock is never removed)" $?
 # ⛔ AND EVERY REGISTRATION MUST BE ONE THE PER-LINE SCAN CAN SEE (fresh review of #3865 at 6a8fcc33f,
@@ -281,8 +333,17 @@ ck "the releasing trap is the ONLY 'EXIT' trap (a second EXIT-family registratio
 # EXIT registration while bash kept only the LAST handler — the lock was never removed and this pair of
 # arms stayed green. The count below sees a registration ANYWHERE a command can start, so the two can no
 # longer disagree: any registration the line scan missed, and any line carrying two, RED here.)
-[ "$(trap_reg_total "$(cat "$SUBJECT")")" = "$(grep -c . <<<"$ALL_TRAPS")" ]
+[ "$(trap_reg_total "$TRAP_TEXT")" = "$(grep -c . <<<"$ALL_TRAPS")" ]
 ck "every trap registration sits at a command position the per-line scan can see (a registration it misses, or a line carrying two, RED)" $?
+# ⛔ AND AN UNREADABLE SIGNAL LIST IS RED, NOT ABSENT (fresh review of #3865 at 000d86dcd, P2 — false
+# GREEN, MEASURED: the parse ended at end-of-line, so `trap 'true' EXIT 2>/dev/null` — a registration
+# bash INSTALLS, REPLACING the releaser — parsed to an EMPTY list, the ONLY-EXIT arm still counted 1 and
+# the INT/TERM arm still passed, while `trap_pin` REDed on the identical spelling: one spelling, two
+# answers, and this side is the fail-OPEN one. `trap_regs` emits `UNKNOWN` when it cannot recover a
+# list, so the answer is now READ-ME rather than absent, and the registration is RED rather than
+# silently "not this family".)
+[ "$(trap_regs "$(cat "$SUBJECT")" | grep -c '^UNKNOWN :: ' || true)" = 0 ]
+ck "every trap registration's SIGNAL LIST is readable (an unparseable one is UNKNOWN — never silently 'not this family')" $?
 # ⛔ AND A RETURNING `INT`/`TERM` HANDLER IS THE #1715 CLASS, AND THE `LOCKF` FILTER CANNOT SEE IT (fresh
 # review of #3865 at 062ff3ca, P3 — MEASURED: `release_lock() { rm -f "$LOCKF"; }; trap 'release_lock'
 # INT` is dropped by every `grep … LOCKF` above, so trap_pin answered GREEN while a RETURNING INT handler
@@ -290,7 +351,8 @@ ck "every trap registration sits at a command position the per-line scan can see
 # handlers TERMINATE (`trap 'exit 143' TERM`, `trap 'exit 130' INT`, orch-loop.sh:2592-2593), so assert it
 # over every registration whose signal list carries INT or TERM, wherever the command word lives.
 _BAD_TERM="$(printf '%s\n' "$ALL_TRAPS" | awk -F' :: ' '
-  { n = split($1, a, " ")
+  { if ($1 == "UNKNOWN") { print; next }
+    n = split($1, a, " ")
     for (i = 1; i <= n; i++) if (a[i] == "INT" || a[i] == "TERM") { if ($2 !~ /exit/) print; next } }')"
 [ -z "$_BAD_TERM" ]
 ck "every INT/TERM trap handler TERMINATES (a RETURNING handler releases the lock while the loop lives — and one reached through a function is invisible to the LOCKF filter)" $?
@@ -340,6 +402,10 @@ _traprow 0 "  trap 'rm -f \"\$LOCKF\"' EXIT" \
   "an INDENTED releaser PASSES (a registration inside an if/case is indented by construction)"
 _traprow 0 "builtin trap 'rm -f \"\$LOCKF\"' EXIT" \
   "a builtin-prefixed releaser PASSES (the same builtin, and the ONLY-EXIT scan must see it)"
+_traprow 0 "trap 'rm -f \"\$LOCKF\"' EXIT 2>/dev/null || true" \
+  "a releaser with a TRAILING REDIRECTION and '|| true' PASSES (the house style — and the SAME suffix was silently DROPPED by the ONLY-EXIT scan, one spelling with two answers)"
+_traprow 0 "trap 'rm -f \"\$LOCKF\"' EXIT 2>/dev/null || exit 1" \
+  "a releaser whose suffix carries another EXIT-ish word still reads ONE registration (the suffix after the redirection is a SEPARATE command, not a second signal)"
 # (the quoting-agnostic extraction and its stated limits live in `trap_pin` above — this arm and §9d
 # both drive it, so the pin has exactly one implementation and it is itself under test.)
 # ⛔ AND THE ONLY-EXIT ARM IS DRIVEN OVER ITS OWN NEAR-MISSES (fresh review of #3865 at 062ff3ca, P2):
@@ -382,12 +448,28 @@ _exitrow 1 "$_REL
 trap 'exit 143' TERM
 trap 'exit 130' INT" \
   "the subject's OWN three registrations are ONE EXIT and none of the others (the shipped shape)"
+# ⛔ AND A TRAILING SUFFIX CANNOT HIDE A SECOND REGISTRATION (fresh review of #3865 at 000d86dcd, P2 —
+# false PASS, MEASURED: the parse read the signal list as an END-OF-LINE run, so each of the three
+# spellings below left `exit_trap_count` at 1 and this arm GREEN while bash REPLACED the releaser —
+# `bash -c 'trap "echo FIRST" EXIT; trap "echo SECOND" EXIT 2>/dev/null; echo body'` prints only
+# SECOND — so the lock was never removed. `2>/dev/null`/`|| true` is the spelling
+# `scripts/record-review.sh:3753` writes, and `trap '…' EXIT;` is what a hand edit produces.)
+_exitrow 2 "$_REL
+trap 'true' EXIT 2>/dev/null" \
+  "a second registration with a TRAILING REDIRECTION still REPLACES the releaser — was a false PASS"
+_exitrow 2 "$_REL
+trap 'true' EXIT;" \
+  "a second registration ending in ';' still REPLACES the releaser — was a false PASS"
+_exitrow 2 "$_REL
+trap 'true' EXIT || true" \
+  "a second registration followed by '|| true' still REPLACES the releaser — was a false PASS"
 # ⛔ AND THE INT/TERM TERMINATION ARM IS DRIVEN THE SAME WAY, over the indirection that defeated the
 # LOCKF filter: a RETURNING INT handler that releases the lock through a FUNCTION removes the lock and
 # leaves the loop alive, which is #1715 spelled in code the `grep … LOCKF` cannot see.
 _term_bad() { # <text> -> non-empty when a registration with INT/TERM does not terminate
   printf '%s\n' "$(trap_regs "$1")" | awk -F' :: ' '
-    { n = split($1, a, " ")
+    { if ($1 == "UNKNOWN") { print; next }
+      n = split($1, a, " ")
       for (i = 1; i <= n; i++) if (a[i] == "INT" || a[i] == "TERM") { if ($2 !~ /exit/) print; next } }'
 }
 _TERMROW_OK="$_REL
@@ -401,6 +483,20 @@ trap 'exit 143' TERM"
 ck "9d: the subject's own INT/TERM handlers all TERMINATE (the arm's positive control)" $?
 [ -n "$(_term_bad "$_TERMROW_BAD")" ]
 ck "9d: a RETURNING INT handler that releases the lock through a FUNCTION is CAUGHT (it is invisible to the LOCKF filter)" $?
+[ -n "$(_term_bad "$_REL
+trap 'release_lock' INT 2>/dev/null")" ]
+ck "9d: a RETURNING INT handler with a TRAILING REDIRECTION is CAUGHT (the parse ended at the suffix, so this arm stayed green on a lock-deleting handler)" $?
+# ⛔ AND AN UNRECOVERABLE SIGNAL LIST IS `UNKNOWN`, WHICH EVERY CONSUMER READS AS RED (fresh review of
+# #3865 at 000d86dcd, P2). An empty list used to mean "not this family" to both consumers; it now means
+# "unreadable", and unreadable is a RED in the ONLY-EXIT arm, the UNKNOWN arm and this one.
+_unkrow() { # <text> <label>
+  [ "$(trap_regs "$1" | grep -c '^UNKNOWN :: ' || true)" = 1 ]
+  ck "9d: $2" $?
+}
+_unkrow "trap 'true' SIGEXIT" \
+  "an UNPARSEABLE signal list reads UNKNOWN (never silently 'not this family')"
+_unkrow "trap 'true' 2>/dev/null" \
+  "a registration naming NO signal at all reads UNKNOWN"
 okc "acq() still takes the lock with set -o noclobber (unchanged primitive)" \
   grep -qF 'acq() { ( set -o noclobber; echo $$ > "$LOCKF" ) 2>/dev/null; }' "$SUBJECT"
 okc_not "the OLD liveness-only reclaim is GONE (it must not survive beside the new verdict)" \
