@@ -143,14 +143,70 @@ is_limit() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; 0) return 0 ;; 0*) return
 MAX_ROUNDS="${LANE_MERGE_MAX_ROUNDS:-3}"
 [ -n "$MAX_ROUNDS_OVERRIDE" ] && MAX_ROUNDS="$MAX_ROUNDS_OVERRIDE"
 is_limit "$MAX_ROUNDS" || { say_err "lane-merge: LANE_MERGE_MAX_ROUNDS='$MAX_ROUNDS' is not a bounded integer — using 3"; MAX_ROUNDS=3; }
-# ⛔ SIZED TO THE CI IT WAITS FOR, NOT TO A ROUND NUMBER (measured on this change's own PR: a
-# 22-check commit on a loaded box reached 7/22 completed at 15 min and was still 15-in-flight at the
-# old 900s bound, so EVERY lane would have spent a chunk on "still in flight — re-run"). 1500s covers
-# a ~25 min CI. It is a MERGE-PHASE cost from the lane's own wall clock (`LANE_TIMEOUT`, 3300s), so the
-# supervision bound below is derived from what is left AFTER it AND after the lane's implementation
-# time — the two must not add up to the whole clock. A re-run is still permitted and still cheap (one
-# PR read) — the bound is a runaway guard, never a reason to call a head green.
-WAIT_S="${LANE_MERGE_WAIT:-1500}";     is_limit "$WAIT_S" || WAIT_S=1500     # per-round check wait
+# ⛔ SIZED TO THE CI IT WAITS FOR, NOT TO A ROUND NUMBER — AND RE-SIZED FROM A MEASUREMENT OF THE
+# LIST THAT EXISTS TODAY (agent-infra#3584). The principle in that heading was already right; the
+# NUMBER was a stale measurement of a smaller list, and it had gone BELOW THE FASTEST real pass.
+#
+# MEASURED 2026-11-09 on daniel-ospina/agent-infra, PR-lane `ci.yml`, over the runs endpoint's 1000-run
+# cap (pages 1-10 of completed runs; the oldest sampled run started 2026-11-07T04:43Z), non-cancelled and
+# non-`main`, `run_started_at` -> `updated_at` so the figure includes the runner queue inside the run —
+# the part a lane waits through. ⛔ THE COUNTS ARE STAMPED, NOT PORTABLE: this is a query over a SLIDING
+# 1000-run window, so `n`, the per-day counts and the percentiles' low digits move as runs age out (re-run
+# hours later: n=211, p50 3836, 199 of 211 = 94.31 %). The STABLE figures are the ratio, `min`, p90, p95 and
+# `max` — those are what any argument here may rest on:
+#     as measured 2026-11-09:  n=212 · min 1623 s · p50 3837 s · p90 4960 s · p95 5612 s · max 7968 s
+#     (132.8 min)
+# ⛔ THE DAYS ARE NOT INTERCHANGEABLE, which is why the population is quoted WHOLE rather than as the
+# newest day: the slowest day's p95/max are 6836 s / 7968 s, the fastest day's are 4565 s / 4725 s.
+# ⛔ AND PER-DAY COUNTS ARE DELIBERATELY NOT QUOTED (review cycle 3, P2 — verified). A per-day count moves
+# with the bucketing key (`created_at` vs `run_started_at` differs by one across a midnight boundary: the
+# same population buckets 92/67/53 one way and 91/67/54 the other), and a count that depends on which
+# clock you group by is not a measurement. The per-day p95/max above DO reproduce under either key, so
+# they are what this block states.
+# ⛔ THE WINDOW IS PART OF THE MEASUREMENT, and the first draft of this block got that wrong (round-2
+# review, P1 — verified). It quoted the newest ~1 day only (n=83: p95 4521, max 4960) and claimed the new
+# bound covered 100 % of the population. It does not: the 11-07 day is materially slower, so a one-day
+# window measured the FASTEST day and turned a real tail into a false "100 %". State the window, always.
+#
+# ⛔ THE OLD 1500 s (25 min) WAS NOT MERELY TIGHT — IT WAS BELOW THE FLOOR OF THE POPULATION, and that is
+# window-independent: 1500 s is under the FASTEST completing run measured (1623 s) and under the median by
+# a factor of 2.5. ⛔ BUT STATE THE CLAIM NO STRONGER THAN THE MEASUREMENT SUPPORTS (review cycle 4, P2 —
+# verified): the 1623 s figure is `run_started_at -> updated_at` for the RUN, while this loop's `deadline`
+# starts at PROCESS START, i.e. at merge-phase entry — which is AFTER the push that opened the PR. So the
+# bound a lane must survive is `run duration - entry latency`, and with only 123 s of margin a lane entering
+# its merge phase >=123 s after the run began COULD have seen `INFLIGHT == 0` inside 1500 s. It is the
+# empirical record, not arithmetic, that settles it: the deployed state files hold 2 x
+# `WAITING_CHECKS checks still in flight after 1500s` (#10302, #2973) and 0 x MERGED. A bound that only
+# fires when a lane happens to enter late is still a bound that costs every other lane its merge, and
+# `INFLIGHT == 0` -> `launch_chain` fired zero times in that record.
+# The 1500 s figure came from a 22-check commit on a loaded box, taken when `bash-suites` was a single
+# ~73 min job; `scripts/run-bash-shards.sh --list` derives 193 shards today, and the matrix changed what a
+# lane waits through.
+#
+# 5400 s (90 min): a round number a reader can hold, and the most this clock can afford (below).
+# 
+# ⛔ AND ITS COVERAGE IS STATED, NOT ROUNDED UP TO 100 %: 200 of 212 (94.3 %) of the measured population
+# completes inside 5400 s. TWELVE runs do not, and two of those exceeded the lane's whole 7200 s clock.
+# That is a real residual and it is NOT closable by this constant — see the arithmetic ceiling below. It is
+# a CEILING and not a delay: the loop breaks the moment `INFLIGHT` reaches 0, so a fast lane pays nothing.
+#
+# It is a MERGE-PHASE cost from the lane's own wall clock, so the supervision bound below is derived
+# from what is left AFTER it AND after the lane's implementation time — the two must not add up to the
+# whole clock. A re-run is still permitted and still cheap (one PR read) — the bound is a runaway guard,
+# never a reason to call a head green.
+#
+# HONEST RESIDUAL, stated because it is not fixed here, and ARITHMETIC rather than taste: keeping the
+# shipped 7 supervision chunks costs `IMPL_RESERVE_S + 7*POLL_S = 900 + 840 = 1740 s`, so the largest wait
+# this clock can carry is `7200 - 1740 = 5460 s`. The measured p95 (5612 s) and max (7968 s) are ABOVE
+# that ceiling, so NO value of `WAIT_S` that fits this lane's clock can cover the tail — the two runs that
+# exceeded 7200 s could not have been waited out by ANY setting of this constant. Raising the ceiling is
+# the remedy, and it is not this constant's to make: raise `LANE_BACKSTOP_S` (which raises the derived
+# supervision budget with it, see below). The tail case hands off as `WAITING_CHECKS` (exit 11) and the
+# next invocation resumes the SAME counter — the designed path, which depends on something RE-INVOKING the
+# lane (the controller's merge step). `ci.yml`'s `bash-suites` job bound is `timeout-minutes: 100`
+# (6000 s) with no internal budget variable, so a pass can legitimately outlive this wait (5400 s) and
+# still be inside the job's own bound.
+WAIT_S="${LANE_MERGE_WAIT:-5400}";     is_limit "$WAIT_S" || WAIT_S=5400     # per-round check wait
 POLL_S="${LANE_MERGE_POLL:-120}";      is_limit "$POLL_S" || POLL_S=120      # one --watch chunk
 # ⛔ --watch IS BOUNDED TOO. A pid probe cannot distinguish "the chain is still working" from "the pid
 # was reused", so an unbounded --watch loop would be a lane that never ends — the same defect the
@@ -169,9 +225,12 @@ POLL_S="${LANE_MERGE_POLL:-120}";      is_limit "$POLL_S" || POLL_S=120      # o
 # IMPL_RESERVE_S is the floor a lane needs for implement → commit → push → open PR before its merge
 # phase can start; the merge phase must never be sized out of it. MAX_WATCH is DERIVED from what that
 # leaves (never a literal), so raising LANE_TIMEOUT buys supervision and lowering it cannot silently
-# eat the implementation time again. Shipped defaults:
-#     3300 - 1500 (check wait) - 900 (implementation reserve) = 900s / 120s = 7 chunks (840s)
-# i.e. the merge phase is bounded at 3240s of the 3300s clock, and a lane that implements within its
+# eat the implementation time again. Shipped defaults, RE-DERIVED when the check wait moved to its
+# measured 5400s (#3584) — the old row read `3300 - 1500 - 900 = 900s / 120s = 7 chunks`, and an
+# arithmetic row that is not recomputed with its operand is the same stale-measurement defect one layer
+# down:
+#     7200 - 5400 (check wait) - 900 (implementation reserve) = 900s / 120s = 7 chunks (840s)
+# i.e. the merge phase is bounded at 6240s of the 7200s clock, and a lane that implements within its
 # reserve reaches BOTH bounds. A cycle that needs longer is not a lane failure: it hands off as
 # WAITING_* (exit 11) and the next invocation resumes the SAME counter.
 # ⛔ AND THE CLOCK ITSELF IS THE LANE'S, READ FROM THE SAME SEAM (#2888 review, P2/P3 — verified). It
@@ -179,7 +238,12 @@ POLL_S="${LANE_MERGE_POLL:-120}";      is_limit "$POLL_S" || POLL_S=120      # o
 # — and `lane.sh` does not export `LANE_TIMEOUT`, so the merge phase permanently spent ~45% of the clock
 # the lane now owns. That is the opposite of what the paragraph above claims ("DERIVED from the lane's own
 # wall clock"). `LANE_BACKSTOP_S` IS exported by spawn-gate.sh, so this child reads the lane's real bound:
-#     7200 - 1500 (check wait) - 900 (implementation reserve) = 4800s / 120s = 40 chunks
+#     7200 - 5400 (check wait) - 900 (implementation reserve) = 900s / 120s = 7 chunks
+# ⛔ AND THAT IS THE COST OF SIZING THE WAIT HONESTLY, SAID OUT LOUD: at the measured 5400s check wait the
+# supervision allowance is 7 chunks, not 40 — the same 7 the 3300s clock used to afford at a 1500s wait.
+# The trade is deliberate. 40 chunks of supervision over a check wait that can never be satisfied is
+# supervision of a phase that never starts; 7 chunks over a wait that reaches the merge phase is
+# supervision that actually runs. Raising LANE_BACKSTOP_S buys more chunks without touching this bound.
 IMPL_RESERVE_S="${LANE_MERGE_IMPL_RESERVE:-900}"; is_limit "$IMPL_RESERVE_S" || IMPL_RESERVE_S=900
 LANE_WALL_S="${LANE_TIMEOUT:-${LANE_BACKSTOP_S:-7200}}"; is_limit "$LANE_WALL_S" || LANE_WALL_S=7200
 # The divisor is floored at the shipped chunk length: LANE_MERGE_POLL=0 is a legitimate value (a chunk
@@ -188,6 +252,15 @@ LANE_WALL_S="${LANE_TIMEOUT:-${LANE_BACKSTOP_S:-7200}}"; is_limit "$LANE_WALL_S"
 _fit_poll="$POLL_S"; [ "$_fit_poll" -ge 1 ] || _fit_poll=120
 MAX_WATCH_FIT=$(( (LANE_WALL_S - WAIT_S - IMPL_RESERVE_S) / _fit_poll ))
 [ "$MAX_WATCH_FIT" -ge 1 ] || MAX_WATCH_FIT=1          # a tiny LANE_TIMEOUT still supervises once
+# ⛔ THE CLAMP ABOVE IS A FLOOR, AND A FLOOR CAN MASK AN OVERSPENT CLOCK (review cycle 3, P3 — verified, not
+# fixed here so the diff stays to its own defect). If an ENV override makes `LANE_WALL_S - WAIT_S -
+# IMPL_RESERVE_S` zero or negative — `LANE_MERGE_WAIT=6300` gives `(7200-6300-900)/120 = 0` — the clamp
+# hands back 1 chunk and the merge phase becomes `6300 + 120 + 900 = 7320 > 7200`: the lane's own wall clock
+# kills it mid-supervision, which is the #2888 shape the three-term invariant exists to prevent. The SHIPPED
+# default is safe (7140 of 7200, 60 s of slack) and the suite's arithmetic arm pins it, which is why this is
+# a regression-guard question and not a live defect. ⛔ SO: anyone who raises the wait, or lowers
+# LANE_BACKSTOP_S, must re-check this arithmetic — the arm catches a DEFAULT change, and only the override
+# warning below catches an env one. The honest fix, when someone owns it, is a `say_err` in this branch too.
 MAX_WATCH="$MAX_WATCH_FIT"
 if [ -n "${LANE_MERGE_MAX_WATCH:-}" ] && is_limit "${LANE_MERGE_MAX_WATCH:-}"; then
   # An explicit override is an operator's escape hatch and is HONOURED rather than silently rewritten —
