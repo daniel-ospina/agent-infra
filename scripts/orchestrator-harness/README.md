@@ -2041,8 +2041,9 @@ off macOS (it renders a launchd plist) — the portability that matters is `orch
    reaches that same `CANNOT-TELL` refusal instead of aborting the lock decision and letting a second
    controller start with no lock while the owner's lock is still on disk. ONE ARGV CANNOT BE PARSED
    AT ALL and is refused rather than reclaimed: a shell OPTION between the shell and the script
-   (`bash -x …/orch-loop.sh`, and in EITHER polarity — `bash +o errexit …/orch-loop.sh`, the form
-   `check-deployed-drift.sh` itself uses) is not the two-token shape and is not provably a
+   (`bash -x …/orch-loop.sh`, and in EITHER polarity — `bash +o errexit …/orch-loop.sh`, a form this
+   repo's own classifier already asserts IS an invocation in `check-deployed-drift.test.sh` §10a-3e) is
+   not the two-token shape and is not provably a
    non-controller either, so answering it `provably NOT the owner` reclaimed a lock whose owner was
    still running (#1715). `bash -c "…; /abs/orch-loop.sh"` is NOT that case and IS reclaimed — #1856
    decided a `-c` wrapper's argv is not a controller — with `bash -x -c "…"` treated the same way,

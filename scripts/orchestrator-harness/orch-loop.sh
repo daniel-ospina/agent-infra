@@ -2450,11 +2450,12 @@ _orch_argv_is_loop() { # shellcheck disable=SC2086
 # changes nothing (`bash -x -c "…; /abs/orch-loop.sh"` reclaims exactly as `bash -c …` does). Only the
 # option forms that leave the script as an ARGUMENT (`-x`, `-e`, `--posix`, `+o errexit`, …) are
 # deferred to a human as ambiguous.
-# ⛔ BOTH POLARITIES COUNT AS AN OPTION. `bash` accepts the `+` form of every `set`-style option, and
-# this repo already uses `bash +o errexit <…>/orch-loop.sh` for a REAL invocation
-# (`check-deployed-drift.sh`). A `-`-only option test minted that form into rc 1 = RECLAIM over a LIVE
-# owner — a fail-OPEN regression versus `main`, which refused any live pid (fresh review at 8eb852d27,
-# P2; MEASURED end-to-end: STARTED, `[lock] reclaiming …`, owner still alive).
+# ⛔ BOTH POLARITIES COUNT AS AN OPTION. `bash` accepts the `+` form of every `set`-style option, and this
+# repo's OWN classifier decision says such an argv IS an invocation: `check-deployed-drift.test.sh`
+# §10a-3e (the `for _v in 'bash -o pipefail' … 'bash +o errexit' …` fixture) asserts that every one of
+# those forms over `<abs>/orch-loop.sh` is an INVOCATION. A `-`-only option test minted that form into
+# rc 1 = RECLAIM over a LIVE owner — a fail-OPEN regression versus `main`, which refused any live pid
+# (fresh review at 8eb852d27, P2; MEASURED end-to-end: STARTED, `[lock] reclaiming …`, owner still alive).
 # ⚠️ ONE NAMED OVER-REFUSAL, stated rather than discovered later: the token scan is ANY-token (so that
 # no plausible option form can miss the script), which means a non-controller whose argv merely NAMES the
 # script behind an option — `bash -x grep /abs/orch-loop.sh` — is refused as ambiguous instead of

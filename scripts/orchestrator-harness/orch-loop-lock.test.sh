@@ -145,7 +145,25 @@ ck "the EXIT trap that releases the lock sits BELOW the section (the block runs 
 # removes $LOCKF. Adding work to an EXIT trap stays legal; adding INT/TERM to the signal list does not.
 # MEASURED: `EXIT INT TERM` → TRAP_SIGS="EXIT INT TERM" ≠ "EXIT" → RED.
 LOCK_TRAPS="$(grep -E '^trap .*LOCKF' "$SUBJECT" 2>/dev/null)"
-TRAP_SIGS="$(printf '%s\n' "$LOCK_TRAPS" | sed -e "s/^trap '[^']*' //")"
+# ⛔ THE SIGNAL LIST IS WHAT ENDS THE LINE, PARSED WITHOUT ASSUMING A QUOTING STYLE (fresh review of this
+# repair, P3 — MEASURED: `sed -e "s/^trap '[^']*' //"` is blind to a DOUBLE-QUOTED trap, e.g.
+# `trap "rm -f \"$0\"" EXIT` — the style `scripts/conflict-rebase-timer.sh:254` itself writes — because
+# the pattern requires a leading single quote; TRAP_SIGS then became the WHOLE LINE and the arm went RED
+# while the invariant held. That direction is fail-closed (no spelling can WIDEN the list past `EXIT`),
+# but the red carried the WRONG DIAGNOSIS: it points the next maintainer at #1715 when nothing is wrong
+# there.)
+# Shell syntax puts the signals LAST, so they are the trailing run of signal words whatever quoting the
+# command uses. A line that yields no such run yields an empty TRAP_SIGS → ≠ `EXIT` → RED, which keeps
+# the fail-closed default.
+# ⚠️ STATED LIMIT, so it is not discovered as a bug: a trap line carrying a TRAILING SUFFIX after the
+# signals (`trap "rm -f '$tmp'" EXIT 2>/dev/null || true`, the form `scripts/record-review.sh:3753`
+# writes) yields NO trailing signal run → empty → RED. That is fail-closed and correct-ish (the signals
+# are no longer the last thing on the line, so this pin no longer reads them), and the subject's own
+# trap carries no suffix — but it is a RED with the #1715 diagnosis, so the limit is named here rather
+# than left to be found. The `rm -f "$LOCKF"` check below is likewise spelling-dependent: a
+# double-quoted trap writes `rm -f \"\$LOCKF\"` and would RED it. Both are false-RED-only.
+TRAP_SIGS="$(printf '%s' "$LOCK_TRAPS" | sed -e 's/[[:space:]]*#.*$//' \
+  | grep -oE '(EXIT|INT|TERM|HUP|QUIT|ERR|DEBUG|RETURN|0)([[:space:]]+(EXIT|INT|TERM|HUP|QUIT|ERR|DEBUG|RETURN|0))*$' 2>/dev/null)"
 [ "$(grep -c . <<<"$LOCK_TRAPS")" = 1 ] \
   && [ "$TRAP_SIGS" = "EXIT" ] \
   && grep -qF 'rm -f "$LOCKF"' <<<"$LOCK_TRAPS"
@@ -817,8 +835,10 @@ ck "16b: the same OPTION form over a NON-loop script is still RECLAIMED (§16 is
 kill -9 "$XP" 2>/dev/null
 
 # ── 16c) THE `+` POLARITY IS AN OPTION TOO (fresh review at 8eb852d27, P2) ──────────────────────
-# `bash` accepts the `+` form of every `set`-style option, and this repo already uses
-# `bash +o errexit <…>/orch-loop.sh` for a REAL invocation (`check-deployed-drift.sh`). A `-`-only option
+# `bash` accepts the `+` form of every `set`-style option, and this repo's OWN classifier decision treats
+# such an argv as an INVOCATION: `check-deployed-drift.test.sh` §10a-3e drives `bash -o pipefail`,
+# `bash -O extglob`, `bash +o noexec`, `bash +o errexit`, `bash --rcfile noexec`, `bash -euo pipefail` …
+# over `<abs>/orch-loop.sh` and asserts each one IS an invocation. A `-`-only option
 # test answered rc 1 = RECLAIM for that argv, so the next start DELETED the lock of a live owner — a
 # fail-OPEN regression versus `main`, which refused any live pid. MEASURED before the fix, same fixture:
 # `STARTED` + `[lock] reclaiming … provably NOT the owner` with the owner still alive.
