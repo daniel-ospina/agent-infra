@@ -108,16 +108,20 @@ export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH
 # `gh` that worker runs resolves to `/opt/homebrew/bin/gh` — the layer would be deployed and inert,
 # which is exactly the state the issue exists to remove. Grouped so the population check in
 # `gh-limit.test.sh` sees them.
-if [ -d "$O/gh-limit" ]; then PATH="$O/gh-limit:$PATH"; fi
-if [ -d "$O/gh-rest" ]; then PATH="$O/gh-rest:$PATH"; fi
+# ⛔ THE WORK ROOT, NOT `$O` (#2095, review of #3846): the controller exports `O` = its STATE dir and
+# `O_WORK` = the harness root, and the gh shim DIRECTORIES live in the harness root. Reading `$O/gh-limit`
+# on a state-dir instance silently drops the serialiser/REST adapter — an INERT layer.
+_NB_WORK="${O_WORK:-$O}"
+if [ -d "$_NB_WORK/gh-limit" ]; then PATH="$_NB_WORK/gh-limit:$PATH"; fi
+if [ -d "$_NB_WORK/gh-rest" ]; then PATH="$_NB_WORK/gh-rest:$PATH"; fi
 # The RESOLUTION, though, mirrors merge-one.sh's repo-authority.sh — NOT lane.sh/fix-one.sh, which
 # source only `$SELF/spawn-gate.sh` and never consult `$O`. Prefer the daemon's copy at `$O`, fall
 # back to the copy beside THIS script; an unresolved helper must never degrade into "the worker ran".
-if [ -f "$O/spawn-gate.sh" ]; then . "$O/spawn-gate.sh"; HARNESS="$O"
+if [ -f "$_NB_WORK/spawn-gate.sh" ]; then . "$_NB_WORK/spawn-gate.sh"; HARNESS="$_NB_WORK"
 else
   HARNESS="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
   . "$HARNESS/spawn-gate.sh" 2>/dev/null \
-    || { echo "nonblocking-dispatch.sh: spawn-gate.sh not found (looked in $O and ${HARNESS:-<unresolved>}) — refusing to start an ungated worker" >&2; exit 78; }
+    || { echo "nonblocking-dispatch.sh: spawn-gate.sh not found (looked in $_NB_WORK and ${HARNESS:-<unresolved>}) — refusing to start an ungated worker" >&2; exit 78; }
 fi
 command -v run_agent >/dev/null 2>&1 \
   || { echo "nonblocking-dispatch.sh: spawn-gate.sh is stale (no run_agent) — refusing to start an ungated worker" >&2; exit 78; }
