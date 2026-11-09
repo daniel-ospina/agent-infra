@@ -143,14 +143,115 @@ is_limit() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; 0) return 0 ;; 0*) return
 MAX_ROUNDS="${LANE_MERGE_MAX_ROUNDS:-3}"
 [ -n "$MAX_ROUNDS_OVERRIDE" ] && MAX_ROUNDS="$MAX_ROUNDS_OVERRIDE"
 is_limit "$MAX_ROUNDS" || { say_err "lane-merge: LANE_MERGE_MAX_ROUNDS='$MAX_ROUNDS' is not a bounded integer — using 3"; MAX_ROUNDS=3; }
-# ⛔ SIZED TO THE CI IT WAITS FOR, NOT TO A ROUND NUMBER (measured on this change's own PR: a
-# 22-check commit on a loaded box reached 7/22 completed at 15 min and was still 15-in-flight at the
-# old 900s bound, so EVERY lane would have spent a chunk on "still in flight — re-run"). 1500s covers
-# a ~25 min CI. It is a MERGE-PHASE cost from the lane's own wall clock (`LANE_TIMEOUT`, 3300s), so the
-# supervision bound below is derived from what is left AFTER it AND after the lane's implementation
-# time — the two must not add up to the whole clock. A re-run is still permitted and still cheap (one
-# PR read) — the bound is a runaway guard, never a reason to call a head green.
-WAIT_S="${LANE_MERGE_WAIT:-1500}";     is_limit "$WAIT_S" || WAIT_S=1500     # per-round check wait
+# ⛔ SIZED TO THE CI IT WAITS FOR, NOT TO A ROUND NUMBER — AND RE-SIZED FROM A MEASUREMENT OF THE
+# LIST THAT EXISTS TODAY (agent-infra#3584). The principle in that heading was already right; the
+# NUMBER was a stale measurement of a smaller list, and it had gone BELOW THE FASTEST real pass.
+#
+# MEASURED 2026-11-09 on daniel-ospina/agent-infra, PR-lane `ci.yml`, over the runs endpoint's 1000-run
+# cap (pages 1-10 of completed runs), non-cancelled and non-`main`. ⛔ THERE ARE TWO CLOCKS HERE AND THIS
+# LOOP LIVES ON THE LONGER ONE — an earlier draft quoted only the shorter one and then claimed it "includes
+# the runner queue", which is exactly backwards (review cycle 6, P2 — verified against the same endpoint):
+#   LANE-VISIBLE (`created_at` -> `updated_at`): creation to final check-run. A run is CREATED when the push
+#     lands and only STARTED when a runner picks it up, so this is the clock a lane actually sits through.
+#     n=209 · min 1931 s · p50 4062 s · p90 9825 s · p95 17185 s · max 32157 s  ->  167 of 209 (79.9 %) in 5400 s
+#   RUN DURATION (`run_started_at` -> `updated_at`): EXCLUDES the pre-start queue. n=209 · min 1623 s ·
+#     p50 3836 s · p90 4928 s · p95 5612 s · max 7968 s  ->  197 of 209 (94.3 %) in 5400 s
+# ⛔ THE 14.4-POINT GAP IS THE POINT, NOT A ROUNDING (94.3 - 79.9): 30 of 209 runs waited 60 s .. 7 h 55 m
+# BEFORE they started, which is why the lane-visible p90 is 2.7 h and its p95 is 4.8 h while the
+# run-duration ones are 1.4 h and 1.6 h. Sizing to the run duration would under-state what a lane waits by
+# SIX HOURS AT THE MAX (32157 - 7968 = 24189 s = 6 h 43 m) and by 3.2 h at p95, in the OPTIMISTIC
+# direction — the one direction a bound must never be wrong in.
+# ⛔ AND THE COUNTS ARE STAMPED, NOT PORTABLE: this is a query over a SLIDING 1000-run window, so `n`, the
+# per-day counts and the percentiles' low digits move as runs age out. What barely moves is `min`, `max` and
+# the two RATIOS — those are what an argument here may rest on. ⛔ AND NOT EVEN `p90`/`p95` ARE STABLE TO THE
+# SECOND (review cycle 7 — an honest downgrade of an earlier "the percentiles are stable" claim): between
+# two reads of the same window the lane-visible p95 moved 17185 s -> 16390 s (-4.6 %). Quote a percentile to
+# size a decision and you will be arguing about a sliding window; quote the order of magnitude, the ratio or
+# the min/max, and the claim survives the next run.
+# ⛔ THE DAYS ARE NOT INTERCHANGEABLE, which is why the population is quoted WHOLE rather than as the
+# newest day: on the run-duration clock the slowest day's p95/max are 6836 s / 7968 s and the fastest
+# day's are 4565 s / (>=4725 s). ⛔ AND THE FASTEST DAY'S MAX IS A LOWER BOUND, NOT A MEASURED CEILING
+# (review cycle 5, P3 — the newest day is still FILLING, so its max grows under you: 4725 s at the first
+# read, 4872 s a few hours later). The slowest day's figures — the ones this argument actually rests on —
+# are exact and stable.
+# ⛔ AND PER-DAY COUNTS ARE DELIBERATELY NOT QUOTED (review cycle 3, P2 — verified). A per-day count moves
+# with the bucketing key (`created_at` vs `run_started_at` differs by one across a midnight boundary: the
+# same population buckets 92/67/53 one way and 91/67/54 the other), and a count that depends on which
+# clock you group by is not a measurement. The per-day p95/max above DO reproduce under either key, so
+# they are what this block states.
+# ⛔ THE WINDOW IS PART OF THE MEASUREMENT, and the first draft of this block got that wrong (round-2
+# review, P1 — verified). It quoted the newest ~1 day only (n=83: p95 4521, max 4960) and claimed the new
+# bound covered 100 % of the population. It does not: the 11-07 day is materially slower, so a one-day
+# window measured the FASTEST day and turned a real tail into a false "100 %". State the window, always.
+#
+# ⛔ THE OLD 1500 s (25 min) WAS NOT MERELY TIGHT — IT WAS BELOW THE FLOOR OF THE POPULATION ON EITHER
+# CLOCK, and that is window-independent: 1500 s is under the lane-visible minimum (1931 s), under the
+# run-duration minimum (1623 s), and 2.7x under the lane-visible median (4062 s). ⛔ BUT STATE THE CLAIM NO
+# STRONGER THAN THE MEASUREMENT SUPPORTS (review cycle 4, P2 — verified): the minimum is a property of the
+# RUN, while this loop's `deadline` starts at PROCESS START, i.e. at merge-phase entry — which is AFTER the
+# push. So the bound a lane must survive is `run clock - entry latency`, and with 431 s of margin on the
+# lane-visible clock a lane entering its merge phase >=431 s after the push COULD have seen `INFLIGHT == 0`
+# inside 1500 s. It is the empirical record, not arithmetic, that settles it, and ⛔ THE RECORD SUPPORTS LESS
+# THAN A CAUSAL CLAIM (review cycle 5, P2 — verified against `$O/state/lanemerge-*.verdict`, which holds
+# exactly FOUR files and deletes none): 2 x `WAITING_CHECKS checks still in flight after 1500s` and 2 x
+# `FIX_REQUIRED … this head's own checks are RED`, so 0 x MERGED over n=4. What that establishes is the COST
+# — a lane that exhausts the bound writes a verdict that is neither a fix order nor a merge, `INFLIGHT` is
+# never recorded on that path,
+# and the two red-head lanes never reached the wait at all (a RED short-circuits BEFORE the `INFLIGHT` test,
+# so their 0 merges are fully explained by the reds). So: the bound's cost is measured; whether it also
+# blocked a GREEN head is NOT in this record, and is argued from the duration population above instead.
+# (PR numbers are not cited: a verdict file is OVERWRITTEN per invocation, so a PR-number citation for a
+# transient state rots by construction — the box's second `WAITING_CHECKS` is now `lanemerge-issue-2844`.)
+# A bound that only fires when a lane happens to enter late is still a bound that costs every other lane its
+# merge, and the duration population above is why the common case is that it fires.
+# The 1500 s figure came from a 22-check commit on a loaded box, taken when `bash-suites` was a single
+# ~73 min job; `scripts/run-bash-shards.sh --list` now derives a 195-shard matrix (count STAMPED
+# 2026-11-09 — the list moves, so read `--list` rather than trusting this number: an earlier draft said
+# 193, which is the same stale-number defect this block exists to fix, one line lower), and the matrix
+# changed what a lane waits through.
+#
+# 5400 s (90 min): a round number a reader can hold, and the most this clock can afford (below).
+#
+# ⛔ AND ITS COVERAGE IS STATED, NOT ROUNDED UP TO 100 %: **79.9 % of the LANE-VISIBLE population (167 of
+# 209) completes inside 5400 s, and 94.3 % of the run-duration population (197 of 209).** FORTY-TWO runs
+# exceed 5400 s on the lane-visible clock and TWENTY-NINE of those exceed the lane's whole 7200 s clock —
+# i.e. one run in five, and one in seven that no setting of this constant could ever have waited out. That
+# is the number to hold onto when reading what follows: this change turns a bound that could never be
+# reached into one that is reached 4 times in 5, and it does NOT fix the queue that makes the fifth slow.
+# ⛔ AND THE POPULATION'S COMPOSITION IS PART OF THE CLAIM (review cycle 5, P2 — verified): ⛔ THE WINDOW
+# HOLDS NO SUCCESSFUL RUN AT ALL. Every completed `ci.yml` run in it is `cancelled` or `failure`, and the
+# newest SUCCESSFUL `ci.yml` run is 2026-10-24T22:02Z — two weeks before the oldest run sampled. So this
+# coverage describes FAILING runs, and that is the RIGHT population to size to rather than a limitation:
+# the newest 100 SUCCESSFUL `ci.yml` runs are markedly FASTER (run-duration median 2114 s, 99 of 100 <=
+# 5400 s, max 5758 s), so failing runs are the BINDING case — sizing to the slowest population is the
+# conservative direction. ⛔ AN EARLIER DRAFT OF THIS SENTENCE CITED "62.5 % <= 5400 s" FOR THE PASSING RUNS
+# AND IT WAS GARBAGE (review cycle 5, P2 — the verifier measured 99.0 %): a 5-of-8 figure from a
+# hand-sampled handful, exactly the small-n inference this block forbids two paragraphs earlier. The
+# passing population COULD NOT be measured from the same window (it holds none), and substituting a
+# different hand-picked window for it is how the false "100 %" of the first draft happened. Measure it or
+# do not quote it.
+# That residual is real and it is NOT closable by this constant — see the arithmetic ceiling below. It is a
+# CEILING and not a delay: the loop breaks the moment `INFLIGHT` reaches 0, so a fast lane pays nothing.
+#
+# It is a MERGE-PHASE cost from the lane's own wall clock, so the supervision bound below is derived
+# from what is left AFTER it AND after the lane's implementation time — the two must not add up to the
+# whole clock. A re-run is still permitted and still cheap (one PR read) — the bound is a runaway guard,
+# never a reason to call a head green.
+#
+# HONEST RESIDUAL, stated because it is not fixed here, and ARITHMETIC rather than taste: keeping the
+# shipped 7 supervision chunks costs `IMPL_RESERVE_S + 7*POLL_S = 900 + 840 = 1740 s`, so the largest wait
+# this clock can carry is `7200 - 1740 = 5460 s`. The measured LANE-VISIBLE p90 (9825 s) and p95 (17185 s)
+# are FAR above that ceiling (as is the run-duration p95 5612 s), so NO value of `WAIT_S` that fits this
+# lane's clock can cover the tail — the 29 runs that exceeded 7200 s on the lane-visible clock could not
+# have been waited out by ANY setting of this constant, and raising `WAIT_S` past 5460 s would only eat the
+# supervision it hands off to. Raising the ceiling is the remedy, and it is not this constant's to make:
+# raise `LANE_BACKSTOP_S`, which raises the derived supervision budget with it (see below). The tail case
+# hands off as `WAITING_CHECKS` (exit 11) and the
+# next invocation resumes the SAME counter — the designed path, which depends on something RE-INVOKING the
+# lane (the controller's merge step). `ci.yml`'s `bash-suites` job bound is `timeout-minutes: 100`
+# (6000 s) with no internal budget variable, so a pass can legitimately outlive this wait (5400 s) and
+# still be inside the job's own bound.
+WAIT_S="${LANE_MERGE_WAIT:-5400}";     is_limit "$WAIT_S" || WAIT_S=5400     # per-round check wait
 POLL_S="${LANE_MERGE_POLL:-120}";      is_limit "$POLL_S" || POLL_S=120      # one --watch chunk
 # ⛔ --watch IS BOUNDED TOO. A pid probe cannot distinguish "the chain is still working" from "the pid
 # was reused", so an unbounded --watch loop would be a lane that never ends — the same defect the
@@ -169,9 +270,12 @@ POLL_S="${LANE_MERGE_POLL:-120}";      is_limit "$POLL_S" || POLL_S=120      # o
 # IMPL_RESERVE_S is the floor a lane needs for implement → commit → push → open PR before its merge
 # phase can start; the merge phase must never be sized out of it. MAX_WATCH is DERIVED from what that
 # leaves (never a literal), so raising LANE_TIMEOUT buys supervision and lowering it cannot silently
-# eat the implementation time again. Shipped defaults:
-#     3300 - 1500 (check wait) - 900 (implementation reserve) = 900s / 120s = 7 chunks (840s)
-# i.e. the merge phase is bounded at 3240s of the 3300s clock, and a lane that implements within its
+# eat the implementation time again. Shipped defaults, RE-DERIVED when the check wait moved to its
+# measured 5400s (#3584) — the old row read `3300 - 1500 - 900 = 900s / 120s = 7 chunks`, and an
+# arithmetic row that is not recomputed with its operand is the same stale-measurement defect one layer
+# down:
+#     7200 - 5400 (check wait) - 900 (implementation reserve) = 900s / 120s = 7 chunks (840s)
+# i.e. the merge phase is bounded at 6240s of the 7200s clock, and a lane that implements within its
 # reserve reaches BOTH bounds. A cycle that needs longer is not a lane failure: it hands off as
 # WAITING_* (exit 11) and the next invocation resumes the SAME counter.
 # ⛔ AND THE CLOCK ITSELF IS THE LANE'S, READ FROM THE SAME SEAM (#2888 review, P2/P3 — verified). It
@@ -179,26 +283,160 @@ POLL_S="${LANE_MERGE_POLL:-120}";      is_limit "$POLL_S" || POLL_S=120      # o
 # — and `lane.sh` does not export `LANE_TIMEOUT`, so the merge phase permanently spent ~45% of the clock
 # the lane now owns. That is the opposite of what the paragraph above claims ("DERIVED from the lane's own
 # wall clock"). `LANE_BACKSTOP_S` IS exported by spawn-gate.sh, so this child reads the lane's real bound:
-#     7200 - 1500 (check wait) - 900 (implementation reserve) = 4800s / 120s = 40 chunks
+#     7200 - 5400 (check wait) - 900 (implementation reserve) = 900s / 120s = 7 chunks
+# ⛔ AND THAT IS THE COST OF SIZING THE WAIT HONESTLY, SAID OUT LOUD: at the measured 5400s check wait the
+# supervision allowance is 7 chunks, not 40 — the same 7 the 3300s clock used to afford at a 1500s wait.
+# The trade is deliberate. 40 chunks of supervision over a check wait that can never be satisfied is
+# supervision of a phase that never starts; 7 chunks over a wait that reaches the merge phase is
+# supervision that actually runs. Raising LANE_BACKSTOP_S buys more chunks without touching this bound.
 IMPL_RESERVE_S="${LANE_MERGE_IMPL_RESERVE:-900}"; is_limit "$IMPL_RESERVE_S" || IMPL_RESERVE_S=900
 LANE_WALL_S="${LANE_TIMEOUT:-${LANE_BACKSTOP_S:-7200}}"; is_limit "$LANE_WALL_S" || LANE_WALL_S=7200
+INTERVAL="${LANE_MERGE_INTERVAL:-20}"; is_limit "$INTERVAL" || INTERVAL=20
+[ "$INTERVAL" -ge 5 ] || INTERVAL=20
+
+# ⛔ THE CHECK WAIT HAS A SECOND BOUND, AND IT IS NOT THIS FILE'S CLOCK (#3584 review, P1 — MEASURED).
+# `WAIT_S` seconds are spent inside ONE TOOL CALL, and `run_agent` (spawn-gate.sh) arms
+# `lane-bound.sh watch` around the lane's `pi` process. That watchdog ends on IDLE, not on the wall
+# clock: `lane-bound.sh` resolves `IDLE_S` flag → `LANE_BOUND_IDLE_S` → **2700 s**, and spawn-gate passes
+# NO `--idle`, so 2700 s is what a shipped fleet runs. Its progress evidence is EITHER growth of the LANE
+# LOG or a CPU delta above `LANE_BOUND_CPU_TOL_CS` (10 cs) across the lane's process SUBTREE.
+# MEASURED 2026-11-09 (this change's own review, the reviewer's suggested probe):
+#     sh lane-bound.sh run --idle 60 -- env LANE_MERGE_WAIT=180 … bash lane-merge.sh 99 --checks-tsv <in-flight>
+#     → [lane-bound] VERDICT verdict=stalled … elapsed=75s silent=75s bytes=0 bytes_delta=0
+#       cpu_cs=0 cpu_delta_cs=0   (TERM, exit 143, and NO `lanemerge-99.verdict` was ever written)
+# ⛔ THE CPU ARM IS INERT FOR A POLLING LOOP, and not because the loop is idle: `ps time` reports the
+# ACCUMULATED time of processes still ALIVE, so each poll's short-lived `gh`/`python3` child carries its
+# CPU away when it exits and the subtree total stays 0. The byte arm is the only one that works — and in a
+# `-p` lane this script's stdout (log_line) reaches no log. So a wait that outlives 2700 s yields NO
+# `WAITING_CHECKS` hand-off: the watchdog TERMs the lane first, `lane.sh` writes "NO merge-phase verdict",
+# and there is no verdict file, no PR comment and no resumable counter. That is STRICTLY WORSE than the
+# 1500 s bound it replaces, which at least exited 11 well below the watchdog.
+# Two arms, in this order:
+#   (1) make progress REAL — append a heartbeat to the LANE LOG the watchdog watches: `$O/logs/lane-<issue>.log`
+#       (lane.sh) or `$O/logs/fix-<pr>.log` (fix-one.sh); `LANE_MERGE_HB` overrides the target.
+#   (2) if no heartbeat target resolves, CAP the wait BELOW the watchdog's allowance rather than out-reach
+#       a bound that will kill the lane unlabelled — a bound the lane cannot reach is an inert guard, which
+#       is this file's own rule (#3584) applied one layer down.
+HB_F="${LANE_MERGE_HB:-}"
+# ⛔ THE INVARIANT BELOW KEEPS ITS DESIGN OPERAND: the cap is a RUNTIME limit on how long this pass waits,
+# and must never feed back into `MAX_WATCH` — otherwise the supervision budget a lane gets would depend on
+# whether a log file happened to exist (7 chunks with a heartbeat, 30 without), and the documented
+# arithmetic row would describe only one of the two worlds.
+WAIT_S_DESIGN="$WAIT_S"
+# ── how much of the LANE's wall clock is already spent ────────────────────────────────────────────
+# ⛔ THE WAIT NEEDS THIS AND MUST NOT GUESS IT (#3584 review, P1 — see the clamp at the deadline).
+# `run_agent` arms `lane-bound.sh`'s WALL ceiling around the lane's `pi` with `LANE_BACKSTOP_S`, so the
+# datum is "when did THIS lane's run start" — and it is READ rather than inferred: `lane.sh` stamps
+# `LANE_RUN_TOKEN="<issue>.<pid>.<epoch>"` into `$O/logs/lane-<issue>.owner` BEFORE it spawns the agent,
+# so that epoch over-states the agent's own start by the spawn latency (the conservative direction for
+# a bound that must never fire late).
+# ⛔ EMPTY MEANS "UNKNOWN", NEVER ZERO. Reading an unresolvable elapsed as 0 would leave the wait
+# uncapped exactly when the lane is oldest — the same inert guard from the other side.
+# ⛔ AND A STALE TOKEN MUST NOT COUNT AS THIS LANE'S. The file is per-ISSUE and outlives the run that
+# wrote it, so a LATER invocation (the controller's merge step re-running this script for a PR whose
+# lane has exited) would otherwise read a token from a dead run, compute an elapsed larger than the
+# whole clock, and clamp the wait to 0 — handing off instantly instead of resuming. A token from the
+# future (clock skew, another box) is unknown for the same reason.
+# ⛔ AND LIVENESS IS NOT IDENTITY (review, P3 — verified on this tree, BOTH directions). The
+# first cut required the token's pid to be merely ALIVE (`kill -0`), and that is wrong twice: a
+# RECYCLED pid (any same-user process) makes a DEAD run's age read as this lane's — measured, an
+# epoch 100000 s old clamped a live wait to 0 — and a NEWER dispatch of the same issue RE-STAMPS
+# this per-ISSUE file, so an OLDER still-live lane reads the newer epoch, UNDER-states its elapsed and
+# the clamp goes inert (the "the epoch over-states the start" argument only holds for a run's OWN
+# token). The identity that actually holds is "the shell that stamped this token leads to me":
+# `lane.sh` → `run_agent` → `lane-bound.sh watch` → `pi` → this tool call. So the token's pid is
+# required to be an ANCESTOR. A controller re-running this script for a PR is not under a lane and
+# correctly gets "unknown", which is the disclosed unclamped path.
+pid_is_ancestor() { # pid_is_ancestor <pid>
+  local want="${1:-}" cur="$$" n=0
+  case "$want" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$want" -gt 0 ] || return 1
+  while [ "$n" -lt 24 ]; do
+    cur="$(ps -o ppid= -p "$cur" 2>/dev/null | tr -d ' ')"
+    # An unreadable or non-numeric PARENT ends the walk as "not an ancestor", never as a match.
+    case "$cur" in ''|*[!0-9]*) return 1 ;; esac
+    [ "$cur" -gt 0 ] || return 1
+    if [ "$cur" = "$want" ]; then return 0; fi
+    n=$(( n + 1 ))
+  done
+  return 1
+}
+lane_elapsed_s() {
+  local now tok lpid ep
+  now="$(date +%s)"
+  # 1. the explicit seam — fixtures, and an operator whose caller stamps no token
+  if is_limit "${LANE_MERGE_ELAPSED_S:-}"; then printf '%s' "$LANE_MERGE_ELAPSED_S"; return 0; fi
+  # 2. lane.sh's own run token
+  [ -n "${ISSUE:-}" ] || return 0
+  [ -r "$O/logs/lane-$ISSUE.owner" ] || return 0
+  # `IFS= read -r` (a builtin) strips the newline; no `tr`/`sed` dialect to get wrong. Trailing
+  # whitespace is trimmed by parameter expansion, the way `round_of` above reads its counter.
+  tok=""; IFS= read -r tok 2>/dev/null < "$O/logs/lane-$ISSUE.owner" || true
+  tok="${tok%"${tok##*[![:space:]]}"}"
+  ep="${tok##*.}"
+  lpid="${tok#*.}"; lpid="${lpid%%.*}"
+  # ⛔ THE EPOCH IS NOT AN `is_limit` VALUE (verified: `is_limit` refuses anything over 9 digits, and a
+  # unix epoch has 10 — the guard would have rejected EVERY real token and left the clamp permanently
+  # inert on the only path that can feed it). Digits-only, plus a length sanity bound, is the test here.
+  case "$ep" in ''|*[!0-9]*) return 0 ;; esac
+  [ "${#ep}" -le 12 ] || return 0
+  [ "$ep" -gt 0 ] || return 0                 # `printf 0` when lane.sh's `date` failed
+  [ "$ep" -le "$now" ] || return 0            # a future stamp is a clock we cannot reason about
+  pid_is_ancestor "$lpid" || return 0          # a token that is not THIS run's is not this lane's age
+  printf '%s' "$(( now - ep ))"
+}
 # The divisor is floored at the shipped chunk length: LANE_MERGE_POLL=0 is a legitimate value (a chunk
 # that exits at once at its deadline), and dividing by it would break the arithmetic below instead of
 # yielding a bound.
 _fit_poll="$POLL_S"; [ "$_fit_poll" -ge 1 ] || _fit_poll=120
-MAX_WATCH_FIT=$(( (LANE_WALL_S - WAIT_S - IMPL_RESERVE_S) / _fit_poll ))
+MAX_WATCH_FIT=$(( (LANE_WALL_S - WAIT_S_DESIGN - IMPL_RESERVE_S) / _fit_poll ))
 [ "$MAX_WATCH_FIT" -ge 1 ] || MAX_WATCH_FIT=1          # a tiny LANE_TIMEOUT still supervises once
+# ⛔ THE CLAMP ABOVE IS A FLOOR, AND A FLOOR CAN MASK AN OVERSPENT CLOCK (review cycle 3, P3 — verified, not
+# fixed here so the diff stays to its own defect). If an ENV override makes `LANE_WALL_S - WAIT_S -
+# IMPL_RESERVE_S` zero or negative — `LANE_MERGE_WAIT=6300` gives `(7200-6300-900)/120 = 0` — the clamp
+# hands back 1 chunk and the merge phase becomes `6300 + 120 + 900 = 7320 > 7200`: the lane's own wall clock
+# kills it mid-supervision, which is the #2888 shape the three-term invariant exists to prevent. The SHIPPED
+# default is safe (7140 of 7200, 60 s of slack) and the suite's arithmetic arm pins it, which is why this is
+# a regression-guard question and not a live defect. ⛔ AND THE SAFETY NET IS NARROWER THAN IT LOOKS (review
+# cycle 5, P2 — verified by running this block under each override): the suite's arm catches a DEFAULT change,
+# and the ONLY override that warns is `LANE_MERGE_MAX_WATCH` (below). An env override of `LANE_MERGE_WAIT`,
+# `LANE_TIMEOUT` or `LANE_BACKSTOP_S` is SILENT — `LANE_TIMEOUT=3300` with the shipped wait yields
+# `MAX_WATCH=1` and a `6420 s` merge phase against a `3300 s` clock, with no line printed anywhere. ⛔ SO:
+# anyone who raises the wait, or lowers the wall, must re-check this arithmetic by hand — nothing here will
+# tell them. The honest fix, when someone owns it, is a `say_err` in this branch.
 MAX_WATCH="$MAX_WATCH_FIT"
+# ⛔ THE `--watch` LAYER NEEDS NO HEARTBEAT, and that is a measured statement rather than an omission: with
+# the DESIGN operand it is bounded by `MAX_WATCH x POLL` (7 x 120 = 840 s at the shipped defaults, and
+# 840 < the 2700 s progress allowance), so it reaches its own verdict before the watchdog can fire. Only the
+# check wait above can outlive the watchdog, which is why only the check wait is capped/hearted.
+# ⛔ AND THE ALLOWANCE IS RE-DERIVED FROM THE CLOCK THAT IS ACTUALLY LEFT, WHEN `--watch` RUNS (#3850
+# review, P2 — verified by arithmetic against this repo's own declared chain budgets). The design operand
+# above sizes the allowance against the WORST-CASE check wait, which is the right FLOOR — but supervision
+# is paid AFTER the wait, from whatever clock remains, so a lane whose checks settled early was granted the
+# worst case's 7 chunks (840 s) while thousands of seconds still stood on its clock. And 840 s is BELOW the
+# chain this loop supervises: `merge-one.sh` budgets a fresh-context review at `REVIEW_TIMEOUT` = 1800 s and
+# leases the PR claim for `REVIEW_TIMEOUT + _gw + 300` = 3000 s at the defaults (`claims.sh:166`), and
+# `chain-merge.sh`'s merge-phase wait is 1890 s (`claims.sh:110`). A lane that finally cleared the wait
+# could therefore hand off a FALSE blocker — `BLOCKED_ATTEMPTS … the chain was STILL RUNNING` — over a
+# chain that was legitimately still reviewing, and `WATCH_F` is only rewound by a fix round or a head move,
+# so every later `--watch` re-entered the same arm.
+# The raise can never exceed the OTHER two bounds, and never lowers the design floor:
+#   · the lane's REMAINING wall clock (`lane_elapsed_s`, one chunk held back to write the verdict);
+#   · the watchdog's progress allowance — `--watch` writes NO heartbeat, so a chunk sequence longer than
+#     `IDLE_BOUND_S` is killed as `stalled`; that bound WINS when it is the smaller one (a labelled hand-off
+#     beats an unlabelled kill).
+# An UNRESOLVABLE elapsed — a controller re-run, which is not under a lane and has no lane clock at all —
+# keeps exactly the shipped design operand, so this cannot become unbounded supervision for a non-lane.
 if [ -n "${LANE_MERGE_MAX_WATCH:-}" ] && is_limit "${LANE_MERGE_MAX_WATCH:-}"; then
   # An explicit override is an operator's escape hatch and is HONOURED rather than silently rewritten —
   # but it is never silent about breaking the invariant above, because the next reader would take the
   # bound at face value.
   MAX_WATCH="$LANE_MERGE_MAX_WATCH"
-  [ "$MAX_WATCH" -le "$MAX_WATCH_FIT" ] || say_err "lane-merge: LANE_MERGE_MAX_WATCH=$MAX_WATCH exceeds what LANE_TIMEOUT=${LANE_WALL_S}s affords after the check wait (${WAIT_S}s) and the implementation reserve (${IMPL_RESERVE_S}s) — $MAX_WATCH_FIT chunk(s) fit; honouring the override, but the lane's wall clock ends the phase first."
+  # ⛔ NOT ON A LANE WITH NO WALL CLOCK: the sentence below says "the lane's wall clock ends the phase
+  # first", which is FALSE when `LANE_TIMEOUT=0` (review cycle 15, P3 — measured: a pinned lane printed that
+  # warning and, two lines later, "no wall ceiling is enforced for this lane").
+  [ "$LANE_WALL_S" -eq 0 ] || [ "$MAX_WATCH" -le "$MAX_WATCH_FIT" ] || say_err "lane-merge: LANE_MERGE_MAX_WATCH=$MAX_WATCH exceeds what LANE_TIMEOUT=${LANE_WALL_S}s affords after the check wait (${WAIT_S_DESIGN}s) and the implementation reserve (${IMPL_RESERVE_S}s) — $MAX_WATCH_FIT chunk(s) fit; honouring the override, but the lane's wall clock ends the phase first."
 fi
-INTERVAL="${LANE_MERGE_INTERVAL:-20}"; is_limit "$INTERVAL" || INTERVAL=20
-[ "$INTERVAL" -ge 5 ] || INTERVAL=20
-
 PHASE_F="$O/state/lanemerge-$PR.phase"   # "this lane IS in its merge phase" (chain-merge waits on it)
 ROUND_F="$O/state/lanemerge-$PR.round"
 VERDICT_F="$O/state/lanemerge-$PR.verdict"
@@ -292,6 +530,66 @@ fi
 # Persist the key on the first round; re-read it when a later invocation was not given one.
 [ -n "${ISSUE:-}" ] && printf '%s\n' "$ISSUE" > "$O/state/lanemerge-$PR.issue" 2>/dev/null
 [ -z "${ISSUE:-}" ] && ISSUE="$(cat "$O/state/lanemerge-$PR.issue" 2>/dev/null || true)"
+# ⛔ AND THIS BLOCK RUNS **AFTER** THE ISSUE IS RECOVERED, NOT AT MODULE SCOPE (review round 3, P2 —
+# verified). `ISSUE` is not always given on the command line: the documented RE-INVOCATION path — the
+# one the PR names as the remaining step between a green PR and `merged` — omits `--issue` and recovers
+# it from `$O/state/lanemerge-<pr>.issue` a few lines above. Resolving the heartbeat target before that
+# recovery found no `lane-<issue>.log`, silently capped the wait to `IDLE_BOUND_S - margin` (2660 s,
+# BELOW the measured lane-visible median of 4062 s) and made the wall clamp inert (no issue -> no run
+# token). The cap is still a RUNTIME limit, so `WAIT_S_DESIGN` above keeps the supervision invariant's
+# operand and neither value can feed back into it.
+if [ -z "$HB_F" ]; then
+  if [ -n "${ISSUE:-}" ] && [ -f "$O/logs/lane-$ISSUE.log" ]; then HB_F="$O/logs/lane-$ISSUE.log"
+  elif [ -f "$O/logs/fix-$PR.log" ]; then HB_F="$O/logs/fix-$PR.log"
+  fi
+fi
+# ⛔ THE SECOND TARGET IS ANOTHER PROCESS'S STALL DETECTOR, STATED RATHER THAN HIDDEN (review, P3 —
+# verified). `$O/logs/fix-$PR.log` is the log a FIXER's own `lane-bound.sh --log` watches, so appending
+# this wait's heartbeats to it is progress evidence for whoever that watchdog is supervising: a genuinely
+# stalled fixer for the SAME PR would keep reading as alive while this merge phase runs. The branch is
+# taken on a re-invocation without `--issue` OR with one whose `lane-<issue>.log` does not exist (a lane run
+# from another `$O`), AND with a concurrently live fixer on that PR — which the per-PR
+# claim is what normally prevents — so this is a narrow disclosed edge rather than a live defect.
+# Closing it properly means preferring a target only THIS invocation's watchdog reads (or probing the
+# claim before falling back); neither is done here, and `LANE_MERGE_HB` is the way to be explicit.
+# The watchdog's allowance, resolved the way `lane-bound.sh` resolves it. This script is never handed the
+# flag, so env → default is the whole chain here — and the default is THEIRS, not a second copy of it.
+# ⛔ THE RESIDUAL, MEASURED RATHER THAN ASSUMED: the heartbeat only counts if it lands in the file the
+# watchdog is watching (`--log`), and the mirror above only sees env → default. MEASURED 2026-11-09 —
+# `--idle 60` passed as a FLAG (invisible to this mirror) left the cap inert; and a heartbeat written to
+# a file OTHER than `--log` left `bytes_delta=0` and the lane was still killed as `stalled` (8 heartbeat
+# lines written, none of them read). Both are safe, not silent: the first because spawn-gate passes no
+# `--idle` (the leg this mirrors), the second because the cap fires when discovery finds nothing. The
+# one path that can still be wrong is a caller passing `--log` somewhere OTHER than the two discovered
+# paths AND `--idle` explicitly — it gets neither arm, and this line is why that is a known edge rather
+# than an oversight.
+IDLE_BOUND_S="${LANE_BOUND_IDLE_S:-2700}"; is_limit "$IDLE_BOUND_S" || IDLE_BOUND_S=2700
+# Two polls of headroom, so the first heartbeat lands before the bound can fire; floored so a tiny
+# LANE_MERGE_INTERVAL cannot make the cap degenerate.
+_hb_margin=$(( INTERVAL * 2 )); [ "$_hb_margin" -ge 10 ] || _hb_margin=10
+# ⛔ THIS IS A RUNTIME LIMIT ON A REAL WAIT, SO `--status` MUST NOT PAY FOR IT (review finding, P3 —
+# verified). `--status` is documented "no network, no writes" and exits ABOVE this block, so a read-only
+# status query never emits the cap's multi-line `say_err` about a wait it was never going to sit
+# through. ⛔ THE ORDER IS THE GUARD, AND IT MUST STAY THIS WAY (`8de98255f` moved this block below the
+# `--status` exit; that MOVE is what fixed the P3 — not the `[ "$STATUS" -eq 0 ]` conjunct, which was
+# dead here because `STATUS=1` always returned above and has been removed). `lane-merge.test.sh` pins
+# the ORDER, so moving the block back above the exit reddens its arm.
+# ⛔ AND `--watch` MUST NOT PAY FOR IT EITHER (#3850 review, P3 — verified). This block has no `WATCH`
+# conjunct below, so every `--watch` invocation — which returns inside its own chunk loop and NEVER reaches the
+# check wait — also emitted a multi-line `CAPPED at …s` about a wait it was never going to sit through, and
+# mutated `WAIT_S` for no consumer. The `--status` guard above cannot cover it (both paths share module scope),
+# so the runtime limit is scoped to the path that runs the wait. `lane-merge.test.sh` pins it.
+if [ "$WATCH" -eq 0 ] && [ -z "$HB_F" ] && [ "$IDLE_BOUND_S" -gt 0 ] && [ "$WAIT_S" -ge "$IDLE_BOUND_S" ]; then
+  # ⛔ THE ALLOWANCE IS AN UPPER BOUND, AND THE OLD FLOOR MADE IT A LOWER ONE (review finding, P3 —
+  # verified by arithmetic). `[ "$WAIT_S" -ge "$POLL_S" ] || WAIT_S="$POLL_S"` RAISED the capped wait
+  # back to one poll chunk whenever the allowance was SMALLER than a chunk — with
+  # `LANE_BOUND_IDLE_S=120` and the shipped 120 s poll that is `WAIT_S=120 >= 120`, i.e. the "cap"
+  # lands ON the bound it exists to stay strictly under and the guard stops guarding. The floor is 0
+  # now: a wait of 0 is a labelled hand-off on the first poll, which is the right answer when the
+  # allowance cannot fit one (the loop's own `[ "$now" -ge "$deadline" ]` test terminates it).
+  WAIT_S=$(( IDLE_BOUND_S - _hb_margin )); [ "$WAIT_S" -ge 0 ] || WAIT_S=0
+  say_err "lane-merge: no watchdog-visible heartbeat target (nothing at \$O/logs/lane-${ISSUE:-<issue>}.log or \$O/logs/fix-$PR.log, and LANE_MERGE_HB is unset) — the check wait is CAPPED at ${WAIT_S}s, below lane-bound.sh's ${IDLE_BOUND_S}s progress allowance. An uncapped wait would be killed as 'stalled' before it could write its hand-off verdict (#3584 review, P1). Set LANE_MERGE_HB, or run the lane with --issue, to get the full wait."
+fi
 printf '%s %s\n' "${ISSUE:-}" "$(date +%s)" > "$PHASE_F" 2>/dev/null || true
 
 # ── the two reads (injectable) ───────────────────────────────────────────────────────────────────
@@ -942,6 +1240,49 @@ if [ "$WATCH" -eq 1 ]; then
   # file, so it is read with a builtin rather than a PATH-resolved `cat` a lane could shim into answering 0.
   w=0; if [ -f "$WATCH_F" ]; then IFS= read -r w < "$WATCH_F" || true; fi; [ -n "$w" ] || w=0; is_limit "$w" || w=0
   w=$(( w + 1 )); printf '%s\n' "$w" > "$WATCH_F"
+  # ⛔ THE ALLOWANCE IS RE-DERIVED HERE, FROM THE CLOCK THAT IS ACTUALLY LEFT (#3850 review, P2 — see the
+  # block at `MAX_WATCH`'s definition for the derivation and the two bounds it is clamped by). It only ever
+  # RAISES the design operand, and it is skipped entirely when an operator pins `LANE_MERGE_MAX_WATCH` (an
+  # explicit ceiling is an escape hatch, not a suggestion). A lane with no resolvable clock — the controller
+  # re-run — keeps the shipped 7 chunks.
+  if [ -z "${LANE_MERGE_MAX_WATCH:-}" ]; then
+    _mw_rt="$MAX_WATCH"
+    _watch_elapsed="$(lane_elapsed_s)"
+    # ⛔ THE WALL AXIS CAN BE OFF, AND THEN THERE IS NO CLOCK TO DERIVE FROM ' SO DO NOT DERIVE FROM THE
+    # ZERO (review cycle 13, P2 ' MEASURED: with `LANE_TIMEOUT=0` this block's `-gt 0` guard did not run,
+    # leaving the design operand's `MAX_WATCH_FIT`, which the arithmetic floors at ONE chunk ' 120 s of
+    # supervision on a lane DOCUMENTED AS UNBOUNDED ' and `--watch` then posted a blocker two minutes into
+    # a legitimate chain wait. That is the same 0-semantics inversion this branch fixed for the check wait,
+    # one layer down). The backstop lane-bound.sh was armed with is the honest source when the fleet exports
+    # it; with neither, supervision is unbounded too (a zero allowance means NO COUNTER, not "spent") and
+    # the operator line says which of the two it got.
+    if [ "$LANE_WALL_S" -eq 0 ]; then
+      if is_limit "${LANE_BACKSTOP_S:-}" && [ "${LANE_BACKSTOP_S:-0}" -gt 0 ]; then
+        # ⛔ AND IT IS THE BACKSTOP THAT IS *LEFT*, NOT THE WHOLE OF IT (review cycle 15, P2 — MEASURED:
+        # deriving from the untouched backstop gave a lane with 100 s of its backstop remaining the SAME 22
+        # chunks as a fresh lane — 2640 s of supervision against a clock that ends in 100 s, so lane-bound.sh
+        # TERMed it mid-supervision with no verdict and no hand-off. That is the very outcome this PR calls
+        # "strictly worse than the bound it replaces" for the check wait, and it was reachable only because
+        # the finite-wall sibling below subtracts the elapsed time and this branch did not.
+        _bt_left=$(( LANE_BACKSTOP_S - _hb_margin ))
+        if [ -n "$_watch_elapsed" ]; then _bt_left=$(( _bt_left - _watch_elapsed )); fi
+        _backstop_fit=$(( _bt_left / _fit_poll ))
+        [ "$_backstop_fit" -ge 1 ] || _backstop_fit=1
+        _mw_rt="$_backstop_fit"
+      else
+        _mw_rt=0
+      fi
+    elif [ -n "$_watch_elapsed" ]; then
+      _wall_fit=$(( (LANE_WALL_S - _watch_elapsed - POLL_S) / _fit_poll ))
+      [ "$_wall_fit" -gt "$_mw_rt" ] && _mw_rt="$_wall_fit"
+    fi
+    [ "$_mw_rt" -eq 0 ] || { [ "$_mw_rt" -ge "$MAX_WATCH_FIT" ] || _mw_rt="$MAX_WATCH_FIT"; }   # never below the design floor, unless unbounded
+    if [ "$_mw_rt" -gt 0 ] && [ "$IDLE_BOUND_S" -gt 0 ]; then
+      _idle_fit=$(( (IDLE_BOUND_S - _hb_margin) / _fit_poll ))
+      if [ "$_idle_fit" -ge 1 ] && [ "$_idle_fit" -lt "$_mw_rt" ]; then _mw_rt="$_idle_fit"; fi
+    fi
+    MAX_WATCH="$_mw_rt"
+  fi
   deadline=$(( $(date +%s) + POLL_S ))
   # ⛔ ONE PR READ PER CHUNK, NOT PER TICK (A7). The header promises "reads the PR ONCE per
   # invocation … waits on LOCAL state files while the chain runs"; at INTERVAL=20 a per-tick read was
@@ -1002,7 +1343,10 @@ if [ "$WATCH" -eq 1 ]; then
     verdict MERGED "$(merged_confirmed 2>/dev/null || printf '%s' "${MT:-${HD:-}}")"
     log_line "✅ MERGED — PR #$PR at head ${HD:-}"; exit 0
   fi
-  if [ "$w" -gt "$MAX_WATCH" ]; then
+  # ⛔ A ZERO ALLOWANCE MEANS "NO COUNTER", NOT "SPENT" (the wall axis is OFF and no `LANE_BACKSTOP_S` was
+  # exported): without this conjunct the comparison fires on the FIRST chunk for ever, which is the same
+  # inversion one more time.
+  if [ "$MAX_WATCH" -gt 0 ] && [ "$w" -gt "$MAX_WATCH" ]; then
     # ⛔ A CHUNK THAT ESTABLISHED NOTHING MUST NOT BE REPORTED AS "UNRESOLVED" (reviewer finding, P2,
     # verified). `WAITING_API` returns in seconds and explicitly refuses to judge the PR, so a run of
     # them could burn the whole budget and then post "the merge chain has not resolved this PR" — a
@@ -1021,7 +1365,7 @@ if [ "$WATCH" -eq 1 ]; then
         post_handoff BLOCKED_ATTEMPTS "supervision budget spent (${MAX_WATCH} --watch chunks) and no BRANCH could be resolved — pass --branch; a chain launched without one reviews the wrong tree"
         verdict BLOCKED_ATTEMPTS "budget spent; no branch could be resolved (pass --branch)" ;;
       WAITING_CHAIN_RUNNING*)
-        HANDOFF_NEXT=running post_handoff BLOCKED_ATTEMPTS "supervision budget spent (${MAX_WATCH} --watch chunks) while the chain was STILL RUNNING (pid $(chain_pid)) — it may still merge; wait for that pid before re-running"
+        HANDOFF_NEXT=running post_handoff BLOCKED_ATTEMPTS "supervision allowance spent (${MAX_WATCH} --watch chunks = $(( MAX_WATCH * POLL_S ))s, which is this lane's bound and NOT the chain's own budget of REVIEW_TIMEOUT + the gate wait) while the chain was STILL RUNNING (pid $(chain_pid)) — it may still merge; wait for that pid before re-running"
         verdict BLOCKED_ATTEMPTS "budget spent; the chain was still running (may still merge — check pid $(chain_pid))" ;;
       WAITING_CHAIN_ABSENT*)
         HANDOFF_NEXT=absent post_handoff BLOCKED_ATTEMPTS "supervision budget spent (${MAX_WATCH} --watch chunks) with NO chain recorded for this PR — every chunk had nothing to supervise; launch the chain"
@@ -1257,7 +1601,98 @@ esac
 # wedged and so a human reading the transcript can see it is making progress and not hung.
 CHECK_TMP="$(mktemp "${TMPDIR:-/tmp}/lane-merge-checks.XXXXXX")" || exit 2
 trap 'rm -f "$CHECK_TMP"' EXIT
-deadline=$(( $(date +%s) + WAIT_S ))
+# ⛔ THE WAIT MUST FIT WHAT IS LEFT OF THE LANE'S **REMAINING** WALL CLOCK, NOT JUST THE WHOLE OF IT
+# (#3584 review, P1 — verified). `deadline` was `now + WAIT_S` and nothing compared it with how much of
+# `LANE_WALL_S` THIS lane had already spent. At the shipped numbers a lane entering its merge phase more
+# than ~1800 s into its run (7200 - 5400) was TERMed by `lane-bound.sh`'s WALL ceiling MID-wait: the
+# `now >= deadline` arm never ran, so `WAITING_CHECKS` was never emitted, no `lanemerge-<pr>.verdict`
+# was written, and `lane.sh` printed "NO merge-phase verdict" over a lane that HAD a labelled hand-off
+# available. ⛔ THAT IS STRICTLY WORSE THAN THE 1500 s BOUND THIS CHANGE REPLACES (which reached its own
+# deadline for any implementation under 5700 s), and it is this file's own rule — "a bound the lane
+# cannot reach is an inert guard" — applied to the number that replaced it. So the wait is clamped to
+# the seconds actually LEFT, minus a margin to write the hand-off, which lands the label BEFORE the
+# kill. ⛔ THE DESIGN OPERAND IS ALREADY CAPTURED (`WAIT_S_DESIGN` above), so this clamp cannot move the
+# supervision budget — same rule as the watchdog cap, for the same reason.
+_lane_elapsed="$(lane_elapsed_s)"
+_wait_elapsed_note=""
+# ⛔ `LANE_TIMEOUT=0` IS "THE WALL AXIS IS OFF", NOT A ZERO-SECOND WAITING BUDGET (#3850 review, P2 —
+# verified). `is_limit` accepts `0` as a valid value (by design: it is the harness's OFF switch), and
+# `spawn-gate.sh` documents it as exactly that — *"`0` — the documented "wall axis OFF" value — is a
+# raise in this sense (unbounded) … the OFF switch remains available … through the caller's own seam,
+# `LANE_TIMEOUT=0`"* — while `lane.sh` passes it straight through. Clamped against it, the arithmetic
+# below (`0 - elapsed - margin`) goes negative, floors at 0, and the wait becomes ZERO for ever: the
+# loop hands off `WAITING_CHECKS` on its FIRST poll, so an unbounded lane can never wait a head out.
+# That is the inversion the harness already has a rule about (`spawn-gate.sh`: "a numeric `-le` would
+# read it as the largest possible SHORTENING"), so the clamp applies ONLY to a FINITE wall, and the
+# unbounded case is disclosed rather than left to be inferred. (External convention agrees: systemd's
+# `TimeoutSec=0` disables the timeout, and `systemd#9556` is the bug filed when `0s` was read as a
+# zero-second budget instead — the same misreading fixed here.)
+if [ "$LANE_WALL_S" -eq 0 ]; then
+  # ⛔ NO BACKTICKS INSIDE THIS MESSAGE (review, P2 — verified by running it): in a DOUBLE-QUOTED
+  # string a backtick is COMMAND SUBSTITUTION, so a "`--watch`" here executed `--watch`, printed
+  # "command not found" to stderr and DELETED the word from the line — corrupting the one message a
+  # LANE_TIMEOUT=0 operator reads, on the exact path this branch exists to fix. `bash -n` passes and a
+  # prefix-grep arm cannot see it, so `lane-merge.test.sh` now pins "no backtick in any say_err".
+  # ⛔ AND IT QUOTES THE DESIGN OPERAND, NOT THE WATCHDOG-CAPPED VALUE (review cycle 13, P3 — measured: it
+  # read 10s while the line printed IMMEDIATELY ABOVE it said the wait was capped at 10s, and this line
+  # claimed nothing had clamped it). ⛔ AND IT STATES WHAT HAPPENS TO THE SUPERVISION AXIS, which is no
+  # longer "floored at one chunk" — see the re-derivation in the `--watch` branch.
+  # ⛔ THE PIN IS READ THROUGH A VARIABLE RATHER THAN WITH AN ARITHMETIC DEFAULT: the suite forbids a
+  # digit default on this name, because that is exactly how a literal allowance default creeps back in.
+  _mw_pin="${LANE_MERGE_MAX_WATCH:-}"
+  if is_limit "$_mw_pin" && [ "$_mw_pin" -eq 0 ]; then
+    # ⛔ A PIN OF ZERO IS "NO COUNTER", NOT "ZERO CHUNKS" (review cycle 15, P3 — measured: this branch
+    # called it "a FINITE 0 chunk(s)" while the code admitted the 1000th chunk, because 0 switches the
+    # budget block off). Labelling an unbounded allowance FINITE is the defect class this file keeps fixing.
+    _watch_basis_note="an explicit LANE_MERGE_MAX_WATCH=0, which DISABLES the supervision counter"
+    _watch_supervision_note="UNBOUNDED (there is no counter to spend)"
+  elif is_limit "${LANE_BACKSTOP_S:-}" && [ "${LANE_BACKSTOP_S:-0}" -gt 0 ]; then
+    _watch_basis_note="lane-bound.sh's own backstop (LANE_BACKSTOP_S=${LANE_BACKSTOP_S}s), because the wall axis (LANE_TIMEOUT) is OFF"
+    # ⛔ THE FIGURE MUST BE WHAT THE CODE WILL USE, WHICH INCLUDES THE ELAPSED SUBTRACTION (review cycle
+    # 16, P3 — measured: the line printed "a FINITE 29 chunk(s)" on a lane that had spent 3400 s of its 3600 s
+    # backstop, where `--watch` derives 1). `_lane_elapsed` is already resolved above for the wait clamp; this
+    # is the same datum the `--watch` branch reads as `_watch_elapsed`.
+    _backstop_chunks=$(( (LANE_BACKSTOP_S - _hb_margin - ${_lane_elapsed:-0}) / _fit_poll ))
+    [ "$_backstop_chunks" -ge 1 ] || _backstop_chunks=1
+    # ⛔ A PINNED `LANE_MERGE_MAX_WATCH` OVERRIDES THIS NUMBER (review cycle 14, observation 2 — measured:
+    # `LANE_BACKSTOP_S=3600 LANE_MERGE_MAX_WATCH=2` printed "a FINITE 29 chunk(s)" while the real allowance
+    # was 2). An operator line that states a number the code will not use is the class this branch fixes.
+    if is_limit "${LANE_MERGE_MAX_WATCH:-}"; then
+      _watch_supervision_note="a FINITE ${LANE_MERGE_MAX_WATCH} chunk(s), because LANE_MERGE_MAX_WATCH pins it"
+    else
+      if [ -n "${_lane_elapsed:-}" ]; then
+        _watch_supervision_note="a FINITE ${_backstop_chunks} chunk(s) derived from what is LEFT of it (${_lane_elapsed}s of this lane's clock already spent), further capped by the watchdog allowance when that is smaller"
+      else
+        # ⛔ THE RATIONALE MUST MATCH THE NUMBER (review cycle 16, observation): with an unresolvable elapsed
+        # it subtracted 0 while still saying "after this lane's elapsed time", which reads as if a subtraction
+        # had happened. Same rule as every other line in this file: state what the code did.
+        _watch_supervision_note="a FINITE ${_backstop_chunks} chunk(s) derived from it, further capped by the watchdog allowance when that is smaller (this lane's elapsed time could not be resolved, so nothing was subtracted from it)"
+      fi
+    fi
+  else
+    _watch_basis_note="no clock at all, because the wall axis is OFF (LANE_TIMEOUT=0) and no LANE_BACKSTOP_S is exported"
+    _watch_supervision_note="UNBOUNDED (there is no counter to spend)"
+  fi
+  say_err "lane-merge: LANE_TIMEOUT=0 is the documented 'wall axis OFF' value (unbounded), not a zero-second budget — the design check wait is ${WAIT_S_DESIGN}s and it is NOT clamped by the wall clock (a WATCHDOG cap may still have reduced it to ${WAIT_S}s, and the line above says so when it did), and no wall ceiling is enforced for this lane. Reading 0 as a zero-second budget would hand off WAITING_CHECKS on the first poll for ever (#3850 review, P2). ⛔ AND NOTE THE OTHER AXIS: the --watch supervision allowance is NOT derived from that zero clock (review cycle 13, P2) — it comes from ${_watch_basis_note}, so it is ${_watch_supervision_note} here. Do not read this line as 'this lane has no bounds at all'."
+elif [ -n "$_lane_elapsed" ]; then
+  _wall_left=$(( LANE_WALL_S - _lane_elapsed - _hb_margin ))
+  [ "$_wall_left" -ge 0 ] || _wall_left=0
+  if [ "$WAIT_S" -gt "$_wall_left" ]; then
+    WAIT_S="$_wall_left"
+    _wait_elapsed_note=" (this lane had already spent ${_lane_elapsed}s of its ${LANE_WALL_S}s clock, so the wait is what was left after a ${_hb_margin}s margin to write the hand-off)"
+    say_err "lane-merge: the check wait is CAPPED at ${WAIT_S}s${_wait_elapsed_note}. Uncapped it would out-live lane-bound.sh's ${LANE_WALL_S}s wall ceiling, which TERMs the lane with NO verdict file and no WAITING_CHECKS hand-off (#3584 review, P1)."
+  fi
+else
+  # ⛔ THIS MESSAGE IS THE ONE AN OPERATOR ACTUALLY READS, SO IT GETS THE SAME CORRECTION THE CODE GOT
+  # (review, P2 — verified): it said "no live run token" and offered "--issue" as an equivalent remedy.
+  # Both were wrong once the test became ANCESTRY: a token can exist, be readable and name a LIVE pid and
+  # still be rejected for being a non-ancestor (an operator would check `kill -0`, see it alive, and have no
+  # way to reconcile that with the message), and `--issue` is what makes the token FINDABLE — it is not
+  # what makes it apply, because a controller re-running this script is not under a lane.
+  say_err "lane-merge: this lane's elapsed wall-clock time could not be resolved — no run token OF THIS LANE at \$O/logs/lane-${ISSUE:-<issue>}.owner (absent, unreadable, future-dated, or naming a pid that is not an ANCESTOR of this script) and LANE_MERGE_ELAPSED_S is unset or unusable — so the ${WAIT_S}s check wait is NOT clamped to what is left of LANE_WALL_S=${LANE_WALL_S}s, and a lane that entered its merge phase late can be TERMed mid-wait with no verdict (#3584 review, P1). ⛔ THE REMEDY IS LANE_MERGE_ELAPSED_S=<seconds>; --issue only makes the token findable, and a token whose pid is not this script's ancestor is never read as this lane's age."
+fi
+_wait_t0="$(date +%s)"
+deadline=$(( _wait_t0 + WAIT_S ))
 while :; do
   rows="$(checks_read "$HEAD")"
   # The single-page read carries a TOTAL line so "this page is all of it" is distinguishable from
@@ -1341,10 +1776,39 @@ while :; do
   if [ "$now" -ge "$deadline" ]; then
     # In flight at the bound is NOT a failure of the lane and NOT a green: it is an unexplained
     # wait. Say so and let the caller re-run (a re-run costs one PR read).
-    log_line "… checks still IN FLIGHT (${IF}) after ${WAIT_S}s — re-run this script; nothing was merged"
+    # ⛔ THE QUOTED NUMBER IS THE WAIT THAT ACTUALLY RAN, NOT THE CONSTANT (review finding, P3 — the
+    # same "quote the operand you measured" rule this file holds elsewhere). `WAIT_S` can now be capped
+    # four ways AFTER the constant is read (watchdog allowance, remaining wall clock, a lost heartbeat,
+    # the seam), so a line rendered from `WAIT_S` would name a bound that never fired.
+    _waited=$(( now - _wait_t0 ))
+    log_line "… checks still IN FLIGHT (${IF}) after ${_waited}s — re-run this script; nothing was merged"
     disposition WAITING_CHECKS
-    verdict WAITING_CHECKS "checks still in flight after ${WAIT_S}s"
+    verdict WAITING_CHECKS "checks still in flight after ${_waited}s"
     exit 11
+  fi
+  # ⛔ WATCHDOG-VISIBLE PROGRESS, EVERY POLL (#3584 review, P1 — measured). `lane_bound`'s only working
+  # progress arm for this loop is GROWTH OF THE LANE LOG: the CPU arm cannot see a poll's short-lived
+  # `gh`/`python3` child (its time is gone once it exits — see the measurement above). Written BEFORE the
+  # sleep so the first poll is already covered, and unconditionally (not only when the count changes),
+  # because an unchanged count is exactly the case the watchdog would read as silence.
+  if [ -n "$HB_F" ]; then
+    printf '[lane-merge] heartbeat %s: %s check(s) in flight at head %s (%ss left in this bound)\n' \
+      "$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date)" "${IF:-?}" "${HEAD:0:12}" \
+      "$(( deadline - $(date +%s) ))" >> "$HB_F" 2>/dev/null || {
+        say_err "lane-merge: the heartbeat target '$HB_F' became unwritable — progress is no longer visible to lane-bound.sh's ${IDLE_BOUND_S}s allowance; re-run with LANE_MERGE_HB pointing at the lane log."
+        HB_F=""
+        # ⛔ DETECTING THE LOSS IS NOT ACTING ON IT (review finding, P2 — verified). Clearing `HB_F`
+        # stops the heartbeats, but the deadline still held the FULL wait — so the loop went on waiting
+        # while visibly silent and was TERMed as `stalled` with no verdict: exactly the outcome the
+        # heartbeat exists to prevent, on a path this branch has just PROVEN it is on. The remaining
+        # wait is clamped to the watchdog's own allowance measured from NOW (silence starts the moment
+        # the last heartbeat landed) minus the same margin, which lands the labelled hand-off before the
+        # stall bound instead of after it.
+        if [ "$IDLE_BOUND_S" -gt 0 ]; then
+          _hb_left=$(( IDLE_BOUND_S - _hb_margin )); [ "$_hb_left" -ge 0 ] || _hb_left=0
+          [ "$deadline" -gt $(( now + _hb_left )) ] && deadline=$(( now + _hb_left ))
+        fi
+      }
   fi
   sleep "$INTERVAL"
 done
