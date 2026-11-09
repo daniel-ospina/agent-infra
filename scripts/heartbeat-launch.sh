@@ -55,7 +55,7 @@
 #   one line, in docs/ops/heartbeat-launch-path.md — the default is parity, and any difference is
 #   named rather than discovered.
 #
-# EXIT CODES: 0 ok · 1 refused/drift · 2 usage or cannot-answer
+# EXIT CODES: 0 ok (or an explicit --help) · 1 refused/drift · 2 usage ERROR or cannot-answer
 set -uo pipefail
 
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -86,12 +86,17 @@ _valid_max_age() {
 LOOP="$PI_AGENT_DIR/scripts/heartbeat-loop.sh"
 [ -f "$LOOP" ] || LOOP="$SELF_DIR/heartbeat-loop.sh"
 
-usage() {
-    local end
+usage() { # [exit-code] — 2 (usage ERROR) by default; `--help` asks for it, so it passes 0
+    local end rc="${1:-2}"
     end="$(grep -n '^set -uo pipefail' "$0" | head -1 | cut -d: -f1)"
     [ -n "${end:-}" ] && [ "$end" -gt 2 ] || end=60
     sed -n "2,$((end - 1))p" "$0" | sed 's/^# \{0,1\}//'
-    exit 2
+    # ⛔ THE EXIT CODE DISTINGUISHES "YOU ASKED" FROM "YOU GOT IT WRONG" (#1867 review P3, round 7).
+    # `--help` printed this whole header and then exited 2, which the legend below defines as a USAGE
+    # ERROR — so a caller probing for the launcher (`if heartbeat-launch.sh --help >/dev/null; then`)
+    # read a documented, working script as broken, and the two readers of one code disagreed about what
+    # had happened. An unknown verb still exits 2: that IS the error.
+    exit "$rc"
 }
 
 # ⛔ THE PRINT HELPER IS `note`, NEVER `say` (#2910, learned the hard way). macOS ships
@@ -599,7 +604,7 @@ case "${1:-}" in
     stop)   cmd_stop ;;
     status) cmd_status ;;
     check)  cmd_check ;;
-    -h|--help|help) usage ;;
+    -h|--help|help) usage 0 ;;
     "")     usage ;;
     *)      printf 'ERROR: unknown argument: %s\n' "$1" >&2; usage ;;
 esac

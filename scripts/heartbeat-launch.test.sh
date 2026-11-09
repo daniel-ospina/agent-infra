@@ -582,6 +582,19 @@ assert_contains "$OUT" "already running" "§16d …so start does not fork a SECO
 assert_eq "$RC" "0" "§16d …the idempotent path, rc=0"
 
 echo ""
+echo '── 17. the exit code distinguishes "you asked" from "you got it wrong" ──'
+
+# ⛔ `--help` PRINTED THE WHOLE HEADER AND THEN EXITED 2 (#1867 review P3, round 7), which the file's
+# own legend defines as a USAGE ERROR: a caller probing for the launcher (`if heartbeat-launch.sh
+# --help >/dev/null; then …`) read a documented, working script as broken. An unknown verb is still 2.
+OUT="$(env HEARTBEAT_PI_AGENT_DIR="$T/nowhere" bash "$LAUNCH" --help 2>&1)"; RC=$?
+assert_eq "$RC" "0" "§17 --help exits 0 (a usage REQUEST is not a usage error)"
+assert_contains "$OUT" "THE launch path for the fleet heartbeat" "§17 …and still prints the header"
+OUT="$(env HEARTBEAT_PI_AGENT_DIR="$T/nowhere" bash "$LAUNCH" frobnicate 2>&1)"; RC=$?
+assert_eq "$RC" "2" "§17 an unknown verb still exits 2 (the error case keeps its code)"
+assert_contains "$OUT" "unknown argument" "§17 …and says which argument it did not understand"
+
+echo ""
 if [ "$FAIL" -eq 0 ]; then
     echo "✅ heartbeat-launch suite passed ($PASS assertions)"
     exit 0
