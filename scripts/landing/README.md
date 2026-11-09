@@ -290,6 +290,12 @@ This is the part that gets misremembered, so it is stated exactly:
   for after a base-side fix: `rail-bg.sh start <pr>` (or `scripts/atomic-land.sh <pr>`). A run that
   stops early — e.g. at `read_record`, before the loop — reads none of them, so there is no base
   measurement in that log.
+
+  A capture that comes back **empty** is not read as a value on the first reply: `gh_read()` re-polls
+  it a bounded number of times (`ATOMIC_LAND_TRANSIENT_POLLS`, default 5) before the caller's
+  fail-closed test sees it, so a transient API failure settles while a genuinely unreadable base
+  still refuses. `atomic-land: could not read the base tip` therefore means *persistently*
+  unreadable, not *once*. See issue #1558.
 - **`gh run rerun <run-id>` re-executes one CI lane at the commit that run was created for.** Per
   GitHub's own documentation, a re-run "will also use the same `GITHUB_SHA` (commit SHA) and
   `GITHUB_REF` (git ref) of the original event that triggered the workflow run". So a re-run is the
