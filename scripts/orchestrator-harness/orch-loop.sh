@@ -80,7 +80,7 @@ for _w in fix-one.sh merge-one.sh stall-fix.sh dispatch-merge.sh; do
   [ -f "$ORC_WORK_ROOT/$_w" ] || _missing_w="$_missing_w $_w"
 done
 if [ -n "$_missing_w" ]; then
-  echo "orch-loop: FATAL the worker scripts are missing from BOTH the state dir ($O) and the directory beside this loop (${_HERE_RS:-<unresolved>}):$_missing_w — refusing to run a controller that would fill its queue and then fail every dispatch with 127. Fix: point O at a SEEDED runtime (bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o $O), or set ORC_STATE_DIR to keep state elsewhere while O stays the harness root." >&2
+  echo "orch-loop: FATAL the worker scripts are missing from BOTH the state dir ($O) and the directory beside this loop (${_HERE_RS:-<unresolved>}):$_missing_w — refusing to run a controller that would fill its queue and then fail every dispatch with 127. Fix: point O at a SEEDED runtime (bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o $O), or set ORC_STATE_DIR to keep the state elsewhere — the tree beside the loop is still where the workers AND their modules are resolved from (it is exported as O_WORK)." >&2
   mkdir -p "$O/logs" 2>/dev/null || true
   echo "[startup] FATAL worker scripts missing from $O and ${_HERE_RS:-?}:$_missing_w — the controller refuses to run" >> "$O/logs/orch-loop.log" 2>/dev/null || true
   exit 78
@@ -8752,7 +8752,11 @@ PY
       # INCOMPLETE is a fail-open that can duplicate a peer's work — so it stops the dispatch, names
       # the fix, and `refresh-candidates.sh --check` refuses the cell up front. Pre-flight and
       # dispatch now take the SAME polarity on the same condition.
-      if [ -f "$O/claims.sh" ] && declare -f claim_issue_acquire >/dev/null 2>&1; then
+      # ⛔ THE REGISTRY IS `_claims_home`, THE TWO-HOME RESOLUTION ABOVE (fresh-context review of #3846,
+      # P1). This arm tested `$O/claims.sh` while the sweep block loaded it from `$_claims_home`, so on a
+      # state-dir instance the registry was LOADED and this guard still said it was absent: the dispatch
+      # took no issue claim and fell to the "no registry" refusal with a remedy that cannot help.
+      if [ -n "${_claims_home:-}" ] && declare -f claim_issue_acquire >/dev/null 2>&1; then
         if claim_issue_acquire "" "$ISS"; then
           # The commit this box pushed, for the FENCED release. Written only on a successful acquire,
           # so a refusal can never leave a release path pointing at someone else's claim.
@@ -8787,10 +8791,10 @@ PY
           fi
           continue
         fi
-      elif [ -f "$O/claims.sh" ]; then
+      elif [ -n "${_claims_home:-}" ]; then
         # PRESENT BUT STALE — see the polarity note above. The box would have to dispatch unclaimed,
         # which is the fail-open this branch now refuses.
-        echo "[dispatch] #$ISS NOT dispatched — \$O/claims.sh predates the issue key (no claim_issue_acquire), so this box cannot take the claim; fix: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o ~/orchestrator" >> "$LOG"
+        echo "[dispatch] #$ISS NOT dispatched — \${_claims_home:-?}/claims.sh predates the issue key (no claim_issue_acquire), so this box cannot take the claim; fix: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o ~/orchestrator" >> "$LOG"
         continue
       else
         # ⛔ NO REGISTRY IS NOT FREEDOM, NOT EVEN FOR DISPATCH (agent-infra#2466). This arm used to
