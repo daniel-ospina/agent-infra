@@ -23,8 +23,10 @@ steps:
     # command — use that form (it is escape-regex-safe); do NOT run
     # `$PARALLEL_CHECK_BIN`/`env PARALLEL_CHECK_BIN=…` at the gate (not in the
     # escape allowlist); `.sh|.py` suffix required. Fail-closed gate; read /
-    # loop_enforcer are the in-session escape; operator force-pass via
-    # /tmp/parallel-check-force.json.
+    # loop_enforcer are the in-session escape, and so is the stale-branch
+    # remedy the verdict prescribes (git fetch, git rebase origin/main, git
+    # rebase --continue, git status, git diff, git add — #1418); operator
+    # force-pass via /tmp/parallel-check-force.json.
   - name: stage_and_commit
     type: skill
     gate: auto

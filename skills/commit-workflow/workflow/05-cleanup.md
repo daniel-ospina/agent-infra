@@ -8,6 +8,39 @@
 
 Runs on **both** auto-merge and staging paths — immediately after merge + migration deploy + verification (default path) or before emitting staging instructions (staging path). The worktree is no longer needed once the PR exists on the remote.
 
+⛔ **The one hard constraint: this step must never remove the directory YOUR session is standing
+in.** If the lane opened in its worktree — the normal case — that directory is the session's
+`process.cwd()`. Every `bash` tool call spawns a **fresh shell rooted there**, so the removal leaves
+the session with no working directory at all:
+
+```
+Working directory does not exist: /…/.worktrees/1145-lane
+Cannot execute bash commands.
+```
+
+From that point every command fails before it runs — including the merged-branch delete below and
+Steps 4-5 — so the session cannot even fix itself (#1895, measured 2026-10-16 on a DMeer lane).
+
+⛔ **`cd "$MAIN_REPO"` does NOT prevent this, and reads as if it does.** A `cd` inside a `bash` tool
+call moves only that one short-lived shell; the session's own cwd is unchanged, so removing the
+directory still orphans it. Judge the hazard from the **process table**, never from `$PWD`.
+
+`scripts/cleanup-worktree.sh` therefore refuses when a live process holds the target by cwd/exe
+(exit 3, naming the holder), and also when the process table cannot be read — a census that cannot
+run proves nothing about whether a session is standing in the tree. **Teardown is then DEFERRED, not
+lost**: `scripts/pi-reap-worktrees.sh` reclaims the directory once nothing holds it (its `--aged-days`
+floor, default 7, is the delay), which is the same #1105 "a live process holds it, so it is not yet
+garbage" rule the reapers already use.
+
+⛔ **What "not lost" does and does not promise.** A lane-rooted session now *always* takes the
+deferral path (the census sees its own session), so for the common case the teardown happens later —
+by the reaper, or by a fresh session that is not rooted in the tree. The reaper reclaims exactly the
+trees this step would have removed, because both sides use the **same** ignored-artifact allowlist
+(`IGNORED_REGENERABLE`, `scripts/pi-reap-worktrees.sh:810`). A worktree carrying anything that list
+does not cover (`.env`, `data/`, a nested `dist/`) is refused here AND preserved by the reaper: it
+stays for an operator. That is the safe direction, and it is why the deferral is not a licence to
+leave dirt behind.
+
 ```bash
 # Detect if running in a worktree
 TOPLEVEL=$(git rev-parse --show-toplevel)
@@ -16,14 +49,43 @@ GIT_COMMON=$(git rev-parse --git-common-dir)
 if [ "$GIT_COMMON" != ".git" ] && [ "$GIT_COMMON" != "$TOPLEVEL/.git" ]; then
   BRANCH=$(git branch --show-current)
   MAIN_REPO=$(cd "$GIT_COMMON/.." && pwd)
-  cd "$MAIN_REPO"
-  bash scripts/cleanup-worktree.sh "$BRANCH"
-  git pull
+  # Run it from a surviving cwd. This changes only THIS shell — if the session is rooted in
+  # $TOPLEVEL, the script refuses (exit 3) and teardown defers to the reaper. That refusal is the
+  # expected outcome for a lane that opened in its worktree, not a failure to work around.
+  ( cd "$MAIN_REPO" && bash scripts/cleanup-worktree.sh "$BRANCH" )
+  # Best-effort refresh of the main checkout (WARN, never a ceremony failure): a shared hub may
+  # refuse the pull outright — see Step 4 for why hub writes are the exception, not the rule.
+  ( cd "$MAIN_REPO" && git pull --ff-only ) || echo "ℹ️ main checkout not fast-forwarded"
 fi
 ```
 
+Run it from a session that is **not** rooted in the worktree (the hub, or another lane's checkout) →
+the ordinary teardown. Run it from the worktree's own session → a named refusal and a deferred
+teardown.
+
 If cleanup fails: warn and continue. Never block Steps 4-5 or staging instructions.
 If not in a worktree: skip silently.
+
+### `--force` is the dirty guard's signal, not a habit (#1895)
+
+`cleanup-worktree.sh` refuses on a dirty worktree **including ignored files** (`git worktree remove`
+does not refuse on those, so an ignored-only `.env` would otherwise be silently destroyed). A repo
+whose worktree convention *requires* a real dependency tree (a hardlinked `node_modules/`, DMeer
+#878) is refused on its **expected** state, so passing `--force` every time would erode the flag
+exactly where it matters.
+
+So ignored-only dirt gets a **closed** allowance: when every ignored entry is a regenerable artifact
+**name** — the fleet's own `IGNORED_REGENERABLE` list (`scripts/pi-reap-worktrees.sh:810`: tool-scoped
+dependency trees and caches, `node_modules`, `.venv`, `__pycache__`, `htmlcov`, `*.egg-info`, …,
+matched on the basename) — the removal proceeds without `--force` and says what it is destroying. Any
+tracked or untracked change, and any ignored file outside that list (`.env`, `data/`, and the
+*generic* names `dist/`, `build/`, `target/`, `.next/`, `.cache`, `coverage`, `output`, which are
+operator data in a nested position), still refuses unless `--force`.
+
+⛔ **Do not widen that list here.** It is a recorded fleet decision with a measurement behind it
+(the 2026-10-11 sweep: 49 of 261 live worktrees carried a non-regenerable entry, `website/apps/
+dashboard/dist/` named). Widening it is a **reopen** of the `pi-reap-worktrees.sh` decision, argued in
+its own home — never a side effect of a teardown script.
 
 ### Merged-branch cleanup (post-merge, #193)
 
@@ -32,6 +94,13 @@ worktree). The merged PR branch must be deleted **regardless of worktree state**
 leave the branch for `gh pr merge --delete-branch` to clean up (that flag hard-fails when
 the default branch is worktree-locked; the merge ceremony in 04-merge-deploy.md already
 handled deletion separately).
+
+⛔ **A deferral here is the expected state, not a fault.** When the worktree is still there — the
+teardown was refused because the session stands in it (#1895, above), or the removal failed — the
+**remote** delete still runs (it is server-side and unaffected), and the **local** branch delete
+defers with the note below. The reaper removes the worktree once nothing holds it; `git branch -D`
+becomes possible then. Do not `--force` the worktree out from under a live session to make this line
+clean.
 
 ```bash
 # BRANCH = the merged PR branch — resolve via gh FIRST. Deriving from the current
