@@ -658,6 +658,35 @@ const ROWS = [
     "bash <<<\\\n'npm exec electron .'", 1, "electron", true],
   ["A74 the ALLOW twin: a continuation in a COMMENT starts a new command, it does not\n    join one (bash RUNS the next line, so the launch there is still read)",
     "# note \\\nelectron .", 1, "electron", true],
+  // ── L54–L56 (round-12 review, tenth pass) — the three gaps the ninth pass left:
+  //     a continuation INSIDE a quoted heredoc body, a `#` glued to `;`/`)`, and
+  //     `watch`'s operand behind another prefix.
+  //   L54: the join ran over the WHOLE command, so a trailing backslash on the last
+  //        body line of a QUOTED heredoc ate the terminator and turned every following
+  //        command — including a launch — into body data. bash terminates at `EOF`
+  //        and runs the next line (measured). The join is now per line INSIDE the
+  //        scanner, so bodies are never joined.
+  ["L54a a trailing backslash in a QUOTED heredoc body does not eat the terminator (was [])",
+    "cat > /tmp/o.txt <<'EOF'\nx \\\nEOF\nnpm exec electron .", 1, "electron", true],
+  ["L54b …the `<<\"EOF\"` spelling too (was [])",
+    'cat > /tmp/o.txt <<"EOF"\nx \\\nEOF\nnpm exec electron .', 1, "electron", true],
+  //   L55: the joiner carried its own, narrower comment rule ("previous char is a
+  //        blank"), so a `#` glued to `;`/`)` was not a comment and the launch on the
+  //        next line was joined INTO it. bash runs that line (measured).
+  ["L55a `#` glued to `;` starts a comment — the launch after it still runs (was [])",
+    "true;# note \\\nnpm exec electron .", 1, "electron", true],
+  ["L55b …and glued to `)` (was [])",
+    "(true)# note \\\nnpm exec electron .", 1, "electron", true],
+  //   L56: `watch`'s operand was read from TOKEN 0, so any listed prefix in front of
+  //        it lost the `sh -c` script while the unprefixed twin fired.
+  ["L56a `watch`'s operand is read behind ANOTHER prefix (`timeout … watch`) (was [])",
+    'timeout 30 watch -n 1 "npm exec electron ."', 1, "electron", true],
+  ["L56b …behind `sudo` (was [])",
+    'sudo watch -n 1 "npm exec electron ."', 1, "electron", true],
+  ["L56c …behind `env` (was [])",
+    'env FOO=1 watch -n 1 "npm exec electron ."', 1, "electron", true],
+  ["A76 the ALLOW twin: a prefixed `watch` with a benign operand stays clean",
+    "timeout 30 watch -n 1 ls", 0, null, false],
   //   L30c: tab completion appends a slash to directories, and `open
   //         ./Build/DMeer.app/` — the incident's own app — matched none of the three
   //         bundle tests while the `-a` spelling of the SAME token was refused.

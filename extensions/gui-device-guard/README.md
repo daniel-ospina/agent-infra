@@ -324,13 +324,14 @@ This is a residual list, not a completeness claim:
   A73). The same strip is applied where the heredoc predicate reads its segment, so a
   leading redirect cannot hide the SHELL that consumes the body either
   (`2>/dev/null bash <<'EOF'` — L52a/L52b).
-- A LINE CONTINUATION is joined BEFORE the heredoc scan, because the operator can sit
-  on the continued line: `bash \` + newline + `<<'EOF'` and `bash <<<\` + newline +
-  `'electron .'` both hand a body to `bash` (measured), and the scan used to see only
-  the raw line — the body was blanked as data, losing block AND row (L53a/L53b). A
-  continuation at the end of a COMMENT is still not a continuation, which is why the
-  join tracks the comment state itself (`# note \` + newline + a launch RUNS the
-  launch — A74).
+- A LINE CONTINUATION is joined per line INSIDE the heredoc scanner, so the operator can
+  sit on the continued line (`bash \` + newline + `<<'EOF'`, `bash <<<\` + newline +
+  `'electron .'` — both hand a body to `bash`, L53a/L53b) while a BODY is never joined:
+  a trailing `\` on the last body line of a QUOTED heredoc used to eat the terminator
+  and swallow every command after it (L54a/L54b). A continuation at the end of a
+  COMMENT is not a continuation — `# note \` + newline + a launch RUNS the launch
+  (A74) — and the comment predicate is bash's own set (a `#` glued to `;` or `)` starts
+  one too: L55a/L55b), shared with `commentCutIndex`'s rule.
 - A LINE CONTINUATION (`\` + newline) is NOT a command separator: bash deletes it
   before word splitting, so
   `npm exec electron . \` + `--use-fake-device-for-media-stream --use-fake-ui-for-media-stream`
@@ -358,7 +359,9 @@ This is a residual list, not a completeness claim:
 - A wrapper **in** the list whose bare OPERAND is a `sh -c` script is re-read:
   `watch -n 1 "electron ."` was `[]` (no block, no row) while the UNQUOTED spelling
   fired, although `watch --help` states the default is `sh -c` and a real run
-  executes the operand (`round 12`, row L45a, allow twin A68).
+  executes the operand (`round 12`, row L45a, allow twin A68) — and the wrapper is
+  looked for at ANY position, so `timeout 30 watch …`, `sudo watch …` and
+  `env FOO=1 watch …` are read too (L56a–L56c, allow twin A76).
 - A wrapper **in** the list takes its own leading POSITIONAL before the command
   (`flock FILE CMD`, `taskset MASK CMD`, `chrt PRIORITY CMD`, `script FILE CMD`,
   `chroot ROOT CMD`),
@@ -394,6 +397,11 @@ This is a residual list, not a completeness claim:
   from a command boundary once metacharacters are stripped, so `case x in x) electron
   .;; esac` can read as a miss. (`until`/`while`/`if`/`select` bodies ARE read — they
   have no per-branch pattern grammar.)
+- **Over-fire, declared**: an UNQUOTED heredoc body whose last line ends with `\`
+  swallows the terminator in bash (so the following line is BODY, not a command), while
+  the guard still reads it as a command and may refuse it. Modeling that needs the
+  body-expansion rules of an unquoted heredoc; the direction is over-fire, which is
+  waivable, unlike a miss.
 - A launch built from a shell variable (`APP=Electron; open -a "$APP"`) is
   recorded with the unexpanded name — the shape is kept, the string is not. The
   same limit reaches a heredoc DELIMITER built from a variable (`cat <<$X`), because
@@ -412,7 +420,7 @@ This is a residual list, not a completeness claim:
 ## Tests
 
 ```bash
-node extensions/gui-device-guard/test.mjs                    # 306 assertions, threat table L1–L53 + handler H1–H15
+node extensions/gui-device-guard/test.mjs                    # 314 assertions, threat table L1–L56 + handler H1–H15
 node extensions/gui-device-guard/test.mjs --classify 'npm exec electron .'
 ```
 
@@ -423,8 +431,8 @@ stays green while `index.ts` is broken and the guard is inert in every session.
 Mutations are pinned, each attributable to the row it is about, all measured at
 ONE head (**this** head — re-measured, not carried over: the counts are the output
 of running the mutant against `test.mjs`, and the assertion total is
-`306 = 235 ROWS + 14 APP_ROWS + 57 explicit \`check()\` calls`): the Electron
-rule's `media` → `false` reds **130**; the wrapper recursion
+`314 = 243 ROWS + 14 APP_ROWS + 57 explicit \`check()\` calls`): the Electron
+rule's `media` → `false` reds **137**; the wrapper recursion
 removed reds **8**; the wrapper WORDS removed reds **2**; the structural rule that
 reads a package-runner anywhere in the segment removed reds **2** (L19h/L19i); the
 comment stripper removed reds **2** (L11d and L11f — re-measured at this head; the
@@ -498,9 +506,11 @@ leading redirect became the command word, and a redirect glued to `--headed` or 
 fake switches hid them); splitting on the `&` of `2>&1` reds **1** (L50c); NOT stripping redirects in
 `lineFeedsShell` reds **3** (L35a, L52a, L52b — the redirect became the shell's
 command word, so a body the shell runs was blanked as data); joining continuations
-AFTER the heredoc scan reds **5** (L48b, L48c, L48a1, L53a, L53b); and ignoring the
-comment state while joining reds **1** (A74 — `# note \` + newline + a launch RUNS
-the launch); dropping `electron-forge` from the electron head test reds **5**
+AFTER the heredoc scan reds **5** (L48b, L48c, L48a1, L53a, L53b); joining over the WHOLE
+command again (instead of per line inside the scanner) reds **2** (L54a/L54b — a
+trailing `\` in a QUOTED body ate the terminator); disabling the scanner's per-line
+join reds **2** (L53a/L53b); and reading `watch`'s operand from token 0 again reds **3**
+(L56a–L56c); dropping `electron-forge` from the electron head test reds **5**
 (L31a–L31e); removing the PROCESS-substitution arm (`<( … )` / `>( … )`, the
 round-12 review's second P2) reds **3** (L32a–L32c, and A55 stays green because the
 double-quoted spelling never was a substitution); dropping the inner-binary term from

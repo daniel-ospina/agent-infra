@@ -870,6 +870,57 @@ function heredocDelimiter(raw: string): string | null {
   return out === "" ? null : out;
 }
 
+/**
+ * Does an unquoted `#` at `i` BEGIN A COMMENT? bash's rule: start of line/input, after
+ * a blank, or after an unquoted, unescaped METACHARACTER (`;&|()<>`).
+ *
+ * ONE copy, used by both continuation joiners — the tenth-pass review caught the
+ * joiner carrying its own narrower rule ("previous char is a blank"), so `true;# note
+ * \` + newline + a launch joined the launch INTO the comment and lost it while the
+ * spaced twin fired.
+ */
+function isCommentStart(text: string, i: number): boolean {
+  if (text[i] !== "#") return false;
+  if (i === 0) return true;
+  const prev = text[i - 1];
+  if (!(/\s/.test(prev) || WORD_BOUNDARY.includes(prev))) return false;
+  return text[i - 2] !== "\\";
+}
+
+/**
+ * If `line` ends with an unquoted, uncommented line continuation, the text with the
+ * next line appended; otherwise null.
+ *
+ * The heredoc scanner joins continuations line by line (see `splitShellStdin`) so a
+ * BODY is never joined; this predicate shares `joinLineContinuations`' rules for
+ * quotes and comments.
+ */
+function joinContinuedLine(line: string, next: string): string | null {
+  let comment = false;
+  let sq = false;
+  let dq = false;
+  let contAt = -1;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (comment) continue;
+    if (!sq && !dq && isCommentStart(line, i)) {
+      comment = true;
+      continue;
+    }
+    if (!dq && ch === "'") {
+      sq = !sq;
+      continue;
+    }
+    if (!sq && ch === '"') {
+      dq = !dq;
+      continue;
+    }
+    if (!sq && ch === "\\" && i === line.length - 1) contAt = i;
+  }
+  if (contAt < 0 || comment) return null;
+  return line.slice(0, contAt) + next;
+}
+
 export function splitShellStdin(command: string): ShellStdin {
 
   if (!command.includes("<<")) return { cleaned: command, programs: [] };
@@ -885,7 +936,24 @@ export function splitShellStdin(command: string): ShellStdin {
   const out: string[] = [];
   const programs: string[] = [];
   for (let li = 0; li < lines.length; li++) {
-    const line = lines[li];
+    // A LINE CONTINUATION IS JOINED HERE, NOT OVER THE WHOLE COMMAND (round-12
+    // review, tenth pass). Joining globally before the scan also joined the BODY of a
+    // QUOTED heredoc, so one trailing backslash in the body ate the terminator and
+    // turned every following command -- including a launch -- into data:
+    //     cat > f <<'EOF'   /   body: x backslash   /   EOF   /   npm exec electron .
+    // bash runs the npm line (measured); the guard returned []. Bodies are consumed by
+    // the loop below and never reach this join, which is exactly the distinction bash
+    // makes for a quoted delimiter (a body is literal).
+    let line = lines[li];
+    let lastLine = li;
+    for (;;) {
+      const next = lastLine + 1;
+      if (next >= lines.length) break;
+      const joinedLine = joinContinuedLine(line, lines[next]);
+      if (joinedLine === null) break;
+      line = joinedLine;
+      lastLine = next;
+    }
     out.push(line);
     const base = starts[li];
     const cut = commentCutIndex(line, base, mask);
@@ -924,7 +992,7 @@ export function splitShellStdin(command: string): ShellStdin {
     // inside it lost BOTH the refusal and the ledger row (measured: that line
     // prints A's body, then B's). Each operator consumes its own body, in
     // appearance order, exactly as the shell does.
-    let j = li + 1;
+    let j = lastLine + 1;
     for (const p of pending) {
       const body: string[] = [];
       while (j < lines.length && lines[j].replace(/^\t+/, "") !== p.word) {
@@ -1720,7 +1788,8 @@ function joinLineContinuations(text: string): string {
       out += ch;
       continue;
     }
-    if (!sq && !dq && ch === "#" && (i === 0 || /\s/.test(text[i - 1]))) {
+    // The shared predicate (see `isCommentStart`) — one comment rule in this file.
+    if (!sq && !dq && isCommentStart(text, i)) {
       comment = true;
       out += ch;
       continue;
@@ -1757,6 +1826,32 @@ function joinLineContinuations(text: string): string {
   return out;
 }
 
+/**
+ * The `sh -c` script a COMMAND-OPERAND wrapper runs (`watch -n 1 "<cmd>"`), or null.
+ *
+ * AT ANY POSITION, NOT ONLY TOKEN 0 (round-12 review, tenth pass): the read was
+ * `toks[0]`, so any listed prefix in front of the wrapper lost the operand --
+ * `timeout 30 watch -n 1 "npm exec electron ."`, `sudo watch ...`, `env FOO=1 watch
+ * ...` were all `[]` while the unprefixed twin fired and `sudo flock -c "..."` fired
+ * (that path already looks at any position). bash runs the operand in every one of
+ * those spellings (measured with stubs on PATH).
+ */
+function commandOperandBody(toks: string[]): string | null {
+  for (let i = 0; i < toks.length; i++) {
+    const head = basename(toks[i]);
+    if (!PREFIX_COMMAND_OPERAND.has(head)) continue;
+    const flags = PREFIX_VALUE_FLAGS[head] ?? [];
+    let k = i + 1;
+    while (k < toks.length && toks[k].startsWith("-")) {
+      if (toks[k].includes("=")) k += 1;
+      else if (flags.includes(toks[k])) k += 2;
+      else k += 1;
+    }
+    if (k < toks.length) return toks.slice(k).join(" ");
+  }
+  return null;
+}
+
 export function classifyLaunchCommand(command: string, depth = 0): LaunchFinding[] {
   const findings: LaunchFinding[] = [];
   // ⛔ A SHELL FED BY A HEREDOC / HERE-STRING RUNS ITS STDIN AS A PROGRAM (round 11,
@@ -1768,11 +1863,14 @@ export function classifyLaunchCommand(command: string, depth = 0): LaunchFinding
   // operator on a line whose only token was `<<EOF` — no shell, body blanked as data
   // — and `bash <<<\` + newline + `'electron .'` matched the BACKSLASH as the
   // here-string operand. bash joins first (measured: both spellings run the body).
-  const joined = joinLineContinuations(command);
-  const heredocs = splitShellStdin(joined);
+  // The scanner joins continuations ITSELF, per line, so a heredoc BODY is never
+  // joined (see `splitShellStdin`); this pass covers the no-heredoc path and any
+  // continuation the scanner left (body lines are already blanked to "", so it cannot
+  // reintroduce the quoted-body bug).
+  const heredocs = splitShellStdin(command);
   // Comments are removed BEFORE tokens are read, so a comment can never satisfy
   // the fake-capture mitigation (review cycle 2, F2).
-  const body = stripComments(heredocs.cleaned);
+  const body = joinLineContinuations(stripComments(heredocs.cleaned));
 
   // ⛔ A `PWDEBUG` EXPORTED IN AN EARLIER SEGMENT STILL APPLIES (review cycle 1,
   // F2: `export PWDEBUG=1; npx playwright test` used to classify as `[]` because
@@ -1895,9 +1993,7 @@ export function classifyLaunchCommand(command: string, depth = 0): LaunchFinding
       // ⛔ `watch … "<cmd>"` / `watch … <cmd> …` — the operand IS a `sh -c` script
       // (see PREFIX_COMMAND_OPERAND). Read from the resolved command word so a flag
       // that consumed a value cannot leave a `--flag` token where the script begins.
-      const operandBody = PREFIX_COMMAND_OPERAND.has(basename(toks[0] ?? ""))
-        ? toks.slice(Math.max(cwi, 1)).join(" ")
-        : null;
+      const operandBody = commandOperandBody(toks);
       const nested = shellBody ?? evalBody ?? operandBody;
       if (nested !== null && nested !== "") {
         findings.push(...classifyLaunchCommand(nested, depth + 1));
