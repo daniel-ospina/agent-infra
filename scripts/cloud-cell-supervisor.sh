@@ -515,6 +515,14 @@ resolve_repo() {
 
 # ONE actionable line, on the verbs that cannot work without a checkout. `status` deliberately does
 # not call it: it is the verb an operator runs to DISCOVER this, so it must still answer.
+# ⛔ $1 IS THE ASKING VERB, AND ONLY `stop` NEEDS IT (review P3, #2093). Every other verb declines to
+# START something, so its refusal is the whole story; `stop` declined to END something, and an
+# operator reading that must be told nothing was stopped and how to stop anyway. This leg was the ONE
+# queue-unusable path that reached `die` without the suffix — so on a cell whose `keys.env` is missing
+# (a plausible reason to be stopping it) the new pre-flight refused with no way past it.
+# ⛔ AND IT PASSES `nofix`: this `die` fires BEFORE any ONE-LINE FIX exists, so the generic tail's
+# "repair the pair with the fix above" would send the operator hunting for a line that was never
+# printed. One tail, one `--force` escape, two repair clauses.
 assert_repo() { # [$1 = the asking verb, so a `stop` refusal carries its own tail]
   local verb="${1:-}"
   if ! resolve_repo; then
@@ -1696,11 +1704,6 @@ assert_queue_target() {
   # ⛔ REPO first: with no checkout, every QUEUE_STATE below is a SYMPTOM, and the old message read
   # `cannot read the QUEUE … 'git -C  remote get-url origin' returned no URL` — an error about an
   # empty path. The cause is the missing checkout, so name it.
-  # ⛔ AND THE ASKING VERB GOES WITH IT (review P3). This leg dies INSIDE assert_repo(), which is why it
-  # used to be the one unusable state whose refusal carried no `stop` tail — so an operator on a cell
-  # whose keys.env is missing (a plausible reason to be stopping it) learned nothing about `--force`, on
-  # the one verb whose default is destructive and which cannot be redone. Every other state gets the
-  # suffix below; this one now does too.
   [ -n "$REPO" ] || assert_repo "$verb"
   case "$QUEUE_STATE" in
     derived|explicit) return 0 ;;
@@ -1718,12 +1721,13 @@ assert_queue_target() {
   # IDENTICAL refusal, which is the dead end this whole string exists to avoid. The prefix is therefore
   # optional in exactly the forms this repo already accepts for "the env file carries KEY": this file's
   # own `sup_env_file_carries` reads `^[[:space:]]*(export[[:space:]]+)?KEY[[:space:]]*=`, so the repair
-  # now covers what the reader reads (the #1745 two-authorities class, in the repair path).
+  # now covers what the reader reads (the #1745 two-authorities class, in the repair path), plus the
+  # `declare -x` form the WRITER emits.
   # ⛔ The value may also arrive as an AMBIENT export rather than a line in $ENV_FILE (both reach this
   # shell: $ENV_FILE is sourced, and an ambient export is inherited). The message names that case too,
   # because the `sed` cannot touch it and would otherwise send the operator straight back to the same
   # refusal with no new information.
-  local onefix="ONE-LINE FIX: let the queue follow the checkout — sed -i -E '/^[[:space:]]*(export[[:space:]]+|declare[[:space:]]+-x[[:space:]]+)?OR[[:space:]]*=/d' '$ENV_FILE' (that form covers a plain, an 'export OR=' and a 'declare -x OR=' line; if OR is exported by your shell rather than written in the file, drop that export) — after which the queue derives from the checkout and targets '$QUEUE_DERIVED'; to point the cell at '$QUEUE_DECLARED' instead, $needs"
+  local onefix="ONE-LINE FIX: let the queue follow the checkout — sed -i -E '/^[[:space:]]*(export[[:space:]]+|declare[[:space:]]+-x[[:space:]]+)?OR[[:space:]]*=/d' '$ENV_FILE' (this matches the column-0, indented, 'export OR=' and 'declare -x OR=' shapes alike; drop an ambient OR export yourself if that is where yours is set) — after which the queue derives from the checkout and targets '$QUEUE_DERIVED'; to point the cell at '$QUEUE_DECLARED' instead, $needs"
   case "$QUEUE_STATE" in
     mismatch)
       die "the QUEUE and the CHECKOUT name DIFFERENT repos — this box is MERGE-INERT: the queue targets '$QUEUE_DECLARED' (OR) but $REPO is a checkout of '$QUEUE_DERIVED' (origin $QUEUE_REMOTE). A controller on this pair dispatches $QUEUE_DECLARED PRs from a $QUEUE_DERIVED tree: its candidate pre-flight cannot run there, every candidate comes back unqueryable, and every '$QUEUE_DECLARED' merge looks for that repo's merge rail inside a '$QUEUE_DERIVED' checkout and refuses — so the queue never advances while every other observable reads green (agent-infra#1901, #1764). $onefix.${verb:+ $(queue_refusal_suffix "$verb")}"
