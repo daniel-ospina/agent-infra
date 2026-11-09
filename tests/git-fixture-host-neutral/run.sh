@@ -47,8 +47,9 @@
 #
 # WHY A BASH SHARD AND NOT A WORKFLOW STEP — `ci.yml`, `node-ci.yml` and `ci-main.yml` are
 #   BYTE-LOCKED (`scripts/check-workflow-lock.mjs` LOCKED_FILES): wiring a step there re-cuts the
-#   last-writer-wins `scripts/workflow-lock.json`, which conflicts with every concurrent workflow
-#   PR, and a `ci-main.yml` line runs on the push lane only — after the merge that reddens main
+#   lock entry for that job, which contends with every concurrent PR that touches the same region
+#   (#1955 scoped that contention to the job — it used to be the whole file), and a `ci-main.yml`
+#   line runs on the push lane only — after the merge that reddens main
 #   (and, since #3131, on a pre-merge `integration/**` batch, where the same red blocks the batch).
 #   This file is in `scripts/run-bash-shards.sh`, the single shard list BOTH lanes execute
 #   (#1369), so the assertion runs on the PR and after it. One run site, no locked-file edit.
