@@ -1,0 +1,42 @@
+{
+  "_ref": "refs/lanes/cmux.klane-1852-1794188285-p3463827-b2d19ff2",
+  "_sha": "58ca1461fd9fdc1d64ba33db7494c8cfe507fb27",
+  "artifacts": [
+    {
+      "kind": "log",
+      "value": "/home/cmux/orchestrator/logs/lane-1852.log"
+    },
+    {
+      "kind": "branch",
+      "value": "feat/1852-tm"
+    },
+    {
+      "kind": "sha",
+      "value": "bf0bc8e09911be838c873487baf1fc56c1796f92"
+    },
+    {
+      "kind": "worktree",
+      "value": "/home/cmux/agent-infra/.worktrees/tm-1852"
+    }
+  ],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 7800,
+  "duration_s": 7221,
+  "ended_at": 1794195506,
+  "exit_code": 143,
+  "heartbeat_at": 1794195506,
+  "host": "cmux",
+  "issue": 1852,
+  "kind": "lane",
+  "lane_id": "cmux.klane-1852-1794188285-p3463827-b2d19ff2",
+  "lease_until": 1794203306,
+  "pid": 3463827,
+  "reason": "bound:exceeded-wallclock",
+  "repo": "daniel-ospina/agent-infra",
+  "schema": 1,
+  "started_at": 1794188285,
+  "state": "FAILED",
+  "tag": "1852",
+  "worktree": "/home/cmux/agent-infra/.worktrees/tm-1852"
+}
