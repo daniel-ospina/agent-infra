@@ -52,7 +52,8 @@
 #  16. ⭐ AN ARGV WE READ BUT COULD NOT ATTRIBUTE IS CANNOT-TELL (fresh review of PR #3837 at 185e7c5bd,
 #      P2): a controller started with a shell OPTION (`bash -x …/orch-loop.sh`) is neither the canonical
 #      shape nor provably a non-controller, so it must refuse rather than be reclaimed out from under a
-#      live owner. `-c` wrappers stay RECLAIMED — #1856 decided they are not controllers, and 4c pins it.
+#      live owner. BOTH option polarities count (§16c: `bash +o errexit …`), and `-c` wrappers stay
+#      RECLAIMED — #1856 decided they are not controllers (4c, §17).
 #
 # ⛔ THE SUBJECT IS THE REAL `orch-loop.sh`, NOT A RE-IMPLEMENTATION. The lock block lives in a marked
 # section (`# [orchlock:begin] … # [orchlock:end]`), which this suite EXTRACTS with `sed` and runs as
@@ -229,13 +230,16 @@ spawn_loop() {
   bash "$1/orch-loop.sh" >/dev/null 2>&1 &
   printf '%s\n' "$!"
 }
-spawn_loop_flagged() {
-  # The SAME stub, launched through a shell OPTION (`bash -x`), so `_orch_argv_is_loop`'s two-token rule
-  # cannot attribute it. This is the shape §16 turns on: a controller we could not PARSE, which is
-  # neither an owner we can confirm nor a non-controller we have proved.
-  printf '#!/bin/bash\ntrap "exit 0" TERM INT\nfor _ in $(seq 1 60); do sleep 1; done\n' > "$1/orch-loop.sh"
-  chmod +x "$1/orch-loop.sh"
-  bash -x "$1/orch-loop.sh" >/dev/null 2>&1 &
+spawn_loop_flagged() { # <dir> [shell-option…] — default `-x`; prints the pid
+  # The SAME stub, launched through a shell OPTION (`bash -x`, `bash +o errexit`, …), so
+  # `_orch_argv_is_loop`'s two-token rule cannot attribute it. This is the shape §16 turns on: a
+  # controller we could not PARSE, which is neither an owner we can confirm nor a non-controller we
+  # have proved.
+  local _d="$1"; shift
+  [ "$#" -gt 0 ] || set -- -x
+  printf '#!/bin/bash\ntrap "exit 0" TERM INT\nfor _ in $(seq 1 60); do sleep 1; done\n' > "$_d/orch-loop.sh"
+  chmod +x "$_d/orch-loop.sh"
+  bash "$@" "$_d/orch-loop.sh" >/dev/null 2>&1 &
   printf '%s\n' "$!"
 }
 spawn_sleep() {
@@ -332,12 +336,17 @@ kill -9 "$SP" 2>/dev/null
 # mutation reader trusts. A fresh lock, so only the shape can decide.
 echo "── 4c. an argv that merely MENTIONS orch-loop.sh is not an owner (#1856)"
 mkcase; CASE_DIR="$C"
-bash -c "sleep 300; $C/peer/orch-loop.sh" >/dev/null 2>&1 &
+# ⛔ THE SLEEP IS BOUNDED AND THE CHILDREN ARE REAPED WITH THE WRAPPER (fresh review at 8eb852d27, P3).
+# `kill -9 $MP` kills the `bash -c` WRAPPER only, so an unbounded `sleep 300` inside the command string
+# is reparented and outlives the suite by minutes — the same fixture-leak class `spawn_loop` now bounds
+# itself for. The bounded form keeps the single-token argv this arm depends on.
+bash -c "for _ in \$(seq 1 60); do sleep 1; done; $C/peer/orch-loop.sh" >/dev/null 2>&1 &
 MP=$!; KIDS="$KIDS $MP"; sleep 0.4
 printf '%s\n' "$MP" > "$C/o/.orch.lock"
 run_drv O="$C/o"
 ck "4c: a process that only MENTIONS the script does not own the lock (it starts and runs)" \
    "$(ran && [ "$RC" -eq 0 ] && echo 0 || echo 1)"
+pkill -P "$MP" 2>/dev/null
 kill -9 "$MP" 2>/dev/null
 
 # ── 5) ⭐ a PEER controller that began AFTER the lock → reclaim (shape cannot discriminate) ──────
@@ -795,6 +804,59 @@ run_drv O="$C/o"
 ck "16b: the same OPTION form over a NON-loop script is still RECLAIMED (§16 is not a blanket refusal)" \
    "$(ran && [ "$RC" -eq 0 ] && echo 0 || echo 1)"
 kill -9 "$XP" 2>/dev/null
+
+# ── 16c) THE `+` POLARITY IS AN OPTION TOO (fresh review at 8eb852d27, P2) ──────────────────────
+# `bash` accepts the `+` form of every `set`-style option, and this repo already uses
+# `bash +o errexit <…>/orch-loop.sh` for a REAL invocation (`check-deployed-drift.sh`). A `-`-only option
+# test answered rc 1 = RECLAIM for that argv, so the next start DELETED the lock of a live owner — a
+# fail-OPEN regression versus `main`, which refused any live pid. MEASURED before the fix, same fixture:
+# `STARTED` + `[lock] reclaiming … provably NOT the owner` with the owner still alive.
+# ⛔ AND NO BACKTICKS IN A DOUBLE-QUOTED LABEL (found by this round's test run, P2; MEASURED: the labels
+# printed with a HOLE — "a live owner behind  is not reclaimed" — and the option words were EXECUTED at
+# label-construction time, because a backtick pair inside a double-quoted string IS a command
+# substitution. Every label below therefore quotes the option form with SINGLE quotes, or spells it out.
+# This is the same hazard the fleet's commit-message rule names; a label is not a safe place for one.
+echo "── 16c. a '+'-form option in front of the script REFUSES too (both polarities are options)"
+mkcase; CASE_DIR="$C"
+PL="$(spawn_loop_flagged "$C/peer" +o errexit)"; KIDS="$KIDS $PL"; sleep 0.4
+printf '%s\n' "$PL" > "$C/o/.orch.lock"
+run_drv O="$C/o"
+ck "16c: a live owner behind 'bash +o errexit …' is not reclaimed (it refuses instead)" \
+   "$(ran && echo 1 || echo 0)"
+ck "16c: …the refusal says CANNOT-TELL and the owner's lock is UNTOUCHED" \
+   "$(want "$ERR" "CANNOT-TELL" && [ "$(lock_pid "$C/o/.orch.lock")" = "$PL" ] && echo 0 || echo 1)"
+ck "16c: …and the owner is still ALIVE (a reclaim here is two controllers on one queue)" \
+   "$(kill -0 "$PL" 2>/dev/null && echo 0 || echo 1)"
+kill -9 "$PL" 2>/dev/null
+# and the `+`-form positive control, so accepting `+` cannot become a blanket refusal
+mkcase; CASE_DIR="$C"
+printf '#!/bin/bash\nfor _ in $(seq 1 60); do sleep 1; done\n' > "$C/peer/notalock.sh"
+chmod +x "$C/peer/notalock.sh"
+bash +o errexit "$C/peer/notalock.sh" >/dev/null 2>&1 &
+YP=$!; KIDS="$KIDS $YP"; sleep 0.4
+printf '%s\n' "$YP" > "$C/o/.orch.lock"
+run_drv O="$C/o"
+ck "16d: the same '+'-form option over a NON-loop script is still RECLAIMED (§16c is not a blanket refusal)" \
+   "$(ran && [ "$RC" -eq 0 ] && echo 0 || echo 1)"
+kill -9 "$YP" 2>/dev/null
+
+# ── 17) A `-c` WRAPPER STAYS RECLAIMED EVEN WITH AN OPTION IN FRONT OF IT (#1856, made ORDERED) ───
+# The `-c` exemption used to fire only when `-c` was argv[2], so the SAME command string answered two
+# OPPOSITE ways once an `-x` was added: `bash -c "…; /abs/orch-loop.sh"` reclaimed (4c) while
+# `bash -x -c "…; /abs/orch-loop.sh"` refused as ambiguous — although #1856's evidence (a `-c` token,
+# i.e. a COMMAND STRING rather than a script argument) is present in both. The scan is now ORDERED: a
+# `-c`-family option seen BEFORE the loop-shaped token means the shell was handed a command string, so
+# it is a wrapper and not a controller. (fresh review at 8eb852d27, P3)
+echo "── 17. a '-c' wrapper is a non-controller even with another option in front of it (#1856)"
+mkcase; CASE_DIR="$C"
+bash -x -c "for _ in \$(seq 1 60); do sleep 1; done; $C/peer/orch-loop.sh" >/dev/null 2>&1 &
+WP=$!; KIDS="$KIDS $WP"; sleep 0.4
+printf '%s\n' "$WP" > "$C/o/.orch.lock"
+run_drv O="$C/o"
+ck "17: a '-c' wrapper with an OPTION in front of it is still RECLAIMED (not refused as ambiguous)" \
+   "$(ran && [ "$RC" -eq 0 ] && echo 0 || echo 1)"
+pkill -P "$WP" 2>/dev/null
+kill -9 "$WP" 2>/dev/null
 
 # ── recap ───────────────────────────────────────────────────────────────────────────────────────
 echo
