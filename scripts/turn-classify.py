@@ -77,7 +77,10 @@ if SCRIPTS not in sys.path:
     sys.path.append(SCRIPTS)
 import _bounce_state as bs                                    # noqa: E402
 REGISTRY = f"{STATE}/lane-registry.tsv"
-CMUX_DISPATCH = f"{HOME}/Documents/GitHub/tortoise/tools/cmux_dispatch.py"
+# ⛔ NO `CMUX_DISPATCH` CONSTANT HERE (#1957): it named a path into ANOTHER checkout and nothing in
+# this module read it (measured: the only occurrence of the name was its own assignment). See the same
+# note in `turn-end.py`; the live send path is `safe-send.sh`, which RESOLVES the producer from an
+# ordered candidate list (`scripts/lib/cmux-dispatch-path.sh`).
 
 # SHARED with turn-end.py ON PURPOSE: one marker directory means one claim per
 # turn, so the two nudgers cannot both speak to the same end-of-turn.
