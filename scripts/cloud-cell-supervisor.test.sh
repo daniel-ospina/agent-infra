@@ -4043,8 +4043,11 @@ kill -0 "$PEER" 2>/dev/null && ok "stop: the PEER controller SURVIVED a stale lo
                             || bad "stop: KILLED the peer controller from a stale lock — the peer is not ours to signal"
 [ -e "$P/o/.orch.lock" ] && ok "stop: left the lock in place (a pid we cannot prove dead is not ours to release)" \
                           || bad "stop: released a lock whose named pid is alive"
-# The provably-DEAD form: the same lock with a pid that is gone is noise the harness's acq() clears,
-# but a recycled pid makes acq() see a live process and exit 0 SILENTLY — so `stop` says so.
+# The provably-DEAD form: the same lock with a pid that is gone is noise the harness's lock clears.
+# (A recycled pid used to make `orch-loop.sh` see a live process and exit 0 SILENTLY; agent-infra#2095
+# gave the loop a real identity test — it reclaims a pid that began after the record was written — so
+# that case is now handled by the loop itself, and this suite's concern is only that `stop` names what
+# it cannot prove.)
 kill -9 "$PEER" 2>/dev/null; sleep 0.3
 printf '999999\n' > "$P/o/.orch.lock"
 OUT="$(own_peer stop)"

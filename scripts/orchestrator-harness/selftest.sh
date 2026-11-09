@@ -5305,10 +5305,29 @@ ck "§6g: NO launchd call in this run addressed a production label (loop AND wat
 # on one PR queue. Driven against the SHIPPED lock+trap block (extracted, not re-implemented) with a
 # stub loop, so it fails on the pre-fix copy. The invariant asserted is "the lock and the process
 # go away together": a released lock may only ever be observed as the process is leaving.
-sed -n '/^# single-instance lock/,/^trap .rm -f "\$LOCKF".*$/p' "$LOOP" > "$TMP/lockblock.sh"
+sed -n '/^# single-instance lock/,/^trap .orc_singleton_release .*EXIT$/p' "$LOOP" > "$TMP/lockblock.sh"
 if need "$TMP/lockblock.sh" "the lock+trap block is extracted from the shipped orch-loop.sh"; then
+  # ⛔ A RANGE THAT STOPPED MATCHING ITS END WOULD RUN TO EOF AND STILL "EXIST" — so the block is
+  # asserted by CONTENT, not by presence. Both halves must be there: the decision (the module call)
+  # and the trap. Rewriting the lock path without either is the state this gate exists to notice.
+  if grep -q 'orc_singleton_acquire' "$TMP/lockblock.sh" && grep -q 'orc_singleton_release' "$TMP/lockblock.sh"; then rc=0; else
+    rc=1; echo "      the extracted block is not the shipped lock+trap pair (its end marker moved)"; fi
+  ck "the lock block is extracted WITH its decision and its trap (not a run to EOF)" $rc
+  # ⛔ EVERY NAME THE EXTRACTED BLOCK READS IS DEFINED HERE, AND THAT IS A FIX, NOT PADDING
+  # (agent-infra#2095, and it is a finding a previous review of the same block made: the refusal path
+  # reads MAX_LOAD/MAX_LOAD_SRC/ORC_INSTANCE/ORC_STATE_SRC, which the extraction does NOT carry. Under
+  # `set -u` an unbound expansion is FATAL and `|| true` does not catch it, so the driver died with
+  # status 1 BEFORE `exit 75` — and the arms below assert only "no ACQUIRED", which a crash satisfies.
+  # A check that cannot tell "refused loudly" from "aborted halfway" is not a check.)
+  lockblock_prelude() { # <state dir>
+    printf 'set -u\nO=%s\n' "'$1'"
+    printf 'LOG="$O/logs/orch-loop.log"; mkdir -p "$O/logs"\n'
+    printf 'ORC_INSTANCE=selftest-%s\n' "$$"
+    printf 'ORC_STATE_SRC=selftest\nMAX_LOAD=100\nMAX_LOAD_SRC=selftest\n'
+    printf '. "%s"\n' "$HERE/controller-state.sh"
+  }
   LK="$TMP/LK"; mkdir -p "$LK/state"
-  { echo 'set -u'; echo "O='$LK'"; cat "$TMP/lockblock.sh"; echo 'while :; do sleep 0.2; done'; } > "$LK/drive.sh"
+  { lockblock_prelude "$LK"; cat "$TMP/lockblock.sh"; echo 'while :; do sleep 0.2; done'; } > "$LK/drive.sh"
   bash -n "$LK/drive.sh" && rc=0 || rc=1
   ck "the lock-trap driver parses" $rc
   rm -f "$LK/.orch.lock"
@@ -5398,7 +5417,7 @@ if need "$TMP/lockblock.sh" "the lock+trap block is extracted from the shipped o
     # interruptibility check below while re-introducing the thundering herd it exists to prevent.
     grep -q 'RANDOM' "$TMP/cycsleep.sh" && rc=0 || rc=1
     ck "the shipped cycle sleep is jittered (±20% of CYC), not a fixed interval" $rc
-    { echo 'set -u'; echo "O='$LK'"; cat "$TMP/lockblock.sh"; echo 'CYC=8'; cat "$TMP/cycsleep.sh"; } > "$LK/cyc.sh"
+    { lockblock_prelude "$LK"; cat "$TMP/lockblock.sh"; echo 'CYC=8'; cat "$TMP/cycsleep.sh"; } > "$LK/cyc.sh"
     bash -n "$LK/cyc.sh" && rc=0 || rc=1
     ck "the cycle-sleep driver parses" $rc
     # Non-vacuity: the driver must OWN the lock (a leftover lock would make it refuse the lock and
@@ -5441,33 +5460,39 @@ if need "$TMP/lockblock.sh" "the lock+trap block is extracted from the shipped o
   # next start (the SIGKILL/reboot path), while one held by a LIVE pid is refused. Without the
   # negative control, "reclaimed" and "silently overwritten" would be the same test. Deliberately
   # LAST in this section: the live-pid case intentionally leaves a lock in place.
-  # ⛔ `LOG` IS SUPPLIED, AND THE LIVE-OWNER FIXTURE IS LOOP-SHAPED (fresh review of agent-infra#1985,
-  # P2). Two separate premises changed with #1985: the block now LOGS a reclaim (`selftest.sh` runs it
-  # under `set -u`, so an absent `LOG` aborted the shell — a red arm here and a VACUOUSLY green one
-  # below), and a live pid is no longer enough to be the owner — `$$` is this SUITE's shell, not an
-  # `orch-loop.sh` invocation, which the loop now reclaims BY DESIGN. So the negative control uses a
-  # real loop-shaped process (`bash <dir>/orch-loop.sh`), which is the shape every shipped launcher
-  # produces, and it is spawned BEFORE the lock is written (the real write order).
-  mkdir -p "$LK/logs"
-  { echo 'set -u'; echo "O='$LK'"; echo "LOG='$LK/logs/orch-loop.log'"; cat "$TMP/lockblock.sh"; echo 'echo ACQUIRED'; } > "$LK/acquire.sh"
+  { lockblock_prelude "$LK"; cat "$TMP/lockblock.sh"; echo 'echo ACQUIRED'; } > "$LK/acquire.sh"
   bash -n "$LK/acquire.sh" && rc=0 || rc=1
   ck "the stale-lock driver parses" $rc
   printf '999999\n' > "$LK/.orch.lock"
   out="$(bash "$LK/acquire.sh" 2>&1)"
   case "$out" in *ACQUIRED*) rc=0;; *) rc=1; echo "      got '$out'";; esac
   ck "a stale lock (dead pid) is reclaimed by the next start" $rc
-  # ⛔ THE STUB IS SELF-BOUNDED (60s), because it is a process literally named `orch-loop.sh` and this
-  # repo's arms read the process table by that shape: if this suite is killed between the spawn and the
-  # `kill -9` below, an unbounded stub would still be running when a LATER arm pgrep's for a controller
-  # — a leak that reads as a live owner. 60s is far longer than the 0.4s the assertion needs.
+  # ⛔ THE LIVE-OWNER FIXTURE IS LOOP-SHAPED (fresh review of agent-infra#1985, P2), AND IT IS
+  # SELF-BOUNDED (60s). This is a process literally named `orch-loop.sh`, and this repo's arms read the
+  # process table by that shape: if this suite is killed between the spawn and the `kill -9` below, an
+  # unbounded stub would still be running when a LATER arm pgrep's for a controller — a leak that reads
+  # as a live owner. 60s is far longer than the 0.4s the assertion needs. The spawn order is the real
+  # one: the owner exists FIRST, then the record naming it is written.
   printf '#!/bin/bash\ntrap "exit 0" TERM INT\nfor _ in $(seq 1 60); do sleep 1; done\n' > "$LK/orch-loop.sh"
   chmod +x "$LK/orch-loop.sh"
   bash "$LK/orch-loop.sh" >/dev/null 2>&1 & owner=$!
   sleep 0.4                                   # the lock is written AFTER the owner exists (real order)
   printf '%s\n' "$owner" > "$LK/.orch.lock"
-  out="$(bash "$LK/acquire.sh" 2>&1)"
+  rm -f "$LK/logs/orch-loop.log"
+  # ⛔ "NO ACQUIRED" IS NOT ENOUGH (agent-infra#2095). That assertion is satisfied by a driver that
+  # CRASHES before reaching the lock — which is exactly what the pre-#2095 extraction did (an unbound
+  # MAX_LOAD killed it under `set -u`). The refusal has to be POSITIVE evidence: exit 75, and the
+  # `[singleton]` line on disk naming the holder. A silent `exit 0` (the shipped behaviour this
+  # replaces) fails all three of these.
+  if out="$(bash "$LK/acquire.sh" 2>&1)"; then acq_rc=0; else acq_rc=$?; fi
   case "$out" in *ACQUIRED*) rc=1; echo "      a live lock was stolen";; *) rc=0;; esac
   ck "a lock held by a LIVE LOOP-SHAPED owner is NOT stolen (reclamation is not a silent overwrite)" $rc
+  [ "$acq_rc" = "75" ] && rc=0 || { rc=1; echo "      refused with rc=$acq_rc, not 75 (a silent 0 reads as a healthy no-op under KeepAlive)"; }
+  ck "the refusal is EXIT 75, not a quiet success" $rc
+  grep -q '\[singleton\]' "$LK/logs/orch-loop.log" 2>/dev/null && rc=0 || { rc=1; echo "      no [singleton] line was written to the log"; }
+  ck "the refusal is on record in the log, naming the holder" $rc
+  [ "$(cat "$LK/.orch.lock" 2>/dev/null)" = "$owner" ] && rc=0 || rc=1
+  ck "the refused instance left the holder's record intact" $rc
   kill -9 "$owner" 2>/dev/null
 fi
 
