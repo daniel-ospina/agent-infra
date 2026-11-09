@@ -1177,18 +1177,27 @@ export REPO=$HOME/eldato/tortoise        # REQUIRED: the target repo's local mai
                                          # CARRIES A REPO PATH DEFAULT ANY MORE (agent-infra#1974,
                                          # #3833) — the complete grep over `*.sh`, `retired/` and
                                          # `*.test.sh` excluded. The seven this passage used to
-                                         # list are all resolved now: `report.sh` (24) and
-                                         # `deploy-crossbox.sh` (23) read
+                                         # list are all resolved now: `report.sh` (44) and
+                                         # `deploy-crossbox.sh` (124) read
                                          # `REPO="$(resolve_repo)"`, and
-                                         # `refresh-candidates.sh` (18),
-                                         # `cloud-cell-supervisor.sh` (93),
-                                         # `pi-reap-worktrees.sh` (1174),
-                                         # `stale-worktrees.sh` (35),
-                                         # `stale-main-triage.sh` (16) — plus
-                                         # `worktree-hygiene-sweep.sh`, `lane-container-reap.sh`
-                                         # and `cloud-cell-doctor.sh` — carry
-                                         # `REPO="${REPO:-}"`, i.e. an explicit NO DEFAULT that
-                                         # cannot invent a path. The `$PWD` three were the worst
+                                         # `refresh-candidates.sh` (149),
+                                         # `cloud-cell-supervisor.sh` (149),
+                                         # `pi-reap-worktrees.sh` (882),
+                                         # `stale-worktrees.sh` (45),
+                                         # `stale-main-triage.sh` (23) — plus
+                                         # `lane-container-reap.sh` (74:
+                                         # `REPO="${LANE_CONTAINER_REPO:-${REPO:-}}"`) and
+                                         # `cloud-cell-doctor.sh` (84: `REPO="${REPO:-}"`) — carry
+                                         # an explicit fallback whose LAST resort is EMPTY, i.e. a
+                                         # NO DEFAULT that cannot invent a path.
+                                         # `worktree-hygiene-sweep.sh` (126) also carries
+                                         # `REPO="${REPO:-}"`; its operator variable
+                                         # `$TORTOISE_REPO`/`$TORTOISE` is a CANDIDATE, not a
+                                         # default, so `resolve_repo` PROVES it (a git checkout,
+                                         # and — when `$OR` is declared — that its `origin` names
+                                         # that target) and it is offered ALONE, never tied against
+                                         # the cwd. The
+                                         # `$PWD` three were the worst
                                          # shape: $PWD is `/` under launchd, so the default
                                          # resolved to a real non-repo directory and failed later
                                          # as `not a git repository: /` instead of at the REPO
@@ -2050,7 +2059,7 @@ clear about what is and is not enforced:
 Five carriers (`orch-loop.sh`, `lane.sh`, `fix-one.sh`, `merge-one.sh`, `nonblocking-dispatch.sh`)
 used to `export AGENT_SKIP_REVIEW_GATE=1 ELDATO_SKIP_VGATE=1` unconditionally. The canon calls both
 flags emergency-only (`skills/commit-workflow/SKILL.md:102,:111`) and a lane collected without review
-is "UNREVIEWED CODE BY DEFAULT" (`skills/parallel-orchestrator/SKILL.md:150`), so a permanent export was
+is "UNREVIEWED CODE BY DEFAULT" (`skills/parallel-orchestrator/SKILL.md:152`), so a permanent export was
 a **defect**, and dangerous in one direction only: the permissive side was the machine that lands the
 most work.
 
