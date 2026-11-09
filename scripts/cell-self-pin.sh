@@ -39,12 +39,17 @@
 # a claim that the executed layer was identified.
 #
 # ── WHAT `--install` RESOLVES, AND WHERE EACH VALUE COMES FROM ─────────────────────────────────
-#   base       ${CELL_HOME:-$HOME}                — the expression this file, the unit's rendered
-#                                                   `Environment=CELL_HOME=` and every sibling installer
-#                                                   agree on. ⛔ Note the SUPERVISOR's own fallback is
-#                                                   `/tmp/cell-home` (its own `CELL_HOME="${CELL_HOME:-/tmp/cell-home}"`), NOT
-#                                                   `$HOME`; that is why the unit renders CELL_HOME
-#                                                   EXPLICITLY rather than trusting the manager's HOME.
+#   base       ${CELL_HOME} if given, else DERIVED             — this file, the unit's rendered
+#                                                   `Environment=CELL_HOME=` and every sibling script
+#                                                   now agree on ONE derivation: scripts/lib/cell-home.sh
+#                                                   (agent-infra#3453). ⛔ Until that change the
+#                                                   SUPERVISOR's own fallback was `/tmp/cell-home`
+#                                                   while this file's was `$HOME`, i.e. two answers to
+#                                                   one question — the #2215 skew installed into
+#                                                   /etc/systemd/system. That divergence is GONE: both
+#                                                   sides consume the resolver, whose precedence is
+#                                                   CELL_HOME -> the account's passwd home -> $HOME
+#                                                   (non-volatile only) -> the fleet default.
 #   record     ${HARNESS_PIN_FILE}                — default $CELL_HOME/.harness-path: the file
 #              (= $CELL_HOME/.harness-path)          cloud-cell-supervisor.sh's `start` READS to choose
 #                                                   the tree it execs (`cmd_start` → `$HARNESS`).
@@ -109,15 +114,27 @@
 # HEAD out of the RECORD the controller acts on rather than out of the stamp.
 set -u
 
-# ⛔ REMEMBERED BEFORE IT IS DEFAULTED, because the DEFAULT IS THE DEFECT. `cloud-cell-supervisor.sh`'s own
-# fallback is `/tmp/cell-home` (measured: its own `CELL_HOME="${CELL_HOME:-/tmp/cell-home}"` default), NOT `$HOME` — so an install run
-# with CELL_HOME unset would render `Environment=CELL_HOME=$HOME` into a unit whose reader is looking
-# somewhere else, i.e. the pin pass reads `$HOME/.harness-path` while the controller reads
-# `$CELL_HOME/.harness-path`: the #2215 skew this whole change exists to remove, installed permanently
-# into /etc/systemd/system. Rendering refuses when this is empty (see `print_unit`); a bare PASS keeps
-# the tolerant default, because a manual run must not be refused over an environment variable.
+# ⛔ REMEMBERED BEFORE IT IS DEFAULTED, because `CELL_HOME_GIVEN` is what `print_unit` refuses on. The
+# DEFAULT is not a second opinion any more: `scripts/lib/cell-home.sh` derives it (agent-infra#3453),
+# and `cloud-cell-supervisor.sh` — the reader of the record this file pins — consumes the SAME resolver,
+# so "the pass derives from $HOME while the controller derives from /tmp/cell-home" can no longer happen.
+# Rendering still refuses an UNSET CELL_HOME (see `print_unit`): the value becomes permanent in
+# /etc/systemd/system, and at that one moment an operator saying which home is the cell's is worth
+# requiring. A bare PASS keeps the tolerant default, because a manual run must not be refused over an
+# environment variable.
+# ⛔ THE SELF PATH COUNTS ONLY WHEN IT NAMES THIS FILE — see `lib/cell-home.sh` §CONSUMERS.
+_SELF="${BASH_SOURCE[0]:-}"; [ -f "$_SELF" ] || _SELF=""     # under `bash -s` $0 is literally `bash` -> `.`
+PIN_SELF_DIR=""
+if [ -n "$_SELF" ]; then PIN_SELF_DIR="$(cd "$(dirname "$_SELF")" 2>/dev/null && pwd -P)"; fi
+CELL_HOME_LIB="${PIN_SELF_DIR:+$PIN_SELF_DIR/lib/cell-home.sh}"
 CELL_HOME_GIVEN="${CELL_HOME:-}"
-CELL_HOME="${CELL_HOME:-$HOME}"
+if [ -n "$CELL_HOME_LIB" ] && [ -r "$CELL_HOME_LIB" ]; then
+  . "$CELL_HOME_LIB"
+  CELL_HOME="$(cell_home_resolve)"
+else
+  CELL_HOME="${CELL_HOME:-${HOME:-}}"
+fi
+[ -n "$CELL_HOME" ] || { printf '%s: FATAL: %s is not readable and neither CELL_HOME nor HOME is set — refusing to default the cell home (agent-infra#3453)\n' "${0##*/}" "${CELL_HOME_LIB:-lib/cell-home.sh}" >&2; exit 78; }
 HARNESS_PIN_DIR="${HARNESS_PIN_DIR:-$CELL_HOME/harness}"
 HARNESS_PIN_FILE="${HARNESS_PIN_FILE:-$CELL_HOME/.harness-path}"
 HARNESS_REF="${HARNESS_REF:-origin/main}"
@@ -696,13 +713,14 @@ place_pass() {
 
 print_unit() { # [dest-dir] — render both units into a directory, or stdout when no dir is given
   local dest="${1:-}" tpl script user home
-  # ⛔ A RENDER OF A BASE NOBODY GAVE IS A LIE THE UNIT CANNOT TAKE BACK. `CELL_HOME` unset defaults to
-  # $HOME here, but the READER of the record this file derives from defaults to /tmp/cell-home — so the
-  # rendered `Environment=CELL_HOME=` would permanently disagree with the controller, and the only guard on
-  # it (`verify_unit`'s CELL_HOME assertion) compares the artifact against that SAME already-wrong value.
-  # Refusing is the only fail-closed answer at the one moment the value becomes permanent.
+  # ⛔ A RENDER OF A BASE NOBODY GAVE IS A LIE THE UNIT CANNOT TAKE BACK. `CELL_HOME` unset is DERIVED
+  # here (scripts/lib/cell-home.sh) and the READER of the record this file derives from —
+  # cloud-cell-supervisor.sh — consumes the SAME resolver, so the two can no longer disagree about which
+  # home is the cell's. What the derivation cannot supply is the OPERATOR's decision, and the rendered
+  # `Environment=CELL_HOME=` is permanent the moment it lands in /etc/systemd/system, so an UNSET
+  # CELL_HOME is still refused at that one moment.
   if [ -z "$CELL_HOME_GIVEN" ]; then
-    bad "CELL_HOME is not set in this environment — this file would default it to \$HOME (${HOME}), while cloud-cell-supervisor.sh's own default is /tmp/cell-home, so the rendered unit would pin a DIFFERENT record than the controller reads (the #2215 skew). Set CELL_HOME to the cell home and re-run."
+    bad "CELL_HOME is not set in this environment — the derived value is '${CELL_HOME}', and a render makes that permanent in /etc/systemd/system for every future tick. Set CELL_HOME to the cell home and re-run (agent-infra#3453: both sides consume scripts/lib/cell-home.sh, so the value you set here is the value the controller reads)."
     return 1
   fi
   # The template dir is resolved from THIS file's repo (templates/systemd is its sibling), then the
@@ -951,8 +969,10 @@ verify_unit() { # <rendered service> [expected ExecStart payload] — the proper
   # The two sides were mixed: `home_real` was always `cd "$CELL_HOME" && pwd -P` (RESOLVED) while
   # `exec_real` fell back to the RAW `$CELL_HOME/…` string whenever the payload's parent did not resolve —
   # which is EVERY FIRST INSTALL, because `place_pass` runs after `verify_unit` and the parent does not exist
-  # yet. So on any box whose `$CELL_HOME` is reached through a symlink (macOS `CELL_HOME=/tmp/cell-home` →
-  # `/private/tmp/cell-home`, the supervisor's own documented default) the two strings could never match and
+  # yet. So on any box whose `$CELL_HOME` is reached through a symlink (an operator-set
+  # `CELL_HOME=/tmp/cell-home` → `/private/tmp/cell-home` on macOS is the measured example — the
+  # legacy home is not a DEFAULT anywhere since agent-infra#3453, but it can still be SET) the two
+  # strings could never match and
   # the FIRST install was refused with a cause naming the containment rule, on a payload that was inside the
   # home. The second attempt passed only because the first had created the parent in between. MEASURED on
   # this box: `CELL_HOME=$T/symhome -> $T/realhome`, `--install` → rc=1, "ExecStart resolves to

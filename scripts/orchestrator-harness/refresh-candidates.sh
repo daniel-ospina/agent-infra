@@ -176,7 +176,25 @@ SC=""   # from $REPO, once resolve_repo has settled it
 # wherever $HOME is already a writable directory (every laptop, and every cell whose controller the
 # supervisor started); a home that is absent, not a directory, or not writable is off-spec for this
 # harness and is replaced.
-CELL_HOME="${CELL_HOME:-/tmp/cell-home}"
+# ⛔ THE ONE HOME (agent-infra#3453): the old default here was the legacy `/tmp/cell-home`, so the home
+# this harness would CREATE and write `$O` into was one no other cell unit agreed with. Derived by
+# `scripts/lib/cell-home.sh` (`../lib/` from the harness dir — the same relative position in a
+# checkout, in a pinned harness worktree, and in the flat farm).
+CELL_HOME_LIB=""
+# ⛔ THE SELF PATH COUNTS ONLY WHEN IT NAMES THIS FILE — see `lib/cell-home.sh` §CONSUMERS.
+_SELF="${BASH_SOURCE[0]:-}"; [ -f "$_SELF" ] || _SELF=""     # under `bash -s` $0 is literally `bash` -> `.`
+if [ -n "$_SELF" ]; then
+  _SELF_DIR="$(cd "$(dirname "$_SELF")" 2>/dev/null && pwd -P)"
+  for _cand in "$_SELF_DIR/../lib/cell-home.sh"; do
+    [ -r "$_cand" ] && { CELL_HOME_LIB="$_cand"; break; }
+  done
+fi
+if [ -n "$CELL_HOME_LIB" ]; then . "$CELL_HOME_LIB"; CELL_HOME="$(cell_home_resolve)"; else CELL_HOME="${CELL_HOME:-${HOME:-}}"; fi
+# ⛔ AN EMPTY CELL_HOME IS NOT A HOME — it is the FILESYSTEM ROOT (`O=/orchestrator`,
+# `SCRIPTS=/.pi/agent/scripts`, a layer installed at `/.pi/agent`). A missing resolver is the
+# incomplete-install case the resolver's header names, so it is the SAME refusal the sibling
+# consumers already make (exit 78, EX_CONFIG) instead of a silent walk to `/`.
+[ -n "$CELL_HOME" ] || { printf '%s: FATAL: %s is not readable and neither CELL_HOME nor HOME is set — refusing to default the cell home (agent-infra#3453)\n' "${0##*/}" "${CELL_HOME_LIB:-lib/cell-home.sh}" >&2; exit 78; }
 usable_home() { [ -n "${1:-}" ] && [ -d "$1" ] && [ -w "$1" ]; }
 # $1 = --create. Runs at LOAD, before anything else: the interpreter probe, uv's cache and the
 # pre-flight all resolve through $HOME. TWO candidates — the caller's $HOME, then $CELL_HOME (the

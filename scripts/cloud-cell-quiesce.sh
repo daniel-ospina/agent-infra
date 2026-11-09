@@ -12,15 +12,38 @@
 #     bash cloud-cell-quiesce.sh
 #
 # Env: REPO (required) OR (required) SCOPE (default own) MAX_LANES (default 3)
-#      CELL_HOME (default /tmp/cell-home) ENV_FILE (default $CELL_HOME/keys.env)
+#      CELL_HOME (default: DERIVED — the box's durable home, see scripts/lib/cell-home.sh)
+#      ENV_FILE (default $CELL_HOME/keys.env)
 #      HARNESS (default $REPO/scripts/orchestrator-harness)
 set -uo pipefail
+
+# ── THE ONE HOME (agent-infra#3453) — DERIVED, never re-spelled ──────────────────────────────────
+# This default used to be `/tmp/cell-home`, the legacy volatile home: the quiesce then re-created the
+# controller session with `HOME=/tmp/cell-home` while the unit that spawns lanes gave them
+# `/home/cmux`, so the relaunched controller's `git push` read a `contents=read` PAT while its `gh`
+# reads worked. One derivation, one home: `scripts/lib/cell-home.sh`.
+# ⛔ THE SELF PATH COUNTS ONLY WHEN IT NAMES THIS FILE — see `lib/cell-home.sh` §CONSUMERS.
+_SELF="${BASH_SOURCE[0]:-}"; [ -f "$_SELF" ] || _SELF=""     # under `bash -s` $0 is literally `bash` -> `.`
+QUIESCE_SELF_DIR=""
+if [ -n "$_SELF" ]; then QUIESCE_SELF_DIR="$(cd "$(dirname "$_SELF")" 2>/dev/null && pwd -P)"; fi
+CELL_HOME_LIB="${QUIESCE_SELF_DIR:+$QUIESCE_SELF_DIR/lib/cell-home.sh}"
+if [ -n "$CELL_HOME_LIB" ] && [ -r "$CELL_HOME_LIB" ]; then
+  . "$CELL_HOME_LIB"
+  CELL_HOME="$(cell_home_resolve)"
+elif [ -n "${CELL_HOME:-}" ]; then
+  :   # an explicit CELL_HOME is a complete answer; the resolver only supplies the DEFAULT
+elif [ -n "${HOME:-}" ]; then
+  CELL_HOME="$HOME"
+  printf '%s: warn: %s is not readable — using HOME (%s) as the cell home; the durable-home default is unavailable on this copy (agent-infra#3453)\n' "${0##*/}" "${CELL_HOME_LIB:-lib/cell-home.sh}" "$CELL_HOME" >&2
+else
+  printf '%s: FATAL: %s is not readable and neither CELL_HOME nor HOME is set — refusing to default the cell home to the legacy /tmp/cell-home (agent-infra#3453)\n' "${0##*/}" "${CELL_HOME_LIB:-lib/cell-home.sh}" >&2
+  exit 78
+fi
 
 REPO="${REPO:?REPO is required}"
 OR="${OR:?OR is required}"
 SCOPE="${SCOPE:-own}"
 MAX_LANES="${MAX_LANES:-3}"
-CELL_HOME="${CELL_HOME:-/tmp/cell-home}"
 ENV_FILE="${ENV_FILE:-$CELL_HOME/keys.env}"
 O="${O:-$CELL_HOME/orchestrator}"
 HARNESS="${HARNESS:-$REPO/scripts/orchestrator-harness}"

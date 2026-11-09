@@ -980,8 +980,8 @@ and no new call site can forget it:
 
 | Entry point | Where | Installed by |
 |---|---|---|
-| `gh-rest/gh` (the REST adapter above) | Mac | `install.sh` → `$O/gh-rest` first on the daemon PATH |
-| `gh-limit/gh` (nothing but the layer) | cloud cells | `cloud-cell-supervisor.sh` → `$O/gh-limit` first on the controller PATH **and** published through tmux `update-environment`; `deploy-crossbox.sh` seeds the same two files and passes the PATH on the controller's `new-session` line (it does not touch `update-environment`) |
+| `gh-rest/gh` (the REST adapter above) | Mac **and** cloud cells | Mac: `install.sh` → `$O/gh-rest` first on the daemon PATH. Cells: `cloud-cell-supervisor.sh` seeds it from the pinned harness into `$O/gh-rest` and leads the controller PATH with it; `deploy-crossbox.sh` seeds the same bytes and leads its session PATH with it |
+| `gh-limit/gh` (nothing but the layer) | Mac and cloud cells | `cloud-cell-supervisor.sh` → `$O/gh-rest` **ahead of** `$O/gh-limit` on the controller PATH (`#2039`: the adapter routes through the same helper, so the adapter must resolve first) **and** published through tmux `update-environment`; `deploy-crossbox.sh` seeds the same two files and passes the same order on the controller's `new-session` line (it does not touch `update-environment`) |
 
 ⛔ **The shim has to be re-asserted after the tool-dir prepend.** Every gh-calling harness script
 opens with `export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH`, which puts a REAL `gh` ahead of the
@@ -1695,7 +1695,7 @@ manifest path above is what a box that is copied into every deploy should use.
 | `PRODUCT_REPOS` | `daniel-ospina/tortoise` | **comma-separated** `owner/repo` list (no spaces, matched as an element — `$(printf '%s' "$PRODUCT_REPOS" | tr ',' ' ')` then `*" $repo "*`), read by `refresh-candidates.sh` and deciding **which repo counts as PRODUCT**: an issue is product work when its repo is in this list AND it does not carry the `harness` label. ⛔ **TODAY ONLY THE ENTRY EQUAL TO `$OR` CAN EVER MATCH**: the backlog is read from `$OR` alone, and the intake is called with `$OR`, so every other element in the list is inert until a pass spans more than one repo. The list form is kept because that is the shape the decision has; it is not a multi-repo queue. If `$OR` is absent from the list, EVERY candidate is harness and the loop prints `product-floor N/A` — which is how a box says "no product channel here", not an error. This is the single input the whole floor rests on, so it is documented here rather than only in `ARCHITECTURE.md`: a repo **outside** the list reports `NOT-A-PRODUCT-REPO` and the loop prints `product-floor N/A`, which is **not** an unmet floor and **not** a finding about product work. ⛔ **`$ENV_FILE`-only: `install.sh` neither renders nor validates it** (its numeric `[`-based validator would reject a list, so a `__PRODUCT_REPOS__` placeholder is deliberately absent), which means exporting it and re-running `install.sh` has no effect, and a hand-added plist key is overwritten by the next render — set it in `$ENV_FILE` on a cell, or edit the `PRODUCT_REPOS=` default in `refresh-candidates.sh` (search the assignment, not a line number — it moved once already) |
 | `CYC` | `240` | seconds between cycles |
 | `STALE_MIN` | `40` | a worker whose log has not grown in this many minutes is presumed hung and its session is killed (§6) |
-| `LANE_TIMEOUT` | `3300` | wall-clock limit on a lane's `pi` run (s). Raised from 2400 when a lane took ownership of its merge (#2029) — the issue-claim lease `CLAIM_ISSUE_TTL` must cover it plus the chain's waits; see `claims.sh`'s arithmetic block |
+| `LANE_TIMEOUT` | `7200` (via `LANE_BACKSTOP_S`) | absolute wall-clock backstop on a lane's `pi` run (s). ⛔ **IT NO LONGER HAS A LITERAL OF ITS OWN** (agent-infra#2888): it defaults to the ONE fleet default, `LANE_BACKSTOP_S` (`spawn-gate.sh`, 7200) — it was `3300` when a flat elapsed cap was the primary bound, and three separate literals is how that cap outlived the progress allowance that replaced it. `lane-bound.sh`'s PROGRESS allowance (45 min) is the PRIMARY wedge signal now; this is only the ceiling for a lane that creeps forward for ever. An explicit `LANE_TIMEOUT` still overrides it, and the issue-claim lease `CLAIM_ISSUE_TTL` must cover it plus the chain's waits; see `claims.sh`'s arithmetic block |
 | ~~`LANE_KEY_GATE`~~ | — | **RETIRED as a switch (agent-infra#3331).** It used to turn the model-credential assertion off, and that was wrong in the one way that matters: this is an ENVIRONMENT variable, so a box's `keys.env` (sourced by the cell supervisor under `set -a`) handed it to every descendant lane and the gate became a fleet-wide off switch that looked like a fixture escape — measured: a key-less lane ran to `outcome=done reason=agent-exit-0` with the suite green. The escape is `--key-gate-off` on the lane's invocation, which no environment can inject. Nothing reads this variable now; a value found in the environment is logged as `check=ignored` and **not** honoured, so a stale fixture is told what changed instead of silently gating |
 | `REVIEW_TIMEOUT` | `1800` | wall-clock limit on a reviewer `pi` run (s) |
 | `FIX_TIMEOUT` | `2400` | wall-clock limit on a fixer `pi` run (s) |
@@ -2222,9 +2222,77 @@ and the exit code **is** the next action (0 MERGED · 10 FIX_REQUIRED · 15 FIX_
 NAMES → fix, push, repeat; when green, launch the harness's per-PR chain **detached** and supervise it with
 `--watch` (short chunks — a lane blocked for 20 minutes inside one shell call reads as wedged to every
 liveness instrument we have). Supervision is **bounded and sized to what the lane can actually spend**:
-`WAIT_S + MAX_WATCH × POLL + IMPL_RESERVE ≤ LANE_TIMEOUT` (1500 + 7 × 120 + 900 = 3240 of the 3300 s
-clock), so the merge phase can never consume the implementation time the same clock pays for — a bound
-the lane itself reaches before its own kill, not one only a later lane could inherit.
+`WAIT_S + MAX_WATCH × POLL + IMPL_RESERVE ≤ LANE_TIMEOUT` (5400 + 7 × 120 + 900 = 7140 of the 7200 s
+clock), so the merge phase leaves the declared implementation reserve standing — a bound the lane itself
+reaches before its own kill, not one only a later lane could inherit.
+⛔ **The trade is stated, because the arithmetic does not make it small — and the FIRST version of this
+paragraph got it backwards** (review cycle 7, P2 — recomputed from both trees instead of carried): it
+compared 1500 s + 7 chunks against 5400 s + 7 chunks and concluded the implementation reserve fell
+"4860 s → 960 s". Main does not ship 7 chunks; it derives **40** (`(7200−1500−900)/120`, the same
+invariant one paragraph up), so the honest row is:
+
+| | `origin/main` | this tree |
+|---|---|---|
+| `WAIT_S` | 1500 | 5400 |
+| derived `MAX_WATCH` × `POLL` | 40 × 120 = 4800 | 7 × 120 = 840 |
+| merge phase's share of the clock | 6300 | 6240 |
+| left for implement → commit → push → open PR | 900 | 960 |
+
+The merge phase's share goes **down** slightly and the implementation reserve goes **up** by 60 s, so this
+constant does not starve implementation. What it costs is **supervision chunks, 40 → 7**: a 5400 s wait on
+a 7200 s clock leaves one 840 s `--watch` allowance. That is the deliberate trade — 7 chunks over a wait
+that reaches the merge phase, instead of 40 over a wait that can never be satisfied — and buying more of
+it means raising `LANE_BACKSTOP_S`, which is not this constant's decision. A lane that needs longer than
+the reserve hands off (`WAITING_CHECKS`, exit 11) and the next invocation resumes the SAME counter.
+⛔ **840 s IS THE WORST-CASE FLOOR, NOT WHAT A LANE GOT — and the floor was below the phase it supervises**
+(#3850 review, P2 — recomputed against the chain's own declared budgets). Supervision is paid AFTER the
+wait, out of whatever clock is left, so a lane whose checks settled early received the *worst case's*
+seven chunks while thousands of seconds still stood. Meanwhile the chain being supervised declares
+`REVIEW_TIMEOUT` = **1800 s** for its reviewer and a PR-claim lease of `REVIEW_TIMEOUT + _gw + 300` =
+**3000 s** (`claims.sh:166`, `chain-merge.sh`'s merge-phase wait 1890 s at `claims.sh:110`) — so 840 s
+could not cover a chain that was merely still reviewing, and the hand-off then posted a FALSE blocker
+(`BLOCKED_ATTEMPTS … the chain was STILL RUNNING`) that `WATCH_F` did not rewind, so every later `--watch`
+re-entered it. `MAX_WATCH` is therefore re-derived in the `--watch` path from the clock actually left —
+`(LANE_WALL_S − elapsed − one chunk) / POLL`, never below the design floor (`MAX_WATCH_FIT`, 7 chunks at the
+shipped defaults and 1 when the wall axis is off), never beyond the
+watchdog's `IDLE_S` allowance (that bound WINS when it is smaller: a labelled hand-off beats an unlabelled
+kill), and skipped when `LANE_MERGE_MAX_WATCH` is pinned. A controller re-run has no lane clock, resolves
+nothing, and keeps exactly the 7 shipped chunks.
+⛔ **AND "WALL AXIS OFF" (`LANE_TIMEOUT=0`) IS NOT READ AS A ZERO CLOCK FOR SUPERVISION EITHER** (review
+cycle 13, P2 — measured: the same arithmetic floored that lane at ONE chunk, 120 s, on a lane documented
+as unbounded, so `--watch` posted a blocker two minutes into a legitimate chain wait). With the wall axis
+off the allowance comes from what is LEFT of `LANE_BACKSTOP_S` when the fleet exports it (the lane's
+elapsed time comes off first, exactly as it does on the finite-wall path) — still capped by the watchdog
+allowance, which applies whatever clock the wall axis was set to — and with neither it is **unbounded**
+(a zero allowance now means *there is no counter*, not *it is spent*), so it ends when the chain resolves
+or dies. The `LANE_TIMEOUT=0` operator line says which of the two it got.
+⛔ **And the wait is spent inside ONE tool call**, so it has a SECOND bound that is not this clock: the
+watchdog's progress allowance (`lane-bound.sh`'s `IDLE_S`, `LANE_BOUND_IDLE_S`, default **2700 s** —
+spawn-gate passes no `--idle`). Its only working progress arm for a polling loop is growth of the LANE
+log (the CPU arm cannot see a poll's short-lived `gh`/`python3` child: `ps time` reports accumulated time
+of processes still ALIVE, measured `cpu_delta_cs=0` across a healthy wait). So `lane-merge.sh` appends a
+heartbeat to the lane log each poll, and **caps the wait below `IDLE_S`** when it cannot resolve a
+heartbeat target — an uncapped wait is killed as `stalled` before it can write `WAITING_CHECKS`, which is strictly worse than the shorter bound it replaces (#3584 review, P1).
+⛔ **And it has a THIRD bound: the lane's own REMAINING wall clock** (#3584 review, P1).
+`deadline` was `now + WAIT_S` with nothing comparing it to how much of `LANE_WALL_S` THIS lane had already
+spent, so a lane entering its merge phase more than ~1800 s in (7200 − 5400) was TERMed by
+`lane-bound.sh`'s wall ceiling MID-wait — no `WAITING_CHECKS`, no verdict file, no hand-off, which
+is strictly worse than the 1500 s bound this change replaces. `lane-merge.sh` now reads the start epoch
+out of the run token `lane.sh` stamps before it spawns the agent (`$O/logs/lane-<issue>.owner`, whose
+epoch OVER-states the start, the conservative direction) and clamps the wait to what is left, minus a
+margin to write the hand-off. The token's pid must be an **ANCESTOR** of the running script — a bounded
+`ps -o ppid=` walk from its own pid — and not merely a LIVE one: a pid can be live and RECYCLED, so
+liveness cannot rule out a finished run (and a newer dispatch re-stamps the per-issue token, which
+would under-state an older lane's elapsed). A non-ancestor, unreadable or future-dated token is the
+disclosed UNCLAMPED path, never a silent clamp. `LANE_MERGE_ELAPSED_S` is the explicit seam, and an
+elapsed it cannot resolve is reported as a residual instead of being read as "the lane just started".
+⛔ **THE CHECK WAIT IS THE LONG POLE AND ITS COVERAGE IS FINITE**: 5400 s covers 79.9 % of the
+measured lane-visible wait (`created_at` → `updated_at`, including the pre-start queue) and 94.3 % of
+run duration (the window holds NO successful run, so those are failing-run figures; the newest 100
+successful runs are faster, so failing runs are the binding case). One run in five therefore still
+hands off as `WAITING_CHECKS` (exit 11), and 29 of 209 exceeded this lane's whole wall clock, which no
+value of `WAIT_S` can wait out. That tail is the run queue's, not this bound's — see #3584.
+
 
 **The cap is 3 fix rounds, enforced by the tool**, not by the brief: a lane that would start round 4 is
 refused, the verdict becomes `BLOCKED_ATTEMPTS`, and a **PR comment names the exact blocker**. A lane stuck
@@ -2844,8 +2912,8 @@ measurements behind it**, never inferred from an exit status.
 
 | limit | default | what it is | what it is NOT |
 |---|---|---|---|
-| wall clock | `LANE_TIMEOUT`, 3300 s | a hard ceiling on the lane's total duration | not a progress signal: it cannot tell SLOW from STALLED, so alone it either kills a lane mid-merge or holds a corpse |
-| **silence** | `LANE_BOUND_IDLE_S`, **1200 s** (20 min) | **no output growth AND no CPU delta** (subtree, tolerance 0.10 s), confirmed on **two consecutive samples** | not a byte counter and not a CPU vote: **both** must be quiet, and either one advancing keeps the lane alive however long it runs |
+| wall clock | `LANE_TIMEOUT`, 7200 s (from `LANE_BACKSTOP_S`) | a hard ceiling on the lane's total duration | not a progress signal: it cannot tell SLOW from STALLED, so alone it either kills a lane mid-merge or holds a corpse |
+| **silence** | `LANE_BOUND_IDLE_S`, **2700 s** (45 min) | **no output growth AND no CPU delta** (subtree, tolerance 0.10 s), confirmed on **two consecutive samples** | not a byte counter and not a CPU vote: **both** must be quiet, and either one advancing keeps the lane alive however long it runs. ⛔ **This row said 1200 s (20 min) and the code has defaulted to 2700 s (45 min) since `lane-bound.sh`'s `num_or "${LANE_BOUND_IDLE_S:-}" 2700` — `spawn-gate.sh`'s own comment calls it "its 45-min default" too, so the row was the stale half.** It matters beyond accuracy: `lane-merge.sh` mirrors this number to decide whether a check wait can outlive the watchdog (#3584 review, P1 — a 5400 s wait against a 1200 s allowance would be a bound no lane could reach), so a reader taking the old figure would size that cap 1500 s too low |
 
 **Why (measured 2026-10-27).** Nine lanes across two cloud cells parked with **0 bytes** of output and
 **`00:00:00` CPU**, the oldest for **3 h 32 m** — every one a `pi` in `ep_poll`, an event-loop wait
@@ -2873,8 +2941,8 @@ stalled fleet and a human reading a report.
 **How to see why a lane died** — one line, three surfaces (the lane log, stdout, and
 `<lane log>.lanebound`):
 ```text
-[lane-bound] VERDICT verdict=stalled tag=lane-42 pid=4242 rc=143 elapsed=1204s wall_bound=3300s
-  idle_bound=1200s silent=1204s bytes=0 bytes_delta=0 cpu_cs=7 cpu_delta_cs=0 tol_cs=10
+[lane-bound] VERDICT verdict=stalled tag=lane-42 pid=4242 rc=143 elapsed=2820s wall_bound=7200s
+  idle_bound=2700s silent=2805s bytes=0 bytes_delta=0 cpu_cs=7 cpu_delta_cs=0 tol_cs=10
   cpu_unreadable=0 signal=TERM log=/home/cmux/orchestrator/logs/lane-42.log
 ```
 
@@ -2983,7 +3051,9 @@ operator who picked it got the previous attempt's verdict.
 **Two observations, and when to expect the kill.** A lane is judged on the sample interval
 `--poll`, default `min(60 s, idle/4)` — ~3 `ps` calls a minute per lane, because on this box the FLEET
 is the load. The silence limit needs **two consecutive confirming samples**, so it fires between
-`LANE_BOUND_IDLE_S` and `LANE_BOUND_IDLE_S + 2 x poll` (20–22 min at the defaults); the wall ceiling is
+`LANE_BOUND_IDLE_S` and `LANE_BOUND_IDLE_S + 2 x poll` (45–47 min at the defaults, which are 2700 s and
+60 s — ⛔ the range read "20–22 min" while this row still carried the retired 1200 s default; a derive-from-
+`LANE_BOUND_IDLE_S` range is only as good as the default it was derived from); the wall ceiling is
 exact to the sample interval it is not allowed to overrun. One sample is never enough: a single reading
 cannot tell a freeze from a missed measurement, which is the same rule §6.5.1 states for the outside
 reapers.
@@ -3005,10 +3075,14 @@ a lane a longer wall, raise the seam the CALLER owns — `LANE_BACKSTOP_S`, `LAN
 directly (its own flag/env, `mac-lane.sh`) still honours the value as given: no lease is derived there.
 
 ⛔ **STATED RESIDUAL.** A lane whose model call takes longer than the silence limit with no output and
-no tool CPU is killed as `stalled`. That is the same bound `task` applies to a sub-agent
-(`TASK_STREAM_STALL_MS` = 20 min) and the same window a human used by hand (5–15 min) — but it IS a
+no tool CPU is killed as `stalled`. That is the same KIND of bound `task` applies to a sub-agent
+(`TASK_STREAM_STALL_MS` = 20 min, a smaller one) and a longer window than a human used by hand (5–15 min)
+— but it IS a
 bound on a legitimate-but-pathological case, and the verdict line says so instead of hiding it, because
-`silent=1204s bytes=0 cpu_delta_cs=0` is exactly what a 20-minute model call looks like from outside.
+`silent=2805s bytes=0 cpu_delta_cs=0` is exactly what a 45-minute model call looks like from outside.
+(⛔ This sentence read "20-minute" while the row above still carried the retired 1200 s idle default; a
+20-minute silence is 1200 s, which is BELOW the 2700 s bound and therefore not killed at all — the
+illustration contradicted the bound it was illustrating.)
 
 ### 6.5.2 The instrument that decides must itself be bounded
 

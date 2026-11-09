@@ -115,11 +115,50 @@ What the controller now does (`orch-loop.sh`, the `# BEGIN gh-bound` block):
   caller gets an empty body and a 124 instead of the limit it hit; `sweep_fail_kind` then reads `other`
   and the deferral is never armed. `NO_WAIT` is the repo's documented contract for a caller that owns
   its own bound (the eight heartbeat tools, `lander.sh`, `cloud-cell-supervisor.sh`): the layer records
-  the limit and answers AT ONCE, and derives its own 5 s lock budget from it, so the backoff moves to
-  the CYCLE's deferral — which is #2028's fix-direction #2 ("never sleep inside a substitution").
+  the limit and answers AT ONCE, and derives its own 5 s lock budget from it. What that closed is the
+  multi-minute in-call sleep — and the pinned substitution it caused; the attempt is simply cheap now
+  (and the deferral/cadence question is answered under the companion below, not here). This is
+  #2028's fix-direction #2 ("never sleep inside a substitution").
   Companion: `sweep_defer_until_recorded` takes the layer's recorded `until=` window when a refusal
-  carries no headers (a `NO_WAIT` answer has no response to take them from), so the box defers for the
-  real window instead of retrying once a minute.
+  carries no rate-limit headers. **Its scope, measured:** the layer's `marker_until` yields a real
+  `reset` only for a `kind=primary` (or `retry-after`) refusal and `now+BASE_WAIT` for a
+  `secondary`/`unclassified` one (`gh-limit.py:518`; `BASE_WAIT = cfg_secs("GH_LIMIT_BASE_WAIT", 60,
+  60, 3600)` at `:216`, so that floor is 60 s only on a DEFAULT box) — and a **headers-less**
+  `NO_WAIT` refusal is classified the latter, so on THAT path the record is the `now+BASE_WAIT`
+  floor: on a default box the two coincide and the companion adds nothing, while with the knob raised
+  the record is the WIDER window and the companion adopts it (`orch-loop.sh:4897-4898` keeps the
+  larger; `sweep-quota.test.sh` grades both halves — the default coincidence and the raised-knob
+  adoption). ⛔ **But the sweep's
+  call site is not that path, and the cadence follows from the response, not the record.** The sweep
+  passes `-i` (`orch-loop.sh:5841`, the sweep's own `gh_bounded api --paginate -i`), which is why the
+  layer's own `classify()` sees no headers
+  (`gh-limit.py:1466-1470` refuses `-i`/`--paginate`, `run_attempt` returns `{}`); the layer still
+  writes the child's FRAMED stdout through on a refusal (`gh-limit.py:5195-5212`, write at `:5211`),
+  so `SWEEP_RAW` — what the caller reads — carries the status line and the full header block.
+  Measured 2026-11-09: `gh api --paginate -i` on a non-2xx emits `HTTP/2.0 422 …` plus
+  `X-Ratelimit-Reset` on **stdout**. So `sweep_defer_until_recorded` returns from its HEADER arm
+  first (`orch-loop.sh:4893-4896`) and never reads the record: on a real refused request the
+  deferral is that response's `x-ratelimit-reset` / `retry-after`, floored at the sweep's OWN 60 s
+  (`orch-loop.sh:4802-4814` — both bounds are literals in `sweep_defer_until`, NOT the layer's
+  operator-configurable `GH_LIMIT_BASE_WAIT` at `gh-limit.py:216`, so raising that knob does not
+  move this floor) and held to the sweep's own 1 h ceiling — **not** a once-a-minute retry.
+  **The record branch is narrower than it looks, and its own reachability is part of the claim:**
+  the call site defers ONLY on a failure `sweep_fail_kind` classifies `rate-limit`
+  (`orch-loop.sh:5893`, `:4778-4796`), so the shape that can reach it is a `rate-limit` refusal
+  whose response carried no reset — `x-ratelimit-remaining: 0` with no `x-ratelimit-reset`, or a
+  stderr-phrase-only refusal with an empty `raw`. A timeout or a no-response failure is classified
+  `network` and defers NOTHING (the `else` branch at `:5899` logs the failure and writes no
+  deferral at all). Where the record branch does fire, it pays only if the last recorded **core**
+  observation was a `primary`/`retry-after` refusal from a different core call that did reach the
+  headers.
+  **Operational residual, stated rather than overstated — and it is the opposite of "once a minute":**
+  because a header always wins (`orch-loop.sh:4887-4889`), a **secondary** refusal's
+  `x-ratelimit-reset` is adopted as the sweep's deferral. That is the exact shape #2137 refuses
+  INSIDE the layer (`gh-limit.py:3498-3500`: "a reset read beside a secondary/unclassified refusal is
+  not a recovery time … Adopting it produced the full-window block this change removes") — so the
+  caller can park a cell for up to 1 h on a window the layer would have floored at its own
+  `now+BASE_WAIT` (60 s on a default box, `GH_LIMIT_BASE_WAIT`). A cell that
+  has not swept in 40 minutes is behaving as written, not wedged.
 - A `GH_BOUND_S`/`GH_BOUND_TRIP` that does not parse falls back LOUDLY. `tb_timeout` answers 125 for a
   non-integer bound, so an unvalidated typo would make every `gh` call fail and take the controller dark.
 - No usable `bounded.sh` is DEGRADED, DISCLOSED and not a refusal to start (the #2320 stance): each
@@ -133,11 +172,56 @@ What the controller now does (`orch-loop.sh`, the `# BEGIN gh-bound` block):
   (`disk-reaper.sh` exits 3); this file keeps its own stance — a controller that cannot start is the
   worse outage — but it does not claim a bound it does not have.
 - Graded by `scripts/orchestrator-harness/gh-bound.test.sh`, whose structural assertion reddens if a
-  NEW **shell** `gh` command position bypasses the bound. That is the scope it can see: it matches a
-  command position in `orch-loop.sh`'s own text, so a call hidden behind a variable, in `eval`, or
-  inside a python heredoc is out of its reach. No such site exists today (independently re-derived
-  over the file: every remaining `gh` is a string literal, the `command gh` pass-through, or the
-  `tb_timeout … gh` argv inside `gh_bounded`), so this is a stated limit, not a live bypass.
+  NEW **shell** `gh` command position bypasses the bound. **What it decides, and how:** a `)` closes a
+  `case` PATTERN list wherever it appears — the grammar is newline-agnostic (`case word in
+  [ [(] pattern [| pattern ]...) command-list ;;]... esac`) — so an expression anchored on a *line's
+  first token* sees only one of the two layouts, and left the one-line
+  `case … in pat) gh api … ;; esac` (the form `orch-loop.sh` itself writes on 88 lines) unscanned
+  (review rounds 2 and 3). The scan therefore accepts `)` at any offset, and blanks LITERAL text
+  first: quote removal runs before a command is executed, so a `)` inside a literal is never a
+  command position. Quoting is modelled in full — `'…'`, `"…"`, ANSI-C `$'…'`, and the ESCAPE
+  CHARACTER, which is a quoting mechanism in its own right (GNU Bash manual §3.1.2) — so `\` escapes
+  in unquoted code too. Round 6: it was modelled only INSIDE double quotes, and
+  `echo it\'s; gh api …` is VALID bash, yet the escaped apostrophe opened a single-quote span and
+  blanked the rest of the line — an under-report that could ship while the comment beside it ruled
+  that channel out as a syntax error.
+  ⛔ **But a `$( … )` substitution inside double quotes does run** — it IS a command
+  position, and blanking a double-quoted span wholesale blinded the scan to the repo's dominant
+  capture idiom `x="$(gh api …)"` (9 of the block's 16 call sites are captured, named at
+  `orch-loop.sh:519`, and the pre-fix line this block documents at `:4910`) — review round 4. A
+  command also follows a shell KEYWORD or a wrapper word, not only a line start, `;`, `|` or `)`: the
+  `while`/`until` loop heads and the `time`/`exec` wrappers are command positions too (round 5 —
+  `until` and `time` were unmodelled while `while` was), so the alternation's group carries all four.
+  The stripper keeps the code inside
+  `$( … )` and blanks only the literal around it, so the quoted and unquoted spellings of one call are
+  seen alike. All of it is graded by ONE fixture, so each is a pinned property rather than prose.
+  Every LOAD-BEARING alternative in the scan's group has its OWN row, and each of these MUST red:
+  the multi-line arm, the one-line `case`, the `while`/`until` loop heads, the other keyword heads
+  (`if`, `then`, `!`, `do`, `else`), the `time`/`exec` wrappers, the `{`/`|`/`&`/`(` anchors, a
+  `command`-prefixed call behind `;` (`; command gh api …`), `x="$(gh api …)"` (incl. the
+  `orch-loop.sh:4910` shape), and an ASSIGNMENT-PREFIXED call (`X=1 gh api …` — bash's grammar
+  admits `[assignment]… command`, so the command word there is a real command position with no
+  `)`/`|`/keyword anchor). The two alternatives that are NOT row-pinned are measured TRUE
+  redundancies, not assumed: `elif` (the group is not word-anchored, so `if` matches its tail) and
+  the `$\(` alternative (the `(` in the anchor class matches the same character) — deleting
+  either leaves the suite GREEN *and* the scan still catches the line. An already-bounded arm, its
+  assignment-prefixed spelling (`X=1 gh_bounded api …`), `pattern="a) gh api"` (and its SINGLE-quoted
+  spelling `pattern='a) gh api'`), a literal `) gh` in
+  prose, and an already-bounded capture MUST NOT. What is
+  still out of its reach is a call hidden behind a variable, in `eval`, inside a python heredoc, in a
+  BACKTICK substitution (the alternation anchors on `$(`,
+  not on a backtick), or behind a WRAPPER WORD the group does not carry — that last one including a
+  wrapper word BEFORE an assignment (`env GH_TOKEN=x gh api …`), which the assignment anchor cannot
+  reach because the wrapper is the command word. Of the wrapper words it
+  carries only `time` and `exec` — its other members are the keywords `if`/`then`/`elif`/`while`/
+  `until`/`!`/`do`/`else` — so `env`, `nice`, `timeout`, `xargs`, `nohup` and `stdbuf` are unmodelled
+  whether or not an assignment follows (`env gh api …` and `env GH_TOKEN=x gh api …` are equally
+  invisible; measured). `sudo` is the sole exception, and it errs CLOSED: the group is not
+  word-anchored, so its `do` alternative matches the tail of `sudo ` and `sudo gh api …` REDS — a
+  false positive at worst, never a silent pass (measured). No such site exists today
+  (independently re-derived over the file: every remaining `gh` is a string literal, the
+  `command gh` pass-through, or the `tb_timeout … gh` argv
+  inside `gh_bounded`), so this is a stated limit, not a live bypass.
 
 The other half of that report — "a heartbeat-age assertion that fails the cell rather than waiting to be
 noticed" — already exists and is not part of this change: `watchdog-loop.sh` reports `WEDGED` ("pid is
@@ -148,9 +232,11 @@ the heartbeat AGE, which is the only signal that distinguishes a wedged controll
 ## The layer that owns this now (#1988)
 
 Every harness `gh` call goes through **one** helper, `scripts/orchestrator-harness/gh-limit.py`,
-reached from two entry points: the Mac REST adapter (`gh-rest/gh`, first on the daemon PATH) and the
-cell wrapper (`gh-limit/gh`, first on the cell's controller PATH). It implements GitHub's own
-documented policy, so this file does not restate the numbers — it names where to look.
+reached from two entry points: the REST adapter (`gh-rest/gh`, first on the daemon PATH and, since
+#2039, first on the cell's controller PATH too) and the cell wrapper (`gh-limit/gh`, **second** on
+that controller PATH — behind the adapter, which routes every call through this same helper). It
+implements GitHub's own documented policy, so this file does not restate the numbers — it names
+where to look.
 
 | Behaviour | Where |
 |---|---|

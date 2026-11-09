@@ -850,7 +850,12 @@ echo "    scripts fleet farm: $fleet_copied copied (fleet cadence, #373 + runner
 # — the same sibling contract and the same `lib/` → `$DEST/scripts/lib/` layout as the seven above.
 # Farming the wrapper WITHOUT this reader is a machine-wide unit that refuses every pass with a named
 # farm gap (see the wrapper's header), so the pair is delivered together.
-lib_srcs=(pid-identity.sh diff-normalize.py beat-pair.sh bounded.sh transcript-patterns.sh live-paths.sh cmux_payload.py repo-set.sh cmux-dispatch-path.sh)
+# agent-infra#3453 adds cell-home.sh: the ONE derivation of a cell's home. Every unit renderer and
+# every script that gives a lane its HOME now CONSUMES it instead of spelling `/tmp/cell-home` (the
+# legacy volatile home) or `/home/cmux` as a default, so a farm that omitted this file would leave
+# every consumer on its named `$HOME` fallback — and, worse, would leave the RESOLVER absent while the
+# consumers that source it look healthy. Farm it with them.
+lib_srcs=(pid-identity.sh diff-normalize.py beat-pair.sh bounded.sh transcript-patterns.sh live-paths.sh cmux_payload.py repo-set.sh cmux-dispatch-path.sh cell-home.sh)
 mkdir -p "$DEST/scripts/lib"
 lib_copied=0
 lib_failed=0

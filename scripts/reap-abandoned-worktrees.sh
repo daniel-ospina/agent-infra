@@ -153,7 +153,42 @@
 set -uo pipefail
 
 SCRIPT_NAME="reap-abandoned-worktrees.sh"
-SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
+# ⛔ THE SELF PATH COUNTS ONLY WHEN IT NAMES THIS FILE — see `lib/cell-home.sh` §CONSUMERS. Under
+# `bash -s` (a piped start) `$0` is literally `bash`, so an unguarded `dirname` answers the CALLER's
+# working directory and this script would source a library out of it.
+_SELF="${BASH_SOURCE[0]:-}"; [ -f "$_SELF" ] || _SELF=""
+SELF_DIR=""
+[ -n "$_SELF" ] && SELF_DIR="$(cd "$(dirname "$_SELF")" 2>/dev/null && pwd)"
+# ── THE ONE HOME (agent-infra#3453) ──────────────────────────────────────────────────────────────
+# This script must not spell `/tmp/cell-home` itself: the one literal lives in `scripts/lib/cell-home.sh`
+# and every other shipped file names it through `CELL_HOME_LEGACY`. The pre-#3453 shape here was
+# `${REAP_AW_CELL_HOME_DEFAULT:-/tmp/cell-home}` — one seam deeper than the flat alternatives the sweep
+# in `lib/cell-home.test.sh` first carried, so it survived a green `c1` (review F3a, verified NO-MATCH).
+# FAIL-CLOSED like the `lib/live-paths.sh` block below, for the same reason: a home this script cannot
+# name is a guard it cannot enforce, and a silently-empty preserve-set is how `/tmp/cell-home` becomes
+# reapable (the measured #3278 defect this guard exists for).
+# ⚠️ ACCEPTED TRADE (review F5): this block runs before argument parsing, so `--help`/`-h` also exits 3
+# on a box with no farmed library. The alternative — answering `--help` first — means the help text and
+# the guard's remedy have two copy sites to drift between, which is worse for a delegate whose only
+# scheduler is a timer. The failure NAMES the missing file and the three places it was looked for, so an
+# operator is never guessing.
+CELL_HOME_LIB=""
+# ⛔ `${SELF_DIR:+…}` AND `${HOME:+…}` — AN EMPTY PREFIX MUST NOT BUILD AN ABSOLUTE PATH. `"$SELF_DIR/lib/…"`
+# with a piped start (no `SELF_DIR`) yields `/lib/cell-home.sh`, and `"${HOME:-}/.pi/…"` with no HOME
+# yields `/.pi/…`: absolute paths outside any checkout, exactly the shape §CONSUMERS forbids (review
+# F5). They still fail closed, but a candidate list must not propose a file no checkout can own.
+for _cand in ${SELF_DIR:+"$SELF_DIR/lib/cell-home.sh"} \
+             ${HOME:+"$HOME/.pi/agent/scripts/lib/cell-home.sh"} \
+             ${AGENT_INFRA_PATH:+"$AGENT_INFRA_PATH/scripts/lib/cell-home.sh"}; do
+    [ -n "$_cand" ] && [ -r "$_cand" ] && { CELL_HOME_LIB="$_cand"; break; }
+    done
+if [ -z "$CELL_HOME_LIB" ]; then
+    printf '%s: ⛔ FAIL-CLOSED — lib/cell-home.sh not found (looked beside this script, in $HOME/.pi/agent/scripts/lib, and in $AGENT_INFRA_PATH/scripts/lib) — without it this script cannot name the cell home its preserve-set must protect\n' "$SCRIPT_NAME" >&2
+    printf 'SKIP reason=cell-home-library-missing\n'
+    exit 3
+fi
+# shellcheck source=lib/cell-home.sh
+. "$CELL_HOME_LIB" || { printf 'SKIP reason=cell-home-library-unreadable path=%s\n' "$CELL_HOME_LIB"; exit 3; }
 STATE_DIR="${REAP_AW_STATE_DIR:-${HOME:-}/.pi/agent/state}"
 LOG="${REAP_AW_LOG:-$STATE_DIR/reap-abandoned-worktrees.log}"
 LOCK_DIR="$STATE_DIR/reap-abandoned-worktrees.lock"
@@ -216,7 +251,9 @@ ROOTS="${REAP_AW_ROOTS:-/tmp}"
 # the exact shape #3278 measured (review round 7). It is a DEFAULT, not a second source of truth: an
 # exported `CELL_HOME` still wins, and a deliberately wrong value protects a different directory — the
 # same trade an operator already makes by setting `CELL_HOME`, so it adds no new hazard class.
-CELL_HOME_DEFAULT="${CELL_HOME:-${REAP_AW_CELL_HOME_DEFAULT:-/tmp/cell-home}}"
+# ⛔ THE LEGACY VALUE COMES FROM THE RESOLVER (`CELL_HOME_LEGACY`), NOT FROM A SECOND LITERAL here — see
+# the derivation block above and `lib/cell-home.sh`.
+CELL_HOME_DEFAULT="${CELL_HOME:-${REAP_AW_CELL_HOME_DEFAULT:-$CELL_HOME_LEGACY}}"
 DRY_RUN="${REAP_AW_DRY_RUN:-1}"
 BUDGET="${REAP_AW_BUDGET_SECONDS:-300}"
 GIT_TIMEOUT="${REAP_AW_GIT_TIMEOUT:-60}"
@@ -297,6 +334,11 @@ if [ "$PRINT_CONFIG" = 1 ]; then
     # The cell home the guard will protect even with `CELL_HOME` unset (the unit's shape). Reported
     # like the other effective bounds: a pass record must not hide what the guard was comparing.
     printf 'cell_home_default=%s\n' "$CELL_HOME_DEFAULT"
+    # ⛔ AND THE DERIVED HOME ITSELF (`cell_home_resolve`), reported next to the legacy guard reference
+    # so the operator can see BOTH readings and whether they differ — the state #3453 exists to remove.
+    # It is also the call that makes the `(d)` sweep able to certify that this file ASKS the resolver
+    # rather than answering "what is this box's home?" on its own (review F3b).
+    printf 'cell_home=%s\n' "$(cell_home_resolve)"
     printf 'mode=%s\n' "$([ "$DRY_RUN" = 1 ] && printf dry-run || printf apply)"
     exit 0
 fi
@@ -313,7 +355,12 @@ if [ -n "${REAP_AW_LIVE_PATHS:-}" ]; then
     }
     LIVE_PATHS_LIB="${REAP_AW_LIVE_PATHS}"
 else
-    for cand in "$SELF_DIR/lib/live-paths.sh" "${HOME:-}/.pi/agent/scripts/lib/live-paths.sh"; do
+    # ⛔ THE SAME `${VAR:+…}` RULE THIS FILE STATES 180 LINES ABOVE (review F-E): a piped start leaves
+    # `SELF_DIR` empty (`/lib/live-paths.sh`) and an unset HOME leaves `/.pi/…`, i.e. absolute paths no
+    # checkout owns. Fails closed either way, but a file that states a rule must not break it, or the
+    # next reader cannot tell which spelling is correct.
+    for cand in ${SELF_DIR:+"$SELF_DIR/lib/live-paths.sh"} \
+                ${HOME:+"$HOME/.pi/agent/scripts/lib/live-paths.sh"}; do
         [ -n "$cand" ] && [ -f "$cand" ] && { LIVE_PATHS_LIB="$cand"; break; }
     done
 fi
@@ -417,8 +464,12 @@ load_pin() {
         f="$REAP_AW_STAMP"
         [ -r "$f" ] || { log_line "SKIP reason=stamp-unreadable path=$f"; return 3; }
     else
-        for cand in "${CELL_HOME:-}/orchestrator/.agent-infra-stamp.json" \
-                    "${HOME:-}/.pi/orchestrator/.agent-infra-stamp.json"; do
+        # ⛔ `${VAR:+…}`, NOT `${VAR:-}` (review round-3 F5): with HOME unset the second candidate is
+        # `/.pi/orchestrator/…` — an absolute path no box owns, and the exact spelling the block 290 lines
+        # above declares forbidden. Fails closed either way, but a file that states a rule must not break
+        # it, or the next reader cannot tell which spelling is correct.
+        for cand in ${CELL_HOME:+"$CELL_HOME/orchestrator/.agent-infra-stamp.json"} \
+                    ${HOME:+"$HOME/.pi/orchestrator/.agent-infra-stamp.json"}; do
             [ -n "$cand" ] && [ -f "$cand" ] && { f="$cand"; break; }
         done
     fi

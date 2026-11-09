@@ -105,6 +105,7 @@ PR_STATE_BIN="$T/no-router-in-this-suite"; export PR_STATE_BIN
 run() { # run <pr> <args…>  → sets RC, OUT
   OUT="$(PATH="$BIN:$PATH" GH_LOG="$T/gh.log" O="$OT" HOME="$T/home" REPO_PATH="${REPO_PATH:-$RUN_REPO}" \
         LANE_MERGE_INTERVAL=5 LANE_MERGE_WAIT="${WAIT_S:-0}" LANE_MERGE_POLL="${POLL_S:-0}" \
+        LANE_MERGE_ELAPSED_S="${LANE_MERGE_ELAPSED_S:-}" \
         bash "$SCRIPT" "$@" 2>&1)"; RC=$?
 }
 verdict_of() { cat "$OT/state/lanemerge-$1.verdict" 2>/dev/null; }
@@ -800,7 +801,7 @@ ck "a classifier that cannot run → it STAMPS WAITING_CLASSIFIER (an unjudged h
 # `$O/lane-merge.sh` path. Every other row in this suite exports `O`, which is exactly why none saw it.
 # The assertion is that argv parsing is REACHED: a bad flag must produce the documented 2, not 1.
 OUT="$(env -u O bash "$SCRIPT" --definitely-not-a-flag 2>&1)"; RC=$?
-ck "with `O` UNSET the script still reaches argv parsing (a bad flag is usage 2, not an unbound-variable 1)" \
+ck "with O UNSET the script still reaches argv parsing (a bad flag is usage 2, not an unbound-variable 1)" \
    $([ "$RC" = 2 ] && echo 0 || echo 1)
 case "$OUT" in
   *"unbound variable"*) ck "…and it does not die on \$O under set -u" 1 ;;
@@ -808,10 +809,9 @@ case "$OUT" in
 esac
 # The same run with a VALID shape must not be refused by `O` either: `--help` names the usage contract.
 OUT="$(env -u O bash "$SCRIPT" --help 2>&1)"; RC=$?
-ck "…and `--help` with `O` unset exits 0 instead of 1" $([ "$RC" = 0 ] && echo 0 || echo 1)
+ck "…and --help with O unset exits 0 instead of 1" $([ "$RC" = 0 ] && echo 0 || echo 1)
 
 # ── 11c-octodecies. the budget hand-off has an arm per disposition it can actually find ────────
-────
 # ⛔ WITHOUT THIS the `WAITING_NO_VERDICT` arm was dead text: deleting it left ALL 63 green (measured),
 # so the hand-off still said "the merge chain has not resolved this PR" about chunks that had resolved
 # the question (nothing to fix) — and the same catch-all swallowed CHECKS/CLASSIFIER.
@@ -1309,9 +1309,11 @@ ck "a TOTAL-only response is NOT a green head (0 check-runs = nothing measured, 
 
 # ── 18. the SUPERVISION BUDGET is sized to what the LANE can actually SPEND, and re-armed (E1) ────
 # ⛔ THE OLD INVARIANT WAS SATISFIED BY MAKING THE TWO SIDES EQUAL (landing review, P1, verified):
-# 1500 (WAIT_S) + 15 x 120 (MAX_WATCH x POLL) = 3300 = lane.sh's LANE_TIMEOUT, so the merge phase
-# consumed the WHOLE wall clock and left EXACTLY ZERO for the lane's implementation, its commits, its
-# pushes and opening the PR. With any real implementation time the lane was killed at 3300s still
+# 1500 (WAIT_S) + 15 x 120 (MAX_WATCH x POLL) = 3300 = the 3300 s LANE_TIMEOUT of the day, so the merge
+# phase consumed the WHOLE wall clock and left EXACTLY ZERO for the lane's implementation, its commits, its
+# pushes and opening the PR. (That literal is gone — agent-infra#2888 gave the wall ONE default,
+# `LANE_BACKSTOP_S` = 7200, so the same inequality is now written against 7200 throughout.) With any real
+# implementation time the lane was killed at 3300s still
 # inside its merge phase — neither bound was ever reached by the lane that OWNS them, no verdict was
 # written, no hand-off comment was posted, and the only signal was lane.sh's "NO merge-phase verdict"
 # line. The BLOCKED_ATTEMPTS / "supervision budget spent" path was unreachable in production.
@@ -1345,6 +1347,68 @@ _ir="$(sed -n 's/.*LANE_MERGE_IMPL_RESERVE:-*\([0-9]*\)}.*/\1/p' "$SCRIPT" | hea
 [ -n "$_ps" ] && [ -n "$_lt" ] && [ -n "$_ws" ] && [ -n "$_ir" ] && _mw=$(( (_lt - _ws - _ir) / _ps )) || _mw=0
 ck "WAIT_S ($_ws) + MAX_WATCH x POLL ($_mw x $_ps) + IMPL_RESERVE ($_ir) = $(( ${_ws:-0} + ${_mw:-0} * ${_ps:-0} + ${_ir:-0} )) ≤ lane-merge.sh's OWN LANE_WALL_S ($_lt) — by ARITHMETIC across the two files, with a NON-ZERO implementation reserve" \
    $([ -n "$_mw" ] && [ "${_ir:-0}" -gt 0 ] && [ "${_mw:-0}" -ge 1 ] && [ $(( ${_ws:-0} + ${_mw:-0} * ${_ps:-0} + ${_ir:-0} )) -le "$_lt" ] && echo 0 || echo 1)
+# ⛔ AND THE CHECK WAIT MUST BE ABLE TO REACH A COMPLETING CI (agent-infra#3584). The arithmetic above is
+# satisfied by ANY positive `_ws` — including one SMALLER than the fastest real CI pass, which is the
+# shipped defect this arm exists to keep out: at 1500 s the wait was BELOW the measured minimum (1623 s),
+# so `INFLIGHT` never reached 0 on the slow population and the loop expired into `WAITING_CHECKS`. ⛔ THE
+# EARLIER WORDING HERE SAID THE SUCCESS PATH "fired zero times" AND THAT WAS FALSE (review cycle 7, P2 —
+# verified against the deployed record): `state/lanemerge-*.chain` holds FIVE launches on 2026-11-08
+# inside the cited window, and `lanemerge-3796.verdict` is `WAITING_HEAD_MOVED`, which requires a live
+# chain pid — so heads DID reach `launch_chain`. What the record supports is `0 x MERGED`: the heads that
+# got through the wait were then blocked downstream. The arithmetic leg is unaffected (1500 s sits below
+# the 1623 s minimum, so which lanes got through was decided by how late they entered, not by CI). A
+# bound no completing run can reach is an inert guard, and no arithmetic asserts it away.
+# The floor is MEASURED, and BOTH CLOCKS ARE STATED because they differ by 14.4 points at 5400 s (94.3 vs
+# 79.9; review cycle 6, P2). Completed non-cancelled non-main `ci.yml` runs on daniel-ospina/agent-infra
+# over the runs
+# endpoint's 1000-run cap as measured 2026-11-09: LANE-VISIBLE (`created_at` -> `updated_at`, which is the
+# clock a lane sits through) min 1931 s, p50 4062 s, p90 9825 s, p95 17185 s, max 32157 s;
+# RUN DURATION
+# (`run_started_at` -> `updated_at`, excluding the pre-start queue) min 1623 s, p50 3836 s, p90 4928 s,
+# p95 5612 s, max 7968 s. 4800 s sits above the fast day's run-duration p95 (4565 s) and is 3.2x the bound
+# this arm exists to keep out, and the shipped 5400 s covers 79.9 % of the lane-visible population
+# (167/209) / 94.3 % of the run-duration one (197/209) — both stated in the script.
+# ⛔ THE CLAIM IS STATED NO STRONGER THAN THE DATA SUPPORTS, TWICE OVER.
+#   (a) NOT A PERCENTAGE (review cycle 3, P2): a share of a SLIDING window rots — an earlier draft said
+#       "88.2 %" and the same query re-run hours later measured 87.7 %, because new runs push old ones out
+#       of the endpoint's 1000-run cap. The MINIMUM does not rot that way, so the floor is argued from it.
+#   (b) NOT "covered no completing run" (review cycle 4, P2): 1623 s is the RUN's own duration, while the
+#       loop's deadline starts at PROCESS START — at merge-phase entry, AFTER the push. So the bound a lane
+#       must survive is `run duration - entry latency`, and 123 s of margin means a lane entering late
+#       COULD have seen `INFLIGHT == 0` inside 1500 s. What the data supports is that 1500 s sat below the
+#       fastest run and 2.5x under the median, so the success path only fired for lanes that entered late.
+#   (c) NOT A CAUSAL CLAIM ABOUT MERGES (review cycle 5, P2): the deployed record is FOUR verdict files —
+#       2 x `WAITING_CHECKS … after 1500s` and 2 x `FIX_REQUIRED … this head's own checks are RED` — and a
+#       RED short-circuits BEFORE the `INFLIGHT` test, so those two lanes never reached the wait and their
+#       0 merges are explained by the reds, not by the bound. The supportable statement is the COST: a lane
+#       that exhausts 1500 s writes a verdict that is neither a fix order nor a merge, and `INFLIGHT` is not
+#       recorded on that path at all. Whether the bound also stopped a GREEN head is argued from the
+#       duration population, not from these four files.
+# The floor is deliberately NOT the three-day p95 (5612 s): no wait above 5460 s fits this lane's clock at
+# all (see the arithmetic ceiling in lane-merge.sh), so a floor there could never be satisfied and would
+# red on every correct tree. The residual above 5400 s is stated in the script; it is not this arm's to
+# close.
+ck "the per-round check wait ($_ws s) is not back under the measured distribution (floor 4800 s; the old 1500 s sat below the fastest measured run of 1623 s and 2.5x under the median) — a wait below it can only succeed for a lane that entered its merge phase late" \
+   $([ -n "$_ws" ] && [ "${_ws:-0}" -ge 4800 ] && echo 0 || echo 1)
+# ⛔ AND THE OTHER SIDE MUST NOT BE STARVED IN THE SAME EDIT (round-2 review, P2). The two bounds are paid
+# out of ONE clock, so raising the wait without a floor on what it leaves would trade a wait that cannot
+# finish for a supervision budget that cannot supervise: `MAX_WATCH` floors at 1 chunk, so a wait raised
+# to 6100 s would still pass the arithmetic arm above (`_mw` = 1, 6100 + 120 + 900 = 7120 ≤ 7200) while
+# leaving a single 120 s `--watch` call — a supervision allowance that exists only formally. 7 chunks is
+# the FLOOR (it is the allowance the retired 3300 s clock afforded at a 1500 s wait, and what the 7200 s
+# clock affords at the 5400 s wait — ⛔ NOT "the SHIPPED allowance": `origin/main` derives 40, because
+# `(7200-1500-900)/120 = 40` there; a label that read as a claim about main was false and is corrected
+# in place — review cycle 7, P3), so it is the regression floor: a future edit that eats it must raise
+# LANE_BACKSTOP_S (which raises `_mw`) rather than quietly convert supervision into waiting.
+# ⛔ THE EXAMPLE VALUES ARE CHECKED, NOT ASSUMED — AND BOTH EARLIER DRAFTS WERE WRONG (review cycles 2 and
+# 3, verified by mutation on copies): 6300 s reds this arm's own ARITHMETIC sibling (`_mw` = 0, which its
+# `-ge 1` refuses), so 6300 demonstrates nothing at all. 6100 s passes the arithmetic and this arm is the
+# one that NAMES the cause — but it does NOT isolate it: at `_mw` = 1 several chunk-accounting arms (the
+# WAITING_API refund, the LOAD-overwrite case, the charged-chunk case) also red, because they need more
+# than one chunk to exercise. That is the suite being STRICTER than a single-arm claim, and what is
+# corrected here is the claim, not the arm.
+ck "the derived supervision allowance ($_mw chunks) is not starved — raising the check wait on one clock must not reduce --watch to a single chunk" \
+   $([ -n "$_mw" ] && [ "${_mw:-0}" -ge 7 ] && echo 0 || echo 1)
 # ⛔ AND THE ARITHMETIC IS NOT THE RUNTIME (this suite's own lesson: a source-shape assertion passes on a
 # script whose runtime lost the property). Drive the DERIVED cap through --watch with a SHRUNK
 # LANE_TIMEOUT: 1500 - 0 (check wait) - 900 (reserve) = 600s / 120s = 5 chunks, so chunk 6 is refused
@@ -1363,6 +1427,60 @@ OUT="$(REPO_PATH="${REPO_PATH:-$RUN_REPO}" PATH="$BIN:$PATH" GH_LOG=/dev/null O=
       bash "$SCRIPT" 40 --watch --repo o/r --pr-tsv "$T/pr-fit.tsv" 2>&1)"; RC=$?
 ck "…and one chunk EARLIER the derived cap does NOT refuse it (the bound is REACHABLE by the lane that owns it, not always-already-spent)" \
    $([ "$RC" = 11 ] && [ "$(verdict_of 40 | cut -d' ' -f1)" = WAITING_CHAIN_ABSENT ] && echo 0 || echo 1)
+# ⛔ AND THE ALLOWANCE MUST BE WHAT THE CLOCK ACTUALLY LEFT, NOT THE WORST CASE'S SHARE (#3850 review,
+# P2 — verified by arithmetic against this repo's own declared chain budgets). The design operand sizes the
+# allowance against the FULL 5400 s check wait, but supervision is paid after the wait, from whatever clock
+# remains — so a lane whose checks settled early got the worst case's 7 chunks (840 s) while thousands of
+# seconds still stood. 840 s is BELOW the chain this loop supervises: `merge-one.sh` budgets its reviewer at
+# `REVIEW_TIMEOUT` = 1800 s and leases the PR claim for 3000 s (`claims.sh:166`), and `chain-merge.sh` waits
+# 1890 s for the merge phase — so the lane handed off `BLOCKED_ATTEMPTS … chain was STILL RUNNING` over a
+# chain that was legitimately still reviewing, and `WATCH_F` only rewinds on a fix round or a head move.
+# The arm drives the DERIVED-FLOOR path first: 7 chunks seeded, chunk 8 arrives with an UNRESOLVABLE lane
+# clock (no `--issue`, no seam) — the design floor must still refuse it, or supervision becomes unbounded
+# for a controller re-run that is not under a lane at all. This row PASSES PRE-FIX and is here as the
+# regression guard that keeps the raise below honest.
+new_o "$T/pr-fit.tsv"
+printf '7\n' > "$OT/state/lanemerge-46.watch"
+OUT="$(REPO_PATH="${REPO_PATH:-$RUN_REPO}" PATH="$BIN:$PATH" GH_LOG=/dev/null O="$OT" HOME="$T/home" \
+      LANE_MERGE_WAIT=5400 LANE_MERGE_POLL=120 \
+      bash "$SCRIPT" 46 --watch --repo o/r --pr-tsv "$T/pr-fit.tsv" 2>&1)"; RC=$?
+ck "with NO resolvable lane clock the supervision allowance stays the 7-chunk design floor — chunk 8 is still refused (a controller re-run is not granted unbounded supervision)" \
+   $([ "$RC" = 13 ] && [ "$(verdict_of 46 | cut -d' ' -f1)" = BLOCKED_ATTEMPTS ] && echo 0 || echo 1)
+# …and with the SAME 7 spent chunks and a RESOLVED clock, chunk 8 must be ADMITTED: at elapsed 1000 s the
+# remaining-clock fit is `(7200 − 1000 − 120)/120 = 50`, clamped by the watchdog's 2700 s allowance to 22 —
+# still far above 7, and still inside both bounds. Pre-fix this row reds (MAX_WATCH stayed 7 → exit 13),
+# which is the non-vacuity of the raise.
+new_o "$T/pr-fit.tsv"
+printf '7\n' > "$OT/state/lanemerge-47.watch"
+OUT="$(REPO_PATH="${REPO_PATH:-$RUN_REPO}" PATH="$BIN:$PATH" GH_LOG=/dev/null O="$OT" HOME="$T/home" \
+      LANE_MERGE_WAIT=5400 LANE_MERGE_POLL=120 LANE_MERGE_ELAPSED_S=1000 \
+      bash "$SCRIPT" 47 --watch --repo o/r --pr-tsv "$T/pr-fit.tsv" 2>&1)"; RC=$?
+ck "a lane whose checks settled EARLY gets supervision sized to the clock it has LEFT (chunk 8 admitted rather than refused against the worst-case wait) — the false 'chain was STILL RUNNING' blocker" \
+   $([ "$RC" = 11 ] && [ "$(verdict_of 47 | cut -d' ' -f1)" = WAITING_CHAIN_ABSENT ] && echo 0 || echo 1)
+# ⛔ AND THE RAISE MUST NOT OUT-REACH THE WATCHDOG (#3850 review, P2 — the second of the two bounds).
+# `--watch` writes NO heartbeat, so a chunk sequence longer than `IDLE_BOUND_S` is killed as `stalled` with
+# no verdict; the smaller bound therefore WINS. `(200 − 10)/120 = 1` chunk here, against a design floor of
+# `(7200 − 0 − 900)/120 = 52`: the watchdog's 1 must be taken, not the floor's 52.
+new_o "$T/pr-fit.tsv"
+printf '1\n' > "$OT/state/lanemerge-48.watch"
+OUT="$(REPO_PATH="${REPO_PATH:-$RUN_REPO}" PATH="$BIN:$PATH" GH_LOG=/dev/null O="$OT" HOME="$T/home" \
+      LANE_MERGE_WAIT=0 LANE_MERGE_POLL=120 LANE_BOUND_IDLE_S=200 LANE_MERGE_ELAPSED_S=1000 \
+      bash "$SCRIPT" 48 --watch --repo o/r --pr-tsv "$T/pr-fit.tsv" 2>&1)"; RC=$?
+ck "…but supervision is CLAMPED by the watchdog's allowance when that is smaller (200 s allowance → 1 chunk), so the raised allowance can never get the lane killed as 'stalled' with no verdict" \
+   $([ "$RC" = 13 ] && [ "$(verdict_of 48 | cut -d' ' -f1)" = BLOCKED_ATTEMPTS ] && echo 0 || echo 1)
+# ⛔ AND `--watch` MUST NOT EMIT THE CHECK-WAIT CAP (#3850 review, P3 — verified). The cap block had no
+# `WATCH` conjunct, so a `--watch` invocation — which returns inside its chunk loop and never reaches the
+# check wait — read a multi-line `CAPPED at …s` say_err about a wait it was never going to sit through, and
+# mutated `WAIT_S` for no consumer. The `--status` guard cannot cover this (both paths share module scope).
+# Conditions here are the cap's own: no heartbeat target (no `--issue`, no lane log), and the shipped
+# 5400 s wait above a 2700 s allowance. Pre-fix this row reds on the `CAPPED at` clause.
+new_o "$T/pr-fit.tsv"
+printf '0\n' > "$OT/state/lanemerge-49.watch"
+OUT="$(REPO_PATH="${REPO_PATH:-$RUN_REPO}" PATH="$BIN:$PATH" GH_LOG=/dev/null O="$OT" HOME="$T/home" \
+      LANE_MERGE_WAIT=5400 LANE_MERGE_POLL=120 \
+      bash "$SCRIPT" 49 --watch --repo o/r --pr-tsv "$T/pr-fit.tsv" 2>&1)"; RC=$?
+ck "a --watch chunk emits NO check-wait cap chatter about a wait it never sits through (the runtime limit is scoped to the path that runs the wait)" \
+   $([ "$RC" = 11 ] && [ "$(verdict_of 49 | cut -d' ' -f1)" = WAITING_CHAIN_ABSENT ] && ! grep -q 'CAPPED at' <<<"$OUT" && echo 0 || echo 1)
 new_o "$T/pr4.tsv"
 printf '20\n' > "$OT/state/lanemerge-32.watch"
 printf '15\n' > "$OT/state/lanemerge-32.apiretry"
@@ -1376,6 +1494,251 @@ ck "a NEW fix round RE-ARMS the supervision budget (a spent counter must not ref
 ck "a NEW fix round also clears apiretry / headmoved / lastdisp (a stale disposition must not drive the hand-off)" \
    $([ ! -f "$OT/state/lanemerge-32.apiretry" ] && [ ! -f "$OT/state/lanemerge-32.headmoved" ] \
       && [ ! -f "$OT/state/lanemerge-32.lastdisp" ] && echo 0 || echo 1)
+
+# ⛔ AND THE CHECK WAIT HAS A *SECOND* BOUND THAT IS NOT THIS FILE'S CLOCK (#3584 review, P1 — MEASURED).
+# `WAIT_S` is spent inside ONE tool call, under `lane-bound.sh watch`, whose bound is IDLE (`LANE_BOUND_IDLE_S`,
+# default 2700 s) and whose only working progress arm for a polling loop is LANE-LOG GROWTH. Measured on this
+# change's own review: `lane-bound.sh run --idle 60 -- … bash lane-merge.sh 99 --checks-tsv <in-flight>`
+# returned `verdict=stalled … bytes_delta=0 cpu_delta_cs=0` at 75 s and wrote NO verdict — the CPU arm cannot
+# see a poll's short-lived `gh`/`python3` child (`ps time` reports accumulated time of processes still ALIVE).
+# These arms pin both halves of the fix: the heartbeat the watchdog needs, and the self-cap that keeps an
+# unhearted wait from out-reaching the bound that would kill the lane UNLABELLED (`lane.sh`'s
+# "NO merge-phase verdict", no PR comment, no resumable counter) — strictly worse than the 1500 s bound.
+# ⛔ THE THIRD CLAUSE IS ANCHORED TO CODE, NOT TO PROSE (review round 3, P3 — verified): `grep heartbeat`
+# matched a dozen COMMENTS and therefore could not fail with the runtime block deleted. It now matches the
+# append that actually produces the signal.
+ck "the check wait is bounded by the WATCHDOG's progress allowance too, not only by this file's clock (the measured 2700 s idle bound is named, and an unhearted wait CAPS itself instead of out-reaching it)" \
+   $(grep -q 'LANE_BOUND_IDLE_S:-2700' "$SCRIPT" && grep -q 'the check wait is CAPPED at' "$SCRIPT" \
+     && grep -q '>> "$HB_F"' "$SCRIPT" && echo 0 || echo 1)
+# (1) the heartbeat the watchdog reads. Pre-fix this file wrote NOTHING: `log_line` is stdout, and a `-p`
+# lane's stdout reaches no log, so the wait was silent for its whole length.
+# ⛔ "EVERY POLL" MUST BE ASSERTED AS REPETITION, NOT AS PRESENCE (verified by mutation — this arm passed
+# a ONE-SHOT heartbeat): with `WAIT_S=2` the loop iterates exactly ONCE, so `grep -q` is satisfied by a
+# heartbeat written a single time, which would leave the lane silent for ~5370 s and get it TERM'd as
+# `stalled` at 2700 s — the precise defect this block exists to close. So the wait is long enough for
+# several iterations (12 s at `LANE_MERGE_INTERVAL=5` = 3 polls) and the assertion counts them. Mutating
+# the write to happen once reds THIS arm and nothing else.
+new_o "$T/pr4.tsv"
+: > "$T/hb-38.log"
+WAIT_S=12 LANE_MERGE_HB="$T/hb-38.log" run 38 --repo o/r --pr-tsv "$T/pr4.tsv" --checks-tsv "$T/checks-inflight.tsv"
+ck "the check wait writes a WATCHDOG-VISIBLE heartbeat on EVERY poll, not once (LANE_MERGE_HB; >=2 over 3 polls) — a one-shot heartbeat leaves the wait silent and it is killed as 'stalled' with no verdict" \
+   $([ "$RC" = 11 ] && [ "$(grep -c '\[lane-merge\] heartbeat' "$T/hb-38.log")" -ge 2 ] && echo 0 || echo 1)
+# …and the target is DISCOVERED without any operator wiring when the lane's own log exists (`--issue` →
+# `$O/logs/lane-<issue>.log`, the file `lane.sh` writes and `run_agent` hands the watchdog as `--log`).
+new_o "$T/pr4.tsv"
+: > "$OT/logs/lane-33.log"
+WAIT_S=6 POLL_S=5 LANE_BOUND_IDLE_S=5 run 33 --issue 33 --repo o/r --pr-tsv "$T/pr4.tsv" --checks-tsv "$T/checks-inflight.tsv"
+ck "…and the heartbeat target is the LANE's own log by DEFAULT (no operator wiring), so the full wait is allowed rather than capped" \
+   $([ "$RC" = 11 ] && grep -q '\[lane-merge\] heartbeat' "$OT/logs/lane-33.log" && ! grep -q 'CAPPED at' <<<"$OUT" && echo 0 || echo 1)
+# (2) the self-cap when no target resolves: the wait must land BELOW the watchdog's allowance, WITH a verdict.
+new_o "$T/pr4.tsv"
+WAIT_S=60 POLL_S=5 LANE_BOUND_IDLE_S=20 run 34 --repo o/r --pr-tsv "$T/pr4.tsv" --checks-tsv "$T/checks-inflight.tsv"
+ck "with NO heartbeat target the check wait CAPS itself below lane-bound.sh's allowance (60 s wait, 20 s allowance → 10 s) and still writes WAITING_CHECKS, instead of waiting to be killed unlabelled" \
+   $([ "$RC" = 11 ] && [ "$(verdict_of 34 | cut -d' ' -f1)" = WAITING_CHECKS ] && grep -q 'CAPPED at 10s' <<<"$OUT" && echo 0 || echo 1)
+# (3) ⛔ THE WAIT MUST FIT WHAT IS LEFT OF THE LANE'S OWN CLOCK, NOT JUST THE WHOLE OF IT (#3584 review,
+# P1 — verified). `deadline` was `now + WAIT_S`, so a lane entering its merge phase more than ~1800 s in
+# (7200 − 5400) was TERMed by lane-bound.sh's WALL ceiling mid-wait: no `WAITING_CHECKS`, no verdict file,
+# no hand-off — strictly worse than the 1500 s bound this change replaces. `LANE_MERGE_ELAPSED_S` is the
+# seam for "how long has this lane been running"; the token path is what a real lane uses.
+new_o "$T/pr4.tsv"
+WAIT_S=60 POLL_S=5 LANE_MERGE_ELAPSED_S=7180 run 35 --repo o/r --pr-tsv "$T/pr4.tsv" --checks-tsv "$T/checks-inflight.tsv"
+ck "a lane that has already spent 7180 s of its 7200 s clock CAPS the check wait to the 10 s that is left (still WAITING_CHECKS, still a verdict) instead of waiting to be WALL-TERMed with none" \
+   $([ "$RC" = 11 ] && [ "$(verdict_of 35 | cut -d' ' -f1)" = WAITING_CHECKS ] && grep -q 'CAPPED at 10s' <<<"$OUT" && grep -q 'already spent 7180s' <<<"$OUT" && echo 0 || echo 1)
+# …and a lane's elapsed time it CANNOT resolve is disclosed, never silently treated as "the lane just started".
+new_o "$T/pr4.tsv"
+WAIT_S=0 run 36 --repo o/r --pr-tsv "$T/pr4.tsv" --checks-tsv "$T/checks-inflight.tsv"
+ck "an UNRESOLVABLE lane elapsed is reported as a residual (named, with the remedy) rather than read as 0 s spent — the wait is honoured and still hands off" \
+   $([ "$RC" = 11 ] && [ "$(verdict_of 36 | cut -d' ' -f1)" = WAITING_CHECKS ] && grep -q 'NOT clamped to what is left of LANE_WALL_S' <<<"$OUT" && echo 0 || echo 1)
+# ⛔ `LANE_TIMEOUT=0` IS "WALL AXIS OFF", NOT A ZERO-SECOND BUDGET (#3850 review, P2 — verified).
+# `is_limit 0` accepts `0` (by design — it is the harness's OFF switch), so the clamp's arithmetic
+# `0 - <elapsed> - <margin>` went negative, floored at 0, and the wait became ZERO for ever: the loop
+# handed off `WAITING_CHECKS` on its FIRST poll, so an UNBOUNDED lane could never wait a head out.
+# `spawn-gate.sh` documents `0` as a raise (unbounded) and `lane.sh` passes it straight through, so this
+# is a reachable production value, not a hypothetical. The wait must be HONOURED here — the verdict's
+# own `after <n>s` is asserted, because "did not print CAPPED" alone would pass on a wait that
+# silently collapsed for a different reason.
+new_o "$T/pr4.tsv"
+OUT="$(PATH="$BIN:$PATH" GH_LOG="$T/gh.log" O="$OT" HOME="$T/home" REPO_PATH="${REPO_PATH:-$RUN_REPO}" \
+      LANE_MERGE_INTERVAL=5 LANE_MERGE_WAIT=6 LANE_MERGE_POLL=5 LANE_MERGE_ELAPSED_S=7180 LANE_TIMEOUT=0 \
+      bash "$SCRIPT" 43 --repo o/r --pr-tsv "$T/pr4.tsv" --checks-tsv "$T/checks-inflight.tsv" 2>&1)"; RC=$?
+_w43="$(verdict_of 43 | sed -n 's/.*after \([0-9][0-9]*\)s.*/\1/p')"
+ck "LANE_TIMEOUT=0 (the documented 'wall axis OFF' value) is UNBOUNDED, not a 0 s budget — the 6 s wait is honoured (handed off after ${_w43:-?}s) instead of clamping to 0 and handing off on the first poll for ever" \
+   $([ "$RC" = 11 ] && [ "$(verdict_of 43 | cut -d' ' -f1)" = WAITING_CHECKS ] && ! grep -q 'CAPPED at' <<<"$OUT" && grep -q 'LANE_TIMEOUT=0 is the documented' <<<"$OUT" && [ -n "${_w43:-}" ] && [ "${_w43:-0}" -ge 5 ] && echo 0 || echo 1)
+# ⛔ AND PIN THE RENDERING, NOT THE SOURCE TEXT (review cycle 12, observation 1): the defect that shipped
+# was a backtick being SUBSTITUTED, so an arm that greps the source sentence passes on the broken tree.
+# These two clauses read the message that actually came out.
+ck "…and its rendered disclosure really contains the word --watch and emits no 'command not found' (a substituted backtick deletes the word and prints the error)" \
+   $(grep -qF -- '--watch supervision allowance' <<<"$OUT" && ! grep -q 'command not found' <<<"$OUT" && echo 0 || echo 1)
+# …and the PRODUCTION path is the token, not the seam, so it is pinned too: `lane.sh` stamps
+# `<issue>.<pid>.<epoch>` into `$O/logs/lane-<issue>.owner` before spawning the agent. A live pid (`$$`,
+# this suite) plus an epoch 7180 s ago must clamp exactly as the seam does — the earlier draft wrote this
+# reader with `is_limit` on the epoch, which refuses anything over NINE digits and would have left the
+# whole clamp permanently inert on the only path that feeds it in production.
+new_o "$T/pr4.tsv"
+printf '%s.%s.%s\n' 41 "$$" "$(( $(date +%s) - 7180 ))" > "$OT/logs/lane-41.owner"
+WAIT_S=60 POLL_S=5 run 41 --issue 41 --repo o/r --pr-tsv "$T/pr4.tsv" --checks-tsv "$T/checks-inflight.tsv"
+# ⛔ ASSERT THE RELATION, NEVER TWO STAMPED INTEGERS (review cycle 12, P2 — MEASURED). The epoch
+# below is stamped with the SUITE's `date`, but the script recomputes `elapsed = date - epoch` after its own
+# startup, so crossing one whole second between the two makes the message read `CAPPED at 9s` /
+# `already spent 7181s` and an exact-match arm REDS ON A CORRECT TREE. Measured on an idle box: 1 in 24
+# runs (4 %) rendered 7181; on a loaded CI runner the window exceeds a second and it reds nearly always —
+# and this suite is a CI shard, so that is a false red for EVERY PR, not a local annoyance. The invariant
+# is arithmetic and does not drift: `elapsed + cap == LANE_WALL_S - _hb_margin` (7200 − 10 = 7190).
+_cap41="$(sed -n 's/.*CAPPED at \([0-9][0-9]*\)s.*/\1/p' <<<"$OUT" | head -1)"
+_spent41="$(sed -n 's/.*already spent \([0-9][0-9]*\)s.*/\1/p' <<<"$OUT" | head -1)"
+ck "the RUN TOKEN lane.sh stamps is read as the lane's elapsed (10-digit epoch accepted, live pid accepted) → cap ${_cap41:-?}s + spent ${_spent41:-?}s = 7190, the clock minus the hand-off margin" \
+   $([ "$RC" = 11 ] && [ "$(verdict_of 41 | cut -d' ' -f1)" = WAITING_CHECKS ] && [ -n "${_cap41:-}" ] && [ -n "${_spent41:-}" ] && [ $(( ${_cap41:-0} + ${_spent41:-0} )) -eq 7190 ] && echo 0 || echo 1)
+# …and a token from a run that is OVER must not clamp a later invocation to 0 (the file is per-ISSUE and
+# outlives the run that wrote it), so the pid in it is required to be THIS run's ANCESTOR — not merely
+# a live process. Two arms: a DEAD pid, and a LIVE pid that is not in the chain that leads here.
+new_o "$T/pr4.tsv"
+printf '%s.%s.%s\n' 44 999999 "$(( $(date +%s) - 7180 ))" > "$OT/logs/lane-44.owner"
+WAIT_S=0 POLL_S=5 run 44 --issue 44 --repo o/r --pr-tsv "$T/pr4.tsv" --checks-tsv "$T/checks-inflight.tsv"
+ck "a STALE run token (its pid is dead) is not read as this lane's elapsed — the wait is disclosed as unclamped instead of being clamped to 0 by a finished run" \
+   $([ "$RC" = 11 ] && grep -q 'NOT clamped to what is left of LANE_WALL_S' <<<"$OUT" && echo 0 || echo 1)
+# —and LIVENESS IS NOT IDENTITY (review, P3 — verified): a pid that is merely ALIVE need not be
+# the run that stamped the token, so a RECYCLED pid would hand a dead run's age to a live lane. The test
+# is ANCESTRY; here the token names a LIVE pid that is this suite's own sibling, so it is not in the
+# chain that leads to lane-merge.sh.
+new_o "$T/pr4.tsv"
+sleep 60 & FOREIGN_PID=$!
+printf '%s.%s.%s\n' 45 "$FOREIGN_PID" "$(( $(date +%s) - 7180 ))" > "$OT/logs/lane-45.owner"
+WAIT_S=0 POLL_S=5 run 45 --issue 45 --repo o/r --pr-tsv "$T/pr4.tsv" --checks-tsv "$T/checks-inflight.tsv"
+disown "$FOREIGN_PID" 2>/dev/null; kill "$FOREIGN_PID" 2>/dev/null; wait "$FOREIGN_PID" 2>/dev/null
+ck "a token naming a LIVE but NON-ANCESTOR pid (a recycled pid) is not read as this lane's elapsed — ancestry, not liveness, decides" \
+   $([ "$RC" = 11 ] && grep -q 'NOT clamped to what is left of LANE_WALL_S' <<<"$OUT" && ! grep -q 'CAPPED at' <<<"$OUT" && echo 0 || echo 1)
+# (4) ⛔ THE CAP'S FLOOR MUST NEVER OUT-REACH THE CAP (review finding, P3 — verified). The old floor
+# `[ "$WAIT_S" -ge "$POLL_S" ] || WAIT_S="$POLL_S"` RAISED the capped wait back to a poll chunk when the
+# allowance was smaller than one, i.e. it returned the value it exists to stay under. With a 15 s
+# allowance (15 s idle bound − 10 s margin) and the shipped 120 s poll chunk, the pre-fix code produced
+# WAIT_S=120 — ON the bound it was capping to.
+new_o "$T/pr4.tsv"
+WAIT_S=60 POLL_S=120 LANE_BOUND_IDLE_S=15 run 37 --repo o/r --pr-tsv "$T/pr4.tsv" --checks-tsv "$T/checks-inflight.tsv"
+ck "the watchdog cap is a MINIMUM even when the allowance is smaller than one poll chunk (15 s allowance, 120 s chunk → 5 s, NOT 120 s), so it cannot land on the bound it caps to" \
+   $([ "$RC" = 11 ] && grep -q 'CAPPED at 5s' <<<"$OUT" && ! grep -q 'CAPPED at 120s' <<<"$OUT" && echo 0 || echo 1)
+# (5) ⛔ DETECTING A LOST HEARTBEAT IS NOT ACTING ON IT (review finding, P2 — verified). `HB_F` is
+# cleared when the append fails, but the deadline held the FULL wait — so the loop kept waiting while
+# visibly silent and was TERMed as `stalled` with no verdict: the outcome the heartbeat exists to
+# prevent, on a path the branch had just detected. A DIRECTORY as the heartbeat target makes the append
+# fail on the very first poll, which is the smallest reproduction of the storage/permission fault.
+new_o "$T/pr4.tsv"
+mkdir -p "$T/hb-dir-39"
+WAIT_S=60 POLL_S=5 LANE_BOUND_IDLE_S=20 LANE_MERGE_HB="$T/hb-dir-39" run 39 --repo o/r --pr-tsv "$T/pr4.tsv" --checks-tsv "$T/checks-inflight.tsv"
+_w39="$(verdict_of 39 | sed -n 's/.*after \([0-9][0-9]*\)s.*/\1/p')"
+ck "a heartbeat that becomes unwritable RE-DERIVES the deadline (60 s wait, 20 s allowance → handed off at ${_w39:-?}s, not 60 s) — otherwise the lane waits silently to be killed as 'stalled' with no verdict" \
+   $([ "$RC" = 11 ] && [ "$(verdict_of 39 | cut -d' ' -f1)" = WAITING_CHECKS ] && grep -q 'became unwritable' <<<"$OUT" && [ -n "${_w39:-}" ] && [ "${_w39:-0}" -le 30 ] && echo 0 || echo 1)
+# (6) ⛔ `--status` IS "no network, no writes" AND MUST STAY QUIET (review finding, P3 — verified).
+# ⛔ AND THE RUNTIME ASSERTION ALONE COULD NOT REDDEN (#3850 review, P3 — verified): the cap block now
+# sits BELOW the `--status` exit, so the arm passes whether or not the block would have printed — it
+# passed on `origin/main` too, where no cap block exists at all. THE ORDER IS THE GUARD, so the order is
+# what is pinned: the mutant this defends is moving the block back ABOVE the exit (which is where it was
+# before `8de98255f`, and what made a read-only query emit the cap's chatter).
+_status_exit_line="$(grep -n '^if \[ "\$STATUS" -eq 1 \]; then$' "$SCRIPT" | head -1 | cut -d: -f1)"
+_cap_block_line="$(grep -n 'say_err "lane-merge: no watchdog-visible heartbeat target' "$SCRIPT" | head -1 | cut -d: -f1)"
+ck "the watchdog cap block sits BELOW the --status exit in the SOURCE (status exit :${_status_exit_line:-?}, cap say_err :${_cap_block_line:-?}) — that order is what keeps a read-only query silent, and moving the block back above the exit reddens this arm" \
+   $([ -n "$_status_exit_line" ] && [ -n "$_cap_block_line" ] && [ "$_cap_block_line" -gt "$_status_exit_line" ] && echo 0 || echo 1)
+OUT="$(PATH="$BIN:$PATH" GH_LOG="$T/gh.log" O="$OT" HOME="$T/home" LANE_MERGE_INTERVAL=5 \
+      LANE_MERGE_WAIT=60 LANE_MERGE_POLL=120 LANE_BOUND_IDLE_S=15 \
+      bash "$SCRIPT" 99 --status 2>&1)"; RC=$?
+ck "--status emits NOTHING but the verdict record even when the cap conditions hold (no cap chatter on a read-only query, got: $(printf '%s' "$OUT" | tr '\n' '|'))" \
+   $([ "$RC" = 0 ] && ! grep -q 'CAPPED at' <<<"$OUT" && echo 0 || echo 1)
+
+# ⛔ NO BACKTICK INSIDE A DOUBLE-QUOTED MESSAGE (review cycle 11, P2 — verified by RUNNING the line).
+# In `say_err "…` a backtick is COMMAND SUBSTITUTION, not text: a "`--watch`" in the LANE_TIMEOUT=0 disclosure
+# EXECUTED `--watch`, emitted `--watch: command not found` to stderr and DELETED the word from the message —
+# so the operator-facing line shipped corrupted, and `bash -n` cannot see it. A prefix-grep arm cannot either,
+# which is why this arm is generic: EVERY say_err in the file is scanned for a backtick.
+_btick="$(printf '\140')"
+# Scope, stated exactly: this scans the single-line `say_err "`, `log_line "`, `disposition "`, `verdict "`
+# and `post_handoff "` EMITTERS. A multi-line message, or a backtick in some other emitter, is not
+# covered — none exists today (every other non-comment backtick in the file sits inside a
+# SINGLE-QUOTED printf format, where it is literal), so this is a stated scope and not a hole.
+# ⛔ CAPTURE, THEN TEST — NO PIPE (the `sigpipe-grep` lane reds this file otherwise, correctly):
+# `grep 'x' f | grep -q pat` is the #841/#864 false-negative idiom, because `grep -q` exits at its first
+# match and the writer upstream takes EPIPE, which `pipefail` turns into a non-zero status — so the arm can
+# report a CLEAN file on a line that IS there. The producer here is a non-quiet `grep`, so it captures first
+# and the test runs against the capture.
+_bt_hits="$(grep -E '(say_err|log_line|disposition|verdict|post_handoff) "' "$SCRIPT" || true)"
+ck "no say_err / log_line / disposition / verdict / post_handoff message carries a backtick inside its double quotes (it would run as COMMAND SUBSTITUTION and silently delete the word from the operator-facing line)" \
+   $(! grep -qF "$_btick" <<<"$_bt_hits" && echo 0 || echo 1)
+# ⛔ THE WALL-AXIS-OFF ALLOWANCE IS DERIVED FROM SOMETHING, NOT FROM THE ZERO CLOCK (review cycle 13,
+# P2 — measured: the design arithmetic floors at ONE chunk = 120 s of supervision on a lane documented as
+# unbounded, so --watch posted a blocker two minutes into a legitimate chain wait). Three arms: the
+# backstop source is FINITE and sized from LANE_BACKSTOP_S, the no-backstop case is UNBOUNDED, and an
+# unbounded allowance must not fire the budget block (a zero allowance means NO COUNTER, not "spent").
+new_o "$T/pr-fit.tsv"
+printf 'open||fithead|clean\n' > "$T/pr-fit.tsv"
+printf '28\n' > "$OT/state/lanemerge-50.watch"
+OUT="$(REPO_PATH="${REPO_PATH:-$RUN_REPO}" PATH="$BIN:$PATH" GH_LOG=/dev/null O="$OT" HOME="$T/home" \
+      LANE_TIMEOUT=0 LANE_BACKSTOP_S=3600 LANE_MERGE_WAIT=0 LANE_MERGE_POLL=0 LANE_BOUND_IDLE_S=0 \
+      bash "$SCRIPT" 50 --watch --repo o/r --pr-tsv "$T/pr-fit.tsv" 2>&1)"; RC=$?
+ck "LANE_TIMEOUT=0 with LANE_BACKSTOP_S=3600 sizes supervision from the BACKSTOP ((3600-10)/120 = 29 chunks), so the 29th chunk is admitted rather than the 2nd being refused" \
+   $([ "$RC" = 11 ] && [ "$(verdict_of 50 | cut -d' ' -f1)" = WAITING_CHAIN_ABSENT ] && echo 0 || echo 1)
+printf '29\n' > "$OT/state/lanemerge-50.watch"
+OUT="$(REPO_PATH="${REPO_PATH:-$RUN_REPO}" PATH="$BIN:$PATH" GH_LOG=/dev/null O="$OT" HOME="$T/home" \
+      LANE_TIMEOUT=0 LANE_BACKSTOP_S=3600 LANE_MERGE_WAIT=0 LANE_MERGE_POLL=0 LANE_BOUND_IDLE_S=0 \
+      bash "$SCRIPT" 50 --watch --repo o/r --pr-tsv "$T/pr-fit.tsv" 2>&1)"; RC=$?
+ck "…and the NEXT one is refused (counter 29 → chunk 30) and the hand-off SAYS 29, so the backstop-derived bound is pinned by its own number (pre-fix prints 1 and reds here)" \
+   $([ "$RC" = 13 ] && [ "$(verdict_of 50 | cut -d' ' -f1)" = BLOCKED_ATTEMPTS ] && grep -q '29 --watch chunks spent' <<<"$OUT" && echo 0 || echo 1)
+printf '999\n' > "$OT/state/lanemerge-51.watch"
+OUT="$(REPO_PATH="${REPO_PATH:-$RUN_REPO}" PATH="$BIN:$PATH" GH_LOG=/dev/null O="$OT" HOME="$T/home" \
+      LANE_TIMEOUT=0 LANE_MERGE_WAIT=0 LANE_MERGE_POLL=0 LANE_BOUND_IDLE_S=0 \
+      bash "$SCRIPT" 51 --watch --repo o/r --pr-tsv "$T/pr-fit.tsv" 2>&1)"; RC=$?
+ck "LANE_TIMEOUT=0 with NO LANE_BACKSTOP_S is UNBOUNDED supervision: the 1000th chunk is NOT refused (a zero allowance means there is no counter, not that it is spent)" \
+   $([ "$RC" = 11 ] && [ "$(verdict_of 51 | cut -d' ' -f1)" = WAITING_CHAIN_ABSENT ] && echo 0 || echo 1)
+ck "the LANE_TIMEOUT=0 disclosure NAMES what the supervision axis got, instead of claiming a finite count it does not have" \
+   $(grep -q 'the --watch supervision allowance is NOT derived' "$SCRIPT" && grep -q 'UNBOUNDED (there is no counter to spend)' "$SCRIPT" && echo 0 || echo 1)
+# ⛔ AND IT MUST NOT STATE A NUMBER THE CODE WILL NOT USE (review cycle 14, observation 2 — measured:
+# `LANE_BACKSTOP_S=3600 LANE_MERGE_MAX_WATCH=2` printed "a FINITE 29 chunk(s)" while the real allowance was 2).
+# The plain path reaches this line; a `--watch` call returns inside its chunk loop before it.
+new_o "$T/pr4.tsv"
+OUT="$(REPO_PATH="${REPO_PATH:-$RUN_REPO}" PATH="$BIN:$PATH" GH_LOG="$T/gh.log" O="$OT" HOME="$T/home" \
+      LANE_MERGE_INTERVAL=5 LANE_MERGE_WAIT=6 LANE_MERGE_POLL=5 \
+      LANE_TIMEOUT=0 LANE_BACKSTOP_S=3600 LANE_MERGE_MAX_WATCH=2 \
+      bash "$SCRIPT" 52 --repo o/r --pr-tsv "$T/pr4.tsv" --checks-tsv "$T/checks-inflight.tsv" 2>&1)"; RC=$?
+# ⛔ AND THE SUITE'S OWN `ck` DESCRIPTIONS GET THE SAME SCAN (review cycle 15 — MEASURED: two of them
+# carried a backtick inside double quotes, so running the suite printed 'O: command not found' and
+# '--help: command not found' to stderr, and the word was DELETED from the description the operator reads.
+# The arm for the script existed; the prose was not covered, which is the same class one layer out.)
+_self="${BASH_SOURCE[0]}"
+# ⛔ AT ANY INDENTATION: six `ck` call sites are inside case arms, and a column-0-only scan left them
+# uncovered (review cycle 15, observation — measured: 0 of the six carry a backtick today, so this is a
+# closed gap rather than a fixed defect).
+_self_hits="$(grep -E '^[[:space:]]*ck "' "$_self" || true)"
+ck "no ck description in THIS suite carries a backtick inside its double quotes, at any indentation (it would run as a command and be deleted from the text, printing 'command not found')" \
+   $(! grep -qF "$_btick" <<<"$_self_hits" && echo 0 || echo 1)
+ck "the LANE_TIMEOUT=0 line reports the PINNED allowance (2 chunks) rather than a backstop-derived figure, so it never states a number the re-derivation will not use" \
+   $(grep -q 'a FINITE 2 chunk(s), because LANE_MERGE_MAX_WATCH pins it' <<<"$OUT" && ! grep -q 'derived from it' <<<"$OUT" && echo 0 || echo 1)
+# ⛔ AND A PIN OF ZERO IS "NO COUNTER", NOT "ZERO CHUNKS" (review cycle 15, P3 — measured: the line called
+# it "a FINITE 0 chunk(s)" while the code admitted the 1000th chunk).
+new_o "$T/pr4.tsv"
+OUT="$(REPO_PATH="${REPO_PATH:-$RUN_REPO}" PATH="$BIN:$PATH" GH_LOG="$T/gh.log" O="$OT" HOME="$T/home" \
+      LANE_MERGE_INTERVAL=5 LANE_MERGE_WAIT=6 LANE_MERGE_POLL=5 \
+      LANE_TIMEOUT=0 LANE_BACKSTOP_S=3600 LANE_MERGE_MAX_WATCH=0 \
+      bash "$SCRIPT" 53 --repo o/r --pr-tsv "$T/pr4.tsv" --checks-tsv "$T/checks-inflight.tsv" 2>&1)"; RC=$?
+ck "a PINNED allowance of 0 is reported as UNBOUNDED, not as 'a FINITE 0 chunk(s)' — zero disables the counter, so the line must not call it finite" \
+   $(grep -q 'UNBOUNDED (there is no counter to spend)' <<<"$OUT" && ! grep -q 'a FINITE 0 chunk(s)' <<<"$OUT" && echo 0 || echo 1)
+# ⛔ AND THE BACKSTOP BRANCH SUBTRACTS THE LANE'S ELAPSED TIME, like its finite-wall sibling (review cycle
+# 15, P2 — measured: a lane with 100 s of backstop left got 22 chunks = 2640 s of supervision, so
+# lane-bound.sh TERMed it mid-supervision with no verdict). 3400 s spent of a 3600 s backstop leaves
+# (3600-3400-margin)/120 = 1 chunk (margin is 2 x LANE_MERGE_INTERVAL, so 40 here), so chunk 2 is refused;
+# without the subtraction it would be 29.
+printf '1\n' > "$OT/state/lanemerge-54.watch"
+OUT="$(REPO_PATH="${REPO_PATH:-$RUN_REPO}" PATH="$BIN:$PATH" GH_LOG=/dev/null O="$OT" HOME="$T/home" \
+      LANE_TIMEOUT=0 LANE_BACKSTOP_S=3600 LANE_MERGE_ELAPSED_S=3400 LANE_MERGE_WAIT=0 LANE_MERGE_POLL=0 LANE_BOUND_IDLE_S=0 \
+      bash "$SCRIPT" 54 --watch --repo o/r --pr-tsv "$T/pr-fit.tsv" 2>&1)"; RC=$?
+ck "the backstop-derived allowance counts only what is LEFT of the backstop: (3600-3400-10)/120 = 1 chunk, so the 2nd is refused (the un-subtracted branch would admit 29)" \
+   $([ "$RC" = 13 ] && grep -q '1 --watch chunks spent' <<<"$OUT" && echo 0 || echo 1)
+
+# ⛔ THE RE-INVOCATION PATH (review round 3, P2 — verified): the documented resume omits `--issue` and
+# recovers it from `$O/state/lanemerge-<pr>.issue`. Resolving the heartbeat target BEFORE that recovery
+# found no `lane-<issue>.log`, capped the wait to `IDLE_BOUND_S - margin` and left the wall clamp inert.
+new_o "$T/pr4.tsv"
+printf '44\n' > "$OT/state/lanemerge-44.issue"
+: > "$OT/logs/lane-44.log"
+WAIT_S=6 POLL_S=5 LANE_BOUND_IDLE_S=5 run 44 --repo o/r --pr-tsv "$T/pr4.tsv" --checks-tsv "$T/checks-inflight.tsv"
+ck "a re-invocation with NO --issue resolves the issue from its state file BEFORE it looks for a heartbeat target — so it gets the lane's own log and the FULL wait, not a silent 2660 s cap" \
+   $([ "$RC" = 11 ] && grep -q '\[lane-merge\] heartbeat' "$OT/logs/lane-44.log" && ! grep -q 'CAPPED at' <<<"$OUT" && echo 0 || echo 1)
 
 # ── 19. an EMPTY PR read must not blank the head or read as merged (E7) ────────────────────────
 new_o "$T/pr25.tsv"
