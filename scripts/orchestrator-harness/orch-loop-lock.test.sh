@@ -155,7 +155,19 @@ ck "LOCKF is defined ONCE in the whole loop (no split identity of the lock path)
 # below it — a false GREEN, which is the direction that matters (fresh review of #3865 at 062ff3ca, P2).
 # A `#`-prefixed line still cannot match, so the comment false PASS this anchor was added for stays shut.
 # ⛔ AND `builtin`/`command` PREFIXES ARE THE SAME REGISTRATION (fresh review of #3865, P3 — MEASURED: `trap_regs` already accepted them, but these two SELECTIONS did not, so a `builtin trap 'rm -f "$LOCKF"' EXIT` subject reddened BOTH this arm and the ONE-trap arm while `trap_pin` was green — a false RED, and three comments claiming the prefixed form PASSED were false. Selecting through the same pattern as `trap_regs` is what makes the claim true; the §9d row that drives the literal never exercised these greps.)
-TRAP_L="$(grep -nE '^[[:space:]]*((builtin|command)[[:space:]]+)?trap .*LOCKF' "$SUBJECT" 2>/dev/null | head -1 | cut -d: -f1)"
+# ⛔ AND THE COMMAND WORD IS A WORD, NOT THE FIRST TOKEN OF A LINE (fresh review of #3865 at 8dd3cc118,
+# P3 — false GREEN, MEASURED: an ordinary registration can be preceded by ASSIGNMENTS (`x=1 trap 'true'
+# EXIT`) or carry a BACKSLASH-ESCAPED command word (`\trap 'true' EXIT`). Both are plain text, both
+# REPLACE the installed EXIT handler (`bash -c 'trap "echo FIRST" EXIT; x=1 trap "echo SECOND" EXIT;
+# echo body'` prints only SECOND), and NEITHER pattern could see them: the per-line scan needs `trap`
+# right after optional whitespace (it read `x=1` / `\trap`), and the accounting class needs a command
+# position before `trap` (after `^` the next word is `x=1`, and `\trap` is not `trap`). So BOTH counts
+# stayed equal and the accounting arm reported ✅ while bash had REPLACED the releaser and the lock was
+# never removed — the fail-OPEN direction that pair of arms exists to close.
+# ONE pattern, used by all four scans (both selections, the per-line scan, the accounting scan), so they
+# cannot disagree about what counts as a registration.
+_TRAP_CMD_RE='([A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*[[:space:]]+)*\\?(builtin[[:space:]]+|command[[:space:]]+)?\\?trap[[:space:]]'
+TRAP_L="$(grep -nE "^[[:space:]]*${_TRAP_CMD_RE}.*LOCKF" "$SUBJECT" 2>/dev/null | head -1 | cut -d: -f1)"
 [ -n "$TRAP_L" ] && [ "$TRAP_L" -gt "$END_L" ]
 ck "the EXIT trap that releases the lock sits BELOW the section (the block runs first)" $?
 # ⛔ THE ARM MUST RED ON THE EXACT #1715 REVERT, AND THE FIRST FORM DID NOT (fresh review of #1985,
@@ -220,7 +232,7 @@ _TRAP_SIGS_AWK='
   BEGIN { n = split("EXIT INT TERM HUP QUIT ERR DEBUG RETURN 0", sig, " ")
           for (i = 1; i <= n; i++) { ok[sig[i]] = 1; ok[tolower(sig[i])] = 1 } }
   { start = 0
-    for (i = 1; i <= NF; i++) if (tolower($i) == "trap") { start = i; break }
+    for (i = 1; i <= NF; i++) { w = tolower($i); sub(/^\\+/, "", w); if (w == "trap") { start = i; break } }
     out = ""
     i = start + 1
     while (out == "" && i <= NF) {
@@ -258,7 +270,7 @@ _TRAP_SIGS_AWK='
 trap_regs() {
   printf '%s\n' "$1" \
     | sed -e 's/[[:space:]]*#.*$//' \
-    | grep -E '^[[:space:]]*((builtin|command)[[:space:]]+)?trap[[:space:]]' \
+    | grep -E "^[[:space:]]*${_TRAP_CMD_RE}" \
     | awk "$_TRAP_SIGS_AWK"
 }
 # exit_trap_count <text> — how many EXIT-family trap REGISTRATIONS the text contains.
@@ -291,7 +303,7 @@ trap_reg_total() {
   printf '%s\n' "$1" \
     | sed -e 's/[[:space:]]*#.*$//' \
     | awk '{ while ($0 ~ /\\$/ && (getline nxt) > 0) { sub(/\\$/, "", $0); $0 = $0 " " nxt } ; print }' \
-    | grep -oE '(^|[;&|({)]|then|do|else|elif|while|until|!)[[:space:]]*((builtin|command)[[:space:]]+)?trap[[:space:]]' \
+    | grep -oE "(^|[;&|({)]|then|do|else|elif|while|until|!)[[:space:]]*${_TRAP_CMD_RE}" \
     | grep -c . || true
 }
 trap_pin() {
@@ -316,7 +328,7 @@ trap_join() {
     | awk '{ while ($0 ~ /\\$/ && (getline nxt) > 0) { sub(/\\$/, "", $0); $0 = $0 " " nxt } ; print }'
 }
 TRAP_TEXT="$(trap_join "$(cat "$SUBJECT")")"
-LOCK_TRAPS="$(trap_join "$(grep -E '^[[:space:]]*((builtin|command)[[:space:]]+)?trap .*LOCKF' "$SUBJECT" 2>/dev/null)")"
+LOCK_TRAPS="$(trap_join "$(grep -E "^[[:space:]]*${_TRAP_CMD_RE}.*LOCKF" "$SUBJECT" 2>/dev/null)")"
 trap_pin "$LOCK_TRAPS"
 ck "the lock is released by ONE trap and its signal list is EXACTLY 'EXIT' (a returning INT/TERM handler deleted it while the loop lived — #1715)" $?
 # ⛔ AND IT MUST BE THE ONLY `EXIT` TRAP, BECAUSE A LATER ONE REPLACES IT (fresh review of #3865 at
@@ -395,6 +407,11 @@ _traprow 0 "trap 'rm -f \"\$LOCKF\"' EXIT" \
   "the shipped form PASSES (one EXIT-only releaser)"
 _traprow 0 "trap 'rm -f \"\$LOCKF\"; command -v x >/dev/null 2>&1 && x' EXIT" \
   "an EXIT trap extended with more cleanup PASSES (the invariant, not a byte match)"
+# ⛔ AN ASSIGNMENT-PREFIXED RELEASER IS A CORRECT TRAP (fresh review of #3865 at 8dd3cc118, P3). The pin
+# was fail-CLOSED here (a false RED), but the same blind spot was fail-OPEN in the two scans below, so
+# both directions are driven: `x=1 trap …` is the registration bash installs.
+_traprow 0 "x=1 trap 'rm -f \"\$LOCKF\"' EXIT" \
+  "an ASSIGNMENT-PREFIXED releaser PASSES (the command word is a word, not the first token of a line)"
 _traprow 1 "trap 'rm -f \"\$LOCKF\"' EXIT INT TERM" \
   "the #1715 revert REDS (a returning INT/TERM handler)"
 _traprow 1 "trap 'rm -f \"\$LOCKF\"' SIGEXIT" \
@@ -483,6 +500,18 @@ trap 'true' EXIT;" \
 _exitrow 2 "$_REL
 trap 'true' EXIT || true" \
   "a second registration followed by '|| true' still REPLACES the releaser — was a false PASS"
+# ⛔ AND NEITHER AN ASSIGNMENT PREFIX NOR A BACKSLASH-ESCAPED COMMAND WORD CAN HIDE ONE (fresh review of
+# #3865 at 8dd3cc118, P3 — false GREEN, MEASURED: both spellings are PLAIN TEXT, both REPLACE the
+# installed EXIT handler, and the per-line scan saw neither — `^[[:space:]]*trap` read `x=1` / `\trap` —
+# so the ONLY-EXIT arm counted ONE registration while the lock was never removed. `_TRAP_CMD_RE` is one
+# pattern shared with the accounting scan, so the two cannot stay equal on a spelling only one of them
+# can read.)
+_exitrow 2 "$_REL
+x=1 trap 'true' EXIT" \
+  "an ASSIGNMENT-PREFIXED second registration REPLACES the releaser — was a false PASS"
+_exitrow 2 "$_REL
+\\trap 'true' EXIT" \
+  "a BACKSLASH-ESCAPED second registration REPLACES the releaser — was a false PASS"
 # ⛔ AND THE INT/TERM TERMINATION ARM IS DRIVEN THE SAME WAY, over the indirection that defeated the
 # LOCKF filter: a RETURNING INT handler that releases the lock through a FUNCTION removes the lock and
 # leaves the loop alive, which is #1715 spelled in code the `grep … LOCKF` cannot see.
@@ -548,6 +577,13 @@ _acctrow disagree "$_REL
   "a registration after a negation is SEEN (the '!' class — was a false PASS once)"
 _acctrow disagree "$_REL; trap 'true' EXIT" \
   "TWO registrations on ONE line disagree with the per-line scan (the original false PASS)"
+# ⛔ AND AN ASSIGNMENT-PREFIXED SECOND REGISTRATION IS A COMMAND POSITION (fresh review of #3865 at
+# 8dd3cc118, P3 — the accounting class needed a separator before `trap`, so `; x=1 trap …` matched NOTHING
+# and this pair AGREED beside a replaced releaser. The same `_TRAP_CMD_RE` closes it (an assignment run
+# after the separator), and this row is the witness: the pre-fix class AGREES here — so the row REDS —
+# while the post-fix class disagrees, which is what a second registration on one line must do.)
+_acctrow disagree "$_REL; x=1 trap 'true' EXIT" \
+  "an ASSIGNMENT-PREFIXED second registration on one line is SEEN by the accounting scan"
 # ⛔ AND THE UNKNOWN ARM'S TEXT SOURCE IS A STATED LIMIT, NOT A ROW (fresh review of #3865 at
 # a2da4598b, note): this arm reads `$(cat "$SUBJECT")` while the scans above read `trap_join`'s output, so
 # a releaser split by a trailing `\` reads UNKNOWN here and parses fine above — one spelling, two answers,
