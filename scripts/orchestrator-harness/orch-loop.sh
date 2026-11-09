@@ -86,6 +86,21 @@ for _dfc in "${O:-}/disk-floor.sh" "${_HERE_RS:-}/disk-floor.sh"; do
   DISK_FLOOR_STATE=ok; DISK_FLOOR_SRC="$_dfc"; break
 done
 [ "$DISK_FLOOR_STATE" = "ok" ] || DISK_FLOOR_STATE=absent
+# ── WHERE THE [cap] LINE'S DISK FIGURES COME FROM (agent-infra#2159) ─────────────────────────────
+# ⛔ THE CONTROLLER DOES NOT MEASURE DISK. `spawn-gate.sh` is its ONE implementation — this file's own
+# gate vector records the decision ("DISK is not repeated here because the spawn point … is its ONE
+# implementation") — so `[cap]` ASKS that binary for the reading it just took, via `--disk-report`.
+# A second `df` here would be a second reading that can disagree with the gate's verdict, which is
+# #2721's own defect; a second copy of the per-lane terms would be the duplication #3395 closed.
+# ⛔ RESOLVED, NOT ASSUMED, and a MISSING COPY IS NOT FATAL (same reasoning as the disk floor above):
+# the enforcing gate lives in spawn-gate.sh/wt-lifecycle.sh wherever a lane is provisioned, so a
+# controller that cannot ASK it is a DEPLOY SKEW, not a box that cannot dispatch. The cycle says
+# CANNOT-VERIFY once, and proceeds — refusing to start a healthy controller over a log field is the
+# trade the disk-floor block above already declined.
+SPAWN_GATE_SH=""
+for _sgc in "${O:-}/spawn-gate.sh" "${_HERE_RS:-}/spawn-gate.sh"; do
+  [ -n "$_sgc" ] && [ -f "$_sgc" ] && { SPAWN_GATE_SH="$_sgc"; break; }
+done
 OR_EXPLICIT="${OR:-}"
 # ⛔ WHETHER THE OPERATOR NAMED OR, TOLD TO THE CHILD EXPLICITLY (#1977 review, P1). The export
 # below is UNCONDITIONAL (#2040), so the child cannot tell an operator's `OR=…` from the default this
@@ -7603,13 +7618,55 @@ PY
     [ "$LAND_EPOCH" -gt "$_now_a" ] && LAND_EPOCH="$_now_a"
     LAND_AGE=$(( (_now_a - (10#$LAND_EPOCH)) / 60 ))
   fi
+  # ── THE DISK READING THE [cap] LINE PRINTS (agent-infra#2159) ────────────────────────────────────
+  # WHY (the measured defect): a cell held SIX live worktrees at ~1.1 GB each on a 32 GB disk and sat
+  # at 179 MB free, while `[cap]` printed `load`, `lanes`, `max_lanes`, `mem_avail` and `swap_free` and
+  # NOT ONE DISK FIGURE — so the box advertised `lanes=0/20` and an orchestrator acting on that line
+  # filled it into the wall, and four `merge-*` lanes died with 0-BYTE logs (the log write itself
+  # failed). The datum was never missing: `spawn-gate.sh` measures free space and one lane's cost on
+  # every admission and writes both to `state/disk.tsv`. Nothing put it on the line an operator reads.
+  # ⛔ ONE READING, ONE SOURCE. This does NOT run `df`: it calls the gate's REPORT verb, which prints
+  # the fields `disk_admit` just measured (`--disk-report`), so the figure on `[cap]` is the same
+  # number the gate refuses on — not a third reading whose verdict could disagree with it.
+  # ⛔ IT IS A REPORT, NOT A FIFTH GATE, AND THAT IS A RECORDED DECISION. The gate vector below says
+  # so in its own words: "DISK is not repeated here because the spawn point (spawn-gate.sh) is its
+  # ONE implementation". So `[cap]` ADVERTISES the constraint (`disk_headroom=no`); it does not
+  # duplicate the refusal. The refusal that matters is upstream of every lane checkout
+  # (`wt_provision` → `disk_admit`, exit 77) and at the spawn point (`DISK-NOHEADROOM`).
+  # [capdisk:begin] (extracted and DRIVEN by cap-disk-report.test.sh — keep the markers)
+  DISK_FREE_MB=""; DISK_NEED_MB=""; DISK_HEADROOM="?"; DISK_SRC="unset"; DISK_STATE="?"
+  if [ -n "${SPAWN_GATE_SH:-}" ] && [ -f "${SPAWN_GATE_SH:-}" ]; then
+    _dr_line="$(bash "$SPAWN_GATE_SH" --disk-report "${REPO:-.}" --label '[cap]' 2>/dev/null)"; _dr_rc=$?
+    if [ "$_dr_rc" -eq 0 ] && [ -n "${_dr_line:-}" ]; then
+      # Positional: `[disk-report] <STATE> <free|?> <need> …` (`disk_report`'s documented format).
+      read -r _dr_tag DISK_STATE DISK_FREE_MB DISK_NEED_MB _dr_rest <<< "$_dr_line"
+      DISK_SRC="report"
+      # `?` (unreadable probe) is NOT coerced to 0 — a gate that treats "cannot measure" as "empty"
+      # refuses a healthy box, and one that treats it as "ample" is the false PASS this line exists
+      # to catch. It reads `unknown`, which is what it is.
+      if ! is_num "${DISK_FREE_MB:-}"; then DISK_FREE_MB="?"; DISK_HEADROOM="unknown"
+      elif ! is_num "${DISK_NEED_MB:-}"; then DISK_NEED_MB="?"; DISK_HEADROOM="unknown"
+      elif [ "$DISK_FREE_MB" -ge "$DISK_NEED_MB" ]; then DISK_HEADROOM="ok"
+      else DISK_HEADROOM="no"; fi
+    else
+      # The verb exists but did not answer (rc 64 usage, a crash, a copy that PREDATES the verb —
+      # the #2033 half-deployed shape). Named, never silent: `disk_src=absent` on the line and this
+      # one line beside it, so an operator reads the absence rather than an inferred capacity.
+      DISK_SRC="absent"
+      echo "[disk] CANNOT-VERIFY (agent-infra#2159): $SPAWN_GATE_SH --disk-report did not answer (rc=$_dr_rc) — this copy PREDATES the report verb or could not run. The [cap] line therefore carries NO disk figure and NO per-lane cost; the ENFORCING disk gate is unchanged (spawn-gate.sh at provision/spawn), so this is a reporting gap, not a capacity change. Re-seed \$O: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o \$O" >> "$LOG"
+    fi
+  else
+    DISK_SRC="absent"
+    echo "[disk] CANNOT-VERIFY (agent-infra#2159): no spawn-gate.sh found (\$O and beside the loop) — the [cap] line cannot show free disk or one lane's cost. The ENFORCING disk gate lives in spawn-gate.sh/wt-lifecycle.sh, so lanes are still refused on a full box; this is a reporting gap. Re-seed \$O." >> "$LOG"
+  fi
+  # [capdisk:end]
   # `@${OR}` is part of this line on purpose: the repo the count came from is the datum whose absence
   # let a wrong-surface read run for hours. bare `$OR` is avoided for the same reason `${OR:-}` is used
   # below — selftest.sh extracts and drives parts of this file in a subshell with no OR.
   # ⛔ `lanes=<live>/<total>` and `zombie=<n>` (#2163). The TOTAL is the field that makes a leak
   # visible: `lanes=14/25` still reads "full" while `lanes=14/76` says the box is carrying 62 finished
   # residents. `max_lanes=` keeps the ceiling the gate applies, so no reader has to infer it.
-  echo "[cap] load=$L/$MAX_LOAD lanes=${LANES_DISPLAY:-?}/$LANES_TOTAL max_lanes=$MAX_LANES zombie=$ZOMBIES lanes_src=${LANES_SOURCE:-unset} mem_avail=${MEMAVAIL_MB}M/${MIN_MEM_FREE_MB}M swap_free=${SWFREE}M/${MIN_SWAP_FREE}M open=${OPEN_N:-?}@${OR:-?} unowned=${UPN:-?} last_land=${LAND_AGE:-?}m review_slots=${MR:-?} fix_slots=${MF:-?}" >> "$LOG"
+  echo "[cap] load=$L/$MAX_LOAD lanes=${LANES_DISPLAY:-?}/$LANES_TOTAL max_lanes=$MAX_LANES zombie=$ZOMBIES lanes_src=${LANES_SOURCE:-unset} mem_avail=${MEMAVAIL_MB}M/${MIN_MEM_FREE_MB}M swap_free=${SWFREE}M/${MIN_SWAP_FREE}M disk_free=${DISK_FREE_MB:-?}M/${DISK_NEED_MB:-?}M disk_headroom=${DISK_HEADROOM:-?} disk_src=${DISK_SRC:-unset} open=${OPEN_N:-?}@${OR:-?} unowned=${UPN:-?} last_land=${LAND_AGE:-?}m review_slots=${MR:-?} fix_slots=${MF:-?}" >> "$LOG"
   # Four gates. swap_total=0 => swap uninitialised (fresh boot), NOT pressure — allow.
   # Name the binding gate: an earlier version logged "skipped (load=…)" while load was never
   # consulted, so a lanes-bound or swap-bound stall looked like a load stall.
