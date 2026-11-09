@@ -661,9 +661,13 @@ release_fix_claim() { # bounded, like merge-one.sh's — it runs on the EXIT pat
 trap 'release_prlock; release_fix_claim' EXIT
 trap 'exit 143' TERM
 trap 'exit 130' INT
-if [ -n "${HEAD:-}" ] && [ -f "$O/claims.sh" ]; then
+# ⛔ `$O_WORK` FIRST (fresh-context review of #3846, P1): the controller exports `O` = its STATE dir and
+# `O_WORK` = the harness root, and the two differ whenever a state dir is named explicitly. Resolving
+# from `$O` alone then loses the claim registry silently on exactly the arrangement README documents.
+_FIX_MOD_DIR="${O_WORK:-$O}"
+if [ -n "${HEAD:-}" ] && [ -f "$_FIX_MOD_DIR/claims.sh" ]; then
   # shellcheck source=/dev/null
-  . "$O/claims.sh"
+  . "$_FIX_MOD_DIR/claims.sh"
   # The fallback used when a malformed FIX_TIMEOUT is refused: the SAME value the run would take.
   _FIX_BOUND_FALLBACK="${LANE_BACKSTOP_S:-7200}"
   is_limit "$_FIX_BOUND_FALLBACK" || _FIX_BOUND_FALLBACK=7200

@@ -29,8 +29,11 @@
 #      (#2040: "derive it from $REPO's origin"), so forwarding only NON-EMPTY values loses it
 #   I  a singleton REFUSAL is PROPAGATED as the wrapper's own exit 75 (agent-infra#2095) — the plist's
 #      program is `orch-pin-exec.sh`, so launchd sees THIS wrapper's code and never the loop's, and
-#      `harness-up`'s REFUSED-SINGLETON row was unreachable without it. Plus the control: a plain
-#      early death is still 69, so the arm cannot pass by labelling everything a refusal.
+#      `harness-up`'s REFUSED-SINGLETON row was unreachable without it. Three arms: the refusal (75); a
+#      plain early death with NO [singleton] line (69, so the arm cannot pass by labelling everything a
+#      refusal); and a STALE [singleton] line from an earlier attempt followed by an unrelated death
+#      (69 — the log is append-only, so an unbounded witness would report a dead controller as a
+#      correct refusal for ever).
 #
 # HERMETIC: its own `TMUX_TMPDIR` (so it can never touch, count or reap a real session), its own
 # HOME, its own scratch `$O`, and a stub `orch-loop.sh`. No network. Run: bash launchd-controller.test.sh
@@ -412,6 +415,57 @@ if [ "$J_RC" -eq 69 ]; then
   ok "case I control: a loop that dies with NO [singleton] line still exits 69 (no refusal is invented)"
 else
   bad "case I control: exited $J_RC, want 69 — a plain early death is now labelled something else"
+fi
+# ⛔ AND A STALE REFUSAL MUST NOT SPEAK FOR THIS ATTEMPT (fresh-context review of #3846, P1). The log is
+# APPEND-ONLY, so a refusal recorded earlier stays in it for ever: an unbounded grep turns every LATER
+# early death — a half-synced `$O` (78), missing worker scripts (78), `REPO` unset (78) — into
+# "REFUSED-SINGLETON … nothing to do here", i.e. a dead controller described as a correct refusal. This
+# arm is the one the two fresh-`$O` arms above CANNOT see.
+STALE_O="$TMP/o-stale"; mkdir -p "$STALE_O/logs"
+echo "[singleton] refused me=pid=1@old state=$STALE_O — HELD by live controller pid 999999" > "$STALE_O/logs/orch-loop.log"
+cat > "$STALE_O/orch-loop.sh" <<'SH'
+#!/bin/bash
+# Dies for an UNRELATED reason and writes no [singleton] line of its own.
+echo "[startup] FATAL REPO is not set" >> "$O/logs/orch-loop.log" 2>/dev/null
+exit 78
+SH
+chmod +x "$STALE_O/orch-loop.sh"
+"$TMUX_BIN" kill-session -t "=$S" 2>/dev/null || true
+K_ERR="$TMP/k.err"
+O="$STALE_O" CONTROLLER_RESTART_FLOOR=2 bash "$TARGET" >"$TMP/k.out" 2>"$K_ERR" &
+K_PID=$!
+wait "$K_PID"; K_RC=$?
+if [ "$K_RC" -eq 69 ]; then
+  ok "case I stale: an OLD [singleton] line does NOT make this attempt read as a refusal (rc 69)"
+else
+  bad "case I stale: exited $K_RC, want 69 — a historical refusal spoke for an unrelated early death"
+fi
+if grep -q 'REFUSED to start' "$K_ERR"; then
+  bad "case I stale: it CLAIMED a refusal for an attempt that never refused"
+else
+  ok "case I stale: it does not claim a refusal it cannot witness"
+fi
+# ⛔ AND THE TWO REFUSALS KEEP THEIR OWN CODES (fresh-context review of #3846). 75 = HELD: a controller
+# owns this state dir, leave the lock alone. 74 = UNJUDGED: the record could not be read or dated, so
+# somebody has to look and may remove it. Opposite remedies, so the wrapper must not flatten them —
+# otherwise `harness-up` asserts "the singleton working, do not touch the lock" over a state whose
+# remedy is the opposite.
+UNJ_O="$TMP/o-unj"; mkdir -p "$UNJ_O/logs"
+cat > "$UNJ_O/orch-loop.sh" <<'SH'
+#!/bin/bash
+echo "[singleton] rc=2 refused me=pid=$$@test state=$O — HELD by pid 999999, whose AGE CANNOT BE READ" >> "$O/logs/orch-loop.log" 2>/dev/null
+exit 74
+SH
+chmod +x "$UNJ_O/orch-loop.sh"
+"$TMUX_BIN" kill-session -t "=$S" 2>/dev/null || true
+L_ERR="$TMP/l.err"
+O="$UNJ_O" CONTROLLER_RESTART_FLOOR=2 bash "$TARGET" >"$TMP/l.out" 2>"$L_ERR" &
+L_PID=$!
+wait "$L_PID"; L_RC=$?
+if [ "$L_RC" -eq 74 ]; then
+  ok "case I unjudged: an UNJUDGED refusal (rc=2) is propagated as 74, not flattened to 75"
+else
+  bad "case I unjudged: exited $L_RC, want 74 — the two refusals share a code again"
 fi
 export O="$TMP/o"
 "$TMUX_BIN" kill-session -t "=$S" 2>/dev/null || true
