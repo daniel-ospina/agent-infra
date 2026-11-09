@@ -1,0 +1,21 @@
+{
+  "artifacts": [],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 7800,
+  "exit_code": null,
+  "heartbeat_at": 1794188276,
+  "host": "cmux",
+  "issue": 1729,
+  "kind": "lane",
+  "lane_id": "cmux.klane-1729-1794188276-p3453954-4360f93c",
+  "lease_until": 1794196076,
+  "pid": 3453954,
+  "reason": null,
+  "repo": "daniel-ospina/agent-infra",
+  "schema": 1,
+  "started_at": 1794188276,
+  "state": "RUNNING",
+  "tag": "1729",
+  "worktree": "/home/cmux/agent-infra/.worktrees/tm-1729"
+}
