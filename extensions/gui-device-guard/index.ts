@@ -458,13 +458,32 @@ function isRedirectionAmp(command: string, i: number): boolean {
   return command[i - 1] === ">" || command[i + 1] === ">";
 }
 
+/**
+ * Is the `|` at `i` the SECOND HALF OF `>|`? That is bash's noclobber-override
+ * redirect, not a pipe, so segmentation must not cut the line there.
+ *
+ * The redirection stripper has always listed `>|` — but `splitSegments` split the
+ * line at the `|` FIRST, so the token seen was a bare `>` followed by the target as
+ * the command word; `>|x electron .` returned [] while bash redirects and RUNS
+ * electron (measured; round-12 review, seventeenth pass, P1, row L67).
+ */
+function isRedirectionPipe(command: string, i: number): boolean {
+  if (command[i] !== "|") return false;
+  return command[i - 1] === ">";
+}
+
 export function splitSegments(command: string): string[] {
   const mask = unquotedMask(command);
   const out: string[] = [];
   let cur = "";
   for (let i = 0; i < command.length; i++) {
     const ch = command[i];
-    if (mask[i] && SEPARATORS.has(ch) && !isRedirectionAmp(command, i)) {
+    if (
+      mask[i] &&
+      SEPARATORS.has(ch) &&
+      !isRedirectionAmp(command, i) &&
+      !isRedirectionPipe(command, i)
+    ) {
       out.push(cur);
       cur = "";
       continue;
@@ -1641,7 +1660,18 @@ function stripRedirections(toks: string[], quoted?: boolean[][]): string[] {
       continue;
     }
     if (lead) {
-      if (lead[1] === "") i++;
+      // The operator run STOPS AT THE FIRST QUOTED CHARACTER, which is why "attached
+      // target?" is answered by an explicit scan and not by the regex remainder.
+      // `tokenize` drops the quotes, so `>">" electron .` arrives as `>>` with flags
+      // [unquoted, QUOTED]: the greedy `>{1,3}` matched BOTH `>`s, the remainder was
+      // "", the NEXT token was consumed as the redirect's target, and the launch
+      // disappeared — bash creates the file `>` and RUNS electron (measured, the guard
+      // returned [] with no block and no row; round-12 review, seventeenth pass, P0).
+      let runEnd = opAt;
+      while (runEnd < tok.length && "<>&|".includes(tok[runEnd]) && chars?.[runEnd] !== true) {
+        runEnd++;
+      }
+      if (tok.slice(runEnd) === "") i++; // no attached target: the NEXT word is it
       continue;
     }
     // A redirect glued to the END of an ordinary word ends the word at the operator —

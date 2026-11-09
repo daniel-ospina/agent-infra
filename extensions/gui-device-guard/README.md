@@ -336,7 +336,11 @@ This is a residual list, not a completeness claim:
   quoted delimiter and must still be stripped (L35a, allow twin A84), and the operator is
   the token's FIRST operator CHARACTER — `>">"x` is a redirect whose quoted `>` begins
   the TARGET, so reading the quotedness of the end of the matched run allowed
-  `>">"x electron .` (L63–L65, allow twin A85).
+  `>">"x electron .` (L63–L65, allow twin A85) — and the run itself has to STOP at a
+  quoted character, because `>">" electron .` is ONE bare redirect whose target is the
+  quoted `>`: taking the regex remainder as "no target attached" ate the next word and
+  lost the launch (L66/L66b). `>|` is a redirect too, not a pipe, and segmentation used
+  to split there before the stripper ever saw it (L67, allow twin A86).
 - A LINE CONTINUATION is joined per line INSIDE the heredoc scanner, so the operator can
   sit on the continued line (`bash \` + newline + `<<'EOF'`, `bash <<<\` + newline +
   `'electron .'` — both hand a body to `bash`, L53a/L53b) while a BODY is never joined:
@@ -465,7 +469,7 @@ This is a residual list, not a completeness claim:
 ## Tests
 
 ```bash
-node extensions/gui-device-guard/test.mjs                    # 333 assertions, threat table L1–L65 + handler H1–H15
+node extensions/gui-device-guard/test.mjs                    # 337 assertions, threat table L1–L67 + handler H1–H15
 node extensions/gui-device-guard/test.mjs --classify 'npm exec electron .'
 ```
 
@@ -476,8 +480,8 @@ stays green while `index.ts` is broken and the guard is inert in every session.
 Mutations are pinned, each attributable to the row it is about, all measured at
 ONE head (**this** head — re-measured, not carried over: the counts are the output
 of running the mutant against `test.mjs`, and the assertion total is
-`333 = 262 ROWS + 14 APP_ROWS + 57 explicit \`check()\` calls`): the Electron
-rule's `media` → `false` reds **147**; the wrapper recursion
+`337 = 266 ROWS + 14 APP_ROWS + 57 explicit \`check()\` calls`): the Electron
+rule's `media` → `false` reds **150**; the wrapper recursion
 removed reds **8**; the wrapper WORDS removed reds **4** (L45a + L56a–L56c); the structural rule that
 reads a package-runner anywhere in the segment removed reds **2** (L19h/L19i); the
 comment stripper removed reds **2** (L11d and L11f — re-measured at this head; the
@@ -572,7 +576,10 @@ instead of per character reds **1** (L35a — `bash<<'EOF'` has an unquoted oper
 followed by a quoted delimiter); reading the quotedness of the LAST character of the
 matched operator RUN — so a redirect whose target begins with a quoted `<`/`>` looks
 quoted — reds **3** (L63–L65: `>">"x electron .` displaced the command word and was
-allowed); and reading `watch`'s operand from token 0 again
+allowed); letting the greedy operator run decide whether a target is ATTACHED reds
+**2** (L66/L66b — `>">"` is one bare `>` whose quoted `>` is the target, so eating the
+next word lost `>">" electron .`); and segmenting `>|` as a pipe again reds **1**
+(L67); and reading `watch`'s operand from token 0 again
 reds **3** (L56a–L56c); dropping `electron-forge` from the electron head test reds **5**
 (L31a–L31e); removing the PROCESS-substitution arm (`<( … )` / `>( … )`, the
 round-12 review's second P2) reds **3** (L32a–L32c, and A55 stays green because the

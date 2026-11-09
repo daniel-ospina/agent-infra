@@ -776,6 +776,24 @@ const ROWS = [
     "<<\"<\"npm exec electron .", 1, "electron", true],
   ["A85 the ALLOW twin: the same quoted-target redirect with a benign word stays clean",
     ">\">\"x ls", 0, null, false],
+  // ── L66–L67 (round-12 review, SEVENTEENTH pass) — two more silent allows in the same
+  //     family: an operator run that must STOP at a quoted character, and `>|`.
+  //   L66: `>">"` arrives from `tokenize` as `>>` with flags [unquoted, QUOTED]. The
+  //        greedy run matched both `>`s, the remainder was "", so the NEXT token was
+  //        eaten as the redirect's target — and the launch disappeared. bash creates the
+  //        file `>` and RUNS electron (measured). The operator run stops at the first
+  //        quoted character, so the quoted `>` IS the (attached) target.
+  ["L66 a quoted target that is a single metacharacter is still ATTACHED (`>\">\" e …`) (was [])",
+    ">\">\" electron .", 1, "electron", true],
+  ["L66b …and with an fd in front (was [])",
+    "2>\">\" electron .", 1, "electron", true],
+  //   L67: `>|` is bash's noclobber-override REDIRECT, but segmentation split the line at
+  //        the `|` before the stripper ever saw the operator, so the target became the
+  //        command word (measured: bash redirects and RUNS electron, guard []).
+  ["L67 `>|` is a redirect, not a pipe — the launch after it still runs (was [])",
+    ">|x electron .", 1, "electron", true],
+  ["A86 the ALLOW twin: …with a benign word it stays clean",
+    ">|x ls", 0, null, false],
   //   A83: the twin that keeps the strip honest — a SPACE before the continuation's tab
   //        means the tab is not LEADING, so the terminator is not recognised and the
   //        document runs to end-of-input (measured: `cat` prints ` \tEOF`).
