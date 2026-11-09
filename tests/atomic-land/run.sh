@@ -37,6 +37,12 @@
 #     with the PRIOR head as its sha argument (the carry-forward input), never
 #     the current head — passing the current head would record without any
 #     equivalence proof.
+# 12. A TRANSIENT EMPTY CAPTURE IS RE-POLLED, A PERSISTENT ONE STILL REFUSES
+#     (#1558). Every GitHub value the rail captures goes through `gh_read`, so an
+#     empty reply is retried a bounded number of times before the caller's
+#     fail-closed test sees it — a transient settles, a genuine failure still
+#     refuses. Both directions are pinned (16b persistent, 16c transient), because
+#     a re-poll that swallows the failure is as wrong as one that never runs.
 #
 # Hermetic: a fake gh, fake record-review and fake admin-merge serve every call;
 # HOME is a temp dir so no real review record is read or written.
@@ -2016,15 +2022,54 @@ grep -qi "advanced after verification" "$SCEN/err" && pass "the stop names the a
 # unreadable capture would silently disable B12 — and the unit would land on a
 # base its checks never covered (the same fail-open, reached by a different
 # path). An unreadable tip must STOP at capture, exactly like the merge base.
-echo "── 16b. an UNREADABLE base tip at capture stops the unit (B12, fail-closed)"
+#
+# ⛔ THE FIXTURE IS PERSISTENTLY EMPTY ON PURPOSE (#1558). "Fail-closed" does not
+# mean "abort on the FIRST empty reply": the capture now re-polls through
+# `gh_read`, so a single empty read is a transient that settles. What must still
+# refuse is a base tip that is unreadable across the whole bound — and that is
+# what this scenario pins (`printf '\n'` is empty on EVERY read, so the re-poll
+# findings the same nothing the single read did). The transient direction is 16c.
+echo "── 16b. a PERSISTENTLY unreadable base tip at capture stops the unit (B12, fail-closed)"
 new_scen basetipunreadable
-printf '\n8888888888888888888888888888888888888888\n' > "$SCEN/base-tip-seq"
+printf '\n' > "$SCEN/base-tip-seq"
 SCEN_RECORD_LOG=1
 run_rail 42 --repo "$REPO" --poll 0
 rc=$?
 [ "$rc" -eq 1 ] && pass "stopped (rc 1) — refused to certify without a base binding" || fail "expected rc 1, got $rc (landed with NO base binding)"
 called "admin-merge" && fail "landed with an unreadable base tip — B12 was silently skipped" || pass "did NOT land without a base-binding capture"
 grep -qi "could not read the base tip" "$SCEN/err" && pass "the stop names the unreadable base tip" || fail "the stop does not name the unreadable base tip"
+# The refusal must be reached WITH EVIDENCE — i.e. after the re-poll ran, not on
+# one empty reply. A refusal that fires before the retry is the #1558 defect.
+_bn="$(cat "$SCEN/base-tip-count" 2>/dev/null || echo 0)"
+[ "$_bn" -ge 2 ] && pass "the empty reply was re-polled ($_bn reads) before refusing" \
+  || fail "the rail refused after $_bn read(s) — the re-poll never ran (the #1558 defect)"
+
+# ═══ 16c. #1558 — a TRANSIENT empty read must NOT be fatal on the first try ═
+# The measured defect: ONE transiently-empty `.base.sha` reply aborted the unit at
+# B12, AFTER `[1/4] update` had already force-pushed a refreshed head — and the
+# identical read succeeded seconds later with no intervening change. So the read
+# that aborts the unit must re-poll before concluding the base is unreadable: the
+# first read comes back empty, the second carries the tip, and the unit proceeds
+# to land. Against the pre-fix rail this scenario stops (rc 1), which is what
+# makes it the regression pin for the class.
+echo "── 16c. a TRANSIENT empty base-tip read is RE-POLLED, not fatal (#1558)"
+new_scen basetipsettles
+printf '%s\n' "$HEAD_NEW" > "$SCEN/head"
+printf 'CLEAN\n' > "$SCEN/state"
+printf '{"pr":42,"head_sha":"%s","verdict":"clean","repo":"%s"}\n' "$HEAD_NEW" "$REPO" \
+  > "$SCEN/home/.pi/agent/reviews/daniel-ospina-agent-infra-42.json"
+printf '\n%s\n' "$(cat "$SCEN/base-tip")" > "$SCEN/base-tip-seq"
+run_rail 42 --repo "$REPO" --poll 0
+rc=$?
+[ "$rc" -eq 0 ] && pass "the unit SETTLED on the re-poll and landed (rc 0)" \
+  || fail "expected rc 0, got $rc — the transient was fatal ($(tail -1 "$SCEN/err"))"
+called "admin-merge 42" && pass "landed once the transient read settled" \
+  || fail "did not land after the transient settled"
+_n="$(cat "$SCEN/base-tip-count" 2>/dev/null || echo 0)"
+[ "$_n" -ge 2 ] && pass "the empty reply was RE-POLLED ($_n reads of the base tip)" \
+  || fail "the empty reply was not re-polled ($_n read(s))"
+grep -qi "could not read the base tip" "$SCEN/err" && fail "a TRANSIENT empty read still aborted the unit (the #1558 defect)" \
+  || pass "no abort on the transient"
 
 # ═══ 17. B11 — two rails on the same PR must not interleave ═════════════
 echo "── 17. a held per-PR lock refuses before any mutation (B11)"
@@ -3756,7 +3801,7 @@ if true; then
   # 2026-10-24, `--queue` raised the population 65 → 71 while the floor stayed at 65, so
   # deleting all six Q mutations reported `71 → 65 ≥ 65` and stayed green — the coverage
   # they carry would have gone silently (review finding, PR #2536).
-  MUTATION_FLOOR=71
+  MUTATION_FLOOR=72
   mutation_drain() { # run the queued mutations in batches, reporting each by name
     local total="${#MUT_QUEUE[@]}" i=0 k n name src rc LOGF=""
     local -a pids names
@@ -4363,6 +4408,13 @@ if true; then
   # B12b: the CAPTURE read must fail closed — an empty capture must not silently
   # disable the pre-land comparison (the path the reviewer reproduced).
   mutate_and_expect_fail B12b 's/if \[ -z "\$CERT_BASE_TIP" \]; then/if false; then/'
+  # B12c (#1558): the CAPTURE's re-poll is what makes a transient distinguishable
+  # from a genuinely unreadable base. Neutralise it — one empty reply is fatal
+  # again — and scenario 16c must redden (it stops instead of settling). A rail
+  # that drops the retry still refuses correctly on a PERSISTENT failure (16b),
+  # which is exactly why 16b alone cannot cover this: the discrimination between
+  # the two is the whole fix.
+  mutate_and_expect_fail B12c 's/\[ "\$t" -gt "\$tries" \] && return 1/return 1/'
   # B13: neutralise the MEASUREMENT — trust `mergeStateStatus` alone. A FAILING
   # required check masks a stale head as BLOCKED, so the measuring arm is the only
   # thing that sees the lag; with the distance always reading 0 the >20-behind PR

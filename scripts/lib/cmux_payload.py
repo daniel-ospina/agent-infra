@@ -215,9 +215,14 @@ def screen_has_payload(screen: str | None, sent_text: str,
     return _pane_matches(screen, marker)
 
 
-def resolve_session_id(workspace: str, run, attempts: int = 3,
-                       retry_s: float = 0.5, sleep=time.sleep) -> str | None:
-    """The pane's bound session id, or None when the pane does not NAME one.
+def _resolve_session_id_qualified(workspace: str, run, attempts: int = 3,
+                                  retry_s: float = 0.5, sleep=time.sleep,
+                                  surface: str | None = None) -> tuple[str | None, bool]:
+    """The pane's bound session id, or None when the pane does not NAME one -- PLUS whether that id
+    is bound to the SURFACE the caller asked for (`False` only on the workspace-only fallback below).
+
+    The second half exists because it decides whether a transcript read may award a verdict at all;
+    `resolve_session_id` is the public form and returns the id alone.
 
     ⛔ SPLIT FROM THE FILE LOOKUP (#1881 review P1). `resolve_session_file` used to answer None for
     three different things — cmux errored, the pane printed no id YET, and the id is known but no
@@ -235,20 +240,114 @@ def resolve_session_id(workspace: str, run, attempts: int = 3,
     message that really was submitted then reads as "not submitted", with a remedy that invites the
     operator to re-send it. A bounded retry costs nothing in soundness (nothing has been sent yet)
     and cannot pick up a new session: the pane that names an id at all is the one that held it.
+
+    ⛔ AND `--surface` MAY NOT EXIST ON THIS BOX'S `cmux` AT ALL (#3795 review P1). Every deployed
+    caller of `cmux surface resume show` is WORKSPACE-ONLY (`orchestrator-heartbeat.sh:1425`,
+    `ask-owner.py:1051`, `lane-status.py:968`, `lane-read.py:21`), and `--surface` is recorded as a
+    flag of `send` / `read-screen` — not of the `resume` scope. A cmux that rejects the flag exits
+    NON-ZERO, and the fallback below then asks the WORKSPACE form, which is the pre-#3795 behaviour.
+    ⛔ WHAT THAT FALLBACK BUYS IS NARROWER THAN IT LOOKS (#3795 review cycle 2, P2). It preserves THIS
+    FUNCTION's public contract — name the pane's session — and the send still reaches the pane. It does
+    NOT raise the *certification* ceiling for `send_verified`, which discards an unqualified id (next
+    paragraph), so a flag-rejecting box still caps at `PANE_ONLY`. The two facts are consistent and
+    must be read together: the retry buys availability, never proof.
+
+    ⛔ BUT AN UNQUALIFIED ANSWER MAY NOT AWARD A VERDICT (#3795 review P2). "Better than naming
+    nothing" is true for SENDING to the pane and false for CERTIFYING it. On a box whose cmux rejects
+    the flag, every surface-qualified read fails, so the retry names the WORKSPACE's session -- which
+    is the right pane only when the workspace holds one surface. When it holds several, that id can
+    belong to a DIFFERENT surface, and `send_verified` would then take its baseline from, and search
+    for the payload tail inside, another pane's transcript. The floor's tail marker is byte-identical
+    on every tick, so an OLD copy of the same message in that other transcript can satisfy the search
+    and mint `VERIFIED` from bytes this send never wrote -- precisely the outcome this module refuses
+    for an empty read two paragraphs above ("how a VERIFIED gets minted from another pane's bytes").
+    A FAILED read is no better evidence of WHICH session it is than an empty one, so the fallback's
+    answer is reported as UNQUALIFIED and `send_verified` denies it the transcript arms entirely. The
+    honest ceiling for evidence from an address the caller did not name is `PANE_ONLY`.
+
+    ⛔ THE FALLBACK IS KEYED ON A FAILED READ, NEVER ON AN EMPTY ONE (#3795 review P1). `surface
+    resume show` exits 0 with empty stdout for a pane that names no session — that is a real answer,
+    and falling back there could bind this send's verification to a DIFFERENT surface's transcript,
+    which is how a `VERIFIED` gets minted from another pane's bytes. Only "the read did not happen"
+    licenses the retry.
+    ⛔ AND THE RETRY IS ONE SHOT (#3795 review cycle 2, P2). The full attempt budget is the wrong
+    budget for a fallback: this runs only after every surface-qualified read already FAILED, and the
+    case it exists for — a cmux that does not know the flag — is deterministic, so three more 45 s
+    reads buy nothing while spending the floor's slack. Session resolution costs at most 3x45 s
+    qualified + 1x45 s fallback; a second full budget would push the whole verification window past
+    the floor's own tick budget (~410 s of a 450 s interval — see `cadence-nudge.sh`'s receipt budget),
+    and the floor's lock is now held by identity as well as age for exactly that reason.
     """
-    for attempt in range(max(1, attempts)):
-        try:
-            proc = run(["cmux", "surface", "resume", "show", "--workspace", workspace],
-                       timeout=45)
-            out = getattr(proc, "stdout", "") or ""
-        except Exception:                                      # noqa: BLE001
-            out = ""
-        for tok in out.replace("'", " ").split():
-            if len(tok) == 36 and tok.count("-") == 4:
-                return tok
-        if attempt + 1 < max(1, attempts):
-            sleep(retry_s)
-    return None
+
+    def probe(surface_arg: str | None, budget: int | None = None) -> tuple[str | None, bool]:
+        """`(session id or None, did the read that PRODUCED it actually succeed)`."""
+        read_ok = False
+        for attempt in range(max(1, budget if budget is not None else attempts)):
+            try:
+                proc = run(["cmux", "surface", "resume", "show", "--workspace", workspace,
+                            *(["--surface", surface_arg] if surface_arg else [])],
+                           timeout=45)
+                out = getattr(proc, "stdout", "") or ""
+                # A non-zero exit is a FAILED READ, not an empty answer. `_default_run` does not
+                # raise on one, so this is the only place that fact is available.
+                # ⛔ THE DEFAULT IS 1, NOT 0 (#3795 review cycle 5, P2). A status that cannot be read
+                # is a FAILURE — the same polarity `send_verified` uses for the payload send, and for the
+                # same reason: this flag gates the transcript arms, so defaulting an unreadable status to
+                # success would let an id out of a read we could not trust award a verdict. The module's
+                # documented API is the `run` seam, so a seam with no `returncode` is reachable.
+                this_read_ok = getattr(proc, "returncode", 1) == 0
+                if this_read_ok:
+                    read_ok = True
+            except Exception:                                  # noqa: BLE001
+                out = ""
+                this_read_ok = False
+            for tok in out.replace("'", " ").split():
+                if len(tok) == 36 and tok.count("-") == 4:
+                    # ⛔ THE FLAG MUST REPORT THE STATUS OF THE READ THAT YIELDED THE TOKEN (#3795
+                    # review cycle 2, P2). This returned a hardcoded `True`, so a cmux that errors on
+                    # `--surface` but still prints the WORKSPACE's id (rc=2) was reported as
+                    # surface-QUALIFIED -- and qualification is the one fact `send_verified` relies on
+                    # to deny the transcript arms. Measured: `qualified=True`, verdict `VERIFIED`, i.e.
+                    # an id out of a FAILED read certifying a send. The comment three lines up states
+                    # the rule this return was breaking; now it is the value, not the rule.
+                    return tok, this_read_ok
+            if attempt + 1 < max(1, budget if budget is not None else attempts):
+                sleep(retry_s)
+        return None, read_ok
+
+    session_id, read_ok = probe(surface)
+    if session_id is not None:
+        # ⛔ A TOKEN OUT OF A **FAILED** READ IS NOT THIS SURFACE'S SESSION (#3795 review cycle 2, P2).
+        # The bug this closes was in `probe` (it returned a hardcoded `True`), but the value it returns
+        # is only consulted here, so the correction has to land here too: a cmux that errors on
+        # `--surface` and still prints the WORKSPACE's id hands back a real id from a read we know
+        # failed, and reporting it QUALIFIED lets `send_verified` take its baseline from — and search
+        # for the payload tail inside — another pane's transcript. The honest answer is "an id, from a
+        # read we could not trust"; the caller then refuses to certify from it.
+        #   When the caller named NO surface there is no other surface to confuse it with, so the
+        #   pre-existing behaviour stands exactly: every existing caller's qualification is unchanged.
+        return session_id, (read_ok if surface else True)
+    qualified = True
+    if surface and not read_ok:
+        _warn("surface-qualified `surface resume show` gave no readable answer; "
+              "retrying workspace-only (this cmux may not accept --surface)")
+        session_id, _ = probe(None, budget=1)
+        qualified = False
+    return session_id, qualified
+
+
+def resolve_session_id(workspace: str, run, attempts: int = 3,
+                       retry_s: float = 0.5, sleep=time.sleep,
+                       surface: str | None = None) -> str | None:
+    """The pane's bound session id, or None when the pane does not NAME one.
+
+    The public form, and the only shape every pre-existing caller needs; the semantics, the fallback
+    and the reason the fallback is keyed on a FAILED read are documented on
+    `_resolve_session_id_qualified`, which also reports whether the id is the surface's OWN.
+    """
+    session_id, _ = _resolve_session_id_qualified(
+        workspace, run, attempts=attempts, retry_s=retry_s, sleep=sleep, surface=surface)
+    return session_id
 
 
 def session_file_hits(session_id: str | None) -> list[str]:
@@ -384,8 +483,9 @@ def transcript_has_payload(path: str, sent_text: str,
 
     ⛔ `since_offset` IS THE POINT (#1881 review P1). Without it this function answered "is the marker
     anywhere in the last 2 MB", which on a live lane can span DAYS — so an earlier message with the
-    same body (a standing order, a nudge, the retry that `orch-send.sh 165` tells the operator to
-    send) certifies a LATER, truncated send. The caller records the transcript's size BEFORE sending
+    same body (a standing order, a nudge, the retry that the re-send branch in `scripts/orch-send.sh`
+    tells the operator to send -- grep `Re-send ONLY if`; the line number rots) certifies a LATER,
+    truncated send. The caller records the transcript's size BEFORE sending
     and passes it here, so only bytes APPENDED BY THIS SEND can match. Omitting it keeps the old
     behaviour for a caller that has no pre-send reading — which is weaker, not stronger, and says so.
     """
@@ -460,7 +560,8 @@ def send_verified(workspace: str, text: str, *, run=None, sleep=time.sleep,
                   tail_chars: int = DEFAULT_TAIL_CHARS,
                   screen_lines: int = DEFAULT_SCREEN_LINES,
                   timeout_s: float = DEFAULT_VERIFY_TIMEOUT_S,
-                  poll_s: float = DEFAULT_POLL_S) -> tuple[str, str]:
+                  poll_s: float = DEFAULT_POLL_S,
+                  surface: str | None = None) -> tuple[str, str]:
     """Send `text` to `workspace`, then verify its tail on the pane.
 
     Returns ``(VERIFIED|PANE_ONLY|SUBMIT_FAILED|UNVERIFIED, last_screen)``. Never raises on a clean
@@ -487,6 +588,13 @@ def send_verified(workspace: str, text: str, *, run=None, sleep=time.sleep,
     """
     run = run or _default_run
     text = flatten(text)
+    # ⛔ THE TARGET IS A WORKSPACE **AND** AN OPTIONAL SURFACE, AND BOTH MUST BE THE CALLER'S (#1187
+    # follow-up). `send_verified` used to address `--workspace` only, so a sender that had already
+    # resolved a SPECIFIC surface (`cadence-nudge.sh` reads `ORCH_SURFACE` from the tick's own state)
+    # could not adopt the checker without silently retargeting its message at whatever surface cmux
+    # considers active — the same "delivered to the wrong place" class as the mis-addressed send in
+    # this issue's own record. Omitted by default, so every existing caller's argv is unchanged.
+    target = ["--workspace", workspace, *(["--surface", surface] if surface else [])]
 
     def cmux(*args):
         return run(["cmux", *args], timeout=45)
@@ -500,7 +608,16 @@ def send_verified(workspace: str, text: str, *, run=None, sleep=time.sleep,
     # by this send (or later) — only that case may reopen the search at offset 0. An id this read
     # could not obtain says nothing about whether a transcript existed, so it must never license the
     # 2 MB window: without a baseline the verdict stays below VERIFIED (PANE_ONLY at best).
-    session_id = resolve_session_id(workspace, run, sleep=sleep)
+    session_id, session_qualified = _resolve_session_id_qualified(
+        workspace, run, sleep=sleep, surface=surface)
+    # ⛔ AN UNQUALIFIED BINDING MAY NOT AWARD A TRANSCRIPT VERDICT (#3795 review P2). The workspace-only
+    # fallback names the WORKSPACE's session, not this surface's; using it to take a baseline (or to
+    # open the offset-0 window) lets another pane's bytes certify this send. Dropping the id here is
+    # the module's EXISTING "no id" path, whose verdict ceiling is already PANE_ONLY -- the honest
+    # ceiling for evidence from an address the caller did not name. The send itself is unaffected: the
+    # message still goes to `target`, which is the caller's own workspace+surface.
+    if not session_qualified:
+        session_id = None
     # ⛔ EXISTENCE IS A READ, NOT AN INFERENCE (#1881 review, rounds 4 and 5): `session_file_for`
     # answers None for "no file", "stat failed" AND "could not look", and only the FIRST of those may
     # reopen the search at offset 0. `session_files_state` reports unreadability as None, which never
@@ -511,7 +628,7 @@ def send_verified(workspace: str, text: str, *, run=None, sleep=time.sleep,
     may_await_new_file = bool(session_id) and session_had_file is False
 
     try:
-        sent = cmux("send", "--workspace", workspace, text)
+        sent = cmux("send", *target, text)
     except Exception as exc:                                   # noqa: BLE001
         # ⛔ A FAILED SEND IS NOT A SILENT ONE (#1881 review P2). The caller's catch-all arm tells the
         # operator "the checker's diagnostics below say which when it printed any", so this path must
@@ -534,7 +651,7 @@ def send_verified(workspace: str, text: str, *, run=None, sleep=time.sleep,
     try:
         # The terminating Enter. Sent as its own call so a payload that itself
         # ends in a newline does not submit the message twice.
-        enter = cmux("send", "--workspace", workspace, "\n")
+        enter = cmux("send", *target, "\n")
         # ⛔ A NON-ZERO EXIT FROM THE ENTER IS A DROPPED ENTER (#1881 review P2). Only the raised
         # case used to clear `entered`, so a `cmux` that exited 2 instead of raising left the flag
         # True and the verdict PANE_ONLY — whose remedy is the re-send this flag exists to forbid.
@@ -564,8 +681,7 @@ def send_verified(workspace: str, text: str, *, run=None, sleep=time.sleep,
     saw_tail = False
     while True:
         try:
-            proc = cmux("read-screen", "--workspace", workspace,
-                        "--lines", str(screen_lines))
+            proc = cmux("read-screen", *target, "--lines", str(screen_lines))
             screen = getattr(proc, "stdout", "") or ""
         except Exception:                                      # noqa: BLE001
             screen = ""
@@ -615,6 +731,9 @@ def _main(argv: list[str] | None = None) -> int:
 
     p = sub.add_parser("verify", help="send a payload, then verify its tail landed")
     p.add_argument("--workspace", required=True)
+    # Optional, and passed through unchanged to `send`, `read-screen` and `surface resume show`.
+    # A caller that resolved a specific surface must keep addressing it (#1187 follow-up).
+    p.add_argument("--surface", default=None)
     p.add_argument("--text", default=None)
     p.add_argument("--file", default=None)
     p.add_argument("--tail-chars", type=int, default=DEFAULT_TAIL_CHARS)
@@ -657,7 +776,8 @@ def _main(argv: list[str] | None = None) -> int:
     # cannot re-open the hole this line used to close for the CLI only.
     verdict, screen = send_verified(args.workspace, text, tail_chars=args.tail_chars,
                                     screen_lines=args.screen_lines,
-                                    timeout_s=args.timeout)
+                                    timeout_s=args.timeout,
+                                    surface=args.surface)
     print(verdict)
     return 0 if verdict == VERIFIED else 3
 
