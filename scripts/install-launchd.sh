@@ -43,10 +43,14 @@
 #
 # `--status` also reports an INSTALLED plist with NO template as UNMANAGED and exits
 # non-zero: that was the blind heartbeat's exact shape — a job on the box that the
-# declared set no longer describes, invisible to every content-drift comparison. Two
-# classes are declared elsewhere and are NOT reported: labels in RETIRED (pending
-# retirement) and labels in OWNED-BY-OTHER-INSTALLERS (another installer of this repo
-# owns them — the harness controller), so the alarm stays about jobs nobody declares.
+# declared set no longer describes, invisible to every content-drift comparison. The
+# declared set is resolved RECURSIVELY (`templates/launchd/*/label.plist` counts — the
+# four repo templates that ship one directory down are this repo's own jobs, not
+# strays, #1867 review P1). Two classes are declared elsewhere and are NOT reported:
+# labels in RETIRED (pending retirement) and labels in OWNED-BY-OTHER-INSTALLERS
+# (another installer of this repo owns them — the harness controller), so the alarm
+# stays about jobs nobody declares. Exit codes: 0 clean · 1 UNMANAGED found · 2 the
+# installed set could NOT be enumerated (UNKNOWN, never a pass — #1867 review P2).
 #
 # Usage:
 #   install-launchd.sh               install/refresh all templates (idempotent)
@@ -1615,6 +1619,29 @@ status_job() {
     echo "  $label: installed=$state version=v$version ($drift)"
 }
 
+# ── THE DECLARED SET — every template this directory describes, at ANY depth (#1867 review P1) ────
+# ⛔ RECURSIVE, and the recursion is the fix, not a convenience. Counting only the FLAT `*.plist`
+# templates made the four templates this repo ships one directory down — `conflict-rebase/`,
+# `harness-apply/`, `reaper/`, `runner-autoscale/`, each installed into `~/Library/LaunchAgents` by
+# its own installer — read as UNMANAGED on a box that has the repo's OWN jobs armed. `--status` then
+# exited 1 and printed the `launchctl bootout && rm -f` remedy for three owner-armed jobs, so the
+# instrument's healthy state on the reference Mac was a hard FAILING row. A job declared one
+# directory down IS described by this repo; the question the caller asks is "is this label in the
+# declared set?", and the declared set is this directory's templates wherever they sit.
+declared_labels() {
+    local template
+    for template in "$TEMPLATES_DIR"/*.plist "$TEMPLATES_DIR"/*/*.plist; do
+        [ -f "$template" ] || continue
+        basename "$template" .plist
+    done
+}
+
+is_declared() { # $1 = label → 0 when a template in the declared set (any depth) describes it
+    # Capture, then grep a here-string — never `declared_labels | grep -q` (#864's SIGPIPE shape).
+    [ -n "$1" ] || return 1
+    grep -qxF -- "$1" <<<"$(declared_labels || true)"
+}
+
 # ── UNMANAGED INSTALLED PLISTS (#1867) ─────────────────────────────────────────────────────────────
 # A plist installed on the box that NO template in the declared set describes is invisible to every
 # content comparison this file makes — the loop in `--status` and the install loop both iterate
@@ -1633,15 +1660,26 @@ status_job() {
 #   · a label in `OWNED-BY-OTHER-INSTALLERS` is installed by ANOTHER surface of this repo (the
 #     harness controller), which is not this installer's set to describe.
 # Without the second, the reference Mac layout is red forever (#1867 review P1).
+# Returns 0 when the installed set was enumerated (rows on stdout, possibly none), 2 when it could
+# NOT be — "I could not look" is a different answer from "nothing to report", and the caller must be
+# able to tell them apart (see the UNKNOWN arm in --status, #1867 review P2).
 unmanaged_plists() {
-    local installed label have_template=0
-    [ -d "$AGENTS_DIR" ] || return 0
+    local installed label
+    # No install dir at all is a known, benign state (nothing was ever installed here).
+    [ -e "$AGENTS_DIR" ] || return 0
+    # ⛔ EXISTS BUT CANNOT BE ENUMERATED IS NOT "NOTHING UNMANAGED" (#1867 review P2). An unreadable
+    # or non-directory AGENTS_DIR produces no rows, empty rows read as a clean box, and `--status`
+    # then exits 0 from an instrument that looked at nothing — the exact fail-open this file guards
+    # three functions away in `cmux_gate_required` ("must not install on the assumption that none
+    # are"). Refuse instead: 2 = UNKNOWN, never a pass.
+    if [ ! -d "$AGENTS_DIR" ] || [ ! -r "$AGENTS_DIR" ] || [ ! -x "$AGENTS_DIR" ]; then
+        return 2
+    fi
     for installed in "$AGENTS_DIR"/com.eldato.*.plist "$AGENTS_DIR"/com.tortoise.*.plist; do
         [ -f "$installed" ] || continue
         label="$(basename "$installed" .plist)"
-        have_template=0
-        [ -f "$TEMPLATES_DIR/$label.plist" ] && have_template=1
-        [ "$have_template" = 1 ] && continue
+        # Declared anywhere in the template tree — flat, or one directory down — is declared.
+        is_declared "$label" && continue
         # A RETIRED label is deliberately template-less: it is DECLARED and it is removed by
         # retire_pass on the next install, so it is not "unmanaged" — it is pending retirement.
         is_retired "$label" && continue
@@ -1934,7 +1972,19 @@ if [ "${1:-}" = "--status" ]; then
     # EXIT CODE carries it: a status command that prints a caveat and exits 0 is read by every
     # caller as "green".
     status_rc=0
-    unmanaged="$(unmanaged_plists || true)"
+    unmanaged=""
+    unr_rc=0
+    unmanaged="$(unmanaged_plists)" || unr_rc=$?
+    if [ "$unr_rc" -ne 0 ] && [ "$unr_rc" -ne 1 ]; then
+        # ⛔ FAIL-CLOSED, like `check`/`cmux_gate_required` above (0 OK · 1 DRIFT · 2 UNKNOWN — never
+        # a pass). A hard failure of `unmanaged_plists` used to be erased by `|| true` into the same
+        # empty string a clean box produces, so an enumeration that failed read as GREEN.
+        echo "" >&2
+        echo "  ⛔ UNKNOWN — $AGENTS_DIR exists but could NOT be enumerated (rc $unr_rc)." >&2
+        echo "     The installed-job set was NOT inspected: this is an unanswered question, not a" >&2
+        echo "     clean box. Re-run with a readable $AGENTS_DIR before trusting any green." >&2
+        status_rc=2
+    fi
     if [ -n "$unmanaged" ]; then
         echo ""
         echo "  ⛔ UNMANAGED — installed with NO template in the declared set:" >&2
@@ -1953,7 +2003,8 @@ if [ "${1:-}" = "--status" ]; then
     if [ -n "$(retired_labels)" ]; then
         echo "Retired (moved to session-checks, #432): $(retired_labels | tr '\n' ' ')"
     fi
-    echo "Env: AGENT_INFRA_PATH=$AGENT_INFRA_PATH"    echo "     TORTOISE_REPO=${TORTOISE_REPO:-<unset — session-checks will use the sibling tortoise or skip the hub leg>}"
+    echo "Env: AGENT_INFRA_PATH=$AGENT_INFRA_PATH"
+    echo "     TORTOISE_REPO=${TORTOISE_REPO:-<unset — session-checks will use the sibling tortoise or skip the hub leg>}"
     echo "     SWARM_ROOT=${SWARM_ROOT:-<unset — canary job skipped>}"
     if [ "$WORKTREE_HYGIENE_MODE" = '--apply' ]; then
         echo "     worktree-hygiene: ARMED ($WT_HYGIENE_ARM_FILE) — the job DELETES on its timer"

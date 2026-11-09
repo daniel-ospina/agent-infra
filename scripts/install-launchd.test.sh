@@ -2890,12 +2890,24 @@ echo ""
 echo "── 18. --status reports an installed plist with no template as UNMANAGED ──"
 
 STRAY_HOME="$T/stray-home"; mkfakehome "$STRAY_HOME"
-run_stray_status() {
+# seed_stray_plist <label> — an installed plist on the box naming <label>. Only the FILENAME matters
+# to `unmanaged_plists` (it classifies by basename); the body is a minimal valid plist so nothing
+# downstream mistakes it for a truncated file.
+seed_stray_plist() {
+    printf '%s\n' \
+        '<?xml version="1.0" encoding="UTF-8"?>' \
+        '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' \
+        '<plist version="1.0"><dict>' \
+        "<key>Label</key><string>$1</string>" \
+        '<key>ProgramArguments</key><array><string>/bin/bash</string><string>/x/stray.sh</string></array>' \
+        '</dict></plist>' > "$STRAY_HOME/Library/LaunchAgents/$1.plist"
+}
+run_stray_status() { # [agents-dir] — defaults to the fake home's LaunchAgents
     ( export HOME="$STRAY_HOME"
       export PATH="$T/bin:$PATH"
       export FAKE_LAUNCHCTL_LOG="$LOG"
       export TEMPLATES_DIR="$TEMPLATES"
-      export AGENTS_DIR="$STRAY_HOME/Library/LaunchAgents"
+      export AGENTS_DIR="${1:-$STRAY_HOME/Library/LaunchAgents}"
       export ELDATO_ALLOW_TEST_HOME=1
       unset TORTOISE_REPO SWARM_ROOT PYTHON_BIN
       bash "$INSTALLER" --status 2>&1 )
@@ -3003,6 +3015,77 @@ else
 fi
 assert_contains "$(cat "$REPO_TEMPLATES/OWNED-BY-OTHER-INSTALLERS" 2>/dev/null || echo MISSING)" "com.eldato.orchestrator-loop" \
     "§18 OWNED-BY-OTHER-INSTALLERS declares the label those installers install"
+
+# ...and the gate reads EVERY entry, not one hardcoded label (#1867 review note). The manifest's own
+# header claims "every entry below still matches the declaring installer's own LABEL=/BASE_LABEL=
+# line"; grepping a single literal made that claim broader than the gate — a second entry added
+# tomorrow would have been exempted with no row to notice it. Resolve the exemption against the
+# installers in this repo, entry by entry.
+FOREIGN_ENTRIES="$(grep -vE '^[[:space:]]*(#|$)' "$REPO_TEMPLATES/OWNED-BY-OTHER-INSTALLERS" 2>/dev/null || true)"
+if [ -n "$FOREIGN_ENTRIES" ]; then
+    ok "§18 OWNED-BY-OTHER-INSTALLERS has entries for the drift gate to check (not a vacuous loop)"
+else
+    bad "§18 OWNED-BY-OTHER-INSTALLERS is empty — the drift rows below would prove nothing"
+fi
+DECLARED_IN_REPO="$(grep -hE '^(BASE_)?LABEL="com\.[A-Za-z0-9._-]+"' \
+    "$SCRIPT_DIR"/install-*.sh "$SCRIPT_DIR"/orchestrator-bringup.sh \
+    "$SCRIPT_DIR"/orchestrator-harness/*.sh 2>/dev/null || true)"
+while IFS= read -r _foreign; do
+    [ -n "$_foreign" ] || continue
+    assert_contains "$DECLARED_IN_REPO" "LABEL=\"$_foreign\"" \
+        "§18 the exemption '$_foreign' is still declared by an installer in this repo (not stale)"
+done <<<"$FOREIGN_ENTRIES"
+
+# ⛔ AND A TEMPLATE ONE DIRECTORY DOWN IS STILL DECLARED (#1867 review P1). This repo ships four
+# launchd templates in SUB-directories — conflict-rebase/, harness-apply/, reaper/, runner-autoscale/
+# — each installed into ~/Library/LaunchAgents by its own installer. Counting only the FLAT
+# `*.plist` templates made every one of them UNMANAGED on the reference Mac, where `--status` exited 1
+# and printed the `launchctl bootout && rm -f` remedy for three owner-armed jobs (and
+# fleet-schedule.py turns that rc into `SCHEDULE NOT VERIFIED` → `fleet-schedule … FAILING`).
+SUBDIR_TEMPLATES=0
+for _tpl in "$REPO_TEMPLATES"/*/*.plist; do
+    [ -f "$_tpl" ] || continue
+    SUBDIR_TEMPLATES=$((SUBDIR_TEMPLATES + 1))
+    _lbl="$(basename "$_tpl" .plist)"
+    seed_stray_plist "$_lbl"
+    set +e
+    OUT="$(run_stray_status)"; RC=$?
+    set -e
+    assert_eq "$RC" "0" "§18 a template in a SUB-directory ($_lbl) is DECLARED — not unmanaged"
+    assert_not_contains "$OUT" "$_lbl" "§18 ... and is not named as a stray, so no bootout advice for the repo's own job"
+    rm -f "$STRAY_HOME/Library/LaunchAgents/$_lbl.plist"
+done
+if [ "$SUBDIR_TEMPLATES" -gt 0 ]; then
+    ok "§18 the sub-directory rows above are not vacuous ($SUBDIR_TEMPLATES template(s) one dir down)"
+else
+    bad "§18 NO sub-directory template exists in $REPO_TEMPLATES — the recursion rows proved nothing"
+fi
+
+# ⛔ AND "I COULD NOT LOOK" IS NOT "NOTHING TO REPORT" (#1867 review P2). An AGENTS_DIR that exists
+# but cannot be enumerated used to produce no rows, and no rows read as a CLEAN box: `--status`
+# exited 0 from an instrument that looked at nothing. It must answer UNKNOWN (2) instead — the same
+# fail-closed polarity `check`/`cmux_gate_required` already have (0 OK · 1 DRIFT · 2 UNKNOWN).
+NOT_A_DIR="$T/agents-not-a-dir"; : > "$NOT_A_DIR"
+set +e
+OUT="$(run_stray_status "$NOT_A_DIR")"; RC=$?
+set -e
+assert_eq "$RC" "2" "§18 an AGENTS_DIR that exists but cannot be enumerated is UNKNOWN (2), not a clean 0"
+assert_contains "$OUT" "UNKNOWN" "§18 ... and says so loudly rather than printing nothing"
+assert_contains "$OUT" "could NOT be enumerated" "§18 ... naming the failed enumeration as the reason"
+
+if [ "$(id -u)" != "0" ]; then
+    UNREADABLE_DIR="$T/agents-unreadable"; mkdir -p "$UNREADABLE_DIR"; : > "$UNREADABLE_DIR/com.eldato.secret.plist"
+    chmod 000 "$UNREADABLE_DIR"
+    set +e
+    OUT="$(run_stray_status "$UNREADABLE_DIR")"; RC=$?
+    set -e
+    chmod 755 "$UNREADABLE_DIR"
+    assert_eq "$RC" "2" "§18 an UNREADABLE LaunchAgents dir is UNKNOWN (2), not a clean 0"
+    assert_contains "$OUT" "could NOT be enumerated" "§18 ... naming the failed enumeration"
+else
+    echo "  · §18 unreadable-dir row SKIPPED: running as root, which reads a 000 dir (the"
+    echo "    not-a-directory row above is the deterministic one and carries the same arm)"
+fi
 
 # The alarm still fires for a job NOBODY declares — the exclusion list must not have blunted it.
 cat > "$STRAY_HOME/Library/LaunchAgents/com.eldato.hand-installed.plist" <<'PLIST'

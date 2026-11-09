@@ -79,6 +79,15 @@ Matching is by **repo-relative suffix**, not absolute prefix: the gate is a prop
 so `$HOME/.pi/agent/scripts/heartbeat-loop.sh` (the farmed copy a plist would actually name) and
 `<worktree>/scripts/heartbeat-loop.sh` both refuse.
 
+The declared set is resolved **recursively**: `templates/launchd/<subdir>/<label>.plist` is a
+template too, so the four jobs this repo ships one directory down (`conflict-rebase`,
+`harness-apply`, `disk-reaper`, `runner-autoscale` — each installed into `~/Library/LaunchAgents`
+by its own installer) are its **own** jobs, not strays. Counting only the flat templates made
+`--status` exit 1 and print the `bootout && rm -f` remedy for three owner-armed jobs on the
+reference Mac. And `--status` exits **2 (UNKNOWN)** when `~/Library/LaunchAgents` exists but cannot
+be enumerated: "I could not look" is a different answer from "nothing to report", and it is never
+reported as clean.
+
 Two label classes are **declared** and therefore never reported as `UNMANAGED`, because an alarm that
 is red on a healthy box is one operators learn to ignore:
 
