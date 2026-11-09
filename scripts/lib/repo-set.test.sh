@@ -1009,7 +1009,11 @@ def _strip_comment(line):
     ⛔ MEMBERSHIP IS PER-GUARD BUT PINNING IS PER-MEMBER, AND THE TWO DO NOT COINCIDE — see the word-set
     and charset bullets, which are split by member because the mutant's delta depends on WHICH character you
     pull: one member reds the suite, the next one moves nothing. A guard listed as "pinned" below is pinned
-    for the members an arm actually exercises, and every other member of it is DECLARED here.
+    for the members an arm actually exercises, and every other member of it is DECLARED here. This is done
+    per member where a member is a CHARACTER you can pick (the word sets and both delimiter charsets, whose
+    members were the ones actually found unpinned); elsewhere the guard is named as a whole, as are the
+    KEYWORDS set (pinned in aggregate) and the quote-set members, which are named, not enumerated — read a
+    "declared" entry as covering its members unless the entry says otherwise.
 
     LOAD-BEARING, UNPINNED — a VALID-bash input separates the guard from its mutant (`bash -n` rc 0, and
     `declare -F` agrees with the BASELINE and not with the mutant), NO fixture line carries that input, and
@@ -1070,11 +1074,17 @@ def _strip_comment(line):
     `_.-` on the PLAIN path moves 3 files but also truncates the three `EOF_*` delimiters in `repo-set.sh`
     (`EOF_NORM`, `EOF_STATE_KEY`, `EOF_GOT`; the bare `EOF` carries no charset character and is never
     affected), losing 14 of its 26 definitions — so `_reader_defs_n` drops below the floor and `f11f`
-    reds at 245/1. The suite catches that one — and ONLY that one: drop `.` or `-` from the same set instead
-    and the suite stays at 246/0, because `cat <<A.B` / `cat <<A-B` then lose the definition below them on
-    valid bash. A member an arm pins is pinned; a member nothing pins is DECLARED. "The suite catches this
-    guard" is a statement about one member, never a reason to skip the others — that reading is how this
-    bullet came to tell a future lane NOT to declare two members that lose a real definition.
+    reds at 245/1. But ONLY the `_` member is pinned: drop `.` or `-` from the same set instead and the
+    suite stays at 246/0, while `cat <<A.B` / `cat <<A-B` lose the definition below them on valid bash. A
+    member an arm pins is pinned; a member nothing pins is DECLARED. "The suite catches this guard" is a
+    statement about one member, never a reason to skip the others — that reading is how this bullet came to
+    tell a future lane NOT to declare two members that lose a real definition.
+    ⛔ AND THE SET APPEARS TWICE — the same `'_.-'` also sits on the QUOTED/backslash path, one branch up.
+    There `-` is the pinned member and `.` and `_` are unpinned: `cat <<'A'.B` (the quoted delimiter closes
+    and concatenates) and `cat <<\A_B` (the backslash-escaped one) each lose the definition below them on
+    valid bash with the suite at 246/0 and 0 of the 438 files moving. So neither occurrence is "the pinned
+    charset": each is pinned for ONE member, and the members the arms do not reach are declared here. A
+    future lane reading "the charset is pinned" would skip exactly the two spellings above.
 
     NOT REACHED BY THIS POPULATION — and NOT because they are inert, which is the distinction that matters:
     `_strip_comment`'s SINGLE-quote state, its DOUBLE-quote state, and its backslash escape each move 0 of
