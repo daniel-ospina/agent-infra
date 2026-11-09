@@ -1010,8 +1010,10 @@ def _strip_comment(line):
     and charset bullets, which are split by member because the mutant's delta depends on WHICH character you
     pull: one member reds the suite, the next one moves nothing. A guard listed as "pinned" below is pinned
     for the members an arm actually exercises, and every other member of it is DECLARED here. This is done
-    per member where a member is a CHARACTER you can pick (the word sets and both delimiter charsets, whose
-    members were the ones actually found unpinned); elsewhere the guard is named as a whole, as are the
+    per member where a member is a CHARACTER you can pick AND a member drop was measured to change something
+    (the word set, the two delimiter charsets, the `_openers` whitespace and delimiter-entry sets, and the
+    DEFINITION NAME charset below — whose digit member is the scanner's largest undeclared false pass);
+    elsewhere the guard is named as a whole, as are the
     KEYWORDS set (pinned in aggregate) and the quote-set members, which are named, not enumerated — read a
     "declared" entry as covering its members unless the entry says otherwise.
 
@@ -1046,6 +1048,12 @@ def _strip_comment(line):
       * `_openers`' IN-QUOTE escape (`if c == '\\': i += 2` inside that state) — a separate condition from
         the outside-quote escape below; `echo "a \" # b" ; cat <<EOF` + a body invents the body line, and
         it moves 1 file (`rank-queue.test.sh`, losing 15 names).
+      * TWO MEMBER-LEVEL GAPS in `_openers`' own character sets, both INVENTING a body line on valid bash with
+        the suite at 246/0 and 0 files moved, and both reached only through a member an arm does not pin:
+        the whitespace skip's TAB (`cat <<` + a literal tab + `EOF` — the SPACE spelling is the one
+        illustrated, so a reader cannot tell the tab is deliberate) and the delimiter-entry set's
+        DOUBLE QUOTE (`cat <<"EOF"` — single quote and backslash are pinned there, the double quote is
+        not).
       * AND FOUR MORE OF THE SAME CLASS, named so this list is not read as exhaustive: `_openers`'
         single-quote CLOSE, and `_strip_comment`'s single-quote close, its in-quote escape, and its
         DOUBLE-quote CLOSE.
@@ -1063,6 +1071,15 @@ def _strip_comment(line):
         the faithful one: this guard's failure direction is a FALSE PASS on a definition bash really makes.
         It moves 0 of the 438 files and the KEYWORDS set is pinned in aggregate (emptying the set reds the
         suite), but the exclusion itself is unpinned, so it is declared here too.
+      * THE DEFINITION NAME CHARSET `[A-Za-z_][A-Za-z0-9_]` (the `defn` and `head` patterns) — the digits
+        member is the BIGGEST undeclared false pass in this scanner: drop it and the suite stays at 246/0,
+        nothing moves in the fixture, and **56 of the 438 files lose 209 distinct names** — every one of them
+        digit-bearing, most of them defined with a same-line brace in their own file, so ground truth and the
+        baseline both find them and the mutant LOSES them (`f10() { :; }` + `bash -n` rc 0 + `declare -F`
+        listing `f10` is the minimal shape; a digit-named fixture line is what would pin this, and none
+        exists). `head`'s copy of the charset is inert on this population (0 files), which is why the SET
+        rather than the occurrence is declared. ⛔ The 209 is measured, not estimated — re-measure it before
+        quoting this bullet, and note it is names, not files.
       * the trailing flush (`if _buf is not None`) — a file ENDING mid-continuation (`last_def() { :; }`
         followed by a single backslash AND a newline) drops the last definition, a FALSE PASS; the shape is
         valid bash. Moves 0. The same bytes WITHOUT the trailing newline are not a fixture: `bash -n`
@@ -1467,7 +1484,7 @@ head_with_comment_between()
 #     changes under it. Until then it is DECLARED, not pinned.
 #     ⛔ AND THE BARE-WORD GUARD BELOW IS WHAT MOVED THIS MUTANT'S DELTA, so an anchor figure measured before
 #     it landed is not comparable: with the bare-word guard REVERTED, the SAME anchor mutant invents 261
-#     distinct names across 125 of these 438 files (132 ordered scans move; 7 more change only by a DUPLICATE
+#     distinct names across 125 of these 438 files (132 ordered scans move, 7 of them ONLY by a DUPLICATE
 #     report of a name the file already had), and it DOES change the fixture scan — 24 -> 26 names, GAINING
 #     `bare_word_then_brace` and `build_it` — so it reds `f11f-0`. ⛔ THE LEFT NUMBER IS 24, NOT 25: the
 #     before-guard base it was first measured on carried one more fixture name than this head does, which is
