@@ -220,6 +220,37 @@ reset_state
 STUB_ENGINE_RC=0 STUB_ENGINE_ROWS_FILE="$ROWS_NONE" STUB_REAPER_RC=0 run_sweep --repo "$REPO" --engine "$STUB_ENGINE"
 assert_contains "$OUT" "remove-rows=0" "a pass with no remove rows reports 0 (the counter is not simply always-on)"
 
+# ── T3b: a DECLARED operator variable decides, never ties ────────────────────
+echo ""
+echo "── T3b. a DECLARED \$TORTOISE_REPO decides — the cwd is a candidate, never a tie ──"
+# ⛔ #1974 §1 names `$TORTOISE_REPO` as an INPUT of the resolution order, and before #3833 it
+# DECIDED (`REPO="${TORTOISE_REPO:-$HOME/eldato/tortoise}"`). #3833 offered it as one candidate
+# beside `$PWD`, so a box that declares its target AND happens to stand in another checkout refused
+# (`rc 3, 2 candidate checkouts qualify`) instead of running against the checkout it declared — a
+# false block in a pass that can REMOVE worktrees. The arm is the shape of that box.
+CWD_REPO="$(mk_repo elsewhere)"
+# ⛔ SCRUB `REPO`/`OR` AS WELL AS `TORTOISE_REPO`/`TORTOISE`: this box exports `REPO` and `OR`
+# ambiently, and a plain assignment to an already-exported variable KEEPS the export attribute — so
+# `REPO="$(mk_repo repo)"` above is visible to every child. A suite that inherits the variable it is
+# pinning would pass on the operator box and prove nothing on a runner.
+reset_state
+_out="$( sweep_env; cd "$CWD_REPO" && env -u REPO -u OR -u TORTOISE \
+        STUB_ENGINE_RC=0 STUB_ENGINE_ROWS_FILE="$ROWS_NONE" STUB_REAPER_RC=0 \
+        TORTOISE_REPO="$REPO" bash "$SWEEP" --engine "$STUB_ENGINE" 2>&1 )"; _rc=$?
+assert_eq "$_rc" "0" "T3b a declared \$TORTOISE_REPO with the cwd in ANOTHER checkout runs (rc 0, not the tie refusal)"
+assert_absent "$_out" "refusing to choose between them" "T3b …and never refuses between two candidate checkouts"
+assert_contains "$(cat "$T/engine-argv.txt" 2>/dev/null)" "--repo $REPO" "T3b …and drives the DECLARED checkout"
+assert_absent "$(cat "$T/engine-argv.txt" 2>/dev/null)" "--repo $CWD_REPO" "T3b …not the checkout the operator happened to stand in"
+# The CONTROL: with nothing declared, the same cwd is still a legitimate CANDIDATE and is derived
+# (and announced) — so the arm above is about the tie, not about the candidate channel being dead.
+reset_state
+_out="$( sweep_env; cd "$CWD_REPO" && env -u REPO -u OR -u TORTOISE_REPO -u TORTOISE \
+        STUB_ENGINE_RC=0 STUB_ENGINE_ROWS_FILE="$ROWS_NONE" STUB_REAPER_RC=0 \
+        bash "$SWEEP" --engine "$STUB_ENGINE" 2>&1 )"; _rc=$?
+assert_eq "$_rc" "0" "T3b control: nothing declared ⇒ the cwd is derived and the pass runs"
+assert_contains "$_out" "a candidate that proved it is a checkout" "T3b control: …and the derived value is ANNOUNCED, never silent"
+assert_contains "$(cat "$T/engine-argv.txt" 2>/dev/null)" "--repo $CWD_REPO" "T3b control: …and it drives the derived checkout"
+
 # ── T4: a dry run writes and removes nothing ─────────────────────────────────
 echo ""
 echo "── T4. a dry run writes NOTHING and removes NOTHING ──"

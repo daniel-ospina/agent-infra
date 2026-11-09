@@ -1177,18 +1177,23 @@ export REPO=$HOME/eldato/tortoise        # REQUIRED: the target repo's local mai
                                          # CARRIES A REPO PATH DEFAULT ANY MORE (agent-infra#1974,
                                          # #3833) — the complete grep over `*.sh`, `retired/` and
                                          # `*.test.sh` excluded. The seven this passage used to
-                                         # list are all resolved now: `report.sh` (24) and
-                                         # `deploy-crossbox.sh` (23) read
+                                         # list are all resolved now: `report.sh` (44) and
+                                         # `deploy-crossbox.sh` (124) read
                                          # `REPO="$(resolve_repo)"`, and
-                                         # `refresh-candidates.sh` (18),
-                                         # `cloud-cell-supervisor.sh` (93),
-                                         # `pi-reap-worktrees.sh` (1174),
-                                         # `stale-worktrees.sh` (35),
-                                         # `stale-main-triage.sh` (16) — plus
-                                         # `worktree-hygiene-sweep.sh`, `lane-container-reap.sh`
-                                         # and `cloud-cell-doctor.sh` — carry
+                                         # `refresh-candidates.sh` (149),
+                                         # `cloud-cell-supervisor.sh` (149),
+                                         # `pi-reap-worktrees.sh` (882),
+                                         # `stale-worktrees.sh` (45),
+                                         # `stale-main-triage.sh` (23) — plus
+                                         # `lane-container-reap.sh` and
+                                         # `cloud-cell-doctor.sh` — carry
                                          # `REPO="${REPO:-}"`, i.e. an explicit NO DEFAULT that
-                                         # cannot invent a path. The `$PWD` three were the worst
+                                         # cannot invent a path. `worktree-hygiene-sweep.sh`
+                                         # carries `REPO="${REPO:-${TORTOISE_REPO:-${TORTOISE:-}}}"`:
+                                         # the box's own declared target still DECIDES (as it did
+                                         # before #1974), the cwd is only a CANDIDATE, and the
+                                         # value is PROVEN by `resolve_repo` either way. The
+                                         # `$PWD` three were the worst
                                          # shape: $PWD is `/` under launchd, so the default
                                          # resolved to a real non-repo directory and failed later
                                          # as `not a git repository: /` instead of at the REPO

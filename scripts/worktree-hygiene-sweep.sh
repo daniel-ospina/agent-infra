@@ -123,16 +123,25 @@ PREFLIGHT_ONLY=0
 # pass every machine runs on a 6-hourly job. A default is only safe if it is TRUE ON EVERY MACHINE and
 # a home directory never is, so there is none: the value is DECLARED (the plist renders `--repo`
 # explicitly) or DERIVED from a candidate that proves itself, or the pass refuses.
-REPO="${REPO:-}"
+REPO="${REPO:-${TORTOISE_REPO:-${TORTOISE:-}}}"
 # The candidates, in the order #1974 states (the operator's own variables, then the current
 # directory). ⛔ A CANDIDATE IS NOT A DEFAULT: `repo-slug.sh`'s `resolve_repo` uses one only after
 # PROVING it is a git checkout (and, when a queue target `$OR` is declared, that its `origin` names
 # that target), and says which value it derived. `$PWD` failed precisely because nothing proved it —
 # under launchd `$PWD` is `/`, a real directory that is not a repo.
+# ⛔ THE OPERATOR VARIABLE IS DECLARED, NOT A CO-EQUAL CANDIDATE (fresh-context review of #3833, F2),
+# which is how the four sibling scripts already read it. `$TORTOISE_REPO`/`$TORTOISE` DECIDED before
+# #1974 (`REPO="${TORTOISE_REPO:-$HOME/eldato/tortoise}"`); offering it as one candidate beside `$PWD`
+# demoted a value the box explicitly declares to a TIE, so a box that names its target AND happens to
+# stand in another checkout got rc 3 "2 candidate checkouts qualify" instead of its declared target —
+# a false block in a pass that can REMOVE worktrees. Measured at 0b34b28c6: rc=3, while the base
+# resolved to the declared checkout. #1974 §1 names it as an INPUT of the order; it is still PROVEN
+# by `resolve_repo` below (§3: a declared-but-bogus value is refused by value, never swapped), so this
+# delivers §1 and only stops the tie.
 # ⛔ ONE PATH PER LINE (`repo-slug.sh` reads the list with `read -r`, never word-splitting): a checkout
 # under a directory with a space in its name is ORDINARY in this repo, and a space-joined list split it
 # into two candidates that could never prove themselves (fresh-context review of #3833, F1).
-REPO_CANDIDATES="$(printf '%s\n' "${TORTOISE_REPO:-${TORTOISE:-}}" "$PWD")"
+REPO_CANDIDATES="$PWD"
 ENGINE=""
 AGED_DAYS=7
 BACKUP_DIR="${HYGIENE_BACKUP_DIR:-$HOME/orchestrator/state/reaped-patches}"
