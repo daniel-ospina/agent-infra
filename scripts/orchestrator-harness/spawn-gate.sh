@@ -161,16 +161,25 @@ is_limit "${MAX_LOAD:-}" || MAX_LOAD=40
 # instrument reporting healthy about a cell that can do no work, which is the same false-PASS shape
 # as this file's own unreadable-`df` divergence. The alternative place to close it is that file's
 # floor, and that is the stronger place; it is held by concurrent lanes, so the DEFAULT is aligned
-# here instead. A deployment wanting a higher dispatch floor sets DISK_MIN_FREE_MB explicitly, and
-# then the two differ BY DECLARATION instead of by accident. ⚠️ THE BAND IS CLOSED IN BOTH DIRECTIONS
-# FOR THE DEFAULTS ONLY (review round, P3): `MIN_FREE_MB` is itself a documented tunable, so setting
-# it LOWER than this floor re-opens the band from the other side (supervisor 100 / gate 500 → `check`
-# healthy, spawns refused 77). The durable fix is to bind the gate to `MIN_FREE_MB` when
-# `DISK_MIN_FREE_MB` is unset — or to have `cloud-cell-supervisor.sh` refuse a floor below this one —
-# and both of those touch a file held by concurrent lanes, so it is recorded as a residual rather than
-# settled here. `spawn-gate.test.sh` pins the EQUALITY of the DEFAULTS against that file's own line, so
-# raising one of the two alone reddens it.
-DISK_MIN_FREE_MB="${DISK_MIN_FREE_MB:-500}"
+# here instead.
+# ⛔ AND NOW THE BAND IS CLOSED BY BINDING, NOT BY TWO LITERALS THAT HAPPEN TO MATCH (agent-infra#1852,
+# which carried the residual this paragraph used to end on). The residual was exact: `MIN_FREE_MB` is
+# itself a documented tunable, so setting it LOWER than this floor re-opened the band from the other
+# side (supervisor 100 / gate 500 → `check` healthy, every spawn refused 77), and the named durable
+# fix was "bind the gate to `MIN_FREE_MB` when `DISK_MIN_FREE_MB` is unset". THAT IS THIS LINE: with
+# `DISK_MIN_FREE_MB` unset the gate takes the cell's `MIN_FREE_MB`, and `cloud-cell-supervisor.sh`
+# takes `DISK_MIN_FREE_MB` when ITS knob is unset — so ONE floor reaches both instruments whichever
+# spelling the operator used, and neither can sit below the other by accident. An explicit
+# `DISK_MIN_FREE_MB` still wins outright (the declaration the older note described), which is why the
+# two can still differ ON PURPOSE — the difference is now declared, and both sides read it.
+# ⛔ INHERITANCE GETS NO WEAKER VALIDATION: a non-numeric, zero or out-of-range INHERITED value is
+# repaired by the guards immediately below exactly as a provided one is, so a stray `MIN_FREE_MB=abc`
+# in a worker's environment cannot make this gate refuse every lane for ever, and `MIN_FREE_MB=0`
+# cannot make it inert.
+# ⛔ AND IT IS NOT A THIRD DEFAULT: the shipped answer with NEITHER knob set is still 500 (the
+# supervisor's own default), which `spawn-gate.test.sh` pins against that file's own line — the pin now
+# also drives the INHERITED path, so a change to either default reddens the suite.
+DISK_MIN_FREE_MB="${DISK_MIN_FREE_MB:-${MIN_FREE_MB:-500}}"
 is_limit "${DISK_MIN_FREE_MB:-}" || DISK_MIN_FREE_MB=500
 # A 0 floor would make `[ "$mb" -ge 0 ]` true for every reading — a gate that can never refuse,
 # i.e. the no-op gate this whole file is written against. Same shape as the `_NCPU` zero guard above.
