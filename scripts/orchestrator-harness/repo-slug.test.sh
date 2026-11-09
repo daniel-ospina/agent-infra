@@ -188,6 +188,25 @@ rr -u REPO_CANDIDATES -u OR REPO_CANDIDATES="$REAL" OR="acme/gadget"
 { [ "$rr_rc" -eq 2 ] && [ -z "$rr_out" ] && err_has 'REPO is unset'; }
 ck "A14b a candidate whose origin names ANOTHER repo is refused, not adopted (rc=$rr_rc)" $?
 
+# A14c THE COMPARISON IS FOLDED, LIKE EVERY OTHER SLUG TEST IN THIS FILE (fresh-context review of
+# #3833, F2). GitHub slugs are CASE-INSENSITIVE — this file states it and `repo_identity_fold` exists
+# for it — so a raw `=` between the candidate's origin and a `keys.env` pin differing only in letter
+# case refused a checkout that is CORRECT. The premise is asserted alongside: the two spellings really
+# do differ as strings, so the arm cannot pass on a fixture that happens to match.
+_pin="acme/widget"
+_pin_up="Acme/Widget"
+[ "$_pin_up" != "$_pin" ] && [ "$(printf '%s' "$_pin_up" | tr '[:upper:]' '[:lower:]')" = "$_pin" ]
+ck "A14c premise: the two spellings differ ONLY in case, and both fold to the pinned slug" $?
+git -C "$REAL" remote set-url origin https://github.com/Acme/Widget.git 2>/dev/null || true
+rr -u REPO_CANDIDATES -u OR REPO_CANDIDATES="$REAL" OR="$_pin"
+{ [ "$rr_rc" -eq 0 ] && [ "$rr_out" = "$RREAL" ]; }
+ck "A14c an origin differing only in CASE from the pinned \$OR still names it (rc=$rr_rc)" $?
+# ...and the FOLD must not widen the rule: a different repo at a different case is still not this one.
+rr -u REPO_CANDIDATES -u OR REPO_CANDIDATES="$REAL" OR="acme/gadget"
+{ [ "$rr_rc" -eq 2 ] && [ -z "$rr_out" ]; }
+ck "A14d folding the case does NOT admit a different repo (rc=$rr_rc)" $?
+git -C "$REAL" remote set-url origin https://github.com/acme/widget.git 2>/dev/null || true
+
 # A15 THE #1974 RULE ITSELF (point 3): a DECLARED value is never replaced by a derived one. A bogus
 # `$REPO` plus a perfectly good candidate is still the operator's refusal, by the value they named.
 rr -u REPO_CANDIDATES -u OR REPO="$NOPE" REPO_CANDIDATES="$REAL"
