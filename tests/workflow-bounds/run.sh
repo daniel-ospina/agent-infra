@@ -75,6 +75,13 @@
 # 24.  FIXTURE — a TEMPLATE caller naming the repo's root workflow by absolute slug → accepted, and the
 #      callee is audited from the ROOT root. `<slug>/…` names the repo root; `./…` is relative to the
 #      caller. Conflating them made a template caller report a present workflow as "does not exist".
+# 25.  FIXTURE — the CEILING BOUNDARY, both directions: a step-only job summing to EXACTLY 360 → REFUSED,
+#      and a job bound EQUAL to its single step bound → REFUSED. The rule is "Σ must be BELOW", so `>` in
+#      place of `>=` would certify both green; every other fixture overshoots (400 vs 360, 40 vs 20), so
+#      the boundary itself was unpinned.
+# 26.  FIXTURE — the REMEDY EDGE: Σ = 359 under a 20-min job bound. "Raise the job bound above 359 and
+#      below 360" names no integer that exists, so that branch must not be taken at 359 — the message has
+#      to say the step bounds are what must come down.
 #
 # HERMETIC: fixtures + temp copies only; no network, no gh, no clock. The live tree is READ, never
 # written (the temp copy is where the mutations land).
@@ -266,8 +273,25 @@ open(p,'w').write('\n'.join(out))
 PY
 node "$GUARD" --root "$TMPROOT/partial" >"$OUT" 2>"$ERR"
 rc=$?
+# ⛔ ASSERT THE PLANT LANDED, AND ASSERT ON A PROPERTY THAT DIFFERS WITH IT (review finding, P3). With
+# ZERO plants the guard emits the identical "NOT every step is bounded" phrase and the identical rc 1, so
+# the two assertions below used to pass either way — this arm was a duplicate of arm 12 that could not
+# fail. The plant removes exactly ONE step from the unbounded list, so the finding's own enumeration is
+# the discriminator: 7 unbounded steps without it, 6 with it.
+if grep -qx '        timeout-minutes: 10' "$PART"; then
+  ok "the bounded-step plant actually landed"
+else
+  no "the bounded-step plant did NOT land — this arm could not have failed"
+fi
 [ "$rc" -eq 1 ] && ok "one bounded step of seven → rc 1" || no "one bounded step passed the guard → rc $rc"
 grep -q 'NOT every step is bounded' "$ERR" && ok "the finding says the steps are not all bounded" || no "the finding does not say why"
+unbounded=$(grep -o 'declares no timeout-minutes' "$ERR" | wc -l | tr -d ' ')
+# 6 unbounded STEP entries + 1 for the job's own "declares no timeout-minutes at all" = 7. Without the
+# plant it is 8 (7 steps + the job), and without the exclusion it would be 7 steps + 1 job also — which is
+# why the count below is the pair {arm 14 plant, 6-of-7}, not rc alone.
+[ "$unbounded" -eq 7 ] \
+  && ok "the finding enumerates 6 unbounded steps + the job (not 7 steps) — the bounded step was excluded" \
+  || no "the finding enumerates $unbounded entries — the plant or the per-step exclusion did not take effect"
 
 echo "== 15. FIXTURE: a step-only job whose bounds sum to or above the 360-minute ceiling"
 run_case steps-over-ceiling
@@ -285,7 +309,8 @@ echo "== 17. FIXTURE: a step-only job with an UNEVALUABLE step bound must SAY so
 run_case steps-expression-uncountable
 [ "$rc" -eq 0 ] && ok "steps-expression-uncountable → rc 0 (its numeric bounds are under the ceiling)" \
   || { no "steps-expression-uncountable → rc $rc, expected 0"; sed -n '1,10p' "$ERR"; }
-grep -q 'x.yml::expr-under' "$OUT" && ok "the NOTE names the job whose sum could not be computed" \
+grep -q 'x.yml::expr-under is bounded by its 3 step bounds, but 1 of them are' "$OUT" \
+  && ok "the NOTE names the job whose sum could not be computed" \
   || no "the unevaluable-sum exemption is SILENT (the job was certified with no note at all)"
 grep -q 'Σ could not be evaluated' "$OUT" && ok "the NOTE says Σ could not be evaluated" \
   || no "the note does not say that the sum was uncomputable"
@@ -371,9 +396,34 @@ run_case caller-cross-root
 [ "$rc" -eq 0 ] && ok "caller-cross-root → rc 0 (the callee exists in the repo ROOT)" \
   || { no "caller-cross-root → rc $rc, expected 0"; grep '   •' "$ERR" | head -3; }
 node "$GUARD" --root "$FIX/caller-cross-root" --list >"$OUT" 2>"$ERR"
-grep -q '^callee-root.yml::root-job	' "$OUT" \
-  && ok "the root callee's job is audited (the call was followed)" \
+grep -q '^templates/t.yml::calls-root	(call → ' "$OUT" \
+  && ok "--list sees the TEMPLATE caller as a call job (the second root is read as a caller too)" \
+  || no "--list does not mark the template caller as a call job"
+# ⛔ THIS, not a `--list` row for the callee's job, is the discriminating assertion (review finding, P3):
+# `callee-root.yml` sits in the REQUIRED root, so main's top-level file loop lists its job whether the call
+# was followed or not — a `--list` row for it proves nothing. The callee COUNTER only increments on the
+# follow-through path, and the summary line is printed only when nothing was refused.
+grep -q '1/1 call job(s) are bounded through the workflow they call' "$OUT" \
+  && ok "the call was FOLLOWED into the root callee (1/1 certified through it)" \
   || no "the callee was not followed — an absolute slug was resolved into the caller's own root"
+
+echo "== 25. FIXTURES: the CEILING BOUNDARY in both directions (equality must be REFUSED)"
+run_case steps-at-ceiling
+[ "$rc" -eq 1 ] && ok "steps-at-ceiling (Σ exactly 360) → rc 1" || no "steps-at-ceiling → rc $rc, expected 1"
+grep -q 'SUM to 360 min' "$ERR" && ok "the finding names the sum against the ceiling" || no "the sum is not named"
+run_case job-bound-equal-steps
+[ "$rc" -eq 1 ] && ok "job-bound-equal-steps (Σ exactly = J) → rc 1" || no "job-bound-equal-steps → rc $rc, expected 1"
+grep -q 'SUM to 20 min' "$ERR" && ok "the finding names the sum against the job bound" || no "the sum is not named"
+
+echo "== 26. FIXTURE: the remedy at Σ = 359 must be one that EXISTS"
+run_case job-bound-remedy-edge
+[ "$rc" -eq 1 ] && ok "job-bound-remedy-edge (Σ 359) → rc 1" || no "job-bound-remedy-edge → rc $rc, expected 1"
+grep -q 'No job bound can sit above 359' "$ERR" \
+  && ok "the remedy says the step bounds must come down" \
+  || no "the remedy does not offer an edit that exists at Σ = 359"
+grep -q 'above 359 and below 360' "$ERR" \
+  && no "the remedy prescribes a job bound in (359,360), where no integer exists" \
+  || ok "the remedy does NOT prescribe an impossible job bound"
 
 echo
 if [ "$fail" -eq 0 ]; then

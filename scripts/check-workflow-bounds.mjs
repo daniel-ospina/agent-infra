@@ -29,8 +29,13 @@
  *       A STEP bound is the STRONGER of the two: its trip is `failure`, which the rail reds. A JOB
  *       bound's trip is `cancelled`, which the rail reads NON-RED — it ends the hold and names the
  *       job, but it does not turn a hang into a red. `ci.yml`'s `verify` is the job that only has
- *       the step shape (66 steps; a 66-step job cannot satisfy the lane guard's “job > Σ steps”
- *       under the platform's 360-minute ceiling, and a bound it cannot satisfy is not a bound).
+ *       the step shape (66 steps, Σ 326). ⛔ ITS ORIGINAL JUSTIFICATION NO LONGER HOLDS and is corrected
+ *       here rather than left standing (review finding, P2): the first draft argued a 66-step job could
+ *       not satisfy the lane guard's “job > Σ steps” under the 360-minute ceiling — true at Σ 381, FALSE
+ *       at Σ 326, where a job bound in 327..359 would satisfy it. The shape is kept deliberately because
+ *       it is the one that keeps the ONLY trip RED: with `J > Σ` a job bound could never fire anyway, so
+ *       it would buy no protection and would relabel the job from "step-bounded" to "job-bounded",
+ *       which is exactly the weaker shape this guard exists to discourage.
  *       A reusable-workflow CALL job (`jobs.<id>.uses`) is the third case — see (d);
  *       ⛔ AND A BOUND'S STEP BUDGET MUST BE REACHABLE (added at review, P2, measured). A job with
  *       no `timeout-minutes` still has one: GitHub's implicit 360-minute ceiling — and its trip is
@@ -88,14 +93,17 @@
  * (`scripts/check-workflow-actionlint.sh` is the in-repo precedent: it lints both roots too.)
  *
  * ── WHY "job bound > sum of step bounds" IS NOT ASSERTED UNIVERSALLY ────────────────────────────
- * Measured on this tree: `ci.yml`'s `verify` job has 66 steps and `ci-main.yml`'s shard slices have
- * three. The `check-ci-lane-parity.mjs` invariant (`job > Σ steps`) is satisfiable for three steps and
- * not in general: a 66-step job under the platform's 360-minute ceiling would need steps averaging
- * <5.5 min, which would false-block a slow-but-healthy step. So the rule asserted here is scoped to
- * the shape where it cannot false-block and cannot be vacuous: it fires only when EVERY step carries a
- * bound (numeric or expression — a numeric subtotal that already breaches the ceiling is refused
- * regardless), and its remedy is always stated as one that exists. A job whose steps are not ALL bounded
- * is covered by the JOB-level NOTE instead, which names any step bound lying beyond the job bound.
+ * ⛔ THE ARITHMETIC ARGUMENT IS GONE; THE SCOPING IS WHAT REMAINS (review finding, P2). This section
+ * used to argue that a 66-step job under the 360-minute ceiling would need steps averaging <5.5 min,
+ * which would false-block a slow-but-healthy step. That was true of `verify`'s FIRST draft (Σ 381, above
+ * the ceiling); it is FALSE of the tree this ships — `verify`'s Σ is 326, averaging 4.94 min, so a job
+ * bound in 327..359 would satisfy `job > Σ steps` today. The rule stays scoped for the reason that still
+ * holds: the invariant is not satisfiable IN GENERAL (a genuinely slow suite can push Σ past 359, where no
+ * job bound can sit above it), and a bound that cannot be satisfied is not a bound. So the rule asserted
+ * here fires only when the shape makes Σ knowable and the remedy real — EVERY step carries a bound (numeric
+ * or expression; a numeric subtotal that already breaches the ceiling is refused regardless) — and its
+ * remedy is always stated as one that exists. A job whose steps are not ALL bounded is covered by the
+ * JOB-level NOTE instead, which names any step bound lying beyond the job bound.
  *
  * ── FAIL-CLOSED ─────────────────────────────────────────────────────────────────────────────────
  * Exit 2 (refusal) — not 0 — when the guard cannot answer: no workflow files, a file whose `jobs` is
@@ -386,8 +394,10 @@ function main() {
                 ` SUM to ${knownSum} min — at or above ${verdict.inert ? `the platform's ${PLATFORM_CEILING_MIN}-minute ceiling (which pre-empts its inert ${verdict.value})` : "its own job bound"}, ` +
                 `so the last step bounds could never fire and the job-level \`cancelled\` (NON-RED to the rail) ` +
                 `pre-empts the red step that actually hung. ` +
-                // The remedy must be one that EXISTS: for knownSum >= 360 no job bound can sit above it.
-                (knownSum < PLATFORM_CEILING_MIN
+                // The remedy must be one that EXISTS. `knownSum < 359` is the exact test, not `< 360`:
+                // at knownSum === 359 no INTEGER job bound lies strictly between it and the 360 ceiling
+                // (review finding, P3 — the 359 edge fell between the two branches).
+                (knownSum < PLATFORM_CEILING_MIN - 1
                   ? `Raise the job bound above ${knownSum} and below ${PLATFORM_CEILING_MIN}, or lower the tail step bounds.`
                   : `No job bound can sit above ${knownSum} inside the platform's ${PLATFORM_CEILING_MIN}-minute ceiling, so the step bounds are what must come down.`)
             );
