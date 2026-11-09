@@ -356,6 +356,47 @@ if need "$LOOP" "the shipped orch-loop.sh"; then
     || ck "§6 the [cap] line does NOT carry state_src=" 1
 fi
 
+# ─────────────────────────────────────────────────────────────────────────────────────────────────
+say "§7 the state dir and the HARNESS ROOT are two homes, and the module seam knows it"
+# ⛔ WHICH MODULES A STATE-DIR INSTANCE CAN STILL LOAD (fresh-context review of #3846, P1). `orch-loop.sh`
+# makes `$O` the state dir and exports it, so every module resolved `$O`-first needs a second home or the
+# documented `ORC_STATE_DIR` arrangement silently loses it — for `claims.sh` that meant the snapshot never
+# loaded, the sweep abstained, every PR read `claim-unreadable`, NOTHING was spawned, and `[cap]` kept
+# printing a healthy line. This drives the SHIPPED resolution block with two real fixture dirs rather
+# than grepping for it: state dir WITHOUT the module, loop dir WITH it.
+if need "$LOOP" "the shipped orch-loop.sh"; then
+  sed -n '/_claims_home=""/,/^  fi$/p' "$LOOP" > "$T/claimsres.sh"
+  if [ ! -s "$T/claimsres.sh" ]; then
+    ck "§7 the claims two-home resolution is extractable from the shipped loop" 1
+  else
+    SD="$T/sd"; LD="$T/ld"; mkdir -p "$SD" "$LD"; : > "$LD/claims.sh"
+    out7="$(O="$SD" _HERE_RS="$LD" bash -c 'set -u; . "$1"; printf "%s" "${_claims_home:-none}"' _ "$T/claimsres.sh" 2>&1)"
+    [ "$out7" = "$LD" ] \
+      && ck "§7 with no claims.sh in the STATE dir, the loop resolves it from the harness root" 0 \
+      || ck "§7 the claims registry was NOT resolved beside the loop — got '$out7' (this is the claim-unreadable-everything shape)" 1
+    : > "$SD/claims.sh"
+    out8="$(O="$SD" _HERE_RS="$LD" bash -c 'set -u; . "$1"; printf "%s" "${_claims_home:-none}"' _ "$T/claimsres.sh" 2>&1)"
+    [ "$out8" = "$SD" ] \
+      && ck "§7 a seeded STATE dir still WINS (production is not redirected by the fallback)" 0 \
+      || ck "§7 a seeded state dir stopped winning — got '$out8'" 1
+    rm -f "$SD/claims.sh"
+    out9="$(O="$SD" _HERE_RS="" bash -c 'set -u; . "$1"; printf "%s" "${_claims_home:-none}"' _ "$T/claimsres.sh" 2>&1)"
+    [ "$out9" = "none" ] \
+      && ck "§7 neither home ⇒ no registry claimed (an absent one is not a found one)" 0 \
+      || ck "§7 a missing registry was reported as found — got '$out9'" 1
+  fi
+  # ⛔ AND THE RESOLVED HARNESS ROOT IS EXPORTED, or the workers lose their own modules: they resolve
+  # `claims.sh` / `repo-authority.sh` from `$O`, which is now the STATE dir.
+  grep -q '^export O_WORK$' "$LOOP" \
+    && ck "§7 the harness root is EXPORTED as O_WORK (workers resolve their modules from it)" 0 \
+    || ck "§7 O_WORK is not exported — a worker on a state-dir instance loses claims and the merge contract" 1
+  for _w in fix-one.sh merge-one.sh; do
+    grep -q '_FIX_MOD_DIR\|_M1_MOD' "$HERE/$_w" 2>/dev/null \
+      && ck "§7 $_w prefers \$O_WORK for its own modules" 0 \
+      || ck "§7 $_w resolves its modules from \$O alone — it loses them on a state-dir instance" 1
+  done
+fi
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1
 exit 0

@@ -769,9 +769,12 @@ if ! is_limit "${REVIEW_TIMEOUT:-1800}"; then
   REVIEW_TIMEOUT=1800
 fi
 
-if [ -f "$O/claims.sh" ]; then
+# ⛔ `$O_WORK` FIRST (fresh-context review of #3846, P1) — same rule as `repo-authority.sh` three lines
+# up: the controller exports `O` = its STATE dir and `O_WORK` = the harness root.
+_M1_MOD="${O_WORK:-$O}"
+if [ -f "$_M1_MOD/claims.sh" ]; then
   # shellcheck source=/dev/null
-  . "$O/claims.sh"
+  . "$_M1_MOD/claims.sh"
   # The lease must OUTLIVE a worst-case review, or another box takes over mid-review and we get
   # the duplicate work this exists to prevent: REVIEW_TIMEOUT (default 1800) + the gate wait
   # below (GATE_POLL_TRIES x GATE_POLL_SECS = 30 x 30s = 900 by default) + the merge itself. Derived, not a bare constant — and passed explicitly,
