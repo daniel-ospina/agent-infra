@@ -1,0 +1,21 @@
+{
+  "artifacts": [],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 605,
+  "exit_code": null,
+  "heartbeat_at": 1794238509,
+  "host": "cmux",
+  "issue": 104,
+  "kind": "lane",
+  "lane_id": "cmux.klane-104-1794238509-p3726217-6b89b6ce",
+  "lease_until": 1794239114,
+  "pid": 3726217,
+  "reason": null,
+  "repo": "daniel-ospina/agent-infra",
+  "schema": 1,
+  "started_at": 1794238509,
+  "state": "RUNNING",
+  "tag": "104",
+  "worktree": "/tmp/tmp.MTUvuj04wM/lbwt"
+}
