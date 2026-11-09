@@ -32,7 +32,7 @@ _DM_WORK="${O_WORK:-$O}"
 # The marker is attached conditionally, exactly like `disp()` in orch-loop.sh, so the two disclosure
 # paths cannot disagree about what an empty token means.
 HARNESS_TOKEN="${HARNESS_TOKEN-unknown}"
-chmod +x "$_DM_WORK/lane.sh" "$_DM_WORK/merge-one.sh" "$_DM_WORK/chain-merge.sh" 2>/dev/null
+chmod +x "${_DM_WORK:-$O}/lane.sh" "${_DM_WORK:-$O}/merge-one.sh" "${_DM_WORK:-$O}/chain-merge.sh" 2>/dev/null
 
 # ── release the cross-box ISSUE claim on the NO-CHAIN path (agent-infra#1850) ────────────────
 # `orch-loop.sh` takes `refs/claims/issue-<N>` when it dispatches, and `chain-merge.sh` releases it
@@ -44,7 +44,9 @@ chmod +x "$_DM_WORK/lane.sh" "$_DM_WORK/merge-one.sh" "$_DM_WORK/chain-merge.sh"
 # The record/fence convention is claims.sh's `claim_issue_release_record` (one implementation; see
 # its comment for why the handover file exists rather than the acquiring process doing the release).
 release_issue_claim_unspawned() { # <issue>
-  local n="$1" csh="$_DM_WORK/claims.sh" out rc=0
+  # ⛔ `${_DM_WORK:-$O}`: this function is EXTRACTED and driven on its own, so the file-level
+  # declaration is unbound there and the no-chain release would silently do nothing.
+  local n="$1" csh="${_DM_WORK:-$O}/claims.sh" out rc=0
   [ -f "$csh" ] || return 0
   # ⛔ NOT `( … ) >/dev/null 2>&1`: reporting success only left a refused fence, a network failure or
   # a stale registry indistinguishable from a release that worked (2026-10-16 review) — the claim
@@ -304,7 +306,7 @@ git fetch origin main --quiet 2>/dev/null
 # until the row was reaped. The release and the row drop are what make "the issues stay in the pool,
 # re-decided on the next invocation" true. ⛔ SYMBOLS, NOT LINE NUMBERS (#2333 review, P2): this note
 # used to cite a line number in that block, and it drifted on the very next edit to orch-loop.sh.
-CIQ_MOD="$_DM_WORK/ci-queue.sh"
+CIQ_MOD="${_DM_WORK:-$O}/ci-queue.sh"
 [ -f "$CIQ_MOD" ] || CIQ_MOD="$(dirname "${BASH_SOURCE[0]:-$0}")/ci-queue.sh"
 if [ -f "$CIQ_MOD" ]; then
   # shellcheck source=/dev/null
@@ -478,7 +480,7 @@ for N in "$@"; do
   # An EMPTY token (the box is current) appends nothing at all — `${T:+ …}`, never `${T:-…}`.
   _lan="$(wt_launcher)"
   _hd="${HARNESS_TOKEN:+ [harness=$HARNESS_TOKEN]}"
-  if wt_spawn "lane-$N" "$WT_ABS" "bash '$_DM_WORK/lane.sh' --repo-dir '$REPO_ABS' --repo '$OR' $N '$BR'"; then
+  if wt_spawn "lane-$N" "$WT_ABS" "bash '${_DM_WORK:-$O}/lane.sh' --repo-dir '$REPO_ABS' --repo '$OR' $N '$BR'"; then
     SPAWNED_IDS="$SPAWNED_IDS $N"
     echo "#$N: lane-$N (implement+PR, launcher=$_lan)$_hd"
   else
@@ -515,7 +517,7 @@ for N in "$@"; do
   # the record can only be OVERWRITTEN by a re-acquire, and a re-acquire needs the current claim to be
   # RELEASED or to reach its CLAIM_ISSUE_TTL (4h) first — not because the gap is small. Do not shorten
   # the TTL without revisiting this line.
-  chain_gen="$( . "$_DM_WORK/claims.sh" 2>/dev/null; claim_issue_record_commit "$O" "$N" 2>/dev/null )" || true
+  chain_gen="$( . "${_DM_WORK:-$O}/claims.sh" 2>/dev/null; claim_issue_record_commit "$O" "$N" 2>/dev/null )" || true
   # ⛔ `${REPO_ABS:-$REPO}`, NOT `$REPO_ABS` (#2762 review, 4th cycle, P1): refresh-scout.test.sh
   # EXTRACTS this branch and drives it under `set -u` without REPO_ABS, and the bare expansion aborted
   # the fragment — reding a registered shard and losing the only witness to the "stop the lane BEFORE

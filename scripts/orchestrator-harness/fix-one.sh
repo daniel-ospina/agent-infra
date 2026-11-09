@@ -49,8 +49,8 @@ export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH
 # helper) wins where it exists. Guarded by `-d`, so a box that ships neither is unchanged.
 # ⛔ THE WORK ROOT, NOT `$O` (#3846): on a state-dir instance `$O/gh-limit` is a directory that can
 # never exist, so the shims would be dropped SILENTLY — the INERT layer this block exists to prevent.
-if [ -d "$_FIX_MOD_DIR/gh-limit" ]; then PATH="$_FIX_MOD_DIR/gh-limit:$PATH"; fi
-if [ -d "$_FIX_MOD_DIR/gh-rest" ]; then PATH="$_FIX_MOD_DIR/gh-rest:$PATH"; fi
+if [ -d "${_FIX_MOD_DIR:-$O}/gh-limit" ]; then PATH="${_FIX_MOD_DIR:-$O}/gh-limit:$PATH"; fi
+if [ -d "${_FIX_MOD_DIR:-$O}/gh-rest" ]; then PATH="${_FIX_MOD_DIR:-$O}/gh-rest:$PATH"; fi
 # The wall-clock limit AND the load gate both live in the shared helper, so this script has no
 # `pi` invocation of its own to forget to gate (agent-infra#1720). NB: L above is a LOG PATH, not a
 # load reading — the gate takes its reading as an argument for exactly that reason.
@@ -670,9 +670,9 @@ trap 'exit 143' TERM
 trap 'exit 130' INT
 # ⛔ `_FIX_MOD_DIR` (the work root) is resolved at the TOP of this file, before the gh shims — see
 # there. `$O` would be the STATE dir on an `ORC_STATE_DIR` instance, where claims.sh does not exist.
-if [ -n "${HEAD:-}" ] && [ -f "$_FIX_MOD_DIR/claims.sh" ]; then
+if [ -n "${HEAD:-}" ] && [ -f "${_FIX_MOD_DIR:-$O}/claims.sh" ]; then
   # shellcheck source=/dev/null
-  . "$_FIX_MOD_DIR/claims.sh"
+  . "${_FIX_MOD_DIR:-$O}/claims.sh"
   # The fallback used when a malformed FIX_TIMEOUT is refused: the SAME value the run would take.
   _FIX_BOUND_FALLBACK="${LANE_BACKSTOP_S:-7200}"
   is_limit "$_FIX_BOUND_FALLBACK" || _FIX_BOUND_FALLBACK=7200
@@ -957,7 +957,7 @@ fi
 # cross-box claim above is released here: after a push the downstream worker claims the NEW head,
 # and without a push the SAME head is still ours, so leaving it held would refuse our own re-review.
 release_prlock
-bash "$_FIX_MOD_DIR/merge-one.sh" "$REPO" "$OR" "$PR" "$BR" >> "$L.log" 2>&1
+bash "${_FIX_MOD_DIR:-$O}/merge-one.sh" "$REPO" "$OR" "$PR" "$BR" >> "$L.log" 2>&1
 echo "[fix $PR] end $(date)" >> "$L.log"
 # ── and the fixer's `.venv` goes with it (agent-infra#1932) ─────────────────────────────────────────
 # LAST, deliberately: the re-review above is dispatched from this same worktree, so reaping before it

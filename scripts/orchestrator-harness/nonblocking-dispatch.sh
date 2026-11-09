@@ -112,12 +112,12 @@ export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH
 # `O_WORK` = the harness root, and the gh shim DIRECTORIES live in the harness root. Reading `$O/gh-limit`
 # on a state-dir instance silently drops the serialiser/REST adapter — an INERT layer.
 _NB_WORK="${O_WORK:-$O}"
-if [ -d "$_NB_WORK/gh-limit" ]; then PATH="$_NB_WORK/gh-limit:$PATH"; fi
-if [ -d "$_NB_WORK/gh-rest" ]; then PATH="$_NB_WORK/gh-rest:$PATH"; fi
+if [ -d "${_NB_WORK:-$O}/gh-limit" ]; then PATH="${_NB_WORK:-$O}/gh-limit:$PATH"; fi
+if [ -d "${_NB_WORK:-$O}/gh-rest" ]; then PATH="${_NB_WORK:-$O}/gh-rest:$PATH"; fi
 # The RESOLUTION, though, mirrors merge-one.sh's repo-authority.sh — NOT lane.sh/fix-one.sh, which
 # source only `$SELF/spawn-gate.sh` and never consult `$O`. Prefer the daemon's copy at `$O`, fall
 # back to the copy beside THIS script; an unresolved helper must never degrade into "the worker ran".
-if [ -f "$_NB_WORK/spawn-gate.sh" ]; then . "$_NB_WORK/spawn-gate.sh"; HARNESS="$_NB_WORK"
+if [ -f "${_NB_WORK:-$O}/spawn-gate.sh" ]; then . "${_NB_WORK:-$O}/spawn-gate.sh"; HARNESS="${_NB_WORK:-$O}"
 else
   HARNESS="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
   . "$HARNESS/spawn-gate.sh" 2>/dev/null \

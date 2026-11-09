@@ -1339,7 +1339,10 @@ gh_env_verdict() {
 # exact "disable it by ambient env" shape orch-loop.sh's dispatch gate forbids. It is now a path:
 # `$O/claims.sh`, everywhere, and the regression suite drives a sandbox `O` instead.
 issue_claim_verdict() { # <issue> -> 0 CLEAN / 1 COLLISION / 2 INCOMPLETE / 3 NOT PROVISIONABLE
-  local csh="$_RC_WORK/claims.sh"
+  # ⛔ `${_RC_WORK:-$O}`: `issue_claim_verdict` is EXTRACTED and driven on its own, so the
+  # file-level declaration is unbound there — the verdict would read "registry NOT INSTALLED"
+  # for a registry that is present, i.e. the INCOMPLETE refusal applied to a healthy box.
+  local csh="${_RC_WORK:-$O}/claims.sh"
   if [ ! -f "$csh" ]; then
     CLAIM_RESULT="the claim registry ($csh) is NOT INSTALLED — INCOMPLETE, never CLEAN"
     return 2
@@ -1558,24 +1561,24 @@ cmd_check() {
   # is the whole point of a provisioning verdict: it needs no network, no `gh`, and no scout, and it
   # refuses to certify a cell that could only merge. A byte-identical check to the one the refresh
   # applies (`declare -f claim_issue_preflight`), so a check can never disagree with the run.
-  if [ -f "$_RC_WORK/claims.sh" ]; then
+  if [ -f "${_RC_WORK:-$O}/claims.sh" ]; then
     # ONE probe for both failure kinds — unloadable, or loaded but carrying no `claim_issue_preflight`
     # — because they share the one operator fix and the one consequence (the pre-flight refuses every
     # issue, so the cell can only merge). Behaviourally byte-identical to the refresh's own check.
-    if ! ( CLAIM_REPO="$SC"; . "$_RC_WORK/claims.sh"; declare -f claim_issue_preflight >/dev/null 2>&1 ) 2>/dev/null; then
-      echo "[refresh] check: FAIL $_RC_WORK/claims.sh cannot answer the issue-claim question (unloadable, or predating the issue-claim reader)"
+    if ! ( CLAIM_REPO="$SC"; . "${_RC_WORK:-$O}/claims.sh"; declare -f claim_issue_preflight >/dev/null 2>&1 ) 2>/dev/null; then
+      echo "[refresh] check: FAIL ${_RC_WORK:-$O}/claims.sh cannot answer the issue-claim question (unloadable, or predating the issue-claim reader)"
       echo "[refresh] NOT PROVISIONABLE: the pre-flight would refuse every issue as INCOMPLETE, so a cell on this repo would MERGE ONLY"
       echo "[refresh]   fix: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o ~/orchestrator  (then re-run this check)"
       return "$EXIT_NOT_PROVISIONABLE"
     fi
-    echo "[refresh] check: claim registry=$_RC_WORK/claims.sh (issue-claim reader present)"
+    echo "[refresh] check: claim registry=${_RC_WORK:-$O}/claims.sh (issue-claim reader present)"
   else
     # ⛔ A MISSING REGISTRY IS NOT A PASS (agent-infra#2466). This arm used to certify the cell and say
     # the refresh would "WARN per issue and dispatch without a cross-box claim" — a check blessing the
     # exact state the run now refuses, i.e. a false PASS. The run path (`issue_claim_verdict`) answers
     # INCOMPLETE for a missing file, and `--check` must refuse what the run refuses, so both name the
     # same one-line remedy.
-    echo "[refresh] check: FAIL $_RC_WORK/claims.sh is absent — the cross-box claim registry is NOT INSTALLED"
+    echo "[refresh] check: FAIL ${_RC_WORK:-$O}/claims.sh is absent — the cross-box claim registry is NOT INSTALLED"
     echo "[refresh] NOT PROVISIONABLE: the pre-flight would refuse every issue as INCOMPLETE (claim-unreadable), so a cell on this repo would dispatch NOTHING"
     echo "[refresh]   fix: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o ~/orchestrator  (then re-run this check)"
     return "$EXIT_NOT_PROVISIONABLE"
@@ -3776,7 +3779,7 @@ _ck_tmp="$O/.checked-decided.$$"
     # the one fact this pass cannot answer locally, so a pass that could not consult the registry
     # must not be byte-identical on the line to one that did. `none` means "nothing was refused";
     # this uses its own value. It records a REFUSAL now, which is what the slug always described.
-    [ -f "$_RC_WORK/claims.sh" ] || CHECKED_REFUSED="claim-registry-absent"
+    [ -f "${_RC_WORK:-$O}/claims.sh" ] || CHECKED_REFUSED="claim-registry-absent"
     _ck_sorted="$(mktemp "${TMPDIR:-/tmp}/ck-sorted.XXXXXX")" || _ck_sorted=""
     # ⛔ A FAILED SORT IS NOT A BINDING CAP (review cycle 3). Both failures landed every candidate in
     # `deferred`, which the reader renders as "CHECKED_RELEASE_MAX is too small for this cell" — the

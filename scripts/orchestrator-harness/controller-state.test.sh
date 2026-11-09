@@ -423,18 +423,21 @@ if need "$LOOP" "the shipped orch-loop.sh"; then
       ck "§7 $_f names NEITHER the old nor the work-root resolution — expected '$_good'" 1
     fi
   done <<'PAIRS'
-fix-one.sh|bash "$O/merge-one.sh"|bash "$_FIX_MOD_DIR/merge-one.sh"
-chain-merge.sh|bash "$O/merge-one.sh"|bash "$_CM_WORK/merge-one.sh"
-dispatch-merge.sh|bash '$O/lane.sh'|bash '$_DM_WORK/lane.sh'
-stall-fix.sh|DISP="$O/nonblocking-dispatch.sh"|DISP="$_SF_WORK/nonblocking-dispatch.sh"
+fix-one.sh|bash "$O/merge-one.sh"|bash "${_FIX_MOD_DIR:-$O}/merge-one.sh"
+chain-merge.sh|bash "$O/merge-one.sh"|bash "${_CM_WORK:-$O}/merge-one.sh"
+dispatch-merge.sh|bash '$O/lane.sh'|bash '${_DM_WORK:-$O}/lane.sh'
+stall-fix.sh|DISP="$O/nonblocking-dispatch.sh"|DISP="${_SF_WORK:-$O}/nonblocking-dispatch.sh"
 merge-one.sh|if [ -n "${HEAD:-}" ] && [ -f "$O/claims.sh" ]; then|if [ -n "${HEAD:-}" ] && [ -f "$_M1_MOD/claims.sh" ]; then
 PAIRS
-  # ⛔ AND THE DISPATCH ARM MUST READ THE SAME HOME THE SWEEP LOADED. It tested `$O/claims.sh` while the
-  # sweep sourced `$_claims_home`, so on a state-dir instance the registry was LOADED and the guard
-  # said absent — no issue claim was taken, and the refusal named a remedy that cannot help.
-  grep -q '\[ -n "${_claims_home:-}" \] && declare -f claim_issue_acquire' "$LOOP" \
-    && ck "§7 the DISPATCH arm takes its issue claim from the same two-home resolution as the sweep" 0 \
-    || ck "§7 the dispatch arm still tests \$O/claims.sh — the registry is loaded and the guard calls it absent" 1
+  # ⛔ AND THE DISPATCH ARM MUST RESOLVE THE REGISTRY ITSELF, IN TWO HOMES. It tested `$O/claims.sh`
+  # while the sweep sourced `$_claims_home`, so on a state-dir instance the registry was LOADED and the
+  # guard said absent. It may also not simply READ `$_claims_home`: that is assigned 3000 lines above and
+  # the arm is EXTRACTED and DRIVEN on its own (`refresh-scout.test.sh`), where the name is unbound —
+  # measured as `claim-unreadable … nothing was batched` on every dispatch leg of that suite.
+  grep -qF '_dch="${_claims_home-}"' "$LOOP" \
+    && grep -qF 'elif [ -n "${_HERE_RS:-}" ] && [ -f "$_HERE_RS/claims.sh" ]; then _dch="$_HERE_RS"' "$LOOP" \
+    && ck "§7 the DISPATCH arm resolves the claim registry itself, in the same two homes as the sweep" 0 \
+    || ck "§7 the dispatch arm cannot resolve the registry on its own — a state-dir instance takes no issue claim, and an extracted driver reads it as absent" 1
   # ⛔ AND THE SPAWN GATE'S FORK FLOOR IS NOT SILENTLY OFF. Its resolver searched `$O` (now the STATE
   # dir) and "beside me" (no harness for the installed `pi` shim), so the work root has its own name.
   grep -q '"${O_WORK:-}"' "$HERE/spawn-gate.sh" \

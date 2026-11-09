@@ -184,7 +184,10 @@ CHAIN_CLAIM_COMMIT="${CHAIN_CLAIM_COMMIT:-}"
 # `claim_issue_release_record` (claims.sh), which is the ONE implementation of that handover — this
 # function only owns the TRAP and the log line.
 release_issue_claim() {
-  local csh="$_CM_WORK/claims.sh" out rc=0
+  # ⛔ `${_CM_WORK:-$O}`, NOT `$_CM_WORK`: this FUNCTION is extracted and driven on its own
+  # (`refresh-scout.test.sh`), so a variable declared at the top of the file is UNBOUND here and the
+  # release resolves `/claims.sh` — the claim then runs to its full lease and nothing says why.
+  local csh="${_CM_WORK:-$O}/claims.sh" out rc=0
   trap - EXIT INT TERM
   [ -f "$csh" ] || return 0
   # CLAIM_REPO is the repo the claim was pushed to (refs/claims live in the TARGET repo's origin),
@@ -510,7 +513,7 @@ else
   echo "[chain $N] no merge-phase marker after ${PHASE_GRACE}s (a pre-merge-phase lane, or it failed before the PR) — reviewing now, as before" >> "$LOG"
 fi
 
-bash "$_CM_WORK/merge-one.sh" "$REPO" "$OR" "$PR" "$BR" >> "$LOG" 2>&1
+bash "${_CM_WORK:-$O}/merge-one.sh" "$REPO" "$OR" "$PR" "$BR" >> "$LOG" 2>&1
 rc=$?
 # A capacity refusal is not a failure of the work: nothing ran and nothing was consumed. Name it
 # HERE, in the log the operator reads for this chain — the reviewer's own line is inside

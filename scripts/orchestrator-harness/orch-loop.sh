@@ -9122,11 +9122,20 @@ PY
       # INCOMPLETE is a fail-open that can duplicate a peer's work — so it stops the dispatch, names
       # the fix, and `refresh-candidates.sh --check` refuses the cell up front. Pre-flight and
       # dispatch now take the SAME polarity on the same condition.
-      # ⛔ THE REGISTRY IS `_claims_home`, THE TWO-HOME RESOLUTION ABOVE (fresh-context review of #3846,
-      # P1). This arm tested `$O/claims.sh` while the sweep block loaded it from `$_claims_home`, so on a
-      # state-dir instance the registry was LOADED and this guard still said it was absent: the dispatch
-      # took no issue claim and fell to the "no registry" refusal with a remedy that cannot help.
-      if [ -n "${_claims_home:-}" ] && declare -f claim_issue_acquire >/dev/null 2>&1; then
+      # ⛔ THE REGISTRY IS RESOLVED SELF-SUFFICIENTLY, NOT READ FROM `_claims_home` (fresh-context review
+      # of #3846, P1). Two reasons. It used to test `$O/claims.sh` while the sweep block sourced the
+      # registry from `$_claims_home`, so on a state-dir instance the registry was LOADED and this guard
+      # said absent — no issue claim taken, and a remedy that cannot help. But `_claims_home` is assigned
+      # 3000 lines ABOVE, and this arm is EXTRACTED and DRIVEN on its own (`refresh-scout.test.sh`), where
+      # that name is UNBOUND — which read as "no registry" and stopped every dispatch. So the two-home
+      # rule is spelled here: the sweep's answer when it has one, otherwise resolved inline.
+      _dch="${_claims_home-}"
+      if [ -z "$_dch" ]; then
+        if [ -f "$O/claims.sh" ]; then _dch="$O"
+        elif [ -n "${_HERE_RS:-}" ] && [ -f "$_HERE_RS/claims.sh" ]; then _dch="$_HERE_RS"
+        fi
+      fi
+      if [ -n "${_dch:-}" ] && declare -f claim_issue_acquire >/dev/null 2>&1; then
         if claim_issue_acquire "" "$ISS"; then
           # The commit this box pushed, for the FENCED release. Written only on a successful acquire,
           # so a refusal can never leave a release path pointing at someone else's claim.
@@ -9161,10 +9170,10 @@ PY
           fi
           continue
         fi
-      elif [ -n "${_claims_home:-}" ]; then
+      elif [ -n "${_dch:-}" ]; then
         # PRESENT BUT STALE — see the polarity note above. The box would have to dispatch unclaimed,
         # which is the fail-open this branch now refuses.
-        echo "[dispatch] #$ISS NOT dispatched — \${_claims_home:-?}/claims.sh predates the issue key (no claim_issue_acquire), so this box cannot take the claim; fix: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o ~/orchestrator" >> "$LOG"
+        echo "[dispatch] #$ISS NOT dispatched — \${_dch:-?}/claims.sh predates the issue key (no claim_issue_acquire), so this box cannot take the claim; fix: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o ~/orchestrator" >> "$LOG"
         continue
       else
         # ⛔ NO REGISTRY IS NOT FREEDOM, NOT EVEN FOR DISPATCH (agent-infra#2466). This arm used to

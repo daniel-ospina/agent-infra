@@ -173,7 +173,7 @@ if [ "$(( SEEN % EVERY ))" -ne 0 ]; then
   exit 0
 fi
 
-DISP="$_SF_WORK/nonblocking-dispatch.sh"
+DISP="${_SF_WORK:-$O}/nonblocking-dispatch.sh"
 if [ ! -x "$DISP" ]; then
   log_line "DRAIN STALL -> STALL FIX COULD NOT DISPATCH (no executable $DISP) — the stall line is the only trace"
   exit 0
