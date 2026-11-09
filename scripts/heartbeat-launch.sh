@@ -81,8 +81,46 @@ usage() {
     exit 2
 }
 
-say() { printf '%s\n' "$*"; }
+# ⛔ THE PRINT HELPER IS `note`, NEVER `say` (#2910, learned the hard way). macOS ships
+# `/usr/bin/say` — the TEXT-TO-SPEECH binary — so a helper of that name whose definition is ever
+# missed (a sliced fragment, a dropped function, a reader who copies three lines) does not fail: the
+# shell finds the binary and READS THE MESSAGE ALOUD. It cost the owner a live customer call before
+# `tests/no-tts/run.sh` made it a required check, and it reds this file for as long as the name is
+# wrong. A name with no binary behind it fails loudly instead: `note: command not found`.
+note() { printf '%s\n' "$*"; }
 die() { printf '%s\n' "$*" >&2; exit 1; }
+
+# ── PROCESS IDENTITY: A PID IS NOT THE LOOP (#1867 review P2) ─────────────────────────────────
+# `kill -0` answers only "is SOME process holding this number". The kernel REUSES pids, so after a
+# SIGKILL, an OOM kill or a reboot the pidfile keeps a number that now belongs to an unrelated
+# process of the same user — and that reads as a healthy heartbeat:
+#   * `start` printed "already running", exited 0 and launched NOTHING. This loop is launched-once
+#     with no timer (`docs/ops/heartbeat-launch-path.md`: "Reboot does not restart the loop"), so
+#     nothing else starts it: the heartbeat stays dead and the operator is told it is running.
+#   * `check` printed "OK loop alive (pid N)" over a dead heartbeat — the false PASS this file
+#     exists to remove, one layer down.
+# `docs/ops/fleet-liveness.md` already records the rule for THIS pidfile ("the pid its OWN pidfile
+# names, cross-checked against a process whose argv is that script (a recycled pid is FAILING, not
+# alive)") and `scripts/fleet-inventory.test.sh` §9l enforces it via `fleet_pids_for`; without this,
+# two instruments on one box disagreed about one loop and the newer one was the weaker. The rule is
+# restated here instead of sourced because this file is farmed standalone (`pi-bootstrap` copies it
+# on its own) and must not depend on a library sitting beside it in a checkout.
+#
+# Matching is by BASENAME for the same reason `fleet_pid_argv_names` is deliberately weak: a loop
+# started from a checkout before the farm landed, or from another path, is still THIS loop, and
+# refusing to recognise it would relaunch a duplicate. A stranger with a different argv is not.
+LOOP_NAME="$(basename "$LOOP")"
+pid_is_loop() { # <pid> → 0 the loop · 1 no such process · 2 a DIFFERENT process holds the pid · 3 cannot tell
+    local p="${1:-}" argv tok
+    [ -n "$p" ] || return 1
+    kill -0 "$p" 2>/dev/null || return 1
+    argv="$(ps -p "$p" -o command= 2>/dev/null)" || return 3
+    [ -n "$argv" ] || return 3        # a live pid with no readable argv is NOT evidence of the loop
+    for tok in $argv; do
+        case "${tok##*/}" in "$LOOP_NAME") return 0 ;; esac
+    done
+    return 2
+}
 
 # ── THE LAUNCHD WITNESS ─────────────────────────────────────────────────────────────────────────
 # `XPC_SERVICE_NAME` is set by launchd IN THE JOB'S OWN ENVIRONMENT, to the job's label. That makes
@@ -140,17 +178,32 @@ EOF
         die "REFUSING: heartbeat loop not found at $LOOP (set HEARTBEAT_PI_AGENT_DIR, or farm scripts/)"
     fi
 
-    # Already running is success, not a second copy. Read the pid AND prove it: a pidfile whose pid
-    # is dead is a stale record, and relaunching over it is correct — but it must say so, because a
-    # silent "already running" over a dead process is the same false PASS one layer down.
+    # Already running is success, not a second copy. Read the pid AND prove it is the LOOP: a pidfile
+    # whose pid is dead is a stale record, and relaunching over it is correct — but it must say so,
+    # because a silent "already running" over a dead process is the same false PASS one layer down.
+    # ⛔ AND A RECYCLED PID IS NOT THE LOOP (#1867 review P2): `kill -0` alone proved PRESENCE, so an
+    # unrelated process holding the number made `start` refuse to launch the launched-once loop. See
+    # `pid_is_loop`.
     if [ -f "$PIDFILE" ]; then
-        local upid
+        local upid ident
         upid="$(tr -dc '0-9' < "$PIDFILE" 2>/dev/null)"
-        if [ -n "$upid" ] && kill -0 "$upid" 2>/dev/null; then
-            say "heartbeat loop already running (pid $upid)."
+        pid_is_loop "$upid"; ident=$?
+        if [ "$ident" = 0 ]; then
+            note "heartbeat loop already running (pid $upid)."
             return 0
         fi
-        say "note: stale pidfile ($PIDFILE, pid ${upid:-none} is not alive) — starting a fresh loop."
+        if [ "$ident" = 3 ]; then
+            die "REFUSING: $PIDFILE names pid ${upid:-<none>} and the process table could not be read,
+  so whether that pid is $LOOP_NAME cannot be answered — and a second loop is worse than none.
+  Check it yourself:  ps -p ${upid:-<pid>} -o command=   then  rm -f $PIDFILE  if it is NOT the loop"
+        fi
+        if [ "$ident" = 2 ]; then
+            note "stale pidfile ($PIDFILE, pid $upid is alive but is NOT $LOOP_NAME — a recycled pid) — starting a fresh loop."
+        elif [ -n "$upid" ]; then
+            note "stale pidfile ($PIDFILE, pid $upid is not alive) — starting a fresh loop."
+        else
+            note "stale pidfile ($PIDFILE holds no pid) — starting a fresh loop."
+        fi
     fi
 
     # ⛔ THE KILL FILE IS CHECKED HERE, NOT LEFT TO THE LOOP. The loop exits at the TOP of its next
@@ -175,11 +228,11 @@ EOF
     printf -v cmd '%s' "LOOP_DETACHED=1 nohup bash \"$LOOP\" >>\"$STATE/heartbeat-launch.log\" 2>&1 &"
 
     if [ "$dry" = 1 ]; then
-        say "DRY RUN — would execute (from a cmux-attributed shell):"
-        say "  $cmd"
-        say "  loop:      $LOOP"
-        say "  state dir: $STATE"
-        say "  pidfile:   $PIDFILE"
+        note "DRY RUN — would execute (from a cmux-attributed shell):"
+        note "  $cmd"
+        note "  loop:      $LOOP"
+        note "  state dir: $STATE"
+        note "  pidfile:   $PIDFILE"
         return 0
     fi
 
@@ -204,7 +257,7 @@ EOF
         if [ -f "$PIDFILE" ]; then
             upid="$(tr -dc '0-9' < "$PIDFILE" 2>/dev/null)"
             if [ -n "$upid" ] && kill -0 "$upid" 2>/dev/null; then
-                say "heartbeat loop started (pid $upid) — verify with: bash $0 check"
+                note "heartbeat loop started (pid $upid) — verify with: bash $0 check"
                 return 0
             fi
         fi
@@ -217,8 +270,8 @@ cmd_stop() {
     mkdir -p "$STATE" 2>/dev/null || true
     printf 'stop requested %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" > "$KILLFILE" 2>/dev/null \
         || die "cannot write $KILLFILE"
-    say "stop requested: $KILLFILE written; the loop exits at the top of its next pass."
-    say "Resume with: rm -f $KILLFILE && bash $0 start"
+    note "stop requested: $KILLFILE written; the loop exits at the top of its next pass."
+    note "Resume with: rm -f $KILLFILE && bash $0 start"
 }
 
 # ── STATUS (informational) ────────────────────────────────────────────────────────────────────
@@ -245,25 +298,31 @@ mtime_iso() { # $1 = file → ISO-8601 mtime, or "<unreadable>"
 }
 
 cmd_status() {
-    local upid="" alive="no"
+    local upid="" alive="no" ident=1
     if [ -f "$PIDFILE" ]; then
         upid="$(tr -dc '0-9' < "$PIDFILE" 2>/dev/null)"
-        [ -n "$upid" ] && kill -0 "$upid" 2>/dev/null && alive="yes"
+        # Same identity rule as `start`/`check` (#1867 review P2): "alive" is not "alive AS THE LOOP".
+        pid_is_loop "$upid"; ident=$?
+        case "$ident" in
+            0) alive="yes" ;;
+            2) alive="no (pid $upid is another process — a recycled pid)" ;;
+            3) alive="unknown (the process table could not be read)" ;;
+        esac
     fi
-    say "loop:      ${upid:-<no pidfile>} (alive: $alive)"
-    say "loop path: $LOOP"
-    say "state dir: $STATE"
+    note "loop:      ${upid:-<no pidfile>} (alive: $alive)"
+    note "loop path: $LOOP"
+    note "state dir: $STATE"
     if [ -f "$LOG" ]; then
-        say "last pass: $(mtime_iso "$LOG") ($LOG)"
+        note "last pass: $(mtime_iso "$LOG") ($LOG)"
     else
-        say "last pass: <never — no $LOG>"
+        note "last pass: <never — no $LOG>"
     fi
     if [ -s "$SNAP" ]; then
-        say "fleet read: $(mtime_iso "$SNAP") ($SNAP)"
+        note "fleet read: $(mtime_iso "$SNAP") ($SNAP)"
     else
-        say "fleet read: <none published>"
+        note "fleet read: <none published>"
     fi
-    [ -f "$KILLFILE" ] && say "kill file: PRESENT ($KILLFILE) — the loop will exit/not run"
+    [ -f "$KILLFILE" ] && note "kill file: PRESENT ($KILLFILE) — the loop will exit/not run"
     return 0
 }
 
@@ -316,28 +375,37 @@ PY
 # that stopped a few minutes ago.
 cmd_check() {
     if ! command -v python3 >/dev/null 2>&1; then
-        say "UNKNOWN: python3 not on PATH — cannot read the fleet snapshot, so this probe refuses to answer"
+        note "UNKNOWN: python3 not on PATH — cannot read the fleet snapshot, so this probe refuses to answer"
         return 2
     fi
     if [ ! -d "$STATE" ]; then
-        say "UNKNOWN: state dir $STATE does not exist — nothing has ever run here, so there is nothing to verify"
+        note "UNKNOWN: state dir $STATE does not exist — nothing has ever run here, so there is nothing to verify"
         return 2
     fi
 
-    local rc=0 upid="" alive=0
+    local rc=0 upid="" alive=0 ident=1
     if [ -f "$PIDFILE" ]; then
         upid="$(tr -dc '0-9' < "$PIDFILE" 2>/dev/null)"
-        [ -n "$upid" ] && kill -0 "$upid" 2>/dev/null && alive=1
+        # ⛔ THE PID MUST BE THE LOOP, NOT MERELY ALIVE (#1867 review P2) — a recycled pid made this
+        # verb report `OK loop alive` over a dead heartbeat. See `pid_is_loop`.
+        pid_is_loop "$upid"; ident=$?
+        [ "$ident" = 0 ] && alive=1
     fi
     if [ "$alive" = 1 ]; then
-        say "OK    loop alive (pid $upid)"
+        note "OK    loop alive (pid $upid)"
+    elif [ "$ident" = 3 ]; then
+        note "UNKNOWN: the process table could not be read, so whether pid ${upid:-<none>} is $LOOP_NAME cannot be answered here — never a pass"
+        return 2
+    elif [ "$ident" = 2 ]; then
+        note "DRIFT loop is NOT running (pidfile pid $upid is alive but is NOT $LOOP_NAME — a recycled pid, so the heartbeat is not beating)"
+        rc=1
     else
-        say "DRIFT loop is NOT running (pidfile ${upid:-absent}) — the heartbeat is not beating"
+        note "DRIFT loop is NOT running (pidfile ${upid:-absent}) — the heartbeat is not beating"
         rc=1
     fi
 
     if [ ! -s "$SNAP" ]; then
-        say "DRIFT no fleet read was ever published ($SNAP missing or empty)"
+        note "DRIFT no fleet read was ever published ($SNAP missing or empty)"
         return 1
     fi
 
@@ -348,11 +416,11 @@ cmd_check() {
     # `prc` is the python verdict; a heredoc that failed to run at all (127/126) is UNKNOWN.
     case "$prc" in
         0|1|2) ;;
-        *) say "UNKNOWN: the snapshot reader did not run (rc=$prc)"; return 2 ;;
+        *) note "UNKNOWN: the snapshot reader did not run (rc=$prc)"; return 2 ;;
     esac
     # `cut --output-delimiter` is GNU-only and this file must run on macOS too, so the verdict
     # column is turned into a space with sed instead of relying on a GNU long option.
-    say "$(printf '%s' "$report" | sed 's/\t/ /')"
+    note "$(printf '%s' "$report" | sed 's/\t/ /')"
     [ "$prc" -gt "$rc" ] && rc="$prc"
     return "$rc"
 }

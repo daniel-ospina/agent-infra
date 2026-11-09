@@ -16,7 +16,7 @@
 # not be checked before this change.
 #
 # §1-§3  the launchd refusal — the gate that must never open
-# §4-§6  start: the kill file, idempotence over a LIVE pid, and --dry-run launching nothing
+# §4-§6  start: the kill file, idempotence over a LIVE loop, the RECYCLED pid, and --dry-run
 # §7-§13 check: a BEHAVIOUR probe (0 OK / 1 DRIFT / 2 UNKNOWN, never a pass by default)
 # §14    the launcher carries no literal user home
 #
@@ -67,14 +67,30 @@ newroot() { # <name> → echoes the root, creates <root>/agent/state
     printf '%s' "$r"
 }
 
-# A LIVE stand-in for the loop (the real one would run a fleet pass). `kill -0` is the only thing
-# the launcher and the probe ask about a pid, so a sleeping process is the same fact to them.
+# A LIVE stand-in for the loop (the real one would run a fleet pass).
+# ⛔ THIS IS THE **RECYCLED-PID** SHAPE (#1867 review P2): a process this user owns, alive, holding a
+# pid — and NOT the loop. The pidfile can name it after a SIGKILL/OOM kill/reboot, because the kernel
+# reuses pids. `kill -0` alone reads it as a healthy heartbeat; nothing else may.
 # ⛔ STDOUT/STDERR ARE REDIRECTED: this runs inside `$( )`, and a child holding the substitution's
 # stdout keeps it open, so the caller BLOCKS for the whole sleep. (Measured: the suite hung at §4.)
 # The pid is recorded in a FILE, not an array, because a command substitution is a subshell and an
 # array appended inside it is lost — the reaper would then have nothing to kill.
 live_pid() {
     sleep 120 >/dev/null 2>&1 &
+    printf '%s\n' "$!" >> "$T/livepids"
+    printf '%s' "$!"
+}
+
+# A LIVE process whose OWN ARGV is the loop (#1867 review P2) — what the pidfile legitimately names.
+# ⛔ NO `exec` OF A SLEEPER: the process's argv must keep naming the script, which is the identity the
+# launcher now proves. `while :; do sleep 1; done` keeps only a one-second child, so this leaves no
+# long-lived litter for the next case's cleanup to chase.
+LOOP_STANDIN="$T/standin/scripts/heartbeat-loop.sh"
+mkdir -p "$(dirname "$LOOP_STANDIN")"
+printf '#!/usr/bin/env bash\nwhile :; do sleep 1; done\n' > "$LOOP_STANDIN"
+chmod +x "$LOOP_STANDIN"
+loop_pid() {
+    bash "$LOOP_STANDIN" >/dev/null 2>&1 &
     printf '%s\n' "$!" >> "$T/livepids"
     printf '%s' "$!"
 }
@@ -139,12 +155,29 @@ assert_contains "$OUT" "rm -f" "§4 …and gives the one command that resumes it
 assert_not_contains "$OUT" "started (pid" "§4 …and does NOT claim it started"
 
 # ⛔ A LIVE PID IS THE EVIDENCE, NOT THE FILE. "already running" over a DEAD pid would be the same
-# false PASS one layer down, so the two cases are asserted separately.
+# false PASS one layer down, so the three cases are asserted separately: the LOOP (idempotent), a
+# DEAD pid (stale), and a RECYCLED LIVE pid that is NOT the loop (also stale — and the one `kill -0`
+# alone could never tell apart, #1867 review P2).
 R="$(newroot s4)"
-P="$(live_pid)"; printf '%s\n' "$P" > "$R/agent/state/heartbeat-loop.pid"
+P="$(loop_pid)"; printf '%s\n' "$P" > "$R/agent/state/heartbeat-loop.pid"
 OUT="$(run "$R" -- start)"; RC=$?
-assert_eq "$RC" "0" "§5 a LIVE pidfile reads as already running (rc=0, idempotent)"
+assert_eq "$RC" "0" "§5 a LIVE loop pidfile reads as already running (rc=0, idempotent)"
 assert_contains "$OUT" "already running" "§5 …and says so rather than forking a second loop"
+
+# ⛔ THE RECYCLED PID (#1867 review P2). A live, user-owned process that is NOT the loop (the shape a
+# reboot leaves in the pidfile) must be named STALE — the pre-fix code proved liveness with `kill -0`
+# alone and printed "already running", exiting 0 WITHOUT launching the launched-once loop, so the
+# heartbeat stayed dead while the operator was told it was running.
+R="$(newroot s5b)"
+P="$(live_pid)"; printf '%s\n' "$P" > "$R/agent/state/heartbeat-loop.pid"
+OUT="$(run "$R" -- start --dry-run)"; RC=$?
+assert_eq "$RC" "0" "§5b a RECYCLED pid does not block the launch (start continues to the launch path)"
+assert_contains "$OUT" "stale pidfile" "§5b …the record is named STALE, not trusted"
+assert_contains "$OUT" "is NOT heartbeat-loop.sh" "§5b …and the reason is the identity, not the liveness"
+assert_not_contains "$OUT" "already running" "§5b …and 'already running' is NOT claimed over a stranger (§5 kept green: polarity is not 'anything alive is stale')"
+OUT="$(env HEARTBEAT_PI_AGENT_DIR="$R/agent" bash "$LAUNCH" status 2>&1)"; RC=$?
+assert_eq "$RC" "0" "§5b status still exits 0 (it is informational)"
+assert_contains "$OUT" "another process" "§5b …and its 'alive:' column says the pid is someone else, not 'yes'"
 
 R="$(newroot s5)"
 printf '999999\n' > "$R/agent/state/heartbeat-loop.pid"
@@ -170,16 +203,29 @@ assert_eq "$RC" "1" "§8 a loop that is not running is DRIFT (1)"
 assert_contains "$OUT" "NOT running" "§8 …and the line names the condition"
 
 R="$(newroot c2)"
-P="$(live_pid)"; printf '%s\n' "$P" > "$R/agent/state/heartbeat-loop.pid"
+P="$(loop_pid)"; printf '%s\n' "$P" > "$R/agent/state/heartbeat-loop.pid"
 OUT="$(run "$R" -- check)"; RC=$?
 assert_eq "$RC" "1" "§9 a LIVE loop that never published is still DRIFT — a heartbeat with no beat"
 assert_contains "$OUT" "no fleet read was ever published" "§9 …and the reason is named, not inferred"
+
+# ⛔ A RECYCLED PID IS NOT ALIVE AS THE LOOP (#1867 review P2). Same fixture as §13b's green case —
+# fresh, non-degenerate snapshot, every other input healthy — except the pid belongs to a stranger.
+# Pre-fix this printed `OK loop alive` and returned 0 over a dead heartbeat: the false PASS this
+# whole file exists to remove, produced by the probe that was added to remove it.
+R="$(newroot c2b)"
+P="$(live_pid)"; printf '%s\n' "$P" > "$R/agent/state/heartbeat-loop.pid"
+printf '[{"lane":"a","degraded":false}]\n' > "$R/agent/state/lane-status.last.json"
+OUT="$(run "$R" -- check)"; RC=$?
+assert_eq "$RC" "1" "§9b a RECYCLED pid is DRIFT (1), never OK — a stranger holding the number is not the loop"
+assert_contains "$OUT" "NOT running" "§9b …and the line says the loop is not running"
+assert_contains "$OUT" "recycled pid" "§9b …and names the recycled pid as the reason"
+assert_not_contains "$OUT" "OK    loop alive" "§9b …and never prints the OK line it used to"
 
 # ⛔ THE ASSERTION THIS SUITE EXISTS FOR: alive is NOT the verdict. A running loop whose last fleet
 # read is DEGRADED is the exact measured failure (27/27 degraded rows, 0 nudges) and it must be
 # RED — every content/process check on the box said that job was fine.
 R="$(newroot c3)"
-P="$(live_pid)"; printf '%s\n' "$P" > "$R/agent/state/heartbeat-loop.pid"
+P="$(loop_pid)"; printf '%s\n' "$P" > "$R/agent/state/heartbeat-loop.pid"
 printf '[{"lane":"a","degraded":true},{"lane":"b","degraded":true}]\n' > "$R/agent/state/lane-status.last.json"
 OUT="$(run "$R" -- check)"; RC=$?
 assert_eq "$RC" "1" "§10 ALIVE + DEGRADED is DRIFT — liveness is not health"
@@ -188,14 +234,14 @@ assert_contains "$OUT" "2/2 rows DEGRADED" "§10 …and the degraded count is pr
 # An EMPTY row set is not a quiet fleet: `degraded` is a per-row flag, so zero rows is vacuously
 # "clean" to any naive check — the trap `lane-status.py`'s own publisher documents.
 R="$(newroot c4)"
-P="$(live_pid)"; printf '%s\n' "$P" > "$R/agent/state/heartbeat-loop.pid"
+P="$(loop_pid)"; printf '%s\n' "$P" > "$R/agent/state/heartbeat-loop.pid"
 printf '[]\n' > "$R/agent/state/lane-status.last.json"
 OUT="$(run "$R" -- check)"; RC=$?
 assert_eq "$RC" "1" "§11 an EMPTY snapshot is DRIFT, not a healthy fleet"
 assert_contains "$OUT" "empty fleet snapshot" "§11 …and it is named as an empty read"
 
 R="$(newroot c5)"
-P="$(live_pid)"; printf '%s\n' "$P" > "$R/agent/state/heartbeat-loop.pid"
+P="$(loop_pid)"; printf '%s\n' "$P" > "$R/agent/state/heartbeat-loop.pid"
 printf '[{"lane":"a","degraded":false}]\n' > "$R/agent/state/lane-status.last.json"
 touch -d '40 minutes ago' "$R/agent/state/lane-status.last.json" 2>/dev/null \
     || touch -t "$(date -v-40M '+%Y%m%d%H%M' 2>/dev/null || date '+%Y%m%d%H%M')" "$R/agent/state/lane-status.last.json"
@@ -204,14 +250,14 @@ assert_eq "$RC" "1" "§12 a STALE fleet read is DRIFT (the loop stopped publishi
 assert_contains "$OUT" "STALE" "§12 …and says STALE rather than reporting the old rows as current"
 
 R="$(newroot c6)"
-P="$(live_pid)"; printf '%s\n' "$P" > "$R/agent/state/heartbeat-loop.pid"
+P="$(loop_pid)"; printf '%s\n' "$P" > "$R/agent/state/heartbeat-loop.pid"
 printf 'not json at all\n' > "$R/agent/state/lane-status.last.json"
 OUT="$(run "$R" -- check)"; RC=$?
 assert_eq "$RC" "2" "§13 an UNPARSEABLE snapshot is UNKNOWN (2), never 'no degraded rows'"
 
 # The positive case, and the only one that may be green.
 R="$(newroot c7)"
-P="$(live_pid)"; printf '%s\n' "$P" > "$R/agent/state/heartbeat-loop.pid"
+P="$(loop_pid)"; printf '%s\n' "$P" > "$R/agent/state/heartbeat-loop.pid"
 printf '[{"lane":"a","degraded":false},{"lane":"b","degraded":false}]\n' > "$R/agent/state/lane-status.last.json"
 OUT="$(run "$R" -- check)"; RC=$?
 assert_eq "$RC" "0" "§13b a LIVE loop with a FRESH, non-degenerate read is OK (0)"

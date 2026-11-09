@@ -21,16 +21,17 @@ export PI_FLEET_PATH_PINNED=1
 # exist and pushed the load-bearing `gh` shim dir NOT onto PATH at all, so `gh` silently fell back to
 # whatever the launch environment happened to carry. A pin is a repair; a repair spelled with one
 # user's name is a divergence that only shows up on the machine nobody tested.
-# The ORDER is unchanged (bin, then shims, then whatever was already on PATH) and an entry is added
-# only when it EXISTS, so the same line means the same thing on macOS and Linux.
-if [ -n "${HOME:-}" ] && [ -d "$HOME" ]; then
-    for _pin_dir in "$HOME/bin" "$HOME/.pi/agent/shims"; do
-        [ -d "$_pin_dir" ] || continue
-        case ":$PATH:" in *":$_pin_dir:"*) continue ;; esac
-        PATH="$_pin_dir:$PATH"
-    done
-    unset _pin_dir
-fi
+# The ORDER is unchanged (bin, then cmux, then the agent dirs, then whatever was already on PATH)
+# and an entry is added only when it EXISTS, so the same line means the same thing on macOS and
+# Linux.
+# ⛔ THE PIN IS APPLIED IN ONE PLACE, FURTHER DOWN (#1867 review P1 residual). It used to be TWO
+# blocks — a two-entry prepend here and the rest below — and both prepended each entry inside their
+# own loop, which installs a list REVERSED (the last entry wins the front). Measured on a brew Mac:
+# `/opt/homebrew/bin` ended up ahead of `$HOME/.pi/agent/shims`, so every child's bare `gh` resolved
+# to the raw binary and the #984 admin-merge guard plus the #1910 fleet pacing gate were silently
+# inert for the loop's whole life (the trap `MEMORY.md:59` records verbatim). One list, built in
+# order and prepended ONCE, reproduces the precedence `main`'s single literal had.
+# It also waits for HOME to be validated and pinned below, which is the HOME its entries derive from.
 # `HOME` IS REQUIRED, NEVER FORCE-SET (#1867). The one-user pin that used to live here
 # (`if [ -d /Users/danielospina ]; then export HOME=…`) re-homed the process to a path derived from
 # the CALLER's HOME above, so the loop wrote its state under one home and changed into another —
@@ -379,11 +380,20 @@ export O="${O:-$HOME/orchestrator}"
 # scan produced nothing usable" — the gate was silently dead while the heartbeat reported a green.
 # Add a PATH entry only when it is needed, but never omit this one silently.
 #
-# ⛔ NO LITERAL USER HOME (#1867). Every home-relative entry is derived from `$HOME` and appended
+# ⛔ NO LITERAL USER HOME (#1867). Every home-relative entry is derived from `$HOME` and added
 # only when it exists; the absolutist list this replaced (`/Users/danielospina/bin:…`) was correct
 # on exactly one machine and produced a PATH full of non-directories everywhere else. The system
-# dirs are APPENDED as the TAIL, because those paths are the same on macOS and on the Linux cells
-# and they must never outrank anything above them in this list.
+# dirs stay LAST IN THE LIST, so they keep the tail rank the same list gave them on `main`.
+# ⛔ THE LIST IS BUILT IN ORDER AND PREPENDED ONCE (#1867 review P1 residual). Prepending each entry
+# inside the loop installs the list REVERSED — the last entry wins the front — which put
+# `/opt/homebrew/bin` ahead of `$HOME/.pi/agent/shims` (`scripts/capacity-transfer.test.sh:48`: on a
+# brew Mac `gh` IS `/opt/homebrew/bin/gh`) and disarmed the `gh` shim's #984 admin-merge guard and
+# #1910 pacing gate for every child of this loop, while the pin LOOKED installed. Appending the
+# entries in list order to an accumulator and prepending that ONE string keeps the first-listed dir
+# furthest front, shims ahead of homebrew/system, and the system dirs appended below as the tail —
+# the precedence `main`'s single literal had. (Nothing is added twice: an entry already on PATH is
+# skipped, and the shim dir is the one entry that must never be omitted.)
+_pin_prefix=""
 for _path_dir in \
     "$HOME/bin" \
     "/Applications/cmux.app/Contents/Resources/bin" \
@@ -393,9 +403,11 @@ for _path_dir in \
     "/opt/homebrew/bin"; do
     [ -d "$_path_dir" ] || continue
     case ":$PATH:" in *":$_path_dir:"*) continue ;; esac
-    PATH="$_path_dir:$PATH"
+    _pin_prefix="$_pin_prefix$_path_dir:"
  done
 unset _path_dir
+if [ -n "$_pin_prefix" ]; then PATH="$_pin_prefix$PATH"; fi
+unset _pin_prefix
 # ⛔ APPEND, NEVER PREPEND (#1867 review P1). These five dirs were PREPENDED by an earlier version of
 # this line, which moved `/usr/local/bin` and `/usr/bin` AHEAD of the entries the loop above pins —
 # so every child's bare `gh` resolved to the raw binary and NOT to `~/.pi/agent/shims/gh`. That shim

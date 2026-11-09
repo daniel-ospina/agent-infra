@@ -81,6 +81,9 @@
 #      And stopping it leaves NO ORPHAN: the loop is signalled as a PROCESS GROUP, so the
 #      `sleep "$SLP"` it parks in (~540 s) does not outlive the test (review advisory, #1954).
 #  13. `<child>.stderr` IS TRUNCATED AT LAUNCH, so run N's report cannot carry run N-1's line.
+#  15. THE PATH PIN'S RANK (#1867 review P1 residual) — the gh shim must outrank
+#      `/opt/homebrew/bin`, which is where `gh` lives on a brew Mac. Prepending per entry installed
+#      the list REVERSED, so the shim was shadowed and the #984/#1910 gates inert.
 #
 # Run: bash scripts/heartbeat-loop.test.sh
 set -uo pipefail
@@ -750,6 +753,69 @@ if has "$TXT14G" "PR-DOCTOR RED UNREPORTED (verdict is STALE"; then
   pass "14g. …and a stale rc=3 is UNREPORTED too (one ordering, matching objective.py)"
 else
   fail "14g. a stale rc=3 was not reported as UNREPORTED (got: $(grep -m1 'PR-DOCTOR' "$LOG14G" 2>/dev/null | cut -c1-140))"
+fi
+
+echo ""
+echo "15. THE PIN'S RANK: the gh shim must NOT lose to /opt/homebrew/bin (the brew-Mac box)"
+# ⛔ THE DEFECT THIS PINS (#1867 review P1 residual). The pin was TWO loops that each PREPENDED per
+# entry, and prepending in list order installs the list REVERSED — the LAST entry wins the front. So
+# `/opt/homebrew/bin` landed ahead of `$HOME/.pi/agent/shims`: on a brew Mac (`gh` IS
+# `/opt/homebrew/bin/gh`, `scripts/capacity-transfer.test.sh:48`) every child's bare `gh` resolved to
+# the RAW binary, silently disarming the shim's #984 admin-merge guard and #1910 pacing gate for the
+# loop's whole life while the pin looked installed. `MEMORY.md:59` records the same trap.
+#
+# ⛔ THE FIXTURE IS THE SHIPPED FILE, NOT A COPY OF ITS LOGIC. The two macOS-absolute dirs cannot
+# exist on a Linux runner, so they are RE-ROOTED into the fixture and the assertion below proves the
+# relocation changed nothing else. The pass is REAL: the tick stub only reports what the loop's own
+# PATH made `gh` resolve to, so nothing here re-implements the precedence it is grading.
+PINROOT="$TMP/pinrank"
+mkdir -p "$PINROOT/opt/homebrew/bin" "$PINROOT/Applications/cmux.app/Contents/Resources/bin"
+printf '#!/bin/bash\necho SHIM-GH\n' > "$PINROOT/shim-gh"
+printf '#!/bin/bash\necho REAL-GH\n' > "$PINROOT/real-gh"
+chmod +x "$PINROOT/shim-gh" "$PINROOT/real-gh"
+RELOC="$PINROOT/relocated-heartbeat-loop.sh"
+sed -e "s#/Applications/cmux.app#$PINROOT/Applications/cmux.app#g" \
+    -e "s#/opt/homebrew/bin#$PINROOT/opt/homebrew/bin#g" "$LOOP" > "$RELOC"
+BACK="$(sed -e "s#$PINROOT/Applications/cmux.app#/Applications/cmux.app#g" \
+             -e "s#$PINROOT/opt/homebrew/bin#/opt/homebrew/bin#g" "$RELOC" | cksum)"
+if [ "$BACK" = "$(cksum < "$LOOP")" ]; then
+  pass "15. the fixture is the SHIPPED loop with ONLY the two macOS-absolute dirs re-rooted"
+else
+  fail "15. the relocated fixture is not the shipped loop — the arm would be grading a rewrite"
+fi
+FIX15="$(mkfix pinrank 0)"
+# Every directory in the pin's list, all present, so the RANK is observable end to end.
+mkdir -p "$FIX15/home/bin" "$FIX15/home/.pi/agent/bin" "$FIX15/home/.pi/agent/shims" "$FIX15/home/.local/bin"
+cp "$PINROOT/shim-gh" "$FIX15/home/.pi/agent/shims/gh"
+cp "$PINROOT/real-gh" "$PINROOT/opt/homebrew/bin/gh"
+cat > "$FIX15/agent/scripts/orchestrator-heartbeat.sh" <<SH
+#!/bin/bash
+{ command -v gh; printf '%s\n' "\$PATH"; } > "$FIX15/gh-resolved" 2>&1
+exit 0
+SH
+SAVED_LOOP="$LOOP"; LOOP="$RELOC"
+run_pass "$FIX15"
+LOOP="$SAVED_LOOP"
+RESOLVED="$(sed -n 1p "$FIX15/gh-resolved" 2>/dev/null)"
+PINPATH="$(sed -n 2p "$FIX15/gh-resolved" 2>/dev/null)"
+# rank 1 = furthest front; 0 = not on PATH at all (an ABSENT control entry makes the order vacuous)
+rank_of(){ printf '%s' "$1" | tr ':' '\n' | awk -v want="$2" '$0 == want { print NR; f=1 } END { if (!f) print 0 }'; }
+SHIM_RANK="$(rank_of "$PINPATH" "$FIX15/home/.pi/agent/shims")"
+BREW_RANK="$(rank_of "$PINPATH" "$PINROOT/opt/homebrew/bin")"
+if [ "$BREW_RANK" -gt 0 ] && [ "$SHIM_RANK" -gt 0 ]; then
+  pass "15. control: BOTH the shim dir and homebrew are on the pinned PATH (ranks $SHIM_RANK / $BREW_RANK)"
+else
+  fail "15. control: the pinned PATH is missing one of the two dirs (shim=$SHIM_RANK brew=$BREW_RANK) — nothing to rank"
+fi
+if [ "$RESOLVED" = "$FIX15/home/.pi/agent/shims/gh" ]; then
+  pass "15. a child's bare 'gh' resolves to the SHIM, not to /opt/homebrew/bin/gh"
+else
+  fail "15. a child's bare 'gh' resolved to [${RESOLVED:-<none>}] — the shim is SHADOWED on the brew-Mac layout"
+fi
+if [ "$SHIM_RANK" -gt 0 ] && [ "$BREW_RANK" -gt 0 ] && [ "$SHIM_RANK" -lt "$BREW_RANK" ]; then
+  pass "15. the shim dir outranks homebrew ($SHIM_RANK < $BREW_RANK) — list order is not installed reversed"
+else
+  fail "15. the shim dir does NOT outrank homebrew (shim=$SHIM_RANK brew=$BREW_RANK) — the pin is installed REVERSED"
 fi
 
 if [ "$failures" -eq 0 ]; then
