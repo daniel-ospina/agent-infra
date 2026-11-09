@@ -171,7 +171,13 @@ What the controller now does (`orch-loop.sh`, the `# BEGIN gh-bound` block):
   `case … in pat) gh api … ;; esac` (the form `orch-loop.sh` itself writes on 88 lines) unscanned
   (review rounds 2 and 3). The scan therefore accepts `)` at any offset, and blanks LITERAL text
   first: quote removal runs before a command is executed, so a `)` inside a literal is never a
-  command position. ⛔ **But a `$( … )` substitution inside double quotes does run** — it IS a command
+  command position. Quoting is modelled in full — `'…'`, `"…"`, ANSI-C `$'…'`, and the ESCAPE
+  CHARACTER, which is a quoting mechanism in its own right (GNU Bash manual §3.1.2) — so `\` escapes
+  in unquoted code too. Round 6: it was modelled only INSIDE double quotes, and
+  `echo it\'s; gh api …` is VALID bash, yet the escaped apostrophe opened a single-quote span and
+  blanked the rest of the line — an under-report that could ship while the comment beside it ruled
+  that channel out as a syntax error.
+  ⛔ **But a `$( … )` substitution inside double quotes does run** — it IS a command
   position, and blanking a double-quoted span wholesale blinded the scan to the repo's dominant
   capture idiom `x="$(gh api …)"` (9 of the block's 16 call sites are captured, named at
   `orch-loop.sh:519`, and the pre-fix line this block documents at `:4910`) — review round 4. A
@@ -186,8 +192,10 @@ What the controller now does (`orch-loop.sh`, the `# BEGIN gh-bound` block):
   `pattern="a) gh api"`, a literal `) gh` in prose, and an already-bounded capture MUST NOT. What is
   still out of its reach is a call hidden behind a variable, in `eval`, inside a python heredoc, in a
   BACKTICK substitution (the alternation anchors on `$(`,
-  not on a backtick), or behind a wrapper **followed by an assignment** (`env GH_TOKEN=x gh api …` —
-  the alternation wants `gh` to follow the wrapper directly). No such site exists today
+  not on a backtick), or behind a WRAPPER WORD the group does not carry — the group holds only `time`
+  and `exec`, so `env`, `nice`, `sudo`, `timeout`, `xargs`, `nohup` and `stdbuf` are unmodelled
+  whether or not an assignment follows (`env gh api …` and `env GH_TOKEN=x gh api …` are equally
+  invisible; measured). No such site exists today
   (independently re-derived over the file: every remaining `gh` is a string literal, the
   `command gh` pass-through, or the `tb_timeout … gh` argv
   inside `gh_bounded`), so this is a stated limit, not a live bypass.
