@@ -1172,20 +1172,25 @@ verify_review_evidence() { # <ref> <head_sha> [polarity] -> 0 = verified
     _ab_bad=0
     while :; do
       _ab_line="${_ab_rest%%"$_ab_sep"*}"
-      case "$_ab_line" in
-        *'[ADVERSARIAL-BOUND]'*)
-          _ab_ok=1; _ab_n=0; _ab_seen=""
-          while IFS= read -r _ab_f; do
-            [ -n "$_ab_f" ] || continue
-            _ab_n=$((_ab_n + 1)); _ab_seen="$_ab_f"
-            grep -qiE '^residuals=[[:space:]]*none[,.:;)]*$' <<<"$_ab_f" || _ab_ok=0
-          done < <(printf '%s' "$_ab_line" | grep -oiE 'residuals=[^[:space:]]*' || true)
-          if [ "$_ab_ok" -ne 1 ] || [ "$_ab_n" -eq 0 ]; then
-            _ab_bad=1
-            if [ "$_ab_n" -eq 0 ]; then _ab_seen='no residuals= field on the marker line'; fi
-            break
-          fi ;;
-      esac
+      # ⛔ DETECT CASE-INSENSITIVELY, LIKE THE TRIGGER ABOVE (found in review of this change, and it was a
+      # real fail-open). The outer trigger is `grep -qiE`, so a body spelling the marker
+      # `[adversarial-bound]` entered this block — and the first cut's `case *'[ADVERSARIAL-BOUND]'*`
+      # is case-SENSITIVE, matched nothing, and the whole arm was skipped: a CAPPED marker in lower case
+      # was ACCEPTED. The detection now uses the same engine and the same flag as the trigger, so the two
+      # cannot disagree about whether there is a marker to judge. (Pinned by 13m6h.)
+      if grep -qiE '\[ADVERSARIAL-BOUND\]' <<<"$_ab_line"; then
+        _ab_ok=1; _ab_n=0; _ab_seen=""
+        while IFS= read -r _ab_f; do
+          [ -n "$_ab_f" ] || continue
+          _ab_n=$((_ab_n + 1)); _ab_seen="$_ab_f"
+          grep -qiE '^residuals=[[:space:]]*none[,.:;)]*$' <<<"$_ab_f" || _ab_ok=0
+        done < <(printf '%s' "$_ab_line" | grep -oiE 'residuals=[^[:space:]]*' || true)
+        if [ "$_ab_ok" -ne 1 ] || [ "$_ab_n" -eq 0 ]; then
+          _ab_bad=1
+          if [ "$_ab_n" -eq 0 ]; then _ab_seen='no residuals= field on the marker line'; fi
+          break
+        fi
+      fi
       [ "$_ab_line" = "$_ab_rest" ] && break
       _ab_rest="${_ab_rest#*"$_ab_sep"}"
     done
