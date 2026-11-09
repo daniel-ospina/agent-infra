@@ -374,9 +374,14 @@ gh_() { "$GH" "$@"; }
 #
 # ⛔ WHERE IT APPLIES — and the line is not "every `gh` call". The re-poll is for
 # the reads whose EMPTY answer makes a VERDICT: it ABORTS the unit (`base_tip`,
-# `merge_base_of`, `resolve_state`, the pre-land head/base re-read), refuses an
-# update (`pr_has_carry_evidence`), or SELECTS the refresh decision (#1533's
-# `behind_by_of`, whose empty result reaches the B13 stop). It deliberately does
+# `merge_base_of`, `resolve_state`, the `--queue` pre-handoff head/base re-read, the
+# pre-land head/base re-read), refuses an update (`pr_has_carry_evidence`), or
+# SELECTS the refresh decision (#1533's `behind_by_of`, whose empty result reaches
+# the B13 stop). The `--queue` and direct-land head/base re-reads are BOTH here
+# because they are twins — same two fields, same `-z` stop — and wrapping only the
+# direct-land one is what left a `--queue` hand-off aborting on one empty reply after
+# `do_record` had already minted the record (found in review, not on the first pass).
+# It deliberately does
 # NOT wrap the two reads whose empty answer already routes to the SAFE default —
 # `strict_of` and `mergeable_of` both read as "unreadable ⇒ refresh" and never as
 # "current". Retrying those would change no verdict and would multiply a read
@@ -2183,8 +2188,20 @@ while :; do
   # checked even here: it makes the record's certified diff describe something other
   # than what lands (agent-infra #1362 — every head-bound check still passes on an
   # edit that changes the target branch), and the read is already being made.
+  #
+  # ⛔ A TRANSIENT EMPTY READ HERE IS THE #1558 CLASS TOO, and this is the twin of the
+  # pre-land re-read below (`pre=`, same two fields, same fail-closed `-z`). It used to
+  # be a bare `gh_` capture, so ONE empty reply stopped the unit with "could not
+  # re-resolve the head and base before the queue hand-off" — AFTER `do_record` had
+  # already minted the record at this head, i.e. the same false abort #1558 measured,
+  # reached through the `--queue` arm instead of the direct-land arm. It goes through
+  # `gh_read()` for the same reason and on the same terms: the bound settles a
+  # transient, and a PERSISTENTLY unreadable pair still returns empty so the `-z` stop
+  # below fires unchanged. (Found by the PR's fresh-context review; the helper's own
+  # WHERE-IT-APPLIES rule names this family — a read whose empty answer makes a
+  # verdict — and this member of it was missed on the first pass.)
   if [ "$QUEUE_MODE" -eq 1 ] && [ "$DRY_RUN" -eq 0 ]; then
-    q_now_row="$(gh_ pr view "$PR" ${repo_args[@]+"${repo_args[@]}"} --json headRefOid,baseRefName --jq '"\(.headRefOid)\t\(.baseRefName)"' 2>/dev/null || true)"
+    q_now_row="$(gh_read pr view "$PR" ${repo_args[@]+"${repo_args[@]}"} --json headRefOid,baseRefName --jq '"\(.headRefOid)\t\(.baseRefName)"')"
     q_now="$(printf '%s' "$q_now_row" | cut -f1)"
     q_now_base="$(printf '%s' "$q_now_row" | cut -f2)"
     if [ -z "$q_now" ] || [ -z "$q_now_base" ]; then
