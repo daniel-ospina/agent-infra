@@ -871,6 +871,52 @@ function heredocDelimiter(raw: string): string | null {
 }
 
 /**
+ * The backslash step of an UNQUOTED heredoc's expansion: `\\`, `\$` and `\`` lose the
+ * backslash, and a backslash before anything else stays put (POSIX: `\` must be used
+ * to quote `\`, `$` and `` ` `` in a here-document).
+ *
+ * This is what the CONSUMING shell actually receives, so it is what the guard must
+ * classify — without it a body line ending in `\\` looked like a literal backslash and
+ * the line after it like a separate command, which OVER-blocked a body whose inner
+ * shell joins the two lines into one `echo` (measured; allow twin A79).
+ *
+ * NOT modelled, and declared as a residual: parameter expansion, command substitution
+ * and arithmetic expansion inside the body — a launch assembled by `$(…)` inside an
+ * unquoted heredoc is beyond a lexer.
+ */
+function unquoteHeredocBackslashes(line: string): string {
+  let out = "";
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    const nx = line[i + 1];
+    if (ch === "\\" && (nx === "\\" || nx === "$" || nx === "`")) {
+      out += nx;
+      i++;
+      continue;
+    }
+    out += ch;
+  }
+  return out;
+}
+
+/**
+ * Was ANY part of a heredoc DELIMITER word quoted? Then the whole document is literal
+ * (no expansion, no continuation removal); otherwise bash expands it, which is a
+ * DIFFERENT document from the source bytes.
+ *
+ * The quoting forms are the ones `heredocDelimiter` removes: `'…'`, `"…"`, `$'…'`,
+ * `$"…"`, and a backslash-escaped character.
+ */
+function heredocDelimiterIsQuoted(raw: string): boolean {
+  for (let i = 0; i < raw.length; i++) {
+    const ch = raw[i];
+    if (";&|<>()`".includes(ch)) return false; // the word ended before this point
+    if (ch === "'" || ch === '"' || ch === "\\") return true;
+  }
+  return false;
+}
+
+/**
  * Does an unquoted `#` at `i` BEGIN A COMMENT? bash's rule: start of line/input, after
  * a blank, or after an unquoted, unescaped METACHARACTER (`;&|()<>`).
  *
@@ -892,8 +938,9 @@ function isCommentStart(text: string, i: number): boolean {
  * next line appended; otherwise null.
  *
  * The heredoc scanner joins continuations line by line (see `splitShellStdin`) so a
- * BODY is never joined; this predicate shares `joinLineContinuations`' rules for
- * quotes and comments.
+ * QUOTED body is never joined; this predicate shares `joinLineContinuations`' rules for
+ * quotes and comments. An UNQUOTED body IS joined with it — bash expands that document,
+ * terminator included (see the body walk in `splitShellStdin`).
  */
 function joinContinuedLine(line: string, next: string): string | null {
   let comment = false;
@@ -950,9 +997,11 @@ export function splitShellStdin(command: string): ShellStdin {
     // QUOTED heredoc, so one trailing backslash in the body ate the terminator and
     // turned every following command -- including a launch -- into data:
     //     cat > f <<'EOF'   /   body: x backslash   /   EOF   /   npm exec electron .
-    // bash runs the npm line (measured); the guard returned []. Bodies are consumed by
-    // the loop below and never reach this join, which is exactly the distinction bash
-    // makes for a quoted delimiter (a body is literal).
+    // bash runs the npm line (measured); the guard returned []. A QUOTED body is
+    // consumed by the loop below and never reaches this join, which is exactly the
+    // distinction bash makes for a quoted delimiter (that body is literal). An UNQUOTED
+    // body IS joined — by the same predicate, inside the body walk — because bash
+    // expands it and matches the terminator against the expanded text (L60).
     let line = lines[li];
     let lastLine = li;
     // Where each joined line BEGINS inside `line` (after its predecessor's continuation
@@ -1001,7 +1050,7 @@ export function splitShellStdin(command: string): ShellStdin {
     }
     const re = /<<(-?)\s*(\S+)/g;
     let m: RegExpExecArray | null;
-    const pending: { word: string; offset: number; stripTabs: boolean }[] = [];
+    const pending: { word: string; offset: number; stripTabs: boolean; quoted: boolean }[] = [];
     while ((m = re.exec(line)) !== null) {
       // ⛔ A `<<` THAT IS PART OF `<<<` IS A HERE-STRING, not a heredoc: otherwise
       //    `bash <<<EOF` opened a heredoc with delimiter `EOF` and swallowed the
@@ -1013,7 +1062,12 @@ export function splitShellStdin(command: string): ShellStdin {
       if (cut !== -1 && m.index > cut) continue;
       const word = heredocDelimiter(m[2]);
       if (word === null) continue; // `<<<` and a bare `<<` with no usable word
-      pending.push({ word, offset: m.index, stripTabs: m[1] === "-" });
+      pending.push({
+        word,
+        offset: m.index,
+        stripTabs: m[1] === "-",
+        quoted: heredocDelimiterIsQuoted(m[2]),
+      });
     }
     if (pending.length === 0) continue;
     // ⛔ A LINE CAN OPEN SEVERAL HEREDOCS, AND THE BODIES ARRIVE IN ORDER (round-12
@@ -1026,12 +1080,33 @@ export function splitShellStdin(command: string): ShellStdin {
     let j = lastLine + 1;
     for (const p of pending) {
       const body: string[] = [];
-      while (j < lines.length && lines[j].replace(/^\t+/, "") !== p.word) {
-        out.push("");
+      while (j < lines.length) {
         // `<<-` strips leading TABS from the body at execution time, so the program
         // the shell runs is the tab-stripped text — not the source bytes.
-        body.push(p.stripTabs ? lines[j].replace(/^\t+/, "") : lines[j]);
-        j++;
+        const tabfree = (k: number) => (p.stripTabs ? lines[k].replace(/^\t+/, "") : lines[k]);
+        // ⛔ AN UNQUOTED DELIMITER MAKES THIS A DIFFERENT DOCUMENT (round-12 review,
+        // twelfth pass, P0). bash removes `\` + newline and collapses `\\`, `\$` and
+        // `\`` before the shell ever sees the body — and the TERMINATOR IS MATCHED
+        // AGAINST THAT TEXT: `EO\` + newline + `F` ends the here-document (measured),
+        // which the raw comparison did not see, so the whole rest of the command —
+        // including a launch bash runs — was swallowed as body. A QUOTED delimiter is
+        // literal and is matched raw, terminator included (L54).
+        let text = tabfree(j);
+        let end = j;
+        if (!p.quoted) {
+          for (;;) {
+            const nx = end + 1;
+            if (nx >= lines.length) break;
+            const joined = joinContinuedLine(text, tabfree(nx));
+            if (joined === null) break;
+            text = joined;
+            end = nx;
+          }
+        }
+        if (text === p.word) break; // the terminator
+        for (let k = j; k <= end; k++) out.push("");
+        body.push(p.quoted ? text : unquoteHeredocBackslashes(text));
+        j = end + 1;
       }
       if (body.length > 0 && lineFeedsShell(line, cut, p.offset)) {
         programs.push(body.join("\n"));

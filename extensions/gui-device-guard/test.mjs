@@ -721,6 +721,22 @@ const ROWS = [
   //        (`<<EOF` with no command discards its body; measured).
   ["A78 the ALLOW twin: `<<EOF` with no command discards its body, even after a join seam",
     "echo \"a \\\n\"<<EOF\nnpm exec electron .\nEOF", 0, null, false],
+  // ── L60/A79/A80 (round-12 review, TWELFTH pass) — an UNQUOTED heredoc is a DIFFERENT
+  //     document from the source bytes: bash removes `\` + newline and collapses
+  //     `\\`, `\$`, `` \` ``, and it matches the TERMINATOR against that text.
+  //   L60: `EO\` + newline + `F` ends the here-document (measured), so the launch after
+  //        it RUNS — the raw comparison saw no terminator and swallowed it as body.
+  ["L60 an UNQUOTED heredoc terminator spelled across a continuation still ends it (was [])",
+    "cat <<EOF\nbody\nEO\\\nF\nnpm exec electron .", 1, "electron", true],
+  //   A80: the QUOTED twin is literal — the `EO\`+`F` pair is NOT the terminator, so the
+  //        launch stays inside the (discarded) body and nothing runs.
+  ["A80 the ALLOW twin: a QUOTED heredoc body is literal, so `EO\\`+`F` is not its terminator",
+    "cat <<'EOF'\nbody\nEO\\\nF\nnpm exec electron .\nEOF", 0, null, false],
+  //   A79: the consuming shell receives the EXPANDED body, where `\\` has already become
+  //        `\` — so its own continuation join makes `electron .` an `echo` argument.
+  //        Classifying the raw body instead OVER-blocked (measured).
+  ["A79 the ALLOW twin: an unquoted body's `\\\\` collapses to `\\`, so the inner shell joins",
+    "sh <<EOF\necho a \\\\\nelectron .\nEOF", 0, null, false],
   //   L30c: tab completion appends a slash to directories, and `open
   //         ./Build/DMeer.app/` — the incident's own app — matched none of the three
   //         bundle tests while the `-a` spelling of the SAME token was refused.
