@@ -850,7 +850,7 @@ echo "    scripts fleet farm: $fleet_copied copied (fleet cadence, #373 + runner
 # — the same sibling contract and the same `lib/` → `$DEST/scripts/lib/` layout as the seven above.
 # Farming the wrapper WITHOUT this reader is a machine-wide unit that refuses every pass with a named
 # farm gap (see the wrapper's header), so the pair is delivered together.
-lib_srcs=(pid-identity.sh diff-normalize.py beat-pair.sh bounded.sh transcript-patterns.sh live-paths.sh cmux_payload.py repo-set.sh)
+lib_srcs=(pid-identity.sh diff-normalize.py beat-pair.sh bounded.sh transcript-patterns.sh live-paths.sh cmux_payload.py repo-set.sh cmux-dispatch-path.sh)
 mkdir -p "$DEST/scripts/lib"
 lib_copied=0
 lib_failed=0
