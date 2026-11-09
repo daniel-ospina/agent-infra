@@ -48,15 +48,30 @@ echo "==> harness-provenance self-test ($HERE)"
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/harness-prov.XXXXXX")"; trap 'rm -rf "$TMP"' EXIT
 G="git -c user.email=t@t -c user.name=t -c commit.gpgsign=false"
 
-# ── the fixture harness SOURCE: the five anchors deploy-harness.sh demands, plus the record tools ──
+# ── the fixture harness SOURCE: the SIX anchors deploy-harness.sh demands, plus the record tools ──
+# ⛔ THE FIXTURE MUST TRACK THE SHIPPED ANCHOR LIST (#3613). `gh-cred.py` was added to
+# `deploy-harness.sh`'s anchor loop and to NEITHER fixture, so 22 arms below went red for a reason none
+# of them named — every one of them printed only "refusing to deploy a directory that is not the
+# harness". The two arms after the chmod DERIVE the list from the shipped script instead of restating
+# it, so the next anchor addition is ONE red that names the file to add, not 22 that blame the deploy.
 SRC="$TMP/src"; mkdir -p "$SRC/gh-rest" "$SRC/gh-limit"
 printf '#!/usr/bin/env bash\necho loop\n'    > "$SRC/orch-loop.sh"
 printf '#!/usr/bin/env bash\necho claims\n'  > "$SRC/claims.sh"
 printf '#!/usr/bin/env python3\nprint(1)\n'  > "$SRC/gh-limit.py"
+printf '#!/usr/bin/env python3\nprint("cred")\n' > "$SRC/gh-cred.py"
 printf '#!/usr/bin/env bash\necho gh\n'      > "$SRC/gh-rest/gh"
 printf '#!/usr/bin/env bash\necho ghlimit\n' > "$SRC/gh-limit/gh"
 cp "$PROV" "$SRC/harness-provenance.sh"
-chmod +x "$SRC"/*.sh "$SRC/gh-rest/gh" "$SRC/gh-limit/gh"
+chmod +x "$SRC"/*.sh "$SRC"/*.py "$SRC/gh-rest/gh" "$SRC/gh-limit/gh"
+
+# ── the fixture really carries every anchor the SHIPPED deploy demands (derived, not enumerated) ──
+ANCHORS="$(sed -n 's/^for anchor in \(.*\); do$/\1/p' "$DEPLOY" | head -1)"
+ck "the shipped deploy's anchor list is READ from the script, not restated here" \
+   "$([ -n "$ANCHORS" ] && echo 0 || echo 1)"
+ANCHORS_MISSING=""
+for _anchor in $ANCHORS; do [ -f "$SRC/$_anchor" ] || ANCHORS_MISSING="$ANCHORS_MISSING $_anchor"; done
+ck "the fixture source carries EVERY anchor deploy-harness.sh demands (missing:${ANCHORS_MISSING:- none})" \
+   "$([ -z "$ANCHORS_MISSING" ] && echo 0 || echo 1)"
 
 O="$TMP/O"; mkdir -p "$O"
 # A record describes bytes that ARE there — so seed $O from the source first, exactly as a deploy

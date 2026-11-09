@@ -5441,17 +5441,34 @@ if need "$TMP/lockblock.sh" "the lock+trap block is extracted from the shipped o
   # next start (the SIGKILL/reboot path), while one held by a LIVE pid is refused. Without the
   # negative control, "reclaimed" and "silently overwritten" would be the same test. Deliberately
   # LAST in this section: the live-pid case intentionally leaves a lock in place.
-  { echo 'set -u'; echo "O='$LK'"; cat "$TMP/lockblock.sh"; echo 'echo ACQUIRED'; } > "$LK/acquire.sh"
+  # ⛔ `LOG` IS SUPPLIED, AND THE LIVE-OWNER FIXTURE IS LOOP-SHAPED (fresh review of agent-infra#1985,
+  # P2). Two separate premises changed with #1985: the block now LOGS a reclaim (`selftest.sh` runs it
+  # under `set -u`, so an absent `LOG` aborted the shell — a red arm here and a VACUOUSLY green one
+  # below), and a live pid is no longer enough to be the owner — `$$` is this SUITE's shell, not an
+  # `orch-loop.sh` invocation, which the loop now reclaims BY DESIGN. So the negative control uses a
+  # real loop-shaped process (`bash <dir>/orch-loop.sh`), which is the shape every shipped launcher
+  # produces, and it is spawned BEFORE the lock is written (the real write order).
+  mkdir -p "$LK/logs"
+  { echo 'set -u'; echo "O='$LK'"; echo "LOG='$LK/logs/orch-loop.log'"; cat "$TMP/lockblock.sh"; echo 'echo ACQUIRED'; } > "$LK/acquire.sh"
   bash -n "$LK/acquire.sh" && rc=0 || rc=1
   ck "the stale-lock driver parses" $rc
   printf '999999\n' > "$LK/.orch.lock"
   out="$(bash "$LK/acquire.sh" 2>&1)"
   case "$out" in *ACQUIRED*) rc=0;; *) rc=1; echo "      got '$out'";; esac
   ck "a stale lock (dead pid) is reclaimed by the next start" $rc
-  printf '%s\n' "$$" > "$LK/.orch.lock"
+  # ⛔ THE STUB IS SELF-BOUNDED (60s), because it is a process literally named `orch-loop.sh` and this
+  # repo's arms read the process table by that shape: if this suite is killed between the spawn and the
+  # `kill -9` below, an unbounded stub would still be running when a LATER arm pgrep's for a controller
+  # — a leak that reads as a live owner. 60s is far longer than the 0.4s the assertion needs.
+  printf '#!/bin/bash\ntrap "exit 0" TERM INT\nfor _ in $(seq 1 60); do sleep 1; done\n' > "$LK/orch-loop.sh"
+  chmod +x "$LK/orch-loop.sh"
+  bash "$LK/orch-loop.sh" >/dev/null 2>&1 & owner=$!
+  sleep 0.4                                   # the lock is written AFTER the owner exists (real order)
+  printf '%s\n' "$owner" > "$LK/.orch.lock"
   out="$(bash "$LK/acquire.sh" 2>&1)"
   case "$out" in *ACQUIRED*) rc=1; echo "      a live lock was stolen";; *) rc=0;; esac
-  ck "a lock held by a LIVE pid is NOT stolen (reclamation is not a silent overwrite)" $rc
+  ck "a lock held by a LIVE LOOP-SHAPED owner is NOT stolen (reclamation is not a silent overwrite)" $rc
+  kill -9 "$owner" 2>/dev/null
 fi
 
 # ── 20) the port-drift check detects that the tortoise source moved (#1712) ──────

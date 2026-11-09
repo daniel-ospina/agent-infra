@@ -2082,14 +2082,262 @@ case "${1:-}" in
 esac
 # [refresh-check:end]
 
+# [orchlock:begin]
 LOCKF="$O/.orch.lock"
+# ⛔ LIVENESS IS NOT IDENTITY (agent-infra#1985). The reclaim below used to be `kill -0 "$OPID"` and
+# nothing else, and that is BROKEN whenever a controller dies without its EXIT trap running (kill -9,
+# an OOM kill, a panic): the lock then names a pid the OS will recycle, so the next controller exits
+# `already running (pid N)` over a REUSED pid, the box dispatches nothing, and its own recovery is
+# blocked — launching a controller cannot fix a lock the controller itself refuses. Measured on a live
+# box: the watchdog saw the named pid alive, `ps -p <pid> -o command=` showed a process that was not
+# the controller, and the reload failed on every pass (`RECOVERY FAILED`, rc 1, three passes).
+#
+# ⛔ THE RULE IS THE FLEET'S ONE PROCESS-IDENTITY RULE (#1178), NOT A NEW ONE. A lock owner is
+#   (a) ALIVE, (b) an `orch-loop.sh` INVOCATION (argv shape — `registry_pid_is_controller`), and
+#   (c) a process that did NOT begin after the lock was written.
+# (c) is the discriminator for a recycled pid: the writer held that pid until it died, so any process
+# now holding the pid BEGAN AFTER the writer wrote the lock. It is the same `pid_began_after` fence
+# `orchestrator-bringup.sh:lock_pid` applies to this very file, and the same one the supervisor, the
+# registry and the installer apply (#1856: one predicate, one answer).
+#
+# ⛔ WHAT THE VERDICT MAY DO. Only POSITIVE evidence of non-ownership reclaims — absent, or not an
+# orch-loop.sh, or provably begun after the lock. A pid we cannot date is NOT reclaimed: reclaiming on
+# an unreadable read is how two controllers end up sweeping one PR queue (#1715), which is worse than
+# a stopped box. That case refuses (as before) and now says so LOUDLY, naming the remedy — the #1985
+# defect was that the refusal was one silent line in the log.
+#
+# ⛔ PINNED MIRRORS, NOT A SOURCE. `$O` is a FLAT seed (`deploy-harness.sh` copies
+# `orchestrator-harness/*`), so it has no `scripts/lib/` to source — the same constraint
+# `harness-refresh.sh:_began_before_lock` and `cloud-cell-supervisor.sh` document for their copies.
+# `orch-loop-lock.test.sh` pins both bodies and the slack to the canonical declarations, so drift
+# reddens CI instead of becoming a wrong reclaim.
+ORCH_LOCK_START_SLACK_SECONDS="${ORCH_LOCK_START_SLACK_SECONDS:-5}"
+# ⛔ VALIDATED BEFORE IT REACHES ARITHMETIC, BECAUSE AN UNVALIDATED READ FAILS OPEN — AND HERE THE
+# OPEN DIRECTION IS THE DESTRUCTIVE ONE. This seam is the ONLY input to the reclaim decision that comes
+# from the environment, and `$(( lt + … ))` below is evaluated inside a `set -u` shell. MEASURED on the
+# extracted block (a LIVE, loop-shaped owner in the lock, the exact `OWNER` case):
+#   unset → `already running (pid N)` (refused, correct)
+#   `1.5` → "syntax error: invalid arithmetic operator" → the ENCLOSING `if ! acq` COMPOUND IS ABORTED,
+#           so the block neither refuses nor reclaims: the newcomer prints STARTED with NO lock of its
+#           own while the LIVE owner's lock stays on disk — and its EXIT trap then deletes THAT lock
+#           (two controllers on one PR queue, #1715, plus a third-party deletion of a live lock).
+#           ⛔ THAT WAS THE PRE-FIX BEHAVIOUR of a fault inside the verdict; the containment for the
+#           NEXT one is the subshell transport at the verdict's call site (see its comment) — this
+#           validation stays the FIRST line because it stops that fault happening at all.
+#   `abc` → "unbound variable" → the controller DIES at the lock check naming neither the variable nor
+#           the remedy (the cryptic-stop class #1985 exists to end)
+#   `08`  → "value too great for base" — ⛔ ALL-DIGITS AND STILL FATAL: bash reads a leading zero as
+#           OCTAL, so a digits-only guard is NOT enough (`10#`, or the textual strip below, is)
+# The fleet's own copy of this same fence validates the same seam and documents the same reason
+# (scripts/lib/fleet-inventory.sh:_fleet_lock_owner). Fail to the documented default instead.
+case "$ORCH_LOCK_START_SLACK_SECONDS" in ''|*[!0-9]*) ORCH_LOCK_START_SLACK_SECONDS=5 ;; esac
+# ⛔ LEADING ZEROS STRIPPED TEXTUALLY, never normalised through `$(( ))`: `08` is all-digits and an
+# OCTAL ERROR in arithmetic (measured above), so the strip is what closes that half of the class.
+# ⛔ WHAT THIS STRIP DOES, EXACTLY — it NORMALISES, it does not REJECT (fresh review of #1985, P3;
+# MEASURED on this block, 11 values): `08` becomes **8** and `007` becomes **7**, and BOTH are KEPT,
+# because both are inside the bound below. The fallback to the documented 5 s covers only a value that
+# is NOT all-digits (`1.5`, `abc`, empty) or is wider than 60; an all-digit value with leading zeros is
+# neither, and no arm observes the resulting value unless §14's value rows run.
+while [ "${#ORCH_LOCK_START_SLACK_SECONDS}" -gt 1 ] \
+      && [ "${ORCH_LOCK_START_SLACK_SECONDS#0}" != "$ORCH_LOCK_START_SLACK_SECONDS" ]; do
+  ORCH_LOCK_START_SLACK_SECONDS="${ORCH_LOCK_START_SLACK_SECONDS#0}"
+ done
+# A slack wider than the fence itself is not a setting, it is a defeat of the fence; the length test
+# comes FIRST so an absurd value is capped instead of reaching `[ -le ]` as an "integer expression
+# expected" error. Same bound as fleet-inventory.sh's copy of this fence.
+{ [ "${#ORCH_LOCK_START_SLACK_SECONDS}" -le 2 ] && [ "$ORCH_LOCK_START_SLACK_SECONDS" -le 60 ]; } \
+  || ORCH_LOCK_START_SLACK_SECONDS=5
+# The one literal this block needs for field parsing: `awk` separates the `stat` column from the argv
+# with a TAB, and the reassembled argv contains no TAB by construction (awk's fields split on whitespace).
+TAB="$(printf '\t')"
+# _orch_ps_start_epoch <pid> — when the process began, from `ps -o etime=` (one shape on BSD and GNU).
+# rc 1 when it cannot be read. PINNED MIRROR of `pid_start_epoch` in scripts/lib/pid-identity.sh.
+# ⛔ `10#`, NOT a bare `$(( ))`: etime ZERO-PADS, and bash reads a leading zero as OCTAL, so
+# `$((08 * 3600))` is an ERROR — which read as "cannot date it" for a few percent of live reads (#1856).
+_orch_ps_start_epoch() {
+  local p="${1:-}" e d h m s r
+  case "$p" in ''|*[!0-9]*) return 1 ;; esac
+  e="$("${PS_BIN:-/bin/ps}" -o etime= -p "$p" 2>/dev/null | tr -d '[:space:]')" || return 1
+  [ -n "$e" ] || return 1
+  d=0
+  case "$e" in *-*) d="${e%%-*}"; r="${e#*-}" ;; *) r="$e" ;; esac
+  case "$d" in ''|*[!0-9]*) return 1 ;; esac
+  case "$r" in
+    *:*:*) h="${r%%:*}"; r="${r#*:}"; m="${r%%:*}"; s="${r##*:}" ;;
+    *:*)   h=0;                 m="${r%%:*}"; s="${r##*:}" ;;
+    *) return 1 ;;
+  esac
+  case "$h$m$s" in ''|*[!0-9]*) return 1 ;; esac
+  h=$((10#${h:-0})); m=$((10#${m:-0})); s=$((10#${s:-0})); d=$((10#${d:-0}))
+  printf '%s\n' "$(( $(date +%s) - (d * 86400 + h * 3600 + m * 60 + s) ))"
+}
+# _orch_lock_probe <pid> — ONE process read, THREE outcomes, because HERE "cannot read" must never be
+# minted into "provably not the owner": the caller answers that verdict by DELETING the lock, so a false
+# negative is two controllers on one state dir (#1715). ⛔ THE DIRECTION IS INVERTED FROM THE SAME
+# PREDICATE'S REPORTING HOMES (`registry_pid_is_controller`, `lock_pid`, `argv_is_orch_loop`), where a
+# false negative only degrades a row to STOPPED — which is why the read/absence arms are NOT mirrored
+# verbatim and carry their own three outcomes (fresh review of #1985, P1).
+#   rc 0  PRESENT  stdout IS the argv, read from a table that provably ran
+#   rc 1  ABSENT   the read RAN and produced a table; the pid is not in it (and we cannot even signal
+#                  it), so the lock outlived its writer
+#   rc 2  UNKNOWN  the read failed, the table was empty, the pid is alive outside the table we could
+#                  read, or its argv could not be had — NEVER reclaim on this
+_orch_lock_probe() {
+  local p="${1:-}" t row stat cmd
+  case "$p" in ''|*[!0-9]*) return 1 ;; esac
+  # ⛔ `-ww`, BECAUSE `COLUMNS` OVERRIDES THE SAFE DEFAULT (#2926). A command substitution is not a
+  # tty, so this read would normally be width-independent — but `ps(1)` checks `COLUMNS` FIRST, and an
+  # exported COLUMNS TRUNCATES the command column. The path token is the LAST thing on the line, so it
+  # is cut mid-name, `${2##*/}` stops equalling `orch-loop.sh`, and the verdict becomes "PROVABLY NOT
+  # the owner" over a LIVE owner whose lock is then deleted — the worst direction of the eight reads
+  # #2926 tracks. `-ww` is unlimited on procps and "at least 131 columns" on BSD ps, so it raises the
+  # ceiling and never lowers it; it cannot narrow an already-unlimited read. Witnessed by
+  # `orch-loop-lock.test.sh` §11, which re-drives the refusal arms under `COLUMNS=20`.
+  t="$("${PS_BIN:-/bin/ps}" -ww -axo pid=,stat=,command= 2>/dev/null)" || return 2
+  # ⛔ AN EMPTY TABLE IS UNREADABLE, NOT EMPTY: the probing process itself appears in any real table,
+  # so a read that "succeeds" and prints nothing never witnesses absence (#1178 C3).
+  case "$t" in *[![:space:]]*) ;; *) return 2 ;; esac
+  row="$(printf '%s\n' "$t" | awk -v p="$p" '$1 == p { c = ""; for (i = 3; i <= NF; i++) c = (c == "" ? $i : c " " $i); print $2 "\t" c; exit }')"
+  if [ -z "$row" ]; then
+    # Not in a table we COULD read. Corroborate with `kill -0`: a pid we can signal is ALIVE, so the
+    # absence belongs to the read, not to the process → UNKNOWN. Otherwise it is positively gone.
+    kill -0 "$p" 2>/dev/null && return 2
+    return 1
+  fi
+  stat="${row%%"$TAB"*}"
+  case "$stat" in Z*) return 1 ;; esac          # a zombie cannot hold a lock — its EXIT trap has run
+  cmd="${row#*"$TAB"}"
+  [ -n "$cmd" ] || return 2                     # present, but its argv is unreadable → UNKNOWN
+  printf '%s\n' "$cmd"
+  return 0
+}
+# _orch_argv_is_loop <argv…> — 0 only when the INVOCATION is an orch-loop.sh.
+# ⛔ THE TWO TOKEN RULES ARE A PINNED MIRROR of `registry_pid_is_controller` in
+# scripts/lib/orchestrator-registry.sh: `${1##*/}` must be a shell and `${2##*/}` must be exactly
+# `orch-loop.sh`. A looser ANY-token match (`/?*orch-loop.sh`) accepted `bash -c "sleep 300; /abs/orch-
+# loop.sh"` — a non-controller — and a caller that merely MENTIONS the path (an editor, a grep) is not a
+# controller either (#1856 review). `orch-loop-lock.test.sh` pins these two rules to the canonical
+# declaration; only the READ arms above are deliberately different (see their header).
+# ⚠ THE CANONICAL'S ONE DOCUMENTED BLIND SPOT IS INHERITED HERE AND IS NOT FIXED BY THESE RULES:
+# `orchestrator-registry.sh` records "NOT handled on purpose: a state dir containing a space" — `set --
+# $*` word-splits, so such a path arrives as two tokens. A future reader who relaxes `safe_argv`
+# upstream must know this copy inherits the same caveat rather than silently diverging.
+_orch_argv_is_loop() { # shellcheck disable=SC2086
+  set -- $*
+  [ "$#" -ge 2 ] || return 1
+  case "${1##*/}" in bash|sh|dash|zsh) ;; *) return 1 ;; esac
+  case "${2##*/}" in orch-loop.sh) return 0 ;; esac
+  return 1
+}
+# _orch_argv_is_loop_flagged <argv…> — 0 when a shell is invoked WITH AN OPTION in front of an
+# `orch-loop.sh` (`bash -x /abs/orch-loop.sh`), i.e. a controller-shaped argv the two-token rule above
+# cannot ATTRIBUTE. Deliberately OUTSIDE that function: its body is a pinned mirror of
+# `orchestrator-registry.sh:registry_pid_is_controller` (the suite pins both the five-line body and the
+# `set --` tail), and this rule is the loop's OWN, because only the loop answers "not the owner" by
+# DELETING a lock.
+# ⛔ WHY IT EXISTS (fresh review of PR #3837 at 185e7c5bd, P2; MEASURED): `bash -x …/orch-loop.sh` failed
+# the two-token rule and was minted into rc 1 = PROVABLY NOT THE OWNER, so the next start printed
+# `STARTED`, logged `[lock] reclaiming …`, and the owner was STILL ALIVE — a second controller on one PR
+# queue (#1715), from an argv we READ but could not attribute. An argv that was read and could not be
+# attributed is `CANNOT-TELL`, never proof of non-ownership; the caller refuses and names it.
+# ⛔ `-c` IS NOT THIS CASE, AND THAT IS A RECORDED DECISION, NOT AN OVERSIGHT: #1856 established that
+# `bash -c "sleep 300; /abs/orch-loop.sh"` is a WRAPPER's argv rather than a controller (accepting it was
+# the loose any-token arm that failed open), and `orch-loop-lock.test.sh` arm 4c asserts such a pid is
+# RECLAIMED. So the `-c`/`--command` forms return 1 here and keep that behaviour, and only the option
+# forms no decision reaches (`-x`, `-e`, `--posix`, …) are deferred to a human as ambiguous.
+_orch_argv_is_loop_flagged() { # shellcheck disable=SC2086
+  local _t
+  set -- $*
+  [ "$#" -ge 3 ] || return 1
+  case "${1##*/}" in bash|sh|dash|zsh) ;; *) return 1 ;; esac
+  case "$2" in -c|--command|-[!-]*c*) return 1 ;; esac    # #1856: a `-c` wrapper is not a controller
+  case "$2" in -*) ;; *) return 1 ;; esac                 # token 2 must be a shell OPTION
+  for _t in "$@"; do
+    case "${_t##*/}" in orch-loop.sh) return 0 ;; esac
+  done
+  return 1
+}
+# _orch_lock_verdict <pid> <lockfile> -> 0 OWNER · 1 PROVABLY NOT the owner · 2 CANNOT TELL
+# Sets ORCH_LOCK_WHY (only on rc 2) to the read that failed, so the refusal names WHICH datum is missing
+# instead of asserting a fact about a process it could not read (fresh review of #1985, P1).
+# ⛔ THREE OUTCOMES, AND 2 IS NOT 1. Folding "cannot read it" into 1 would reclaim a lock whose live
+# owner it simply could not read (two controllers, #1715); folding it into 0 would keep the #1985 silent
+# stop. The caller refuses on 2, loudly, with the remedy named.
+ORCH_LOCK_WHY=""
+_orch_lock_verdict() {
+  local p="${1:-}" lf="${2:-}" lt pstart cmd
+  ORCH_LOCK_WHY=""
+  case "$p" in ''|*[!0-9]*) return 1 ;; esac
+  # ⛔ ONLY PID 0 IS EXCLUDED NUMERICALLY. `kill -0 0` targets OUR OWN PROCESS GROUP, so 0 can never
+  # be a lock owner — but pid 1 is a normal answer in a container whose entrypoint IS the loop, and
+  # the shape arm answers it correctly either way (init is not `<shell> <…/orch-loop.sh>`). Treating 1
+  # as "provably not the owner" was a THIRD reclaim reason the design does not sanction, and a
+  # numeric assumption is not positive evidence (fresh review of #1985, P2).
+  [ "$p" -gt 0 ] || return 1
+  cmd="$(_orch_lock_probe "$p")"; case $? in
+    0) ;;                                         # present, argv read
+    1) return 1 ;;                                # positively absent — the lock outlived its writer
+    *) ORCH_LOCK_WHY="the process table or that pid's argv cannot be read"; return 2 ;;
+  esac
+  # ⛔ AN ARGV WE READ BUT COULD NOT ATTRIBUTE IS NOT PROOF OF NON-OWNERSHIP. `_orch_argv_is_loop` answers
+  # "is this the canonical shape"; a controller started with a shell OPTION (`bash -x …/orch-loop.sh`) is
+  # neither that shape nor provably a non-controller, so it is deferred to a human as CANNOT-TELL rather
+  # than reclaimed out from under a live owner (#1715). Everything the shape rule DOES attribute as a
+  # non-controller (a `sleep`, a `-c` wrapper — #1856) still reclaims on rc 1 below, unchanged.
+  _orch_argv_is_loop "$cmd" || {
+    if _orch_argv_is_loop_flagged "$cmd"; then
+      ORCH_LOCK_WHY="that pid's argv is a SHELL INVOCATION of orch-loop.sh carrying an option the ownership rule cannot attribute"; return 2
+    fi
+    return 1                                      # argv READ, and it is not an orch-loop.sh
+  }
+  lt="$(date -r "$lf" +%s 2>/dev/null)" || { ORCH_LOCK_WHY="the lock file's own timestamp cannot be read"; return 2; }
+  case "$lt" in ''|*[!0-9]*) ORCH_LOCK_WHY="the lock file's own timestamp cannot be read"; return 2 ;; esac
+  pstart="$(_orch_ps_start_epoch "$p")" || { ORCH_LOCK_WHY="that pid's START TIME cannot be read"; return 2; }
+  [ "$pstart" -gt "$(( lt + ORCH_LOCK_START_SLACK_SECONDS ))" ] && return 1   # began AFTER the lock
+  return 0
+}
 acq() { ( set -o noclobber; echo $$ > "$LOCKF" ) 2>/dev/null; }
 if ! acq; then
-  OPID="$(cat "$LOCKF" 2>/dev/null || echo 0)"
-  if [ "${OPID:-0}" -gt 0 ] && kill -0 "$OPID" 2>/dev/null; then echo "[orch-loop] already running (pid $OPID)"; exit 0; fi
+  # Digits only, like `orchestrator-bringup.sh:lock_pid`: a lock carrying `abc` reached `[ abc -gt 0 ]`
+  # — an ERRORED test, which is FALSE, which reclaimed it — so the read is sanitised before any test.
+  OPID="$(tr -dc '0-9' 2>/dev/null < "$LOCKF")"
+  # ⛔ THE VERDICT RUNS IN A SUBSHELL AND TRANSPORTS ITS ANSWER THROUGH STDOUT — A STATEMENT SPLIT DOES
+  # NOT CONTAIN ANYTHING (fresh review of #1985, P3; MEASURED, both shapes). `v; _OV=$?` and `v`⏎`_OV=$?`
+  # are the SAME AND-OR list, so a bash ARITHMETIC fault inside the verdict does not stop at the
+  # verdict — it aborts the whole `if ! acq` compound (no refusal, no CANNOT-TELL, no reclaim log, no
+  # `rm`) and execution then continues PAST it: the newcomer prints STARTED with NO lock of its own
+  # while the live owner's lock stays on disk, and its EXIT trap later deletes THAT lock (#1715).
+  # ⛔ A PLAIN `( verdict ); _OV=$?` CONTAINS THE FAULT BUT IS NOT A FIX: it mints rc **1**, which is
+  # the RECLAIM answer — the destructive direction (MEASURED). So the verdict reports its rc AND its
+  # reason on stdout from inside the subshell, and a substitution that produced NO result (the fault
+  # aborted it) is mapped to 2 = CANNOT-TELL, which refuses LOUDLY. The input validation above stays
+  # the FIRST line of defence; this is the containment for a fault it cannot know about, which is the
+  # shape the slack fault arrived in.
+  _OVR="$( _orch_lock_verdict "${OPID:-0}" "$LOCKF"; printf '%s\t%s' "$?" "${ORCH_LOCK_WHY:-}" )"
+  _OV="${_OVR%%"$TAB"*}"
+  ORCH_LOCK_WHY="${_OVR#*"$TAB"}"
+  case "${_OV:-}" in
+    0|1|2) ;;
+    *) _OV=2
+       [ -n "${_OVR:-}" ] || ORCH_LOCK_WHY="the ownership verdict itself faulted: it produced NO result, so nothing about the owner was established" ;;
+  esac
+  if [ "$_OV" = 0 ]; then echo "[orch-loop] already running (pid $OPID)"; exit 0; fi
+  if [ "$_OV" = 2 ]; then
+    _MSG="[orch-loop] CANNOT-TELL: lock $LOCKF names pid ${OPID:-none} and ${ORCH_LOCK_WHY:-the owner cannot be identified}, so a RECYCLED pid cannot be ruled out — a second controller is refused (agent-infra#1715). If no controller is running: rm -f $LOCKF (agent-infra#1985)"
+    echo "$_MSG" >&2
+    # ⛔ `${LOG:-/dev/null}`, NOT `$LOG`: this block is EXTRACTED and driven by consumers that supply
+    # only `O` (`selftest.sh` §20 runs it under `set -u`), where an unbound `$LOG` ABORTS the shell
+    # before the reclaim — a red shard AND a vacuously green refusal arm (fresh review of #1985, P2).
+    echo "[lock] CANNOT-TELL — $_MSG" >> "${LOG:-/dev/null}" 2>/dev/null || true
+    exit 0
+  fi
+  # Positive evidence only: absent, not an orch-loop.sh, or provably begun AFTER the lock. Logged,
+  # because a silent reclaim is the other half of the #1715 class (it must never be invisible).
+  echo "[lock] reclaiming $LOCKF — pid ${OPID:-none} is provably NOT the owner (absent, not an orch-loop.sh invocation, or begun after the lock was written)" >> "${LOG:-/dev/null}" 2>/dev/null || true
   rm -f "$LOCKF"
   acq || { echo "[orch-loop] lock race — exiting"; exit 0; }
 fi
+# [orchlock:end]
 # ⛔ THE SIGNAL HANDLERS ONLY TERMINATE — THE LOCK IS RELEASED BY THE `EXIT` TRAP ALONE.
 # Was `trap 'rm -f "$LOCKF"' EXIT INT TERM`, and for INT/TERM a handler that RETURNS does NOT
 # terminate: bash RESUMES the interrupted command loop, so the documented stop path
