@@ -2974,15 +2974,26 @@ _clean() { rm -f "$RS"/state/needsfix-* "$RS"/state/needsreview-* "$RS"/state/pa
   # P2). The first form re-typed the pattern here, so reverting merge-one.sh's expression left the
   # whole suite green: a pin over a COPY, the exact false PASS the round-8 finding was about. This
   # evaluates the producer's own `LAST=` line, so the two cannot drift apart again.
-  if grep -q '^LAST="$(grep -aE' "$MERGE"; then
+  # ⛔ THE EXTRACTOR'S SHAPE MOVED AND THIS PIN DID NOT FOLLOW IT (round-26 review of #2132 replaced
+  # `LAST="$(grep -aE …)"` with a BUILTIN `while read` loop, so a shimmed grep/tail cannot fabricate a
+  # verdict). This pin still grepped for the OLD expression, and its `else` arm returned an EMPTY
+  # string — so all six rows below read `expected […], got []` on a tree whose extractor is correct.
+  # That is a red which names nothing, and it sat on `main` for two merges: `main`'s `bash-suites` was
+  # red (499 passed, 6 failed) for a reason no PR caused. The block is now located by its ANCHORS and
+  # EVALUATED, so this still drives the producer's OWN code (never a re-typed copy) and a future shape
+  # change fails the locatability row below — loudly, once — instead of the six after it.
+  _last_src="$(sed -n '/^LAST=""$/,/^done < "\$L\.log"$/p' "$MERGE" 2>/dev/null)"
+  if [ -n "$_last_src" ]; then
     _last_of() {
       ( L="$TMP/extract"; printf '%s\n' "$1" > "$TMP/extract.log"
-        eval "$(grep -m1 '^LAST="$(grep -aE' "$MERGE")"
+        eval "$_last_src"
         printf '%s' "${LAST:-}" )
     }
   else
     _last_of() { printf '%s' ''; }
   fi
+  eqv "the shipped verdict extractor is LOCATABLE in merge-one.sh (this pin reads code, not nothing)" \
+      "located" "$( [ -n "$_last_src" ] && printf located || printf MISSING )"
   eqv "the shipped verdict extractor accepts ISSUES 3" "ISSUES 3" "$(_last_of 'ISSUES 3')"
   eqv "…accepts ISSUES: 3" "ISSUES: 3" "$(_last_of 'ISSUES: 3')"
   eqv "…accepts ISSUES - 2" "ISSUES - 2" "$(_last_of 'ISSUES - 2')"
