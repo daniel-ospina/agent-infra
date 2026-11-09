@@ -1458,7 +1458,10 @@ head_with_comment_between()
 #     ⛔ AND THE BARE-WORD GUARD BELOW IS WHAT MOVED THIS MUTANT'S DELTA, so an anchor figure measured before
 #     it landed is not comparable: with the bare-word guard REVERTED, the SAME anchor mutant invents 261
 #     distinct names across 125 of these 438 files (132 ordered scans move; 7 more change only by a DUPLICATE
-#     report of a name the file already had), and it DOES change the fixture scan (25 -> 26 names), so it reds `f11f-0`.
+#     report of a name the file already had), and it DOES change the fixture scan — 24 -> 26 names, GAINING
+#     `bare_word_then_brace` and `build_it` — so it reds `f11f-0`. ⛔ THE LEFT NUMBER IS 24, NOT 25: the
+#     before-guard base it was first measured on carried one more fixture name than this head does, which is
+#     the same stale-base trap the paragraph above describes. Names, not counts, are what survive a head.
 #     The anchor was pinned before that guard and is NOT pinned after it. A mutation delta belongs to a HEAD,
 #     not to a guard — so the 130 / 29 / 54 figures an earlier revision of this note carried are withdrawn
 #     BY NAME here rather than dropped silently, and none of the three is a number at this head. The 261
