@@ -76,6 +76,10 @@ make_src() { # make_src <dir>
   printf '#!/bin/bash\necho claims v2\n'      > "$d/claims.sh"
   printf '#!/bin/bash\necho merge-one v2\n'   > "$d/merge-one.sh"
   printf '#!/usr/bin/env python3\nprint(1)\n' > "$d/gh-limit.py"
+  # ⛔ #3613 ADDED THIS ANCHOR TO deploy-harness.sh AND NOT TO THIS FIXTURE: 98 arms below went red,
+  # every one of them reporting only "refusing to deploy a directory that is not the harness". The
+  # derived arm right after case 1's `make_src` exists so the next anchor addition cannot repeat that.
+  printf '#!/usr/bin/env python3\nprint("cred")\n' > "$d/gh-cred.py"
   printf '#!/bin/bash\necho rest\n'           > "$d/gh-rest/gh"
   printf '#!/bin/bash\necho limit-shim\n'     > "$d/gh-limit/gh"
   printf '#!/bin/bash\necho old\n'            > "$d/retired/sweep.sh"
@@ -130,6 +134,15 @@ snapshot() { ( cd "$1" 2>/dev/null && find . -type f -print | LC_ALL=C sort | wh
 # ── 1. THE HAPPY PATH — and proof that it is a deploy, not a listing ────────────────────────────
 say_case "1. a valid source deploys, verifies, and notifies success"
 SRC1="$T/src1"; O1="$T/o1"; make_src "$SRC1"; make_target "$O1"
+# ⛔ THE FIXTURE CARRIES EVERY ANCHOR THE SHIPPED SCRIPT DEMANDS — the list is DERIVED from
+# `deploy-harness.sh` itself, never restated, so an anchor added there without a fixture update is ONE
+# red that names the missing file (#3613 added `gh-cred.py` and left this fixture stale: 98 arms went
+# red, each of them reporting only "refusing to deploy a directory that is not the harness").
+ANCHORS="$(sed -n 's/^for anchor in \(.*\); do$/\1/p' "$DEPLOY" | head -1)"
+if [ -n "$ANCHORS" ]; then ok "the shipped deploy's anchor list is READ from the script, not restated"; else bad "could not read the shipped deploy's anchor list"; fi
+ANCHORS_MISSING=""
+for _anchor in $ANCHORS; do [ -f "$SRC1/$_anchor" ] || ANCHORS_MISSING="$ANCHORS_MISSING $_anchor"; done
+if [ -z "$ANCHORS_MISSING" ]; then ok "the fixture source carries EVERY anchor deploy-harness.sh demands"; else bad "the fixture source is missing anchor(s):$ANCHORS_MISSING — deploy-harness.sh demands them, so every deploy arm below would refuse for the wrong reason"; fi
 mkdir -p "$O1/bg"
 # ⛔ THE SELF-CONFIRMING SHAPE, on purpose: the target already holds 30 scripts AND the exact files
 # the source ships. A deploy that counted what is already there would call this a success before it
