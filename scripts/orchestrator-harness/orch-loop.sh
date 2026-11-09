@@ -2112,6 +2112,9 @@ LOCKF="$O/.orch.lock"
 # `orch-loop-lock.test.sh` pins both bodies and the slack to the canonical declarations, so drift
 # reddens CI instead of becoming a wrong reclaim.
 ORCH_LOCK_START_SLACK_SECONDS="${ORCH_LOCK_START_SLACK_SECONDS:-5}"
+# The one literal this block needs for field parsing: `awk` separates the `stat` column from the argv
+# with a TAB, and the reassembled argv contains no TAB by construction (awk's fields split on whitespace).
+TAB="$(printf '\t')"
 # _orch_ps_start_epoch <pid> — when the process began, from `ps -o etime=` (one shape on BSD and GNU).
 # rc 1 when it cannot be read. PINNED MIRROR of `pid_start_epoch` in scripts/lib/pid-identity.sh.
 # ⛔ `10#`, NOT a bare `$(( ))`: etime ZERO-PADS, and bash reads a leading zero as OCTAL, so
@@ -2133,36 +2136,73 @@ _orch_ps_start_epoch() {
   h=$((10#${h:-0})); m=$((10#${m:-0})); s=$((10#${s:-0})); d=$((10#${d:-0}))
   printf '%s\n' "$(( $(date +%s) - (d * 86400 + h * 3600 + m * 60 + s) ))"
 }
-# _orch_pid_is_loop <pid> — 0 only for a live process whose INVOCATION is an orch-loop.sh.
-# PINNED MIRROR of `registry_pid_is_controller` in scripts/lib/orchestrator-registry.sh: `${1##*/}` must
-# be a shell and `${2##*/}` must be exactly `orch-loop.sh`. A looser ANY-token match (`/?*orch-loop.sh`)
-# accepted `bash -c "sleep 300; /abs/orch-loop.sh"` — a non-controller — and a caller that merely
-# MENTIONS the path (an editor, a grep) is not a controller either (#1856 review).
-_orch_pid_is_loop() {
-  local p="${1:-}" c tok
+# _orch_lock_probe <pid> — ONE process read, THREE outcomes, because HERE "cannot read" must never be
+# minted into "provably not the owner": the caller answers that verdict by DELETING the lock, so a false
+# negative is two controllers on one state dir (#1715). ⛔ THE DIRECTION IS INVERTED FROM THE SAME
+# PREDICATE'S REPORTING HOMES (`registry_pid_is_controller`, `lock_pid`, `argv_is_orch_loop`), where a
+# false negative only degrades a row to STOPPED — which is why the read/absence arms are NOT mirrored
+# verbatim and carry their own three outcomes (fresh review of #1985, P1).
+#   rc 0  PRESENT  stdout IS the argv, read from a table that provably ran
+#   rc 1  ABSENT   the read RAN and produced a table; the pid is not in it (and we cannot even signal
+#                  it), so the lock outlived its writer
+#   rc 2  UNKNOWN  the read failed, the table was empty, the pid is alive outside the table we could
+#                  read, or its argv could not be had — NEVER reclaim on this
+_orch_lock_probe() {
+  local p="${1:-}" t row stat cmd
   case "$p" in ''|*[!0-9]*) return 1 ;; esac
-  kill -0 "$p" 2>/dev/null || return 1
-  c="$(ps -o command= -p "$p" 2>/dev/null)" || return 1
-  # shellcheck disable=SC2086
-  set -- $c
+  t="$("${PS_BIN:-/bin/ps}" -axo pid=,stat=,command= 2>/dev/null)" || return 2
+  # ⛔ AN EMPTY TABLE IS UNREADABLE, NOT EMPTY: the probing process itself appears in any real table,
+  # so a read that "succeeds" and prints nothing never witnesses absence (#1178 C3).
+  case "$t" in *[![:space:]]*) ;; *) return 2 ;; esac
+  row="$(printf '%s\n' "$t" | awk -v p="$p" '$1 == p { c = ""; for (i = 3; i <= NF; i++) c = (c == "" ? $i : c " " $i); print $2 "\t" c; exit }')"
+  if [ -z "$row" ]; then
+    # Not in a table we COULD read. Corroborate with `kill -0`: a pid we can signal is ALIVE, so the
+    # absence belongs to the read, not to the process → UNKNOWN. Otherwise it is positively gone.
+    kill -0 "$p" 2>/dev/null && return 2
+    return 1
+  fi
+  stat="${row%%"$TAB"*}"
+  case "$stat" in Z*) return 1 ;; esac          # a zombie cannot hold a lock — its EXIT trap has run
+  cmd="${row#*"$TAB"}"
+  [ -n "$cmd" ] || return 2                     # present, but its argv is unreadable → UNKNOWN
+  printf '%s\n' "$cmd"
+  return 0
+}
+# _orch_argv_is_loop <argv…> — 0 only when the INVOCATION is an orch-loop.sh.
+# ⛔ THE TWO TOKEN RULES ARE A PINNED MIRROR of `registry_pid_is_controller` in
+# scripts/lib/orchestrator-registry.sh: `${1##*/}` must be a shell and `${2##*/}` must be exactly
+# `orch-loop.sh`. A looser ANY-token match (`/?*orch-loop.sh`) accepted `bash -c "sleep 300; /abs/orch-
+# loop.sh"` — a non-controller — and a caller that merely MENTIONS the path (an editor, a grep) is not a
+# controller either (#1856 review). `orch-loop-lock.test.sh` pins these two rules to the canonical
+# declaration; only the READ arms above are deliberately different (see their header).
+_orch_argv_is_loop() { # shellcheck disable=SC2086
+  set -- $*
   [ "$#" -ge 2 ] || return 1
   case "${1##*/}" in bash|sh|dash|zsh) ;; *) return 1 ;; esac
   case "${2##*/}" in orch-loop.sh) return 0 ;; esac
   return 1
 }
 # _orch_lock_verdict <pid> <lockfile> -> 0 OWNER · 1 PROVABLY NOT the owner · 2 CANNOT TELL
-# ⛔ THREE OUTCOMES. 2 must reach the caller AS 2: folding "cannot date it" into 1 would reclaim a lock
-# whose live owner it simply could not read (two controllers, #1715), and folding it into 0 would keep
-# the #1985 silent stop. The caller refuses on 2, loudly.
+# Sets ORCH_LOCK_WHY (only on rc 2) to the read that failed, so the refusal names WHICH datum is missing
+# instead of asserting a fact about a process it could not read (fresh review of #1985, P1).
+# ⛔ THREE OUTCOMES, AND 2 IS NOT 1. Folding "cannot read it" into 1 would reclaim a lock whose live
+# owner it simply could not read (two controllers, #1715); folding it into 0 would keep the #1985 silent
+# stop. The caller refuses on 2, loudly, with the remedy named.
+ORCH_LOCK_WHY=""
 _orch_lock_verdict() {
-  local p="${1:-}" lf="${2:-}" lt pstart
+  local p="${1:-}" lf="${2:-}" lt pstart cmd
+  ORCH_LOCK_WHY=""
   case "$p" in ''|*[!0-9]*) return 1 ;; esac
   [ "$p" -gt 1 ] || return 1                      # pid 0 is our own process group; 1 is init
-  kill -0 "$p" 2>/dev/null || return 1             # absent — the lock outlived its writer
-  _orch_pid_is_loop "$p" || return 1              # alive, but the invocation is not an orch-loop.sh
-  lt="$(date -r "$lf" +%s 2>/dev/null)" || return 2
-  case "$lt" in ''|*[!0-9]*) return 2 ;; esac
-  pstart="$(_orch_ps_start_epoch "$p")" || return 2
+  cmd="$(_orch_lock_probe "$p")"; case $? in
+    0) ;;                                         # present, argv read
+    1) return 1 ;;                                # positively absent — the lock outlived its writer
+    *) ORCH_LOCK_WHY="the process table or that pid's argv cannot be read"; return 2 ;;
+  esac
+  _orch_argv_is_loop "$cmd" || return 1           # argv READ, and it is not an orch-loop.sh
+  lt="$(date -r "$lf" +%s 2>/dev/null)" || { ORCH_LOCK_WHY="the lock file's own timestamp cannot be read"; return 2; }
+  case "$lt" in ''|*[!0-9]*) ORCH_LOCK_WHY="the lock file's own timestamp cannot be read"; return 2 ;; esac
+  pstart="$(_orch_ps_start_epoch "$p")" || { ORCH_LOCK_WHY="that pid's START TIME cannot be read"; return 2; }
   [ "$pstart" -gt "$(( lt + ORCH_LOCK_START_SLACK_SECONDS ))" ] && return 1   # began AFTER the lock
   return 0
 }
@@ -2174,7 +2214,7 @@ if ! acq; then
   _orch_lock_verdict "${OPID:-0}" "$LOCKF"; _OV=$?
   if [ "$_OV" = 0 ]; then echo "[orch-loop] already running (pid $OPID)"; exit 0; fi
   if [ "$_OV" = 2 ]; then
-    _MSG="[orch-loop] CANNOT-TELL: lock $LOCKF names pid ${OPID:-none}, which is ALIVE and is an orch-loop.sh invocation, but its START TIME cannot be read — a RECYCLED pid cannot be ruled out, so a second controller is refused (agent-infra#1715). If no controller is running: rm -f $LOCKF (agent-infra#1985)"
+    _MSG="[orch-loop] CANNOT-TELL: lock $LOCKF names pid ${OPID:-none} and ${ORCH_LOCK_WHY:-the owner cannot be identified}, so a RECYCLED pid cannot be ruled out — a second controller is refused (agent-infra#1715). If no controller is running: rm -f $LOCKF (agent-infra#1985)"
     echo "$_MSG" >&2
     echo "[lock] CANNOT-TELL — $_MSG" >> "$LOG" 2>/dev/null || true
     exit 0
