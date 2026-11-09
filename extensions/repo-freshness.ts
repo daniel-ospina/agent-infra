@@ -523,7 +523,7 @@ export function syncRepoState(cwd: string, now: number = Date.now()): RepoState 
  */
 export function countCommitsBetween(cwd: string, from: string, to: string): number | null {
   const hex = /^[0-9a-f]{7,64}$/i;
-  if (!hex.test(from) || !hex.test(to)) return null;
+  // MUTANT: hex gate deleted (proof that the new rows can go red)
   // #2105 P1 — argv form for the same reason as `syncRepoState`: `cwd` comes from
   // the report path's caller-supplied path. The hex test stays as a second lock,
   // not as the mechanism.
