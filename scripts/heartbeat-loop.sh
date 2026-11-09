@@ -388,8 +388,10 @@ export O="${O:-$HOME/orchestrator}"
 # only the three absent ones prepended, and a child's bare `gh` still resolved to the raw binary.
 # The block's own comment says the shim dir "must never be omitted"; the skip arm omitted it. A pinned
 # dir is now ALWAYS prepended, and its inherited occurrences are STRIPPED from the tail, so rank is
-# forced rather than assumed. Empty PATH components (which mean the cwd) are dropped by the same
-# pass — they are the one entry a caller never sees, and `.` on a PATH is a hazard, not a setting.
+# forced rather than assumed. Empty PATH components (which mean the cwd) are dropped by the final
+# assembly below, which runs on every input — not by a prune nested inside a per-entry loop that only
+# runs when some pinned directory exists — because they are the one entry a caller never sees, and `.`
+# on a PATH is a hazard, not a setting.
 _pin_prefix=""
 _pin_rest="$PATH"
 _oldifs="$IFS"
@@ -416,29 +418,44 @@ for _path_dir in \
     IFS="$_oldifs"
     _pin_rest="$_pruned"
 done
-unset _path_dir _pin_dir _pruned _oldifs
-# ⛔ NO TRAILING SEPARATOR WHEN THE TAIL IS EMPTY (#1867 review P3, round 7). `_pin_prefix` always ends
-# in `:`, so appending an EMPTY `_pin_rest` produced `…:shims::/usr/local/bin:…` — a double colon is an
-# EMPTY PATH COMPONENT, i.e. the CWD, which is the exact hazard the pass above says it drops. The
-# inputs that reach it: a caller whose whole PATH is already the pinned dirs, or an empty PATH. (An
-# INTERIOR empty component was always handled — dropped by the same pass — so only an all-pinned or
-# empty PATH could do this.)
-if [ -n "$_pin_rest" ]; then
-    PATH="$_pin_prefix$_pin_rest"
-else
-    PATH="${_pin_prefix%:}"
-fi
-unset _pin_prefix _pin_rest
+unset _path_dir _pin_dir _pruned
+# ⛔ ONE ASSEMBLY, ONE PRUNE, ALWAYS (#1867 review P3, round 8). The empty-component pruning used to
+# live ONLY inside the per-entry loop above, so it ran only when at least one pinned directory existed
+# — and the tail append then welded the pieces together unconditionally. With no pinned dir present and
+# an empty PATH the result was `:/usr/local/bin:…`, a LEADING empty component: the cwd ranked AHEAD of
+# every system dir, which is the exact hazard the pass above exists to remove and one of the two inputs
+# this block's own comment named. The round-7 fix covered the empty TAIL (no trailing `:`) and missed
+# the empty BASE, and neither covered an INTERIOR `::` inherited from a caller. MEASURED on the round-7
+# line with an empty PATH and none of the six pinned dirs: the child saw
+# `PATH=:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin`.
+# The join is now component-wise and unconditional, so no input shape can emit a leading, trailing or
+# interior empty component — and the system tail cannot be appended twice. The pieces are handed to ONE
+# split (`_pin_prefix`'s own trailing `:` is just a delimiter here, so an empty value neither welds a
+# `::` nor needs a separate "is the tail empty" arm), which is why the 2-arm `if` it replaces is gone.
+_pin_path=""
+_oldifs="$IFS"
+IFS=':'
+# Globbing OFF around the split: a PATH component containing `*` or `?` must be copied, not expanded
+# against the cwd — the same reason `pid_is_loop` does it in `heartbeat-launch.sh`.
+set -f
+for _pin_dir in $_pin_prefix $_pin_rest /usr/local/bin /usr/bin /bin /usr/sbin /sbin; do
+    [ -n "$_pin_dir" ] || continue
+    _pin_path="${_pin_path:+$_pin_path:}$_pin_dir"
+done
+set +f
+IFS="$_oldifs"
 # ⛔ APPEND, NEVER PREPEND (#1867 review P1). These five dirs were PREPENDED by an earlier version of
 # this line, which moved `/usr/local/bin` and `/usr/bin` AHEAD of the entries the loop above pins —
 # so every child's bare `gh` resolved to the raw binary and NOT to `~/.pi/agent/shims/gh`. That shim
 # is load-bearing, not a convenience wrapper: its header calls it "the argv-level admin-merge guard
 # (#984)" and "THE FLEET COURTESY GATE (#1910)", and `:3-10` of THIS file records the measured
 # consequence of losing it ("every telemetry read returned empty and the fleet read '0 open PRs /
-# VERDICT=STALLED' while 100 PRs were open"). Appending reproduces the pre-change precedence
-# (shims before homebrew/system) on both platforms, and the comment above now states what the code
-# actually does.
-export PATH="$PATH:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+# VERDICT=STALLED' while 100 PRs were open"). The assembly above keeps them LAST — pinned prefix,
+# then the inherited PATH, then the system tail — which reproduces the pre-change precedence
+# (shims before homebrew/system) on both platforms.
+PATH="$_pin_path"
+export PATH
+unset _pin_prefix _pin_rest _pin_path _pin_dir _oldifs
 export CMUX_QUIET=1     # the deprecation notice otherwise PREFIXES --json output
 
 # ⛔ REPO EVIDENCE FOR THE DETACHED PASS, PINNED HERE BECAUSE THIS LOOP *IS* THE LAUNCHER (agent-infra#2280).

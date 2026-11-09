@@ -155,9 +155,10 @@ run_pass() {
   local d="$1"
   # ⛔ `RUN_PASS_PATH` LETS ONE CASE CHOOSE THE INHERITED PATH (#1867 review P2, round 6). The pin's
   # whole job is to OVERRIDE an inherited rank, so a case that wants to prove it must be able to
-  # hand the loop a PATH of its own; every other case takes `$PATH` unchanged.
+  # hand the loop a PATH of its own; every other case takes `$PATH` unchanged. `-`, not `:-`: an EMPTY
+  # value is a PATH OF ITS OWN (round 8's §15d drives an empty PATH), not a request for the default.
   ( HOME="$d/home" HEARTBEAT_PI_AGENT_DIR="$d/agent" LOOP_DETACHED=1 HEARTBEAT_PASS_ONCE=1 \
-      PATH="${RUN_PASS_PATH:-$PATH}" \
+      PATH="${RUN_PASS_PATH-$PATH}" \
       /bin/bash "$LOOP" >/dev/null 2>&1 ) &
   local pid=$! wd
   # ⛔ KILL THE GROUP, NOT THE SUBSHELL. `kill "$wd"` reaped the watchdog subshell and orphaned the
@@ -878,6 +879,55 @@ elif [ "${P15C#:}" != "$P15C" ] || [ "${P15C%:}" != "$P15C" ] || [ "${P15C#*::}"
   fail "15c. the pinned PATH carries an EMPTY component (the cwd): $P15C"
 else
   pass "15c. a PATH made entirely of pinned dirs yields no empty component (the cwd is not silently added)"
+fi
+
+# ⛔ AND THE EMPTY-COMPONENT PRUNE MUST RUN FOR EVERY INPUT, NOT ONLY WHEN A PINNED DIR EXISTS
+# (#1867 review P3, round 8). Round 7 closed the empty TAIL (no trailing `:` when `_pin_rest` is empty)
+# and the comment claimed empty components "are dropped by the same pass" — but that pass lives INSIDE
+# the `for _path_dir` loop, so it only ran when at least one of the six dirs existed, while the system
+# tail was appended unconditionally afterwards. Two shapes slipped through: an EMPTY PATH with no pinned
+# dir (the append built `:/usr/local/bin:…` — a LEADING empty component, i.e. the cwd ranked ahead of
+# every system dir) and an INTERIOR `::` inherited from a caller (nothing pruned it). §15c cannot see
+# either: its PATH is entirely pinned dirs, so the inner pass always runs there.
+# ⚠️ DISCLOSED: this row's failing arm needs NO pinned dir to exist. Four of the six are under the
+# fixture HOME (controlled), but `/Applications/cmux.app/…` and `/opt/homebrew/bin` are literals — on a
+# host where either exists the inner pass runs and its prune covers the interior shape, so the row
+# discriminates for the LEADING arm only there. On the Linux runner (where the suite runs in CI) neither
+# exists, so both arms discriminate. The empty-PATH case is asserted against the leading arm directly.
+FIX15D="$(mkfix pinrank4 0)"
+cat > "$FIX15D/agent/scripts/orchestrator-heartbeat.sh" <<SH
+#!/bin/bash
+printf '%s\n' "\$PATH" > "$FIX15D/path"
+exit 0
+SH
+# Shape 1: an EMPTY inherited PATH (a caller that exported PATH= / an unset-looking environment).
+RUN_PASS_PATH=""
+run_pass "$FIX15D"
+P15D="$(cat "$FIX15D/path" 2>/dev/null)"
+rm -f "$FIX15D/path"
+if [ -z "$P15D" ]; then
+  fail "15d. the empty-PATH row produced no PATH to inspect — nothing was measured"
+elif [ "${P15D#:}" != "$P15D" ] || [ "${P15D%:}" != "$P15D" ] || [ "${P15D#*::}" != "$P15D" ]; then
+  fail "15d. an EMPTY inherited PATH produced an EMPTY component (the cwd on PATH): $P15D"
+else
+  pass "15d. an EMPTY inherited PATH yields no empty component — the system tail is not welded on behind a ':'"
+fi
+case ":$P15D:" in
+  *:/usr/bin:*) pass "15d. ... and the system tail is still appended (an empty PATH is not a broken PATH)" ;;
+  *) fail "15d. the system tail is MISSING from the assembled PATH: ${P15D:-<none>}" ;;
+esac
+# Shape 2: an INTERIOR empty component inherited from the caller.
+RUN_PASS_PATH="/usr/bin::/bin"
+run_pass "$FIX15D"
+P15E="$(cat "$FIX15D/path" 2>/dev/null)"
+rm -f "$FIX15D/path"
+unset RUN_PASS_PATH
+if [ -z "$P15E" ]; then
+  fail "15e. the interior-empty row produced no PATH to inspect — nothing was measured"
+elif [ "${P15E#*::}" != "$P15E" ] || [ "${P15E#:}" != "$P15E" ] || [ "${P15E%:}" != "$P15E" ]; then
+  fail "15e. an inherited INTERIOR empty component survived the pin (the cwd on PATH): $P15E"
+else
+  pass "15e. an inherited INTERIOR '::' is dropped — the prune is no longer conditional on a pinned dir existing"
 fi
 
 if [ "$failures" -eq 0 ]; then

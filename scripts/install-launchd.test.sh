@@ -2418,7 +2418,7 @@ set -e
 assert_eq "$RC" "0" "--status exits 0"
 assert_contains "$OUT" "provider-latency-tripwire: installed=loaded version=v0.1.0 (DRIFTED" "status flags drifted tripwire"
 assert_contains "$OUT" "corruption-canary: installed=loaded version=v0.1.0 (in sync)" "status reports canary in sync"
-assert_contains "$OUT" "Retired (moved to session-checks, #432)" "status lists retired jobs"
+assert_contains "$OUT" "Retired in this repo (no template; the next install unloads + removes each)" "status lists retired jobs"
 
 echo "── 10. --uninstall ───────────────────────────────────────────────"
 set +e
@@ -2953,8 +2953,29 @@ PLIST
 set +e
 OUT="$(run_stray_status)"; RC=$?
 set -e
-assert_eq "$RC" "0" "§18 a RETIRED label is NOT unmanaged (it is declared, and retire_pass removes it)"
-assert_not_contains "$OUT" "UNMANAGED" "§18 ... so no false alarm on a box that installed the pre-retirement jobs"
+assert_not_contains "$OUT" "UNMANAGED" "§18 a RETIRED label is NOT unmanaged (it is declared, and retire_pass removes it)"
+# ⛔ BUT "NOT UNMANAGED" IS NOT "CLEAN" (#1867 review, round 8). `retire_pass` — the only remover —
+# runs on an INSTALL, never on `--status`. Exempting RETIRED from the ROW was right; exempting it from
+# the EXIT CODE meant this verb exited 0 over a job the manifest says must go, and
+# `scripts/fleet-schedule.py --verify` then printed `SCHEDULE VERIFIED` over it. The row class is its
+# own (`⛔ RETIRED-INSTALLED`), the exit is 1, and the remedy is an INSTALL — not `rm -f`, because the
+# label IS declared and `retire_pass` does the bootout AND the removal.
+assert_eq "$RC" "1" "§18 a RETIRED label that is STILL INSTALLED exits 1, not 0 (retire_pass has not run)"
+assert_contains "$OUT" "RETIRED-INSTALLED" "§18 ... with its OWN row class, distinct from UNMANAGED"
+assert_contains "$OUT" "com.eldato.hub-state-check" "§18 ... naming the label"
+assert_contains "$OUT" "install-launchd.sh --install" "§18 ... and the remedy that actually removes it (retire_pass)"
+assert_not_contains "$OUT" 'bootout gui/' "§18 ... never the hand-deletion remedy: the label is DECLARED, not a stray"
+# ⛔ AND THE FIXTURE MUST BE TORN DOWN (#1867 review, round 8). The old row exited 0 whatever the plist
+# said, so leaving it on disk was invisible; now that it is a FAILING state, a seed without a teardown
+# would leave `--status` returning 1 for every later row in this section — eleven `want: 0` rows red with
+# a message that names the label UNDER TEST instead of the leaked one. MEASURED with the teardown
+# missing: 11 ❌, all `got: 1, want: 0`, the first being the very next control row.
+rm -f "$STRAY_HOME/Library/LaunchAgents/com.eldato.hub-state-check.plist"
+set +e
+OUT="$(run_stray_status)"; RC=$?
+set -e
+assert_eq "$RC" "0" "§18 control: removing the retired plist clears the RETIRED-INSTALLED row (the seed is torn down)"
+assert_not_contains "$OUT" "RETIRED-INSTALLED" "§18 ... so no later row in this section inherits the leak"
 
 # ⛔ THE BLIND JOB'S OWN LABEL IS NOW DECLARED (#1867 review P1), and that entry IS the remediation.
 # `com.tortoise.heartbeat-loop` is the hand-installed launchd job that ran scripts/heartbeat-loop.sh
@@ -2977,9 +2998,24 @@ PLIST
 set +e
 OUT="$(run_stray_status)"; RC=$?
 set -e
-assert_eq "$RC" "0" "§18 the blind job is NOT unmanaged once RETIRED declares it (retire_pass removes it)"
-assert_not_contains "$OUT" "UNMANAGED" "§18 ... so the box goes green in the same change that diagnosed it"
+assert_not_contains "$OUT" "UNMANAGED" "§18 the blind job is NOT unmanaged once RETIRED declares it (retire_pass removes it)"
+# ⛔ THE FALSE PASS THIS CHANGE EXISTED TO PREVENT WAS STILL HERE (#1867 review, round 8), one layer
+# down: this verb certified the box that was still ticking the blind job. MEASURED on round 7's code
+# with a fixture holding ONLY this plist: rc=0, zero rows, plist still on disk — while the normalising
+# caller (`fleet-schedule.py --verify`) printed `SCHEDULE VERIFIED`. It must fail until an install
+# removes the job.
+assert_eq "$RC" "1" "§18 the blind job still installed is a FAILING state, not a green one"
+assert_contains "$OUT" "RETIRED-INSTALLED" "§18 ... reported as RETIRED-INSTALLED, one line per job"
+assert_contains "$OUT" "com.tortoise.heartbeat-loop" "§18 ... naming the blind heartbeat's own label"
+assert_contains "$OUT" "install-launchd.sh --install" "§18 ... and pointing at the install that runs retire_pass"
 rm -f "$STRAY_HOME/Library/LaunchAgents/com.tortoise.heartbeat-loop.plist"
+# The CONTROL: with the retired plist gone the box is green again, so the row above is not a stuck red
+# and an operator can verify the removal with the same verb they diagnosed with.
+set +e
+OUT="$(run_stray_status)"; RC=$?
+set -e
+assert_eq "$RC" "0" "§18 control: once the retired job is removed, --status is 0 again (transient by construction)"
+assert_not_contains "$OUT" "RETIRED-INSTALLED" "§18 ... and no longer reports a retired-installed row"
 
 # ⛔ A JOB ANOTHER INSTALLER OF THIS REPO OWNS IS NOT UNMANAGED (#1867 review P1). The harness
 # controller `com.eldato.orchestrator-loop` is rendered by scripts/orchestrator-harness/install.sh
@@ -3205,7 +3241,17 @@ printf '%s\n' \
     '<key>ProgramArguments</key><array><string>/bin/bash</string><string>/x/nested.sh</string></array>' \
     '</dict></plist>' > "$TEMPLATES/group/sub/com.eldato.nested.plist"
 seed_stray_plist com.eldato.nested
+# ⛔ THE set +e/set -e WINDOW IS NOT DECORATION (#1867 review, round 8). Every neighbouring block in
+# this section has it and this one did not, so under the suite's `set -euo pipefail` a NON-ZERO status
+# aborted the run at the assignment: the §18b failure MESSAGE never printed and the ten assertions
+# after it (both UNKNOWN rows, the unreadable-dir row, the nobody-declares-it control) never ran.
+# MEASURED with `declared_labels` narrowed back to the two fixed globs in a /tmp copy: 505 ✅ / 0 ❌ /
+# rc=1, stopping dead at "the sub-directory rows above are not vacuous" — a red CI job whose
+# diagnosis is missing and a fifth of the section silently skipped. A row that cannot report is not a
+# row.
+set +e
 OUT="$(run_stray_status)"; RC=$?
+set -e
 assert_eq "$RC" "0" "§18b a template THREE levels down is DECLARED — the declared set is a walk, not two globs"
 assert_not_contains "$OUT" "com.eldato.nested" "§18b ...so no bootout+rm advice is aimed at a job this repo ships"
 rm -f "$TEMPLATES/group/sub/com.eldato.nested.plist" "$STRAY_HOME/Library/LaunchAgents/com.eldato.nested.plist"

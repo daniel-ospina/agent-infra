@@ -3650,7 +3650,21 @@ def cmd_darwin(mode):
         # substring made the intro line match too, so three undeclared jobs and one both reported
         # "1 launchd job(s) …". The delegate now prints the marker ON EACH JOB LINE and keeps the word
         # out of its intro; this scan matches the marker, so `len(bad)` counts what it names.
-        JOB_MARKERS = ("NOT INSTALLED", "DRIFTED", "not loaded", "⛔ UNMANAGED", "⛔ UNKNOWN")
+        # ⛔ AND `⛔ RETIRED-INSTALLED` (#1867 review, round 8). A retired label that is STILL on disk
+        # is the blind heartbeat's own case: `install-launchd.sh` exempts the RETIRED class from the
+        # UNMANAGED row (it is declared), and `retire_pass` — the only remover — runs on an INSTALL. So
+        # without this marker the delegate exited 1 with a row this scan did not count, and the verdict
+        # read `SCHEDULE NOT VERIFIED — 0 launchd job(s) …` over a box still ticking a job this
+        # repository has retired. The marker is on the JOB line, like UNMANAGED, so the count is a count
+        # of jobs.
+        JOB_MARKERS = (
+            "NOT INSTALLED",
+            "DRIFTED",
+            "not loaded",
+            "⛔ UNMANAGED",
+            "⛔ RETIRED-INSTALLED",
+            "⛔ UNKNOWN",
+        )
         bad = [line for line in text.splitlines() if any(m in line for m in JOB_MARKERS)]
         for line in bad:
             print("  FAIL   %s" % line.strip(), file=sys.stderr)
@@ -3667,7 +3681,8 @@ def cmd_darwin(mode):
         if bad or out.returncode != 0:
             print(
                 "SCHEDULE NOT VERIFIED — %d launchd job(s) not installed/loaded/in sync/declared "
-                "above (UNMANAGED = installed with no template; UNKNOWN = the installed set could "
+                "above (UNMANAGED = installed with no template; RETIRED-INSTALLED = retired here but "
+                "still installed, cleared by the next install; UNKNOWN = the installed set could "
                 "not be enumerated)"
                 % len(bad),
                 file=sys.stderr,

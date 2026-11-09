@@ -1118,18 +1118,41 @@ out="$(darwin_run --verify)"; rc=$?
 cat > "$DARWIN_ROOT/scripts/install-launchd.sh" <<'SH'
 #!/usr/bin/env bash
 printf '%s\n' "${1:-<no args>}" >> "$DELEGATE_RECORD"
+# ⛔ THE SHIPPED FORMAT, including round 8's third class: a RETIRED label that is still INSTALLED.
+# `install-launchd.sh --status` reports it as `⛔ RETIRED-INSTALLED` (one line per job) and exits 1,
+# because `retire_pass` — the only remover — runs on an INSTALL and this verb never does. A scan that
+# does not carry the wording counted 0 jobs over a box still ticking the blind heartbeat while the
+# verdict beside it said NOT VERIFIED — the same false count the UNMANAGED wording was fixed for, one
+# class over.
 echo "  ⛔ Installed job(s) with NO template in the declared set — one line per job:" >&2
 echo "  ⛔ UNMANAGED   com.eldato.mystery ($HOME/Library/LaunchAgents/com.eldato.mystery.plist)" >&2
 echo "  ⛔ UNMANAGED   com.eldato.other ($HOME/Library/LaunchAgents/com.eldato.other.plist)" >&2
+echo "  ⛔ RETIRED in this repo, STILL INSTALLED here — one line per job:" >&2
+echo "  ⛔ RETIRED-INSTALLED   com.tortoise.heartbeat-loop ($HOME/Library/LaunchAgents/com.tortoise.heartbeat-loop.plist)" >&2
 exit 0
 SH
 chmod +x "$DARWIN_ROOT/scripts/install-launchd.sh"
 out="$(darwin_run --verify)"; rc=$?
-grep -q 'SCHEDULE NOT VERIFIED — 2 launchd job(s)' <<<"$out" \
-  && ok "an UNMANAGED-only failure counts EVERY job line (2 of 2), never the section intro" \
-  || bad "the UNMANAGED count is not per job — two undeclared jobs did not read as 2 jobs: $out"
+grep -q 'SCHEDULE NOT VERIFIED — 3 launchd job(s)' <<<"$out" \
+  && ok "the count covers EVERY class per job line (2 UNMANAGED + 1 RETIRED-INSTALLED = 3), never an intro" \
+  || bad "the count is not per job across classes — 2 UNMANAGED + 1 RETIRED-INSTALLED did not read as 3: $out"
 [ "$rc" -eq 1 ] && ok "…and the verdict is still NOT VERIFIED" \
-  || bad "the UNMANAGED-only failure returned $rc, not 1"
+  || bad "the multi-class failure returned $rc, not 1"
+# ⛔ AND THE RETIRED CLASS IS COUNTED ON ITS OWN (#1867 review, round 8): a run whose ONLY row is a
+# still-installed retired job must read as 1 job, not 0. This is the blind heartbeat's exact shape —
+# the label IS declared, so nothing else in the scan can see it.
+cat > "$DARWIN_ROOT/scripts/install-launchd.sh" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "${1:-<no args>}" >> "$DELEGATE_RECORD"
+echo "  ⛔ RETIRED in this repo, STILL INSTALLED here — one line per job:" >&2
+echo "  ⛔ RETIRED-INSTALLED   com.tortoise.heartbeat-loop ($HOME/Library/LaunchAgents/com.tortoise.heartbeat-loop.plist)" >&2
+exit 1
+SH
+chmod +x "$DARWIN_ROOT/scripts/install-launchd.sh"
+out="$(darwin_run --verify)"; rc=$?
+grep -q 'SCHEDULE NOT VERIFIED — 1 launchd job(s)' <<<"$out" \
+  && ok "a RETIRED-INSTALLED-only failure is COUNTED (1 of 1), not reported as 0 jobs" \
+  || bad "a RETIRED-INSTALLED-only failure printed a 0-job verdict: $out"
 cat > "$DARWIN_ROOT/scripts/install-launchd.sh" <<'SH'
 #!/usr/bin/env bash
 printf '%s\n' "${1:-<no args>}" >> "$DELEGATE_RECORD"

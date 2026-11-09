@@ -46,13 +46,19 @@
 # declared set no longer describes, invisible to every content-drift comparison. The
 # declared set is resolved RECURSIVELY (`templates/launchd/*/label.plist` counts — the
 # four repo templates that ship one directory down are this repo's own jobs, not
-# strays, #1867 review P1). Three classes are declared elsewhere and are NOT reported:
-# labels in RETIRED (pending retirement), labels in OWNED-BY-OTHER-INSTALLERS (another
-# surface of this repo installs or adopts them — every installer in `scripts/`, and the
-# box's own adopted controller job), so the alarm stays about jobs nobody declares.
-# Exit codes for `--status`: 0 clean · 1 UNMANAGED found · 2 the installed set could NOT
-# be enumerated (UNKNOWN, never a pass — #1867 review P2). `2` is ALSO the global usage
-# code; see the second Exit-codes line below the env list, which spells both.
+# strays, #1867 review P1). Two classes are declared elsewhere and are NOT reported as
+# UNMANAGED: labels in RETIRED (declared, pending removal by `retire_pass`) and labels
+# in OWNED-BY-OTHER-INSTALLERS (another surface of this repo installs or adopts them —
+# every installer in `scripts/`, and the box's own adopted controller job), so the alarm
+# stays about jobs nobody declares. ⛔ RETIRED IS NOT "GREEN", THOUGH (round 8): an
+# installed RETIRED label is reported as `⛔ RETIRED-INSTALLED` and the verb exits 1
+# until an install removes it — `retire_pass` runs on INSTALL, never on `--status`, so
+# exempting the class from BOTH the row and the exit code certified a box that was
+# still ticking the blind job this change exists to remove.
+# Exit codes for `--status`: 0 clean · 1 UNMANAGED or RETIRED-but-still-installed ·
+# 2 the installed set could NOT be enumerated (UNKNOWN, never a pass — #1867 review P2).
+# `2` is ALSO the global usage code; see the second Exit-codes line below the env list,
+# which spells both.
 #
 # Usage:
 #   install-launchd.sh               install/refresh all templates (idempotent)
@@ -1714,6 +1720,31 @@ unmanaged_plists() {
     done
 }
 
+# ── A RETIRED LABEL THAT IS STILL INSTALLED (round 8) ───────────────────────────────────────────
+# ⛔ THE FALSE PASS THIS INSTRUMENT ITSELF WAS HOLDING. `unmanaged_plists` exempts RETIRED labels
+# (they are DECLARED, so "no template" is not "undescribed"), and `retire_pass` — the ONLY remover —
+# runs on an INSTALL, never on `--status`. Exempting the class from the ROW was right; exempting it
+# from the EXIT CODE was not: on a box still carrying `com.tortoise.heartbeat-loop.plist`, `--status`
+# printed the retired list as prose, produced no row, and exited 0 — so `scripts/fleet-schedule.py
+# --verify` printed `SCHEDULE VERIFIED` over the exact blind job this change exists to remove, while
+# that job ticked, logged `Access denied`, and delivered nothing. MEASURED on round 7's code with a
+# fixture holding only that plist: rc=0, zero `UNMANAGED` rows, plist still on disk; with the RETIRED
+# line removed from a copy of the templates, rc=1 and the `bootout && rm -f` remedy.
+# So it gets its OWN row class and its own exit contribution — and NOT the delete remedy, which would
+# be wrong twice over (the label IS declared, and `retire_pass` does the bootout AND the removal, on
+# the next install). The state is transient by construction: any install clears it.
+installed_retired_plists() {
+    local installed label
+    # No install dir at all is a known, benign state (nothing was ever installed here).
+    [ -e "$AGENTS_DIR" ] || return 0
+    for installed in "$AGENTS_DIR"/com.eldato.*.plist "$AGENTS_DIR"/com.tortoise.*.plist; do
+        [ -f "$installed" ] || continue
+        label="$(basename "$installed" .plist)"
+        is_retired "$label" || continue
+        printf '%s\n' "$label"
+    done
+}
+
 uninstall_job() {
     local template="$1" label installed
     label="$(job_label "$template")"
@@ -1727,14 +1758,16 @@ uninstall_job() {
     fi
 }
 
-# Retired launchd jobs (#432 — Option C): labels listed in
-# templates/launchd/RETIRED. Their work moved to extensions/session-checks.ts
-# (session_start, age-gated) because launchd cannot run them — macOS TCC
-# blocks launchd-spawned processes from ~/Documents regardless of interpreter
-# (#427/#431). The installer unloads + removes retired jobs on machines that
-# installed them pre-retirement (the template loop only manages PRESENT
-# templates, so a removed template would otherwise strand installed jobs
-# forever).
+# Retired launchd jobs (#432 — Option C): labels listed in templates/launchd/RETIRED. TWO of them
+# (#427/#431) moved to extensions/session-checks.ts (session_start, age-gated) because macOS TCC blocks
+# launchd-spawned processes from ~/Documents regardless of interpreter — and the others were retired
+# for their own reasons, spelled in the manifest beside each label (the #2303 watchdog → the SHIPPED
+# controller-watchdog template; #1867's blind heartbeat → scripts/heartbeat-launch.sh). ⛔ Do NOT state
+# one destination for the CLASS: that sentence was printed to operators and was false for two of the
+# four labels (round 8). The installer unloads + removes retired jobs on machines that installed them
+# pre-retirement (the template loop only manages PRESENT templates, so a removed template would
+# otherwise strand installed jobs forever), and `--status` reports one that is still installed as
+# RETIRED-INSTALLED and exits 1 until that install runs.
 #
 # ⛔ A LABEL HERE RETIRES THE JOB EVEN WHEN ITS TEMPLATE IS STILL PRESENT, AND
 # THAT IS DELIBERATE (#2908). The installer used to ERROR and exit 1 on the
@@ -2042,8 +2075,36 @@ if [ "${1:-}" = "--status" ]; then
         done <<<"$unmanaged"
         status_rc=1
     fi
+    # ── RETIRED, STILL INSTALLED (round 8) — its own row class, its own exit contribution ────────
+    # One line per job, carrying the verdict word, for the same reason `UNMANAGED` does: a consumer
+    # counting markers must count JOBS. The remedy is an INSTALL (which runs `retire_pass`), never
+    # `rm -f` — the label is declared, so a hand-deletion is the wrong instruction, and it would leave
+    # the launchd registration behind.
+    _retired_installed="$(installed_retired_plists)" || true
+    if [ -n "$_retired_installed" ]; then
+        echo "" >&2
+        echo "  ⛔ RETIRED in this repo, STILL INSTALLED here — one line per job:" >&2
+        while IFS= read -r _lbl; do
+            [ -n "$_lbl" ] || continue
+            echo "  ⛔ RETIRED-INSTALLED   $_lbl ($AGENTS_DIR/$_lbl.plist)" >&2
+        done <<<"$_retired_installed"
+        echo "    Each is declared in templates/launchd/RETIRED and removed by retire_pass, which runs on" >&2
+        echo "    an INSTALL — never on --status. Nothing needs them; run:" >&2
+        echo "      bash scripts/install-launchd.sh --install" >&2
+        if [ "$status_rc" -eq 0 ]; then
+            status_rc=1
+        fi
+    fi
+    unset _retired_installed
     if [ -n "$(retired_labels)" ]; then
-        echo "Retired (moved to session-checks, #432): $(retired_labels | tr '\n' ' ')"
+        # ⛔ THE SENTENCE WAS FALSE FOR TWO OF THE THREE LABELS IT NAMED (round 8). It said every
+        # retired job "moved to session-checks, #432" — true of hub-state-check and skill-lint-oracle,
+        # and false of `com.eldato.orchestrator-watchdog` (retired in favour of the SHIPPED
+        # controller-watchdog template) and of `com.tortoise.heartbeat-loop` (whose work moved to
+        # `scripts/heartbeat-launch.sh`). An operator reading the status of the box's blind heartbeat
+        # was told its work lives in session-checks. The list is what matters — which labels are
+        # retired — so it is stated as that, and the reason each was retired lives in the manifest.
+        echo "Retired in this repo (no template; the next install unloads + removes each): $(retired_labels | tr '\n' ' ')"
     fi
     echo "Env: AGENT_INFRA_PATH=$AGENT_INFRA_PATH"
     echo "     TORTOISE_REPO=${TORTOISE_REPO:-<unset — session-checks will use the sibling tortoise or skip the hub leg>}"

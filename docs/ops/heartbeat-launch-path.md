@@ -45,7 +45,7 @@ activity**. That is the false PASS this change exists to make impossible.
 | Verb | What it does | Exit |
 |---|---|---|
 | `heartbeat-launch.sh start` | start the detached loop, once | 0 started or already running · 1 refused |
-| `heartbeat-launch.sh start --dry-run` | print the exact command, run nothing | 0 |
+| `heartbeat-launch.sh start --dry-run` | print the exact command, run nothing | 0 printed · 1 refused |
 | `heartbeat-launch.sh stop` | write the loop's own kill file | 0 |
 | `heartbeat-launch.sh status` | running? how stale is the last pass and the last fleet read? | 0 |
 | `heartbeat-launch.sh check` | **behaviour probe** — see below | 0 OK · 1 DRIFT · 2 UNKNOWN |
@@ -60,6 +60,12 @@ so a box driven entirely from `$HOME/.pi/agent` has the loop and **not** the lau
 starts it must therefore name a checkout (`#1553` owns whether the loop should keep two homes).
 
 `check` answers the question a content comparison cannot: **is the scheduled thing live *and fed*?**
+
+⛔ **`start --dry-run` prints the command and runs nothing, but it still REFUSES** — `1` when the
+environment forbids the start (a `HEARTBEAT-OFF` kill file, a launchd-parented shell, a missing loop
+to run) exactly as `start` would. The environment decides, not the argv: a dry run that printed a
+command the real verb would refuse would be a rehearsal of something that cannot happen. That is why
+the exit column is not a flat `0`.
 
 - **0 OK** — the loop's pidfile names a process whose **own argv is the loop** (`pid_is_loop`:
   a bare "some process holds this number" check is not identity — the kernel reuses pids, so the
@@ -84,9 +90,11 @@ An empty snapshot is **not** a healthy fleet: `degraded` is a *per-row* flag, so
 `scripts/install-launchd.sh` **refuses, hard and non-zero,** any template whose `ProgramArguments`
 name a script listed in `templates/launchd/LAUNCHD-INCOMPATIBLE` — and it names the documented
 launch path instead of installing blindness. `--status` additionally reports an **installed plist
-with no template** as `UNMANAGED` and exits non-zero: that was the blind heartbeat's exact shape, a
-job on the box that the declared set no longer describes, so neither the status pass nor the content
-drift check could see it.
+with no template** as `UNMANAGED` and exits non-zero — that was the blind heartbeat's original shape,
+a job on the box the declared set could not describe, so neither the status pass nor the content
+drift check could see it. Its label is now declared in `RETIRED`, where a still-installed copy is
+reported as `RETIRED-INSTALLED` (also non-zero, but with the install remedy rather than a delete) —
+see the two classes below.
 
 Matching is by **repo-relative suffix**, not absolute prefix: the gate is a property of the script,
 so `$HOME/.pi/agent/scripts/heartbeat-loop.sh` (the farmed copy a plist would actually name) and
@@ -104,10 +112,21 @@ reported as clean.
 Two label classes are **declared** and therefore never reported as `UNMANAGED`, because an alarm that
 is red on a healthy box is one operators learn to ignore:
 
-- `templates/launchd/RETIRED` — pending retirement; `retire_pass` unloads and removes it. The blind
-  job itself (`com.tortoise.heartbeat-loop`, hand-installed, no template ever named it) is listed
-  there, so **the same change that diagnoses it removes it** — otherwise `--status` stayed red until
-  a human hand-deleted a plist, since `--uninstall` iterates templates and nothing describes it.
+- `templates/launchd/RETIRED` — declared, **and pending removal**: `retire_pass` unloads and removes
+  it, on the next `--install`. The blind job itself (`com.tortoise.heartbeat-loop`, hand-installed,
+  no template ever named it) is listed there, so the change that diagnoses it also removes it — no
+  human hand-deletion, which `--uninstall` could not do either, since it iterates templates and
+  nothing describes this label.
+
+  ⛔ **`RETIRED` is not `UNMANAGED`, but it is not green either.** A retired label that is **still
+  installed** is reported as its own row class, `⛔ RETIRED-INSTALLED`, one line per job, and
+  `--status` exits **1** until an install removes it. Exempting the class from the row was right;
+  exempting it from the *exit code* was not — `retire_pass` runs on an install and `--status` never
+  does, so the verb certified a box that was still ticking the blind job, and the caller that
+  normalises it (`scripts/fleet-schedule.py --verify`) printed `SCHEDULE VERIFIED` over it. The
+  remedy printed for this class is `bash scripts/install-launchd.sh --install` — never the
+  `launchctl bootout … && rm -f …` advice, which belongs to jobs nobody declares. The state is
+  transient by construction: any install clears it.
 - `templates/launchd/OWNED-BY-OTHER-INSTALLERS` — installed, **or adopted and supervised**, by
   another surface of this repo. Four labels are there today, each with its declaring surface named
   in the manifest:
