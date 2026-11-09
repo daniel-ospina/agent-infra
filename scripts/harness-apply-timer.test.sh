@@ -4159,14 +4159,66 @@ t28_run() { # <cdpath> — the pass by RELATIVE path from $T/t28, with an EXPLIC
 # ⛔ THE ASSERTION IS THE BOUNDARY, NOT THE PATH. `beside $T/t28/fhx` alone matches a TWO-LINE value as
 # well (its first line is that same string), so on its own it would pin nothing — the text that must
 # follow on the SAME line is `, in $O=`, and a doubled capture puts a newline there instead.
+# ⛔ AND THE PREFIX IS A `pwd` VALUE, NOT `$T` (host-class false block, repaired here). On a host whose
+# `TMPDIR` ends with `/` (macOS), `mktemp -d "$TMPDIR/x.XXXXXX"` yields a `$T` containing `//`, while the
+# pass's `$HERE` is `cd … && pwd` and comes back SINGLE-slashed — so an assertion built from `$T` can
+# never match, and this arm red on macOS for a reason that has nothing to do with CDPATH. Collapsing it
+# the same way the pass does keeps the arm measuring the newline, which is what it is for.
+T28P="$(cd "$T" && pwd)"
 OUT="$(t28_run "$T/t28" 2>&1)"
-assert_contains "$OUT" "beside $T/t28/fhx, in \$O=" \
+assert_contains "$OUT" "beside $T28P/t28/fhx, in \$O=" \
     "T28 an inherited CDPATH does not double \$HERE — the value is ONE line, so every path built from it resolves"
 # Control: the SAME fixture with no CDPATH. If this stops producing the same boundary, the row above is
 # passing for a reason other than the `CDPATH=` prefix and would no longer pin it.
 OUT="$(t28_run "" 2>&1)"
-assert_contains "$OUT" "beside $T/t28/fhx, in \$O=" \
+assert_contains "$OUT" "beside $T28P/t28/fhx, in \$O=" \
     "T28 control: the same boundary holds with no CDPATH at all (so the row above is not an artifact of the fixture)"
+
+# ── T29: THE INSTALLED UNIT EXPORTS ONE HOME, NOT TWO (review F2) ────────────────────────────────
+# ⛔ THE REGRESSION THIS PINS. Once the systemd render was handed the DERIVED home, the unit carried
+# `Environment=HOME=<derivation>` while `HARNESS_APPLY_STATE_DIR` still defaulted to
+# `${HOME}/.pi/agent/state` — the INVOKING SHELL's home. Before that commit both came from `$HOME` and
+# were at least self-consistent; after it, on exactly the channel the derivation targets (`cmux vm exec`,
+# `HOME=/home/ubuntu`, derivation `/home/cmux`), one unit carried TWO homes. The consequence is the
+# #2416/#2032 inert-enforcer shape with the parts swapped: the scheduled pass writes
+# `harness-apply.status` where the box does not look, while an operator (or fleet-health) reads
+# `$CELL_HOME/.pi/agent/state/harness-apply.status` and finds nothing.
+# ⛔ NEITHER EXISTING GUARD COULD SEE IT: `refuse_transient_target` grades transient-scratch patterns
+# (`$T29` is not one), `refuse_systemd_unsafe_values` grades characters, and the pass's own split guard
+# compares `HOME` against the derivation — and `HOME` is now the value that AGREES.
+say_case "T29 the rendered unit exports ONE home: HOME and HARNESS_APPLY_STATE_DIR agree"
+T29="$T/t29"; mkdir -p "$T29/cellhome" "$T29/shellhome" "$T29/units" "$T29/farm/.pi/agent/scripts"
+cp "$PASS_SH" "$T29/farm/.pi/agent/scripts/harness-apply-pass.sh"
+# `HARNESS_APPLY_STATE_DIR` is DELIBERATELY NOT SET: the default is the thing under test.
+# ⛔ `ELDATO_PLATFORM=Linux` IS EXPLICIT (the seam T11 uses for Darwin): the arm grades the SYSTEMD
+# render, and on a Mac the installer would otherwise take the launchd branch and this row would pass or
+# fail for a reason unrelated to the home split (the T3-class host dependence).
+OUT="$(HOME="$T29/shellhome" CELL_HOME="$T29/cellhome" ELDATO_PLATFORM=Linux \
+    HARNESS_APPLY_PASS="$T29/farm/.pi/agent/scripts/harness-apply-pass.sh" \
+    HARNESS_APPLY_REPO="$REPO_P" SYSTEMD_UNIT_DIR="$T29/units" SYSTEMCTL="$T/bin/systemctl" \
+    SYSTEMCTL_CALLS=/dev/null bash "$INST" --install 2>&1)"; RC=$?
+assert_eq "$RC" "0" "T29 the install succeeds on a box whose shell HOME is not its CELL_HOME"
+SVC29="$(cat "$T29/units/eldato-harness-apply.service" 2>/dev/null)"
+UNIT_HOME29="$(printf '%s\n' "$SVC29" | sed -n 's/^Environment=HOME=//p')"
+UNIT_STATE29="$(printf '%s\n' "$SVC29" | sed -n 's/^Environment=HARNESS_APPLY_STATE_DIR=//p')"
+# The two reads must have produced a value each — otherwise the assertions below would compare two
+# empty strings and pass for the wrong reason.
+assert_eq "$UNIT_HOME29" "$T29/cellhome" "T29 the unit's HOME is the DERIVED home (the value that was already fixed)"
+case "$UNIT_STATE29" in
+    "$UNIT_HOME29"/*) ok "T29 …and HARNESS_APPLY_STATE_DIR sits INSIDE that same home, so both Environment= lines name ONE home" ;;
+    *) bad "T29 the unit exports HOME=$UNIT_HOME29 but HARNESS_APPLY_STATE_DIR=$UNIT_STATE29 — one unit, two homes (the pass would record where nobody reads)" ;;
+esac
+assert_absent "$SVC29" "$T29/shellhome" "T29 …and the INVOKING shell's home is nowhere in the unit"
+# The control that makes the row above a test of the default rather than of the seam: an EXPLICIT
+# HARNESS_APPLY_STATE_DIR is still honoured verbatim (it is a documented override, not a victim).
+OUT="$(HOME="$T29/shellhome" CELL_HOME="$T29/cellhome" ELDATO_PLATFORM=Linux \
+    HARNESS_APPLY_PASS="$T29/farm/.pi/agent/scripts/harness-apply-pass.sh" \
+    HARNESS_APPLY_REPO="$REPO_P" HARNESS_APPLY_STATE_DIR="$T29/explicit-state" \
+    SYSTEMD_UNIT_DIR="$T29/units2" SYSTEMCTL="$T/bin/systemctl" SYSTEMCTL_CALLS=/dev/null \
+    bash "$INST" --install 2>&1)"; RC=$?
+assert_eq "$RC" "0" "T29 control: an EXPLICIT HARNESS_APPLY_STATE_DIR still installs"
+assert_contains "$(cat "$T29/units2/eldato-harness-apply.service" 2>/dev/null)" "$T29/explicit-state" \
+    "T29 control: …and is honoured verbatim, so the row above measures the DEFAULT"
 
 echo
 echo "────────────────────────────────────────────────────────"

@@ -60,7 +60,11 @@
 #   HARNESS_APPLY_REPO       the agent-infra checkout the pass converges (default: this repo)
 #   HARNESS_APPLY_REF        the ref to converge on (default origin/main)
 #   HARNESS_APPLY_MODE       pin|sync (default: decided by the pass — see its header)
-#   HARNESS_APPLY_STATE_DIR  the pass record/log dir the unit exports (default $HOME/.pi/agent/state)
+#   HARNESS_APPLY_STATE_DIR  the pass record/log dir the unit exports (default $CELL_HOME/.pi/agent/state
+#                            — ⛔ the DERIVED home, not $HOME: the unit exports `Environment=HOME=$CELL_HOME`,
+#                            so a record dir taken from $HOME would put its two `Environment=` lines in
+#                            DIFFERENT homes, and the scheduled pass would write the record where the box
+#                            does not look (review F2))
 #   CELL_HOME                the cell's ONE home (default: DERIVED — scripts/lib/cell-home.sh). ⛔ It is
 #                            rendered as the unit's `Environment=HOME=`, because the home this unit runs
 #                            as and the home the pass derives are the SAME question, and the pass refuses
@@ -129,7 +133,16 @@ if [ -z "${LAUNCHD_TEMPLATES_DIR:-}" ]; then
 fi
 LAUNCHD_TEMPLATES_DIR="${LAUNCHD_TEMPLATES_DIR:-$INFRA_ROOT/templates/launchd/harness-apply}"
 PLATFORM="${ELDATO_PLATFORM:-$(uname -s 2>/dev/null || printf 'unknown')}"
-STATE_DIR="${HARNESS_APPLY_STATE_DIR:-${HOME:?HOME is required}/.pi/agent/state}"
+# ⛔ THE STATE DIR IS DERIVED FROM THE SAME HOME THE UNIT EXPORTS (review F2). This defaulted to
+# `${HOME:?…}/.pi/agent/state` while the systemd render was handed `$CELL_HOME` as `Environment=HOME=`
+# — so on the very channel this change targets (`cmux vm exec`, `HOME=/home/ubuntu`, derivation
+# `/home/cmux`) the unit carried `HOME=/home/cmux` AND `HARNESS_APPLY_STATE_DIR=/home/ubuntu/.pi/agent/state`:
+# one unit, two homes, i.e. the split this PR exists to remove, reintroduced inside a single file's
+# environment. The observable is the #2416/#2032 inert-enforcer shape with the parts swapped — the
+# scheduled pass writes `harness-apply.status` where nobody reads it, while an operator (or
+# fleet-health) reads `$CELL_HOME/.pi/agent/state/harness-apply.status` and finds nothing. The explicit
+# override still wins, which is the seam the suite and an unusual box use.
+STATE_DIR="${HARNESS_APPLY_STATE_DIR:-${CELL_HOME:?CELL_HOME is required}/.pi/agent/state}"
 INTERVAL_MIN="${HARNESS_APPLY_INTERVAL_MIN:-10}"
 UNIT_NAME="eldato-harness-apply"
 LABEL="com.eldato.${UNIT_NAME#eldato-}"
@@ -197,14 +210,18 @@ help_text() {
 usage() { help_text; exit 2; }
 
 # ── resolve the pass ───────────────────────────────────────────────────────────────────────────
-# The FARMED copy first (that is what a cell has after `pi-bootstrap/setup.sh`, and a unit pointing
-# at a worktree checkout would break the day that worktree is reaped).
+# The farmed copy first (that is what a cell has after `pi-bootstrap/setup.sh`, and a unit pointing
+# at a worktree checkout would break the day that worktree is reaped). ⛔ THE FARM UNDER THE CELL'S OWN
+# HOME COMES BEFORE THE INVOKING SHELL'S (review F2): a `cmux vm exec` start has
+# `HOME=/home/ubuntu` while the farm every unit runs from is under `$CELL_HOME`, so the old order either
+# missed the farmed copy entirely (falling through to a worktree checkout that will be reaped) or found
+# one in a home the unit does not run as — the same seam as STATE_DIR above.
 PASS=""
 if [ -n "${HARNESS_APPLY_PASS:-}" ] && [ ! -f "$HARNESS_APPLY_PASS" ]; then
     err "\$HARNESS_APPLY_PASS is set to '$HARNESS_APPLY_PASS' but that is not a regular file — refusing to install a unit that points at a DIFFERENT copy of the pass"
     exit 2
 fi
-for cand in "${HARNESS_APPLY_PASS:-}" "${HOME:-}/.pi/agent/scripts/harness-apply-pass.sh" "$INFRA_ROOT/scripts/harness-apply-pass.sh"; do
+for cand in "${HARNESS_APPLY_PASS:-}" "$CELL_HOME/.pi/agent/scripts/harness-apply-pass.sh" "${HOME:-}/.pi/agent/scripts/harness-apply-pass.sh" "$INFRA_ROOT/scripts/harness-apply-pass.sh"; do
     [ -n "$cand" ] || continue
     [ -f "$cand" ] && { PASS="$cand"; break; }
 done
