@@ -194,8 +194,10 @@ What the controller now does (`orch-loop.sh`, the `# BEGIN gh-bound` block):
   `until` and `time` were unmodelled while `while` was), so the alternation's group carries all four.
   The stripper keeps the code inside
   `$( … )` and blanks only the literal around it, so the quoted and unquoted spellings of one call are
-  seen alike. All of it is graded by ONE fixture, so each is a pinned property rather than prose: the
-  multi-line arm, the one-line `case`, the `while`/`until` heads, the `time`/`exec` wrappers,
+  seen alike. All of it is graded by ONE fixture, so each is a pinned property rather than prose, and
+  every alternative in the scan's group has its OWN row — the multi-line arm, the one-line `case`, the
+  `while`/`until` loop heads, the other keyword heads (`if`, `then`, `elif`, `!`, `do`, `else`), the
+  `time`/`exec` wrappers, the `{`/`|`/`&`/`(` anchors,
   `x="$(gh api …)"` (incl. the `orch-loop.sh:4910` shape), and an ASSIGNMENT-PREFIXED call
   (`X=1 gh api …` — bash's grammar admits `[assignment]… command`, so the command word there is a
   real command position with no `)`/`|`/keyword anchor) MUST red; an already-bounded arm, its
