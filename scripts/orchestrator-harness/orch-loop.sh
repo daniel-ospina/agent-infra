@@ -2466,6 +2466,13 @@ _orch_argv_is_loop() { # shellcheck disable=SC2086
 # two controllers on one queue (#1715). Do not narrow the scan to the "first non-option token" to fix
 # it: every option-taking form (`-o errexit`, `--rcfile FILE`, `+O shopt`) then makes that token an
 # argument rather than the script, and the missed script becomes a reclaim over a live owner.
+# ⚠️ AND ONE NAMED RESIDUAL IN THE OTHER DIRECTION (fresh review of #3865, P3 — MEASURED): a `-c`-family
+# token that is an OPTION'S VALUE is read as a command string. `bash --rcfile -c <abs>/orch-loop.sh` really
+# RUNS the script (its `ps` column is `bash --rcfile -c /abs/orch-loop.sh`), and it answers rc 1 = RECLAIM
+# over a running controller — the #1715 direction. It needs a file literally named `-c`, so it is exotic,
+# and skipping a value-taking option's operand would re-open the ambiguity this rule exists for. Named
+# here rather than left to be rediscovered; the fix, if it ever bites, is to skip the operand of the
+# known value-taking long options (`--rcfile`, `--init-file`) only.
 _orch_argv_is_loop_flagged() { # shellcheck disable=SC2086
   local _t
   set -- $*
