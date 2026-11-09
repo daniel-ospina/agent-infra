@@ -2894,6 +2894,11 @@ export REAP_OPEN_LIMIT REAP_PR_LIMIT
 # the LISTING (a gh/tier/jq read), not about provisioning, and the record must say which.
 refresh_stage list "rest_list issues/pulls --repo $OR (open-issue + PR-branch listings, REAP_OPEN_LIMIT=$REAP_OPEN_LIMIT REAP_PR_LIMIT=$REAP_PR_LIMIT)"
 if [ "$REAP_OPEN_LIMIT" -eq 0 ]; then
+  # ⛔ REMOVED, NOT MERELY NOT-WRITTEN (#2183's doctrine, applied to this skip). A killed pass can
+  # leave LAST pass's `.open_iss` behind, and a file this pass did not write must not be readable as
+  # this pass's answer — before the skip this could not bite because the window was always
+  # overwritten or deleted on failure.
+  rm -f "$O/.open_iss"
   echo "[refresh] listings: the open-issue window is NOT requested — dispatched.txt names no rows, and it is that window's only consumer (#1984); a pass that has nothing to reap cannot answer differently for having read it"
 elif ! rest_list issues --repo "$OR" --state open --limit "$REAP_OPEN_LIMIT" --jq '.[].number' > "$O/.open_iss" 2>"$O/.list-err"; then
   rm -f "$O/.open_iss"
@@ -2901,6 +2906,7 @@ elif ! rest_list issues --repo "$OR" --state open --limit "$REAP_OPEN_LIMIT" --j
   [ -s "$O/.list-err" ] && sed -n '1,2p' "$O/.list-err" | sed 's/^/[refresh]   /'
 fi
 if [ "$REAP_PR_LIMIT" -eq 0 ]; then
+  rm -f "$O/.pr_brs"
   echo "[refresh] listings: the PR-branch window is NOT requested — dispatched.txt and checked.txt both name no rows, and nothing else reads it (#1984)"
 else
   if ! rest_list pulls --repo "$OR" --state all --limit "$REAP_PR_LIMIT" --jq '.[]|.head.ref' > "$O/.pr_brs" 2>"$O/.list-err"; then
