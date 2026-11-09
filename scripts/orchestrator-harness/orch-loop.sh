@@ -2454,8 +2454,11 @@ _orch_argv_is_loop() { # shellcheck disable=SC2086
 # repo's OWN classifier decision says such an argv IS an invocation: `check-deployed-drift.test.sh`
 # §10a-3e (the `for _v in 'bash -o pipefail' … 'bash +o errexit' …` fixture) asserts that every one of
 # those forms over `<abs>/orch-loop.sh` is an INVOCATION. A `-`-only option test minted that form into
-# rc 1 = RECLAIM over a LIVE owner — a fail-OPEN regression versus `main`, which refused any live pid
-# (fresh review at 8eb852d27, P2; MEASURED end-to-end: STARTED, `[lock] reclaiming …`, owner still alive).
+# rc 1 = RECLAIM over a LIVE owner — which `main` does too, MEASURED (its own predicate is the `-`-only
+# form), so this CLOSES a fail-open band that both `main` and the pre-#1985 loop had in different shapes:
+# the pre-#1985 loop refused any live pid, and #1985's shape rule reclaimed on a `+`-form option
+# (fresh review of #3865 at 8c3346680, P3 — an earlier wording here called it a regression versus `main`,
+# which is measurably wrong).
 # ⚠️ ONE NAMED OVER-REFUSAL, stated rather than discovered later: the token scan is ANY-token (so that
 # no plausible option form can miss the script), which means a non-controller whose argv merely NAMES the
 # script behind an option — `bash -x grep /abs/orch-loop.sh` — is refused as ambiguous instead of
@@ -2470,13 +2473,20 @@ _orch_argv_is_loop_flagged() { # shellcheck disable=SC2086
   case "${1##*/}" in bash|sh|dash|zsh) ;; *) return 1 ;; esac
   case "$2" in -*) ;; +*) ;; *) return 1 ;; esac          # token 2 must be a shell OPTION, either polarity
   for _t in "$@"; do                                # ORDERED: a `-c` before the script is #1856's wrapper
-    # ⛔ `+c` IS THE SAME TOKEN IN THE OTHER POLARITY, and leaving it out made the rule inconsistent with
-    # its own premise (fresh review of #3865 at f8604c74c, P3; MEASURED: `bash +c 'echo X'` and
-    # `bash +cx 'echo X'` both EXECUTE the string — as does `dash +c '…'`). So `bash +c "…;
-    # /abs/orch-loop.sh"` answered CANNOT-TELL and would need a human `rm -f`, while the `-c` spelling of
-    # the SAME argv reclaims. Fail-closed, so no safety loss — but a refusal the stated rule says cannot
-    # happen, which is the kind of drift that turns a rule into folklore. Both polarities now exempt.
-    case "$_t" in -c|--command|-[!-]*c*|+c|+[!-]*c*) return 1 ;; esac
+    # ⛔ `+c` IS THE SAME TOKEN IN THE OTHER POLARITY (fresh review of #3865, MEASURED: `bash +c 'echo X'`
+    # and `bash +cx 'echo X'` both EXECUTE the string).
+    # ⛔ AND `-c` IS A LETTER IN A SHORT-OPTION CLUSTER, NOT A WHOLE TOKEN: `-cx`, `-ce` and `+cx` are
+    # the same family and a whole-token match (`-[!-]*c*`) missed `-cx`/`-ce` entirely, so those spellings
+    # were refused as ambiguous while executing the string (fresh review of #3865 at 8c3346680, P3;
+    # `+cx` answered RECLAIM on the base and CANNOT-TELL here — a NEW over-refusal for a spelling this
+    # rule names). LONG options are NOT the family (`--rcfile FILE` leaves the script as an argument, so
+    # `--*` falls through to the ambiguous answer), and a short cluster only means `-c` when it carries a
+    # literal `c` — `-o pipefail`, `-x`, `+o errexit` do not.
+    case "$_t" in
+      --command) return 1 ;;                                              # the LONG spelling of -c
+      --*) ;;                                                             # any other long option: not the family
+      -c|-*c*|+c|+*c*) return 1 ;;                                        # short cluster carrying `c`
+    esac
     case "${_t##*/}" in orch-loop.sh) return 0 ;; esac
   done
   return 1

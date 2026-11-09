@@ -59,7 +59,12 @@
 #      one `^trap` line mentioning the lock, its signal list EXACTLY `EXIT` (matched per WHOLE token, so
 #      `SIGEXIT` — which bash REJECTS, installing no trap — reds instead of reading as `EXIT`), and it
 #      removes `$LOCKF` on COMMENT-STRIPPED text (so a trailing comment naming the command cannot answer
-#      it). Stated false REDs: a trailing suffix after the signals, and a double-quoted removal spelling.
+#      it). Stated false RED: a trailing suffix after the signals. (`SIGEXIT` is NOT in that list and is
+#      not a false RED at all — bash REJECTS it and installs no trap, so it must red; a DOUBLE-QUOTED
+#      trap including the removal PASSES, which is what §9c row 7 pins. Only the UNQUOTED-variable
+#      spelling `rm -f $LOCKF` reds the removal clause, and the subject does not use it.)
+#      AND THE RELEASING TRAP MUST BE THE ONLY `EXIT` TRAP: a later `trap … EXIT` REPLACES it, so the
+#      lock would never be removed while both traps are spelled correctly.
 #
 # ⛔ THE SUBJECT IS THE REAL `orch-loop.sh`, NOT A RE-IMPLEMENTATION. The lock block lives in a marked
 # section (`# [orchlock:begin] … # [orchlock:end]`), which this suite EXTRACTS with `sed` and runs as
@@ -179,6 +184,15 @@ trap_pin() {
 LOCK_TRAPS="$(grep -E '^trap .*LOCKF' "$SUBJECT" 2>/dev/null)"
 trap_pin "$LOCK_TRAPS"
 ck "the lock is released by ONE trap and its signal list is EXACTLY 'EXIT' (a returning INT/TERM handler deleted it while the loop lived — #1715)" $?
+# ⛔ AND IT MUST BE THE ONLY `EXIT` TRAP, BECAUSE A LATER ONE REPLACES IT (fresh review of #3865 at
+# 8c3346680, P2 — false PASS, MEASURED: appending `trap 'true' EXIT` after the releaser left the suite
+# at `PASS=118 FAIL=0`, while bash REPLACES the handler — `bash -c 'trap "echo FIRST" EXIT; trap
+# "echo SECOND" EXIT'` prints only `SECOND` — so the lock is never removed. The pin above counts only
+# traps that MENTION `$LOCKF`, which is exactly the shape a lane adding a second trap line does not
+# touch, and this PR's own prose invites extending the EXIT trap.)
+EXIT_TRAPS="$(grep -E '^trap .* EXIT' "$SUBJECT" 2>/dev/null)"
+[ "$(grep -c . <<<"$EXIT_TRAPS")" = 1 ]
+ck "the releasing trap is the ONLY 'EXIT' trap (a second 'trap ... EXIT' REPLACES the first, so the lock is never removed)" $?
 # ── 9c) THE PIN ITSELF, DRIVEN OVER THE SPELLINGS THAT DEFEATED IT ────────────────────────────────
 # A pin that is never driven against its own near-misses is how this arm shipped a false PASS twice
 # (2026-11-09: the comment-match, then the `SIGEXIT` and trailing-comment ones). Each row is a
@@ -884,8 +898,9 @@ kill -9 "$XP" 2>/dev/null
 # such an argv as an INVOCATION: `check-deployed-drift.test.sh` §10a-3e drives `bash -o pipefail`,
 # `bash -O extglob`, `bash +o noexec`, `bash +o errexit`, `bash --rcfile noexec`, `bash -euo pipefail` …
 # over `<abs>/orch-loop.sh` and asserts each one IS an invocation. A `-`-only option
-# test answered rc 1 = RECLAIM for that argv, so the next start DELETED the lock of a live owner — a
-# fail-OPEN regression versus `main`, which refused any live pid. MEASURED before the fix, same fixture:
+# test RECLAIMED over a live owner — which `main` also does (MEASURED: its own predicate is the `-`-only
+# form), so this CLOSES a fail-open band rather than restoring one; the pre-#1985 loop refused any live
+# pid, and #1985's shape rule opened the band this arm closes. MEASURED before the fix, same fixture:
 # `STARTED` + `[lock] reclaiming … provably NOT the owner` with the owner still alive.
 # ⛔ AND NO BACKTICKS IN A DOUBLE-QUOTED LABEL (found by this round's test run, P2; MEASURED: the labels
 # printed with a HOLE — "a live owner behind  is not reclaimed" — and the option words were EXECUTED at
@@ -951,6 +966,21 @@ ck "17b: a '+c' wrapper is RECLAIMED too (the exemption holds for BOTH polaritie
    "$(ran && [ "$RC" -eq 0 ] && echo 0 || echo 1)"
 pkill -P "$ZP" 2>/dev/null
 kill -9 "$ZP" 2>/dev/null
+# ⛔ AND `c` INSIDE A SHORT-OPTION CLUSTER IS STILL THE SAME FAMILY (fresh review of #3865 at 8c3346680,
+# P3 — MEASURED: `bash +cx 'echo FROM_PLUS_CX'` and `bash -ce …` BOTH execute the string, while a
+# whole-token match missed both, so those spellings were refused as ambiguous even though they execute.
+# Two rows, one per polarity, so the cluster rule is witnessed and not merely written.)
+for _cf in '+cx' '-ce'; do
+  mkcase; CASE_DIR="$C"
+  bash "$_cf" "for _ in \$(seq 1 60); do sleep 1; done; $C/peer/orch-loop.sh" >/dev/null 2>&1 &
+  TP=$!; KIDS="$KIDS $TP"; sleep 0.4
+  printf '%s\n' "$TP" > "$C/o/.orch.lock"
+  run_drv O="$C/o"
+  ck "17c: a '$_cf' cluster wrapper is RECLAIMED (c inside a short-option cluster is the -c family)" \
+     "$(ran && [ "$RC" -eq 0 ] && echo 0 || echo 1)"
+  pkill -P "$TP" 2>/dev/null
+  kill -9 "$TP" 2>/dev/null
+done
 
 # ── recap ───────────────────────────────────────────────────────────────────────────────────────
 echo
