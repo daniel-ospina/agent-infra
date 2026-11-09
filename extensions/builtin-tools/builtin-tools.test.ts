@@ -12,7 +12,7 @@
  * node_modules/typebox. Created by CI setup or manually.
  */
 
-import { stripHtml, getPerplexityKey, augmentPath, PATH_EXTRA_DIRS, getPiInvocation, getSubAgentPath, resolveProviderModel, loadModelRegistry, getModelsJsonPath, getExitGraceMs, DEFAULT_EXIT_GRACE_MS, armExitWatchdog, getExitCompleteGraceMs, DEFAULT_EXIT_COMPLETE_GRACE_MS, armCompletionWatchdog, composeTaskResult, getFallbackModel, DEFAULT_FALLBACK_MODEL, connectionErrorDetected, shouldFallback, resolveProviderBaseUrl, HEARTBEAT_MARKER_PREFIX, HEARTBEAT_INTERVAL_MIN_MS, HEARTBEAT_INTERVAL_MAX_MS, DEFAULT_HEARTBEAT_INTERVAL_MS, DEFAULT_STREAM_STALL_MS, DEFAULT_TOOL_STALL_MS, DEFAULT_FIRST_MESSAGE_MS, clampHeartbeatIntervalMs, getHeartbeatIntervalMs, getStreamStallMs, getToolStallMs, getFirstMessageMs, createHeartbeatState, parseHeartbeatLine, flushHeartbeatResidue, flushHeartbeatLineBuf, ingestHeartbeatChunk, heartbeatKillDecision, HEARTBEAT_LINE_BUF_MAX, HEARTBEAT_TRACE_MAX, getTaskMaxDispatchMs, getTaskHardCapMs, DEFAULT_HARD_CAP_MS, loadScaledBound, getFirstOutputTimeoutMs, getSystemLoad, setLoad1Override, getLoad1, getCutGapMs, getEffectiveCutGapMs, getCpuStallMs, DEFAULT_CPU_STALL_MS, DEFAULT_PROGRESS_AGE_MS, getProgressAgeMs, classifyTaskExit, getTaskBackstopMs, DEFAULT_BACKSTOP_MARGIN_MS, DEFAULT_TASK_MODEL, renderRepoStateLine, renderMachineStateLine, countPiProcs, countPiInPsOutput, formatLoad1, probeSystemLoad, resolveTaskCwd, taskCwdRefusal, spawnSubAgent, resolveStreamStallMs, streamStallInertWarning, inFlightProgress, DEFAULT_SESSION_CEILING_MULT, resolveSessionCeiling, isDispatchSaturated, saturationNotice, dispatchSaturationRefusal, probeDispatchSaturation, probePiProcs, setPiProcsOverride, classifyChildLiveness, childMessagesSent, TASK_LIVENESS_DETAIL_KEYS, stampLivenessDefaults, childLivenessFor, exhaustionStatusFor, classifyBackgroundOutcome, readMarkerAge, decisionSnapshotStale, supersedingEvidence } from "./index.js";
+import { stripHtml, getPerplexityKey, augmentPath, PATH_EXTRA_DIRS, getPiInvocation, getSubAgentPath, resolveProviderModel, loadModelRegistry, getModelsJsonPath, getExitGraceMs, DEFAULT_EXIT_GRACE_MS, armExitWatchdog, getExitCompleteGraceMs, DEFAULT_EXIT_COMPLETE_GRACE_MS, armCompletionWatchdog, composeTaskResult, getFallbackModel, DEFAULT_FALLBACK_MODEL, connectionErrorDetected, shouldFallback, resolveProviderBaseUrl, HEARTBEAT_MARKER_PREFIX, HEARTBEAT_INTERVAL_MIN_MS, HEARTBEAT_INTERVAL_MAX_MS, DEFAULT_HEARTBEAT_INTERVAL_MS, DEFAULT_STREAM_STALL_MS, DEFAULT_TOOL_STALL_MS, DEFAULT_FIRST_MESSAGE_MS, clampHeartbeatIntervalMs, getHeartbeatIntervalMs, getStreamStallMs, getToolStallMs, getFirstMessageMs, createHeartbeatState, parseHeartbeatLine, flushHeartbeatResidue, flushHeartbeatLineBuf, ingestHeartbeatChunk, heartbeatKillDecision, HEARTBEAT_LINE_BUF_MAX, HEARTBEAT_TRACE_MAX, getTaskMaxDispatchMs, getTaskHardCapMs, DEFAULT_HARD_CAP_MS, loadScaledBound, getFirstOutputTimeoutMs, getSystemLoad, setLoad1Override, getLoad1, getCutGapMs, getEffectiveCutGapMs, getCpuStallMs, DEFAULT_CPU_STALL_MS, DEFAULT_PROGRESS_AGE_MS, getProgressAgeMs, classifyTaskExit, getTaskBackstopMs, DEFAULT_BACKSTOP_MARGIN_MS, DEFAULT_TASK_MODEL, renderRepoStateLine, renderMachineStateLine, countPiProcs, countPiInPsOutput, formatLoad1, probeSystemLoad, resolveTaskCwd, taskCwdRefusal, describeSpawnFailure, spawnSubAgent, resolveStreamStallMs, streamStallInertWarning, inFlightProgress, DEFAULT_SESSION_CEILING_MULT, resolveSessionCeiling, isDispatchSaturated, saturationNotice, dispatchSaturationRefusal, probeDispatchSaturation, probePiProcs, setPiProcsOverride, classifyChildLiveness, childMessagesSent, TASK_LIVENESS_DETAIL_KEYS, stampLivenessDefaults, childLivenessFor, exhaustionStatusFor, classifyBackgroundOutcome, readMarkerAge, decisionSnapshotStale, supersedingEvidence } from "./index.js";
 import { dispatchUnkeyedSet } from "../shared/provider-failover.js";
 import { asyncRepoState } from "../repo-freshness.js";
 import builtinTools from "./index.js";
@@ -30,7 +30,7 @@ const childFactory: (pi: any) => void =
 import type { ModelRegistry } from "./index.js";
 import { ok, equal, deepEqual } from "node:assert/strict";
 import { EventEmitter } from "node:events";
-import { spawn, execSync } from "node:child_process";
+import { spawn, spawnSync, execSync } from "node:child_process";
 import { treeKill } from "../shared/tree-kill.js";
 import { readFileSync, renameSync, existsSync, writeFileSync, rmSync, mkdirSync, chmodSync, mkdtempSync, realpathSync, utimesSync, statSync } from "node:fs";
 import { createRequire } from "node:module";
@@ -7731,6 +7731,202 @@ test("#1071 (review fix): an existing target is canonicalized to its PHYSICAL pa
   } finally {
     rmSync(link, { recursive: true, force: true });
     rmSync(real, { recursive: true, force: true });
+  }
+});
+
+// ── #1698: a MISSING spawn cwd names the CAUSE, not the binary ───────
+//
+section("#1698 — a missing spawn cwd names the cause");
+
+// POSITIVE CONTROL, measuring the premise rather than asserting it: Node reports a
+// missing working directory as an ENOENT naming the EXECUTABLE (`spawn <binary>
+// ENOENT`), never the directory. That is the whole defect — the raw message reads
+// as "pi is not installed", so a swept /tmp worktree costs calls to misdiagnose.
+// If a future Node named the cwd itself, the pin below would be pinning a shape
+// that no longer occurs, so this control fails loudly first.
+test("#1698: `spawn` reports a missing cwd as an ENOENT on the BINARY — the misdiagnosis this fixes", () => {
+  const ghost = join(tmpdir(), `t1698-ghost-${process.pid}-${Math.random().toString(16).slice(2)}`);
+  const r = spawnSync(process.execPath, ["-e", "1"], { cwd: ghost });
+  equal(r.error?.code, "ENOENT", "a missing cwd surfaces as ENOENT");
+  ok(/ENOENT/.test(String(r.error?.message)), `the message carries the errno: ${r.error?.message}`);
+  ok(!String(r.error?.message).includes(ghost), `and does NOT name the missing directory — it names the binary: ${r.error?.message}`);
+});
+
+// The fix: an ENOENT whose cwd is genuinely ABSENT gets the cause named, and the
+// original message is preserved (so nothing is lost from what Node said).
+test("#1698: an ENOENT with a MISSING cwd names the directory and denies the pi-install reading", () => {
+  const ghost = join(tmpdir(), `t1698-missing-${process.pid}-${Math.random().toString(16).slice(2)}`);
+  const err = Object.assign(new Error(`spawn ${process.execPath} ENOENT`), { code: "ENOENT" });
+  const msg = describeSpawnFailure(err, ghost);
+  ok(msg.startsWith(`spawn ${process.execPath} ENOENT`), `the original message is preserved: ${msg}`);
+  ok(msg.includes(`(spawn cwd: ${ghost})`), `the cwd it was handed is still reported: ${msg}`);
+  ok(msg.includes("DOES NOT EXIST"), `the cause is named: ${msg}`);
+  ok(msg.includes(ghost), `the missing directory is named: ${msg}`);
+  ok(/NOT a missing `pi` install/.test(msg), `it denies the reading the raw errno invites: ${msg}`);
+});
+
+// The mirror: an ENOENT whose cwd EXISTS really does mean the binary is missing,
+// so the plain message must stand — claiming "the cwd was swept" there would send
+// the reader to rebuild a directory that is right in front of them.
+test("#1698: an ENOENT with an EXISTING cwd keeps the plain message (the binary IS what is missing)", () => {
+  const dir = mkdtempSync(join(tmpdir(), "t1698-exists-"));
+  try {
+    const err = Object.assign(new Error(`spawn /nonexistent/pi ENOENT`), { code: "ENOENT" });
+    const msg = describeSpawnFailure(err, dir);
+    equal(msg, `spawn /nonexistent/pi ENOENT (spawn cwd: ${dir})`, "byte-exact plain message — no cause claimed");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// Any other errno means the path may well exist (EACCES on a mode-000 dir, EPERM,
+// a stale mount). The fail-safe direction is NO cause claim: a wrong "this was
+// swept" is worse than the generic message it replaced.
+test("#1698: a non-ENOENT failure with a missing cwd makes NO claim (fail-safe)", () => {
+  const ghost = join(tmpdir(), `t1698-eacces-${process.pid}-${Math.random().toString(16).slice(2)}`);
+  const err = Object.assign(new Error("spawn /x EACCES"), { code: "EACCES" });
+  equal(describeSpawnFailure(err, ghost), `spawn /x EACCES (spawn cwd: ${ghost})`, "no cause claimed on an unrecognised errno");
+  equal(describeSpawnFailure({ message: "boom" }, ghost), `boom (spawn cwd: ${ghost})`, "an errno-less error stays plain");
+});
+
+// TOTAL by construction: this runs on the settle path of a failed dispatch, so it
+// must never throw — a throw here would replace the child's failure with a crash.
+test("#1698: describeSpawnFailure is total — odd inputs never throw", () => {
+  const ghost = join(tmpdir(), `t1698-total-${process.pid}-${Math.random().toString(16).slice(2)}`);
+  for (const bad of [undefined, null, "a string", 42, {}, { code: "ENOENT" }]) {
+    const msg = describeSpawnFailure(bad, ghost);
+    ok(typeof msg === "string" && msg.includes(ghost), `odd input ${String(bad)} still yields a message naming the cwd: ${msg}`);
+  }
+  const enoentNoMessage = { code: "ENOENT" };
+  ok(describeSpawnFailure(enoentNoMessage, ghost).includes("DOES NOT EXIST"), "an errno-only object still gets the cause named");
+});
+
+// THE FAIL-SAFE DIRECTION, PINNED (review round 5, P3 — verified finding). The row
+// above exercises only `exists` and `absent`. The branch the `isAbsentPath` doc
+// comment spends six lines on — a path that EXISTS but whose `statSync` FAILS — was
+// asserted by comment only: `catch { return true; }` left every `#1698` row GREEN
+// before this one. A directory the process cannot traverse (mode 000)
+// makes `statSync` on a child throw `EACCES` while the child is really there, so the
+// mutant `catch { return true; }` would append "the cwd does not exist" to a
+// directory sitting on disk — the misdiagnosis the guard exists to prevent.
+test("#1698: an existing cwd whose stat FAILS keeps the plain message (the fail-safe arm)", () => {
+  const parent = mkdtempSync(join(tmpdir(), "t1698-eacces-"));
+  const child = join(parent, "child");
+  mkdirSync(child);
+  // Mode bits deny nothing to uid 0, where the premise does not hold — declared
+  // rather than silently asserting a green row that measured nothing.
+  if (typeof process.getuid === "function" && process.getuid() === 0) return;
+  chmodSync(parent, 0o000);
+  try {
+    // The premise: the child EXISTS, and `statSync` on it still throws.
+    let threw = false;
+    try {
+      statSync(child);
+    } catch {
+      threw = true;
+    }
+    ok(threw, "premise — an untraversable parent makes statSync throw on a child that exists");
+    equal(
+      describeSpawnFailure({ code: "ENOENT", message: "spawn /x ENOENT" }, child),
+      `spawn /x ENOENT (spawn cwd: ${child})`,
+      "a stat failure that is NOT ENOENT/ENOTDIR claims nothing — the directory is still there",
+    );
+  } finally {
+    chmodSync(parent, 0o700);
+    rmSync(parent, { recursive: true, force: true });
+  }
+});
+
+// ⛔ THE OTHER HALF OF THE SAME GUARD (review round 5, P3 — the `ENOTDIR` arm). The
+// row above pins the catch: a failure that is neither `ENOENT` nor `ENOTDIR` must
+// claim nothing. But `isAbsentPath` accepts the PAIR, and dropping `ENOTDIR` from it
+// (`return code === "ENOENT"`) reddened NO row before this one existed — measured on
+// the real `index.ts`; now this is the only row that reddens. The arm is kept as
+// DEFENCE-IN-DEPTH, not as the guard that rescues a common shape — measured (node
+// v24.21.0): a cwd whose ANCESTOR IS A FILE makes `spawn` throw SYNCHRONOUSLY with
+// `code: "ENOTDIR"` / message `spawn ENOTDIR`, so no ChildProcess exists, no async
+// `error` event fires, and `describeSpawnFailure` (reached only from `proc.on("error")`)
+// is never called for that shape at all — which is why THIS ROW IS A PREDICATE-CONTRACT
+// ROW, not a replay of a producible state: it calls the helper with `{ code: "ENOENT" }`
+// deliberately, to pin `isAbsentPath`'s answer for an `ENOTDIR` path. It must not be
+// read as claiming that spawn ever reports ENOENT for that path (it does not). The
+// arm still earns its place: it keeps `isAbsentPath` correct as a plain predicate — a
+// path under a FILE cannot exist — so any caller that DOES hand it one (a cross-check,
+// a future sync `catch`) gets the true answer instead of "this path exists".
+test("#1698: isAbsentPath's ENOTDIR arm — a path under a FILE is ABSENT (predicate contract, not a spawn replay)", () => {
+  const dir = mkdtempSync(join(tmpdir(), "t1698-enotdir-"));
+  try {
+    const file = join(dir, "not-a-dir");
+    writeFileSync(file, "x");
+    const under = join(file, "child");
+    let code: string | undefined;
+    try {
+      statSync(under);
+    } catch (err) {
+      code = (err as { code?: string } | null)?.code;
+    }
+    equal(code, "ENOTDIR", "premise — the probe really hits ENOTDIR here, not ENOENT");
+    ok(
+      describeSpawnFailure({ code: "ENOENT", message: "spawn /x ENOENT" }, under).includes("DOES NOT EXIST"),
+      "the ENOTDIR arm names the cause for a path under a FILE (called directly: production throws ENOTDIR synchronously, so this pins the PREDICATE, not a spawn replay)",
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ⛔ THE CALL SITE, PINNED (review round 2, P2 — verified finding). The five rows
+// above test `describeSpawnFailure` DIRECTLY, so before this block the mutant
+// `:5152 → text: `Sub-agent failed: ${err.message} (spawn cwd: ${targetCwd})``
+// restored the entire #1698 defect and every one of them stayed GREEN: not one row
+// in this file referenced `Sub-agent failed`. An assertion that cannot fail under
+// the mutation that reverts the fix is the class #3442 names. Two rows, in the
+// order of strength this file already uses:
+//   (i)  SOURCE pin — deterministic, anchored, and it names the exact substitution;
+//   (ii) BEHAVIOURAL pin — the settle a failed dispatch actually reports. A
+//        nonexistent cwd is the one target `taskCwdRefusal` deliberately lets
+//        through (`:3977`), so this exercises the real path the fix exists for,
+//        with no child: `spawn` fails before exec.
+test("#1698: the spawn-error settle CALLS describeSpawnFailure (source pin — the call-site mutation)", () => {
+  ok(
+    source.includes("Sub-agent failed: ${describeSpawnFailure(err, targetCwd)}"),
+    "the settle composes its message through describeSpawnFailure (reverting this restores the #1698 defect)",
+  );
+  // The negative twin: the pre-fix form must be GONE, not merely accompanied. A
+  // bare `includes` on the new text would stay green if an old-shaped producer
+  // were added beside it.
+  ok(
+    !source.includes("Sub-agent failed: ${err.message} (spawn cwd: ${targetCwd})"),
+    "no producer still reports the raw errno with no cause named",
+  );
+});
+
+testAsync("#1698 (behavioural): a dispatch into a MISSING cwd settles with the cause named", async () => {
+  const ghost = join(tmpdir(), `t1698-settle-${process.pid}-${Math.random().toString(16).slice(2)}`);
+  // `process.argv[1] = undefined` makes getPiInvocation fall back to bare `pi`
+  // (cut-resume.integration.test.ts precedent) — irrelevant to the outcome here,
+  // because the cwd is missing, so `spawn` fails before any exec.
+  const prevArgv1 = process.argv[1];
+  (process.argv as unknown as string[])[1] = undefined as unknown as string;
+  try {
+    const res = await Promise.race([
+      // No row in the operator's ledger for a test dispatch (#783 gate). Without
+      // this the settle writes a fake `spawn-error` dispatch-outcome row — with a
+      // `/tmp/t1698-settle-*` cwd and `dispatchId: null` — into the append-only
+      // operator audit ledger on EVERY run (measured: 3 such rows accrued in one
+      // session's test runs). Same rule as the `#1071` row below.
+      spawnSubAgent("deepseek-v4-flash", "deepseek", { DISPATCH_LEDGER: "0" }, ["--version"], undefined, undefined, ghost),
+      new Promise<null>((r) => setTimeout(() => r(null), 20_000)),
+    ]);
+    ok(res !== null, "the dispatch SETTLES on a missing cwd (it must not hang the parent)");
+    const text = String((res as { content?: { text?: string }[] } | null)?.content?.[0]?.text ?? "");
+    ok(text.includes("Sub-agent failed"), `the settle message is composed: ${text}`);
+    ok(text.includes("DOES NOT EXIST"), `it names the missing cwd as the CAUSE — the wiring this row exists for: ${text}`);
+    ok(text.includes(ghost), `it names the directory: ${text}`);
+    ok(/NOT a missing `pi` install/.test(text), `it denies the reading the raw errno invites: ${text}`);
+    equal((res as { details?: { isError?: unknown } } | null)?.details?.isError, true, "still reported as an error, never a success");
+  } finally {
+    (process.argv as unknown as string[])[1] = prevArgv1;
   }
 });
 
