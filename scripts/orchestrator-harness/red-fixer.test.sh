@@ -348,6 +348,11 @@ drive_route() {
     # `head_reds` asks gh; the stub answers the three shapes it can return. A stub that printed
     # nothing would make the role read UNKNOWN everywhere and silently grade the wrong branch.
     gh() { printf '[{"name":"lint","state":"%s"}]\n' "${GH_STATE:-FAILURE}"; return 0; }
+    # ⛔ THE EXTRACTED BLOCK CALLS `gh_bounded`, NOT `gh` (agent-infra#2028). A TRANSPARENT
+    # PASS-THROUGH on purpose: the bound is graded by `gh-bound.test.sh` against the real block, and
+    # repeating it in every rig would make these suites depend on `scripts/lib/bounded.sh` on the
+    # runner. The name is pinned — without it every read below answers nothing.
+    gh_bounded() { gh "$@"; }
     can_spawn() { return 0; }
     # A ledger row is a TAB-delimited record; the summary counts act vs wait, so the stub records
     # which it was (the router's claim "it acted" must be checkable).
@@ -643,7 +648,8 @@ drive_route red-tree deadbeefdeadbeefdeadbeefdeadbeefdeadbeef deadbeefdeadbeefde
 
 echo
 echo "  -- (4b-pred) the clearance predicate fails CLOSED (a miss is never a green) --"
-reds_of() { ( OR=o/r; JSON="$1"; . "$TMP/headreds.sh"; gh() { printf '%s\n' "$JSON"; }; head_reds 1 ); }
+reds_of() { ( OR=o/r; JSON="$1"; . "$TMP/headreds.sh"; gh() { printf '%s\n' "$JSON"; };
+  gh_bounded() { gh "$@"; }; head_reds 1 ); }   # the shipped read is bounded (agent-infra#2028)
 [ "$(reds_of '[{"name":"lint","state":"FAILURE"}]')" = "RED" ] \
   && ok "a completed red is RED" || bad "a completed red is not RED"
 [ "$(reds_of '[{"name":"lint","state":"SUCCESS"}]')" = "GREEN" ] \

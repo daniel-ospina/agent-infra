@@ -42,6 +42,13 @@ awk '/^  # BEGIN sweep-listing/,/^  # END sweep-listing/' "$LOOP" > "$T/block.sh
 # cannot drift.
 grep -m1 '^is_num() {' "$LOOP" > "$T/deps.sh"
 cat "$T/quota.sh" >> "$T/deps.sh"
+# ⛔ EVERY `gh` CALL IN THE EXTRACTED BLOCK NOW GOES THROUGH THE SHIPPED `gh_bounded` (agent-infra#2028),
+# so the rig needs that name. It is stubbed as a TRANSPARENT PASS-THROUGH here on purpose: the bound
+# ITSELF is graded by `gh-bound.test.sh` against the real shipped block, and repeating it here would make
+# this suite depend on `scripts/lib/bounded.sh` being installed on the runner — a quota suite that fails
+# for a reason it does not test. The name is still pinned: a rename in the shipped block would leave the
+# call unresolved and every check below RED.
+printf 'gh_bounded() { gh "$@"; }\n' >> "$T/deps.sh"
 
 # ── the stub `gh` ───────────────────────────────────────────────────────────────
 # Records every argv to $GH_CALLS, then prints a canned `gh api --include` response. The 200 body is
@@ -191,7 +198,11 @@ fi
 
 # ── 2) the listing must be the conditional REST call, not `gh pr list` ───────────
 if need "$T/block.sh" "the sweep-listing block"; then
-  grep -q 'gh api --paginate -i' "$T/block.sh" && ok "the shipped listing uses a REST \`gh api\` call (ETags live there)" \
+  # ⛔ THE ARGV, NOT THE CALLER'S NAME: since agent-infra#2028 the listing runs through `gh_bounded`, so a
+  # literal `grep 'gh api --paginate -i'` reddened on a fix that kept the REST call and bounded it. What
+  # this check is FOR is that the listing is REST + paginated + `-i` (headers are where ETags live) —
+  # whichever wrapper precedes it.
+  grep -qE '(gh|gh_bounded) api --paginate -i' "$T/block.sh" && ok "the shipped listing uses a REST \`gh api\` call (ETags live there)" \
     || bad "the shipped listing is not a \`gh api\` call — no conditional request is possible"
   grep -q 'gh pr list' "$T/block.sh" && bad "the shipped listing still shells out to \`gh pr list\` (GraphQL, no ETag)" \
     || ok "the shipped listing no longer uses \`gh pr list\` (GraphQL cannot be conditional)"
