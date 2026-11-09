@@ -279,12 +279,17 @@
 # mechanical re-bind at the live head. This is evidence a REVIEWER produced, and
 # the two must not be conflated in either direction.
 # The script then VERIFIES it: it must exist, belong to THIS PR, POSTDATE the
-# recorded head's commit, and NOT assert an UNRESOLVED outcome. THREE ARMS, and
+# recorded head's commit, and NOT assert an UNRESOLVED outcome. FOUR ARMS, and
 # the split between them is the whole contract:
 #   (1)  the review skills' own exit markers — Auto-fix stalled/failed/reached/
 #        aborted/converged/stuck, "N issues remain", "requires human
-#        attention/input/review", "test review capped", [ADVERSARIAL-BOUND].
-#        UNCONDITIONAL.
+#        attention/input/review", "test review capped". UNCONDITIONAL.
+#   (1a) `[ADVERSARIAL-BOUND]` — SPLIT OUT OF (1) AND CONDITIONAL ON ITS OWN FIELD
+#        (agent-infra#1889). The token is emitted for BOTH the capped exit
+#        (fixer-loop.md) and the CLEAN threat-coverage disclosure (`AGENTS.md`
+#        §Hard Cap), so it vetoes UNLESS every marker in the artifact says
+#        `residuals=none`. Do NOT put it back in (1)'s list: that is the false
+#        refusal #1889 removed. The arm is below (1b).
 #   (1b) a DECLARED negative outcome — an `Outcome: not-clean` line, or a
 #        "Review — NOT CLEAN" header. UNCONDITIONAL, and checked BEFORE (2) so a
 #        body cannot declare both and be accepted.
@@ -1101,13 +1106,20 @@ verify_review_evidence() { # <ref> <head_sha> [polarity] -> 0 = verified
   # a lane whose review ABORTED could name its own Step-8 comment and mint clean.
   # An unresolved-exit prefix that this list does not name is a fail-open, so
   # extend it from fixer-loop.md, never from memory.
-  # ⛔ THREE ARMS, AND THE SPLIT IS SECURITY-RELEVANT (1b below is unconditional too).
+  # ⛔ FOUR ARMS, AND THE SPLIT IS SECURITY-RELEVANT (1b below is unconditional too).
   #
   # (1) STRUCTURAL ABORT MARKERS — always veto, unconditionally. These are the review skills' own
   #     Step-8 exit prefixes (fixer-loop.md §"PR comment prefix"). A lane whose review ABORTED emits
   #     one of them, so vetoing them unconditionally is what keeps the tortoise#3549 hole closed: a
   #     lane cannot mint `clean` by naming its own aborted Step-8 comment, whether or not that
   #     comment also claims an outcome.
+  #
+  # ⛔ (1a) `[ADVERSARIAL-BOUND]` IS NOT ONE OF THEM ANY MORE (agent-infra#1889) — it is the ONE
+  #     Step-8 prefix that is CONDITIONAL, and it lives in its own arm (the `residuals=` block right
+  #     after this grep). It was moved out because the same token is ALSO the skill's mandated
+  #     disclosure for a CLEAN threat-coverage exit, and a lane that adds a newly-spelled prefix to
+  #     this list must not re-add it: "extend from fixer-loop.md" is how this file keeps the list
+  #     complete, and #1889 is the one entry that had to be narrowed rather than extended.
   #
   # (2) THE LOOSE `not…clean` ARM — only when the artifact states NO explicit outcome. It is a
   #     substring search over prose, and prose about code reviews legitimately contains the phrase
@@ -1165,7 +1177,7 @@ verify_review_evidence() { # <ref> <head_sha> [polarity] -> 0 = verified
   # two characters `\n`; real newlines are normalised to that same literal first, and a WRAPPED
   # marker whose field fell onto the next line therefore REFUSES instead of being guessed at.
   if grep -qiE '\[ADVERSARIAL-BOUND\]' <<<"$body"; then
-    local _ab_norm _ab_sep _ab_rest _ab_line _ab_f _ab_seen _ab_n _ab_ok _ab_bad
+    local _ab_norm _ab_sep _ab_rest _ab_line _ab_f _ab_seen _ab_n _ab_ok _ab_bad _ab_t _ab_c
     _ab_sep=$'\\n'                  # the two characters backslash+n — @tsv's escape for a newline
     _ab_norm="${body//$'\n'/"$_ab_sep"}"   # real newlines → that same literal, so ONE splitter covers both
     _ab_rest="$_ab_norm"
@@ -1188,6 +1200,22 @@ verify_review_evidence() { # <ref> <head_sha> [polarity] -> 0 = verified
         if [ "$_ab_ok" -ne 1 ] || [ "$_ab_n" -eq 0 ]; then
           _ab_bad=1
           if [ "$_ab_n" -eq 0 ]; then _ab_seen='no residuals= field on the marker line'; fi
+          break
+        fi
+        # (iv) A CONTRADICTORY DISCLOSURE IS NOT A CLEAN ONE (raised as a measured gap in the fresh
+        # review at this head, and closed here rather than filed: the reviewer confirmed the widening,
+        # and this lane was re-pushing anyway). `covered` below `threats` is the artifact's OWN
+        # admission that a declared class was not covered, which cannot sit beside `residuals=none` —
+        # pre-#1889 the bare token refused it, so accepting it would be a NEW fail-open introduced by
+        # this change. Both fields are already on the line being parsed, so the check is a comparison,
+        # not a second parser. ⛔ DELIBERATELY NOT A COMPLETENESS TEST: when either field is ABSENT the
+        # comparison is skipped and the terse `residuals=none` form still passes, because demanding the
+        # counts would re-create the very friction #1889 removed. Only a CONTRADICTION refuses.
+        _ab_t="$(printf '%s' "$_ab_line" | grep -oiE 'threats=[0-9]+' | head -n 1 | tr -dc '0-9')"
+        _ab_c="$(printf '%s' "$_ab_line" | grep -oiE 'covered=[0-9]+' | head -n 1 | tr -dc '0-9')"
+        if [ -n "$_ab_t" ] && [ -n "$_ab_c" ] && [ "$_ab_t" != "$_ab_c" ]; then
+          _ab_bad=1
+          _ab_seen="threats=${_ab_t} but covered=${_ab_c} — a declared class was NOT covered, so this cannot be a residuals=none exit"
           break
         fi
       fi

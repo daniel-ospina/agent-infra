@@ -4899,6 +4899,29 @@ EV_REF="comment:42489101" run_record_ev 424891 STUB_EVIDENCE_BODY="## Review
 $VACUITY_BLOCK"
 assert_eq "$RECORD_RC" "0" "13m6h the LOWER-CASE clean form is still ACCEPTED (rc 0) [err: $(printf '%s' "$RECORD_ERR" | tail -1)]"
 
+# 13m6i — A CONTRADICTORY DISCLOSURE IS NOT A CLEAN ONE. `covered` below `threats` is the artifact's
+# own admission that a declared class went uncovered, so `residuals=none` beside it cannot be true —
+# and pre-#1889 the bare token refused it, so accepting it would be a NEW fail-open introduced by this
+# change (raised as a measured, out-of-surface gap in the fresh review at `9ecc4679f`; closed here
+# because this lane was re-pushing anyway). The other half is a guard against over-correction: a TERSE
+# marker that carries no counts still passes, because demanding them would re-create the friction
+# #1889 exists to remove.
+rm -f "$(Q2 424892)"
+EV_REF="comment:42489201" run_record_ev 424892 STUB_EVIDENCE_BODY="## Review
+
+[ADVERSARIAL-BOUND] cycles=2 threats=17 covered=15 residuals=none — two declared classes uncovered
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13m6i covered < threats with residuals=none is a contradiction — refused (rc 3)"
+[ ! -f "$(Q2 424892)" ] && ok "13m6i no record minted from a self-contradictory clean disclosure" || bad "13m6i minted from a contradictory disclosure"
+rm -f "$(Q2 424893)"
+EV_REF="comment:42489301" run_record_ev 424893 STUB_EVIDENCE_BODY="## Review — THREAT SURFACE COVERED
+
+[ADVERSARIAL-BOUND] residuals=none
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "0" "13m6i the TERSE clean form (no counts) is still ACCEPTED — the arm checks contradiction, not completeness (rc 0)"
+
 # 13m6f — MUTATION PIN (the CAPPED direction). With the whole residuals= arm DISABLED, 13m6's capped
 # marker must be ACCEPTED — if it still refuses, 13m6 is passing on some other arm and this fix's
 # discrimination is untested. Built from THIS script into $T, never edited in place.
@@ -5286,13 +5309,13 @@ fi
 #     → :2482 :4186 :6501 :6613, plus a comment mention at :2356) and the
 #     same four PREDICATE sites are at head
 #     (`grep -n 'grep -qxF' scripts/record-review.sh` prints all four PREDICATE lines at head —
-#     CITE-CHECK: :2609 :4335 :6705 :6879, plus a comment mention at :2473; `14.1c-CITE` below
+#     CITE-CHECK: :2637 :4363 :6733 :6907, plus a comment mention at :2506; `14.1c-CITE` below
 #     re-derives these numbers, so they cannot rot silently): in #3168's diff the only
-#     hunk at `post_marker()` (:2582) ADDS A COMMENT — this PR does not touch
+#     hunk at `post_marker()` (:2615) ADDS A COMMENT — this PR does not touch
 #     `post_marker()` at all — and the
 #     predicate line beside it (:2609) is CONTEXT, not a change.
 #     WHAT THE VECTOR BELOW ACTUALLY PINS: the BODY-APPEND site
-#     (`if ! grep -qxF -- "$MARKER" <<<"$BODY"`; on main at bd1b205d :6501 — at head CITE-CHECK: :6705). It is a
+#     (`if ! grep -qxF -- "$MARKER" <<<"$BODY"`; on main at bd1b205d :6501 — at head CITE-CHECK: :6733). It is a
 #     MAIN-REGRESSION pin — reverting this PR leaves 14.1c GREEN, and 14.10f is a
 #     main-regression pin for the same reason. Keeping them is right (main's
 #     anchoring should not silently regress); calling them evidence about this diff
@@ -6219,14 +6242,14 @@ assert_eq "$REC_BEFORE_14B" "$(cat "$F_HOME/.pi/agent/reviews/daniel-ospina-agen
 #       not. `if command grep -qxF -- "$marker" <<<"$body"` is ALREADY `-qxF` on main
 #       (`git show bd1b205d:scripts/record-review.sh | grep -n 'grep -qxF'` — the sha is NAMED
 #       because `origin/main` moves and a bare "main :NNNN" rots the moment it does → :2482),
-#       and in #3168's diff the only hunk at `post_marker()` (head :2582) ADDS A COMMENT above
+#       and in #3168's diff the only hunk at `post_marker()` (head :2615) ADDS A COMMENT above
 #       it (this PR does not touch `post_marker()` at all) — the
-#       predicate line (head :2609) is CONTEXT. Reverting #3168 leaves this vector GREEN; it is kept
+#       predicate line (head :2637) is CONTEXT. Reverting #3168 leaves this vector GREEN; it is kept
 #       because main's anchoring should not silently regress, and it is labelled so the
 #       next reader does not mistake it for evidence about this diff. The predicate must
 #       match the gate's line-anchored `^…$` admission, exactly like the three other
 #       sites already anchored on main (bd1b205d :4186 :6501 :6613) — the same four that the grep
-#       above prints at head, CITE-CHECK: :4335 :6705 :6879 (`14.1c-CITE` re-derives the triple).
+#       above prints at head, CITE-CHECK: :4363 :6733 :6907 (`14.1c-CITE` re-derives the triple).
 #       ⛔ ASSERTS THE TRANSPORT (a PATCH was issued), not the exit code: the destructive
 #       mutant also exited 0.
 if [ -n "${QB_LINE:-}" ]; then
