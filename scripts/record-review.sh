@@ -1211,8 +1211,8 @@ verify_review_evidence() { # <ref> <head_sha> [polarity] -> 0 = verified
         # not a second parser. ⛔ DELIBERATELY NOT A COMPLETENESS TEST: when either field is ABSENT the
         # comparison is skipped and the terse `residuals=none` form still passes, because demanding the
         # counts would re-create the very friction #1889 removed. Only a CONTRADICTION refuses.
-        _ab_t="$(printf '%s' "$_ab_line" | grep -oiE 'threats=[0-9]+' | head -n 1 | tr -dc '0-9')"
-        _ab_c="$(printf '%s' "$_ab_line" | grep -oiE 'covered=[0-9]+' | head -n 1 | tr -dc '0-9')"
+        _ab_t="$(printf '%s' "$_ab_line" | grep -oiE 'threats=[0-9]+' | command head -n 1 | tr -dc '0-9')"
+        _ab_c="$(printf '%s' "$_ab_line" | grep -oiE 'covered=[0-9]+' | command head -n 1 | tr -dc '0-9')"
         if [ -n "$_ab_t" ] && [ -n "$_ab_c" ] && [ "$_ab_t" != "$_ab_c" ]; then
           _ab_bad=1
           _ab_seen="threats=${_ab_t} but covered=${_ab_c} — a declared class was NOT covered, so this cannot be a residuals=none exit"
