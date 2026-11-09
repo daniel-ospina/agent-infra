@@ -4810,6 +4810,106 @@ EV_REF="comment:42475601" run_record_ev 424756 \
     STUB_EVIDENCE_BODY="[ADVERSARIAL-BOUND] cycles=2 threats=17 covered=15 residuals=#12,#14 — bounded by the declared threat surface (#838); residuals filed, not chased"
 assert_eq "$RECORD_RC" "3" "13m6 an [ADVERSARIAL-BOUND] (residuals filed) artifact is refused (rc 3)"
 
+# ── agent-infra#1889 — THE CLEAN [ADVERSARIAL-BOUND] FORM ───────────────────────────────
+# The token is emitted for TWO different exits: `fixer-loop.md` §"PR comment prefix" uses it for
+# `EXIT_REASON == "adversarial-capped"`, and `AGENTS.md` §Hard Cap REQUIRES it as the disclosure of a
+# CLEAN threat-coverage exit (`residuals=none`). Matching the bare token refused the honest case —
+# the lane whose verifier returned `THREAT SURFACE COVERED` with 0 issues and nothing filed — and the
+# cheapest way to pass became DROPPING the mandated disclosure. The arm now reads the token's own
+# `residuals=` field. Both directions are pinned: the acceptance alone would let a fail-open land
+# ("any [ADVERSARIAL-BOUND] is clean"), the refusals alone would let the false refusal return.
+rm -f "$(Q2 424860)"
+EV_REF="comment:42486001" run_record_ev 424860 STUB_EVIDENCE_BODY="## Review — THREAT SURFACE COVERED
+
+Every declared threat class is covered by a test. No in-scope bypass reproduced; nothing filed.
+
+[ADVERSARIAL-BOUND] cycles=2 threats=17 covered=17 residuals=none — bounded by the declared threat surface (agent-infra#838)
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "0" "13m6b the CLEAN [ADVERSARIAL-BOUND] form (residuals=none) is ACCEPTED (rc 0) [err: $(printf '%s' "$RECORD_ERR" | tr '\n' ' ')]"
+R13M6B="$(cat "$(Q2 424860)" 2>/dev/null || true)"
+assert_contains "$R13M6B" '"evidence":"comment:42486001"' "13m6b the accepted artifact is the one the record names"
+assert_contains "$R13M6B" '"mint":"fresh"' "13m6b the clean form mints a FRESH record, not a carry"
+
+# 13m6c — an UNPARSEABLE disclosure is a cannot-verify, never a pass: a marker with no `residuals=`
+# field at all must refuse. (Fail-closed on the axis the acceptance above would otherwise widen.)
+rm -f "$(Q2 424861)"
+EV_REF="comment:42486101" run_record_ev 424861 STUB_EVIDENCE_BODY="## Review
+
+[ADVERSARIAL-BOUND] cycles=2 threats=17 covered=17
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13m6c an [ADVERSARIAL-BOUND] with no residuals= field is refused (rc 3)"
+[ ! -f "$(Q2 424861)" ] && ok "13m6c no record minted from an unparseable disclosure" || bad "13m6c minted from an unparseable disclosure"
+
+# 13m6d — near-miss VALUES must refuse, or the field is a rubber stamp: a residuals list appended to
+# the clean word, a suffix on it, and the UNSUBSTITUTED template a lane copies without filling in.
+_m6d=0
+for _m6d_val in 'none,#12' 'none-filed' 'none#12' '<#N,…|none>'; do
+    _m6d=$((_m6d + 1)); _m6d_pr=$((424861 + _m6d))
+    rm -f "$(Q2 $_m6d_pr)"
+    EV_REF="comment:${_m6d_pr}01" run_record_ev "$_m6d_pr" \
+        STUB_EVIDENCE_BODY="## Review
+
+[ADVERSARIAL-BOUND] cycles=2 threats=17 covered=15 residuals=${_m6d_val}
+
+$VACUITY_BLOCK"
+    assert_eq "$RECORD_RC" "3" "13m6d residuals='${_m6d_val}' is not the clean value — refused (rc 3)"
+done
+
+# 13m6e — THE LAUNDERING GUARD. One capped marker refuses the artifact however many clean ones sit
+# beside it, in either order: "the disclosure mentions residuals=none" must never rescue an artifact
+# whose own exit was capped (a comment may carry several markers when a lane pastes its cycle log).
+rm -f "$(Q2 424870)"
+EV_REF="comment:42487001" run_record_ev 424870 STUB_EVIDENCE_BODY="## Review
+
+[ADVERSARIAL-BOUND] cycles=2 threats=17 covered=17 residuals=none — cycle 1, nothing filed
+
+[ADVERSARIAL-BOUND] cycles=2 threats=17 covered=15 residuals=#12,#14 — cycle 2, residuals filed
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13m6e a clean marker beside a CAPPED one still refuses (rc 3)"
+rm -f "$(Q2 424871)"
+EV_REF="comment:42487101" run_record_ev 424871 STUB_EVIDENCE_BODY="## Review
+
+[ADVERSARIAL-BOUND] cycles=2 threats=17 covered=15 residuals=#12 — if residuals=none it would be clean
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13m6e prose mentioning residuals=none cannot launder a capped marker (rc 3)"
+
+# 13m6f — MUTATION PIN (the CAPPED direction). With the whole residuals= arm DISABLED, 13m6's capped
+# marker must be ACCEPTED — if it still refuses, 13m6 is passing on some other arm and this fix's
+# discrimination is untested. Built from THIS script into $T, never edited in place.
+_m6f_mut="$T/record-review.mut1889-noarm.sh"
+command sed 's#^  if grep -qiE .*ADVERSARIAL-BOUND.*$#  if false; then#' "$RECORD" > "$_m6f_mut"
+if command grep -q 'if false; then' "$_m6f_mut" && ! cmp -s "$_m6f_mut" "$RECORD"; then
+    _m6f_pr=424880
+    rm -f "$(Q2 $_m6f_pr)"
+    EV_REF="comment:${_m6f_pr}01" run_record_ev "$_m6f_pr" RECORD="$_m6f_mut" \
+        STUB_EVIDENCE_BODY="[ADVERSARIAL-BOUND] cycles=2 threats=17 covered=15 residuals=#12,#14 — residuals filed, not chased
+
+$VACUITY_BLOCK"
+    assert_eq "$RECORD_RC" "0" "13m6f MUTATION: with the residuals= arm disabled a CAPPED marker is ACCEPTED (rc 0) — 13m6 is load-bearing"
+else
+    bad "13m6f could not build the mutant copy — the pin did not run"
+fi
+
+# 13m6g — MUTATION PIN, the other direction: with the CLEAN-form acceptance removed (every marker
+# vetoed unconditionally, the pre-#1889 behaviour) 13m6b must be REFUSED.
+_m6g_mut="$T/record-review.mut1889b.sh"
+command sed 's#^            grep -qiE .\^residuals=.*$#            false || _ab_ok=0#' "$RECORD" > "$_m6g_mut"
+if command grep -q 'false || _ab_ok=0' "$_m6g_mut" && ! cmp -s "$_m6g_mut" "$RECORD"; then
+    _m6g_pr=424881
+    rm -f "$(Q2 $_m6g_pr)"
+    EV_REF="comment:${_m6g_pr}01" run_record_ev "$_m6g_pr" RECORD="$_m6g_mut" \
+        STUB_EVIDENCE_BODY="[ADVERSARIAL-BOUND] cycles=2 threats=17 covered=17 residuals=none — bounded by the declared threat surface
+
+$VACUITY_BLOCK"
+    assert_eq "$RECORD_RC" "3" "13m6g MUTATION: without the clean-form branch a residuals=none marker is REFUSED (rc 3) — 13m6b is load-bearing"
+else
+    bad "13m6g could not build the mutant copy — the pin did not run"
+fi
+
 # 13g3 — the marker veto must be anchored to a LINE START, not to position 0. The
 # body arrives @tsv-escaped, so a marker introduced by ANY preceding line used to
 # slip through `^` — the exact laundering 13g forbids, with a preamble in front.
@@ -5164,13 +5264,13 @@ fi
 #     → :2482 :4186 :6501 :6613, plus a comment mention at :2356) and the
 #     same four PREDICATE sites are at head
 #     (`grep -n 'grep -qxF' scripts/record-review.sh` prints all four PREDICATE lines at head —
-#     CITE-CHECK: :2546 :4272 :6642 :6816, plus a comment mention at :2415; `14.1c-CITE` below
+#     CITE-CHECK: :2604 :4330 :6700 :6874, plus a comment mention at :2473; `14.1c-CITE` below
 #     re-derives these numbers, so they cannot rot silently): in #3168's diff the only
-#     hunk at `post_marker()` (:2524) ADDS A COMMENT — this PR does not touch
+#     hunk at `post_marker()` (:2582) ADDS A COMMENT — this PR does not touch
 #     `post_marker()` at all — and the
-#     predicate line beside it (:2546) is CONTEXT, not a change.
+#     predicate line beside it (:2604) is CONTEXT, not a change.
 #     WHAT THE VECTOR BELOW ACTUALLY PINS: the BODY-APPEND site
-#     (`if ! grep -qxF -- "$MARKER" <<<"$BODY"`; on main at bd1b205d :6501 — at head CITE-CHECK: :6642). It is a
+#     (`if ! grep -qxF -- "$MARKER" <<<"$BODY"`; on main at bd1b205d :6501 — at head CITE-CHECK: :6700). It is a
 #     MAIN-REGRESSION pin — reverting this PR leaves 14.1c GREEN, and 14.10f is a
 #     main-regression pin for the same reason. Keeping them is right (main's
 #     anchoring should not silently regress); calling them evidence about this diff
@@ -5196,7 +5296,7 @@ fi
 #     `:6625` / `:6770` at `dc7e3ae99`, `:6634` / `:6779` at `921109de2` and `:6639` / `:6796` at
 #     `17551325e` as comment blocks were added above them, while the CITES beside them still read
 #     `:6625` / `:6770` at all three — that divergence IS the rot this paragraph describes — and at
-#     this head the predicates are `:6642` / `:6816`). One
+#     this head the predicates are `:6700` / `:6874`). One
 #     lane's response was to delete the numbers — which removes the rot but also removes the
 #     reader's target. Both intents are kept here: the number stays, and it is CHECKED.
 #     Every head number printed FOR A BODY-PRESENCE PREDICATE is TAGGED `CITE-CHECK:`; the tagged
@@ -6097,14 +6197,14 @@ assert_eq "$REC_BEFORE_14B" "$(cat "$F_HOME/.pi/agent/reviews/daniel-ospina-agen
 #       not. `if command grep -qxF -- "$marker" <<<"$body"` is ALREADY `-qxF` on main
 #       (`git show bd1b205d:scripts/record-review.sh | grep -n 'grep -qxF'` — the sha is NAMED
 #       because `origin/main` moves and a bare "main :NNNN" rots the moment it does → :2482),
-#       and in #3168's diff the only hunk at `post_marker()` (head :2524) ADDS A COMMENT above
+#       and in #3168's diff the only hunk at `post_marker()` (head :2582) ADDS A COMMENT above
 #       it (this PR does not touch `post_marker()` at all) — the
-#       predicate line (head :2546) is CONTEXT. Reverting #3168 leaves this vector GREEN; it is kept
+#       predicate line (head :2604) is CONTEXT. Reverting #3168 leaves this vector GREEN; it is kept
 #       because main's anchoring should not silently regress, and it is labelled so the
 #       next reader does not mistake it for evidence about this diff. The predicate must
 #       match the gate's line-anchored `^…$` admission, exactly like the three other
 #       sites already anchored on main (bd1b205d :4186 :6501 :6613) — the same four that the grep
-#       above prints at head, CITE-CHECK: :4272 :6642 :6816 (`14.1c-CITE` re-derives the triple).
+#       above prints at head, CITE-CHECK: :4330 :6700 :6874 (`14.1c-CITE` re-derives the triple).
 #       ⛔ ASSERTS THE TRANSPORT (a PATCH was issued), not the exit code: the destructive
 #       mutant also exited 0.
 if [ -n "${QB_LINE:-}" ]; then

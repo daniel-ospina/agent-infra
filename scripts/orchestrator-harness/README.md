@@ -1924,11 +1924,20 @@ off macOS (it renders a launchd plist) — the portability that matters is `orch
    evidence veto in `scripts/record-review.sh`, and its vocabulary is `NOT CLEAN`, "requires human
    attention/input/review", "unresolved issues",
    "auto-fix stalled/failed/reached/converged/aborted/stuck", "test review capped",
-   `[ADVERSARIAL-BOUND]`, and a **counted** `N issues remain`. The count is
+   `[NO-LOOP-BUDGET]`, and a **counted** `N issues remain`. The count is
    deliberate: a bare "issues remain" is NOT matched, because the veto must not false-refuse the
    legitimate clean phrasing "No issues remain after the fixes" — which also means a CLEAN comment
    whose body says (uncounted) that issues remain does pass the veto. Quote the gate's list, not a
    wider one.
+   ⛔ **`[ADVERSARIAL-BOUND]` is deliberately NOT in that flat list — it is split by its own field**
+   (agent-infra#1889). The token marks TWO exits: `fixer-loop.md` emits it for
+   `EXIT_REASON == "adversarial-capped"`, and `AGENTS.md` §Hard Cap REQUIRES it as the disclosure of
+   a **clean** threat-coverage exit. The veto therefore reads the `residuals=` value: the marker is
+   clean evidence **iff every marker in the artifact says `residuals=none`**. A non-`none` value
+   (`#12`, `filed`, `none,#12`), an unsubstituted template (`<#N,…|none>`), and a marker with **no**
+   `residuals=` field all still refuse. Matching the bare token refused the honest case — the lane
+   whose verifier returned `THREAT SURFACE COVERED` with nothing filed — which made the cheapest way
+   to pass be DROPPING the mandated disclosure, inverting the arm's own intent.
 3. **Scope adapts to the queue — and can be pinned.** `open PRs > 10` → **broad** mode: the sweep
    covers every non-draft PR in the repo except the branch classes it deliberately never touches
    (`design/`, `scope/`, `dependabot/` — the selector is

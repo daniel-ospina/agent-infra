@@ -1085,7 +1085,9 @@ verify_review_evidence() { # <ref> <head_sha> [polarity] -> 0 = verified
   #       escalation form above shares the label and is vetoed by its own text)
   #   "⚠️ Test review capped at 10 cycles — N issues remain:"   (literal N)
   #   "Requires Human Input / Requires Human Attention"        (plan-review block)
-  #   "[ADVERSARIAL-BOUND] cycles=… threats=… covered=… residuals=…"
+  #   "[ADVERSARIAL-BOUND] … residuals=<#N,…>"                 (CAPPED form ONLY — agent-infra#1889:
+  #       the same token is also the skill's MANDATED disclosure for a CLEAN threat-coverage exit,
+  #       `residuals=none`. It is split out of this grep into its own arm below, on its own field)
   #   "[NO-LOOP-BUDGET] RISK_CLASS=low — the single Step 4 pass is the whole budget…"
   #       (#1537: a `low` change budgets NO re-review loop, so entering the loop means
   #       findings survived Step 6. Naming that comment as `clean` evidence would mint a
@@ -1133,9 +1135,65 @@ verify_review_evidence() { # <ref> <head_sha> [polarity] -> 0 = verified
       "$kind" "$id" "$REPO" "$PR" "$created" "${head:0:12}"
     return 0
   fi
-  if grep -qiE 'auto-fix[[:space:]]+(stalled|failed|reached|aborted|converged|stuck)|require[s]?[[:space:]]+human[[:space:]]+(attention|input|review)|unresolved[[:space:]]+issues?|[0-9]+[[:space:]]+issues?[[:space:]]+remain|test[[:space:]]+review[[:space:]]+capped|\[ADVERSARIAL-BOUND\]|\[NO-LOOP-BUDGET\]' <<<"$body"; then
+  if grep -qiE 'auto-fix[[:space:]]+(stalled|failed|reached|aborted|converged|stuck)|require[s]?[[:space:]]+human[[:space:]]+(attention|input|review)|unresolved[[:space:]]+issues?|[0-9]+[[:space:]]+issues?[[:space:]]+remain|test[[:space:]]+review[[:space:]]+capped|\[NO-LOOP-BUDGET\]' <<<"$body"; then
     echo "   $kind $id asserts an UNRESOLVED outcome (a stalled/failed/cap/human-input exit) — it is evidence the review did not conclude clean." >&2
     return 1
+  fi
+  # ── agent-infra#1889 — THE [ADVERSARIAL-BOUND] DISCLOSURE HAS TWO FORMS; ITS OWN FIELD SPLITS THEM.
+  # `AGENTS.md` §Hard Cap makes the adversarial domain's clean exit "THREAT SURFACE COVERED" and
+  # REQUIRES the lane to disclose that the merge rests on threat coverage rather than a literal
+  # `NO ISSUES FOUND`: `[ADVERSARIAL-BOUND] cycles=<N> threats=<K> covered=<K> residuals=<#N,…|none>`.
+  # `fixer-loop.md` §"PR comment prefix" emits THE SAME TOKEN for the capped exit
+  # (`EXIT_REASON == "adversarial-capped"`). The token therefore CANNOT distinguish a clean bounded
+  # exit from a capped one — the skill's own `residuals=` field is the discriminator — and matching
+  # the bare token refused precisely the lane most likely to quote it (a bounded clean exit cannot
+  # honestly print `NO ISSUES FOUND`), making the mandated disclosure expensive and the cheap path
+  # silent NONDISCLOSURE. It inverted the arm's own intent. Measured 2026-10-16 on a lane whose fresh
+  # verifier returned `THREAT SURFACE COVERED` with 0 issues and no residuals filed.
+  #
+  # THE RULE IS FAIL-CLOSED, ON THREE AXES — a wider reading of "clean" is how this would become a
+  # fail-open, so each axis refuses rather than guesses:
+  #   (i)   EVERY marker in the artifact must carry the clean value. One capped marker anywhere in
+  #         the same artifact refuses it, so prose that merely mentions "residuals=none" beside a
+  #         real `residuals=#12` cannot launder the capped exit.
+  #   (ii)  EVERY `residuals=` field on the marker's own line must be EXACTLY `none`
+  #         (case-insensitive), up to its own delimiter. `residuals=none,#12`, `residuals=none-filed`,
+  #         `residuals=noneX` and the unsubstituted template `residuals=<#N,…|none>` all REFUSE.
+  #   (iii) A marker with NO `residuals=` field at all REFUSES: an unparseable disclosure is a
+  #         cannot-verify, and a cannot-verify is never a pass (the posture of every arm here).
+  # The field is read on the marker's OWN line. The body arrives @tsv-escaped, so a newline is the
+  # two characters `\n`; real newlines are normalised to that same literal first, and a WRAPPED
+  # marker whose field fell onto the next line therefore REFUSES instead of being guessed at.
+  if grep -qiE '\[ADVERSARIAL-BOUND\]' <<<"$body"; then
+    local _ab_norm _ab_sep _ab_rest _ab_line _ab_f _ab_seen _ab_n _ab_ok _ab_bad
+    _ab_sep=$'\\n'                  # the two characters backslash+n — @tsv's escape for a newline
+    _ab_norm="${body//$'\n'/"$_ab_sep"}"   # real newlines → that same literal, so ONE splitter covers both
+    _ab_rest="$_ab_norm"
+    _ab_bad=0
+    while :; do
+      _ab_line="${_ab_rest%%"$_ab_sep"*}"
+      case "$_ab_line" in
+        *'[ADVERSARIAL-BOUND]'*)
+          _ab_ok=1; _ab_n=0; _ab_seen=""
+          while IFS= read -r _ab_f; do
+            [ -n "$_ab_f" ] || continue
+            _ab_n=$((_ab_n + 1)); _ab_seen="$_ab_f"
+            grep -qiE '^residuals=[[:space:]]*none[,.:;)]*$' <<<"$_ab_f" || _ab_ok=0
+          done < <(printf '%s' "$_ab_line" | grep -oiE 'residuals=[^[:space:]]*' || true)
+          if [ "$_ab_ok" -ne 1 ] || [ "$_ab_n" -eq 0 ]; then
+            _ab_bad=1
+            if [ "$_ab_n" -eq 0 ]; then _ab_seen='no residuals= field on the marker line'; fi
+            break
+          fi ;;
+      esac
+      [ "$_ab_line" = "$_ab_rest" ] && break
+      _ab_rest="${_ab_rest#*"$_ab_sep"}"
+    done
+    if [ "$_ab_bad" -eq 1 ]; then
+      echo "   $kind $id carries an [ADVERSARIAL-BOUND] disclosure that is NOT the clean form (${_ab_seen:-unparseable}) — the token marks the CAPPED exit unless its own field says otherwise, so only \`residuals=none\` makes it a bounded-but-CLEAN review (agent-infra#1889)." >&2
+      echo "   If the review DID conclude clean with no residuals, its disclosure must read \`[ADVERSARIAL-BOUND] cycles=<N> threats=<K> covered=<K> residuals=none\` — the machine-readable line belongs in the PR BODY, and this post may spell it out in plain words instead; if the exit was capped, name the capped artifact and record the not-clean outcome instead." >&2
+      return 1
+    fi
   fi
   # (1b) DECLARED NEGATIVE OUTCOMES — always veto, and BEFORE the `Outcome:` suppression. Without
   #      this arm the suppression hands back the tortoise#3549 shape (§13f) for the price of one
