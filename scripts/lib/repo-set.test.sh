@@ -1353,23 +1353,28 @@ head_with_comment_between()
 {
   :
 }
-# ⛔ TWO LOAD-BEARING GUARDS HAD NO PIN, AND THE TWO MUTANTS ARE NOT THE SAME SHAPE (measured, round 48
-# re-review, at this head over the 437 `git ls-files '*.sh'` files): deleting `head`'s end-of-line anchor
-# INVENTS names — 133 of them across 66 of those files; deleting the next-line-brace branch HIDES names on the
-# FIXTURE ONLY (6 of them: `name_next_line`, `name_func_next`, `head_after_inline_comment`,
-# `head_with_comment_between`, `indented_head_only`, `head_then_blank`) and moves 0 of the repo's own files.
-# Between them they invent `echo`, `printf` and `mkdir` as "definitions" — `awk` and `shift` did NOT appear in
-# either mutant when this was re-measured and must not be named.
-# ⛔ NO COUNT AND NO "HUNDREDS" IS WRITTEN HERE, AND THE REASON IS MEASURED RATHER THAN STYLISTIC. The
-# sentence in this very position used to say both guards move "hundreds of the repo's own scripts" and then
-# re-measured them at 130 and 4 four lines later — the paragraph refuting its own header. It is worse than
-# that now: two measurements of the SAME two mutants at this SAME head disagreed — 130 and 4 files in one,
-# 124 and 0 in the other, over the same `git ls-files '*.sh'` population (435 then, 437 now) — and earlier drafts quoted
-# 283 / 282 / 276 / 21 / 18 / 20 from populations that are not the size of any set this tree has. ⛔ AND THE
-# NAME LIST DID NOT SURVIVE EITHER: `break` was named here as one of the invented definitions and appears in
-# NEITHER measurement. What survives every measurement is the DIRECTION — deleting the anchor INVENTS names,
-# deleting the next-line branch HIDES them — so run the mutant over `git ls-files '*.sh'` and read the delta
-# yourself; do not copy a number or a name out of this comment. None of these may be reported:
+# ⛔ ONE OF THESE TWO GUARDS IS STILL UNPINNED, AND THE TWO MUTANTS ARE NOT THE SAME SHAPE (measured, round 48
+# re-review, at this head over the 437 `git ls-files '*.sh'` files).
+#   * DELETING `head`'s END-OF-LINE ANCHOR HAS NO PIN. The mutant that removes it leaves the suite at
+#     246 passed / 0 failed — every arm green — while over the repo it INVENTS 133 names across 66 of the 437
+#     files. A guard whose removal reds nothing is the inert-enforcer shape this file exists to catch, so this
+#     one is still OWED a fixture line that changes under it. Until then it is DECLARED, not pinned.
+#   * DELETING THE NEXT-LINE-BRACE BRANCH IS PINNED (revert it and `f11f-0` reds, 245 passed / 1 failed). It
+#     HIDES names on the FIXTURE ONLY — 6 of them (`name_next_line`, `name_func_next`,
+#     `head_after_inline_comment`, `head_with_comment_between`, `indented_head_only`, `head_then_blank`) — and
+#     moves 0 of the repo's own files.
+#   * THE BARE-WORD GUARD ABOVE IS PINNED too (revert it and `f11f-0` reds on `bare_word_then_brace`).
+# Between the two mutants they invent `echo`, `printf` and `mkdir` as "definitions". ⛔ `awk` and `shift` were
+# named here before and appear in NEITHER mutant at this head — do not re-add them without a measurement.
+# ⛔ EVERY NUMBER IN THIS COMMENT IS THIS HEAD'S AND NONE OF THE OLDER ONES REPRODUCES — re-measure, never
+# copy. The sentence in this position used to say both guards move "hundreds of the repo's own scripts" and then
+# re-measured them at 130 and 4 four lines later, refuting its own header. Two further quoted pairs (130/4 and
+# 124/0) came from a population of 435 `*.sh` files and reproduce NEITHER number here, where the population is
+# 437 and the two mutants measure 66 and 0; earlier drafts also quoted 283 / 282 / 276 / 21 / 18 / 20 from
+# populations that are not the size of any set this tree has, and `break` was named as an invented definition
+# in neither measurement. What survives every measurement is the DIRECTION — deleting the anchor INVENTS
+# names, deleting the next-line branch HIDES them — so delete a guard, run the suite, run the mutant over
+# `git ls-files '*.sh'`, and read the delta yourself. None of these may be reported:
 #   * a bare command name followed by `:` (not a brace) — a `head` match that must NOT be claimed;
 #   * a command with arguments, then `{` on the next line — likewise;
 #   * a head followed by a line that CONTAINS `{` but does not start with it.
