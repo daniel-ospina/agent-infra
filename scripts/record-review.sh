@@ -2337,7 +2337,34 @@ $m"
     # asymmetry is deliberate: there the brace is prose the artifact merely mentioned, while here it
     # is the ENDPOINT of the stated range — an endpoint this code cannot evaluate is not a verified
     # endpoint, which is the same rule that refuses an unresolvable `HEAD`.
-    while [[ "$_scan" =~ ([0-9a-fA-F]{4,40})[[:space:]]*(\.{2,3})[[:space:]]*([0-9a-fA-F]{4,40}|[Hh][Ee][Aa][Dd]|@)(@\{[^}]*\}|[^0-9A-Za-z_/+=$%&@-]|$) ]]; do
+    # ⛔ A BRACE ON THE BARE OPERAND `@` IS THE SAME BRACE, AND IT WAS NOT REACHED (twenty-fifth review
+    # cycle, P0 — MEASURED, a REGRESSION this branch introduced). The group above starts at `@`, and
+    # the operand alternative `@` is tried BEFORE the brace group, so for `..@{u}` the operand takes
+    # the `@`, the brace group can never begin at `{`, and the boundary class matched the `{` alone —
+    # `_sbrace` stayed EMPTY, `_straw` stayed `@`, and the tip arm read it as the attested head. With
+    # the branch's upstream at a mid commit, `delta:<BASE>..@{u}` recorded rc 0 over `<BASE>..<HEAD>`
+    # while the artifact had stated one commit, and the parent head REFUSED the same text (rc 1, it
+    # could not parse it at all). `@{1}`, `@{yesterday}`, `@{-1}` and `@{2.weeks.ago}` were refused
+    # only because a later arm caught them — the ENDPOINT arm accepted every one of them. The brace
+    # group therefore has a second spelling, `\{…\}`, which is the brace as it arrives when the
+    # operand already ate the `@`; both spellings reconstruct the SAME `@{…}` token and go through the
+    # one position rule above, so `..@{0}` is the tip and `..@{u}` is an endpoint this code will not
+    # evaluate.
+    # ⛔ A NAME-LEGAL RUN AFTER THE TOKEN IS PEELED BY GIT, NOT REFUSED BY THE CLASS (twenty-fifth
+    # cycle, P1 — MEASURED, an undeclared cost of the admitted set). Requiring a non-name character
+    # after the operand refused honest artifacts whose range is immediately followed by name-legal
+    # prose — `delta:<A>..<B>+comment:<id>` (the evidence ref this tool itself teaches, quoted right
+    # after the range), `..<B>/diff.`, `..<B>=3 commits`, `..<B>$3` — every one of them rc 0 at the
+    # parent and rc 1 here as "cannot parse", i.e. the same false-block class the `!` removal was for.
+    # The boundary is now decided by RESOLUTION: the operand plus the whole name-legal run is offered
+    # to git, and when that is not a revision the run is peeled one character at a time from the right
+    # until it is. `head+1` (a real ref) resolves WHOLE, so it is still the ref and not a truncated
+    # tip; `..<B>+comment:…` peels to `<B>`, the commit the artifact actually wrote. DECLARED
+    # REMAINDER of the peel: a name-legal run that resolves to NO revision at all leaves the operand
+    # as written, so a name whose continuation is prose (`..<B>-1`) reads as `<B>` — the same
+    # truncation direction as the class rule it replaces, chosen because git, not a character list,
+    # now answers the question.
+    while [[ "$_scan" =~ ([0-9a-fA-F]{4,40})[[:space:]]*(\.{2,3})[[:space:]]*([0-9a-fA-F]{4,40}|[Hh][Ee][Aa][Dd]|@)(@\{[^}]*\}|\{[^}]*\}|[^0-9A-Za-z_/+=$%&@-]|$|[0-9A-Za-z_/+=%&@-]+) ]]; do
       _sf="$(printf '%s' "${BASH_REMATCH[1]}" | command tr 'A-F' 'a-f')"
       _ss="${BASH_REMATCH[2]}"
       # ⛔ ONE SPELLING, NOT TWO: THE RAW TOKEN IS BOTH WHAT DECIDES AND WHAT THE MESSAGE QUOTES
@@ -2397,7 +2424,32 @@ $m"
       # matrix's whole value is that a cell which cannot build its mutant REDDENS rather than passing
       # silently, and an unbound-index abort would have reported "mutant still refused" — a vacuous
       # pass wearing the shape of a load-bearing one (M60, measured).
-      case "${BASH_REMATCH[4]:-}" in '@{'*) _sbrace="${BASH_REMATCH[4]}" ;; esac
+      _srun=""
+      case "${BASH_REMATCH[4]:-}" in
+        '@{'*) _sbrace="${BASH_REMATCH[4]}" ;;
+        # The brace as it arrives after the operand alternative `@` ate the `@`: same token, rebuilt.
+        '{'*) if [ "$_straw" = "@" ]; then _sbrace="@${BASH_REMATCH[4]}"; fi ;;
+        *) _srun="${BASH_REMATCH[4]:-}" ;;
+      esac
+      # ⛔ THE BOUNDARY IS GIT'S ANSWER, NOT THIS CLASS'S (see the twenty-fifth cycle above). Offered
+      # whole first — so a real ref that merely CONTINUES like prose (`head+1`) is that ref — then
+      # peeled from the right until it resolves. Bounded, because a pathological token must cost a
+      # bounded number of git calls, and the bare operand is always tried before giving up.
+      if [ -n "$_srun" ]; then
+        _scand="${_straw}${_srun}"
+        _sres=""
+        _spn=0
+        while [ "$_spn" -lt 40 ]; do
+          _spn=$((_spn + 1))
+          if [ -n "$(delta_git "$root" rev-parse --verify "${_scand}^{commit}" 2>/dev/null || true)" ]; then
+            _sres="$_scand"
+            break
+          fi
+          [ "$_scand" = "$_straw" ] && break
+          _scand="${_scand%?}"
+        done
+        if [ -n "$_sres" ]; then _straw="$_sres"; fi
+      fi
       if [ -n "$_sbrace" ]; then
         # The brace is part of the CLAIM (so the refusal quotes it) and it decides the endpoint.
         # ⛔ THE BRACE DECIDES THE POSITION — THE OPERAND STILL DECIDES THE NAME (twenty-fourth review
@@ -2755,9 +2807,18 @@ $m"
       # needs resolving: a chain that is not the identity narrows, and that verdict now holds in every
       # frame because no checkout is consulted.
       # A bare brace group that did NOT resolve to the attested head: a POSITION (numeric or dated)
-      # narrows, while a SYMBOLIC name (`@{upstream}`, `@{push}`) cannot narrow anything and must not be
-      # refused as though it did — MEASURED: `@{upstream}` prose was refused "always NARROWER" in every
+      # narrows, while a SYMBOLIC name (`@{upstream}`, `@{push}`) is NOT EVALUATED and must not be
+      # refused as though it were — MEASURED: `@{upstream}` prose was refused "always NARROWER" in every
       # frame, which the sentence that called it resolved was measurably wrong about.
+      # ⛔ DECLARED REMAINDER, and the previous wording of this comment was FALSE ABOUT IT (twenty-fifth
+      # review cycle, P2 — MEASURED). It said a symbolic name "cannot narrow anything". It CAN: with the
+      # branch upstream at a mid commit, `@{u}` = that commit and `@{u}..HEAD` is 2 commits against the
+      # 3 recorded, so `…; I only actually reviewed @{u}..HEAD.` narrowed and rc was 0 — at the parent
+      # too, so the VERDICT is pre-existing and is not what changed here. What is wrong is the
+      # sentence: the code cannot evaluate `@{upstream}`/`@{push}` without the checkout's branch
+      # configuration, which is the frame this file refuses to consult (`@{u}` means a different commit
+      # in every clone), so the narrowing is SKIPPED rather than resolved — a stated residual, not a
+      # property of the syntax. No vector names these spellings, which is why the trade went unseen.
       if [ -z "$_tref" ]; then
         case "$_top" in
           *[!0-9A-Za-z_].*|*[0-9]*) _tiprel=1; break ;;
@@ -2797,6 +2858,22 @@ $m"
       _tsel="$(delta_git "$root" rev-parse --verify "${_tref}${_top}^{commit}" 2>/dev/null || true)"
       [ -n "$_tsel" ] || _tsel="$(delta_git "$root" rev-parse --verify "${_tref}^{commit}" 2>/dev/null || true)"
       [ -n "$_tsel" ] || continue
+      # ⛔ A COMMIT AFTER THE HEAD IS REFUSED EARLIER, AND THE POPULATION THIS ARM CANNOT SEE IS DECLARED
+      # (twenty-fifth review cycle, P2 — MEASURED TWICE, and the measurement is why there is no test
+      # here). A reviewer reported that a selector landing on a DEEPER DESCENDANT falls through the two
+      # ancestors tests below (not an ancestor of `from`, not an ancestor of `to`) and is accepted. In
+      # their STANDALONE driver of this region that is exactly what happens; through the shipped
+      # `verify_review_evidence` it is unreachable, and both spellings were measured:
+      #   • a FULL SHA descendant is refused by the commit-token scan above ("a commit AFTER <to>…, the
+      #     head being attested") BEFORE this arm runs — a vector on that spelling stayed rc 3 with a
+      #     descendant test added, i.e. it measured nothing;
+      #   • a REF NAME descendant never enters this arm at all, because the operand class of `_tipscan`
+      #     admits hex, the tip's word and a brace group — not a ref name (that class is a separate,
+      #     pre-existing residual). MEASURED: `I re-read afterhead~1 for the API part`, with a branch
+      #     `afterhead` on a descendant of the head, recorded rc 0 — at this head AND at 980d1f907.
+      # A descendant test was therefore written, measured as unobservable, and REMOVED rather than
+      # shipped as a guard nothing can exercise; the residual that remains (a narrowing reached through
+      # a ref name) is stated here instead of being implied by the sentence above.
       if [ "$_tsel" = "$_tosha" ]; then _tiprel=1; break; fi
       delta_git "$root" merge-base --is-ancestor "$_tsel" "$from" 2>/dev/null && continue
       delta_git "$root" merge-base --is-ancestor "$_tsel" "$_tosha" 2>/dev/null && { _tiprel=1; break; }
