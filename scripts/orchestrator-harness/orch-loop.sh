@@ -59,6 +59,35 @@ fi
 orc_state_pick "${_HERE_RS:-}" "$_ORC_ENV_O"
 O="$ORC_STATE_RESOLVED"
 ORC_INSTANCE="$(orc_instance_id "$O" "${_HERE_RS:-unknown}")"
+# ── WHICH TREE THE WORKER SCRIPTS COME FROM (agent-infra#2095, fresh-context review P1) ──────────
+# ⛔ `O` IS NOW THE STATE DIR *AND* IT WAS ALREADY THE HARNESS ROOT, AND THAT WAS COINCIDENTAL. Every
+# module this loop SOURCES has a beside-the-loop fallback (repo-slug.sh, worker-terminal.sh,
+# nochk-guard.sh, check-class.py …), but the eight WORKER spawn sites run `bash '$O/<script>'` with no
+# resolution step and no startup check at all — and `wt_spawn` validates the launcher and the
+# environment contract, not the script path in the command it is handed. So the moment a state dir can
+# differ from the tree beside the loop (an isolated proof copy — the very case this change creates — or
+# a documented `ORC_STATE_DIR`), the loop would start healthy, fill its queue from `$O/candidates.txt`,
+# and then run `bash '<state dir>/fix-one.sh'` for every dispatch: 127 in the lane's log while `[state]`,
+# `[cap]` and the run report all read healthy. That is category A — a controller that reports healthy
+# and can dispatch nothing — and it is why this resolves ONCE, here, and refuses to start when neither
+# tree can run a worker.
+ORC_WORK_ROOT="$O"
+if [ ! -f "$ORC_WORK_ROOT/fix-one.sh" ] && [ -f "${_HERE_RS:-}/fix-one.sh" ]; then
+  ORC_WORK_ROOT="${_HERE_RS:-}"
+fi
+_missing_w=""
+for _w in fix-one.sh merge-one.sh stall-fix.sh dispatch-merge.sh; do
+  [ -f "$ORC_WORK_ROOT/$_w" ] || _missing_w="$_missing_w $_w"
+done
+if [ -n "$_missing_w" ]; then
+  echo "orch-loop: FATAL the worker scripts are missing from BOTH the state dir ($O) and the directory beside this loop (${_HERE_RS:-<unresolved>}):$_missing_w — refusing to run a controller that would fill its queue and then fail every dispatch with 127. Fix: point O at a SEEDED runtime (bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o $O), or set ORC_STATE_DIR to keep state elsewhere while O stays the harness root." >&2
+  mkdir -p "$O/logs" 2>/dev/null || true
+  echo "[startup] FATAL worker scripts missing from $O and ${_HERE_RS:-?}:$_missing_w — the controller refuses to run" >> "$O/logs/orch-loop.log" 2>/dev/null || true
+  exit 78
+fi
+# Where the WORKER scripts live. Named separately from `O` (state) because the two can now differ; the
+# `$O/state/argv-*`, `$O/.batch` and `$O/candidates.txt` arguments stay `$O` — they ARE state.
+O_WORK="$ORC_WORK_ROOT"
 # ⛔ SAY IT OUT LOUD, ONCE, AND ON THE `console` SIDE TOO. The incident needed `ps` archaeology
 # because NOTHING in either controller's log named the state dir it was writing or the fact that it
 # had adopted production as a DEFAULT rather than because a unit told it to. A derived (isolated)
@@ -2463,7 +2492,7 @@ is_limit "${STALE_MIN:-}" || STALE_MIN=40
 # PR #3756, P0 — reproduced). `worker-terminal.sh` launches a worker on a durable cmux terminal
 # (`/bin/bash $O/state/run-<w>.sh`, `:2066`/`:2075`) or, where the cmux daemon does not answer — "the
 # launchd Mac and **the Linux cell**" (`:1888`), "on a cell tmux is the only surface" (`:2041`) — in a
-# TMUX PANE whose command is `bash -c '<env>; cd <cwd> && bash $O/fix-one.sh --argv $O/state/argv-<PR>'`
+# TMUX PANE whose command is `bash -c '<env>; cd <cwd> && bash $O_WORK/fix-one.sh --argv $O/state/argv-<PR>'`
 # (`:2020`). On the tmux arm the run script is never written (that arm returns at `:2028`/`:2038`) and
 # the log path is a shell REDIRECT, not an argv element (`spawn-gate.sh`'s `run_agent`), so an identity
 # set built from `<log>.log` / `wt-<w>` / `run-<w>.sh` matched NOTHING there — i.e. #2104, which was
@@ -6676,7 +6705,7 @@ while true; do
             RF_BOOK=$(( RF_N + 1 ))
             if printf '%s %s\n' "$HEAD_N" "$RF_BOOK" > "$RF_CF" 2>/dev/null \
                && printf '%s\n' "$(( RF_FN + 1 ))" > "$RF_FC" 2>/dev/null; then
-              if wt_spawn "fix-$PR" "$SPAWN_CWD" "unset OPENAI_API_KEY OPENAI_BASE_URL; bash '$O/fix-one.sh' --argv '$O/state/argv-$PR'"; then
+              if wt_spawn "fix-$PR" "$SPAWN_CWD" "unset OPENAI_API_KEY OPENAI_BASE_URL; bash '$O_WORK/fix-one.sh' --argv '$O/state/argv-$PR'"; then
                 RF_N="$RF_BOOK"
                 # (7) PR NUMBER, the refusal VERBATIM, the attempt counter and the session name, in ONE
                 # line: an operator reading this log must not have to join three files to learn why a
@@ -6886,7 +6915,7 @@ while true; do
             # `fix-one.sh`'s own spawn gate. `ci-queue.sh`'s header states the class rule: only work
             # that ADDS a new CI run is queue-gated. Do not re-nest it here.
             printf '%s\n' "$REPO" "$OR" "$PR" "$BR" > "$O/state/argv-$PR"
-            if wt_spawn "fix-$PR" "$SPAWN_CWD" "bash '$O/fix-one.sh' --argv '$O/state/argv-$PR'"; then
+            if wt_spawn "fix-$PR" "$SPAWN_CWD" "bash '$O_WORK/fix-one.sh' --argv '$O/state/argv-$PR'"; then
               echo $((NFC + 1)) > "$CF"
               echo "#$PR CONFLICTING -> fixer attempt $((NFC + 1))" >>"$LOG"
               disp "$PR" "${HEAD_N:-}" CONFLICTED act "conflict fixer spawned (attempt $((NFC + 1)))"
@@ -6953,7 +6982,7 @@ while true; do
             # set as the worker's REQ makes it the override — one resolution, one authority.
             # ⛔ shq, never %q: `%q` emits `$'…'` for a non-printable byte and dash does not parse
             # that as quoting, so the value would execute (round-8 adversarial review, B6).
-            if wt_spawn "merge-$PR" "$SPAWN_CWD" "REQ=$(shq "$REQ") REVIEW_GATE=$(shq "$REVIEW_GATE") bash '$O/merge-one.sh' --argv '$O/state/argv-$PR'"; then
+            if wt_spawn "merge-$PR" "$SPAWN_CWD" "REQ=$(shq "$REQ") REVIEW_GATE=$(shq "$REVIEW_GATE") bash '$O_WORK/merge-one.sh' --argv '$O/state/argv-$PR'"; then
               echo "#$PR GREEN -> rail worker merge-$PR" >>"$LOG"
               disp "$PR" "${HEAD_N:-}" GREEN act "rail worker merge-$PR spawned"
             else
@@ -7126,7 +7155,7 @@ while true; do
               # It is the counterpart `refund_bailed_fixer … 1` requires: this is the ONLY site that
               # consumes a findings marker, so it is the only site that may authorise a restore.
               : > "$O/state/fixspend-$PR-$HEAD_N"
-              if wt_spawn "fix-$PR" "$SPAWN_CWD" "bash '$O/fix-one.sh' --argv '$O/state/argv-$PR'"; then
+              if wt_spawn "fix-$PR" "$SPAWN_CWD" "bash '$O_WORK/fix-one.sh' --argv '$O/state/argv-$PR'"; then
                 echo $((NF + 1)) > "$FIXN"; rm -f "$O/state/needsfix-$PR-$HEAD_N"
                 echo "#$PR fixer attempt $((NF + 1))" >>"$LOG"
                 disp "$PR" "${HEAD_N:-}" "$V" act "review-gate fixer spawned (attempt $((NF + 1)))"
@@ -7290,7 +7319,7 @@ while true; do
               # ⛔ A SPAWN THAT DID NOT HAPPEN MUST SAY SO (#2126 T1). This line was `tmux … && echo`,
               # so a FAILED re-record spawn was completely unremarked — the PR looked idle with no
               # reason. Every other spawn site in this file has an explicit failure branch.
-              if wt_spawn "review-$PR" "$SPAWN_CWD" "REV_PAID=1 REV_ROUND=$(( ${_rrn:-0} + 1 )) REQ=$(shq "$REQ") REVIEW_GATE=$(shq "$REVIEW_GATE") bash '$O/merge-one.sh' --argv '$O/state/argv-$PR'"; then
+              if wt_spawn "review-$PR" "$SPAWN_CWD" "REV_PAID=1 REV_ROUND=$(( ${_rrn:-0} + 1 )) REQ=$(shq "$REQ") REVIEW_GATE=$(shq "$REVIEW_GATE") bash '$O_WORK/merge-one.sh' --argv '$O/state/argv-$PR'"; then
                 # SPEND THE REVIEW BUDGET ONLY ON A SPAWN THAT HAPPENED — the same rule `fixcount`
                 # follows one arm above: bookkeeping before the spawn makes a killed/failed spawn cost
                 # a real attempt, and this counter is the only thing standing between a wedged reviewer
@@ -7380,7 +7409,7 @@ while true; do
             # (#2927): a CI-red fixer is REPAIR, and the bounds on it are this `$MF` fix-lane ceiling,
             # `can_spawn`'s load/disk/memory gate and the cross-box claim.
             printf '%s\n' "$REPO" "$OR" "$PR" "$BR" > "$O/state/argv-$PR"
-            if wt_spawn "fix-$PR" "$SPAWN_CWD" "bash '$O/fix-one.sh' --argv '$O/state/argv-$PR'"; then
+            if wt_spawn "fix-$PR" "$SPAWN_CWD" "bash '$O_WORK/fix-one.sh' --argv '$O/state/argv-$PR'"; then
               echo $((NFC2 + 1)) > "$O/state/fixcount-$PR"
               echo "#$PR CI-red ($V) -> fixer attempt $((NFC2 + 1))" >>"$LOG"
               disp "$PR" "${HEAD_N:-}" "$V" act "CI-red fixer spawned (attempt $((NFC2 + 1)))"
@@ -8701,12 +8730,12 @@ PY
     # is a different file, and an escalation the operator cannot find where he reads is not one.
     if [ "${_stalled:-0}" = "1" ] && [ "${_dpok:-0}" != "1" ]; then
       echo "[dispatch] DRAIN STALL -> STALL FIX SKIPPED (the pass counter could not be persisted to state/drain-stall, so the one-per-${DRAIN_STALL_FIX_EVERY:-3} bound cannot be enforced — dispatching anyway would fire on every stalled pass)" >> "$LOG"
-    elif [ "${_stalled:-0}" = "1" ] && [ -x "$O/stall-fix.sh" ]; then
+    elif [ "${_stalled:-0}" = "1" ] && [ -x "$O_WORK/stall-fix.sh" ]; then
       O="$O" UPN_WORK="${UPN_WORK:-}" HARNESS_REPO="${HARNESS_REPO:-}" \
         PRDISP_SPAWNS="${PRDISP_SPAWNS:-}" _AGESRC="${_agesrc:-measured}" \
-        bash "$O/stall-fix.sh" "${_dpass:-0}" "${_lage:-?}" >> "$LOG" 2>&1 || true
+        bash "$O_WORK/stall-fix.sh" "${_dpass:-0}" "${_lage:-?}" >> "$LOG" 2>&1 || true
     elif [ "${_stalled:-0}" = "1" ]; then
-      echo "[dispatch] DRAIN STALL -> STALL FIX MISSING ($O/stall-fix.sh absent or not executable) — the escalation recorded the stall and dispatched nobody" >> "$LOG"
+      echo "[dispatch] DRAIN STALL -> STALL FIX MISSING ($O_WORK/stall-fix.sh absent or not executable) — the escalation recorded the stall and dispatched nobody" >> "$LOG"
     fi
     # [drain-health:end]
   else
@@ -9278,7 +9307,7 @@ PY
       _dmrc=0
       # The recount below reads a file THIS call writes, so a stale one must not be mistaken for it.
       rm -f "$O/.dispatched-ids" 2>/dev/null || true
-      bash "$O/dispatch-merge.sh" "$REPO" "$OR" $(tr '\n' ' ' < "$O/.batch") >> "$LOG" 2>&1 || _dmrc=$?
+      bash "$O_WORK/dispatch-merge.sh" "$REPO" "$OR" $(tr '\n' ' ' < "$O/.batch") >> "$LOG" 2>&1 || _dmrc=$?
       if [ "$_dmrc" = "3" ]; then
         echo "[dispatch] ci-queue gate DEFERRED the whole batch ($K issue(s)) — nothing was dispatched; claims released, rows dropped, re-decided next cycle" >> "$LOG"
         K=0; : > "$O/.batch"

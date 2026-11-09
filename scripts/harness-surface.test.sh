@@ -661,6 +661,10 @@ case "${LAUNCHD_MODE:-running}" in
   signed) printf '\tstate = spawn scheduled\n\tlast exit code = -15\n\truns = 3\n'; exit 0 ;;
   # NON-CANONICAL INTEGER: `00` must normalise to a clean 0, not read as a crash (round 5).
   zerozero) printf '\tstate = spawn scheduled\n\tlast exit code = 00\n\truns = 5\n'; exit 0 ;;
+  # ⛔ A DELIBERATE REFUSAL, NOT A DEATH (agent-infra#2095): `orch-loop.sh` exits 75 when another
+  # controller of this state dir holds `.orch.lock`. KeepAlive relaunches it every ThrottleInterval,
+  # so a `DIED … every attempt is failing` row would be a permanent FALSE-RED on a healthy box.
+  refused-singleton) printf '\tstate = spawn scheduled\n\tlast exit code = 75\n\truns = 9\n'; exit 0 ;;
   # Loaded with no process AND no exit data at all: the row may not invent one.
   no-data) printf '\tstate = spawn scheduled\n'; exit 0 ;;
   *) printf '\tstate = running\n\tpid = 4242\n'; exit 0 ;;
@@ -745,10 +749,11 @@ ck "(d) …but a cumulative count is NOT turned into any crash/persistence verdi
    "$(case "$launchd_row" in ""|*CRASH*|*PERSIST*|*LOOP*|*"will not help"*) echo 1 ;; *) echo 0 ;; esac)"
 ck "(d) …and persistence is stated CONDITIONALLY, so the count is evidence not a verdict [$(printf '%s' "$launchd_row" | cut -c1-200)]" \
    "$(case "$launchd_row" in *"if it STAYS here"*) echo 0 ;; *) echo 1 ;; esac)"
-# ⛔ A CLEAN EXIT IS NOT A CRASH (review cycle 2). `orch-loop.sh`'s lock path prints "already running"
-# and `exit 0`; with KeepAlive that is a job that exits IMMEDIATELY and cleanly, every time. Calling
-# it DIED and pointing at `launchd.err` (that message goes to STDOUT) is a named WRONG CAUSE — worse
-# than the old agnostic wording.
+# ⛔ A CLEAN EXIT IS NOT A CRASH (review cycle 2). `orch-loop.sh` used to answer a held lock with
+# "already running" and `exit 0`, so this was the lock-refusal state. ⛔ SINCE agent-infra#2095 THAT IS
+# NO LONGER TRUE: the lock path exits **75** and has its own row (`REFUSED-SINGLETON`, asserted below),
+# so this arm is about a job that genuinely exited 0. Calling either one DIED and pointing at
+# `launchd.err` is a named WRONG CAUSE — worse than the old agnostic wording.
 OUT="$( cd "$TMP" && PATH="$TMP/darwinbin:$TMP:$PATH" HOME="$TMP/home" CELL_HOME="$CELL" \
         HARNESS_PIN_DIR="$PINROOT" HARNESS_PIN_FILE="$CELL/.harness-path" HARNESS_UP_OS=Darwin \
         LAUNCHD_MODE=clean-exit HU_PS="$TMP/ps-probe" PS_TABLE="$TMP/ps-pinned" HU_LOADAVG_FILE="$TMP/load" \
@@ -760,6 +765,33 @@ ck "(d) …and it does NOT claim every attempt is failing [$(printf '%s' "$launc
    "$(case "$launchd_row" in ""|*"every attempt is failing"*) echo 1 ;; *) echo 0 ;; esac)"
 ck "(d) …and it points at launchd.OUT, which is where 'already running' is written [$(printf '%s' "$launchd_row" | cut -c1-200)]" \
    "$(case "$launchd_row" in *launchd.out*launchd.err*|*launchd.err*) echo 1 ;; *launchd.out*) echo 0 ;; *) echo 1 ;; esac)"
+# ⛔ 75 IS A REFUSAL, AND IT MUST NOT READ AS A DEATH (agent-infra#2095). Without its own arm exit 75
+# fell through to `DIED … every attempt is failing`, which under KeepAlive repeats for ever on a
+# CORRECT refusal — the same class as the false-green the old silent `exit 0` produced, in the other
+# direction. Removing the `REFUSED-SINGLETON` arm reddens all three checks below.
+OUT="$( cd "$TMP" && PATH="$TMP/darwinbin:$TMP:$PATH" HOME="$TMP/home" CELL_HOME="$CELL" \
+        HARNESS_PIN_DIR="$PINROOT" HARNESS_PIN_FILE="$CELL/.harness-path" HARNESS_UP_OS=Darwin \
+        LAUNCHD_MODE=refused-singleton HU_PS="$TMP/ps-probe" PS_TABLE="$TMP/ps-pinned" HU_LOADAVG_FILE="$TMP/load" \
+        bash "$UP" status --repo "$REPO_FIX" --harness "$PIN_TREE" --no-fetch 2>&1 )"; RC=$?
+launchd_row="$(printf '%s\n' "$OUT" | grep -E '^launchd ' | head -1)"
+ck "(d) a singleton REFUSAL (exit 75) is NAMED REFUSED-SINGLETON [$launchd_row]" \
+   "$(case "$launchd_row" in *REFUSED-SINGLETON*) echo 0 ;; *) echo 1 ;; esac)"
+ck "(d) …and it does NOT read as a crash — no 'every attempt is failing', no launchd.err framing [$(printf '%s' "$launchd_row" | cut -c1-220)]" \
+   "$(case "$launchd_row" in ""|*"every attempt is failing"*|*DIED*) echo 1 ;; *) echo 0 ;; esac)"
+ck "(d) …and it says the refusal is the singleton working, and points at the [singleton] record [$(printf '%s' "$launchd_row" | cut -c1-220)]" \
+   "$(case "$launchd_row" in *"singleton working"*orch-loop.log*) echo 0 ;; *) echo 1 ;; esac)"
+# NON-VACUITY CONTROL: the same row family still calls a genuine failure DIED. Without this, an arm
+# that labelled EVERY exit code REFUSED-SINGLETON would pass the three checks above.
+OUT="$( cd "$TMP" && PATH="$TMP/darwinbin:$TMP:$PATH" HOME="$TMP/home" CELL_HOME="$CELL" \
+        HARNESS_PIN_DIR="$PINROOT" HARNESS_PIN_FILE="$CELL/.harness-path" HARNESS_UP_OS=Darwin \
+        LAUNCHD_MODE=crashloop HU_PS="$TMP/ps-probe" PS_TABLE="$TMP/ps-pinned" HU_LOADAVG_FILE="$TMP/load" \
+        bash "$UP" status --repo "$REPO_FIX" --harness "$PIN_TREE" --no-fetch 2>&1 )"; RC=$?
+launchd_row="$(printf '%s\n' "$OUT" | grep -E '^launchd ' | head -1)"
+ck "(d) control: exit 128 is still DIED, not REFUSED-SINGLETON [$launchd_row]" \
+   "$(case "$launchd_row" in *DIED*|*"last exit 128"*) case "$launchd_row" in *REFUSED-SINGLETON*) echo 1 ;; *) echo 0 ;; esac ;; *) echo 1 ;; esac)"
+ck "(d) control: …and it still says every attempt is failing [$(printf '%s' "$launchd_row" | cut -c1-200)]" \
+   "$(case "$launchd_row" in *"every attempt is failing"*) echo 0 ;; *) echo 1 ;; esac)"
+
 # ⛔ `runs = 0` SETTLES "NEVER KICKED" even with no exit code — the count is not discarded when the
 # code is absent (review cycle 2).
 OUT="$( cd "$TMP" && PATH="$TMP/darwinbin:$TMP:$PATH" HOME="$TMP/home" CELL_HOME="$CELL" \

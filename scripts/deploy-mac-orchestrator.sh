@@ -468,7 +468,15 @@ done
 [ -n "$DEPLOY_PATH" ] || DEPLOY_PATH="/usr/bin:/bin:/usr/sbin:/sbin"
 log "relaunch PATH: $DEPLOY_PATH"
 cd "$HOME" || exit 1
-PATH="$DEPLOY_PATH" \
+# ⛔ `O` MUST REACH THE CHILD (agent-infra#2095). It was never exported: the default `O` happened to
+# work because the loop resolved `$HOME/orchestrator`, which is also where this script put the scripts —
+# so `_HERE_RS == $HOME/orchestrator == production`, the copy "lives in production", and nothing showed
+# the gap. With the documented `O=<dir> bash deploy-mac-orchestrator.sh` override the child sees NO `O`,
+# resolves its state dir as `derived:isolated(<dir>)`, takes its lock under $TMPDIR, and this script's
+# OWN verification then fails ("no controller holds $O/.orch.lock after the restart", exit 1) while the
+# isolated controller it launched keeps running under nohup — a failed deploy plus an unsupervised
+# controller. One word, and `deploy-crossbox.sh:179` already passes `O=` into its invocation the same way.
+O="$O" PATH="$DEPLOY_PATH" \
   nohup bash "$O/orch-loop.sh" >> "$O/logs/nohup.out" 2>&1 &
 sleep 8
 

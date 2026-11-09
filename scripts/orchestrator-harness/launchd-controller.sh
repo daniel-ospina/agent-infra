@@ -148,7 +148,14 @@ _shq() { local s="${1:-}" q="'"; printf "'%s'" "${s//$q/$q\\$q$q}"; }
 # THE PLIST'S KEY SET, VERBATIM. Keep it equal to `EnvironmentVariables` in launchd.plist.template —
 # `launchd-controller.test.sh` asserts that equality in both directions, so a key added to the
 # template cannot silently fail to reach the controller.
-CONTROLLER_ENV="PATH HOME OR REPO O HARNESS_PIN HARNESS_PIN_FILE HARNESS_PIN_DIR HARNESS_REPO HARNESS_MATERIALISER SCOPE MAX_LOAD MAX_LANES MAX_REVIEW MERGE_PRIORITY_AT MERGE_PRIORITY_MAX_AGE_MIN FUNNEL_MAX_AGE_MIN MAX_FIX MAX_FIX_TRIES MAX_RED_FIX MAX_RED_FIX_TRIES MIN_SWAP_FREE MIN_MEM_FREE_MB MEM_MIN_AVAIL_MB MEM_LANE_RESERVE_MB MEM_SPAWN_RESERVE_LANES BATCH PRODUCT_FLOOR CYC UV_CACHE_DIR UV_LINK_MODE ORCH_ENTRY"
+CONTROLLER_ENV="PATH HOME OR REPO O HARNESS_PIN HARNESS_PIN_FILE HARNESS_PIN_DIR HARNESS_REPO HARNESS_MATERIALISER SCOPE MAX_LOAD MAX_LANES MAX_REVIEW MERGE_PRIORITY_AT MERGE_PRIORITY_MAX_AGE_MIN FUNNEL_MAX_AGE_MIN MAX_FIX MAX_FIX_TRIES MAX_RED_FIX MAX_RED_FIX_TRIES MIN_SWAP_FREE MIN_MEM_FREE_MB MEM_MIN_AVAIL_MB MEM_LANE_RESERVE_MB MEM_SPAWN_RESERVE_LANES BATCH PRODUCT_FLOOR CYC UV_CACHE_DIR UV_LINK_MODE ORCH_ENTRY ORC_CONTROLLER_ORIGIN"
+# ⛔ `ORC_CONTROLLER_ORIGIN` (#2095) is the same parity one line over, and it was added to the plist
+# WITHOUT being added here — which `launchd-controller.test.sh` case E caught at the exact moment it
+# would have shipped (a red in a file the change never opened). The key is what makes a `[cap]` line
+# able to say `max_load_src=plist(launchd)` instead of `env`: the pane is started as
+# `tmux new-session … /usr/bin/env $ENV_PREFIX /bin/bash <loop>`, so it sees the tmux SERVER's
+# environment plus this whitelist — not the plist's. Absent here, the one datum the change exists to
+# add was non-deterministic on the Mac (present on a cold server, absent on a long-lived one).
 # ⛔ THE THREE MEM_* KEYS ARE FORWARDED, AND THEY WERE NOT (#2387). `launchd.plist.template` renders
 # `MEM_MIN_AVAIL_MB`, `MEM_LANE_RESERVE_MB` and `MEM_SPAWN_RESERVE_LANES` — the spawn gate's memory floor
 # and the two factors it is derived from — and this list did not carry them, so the pane never received
@@ -254,8 +261,10 @@ _STARTED="$(date +%s)"
 while "$TMUX_BIN" has-session -t "=$S" 2>/dev/null; do sleep 5; done
 _LIVED=$(( $(date +%s) - _STARTED ))
 
-# ⛔ FLOOR THE RESTART RATE. `orch-loop.sh` exits 0 at once when another controller holds
-# `.orch.lock`, and a session whose loop refuses to start dies in milliseconds. launchd already
+# ⛔ FLOOR THE RESTART RATE. `orch-loop.sh` REFUSES (exit 75, `[singleton]` in the log) at once when
+# another controller holds `.orch.lock` — it used to print "already running" and exit 0 — and a
+# session whose loop refuses to start dies in milliseconds either way, so the floor is unchanged and
+# its reason is not. launchd already
 # throttles KeepAlive to `ThrottleInterval` (10 s, rendered in the plist); this keeps the wrapper's
 # own restart interval from ever being shorter than that, so a genuinely broken controller produces
 # ONE line per window instead of a wall of them. It is a floor, not a fixed delay: a controller that
