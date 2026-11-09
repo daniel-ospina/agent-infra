@@ -508,11 +508,18 @@ jobs:
     # #2055 — this job carries NO job-level bound on purpose: it has 65 steps, and a 65-step job
     # cannot keep `job-bound > Σ step-bounds` under the platform's 360-minute ceiling — an invariant
     # `scripts/check-ci-lane-parity.mjs` refuses to see broken. So EVERY step below carries its own
-    # bound (sum 381 min), sized from that STEP's measured max over 12 completed runs
+    # bound (sum 322 min), sized from that STEP's measured max over 12 completed runs
     # (2026-11-09; the two heavy ones are the finished-lane reaper's mutation control at 7.3 min and
     # its suite at 2.2 min). A step trip is `failure` — RED — which is the property a job bound
     # (`cancelled`, NON-RED to the rail, #3242) cannot provide. This is the amended indicator (b) of
     # this issue applied honestly rather than a bound that is only decorative.
+    #
+    # ⛔ AND THE SUM IS DELIBERATELY UNDER 360, NOT JUST UNDER ITS OWN ARITHMETIC (review finding, P2,
+    # measured). With no job bound the job still has ONE: GitHub's implicit 360-minute ceiling, and
+    # ITS trip is `cancelled` — non-red. A step-bounds sum above 360 would therefore make the last
+    # few step bounds UNREACHABLE, so a cumulative overrun would land on the non-red conclusion while
+    # every individual bound looked like the red one. `scripts/check-workflow-bounds.mjs` now refuses
+    # that shape (a job bounded only by its steps must have Σ < 360), and its suite pins the refusal.
     steps:
       - uses: actions/checkout@v4
         timeout-minutes: 10
@@ -535,7 +542,7 @@ jobs:
         with:
           python-version: '3.12'
       - name: Install pyyaml
-        timeout-minutes: 5
+        timeout-minutes: 4
         # pyyaml: the sequence-enforcer's loadSteps frontmatter fallback runs
         # `python3 -c 'import yaml'` — the CI runner's python3 has no PyYAML by
         # default (local macOS python3 does), which fails the token_phase +
@@ -544,7 +551,7 @@ jobs:
         # them (#1349) — this job no longer imports pytest.
         run: pip install pyyaml
       - name: Fleet liveness acceptance suite (#1178, zero-dep)
-        timeout-minutes: 5
+        timeout-minutes: 4
         # #1178 — the liveness classifier (tools/fleet/liveness.py) and the
         # shared process-identity rule it shells out to
         # (scripts/lib/pid-identity.sh — the SAME library the kill-path reaper
@@ -558,7 +565,7 @@ jobs:
         # (scripts/pi-reap-idle.test.sh) against the same library.
         run: python3.12 tools/fleet/liveness.test.py
       - name: Fleet liveness mutation evidence (#1178, zero-dep)
-        timeout-minutes: 5
+        timeout-minutes: 4
         # The suite above is only a pin if it can FAIL. `--mutations`
         # reintroduces each of the 38 defects into a TEMP copy of the module (or
         # of the identity library) and re-runs the paired test against it in a
@@ -568,7 +575,7 @@ jobs:
         # must report on its own (the same reason every suite here is separated).
         run: python3.12 tools/fleet/liveness.test.py --mutations
       - name: Scheduled lane-liveness report suite (#1178 unit 3, zero-dep)
-        timeout-minutes: 5
+        timeout-minutes: 4
         # #1178 unit 3 — the DELIVERY half. tools/fleet/liveness.py is a pull
         # tool, so it is silent exactly when the orchestrator is dead; this step
         # pins the scheduled report (tools/fleet/lane_liveness.py) that runs
@@ -587,7 +594,7 @@ jobs:
         # verdict cannot suppress the other (same rule as every suite here).
         run: python3.12 tools/fleet/lane_liveness.test.py
       - name: PR state router suite (#2866, zero-dep)
-        timeout-minutes: 5
+        timeout-minutes: 4
         # #2866 — the router is the ONE answer to "what does this PR need next, and should anything
         # be running for it right now". Its rules are what decide whether CI is spent (a `cancelled`
         # check is NOT a failure; an empty surface is NOT green; `attested_sha` must be the merged
@@ -596,14 +603,14 @@ jobs:
         # fixtures, and a stub `record-review.sh` answers the diff-hash seam — no network.
         run: python3.12 tools/fleet/pr_state.test.py
       - name: PR state router mutation evidence (#2866, zero-dep)
-        timeout-minutes: 5
+        timeout-minutes: 4
         # The suite above is only a pin if it can FAIL. `--mutations` reverts each rule in a TEMP copy
         # of the module and re-runs the paired test against it in a subprocess — a mutation whose
         # test still passes is reported as a suite failure. Its own step, so one verdict cannot
         # suppress the other (the same rule the two fleet-liveness steps above follow).
         run: python3.12 tools/fleet/pr_state.test.py --mutations
       - name: pi pool reaper gate suite (zero-dep)
-        timeout-minutes: 5
+        timeout-minutes: 4
         # The `pi` session pool had NO owner: the `ppid=1 + our-checkout + testish` orphan class
         # cannot see a lane's `pi` (bare argv, reparented to launchd or under tmux), so days-old
         # stopped sessions accumulated while the box's own lanes waited for capacity (measured
@@ -641,7 +648,7 @@ jobs:
         # binding only the requested subset, and `code_only()` reverted — and requires the suite to fail.
         run: python3.12 scripts/orchestrator-harness/pi-done-not-exited.test.py --mutations
       - name: Ref-claim registry reader suite (#1777, zero-dep)
-        timeout-minutes: 5
+        timeout-minutes: 4
         # #1777 — an orchestrator lane runs `pi -p --no-session`, so it writes no
         # transcript and no cmux store record and is in NO population
         # lane_liveness.py can build; a controller then read that absence as
@@ -657,7 +664,7 @@ jobs:
         # established (including "no claim visible").
         run: python3.12 tools/fleet/claim_lanes.test.py
       - name: Ref-claim reader mutation evidence (#1777, zero-dep)
-        timeout-minutes: 5
+        timeout-minutes: 4
         # 48 mutations, each reintroducing the defect its test exists to catch:
         # a failed read read as an absence, an empty registry read as a failed
         # one, a missing/stale/shape-drifted snapshot accepted, presence dropped
@@ -684,7 +691,7 @@ jobs:
         # step so neither verdict suppresses the other.
         run: python3.12 tools/fleet/claim_lanes.test.py --mutations
       - name: Successor-preflight suite (#1317, zero-dep)
-        timeout-minutes: 5
+        timeout-minutes: 4
         # #1317 — a successor lane was dispatched to a unit whose predecessor was
         # live and mid-review, on a state assertion ("out of context") nobody had
         # read from an artifact. `tools/fleet/successor_preflight.py` proves the
@@ -708,14 +715,14 @@ jobs:
         # post-merge by the reaper's own suite).
         run: python3.12 tools/fleet/successor_preflight.test.py
       - name: Successor-preflight mutation evidence (#1317, zero-dep)
-        timeout-minutes: 5
+        timeout-minutes: 4
         # The suite above is only a pin if it can FAIL. A mutation whose paired
         # leg still passes is reported as a suite failure. Its own step, not a
         # second command in the step above — sequencing would suppress one
         # verdict when the other fails (the same rule as every suite here).
         run: python3.12 tools/fleet/successor_preflight.test.py --red-control
       - name: Dispatch-preflight suite (zero-dep)
-        timeout-minutes: 5
+        timeout-minutes: 4
         # The complementary question to the successor preflight above: that tool
         # asks "is a predecessor still ALIVE", this one asks "is there anything
         # left to LAND". Measured 2026-10-18: 12 of 15 dispatched worktrees sat on
@@ -736,13 +743,13 @@ jobs:
         # `pipeline-compliance` is the repo's only required check.
         run: python3.12 tools/fleet/dispatch_preflight.test.py
       - name: Dispatch-preflight mutation evidence (zero-dep)
-        timeout-minutes: 5
+        timeout-minutes: 4
         # Its own step, not a second command in the step above — sequencing would
         # suppress one verdict when the other fails (the rule every suite here
         # follows).
         run: python3.12 tools/fleet/dispatch_preflight.test.py --red-control
       - name: fleet-health REAPER-table suite (#1862, zero-dep)
-        timeout-minutes: 5
+        timeout-minutes: 4
         # #1862 — the restored orphan reaper (`com.eldato.pi-reap-orphans`) is installed
         # unconditionally by install-launchd.sh, but `fleet-health.py`'s `reaper_section()` reads a
         # HARD-CODED label tuple: a job absent from it is never read at all, so the panel printed
@@ -758,7 +765,7 @@ jobs:
         # Its own step, not a flag on the step above (one verdict cannot suppress the other).
         run: python3.12 tools/fleet/fleet_health.test.py
       - name: fleet-health REAPER-table mutation evidence (#1862, zero-dep)
-        timeout-minutes: 5
+        timeout-minutes: 4
         # The suite above is only a pin if it can FAIL. Eight mutations are written to TEMP copies of
         # the module and re-imported: the four lane-CENSUS ones (neuter the reconciliation, drop
         # `attributed`, split the UNVERIFIED tails on `attributed` instead of the note, and let the
@@ -768,7 +775,7 @@ jobs:
         # as every suite here.
         run: python3.12 tools/fleet/fleet_health.test.py --red-control
       - name: Outcome-canary suite (fleet outcome assertions, zero-dep)
-        timeout-minutes: 5
+        timeout-minutes: 4
         # The fleet's failures are OUTCOMES that are absent while every component is up: a
         # controller running with a silent log, a queue the refresh could not read, 47 candidates
         # and 47 refused dispatches, a green PR whose lander expired. Unit tests cannot see any of
@@ -780,7 +787,7 @@ jobs:
         # (#646). Its own step so one verdict cannot suppress the other.
         run: python3.12 tools/fleet/outcome_canary.test.py
       - name: Outcome-canary static evaluation (every fixture, its declared verdict)
-        timeout-minutes: 5
+        timeout-minutes: 4
         # The suite imports the module; THIS runs the shipped CLI the way a scheduler would, over
         # every fixture, and fails (exit 1 — a FAIL, not the exit 3 usage error) if any fixture
         # grades differently from its declared `_expect` — so a predicate that drifts is visible in the CI log as a named fixture, not
@@ -857,10 +864,10 @@ jobs:
         # RED. A mutation that survives is reported as a suite failure.
         run: python3.12 tools/fleet/outcome_canary.test.py --mutations
       - name: Sequence-enforcer suite (incl. joint checker→enforcer test)
-        timeout-minutes: 5
+        timeout-minutes: 4
         run: npx tsx extensions/sequence-enforcer/sequence-enforcer.test.ts
       - name: Spawn-capacity suite (#2665, zero-dep)
-        timeout-minutes: 5
+        timeout-minutes: 4
         # The ≥1-dispatch floor's classifier: a `task`/`subagent` result that produced NO verdict
         # must not count as a review. Zero-dependency (node stdlib + tsx), so it runs in THIS job,
         # which performs no `npm ci` — and its consumer's suite lives in
@@ -868,7 +875,7 @@ jobs:
         # ran nowhere until this step existed.
         run: npx tsx extensions/shared/spawn-capacity.test.ts
       - name: Kill-switch / session-escape suite (#1419)
-        timeout-minutes: 5
+        timeout-minutes: 4
         # #1419 — the deadlock escape. Zero-dependency (node stdlib + tsx), so it
         # MUST run in THIS job, which performs no `npm ci`; it is also invoked
         # post-merge from ci-main.yml. It pins the escape's CHANNEL as well as its
@@ -876,7 +883,7 @@ jobs:
         # loader gives every extension its own graph) still share one escape.
         run: npx tsx extensions/shared/kill-switch.test.ts
       - name: Skill-enforcer suite (#1321/#1322, zero-dep)
-        timeout-minutes: 5
+        timeout-minutes: 4
         # #1321 — under the DEPLOYED (symlinked) layout the manifest was resolved
         # from the farm directory rather than the real module, so the extension
         # announced `✅ Loaded — enforcing 0 skill gates` and enforced nothing,
@@ -893,7 +900,7 @@ jobs:
         # jiti where jiti is resolvable (reported as skipped otherwise).
         run: npx tsx extensions/skill-enforcer.test.ts
       - name: Merge-scope subtraction suite (#755, SDK-free)
-        timeout-minutes: 5
+        timeout-minutes: 4
         # #755 — zero-dependency by construction: subtract-scope.test.ts imports
         # ./index.js as a TYPE only (erased by tsx) and drives real git in temp
         # repos. It MUST run here, in the job that performs no `npm ci` — that is
@@ -901,14 +908,14 @@ jobs:
         # index.test.ts instead, which DOES need the SDK.
         run: npx tsx extensions/verification-gate/subtract-scope.test.ts
       - name: Merge-scope tripwire (#755)
-        timeout-minutes: 5
+        timeout-minutes: 4
         # Zero-dep plain node: guards the deleted-symbol class, the one-statement-
         # per-mechanism property for the seam and the reason vocabulary, and the
         # two anchors the rule's safety depends on (`:2204`'s tracking, and the
         # push/commit discrimination at the scope-resolution site).
         run: node extensions/verification-gate/test-subtract-scope.mjs
       - name: Compaction-watchdog guard suite (#1215, zero-dep)
-        timeout-minutes: 5
+        timeout-minutes: 4
         # #1215 — the context-clamp death (#1214) must never be silent. Zero-dep
         # by construction: the extension imports `@earendil-works/pi-coding-agent`
         # as a TYPE only (erased by tsx) and node stdlib otherwise, so it runs in
@@ -922,7 +929,7 @@ jobs:
         run: npx tsx extensions/compaction-watchdog.test.ts
 
       - name: Clamp-output-floor suite (#1214b — the PR-lane half, not post-merge only)
-        timeout-minutes: 5
+        timeout-minutes: 4
         # #1250 — the defect this step exists to not repeat: a suite wired ONLY
         # into ci-main.yml (push: main) is a suite that runs AFTER the merge, so
         # it reports the breakage on main instead of on the PR that caused it.
@@ -939,7 +946,7 @@ jobs:
         run: npx tsx extensions/clamp-output-floor.test.ts
 
       - name: Orphan-watchdog settle-record suite (#385 — the PR-lane half)
-        timeout-minutes: 5
+        timeout-minutes: 4
         # The #385 watchdog killed its descendant tree and exited 137 with only a
         # free-text line, so "killed by our watchdog", "thought it was done" and
         # "never started" were indistinguishable — three lanes vanished and only
@@ -956,7 +963,7 @@ jobs:
         run: npx tsx extensions/task-heartbeat.orphan.test.ts
 
       - name: Secret-echo-guard suite (#5109 — the transcript-leak control)
-        timeout-minutes: 5
+        timeout-minutes: 4
         # #5109 — a live API key was persisted in plaintext into session
         # transcripts (60/576 files, still growing) because every reading tool
         # returns the value and the result is written verbatim. This extension
@@ -972,13 +979,13 @@ jobs:
         run: npx tsx extensions/secret-echo-guard.test.ts
 
       - name: Loop-enforcer tier-bound parity (#723 — runtime caps vs canonical table)
-        timeout-minutes: 5
+        timeout-minutes: 4
         # VISIBLE, not merge-blocking (only pipeline-compliance is required).
         # The blocking backstop is ci-main.yml's extension-tests job, same
         # split as sequence-enforcer above.
         run: npx tsx extensions/loop-enforcer/tier-config-parity.test.ts
       - name: Loop-enforcer termination layers (#847 — L3 stall predicates)
-        timeout-minutes: 5
+        timeout-minutes: 4
         # Zero-dep: the suite's only import is `./termination.ts`, which has no
         # imports at all — no `node:` modules, no packages — so it MUST run
         # here, in the job that performs no `npm ci`. Before #847 this suite
@@ -989,7 +996,7 @@ jobs:
         # position) are worth nothing if nothing runs them.
         run: npx tsx extensions/loop-enforcer/termination.test.ts
       - name: Loop-enforcer review-scale rule (#1537 — severity / scope / proportional ceiling)
-        timeout-minutes: 5
+        timeout-minutes: 4
         # Zero-dep: the module's only import is `./termination.ts` (itself import-free)
         # and the suite adds `node:*` only, so it runs here, in the job that performs
         # no `npm ci`. Also picked up by ci-main.yml's `extensions/loop-enforcer/*.test.ts`
@@ -1002,7 +1009,7 @@ jobs:
         # class caps, so a suite that only proves the acceptance path cannot stay green.
         run: npx tsx extensions/loop-enforcer/review-scale.test.ts
       - name: Loop-enforcer cron exit property (#2935/#2944 — the interval must not hold the event loop)
-        timeout-minutes: 5
+        timeout-minutes: 4
         # #2935 — every cell lane printed its answer and then never exited; the
         # cause was THIS module's `setInterval`, a REF'd handle nothing cleared.
         # The suite was wired only into ci-main.yml's
@@ -1015,7 +1022,7 @@ jobs:
         # hanging the suite.
         run: npx tsx extensions/loop-enforcer/scheduler-unref.test.ts
       - name: Loop-enforcer cron re-arm across session replacement (#2948)
-        timeout-minutes: 5
+        timeout-minutes: 4
         # #2948 — #2944 cleared the tick on `session_shutdown`, which pi also emits
         # on session REPLACEMENT ("new" | "resume" | "fork"), and those flows do
         # not re-run extension factories — so the timer was never recreated and
@@ -1028,7 +1035,7 @@ jobs:
         # behind the post-merge glob reports this class of regression on main.
         run: npx tsx extensions/loop-enforcer/cron-rearm.test.ts
       - name: Shipped-default failover coverage pin (#715)
-        timeout-minutes: 5
+        timeout-minutes: 4
         # VISIBLE but NOT merge-blocking here: the repo's only required status
         # check is `pipeline-compliance`. The BLOCKING backstop is the
         # post-merge ci-main.yml `extensions/shared/*.test.ts` glob. Kept in
@@ -1037,7 +1044,7 @@ jobs:
         # WITHOUT `npm ci`, which this job does not perform.
         run: npx tsx extensions/shared/default-coverage.test.ts
       - name: Stall-vocabulary + progress-edge parity (#1068, zero-dep)
-        timeout-minutes: 5
+        timeout-minutes: 4
         # #1068 — the declared-surface instrument (`declared-surface.ts`), the
         # progress-edge declaration (`heartbeat-progress-edges.ts`) and both
         # suites import `node:*` + each other ONLY, so they run in THIS job (the
@@ -1055,14 +1062,14 @@ jobs:
         # plus `integration/**` since #3131).
         run: npx tsx extensions/shared/declared-surface.test.ts
       - name: Heartbeat progress-edge declaration drift gate (#1068, zero-dep)
-        timeout-minutes: 5
+        timeout-minutes: 4
         # The SECOND suite of the #1068 pair, as its own step on purpose: `&&`
         # short-circuits, so a `declared-surface` failure would suppress this
         # suite's verdict for that PR entirely (the same reason the accumulator
         # at the top of this job avoids `&&`). Each suite reports on its own.
         run: npx tsx extensions/shared/heartbeat-progress-edges.test.ts
       - name: Shared bash/git command-parser suite (#966, zero-dep)
-        timeout-minutes: 5
+        timeout-minutes: 4
         # #966 — extensions/shared/git-command-parse.ts imports `node:*` ONLY, so
         # its suite runs in THIS job (the job that performs no `npm ci`), like
         # the loop-enforcer and failover suites around it. VISIBLE, not
@@ -1075,7 +1082,7 @@ jobs:
         # copies live in their SDK-bearing index.test.ts (post-merge glob).
         run: npx tsx extensions/shared/git-command-parse.test.ts
       - name: Load-scale doc↔code contract (#1073, zero-dep)
-        timeout-minutes: 5
+        timeout-minutes: 4
         # #1073 — docs/ops/load-policy.md once named two watchdog scale knobs
         # (`TASK_LOAD_SCALE_START` / `_MAX`) that no code read: an operator set
         # one and got nothing. The root cause was a rebase that merged one #209
@@ -1092,7 +1099,7 @@ jobs:
         # `extensions/shared/*.test.ts` glob, which picks this file up too.
         run: npx tsx extensions/shared/load-scale-contract.test.ts
       - name: Task-run record + retention suite (#1662, zero-dep)
-        timeout-minutes: 5
+        timeout-minutes: 4
         # #1662 — extensions/shared/task-runs.ts imports `node:*` ONLY, so its
         # suite runs in THIS job (the job that performs no `npm ci`), like the
         # loop-enforcer and load-scale suites around it. VISIBLE, not
@@ -1108,7 +1115,7 @@ jobs:
         # (#1250: a suite wired only into ci-main.yml runs post-merge).
         run: npx tsx extensions/shared/task-runs.test.ts
       - name: Reviewer pre-flight disclosure drift pin (#2148, zero-dep)
-        timeout-minutes: 5
+        timeout-minutes: 4
         # #2148 — the reviewer requirement was disclosed only at the finish line, so three lanes did
         # their whole job on 2026-10-19 and were then refused at the rail. The disclosure's ONE
         # wording lives in extensions/shared/reviewer-preflight.ts (pi side) and
@@ -1119,7 +1126,7 @@ jobs:
         # post-merge ci-main.yml `extensions/shared/*.test.ts` glob, which picks this file up too.
         run: npx tsx extensions/shared/reviewer-preflight.test.ts
       - name: Headless-lane contract suite (#2965, zero-dep)
-        timeout-minutes: 5
+        timeout-minutes: 4
         # #2965 — a guard must judge what the process IS, not who launched it. `lane.sh` exports
         # SKILL_ENFORCER_DISABLED=1 for its own lanes; a headless `pi -p` started any other way (a
         # cloud-cell dispatch, a hand-run "pi -p … --no-session") got the gates and none of the
@@ -1133,7 +1140,7 @@ jobs:
         # `extensions/shared/*.test.ts` glob, which picks this file up too.
         run: npx tsx extensions/shared/headless-lane.test.ts
       - name: Headless-lane contract MUTATION evidence (#2965, zero-dep)
-        timeout-minutes: 5
+        timeout-minutes: 4
         # The suite above is only a pin if it can FAIL. Mutations reintroduce each arm's defect —
         # the derivation reverted so a linked worktree no longer derives a lane, and the historical
         # path-insensitive fail-open that treats EVERY checkout as a linked worktree (#618/#621) —
@@ -1142,7 +1149,7 @@ jobs:
         # can suppress the other (the rule every sibling suite here follows).
         run: npx tsx extensions/shared/headless-lane.test.ts --mutations
       - name: main-worktree-guard module-LOAD regression (#744)
-        timeout-minutes: 5
+        timeout-minutes: 4
         # The guard's bash-git classifier lost its LATER bindings SILENTLY in
         # every session from #697 until #744 (five rename-destructuring targets
         # declared nowhere → ReferenceError at module load, swallowed by the
@@ -1159,7 +1166,7 @@ jobs:
         # Zero-dep (`node:*` + the `git` binary), no `npm ci`, ~30s.
         run: node extensions/main-worktree-guard/test-module-load.mjs
       - name: main-worktree-guard working-tree-discard gate (#709)
-        timeout-minutes: 5
+        timeout-minutes: 4
         # The discard family used to be gated on git ARGV, so `git checkout --
         # <path>` (the 2026-09-10 incident verb) classified `allow` and every
         # other discard verb was exempt in linked worktrees — exactly where the
@@ -1171,7 +1178,7 @@ jobs:
         # not PR-triggered); perf-parity with the #744 step above.
         run: node extensions/main-worktree-guard/test-discard-gate.mjs
       - name: main-worktree-guard M4/M5 recovery window (#3303)
-        timeout-minutes: 5
+        timeout-minutes: 4
         # M4 was UNRECOVERABLE in the state it exists to repair: its only
         # sanctioned recovery was `git checkout main`, a NO-OP on a dirty tree,
         # and #709's documented escape marker never reached it. Measured
@@ -1190,7 +1197,7 @@ jobs:
         # not a flag on the step above (the rule every suite in this job follows).
         run: node extensions/main-worktree-guard/test-m4-recovery-window.mjs
       - name: main-worktree-guard unborn-HEAD first-commit gate (#2218)
-        timeout-minutes: 5
+        timeout-minutes: 4
         # #2218: `git commit` was impossible in any freshly-initialised repo. The
         # ownership probe is ONE combined `rev-parse --git-dir HEAD --abbrev-ref
         # HEAD`, which exits 128 when HEAD is UNBORN (`HEAD` is an ambiguous
@@ -1211,7 +1218,7 @@ jobs:
         # per-PR step is the only thing that reads it before a merge.
         run: node extensions/main-worktree-guard/test-unborn-head.mjs
       - name: main-worktree-guard discard-gate MUTATION evidence (#2161)
-        timeout-minutes: 5
+        timeout-minutes: 4
         # #2161 closed a fail-OPEN hole: an escaped quote inside an ANSI-C
         # `$'…'` word closed the word early, phantom-quoted the rest of the
         # script, and the M5 walk reported ZERO discards. That is a DETECTION
@@ -1227,7 +1234,7 @@ jobs:
         # suppress the other (the rule every suite in this job follows).
         run: node extensions/main-worktree-guard/test-discard-gate.mjs --mutations
       - name: main-worktree-guard script-content backdoor gate (#1484, false positives #1485)
-        timeout-minutes: 5
+        timeout-minutes: 4
         # #1484 gated the CONTENT of every executed path, so (a) a COMPILED
         # EXECUTABLE was read as a script — `/Users/…/bin/gh` is a Go binary whose
         # bytes contain the word `git`, which refused EVERY `gh issue list`/`api`/
@@ -1246,7 +1253,7 @@ jobs:
         # main before anything reads it.
         run: node extensions/main-worktree-guard/test-script-backdoor.mjs
       - name: main-worktree-guard git command POSITION (#1158)
-        timeout-minutes: 5
+        timeout-minutes: 4
         # #1158: the classifier treated ANY token whose basename was `git` as the
         # start of a git invocation, so an OPERAND `git` manufactured a phantom
         # invocation whose "verb" was the NEXT SHELL OPERATOR — and the
@@ -1295,7 +1302,7 @@ jobs:
         # asserted on had been skipped).
         run: node extensions/main-worktree-guard/test-hub-sweep.mjs
       - name: main-worktree-guard nested-worktree hub gate (#1919)
-        timeout-minutes: 5
+        timeout-minutes: 4
         # `git worktree add 8779-optA` (a RELATIVE path) puts a registered
         # worktree INSIDE the repo root; git reports it as an untracked
         # directory, so the hub read DIRTY forever and the M4 hub-state gate
@@ -1310,7 +1317,7 @@ jobs:
         # PR-triggered).
         run: node extensions/main-worktree-guard/test-nested-worktree.mjs
       - name: main-worktree-guard REMOTE-EXEC boundary (#3444)
-        timeout-minutes: 5
+        timeout-minutes: 4
         # Every gate here resolved PATHS and HUB STATE against the LOCAL
         # checkout, so a command whose execution target is another box
         # (`cmux vm exec <vm> -- …`, `ssh <host> …`, `docker exec <c> …`) was
@@ -1330,7 +1337,7 @@ jobs:
         # ci-main.yml is not PR-triggered).
         run: node extensions/main-worktree-guard/test-remote-context.mjs
       - name: main-worktree-guard REMOTE-EXEC boundary MUTATION evidence (#3444)
-        timeout-minutes: 5
+        timeout-minutes: 4
         # The suite above is only a pin if it can FAIL, and this fix has TWO
         # directions to get wrong — too little (the boundaries are not
         # recognised, today's false blocks remain) and too much (the mask runs
@@ -1344,7 +1351,7 @@ jobs:
         # sibling suite here follows). Zero-dep, ~10s.
         run: node extensions/main-worktree-guard/test-remote-context.mjs --mutations
       - name: task-cwd-guard shared-main spawn-cwd gate (#1240)
-        timeout-minutes: 5
+        timeout-minutes: 4
         # A `task` dispatch with no explicit `cwd` inherits the PARENT's cwd
         # (#1071), so ~124 dispatches/hour on the tortoise hub landed in a
         # SHARED MAIN checkout — where one lane's unpushed commit gates git
@@ -1358,7 +1365,7 @@ jobs:
         # glob in ci-main.yml is not PR-triggered).
         run: node extensions/task-cwd-guard/test-cwd-guard.mjs
       - name: entry-point guard symlink regression (#708)
-        timeout-minutes: 5
+        timeout-minutes: 4
         # The entry-point idiom `pathToFileURL(process.argv[1]).href ===
         # import.meta.url` is symlink-SENSITIVE (pathToFileURL does no fs
         # resolution; the ESM loader realpaths import.meta.url), so ANY
@@ -1374,7 +1381,7 @@ jobs:
         # Zero-dep (`node:*` only), no `npm ci`, ~3s.
         run: node extensions/shared/test-is-main.mjs
       - name: infra-verify bounded-scan regression (#1051)
-        timeout-minutes: 5
+        timeout-minutes: 4
         # `find <dir>/` dereferences a symlinked START POINT and `-P` cannot undo
         # it, so a repo committing `templates -> /` turned infra-verify's bounded
         # in-checkout enumeration into a filesystem-wide walk that could report
@@ -1389,7 +1396,7 @@ jobs:
         # asserted to LEAK, then the fixed form is asserted not to.
         run: node extensions/shared/test-infra-verify-scan.mjs
       - name: read-path failure contract — tortoise-memory.mjs (tortoise#3805 / #1182)
-        timeout-minutes: 5
+        timeout-minutes: 4
         # The skills' memory client used to exit 0 in every direction (never
         # configured, unreachable, and a genuinely empty store were ONE
         # observable) and defaulted its base URL to the DASHBOARD host while the
@@ -1405,7 +1412,7 @@ jobs:
         # (`node:*` only), no `npm ci`, ~4s.
         run: node --test scripts/tortoise-memory.test.mjs
       - name: version-stamp drift check — scripts/check-version-stamp.test.mjs (#1760)
-        timeout-minutes: 5
+        timeout-minutes: 4
         # A check nothing runs is the inert gate #1760 exists to remove, so its suite is wired here.
         # The SUITE is wired rather than the checker: the suite builds its own git fixtures (a real
         # repo, a stamped surface, an off-main-line branch), so it is independent of whether the
@@ -1415,7 +1422,7 @@ jobs:
         # Zero-dep (`node:*` only), no `npm ci`.
         run: node --test scripts/check-version-stamp.test.mjs
       - name: cmux-session snapshot pin — extensions/cmux-session.test.ts (#1138)
-        timeout-minutes: 5
+        timeout-minutes: 4
         # Same shape as the step above, one layer down: a suite that pins a
         # version-controlled snapshot, wired nowhere, so it enforced nothing.
         # extensions/cmux-session.ts is a bootstrap SNAPSHOT of a file cmux
@@ -1439,7 +1446,7 @@ jobs:
         # no `npm ci`.
         run: npx tsx extensions/cmux-session.test.ts
       - name: Shared tool-call predicate (#1330, zero-dep half)
-        timeout-minutes: 5
+        timeout-minutes: 4
         # #1330 — pi's `isToolCallEventType` was copied PRIVATELY into each extension
         # that needed it (skill-enforcer, sequence-enforcer, and the two test-side
         # SDK stubs). A copy of an SDK function has no pin unless someone writes
@@ -1462,7 +1469,7 @@ jobs:
         # glob, which collects this file automatically.
         run: npx tsx extensions/shared/tool-call-event.test.ts
       - name: Literal-path fence (no swarm abspath in skills/extensions/scripts)
-        timeout-minutes: 5
+        timeout-minutes: 4
         # Task 4 acceptance, CI-enforced: FAIL on a match. docs/ is excluded
         # (provenance).
         run: '! grep -rE ''/Users/danielospina/swarm/operations/coordination'' skills/ extensions/ scripts/'

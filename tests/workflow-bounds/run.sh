@@ -184,21 +184,41 @@ cp -R "$ROOT/.github/workflows" "$TMPROOT/decoy/.github/workflows"
 DEC="$TMPROOT/decoy/.github/workflows/harness-single-source.yml"
 # the job-level bound goes first, or the job is bounded and the decoy proves nothing.
 grep -v '^    timeout-minutes:' "$DEC" > "$DEC.base"; mv "$DEC.base" "$DEC"
-python3 - "$DEC" <<'PY'
+python3 - "$DEC" <<'PY2'
 import sys
-p=sys.argv[1]
-src=open(p).read().split('\n')
-out=[]
+p = sys.argv[1]
+src = open(p).read().split('\n')
+out = []
+planted_comment = planted_scalar = 0
 for line in src:
     out.append(line)
-    if line.rstrip()=='      - name: doctor reports the platform and the supervisor it found':
-        # a comment that spells the key, and a block-scalar body that spells it too
-        out.append('        # timeout-minutes: 5')
-open(p,'w').write('\n'.join(out))
-PY
+    if line.rstrip() == '      - name: doctor reports the platform and the supervisor it found':
+        out.append('        # timeout-minutes: 5')          # a comment that spells the key
+        planted_comment += 1
+    elif line.rstrip() == '        run: |':
+        # INSIDE the block-scalar BODY: a line a grep would match and a YAML reader must not see as
+        # a key of the step (#637/#675 — the bypass class this guard exists to close).
+        out.append('          echo "timeout-minutes: 99"')
+        planted_scalar += 1
+open(p, 'w').write('\n'.join(out))
+print("PLANTED comment=%d scalar=%d" % (planted_comment, planted_scalar))
+PY2
+# ⛔ ASSERT THE PLANT LANDED (review finding, P2): the previous arm specified a block-scalar decoy in
+# its own description but planted only a comment, so the guard's cited bypass class had NO arm. A
+# mutation that silently does not mutate is an assertion that cannot fail.
+if grep -q 'echo "timeout-minutes: 99"' "$DEC"; then
+  ok "the block-scalar decoy was actually planted"
+else
+  no "the block-scalar decoy was NOT planted — this arm could not have failed"
+fi
+if grep -q '^        # timeout-minutes: 5' "$DEC"; then
+  ok "the comment decoy was actually planted"
+else
+  no "the comment decoy was NOT planted"
+fi
 node "$GUARD" --root "$TMPROOT/decoy" >"$OUT" 2>"$ERR"
 rc=$?
-[ "$rc" -eq 1 ] && ok "decoy comment/step-bound does not satisfy the job → rc 1" || no "decoy satisfied the guard → rc $rc (a text match, not a structure read)"
+[ "$rc" -eq 1 ] && ok "decoy comment + block-scalar line do not satisfy the job → rc 1" || no "decoy satisfied the guard → rc $rc (a text match, not a structure read)"
 
 echo "== 14. MUTATION: ONE bounded step does not bound its job"
 mkdir -p "$TMPROOT/partial/.github"
@@ -221,6 +241,18 @@ node "$GUARD" --root "$TMPROOT/partial" >"$OUT" 2>"$ERR"
 rc=$?
 [ "$rc" -eq 1 ] && ok "one bounded step of seven → rc 1" || no "one bounded step passed the guard → rc $rc"
 grep -q 'NOT every step is bounded' "$ERR" && ok "the finding says the steps are not all bounded" || no "the finding does not say why"
+
+echo "== 15. FIXTURE: a step-only job whose bounds sum to or above the 360-minute ceiling"
+run_case steps-over-ceiling
+[ "$rc" -eq 1 ] && ok "steps-over-ceiling → rc 1" || no "steps-over-ceiling → rc $rc, expected 1"
+grep -q 'SUM to [0-9]* min' "$ERR" && ok "the finding names the SUM against the ceiling" || no "the ceiling reason is missing"
+grep -q 'REACHABLE' "$ERR" && ok "the finding says WHY it matters (the last bounds are unreachable)" || no "the finding does not say why"
+
+echo "== 16. NON-VACUITY on the live tree: the one step-only job is UNDER the ceiling"
+node "$GUARD" >"$OUT" 2>"$ERR"
+grep -q 'bounded by its steps alone (Σ [0-9]* min, under the 360-minute ceiling)' "$OUT" \
+  && ok "the live step-only job reports a sum under the ceiling" \
+  || no "the live step-only job's sum is not reported under the ceiling"
 
 echo
 if [ "$fail" -eq 0 ]; then

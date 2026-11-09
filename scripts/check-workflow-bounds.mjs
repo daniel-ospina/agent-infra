@@ -32,6 +32,12 @@
  *       the step shape (65 steps; a 65-step job cannot satisfy the lane guard's “job > Σ steps”
  *       under the platform's 360-minute ceiling, and a bound it cannot satisfy is not a bound).
  *       A reusable-workflow CALL job (`jobs.<id>.uses`) is the third case — see (d);
+ *       ⛔ AND A STEP-ONLY JOB'S BOUNDS MUST BE REACHABLE (added at review, P2, measured). A job with
+ *       no `timeout-minutes` still has one: GitHub's implicit 360-minute ceiling — and its trip is
+ *       `cancelled`, NON-RED to the rail. So if the step bounds SUM to 360 or more, the platform's
+ *       non-red cancel arrives before the last step bounds do, and those bounds are decorative. A job
+ *       bounded only by its steps is therefore required to have Σ < 360. (This was real: `ci.yml`'s
+ *       `verify` shipped 65 step bounds summing to 381 min in the first draft of this change.)
  *   (c) the value is a positive integer number of minutes, or a `${{ … }}` expression (GitHub
  *       resolves `jobs.<id>.timeout-minutes` from the `github`, `needs`, `strategy`, `matrix`,
  *       `vars` and `inputs` contexts, so a reusable workflow may legitimately forward one);
@@ -91,6 +97,13 @@ const HERE = dirname(fileURLToPath(import.meta.url));
  * whose own subject changes with the checkout can be satisfied by moving the checkout.
  */
 const SELF_SLUG = "daniel-ospina/agent-infra";
+
+/**
+ * GitHub's ceiling for `jobs.<job_id>.timeout-minutes` on a hosted runner (the default when no bound is
+ * declared). A bound at or above it can never fire first, and its own trip is `cancelled` — NON-RED to
+ * this repo's rail — so anything that must produce a RED has to sit strictly below it.
+ */
+const PLATFORM_CEILING_MIN = 360;
 
 function parseArgs(argv) {
   const out = { root: resolve(HERE, ".."), list: false };
@@ -304,6 +317,22 @@ function main() {
         continue;
       }
       if (steps.length > 0 && badSteps.length === 0) {
+        // A step-only job must be bounded BELOW the platform ceiling, or its last step bounds can
+        // never fire (the 360-minute default cancel — `cancelled`, NON-RED — arrives first).
+        const numeric = steps.map((s) => Number(s && s["timeout-minutes"]));
+        if (numeric.every((n) => Number.isFinite(n))) {
+          const sum = numeric.reduce((a, b) => a + b, 0);
+          if (sum >= PLATFORM_CEILING_MIN) {
+            violations.push(
+              `${where} is bounded only by its ${steps.length} step bounds, which SUM to ${sum} min — at or ` +
+                `above the platform's ${PLATFORM_CEILING_MIN}-minute job ceiling, whose trip is \`cancelled\` ` +
+                `(NON-RED to the rail). The last step bounds could never fire, so lower them: the step ` +
+                `bounds are the red-producing bound and they must all be REACHABLE.`
+            );
+            continue;
+          }
+          notes.push(`${where} is bounded by its steps alone (Σ ${sum} min, under the ${PLATFORM_CEILING_MIN}-minute ceiling)`);
+        }
         boundedBySteps++;
         continue;
       }

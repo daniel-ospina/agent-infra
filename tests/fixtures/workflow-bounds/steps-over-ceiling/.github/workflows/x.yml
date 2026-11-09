@@ -1,0 +1,12 @@
+name: fixture step bounds above the platform ceiling
+on:
+  pull_request:
+jobs:
+  sums-too-high:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        timeout-minutes: 200
+      - name: the tail bound can never fire
+        timeout-minutes: 200
+        run: echo hi
