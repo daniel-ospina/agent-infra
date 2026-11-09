@@ -1,0 +1,21 @@
+{
+  "artifacts": [],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 605,
+  "exit_code": null,
+  "heartbeat_at": 1794238567,
+  "host": "cmux",
+  "issue": 42,
+  "kind": "fixer",
+  "lane_id": "cmux.kfixer-42-1794238567-p3758020-bfee8ce1",
+  "lease_until": 1794239172,
+  "pid": 3758020,
+  "reason": null,
+  "repo": null,
+  "schema": 1,
+  "started_at": 1794238567,
+  "state": "RUNNING",
+  "tag": "42",
+  "worktree": "/tmp/bl-2028"
+}
