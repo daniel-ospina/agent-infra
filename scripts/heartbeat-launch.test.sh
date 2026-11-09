@@ -198,6 +198,26 @@ assert_contains "$OUT" "LOOP_DETACHED=1" "§6 …including LOOP_DETACHED=1, so t
     && bad "§6 …and launched NOTHING (no log file was created)" \
     || ok "§6 …and launched NOTHING (no log file was created)"
 
+# ⛔ A LIVE PID WHOSE ARGV CANNOT BE READ IS NOT A VERDICT — IT IS AN UNANSWERED QUESTION (#1867
+# review, non-blocking note 1). `pid_is_loop` answers 3 here, and the two verbs must disagree with
+# the DEAD case in the ONLY safe direction: `start` refuses (a second loop is worse than none) and
+# `check` answers UNKNOWN, never "not running" and never the recycled-pid DRIFT. A `ps` that FAILS
+# is how an unreadable process table is emulated; nothing else on PATH is shimmed.
+# ⛔ `--dry-run` HERE ON PURPOSE: the refusal is decided by the pidfile, before the argv is looked
+# at, so this arm still reddens — and a mutant that drops the refusal prints the dry-run command
+# instead of FORKING a real loop, which would hold the caller's command substitution open and hang
+# the suite instead of failing it (measured: this arm hung under exactly that mutation).
+PSDEAD="$T/psdead"; mkdir -p "$PSDEAD"
+printf '#!/bin/sh\nexit 1\n' > "$PSDEAD/ps"; chmod +x "$PSDEAD/ps"
+R="$(newroot s5c)"
+P="$(live_pid)"; printf '%s\n' "$P" > "$R/agent/state/heartbeat-loop.pid"
+OUT="$(run "$R" PATH="$PSDEAD:$PATH" -- start --dry-run)"; RC=$?
+assert_eq "$RC" "1" "§5c an UNREADABLE process table makes start REFUSE (1), not launch a second loop"
+assert_contains "$OUT" "could not be read" "§5c …and says WHY, so the refusal is actionable"
+assert_not_contains "$OUT" "already running" "§5c …and never claims 'already running' from an unread answer"
+assert_not_contains "$OUT" "stale pidfile" "§5c …nor names it stale: cannot-tell is not the recycled-pid verdict"
+assert_not_contains "$OUT" "DRY RUN" "§5c …and the refusal pre-empts the dry-run print (nothing proceeds)"
+
 echo "── 7-13. check: the behaviour probe (0 OK / 1 DRIFT / 2 UNKNOWN) ──"
 
 R="$T/nostate"
@@ -228,6 +248,18 @@ assert_eq "$RC" "1" "§9b a RECYCLED pid is DRIFT (1), never OK — a stranger h
 assert_contains "$OUT" "NOT running" "§9b …and the line says the loop is not running"
 assert_contains "$OUT" "recycled pid" "§9b …and names the recycled pid as the reason"
 assert_not_contains "$OUT" "OK    loop alive" "§9b …and never prints the OK line it used to"
+
+# …and the third answer: the process table could not be read, so neither verdict is available. This
+# is the arm `check` must NOT collapse into "not running" (DRIFT would tell the operator to launch a
+# SECOND loop over a live one) or into OK (the false pass this file exists to remove).
+R="$(newroot c2c)"
+P="$(live_pid)"; printf '%s\n' "$P" > "$R/agent/state/heartbeat-loop.pid"
+printf '[{"lane":"a","degraded":false}]\n' > "$R/agent/state/lane-status.last.json"
+OUT="$(run "$R" PATH="$PSDEAD:$PATH" -- check)"; RC=$?
+assert_eq "$RC" "2" "§9c an UNREADABLE process table is UNKNOWN (2), never DRIFT and never OK"
+assert_contains "$OUT" "could not be read" "§9c …and names the unread table as the reason"
+assert_not_contains "$OUT" "OK    loop alive" "§9c …and does not claim the loop is alive"
+assert_not_contains "$OUT" "DRIFT loop is NOT running" "§9c …nor claims it is not running (that would invite a second loop)"
 
 # ⛔ THE ASSERTION THIS SUITE EXISTS FOR: alive is NOT the verdict. A running loop whose last fleet
 # read is DEGRADED is the exact measured failure (27/27 degraded rows, 0 nudges) and it must be

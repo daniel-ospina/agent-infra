@@ -50,6 +50,15 @@ activity**. That is the false PASS this change exists to make impossible.
 | `heartbeat-launch.sh status` | running? how stale is the last pass and the last fleet read? | 0 |
 | `heartbeat-launch.sh check` | **behaviour probe** — see below | 0 OK · 1 DRIFT · 2 UNKNOWN |
 
+⛔ **WHICH COPY THE OPERATOR RUNS.** `scripts/heartbeat-launch.sh` is **not** in
+`pi-bootstrap/setup.sh`'s farm set, so the launcher you invoke is the **checkout-relative** one
+(`bash <checkout>/scripts/heartbeat-launch.sh start`) — that is the versioned entry point, and it is
+what this doc's table means everywhere else. The **loop** exists in two places: the same checkout
+(`<checkout>/scripts/heartbeat-loop.sh`) and the farmed copy at
+`$HOME/.pi/agent/scripts/heartbeat-loop.sh`. The launcher prefers the farmed loop when it is there,
+so a box driven entirely from `$HOME/.pi/agent` has the loop and **not** the launcher; whatever
+starts it must therefore name a checkout (`#1553` owns whether the loop should keep two homes).
+
 `check` answers the question a content comparison cannot: **is the scheduled thing live *and fed*?**
 
 - **0 OK** — the loop's pidfile names a process whose **own argv is the loop** (`pid_is_loop`:
