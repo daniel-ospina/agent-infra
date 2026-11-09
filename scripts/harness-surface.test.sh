@@ -834,7 +834,7 @@ launchd_row="$(printf '%s\n' "$OUT" | grep -E '^launchd ' | head -1)"
 ck "(d) an UNJUDGED refusal (exit 74) is NAMED REFUSED-UNJUDGED, not folded into the 75 row [$launchd_row]" \
    "$(case "$launchd_row" in *REFUSED-UNJUDGED*) case "$launchd_row" in *REFUSED-SINGLETON*) echo 1 ;; *) echo 0 ;; esac ;; *) echo 1 ;; esac)"
 ck "(d) …and it gives the OPPOSITE remedy — investigate, and removing the record IS allowed when nothing holds it [$(printf '%s' "$launchd_row" | cut -c1-240)]" \
-   "$(case "$launchd_row" in *"rm -f"*|*"rm -f"*) echo 0 ;; *) echo 1 ;; esac)"
+   "$(case "$launchd_row" in *"rm -f"*) echo 0 ;; *) echo 1 ;; esac)"
 
 # ⛔ `runs = 0` SETTLES "NEVER KICKED" even with no exit code — the count is not discarded when the
 # code is absent (review cycle 2).

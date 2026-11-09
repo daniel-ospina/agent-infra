@@ -1160,8 +1160,8 @@ rail_attempt() {
   # `CLAIM_ACTION_CLAIMS_SH` surviving is what makes this invisible: it enters the rail's
   # `if [ -n "${CLAIM_ACTION_CLAIMS_SH:-}" ]` gate and then `admin-merge.sh:11738` refuses EVERY
   # merge with `REFUSED [hold-proof] … reason=no-token` — a total outage of the only merge path,
-  # on all three ingresses, reported as a claims fault. `test-gates.sh` L7 now pins the token's
-  # arrival for this reason.
+  # on all three ingresses, reported as a claims fault. `test-gates.sh` L11 pins the token's
+  # arrival for this reason — L7 pins the LANDING block, which stops above this invocation.
   # ⛔ `${_M1_MOD:-$O}` IS SELF-SUFFICIENT ON PURPOSE: this block is EXTRACTED and DRIVEN by
   # `test-gates.sh` from a range that starts far below `_M1_MOD`'s assignment, so a bare
   # `$_M1_MOD` is unbound there — under `set -u` the subshell dies at the expansion and the `if`
