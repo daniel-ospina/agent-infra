@@ -5282,6 +5282,70 @@ else
     bad "13m6r could not build the bare-word mutant copy (binds='${_m6r_binds:-?}') — the pin did not run"
 fi
 
+# 13m6s — THE COUNT FIELD NEEDS A LEFT BOUNDARY (#3829's SECOND review; measured at `39455bdd`). The
+# extractor was an UNANCHORED substring, so `grep -oiE 'covered=[0-9]+'` matched INSIDE `uncovered=13`
+# and `not-covered=13`: a marker that declares every class UNCOVERED —
+# `threats=13 uncovered=13 residuals=filed` — read `covered='13'`, compared equal to `threats`, and
+# minted `clean`. That is the single fail-open the contradiction guard exists to prevent, and it was
+# reachable with EITHER filed spelling (`residuals=#1269` too), so it defeated the whole arm. The
+# mirror was a false refusal: `covered=13 uncovered=0` was read as two covered values and rejected as
+# "MORE THAN ONE count value" — the honest lane told it had declared a count pair it never wrote.
+# Both directions are pinned, and 13m6t makes the anchoring load-bearing.
+rm -f "$(Q2 424993)"
+EV_REF="comment:42499301" run_record_ev 424993 STUB_EVIDENCE_BODY="## Review — THREAT SURFACE COVERED
+
+[ADVERSARIAL-BOUND] cycles=2 threats=13 uncovered=13 residuals=filed — bounded by the declared threat surface
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13m6s uncovered=<n> is NOT coverage evidence — a marker admitting uncovered classes is refused (rc 3)"
+[ ! -f "$(Q2 424993)" ] && ok "13m6s no record minted from a marker that declares classes UNCOVERED" || bad "13m6s minted from a marker declaring every class UNCOVERED"
+rm -f "$(Q2 424994)"
+EV_REF="comment:42499401" run_record_ev 424994 STUB_EVIDENCE_BODY="## Review — THREAT SURFACE COVERED
+
+[ADVERSARIAL-BOUND] cycles=2 threats=13 not-covered=13 residuals=#1269 — bounded by the declared threat surface
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13m6s not-covered=<n> is not coverage evidence either — refused with the NUMERIC spelling too (rc 3)"
+[ ! -f "$(Q2 424994)" ] && ok "13m6s no record minted from not-covered=<n>" || bad "13m6s minted from not-covered=<n>"
+# The MIRROR: an honest disclosure that says ZERO uncovered beside a real equal pair must ACCEPT —
+# before the anchor it was refused as an ambiguity the line never declared.
+rm -f "$(Q2 424995)"
+EV_REF="comment:42499501" run_record_ev 424995 STUB_EVIDENCE_BODY="## Review — THREAT SURFACE COVERED
+
+[ADVERSARIAL-BOUND] cycles=2 threats=13 covered=13 uncovered=0 residuals=filed
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "0" "13m6s covered=<n> uncovered=0 is a CLEAN disclosure, not an ambiguity — accepted (rc 0) [err: $(printf '%s' "$RECORD_ERR" | tr '\n' ' ')]"
+
+# 13m6t — MUTATION PIN (attribution for the LEFT BOUNDARY). 13m6s asserts that `uncovered=` is not
+# coverage evidence; this pin proves the BOUNDARY is what refuses it — with the boundary emptied the
+# identical body must ACCEPT — and the control, on the SAME mutant, a plain equal-count marker must
+# still ACCEPT (the pin broke the boundary, not the arm). The boundary is ONE named constant
+# (`_ab_lb`), which is what makes this a one-token mutation rather than a bracket-escaping exercise:
+# the first draft of this pin tried to `sed` the bracket expression itself and matched 69 lines.
+_m6t_mut="$T/record-review.mut1889g.sh"
+command sed 's#^[[:space:]]*_ab_lb=.*$#        _ab_lb=#' "$RECORD" > "$_m6t_mut"
+_m6t_binds=$(command diff "$RECORD" "$_m6t_mut" 2>/dev/null | command grep -c '^< ' || true)
+if [ "${_m6t_binds:-0}" = "1" ] && command grep -qF "_ab_lb='(^|" "$RECORD" \
+   && bash -n "$_m6t_mut" 2>/dev/null && ! cmp -s "$_m6t_mut" "$RECORD"; then
+    _m6t_pr=424996
+    rm -f "$(Q2 $_m6t_pr)"
+    EV_REF="comment:${_m6t_pr}01" run_record_ev "$_m6t_pr" RECORD="$_m6t_mut" \
+        STUB_EVIDENCE_BODY="[ADVERSARIAL-BOUND] cycles=2 threats=13 uncovered=13 residuals=filed
+
+$VACUITY_BLOCK"
+    assert_eq "$RECORD_RC" "0" "13m6t MUTATION: with the LEFT BOUNDARY removed uncovered=13 mints clean (rc 0) — 13m6s is load-bearing"
+    _m6t_pr=424997
+    rm -f "$(Q2 $_m6t_pr)"
+    EV_REF="comment:${_m6t_pr}01" run_record_ev "$_m6t_pr" RECORD="$_m6t_mut" \
+        STUB_EVIDENCE_BODY="[ADVERSARIAL-BOUND] cycles=2 threats=13 covered=13 residuals=filed
+
+$VACUITY_BLOCK"
+    assert_eq "$RECORD_RC" "0" "13m6t control: on the SAME mutant a plain equal-count marker still ACCEPTS (rc 0) — the pin broke the anchor, not the arm"
+else
+    bad "13m6t could not build the unanchored-extractor mutant (binds='${_m6t_binds:-?}') — the pin did not run"
+fi
+
 # 13g3 — the marker veto must be anchored to a LINE START, not to position 0. The
 # body arrives @tsv-escaped, so a marker introduced by ANY preceding line used to
 # slip through `^` — the exact laundering 13g forbids, with a preamble in front.
@@ -5636,13 +5700,13 @@ fi
 #     → :2482 :4186 :6501 :6613, plus a comment mention at :2356) and the
 #     same four PREDICATE sites are at head
 #     (`grep -n 'grep -qxF' scripts/record-review.sh` prints all four PREDICATE lines at head —
-#     CITE-CHECK: :2722 :4448 :6818 :6992, plus a comment mention at :2591; `14.1c-CITE` below
+#     CITE-CHECK: :2736 :4462 :6832 :7006, plus a comment mention at :2605; `14.1c-CITE` below
 #     re-derives these numbers, so they cannot rot silently): in #3168's diff the only
-#     hunk at `post_marker()` (:2700) ADDS A COMMENT — this PR does not touch
+#     hunk at `post_marker()` (:2714) ADDS A COMMENT — this PR does not touch
 #     `post_marker()` at all — and the
-#     predicate line beside it (CITE-CHECK: :2722) is CONTEXT, not a change.
+#     predicate line beside it (CITE-CHECK: :2736) is CONTEXT, not a change.
 #     WHAT THE VECTOR BELOW ACTUALLY PINS: the BODY-APPEND site
-#     (`if ! grep -qxF -- "$MARKER" <<<"$BODY"`; on main at bd1b205d :6501 — at head CITE-CHECK: :6818). It is a
+#     (`if ! grep -qxF -- "$MARKER" <<<"$BODY"`; on main at bd1b205d :6501 — at head CITE-CHECK: :6832). It is a
 #     MAIN-REGRESSION pin — reverting this PR leaves 14.1c GREEN, and 14.10f is a
 #     main-regression pin for the same reason. Keeping them is right (main's
 #     anchoring should not silently regress); calling them evidence about this diff
@@ -5668,7 +5732,7 @@ fi
 #     `:6625` / `:6770` at `dc7e3ae99`, `:6634` / `:6779` at `921109de2` and `:6639` / `:6796` at
 #     `17551325e` as comment blocks were added above them, while the CITES beside them still read
 #     `:6625` / `:6770` at all three — that divergence IS the rot this paragraph describes — and at
-#     this head the predicates are `:6818` / `:6992` — CITE-CHECK: :6818 :6992 — re-derived by the
+#     this head the predicates are `:6832` / `:7006` — CITE-CHECK: :6832 :7006 — re-derived by the
 #     guard below, like every other head cite of a predicate). One
 #     lane's response was to delete the numbers — which removes the rot but also removes the
 #     reader's target. Both intents are kept here: the number stays, and it is CHECKED.
@@ -6570,14 +6634,14 @@ assert_eq "$REC_BEFORE_14B" "$(cat "$F_HOME/.pi/agent/reviews/daniel-ospina-agen
 #       not. `if command grep -qxF -- "$marker" <<<"$body"` is ALREADY `-qxF` on main
 #       (`git show bd1b205d:scripts/record-review.sh | grep -n 'grep -qxF'` — the sha is NAMED
 #       because `origin/main` moves and a bare "main :NNNN" rots the moment it does → :2482),
-#       and in #3168's diff the only hunk at `post_marker()` (head :2700) ADDS A COMMENT above
+#       and in #3168's diff the only hunk at `post_marker()` (head :2714) ADDS A COMMENT above
 #       it (this PR does not touch `post_marker()` at all) — the
-#       predicate line (head :2722) is CONTEXT. Reverting #3168 leaves this vector GREEN; it is kept
+#       predicate line (head :2736) is CONTEXT. Reverting #3168 leaves this vector GREEN; it is kept
 #       because main's anchoring should not silently regress, and it is labelled so the
 #       next reader does not mistake it for evidence about this diff. The predicate must
 #       match the gate's line-anchored `^…$` admission, exactly like the three other
 #       sites already anchored on main (bd1b205d :4186 :6501 :6613) — the same four that the grep
-#       above prints at head, CITE-CHECK: :4448 :6818 :6992 (`14.1c-CITE` re-derives the triple).
+#       above prints at head, CITE-CHECK: :4462 :6832 :7006 (`14.1c-CITE` re-derives the triple).
 #       ⛔ ASSERTS THE TRANSPORT (a PATCH was issued), not the exit code: the destructive
 #       mutant also exited 0.
 if [ -n "${QB_LINE:-}" ]; then

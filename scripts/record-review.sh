@@ -1222,7 +1222,7 @@ verify_review_evidence() { # <ref> <head_sha> [polarity] -> 0 = verified
   # marker whose field fell onto the next line therefore REFUSES instead of being guessed at.
   if grep -qiE '\[ADVERSARIAL-BOUND\]' <<<"$body"; then
     local _ab_norm _ab_sep _ab_rest _ab_line _ab_f _ab_v _ab_seen _ab_n _ab_ok _ab_bad _ab_t _ab_c
-    local _ab_tset _ab_cset _ab_nt _ab_nc _ab_num
+    local _ab_tset _ab_cset _ab_nt _ab_nc _ab_num _ab_lb
     _ab_sep=$'\\n'                  # the two characters backslash+n — @tsv's escape for a newline
     _ab_norm="${body//$'\n'/"$_ab_sep"}"   # real newlines → that same literal, so ONE splitter covers both
     _ab_rest="$_ab_norm"
@@ -1253,10 +1253,24 @@ verify_review_evidence() { # <ref> <head_sha> [polarity] -> 0 = verified
         # two different `threats=` (or two `covered=`) has no single pair to compare, exactly like (iii).
         # ⛔ DELIBERATELY NOT A COMPLETENESS TEST: when either field is ABSENT the comparison is
         # skipped, the terse forms still pass, and only the FILED value (v) requires the counts.
-        _ab_tset="$(printf '%s' "$_ab_line" | grep -oiE 'threats=[0-9]+' | grep -oE '[0-9]+' \
+        # ⛔ THE FIELD NAME NEEDS A LEFT BOUNDARY, OR THE ARTIFACT SUPPLIES ITS OWN COVERAGE EVIDENCE
+        # (found in review of #3829 at `39455bdd`, measured here). `grep -oiE 'covered=[0-9]+'` is an
+        # UNANCHORED substring, so it matched INSIDE `uncovered=13` and `not-covered=13`: the body
+        # `[ADVERSARIAL-BOUND] cycles=2 threats=13 uncovered=13 residuals=filed` — an artifact that
+        # declares every class UNCOVERED — read `covered='13'`, compared equal to `threats=13`, and
+        # minted `clean`. That defeats the very guard this paragraph describes, and the mirror was a
+        # false refusal: `covered=13 uncovered=0` read two covered values and was rejected as a
+        # cannot-verify the line never declared. So every count field is matched with a left boundary
+        # that excludes an identifier character (`-` included, for `not-covered=`). The boundary is
+        # consumed by `grep -o`, which is harmless: the digit stage below re-extracts `[0-9]+`.
+        # ⛔ ONE DEFINITION OF THE BOUNDARY, so the two extractors cannot drift and a mutation pin can
+        # remove it with a one-token edit (`_ab_lb=`). It is `[^-[:alnum:]]` rather than `[^[:alnum:]]`
+        # so `not-covered=` does not qualify either.
+        _ab_lb='(^|[^-[:alnum:]])'
+        _ab_tset="$(printf '%s' "$_ab_line" | grep -oiE "${_ab_lb}threats=[0-9]+" | grep -oE '[0-9]+' \
           | while IFS= read -r _ab_num; do printf '%s\n' "$((10#${_ab_num}))"; done \
           | sort -u | tr '\n' ' ' | sed 's/^ *//; s/ *$//' || true)"
-        _ab_cset="$(printf '%s' "$_ab_line" | grep -oiE 'covered=[0-9]+' | grep -oE '[0-9]+' \
+        _ab_cset="$(printf '%s' "$_ab_line" | grep -oiE "${_ab_lb}covered=[0-9]+" | grep -oE '[0-9]+' \
           | while IFS= read -r _ab_num; do printf '%s\n' "$((10#${_ab_num}))"; done \
           | sort -u | tr '\n' ' ' | sed 's/^ *//; s/ *$//' || true)"
         _ab_nt=0; for _ab_num in $_ab_tset; do _ab_nt=$((_ab_nt + 1)); done

@@ -1936,9 +1936,10 @@ off macOS (it renders a launchd plist) — the portability that matters is `orch
    acceptance criterion is the one the decision states — **coverage** — not the `residuals=` value:
    the marker is clean evidence **iff every marker in the artifact carries a legal clean value**, and
    a legal clean value is exactly `residuals=none` **or** a FILED residual list, in **either** of its
-   two spellings — a NUMERIC list (`residuals=#1083,#1084`) **or** the bare word `filed`
-   (`residuals=filed`, case-insensitive) — **with `threats=<K>` and `covered=<K>` both present on that
-   line and EQUAL**. The filed form is the normal state of a clean bounded exit — the decision files
+   two spellings — a NUMERIC list, which is any value that carries a DIGIT and contains none of
+   `none`, `<`, `>` or `…` (`residuals=#1083,#1084`, `residuals=R-B1..R-B6`) **or** the bare word
+   `filed` (`residuals=filed`, case-insensitive) — **with `threats=<K>` and `covered=<K>` both present
+   on that line and EQUAL**. The filed form is the normal state of a clean bounded exit — the decision files
    residuals "from cycle 1, not chased", renders the field `<#N,…|none>`, and three merged plans
    record exactly that shape as clean (`docs/plans/2026-09-15-issue-1051-bounded-scan-root.md`,
    `docs/plans/2026-09-28-issue-1505-…`, and
@@ -1951,7 +1952,8 @@ off macOS (it renders a launchd plist) — the portability that matters is `orch
    `3bef6262`, where `residuals=filed` with equal counts was refused by a message naming only
    conditions the artifact already met). It widens nothing that matters: the protection is the
    coverage comparison, which is identical for both spellings, and the word is matched EXACTLY —
-   `filed-off`, `some`, `yes`, `unknown` all still refuse. **SIX** things still refuse a marker:
+   `filed-off`, `some`, `yes`, `unknown` all still refuse. **SIX** things still refuse a marker, plus a
+   seventh described below (a count pair that cannot be identified):
    (i) a value that merely MENTIONS `none`
    (`none,#12`, `none-filed`, `noneX`); (ii) an unsubstituted template (`<#N,…|none>`); (iii) a
    marker with **no** `residuals=` field; (iv) a **contradictory disclosure** — when the marker line
@@ -1970,7 +1972,12 @@ off macOS (it renders a launchd plist) — the portability that matters is `orch
    later contradiction and let the artifact mint while its own fields admitted an uncovered class
    (measured on three shapes, fixed in #3829), so a pasted cycle-log row carrying two pairs refuses and
    the message names the ambiguity. The comparison is NUMERIC, so `threats=09 covered=9` is equal rather
-   than a false contradiction, and a space after the `=` (`residuals= none`) is accepted.
+   than a false contradiction, and a space after the `=` (`residuals= none`) is accepted. Each count
+   field is matched with a LEFT BOUNDARY, so `uncovered=13` and `not-covered=13` are NOT coverage
+   evidence: before this round's review the extractor was an unanchored substring, so a marker that
+   declared every class **UNCOVERED** (`threats=13 uncovered=13 residuals=filed`) minted `clean` — the
+   one fail-open the contradiction guard exists to prevent — and, in mirror, an honest
+   `covered=13 uncovered=0` was refused as "MORE THAN ONE count value".
    ⛔ **THE REMAINING SEAM, stated rather than hidden:** the capped emission
    (`skills/code-review/references/fixer-loop.md` §"PR comment prefix") is
    `threats=<K> covered=<K> residuals=<#N,…|none>` — equal counts BY CONSTRUCTION, and its own prose
