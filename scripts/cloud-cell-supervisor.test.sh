@@ -1097,22 +1097,28 @@ printf '#!/bin/bash\nexit 1\n' > "$P/nodfbin/df"; chmod +x "$P/nodfbin/df"   # d
 
 PH=""; PPATH=""; PREF=""; PROV_OUT=''; PROV_RC=0
 # ⛔ THE DISK IS AN EXPLICIT SEAM HERE, NOT THE HOST'S (agent-infra#1852). `check` now refuses a cell
-# that cannot fit ONE lane, so the runner's own free space would decide every arm in this section — a
-# loaded runner would redden arms about harness provenance. The seams below are SET only by the arms
-# whose subject IS the disk (§h/§h2/§h3), and they are the very knobs the shipped supervisor honours:
-#   PROV_FLOOR       -> MIN_FREE_MB. Unset = 1 ("the floor passes"), so provenance arms cannot be
-#                       decided by a disk condition. SET BUT EMPTY = leave MIN_FREE_MB empty, which is
-#                       how §h3 drives the DISK_MIN_FREE_MB -> MIN_FREE_MB inheritance.
+# that cannot fit ONE lane, so the runner's own free space would decide the provenance arms — but the
+# DEFAULTS BELOW ARE THE PRE-CHANGE SEMANTICS EXACTLY, and that is not tidiness: the arms in §(n)
+# below are ABOUT `start`'s unattended prune, which fires only when `free < 2 x MIN_FREE_MB`. Driving
+# them with a tiny floor (the first draft defaulted it to 1) made the 900MiB `prunebin` stub sit ABOVE
+# the trigger, so the prune never ran and four arms went red on CI (`start did not prune even with no
+# worker running`, `no KEEP line about the venv`, and the two stand-down explanations) — measured on
+# this PR's own head, while the same suite was green on main. So:
+#   PROV_FLOOR       -> MIN_FREE_MB. Default 500 = the shipped floor. SET BUT EMPTY leaves MIN_FREE_MB
+#                       empty, which is how §h3 drives the DISK_MIN_FREE_MB -> MIN_FREE_MB inheritance.
 #   PROV_DISK_FLOOR  -> DISK_MIN_FREE_MB (empty = not set).
-#   PROV_TREE/_SELF/_RESERVE -> DISK_LANE_*_MB. EMPTY IS NOT AN OVERRIDE (the shipped derivation
-#                       applies, exactly as in spawn-gate.sh), so neutralising them takes an explicit 0.
+#   PROV_TREE/_SELF/_RESERVE -> DISK_LANE_*_MB. Default **0**, i.e. the one-lane-fit arm is NEUTRALISED
+#                       for every arm that is not about it — the same explicit-0 neutralisation the
+#                       shipped gate honours, and the same shape spawn-gate.test.sh uses for its
+#                       load/success arms. SET BUT EMPTY means "no override": the shipped derivation
+#                       applies, which is what §h2 needs to measure the real numbers.
 prov() {
   local sub="$1"; shift
   rm -f "$P/tmuxup"
   PROV_OUT="$(PATH="${PPATH:+$PPATH:}$P/bin:$PATH" PROV_TMUX_UP="$P/tmuxup" \
-              MIN_FREE_MB="${PROV_FLOOR-1}" DISK_MIN_FREE_MB="${PROV_DISK_FLOOR:-}" \
-              DISK_LANE_TREE_MB="${PROV_TREE:-}" DISK_LANE_SELF_MB="${PROV_SELF:-}" \
-              DISK_LANE_RESERVE_MB="${PROV_RESERVE:-}" \
+              MIN_FREE_MB="${PROV_FLOOR-500}" DISK_MIN_FREE_MB="${PROV_DISK_FLOOR:-}" \
+              DISK_LANE_TREE_MB="${PROV_TREE-0}" DISK_LANE_SELF_MB="${PROV_SELF-0}" \
+              DISK_LANE_RESERVE_MB="${PROV_RESERVE-0}" \
               CELL_HOME="$P/home" ENV_FILE="$P/keys.env" SESSION="ai1745-$$" \
               O="$P/o" REPO="${PROV_REPO:-$P/repo}" HARNESS_REPO="$AI" HARNESS_FETCH=0 HARNESS_REF="${PREF:-origin/main}" \
               HARNESS_PIN_DIR="$P/pin" HARNESS_PIN_FILE="$P/home/.harness-path" HARNESS="$PH" \
@@ -1387,11 +1393,11 @@ prov start
 # the two assertions below pass because the HARNESS is refused, not because the disk is — a false
 # pass in the test itself (found by mutating the floor to `if false` and watching it stay green).
 PH="$(cat "$P/home/.harness-path" 2>/dev/null)"
-# These arms are ABOUT the shipped 500MB floor, so they set it explicitly (the provenance arms above
-# default it to 1) and NEUTRALISE the one-lane-fit predicate #1852 added on the same reading: two
-# predicates read the same `df`, and an arm that does not say which one it is testing proves neither.
-# The neutralisation is the three overrides `spawn-gate.sh` honours, with an explicit 0 — the same shape
-# spawn-gate.test.sh uses for its load/success arms.
+# These arms are ABOUT the shipped 500MB floor, so they set it explicitly and NEUTRALISE the
+# one-lane-fit predicate #1852 added on the same reading: two predicates read the same `df`, and an arm
+# that does not say which one it is testing proves neither. The neutralisation is the three overrides
+# `spawn-gate.sh` honours, with an explicit 0 (which is also `prov()`'s default — spelled here so the
+# arm states what it relies on).
 PROV_FLOOR=500; PROV_TREE=0; PROV_SELF=0; PROV_RESERVE=0
 PPATH="$P/lowbin"
 prov check
@@ -1522,7 +1528,8 @@ for badfloor in abc 000; do
     bad "DISK_MIN_FREE_MB=$badfloor was ACCEPTED as a floor — it can never fire, or it means zero"
   fi
 done
-PROV_FLOOR=1; PROV_DISK_FLOOR=; PROV_TREE=; PROV_SELF=; PROV_RESERVE=
+# ── reset to the PRE-CHANGE semantics for every arm below (§10 onward): shipped floor, lane-fit off.
+unset PROV_FLOOR PROV_DISK_FLOOR PROV_TREE PROV_SELF PROV_RESERVE
 PPATH=""
 
 # (i) UNRESOLVABLE REF — cannot-verify must never be read as a pass.
