@@ -675,13 +675,18 @@ script:reap-lane-venvs.sh script:record-review.sh script:registry-sync.sh script
 script:runner_autoscale.py script:session-postmortem.sh script:tortoise_graph_client.py
 script:turn-classify.py script:turn-end.py script:undelivered-answers.py script:venv-real-cost.py
 script:watch-truncation.sh script:wip-sweep.sh
-lib:beat-pair.sh lib:bounded.sh lib:cmux-dispatch-path.sh lib:cmux_payload.py lib:diff-normalize.py lib:live-paths.sh
+lib:beat-pair.sh lib:bounded.sh lib:cell-home.sh lib:cmux-dispatch-path.sh lib:cmux_payload.py lib:diff-normalize.py lib:live-paths.sh
 lib:pid-identity.sh lib:transcript-patterns.sh
 state:lane-confirm.py state:lane-triage.py state:lane-verdict.py
 script:cmux_dispatch.py foreign:orch-loop.sh
 other:orchestrator-harness/brief-gate.sh other:orchestrator-harness/capacity.sh
 other:orchestrator-harness/cloud-cell-doctor.sh
 "
+# RE-CUT 2026-11-09 (computed from the population, never hand-typed): `lib:cell-home.sh` ADDED, nothing
+# removed. `agent-infra#3453` puts `cell-home.sh` in `setup.sh`'s `lib_srcs` and
+# `scripts/harness-apply-pass.sh` resolves it as a `lib/` sibling, so it is a lane producer this pin has
+# to name — without it the pin failed with `ADDED: lib:cell-home.sh`, i.e. a farm that delivers the
+# resolver reads as drift. One line, no exemption.
 # RE-CUT 2026-11-07 (computed by `--cut`, never hand-typed): NINE PIN LINES added, NONE removed,
 # covering EIGHT distinct files — the doctor appears twice, as `script:cloud-cell-doctor.sh` (the flat
 # `$DEST/scripts/` location) and as `other:orchestrator-harness/cloud-cell-doctor.sh` (the $O payload).

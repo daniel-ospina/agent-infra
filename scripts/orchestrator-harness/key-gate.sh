@@ -6,12 +6,13 @@
 #     . key-gate.sh
 #     key_gate_assert "lane 42" "${HOME:-}"      # one verdict line (+ a warning line on one arm), 0 or KEY_GATE_REFUSED
 #
-# THE DEFECT THIS REFUSES — measured 2026-11-02 on two cloud cells. A lane runs with
-# `HOME=/tmp/cell-home`, which is REQUIRED: the operational layer (`record-review.sh`, the gh shim, the
-# extensions) lives under `$CELL_HOME/.pi/agent`. But the model credential lives in
-# `/home/cmux/keys.env` — under the ACCOUNT home — and `lane-env.sh` sources `${ENV_FILE:-$HOME/keys.env}`,
-# i.e. the redirected one. So the single setting that makes the operational layer work is the setting
-# that hides the credential. `pi` started, found no key, and was gone:
+# THE DEFECT THIS REFUSES — measured 2026-11-02 on two cloud cells. A lane ran with
+# `HOME=/tmp/cell-home` (the LEGACY volatile home: agent-infra#3453 has since unified every unit on the
+# durable `/home/cmux`, and this file now DERIVES it rather than naming it), which redirected the
+# operational layer (`record-review.sh`, the gh shim, the extensions) to `$CELL_HOME/.pi/agent`. But the
+# model credential lived in `/home/cmux/keys.env` — under the ACCOUNT home — and `lane-env.sh` sources
+# `${ENV_FILE:-$HOME/keys.env}`, i.e. the redirected one. So the single setting that made the operational
+# layer work was the setting that hid the credential. `pi` started, found no key, and was gone:
 #
 #     No API key found for the selected model.
 #
@@ -96,6 +97,23 @@
 # is settable from `keys.env`, and the fleet's own `provider-credential.test.sh` documents the store).
 # `key_gate_stored_credential` is therefore consulted BEFORE the refusal, and its answer is the third
 # "cannot say" arm: it asserts nothing.
+
+# ⛔ THE ONE HOME (agent-infra#3453): this used to default to the legacy `/tmp/cell-home`, so the
+# candidate list this function builds pointed at a home no other cell unit agreed with — the split
+# whose symptom is "the credential IS on the box and `git push` still answers 403". Derived by
+# `scripts/lib/cell-home.sh` (`../lib/` from the harness dir: checkout, pinned worktree, flat farm).
+# ⛔ THE SELF PATH COUNTS ONLY WHEN IT NAMES THIS FILE — see `lib/cell-home.sh` §CONSUMERS. A PIPED
+# start (`bash -s`) has no `BASH_SOURCE` and its `$0` is LITERALLY `bash`, so `dirname "${BASH_SOURCE[0]:-$0}"`
+# answers `.` and the candidate becomes `<parent-of-CWD>/lib/cell-home.sh`: this gate then SOURCES code
+# out of a directory it does not own (measured here: a planted fixture sourced and ran, `cell_home_resolve`
+# came back command-not-found and `CELL_HOME` stayed empty). Guarded, a piped start has no sibling to
+# trust and takes the documented `$HOME` fallback below instead.
+_SELF="${BASH_SOURCE[0]:-}"; [ -f "$_SELF" ] || _SELF=""
+KG_SELF_DIR=""
+if [ -n "$_SELF" ]; then KG_SELF_DIR="$(cd "$(dirname "$_SELF")/.." 2>/dev/null && pwd -P)"; fi
+CELL_HOME_LIB=""
+if [ -n "$KG_SELF_DIR" ] && [ -r "$KG_SELF_DIR/lib/cell-home.sh" ]; then CELL_HOME_LIB="$KG_SELF_DIR/lib/cell-home.sh"; fi
+if [ -n "$CELL_HOME_LIB" ]; then . "$CELL_HOME_LIB"; CELL_HOME="$(cell_home_resolve)"; else CELL_HOME="${CELL_HOME:-${HOME:-}}"; fi
 
 # The refusal carries its own status: 82 is unassigned elsewhere in this tree (70-83 are spawn-gate's,
 # repo-target's and brief-gate's — 83 is the HARNESS/SKEW gate since agent-infra#3237; 93-98 are the
@@ -1835,7 +1853,7 @@ key_gate_stored_credential() {
 key_gate_candidates() {
   local home="${1:-}" acct cell c
   acct="$(key_gate_account_home)"
-  cell="${CELL_HOME:-/tmp/cell-home}"
+  cell="$CELL_HOME"
   for c in "${ENV_FILE:-}" \
            "${home:+$home/keys.env}" \
            "${home:+$home/pi-keys.env}" \
@@ -2784,11 +2802,11 @@ key_gate_assert_main() {
           # one of them needs to see that the gate looked, or the refusal reads as "you have no credential" when what
           # it means is "neither the variable nor <these paths> is set here".
           printf '[key-gate] %s: pi resolves this BUILT-IN provider from %s (its own table, `dist/env-api-keys.js`), OR from a NON-VARIABLE path this gate ALSO checked and found closed: %s. Measured: with neither, `pi -p --no-session --provider %s --model %s` answers "No API key found for %s." and exits. ⛔ ON A CELL THE VARIABLE IS THE USUAL TRAP: HOME is redirected to the operational home (%s) so the operational layer is found, and the credential usually lives in the ACCOUNT home instead — export %s (or point ENV_FILE at a file that does) and re-dispatch. No models.json apiKey template is involved here (%s)\n' \
-            "$label" "$bltv" "$bpaths" "$KEY_GATE_PROVIDER" "$KEY_GATE_MODEL" "$KEY_GATE_PROVIDER" "${CELL_HOME:-/tmp/cell-home}" "$bvar" "${KEY_GATE_MODELS_JSON:-<none>}"
+            "$label" "$bltv" "$bpaths" "$KEY_GATE_PROVIDER" "$KEY_GATE_MODEL" "$KEY_GATE_PROVIDER" "$CELL_HOME" "$bvar" "${KEY_GATE_MODELS_JSON:-<none>}"
           return "$KEY_GATE_REFUSED"
         fi
         printf '[key-gate] %s: pi resolves this BUILT-IN provider from %s alone (its own table, `dist/env-api-keys.js`), and NOTHING in the environment this lane would run with holds a value for any of them — measured: `pi -p --no-session --provider %s --model %s` answers "No API key found for %s." and exits having done nothing. ⛔ ON A CELL THIS IS THE TRAP: HOME is redirected to the operational home (%s) so the operational layer is found, and the credential usually lives in the ACCOUNT home instead — export %s (or point ENV_FILE at a file that does) and re-dispatch. No models.json apiKey template is involved here (%s)\n' \
-          "$label" "$bltv" "$KEY_GATE_PROVIDER" "$KEY_GATE_MODEL" "$KEY_GATE_PROVIDER" "${CELL_HOME:-/tmp/cell-home}" "$bvar" "${KEY_GATE_MODELS_JSON:-<none>}"
+          "$label" "$bltv" "$KEY_GATE_PROVIDER" "$KEY_GATE_MODEL" "$KEY_GATE_PROVIDER" "$CELL_HOME" "$bvar" "${KEY_GATE_MODELS_JSON:-<none>}"
         return "$KEY_GATE_REFUSED" ;;
       uncertain:*)
         # A built-in whose env var alone is NOT the whole answer refuses NOTHING (see the table measured notes):
@@ -2908,7 +2926,7 @@ key_gate_assert_main() {
   printf '[key-gate] %s check=fail result=REFUSED reason=%s var=%s provider=%s model=%s agent_dir=%s models_json=%s candidates=%s\n' \
     "$label" "$KEY_GATE_REASON" "$KEY_GATE_VAR" "$KEY_GATE_PROVIDER" "$KEY_GATE_MODEL" "${KEY_GATE_AGENT_DIR:-<none>}" "${KEY_GATE_MODELS_JSON:-<none>}" "$cands"
   printf '[key-gate] %s: $%s holds no value in the environment this lane would run with, so `pi` would start, print "No API key found", and exit having done nothing. ⛔ ON A CELL THIS IS THE TRAP: HOME is redirected to the operational home (%s) so the operational layer is found, and the credential usually lives in the ACCOUNT home instead — check every candidate above, export $%s (or point ENV_FILE at a file that does), then re-dispatch. ⛔ THIS LANE RUNS provider=%s model=%s, and `pi -p --no-session --provider %s --model %s` is the invocation this verdict is about; a bare `pi` with no model flag asks a DIFFERENT question (see the box-default line above, when the companion speaks) — measured on cell-5, where the keys file held only GH_TOKEN and the MODEL FLAG was the fix (agent-infra#3443).\n' \
-    "$label" "$KEY_GATE_VAR" "${CELL_HOME:-/tmp/cell-home}" "$KEY_GATE_VAR" "$KEY_GATE_PROVIDER" "$KEY_GATE_MODEL" "$KEY_GATE_PROVIDER" "$KEY_GATE_MODEL"
+    "$label" "$KEY_GATE_VAR" "$CELL_HOME" "$KEY_GATE_VAR" "$KEY_GATE_PROVIDER" "$KEY_GATE_MODEL" "$KEY_GATE_PROVIDER" "$KEY_GATE_MODEL"
   return "$KEY_GATE_REFUSED"
 }
 

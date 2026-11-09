@@ -87,7 +87,10 @@ fi
 #                          counterpart (this unit is Type=simple, where that directive does not bound start)
 #   ORCH_HANDOVER_TIMEOUT_SEC the handover ceiling for a controller this state dir still OWNS (default 3600;
 #                          a whole number >= 1). Long on purpose: that controller is landing work
-#   CELL_HOME              the cell's home whose keys.env/state the controller reads (default $HOME)
+#   CELL_HOME              the cell's home whose keys.env/state the controller reads (default: DERIVED —
+#                          scripts/lib/cell-home.sh). ⛔ It is rendered as BOTH `Environment=HOME=` and
+#                          `Environment=CELL_HOME=` in the unit: the home the unit runs as and the home it
+#                          pins are the same question, and the pass refuses (exit 27) while they disagree.
 #   ENV_FILE               the controller's env file (default $CELL_HOME/keys.env)
 #   O                      the controller's state dir, used only to READ BACK the heartbeat
 #                          (default $CELL_HOME/orchestrator)
@@ -142,7 +145,28 @@ RESTART_SEC="${ORCH_RESTART_SEC:-15}"
 #     migration path and is landing work. A long bound is correct here; a short one would fail the upgrade.
 START_TIMEOUT_SEC="${ORCH_START_TIMEOUT_SEC:-60}"
 HANDOVER_TIMEOUT_SEC="${ORCH_HANDOVER_TIMEOUT_SEC:-3600}"
-CELL_HOME="${CELL_HOME:-${HOME:?HOME is required}}"
+# ── THE ONE HOME (agent-infra#3453) — DERIVED, never defaulted to the legacy /tmp/cell-home ────────
+# ⛔ THIS INSTALLER RENDERS THE UNIT THE PASS'S SPLIT GUARD MEASURES (review F1). The pass compares this
+# unit's `Environment=CELL_HOME=` against the home it derives, and it REFUSES every tick (exit 27) while
+# they disagree — so a renderer that answers "what is this box's home?" from `$HOME` does not merely
+# produce a wrong unit, it makes the pass refuse over a disagreement this file authored. That is not
+# hypothetical on the channel the fleet reaches a cell through: `cmux vm exec` runs as `cmux` with
+# `HOME=/home/ubuntu`, a directory the image does not create, so `$HOME` there is a home no account
+# lives in. The rule lives in `scripts/lib/cell-home.sh`; this is the same consumer block
+# `install-repair-service.sh` carries.
+CELL_HOME_LIB=""
+# ⛔ THE SELF PATH COUNTS ONLY WHEN IT NAMES THIS FILE — see `lib/cell-home.sh` §CONSUMERS.
+_SELF="${BASH_SOURCE[0]:-}"; [ -f "$_SELF" ] || _SELF=""     # under `bash -s` $0 is literally `bash` -> `.`
+if [ -n "$_SELF" ]; then
+  _SELF_DIR="$(cd "$(dirname "$_SELF")" 2>/dev/null && pwd -P)"
+  for _cand in "$_SELF_DIR/lib/cell-home.sh" "$_SELF_DIR/../lib/cell-home.sh"; do
+    [ -r "$_cand" ] && { CELL_HOME_LIB="$_cand"; break; }
+  done
+fi
+if [ -n "$CELL_HOME_LIB" ]; then . "$CELL_HOME_LIB"; CELL_HOME="$(cell_home_resolve)"; else CELL_HOME="${CELL_HOME:-${HOME:?HOME is required}}"; fi
+# ⛔ AN EMPTY CELL_HOME IS NOT A HOME — it is the FILESYSTEM ROOT, and this file renders it into TWO
+# `Environment=` lines. A missing resolver is the incomplete-install case, so it is a REFUSAL.
+[ -n "$CELL_HOME" ] || { printf '%s: FATAL: %s is not readable and neither CELL_HOME nor HOME is set — refusing to default the cell home (agent-infra#3453)\n' "${0##*/}" "${CELL_HOME_LIB:-lib/cell-home.sh}" >&2; exit 78; }
 ENV_FILE="${ENV_FILE:-$CELL_HOME/keys.env}"
 O="${O:-$CELL_HOME/orchestrator}"
 ACTION=--install
@@ -1142,7 +1166,7 @@ choose_target() {
 render() {
     local tpl="$1" dest="$2"
     sed -e "s|{{USER}}|$(sed_esc "$(id -un)")|g" \
-        -e "s|{{HOME}}|$(sed_esc "$HOME")|g" \
+        -e "s|{{HOME}}|$(sed_esc "$CELL_HOME")|g" \
         -e "s|{{CELL_HOME}}|$(sed_esc "$CELL_HOME")|g" \
         -e "s|{{ENV_FILE}}|$(sed_esc "$ENV_FILE")|g" \
         -e "s|{{PATH}}|$(sed_esc "$PATH")|g" \

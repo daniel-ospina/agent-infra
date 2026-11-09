@@ -60,7 +60,15 @@
 #   HARNESS_APPLY_REPO       the agent-infra checkout the pass converges (default: this repo)
 #   HARNESS_APPLY_REF        the ref to converge on (default origin/main)
 #   HARNESS_APPLY_MODE       pin|sync (default: decided by the pass — see its header)
-#   HARNESS_APPLY_STATE_DIR  the pass record/log dir the unit exports (default $HOME/.pi/agent/state)
+#   HARNESS_APPLY_STATE_DIR  the pass record/log dir the unit exports (default $CELL_HOME/.pi/agent/state
+#                            — ⛔ the DERIVED home, not $HOME: the unit exports `Environment=HOME=$CELL_HOME`,
+#                            so a record dir taken from $HOME would put its two `Environment=` lines in
+#                            DIFFERENT homes, and the scheduled pass would write the record where the box
+#                            does not look (review F2))
+#   CELL_HOME                the cell's ONE home (default: DERIVED — scripts/lib/cell-home.sh). ⛔ It is
+#                            rendered as the unit's `Environment=HOME=`, because the home this unit runs
+#                            as and the home the pass derives are the SAME question, and the pass refuses
+#                            (exit 27) while they disagree (agent-infra#3453).
 #   HARNESS_APPLY_INTERVAL_MIN  minutes between passes (default 10; 1..1440)
 #   TEMPLATES_DIR            systemd template dir (default: this repo's templates/systemd)
 #   LAUNCHD_TEMPLATES_DIR    plist template dir (default: this repo's templates/launchd/harness-apply)
@@ -75,6 +83,27 @@
 #
 # Exit codes: 0 ok · 1 failure (named) · 2 usage.
 set -uo pipefail
+
+# ── THE ONE HOME (agent-infra#3453) — DERIVED, never defaulted to the legacy /tmp/cell-home ────────
+# ⛔ THIS INSTALLER IS ONE OF THE RENDERERS THE PASS'S SPLIT GUARD READS (review F1). The pass compares
+# this unit's `Environment=HOME=` against the home it derives, so a renderer that answers "what is this
+# box's home?" from `$HOME` does not merely produce a wrong unit — it makes the pass REFUSE every tick
+# (exit 27) over a disagreement its own installer authored, on the one channel the fleet reaches a cell
+# through: `cmux vm exec` runs as `cmux` with `HOME=/home/ubuntu`, a directory that is not created on the
+# image. The rule lives in `scripts/lib/cell-home.sh`; this block is the same consumer shape
+# `install-repair-service.sh` carries.
+CELL_HOME_LIB=""
+# ⛔ THE SELF PATH COUNTS ONLY WHEN IT NAMES THIS FILE — see `lib/cell-home.sh` §CONSUMERS.
+_SELF="${BASH_SOURCE[0]:-}"; [ -f "$_SELF" ] || _SELF=""     # under `bash -s` $0 is literally `bash` -> `.`
+if [ -n "$_SELF" ]; then
+  _SELF_DIR="$(cd "$(dirname "$_SELF")" 2>/dev/null && pwd -P)"
+  for _cand in "$_SELF_DIR/lib/cell-home.sh" "$_SELF_DIR/../lib/cell-home.sh"; do
+    [ -r "$_cand" ] && { CELL_HOME_LIB="$_cand"; break; }
+  done
+fi
+if [ -n "$CELL_HOME_LIB" ]; then . "$CELL_HOME_LIB"; CELL_HOME="$(cell_home_resolve)"; else CELL_HOME="${CELL_HOME:-${HOME:-}}"; fi
+# ⛔ AN EMPTY CELL_HOME IS NOT A HOME — it is the FILESYSTEM ROOT, and it is rendered into the unit.
+[ -n "$CELL_HOME" ] || { printf '%s: FATAL: %s is not readable and neither CELL_HOME nor HOME is set — refusing to default the cell home (agent-infra#3453)\n' "${0##*/}" "${CELL_HOME_LIB:-lib/cell-home.sh}" >&2; exit 78; }
 
 INFRA_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 if [ -z "${TEMPLATES_DIR:-}" ]; then
@@ -104,12 +133,29 @@ if [ -z "${LAUNCHD_TEMPLATES_DIR:-}" ]; then
 fi
 LAUNCHD_TEMPLATES_DIR="${LAUNCHD_TEMPLATES_DIR:-$INFRA_ROOT/templates/launchd/harness-apply}"
 PLATFORM="${ELDATO_PLATFORM:-$(uname -s 2>/dev/null || printf 'unknown')}"
-STATE_DIR="${HARNESS_APPLY_STATE_DIR:-${HOME:?HOME is required}/.pi/agent/state}"
+# ⛔ THE STATE DIR IS DERIVED FROM THE SAME HOME THE UNIT EXPORTS (review F2). This defaulted to
+# `${HOME:?…}/.pi/agent/state` while the systemd render was handed `$CELL_HOME` as `Environment=HOME=`
+# — so on the very channel this change targets (`cmux vm exec`, `HOME=/home/ubuntu`, derivation
+# `/home/cmux`) the unit carried `HOME=/home/cmux` AND `HARNESS_APPLY_STATE_DIR=/home/ubuntu/.pi/agent/state`:
+# one unit, two homes, i.e. the split this PR exists to remove, reintroduced inside a single file's
+# environment. The observable is the #2416/#2032 inert-enforcer shape with the parts swapped — the
+# scheduled pass writes `harness-apply.status` where nobody reads it, while an operator — and
+# `tools/fleet/fleet-health.py`, which resolves the record from `HARNESS_APPLY_STATE_DIR` else `$HOME`
+# (agent-infra#3870) — read `$CELL_HOME/.pi/agent/state/harness-apply.status` and find nothing. The explicit
+# override still wins, which is the seam the suite and an unusual box use.
+STATE_DIR="${HARNESS_APPLY_STATE_DIR:-${CELL_HOME:?CELL_HOME is required}/.pi/agent/state}"
 INTERVAL_MIN="${HARNESS_APPLY_INTERVAL_MIN:-10}"
 UNIT_NAME="eldato-harness-apply"
 LABEL="com.eldato.${UNIT_NAME#eldato-}"
 PASS_REF="${HARNESS_APPLY_REF:-origin/main}"
 PASS_MODE="${HARNESS_APPLY_MODE:-}"
+# ⛔ THE CONTROLLER'S UNIT NAME GOES INTO THE PASS'S UNIT (agent-infra#3453, review round-3 F2). The pass
+# READS that unit to compare homes; `install-controller-service.sh` renders and validates
+# `CONTROLLER_UNIT=<bare name>`, so a renamed controller is a supported install — and a pass that
+# assumed `eldato-orchestrator` would find no unit, print `split_home=none`, and refuse nothing. One
+# fact, rendered into both units, from the operator's own `CONTROLLER_UNIT`.
+CONTROLLER_UNIT="${CONTROLLER_UNIT:-eldato-orchestrator}"
+case "$CONTROLLER_UNIT" in *.service) : ;; *) CONTROLLER_UNIT="$CONTROLLER_UNIT.service" ;; esac
 
 # ── the checkout the pass converges ──────────────────────────────────────────────────────────
 # ⛔ A FARMED INSTALLER HAS NO CHECKOUT BESIDE IT. On a cell this file lives at
@@ -165,14 +211,18 @@ help_text() {
 usage() { help_text; exit 2; }
 
 # ── resolve the pass ───────────────────────────────────────────────────────────────────────────
-# The FARMED copy first (that is what a cell has after `pi-bootstrap/setup.sh`, and a unit pointing
-# at a worktree checkout would break the day that worktree is reaped).
+# The farmed copy first (that is what a cell has after `pi-bootstrap/setup.sh`, and a unit pointing
+# at a worktree checkout would break the day that worktree is reaped). ⛔ THE FARM UNDER THE CELL'S OWN
+# HOME COMES BEFORE THE INVOKING SHELL'S (review F2): a `cmux vm exec` start has
+# `HOME=/home/ubuntu` while the farm every unit runs from is under `$CELL_HOME`, so the old order either
+# missed the farmed copy entirely (falling through to a worktree checkout that will be reaped) or found
+# one in a home the unit does not run as — the same seam as STATE_DIR above.
 PASS=""
 if [ -n "${HARNESS_APPLY_PASS:-}" ] && [ ! -f "$HARNESS_APPLY_PASS" ]; then
     err "\$HARNESS_APPLY_PASS is set to '$HARNESS_APPLY_PASS' but that is not a regular file — refusing to install a unit that points at a DIFFERENT copy of the pass"
     exit 2
 fi
-for cand in "${HARNESS_APPLY_PASS:-}" "${HOME:-}/.pi/agent/scripts/harness-apply-pass.sh" "$INFRA_ROOT/scripts/harness-apply-pass.sh"; do
+for cand in "${HARNESS_APPLY_PASS:-}" "$CELL_HOME/.pi/agent/scripts/harness-apply-pass.sh" "${HOME:-}/.pi/agent/scripts/harness-apply-pass.sh" "$INFRA_ROOT/scripts/harness-apply-pass.sh"; do
     [ -n "$cand" ] || continue
     [ -f "$cand" ] && { PASS="$cand"; break; }
 done
@@ -266,7 +316,7 @@ refuse_transient_target() {
     # ⛔ EVERY SUBSTITUTED VALUE GOES THROUGH `sed` — where a BACKSLASH IS AN ESCAPE. Measured on the
     # disk-reaper installer: `s|{{HOME}}|/tmp/a\b|` rendered `/tmp/ab`, exit 0, no `{{` left for the
     # post-render guard, and the unit pointed at a path that does not exist.
-    for v in "HOME=$HOME" "PATH=$PATH" "STATE_DIR=$STATE_DIR" "PASS=$PASS" "PASS_REPO=$PASS_REPO" "PASS_REF=$PASS_REF"; do
+    for v in "HOME=$HOME" "PATH=$PATH" "STATE_DIR=$STATE_DIR" "PASS=$PASS" "PASS_REPO=$PASS_REPO" "PASS_REF=$PASS_REF" "CONTROLLER_UNIT=$CONTROLLER_UNIT"; do
         case "${v#*=}" in
             *\\*) err "REFUSING: ${v%%=*} contains a backslash — the artifact is rendered with sed, where a backslash is an escape, so the rendered path would silently differ from the real one"; return 1 ;;
         esac
@@ -291,7 +341,7 @@ refuse_transient_target() {
 refuse_systemd_unsafe_values() {
     local v
     [ "${TARGET:-}" = "launchd" ] && return 0
-    for v in "HOME=$HOME" "PATH=$PATH" "STATE_DIR=$STATE_DIR" "PASS=$PASS" "PASS_REPO=$PASS_REPO"; do
+    for v in "HOME=$HOME" "PATH=$PATH" "STATE_DIR=$STATE_DIR" "PASS=$PASS" "PASS_REPO=$PASS_REPO" "CONTROLLER_UNIT=$CONTROLLER_UNIT"; do
         case "${v#*=}" in
             *[[:space:]]*) err "REFUSING: ${v%%=*} contains whitespace — systemd splits the rendered unit on it, so it would never run"; return 1 ;;
         esac
@@ -308,10 +358,25 @@ xml_sed_repl() {
         | sed -e 's/[&\\|]/\\&/g'
 }
 
-render() { # render <template> <dest>
-    local tpl="$1" dest="$2"
+render() { # render <template> <dest> [home]
+    # ⛔ THE THIRD ARGUMENT IS THE UNIT'S `HOME`, AND **BOTH** BRANCHES PASS THE DERIVED ONE (review F1,
+    # review F3). A unit that exports `HOME=<the invoking shell's home>` is the SPLIT the pass's guard
+    # refuses: on a cell reached through `cmux vm exec` that value is `/home/ubuntu`, which does not
+    # exist, while the home every other unit runs as is the account's.
+    # ⛔ THE LAUNCHD BRANCH USED TO KEEP `$HOME`, AND THE GROUND GIVEN FOR IT WAS FALSE (review F3). This
+    # comment claimed the plist's `{{HOME}}` fed EXECUTABLE PATHS that "must resolve" to the account's
+    # home. It does not: `templates/launchd/harness-apply/com.eldato.harness-apply.plist` carries
+    # `{{HOME}}` in exactly one place — `EnvironmentVariables → HOME` — which IS the job's environment and
+    # therefore the very field this derivation exists to feed; the executable paths are `{{PY_BIN}}`,
+    # `{{LAUNCHER}}` and `{{PASS}}`, each resolved to an absolute path by its own resolver and none of them
+    # built from `{{HOME}}`, so re-basing `{{HOME}}` moves no program. Keeping `$HOME` therefore meant a
+    # documented `CELL_HOME=<…>` override (the resolver's precedence 1) silently did not reach a Darwin
+    # install, and the plist exported one home while `HARNESS_APPLY_STATE_DIR` was derived from it.
+    # `$HOME` survives only as the default for a template that names no home at all (none does today), so
+    # a caller that forgets the argument degrades to the old behaviour rather than to an empty value.
+    local tpl="$1" dest="$2" _unit_home="${3:-$HOME}"
     sed -e "s|{{USER}}|$(xml_sed_repl "$(id -un)")|g" \
-        -e "s|{{HOME}}|$(xml_sed_repl "$HOME")|g" \
+        -e "s|{{HOME}}|$(xml_sed_repl "$_unit_home")|g" \
         -e "s|{{PATH}}|$(xml_sed_repl "$PATH")|g" \
         -e "s|{{STATE_DIR}}|$(xml_sed_repl "$STATE_DIR")|g" \
         -e "s|{{PASS}}|$(xml_sed_repl "$PASS")|g" \
@@ -319,6 +384,7 @@ render() { # render <template> <dest>
         -e "s|{{PASS_REPO}}|$(xml_sed_repl "$PASS_REPO")|g" \
         -e "s|{{PASS_REF}}|$(xml_sed_repl "$PASS_REF")|g" \
         -e "s|{{PASS_MODE}}|$(xml_sed_repl "$PASS_MODE")|g" \
+        -e "s|{{CONTROLLER_UNIT}}|$(xml_sed_repl "$CONTROLLER_UNIT")|g" \
         -e "s|{{INTERVAL_MIN}}|$INTERVAL_MIN|g" \
         -e "s|{{INTERVAL_SEC}}|$(( INTERVAL_MIN * 60 ))|g" \
         -e "s|{{LABEL}}|$LABEL|g" \
@@ -429,7 +495,7 @@ do_install_systemd() {
     refuse_systemd_unsafe_values || return 1
 
     tmpd="$(mktemp -d "${TMPDIR:-/tmp}/harness-apply-unit.XXXXXX")" || { err "cannot create a temp dir"; return 1; }
-    render "$src_svc" "$tmpd/$UNIT_NAME.service" || { rm -rf "$tmpd"; return 1; }
+    render "$src_svc" "$tmpd/$UNIT_NAME.service" "$CELL_HOME" || { rm -rf "$tmpd"; return 1; }
     render "$src_tim" "$tmpd/$UNIT_NAME.timer" || { rm -rf "$tmpd"; return 1; }
     # A USER unit may not carry User= (systemd rejects it).
     if [ "$TARGET" = "user" ]; then
@@ -513,7 +579,7 @@ do_install_launchd() {
     resolve_launcher || return 1
 
     tmpd="$(mktemp -d "${TMPDIR:-/tmp}/harness-apply-plist.XXXXXX")" || { err "cannot create a temp dir"; return 1; }
-    render "$src_plist" "$tmpd/$LABEL.plist" || { rm -rf "$tmpd"; return 1; }
+    render "$src_plist" "$tmpd/$LABEL.plist" "$CELL_HOME" || { rm -rf "$tmpd"; return 1; }
     # ⛔ A PLIST THAT DOES NOT PARSE IS NOT INSTALLED. A placeholder inside an XML COMMENT renders a
     # doubled dash into it, which is forbidden there — the disk-reaper installer measured exactly this
     # and the box silently had no job while the installer said OK.
@@ -699,8 +765,23 @@ do_status() {
     # every bring-up that installs this. It is a FAILURE when the job claims it ran and left no usable
     # record: that is a pass refusing before it can write anything. Same split the disk-reaper status
     # verb records, and for the same reason.
-    case "$REC" in
-        status=never*)
+    # ⛔ THE VERDICT IS A LINE, NOT THE FIRST LINE (agent-infra#3453, measured). `--print-status` now
+    # emits READINGS before its verdict — `split_home=… derived=… why=[…]` on stdout for every verb (a
+    # refusal that exits before `write_record` leaves the PREVIOUS tick standing, so the split must be
+    # sayable on a status read), and, on a hand-run, a one-line note on stderr that `2>&1` above folds
+    # into the same blob. `case "$REC" in status=never*)` was therefore a PREFIX match on a blob that no
+    # longer starts with the verdict, so a no-record box whose blob BEGAN with a reading fell to the
+    # generic `*)` arm, which fails on `REC_RC` (3 for `status=never`) — `--status` exited 1 for a HEALTHY
+    # fresh install. ⛔ NOT EVERY NO-RECORD BOX (review cycle-10 #5): one whose blob is only the verdict
+    # still matched `status=never*`, so the blast radius is the READING-CARRYING blobs: a detected split, a
+    # `split_home=unmeasurable`, and the hand-run note. ⛔ "WHICH THE ARM BELOW EXERCISES" WOULD OVERSTATE
+    # IT (review cycle-11 #3): that arm pins the detected-split shape only, so the other two are measured
+    # here but not pinned there. In those shapes none of the three `never` states below could be reached,
+    # so the inert-timer diagnosis was unreachable in the state it exists for. Classifying the `status=`
+    # authoritative wherever the readings sit, and keeps working if another field is added in front.
+    REC_STATUS="$(printf '%s\n' "$REC" | sed -n 's/^status=\([a-z-]*\).*/\1/p' | head -1)"
+    case "${REC_STATUS:-}" in
+        never)
             # ⛔ "NEVER" IS TWO DIFFERENT STATES, and conflating them is how a dead timer certifies a
             # box: (a) the job has NOT FIRED YET — a fresh install, a note; (b) the job HAS fired and
             # left no record — the pass is refusing before it can write one, a FAILURE. The scheduler's

@@ -148,9 +148,11 @@ the heartbeat AGE, which is the only signal that distinguishes a wedged controll
 ## The layer that owns this now (#1988)
 
 Every harness `gh` call goes through **one** helper, `scripts/orchestrator-harness/gh-limit.py`,
-reached from two entry points: the Mac REST adapter (`gh-rest/gh`, first on the daemon PATH) and the
-cell wrapper (`gh-limit/gh`, first on the cell's controller PATH). It implements GitHub's own
-documented policy, so this file does not restate the numbers — it names where to look.
+reached from two entry points: the REST adapter (`gh-rest/gh`, first on the daemon PATH and, since
+#2039, first on the cell's controller PATH too) and the cell wrapper (`gh-limit/gh`, **second** on
+that controller PATH — behind the adapter, which routes every call through this same helper). It
+implements GitHub's own documented policy, so this file does not restate the numbers — it names
+where to look.
 
 | Behaviour | Where |
 |---|---|
