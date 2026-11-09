@@ -1782,6 +1782,26 @@ HARNESS_APPLIED=""
 # names the ONE engine allowed to materialise a pin, and an operator may pin it; this box's own `start`
 # defaults it to empty (the loop passes `$SUP_SELF` explicitly to the controller it launches).
 HARNESS_MATERIALISER="${HARNESS_MATERIALISER:-}"
+# ── ONE FLOOR, WHICHEVER KNOB SETS IT (agent-infra#1852) ────────────────────────────────────────
+# `spawn-gate.sh`'s `DISK_MIN_FREE_MB` defaults to `MIN_FREE_MB` when it is unset; this is the other
+# half of that binding, and between them the two instruments can no longer certify different floors by
+# accident. That is the defect this issue records: a cell where `check` printed `CELL CAN RUN A
+# CONTROLLER` while every lane spawn was refused 77 — healthy by one instrument, unable to work by the
+# other. The reachable shape it closes here is an operator who sets only THIS file's knob (the
+# documented home of the other cell knobs): before this line, `MIN_FREE_MB=2000` certified a cell down
+# to 2000 MB that the dispatch gate refused below 500 — the band in the harmless direction — while a
+# LOWER floor (an old plist, a copied keys.env) opened it in the harmful one, where `check` blesses a
+# cell whose every spawn dies.
+# ⛔ AN INHERITED VALUE IS VALIDATED WHERE THE OPERATOR CAN SEE IT, and with ITS OWN name. Letting the
+# `MIN_FREE_MB` validation below report a `DISK_MIN_FREE_MB` mistake would send an operator to fix a
+# knob they never set (the reason the message names the variable that was actually wrong).
+# ⛔ `MIN_FREE_MB` still WINS when both are set: that is the declaration this file already documents,
+# and the dispatch gate reads `DISK_MIN_FREE_MB` explicitly in that case.
+if [ -z "${MIN_FREE_MB:-}" ] && [ -n "${DISK_MIN_FREE_MB:-}" ]; then
+  case "$DISK_MIN_FREE_MB" in ''|*[!0-9]*|?????????*) die "DISK_MIN_FREE_MB must be a positive whole number of megabytes (got '$DISK_MIN_FREE_MB') — it sets MIN_FREE_MB when MIN_FREE_MB is unset (agent-infra#1852: one floor serves check and the dispatch gate)" ;; esac
+  [ "$((10#$DISK_MIN_FREE_MB))" -gt 0 ] || die "DISK_MIN_FREE_MB must be a positive whole number of megabytes (got '$DISK_MIN_FREE_MB') — it sets MIN_FREE_MB when MIN_FREE_MB is unset (agent-infra#1852)"
+  MIN_FREE_MB="$((10#$DISK_MIN_FREE_MB))"
+fi
 MIN_FREE_MB="${MIN_FREE_MB:-500}"
 SCRATCH_DAYS="${SCRATCH_DAYS:-3}"
 # Where review scratch checkouts accumulate. Parameterized so the destructive `--scratch` path can be
@@ -2378,12 +2398,84 @@ seed_and_stamp() {
   stamp_write || die "cannot record the harness provenance at $STAMP"
 }
 
+# ── ONE LANE MUST FIT, and the numbers are the DISPATCH gate's own (agent-infra#1852) ───────────
+# The floor above answers "is the filesystem full?". It does not answer "can this cell start ONE
+# lane?", and the gap between those two questions is this issue: a cell read HEALTHY at 1,469 MB and
+# could do no work, because getting a lane's dev env onto it costs gigabytes. #2721/#3395 closed the
+# live-dispatch half by measuring a lane's own tree (`max(tree, self) + reserve`, derived from the
+# TARGET repo, never one global constant). This half was left behind: `check` still admitted on
+# `free >= MIN_FREE_MB` alone, so after #2721 a python-target cell could be certified at 1 GB free
+# while the dispatch gate refused EVERY spawn at less than ~8 GB — the same false PASS one instrument
+# over, which is exactly what this file's own `cmd_check_*` list exists to prevent. Measured on cell-3
+# 2026-10-17 (#1852 comment): `df` 727 MB free, `lane-5475.log` `[disk-gate] REFUSED … <
+# disk_min_free_mb=500`, while `check` printed `CELL CAN RUN A CONTROLLER`.
+#
+# ⛔ THE PREDICATE IS MIRRORED, AND THE MIRROR IS PINNED BEHAVIOURALLY, NOT BY COMMENT. These two are
+# two files with no shared shell library (`cloud-cell-supervisor.sh` does not source `spawn-gate.sh`,
+# and the dispatch gate is installed standalone as `pi`), so the numbers and the marker set ARE spelled
+# twice — the same duplication `spawn-gate.sh` already accepts for the FLOOR default. What is NOT
+# duplicated is the ANSWER: `cloud-cell-supervisor.test.sh` computes `spawn-gate.sh`'s own
+# `disk_lane_costs` + `disk_lane_need` for the same fixture target and asserts that `check` refuses one
+# MB below that number and passes AT it — so raising `DISK_LANE_SELF_PY_DEFAULT`, adding a package
+# manager marker on one side, or changing the reserve multiple reddens the suite instead of silently
+# re-opening the band. (Review-objection answer: the alternative — sourcing `spawn-gate.sh` from
+# `check` — was rejected because `check` runs BEFORE `$O` is seeded and the test fixtures seed the
+# worker set as EMPTY files, so a source-based read would report "cannot judge" on a healthy cell.)
+# ⛔ EVERY OVERRIDE `spawn-gate.sh` honours for a cell whose measurement differs is honoured HERE too
+# (`DISK_LANE_TREE_MB` / `_SELF_MB` / `_RESERVE_MB`), with its validation: EMPTY or non-numeric is not
+# an override (it derives), an explicit `0` IS one. Without this the gate would be capped at the shipped
+# worst case and a cell that legitimately measured differently would re-open the band from the other
+# side — check refusing a cell the dispatch gate admits, which is a false BLOCK, and would be
+# undiagnosable because the operator's override looks applied.
+# ⛔ STATED LIMIT: the volume measured is the one `free_mb "$CELL_HOME"` reads (the floor's own), not
+# each lane's worktree path. On a cell `$O` and `$CELL_HOME` are on the same rootfs, so this is the
+# right volume in the shipped topology; a cell that moved `$O` to another mount would be judged on the
+# home's volume. That limitation is the FLOOR's, unchanged here, and named rather than papered over.
+SUP_LANE_TREE_PY_MB=350
+SUP_LANE_SELF_PY_MB=6144
+SUP_LANE_PLAIN_MB=64
+SUP_LANE_RESERVE_MULT=4
+
+# sup_cost_num <v> — the override-coercion `spawn-gate.sh`'s `is_limit` applies, so an inherited typo
+# cannot turn the term into "not a number" (which `[ -lt ]` would error on) or into a wrap.
+sup_cost_num() { # sup_cost_num <value> -> the number on stdout, non-zero exit when it is not one
+  case "${1:-}" in ''|*[!0-9]*) return 1 ;; 0) printf '%s\n' 0; return 0 ;; 0*) return 1 ;; esac
+  [ "${#1}" -le 9 ] || return 1
+  printf '%s\n' "$((10#$1))"
+}
+
+# sup_python_target <path> — 0 when this path will materialise a venv (any package manager's marker,
+# at the top level or ONE level down). BOUNDED and globs only: this runs in `check`, never a tree walk.
+sup_python_target() { # sup_python_target <path>
+  local p="${1:-.}" f f2
+  for f in uv.lock poetry.lock pdm.lock Pipfile Pipfile.lock pyproject.toml setup.py setup.cfg requirements.txt; do
+    [ -e "$p/$f" ] && return 0
+    for f2 in "$p"/*/"$f"; do [ -e "$f2" ] && return 0; done
+  done
+  return 1
+}
+
+# sup_lane_need_mb <path> — the MB ONE lane for this target must find free, on THIS cell's floor.
+# `max(tree, self) + reserve`, the dispatch gate's admission rule: the lane admitted on the strength of
+# the reserve is the lane that eats it, so the WORST case is what admission is bounded by.
+sup_lane_need_mb() { # sup_lane_need_mb <path>
+  local p="${1:-.}" tree self reserve worst o
+  if sup_python_target "$p"; then tree="$SUP_LANE_TREE_PY_MB"; self="$SUP_LANE_SELF_PY_MB"
+  else tree="$SUP_LANE_PLAIN_MB"; self="$SUP_LANE_PLAIN_MB"; fi
+  o="$(sup_cost_num "${DISK_LANE_TREE_MB:-}")" && tree="$o"
+  o="$(sup_cost_num "${DISK_LANE_SELF_MB:-}")" && self="$o"
+  reserve="$(( SUP_LANE_RESERVE_MULT * MIN_FREE_MB ))"
+  o="$(sup_cost_num "${DISK_LANE_RESERVE_MB:-}")" && reserve="$o"
+  if [ "$tree" -gt "$self" ]; then worst="$tree"; else worst="$self"; fi
+  printf '%s\n' "$(( worst + reserve ))"
+}
+
 # A full disk is not a warning on a cell. MEASURED 2026-10-15: at 111MB free the controller log
 # filled with `No space left on device` from claims.sh and orch-loop.sh while the loop kept running
 # and reporting lanes — the same "failed precondition as success" shape this file refuses elsewhere,
 # with the added cost that `git` writes fail too (so nothing can be reviewed, recorded or merged).
 cmd_check_disk() {
-  local mb; mb="$(free_mb "$CELL_HOME")"
+  local mb need; mb="$(free_mb "$CELL_HOME")"
   # ⛔ An unreadable df is NOT a pass. `free_mb` prints nothing when df is missing/unreadable, and
   # returning 0 here read that as "enough" — the opposite of what its own comment claims and of this
   # file's rule that cannot-verify is never a pass. A cell whose floor cannot be measured must not be
@@ -2394,9 +2486,20 @@ cmd_check_disk() {
   if [ "$mb" -lt "$MIN_FREE_MB" ]; then
     die "only ${mb}MB free on $(dirname "$CELL_HOME") — below the ${MIN_FREE_MB}MB floor. At this level git writes and the controller's own state writes fail with I/O errors and the loop keeps reporting lanes. Free space first: $0 prune"
   fi
+  # ── AND ONE LANE MUST FIT (agent-infra#1852) ────────────────────────────────────────────────────
+  # Above the floor and below this number a cell is blessed by every other instrument in this file
+  # while `lane.sh` / `fix-one.sh` / `adopt-fix.sh` refuse EVERY spawn 77 (`DISK-NOHEADROOM`) — the
+  # exact "passes both instruments and can do no work" state the issue title names. Refusing HERE is
+  # the only place the operator sees it before the cell is started, and the message carries the three
+  # numbers so they can recompute it against the box instead of taking it on faith.
+  need="$(sup_lane_need_mb "$REPO")"
+  if [ "$mb" -lt "$need" ]; then
+    die "only ${mb}MB free on $(dirname "$CELL_HOME"), and ONE lane for this cell's target needs ${need}MB (worst-case tree of max($SUP_LANE_TREE_PY_MB=${SUP_LANE_TREE_PY_MB}/${SUP_LANE_PLAIN_MB}=${SUP_LANE_PLAIN_MB}, ${SUP_LANE_SELF_PY_MB}=${SUP_LANE_SELF_PY_MB}/${SUP_LANE_PLAIN_MB}=${SUP_LANE_PLAIN_MB})MB for '$REPO' + reserve $(( SUP_LANE_RESERVE_MULT * MIN_FREE_MB ))MB = ${SUP_LANE_RESERVE_MULT} x the ${MIN_FREE_MB}MB floor). Every spawn would be REFUSED 77 by the dispatch gate (spawn-gate.sh DISK-NOHEADROOM) while this check certified the cell — the false pass agent-infra#1852 records. Free space first: $0 prune (--caches, and --scratch for /tmp), or override the measurement once you have taken a real df delta for this cell: DISK_LANE_SELF_MB / DISK_LANE_TREE_MB / DISK_LANE_RESERVE_MB."
+  fi
   if [ "$mb" -lt "$((MIN_FREE_MB * 4))" ]; then
     log_line "warn: ${mb}MB free on $(dirname "$CELL_HOME") — under $((MIN_FREE_MB * 4))MB. 'prune' reclaims the regenerable caches."
   fi
+  log_line "ok: ${mb}MB free on $(dirname "$CELL_HOME"); one lane for '$REPO' needs ${need}MB (worst case + ${SUP_LANE_RESERVE_MULT} x the ${MIN_FREE_MB}MB floor)"
 }
 
 # The provenance half of `check`. Three refusals that CANNOT be mended by getting fresher (untracked,

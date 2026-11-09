@@ -1096,12 +1096,25 @@ mkdir -p "$P/nodfbin"
 printf '#!/bin/bash\nexit 1\n' > "$P/nodfbin/df"; chmod +x "$P/nodfbin/df"   # df that CANNOT answer
 
 PH=""; PPATH=""; PREF=""; PROV_OUT=''; PROV_RC=0
+# ⛔ THE DISK IS AN EXPLICIT SEAM HERE, NOT THE HOST'S (agent-infra#1852). `check` now refuses a cell
+# that cannot fit ONE lane, so the runner's own free space would decide every arm in this section — a
+# loaded runner would redden arms about harness provenance. The seams below are SET only by the arms
+# whose subject IS the disk (§h/§h2/§h3), and they are the very knobs the shipped supervisor honours:
+#   PROV_FLOOR       -> MIN_FREE_MB. Unset = 1 ("the floor passes"), so provenance arms cannot be
+#                       decided by a disk condition. SET BUT EMPTY = leave MIN_FREE_MB empty, which is
+#                       how §h3 drives the DISK_MIN_FREE_MB -> MIN_FREE_MB inheritance.
+#   PROV_DISK_FLOOR  -> DISK_MIN_FREE_MB (empty = not set).
+#   PROV_TREE/_SELF/_RESERVE -> DISK_LANE_*_MB. EMPTY IS NOT AN OVERRIDE (the shipped derivation
+#                       applies, exactly as in spawn-gate.sh), so neutralising them takes an explicit 0.
 prov() {
   local sub="$1"; shift
   rm -f "$P/tmuxup"
   PROV_OUT="$(PATH="${PPATH:+$PPATH:}$P/bin:$PATH" PROV_TMUX_UP="$P/tmuxup" \
+              MIN_FREE_MB="${PROV_FLOOR-1}" DISK_MIN_FREE_MB="${PROV_DISK_FLOOR:-}" \
+              DISK_LANE_TREE_MB="${PROV_TREE:-}" DISK_LANE_SELF_MB="${PROV_SELF:-}" \
+              DISK_LANE_RESERVE_MB="${PROV_RESERVE:-}" \
               CELL_HOME="$P/home" ENV_FILE="$P/keys.env" SESSION="ai1745-$$" \
-              O="$P/o" REPO="$P/repo" HARNESS_REPO="$AI" HARNESS_FETCH=0 HARNESS_REF="${PREF:-origin/main}" \
+              O="$P/o" REPO="${PROV_REPO:-$P/repo}" HARNESS_REPO="$AI" HARNESS_FETCH=0 HARNESS_REF="${PREF:-origin/main}" \
               HARNESS_PIN_DIR="$P/pin" HARNESS_PIN_FILE="$P/home/.harness-path" HARNESS="$PH" \
               bash "$SUP" "$sub" "$@" 2>&1)"
   PROV_RC=$?
@@ -1374,6 +1387,12 @@ prov start
 # the two assertions below pass because the HARNESS is refused, not because the disk is — a false
 # pass in the test itself (found by mutating the floor to `if false` and watching it stay green).
 PH="$(cat "$P/home/.harness-path" 2>/dev/null)"
+# These arms are ABOUT the shipped 500MB floor, so they set it explicitly (the provenance arms above
+# default it to 1) and NEUTRALISE the one-lane-fit predicate #1852 added on the same reading: two
+# predicates read the same `df`, and an arm that does not say which one it is testing proves neither.
+# The neutralisation is the three overrides `spawn-gate.sh` honours, with an explicit 0 — the same shape
+# spawn-gate.test.sh uses for its load/success arms.
+PROV_FLOOR=500; PROV_TREE=0; PROV_SELF=0; PROV_RESERVE=0
 PPATH="$P/lowbin"
 prov check
 [ "$PROV_RC" -ne 0 ] && ok "check REFUSES a cell below the free-space floor (the full-disk false pass)" \
@@ -1397,7 +1416,7 @@ prov check
                      || bad "check: accepted 499MiB free — $PROV_OUT"
 PPATH="$P/unithigh"
 prov check
-[ "$PROV_RC" -eq 0 ] && ok "check PASSES exactly AT the 500MiB floor (no false block)" \
+[ "$PROV_RC" -eq 0 ] && ok "check PASSES exactly AT the 500MiB floor when one lane fits (no false block; the floor arm alone)" \
                      || bad "check: FALSE BLOCK at 500MiB free — $PROV_OUT"
 # ⛔ An unreadable df is cannot-verify, never a pass: a cell whose floor cannot be measured must not
 # be blessed as able to run a controller.
@@ -1409,6 +1428,101 @@ case "$PROV_OUT" in
   *"cannot read the free space"*) ok "check: names the unreadable-df state" ;;
   *) bad "check: the unreadable-df refusal is not explained — $PROV_OUT" ;;
 esac
+PPATH=""
+
+# ── (h2) ONE LANE MUST FIT — the SAME predicate the dispatch gate admits on (agent-infra#1852) ─────
+# The issue's thesis, one instrument over: `check` used to admit on `free >= MIN_FREE_MB` alone, so a
+# cell could be certified HEALTHY at 1,469MB while the dispatch gate refused every spawn because one
+# lane's tree did not fit. #2721/#3395 closed the dispatch half; these arms pin the `check` half.
+# ⛔ THE REFERENCE IS `spawn-gate.sh`'s OWN `disk_lane_costs` + `disk_lane_need`, driven through the
+# shipped file — never a number retyped here. Drift in EITHER file's constants, package-manager marker
+# set, or reserve multiple moves one side only, and reddens these arms: that is the only thing keeping
+# two separate scripts from certifying two different floors, which IS the defect this issue records.
+say_case "check refuses a cell that cannot fit ONE lane — on spawn-gate.sh's own numbers (#1852)"
+GATE="$HERE/orchestrator-harness/spawn-gate.sh"
+gate_need() { # gate_need <target> <floor-mb> -> the MB spawn-gate.sh itself would require
+  DISK_MIN_FREE_MB="$2" bash -c 'set -u; . "$1" >/dev/null 2>&1 || exit 3; set -- $(disk_lane_costs "$2"); disk_lane_need "$1" "$2" "$3"' _ "$GATE" "$1" 2>/dev/null
+}
+PROV_FLOOR=500; PROV_TREE=; PROV_SELF=; PROV_RESERVE=    # the SHIPPED derivation, no overrides
+REF_PLAIN="$(gate_need "$P/repo" 500)"
+case "${REF_PLAIN:-}" in
+  ''|*[!0-9]*) bad "could not read spawn-gate.sh's own lane requirement (got '${REF_PLAIN:-}') — every arm below would be vacuous"; REF_PLAIN=2064 ;;
+esac
+[ "$REF_PLAIN" -gt 500 ]; rc=$?
+[ "$rc" -eq 0 ] && ok "spawn-gate.sh's requirement for a NON-python target is ${REF_PLAIN}MB, strictly ABOVE the 500MB floor — the band this change closes is real" \
+                || bad "the reference requirement ${REF_PLAIN}MB is not above the floor — these arms cannot see the band"
+mkdf "$P/needbelow" $(( (REF_PLAIN - 1) * 1024 ))
+PPATH="$P/needbelow"; prov check
+[ "$PROV_RC" -ne 0 ] && ok "check REFUSES at ${REF_PLAIN}MB-1: ABOVE the floor, BELOW one lane's cost (the false pass in this issue's title)" \
+                     || bad "check certified a cell one MB short of one lane's cost — the band is still open"
+case "$PROV_OUT" in
+  *"ONE lane for this cell's target needs ${REF_PLAIN}MB"*) ok "…and the refusal names the lane requirement, so an operator can recompute it against the box" ;;
+  *) bad "the refusal does not name the lane requirement — $PROV_OUT" ;;
+esac
+case "$PROV_OUT" in
+  *"below the 500MB floor"*) bad "the refusal is the FLOOR die, not the lane-fit arm — the arm would pass against the pre-fix script too" ;;
+  *) ok "…and it is NOT the floor die (the floor is satisfied at ${REF_PLAIN}MB) — the NEW arm decided it" ;;
+esac
+mkdf "$P/needat" $(( REF_PLAIN * 1024 ))
+PPATH="$P/needat"; prov check
+[ "$PROV_RC" -eq 0 ] && ok "check PASSES exactly AT one lane's cost (inclusive boundary, no false block)" \
+                     || bad "check: FALSE BLOCK at exactly the lane requirement — $PROV_OUT"
+case "$PROV_OUT" in
+  *"one lane for '"*"' needs ${REF_PLAIN}MB"*) ok "…and reports the requirement it admitted on" ;;
+  *) bad "check did not report the lane requirement it used — $PROV_OUT" ;;
+esac
+# ⛔ A PYTHON TARGET MUST BE DISCRIMINATED FROM A PLAIN ONE. This is the half that made the measured
+# cells unable to work (a tortoise lane materialises ~6GB of venv on a cold cache; an agent-infra
+# worktree installs nothing). A mirror that stopped reading package-manager markers would answer the
+# same number for both and judge every cell as cheap — the "one global constant" failure #1852
+# explicitly rejects.
+cp -a "$P/repo" "$P/pyrepo"
+: > "$P/pyrepo/pyproject.toml"
+REF_PY="$(gate_need "$P/pyrepo" 500)"
+[ "${REF_PY:-0}" -gt "$REF_PLAIN" ]; rc=$?
+[ "$rc" -eq 0 ] && ok "a PYTHON target costs more than a plain one at the same floor (${REF_PY}MB vs ${REF_PLAIN}MB) — the derivation is target-specific" \
+                || bad "the python target was not discriminated (${REF_PY:-?} vs ${REF_PLAIN}) — the marker set or the constants are not applied"
+PROV_REPO="$P/pyrepo"
+mkdf "$P/pybelow" $(( (REF_PY - 1) * 1024 ))
+PPATH="$P/pybelow"; prov check
+[ "$PROV_RC" -ne 0 ] && ok "check REFUSES a python-target cell one MB short of ITS lane cost (${REF_PY}MB) — the ~8GB band, not the 500MB floor" \
+                     || bad "check certified a python cell the dispatch gate would refuse every spawn on — $PROV_OUT"
+mkdf "$P/pyat" $(( REF_PY * 1024 ))
+PPATH="$P/pyat"; prov check
+[ "$PROV_RC" -eq 0 ] && ok "check PASSES a python-target cell AT its lane cost (no false block on a cell that really can work)" \
+                     || bad "check: FALSE BLOCK of a python cell at exactly ${REF_PY}MB — $PROV_OUT"
+PROV_REPO=""
+
+# ── (h3) ONE FLOOR, WHICHEVER KNOB SETS IT (agent-infra#1852) ────────────────────────────────────
+# `spawn-gate.sh`'s `DISK_MIN_FREE_MB` defaults to `MIN_FREE_MB` when unset, and this file's
+# `MIN_FREE_MB` defaults to `DISK_MIN_FREE_MB` when unset. Between them ONE floor reaches both
+# instruments, so an operator who sets only one knob can no longer open a band — which is exactly the
+# residual `spawn-gate.sh` used to carry as a comment.
+say_case "MIN_FREE_MB and DISK_MIN_FREE_MB bind each other — one floor, two spellings (#1852)"
+PROV_FLOOR=; PROV_DISK_FLOOR=2000; PROV_TREE=0; PROV_SELF=0; PROV_RESERVE=0
+mkdf "$P/disklow" $(( 1500 * 1024 ))
+PPATH="$P/disklow"; prov check
+if [ "$PROV_RC" -ne 0 ]; then
+  case "$PROV_OUT" in
+    *"below the 2000MB floor"*) ok "with MIN_FREE_MB UNSET, DISK_MIN_FREE_MB=2000 IS the floor check enforces (the knob the dispatch gate reads)" ;;
+    *) bad "check did not take DISK_MIN_FREE_MB as its floor — $PROV_OUT" ;;
+  esac
+else
+  bad "check certified a cell at 1500MB under DISK_MIN_FREE_MB=2000 — the band re-opened from the other side"
+fi
+PPATH=""
+for badfloor in abc 000; do
+  PROV_DISK_FLOOR="$badfloor"; prov check
+  if [ "$PROV_RC" -ne 0 ]; then
+    case "$PROV_OUT" in
+      *DISK_MIN_FREE_MB*) ok "DISK_MIN_FREE_MB=$badfloor is refused at LOAD and named as the knob that was wrong (not as MIN_FREE_MB)" ;;
+      *) bad "the load refusal for DISK_MIN_FREE_MB=$badfloor does not name it — $PROV_OUT" ;;
+    esac
+  else
+    bad "DISK_MIN_FREE_MB=$badfloor was ACCEPTED as a floor — it can never fire, or it means zero"
+  fi
+done
+PROV_FLOOR=1; PROV_DISK_FLOOR=; PROV_TREE=; PROV_SELF=; PROV_RESERVE=
 PPATH=""
 
 # (i) UNRESOLVABLE REF — cannot-verify must never be read as a pass.
