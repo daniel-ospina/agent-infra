@@ -577,6 +577,21 @@ cat > "$TMP/mpbin/gh" <<'GHEOF'
 printf '%s\n' "${GH_ROWS:-}"
 GHEOF
 chmod +x "$TMP/mpbin/gh"
+# ⛔ THE SHIPPED PROBE READS THROUGH `gh_bounded`, NOT `gh` (agent-infra#2028), SO THE RIG MUST CARRY
+# THAT NAME. Measured on CI at 40e736e4: every arm below read `UNMEASURED … (gh rc=127)` because the
+# extracted `cascade_main_probe` called a function the extraction never brings in, and the two mutation
+# arms then reported "the assertion does NOT discriminate" — a rig that fails for a reason it does not
+# test, which is the fail-open shape this suite exists to prevent. It is an EXECUTABLE on the fixture
+# PATH (not a shell function) because the probes run the block in a CHILD (`bash "$probe"`), so an
+# in-process stub would be invisible to exactly the arms that need it. A TRANSPARENT PASS-THROUGH on
+# purpose: the bound itself is graded by `gh-bound.test.sh` against the real shipped block, and
+# re-implementing it here would make this suite depend on `scripts/lib/bounded.sh` on the runner. The
+# name stays pinned — a rename in the shipped block leaves this shim unused and every arm RED again.
+cat > "$TMP/mpbin/gh_bounded" <<'GHBEOF'
+#!/bin/bash
+exec gh "$@"
+GHBEOF
+chmod +x "$TMP/mpbin/gh_bounded"
 probe_main() { # <tsv rows…> -> the recorded verdict line ('' when none was written)
   local w="$TMP/mp$$"
   rm -rf "$w"; mkdir -p "$w/state"
