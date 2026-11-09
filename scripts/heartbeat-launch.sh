@@ -102,9 +102,13 @@ die() { printf '%s\n' "$*" >&2; exit 1; }
 # `docs/ops/fleet-liveness.md` already records the rule for THIS pidfile ("the pid its OWN pidfile
 # names, cross-checked against a process whose argv is that script (a recycled pid is FAILING, not
 # alive)") and `scripts/fleet-inventory.test.sh` §9l enforces it via `fleet_pids_for`; without this,
-# two instruments on one box disagreed about one loop and the newer one was the weaker. The rule is
-# restated here instead of sourced because this file is farmed standalone (`pi-bootstrap` copies it
-# on its own) and must not depend on a library sitting beside it in a checkout.
+# two instruments on one box disagreed about one loop and the newer one was the weaker.
+# ⛔ WHY THE RULE IS RESTATED HERE INSTEAD OF SOURCED (#1867 review, non-blocking note): this file
+# sources NO library and runs both from a checkout and against the farmed layout (`LOOP` prefers
+# `$PI_AGENT_DIR/scripts/`), so a `scripts/lib/...` path would be a dependency that exists in one of
+# those two layouts and not the other. And `fleet_pids_for` answers a DIFFERENT question — "is pid N
+# one of the pids running exactly these paths?" — so reusing it would call a loop started from a
+# checkout (the pre-farm case it explicitly allows) a stranger and relaunch a second copy.
 #
 # Matching is by BASENAME for the same reason `fleet_pid_argv_names` is deliberately weak: a loop
 # started from a checkout before the farm landed, or from another path, is still THIS loop, and

@@ -308,8 +308,12 @@ chmod +x "$BSDBIN/date"
 R="$(newroot s15)"
 printf 'a pass\n' > "$R/agent/state/orchestrator-heartbeat.log"
 printf '[{"lane":"a","degraded":false}]\n' > "$R/agent/state/lane-status.last.json"
-OUT="$(PATH="$BSDBIN:$PATH" HEARTBEAT_PI_AGENT_DIR="$R/agent" bash "$LAUNCH" status 2>&1)"; RC=$?
-assert_eq "$RC" "0" '§15 status exits 0 on a box whose date is BSD'
+OUT="$(PATH="$BSDBIN:$PATH" HEARTBEAT_PI_AGENT_DIR="$R/agent" bash "$LAUNCH" status 2>&1)"
+# ⛔ NO `assert_eq "$RC" "0"` ROW HERE (review round 3, rule-3). `cmd_status` ends `return 0`
+# unconditionally — it is the INFORMATIONAL verb, and the table in docs/ops/heartbeat-launch-path.md
+# says so — so an exit-code row could not be varied by any mutation of this diff. An arm nothing can
+# redden reads as coverage and is dead weight; the two rows below are the live ones (they carry the
+# GNU-only `date -r <path>` defect this section exists for).
 assert_not_contains "$OUT" "<unreadable>" '§15 …and both timestamps are READABLE (no GNU-only date -r <path>)'
 assert_contains "$OUT" "last pass: 20" "§15 …the last-pass line carries a real ISO timestamp"
 

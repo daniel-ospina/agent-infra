@@ -52,12 +52,16 @@ activity**. That is the false PASS this change exists to make impossible.
 
 `check` answers the question a content comparison cannot: **is the scheduled thing live *and fed*?**
 
-- **0 OK** — the loop's pidfile names a live process **and** the last published fleet read
-  (`state/lane-status.last.json`) is fresh (default bound 900 s) and carries **zero** `degraded`
-  rows.
+- **0 OK** — the loop's pidfile names a process whose **own argv is the loop** (`pid_is_loop`:
+  a bare "some process holds this number" check is not identity — the kernel reuses pids, so the
+  number a reboot or a `SIGKILL` left in the pidfile can belong to a stranger) **and** the last
+  published fleet read (`state/lane-status.last.json`) is fresh (default bound 900 s) and carries
+  **zero** `degraded` rows.
 - **1 DRIFT** — it is not running, has never published, is stale, published an **empty** row set,
-  or its last read is DEGRADED.
-- **2 UNKNOWN** — the probe could not answer (no `python3`, no state dir). **Never a pass.**
+  or its last read is DEGRADED. A **recycled** pid (alive, but not the loop) is DRIFT too: it says
+  `recycled pid` rather than `OK loop alive`.
+- **2 UNKNOWN** — the probe could not answer (no `python3`, no state dir, unreadable process
+  table). **Never a pass.**
 
 An empty snapshot is **not** a healthy fleet: `degraded` is a *per-row* flag, so on zero rows
 `any(...)` is vacuously false — the same trap `lane-status.py`'s own publisher documents.
@@ -117,6 +121,17 @@ the code: the loop is the same file, with the same contract, on both.
 **Reboot does not restart the loop** on either platform. Re-run `heartbeat-launch.sh start` after a
 reboot; that is a property of "detached launched-once loop" and it is why `check` exists — a loop
 that died is reported as DRIFT rather than silently believed alive.
+
+⛔ **A PID IN THE PIDFILE IS NOT AN IDENTITY.** The loop's pidfile holds a bare `$$`, written once
+and removed by an EXIT trap — so a `SIGKILL`, an OOM kill or a reboot leaves the old number on disk,
+and the kernel reuses it. `kill -0` alone therefore answers "somebody holds this number", which is
+how `start` came to print `already running` and exit 0 **without launching** (nothing else starts a
+launched-once loop) and how `check` printed `OK loop alive` over a dead heartbeat. All three verbs
+therefore cross-check the pid against its **own argv** (`pid_is_loop`, the same rule
+`docs/ops/fleet-liveness.md` records for this pidfile): a stranger holding the number reads
+`stale pidfile` in `start`, `DRIFT` in `check`, and `alive: no (… another process)` in `status`. An
+unreadable process table is UNKNOWN in `check` and a loud refusal in `start` — never a pass, and
+never a second loop.
 
 ## Related
 
