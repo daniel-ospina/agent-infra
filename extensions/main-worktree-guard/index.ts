@@ -139,7 +139,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { isToolCallEventType } from "@earendil-works/pi-coding-agent";
 import { execSync, execFileSync } from "node:child_process";
 import { resolve, dirname, join, relative, sep } from "node:path";
-import { realpathSync, existsSync, lstatSync, statSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
+import { realpathSync, existsSync, lstatSync, statSync, readdirSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { createHash } from "node:crypto";
@@ -1059,23 +1059,41 @@ function _hubTreeSignature(hubTop: string): string | null {
   return [stamp(join(common, "index")), stamp(join(common, "logs", "HEAD")), stamp(hubTop)].join("|");
 }
 
-// `git status --porcelain=v1` (collapsed) → the set of paths the hub reports as
-// not-committed. Rename/copy entries carry BOTH sides (`R  old -> new`) and both
-// are observed, so neither side's disappearance can be misread as a sweep.
-// Git's quoted spelling is unescaped; a path this cannot parse stays unmatched,
-// which fails toward SILENCE (no banner), never toward a false accusation.
+// `git status --porcelain=v1 -z` (collapsed) → the set of paths the hub reports
+// as not-committed. Rename/copy entries carry BOTH sides and both are observed,
+// so neither side's disappearance can be misread as a sweep.
+// ⛔ `-z` IS LOAD-BEARING, not a style choice (#718 review round 4, Issue 1).
+// Without it git C-quotes every path holding a non-ASCII byte, a `"` or a `\`
+// under the default `core.quotePath=true`, spelling the bytes as OCTAL escapes:
+// a modified `café.md` arrives as ` M "caf\303\251.md"`. Decoding that by hand
+// is a trap — the previous `replace(/\\(.)/g, "$1")` consumed the octals ONE
+// CHARACTER AT A TIME and produced the key `caf303251.md`, a name that cannot
+// exist. `_hubPathIsGone` then lstat-ed that name, failed, and reported as
+// ABSENT a path that was on disk AND in HEAD — the round-3 P1 ("set membership
+// is not absence") reinstated through the path decoder, with a name the victim
+// can neither `git status` nor restore. `-z` output is NEVER quoted
+// (git-status(1)), so there is nothing to decode and nothing to get wrong; the
+// repo already reads paths this way (`scripts/bg-rescue-wip.sh:343`). The cost
+// of `-z` is that a rename's field order is reversed — `XY <to>\0<from>\0`,
+// not `old -> new` — which is why the origin side is taken from the NEXT field.
+// Any lossy step left is the utf-8 decode of the path bytes themselves, whose
+// residual is declared in the README (`(f)`): a path that is not valid utf-8
+// cannot be lstat-ed and so lands in the ABSENT population.
 function _dirtyPathsFromPorcelain(porcelain: string): Set<string> {
   const out = new Set<string>();
-  for (const raw of porcelain.split("\n")) {
+  const entries = porcelain.split("\0");
+  for (let i = 0; i < entries.length; i++) {
+    const raw = entries[i];
     if (!raw) continue;
-    const entry = raw.slice(3); // `XY <path>`: XY is 2 columns, path starts at 3
-    if (!entry) continue;
-    for (const side of entry.includes(" -> ") ? entry.split(" -> ") : [entry]) {
-      let p = side;
-      if (p.length > 1 && p.startsWith('"') && p.endsWith('"')) {
-        p = p.slice(1, -1).replace(/\\(.)/g, "$1");
-      }
-      if (p) out.add(p);
+    const p = raw.slice(3); // `XY <path>`: XY is 2 columns, path starts at 3
+    if (!p) continue;
+    out.add(p);
+    // Rename/copy (`R`/`C` in the index column): the ORIGIN path is the next
+    // NUL-terminated field, positional — never a ` -> ` split, which a path
+    // containing that literal substring would have broken.
+    if (raw[0] === "R" || raw[0] === "C") {
+      const from = entries[i + 1];
+      if (from) { out.add(from); i++; }
     }
   }
   return out;
@@ -1161,9 +1179,21 @@ function _warnHubSweep(absent: string[], onDisk: string[], hubTop: string): void
 // symlink counts as PRESENT — a symlink is content that still exists. An entry
 // this cannot parse, or one that escapes the hub, is treated as GONE: the safe
 // direction, because GONE is what warns.
+// ⛔ A collapsed untracked DIRECTORY (`?? dir/`, trailing slash) is present by
+// CONTENT, not by the survival of the directory NODE (#718 review round 4,
+// Issue 2). That entry shape is exactly what the incident lost ("one new
+// untracked skill directory"), and `rm dir/*` — or any partial sweep one level
+// down — leaves the node while every byte of the work is gone. Asking `lstat`
+// about the node there answered "present" for a TOTAL loss and printed the
+// reassuring "still ON DISK" population, the exact inverse of the round-3 P1.
+// An empty (or unreadable) directory is therefore GONE.
 function _hubPathIsGone(hubTop: string, rel: string): boolean {
   if (!rel || rel.startsWith("/") || rel.split(/[\\/]/).includes("..")) return true;
-  try { lstatSync(join(hubTop, rel)); return false; } catch { return true; }
+  const abs = join(hubTop, rel);
+  if (rel.endsWith("/")) {
+    try { return readdirSync(abs).length === 0; } catch { return true; }
+  }
+  try { lstatSync(abs); return false; } catch { return true; }
 }
 
 // A collapsed untracked DIRECTORY that is now listed per-file is a porcelain
@@ -1236,7 +1266,8 @@ function _hubSweepCheck(): void {
     // make a LIVE lane's next git command fail at exactly the frequency this arm
     // samples (#718 review round 3). It also keeps our own probe from perturbing
     // the index signature the burst gate reads.
-    const porcelain = execSync("git status --porcelain=v1", {
+    // `-z` so git never C-quotes a path (see _dirtyPathsFromPorcelain).
+    const porcelain = execSync("git status --porcelain=v1 -z", {
       cwd: hubTop, encoding: "utf-8", timeout: 5000,
       env: { ...process.env, GIT_OPTIONAL_LOCKS: "0" },
     });

@@ -1102,10 +1102,16 @@ jobs:
         # (plain git/rm, exactly what a concurrent session does), then pins the
         # negative controls that keep it from becoming noise — a worktree-rooted
         # session is silent, the env hatch is silent, a never-dirty hub is
-        # silent, an APPEARING path is not a loss, and a path is reported once.
-        # Zero-dep (`node:*` + the `git` binary), no `npm ci`, ~2s. Its own step
+        # silent, an APPEARING path is not a loss, a RENAME is not a loss, and a
+        # path is reported once.
+        # Zero-dep (`node:*` + the `git` binary), no `npm ci`, ~16s. Its own step
         # (the post-merge `extensions/*/test*.mjs` glob in ci-main.yml is not
-        # PR-triggered).
+        # PR-triggered). The wall clock is deliberate, not fixture cost: the
+        # arm's burst ceiling is 1.5s, so every control that must PROVABLY reach
+        # `git status` carries a real `pause(1600)` — a dozen of them. Do not
+        # "optimise" them away; they are what makes those rows pins rather than
+        # no-ops (three review rounds found a control passing because the call it
+        # asserted on had been skipped).
         run: node extensions/main-worktree-guard/test-hub-sweep.mjs
       - name: main-worktree-guard nested-worktree hub gate (#1919)
         # `git worktree add 8779-optA` (a RELATIVE path) puts a registered

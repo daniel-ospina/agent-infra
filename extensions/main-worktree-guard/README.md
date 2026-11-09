@@ -1689,7 +1689,15 @@ for main-checkout sessions) is joined by the observed dirty-path set, and every
 the **uncommitted** set; `git add -A` and `git commit` move work into the
 index/HEAD and delete nothing (`?? docs/` even becomes `A  docs/plans/plan.md` —
 a collapsed untracked directory is re-listed per-file, so its own entry vanishes
-while the directory is untouched). The banner therefore names **two
+while the directory is untouched). The porcelain is read with `-z`, so a path is
+never C-quoted: git spells any non-ASCII path as `\NNN` octal escapes under the
+default `core.quotePath=true`, and decoding those by hand produced a key that
+was not the path (`café.md` → `caf303251.md`), which then `lstat`-ed as missing
+and reported a present, committed path as ABSENT. `-z` output is never quoted,
+so there is nothing to decode — at the cost that a rename arrives as two
+NUL-separated fields with the destination FIRST, which is why the origin side is
+taken positionally rather than by splitting on ` -> ` (a rename is therefore not
+a sweep: both sides are observed). The banner names **two
 populations** with different advice, because its payload is a recovery
 instruction:
 
@@ -1735,8 +1743,11 @@ hatch, matching the sibling #350 hygiene check.
 **Declared residuals.** (a) Collapsed porcelain is used deliberately — an
 untracked DIRECTORY arrives as one `?? dir/` entry, exactly the artifact shape
 the incident lost — so a file removed from inside an untracked directory that
-still has other entries is not reported as such (the 1.5s ceiling still re-reads
-and would report the directory if it emptied). (b) A path swept and re-created
+still has other entries does not change the collapsed entry, and that sub-case
+is not reported. When the whole entry leaves the dirty set it is classified by
+**content**, not by the survival of the directory node (`readdir` non-empty ⇒ on
+disk), so an `rm dir/*` that leaves the empty directory behind IS reported as
+ABSENT: the node surviving is not survival. (b) A path swept and re-created
 with identical content between two observations is invisible. (c) This is
 detection, not recovery: nothing here restores the work. (d) A `git add -A` or
 `git commit` performed by a concurrent process on paths that were NOT collapsed
@@ -1745,7 +1756,13 @@ banner says so) but possibly benign. It is not suppressed, because from git
 state alone a commit and a reverted edit are indistinguishable and only the
 second is a loss. (e) The dedupe set re-arms when a path is observed dirty
 again, so a path lost twice is reported twice — one banner per LOSS, not one per
-path per session.
+path per session. (f) A collapsed untracked directory that survives holding
+only TRACKED content (its untracked payload deleted, a tracked file underneath
+it remaining) still lands in the still-on-disk population: presence is answered
+per entry, and per-file precision inside a collapsed entry would cost the
+unbounded expansion (a) is there to avoid. (g) A path whose bytes are not valid
+UTF-8 cannot be `lstat`-ed by its decoded name and so lands in the ABSENT
+population — the one lossy step left after `-z` removed git's octal quoting.
 
 **Warn-only, always.** The arm has already happened by the time it can fire, and
 refusing the victim's next command would punish it for someone else's write.

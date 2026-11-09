@@ -342,6 +342,83 @@ async function main() {
     expectTrue("F2c: …and it says what to check instead of restoring blind",
       f2b.includes("ON DISK") && f2b.includes("REVERTED"), "the classification is missing from the banner");
 
+    // ── H. THE PRESENCE TEST MUST BE HANDED THE PATH GIT ACTUALLY REPORTED ──
+    // (#718 review round 4, Issue 1.) Under the default `core.quotePath=true`
+    // git C-quotes any path holding a non-ASCII byte, a `"` or a `\`, and
+    // spells the bytes as OCTAL escapes: a modified `café.md` arrives as
+    // ` M "caf\303\251.md"`. The pre-fix unescape decoded those ONE CHARACTER
+    // AT A TIME (`replace(/\\(.)/g, "$1")`), so the observed key became
+    // `caf303251.md` — a name that cannot exist. `_hubPathIsGone` then lstat-ed
+    // that name, failed, and reported as ABSENT a path that is on disk AND in
+    // HEAD — the round-3 P1 reinstated by a different mechanism, with a path
+    // name the victim can neither `git status` nor restore.
+    pause(1600);
+    write(join(hub, "café.md"), "sibling-authored\n");
+    gg("add -A", hub);
+    gg("commit -qm add-cafe", hub);
+    pause(1600);
+    write(join(hub, "café.md"), "v2 — a session's edit\n");
+    await callFrom(hub);
+    drain();
+    pause(1600);
+    gg("commit -qam sibling-wip-cafe", hub);
+    await callFrom(hub);
+    const h1 = sweeps(drain());
+    const h1b = h1[0] ?? "";
+    expect("H1: a committed QUOTED (non-ASCII) path is reported (it left the dirty set)", h1.length, 1);
+    expectTrue("H1a: …under its REAL name, not git's octal escapes decoded as characters",
+      h1b.includes("café.md") && !h1b.includes("caf303251"),
+      h1.length ? `named rows: ${h1b.split("\n").filter((l) => l.includes("•")).join(" | ")}` : "no banner");
+    expectTrue("H1b: …and NOT claimed ABSENT — it is on disk and in HEAD",
+      !h1b.includes("ABSENT from the hub"),
+      "a mangled key turns a PRESENT path into an absent one, which is the destructive advice");
+
+    // ── H2. A COLLAPSED UNTRACKED DIRECTORY IS PRESENT BY CONTENT ─────────
+    // (#718 review round 4, Issue 2.) `?? dir/` is the artifact shape the
+    // incident lost ("one new untracked skill directory"), so presence must
+    // mean "still holds something", not "the directory node survived".
+    // `rm` of specific files (or a partial sweep one level down) leaves the
+    // NODE while every byte of the work is gone: pre-fix `_hubPathIsGone`
+    // lstat-ed the node, succeeded, and printed the reassuring "still ON DISK"
+    // population for a TOTAL loss.
+    pause(1600);
+    inHub("swept-keep/a.txt", "a\n");
+    inHub("swept-keep/b.txt", "b\n");
+    await callFrom(hub);
+    drain();
+    pause(1600);
+    rmSync(join(hub, "swept-keep/a.txt"), { force: true });
+    rmSync(join(hub, "swept-keep/b.txt"), { force: true }); // the DIRECTORY survives, empty
+    await callFrom(hub);
+    const h2 = sweeps(drain());
+    const h2b = h2[0] ?? "";
+    expect("H2: a collapsed untracked directory emptied under the session is reported", h2.length, 1);
+    expectTrue("H2a: …as ABSENT, not as 'still ON DISK' — every byte inside it is gone",
+      h2b.includes("ABSENT from the hub") && h2b.includes("swept-keep/"),
+      h2.length ? `named rows: ${h2b.split("\n").filter((l) => l.includes("•")).join(" | ")}` : "no banner");
+
+    // ── H3. A RENAME IS NOT A SWEEP (both sides are observed) ─────────────
+    // `git status --porcelain=v1 -z` reports a rename as TWO NUL-separated
+    // fields with the destination FIRST (`RM <to>\0<from>\0` — the reverse of
+    // the `old -> new` spelling the non-`-z` format uses). Both sides must be
+    // observed, or the ORIGIN name vanishes from the set while the file was
+    // merely moved — a false"swept" accusation. This row is what pins the
+    // field-order handling that `-z` forced (dropping the `R`/`C` branch
+    // reddens it and only it).
+    pause(1600);
+    inHub("mv-src.txt", "to be moved\n");
+    gg("add -A", hub);
+    gg("commit -qm mv-base", hub);
+    pause(1600);
+    inHub("mv-src.txt", "an edit that must not be mistaken for a loss\n");
+    await callFrom(hub);
+    drain();
+    pause(1600);
+    gg("mv mv-src.txt mv-dst.txt", hub); // out-of-process: a concurrent session
+    await callFrom(hub);
+    expect("H3: a concurrent RENAME is not reported as a sweep (both sides observed)",
+      sweeps(drain()).length, 0);
+
     // ── G. a read-only git call in a SHARED tree never takes `.git/index.lock`
     // The repo's own convention (scripts/bg-rescue-wip.sh:33-34, :243, :342): a
     // plain `git status` rewrites the real index and takes `.git/index.lock`,
