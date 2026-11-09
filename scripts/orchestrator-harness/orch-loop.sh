@@ -2193,7 +2193,12 @@ _orch_lock_verdict() {
   local p="${1:-}" lf="${2:-}" lt pstart cmd
   ORCH_LOCK_WHY=""
   case "$p" in ''|*[!0-9]*) return 1 ;; esac
-  [ "$p" -gt 1 ] || return 1                      # pid 0 is our own process group; 1 is init
+  # ⛔ ONLY PID 0 IS EXCLUDED NUMERICALLY. `kill -0 0` targets OUR OWN PROCESS GROUP, so 0 can never
+  # be a lock owner — but pid 1 is a normal answer in a container whose entrypoint IS the loop, and
+  # the shape arm answers it correctly either way (init is not `<shell> <…/orch-loop.sh>`). Treating 1
+  # as "provably not the owner" was a THIRD reclaim reason the design does not sanction, and a
+  # numeric assumption is not positive evidence (fresh review of #1985, P2).
+  [ "$p" -gt 0 ] || return 1
   cmd="$(_orch_lock_probe "$p")"; case $? in
     0) ;;                                         # present, argv read
     1) return 1 ;;                                # positively absent — the lock outlived its writer

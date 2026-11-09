@@ -340,6 +340,28 @@ ck "7b: the live owner's lock is UNTOUCHED (a failed read clobbers nothing)" \
    "$( [ "$(lock_pid "$C/o/.orch.lock")" = "$VP" ] && echo 0 || echo 1 )"
 kill -9 "$VP" 2>/dev/null
 
+# ── 7c) PID 1 IS DECIDED BY THE SHAPE, NOT BY A NUMERIC SHORTCUT (fresh review of #1985, P2).
+# A lock naming pid 1 is a normal answer in a container whose entrypoint IS the loop, so `1` may not be
+# turned into "provably not the owner" by a comparison: that is a third reclaim reason the design does
+# not sanction, and the caller answers rc 1 by DELETING the lock. Driven with a `ps` shim whose table
+# row for pid 1 IS a loop invocation — the numeric shortcut reds this arm, the shape arm passes it.
+echo "── 7c. pid 1 flows through the SHAPE arm (a numeric shortcut must not reclaim it)"
+mkcase; CASE_DIR="$C"
+cat > "$C/bin/ps-pid1" <<'PSSHIM3'
+#!/bin/bash
+case "$*" in
+  *etime*) echo 10:00; exit 0 ;;
+  *-axo*)  printf '      1 Ss   bash /tmp/x/orch-loop.sh\n'; exit 0 ;;
+esac
+exit 1
+PSSHIM3
+chmod +x "$C/bin/ps-pid1"
+printf '1\n' > "$C/o/.orch.lock"
+run_drv O="$C/o" PS_BIN="$C/bin/ps-pid1"
+ck "7c: a lock naming a LOOP-SHAPED pid 1 is deferred to, not reclaimed on the number" \
+   "$(want "$OUT" "already running (pid 1)" && echo 0 || echo 1)"
+ck "7c: …and its lock is left in place" "$( [ "$(lock_pid "$C/o/.orch.lock")" = "1" ] && echo 0 || echo 1 )"
+
 # ── 8) a lock carrying NO digits, and a lock naming pid 0 ────────────────────────────────────────
 # `[ abc -gt 0 ]` is an ERRORED test, which is FALSE, which reclaimed — the #1831 class. pid 0 is the
 # caller's own PROCESS GROUP (`kill -0 0` succeeds!), so it must never be treated as a live owner.
