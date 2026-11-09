@@ -3781,9 +3781,73 @@ test("#3255 policy: the git-op root is authoritative — adoption must never gat
     /const cwd = resolveGitRoot\(cdPath \?\? inputCwd\)/.test(src),
     "the git-op root must come from the command's own cwd",
   );
+  // ⛔ THE DECLARATION IS THE SHAPE THE PRE-FIX CODE ACTUALLY HAD (review cycle 6, F1).
+  // `origin/main` runs `const sessionRoot = normalizeWorktreeRoot(recoveryOnlyRoot(…));`
+  // then `recoverBridgeForRoot(sessionRoot)` — the adopted root arrives through a
+  // LOCAL, so neither inlined-call negation below matches it and this pin was GREEN on
+  // the very code it is named after. The third negation closes the declaration; the
+  // two inlined-call forms stay for the shapes a "tidy up the local" refactor produces.
   ok(
-    /const sessionRoot = normalizeWorktreeRoot\(recoveryOnlyRoot\(/.test(src),
-    "session-start bridge recovery is the one place adoption is permitted",
+    !/const sessionRoot = normalizeWorktreeRoot\(recoveryOnlyRoot\(/.test(src) &&
+      !/recoverBridgeForRoot\(\s*normalizeWorktreeRoot\(recoveryOnlyRoot/.test(src) &&
+      !/recoverBridgeForRoot\(recoveryOnlyRoot/.test(src),
+    "recovery must never be COUNTED against an adopted root — a sibling's entries are keyed on the " +
+      "sibling, so counting them claims verified state this session does not have (#1265 AC (b))",
+  );
+  ok(
+    /const ownRoot = normalizeWorktreeRoot\(resolveGitRoot\(process\.cwd\(\)\)\)/.test(src),
+    "session-start recovery must count the session's OWN root",
+  );
+  // #1265 review, P1: the check above pins the root the session DECLARES, not the
+  // root it COUNTS. A revert that kept `ownRoot` but counted `inspectRoot` would
+  // re-ship the false verified-state claim (and re-suppress the #264 P2 warning)
+  // while every assertion above stayed green.
+  ok(
+    /const recovered = recoverBridgeForRoot\(ownRoot\)/.test(src),
+    "the count reported at session_start must come from the session's OWN root",
+  );
+  // The DURABLE half must name its root too: `recoverBridgeForRoot` is called for
+  // the own root AND (inspection only) for a sibling, so an emit without `root`
+  // is indistinguishable between the two — restoring the false claim in
+  // gate-events.jsonl. The e2e behavioural parity is the A-KEYED row
+  // (`root === realA` → 1): it counts 0 while the field is absent, so the pre-fix
+  // shape reddens it. It is the ONLY durable detector for a wrong-root record — a
+  // `root: normRoot → process.cwd()` mutant reddens it and no other durable/behavioural
+  // row (the source pin "the durable gate_recovery record must name the root it recovered for"
+  // reddens too, but that pins the literal, not the behaviour: measured `316 passed, 1 failed`,
+  // the one red being that pin's). Pins are cited by ASSERTION MESSAGE, not line: a line number
+  // in this file has already drifted once under an edit to the comment above it.
+  // ⛔ The own-root row this comment used to credit that coverage to was DELETED in
+  // review cycle 5: it could not fail in either direction (pre-fix there is no `root`
+  // field, and the bridge's only compound key is A's). Cycle 7 found this comment
+  // still describing it — do not re-add that row, and do not trade the A-keyed one
+  // away on the strength of a row that does not exist.
+  ok(
+    /event: "gate_recovery"[^}]*?root: normRoot/.test(src),
+    "the durable gate_recovery record must name the root it recovered for",
+  );
+  // #1265 AC (b)/R3: the un-followable "cd into it" remedy — the FIRST of three consecutive
+  // children that died in one worktree followed it into a tree it did not own.
+  //
+  // ⛔ THIS IS A WHOLE-FILE NEGATION, COMMENTS INCLUDED, AND IT SAYS SO. That is deliberate, and
+  // it is the honest shape: two earlier versions of this pin tried to test only RENDERED text
+  // and both lied. The first ran over the file while its message asserted a *rendered message*
+  // regressed, so a pure comment reflow turned it red; the second added a hand-written comment
+  // scanner, which desynced TWICE (on `.replace(/"[^"]*"/g, " ")`'s quotes, then on the nested
+  // template in the Plain-text PASS log line) and left 274 then 21 comment lines verbatim — i.e.
+  // a strip that silently stops stripping is exactly how a negative pin goes green over the
+  // code it bans. A lexer in a test file is not worth the blast radius, so the pin covers the
+  // whole file and the constraint is stated where it bites: index.ts may not CONTAIN this
+  // phrase anywhere, so its #1265 note paraphrases the old remedy (`cd` is what it told you to
+  // do) instead of quoting it. The behavioural half — the guarantee that matters — is e2e
+  // 1265a, which asserts the captured transcript never contains the phrase at all.
+  ok(
+    !/\(cd into it\)/.test(src),
+    "the 'cd into it' remedy must appear NOWHERE in index.ts — comments included (that is why the #1265 note paraphrases it) — the first child that followed it died in a tree it did not own",
+  );
+  ok(
+    /re-dispatch verification for THIS root/.test(src) && /refused by design/.test(src),
+    "the root-mismatch remedy must be the followable one and must state that adoption is refused by design",
   );
 });
 
