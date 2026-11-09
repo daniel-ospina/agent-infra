@@ -6,7 +6,7 @@ doc_status: live
 subjects.team: organisation-design-team
 created: 2026-08-10
 aboutSubjects: organisation-design-team
-aboutObjects: agent-infra, issue-143, issue-1762, issue-1988, issue-2139, issue-2143, issue-2227, issue-2342, issue-3429, issue-3584, issue-3627, gh-rate-limits, gh-limit, gh-cred, github-app-installation
+aboutObjects: agent-infra, issue-143, issue-1762, issue-1988, issue-2028, issue-2139, issue-2143, issue-2227, issue-2342, issue-3429, issue-3584, issue-3627, gh-rate-limits, gh-limit, gh-cred, github-app-installation
 ---
 
 # GitHub API rate limits — detection & fallback runbook
@@ -67,6 +67,83 @@ The rules that follow from it, and where they live:
   covers "we waited 63 s and got an answer" cannot also cover "we never got an answer".
 - Bounds that a busy box can exceed are not bounds: `lane-status.py` caps the WORK it walks
   (session files, pids, activity files) and reports `lane-status: SAMPLED …` when a cap bites.
+
+## The controller bounds its own calls (agent-infra#2028)
+
+The limit above is why the bound belongs at the call site, and the shell call sites had none. Measured
+2026-10-18, twice:
+
+- the `[res]` line's `gh api rate_limit` probe left a `gh` child alive for **2h 08m** with 0.01 s CPU
+  and **no open sockets** — it never got as far as a response, so no HTTP-layer timeout could have
+  helped — while the supervisor reported the controller `running` and its heartbeat was 2 h stale;
+- `ps` showed **eight** `bash orch-loop.sh` processes aged from 23 minutes up to the **derived
+  no-progress window** (`docs/ops/cost-config-policy.md` §2 is that figure's single source; it is not
+  restated here, because that restatement is what the cost pin forbids), which was ONE controller plus
+  its substitution subshells. **A subshell inherits argv**, so `pgrep -f orch-loop.sh` counts the loop
+  plus every `$( … )` it is running: it is NOT a duplicate-controller check and killing the "surplus"
+  kills in-flight work. For "how many controllers are there", read `.orch.lock`'s pid or count
+  processes whose PARENT is the supervisor (#1856/#1859, `scripts/lib/fleet-inventory.sh`).
+
+What the controller now does (`orch-loop.sh`, the `# BEGIN gh-bound` block):
+
+| Knob | Default | Why that number |
+|---|---|---|
+| `GH_BOUND_S` | **120 s** | ~1.9x the 63.0 s serialised `gh pr view` measured on a 13-lane box above; a bound UNDER the measurement manufactures a false absence. Below one `CYC` (240 s), so no child outlives a cycle — per CHILD, that is; `GH_BOUND_TRIP` is what bounds a whole cycle. |
+| `GH_BOUND_TRIP` | **3** | a per-call bound is not a CYCLE bound: the sweep reads every open PR (>= 2 calls each), so a window where EVERY call hangs costs `bound x 2 x open_prs`. Past the trip, the rest of that cycle fails fast with `rc=124` without spawning `gh` at all. |
+
+- Every `gh` call in the cycle body runs through `gh_bounded`, which is `tb_timeout` from
+  `scripts/lib/bounded.sh` (`timeout` -> `gtimeout` -> internal watchdog — macOS ships neither).
+  A fired bound answers **124**, GNU `timeout`'s code, which every call site already treats as a
+  failed read; the call is otherwise byte-for-byte transparent (same stdout, same stderr, same status),
+  because several sites parse `--json` output and two merge `2>&1` before parsing.
+- The trip counter is reset at the cycle top with a BUILTIN truncation (`:` + a redirect), never `rm`:
+  that line sits above `fork_gate`, where a failed fork terminates the controller (#2293).
+- **The internal watchdog's scratch dir is made ONCE, in the parent, and reaped on exit.** Nine of the
+  block's sixteen call sites are captured (`x="$(gh_bounded …)"`), and on a host whose watchdog
+  resolves to the internal one (macOS — no `timeout`, no `gtimeout`) `tb_bound_tmp` would run INSIDE
+  that substitution's subshell: the assignment dies with the child, so no caller-level cleanup can see
+  it. Measured at the pre-fix head: **one orphaned empty `bounded.XXXXXX` per captured call**, for the
+  life of a process that outlives a month of cycles. That is the defect `bounded.sh` documents on
+  `disk-reaper.sh`'s scratch, with the same fix (create it in the PARENT; every probe reuses it,
+  because a subshell inherits the variable), and `gh_bound_cleanup` — called from the controller's
+  `EXIT` trap — removes it. Hosts that resolved a real `timeout` make no scratch at all.
+- **Each call is also `GH_LIMIT_NO_WAIT=1`**, set for that one child and then put back (set-ness
+  included, so a caller's own value survives). The bound alone is not enough: the layer this `gh`
+  resolves through (`gh-limit.py`) sleeps INSIDE the call — 60/120/240 s per refusal attempt, so a
+  rate-limited call answers at ~420 s, plus up to a 600 s single-flight lock wait. A 120 s bound would
+  kill it during the second wait, BEFORE `fail_loudly()` can print the RATE-LIMITED refusal, so the
+  caller gets an empty body and a 124 instead of the limit it hit; `sweep_fail_kind` then reads `other`
+  and the deferral is never armed. `NO_WAIT` is the repo's documented contract for a caller that owns
+  its own bound (the eight heartbeat tools, `lander.sh`, `cloud-cell-supervisor.sh`): the layer records
+  the limit and answers AT ONCE, and derives its own 5 s lock budget from it, so the backoff moves to
+  the CYCLE's deferral — which is #2028's fix-direction #2 ("never sleep inside a substitution").
+  Companion: `sweep_defer_until_recorded` takes the layer's recorded `until=` window when a refusal
+  carries no headers (a `NO_WAIT` answer has no response to take them from), so the box defers for the
+  real window instead of retrying once a minute.
+- A `GH_BOUND_S`/`GH_BOUND_TRIP` that does not parse falls back LOUDLY. `tb_timeout` answers 125 for a
+  non-integer bound, so an unvalidated typo would make every `gh` call fail and take the controller dark.
+- No usable `bounded.sh` is DEGRADED, DISCLOSED and not a refusal to start (the #2320 stance): each
+  cycle logs it and `state/gh-bound` records it for a reader. **"No usable" is three cases**, and the
+  third is the one that used to slip through: the library is missing; it defines no `tb_timeout`; or
+  `TB_TIMEOUT_KIND=invalid` because an operator's `TB_TIMEOUT_BIN` pin is not executable. That third
+  case satisfied the old presence check, so the block announced "bounded" and DELETED `state/gh-bound`
+  while `tb_timeout` exec'd the nonexistent pin — rc=127 on every call, a fully dark controller whose
+  own state file said it was fine. It is now DEGRADED, named with its remedy
+  (`TB_TIMEOUT_FORCE_INTERNAL=1` works), and recorded. `bounded.sh` asks callers to REFUSE instead
+  (`disk-reaper.sh` exits 3); this file keeps its own stance — a controller that cannot start is the
+  worse outage — but it does not claim a bound it does not have.
+- Graded by `scripts/orchestrator-harness/gh-bound.test.sh`, whose structural assertion reddens if a
+  NEW **shell** `gh` command position bypasses the bound. That is the scope it can see: it matches a
+  command position in `orch-loop.sh`'s own text, so a call hidden behind a variable, in `eval`, or
+  inside a python heredoc is out of its reach. No such site exists today (independently re-derived
+  over the file: every remaining `gh` is a string literal, the `command gh` pass-through, or the
+  `tb_timeout … gh` argv inside `gh_bounded`), so this is a stated limit, not a live bypass.
+
+The other half of that report — "a heartbeat-age assertion that fails the cell rather than waiting to be
+noticed" — already exists and is not part of this change: `watchdog-loop.sh` reports `WEDGED` ("pid is
+alive but the heartbeat is Ns old"), and `cloud-cell-doctor.sh` reports `CONTROLLER STALE`. **Both read
+the heartbeat AGE, which is the only signal that distinguishes a wedged controller from a working one —
+`launchctl print` / a live pid cannot.**
 
 ## The layer that owns this now (#1988)
 
@@ -376,10 +453,14 @@ Two properties worth knowing before you debug it:
   1 s, `LOCK_TIMEOUT` below 1 s: an environment that could set them to 0 would switch off the three
   guarantees the issue asks for while still looking clamped. Upper bounds are clamped too, and
   `nan`/`inf` fall back to the default.
-- **The child `gh` has no timeout.** A hung request holds the attempt lock for its whole duration;
-  other callers wait up to `GH_LIMIT_LOCK_TIMEOUT` (600 s) — or `GH_LIMIT_NO_WAIT_LOCK_S` (5 s) when
-  `GH_LIMIT_NO_WAIT=1` — then proceed UNSERIALISED with an `events.log` line. No timeout is imposed
-  on the child: a legitimate `gh` call's duration is not knowable here.
+- **The child `gh` has no timeout — at THIS layer.** A hung request holds the attempt lock for its
+  whole duration; other callers wait up to `GH_LIMIT_LOCK_TIMEOUT` (600 s) — or
+  `GH_LIMIT_NO_WAIT_LOCK_S` (5 s) when `GH_LIMIT_NO_WAIT=1` — then proceed UNSERIALISED with an
+  `events.log` line. No timeout is imposed on the child here: a legitimate `gh` call's duration is
+  not knowable at this layer. **The CALLER owns the bound, and the controller now takes it
+  (agent-infra#2028)** — see §"The controller bounds its own calls" (above; and this section is the
+  layer it passes through). A hung call with no caller-side bound is the 2h-08m wedge that section
+  records.
 - **The re-entrancy opt-out is silent.** A gh child that itself runs a harness script is not
   serialised (that would deadlock) and nothing is logged, so an ambient `GH_LIMIT_LOCK_HELD=1`
   would disable serialisation on that box without a trace. It is a documented seam, not a knob.
