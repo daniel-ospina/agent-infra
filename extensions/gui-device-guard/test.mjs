@@ -763,6 +763,19 @@ const ROWS = [
     "bash -c \"cat <<-EOF\n\tbody\n\\\n\tEOF\nnpm exec electron .\"", 1, "electron", true],
   ["A84 the ALLOW twin: …so the same command string with a benign tail stays clean",
     "bash -c \"cat <<EOF\nbody\nEOF\nls\"", 0, null, false],
+  // ── L63–L65 (round-12 review, SIXTEENTH pass) — the other half of the quoted-operator
+  //     rule: a redirect whose TARGET begins with a quoted `<`/`>` is still a redirect.
+  //     `tokenize` drops the quotes, so `>">"x` arrives as `>>x`; reading the quotedness
+  //     of the LAST character of the matched operator run displaced the command word and
+  //     allowed a launch bash RUNS (measured three ways).
+  ["L63 a redirect whose target starts with a QUOTED `>` is still a redirect (was [])",
+    ">\">\"x electron .", 1, "electron", true],
+  ["L64 …the `<` spelling of the same (was [])",
+    "<\"<\"f electron .", 1, "electron", true],
+  ["L65 …and behind the here-document operator (bash warns, then runs the launch) (was [])",
+    "<<\"<\"npm exec electron .", 1, "electron", true],
+  ["A85 the ALLOW twin: the same quoted-target redirect with a benign word stays clean",
+    ">\">\"x ls", 0, null, false],
   //   A83: the twin that keeps the strip honest — a SPACE before the continuation's tab
   //        means the tab is not LEADING, so the terminator is not recognised and the
   //        document runs to end-of-input (measured: `cat` prints ` \tEOF`).

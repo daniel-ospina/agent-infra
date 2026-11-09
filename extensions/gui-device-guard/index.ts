@@ -1610,9 +1610,16 @@ function attachedShortArg(tok: string, letter: string): string | null {
  * in the other direction: `npx playwright test --headed>/tmp/pw.log` was `[]` and
  * `electron . <both fake switches>/tmp/log` was REFUSED although both switches were
  * in argv. Bash deletes redirections from the word list and ends a word at the
- * operator; so does this. (Quotes are already removed by `tokenize`, so a QUOTED
- * `>` is treated as an operator here — the same accepted trade `stripTrailingMetachars`
- * makes.)
+ * operator; so does this.
+ *
+ * ⛔ AN OPERATOR THAT CAME FROM QUOTED TEXT IS DATA (round-12 review, fifteenth pass,
+ * P0). `tokenize` removes the quotes but `quoted` says, per CHARACTER, where they were:
+ * `bash -c "cat <<-EOF …"` is one token whose `<<` is quoted data, and cutting it at the
+ * `<` left the recursion `cat `, so the heredoc was never scanned and a launch bash RUNS
+ * was allowed with no row. The opposite shape has to keep working — `bash<<'EOF'` is an
+ * unquoted operator with a quoted delimiter (L35a) — which is why the check is per
+ * character and anchored on the FIRST operator character, not on the last character of
+ * the matched run (`>">"x` is a redirect whose quoted `>` begins the TARGET).
  */
 function stripRedirections(toks: string[], quoted?: boolean[][]): string[] {
   const out: string[] = [];
@@ -1622,7 +1629,14 @@ function stripRedirections(toks: string[], quoted?: boolean[][]): string[] {
     // A token that IS a redirection (`>`, `2>`, `>>f`, `2>&1`, `&>f`, `<<EOF`): bash
     // never passes it as a word. With no target attached, the target is the NEXT word.
     const lead = /^(?:\d{1,2})?(?:&>>|&>|>{1,3}|<{1,3}|>\||&)(.*)$/.exec(tok);
-    if (lead && chars?.[lead[0].length - lead[1].length - 1] === true) {
+    // ⛔ THE OPERATOR IS THE TOKEN'S FIRST OPERATOR CHARACTER — NOT THE LAST CHARACTER
+    // OF THE MATCHED RUN (round-12 review, sixteenth pass, P1). `tokenize` drops the
+    // quotes, so `>">"x` arrives as `>>x` with flags [unquoted, QUOTED, unquoted]: the
+    // greedy `>{1,3}` span swallowed the quoted `>` that bash reads as the TARGET's
+    // first character, the token was pushed as a WORD, and the command word was
+    // displaced — `>">"x electron .` returned [] while bash runs electron (measured).
+    const opAt = tok.search(/[<>&]/);
+    if (lead && opAt >= 0 && chars?.[opAt] === true) {
       out.push(tok); // a QUOTED operator is data
       continue;
     }
