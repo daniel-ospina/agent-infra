@@ -2059,7 +2059,7 @@ clear about what is and is not enforced:
 Five carriers (`orch-loop.sh`, `lane.sh`, `fix-one.sh`, `merge-one.sh`, `nonblocking-dispatch.sh`)
 used to `export AGENT_SKIP_REVIEW_GATE=1 ELDATO_SKIP_VGATE=1` unconditionally. The canon calls both
 flags emergency-only (`skills/commit-workflow/SKILL.md:102,:111`) and a lane collected without review
-is "UNREVIEWED CODE BY DEFAULT" (`skills/parallel-orchestrator/SKILL.md:150`), so a permanent export was
+is "UNREVIEWED CODE BY DEFAULT" (`skills/parallel-orchestrator/SKILL.md:152`), so a permanent export was
 a **defect**, and dangerous in one direction only: the permissive side was the machine that lands the
 most work.
 

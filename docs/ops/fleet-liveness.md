@@ -47,6 +47,55 @@ label — it produces a dispatch into the owner's own work.
 
 ---
 
+## 0. Scope — this document is ONE liveness surface, not all of them
+
+Before any state name is compared across tools: the vocabulary on this page
+(`dead | running-quiet | wedged | idle | unknown`) belongs to
+`tools/fleet/liveness.py`. A **second** liveness surface exists with its own,
+*different* vocabulary — the task tool's `task_status` / `Alive state:` wedge
+report, whose states are `alive | wedged | not-started | gone | done | failed |
+cut | unknown` (§0a). The two must never be reconciled by hand: neither is a
+second opinion on the other, and a name that appears in both (`wedged`) does not
+mean the same thing in both.
+
+### 0a. The task-tool surface, and the two verdicts it must never confuse (#2105)
+
+The task tool's report is false in both directions if either rule below is lost
+— measured on eight cut children across two lanes in one session:
+
+| condition | verdict | correct response |
+|---|---|---|
+| nothing was **ever** in flight (no turn, no tool, no message) **and the child is emitting markers**, with the elapsed time past a bound | **`not-started`** | wait, or reassign the work — killing it loses the dispatch and burns the fleet further |
+| something **was** in flight (or a turn was open) and it stopped | `wedged` | kill / re-dispatch |
+| nothing was **ever** in flight **and the child emits nothing at all** | `wedged` (silence class) | watchdog `tier-1 zero-output` parity — this is not excused as "not started" |
+
+`not-started` is a latch-based STATE (`isNotYetStarted`), never a duration: a
+stall requires something to be in flight and then stop, so a child that has not
+begun cannot have stalled. It is still **bounded** — the `no-progress` window
+owns it (a longer bound than the stream-stall wedge), and `silence-threshold`
+owns a child that emits nothing at all — so the separation changes *which*
+response is correct, never whether the run is bounded.
+
+**⛔ `not-started` DOES NOT SWALLOW THE SILENCE CLASS.** The state is reachable
+only on the marker-bearing arm (`markers > 0`); a child that emitted nothing at
+all falls through to the `noMarkerYet`/`staleLog` arm and reads **`wedged`**, so
+the three rows above are exhaustive rather than the first two being a summary of
+the third. **And the suppression is conditional on its substitute being armed**:
+the `no-progress` window is gated on `TASK_PROGRESS_AGE_MS > 0`, so with an
+explicit `TASK_PROGRESS_AGE_MS=0` the `stream-stall` bound still cuts a
+not-started child. Pulling that valve therefore cannot move the class from S
+to the 6 h hard cap.
+
+**And the report's tree fields are read AT REPORT TIME.** A spawn-time snapshot
+rendered as current state is not a weak reading, it is a false one: it stated
+`dirty=false dirtyPaths=0` on a worktree holding seven uncommitted commits. The
+report now re-reads `git status --porcelain -z` / `rev-parse HEAD` /
+`branch --show-current`, stamps `repoStateAt=`, and — when the head moved after
+the probe — **withholds the verdict** (`verdictWithheld=stale-snapshot`, plus
+`commitsSinceSnapshot=`) instead of reporting "nothing happened".
+
+---
+
 ## 1. The five states and what each rests on
 
 Every state is read from the same three inputs — the **cmux hook store**
