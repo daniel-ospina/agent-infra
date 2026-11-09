@@ -6,5 +6,8 @@ jobs:
     # The schema rejects the KEY, so an empty value fails the run just as a valid one does. If the guard
     # reads this as a validity test instead of a presence test, the bound falls through and the file is
     # certified GREEN through the callee — a false pass (review finding, P3).
+    # The callee MUST sit at .github/workflows/callee.yml: `./` names the CALLER's own root, so a callee
+    # parked under templates/ makes this a broken-call fixture instead, and the false pass can never be
+    # reproduced from it (review finding, P3 — the fixture did not construct the shape it described).
     uses: ./.github/workflows/callee.yml
     timeout-minutes:

@@ -95,8 +95,9 @@
 #      GitHub's caller schema too, and reading it as a validity test certified the file through the callee.
 # 36. FIXTURES — three NOTE gates that must not fire on the wrong shape: a 0-step job gets no step-budget
 #      note, a step bound EQUAL to J is still "unreachable", and a fully step-bounded job gets no JOB note.
-# 37. FIXTURE + USAGE — the zero-step violation wording (no empty `()`), `--root` with no value, and an
-#      unknown argument: all exit 2 rather than silently auditing something else.
+# 37. FIXTURE + USAGE — the zero-step violation wording (no empty `()`; that row asserts rc 1, a
+#      violation), then `--root` with no value and an unknown argument, which are the two that must exit 2
+#      rather than silently auditing the default root.
 #
 # HERMETIC: fixtures + temp copies only; no network, no gh, no clock. The live tree is READ, never
 # written (the temp copy is where the mutations land).
