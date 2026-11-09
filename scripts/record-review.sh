@@ -279,12 +279,17 @@
 # mechanical re-bind at the live head. This is evidence a REVIEWER produced, and
 # the two must not be conflated in either direction.
 # The script then VERIFIES it: it must exist, belong to THIS PR, POSTDATE the
-# recorded head's commit, and NOT assert an UNRESOLVED outcome. THREE ARMS, and
+# recorded head's commit, and NOT assert an UNRESOLVED outcome. FOUR ARMS, and
 # the split between them is the whole contract:
 #   (1)  the review skills' own exit markers — Auto-fix stalled/failed/reached/
 #        aborted/converged/stuck, "N issues remain", "requires human
-#        attention/input/review", "test review capped", [ADVERSARIAL-BOUND].
-#        UNCONDITIONAL.
+#        attention/input/review", "test review capped". UNCONDITIONAL.
+#   (1a) `[ADVERSARIAL-BOUND]` — SPLIT OUT OF (1) AND CONDITIONAL ON ITS OWN FIELD
+#        (agent-infra#1889). The token is emitted for BOTH the capped exit
+#        (fixer-loop.md) and the CLEAN threat-coverage disclosure (`AGENTS.md`
+#        §Hard Cap), so it vetoes UNLESS every marker in the artifact says
+#        `residuals=none`. Do NOT put it back in (1)'s list: that is the false
+#        refusal #1889 removed. The arm is below (1b).
 #   (1b) a DECLARED negative outcome — an `Outcome: not-clean` line, or a
 #        "Review — NOT CLEAN" header. UNCONDITIONAL, and checked BEFORE (2) so a
 #        body cannot declare both and be accepted.
@@ -1085,7 +1090,9 @@ verify_review_evidence() { # <ref> <head_sha> [polarity] -> 0 = verified
   #       escalation form above shares the label and is vetoed by its own text)
   #   "⚠️ Test review capped at 10 cycles — N issues remain:"   (literal N)
   #   "Requires Human Input / Requires Human Attention"        (plan-review block)
-  #   "[ADVERSARIAL-BOUND] cycles=… threats=… covered=… residuals=…"
+  #   "[ADVERSARIAL-BOUND] … residuals=<#N,…>"                 (CAPPED form ONLY — agent-infra#1889:
+  #       the same token is also the skill's MANDATED disclosure for a CLEAN threat-coverage exit,
+  #       `residuals=none`. It is split out of this grep into its own arm below, on its own field)
   #   "[NO-LOOP-BUDGET] RISK_CLASS=low — the single Step 4 pass is the whole budget…"
   #       (#1537: a `low` change budgets NO re-review loop, so entering the loop means
   #       findings survived Step 6. Naming that comment as `clean` evidence would mint a
@@ -1099,13 +1106,20 @@ verify_review_evidence() { # <ref> <head_sha> [polarity] -> 0 = verified
   # a lane whose review ABORTED could name its own Step-8 comment and mint clean.
   # An unresolved-exit prefix that this list does not name is a fail-open, so
   # extend it from fixer-loop.md, never from memory.
-  # ⛔ THREE ARMS, AND THE SPLIT IS SECURITY-RELEVANT (1b below is unconditional too).
+  # ⛔ FOUR ARMS, AND THE SPLIT IS SECURITY-RELEVANT (1b below is unconditional too).
   #
   # (1) STRUCTURAL ABORT MARKERS — always veto, unconditionally. These are the review skills' own
   #     Step-8 exit prefixes (fixer-loop.md §"PR comment prefix"). A lane whose review ABORTED emits
   #     one of them, so vetoing them unconditionally is what keeps the tortoise#3549 hole closed: a
   #     lane cannot mint `clean` by naming its own aborted Step-8 comment, whether or not that
   #     comment also claims an outcome.
+  #
+  # ⛔ (1a) `[ADVERSARIAL-BOUND]` IS NOT ONE OF THEM ANY MORE (agent-infra#1889) — it is the ONE
+  #     Step-8 prefix that is CONDITIONAL, and it lives in its own arm (the `residuals=` block right
+  #     after this grep). It was moved out because the same token is ALSO the skill's mandated
+  #     disclosure for a CLEAN threat-coverage exit, and a lane that adds a newly-spelled prefix to
+  #     this list must not re-add it: "extend from fixer-loop.md" is how this file keeps the list
+  #     complete, and #1889 is the one entry that had to be narrowed rather than extended.
   #
   # (2) THE LOOSE `not…clean` ARM — only when the artifact states NO explicit outcome. It is a
   #     substring search over prose, and prose about code reviews legitimately contains the phrase
@@ -1133,9 +1147,196 @@ verify_review_evidence() { # <ref> <head_sha> [polarity] -> 0 = verified
       "$kind" "$id" "$REPO" "$PR" "$created" "${head:0:12}"
     return 0
   fi
-  if grep -qiE 'auto-fix[[:space:]]+(stalled|failed|reached|aborted|converged|stuck)|require[s]?[[:space:]]+human[[:space:]]+(attention|input|review)|unresolved[[:space:]]+issues?|[0-9]+[[:space:]]+issues?[[:space:]]+remain|test[[:space:]]+review[[:space:]]+capped|\[ADVERSARIAL-BOUND\]|\[NO-LOOP-BUDGET\]' <<<"$body"; then
+  if grep -qiE 'auto-fix[[:space:]]+(stalled|failed|reached|aborted|converged|stuck)|require[s]?[[:space:]]+human[[:space:]]+(attention|input|review)|unresolved[[:space:]]+issues?|[0-9]+[[:space:]]+issues?[[:space:]]+remain|test[[:space:]]+review[[:space:]]+capped|\[NO-LOOP-BUDGET\]' <<<"$body"; then
     echo "   $kind $id asserts an UNRESOLVED outcome (a stalled/failed/cap/human-input exit) — it is evidence the review did not conclude clean." >&2
     return 1
+  fi
+  # ── agent-infra#1889 — THE [ADVERSARIAL-BOUND] DISCLOSURE HAS TWO FORMS; ITS OWN FIELD SPLITS THEM.
+  # `AGENTS.md` §Hard Cap makes the adversarial domain's clean exit "THREAT SURFACE COVERED" and
+  # REQUIRES the lane to disclose that the merge rests on threat coverage rather than a literal
+  # `NO ISSUES FOUND`: `[ADVERSARIAL-BOUND] cycles=<N> threats=<K> covered=<K> residuals=<#N,…|none>`.
+  # `fixer-loop.md` §"PR comment prefix" emits THE SAME TOKEN for the capped exit
+  # (`EXIT_REASON == "adversarial-capped"`). The token therefore CANNOT distinguish a clean bounded
+  # exit from a capped one — the skill's own `residuals=` field is the discriminator — and matching
+  # the bare token refused precisely the lane most likely to quote it (a bounded clean exit cannot
+  # honestly print `NO ISSUES FOUND`), making the mandated disclosure expensive and the cheap path
+  # silent NONDISCLOSURE. It inverted the arm's own intent. Measured 2026-10-16 on a lane whose fresh
+  # verifier returned `THREAT SURFACE COVERED` with 0 issues and no residuals filed.
+  #
+  # ⛔ ITS ACCEPTANCE CRITERION IS COVERAGE, NOT THE `residuals=` VALUE (agent-infra#3829 F1). The
+  # decision this arm serves is `AGENTS.md` §Hard Cap ("Statement of record" for every skill that
+  # repeats it): acceptance is **every declared threat class covered by a test + green CI**, residuals
+  # are "filed from cycle 1, not chased", and it renders the field `<#N,…|none>` — so a CLEAN bounded
+  # exit may legitimately have FILED residuals. Two merged plans record exactly that shape as clean
+  # (`docs/plans/2026-09-15-issue-1051-bounded-scan-root.md`: `threats=11 covered=11
+  # residuals=#1083,#1084,#1096`; `docs/plans/2026-09-28-issue-1505-…`: `covered=5 residuals=R-B1..R-B6
+  # + C6`). Reading only the value refused the honest lane that filed what the decision told it to
+  # file, and made it strip its own disclosure to mint — the same defect as #1889, one field over.
+  # So the counts on the SAME line are the discriminator where they exist, and the value is the
+  # fallback only for the terse form.
+  #
+  # THE RULE IS STILL FAIL-CLOSED — a wider reading of "clean" is how this would become a fail-open,
+  # so each axis refuses rather than guesses:
+  #   (i)   EVERY marker in the artifact must be clean. One capped marker anywhere in the same
+  #         artifact refuses it, so prose that merely mentions a clean form beside a real
+  #         `residuals=#12` on an UNCOVERED line cannot launder the capped exit.
+  #   (ii)  EVERY `residuals=` field on the marker's own line must carry a LEGAL CLEAN VALUE, which is
+  #         exactly `none` (case-insensitive, up to its own delimiter) **or** a FILED residual list in
+  #         EITHER of its two spellings: a NUMERIC list (`residuals=#1083,#1084`) **or** the bare WORD
+  #         `filed` (`residuals=filed`, case-insensitive) — and the filed form is admitted ONLY on
+  #         POSITIVE coverage evidence: both `threats=<K>` and `covered=<K>` present on the same line
+  #         and EQUAL. Near-misses still REFUSE: values that merely MENTION `none`
+  #         (`residuals=none,#12`, `residuals=none-filed`, `residuals=noneX`), and the unsubstituted
+  #         template `residuals=<#N,…|none>`.
+  #         ⛔ THE BARE WORD WAS REFUSED AND MUST NOT BE (review of #3829, measured at `3bef6262`).
+  #         The first cut of this branch demanded a DIGIT in the value, which is not a requirement any
+  #         decision states, is not one of the enumerated refusal causes, and was not named by the
+  #         refusal message — so an honest lane met a message listing only conditions it already
+  #         satisfied. It is not hypothetical: `docs/plans/2026-09-21-issue-1321-1322-skill-enforcer-gates.md`
+  #         records `[ADVERSARIAL-BOUND] cycles=2 threats=13 covered=13 residuals=filed` as that lane's
+  #         CLEAN exit (:463; :407 is its capped predecessor), and
+  #         `skills/writing-plans/workflow/05-review-handoff.md` tells every lane to copy that very
+  #         disclosure out of the plan doc into the PR body — so the fleet is INSTRUCTED to write a
+  #         spelling this arm refused, and the cheapest way to mint was rewriting a TRUE disclosure into
+  #         `none`, the inversion #1889 exists to remove. It adds no fail-open either: a numeric filed
+  #         list with equal counts is already accepted, and `filed` asserts the same thing without
+  #         enumerating it — the coverage comparison, which is where the protection actually lives, is
+  #         identical. The word is matched EXACTLY (`filed`, up to its own delimiter); every other
+  #         digit-free value (`filed-off`, `some`, `yes`, `unknown`) still refuses.
+  #   (iii) A marker with NO `residuals=` field at all REFUSES: an unparseable disclosure is a
+  #         cannot-verify, and a cannot-verify is never a pass (the posture of every arm here).
+  #   (v)   A FILED list WITHOUT the counts REFUSES: its legality rests on the coverage comparison, so
+  #         with no `threats=`/`covered=` it is a cannot-verify, exactly as (iii). The TERSE
+  #         `residuals=none` form still passes — demanding the counts would re-create the friction
+  #         #1889 exists to remove. (iv), below, refuses a CONTRADICTION between the counts.
+  #   (iv)  THE COUNTS MUST IDENTIFY ONE PAIR, ON THE MARKER'S OWN LINE. A field that appears MORE THAN
+  #         ONCE with different values (`threats=17 … threats=12`), or a count pair that sits earlier on
+  #         the line than the marker's own, leaves no single pair to compare — a cannot-verify, exactly
+  #         as (iii). With one value per field, `covered` below `threats` REFUSES. The comparison is
+  #         NUMERIC, so `threats=09 covered=9` is EQUAL, not a contradiction.
+  # `residuals=` tolerates a SPACE after the `=` (`residuals= none`), which is the spelling a human
+  # types; the extractor below carries `[[:space:]]*` so the allowance is reachable, and every
+  # near-miss (`none,#12`, `none-filed`, the template) still refuses.
+  # The field is read on the marker's OWN line. The body arrives @tsv-escaped, so a newline is the
+  # two characters `\n`; real newlines are normalised to that same literal first, and a WRAPPED
+  # marker whose field fell onto the next line therefore REFUSES instead of being guessed at.
+  if grep -qiE '\[ADVERSARIAL-BOUND\]' <<<"$body"; then
+    local _ab_norm _ab_sep _ab_rest _ab_line _ab_f _ab_v _ab_seen _ab_n _ab_ok _ab_bad _ab_t _ab_c
+    local _ab_tset _ab_cset _ab_nt _ab_nc _ab_num _ab_lb
+    _ab_sep=$'\\n'                  # the two characters backslash+n — @tsv's escape for a newline
+    _ab_norm="${body//$'\n'/"$_ab_sep"}"   # real newlines → that same literal, so ONE splitter covers both
+    _ab_rest="$_ab_norm"
+    _ab_bad=0
+    while :; do
+      _ab_line="${_ab_rest%%"$_ab_sep"*}"
+      # ⛔ DETECT CASE-INSENSITIVELY, LIKE THE TRIGGER ABOVE (found in review of this change, and it was a
+      # real fail-open). The outer trigger is `grep -qiE`, so a body spelling the marker
+      # `[adversarial-bound]` entered this block — and the first cut's `case *'[ADVERSARIAL-BOUND]'*`
+      # is case-SENSITIVE, matched nothing, and the whole arm was skipped: a CAPPED marker in lower case
+      # was ACCEPTED. The detection now uses the same engine and the same flag as the trigger, so the two
+      # cannot disagree about whether there is a marker to judge. (Pinned by 13m6h.)
+      if grep -qiE '\[ADVERSARIAL-BOUND\]' <<<"$_ab_line"; then
+        _ab_ok=1; _ab_n=0; _ab_seen=""
+        # (iv) THE COUNTS MUST IDENTIFY ONE PAIR — and a CONTRADICTORY pair is not a clean one. This
+        # runs FIRST: `covered` below `threats` is the artifact's OWN admission that a declared class
+        # was not covered, so no value can rescue it, and refusing it here is what keeps a filed list
+        # from laundering an uncovered surface (the one fail-open the count-based acceptance could open).
+        # ⛔ THE EXTRACTION IS PART OF THE CHECK (agent-infra#3829 F1, measured at `436b0a81`). The first
+        # cut read the FIRST `threats=` and the FIRST `covered=` on the line INDEPENDENTLY (`command
+        # head -n 1`, once per field), so the pair the comparison saw was not necessarily the marker's
+        # own: an earlier EQUAL pair on the same line shadowed a later contradiction and the artifact
+        # minted `clean` while its own marker admitted `covered < threats` — three shapes, e.g.
+        # `[ADVERSARIAL-BOUND] cycles=2 threats=17 covered=17 residuals=#970; also threats=12 covered=9`.
+        # It also compared the digits as STRINGS, so `threats=09 covered=9` was refused as "a declared
+        # class was NOT covered" when 9 == 9. So: collect EVERY value of each field, normalise it
+        # NUMERICALLY, and refuse when a field carries more than one distinct value — a line declaring
+        # two different `threats=` (or two `covered=`) has no single pair to compare, exactly like (iii).
+        # ⛔ DELIBERATELY NOT A COMPLETENESS TEST: when either field is ABSENT the comparison is
+        # skipped, the terse forms still pass, and only the FILED value (v) requires the counts.
+        # ⛔ THE FIELD NAME NEEDS A LEFT BOUNDARY, OR THE ARTIFACT SUPPLIES ITS OWN COVERAGE EVIDENCE
+        # (found in review of #3829 at `39455bdd`, measured here). `grep -oiE 'covered=[0-9]+'` is an
+        # UNANCHORED substring, so it matched INSIDE `uncovered=13` and `not-covered=13`: the body
+        # `[ADVERSARIAL-BOUND] cycles=2 threats=13 uncovered=13 residuals=filed` — an artifact that
+        # declares every class UNCOVERED — read `covered='13'`, compared equal to `threats=13`, and
+        # minted `clean`. That defeats the very guard this paragraph describes, and the mirror was a
+        # false refusal: `covered=13 uncovered=0` read two covered values and was rejected as a
+        # cannot-verify the line never declared. So every count field is matched with a left boundary
+        # that excludes an identifier character (`-` included, for `not-covered=`). The boundary is
+        # consumed by `grep -o`, which is harmless: the digit stage below re-extracts `[0-9]+`.
+        # ⛔ ONE DEFINITION OF THE BOUNDARY, so the two extractors cannot drift and a mutation pin can
+        # remove it with a one-token edit (`_ab_lb=`). It excludes `_` AND `-` because BOTH are
+        # identifier characters, and excluding only `-` was not enough: `not_covered=13`,
+        # `Not_Covered=13` and `all_covered=13` still matched `covered=13` and minted `clean` (found in
+        # the SECOND review of this PR, measured — the same class as `uncovered=`, one character over).
+        _ab_lb='(^|[^-_[:alnum:]])'
+        _ab_tset="$(printf '%s' "$_ab_line" | grep -oiE "${_ab_lb}threats=[0-9]+" | grep -oE '[0-9]+' \
+          | while IFS= read -r _ab_num; do printf '%s\n' "$((10#${_ab_num}))"; done \
+          | sort -u | tr '\n' ' ' | sed 's/^ *//; s/ *$//' || true)"
+        _ab_cset="$(printf '%s' "$_ab_line" | grep -oiE "${_ab_lb}covered=[0-9]+" | grep -oE '[0-9]+' \
+          | while IFS= read -r _ab_num; do printf '%s\n' "$((10#${_ab_num}))"; done \
+          | sort -u | tr '\n' ' ' | sed 's/^ *//; s/ *$//' || true)"
+        _ab_nt=0; for _ab_num in $_ab_tset; do _ab_nt=$((_ab_nt + 1)); done
+        _ab_nc=0; for _ab_num in $_ab_cset; do _ab_nc=$((_ab_nc + 1)); done
+        if [ "$_ab_nt" -gt 1 ] || [ "$_ab_nc" -gt 1 ]; then
+          _ab_bad=1
+          _ab_seen="the marker line declares MORE THAN ONE count value (threats='${_ab_tset:-none}' covered='${_ab_cset:-none}') — the marker's own pair cannot be identified, so this is a cannot-verify, not a clean exit"
+          break
+        fi
+        _ab_t="$_ab_tset"
+        _ab_c="$_ab_cset"
+        if [ -n "$_ab_t" ] && [ -n "$_ab_c" ] && [ "$_ab_t" != "$_ab_c" ]; then
+          _ab_bad=1
+          _ab_seen="threats=${_ab_t} but covered=${_ab_c} — a declared class was NOT covered, so this cannot be a clean exit"
+          break
+        fi
+        while IFS= read -r _ab_f; do
+          [ -n "$_ab_f" ] || continue
+          _ab_n=$((_ab_n + 1)); _ab_seen="$_ab_f"
+          _ab_v="${_ab_f#*=}"
+          # (ii-d) AN EMPTY `residuals=` MUST NOT SWALLOW THE NEXT FIELD (measured, second review of
+          # this PR). The extractor allows a space after the `=` (`residuals= none` is the spelling a
+          # human types), and `residuals=[[:space:]]*[^[:space:]]*` lets that space-crossing continue
+          # into the NEXT token: `… threats=13 residuals= covered=13` extracted ONE value,
+          # `covered=13`, which carries a digit and so passed branch (ii-b) — an EMPTY field minting a
+          # clean record, falsifying this arm's own "an EMPTY value still refuses" claim. A residuals
+          # VALUE never contains `=`, so a value that does is a swallowed field, not a value: it is
+          # treated as EMPTY (which refuses) rather than guessed at.
+          if grep -qF '=' <<<"$_ab_v"; then _ab_v=""; fi
+          _ab_ok=0
+          # (ii) the documented TERSE clean value: exactly `none`, case-insensitive, up to a delimiter.
+          grep -qiE '^residuals=[[:space:]]*none[,.:;)]*$' <<<"$_ab_f" && _ab_ok=1
+          # (ii-b)/(ii-c) the OTHER legal clean value — a FILED residual list — admitted ONLY when
+          # coverage is POSITIVELY established on the same line (both counts present and equal; (iv)
+          # already refused a contradiction). BOTH spellings are one self-contained branch each, so a
+          # mutation pin can disable one and prove the other still works: (ii-b) a NUMERIC list (it
+          # must carry a digit and none of `none`, `<`, `>` or an ellipsis), and (ii-c) the SAME
+          # assertion in words — the bare word `filed`, case-insensitive up to its own delimiter, with
+          # an optional space after the `=` as in (ii). The word is matched EXACTLY, so `filed-off`,
+          # `some` and `yes` still refuse. Pinned by 13m6k/13m6l and 13m6q/13m6r.
+          if [ "$_ab_ok" -ne 1 ] && [ -n "$_ab_t" ] && [ "$_ab_t" = "$_ab_c" ] && ! grep -qiE 'none|<|>|…' <<<"$_ab_v" && grep -qE '[0-9]' <<<"$_ab_v"; then _ab_ok=1; fi
+          if [ "$_ab_ok" -ne 1 ] && [ -n "$_ab_t" ] && [ "$_ab_t" = "$_ab_c" ] && ! grep -qiE 'none|<|>|…' <<<"$_ab_v" && grep -qiE '^[[:space:]]*filed[,.:;)]*$' <<<"$_ab_v"; then _ab_ok=1; fi
+          [ "$_ab_ok" -eq 1 ] || break
+        # ⛔ `[[:space:]]*` AFTER THE `=` IS LOAD-BEARING, AND IT HAS TO BE REACHABLE (#3829 review). The
+        # predicate above accepts `residuals= none` — the spelling a human types — but the first
+        # extractor was `residuals=[^[:space:]]*`, which can never yield a space after the `=`, so that
+        # allowance was dead code and the human spelling was refused with `(residuals=)`. The extractor
+        # now consumes the spaces too; every near-miss (`none,#12`, `none-filed`, the template, an EMPTY
+        # value, and a field that WRAPPED onto the next line) still refuses.
+        done < <(printf '%s' "$_ab_line" | grep -oiE 'residuals=[[:space:]]*[^[:space:]]*' || true)
+        if [ "$_ab_ok" -ne 1 ] || [ "$_ab_n" -eq 0 ]; then
+          _ab_bad=1
+          if [ "$_ab_n" -eq 0 ]; then _ab_seen='no residuals= field on the marker line'; fi
+          break
+        fi
+      fi
+      [ "$_ab_line" = "$_ab_rest" ] && break
+      _ab_rest="${_ab_rest#*"$_ab_sep"}"
+    done
+    if [ "$_ab_bad" -eq 1 ]; then
+      echo "   $kind $id carries an [ADVERSARIAL-BOUND] disclosure that is NOT the clean form (${_ab_seen:-unparseable}) — the token marks TWO exits, and its own fields split them: a CLEAN bounded exit is \`residuals=none\` OR a filed residual list — \`residuals=#1083,#1084\`, or the bare word \`residuals=filed\` — with \`threats=\` and \`covered=\` present and EQUAL (agent-infra#1889, #3829). Any OTHER value refuses, including one that merely MENTIONS \`none\` and the unsubstituted template." >&2
+      echo "   If the review DID conclude clean, its disclosure must read \`[ADVERSARIAL-BOUND] cycles=<N> threats=<K> covered=<K> residuals=<#N,…|none>\` with nothing left uncovered — the machine-readable line belongs in the PR BODY, and this post may spell it out in plain words instead; if the exit was capped, name the capped artifact and record the not-clean outcome instead." >&2
+      return 1
+    fi
   fi
   # (1b) DECLARED NEGATIVE OUTCOMES — always veto, and BEFORE the `Outcome:` suppression. Without
   #      this arm the suppression hands back the tortoise#3549 shape (§13f) for the price of one
