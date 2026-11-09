@@ -1003,10 +1003,10 @@ def _odd_backslashes(s):
 def _strip_comment(line):
     """`line` with a trailing comment removed — bash's rule: an unquoted `#` that starts a WORD.
 
-    ⛔ NO GUARD IN THIS SCANNER IS UNDECLARED ANY MORE, BUT FIVE ARE LOAD-BEARING AND UNPINNED — DECLARED
+    ⛔ NO GUARD IN THIS SCANNER IS UNDECLARED ANY MORE, BUT SIX ARE LOAD-BEARING AND UNPINNED — DECLARED
     HERE, BECAUSE "EVERY GUARD IS PINNED OR DECLARED" WAS FALSE UNTIL EVERY GUARD WAS MUTATED ONE AT A TIME
     (baseline 246/0; population `git ls-files '*.sh'`, which was 435 when that sweep ran and is 438 now).
-    ⛔ ONE OF THE FIVE IS PINNED FOR ONE MEMBER OF ITS CONDITION — see the word-set bullet, which is split
+    ⛔ ONE OF THE SIX IS PINNED FOR ONE MEMBER OF ITS CONDITION — see the word-set bullet, which is split
     by member because the mutant's delta depends on which character you pull.
 
     LOAD-BEARING, UNPINNED — a VALID-bash input separates the guard from its mutant (`bash -n` rc 0, and
@@ -1029,6 +1029,9 @@ def _strip_comment(line):
       * `_openers` backslash escape — it takes the escape and the OPENER on ONE logical line to separate it:
         `echo \" ; cat <<EOF` plus a body invents the body line (FALSE RED). A two-line spelling does not
         discriminate, because `quote` is per-call and an unclosed quote carries nowhere. Moves 0.
+      * `_openers`' WHITESPACE SKIP before the delimiter word (`cat << EOF`, not `<<EOF`) — delete it and the
+        delimiter is EMPTY, no opener is recorded, and the body line is INVENTED as a definition (FALSE
+        RED) on valid bash. Moves 0 files, and no fixture line carries the spaced spelling.
       * the trailing flush (`if _buf is not None`) — a file ENDING mid-continuation (`last_def() { :; }`
         followed by a single backslash AND a newline) drops the last definition, a FALSE PASS; the shape is
         valid bash. Moves 0. The same bytes WITHOUT the trailing newline are not a fixture: `bash -n`
@@ -1051,12 +1054,12 @@ def _strip_comment(line):
     proof that the guard is load-bearing.
 
     ⛔ SO THIS IS A DECLARATION, NOT A PIN, and it says so: writing the shapes above into `FIXTURE` is the
-    work that turns them into pins — SEVEN shapes for EIGHT guards, because one single-quoted spelling
+    work that turns them into pins — EIGHT shapes for NINE guards, because one single-quoted spelling
     separates the setter, the single-quote BRANCH and (in the same statement) the setter's own quote tuple,
     while the blanket double-quote branch needs the OTHER quote character. Until then a lane that
-    "simplifies" one of those eight is removing bash-faithfulness that only the fixture would catch. Each
+    "simplifies" one of those nine is removing bash-faithfulness that only the fixture would catch. Each
     shape is written out by name rather than counted, because the names are what survives a new head — and
-    the population numbers above are already stale at this head, which is the argument for the shape and
+    the population numbers above will be stale at the next head, which is the argument for the shape and
     against the count.
 
     ⛔ A COMMENT ENDS AT THE NEWLINE HOWEVER MANY BACKSLASHES IT CARRIES (round 48 review, P2 — measured).
@@ -1421,8 +1424,9 @@ head_with_comment_between()
 #     the inert-enforcer shape this file exists to catch, so this guard is still OWED a fixture line that
 #     changes under it. Until then it is DECLARED, not pinned.
 #     ⛔ AND THE BARE-WORD GUARD BELOW IS WHAT MOVED THIS MUTANT'S DELTA, so an anchor figure measured before
-#     it landed is not comparable: with the bare-word guard REVERTED, the SAME anchor mutant invents 261 names
-#     across 131 of these 438 files and DOES change the fixture scan (25 -> 26 names), so it reds `f11f-0`.
+#     it landed is not comparable: with the bare-word guard REVERTED, the SAME anchor mutant invents 261
+#     distinct names across 125 of these 438 files (6 more change only by a DUPLICATE report of a name the
+#     file already had), and it DOES change the fixture scan (25 -> 26 names), so it reds `f11f-0`.
 #     The anchor was pinned before that guard and is NOT pinned after it. A mutation delta belongs to a HEAD,
 #     not to a guard — so the 130 / 261 / 4 / 29 / 54 figures an earlier revision of this note carried are
 #     withdrawn BY NAME here rather than dropped silently, and none of them is a number at this head.
