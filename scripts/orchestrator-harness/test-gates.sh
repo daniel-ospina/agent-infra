@@ -2988,16 +2988,23 @@ _clean() { rm -f "$RS"/state/needsfix-* "$RS"/state/needsreview-* "$RS"/state/pa
   # (b) bash executes the parseable PREFIX of an `eval` before erroring — so 506/0 rested on an
   # accident of the file's current text, plus six `syntax error near unexpected token 'fi'` lines on
   # stderr that nothing graded. The extraction now walks to the `fi` that CLOSES the `if [ -f "$L.log" ]`
-  # arm, refuses to run past 60 lines, and the row below requires the result to parse standalone
+  # arm, refuses to run past 80 lines, and the row below requires the result to parse standalone
   # (`bash -n`) — so a broken anchor or a widened shape reds a NAMED row instead of feeding eval
   # unrelated top-level statements (`echo "[merge $PR] verdict: …" >> "$L.log"` and the `case`
   # mapping are three lines past the block).
+  # ⛔ ONE BOUND, ONE ROW (#3849 review round 2, P2). The first version of this pin also carried a
+  # separate `BOUNDED` row written as `[ line-count -le 40 ]` — which was GREEN on an EMPTY extraction
+  # (0 ≤ 40), i.e. green on the exact "reads nothing" failure the row was named for, while a CORRECT
+  # 45-line block (a future arm with comments) reddened it. Two bounds for one property, and the
+  # weaker of the two was the one asserted. ONE constant now: the awk caps the extraction at 80 lines
+  # — six times the block's 13, so honest growth has room and only a RUNAWAY is refused — and prints
+  # NOTHING when it cannot close, so `MISSING` is that outcome and one row names all three states.
   _last_src="$(awk '
     /^LAST=""$/ { emit = 1 }
     emit { buf = buf $0 "\n"; n++ }
     emit && /^[[:space:]]*done < "\$L\.log"[[:space:]]*$/ { saw_done = 1 }
     saw_done && /^[[:space:]]*fi[[:space:]]*$/ { print buf; exit }
-    n > 60 { exit }
+    n > 80 { exit }
   ' "$MERGE" 2>/dev/null)"
   _last_state="MISSING"
   if [ -n "$_last_src" ]; then
@@ -3013,13 +3020,21 @@ _clean() { rm -f "$RS"/state/needsfix-* "$RS"/state/needsreview-* "$RS"/state/pa
   else
     _last_of() { printf '%s' ''; }
   fi
-  eqv "the shipped verdict extractor block is LOCATED and SELF-CONTAINED in merge-one.sh" \
+  eqv "the shipped verdict extractor block is LOCATED, SELF-CONTAINED and BOUNDED in merge-one.sh" \
       "located" "$_last_state"
-  eqv "…and the extraction is BOUNDED (a range that never closes is not a pin)" \
-      "yes" "$( [ "$(printf '%s\n' "$_last_src" | grep -c .)" -le 40 ] 2>/dev/null && printf yes || printf no )"
   eqv "the shipped verdict extractor accepts ISSUES 3" "ISSUES 3" "$(_last_of 'ISSUES 3')"
   eqv "…accepts ISSUES: 3" "ISSUES: 3" "$(_last_of 'ISSUES: 3')"
   eqv "…accepts ISSUES - 2" "ISSUES - 2" "$(_last_of 'ISSUES - 2')"
+  # ⛔ THE PRODUCER ACCEPTS SIX SEPARATOR FORMS AND THIS PIN DROVE THREE (#3849 review round 2, P3).
+  # `merge-one.sh` states the two halves are pinned "against every accepted form"; deleting the
+  # `|ISSUES-*` arm or the `|CLEAN:*|CLEAN-*` arms left this suite 8/8 GREEN, because `ISSUES - 2`
+  # matches through `ISSUES[[:space:]]*` and not through `ISSUES-*`. The consequence of the gap is the
+  # #2132 loop itself: a reviewer's `ISSUES-3` would read NO-VERDICT, the fixer would be withheld, and
+  # nothing here would red. Each arm is named by its own row now.
+  eqv "…accepts ISSUES-3 (the \`ISSUES-*\` arm)" "ISSUES-3" "$(_last_of 'ISSUES-3')"
+  eqv "…accepts CLEAN: with its URL (the \`CLEAN:*\` arm)" "CLEAN: https://github.com/o/r/pull/1#issuecomment-9" "$(_last_of 'CLEAN: https://github.com/o/r/pull/1#issuecomment-9')"
+  eqv "…accepts CLEAN-ok (the \`CLEAN-*\` arm)" "CLEAN-ok" "$(_last_of 'CLEAN-ok')"
+  eqv "…and an ISSUES-3 line CLASSIFIES as findings (the two halves agree)" "ISSUES" "$(_vc "$(_last_of 'ISSUES-3')")"
   eqv "…accepts a CLEAN line with its URL" "CLEAN https://github.com/o/r/pull/1#issuecomment-9" "$(_last_of 'CLEAN https://github.com/o/r/pull/1#issuecomment-9')"
   eqv "…ignores earlier noise and takes the LAST verdict" "ISSUES 2" "$(_last_of 'ISSUES 5
 noise

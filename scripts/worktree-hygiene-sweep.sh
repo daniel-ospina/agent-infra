@@ -125,7 +125,7 @@ PREFLIGHT_ONLY=0
 # explicitly) or DERIVED from a candidate that proves itself, or the pass refuses.
 REPO="${REPO:-}"
 # ⛔ THE OPERATOR VARIABLE IS AN INPUT OF THE DERIVATION — OFFERED ALONE, NEVER AS A CO-EQUAL
-# CANDIDATE BESIDE THE CWD (fresh-context review of #3833, F2 and #3849 review, P1).
+# CANDIDATE BESIDE THE CWD (fresh-context review of #3833, F2 and #3849 review round 1, P2).
 # WHY NOT BESIDE `$PWD` (F2): #1974 §1 names `$TORTOISE_REPO`/`$TORTOISE` as an INPUT, and before
 # #1974 it DECIDED (`REPO="${TORTOISE_REPO:-$HOME/eldato/tortoise}"`). Offering it as ONE candidate
 # beside `$PWD` demoted a value the box explicitly declares to a TIE, so a box that names its target
