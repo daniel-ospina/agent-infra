@@ -25,9 +25,10 @@
 #      the remedy named — the #1985 defect was that this refusal was one silent line [fail closed]
 #   8. a lock carrying no digits, and a lock naming pid 0 → reclaim, run, and NO shell error
 #      (`[ abc -gt 0 ]` is an ERRORED test, which is FALSE, which reclaimed — #1831's class)
-#   9. structural + DRIFT pins: the block sits above the EXIT trap, the trap is the only releaser,
-#      `acq` keeps `noclobber`, the old liveness-only line is GONE, and both mirror bodies plus the
-#      slack are IDENTICAL to the canonical declarations they were copied from (#1178/#1856).
+#   9. structural + DRIFT pins: the block sits above the EXIT trap, that trap's signal list is
+#      EXACTLY `EXIT` and it is the only releaser (`acq` keeps `noclobber`), the old liveness-only line
+#      is GONE, and both mirror bodies plus the slack are IDENTICAL to the canonical declarations they
+#      were copied from (#1178/#1856).
 #  10. an exported `COLUMNS` cannot change any answer above (#2926): a width-truncated process read
 #      would turn a LIVE loop-shaped owner into "provably NOT the owner" and DELETE its lock, so §11
 #      re-drives the refusal arms with `COLUMNS=20` — the witness #2926 requires of every `-ww` fix.
@@ -125,20 +126,30 @@ ck "the section defines the lock file, the verdict, and the acquisition" $?
 ck "LOCKF is defined ONCE in the whole loop (no split identity of the lock path)" $?
 
 # ── 9b) STRUCTURAL: the block is ABOVE the EXIT trap, and the trap is the ONLY releaser ───────────
-TRAP_L="$(grep -nF "trap 'rm -f \"\$LOCKF\"' EXIT" "$SUBJECT" | head -1 | cut -d: -f1)"
+# ⛔ ONLY A REAL `^trap` LINE COUNTS (MEASURED: the previous form used `grep -nF` over the whole file,
+# so the COMMENT that documents the #1715 regression — `# Was trap 'rm -f "$LOCKF"' EXIT INT TERM` —
+# satisfied it. That is a false PASS on a structural pin, and it is why this arm stayed GREEN when
+# main's #3843 extended the trap. Anchored at `^trap`, no comment can answer it.)
+TRAP_L="$(grep -nE '^trap .*LOCKF' "$SUBJECT" 2>/dev/null | head -1 | cut -d: -f1)"
 [ -n "$TRAP_L" ] && [ "$TRAP_L" -gt "$END_L" ]
 ck "the EXIT trap that releases the lock sits BELOW the section (the block runs first)" $?
 # ⛔ THE ARM MUST RED ON THE EXACT #1715 REVERT, AND THE FIRST FORM DID NOT (fresh review of #1985,
 # P2 — MEASURED: restoring `trap 'rm -f "$LOCKF"' EXIT INT TERM` byte for byte left every arm green,
 # because the regex anchored the signal names at the START of the trap while the historical regression
 # has them AFTER `EXIT`). So this pins the WHOLE SET: one trap line may mention $LOCKF at all, and it
-# must be exactly the EXIT-only form.
+# is the EXIT-only form.
+# ⛔ BUT IT PINS THE INVARIANT, NOT A BYTE-EXACT STRING (MEASURED against main's #3843/#2028, which
+# EXTENDED the trap to also run `gh_bound_cleanup`): that extension is legitimate — the lock is still
+# released FIRST, and still only on EXIT — while a literal `-qxF` match REDS on it. So the assertion is
+# the invariant: ONE `^trap` line mentioning $LOCKF, whose SIGNAL LIST is exactly `EXIT`, and which
+# removes $LOCKF. Adding work to an EXIT trap stays legal; adding INT/TERM to the signal list does not.
+# MEASURED: `EXIT INT TERM` → TRAP_SIGS="EXIT INT TERM" ≠ "EXIT" → RED.
 LOCK_TRAPS="$(grep -E '^trap .*LOCKF' "$SUBJECT" 2>/dev/null)"
-# ⛔ `-qxF`, NOT `-qF`: a SUBSTRING match accepts `trap 'rm -f "$LOCKF"' EXIT INT TERM`, which is the
-# very regression this arm exists for (MEASURED on the first fix of this arm — the revert stayed green).
+TRAP_SIGS="$(printf '%s\n' "$LOCK_TRAPS" | sed -e "s/^trap '[^']*' //")"
 [ "$(grep -c . <<<"$LOCK_TRAPS")" = 1 ] \
-  && grep -qxF "trap 'rm -f \"\$LOCKF\"' EXIT" <<<"$LOCK_TRAPS"
-ck "the lock is released by ONE trap and it is EXACTLY the EXIT-only form (a returning INT/TERM handler deleted it while the loop lived — #1715)" $?
+  && [ "$TRAP_SIGS" = "EXIT" ] \
+  && grep -qF 'rm -f "$LOCKF"' <<<"$LOCK_TRAPS"
+ck "the lock is released by ONE trap and its signal list is EXACTLY 'EXIT' (a returning INT/TERM handler deleted it while the loop lived — #1715)" $?
 okc "acq() still takes the lock with set -o noclobber (unchanged primitive)" \
   grep -qF 'acq() { ( set -o noclobber; echo $$ > "$LOCKF" ) 2>/dev/null; }' "$SUBJECT"
 okc_not "the OLD liveness-only reclaim is GONE (it must not survive beside the new verdict)" \
