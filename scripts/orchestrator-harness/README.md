@@ -980,8 +980,8 @@ and no new call site can forget it:
 
 | Entry point | Where | Installed by |
 |---|---|---|
-| `gh-rest/gh` (the REST adapter above) | Mac | `install.sh` → `$O/gh-rest` first on the daemon PATH |
-| `gh-limit/gh` (nothing but the layer) | cloud cells | `cloud-cell-supervisor.sh` → `$O/gh-limit` first on the controller PATH **and** published through tmux `update-environment`; `deploy-crossbox.sh` seeds the same two files and passes the PATH on the controller's `new-session` line (it does not touch `update-environment`) |
+| `gh-rest/gh` (the REST adapter above) | Mac **and** cloud cells | Mac: `install.sh` → `$O/gh-rest` first on the daemon PATH. Cells: `cloud-cell-supervisor.sh` seeds it from the pinned harness into `$O/gh-rest` and leads the controller PATH with it; `deploy-crossbox.sh` seeds the same bytes and leads its session PATH with it |
+| `gh-limit/gh` (nothing but the layer) | Mac and cloud cells | `cloud-cell-supervisor.sh` → `$O/gh-rest` **ahead of** `$O/gh-limit` on the controller PATH (`#2039`: the adapter routes through the same helper, so the adapter must resolve first) **and** published through tmux `update-environment`; `deploy-crossbox.sh` seeds the same two files and passes the same order on the controller's `new-session` line (it does not touch `update-environment`) |
 
 ⛔ **The shim has to be re-asserted after the tool-dir prepend.** Every gh-calling harness script
 opens with `export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH`, which puts a REAL `gh` ahead of the

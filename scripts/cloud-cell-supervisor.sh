@@ -281,10 +281,14 @@ workers_maybe_live() {
 #                        the same false "CELL CAN RUN A CONTROLLER" this script already guards for a
 #                        stale `$O`. The controller sources keys.env, so its env carries the value
 #                        and a worker it creates can inherit it; nothing is written to a file.
-#   PATH               — the gh-limit layer (#1988) lives FIRST on the controller's PATH, and the
-#                        sessions the controller spawns are created by a client holding THAT PATH, so
-#                        publishing the name is what puts the layer in front of every lane's and
-#                        worker's `gh` too. Without it only the controller would be serialised.
+#   PATH               — the gh layers live FIRST on the controller's PATH — `$O/gh-rest` (the REST
+#                        adapter, #2039) AHEAD of `$O/gh-limit` (#1988) — and the sessions the
+#                        controller spawns are created by a client holding THAT PATH, so publishing the
+#                        name is what puts both layers in front of every lane's and worker's `gh` too.
+#                        Without it only the controller would be served. ORDER MATTERS: the adapter
+#                        routes every call through the same `$O/gh-limit.py`, so it must resolve first
+#                        or the adapter is never reached (this file's `start` builds exactly that order,
+#                        :3945; `lane.sh:83-84` re-asserts it for lanes).
 WORKER_ENV_NAMES="AI_REVIEW_GATE_KEY HOME O DEEPSEEK_API_KEY PATH"
 
 log_line() { printf '%s %s\n' "$(date -u +%FT%TZ)" "$*"; }
@@ -3103,14 +3107,26 @@ cmd_check() {
   [ -z "$missing" ] || die "worker scripts missing from $O:$missing — run 'start' (it seeds $O) or, for a verified redeploy: bash '$HARNESS'/deploy-harness.sh --src '$HARNESS' --o '$O'"
   # ── the gh-limit layer (#1988): present, AND able to run ──────────────────────────────────────
   # Presence alone is the false-green this file refuses everywhere else: a shim that cannot find the
-  # real gh exits 127 on EVERY call, which would stop merges altogether. So resolve `gh` through the
-  # very PATH the session will get and require it to answer.
+  # real gh exits 127 on EVERY call, which would stop merges altogether. So the layer is EXECUTED BY
+  # ITS OWN PATH and required to answer.
+  # ⛔ A REGULAR FILE IS NOT A RUNNABLE ONE, AND PATH HIDES THE DIFFERENCE (fresh review, P2, measured).
+  # This probe used to be `PATH="$O/gh-limit:$PATH" gh --version`, with a comment claiming it resolved
+  # `gh` "through the very PATH the session will get". It was wrong twice over. (1) `gh` there is a
+  # NAME: with a mode-`-x` `$O/gh-limit/gh` the kernel SKIPS the candidate (EACCES) and CONTINUES the
+  # search, so the probe was answered by `$O/gh-rest/gh` or the real binary and rc=0 certified a box
+  # whose rate-limit layer is INERT — the identical false PASS the adapter block below was fixed for
+  # (and the same mechanism mise/asdf document as shim fall-through). (2) It is not the session's PATH
+  # either: `start` leads with `$O/gh-rest` (:3945), so no `PATH=` form here answers about an order
+  # this box will ever have. The MODE is therefore required (and named), and the layer is executed BY
+  # PATH — the same rule, applied three lines early because the adapter probe sits one layer down.
   if [ -f "$O/gh-limit/gh" ] && [ -f "$O/gh-limit.py" ]; then
+    [ -x "$O/gh-limit/gh" ] \
+      || die "the gh-limit layer at $O/gh-limit/gh is PRESENT but NOT EXECUTABLE — the shell SKIPS it and resolves gh to $O/gh-rest/gh or the real binary, so EVERY gh call in the session bypasses the layer while this box would report it as installed (#1988). Remedy: chmod +x it, or re-seed with '$0 start'."
     # ⛔ `NO_WAIT` ON THE PROBE. Without it a box with one gh hanging in flight makes `check` wait up
     # to the layer's 600 s lock budget — and `check` is the diagnostic an operator runs BECAUSE the
     # box looks stuck. `gh --version` needs no lock at all, but the lock is taken before the child is
     # classified (review round 9).
-    PATH="$O/gh-limit:$PATH" GH_LIMIT_NO_WAIT=1 GH_LIMIT_NO_WAIT_LOCK_S=2 gh --version >/dev/null 2>&1 \
+    GH_LIMIT_NO_WAIT=1 GH_LIMIT_NO_WAIT_LOCK_S=2 "$O/gh-limit/gh" --version >/dev/null 2>&1 \
       || die "the gh-limit layer at $O/gh-limit cannot run gh — every gh call in the session would fail. Fix the layer or remove it before starting (a cell without it MERGES but is not serialised, #1988)."
   else
     log_line "WARN: no gh-limit layer in $O — this cell's gh calls are NOT serialised/backed off (#1988); run 'start' to seed it"
