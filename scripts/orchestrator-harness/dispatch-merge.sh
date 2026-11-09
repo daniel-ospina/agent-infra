@@ -11,6 +11,11 @@ set -u
 REPO="${1:-}"; OR="${2:-}"; shift 2 2>/dev/null || true
 SELF="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 O="${O:-$HOME/orchestrator}"; mkdir -p "$O/logs" "$O/state"
+# ⛔ THE WORK ROOT (#2095, review of #3846, P1). The controller exports `O` = its STATE dir and `O_WORK`
+# = the harness root. `lane.sh` is the file this dispatcher HANDS TO A TMUX PANE: resolving it from `$O`
+# on a state-dir instance spawns a pane that dies 127 while `wt_spawn` still returns 0, so the dispatch
+# books as spawned and nothing runs — the "reports healthy and can dispatch nothing" shape.
+_DM_WORK="${O_WORK:-$O}"
 # ⛔ PUBLISHED UP FRONT, OVERWRITTEN AT THE END (#2762 review, 4th cycle, P2). The controller recounts
 # from this file, and it used to exist only on the paths that reached the loop's tail — so the two
 # earlier "nothing started" exits (worker-terminal FATAL 78, a failed `cd`) left the batch counted as
@@ -27,7 +32,7 @@ O="${O:-$HOME/orchestrator}"; mkdir -p "$O/logs" "$O/state"
 # The marker is attached conditionally, exactly like `disp()` in orch-loop.sh, so the two disclosure
 # paths cannot disagree about what an empty token means.
 HARNESS_TOKEN="${HARNESS_TOKEN-unknown}"
-chmod +x "$O/lane.sh" "$O/merge-one.sh" "$O/chain-merge.sh" 2>/dev/null
+chmod +x "$_DM_WORK/lane.sh" "$_DM_WORK/merge-one.sh" "$_DM_WORK/chain-merge.sh" 2>/dev/null
 
 # ── release the cross-box ISSUE claim on the NO-CHAIN path (agent-infra#1850) ────────────────
 # `orch-loop.sh` takes `refs/claims/issue-<N>` when it dispatches, and `chain-merge.sh` releases it
@@ -39,7 +44,7 @@ chmod +x "$O/lane.sh" "$O/merge-one.sh" "$O/chain-merge.sh" 2>/dev/null
 # The record/fence convention is claims.sh's `claim_issue_release_record` (one implementation; see
 # its comment for why the handover file exists rather than the acquiring process doing the release).
 release_issue_claim_unspawned() { # <issue>
-  local n="$1" csh="$O/claims.sh" out rc=0
+  local n="$1" csh="$_DM_WORK/claims.sh" out rc=0
   [ -f "$csh" ] || return 0
   # ⛔ NOT `( … ) >/dev/null 2>&1`: reporting success only left a refused fence, a network failure or
   # a stale registry indistinguishable from a release that worked (2026-10-16 review) — the claim
@@ -299,7 +304,7 @@ git fetch origin main --quiet 2>/dev/null
 # until the row was reaped. The release and the row drop are what make "the issues stay in the pool,
 # re-decided on the next invocation" true. ⛔ SYMBOLS, NOT LINE NUMBERS (#2333 review, P2): this note
 # used to cite a line number in that block, and it drifted on the very next edit to orch-loop.sh.
-CIQ_MOD="$O/ci-queue.sh"
+CIQ_MOD="$_DM_WORK/ci-queue.sh"
 [ -f "$CIQ_MOD" ] || CIQ_MOD="$(dirname "${BASH_SOURCE[0]:-$0}")/ci-queue.sh"
 if [ -f "$CIQ_MOD" ]; then
   # shellcheck source=/dev/null
@@ -473,7 +478,7 @@ for N in "$@"; do
   # An EMPTY token (the box is current) appends nothing at all — `${T:+ …}`, never `${T:-…}`.
   _lan="$(wt_launcher)"
   _hd="${HARNESS_TOKEN:+ [harness=$HARNESS_TOKEN]}"
-  if wt_spawn "lane-$N" "$WT_ABS" "bash '$O/lane.sh' --repo-dir '$REPO_ABS' --repo '$OR' $N '$BR'"; then
+  if wt_spawn "lane-$N" "$WT_ABS" "bash '$_DM_WORK/lane.sh' --repo-dir '$REPO_ABS' --repo '$OR' $N '$BR'"; then
     SPAWNED_IDS="$SPAWNED_IDS $N"
     echo "#$N: lane-$N (implement+PR, launcher=$_lan)$_hd"
   else
@@ -510,7 +515,7 @@ for N in "$@"; do
   # the record can only be OVERWRITTEN by a re-acquire, and a re-acquire needs the current claim to be
   # RELEASED or to reach its CLAIM_ISSUE_TTL (4h) first — not because the gap is small. Do not shorten
   # the TTL without revisiting this line.
-  chain_gen="$( . "$O/claims.sh" 2>/dev/null; claim_issue_record_commit "$O" "$N" 2>/dev/null )" || true
+  chain_gen="$( . "$_DM_WORK/claims.sh" 2>/dev/null; claim_issue_record_commit "$O" "$N" 2>/dev/null )" || true
   # ⛔ `${REPO_ABS:-$REPO}`, NOT `$REPO_ABS` (#2762 review, 4th cycle, P1): refresh-scout.test.sh
   # EXTRACTS this branch and drives it under `set -u` without REPO_ABS, and the bare expansion aborted
   # the fragment — reding a registered shard and losing the only witness to the "stop the lane BEFORE
