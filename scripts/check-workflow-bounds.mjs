@@ -29,15 +29,30 @@
  *       A STEP bound is the STRONGER of the two: its trip is `failure`, which the rail reds. A JOB
  *       bound's trip is `cancelled`, which the rail reads NON-RED — it ends the hold and names the
  *       job, but it does not turn a hang into a red. `ci.yml`'s `verify` is the job that only has
- *       the step shape (65 steps; a 65-step job cannot satisfy the lane guard's “job > Σ steps”
+ *       the step shape (66 steps; a 66-step job cannot satisfy the lane guard's “job > Σ steps”
  *       under the platform's 360-minute ceiling, and a bound it cannot satisfy is not a bound).
  *       A reusable-workflow CALL job (`jobs.<id>.uses`) is the third case — see (d);
- *       ⛔ AND A STEP-ONLY JOB'S BOUNDS MUST BE REACHABLE (added at review, P2, measured). A job with
+ *       ⛔ AND A BOUND'S STEP BUDGET MUST BE REACHABLE (added at review, P2, measured). A job with
  *       no `timeout-minutes` still has one: GitHub's implicit 360-minute ceiling — and its trip is
  *       `cancelled`, NON-RED to the rail. So if the step bounds SUM to 360 or more, the platform's
  *       non-red cancel arrives before the last step bounds do, and those bounds are decorative. A job
  *       bounded only by its steps is therefore required to have Σ < 360. (This was real: `ci.yml`'s
  *       `verify` shipped 65 step bounds summing to 381 min in the first draft of this change.)
+ *       ⛔ THE SAME RULE APPLIES WHEN THE JOB HAS A BOUND OF ITS OWN (added at review, P2, measured).
+ *       A job bound J is itself a cancelling ceiling, so a step bound lying at or beyond J can never
+ *       fire — and J's trip is `cancelled`/NON-RED, so the non-red conclusion PRE-EMPTS the red step
+ *       that actually hung, which is the same false pass in the other direction. Where EVERY step
+ *       carries a finite numeric bound, Σ must therefore be strictly BELOW `min(J, 360)` (an inert
+ *       J > 360 cannot fire at all, so 360 is what covers the job). Nothing is blocked by this: a job
+ *       that declares a bound may always raise it (to ≤ 359) until it sits above Σ — EXCEPT where Σ
+ *       itself is ≥ 360, when no such bound exists and the tail step bounds are what must come down (the
+ *       violation says which of the two applies).
+ *       ⛔ AND A SUM THIS GUARD CANNOT COMPUTE IS REPORTED, NEVER SILENTLY CERTIFIED (added at review,
+ *       P2, measured). `${{ … }}` is an accepted step bound (clause (c)), so a step-only job may carry
+ *       one and Σ is then uncomputable; treating that as "nothing to check" is how the reachability
+ *       rule above becomes decorative, so it is a NOTE on every run (the doctrine this file already
+ *       keeps for a foreign callee). The numeric bounds are still summed, and a numeric subtotal that
+ *       ALREADY reaches the ceiling is refused regardless of the expression.
  *   (c) the value is a positive integer number of minutes, or a `${{ … }}` expression (GitHub
  *       resolves `jobs.<id>.timeout-minutes` from the `github`, `needs`, `strategy`, `matrix`,
  *       `vars` and `inputs` contexts, so a reusable workflow may legitimately forward one);
@@ -61,25 +76,40 @@
  * job ends", which is strictly better than the measured 55-minute hold — the remaining false-pass
  * surface (a non-verdict scored non-red) is ONE root, tracked as #3242, and is not created here.
  *
- * ── WHY NO UNIVERSAL "job bound > sum of step bounds" HERE ──────────────────────────────────────
- * Measured on this tree: `ci.yml`'s `verify` job has 65 steps and `ci-main.yml`'s shard slices have
+ * ── BOTH WORKFLOW ROOTS, NOT JUST THE LIVE ONE (added at review, P2, measured) ──────────────────
+ * This repo's workflow files live in TWO places: `.github/workflows/` (what GitHub runs) and
+ * `templates/.github/workflows/` (the reusables consumers generate from — 5 files, 13 jobs). The
+ * header above says EVERY workflow, and the template root is where one of them reaches a CONSUMER's
+ * queue: `templates/…/pipeline-compliance.yml` is the consumer copy of this repo's only required
+ * check. It is deliberately NOT one of the four `scripts/sync-ci-workflows.sh` materializes, so
+ * `workflow-drift` byte-compares it never — a bound deleted there was previously caught by nothing at
+ * all. Both roots are scanned whenever they exist; a fixture root without `templates/` simply skips
+ * it, and a template job is labelled `templates/<file>::<job>` so the two roots stay distinguishable.
+ * (`scripts/check-workflow-actionlint.sh` is the in-repo precedent: it lints both roots too.)
+ *
+ * ── WHY "job bound > sum of step bounds" IS NOT ASSERTED UNIVERSALLY ────────────────────────────
+ * Measured on this tree: `ci.yml`'s `verify` job has 66 steps and `ci-main.yml`'s shard slices have
  * three. The `check-ci-lane-parity.mjs` invariant (`job > Σ steps`) is satisfiable for three steps and
- * not in general: a 65-step job under the platform's 360-minute ceiling would need steps averaging
- * <5.5 min, which would false-block a slow-but-healthy step. That invariant stays where it was
- * proven — on the lane jobs it was written for — rather than being asserted everywhere and being
- * either wrong or vacuous.
+ * not in general: a 66-step job under the platform's 360-minute ceiling would need steps averaging
+ * <5.5 min, which would false-block a slow-but-healthy step. So the rule asserted here is scoped to
+ * the shape where it cannot false-block and cannot be vacuous: it fires only when EVERY step carries a
+ * bound (numeric or expression — a numeric subtotal that already breaches the ceiling is refused
+ * regardless), and its remedy is always stated as one that exists. A job whose steps are not ALL bounded
+ * is covered by the JOB-level NOTE instead, which names any step bound lying beyond the job bound.
  *
  * ── FAIL-CLOSED ─────────────────────────────────────────────────────────────────────────────────
  * Exit 2 (refusal) — not 0 — when the guard cannot answer: no workflow files, a file whose `jobs` is
  * not a mapping or holds no job, unparseable YAML, or a `--root` with no `.github/workflows`. A guard
  * that passes when it read nothing is the class of defect it exists to find (#637, #675 P2).
  *
- * Exit codes: 0 every job bounded (or bounded through its callee) · 1 a job has no usable bound (or a
- * call job declares one, which GitHub rejects) — each named with its file · 2 refusal.
+ * Exit codes: 0 every job bounded (or bounded through its callee) · 1 a job has no usable bound, or a
+ * call job declares one (which GitHub rejects), or a bound sits at/below the step budget it is meant
+ * to pre-empt — each named with its file · 2 refusal.
  *
  * Usage:
  *   node scripts/check-workflow-bounds.mjs [--root DIR] [--list]
- *     --root DIR   audit DIR/.github/workflows instead of this repo's (fixtures, mutations)
+ *     --root DIR   audit DIR/.github/workflows AND DIR/templates/.github/workflows (when present)
+ *                  instead of this repo's (fixtures, mutations)
  *     --list       print `<file>::<job>\t<bound>` for every job, then the verdict (used by the suite
  *                  to prove the parse is NON-VACUOUS — it must see the jobs it claims to check)
  */
@@ -156,38 +186,60 @@ function classifyBound(raw) {
  * `./.github/workflows/<f>`.
  */
 function resolveLocalCallee(uses) {
-  const m = /^(?:(\.\/)|([^/@\s]+\/[^/@\s]+)\/)?(\.github\/workflows\/[^@\s]+?\.ya?ml)(?:@.*)?$/.exec(
+  // Two capture groups only: the OPTIONAL `<slug>` (absent for a `./…` call) and the path. The `./`
+  // prefix is its own alternative with no capture group, so a `./` call leaves `slug` undefined.
+  const m = /^(?:(?:\.\/)|([^/@\s]+\/[^/@\s]+)\/)?(\.github\/workflows\/[^@\s]+?\.ya?ml)(?:@.*)?$/.exec(
     uses.trim()
   );
   if (!m) return null;
-  const [, dotSlash, slug, rel] = m;
-  if (dotSlash) return rel;
-  if (slug === SELF_SLUG) return rel;
+  const [, slug, rel] = m;
+  // ⛔ THE TWO FORMS MEAN DIFFERENT ROOTS once there are two (review finding, P3).
+  // `<slug>/.github/workflows/<f>` names the REPO root, so a caller sitting in
+  // `templates/.github/workflows/` resolves it to `.github/workflows/<f>` — not to a template sibling.
+  // `./.github/workflows/<f>` is a path relative to the caller, so it stays in the caller's own root.
+  // Conflating them made a template caller report a present workflow as "does not exist".
+  if (slug === undefined) return { rel, rooted: false }; // `./…` — relative to the caller
+  if (slug === SELF_SLUG) return { rel, rooted: true }; // `<slug>/…` — the repo root, always
   return null;
 }
 
 function main() {
   const { root, list } = parseArgs(process.argv.slice(2));
-  const dir = join(root, ".github", "workflows");
 
-  let entries;
-  try {
-    entries = readdirSync(dir);
-  } catch (e) {
-    process.stderr.write(
-      `check-workflow-bounds: ✗ REFUSING — cannot read ${dir} (${e.code || e.message}).\n` +
-        `   A guard that read no workflow cannot say every job is bounded; this is exit 2, not a pass.\n`
-    );
-    process.exit(2);
+  // ── THE TWO WORKFLOW ROOTS (see the header). `.github/workflows/` is required; the template root
+  // is scanned whenever it exists, so a fixture root (which has none) and a mutation copy behave as
+  // before while the live tree gets both. Labels keep the roots distinguishable to the reader.
+  const rootSpecs = [
+    { dir: join(root, ".github", "workflows"), label: "", required: true },
+    { dir: join(root, "templates", ".github", "workflows"), label: "templates/", required: false },
+  ];
+
+  /** @type {{key: string, path: string, label: string}[]} */
+  const scanned = [];
+  for (const spec of rootSpecs) {
+    if (!spec.required && !existsSync(spec.dir)) continue;
+    let entries;
+    try {
+      entries = readdirSync(spec.dir);
+    } catch (e) {
+      process.stderr.write(
+        `check-workflow-bounds: ✗ REFUSING — cannot read ${spec.dir} (${e.code || e.message}).\n` +
+          `   A guard that read no workflow cannot say every job is bounded; this is exit 2, not a pass.\n`
+      );
+      process.exit(2);
+    }
+    const here = entries.filter((f) => /\.ya?ml$/.test(f)).sort();
+    if (here.length === 0) {
+      process.stderr.write(
+        `check-workflow-bounds: ✗ REFUSING — ${spec.dir} holds no .yml/.yaml file.\n` +
+          `   Nothing was checked, so nothing can be certified: exit 2.\n`
+      );
+      process.exit(2);
+    }
+    for (const f of here) scanned.push({ key: spec.label + f, path: join(spec.dir, f), label: spec.label });
   }
-  const files = entries.filter((f) => /\.ya?ml$/.test(f)).sort();
-  if (files.length === 0) {
-    process.stderr.write(
-      `check-workflow-bounds: ✗ REFUSING — ${dir} holds no .yml/.yaml file.\n` +
-        `   Nothing was checked, so nothing can be certified: exit 2.\n`
-    );
-    process.exit(2);
-  }
+  const byKey = new Map(scanned.map((e) => [e.key, e]));
+  const files = scanned.map((e) => e.key);
 
   const violations = [];
   const notes = [];
@@ -202,7 +254,7 @@ function main() {
   function loadJobs(file) {
     let doc;
     try {
-      doc = parseWorkflowYaml(readFileSync(join(dir, file), "utf8"));
+      doc = parseWorkflowYaml(readFileSync(byKey.get(file).path, "utf8"));
     } catch (e) {
       const kind = e instanceof WorkflowYamlError ? "unparseable by the structural reader" : "unreadable";
       process.stderr.write(
@@ -242,6 +294,9 @@ function main() {
       process.exit(2);
     }
     const jobs = loadJobs(file);
+    // The root label this file came from (`""` for `.github/workflows/`, `"templates/"` otherwise), so a
+    // `uses:` resolved to `.github/workflows/<f>` is followed INTO THE SAME ROOT the caller lives in.
+    const label = byKey.get(file).label;
     for (const id of Object.keys(jobs)) {
       jobCount++;
       const job = jobs[id] || {};
@@ -269,15 +324,17 @@ function main() {
           );
           continue;
         }
-        if (!existsSync(join(dir, local.replace(/^\.github\/workflows\//, "")))) {
+        // A `./…` call stays in the caller's root; an explicit `<slug>/…` call names the repo root.
+        const calleeKey = (local.rooted ? "" : label) + local.rel.replace(/^\.github\/workflows\//, "");
+        if (!byKey.has(calleeKey)) {
           violations.push(
-            `${where} calls ${job.uses.trim()}, resolved to ${local} in THIS repo, but that file does not ` +
+            `${where} calls ${job.uses.trim()}, resolved to ${local.rel} in THIS repo, but that file does not ` +
               `exist — the call is broken, so nothing inside it can be bounded`
           );
           continue;
         }
         viaCallee++;
-        auditFile(local.replace(/^\.github\/workflows\//, ""), depth + 1);
+        auditFile(calleeKey, depth + 1);
         continue;
       }
 
@@ -299,6 +356,51 @@ function main() {
         );
       }
       if (verdict.ok) {
+        // ⛔ AND THE STEP BUDGET MUST FIT INSIDE THE BOUND THAT CANCELS IT (review finding, P2, measured).
+        // A job bound J is a cancelling ceiling, so a step bound at or beyond J can never fire — and J's
+        // trip is `cancelled`/NON-RED, so the non-red conclusion pre-empts the red step that hung.
+        //
+        // ⛔ SCOPED TO "EVERY STEP CARRIES SOME BOUND", NOT "EVERY STEP IS NUMERIC" (review finding, P2,
+        // measured). Requiring all-numeric here let ONE `${{ … }}` step bound switch the whole rule off,
+        // silently — Finding A's class, on this branch. The NUMERIC subtotal is provable on its own, so
+        // it is always checked; only the part that depends on the expression is downgraded to a NOTE.
+        // A job with UNBOUNDED steps is out of scope entirely (the JOB-level NOTE below covers it).
+        const everyStepBounded = steps.length > 0 && badSteps.length === 0;
+        if (everyStepBounded) {
+          const numeric = steps.map((s) => Number(s && s["timeout-minutes"]));
+          const known = numeric.filter((n) => Number.isFinite(n));
+          const unevaluable = numeric.length - known.length;
+          const knownSum = known.reduce((a, b) => a + b, 0);
+          // An inert J (> 360) cannot fire at all, so the platform ceiling is what actually covers the job.
+          const ceiling = verdict.expression || verdict.inert ? PLATFORM_CEILING_MIN : Number(verdict.value);
+          if (verdict.expression) {
+            notes.push(
+              `${where} declares an EXPRESSION job bound and every step carries a bound, so whether its bound ` +
+                `sits above their ${knownSum}-min numeric subtotal${unevaluable > 0 ? ` (+${unevaluable} expression bound(s))` : ""} ` +
+                `could NOT be checked — a bound at or below that sum would make its last step bounds unreachable`
+            );
+          } else if (knownSum >= ceiling) {
+            violations.push(
+              `${where} declares timeout-minutes ${verdict.value} but its ${steps.length} step bounds` +
+                (unevaluable > 0 ? `, of which only the ${known.length} numeric ones are summed here,` : "") +
+                ` SUM to ${knownSum} min — at or above ${verdict.inert ? `the platform's ${PLATFORM_CEILING_MIN}-minute ceiling (which pre-empts its inert ${verdict.value})` : "its own job bound"}, ` +
+                `so the last step bounds could never fire and the job-level \`cancelled\` (NON-RED to the rail) ` +
+                `pre-empts the red step that actually hung. ` +
+                // The remedy must be one that EXISTS: for knownSum >= 360 no job bound can sit above it.
+                (knownSum < PLATFORM_CEILING_MIN
+                  ? `Raise the job bound above ${knownSum} and below ${PLATFORM_CEILING_MIN}, or lower the tail step bounds.`
+                  : `No job bound can sit above ${knownSum} inside the platform's ${PLATFORM_CEILING_MIN}-minute ceiling, so the step bounds are what must come down.`)
+            );
+            continue;
+          } else if (unevaluable > 0) {
+            notes.push(
+              `${where} declares timeout-minutes ${verdict.value} and every step carries a bound, but ${unevaluable} of ` +
+                `them are \`\${{ … }}\` expressions, so Σ could not be evaluated — the reachability rule was NOT ` +
+                `applied to those (the ${known.length} numeric bound(s) total ${knownSum} min, so the expression ` +
+                `bound(s) must stay below ${ceiling - knownSum} min)`
+            );
+          }
+        }
         bounded++;
         if (verdict.inert) {
           notes.push(
@@ -309,9 +411,16 @@ function main() {
         // weaker shape is visible rather than implied. It is a NOTE, not a violation:
         // `check-ci-lane-parity.mjs` refuses that shape in the two lane documents already.
         if (steps.length > 0 && badSteps.length > 0) {
+          // …and name any step bound that is ALREADY beyond the job bound, so the NOTE genuinely covers
+          // the shape the all-numeric rule above cannot (review finding, P3: it claimed coverage it did not give).
+          const ceilingHere = verdict.expression || verdict.inert ? PLATFORM_CEILING_MIN : Number(verdict.value);
+          const stranded = steps.filter((s) => Number(s && s["timeout-minutes"]) >= ceilingHere).length;
           notes.push(
             `${where} is bounded only at the JOB level — ${badSteps.length}/${steps.length} step(s) carry no bound, so its trip is ` +
-              `\`cancelled\` (NON-RED to the rail). The job ends and names itself; a step bound would red it.`
+              `\`cancelled\` (NON-RED to the rail). The job ends and names itself; a step bound would red it.` +
+              (stranded > 0
+                ? ` NOTE: ${stranded} step bound(s) here are at or above ${ceilingHere} min and can never fire.`
+                : "")
           );
         }
         continue;
@@ -320,19 +429,35 @@ function main() {
         // A step-only job must be bounded BELOW the platform ceiling, or its last step bounds can
         // never fire (the 360-minute default cancel — `cancelled`, NON-RED — arrives first).
         const numeric = steps.map((s) => Number(s && s["timeout-minutes"]));
-        if (numeric.every((n) => Number.isFinite(n))) {
-          const sum = numeric.reduce((a, b) => a + b, 0);
-          if (sum >= PLATFORM_CEILING_MIN) {
-            violations.push(
-              `${where} is bounded only by its ${steps.length} step bounds, which SUM to ${sum} min — at or ` +
-                `above the platform's ${PLATFORM_CEILING_MIN}-minute job ceiling, whose trip is \`cancelled\` ` +
-                `(NON-RED to the rail). The last step bounds could never fire, so lower them: the step ` +
-                `bounds are the red-producing bound and they must all be REACHABLE.`
-            );
-            continue;
-          }
-          notes.push(`${where} is bounded by its steps alone (Σ ${sum} min, under the ${PLATFORM_CEILING_MIN}-minute ceiling)`);
+        const known = numeric.filter((n) => Number.isFinite(n));
+        const unevaluable = numeric.length - known.length;
+        const sum = known.reduce((a, b) => a + b, 0);
+        if (sum >= PLATFORM_CEILING_MIN) {
+          violations.push(
+            `${where} is bounded only by its ${steps.length} step bounds` +
+              (unevaluable > 0 ? `, of which only the ${known.length} numeric ones are summed here` : "") +
+              `, which SUM to ${sum} min — at or ` +
+              `above the platform's ${PLATFORM_CEILING_MIN}-minute job ceiling, whose trip is \`cancelled\` ` +
+              `(NON-RED to the rail). The last step bounds could never fire, so lower them: the step ` +
+              `bounds are the red-producing bound and they must all be REACHABLE.`
+          );
+          continue;
         }
+        // ⛔ A SUM THIS GUARD CANNOT COMPUTE IS REPORTED, NEVER SILENTLY CERTIFIED (review finding, P2,
+        // measured). `${{ … }}` is an accepted step bound, so `Number()` of it is NaN and Σ is unknown;
+        // falling through to `boundedBySteps++` would report the job as certified on a property that was
+        // never evaluated — silently, which the file's own doctrine forbids. NOTE, so it is visible.
+        if (unevaluable > 0) {
+          notes.push(
+            `${where} is bounded by its ${steps.length} step bounds, but ${unevaluable} of them are \`\${{ … }}\` ` +
+              `expressions, so Σ could not be evaluated — the ${PLATFORM_CEILING_MIN}-minute reachability rule was ` +
+              `NOT applied (the ${known.length} numeric bound(s) total ${sum} min, so the expression bound(s) ` +
+              `must stay below ${PLATFORM_CEILING_MIN - sum} min)`
+          );
+          boundedBySteps++;
+          continue;
+        }
+        notes.push(`${where} is bounded by its steps alone (Σ ${sum} min, under the ${PLATFORM_CEILING_MIN}-minute ceiling)`);
         boundedBySteps++;
         continue;
       }

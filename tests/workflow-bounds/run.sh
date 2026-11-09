@@ -48,6 +48,33 @@
 #      string — the #637/#675 bypass class this guard would otherwise reintroduce.
 # 14.  MUTATION: add `timeout-minutes` to a step of a JOB with no job bound and no other bound step →
 #      STILL REFUSED. One bounded step is not a bounded job.
+# 15.  FIXTURE — a step-only job whose step bounds SUM to/above the 360-minute ceiling → REFUSED. With
+#      no job bound the platform's implicit 360 IS the bound, its trip is `cancelled` (NON-RED to the
+#      rail), so every step bound above it is decorative.
+# 16.  NON-VACUITY on the live tree: the one step-only job reports its sum UNDER the ceiling.
+# 17.  FIXTURE — a step-only job carrying ONE `${{ … }}` step bound → accepted WITH a visible NOTE.
+#      Σ is uncomputable then, so the reachability rule of arm 15 CANNOT be applied; certifying it
+#      silently is the false pass, which makes the NOTE the assertion.
+# 18.  FIXTURE — the same shape, but the NUMERIC bounds alone already reach 360 → REFUSED. An
+#      unevaluable step may not excuse a numeric subtotal that breaches the ceiling on its own.
+# 19.  FIXTURE — a job bound AT OR BELOW the sum of its own step bounds → REFUSED. The job's own trip
+#      is `cancelled` (NON-RED), so it PRE-EMPTS the red step bound that actually hung (#3242's class).
+# 20.  MUTATION of a TEMPLATE: delete a job bound from `templates/.github/workflows/` in a temp root →
+#      REFUSED, named as `templates/<file>::<job>`. That root is where a consumer's ONLY required check
+#      comes from, and nothing else byte-compares it (`workflow-drift` covers four files, not this one),
+#      so before this arm a bound deleted there was caught by nothing at all.
+# 21.  FIXTURE — a job bound under a step budget whose NUMERIC part alone breaches it, with one
+#      `${{ … }}` step bound present → REFUSED, and the finding discloses that only the numeric bounds
+#      were summed. Requiring ALL steps numeric (the first cut of the rule) let one expression switch the
+#      whole rule off silently — Finding A's class, on the job-bound branch.
+# 22.  FIXTURE — the same shape with the numeric subtotal safely under the job bound → accepted WITH a
+#      NOTE, because the expression bound's share was not checked. Not silent.
+# 23.  FIXTURE — a job with a bound, one UNBOUNDED step, and a step bound already beyond the job bound →
+#      accepted with the JOB-level NOTE, which must NAME the unreachable step bound (the header claims
+#      the NOTE covers this shape; before this arm it did not say so).
+# 24.  FIXTURE — a TEMPLATE caller naming the repo's root workflow by absolute slug → accepted, and the
+#      callee is audited from the ROOT root. `<slug>/…` names the repo root; `./…` is relative to the
+#      caller. Conflating them made a template caller report a present workflow as "does not exist".
 #
 # HERMETIC: fixtures + temp copies only; no network, no gh, no clock. The live tree is READ, never
 # written (the temp copy is where the mutations land).
@@ -110,7 +137,7 @@ for job in "ci.yml::bash-suites" "ci.yml::verify" "ci.yml::test" "pipeline-compl
   grep -q "^${job}	" "$OUT" && ok "--list names ${job}" || no "--list does NOT name ${job} (a vacuous or stale parse)"
 done
 count=$(grep -c '	' "$OUT")
-if [ "$count" -ge 40 ]; then ok "--list reports $count jobs (>= 40; the tree holds 47 today)"; else
+if [ "$count" -ge 40 ]; then ok "--list reports $count jobs (>= 40; both roots hold 60 today)"; else
   no "--list reports only $count jobs — the parse lost most of the tree"
 fi
 grep -q 'ci.yml::ci	(call → ' "$OUT" && ok "--list marks the reusable CALL job as a call, not as bounded" || no "call job not marked as a call"
@@ -253,6 +280,100 @@ node "$GUARD" >"$OUT" 2>"$ERR"
 grep -q 'bounded by its steps alone (Σ [0-9]* min, under the 360-minute ceiling)' "$OUT" \
   && ok "the live step-only job reports a sum under the ceiling" \
   || no "the live step-only job's sum is not reported under the ceiling"
+
+echo "== 17. FIXTURE: a step-only job with an UNEVALUABLE step bound must SAY so, never certify silently"
+run_case steps-expression-uncountable
+[ "$rc" -eq 0 ] && ok "steps-expression-uncountable → rc 0 (its numeric bounds are under the ceiling)" \
+  || { no "steps-expression-uncountable → rc $rc, expected 0"; sed -n '1,10p' "$ERR"; }
+grep -q 'x.yml::expr-under' "$OUT" && ok "the NOTE names the job whose sum could not be computed" \
+  || no "the unevaluable-sum exemption is SILENT (the job was certified with no note at all)"
+grep -q 'Σ could not be evaluated' "$OUT" && ok "the NOTE says Σ could not be evaluated" \
+  || no "the note does not say that the sum was uncomputable"
+grep -q 'reachability rule was NOT applied' "$OUT" && ok "the NOTE says the ceiling rule was NOT applied (not silently passed)" \
+  || no "the note does not say the rule was skipped"
+
+echo "== 18. FIXTURE: an unevaluable step bound does not excuse a NUMERIC subtotal already at the ceiling"
+run_case steps-expression-over
+[ "$rc" -eq 1 ] && ok "steps-expression-over → rc 1" || no "steps-expression-over → rc $rc, expected 1"
+grep -q 'x.yml::expr-over' "$ERR" && ok "the refused job is named" || no "the refused job was not named"
+grep -q 'SUM to 400 min' "$ERR" && ok "the finding names the numeric SUM against the ceiling" \
+  || no "the ceiling reason is missing"
+grep -q 'only the 2 numeric ones are summed here' "$ERR" && ok "the finding says it summed only the numeric bounds" \
+  || no "the finding does not disclose that an expression bound was left out of the sum"
+
+echo "== 19. FIXTURE: a job bound AT OR BELOW the sum of its own step bounds"
+run_case job-bound-below-steps
+[ "$rc" -eq 1 ] && ok "job-bound-below-steps → rc 1" || no "job-bound-below-steps → rc $rc, expected 1"
+grep -q 'x.yml::bound-too-low' "$ERR" && ok "the refused job is named" || no "the refused job was not named"
+grep -q 'SUM to 40 min' "$ERR" && ok "the finding names the step SUM against the job bound" \
+  || no "the finding does not name the sum"
+grep -q 'PRE-EMPTS\|pre-empts' "$ERR" && ok "the finding says WHY (the non-red job trip pre-empts the red step)" \
+  || no "the finding does not say why it matters"
+
+echo "== 20. MUTATION of a TEMPLATE: delete one job's bound under templates/"
+mkdir -p "$TMPROOT/tpl"
+cp -R "$ROOT/.github" "$TMPROOT/tpl/.github"
+mkdir -p "$TMPROOT/tpl/templates"
+cp -R "$ROOT/templates/.github" "$TMPROOT/tpl/templates/.github"
+TPL="$TMPROOT/tpl/templates/.github/workflows/pipeline-compliance.yml"
+if ! grep -q '^    timeout-minutes:' "$TPL"; then
+  no "templates/pipeline-compliance.yml carries no job-level bound to mutate — the template arm cannot be trusted"
+else
+  grep -v '^    timeout-minutes:' "$TPL" > "$TPL.new"; mv "$TPL.new" "$TPL"
+  node "$GUARD" --root "$TMPROOT/tpl" >"$OUT" 2>"$ERR"
+  rc=$?
+  [ "$rc" -eq 1 ] && ok "template bound deleted → rc 1" || no "template bound deleted → rc $rc, expected 1"
+  grep -q 'templates/pipeline-compliance.yml::pipeline-compliance' "$ERR" \
+    && ok "the mutated TEMPLATE job is named" \
+    || no "the template root is NOT audited — a bound deleted there is caught by nothing"
+fi
+
+# ── the templates root is scanned at all: non-vacuity, so the arm above cannot pass by scanning nothing
+node "$GUARD" --list >"$OUT" 2>"$ERR"
+grep -q '^templates/python-ci.yml::typecheck	' "$OUT" \
+  && ok "--list shows a template job, so the templates root is really scanned" \
+  || no "--list shows NO template job — the second root is not being read"
+
+echo "== 21. FIXTURE: a job bound breached by the NUMERIC step subtotal alone (an expression is present)"
+run_case job-bound-expression-over
+[ "$rc" -eq 1 ] && ok "job-bound-expression-over → rc 1" || no "job-bound-expression-over → rc $rc, expected 1"
+grep -q 'x.yml::bound-under-expr' "$ERR" && ok "the refused job is named" || no "the refused job was not named"
+grep -q 'only the 1 numeric ones are summed here' "$ERR" \
+  && ok "the finding discloses that an expression bound was left out of the sum" \
+  || no "the finding certifies a sum without disclosing the expression it skipped"
+grep -q 'No job bound can sit above 400' "$ERR" \
+  && ok "the remedy offered is one that EXISTS (no bound above Σ inside the ceiling)" \
+  || no "the remedy prescribes a job bound that cannot exist"
+
+echo "== 22. FIXTURE: a job bound above an UNCOMPUTABLE step budget must SAY so"
+run_case job-bound-expression-uncountable
+[ "$rc" -eq 0 ] && ok "job-bound-expression-uncountable → rc 0 (its numeric subtotal is under the bound)" \
+  || { no "job-bound-expression-uncountable → rc $rc, expected 0"; sed -n '1,10p' "$ERR"; }
+grep -q 'x.yml::bound-under-uncountable' "$OUT" \
+  && ok "the NOTE names the job whose step budget could not be fully summed" \
+  || no "the unevaluable job-bound rule is SILENT (one expression bound switched the rule off)"
+grep -q 'reachability rule was NOT applied to those' "$OUT" \
+  && ok "the NOTE says the reachability rule was NOT applied" \
+  || no "the note does not say the rule was skipped"
+
+echo "== 23. FIXTURE: the JOB-level NOTE must NAME a step bound already beyond the job bound"
+run_case job-bound-mixed-steps
+[ "$rc" -eq 0 ] && ok "job-bound-mixed-steps → rc 0 (a job bound is a valid backstop)" \
+  || { no "job-bound-mixed-steps → rc $rc, expected 0"; sed -n '1,10p' "$ERR"; }
+grep -q 'x.yml::mixed is bounded only at the JOB level' "$OUT" \
+  && ok "the JOB-level note is emitted" || no "the JOB-level note is missing"
+grep -q 'step bound(s) here are at or above 20 min and can never fire' "$OUT" \
+  && ok "the note NAMES the unreachable step bound" \
+  || no "the note claims coverage without naming the step bound that can never fire"
+
+echo "== 24. FIXTURE: an absolute-slug callee from a TEMPLATE caller resolves to the ROOT root"
+run_case caller-cross-root
+[ "$rc" -eq 0 ] && ok "caller-cross-root → rc 0 (the callee exists in the repo ROOT)" \
+  || { no "caller-cross-root → rc $rc, expected 0"; grep '   •' "$ERR" | head -3; }
+node "$GUARD" --root "$FIX/caller-cross-root" --list >"$OUT" 2>"$ERR"
+grep -q '^callee-root.yml::root-job	' "$OUT" \
+  && ok "the root callee's job is audited (the call was followed)" \
+  || no "the callee was not followed — an absolute slug was resolved into the caller's own root"
 
 echo
 if [ "$fail" -eq 0 ]; then

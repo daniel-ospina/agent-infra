@@ -1,0 +1,9 @@
+name: fixture caller-cross-root — a TEMPLATE job calling the repo's root workflow
+on:
+  workflow_call:
+jobs:
+  calls-root:
+    # `<slug>/.github/workflows/<f>@<ref>` names the REPO ROOT, not a template sibling. Resolving this
+    # into the caller's own root made the guard report a present workflow as "does not exist" — a false
+    # violation produced by the second root this PR added, so it needs its own arm.
+    uses: daniel-ospina/agent-infra/.github/workflows/callee-root.yml@main

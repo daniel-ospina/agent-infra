@@ -1,0 +1,16 @@
+name: fixture a job with a bound, an unbounded step, AND a step bound beyond the job bound
+on:
+  pull_request:
+jobs:
+  mixed:
+    # One step carries no bound at all, so the all-steps-bounded rule cannot fire and the JOB-level NOTE
+    # is what reports this job. The 400-min step bound can never fire under a 20-min job bound, so the
+    # NOTE must name it — otherwise the header's claim that the NOTE "covers" this shape is false.
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: a bound that is already unreachable
+        timeout-minutes: 400
+        run: echo hi
+      - name: no bound here at all
+        run: echo hi

@@ -505,12 +505,14 @@ jobs:
     # Task 1 local env, the `test` job, and ci-main's python-ci caller — a
     # 3.11/3.12 divergence would pass PR CI and only break post-merge.
     runs-on: ubuntu-latest
-    # #2055 — this job carries NO job-level bound on purpose: it has 65 steps, and a 65-step job
+    # #2055 — this job carries NO job-level bound on purpose: it has 66 steps, and a 66-step job
     # cannot keep `job-bound > Σ step-bounds` under the platform's 360-minute ceiling — an invariant
     # `scripts/check-ci-lane-parity.mjs` refuses to see broken. So EVERY step below carries its own
-    # bound (sum 322 min), sized from that STEP's measured max over 12 completed runs
+    # bound (sum 326 min), sized from that STEP's measured max over 12 completed runs
     # (2026-11-09; the two heavy ones are the finished-lane reaper's mutation control at 7.3 min and
-    # its suite at 2.2 min). A step trip is `failure` — RED — which is the property a job bound
+    # its suite at 2.2 min) — with ONE stated exception: the #718 hub-sweep step landed on main after
+    # that measurement, so it has no 12-run series yet and its bound is sized from its own documented
+    # wall clock instead (see its comment). Every other bound below is a 12-run p90. A step trip is `failure` — RED — which is the property a job bound
     # (`cancelled`, NON-RED to the rail, #3242) cannot provide. This is the amended indicator (b) of
     # this issue applied honestly rather than a bound that is only decorative.
     #
@@ -1274,6 +1276,12 @@ jobs:
         # Zero-dep (`node:*` + the `git` binary), no `npm ci`, ~5s.
         run: node extensions/main-worktree-guard/test-command-position.mjs
       - name: main-worktree-guard hub working-tree SWEEP detection (#718)
+        # Sized from this step's own documented wall clock (~16s: a dozen deliberate `pause(1600)`
+        # bursts inside the arms), NOT from a 12-run p90 — the step landed on main today (#3781), so
+        # no completed-run series exists for it yet. 4 min matches the seven sibling
+        # `main-worktree-guard` steps in this job (all 4), i.e. ~15x headroom. Re-derive from the
+        # 12-run p90 once that series exists.
+        timeout-minutes: 4
         # #718 (2026-09-10): a session authored six artifacts in the shared hub
         # — one new untracked skill DIRECTORY, four tracked SKILL.md edits, one
         # new doc — and a concurrent session returned the hub to `main`. ALL SIX
