@@ -307,7 +307,7 @@ DEPLOY_SET=()
 # (cloud-cell-supervisor.sh:2403 via `seed_one`; deploy-mac-orchestrator.sh:304-307 copies the whole
 # nested entry), and it is LIVE wherever the adapter is not: every carrier now puts `$O/gh-rest` FIRST
 # and `$O/gh-limit` second (cloud-cell-supervisor.sh:4119; deploy-crossbox.sh:213;
-# orch-loop.sh:149-150), so a box whose pin predates the adapter — it ships `gh-limit`, not
+# orch-loop.sh:148-149), so a box whose pin predates the adapter — it ships `gh-limit`, not
 # `gh-rest` — is the state `check` only WARNS about (cloud-cell-supervisor.sh:3170-3171), and there
 # `gh` resolves to a stale deployed `gh-limit/gh` on EVERY gh call. ⛔ This sentence used to say `$O/gh-limit` is FIRST, which #2039 made false; the CONCLUSION is
 # unchanged (reachable and live on the pin class above), which is why the file stays in the compared
