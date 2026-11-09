@@ -1192,11 +1192,20 @@ verify_review_evidence() { # <ref> <head_sha> [polarity] -> 0 = verified
   #         with no `threats=`/`covered=` it is a cannot-verify, exactly as (iii). The TERSE
   #         `residuals=none` form still passes — demanding the counts would re-create the friction
   #         #1889 exists to remove. (iv), below, refuses a CONTRADICTION between the counts.
+  #   (iv)  THE COUNTS MUST IDENTIFY ONE PAIR, ON THE MARKER'S OWN LINE. A field that appears MORE THAN
+  #         ONCE with different values (`threats=17 … threats=12`), or a count pair that sits earlier on
+  #         the line than the marker's own, leaves no single pair to compare — a cannot-verify, exactly
+  #         as (iii). With one value per field, `covered` below `threats` REFUSES. The comparison is
+  #         NUMERIC, so `threats=09 covered=9` is EQUAL, not a contradiction.
+  # `residuals=` tolerates a SPACE after the `=` (`residuals= none`), which is the spelling a human
+  # types; the extractor below carries `[[:space:]]*` so the allowance is reachable, and every
+  # near-miss (`none,#12`, `none-filed`, the template) still refuses.
   # The field is read on the marker's OWN line. The body arrives @tsv-escaped, so a newline is the
   # two characters `\n`; real newlines are normalised to that same literal first, and a WRAPPED
   # marker whose field fell onto the next line therefore REFUSES instead of being guessed at.
   if grep -qiE '\[ADVERSARIAL-BOUND\]' <<<"$body"; then
     local _ab_norm _ab_sep _ab_rest _ab_line _ab_f _ab_v _ab_seen _ab_n _ab_ok _ab_bad _ab_t _ab_c
+    local _ab_tset _ab_cset _ab_nt _ab_nc _ab_num
     _ab_sep=$'\\n'                  # the two characters backslash+n — @tsv's escape for a newline
     _ab_norm="${body//$'\n'/"$_ab_sep"}"   # real newlines → that same literal, so ONE splitter covers both
     _ab_rest="$_ab_norm"
@@ -1211,15 +1220,37 @@ verify_review_evidence() { # <ref> <head_sha> [polarity] -> 0 = verified
       # cannot disagree about whether there is a marker to judge. (Pinned by 13m6h.)
       if grep -qiE '\[ADVERSARIAL-BOUND\]' <<<"$_ab_line"; then
         _ab_ok=1; _ab_n=0; _ab_seen=""
-        # (iv) A CONTRADICTORY DISCLOSURE IS NOT A CLEAN ONE, and this runs FIRST: `covered` below
-        # `threats` is the artifact's OWN admission that a declared class was not covered, so no value
-        # can rescue it — and refusing it here is what keeps a filed list from laundering an uncovered
-        # surface, which is the one fail-open the count-based acceptance could otherwise open. Both
-        # fields are already on the line being parsed, so the check is a comparison, not a second
-        # parser. ⛔ DELIBERATELY NOT A COMPLETENESS TEST: when either field is ABSENT the comparison is
+        # (iv) THE COUNTS MUST IDENTIFY ONE PAIR — and a CONTRADICTORY pair is not a clean one. This
+        # runs FIRST: `covered` below `threats` is the artifact's OWN admission that a declared class
+        # was not covered, so no value can rescue it, and refusing it here is what keeps a filed list
+        # from laundering an uncovered surface (the one fail-open the count-based acceptance could open).
+        # ⛔ THE EXTRACTION IS PART OF THE CHECK (agent-infra#3829 F1, measured at `436b0a81`). The first
+        # cut read the FIRST `threats=` and the FIRST `covered=` on the line INDEPENDENTLY (`command
+        # head -n 1`, once per field), so the pair the comparison saw was not necessarily the marker's
+        # own: an earlier EQUAL pair on the same line shadowed a later contradiction and the artifact
+        # minted `clean` while its own marker admitted `covered < threats` — three shapes, e.g.
+        # `[ADVERSARIAL-BOUND] cycles=2 threats=17 covered=17 residuals=#970; also threats=12 covered=9`.
+        # It also compared the digits as STRINGS, so `threats=09 covered=9` was refused as "a declared
+        # class was NOT covered" when 9 == 9. So: collect EVERY value of each field, normalise it
+        # NUMERICALLY, and refuse when a field carries more than one distinct value — a line declaring
+        # two different `threats=` (or two `covered=`) has no single pair to compare, exactly like (iii).
+        # ⛔ DELIBERATELY NOT A COMPLETENESS TEST: when either field is ABSENT the comparison is
         # skipped, the terse forms still pass, and only the FILED value (v) requires the counts.
-        _ab_t="$(printf '%s' "$_ab_line" | grep -oiE 'threats=[0-9]+' | command head -n 1 | tr -dc '0-9')"
-        _ab_c="$(printf '%s' "$_ab_line" | grep -oiE 'covered=[0-9]+' | command head -n 1 | tr -dc '0-9')"
+        _ab_tset="$(printf '%s' "$_ab_line" | grep -oiE 'threats=[0-9]+' | grep -oE '[0-9]+' \
+          | while IFS= read -r _ab_num; do printf '%s\n' "$((10#${_ab_num}))"; done \
+          | sort -u | tr '\n' ' ' | sed 's/^ *//; s/ *$//' || true)"
+        _ab_cset="$(printf '%s' "$_ab_line" | grep -oiE 'covered=[0-9]+' | grep -oE '[0-9]+' \
+          | while IFS= read -r _ab_num; do printf '%s\n' "$((10#${_ab_num}))"; done \
+          | sort -u | tr '\n' ' ' | sed 's/^ *//; s/ *$//' || true)"
+        _ab_nt=0; for _ab_num in $_ab_tset; do _ab_nt=$((_ab_nt + 1)); done
+        _ab_nc=0; for _ab_num in $_ab_cset; do _ab_nc=$((_ab_nc + 1)); done
+        if [ "$_ab_nt" -gt 1 ] || [ "$_ab_nc" -gt 1 ]; then
+          _ab_bad=1
+          _ab_seen="the marker line declares MORE THAN ONE count value (threats='${_ab_tset:-none}' covered='${_ab_cset:-none}') — the marker's own pair cannot be identified, so this is a cannot-verify, not a clean exit"
+          break
+        fi
+        _ab_t="$_ab_tset"
+        _ab_c="$_ab_cset"
         if [ -n "$_ab_t" ] && [ -n "$_ab_c" ] && [ "$_ab_t" != "$_ab_c" ]; then
           _ab_bad=1
           _ab_seen="threats=${_ab_t} but covered=${_ab_c} — a declared class was NOT covered, so this cannot be a clean exit"
@@ -1239,7 +1270,13 @@ verify_review_evidence() { # <ref> <head_sha> [polarity] -> 0 = verified
           # `none`, `<`, `>`, `…`.
           if [ "$_ab_ok" -ne 1 ] && [ -n "$_ab_t" ] && [ "$_ab_t" = "$_ab_c" ] && ! grep -qiE 'none|<|>|…' <<<"$_ab_v" && grep -qE '[0-9]' <<<"$_ab_v"; then _ab_ok=1; fi
           [ "$_ab_ok" -eq 1 ] || break
-        done < <(printf '%s' "$_ab_line" | grep -oiE 'residuals=[^[:space:]]*' || true)
+        # ⛔ `[[:space:]]*` AFTER THE `=` IS LOAD-BEARING, AND IT HAS TO BE REACHABLE (#3829 review). The
+        # predicate above accepts `residuals= none` — the spelling a human types — but the first
+        # extractor was `residuals=[^[:space:]]*`, which can never yield a space after the `=`, so that
+        # allowance was dead code and the human spelling was refused with `(residuals=)`. The extractor
+        # now consumes the spaces too; every near-miss (`none,#12`, `none-filed`, the template, an EMPTY
+        # value, and a field that WRAPPED onto the next line) still refuses.
+        done < <(printf '%s' "$_ab_line" | grep -oiE 'residuals=[[:space:]]*[^[:space:]]*' || true)
         if [ "$_ab_ok" -ne 1 ] || [ "$_ab_n" -eq 0 ]; then
           _ab_bad=1
           if [ "$_ab_n" -eq 0 ]; then _ab_seen='no residuals= field on the marker line'; fi

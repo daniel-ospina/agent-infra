@@ -1949,16 +1949,24 @@ off macOS (it renders a launchd plist) — the portability that matters is `orch
    contradiction, not a clean exit); and (v) a **FILED list with no counts** — its legality rests on
    the coverage comparison, so without both counts it is a cannot-verify, like (iii). The TERSE
    `residuals=none` form needs no counts and still passes: only a CONTRADICTION refuses, so demanding
-   the counts would re-create the friction #1889 removed. The comparison takes the FIRST
-   `threats=`/`covered=` on the line, so a cycle-log line that mentions an earlier `covered=` before
-   the marker's own fields is refused too — fail-closed, and diagnosed by the refusal message.
-   ⛔ **THE REMAINING SEAM, stated rather than hidden:** a capped run that substituted equal counts and
-   filed nothing writes `residuals=none` and mints; the two exits cannot be told apart in-band (the
-   capped emission carries the same text). Omitting the marker was always available, so this is not a
-   new capability — but the gate's claim is "the disclosure is checked", not "the exit label is
-   re-derived". Matching the bare token refused the honest case — the lane whose verifier returned
-   `THREAT SURFACE COVERED` with nothing filed — which made the cheapest way to pass be DROPPING the
-   mandated disclosure, inverting the arm's own intent.
+   the counts would re-create the friction #1889 removed. The count fields must identify **ONE pair on
+   the marker's own line**: when a field appears more than once with DIFFERENT values (`threats=17 …
+   threats=12`), or a count pair sits earlier on the line than the marker's own, the marker's pair
+   cannot be identified and the arm refuses as a cannot-verify — an earlier EQUAL pair used to shadow a
+   later contradiction and let the artifact mint while its own fields admitted an uncovered class
+   (measured on three shapes, fixed in #3829), so a pasted cycle-log row carrying two pairs refuses and
+   the message names the ambiguity. The comparison is NUMERIC, so `threats=09 covered=9` is equal rather
+   than a false contradiction, and a space after the `=` (`residuals= none`) is accepted.
+   ⛔ **THE REMAINING SEAM, stated rather than hidden:** the capped emission
+   (`skills/code-review/references/fixer-loop.md` §"PR comment prefix") is
+   `threats=<K> covered=<K> residuals=<#N,…|none>` — equal counts BY CONSTRUCTION, and its own prose
+   files residuals — so a capped run writes either `residuals=none` or its filed list and mints; the two
+   exits cannot be told apart in-band (the capped emission carries the same text). Omitting the marker
+   was always available, so this is not a new capability — but the gate's claim is "the disclosure is
+   checked", not "the exit label is re-derived", and #1269 owns the structural fix (a single-valued
+   exit field, as every comparable does it). Matching the bare token refused the honest case — the lane
+   whose verifier returned `THREAT SURFACE COVERED`, with or without filed residuals — which made the
+   cheapest way to pass be DROPPING the mandated disclosure, inverting the arm's own intent.
 3. **Scope adapts to the queue — and can be pinned.** `open PRs > 10` → **broad** mode: the sweep
    covers every non-draft PR in the repo except the branch classes it deliberately never touches
    (`design/`, `scope/`, `dependabot/` — the selector is
