@@ -1022,9 +1022,10 @@ def _strip_comment(line):
         (`scripts/pi-reap-idle.sh`, inventing `prints`). So of the SIX members of the set — SPACE, TAB, `;`,
         `|`, `&`, `(` — five are unpinned and the SPACE is pinned: read the member, not the guard.
       * `_openers` DOUBLE-quote state — `echo "a <<b"` then a real heredoc loses every definition after it.
-        This one is NOT hypothetical: it moves 5 files and invents `pass` in `pr-path-reads.test.sh`, so
-        the namespace arm's own direction is exposed — and it is still unpinned, because no arm scans that
-        population.
+        This one is NOT hypothetical: it moves 5 files, and in `pr-path-reads.test.sh` it RECOVERS a real
+        definition the baseline misses — `pass()`, defined inside a `then` branch that the phantom opener
+        swallows. So the guard protects the namespace arm's own false-PASS direction, and it is still
+        unpinned, because no arm scans that population.
       * `_openers` backslash escape — it takes the escape and the OPENER on ONE logical line to separate it:
         `echo \" ; cat <<EOF` plus a body invents the body line (FALSE RED). A two-line spelling does not
         discriminate, because `quote` is per-call and an unclosed quote carries nowhere. Moves 0.
@@ -1036,9 +1037,10 @@ def _strip_comment(line):
         disagree there. ⛔ "EXECUTING errors" was wrong here until it was measured: only `source` does.
 
     PINNED, and the one case worth naming because it looks like the five above: the delimiter charset
-    `_.-` on the PLAIN path moves 3 files but also truncates the four `EOF*` delimiters in `repo-set.sh`,
-    losing 14 of its 26 definitions — so `_reader_defs_n` drops below the floor and `f11f` reds at 245/1.
-    The suite DOES catch that one; do not "declare" it.
+    `_.-` on the PLAIN path moves 3 files but also truncates the three `EOF_*` delimiters in `repo-set.sh`
+    (`EOF_NORM`, `EOF_STATE_KEY`, `EOF_GOT`; the bare `EOF` carries no charset character and is never
+    affected), losing 14 of its 26 definitions — so `_reader_defs_n` drops below the floor and `f11f`
+    reds at 245/1. The suite DOES catch that one; do not "declare" it.
 
     NOT REACHED BY THIS POPULATION — and NOT because they are inert, which is the distinction that matters:
     `_strip_comment`'s SINGLE-quote state, its DOUBLE-quote state, and its backslash escape each move 0 of
