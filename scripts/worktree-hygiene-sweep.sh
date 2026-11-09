@@ -124,15 +124,39 @@ PREFLIGHT_ONLY=0
 # a home directory never is, so there is none: the value is DECLARED (the plist renders `--repo`
 # explicitly) or DERIVED from a candidate that proves itself, or the pass refuses.
 REPO="${REPO:-}"
-# The candidates, in the order #1974 states (the operator's own variables, then the current
-# directory). ⛔ A CANDIDATE IS NOT A DEFAULT: `repo-slug.sh`'s `resolve_repo` uses one only after
-# PROVING it is a git checkout (and, when a queue target `$OR` is declared, that its `origin` names
-# that target), and says which value it derived. `$PWD` failed precisely because nothing proved it —
-# under launchd `$PWD` is `/`, a real directory that is not a repo.
+# ⛔ THE OPERATOR VARIABLE IS AN INPUT OF THE DERIVATION — OFFERED ALONE, NEVER AS A CO-EQUAL
+# CANDIDATE BESIDE THE CWD (fresh-context review of #3833, F2, and #3849 review round 1, where the
+# RECORDED review grades it P1: "### P1 — scripts/worktree-hygiene-sweep.sh:126 — $TORTOISE_REPO stops
+# being a *proven* candidate and becomes a *deciding* value, so resolve_repo's $OR identity proof no
+# longer applies to it" (quoted whole — a truncated quote closed as if complete is the class this
+# comment is apologising for). The independently-dispatched review of
+# the same head graded it P2; both name this one finding, and the round is named here because the
+# grade is not what carries it — the measurement below is).
+# WHY NOT BESIDE `$PWD` (F2): #1974 §1 names `$TORTOISE_REPO`/`$TORTOISE` as an INPUT, and before
+# #1974 it DECIDED (`REPO="${TORTOISE_REPO:-$HOME/eldato/tortoise}"`). Offering it as ONE candidate
+# beside `$PWD` demoted a value the box explicitly declares to a TIE, so a box that names its target
+# AND happens to stand in another checkout got rc 3 "2 candidate checkouts qualify" instead of its
+# declared target — a false block in a pass that can REMOVE worktrees. Measured at 0b34b28c6: rc=3,
+# while the base resolved to the declared checkout.
+# WHY NOT IN THE DECLARED CHANNEL (`REPO="${REPO:-${TORTOISE_REPO:-…}}"`, the first shape of this
+# fix): `resolve_repo` applies §1's SECOND proof — "its `origin` remote names exactly `$OR`" — ONLY
+# inside the candidate loop. A value moved up to `REPO` is checked by `rev-parse --show-toplevel`
+# alone, so a box that declares `$TORTOISE_REPO` and `$OR` would sweep a checkout of a DIFFERENT repo
+# (measured: with `OR=daniel-ospina/agent-infra` and `TORTOISE_REPO` naming a `tortoise` checkout,
+# the declared shape drove the tortoise checkout, while the candidate shape REFUSED it). #1974 §1
+# names this variable *inside* the proven derivation, so it stays there: the tie is what §1 does not
+# ask for, the proof is what it does.
+# ⛔ THE COST OF THAT CHOICE, STATED RATHER THAN HIDDEN: when the operator variable IS declared and
+# FAILS its proof, this pass now REFUSES instead of silently falling through to whatever directory
+# the operator stood in — which is the fail-closed direction §3's rule implies ("a DECLARED value is
+# never silently replaced"). Nothing else changes: `--repo` still bypasses the derivation (§3), the
+# armed plist still renders `--repo {{TORTOISE_REPO}}` explicitly, and with nothing declared the cwd
+# is offered exactly as before.
 # ⛔ ONE PATH PER LINE (`repo-slug.sh` reads the list with `read -r`, never word-splitting): a checkout
 # under a directory with a space in its name is ORDINARY in this repo, and a space-joined list split it
 # into two candidates that could never prove themselves (fresh-context review of #3833, F1).
-REPO_CANDIDATES="$(printf '%s\n' "${TORTOISE_REPO:-${TORTOISE:-}}" "$PWD")"
+REPO_CANDIDATES="${TORTOISE_REPO:-${TORTOISE:-}}"
+[ -n "$REPO_CANDIDATES" ] || REPO_CANDIDATES="$PWD"
 ENGINE=""
 AGED_DAYS=7
 BACKUP_DIR="${HYGIENE_BACKUP_DIR:-$HOME/orchestrator/state/reaped-patches}"
