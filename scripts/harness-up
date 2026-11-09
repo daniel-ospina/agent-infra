@@ -119,8 +119,11 @@
 # so the skip below is for a box that has never been installed, not for "the Mac".
 set -uo pipefail
 
-SELF_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SELF="$SELF_PATH/$(basename "${BASH_SOURCE[0]}")"
+# ⛔ THE SELF PATH COUNTS ONLY WHEN IT NAMES THIS FILE — see `lib/cell-home.sh` §CONSUMERS.
+_SELF="${BASH_SOURCE[0]:-}"; [ -f "$_SELF" ] || _SELF=""     # under `bash -s` $0 is literally `bash` -> `.`
+SELF_PATH=""
+if [ -n "$_SELF" ]; then SELF_PATH="$(cd "$(dirname "$_SELF")" && pwd)"; SELF="$SELF_PATH/$(basename "$_SELF")";
+else SELF="${0:-harness-up}"; fi   # a piped start keeps a COHERENT name in the warnings below
 
 log_line()  { printf '%s\n' "$*"; }
 warn() { printf 'harness-up: %s\n' "$*" >&2; }
@@ -580,8 +583,23 @@ case "$HU_OS" in
 esac
 
 # ── configuration: ONE resolution, the child never re-derives it ─────────────────────────────────
-CELL_HOME="${CELL_HOME:-}"
-[ -n "$CELL_HOME" ] || CELL_HOME="${HOME:-/tmp/cell-home}"
+# ⛔ THE ONE HOME (agent-infra#3453): the fallback here used to be the LEGACY volatile
+# `/tmp/cell-home`, so a run with `HOME` unset handed every child a home no other unit agreed with —
+# the split whose symptom is "the credential exists and `git push` still answers 403". The rule, the
+# precedence and the ONLY literal live in `scripts/lib/cell-home.sh`: a sibling in a checkout and in
+# the farm (`pi-bootstrap/setup.sh`'s `lib_srcs`), and a copy without it falls back to `$HOME` (the
+# one home on a compliant cell) — never the legacy path.
+CELL_HOME_LIB=""
+# ⛔ WITHOUT A SELF PATH THERE IS NO SIBLING TO TRUST (review F6 round 5): an empty `SELF_PATH` built
+# `/lib/cell-home.sh` and `/../lib/cell-home.sh` — absolute paths outside any checkout. Nested inside the
+# guard, like the 11 sibling consumers, so a piped start takes the documented `$HOME` fallback.
+if [ -n "${SELF_PATH:-}" ]; then
+  for _cand in "$SELF_PATH/lib/cell-home.sh" "$SELF_PATH/../lib/cell-home.sh"; do
+    [ -r "$_cand" ] && { CELL_HOME_LIB="$_cand"; break; }
+  done
+fi
+if [ -n "$CELL_HOME_LIB" ]; then . "$CELL_HOME_LIB"; CELL_HOME="$(cell_home_resolve)"; else CELL_HOME="${CELL_HOME:-${HOME:-}}"; fi
+[ -n "$CELL_HOME" ] || die "neither CELL_HOME nor HOME is set, so the cell home cannot be derived — refusing to default it to the legacy /tmp/cell-home (agent-infra#3453)" 2
 O="${A_O:-${O:-}}"
 # ⛔ A TRAILING SLASH IS THE SAME DIRECTORY: one spelling reaches the rows, the delegation and the
 # drift check (a spelling difference is not a difference in what the box runs).

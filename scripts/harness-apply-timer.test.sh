@@ -57,6 +57,14 @@ assert_file()     { if [ -f "$1" ]; then ok "$2"; else bad "$2 (missing file: $1
 say_case()        { echo; echo "── $* ──"; }
 
 T="$(mktemp -d "${TMPDIR:-/tmp}/harness-apply-test.XXXXXX")" || { echo "cannot create a temp dir"; exit 1; }
+# ⛔ THE CONTROLLER UNIT IS A HOST PATH, SO IT IS PINNED SHUT FOR THE WHOLE SUITE (review F1, measured).
+# `/etc/systemd/system/eldato-orchestrator.service` EXISTS on a cell and pins `CELL_HOME=/tmp/cell-home`,
+# so without this the split guard would red 11 arms on a cell and pass on a Mac — a host assumption, not
+# a product defect (the same class `HARNESS_APPLY_DRIFT_CHECK=0` and `acct_stub` remove). It is exported
+# so the INSTALLER's `--status`/`--dry-run` (which exec the pass with this shell's env) inherits it too;
+# the `env -i` arms below name it explicitly. T27 drives the seam with REAL rendered units, which is
+# where the behaviour is measured.
+export HARNESS_APPLY_CONTROLLER_UNIT="$T/no-controller.service"
 cleanup() { rm -rf "$T"; }
 trap cleanup EXIT
 
@@ -121,8 +129,38 @@ run_pass() {
     HARNESS_PIN="$d/home/.pi/agent/state/HARNESS-PIN" HARNESS_PIN_FILE="$d/home/.harness-path" \
     HARNESS_PIN_DIR="$d/home/harness" CELL_HOME="${CELL_HOME_P:-$d/home}" O="$d/home/orchestrator" \
     HARNESS_APPLY_SYNC_CMD="${HARNESS_APPLY_SYNC_CMD:-$T/sync-stub.sh}" \
+    HARNESS_APPLY_CONTROLLER_UNIT="${CONTROLLER_UNIT_P:-$T/no-controller.service}" \
     bash "${PASS_UNDER_TEST:-$PASS_SH}" "$@"
 }
+
+# ⛔ acct_stub <dir> <home> — print a PATH entry whose `getent` answers <home> for the account lookup.
+# WHY THIS EXISTS (agent-infra#3453). The pass now DERIVES `CELL_HOME` instead of reading `$HOME`, and the
+# derivation's precedence puts the PASSWD record's home AHEAD of `$HOME`. The shipped unit sets HOME and
+# NOT CELL_HOME, so a fixture that overrides only HOME no longer controls the home the pass resolves: the
+# real account lookup answers the HOST's home (`/home/runner` on a CI runner, `/home/cmux` on a cell),
+# which escapes this suite's temp tree. MEASURED before this seam: 7 legs red on the `cmux` cell (T16 ×2,
+# T26 ×5, T26 reported `got '24'` because it tried to read the box's REAL pin record) and
+# `279 passed, 0 failed` on origin/main — i.e. a host assumption in the fixture, not a product defect.
+# Stubbing the account lookup is the SAME seam `scripts/lib/cell-home.test.sh` uses for the same reason,
+# and it keeps every arm below faithful to the ACTUAL unit artifact (HOME, no CELL_HOME).
+acct_stub() { # <dir> <home>
+    local d="$1" h="$2"
+    mkdir -p "$d" || return 1
+    {
+        printf '#!/usr/bin/env bash\n'
+        printf 'case "${1:-}" in\n'
+        printf '  passwd) printf "%%s:x:1000:1000::%s:/bin/bash\\n" "${2:-$(id -un)}" ;;\n' "$h"
+        printf 'esac\n'
+    } >"$d/getent"
+    chmod +x "$d/getent"
+    printf '%s\n' "$d"
+}
+
+# NON-VACUITY: the stub must BE the account lookup, or every arm that relies on it silently grades the
+# host instead of the fixture (the exact failure this seam exists to remove).
+assert_eq "$(PATH="$(acct_stub "$T/acct-selfcheck" "$T/acct-selfcheck-home"):$PATH" \
+  getent passwd "$(id -un)" | awk -F: 'NR==1{print $6}')" "$T/acct-selfcheck-home" \
+  "fixture: the account stub answers the fixture home, so no env -i arm below reads the HOST's home"
 
 mkdir -p "$T/home-directory"   # so $T itself is never an unset-HOME fallback
 
@@ -558,7 +596,7 @@ say_case "T16 the pass runs from the unit's own environment"
 mk_origin t16; mk_clone t16; write_sync_stub
 REPO_P="$CLONE"; MODE_P=sync
 mkdir -p "$T/t16/state" "$T/t16/home"
-OUT="$(env -i HOME="$T/t16/home" PATH="$PATH" \
+OUT="$(env -i HOME="$T/t16/home" PATH="$(acct_stub "$T/t16/acct" "$T/t16/home"):$PATH" HARNESS_APPLY_CONTROLLER_UNIT="$T/no-controller.service" \
     HARNESS_APPLY_REPO="$CLONE" HARNESS_APPLY_REF=origin/main HARNESS_APPLY_MODE=sync \
     HARNESS_APPLY_STATE_DIR="$T/t16/state" HARNESS_APPLY_SYNC_CMD="$T/sync-stub.sh" \
     bash "$PASS_SH" 2>&1)"; RC=$?
@@ -569,7 +607,7 @@ assert_contains "$REC16" "ref=$(printf '%s' "$(git -C "$T/o-t16" rev-parse main)
 assert_absent "$OUT" "no checkout resolved" "T16 the P0 refusal text is absent"
 # ... and the same environment still HONOURS the direct-run names, so an operator's own invocation and
 # a unit-rendered one cannot resolve two different repos.
-OUT="$(env -i HOME="$T/t16/home" PATH="$PATH" HARNESS_REPO="$CLONE" HARNESS_REF=origin/main \
+OUT="$(env -i HOME="$T/t16/home" PATH="$T/t16/acct:$PATH" HARNESS_REPO="$CLONE" HARNESS_REF=origin/main HARNESS_APPLY_CONTROLLER_UNIT="$T/no-controller.service" \
     HARNESS_APPLY_MODE=sync HARNESS_APPLY_STATE_DIR="$T/t16/state" \
     HARNESS_APPLY_SYNC_CMD="$T/sync-stub.sh" bash "$PASS_SH" 2>&1)"; RC=$?
 assert_eq "$RC" "0" "T16 the direct-run names (HARNESS_REPO/HARNESS_REF) still work"
@@ -666,7 +704,8 @@ REPO_P="$CLONE"; MODE_P=sync
 mkdir -p "$T/t19/state"
 PYLAN="$(command -v python3 2>/dev/null || printf '/usr/bin/python3')"
 LAUNCHER_PY="$HERE/pi-reap-worktrees-launchd.py"
-env -i HOME="$T/t19/home" PATH="$PATH" HARNESS_APPLY_REPO="$CLONE" HARNESS_APPLY_REF=origin/main \
+env -i HOME="$T/t19/home" PATH="$(acct_stub "$T/t19/acct" "$T/t19/home"):$PATH" HARNESS_APPLY_CONTROLLER_UNIT="$T/no-controller.service" \
+    HARNESS_APPLY_REPO="$CLONE" HARNESS_APPLY_REF=origin/main \
     HARNESS_APPLY_MODE=sync HARNESS_APPLY_STATE_DIR="$T/t19/state" \
     HARNESS_APPLY_SYNC_CMD="$T/sync-stub.sh" \
     "$PYLAN" "$LAUNCHER_PY" --script "$PASS_SH" >"$T/t19/out" 2>"$T/t19/err"; RC=$?
@@ -675,6 +714,29 @@ assert_eq "$(wc -c <"$T/t19/err" | tr -d ' ')" "0" \
     "T19 NOTHING on stderr under bash -s (BASH_SOURCE is unset there; set -u used to print it every tick)"
 assert_contains "$(cat "$T/t19/out" 2>/dev/null || true)" "harness: mode=sync" "T19 and the pass really ran"
 assert_contains "$(cat "$T/t19/state/harness-apply.status" 2>/dev/null || true)" "rc=0" "T19 and it recorded a pass"
+
+# ── T19b: A PIPED START MUST NOT SOURCE THE RESOLVER OUT OF THE WORKING DIRECTORY ─────────────
+# ⛔ `bash -s` has no BASH_SOURCE **and its `$0` is literally `bash`**, so `dirname` answers `.` and a
+# naive `$SELF_DIR/lib/cell-home.sh` lookup becomes `$PWD/lib/cell-home.sh` — the pass would SOURCE
+# code from whatever directory it was started in, which is the same code-execution-from-CWD shape
+# `pi-bootstrap/cell-install.sh` refuses for a `keys.env` it does not own. (The earlier note that
+# `$HERE` is left EMPTY was wrong: it degrades to `.`.) The hostile library plants a marker, and the arm
+# asserts the marker is NEVER created — i.e. `$PWD/lib/` is not on the resolver search path at all.
+say_case "T19b a piped start does not source \$PWD/lib/cell-home.sh"
+mk_origin t19b; mk_clone t19b; write_sync_stub
+REPO_P="$CLONE"; MODE_P=sync
+mkdir -p "$T/t19b/state" "$T/t19b/cwd/lib"
+MARKER="$T/t19b/SOURCED-FROM-CWD"
+printf 'touch %s\n' "$MARKER" >"$T/t19b/cwd/lib/cell-home.sh"
+( cd "$T/t19b/cwd" && env -i HOME="$T/t19b/home" PATH="$(acct_stub "$T/t19b/acct" "$T/t19b/home"):$PATH" HARNESS_APPLY_CONTROLLER_UNIT="$T/no-controller.service" \
+    HARNESS_APPLY_REPO="$CLONE" HARNESS_APPLY_REF=origin/main \
+    HARNESS_APPLY_MODE=sync HARNESS_APPLY_STATE_DIR="$T/t19b/state" \
+    HARNESS_APPLY_SYNC_CMD="$T/sync-stub.sh" \
+    bash -s <"$PASS_SH" >"$T/t19b/out" 2>"$T/t19b/err" ); RC=$?
+assert_eq "$RC" "0" "T19b the piped start still runs (rc 0 — the guard does not break the entry point)"
+assert_eq "$([ -e "$MARKER" ] && echo SOURCED || echo clean)" "clean" \
+    "T19b …and it did NOT source \$PWD/lib/cell-home.sh (no code from the working directory)"
+assert_contains "$(cat "$T/t19b/out" 2>/dev/null || true)" "harness: mode=sync" "T19b …and the pass really ran"
 
 # ── T21: a FAILED fetch is cannot-verify, never "current" against a stale ref ────────────────
 # THE HEADLINE OF ONE REVIEW ROUND, and it had no test: the pass used to warn on stderr and compare
@@ -1001,6 +1063,26 @@ OUT="$(SYSTEMCTL_LAST_TRIGGER="Thu 2026-10-23 05:00:00 UTC" SYSTEMCTL_EXEC_TS="T
     SYSTEMCTL_CALLS=/dev/null bash "$INST" --status 2>&1)"; RC=$?
 assert_eq "$RC" "0" "T8b a completed pass with exit 0 and no record here is a note (names HARNESS_APPLY_STATE_DIR)"
 assert_contains "$OUT" "HARNESS_APPLY_STATE_DIR" "T8b and the note names the seam to check"
+# ⛔ THE VERDICT IS A LINE, NOT THE FIRST LINE (review P2-2, reproduced). `--print-status` now prints its
+# split-home reading BEFORE `status=` (and a hand-run's note on stderr, which this installer folds into
+# the same blob with `2>&1`), so `case "$REC" in status=never*)` — a PREFIX match on the whole blob —
+# stopped matching and EVERY no-record box fell to the failure arm: `--status` exited 1 for a HEALTHY
+# fresh install, and the three `never` diagnoses below became unreachable in exactly the state they
+# exist for. The stub pass prints that shape literally, so reverting the line-scan reds this arm.
+STUBP="$T/bin/pass-split-then-never"
+cat >"$STUBP" <<'SPLITSTUB'
+#!/usr/bin/env bash
+printf 'split_home=/x derived=/y from=unit why=[the controller pins another home] — two live homes\n'
+printf 'status=never pin=none — no pass has ever completed on this box (/x/state/harness-apply.status)\n'
+exit 3
+SPLITSTUB
+chmod +x "$STUBP"
+OUT="$(HOME="$T/t3/home" HARNESS_APPLY_PASS="$STUBP" HARNESS_APPLY_REPO="$REPO_P" \
+    HARNESS_APPLY_STATE_DIR="$T/t8b-state" SYSTEMD_UNIT_DIR="$FRESH2" SYSTEMCTL="$T/bin/systemctl" \
+    SYSTEMCTL_CALLS=/dev/null bash "$INST" --status 2>&1)"; RC=$?
+assert_eq "$RC" "0" "T8b a split-home reading BEFORE the verdict does not fail a fresh install's --status (the verdict is the status= LINE)"
+assert_contains "$OUT" "no pass has completed yet" "T8b …and the never-fired note is still reached through it"
+assert_contains "$OUT" "split_home=/x derived=/y" "T8b …and the reading itself is still reported, not swallowed"
 
 say_case "T14 a STALE pass record is an alarm, not a healthy silence"
 mk_origin t14; mk_clone t14; write_sync_stub
@@ -1817,7 +1899,7 @@ assert_contains "$OUT" "farm: UNKNOWN" "T24 control: and the line says the grade
 REC24U="$(cat "$T/t24u/state/harness-apply.status" 2>/dev/null || true)"
 assert_contains "$REC24U" "action=farm-unknown" "T24 control: the record names the unreadable grade"
 # ⛔ NO GRADE, BUT STILL A NAME (review round 13, reproduced). `check-farm-drift.sh` prints its per-file
-# rows BEFORE the exits that give up (:689 `matched -eq 0`, :699 mixed ungradeable), so "no grade" was
+# rows BEFORE the exits that give up (`matched -eq 0`, the mixed-ungradeable pair), so "no grade" was
 # never the same claim as "nothing was reported": measured, 2 UNSOURCED rows then exit 2 recorded
 # `farm_rows=not-graded` and named both files NOWHERE. The rows file is published when the instrument
 # printed anything, and `farm_n=not-graded` still says no grade was produced.
@@ -3614,10 +3696,28 @@ MAT
 # `run_pass_unit <case-dir>` — the pass under the rendered unit's environment.
 run_pass_unit() {
     local d="$1"; shift
-    local -a e=( HOME="$d/home" PATH="$PATH" TMPDIR="${TMPDIR:-/tmp}"
+    # ⛔ THE STUB IS BUILT FIRST AND ITS STATUS IS CHECKED. `PATH="$(acct_stub …):$PATH"` inside the
+    # array literal below hands the substitution's status to `local`, a builtin that ALWAYS succeeds — so
+    # a FAILED stub and an EMPTY one were indistinguishable, and an empty PATH entry silently grades the
+    # HOST again, which is the exact defect this seam exists to remove (`check-false-pass-shapes.sh`,
+    # discarded-status, #2096).
+    local _acct
+    if ! _acct="$(acct_stub "$d/acct" "$d/home")"; then
+        printf 'FIXTURE FAILURE: could not build the account stub for %s — refusing to run the pass against the HOST\n' "$d" >&2
+        return 1
+    fi
+    local -a e=( HOME="$d/home" PATH="$_acct:$PATH" TMPDIR="${TMPDIR:-/tmp}"
                  HARNESS_APPLY_REPO="$REPO_P" HARNESS_APPLY_REF=origin/main HARNESS_APPLY_MODE=
                  HARNESS_APPLY_STATE_DIR="$d/state" HARNESS_APPLY_DRIFT_CHECK=0 HARNESS_FETCH=1
                  HARNESS_APPLY_SYNC_CMD="$T/sync-stub.sh"
+                 # ⛔ THE CONTROLLER UNIT IS A HOST PATH, SO IT IS PINNED SHUT HERE (review F1).
+                 # `/etc/systemd/system/eldato-orchestrator.service` EXISTS on a cell and pins
+                 # `CELL_HOME=/tmp/cell-home`, so without this seam every arm below would inherit the
+                 # HOST's controller and the split guard would red 108 arms on a cell while passing on a
+                 # Mac — a host assumption, not a product defect (the same class `acct_stub` and
+                 # `HARNESS_APPLY_DRIFT_CHECK=0` exist to remove). T27 drives the seam explicitly with a
+                 # REAL rendered unit, which is where the behaviour is measured.
+                 HARNESS_APPLY_CONTROLLER_UNIT="${CONTROLLER_UNIT_P:-$T/no-controller.service}"
                  HARNESS_MATERIALISER="${MATERIALISER_P:-}"
                  STUB_REPO="$REPO_P" STUB_CELL_HOME_FALLBACK="${FALLBACK_P:-}" )
     [ -z "${FARM_CHECKER_P:-}" ] || e+=( HARNESS_APPLY_FARM_CHECKER="$FARM_CHECKER_P" )
@@ -3693,7 +3793,585 @@ OUT="$(PASS_UNDER_TEST="$PASS_PRE" run_pass_unit "$T/t26pf" 2>&1)"; RC=$?
 assert_eq "$RC" "25" "T26 control: the PRE-FIX pass never reaches predicate 4 (25, not 24) with the same drift"
 assert_absent "$OUT" "farm: DRIFT" "T26 control: so the farm grade this feature exists to emit is never printed"
 
-# ── T27: `$HERE` is CDPATH-IMMUNE, so the value every path beside this pass is built from is ONE line ──
+# ── T27: THE PASS AND ITS CONTROLLER MUST RESOLVE ONE HOME — OR THE PASS REFUSES ────────────────
+# Review F1 + F2 (blocking). F1 measured that the pass DERIVED `/home/cmux` while the controller read
+# `/tmp/cell-home`, so one tick wrote a pin under one home and re-read its own record for the verdict —
+# a GREEN unit over a pin the controller never sees. F2 measured that NO arm could see it: every arm's
+# account stub answered the SAME home the arm also set as `HOME`, so `cell_home_resolve` and the
+# pre-fix `CELL_HOME="${CELL_HOME:-$HOME}"` returned one string everywhere and reverting the derivation
+# left the suite green. These arms drive the REAL templates (not a hand-spelled copy) with a stub that
+# answers a home the arm does NOT set as `HOME`, which is the row that could not fail before.
+say_case "T27 the pass refuses when its unit's HOME and its derivation disagree (one home, or no pass)"
+T27="$T/t27"; mkdir -p "$T27" "$T27/state" "$T27/acct-home" "$T27/legacy-home/home"
+ACCT27="$(acct_stub "$T27/acct" "$T27/acct-home")" || bad "T27 fixture: could not build the account stub"
+# render_unit_env <template> <HOME> <CELL_HOME> <state> — the artifact's OWN Environment= lines as
+# `env` assignments. Driving the template is the point: a hand-spelled environment is a second source of
+# truth, and this suite exists because that is how the split stayed invisible.
+render_unit_env() {
+    sed -e "s|{{HOME}}|$2|g" -e "s|{{CELL_HOME}}|$3|g" -e "s|{{STATE_DIR}}|$4|g" \
+        -e "s|{{USER}}|$(id -un)|g" -e "s|{{PATH}}|/usr/bin:/bin:/usr/sbin:/sbin|g" \
+        -e "s|{{PASS}}|$PASS_SH|g" -e "s|{{PASS_DIR}}|${PASS_SH%/*}|g" \
+        -e "s|{{PASS_REPO}}|${REPO_P:-$HERE/..}|g" -e "s|{{PASS_REF}}|origin/main|g" \
+        -e "s|{{PASS_MODE}}||g" -e "s|{{ENV_FILE}}||g" -e "s|{{O}}||g" \
+        -e "s|{{CONTROLLER_UNIT}}|${HA_CTRL_UNIT:-eldato-orchestrator.service}|g" "$1" \
+      | sed -n 's/^Environment=\([A-Za-z_][A-Za-z0-9_]*\)=\(.\{1,\}\)$/\1=\2/p' \
+      | grep -v '{{'
+}
+# resolve_under <env assignments…> — the SAME resolver the pass sources, under exactly this environment.
+# Not a re-implementation: it sources scripts/lib/cell-home.sh from the tree under test.
+resolve_under() {
+    env -i "$@" PATH="$ACCT27:/usr/bin:/bin:/usr/sbin:/sbin" \
+        bash -c '. "$1/scripts/lib/cell-home.sh"; cell_home_resolve' _ "$HERE/.."
+}
+# run_under <env assignments…> — the pass under exactly this environment.
+run_under() { # <env assignments…> [extra args…] — the pass under exactly this environment.
+    local -a _env=() _args=()
+    while [ $# -gt 0 ]; do
+        case "$1" in *=*) _env+=("$1"); shift ;; *) _args+=("$1"); shift ;; esac
+    done
+    # No extra arg = the ACTING path (the split refusal lives there). The repo is the suite's own LOCAL
+    # clone, so the fetch is hermetic, and the refusal precedes every mutation — nothing is touched.
+    # ⛔ `HARNESS_FETCH=0` CANNOT BE USED HERE: a not-fetched pass refuses `cannot-verify` (23) BEFORE the
+    # move section, so the split guard would never be reached and these arms would measure the fetch rule.
+    # ⛔ `"${_arr[@]-}"` IS NOT OPTIONAL ON bash 3.2 (macOS — the other host this fleet runs). Under
+    # `set -u`, expanding an EMPTY array as `"${_args[@]}"` is an "unbound variable" ABORT, so EVERY
+    # acting-path leg (the ones with no extra arg — exactly the legs that measure the split refusal)
+    # died before the pass was ever started, and the suite reported them as ordinary assertion failures
+    # naming `_args[@]` rather than the cause. The `${arr[@]+"${arr[@]}"}` form expands to nothing when
+    # empty on both bash 3.2 and bash 5, so the same arms measure the same thing on both hosts.
+    # ⛔ A UNIT INVOCATION CARRIES `INVOCATION_ID`, AND THE PASS NOW ASKS (review F2). The rendered
+    # `Environment=` lines below are the UNIT's environment, so the run they describe is a unit's run;
+    # systemd sets `INVOCATION_ID` (and `JOURNAL_STREAM`) per activation, and the pass uses exactly that
+    # to tell "a unit exported this HOME" from "this shell's HOME". Without it here the arms would
+    # exercise the MANUAL shape while claiming to measure the unit's — and the split they exist to grade
+    # would read as no split at all. The manual shape has its own arm below, which omits it.
+    local -a _marker=()
+    [ "${RUN_NO_UNIT:-0}" = 1 ] || _marker+=("INVOCATION_ID=0f3d2a1c0b9e4d6a8c7e5f4b3a2c1d0e")
+    env -i ${_env[@]+"${_env[@]}"} ${_marker[@]+"${_marker[@]}"} PATH="$ACCT27:/usr/bin:/bin:/usr/sbin:/sbin" HARNESS_APPLY_DRIFT_CHECK=0 \
+        HARNESS_APPLY_FARM_CHECK=0 \
+        bash "${PASS_UNDER_TEST:-$PASS_SH}" ${_args[@]+"${_args[@]}"} 2>&1
+}
+  # ⛔ NO `mapfile`: macOS ships bash 3.2 and CI parses every script with it (`bash32-parse`).
+read_env() { # <template> <HOME> <CELL_HOME> <state> — fills the global ENV_ARR
+    ENV_ARR=()
+    local _l
+    while IFS= read -r _l; do ENV_ARR+=("$_l"); done < <(render_unit_env "$@")
+    # ⛔ AN EMPTY RENDER IS A NAMED FAILURE, NOT A CRASH: every arm below reads `"${ENV_ARR[@]}"`, and
+    # under `set -u` on bash 3.2 (macOS — the other host this fleet runs) an EMPTY array expansion is an
+    # "unbound variable" abort, so a render that produced nothing used to kill the suite with a message
+    # that names the array instead of the cause. The render regex also carried `\(.\+\)`, which BSD
+    # sed does not support in BRE — so on macOS this function returned NOTHING and every T27 arm was
+    # unrunnable, while GNU sed on the Linux cell rendered it happily. `\{1,\}` is POSIX BRE and works
+    # on both; this guard is what names the defect if it ever comes back.
+    # (…and it EXITS, because a bare `bad` would leave the arms below expanding an empty array, which
+    # aborts the suite with "unbound variable" — the message that hid this cause in the first place.)
+    if [ "${#ENV_ARR[@]}" -eq 0 ]; then
+        bad "T27 fixture: rendering $1 produced no Environment= line — the arms below cannot run (a host-class sed/set -u trap, not a product defect)"
+        exit 1
+    fi
+}
+read_env "$HERE/../templates/systemd/eldato-harness-apply.service" \
+    "$T27/legacy-home" "$T27/legacy-home" "$T27/state"; HA_ENV=("${ENV_ARR[@]}")
+read_env "$HERE/../templates/systemd/eldato-orchestrator.service" \
+    "$T27/legacy-home" "$T27/legacy-home" "$T27/state"; ORCH_ENV=("${ENV_ARR[@]}")
+# The fixture must BE the shape the finding measured, or the arms below grade a fixture property: the
+# harness-apply unit says HOME and NOT CELL_HOME, the controller's unit says BOTH.
+assert_contains "$(printf '%s\n' "${HA_ENV[@]}")" "HOME=" "T27 fixture: the harness-apply unit exports HOME"
+assert_absent "$(printf '%s\n' "${HA_ENV[@]}")" "CELL_HOME=" "T27 fixture: …and NOT CELL_HOME (the state the finding measured)"
+assert_contains "$(printf '%s\n' "${ORCH_ENV[@]}")" "CELL_HOME=" "T27 fixture: the controller's unit DOES export CELL_HOME"
+# THE SPLIT, measured on the templates: on a box whose units still name the legacy home, the two units
+# answer DIFFERENT homes — so the pass must not silently pick one.
+assert_eq "$(resolve_under "${HA_ENV[@]}")" "$T27/acct-home" \
+    "T27 the pass's unit derives the ACCOUNT's home (the passwd record)"
+assert_eq "$(resolve_under "${ORCH_ENV[@]}")" "$T27/legacy-home" \
+    "T27 the controller's unit resolves the home it PINNED — the two disagree on an un-migrated box"
+OUT="$(run_under "${HA_ENV[@]}")"; RC=$?
+assert_eq "$RC" "27" "T27 so the pass REFUSES (27) rather than writing a pin its controller never reads"
+assert_contains "$OUT" "REFUSED split-home" "T27 and the refusal says what it is"
+assert_contains "$OUT" "CELL_HOME='$T27/acct-home'" "T27 naming the home it would have used"
+assert_contains "$OUT" "exports HOME=$T27/legacy-home" "T27 and the unit's home it would have diverged from"
+assert_contains "$OUT" "cell-home-migrate.sh" "T27 and the remedy, so the operator is not left to guess"
+# ⛔ AND THE REMEDY MUST BE ABLE TO RESOLVE THE REFUSAL (review F1). This one used to send EVERY split to
+# `cell-home-migrate.sh` — a tool whose whole graded population is the LEGACY literal, so on a box whose
+# unit pins some OTHER wrong home (a stale `/home/ubuntu`, the measured `cmux vm exec` value, baked in
+# by an older installer) it answers "one home — nothing to do" and the only printed remedy is a no-op
+# loop. The two arms below are a DISCRIMINATING PAIR on the one input that now decides the remedy: the
+# fixture's `$T27/legacy-home` is a wrong home that is NOT the legacy literal, and overriding
+# `CELL_HOME_LEGACY` to it makes the same run the legacy case.
+assert_contains "$OUT" "install-harness-apply-timer.sh" \
+    "T27 the remedy for a NON-legacy split names the installer that rendered this unit"
+assert_contains "$OUT" "reports this box converged" \
+    "T27 …and says the migration CANNOT resolve it, so the operator is not sent in a loop"
+OUT="$(run_under CELL_HOME_LEGACY="$T27/legacy-home" "${HA_ENV[@]}")"
+assert_contains "$OUT" "cell-home-migrate.sh --check" \
+    "T27 when the split IS the legacy literal the remedy is the migration (the tool that grades it)"
+assert_absent "$OUT" "reports this box converged" \
+    "T27 …and it does not warn the migration is useless for a home it really does grade"
+# ⛔ THE MANUAL SHAPE: THE SAME DISAGREEMENT WITH NO UNIT BEHIND IT (review F2). An operator running the
+# pass by hand in a `cmux vm exec` shell has `HOME=/home/ubuntu` and no unit in the picture, while the
+# derived home is the account's — the home the controller reads. So the pin that run would write is the
+# CORRECT one, and it used to refuse (27) with a diagnostic asserting "the unit that starts this pass
+# exports HOME=…" about a unit that does not exist. Fail-closed, so no wrong write — but a false block
+# plus a false statement, on the invocation shape the pass's own header documents as ordinary.
+# ⛔ THE SEAM GOES IN AS AN ARGUMENT, NOT AS A PREFIX ASSIGNMENT (measured). `run_under` builds the
+# pass's environment with `env -i` from its `*=*` ARGUMENTS only, so a prefix assignment is exported to
+# the FUNCTION and then discarded by `env -i` — the pass never saw it. Both arms below therefore measured
+# THIS HOST's real `/etc/systemd/system/eldato-orchestrator.service` (pinning `/home/cmux`) instead of the
+# `absent.service` they name: the manual arm refused for a reason it was written to prove absent, and its
+# polarity partner passed for a reason it does not name (the unit-HOME leg), so neither pinned the
+# controller seam at all. `RUN_NO_UNIT` stays a prefix assignment because `run_under` READS it itself.
+OUT="$(RUN_NO_UNIT=1 run_under HARNESS_APPLY_CONTROLLER_UNIT="$T27/absent.service" "${HA_ENV[@]}")"; RC=$?
+if [ "$RC" = "27" ]; then
+    bad "T27 manual: a HAND-run pass still exits 27 over a HOME no unit exported (review F2's false block)"
+else
+    ok "T27 manual: a hand-run pass is NOT refused over a HOME no unit exported (rc=$RC)"
+fi
+assert_absent "$OUT" "REFUSED split-home" "T27 manual: …and nothing claims a unit exported a home it did not"
+assert_absent "$OUT" "the unit that starts this pass exports" "T27 manual: …and the false premise is gone from the output"
+assert_contains "$OUT" "no unit started this run" "T27 manual: …and the reading is stated as what it actually measured"
+# …AND THE UNIT SHAPE OF THE SAME ENVIRONMENT STILL REFUSES — otherwise the arm above would be satisfied
+# by deleting the guard instead of by scoping it, and a real unit split would go unwarned. This is the
+# polarity partner of the manual arm, on the SAME rendered environment, differing only in the marker.
+OUT="$(run_under HARNESS_APPLY_CONTROLLER_UNIT="$T27/absent.service" "${HA_ENV[@]}")"; RC=$?
+assert_eq "$RC" "27" "T27 a UNIT invocation with the SAME HOME still refuses (the manual arm is a scope, not a deletion)"
+assert_contains "$OUT" "the unit that starts this pass exports" "T27 …and a unit invocation may still say so, because it is true there"
+# ⛔ NON-VACUITY: the refusal is what stops it. Remove `exit 27` and the same environment runs — and the
+# home it runs with is the account's, i.e. the split F1 measured. Without this leg, T27 would be green
+# on a tree whose guard had been deleted.
+# ⛔ THREE THINGS THE FIRST CUT OF THIS CONTROL GOT WRONG (review F-D, all measured), and each one made
+# the arm unable to fail — the exact class this suite exists to catch, inside the arm written to prove
+# non-vacuity:
+#   1. it ran `--print-status`, a verb the F3 rule in THIS PR guarantees can never exit 27, so the
+#      assertion `RC != 27` was unfalsifiable by construction;
+#   2. the mutant copy had no `lib/cell-home.sh` sibling, so `CELL_HOME_LIB` was empty, the derivation
+#      never ran, `SPLIT_HOME` stayed empty and there was no split to observe at all;
+#   3. it deleted only the `exit 27` line, leaving the block that sets `REC_ACTION`/`REC_DETAIL` — a
+#      "mutant" that still does most of the work.
+# It now runs the ACTING path, against a mutant with the WHOLE refusal block removed, beside its own copy
+# of the resolver — and asserts the two facts that matter: it is not refused, and it proceeds.
+MUT27="$T27/mut27"; mkdir -p "$MUT27/scripts/lib"
+cp "$HERE/lib/cell-home.sh" "$MUT27/scripts/lib/cell-home.sh"
+PASS_NOGUARD="$MUT27/scripts/pass-noguard.sh"
+# The mutant neuters the SECOND `if [ -n "$SPLIT_HOME" ]` — the refusal; the first is the reading, which
+# must keep working so the control can still SEE the split. Counting beats pattern-matching on context,
+# which rots as the surrounding comments change.
+awk '
+  /^if \[ -n "\$SPLIT_HOME" \]; then$/ { n++; if (n == 2) { print "if false; then"; next } }
+  { print }' "$PASS_SH" >"$PASS_NOGUARD"
+if cmp -s "$PASS_SH" "$PASS_NOGUARD"; then
+    bad "T27 control: the guard-removal mutant is IDENTICAL to the pass — this control proves nothing"
+elif [ "$(grep -c '^if false; then$' "$PASS_NOGUARD")" != "1" ]; then
+    bad "T27 control: the refusal guard was not neutered — the removal did not apply"
+else
+    ok "T27 control: the mutant's refusal guard is neutered and its reading arm is intact"
+fi
+OUT="$(PASS_UNDER_TEST="$PASS_NOGUARD" run_under "${HA_ENV[@]}")"; RC=$?
+if [ "$RC" = "27" ]; then bad "T27 control: the guard-less pass still exits 27 — the guard is not what refused";
+else ok "T27 control: WITHOUT the guard the same environment, on the ACTING path, is NOT refused (rc=$RC)"; fi
+assert_absent "$OUT" "REFUSED split-home" "T27 control: …and nothing says the homes disagree"
+assert_contains "$OUT" "split_home=$T27/legacy-home" "T27 control: …it still SEES the split as a reading, and acts anyway"
+assert_eq "$(resolve_under "${HA_ENV[@]}")" "$T27/acct-home" \
+    "T27 control: …so it wrote under the account's home, not the controller's — F1's split, reproduced"
+# AND THE FALSE-POSITIVE ARM: a genuinely CONVERGED box must run normally. Review F1 was right that the
+# first cut of this leg was NOT a converged box: it rendered the PASS unit at the durable home while
+# leaving the CONTROLLER unit at the legacy one — a second split arm, not a polarity partner. A converged
+# box has BOTH units on the same durable home, and that is what is rendered here.
+read_env "$HERE/../templates/systemd/eldato-harness-apply.service" \
+    "$T27/acct-home" "$T27/acct-home" "$T27/state"; HA_CONV=("${ENV_ARR[@]}")
+read_env "$HERE/../templates/systemd/eldato-orchestrator.service" \
+    "$T27/acct-home" "$T27/acct-home" "$T27/state"; ORCH_CONV=("${ENV_ARR[@]}")
+# The controller unit is a FILE the pass reads, so the seam is the file. `ORCH_CONV` is rendered from the
+# REAL template and then written as the controller's own unit — both sides of this leg are the artifacts.
+printf '[Service]\n' >"${T27}/controller-converged.service"
+printf '%s\n' "${ORCH_CONV[@]}" | sed 's/^/Environment=/' >>"${T27}/controller-converged.service"
+OUT="$(run_under HARNESS_APPLY_CONTROLLER_UNIT="${T27}/controller-converged.service" "${HA_CONV[@]}" --print-status)"; RC=$?
+if [ "$RC" = "27" ]; then bad "T27 a CONVERGED box (both units on the durable home) is refused — the guard is a false positive";
+else ok "T27 a CONVERGED box is NOT refused (rc=$RC) — the guard fires only on the real disagreement"; fi
+assert_absent "$OUT" "REFUSED split-home" "T27 …and says nothing about a split"
+# ⛔ THE SHAPE THE FIRST CUT MISSED (review F1, verified): the PASS unit was repointed but the
+# CONTROLLER's was not — exactly what `cell-home-migrate.sh --apply` leaves when rule 4 refuses a single
+# unit. Here `HOME == the derivation`, so a guard that compares only the pass's own `$HOME` sees nothing;
+# the controller's pinned `CELL_HOME` is the disagreement and it must still refuse.
+printf '[Service]\n' >"${T27}/controller-legacy.service"
+printf '%s\n' "${ORCH_ENV[@]}" | sed 's/^/Environment=/' >>"${T27}/controller-legacy.service"
+OUT="$(run_under HARNESS_APPLY_CONTROLLER_UNIT="${T27}/controller-legacy.service" "${HA_CONV[@]}")"; RC=$?
+assert_eq "$RC" "27" "T27 the pass refuses when its OWN unit agrees but the CONTROLLER's does not (the shape a HOME-only guard misses)"
+assert_contains "$OUT" "the controller's unit pins CELL_HOME" "T27 and it names the controller as the side that disagrees"
+# ⛔ A VALUE THE PASS CANNOT RESOLVE IS CANNOT MEASURE, NOT A COMPARISON: an unrendered `{{CELL_HOME}}` must
+# not be string-compared, or every box whose unit renders late would be refused.
+printf '[Service]\nEnvironment=CELL_HOME={{CELL_HOME}}\n' >"${T27}/controller-unrendered.service"
+OUT="$(run_under HARNESS_APPLY_CONTROLLER_UNIT="${T27}/controller-unrendered.service" "${HA_CONV[@]}" --print-status)"; RC=$?
+if [ "$RC" = "27" ]; then bad "T27 an UNRENDERED controller value was compared and refused — a placeholder is not a reading";
+else ok "T27 an unrendered controller value is CANNOT MEASURE and is never compared (rc=$RC)"; fi
+# ⛔ AND NO CONTROLLER UNIT AT ALL (a Mac) IS NOT A SPLIT — the guard never invents a home.
+OUT="$(run_under HARNESS_APPLY_CONTROLLER_UNIT="${T27}/does-not-exist.service" "${HA_CONV[@]}" --print-status)"; RC=$?
+if [ "$RC" = "27" ]; then bad "T27 a box with NO controller unit was refused — the guard invented a home";
+else ok "T27 a box with no controller unit (a Mac) is not refused (rc=$RC)"; fi
+# AND AN EXPLICIT `CELL_HOME` IS NEVER SECOND-GUESSED (`cell_home_resolve` step 1): the controller's own
+# unit sets it, and a migration or an operator naming the home must get that home.
+OUT="$(run_under "${ORCH_ENV[@]}" --print-status)"; RC=$?
+if [ "$RC" = "27" ]; then bad "T27 an explicit CELL_HOME was second-guessed (refused) — step 1 must win";
+else ok "T27 an explicit CELL_HOME wins and is never second-guessed (rc=$RC)"; fi
+# ⛔ THE READ-ONLY VERBS MUST NOT RED (review F3, verified): the refusal belongs on the ACTING path only.
+# `--print-status` answers from the RECORD and `--dry-run` changes nothing (including its exit contract),
+# so both must be able to SAY the split without exiting 27 — otherwise an operator inspecting the box is
+# the last to learn why it is red, and the preview breaks its own documented promise.
+OUT="$(run_under "${HA_ENV[@]}" --dry-run)"; RC=$?
+assert_eq "$RC" "0" "T27 a SPLIT box's --dry-run still exits 0 (a preview must not red a box)"
+assert_contains "$OUT" "would REFUSE split-home" "T27 …and the preview still SAYS it would refuse, so the disclosure is not lost"
+OUT="$(run_under "${HA_ENV[@]}" --print-status)"; RC=$?
+if [ "$RC" = "27" ]; then bad "T27 --print-status exited 27 — a record read must not take the acting path's refusal";
+else ok "T27 --print-status answers from the RECORD (rc=$RC) and never exits 27"; fi
+assert_contains "$OUT" "split_home=" "T27 …while still reporting the split as a READING"
+
+# ⛔ THE TWO SPELLINGS systemd REALLY USES, AND THE UNIT NAME IT REALLY READS (review F-B/F-C, both
+# reproduced): an `Environment=` line is UNQUOTED and split into a LIST of assignments, so a pattern
+# anchored at `Environment=CELL_HOME=` sees neither the quoted form nor the multi-assignment form — and
+# the multi-assignment form is the row this PR's own comment documents. A guard that cannot measure
+# prints `split_home=none` and every reader infers agreement, which is worse than no guard.
+printf '[Service]\nEnvironment="CELL_HOME=%s"\n' "$T27/legacy-home" >"$T27/controller-quoted.service"
+OUT="$(run_under HARNESS_APPLY_CONTROLLER_UNIT="$T27/controller-quoted.service" "${HA_CONV[@]}")"; RC=$?
+assert_eq "$RC" "27" "T27 a QUOTED Environment=\"CELL_HOME=…\" is measured (systemd unquotes each line)"
+assert_contains "$OUT" "the controller's unit pins CELL_HOME" "T27 …and the quoted value is the one it names"
+printf '[Service]\nEnvironment=HOME=/tmp/whatever CELL_HOME=%s\n' "$T27/legacy-home" >"$T27/controller-multi.service"
+OUT="$(run_under HARNESS_APPLY_CONTROLLER_UNIT="$T27/controller-multi.service" "${HA_CONV[@]}")"; RC=$?
+assert_eq "$RC" "27" "T27 a MULTI-ASSIGNMENT Environment= line is measured (it is a list, not a scalar)"
+# ⛔ AND THE THIRD SPELLING systemd ACCEPTS: WHITESPACE AROUND `=` IS IGNORED, SO A SPACED
+# `Environment = CELL_HOME=…` IS THE SAME DIRECTIVE. systemd.syntax(7): *"Whitespace immediately before or
+# after the '=' is ignored."* The reader was anchored at `Environment=`, so the spaced form — what an
+# operator writes by hand in a drop-in — parsed to NOTHING, `split_home` read `none`, and every reader
+# inferred agreement. Reproduced before the fix: `environment_cell_home` answered '' for all three spaced
+# spellings below while the migrate tool in this same PR already honoured the rule.
+# (The spaced form's own arm is in the QUOTING/ORDERING block below; this fixture exists for the
+# mutation control only, so it is named apart and is created here — self-contained, no ordering coupling.)
+printf '[Service]\nEnvironment = CELL_HOME=%s\n' "$T27/legacy-home" >"$T27/controller-spaced-mut.service"
+# …and the other two spacings are the same directive too, so a fix for one is not a fix for the class.
+for _sep in 'Environment= CELL_HOME=' 'Environment =CELL_HOME='; do
+    printf '[Service]\n%s%s\n' "$_sep" "$T27/legacy-home" >"$T27/controller-spaced2.service"
+    OUT="$(run_under HARNESS_APPLY_CONTROLLER_UNIT="$T27/controller-spaced2.service" "${HA_CONV[@]}" --dry-run)"; RC=$?
+    assert_contains "$OUT" "would REFUSE split-home" "T27 '$_sep' is the same directive (whitespace on the other side of '=' is ignored too)"
+    assert_eq "$RC" "0" "T27 …and it is a READING on --dry-run, so the preview does not red the box"
+done
+# ⛔ THE POLARITY PAIR, WITHOUT WHICH THE ARM ABOVE WOULD FIRE ON ANY 'Environment =' LINE: a spaced
+# directive that AGREES is not a split, and an `EnvironmentFile=` is not an `Environment=` at all — a
+# reader widened to match both would refuse a converged box, or read a CELL_HOME out of a file path.
+printf '[Service]\nEnvironment = CELL_HOME=%s\n' "$T27/acct-home" >"$T27/controller-spaced-ok.service"
+OUT="$(run_under HARNESS_APPLY_CONTROLLER_UNIT="$T27/controller-spaced-ok.service" "${HA_CONV[@]}" --dry-run)"; RC=$?
+assert_contains "$OUT" "split_home=none" "T27 a SPACED directive that AGREES is not a split (the arm above measures the home, not the spelling)"
+printf '[Service]\nEnvironmentFile=%s\n' "$T27/legacy-home/keys.env" >"$T27/controller-envfile.service"
+OUT="$(run_under HARNESS_APPLY_CONTROLLER_UNIT="$T27/controller-envfile.service" "${HA_CONV[@]}" --dry-run)"; RC=$?
+assert_contains "$OUT" "split_home=none" "T27 'EnvironmentFile=' is NOT read as 'Environment=' (a widened reader must not invent a home)"
+# ⛔ THE FOURTH SPELLING, AND THE ONE THAT SHIPPED (review F2, reproduced on this head).
+# systemd.syntax(7): *"Lines ending in a backslash are concatenated with the following line while reading
+# and the backslash is replaced by a space character"* — so
+#     Environment=HOME=/home/x \
+#     CELL_HOME=/tmp/other-home
+# is ONE directive in which the SECOND assignment wins (`Environment=` is LAST-WINS), while a
+# PHYSICAL-LINE reader never sees a second `Environment=` at all and measures nothing. `[]` is not "no
+# CELL_HOME": it becomes `split_home=none`, which every reader in this file infers as agreement — and on
+# the population this guard targets (the pass's own unit repointed, the controller's drop-in pinning the
+# home by hand) that is a green unit over a pin the controller never sees.
+# No shipped renderer emits a continuation and `cell-self-pin.sh` refuses one in the drop-ins IT
+# verifies — but that gate walks only the cell-self-pin population, while the controller's drop-ins are
+# exactly where an operator pins the home by hand.
+printf '[Service]\nEnvironment=HOME=%s \\\nCELL_HOME=%s\n' "$T27/acct-home" "$T27/legacy-home" >"$T27/controller-cont.service"
+OUT="$(run_under HARNESS_APPLY_CONTROLLER_UNIT="$T27/controller-cont.service" "${HA_CONV[@]}" --dry-run)"; RC=$?
+assert_contains "$OUT" "would REFUSE split-home" "T27 a BACKSLASH-CONTINUED Environment= is measured (it is ONE logical directive)"
+assert_contains "$OUT" "split_home=$T27/legacy-home" "T27 …and the continued assignment is the home it names (the second one wins)"
+assert_eq "$RC" "0" "T27 …and it is a READING on --dry-run, so the preview does not red the box"
+# …and the man page's OWN example: a COMMENT BLOCK between the continued lines is ignored, and the
+# continued line is concatenated with whatever follows the block.
+printf '[Service]\nEnvironment=HOME=%s \\\n# this line is ignored\n; this line is ignored too\nCELL_HOME=%s\n' \
+    "$T27/acct-home" "$T27/legacy-home" >"$T27/controller-contcomment.service"
+OUT="$(run_under HARNESS_APPLY_CONTROLLER_UNIT="$T27/controller-contcomment.service" "${HA_CONV[@]}" --dry-run)"
+assert_contains "$OUT" "would REFUSE split-home" "T27 a COMMENT BLOCK inside a continuation is ignored and the continuation survives (systemd.syntax(7)'s own example)"
+# ⛔ THE POLARITY PAIRS, WITHOUT WHICH THE ARMS ABOVE WOULD FIRE ON ANY BACKSLASH. A continuation that
+# AGREES is not a split…
+printf '[Service]\nEnvironment=HOME=%s \\\nCELL_HOME=%s\n' "$T27/legacy-home" "$T27/acct-home" >"$T27/controller-cont-ok.service"
+OUT="$(run_under HARNESS_APPLY_CONTROLLER_UNIT="$T27/controller-cont-ok.service" "${HA_CONV[@]}" --dry-run)"
+assert_contains "$OUT" "split_home=none" "T27 a CONTINUED assignment that AGREES is not a split (the arms above measure the home, not the backslash)"
+# …and the DIRECTIVE NAME COMES FROM THE LOGICAL LINE: this is ONE `ExecStart=` whose VALUE happens to
+# contain the text `Environment=CELL_HOME=…`, which systemd does not parse as an `Environment=`.
+printf '[Service]\nExecStart=/bin/echo --x \\\nEnvironment=CELL_HOME=%s\n' "$T27/legacy-home" >"$T27/controller-cont-foreign.service"
+OUT="$(run_under HARNESS_APPLY_CONTROLLER_UNIT="$T27/controller-cont-foreign.service" "${HA_CONV[@]}" --dry-run)"
+assert_contains "$OUT" "split_home=none" "T27 a continuation of ANOTHER directive is not read as Environment= (the name comes from the logical line)"
+# ⛔ NON-VACUITY FOR THE CONTINUATION LEG: revert ONLY the logical-line join in a copy of the pass and
+# the same fixture stops being measured at all — which is the pre-fix shape this finding is about.
+PASS_PHYS="$MUT27/scripts/pass-physical.sh"
+sed 's|^$(logical_lines "\$1")$|$(cat "$1")|' "$PASS_SH" >"$PASS_PHYS"
+if cmp -s "$PASS_SH" "$PASS_PHYS"; then
+    bad "T27 continuation control: the mutant is IDENTICAL to the pass — this control proves nothing"
+elif ! grep -qF '$(logical_lines "$1")' "$PASS_SH"; then
+    bad "T27 continuation control: the logical-line read is not in the pass — this control is stale"
+elif grep -qF '$(logical_lines "$1")' "$PASS_PHYS"; then
+    bad "T27 continuation control: the mutated copy STILL reads logical lines — the revert did not apply"
+else
+    ok "T27 continuation control: the mutant reads PHYSICAL lines and not the fixed logical ones"
+fi
+OUT="$(PASS_UNDER_TEST="$PASS_PHYS" run_under HARNESS_APPLY_CONTROLLER_UNIT="$T27/controller-cont.service" "${HA_CONV[@]}" --dry-run)"
+assert_absent "$OUT" "would REFUSE split-home" "T27 continuation control: reading PHYSICAL lines the continued CELL_HOME is invisible — the arms above are what sees it"
+assert_contains "$OUT" "split_home=none" "T27 continuation control: …and the readings print no split at all (F2's fail-open reproduced)"
+# ⛔ NON-VACUITY FOR THE WHOLE SPACED LEG: revert ONLY the whitespace tolerance in a copy of the pass and
+# the same spaced unit stops being measured at all. Without this row the arms above would be green on a
+# tree whose reader had regressed to the anchored form — the exact way this one shipped.
+# ⛔ THE MUTATION TARGETS THE RULE, NOT A LINE SHAPE (the reader was rewritten to consume LOGICAL lines
+# when the continuation hole was closed, so a mutation written against the old `sed` pattern became a
+# no-op — and a no-op mutant reports "identical to the pass", which is the control refusing rather than
+# proving). The rule here is the blank-skip between the directive NAME and the `=`, so the FIRST
+# `body="${body#?}"` blank-strip loop inside `environment_cell_home` is what gets neutered.
+PASS_SPACED="$MUT27/scripts/pass-spaced.sh"
+awk '
+  /^environment_cell_home\(\)/ { inf=1 }
+  inf && !done && index($0, "while :; do case \"$body\" in [[:space:]]*") > 0 { print "        :"; done=1; next }
+  inf && /^}$/ { inf=0 }
+  { print }' "$PASS_SH" >"$PASS_SPACED"
+if cmp -s "$PASS_SH" "$PASS_SPACED"; then
+    bad "T27 spatial control: the mutant is IDENTICAL to the pass — this control proves nothing"
+elif [ "$(grep -c 'body="${body#?}"' "$PASS_SPACED")" -ge "$(grep -c 'body="${body#?}"' "$PASS_SH")" ]; then
+    bad "T27 spatial control: the blank-skip rule was not neutered — the revert did not apply"
+else
+    ok "T27 spatial control: the mutant drops ONE blank-skip rule and keeps the rest of the reader"
+fi
+assert_contains "$(run_under HARNESS_APPLY_CONTROLLER_UNIT="$T27/controller-spaced-mut.service" "${HA_CONV[@]}" --dry-run)" \
+    "would REFUSE split-home" "T27 spatial control: on the FIXED tree the spaced unit IS measured (the pair's positive half)"
+OUT="$(PASS_UNDER_TEST="$PASS_SPACED" run_under HARNESS_APPLY_CONTROLLER_UNIT="$T27/controller-spaced-mut.service" "${HA_CONV[@]}" --dry-run)"; RC=$?
+assert_absent "$OUT" "would REFUSE split-home" "T27 spatial control: without the rule the SPACED unit is invisible — the arms above are what sees it"
+assert_contains "$OUT" "split_home=none" "T27 spatial control: …and the readings print no split at all (the fail-open F-G fixed)"
+# …and the unit NAME is not a constant: `install-controller-service.sh` renders and validates
+# `CONTROLLER_UNIT=<bare name>` and honours `CONTROLLER_SYSTEM_UNIT_DIR`.
+mkdir -p "$T27/units"
+printf '[Service]\nEnvironment=CELL_HOME=%s\n' "$T27/legacy-home" >"$T27/units/eldato-orchestrator-a.service"
+OUT="$(run_under "${HA_CONV[@]}" CONTROLLER_UNIT=eldato-orchestrator-a CONTROLLER_SYSTEM_UNIT_DIR="$T27/units")"; RC=$?
+assert_eq "$RC" "27" "T27 a RENAMED controller unit (CONTROLLER_UNIT + CONTROLLER_SYSTEM_UNIT_DIR) is measured"
+# ⛔ AND THE POLARITY: the same renamed unit pinning the SAME home is not a refusal, so the previous leg
+# measures the disagreement and not the name.
+printf '[Service]\nEnvironment=CELL_HOME=%s\n' "$T27/acct-home" >"$T27/units/eldato-orchestrator-b.service"
+OUT="$(run_under "${HA_CONV[@]}" CONTROLLER_UNIT=eldato-orchestrator-b CONTROLLER_SYSTEM_UNIT_DIR="$T27/units" --print-status)"; RC=$?
+if [ "$RC" = "27" ]; then bad "T27 the renamed-unit leg fires on agreement too — it measures the name, not the home";
+else ok "T27 a renamed unit that AGREES is not refused (rc=$RC) — the previous leg measures the home"; fi
+
+# ⛔ AND A DROP-IN, WHICH IS HOW THIS FLEET ACTUALLY PINS A HOME (`…/cell-self-pin.service.d/*.conf`).
+# The first cut of the reader built `"${unit%/*}.d"` — `<dir>.d` — so the unit's own drop-in directory was
+# never read, and no arm noticed because there was no drop-in arm. There is one now, and it also asserts
+# the ORDERING: a lexicographically LATER drop-in wins (systemd applies them in that order).
+mkdir -p "$T27/controller-dropin.service.d"
+printf '[Service]\nEnvironment=CELL_HOME=%s\n' "$T27/acct-home" >"$T27/controller-dropin.service"
+printf 'Environment=CELL_HOME=%s\n' "$T27/legacy-home" >"$T27/controller-dropin.service.d/50-legacy.conf"
+OUT="$(run_under HARNESS_APPLY_CONTROLLER_UNIT="$T27/controller-dropin.service" "${HA_CONV[@]}")"; RC=$?
+assert_eq "$RC" "27" "T27 a DROP-IN's CELL_HOME is read (the fleet's own mechanism for pinning a home)"
+assert_contains "$OUT" "the controller's unit pins CELL_HOME=$T27/legacy-home" "T27 …and the drop-in's value is the one that wins over the unit's"
+printf 'Environment=CELL_HOME=%s\n' "$T27/acct-home" >"$T27/controller-dropin.service.d/90-converged.conf"
+OUT="$(run_under HARNESS_APPLY_CONTROLLER_UNIT="$T27/controller-dropin.service" "${HA_CONV[@]}" --print-status)"; RC=$?
+if [ "$RC" = "27" ]; then bad "T27 a LATER drop-in did not win — systemd applies drop-ins in lexicographic order and last wins";
+else ok "T27 a lexicographically LATER drop-in wins (rc=$RC) — the order is systemd's, not the directory's"; fi
+
+# ⛔ THE SPELLINGS THAT MEASURED NOTHING (review round-3 F1, each verified): systemd.syntax(7) says
+# whitespace around `=` is ignored, and that BOTH single and double quotes wrap an item and are then
+# removed. The first cut handled only the double-quoted, no-space form — so `'…'` and `Environment = …`
+# silently measured NOTHING (`split_home=none`, which every reader infers as agreement), and a quoted
+# value containing a space compared as a TRUNCATED PREFIX that could equal the derived home.
+printf "[Service]\nEnvironment='CELL_HOME=%s'\n" "$T27/legacy-home" >"$T27/controller-sq.service"
+OUT="$(run_under HARNESS_APPLY_CONTROLLER_UNIT="$T27/controller-sq.service" "${HA_CONV[@]}")"; RC=$?
+assert_eq "$RC" "27" "T27 a SINGLE-quoted Environment='CELL_HOME=…' is measured (systemd removes both quote kinds)"
+printf '[Service]\nEnvironment = %s\n' "CELL_HOME=$T27/legacy-home" >"$T27/controller-spaced.service"
+OUT="$(run_under HARNESS_APPLY_CONTROLLER_UNIT="$T27/controller-spaced.service" "${HA_CONV[@]}")"; RC=$?
+assert_eq "$RC" "27" "T27 whitespace around the '=' (Environment = CELL_HOME=…) is ignored, as systemd ignores it"
+# ⛔ THE TRUNCATION CASE, which was worse than "cannot measure": a quoted value with a space used to be
+# compared as its first token, so `"<derived> with-suffix"` read as EQUAL to a converged box's home and
+# the guard reported agreement over a real split.
+printf '[Service]\nEnvironment="CELL_HOME=%s with-suffix"\n' "$T27/acct-home" >"$T27/controller-spaceval.service"
+OUT="$(run_under HARNESS_APPLY_CONTROLLER_UNIT="$T27/controller-spaceval.service" "${HA_CONV[@]}")"; RC=$?
+assert_eq "$RC" "27" "T27 a quoted value CONTAINING A SPACE is compared whole, not truncated to a prefix"
+assert_contains "$OUT" "with-suffix" "T27 …and the whole value is what the refusal names"
+# ⛔ AND THE ORDERING ARM MUST BE ABLE TO FAIL (review round-3 F4, measured): the previous fixture had ONE
+# drop-in directory, so it only ever tested order WITHIN a directory and the mutation its own comment
+# names (directory-by-directory application) left the suite green. Two directories, two names, one
+# collision: systemd applies drop-ins lexicographically by FILE NAME across the directories, so the
+# LATER NAME wins, and an equally-named file resolves to the HIGHER-PRECEDENCE directory.
+# Two REAL drop-in directories, both on systemd's list: the unit's own, and the per-user one (which is
+# writable inside the fixture because `HOME` is the fixture's). The values are chosen so that NAME order
+# and DIRECTORY order give DIFFERENT answers — otherwise the arm cannot fail.
+ORD1="$T27/controller-ord.service.d"
+ORD2="$T27/acct-home/.config/systemd/user/controller-ord.service.d"
+mkdir -p "$ORD1" "$ORD2"
+printf '[Service]\nEnvironment=CELL_HOME=%s\n' "$T27/acct-home" >"$T27/controller-ord.service"
+# name order: a-aa (ORD2) then z-zz (ORD1)  -> LAST is z-zz  -> legacy-home
+# dir  order: ORD1 (z-zz) then ORD2 (a-aa)  -> LAST is a-aa  -> acct-home (agreement: no refusal)
+printf 'Environment=CELL_HOME=%s\n' "$T27/legacy-home" >"$ORD1/z-zz.conf"
+printf 'Environment=CELL_HOME=%s\n' "$T27/acct-home" >"$ORD2/a-aa.conf"
+OUT="$(run_under HARNESS_APPLY_CONTROLLER_UNIT="$T27/controller-ord.service" "${HA_CONV[@]}")"; RC=$?
+assert_eq "$RC" "27" "T27 drop-ins are applied by FILE NAME across directories, not directory-by-directory"
+assert_contains "$OUT" "split_home=$T27/legacy-home" "T27 …the later NAME wins, so the answer is the lower directory's z-zz (directory order would say acct-home)"
+# ⛔ AND THE NAME TRAVELS FROM THE PASS'S OWN UNIT (agent-infra#3453, the feeder half of review F-C):
+# `install-controller-service.sh` renders and validates `CONTROLLER_UNIT=<bare name>`, and the pass's unit
+# now carries the SAME fact (`Environment=CONTROLLER_UNIT={{CONTROLLER_UNIT}}`), because a pass that
+# assumed `eldato-orchestrator` would find no unit at all on a renamed install, print `split_home=none`,
+# and refuse nothing — the fail-open class this whole block exists to close. Without the render the line
+# is DROPPED by this harness's own `grep -v '{{'`, the pass falls back to the default name, finds no such
+# unit in the fixture, and this arm has nothing to refuse.
+mkdir -p "$T27/renamed"
+printf '[Service]\nEnvironment=CELL_HOME=%s\n' "$T27/legacy-home" >"$T27/renamed/eldato-orchestrator-zz.service"
+HA_CTRL_UNIT="eldato-orchestrator-zz.service" read_env "$HERE/../templates/systemd/eldato-harness-apply.service" \
+    "$T27/acct-home" "$T27/acct-home" "$T27/state"; HA_NAMED=("${ENV_ARR[@]}")
+assert_contains "$(printf '%s\n' "${HA_NAMED[@]}")" "CONTROLLER_UNIT=eldato-orchestrator-zz.service" \
+    "T27 the pass's unit CARRIES the controller's name (one fact, rendered into both units)"
+OUT="$(run_under "${HA_NAMED[@]}" CONTROLLER_SYSTEM_UNIT_DIR="$T27/renamed")"; RC=$?
+assert_eq "$RC" "27" "T27 …and the pass reads THAT unit, so a renamed install is still compared, not silently unmeasured"
+
+# ⛔ AND THE COLLISION RULE: the same NAME in two directories resolves to the HIGHER-precedence one.
+ORD3="$T27/controller-same.service.d"
+mkdir -p "$ORD3" "$T27/acct-home/.config/systemd/user/controller-same.service.d"
+printf '[Service]\nEnvironment=CELL_HOME=%s\n' "$T27/acct-home" >"$T27/controller-same.service"
+printf 'Environment=CELL_HOME=%s\n' "$T27/nowhere-home" >"$ORD3/mm.conf"
+printf 'Environment=CELL_HOME=%s\n' "$T27/acct-home" >"$T27/acct-home/.config/systemd/user/controller-same.service.d/mm.conf"
+OUT="$(run_under HARNESS_APPLY_CONTROLLER_UNIT="$T27/controller-same.service" "${HA_CONV[@]}")"; RC=$?
+assert_eq "$RC" "27" "T27 an equally-named drop-in resolves to the HIGHER-precedence directory"
+assert_contains "$OUT" "split_home=$T27/nowhere-home" "T27 …the unit's own directory wins the name, not the per-user one"
+# ⛔ A DASH-TRUNCATED DROP-IN DIRECTORY KEEPS THE TYPE SUFFIX, AND EVERY DASH IS A CANDIDATE (review F3,
+# both reviewers). `systemd.unit(5)`: for `foo-bar-baz.service` the drop-in dirs are
+# `foo-bar-baz.service.d`, `foo-bar-.service.d` and `foo-.service.d`. The reader built `<prefix>-.d`
+# (`eldato-.d`) — a name systemd NEVER reads — and only ever the FIRST truncation, so a `CELL_HOME=`
+# pinned through a truncated drop-in measured nothing, `split_home` printed `none`, and a reading that
+# did not happen read as agreement. NO ARM COVERED IT: every fixture above passes an explicit
+# `${unit}.d` or a full-name dir. The name below has TWO dashes, and the fixture plants the SECOND
+# truncation, so the arm fails unless the loop walks past the first dash AND keeps `.service`.
+mkdir -p "$T27/trunc" "$T27/acct-home/.config/systemd/user/eldato-.service.d"
+printf '[Service]\nEnvironment=CELL_HOME=%s\n' "$T27/acct-home" >"$T27/trunc/eldato-orchestrator-zz.service"
+printf 'Environment=CELL_HOME=%s\n' "$T27/legacy-home" >"$T27/acct-home/.config/systemd/user/eldato-.service.d/50-trunc.conf"
+OUT="$(run_under HARNESS_APPLY_CONTROLLER_UNIT="$T27/trunc/eldato-orchestrator-zz.service" "${HA_CONV[@]}")"; RC=$?
+assert_eq "$RC" "27" "T27 a DASH-TRUNCATED drop-in dir (…/eldato-.service.d) IS read — every dash boundary, with the type suffix kept"
+assert_contains "$OUT" "split_home=$T27/legacy-home" "T27 …and its CELL_HOME is the value that wins over the unit's"
+# ⛔ AND THE SPELLING THE OLD READER BUILT IS NOT A DROP-IN DIRECTORY. `…/eldato-.d` is a name systemd
+# never reads, so a fixture that only has THAT must measure nothing — otherwise "found a file" would be
+# standing in for "found systemd's file", which is the class this whole block exists to close.
+rm -rf "$T27/acct-home/.config/systemd/user/eldato-.service.d"
+mkdir -p "$T27/acct-home/.config/systemd/user/eldato-.d"
+printf 'Environment=CELL_HOME=%s\n' "$T27/legacy-home" >"$T27/acct-home/.config/systemd/user/eldato-.d/50-bogus.conf"
+OUT="$(run_under HARNESS_APPLY_CONTROLLER_UNIT="$T27/trunc/eldato-orchestrator-zz.service" "${HA_CONV[@]}" --print-status)"; RC=$?
+# ⛔ THE ASSERTION IS THE ABSENCE OF THE *VALUE*, NOT THE TOKEN `split_home=none` (measured). That token
+# exists only on the ACTING path's `harness: mode=…` line; `--print-status` prints the reading line ONLY
+# when a split exists, so `split_home=none` is never in its output and an arm asking for it fails whatever
+# the reader does. What both arms below mean is "the value in THIS fixture was not read", so they assert
+# exactly that — non-vacuous, because a reader that DID see the truncated dir prints the value.
+assert_absent "$OUT" "split_home=$T27/legacy-home" "T27 …while …/eldato-.d (the pre-fix spelling) is NOT read — the arm measures systemd's name, not any name"
+# ⛔ NON-VACUITY: revert ONLY the directory-name construction in a copy of the pass and the SAME
+# truncated drop-in becomes invisible — i.e. the arm above is what sees it.
+# ⛔ THE MUTATION SPLICES THE CALL, IT DOES NOT REPLACE THE LINE. The `pres+=` call shares its line with
+# the loop's ONLY `break`, so a line-level rewrite deletes the exit and the mutant is an unbounded
+# `while :; do pres+=(…); done` — measured: 16 GB RSS inside a minute, and the suite never terminates.
+# Same rule as `mut_sub`: replace the substring, keep every byte around it.
+PASS_TRUNC="$MUT27/scripts/pass-trunc.sh"
+awk '
+  BEGIN { old = "pres+=(\"${stem}-${typ:+.$typ}.d\")"; new = "pres+=(\"${stem}-.d\")" }
+  !done && index($0, old) > 0 { i = index($0, old); $0 = substr($0, 1, i - 1) new substr($0, i + length(old)); done = 1 }
+  { print }' "$PASS_SH" >"$PASS_TRUNC"
+if cmp -s "$PASS_SH" "$PASS_TRUNC"; then
+    bad "T27 truncation control: the mutant is IDENTICAL to the pass — this control proves nothing"
+else
+    rm -rf "$T27/acct-home/.config/systemd/user/eldato-.d"
+    mkdir -p "$T27/acct-home/.config/systemd/user/eldato-.service.d"
+    printf 'Environment=CELL_HOME=%s\n' "$T27/legacy-home" >"$T27/acct-home/.config/systemd/user/eldato-.service.d/50-trunc.conf"
+    OUT="$(PASS_UNDER_TEST="$PASS_TRUNC" run_under HARNESS_APPLY_CONTROLLER_UNIT="$T27/trunc/eldato-orchestrator-zz.service" "${HA_CONV[@]}" --print-status)"
+    assert_absent "$OUT" "split_home=$T27/legacy-home" "T27 truncation control: with the pre-fix '<prefix>-.d' spelling the same drop-in is INVISIBLE — the arm above is what sees it"
+fi
+# ⛔ A DOTTED UNIT NAME KEEPS ITS TRUNCATED DROP-IN DIRECTORIES (review P2, reproduced). `systemd.unit(5)`
+# allows a dot in the name prefix, and the truncation split on the FIRST dot — so `foo.bar-baz.service`
+# produced `stem=foo` / `typ=bar-baz.service`, the loop found no dash in `foo`, and `foo.bar-.service.d`
+# was NEVER built (one dash in that name, so exactly one truncation). A `CELL_HOME=` pinned through it then measured nothing,
+# `split_home` read `none`, and a reading that did not happen read as agreement — the class this block
+# exists to close, one character of the name away. The type suffix is what follows the LAST dot.
+mkdir -p "$T27/dot" "$T27/acct-home/.config/systemd/user/foo.bar-.service.d"
+printf '[Service]\nEnvironment=CELL_HOME=%s\n' "$T27/acct-home" >"$T27/dot/foo.bar-baz.service"
+printf 'Environment=CELL_HOME=%s\n' "$T27/legacy-home" >"$T27/acct-home/.config/systemd/user/foo.bar-.service.d/50-trunc.conf"
+OUT="$(run_under HARNESS_APPLY_CONTROLLER_UNIT="$T27/dot/foo.bar-baz.service" "${HA_CONV[@]}" --print-status)"
+assert_contains "$OUT" "split_home=$T27/legacy-home" \
+    "T27 a DOTTED unit name still builds …/foo.bar-.service.d — the type suffix follows the LAST dot"
+# ⛔ A TRAILING SLASH IS THE SAME HOME (review P2, reproduced). The guard compared RAW strings, so a unit
+# rendering `Environment=HOME=<acct>/` against the derived `<acct>` — one home, one character apart —
+# exited 27 claiming "two live homes on one box", on exactly the home the guard exists to protect. The
+# installer refuses whitespace and backslashes in that value, never a trailing slash. ⛔ THE OVERRIDE GOES
+# AFTER `"${HA_ENV[@]}"`: `env` is last-wins, so an argument before it would be silently overridden.
+# ⛔ THE CONTROLLER LEG IS SEAMED OFF HERE ON PURPOSE, AND THE REASON IS THE **HOST**, NOT THIS SUITE
+# (review cycle-4 #4, measured — the earlier note named a suite global that does not exist: every
+# `CONTROLLER_SYSTEM_UNIT_DIR` use here is a per-invocation `*=*` argument, `run_under` builds `env -i`
+# from its arguments only, and no arm installs into `/etc/systemd/system`). Without the seam,
+# `split_home_controller` takes its `else` branch and finds THIS BOX'S real
+# `/etc/systemd/system/eldato-orchestrator.service` (which pins `/home/cmux`), so the arm would measure
+# the host's controller split instead of the HOME spelling it names. `absent.service` makes the controller
+# answer nothing, leaving the trailing slash as the only comparison.
+OUT="$(run_under HARNESS_APPLY_CONTROLLER_UNIT="$T27/absent.service" "${HA_ENV[@]}" HOME="$T27/acct-home/")"; RC=$?
+if [ "$RC" = "27" ]; then
+    bad "T27 a trailing slash on the unit's HOME is the SAME home, not a split (it refused, 27)"
+else
+    ok "T27 a trailing slash on the unit's HOME is the same home, not a split (rc=$RC)"
+fi
+assert_absent "$OUT" "REFUSED split-home" "T27 …and nothing claims two live homes over one home"
+# ⛔ NO RESOLVER IS A THIRD STATE, NOT "NO SPLIT" (review P2, reproduced). With `lib/cell-home.sh` absent
+# beside the pass neither split leg can run, `SPLIT_HOME` stays empty — and a reading that prints `none`
+# then reads as MEASURED AGREEMENT, the reading this file's own notes call worse than no guard. Every
+# sibling consumer REFUSES (exit 78) when it cannot resolve; the pass is the guard, so it must at least
+# say that it could not measure.
+mkdir -p "$T27/nolib"
+cp "${PASS_UNDER_TEST:-$PASS_SH}" "$T27/nolib/harness-apply-pass.sh"
+OUT="$(env -i PATH="$ACCT27:/usr/bin:/bin:/usr/sbin:/sbin" HOME="$T27/acct-home" CELL_HOME="$T27/acct-home" \
+    HARNESS_APPLY_STATE_DIR="$T27/state" bash "$T27/nolib/harness-apply-pass.sh" --print-status 2>&1)"
+assert_contains "$OUT" "split_home=unmeasurable" \
+    "T27 with no resolver beside the pass the reading says UNMEASURABLE, so nobody infers agreement"
+# ⛔ THE SECOND ASSERTION HERE USED TO BE `assert_absent "$OUT" "split_home=none"` AND IT COULD NOT FAIL
+# (review cycle-9 #3, reason corrected cycle-10 #3). `--print-status` prints the reading line when a split
+# EXISTS (`split_home=<home> …`) and when the split could not be measured (`split_home=unmeasurable`, added
+# by this branch), but never the acting path's `split_home=none` token — so `split_home=none` was absent
+# from its output under EVERY implementation, the arm was vacuous, and a vacuous arm reads as coverage that
+# does not exist. (The first version of this note said the verb never prints a `split_home=` field at all,
+# which the two assertions written beside it contradict.) What must be non-empty is the DISCLOSURE, so that
+# is what is asserted: a reader that stayed silent would fail here.
+assert_contains "$OUT" "NOTHING was measured" \
+    "T27 …and the reading SAYS nothing was measured, so it cannot be taken as agreement"
+# ⛔ A READABLE UNIT WHOSE VALUE CANNOT BE INTERPRETED IS THE SAME CLASS, BY A SECOND ROUTE (review
+# cycle-9 #6, reproduced). `environment_cell_home` discards a value containing `{` (an unrendered
+# template) or `%` (a systemd specifier), so `_ctrl_home` came back empty and the split test concluded
+# `none` — "I could not read the controller" printed as "the controller agrees". Both spellings are
+# pinned: the state must be `unmeasurable`, and the acting verb must NOT refuse (there is no measured
+# disagreement to refuse on — inventing one would be a false block on a box that may be perfectly fine).
+for _spell in '{{CELL_HOME}}' '%h'; do
+    mkdir -p "$T27/unrend"
+    printf '[Service]\nEnvironment=CELL_HOME=%s\n' "$_spell" >"$T27/unrend/unrend.service"
+    OUT="$(run_under HARNESS_APPLY_CONTROLLER_UNIT="$T27/unrend/unrend.service" "${HA_CONV[@]}" --print-status)"; RC=$?
+    assert_contains "$OUT" "split_home=unmeasurable" \
+        "T27 a controller pinning '$_spell' is READ BUT NOT MEASURABLE — it must not read as agreement"
+    if [ "$RC" = "27" ]; then
+        bad "T27 …and it is NOT refused over a value that was never measured ('$_spell')"
+    else
+        ok "T27 …and no split is claimed over a value that was never measured ('$_spell', rc=$RC)"
+    fi
+done
+# ⛔ PRECEDENCE DECIDES WHICH ANSWER IS THE READING (review cycle-10 #1, reproduced against the pre-fix
+# code). `split_home_controller` applies systemd's order — the unit, then its drop-ins, later drop-in
+# winning — so the LAST measurable-or-not answer is the value the box actually runs. The first cut only
+# LATCHED the "unmeasurable" flag, which meant a drop-in pinning `{{CELL_HOME}}` OVER a unit pinning a real
+# home still reported that real home: the reading printed agreement for a value the box does not run. Both
+# directions are pinned, because a fix that only ever prefers "unmeasurable" would be wrong the other way.
+# ⛔ THE FIXTURE NAMES CARRY NO DASH ON PURPOSE. `dropin_cell_home` also builds systemd's DASH-TRUNCATED
+# directories (`<prefix>-.service.d`), so a unit named `eldato-prec.service` also reads
+# `eldato-.service.d` — and earlier arms in this block leave a `CELL_HOME=<legacy-home>` drop-in there. The
+# first cut of this arm used a dashed name and measured that leftover instead (reported
+# `split_home=…/legacy-home`): the arm was failing on a neighbour's fixture, not on the code.
+mkdir -p "$T27/prec/prec.service.d" "$T27/prec/otheru.service.d"
+printf '[Service]\nEnvironment=CELL_HOME=%s\n' "$T27/acct-home" >"$T27/prec/prec.service"
+printf 'Environment=CELL_HOME={{CELL_HOME}}\n' >"$T27/prec/prec.service.d/50-over.conf"
+OUT="$(run_under HARNESS_APPLY_CONTROLLER_UNIT="$T27/prec/prec.service" "${HA_CONV[@]}" --print-status)"; RC=$?
+assert_contains "$OUT" "split_home=unmeasurable" \
+    "T27 a HIGHER-precedence drop-in pinning {{CELL_HOME}} OVERRIDES the unit's measurable home — the reading is unmeasurable, not agreement"
+[ "$RC" = "27" ] && bad "T27 …and no split is invented over a value that was never measured (rc 27)" \
+  || ok "T27 …and no split is invented over a value that was never measured (rc=$RC)"
+printf '[Service]\nEnvironment=CELL_HOME=%s\n' "$T27/acct-home" >"$T27/prec/otheru.service"
+printf 'Environment=CELL_HOME={{CELL_HOME}}\n' >"$T27/prec/otheru.service.d/50-a.conf"
+printf 'Environment=CELL_HOME=%s\n' "$T27/legacy-home" >"$T27/prec/otheru.service.d/60-b.conf"
+OUT="$(run_under HARNESS_APPLY_CONTROLLER_UNIT="$T27/prec/otheru.service" "${HA_CONV[@]}" --print-status)"
+assert_contains "$OUT" "split_home=$T27/legacy-home" \
+    "T27 a LATER measurable drop-in (60-b) CLEARS an earlier unmeasurable one (50-a) — the last answer wins, as systemd does"
+assert_absent "$OUT" "split_home=unmeasurable" "T27 …and the reading is not left saying unmeasurable once a later drop-in was measured"
+# ── T28: `$HERE` is CDPATH-IMMUNE, so the value every path beside this pass is built from is ONE line ──
 # ⛔ THE ONE CDPATH SITE THE SUITE DID NOT PIN (review round 11, closed here). `$HERE` is captured with
 # `CDPATH=` for the same reason as the other five sites: bash's `cd` PRINTS the resolved directory when
 # it resolves through an inherited CDPATH, so `$HERE` would hold TWO lines, and every path built from it
@@ -3703,34 +4381,86 @@ assert_absent "$OUT" "farm: DRIFT" "T26 control: so the farm grade this feature 
 # `/.pi/agent/scripts` — true, but the refusals are not the only observable: the `deployed_drift=not-run`
 # line QUOTES `$HERE` (`harness-apply-pass.sh:856`), so the text that must follow it ON THE SAME LINE is
 # what a mangled value breaks. Hence the relative invocation under an inherited CDPATH below.
-say_case "T27 \$HERE is CDPATH-immune — a relative invocation under an inherited CDPATH stays ONE line"
-mk_origin t27; mk_clone t27; write_sync_stub
+say_case "T28 \$HERE is CDPATH-immune — a relative invocation under an inherited CDPATH stays ONE line"
+mk_origin t28; mk_clone t28; write_sync_stub
 REPO_P="$CLONE"; MODE_P=sync
 # The pass is COPIED into a directory whose name does not begin with `.`: `cd` ignores CDPATH when the
 # directory argument begins with `.`, so a `.pi/agent/scripts`-shaped dirname can never reach the hazard
 # at all — which is precisely why a farm-shaped fixture pins nothing.
-mkdir -p "$T/t27/fhx" "$T/t27/home/.pi/agent/state" "$T/t27/state" "$T/t27/nocheck"
-cp "${PASS_UNDER_TEST:-$PASS_SH}" "$T/t27/fhx/harness-apply-pass.sh"
-t27_run() { # <cdpath> — the pass by RELATIVE path from $T/t27, with an EXPLICIT CDPATH
-    ( cd "$T/t27" && CDPATH="$1" HARNESS_REPO="$REPO_P" HARNESS_REF=origin/main HARNESS_FETCH=1 \
-        HARNESS_APPLY_STATE_DIR="$T/t27/state" HARNESS_APPLY_MODE="" \
-        HARNESS_PIN="$T/t27/home/.pi/agent/state/HARNESS-PIN" HARNESS_PIN_FILE="$T/t27/home/.harness-path" \
-        HARNESS_PIN_DIR="$T/t27/home/harness" CELL_HOME="$T/t27/home" O="$T/t27/home/orchestrator" \
+mkdir -p "$T/t28/fhx" "$T/t28/home/.pi/agent/state" "$T/t28/state" "$T/t28/nocheck"
+cp "${PASS_UNDER_TEST:-$PASS_SH}" "$T/t28/fhx/harness-apply-pass.sh"
+t28_run() { # <cdpath> — the pass by RELATIVE path from $T/t28, with an EXPLICIT CDPATH
+    ( cd "$T/t28" && CDPATH="$1" HARNESS_REPO="$REPO_P" HARNESS_REF=origin/main HARNESS_FETCH=1 \
+        HARNESS_APPLY_STATE_DIR="$T/t28/state" HARNESS_APPLY_MODE="" \
+        HARNESS_PIN="$T/t28/home/.pi/agent/state/HARNESS-PIN" HARNESS_PIN_FILE="$T/t28/home/.harness-path" \
+        HARNESS_PIN_DIR="$T/t28/home/harness" CELL_HOME="$T/t28/home" O="$T/t28/home/orchestrator" \
         AGENT_INFRA_PATH= HARNESS_APPLY_SYNC_CMD="$T/sync-stub.sh" \
-        HARNESS_APPLY_DRIFT_CHECK=1 HARNESS_APPLY_DRIFT_DIR="$T/t27/nocheck" \
+        HARNESS_APPLY_DRIFT_CHECK=1 HARNESS_APPLY_DRIFT_DIR="$T/t28/nocheck" \
         bash "fhx/harness-apply-pass.sh" --dry-run 2>&1 )
 }
-# ⛔ THE ASSERTION IS THE BOUNDARY, NOT THE PATH. `beside $T/t27/fhx` alone matches a TWO-LINE value as
+# ⛔ THE ASSERTION IS THE BOUNDARY, NOT THE PATH. `beside $T/t28/fhx` alone matches a TWO-LINE value as
 # well (its first line is that same string), so on its own it would pin nothing — the text that must
 # follow on the SAME line is `, in $O=`, and a doubled capture puts a newline there instead.
-OUT="$(t27_run "$T/t27" 2>&1)"
-assert_contains "$OUT" "beside $T/t27/fhx, in \$O=" \
-    "T27 an inherited CDPATH does not double \$HERE — the value is ONE line, so every path built from it resolves"
+# ⛔ AND THE PREFIX IS A `pwd` VALUE, NOT `$T` (host-class false block, repaired here). On a host whose
+# `TMPDIR` ends with `/` (macOS), `mktemp -d "$TMPDIR/x.XXXXXX"` yields a `$T` containing `//`, while the
+# pass's `$HERE` is `cd … && pwd` and comes back SINGLE-slashed — so an assertion built from `$T` can
+# never match, and this arm red on macOS for a reason that has nothing to do with CDPATH. Collapsing it
+# the same way the pass does keeps the arm measuring the newline, which is what it is for.
+T28P="$(cd "$T" && pwd)"
+OUT="$(t28_run "$T/t28" 2>&1)"
+assert_contains "$OUT" "beside $T28P/t28/fhx, in \$O=" \
+    "T28 an inherited CDPATH does not double \$HERE — the value is ONE line, so every path built from it resolves"
 # Control: the SAME fixture with no CDPATH. If this stops producing the same boundary, the row above is
 # passing for a reason other than the `CDPATH=` prefix and would no longer pin it.
-OUT="$(t27_run "" 2>&1)"
-assert_contains "$OUT" "beside $T/t27/fhx, in \$O=" \
-    "T27 control: the same boundary holds with no CDPATH at all (so the row above is not an artifact of the fixture)"
+OUT="$(t28_run "" 2>&1)"
+assert_contains "$OUT" "beside $T28P/t28/fhx, in \$O=" \
+    "T28 control: the same boundary holds with no CDPATH at all (so the row above is not an artifact of the fixture)"
+
+# ── T29: THE INSTALLED UNIT EXPORTS ONE HOME, NOT TWO (review F2) ────────────────────────────────
+# ⛔ THE REGRESSION THIS PINS. Once the systemd render was handed the DERIVED home, the unit carried
+# `Environment=HOME=<derivation>` while `HARNESS_APPLY_STATE_DIR` still defaulted to
+# `${HOME}/.pi/agent/state` — the INVOKING SHELL's home. Before that commit both came from `$HOME` and
+# were at least self-consistent; after it, on exactly the channel the derivation targets (`cmux vm exec`,
+# `HOME=/home/ubuntu`, derivation `/home/cmux`), one unit carried TWO homes. The consequence is the
+# #2416/#2032 inert-enforcer shape with the parts swapped: the scheduled pass writes
+# `harness-apply.status` where the box does not look, while an operator (or fleet-health) reads
+# `$CELL_HOME/.pi/agent/state/harness-apply.status` and finds nothing.
+# ⛔ NEITHER EXISTING GUARD COULD SEE IT: `refuse_transient_target` grades transient-scratch patterns
+# (`$T29` is not one), `refuse_systemd_unsafe_values` grades characters, and the pass's own split guard
+# compares `HOME` against the derivation — and `HOME` is now the value that AGREES.
+say_case "T29 the rendered unit exports ONE home: HOME and HARNESS_APPLY_STATE_DIR agree"
+T29="$T/t29"; mkdir -p "$T29/cellhome" "$T29/shellhome" "$T29/units" "$T29/farm/.pi/agent/scripts"
+cp "$PASS_SH" "$T29/farm/.pi/agent/scripts/harness-apply-pass.sh"
+# `HARNESS_APPLY_STATE_DIR` is DELIBERATELY NOT SET: the default is the thing under test.
+# ⛔ `ELDATO_PLATFORM=Linux` IS EXPLICIT (the seam T11 uses for Darwin): the arm grades the SYSTEMD
+# render, and on a Mac the installer would otherwise take the launchd branch and this row would pass or
+# fail for a reason unrelated to the home split (the T3-class host dependence).
+OUT="$(HOME="$T29/shellhome" CELL_HOME="$T29/cellhome" ELDATO_PLATFORM=Linux \
+    HARNESS_APPLY_PASS="$T29/farm/.pi/agent/scripts/harness-apply-pass.sh" \
+    HARNESS_APPLY_REPO="$REPO_P" SYSTEMD_UNIT_DIR="$T29/units" SYSTEMCTL="$T/bin/systemctl" \
+    SYSTEMCTL_CALLS=/dev/null bash "$INST" --install 2>&1)"; RC=$?
+assert_eq "$RC" "0" "T29 the install succeeds on a box whose shell HOME is not its CELL_HOME"
+SVC29="$(cat "$T29/units/eldato-harness-apply.service" 2>/dev/null)"
+UNIT_HOME29="$(printf '%s\n' "$SVC29" | sed -n 's/^Environment=HOME=//p')"
+UNIT_STATE29="$(printf '%s\n' "$SVC29" | sed -n 's/^Environment=HARNESS_APPLY_STATE_DIR=//p')"
+# The two reads must have produced a value each — otherwise the assertions below would compare two
+# empty strings and pass for the wrong reason.
+assert_eq "$UNIT_HOME29" "$T29/cellhome" "T29 the unit's HOME is the DERIVED home (the value that was already fixed)"
+case "$UNIT_STATE29" in
+    "$UNIT_HOME29"/*) ok "T29 …and HARNESS_APPLY_STATE_DIR sits INSIDE that same home, so both Environment= lines name ONE home" ;;
+    *) bad "T29 the unit exports HOME=$UNIT_HOME29 but HARNESS_APPLY_STATE_DIR=$UNIT_STATE29 — one unit, two homes (the pass would record where nobody reads)" ;;
+esac
+assert_absent "$SVC29" "$T29/shellhome" "T29 …and the INVOKING shell's home is nowhere in the unit"
+# The control that makes the row above a test of the default rather than of the seam: an EXPLICIT
+# HARNESS_APPLY_STATE_DIR is still honoured verbatim (it is a documented override, not a victim).
+OUT="$(HOME="$T29/shellhome" CELL_HOME="$T29/cellhome" ELDATO_PLATFORM=Linux \
+    HARNESS_APPLY_PASS="$T29/farm/.pi/agent/scripts/harness-apply-pass.sh" \
+    HARNESS_APPLY_REPO="$REPO_P" HARNESS_APPLY_STATE_DIR="$T29/explicit-state" \
+    SYSTEMD_UNIT_DIR="$T29/units2" SYSTEMCTL="$T/bin/systemctl" SYSTEMCTL_CALLS=/dev/null \
+    bash "$INST" --install 2>&1)"; RC=$?
+assert_eq "$RC" "0" "T29 control: an EXPLICIT HARNESS_APPLY_STATE_DIR still installs"
+assert_contains "$(cat "$T29/units2/eldato-harness-apply.service" 2>/dev/null)" "$T29/explicit-state" \
+    "T29 control: …and is honoured verbatim, so the row above measures the DEFAULT"
 
 echo
 echo "────────────────────────────────────────────────────────"

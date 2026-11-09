@@ -313,7 +313,9 @@ SUP=$SNAP/scripts/cloud-cell-supervisor.sh
 #    how an operator reads "fix absent" as "nothing to fix".
 bash $SUP check
 
-# 2. REPAIR the pair — pick ONE. On a post-#2093 snapshot the refusal prints both, with the values filled in.
+# 2. REPAIR the pair — pick ONE. On a post-#2093 snapshot the refusal PRINTS (a) with the values filled in, and
+#    names (b) as prose — (b) repoints the checkout at a different repo on disk, so the supervisor will not
+#    spell the command out for you.
 cp /tmp/cell-home/keys.env /tmp/cell-home/keys.env.bak-$(date -u +%Y%m%dT%H%M%SZ)
 # (a) let the queue follow the checkout — the repair that cannot be wrong about WHICH side is stale.
 #     ⛔ THE PREFIX IS OPTIONAL ON PURPOSE: a cell's keys.env carries the EXPORTED form as often as the
@@ -345,8 +347,9 @@ case: its `OR` names agent-infra while `REPO` is a tortoise tree, and that cell'
 checkout says. (The command is the `sed -E` in step 2 (a) above, not a bare `^OR=` anchor: a `keys.env`
 written `export OR=…` or `declare -x OR=…` is common enough that the narrow form silently edits nothing.)
 If the intent is the opposite — the box MUST work agent-infra PRs — use (b), because then the *checkout* is
-what is stale. Nothing in the supervisor can decide that for you, which is why the refusal prints both and
-the repair is not automated: `stop` refusing is the guard, and picking the direction is the operator's call.
+what is stale. Nothing in the supervisor can decide that for you, which is why the refusal prints (a) and
+names (b) in prose, and the repair is not automated: `stop` refusing is the guard, and picking the
+direction is the operator's call.
 
 ### 3.3 Not deployed for scheduling reasons, not for correctness
 
@@ -386,7 +389,8 @@ was 14 working of 76 resident, and `zombie=` is in the same line so a box full o
 - **Cloud cell** — `check` → `stop` → `start`. `start` runs `apply` (fetch `origin/main`, write an
   immutable `<sha12>/` snapshot, move the pin, stamp) before launching. Never hand-edit a file inside a
   snapshot: it destroys the per-file provenance proof. ⛔ **`check` first, always:** it is the read-only
-  pre-flight, and since agent-infra#2093 `stop` refuses the same unusable pairs `start` refuses — so a
+  pre-flight, and since agent-infra#2093 `stop` refuses the same unusable pairs `start` refuses — it
+  just also requires that the state dir has something a stop would end — so a
   wrong `OR`/`REPO` pair now surfaces at step 1 instead of leaving the box stopped and unrefreshed. ⛔
   **On a snapshot that includes #2093.** On an older snapshot this claim does not hold as written: there
   `stop` has no gate, and the safety is `check`'s alone — which has always refused, so the sequence is

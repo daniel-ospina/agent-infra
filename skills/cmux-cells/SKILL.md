@@ -40,14 +40,17 @@ The documented path, run ON the cell:
 git clone https://github.com/daniel-ospina/agent-infra.git /tmp/cell-ai
 cd /tmp/cell-ai && git checkout main
 bash pi-bootstrap/cell-install.sh            # the operational layer: scripts farm, guards, skills, config
-HOME=/tmp/cell-home bash scripts/cloud-cell-bringup.sh --check   # → should end: CELL READY
+bash scripts/cloud-cell-bringup.sh --check   # → should end: CELL READY
 ```
 
-`HOME=/tmp/cell-home` is mandatory — not because exec's own home is broken (measured 2026-10-27: exec runs as `cmux` with a
-writable `HOME=/home/cmux`), but because **the operational layer is installed under `$CELL_HOME=/tmp/cell-home`**:
-`record-review.sh`, the `gh` shim and the extensions all live under `/tmp/cell-home/.pi/agent`, so a lane launched without it
-reads an empty home and silently loses the merge path. (`scripts/cloud-cell-bringup.sh` still carries an older
-`/home/ubuntu` explanation — that part is stale.)
+⛔ **NO HOME OVERRIDE — the layer and the credential now live in the SAME home (agent-infra#3453, measured 2026-11-05).**
+This block used to say `HOME=/tmp/cell-home` was mandatory, because the operational layer (`record-review.sh`, the `gh` shim,
+the extensions) was installed under `/tmp/cell-home/.pi/agent`. That put the LAYER in `/tmp/cell-home` and the model
+CREDENTIAL in the account home (`/home/cmux/keys.env`), so a 17-lane wave produced **0 landings**: every `git push` answered
+`403 … contents=write` while `gh` READS still worked, and it read as a token problem. One home now: `scripts/lib/cell-home.sh`
+DERIVES it (`$CELL_HOME`, else the passwd record's home — `/home/cmux` on a cell), every unit renderer consumes that resolver,
+and `cloud-cell-bringup.sh --check` REFUSES a box whose `CELL_HOME` is not the account home. Do not set `HOME` or `CELL_HOME`
+by hand; a box still on `/tmp/cell-home` is converged with `bash scripts/cell-home-migrate.sh --check`, then `--apply`.
 
 ⛔ **AND THE SAME REDIRECTION IS WHAT HIDES THE CREDENTIAL — the half of this fact that bites (agent-infra#3331, measured
 2026-11-02).** The model credential normally lives in the **ACCOUNT** home's `keys.env` (`/home/cmux/keys.env`), i.e. *not*
@@ -161,8 +164,11 @@ reads an installed FILE; none of them proves a lane can get a token. This is the
 exactly one line:
 
 ```bash
-env -i HOME=/tmp/cell-home PATH="$PATH" pi -p "reply with exactly PROVIDER_OK"   # → PROVIDER_OK, no trailing noise
+env -i HOME=/home/cmux PATH="$PATH" pi -p "reply with exactly PROVIDER_OK"   # → PROVIDER_OK, no trailing noise
 ```
+
+⛔ **`/home/cmux`, not the legacy `/tmp/cell-home`** (agent-infra#3453): the durable account home is the one cell home, derived
+by `scripts/lib/cell-home.sh`. A clean shell pointed at the legacy volatile home proves nothing about the box a lane runs on.
 
 ⛔ **`env -i` IS THE POINT, not decoration.** An operator shell on a cell already carries
 `DEEPSEEK_API_KEY`, so a plain `HOME=… pi -p …` answers even when the store is `{}` — the exact false
@@ -573,12 +579,15 @@ killed 37 processes *and the tmux server*, losing every lane. The gate would hav
   which pins its own pair. Also note `No API key found for the selected model.` and `No API key found for <provider>.` are
   two different sentences: only the second names the provider whose credential is missing, and #3443 is the record of how
   much was inferred from the first.
-- ⛔ **AND THE REDIRECTED `HOME` IS WHAT HIDES IT — the trap this bullet used to state only half of** (agent-infra#3331,
-  measured 2026-11-02 on two cells). A lane MUST run with `HOME=$CELL_HOME` (default `/tmp/cell-home`), because the
-  operational layer — `record-review.sh`, the gh shim, the extensions — lives under `$CELL_HOME/.pi/agent`. But the
-  credential normally lives in the **ACCOUNT** home's `keys.env` (`/home/cmux/keys.env`), and `lane-env.sh` sources
-  `${ENV_FILE:-$HOME/keys.env}` — the *redirected* one. So **the single setting that makes the operational layer work is the
-  setting that hides the credential**, and the lane dies in seconds having done nothing. Three consequences for an operator:
+- ⛔ **THE REDIRECTED `HOME` IS WHAT HID THE CREDENTIAL — closed on a converged box, still the trap on one that is not**
+  (agent-infra#3331, measured 2026-11-02 on two cells; unified by agent-infra#3453). A lane runs with `HOME=$CELL_HOME`, and
+  `$CELL_HOME` is **DERIVED** by `scripts/lib/cell-home.sh` — the ACCOUNT home (`/home/cmux`) on a converged cell, never the
+  legacy `/tmp/cell-home` — so do not set either by hand. On a box that has NOT been converged the operational layer
+  (`record-review.sh`, the gh shim, the extensions) lives under the legacy home while the model credential lives in the
+  **ACCOUNT** home's `keys.env` (`/home/cmux/keys.env`), and `lane-env.sh` sources `${ENV_FILE:-$HOME/keys.env}` — the
+  *redirected* one. So **the single setting that made the operational layer work was the setting that hid the credential**,
+  and the lane died in seconds having done nothing. Check the box with `bash scripts/cell-home-migrate.sh --check` before
+  diagnosing a credential. Three consequences for an operator:
   launch with the harness (`lane.sh`/`lane-exec.sh`, which pin the pair) rather than a hand-written `pi` line; read the
   lane's LAST log line before concluding anything — since #3331 `lane.sh` refuses a keyless environment **before** spawning
   `pi` (`[key-gate] … result=REFUSED var=<NAME>`, exit **82**) and every lane log ends with

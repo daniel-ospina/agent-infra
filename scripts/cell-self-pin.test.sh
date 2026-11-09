@@ -2025,8 +2025,9 @@ else bad "the shipped template did not install: $(cat "$T/install.log")"; fi
 # `home_real` was always `cd "$CELL_HOME" && pwd -P` (RESOLVED) while `exec_real` stayed the RAW
 # `$CELL_HOME/…` string whenever the payload's parent did not resolve — which is EVERY FIRST INSTALL,
 # because `place_pass` runs AFTER `verify_unit`, so `$CELL_HOME/.pi/agent/scripts` does not exist yet.
-# On any box whose `$CELL_HOME` is reached through a symlink — macOS `CELL_HOME=/tmp/cell-home` →
-# `/private/tmp/cell-home`, the supervisor's own documented default — the two strings could never match
+# On any box whose `$CELL_HOME` is reached through a symlink — an operator-set `CELL_HOME=/tmp/cell-home`
+# → `/private/tmp/cell-home` on macOS is the measured example (the legacy home is not a DEFAULT anywhere
+# since agent-infra#3453, but it can still be SET) — the two strings could never match
 # and the FIRST install was refused with a cause naming the containment rule, on a payload that was
 # inside the home. The second attempt passed only because the first had created the parent in between,
 # i.e. the operator's remedy was "run it twice". MEASURED here: rc=1, "ExecStart resolves to
@@ -2589,20 +2590,44 @@ case "$out" in
   *'UNKNOWN (2) — the fetch failed'*) ok "…and the verdict names the FAILED FETCH as its reason, so the two rules are distinguishable on the operator's line too" ;;
   *) bad "…but the verdict does not name the failed fetch: $out" ;;
 esac
-# ⛔ (b) A RENDER REFUSES WHEN `CELL_HOME` IS UNSET. The installer's default is `$HOME`; the READER of the
-# record it derives from defaults to `/tmp/cell-home` (the supervisor's own `CELL_HOME="${CELL_HOME:-/tmp/cell-home}"`). Rendering bakes
-# `Environment=CELL_HOME=` into /etc/systemd/system for ever, and `verify_unit`'s CELL_HOME assertion is
-# self-referential (it compares the artifact with the same already-wrong value), so nothing else can catch
-# it. Refusing at the one moment the value becomes permanent is the only fail-closed answer.
+# ⛔ (b) A RENDER REFUSES WHEN `CELL_HOME` IS UNSET. The value is now DERIVED
+# (`scripts/lib/cell-home.sh`, agent-infra#3453) and the READER of the record it derives from —
+# cloud-cell-supervisor.sh — consumes the SAME resolver, so the two can no longer disagree about which home
+# is the cell's. What a derivation cannot supply is the OPERATOR'S decision, and rendering bakes
+# `Environment=CELL_HOME=` into /etc/systemd/system for ever, while `verify_unit`'s CELL_HOME assertion is
+# self-referential (it compares the artifact with the same value). Refusing at the one moment the value
+# becomes permanent is the only fail-closed answer — and the refusal must NAME the derived value it would
+# have written, so the operator sees what they are about to make permanent.
 out="$(env -u CELL_HOME -u HARNESS -u HARNESS_PIN_FILE -u HARNESS_PIN_DIR -u HARNESS_REPO -u O -u STAMP \
      -u TEMPLATES_DIR -u SYSTEMD_UNIT_DIR -u CELL_SELF_PIN_INTERVAL_MIN \
      -u CELL_SELF_PIN_ALLOW_DUPLICATE_ACTUATOR -u CELL_SELF_PIN_SRC \
      PATH="$T/fakebin-none:$PATH" HOME="$T/home" bash "$PIN" --print-unit 2>&1)"; rc=$?
-[ "$rc" -ne 0 ] && ok "--print-unit REFUSES to render when CELL_HOME is unset (the base would be \$HOME, not the supervisor's)" \
-  || bad "a render with CELL_HOME unset succeeded (rc=$rc) — it bakes a WRONG base into the unit: $out"
+[ "$rc" -ne 0 ] && ok "--print-unit REFUSES to render when CELL_HOME is unset (an explicit base is required to make it permanent)" \
+  || bad "a render with CELL_HOME unset succeeded (rc=$rc) — it bakes an unconfirmed base into the unit: $out"
+# ⛔ AND IT NAMES THE DERIVED VALUE, not the pre-#3453 divergence. This arm used to assert the string
+# `/tmp/cell-home` — the LEGACY home the old message pointed at — which is now the one answer the resolver
+# must never produce. A test asserting a literal there would pin the defect in place.
+# ⛔ AND IT IS NOT A FIXTURE LITERAL EITHER. The first version of this arm asserted the fixture's
+# `$T/home` — which is WRONG ON EVERY REAL HOST, because the resolver's precedence puts the PASSWD
+# record's home AHEAD of `$HOME`: on a CI runner the derived value is `/home/runner`, on a cell
+# `/home/cmux`, never the temp-dir fixture home. So the arm read as a defect in the product and was a
+# host assumption in the test (measured: `505 ok, 1 failed` on the `cmux` cell, the one leg red).
+# The assertion is therefore against the value THE ONE RESOLVER ANSWERS for this same environment —
+# that IS the contract ("the refusal names the derived value"), it is host-independent, and it is
+# non-vacuous: on pre-#3453 code `lib/cell-home.sh` does not exist, so the derivation below yields
+# nothing and this leg still fails.
+derived=""; derived="$(cd "$T" && env -u CELL_HOME -u HOME_ORIG -u CELL_HOME_FLEET_DEFAULT \
+  PATH="$T/fakebin-none:$PATH" HOME="$T/home" \
+  bash -c '. "$1/lib/cell-home.sh" && cell_home_resolve' _ "$SELF" 2>/dev/null)"
+[ -n "$derived" ] && ok "…the derivation is READABLE (scripts/lib/cell-home.sh answers '$derived' in this env), so the assertion below measures the product and not an absent file" \
+  || bad "…scripts/lib/cell-home.sh did not answer a derived value in this env, so the arm below cannot measure anything"
 case "$out" in
-  *'CELL_HOME'*'/tmp/cell-home'*) ok "…and the refusal names the divergence (CELL_HOME vs the supervisor's /tmp/cell-home)" ;;
-  *) bad "…but the refusal does not name the divergence it refused for: $out" ;;
+  *"$derived"*) ok "…and the refusal names the DERIVED value it would have written ('$derived' — the resolver's answer, not a fixture literal)" ;;
+  *) bad "…but the refusal does not name the derived value '$derived' it refused over: $out" ;;
+esac
+case "$out" in
+  *'3453'*) ok "…citing agent-infra#3453 as the reason the two sides now agree" ;;
+  *) bad "…but the refusal does not cite the change that unified the derivation: $out" ;;
 esac
 
 printf '\n%d ok, %d failed\n' "$ok_n" "$bad_n"

@@ -12,15 +12,38 @@
 #     bash cloud-cell-quiesce.sh
 #
 # Env: REPO (required) OR (required) SCOPE (default own) MAX_LANES (default 3)
-#      CELL_HOME (default /tmp/cell-home) ENV_FILE (default $CELL_HOME/keys.env)
+#      CELL_HOME (default: DERIVED — the box's durable home, see scripts/lib/cell-home.sh)
+#      ENV_FILE (default $CELL_HOME/keys.env)
 #      HARNESS (default $REPO/scripts/orchestrator-harness)
 set -uo pipefail
+
+# ── THE ONE HOME (agent-infra#3453) — DERIVED, never re-spelled ──────────────────────────────────
+# This default used to be `/tmp/cell-home`, the legacy volatile home: the quiesce then re-created the
+# controller session with `HOME=/tmp/cell-home` while the unit that spawns lanes gave them
+# `/home/cmux`, so the relaunched controller's `git push` read a `contents=read` PAT while its `gh`
+# reads worked. One derivation, one home: `scripts/lib/cell-home.sh`.
+# ⛔ THE SELF PATH COUNTS ONLY WHEN IT NAMES THIS FILE — see `lib/cell-home.sh` §CONSUMERS.
+_SELF="${BASH_SOURCE[0]:-}"; [ -f "$_SELF" ] || _SELF=""     # under `bash -s` $0 is literally `bash` -> `.`
+QUIESCE_SELF_DIR=""
+if [ -n "$_SELF" ]; then QUIESCE_SELF_DIR="$(cd "$(dirname "$_SELF")" 2>/dev/null && pwd -P)"; fi
+CELL_HOME_LIB="${QUIESCE_SELF_DIR:+$QUIESCE_SELF_DIR/lib/cell-home.sh}"
+if [ -n "$CELL_HOME_LIB" ] && [ -r "$CELL_HOME_LIB" ]; then
+  . "$CELL_HOME_LIB"
+  CELL_HOME="$(cell_home_resolve)"
+elif [ -n "${CELL_HOME:-}" ]; then
+  :   # an explicit CELL_HOME is a complete answer; the resolver only supplies the DEFAULT
+elif [ -n "${HOME:-}" ]; then
+  CELL_HOME="$HOME"
+  printf '%s: warn: %s is not readable — using HOME (%s) as the cell home; the durable-home default is unavailable on this copy (agent-infra#3453)\n' "${0##*/}" "${CELL_HOME_LIB:-lib/cell-home.sh}" "$CELL_HOME" >&2
+else
+  printf '%s: FATAL: %s is not readable and neither CELL_HOME nor HOME is set — refusing to default the cell home to the legacy /tmp/cell-home (agent-infra#3453)\n' "${0##*/}" "${CELL_HOME_LIB:-lib/cell-home.sh}" >&2
+  exit 78
+fi
 
 REPO="${REPO:?REPO is required}"
 OR="${OR:?OR is required}"
 SCOPE="${SCOPE:-own}"
 MAX_LANES="${MAX_LANES:-3}"
-CELL_HOME="${CELL_HOME:-/tmp/cell-home}"
 ENV_FILE="${ENV_FILE:-$CELL_HOME/keys.env}"
 O="${O:-$CELL_HOME/orchestrator}"
 HARNESS="${HARNESS:-$REPO/scripts/orchestrator-harness}"
@@ -138,9 +161,11 @@ step "wip-sweep: ${SWEEP:-<none found — WORK ON THIS BOX WILL NOT BE ARCHIVED>
 #    leaves the fix-*/merge-*/chain-* sessions (and their claim leases) behind.
 # ⛔ --force (agent-infra#2093): this script's whole verb is "end every controller on this box", and
 # it sweeps with `tmux kill-server` + `pkill` immediately below whatever the supervisor answers. The
-# supervisor's new queue-target pre-flight refuses `stop` on a mismatch WHILE a controller is live (so
-# the documented `stop` → `start` deploy cannot strand a box), which is exactly the state this script
-# is run in — pass the flag rather than letting a guard this script does not rely on change its path.
+# supervisor's new pre-flight refuses `stop` on a queue/checkout pair it cannot use (mismatch, invalid,
+# unreadable, underivable) WHENEVER this state dir has something a stop would end — the `.desired`
+# marker, a provably-own session, a doctor loop, or a controller pid — which is exactly the state this
+# script runs in (so the documented `stop` → `start` deploy cannot strand a box). Pass the flag rather
+# than letting a guard this script does not rely on change its path.
 [ -n "$SW" ] && bash "$SW" stop --force >/dev/null 2>&1 || true
 tmux kill-server >/dev/null 2>&1 || true
 sleep 2

@@ -89,10 +89,11 @@
 # not re-implemented: `stop` calls `assert_queue_target` itself, so the verbs cannot drift into the
 # #1745 shape (one verb blesses what the next refuses).
 # ⛔ `stop` STAYS ANSWERABLE, which is the whole reason the refusal is narrow. It refuses only when
-# (a) the pair is not usable AND (b) this state dir has something a stop would actually END. Stopping
-# a cell that is already down loses nothing, and an operator who means to stop a misconfigured box
-# anyway types `stop --force` — the refusal names that flag. `status` is unchanged: it reports the
-# pair and never refuses.
+# (a) the pair is not usable AND (b) this state dir has something a stop would actually END. Stopping a
+# cell with NONE of those legs loses nothing; ⛔ a cell that is already DOWN but still carries
+# `state/roles/.desired` is not that case — the marker IS one of the legs, so it needs `--force` too.
+# An operator who means to stop a misconfigured box anyway types `stop --force` — the refusal names that
+# flag. `status` is unchanged: it reports the pair and never refuses.
 # ⛔ The gate is NOT weakened by any of this: `check`/`start` still refuse the pair outright.
 #
 # Prereqs on the cell (see cloud-cell-bringup.sh --check):
@@ -153,7 +154,45 @@
 
 set -uo pipefail
 
-CELL_HOME="${CELL_HOME:-/tmp/cell-home}"
+# ── THE ONE HOME (agent-infra#3453) — DERIVED, never re-spelled ──────────────────────────────────
+# ⛔ THIS LINE USED TO BE `CELL_HOME="${CELL_HOME:-/tmp/cell-home}"`, and that default is the measured
+# root of a 17-lane wave that landed ZERO work: this supervisor is the process the cell's controller
+# unit execs, it hands every session `HOME='$CELL_HOME'`, and `/tmp/cell-home` was NOT the home the
+# unit that SPAWNS lanes gave them (`/home/cmux`), so `gh`/`git` resolved a fine-grained PAT with
+# `contents=read` and every `git push` answered 403 while every `gh` READ worked. It is also the 23 GB
+# that pins the runner ceiling at `by_disk=1` on cell-3/cell-4. The rule and the precedence live in
+# `scripts/lib/cell-home.sh`.
+# ⛔ THE FALLBACK IS `$HOME`, NEVER THE LEGACY PATH: this script is deployed in places a farm's `lib/`
+# may not reach (a hand-copied controller payload, a pinned harness worktree), and `cell-self-pin.sh`
+# already defaults on `$HOME` for the same reason — two different defaults for one home IS the skew.
+# A cell whose `$HOME` is not its durable home is refused by `cloud-cell-bringup.sh --check`, which
+# reads the passwd record itself rather than trusting this value.
+# ⛔ THE SELF PATH COUNTS ONLY WHEN IT NAMES THIS FILE — see `lib/cell-home.sh` §CONSUMERS. Under a
+# PIPED start (`bash -s`) there is no `BASH_SOURCE` and `$0` is LITERALLY `bash`, so
+# `dirname "${BASH_SOURCE[0]:-$0}"` answers `.` and the candidate becomes `$PWD/lib/cell-home.sh` — this
+# supervisor then SOURCES the resolver out of the directory it happens to be started in (measured: a
+# planted `$PWD/lib/cell-home.sh` was sourced and executed). Guarded, a piped start has no sibling to
+# trust and takes the documented `$HOME` fallback below (with its exit-78 refusal when `$HOME` is unset).
+_SELF="${BASH_SOURCE[0]:-}"; [ -f "$_SELF" ] || _SELF=""
+SUP_SELF_DIR=""
+if [ -n "$_SELF" ]; then SUP_SELF_DIR="$(cd "$(dirname "$_SELF")" 2>/dev/null && pwd -P)"; fi
+CELL_HOME_LIB="${SUP_SELF_DIR:+$SUP_SELF_DIR/lib/cell-home.sh}"
+if [ -n "$CELL_HOME_LIB" ] && [ -r "$CELL_HOME_LIB" ]; then
+  . "$CELL_HOME_LIB"
+  CELL_HOME="$(cell_home_resolve)"
+else
+  # ⛔ AN EXPLICIT `CELL_HOME` IS NOT A DEFAULT, AND MUST NOT BE REPORTED AS ONE (review FOLLOW-UP 1).
+  # This branch used to print "using HOME as the cell home" even when the box HAD named its home, so an
+  # operator who did the right thing was told it was defaulted — and then had no reason to look again
+  # when the RESOLVER went missing, which is the condition this warning exists to expose.
+  if [ -n "${CELL_HOME:-}" ]; then
+    printf '%s: warn: %s is not readable — keeping the CELL_HOME this box named (%s). The DURABLE-home resolver is unavailable on this copy; run pi-bootstrap/setup.sh to place it (agent-infra#3453)\n' "${0##*/}" "${CELL_HOME_LIB:-lib/cell-home.sh}" "$CELL_HOME" >&2
+  else
+    CELL_HOME="${HOME:-}"
+    [ -n "$CELL_HOME" ] || { printf '%s: FATAL: neither %s nor HOME is set, so the cell home cannot be derived — refusing to default it to the legacy /tmp/cell-home (agent-infra#3453)\n' "${0##*/}" "${CELL_HOME_LIB:-lib/cell-home.sh}" >&2; exit 78; }
+    printf '%s: warn: %s is not readable — using HOME as the cell home (%s). The DURABLE-home default is unavailable on this copy; run pi-bootstrap/setup.sh to place the resolver (agent-infra#3453)\n' "${0##*/}" "${CELL_HOME_LIB:-lib/cell-home.sh}" "$CELL_HOME" >&2
+  fi
+fi
 # ⛔ REPO HAS NO PATH DEFAULT (agent-infra#1935). This line used to be `REPO="${REPO:-/tmp/cell}"`,
 # and that path does not exist on the cloud cell: `start` died with `FATAL: no git repo at /tmp/cell`
 # — a controller that will not start, for a directory the operator never chose and nothing creates.
@@ -298,10 +337,15 @@ workers_maybe_live() {
 #                        the same false "CELL CAN RUN A CONTROLLER" this script already guards for a
 #                        stale `$O`. The controller sources keys.env, so its env carries the value
 #                        and a worker it creates can inherit it; nothing is written to a file.
-#   PATH               — the gh-limit layer (#1988) lives FIRST on the controller's PATH, and the
-#                        sessions the controller spawns are created by a client holding THAT PATH, so
-#                        publishing the name is what puts the layer in front of every lane's and
-#                        worker's `gh` too. Without it only the controller would be serialised.
+#   PATH               — the gh layers live FIRST on the controller's PATH — `$O/gh-rest` (the REST
+#                        adapter, #2039) AHEAD of `$O/gh-limit` (#1988) — and the sessions the
+#                        controller spawns are created by a client holding THAT PATH, so publishing the
+#                        name is what puts both layers in front of every lane's and worker's `gh` too.
+#                        Without it only the controller would be served. ORDER MATTERS: the adapter
+#                        routes every call through the same `$O/gh-limit.py`, so it must resolve first
+#                        or the adapter is never reached (this file's `start` builds exactly that order
+#                        in both carriers — :4103 for the service-mode export, :4131 for the tmux
+#                        string; `lane.sh:83-84` re-asserts it for lanes).
 WORKER_ENV_NAMES="AI_REVIEW_GATE_KEY HOME O DEEPSEEK_API_KEY PATH"
 
 log_line() { printf '%s %s\n' "$(date -u +%FT%TZ)" "$*"; }
@@ -534,7 +578,7 @@ assert_repo() { # [$1 = the asking verb, so a `stop` refusal carries its own tai
   # string unvalidated: a checkout directory named with a quote would close the quote in
   # `REPO='$REPO'` and the rest would be parsed as shell. This is the same class as the `$HARNESS`
   # re-check below, which exists for exactly this reason (a value that changes after the guard).
-  safe_argv "$REPO" || die "\$REPO must not contain a quote or shell metacharacter: $REPO"
+  safe_argv "$REPO" || die "\$REPO must not contain a quote or shell metacharacter: $REPO.${verb:+ $(queue_refusal_suffix "$verb" "Set REPO to a checkout path with no quote or shell metacharacter")}"
   # A DERIVED checkout changes the queue target (resolve_queue_target reads its origin), so re-derive
   # OR before anything asserts the pair.
   resolve_queue_target || true; OR="$QUEUE_REPO"
@@ -1781,12 +1825,12 @@ queue_state_text() {
   case "$QUEUE_STATE" in
     derived)     printf 'ok — derived from the checkout' ;;
     explicit)    printf 'ok — OR matches the checkout' ;;
-    # ⛔ NAME THE CONDITION THE CODE APPLIES (review P3). `stop_would_end_something` refuses on more
-    # than "a controller is live": the first leg is `$ROLES_DIR/.desired`, which a box that is DOWN (OOM,
-    # reboot, an earlier partial stop) still carries. That is the state this PR's own doc §3.2 names
-    # ("including one that is already down but still carries `.desired`, which does need `--force`"), so
-    # "while a controller is live" told an operator the opposite of what `stop` does.
-    mismatch)    printf 'MISMATCH — start/check refuse, and stop refuses while this state dir has anything a stop would end (.desired, a provably-own session, or a controller) — MERGE-INERT, agent-infra#1901' ;;
+    # ⛔ NAME THE CONDITION THE CODE APPLIES, NOT ONE OF ITS LEGS (review P3, both lanes). The old text said
+    # "while a controller is live", but `stop_would_end_something` refuses on more than that: the FIRST leg
+    # is `$ROLES_DIR/.desired`, which a box that is DOWN (OOM, reboot, an earlier partial stop) still
+    # carries — exactly the state this PR's own doc §3.2 names. The line therefore names the gate's own
+    # condition, and enumerates the legs the code reads, so it cannot be read as one example of them.
+    mismatch)    printf 'MISMATCH — start/check refuse, and stop refuses while this state dir has anything a stop would end (marker, provable own session, doctor loop, or controller pid) — MERGE-INERT, agent-infra#1901' ;;
     nocheckout)  printf 'NO CHECKOUT — REPO is not set; start/check derive one or refuse (agent-infra#1935)' ;;
     unreadable)  printf 'UNREADABLE — the checkout has no origin remote; start/check refuse' ;;
     underivable) printf 'UNDERIVABLE — origin is not https/http/ssh/scp-like naming <owner>/<repo>; start/check refuse' ;;
@@ -2460,6 +2504,21 @@ seed_and_stamp() {
     n=$((n + 1))
   done
   [ "$n" -gt 0 ] || die "no *.sh scripts in $HARNESS — nothing to seed into $O"
+  # ── ONE stage-then-rename helper for the shim layers (#1988, #2039) ───────────────────────────
+  # A `gh` shim may be EXECUTED at any moment by a live lane, so a plain `cp` (which truncates before
+  # it writes) has a window in which a call reads a half-written shim — and a truncation at a
+  # statement boundary leaves a VALID script that prints nothing and exits 0, which every caller here
+  # reads as "no rows" (the same reason install.sh stages and renames). `mv` is atomic within one
+  # filesystem, so a reader sees the old bytes or the new ones, never neither.
+  # ⛔ HOISTED out of the gh-limit branch so BOTH layers use it: two copies of this is how one of them
+  # loses the atomicity (the second copy would be a second thing to keep right, and the REST adapter
+  # below is the entry point every gh call resolves).
+  seed_one() {  # <src> <dest>
+    local _src="$1" _dst="$2" _tmp="$O/.seed-$(basename "$2").$$"
+    cp -p "$_src" "$_tmp" || die "cannot stage $(basename "$_dst") into $O — free space ($0 prune)"
+    chmod +x "$_tmp"     || { rm -f "$_tmp"; die "cannot chmod $(basename "$_dst")"; }
+    mv -f "$_tmp" "$_dst" || { rm -f "$_tmp"; die "cannot install $_dst into $O"; }
+  }
   # ── the gh-limit layer (#1988) ────────────────────────────────────────────────────────────────
   # Four boxes act as ONE GitHub account, so an unserialised, un-backoff'd box spends everyone's
   # quota. The layer is a `gh` shim on the controller's PATH plus the ONE python helper the Mac
@@ -2468,12 +2527,6 @@ seed_and_stamp() {
   # running lane's `gh` may be executed at any moment, and a truncated shim would be a broken `gh`.
   if [ -f "$HARNESS/gh-limit/gh" ] && [ -f "$HARNESS/gh-limit.py" ]; then
     mkdir -p "$O/gh-limit" || die "cannot create $O/gh-limit"
-    seed_one() {  # <src> <dest>
-      local _src="$1" _dst="$2" _tmp="$O/.seed-$(basename "$2").$$"
-      cp -p "$_src" "$_tmp" || die "cannot stage $(basename "$_dst") into $O — free space ($0 prune)"
-      chmod +x "$_tmp"     || { rm -f "$_tmp"; die "cannot chmod $(basename "$_dst")"; }
-      mv -f "$_tmp" "$_dst" || { rm -f "$_tmp"; die "cannot install $_dst into $O"; }
-    }
     seed_one "$HARNESS/gh-limit/gh" "$O/gh-limit/gh"
     seed_one "$HARNESS/gh-limit.py" "$O/gh-limit.py"
   else
@@ -2487,6 +2540,39 @@ seed_and_stamp() {
       log_line "seed: removed the stale gh-limit layer — the harness no longer ships it"
     fi
     log_line "WARN: $HARNESS ships no gh-limit layer — this cell's gh calls will NOT be serialised or backed off (#1988)"
+  fi
+  # ── the gh REST adapter (#2039) ───────────────────────────────────────────────────────────────
+  # ⛔ MEASURED 2026-10-18 ON `pi-cell-2`: the adapter existed ONLY in the pinned harness and never
+  # reached $O, so the per-candidate pre-flight (`gh issue view` / `gh pr list`, both GraphQL) could
+  # not certify a single candidate the moment the GraphQL budget was exhausted — the refresh ABORTed
+  # and the cell dispatched NOTHING for as long as the refusal lasted, while the REST budget sat at
+  # 1952/5000 and the log said only `FAILED rc=1 (transient — retried next cycle)`. `install.sh` seeds
+  # this adapter on the Mac and puts it first on the daemon PATH (`install.sh:789-884`); the cell path
+  # seeded its LIMIT layer and never the adapter, so the two platforms diverged on which reads reach
+  # REST — and that is the divergence, NOT stop-vs-degrade: the open-PR read is still GraphQL (#2143).
+  # ⛔ SAME `$O/gh-limit.py` SIBLING AS THE MAC, and that is not a coincidence: the adapter resolves
+  # its limit layer as `$SELF_DIR/../gh-limit.py`, which for `$O/gh-rest/gh` IS `$O/gh-limit.py` — the
+  # file the block above seeds. So a cell that gets this adapter keeps #1988's serialisation (measured
+  # interplay; both shims carry the marker the path walk skips by, so neither recurses into the other).
+  if [ -f "$HARNESS/gh-rest/gh" ]; then
+    mkdir -p "$O/gh-rest" || die "cannot create $O/gh-rest"
+    # Staleness, said out loud the way install.sh says it: the copy is replaced either way (that is the
+    # point of seeding from the pin), but an operator reading the log should see that the box was
+    # running a DIFFERENT adapter before this seed rather than inferring it from silence.
+    if [ -f "$O/gh-rest/gh" ] && ! cmp -s "$HARNESS/gh-rest/gh" "$O/gh-rest/gh"; then
+      log_line "seed: replacing a DIFFERENT $O/gh-rest/gh — the installed adapter was stale"
+    fi
+    seed_one "$HARNESS/gh-rest/gh" "$O/gh-rest/gh"
+  else
+    # MIRROR away, for the reason the gh-limit branch states: a `$O/gh-rest/gh` from an earlier
+    # harness would stay on the controller PATH translating commands this harness no longer ships
+    # support for. The honest state is "no adapter, and the warn below says what that costs".
+    if [ -e "$O/gh-rest/gh" ]; then
+      rm -f "$O/gh-rest/gh" || die "cannot remove the stale gh-rest adapter from $O"
+      rmdir "$O/gh-rest" 2>/dev/null || true
+      log_line "seed: removed the stale gh-rest adapter — the harness no longer ships it"
+    fi
+    log_line "WARN: $HARNESS ships no gh-rest adapter — the per-candidate pre-flight stays on GraphQL, so a GraphQL exhaustion stops dispatch entirely (#2039)"
   fi
   # ⛔ MIRROR, do not merely overlay. `orch-loop.sh`/`merge-one.sh` invoke workers BY NAME from $O, so a
   # script RENAMED upstream would leave its old copy live in $O and still invocable — the record would
@@ -3148,17 +3234,79 @@ cmd_check() {
   [ -z "$missing" ] || die "worker scripts missing from $O:$missing — run 'start' (it seeds $O) or, for a verified redeploy: bash '$HARNESS'/deploy-harness.sh --src '$HARNESS' --o '$O'"
   # ── the gh-limit layer (#1988): present, AND able to run ──────────────────────────────────────
   # Presence alone is the false-green this file refuses everywhere else: a shim that cannot find the
-  # real gh exits 127 on EVERY call, which would stop merges altogether. So resolve `gh` through the
-  # very PATH the session will get and require it to answer.
+  # real gh exits 127 on EVERY call, which would stop merges altogether. So the layer is EXECUTED BY
+  # ITS OWN PATH and required to answer.
+  # ⛔ A REGULAR FILE IS NOT A RUNNABLE ONE, AND PATH HIDES THE DIFFERENCE (fresh review, P2, measured).
+  # This probe used to be `PATH="$O/gh-limit:$PATH" gh --version`, with a comment claiming it resolved
+  # `gh` "through the very PATH the session will get". It was wrong twice over. (1) `gh` there is a
+  # NAME: with a mode-`-x` `$O/gh-limit/gh` the kernel SKIPS the candidate (EACCES) and CONTINUES the
+  # search, so the probe was answered by `$O/gh-rest/gh` or the real binary and rc=0 certified a box
+  # whose gh-limit SHIM is unrunnable — still serialised when the adapter gave that answer (it routes
+  # through the same `$O/gh-limit.py`), unguarded when the real binary did. That is the identical
+  # false PASS the adapter block below was fixed for, and the same mechanism mise/asdf document as
+  # shim fall-through. (2) It is not the session's PATH either: `start` leads with `$O/gh-rest`
+  # (:4103, :4131), so no `PATH=` form answers about the order this box will ever have. The MODE is
+  # therefore required (and named), and the layer is executed BY PATH — the same rule, applied three
+  # lines early because the adapter probe sits one layer down.
   if [ -f "$O/gh-limit/gh" ] && [ -f "$O/gh-limit.py" ]; then
+    [ -x "$O/gh-limit/gh" ] \
+      || die "the gh-limit layer at $O/gh-limit/gh is PRESENT but NOT EXECUTABLE — the shell SKIPS it and resolves gh PAST it: to $O/gh-rest/gh when the adapter is deployed, where calls are still serialised through the same $O/gh-limit.py, or to the real binary when it is not, where NOTHING is serialised or backed off. Either way this box would report a layer it cannot run (#1988). Remedy: chmod +x it, or re-seed with '$0 start'."
     # ⛔ `NO_WAIT` ON THE PROBE. Without it a box with one gh hanging in flight makes `check` wait up
     # to the layer's 600 s lock budget — and `check` is the diagnostic an operator runs BECAUSE the
     # box looks stuck. `gh --version` needs no lock at all, but the lock is taken before the child is
     # classified (review round 9).
-    PATH="$O/gh-limit:$PATH" GH_LIMIT_NO_WAIT=1 GH_LIMIT_NO_WAIT_LOCK_S=2 gh --version >/dev/null 2>&1 \
+    GH_LIMIT_NO_WAIT=1 GH_LIMIT_NO_WAIT_LOCK_S=2 "$O/gh-limit/gh" --version >/dev/null 2>&1 \
       || die "the gh-limit layer at $O/gh-limit cannot run gh — every gh call in the session would fail. Fix the layer or remove it before starting (a cell without it MERGES but is not serialised, #1988)."
   else
     log_line "WARN: no gh-limit layer in $O — this cell's gh calls are NOT serialised/backed off (#1988); run 'start' to seed it"
+  fi
+  # ── the gh REST adapter (#2039): present, AND able to run ──────────────────────────────────────
+  # ⛔ REQUIRED WHEN THE PINNED HARNESS SHIPS IT, because the failure it prevents is silent and total:
+  # without the adapter on PATH the per-candidate pre-flight asks GraphQL, every candidate comes back
+  # INCOMPLETE while the GraphQL budget is refused, the refresh ABORTs, and the cell dispatches nothing
+  # — while `check` used to print CELL CAN RUN A CONTROLLER over it. That is the false-green class this
+  # file refuses everywhere else (`check`'s verdict is the last gate before `start`), so it is a
+  # REFUSAL, not a warning: a cell that cannot run the adapter is refused rather than silently degraded.
+  # Conditioned on the HARNESS shipping it — a pin that predates the adapter cannot be asked to have
+  # seeded one, and lying about that would refuse every honest restart on an older pin.
+  if [ -f "$HARNESS/gh-rest/gh" ]; then
+    if [ ! -f "$O/gh-rest/gh" ]; then
+      die "the pinned harness ships gh-rest/gh but $O/gh-rest/gh is MISSING — the per-candidate pre-flight would stay on GraphQL, so a GraphQL exhaustion stops dispatch entirely while this cell reports RUNNING (#2039). Run '$0 start' (and 'apply' first if the pin is behind) to seed it."
+    fi
+    # ⛔ A REGULAR FILE IS NOT A RUNNABLE ONE, AND PATH HIDES THE DIFFERENCE (fresh review, P2, measured).
+    # The kernel SKIPS a candidate it cannot execute and CONTINUES the search, so with a mode-`-x`
+    # `$O/gh-rest/gh` a `PATH="$O/gh-rest:$PATH" gh --version` answered from `$O/gh-limit/gh` (or the real
+    # binary) and `check` certified a box whose pre-flight was back on GraphQL — a false PASS on the one
+    # surface this change exists to make truthful. So the MODE is required (and named), and the adapter is
+    # then executed BY PATH rather than through a PATH lookup that can silently resolve elsewhere.
+    [ -x "$O/gh-rest/gh" ] \
+      || die "the gh REST adapter at $O/gh-rest/gh is PRESENT but NOT EXECUTABLE — the shell SKIPS it and resolves gh to $O/gh-limit/gh or the real binary, so the pre-flight is back on GraphQL while this box would report the adapter (#2039). Remedy: chmod +x it, or re-seed from the pin with '$0 start'."
+    # ⛔ EXECUTED BY PATH, not via `PATH=… gh`. `GH_LIMIT_NO_WAIT` keeps the diagnostic from waiting on the
+    # layer's lock (the adapter routes through the same helper); an adapter that cannot resolve the real
+    # gh exits 127 on every call, which is worse than an absent one.
+    GH_LIMIT_NO_WAIT=1 GH_LIMIT_NO_WAIT_LOCK_S=2 "$O/gh-rest/gh" --version >/dev/null 2>&1 \
+      || die "the gh REST adapter at $O/gh-rest/gh cannot run gh — every gh call in the session would fail, and the pre-flight would fall back to GraphQL (#2039). Remedy: '$0 start' re-seeds it from the pinned harness and '$0 apply' first if the pin is behind — removing it while the harness still ships it only moves this refusal one line up."
+    # ⛔ SAID OUT LOUD ON THE GREEN PATH TOO (#2039, and #2041's measured complaint: the deploy announced
+    # "convergence COMPLETE" over a missing layer). The operator's question is not only "did check pass"
+    # but "IS this box's gh the adapter, and does it have a limit layer beside it" — the same one-answer
+    # shape the Mac's install.sh prints. A status verb that stays silent about a seeded shim leaves the
+    # next GraphQL exhaustion to be diagnosed from a log line that names neither.
+    if [ -f "$O/gh-limit.py" ]; then
+      # ⛔ THE SENTENCE NAMES THE READ THAT MOVED, AND ONLY IT (fresh review round 7, P2, measured). It
+      # used to end "a GraphQL refusal degrades the pre-flight to REST instead of stopping dispatch" —
+      # FALSE on the second half, and it contradicted this PR's own body. The pre-flight's ISSUE read
+      # (`gh issue view`) moved to REST, but its BLOCKING open-PR read still asks
+      # `mergedAt,closingIssuesReferences`, neither of which is in the adapter's `PR_FIELDS`
+      # (`gh-rest/gh:184`), so `fields_ok pr || delegate` (`gh-rest/gh:506`) hands the whole call back to
+      # GraphQL — still refused — and the tool's own REST rescue then marks the surface
+      # `closing-references-unmeasured` and exits 2, which STOPS dispatch. `check` is the artifact an
+      # operator reads on the cell, so it must not promise the half the chain does not deliver.
+      log_line "ok: gh REST adapter -> $O/gh-rest (first on the controller's PATH, ahead of $O/gh-limit; its limit layer is $O/gh-limit.py) — the pre-flight's ISSUE read is served over REST, so a GraphQL refusal no longer makes it INCOMPLETE; the blocking open-PR read is still GraphQL (#2143, #2039)"
+    else
+      log_line "ok: gh REST adapter -> $O/gh-rest (first on the controller's PATH) — but $O/gh-limit.py is ABSENT, so its calls are NOT serialised or backed off (#1988)"
+    fi
+  else
+    log_line "WARN: $HARNESS ships no gh-rest adapter — the per-candidate pre-flight stays on GraphQL, so a GraphQL exhaustion stops dispatch (#2039); advance the pin with '$0 apply'"
   fi
 
   # ── which commit is this cell running? (agent-infra#1745) ────────────────────────────────────
@@ -4039,11 +4187,13 @@ cmd_start() {
   # controller now re-pins ITSELF once per cycle (`harness-refresh.sh`), and the ONLY materialiser it may
   # call is this supervisor — so `HARNESS_MATERIALISER` names this very file, and the pin root/ref it
   # must act on are the OPERATOR'S, not whatever the child would re-derive from defaults. Without them
-  # the child would default HARNESS_PIN_DIR to $CELL_HOME/harness: with CELL_HOME unset in the session
-  # that default is `/tmp/cell-home/harness` (this file's own default), so the re-pin would create a
-  # worktree nobody reads and write a pin pointing at it — a re-pin that advances nothing while reporting
-  # success. The doctor's own note (see `start_doctor_loop`) records the measured cost of this same
-  # omission for SCOPE. Every value here is already in the injection guard's list below (:1697).
+  # the child would default HARNESS_PIN_DIR to $CELL_HOME/harness. That default is now the SAME
+  # derivation this file uses (scripts/lib/cell-home.sh, agent-infra#3453 — it used to be
+  # `/tmp/cell-home`, a home no other unit used), but a derivation is not the OPERATOR'S pin: if they
+  # pinned a different root the re-pin would still create a worktree nobody reads and write a pin
+  # pointing at it — advancing nothing while reporting success. So the values are passed explicitly.
+  # The doctor's own note (see `start_doctor_loop`) records the measured cost of this same omission for
+  # SCOPE. Every value here is already in the injection guard's list in `cmd_start` (the `safe_argv` loop).
   # ── SERVICE MODE: this process IS the controller (agent-infra#2402) ──────────────────────────────
   # ⛔ THERE IS NO SECOND BOUNDARY HERE, SO THERE IS NO SECOND COPY OF THE ENVIRONMENT. The tmux command
   # string just below exists because a session is served the SERVER's environment, not this shell's —
@@ -4066,13 +4216,19 @@ cmd_start() {
     # exported, and the unit renders no `UnsetEnvironment=`.
     unset GH_REPO
     # ⛔ THE gh-limit LAYER IS PART OF THE ENVIRONMENT, NOT OF THE TMUX PATH (#1988). The session string
-    # below puts `$O/gh-limit` FIRST on PATH; in service mode there is no session string, so the same
+    # below puts `$O/gh-rest:$O/gh-limit` FIRST on PATH; in service mode there is no session string, so the same
     # export has to happen HERE or the controller silently loses the gh wrapper — every gh call
     # unserialised and unbacked-off, on the one box shape this unit creates. `start` has already seeded
     # it (cmd_check refuses a cell whose layer cannot run), so this only ever prepends a real directory;
     # the guard keeps a cell that legitimately ships no layer (the "NOT serialised" warning above) from
     # gaining a PATH entry that does not exist.
     [ -d "$O/gh-limit" ] && export PATH="$O/gh-limit:$PATH"
+    # ⛔ AND THE REST ADAPTER, PREPENDED **AFTER** IT SO IT RESOLVES FIRST (#2039) — the same order
+    # `lane.sh:83-84` uses and for the same reason: `$O/gh-rest/gh` itself routes every call through
+    # `$O/gh-limit.py`, so the adapter in front loses NO serialisation, while the adapter BEHIND the
+    # limit shim is never reached at all (the limit shim execs the real gh) — i.e. a cell that seeded
+    # both but ordered them the other way would pay the seed cost and still ask GraphQL.
+    [ -d "$O/gh-rest" ] && export PATH="$O/gh-rest:$PATH"
     # ⛔ THE DOCTOR ROLE IS NOT OPTIONAL ON THIS PATH EITHER (#2402 review P1). The tmux path launches it a
     # few lines below; `exec` REPLACES this process, so anything placed after it never runs. Without this
     # call a service-managed cell dispatches but never reaps, lands, repairs or prunes — the "dispatches
@@ -4100,7 +4256,7 @@ cmd_start() {
   # ⛔ THE SESSION IS SERVED THE TMUX SERVER'S ENV, NOT THIS SHELL'S — so the `unset` cannot be done
   # here and must be part of the string, exactly like every other value below.
   tmux new-session -d -s "$SESSION" -c "$HARNESS" \
-    "set -a; [ ! -f '$ENV_FILE' ] || . '$ENV_FILE'; set +a; unset GH_REPO; PATH='$O/gh-limit':\"\$PATH\" HOME='$CELL_HOME' CELL_HOME='$CELL_HOME' REPO='$REPO' O='$O' OR='$OR' SCOPE='$SCOPE' HARNESS_REPO='$HARNESS_REPO' HARNESS_REF='$HARNESS_REF' HARNESS_PIN_DIR='$HARNESS_PIN_DIR' HARNESS_PIN_FILE='$HARNESS_PIN_FILE' HARNESS_MATERIALISER='${SUP_SELF:-}' bash '$HARNESS/orch-loop.sh' 2>&1 | tee -a '$O/logs/controller.log'"
+    "set -a; [ ! -f '$ENV_FILE' ] || . '$ENV_FILE'; set +a; unset GH_REPO; PATH='$O/gh-rest':'$O/gh-limit':\"\$PATH\" HOME='$CELL_HOME' CELL_HOME='$CELL_HOME' REPO='$REPO' O='$O' OR='$OR' SCOPE='$SCOPE' HARNESS_REPO='$HARNESS_REPO' HARNESS_REF='$HARNESS_REF' HARNESS_PIN_DIR='$HARNESS_PIN_DIR' HARNESS_PIN_FILE='$HARNESS_PIN_FILE' HARNESS_MATERIALISER='${SUP_SELF:-}' bash '$HARNESS/orch-loop.sh' 2>&1 | tee -a '$O/logs/controller.log'"
   sleep 3
   if tmux has-session -t "$SESSION" 2>/dev/null; then
     log_line "controller started (tmux '$SESSION'), state=$O"
@@ -4187,8 +4343,9 @@ unit_stop_effect_verdict() { # <unit>
 # ⛔ WHY THIS EXISTS AT ALL (agent-infra#2093). `stop` is the verb an operator reaches for on a box
 # that is wrong — that is the doctrine this file already applies to `status` and to
 # orchestrator-bringup.sh's stop ("REPORT, never die"). So the new pre-flight is deliberately NARROW:
-# it refuses only when there is something to lose. Stopping a cell that is already down loses nothing
-# and must stay answerable, while stopping a LIVE one on an unusable pair is the exact action that
+# it refuses only when there is something to lose. Stopping a cell with NONE of the legs below loses
+# nothing and must stay answerable (⛔ a DOWN cell that still carries `.desired` is NOT such a cell —
+# the marker is the first leg), while stopping a LIVE one on an unusable pair is the exact action that
 # left lane-1 un-deployable.
 # ⛔ Conservative in the REFUSAL direction: a read that cannot be made counts as "something is
 # running". The two errors are not symmetric — a refused stop on an idle box costs one flag, a stop
