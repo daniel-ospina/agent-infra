@@ -857,8 +857,13 @@ ck "16: …and names the unparsed argv, not a read that failed (the human must k
    "$(want "$ERR" "cannot attribute" && echo 0 || echo 1)"
 ck "16: …the live owner's lock is UNTOUCHED (a refusal clobbers nothing)" \
    "$( [ "$(lock_pid "$C/o/.orch.lock")" = "$GP" ] && echo 0 || echo 1)"
-ck "16: …and the owner is still ALIVE (the unchanged owner is what made the old reclaim a #1715)" \
-   "$(kill -0 "$GP" 2>/dev/null && echo 0 || echo 1)"
+# ⛔ THE SAME INERT ROW WAS DELETED HERE TOO ("…and the owner is still ALIVE", `kill -0 "$GP"`). The
+# review of PR #3865 at 49fda057a scoped this one OUT as a follow-up because it predates the diff, and
+# this lane MEASURED it before deciding rather than inheriting the assumption: under the mutant that
+# removes the unparsed-argv refusal (`if false` in place of the `_orch_argv_is_loop_flagged` call) the
+# FOUR rows above go RED and this row stayed GREEN — no branch of the lock decision signals the named
+# pid, so the row cannot vary and is not coverage (#3442 rule 3). Deleting it rather than leaving a
+# follow-up debt beside its identical twin above; the four rows above carry the whole behaviour.
 kill -9 "$GP" 2>/dev/null
 # The positive control, so §16 cannot pass by refusing every shell-option argv it cannot parse: the
 # SAME option form with a NON-loop script must still be RECLAIMED (rc 1), which is what keeps this arm
@@ -896,8 +901,14 @@ ck "16c: a live owner behind 'bash +o errexit …' is not reclaimed (it refuses 
    "$(ran && echo 1 || echo 0)"
 ck "16c: …the refusal says CANNOT-TELL and the owner's lock is UNTOUCHED" \
    "$(want "$ERR" "CANNOT-TELL" && [ "$(lock_pid "$C/o/.orch.lock")" = "$PL" ] && echo 0 || echo 1)"
-ck "16c: …and the owner is still ALIVE (a reclaim here is two controllers on one queue)" \
-   "$(kill -0 "$PL" 2>/dev/null && echo 0 || echo 1)"
+# ⛔ A THIRD ROW STOOD HERE — "…and the owner is still ALIVE" (`kill -0 "$PL"`) — AND IT WAS DELETED, NOT
+# KEPT AS A DISCLOSED GREEN (#3442 rule 3; review of PR #3865 at 49fda057a, P3). It could not VARY: the
+# only thing the mutant changes is the predicate's ANSWER, which selects the refusal branch or the reclaim
+# branch, and NEITHER signals the named pid (the reclaim path is `rm -f "$LOCKF"` then `acq`). MEASURED
+# under the `-`-only revert on a staged copy: the two rows above go RED and that row stayed GREEN.
+# ⛔ DO NOT RE-ADD IT. The behaviour it appears to guard is already carried above — a wrong reclaim is
+# witnessed by "it refuses instead" (row 1) and by "the lock is UNTOUCHED" (row 2), which is the
+# observable a reclaim actually changes. An assertion that cannot go red is a false guard, not coverage.
 kill -9 "$PL" 2>/dev/null
 # and the `+`-form positive control, so accepting `+` cannot become a blanket refusal
 mkcase; CASE_DIR="$C"
