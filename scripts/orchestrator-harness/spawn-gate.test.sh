@@ -32,6 +32,11 @@ export LANE_PREFLIGHT=0
 # The registry's own arms re-enable it explicitly with their own isolated state root and their own bare
 # origin — so the switch is load-bearing and its arms are the assertion that the leg runs at all.
 export LANE_REGISTRY=0
+# ⛔ AND THE DISK FLOOR MUST NOT BE INHERITED FROM THE RUNNER (agent-infra#1852). `DISK_MIN_FREE_MB` now
+# defaults to `MIN_FREE_MB` when it is unset, so an ambient `MIN_FREE_MB` (a cell's keys.env, a tmux
+# server, a launchd plist) would decide every arm that does not set the floor explicitly — a green suite
+# measuring the operator's shell. The inheritance arms re-introduce it DELIBERATELY, one arm at a time.
+unset MIN_FREE_MB
 PASS=0; FAIL=0
 ck() { # ck <name> <0|1>
   if [ "$2" -eq 0 ]; then printf '  ✅ %s\n' "$1"; PASS=$((PASS+1));
@@ -3991,11 +3996,32 @@ sup="$(sed -n 's/^MIN_FREE_MB="\${MIN_FREE_MB:-\([0-9][0-9]*\)}".*/\1/p' "$HERE/
 # catch, in the direction that matters. `env -u` removes the variable from a caller's environment too,
 # so the probe reads the shipped default and nothing else. (The pre-fix count is deliberately NOT
 # recorded: it is not re-measurable from this tree without reverting the check below.)
-dfl="$(env -u DISK_MIN_FREE_MB bash -c '. "$1"; printf "%s" "$DISK_MIN_FREE_MB"' _ "$GATE")"
+dfl="$(env -u DISK_MIN_FREE_MB -u MIN_FREE_MB bash -c '. "$1"; printf "%s" "$DISK_MIN_FREE_MB"' _ "$GATE")"
 if [ -n "$sup" ] && [ "$dfl" = "$sup" ]; then rc=0; else rc=1; fi
 ck "the DEFAULT (unset) floor EQUALS the supervisor's MIN_FREE_MB ($dfl vs ${sup:-<unreadable>}) — a higher one is a false PASS, not a safer gate" $rc
 if [ -n "$sup" ] && [ "$zf" = "$sup" ]; then rc=0; else rc=1; fi
 ck "...and the REPAIRED floor (DISK_MIN_FREE_MB=0) equals it too ($zf) — the fallback is not a second, drifting default" $rc
+# ⛔ AND THE INHERITANCE ITSELF MUST BE DRIVEN, NOT JUST THE DEFAULT (agent-infra#1852, which carried
+# this as a recorded residual). `MIN_FREE_MB` is a documented tunable, so setting it LOWER than the
+# dispatch floor used to re-open the band from the other side (supervisor 100 / gate 500 → `check`
+# healthy, every spawn refused 77), and a HIGHER one left the reverse gap. The fix is that this file
+# FOLLOWS `MIN_FREE_MB` when `DISK_MIN_FREE_MB` is unset. These arms pin the follow, the explicit
+# override, and that an INHERITED value gets the SAME validation as a provided one — a typo in a
+# worker's environment must not disarm the gate, and `0` must not make it a no-op.
+inh="$(env -u DISK_MIN_FREE_MB MIN_FREE_MB=1234 bash -c '. "$1"; printf "%s %s" "$DISK_MIN_FREE_MB" "$DISK_WARN_FREE_MB"' _ "$GATE")"
+[ "$inh" = "1234 4936" ]; rc=$?
+ck "with DISK_MIN_FREE_MB unset the floor INHERITS MIN_FREE_MB (got '$inh', want '1234 4936') — the band is closed by BINDING, not by two literals that happen to match" $rc
+ow="$(DISK_MIN_FREE_MB=2000 MIN_FREE_MB=1234 bash -c '. "$1"; printf "%s" "$DISK_MIN_FREE_MB"' _ "$GATE")"
+[ "$ow" = "2000" ]; rc=$?
+ck "an EXPLICIT DISK_MIN_FREE_MB still WINS over the inherited one (got '$ow') — the divergence stays a DECLARATION, not an accident" $rc
+for inhis in abc 0 9999999999; do
+  rep="$(env -u DISK_MIN_FREE_MB MIN_FREE_MB="$inhis" bash -c '. "$1"; printf "%s" "$DISK_MIN_FREE_MB"' _ "$GATE")"
+  [ "$rep" = "500" ]; rc=$?
+  ck "an INHERITED MIN_FREE_MB=$inhis is REPAIRED to 500 exactly as a provided one is (got '$rep') — inheritance gets no weaker validation" $rc
+done
+pol_inh="$(env -u DISK_MIN_FREE_MB MIN_FREE_MB=1234 bash -c '. "$1"; disk_ok 1300 && a=allow || a=refuse; disk_ok 1200 && b=allow || b=refuse; printf "%s %s" "$a" "$b"' _ "$GATE")"
+[ "$pol_inh" = "allow refuse" ]; rc=$?
+ck "…and the INHERITED floor is the one the PREDICATE uses (1300 allow / 1200 refuse at MIN_FREE_MB=1234: '$pol_inh')" $rc
 # ⛔ THE FREE-SPACE CONVERSION MUST NOT GO THROUGH `print int(...)` (review round 1, P2). `int()`
 # renders through awk's OFMT, so on mawk — the default `awk` on Debian/Ubuntu, i.e. ON THE CELL — an
 # integral value at or above 2^31 prints as `2.14748e+09`: not a number to `[ -lt ]` (errors), which
