@@ -1559,7 +1559,7 @@ _tipvariant() { # <token> -> the token, with a tip-word case variant normalised 
 delta_verify() { # <id: A..B[+artifact]> <head_sha> -> 0 = verified (sets DELTA_*)
   local id="$1" head="$2" range from to cover="" root="" tmp="" norm=""
   local authored="" newest="" n_authored=0 anchor="" dg_rc=0 base_sha="" base_ref=""
-  local merges_in_range="" evil="" evil_shas="" m="" parents="" pcount="" p1="" p2="" prest="" want="" actual="" cands="" mrc="" body_claim="" stated_from="" stated_to="" stated_sep="" _delta_tok="" E_OUT="" E_RC="" _scan="" _any="" _all_ok="" _sf="" _ss="" _st="" _straw="" _stcmp="" _sbrace="" _sin="" _ok="" _sfs="" _r="" _claim="" _toks="" _tok_rc=0 _tok="" _tsha="" _tipscan="" _tref="" _top="" _tiprel=0 _tisref="" _tosha="" _tipchain="" _svsh="" _tv="" _tsel="" _lid=0 _rid=0 _lrest="" _rrest="" _elhs="" _erhs="" _elsha="" _ersha="" _eranges="" _opends="" _olhs="" _olrest="" _olid=0 _osha="" _emptyrange="" _emptystated="" _estated="" _dident="" _drivers="" _dg_rc=0 _gitdir="" _gd_rc=0 _commondir="" _cd_rc=0 _attr_amb="" _wt_amb="" _ls_rc=0 _st_amb="" _st_rc=0 _ad="" _adrift="" _adr_rc=0
+  local merges_in_range="" evil="" evil_shas="" m="" parents="" pcount="" p1="" p2="" prest="" want="" actual="" cands="" mrc="" body_claim="" stated_from="" stated_to="" stated_sep="" _delta_tok="" E_OUT="" E_RC="" _scan="" _any="" _all_ok="" _sf="" _ss="" _st="" _straw="" _stcmp="" _sbrace="" _sin="" _ok="" _sfs="" _r="" _claim="" _toks="" _tok_rc=0 _tok="" _tsha="" _tipscan="" _tref="" _top="" _tiprel=0 _tisref="" _tosha="" _tipchain="" _tbase="" _svsh="" _tv="" _tsel="" _lid=0 _rid=0 _lrest="" _rrest="" _elhs="" _erhs="" _elsha="" _ersha="" _eranges="" _opends="" _olhs="" _olrest="" _olid=0 _osha="" _emptyrange="" _emptystated="" _estated="" _dident="" _drivers="" _dg_rc=0 _gitdir="" _gd_rc=0 _commondir="" _cd_rc=0 _attr_amb="" _wt_amb="" _ls_rc=0 _st_amb="" _st_rc=0 _ad="" _adrift="" _adr_rc=0
   range="${id%%+*}"
   [ "$range" != "$id" ] && cover="${id#*+}"
   from="${range%%..*}"; to="${range##*..}"
@@ -2364,7 +2364,7 @@ $m"
     # as written, so a name whose continuation is prose (`..<B>-1`) reads as `<B>` — the same
     # truncation direction as the class rule it replaces, chosen because git, not a character list,
     # now answers the question.
-    while [[ "$_scan" =~ ([0-9a-fA-F]{4,40})[[:space:]]*(\.{2,3})[[:space:]]*([0-9a-fA-F]{4,40}|[Hh][Ee][Aa][Dd]|@)(@\{[^}]*\}|\{[^}]*\}|[^0-9A-Za-z_/+=$%&@-]|$|[0-9A-Za-z_/+=%$&@-]+) ]]; do
+    while [[ "$_scan" =~ ([0-9a-fA-F]{4,40})[[:space:]]*(\.{2,3})[[:space:]]*([0-9a-fA-F]{4,40}|[Hh][Ee][Aa][Dd]|@)(@\{[^}]*\}|\{[^}]*\}|[^0-9A-Za-z_/+=$%&@~^{}-]|$|[0-9A-Za-z_/+=%$&@~^{}-]+) ]]; do
       _sf="$(printf '%s' "${BASH_REMATCH[1]}" | command tr 'A-F' 'a-f')"
       _ss="${BASH_REMATCH[2]}"
       # ⛔ ONE SPELLING, NOT TWO: THE RAW TOKEN IS BOTH WHAT DECIDES AND WHAT THE MESSAGE QUOTES
@@ -2545,7 +2545,7 @@ $m"
       fi
     done
     if [ "$_any" -eq 1 ] && [ "$_all_ok" -ne 1 ]; then
-      echo "   delta: the covering artifact '$cover' states a DIFFERENT range than the one being recorded — the body quotes delta:${stated_from:0:12}${stated_sep}${stated_to:0:12} but this record would assert ${from:0:12}…..${to:0:12}… — a verdict cannot be extended past the range it declared, and recording it as if it could would make delta_range a claim the artifact itself contradicts. (EVERY range the artifact states is checked, not just the first.)" >&2
+      echo "   delta: the covering artifact '$cover' states a DIFFERENT range than the one being recorded — the body quotes delta:${stated_from:0:12}${stated_sep}${stated_to} but this record would assert ${from:0:12}…..${to:0:12}… — a verdict cannot be extended past the range it declared, and recording it as if it could would make delta_range a claim the artifact itself contradicts. (EVERY range the artifact states is checked, not just the first.)" >&2
       return 1
     fi
     if [ "$_any" -eq 1 ]; then
@@ -2828,6 +2828,21 @@ $m"
       # NAMED one was refused with "RELATIVE TO THE TIP … always NARROWER", which is false about it —
       # the false-block class this file's own doctrine calls worse than the gap. `0+` states the rule
       # (a zero count is a zero count) instead of enumerating the spellings that happen to occur.
+      # ⛔ THE OPERAND IS RESOLVED BEFORE THE IDENTITY SKIPS (twenty-seventh review cycle, P1 —
+      # MEASURED, a fail-open the parent did not have). Both `continue`s below returned BEFORE anything
+      # resolved the operand, so a narrowing that hides in the OPERAND rather than in a selector
+      # (`afterhead^{commit}..HEAD`, `afterhead~0..HEAD`, `afterhead^0..HEAD`, `afterhead..HEAD`) was
+      # never classified: the range is EMPTY (nought commits against the recorded ones) and the record
+      # was minted. The parent refused the identity spellings through its literal catch; the bare ones
+      # are a PRE-EXISTING hole recorded here rather than silently kept.
+      case "$_tref" in
+        ''|HEAD|@) : ;;
+        *)
+          _tbase="$(delta_git "$root" rev-parse --verify "${_tref}^{commit}" 2>/dev/null || true)"
+          if [ -n "$_tbase" ] && [ "$_tbase" != "$_tosha" ]; then
+            delta_git "$root" merge-base --is-ancestor "$_tosha" "$_tbase" 2>/dev/null && { _tiprel=1; break; }
+          fi ;;
+      esac
       [[ "$_top" =~ ^(${_dident}+)$ ]] && continue
       # ⛔ NO SELECTOR, NOTHING TO CLASSIFY. The chain group is `*` because a brace group on a bare `@`
       # IS the selector and arrives through the operand (normalised above); that also lets a bare
