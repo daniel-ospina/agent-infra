@@ -474,6 +474,25 @@ This is bounded hard, and a lane that reads it as a general licence has read it 
   plausible-sounding remedy is exactly how an agent talks a human into a destructive action on a
   healthy system.
 
+- **⛔ A WEDGE VERDICT IS NEVER, BY ITSELF, A REASON TO DISCARD A WORKTREE — read the artifact
+  first.** The harness's `Alive state:` / `task_status` report has been measured **false in both
+  directions** (#2105, eight cut children across two lanes in one session): it stated
+  `dirty=false dirtyPaths=0 headSha=<stale>` on worktrees holding modified files and **seven
+  uncommitted commits** — a lane that trusted it would have thrown finished work away — and it read
+  four consecutive **not-yet-started** children as `wedged` (alive state: `tickCount=1
+  firstTickLagMs=2045960 toolsInFlight=0`), so the work was killed and retried into the same spawn
+  latency, 4 and 6 times. `git status --porcelain`, `git log -1` and `git rev-list --count` run in
+  the child's OWN worktree are authoritative; a verdict from any instrument is not. The report now
+  reads the tree **at report time** and withholds its verdict when the head moved
+  (`verdictWithheld=stale-snapshot` / `VERDICT WITHHELD — snapshot is stale`), and a child that has
+  never begun a turn reads `not-started`, never `wedged` — **while it is emitting markers**. The
+  qualifier is not a loophole: a child emitting nothing at all is the silence class (that is the
+  watchdog's own `tier-1 zero-output` parity), so it still reads `wedged` at the silence bound and
+  must not be excused as "not started". **The rule survives the fix.**
+  "Not started" (nothing was ever in flight) and "stalled" (something was in flight and stopped)
+  have **opposite** correct responses — wait or reassign for the first, kill for the second — so
+  never treat them as the same event.
+
 ## ⛔ Reading lane liveness — an ABSENCE is not a verdict
 
 **A lane can be live and absent from every population the fleet can enumerate.** An orchestrator
@@ -597,6 +616,73 @@ When you encounter a **pre-existing bug** (not introduced by your current work),
   code should be) when husky hooks are installed — do not rely on it running (#672). On a hit:
   amend **before** pushing; if it is already pushed, post a correction note instead of silently
   force-pushing. Worked example: `skills/commit-workflow/workflow/02-commit-pr.md`.
+
+## ⛔ HARD RULE: Durable Paths — never park work under `/tmp`
+
+**`/tmp` is swept, and the sweep is silent.** macOS periodically clears `/tmp`/`/private/tmp`. On a
+**Linux cell** the mechanism is *not* a reboot: `/tmp` is not its own mount there, so
+`systemd-tmpfiles --clean` removes an entry once it ages out of the box's `tmpfiles.d` window (`D /tmp …
+30d` on this fleet's Ubuntu/systemd-255 image, `10d` on some others) and the reapers walk it too — the
+box looks healthy for a while and then goes silently dead (`docs/ops/controller-service.md:72-74`;
+`docs/ops/disk-consumers.md:259`). "Cleared on reboot" would read as *safe until the next reboot*, which
+is the unsafe direction. The rule is therefore **durable vs volatile**, not one literal path: `$TMPDIR`
+is a *different* directory (`/var/folders/…` on macOS) with its own cleanup policy (idle-based, days) —
+fine for a message file that lives seconds, **not** durable for a worktree or a plan.
+
+- **⛔ On a CELL, "under `/tmp`" is not the test — the durable ROOT is.** The cells keep their home under
+`/tmp` (`HOME=/tmp/cell-home`, with the checkouts also there — `/tmp/cell-t3` is the tortoise tree and
+`/tmp/cell-ai` the agent-infra one — `docs/ops/disk-consumers.md:31-33,42,46`), so both roots prescribed
+below are *themselves* under `/tmp` there and a bare "never under `/tmp`" is unsatisfiable. The durable
+roots on a cell are `CELL_HOME`, the cell's own repo checkout, and `$AGENT_INFRA_PATH` — the same set
+`docs/ops/controller-service.md:78-82` accepts, having recorded that "under `/tmp`" "alone cannot be the
+rule without blocking every cell bring-up". So never `/tmp/wt-*` on a cell either, but
+`<cell-repo>/.worktrees/<type>/<name>` is durable **because it is the cell's working filesystem**, not
+because it escapes `/tmp`.
+
+- **Worktrees go inside the repo**: `<repo>/.worktrees/<type>/<name>` — on a cell, durable **because the
+repo IS the cell's working filesystem** (see the carve-out above; the repo is itself under `/tmp` there,
+so this bullet does not claim it escapes the sweep), and elsewhere because it is outside `$TMPDIR`. Never
+`/tmp/wt-*`, `/private/tmp/wt-*` or `$TMPDIR/wt-*`. Measured twice in one session (2026-10-12→13):
+`/tmp/wt-agent-infra` and `/tmp/wt-7860` vanished under live lanes, and the dispatch then failed `ENOENT
+(spawn cwd: …)` — a lost *directory* reported as a spawn bug (#1698).
+- **Durable artifacts** — the plan, the problem statement, review findings, a note you will still need —
+belong in `~/.pi/agent/state/`, the repo, or **the issue itself**. A `/tmp/*.md` is not recoverable from
+git because it was never committed; that is the same reasoning the commit-message rule above already
+applies to its own temp file.
+- **Ephemeral scratch is fine, and only that.** A self-removing scratch checkout (agent-infra:
+`scripts/scratch-worktree.sh run`, root `$SCRATCH_WORKTREE_ROOT`, **default `/tmp`**) is for a throwaway
+command — never the home of work you would have to recover.
+- **A `cwd` in a spawn failure is about the DIRECTORY, not the install.** `task()` names it (#1698):
+`⛔ THE SPAWN CWD DOES NOT EXIST … this is NOT a missing pi install`. Check the directory first.
+
+### A dead worktree record: `prune` handles it — unless the record is LOCKED
+
+Measured (git 2.43.0, 2026-11-08, one throwaway repo / three records): after `rm -rf` of a worktree
+directory, `git worktree list` marks an **UNLOCKED** record `prunable` — a LOCKED one still reads `locked`
+and is never marked, which is why it is easy to miss — and a plain `git worktree prune` **removes the
+unlocked one immediately** (`-v`: `gitdir file points to non-existent location`; plain prune expires *now*,
+not in three months). Two documented ways it then survives:
+
+| why it survived | measurement |
+|---|---|
+| **`git worktree lock`** | prune skips it **silently** — rc 0, no warning — and `git worktree remove --force` refuses (`cannot remove a locked working tree`). This is the one silent skip. |
+| `git gc` instead of prune | a freshly-dead record is **still listed** after `git gc` — it honours `gc.worktreePruneExpire`, default **3 months** |
+
+Remedy, scoped to **your own** record: `git worktree remove <path>` — it removes a record whose directory is
+gone (measured rc 0) and REFUSES on a tree with uncommitted **tracked or untracked** changes (`contains
+modified or untracked files`). That guard does **not** cover **ignored** files: a `.env` or a `node_modules/`
+leaves `git status` clean, so `remove` succeeds and deletes them (measured rc 0). Check first with
+`git -C <path> status --porcelain --ignored`, which is what `scripts/stale-worktrees.sh` does before its own
+removals. On a LOCKED record `remove` refuses (`cannot remove a locked working tree`), so run
+`git worktree unlock <path>` first — but do **not** chain the two with `&&`: `unlock` on an UNLOCKED record
+is itself `fatal: '<path>' is not locked`, which would skip the removal. `remove -f -f` overrides both the
+lock and the dirty guard, so it discards uncommitted work — use it only when you mean to.
+⛔ **Never run a bare `git worktree prune` as housekeeping.** It takes **no path argument**
+(`git worktree prune [-n] [-v] [--expire <expire>]`) — **no path filter**, so within the repo it runs in it
+deregisters EVERY record whose directory is momentarily unstat-able (an unmounted volume, a permission blip),
+destroying an unrelated checkout whose files are still on disk. `-C <repo>` scopes it to one *repo*, which is
+how the gate-guarded `scripts/pi-reap-worktrees.sh` uses it; the measurement behind the ban is recorded at
+`scripts/stale-worktrees.sh:145-150`, and `#1141`'s tracker entry does not carry it.
 
 ## Search
 

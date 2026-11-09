@@ -2445,16 +2445,31 @@ check_controller_service() {
     return 0
   fi
   for cand in "${CONTROLLER_SERVICE_INSTALLER:-}" \
-              "${HOME:-}/.pi/agent/scripts/install-controller-service.sh" \
               "${LAYER_ROOT:-}/scripts/install-controller-service.sh" \
+              "${HOME:-}/.pi/agent/scripts/install-controller-service.sh" \
               "$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/install-controller-service.sh"; do
     [ -n "$cand" ] && [ -f "$cand" ] && { installer="$cand"; break; }
   done
-  [ -n "$installer" ] || die "install-controller-service.sh not found (looked at \$CONTROLLER_SERVICE_INSTALLER, \$HOME/.pi/agent/scripts, \$LAYER_ROOT/scripts, and beside this script) — the controller would stay a tmux session with nothing above it (#2402): it survives until the box empties, and then it is gone with no signal"
+  [ -n "$installer" ] || die "install-controller-service.sh not found (looked at \$CONTROLLER_SERVICE_INSTALLER, \$LAYER_ROOT/scripts, \$HOME/.pi/agent/scripts, and beside this script) — the controller would stay a tmux session with nothing above it (#2402): it survives until the box empties, and then it is gone with no signal"
   # ⛔ THE LAYER THE BRING-UP ALREADY TRUSTS IS THE ONE TO RUN (review P1, #2402). This script is normally
-  # pushed STANDALONE into /tmp, so "beside this script" proves nothing, and the installer is not in the
-  # farm list — a cell provisioned the documented way therefore found nothing here and DIED at this check
-  # (killing every bring-up). $LAYER_ROOT/scripts is the checkout check_operational_layer just installed.
+  # pushed STANDALONE into /tmp, so "beside this script" proves nothing — and BEFORE the #1938 farm entry
+  # the installer was in no farm array at all, so a cell provisioned the documented way found nothing here
+  # and DIED at this check (killing every bring-up). $LAYER_ROOT/scripts is the checkout
+  # check_operational_layer just installed.
+  # ⛔ AND THAT IS WHY `$LAYER_ROOT` IS TRIED BEFORE `$HOME/.pi/agent/scripts`, not after: #1938 makes the
+  # farm deliver this installer to `$CELL_HOME/.pi/agent/scripts`, and `setup_home` exports
+  # HOME="$CELL_HOME" (:353) BEFORE any check runs, so on a compliant cell candidate 2 = the FARMED copy
+  # and it would win on EVERY bring-up. That is not a cosmetic preference: the farmed copy has no
+  # `../templates` (see the TEMPLATES_DIR note below), so it would render the LAYER's systemd units from
+  # an installer of a different vintage, while the supervisor just below is resolved from the layer. The
+  # order here keeps installer and supervisor on one vintage and leaves the farmed copy as a genuine
+  # FALLBACK for a box with no layer — which is what it was before this PR, when it simply did not exist.
+  # ⛔ ORDER IS LOAD-BEARING, so the suite pins it STATICALLY, reading this very `for cand` list: putting
+  # `$HOME` back ahead of `$LAYER_ROOT` reddens that arm instead of silently reinstating the skew.
+  # ⛔ IT MUST BE STATIC — a DYNAMIC sentinel cannot discriminate here, and an earlier version of this
+  # comment claimed one: the operational-layer step re-farms this installer from the layer earlier in the
+  # same run, so both orders resolve byte-identical files and a sentinel arm stays green either way. An
+  # arm that cannot fail is worse than no arm, because it advertises a guarantee it does not hold.
   # The supervisor is resolved from the SAME checkout: the installer prefers $HOME/.pi/agent/scripts, and a
   # stale copy there predating ORCH_FOREGROUND would hand the unit a launcher that exits 0.
   local layer_sup="${LAYER_ROOT:+$LAYER_ROOT/scripts/cloud-cell-supervisor.sh}"

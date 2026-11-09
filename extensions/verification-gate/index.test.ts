@@ -7,7 +7,7 @@
  * Run: npx tsx extensions/verification-gate.test.ts
  */
 
-import { extractJson, isValidResult, isGitOp, isGitCommit, resolveProjectRoot, resolveMergeRoot, scopeFiles, extractCdPath, normalizeRegistryPath, mergeVerifiedFiles, hashAndMergeFiles, extractRepoFlag, extractGhRepoEnv, extractPrNumber, repoNameFromRemote, evaluateMergeScope, isMergeCommand, mergeCommandWindow, hashMatchesDisk, buildSubAgentBlockMessage, isTaskSubAgent, SHAPE_EXEMPT_EXTENSIONS, BUILD_OUTPUT_SEGMENTS, isShapeExemptFile, isDeletionPush, isBareCommitShape, commitSweepClass, wtPathCommitInfo, commitChainMutationClass, commandRunsCommit, parsePushRefSpecs, resolvePushTier, buildPushRangeDiffCommand, resolveCommitOid, isAncestorOrEqual, resolvePushRangeScope, formatCeremonyDiagnostics, recordDispatchFailure, recordDispatchJudgment, recordDispatchSuccess, dispatchState, parseDiffNameStatus, parseDiffNameStatusDetailed, applyScopeGate, routeScopeGate, combineScopes, pickVerifiedRoot, indexRecordsContent, verificationCandidates } from "./index.js";
+import { extractJson, isValidResult, isGitOp, isGitCommit, resolveProjectRoot, resolveMergeRoot, scopeFiles, extractCdPath, normalizeRegistryPath, mergeVerifiedFiles, hashAndMergeFiles, extractRepoFlag, extractGhRepoEnv, extractPrNumber, repoNameFromRemote, evaluateMergeScope, isMergeCommand, mergeCommandWindow, hashMatchesDisk, buildSubAgentBlockMessage, isTaskSubAgent, SHAPE_EXEMPT_EXTENSIONS, BUILD_OUTPUT_SEGMENTS, isShapeExemptFile, isDeletionPush, isBareCommitShape, commitSweepClass, wtPathCommitInfo, commitChainMutationClass, commandRunsCommit, parsePushRefSpecs, resolvePushTier, buildPushRangeDiffCommand, resolveCommitOid, isAncestorOrEqual, resolvePushRangeScope, formatCeremonyDiagnostics, orderMattersLines, recordDispatchFailure, recordDispatchJudgment, recordDispatchSuccess, dispatchState, parseDiffNameStatus, parseDiffNameStatusDetailed, applyScopeGate, routeScopeGate, combineScopes, pickVerifiedRoot, indexRecordsContent, verificationCandidates } from "./index.js";
 import { createHash } from "node:crypto";
 import { execSync } from "node:child_process";
 import { ok, equal, deepEqual, throws } from "node:assert/strict";
@@ -3110,9 +3110,42 @@ test("escalation copy never contains the pinned negative phrases — all 4 forma
   }
 });
 
-test("zero-merge remedy names the exact-blocked-file fix", () => {
+test("zero-merge remedy names the exact-blocked-file fix AND the sequencing cause (#2087)", () => {
   const d = formatCeremonyDiagnostics("zero-merge-pass", 1, "capable");
   ok(d.includes("EXACT blocked files"), "zero-merge remedy re-targets the dispatch");
+  // #2087: the old remedy was the WHOLE remedy, and it misdiagnosed a SEQUENCING state as a
+  // verifier defect — "re-dispatch naming the EXACT blocked files" cannot help when the names
+  // were already exact. The distinguishing words below are what an agent needs to stop
+  // re-dispatching into the same zero-merge.
+  ok(/SEQUENCING state, not a verifier defect/.test(d), "names the sequencing cause, not a verifier bug");
+  ok(/blocked set or its STAGED diff/.test(d), "names the two scopes a PASS can merge into");
+  ok(/stage the change first/.test(d), "names the achievable action that creates the scope");
+});
+
+test("both block messages print the ORDER a PASS can merge in (#2087)", () => {
+  // The gate's remedy is an instruction an agent follows literally, so the order has to be IN
+  // the message: a verifier dispatched before the first blocked op (or before staging) records
+  // 0 of N files, and the retry is refused with the identical text. `orderMattersLines` is the
+  // ONE producer both block sites render. THIS test pins its content plus the SUB-AGENT site
+  // (the `buildSubAgentBlockMessage` call below); the INTERACTIVE site is pinned where a block
+  // message can actually be rendered — `index.lane-satisfiable.test.ts`'s `(#2087) a PASS taken
+  // before any scope exists …` case asserts the real handler's `reason` carries it.
+  const lines = orderMattersLines(["a.ts"], "  ").join("\n");
+  ok(/ORDER MATTERS \(#2087\)/.test(lines), "the order is stated");
+  ok(/dispatched BEFORE the first block/.test(lines), "names the failing order explicitly");
+  ok(/git add a\.ts/.test(lines), "names the concrete staging command for THESE files");
+  ok(/THIS refusal recorded the scope/.test(lines), "says the scope already exists after the block");
+  ok(/push \/ gh op needs no staging/.test(lines), "distinguishes a push (nothing to stage) from a commit");
+  // #2087 precision: the push exemption is NOT unconditional — a push whose range could not be
+  // resolved keeps the staged-index fallback, so the line must not tell that shape to skip staging.
+  ok(/first push with no[\s\S]*usable base[\s\S]*staged index/.test(lines), "names the staged-index fallback for an unresolvable push range");
+  // Every rendered line is indented once by the caller — the block bodies are one level in.
+  ok(lines.split("\n").every((l) => l.startsWith("  ")), "every line carries the caller's indent");
+  // An empty blocked set must not render a dangling `git add ` with no arguments.
+  const empty = orderMattersLines([], "  ").join("\n");
+  ok(!/git add\s*$/.test(empty), "no dangling `git add` when the blocked set is empty");
+  // And the sub-agent message carries it in-band (the child's own ceremony) — the site pin.
+  ok(/ORDER MATTERS \(#2087\)/.test(buildSubAgentBlockMessage(["  Unverified files:"], "/repo", ["a.ts"])), "sub-agent block states the order too");
 });
 
 test("record-fn taxonomy post-conditions: format classes move the streak; judgment/zero-merge do not; success resets", () => {

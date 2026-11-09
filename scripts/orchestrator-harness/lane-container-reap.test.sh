@@ -41,7 +41,12 @@ mkdir -p "$T/bin" "$T/state"
 
 NOW=1790000000                      # pinned clock; the suite never reads the real one
 MIN_AGE=14400
-REPO="/repo"
+# ⛔ A REAL DIRECTORY, NOT `/repo` (agent-infra#1974). The reaper now resolves REPO through the box's
+# ONE resolver, which PROVES the value is a checkout — so a fixture path that exists nowhere would be
+# refused before any arm ran. (That is the defect the resolver removes: `/repo`, `/tmp/cell` and a
+# developer's home directory were all "paths the script invented" and the arms could not tell.)
+REPO="$T/repo"
+mkdir -p "$REPO"
 SNAP="$T/state/claims-snapshot"
 RM_LOG="$T/rm.log"
 export NOW MIN_AGE REPO SNAP RM_LOG
@@ -107,10 +112,15 @@ printf '%s %s %s\n' "1" "0" "/sbin/init"
 cat "$PS_FIXTURE"
 SH
 
-# `git` answers only `worktree list --porcelain`.
+# `git` answers the resolver's proof and `worktree list --porcelain`. The proof arm is what makes the
+# fixture honest: `STUB_IS_CHECKOUT=0` models a directory that is NOT a checkout, which is the shape
+# the reaper must refuse rather than sweep.
 cat > "$T/bin/git" <<'SH'
 #!/bin/sh
 case " $* " in
+  *" rev-parse --show-toplevel "*)
+    if [ "${STUB_IS_CHECKOUT:-1}" = 1 ]; then printf '%s\n' "$REPO"; exit 0; fi
+    exit 1 ;;
   *" worktree list "*)
     cat "$WORKTREE_LIST"
     ;;
@@ -141,9 +151,9 @@ run_reaper() {
     )
 }
 
-SLUG_OLD="$(slug_for "/repo/.worktrees/fix-8888")"
-SLUG_LIVE="$(slug_for "/repo/.worktrees/fix-7777")"
-SLUG_PROC="$(slug_for "/repo/.worktrees/fix-6666")"
+SLUG_OLD="$(slug_for "$REPO/.worktrees/fix-8888")"
+SLUG_LIVE="$(slug_for "$REPO/.worktrees/fix-7777")"
+SLUG_PROC="$(slug_for "$REPO/.worktrees/fix-6666")"
 
 : > "$SNAP"
 printf 'refs/claims/9665-abc123def456\tbox1:123\t%s\n' "$(( NOW + 3600 ))" > "$SNAP"
@@ -175,8 +185,8 @@ export PS_FIXTURE="$T/ps.fixture"
 
 # WORKTREE_LIST: the live slug is listed; the old slug is gone.
 cat > "$T/worktree.list" <<EOF
-worktree /repo
-worktree /repo/.worktrees/fix-7777
+worktree $REPO
+worktree $REPO/.worktrees/fix-7777
 EOF
 export WORKTREE_LIST="$T/worktree.list"
 
@@ -255,6 +265,26 @@ printf 'cap9664-pg\trunning\n' > "$T/docker.list"
 out="$(run_reaper --apply)"
 has "$out" "REMOVED cap9664-pg" "apply removes the proven-gone container"
 eq "$(cat "$RM_LOG")" "cap9664-pg" "docker rm -f was the exact removal"
+
+# K. A REPO THAT IS NOT A CHECKOUT IS REFUSED, not swept (fresh-context review of #3833: the git stub's
+# `STUB_IS_CHECKOUT=0` arm models exactly this shape and NOTHING set it, so the branch was dead and the
+# fixture's own honesty claim was unexercised). ⛔ THE ATTRIBUTION IS THE DECLARED-VALUE VALIDATION, not
+# the derivation's proof (fresh-context review of #3833, minor note — corrected): `run_reaper` exports
+# `LANE_CONTAINER_REPO="$REPO"`, so `resolve_repo` takes the DECLARED arm and never enters the candidate
+# loop; `STUB_IS_CHECKOUT=0` is what its `rev-parse --show-toplevel` answers there.
+# The property is the one that matters either way: a directory that cannot prove it is a checkout must
+# never reach a `docker rm -f`, and the refusal must name the value that is wrong rather than the
+# library that is absent. The DERIVED arm's refusal shape is covered for real by
+# `repo-checkout-required.test.sh` §B/§D3 and `repo-slug.test.sh` A11/A16.
+echo " K. a REPO that is NOT a checkout is refused and sweeps nothing"
+printf 'cap9664-pg\trunning\n' > "$T/docker.list"
+: > "$T/ps.fixture"
+: > "$RM_LOG"
+out="$(STUB_IS_CHECKOUT=0 run_reaper --apply 2>&1)"; rc=$?
+eq "$rc" "2" "a REPO that cannot prove it is a checkout exits 2 (rc=$rc)"
+has "$out" "is not a git checkout" "the refusal names the value, not a missing library"
+eq "$(cat "$RM_LOG")" "" "nothing was removed from a directory that is not a checkout"
+hasnt "$out" "REMOVED" "no removal is claimed on the refusal"
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" = 0 ] || exit 1

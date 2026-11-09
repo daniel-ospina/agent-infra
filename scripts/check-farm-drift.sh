@@ -626,10 +626,14 @@ fi
 # fatal arm fires on a correct box and NEVER CONVERGES: `pi-bootstrap/setup.sh` turns rc=1 into
 # `exit 1`, and `sync.sh:72` calls it under `set -euo pipefail` with no `|| true`, so every later
 # sync step is skipped on every run and auto-sync can never complete. Measured 2026-10-31 on a box
-# that had just installed clean: ONE stale file that no farm array delivers (`admin-merge.sh` —
+# that had just installed clean: ONE stale file that no farm array delivered (`admin-merge.sh` —
 # grep count 0 in setup.sh) → rc=1 → `⛔ FARM DID NOT CONVERGE` → setup.sh exit 1, and a second full
 # setup.sh run left the file STILL STALE, so the printed remedy ("re-run the farm") could never
-# clear it. The farm's own declaration is the population it owes, and this check already reads it,
+# clear it. ⚠️ THAT MEASUREMENT IS HISTORICAL and `admin-merge.sh` is a POOR example NOW: the rail is a
+# `merge_gate_srcs` member (`grep -c 'admin-merge\.sh' pi-bootstrap/setup.sh` is no longer 0), so it is
+# DECLARED and self-converging — precisely the case that stays FATAL rather than the case this fix
+# covers. The shape to picture is a file the declaration does NOT list; `admin-merge.sh` was one on
+# 2026-10-31 and is not one any more, so do not read the example as describing today's farm. The farm's own declaration is the population it owes, and this check already reads it,
 # so the class is knowable rather than guessed: DECLARED stale stays FATAL (that IS #10114 — the farm
 # delivers it and did not converge it), while drift OUTSIDE the declaration joins UNSOURCED in the
 # "a deploy cannot fix it, a human must" verdict (3) — loud, never a pass.

@@ -1,0 +1,12 @@
+name: fixture expression bound
+on:
+  workflow_call:
+    inputs:
+      timeout:
+        type: number
+jobs:
+  forwarded:
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ inputs.timeout }}
+    steps:
+      - uses: actions/checkout@v4

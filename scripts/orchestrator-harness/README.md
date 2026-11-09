@@ -451,7 +451,7 @@ a killed worker cannot take the controller down with it.
 | `candidates.emergency.txt` | the `P0-blocker` subset of `candidates.product.txt`'s parent backlog, in **backlog order** — i.e. the P0 candidates this box could dispatch, by their own label, intersected with `candidates.txt`. It is what the floor consults before reordering, so an emergency can never be displaced by a share target. ⛔ **ABSENT ≠ EMPTY**: the writer CREATES the file (possibly empty) on a completed read, so an empty file beside an `OK p0=0` record means the split RAN and saw no P0 — while an ABSENT file means no pass could classify this cycle, and the floor reads that as UNKNOWN and stands down |
 | `state/product-class` | WHICH arm classified the batch and what it measured: `NOT-A-PRODUCT-REPO …` / `BUDGET-SKIPPED …` / `LISTING-FAILED …` / `LISTING-TRUNCATED …` / `WRITE-FAILED …` / `OK product=<n> harness=<m>`. Written by `write_product_queues`; the dispatch line repeats it instead of asking a second time |
 | `state/emergency-class` | the emergency split's outcome, and deliberately a SEPARATE polarity from `state/product-class`: `OK p0=<n>`, `NOT-A-PRODUCT-REPO …` (no floor applies, so nothing to override), or `UNKNOWN-<BUDGET-SKIPPED|LISTING-FAILED|LISTING-TRUNCATED|WRITE-FAILED> …`. ⛔ Every `UNKNOWN-` arm also REMOVES `candidates.emergency.txt`, and the reader requires the file to exist with a line count matching the recorded `p0=` before it trusts an `OK` record — so a stale record left standing by a failed write cannot be read as "no P0". An unreadable PRODUCT class under-claims (an unclassifiable item must not satisfy the floor); an unreadable EMERGENCY class must not, because "no P0 could be read" is not "there is no P0" — so every `UNKNOWN-` arm stands the floor down (`product-floor OVERRIDDEN emergency=p0-unknown(…)`), naming the reason |
-| `dispatched.txt` | issues already handed to a lane — **pruned** when the issue is still open, no PR branch matches it and no `lane-<N>` is live (see §7.1); plus, for an entry the capped (500-row) open-issue listing cannot answer for, a direct `gh issue view <N> --json state` — removed only when the issue is **CLOSED** *and* already out of `candidates.txt`, and KEPT (and named on the `[reap] dispatched re-check:` line) when it is OPEN, because a merged PR naming an OPEN issue reads CLEAN downstream |
+| `dispatched.txt` | issues already handed to a lane — **pruned** when the issue is still open, no PR branch matches it and no `lane-<N>` is live (see §7.1); plus, for an entry the capped open-issue listing cannot answer for (500 rows, or the rows-sized bound when a pass serves four or fewer), a direct `gh issue view <N> --json state` — removed only when the issue is **CLOSED** *and* already out of `candidates.txt`, and KEPT (and named on the `[reap] dispatched re-check:` line) when it is OPEN, because a merged PR naming an OPEN issue reads CLEAN downstream |
 | `checked.txt` | issues whose pre-flight returned **CLEAN** (the terminal verdict); an **errored** pre-flight and a **COLLISION** leave no entry, so the next pass re-attempts them (agent-infra#1716). ⛔ **REVALIDATED EVERY PASS** (agent-infra#2183): an entry survives only while a re-checkable keep-fact holds — `dispatched`, `queued`, `pr`, `lane`, or a live cross-box `claim` — and anything else is **released** and re-judged, so a candidate judged CLEAN whose lane never started cannot be suppressed for ever. A reaped number is dropped from it too. The release is bounded (`CHECKED_RELEASE_MAX`, 24 asks/pass) and rotated by `state/checked-release-cursor`, which holds the **last issue asked** (not the largest), so a head of permanently-held entries cannot starve the tail. ⛔ The bound applies to the registry path: a box with **no `$O/claims.sh`** takes the documented fallback and releases the whole residue in one pass (no claim can exist there, so there is nothing to re-check per entry) |
 | `state/collided` | `"<expiry-epoch> <issue>"` per line — candidates a peer was holding at the last pre-flight. A pass walks PAST a fresh record without spending a pre-flight run, so a blocked pool HEAD is not re-bought on every pass; a skipped candidate stays out of `candidates.txt` and out of `checked.txt`, so it is **deferred, never dropped** — the record lapses after `POOL_COLLISION_TTL` (900 s) and the candidate is judged again (agent-infra#1729). Only a COLLISION is recorded: a DEGRADED / INCOMPLETE / verdict-less answer is an environment failure and stays visible on every pass (agent-infra#1736) |
 | `state/mergeclaim-<PR>.lock` | single-owner claim: only one worker may review/record/merge/**fix** a given PR. Taken by `merge-one.sh`, by the doctor's `merge` role, and — since the pusher hole was closed (#2574) — by `fix-one.sh`, the one worker whose product is a NEW HEAD: without it a lander could re-resolve a head that a fixer then moved under it, and the rail refuses with the just-minted attestation stale. A LIVE holder makes the fixer DEFER with a refundable bail marker and no attempt consumed. A claim whose pid `kill -0` proves GONE is TAKEN OVER — measured, and by `mv` aside + verify, never `rm && write`: the record is renamed aside, what was detached is checked against the dead pid that was measured, and a record that turns out to be a peer's LIVE claim is put back with `ln` (create-if-absent) **if the path is still free** — if a third party has re-claimed it in between, the displaced claim cannot be reinstated, which is logged as a WARNING and reported as its own deferral (never as "nothing was deleted"). `fix-one.sh` also CREATES the record with its pid already in it (a pre-written file `ln`-ed into place), because a noclobber create that writes the pid afterwards leaves the file briefly EMPTY and the other three readers treat "no owner" as a reason to `rm` it. An EMPTY or unparseable record is **not** stale ON ITS CONTENT ALONE (that same window), so content alone never reaps it. ⛔ AN EMPTY RECORD THAT HAS OUTLIVED ANY POSSIBLE CREATE WINDOW IS A MEASUREMENT, NOT AN INFERENCE (agent-infra#3096): `fix-one.sh`'s `prlock_no_owner_abandoned` and `pr-owner-liveness.sh`'s `pl_verdict` both reclaim one whose `find -mmin` age exceeds `PRLOCK_NO_OWNER_GRACE_MIN` (default 2 m — microseconds vs the 21 h measured on the cells), by detach-and-verify, never `rm && write`. Before that reconcile the two verdicts DISAGREED for one state — `pl_verdict` answered OWNED for a 21-hour-old 0-byte record while `pr_owned` counted the PR un-owned — so the controller spawned nothing for a PR nothing owned and the issue path stayed shut. The `OVERRIDES`-style departure from the earlier literal rule is marked in `pr-owner-liveness.sh`'s header with its evidence; the rule it protects (never reap on emptiness ALONE) is unchanged. A lock state no re-dispatch can clear (a path that is not a regular file, or an unwritable `$O/state`) is REFUSED and the attempt is CONSUMED, so `MAX_FIX_TRIES` parks the PR instead of a refunded spin. **Per box** — the cross-box fence for the landing path is `refs/claims/pr-<PR>` in the shared repo (§7.2b) |
@@ -1173,27 +1173,46 @@ export REPO=$HOME/eldato/tortoise        # REQUIRED: the target repo's local mai
                                          # any other machine: REPO missing -> the controller dies
                                          # at startup and crash-loops under KeepAlive; REPO wrong
                                          # but existing -> the refresh aborts every cycle while
-                                         # the controller keeps beating. ⛔ SEVEN shipped SHELL
-                                         # scripts still carry a REPO default of their own — the
-                                         # complete grep over `*.sh`, `retired/` and `*.test.sh`
-                                         # excluded:
-                                         # refresh-candidates.sh:18, report.sh:24,
-                                         # cloud-cell-supervisor.sh:93,
-                                         # deploy-crossbox.sh:23,
-                                         # pi-reap-worktrees.sh:1174 (`${REPO:-$PWD}`),
-                                         # stale-worktrees.sh:35 (`REPO="$PWD"`) and
-                                         # stale-main-triage.sh:16 (`${1:-$PWD}`). The `$PWD`
-                                         # three are the worst shape: $PWD is `/` under launchd,
-                                         # so the default resolves to a real non-repo directory
-                                         # and fails later as `not a git repository: /` instead
-                                         # of at the REPO boundary. ⛔ TWO of the same class are not
+                                         # the controller keeps beating. ⛔ NO SHIPPED SHELL SCRIPT
+                                         # CARRIES A REPO PATH DEFAULT ANY MORE (agent-infra#1974,
+                                         # #3833) — the complete grep over `*.sh`, `retired/` and
+                                         # `*.test.sh` excluded. The seven this passage used to
+                                         # list are all resolved now: `report.sh` (44) and
+                                         # `deploy-crossbox.sh` (124) read
+                                         # `REPO="$(resolve_repo)"`, and
+                                         # `refresh-candidates.sh` (149),
+                                         # `cloud-cell-supervisor.sh` (149),
+                                         # `pi-reap-worktrees.sh` (882),
+                                         # `stale-worktrees.sh` (45),
+                                         # `stale-main-triage.sh` (23) — plus
+                                         # `lane-container-reap.sh` (74:
+                                         # `REPO="${LANE_CONTAINER_REPO:-${REPO:-}}"`) and
+                                         # `cloud-cell-doctor.sh` (84: `REPO="${REPO:-}"`) — carry
+                                         # an explicit fallback whose LAST resort is EMPTY, i.e. a
+                                         # NO DEFAULT that cannot invent a path.
+                                         # `worktree-hygiene-sweep.sh` (126) also carries
+                                         # `REPO="${REPO:-}"`; its operator variable
+                                         # `$TORTOISE_REPO`/`$TORTOISE` is a CANDIDATE, not a
+                                         # default, so `resolve_repo` PROVES it (a git checkout,
+                                         # and — when `$OR` is declared — that its `origin` names
+                                         # that target) and it is offered ALONE, never tied against
+                                         # the cwd. The
+                                         # `$PWD` three were the worst
+                                         # shape: $PWD is `/` under launchd, so the default
+                                         # resolved to a real non-repo directory and failed later
+                                         # as `not a git repository: /` instead of at the REPO
+                                         # boundary — which is why the cwd is now a CANDIDATE
+                                         # that must PROVE itself through `repo-slug.sh`'s
+                                         # `resolve_repo` rather than a value used because
+                                         # nothing was set. `check-single-source.sh`'s REPO arm
+                                         # reds a re-introduced default, so this cannot drift
+                                         # back silently. ⛔ TWO of the same class are not
                                          # shell scripts, and they are the rawest form of it — a
                                          # hardcoded home with NO env override, used only to import
                                          # the SDK: `goal-state.py:29`
                                          # (`REPO = "/Users/<someone>/Documents/GitHub/tortoise"`)
                                          # and `seed-goal-map.py:29` (the same literal passed straight
-                                         # to `sys.path.insert`). Tracked separately. #1977 covers
-                                         # the first and the third; the other five are untracked. So export REPO in
+                                         # to `sys.path.insert`). Tracked separately (#1977). So export REPO in
                                          # the daemon AND the session env (#1935).
 export O=$HOME/orchestrator              # the harness state directory
 export SCOPE=own                         # drain scope: auto (default) | own | broad.
@@ -2040,7 +2059,7 @@ clear about what is and is not enforced:
 Five carriers (`orch-loop.sh`, `lane.sh`, `fix-one.sh`, `merge-one.sh`, `nonblocking-dispatch.sh`)
 used to `export AGENT_SKIP_REVIEW_GATE=1 ELDATO_SKIP_VGATE=1` unconditionally. The canon calls both
 flags emergency-only (`skills/commit-workflow/SKILL.md:102,:111`) and a lane collected without review
-is "UNREVIEWED CODE BY DEFAULT" (`skills/parallel-orchestrator/SKILL.md:150`), so a permanent export was
+is "UNREVIEWED CODE BY DEFAULT" (`skills/parallel-orchestrator/SKILL.md:152`), so a permanent export was
 a **defect**, and dangerous in one direction only: the permissive side was the machine that lands the
 most work.
 
@@ -2491,16 +2510,50 @@ to a sibling that happens to share the wrapper. See §6.5.1b.
 
 ```text
 [scope] open=24 -> BROAD (auto)             ← or (pinned SCOPE=own) / (pinned SCOPE=broad)
-[cap] load=7/100 lanes=4/12 max_lanes=25 zombie=0 lanes_src=census mem_avail=11761M/512M swap_free=588M/600M   ← every gate names its ceiling
+[cap] load=7/100 lanes=4/12 max_lanes=25 zombie=0 lanes_src=census mem_avail=11761M/512M swap_free=588M/600M disk_free=41230M/8144M disk_headroom=ok disk_src=report   ← every gate names its ceiling
 [dispatch] load=7 lanes=4 -> 4429 4489
 [refresh] queue=READ(7) — every priority tier was READ; 7 candidate(s) listed (agent-infra#1931)
 [refresh] +#4508 CLEAN -> backlog
 #8219 FAILED:ai-review-gate          ← per-PR verdict for the required checks
 #8192 fixer attempt 1                ← routed to a fixer, not a re-record
 ...
-[cap] load=104/100 lanes=4/12 max_lanes=25 zombie=8 lanes_src=census mem_avail=11890M/512M swap_free=588M/600M
+[cap] load=104/100 lanes=4/12 max_lanes=25 zombie=8 lanes_src=census mem_avail=11890M/512M swap_free=588M/600M disk_free=179M/8144M disk_headroom=no disk_src=report
 [dispatch] skipped (load=104>=max_load=100)   ← and WHY, naming the binding gate
 ```
+
+### `disk_free=` / `disk_headroom=` — the capacity the box does not have (agent-infra#2159)
+
+`[cap]` carried `load`, `lanes`, `max_lanes`, `mem_avail` and `swap_free` and **no disk figure and no
+per-lane cost**, so a cell holding six LIVE worktrees at ~1.1 GB each on a 32 GB disk sat at **179 MB
+free** while its line advertised `lanes=0/20` — and an orchestrator acting on that line filled it into
+the wall (four `merge-*` lanes then died with 0-byte logs: the log write itself failed). The datum was
+never missing — `spawn-gate.sh` measures free space and one lane's cost on every admission and appends
+both to `state/disk.tsv` — it simply was not on the line an operator reads.
+
+The three fields, and the two rules that make them trustworthy:
+
+| field | meaning |
+|---|---|
+| `disk_free=<free>M/<need>M` | MiB free on the volume holding `$REPO`, against what ONE more lane needs — `max(tree, self) + reserve`, the pre-start seam's bound (`disk_worktree_need`). Read as the pair `mem_avail=<free>M/<floor>M` already is |
+| `disk_headroom=ok\|no\|unknown` | `no` = the next lane does **not** fit at this reading; `unknown` = the probe could not answer (never coerced to a number) |
+| `disk_src=report\|absent` | where the reading came from. `absent` = no `spawn-gate.sh` with `--disk-report` was found (deploy skew), and the cycle says so in one `[disk] CANNOT-VERIFY` line |
+
+⛔ **IT IS A REPORT, NOT A FIFTH GATE, AND THAT IS THE RECORDED DECISION.** The controller's gate
+vector states it: *"DISK is not repeated here because the spawn point (`spawn-gate.sh`) is its ONE
+implementation"*. So `[cap]` ADVERTISES the constraint and does not duplicate the refusal — the
+refusal that matters happens upstream of every lane checkout (`wt_provision` → `disk_admit`, exit 77)
+and at the spawn point (`DISK-NOHEADROOM`). Adding a second disk gate here would be the duplication
+agent-infra#1178 forbids.
+
+⛔ **ONE MEASUREMENT.** The figure comes from `spawn-gate.sh --disk-report`, which prints the fields
+`disk_admit` just measured — the controller runs **no `df` of its own**. A second reading is a reading
+whose report can disagree with the verdict beside it (#2721's own defect). The pairing is pinned by
+`cap-disk-report.test.sh` (the report's `free`/`need` are asserted equal to `--disk-admit`'s on the
+same stubbed fixture).
+
+⚠️ **Stated limit:** the volume measured is the one `$REPO` lives on. A lane provisioned onto a
+different mount would be judged on the repo's volume — the same limit the supervisor's `check` states,
+and the shipped topology (lanes under `<repo>/.worktrees`) does not split them.
 
 ⛔ **`backlog=0` alone is never a clearance** (agent-infra#1931). The cycle line carries the pool's
 READ state beside it, and `EMPTY` is the only form that means "no work":
@@ -3865,8 +3918,9 @@ answer different questions:
   it is kept by the window-blind arm's no-slug path. ⛔ Do not read "`9999` kept" as pinning
   "closed ⇒ kept": with a slug the shipped code does the OPPOSITE for a window-blind CLOSED issue —
   it is reclaimed.
-* **window-BLIND entries** (absent from that listing, which is `--limit 500` created-DESC and
-  permanently saturated on a repo with more open issues than that): the issue's own state is asked
+* **window-BLIND entries** (absent from that listing, which is a created-DESC window of `--limit 500`
+  — or the rows-sized bound when a pass serves four or fewer — and permanently saturated on a repo
+  with more open issues than that): the issue's own state is asked
   directly (`gh issue view <N> --json state`, bounded by `DISPATCHED_RECHECK_MAX`, rotated by
   `state/dispatched-recheck-cursor`). ⛔ The rule is INVERTED here: the entry is removed only when the
   issue is **CLOSED** *and* already out of `candidates.txt`, and an **OPEN** entry is KEPT and named
@@ -5226,6 +5280,7 @@ pressure. A `tree` the OPERATOR states for the cell is honoured on both sides.
 | `run_agent` (live dispatch) | immediately before the agent starts | `REFUSED … DISK-NOHEADROOM` (unchanged, fail-OPEN on an unreadable probe) |
 | `wt_provision` → `wt_disk_admit` (PRE-START) | before `git worktree add`, i.e. before anything is created | `REFUSED-DISK(free=…, need=…, box=…; free_mb=, need_mb=)`, return **4** |
 | `spawn-gate.sh --disk-admit <target>` (the VERB) | from a dispatcher that is not this tree's shell code | same lines, exit 0/77/64 |
+| `spawn-gate.sh --disk-report <target>` (the REPORT verb) | from a caller that PRINTS capacity rather than deciding it (`orch-loop.sh`'s `[cap]` line) | one parseable row, `[disk-report] <STATE> <free|?> <need> tree= self= reserve= box= target=`, exit **0** (a report is not a gate) — the fields `disk_admit` just measured, so the printed figure cannot disagree with the verdict |
 
 rc **4** is mapped by each caller to what ITS surface can express: `fix-one.sh` refunds the attempt
 and exits **77** (`AGENT_DISK_REFUSED`); `adopt-fix.sh` exits **77**; `dispatch-merge.sh` releases the

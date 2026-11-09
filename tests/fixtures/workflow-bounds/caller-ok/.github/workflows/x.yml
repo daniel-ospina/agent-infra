@@ -1,0 +1,6 @@
+name: fixture caller ok
+on:
+  pull_request:
+jobs:
+  caller:
+    uses: daniel-ospina/agent-infra/.github/workflows/callee.yml@main

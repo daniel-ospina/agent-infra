@@ -1820,6 +1820,34 @@ HARNESS_APPLIED=""
 # names the ONE engine allowed to materialise a pin, and an operator may pin it; this box's own `start`
 # defaults it to empty (the loop passes `$SUP_SELF` explicitly to the controller it launches).
 HARNESS_MATERIALISER="${HARNESS_MATERIALISER:-}"
+# ── ONE FLOOR, WHICHEVER KNOB SETS IT (agent-infra#1852) ────────────────────────────────────────
+# `spawn-gate.sh`'s `DISK_MIN_FREE_MB` defaults to `MIN_FREE_MB` when it is unset; this is the other
+# half of that binding, and between them the two instruments can no longer certify different floors by
+# accident. That is the defect this issue records: a cell where `check` printed `CELL CAN RUN A
+# CONTROLLER` while every lane spawn was refused 77 — healthy by one instrument, unable to work by the
+# other. The reachable shape it closes here is an operator who sets only THIS file's knob (the
+# documented home of the other cell knobs): before this line, `MIN_FREE_MB=2000` certified a cell down
+# to 2000 MB that the dispatch gate refused below 500 — the band in the harmless direction — while a
+# LOWER floor (an old plist, a copied keys.env) opened it in the harmful one, where `check` blesses a
+# cell whose every spawn dies.
+# ⛔ AN INHERITED VALUE IS VALIDATED WHERE THE OPERATOR CAN SEE IT, and with ITS OWN name. Letting the
+# `MIN_FREE_MB` validation below report a `DISK_MIN_FREE_MB` mistake would send an operator to fix a
+# knob they never set (the reason the message names the variable that was actually wrong).
+# ⛔ `MIN_FREE_MB` still WINS when both are set: that is the declaration this file already documents,
+# and the dispatch gate reads `DISK_MIN_FREE_MB` explicitly in that case.
+# ⛔ BOTH SET TO DIFFERENT VALUES IS RECORDED, NOT SILENT (review round 7, non-blocking observation).
+# `MIN_FREE_MB=100` beside `DISK_MIN_FREE_MB=5000` makes this file enforce 100 while the gate enforces
+# 5000, and neither instrument named the other knob — the harmful direction being exactly the pair the
+# comment above calls out (a stale keys.env beside a newer plist). This does NOT change admission (the
+# documented precedence still decides); it only stops the divergence from being invisible in the log.
+if [ -n "${MIN_FREE_MB:-}" ] && [ -n "${DISK_MIN_FREE_MB:-}" ] && [ "$MIN_FREE_MB" != "$DISK_MIN_FREE_MB" ]; then
+  log_line "warn: MIN_FREE_MB=${MIN_FREE_MB} and DISK_MIN_FREE_MB=${DISK_MIN_FREE_MB} DISAGREE — check enforces MIN_FREE_MB while the dispatch gate enforces DISK_MIN_FREE_MB, so the two instruments bound different floors. Declare the floor with ONE spelling, or set both to the same value."
+fi
+if [ -z "${MIN_FREE_MB:-}" ] && [ -n "${DISK_MIN_FREE_MB:-}" ]; then
+  case "$DISK_MIN_FREE_MB" in ''|*[!0-9]*|?????????*) die "DISK_MIN_FREE_MB must be a positive whole number of megabytes (got '$DISK_MIN_FREE_MB') — it sets MIN_FREE_MB when MIN_FREE_MB is unset (agent-infra#1852: one floor serves check and the dispatch gate)" ;; esac
+  [ "$((10#$DISK_MIN_FREE_MB))" -gt 0 ] || die "DISK_MIN_FREE_MB must be a positive whole number of megabytes (got '$DISK_MIN_FREE_MB') — it sets MIN_FREE_MB when MIN_FREE_MB is unset (agent-infra#1852)"
+  MIN_FREE_MB="$((10#$DISK_MIN_FREE_MB))"
+fi
 MIN_FREE_MB="${MIN_FREE_MB:-500}"
 SCRATCH_DAYS="${SCRATCH_DAYS:-3}"
 # Where review scratch checkouts accumulate. Parameterized so the destructive `--scratch` path can be
@@ -1835,6 +1863,11 @@ case "$MIN_FREE_MB" in ''|*[!0-9]*|?????????*) die "MIN_FREE_MB must be a positi
 # check that exists because a full disk read healthy cannot be disarmed by a spelling of zero. The
 # digit cap matters too: bash arithmetic wraps at 2^63, so `18446744073709551617` (2^64+1) normalises
 # to 1 — a huge floor silently became 1 MiB. 9 digits is ~1 PB, beyond any real cell.
+# ⛔ THE CAP IS 8 DIGITS HERE AND 9 IN `spawn-gate.sh` (`is_limit`'s `-le 9`), and the asymmetry is
+# DELIBERATE, not drift (review round 7, non-blocking observation): this file DIES loudly on a 9-digit
+# floor while the gate would accept it, i.e. the divergence is in the safe direction (a false block an
+# operator sees, never a floor that cannot fire). Naming it here is what keeps the next reader from
+# "tidying" one cap into the other and losing the loud half.
 [ "$((10#$MIN_FREE_MB))" -gt 0 ] || die "MIN_FREE_MB must be a positive whole number of megabytes (got '$MIN_FREE_MB')"
 MIN_FREE_MB="$((10#$MIN_FREE_MB))"
 
@@ -2416,12 +2449,111 @@ seed_and_stamp() {
   stamp_write || die "cannot record the harness provenance at $STAMP"
 }
 
+# ── ONE LANE MUST FIT, and the numbers are the DISPATCH gate's own (agent-infra#1852) ───────────
+# The floor above answers "is the filesystem full?". It does not answer "can this cell start ONE
+# lane?", and the gap between those two questions is this issue: a cell read HEALTHY at 1,469 MB and
+# could do no work, because getting a lane's dev env onto it costs gigabytes. #2721/#3395 closed the
+# live-dispatch half by measuring a lane's own tree (`max(tree, self) + reserve`, derived from the
+# TARGET repo, never one global constant). This half was left behind: `check` still admitted on
+# `free >= MIN_FREE_MB` alone, so after #2721 a python-target cell could be certified at 1 GB free
+# while the dispatch gate refused EVERY spawn at less than ~8 GB — the same false PASS one instrument
+# over, which is exactly what this file's own `cmd_check_*` list exists to prevent. Measured on cell-3
+# 2026-10-17 (#1852 comment): `df` 727 MB free, `lane-5475.log` `[disk-gate] REFUSED … <
+# disk_min_free_mb=500`, while `check` printed `CELL CAN RUN A CONTROLLER`.
+#
+# ⛔ THE PREDICATE IS MIRRORED, AND THE MIRROR IS PINNED BEHAVIOURALLY, NOT BY COMMENT. These two are
+# two files with no shared shell library (`cloud-cell-supervisor.sh` does not source `spawn-gate.sh`,
+# and the dispatch gate is installed standalone as `pi`), so the numbers and the marker set ARE spelled
+# twice — the same duplication `spawn-gate.sh` already accepts for the FLOOR default. What is NOT
+# duplicated is the ANSWER: `cloud-cell-supervisor.test.sh` computes `spawn-gate.sh`'s own
+# `disk_lane_costs` + `disk_lane_need` (the live arm) AND its `disk_worktree_need` (the pre-start
+# seam) for the same fixture and asserts that `check` refuses one MB below the BINDING of the two and
+# passes AT it — so raising `DISK_LANE_SELF_PY_DEFAULT`, adding a package manager marker on one side,
+# or changing the reserve multiple reddens the suite instead of silently re-opening the band.
+# (Review-objection answer: the alternative — sourcing `spawn-gate.sh` from `check` — was rejected
+# because `check` runs BEFORE `$O` is seeded and the test fixtures seed the worker set as EMPTY files,
+# so a source-based read would report "cannot judge" on a healthy cell.)
+# ⛔ THERE ARE TWO ADMISSION BOUNDS AND THE SEAM IS THE ONE THAT BINDS (review round 7, P1 —
+# MEASURED). `spawn-gate.sh` admits inside `run_agent` (`disk_lane_need`, cheap on a plain target)
+# AND earlier, at `wt_provision` (`disk_worktree_need`, which charges the python class
+# unconditionally and is therefore target-independent). Every worktree-creating dispatch path
+# (`fix-one.sh`, `adopt-fix.sh`, `dispatch-merge.sh`) refuses at the LATTER, so certifying on the
+# former told a plain-target cell — this fleet's own harness repo — `CELL CAN RUN A CONTROLLER` at
+# 2,064MB while every lane checkout was refused at 8,144MB. That is #1852's false PASS narrowed, not
+# closed; `check` therefore asks against max(both) and names BOTH numbers in its verdict.
+# ⛔ EVERY OVERRIDE `spawn-gate.sh` honours for a cell whose measurement differs is honoured HERE too
+# (`DISK_LANE_TREE_MB` / `_SELF_MB` / `_RESERVE_MB`), with its validation: EMPTY or non-numeric is not
+# an override (it derives), an explicit `0` IS one. Without this the gate would be capped at the shipped
+# worst case and a cell that legitimately measured differently would re-open the band from the other
+# side — check refusing a cell the dispatch gate admits, which is a false BLOCK, and would be
+# undiagnosable because the operator's override looks applied.
+# ⛔ STATED LIMIT: the volume measured is the one `free_mb "$CELL_HOME"` reads (the floor's own), not
+# each lane's worktree path. On a cell `$O` and `$CELL_HOME` are on the same rootfs, so this is the
+# right volume in the shipped topology; a cell that moved `$O` to another mount would be judged on the
+# home's volume. That limitation is the FLOOR's, unchanged here, and named rather than papered over.
+SUP_LANE_TREE_PY_MB=350
+SUP_LANE_SELF_PY_MB=6144
+SUP_LANE_PLAIN_MB=64
+SUP_LANE_RESERVE_MULT=4
+
+# sup_cost_num <v> — the override-coercion `spawn-gate.sh`'s `is_limit` applies, so an inherited typo
+# cannot turn the term into "not a number" (which `[ -lt ]` would error on) or into a wrap.
+sup_cost_num() { # sup_cost_num <value> -> the number on stdout, non-zero exit when it is not one
+  case "${1:-}" in ''|*[!0-9]*) return 1 ;; 0) printf '%s\n' 0; return 0 ;; 0*) return 1 ;; esac
+  [ "${#1}" -le 9 ] || return 1
+  printf '%s\n' "$((10#$1))"
+}
+
+# sup_python_target <path> — 0 when this path will materialise a venv (any package manager's marker,
+# at the top level or ONE level down). BOUNDED and globs only: this runs in `check`, never a tree walk.
+sup_python_target() { # sup_python_target <path>
+  local p="${1:-.}" f f2
+  for f in uv.lock poetry.lock pdm.lock Pipfile Pipfile.lock pyproject.toml setup.py setup.cfg requirements.txt; do
+    [ -e "$p/$f" ] && return 0
+    for f2 in "$p"/*/"$f"; do [ -e "$f2" ] && return 0; done
+  done
+  return 1
+}
+
+# sup_lane_terms <path> — the LIVE-DISPATCH arm's terms for this target: `<need> <tree> <self>
+# <reserve> <class>`. Mirrors `spawn-gate.sh`'s `disk_lane_costs` + `disk_lane_need`: the class comes
+# from the target's package-manager markers, the reserve from the floor. `max(tree, self) + reserve`,
+# the gate's own admission rule: the lane admitted on the strength of the reserve is the lane that eats
+# it, so the WORST case is what admission is bounded by.
+sup_lane_terms() { # sup_lane_terms <path>
+  local p="${1:-.}" tree self reserve worst o cls
+  if sup_python_target "$p"; then tree="$SUP_LANE_TREE_PY_MB"; self="$SUP_LANE_SELF_PY_MB"; cls=python
+  else tree="$SUP_LANE_PLAIN_MB"; self="$SUP_LANE_PLAIN_MB"; cls=plain; fi
+  o="$(sup_cost_num "${DISK_LANE_TREE_MB:-}")" && tree="$o"
+  o="$(sup_cost_num "${DISK_LANE_SELF_MB:-}")" && self="$o"
+  reserve="$(( SUP_LANE_RESERVE_MULT * MIN_FREE_MB ))"
+  o="$(sup_cost_num "${DISK_LANE_RESERVE_MB:-}")" && reserve="$o"
+  if [ "$tree" -gt "$self" ]; then worst="$tree"; else worst="$self"; fi
+  printf '%s %s %s %s %s\n' "$(( worst + reserve ))" "$tree" "$self" "$reserve" "$cls"
+}
+
+# sup_seam_terms — the PRE-START SEAM's terms: `<need> <tree> <self> <reserve>`. Mirrors
+# `spawn-gate.sh`'s `disk_worktree_terms` + `disk_worktree_need`, and it is TARGET-INDEPENDENT on
+# purpose: the seam charges the PYTHON class unconditionally (`spawn-gate.sh`: "this is why the seam
+# needs no `--repo`"), so it needs no classifier here either. `tree` takes the PY DEFAULT when the
+# operator has not stated one, and an explicit `0` IS honoured — the same rules the gate applies.
+sup_seam_terms() { # sup_seam_terms -> "<need> <tree> <self> <reserve>"
+  local tree self reserve worst
+  tree="$(sup_cost_num "${DISK_LANE_TREE_MB:-}")" || tree="$SUP_LANE_TREE_PY_MB"
+  self="$(sup_cost_num "${DISK_LANE_SELF_MB:-}")" || self="$SUP_LANE_SELF_PY_MB"
+  reserve="$(sup_cost_num "${DISK_LANE_RESERVE_MB:-}")" || reserve="$(( SUP_LANE_RESERVE_MULT * MIN_FREE_MB ))"
+  if [ "$tree" -gt "$self" ]; then worst="$tree"; else worst="$self"; fi
+  printf '%s %s %s %s\n' "$(( worst + reserve ))" "$tree" "$self" "$reserve"
+}
+
 # A full disk is not a warning on a cell. MEASURED 2026-10-15: at 111MB free the controller log
 # filled with `No space left on device` from claims.sh and orch-loop.sh while the loop kept running
 # and reporting lanes — the same "failed precondition as success" shape this file refuses elsewhere,
 # with the added cost that `git` writes fail too (so nothing can be reviewed, recorded or merged).
 cmd_check_disk() {
-  local mb; mb="$(free_mb "$CELL_HOME")"
+  local mb need which live_terms seam_terms lneed ltree lself lres lcls
+  local snneed stree sself sres
+  mb="$(free_mb "$CELL_HOME")"
   # ⛔ An unreadable df is NOT a pass. `free_mb` prints nothing when df is missing/unreadable, and
   # returning 0 here read that as "enough" — the opposite of what its own comment claims and of this
   # file's rule that cannot-verify is never a pass. A cell whose floor cannot be measured must not be
@@ -2432,9 +2564,35 @@ cmd_check_disk() {
   if [ "$mb" -lt "$MIN_FREE_MB" ]; then
     die "only ${mb}MB free on $(dirname "$CELL_HOME") — below the ${MIN_FREE_MB}MB floor. At this level git writes and the controller's own state writes fail with I/O errors and the loop keeps reporting lanes. Free space first: $0 prune"
   fi
+  # ── AND ONE LANE MUST FIT (agent-infra#1852) ────────────────────────────────────────────────────
+  # Above the floor and below this number a cell is blessed by every other instrument in this file
+  # while `lane.sh` / `fix-one.sh` / `adopt-fix.sh` refuse EVERY spawn 77 (`DISK-NOHEADROOM`) — the
+  # exact "passes both instruments and can do no work" state the issue title names. Refusing HERE is
+  # the only place the operator sees it before the cell is started.
+  # ⛔ THE REQUIREMENT IS THE BINDING OF THE TWO BOUNDS, and the message carries the EFFECTIVE terms
+  # of both. Taking the live arm alone certified a plain-target cell at 2,064MB while the pre-start
+  # seam refused every lane checkout at 8,144MB (false PASS, closed here); printing the shipped
+  # CONSTANTS while refusing on overridden terms made the message's own arithmetic unable to reproduce
+  # the number it refused on — for exactly the operator who took the documented `DISK_LANE_SELF_MB`
+  # remedy (the line's stated purpose is that the numbers can be recomputed, not taken on faith).
+  live_terms="$(sup_lane_terms "$REPO")"
+  read -r lneed ltree lself lres lcls <<<"$live_terms"
+  seam_terms="$(sup_seam_terms)"
+  read -r snneed stree sself sres <<<"$seam_terms"
+  if [ "$lneed" -gt "$snneed" ]; then
+    need="$lneed"; which="the live dispatch arm (run_agent) at ${lneed}MB"
+  elif [ "$snneed" -gt "$lneed" ]; then
+    need="$snneed"; which="the PRE-START worktree seam (wt_provision) at ${snneed}MB"
+  else
+    need="$lneed"; which="both arms, which agree at ${need}MB"
+  fi
+  if [ "$mb" -lt "$need" ]; then
+    die "only ${mb}MB free on $(dirname "$CELL_HOME"), and ONE lane does not fit: it needs ${need}MB, and the binding bound is ${which} (live arm for '$REPO': ${lneed}MB = max(tree ${ltree}, self ${lself})MB + ${lres}MB reserve; pre-start worktree seam, target-independent: ${snneed}MB = max(tree ${stree}, self ${sself})MB + ${sres}MB reserve; a reserve defaults to ${SUP_LANE_RESERVE_MULT} x the ${MIN_FREE_MB}MB floor). Below ${need}MB every lane checkout would be REFUSED 77 by the dispatch gate (spawn-gate.sh DISK-NOHEADROOM) while this check certified the cell — the false pass agent-infra#1852 records. Free space first: $0 prune (--caches, and --scratch for /tmp), or override the measurement once you have taken a real df delta for this cell: DISK_LANE_SELF_MB / DISK_LANE_TREE_MB / DISK_LANE_RESERVE_MB (both arms honour them)."
+  fi
   if [ "$mb" -lt "$((MIN_FREE_MB * 4))" ]; then
     log_line "warn: ${mb}MB free on $(dirname "$CELL_HOME") — under $((MIN_FREE_MB * 4))MB. 'prune' reclaims the regenerable caches."
   fi
+  log_line "ok: ${mb}MB free on $(dirname "$CELL_HOME"); ONE lane needs ${need}MB — binding bound: ${which} (live arm for '$REPO' [${lcls}]: ${lneed}MB = max(tree ${ltree}, self ${lself})MB + ${lres}MB reserve; pre-start seam: ${snneed}MB = max(tree ${stree}, self ${sself})MB + ${sres}MB reserve)"
 }
 
 # The provenance half of `check`. Three refusals that CANNOT be mended by getting fresher (untracked,
@@ -4890,10 +5048,13 @@ cache_reaper_path() {
   # policy run on one box, chosen by two different rules.
   # ONE chain, the same one orchestrator-harness/orch-loop.sh and cloud-cell-bringup.sh use:
   # ${CACHE_REAPER:-} -> the FARMED copy (what the launchd job and the cell clock execute) -> the
-  # copy beside this script. Farmed BEFORE beside-this-script matters: this supervisor is never
-  # farmed (pi-bootstrap/setup.sh's fleet_srcs does not list it), so a lane running it from a
-  # checkout would otherwise arm a copy it is mid-edit on while the hourly bound the operator reads
-  # about is a different file.
+  # copy beside this script. Farmed BEFORE beside-this-script matters for a supervisor run FROM A
+  # CHECKOUT — the cell bring-up and the merge lanes do exactly that — because that sibling is a file
+  # the lane may be mid-edit on while the hourly bound the operator reads about is a different file.
+  # ⛔ THE OLD REASON HERE WAS FALSE: it said "this supervisor is never farmed (pi-bootstrap/setup.sh's
+  # fleet_srcs does not list it)". The supervisor IS farmed flat as of this landing (#1938), so for a
+  # FARMED supervisor beside-this-script and the farmed copy are the SAME file and the ordering is
+  # moot — which makes the checkout case the only one that still needs it, not one of two.
   for cand in "${CACHE_REAPER:-}" \
               "${HOME:-}/.pi/agent/scripts/pi-cache-reap.sh" \
               "$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/pi-cache-reap.sh"; do

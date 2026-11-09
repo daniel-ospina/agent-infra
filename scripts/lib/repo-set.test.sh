@@ -1003,6 +1003,151 @@ def _odd_backslashes(s):
 def _strip_comment(line):
     """`line` with a trailing comment removed — bash's rule: an unquoted `#` that starts a WORD.
 
+    ⛔ NO GUARD IN THIS SCANNER IS UNDECLARED ANY MORE, AND THE ONES NOTHING PINS ARE NAMED BELOW — DECLARED
+    HERE, BECAUSE "EVERY GUARD IS PINNED OR DECLARED" WAS FALSE UNTIL EVERY GUARD WAS MUTATED ONE AT A TIME
+    (baseline 246/0; population `git ls-files '*.sh'`, which was 435 when that sweep ran and is 438 now).
+    ⛔ MEMBERSHIP IS PER-GUARD BUT PINNING IS PER-MEMBER, AND THE TWO DO NOT COINCIDE — see the word-set
+    and charset bullets, which are split by member because the mutant's delta depends on WHICH character you
+    pull: one member reds the suite, the next one moves nothing. A guard listed as "pinned" below is pinned
+    for the members an arm actually exercises, and every other member of it is DECLARED here. This is done
+    per member where a member is a CHARACTER you can pick AND a member drop was measured to change something
+    (the word set, the two delimiter charsets, the `_openers` whitespace and delimiter-entry sets, and the
+    DEFINITION NAME charset below — whose digit member is the scanner's largest undeclared false pass);
+    elsewhere the guard is named as a whole, as are the
+    KEYWORDS set (pinned in aggregate) and the quote-set members, which are named, not enumerated — read a
+    "declared" entry as covering its members unless the entry says otherwise.
+
+    LOAD-BEARING, UNPINNED — a VALID-bash input separates the guard from its mutant (`bash -n` rc 0, and
+    `declare -F` agrees with the BASELINE and not with the mutant — or with the MUTANT where the guard ITSELF
+    is the false pass, which is the head-branch KEYWORD exclusion's case below and the only entry here that
+    runs in that direction), NO fixture line carries that input, and the mutant leaves the suite at 246/0:
+      * `_strip_comment` quote-open, below — `echo 'a # b' ; cat <<EOF` plus a body: the mutant scans the
+        body as code, a FALSE RED. Moves 0 files.
+      * `_strip_comment` word set (` \t;|&(`) — `x=1;# note cat <<NOPE` loses the very next definition, a
+        FALSE PASS, and the delta is not one number: dropping `\t`, `;`, `|`, `&` or `(` moves 0 files, but
+        dropping the SPACE moves 1 — `scripts/check-false-pass-shapes.sh`, whose awk comment mentioning
+        `cat <<EOF` stops being a comment and swallows eight tokens — and THAT member is pinned, because it
+        reds `f11f-0` at 245/1. Dropping the whole condition moves 1 the other way
+        (`scripts/pi-reap-idle.sh`, inventing `prints`). So of the SIX members of the set — SPACE, TAB, `;`,
+        `|`, `&`, `(` — five are unpinned and the SPACE is pinned: read the member, not the guard.
+      * `_openers` DOUBLE-quote state — `echo "a <<b"` then a real heredoc loses every definition after it.
+        This one is NOT hypothetical: it moves 5 files, and in `pr-path-reads.test.sh` it RECOVERS a real
+        definition the baseline misses — `pass()`, defined inside a `then` branch that the phantom opener
+        swallows. So the guard protects the namespace arm's own false-PASS direction, and it is still
+        unpinned, because no arm scans that population.
+      * `_openers` backslash escape — it takes the escape and the OPENER on ONE logical line to separate it:
+        `echo \" ; cat <<EOF` plus a body invents the body line (FALSE RED). A two-line spelling does not
+        discriminate, because `quote` is per-call and an unclosed quote carries nowhere. Moves 0.
+      * `_openers`' WHITESPACE SKIP before the delimiter word (`cat << EOF`, not `<<EOF`) — delete it and the
+        delimiter is EMPTY, no opener is recorded, and the body line is INVENTED as a definition (FALSE
+        RED) on valid bash. Moves 0 files, and no fixture line carries the spaced spelling.
+      * `_openers`' QUOTE-CLOSE test (inside the double-quote state) — delete `if c == quote: quote = None`
+        and every definition after `echo "a" ; cat <<EOF` + a body is invented as a body line (FALSE RED);
+        it moves 41 of the 438 files and invents 109 names — the largest INVENTED-NAME delta among the guards
+        this block declares (the charset members declared below LOSE names over more files, 86 and 92, and
+        digits loses more names, 209, but those are FALSE PASSES; the `head` anchor, declared separately
+        below, is larger on both at 66 files and 133 names) — and it was undeclared until this note.
+      * `_openers`' IN-QUOTE escape (`if c == '\\': i += 2` inside that state) — a separate condition from
+        the outside-quote escape below; `echo "a \" # b" ; cat <<EOF` + a body invents the body line, and
+        it moves 1 file (`rank-queue.test.sh`, losing 15 names).
+      * TWO MEMBER-LEVEL GAPS in `_openers`' own character sets, both INVENTING a body line on valid bash with
+        the suite at 246/0 and 0 files moved, and both reached only through a member an arm does not pin:
+        the whitespace skip's TAB (`cat <<` + a literal tab + `EOF` — the SPACE spelling is the one
+        illustrated, so a reader cannot tell the tab is deliberate) and the delimiter-entry set's
+        DOUBLE QUOTE (`cat <<"EOF"` — single quote and backslash are pinned there, the double quote is
+        not).
+      * AND FOUR MORE OF THE SAME CLASS, named so this list is not read as exhaustive: `_openers`'
+        single-quote CLOSE, and `_strip_comment`'s single-quote close, its in-quote escape, and its
+        DOUBLE-quote CLOSE.
+        ⛔ TWO OF THESE FOUR ARE FALSE PASSES, NOT NOISE, and they are the two quote CLOSES. Each over
+        `echo 'a' # cat <<NOPE` / `echo "a" # cat <<NOPE` followed by a real definition: ground truth and the
+        baseline both find it, the mutant LOSES it, and for the same reason in both — the `#` stops being a
+        comment and the phantom `NOPE` heredoc swallows the definition below. Which quote character you
+        write changes the spelling, not the direction, so a note that calls one dangerous and its neighbour
+        noise is describing the spelling. `head_after_inline_comment` pins this shape in the definition
+        loop, quote-blind. The other two — `_openers`' single-quote close and the in-quote escape — INVENT a
+        body line instead, the direction the namespace arm already fails closed on. All four separate on
+        valid-bash input, move 0 of the 438 files and leave the suite at 246/0.
+      * the head-branch KEYWORD exclusion (`if not m or m.group(1) in KEYWORDS` on the NEXT-LINE path) —
+        delete it and a valid-bash input `local ()` + `{ :; }` is FOUND instead of missed, so the mutant is
+        the faithful one: this guard's failure direction is a FALSE PASS on a definition bash really makes.
+        It moves 0 of the 438 files and the KEYWORDS set is pinned in aggregate (emptying the set reds the
+        suite), but the exclusion itself is unpinned, so it is declared here too.
+      * THE DEFINITION NAME CHARSET `[A-Za-z_][A-Za-z0-9_]` (the `defn` and `head` patterns) — TWO OF ITS
+        MEMBERS ARE UNDECLARED FALSE PASSES, the uppercase range and the digits, and WHICH ONE IS BIGGEST
+        DEPENDS ON THE METRIC, so both are given with theirs. (Lowercase and `_` complete the set; this note
+        makes no claim about them beyond that they were not the members found unpinned.) (a) Uppercase `A-Z`, by FILES: drop it from the FIRST class and 86 of the 438
+        files move, losing 19 names; drop it from the SECOND class and 92 move, losing 40 — suite 246/0 and
+        fixture 24 in both cases, so neither is discriminable here. `PASS() { :; }` at
+        `scratch-worktree.test.sh:52` is the minimal shape (`bash -n` rc 0, bash defines `PASS`, the mutant
+        loses it). Of the 19 from the first class, 16 are real definitions and 3 (`BEGIN`, `END`, `NF`) are
+        names this scanner already invents from awk programs — and `RUN` is NOT one of the artifacts,
+        it is `RUN() {` in three real files, which is why this split is stated as 16/3 and not 15/4.
+        (b) Digits `0-9`, by NAMES: drop it and the suite stays at 246/0, nothing moves in the fixture, and
+        56 of the 438 files lose 209 distinct names — all of them digit-bearing, most defined with a same-line
+        brace in their own file, so ground truth and the baseline both find them and the mutant LOSES them
+        (`f10() { :; }` + `bash -n` rc 0 + `declare -F` listing `f10` is the minimal shape).
+        ⛔ Both are measured, not estimated, and both are FALSE PASSES: a digit-named or uppercase-named
+        fixture line is what would pin either, and none exists. `head`'s copies of both classes are inert on
+        this population (0 files), which is why the SET is declared and not one occurrence.
+      * THE `defn`/`head` PATTERNS' WHITESPACE TOLERANCES — FIVE mutations over FOUR tolerances, every one
+        unpinned, none named until now, and every one a FALSE PASS on valid bash (suite 246/0, fixture
+        24 -> 24, 0 of the 438 files, `bash -n` rc 0, `declare -F` defines the name, the mutant loses it):
+          - the optional space BEFORE `()` (both patterns): `name () { :; }`. ⛔ This is the spelling the
+            pattern's own comment advertises as supported, and NOTHING exercises it — the fixture has
+            `name_same_line() {` and `indented_same_line() {`, never a space before the parens, and no tracked
+            `*.sh` carries it in definition position either (0 of the 7065 lines the `defn` pattern matches).
+            So it is DECLARED, not pinned, and the fixture line in that spelling is the pin — the cheapest
+            fix in this whole file.
+          - an optional space INSIDE the parens (`defn`): `name( ) { :; }`.
+          - trailing blanks before the end of the line (`head`): `name ()` + spaces, then `{ :; }` below.
+          - more than one space after `function` (`defn`): `function  name { :; }`.
+      * the `function` WORD TEST (`re.match(r'function[ \t]', ...)`) — mutant it to a bare
+        `startswith('function')` and the suite stays at 246/0 with 0 of the 438 files moving, but a
+        valid-bash file containing `function_helper` followed by `{ :; }` is then reported as a DEFINITION
+        named `function_helper`, which bash never defines (an INVENTED name, i.e. the direction the
+        namespace arm fails closed on). Declared rather than pinned because no real script here carries the
+        spelling; the shape is the fixture to write.
+      * the trailing flush (`if _buf is not None`) — a file ENDING mid-continuation (`last_def() { :; }`
+        followed by a single backslash AND a newline) drops the last definition, a FALSE PASS; the shape is
+        valid bash. Moves 0. The same bytes WITHOUT the trailing newline are not a fixture: `bash -n`
+        accepts them and `bash <file>` RUNS them with no error, but SOURCING them raises a syntax error at
+        the dangling backslash — so ground truth (nothing defined) and the baseline (it prints the name)
+        disagree there. ⛔ "EXECUTING errors" was wrong here until it was measured: only `source` does.
+
+    PINNED, and the one case worth naming because it looks like the ones above: the delimiter charset
+    `_.-` on the PLAIN path moves 3 files but also truncates the three `EOF_*` delimiters in `repo-set.sh`
+    (`EOF_NORM`, `EOF_STATE_KEY`, `EOF_GOT`; the bare `EOF` carries no charset character and is never
+    affected), losing 14 of its 26 definitions — so `_reader_defs_n` drops below the floor and `f11f`
+    reds at 245/1. But ONLY the `_` member is pinned: drop `.` or `-` from the same set instead and the
+    suite stays at 246/0, while `cat <<A.B` / `cat <<A-B` lose the definition below them on valid bash. A
+    member an arm pins is pinned; a member nothing pins is DECLARED. "The suite catches this guard" is a
+    statement about one member, never a reason to skip the others — that reading is how this bullet came to
+    tell a future lane NOT to declare two members that lose a real definition.
+    ⛔ AND THE SET APPEARS TWICE — the same `'_.-'` also sits on the QUOTED/backslash path, one branch up.
+    There `-` is the pinned member and `.` and `_` are unpinned: `cat <<'A'.B` (the quoted delimiter closes
+    and concatenates) and `cat <<\\A_B` (the backslash-escaped one) each lose the definition below them on
+    valid bash with the suite at 246/0 and 0 of the 438 files moving. So neither occurrence is "the pinned
+    charset": each is pinned for ONE member, and the members the arms do not reach are declared here. A
+    future lane reading "the charset is pinned" would skip exactly the two spellings above.
+
+    NOT REACHED BY THIS POPULATION — and NOT because they are inert, which is the distinction that matters:
+    `_strip_comment`'s SINGLE-quote state, its DOUBLE-quote state, and its backslash escape each move 0 of
+    the 438 files and each leaves the suite at 246/0, but every one of them ALSO separates on a valid-bash
+    input — the quote-open shape above with the OTHER quote character, and a trailing `#` after an escaped
+    quote. So the honest label is "nothing here reaches it", not "no-op": the quote-open shape above pins
+    the single-quote state as soon as its single-quoted spelling is written into `FIXTURE`, which is itself
+    proof that the guard is load-bearing.
+
+    ⛔ SO THIS IS A DECLARATION, NOT A PIN, and it says so: writing the shapes above into `FIXTURE` is the
+    work that turns them into pins — one shape per guard named above, because one single-quoted spelling
+    separates the setter, the single-quote BRANCH and (in the same statement) the setter's own quote tuple,
+    while the blanket double-quote branch needs the OTHER quote character. Until then a lane that
+    "simplifies" one of those guards is removing bash-faithfulness that only the fixture would catch. Each
+    shape is written out by name rather than counted, because the names are what survives a new head — and
+    the population numbers above will be stale at the next head, which is the argument for the shape and
+    against the count.
+
     ⛔ A COMMENT ENDS AT THE NEWLINE HOWEVER MANY BACKSLASHES IT CARRIES (round 48 review, P2 — measured).
     The join tested the RAW line, so `x=1  # note \\` was read as a continuation, the next line was
     swallowed and a real definition went invisible (a FALSE PASS) — and inside a `cat <<EOF` body the
@@ -1056,9 +1201,15 @@ def _openers(line):
     only spelling this walk models — and it is LOAD-BEARING, because bash joins a backslash-newline inside an
     UNQUOTED here-document and does not inside a quoted one (see the body loop).
 
-    A comment ends at the newline — `_strip_comment` has already removed it, so this walk never sees one
-    and the comment RULE has exactly one definition in this file (it used to live here too, which is why
-    mutating either COPY left the fixture green). A quoted delimiter keeps its own quoting rules, and
+    A comment ends at the newline — `_strip_comment` has already removed it, so this walk never sees one.
+    ⛔ THE COMMENT RULE IS NOT DEFINED ONCE IN THIS FILE, AND THIS SENTENCE USED TO CLAIM IT WAS (round 48
+    review, P3 — measured): `_strip_comment` is the QUOTE-AWARE rule, and the definition loop carries a
+    SECOND one — a `re.sub` that cuts at the first whitespace-preceded `#` — which is whitespace-anchored and
+    quote-BLIND, so the two disagree on a line like `echo "a #b"` (untouched there, truncated to `echo "a`
+    here). Neither is a redundant copy: delete `_strip_comment` and the walk opens phantom heredocs (6 of the
+    438 files change and the fixture loses 18 names — `after_bare_word_brace` among them, which is why this
+    number is one more than the 17 measured before this fixture grew); delete that `re.sub` and `f11f-0` reds by losing
+    `head_after_inline_comment`. This walk owns NEITHER; a quoted delimiter keeps its own quoting rules, and
     `$(( … ))` / `(( … ))` are arithmetic where `<<` is a shift.
     """
     global _arith_depth
@@ -1123,12 +1274,14 @@ def _openers(line):
                 quoted = True
                 q = line[j]
                 j += 1
-                # ⛔ DECLARED NO-OP, not a pinned arm (round 48 review, P3 — measured): a quoted delimiter
-                # holding a character OUTSIDE [A-Za-z0-9_.-] (e.g. `<<'A,B'`) is the only spelling that tells
-                # this branch from the fallback loop below, and no fixture line carries one — deleting the
-                # branch leaves the suite at 246/0 and changes the scan of 0 of 435 `git ls-files '*.sh'`
-                # files. Declared rather than pinned because a pin here would encode a spelling no real
-                # script uses; if one ever appears, this note is the fixture to write.
+                # ⛔ NOT REACHED BY THIS POPULATION — and LOAD-BEARING, not a no-op, which is the label this
+                # note carried until it was mutated: a quoted delimiter holding a character OUTSIDE
+                # [A-Za-z0-9_.-] (`<<'A,B'`) is the only spelling that tells this branch from the fallback
+                # loop, and deleting the branch LOSES a real definition (`after` disappears on valid bash,
+                # `bash -n` rc 0) — a FALSE PASS in the namespace arm's direction. It moves 0 of the 438
+                # files and no fixture line carries the spelling, so nothing here reaches it; declared
+                # because a pin would encode a spelling no real script uses, and that spelling is the
+                # fixture to write if one ever appears.
                 if q in ("'", '"'):          # a QUOTED delimiter may hold any character
                     while j < n and line[j] != q:
                         delim += line[j]
@@ -1158,7 +1311,8 @@ def _openers(line):
             # ⛔ DECLARED NO-OP (round 48 review, P3 — measured): every opener the walk can produce on a
             # fixture or repo line yields a non-empty delimiter, because `#` blocks the whole-line form and
             # the trailing-comment strip runs before the walk. Deleting this test leaves the suite at 246/0
-            # and moves 0 of 435 files. It stays as the boundary for `cat <<` with nothing after it, which is
+            # and moves 0 of the `git ls-files '*.sh'` population it was measured over (435 then, 438 at
+            # this head). It stays as the boundary for `cat <<` with nothing after it, which is
             # a bash syntax error rather than a construct to model.
             if delim:
                 out.append((delim, strip_tabs, quoted))
@@ -1209,8 +1363,9 @@ for i, raw in enumerate(lines):
     # ⛔ DECLARED NO-OP, and structurally so (round 48 review, P3 — measured): a whole-line comment cannot
     # reach a definition here, because `defn` opens with `^\s*(?:function\s+)?([A-Za-z_]...)` and `#` is not
     # a name character — measured directly: `#foo() {`, `  # foo() {`, `#a(){`, `#!/bin/bash` all fail
-    # `defn.match` with this skip removed. Deleting it leaves the suite at 246/0 and moves 0 of 435
-    # `git ls-files '*.sh'` files. Kept as the read-aloud statement of intent, not as a guard; do not cite
+    # `defn.match` with this skip removed. Deleting it leaves the suite at 246/0 and moves 0 of the
+    # `git ls-files '*.sh'` population (435 when measured, 438 at this head). Kept as the read-aloud
+    # statement of intent, not as a guard; do not cite
     # it as pinned.
     if raw.lstrip().startswith('#'):
         continue
@@ -1225,6 +1380,27 @@ for i, raw in enumerate(lines):
         defs.append(m.group(1)); continue
     m = head.match(s)
     if not m or m.group(1) in KEYWORDS:
+        continue
+    # ⛔ `head` ALONE CANNOT TELL A DEFINITION FROM A BARE WORD (round 48 review, P3 — measured): bash defines
+    # a function on a LATER line only after `name()` or after the `function` keyword. A bare word followed by
+    # `{ … }` is a COMMAND followed by a GROUP COMMAND, and nothing is defined — `echo_one` + `{ :; }` is
+    # `bash -n` rc 0 with `declare -F` listing only the real definition, while `head` (which makes BOTH the
+    # parens and the keyword optional) reported `echo_one`. That is an INVENTED name — the fail-closed
+    # direction, so not the dangerous one, but still a claim about a name bash never defined.
+    # ⛔ AND THE KEYWORD IS A WORD, NOT A PREFIX (round 48 re-review, P3 — measured): `startswith('function')`
+    # admitted `function_helper`, `functions` and `functional`, which are BARE WORDS — `bash -n` rc 0 and
+    # `declare -F` listing only the real definition, while the scanner printed each one as a definition. That
+    # is the same invented name this guard exists to refuse, so the test is the reserved word followed by
+    # whitespace, which is how bash reads it.
+    # ⛔ ITS COST IS MEASURED, NOT "NOTHING" (round 48 re-review, P3 — measured over the 438
+    # `git ls-files '*.sh'` files at this head): the name SET never moves, but 4 files' ORDERED scan does —
+    # `scripts/disk-reaper.sh` and scripts/orchestrator-harness/{capacity-transfer,pr-sickness,repo-slug}.test.sh
+    # each lose one DUPLICATE report of a bare word that is also defined properly (`check_peer_locks`,
+    # `lbgh_clear`, `reset_all`, `rr`). So: 0 name sets move, 4 of 438 ordered scans move. On the fixture the
+    # guard removes nothing except the invention itself — reverted, the fixture scan gains ONLY
+    # `bare_word_then_brace`. It is PINNED (revert it and `f11f-0` reds on that name, a command and not a
+    # definition).
+    if '(' not in s and not re.match(r'function[ \t]', s.lstrip()):
         continue
     for later in lines[i+1:]:
         t = later.strip()
@@ -1288,11 +1464,13 @@ continued_name() \
 # ⛔ AND A COMMENT THAT *MENTIONS* AN OPENER MUST NOT OPEN ONE, AND IT IS PINNED BY THE TWO LINES BELOW
 # (round 48 review, P2 — measured at this head): delete the `#` suppression and the scan truncates after
 # `continued_name`, so `after_notes_comment()` disappears and `f11f-0` reds at 245/1. It also moves the
-# scan of 6 of the 435 `git ls-files '*.sh'` files — an earlier revision of THIS note called that "20" and
+# scan of 6 of the `git ls-files '*.sh'` files (435 at the head that measured this; 438 now) — an earlier
+# revision of THIS note called that "20" and
 # an even earlier one "21". ⛔ THOSE DELTAS ARE THE PART THAT DID NOT REPRODUCE, and the "446" was a
-# DEFINITION rather than a count: it reproduces only as 435 `*.sh` PLUS the 11 tracked extensionless
-# scripts whose shebang names bash, which is not the population this note named ("shebang-marked,
-# `bash -n`-clean" — 452). So the mutant and the population are the reproducible half and the delta follows
+# DEFINITION rather than a count: it reproduces only as 435 `*.sh` PLUS the tracked extensionless scripts
+# whose shebang names BASH — 11 at this head, of 17 such scripts counting the `sh`-shebanged ones — which
+# is not the population this note named ("shebang-marked, `bash -n`-clean"). So the mutant and the
+# population are the reproducible half and the delta follows
 # from them; the old numbers are withdrawn, not replaced. Cycle 2 also measured the SHAPE it fails on: a
 # TRAILING comment (`x=1  # see cat <<'NOTE'`) opened the phantom heredoc even where the whole-line form
 # was exempted, so the fixture carries that spelling too.
@@ -1326,19 +1504,45 @@ head_with_comment_between()
 {
   :
 }
-# ⛔ TWO LOAD-BEARING GUARDS HAD NO PIN, AND EACH CHANGES THE SCAN OF HUNDREDS OF VALID SCRIPTS (measured:
-# deleting them left ALL 246 arms green, while each mutant alone moves the scan of hundreds of the repo's own
-# scripts — the two between them inventing `echo`, `printf`, `break`, `mkdir`, `awk` as "definitions").
-# ⛔ EVERY FIGURE IN THE PREVIOUS PARAGRAPH WAS REWRITTEN THREE TIMES AND TWO OF THE THREE STILL DO NOT
-# REPRODUCE (round 48 review, P3 — measured at this head over the 435 `git ls-files '*.sh'` files):
-# `head`'s end-of-line anchor moves 130 of them, which reproduces exactly; the `{`-on-the-next-line guard
-# does NOT reproduce its stated 283 under any reconstruction tried (deleting the branch moves 4, widening
-# it to a substring test moves 52, dropping the KEYWORDS exclusion moves 29), and earlier drafts quoted
-# 282 / 276 / 21 / 18 / 20 from populations that are not the size of any set this tree has. ⛔ SO NO
-# NUMBER IS WRITTEN HERE: run the mutant over `git ls-files '*.sh'` and read the delta, because that is the
-# only half of the claim that survives a new head — which is exactly why the file records the mutant rather
-# than the count. What the guards do is reproducible and does not move: the two between them invent `echo`,
-# `printf`, `break`, `mkdir`, `awk` as "definitions". None of them may be reported:
+# ⛔ ONE OF THESE TWO GUARDS IS STILL UNPINNED, AND THE TWO MUTANTS ARE NOT THE SAME SHAPE. Measured at
+# this head over the 438 `git ls-files '*.sh'` files; re-measure rather than copy any number below.
+#   * DELETING `head`'s END-OF-LINE ANCHOR HAS NO PIN: the suite stays at 246 passed / 0 failed — every arm
+#     green — while the mutant INVENTS 133 names. They appear in 63 of the 438 files; 3 more change only by a
+#     DUPLICATE report of a name the file already had (the ordered scan moves, the name set does not). That is
+#     the inert-enforcer shape this file exists to catch, so this guard is still OWED a fixture line that
+#     changes under it. Until then it is DECLARED, not pinned.
+#     ⛔ AND THE BARE-WORD GUARD BELOW IS WHAT MOVED THIS MUTANT'S DELTA, so an anchor figure measured before
+#     it landed is not comparable: with the bare-word guard REVERTED, the SAME anchor mutant invents 261
+#     distinct names across 125 of these 438 files (132 ordered scans move, 7 of them ONLY by a DUPLICATE
+#     report of a name the file already had), and it DOES change the fixture scan — 24 -> 26 names, GAINING
+#     `bare_word_then_brace` and `build_it` — so it reds `f11f-0`. ⛔ THE LEFT NUMBER IS 24, NOT 25: the
+#     before-guard base it was first measured on carried one more fixture name than this head does, which is
+#     the same stale-base trap the paragraph above describes. Names, not counts, are what survive a head.
+#     The anchor was pinned before that guard and is NOT pinned after it. A mutation delta belongs to a HEAD,
+#     not to a guard — so the 130 / 29 / 54 figures an earlier revision of this note carried are withdrawn
+#     BY NAME here rather than dropped silently, and none of the three is a number at this head. The 261
+#     above and the 4 in the bare-word paragraph are NOT withdrawals: both are re-measured at this head.
+#   * DELETING THE NEXT-LINE-BRACE BRANCH IS PINNED — the BRANCH, not each condition inside it: removing only
+#     its `t.startswith('{')` TEST leaves the suite at 246/0 (fixture 24 -> 24, `repo-set.sh` 26 -> 26, so
+#     neither scanner consumer moves), and it moves 1 set + 2 ordered-only scans of the 438, INVENTING `flush`
+#     in `check-workflow-concurrency.sh` — an awk function inside a multi-line quoted program, i.e. a name
+#     bash never defines. Inventing is the direction the namespace arm fails closed on, and limit (iii) above
+#     already declares that this scanner invents names from quoted programs, so the test is DECLARED, not
+#     dropped. Revert the whole branch and it is a different measurement: `f11f-0` reds (245 passed / 1 failed). It
+#     invents NOTHING and HIDES names on the FIXTURE ONLY — 6 of them (`name_next_line`, `name_func_next`,
+#     `head_after_inline_comment`, `head_with_comment_between`, `indented_head_only`, `head_then_blank`) — and
+#     moves 0 of the repo's own files.
+#   * THE BARE-WORD GUARD ABOVE IS PINNED too: revert it and `f11f-0` reds on `bare_word_then_brace`
+#     (245 passed / 1 failed).
+# Of the five names an earlier revision quoted as invented (`echo`, `printf`, `mkdir`, `awk`, `shift`), only
+# `echo`, `printf` and `mkdir` are invented here — by the ANCHOR mutant alone, among its 133; the next-line
+# mutant invents nothing. `awk` and `shift` appear in neither, so do not re-add a name without a measurement.
+# ⛔ `break` WAS IN AN EARLIER REVISION OF THIS LIST AND IS INVENTED BY NO MUTANT — withdrawn BY NAME here
+# rather than dropped silently, which is the only way a withdrawn claim stops being re-added (re-measured at
+# this head: none of the anchor mutant's 133 invented names, the next-line branch's 0, or the bare-word
+# guard's 0 is `break`).
+# ⛔ WHAT SURVIVES IS THE DIRECTION — deleting the anchor INVENTS names, deleting the next-line branch HIDES
+# them — so delete a guard, run the suite, run the mutant over `git ls-files '*.sh'`, and read the delta yourself. None of these may be reported:
 #   * a bare command name followed by `:` (not a brace) — a `head` match that must NOT be claimed;
 #   * a command with arguments, then `{` on the next line — likewise;
 #   * a head followed by a line that CONTAINS `{` but does not start with it.
@@ -1350,6 +1554,14 @@ build_it --fast
 }
 prefix_name
 echo x { :; }
+# ⛔ A BARE WORD IS NOT A DEFINITION, EVEN WITH A BRACE ON THE NEXT LINE (round 48 review, P3 — measured):
+# bash defines a function there only after `name()` or the `function` keyword, so this is a COMMAND followed
+# by a GROUP COMMAND and `bare_word_then_brace` must NOT be reported. `head` makes both the parens and the
+# keyword optional, so it reported it — an INVENTED name. Only the definition after it may be reported, and
+# reverting the guard reds `f11f-0` on the invention.
+bare_word_then_brace
+{ :; }
+after_bare_word_brace() { :; }
 #   * and a heredoc whose terminator line is `INNER2;` — bash does NOT close it there (the body runs on), so
 #     the line after must not be scanned as code.
 cat <<'INNER2'
@@ -1367,8 +1579,8 @@ INNER2
 #       WALK (`_openers`, NOT a regex — see the note below at "THE OPENER IS FOUND BY A WALK"), and it pins
 #       the false-PASS direction. ⛔ Measured by deleting that branch: `-` is itself in the delimiter charset,
 #       so the opener is recorded with delimiter `-`, never terminates, and the rest of the fixture is
-#       SWALLOWED — nine real definitions are LOST (`real_after_tab_heredoc` through `after_paren_arith`) and
-#       NOTHING is invented (`not_a_def_from_a_tab_heredoc` is not reported either). So the body line is not
+#       SWALLOWED — eleven real definitions are LOST (`real_after_tab_heredoc` through `after_paren_arith`)
+#       and NOTHING is invented (`not_a_def_from_a_tab_heredoc` is not reported either). So the body line is not
 #       "scanned as code"; it and everything after it disappear.
   indented_head_only()
 {
@@ -1461,7 +1673,10 @@ body_of_bang_delimiter() { :; }
 # was read as body — a FALSE PASS in the namespace arm's own direction, with no fixture and no entry on the
 # declared-limits list. ⛔ AND THE JOIN IS THE UNQUOTED PATH ONLY: with `<<'JQ'` the identical `J\` + `Q` is
 # LITERAL, the terminator never arrives there, and the next line is still BODY. Both directions are pinned,
-# so joining whatever ends in a backslash — the lazy fix — reds this arm by inventing `body_of_quoted_join`.
+# so joining whatever ends in a backslash — the lazy fix — reds this arm by inventing `still_body_of_quoted_join`
+# (the line AFTER the false terminator; `body_of_quoted_join` above carries no trailing backslash and is
+# never reported by either the correct scanner or the mutant, so naming it would point a reader at the wrong
+# fixture line).
 cat <<JOINED
 body_of_joined_terminator() { :; }
 JOIN\
@@ -1481,7 +1696,7 @@ after_paren_arith() { :; }
 FIXTURE
 _scan_fixture="$(python3 "$T/defs.py" "$T/defs-fixture.sh")"
 ck "f11f-0 …and every one of those spellings is really SEEN (brace on either line, any indent), while bare keywords followed by '{' are not counted" \
-   '[ "$_scan_fixture" = "name_same_line name_func_kw indented_same_line name_next_line name_func_next continued_name after_notes_comment after_comment_continuation head_after_inline_comment head_with_comment_between indented_head_only head_then_blank real_after_tab_heredoc after_arith_and_trailing_comment after_tabbed_terminator after_here_strings after_two_openers after_even_backslash_run after_backslash_comment after_multiline_arith after_joined_terminator after_quoted_join after_paren_arith" ]'
+   '[ "$_scan_fixture" = "name_same_line name_func_kw indented_same_line name_next_line name_func_next continued_name after_notes_comment after_comment_continuation head_after_inline_comment head_with_comment_between after_bare_word_brace indented_head_only head_then_blank real_after_tab_heredoc after_arith_and_trailing_comment after_tabbed_terminator after_here_strings after_two_openers after_even_backslash_run after_backslash_comment after_multiline_arith after_joined_terminator after_quoted_join after_paren_arith" ]'
 # ⛔ THE DEGRADED PATH MUST NOT CLAIM TO GRADE WHEN IT CANNOT NAME A REPO (review round 2, P1). The
 # doctor's REPO-only arm raises when the checkout's `origin` proves nothing — the TCC shape on the
 # default macOS install — so `f4`'s stub (which echoes argv) would pass on a wrapper that dies in

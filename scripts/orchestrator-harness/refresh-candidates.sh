@@ -2850,20 +2850,141 @@ rest_list() {
 # distinguishable from "the answer is none" (PRESENT but EMPTY). The reaper refuses the whole pass
 # unless both are present; a genuinely empty list is still a valid answer and still reaps.
 lists_transport_note
+# ── A LISTING NOBODY READS IS NOT A FREE QUESTION (agent-infra#1984) ───────────────────────────
+# The two listings below are the REAPER's inputs, and nothing else reads them: `.open_iss` is
+# consumed only by the dispatched reap, `.pr_brs` by the dispatched reap and the checked
+# classification. A pass whose `dispatched.txt` and `checked.txt` are both empty therefore spends
+# both windows (10 core requests at the 500-row bound) on a question that cannot change any answer.
+# That is exactly the shape #1984 exists to remove: the refresh runs WHENEVER THE BACKLOG IS SHORT,
+# i.e. in the stall it exists to fix, and the pass that has nothing to reap is the most common one.
+#
+# ⛔ THE BOUND IS DERIVED FROM WHAT THE REAPER CAN USE, NOT FROM A SMALLER TASTE (the issue's own
+# acceptance, #1984): a pass over `agent-infra` with an empty `dispatched.txt` issues ZERO listing
+# requests; a non-empty one issues at most one request per row it serves. `rest_list` pages at 100
+# rows, so `--limit 100*n` is n pages: the windows below are sized to the rows that read them and
+# clamped to the 500 the shipped behaviour has always used, so a pass at or above five rows behaves
+# EXACTLY as before and a smaller one costs less without ever costing more.
+#
+# ⛔ WHAT A NARROWER PR WINDOW COSTS, AND WHY IT CANNOT UN-BLACKLIST ON IT. `has_pr` is a REGEX
+# against the PR head refs in `.pr_brs`; a PR outside the window reads exactly like no PR at all,
+# and "no PR" is what releases a dispatched entry back into the queue (#1705: a duplicate lane for
+# work that already had one). So when the PR window is narrower than the shipped 500 the pass says
+# so, and the reap REFUSES to un-blacklist on a PR-absence fact read from it: those rows take the
+# window-blind path instead (KEPT, or settled only by the issue's own CLOSED state — the same
+# fail-closed arm the saturated 500-row window already uses). A narrower window can therefore only
+# ever make the pass keep MORE, never release more.
+#
+# The counts are read from the FILES the reap will rewrite, before it runs, so a listing is skipped
+# only when the file it serves is genuinely empty. UNREADABLE COUNTS AS 1, never as 0: a blacklist
+# this pass cannot read is not an empty one, and skipping the listings on it would be that inference.
+# ⛔ "UNREADABLE" IS DECIDED HERE, NOT BY WHAT `awk` DOES WITH THE PATH. The first cut tested only
+# `-e` then `-r`, leaving every other shape to awk's directory/odd-file behaviour — and that is
+# IMPLEMENTATION-DEPENDENT: measured on the bash-suites runner, a DIRECTORY named `dispatched.txt`
+# reached awk, awk exited with an empty row count under that box's awk, the count collapsed to 0, and
+# the pass SKIPPED both listings while calling them deliberately not-requested (the `unreadable-rows`
+# case in `refresh-quota.test.sh`, red on 82cb2aab1's merge commit, job 128992051819). An unreadable
+# blacklist silently becoming "no rows to reap" is exactly the inference this block exists to refuse,
+# so the row count must not depend on a tool's error path at all: anything PRESENT that is not a
+# readable REGULAR file is 1. `-e` stays the absence test because it is the one `lines()` uses
+# (`os.path.exists`, so a dangling link is absent to both readers, and neither can disagree).
+_reap_rows_in() {  # <file> → non-blank rows; unreadable/unparseable ⇒ 1 (never "nothing to do")
+  _rr_f="$1"
+  if [ ! -e "$_rr_f" ]; then printf '0'; return 0; fi
+  if [ ! -f "$_rr_f" ] || [ ! -r "$_rr_f" ]; then printf '1'; return 0; fi
+  _rr_n="$(awk 'NF { n++ } END { printf "%d", n+0 }' "$_rr_f" 2>/dev/null)"
+  case "$_rr_n" in
+    ''|*[!0-9]*) printf '1' ;;
+    *) printf '%s' "$_rr_n" ;;
+  esac
+  return 0
+}
+# `rest_list` charges one request per 100-row page, so a page count IS a limit. Clamped to
+# [100, 500]: below 100 the provider caps per_page anyway (a "1-row limit" is still one page), and
+# 500 is the window every earlier pass used.
+_reap_window() {  # <rows> → a limit that is at most one page per row, never more than 500
+  _rw_n="$1"
+  _rw_l=$(( _rw_n * 100 ))
+  [ "$_rw_l" -lt 100 ] && _rw_l=100
+  [ "$_rw_l" -gt 500 ] && _rw_l=500
+  printf '%s' "$_rw_l"
+}
+DISP_ROWS="$(_reap_rows_in "$O/dispatched.txt")"
+CK_ROWS="$(_reap_rows_in "$O/checked.txt")"
+# `.open_iss` serves the dispatched reap alone.
+[ "$DISP_ROWS" -eq 0 ] && REAP_OPEN_LIMIT=0 || REAP_OPEN_LIMIT="$(_reap_window "$DISP_ROWS")"
+# `.pr_brs` serves BOTH halves, so it is skipped only when BOTH are empty.
+PR_ROWS=$(( DISP_ROWS + CK_ROWS ))
+[ "$PR_ROWS" -eq 0 ] && REAP_PR_LIMIT=0 || REAP_PR_LIMIT="$(_reap_window "$PR_ROWS")"
+# The reap reads these to tell "we did not ask" from "the read failed" — the two are the same
+# ABSENT file on disk, and reporting one as the other is the #1705/#1736 class in a log line.
+export REAP_OPEN_LIMIT REAP_PR_LIMIT
+# ⛔ "THE WINDOW WAS SMALL" AND "THE WINDOW WAS CLIPPED" ARE DIFFERENT FACTS, AND ONLY THE SECOND
+# MAKES ABSENCE WORTHLESS (fresh review of #1984, P1). The limit is OUR choice; whether the provider
+# ended the collection is ITS answer. `rest_list` publishes that answer as `REST_WINDOW_FILLED` (its
+# own contract at the helper: the flag "a caller that reads ABSENCE from the answer as evidence MUST
+# test"), so a 100-row window whose collection ENDED still proves "no PR" — which is why a guard keyed
+# only on the limit suppressed the dead-lane retry on every pass with four or fewer rows, and printed a
+# narrowed-window warning over a COMPLETE answer. Both facts are recorded here; the decision is made
+# once, in the reap, from BOTH.
+PR_WINDOW_CLIPPED=0
+# ⛔ THE OPEN WINDOW IS NARROWED TOO, SO IT IS DISCLOSED TOO (fresh review of #1984, P2). `.open_iss`
+# answers "is this dispatched issue still open", and a row outside a NARROWED window is no longer
+# PROVED open: it takes the window-blind path (KEPT, or settled by its own CLOSED state through ONE
+# targeted `gh issue view` — a GraphQL read — per row). That is the safe direction, but it is a TRADE
+# (up to 9 saved REST requests can become up to 12 GraphQL ones on a ≤4-row pass), and an undisclosed
+# trade is the defect: the operator could not tell from the log that the release arm had been narrowed.
+OPEN_WINDOW_CLIPPED=0
 # The stage is set HERE, before the first network read of the pass: from this point a failure is about
 # the LISTING (a gh/tier/jq read), not about provisioning, and the record must say which.
-refresh_stage list "rest_list issues/pulls --repo $OR (open-issue + PR-branch listings)"
-if ! rest_list issues --repo "$OR" --state open --limit 500 --jq '.[].number' > "$O/.open_iss" 2>"$O/.list-err"; then
+refresh_stage list "rest_list issues/pulls --repo $OR (open-issue + PR-branch listings, REAP_OPEN_LIMIT=$REAP_OPEN_LIMIT REAP_PR_LIMIT=$REAP_PR_LIMIT)"
+if [ "$REAP_OPEN_LIMIT" -eq 0 ]; then
+  # ⛔ REMOVED, NOT MERELY NOT-WRITTEN (#2183's doctrine, applied to this skip). A killed pass can
+  # leave LAST pass's `.open_iss` behind, and a file this pass did not write must not be readable as
+  # this pass's answer — before the skip this could not bite because the window was always
+  # overwritten or deleted on failure.
+  rm -f "$O/.open_iss"
+  echo "[refresh] listings: the open-issue window is NOT requested — dispatched.txt names no rows, and it is that window's only consumer (#1984); a pass that has nothing to reap cannot answer differently for having read it"
+elif ! rest_list issues --repo "$OR" --state open --limit "$REAP_OPEN_LIMIT" --jq '.[].number' > "$O/.open_iss" 2>"$O/.list-err"; then
   rm -f "$O/.open_iss"
   echo "[refresh] WARN: open-issue listing FAILED — reaping pass will be skipped (an unreadable listing is not an empty one)"
   [ -s "$O/.list-err" ] && sed -n '1,2p' "$O/.list-err" | sed 's/^/[refresh]   /'
+else
+  if [ "${REST_WINDOW_FILLED:-0}" = "1" ]; then OPEN_WINDOW_CLIPPED=1; fi
+  if [ "$REAP_OPEN_LIMIT" -lt 500 ]; then
+    echo "[refresh] listings: the open-issue window is NARROWED to ${REAP_OPEN_LIMIT} rows (it serves ${DISP_ROWS} row(s); the shipped window is 500) and the provider $([ "$OPEN_WINDOW_CLIPPED" -eq 1 ] && echo 'ended it with a next page still advertised' || echo 'ENDED the collection inside it') — a dispatched row outside it is not a proved-open row, so it takes the window-blind path (KEPT, or settled by its own CLOSED state through ONE targeted read each) (#1984)"
+  fi
 fi
-if ! rest_list pulls --repo "$OR" --state all --limit 500 --jq '.[]|.head.ref' > "$O/.pr_brs" 2>"$O/.list-err"; then
+if [ "$REAP_PR_LIMIT" -eq 0 ]; then
   rm -f "$O/.pr_brs"
-  echo "[refresh] WARN: PR listing FAILED — reaping pass will be skipped (an unreadable listing is not an empty one)"
-  [ -s "$O/.list-err" ] && sed -n '1,2p' "$O/.list-err" | sed 's/^/[refresh]   /'
+  echo "[refresh] listings: the PR-branch window is NOT requested — dispatched.txt and checked.txt both name no rows, and nothing else reads it (#1984)"
+else
+  if ! rest_list pulls --repo "$OR" --state all --limit "$REAP_PR_LIMIT" --jq '.[]|.head.ref' > "$O/.pr_brs" 2>"$O/.list-err"; then
+    rm -f "$O/.pr_brs"
+    echo "[refresh] WARN: PR listing FAILED — reaping pass will be skipped (an unreadable listing is not an empty one)"
+    [ -s "$O/.list-err" ] && sed -n '1,2p' "$O/.list-err" | sed 's/^/[refresh]   /'
+  else
+    # `rest_list` resets this at ENTRY, so a value read here is THIS call's, never the previous tier's.
+    if [ "${REST_WINDOW_FILLED:-0}" = "1" ]; then PR_WINDOW_CLIPPED=1; fi
+    if [ "$REAP_PR_LIMIT" -lt 500 ]; then
+      # ⛔ SAID OUT LOUD, because it changes what the ANSWER means: a PR outside a NARROWED window is
+      # indistinguishable from no PR, and "no PR" is what releases a dispatch back into the queue. The
+      # CLIPPED case is named separately, and ONLY it withdraws the evidence — a narrowed window whose
+      # collection ENDED answers the question completely, and saying otherwise sends an operator after
+      # a truncation that did not happen.
+      if [ "$PR_WINDOW_CLIPPED" -eq 1 ]; then
+        echo "[refresh] listings: the PR-branch window is NARROWED to ${REAP_PR_LIMIT} rows (it serves ${PR_ROWS} row(s); the shipped window is 500) AND the provider ended it with a next page still advertised, so a head ref outside it was NOT read — no entry is released on a PR-absence read from it this pass (#1984)"
+      else
+        echo "[refresh] listings: the PR-branch window is NARROWED to ${REAP_PR_LIMIT} rows (it serves ${PR_ROWS} row(s); the shipped window is 500) and the provider ENDED the collection inside it, so it is a COMPLETE answer for this pass (#1984)"
+      fi
+    fi
+  fi
 fi
 rm -f "$O/.list-err"
+# The PR window's CLIPPED fact travels with its limit, so no consumer has to infer it from the limit
+# again. ⛔ ONLY the PR window's: the open window's clipping is DISCLOSED but decides nothing in the
+# reap (absence from it means "not proved open", which the window-blind path already handles), and an
+# exported marker nothing reads is dead code wearing the shape of a guard.
+export REAP_PR_CLIPPED="$PR_WINDOW_CLIPPED"
 # ── NOTHING THIS PASS DID NOT CLASSIFY MAY BE READ AS THIS PASS'S CLASSIFICATION (agent-infra#2183)
 # ⛔ TRUNCATED AT PASS START, AS AN EXPLICIT LIST — never a `checked-*` glob, which would also delete
 # `state/checked-release-cursor` on every pass and silently reduce the release rotation to "always
@@ -2969,6 +3090,50 @@ except OSError as exc:
 # justification this change exists to remove. The guard is therefore SPLIT by what each half reads.
 have_open = os.path.exists(os.path.join(O, ".open_iss"))
 have_pr = os.path.exists(os.path.join(O, ".pr_brs"))
+# ── "WE DID NOT ASK" IS NOT "THE READ FAILED" (agent-infra#1984) ──────────────────────────
+# Both are the same ABSENT file on disk, and the caller now skips a listing when the rows that
+# read it are empty — so the caller states, per listing, whether it asked at all (`0` = it did
+# not). ABSENT + asked ⇒ the read failed ⇒ the fail-closed arm below. ABSENT + not asked ⇒ there
+# is nothing to decide, and reporting it as an unreadable listing would be the #1705/#1736 class
+# arriving through a log line: an operator would go looking for a broken reader that never ran.
+# A missing/blank marker means the caller did not say (the extracted-body fixtures run this file
+# directly), and that is read as the historical behaviour: the listings were asked for.
+_REAP_OPEN_LIMIT = (os.environ.get("REAP_OPEN_LIMIT") or "").strip()
+_REAP_PR_LIMIT = (os.environ.get("REAP_PR_LIMIT") or "").strip()
+_open_not_asked = _REAP_OPEN_LIMIT == "0"
+_pr_not_asked = _REAP_PR_LIMIT == "0"
+# ⛔ WHEN IS A MISS IN `.pr_brs` EVIDENCE OF "NO PR"? (agent-infra#1984; fresh review P1.)
+# `has_pr` is a regex over the head refs a WINDOW returned. A head ref outside that window is
+# indistinguishable from no PR, and "no PR" is exactly what releases a dispatched entry back into
+# the queue (#1705's duplicate lane) — so the question is not how big the window was, it is whether
+# the provider ENDED the collection inside it. Two facts decide that, and BOTH are needed:
+#   * `REAP_PR_CLIPPED` (from `rest_list`'s own `REST_WINDOW_FILLED`): the window ended FULL with a
+#     next page still advertised, so rows exist that were NOT read. Absence is then not evidence.
+#   * the LIMIT asked for. At the shipped 500 this pass reads exactly what every earlier pass read,
+#     so its coverage is the SAME accepted residual the file already states (the checked half's
+#     `STATED RESIDUAL:` note: a 500-row window and a PR whose head ref does not name the issue) —
+#     withholding the release arm there would not repair that residual, it would silently retire the
+#     dead-lane retry instead.
+# So: a CLIPPED window narrower than the shipped one withholds the evidence; a narrowed window whose
+# collection ended is a COMPLETE answer and proves "no PR" as well as a 500-row one would have; and
+# the shipped 500 behaves exactly as before. An absent marker reads as the full window (unchanged).
+_pr_limit = int(_REAP_PR_LIMIT) if _REAP_PR_LIMIT.isdigit() else 500
+_pr_clipped = (os.environ.get("REAP_PR_CLIPPED") or "").strip() == "1"
+_pr_window_blind = (not _pr_not_asked) and _pr_clipped and _pr_limit < 500
+# ⛔ "NOT ASKED" IS NOT A ZERO-ROW WINDOW (fresh review of #1984, P2). The marker `0` means the caller
+# declined to ask, so nothing may claim a 0-row window was read. That guard lives in the SHELL — the
+# narrowing lines sit inside the `if [ "$REAP_PR_LIMIT" -eq 0 ] else` branch, so a declined window
+# cannot reach them — and a Python twin of it would be DEAD CODE (defined, never read) claiming a duty
+# it does not perform. It is deliberately not restated here.
+# ⛔ THESE TWO ARE NOT BELT-AND-BRACES, AND NOT DEAD WEIGHT (fresh review of #1984, observation 1,
+# refuted): drop one and the refusal below reads it. Without `or _pr_not_asked`, `have_pr` is False for
+# the ABSENT file a deliberate skip leaves behind, so `if not have_pr:` REFUSES the checked
+# classification and publishes `refused=pr-brs-unreadable` — a pass that never asked for the window
+# reporting a broken reader that never ran, which is the log-lie the block above forbids. They are
+# inert only in STATISTICS (a not-asked window implies both row files are empty, so there is nothing
+# left to classify); the POLARITY they carry is the whole point.
+have_open = have_open or _open_not_asked
+have_pr = have_pr or _pr_not_asked
 # PRESENT BUT UNDECODABLE IS THE ABSENT CASE (see `lines()`): existence is not readability, and the
 # guard below is the one place that turns "I could not read this listing" into "do not decide on it".
 _open_rows = lines(".open_iss") if have_open else []
@@ -2977,10 +3142,18 @@ if _open_rows is None:
     have_open = False; _open_rows = []
 if _pr_rows is None:
     have_pr = False; _pr_rows = []
-if not have_open or not have_pr:
+if _open_not_asked or _pr_not_asked:
+    print("[reap] NOT REQUESTED: %s — the row(s) that read it are empty this pass, so the window "
+          "was not asked for and nothing is decided from it (#1984). This is a deliberate skip, "
+          "NOT an unreadable listing%s"
+          % (" ".join(f for f, skip in ((".open_iss", _open_not_asked), (".pr_brs", _pr_not_asked)) if skip),
+             "; the checked classification still runs" if (_open_not_asked and not _pr_not_asked) else ""))
+if (not have_open and not _open_not_asked) or (not have_pr and not _pr_not_asked):
     print("[reap] SKIPPED: %s not readable — an unreadable listing is not an empty one; the "
           "dispatched blacklist is untouched%s"
-          % (" ".join(f for f, ok in ((".open_iss", have_open), (".pr_brs", have_pr)) if not ok),
+          % (" ".join(f for f, ok, skip in ((".open_iss", have_open, _open_not_asked),
+                                            (".pr_brs", have_pr, _pr_not_asked))
+                   if not ok and not skip),
              "; the checked classification still runs" if (not have_open and have_pr) else ""))
 # ⛔ THE CHECKED CLASSIFICATION CANNOT RULE OUT A PR WITHOUT `.pr_brs`, so it refuses the WHOLE
 # classification rather than releasing on the facts it happens to have. Same polarity as #1705,
@@ -2993,6 +3166,14 @@ if not have_pr:
     raise SystemExit(0)
 open_iss = {l for l in _open_rows if l}
 brs = [l for l in _pr_rows if l]
+if _pr_window_blind:
+    # Named once, with the consequence, rather than left to a reader to infer from a smaller
+    # failure count: this is the ONE place the clipped window changes a verdict.
+    print("[reap] the PR-branch window is NARROWED to %d rows AND CLIPPED (a next page was still "
+          "advertised), so a head ref outside it is not evidence of 'no PR' (#1984) — nothing is "
+          "released on that reading this pass: a dispatched entry that would have been "
+          "un-blacklisted is KEPT or settled by its own CLOSED state instead, and a checked entry "
+          "whose only keep fact is its PR branch is KEPT and named" % _pr_limit)
 # ⛔ AN UNREADABLE SESSION LIST IS NOT "NO LANES" (review E-P3, cycle 2). `tmux ls`'s exit status was
 # discarded and every failure collapsed into `out = ""`, so a tmux that could not answer silently
 # REMOVED the `lane` keep fact — moving live lanes toward release, which is the duplicate-dispatch
@@ -3034,23 +3215,28 @@ if not _disp_ok:
           "nothing is reaped and the file is left exactly as it was")
     _disp_rows = []
 # ── THE CAPPED WINDOW IS NOT AN ANSWER, SO THE ENTRIES IT CANNOT REACH ARE ASKED DIRECTLY ──────
-# ⛔ `.open_iss` IS `--limit 500` created-DESC against a repo with 1371 open issues (measured
-# 2026-10-30, daniel-ospina/tortoise), so it is PERMANENTLY saturated: every issue older than the 500
-# newest OPEN ones is absent from it for ever. The reap below reads that absence as "cannot prove it
-# is open" — the right polarity for the CLOSED question, and the WRONG one for the RELEASE question,
+# ⛔ `.open_iss` IS A created-DESC WINDOW — `--limit 500`, or the rows-sized bound when a pass serves
+# four or fewer (#1984, see the listing block) — against a repo with 1371 open issues (measured
+# 2026-10-30, daniel-ospina/tortoise). At the shipped 500 it is PERMANENTLY saturated: every issue
+# older than the 500 newest OPEN ones is absent from it for ever. On a one-to-four-row pass the window
+# is 100–400 rows instead, which widens this exposure by exactly that factor (that trade is disclosed
+# on the listing block's `NARROWED` line, not silently taken). The reap below reads that absence as
+# "cannot prove it is open" — the right polarity for the CLOSED question, and the WRONG one for the RELEASE question,
 # because it makes the suppression PERMANENT: an abandoned dispatch falls out of the window, is never
 # dropped from `dispatched.txt`, therefore never leaves `checked.txt`, therefore is SKIPPED by every
 # later pass and never re-enters `candidates.txt` (which the dispatch cycle prunes of dispatched ids).
 # The issue stays open, nobody works it, and the one line an operator reads counts it as `dispatched`.
 # MEASURED on the live box: the shipped reap released NOTHING (0 releasable of 384) while 169 of the
 # 203 entries in `dispatched.txt` were outside the window. Of the 12 asked in the first bounded pass,
-# ALL were OPEN — and `.pr_brs` is as saturated as `.open_iss` (4142 PRs exist, 500 visible), so "no PR"
-# is NOT a fact this pass can read: 7 of those 12 turned out to have head-ref-naming MERGED PRs outside
-# the window (verified: #1789 → PR 8041, #2107 → PR 8128, both MERGED, both issues still OPEN).
+# ALL were OPEN — and `.pr_brs` is as saturated as `.open_iss` (4142 PRs exist; 500 visible at the
+# shipped bound, 100–400 on a one-to-four-row pass), so "no PR" is NOT a fact this pass can read: 7
+# of those 12 turned out to have head-ref-naming MERGED PRs outside the window (verified: #1789 →
+# PR 8041, #2107 → PR 8128, both MERGED, both issues still OPEN).
 # ⛔ SO ONLY A **CLOSED** ISSUE IS RELEASED. An OPEN, window-blind entry is KEPT and NAMED. The reason is
-# in this file's own words: the LANDED verdict comes ONLY from the issue's own CLOSED state (`:4552-4559`,
-# tortoise#8625), so an OPEN issue whose PR merged reads **CLEAN** in the pre-flight and is re-queued —
-# a lane re-implementing shipped work (#8560/#7174). The reap may end SILENCE; it may not cause a
+# in this file's own words: the LANDED verdict comes ONLY from the issue's own CLOSED state (the
+# landed-prune block's own contract below, tortoise#8625), so an OPEN issue whose PR merged reads
+# **CLEAN** in the pre-flight and is re-queued — a lane re-implementing shipped work (#8560/#7174).
+# The reap may end SILENCE; it may not cause a
 # requeue. What it therefore delivers is (a) every CLOSED entry reclaimed, (b) the OPEN class COUNTED and
 # NAMED on the operator line every pass, rotated so the whole class is named over time — a stated deficit
 # instead of an invisible permanent suppression. Closing that half needs the PR question answered
@@ -3115,7 +3301,11 @@ if have_open and _disp_ok:
         has_pr = any(re.search(r"(^|[-/])%s([-/]|$)" % re.escape(n), b) for b in brs)
         if has_pr:
             keep.append(n); continue
-        if n in open_iss:
+        # ⛔ A NARROWED WINDOW CANNOT PROVE "NO PR" (agent-infra#1984). The row goes to the
+        # window-blind arm instead of `reaped`, which is the polarity that can only ever KEEP more:
+        # it is settled only by its own authoritative CLOSED state, never by an absence read from a
+        # window the pass chose to make smaller. At the shipped 500-row window this line is inert.
+        if n in open_iss and not _pr_window_blind:
             reaped.append(n)
         else:
             _window_blind.append(n)
@@ -3195,9 +3385,10 @@ if have_open and _disp_ok:
         _askedset = set(_asked)
         # ⛔ ONLY A **CLOSED** ISSUE IS RELEASED. An OPEN one is KEPT and NAMED, however abandoned it
         # looks, and the reason is measured in this file's own words: the LANDED verdict comes ONLY from
-        # the issue's own state being CLOSED (`:4552-4559`, tortoise#8625), so an OPEN issue whose PR was
-        # merged reads **CLEAN** in the pre-flight and is re-queued — a lane re-implementing shipped
-        # work, which is the #8560/#7174 class this whole reap exists to prevent. The window-blind "no PR"
+        # the issue's own state being CLOSED (the landed-prune block's contract below, tortoise#8625), so
+        # an OPEN issue whose PR was merged reads **CLEAN** in the pre-flight and is re-queued — a lane
+        # re-implementing shipped work, which is the #8560/#7174 class this whole reap exists to
+        # prevent. The window-blind "no PR"
         # fact cannot tell the two apart, so the reap must not act on it: silence is what it may end, a
         # requeue is what it may not cause. Named on the line instead of dropped, counted, and rotated.
         # ⛔ A CLOSED ENTRY IS ONLY RECLAIMED WHEN ITS QUEUE ROW IS ALREADY GONE. `dispatched.txt` is the
@@ -3335,14 +3526,16 @@ if have_open and _disp_ok:
 #   pr          a PR head ref names it
 #   lane        a live `lane-N` session exists (the ONE `tmux ls` above, already paid for)
 # NOT keep facts, and why:
-#   absent from `.open_iss`  it is a 500-row created-DESC WINDOW: the oldest open issues fall out of
-#                            it permanently, so absence is not "closed". Its documented loss only
-#                            NARROWS this pass, so it can never be a terminal fact.
+#   absent from `.open_iss`  it is a created-DESC WINDOW (500 rows, or the rows-sized bound when a
+#                            pass serves four or fewer — see the listing block), so the oldest open
+#                            issues fall out of it permanently and absence is not "closed". Its
+#                            documented loss only NARROWS this pass, so it can never be a terminal fact.
 #   a branch ref             the scout is fetched without `--prune`, so a deleted branch's ref never
 #                            goes away — unbounded evidence. The pre-flight's own branch/PR COLLISION
 #                            already refuses to queue such an issue, TTL-bounded by the collision
 #                            ledger, which is the right home for a fact that expires.
-# STATED RESIDUAL: `.pr_brs` is the same 500-row window, and a PR whose head ref does not embed the
+# STATED RESIDUAL: `.pr_brs` is a created-DESC WINDOW (500 rows, or the rows-sized bound when a pass
+# serves four or fewer — see the listing block), and a PR whose head ref does not embed the
 # issue number never matches — both make the `pr` keep fact MISSING for old or oddly-named PRs, which
 # releases the entry and buys ONE re-judge (the pre-flight then answers COLLISION for a live PR). A
 # cost, not a correctness guarantee, and it is bounded by the release cap in the bash filter.
@@ -3383,6 +3576,21 @@ for n in _cksrc:
         kept.append((n, "pr"))
     elif n in live:
         kept.append((n, "lane"))
+    elif _pr_window_blind:
+        # ⛔ THE SAME PREDICATE AT THE SECOND READER (#1984, fresh review P1b). `pr_ref` is a regex
+        # over the SAME window `has_pr` reads, so a clipped window makes this "no PR" fact missing
+        # for the same reason — and a missing keep fact here RELEASES. Releasing is only a bounded
+        # cost (one re-judge) and the shipped 500 already accepts it, but a window this pass CHOSE to
+        # clip is not the shipped residual: the entry is KEPT, and its reason is a row the operator
+        # line prints it as `pr-unknown`), so it is a STATED deficit rather than an invisible
+        # suppression. Bounded by construction: the window is only narrowed when the row files total
+        # four or fewer, so at most four entries can be held this way on any pass.
+        # ⛔ THE REASON IS `pr-unknown`, NOT A NEW COUNTER: the dispatch line's checked breakdown has
+        # one bucket per fact plus `unknown` for a reason it does not map, and adding a ninth counter
+        # would change the funnel's field set for a condition this narrow. `unknown` is the
+        # documented fallback ("an UNMAPPED reason lands in `unknown` rather than vanishing, so the
+        # counters always sum"), and the cause is written verbatim in `state/checked-kept`.
+        kept.append((n, "pr-unknown"))
     else:
         releasable.append(n)
 # ⛔ THIS DOES NOT REWRITE checked.txt BEYOND THE PRE-EXISTING `dispatched.txt` DROP ABOVE. It
@@ -3391,10 +3599,11 @@ for n in _cksrc:
 # an entry the registry keeps never has to be put back.
 publish("checked-kept", "".join("%s\t%s\n" % (n, r) for n, r in kept))
 publish("checked-release-candidates", "".join(n + "\n" for n in dict.fromkeys(releasable)))
-print("[reap] checked: %d entr(ies) — dispatched=%d queued=%d pr=%d lane=%d releasable=%d"
+print("[reap] checked: %d entr(ies) — dispatched=%d queued=%d pr=%d lane=%d pr-unknown=%d releasable=%d"
       % (len(kept) + len(releasable),
          sum(1 for _, r in kept if r == "dispatched"), sum(1 for _, r in kept if r == "queued"),
          sum(1 for _, r in kept if r == "pr"), sum(1 for _, r in kept if r == "lane"),
+         sum(1 for _, r in kept if r == "pr-unknown"),
          len(releasable)))
 
 # ── landed.txt: a REPORTED decision, never a second blacklist (tortoise#8560/#8625/#8629) ─────
@@ -3411,10 +3620,10 @@ print("[reap] checked: %d entr(ies) — dispatched=%d queued=%d pr=%d lane=%d re
 # done and suppressing it is a false LANDED. Either way: release, loudly.
 #
 # ⛔ IT READS THE ENTRY'S OWN STATE — it does NOT infer CLOSED from ABSENCE in the capped
-# `.open_iss` listing. `.open_iss` is `--limit 500` against a repo with >500 open issues, so it is
-# PERMANENTLY saturated and absence from it proves nothing; an earlier `len(open_iss) < 500` guard
-# was a no-op on every pass. The targeted, UNCAPPED `gh issue view <N> --json state` answers the
-# actual question.
+# `.open_iss` listing. `.open_iss` is a created-DESC window (500 rows, or fewer when a pass serves
+# four or fewer — see the listing block) against a repo with >500 open issues, so it is PERMANENTLY
+# saturated and absence from it proves nothing; an earlier `len(open_iss) < 500` guard was a no-op on
+# every pass. The targeted, UNCAPPED `gh issue view <N> --json state` answers the actual question.
 #
 # ⛔ FAIL CLOSED PER ENTRY: an entry whose state cannot be read is KEPT — a failed read never drops a
 # suppression that may still be owed. Named in the log, so it is never silent.

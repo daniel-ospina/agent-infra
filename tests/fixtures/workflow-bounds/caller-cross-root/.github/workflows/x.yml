@@ -1,0 +1,10 @@
+name: fixture caller-cross-root — a plain bounded workflow in the required root
+on:
+  pull_request:
+jobs:
+  x:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: work
+        run: echo hi

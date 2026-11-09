@@ -8,9 +8,10 @@ name: Harness single source
 #
 # ⛔ ITS OWN WORKFLOW, ON PURPOSE — and that is a decision, not tidiness. This job used to live in
 # ci.yml, which is a BYTE-LOCKED workflow (scripts/check-workflow-lock.mjs, LOCKED_FILES). Adding a
-# job there forced this branch to also commit `scripts/workflow-lock.json`, and the lock is a
-# last-writer-wins recording of ci.yml's hash: every main commit that re-cut the lock made this
-# branch CONFLICT, three times in one evening, each costing a rebase + a full CI run. A dedicated
+# job there forced this branch to also re-cut the lock entry for ci.yml, and every main commit that
+# re-cut the lock made this branch CONFLICT, three times in one evening, each costing a rebase + a
+# full CI run. (Since #1955 the lock is region-keyed, so that contention is scoped to `jobs.ci` —
+# narrower, but a harness job would still land in the same region.) A dedicated
 # workflow is classified once in `UNLOCKED_WORKFLOWS` (check-workflow-lock.mjs) and then never
 # collides with a locked-file edit again. The job name is unchanged — `harness-single-source` — so
 # the check that branch protection and the fleet's logs already reference still appears.
@@ -101,6 +102,18 @@ permissions:
 jobs:
   harness-single-source:
     runs-on: ubuntu-latest
+    # #2055 — a job with NO bound can hang until the platform's 6-hour ceiling, and this one runs on
+    # every PR whose paths filter matches, so a hang holds the merge queue (measured on PR #2168: a
+    # peer job sat `in_progress` for >55 min and the rail refused to classify anything). Measured over
+    # 14 completed runs of this workflow (2026-11-09): p50 14 s, p90 74 s, max 156 s. 25 min is ~10x
+    # the observed max — above runner variance, far below a hang.
+    #
+    # ⛔ THIS BOUND IS A BACKSTOP, NOT THE RED (stated so it is not misread): a job-level
+    # `timeout-minutes` trip is reported `cancelled`, which this repo's rail reads NON-RED. What it
+    # buys is that the job ENDS and NAMES itself instead of queueing every PR behind it forever. The
+    # red-producing bound is the step's — see ci.yml's `bash-suites` — and the false-pass surface a
+    # non-verdict leaves behind is ONE root, agent-infra#3242, not a new one created here.
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
       - name: doctor reports the platform and the supervisor it found

@@ -80,6 +80,11 @@ echo "==> refresh-candidates core-quota contract ($HERE)"
 #   here as 20) + 5 cached candidates (1 each) = ~30. The pre-fix pass pays the rebuild SIX times
 #   (~125 here, 130 measured live). 40 is the ceiling: it leaves room for the fixture's variance and
 #   still reds ANY regression that rebuilds the board more than once per pass.
+# ⛔ THE LISTING TERM IS NOW 0 IN THIS FIXTURE, DELIBERATELY AND SAID OUT LOUD (#1984): a case whose
+# `dispatched.txt` and `checked.txt` are both empty no longer asks the reaper's two windows at all
+# (the `idle-reap:` case below asserts the ZERO). The ceiling is an UPPER bound, so it still measures
+# what it was built to measure — the board rebuild — and the `spent > 0` arm below keeps it from
+# passing on a stub that charges nothing.
 CORE_CEILING=40
 BOARD_COST=20        # modeled per-rebuild cost, from the measured 130/6 = 21.7 calls per rebuild
 CACHED_COST=1        # a cache hit costs no board read
@@ -130,6 +135,14 @@ mk_case() {
 # case 4 would pass by vacuity rather than by the reaper running.
 mk_gh() {
   local d="$1" rows="$2" rate_body="${3:-}" open_rows="${4:-[]}"
+  # ⛔ `$d/bin/pulls-body` CARRIES THE PULLS ANSWER; `$d/bin/pulls-clip` IS THE TRUNCATION MARKER
+  # (#1984). The body below is an INTERPOLATING heredoc, so a JSON payload cannot be passed through it
+  # without a quoting nightmare; a file is both simpler and less fragile, and the MARKER's existence is
+  # what the wrapper reads to emit `link: … rel="next"`. Two facts are therefore drivable
+  # INDEPENDENTLY: a FULL page that ENDS the collection (body, no marker — a complete answer at any
+  # limit) and a full page that still advertises a next one (both — `REST_WINDOW_FILLED`, the fact that
+  # decides whether absence may be read as evidence). Absent = the historical `[]` answer.
+  rm -f "$d/bin/pulls-body" "$d/bin/pulls-clip"
   cat > "$d/bin/gh.body" <<SH
 #!/bin/bash
 charge() {  # <cost> — spend from the scripted budget (never below 0)
@@ -140,8 +153,8 @@ case "\$*" in
   "api rate_limit")
     if [ -n "$rate_body" ]; then printf '%s\n' "$rate_body"
     else printf '{"resources":{"core":{"remaining":%s},"graphql":{"remaining":4990}}}\n' "\$(cat "$d/core")"; fi ;;
-  *"/pulls?"*) charge 1; printf '[]\n' ;;
-  *"labels=P0-blocker"*) charge 1; printf '%s\n' '$rows' ;;
+  *"/pulls?"*) charge 1; if [ -f "$d/bin/pulls-body" ]; then cat "$d/bin/pulls-body"; else printf '[]\n'; fi ;;
+  *"labels="*) charge 1; printf '%s\n' '$rows' ;;
   *"/issues?"*) charge 1; printf '%s\n' '$open_rows' ;;
   *) printf '[]\n' ;;
 esac
@@ -159,7 +172,13 @@ if [ "$1" = api ] && [ "$2" = -i ]; then
   [ -s "$d/.gh.err" ] && cat "$d/.gh.err" >&2
   rm -f "$d/.gh.err"
   [ "$rc" -eq 0 ] || exit "$rc"
-  printf 'HTTP/2.0 200 OK\r\ncontent-type: application/json\r\n\r\n%s\n' "$out"
+  printf 'HTTP/2.0 200 OK\r\ncontent-type: application/json\r\n'
+  # ⛔ THE LINK HEADER IS THE PROVIDER'S OWN STATEMENT THAT THE COLLECTION DID NOT END, and it is the
+  # only way a fixture can drive `rest_list`'s `REST_WINDOW_FILLED` — the fact #1984's guard now
+  # reads instead of inferring from the limit. Emitted ONLY for the pulls listing, and only when the
+  # CLIPPED fixture asked for it, so every other case keeps its historical complete answer.
+  case "$*" in *"/pulls?"*) [ -f "$d/pulls-clip" ] && printf 'link: <https://api.github.com/x?page=2>; rel="next"\r\n' ;; esac
+  printf '\r\n%s\n' "$out"
   exit 0
 fi
 exec "$d/gh.body" "$@"
@@ -251,6 +270,23 @@ open(core_p, "w").write(str(c))
 print("VERDICT: CLEAN")
 PY
   chmod +x "$1"
+}
+
+# mk_pulls_full <case-dir> <n> [clip] — serve n head refs from the pulls listing, optionally CLIPPED.
+# ⛔ THE PAGE COUNT MUST VARY WITH THE LIMIT OR THE ASSERTION IS UNFALSIFIABLE (fresh review of #1984,
+# P2). `rest_list` breaks after page 1 on a SHORT page, so a fixture that answers a handful of rows
+# cannot tell `--limit 100` from `--limit 500`: both are one request, and the "one request per row" and
+# "no page=2" rows would pass on ANY limit. A FULL page is what makes the limit observable.
+# ⛔ AND THE REF NAMES CARRY NO BARE DIGIT RUN: `has_pr`/`pr_ref` match `(^|[-/])N([-/]|$)`, so
+# `chore/nope-41` IS a match for issue #41 and the fixture would grade a row that has a PR.
+mk_pulls_full() {
+  local d="$1" n="$2" clip="${3:-}" i out='['
+  for i in $(seq 1 "$n"); do
+    [ "$i" -gt 1 ] && out="$out,"
+    out="$out{\"head\":{\"ref\":\"chore/nope-xx$i\"}}"
+  done
+  printf '%s]' "$out" > "$d/bin/pulls-body"
+  if [ -n "$clip" ]; then : > "$d/bin/pulls-clip"; else rm -f "$d/bin/pulls-clip"; fi
 }
 
 # rf <dir> <refresh|check> [KEY=VAL ...] — runs the SHIPPED script hermetically; $OUT/$RC.
@@ -393,8 +429,14 @@ mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
 # A `tmux` stub, so "no live lane" is a fact of the fixture rather than of the host: the reaper asks
 # `tmux ls` for `lane-<issue>` sessions, and an ambient session on a real box would keep the entry.
 printf '#!/bin/bash\nexit 0\n' > "$D/bin/tmux"; chmod +x "$D/bin/tmux"
-printf '41\n' > "$D/o/dispatched.txt"
-printf '41\n' > "$D/o/checked.txt"
+# ⛔ FIVE ROWS, NOT ONE, AND THE NUMBER IS THE FIXTURE'S CONTRACT WITH THE SHIPPED WINDOW (#1984).
+# `rest_list` pages at 100 rows, so the shipped pass now sizes each reaper window to the rows it
+# serves — one row ⇒ a 100-row window, which is NARROWER than the shipped 500 and is therefore not
+# evidence of "no PR". That guard is graded by the `row-bounded:` case below; THIS case grades the
+# standard window (a row open, no PR, no lane ⇒ un-blacklisted), so it must run above the five-row
+# knee where the window is still the full 500. Seeding one row here silently changed what this case
+# measured — the same trap the `open-rows` seam two paragraphs up was added for.
+for _r in 41 42 43 44 45; do printf '%s\n' "$_r" >> "$D/o/dispatched.txt"; printf '%s\n' "$_r" >> "$D/o/checked.txt"; done
 rf "$D" refresh COLLISION_PREFLIGHT_CORE_RESERVE=40
 spent_dry=$(( 20 - $(cat "$D/core") ))
 [ "$RC" -eq 1 ] && ok "unaffordable: refuses TRANSIENTLY (rc=1, retried next cycle) rather than exiting 0" \
@@ -638,6 +680,250 @@ else
     bad "truncation-stale: with the .pool-sat reset deleted the clip did NOT persist — the check above is not grading the reset"
   fi
 fi
+
+# ── 8) A PASS WITH NOTHING TO REAP ISSUES **ZERO** LISTING REQUESTS (agent-infra#1984) ────────
+# The refresh runs WHENEVER THE BACKLOG IS SHORT — i.e. in the stall it exists to fix — and the two
+# windows below are the REAPER's inputs alone. `.open_iss` is read only by the dispatched reap;
+# `.pr_brs` by the dispatched reap and the checked classification. So when `dispatched.txt` and
+# `checked.txt` are both empty the windows cannot change any answer, and a pass that spends 10 core
+# requests asking them is spending on a question no reader exists for. That is the issue's own
+# acceptance line: "a pass over `agent-infra` with an empty `dispatched.txt` issues ZERO listing
+# requests".
+# ⛔ ASSERTED ON THE WIRE, NOT ON A LOG LINE. The stub records every `gh api -i` it serves in
+# `gh.argv`, so "no listing was asked for" is a fact about the requests rather than about a sentence
+# the script could print while still calling. The TIER listings still run (they build the pool) —
+# they carry `labels=`, which is what separates them from the reaper's unlabelled window.
+mk_case idle-reap 1000
+mk_gh "$D" "$(rows 2)"
+mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+# ⛔ AND ONE ARM THIS FIXTURE WAS NOT MODELING: a box whose `tmux` cannot answer (#1984). The
+# checked half then REFUSES by design (`[reap] SKIPPED (checked: the live-session list could not be
+# read)` — `lane` is a keep fact and an unreadable session list is not "no lanes"), and the suites
+# runner has no tmux, so it emits that line on EVERY idle pass. Without the stub the two
+# "checked-half" rows below could only be green for the absence of ANY such line — measured on the
+# runner, where a bare `(checked:` glob reddened the row over the tmux probe rather than over
+# `.pr_brs`. The stub fails like a missing/broken tmux, so this box now sees the same log a CI pass
+# does and the rows grade what they name.
+printf '#!/bin/bash\nexit 1\n' > "$D/bin/tmux"; chmod +x "$D/bin/tmux"
+rf "$D" refresh
+idle_pulls="$(grep -cE '^repos/[^ ]*/pulls\?' "$D/bin/gh.argv" 2>/dev/null | tr -d ' ')"
+idle_open="$(grep -E '^repos/[^ ]*/issues\?' "$D/bin/gh.argv" 2>/dev/null | grep -vc 'labels=')"
+idle_tiers="$(grep -cE '^repos/[^ ]*/issues\?.*labels=' "$D/bin/gh.argv" 2>/dev/null | tr -d ' ')"
+[ "$RC" -eq 0 ] && ok "idle-reap: the pass still SUCCEEDS with nothing to reap (rc=0) — the windows are not what makes it run" \
+              || bad "idle-reap: rc=$RC (want 0) — output: $OUT"
+[ "${idle_tiers:-0}" -ge 1 ] || bad "idle-reap: the TIER listings never ran — the zero below would then be a property of a refused pass, not of the reap bound"
+[ "${idle_pulls:-1}" = "0" ] && ok "idle-reap: ZERO PR-branch listing requests (both row files are empty, so nothing reads the window)" \
+                            || bad "idle-reap: $idle_pulls PR listing(s) were still issued for an empty blacklist — $(grep -oE 'pulls\?[^ ]*' "$D/bin/gh.argv" 2>/dev/null | head -1)"
+[ "${idle_open:-1}" = "0" ] && ok "idle-reap: ZERO unlabelled open-issue listing requests (dispatched.txt is that window's only consumer)" \
+                           || bad "idle-reap: $idle_open unlabelled open-issue listing(s) were still issued — $(grep -E '^repos/[^ ]*/issues\?' "$D/bin/gh.argv" 2>/dev/null | grep -v 'labels=' | head -1)"
+case "$OUT" in
+  *"the open-issue window is NOT requested"*) ok "idle-reap: the skipped window is NAMED in the log, with its reason" ;;
+  *) bad "idle-reap: the pass does not say the window was deliberately not asked for — output: $OUT" ;;
+esac
+case "$OUT" in
+  *"the PR-branch window is NOT requested"*) ok "idle-reap: the PR window's skip is NAMED too, and for its own reason (both row files empty)" ;;
+  *) bad "idle-reap: the PR window's deliberate skip is not reported — output: $OUT" ;;
+esac
+# ⛔ "WE DID NOT ASK" MUST NOT BE REPORTED AS "THE READ FAILED" (#1705/#1736 through a log line).
+# The two are the same ABSENT file on disk, and an operator reading "not readable" would go hunting a
+# broken reader that never ran.
+case "$OUT" in
+  *"[reap] NOT REQUESTED:"*) ok "idle-reap: the reap reports a DELIBERATE skip by name" ;;
+  *) bad "idle-reap: no '[reap] NOT REQUESTED:' line — the skip is indistinguishable from a failure — output: $OUT" ;;
+esac
+# ⛔ AND IT MUST NOT CLAIM A NARROWED WINDOW EITHER (fresh review P2, and the whole of the cycle-2
+# fix `e7707ee0c`). `REAP_PR_LIMIT=0` is "we did not ask", not "we read a 0-row window" — reading it
+# as a limit printed `the PR-branch window is NARROWED to 0 rows` over a read that never happened.
+# Nothing else in either suite varies with that term, so without this row the fix is unpinned.
+case "$OUT" in
+  *"is NARROWED to"*) bad "idle-reap: the reap reported a NARROWED window over a listing it never requested — 'we did not ask' is not 'we read a small window' (a declined marker is not a limit)" ;;
+  *) ok "idle-reap: no NARROWED line over a declined window (a not-asked marker is not a limit)" ;;
+esac
+case "$OUT" in
+  *"[reap] SKIPPED:"*) bad "idle-reap: the reap printed an UNREADABLE-listing skip for a window it deliberately did not ask for — that sends an operator after a reader that never ran" ;;
+  *) ok "idle-reap: no 'not readable' skip is printed for a window that was never requested" ;;
+esac
+# ⛔ THE OTHER UNREADABLE-SKIP SHAPE, WHICH THE ROW ABOVE DOES NOT MATCH (fresh review of #1984,
+# observation 1 — refuted as inert). `[reap] SKIPPED:` is the LISTING half; `[reap] SKIPPED (checked: …)`
+# is the REFUSAL of the checked classification, and it is what the reap's
+# `have_pr = have_pr or _pr_not_asked` exists to prevent. Measured: dropping that `or` leaves the row
+# above GREEN (its glob requires the colon right after `SKIPPED`) while the pass prints `[reap]
+# SKIPPED (checked: .pr_brs unreadable)` over a window it never asked for — the same log-lie, one arm
+# over. So the claim that the pair is dead weight is falsifiable, and this is what falsifies it.
+# ⛔ NARROWED TO THE `.pr_brs` SHAPE, DELIBERATELY (#1984). Other arms print their own
+# `[reap] SKIPPED (checked: …)` refusals and those are CORRECT on this pass — a box without tmux
+# cannot read the `lane` keep fact and must refuse (measured on the bash-suites runner, where that
+# line is present on every idle pass). A bare `(checked:` glob would grade the tmux probe, not this.
+case "$OUT" in
+  *"[reap] SKIPPED (checked: .pr_brs"*) bad "idle-reap: a window this pass never ASKED for was reported as an UNREADABLE .pr_brs to the checked half — 'we did not ask' must not read as a broken reader" ;;
+  *) ok "idle-reap: the checked half is not refused as unreadable over a window that was never requested" ;;
+esac
+# Non-vacuity: the SAME fixture with one row then asks for both windows, so the zero above is the
+# empty blacklist rather than a stub that records nothing.
+mk_case idle-reap-control 1000
+mk_gh "$D" "$(rows 2)"
+mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+printf '99\n' > "$D/o/dispatched.txt"
+rf "$D" refresh
+ctl_pulls="$(grep -cE '^repos/[^ ]*/pulls\?' "$D/bin/gh.argv" 2>/dev/null | tr -d ' ')"
+[ "${ctl_pulls:-0}" -ge 1 ] && ok "idle-reap: NON-VACUITY — one dispatched row brings the PR window back ($ctl_pulls request(s)), so the zero above measures the bound" \
+                             || bad "idle-reap: with a seeded dispatched.txt NO PR listing was issued either — the zero above grades the stub, not the pass"
+
+# ── 9) THE WINDOW IS SIZED TO THE ROWS IT SERVES — AND WHETHER A MISS IS EVIDENCE IS THE PROVIDER'S
+#      FACT, NOT OUR LIMIT (agent-infra#1984; fresh review P1) ─────────────────────────────────────
+# `rest_list` pages at 100 rows, so a window sized to the rows that read it is at most one request
+# per row (the issue's second acceptance line), clamped to the 500 every earlier pass used — a pass
+# with five or more rows behaves exactly as before.
+# ⛔ THE GUARD MUST BE KEYED ON TRUNCATION, NOT ON THE LIMIT (fresh review P1, and this case is what
+# pins it). `has_pr` is a regex over the head refs the window returned, and "no PR" is what releases a
+# dispatched entry back into the queue — the duplicate-lane class (#1705). The first cut withheld that
+# release whenever the LIMIT was below 500, which also withheld it from a 100-row window whose
+# collection had ENDED — a complete answer that proves "no PR" as well as a 500-row one would have,
+# and the pass then printed a truncation warning over it. `rest_list` already publishes the provider's
+# own fact (`REST_WINDOW_FILLED`), so the guard reads THAT plus the limit:
+#   narrowed + COMPLETE  → absence is evidence → the dead-lane retry works (this case, #41 RELEASED)
+#   narrowed + CLIPPED   → it is not            → KEPT (§10)
+#   shipped 500 (either) → unchanged from the shipped behaviour
+mk_case row-bounded 1000
+# ⛔ BOTH WINDOWS ANSWER A FULL PAGE, so the request COUNT is a function of the limit and nothing else
+# (a short page ends the collection at any limit — see `mk_pulls_full`). `.open_iss` = 200 open issues
+# including 41..46, answered as one 200-row page; the pulls answer is 100 refs that END the collection.
+mk_gh "$D" "$(rows 2)" "" "$(rows 200)"
+mk_pulls_full "$D" 100
+mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+printf '#!/bin/bash\nexit 0\n' > "$D/bin/tmux"; chmod +x "$D/bin/tmux"
+printf '41\n' > "$D/o/dispatched.txt"
+rf "$D" refresh
+rb_pulls="$(grep -cE '^repos/[^ ]*/pulls\?' "$D/bin/gh.argv" 2>/dev/null | tr -d ' ')"
+rb_open="$(grep -E '^repos/[^ ]*/issues\?' "$D/bin/gh.argv" 2>/dev/null | grep -vc 'labels=')"
+[ "${rb_pulls:-0}" = "1" ] && ok "row-bounded: one dispatched row costs ONE PR-window request — the window is sized to the rows that read it" \
+                            || bad "row-bounded: $rb_pulls PR listing request(s) for one row (want 1) — the window is not bounded by its readers"
+[ "${rb_open:-0}" = "1" ] && ok "row-bounded: one dispatched row costs ONE open-issue request" \
+                           || bad "row-bounded: $rb_open open-issue listing request(s) for one row (want 1)"
+# At most one page per row: nothing asks for a second page of either window.
+rb_page2="$(grep -cE '^repos/[^ ]*/(issues|pulls)\?[^ ]*page=2' "$D/bin/gh.argv" 2>/dev/null | tr -d ' ')"
+[ "${rb_page2:-1}" = "0" ] && ok "row-bounded: no window paged past ONE page for a one-row pass" \
+                            || bad "row-bounded: $rb_page2 listing(s) asked for page=2 — the window is still the fixed 500-row shape"
+case "$OUT" in
+  *"the open-issue window is NARROWED to 100 rows"*) ok "row-bounded: the OPEN window's narrowing is DISCLOSED too (it narrows the release arm, so an operator must be able to see it) — fresh review P2-3" ;;
+  *) bad "row-bounded: the open-issue window was narrowed to a rows-sized bound without saying so — the release path is silently narrower than the shipped 500" ;;
+esac
+case "$OUT" in
+  *"the PR-branch window is NARROWED to 100 rows"*"COMPLETE answer for this pass"*) ok "row-bounded: the narrowed window is NAMED as a COMPLETE answer (the provider ended the collection), not as a truncation" ;;
+  *) bad "row-bounded: the narrowed-and-complete window is not disclosed as complete — output: $OUT" ;;
+esac
+case "$OUT" in
+  *"AND the provider ended it with a next page still advertised"*) bad "row-bounded: the pass claims the window was CLIPPED although the provider ended the collection — a truncation warning over a complete answer" ;;
+  *) ok "row-bounded: no clipped-window warning over a complete answer" ;;
+esac
+case "$OUT" in
+  *"[reap] the PR-branch window is NARROWED"*"CLIPPED"*) bad "row-bounded: the reap withdrew the PR-absence evidence for a window that was COMPLETE — the dead-lane retry is unreachable again (fresh review P1a)" ;;
+  *) ok "row-bounded: the reap did NOT withdraw the evidence — a complete narrowed window still proves 'no PR'" ;;
+esac
+case "$(tr '\n' ' ' < "$D/o/dispatched.txt" 2>/dev/null)" in
+  *41*) bad "row-bounded: #41 was KEPT although the narrowed window was COMPLETE — a PR cannot be hiding from a collection the provider said had ended, so the dead-lane retry is unreachable" ;;
+  *) ok "row-bounded: #41 is RELEASED — a narrowed window the provider ENDED is a complete answer, so absence from it is real evidence (#1984 P1a)" ;;
+esac
+
+# ── 10) THE SAME ROW, THE SAME WINDOW SIZE, CLIPPED: THE EVIDENCE IS WITHDRAWN ──────────────────
+# This is the half the guard exists for, and the fresh review's P1b: a clipped window cannot prove
+# "no PR", so the release arm must be refused and the row KEPT — settled only by its own CLOSED state.
+mk_case row-bounded-clipped 1000
+mk_gh "$D" "$(rows 2)" "" "$(rows 6)"
+mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+printf '#!/bin/bash\nexit 0\n' > "$D/bin/tmux"; chmod +x "$D/bin/tmux"
+# A FULL page of head refs, NONE of which name the seeded issues, and a `link: … rel="next"` the
+# wrapper emits because this file exists: the listing is genuinely clipped and genuinely does not
+# contain #41 — exactly the shape that must NOT be read as "no PR".
+mk_pulls_full "$D" 100 clip
+printf '41\n' > "$D/o/dispatched.txt"
+rf "$D" refresh
+rc_pulls="$(grep -cE '^repos/[^ ]*/pulls\?' "$D/bin/gh.argv" 2>/dev/null | tr -d ' ')"
+[ "${rc_pulls:-0}" = "1" ] && ok "row-bounded-clipped: the clipped window still costs ONE request for one row" \
+                           || bad "row-bounded-clipped: $rc_pulls PR listing request(s) for one row (want 1)"
+case "$OUT" in
+  *"AND the provider ended it with a next page still advertised"*) ok "row-bounded-clipped: the clipped window is NAMED as clipped, with its consequence" ;;
+  *) bad "row-bounded-clipped: the clipped window is not disclosed — output: $OUT" ;;
+esac
+case "$OUT" in
+  *"[reap] the PR-branch window is NARROWED to 100 rows AND CLIPPED"*) ok "row-bounded-clipped: the reap WITHDRAWS the PR-absence evidence for a clipped window (the guard fires on the provider's fact)" ;;
+  *) bad "row-bounded-clipped: the reap did not withdraw the evidence for a clipped window — #1705's duplicate lane is one miss away — output: $OUT" ;;
+esac
+case "$(tr '\n' ' ' < "$D/o/dispatched.txt" 2>/dev/null)" in
+  *41*) ok "row-bounded-clipped: #41 is KEPT — open with no branch, but read from a CLIPPED window, so nothing is released on it (#1705)" ;;
+  *) bad "row-bounded-clipped: #41 was UN-BLACKLISTED from a CLIPPED window — a PR outside the window reads exactly like no PR, and that releases a dispatch into a duplicate lane" ;;
+esac
+
+# ── 10b) NON-VACUITY: THE SAME CLIPPED STUB AT FIVE ROWS RELEASES #41 ─────────────────────────
+# Identical fixture, identical clip, ONLY the row count differs — so the KEEP above is the (narrow AND
+# clipped) pair and not the clip alone, and the shipped 500-row behaviour is confirmed unchanged.
+mk_case row-bounded-clipped-control 1000
+mk_gh "$D" "$(rows 2)" "" "$(rows 6)"
+mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+printf '#!/bin/bash\nexit 0\n' > "$D/bin/tmux"; chmod +x "$D/bin/tmux"
+mk_pulls_full "$D" 100 clip
+for _r in 41 42 43 44 45; do printf '%s\n' "$_r" >> "$D/o/dispatched.txt"; done
+rf "$D" refresh
+case "$(tr '\n' ' ' < "$D/o/dispatched.txt" 2>/dev/null)" in
+  *41*) bad "row-bounded-clipped: with FIVE rows — the shipped 500-row window — #41 was still KEPT, so the case above proves nothing about the narrowed pair" ;;
+  *) ok "row-bounded-clipped: NON-VACUITY — at five rows the window is the shipped 500 and #41 IS released, so the KEEP above is the (narrow AND clipped) guard" ;;
+esac
+
+# ── 10c) THE SECOND CONSUMER OF THE SAME WINDOW (fresh review P1b) ─────────────────────────────
+# `pr_ref` reads the SAME `.pr_brs` for the checked classification, so a clipped window makes its "a
+# PR names this issue" keep fact MISSING for the same reason — and a missing keep fact RELEASES. On a
+# narrowed+clipped window that release is refused and the entry is KEPT with the cause written down
+# (`pr-unknown`), which is the file's "stated deficit, not an invisible suppression".
+mk_case checked-pr-clipped 1000
+mk_gh "$D" "$(rows 2)" "" "$(rows 6)"
+mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+printf '#!/bin/bash\nexit 0\n' > "$D/bin/tmux"; chmod +x "$D/bin/tmux"
+mk_pulls_full "$D" 100 clip
+printf '41\n' > "$D/o/dispatched.txt"
+printf '41\n42\n' > "$D/o/checked.txt"
+rf "$D" refresh
+case "$(tr '\t\n' '  ' < "$D/o/state/checked-kept" 2>/dev/null)" in
+  *"42 pr-unknown "*) ok "checked-pr-clipped: 42 is KEPT with the reason written down (pr-unknown) instead of released off a clipped window (fresh review P1b)" ;;
+  *) bad "checked-pr-clipped: 42 was not kept as 'pr-unknown' — kept: $(tr '\t\n' '  ' < "$D/o/state/checked-kept" 2>/dev/null); a clipped window released it" ;;
+esac
+
+# ── 10d) AN UNREADABLE ROW FILE IS NOT AN EMPTY ONE ───────────────────────────────────────────
+# `_reap_rows_in` answers 1 for a row file this pass cannot read, so the windows are still asked and
+# the reap's own fail-closed arms run. Without it, a DIRECTORY (or an EACCES file) would read as
+# "nothing to reap" and the whole reaper would go quiet on a box whose blacklist is unreadable.
+mk_case unreadable-rows 1000
+mk_gh "$D" "$(rows 2)"
+mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+mkdir "$D/o/dispatched.txt"
+# ⛔ THE ROW COUNT MUST NOT DEPEND ON WHAT THIS BOX'S `awk` DOES WITH A DIRECTORY (#1984). The first
+# cut of the shipped guard tested `-e` then `-r`, leaving every other path shape to awk — and that is
+# BUILD-DEPENDENT: on the bash-suites runner (gawk) a command-line directory is SKIPPED with a
+# warning, so the END block still ran and printed `0` rows at rc 0, the count collapsed to "nothing
+# to reap", and the pass skipped both listings while calling them deliberately not-requested. That
+# is the red this case was dispatched for (job 128992051819 on 82cb2aab1's merge commit: "0 PR / 0
+# open request(s) with an unreadable dispatched.txt"). ⛔ The host's own awk ERRORS on a directory
+# (mawk: "read error (Is a directory)", empty stdout), which the shipped count maps to 1 — so
+# without this stub the case is GREEN for the broken count and cannot prove the fix. The stub
+# reproduces the runner's answer (`0`, rc 0) for a directory argument and delegates everything else
+# to the real awk, so the case grades the SHIPPED guard on either build.
+REAL_AWK="$(command -v awk)"
+cat > "$D/bin/awk" <<SH
+#!/bin/bash
+for _a in "\$@"; do _last="\$_a"; done
+if [ -d "\$_last" ]; then printf '0'; exit 0; fi
+exec "$REAL_AWK" "\$@"
+SH
+chmod +x "$D/bin/awk"
+rf "$D" refresh
+ur_pulls="$(grep -cE '^repos/[^ ]*/pulls\?' "$D/bin/gh.argv" 2>/dev/null | tr -d ' ')"
+ur_open="$(grep -E '^repos/[^ ]*/issues\?' "$D/bin/gh.argv" 2>/dev/null | grep -vc 'labels=')"
+[ "${ur_pulls:-0}" -ge 1 ] && [ "${ur_open:-0}" -ge 1 ] \
+  && ok "unreadable-rows: an unreadable dispatched.txt still asks BOTH windows (unreadable is not empty)" \
+  || bad "unreadable-rows: ${ur_pulls:-0} PR / ${ur_open:-0} open request(s) with an unreadable dispatched.txt — the listings were skipped on a file the pass could not read"
+case "$OUT" in
+  *"the open-issue window is NOT requested"*) bad "unreadable-rows: the pass reported the window as deliberately not-requested for a blacklist it merely could not READ" ;;
+  *) ok "unreadable-rows: the skip is not claimed for an unreadable blacklist" ;;
+esac
 
 echo
 echo "  $PASS passed, $FAIL failed"

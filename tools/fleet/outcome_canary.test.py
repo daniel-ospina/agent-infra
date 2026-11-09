@@ -4204,6 +4204,35 @@ def test_an_unrecognised_or_timed_out_send_is_AMBIGUOUS_not_refused():
 
 
 @test
+def test_every_FATAL_pre_send_refusal_in_safe_send_is_REFUSED():
+    """The phrase list mirrors ANOTHER FILE's wording, so it drifts silently — and the drift is
+    permanent suppression, because rc 5 is not in the refused set (it also means
+    sent-but-unconfirmed): a reworded FATAL loses its only entry and is then suppressed on every
+    poll. #1957/#3836 reworded safe-send.sh's interpreter refusal from `no python3.12 found` to
+    `no python >= 3.12 found … NOTHING was sent` and did exactly that to the fleet's only controller
+    alert.
+
+    So this arm reads the REAL script and grades every pre-send FATAL line it finds, instead of
+    restating one wording here: a future reword reddens THIS test rather than silencing the canary.
+    """
+    m = load()
+    script = os.path.normpath(os.path.join(HERE, "..", "..", "scripts", "safe-send.sh"))
+    assert os.path.exists(script), (
+        "safe-send.sh is the producer this phrase list mirrors; a suite that cannot read it grades "
+        "nothing (%s)" % script)
+    with open(script) as fh:
+        fatal = re.findall(r'^\s*echo "(FATAL[^"]*)"', fh.read(), re.M)
+    assert fatal, ("no FATAL echo line extracted from %s — the EXTRACTION broke, so this arm would "
+                   "pass over nothing" % script)
+    for text in fatal:
+        verdict = m.classify_send(5, text)
+        assert verdict == "refused", (
+            "safe-send.sh's pre-send refusal %r (rc 5) classifies as %r. rc 5 is not in the refused "
+            "set, so ONLY a NOTHING_CONSUMED_PHRASES entry keeps it retryable; without one the alert "
+            "is AMBIGUOUS and suppressed forever" % (text, verdict))
+
+
+@test
 def test_the_sent_message_carries_the_respawn_evidence():
     """The documented wiring is launchd, where stdout is a log nobody reads: the MESSAGE is the only
     channel. The extras used to be composed AFTER the send, so `RESPAWN TOOK`/`DID NOT TAKE` reached
@@ -4554,6 +4583,15 @@ def test_source_never_contains_a_forbidden_launchctl_form():
 
 MUTATIONS = [
     # (label, old, new, paired test)
+    # ── #3836 F1: safe-send.sh's reworded pre-send refusal lost its phrase entry ──────────
+    # The mutant re-words the list entry instead of removing it, which is the SHAPE OF THE REAL
+    # DEFECT: #1957 reworded the PRODUCER (safe-send.sh) and left the CONSUMER's copy behind, and the
+    # paired leg reads the real script, so only a list entry that matches the shipped wording keeps it
+    # green. A drift in either direction reddens it.
+    ("the phrase list no longer matches safe-send.sh's reworded pre-send refusal (#3836 F1)",
+     '    "nothing was sent",          # rc 5 FATAL',
+     '    "nothing was transmitted",   # rc 5 FATAL',
+     "test_every_FATAL_pre_send_refusal_in_safe_send_is_REFUSED"),
     # ── the landing review's P1 (the spawn line drifted from its emitter) ─────────────────
     # Reverting to the pre-#2209 literal is the MEASURED defect: the disclosure makes the shipped
     # line unmatchable, `work_dispatched` abstains on every healthy cycle and NO_LANE_STARTED becomes

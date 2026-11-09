@@ -118,7 +118,45 @@ EXIT_PREREQ=6
 
 MODE=dry-run
 PREFLIGHT_ONLY=0
-REPO="${TORTOISE_REPO:-$HOME/eldato/tortoise}"
+# ⛔ REPO HAS NO PATH DEFAULT (agent-infra#1974). This line used to read
+# `REPO="${TORTOISE_REPO:-$HOME/eldato/tortoise}"` — ONE DEVELOPER'S HOME DIRECTORY, baked into a
+# pass every machine runs on a 6-hourly job. A default is only safe if it is TRUE ON EVERY MACHINE and
+# a home directory never is, so there is none: the value is DECLARED (the plist renders `--repo`
+# explicitly) or DERIVED from a candidate that proves itself, or the pass refuses.
+REPO="${REPO:-}"
+# ⛔ THE OPERATOR VARIABLE IS AN INPUT OF THE DERIVATION — OFFERED ALONE, NEVER AS A CO-EQUAL
+# CANDIDATE BESIDE THE CWD (fresh-context review of #3833, F2, and #3849 review round 1, where the
+# RECORDED review grades it P1: "### P1 — scripts/worktree-hygiene-sweep.sh:126 — $TORTOISE_REPO stops
+# being a *proven* candidate and becomes a *deciding* value, so resolve_repo's $OR identity proof no
+# longer applies to it" (quoted whole — a truncated quote closed as if complete is the class this
+# comment is apologising for). The independently-dispatched review of
+# the same head graded it P2; both name this one finding, and the round is named here because the
+# grade is not what carries it — the measurement below is).
+# WHY NOT BESIDE `$PWD` (F2): #1974 §1 names `$TORTOISE_REPO`/`$TORTOISE` as an INPUT, and before
+# #1974 it DECIDED (`REPO="${TORTOISE_REPO:-$HOME/eldato/tortoise}"`). Offering it as ONE candidate
+# beside `$PWD` demoted a value the box explicitly declares to a TIE, so a box that names its target
+# AND happens to stand in another checkout got rc 3 "2 candidate checkouts qualify" instead of its
+# declared target — a false block in a pass that can REMOVE worktrees. Measured at 0b34b28c6: rc=3,
+# while the base resolved to the declared checkout.
+# WHY NOT IN THE DECLARED CHANNEL (`REPO="${REPO:-${TORTOISE_REPO:-…}}"`, the first shape of this
+# fix): `resolve_repo` applies §1's SECOND proof — "its `origin` remote names exactly `$OR`" — ONLY
+# inside the candidate loop. A value moved up to `REPO` is checked by `rev-parse --show-toplevel`
+# alone, so a box that declares `$TORTOISE_REPO` and `$OR` would sweep a checkout of a DIFFERENT repo
+# (measured: with `OR=daniel-ospina/agent-infra` and `TORTOISE_REPO` naming a `tortoise` checkout,
+# the declared shape drove the tortoise checkout, while the candidate shape REFUSED it). #1974 §1
+# names this variable *inside* the proven derivation, so it stays there: the tie is what §1 does not
+# ask for, the proof is what it does.
+# ⛔ THE COST OF THAT CHOICE, STATED RATHER THAN HIDDEN: when the operator variable IS declared and
+# FAILS its proof, this pass now REFUSES instead of silently falling through to whatever directory
+# the operator stood in — which is the fail-closed direction §3's rule implies ("a DECLARED value is
+# never silently replaced"). Nothing else changes: `--repo` still bypasses the derivation (§3), the
+# armed plist still renders `--repo {{TORTOISE_REPO}}` explicitly, and with nothing declared the cwd
+# is offered exactly as before.
+# ⛔ ONE PATH PER LINE (`repo-slug.sh` reads the list with `read -r`, never word-splitting): a checkout
+# under a directory with a space in its name is ORDINARY in this repo, and a space-joined list split it
+# into two candidates that could never prove themselves (fresh-context review of #3833, F1).
+REPO_CANDIDATES="${TORTOISE_REPO:-${TORTOISE:-}}"
+[ -n "$REPO_CANDIDATES" ] || REPO_CANDIDATES="$PWD"
 ENGINE=""
 AGED_DAYS=7
 BACKUP_DIR="${HYGIENE_BACKUP_DIR:-$HOME/orchestrator/state/reaped-patches}"
@@ -140,7 +178,7 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --apply)      MODE=apply; shift ;;
         --dry-run)    MODE=dry-run; shift ;;
-        --repo)       REPO="${2:-}"; shift 2 ;;
+        --repo)       REPO="${2:-}"; REPO_CANDIDATES=""; shift 2 ;;
         --engine)     ENGINE="${2:-}"; shift 2 ;;
         --aged-days)  AGED_DAYS="${2:-}"; shift 2 ;;
         --backup-dir) BACKUP_DIR="${2:-}"; shift 2 ;;
@@ -157,6 +195,27 @@ case "$AGED_DAYS" in
     ''|*[!0-9]*) echo "worktree-hygiene: --aged-days must be a non-negative integer, got '$AGED_DAYS'" >&2
                  exit "$EXIT_USAGE" ;;
 esac
+
+# ⛔ THE TARGET CHECKOUT IS RESOLVED, NEVER INVENTED (agent-infra#1974 indicator (a)): ONE actionable
+# line on refusal, naming the value to set — instead of a pass that starts against a path nobody
+# chose. `repo-slug.sh` is located beside this script first, then the operator's `$AGENT_INFRA_PATH`,
+# and an entry counts only if it actually DEFINES `resolve_repo` (a stale copy must not shadow a good
+# one and leave the consolidation silently inert).
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+for _rsl in "$SCRIPT_DIR/orchestrator-harness/repo-slug.sh" "$SCRIPT_DIR/repo-slug.sh" \
+            "${AGENT_INFRA_PATH:-}/scripts/orchestrator-harness/repo-slug.sh"; do
+    [ -n "$_rsl" ] && [ -f "$_rsl" ] || continue
+    # shellcheck disable=SC1090
+    . "$_rsl" 2>/dev/null || continue
+    command -v resolve_repo >/dev/null 2>&1 && break
+    unset -f resolve_repo 2>/dev/null || true
+done
+if command -v resolve_repo >/dev/null 2>&1; then
+    REPO="$(resolve_repo)" || exit "$EXIT_USAGE"
+elif [ -z "$REPO" ]; then
+    echo "worktree-hygiene: REPO is unset and repo-slug.sh (the ONE resolver) was not found beside this script ($SCRIPT_DIR/orchestrator-harness, $SCRIPT_DIR) or in \$AGENT_INFRA_PATH — pass --repo <checkout>" >&2
+    exit "$EXIT_USAGE"
+fi
 
 [ -d "$REPO" ] || { echo "worktree-hygiene: repo not found: $REPO" >&2; exit "$EXIT_USAGE"; }
 git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1 || {

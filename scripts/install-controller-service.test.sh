@@ -3678,10 +3678,16 @@ PREF2_RC=0; PREF2_OUT="$(EXTRA_ENV="ORCH_SUPERVISOR=$SCRATCH_P/cloud-cell-superv
 # ⛔ AND THE HARNESS PIN IS A CANDIDATE, NOT JUST A REMEDY IN THE REFUSAL TEXT (review-8 P1, MEASURED). This is
 # the shape that killed a bring-up: the caller's preference is skipped (a lane-owner layer), and the box's only
 # durable supervisor is the harness pin — which the refusal text RECOMMENDS but the candidate list never
-# proposed. The other candidates cannot stand in for it on a fresh cell: `cloud-cell-supervisor.sh` is in no
-# pi-bootstrap array (this file's own refusal text says so, #1938), and `beside` is that same farmed directory.
-# So the install refused and `cloud-cell-bringup.sh` died at `check_controller_service` — a false block on a cell
-# that HAS a durable supervisor. `check_harness_pin` runs BEFORE `check_controller_service` in the bring-up, so
+# proposed. ⛔ THE OTHER TWO CANDIDATES' CASE NARROWS WITH THIS LANDING'S `fleet_srcs` ENTRY (#1938), and the old wording here said the
+# opposite: `cloud-cell-supervisor.sh` IS farmed flat by `setup.sh`'s `fleet_srcs`, so a correctly-installed box
+# DOES hold `$HOME/.pi/agent/scripts/cloud-cell-supervisor.sh`. ⛔ BUT THE FARMED CANDIDATE AND `beside` ARE NOT
+# SYNONYMS: `beside` is derived from the RUNNING script, so they collapse into one candidate only when the
+# installer is invoked from its FARMED path. This fixture runs the CHECKOUT copy (`INST=${INST:-$HERE/…}`), so
+# `beside` here is the repo's sibling — a distinct third candidate — and the arm passes because the PIN precedes
+# it, not because nothing else was left. What survives as a real case is the one the `rm -f` below builds: an
+# install predating that entry, or a removed farmed copy. So the pin
+# is the candidate that saves a bring-up on a cell that HAS a durable supervisor.
+# `check_harness_pin` runs BEFORE `check_controller_service` in the bring-up, so
 # the pin is always there by the time this question is asked.
 PREFC="$(arm_root prefc)"; mk_systemctl "$PREFC/bin" "$PREFC/state" "$PREFC/sc.log"; mk_tmux "$PREFC/bin" "$PREFC/tmux.log"
 rm -f "$(farmed_sup "$PREFC")"    # no farm — the fresh-cell shape the false block needed

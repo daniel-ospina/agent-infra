@@ -1,0 +1,21 @@
+name: fixture a step-only job whose sum this guard cannot compute
+on:
+  workflow_call:
+    inputs:
+      step_timeout:
+        type: number
+jobs:
+  expr-under:
+    # No job bound, and one step bound is a `${{ … }}` expression — the shape that made the
+    # reachability rule silently inapplicable. The numeric bounds are under the ceiling, so the job is
+    # accepted, but the guard must SAY that Σ could not be evaluated rather than certifying it silently.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        timeout-minutes: 100
+      - name: an unevaluable bound
+        timeout-minutes: ${{ inputs.step_timeout }}
+        run: echo hi
+      - name: another bounded step
+        timeout-minutes: 100
+        run: echo hi

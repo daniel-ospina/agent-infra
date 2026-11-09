@@ -459,11 +459,24 @@ fi
 # is not, and is farmed ahead of its caller (see below). No per-producer caller map is kept here on
 # purpose: every line-numbered edge this paragraph used to carry had already drifted (:238 -> :329 by
 # 2026-10-16), and the gate derives and pins the real edges on every run. Read the gate's
-# `DECLARED-*` / `SUMMARY:` lines, not this comment, for the current population. One producer it
-# cannot see is a NAMED residual, not a blank spot: `cloud-cell-supervisor.sh` is exec'd by the farmed
-# `cloud-cell-quiesce.sh` through a variable-held prefix, so it is in no array and a fresh farm gets the
-# consumer without it (the quiesce then falls back to `supervisor: <none found>`) — #1938 owns whether
-# it is delivered or stays cell-only.
+# `DECLARED-*` / `SUMMARY:` lines, not this comment, for the current population. `cloud-cell-supervisor.sh`
+# USED TO BE the one NAMED residual here: `cloud-cell-quiesce.sh` execs it through a variable-held
+# prefix, so the derivation could not see that edge, and a fresh farm got the consumer without it.
+# ⛔ THE DELIVERY RESIDUAL IS CLOSED BY THIS LANDING (#1938): the supervisor is FARMED below in
+# `fleet_srcs`, beside the `cloud-cell-quiesce.sh` that calls it. It reaches the derived population
+# through a DIFFERENT exec site — `install-controller-service.sh`'s `$(pwd)/cloud-cell-supervisor.sh` —
+# which is why pinning it works even though the quiesce leg stays invisible to the scan.
+# ⛔ AND THE QUIESCE'S OWN `<none found>` FALLBACK IS UNCHANGED BY THAT ENTRY — an earlier version of
+# this paragraph said it was "no longer the only outcome on a fresh farm", which was FALSE and
+# contradicted the correction recorded in the same series. `cloud-cell-quiesce.sh` tries
+# `$REPO/scripts/…`, `$O/…` and two `/tmp/…/scripts/…` paths — it never looks in `$DEST/scripts/`, and
+# nothing seeds the supervisor into `$O` (`cloud-cell-supervisor.sh`'s `seed_and_stamp` seeds from
+# `$HARNESS`, which holds `orchestrator-harness/`, not the supervisor). So on a farm-only box the
+# quiesce still prints `<none found — will start tmux directly>` in EVERY case, before and after this
+# PR. The residual is the quiesce's CANDIDATE LIST, and it is recorded in
+# `pi-bootstrap/tests/test-setup-no-nesting.sh`'s DECLARED RESIDUALS block. ⛔ Do not restate it here as
+# fixed: two files disagreeing about one outcome is the exact failure this file's own P3 paragraph
+# exists to stop.
 #
 # ⛔ ONE CONSTRAINT HERE IS NOT DERIVED AND MUST BE STATED: `pr-doctor.py` is listed BEFORE
 # `objective.py` (#1872). The driver imports the classifier by path and `SystemExit`s when it finds
@@ -656,12 +669,36 @@ fi
 # whose target does not resolve — so flattening the farm would leave both units unrunnable (exit 1,
 # nothing installed). The copy leg creates the parent directory for exactly this reason.
 # ⚠️ NOT because of `watchdog-loop.sh`'s `$SELF_DIR/../cloud-cell-supervisor.sh` fallback. An earlier
-# draft of this comment claimed the nesting preserved that sibling, and it was FALSE:
-# `cloud-cell-supervisor.sh` is in NO farm array (this file's own "named residual" paragraph above
-# says so and names #1938 as its owner), so the fallback resolves `$SELF_DIR/../cloud-cell-supervisor.sh`
-# to `$HOME/.pi/agent/scripts/cloud-cell-supervisor.sh` and finds nothing nested OR flat. A
-# justification nobody re-derived is how a false claim outlives the shape it described (review P2-G
-# of #3413). No line-numbered claim about any OTHER script belongs here for the same reason.
+# draft of this comment claimed the nesting preserved that sibling, and it was FALSE THEN:
+# `cloud-cell-supervisor.sh` was in NO farm array, so the fallback resolved
+# `$SELF_DIR/../cloud-cell-supervisor.sh` to `$HOME/.pi/agent/scripts/cloud-cell-supervisor.sh` and
+# found nothing nested OR flat. A justification nobody re-derived is how a false claim outlives the
+# shape it described (review P2-G of #3413). No line-numbered claim about any OTHER script belongs
+# here for the same reason.
+# ⛔ AND THAT FALLBACK NOW RESOLVES — stated PRECISELY, because the first version of this paragraph
+# over-claimed it. `watchdog-loop.sh` is farmed NESTED, so its `$SELF_DIR` is
+# `$DEST/scripts/orchestrator-harness` and `$SELF_DIR/../cloud-cell-supervisor.sh` is
+# `$DEST/scripts/cloud-cell-supervisor.sh` — the file `fleet_srcs` now writes. `[ -f ]` therefore
+# becomes true where it was false, and the cell arm's `if [ -n "$sup" ] && [ -f "$sup" ]` can now take
+# the `$sup start` branch (`RESTART_VERB="$sup start"`), a failure in which is reported as
+# `RESTART-FAILED` naming that verb — never `verb=unknown`.
+# ⛔ BUT NO SHIPPED CONSUMER REACHES THAT FALLBACK, so NO DEPLOYED WATCHDOG CHANGES BEHAVIOUR. The two
+# fallbacks are guarded by `[ -n "$sup" ] ||`, and the shipped systemd cell unit always sets the
+# variable that guard tests: `install-cell-timers.sh` defaults
+# `SUPERVISOR="${SUPERVISOR:-$INFRA_ROOT/scripts/cloud-cell-supervisor.sh}"` (the LAYER CHECKOUT, not
+# the farm), renders it into `templates/systemd/eldato-controller-watchdog.service` as
+# `Environment=SUPERVISOR={{SUPERVISOR}}`, and `cloud-cell-bringup.sh` passes no `SUPERVISOR` in its
+# env array — so that default is what every armed cell gets. On macOS the `com.eldato.controller-watchdog`
+# plist sets no `SUPERVISOR` either, but Darwin takes the `launchctl` arm, not this one. The arm becomes
+# live only for an invocation whose `SUPERVISOR` is UNSET: an ad-hoc/manual run, or a future installer
+# that stops hard-coding the checkout path.
+# ⚠️ AND ONE PRE-EXISTING FRAGILITY IS VISIBLE FROM HERE, not introduced here: because the guard is
+# `[ -n "$sup" ]` (non-empty) and not `[ -f "$sup" ]` (readable), a `SUPERVISOR` that NAMES a path the
+# cell cannot read SHORT-CIRCUITS both fallbacks — so when the layer checkout is reaped the arm still
+# refuses even though a farmed copy now exists. Changing that guard is a restart-path decision of its
+# own; it is recorded here, not taken, so nobody reads this farm entry as having fixed it.
+# The nesting is NOT justified by this fallback — the templates naming the nested path is the whole
+# reason, above.
 # agent-infra#2281 §1 adds pr-doctor-machine.sh: the MACHINE-scoped entry point the
 # `com.tortoise.pr-doctor` unit execs. Before it the unit asserted ONE repo in its argv
 # (`--repo daniel-ospina/tortoise`), so a box running two repos graded exactly one and the second
@@ -675,7 +712,7 @@ fi
 # unit whose every tick exits 127 while `list-timers` reads green. Before this line NEITHER was on a
 # cell, which is why a capability that had shipped, been tested and carried a header was scheduled on
 # zero boxes — the installer could not even find the thing it was meant to install.
-fleet_srcs=(fleet-cost-weekly.sh fleet-cost-report.sh fleet-schedule.py conflict-rebase.py conflict-rebase-timer.sh install-conflict-rebase-timer.sh watch-truncation.sh session-postmortem.sh pi-reap-idle.sh pi-task-session-prune.sh pi-cache-reap.sh pi-reap-orphans.sh pi-reap-worktrees.sh reap-lane-venvs.sh venv-real-cost.py reap-abandoned-worktrees.sh reap-duplicate-installs.sh reap-runner-work.sh disk-reaper.sh disk-reaper-run.sh install-disk-reaper-timer.sh harness-apply-pass.sh install-harness-apply-timer.sh install-runner-autoscale-timer.sh pi-reap-worktrees-launchd.py worktree-disk-probe.sh cleanup-stale-branches.sh ci_runner_gate.sh ask-owner.py beta-progress.py cadence-nudge.sh cadence-timer.sh child-check.py cloud-cell-quiesce.sh deploy-crossbox.sh deploy-mac-orchestrator.sh goal-state.py lane-actions.py lane-arm.sh install-lane-arm-timer.sh lane-guard.py lane-read.py lane-scan-fallback.sh lane-watchdog.py lane-wip.py live-workspaces-publisher.py merge-queue.py orch-send.sh orchestrator-heartbeat.sh orphan-reap.py pr-doctor-machine.sh pr-doctor.py objective.py probe-one.py publish-live-workspaces.py safe-send.sh seed-goal-map.py tree-cpu.py _bounce_state.py turn-classify.py turn-end.py unblock-lane.sh undelivered-answers.py worktree-hygiene-sweep.sh registry-sync.sh pr-repair-loop.sh install-repair-service.sh pr-doctor-trigger.py bg-rescue-wip.sh wip-sweep.sh objective-reminder.sh orchestrator-harness/worker-supply.sh orchestrator-harness/watchdog-loop.sh)
+fleet_srcs=(fleet-cost-weekly.sh fleet-cost-report.sh fleet-schedule.py conflict-rebase.py conflict-rebase-timer.sh install-conflict-rebase-timer.sh watch-truncation.sh session-postmortem.sh pi-reap-idle.sh pi-task-session-prune.sh pi-cache-reap.sh pi-reap-orphans.sh pi-reap-worktrees.sh reap-lane-venvs.sh venv-real-cost.py reap-abandoned-worktrees.sh reap-duplicate-installs.sh reap-runner-work.sh disk-reaper.sh disk-reaper-run.sh install-disk-reaper-timer.sh harness-apply-pass.sh install-harness-apply-timer.sh install-runner-autoscale-timer.sh pi-reap-worktrees-launchd.py worktree-disk-probe.sh cleanup-stale-branches.sh ci_runner_gate.sh ask-owner.py beta-progress.py cadence-nudge.sh cadence-timer.sh child-check.py cloud-cell-quiesce.sh install-controller-service.sh cloud-cell-supervisor.sh deploy-crossbox.sh deploy-mac-orchestrator.sh goal-state.py lane-actions.py lane-arm.sh install-lane-arm-timer.sh lane-guard.py lane-read.py lane-scan-fallback.sh lane-watchdog.py lane-wip.py live-workspaces-publisher.py merge-queue.py orch-send.sh orchestrator-heartbeat.sh orphan-reap.py pr-doctor-machine.sh pr-doctor.py objective.py probe-one.py publish-live-workspaces.py safe-send.sh seed-goal-map.py tree-cpu.py _bounce_state.py turn-classify.py turn-end.py unblock-lane.sh undelivered-answers.py worktree-hygiene-sweep.sh registry-sync.sh pr-repair-loop.sh install-repair-service.sh pr-doctor-trigger.py bg-rescue-wip.sh wip-sweep.sh objective-reminder.sh orchestrator-harness/worker-supply.sh orchestrator-harness/watchdog-loop.sh)
 mkdir -p "$DEST/scripts"
 fleet_copied=0
 for base in "${fleet_srcs[@]}"; do
@@ -713,7 +750,38 @@ done
 # down with it. Measured on #3486: `FAIL: install exited 1`, then `GUARD MISSING: …` × 6.
 # A `src` subdirectory with a flat `dest` is exactly what the installer's own reader models, so the
 # test's independent expectation stays a superset of this declaration with no change in semantics.
-mcp_harness_srcs=(lane_registry.py)
+#
+# ⛔ `cloud-cell-doctor.sh` BELONGS IN THIS ARRAY, and the array name is about the SOURCE DIR, not
+# about MCP: this is the repo's only src-one-down / dest-flat farm, and the doctor needs exactly that
+# (`scripts/orchestrator-harness/cloud-cell-doctor.sh` → `$DEST/scripts/cloud-cell-doctor.sh`). That
+# destination is the one `cloud-cell-supervisor.sh`'s `doctor_path()` resolves as
+# `$(dirname "$SUP_SELF")/cloud-cell-doctor.sh`, and the supervisor is farmed here FLAT — so without
+# this entry a fresh `$DEST/scripts` holds a supervisor whose every role `die`s "cloud-cell-doctor.sh
+# not found" (measured shape, #1552/#1899). It was EXEMPTED under #3530 when this array was believed
+# closed to it; the exemption claimed "no FARM_ARRAYS entry can carry it", which was false — the
+# installer loop below is content-agnostic, and `cell-install.sh:FARM_LAYOUT` already maps this array
+# to `scripts/orchestrator-harness → scripts`, so a cell gets it too. Measured 2026-11-07.
+# ⚠️ What farming flat does NOT carry is the doctor's OPTIONAL harness siblings (`lane-reap.sh`,
+# `rail-refusal.sh`, `repo-slug.sh`, `live-ownership.sh`), which it resolves from `$SELF_DIR` — still
+# absent on a farm-only box, where they degrade rather than die.
+# ⛔ THE CANDIDATE ORDER IS NOT "FARMED COPY LAST", and an earlier version of this comment said it
+# was. `doctor_path()`'s loop (`cloud-cell-supervisor.sh`) tries, in order: `$O/cloud-cell-doctor.sh`,
+# `$(dirname "$SUP_SELF")/orchestrator-harness/cloud-cell-doctor.sh`,
+# `$(dirname "$SUP_SELF")/cloud-cell-doctor.sh`, `${HARNESS:-}/scripts/orchestrator-harness/...`,
+# `${HARNESS_PIN_DIR:-}/scripts/orchestrator-harness/...`. `$(dirname "$SUP_SELF")` IS `$DEST/scripts`
+# for the farmed supervisor, so this entry lands THIRD OF FIVE — ahead of BOTH pinned-harness
+# candidates, not behind them.
+# ⚠️ THE ACCEPTED EFFECT, named rather than hidden: on an UNSEEDED cell (`$O` not yet populated) with
+# a pinned harness holding a different doctor, the farmed copy now WINS over the pinned one — it
+# SHADOWS it. That is acceptable here because (a) `$O`, the seed the provenance record describes,
+# still wins on a started cell, which is every merge/doctor run that matters; and (b) the flat copy is
+# rewritten by every `setup.sh` run, so divergence means the harness was updated without re-running
+# the installer — a state the farm is supposed to be the authority on. ⛔ This is therefore NOT a
+# reason to reorder `doctor_path()`: that order encodes #2306 (the pinned harness must be consulted at
+# all) and reordering it is a design change, not a comment fix.
+# Before this entry candidate 3 was simply ABSENT on a farm-only box, so nothing shadowed — and the
+# supervisor's every role `die`d.
+mcp_harness_srcs=(lane_registry.py cloud-cell-doctor.sh)
 for base in "${mcp_harness_srcs[@]}"; do
   farm_declared_rel+="scripts/$base"$'\n'
   f="$INFRA_ROOT/scripts/orchestrator-harness/$base"
@@ -787,7 +855,7 @@ echo "    scripts fleet farm: $fleet_copied copied (fleet cadence, #373 + runner
 # legacy volatile home) or `/home/cmux` as a default, so a farm that omitted this file would leave
 # every consumer on its named `$HOME` fallback — and, worse, would leave the RESOLVER absent while the
 # consumers that source it look healthy. Farm it with them.
-lib_srcs=(pid-identity.sh diff-normalize.py beat-pair.sh bounded.sh transcript-patterns.sh live-paths.sh cmux_payload.py repo-set.sh cell-home.sh)
+lib_srcs=(pid-identity.sh diff-normalize.py beat-pair.sh bounded.sh transcript-patterns.sh live-paths.sh cmux_payload.py repo-set.sh cmux-dispatch-path.sh cell-home.sh)
 mkdir -p "$DEST/scripts/lib"
 lib_copied=0
 lib_failed=0
@@ -978,7 +1046,27 @@ fi
 # land as its `../verify-admin-merge-evidence.sh` sibling — the shim resolves the verifier from
 # its own location and fails CLOSED without it, so shipping one without the other produces a gate
 # that refuses EVERY admin merge.
-merge_gate_srcs=(record-review.sh review-pr.sh gh-shim/gh verify-admin-merge-evidence.sh)
+#
+# ⛔ `admin-merge.sh` IS THE SAME RULE ONE LEVEL DEEPER, and an earlier head of the PR that farmed
+# it BROKE it: the rail resolves THREE helpers from `$SELF_DIR` and REFUSES when they are missing,
+# so landing the rail alone produces a rail that exits 1 immediately on a farm-only box.
+#   * `scripts/admin-merge.sh` `CFS="${ADMIN_MERGE_FAILURE_SET_SH:-$SELF_DIR/ci-failure-set.sh}"`,
+#     then `[ -x "$CFS" ] || [ -f "$CFS" ] || { say_err "admin-merge: parser not found at $CFS";
+#     exit 1; }` in `main()` — reached on EVERY invocation carrying a PR number;
+#   * `EXEMPTION_PY="$SELF_DIR/ci_exemption.py"`, refused by name when absent;
+#   * `bash "$SELF_DIR/ci-workflow-pr-evaluable.sh"` at three call sites.
+# `git grep` over `pi-bootstrap/` found NONE of the three in ANY farm array before this line, so the
+# doctor's last-resort rail (`cloud-cell-doctor.sh`, which resolves `admin-merge.sh` beside itself
+# and from `$CELL_HOME/.pi/agent/scripts/`) went from ABSENT to PRESENT-BUT-INERT — the #1552 class
+# still open for this one producer, just one level down. The trio is a COMPLETE closure, not a
+# guess: `ci-failure-set.sh` resolves only `ci_exemption.py` beside itself, and
+# `ci-workflow-pr-evaluable.sh` and `ci_exemption.py` resolve nothing further (`rg` for
+# `SELF_DIR|dirname.*BASH_SOURCE|__file__` returns no resolution site in either).
+# ⛔ AND THE DEPENDENCY IS NOT STATICALLY ATTRIBUTABLE, which is why the gate could not see it: the
+# call is spelled `"$BASH" "$CFS"`, not a producer-shaped command, so no consumer scan can find it.
+# A farm entry therefore has to be justified by reading the resolved consumer, exactly as this list
+# does for `gh-shim/gh` above.
+merge_gate_srcs=(record-review.sh review-pr.sh gh-shim/gh verify-admin-merge-evidence.sh admin-merge.sh ci-failure-set.sh ci_exemption.py ci-workflow-pr-evaluable.sh)
 # The hosted-graph FALLBACK half (graph-mcp-provision). The MCP entry in
 # templates/.mcp.base.json is the PRIMARY path; this script is what a lane can still use when
 # the MCP client is unavailable from inside the session (#10605: ${TORTOISE_MCP_API_KEY} expanded

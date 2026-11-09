@@ -582,6 +582,28 @@ repo_path_default_hits() {
       #   RESIDUAL: `&& REPO=/tmp/x` / `|| REPO="$AMBIENT"` — an assignment behind a separator — is not
       #   graded here. The RUNTIME is unaffected (`resolve_repo` refuses any value that is not a
       #   checkout), so what is lost is the coverage of the gate, not the safety of the box.
+      #   ⛔ RESIDUAL 2 — THE CANDIDATE CHANNEL, and do NOT read "the debt list is empty" as "nothing
+      #   invents a path" (fresh-context review of #3833). Since #1974 the shipped scripts offer the cwd
+      #   as a CANDIDATE via `REPO_CANDIDATES=<newline-delimited paths>`, which this arm does not examine
+      #   at all (it grades only lines matching `^REPO=`). A per-machine path planted there reds nothing
+      #   here. ⛔ AND IT IS NOT FAIL-CLOSED — an earlier version of this note claimed it was, and that
+      #   claim was MEASURED FALSE (fresh-context review of #3833, F1). With NO `$OR` declared, the
+      #   `resolve_repo` proof is only "this path is a git checkout", never "this box chose it", so a
+      #   planted candidate is ADOPTED on exactly the box that has that path — the #1974 defect
+      #   (`worktree-hygiene-sweep.sh` and one developer home directory) re-expressed in a channel this
+      #   arm does not read. Measured on the merged tree: with `REPO_CANDIDATES="/tmp/…/aaa"` planted
+      #   into `stale-worktrees.sh` and no `$OR` set, this gate returned rc 0 ("scanned 76 shipped
+      #   script(s)", no DIVERGENCE), and running that script from a DIFFERENT real checkout printed
+      #   `REPO is unset — using /tmp/…/aaa` and swept `aaa` (rc 0). ⛔ THE RESIDUAL IS NARROWER THAN IT
+      #   FIRST READS (#3849 review, P3): with `$OR` DECLARED the second proof applies, and the same
+      #   planted candidate IS rejected (measured: `OR=daniel-ospina/agent-infra` + a candidate whose
+      #   origin is the tortoise repo → the refusal, not adoption). So the hole is "boxes that declare no
+      #   queue target". The announcement on stderr is the only mitigation there, and `--execute` can
+      #   REMOVE worktrees, so the cost of the wrong directory is not zero. Grading the channel would
+      #   mean parsing a value whose whole point is to be a LIST, and the widening that was tried on the
+      #   matcher above (#3054) was measured reddening honest sites and reverted — this arm states that a
+      #   gate which refuses honest trees gets switched off, so the residual is named precisely rather
+      #   than half-implemented. Closing it is its own change, with its own arms.
       if (ln !~ /^REPO=/) next
       val = ln
       sub(/^REPO=/, "", val)                              # the value, without the assignment
@@ -646,12 +668,19 @@ repo_path_default_hits() {
     }
   ' "$@"
 }
-# The scripts that STILL carry a path default, kept NAMED so the debt is visible instead of the arm
-# being narrowed silently. Every entry is pre-existing and is somebody's separate fix; the arm PRINTS
-# them on every run (below) so an operator reads "2 scripts still default REPO", never "REPO is clean".
-# ⛔ Deleting an entry is what FIXING the file looks like; adding one is how this arm gets defeated, and
-# an entry whose file no longer carries a default is reported as stale.
-REPO_DEFAULT_KNOWN="cloud-cell-doctor.sh lane-container-reap.sh stale-main-triage.sh stale-worktrees.sh worktree-hygiene-sweep.sh"
+# The scripts that STILL carry a path default. ⛔ THE LIST IS NOW EMPTY AND THAT IS THE POINT
+# (agent-infra#1974): every entry it ever held was a shipped `REPO="${REPO:-<a path>}"`, and five of
+# them named a path that is wrong on every box but the one they were written on — a developer's home
+# directory, `/tmp/cell` (which exists nowhere), and `$PWD` (which under launchd is `/`, a real
+# directory that is not a repo). All five are fixed: `cloud-cell-doctor.sh`, `lane-container-reap.sh`,
+# `stale-main-triage.sh`, `stale-worktrees.sh`, `worktree-hygiene-sweep.sh` now resolve through
+# `repo-slug.sh`'s `resolve_repo` (environment → a candidate that PROVES it is a checkout → refuse).
+# ⛔ AN EMPTY LIST IS THE STRICTER STATE, NOT A DISARMED ONE: the arm below still scans every shipped
+# script, and ANY new `REPO=` path default now REDS the check instead of being excused by name. Adding
+# an entry back is how this arm would be defeated, so it is not a supported edit — fix the script.
+# An entry whose file no longer carries a default is reported as STALE, which is the note this empty
+# list exists to stop producing.
+REPO_DEFAULT_KNOWN=""
 # ⛔ THE POPULATION IS TWO DIRECTORIES, NOT ONE — and the second is not optional. Two of the three
 # offenders live in the repo's `scripts/` (`pi-reap-worktrees.sh`, `deploy-crossbox.sh`), so a scan of
 # this directory alone left this arm blind to the very file it was written for: measured, re-introducing

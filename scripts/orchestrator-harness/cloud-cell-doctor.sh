@@ -73,8 +73,33 @@ if [ -n "$CELL_HOME_LIB" ]; then . "$CELL_HOME_LIB"; CELL_HOME="$(cell_home_reso
 # incomplete-install case the resolver's header names, so it is the SAME refusal the five sibling
 # consumers already make (exit 78, EX_CONFIG) instead of a silent walk to `/`.
 [ -n "$CELL_HOME" ] || { printf '%s: FATAL: %s is not readable and neither CELL_HOME nor HOME is set — refusing to default the cell home (agent-infra#3453)\n' "${0##*/}" "${CELL_HOME_LIB:-lib/cell-home.sh}" >&2; exit 78; }
+# ⛔ DEFINED HERE, NOT ONLY INTERPOLATED (fresh-context review of #3833, F1 — measured). `require_repo`'s
+# two refusal lines name this file, and before this line existed the file never defined it: with
+# `set -uo pipefail` (line 55) the interpolation ABORTED the refusal with `ENV_FILE: unbound variable`
+# and rc 1 — on the exact case #1974 indicator (a) names (a box with REPO unset), instead of the
+# rc 3 cannot-verify and the one actionable line. It stayed invisible on a cell because the supervisor
+# passes ENV_FILE explicitly, and on a developer box because the variable was ambient in every shell.
+# The same default as the six siblings that own this variable (cloud-cell-supervisor.sh:150,
+# cloud-cell-bringup.sh:78, cloud-cell-quiesce.sh:24, pr-repair-loop.sh:154,
+# install-controller-service.sh:146, install-repair-service.sh:89).
+ENV_FILE="${ENV_FILE:-$CELL_HOME/keys.env}"
 O="${O:-$CELL_HOME/orchestrator}"
-REPO="${REPO:-/tmp/cell}"
+# ⛔ REPO HAS NO PATH DEFAULT (agent-infra#1974). This line used to read `REPO="${REPO:-/tmp/cell}"`
+# — a path that exists on NO machine — and it is the second of the two defaults #1974 was filed for.
+# A default is only safe if it is TRUE ON EVERY BOX; `/tmp/cell` never is. With it in force the
+# `merge` role's rail lookup resolved `/scripts/admin-merge.sh` and the `hygiene` role's worktree
+# enumeration ran `git -C /tmp/cell`, so both passes answered CANNOT-VERIFY about a directory the
+# operator never chose and nothing creates — a refusal that names the script's own placeholder as
+# though it were the operator's mistake.
+# The value is REQUIRED, and the roles that cannot work without a checkout refuse by name through
+# `require_repo` below (indicator (a) of #1974: ONE actionable line instead of a pass against an
+# absent path). `status` never calls it: it is the verb an operator runs to DISCOVER this, so it must
+# still answer on a box whose REPO was never set.
+# ⛔ AND THE DOCTOR DOES NOT DERIVE ONE. It is launched by cloud-cell-supervisor.sh, which passes
+# REPO explicitly from what the operator declared (`keys.env` on a cell, the plist on a Mac), and that
+# supervisor's `resolve_repo` owns the provisioning-candidate derivation — a second copy here is the
+# fork `check-single-source.sh` exists to refuse.
+REPO="${REPO:-}"
 OR="${OR:-}"
 SESSION="${SESSION:-orch}"
 SUPERVISOR="${DOCTOR_SUPERVISOR:-}"
@@ -374,6 +399,30 @@ log() {
 
 state_get() { # <role> <key>
   sed -n "s/^$2=//p" "$ROLES_DIR/$1.state" 2>/dev/null | head -1
+}
+
+# require_repo <role> — the ONE precondition for the roles that read the target checkout.
+# ⛔ ONE ACTIONABLE LINE, NOT A GUESS (agent-infra#1974 indicator (a)). The doctor used to answer this
+# by defaulting REPO to `/tmp/cell`, so a cell whose operator never declared one ran the pass against
+# a path that exists nowhere and reported the consequence ("the checkout /tmp/cell is missing") as
+# though the operator had chosen it. The refusal below names the value to set and, on a cell, the one
+# file it is set in — which is what the operator reading it needs, by construction, since they are
+# looking at a box where it was never set.
+# rc 3 = the read the pass needs could not be taken, which is the doctor's own "cannot-verify" and is
+# NEVER a pass (see the exit-code table at the top of this file).
+require_repo() {
+  local role="$1" why="" res=""
+  if [ -z "$REPO" ]; then
+    why="REPO is not set, so there is no checkout to read — set REPO=<the checkout this cell works> in $ENV_FILE (or export it before a hand run); the doctor has NO path default on purpose (agent-infra#1974)"
+    res="cannot-verify: no checkout (REPO unset)"
+  elif [ ! -d "$REPO" ]; then
+    why="REPO=$REPO does not exist on this box, so there is no checkout to read — set REPO to a checkout that exists, in $ENV_FILE (or export it before a hand run) (agent-infra#1974)"
+    res="cannot-verify: no checkout (REPO=$REPO does not exist)"
+  fi
+  [ -n "$why" ] || return 0
+  log "[$role] CANNOT-VERIFY: $why"
+  state_write "$role" 3 "$res"
+  return 3
 }
 
 # state_write <role> <rc> <result...> — last_pass_* / passes / last_rc / last_result.
@@ -1250,6 +1299,7 @@ run_merge() {
     log "[merge] CANNOT-VERIFY: \$OR is unset (the queue target is resolved by the supervisor)"
     state_write merge 3 "cannot-verify: OR unset"; return 3
   fi
+  require_repo "merge" || return $?
   rail="$(rail_path)" || {
     log "[merge] CANNOT-VERIFY: admin-merge.sh not found (looked beside the supervisor, $SELF_DIR, $REPO/scripts, $CELL_HOME/.pi/agent/scripts)"
     state_write merge 3 "cannot-verify: admin-merge.sh not found"; return 3
@@ -2270,6 +2320,7 @@ run_hygiene() {
   # see "POSITIONAL PARAMETERS: WHICH MAY BE ABSENT" before run_role_pass for the file-wide audit.
   local dry="${1:-}" before after mb rc wt mode out result="" h_rc=0 prev frag df_before df_after stop_reaper=0
   local dry="${1:-}" before after mb rc wt mode out result="" h_rc=0 prev frag df_before df_after stop_reaper=0 reason
+  require_repo "hygiene" || return $?
   # ⛔ THE PASS-LEVEL `df` READ COMES FIRST, and the delta printed at the END is the ONLY savings this
   # role may claim. Not a `du` sum (see the section header), and not docker's own "Total reclaimed"
   # line — that is a different instrument reporting on a different question.
@@ -3122,7 +3173,7 @@ run_status() {
 #     state_write(role, rc), state_write_rehearsal(role, own), lock_claim(d, tmp), reclaim_lock(d),
 #     role_lock(role), role_unlock(role), bounded(s), run_bounded(s), pid_ident(pid),
 #     human_above(pid), attestation_clean(pr, head), role_row(role, bound), run_role_pass(role),
-#     controller_heartbeat_verdict(who).
+#     require_repo(role), controller_heartbeat_verdict(who).
 #     * who (controller_heartbeat_verdict) — it NAMES what is up (`tmux '<session>'`, `the
 #       controller (service-managed)`) in the line the operator reads. An empty default would print a
 #       diagnosis that names nobody — `⛔ CONTROLLER STALE:  is up but …` — so the read stays fatal
@@ -3140,6 +3191,9 @@ run_status() {
 #       so this read must never acquire a default.
 #     * run_role_pass's role — "" would fall to the `*)` arm's `unknown role ""`; not bare-dispatched
 #       anywhere, so it stays fatal.
+#     * require_repo's role — it is the label the refusal is LOGGED AND RECORDED under; a pass
+#       recorded against NO role is a verdict nothing can read, so an absent role is the caller's bug
+#       (`run_merge`/`run_hygiene` both pass their own name literally).
 #   EMBEDDING — an ANNOTATION, never an exemption (review P2): a value that embeds the positional —
 #   `tmp="$1/.own.tmp.$$"`, `d="$ROLES_DIR/.$1.lock"` — is GRADED on the read (`bare` above, hence
 #   `lock_claim`'s `tmp` and `role_unlock`'s `d` are on the REQUIRED list) and merely ANNOTATED as

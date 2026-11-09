@@ -584,6 +584,28 @@ task(prompt='[VGATE] verify files: <list staged files>. Classification: <UI|back
 # them in the prompt exactly as the gate named them.
 ```
 
+**⛔ THE ORDER IS PART OF THE CEREMONY (agent-infra#2087).** A `PASS` merges ONLY files that
+this worktree root's *recorded blocked set* or its *current staged diff* already contains —
+those two sets are the anchor that stops a full-repo-scan PASS from blessing arbitrary files.
+So the scope must EXIST before the verifier runs, and "verify first, then commit/push" — the
+order one naturally reads the raw instruction as — records **0 of N files**: the PASS is
+discarded, the retry is refused with the identical text, and re-dispatching the same verifier
+repeats it (`zero-merge-pass`). The order that works:
+
+1. **Stage the change** (`git add <files>`) — or, for a `push`/`gh pr` op, simply attempt it
+   once: the refusal IS what records the push range. Nothing to stage on a push, **except** the
+   documented first-push fallback (a push with no usable base — a fresh `git init` first push, or
+   any range-probe failure — keeps the staged-index scope, so that shape stages like a commit).
+2. **Dispatch the verifier** naming the files the block printed.
+3. **Retry the git operation.**
+
+Measured 2026-11-04: `stage → verify → commit`, `block → verify → retry`, and (the headline shape,
+`push` of an already-made commit) `refused push → verify → retry` all converge in one cycle;
+`verify → stage → commit` is refused (fail-closed, deliberately — seeding the scope from the
+branch's unpushed diff was considered in #2087 and rejected as an anchor weakening).
+The block message prints this order, and the `zero-merge-pass` remedy now names ordering as the
+cause instead of blaming the verifier.
+
 **Format requirements (CRITICAL):**
 - Prompt MUST say `verify files:` (plural) — `verify file:` (singular) will silently fail
 - Response MUST include `PASS` on its own line, OR valid JSON: `{"status": "PASS", "failures": [], "verified_files": [{"path": "...", "hash": "..."}]}`
@@ -663,7 +685,7 @@ push remote's `main`. No config ⇒ no narrowing (fail closed).
 | `empty-content` / `no-text` / `unparseable` | Verifier response was not parseable | Response must contain `PASS` on its own line OR exact JSON `{"status":"PASS","failures":[],"verified_files":[…]}`; prompt must say `verify files:` (PLURAL) with the repo-relative paths from the block message |
 | `fail-open-refused` | Unparseable response in a task sub-agent — fail-open merge refused (#285) | Files were NOT recorded; re-dispatch a verifier that returns PASS/JSON per above |
 | `fail-verdict` | Verifier judged the files NOT ready | Do NOT re-dispatch blindly — address the failures the verifier listed, fix the files, then re-dispatch |
-| `zero-merge-pass` | Verifier PASSed but nothing matched the block/diff scope | Re-dispatch naming the EXACT blocked files printed in the block message |
+| `zero-merge-pass` | Verifier PASSed but **0 files merged** — the PASS was dispatched before any block/staging existed, so it had no scope to attach to (a SEQUENCING state, not a verifier defect) | Fix the ORDER, not the file list: stage the change (`git add <files>`) — or, for a push, let the refusal record the range — THEN re-dispatch naming the EXACT blocked files printed in the block message |
 | Hash mismatch remedy line | Verifier-recorded hash ≠ disk | Either the file changed after verification OR the verifier mis-transcribed the hash — **never hand-type sha256**: run `sha256sum <file>` and re-dispatch the exact hash. For a **symlink** that command is wrong — `sha256sum` FOLLOWS the link (and errors on a directory link) while the gate hashes the raw LINK TARGET bytes (git's mode-120000 blob), so use the buffer form: `node -e 'const f=require("fs"),c=require("crypto");console.log(c.createHash("sha256").update(f.readlinkSync(process.argv[1],{encoding:"buffer"})).digest("hex"))' -- <path>` (#1092) |
 
 **Threshold semantics (#561):** `dispatchStreak` counts only dispatch-FORMAT failures (empty/no-text/unparseable/refused) and escalates MESSAGING at 3 — it never disables or bypasses anything. The gate NEVER auto-disables for task sub-agents (#285). FAIL verdicts and zero-merge PASSes are successful dispatches (#132) — they add a remedy line but do not move the streak. Any successful merge resets the streak. In an interactive session only, 3 consecutive format failures still auto-disable the gate (unchanged), now recorded to the audit log.

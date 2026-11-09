@@ -6,13 +6,20 @@
 // a realpath STRING EQUALITY. That is correct only where the guard and the
 // scripts live in ONE tree. pi's deployment does not guarantee that:
 // on a copy-deployed box (this cell) the module root is `~/.pi/agent`, whose
-// `scripts/` is a PARTIAL copy that does not contain `admin-merge.sh` (#2176),
+// `scripts/` was a PARTIAL copy that did not contain `admin-merge.sh` (#2176),
 // while the rail's real home is `$AGENT_INFRA_PATH/scripts/admin-merge.sh`. So
 // the comparison compared
 //     /tmp/cell-ai/scripts/admin-merge.sh      (executed)
-//   ≠ /tmp/cell-home/.pi/agent/scripts/admin-merge.sh   (does not exist)
+//   ≠ /tmp/cell-home/.pi/agent/scripts/admin-merge.sh   (did not exist)
 // and the rail — the chokepoint that computes the failing set before an `--admin`
 // merge — was REFUSED from every hub-rooted session (#2332, measured 2026-10-22).
+// ⛔ `(did not exist)` is HISTORICAL: as of #3531 the rail is a `merge_gate_srcs`
+// member and IS farmed flat to `$DEST/scripts/admin-merge.sh`, so the fixture below
+// builds the PRE-#3531 shape deliberately. The identity property this file pins is
+// unchanged — the exemption must key on bytes, not on the spelling — and the fixture
+// stays valid because a farm can be older than the module that reads it. What changes
+// is only which real box the shape describes: today it is an un-refreshed farm, not
+// the normal copy-deployed one.
 //
 // WHAT IS ASSERTED. Exempt iff (a) the file IS at a sanctioned relpath inside a
 // framework checkout AND (b) its bytes ARE the audited bytes pinned in

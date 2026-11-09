@@ -1,0 +1,7 @@
+name: fixture caller-broken-callee — a call job naming a local workflow that does not exist
+on:
+  pull_request:
+jobs:
+  calls-missing:
+    # Named as its own violation so it cannot degrade into `loadJobs`' unreadable-path refusal.
+    uses: ./.github/workflows/nope.yml

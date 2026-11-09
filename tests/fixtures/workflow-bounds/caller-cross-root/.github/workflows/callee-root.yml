@@ -1,0 +1,10 @@
+name: fixture caller-cross-root — the root lane, whose callee a TEMPLATE caller names
+on:
+  pull_request:
+jobs:
+  root-job:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: work
+        run: echo hi

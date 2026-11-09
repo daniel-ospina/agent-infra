@@ -394,6 +394,12 @@ check_fleet_srcs_farmed() {
 #       a file from ANOTHER checkout — `session-postmortem.sh:27` (eldato's `scripts/`) and
 #       `safe-send.sh:146` (tortoise's `tools/cmux_dispatch.py`), which is WHY this form is
 #       directory-agnostic. The farm cannot deliver these, so they are DISCLOSED, never silently absorbed.
+#       ⛔ BOTH live instances have now LEFT this class by being FIXED, not by the form narrowing: #1921
+#       vendored the postmortem producer as a `lib:` sibling, and #1957 replaced `safe-send.sh`'s single
+#       absolute literal with an ordered CANDIDATE LIST (`scripts/lib/cmux-dispatch-path.sh`) whose first
+#       entry is the FARM DESTINATION — so the derivation now reports `script:cmux_dispatch.py`
+#       (undelivered here, disclosed with an owner) instead of a `foreign:` path one box happens to have.
+#       The form stays: the class can reappear in any farmed consumer, and a path DOCUMENTED counts.
 #
 # ⛔ ONE CLASSIFIER, NOT SIX. Every form whose match is a BARE RELATIVE NAME funnels it through
 # `_producer_kind` (F4, F4b, F4c, F5, F7, F8), so `lib/<n>` means `lib:` and `<sub>/<n>` means `other:` in all
@@ -410,12 +416,18 @@ check_fleet_srcs_farmed() {
 # ⚠️ DECLARED RESIDUALS of the extraction — do not describe these as covered:
 #   ⛔ THE FIRST ONE HAS A LIVE MEMBER ON THIS TREE, so none of them is hypothetical:
 #     `scripts/cloud-cell-quiesce.sh` (farmed) locates `cloud-cell-supervisor.sh` by trying
-#     `"$REPO/scripts/…"`, `"$O/…"` and a `/tmp/<repo>/scripts/…` path — a variable-held prefix and a
-#     cross-repo path, i.e. residual (1) and residual (4) at once. That producer is in NO farm array, so
-#     a fresh farm gets the consumer without it and the quiesce degrades to
-#     `supervisor: <none found — will start tmux directly>`. #1938 owns whether it is delivered or stays
-#     cell-only; until it is dispositioned, the `0 undelivered-and-undisclosed` line is a statement about
-#     the DECLARED SURFACE, not a claim about the farm.
+#     `"$REPO/scripts/…"`, `"$O/…"` and two `/tmp/<repo>/scripts/…` paths — a variable-held prefix and
+#     a cross-repo path, i.e. residual (1) and residual (4) at once.
+#     ⛔ THE DELIVERY HALF IS NO LONGER THE PROBLEM, AND THE REASON MOVED. `cloud-cell-supervisor.sh`
+#     IS farmed by this landing (`fleet_srcs`, #1938), so a fresh farm DOES receive it at
+#     `$DEST/scripts/cloud-cell-supervisor.sh`. What still fails is the quiesce's OWN CANDIDATE LIST:
+#     it never looks in `$DEST/scripts/`, so on a farm-only box with no clone it still prints
+#     `supervisor: <none found — will start tmux directly>` and falls back to `tmux kill-server`.
+#     ⛔ That is the residual now, recorded rather than papered over. Adding `$DEST/scripts` to that
+#     list is NOT done here: it changes what the quiesce will EXEC on a box where both a clone and a
+#     farm exist, which is a behaviour decision of its own, not a side effect of a farm entry.
+#     (The degradation is safe — the unbudgeted `tmux kill-server` still sweeps — which is why this
+#     can stay a recorded residual rather than a blocker.)
 #   (1) a path PREFIX held in a variable set elsewhere (`X="$HOME/foo"; "$X/scripts/y.sh"`),
 #   (2) a producer reached through a registry/plugin table,
 #   (3) a `..`-relative join that is not `../scripts/` (e.g. the python `os.path.join(here, "..",
@@ -447,19 +459,35 @@ LANE_PRODUCERS_STATE_RESIDUAL="lane-confirm.py:#1797 lane-triage.py:#1553 lane-v
 # was replaced by a one-line "not found" note, on every box but the owner's (#1921) — #1921 VENDORED
 # that producer as `scripts/lib/transcript-patterns.sh` and the consumer now resolves it as a SIBLING,
 # so the site is gone and with it the `foreign:postmortem.sh` entry: the producer is `lib:` now, not
-# foreign. `safe-send.sh:146` runs a CROSS-CHECKOUT `…/tortoise/tools/cmux_dispatch.py` — and this
+# foreign. `safe-send.sh:146` ran a CROSS-CHECKOUT `…/tortoise/tools/cmux_dispatch.py` — and this
 # class's first form required the
 # parent directory to be `scripts/`, so that one was invisible while the line above claimed the class was
-# complete: the widening is #1957's, and it is why the form is directory-agnostic now.
-LANE_PRODUCERS_FOREIGN_RESIDUAL="cmux_dispatch.py:#1957 orch-loop.sh:#2413"
+# complete: the widening is #1899's (PR #1958), and it is why the form is directory-agnostic now.
+# ⛔ #1957 then REMOVED that site — the second member to leave this class by being FIXED: the consumer
+# resolves the producer from an ordered candidate list (`scripts/lib/cmux-dispatch-path.sh`) whose first
+# entry is the FARM DESTINATION, so the derivation reports `script:cmux_dispatch.py` (delivered by no
+# array HERE, disclosed in `LANE_PRODUCERS_EXEMPT` with #1957 — the same disposition `ai_pr_status.py`
+# has, because this repo does not contain the file and no array can carry it). A missing producer is now
+# REFUSED with the full list of paths tried, in place of running an interpreter against a literal that
+# only one box happened to have.
+LANE_PRODUCERS_FOREIGN_RESIDUAL="orch-loop.sh:#2413"
 # `orch-loop.sh` joined this class on 2026-11-06 with agent-infra#2413 (PR #3413). It is NOT a delivered
 # producer and NOT a farm gap this PR can close: the entry comes from `watchdog-loop.sh`'s own MEASURED
 # example of where the controller lives on a Mac — `bash /home/cmux/harness/<sha>/scripts/
 # orchestrator-harness/orch-loop.sh` — which the derivation reads as a cross-checkout exec site. That
 # path is rendered by the harness deploy (`install.sh`'s `HARNESS_PIN_DIR`), not by any `fleet_srcs`
-# entry, so this farm can never carry it; #1938 is where whether the harness entry points are ever
-# farmed is decided. The site only becomes VISIBLE here because this PR is what first farms
-# `orchestrator-harness/watchdog-loop.sh` — before it, the consumer was outside the scanned population.
+# entry, so this farm can never carry it. ⛔ NO ISSUE TRACKS *WHETHER* the pinned harness entry points should
+# ever be farmed — that question is undecided — and the earlier pointer here was WRONG: it named #1938,
+# which is the SUPERVISOR-delivery residual this PR closes on merge and which never covered `orch-loop.sh`
+# — a reader following it landed on an issue about a different file. The DISCLOSURE itself is owned, by the
+# `LANE_PRODUCERS_FOREIGN_RESIDUAL` value two lines up: `orch-loop.sh:#2413` (the class was widened for it
+# on 2026-11-06, PR #3413), and the gate's own remedy names that owner — so do not read the sentence below
+# as claiming this entry is unowned; it is owned, and only the FARMING question is open.
+# The disclosure stands on its own as the record: `orch-loop.sh` is a `foreign:` producer (another
+# checkout), delimited by `LANE_PRODUCERS_FOREIGN_RESIDUAL` above, and whether the pinned harness entry
+# points are ever farmed is undecided rather than owned. The site only becomes VISIBLE here because
+# this PR is what first farms `orchestrator-harness/watchdog-loop.sh` — before it, the consumer was
+# outside the scanned population.
 # DISCLOSED with an owner, which the gate's own remedy names, instead of left as an undelivered
 # producer that only shows up on a fresh box.
 # ⚠️ DELIVERABLE producers still withheld from every farm array, both owned by #1553 and unchanged
@@ -492,7 +520,21 @@ LANE_PRODUCERS_FOREIGN_RESIDUAL="cmux_dispatch.py:#1957 orch-loop.sh:#2413"
 # undeclared entry here would grow the `DELIVERED BY NOTHING` set by two names while the PR reported
 # itself clean (measured: this landing adds exactly `script:install-ci-runner-x64.sh` and
 # `script:runner_autoscale.py` to it).
-LANE_PRODUCERS_EXEMPT="lane-status.py:#1553 heartbeat-loop.sh:#1553 install-ci-runner-x64.sh:#2403 runner_autoscale.py:#2403 repo-target.sh:#3174 ai_pr_status.py:#2413"
+# `cloud-cell-doctor.sh` was EXEMPTED HERE on 2026-11-06 (#3530) and is now DELIVERED instead — the
+# exemption is GONE because its stated reason was false. It read "it does not exist at
+# `scripts/cloud-cell-doctor.sh` at all … whose file list is not one of FARM_ARRAYS": but
+# `mcp_harness_srcs` IS in `FARM_ARRAYS` below, and it is precisely the src-one-down / dest-flat array
+# that writes `$INFRA_ROOT/scripts/orchestrator-harness/<base>` to `$DEST/scripts/<base>` — exactly
+# the path `cloud-cell-supervisor.sh`'s `doctor_path()` resolves as
+# `$(dirname "$SUP_SELF")/cloud-cell-doctor.sh` (:4530), and `run_role` `die`s without it (:4550).
+# The doctor is now a member of that array, so it arrives beside the farmed supervisor.
+# ⛔ THE FALSE BLOCK THIS REMOVED is why it matters and must not come back: the `script)` disposition
+# branch below enumerated FOUR flat arrays and not `mcp_harness_srcs`, so farming the doctor and
+# dropping this exemption went RED — `DELIVERED BY NOTHING: cloud-cell-doctor.sh` — over a file
+# `setup.sh` then delivers. That was the in-file "natural remedy for a false block is to widen the
+# exemption list, i.e. to weaken the gate" hazard firing for real. The branch now consults every flat
+# array `FARM_ARRAYS` names.
+LANE_PRODUCERS_EXEMPT="lane-status.py:#1553 heartbeat-loop.sh:#1553 install-ci-runner-x64.sh:#2403 runner_autoscale.py:#2403 repo-target.sh:#3174 ai_pr_status.py:#2413 cmux_dispatch.py:#1957"
 # A ROOT of the derivation rather than a producer found by it: `heartbeat-loop.sh` is run by a launchd job
 # on the owner's box (no plist template in this repo names it; the label `com.tortoise.heartbeat-loop`
 # appears only in a comment at scripts/lane-status.py:41) and NO farmed consumer execs it (measured at
@@ -512,13 +554,83 @@ LAUNCHD_ENTRY_PRODUCERS="heartbeat-loop.sh"
 # entry list exists to pin), and (b) `pi-bootstrap/cell-install.sh`'s own `lane_srcs`/`FARM_LAYOUT`,
 # which is a DIFFERENT installer with its own destination layout. A producer exec'd only from one of
 # those is not in this population; extending here means teaching `farm_source_dir` that destination.
-FARM_ARRAYS="fleet_srcs merge_gate_srcs fleet_tools lane_root_srcs lib_srcs graph_srcs"
+FARM_ARRAYS="fleet_srcs merge_gate_srcs fleet_tools lane_root_srcs lib_srcs graph_srcs mcp_harness_srcs"
 farm_source_dir() { # <array-name> -> the repo dir its entries are read from
   case "$1" in
     lib_srcs)    printf 'scripts/lib' ;;
     fleet_tools) printf 'tools/fleet' ;;
+    # #3486 farms `lane_registry.py` FLAT into `$DEST/scripts/` from the harness subdirectory, so its
+    # SOURCE dir is one down even though its destination is not — the reason it is its own array and
+    # not a `fleet_srcs` member (that array resolves every source as `$INFRA_ROOT/scripts/$base`).
+    # `cloud-cell-doctor.sh` rides the same array and the same src-one-down / dest-flat shape, which is
+    # the destination `cloud-cell-supervisor.sh`'s `doctor_path()` resolves beside itself.
+    # ⛔ THIS ARM IS PROBED, not merely asserted: PROBE_CLOSURE declares an `mcp_harness_srcs` root whose
+    # source lives at `scripts/orchestrator-harness/` and which execs a producer. Delete this arm and
+    # that root resolves to `scripts/mcp-root.py` (absent) → skipped → its producer silently leaves the
+    # population → the closure comparison names it. Without that probe the arm was UNFALSIFIABLE: the
+    # only live entry (`lane_registry.py`) execs nothing, so no mutation of this diff could redden it
+    # (#3442 rule 3, the inert-assertion class).
+    mcp_harness_srcs) printf 'scripts/orchestrator-harness' ;;
     *)           printf 'scripts' ;;
   esac
+}
+# The DESTINATION KIND a farm array writes into — the other half of the fact `farm_source_dir` carries,
+# and the one the delivery ladder needs. Read BY NAME from `FARM_ARRAYS` (see `delivered_flat`), so a
+# new flat array is consulted the moment it joins the list — which the root-set floor below already
+# requires of every array setup.sh declares.
+# ⛔ EACH KIND IS READ OFF setup.sh's OWN COPY-LOOP DESTINATION, not guessed and NOT cited by line
+# number: `flat` is `dest="$DEST/scripts/$base"`, `lib` is `dest="$DEST/scripts/lib/$base"`, `fleet`
+# is `dest="$DEST/scripts/fleet/$base"`. The arrays are named here rather than the lines because the
+# lines DRIFT on every rebase — an earlier head of this comment cited `:647/:692/:959/:1001/:760/:852`
+# and ALL SIX were stale within one base move, which is the same defect class as a stale pin (a
+# comment a next lane quotes as authority must still be true). Re-derive with
+# `grep -n '<array>=(\|dest="$DEST/scripts' pi-bootstrap/setup.sh` if a line is ever needed.
+# ⛔ EVERY ARRAY IN `FARM_ARRAYS` IS NAMED BELOW, and `unknown` is the default. The previous version
+# defaulted to `flat`, which was a FALSE PASS in the one direction this gate exists to refuse: an
+# array added to `FARM_ARRAYS` that writes a SUBDIRECTORY (`$DEST/scripts/lib/<n>`) was unknown here,
+# read as `flat`, and therefore CREDITED with delivering `<n>` where `$DEST/scripts/<n>` does not
+# exist — a `script:<n>` producer reading DELIVERED over nothing. The comment above it claimed the
+# default was fail-CLOSED ("false-BLOCKS loudly … instead of reading as delivered"); it was inverted.
+# Two independent guards now make the promise true, and neither relies on the default being lucky:
+# `delivered_flat` credits ONLY `flat` (so `unknown` can never be a false PASS), and
+# `check_farm_dest_kinds` below FAILS LOUDLY naming every `unknown` member (so an unmapped array
+# cannot be silently skipped either). Probe: `dest-kind-probe`.
+# ⛔ A PROBE SEAM, and it is EMPTY in every real run. It exists because the ladder probe needs a
+# SYNTHETIC flat array, and a probe that adds its own name to the map above would be testing the MAP
+# instead of the ladder — the exact hand-list circularity the ladder probe was written to break. The
+# seam can only ever supply a KIND for a name the probe itself passed; it cannot add a name to any
+# list, so a `delivered_flat` reverted to a fixed list still reddens `ladder-probe` (that list would
+# not contain `zz_flat_srcs` at all). (`cap_int_seam` is the same shape, for the same reason.)
+FARM_DEST_KIND_SEAM=""
+farm_dest_kind() { # <array-name> -> flat | lib | fleet | unknown
+  local a="$1"
+  if [ -n "$FARM_DEST_KIND_SEAM" ]; then
+    case " $FARM_DEST_KIND_SEAM " in *" $a "*) printf 'flat'; return 0 ;; esac
+  fi
+  case "$a" in
+    fleet_srcs|merge_gate_srcs|lane_root_srcs|graph_srcs|mcp_harness_srcs) printf 'flat' ;;
+    lib_srcs)    printf 'lib' ;;
+    fleet_tools) printf 'fleet' ;;
+    *)           printf 'unknown' ;;
+  esac
+}
+# THE DEST-KIND FLOOR: every member of `FARM_ARRAYS` must have a KNOWN destination kind. `delivered_flat`
+# refusing an `unknown` kind keeps it from being a false PASS, but on its own it would make an unmapped
+# array read as `DELIVERED BY NOTHING` — a false BLOCK over a file setup.sh really writes. So the
+# unmapped array is NAMED and FAILED here instead, which is the "fail-closed loudly" the comment has
+# always promised. Mirrors `check_farm_arrays`: the same `_DEST_KIND_RAN` sentinel proves the wiring,
+# and `dest-kind-probe` proves each direction on a synthetic tree.
+check_farm_dest_kinds() { # <label>
+  _DEST_KIND_RAN=1  # proof-of-wiring sentinel: asserted at the end of the #1899 block (see there)
+  local label="$1" a miss=""
+  for a in $FARM_ARRAYS; do
+    [ "$(farm_dest_kind "$a")" = unknown ] && miss="$miss $a"
+  done
+  if [ -n "$miss" ]; then
+    fail "$label: farm array(s) in FARM_ARRAYS with NO destination kind in farm_dest_kind:$miss — an unknown kind is credited with nothing by delivered_flat and skipped silently, so its producers read DELIVERED BY NOTHING over files setup.sh writes; add each array to farm_dest_kind (flat|lib|fleet) (#1899)"
+    return
+  fi
+  echo "ok: $label every FARM_ARRAYS member has a known destination kind ($(printf '%s\n' $FARM_ARRAYS | grep -c .) mapped) (#1899)"
 }
 # The arrays setup.sh actually declares (a destination-agnostic floor for the list above).
 declared_farm_arrays() { # <repo-root>
@@ -550,33 +662,96 @@ check_farm_arrays() { # <repo-root> <label>
 # green over a population that shrank — which is exactly the #1899 defect.
 # Format: `kind:name`, kind ∈ script | lib | state | foreign | other.
 LANE_PRODUCERS_CANONICAL="
-script:ask-owner.py script:ai_pr_status.py script:beta-progress.py script:cadence-nudge.sh script:disk-reaper-run.sh
-script:disk-reaper.sh script:fleet-cost-report.sh script:goal-state.py script:harness-apply-pass.sh
-script:install-ci-runner-x64.sh script:heartbeat-loop.sh script:lane-actions.py script:lane-guard.py script:lane-scan-fallback.sh
-script:lane-status.py script:lane-watchdog.py script:merge-queue.py script:objective.py
-script:orchestrator-heartbeat.sh script:pi-reap-worktrees-launchd.py script:pi-reap-worktrees.sh
+script:admin-merge.sh script:ai_pr_status.py script:ask-owner.py script:beta-progress.py
+script:bg-rescue-wip.sh script:cadence-nudge.sh script:cloud-cell-doctor.sh script:cloud-cell-supervisor.sh
+script:conflict-rebase-timer.sh script:conflict-rebase.py script:disk-reaper-run.sh script:disk-reaper.sh
+script:fleet-cost-report.sh script:fleet-schedule.py script:goal-state.py script:harness-apply-pass.sh
+script:heartbeat-loop.sh script:install-ci-runner-x64.sh script:install-controller-service.sh
+script:lane-actions.py script:lane-guard.py script:lane-scan-fallback.sh script:lane-status.py
+script:lane-watchdog.py script:merge-queue.py script:objective.py script:orchestrator-heartbeat.sh
+script:pi-cache-reap.sh script:pi-reap-worktrees-launchd.py script:pi-reap-worktrees.sh
 script:pr-doctor-trigger.py script:pr-doctor.py script:pr-repair-loop.sh script:publish-live-workspaces.py
-script:record-review.sh script:repo-target.sh script:runner_autoscale.py script:session-postmortem.sh script:tortoise_graph_client.py
-script:turn-classify.py
-script:turn-end.py script:undelivered-answers.py script:venv-real-cost.py script:watch-truncation.sh
-script:wip-sweep.sh script:bg-rescue-wip.sh
-lib:beat-pair.sh lib:bounded.sh lib:cmux_payload.py lib:diff-normalize.py lib:live-paths.sh
+script:reap-lane-venvs.sh script:record-review.sh script:registry-sync.sh script:repo-target.sh
+script:runner_autoscale.py script:session-postmortem.sh script:tortoise_graph_client.py
+script:turn-classify.py script:turn-end.py script:undelivered-answers.py script:venv-real-cost.py
+script:watch-truncation.sh script:wip-sweep.sh
+lib:beat-pair.sh lib:bounded.sh lib:cmux-dispatch-path.sh lib:cmux_payload.py lib:diff-normalize.py lib:live-paths.sh
 lib:pid-identity.sh lib:transcript-patterns.sh
 state:lane-confirm.py state:lane-triage.py state:lane-verdict.py
-foreign:cmux_dispatch.py foreign:orch-loop.sh
-other:orchestrator-harness/brief-gate.sh other:orchestrator-harness/capacity.sh"
-# `script:ai_pr_status.py` joined on 2026-11-04 with agent-infra#2413 (PR #3413), and it is a DISCLOSED
-# GAP rather than a delivery. Not a farm change: `objective-reminder.sh` became a FARMED consumer for
-# the first time in that PR (its template used to exec the checkout, which launchd cannot read under
-# TCC — the 126s the PR is about), so the derivation now sees its exec site. The producer is a
-# hardcoded default at `scripts/objective-reminder.sh:100` (TRIAGE_CMD defaults to
-# `$HOME/.pi/agent/scripts/ai_pr_status.py`) and NO ARRAY HERE CAN CARRY IT: `scripts/ai_pr_status.py`
-# does not exist in this repo, and the consumer's own row at `:75-76` says so ("it is NOT shipped by
-# this repo"). The consumer also guards it twice — `[ -f "$TRIAGE_CMD" ]` and `command -v python3`
-# (`:152-153`) — so a farm WITHOUT it loses an optional triage line, never delivery. That makes
-# `LANE_PRODUCERS_EXEMPT` the remedy the gate's own message names ("if no array can carry it"), owned
-# by #2413, whose subject is the objective-reminder's delivery leg. It cannot outlive its reason: the
-# stale-disclosure check FAILS the moment the exec site moves or the producer is delivered.
+script:cmux_dispatch.py foreign:orch-loop.sh
+other:orchestrator-harness/brief-gate.sh other:orchestrator-harness/capacity.sh
+other:orchestrator-harness/cloud-cell-doctor.sh
+"
+# RE-CUT 2026-11-07 (computed by `--cut`, never hand-typed): NINE PIN LINES added, NONE removed,
+# covering EIGHT distinct files — the doctor appears twice, as `script:cloud-cell-doctor.sh` (the flat
+# `$DEST/scripts/` location) and as `other:orchestrator-harness/cloud-cell-doctor.sh` (the $O payload).
+# `admin-merge.sh`, `cloud-cell-doctor.sh`×2, `cloud-cell-supervisor.sh`,
+# `install-controller-service.sh`, `fleet-schedule.py`, `pi-cache-reap.sh`, `reap-lane-venvs.sh`,
+# `registry-sync.sh`.
+#
+# FOUR of the eight were `DELIVERED BY NOTHING` — the #1552 shape the same run names: a fresh
+# `$DEST/scripts` gets a farmed consumer WITHOUT the executable it calls. Verified against the CODE,
+# not the diff (#1899):
+#   · `cloud-cell-quiesce.sh` (fleet_srcs) resolves and EXECs the supervisor — the candidate
+#     `for c in "$REPO/scripts/cloud-cell-supervisor.sh" …` loop (:44-49, through its `done`) sets `SW`,
+#     and the exec is `[ -n "$SW" ] && bash "$SW" stop` (:139). ⛔ The loop and the exec are 90 lines
+#     apart; an earlier version of this bullet cited `:44-55` for both, which covered the loop plus
+#     unrelated comment text and never reached the exec — the claim was right and the citation was not.
+#     That is the defect this file's P3 rule removes, stated further down in this same block: cite the
+#     FUNCTION and let `grep -n` find the line, rather than a number that a base move can strand.
+#   · `cloud-cell-supervisor.sh` execs `cloud-cell-doctor.sh` — `doctor_path()` (:4530) and
+#     `die "cloud-cell-doctor.sh not found …"` (:4550) — and names `install-controller-service.sh
+#     --install` as its own repair (:3654, :4264).
+#   · `cloud-cell-doctor.sh` execs the rail: `${SUPERVISOR:+$(dirname "$SUPERVISOR")/admin-merge.sh}`
+#     (:1153) and `$CELL_HOME/.pi/agent/scripts/admin-merge.sh` (:1157).
+# So all four are FARMED rather than exempt, each into the FLAT array whose destination its consumer
+# resolves:
+#   · `cloud-cell-supervisor.sh` + `install-controller-service.sh` → `fleet_srcs` (destination
+#     `$DEST/scripts/`, beside the `cloud-cell-quiesce.sh` that calls them);
+#   · `cloud-cell-doctor.sh` → `mcp_harness_srcs`, the src-one-down / dest-flat array
+#     (`scripts/orchestrator-harness/` → `$DEST/scripts/`) — exactly what `doctor_path()` resolves as
+#     `$(dirname "$SUP_SELF")/cloud-cell-doctor.sh` beside the farmed supervisor. It was EXEMPTED
+#     under #3530 on the claim that no farm array could carry it; that claim was false (the array's
+#     loop is content-agnostic and `cell-install.sh:FARM_LAYOUT` already maps it), and the exemption
+#     is DELETED — it would now read STALE;
+#   · `admin-merge.sh` → `merge_gate_srcs` (flat `$DEST/scripts/`). Its independent corroboration is
+#     `record-review.sh`'s always-review-the-full-surface list, which carries `scripts/admin-merge.sh`
+#     BY NAME (`review_full_surface_path`) — ⛔ NOT "beside `verify-admin-merge-evidence.sh`":
+#     that string does not occur in `record-review.sh` at all (`grep -c` = 0), and the pair shares no
+#     list. The rail is genuinely exec'd by a farmed consumer, which is what justifies the farm entry.
+#     (No line number here on purpose — an earlier version of this block cited `:719` and the real
+#     line had moved to `:729`, which is the very defect this file's P3 fix removes. Cite the
+#     function and let `grep -n admin-merge.sh scripts/record-review.sh` find it.)
+#     ⛔ THAT SAME LIST IS THE CORROBORATION FOR THE RAIL'S HELPER TRIO: it names
+#     `scripts/ci-failure-set.sh` and, two comments below it, "Rail-exec'd decision modules:
+#     `admin-merge.sh` execs BOTH of these" — `ci_exemption.py` and `ci-workflow-pr-evaluable.sh`.
+#     So `record-review.sh` ALREADY graded all three as rail-owning files; `merge_gate_srcs` was the
+#     only list that had not caught up, which is why the rail was farmed without them.
+# The remaining FOUR were already DELIVERED and are a pure re-pin: `fleet-schedule.py`,
+# `pi-cache-reap.sh`, `reap-lane-venvs.sh`, `registry-sync.sh` (all members of `fleet_srcs`).
+# The closure already scanned the three cell scripts as producers, so farming them adds no new
+# producers — it only DELIVERS the ones the adjacent consumer calls.
+#
+# RE-CUT 2026-11-09 (computed by `--cut`, never hand-typed): TWO entries added, NONE removed —
+# `script:conflict-rebase-timer.sh` and `script:conflict-rebase.py`. Neither is this PR's producer:
+# they arrive from `main` (agent-infra#2698 / #3760, `9ff6cf0bc`), which added BOTH to
+# `pi-bootstrap/setup.sh`'s `fleet_srcs` — and that entry is what makes each exec site below
+# resolvable from a farm, so the derivation sees them for the first time. The re-cut happened at this
+# PR's REBASE onto that main, and the ORDER of the literal above changed with it because `--cut`
+# regenerates the whole block from the DERIVED population; the set-diff against the pre-rebase pin is
+# exactly `{added: the two names, removed: none}`, and that diff is the review artifact.
+# Verified against the CODE, not the diff (#1899):
+#   · `conflict-rebase-timer.sh` — the rendered unit's `ExecStart=/bin/bash {{TIMER}} start --once`
+#     (templates/systemd/eldato-conflict-rebase.service) is fed by `install-conflict-rebase-timer.sh`'s
+#     candidate loop, whose second entry is `${HOME}/.pi/agent/scripts/conflict-rebase-timer.sh` — the
+#     F3 agent-dir form, i.e. THIS array's destination, so the scan can follow it;
+#   · `conflict-rebase.py` — its `$SELF_DIR` sibling in that wrapper:
+#     `BOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/conflict-rebase.py"`.
+# Both are DELIVERED by the same `fleet_srcs` entry that put the wrapper on the box (setup.sh states
+# the reason in its own comment: farming the wrapper without the bot installs a unit whose every tick
+# exits 127 while `list-timers` reads green), so this is a re-pin of the derived population, NOT a
+# `LANE_PRODUCERS_EXEMPT` entry — an exemption would claim a deliverable producer is withheld.
+#
 # `script:harness-apply-pass.sh` joined on 2026-10-23 (PR #2427): the harness-apply timer's unit and
 # its plist exec the pass (`install-harness-apply-timer.sh` renders both from templates/), so it is a
 # producer a farmed consumer EXECS. It is DELIVERED — `pi-bootstrap/setup.sh`'s `fleet_srcs` farms it,
@@ -620,7 +795,15 @@ other:orchestrator-harness/brief-gate.sh other:orchestrator-harness/capacity.sh"
 #
 # `lib:transcript-patterns.sh` joined on 2026-10-17 (#1921) and `foreign:postmortem.sh` LEFT in the
 # same landing, which is the derivation doing its job: the exec site did not vanish, it CHANGED KIND —
-# the consumer now execs a sibling that `lib_srcs` farms, and the old foreign reference is gone. A
+# the consumer now execs a sibling that `lib_srcs` farms, and the old foreign reference is gone.
+# ⛔ THE SAME THING HAPPENED AGAIN IN #1957, and it is the reason `script:cmux_dispatch.py` is here and
+# `foreign:cmux_dispatch.py` is not: `scripts/safe-send.sh` stopped naming one checkout's absolute path
+# and now resolves the producer from an ordered candidate list in `scripts/lib/cmux-dispatch-path.sh`
+# (a new `lib:` entry, DELIVERED by `lib_srcs`) whose FIRST candidate is the farm destination. So the
+# derivation sees the producer at `$DEST/scripts/cmux_dispatch.py` — a place a delivery CAN arrive, and
+# one this repo cannot fill (the file is tortoise's) — which is exactly the `LANE_PRODUCERS_EXEMPT`
+# disposition `ai_pr_status.py` already has. ⛔ It is NOT a delivery and NOT a re-pin: nothing here farms
+# it, and the consumer refuses loudly (naming every path it tried) when no candidate exists.
 # agent-infra#1874 (the lane-table dispatcher's retirement) removed FIVE entries in one landing, and
 # each was verified against the CODE rather than accepted from the diff — the pin's own warning:
 #   * `script:queue-dispatch.py` — the file MOVED to `scripts/orchestrator-harness/retired/`; it is
@@ -661,6 +844,30 @@ farm_declares() { # <array-name> <entry> [<repo-root>|<setup.sh>] -> 0 when the 
   fi
   [ -n "$line" ] || return 1
   printf '%s\n' "$line" | tr -s ' ' '\n' | sed '/^$/d' | grep -Fxq -- "$entry"
+}
+# Is <entry> delivered FLAT into `$DEST/scripts/` by ANY array in `FARM_ARRAYS`? The ladder the `script)`
+# disposition branch consults — a FUNCTION so it is probeable on a synthetic tree, and DRIVEN BY
+# `FARM_ARRAYS` so that "a future flat array cannot reintroduce the gap" is a property of the CODE.
+# ⛔ IT WAS A HAND LIST OF FIVE NAMES until the 2026-11-07 review of this PR: correct on that day and
+# silently wrong the day a sixth flat array landed (exactly the false block that made the
+# `cloud-cell-doctor.sh` exemption look necessary). A comment promising enumeration while the code
+# hand-lists is the class the next lane quotes back as authority.
+# ⛔ PROBED, not merely asserted: `ladder-probe` below declares `zz_flat_srcs`, a name NO hand list
+# could contain, and asserts a member of it is delivered. Replace this loop with any fixed list and
+# that probe reddens.
+# ⛔ AND THE KIND TEST IS AN ALLOW-LIST ON PURPOSE (`= flat`, not `!= lib`): an array whose kind
+# `farm_dest_kind` does not know is `unknown` and is credited with NOTHING here. With the old
+# `* -> flat` default, a NEW subdir-dest array read as flat-delivered — a `<n>` reported DELIVERED at
+# `$DEST/scripts/<n>` that setup.sh actually writes to `$DEST/scripts/lib/<n>` — i.e. a false PASS.
+# The matching loud half is `check_farm_dest_kinds`, so the array is NAMED rather than silently
+# skipped; both directions are probed by `dest-kind-probe`.
+delivered_flat() { # <entry> <repo-root>
+  local entry="$1" root="${2:-$ROOT}" a
+  for a in $FARM_ARRAYS; do
+    [ "$(farm_dest_kind "$a")" = flat ] || continue
+    farm_declares "$a" "$entry" "$root" && return 0
+  done
+  return 1
 }
 # A repo-relative path as a population entry.
 producer_kind_of() { # <scripts/... path>
@@ -775,9 +982,14 @@ _producer_scan() { # <file> -> "<kind>:<name>" lines
     | sed -E 's|^\$\{?[A-Z_]+\}?/||' | while IFS= read -r line; do _producer_kind "$line" state; done
   # F6 — an ABSOLUTE path OUTSIDE the agent dir: another checkout's file. ANY directory, not just `scripts/`:
   # the first version of this form hardcoded `<…>/scripts/<n>` and therefore could not see
-  # `scripts/safe-send.sh:146`, which runs `…/tortoise/tools/cmux_dispatch.py` — a producer in a DIFFERENT
+  # `scripts/safe-send.sh:146`, which ran `…/tortoise/tools/cmux_dispatch.py` — a producer in a DIFFERENT
   # checkout, in no farm array, undisclosed, while the gate printed `DECLARED-FOREIGN: … 1` as if that were the
   # whole class (#1957). A cross-checkout `tools/`, `bin/` or `lib/` is the same failure as `scripts/`.
+  # ⛔ NO LIVE SITE USES THIS FORM TODAY (#1957 removed the last one — safe-send.sh now resolves the
+  # producer from a candidate list, so the entry it contributes is `script:cmux_dispatch.py` at the FARM
+  # DESTINATION). It is KEPT for the same reason F8 is: the class can reappear in any farmed consumer, and
+  # a scanner that had to be re-widened to see it would report `0 undelivered-and-undisclosed` meanwhile —
+  # #1899's own failure shape. Its probe below (`foreign:orch-loop.sh`) keeps it non-inert.
   # BOTH agent dirs are excluded — F3 owns `agent/scripts/<n>` and `agent/state/<p>`, so the state producer
   # (`lane-confirm.py`, orchestrator-heartbeat.sh:336) does not also surface here as a duplicate `foreign:`.
   { grep -ohE '/(Users|home)/[A-Za-z0-9_./-]+/[A-Za-z0-9_-]+\.(py|sh)' "$f" 2>/dev/null || true; } \
@@ -929,9 +1141,19 @@ check_producer_farm_declared() { # <label> <derived-population>
       script)
         # Every FLAT array counts: `lane_root_srcs` is absent on this tree until #1553 (the membership
         # branch simply goes false), and `merge_gate_srcs` also lands in `$DEST/scripts/`.
-        if farm_declares fleet_srcs "$name" "$root" || farm_declares lane_root_srcs "$name" "$root" \
-           || farm_declares merge_gate_srcs "$name" "$root" \
-           || farm_declares graph_srcs "$name" "$root"; then
+        # ⛔ `mcp_harness_srcs` is a FLAT destination too, and omitting it was a FALSE BLOCK, not a
+        # conservative default: it copies `scripts/orchestrator-harness/<base>` to `$DEST/scripts/<base>`
+        # (`setup.sh`, the loop under `mcp_harness_srcs=`), so a producer it delivers IS at the flat
+        # `agent/scripts/<n>` location every other arm here is testing for. Before this arm existed the
+        # gate refused the CORRECT remedy for `cloud-cell-doctor.sh` — farm it, drop the #3530
+        # exemption — with `DELIVERED BY NOTHING`, over a file `setup.sh` then wrote; the documented
+        # remedy for a false block is to widen the exemption list, i.e. to WEAKEN the gate.
+        # ⛔ The arrays are enumerated BY NAME from `FARM_ARRAYS` (`delivered_flat`), NOT re-listed here.
+        # A hand list would make the guarantee manual: the root-set floor above refuses an array that
+        # setup.sh declares and `FARM_ARRAYS` omits, but it knows nothing about THIS ladder, so a sixth
+        # flat array in both places would pass the floor, pass the derivation, and still read
+        # `DELIVERED BY NOTHING` over a file setup.sh then writes. `ladder-probe` proves the enumeration.
+        if delivered_flat "$name" "$root"; then
           delivered=$((delivered+1)); continue
         fi
         # The fleet directory IS a real deployed location (`setup.sh` mkdirs `$DEST/scripts/fleet/`), so
@@ -1189,9 +1411,9 @@ fi
 # and must REPORT an entrypoint handed to it, from a synthetic tree so the probe cannot drift with the
 # real repo.
 PROBE_CLOSURE="$TMP/producer-closure"
-mkdir -p "$PROBE_CLOSURE/scripts" "$PROBE_CLOSURE/scripts/lib" "$PROBE_CLOSURE/pi-bootstrap" \
-  "$PROBE_CLOSURE/tools/fleet"
-printf 'fleet_srcs=(root.sh)\nlib_srcs=(lib-root.sh)\nmerge_gate_srcs=()\nfleet_tools=(tool-fleet.py)\n' > "$PROBE_CLOSURE/pi-bootstrap/setup.sh"
+mkdir -p "$PROBE_CLOSURE/scripts" "$PROBE_CLOSURE/scripts/lib" "$PROBE_CLOSURE/scripts/orchestrator-harness" \
+  "$PROBE_CLOSURE/pi-bootstrap" "$PROBE_CLOSURE/tools/fleet"
+printf 'fleet_srcs=(root.sh)\nlib_srcs=(lib-root.sh)\nmerge_gate_srcs=()\nfleet_tools=(tool-fleet.py)\nmcp_harness_srcs=(mcp-root.py)\n' > "$PROBE_CLOSURE/pi-bootstrap/setup.sh"
 printf '#!/bin/bash\nY=$(/usr/bin/python3 "$SCRIPTS/hop1.py")\n' > "$PROBE_CLOSURE/scripts/root.sh"
 printf '#!/bin/bash\nZ=$(/usr/bin/python3 "$SCRIPTS/hop2.py")\n' > "$PROBE_CLOSURE/scripts/hop1.py"
 # A subdirectory dest (`$SCRIPTS/fleet/<n>`) must be followed to its REAL source dir (`tools/fleet/`),
@@ -1205,6 +1427,13 @@ printf '#!/bin/bash\nF=$(/usr/bin/python3 "$SCRIPTS/hop-fleet.py")\n' > "$PROBE_
 # site is the proof — with the arm wrong the root is never found, `hop4.py` silently leaves the
 # population, and the set comparison stays green because it compares two sets that agree.
 printf '#!/bin/bash\nL4=$(/usr/bin/python3 "$SCRIPTS/hop4.py")\n' > "$PROBE_CLOSURE/scripts/lib/lib-root.sh"
+# An `mcp_harness_srcs` ROOT — the SAME proof for the src-one-down / dest-flat arm (`scripts/
+# orchestrator-harness/` → `$DEST/scripts/`). Its live entry (`lane_registry.py`) execs nothing, so
+# without this root deleting the arm reddens NOTHING: `scripts/lane_registry.py` does not exist and the
+# `[ -f ]` guard skips it silently. That is #3442 rule 3 exactly — an assertion whose value cannot vary
+# under any mutation of the diff. With this root, deleting the arm resolves `mcp-root.py` under
+# `scripts/` (absent) and `hop-mcp.py` leaves the population, which the comparison NAMES.
+printf '#!/bin/bash\nMC=$(/usr/bin/python3 "$SCRIPTS/hop-mcp.py")\n' > "$PROBE_CLOSURE/scripts/orchestrator-harness/mcp-root.py"
 printf '#!/bin/bash\nS=$(/usr/bin/python3 "$SCRIPTS/lib/shared.sh")\n' > "$PROBE_CLOSURE/scripts/entry.sh"
 # SAME BASENAME, DIFFERENT FILE: `entry3.sh` execs `lib/entry3.sh`. The self-edge filter must keep it —
 # a basename-blind filter drops it, the closure never enqueues `scripts/lib/entry3.sh`, and `hop5.py`
@@ -1218,11 +1447,11 @@ printf '#!/bin/bash\nS2=$(/usr/bin/python3 "$SCRIPTS/hop3.py")\n' > "$PROBE_CLOS
 closure_want="$(printf '%s\n' \
   lib:entry3.sh lib:shared.sh other:fleet/other-tool.py script:entry.sh script:entry2.sh \
   script:entry3.sh script:hop-deep.py \
-  script:hop-fleet.py script:hop1.py script:hop2.py script:hop3.py script:hop4.py \
+  script:hop-fleet.py script:hop-mcp.py script:hop1.py script:hop2.py script:hop3.py script:hop4.py \
   script:hop5.py state:lane-x.py | sort)"
 closure_got="$(derive_lane_producers "$PROBE_CLOSURE" scripts/entry.sh scripts/entry2.sh scripts/entry3.sh | sort -u)"
 if [ "$closure_got" = "$closure_want" ]; then
-  echo "ok: the producer closure is TRANSITIVE, follows a subdir dest to its real source dir, reads each root from its own dir, keeps a SAME-BASENAME substrate that is a different file, and reports EVERY entrypoint (5 hops + 3 entrypoints) (#1899)"
+  echo "ok: the producer closure is TRANSITIVE, follows a subdir dest to its real source dir, reads each root from its own dir (fleet_tools, lib_srcs AND the src-one-down mcp_harness_srcs), keeps a SAME-BASENAME substrate that is a different file, and reports EVERY entrypoint (6 hops + 3 entrypoints) (#1899)"
 else
   fail "the producer closure is not transitive — got:$(printf '\n  %s' $closure_got | tr '\n' '|') want:$(printf '\n  %s' $closure_want | tr '\n' '|') (#1899)"
 fi
@@ -1235,6 +1464,68 @@ if [ "$(producer_probe check_farm_arrays "$PROBE_FLOOR" "floor-probe")" -gt 0 ];
   echo "ok: a farm array the derivation does NOT read trips the root-set floor (#1899)"
 else
   fail "an unread farm array did NOT trip the root-set floor — an unscanned array means invisible producers (#1899)"
+fi
+# DELIVERY-LADDER PROBE — the `script)` branch must consult `FARM_ARRAYS` BY NAME, never a hand list.
+# A fixed list can only be as right as the day it was typed; this probe declares an array
+# (`zz_flat_srcs`) that NO list in this file contains, adds it to `FARM_ARRAYS` the way setup.sh
+# requires, and asserts a member of it is delivered. Two controls keep the green meaningful: an array
+# absent from `FARM_ARRAYS` is NOT consulted (so the first assertion is about the enumeration and not
+# about "everything reads delivered"), and a `lib_srcs` member is NOT flat (it lands at
+# `$DEST/scripts/lib/<n>`, so calling `script:<n>` delivered would be a false PASS of exactly the
+# kind the missing `mcp_harness_srcs` arm produced in the other direction).
+# ⛔ `zz_flat_srcs`'s DESTINATION KIND comes from `FARM_DEST_KIND_SEAM`, not from the map above: the
+# probe must not edit the map it is testing against (see the seam's own comment). Everything else in
+# this probe — the membership in `FARM_ARRAYS`, the entry name, the delivered answer — is the real
+# code path.
+PROBE_LADDER="$TMP/producer-ladder"
+mkdir -p "$PROBE_LADDER/pi-bootstrap"
+printf 'fleet_srcs=(flat-x.sh)\nlib_srcs=(lib-x.sh)\nmerge_gate_srcs=()\ngraph_srcs=()\nmcp_harness_srcs=()\nzz_flat_srcs=(zz-flat-producer.sh)\n' > "$PROBE_LADDER/pi-bootstrap/setup.sh"
+if ( FARM_ARRAYS="$FARM_ARRAYS zz_flat_srcs" FARM_DEST_KIND_SEAM="zz_flat_srcs"; delivered_flat zz-flat-producer.sh "$PROBE_LADDER" ); then
+  echo "ok: the delivery ladder enumerates FARM_ARRAYS BY NAME — a flat array no hand list names still delivers its producer (#1899)"
+else
+  fail "the delivery ladder does not consult FARM_ARRAYS by name — a sixth flat array reads DELIVERED BY NOTHING over a file setup.sh writes, i.e. the false block whose documented remedy weakens the gate (#1899)"
+fi
+# The control is a SINGLE-VARIABLE one: the seam still says `zz_flat_srcs` is flat, so the only
+# difference from the assertion above is membership in `FARM_ARRAYS`. Without the seam this would
+# also be testing the kind map, and a green would say less than it appears to.
+if ( FARM_DEST_KIND_SEAM="zz_flat_srcs"; delivered_flat zz-flat-producer.sh "$PROBE_LADDER" ); then
+  fail "the delivery ladder delivers from an array FARM_ARRAYS does NOT name — the root-set floor is the only thing enforcing membership, so a member of an unread array reads as delivered (#1899)"
+else
+  echo "ok: an array absent from FARM_ARRAYS is NOT consulted (positive control for the ladder probe) (#1899)"
+fi
+if ( delivered_flat lib-x.sh "$PROBE_LADDER" ); then
+  fail "the delivery ladder reports a lib_srcs member as FLAT-delivered — it lands at \$DEST/scripts/lib/<n>, so a script:<n> consumer still finds nothing, which is a false PASS (#1899)"
+else
+  echo "ok: a lib_srcs member is NOT flat-delivered (farm_dest_kind is consulted, not bypassed) (#1899)"
+fi
+# DEST-KIND PROBE — the two directions the `farm_dest_kind` default must get right, asserted on a
+# SYNTHETIC tree because the live tree cannot express either one: today every `FARM_ARRAYS` member is
+# mapped, so no real array can exercise the unknown arm and a bug in it would be invisible (#3442
+# rule 3). `zz_subdir_srcs` writes `$DEST/scripts/lib/`, i.e. a SUBDIRECTORY destination — the shape
+# the old `* -> flat` default mis-graded.
+#   1. NO FALSE PASS: `delivered_flat` must NOT credit an unknown-kind array's member as flat, or a
+#      `script:<n>` consumer reads DELIVERED over `$DEST/scripts/<n>` that nothing writes.
+#   2. NO SILENT SKIP: `check_farm_dest_kinds` must FAIL LOUDLY naming the array, or the honest
+#      remedy for that false block would be to widen another list (i.e. weaken the gate).
+#   3. POSITIVE CONTROL: the REAL `FARM_ARRAYS` passes the floor. Without it a `check_farm_dest_kinds`
+#      that failed unconditionally would satisfy (2) and redden every run.
+PROBE_DESTKIND="$TMP/producer-destkind"
+mkdir -p "$PROBE_DESTKIND/pi-bootstrap"
+printf 'fleet_srcs=(flat-x.sh)\nzz_subdir_srcs=(subdir-producer.sh)\n' > "$PROBE_DESTKIND/pi-bootstrap/setup.sh"
+if ( FARM_ARRAYS="$FARM_ARRAYS zz_subdir_srcs"; delivered_flat subdir-producer.sh "$PROBE_DESTKIND" ); then
+  fail "the delivery ladder credits an UNKNOWN-destination array as flat — a <n> written to \$DEST/scripts/lib/<n> is reported DELIVERED at \$DEST/scripts/<n>, which is the false PASS the fail-closed default was supposed to prevent (#1899)"
+else
+  echo "ok: a member of an array with an UNKNOWN destination kind is NOT credited as flat-delivered (no false PASS) (#1899)"
+fi
+if ( FARM_ARRAYS="$FARM_ARRAYS zz_subdir_srcs"; producer_probe check_farm_dest_kinds "dest-kind-probe" ) | grep -q '^0$'; then
+  fail "an array in FARM_ARRAYS with NO destination kind did NOT trip the dest-kind floor — it is silently skipped, so its producers read DELIVERED BY NOTHING over files setup.sh writes (#1899)"
+else
+  echo "ok: an UNKNOWN-destination array in FARM_ARRAYS trips the dest-kind floor by name (fail-closed LOUDLY, not silently) (#1899)"
+fi
+if ( producer_probe check_farm_dest_kinds "dest-kind-real" ) | grep -q '^0$'; then
+  echo "ok: the REAL FARM_ARRAYS passes the dest-kind floor (positive control — every declared array is mapped) (#1899)"
+else
+  fail "the dest-kind floor FAILS on the real FARM_ARRAYS — an array setup.sh declares has no farm_dest_kind arm, so its destination is unknown (#1899)"
 fi
 # DRIFT PIN — a population that cannot be built, or that shrank, substituted or GREW, must never read
 # as clean. The GROWTH case is #1899's own defect: an exec site no farm array delivers.
@@ -1251,6 +1542,7 @@ fi
 # an output assertion cannot tell "never ran" from "ran and failed", and reporting a drift failure as
 # "its invocation is unproven" sends the reader to the wrong file.
 check_farm_arrays "$ROOT" "run1"
+check_farm_dest_kinds "run1"
 LANE_PRODUCERS_DERIVED=""
 _ENTRY_ARGS=""
 for _e in $LAUNCHD_ENTRY_PRODUCERS; do _ENTRY_ARGS="$_ENTRY_ARGS scripts/$_e"; done
@@ -2105,6 +2397,8 @@ check_producer_farm_declared "run1" "$LANE_PRODUCERS_DERIVED"
 # not a signal anything reads.
 [ "${_FLOOR_RAN:-0}" = 1 ] \
   || fail "run1: the root-set floor NEVER RAN on the real tree — its invocation is missing or was skipped, so an unread farm array would go unnoticed (#1899)"
+[ "${_DEST_KIND_RAN:-0}" = 1 ] \
+  || fail "run1: the dest-kind floor NEVER RAN on the real tree — its invocation is missing or was skipped, so a FARM_ARRAYS member with no farm_dest_kind arm would be credited with nothing and skipped silently (#1899)"
 [ "${_PIN_RAN:-0}" = 1 ] \
   || fail "run1: the population pin NEVER RAN on the real tree — its invocation is missing or was skipped, so a silently SHRUNK population would read as clean (#1899)"
 [ "${_DISPO_RAN:-0}" = 1 ] \
@@ -2490,8 +2784,25 @@ rm -f "$TMP/gate-ran"
 # `pi … ; _grc=$?` the shell ABORTED on the gate's own 76 before `_grc` was ever assigned — the suite
 # exited 76 with 239 log lines and no recap, so the two real FAILs below were never reported and the
 # arm read as a harness crash. Capture the status the way the positive control below already does.
+# ⛔ THE INSTRUMENT IS PINNED TO THE TREE UNDER TEST, NOT TO THE BOX (#3531). The gate reaches the
+# LOAD arm only through `capacity.sh`, and `spawn-gate.sh` resolves it from `${O:-}`, its own dir,
+# `${AGENT_INFRA_PATH}/scripts/orchestrator-harness`, `${HOME}/orchestrator` and
+# `${HOME}/.pi/agent/scripts` — in that order. Nothing in this arm used to pin ANY of them, so the
+# verdict depended on ambient box state and DISAGREED between a lane and CI on the SAME commit:
+#   · measured 2026-11-07 on a lane box (`O=/home/cmux/orchestrator`, `AGENT_INFRA_PATH` set, both
+#     with a `capacity.sh`): rc 76, arm GREEN; reproduced the CI red only under
+#     `env -u O -u AGENT_INFRA_PATH`;
+#   · on CI both are unset and `$HOME` is the temp dir, so no candidate resolves -> the gate answers
+#     `nodeploy` (`capacity.sh is not reachable from this spawn gate`) and exits 83 — the two FAILs
+#     below, `FAILURES: 2`, byte-identical on `5fb383ac` (pre-fix) and after it.
+# ⛔ THE GREEN WAS THE WORSE HALF: on a box with an ambient payload the arm certified the LOAD gate
+# using `/home/cmux/orchestrator/capacity.sh`, a file from OUTSIDE the tree under test — so it could
+# pass while this repo's own `capacity.sh` was broken. Pin BOTH inputs: `O=` empties the first
+# candidate (the gate skips it on `[ -n ]`), and `AGENT_INFRA_PATH="$CLONE"` points the third at the
+# repo being installed, which is also the copy that installed this gate. A `$CLONE` whose
+# capacity.sh is incomplete then REFUSES loudly under 83 instead of borrowing a working copy.
 _grc=0
-HOME="$HOME_DIR" MAX_LOAD=0 MEM_MIN_AVAIL_MB=1 PATH="$DEST/bin:$TMP/gate-real:$PATH" pi -p "gate probe" >/dev/null 2>&1 || _grc=$?
+HOME="$HOME_DIR" O= AGENT_INFRA_PATH="$CLONE" MAX_LOAD=0 MEM_MIN_AVAIL_MB=1 PATH="$DEST/bin:$TMP/gate-real:$PATH" pi -p "gate probe" >/dev/null 2>&1 || _grc=$?
 if [ "$_grc" -eq 76 ] && [ ! -e "$TMP/gate-ran" ]; then
   echo "ok: the installed gate REFUSED a spawn at MAX_LOAD=0 with the LOAD code 76 (the real pi never ran)"
 elif [ ! -e "$TMP/gate-ran" ]; then
@@ -2502,7 +2813,7 @@ elif [ ! -e "$TMP/gate-ran" ]; then
 else
   fail "the installed gate allowed a spawn at MAX_LOAD=0 — 'spawn nothing' is not enforced"
 fi
-HOME="$HOME_DIR" MAX_LOAD=999999999 MEM_MIN_AVAIL_MB=1 PATH="$DEST/bin:$TMP/gate-real:$PATH" pi -p "gate probe" >/dev/null 2>&1 || true
+HOME="$HOME_DIR" O= AGENT_INFRA_PATH="$CLONE" MAX_LOAD=999999999 MEM_MIN_AVAIL_MB=1 PATH="$DEST/bin:$TMP/gate-real:$PATH" pi -p "gate probe" >/dev/null 2>&1 || true
 if [ -e "$TMP/gate-ran" ]; then
   echo "ok: POSITIVE CONTROL — below the ceiling the installed gate EXECs the real pi"
 else

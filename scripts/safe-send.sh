@@ -54,6 +54,10 @@ if [ ! -f "$FILE" ]; then
 fi
 
 SCRIPTS="$(cd "$(dirname "$0")" && pwd)"     # safe-send lives beside lane-status.py
+# The dispatcher's LOCATION is resolved once, from an ordered candidate list — never from one box's
+# absolute path (#1957). See that file's header for the decision it records (derive, do not vendor) and
+# for why `-f`, not `-x`, is the test the producer must pass.
+. "$SCRIPTS/lib/cmux-dispatch-path.sh"
 
 # ── THE BRIEF GATE (agent-infra#2258) ────────────────────────────────────────────────────────────
 # `<brief-file>` is the argument, so the RESEARCH contract is checked on exactly what is about to be
@@ -140,10 +144,32 @@ if [ -n "$PSCREEN" ]; then
       fi ;;
   esac
 fi
-# Overridable so the rc -> state mapping can be PROVEN with a stub dispatcher instead of
-# by sending a real message into a real lane (which would cause the very sidetracking this
-# gate exists to prevent). Defaults to the real dispatcher.
-DISPATCH="${SAFE_SEND_DISPATCH:-/Users/danielospina/Documents/GitHub/tortoise/tools/cmux_dispatch.py}"
+# ── WHERE IS THE DISPATCHER? (agent-infra#1957) ────────────────────────────────
+# Resolved AFTER the brief gate and after the no-pi guard (so a bad brief is still the refusal a caller
+# sees, and a bare login shell is still refused before anything else), and BEFORE the busy/idle probes —
+# because the producer is a precondition of the tool running at ALL, and discovering it last is what made
+# this defect expensive: a box without the checkout still paid a `cmux read-screen` plus the lane-guard's
+# 5-8s before an interpreter finally failed on a missing file, and the rc it returned was the
+# INTERPRETER's, indistinguishable from a dispatcher verdict.
+# A refusal here names what is missing and every path it tried (refresh-candidates.sh's rule: a refusal
+# that does not say WHERE it looked sends the operator to guess).
+# `SAFE_SEND_DISPATCH` overrides the whole search, which is how the rc -> state mapping is proven with a
+# stub dispatcher instead of by sending a real message into a real lane (the very sidetracking this gate
+# exists to prevent) — so it is taken as the WHOLE answer, and a bad override is named as the override.
+DISPATCH=""
+if ! DISPATCH="$(cmux_dispatch_resolve "${SAFE_SEND_DISPATCH:-}")"; then
+  echo "FATAL [$LABEL]: cmux_dispatch.py NOT FOUND — the send path cannot run, and NOTHING was sent." >&2
+  echo "         Looked in (in order): $(cmux_dispatch_candidates_one_line "${SAFE_SEND_DISPATCH:-}")" >&2
+  if [ -n "${SAFE_SEND_DISPATCH:-}" ]; then
+    echo "         That list is ONLY yours: SAFE_SEND_DISPATCH=$SAFE_SEND_DISPATCH — an override is taken" >&2
+    echo "         as the whole answer, so this file is the one to fix (or unset it to allow the search)." >&2
+  else
+    echo "         Remedy: set SAFE_SEND_DISPATCH to a cmux_dispatch.py you trust, or set TORTOISE_REPO to" >&2
+    echo "         the tortoise checkout on this box (its tools/cmux_dispatch.py is the producer), or clone" >&2
+    echo "         tortoise as a SIBLING of agent-infra. The producer belongs to the tortoise repo (#1957)." >&2
+  fi
+  exit 5
+fi
 
 if [ "$MODE" != "--force" ]; then
   # read-screen can fail or resolve to another pane; a FAILED read must not read as
@@ -210,9 +236,18 @@ fi
 #      it for "nothing happened" and blind-retry a second instruction on top of the first.
 #   3  refused / never became ready — nothing was consumed.
 # cmux_dispatch.py requires Python >= 3.12; bare python3 may be 3.9 depending on PATH.
-PY312="${SAFE_SEND_PYTHON:-$(command -v python3.12 || true)}"
-[ -x "$PY312" ] || PY312="/Users/danielospina/.local/bin/python3.12"
-[ -x "$PY312" ] || { echo "FATAL [$LABEL]: no python3.12 found -- cannot run cmux_dispatch.py"; exit 5; }
+# Resolved from a LADDER in the same lib as the producer (#1957 — the fallback used to be
+# `/Users/danielospina/.local/bin/python3.12`, the same defect one line down: a Mac-only path that
+# missed even this box, where 3.12 is at /usr/local/bin). A bare `python3` is accepted only when its
+# VERSION satisfies the dispatcher; accepting it on name alone is how a 3.9 box gets a SyntaxError that
+# reads as a dispatcher verdict.
+PY312=""
+if ! PY312="$(cmux_dispatch_python_resolve "${SAFE_SEND_PYTHON:-}")"; then
+  echo "FATAL [$LABEL]: no python >= 3.12 found — cannot run cmux_dispatch.py, and NOTHING was sent." >&2
+  echo "         Looked in (in order): $(cmux_dispatch_python_candidates_one_line "${SAFE_SEND_PYTHON:-}")" >&2
+  echo "         Remedy: install python3.12+, or set SAFE_SEND_PYTHON to an interpreter >= 3.12." >&2
+  exit 5
+fi
 OUT=$("$PY312" "$DISPATCH" send --workspace "$WS" --label "$LABEL" --file "$FILE" 2>&1)
 RC=$?
 printf '%s\n' "$OUT"

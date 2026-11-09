@@ -12,9 +12,9 @@
  * node_modules/typebox. Created by CI setup or manually.
  */
 
-import { stripHtml, getPerplexityKey, augmentPath, PATH_EXTRA_DIRS, getPiInvocation, getSubAgentPath, resolveProviderModel, loadModelRegistry, getModelsJsonPath, getExitGraceMs, DEFAULT_EXIT_GRACE_MS, armExitWatchdog, getExitCompleteGraceMs, DEFAULT_EXIT_COMPLETE_GRACE_MS, armCompletionWatchdog, composeTaskResult, getFallbackModel, DEFAULT_FALLBACK_MODEL, connectionErrorDetected, shouldFallback, resolveProviderBaseUrl, HEARTBEAT_MARKER_PREFIX, HEARTBEAT_INTERVAL_MIN_MS, HEARTBEAT_INTERVAL_MAX_MS, DEFAULT_HEARTBEAT_INTERVAL_MS, DEFAULT_STREAM_STALL_MS, DEFAULT_TOOL_STALL_MS, DEFAULT_FIRST_MESSAGE_MS, clampHeartbeatIntervalMs, getHeartbeatIntervalMs, getStreamStallMs, getToolStallMs, getFirstMessageMs, createHeartbeatState, parseHeartbeatLine, flushHeartbeatResidue, flushHeartbeatLineBuf, ingestHeartbeatChunk, heartbeatKillDecision, HEARTBEAT_LINE_BUF_MAX, HEARTBEAT_TRACE_MAX, getTaskMaxDispatchMs, getTaskHardCapMs, DEFAULT_HARD_CAP_MS, loadScaledBound, getFirstOutputTimeoutMs, getSystemLoad, setLoad1Override, getLoad1, getCutGapMs, getEffectiveCutGapMs, getCpuStallMs, DEFAULT_CPU_STALL_MS, DEFAULT_PROGRESS_AGE_MS, getProgressAgeMs, classifyTaskExit, getTaskBackstopMs, DEFAULT_BACKSTOP_MARGIN_MS, DEFAULT_TASK_MODEL, renderRepoStateLine, renderMachineStateLine, countPiProcs, countPiInPsOutput, formatLoad1, probeSystemLoad, resolveTaskCwd, taskCwdRefusal, spawnSubAgent, resolveStreamStallMs, streamStallInertWarning, inFlightProgress, DEFAULT_SESSION_CEILING_MULT, resolveSessionCeiling, isDispatchSaturated, saturationNotice, dispatchSaturationRefusal, probeDispatchSaturation, probePiProcs, setPiProcsOverride, classifyChildLiveness, childMessagesSent, TASK_LIVENESS_DETAIL_KEYS, stampLivenessDefaults, childLivenessFor, exhaustionStatusFor, classifyBackgroundOutcome } from "./index.js";
+import { stripHtml, getPerplexityKey, augmentPath, PATH_EXTRA_DIRS, getPiInvocation, getSubAgentPath, resolveProviderModel, loadModelRegistry, getModelsJsonPath, getExitGraceMs, DEFAULT_EXIT_GRACE_MS, armExitWatchdog, getExitCompleteGraceMs, DEFAULT_EXIT_COMPLETE_GRACE_MS, armCompletionWatchdog, composeTaskResult, getFallbackModel, DEFAULT_FALLBACK_MODEL, connectionErrorDetected, shouldFallback, resolveProviderBaseUrl, HEARTBEAT_MARKER_PREFIX, HEARTBEAT_INTERVAL_MIN_MS, HEARTBEAT_INTERVAL_MAX_MS, DEFAULT_HEARTBEAT_INTERVAL_MS, DEFAULT_STREAM_STALL_MS, DEFAULT_TOOL_STALL_MS, DEFAULT_FIRST_MESSAGE_MS, clampHeartbeatIntervalMs, getHeartbeatIntervalMs, getStreamStallMs, getToolStallMs, getFirstMessageMs, createHeartbeatState, parseHeartbeatLine, flushHeartbeatResidue, flushHeartbeatLineBuf, ingestHeartbeatChunk, heartbeatKillDecision, HEARTBEAT_LINE_BUF_MAX, HEARTBEAT_TRACE_MAX, getTaskMaxDispatchMs, getTaskHardCapMs, DEFAULT_HARD_CAP_MS, loadScaledBound, getFirstOutputTimeoutMs, getSystemLoad, setLoad1Override, getLoad1, getCutGapMs, getEffectiveCutGapMs, getCpuStallMs, DEFAULT_CPU_STALL_MS, DEFAULT_PROGRESS_AGE_MS, getProgressAgeMs, classifyTaskExit, getTaskBackstopMs, DEFAULT_BACKSTOP_MARGIN_MS, DEFAULT_TASK_MODEL, renderRepoStateLine, renderMachineStateLine, countPiProcs, countPiInPsOutput, formatLoad1, probeSystemLoad, resolveTaskCwd, taskCwdRefusal, describeSpawnFailure, spawnSubAgent, resolveStreamStallMs, streamStallInertWarning, inFlightProgress, DEFAULT_SESSION_CEILING_MULT, resolveSessionCeiling, isDispatchSaturated, saturationNotice, dispatchSaturationRefusal, probeDispatchSaturation, probePiProcs, setPiProcsOverride, classifyChildLiveness, childMessagesSent, TASK_LIVENESS_DETAIL_KEYS, stampLivenessDefaults, childLivenessFor, exhaustionStatusFor, classifyBackgroundOutcome, readMarkerAge, decisionSnapshotStale, supersedingEvidence, repoStateReportText, repoStateSnapshotStale, isNotYetStarted } from "./index.js";
 import { dispatchUnkeyedSet } from "../shared/provider-failover.js";
-import { asyncRepoState } from "../repo-freshness.js";
+import { asyncRepoState, syncRepoState, countCommitsBetween } from "../repo-freshness.js";
 import builtinTools from "./index.js";
 
 import type { HeartbeatState, HeartbeatIngestContext, HeartbeatDecisionInput, CompletionWatchdog, ComposeTaskResultInput } from "./index.js";
@@ -30,7 +30,7 @@ const childFactory: (pi: any) => void =
 import type { ModelRegistry } from "./index.js";
 import { ok, equal, deepEqual } from "node:assert/strict";
 import { EventEmitter } from "node:events";
-import { spawn, execSync } from "node:child_process";
+import { spawn, spawnSync, execSync } from "node:child_process";
 import { treeKill } from "../shared/tree-kill.js";
 import { readFileSync, renameSync, existsSync, writeFileSync, rmSync, mkdirSync, chmodSync, mkdtempSync, realpathSync, utimesSync, statSync } from "node:fs";
 import { createRequire } from "node:module";
@@ -71,6 +71,7 @@ import { dirname, join, resolve } from "node:path";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const source = readFileSync(resolve(__dirname, "index.ts"), "utf-8");
+const repoFreshSource = readFileSync(resolve(__dirname, "../repo-freshness.ts"), "utf-8");
 
 let passed = 0;
 let failed = 0;
@@ -2626,7 +2627,7 @@ test("E282c: diagnostics — first-message-stall [task] triage line + tick/marke
   }
 });
 
-test("E12: ready + no turn — not tier-1-killed; ticks stop → silence at T; ticks flow → stream-stall at S", () => {
+test("E12: ready + no turn — not tier-1-killed; ticks stop → silence at T; ticks flow → NOT stream-stall (#2105)", () => {
   const st = createHeartbeatState();
   st.sawReady = true;
   // at 61s: no tier-1 kill (sawReady gate)
@@ -2637,16 +2638,51 @@ test("E12: ready + no turn — not tier-1-killed; ticks stop → silence at T; t
   equal(dStop.kill, true);
   equal(dStop.reason, "silence-threshold");
   equal(dStop.resolveUndefined, true);
-  // ticks flow, stream age past S → stream-stall
+  // ticks flow, stream age past S → NOT stream-stall any more (#2105)
+  //
+  // This case used to assert `stream-stall` at S for a child that had emitted
+  // `ready` and nothing else. That assertion pinned the defect #2105 reports:
+  // with no turn ever started, `streamAgeMs` is nothing but the time since
+  // spawn, so S (20 min) was measuring CHILD-SPAWN LATENCY under load and
+  // reporting it as a wedge. Four consecutive dispatches were cut on it, none
+  // for a task reason. A child that never began is bounded instead by
+  // `no-progress` — a LONGER window, i.e. the wait the issue asks for — so this
+  // asserts the SUPPRESSION and then proves the class is still bounded by
+  // moving the same state past X.
+  //
+  // ⛔ THE SUPPRESSION IS CONDITIONAL ON ITS SUBSTITUTE BEING ARMED (#2105
+  // review P2). `no-progress` is gated on `progressAgeMs > 0`, so suppressing
+  // stream-stall unconditionally left NO bound below the 6 h hard cap for an
+  // operator who set `TASK_PROGRESS_AGE_MS=0`. The case below therefore supplies
+  // an ARMED bound (`progressAgeMs` > 0, anchor at `startedAt` so X has not
+  // elapsed yet) — production's default shape.
   const st2 = createHeartbeatState();
   st2.sawReady = true;
   st2.everSawWork = false; // only ready seen — no turn ever
   st2.streamAgeMs = S + 1;
   st2.lastMarkerAt = 3_000_000;
-  const dFlow = heartbeatKillDecision(dinput({ now: 3_000_010, lastLifeSignAt: 3_000_000, hasOutput: false, state: st2 }));
-  equal(dFlow.kill, true);
-  equal(dFlow.reason, "stream-stall");
-  equal(dFlow.resolveUndefined, true);
+  const dFlow = heartbeatKillDecision(
+    dinput({ now: 3_000_010, startedAt: 3_000_000, lastLifeSignAt: 3_000_000, hasOutput: false, state: st2, progressAgeMs: 60_000 }),
+  );
+  equal(dFlow.kill, false, "a never-started child is NOT cut as wedged at S (#2105) while the substitute bound is armed");
+  // ⛔ AND THE ARMED CASE IS NOT A LOOPHOLE: with the substitute DISABLED
+  // (`progressAgeMs: 0`, i.e. `TASK_PROGRESS_AGE_MS=0`) the OLD stream-stall
+  // bound must still cut. Without this, the only bound left on the class is the
+  // 6 h hard cap — a silent 20 min → 6 h widening. This case FAILS on the
+  // pre-fix code, which suppressed unconditionally.
+  const dDisabled = heartbeatKillDecision(
+    dinput({ now: 3_000_010, startedAt: 0, lastLifeSignAt: 3_000_000, hasOutput: false, state: st2, progressAgeMs: 0 }),
+  );
+  equal(dDisabled.kill, true, "TASK_PROGRESS_AGE_MS=0 must NOT remove the only bound on a never-started child");
+  equal(dDisabled.reason, "stream-stall", "…the stream-stall bound still applies when no-progress is disabled");
+  // BOUNDED TWIN: the same never-started state is still bounded, by X.
+  const dX = heartbeatKillDecision(
+    dinput({ now: 3_000_010, startedAt: 0, lastLifeSignAt: 3_000_000, hasOutput: false, state: st2, progressAgeMs: 60_000 }),
+  );
+  equal(dX.kill, true, "still bounded — never an unbounded wait");
+  equal(dX.reason, "no-progress", "the no-progress bound owns the never-started class, not stream-stall");
+  equal(dX.notStarted, true, "and the payload NAMES the condition so the headline can route to reassign");
+  equal(dX.resolveUndefined, true, "no real output → retryable");
 });
 
 test("no markers at all → stall clauses inert (legacy fallback guard)", () => {
@@ -3090,9 +3126,13 @@ test("E271i: loop↔decision fresh-window coupling + the far tail's ungated owne
   equal(hcGuardConds.slice().sort().join(" | "), "!hasOutput | settled", "the callback's guards are EXACTLY `settled` and `!hasOutput` — a freshness term folded into one of them is caught whatever its spelling");
   ok(!/stateFresh|freshWindowMs|HEARTBEAT_TIMEOUT_MS|heartbeatTimeoutMs|getHeartbeatIntervalMs|clampHeartbeatIntervalMs|HEARTBEAT_INTERVAL_MS|TASK_HEARTBEAT_INTERVAL_MS|DEFAULT_HEARTBEAT|intervalMs|hbThresholds|cutGapMs/.test(hcBody), "…and no freshness expression may appear in the callback OUTSIDE those `if` headers (a `switch`, ternary or `||`-shaped gate) — the condition pin cannot see those. A denylist can never be complete (cycle 6's set was itself narrower than cycle 4's: it had dropped `hbThresholds`, which is what caught a `hbThresholds.heartbeatTimeoutMs` fold); the MARKER-clock family below is pinned POSITIVELY instead, because it cannot be listed here at all");
   // The marker clock cannot go in the denylist: the callback reads
-  // `hbCtx.state.lastMarkerAt` TWICE on its one report declaration, and the
-  // `markerAgeMs` local six times in the same report. Positive pins instead:
-  equal(hcBody.split("hbCtx.state.lastMarkerAt").length - 1, 2, "the callback reads the marker clock exactly twice — both on the single report declaration. A THIRD read is a freshness gate on the far tail (this is the read a `markerAgeMs`/`lastMarkerAt`-based gate needs)");
+  // `hbCtx.state.lastMarkerAt` on its one report declaration, through the single
+  // clamped reader. Positive pins instead:
+  equal(hcBody.split("hbCtx.state.lastMarkerAt").length - 1, 1, "the callback reads the marker clock exactly ONCE — on the single report declaration, through `readMarkerAge` (#1339). A SECOND read is a freshness gate on the far tail (this is the read a `markerAgeMs`/`lastMarkerAt`-based gate needs)");
+  ok(
+    /const markerAgeMs = readMarkerAge\(hbCtx\.state\.lastMarkerAt, [^\n]*\)\.ageMs;/.test(hcBody),
+    "that one read goes through `readMarkerAge` (#1339) — the raw `now - lastMarkerAt` shape can go NEGATIVE, and a negative age printed in a far-tail payload is exactly the defect #1339 measured",
+  );
   ok(/const markerAgeMs = [^;]+;\s*doResolve\(composeAbnormalExit\(/.test(hcBody), "the marker-age local flows STRAIGHT into the resolve — nothing (not even a ternary) may sit between them, which is how the far tail would become freshness-gated without adding an `if` header");
   // The order pin reads the guard with the SAME whitespace-tolerant regex as the
   // presence check: an exact-literal `indexOf` returned -1 on a reformatted guard
@@ -3125,6 +3165,341 @@ test("E271f: exit taxonomy — null → cut, 0+tools>0 → cut, 0+tools=0 → su
   equal(classifyTaskExit(0, 0), "success", "clean exit with no tools in flight is success");
   equal(classifyTaskExit(1, 0), "failed", "non-zero exit is failed (existing)");
   equal(classifyTaskExit(2, 3), "failed", "non-zero exit with tools in flight is still failed (tool-stall semantics)");
+});
+
+section("#1339 — a kill verdict must agree with the evidence, and no age may be negative");
+
+test("#1339a: readMarkerAge — one reader, sentinel for 'never', CLAMP for 'future' (source of the -1s headline)", () => {
+  // Measured upstream (#1208 B2): `no life signs for -2s`, and re-measured on
+  // this box (#1339): `no life signs for -1s (marker gap exceeded 113s)` beside
+  // `lastMarkerAgeMs=-532`. A negative age is not a measurement of silence.
+  deepEqual(readMarkerAge(0, 1_000_000), { ageMs: -1, invalid: false }, "no marker ever parsed → the -1 SENTINEL, not an age (stateFresh carries the condition)");
+  deepEqual(readMarkerAge(-5, 1_000_000), { ageMs: -1, invalid: false }, "any non-positive timestamp is the sentinel, never a negative age");
+  deepEqual(readMarkerAge(999_000, 1_000_000), { ageMs: 1_000, invalid: false }, "an ordinary past timestamp is the plain difference");
+  deepEqual(readMarkerAge(1_000_000, 1_000_000), { ageMs: 0, invalid: false }, "exactly now is 0, not invalid");
+  deepEqual(readMarkerAge(1_000_532, 1_000_000), { ageMs: 0, invalid: true }, "a FUTURE timestamp is INVALID INPUT, clamped to 0 and flagged — this is the exact -532ms reading from the live cut");
+});
+
+test("#1339b: the decision never evaluates a threshold against an invalid marker age (fail-safe: no kill)", () => {
+  const now = 10_000_000;
+  const gap = 37_500;
+  // Positive CONTROL: the same stale marker in the PAST is a cut, and the
+  // decision reports the age it used.
+  const stale = cutClauseState(gap + 20_000, now);
+  const cut = heartbeatKillDecision(dinput({ now, lastLifeSignAt: now, state: stale, cutGapMs: gap }));
+  equal(cut.kill, true, "control: markers genuinely stale past the gap still cut (the detector is not disarmed)");
+  equal(cut.reason, "cut");
+  equal(cut.markerAgeMs, gap + 20_000, "the decision carries the marker age it actually used (#1339 snapshot, printed by the headline)");
+
+  // The DEFECT shape: the marker timestamp is in the FUTURE of the decision
+  // clock (it was ingested after `now` was taken, inside the awaited kill path).
+  // NOTE (#1339 review): the `cut` clause is `markerAge > cutGapMs`, so a raw
+  // NEGATIVE age would be LESS than the gap and could not fire it either way —
+  // asserting `kill === false` here proves nothing about the clamp. What the
+  // clamp actually buys is that no consumer ever receives the negative number,
+  // so THAT is what is pinned: the decision carries 0, not -532.
+  const future = cutClauseState(gap + 20_000, now);
+  future.lastMarkerAt = now + 532;
+  const invalid = heartbeatKillDecision(dinput({ now, lastLifeSignAt: now, state: future, cutGapMs: gap }));
+  equal(invalid.kill, false, "a marker timestamp in the future is not silence past the gap (it is not silence at all)");
+  equal(invalid.markerAgeMs, undefined, "no kill → no decision age to report");
+  ok(
+    readMarkerAge(future.lastMarkerAt, now).ageMs === 0,
+    "the clamp is what turns the measured -532ms into 0 — this is the assertion the raw-difference revert fails (#1339 review: the earlier `kill === false` legs passed even with the clamp reverted)",
+  );
+
+  // And the snapshot the headline prints is the clamped one, never the raw
+  // negative difference — where a kill IS taken (a different clause), the
+  // reported age must still be a non-negative value.
+  const futureHung = cutClauseState(gap + 20_000, now);
+  futureHung.lastMarkerAt = now + 532;
+  futureHung.toolAgeMaxMs = 21_600_001;
+  const otherClause = heartbeatKillDecision(
+    dinput({ now, lastLifeSignAt: now, state: futureHung, cutGapMs: gap, toolStallMs: 21_600_000 }),
+  );
+  equal(otherClause.kill, true, "a clause that does not read the marker clock still fires");
+  equal(otherClause.reason, "tool-stall");
+  equal(otherClause.markerAgeMs, 0, "…and the payload still carries the CLAMPED 0, not the raw -532 (fails if the clamp is reverted)");
+  // #1339 review P2: the clamped `0` above is INDISTINGUISHABLE from a marker that
+  // landed exactly now, so a reader cannot tell "fresh" from "uncomputable". The
+  // flag `readMarkerAge` promises to report is carried on the DECISION, and the
+  // payload prints it, so the two cases are separable in the post-mortem.
+  equal(otherClause.markerAgeInvalid, true, "a clamped decision says so — otherwise the clamped 0 reads as a live marker");
+  equal(cut.markerAgeInvalid, false, "a genuinely stale marker is not flagged invalid (the flag is not a second clamp)");
+  equal(
+    heartbeatKillDecision(dinput({ now, lastLifeSignAt: now, state: cutClauseState(gap + 20_000, now), cutGapMs: gap })).markerAgeInvalid,
+    false,
+    "…and the ordinary past-timestamp path stays unflagged",
+  );
+});
+
+test("#1339e: supersedingEvidence — the guard asks each clause about ITS OWN clock", () => {
+  const snap = 5_000_000;
+  const base = { lastMarkerAt: 0, lastLifeSignAt: snap - 1, lastProgressAt: 0, startedAt: 1, sessionEnded: false, toolsInFlight: 0 };
+
+  // No-progress is measured on `lastProgressAt`, which ticks and bytes do NOT
+  // advance (the clause's binding rule). A marker inside the awaited window is
+  // therefore NOT a refutation of it — the content-free loop stays killable.
+  equal(
+    supersedingEvidence("no-progress", snap, { ...base, lastMarkerAt: snap + 1, lastLifeSignAt: snap + 1 }),
+    null,
+    "no-progress: a marker AND a byte after the snapshot do not refute a verdict about WORK COMPLETED — suppressing here re-opens the hole the clause exists to close",
+  );
+  equal(
+    supersedingEvidence("no-progress", snap, { ...base, lastProgressAt: snap + 1 }),
+    "progress",
+    "no-progress: real work completing inside the window DOES refute it (fail-safe direction preserved)",
+  );
+  equal(
+    supersedingEvidence("no-progress", snap, { ...base, lastProgressAt: 0, startedAt: snap + 1 }),
+    "progress",
+    "no-progress: the anchor falls back to `startedAt` exactly as the clause does — a dispatch that started inside the window has not had its bound yet",
+  );
+  equal(
+    supersedingEvidence("no-progress", snap, { ...base, lastProgressAt: snap }),
+    null,
+    "no-progress: progress AT the snapshot instant is not newer (equality is not staleness)",
+  );
+
+  // #1339 CYCLE-2 P1 — the clause's two SCOPE gates, which flip inside the
+  // awaited window with `lastProgressAt` UNTOUCHED. `heartbeatKillDecision`
+  // returns `kill:false` for both at that same instant (#191 early return;
+  // the clause's `toolsInFlight === 0` scope), so the guard must not execute a
+  // verdict the clause itself refuses. Measured before the fix: the kill ran in
+  // both cases, and for `session_end` it discarded FINISHED work as a
+  // partial-result kill.
+  equal(
+    supersedingEvidence("no-progress", snap, { ...base, sessionEnded: true, lastMarkerAt: snap + 1 }),
+    "session-end",
+    "no-progress: a session_end inside the window supersedes — #191 forbids ANY stall clause racing a completed session, and it moves no progress clock",
+  );
+  equal(
+    supersedingEvidence("no-progress", snap, { ...base, toolsInFlight: 1, lastMarkerAt: snap + 1 }),
+    "tool-in-flight",
+    "no-progress: a tool_start inside the window supersedes — an in-flight tool is a DECLARED long operation owned by the tool clauses, and it moves no progress clock either",
+  );
+  equal(
+    supersedingEvidence("no-progress", snap, { ...base, sessionEnded: true, toolsInFlight: 1 }),
+    "session-end",
+    "session_end outranks a concurrent tool_start (strongest gate first)",
+  );
+
+  // Every other reason is superseded by the marker/byte channels, and the
+  // returned channel NAMES the one that fired so the log cannot print a
+  // negative delta for a channel that did not move (#1339 review).
+  for (const reason of ["cut", "silence-threshold", "stream-stall", "tool-silence", "tool-dead", "tool-stall", "first-message-stall", "zero-output"] as const) {
+    equal(supersedingEvidence(reason, snap, base), null, `${reason}: a silent child (both channels behind the snapshot) leaves the verdict standing`);
+    equal(supersedingEvidence(reason, snap, { ...base, lastMarkerAt: snap + 1 }), "marker", `${reason}: a marker after the snapshot supersedes, and is NAMED`);
+    equal(supersedingEvidence(reason, snap, { ...base, lastLifeSignAt: snap + 1 }), "bytes", `${reason}: a byte after the snapshot supersedes, and is NAMED`);
+    equal(supersedingEvidence(reason, snap, { ...base, lastMarkerAt: snap + 1, lastLifeSignAt: snap + 1 }), "marker", `${reason}: the marker is named first when both fired`);
+  }
+});
+
+test("#1339c: decisionSnapshotStale — evidence newer than the snapshot supersedes the verdict", () => {
+  const snap = 5_000_000;
+  equal(decisionSnapshotStale(snap, 0, snap - 1), false, "a silent child (no marker, last byte before the snapshot) does NOT supersede — the kill stands");
+  equal(decisionSnapshotStale(snap, snap - 1_000, snap - 1), false, "both channels behind the snapshot → not stale (the ordinary wedge)");
+  equal(decisionSnapshotStale(snap, snap, snap - 1), false, "a marker at the snapshot instant is not NEWER — equality is not staleness (a child ticking exactly at the decision is still the verdict's evidence)");
+  equal(decisionSnapshotStale(snap, snap + 1, snap - 1), true, "a marker AFTER the snapshot supersedes the verdict");
+  equal(decisionSnapshotStale(snap, 0, snap + 1), true, "a real output BYTE after the snapshot supersedes it too — the byte channel is independent of markers");
+  equal(decisionSnapshotStale(snap, snap + 1, snap + 1), true, "both channels newer");
+});
+
+test("#1339d: loop wiring — the verdict is re-validated against evidence across the awaited probe (source-scan)", () => {
+  const src = readFileSync(resolve(__dirname, "index.ts"), "utf-8");
+  // The guard is the ONLY consumer of `supersedingEvidence` in the loop, and it
+  // must sit between the post-await `settled`/exit re-check and the tree kill —
+  // the window it protects is exactly that gap.
+  const guardIdx = src.indexOf("supersedingEvidence(decision.reason, now, {");
+  ok(guardIdx > -1, "the kill path re-validates the decision against the marker, byte AND progress clocks");
+  const settledIdx = src.indexOf("if (settled || proc.exitCode !== null) return;");
+  const killIdx = src.indexOf("killTreeAndEscalate();", settledIdx);
+  ok(settledIdx > -1 && settledIdx < guardIdx, "the evidence re-check follows the post-await settled re-check (the same await window, asked about evidence)");
+  ok(guardIdx < killIdx, "the evidence re-check precedes the tree kill — a stale verdict must never be executed");
+  // #1339 CYCLE-3 P2 — the SAME class that produced the cycle-2 P1, one layer
+  // out: `supersedingEvidence` was pinned but the two lines that hand it LIVE
+  // scope-gate state were not, so replacing them with the constants
+  // `false`/`0` restored the P1 (a `session_end`/`tool_start` inside the awaited
+  // window stops superseding a `no-progress` kill → finished work discarded as a
+  // partial-result kill) and left all 373 tests green. A typecheck would not
+  // catch it either (`false`/`0` satisfy `boolean`/`number`), and this repo has
+  // no root tsconfig so that job self-skips. The channels are INERT without this
+  // wiring, so the wiring is pinned.
+  //
+  // ⛔ BUT A WHOLE-FILE `src.includes()` IS NOT A PIN FOR A LINE THAT IS NOT
+  // UNIQUE. Measured (#1339 cycle-4 review): `lastLifeSignAt: lastHeartbeat,`
+  // occurs 3× in index.ts and `toolsInFlight: hbCtx.state.toolsInFlight,` 2×, so
+  // a global substring test stayed GREEN while the GUARD'S OWN argument was
+  // mutated to `now`. The direction of that mutation is the one that HURTS, and
+  // it is the opposite of over-suppression (#1339c already pins it):
+  // `decisionSnapshotStale` is a STRICT `>` and the guard is called with
+  // `snapshotAt === now`, so `lastLifeSignAt: now` can never be `> now` — the
+  // byte channel is permanently INERT, the guard never supersedes, and the kill
+  // executes on the superseded verdict. That is the original #1339 false kill,
+  // in the configuration where no marker ever parses (`hbEnabled === false`, or
+  // a marker failing the nonce check). Each literal is therefore asserted INSIDE
+  // the guard's argument block, which is the only region where it is evidence of
+  // this wiring at all.
+  const guardCall = src.indexOf(": supersedingEvidence(decision.reason, now, {");
+  ok(guardCall > -1, "the guard is called with the channels object (this slice is the region every pin below reads)");
+  // FAIL-CLOSED on the FIRST-MATCH read above (#1339 cycle-4 review P3): every
+  // pin below is scoped to the FIRST occurrence, so a second re-validation added
+  // ABOVE the guard would silently become the region under test while the real
+  // guard's channels were mutated — the inert-pin class this test exists to
+  // close, restored one layer out. Exactly one call site is the premise.
+  equal(
+    src.split(": supersedingEvidence(decision.reason, now, {").length - 1,
+    1,
+    "exactly ONE re-validation call site — the region pins below resolve it by first match, so a second one added above would be read instead of the guard",
+  );
+  const guardArgs = guardCall > -1 ? src.slice(guardCall, src.indexOf("});", guardCall)) : "";
+  for (const [literal, why] of [
+    ["lastMarkerAt: hbCtx.state.lastMarkerAt,", "the marker channel reads live state"],
+    ["lastLifeSignAt: lastHeartbeat,", "the byte channel reads the live life-sign clock — `now` here fires the channel on every tick and suppresses every kill"],
+    ["lastProgressAt: hbCtx.state.lastProgressAt,", "the progress channel reads the clause's own clock"],
+    ["startedAt,", "the progress anchor is the dispatch's start, not a re-read"],
+    ["sessionEnded: hbCtx.state.sessionEnded,", "the #191 scope gate reads live state, never the constant `false`"],
+    ["toolsInFlight: hbCtx.state.toolsInFlight,", "the in-flight scope gate reads live state, never the constant `0`"],
+  ] as const) {
+    ok(guardArgs.includes(literal), `the guard's OWN channels object carries \`${literal.trim()}\` — ${why} (cycle-4 review: a global includes() is inert for a non-unique line)`);
+  }
+  // The BYTE channel is the only evidence path when no marker ever parses
+  // (`hbEnabled === false`, or a marker failing the nonce check → `lastMarkerAt`
+  // stays 0 forever), and `silence-threshold`'s clock IS `i.lastLifeSignAt` — so
+  // an inert byte channel restores the stale-verdict kill this change exists to
+  // stop, in exactly the configuration where nothing else can catch it.
+  equal(guardArgs.split("lastLifeSignAt:").length - 1, 1, "the guard passes exactly one byte channel (no shadowed second binding)");
+  // The exemption is a WALL-CLOCK policy cap, not a liveness inference.
+  ok(
+    /decision\.reason === "max-dispatch"\s*\n\s*\? null\s*\n\s*: supersedingEvidence\(/.test(src),
+    "`max-dispatch` is exempt: a fresh byte does not make a policy-capped dispatch younger",
+  );
+  // Rate-limited, NOT one-shot: a permanent latch hides exactly the recurrence
+  // the parent must see (#1339 review).
+  ok(src.includes("let staleSuppressCount = 0;"), "the suppressions are COUNTED per dispatch, so the log can report the running total");
+  ok(
+    src.includes("now - staleSuppressLoggedAt >= STALE_SUPPRESS_RELOG_MS"),
+    "the suppression log RE-ARMS (bounded to one line per minute) — a one-shot latch would report a wedge suppressed for hours only once",
+  );
+  ok(src.includes("${staleSuppressCount} suppression(s) this dispatch"), "the log carries the count, not just the first occurrence");
+  ok(src.includes("re-deciding on the next tick (#1339)"), "the suppression states what happens next, so the operator does not read it as a lost kill");
+  // The log must never print a delta for a channel that did not move — that was
+  // the `marker +-45123ms` nonsense (#1339 review).
+  ok(
+    src.includes("(${evidence} relative to the snapshot;"),
+    "the log names the channel that ACTUALLY fired and one positive delta, never an untouched channel's negative one",
+  );
+  ok(
+    src.includes('const evidence = evidenceDelta === null ? supersededBy : `${supersededBy} +${evidenceDelta}ms`;'),
+    "the two SCOPE channels (session-end / tool-in-flight) have no timed delta and print a LABEL, not a fabricated +0ms",
+  );
+  equal(src.split("staleDecisionSuppressLogged").length - 1, 0, "the permanent one-shot latch is gone (replaced by the rate-limited counter)");
+  // The headline prints the DECISION's snapshot; the payload keeps the live read
+  // beside it, labelled. Both are clamped through the single reader.
+  ok(src.includes("const decMarkerAgeMs = decision.markerAgeMs ?? -1;"), "the kill path exposes the decision's own marker age");
+  ok(src.includes("decMarkerAgeMs=${decMarkerAgeMs}"), "the heartbeat-kill alive summary carries the decision-time age beside the live one (the #5389 pattern)");
+  // The pin below is scoped to the alive-summary TEMPLATE, not the file: a
+  // whole-file `src.includes()` for this literal is satisfiable by a COMMENT
+  // carrying the same text (#1339 cycle-4 review P2 — reproduced: deleting the
+  // field from the template and parking the literal in a `//` comment left
+  // 373/0 green). Selecting the region by FIRST MATCH is itself unsound here:
+  // THREE `const aliveSummary = ` templates exist (the hard-cap kill payload, the
+  // heartbeat-kill payload, the backstop), so the region is selected by CONTENT —
+  // `decToolCpuStallMs=` appears only in the heartbeat-kill summary — and the
+  // template count is pinned so a fourth cannot silently win the selection.
+  const aliveStarts = [...src.matchAll(/const aliveSummary = `Alive state: toolsInFlight=/g)].map((m) => m.index ?? -1);
+  equal(aliveStarts.length, 3, "three `Alive state:` templates exist (hard-cap / heartbeat-kill / backstop) — the selection below is by content, so the count is a premise");
+  const aliveTemplates = aliveStarts.map((s) => {
+    const e = s >= 0 ? src.indexOf("`;", s) : -1;
+    return e > s ? src.slice(s, e) : "";
+  });
+  const killSummaries = aliveTemplates.filter((t) => t.includes("decToolCpuStallMs="));
+  equal(killSummaries.length, 1, "exactly ONE template is the heartbeat-kill payload (`decToolCpuStallMs=` is its marker) — so the region pins below cannot read another kill path's summary");
+  const aliveSummarySrc = killSummaries[0] ?? "";
+  ok(
+    src.includes("const decMarkerAgeInvalid = decision.markerAgeInvalid === true;"),
+    "the decision's flag is read — `readMarkerAge` promises to report a clamped age to its caller, and this is that caller (cycle-4 review)",
+  );
+  equal(
+    aliveSummarySrc.split("decMarkerAgeInvalid=${decMarkerAgeInvalid}").length - 1,
+    1,
+    "the heartbeat-kill TEMPLATE prints the DECISION's invalid flag — `readMarkerAge` promises to report a clamped age, and a bare 0 cannot be told from a fresh marker (cycle-4 review)",
+  );
+  equal(
+    src.split("decMarkerAgeInvalid=${decMarkerAgeInvalid}").length - 1,
+    1,
+    "…and that literal exists NOWHERE else in the file, so a comment carrying it cannot satisfy the region pin",
+  );
+  equal(
+    aliveSummarySrc.split("lastMarkerAgeInvalid=${lastMarkerAgeInvalid}").length - 1,
+    1,
+    "the summary also prints the LIVE read's invalid flag — the decision-time read is taken before any yield and can only clamp on a backwards clock step, so the decision flag alone prints `false` beside exactly the clamped live age it exists to expose (cycle-4 review)",
+  );
+  equal(
+    src.split("lastMarkerAgeInvalid=${lastMarkerAgeInvalid}").length - 1,
+    1,
+    "…and that literal too exists nowhere else — the same comment-proofing as the decision flag",
+  );
+  ok(
+    src.includes("const liveMarkerAge = readMarkerAge(hbCtx.state.lastMarkerAt, now);") &&
+      src.includes("const lastMarkerAgeInvalid = liveMarkerAge.invalid;"),
+    "the live flag comes from the SAME read as the printed live age (a second `readMarkerAge` call could disagree with the age beside it)",
+  );
+  ok(src.includes("no life signs for ${Math.round(decMarkerAgeMs / 1000)}s"), "the cut headline prints the DECISION's age — the post-await re-read is what rendered '-1s'");
+  // The three completion/backstop payloads read `.ageMs` only (no `invalid`
+  // field). That is DELIBERATE, not an omission (#1339 review-6 P3): each takes
+  // `now = Date.now()` AT its own read, so `lastMarkerAt > now` there can only
+  // mean the WALL CLOCK stepped backwards — the case the decision-time flag
+  // already covers — whereas the tick-kill path reads AFTER an `await`, which is
+  // where a marker ingested inside the probe window makes the live read clamp.
+  // That scope is stated on `MarkerAgeReading.invalid` and in `load-policy.md`
+  // §6; the field's exact literal is already pinned to exactly one occurrence
+  // above, so no second pin is warranted (and a looser
+  // `"lastMarkerAgeInvalid="` count pin would be satisfiable by the docblock
+  // that explains the scope — the comment-satisfiable-pin class this test
+  // exists to close).
+  equal(src.split("hbCtx.state.lastMarkerAt > 0 ? Date.now() - hbCtx.state.lastMarkerAt").length - 1, 0, "no site computes the marker age by hand any more — every reader goes through `readMarkerAge`");
+  equal(src.split("hbCtx.state.lastMarkerAt > 0 ? now - hbCtx.state.lastMarkerAt : -1").length - 1, 0, "…neither on the tick clock");
+  // ⛔ THE TWO PINS ABOVE ARE SPELLING-BOUND, and a real revert of the backstop
+  // reader (the site whose comment claims "the single-reader invariant is only
+  // true if this site goes through it too") ends in `: Infinity`, so it matches
+  // NEITHER — measured (#1339 review-6): restoring
+  // `lastMarkerAt > 0 ? now - lastMarkerAt : Infinity` left 373/0 GREEN. This
+  // regex is the spelling-free form of the same invariant: any hand-rolled
+  // `lastMarkerAt > 0 ? <clock> - lastMarkerAt` ternary is caught whatever its
+  // false-branch is.
+  ok(
+    !/\blastMarkerAt > 0 \?\s*(?:Date\.now\(\)|now)\s*-/.test(src),
+    "no hand-rolled `lastMarkerAt > 0 ? <clock> - lastMarkerAt` ternary survives — a `: Infinity` / `: 0` false-branch does not exempt the raw difference from the single-reader rule (#1339 review-6 mutation: `: Infinity` survived the exact-literal pins above). The pattern recognises the `Date.now()` and `now` clocks ONLY; a RENAMED clock is caught by the positive pin below instead, which is spelling-free (#1339 re-review P3b — this message used to claim \"in any spelling\", which overstated the pattern)",
+  );
+  // ⛔ A POSITIVE `src.includes()` IS SATISFIABLE BY A COMMENTED-OUT COPY (#1339
+  // re-review P3a — measured: commenting both lines out and writing
+  // `const markerAge = Infinity;` left the suite GREEN). Positive presence
+  // claims are therefore asked of a COMMENT-STRIPPED projection, so prose
+  // cannot stand in for code. The naive strip is the one `#1339`'s wiring block
+  // above already uses (`code`), for exactly this reason.
+  const code = src.replace(/\/\/[^\n]*/g, "").replace(/\/\*[\s\S]*?\*\//g, "");
+  ok(
+    code.includes("const backstopMarkerAge = readMarkerAge(hbCtx.state.lastMarkerAt, now).ageMs;") &&
+      code.includes("const markerAge = backstopMarkerAge < 0 ? Infinity : backstopMarkerAge;"),
+    "the backstop's freshness read goes through `readMarkerAge` and maps its `-1` SENTINEL to `Infinity` — so `stateFresh` never compares a threshold against a sentinel or a negative age (the pre-#1339 shape could go negative whenever a marker was ingested between the timer's `now` and the read)",
+  );
+  // ⛔ THE SUPPRESSION ITSELF (#1339 review-6 P2). Everything above pins the
+  // helpers, the guard's ARGUMENTS and the call's POSITION — and none of it
+  // asserts that a non-null `supersededBy` actually PREVENTS the kill. Measured:
+  // `if (supersededBy) {` → `if (false as boolean) {` (fully inert guard) and
+  // deleting the block's `return;` (the realistic refactor) BOTH left 373/0
+  // GREEN — so the fix could be removed entirely with the whole file's suite
+  // green, which is the false-PASS class this PR exists to close. Pinned below
+  // structurally: the gate exists once, its block RETURNS before the kill, and
+  // the block never reaches the tree kill.
+  equal(src.split("if (supersededBy) {").length - 1, 1, "exactly ONE suppression gate — the guard's verdict is what gates the kill, and a second gate elsewhere would be a different policy");
+  const suppressIdx = src.indexOf("if (supersededBy) {");
+  const suppressEnd = suppressIdx >= 0 ? src.indexOf("clearInterval(heartbeat);", suppressIdx) : -1;
+  const suppressBlock = suppressIdx >= 0 && suppressEnd > suppressIdx ? src.slice(suppressIdx, suppressEnd) : "";
+  ok(suppressEnd > suppressIdx, "the suppression returns BEFORE `clearInterval(heartbeat)` — the tick timer must stay armed so the clause re-decides (clearing it would turn a one-tick suppression into a dead detector)");
+  ok(/^\s+return;\s*$/m.test(suppressBlock), "the suppressed path RETURNS — without this `return;` the block only LOGS and the kill executes on the superseded verdict (`#1339 review-6 mutation 2b: 373/0 GREEN without it`)");
+  ok(!suppressBlock.includes("killTreeAndEscalate"), "…and never reaches `killTreeAndEscalate()` — a kill inside the suppression block is the false kill this change exists to stop");
 });
 
 test("getTaskBackstopMs — default tool-stall + 30min; env override; 0 = off", () => {
@@ -5636,8 +6011,15 @@ test("#783 §6.6: dispatch outcome row preserves UNKNOWN dirtyPaths as null (nev
   // call site coalesced `?? []` and the row type declared `string[]` — so the
   // JSONL row asserted "zero dirty paths" for a tree nobody observed.
   const src = readFileSync(resolve(__dirname, "index.ts"), "utf-8");
-  ok(src.includes("dirtyPaths: repoState?.paths ?? null"), "the row must carry null (UNKNOWN)");
-  ok(!src.includes("dirtyPaths: repoState?.paths ?? []"), "the laundering form must be gone");
+  // #2105 review P2 moved the row onto the SETTLE-TIME read (`settleState`), so
+  // this pins the SHAPE — the field carries `?? null`, never `?? []` — rather than
+  // the name of the variable it reads from. The anti-laundering check is written
+  // against the field, so it cannot be satisfied by renaming the reader.
+  const dirtyIdx = src.indexOf("dirtyPaths:");
+  ok(dirtyIdx > 0, "the row carries a dirtyPaths field");
+  const dirtyField = src.slice(dirtyIdx, dirtyIdx + 120);
+  ok(/dirtyPaths: \w+\?\.paths \?\? null/.test(dirtyField), "the row must carry null (UNKNOWN)");
+  ok(!/\?\? \[\]/.test(dirtyField), "the laundering form must be gone");
   const rec = readFileSync(resolve(__dirname, "../shared/dispatch-record.ts"), "utf-8");
   ok(rec.includes("dirtyPaths: string[] | null;"), "the row type must admit null");
 });
@@ -7293,6 +7675,19 @@ testAsync("#783/T2: asyncRepoState reads branch/headSha/dirty/paths from a real 
     deepEqual(dirty!.paths, ["a.txt"], "the changed path is reported");
     equal(dirty!.headSha, clean!.headSha, "headSha unchanged by a worktree edit");
 
+    // #2105 review P2 — the SAME coverage gap the sync twin had: `?? a.txt` is the
+    // one porcelain shape with NO leading space. The shape every dirty worktree
+    // actually has is ` M path` (X column is a space), so pin that here too. This
+    // reader was already argv-form and never trimmed, so it is a GUARANTEE rather
+    // than a bug fix — and it is what makes the two readers provably agree.
+    rmSync(join(dir, "a.txt"), { force: true });
+    writeFileSync(join(dir, "tracked.txt"), "v1\n");
+    execSync("git add tracked.txt && git -c user.email=t@t -c user.name=t commit -q -m add-t", { cwd: dir });
+    writeFileSync(join(dir, "tracked.txt"), "v2\n");
+    const trackedChange = await asyncRepoState(dir);
+    equal(trackedChange!.dirty, true, "a TRACKED modification is seen");
+    deepEqual(trackedChange!.paths, ["tracked.txt"], "…and its path is not truncated");
+
     execSync("git checkout -q --detach", { cwd: dir });
     const detached = await asyncRepoState(dir);
     equal(detached!.branch, null, "detached HEAD → branch=null (worktree is the recovery key)");
@@ -7316,6 +7711,210 @@ testAsync("#783/T2 (review fix): a failed status probe is UNKNOWN, never a confi
     `branch=main headSha=${"a".repeat(40)} worktree=/tmp dirty=unknown dirtyPaths=unknown`,
     "the render shows dirty=unknown dirtyPaths=unknown (name=value format preserved)",
   );
+});
+
+// ── #2105 — the wedge report reads the artifact AT REPORT TIME ────────
+//
+// The defect: the report rendered the SPAWN-TIME snapshot with no timestamp, so
+// `dirty=false dirtyPaths=0 headSha=<spawn sha>` read as "this worker did
+// nothing" on a worktree holding modified files and seven commits. These tests
+// pin the three things the issue asks for: the artifact is re-read at report
+// time, the stale case is a REFUSAL, and a failed read proves no negative.
+section("#2105 — repo state is read at REPORT time, and a stale snapshot withholds the verdict");
+
+const RS_SNAP = { branch: "feat/x", headSha: "a".repeat(40), dirty: false, paths: [] as string[], observedAt: 1_000 };
+const RS_NOW = { branch: "feat/x", headSha: "b".repeat(40), dirty: true, paths: ["m.ts", "n.ts", "o.ts"], observedAt: 9_000 };
+
+test("#2105: an UNMOVED head renders the FRESH read, timestamped, with no withholding", () => {
+  const same = { ...RS_NOW, headSha: RS_SNAP.headSha, dirty: false, paths: [] as string[] };
+  const line = repoStateReportText(RS_SNAP, "/wt", 9_000, { probe: () => same, countCommits: () => 0 });
+  ok(line.startsWith(renderRepoStateLine(same, "/wt")), "the tree facts are the FRESH ones, in the established census format");
+  ok(line.includes("repoStateSource=fresh"), "the line names where the facts came from");
+  ok(line.includes("repoStateAt=9000"), "…and WHEN they were read (#2105 ask 1: name the timestamp)");
+  ok(line.includes("snapshotAgeMs=8000"), "the snapshot's own age is still disclosed");
+  ok(line.includes("verdictWithheld=none"), "nothing withheld when the tree did not move");
+  ok(!line.includes("WITHHELD —"), "no refusal sentence on a current reading");
+});
+
+test("#2105: a HEAD THAT MOVED is a REFUSAL, not a report — and it names the commits that landed", () => {
+  const line = repoStateReportText(RS_SNAP, "/wt", 9_000, { probe: () => RS_NOW, countCommits: () => 7 });
+  // The FRESH facts are still reported — they are the antidote to "nothing happened".
+  ok(line.includes("headSha=" + "b".repeat(40)), "the observed head is reported, not the recorded one");
+  ok(line.includes("dirty=true dirtyPaths=3"), "the observed dirty tree is reported (the incident's seven commits + modified files)");
+  ok(line.includes("verdictWithheld=stale-snapshot"), "the machine token a consumer routes on (#2105 ask 2)");
+  ok(line.includes("VERDICT WITHHELD — snapshot is stale"), "…and the readable sentence the issue asks for verbatim");
+  ok(line.includes(`snapshotHeadSha=${"a".repeat(40)}`), "the stale head is kept, LABELLED as the snapshot");
+  ok(line.includes("commitsSinceSnapshot=7"), "the number that was missing in the incident");
+  ok(!line.includes("\n"), "never a newline — the Alive state line stays single-line");
+});
+
+test("#2105: a failed read at report time proves NO negative — unknown, never a cached clean", () => {
+  const line = repoStateReportText(RS_SNAP, "/wt", 9_000, { probe: () => null });
+  ok(line.includes("dirty=unknown dirtyPaths=unknown"), "a tree nobody could read is UNKNOWN, never dirty=false");
+  ok(line.includes("repoStateSource=unavailable"), "the source is named");
+  ok(line.includes("verdictWithheld=state-unreadable"), "the withholding is named");
+  ok(line.includes(`snapshotHeadSha=${"a".repeat(40)}`), "the snapshot head survives, labelled as a past reading");
+  ok(!line.includes("dirty=false"), "the cached snapshot is NEVER rendered as current state");
+});
+
+test("#2105: a PARTIAL read (status failed, head readable) still withholds the verdict", () => {
+  // ⛔ THE COMMON UNREADABLE CASE, not the rare one (#2105 review P2).
+  // `syncRepoState` returns a state while ANY of its three reads succeeds, so this
+  // is the shape a tree has when `git status` alone fails — `index.lock` held by
+  // the very commit the child is making, or the 5 s status timeout on a tree this
+  // repo's size. The FIELDS were safe; the TOKEN said `verdictWithheld=none`,
+  // i.e. "a verdict was given", for a tree nobody observed.
+  const partialAt = (headSha: string) => ({ branch: "feat/x", headSha, dirty: null, paths: null, observedAt: 9_000 });
+
+  // (a) unmoved head + failed status: the plain partial read.
+  const quiet = repoStateReportText(RS_SNAP, "/wt", 9_000, { probe: () => partialAt(RS_SNAP.headSha), countCommits: () => 0 });
+  ok(quiet.includes("verdictWithheld=state-unreadable"), "a tree whose status never ran withholds the verdict");
+  ok(!quiet.includes("verdictWithheld=none"), "…so the token can NEVER say 'no verdict withheld' over an unknown field");
+  ok(quiet.includes("dirty=unknown dirtyPaths=unknown"), "the fields stay UNKNOWN, never a fabricated clean");
+  ok(!quiet.includes("dirty=false"), "no cached clean is rendered as current state");
+  ok(quiet.includes("repoStateSource=fresh"), "the source is named; the failure is in the status read, not the reader");
+  ok(!quiet.includes("snapshotHeadSha="), "an unmoved head invents no staleness beside the refusal");
+
+  // (b) moved head AND failed status — the reviewer's own fixture shape. The
+  // unreadable refusal WINS (a moved head does not make the tree observable),
+  // and BOTH readable-head facts survive, so nothing is silently dropped.
+  const both = repoStateReportText(RS_SNAP, "/wt", 9_000, { probe: () => partialAt("b".repeat(40)), countCommits: () => 7 });
+  ok(both.includes("verdictWithheld=state-unreadable"), "the unreadable tree is the primary refusal, even when the head also moved");
+  ok(!both.includes("verdictWithheld=stale-snapshot"), "…and it does not launder itself into the stale token");
+  ok(both.includes(`headSha=${"b".repeat(40)}`), "the observed head survives — an observed fact is not withheld with the verdict");
+  ok(both.includes(`snapshotHeadSha=${"a".repeat(40)}`), "the moved snapshot head is still named");
+  ok(both.includes("commitsSinceSnapshot=7"), "…with the commit count, because both heads WERE readable");
+  ok(both.includes("the head ALSO moved"), "the human sentence states both facts, not just the one the token names");
+  ok(!both.includes("\n"), "never a newline — the Alive state line stays single-line");
+});
+
+test("#2105: repoStateSnapshotStale — a moved head only, never a missing one", () => {
+  equal(repoStateSnapshotStale(RS_SNAP, RS_NOW), true, "two known, different heads ⇒ stale");
+  equal(repoStateSnapshotStale(RS_SNAP, { ...RS_NOW, headSha: RS_SNAP.headSha }), false, "same head ⇒ not stale");
+  equal(repoStateSnapshotStale(null, RS_NOW), false, "no recorded head ⇒ no staleness CLAIM (absence is not evidence)");
+  equal(repoStateSnapshotStale(RS_SNAP, null), false, "no observed head ⇒ no staleness claim");
+  equal(repoStateSnapshotStale({ ...RS_SNAP, headSha: null }, RS_NOW), false, "an unreadable recorded head is not a move");
+});
+
+testAsync("#2105: syncRepoState reads a REAL repo (branch/headSha/dirty/paths) and stamps observedAt", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "t2105-sync-"));
+  try {
+    execSync("git init -q", { cwd: dir });
+    execSync("git -c user.email=t@t -c user.name=t commit -q --allow-empty -m init", { cwd: dir });
+    const clean = syncRepoState(dir, 12_345);
+    ok(clean, "a real repo is readable at report time");
+    equal(clean!.dirty, false);
+    deepEqual(clean!.paths, []);
+    equal(clean!.observedAt, 12_345, "the read is STAMPED — an age is what a report needs");
+    ok(/^[0-9a-f]{40}$/.test(clean!.headSha ?? ""), "a full head sha");
+    writeFileSync(join(dir, "dirty.txt"), "x");
+    const dirty = syncRepoState(dir);
+    equal(dirty!.dirty, true, "an untracked file is seen");
+    deepEqual(dirty!.paths, ["dirty.txt"], "and named");
+
+    // ⛔ THE SHAPE EVERY DIRTY WORKTREE ACTUALLY HAS (#2105 review P2). Porcelain
+    // `-z` writes ` M x.txt` — the X column is a SPACE for every unstaged change.
+    // The reader used to `.trim()` its stdout, which ate that column for the FIRST
+    // entry only, so `slice(3)` returned a truncated path (".txt"). The existing
+    // untracked fixture (`?? dirty.txt`) has no leading space, which is why it
+    // could not see the defect. This case FAILS on the pre-fix code.
+    rmSync(join(dir, "dirty.txt"), { force: true }); // untracked fixture is a SEPARATE case above
+    writeFileSync(join(dir, "x.txt"), "v1\n");
+    execSync("git add x.txt && git -c user.email=t@t -c user.name=t commit -q -m add-x", { cwd: dir });
+    writeFileSync(join(dir, "x.txt"), "v2\n");
+    const tracked = syncRepoState(dir);
+    equal(tracked!.dirty, true, "a TRACKED modification is seen, not just an untracked one");
+    deepEqual(tracked!.paths, ["x.txt"], "its path survives the space-X column (no trim, no truncation)");
+
+    // …and the narrow FALSE-CLEAN the trim produced: a 1-character path as the
+    // tree's ONLY change parsed to `[]` ⇒ `dirty=false` — the fabricated clean
+    // this whole change exists to prevent.
+    execSync("git checkout -- x.txt", { cwd: dir });
+    writeFileSync(join(dir, "a"), "v1\n");
+    execSync("git add a && git -c user.email=t@t -c user.name=t commit -q -m add-a", { cwd: dir });
+    writeFileSync(join(dir, "a"), "v2\n");
+    const oneChar = syncRepoState(dir);
+    deepEqual(oneChar!.paths, ["a"], "a 1-character path survives the read");
+    equal(oneChar!.dirty, true, "…so the tree is never reported clean from a read that lost it");
+
+    equal(syncRepoState(join(dir, "does-not-exist")), null, "an unreadable tree is UNKNOWN (null), not a clean one");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+testAsync("#2105 P1: syncRepoState never puts the caller-supplied cwd through a shell (child→parent execution)", async () => {
+  // `cwd` here is the `task` tool's CALLER-SUPPLIED path: a child agent has shell
+  // access, so it can `mkdir` a directory with metacharacters in its name and pass
+  // it as `task({ cwd })`. Before this fix the report-time read reached git as
+  // execSync(`git -C "${repo}" …`) — and `$(…)` IS expanded inside double quotes —
+  // so the CHILD chose a command run in the PARENT process. `taskCwdRefusal`
+  // rejects only NUL/non-directories, so the metacharacters arrived intact.
+  //
+  // `$(>file)` is a bare redirection: it creates `file` relative to the git
+  // process's cwd (the parent's), so no `/` is needed in the directory name.
+  const root = mkdtempSync(join(tmpdir(), "t2105-inj-"));
+  const sentinel = `pi2105_inj_${process.pid}_${Date.now()}`;
+  const sentinelPath = join(process.cwd(), sentinel);
+  try {
+    const evil = join(root, `dol$(${">"}${sentinel})`);
+    mkdirSync(evil);
+    const state = syncRepoState(evil);
+    equal(existsSync(sentinelPath), false, "the caller-supplied cwd must never be shell-expanded in the parent");
+    equal(state, null, "an unreadable path stays UNKNOWN (null), never a confident clean");
+  } finally {
+    rmSync(sentinelPath, { force: true });
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("#2105 P1: the report-time reader is ARGV-form, never a shell string (source pin)", () => {
+  // The mechanism is the fix: a denylist of metacharacters would be a new
+  // enumeration to defeat. Assert the shell-free reader exists and that the
+  // report path uses it.
+  ok(
+    repoFreshSource.includes('execFileSync("git", ["-C", cwd, ...args]'),
+    "one shell-free (argv) reader exists for the report path",
+  );
+  const syncBody = repoFreshSource.slice(
+    repoFreshSource.indexOf("export function syncRepoState"),
+    repoFreshSource.indexOf("export function countCommitsBetween"),
+  );
+  ok(syncBody.includes('tryGitArgv(cwd, ["status", "--porcelain", "-z"]'), "the status read is argv-form");
+  ok(!/\btryGit\(/.test(syncBody), "no shell-form reader remains in syncRepoState");
+  // …and the argv reader must NOT trim: porcelain `-z` X column is a space.
+  const argvBody = repoFreshSource.slice(
+    repoFreshSource.indexOf("function gitArgv"),
+    repoFreshSource.indexOf("function tryGitArgv"),
+  );
+  ok(!/\.trim\(\)/.test(argvBody), "the argv reader returns stdout VERBATIM (a trim misaligns porcelain -z)");
+});
+
+testAsync("#2105: countCommitsBetween counts what landed since the snapshot, and refuses a non-hex ref", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "t2105-count-"));
+  try {
+    execSync("git init -q", { cwd: dir });
+    execSync("git -c user.email=t@t -c user.name=t commit -q --allow-empty -m one", { cwd: dir });
+    const first = execSync("git rev-parse HEAD", { cwd: dir, encoding: "utf-8" }).trim();
+    for (const m of ["two", "three", "four"]) execSync(`git -c user.email=t@t -c user.name=t commit -q --allow-empty -m ${m}`, { cwd: dir });
+    const now = execSync("git rev-parse HEAD", { cwd: dir, encoding: "utf-8" }).trim();
+    equal(countCommitsBetween(dir, first, now), 3, "the three commits that landed after the snapshot");
+    equal(countCommitsBetween(dir, now, now), 0, "nothing between a head and itself");
+    // The hex gate's PROOF must use a ref git itself would ACCEPT. With the argv
+    // reader in place, `--help` / `zzz` are refused by git (`fatal: bad revision`,
+    // exit 128) and `tryGitArgv` swallows the throw to `null` — so those rows read
+    // `null` whether the regex exists or not and cannot red when it is deleted.
+    // `HEAD` is a git-VALID rev that is NOT hex: with the gate deleted the call
+    // returns a NUMBER here and these rows go red. Measured both ways: gate on →
+    // null, gate deleted → 0 (`HEAD..<now>`) and 3 (`<first>..HEAD`).
+    equal(countCommitsBetween(dir, "HEAD", now), null, "a git-valid but non-hex ref is refused BY THE HEX GATE (deleting the regex returns 0 here)");
+    equal(countCommitsBetween(dir, first, "HEAD"), null, "…on either side (deleting the regex returns 3 here)");
+    // Kept as defence-in-depth rows, not as the gate's proof (git refuses them itself).
+    equal(countCommitsBetween(dir, "--help", now), null, "an option-shaped ref is refused (no shell interpolation of arbitrary text)");
+    equal(countCommitsBetween(dir, first, "zzz"), null, "…on either side");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 // ── #1071: the task child's TARGET working directory ─────────────────
@@ -7395,6 +7994,202 @@ test("#1071 (review fix): an existing target is canonicalized to its PHYSICAL pa
   }
 });
 
+// ── #1698: a MISSING spawn cwd names the CAUSE, not the binary ───────
+//
+section("#1698 — a missing spawn cwd names the cause");
+
+// POSITIVE CONTROL, measuring the premise rather than asserting it: Node reports a
+// missing working directory as an ENOENT naming the EXECUTABLE (`spawn <binary>
+// ENOENT`), never the directory. That is the whole defect — the raw message reads
+// as "pi is not installed", so a swept /tmp worktree costs calls to misdiagnose.
+// If a future Node named the cwd itself, the pin below would be pinning a shape
+// that no longer occurs, so this control fails loudly first.
+test("#1698: `spawn` reports a missing cwd as an ENOENT on the BINARY — the misdiagnosis this fixes", () => {
+  const ghost = join(tmpdir(), `t1698-ghost-${process.pid}-${Math.random().toString(16).slice(2)}`);
+  const r = spawnSync(process.execPath, ["-e", "1"], { cwd: ghost });
+  equal(r.error?.code, "ENOENT", "a missing cwd surfaces as ENOENT");
+  ok(/ENOENT/.test(String(r.error?.message)), `the message carries the errno: ${r.error?.message}`);
+  ok(!String(r.error?.message).includes(ghost), `and does NOT name the missing directory — it names the binary: ${r.error?.message}`);
+});
+
+// The fix: an ENOENT whose cwd is genuinely ABSENT gets the cause named, and the
+// original message is preserved (so nothing is lost from what Node said).
+test("#1698: an ENOENT with a MISSING cwd names the directory and denies the pi-install reading", () => {
+  const ghost = join(tmpdir(), `t1698-missing-${process.pid}-${Math.random().toString(16).slice(2)}`);
+  const err = Object.assign(new Error(`spawn ${process.execPath} ENOENT`), { code: "ENOENT" });
+  const msg = describeSpawnFailure(err, ghost);
+  ok(msg.startsWith(`spawn ${process.execPath} ENOENT`), `the original message is preserved: ${msg}`);
+  ok(msg.includes(`(spawn cwd: ${ghost})`), `the cwd it was handed is still reported: ${msg}`);
+  ok(msg.includes("DOES NOT EXIST"), `the cause is named: ${msg}`);
+  ok(msg.includes(ghost), `the missing directory is named: ${msg}`);
+  ok(/NOT a missing `pi` install/.test(msg), `it denies the reading the raw errno invites: ${msg}`);
+});
+
+// The mirror: an ENOENT whose cwd EXISTS really does mean the binary is missing,
+// so the plain message must stand — claiming "the cwd was swept" there would send
+// the reader to rebuild a directory that is right in front of them.
+test("#1698: an ENOENT with an EXISTING cwd keeps the plain message (the binary IS what is missing)", () => {
+  const dir = mkdtempSync(join(tmpdir(), "t1698-exists-"));
+  try {
+    const err = Object.assign(new Error(`spawn /nonexistent/pi ENOENT`), { code: "ENOENT" });
+    const msg = describeSpawnFailure(err, dir);
+    equal(msg, `spawn /nonexistent/pi ENOENT (spawn cwd: ${dir})`, "byte-exact plain message — no cause claimed");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// Any other errno means the path may well exist (EACCES on a mode-000 dir, EPERM,
+// a stale mount). The fail-safe direction is NO cause claim: a wrong "this was
+// swept" is worse than the generic message it replaced.
+test("#1698: a non-ENOENT failure with a missing cwd makes NO claim (fail-safe)", () => {
+  const ghost = join(tmpdir(), `t1698-eacces-${process.pid}-${Math.random().toString(16).slice(2)}`);
+  const err = Object.assign(new Error("spawn /x EACCES"), { code: "EACCES" });
+  equal(describeSpawnFailure(err, ghost), `spawn /x EACCES (spawn cwd: ${ghost})`, "no cause claimed on an unrecognised errno");
+  equal(describeSpawnFailure({ message: "boom" }, ghost), `boom (spawn cwd: ${ghost})`, "an errno-less error stays plain");
+});
+
+// TOTAL by construction: this runs on the settle path of a failed dispatch, so it
+// must never throw — a throw here would replace the child's failure with a crash.
+test("#1698: describeSpawnFailure is total — odd inputs never throw", () => {
+  const ghost = join(tmpdir(), `t1698-total-${process.pid}-${Math.random().toString(16).slice(2)}`);
+  for (const bad of [undefined, null, "a string", 42, {}, { code: "ENOENT" }]) {
+    const msg = describeSpawnFailure(bad, ghost);
+    ok(typeof msg === "string" && msg.includes(ghost), `odd input ${String(bad)} still yields a message naming the cwd: ${msg}`);
+  }
+  const enoentNoMessage = { code: "ENOENT" };
+  ok(describeSpawnFailure(enoentNoMessage, ghost).includes("DOES NOT EXIST"), "an errno-only object still gets the cause named");
+});
+
+// THE FAIL-SAFE DIRECTION, PINNED (review round 5, P3 — verified finding). The row
+// above exercises only `exists` and `absent`. The branch the `isAbsentPath` doc
+// comment spends six lines on — a path that EXISTS but whose `statSync` FAILS — was
+// asserted by comment only: `catch { return true; }` left every `#1698` row GREEN
+// before this one. A directory the process cannot traverse (mode 000)
+// makes `statSync` on a child throw `EACCES` while the child is really there, so the
+// mutant `catch { return true; }` would append "the cwd does not exist" to a
+// directory sitting on disk — the misdiagnosis the guard exists to prevent.
+test("#1698: an existing cwd whose stat FAILS keeps the plain message (the fail-safe arm)", () => {
+  const parent = mkdtempSync(join(tmpdir(), "t1698-eacces-"));
+  const child = join(parent, "child");
+  mkdirSync(child);
+  // Mode bits deny nothing to uid 0, where the premise does not hold — declared
+  // rather than silently asserting a green row that measured nothing.
+  if (typeof process.getuid === "function" && process.getuid() === 0) return;
+  chmodSync(parent, 0o000);
+  try {
+    // The premise: the child EXISTS, and `statSync` on it still throws.
+    let threw = false;
+    try {
+      statSync(child);
+    } catch {
+      threw = true;
+    }
+    ok(threw, "premise — an untraversable parent makes statSync throw on a child that exists");
+    equal(
+      describeSpawnFailure({ code: "ENOENT", message: "spawn /x ENOENT" }, child),
+      `spawn /x ENOENT (spawn cwd: ${child})`,
+      "a stat failure that is NOT ENOENT/ENOTDIR claims nothing — the directory is still there",
+    );
+  } finally {
+    chmodSync(parent, 0o700);
+    rmSync(parent, { recursive: true, force: true });
+  }
+});
+
+// ⛔ THE OTHER HALF OF THE SAME GUARD (review round 5, P3 — the `ENOTDIR` arm). The
+// row above pins the catch: a failure that is neither `ENOENT` nor `ENOTDIR` must
+// claim nothing. But `isAbsentPath` accepts the PAIR, and dropping `ENOTDIR` from it
+// (`return code === "ENOENT"`) reddened NO row before this one existed — measured on
+// the real `index.ts`; now this is the only row that reddens. The arm is kept as
+// DEFENCE-IN-DEPTH, not as the guard that rescues a common shape — measured (node
+// v24.21.0): a cwd whose ANCESTOR IS A FILE makes `spawn` throw SYNCHRONOUSLY with
+// `code: "ENOTDIR"` / message `spawn ENOTDIR`, so no ChildProcess exists, no async
+// `error` event fires, and `describeSpawnFailure` (reached only from `proc.on("error")`)
+// is never called for that shape at all — which is why THIS ROW IS A PREDICATE-CONTRACT
+// ROW, not a replay of a producible state: it calls the helper with `{ code: "ENOENT" }`
+// deliberately, to pin `isAbsentPath`'s answer for an `ENOTDIR` path. It must not be
+// read as claiming that spawn ever reports ENOENT for that path (it does not). The
+// arm still earns its place: it keeps `isAbsentPath` correct as a plain predicate — a
+// path under a FILE cannot exist — so any caller that DOES hand it one (a cross-check,
+// a future sync `catch`) gets the true answer instead of "this path exists".
+test("#1698: isAbsentPath's ENOTDIR arm — a path under a FILE is ABSENT (predicate contract, not a spawn replay)", () => {
+  const dir = mkdtempSync(join(tmpdir(), "t1698-enotdir-"));
+  try {
+    const file = join(dir, "not-a-dir");
+    writeFileSync(file, "x");
+    const under = join(file, "child");
+    let code: string | undefined;
+    try {
+      statSync(under);
+    } catch (err) {
+      code = (err as { code?: string } | null)?.code;
+    }
+    equal(code, "ENOTDIR", "premise — the probe really hits ENOTDIR here, not ENOENT");
+    ok(
+      describeSpawnFailure({ code: "ENOENT", message: "spawn /x ENOENT" }, under).includes("DOES NOT EXIST"),
+      "the ENOTDIR arm names the cause for a path under a FILE (called directly: production throws ENOTDIR synchronously, so this pins the PREDICATE, not a spawn replay)",
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ⛔ THE CALL SITE, PINNED (review round 2, P2 — verified finding). The five rows
+// above test `describeSpawnFailure` DIRECTLY, so before this block the mutant
+// `:5152 → text: `Sub-agent failed: ${err.message} (spawn cwd: ${targetCwd})``
+// restored the entire #1698 defect and every one of them stayed GREEN: not one row
+// in this file referenced `Sub-agent failed`. An assertion that cannot fail under
+// the mutation that reverts the fix is the class #3442 names. Two rows, in the
+// order of strength this file already uses:
+//   (i)  SOURCE pin — deterministic, anchored, and it names the exact substitution;
+//   (ii) BEHAVIOURAL pin — the settle a failed dispatch actually reports. A
+//        nonexistent cwd is the one target `taskCwdRefusal` deliberately lets
+//        through (`:3977`), so this exercises the real path the fix exists for,
+//        with no child: `spawn` fails before exec.
+test("#1698: the spawn-error settle CALLS describeSpawnFailure (source pin — the call-site mutation)", () => {
+  ok(
+    source.includes("Sub-agent failed: ${describeSpawnFailure(err, targetCwd)}"),
+    "the settle composes its message through describeSpawnFailure (reverting this restores the #1698 defect)",
+  );
+  // The negative twin: the pre-fix form must be GONE, not merely accompanied. A
+  // bare `includes` on the new text would stay green if an old-shaped producer
+  // were added beside it.
+  ok(
+    !source.includes("Sub-agent failed: ${err.message} (spawn cwd: ${targetCwd})"),
+    "no producer still reports the raw errno with no cause named",
+  );
+});
+
+testAsync("#1698 (behavioural): a dispatch into a MISSING cwd settles with the cause named", async () => {
+  const ghost = join(tmpdir(), `t1698-settle-${process.pid}-${Math.random().toString(16).slice(2)}`);
+  // `process.argv[1] = undefined` makes getPiInvocation fall back to bare `pi`
+  // (cut-resume.integration.test.ts precedent) — irrelevant to the outcome here,
+  // because the cwd is missing, so `spawn` fails before any exec.
+  const prevArgv1 = process.argv[1];
+  (process.argv as unknown as string[])[1] = undefined as unknown as string;
+  try {
+    const res = await Promise.race([
+      // No row in the operator's ledger for a test dispatch (#783 gate). Without
+      // this the settle writes a fake `spawn-error` dispatch-outcome row — with a
+      // `/tmp/t1698-settle-*` cwd and `dispatchId: null` — into the append-only
+      // operator audit ledger on EVERY run (measured: 3 such rows accrued in one
+      // session's test runs). Same rule as the `#1071` row below.
+      spawnSubAgent("deepseek-v4-flash", "deepseek", { DISPATCH_LEDGER: "0" }, ["--version"], undefined, undefined, ghost),
+      new Promise<null>((r) => setTimeout(() => r(null), 20_000)),
+    ]);
+    ok(res !== null, "the dispatch SETTLES on a missing cwd (it must not hang the parent)");
+    const text = String((res as { content?: { text?: string }[] } | null)?.content?.[0]?.text ?? "");
+    ok(text.includes("Sub-agent failed"), `the settle message is composed: ${text}`);
+    ok(text.includes("DOES NOT EXIST"), `it names the missing cwd as the CAUSE — the wiring this row exists for: ${text}`);
+    ok(text.includes(ghost), `it names the directory: ${text}`);
+    ok(/NOT a missing `pi` install/.test(text), `it denies the reading the raw errno invites: ${text}`);
+    equal((res as { details?: { isError?: unknown } } | null)?.details?.isError, true, "still reported as an error, never a success");
+  } finally {
+    (process.argv as unknown as string[])[1] = prevArgv1;
+  }
+});
+
 // SOURCE PINS: the ONE resolved value feeds BOTH consumers (spawn + repo probe)
 // and the ledger row, and the schema exposes it to parents.
 test("#1071: the target cwd is wired through spawn + repo probe + ledger row (source pin)", () => {
@@ -7405,9 +8200,13 @@ test("#1071: the target cwd is wired through spawn + repo probe + ledger row (so
   ok(/\{\s*\n\s*cwd: targetCwd,\s*\n\s*shell: false,/.test(source), "the child is SPAWNED in the target cwd (not process.cwd())");
   ok(source.includes("cwd: targetCwd,"), "the repo-state/ledger consumers read the same target cwd");
   ok(source.includes("void asyncRepoState(targetCwd, { signal })"), "the repo probe reads the TARGET repo");
-  ok(source.includes("renderRepoStateLine(repoState, targetCwd)"), "the wedge report names the TARGET worktree");
+  // #2105: the report no longer renders the spawn-time snapshot; it re-reads the
+  // TARGET worktree at report time. The pin therefore follows the seam — the
+  // cached snapshot AND the target cwd are both handed to the report renderer.
+  ok(source.includes("repoStateReportText(repoState, targetCwd, Date.now())"), "the wedge report reads + names the TARGET worktree at report time");
   ok(!source.includes("void asyncRepoState(process.cwd(), { signal })"), "no stale parent-cwd probe remains");
   ok(!source.includes("renderRepoStateLine(repoState, process.cwd())"), "no stale parent-cwd render remains");
+  ok(!source.includes("const repoStateText = (): string => renderRepoStateLine(repoState, targetCwd);"), "the wedge report never renders the spawn-time snapshot as current state");
 });
 
 test("#1071: the task tool schema exposes `cwd` and threads it to every leg (source pin)", () => {
@@ -7924,6 +8723,120 @@ test("#1662: a stale log (markers stopped) with a live pid reads WEDGED", () => 
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+// ── #2105 (b) — NOT STARTED is not STALLED ───────────────────────────
+//
+// The tell, from the issue: "a child with `toolsInFlight=0` and no first tick
+// has not stalled — it has not begun." The detector was measuring CHILD-SPAWN
+// LATENCY under load (one child's first tick took 34 min, its first marker 16
+// min) and reporting it as "wedged", so lanes killed and retried (4 and 6
+// times) into the same latency. The two states have opposite correct
+// responses; these tests pin the separation and that neither is unbounded.
+section("#2105 — not-started vs stalled");
+
+test("#2105: isNotYetStarted — a ready-only child has not begun; any latch of work disproves it", () => {
+  const st = createHeartbeatState();
+  st.sawReady = true;
+  st.markerCount = 1;
+  st.tickCount = 1;
+  equal(isNotYetStarted(st), true, "ready + one tick, no turn/tool/message ⇒ NOT STARTED");
+
+  // Every latch a started child would set, one at a time, on top of that shape.
+  const withTurn = { ...createHeartbeatState(), sawReady: true, turnActive: true, everSawWork: true };
+  equal(isNotYetStarted(withTurn), false, "a turn is STARTED (not started is not 'no output yet')");
+  const withTool = { ...createHeartbeatState(), sawReady: true, toolsInFlight: 1, everSawWork: true, everSawRealActivity: true };
+  equal(isNotYetStarted(withTool), false, "a tool in flight is STARTED");
+  const withMsg = { ...createHeartbeatState(), sawReady: true, everSawRealActivity: true, firstActivityAt: 5 };
+  equal(isNotYetStarted(withMsg), false, "a message is STARTED");
+  const withProgress = { ...createHeartbeatState(), sawReady: true, lastProgressAt: 5 };
+  equal(isNotYetStarted(withProgress), false, "a completed unit of work is STARTED");
+  const ended = { ...createHeartbeatState(), sawReady: true, sessionEnded: true };
+  equal(isNotYetStarted(ended), false, "a child that declared completion is FINISHED, not unstarted (#191 owns it)");
+});
+
+test("#2105: a never-started lane reads `not-started`, never `wedged` (the re-dispatch footgun)", () => {
+  const dir = mkdtempSync(join(tmpdir(), "t2105-notstarted-"));
+  try {
+    withEnv({ TASK_HEARTBEAT_TIMEOUT_MS: undefined }, () => {
+      // ready + a tick with nothing latched, stream age 21.7 min > the 20-min S,
+      // log fresh. This is the incident's alive-state (tickCount=1,
+      // toolsInFlight=0) and pre-fix it read `wedged` — the re-dispatch signal.
+      const notStarted = `[task-heartbeat] ready nonce=testnonce\n[task-heartbeat] tick nonce=testnonce tools=0 turn=0 stream_age_ms=1300000 tool_age_max_ms=0 saw_msg=0 saw_tool=0\n`;
+      const a = seedRunningRun(dir, { markers: notStarted });
+      const va = evaluateTaskRunStatus(a.id, dir);
+      equal(va.heartbeat?.not_started, true, "the same predicate the watchdog uses is surfaced");
+      equal(va.status, "not-started", `got ${va.status}: ${va.note ?? ""}`);
+      equal(va.terminal, false, "non-terminal — a poller still reaps it later");
+      equal(va.alive, true, "the process is up: not-started ≠ dead");
+      ok(/WAIT, or reassign/.test(va.note ?? ""), `the note routes to the correct response: ${va.note}`);
+
+      // CONTROL — the SAME age/stream shape with a turn latched is a genuine
+      // no-tool stream stall and must still read `wedged`. Without this the
+      // assertion above could pass on an inert fixture.
+      const stalled = `[task-heartbeat] turn_start nonce=testnonce 1\n[task-heartbeat] tick nonce=testnonce tools=0 turn=1 stream_age_ms=1300000 tool_age_max_ms=0 saw_msg=1 saw_tool=0\n`;
+      const b = seedRunningRun(dir, { markers: stalled });
+      const vb = evaluateTaskRunStatus(b.id, dir);
+      equal(vb.heartbeat?.not_started, false, "a latched turn is not 'not started'");
+      equal(vb.status, "wedged", `the no-tool stall is unchanged for a STARTED child (got ${vb.status}: ${vb.note ?? ""})`);
+    });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("#2105: the kill headline names NEVER STARTED and routes to reassign (source pin)", () => {
+  // The generic no-progress headline offers "content-free loop or stalled
+  // stream" — both of which invite the retry that cost these lanes 4 and 6
+  // dispatches. The override must name the condition and route to reassign, and
+  // it must be gated on the DECISION's snapshot (live state can move during the
+  // awaited network probe — the #5389 live/decision split).
+  ok(source.includes("if (decision.notStarted === true)"), "the override is gated on the decision's snapshot");
+  ok(source.includes("⛔ Sub-agent NEVER STARTED"), "the headline names the condition");
+  ok(/NEVER STARTED[\s\S]{0,400}REASSIGN/.test(source), "…and routes to REASSIGN, not retry");
+  // ⛔ NOT "WAIT" (#2105 review P3): this headline is composed on the KILL path,
+  // so by the time the parent reads it the child is already dead. "WAIT" is an
+  // instruction nobody can follow. This assertion FAILS on the pre-fix text
+  // ("WAIT or REASSIGN").
+  ok(
+    !/NEVER STARTED[\s\S]{0,400}\bWAIT\b/.test(source),
+    "the kill headline must not tell the parent to WAIT for a child it has just cut",
+  );
+  // Every Alive state report carries the token, so a post-mortem can tell the
+  // two conditions apart instead of inferring it from tickCount.
+  const aliveTemplates = source.match(/Alive state: toolsInFlight=[^\n]*/g) ?? [];
+  ok(aliveTemplates.length >= 4, `four abnormal-exit Alive state sites (found ${aliveTemplates.length})`);
+  for (const site of aliveTemplates) {
+    ok(site.includes("${notStartedText()}"), "every Alive state line reports the not-started state");
+  }
+  ok(source.includes('const notStartedText = (): string => `notStarted=${isNotYetStarted(hbCtx.state)}`;'), "one predicate, shared with the watchdog and the status view");
+  ok(source.includes("decNotStarted=${decision.notStarted === true}"), "the kill payload keeps the DECISION's snapshot beside the live read");
+});
+
+test("#2105 P2: the durable dispatch-outcome row reads the tree AT SETTLE, not at spawn (source pin)", () => {
+  // The row's own comment says "Only values known AT SETTLE are recorded", and the
+  // ledger is APPEND-ONLY, so a spawn-time snapshot written there is the incident's
+  // false clean persisted forever ("7 commits landed" + `dirty=false`) in the file
+  // ledger consumers read. `repoState` is assigned once at spawn and never
+  // re-read, so using it here asserted the opposite of the comment. This pin FAILS
+  // on the pre-fix code, which interpolated `repoState?.…` into every field.
+  const start = source.indexOf("const writeOutcomeRow =");
+  ok(start > 0, "the row writer exists");
+  const rowBody = source.slice(start, source.indexOf("dirtyPaths:", start) + 40);
+  ok(rowBody.includes("syncRepoState(targetCwd)"), "the row reads the tree when it is written");
+  ok(!/repoState\?\./.test(rowBody), "no spawn-time snapshot field survives in the row");
+  ok(rowBody.includes("settleState?.headSha"), "headSha comes from the settle read");
+  ok(rowBody.includes("settleState?.paths"), "dirtyPaths comes from the settle read");
+});
+
+test("#2105 P2: a disabled no-progress bound still names a bound that will act (source pin)", () => {
+  // `task_status` used to interpolate `getProgressAgeMs() / 60_000` unconditionally,
+  // printing "the no-progress window (0 min)" — a claim a reader will act on that
+  // was false. With the suppression now conditional on the substitute being armed,
+  // a disabled no-progress bound means stream-stall is what cuts the child.
+  ok(source.includes("const notStartedBounded = notStarted && i.progressAgeMs > 0;"), "the suppression is gated on its substitute being ARMED");
+  ok(source.includes("!notStartedBounded && effStreamAge > i.streamStallMs"), "…and stream-stall still owns the class when it is not");
+  ok(source.includes("TASK_PROGRESS_AGE_MS=0 disables the no-progress window"), "the status note names the bound that actually acts");
 });
 
 test("#1662: a nonce MISMATCH is not a life sign (foreign writer on the child's fd 2)", () => {

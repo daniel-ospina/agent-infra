@@ -205,6 +205,86 @@ unconditionally.
   self-reported sample, not a live reading. All four `Alive state:` diagnostics
   expose the raw pair, `effStreamAgeMs=` / `effToolAgeMs=`, and
   `everSawRealActivity=` for triage.
+- **The verdict may not outrun its own evidence (#1339).** The decision is a
+  pure function of a SNAPSHOT, but the kill path is not: the #318 network probe
+  is awaited between the decision and `killTreeAndEscalate()` (default ON,
+  timeout up to 9 s), and every `await` yields the event loop, which is exactly
+  where the child's `data` handlers run. So the kill path re-validates before
+  killing — if the fired clause's own premise changed after the snapshot, the
+  verdict is superseded and the kill is suppressed. `no-progress` is the one
+  clause whose clock is not a function of marker/byte arrival, so it — and only
+  it — is asked about what IT reads (`supersedingEvidence`): `no-progress` is
+  measured on
+  `lastProgressAt`, which ticks and output bytes do NOT advance, so a marker
+  inside the window cannot refute it — asking the marker/byte question there
+  would restore the reset that clause exists to deny — and it is ALSO asked
+  about its own two scope gates, `session_end` (the `#191` early return: no
+  stall clause may race a completed session) and a tool in flight (a DECLARED
+  long operation, owned by the tool clauses), because both flip inside the
+  window without moving any progress clock and the clause refuses to kill for
+  either. Every other reason is refuted by a marker or a real output byte, and
+  suppressing is the fail-safe direction (a live child is not killed, and the
+  clause re-decides on the next tick). The marker/byte question is the right one
+  for each of them, and the argument differs by group: `silence-threshold`
+  decides on `now - lastLifeSignAt` — the byte clock, so a byte IS its own
+  refutation — and `cut` decides on `markerAge`, so a fresh marker refutes it
+  outright. `zero-output` is NOT `stateFresh`-gated: it fires on ABSENCE latches
+  (`!hasOutput`, `!everSawWork`, `!sawReady`, past tier-1), and a marker proves
+  the child is running — a `tick` marker sets none of those latches, so here the
+  channel refutes a premise the clause does not measure directly (still
+  fail-safe: the child re-decides and is caught by `silence-threshold` at T, or
+  by `TASK_HARD_CAP_MS`). The AGE clauses — `stream-stall`, `tool-stall`,
+  `tool-silence`, `tool-dead`, `first-message-stall` — are `stateFresh`-gated
+  and decide on `effStreamAge`/`effToolAge` = the child's frozen sample +
+  `markerAge`, so a fresh marker NARROWS the decided age rather than refuting
+  it; those are the clauses whose own bound can be deferred for as long as
+  markers keep landing inside the probe window, and their backstop is
+  `TASK_HARD_CAP_MS`. Comparing those ages against live values is a tracked
+  follow-up (agent-infra#3814), not something this guard does. `max-dispatch` is exempt (a
+  wall-clock policy cap, not an inference about progress).
+  **The honest bound is not "one tick".** Suppression repeats for as long as
+  the child keeps producing evidence newer than each tick's own snapshot, which
+  for a marker/byte clause means "it is working" (the point of the fix). The
+  bound on the SUPPRESSION is `TASK_HARD_CAP_MS` — NOT the clause's own bound,
+  which is precisely what a suppression defers — and the hard cap is enforced by
+  its own timer, outside the decision path. Note the byte channel is unauthenticated — a grandchild
+  MCP server inherits the child's fd 2, so its stderr also counts as a life sign
+  (`ingestHeartbeatChunk` → `onLifeSign`) — a pre-existing property of that
+  channel, not of this guard. The suppression is logged on the first occurrence
+  and then at most once a minute, carrying a running count, so a long
+  suppression is visible instead of silent. Measured at this fix's head: a cut
+  reported `no life signs for -1s (marker gap exceeded 113s)` with
+  `lastMarkerAgeMs=-532` under `load1=190.62` — the child was ticking while the
+  kill ran.
+- **A marker age is never negative (#1339).** `readMarkerAge()` is the single
+  reader for it (decision, all four kill payloads, every headline). `-1` is the
+  "no marker was ever parsed" SENTINEL, never an age; a marker timestamp in the
+  FUTURE of the reader's clock is INVALID INPUT — it is clamped to 0 and flagged,
+  never compared against a threshold and never printed as a negative age (that is
+  how `no life signs for -2s` / `-1s` reached operators). Clamping here is not a
+  bound being clamped: #1070's "warn, never clamp" rule protects an operator's
+  bound, and this clamps a MEASUREMENT that has no valid value, toward "no
+  evidence of silence" (the fail-safe direction). The kill payload carries the
+  DECISION's own age as `decMarkerAgeMs=` beside the live `lastMarkerAgeMs=` —
+  the same decision-vs-live split #5389 established for the CPU pair, because a
+  marker can land in the awaited window and make a live-only read contradict the
+  headline it ships beside. The flag `readMarkerAge()` returns is now reported,
+  not just promised: the payload carries `decMarkerAgeInvalid=` AND
+  `lastMarkerAgeInvalid=`, because a clamped `0` is otherwise indistinguishable
+  from a marker that landed exactly now — the same unreadability that hid the
+  original bug. The two are NOT redundant. The decision-time read is taken
+  before any yield (nothing can stamp a marker or a byte between the tick's `now`
+  and the synchronous decision), so it can only be invalid if the WALL CLOCK
+  stepped backwards; the live read is taken AFTER the awaited probe, and that is
+  the one where a marker ingested in the window is newer than `now`. Reporting
+  only the decision's flag would print "valid" beside precisely the clamped live
+  age the flag exists to expose. Both fields live on the TICK-KILL payload, and
+  that scope is deliberate (`#1339` review-6): it is the only reader taken after
+  an `await`. The completion (hard-cap, exit-cut) and backstop payloads read
+  `.ageMs` alone and capture `now = Date.now()` AT their own read, so a marker
+  timestamp ahead of `now` there can only mean the WALL CLOCK stepped backwards
+  — the case the decision-time flag already covers — while a marker ingested
+  inside the awaited probe is a tick-path condition by construction.
 - **Cut-gap bound (#1070):** the marker-gap cut deadline is a SECOND consumer of
   the same scale function. `effCutGap = getEffectiveCutGapMs(latched, load1)` —
   the derived base (`1.25 ×` tick interval, floor `15_000`) scaled 1x/2x/3x, with

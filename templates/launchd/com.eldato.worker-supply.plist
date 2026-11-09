@@ -44,10 +44,11 @@
          setup.sh's `fleet_srcs` array delivers this file, and it does so NESTED because that is the
          path this plist names — `install-launchd.sh` refuses a target that does not resolve. NOT
          because of any `$SELF_DIR`-relative sibling lookup: this job's own script sets `HERE` and
-         never reads it, and the sibling an earlier draft of this sentence credited
-         (`cloud-cell-supervisor.sh`) is in NO farm array, so it is missing nested AND flat. A false
+         never reads it. ⛔ The sibling an earlier draft credited (`cloud-cell-supervisor.sh`) is
+         FARMED FLAT as of this landing (#1938), so it is present on a provisioned box — but it is not
+         NESTED, so it was never a reason for THIS file's nesting and still is not. A false
          justification outlives the shape it described, which is why the corrected reason is written
-         out (fresh review of #3413).
+         out (fresh review of #3413; re-derived after the supervisor joined `fleet_srcs`).
          `verify_targets` now verdicts a TCC-protected EXEC target: that unit is SKIPPED loudly and any
          already-installed copy is UNLOADED and removed, so this defect cannot come back as an
          armed-and-dead job even if someone points the path back at the checkout.

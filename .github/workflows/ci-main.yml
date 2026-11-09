@@ -676,9 +676,22 @@ jobs:
 
   skill-lint:
     runs-on: ubuntu-latest
+    # #2055 — a bound so a hang ENDS and NAMES itself instead of parking the merge queue
+    # (measured: PR #2168's `bash-suites` held a reviewed PR >55 min and the rail then refused to
+    # classify ANY check on that head). Derivation, from CI's own history over 12 completed runs
+    # (2026-11-09): this job's p50 0.1 / p90 0.1 / max 0.2 min; EVERY step below carries its own
+    # bound sized from that STEP's measured max (x5, floor 5; `uses:` steps 10 — the repo's existing
+    # convention), so the step bounds sum to 15 min.
+    # ⛔ THE STEP BOUND IS THE BOUND, AND IT IS THE RED ONE: a step trip is `failure`. A JOB trip is
+    # `cancelled`, which this repo's rail reads NON-RED (#3242) — so the job-level number here is a
+    # backstop only, and it is kept ABOVE the step sum (the invariant
+    # `scripts/check-ci-lane-parity.mjs` enforces for these files).
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
+        timeout-minutes: 10
       - name: Skill lint (hard gate — issue #237)
+        timeout-minutes: 5
         run: |
           node scripts/check-skill-lint.mjs --skills-dir skills
 
@@ -691,11 +704,25 @@ jobs:
     # DETECTED (warn) not blocked — the 4h pi.dev refresh may legitimately
     # revert the store, and the weekly report + tripwire are the alert path.
     runs-on: ubuntu-latest
+    # #2055 — a bound so a hang ENDS and NAMES itself instead of parking the merge queue
+    # (measured: PR #2168's `bash-suites` held a reviewed PR >55 min and the rail then refused to
+    # classify ANY check on that head). Derivation, from CI's own history over 12 completed runs
+    # (2026-11-09): this job's p50 0.4 / p90 0.6 / max 0.6 min; EVERY step below carries its own
+    # bound sized from that STEP's measured max (x5, floor 5; `uses:` steps 10 — the repo's existing
+    # convention), so the step bounds sum to 20 min.
+    # ⛔ THE STEP BOUND IS THE BOUND, AND IT IS THE RED ONE: a step trip is `failure`. A JOB trip is
+    # `cancelled`, which this repo's rail reads NON-RED (#3242) — so the job-level number here is a
+    # backstop only, and it is kept ABOVE the step sum (the invariant
+    # `scripts/check-ci-lane-parity.mjs` enforces for these files).
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
+        timeout-minutes: 10
       - name: Cost-config guard (shipped, --shipped-only)
+        timeout-minutes: 5
         run: bash scripts/check-cost-config.sh --shipped-only
       - name: Cost-config fixture suite (#341 scenarios 0-14; green same-merge)
+        timeout-minutes: 5
         run: bash tests/cost-config/run.sh
 
   sigpipe-grep-guard:
@@ -706,11 +733,25 @@ jobs:
     # red signal: a merge that reintroduces the idiom, or that leaves a stale
     # exception, fails here even if its PR check was bypassed.
     runs-on: ubuntu-latest
+    # #2055 — a bound so a hang ENDS and NAMES itself instead of parking the merge queue
+    # (measured: PR #2168's `bash-suites` held a reviewed PR >55 min and the rail then refused to
+    # classify ANY check on that head). Derivation, from CI's own history over 12 completed runs
+    # (2026-11-09): this job's p50 1.0 / p90 1.1 / max 1.1 min; EVERY step below carries its own
+    # bound sized from that STEP's measured max (x5, floor 5; `uses:` steps 10 — the repo's existing
+    # convention), so the step bounds sum to 20 min.
+    # ⛔ THE STEP BOUND IS THE BOUND, AND IT IS THE RED ONE: a step trip is `failure`. A JOB trip is
+    # `cancelled`, which this repo's rail reads NON-RED (#3242) — so the job-level number here is a
+    # backstop only, and it is kept ABOVE the step sum (the invariant
+    # `scripts/check-ci-lane-parity.mjs` enforces for these files).
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
+        timeout-minutes: 10
       - name: SIGPIPE false-negative guard (the scan set must be clean)
+        timeout-minutes: 5
         run: bash scripts/check-no-sigpipe-grep.sh
       - name: SIGPIPE guard suite (hermetic, zero network)
+        timeout-minutes: 5
         run: bash tests/sigpipe-grep/run.sh
 
   bash32-parse-guard:
@@ -759,9 +800,22 @@ jobs:
     env:
       PI_EXTENSIONS_DIR: ${{ github.workspace }}/pi-bootstrap/pi-config/extensions
     runs-on: ubuntu-latest
+    # #2055 — a bound so a hang ENDS and NAMES itself instead of parking the merge queue
+    # (measured: PR #2168's `bash-suites` held a reviewed PR >55 min and the rail then refused to
+    # classify ANY check on that head). Derivation, from CI's own history over 12 completed runs
+    # (2026-11-09): this job's p50 0.1 / p90 0.2 / max 0.2 min; EVERY step below carries its own
+    # bound sized from that STEP's measured max (x5, floor 5; `uses:` steps 10 — the repo's existing
+    # convention), so the step bounds sum to 15 min.
+    # ⛔ THE STEP BOUND IS THE BOUND, AND IT IS THE RED ONE: a step trip is `failure`. A JOB trip is
+    # `cancelled`, which this repo's rail reads NON-RED (#3242) — so the job-level number here is a
+    # backstop only, and it is kept ABOVE the step sum (the invariant
+    # `scripts/check-ci-lane-parity.mjs` enforces for these files).
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
+        timeout-minutes: 10
       - name: Extension-farm parity gate (symlink farm + manifest.json into extensions/)
+        timeout-minutes: 5
         run: bash scripts/check-pi-config-extensions.sh
 
   python-ci:
@@ -793,13 +847,24 @@ jobs:
       # on the PR and never on the merged tree, which is exactly backward. They had drifted by one
       # (`scripts/test_lane_wip.py`, added to `ci.yml` only) in the commit whose own thesis was that a
       # suite the repo does not RUN is a suite it does not have.
-      test-command: 'python3.12 -m pytest scripts/test_parallel_work_check.py tests/test_ci_exemption.py tests/test_ci_exemption_producer.py scripts/test_lane_status.py scripts/test_lane_actions.py scripts/test_lane_watchdog.py scripts/test_admin_merge_head.py scripts/test_objective.py scripts/test_cmux_payload.py scripts/test_merge_queue.py scripts/test_turn_classify_state.py scripts/test_pr_doctor.py scripts/test_ask_owner.py scripts/test_dispatch_wiring.py scripts/test_pr_loop.py tests/test_pytest_root_cut.py scripts/test_beta_progress.py scripts/test_bounce_state.py scripts/test_lane_registry.py scripts/test_lane_wip.py scripts/test_graph_target_address.py scripts/test_lane_relaunch.py mcp-servers/orchestrator/test_server.py -x --timeout=60 -q'
+      test-command: 'python3.12 -m pytest scripts/test_parallel_work_check.py tests/test_ci_exemption.py tests/test_ci_exemption_producer.py scripts/test_lane_status.py scripts/test_lane_actions.py scripts/test_lane_watchdog.py scripts/test_admin_merge_head.py scripts/test_objective.py scripts/test_cmux_payload.py scripts/test_merge_queue.py scripts/test_turn_classify_state.py scripts/test_pr_doctor.py scripts/test_ask_owner.py scripts/test_dispatch_wiring.py scripts/test_pr_loop.py tests/test_pytest_root_cut.py scripts/test_beta_progress.py scripts/test_bounce_state.py scripts/test_lane_registry.py scripts/test_lane_wip.py scripts/test_graph_target_address.py scripts/test_lane_relaunch.py scripts/test_cmux_dispatch_path.py mcp-servers/orchestrator/test_server.py -x --timeout=60 -q'
       lint-command: ''
       typecheck-command: ''
       install-extras: ''
 
   auto-file-on-failure:
     runs-on: ubuntu-latest
+    # #2055 — a bound so a hang ENDS and NAMES itself instead of parking the merge queue
+    # (measured: PR #2168's `bash-suites` held a reviewed PR >55 min and the rail then refused to
+    # classify ANY check on that head). Derivation, from CI's own history over 12 completed runs
+    # (2026-11-09): this job's p50 0.2 / p90 0.2 / max 0.3 min; EVERY step below carries its own
+    # bound sized from that STEP's measured max (x5, floor 5; `uses:` steps 10 — the repo's existing
+    # convention), so the step bounds sum to 10 min.
+    # ⛔ THE STEP BOUND IS THE BOUND, AND IT IS THE RED ONE: a step trip is `failure`. A JOB trip is
+    # `cancelled`, which this repo's rail reads NON-RED (#3242) — so the job-level number here is a
+    # backstop only, and it is kept ABOVE the step sum (the invariant
+    # `scripts/check-ci-lane-parity.mjs` enforces for these files).
+    timeout-minutes: 15
     needs: [extension-tests, script-validate, script-validate-gate, skill-lint, cost-config-guard, pi-config-extensions-guard, sigpipe-grep-guard, bash32-parse-guard, python-ci]
     if: failure() && github.ref == 'refs/heads/main'
     # ⛔ BOTH CLAUSES ARE LOAD-BEARING (#3131), in DIFFERENT directions.
@@ -822,6 +887,7 @@ jobs:
     # behaviour, which created a duplicate on every failure.
     steps:
       - uses: actions/github-script@v7
+        timeout-minutes: 10
         env:
           NEEDS: ${{ toJSON(needs) }}
         with:

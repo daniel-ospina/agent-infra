@@ -27,7 +27,7 @@
  *   3. THE BEHAVIOURAL HALF IS EXECUTION. `scripts/run-bash-shards.sh` proves at RUNTIME that it ran
  *      the listed shards and that a failing shard is recorded (its sentinels); this guard only
  *      checks that the lane INVOKES it.
- *   4. THE CONTENT LOCK is the conspicuousness tripwire (`scripts/workflow-lock.json`, checked by
+ *   4. THE CONTENT LOCK is the conspicuousness tripwire (`scripts/workflow-lock.d/`, checked by
  *      `check-workflow-lock.mjs`) — as #666 casts it, not a control the PR cannot edit, but an edit
  *      that is impossible to make invisibly.
  *

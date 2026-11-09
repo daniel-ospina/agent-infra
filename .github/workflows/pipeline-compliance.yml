@@ -199,7 +199,7 @@ jobs:
         # ci-main.yml's extension leg said so outright ("pipeline-compliance.yml
         # is also PR-triggered, but runs no test suite"). That line is now stale,
         # and this step is what makes it so; it is not corrected here because
-        # ci-main.yml is pinned in scripts/workflow-lock.json and a comment
+        # ci-main.yml is pinned in scripts/workflow-lock.d/ and a comment
         # tweak would force a lock re-derivation. (Cited by its TEXT, not by a
         # line number: the coordinate had already rotted from :98 to :55-56 to
         # :155 as its neighbours moved, and a number that rots argues for the
@@ -458,6 +458,11 @@ jobs:
     # filesystem. This job fails on (a) a template edit without
     # materialization, or (b) any symlink under .github/workflows/.
     runs-on: ubuntu-latest
+    # #2055 — one checkout plus four byte comparisons, and this job runs on EVERY PR (it carries no
+    # `paths` filter), so an unbounded hang here parks the whole queue. 15 min is a wide ceiling that
+    # still ends a pathological run. A job bound is a BACKSTOP (`cancelled`, which this repo's rail
+    # reads NON-RED) — it ends the hold and names the job; the red-producing bound is a step's.
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - name: Reusable workflows match templates

@@ -1,0 +1,21 @@
+name: fixture job-bound-expression-ceiling — an EXPRESSION J over a subtotal that already breaches 360
+on:
+  workflow_dispatch:
+    inputs:
+      cap:
+        type: number
+        default: 400
+jobs:
+  expr-ceiling:
+    runs-on: ubuntu-latest
+    # min(J, 360) <= 360 for EVERY J, including one this guard cannot evaluate, so a numeric subtotal at
+    # or above 360 is unreachable whatever the expression resolves to. Downgrading that to a NOTE was a
+    # false PASS: the last step bounds can never fire and nothing said so (review finding, P2).
+    timeout-minutes: ${{ inputs.cap }}
+    steps:
+      - name: first
+        timeout-minutes: 200
+        run: echo hi
+      - name: second
+        timeout-minutes: 200
+        run: echo hi

@@ -251,7 +251,8 @@ export HOME="$T/home"
 # a cleaning — which is the case whenever this suite runs from a lane worktree (`.worktrees/`), the exact
 # shape #2697 measured. What it falls through to is this farm, so a fixture home with an empty
 # `.pi/agent/scripts` would leave the controller install with nowhere durable to land. A cell whose farm has
-# no supervisor (#1938's named residual) is the shape that then gets the installer's loud refusal — correct
+# no supervisor (an install predating `fleet_srcs`'s entry, or a removed copy — #1938, whose delivery residual
+# this PR closes) is the shape that then gets the installer's loud refusal — correct
 # on a worktree, and not what these arms are about.
 mkdir -p "$T/home/.pi/agent/scripts"
 cp "$HERE/cloud-cell-supervisor.sh" "$T/home/.pi/agent/scripts/cloud-cell-supervisor.sh"
@@ -1969,10 +1970,21 @@ fi
 
 echo
 say_case "the controller check resolves the installer from the LAYER, not from where this script was pushed"
-# ⛔ A REAL CELL RUNS THIS SCRIPT FROM /tmp (pushed standalone), and the installer is not in the farm list:
-# a check that only looks "beside this script" (or in $HOME/.pi/agent/scripts) therefore DIED on every
-# provisioned cell — killing the bring-up it was added to protect. Resolution must use the layer checkout
-# check_operational_layer just installed, which is what this arm pins.
+# ⛔ A REAL CELL RUNS THIS SCRIPT FROM /tmp (pushed standalone). Before the #1938 farm entry the installer
+# was in no farm array at all, so a check that only looks "beside this script" (or in
+# $HOME/.pi/agent/scripts) DIED on every provisioned cell — killing the bring-up it was added to protect.
+# Resolution must use the layer checkout check_operational_layer just installed, which is what this arm
+# pins. ⛔ AND THE ARM ALSO PINS THE ORDER, which #1938 made load-bearing: this fixture's HOME and
+# CELL_HOME are the SAME directory (the bring-up itself exports HOME="$CELL_HOME"), so once the farm
+# delivers the installer, `$HOME/.pi/agent/scripts` resolves on a compliant cell and would win unless
+# `$LAYER_ROOT` is tried first — pairing an installer of one vintage with the layer's unit templates.
+# ⛔ THE ORDER IS PINNED STATICALLY, ON PURPOSE, AND THE REASON IS MEASURED: a DYNAMIC sentinel cannot
+# discriminate here. `install-controller-service.sh` is a `fleet_srcs` member, and the operational-layer
+# step farms it to `$HOME/.pi/agent/scripts/` EARLIER IN THIS SAME RUN — on top of any sentinel — so by
+# the time the controller check resolves a candidate, both paths hold byte-identical files and the two
+# orders are observationally equal. A sentinel arm here would therefore be GREEN under both orders: an
+# inert enforcer, which is worse than no arm because it advertises a guarantee it cannot fail on. So the
+# assertion below reads the shipped `for cand` list and reddens if those two lines ever swap.
 mkdir -p "$T/standalone"
 cp "$BRINGUP" "$T/standalone/cloud-cell-bringup.sh"
 printf '%s\n' "$TOK_BODY" > "$TOK"
@@ -1987,6 +1999,19 @@ case "$SA_OUT" in
   *"install-controller-service.sh not found"*) bad "a standalone-pushed bring-up cannot find the installer — every cell bring-up dies at the controller check" ;;
   *) bad "the standalone run did not reach the controller check (rc=$SA_RC): $(printf '%s' "$SA_OUT" | tail -6 | tr '\n' ' ')" ;;
 esac
+# ⛔ THE ORDER (see the note above): `$LAYER_ROOT/scripts` MUST precede `$HOME/.pi/agent/scripts` in the
+# shipped candidate list, because #1938 makes the farmed copy resolve on every compliant cell and it has
+# no `../templates`. Static by necessity, not by preference: the farm overwrites the destination with the
+# layer's own bytes within this same run, so no dynamic probe can tell the two orders apart.
+SA_CANDS="$(awk '/^check_controller_service\(\) \{/{f=1} f{print} f&&/^}$/{exit}' "$BRINGUP")"
+SA_CANDS="$(printf '%s\n' "$SA_CANDS" | sed -n '/for cand in /,/^  done$/p')"
+SA_LAYER_LINE="$(printf '%s\n' "$SA_CANDS" | grep -n 'LAYER_ROOT:-}/scripts/install-controller-service' | head -1 | cut -d: -f1)"
+SA_HOME_LINE="$(printf '%s\n' "$SA_CANDS" | grep -n 'HOME:-}/.pi/agent/scripts/install-controller-service' | head -1 | cut -d: -f1)"
+if [ -n "$SA_LAYER_LINE" ] && [ -n "$SA_HOME_LINE" ] && [ "$SA_LAYER_LINE" -lt "$SA_HOME_LINE" ]; then
+  ok "…and the LAYER candidate precedes the farmed \$HOME candidate, so installer and supervisor share one vintage (#1938 made this order load-bearing)"
+else
+  bad "the farmed \$HOME candidate precedes the layer candidate (or a candidate is gone) — a stale farmed installer would render the layer's unit templates; measured lines: layer=${SA_LAYER_LINE:-ABSENT} home=${SA_HOME_LINE:-ABSENT}"
+fi
 rm -rf "$T/standalone"
 
 # ══ REPO IDENTITY (agent-infra#3521) — a directory must not lie about which repo it is ══════════

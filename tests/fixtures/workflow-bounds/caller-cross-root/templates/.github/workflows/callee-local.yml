@@ -1,0 +1,10 @@
+name: fixture caller-cross-root — a bounded template sibling a RELATIVE call resolves to
+on:
+  workflow_call:
+jobs:
+  local-job:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: work
+        run: echo hi
