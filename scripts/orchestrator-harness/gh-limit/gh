@@ -4,9 +4,11 @@
 #
 # WHY A SHIM AND NOT CALL-SITE EDITS. Four boxes share one GitHub account, so one box's burst is
 # another box's secondary limit (#1988). A layer each call site has to remember is a layer that
-# gets forgotten — one new `gh` call is all it takes — so this dir is put FIRST on the harness's
-# PATH and every `gh` a controller, lane or worker runs lands here. That is the same deployment
-# shape `install.sh` uses for `gh-rest/gh` on the Mac, with one deliberate difference: this wrapper
+# gets forgotten — one new `gh` call is all it takes — so this dir sits at the FRONT of the harness's
+# PATH, alone or immediately behind the REST adapter (#2039) that runs the same `../gh-limit.py`; with
+# the helper present a gh reached through this dir lands in that layer, and with it absent both entry
+# points fail open to the real `gh`, loudly and never on the call. Same deployment shape `install.sh`
+# uses for `gh-rest/gh` on the Mac, with one deliberate difference: this wrapper
 # does NOT translate GraphQL calls to REST. Moving the call sites to REST is #1978/#1986's job
 # (their `gh api` calls are already REST and pass through here untouched); mixing the two in one
 # change would make a translation bug and a backoff bug indistinguishable.
