@@ -2306,16 +2306,21 @@ $m"
     # branch `head+1` at a mid commit: `delta:<BASE>..head+1` recorded rc 0 with
     # `"delta_range":"<BASE>..<HEAD>"` — a signed `clean` over the commits the artifact excluded —
     # while the identical claim on a ref not named `head…` (`..mid+2`, same commit) was refused rc 3.
-    # So the class now admits EVERY ref-legal character that can continue a name in running prose:
-    # alphanumerics, `_`, `/`, `-`, and `+ = $ % ! & @` (the last closes `head@{1}`, which had been
-    # read as the bare tip word plus a discarded selector).
-    # DECLARED REMAINDER, stated rather than discovered: `, ; : ( ) < > ' "` still TERMINATE the token,
+    # So the class now admits every ref-legal character that can continue a name in running prose
+    # WITHOUT also being able to end one: alphanumerics, `_`, `/`, `-`, and `+ = $ % & @` (the last
+    # closes `head@1`, which had been read as the bare tip word plus a discarded selector). `!` was
+    # added with them and then REMOVED again — it can end a sentence, and the measurement is below.
+    # DECLARED REMAINDER, stated rather than discovered: `, ; : ( ) < > ' " !` still TERMINATE the token,
     # so a ref whose name continues with one of them (`head,1`, `head'1`) reads as the tip word
     # followed by punctuation. That is a CHOICE against the other error, not an oversight: those are
     # precisely the characters that end a sentence or a quoted token, and an artifact that writes
     # `reviewed delta:<BASE>..HEAD;` / `..HEAD,` / `..HEAD)` / `"delta:<BASE>..HEAD"` is the ordinary
     # honest form this arm must accept — refusing them would be the false-block class this file
-    # records as worse than the gap. A "maximal ref-legal run then resolve" rule cannot split them
+    # records as worse than the gap. `!` is in that set for the same reason and was measured there
+    # (twenty-fourth cycle, P2): `reviewed delta:<BASE>..HEAD!` is a sentence, and the parent head
+    # accepted it, so leaving `!` a name character turned a widened class into a NEW false block. The
+    # trade is declared rather than hidden: a ref named `head!1` now reads as the tip word followed by
+    # punctuation, which is the gap this file chooses over refusing an honest artifact. A "maximal ref-legal run then resolve" rule cannot split them
     # either: `;` is ref-legal, so that rule reads `..HEAD;` as a ref named `HEAD;`.
     # ⛔ A BRACE ON THE TIP IS A SELECTOR, NOT PART OF THE NAME — AND IT IS DECIDED, NOT IGNORED
     # (twenty-third review cycle, found by the commit verifier, MEASURED). `@` had to join the
@@ -2332,7 +2337,7 @@ $m"
     # asymmetry is deliberate: there the brace is prose the artifact merely mentioned, while here it
     # is the ENDPOINT of the stated range — an endpoint this code cannot evaluate is not a verified
     # endpoint, which is the same rule that refuses an unresolvable `HEAD`.
-    while [[ "$_scan" =~ ([0-9a-fA-F]{4,40})[[:space:]]*(\.{2,3})[[:space:]]*([0-9a-fA-F]{4,40}|[Hh][Ee][Aa][Dd]|@)(@\{[^}]*\}|[^0-9A-Za-z_/+=$%!&@-]|$) ]]; do
+    while [[ "$_scan" =~ ([0-9a-fA-F]{4,40})[[:space:]]*(\.{2,3})[[:space:]]*([0-9a-fA-F]{4,40}|[Hh][Ee][Aa][Dd]|@)(@\{[^}]*\}|[^0-9A-Za-z_/+=$%&@-]|$) ]]; do
       _sf="$(printf '%s' "${BASH_REMATCH[1]}" | command tr 'A-F' 'a-f')"
       _ss="${BASH_REMATCH[2]}"
       # ⛔ ONE SPELLING, NOT TWO: THE RAW TOKEN IS BOTH WHAT DECIDES AND WHAT THE MESSAGE QUOTES
@@ -2395,14 +2400,31 @@ $m"
       case "${BASH_REMATCH[4]:-}" in '@{'*) _sbrace="${BASH_REMATCH[4]}" ;; esac
       if [ -n "$_sbrace" ]; then
         # The brace is part of the CLAIM (so the refusal quotes it) and it decides the endpoint.
-        _straw="${_straw}${_sbrace}"
-        _sin="${_sbrace#@\{}"; _sin="${_sin%\}}"
-        case "$_sin" in
-          now) _stcmp="$to" ;;
-          *[!0-9]*) _stcmp='' ;;
-          *[1-9]*) _stcmp='' ;;
-          *) _stcmp="$to" ;;
+        # ⛔ THE BRACE DECIDES THE POSITION — THE OPERAND STILL DECIDES THE NAME (twenty-fourth review
+        # cycle, P1 — MEASURED, and it was a REGRESSION against the parent). The first version of this
+        # branch keyed on the SPELLING alone: `…@{0}` and `…@{now}` the attested head, anything else an
+        # elder position. But a reflog position belongs to a NAME, and `head` may BE a ref name at a
+        # mid commit: `delta:<BASE>..head@{0}` is that ref's current tip — the mid commit — and it
+        # recorded rc 0 with `delta_range=<BASE>..<HEAD>`, a signed `clean` over exactly the commits
+        # the artifact excluded, while the parent head refused the same text. So the operand is
+        # decided FIRST, by the same git query every other arm uses (`_tipvariant`), and only the
+        # canonical tip word takes the position rule with no checkout consulted — a variant that is
+        # NOT a ref is the tip word here too, which keeps an honest `..head@{0}` frame-free instead of
+        # resolving it in the delta checkout.
+        _sorig="${_straw}"
+        case "$(_tipvariant "$_sorig")" in
+          HEAD|@)
+            _sin="${_sbrace#@\{}"; _sin="${_sin%\}}"
+            case "$_sin" in
+              now) _stcmp="$to" ;;
+              *[!0-9]*) _stcmp='' ;;
+              *[1-9]*) _stcmp='' ;;
+              *) _stcmp="$to" ;;
+            esac ;;
+          *)
+            _stcmp="$(delta_git "$root" rev-parse --verify "${_sorig}${_sbrace}^{commit}" 2>/dev/null || true)" ;;
         esac
+        [ -z "$_sbrace" ] || _straw="${_sorig}${_sbrace}"
       else
         case "$_straw" in
           HEAD|@) _stcmp="$to" ;;
