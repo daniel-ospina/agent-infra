@@ -28,6 +28,9 @@
 set -uo pipefail
 
 O="${O:-$HOME/orchestrator}"
+# ⛔ THE WORK ROOT (#2095, review of #3846, P1): the controller exports `O` = its STATE dir and `O_WORK`
+# = the harness root, where the dispatcher this file execs actually lives.
+_SF_WORK="${O_WORK:-$O}"
 SEEN="${1:-}"                       # the pass's stall counter (_dpass), from the loop
 EVERY="${DRAIN_STALL_FIX_EVERY:-3}"
 TIMEOUT="${DRAIN_STALL_FIX_TIMEOUT:-1800}"
@@ -170,7 +173,7 @@ if [ "$(( SEEN % EVERY ))" -ne 0 ]; then
   exit 0
 fi
 
-DISP="$O/nonblocking-dispatch.sh"
+DISP="$_SF_WORK/nonblocking-dispatch.sh"
 if [ ! -x "$DISP" ]; then
   log_line "DRAIN STALL -> STALL FIX COULD NOT DISPATCH (no executable $DISP) — the stall line is the only trace"
   exit 0
