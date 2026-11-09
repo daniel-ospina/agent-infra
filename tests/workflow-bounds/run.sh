@@ -407,8 +407,8 @@ grep -q '^templates/t.yml::calls-root	(call → ' "$OUT" \
 # `callee-root.yml` sits in the REQUIRED root, so main's top-level file loop lists its job whether the call
 # was followed or not — a `--list` row for it proves nothing. The callee COUNTER only increments on the
 # follow-through path, and the summary line is printed only when nothing was refused.
-grep -q '1/1 call job(s) are bounded through the workflow they call' "$OUT" \
-  && ok "the call was FOLLOWED into the root callee (1/1 certified through it)" \
+grep -q '2/2 call job(s) are bounded through the workflow they call' "$OUT" \
+  && ok "the call was FOLLOWED into the root callee (2/2 certified through it)" \
   || no "the callee was not followed — an absolute slug was resolved into the caller's own root"
 
 echo "== 25. FIXTURES: the CEILING BOUNDARY in both directions (equality must be REFUSED)"
@@ -436,6 +436,82 @@ grep -q "at or above the platform's 360-minute ceiling (which pre-empts its iner
   && ok "the finding says WHICH ceiling covers the job (360, not the inert 500)" \
   || no "the finding does not name the platform ceiling as the one that covers an inert job bound"
 grep -q 'SUM to 400 min' "$ERR" && ok "the finding names the step SUM" || no "the sum is not named"
+# The standalone inert NOTE lives on the ACCEPTED-job path, so it cannot be asserted here: this fixture
+# is refused at `knownSum >= jobCeiling` and `continue`s before the note is pushed. It is asserted in
+# arm 31, whose inert job is accepted (review finding, P3 — arm 27 greps only the violation).
+
+echo "== 28. FIXTURE: an EXPRESSION job bound is still capped by the 360 ceiling"
+# min(J, 360) <= 360 for EVERY J, including one the guard cannot evaluate — so a numeric subtotal at or
+# above 360 is unreachable whatever the expression resolves to. The expression branch used to take
+# precedence over the sum check and downgrade this to a NOTE: a false PASS, and the same class as arm
+# 27's inert term on the other axis (review finding, P2).
+run_case job-bound-expression-ceiling
+[ "$rc" -eq 1 ] && ok "job-bound-expression-ceiling (J expression, Σ 400) → rc 1" \
+  || no "job-bound-expression-ceiling → rc $rc, expected 1 (an unreachable step budget was certified)"
+grep -q 'SUM to 400 min' "$ERR" && ok "the finding names the step SUM" || no "the sum is not named"
+grep -q 'which caps ANY resolved job bound' "$ERR" \
+  && ok "the finding says the ceiling applies WITHOUT knowing the expression's value" \
+  || no "the finding does not say why an unevaluable job bound still caps the budget"
+grep -q 'above 400 and below 360' "$ERR" \
+  && no "the remedy prescribes raising an EXPRESSION job bound, which is not an edit that exists" \
+  || ok "the remedy does not tell the reader to raise an expression bound"
+
+# …and the NOTE arm is only correct when the subtotal is BELOW the ceiling. A subtotal under 360 with an
+# expression J must stay a NOTE (a legitimate shape), or the fix for the finding above would false-block.
+run_case job-bound-expression-under
+[ "$rc" -eq 0 ] && ok "job-bound-expression-under (J expression, Σ 30 under 360) → rc 0, still a NOTE" \
+  || no "job-bound-expression-under → rc $rc, expected 0 (a legitimate expression-bounded job was refused)"
+grep -q 'EXPRESSION job bound' "$OUT" && ok "…and it is still reported as a NOTE" || no "the NOTE is gone"
+
+echo "== 29. FIXTURE: a template caller's relative uses: resolves into the TEMPLATE root, not the repo root"
+# Arm 24 pins the absolute-slug half (rooted: true). The `./` half lives in the required root in every
+# other fixture, where `label === ""` makes both rootings identical — so it was pinned by nothing, and
+# flipping it false-blocks a legitimate template caller (review finding, P2).
+run_case caller-cross-root
+[ "$rc" -eq 0 ] && ok "caller-cross-root → rc 0 (a template relative sibling is present)" \
+  || { no "caller-cross-root → rc $rc, expected 0"; grep '   •' "$ERR" | head -3; }
+node "$GUARD" --root "$FIX/caller-cross-root" --list >"$OUT" 2>"$ERR"
+grep -q '2/2 call job(s) are bounded through the workflow they call' "$OUT" \
+  && ok "both call jobs are followed (the absolute slug into ROOT, the relative form into templates/)" \
+  || no "a relative template caller was resolved into the wrong root, so only 1 call was followed"
+grep -q 'does not exist' "$ERR" \
+  && no "a present template sibling was reported as missing (the relative rooting is wrong)" \
+  || ok "no false 'does not exist' for the template sibling"
+
+echo "== 30. FIXTURE: a jobs: mapping that holds NO job is REFUSED, not certified"
+# `jobs: {}` parses as a mapping, so the "not a mapping" refusal does not fire, and a sibling file's job
+# keeps the "zero jobs overall" backstop from firing. Without the dedicated refusal the file is certified
+# green with nothing read from it (review finding, P2 — the header names this refusal and nothing pinned it).
+run_case jobs-empty-mapping
+[ "$rc" -eq 2 ] && ok "jobs-empty-mapping (empty jobs mapping beside a valid file) → rc 2" \
+  || no "jobs-empty-mapping → rc $rc, expected 2 (a file with no jobs was certified)"
+grep -q 'declares `jobs` with NO jobs in it' "$ERR" \
+  && ok "the refusal names the file and the reason" || no "the refusal does not name the empty `jobs`"
+
+echo "== 31. FIXTURE: an inert job bound with an UNBOUNDED step still reports the stranded step bound"
+# The JOB-level NOTE's ceiling carries the same `expression || inert ? 360 : J` term as arm 27's site; with
+# a NON-inert J (arm 23's fixture) dropping the term is invisible, so the stranded clause silently vanished
+# (review finding, P3). The job itself is still ACCEPTED — a job bound is a valid backstop by design.
+run_case job-bound-inert-mixed
+[ "$rc" -eq 0 ] && ok "job-bound-inert-mixed (inert J + unbounded step) → rc 0 (the job bound is a backstop)" \
+  || no "job-bound-inert-mixed → rc $rc, expected 0 (a job bound plus unbounded steps must not be refused)"
+grep -q '1 step bound(s) here are at or above 360 min and can never fire' "$OUT" \
+  && ok "the NOTE names the stranded step bound against 360, not the inert 500" \
+  || no "the stranded-step clause is gone (the NOTE's ceiling used the inert J)"
+# …and the STANDALONE inert note (a separate push from the JOB-level one) is only reachable on an
+# ACCEPTED job, which is why it is pinned here rather than on the refused job-bound-inert fixture.
+grep -q 'declares 500 min — above the platform' "$OUT" \
+  && ok "the inert job bound is REPORTED as a standalone NOTE, not merely as a clause" \
+  || no "an inert job bound is certified with no standalone note"
+
+echo "== 32. FIXTURE: a call job naming a MISSING local workflow is named, not crashed into a refusal"
+# Without the named violation this fails closed through `loadJobs`' unreadable-path refusal instead — a
+# crash-as-refusal, which loses the file:line the reader needs (review finding, P3).
+run_case caller-broken-callee
+[ "$rc" -eq 1 ] && ok "caller-broken-callee → rc 1" || no "caller-broken-callee → rc $rc, expected 1"
+grep -q 'the call is broken, so nothing inside it can be bounded' "$ERR" \
+  && ok "the finding is NAMED as a broken call, not an unreadable file" \
+  || no "the broken callee is not named as such"
 
 echo
 if [ "$fail" -eq 0 ]; then

@@ -48,10 +48,12 @@
  *       fire — and J's trip is `cancelled`/NON-RED, so the non-red conclusion PRE-EMPTS the red step
  *       that actually hung, which is the same false pass in the other direction. Where EVERY step
  *       carries a finite numeric bound, Σ must therefore be strictly BELOW `min(J, 360)` (an inert
- *       J > 360 cannot fire at all, so 360 is what covers the job). Nothing is blocked by this: a job
- *       that declares a bound may always raise it (to ≤ 359) until it sits above Σ — EXCEPT where Σ
- *       itself is ≥ 360, when no such bound exists and the tail step bounds are what must come down (the
- *       violation says which of the two applies).
+ *       J > 360 cannot fire at all, so 360 is what covers the job; and an EXPRESSION J is capped at 360
+ *       too, so a numeric subtotal ≥ 360 is refused whether or not the expression can be evaluated).
+ *       Nothing is blocked by this: a job that declares a NUMERIC bound may always raise it (to ≤ 359)
+ *       until it sits above Σ — EXCEPT where Σ itself is ≥ 359, when no such bound exists and the tail
+ *       step bounds are what must come down (the violation says which of the two applies). 359, not
+ *       360, is the exact boundary: at Σ = 359 no integer J lies strictly between Σ and the ceiling.
  *       ⛔ AND A SUM THIS GUARD CANNOT COMPUTE IS REPORTED, NEVER SILENTLY CERTIFIED (added at review,
  *       P2, measured). `${{ … }}` is an accepted step bound (clause (c)), so a step-only job may carry
  *       one and Σ is then uncomputable; treating that as "nothing to check" is how the reachability
@@ -76,8 +78,10 @@
  * `cancelled` as NON-RED. A job bound is therefore a RUNNER-LEAK BACKSTOP and a NAMING device, not a
  * red-producing bound. The red-producing bound is the STEP bound, which is `failure`, and the jobs
  * that run long work in this repo already carry one (#2482 sized them, #3187 pins them: `bash-suites`
- * 70 min on the shard step, `bash-suites-gate` 70, `script-validate*` on their shard steps). Where a
- * job has NO step bound, a job bound still converts "the whole queue waits forever" into "one named
+ * 70 min on the shard step, `bash-suites-gate` a 60-min job bound over 10/10/5/15-min steps, and
+ * `ci-main.yml::script-validate` a 40-min shard step). `node-ci.yml::script-validate` carries NO step
+ * bound at all (its job bound is the backstop). Where a job has NO step bound, a job bound still
+ * converts "the whole queue waits forever" into "one named
  * job ends", which is strictly better than the measured 55-minute hold — the remaining false-pass
  * surface (a non-verdict scored non-red) is ONE root, tracked as #3242, and is not created here.
  *
@@ -109,6 +113,12 @@
  * Exit 2 (refusal) — not 0 — when the guard cannot answer: no workflow files, a file whose `jobs` is
  * not a mapping or holds no job, unparseable YAML, or a `--root` with no `.github/workflows`. A guard
  * that passes when it read nothing is the class of defect it exists to find (#637, #675 P2).
+ * Three of those refusals OVERLAP ON PURPOSE ("dir holds no .yml", "`jobs` holds no job", "zero jobs
+ * overall"): a single-file root that is empty trips whichever survives, so no one of them is pinned in
+ * isolation by the suite — that is defence in depth, not uncovered logic. The `depth > 3` cap is a
+ * symlink-cycle guard on the `uses:` walk, and the broken-local-callee violation is the *named* form of
+ * a failure that would otherwise surface as `loadJobs`' unreadable-path refusal (a crash-as-refusal).
+ * Both are exercised by `caller-broken-callee` or stated here; neither is silent.
  *
  * Exit codes: 0 every job bounded (or bounded through its callee) · 1 a job has no usable bound, or a
  * call job declares one (which GitHub rejects), or a bound sits at/below the step budget it is meant
@@ -379,35 +389,45 @@ function main() {
           const known = numeric.filter((n) => Number.isFinite(n));
           const unevaluable = numeric.length - known.length;
           const knownSum = known.reduce((a, b) => a + b, 0);
-          // An inert J (> 360) cannot fire at all, so the platform ceiling is what actually covers the job.
-          const ceiling = verdict.expression || verdict.inert ? PLATFORM_CEILING_MIN : Number(verdict.value);
-          if (verdict.expression) {
-            notes.push(
-              `${where} declares an EXPRESSION job bound and every step carries a bound, so whether its bound ` +
-                `sits above their ${knownSum}-min numeric subtotal${unevaluable > 0 ? ` (+${unevaluable} expression bound(s))` : ""} ` +
-                `could NOT be checked — a bound at or below that sum would make its last step bounds unreachable`
-            );
-          } else if (knownSum >= ceiling) {
+          // The ceiling the job is actually held to is min(J, 360) — and for an EXPRESSION J it is still
+          // 360, because the platform caps any resolved value: `min(J, 360) <= 360` for EVERY J, including
+          // one the guard cannot evaluate. So a numeric step subtotal at or above 360 is unreachable
+          // whatever the expression resolves to, and it must be REFUSED here rather than downgraded to a
+          // NOTE (review finding, P2: the expression branch took precedence over the sum check, so a job
+          // whose tail step bounds could never fire was certified green with no output at all — the same
+          // false PASS the inert-J term had, on the expression axis). An inert J (> 360) is capped for the
+          // same reason: the ceiling, not J, is what covers the job.
+          const jobCeiling = verdict.expression || verdict.inert ? PLATFORM_CEILING_MIN : Number(verdict.value);
+          if (knownSum >= jobCeiling) {
             violations.push(
               `${where} declares timeout-minutes ${verdict.value} but its ${steps.length} step bounds` +
                 (unevaluable > 0 ? `, of which only the ${known.length} numeric ones are summed here,` : "") +
-                ` SUM to ${knownSum} min — at or above ${verdict.inert ? `the platform's ${PLATFORM_CEILING_MIN}-minute ceiling (which pre-empts its inert ${verdict.value})` : "its own job bound"}, ` +
+                ` SUM to ${knownSum} min — at or above ${verdict.inert ? `the platform's ${PLATFORM_CEILING_MIN}-minute ceiling (which pre-empts its inert ${verdict.value})` : verdict.expression ? `the platform's ${PLATFORM_CEILING_MIN}-minute ceiling (which caps ANY resolved job bound, so this holds whatever the expression evaluates to)` : "its own job bound"}, ` +
                 `so the last step bounds could never fire and the job-level \`cancelled\` (NON-RED to the rail) ` +
                 `pre-empts the red step that actually hung. ` +
                 // The remedy must be one that EXISTS. `knownSum < 359` is the exact test, not `< 360`:
                 // at knownSum === 359 no INTEGER job bound lies strictly between it and the 360 ceiling
-                // (review finding, P3 — the 359 edge fell between the two branches).
-                (knownSum < PLATFORM_CEILING_MIN - 1
+                // (review finding, P3 — the 359 edge fell between the two branches). An expression job
+                // bound cannot be "raised" at all, so the remedy there is the step bounds.
+                (!verdict.expression && knownSum < PLATFORM_CEILING_MIN - 1
                   ? `Raise the job bound above ${knownSum} and below ${PLATFORM_CEILING_MIN}, or lower the tail step bounds.`
                   : `No job bound can sit above ${knownSum} inside the platform's ${PLATFORM_CEILING_MIN}-minute ceiling, so the step bounds are what must come down.`)
             );
             continue;
+          }
+          if (verdict.expression) {
+            notes.push(
+              `${where} declares an EXPRESSION job bound and every step carries a bound, so whether its bound ` +
+                `sits above their ${knownSum}-min subtotal${unevaluable > 0 ? ` (+${unevaluable} expression bound(s))` : ""} ` +
+                `could NOT be checked — a bound at or below that sum would make its last step bounds unreachable ` +
+                `(the ${PLATFORM_CEILING_MIN}-minute platform ceiling still applies, and ${knownSum} < ${PLATFORM_CEILING_MIN} so it does not bite)`
+            );
           } else if (unevaluable > 0) {
             notes.push(
               `${where} declares timeout-minutes ${verdict.value} and every step carries a bound, but ${unevaluable} of ` +
                 `them are \`\${{ … }}\` expressions, so Σ could not be evaluated — the reachability rule was NOT ` +
                 `applied to those (the ${known.length} numeric bound(s) total ${knownSum} min, so the expression ` +
-                `bound(s) must stay below ${ceiling - knownSum} min)`
+                `bound(s) must stay below ${jobCeiling - knownSum} min)`
             );
           }
         }
