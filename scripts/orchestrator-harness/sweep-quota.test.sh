@@ -224,18 +224,28 @@ if need "$T/quota.sh" "the sweep-quota helper block"; then
   [ "$got" -ge $(( now + 55 )) ] && [ "$got" -le $(( now + 75 )) ] \
     && ok "sweep_defer_until_recorded: a kind=secondary record (what a NO_WAIT refusal writes) stays on the 60s floor — no invented window" \
     || bad "sweep_defer_until_recorded invented a window from a kind=secondary record ('$got')"
+  # ⛔ THE RECORD IN PLACE FOR THE NEXT ROW MUST BE **LATER THAN THE HEADER**, or the row cannot tell
+  # "the header won" from "the record won" — both answers sit under its ceiling and it passes either
+  # way. That is agent-infra#2028 review round 5's P1: the `secondary` row above left `until=now+60`
+  # in place, so deleting the header-priority early return from `sweep_defer_until_recorded` left this
+  # suite GREEN at this head, while the same mutant reds on base where the record was `now+3000`. The
+  # record is therefore re-established here, and the winner is asserted on BOTH sides — the `-ge`
+  # lower bound is what a 60 s floor cannot satisfy.
+  rec "$now" "$(( now + 3000 ))"
   raw="$(printf 'HTTP/2.0 403 x\r\nX-Ratelimit-Reset: %s\r\n\r\n' "$(( now + 120 ))")"
   got="$(sweep_defer_until_recorded "$raw")"
-  [ "$got" -le $(( now + 140 )) ] \
+  [ "$got" -ge $(( now + 110 )) ] && [ "$got" -le $(( now + 140 )) ] \
     && ok "sweep_defer_until_recorded: a response header WINS over a later recorded window (this response's truth, not the last one's)" \
     || bad "sweep_defer_until_recorded let a stale record overrule the response headers ('$got')"
   # ⛔ THE CALL-SITE ROW (agent-infra#2028 review round 4, finding 2). The record in place here is the
-  # `secondary` one at `until=now+60` from the row above — i.e. exactly what the layer writes for a
-  # headers-less `NO_WAIT` refusal — while `raw` is the `-i` FRAMED body the sweep actually receives on
-  # a rate-limit 403. The old prose claimed this deferred on the 60 s floor and re-attempted once a
-  # minute; the code takes the header's reset. The row above cannot settle it (its ceiling of
-  # `now+140` is satisfied by a 60 s floor too), so THIS one asserts the window is taken UPWARD to the
-  # header and reds on any mutant that reads the record instead of the header.
+  # `secondary` one at `until=now+60` that the `rec` immediately below writes — i.e. exactly what the
+  # layer writes for a headers-less `NO_WAIT` refusal — while `raw` is the `-i` FRAMED body the sweep
+  # actually receives on a rate-limit 403. The old prose claimed this deferred on the 60 s floor and
+  # re-attempted once a minute; the code takes the header's reset. The row above cannot settle it: it
+  # pairs a header with a LATER `primary` record, so it pins header-wins without ever exercising the
+  # operator-facing combination (a framed 403 beside a SECONDARY record whose own `until=` IS the
+  # floor). THIS row is that combination, and it reds on any mutant that reads the record instead of
+  # the header.
   rec "$now" "$(( now + 60 ))" 0 secondary
   raw="$(printf 'HTTP/2.0 403 Forbidden\r\nX-Ratelimit-Limit: 5000\r\nX-Ratelimit-Remaining: 0\r\nX-Ratelimit-Reset: %s\r\nContent-Type: application/json\r\n\r\n{"message":"API rate limit exceeded"}' "$(( now + 900 ))")"
   got="$(sweep_defer_until_recorded "$raw")"

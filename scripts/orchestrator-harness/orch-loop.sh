@@ -4875,10 +4875,10 @@ gh_limit_recorded_until() {
 #   `X-Ratelimit-Reset` (and `X-Ratelimit-Remaining`).
 # The header arm below therefore returns FIRST and `gh_limit_recorded_until` is never called on that
 # path: the deferral is that response's `x-ratelimit-reset`/`retry-after`, floored at 60 s and capped
-# at 1 h by `sweep_defer_until`. The record branch reaches only a refusal that carries no reset header
-# at all (a shim/EX_TEMPFAIL, a timeout, a no-response failure — `raw` empty); there it pays only when
-# the last recorded CORE observation was a `primary`/`retry-after` refusal written by a DIFFERENT core
-# call that did reach the headers, and then the window outlives this refusal.
+# at 1 h by `sweep_defer_until`. The record branch's own reach is narrower: the call site defers only
+# on a `rate-limit`-classified failure, so what arrives is a refusal carrying no reset (`remaining: 0`
+# with none, or a stderr-phrase-only one with empty `raw`) — NOT a timeout/no-response failure, which
+# classify `network` and write no deferral. It pays only via a DIFFERENT core call that saw headers.
 # Residual, stated rather than overstated — and it is the OPPOSITE of "once a minute": because a header
 # always WINS (`A header always WINS` below), a SECONDARY refusal's `x-ratelimit-reset` is adopted as
 # the sweep's deferral, up to the 1 h ceiling. That is the shape #2137 refuses INSIDE the layer (the

@@ -133,11 +133,17 @@ What the controller now does (`orch-loop.sh`, the `# BEGIN gh-bound` block):
   Measured 2026-11-09: `gh api --paginate -i` on a non-2xx emits `HTTP/2.0 422 …` plus
   `X-Ratelimit-Reset` on **stdout**. So `sweep_defer_until_recorded` returns from its HEADER arm
   first (`orch-loop.sh:4893-4896`) and never reads the record: on a real refused request the
-  deferral is that response's `x-ratelimit-reset` / `retry-after`, floored at 60 s and capped at 1 h
-  (`orch-loop.sh:4802-4814`), **not** a once-a-minute retry. The record branch fires only for a
-  refusal that carries no reset header at all — a shim/`EX_TEMPFAIL`, a timeout, a no-response
-  failure — where `SWEEP_RAW` is empty; there it pays only if the last recorded **core** observation
-  was a `primary`/`retry-after` refusal from a different core call that did reach the headers.
+  deferral is that response's `x-ratelimit-reset` / `retry-after`, floored at the layer's base wait
+  and held to the sweep's own 1 h ceiling (`orch-loop.sh:4802-4814`) — **not** a once-a-minute
+  retry. **The record branch is narrower than it looks, and its own reachability is part of the
+  claim:** the call site defers ONLY on a failure `sweep_fail_kind` classifies `rate-limit`
+  (`orch-loop.sh:5893`, `:4778-4796`), so the shape that can reach it is a `rate-limit` refusal
+  whose response carried no reset — `x-ratelimit-remaining: 0` with no `x-ratelimit-reset`, or a
+  stderr-phrase-only refusal with an empty `raw`. A timeout or a no-response failure is classified
+  `network` and defers NOTHING (the `else` branch at `:5899` logs the failure and writes no
+  deferral at all). Where the record branch does fire, it pays only if the last recorded **core**
+  observation was a `primary`/`retry-after` refusal from a different core call that did reach the
+  headers.
   **Operational residual, stated rather than overstated — and it is the opposite of "once a minute":**
   because a header always wins (`orch-loop.sh:4887-4889`), a **secondary** refusal's
   `x-ratelimit-reset` is adopted as the sweep's deferral. That is the exact shape #2137 refuses
@@ -162,21 +168,28 @@ What the controller now does (`orch-loop.sh`, the `# BEGIN gh-bound` block):
   `case` PATTERN list wherever it appears — the grammar is newline-agnostic (`case word in
   [ [(] pattern [| pattern ]...) command-list ;;]... esac`) — so an expression anchored on a *line's
   first token* sees only one of the two layouts, and left the one-line
-  `case … in pat) gh api … ;; esac` (the form `orch-loop.sh` itself writes on 76 lines) unscanned
+  `case … in pat) gh api … ;; esac` (the form `orch-loop.sh` itself writes on 88 lines) unscanned
   (review rounds 2 and 3). The scan therefore accepts `)` at any offset, and blanks LITERAL text
   first: quote removal runs before a command is executed, so a `)` inside a literal is never a
   command position. ⛔ **But a `$( … )` substitution inside double quotes does run** — it IS a command
   position, and blanking a double-quoted span wholesale blinded the scan to the repo's dominant
-  capture idiom `x="$(gh api …)"` (16 call sites at `orch-loop.sh:519`, and the pre-fix line this
-  block documents at `:4896`) — review round 4. The stripper therefore keeps the code inside
+  capture idiom `x="$(gh api …)"` (9 of the block's 16 call sites are captured, named at
+  `orch-loop.sh:519`, and the pre-fix line this block documents at `:4910`) — review round 4. A
+  command also follows a shell KEYWORD or a wrapper word, not only a line start, `;`, `|` or `)`: the
+  `while`/`until` loop heads and the `time`/`exec` wrappers are command positions too (round 5 —
+  `until` and `time` were unmodelled while `while` was), so the alternation's group carries all four.
+  The stripper keeps the code inside
   `$( … )` and blanks only the literal around it, so the quoted and unquoted spellings of one call are
   seen alike. All of it is graded by ONE fixture, so each is a pinned property rather than prose: the
-  multi-line arm, the one-line `case`, and `x="$(gh api …)"` (incl. the `orch-loop.sh:4896` shape)
-  MUST red; an already-bounded arm, `pattern="a) gh api"`, a literal `) gh` in prose, and an
-  already-bounded capture MUST NOT. What is still out of its reach is a call hidden behind a variable,
-  in `eval`, inside a python heredoc, or in a BACKTICK substitution (the alternation anchors on `$(`,
-  not on a backtick). No such site exists today (independently re-derived over the file: every
-  remaining `gh` is a string literal, the `command gh` pass-through, or the `tb_timeout … gh` argv
+  multi-line arm, the one-line `case`, the `while`/`until` heads, the `time`/`exec` wrappers, and
+  `x="$(gh api …)"` (incl. the `orch-loop.sh:4910` shape) MUST red; an already-bounded arm,
+  `pattern="a) gh api"`, a literal `) gh` in prose, and an already-bounded capture MUST NOT. What is
+  still out of its reach is a call hidden behind a variable, in `eval`, inside a python heredoc, in a
+  BACKTICK substitution (the alternation anchors on `$(`,
+  not on a backtick), or behind a wrapper **followed by an assignment** (`env GH_TOKEN=x gh api …` —
+  the alternation wants `gh` to follow the wrapper directly). No such site exists today
+  (independently re-derived over the file: every remaining `gh` is a string literal, the
+  `command gh` pass-through, or the `tb_timeout … gh` argv
   inside `gh_bounded`), so this is a stated limit, not a live bypass.
 
 The other half of that report — "a heartbeat-age assertion that fails the cell rather than waiting to be

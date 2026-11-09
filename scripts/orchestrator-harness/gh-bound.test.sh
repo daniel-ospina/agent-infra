@@ -285,16 +285,18 @@ esac
 #     appears — the bash grammar is newline-agnostic (`case word in [ [(] pattern [| pattern ]...)
 #     command-list ;;]... esac`, GNU Bash manual 3.2.5.2; measured: `bash -c 'help case'`), so a
 #     line-anchored arm pattern sees only ONE of the two layouts. `orch-loop.sh` itself writes the
-#     one-line form on 76 lines, e.g. `case "${_ghb_n:-}" in ''|*[!0-9]*) _ghb_n=0 ;; esac` — a
+#     one-line form on 88 lines, e.g. `case "${_ghb_n:-}" in ''|*[!0-9]*) _ghb_n=0 ;; esac` — a
 #     future unbounded call written that way would leave this scan EMPTY and this row GREEN. So `)`
-#     is accepted at ANY offset, not only as the line's first token.
+#     is accepted at ANY offset, not only as the line's first token. (Measured: `awk '/case/ && / in /
+#     && /\)/ && /;;/ && /esac/' orch-loop.sh | grep -vc '^[[:space:]]*#'` → 88, identical at
+#     `origin/main`. An earlier 76 was not reproducible by any definition.)
 #  2. A `)` INSIDE A LITERAL IS NEVER A COMMAND POSITION (quote removal happens before a command is
 #     executed), so a quoted span is blanked before matching: `pattern="a) gh api"` cannot red it,
 #     and the fixture has that control row so the claim is pinned rather than prose.
 #  3. BUT A `$( … )` SUBSTITUTION INSIDE DOUBLE QUOTES RUNS, so it IS a command position. Blanking a
 #     double-quoted span WHOLESALE was the fail-open this row shipped in review round 4: it removed
-#     the repo's dominant capture idiom — `x="$(gh api …)"`, 16 call sites named at
-#     `orch-loop.sh:519`, and the very pre-fix line the block above documents (`:4896`) — so an
+#     the repo's dominant capture idiom — `x="$(gh api …)"`, 9 of the block's 16 call sites, named at
+#     `orch-loop.sh:519`, and the very pre-fix line the block above documents (`:4910`) — so an
 #     unbounded call written that way left this scan EMPTY and this row GREEN. The stripper therefore
 #     keeps the CODE inside `$( … )` and blanks only the literal text around it, so the
 #     `$(`-anchored alternative sees the substitution exactly as it sees it unquoted. The `)` that
@@ -302,6 +304,14 @@ esac
 #     while a `)` that is merely literal text stays blanked. ShellCheck answers this by parsing to an
 #     AST; a line regex cannot, so this is the next best thing — and the residue is a stated limit in
 #     `docs/ops/gh-rate-limits.md`.
+#  4. A command can also follow a shell KEYWORD or a wrapper word, not only a line start, `;`, `|`, or
+#     `)`. `while` was already in the group; its sibling `until` was not, and neither were the `time`
+#     and `exec` wrappers — so `until gh api …` / `time gh api …` passed this assertion GREEN while
+#     the row's message said every command position was caught (agent-infra#2028 review round 5).
+#     All four are in the group now, and rows 13–15 grade them. A wrapper followed by an ASSIGNMENT
+#     (`env GH_TOKEN=x gh api …`) is still out of reach, because the alternation requires `gh` to
+#     follow the wrapper directly; that is named beside `variable` / `eval` / python heredoc /
+#     backtick in the runbook's stated limits, so the remaining gap is disclosed, not implied closed.
 _unbounded_scan() {
   awk '
   # code(<line>) -> the line with its LITERAL text REMOVED: single-quoted spans in full, and the
@@ -338,7 +348,7 @@ _unbounded_scan() {
     return out
   }
   { line=$0; sub(/^[ \t]+/,"",line); if (line ~ /^#/) next;
-    if (code(line) ~ /(^|[|;&({]|\$\(|(if|then|elif|while|!|do|else)[ \t]|\))[ \t]*(command[ \t]+)?gh[ \t]/) print NR": "line }' "$@" \
+    if (code(line) ~ /(^|[|;&({]|\$\(|(if|then|elif|while|until|!|do|else|time|exec)[ \t]|\))[ \t]*(command[ \t]+)?gh[ \t]/) print NR": "line }' "$@" \
     | grep -v 'gh rc=%s' | grep -v 'then command gh "\$@"'
 }
 UNBOUNDED="$(_unbounded_scan "$LOOP")"
@@ -346,20 +356,23 @@ UNBOUNDED="$(_unbounded_scan "$LOOP")"
   || bad "structural: unbounded gh call site(s) remain in orch-loop.sh:
 $UNBOUNDED"
 # …and the catcher itself must SEE every command position a call can be hidden in, or a future site
-# written the other way passes with this assertion still green. Twelve lines, each graded:
+# written the other way passes with this assertion still green. Fifteen lines, each graded:
 #   1  a multi-line arm, unbounded              -> MUST be reported
 #   2  a multi-line arm, already bounded        -> must NOT (else every case-arm site reds)
-#   3  a ONE-LINE `case … in pat) gh api …`     -> MUST be reported (the form this file uses 76x)
+#   3  a ONE-LINE `case … in pat) gh api …`     -> MUST be reported (the form `orch-loop.sh` uses 88x)
 #   4  `) gh` inside a double-quoted literal    -> must NOT (the string-literal property, pinned)
 #   5  `) gh` inside a plain sentence             -> must NOT
 #   6  `x="$(gh api …)"` — substitution in a double-quoted span -> MUST (property 3)
 #   7  the same, inside an `if [ -n … ]` test                    -> MUST (property 3)
 #   8  `x="$(command gh api …)"`                                 -> MUST (property 3)
-#   9  the PRE-FIX capture idiom quoted from `orch-loop.sh:4896` -> MUST (property 3)
+#   9  the PRE-FIX capture idiom quoted from `orch-loop.sh:4910` -> MUST (property 3)
 #  10  the same line UNQUOTED (`x=$(gh api …)`)                   -> MUST (the control showing rows
 #      6–9 are not merely inheriting an alternation that only ever matched the unquoted form)
 #  11  an already-BOUNDED capture (`x="$(gh_bounded api …)"`)     -> must NOT (no false positive)
 #  12  a literal `) gh` AFTER a substitution in one quoted span    -> must NOT (that `)` is literal)
+#  13  an `until` loop head (`while`'s keyword sibling)            -> MUST (property 4)
+#  14  a `time` wrapper                                            -> MUST (property 4)
+#  15  an `exec` wrapper                                           -> MUST (property 4)
 printf '%s\n' \
   'core) gh api repos/o/r/pulls' \
   '  other) gh_bounded api repos/o/r' \
@@ -372,12 +385,15 @@ printf '%s\n' \
   'OPEN_N="$(gh pr list --repo x --state open --limit 300 2>/dev/null)"; : "${OPEN_N:=0}"' \
   'Y=$(gh api repos/o/r)' \
   'rows="$(gh_bounded api repos/o/r)"' \
-  'echo "a ($(date)) gh is down"' > "$T/casearm.sh"
+  'echo "a ($(date)) gh is down"' \
+  'until gh api repos/o/r; do :; done' \
+  'time gh api repos/o/r' \
+  'exec gh api repos/o/r' > "$T/casearm.sh"
 CASEARM="$(_unbounded_scan "$T/casearm.sh")"
-if [ "$(awk -F: '{print $1}' <<<"$CASEARM" | tr '\n' ' ')" = "1 3 6 7 8 9 10 " ]; then
-  ok "structural: every command position IS caught — both \`case\` layouts, AND a \`\$( … gh …)\` substitution inside a double-quoted span (incl. the pre-fix capture idiom from orch-loop.sh:4896) — while a literal \`) gh\` and an already-bounded call do not red it: the blind spot is closed, not documented"
+if [ "$(awk -F: '{print $1}' <<<"$CASEARM" | tr '\n' ' ')" = "1 3 6 7 8 9 10 13 14 15 " ]; then
+  ok "structural: every command position IS caught — both \`case\` layouts, the \`while\`/\`until\` loop heads, the \`time\`/\`exec\` wrappers, AND a \`\$( … gh …)\` substitution inside a double-quoted span (incl. the pre-fix capture idiom from orch-loop.sh:4910) — while a literal \`) gh\` and an already-bounded call do not red it: the blind spot is closed, not documented"
 else
-  bad "structural: a command position is UNSCANNED — scan said '${CASEARM:-<nothing>}' (want lines 1, 3, 6, 7, 8, 9 and 10 only)"
+  bad "structural: a command position is UNSCANNED — scan said '${CASEARM:-<nothing>}' (want lines 1, 3, 6, 7, 8, 9, 10, 13, 14 and 15 only)"
 fi
 # … and the ONE permitted bare `gh` is the degraded pass-through inside gh_bounded itself.
 grep -q 'then command gh "\$@"' "$LOOP" && ok "structural: the degraded pass-through is the only bare gh, and it is inside gh_bounded" \
