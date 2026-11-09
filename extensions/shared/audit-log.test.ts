@@ -3,7 +3,7 @@
  * Run: npx tsx extensions/shared/audit-log.test.ts
  */
 
-import { appendJsonl, gateEventsFile } from "./audit-log.js";
+import { appendJsonl, gateEventsFile, GATE_EVENT_NAMES } from "./audit-log.js";
 import { ok, equal } from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -91,6 +91,42 @@ test("appends multiple entries sequentially (append-only)", () => {
   equal(lines.length, 2);
   equal(lines[0].event, "gate_bypass");
   equal(lines[1].dispatch_count, 1);
+});
+
+// ── GATE_EVENT_NAMES — the declared event vocabulary (#853 review) ────────
+// ⛔ WHY THIS SECTION EXISTS. `GateEventName` was a bare type union, and a TYPE IS
+// INVISIBLE AT RUNTIME: `appendJsonl` takes `Record<string, unknown>`, so a name this repo
+// never declared (a typo, or a member someone deleted) writes fine and a report reading it
+// finds nothing. The #853 review measured exactly that: deleting a union member reddened NO
+// test. The type now derives from this array, so membership is assertable and the control is
+// real instead of claimed.
+test("GATE_EVENT_NAMES is non-empty and every member is a lowercase snake_case token", () => {
+  ok(GATE_EVENT_NAMES.length > 0, "the vocabulary is empty — no event could be declared");
+  const bad = GATE_EVENT_NAMES.filter((n) => !/^[a-z][a-z0-9]*(_[a-z0-9]+)*$/.test(n));
+  equal(bad.length, 0, `non-conforming event name(s): ${bad.join(", ")}`);
+});
+
+test("GATE_EVENT_NAMES has no duplicates (a duplicate is a rename that half-landed)", () => {
+  const seen = new Set<string>();
+  const dupes: string[] = [];
+  for (const n of GATE_EVENT_NAMES) {
+    if (seen.has(n)) dupes.push(n);
+    seen.add(n);
+  }
+  equal(dupes.length, 0, `duplicate event name(s): ${dupes.join(", ")}`);
+});
+
+// The degradation events are the ones an OPERATOR report has to be able to find. Naming them
+// here is deliberate: an enforcement layer that is degraded silently is the defect both
+// events exist for (#3297, #853), so their absence from the vocabulary must be a test failure
+// rather than a code-reading exercise.
+test("the two degraded-enforcement events are declared (guard_degraded #853, gh_shim_degraded #3297)", () => {
+  for (const name of ["guard_degraded", "gh_shim_degraded"]) {
+    ok(
+      (GATE_EVENT_NAMES as readonly string[]).includes(name),
+      `"${name}" is not a declared GateEventName — a report reading it would find nothing`
+    );
+  }
 });
 
 // ── Summary ───────────────────────────────────────────

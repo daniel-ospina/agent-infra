@@ -771,7 +771,15 @@ for r in rows:
             # capacity (no reliable staleness read) and NOT dead (relaunching would kill it).
             cap_occ.append("%s(%dm,record-stale)" % (r["lane"], a))
         elif _shell_visible(_ws) is True:
-            cap_dead.append("%s(%dm)" % (r["lane"], a))   # bare shell -> relaunch is safe
+            # ⛔ APPEND THE ACTIONABLE HANDLE (review round 5, P2 — and it is the SAME owner ask
+            # recorded above, applied to the one list that still lacked it). The clause this PR
+            # rewrote prescribes `lane-relaunch.py --ws <uuid>`, but this list carried `lane(age)`
+            # only — so the operator could not form the prescribed command without first looking the
+            # workspace up, which is exactly the step the owner asked to remove. The FULL id, not
+            # the 8-char prefix the other lists use: `lane-relaunch.py` compares the whole uuid and
+            # hands it to `cmux send --workspace`, so a prefix would be an unusable handle. Empty
+            # brackets if unknown — never a guess, because a wrong handle types into another lane.
+            cap_dead.append("%s(%dm)[%s]" % (r["lane"], a, _ws or ""))   # bare shell -> relaunch is safe
         else:
             cap_occ.append("%s(%dm,unconfirmed)" % (r["lane"], a))
         continue
@@ -1119,9 +1127,26 @@ fi
 # DEAD PANES: NOT CAPACITY, AND NOT A DISPATCH. A dead lane still carries its LAST session
 # file, so the staleness test reads it as idle forever -- which is how the CAPACITY clause
 # came to offer two dead panes as "free" on 2026-10-03 and order a send into a bare login
-# shell. They need a RELAUNCH; the exact mechanism is in ORCHESTRATION-BOARD §72.
+# shell. They need a RELAUNCH -- $AGENT_INFRA_PATH/scripts/lane-relaunch.py --ws <uuid> (it types the
+# launch line into the pane's own login shell; never respawn-pane, which DELETES the workspace when
+# its command fails, #942). The pre-fix text credited the mechanism to a board document that is on no
+# box in this fleet, and an instruction pointing at nothing is how an operator improvises.
+# ⛔ `$AGENT_INFRA_PATH/…`, NOT a bare `scripts/…` AND NOT `$SCRIPTS/…` (review finding 2, 2026-11-08).
+# A bare repo-relative path resolves only from a checkout, and this file is FARMED to
+# `$HOME/.pi/agent/scripts` where `scripts/` resolves to nothing — the very defect this change
+# closes, one hop out. `$SCRIPTS/` is not the answer either: `lane-relaunch.py` imports
+# `lane-status.py`, which `pi-bootstrap/setup.sh:489-496` deliberately WITHHOLDS from the farm (#1553
+# — farming the repo copy would overwrite the live classifier with an older one), so a farm-relative
+# pointer would name a file that must not be there. `$AGENT_INFRA_PATH` is the checkout the operator
+# already has (AGENTS.md makes it a prerequisite) and is how `safe-send.sh:82` reaches its own gate
+# for exactly this reason. `test_lane_relaunch.py` derives the correct form from the farm arrays, so
+# if #1553 lands and the farm starts carrying it, the test moves with it instead of going stale.
+# ⛔ DO NOT SPELL THAT GATE'S FILENAME IN THIS FILE (review round 4, P1):
+# `scripts/orchestrator-harness/brief-gate.test.sh` keeps a census of every file that mentions it,
+# and an undeclared mention turns that census permanently RED — attributing nothing. A prose
+# reference is not a dispatch path and must not declare itself as one.
 if [ "${N_DEAD:-0}" -gt 0 ]; then
-  CAPTEXT="${CAPTEXT} ⛔ DEAD LANES — CONFIRMED BARE SHELL, no pi in the pane: ${DEAD}. These are NOT free capacity and are NOT dispatchable: a send into one would be typed into a BARE LOGIN SHELL and executed. They need a RELAUNCH (recover-fleet / relaunch, board §72), not an item."
+  CAPTEXT="${CAPTEXT} ⛔ DEAD LANES — CONFIRMED BARE SHELL, no pi in the pane: ${DEAD}. These are NOT free capacity and are NOT dispatchable: a send into one would be typed into a BARE LOGIN SHELL and executed. They need a RELAUNCH via \$AGENT_INFRA_PATH/scripts/lane-relaunch.py --ws <uuid>, not an item. (If AGENT_INFRA_PATH is unset, it is your agent-infra checkout — the tool is not farmed, because it imports lane-status.py, which #1553 withholds.) It types the launch line into the pane's OWN login shell (where the user's PATH lives); it never uses respawn-pane, which DELETES the workspace when its command fails (#942)."
 fi
 # ⛔ OCCUPIED IS NOT DEAD, AND MUST NEVER CARRY THE RELAUNCH REMEDY. Measured 2026-10-04:
 # `DMeer - linkedin outreach` read `pid_exists=no` and was reported "NO pi PROCESS IN THE

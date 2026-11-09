@@ -1069,6 +1069,11 @@ Ink-based TUI with a large mounted output also burn under the same profile?
    per-frame cost is `getEntries()` (a fresh filtered array plus a scan of every
    session entry). Cache on the branch/last-entry identity, and stop walking
    every entry to build a fresh array per frame.
+   **Landed upstream as of `pi` 1.2.0** — `getSessionStats()` now caches on
+   `(session, sessionId, leafId, entryCount, limitsModel)`
+   (`dist/modes/interactive/components/footer.js:77-95`, whose docstring at
+   `:77` states the reason: "the footer renders on every frame"). See the
+   re-measure below; this is the one recommendation of the five that has shipped.
 3. **Make frames cheap and windowed** (the issue's ask 2). Note the ask as
    filed — "make the idle path event-driven" — is **insufficient as stated and
    is not adopted here without re-derivation**: an animated indicator (`Working`
@@ -1093,6 +1098,181 @@ this paragraph is the only re-check. Trigger for a manual re-measure: the next
 time any `pi` process exceeds ~5% of a core with a transcript silent > 120 s. If
 the fleet's next restart shows the spin gone, that is evidence for the "not idle
 at all — queued auto-continuation" framing rather than against it.
+
+### Re-measure 2026-11-08 (Linux cell, `pi` 1.2.0) — the CPU half of the trigger fired; no idle burn observed
+
+**Why this section exists.** The re-check paragraph above commits this report to
+a manual re-measure "the next time any `pi` process exceeds ~5% of a core **with a
+transcript silent > 120 s**" — a **two-conjunct** trigger. The **CPU half** of it
+fired on 2026-11-08 on a Linux fleet cell (x86_64, load 17.70, 22 days uptime,
+`pi` **1.2.0** — the report above probed **0.85.1** on macOS arm64). The silence
+conjunct **could be evaluated for only one of the 19 processes the sessions probe
+could map** — the `.jsonl` predicate reads `None` for the other 18 (below) — and the
+read evidence
+below shows the processes above 5% reading at working rates rather than sitting on
+the idle floor. That is evidence *against* a silent-session burn, but it is not the
+transcript predicate: for those 18 the silence value is **unknown, not negative**.
+So what this section records is **the CPU
+signal firing and the burn being absent from these four windows for every process
+the labelling placed *in* the idle set**, not the committed two-conjunct trigger
+having fired. It also records, more durably, a **better predicate pair**
+(ΔCPU + `rchar`) than the 09-16 table's transcript-age predicate. And note what
+that implies for the guard: **#1127 is ΔCPU joined to #469's `.jsonl` silence**, the
+very conjunct this box made unevaluable for 18 of 19 processes — so a guard keyed on
+it alone would be blind to most of the fleet, and `rchar` belongs in its second
+conjunct.
+
+**A method correction, forced by the data.** The 09-16 table keys "idle" on the
+age of the session `.jsonl`. That predicate is **not obtainable on a fleet box**:
+in the first window, of the **19** `pi` processes whose cwd the sessions probe
+could resolve, **18 had no session directory at all** (nothing at
+`~/.pi/agent/sessions/--<cwd>--/`), and exactly **one** `.jsonl` in the whole
+sessions tree had been written in the previous 15 minutes. Silence therefore read
+`None` for 18 of 19 — the 09-16 predicate is a single-host artifact and cannot be
+the fleet's trip. (The probe's denominator is the 19 processes whose cwd it could
+map, not the whole process table: the `rchar` windows below count **22–30** `pi`
+processes, so the probe's 19 is a subset of the live processes rather than all of
+them — which is itself the point: for the rest the predicate cannot even be
+evaluated.)
+
+The substitute is **`/proc/<pid>/io`'s `rchar`**, which needs no cooperation from
+`pi` and — read alongside ΔCPU — separates the two cases this issue conflates:
+*idle* (reads sit on a flat floor) versus *legitimately working* (reads scale with
+the provider stream or the tool output). Be precise about which of the two carries
+the weight, though. This section's `idle` / `working` labels are **per window, not
+per process**, and the rule behind them is **not stated here** — so the read floor
+below describes the samples the labels mark, and is a corroborating signal rather
+than an independent classifier. (The same gap applies to the `TUI` / non-`TUI` split
+that the 12 and 37 counts are computed over: no test for it is recorded here either,
+so those counts are not re-derivable from this section. Named rather than left
+implicit.) That is why **ΔCPU makes the split and `rchar` corroborates it**: a read
+threshold cannot stand on its own when the label it would reproduce is itself
+unstated. ΔCPU comes from `/proc/<pid>/stat`'s `utime+stime` ticks (`USER_HZ=100`),
+i.e. the 09-16 method (`ps -o time` twice) at 10 ms resolution. The main-thread vs
+`V8Worker` split in the last bullet cannot come from those **process-level**
+totals, which sum every thread; it reads the same counters **per thread**
+(`/proc/<pid>/task/<tid>/stat`), identifying the worker pool by `comm`.
+Both are measured on the **same** 25–30 s window, so CPU and reads are the same
+epoch — the property the epoch analysis above found missing across windows.
+
+| window (UTC) | `pi` procs | TUI | TUI Σ % of one core | idle TUI | worst idle % | working TUI | min `rchar` (working) |
+|---|---|---|---|---|---|---|---|
+| 09:26:14 (30 s) | 30 | 15 | 18.0 | 11 | **0.3** | 4 | 26.4 KB/s |
+| 09:26:50 (25 s) | 22 | 14 | 18.1 | 8 | **0.2** | 6 | 10.4 KB/s |
+| 09:27:15 (25 s) | 22 | 14 | 11.7 | 9 | **0.1** | 5 | 54.5 KB/s |
+| 09:27:40 (25 s) | 22 | 14 | 20.8 | 9 | **0.1** | 5 | 299.7 KB/s |
+
+**Result — no process labelled idle was burning, and every hot process was
+reading.**
+
+- **12 distinct idle TUI processes across the four windows, and the worst value any
+  of them shows while labelled idle is 0.3% of a core** (11 of 12 at ≤ 0.2%; pids
+  quoted below reach 5.2–7.0% in their *working* windows, which is why the label is
+  per window and not per process). The four idle read samples the pid series below
+  quote are tightly clustered — 8.4, 8, 10 and 10 KB/s — a fixed background poll,
+  not input, so the floor looks like a stable control rather than a per-process
+  accident. Two honest qualifications. First, a cluster is not a constant: it is a
+  *band*. Second, and decisive for how much it can carry, those four are **quoted
+  samples from three pids**, not the population — there is no `max rchar (idle)`
+  column, so the idle-sample maximum used above (10 KB/s) is the maximum
+  of the quoted samples, **not**
+  of all 37 idle process-windows, and one unquoted idle sample above 10.4 KB/s
+  would close the gap entirely. The sample nearest it, pid 4076400 (the exception
+  below), reads 10.4 KB/s at **0.8% of a core**, and the table's own 09:26:50 row
+  places that sample in the *working* set (8 idle / 6 working, worst idle 0.2%,
+  10.4 KB/s as that row's working minimum) — so the 0.4 KB/s separation is what the
+  labelling records, and the membership rule behind the labels is unstated. That is
+  exactly why **ΔCPU makes the split and `rchar` only corroborates**, and why the
+  negative the next bullet reports is a **read-rate** result — genuinely measured,
+  but silent about the transcript predicate the trigger actually names.
+- **No window contained a process above 1% of a core with reads at that floor** —
+  which is the 09-16 defect signature (11 processes at 6.4–26.3% while silent for
+  1.0–209.5 min), and it does not recur here. Be clear about what it is though. The
+  first conjunct is close to construction — no process above 1% is labelled idle
+  under a ΔCPU split — but the second is a **measured** value: the lowest read rate
+  any labelled-working process showed in any window is **10.4 KB/s — 0.4 KB/s above
+  the 10 KB/s maximum of the quoted idle samples, ≈4%**. So `NONE` is a real result
+  about reads, not a tautology; what it says
+  nothing about is **transcript silence**, which is the quantity the committed
+  trigger names. Within that scope it does establish that a *gross* recurrence of the
+  09-16 signature is absent from these four windows. What it cannot do is separate a
+  busy process whose reads sit in the *working* band from one genuinely working —
+  reason (d) below.
+- ΔCPU tracked `rchar` **in both directions, for the same pid, across windows**
+  rather than following a constant cadence: pid 2324326 read
+  `0.1%/8.4 KB/s → 2.8%/4 089 KB/s → 3.4%/9 841 KB/s → 5.5%/708 KB/s`, pid
+  1040172 `7.0%/41 KB/s → 0.2%/10 KB/s → 0.0%/10 KB/s → 2.0%/35 911 KB/s`, pid
+  1956953 `0.0%/8 KB/s → 2.6%/179 KB/s → 2.8%/198 KB/s → 5.2%/300 KB/s`. A render
+  loop on a timer would not idle at 0.0% and then follow a provider stream —
+  **these sessions were working, not spinning.**
+- **One honest exception, recorded rather than smoothed:** pid 4076400 spent one
+  window at **0.8% of a core** with 10.4 KB/s of reads — a transient ~30× below
+  the 26.3% peak this report measured, and level with the report's 0.8%
+  fresh-idle-TUI control. That control is **not** a licence to normalise it
+  away: it holds rendered *size* at ~zero and is, by this report's own
+  correction above, blind along exactly the axis the cost law says is live.
+- **Aggregate:** `pi`'s whole process tree summed to **38.2% of one core** over a
+  10 s window (22 processes) against **177.5%** on 09-16 (39 processes, 30 s).
+  The 10 s window is shorter than the 25–30 s discriminator windows above;
+  `%` of one core is rate-normalised, so the pair is comparable *as a rate*, but
+  this is the weakest window in the section against the bursty offender that
+  point (a) below names. And the box's **CPU** was **not `pi`'s**: the top consumers
+  were `bash` 99.9%, `python3` 96.3%, `bash` 63.1%, `python3` 16.9%, `bash`
+  15.8%, `pytest` 7.3% — i.e. the fleet's own
+  work. That further undercuts the "`pi` CPU → load → swap → reboot" chain from
+  the *other* direction: against the CPU those six named consumers were using, `pi`
+  was **~13%** (38.2% vs 299.3% of one core), not the driver. (Load average is not
+  CPU demand — this report says so above, and load 17.70 is not explained by any
+  CPU share here; only the CPU comparison is made.)
+- **Main thread vs workers** (the report's caveat quantified, though *not* the
+  size column, which stays missing below). Over the **26 busy samples at ≥3% of a
+  core** — the resolution at which a per-thread share is more than a handful of
+  ticks — the main thread carried **0.610–0.876** of the process ΔCPU and the
+  `V8Worker` pool **0.095–0.400**; within every row those two shares plus the
+  remaining threads land **between 0.936 and 1.015** — a residual of **−0.064 to
+  +0.015** against 1 across all four windows. **An earlier revision of this bullet
+  quoted 0.61–1.00 beside a single 0.41 `V8Worker` maximum and read the pair as a
+  contradiction. That was an artifact of the quoting, not a finding:** 1.00 came
+  from a sub-3% sample — the smallest at 0.0–0.1% of a core, where a process's
+  whole ΔCPU is at most **three ticks** (30 s window at `USER_HZ=100`) and the split
+  is meaningless — while 0.41
+  came from a *different* sample, so the pair described no single population and the
+  "0.61 + 0.41 > 1" impossibility dissolved once both ends were read over one set.
+  The remaining residual is **not attributed**: read skew between the process total
+  (`/proc/<pid>/stat`) and the per-thread counters (`/proc/<pid>/task/<tid>/stat`)
+  bounds only the small end of it, and the −0.064 end would need a thread that
+  exited inside the window. Neither was measured. The load-bearing
+  observation survives unchanged and is not weakened by the correction: the main
+  thread carries the majority of ΔCPU in **every** sample at ≥3% of a core (its
+  floor there is 0.610), so the burn, when it exists, is main-thread JS —
+  consistent with the render-frame mechanism and *not* primarily collector
+  throughput. Below that threshold the split is not claimed: at 0.7–1.3% of a
+  core a sample's whole ΔCPU is only **17–39 ticks** (25–30 s window, `USER_HZ=100`)
+  — coarse enough that a per-thread split is mostly noise — and the shares there
+  range 0.32–1.00 for the main thread: the resolution limit, not a second finding.
+
+**What this settles, and what it does not.** What it **records** is narrower than
+an independent negative: **no process labelled idle on one Linux x86_64 fleet box
+(`pi` 1.2.0) exceeded 0.3% of a core in 105 s of windows** — a direct consequence of
+the ΔCPU split rather than a free-standing measurement — and it supplies the missing
+discriminator for telling a burner from a worker. It does **not** settle that the
+defect is fixed, for four reasons this report's own analysis demands be stated:
+(a) the burn is **episodic** — windows this short cannot exclude a bursty offender,
+so a negative here is one epoch, not a lifetime rate; (b) the OS and
+version both moved (macOS arm64/0.85.1 → Linux x86_64/1.2.0), so the two
+observations are confounded exactly as the 09-16 confound analysis warns;
+(c) one of the five recommendations above **has shipped** in between (the footer
+memoisation, item 2), which is a plausible partial cause and is *not* demonstrated
+to be the cause; and (d) the discriminator has a **categorical blind spot** a longer
+window cannot fix — a busy process whose reads sit in the *working* band is
+indistinguishable from one genuinely working. The 09-16 burners' read rates were
+**never measured** (that table recorded ΔCPU and `.jsonl` age only), so whether
+reads would have separated them here is *unknown*, not no. What it does
+mean operationally is that the **mechanical trip is
+still #1127** — a prose re-check answered once is still prose — and that #1127 must
+take `rchar` (or an equivalent) as its second conjunct: #469's `.jsonl` silence was
+unevaluable for 18 of 19 processes on this box, so a guard keyed on it alone is blind
+to most of the fleet.
 
 ### Mitigation available in agent-infra (the issue's ask 3)
 

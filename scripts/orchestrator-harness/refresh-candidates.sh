@@ -317,9 +317,10 @@ UV="${SCOUT_UV:-uv}"
 
 # ── exit codes: TWO failure kinds, because the caller must act on them differently ────────────
 # `&` in orch-loop.sh discarded this script's status, so a bare non-zero was invisible. orch-loop
-# now reads the code: TRANSIENT is retried next cycle (a network/tool hiccup — retrying is
-# correct); NOT_PROVISIONABLE stops the retry loop and is surfaced loudly, because retrying cannot
-# help. Keep these in sync with orch-loop.sh's `-eq 3` handler.
+# now reads the code: TRANSIENT is retried INSIDE the same cycle on a short bounded backoff
+# (agent-infra#3584) and, if that budget is spent, again next cycle (a network/tool hiccup —
+# retrying is correct); NOT_PROVISIONABLE stops the retry loop and is surfaced loudly, because
+# retrying cannot help. Keep these in sync with orch-loop.sh's `-eq 3` handler.
 EXIT_TRANSIENT=1
 EXIT_NOT_PROVISIONABLE=3
 
@@ -890,6 +891,133 @@ GH_PROBE_ERR=""
 # DEVICE NODE (silently refused for an unprivileged user, destructive for root). One cleanup point, with
 # the guard in it, instead of six call sites that each have to remember.
 gh_probe_err_cleanup() { case "${GH_PROBE_ERR:-}" in ''|/dev/null) return 0 ;; esac; rm -f "$GH_PROBE_ERR" 2>/dev/null || true; }
+# ── WHICH PRECONDITION REFUSED, IN THE RECORD (#3584) ───────────────────────────────────────────
+# ⛔ THE CALL SITE USED TO SAY `the gh environment precondition refused (the refusal line above names
+# which one)`. That sentence is a POINTER, and the artifact `orch-loop.sh` builds its `[dispatch]
+# BLOCKED` line from — `state/refresh-last`'s `why=` — is not the log the pointer points at. Measured
+# on a cell's reported shape: the record read
+#
+#     why=TRANSIENT: the gh environment precondition refused (the refusal line above names which one) …
+#
+# so the one sentence an operator reads named neither the precondition nor the gh layer's own refusal.
+# "Refused because auth", "refused because the budget/throttle layer would not let the call out" and
+# "refused because this box could not reach GitHub" were indistinguishable in the record — the
+# `provision` stage's own acceptance criterion on #3584, and the reason a week of `TRANSIENT` refusals
+# had "no visible cause".
+#
+# WHAT NAMES IT. Every refusing arm sets `GH_PROBE_CAUSE` to the question it asked and the answer it
+# MEASURED, and the call site interpolates it. NO new classifier and NO new gh call: the clause is
+# rendered from evidence the probe has already paid for (`$GH_PROBE_ERR` — STDERR only — plus the rc),
+# so the layer's own refusal line reaches the record with the words that produced it.
+# ⛔ WHICH line that is, is NOT always the most specific one, and the earlier version of this paragraph
+# named the wrong candidates (`floor=`, `resets_in=`, the shim's `gh-contended … wait budget` note):
+# `gh-limit: gh-core-floor …` can never appear on this call at all (see below), and on the rc=75 arm the
+# take quotes the PACING note while `gh-contended` is line 3 — see the `GH_PROBE_CAUSE_MAX` block below
+# for the measurement. What is true, and all this paragraph should claim, is that whatever the take
+# quotes is the layer's own words rather than a classification of them.
+#
+# ⛔ ONE SHAPE THAT CANNOT ARRIVE HERE, SAID OUT LOUD SO NOBODY CHASES IT (#3701 review, P2). `gh api
+# rate_limit` IS THE METER: `gh-limit.py`'s `reaches_api()` answers False for it, and the CORE floor is
+# gated behind `reaches_api` — so `gh-limit: gh-core-floor …` can NEVER appear on THIS call's stderr.
+# (It appears on the CORE reads the same pass makes, which is where the floor's own line comes from —
+# a different call. ⛔ AND ITS SHAPE IS `gh-limit.py:4780`'s, NOT the `BUDGET:gh-rest: …` wrapper an
+# earlier version of this comment quoted: a reviewer grepped for that prefix and found no producer
+# anywhere in the tree, so it was a remembered shape rather than a real one. The real one is
+# `gh-limit: gh-core-floor remaining=<N> floor=<F> resets_in=<Nm> — gh rate limit: …`.)
+#
+# ⛔ AND WHICH REFUSAL *DOES* REACH IT DEPENDS ON ONE KNOB, SO THE CLAUSES SAY ONLY WHAT THE ARM
+# ESTABLISHES (#3701 review round 2, P2). The layer that CAN stop this call is `scripts/gh-shim/gh`'s
+# shared cooldown window, but `wait_for_cooldown` sleeps out that window and only exits 75 once it has
+# SPENT `AGENT_GH_GATE_WAIT_BUDGET` (default 120 s) — while this probe bounds the same call at
+# `GH_PROBE_TIMEOUT` (default 20 s) and kills its process group. So at DEFAULT settings the shape that
+# arrives is the TIMEOUT (rc=142), not the 75; 75 arrives only when the wait budget is set below the
+# probe bound. Both arms therefore name a NON-ANSWER and claim nothing about WHY — the TIMEOUT arm
+# once said "not a spent budget", which a shim sleeping on a shared throttle window falsifies.
+GH_PROBE_CAUSE=""
+# ⛔ ONE LINE, BOUNDED, AND NEVER THE TOKEN. `gh auth token`'s STDOUT is already discarded by
+# `gh_probe_bounded`; this reads STDERR only. The take must not grow the record without limit either:
+# a `--paginate` refusal can replay a whole error body, and `why=` is a single-line key in a file every
+# beat reads — so the first non-empty line, whitespace-collapsed, truncated.
+# ⛔ AND THE CLAUSE PUTS ITS FIXED-SIZE VERDICT FIRST AND ITS EVIDENCE LAST (#3701 review round 3,
+# P2). `refresh_cause_brief` prints `why=` cut at 400 BYTES (`orch-loop.sh:2559`; GNU `cut -c` is
+# byte-wise — `printf 'aéb' | cut -c1-2` yields `a\xc3`), and `provision_fail` spends 52 of them on
+# `TRANSIENT: the gh environment precondition refused [` plus 46 on the trailing
+# `] — no candidate can be judged from this box`. MEASURED, byte for byte, on the rc=75 arm: the
+# prefix and the fixed `answer=` + `question=` half cost 308 bytes before the evidence VALUE starts
+# (52 of prefix + 245 of fixed clause + 11 for `; evidence=`), so the evidence gets the remaining 92 of
+# the 400 — 95 when `source=env`, which is 3 bytes shorter than `source=stored`.
+# ⛔ AND WHAT ARRIVES THERE IS NOT THE `gh-contended` LINE (#3701 review round 7, P2). That was this
+# comment's claim and it was false: `gh_probe_evidence` takes the FIRST non-empty captured line
+# (`awk 'NF{print; exit}'`), while `wait_for_cooldown` buffers TWO notes into the same `$NOTEF` before
+# the refusal is even written (`scripts/gh-shim/gh:1479` the shared-window/pacing note, `:1485` the
+# budget-read note) — and `flush_notes 75` (`:1876`) then cats all three to stderr. So the record quotes
+# the PACING note and the `gh-contended` verdict (`:1874`, 244-byte note, 253-byte line) is line 3 and
+# never reaches it. MEASURED on a representative capture (`waiting 5s … budget 1000ms`): the quoted line
+# is 101 bytes, its evidence VALUE 108, so the clause is 245 + 11 + 108 = 364 against a 348-byte window
+# (400 − 52; the 46-byte suffix survives only when nothing is cut) — 364 > 348, so the cut still fires
+# and severs `(budget 1000ms)`. The decision below is unchanged, because it is about WHICH part yields,
+# not about which line arrives.
+# Round 2 answered "the verdict", and MEASURED with the capture this block establishes is real, that
+# pushes out the OTHER half instead — it does not save the verdict, it moves the damage:
+#   * from a captured line of 86 bytes the `question=` is no longer whole — it loses its closing `)`
+#     first, `source=` only with the 16-byte tail `, source=stored)`, which is what the real 101-byte
+#     pacing note loses; and `question=` is ABSENT ENTIRELY from a 160-byte capture;
+#   * from 171 bytes the cut reaches the VERDICT — it severs its last byte (`… NOT auth and NOT an
+#     outag`). The verdict is absent WHOLLY only at 324 bytes, which the 323-byte take cap just misses,
+#     so "gone" would overstate it: this is the one place the cap keeps something whole.
+# (Both boundaries measured with this arm's own clause through the real `refresh_cause_brief`. An earlier
+# version of this paragraph quoted `… — nothing was sent, so NEI`, which reproduces only when the capture
+# is led by the `gh-contended` note ALONE — the 244-byte note, i.e. WITHOUT `gate_note`'s `gh-gate: `
+# prefix (`:935` above defines that distinction; an earlier cut of this sentence said "the 253-byte
+# line" and was off by exactly the prefix). Either way it is a shape production cannot emit for this
+# arm — with the prefix the beat ends `… nothing was sen`, i.e. still inside the verdict — so the
+# paragraph was quoting a ghost both ways.) The
+# verdict and the question are FIXED-SIZE (245 bytes together, whatever the stderr says); the evidence
+# is the only variable-length part, AND the record keeps it whole — `GH_PROBE_CAUSE_MAX` below bounds
+# the evidence TAKE at 320 (`line` is cut there and the ASCII marker appended, so the take tops out 3
+# over the cap, plus `rc=`), which is why the record's clause is a bounded number while the beat's
+# 400-byte window is not big enough to hold it. So the verdict leads and the evidence closes, and once
+# the evidence is long enough to reach the cut (over 92 bytes, i.e. a captured line of 86 bytes or more)
+# the severed tail is evidence and its loss costs nothing the record does not already hold. Below that
+# the cut falls in `provision_fail`'s own trailing consequence sentence instead — not the verdict, and
+# still whole in the record and on the `[refresh] FAILED` log line — which is the only invariant this
+# ordering buys and the one `(g7)` pins.
+# ⛔ DECLARED RESIDUAL: the take is the FIRST line, so an arm whose capture carries a preceding note is
+# quoted by that note, not by its verdict. That is stated rather than fixed here — re-ordering the take
+# is a behaviour change for every arm and belongs with the issue, not in a fix round — and the beat
+# still names the precondition from the `answer=`/`question=` half and the log keeps all three lines.
+# `refresh-provision.test.sh`'s `(g7)` drives the REAL `refresh_cause_brief` and pins both halves:
+# every other arm reads `rec why`, which is unbounded, so they all stay green while the beat cuts.
+GH_PROBE_CAUSE_MAX=320
+gh_probe_evidence() {  # <rc> — the measured answer, one line, or a named non-answer
+  local rc="${1:-?}" line
+  # ⛔ THE `/dev/null` SENTINEL IS "CAPTURE UNAVAILABLE", NOT "NOTHING WAS WRITTEN" (#3701 review round 23,
+  # P2). `gh_probe_bounded` falls back to this sentinel when `mktemp` fails, and `[ -s /dev/null ]` is
+  # FALSE BY CONSTRUCTION — so without this branch the clause below would say `no stderr written` about a
+  # capture that never existed. stderr WAS written (into the device node) and then discarded, which is a
+  # statement about THIS BOX, not about the producer: the refusal's own words are simply unavailable. The
+  # difference matters because `no stderr written` is a positive claim about the refusal, and it is the
+  # claim an operator would reason from — the exact over-claim this file's scoping contract forbids.
+  if [ "${GH_PROBE_ERR:-}" = /dev/null ]; then
+    printf 'rc=%s, stderr capture UNAVAILABLE (mktemp failed, so the capture fell back to /dev/null and the refusal wrote there and was discarded — nothing about what it said is knowable here)' "$rc"
+    return 0
+  fi
+  line="$( [ -s "${GH_PROBE_ERR:-/dev/null}" ] && awk 'NF{print; exit}' "$GH_PROBE_ERR" 2>/dev/null )"
+  # An EMPTY stderr is NOT "nothing to say": the call failed and wrote no reason, and the rc is then
+  # the whole of the evidence. Say that, instead of rendering an empty parenthetical.
+  if [ -z "$line" ]; then printf 'rc=%s, no stderr written' "$rc"; return 0; fi
+  line="$(printf '%s' "$line" | tr -s '[:space:]' ' ')"
+  # ⛔ THE TRUNCATION MARKER IS ASCII, SO THE MARKER CAN NEVER BE SPLIT — AND THE RESIDUAL IS THAT THE
+  # CUT ITSELF CAN BE (#3701 review round 3, P2 note 2). `${line:0:N}` counts CHARACTERS in a UTF-8
+  # locale and BYTES under `LC_ALL=C` (which a cell's cron-ish environment does provide), so under the
+  # byte count the cut can land inside a multi-byte sequence and render U+FFFD. `...` is ASCII, so IT
+  # is safe; the severed sequence is NOT, and that residual is DECLARED here rather than fixed: it
+  # costs one character of a 320-byte quote on the beat, it cannot corrupt the line's structure
+  # (`why=` is a single line, and every consumer is `cut`/`case`/`grep` on ASCII delimiters), and a
+  # boundary-safe cutter in this hot path would import more risk than the character it saves.
+  if [ "${#line}" -gt "$GH_PROBE_CAUSE_MAX" ]; then line="${line:0:$GH_PROBE_CAUSE_MAX}..."; fi
+  printf 'rc=%s: %s' "$rc" "$line"
+}
 gh_probe_bounded() { # gh_probe_bounded <secs> <cmd…>; sets GH_PROBE_ERR (stderr of the probe)
   local _s="$1"; shift
   # ⛔ RELEASE THIS FUNCTION'S OWN PREVIOUS PROBE FILE FIRST. Every call mints a NEW `mktemp` path and
@@ -980,7 +1108,9 @@ gh_probe_retry() {
 # 0 = the environment the pre-flight runs in can authenticate; 1 = TRANSIENT; 3 = PERMANENT.
 gh_probe_env() {
   local terr err prc presence=""
+  GH_PROBE_CAUSE=""
   if ! command -v gh >/dev/null 2>&1; then
+    GH_PROBE_CAUSE="answer=NO — gh is not on PATH in this environment; question=is gh on PATH"
     echo "[refresh] NOT PROVISIONABLE: gh is not on PATH — the verdict-deciding surfaces of the collision pre-flight are gh-backed, so no candidate can be judged and a cell on this repo could only MERGE (#1736)"
     return "$EXIT_NOT_PROVISIONABLE"
   fi
@@ -997,15 +1127,47 @@ gh_probe_env() {
   # DEAD PROXY a pure network fault prints exactly the same "The token in ~/.config/gh/hosts.yml is
   # invalid." as a revoked one — so any text match on "invalid"/"expired"/"authenticat" classifies an
   # outage as a credential failure and latches the permanent marker a human must clear (#1853 review).
-  # PRESENCE is `gh auth token`: an OFFLINE lookup of the stored credential (hosts.yml / the keyring),
-  # so its exit status is cause-independent. ⛔ ITS STDOUT IS THE TOKEN — it is discarded below and the
-  # captured stream is STDERR ONLY (`2>&1 >/dev/null`), so no token can reach the log.
+  # PRESENCE is `gh auth token`: an OFFLINE lookup of the stored credential (hosts.yml / the keyring).
+  # ⛔ rc=0 IS presence — the lookup produced a token, so something IS stored. rc≠0 IS **NOT** ABSENCE,
+  # and saying so was this arm's over-claim (#3701 review round 24, P2): the lookup fails equally when a
+  # credential IS stored and its helper cannot decrypt it (`gh: gpg: decryption failed: No secret key` —
+  # the very failure the sibling timeout arm's `fix:` line names as the usual cause, and the shape the
+  # suite's `(g16)` stub reproduces), when the keyring denies access, or when `hosts.yml` is malformed.
+  # So rc≠0 establishes only that THIS LOOKUP returned no token, and the clause below says UNKNOWN and
+  # carries the helper's own line, which is what tells an operator whether to re-authenticate or to
+  # repair the store. ⛔ ITS STDOUT IS THE TOKEN — it is discarded below and the
+  # captured stream is STDERR ONLY. The real idiom is `>/dev/null 2>"$GH_PROBE_ERR"` (stdout to
+  # /dev/null, stderr to the capture file).
+  # ⛔ AND THE DEPRECATED ORDER IS UNSAFE **HERE** WHILE IT WAS SAFE WHERE THE OLD SENTENCE SAT — the two
+  # contexts differ and getting that backwards is what three revisions of this comment did (#3701 review
+  # rounds 8, 21, 22). THE SITE: `gh_probe_bounded` captures by REDIRECTING A FILE at STATEMENT LEVEL
+  # (`:1017`, `:1021`, `:1024`: `… </dev/null >/dev/null 2>"$GH_PROBE_ERR"`), and both call sites are
+  # top-level (`gh_probe_bounded "$bound" "$@"` and `gh_probe_bounded "$GH_PROBE_TIMEOUT" gh auth
+  # token`, cited by CONTENT rather than by line — a line number here is moved by this very comment,
+  # which is the defect class this PR keeps hitting) — no command substitution anywhere on this path. At
+  # statement level `2>&1 >/dev/null` points stderr at the pass's REAL stdout (the log) and then sends stdout to
+  # /dev/null, so the token-free capture file stays EMPTY and the refusal text lands in the log: measured
+  # on the extracted function, shipped order → `rc=3 capture=[THE-SHIM-ERR]`; with the orders swapped →
+  # `capture=[]` and `THE-SHIM-ERR` on the log. WHAT THE OLD SENTENCE DESCRIBED was the pre-#1736 form,
+  # `terr="$(gh auth token 2>&1 >/dev/null)"`, where the same order IS safe — inside `$( )`, `2>&1`
+  # points stderr at the capture pipe and `>/dev/null` re-points only stdout, so stderr is captured and
+  # stdout discarded (measured: `x="$(cmd 2>&1 >/dev/null)"` yields the stderr text, nothing from
+  # stdout). So the old wording was right about ITS code and wrong once the capture moved into a file;
+  # this one is right about the CURRENT code and says so explicitly. The shipped form — `>/dev/null`
+  # first, then `2>` — is correct in BOTH contexts, which is why it is the one to keep.
   # ⛔ BOUNDED, STDIN CLOSED, AND A NON-ANSWER IS NOT AN ABSENCE (TOKEN_HANG_FIX). See the block above
   # `gh_probe_bounded`. MEASURED rc=142: an unbounded capture here is what stalled the funnel forever.
   if [ -z "$presence" ]; then
     gh_probe_bounded "$GH_PROBE_TIMEOUT" gh auth token; prc=$?
     terr="$( [ -n "$GH_PROBE_ERR" ] && sed -n '1,4p' "$GH_PROBE_ERR" 2>/dev/null )"
     if gh_probe_timed_out "$prc"; then
+      # ⛔ THE EVIDENCE RIDES ALONG HERE TOO (#3701 round 4, P2). This arm computed `terr` and printed
+      # it to the LOG only, while the fix line below names a hung credential helper as the usual
+      # cause — a diagnosis the reader of the RECORD could not reach. Same ordering as every other
+      # arm: the VERDICT leads (it is fixed-size and names the precondition, so the beat must never
+      # cut it) and the EVIDENCE closes (variable-length, and whole in the record). `rc=` is no longer
+      # repeated in the answer text, because `gh_probe_evidence` already prefixes it.
+      GH_PROBE_CAUSE="answer=UNKNOWN — the probe did not answer within ${GH_PROBE_TIMEOUT}s, so this is a NON-ANSWER, not an absence and not a rejected credential; question=is a gh credential STORED here (gh auth token); evidence=$(gh_probe_evidence "$prc")"
       echo "[refresh] TRANSIENT: gh credential PRESENCE UNKNOWN — 'gh auth token' did not answer within ${GH_PROBE_TIMEOUT}s in the environment the pre-flight runs in (HOME=$HOME), so whether a credential is stored here CANNOT BE VERIFIED from this box (rc=$prc). This is NOT 'no credential': a probe that cannot answer is a fact about the probe, not about the credential, and it is retried next cycle instead of latching the permanent MERGE-ONLY marker (#1736, TOKEN_HANG_FIX)"
       printf '%s\n' "$terr" | sed -n '1,2p' | sed 's/^/[refresh]   /'
       echo "[refresh]   fix: put the token in the cell's environment (GH_TOKEN/GITHUB_TOKEN) so presence needs no gh call at all, or raise GH_PROBE_TIMEOUT (now ${GH_PROBE_TIMEOUT}s) if this box's credential store is merely slow; a hung credential helper (gpg/keyring with no tty) is the usual cause"
@@ -1013,9 +1175,28 @@ gh_probe_env() {
       return "$EXIT_TRANSIENT"
     fi
     if [ "$prc" -ne 0 ]; then
-      echo "[refresh] NOT PROVISIONABLE: gh has no credential STORED for the host it is configured for, in the environment the pre-flight runs in (HOME=$HOME) — its issue/PR surfaces cannot be read, so the pre-flight would answer from partial evidence and read every candidate as a collision (#1736)"
+      # ⛔ THE CLAUSE CLAIMS ONLY WHAT THE EXIT STATUS ESTABLISHES (#3701 review round 24, P2). It read
+      # `answer=NO — nothing is stored for the host gh is configured for`, which the arm cannot know:
+      # the SAME stub that proves the sibling timeout arm is genuine — `(g10)`'s `auth token` failing
+      # with `gpg: decryption failed: No secret key` — reaches THIS arm as soon as it fails FAST instead
+      # of hanging, and the record would then assert an absence AND quote, in the same sentence, evidence
+      # that a credential exists and could not be read. `(g16)` is that fixture; it reds if this wording
+      # goes back to asserting absence. The `*)` arm below already gets this right ("read its evidence
+      # before calling this auth or an outage"); this one classified.
+      # ⛔ EVIDENCE CLOSES THIS ARM TOO (#3701 review round 12, P2). It used to sit MID-clause with
+      # `question=` last, which broke the very invariant the sibling arm's comment above claims for
+      # "every other arm". MEASURED by driving the REAL `refresh_cause_brief` (`orch-loop.sh:2559`,
+      # `cut -c1-400`) over this arm's own prefix — `NOT PROVISIONABLE: the gh environment precondition
+      # refused [` plus the trailing `] — no candidate can be judged from this box` — with the pre-fix
+      # clause taken verbatim from `8f498599^` and a rising evidence VALUE, this arm's `question=` half
+      # is WHOLE through 215 bytes, arrives TRUNCATED at 216-261, and from 262 it is GONE entirely —
+      # the cut lands inside the evidence and never reaches `question=` at all. With the evidence moved
+      # last it is whole at every length the take can produce (measured 150, 243, 320 and 330; the take
+      # tops out at `rc=N: ` + 320 + `...`, so there is no length that reaches it).
+      GH_PROBE_CAUSE="answer=UNKNOWN — the credential lookup returned no token, which does NOT establish absence (a stored credential its helper cannot decrypt fails here too); question=is a gh credential STORED here (gh auth token); evidence=$(gh_probe_evidence "$prc")"
+      echo "[refresh] NOT PROVISIONABLE: the gh credential lookup in the environment the pre-flight runs in (HOME=$HOME) returned no token (rc=$prc) — that does NOT establish that no credential exists: a stored credential its helper cannot decrypt (gpg/keyring with no tty) fails here too, and the line below names which. Either way its issue/PR surfaces cannot be read, so the pre-flight would answer from partial evidence and read every candidate as a collision (#1736)"
       printf '%s\n' "$terr" | sed -n '1,4p' | sed 's/^/[refresh]   /'
-      echo "[refresh]   fix: authenticate gh in THIS home (gh auth login --with-token <token>), or point HOME at the home that already holds the credentials; set GH_HOST to name a host other than the one gh is configured for, then re-run"
+      echo "[refresh]   fix: read the line above first — a decryption/helper failure means the token is STORED and unreadable, so repair THIS home's credential store (an unlocked gpg/keyring) instead of re-authenticating; if the store is genuinely empty, authenticate gh in THIS home (gh auth login --with-token <token>) or point HOME at the home that already holds the credentials; set GH_HOST to name a host other than the one gh is configured for, then re-run"
       gh_probe_err_cleanup
       return "$EXIT_NOT_PROVISIONABLE"
     fi
@@ -1028,9 +1209,29 @@ gh_probe_env() {
   # TRANSIENT-shaped (the fall-through below is TRANSIENT unless the API answers 401), so it cannot
   # latch anything.
   gh_probe_retry "$GH_PROBE_TIMEOUT" gh api rate_limit; prc=$?
-  [ "$prc" -eq 0 ] && { gh_probe_err_cleanup; return 0; }
+  [ "$prc" -eq 0 ] && { GH_PROBE_CAUSE=""; gh_probe_err_cleanup; return 0; }
   err="$( [ -n "$GH_PROBE_ERR" ] && sed -n '1,4p' "$GH_PROBE_ERR" 2>/dev/null )"
   if gh_probe_timed_out "$prc"; then
+    # ⛔ "NOT A SPENT BUDGET" WAS A CLAIM THIS ARM CANNOT MAKE (#3701 review round 2, P2). At DEFAULT
+    # settings the shim spends 120 s sleeping out a shared throttle window before it ever returns 75,
+    # so a probe bounded at 20 s sees THIS arm — and "a shared budget is being slept out" is one of
+    # the things a bound here can mean. It establishes a NON-ANSWER, nothing more.
+    # ⛔ AND IT CARRIES ITS EVIDENCE SLOT (#3701 round 4; rounds 7-8 corrected WHAT it can say). On
+    # the default path this probe USUALLY kills the call before the shim flushes, so the capture is
+    # often EMPTY and `gh_probe_evidence` renders `rc=142, no stderr written` — a NAMED NON-ANSWER,
+    # not a quote. That is the honest maximum here and the reason the slot is worth wiring: the record
+    # says the layer wrote nothing, instead of having no evidence field at all.
+    # ⛔ BUT NOT ALWAYS, AND THE DIFFERENCE IS WHICH ARM OF `gh_probe_bounded` RAN (#3701 round 8,
+    # P2): its perl arm SIGKILLs (`$SIG{ALRM}=sub{ kill("KILL", -$pid) }`, cited by CONTENT because a
+    # line number here is moved by any edit above it — this one drifted :994 -> :1000 while the PR was
+    # being reviewed), while its `timeout --kill-after=2` fallback sends
+    # SIGTERM first — and the shim TRAPS term and flushes its buffered notes on exit
+    # (`scripts/gh-shim/gh:1828`, `:740-743`, `:744-749`). Measured on the real shim: perl arm `rc=142`
+    # with 0 bytes of stderr, timeout arm `rc=124` with 233 bytes of notes. So this record says
+    # "nothing was written" on the perl path and QUOTES the pacing note on the timeout path; both are
+    # honest, and neither is a guarantee. `(g9)`'s stub writes stderr BEFORE sleeping, an ordering a
+    # killed shim cannot produce, so that row pins the INTERPOLATION, not a production byte count.
+    GH_PROBE_CAUSE="answer=NO — the probe did not answer within ${GH_PROBE_TIMEOUT}s: a NON-ANSWER, which establishes neither a rejected credential nor anything about the budget; question=can the stored credential answer at all (gh api rate_limit, source=$presence); evidence=$(gh_probe_evidence "$prc")"
     echo "[refresh] TRANSIENT: the gh credential is present (source=$presence) but 'gh api rate_limit' did not answer within ${GH_PROBE_TIMEOUT}s (rc=$prc) in the environment the pre-flight runs in (HOME=$HOME) — a probe that cannot answer is an OUTAGE, not a rejected credential, so this is retried next cycle instead of latching the permanent MERGE-ONLY marker (#1736, TOKEN_HANG_FIX)"
     printf '%s\n' "$err" | sed -n '1,2p' | sed 's/^/[refresh]   /'
     gh_probe_err_cleanup
@@ -1049,12 +1250,35 @@ gh_probe_env() {
   # ⚠️ DECLARED RESIDUAL: a credential that GitHub rejects with a 403 is therefore retried
   # indefinitely (loudly, via `FAILED rc=1`) and never writes the permanent marker.
   if grep -q 'HTTP 401' <<<"$err"; then
+    GH_PROBE_CAUSE="answer=NO — GitHub REJECTED it (HTTP 401), which a retry cannot mend; question=is the stored credential ACCEPTED (source=$presence)"
     echo "[refresh] NOT PROVISIONABLE: the gh credential PRESENT for the host gh is configured for (source=$presence) is REJECTED by GitHub (HTTP 401) in the environment the pre-flight runs in (HOME=$HOME) — a retry cannot fix it, and every candidate would be read as a collision (#1736)"
     printf '%s\n' "$err" | sed -n '1,4p' | sed 's/^/[refresh]   /'
     echo "[refresh]   fix: re-authenticate gh in THIS home (gh auth login --with-token <token>), then re-run"
     gh_probe_err_cleanup
     return "$EXIT_NOT_PROVISIONABLE"
   fi
+  # ⛔ VERDICT FIRST, EVIDENCE LAST (#3701 review round 3, P2) — see `GH_PROBE_CAUSE_MAX`'s note: the
+  # verdict is fixed-size, the evidence is not, and only the evidence survives whole in the record.
+  # ⛔ rc=75 IS NAMED OFF THE EXIT CODE, AND THE CLAUSE CLAIMS ONLY WHAT 75 MEANS (#3701 review, P1).
+  # 75 is gh-limit.py's / scripts/gh-shim/gh's EX_TEMPFAIL: "refused LOCALLY, nothing was sent". It
+  # is NOT "the account is out of quota" — `gh-limit.py:3439` states that exact inversion as a defect
+  # it fixed ("A CONTENDED VERDICT IS NOT A LIMIT … That says 'I could not ask', NOT 'the account is
+  # out of quota'"), and the same code is BUSY_EXIT for single-flight contention. So the clause says
+  # what is TRUE — nothing was sent, so neither the credential nor the budget was tested — and lets
+  # the layer's own line, quoted verbatim, say which local verdict it was. A text match could not
+  # name this at all: prose drifts, which is why the repo keys on the rc for this code.
+  # ⛔ AND THE EVIDENCE IS INTERPOLATED LAST, NOT FIRST (#3701 review round 3, P2). It is the only
+  # unbounded part of the clause, so it is the only part the beat's cut may be allowed to land in.
+  # ⛔ AND AT DEFAULT KNOBS THIS ARM IS PREDATED BY THE BOUND: the shim sleeps out its
+  # `AGENT_GH_GATE_WAIT_BUDGET` (120 s) before returning 75, and this probe kills the call at
+  # `GH_PROBE_TIMEOUT` (20 s), so the TIMEOUT arm above is the default shape. 75 reaches here only
+  # when an operator sets the wait budget below the probe bound — which is why the arm stays (it is
+  # the documented verdict contract, and gh-limit's own BUSY code shares it) but is not described as
+  # the common case.
+  case "$prc" in
+    75) GH_PROBE_CAUSE="answer=REFUSED LOCALLY by the gh layer (rc=75 EX_TEMPFAIL — nothing was sent, so NEITHER the credential NOR the budget was tested): NOT auth and NOT an outage; question=can the stored credential answer at all (gh api rate_limit, source=$presence); evidence=$(gh_probe_evidence "$prc")" ;;
+    *)  GH_PROBE_CAUSE="answer=NO — the call failed; read its evidence before calling this auth or an outage; question=can the stored credential answer at all (gh api rate_limit, source=$presence); evidence=$(gh_probe_evidence "$prc")" ;;
+  esac
   echo "[refresh] TRANSIENT: a gh credential is PRESENT for the host gh is configured for (source=$presence) but the API did not answer with a 401 in the environment the pre-flight runs in (HOME=$HOME) — treating it as an outage rather than a rejected credential, so this is retried next cycle instead of latching the permanent MERGE-ONLY marker (#1736)"
   printf '%s\n' "$err" | sed -n '1,4p' | sed 's/^/[refresh]   /'
   gh_probe_err_cleanup
@@ -1062,6 +1286,11 @@ gh_probe_env() {
 }
 
 gh_env_verdict() {
+  # `GH_PROBE_CAUSE` is set by every refusing arm and consumed by the CALL SITE below, which is what
+  # puts the specific precondition into `state/refresh-last` (#3584). Clearing it first means an arm
+  # that forgets to name itself reads as "no clause", never as a STALE clause from a previous pass —
+  # a stale flag that records a past state is the defect class this harness keeps paying for.
+  GH_PROBE_CAUSE=""
   # The probe covers the host the pre-flight's own host-LESS calls resolve. The harness's POOL
   # LISTING is a different call — it names `$OR` directly — and it is guarded where it runs: an
   # unreadable listing must not be read as an empty one (see `.pool` in cmd_run).
@@ -2082,7 +2311,32 @@ refresh_record_write running provision 0 \
   "cmd=?"
 # The same environment precondition on the RUN path — and before the scout is provisioned, so a cell
 # that cannot read GitHub refuses in a second instead of after minutes of network work.
-gh_env_verdict || { _ghev=$?; provision_fail "$_ghev" "the gh environment precondition refused (the refusal line above names which one) — no candidate can be judged from this box"; }
+# ⛔ THE CAUSE NAMES THE PRECONDITION (#3584). This used to read `(the refusal line above names which
+# one)`, which is a pointer into the LOG — while `orch-loop.sh` builds its `[dispatch] BLOCKED` line
+# from the RECORD this sentence is written into (`refresh_cause_brief`). A
+# pointer in the record names nothing to a reader who has only the record: "refused because auth",
+# "refused because the gh layer declined to let the call out" and "refused because the box could not
+# reach GitHub" all read identically. So the probe's own measured clause is interpolated here, and a
+# probe that somehow set none is NAMED as such rather than silently reverting to the pointer.
+# ⛔ NO SPECIFIC LAYER IS NAMED HERE ANY MORE (#3701 review round 2, P2): an earlier draft of this
+# comment, and of two others in this file, credited the measured refusal to a `gh-core-floor` budget
+# line — which CANNOT refuse this probe's `api rate_limit` call (`gh-limit.py`'s `reaches_api()` is
+# False for the meter, and the floor is gated behind it). The comments now agree with each other and
+# with the code; the arm-by-arm detail is at the `GH_PROBE_CAUSE` definition above.
+# ⛔ AND `.refresh-blocked` IS FIXED TOO, ON THE rc=3 ARMS — stated this way because an earlier
+# version of this very comment got it BACKWARDS (#3701 round 8, P1). That marker's "Reason and
+# evidence" is `tail -n +$((log_mark+1)) "$LOG" | grep 'NOT PROVISIONABLE' | tail -3`
+# (`orch-loop.sh:8801`), i.e. it quotes the LOG — but the cause reaches that log WITH this clause:
+# `provision_fail` prefixes `NOT PROVISIONABLE: ` when rc is `EXIT_NOT_PROVISIONABLE` (:617-620) and
+# `refresh_fail` writes the WHOLE cause to stdout (:607), which `orch-loop.sh` sends to `$LOG`. So an
+# rc=3 refusal now lands in that marker as the measured clause, where before it landed as the pointer.
+# ⛔ THE LIMITS, so neither surface is over-claimed: a rc=1 (TRANSIENT) refusal writes NO
+# `.refresh-blocked` at all — `orch-loop.sh` writes that file on the rc=3 arm (`:8804`) and, separately,
+# on the rc=78 config-refusal arm (`:8817`), never on the TRANSIENT path — so
+# the `why=TRANSIENT:` shape quoted above has the RECORD as its sole surface; and the marker reads the
+# log, never the record file. Both derived surfaces therefore name the precondition on the rc=3 path;
+# only the TRANSIENT path has one surface.
+gh_env_verdict || { _ghev=$?; provision_fail "$_ghev" "the gh environment precondition refused [${GH_PROBE_CAUSE:-NO CLAUSE RECORDED by gh_probe_env — the specific precondition was not named}] — no candidate can be judged from this box"; }
 
 # ── THE CORE BUDGET IS FINITE AND SHARED — ASK BEFORE YOU SPEND IT (#1736 follow-up) ─────────────
 # MEASURED 2026-10-18 on the live Mac, from consecutive `[refresh]` lines in

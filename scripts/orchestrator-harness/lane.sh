@@ -614,6 +614,19 @@ the terminal BLOCKED_* exits; for any other handoff you write it yourself:
     gh pr comment <PR> --repo $OR --body "<the exact blocker: the check name + its failure, the conflict, the missing precondition, and what you already tried>"
 Then report it. "Blocked" with no reason forces the next lane to re-derive everything you learned.
 
+## The mandatory lane report — it is now VERIFIED before merge (#2977)
+The owner ruling of 2026-10-28 keeps your push/PR authority with the session gates bypassed and moves the
+guarantee to the harness: a durable per-lane report plus a verifier that reads it. \`lane-merge.sh\` runs that
+verifier BEFORE it launches the (paid) merge chain, and \`merge-one.sh\` runs it before the rail and the
+reviewer. If the repo ships \`tools/worktree_report.py\`, then a report that is **absent, invalid, records a
+FAILING suite, or was written at a different head than the one you are merging** is REFUSED, and you spend a
+fix round (exit 10). The fix is usually free — no push:
+    python3 tools/worktree_report.py run --cmd '<the exact command>'   # each suite, AT THIS HEAD
+    python3 tools/worktree_report.py check                            # 0 green · 3 red-but-valid · 1 invalid
+⛔ Re-rendering an old report is NOT the fix: it launders evidence taken from a different tree into the head
+you are shipping, which is the false green the gate exists to refuse. A repo that ships no writer (or a box
+with no worktree for your branch) is an ABSTENTION, logged in the merge log and never counted as a green.
+
 ## Rules
 - The review/VGATE extensions are BYPASSED for you and you have NO "task" tool — do NOT dispatch. The PARENT runs the review gate (that is the chain in the merge loop above, not you).
 - Commit with \`git commit -F <message-file>\` (repo-unique temp path per AGENTS.md "Editing Rules"). Stage specific files; never \`git add -A\`.

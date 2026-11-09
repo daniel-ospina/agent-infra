@@ -136,6 +136,13 @@ export const OUT_OF_FAMILY_TERMS = [
   // above and its BEHAVIOUR pinned by origination-funnel.test.sh §5c (young ⇒ in flight, past the
   // bound ⇒ BLOCKED, unreadable `at=` ⇒ BLOCKED).
   "RUNNING_STALE_MIN",
+  // agent-infra#3584: the in-cycle TRANSIENT retry's ATTEMPT cap. `inFamily` needs a family TOKEN
+  // *and* a bound SUFFIX: the token is present (`REFRESH` contains `FRESH`), but `_ATTEMPTS` is not
+  // in `SCAN_BOUND_SUFFIXES`, so the name scan cannot see it. Listed deliberately, with its value
+  // pinned by the registration above and its BEHAVIOUR pinned by refresh-scout.test.sh §7
+  // (b1) (3 attempts with the cap at 3, read off the invoke count), (b2) (cap=1 makes exactly one) and
+  // (b6)+(b11) (a junk and an over-range value are both rejected by ONE guard).
+  "REFRESH_RETRY_MAX_ATTEMPTS",
   "DEFAULT_MAX_DISPATCH_MS",
   // #1167: the merge rail's two surviving re-run bounds. Their shell symbols
   // carry no stall-family token (the STALLED threshold is now the DERIVED
@@ -968,6 +975,53 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
       "scripts/orchestrator-harness/origination-funnel.test.sh §5c — the reader's in-flight/dead split (see REFRESH_STALE_LOCK_MIN)",
     note: "DERIVED alias of REFRESH_STALE_LOCK_MIN, kept as its own symbol so the reader can be re-pointed without touching the lock guard. `inFamily` cannot see it (no family token in `RUNNING`), so it is registered rather than left to the reverse scan — the audit should know every bound the beat acts on.",
   },
+  // agent-infra#3584 — the in-cycle TRANSIENT retry bounds. These are the actuation guard for the
+  // stall the issue measured: a `TRANSIENT` refresh refusal used to be retried only at the next
+  // cycle (15-161 min away, #3585), so a hiccup a 30 s retry clears cost HOURS of origination. The
+  // THREE `_S` knobs are seen by the reverse scan (`_S` is a bound suffix) and must be registered;
+  // `…_ATTEMPTS` is NOT (no family token), so it is registered DELIBERATELY on the
+  // `RUNNING_STALE_MIN` precedent: it is the runaway guard for exactly this failure mode, and a
+  // retry loop whose cap nothing audits is a bound nobody notices going missing.
+  {
+    name: "REFRESH_RETRY_MAX_ATTEMPTS",
+    owners: ["scripts/orchestrator-harness/orch-loop.sh"],
+    value: '"${REFRESH_RETRY_MAX_ATTEMPTS:-3}"',
+    overrides: ["REFRESH_RETRY_MAX_ATTEMPTS=3"],
+    axis: "gate",
+    guardedBy:
+      "scripts/orchestrator-harness/refresh-scout.test.sh §7 (b1)/(b2)/(b6)+(b11) — the shipped retry block is extracted VERBATIM and driven: an invoke count of 3 when the cap is 3, exactly 1 at cap=1, and the default restored when the knob is junk (`abc`) or over its ceiling (`99`). (b11) is the over-range arm's own label — it must NOT be cited as (b8), which is the wall-clock budget arm)",
+    note: "attempt cap for the in-cycle retry of a TRANSIENT refresh (3 default, legal range 1-10). `inFamily` cannot see it: the token is there (`REFRESH` contains `FRESH`) but `_ATTEMPTS` is not a bound suffix, so it is registered rather than left to the reverse scan. Validated by ONE `case` whose patterns reject junk, leading zeros AND out-of-range values (the second arm of `[1-9]|10` is the ceiling), so the check is the single authority — three redundant resets used to mean a suite arm could not attribute its red to this guard (review round 2, F3).",
+  },
+  {
+    name: "REFRESH_RETRY_BACKOFF_S",
+    owners: ["scripts/orchestrator-harness/orch-loop.sh"],
+    value: '"${REFRESH_RETRY_BACKOFF_S:-30}"',
+    overrides: ["REFRESH_RETRY_BACKOFF_S=30"],
+    axis: "gate",
+    guardedBy:
+      "scripts/orchestrator-harness/refresh-scout.test.sh §7 (b9) — a 10 s backoff is driven with BOTH the per-delay cap and the budget raised out of the way, and the arm asserts the LOGGED delays are `10s` then `20s`, so the DOUBLING itself is graded (deleting the doubling loop reds it, measured); (b3) proves the delay is REFUSED (not shortened) when it does not fit the budget; and (b7) drives REFRESH_RETRY_MAX_DELAY_S itself (backoff 1000 clamped to a 1 s cap), so the per-DELAY clamp is graded rather than assumed",
+    note: "first in-cycle backoff delay for a TRANSIENT refresh, DOUBLED per attempt and clamped by REFRESH_RETRY_MAX_DELAY_S. Suites set it to 0 so the policy is graded instead of slept through — which is also why it is a knob and not a literal.",
+  },
+  {
+    name: "REFRESH_RETRY_MAX_DELAY_S",
+    owners: ["scripts/orchestrator-harness/orch-loop.sh"],
+    value: '"${REFRESH_RETRY_MAX_DELAY_S:-120}"',
+    overrides: ["REFRESH_RETRY_MAX_DELAY_S=120"],
+    axis: "gate",
+    guardedBy:
+      "scripts/orchestrator-harness/refresh-scout.test.sh §7 (b7) — the backoff is set ABOVE the cap and the arm asserts the LOGGED delay is the cap, so `[ \"$_rd\" -gt \"$REFRESH_RETRY_MAX_DELAY_S\" ]` is exercised, and (b7) is the ONLY arm that exercises it: (b3) sets only REFRESH_RETRY_BACKOFF_S=30 and REFRESH_RETRY_BUDGET_S=1, so REFRESH_RETRY_MAX_DELAY_S is the default 120, `_rd` stays 30, the clamp never fires there, and the refusal it logs prints the UNCLAMPED delay (fresh-context review, P2 — measured)",
+    note: "per-delay cap on the doubled backoff, so raising REFRESH_RETRY_BACKOFF_S or the attempt cap cannot make one sleep unbounded. The TOTAL bound is REFRESH_RETRY_BUDGET_S, not this — this one only stops a single delay running away.",
+  },
+  {
+    name: "REFRESH_RETRY_BUDGET_S",
+    owners: ["scripts/orchestrator-harness/orch-loop.sh"],
+    value: '"${REFRESH_RETRY_BUDGET_S:-300}"',
+    overrides: ["REFRESH_RETRY_BUDGET_S=300", 'REFRESH_RETRY_BUDGET_S="$_budget_cap"'],
+    axis: "gate",
+    guardedBy:
+      "scripts/orchestrator-harness/refresh-scout.test.sh §7 (b3) — with REFRESH_RETRY_BACKOFF_S=30 and the budget at 1 s the block makes exactly ONE attempt and logs `the 1s in-cycle retry budget is spent` AND names the `stale-lock guard reaping this pass while it still runs` (both greps are required: deleting the guard mention alone reds the arm, measured); (b8) drives a stub that SLEEPS 2 s per pass against the same 1 s budget, so a sleeps-only accumulator (which would see 0 + 0 ≤ 1 and retry) reds, i.e. the bound is wall clock rather than the sum of the sleeps; and (b3b) pins the CEILING — with REFRESH_STALE_LOCK_MIN=1 (a 60 s guard) a bogus `REFRESH_RETRY_BUDGET_S=3000` must fall back to 30 s and refuse a 40 s backoff on the FIRST attempt, so a typo cannot buy a sleep longer than the guard it must not outlive",
+    note: "the TOTAL WALL CLOCK the retries may add in one cycle, checked BEFORE each sleep. This is a correctness bound, not politeness: REFRESH_STALE_LOCK_MIN clears `.refresh.lock` after 20 min, so a retrying pass that outlived it would be reaped by the NEXT cycle while STILL RUNNING — exactly the concurrent double-pass the lock exists to prevent. ⛔ WHAT IT DOES AND DOES NOT BOUND (review round 3, measured rather than argued): it bounds the SLEEPS the retries add plus one further pass runtime — the residual is one attempt's own duration, which a retrying pass cannot cap and which a FIRST attempt already carries today (`refresh-candidates.sh:3244-3248` records that a single pass can cross the guard on its own). Worst case is therefore budget + one pass runtime, not budget alone. ⛔ AND IT MAY NOT REACH THE GUARD (review round 2, P2 — measured): the `case` rejects junk but accepted `3000`, which bought 2000 s of sleep against the 1200 s window, so a value at or past `REFRESH_STALE_LOCK_MIN * 60` falls back to `min(300, guard/2)`. The shipped defaults (30 + 60 s of sleep against a 300 s budget, under a 20 min guard) leave a factor of ~4 of headroom for a pass that completes in its usual seconds — ~1.8x at the ~6m20s pass cited above, which is the honest figure rather than 'an order of magnitude'.",
+  },
   // — retention axis —
   {
     name: "MAX_AGE_DAYS",
@@ -1562,10 +1616,23 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
 
 /**
  * Explicit carve-outs from the reverse scan. Each MUST carry a substantive
- * rationale: the point of the exemption list is that a reader can see WHY a
- * family-matching identifier is not a stall bound.
+ * rationale. TWO reasons are admissible, and a reader must be able to tell which
+ * one a row takes: (a) the identifier is NOT a stall/liveness bound at all (the
+ * original purpose — a measurement, a retention floor); or (b) it IS a real
+ * stall/liveness bound whose DECLARATION ARITY no single registry row can
+ * express (the ONE-NAME/TWO-SITES shape `RUNNER_WORK_MIN_AGE`'s note records for the bare
+ * `MIN_AGE` — two SHIPPED owners at values that must differ, resolved there by RENAMING;
+ * here the second site is a TEST FIXTURE rather than a second floor) — in which case the
+ * rationale must also say how the VALUE is pinned elsewhere, because this list
+ * removes the declaration from the gate and nothing else.
  */
 export const STALL_SCAN_EXEMPTIONS: readonly Exemption[] = [
+  {
+    symbol: "_WREAP_WINDOW_MIN",
+    rationale:
+      "#3793 — the #2104 reaper's two-sample WINDOW (`4d56e7cc8`), carried in TWO files at DIFFERENT arities, so no single registry row can hold it. `scripts/orchestrator-harness/orch-loop.sh` is the DEFINITION: two lines (`_WREAP_WINDOW_MIN=\"${WREAP_WINDOW_MIN:-6}\"` and its `is_num` fallback). `scripts/orchestrator-harness/selftest.sh` is FIVE lines and not one of them defines the bound: the suite's OWN SHELL assigns 0 (`_WREAP_WINDOW_MIN=0`, the line that makes every sibling arm inherit 0, disarming the window for the arms whose subject is something else), `_wreap_verdict_win` sets 6 inside its own subshell to drive the too-young side, and the remaining three are fixture preludes that also set 0 (the `rl.sh`, `rl2.sh` and `rr.sh` preludes). ⛔ SITES ARE CITED BY SYMBOL, NOT BY LINE, and the history is stated precisely because an earlier revision of this very sentence got it wrong: each `:NNN` into `selftest.sh` was EXACT when the arms landed, and then the four refs BELOW the added comment block drifted by +10 in the next commit of this same PR (which is where round-1's fix inserted 11 comment lines for 1), while the three above it did not move at all. So the drift was self-inflicted and is inherent to citing lines in the file being edited — the same failure mode this exemption's own rationale is about, a pointer that reads as a fact and is not one. The forward check demands that EVERY owner of a term declare it exactly `1 + overrides.length` times, so the only row that could name both owners would have to record one of them as carrying a count it does not — a false record, which is the failure mode this registry exists to prevent. Registering the definition alone is equally red: the reverse scan then reports the selftest's fixture assignments as a registered term re-declared in a file that is not an owner. This is the `X_MIN` collision recorded in `RUNNER_WORK_MIN_AGE`'s note, with a TEST FIXTURE as the second site rather than a second floor — the shape the registry has no row for, which is what an exemption carrying this rationale is for. ⛔ THE VALUE IS PINNED BY TWO ARMS ADDED WITH THIS EXEMPTION, because the earlier state of this class is the reason it is declared here at all: `4d56e7cc8` shipped the bound with NOTHING measuring either literal — every window-sensitive arm in the suite inherited the ambient `0` that the suite's own shell assigns (`_WREAP_WINDOW_MIN=0`), and `1 >= 0` is true for any default, so the shipped number was never read. `_wreap_verdict_def` unsets the variable so `_wreap_verdict` resolves the shipped `${_WREAP_WINDOW_MIN:-6}`, and requires a flat reading across a 3600 s gap to be IDLE (rc 0) — a default past 60 min turns the same baseline into UNKNOWN (rc 2) and reds it (verified by mutation: the consumer's `:-6}` rewritten to `:-120}` yields rc 2); and because `reapw_prelude` extracts FUNCTIONS only, the DECLARATION's default never enters the extracted unit, so that literal is pinned by the `grep -qF` SHAPE arm that sits beside it. ⛔ WHAT THAT SHAPE PIN DOES AND DOES NOT BUY, stated because claiming more would be false: the grep pattern IS the literal, so it pins that the declaration still reads `:-6}` and forces an edit here whenever the declaration moves — a tripwire, not an invariant. It does NOT tie `orch-loop.sh:2183` to the consumer fallback at `:2357`, which the behavioural arm above brackets only at `<= 60` min (its baseline is 3600 s, so `mmin` is 60); nor does it read the other two literal sites, `:2184` (`_WREAP_WINDOW_MIN=6`) and `:2485` (the operator-facing `window=${_WREAP_WINDOW_MIN:-6}m` log). Pinned: the declaration's exact `6`, and the consumer's `<= 60`. NOT pinned: their equality, and those two sites — tracked in #3804, filed with this exemption, rather than asserted as covered. ⚠️ DISCLOSED, not modelled: unlike a registered row — which reds when a term is declared in a file the registry does not list as an owner — an exemption is keyed on the SYMBOL ALONE (`declared-surface.ts`'s `reverseViolations` consults the exemption map only for an UNREGISTERED symbol), so a FUTURE third file declaring `_WREAP_WINDOW_MIN` is invisible to this gate — the carve-out is SYMBOL-WIDE, not file-scoped, and it is only that today's two declaring files are in fact the two above. Found while merging #3712, whose diff is untouched by any of it.",
+    owner: "#3793",
+  },
   {
     symbol: "EDGE_REAP_MS",
     rationale:

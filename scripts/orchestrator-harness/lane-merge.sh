@@ -66,6 +66,50 @@ CHECKS_TSV=""; PR_TSV=""; MAX_ROUNDS_OVERRIDE=""
 # at the point of use (never silently skipped).
 # shellcheck source=/dev/null
 . "$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)/pr-state.sh" 2>/dev/null || true
+# ── THE MANDATORY LANE REPORT'S CONSUMER (#2977, owner ruling 2026-10-28) ────────────────────
+# ⛔ THIS IS THE EVIDENCE HALF OF THE GATE SUBSTITUTION, AND IT IS GATED HERE BECAUSE THIS IS THE LANE'S
+# OWN CONVERSATION. The ruling keeps push/PR authority with the session gates bypassed BY DESIGN and
+# makes the harness supply the equivalent guarantee: a durable per-lane report (tortoise#10220) plus a
+# verifier that refuses to merge on silence. Measured 2026-11-07: nothing consumed the report, and the
+# one staleness signal it emits (`head_moved_since_write`) is a WARNING by a recorded decision whose
+# owner is "the consumer" — two of four review rounds that day were re-run because a report described a
+# tree one commit behind the head being merged, and `check` exited 0 both times.
+# ⛔ REFUSING HERE RATHER THAN ONLY INSIDE merge-one.sh IS NOT DUPLICATION: the remedy costs NO PUSH
+# (re-run the suites at this head and re-write the report), so parking at a head inside the chain would
+# deadlock the lane on its own `parked-<PR>` marker. Here it is one FIX_REQUIRED round and the lane can
+# clear it in place; the chain keeps its own refusal as the backstop for every other ingress.
+# Sourced WITHOUT the `|| true` that pr-state.sh gets: a missing consumer for a gate is a harness defect
+# that must be loud, and `lane_report_gate` would then be an unbound command (set -u) at the one place
+# the lane is told it may merge.
+# ⛔ `$O` IS NOT YET DEFAULTED HERE (fresh review, P1 — it landed as a STARTUP BREAK). `set -u` is at :57
+# and `O="${O:-$HOME/orchestrator}"` is at :115, BELOW argv parsing, so referencing a bare `$O` in this
+# loop made the script die with `line 85: O: unbound variable` (exit 1) whenever `O` was not exported —
+# before a single argument was read, on the very box shape the header documents as supported (a lane
+# runs the deployed `$O/lane-merge.sh`; `lane.sh` sets `O` WITHOUT `export`). Exit 1 is not even in this
+# file's own exit-code contract, so the lane got an unmapped failure. The default is spelled INLINE here
+# rather than moving the block below :115: `LANE_REPORT_GATE` must be resolved before the argv loop
+# terminates the process on a bad flag.
+LANE_REPORT_GATE=""
+# ⛔ THE CHECKOUT SIBLING WINS OVER `$O`, AND THAT IS DISCLOSED RATHER THAN FIXED (round-20 review, P2).
+# A lane runs the carrier out of its own checkout (the `launch_chain` comment calls that the natural
+# way to run this script), so an UNCOMMITTED edit of `scripts/orchestrator-harness/lane-report-gate.sh`
+# is the module that sources here — it decides the verdict and prints the "verified" line. Measured:
+# with a lane-edited sibling gate returning 0 and the real gate present in `$O`, this carrier logged
+# `VERDICT=PASS` and launched the chain, while the deployed shape refused with `VERDICT=ABSENT`.
+# ⛔ WHY THIS IS NOT A P0: the MERGE is still refused, because the chain this script launches is always
+# `$O/merge-one.sh` (`chain-merge.sh`), which sources the gate from ITS OWN `$O` sibling and re-runs the
+# check. ⛔ THE COST IS NOT "A PAID REVIEW" — an earlier wording said that and it was measured false
+# (round-21 review, P2): merge-one.sh's gate block refuses with `exit 9` BEFORE `REV_STARTED=1`, so no
+# reviewer is bought and its own log line says so ("No review was bought and nothing was merged"). The
+# real chain-side cost is a FIX_REQUIRED verdict round. What this carrier loses is the false
+# "verified" line and whatever a lane does between seeing it and the chain's own refusal.
+# The class is the same one the gate's provenance comment names — the lane supplying the instrument —
+# tracked with its siblings in agent-infra#3789. `merge-one.sh` shares the lookup order.
+for _lrg in "$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)/lane-report-gate.sh" "${O:-$HOME/orchestrator}/lane-report-gate.sh"; do
+  [ -f "$_lrg" ] && { LANE_REPORT_GATE="$_lrg"; break; }
+done
+# shellcheck source=/dev/null
+[ -n "$LANE_REPORT_GATE" ] && . "$LANE_REPORT_GATE"
 lrow=""
 while [ $# -gt 0 ]; do
   # ⛔ A VALUE-LESS TRAILING FLAG USED TO SPIN FOREVER (landing-review P2, REPRODUCED). Seven arms ended
@@ -210,7 +254,14 @@ verdict() { # verdict <TOKEN> <reason…> — the ONE writer, so no exit path ca
   [ -n "$ISSUE" ] && printf '%s %s\n' "$tok" "$*" > "$O/state/lanemerge-issue-$ISSUE.verdict"
   return 0
 }
-round_of() { local r=0; [ -f "$ROUND_F" ] && r="$(cat "$ROUND_F" 2>/dev/null || echo 0)"; is_limit "$r" || r=0; printf '%s' "$r"; }
+# ⛔ THE ROUND COUNTER IS READ WITH A BUILTIN, LIKE THE VERDICT LINE (round-24 review, P1). This was
+# `r="$(cat "$ROUND_F")"`, and a lane runs this carrier itself with its own PATH — a `cat` that answers 0
+# for `*.round` makes `round_of` return 0 forever, so `emit_fix` grants round 1 every time and THE CAP AT
+# MAX_ROUNDS NEVER FIRES: an unbounded budget on the one number this script exists to bound. Measured with
+# only PATH differing, round file seeded to the cap: control 13/BLOCKED_ATTEMPTS, shimmed 10/FIX_REQUIRED
+# round after round. `IFS= read -r` is a builtin; nothing to shim. (The `git` seam in this file is the
+# disclosed residual, agent-infra#3789 — but a counter is not a seam, it is a file read.)
+round_of() { local r=0; if [ -f "$ROUND_F" ]; then IFS= read -r r < "$ROUND_F" || true; fi; [ -n "$r" ] || r=0; is_limit "$r" || r=0; printf '%s' "$r"; }
 
 # ── --status: no network, no writes. chain-merge.sh and an operator both read this. ──────────────
 if [ "$STATUS" -eq 1 ]; then
@@ -352,10 +403,24 @@ PY
 }
 
 # ── chain supervision ────────────────────────────────────────────────────────────────────────────
-chain_pid() { awk '{print $1}' "$CHAIN_F" 2>/dev/null; }
-chain_head() { awk '{print $2}' "$CHAIN_F" 2>/dev/null; }
+# ⛔ COUNTER FILES ARE READ WITH A BUILTIN, INCLUDING HERE (round-25 review, P1). `round_of` and the
+# watch increment were converted, but the counters DESIDE whether a loop is bounded, and three of those
+# reads were still `cat`: a `cat` answering 0 for `*.headmoved` makes "pass 2" unreachable, and one
+# answering 0 for `*.apiretry` makes the refund unconditional, so WATCH_F is pinned at 0 and
+# BLOCKED_ATTEMPTS can never fire — measured on the shipped carrier with only PATH differing (control:
+# 13 after 81 runs; shimmed: 11 for ever, watch=0). A counter is a file read, not a seam: read it with
+# `IFS= read -r`, never a PATH-resolved program.
+_lm_readint() { # _lm_readint <file> — integer file contents, 0 when absent/blank/unusable
+  local _v=0
+  [ -f "$1" ] && { IFS= read -r _v < "$1" || true; }
+  [ -n "$_v" ] || _v=0
+  is_limit "$_v" || _v=0
+  printf '%s' "$_v"
+}
+chain_pid() { local _p=""; [ -f "$CHAIN_F" ] && { IFS= read -r _p < "$CHAIN_F" || true; }; printf '%s' "${_p%% *}"; }
+chain_head() { local _p=""; [ -f "$CHAIN_F" ] && { IFS= read -r _p < "$CHAIN_F" || true; }; _p="${_p#* }"; printf '%s' "${_p%% *}"; }
 chain_alive() { local p; p="$(chain_pid)"; [ -n "$p" ] && kill -0 "$p" 2>/dev/null; }
-chain_log() { local l; l="$(awk '{print $3}' "$CHAIN_F" 2>/dev/null)"; printf '%s' "${l:-$CHAIN_LOG}"; }
+chain_log() { local _p=""; [ -f "$CHAIN_F" ] && { IFS= read -r _p < "$CHAIN_F" || true; }; _p="${_p#* }"; _p="${_p#* }"; printf '%s' "${_p:-$CHAIN_LOG}"; }
 
 # resolve_trusted_checkout [lane-checkout] — the repo's MAIN worktree, the tree the chain must run from.
 #
@@ -382,7 +447,15 @@ resolve_trusted_checkout() {
   if ! git -C "$lane_real" rev-parse --git-dir >/dev/null 2>&1; then
     printf '%s' "$lane_real"; return 0
   fi
-  main="$(git -C "$lane_real" worktree list --porcelain 2>/dev/null | awk '/^worktree /{print substr($0,10); exit}')"
+  # ⛔ `awk` HERE DECIDED WHICH CHECKOUT IS "TRUSTED", AND `awk` IS PATH-RESOLVED (round-24 review, P2). A
+  # shimmed `awk` returning the lane's own worktree defeated the resolver this function exists to make
+  # fail-closed — measured: control handed the chain the hub, the awk shim handed it the lane. Parsed with
+  # a bash builtin loop instead (the same shape the gate uses for its own resolution). `git` remains the
+  # disclosed seam (agent-infra#3789); a field split is not a seam.
+  main=""
+  while IFS= read -r _stanza; do
+    case "$_stanza" in "worktree "*) main="${_stanza#worktree }"; break ;; esac
+  done <<< "$(git -C "$lane_real" worktree list --porcelain 2>/dev/null)"
   [ -n "$main" ] && [ -d "$main" ] || return 1
   main_real="$(cd "$main" 2>/dev/null && pwd -P)" || return 1
   [ -n "$main_real" ] || return 1
@@ -448,7 +521,7 @@ fi
   # merging — permanently foreclosing the lane. merge-one.sh's own claim reaper clears exactly this
   # condition, so do the same test it does: read the pid and probe it.
   if [ -f "$O/state/mergeclaim-$PR.lock" ]; then
-    local opid; opid="$(cat "$O/state/mergeclaim-$PR.lock" 2>/dev/null || echo 0)"
+    local opid; opid="$(_lm_readint "$O/state/mergeclaim-$PR.lock")"
     case "${opid:-0}" in ''|*[!0-9]*) opid=0 ;; esac
     if [ "$opid" -gt 0 ] && kill -0 "$opid" 2>/dev/null; then
       # A LIVE owner (the controller's chain, or an earlier round of ours): never spawn a competitor.
@@ -598,6 +671,12 @@ chain_verdict_from_log() { # chain_verdict_from_log <chain-log> [head]
     #     comment on an already-merged PR, and chain-merge re-ran merge-one.sh on it.
     # Both spellings are accepted on purpose: a `$O` deployed before the rename still writes the older
     # `NOT CLEAN or reviewer failed` line, and a lane reading its own box's log must not misclassify it.
+    # ⛔ THE MANDATORY LANE REPORT'S REFUSAL IS A FIX DUTY, NOT A BLOCK (#2977). merge-one.sh exits 9
+    # with no `needsfix` marker (it must not authorise a code-fixing agent for a report the LANE can fix
+    # in place, with no push), so without this arm a refused report classified UNKNOWN and reached the
+    # lane as BLOCKED_ATTESTATION (12) — "hand off, only a fresh reviewer can supply this" — about a
+    # report the lane itself can re-run. Same writer's-vocabulary rule as the patterns below.
+    if tail -n 300 "$mlog" 2>/dev/null | grep -qE '^\[merge [0-9]+\] LANE REPORT REFUSED'; then echo "FIX_REQUIRED"; return; fi
     if tail -n 300 "$mlog" 2>/dev/null | grep -qE 'NO VERDICT \(stall/crash/timeout|no needsfix marker|NOT CLEAN or reviewer failed'; then
       echo "REVIEW_NO_VERDICT"; return
     fi
@@ -688,7 +767,14 @@ post_handoff() { # post_handoff <verdict-token> <reason>
       printf -- '- Last failing check names observed: `%s`\n' "$(tr '\n' ',' < "$LAST_F" | sed 's/,$//')"
     fi
     _rs="$(round_of)"; [ "$_rs" -gt "$MAX_ROUNDS" ] && _rs="$MAX_ROUNDS"   # never render "4/3"
-    printf -- '- Rounds spent: %s/%s (the loop is capped by design — a lane in round 5 is a failure, not thoroughness).\n\n' "$_rs" "$MAX_ROUNDS"
+    # ⛔ THE BOX ARM MUST NOT RENDER A BUDGET IT DID NOT SPEND (round-21 review, P2). This line was
+    # unconditional, so a box-fault hand-off said `Rounds spent: 0/3` beside "the loop is capped by
+    # design" — implying this run spent the budget, which is exactly what the box arm exists to avoid.
+    if [ "${HANDOFF_NEXT:-}" = "box" ]; then
+      printf -- '- Rounds spent: %s/%s — this run spent NONE (a box/repo fault cannot be fixed by a push); rounds already spent by EARLIER runs: %s.\n\n' "$_rs" "$MAX_ROUNDS" "$_rs"
+    else
+      printf -- '- Rounds spent: %s/%s (the loop is capped by design — a lane in round 5 is a failure, not thoroughness).\n\n' "$_rs" "$MAX_ROUNDS"
+    fi
     # ⛔ THE BRANCH MUST BE RESOLVED, NOT A PLACEHOLDER (reviewer finding, P1, R11, measured): the brief's
     # own `--watch` call never passes `--branch`, so `${BR:-<branch>}` rendered the literal `<branch>` on
     # the documented supervision path — and merge-one feeds that argument into
@@ -729,6 +815,10 @@ post_handoff() { # post_handoff <verdict-token> <reason>
           absent)  if [ -n "$_rp" ]; then chain_cmd "$_rp" "$_br" "launch the chain — " "."
                    else merge_authority_unresolved_note; fi
                    [ "$_br" = "<branch>" ] && printf '(pass --branch: this checkout is not on a branch.)\n' ;;
+          box)     printf 'Next: NOTHING you can push. The blocker is the BOX (or its lane-report state),\n'
+                   printf 'not this PR, and THIS run spent no fix round — so re-run `%s/lane-merge.sh %s --repo %s`\n' "$O" "$PR" "$OR"
+                   printf 'once the box reason named above is repaired. Rounds already spent by earlier\n'
+                   printf 'runs are NOT refunded: the cap counts every round on this PR.\n' ;;
           # ⛔ NOT `--watch` (reviewer finding, P1, R11, measured: RC=13, same token, 0.455s, zero
           # supervision — the budget is what refused it, so chunk N+1 is charged before any work and
           # re-hands-off). A PLAIN run re-reads the PR and the checks, and its fix path re-arms the budget.
@@ -743,8 +833,15 @@ post_handoff() { # post_handoff <verdict-token> <reason>
     case "$tok" in
       BLOCKED_CLOSED)
         printf '\n_This PR is closed; re-running lane-merge.sh %s reports the same thing._\n' "$PR" ;;
+      # ⛔ THE BOX FOOTER CANNOT SAY "after a fix" (round-21 review, P2): it sat under the box arm and
+      # told the next holder to re-run "after a fix" on a fault whose whole point is that no fix exists,
+      # contradicting the arm's own "NOTHING you can push" two lines above.
       *)
-        printf '\n_Re-run with `%s/lane-merge.sh %s --repo %s` after a fix; a new head re-arms the PR._\n' "$O" "$PR" "$OR" ;;
+        if [ "${HANDOFF_NEXT:-}" = "box" ]; then
+          printf '\n_Re-run with `%s/lane-merge.sh %s --repo %s` once the BOX reason above is repaired — no push is involved._\n' "$O" "$PR" "$OR"
+        else
+          printf '\n_Re-run with `%s/lane-merge.sh %s --repo %s` after a fix; a new head re-arms the PR._\n' "$O" "$PR" "$OR"
+        fi ;;
     esac
   } > "$body"
   if gh api -X POST "repos/$OR/issues/$PR/comments" -F "body=@$body" >/dev/null 2>&1; then
@@ -794,13 +891,24 @@ emit_fix() { # emit_fix <TOKEN> <reason…>
 # record-review.sh writes; no API call. A record bound to a DIFFERENT head does NOT count: that is
 # the stranded-attestation condition, not coverage.
 review_record_at_head() {
-  local n slug f sha
+  local n slug f sha line
   n="$PR"; slug="$(printf '%s' "$OR" | tr '/' '-')"
   for f in "$HOME/.pi/agent/reviews/$slug-$n.json" "$HOME/.pi/agent/reviews/$n.json"; do
     [ -f "$f" ] || continue
-    sha="$(grep -o '"head_sha"[[:space:]]*:[[:space:]]*"[0-9a-fA-F]*"' "$f" 2>/dev/null \
-            | head -1 | grep -o '[0-9a-fA-F]\{7,\}')"
-    if [ -n "${sha:-}" ] && [ -n "${HEAD:-}" ]; then
+    # ⛔ BUILTIN PARSE OF THE ATTESTED HEAD (round-26 review, P3). This used `grep -o … | head -1 |
+    # grep -o`, three PATH-resolved programs deciding whether a signed review exists at $HEAD: a shim
+    # made a record bound to ANOTHER head read as present (measured: rc=1 → rc=0, "a signed review exists
+    # at this head" about a head it never named). The consequence is a mis-grade (exit 12
+    # BLOCKED_ATTESTATION → 13 BLOCKED, so the lane loses the exact remedy), not a merge — but it is a
+    # decision read, and the rest of this file now reads its state with builtins.
+    sha=""
+    while IFS= read -r line || [ -n "$line" ]; do
+      case "$line" in *'"head_sha"'*) sha="${line#*\"head_sha\"}"; break ;; esac
+    done < "$f"
+    sha="${sha#*:}"; sha="${sha#*\"}"; sha="${sha%%\"*}"
+    case "$sha" in ''|*[!0-9a-fA-F]*) sha="" ;; esac
+    [ "${#sha}" -ge 7 ] || sha=""
+    if [ -n "$sha" ] && [ -n "${HEAD:-}" ]; then
       case "$HEAD" in "$sha"*) return 0 ;; esac
     fi
   done
@@ -830,7 +938,9 @@ if [ "$WATCH" -eq 1 ]; then
   # a new head (the exact bug an earlier round fixed for the in-loop path only). A failed read in a
   # later chunk is the same story, so the seed covers both.
   HEAD="$(cat "$O/state/lanemerge-$PR.head" 2>/dev/null || true)"
-  w="$(cat "$WATCH_F" 2>/dev/null || echo 0)"; is_limit "$w" || w=0
+  # ⛔ SAME RULE AS round_of (round-24 review, P1): the supervision budget is a COUNTER read from a local
+  # file, so it is read with a builtin rather than a PATH-resolved `cat` a lane could shim into answering 0.
+  w=0; if [ -f "$WATCH_F" ]; then IFS= read -r w < "$WATCH_F" || true; fi; [ -n "$w" ] || w=0; is_limit "$w" || w=0
   w=$(( w + 1 )); printf '%s\n' "$w" > "$WATCH_F"
   deadline=$(( $(date +%s) + POLL_S ))
   # ⛔ ONE PR READ PER CHUNK, NOT PER TICK (A7). The header promises "reads the PR ONCE per
@@ -977,7 +1087,7 @@ if [ "$WATCH" -eq 1 ]; then
       # every pass meant a chain that never died left the lane cycling WAITING_HEAD_MOVED until its 3300s
       # wall clock ran out — a wait with no terminal state. One re-run is honest (the chain usually
       # finishes the old head); a SECOND is a stuck chain, and that is a hand-off with a name.
-      _hm=$(( $(cat "$O/state/lanemerge-$PR.headmoved" 2>/dev/null || echo 0) + 1 ))
+      _hm=$(( $(_lm_readint "$O/state/lanemerge-$PR.headmoved") + 1 ))
       printf '%s\n' "$_hm" > "$O/state/lanemerge-$PR.headmoved" 2>/dev/null || true
       log_line "… the PR head moved past the chain's head ($(chain_head) → ${HD}) — the chain is working"
       log_line "   a head that is no longer the tip (pass $_hm of 2)."
@@ -1038,10 +1148,10 @@ if [ "$WATCH" -eq 1 ]; then
           # refunds can never be the one that crosses the budget). So: at most MAX_WATCH refunds per
           # cycle; past that, the chunk is CHARGED and the honest hand-off becomes reachable.
           _ar="$O/state/lanemerge-$PR.apiretry"
-          _n_ar="$(cat "$_ar" 2>/dev/null || echo 0)"; is_limit "$_n_ar" || _n_ar=0
+          _n_ar="$(_lm_readint "$_ar")"
           if [ "$_n_ar" -lt "$MAX_WATCH" ]; then
             _n_ar=$(( _n_ar + 1 )); printf '%s\n' "$_n_ar" > "$_ar" 2>/dev/null || true
-            w="$(cat "$WATCH_F" 2>/dev/null || echo 0)"; is_limit "$w" || w=0
+            w="$(_lm_readint "$WATCH_F")"
             [ "$w" -gt 0 ] && printf '%s\n' "$(( w - 1 ))" > "$WATCH_F" 2>/dev/null
             log_line "… the API could not be read (retry $_n_ar/$MAX_WATCH this cycle) — no round and no chunk is spent"
           else
@@ -1245,6 +1355,125 @@ done
 
 # Green + mergeable → launch the harness chain (fresh reviewer where the repo needs one, the repo's
 # own rail where it does not) and hand control to --watch.
+#
+# ── THE MANDATORY LANE REPORT (#2977) — BEFORE the chain, because the chain is PAID ────────────
+# A report that is absent, invalid, red or written at another head is not evidence for the tree about
+# to be merged, and a lane whose own evidence says that may not land. 5 and 6 are ABSTENTIONS (this box
+# or this repo cannot carry the check) and are logged, never treated as green: collapsing them into a
+# pass is how a gate reports coverage it does not have.
+#
+# ⛔ AN EMPTY BRANCH IS NOT GATED HERE, DELIBERATELY (fresh review, P1 — the guard must not outrank a
+# better refusal). `launch_chain` already refuses a missing branch with the ACTIONABLE remedy
+# (`WAITING_NO_BRANCH`, exit 2, "pass --branch <name>"), and the gate cannot bind a report to a branch
+# it was not given. Running it first would turn that exit 2 into a `FIX_REQUIRED` telling the lane to
+# fix CODE over a caller error. The empty-branch arm still refuses in the gate itself, which is where
+# merge-one.sh / chain-merge.sh / fix-one.sh reach it.
+_lrg_rc=0; _lrg_out=""; _lrg_skip=0
+if [ -z "${RESOLVED_BR// /}" ]; then
+  : # launch_chain owns the refusal below; nothing to gate, and no chain will launch.
+elif [ -n "$LANE_REPORT_GATE" ]; then
+  # ⛔ THE VERIFIER MUST NOT COME FROM THE TREE BEING MERGED (fresh review, P2). The gate resolves
+  # `tools/worktree_report.py` from the repo it is handed, and `$(pwd)` here is the LANE's own
+  # worktree on the branch under review — so a lane could edit the grader that grades it. A trusted
+  # (main) checkout is resolved here, once, exactly as `launch_chain` resolves it, so the gate's
+  # instrument comes from the tree nobody is merging.
+  # ⛔ THAT IS TRUE FOR A LINKED WORKTREE AND FALSE FOR AN INDEPENDENT CLONE (round-19 review, P1).
+  # `resolve_trusted_checkout` returns the FIRST `git worktree list` stanza, which for a clone is the
+  # clone itself — i.e. the tree under review. So a lane running this script from its own clone still
+  # supplies the grader, and the residual is NOT closed here; it is disclosed here, in the gate's own
+  # provenance comment, and alongside its siblings in agent-infra#3789. Do not read this block as
+  # closing the self-supplied-instrument class.
+  # ⛔ AND WHEN THERE IS NO TRUSTED CHECKOUT, THE GATE DOES NOT RUN AT ALL (fresh review, P2). Falling
+  # back to the lane checkout made the gate source its verifier from the tree under review and return
+  # a self-graded PASS — the bypass this block exists to close, re-reachable on the fallback path. It
+  # is skipped instead, and `launch_chain` refuses immediately below (it resolves the same checkout and
+  # BLOCKs with the actionable remedy), so no merge can follow a skipped check.
+  _lrg_repo="${REPO_PATH:-$(pwd)}"
+  _lrg_trusted="$(resolve_trusted_checkout "$_lrg_repo" 2>/dev/null)" || _lrg_trusted=""
+  if [ -z "$_lrg_trusted" ]; then
+    _lrg_skip=1
+    log_line "lane-report: NOT CHECKED — no trusted (main) checkout to source the verifier from (the only reachable copy is the tree under review); launch_chain will refuse this merge."
+  else
+    _lrg_repo="$_lrg_trusted"
+    # ONE run, captured: the verdict line is the diagnosis, and running the gate twice to quote it would
+    # pay two git/python invocations per merge for a message.
+    _lrg_out="$(lane_report_gate "$_lrg_repo" "$RESOLVED_BR" "$HEAD" 2>&1)" || _lrg_rc=$?
+    [ -n "$_lrg_out" ] && log_line "$_lrg_out"
+  fi
+else
+  log_line "lane-report: NOT CHECKED — lane-report-gate.sh is not deployed (looked beside this script and in \$O=$O). The mandatory lane report (#2977) is NOT verified on this box; redeploy the harness."
+  _lrg_rc=5
+fi
+# ⛔ THE CASE RUNS ONLY WHEN THE GATE RAN: with no branch, `_lrg_rc` is 0 and this block would CLAIM a
+# verification that never happened. The branchless path falls straight through to `launch_chain`, which
+# refuses before anything merges.
+if [ -n "${RESOLVED_BR// /}" ] && [ "$_lrg_skip" = 0 ]; then
+  case "$_lrg_rc" in
+    0)  log_line "lane-report: verified at head ${HEAD:0:12} — the report describes the tree being merged" ;;
+    5|6) log_line "lane-report: NOT ENFORCED here (rc=$_lrg_rc) — an abstention, not a green: this box/repo cannot carry the check" ;;
+    # ⛔ 7 IS A BAG, NOT A FAULT CLASS (round-20 review, P1), AND THE SPLIT IS BY REASON TOKEN, NOT BY
+    # SUBSTRING OF THE LINE (round-21 review, P1). The gate renders LANE-CHOSEN values on the same line
+    # (`branch=$branch worktree=$wt … reason=…`), and a lane creates its own branch, so
+    # `git check-ref-format --branch 'fix/2977-reason=no-interpreter-at-or-above-python-3.12'` is legal.
+    # Matching the raw line therefore let a lane whose fault was `writer-state-absent` (lane-fixable)
+    # select the BOX arm — no round spent, `BLOCKED_ATTEMPTS`, "nothing you can push" — and the 3-round
+    # cap never fired for a fault the lane owned. Measured: same reason, only the branch differs →
+    # RC=14/round-none vs RC=10/round-1. So the reason VALUE is extracted and compared EXACTLY.
+    # ⛔ TWO DEFENCES, BECAUSE ORDERING ALONE IS NOT ONE (round-22 review, P1). `##*reason=` takes the
+    # LAST occurrence, so ANY lane-chosen value carrying the literal `reason=` can win — a worktree PATH
+    # is as lane-controlled as a branch name, and one emit rendered `state=$wt/…` after the token
+    # (measured: worktree `…/lane-wt-reason=no-interpreter-…` → the extracted token was the path tail →
+    # box arm, 14, round 0). (a) `reason=` is now the LAST lane-influenced field on every emit, pinned by
+    # a gate-suite row; (b) the count of `reason=` tokens is checked, and anything but exactly ONE is
+    # LANE-fixable — so a future emit that reintroduces the ordering defect, and any spoof, costs the
+    # lane a round instead of buying it the no-round arm. The budget is the thing an attacker would want
+    # to preserve, so refusing to preserve it is the fail-safe polarity.
+    # ⛔ THE LANE-CLEARABLE SET IS THE EXPLICIT LIST; every other 7 is the box/caller arm. That default
+    # is deliberate: a NEW reason that a lane could clear would at worst hand off with the token printed
+    # (recoverable, and the message says so), whereas defaulting the other way burns a lane's rounds on
+    # what no push can change — the round-19 defect. The evaluable set is `writer-state-*`,
+    # `worktree-registered-but-unreadable`, and the three report/worktree-placement arms, whose remedies
+    # are all one `git switch` or one `run` away (`lane_report_remedy 7`).
+    7)  # ⛔ THE WITNESS LINE IS CUT WITH A BUILTIN, NOT `tail` (round-23 review, P1). `lane-merge.sh` sets
+        # no PATH, and a lane runs this carrier itself — the gate's own threat premise — so a 7-line `tail`
+        # shim could author the line this decision reads: keep only lines containing `VERDICT=UNMEASURABLE`
+        # and replace them with a box reason, and the whole reason-token split (round 22), INCLUDING its
+        # `reason=` count, is computed over text the lane wrote. Measured on the fixture with only PATH
+        # differing: control 10/FIX_REQUIRED/round 1, shimmed 14/BLOCKED_ATTEMPTS/round 0. `${var##*$'\n'}`
+        # is a pure parameter expansion: no program, nothing to shim.
+        _lrg_line="${_lrg_out##*$'\n'}"
+        # ⛔ A LINE WITH MORE THAN ONE `reason=` IS AMBIGUOUS AND IS TREATED AS LANE-FIXABLE (round-22
+        # review, P1). Nothing in the gate promises the token is unique — every lane-chosen value is a
+        # candidate (`branch`, `worktree`, a path in `state=`), and a path or branch containing
+        # `reason=no-interpreter-…` makes `##*reason=` resolve to the PATH TAIL rather than the verdict.
+        # Fixing the ordering on all 32 emit sites is necessary but not sufficient, because a future emit
+        # can reintroduce it. So ambiguity is DETECTED: a spoof attempt then costs the lane a fix round
+        # instead of buying it the no-round arm, which is the fail-safe polarity (the round budget is the
+        # thing an attacker would want to preserve, and this refuses to preserve it).
+        _lrg_norsn="${_lrg_line//reason=/}"
+        _lrg_nrsn=$(( (${#_lrg_line} - ${#_lrg_norsn}) / 7 ))
+        _lrg_rsn="${_lrg_line##*reason=}"; _lrg_rsn="${_lrg_rsn%%[[:space:]]*}"
+        if [ "$_lrg_nrsn" != 1 ]; then
+          log_line "⛔ lane-report: UNMEASURABLE (rc=7) — the verdict line carries $_lrg_nrsn 'reason=' tokens, so its cause cannot be read unambiguously. A LANE-chosen field (branch, worktree or a path) is spoofing the token. Treated as LANE-fixable so the round budget is never handed to a spoof."
+          lane_report_remedy 7 2>/dev/null || true
+          emit_fix FIX_REQUIRED "the lane report verdict line is ambiguous ($_lrg_nrsn reason= tokens): $_lrg_line"
+        fi
+        case "$_lrg_rsn" in
+          writer-state-*|worktree-registered-but-unreadable|evidence-present-on-this-box-but-no-worktree-is-registered-on-this-branch|worktree-at-this-head-is-not-registered-on-this-branch-and-holds-no-report|this-box-holds-the-report-for-this-branch-in-a-worktree-that-is-not-at-the-merging-head)
+            log_line "⛔ lane-report: UNMEASURABLE (rc=7, reason=$_lrg_rsn) — a LANE-fixable condition, so a fix round is spent."
+            lane_report_remedy 7 2>/dev/null || true
+            emit_fix FIX_REQUIRED "the lane report could not be verified (rc=7, reason=$_lrg_rsn): $_lrg_line" ;;
+          *)
+            log_line "⛔ lane-report: UNMEASURABLE (rc=7, reason=$_lrg_rsn) — a BOX/REPO/CALLER fault. No fix round is spent: nothing a push does can clear it."
+            lane_report_remedy 7 2>/dev/null || true
+            HANDOFF_NEXT=box emit_blocked BLOCKED_ATTEMPTS "the lane report cannot be verified on this box (rc=7, reason=$_lrg_rsn): $_lrg_line" ;;
+        esac ;;
+    *)  log_line "⛔ lane-report: REFUSED (rc=$_lrg_rc) — the mandatory lane report does not support merging head ${HEAD:0:12}"
+        lane_report_remedy "$_lrg_rc" 2>/dev/null || true
+        emit_fix FIX_REQUIRED "the lane report does not support this merge (rc=$_lrg_rc): ${_lrg_out##*$'\n'}" ;;
+  esac
+fi
+
 launch_chain "$HEAD" || exit 2
 log_line "… the merge chain owns PR #$PR now. Next: lane-merge.sh $PR --watch (bounded chunk; repeat)"
 exit 11
