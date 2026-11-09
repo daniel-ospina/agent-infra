@@ -1,0 +1,16 @@
+name: fixture job-bound-inert-mixed — an INERT job bound with an UNBOUNDED step
+on:
+  pull_request:
+jobs:
+  inert-mixed:
+    runs-on: ubuntu-latest
+    # The job is accepted (a job bound is a valid backstop), but the JOB-level NOTE must still name the
+    # 400-min step bound as unreachable: the ceiling is 360, not the inert 500. Dropping the inert term
+    # from that NOTE's ceiling lost the clause silently (review finding, P3).
+    timeout-minutes: 500
+    steps:
+      - name: first
+        timeout-minutes: 400
+        run: echo hi
+      - name: second
+        run: echo hi

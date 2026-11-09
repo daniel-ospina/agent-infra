@@ -474,6 +474,25 @@ This is bounded hard, and a lane that reads it as a general licence has read it 
   plausible-sounding remedy is exactly how an agent talks a human into a destructive action on a
   healthy system.
 
+- **⛔ A WEDGE VERDICT IS NEVER, BY ITSELF, A REASON TO DISCARD A WORKTREE — read the artifact
+  first.** The harness's `Alive state:` / `task_status` report has been measured **false in both
+  directions** (#2105, eight cut children across two lanes in one session): it stated
+  `dirty=false dirtyPaths=0 headSha=<stale>` on worktrees holding modified files and **seven
+  uncommitted commits** — a lane that trusted it would have thrown finished work away — and it read
+  four consecutive **not-yet-started** children as `wedged` (alive state: `tickCount=1
+  firstTickLagMs=2045960 toolsInFlight=0`), so the work was killed and retried into the same spawn
+  latency, 4 and 6 times. `git status --porcelain`, `git log -1` and `git rev-list --count` run in
+  the child's OWN worktree are authoritative; a verdict from any instrument is not. The report now
+  reads the tree **at report time** and withholds its verdict when the head moved
+  (`verdictWithheld=stale-snapshot` / `VERDICT WITHHELD — snapshot is stale`), and a child that has
+  never begun a turn reads `not-started`, never `wedged` — **while it is emitting markers**. The
+  qualifier is not a loophole: a child emitting nothing at all is the silence class (that is the
+  watchdog's own `tier-1 zero-output` parity), so it still reads `wedged` at the silence bound and
+  must not be excused as "not started". **The rule survives the fix.**
+  "Not started" (nothing was ever in flight) and "stalled" (something was in flight and stopped)
+  have **opposite** correct responses — wait or reassign for the first, kill for the second — so
+  never treat them as the same event.
+
 ## ⛔ Reading lane liveness — an ABSENCE is not a verdict
 
 **A lane can be live and absent from every population the fleet can enumerate.** An orchestrator

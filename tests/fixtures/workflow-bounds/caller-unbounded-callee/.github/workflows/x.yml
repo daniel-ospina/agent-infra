@@ -1,0 +1,6 @@
+name: fixture caller into an unbounded callee
+on:
+  pull_request:
+jobs:
+  caller:
+    uses: ./.github/workflows/callee.yml

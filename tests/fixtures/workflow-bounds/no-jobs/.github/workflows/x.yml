@@ -1,0 +1,4 @@
+name: fixture no jobs
+on:
+  pull_request:
+jobs:

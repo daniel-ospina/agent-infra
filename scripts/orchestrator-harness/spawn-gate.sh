@@ -823,6 +823,18 @@ disk_worktree_need() { # -> the MB a worktree creation must find free
 # It is stated in README §7.2i, and the cost of choosing the worst case is named there too: a box at
 # ~5 GB free refuses a harness lane the live gate would have admitted, until an operator states a
 # smaller worst case with DISK_LANE_SELF_MB.
+# ── THE MEASUREMENT IS PUBLISHED, NOT JUST THE VERDICT (agent-infra#2159) ────────────────────────
+# `disk_admit` sets the seven `DISK_ADMIT_*` fields below on EVERY arm, and `--disk-report` prints
+# them as one machine-readable line. WHY THEY LIVE HERE and are not re-derived by the reporter: a
+# report that took its own `df` and its own terms would be a SECOND measurement that can disagree
+# with the verdict printed beside it — #2721's own defect ("a gate that measures twice is a gate
+# whose report can disagree with its verdict"). Because they are assigned in the deciding function,
+# the `[cap]` line and the refusal are the same numbers by construction.
+# ⛔ `DISK_ADMIT_VERDICT` WAS ONCE DOCUMENTED AND REMOVED FOR HAVING NO READER (review round 3).
+# These fields are NOT that: `disk_report_cli` is their reader, and orch-loop.sh's `[cap]` line is
+# the surface it feeds (agent-infra#2159 — a box at 179 MB advertised `lanes=0/20`). An EMPTY field
+# means "this arm did not measure it", never zero: an unreadable `df` publishes an empty
+# `DISK_ADMIT_FREE_MB` and the reporter renders `?` for it.
 disk_admit() { # <target> [<label>]
   # ⛔ THE READING IS NOT CALLED `free` (review round 5, P1 — MEASURED). `check-portability-traps.sh`
   # reads a bare word in `local` as a CALL, so `local … free …` was counted as a use of the `free`
@@ -831,13 +843,24 @@ disk_admit() { # <target> [<label>]
   # the command in a file that probes memory elsewhere; `avail` says what it is.
   local target="${1:-.}" label="${2:-disk-admit}" avail need box terms tree self reserve
   DISK_ADMIT_LINE=""
+  DISK_ADMIT_STATE=""
+  DISK_ADMIT_FREE_MB="" DISK_ADMIT_NEED_MB="" DISK_ADMIT_TREE_MB=""
+  DISK_ADMIT_SELF_MB="" DISK_ADMIT_RESERVE_MB="" DISK_ADMIT_BOX=""
   need="$(disk_worktree_need)"
   terms="$(disk_worktree_terms)"
   tree="${terms%% *}"; terms="${terms#* }"
   self="${terms%% *}"; reserve="${terms#* }"
   box="$(disk_box_id)"
+  DISK_ADMIT_NEED_MB="$need"; DISK_ADMIT_TREE_MB="$tree"
+  DISK_ADMIT_SELF_MB="$self"; DISK_ADMIT_RESERVE_MB="$reserve"
+  DISK_ADMIT_BOX="$box"
   avail="$(disk_free_mb_target "$target")"
+  # ⛔ `if`, NOT `disk_readable … && DISK_ADMIT_FREE_MB=…`: the `&&` form leaves a NON-ZERO status as
+  # the list's result, and a caller that sources this file under `set -e` would abort the sweep on an
+  # unreadable probe — turning a fail-OPEN reading into a stopped box.
+  if disk_readable "$avail"; then DISK_ADMIT_FREE_MB="$avail"; fi
   if ! disk_readable "$avail"; then
+    DISK_ADMIT_STATE="REFUSED-UNKNOWN"
     DISK_ADMIT_LINE="[disk-admit] REFUSED-UNKNOWN $label: free=? need=$(disk_mb_gb "$need") box=$box target=$target — the free-space probe could not answer (no readable \`df\` for that path or its nearest EXISTING ancestor), so the lane's headroom CANNOT be verified. Nothing was created, no worktree, no branch; a PRE-START admission fails CLOSED (an unmeasurable box is not an empty one). Check PATH/'df' on this box, or pass the volume explicitly (agent-infra#3395/#3231)"
     printf '%s\n' "$DISK_ADMIT_LINE"
     return "$AGENT_DISK_REFUSED"
@@ -849,12 +872,49 @@ disk_admit() { # <target> [<label>]
   # created — where every other predicate in this file refuses an uncomparable reading. Written as
   # `need <= avail`, an errored comparison is FALSE, i.e. a refusal.
   if ! [ "$need" -le "$avail" ]; then
+    DISK_ADMIT_STATE="REFUSED-DISK"
     DISK_ADMIT_LINE="[disk-admit] REFUSED-DISK(free=$(disk_mb_gb "$avail"), need=$(disk_mb_gb "$need"), box=$box; free_mb=$avail, need_mb=$need) $label: $avail MB free on $target < ${need}MB required (need ${need}MB = max(tree ${tree}MB, self ${self}MB) + reserve ${reserve}MB) — nothing was CREATED by this attempt: no worktree, no branch, no agent, nothing consumed. Reclaim with 'cloud-cell-supervisor.sh prune' (--caches, and --scratch for /tmp) or let a lane finish; this does NOT clear by waiting. A box whose lanes are MEASURED cheaper may lower DISK_LANE_SELF_MB deliberately (agent-infra#3395)"
     printf '%s\n' "$DISK_ADMIT_LINE"
     return "$AGENT_DISK_REFUSED"
   fi
+  DISK_ADMIT_STATE="ADMITTED"
   [ "${DISK_ADMIT_VERBOSE:-0}" = 1 ] && printf '[disk-admit] ADMITTED %s: free=%sMB need=%sMB box=%s target=%s\n' \
     "$label" "$avail" "$need" "$box" "$target"
+  return 0
+}
+
+# disk_report <target> [<label>] — ONE machine-readable line, from the SAME measurement `disk_admit`
+# just took (see the field block above `disk_admit`). WHY IT EXISTS (agent-infra#2159): the fleet's
+# operator-facing capacity line (`orch-loop.sh`'s `[cap]`) printed `load`, `lanes`, `max_lanes`,
+# `mem_avail` and `swap_free` — and NO disk figure and NO per-lane cost — so a box at 179 MB free
+# advertised `lanes=0/20` and an orchestrator filled it into the wall. The datum existed; nothing
+# printed it. ⛔ THE [cap] LINE MUST NOT MEASURE DISK ITSELF: `orch-loop.sh`'s own gate vector records
+# the decision ("DISK is not repeated here because the spawn point (spawn-gate.sh) is its ONE
+# implementation"), so the controller ASKS, and this verb is how it asks.
+#
+# FORMAT — POSITIONAL AND STABLE, because it is PARSED (`orch-loop.sh` reads field 2, 3 and 4):
+#   [disk-report] <STATE> <free|?> <need> tree=<mb> self=<mb> reserve=<mb> box=<id> target=<path>
+# STATE is `ADMITTED`, `REFUSED-DISK` or `REFUSED-UNKNOWN` — the SAME names `disk_admit`'s verdict
+# line carries, so a reader never has to know which arm answered. `free` is `?` when the probe could
+# not answer (never a fabricated number), `need` is `max(tree, self) + reserve`.
+# rc: 0 whenever the report was PRODUCED — including a REFUSED verdict, because a report is not a
+# gate and a caller that treated rc 0 as "go" would be reading this verb as admission. 77 is
+# deliberately NOT reused here: the verdict is field 2 and only the admission arm may refuse.
+disk_report() { # <target> [<label>]
+  local target="${1:-.}" label="${2:-disk-report}"
+  # The verdict is produced by the DECIDING function, never re-derived (see the field block above).
+  # `>/dev/null` drops the human line: the report IS the line below, and printing both would hand a
+  # parser two rows for one measurement.
+  disk_admit "$target" "$label" >/dev/null
+  printf '[disk-report] %s %s %s tree=%s self=%s reserve=%s box=%s target=%s\n' \
+    "${DISK_ADMIT_STATE:-REFUSED-UNKNOWN}" \
+    "${DISK_ADMIT_FREE_MB:-?}" \
+    "${DISK_ADMIT_NEED_MB:-?}" \
+    "${DISK_ADMIT_TREE_MB:-?}" \
+    "${DISK_ADMIT_SELF_MB:-?}" \
+    "${DISK_ADMIT_RESERVE_MB:-?}" \
+    "${DISK_ADMIT_BOX:-?}" \
+    "$target"
   return 0
 }
 
@@ -886,6 +946,28 @@ disk_admit_cli() {
   done
   [ -n "$target" ] || { printf 'disk-admit: a target path is required (the volume the worktree will be written to)\n' >&2; return 64; }
   disk_admit "$target" "$label"
+}
+
+# disk_report_cli [--target P] [--label S] [P] — the REPORT verb, for a caller that prints capacity
+# rather than deciding it (`orch-loop.sh`'s `[cap]` line). Same argument shape as `--disk-admit`, so an
+# operator needs one spelling for both questions; unlike that verb it NEVER refuses and never prints
+# the human verdict line — it prints the one parseable row and exits 0 (see `disk_report`).
+disk_report_cli() {
+  local target="" label="disk-report"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --target) [ $# -ge 2 ] || { printf 'disk-report: --target needs a path\n' >&2; return 64; }; target="$2"; shift 2 ;;
+      --label)  [ $# -ge 2 ] || { printf 'disk-report: --label needs a value\n' >&2; return 64; }; label="$2"; shift 2 ;;
+      -h|--help)
+        printf 'usage: spawn-gate.sh --disk-report <target-path> [--label <text>]\n'
+        printf '  prints ONE line: [disk-report] <STATE> <free|?> <need> tree= self= reserve= box= target=  · exit 0 (a report is not a gate) · 64 = usage\n'
+        return 0 ;;
+      -*) printf 'disk-report: unknown option %s\n' "$1" >&2; return 64 ;;
+      *)  if [ -z "$target" ]; then target="$1"; else label="$1"; fi; shift ;;
+    esac
+  done
+  [ -n "$target" ] || { printf 'disk-report: a target path is required (the volume a lane would be written to)\n' >&2; return 64; }
+  disk_report "$target" "$label"
 }
 
 # 1-min load average, integer. Empty when the probe fails (see can_spawn).
@@ -5223,6 +5305,15 @@ pi_shim_main() {
   if [ "${1:-}" = "--disk-admit" ]; then
     shift
     disk_admit_cli "$@"
+    exit $?
+  fi
+  # ── THE REPORT VERB, SAME REASONS, AND IT SPAWNS NOTHING EITHER ────────────────────────────────
+  # `orch-loop.sh`'s `[cap]` line asks this question once per cycle (agent-infra#2159). It is the same
+  # measurement as `--disk-admit`, from the same function — not a second `df` inside the controller,
+  # which would be a second reading its verdict could disagree with.
+  if [ "${1:-}" = "--disk-report" ]; then
+    shift
+    disk_report_cli "$@"
     exit $?
   fi
   real="$(pi_gate_real "$self")" || {

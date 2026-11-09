@@ -1,0 +1,19 @@
+name: fixture a job bound ABOVE the platform ceiling, over a step budget above it too
+on:
+  pull_request:
+jobs:
+  inert-bound:
+    # J = 500 is inert (the runner's own 360-minute ceiling cancels first), so the ceiling that actually
+    # covers this job is 360 — NOT 500. Σ = 400 is therefore above the real ceiling and the step bounds can
+    # never fire. Dropping the `verdict.inert` term from the ceiling expression (treating the ceiling as J)
+    # certifies this job green with only the "inert" note, which is why this fixture exists: the `min(J,360)`
+    # term the header states was pinned by nothing (review finding, P3).
+    runs-on: ubuntu-latest
+    timeout-minutes: 500
+    steps:
+      - name: first half
+        timeout-minutes: 200
+        run: echo hi
+      - name: a tail bound the real ceiling pre-empts
+        timeout-minutes: 200
+        run: echo hi

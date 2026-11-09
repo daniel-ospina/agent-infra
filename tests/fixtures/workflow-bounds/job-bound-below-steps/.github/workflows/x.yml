@@ -1,0 +1,13 @@
+name: fixture a job bound at or below the sum of its own step bounds
+on:
+  pull_request:
+jobs:
+  bound-too-low:
+    # The job cancels at 20 min, so the 40-minute step bound can never fire — and the job-level trip is
+    # `cancelled`, which the merge rail reads NON-RED, so the non-red conclusion pre-empts the red step.
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: one long step
+        timeout-minutes: 40
+        run: echo hi

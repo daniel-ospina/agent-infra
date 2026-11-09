@@ -1,0 +1,20 @@
+name: fixture a job bound under a step budget whose numeric part alone breaches it
+on:
+  workflow_call:
+    inputs:
+      step_timeout:
+        type: number
+jobs:
+  bound-under-expr:
+    # Same shape as `job-bound-below-steps`, but ONE step bound is a `${{ … }}` expression. The rule
+    # must NOT switch itself off just because Σ is not fully computable: the numeric bounds alone
+    # (400) already sit above the 20-min job bound, so the refusal is provable without the expression.
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: one long step
+        timeout-minutes: 400
+        run: echo hi
+      - name: an unevaluable bound
+        timeout-minutes: ${{ inputs.step_timeout }}
+        run: echo hi

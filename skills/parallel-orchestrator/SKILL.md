@@ -138,9 +138,11 @@ The `subagent` tool blocks until completion. The **`task`** tool now has a first
 ```
 task({ prompt, background: true })
   → { run_id, pid, pgid, log_path }      # returns IMMEDIATELY, never awaits
-task_status({ run_id })                  # alive | wedged | gone | done
+task_status({ run_id })                  # alive | wedged | not-started | gone | done
 task_collect({ run_id })                 # the final message + exit status, once done
 ```
+
+- **`not-started` is NOT `wedged`, and the response is the opposite one.** The child is up and emitting markers but has never begun a turn/tool/message (`docs/ops/fleet-liveness.md` §0a). `wedged`'s response is re-dispatch; `not-started`'s is **wait, or reassign the work** — killing it loses the dispatch and burns the fleet further. (`AGENTS.md` carries the same rule, with the qualifier that a child emitting *nothing at all* is the silence class and does read `wedged`.)
 
 - **Liveness comes from the child's `[task-heartbeat]` markers, never from `%CPU`.** `%CPU == 0` means *waiting*, not finished — a lane blocked in a long tool call is exactly 0 % CPU (`docs/ops/fleet-liveness.md`). `task_status` reads the same markers the watchdog uses (pid probe + fresh markers), and returns non-blockingly.
 - **`task_collect` never blocks.** While the lane runs it returns a not-finished notice; poll `task_status` instead. Reaping loop: poll `task_status` between other work → call `task_collect` once it reports a terminal status (`done` | `failed` | `cut`) **or `gone`**. `gone` means the process exited but its terminal record is not yet persisted — the child can exit seconds before the parent's settle write lands, so `task_collect` keeps returning not-finished until the settle grace (5 min) expires, then salvages it fail-closed to `failed`. Re-poll rather than treating a `gone` lane as finished. A lane left `wedged` with a stale log is likewise terminated by `task_collect` (same fail-closed salvage) instead of being polled forever.

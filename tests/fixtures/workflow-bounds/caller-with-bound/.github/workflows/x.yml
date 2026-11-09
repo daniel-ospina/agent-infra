@@ -1,0 +1,7 @@
+name: fixture caller with a bound
+on:
+  pull_request:
+jobs:
+  caller:
+    uses: ./.github/workflows/callee.yml
+    timeout-minutes: 30
