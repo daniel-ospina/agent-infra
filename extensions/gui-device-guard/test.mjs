@@ -374,6 +374,74 @@ const ROWS = [
     "bash -c 'ls' <<EOF\nnpm exec electron .\nEOF", 0, null, false],
   ["A47 a `cat` heredoc body naming the launch stays data (the A31 twin, re-pinned)",
     "cat > /tmp/n.md <<'EOF'\nelectron .\nEOF", 0, null, false],
+  // ── L29 (round 12, P1) — the redirect binds to the SEGMENT IT SITS IN, not to the
+  //     line's last one. `lineFeedsShell` asked about `segs[segs.length - 1]`, so a
+  //     heredoc/here-string fed to a shell on the LEFT of a pipe was tested against
+  //     `tee log`, answered "not a shell", and blanked as data:
+  //
+  //         bash <<'EOF' | tee /tmp/log        (runs the body — measured)
+  //         npm exec electron .
+  //         EOF
+  //
+  //     → `[]`, i.e. no refusal AND no ledger row: the double loss rounds 3/4/5/11
+  //     treat as blocking, on the pipeline spelling of the shape round 11 closed for
+  //     a bare `bash <<'EOF'`. The scan follows `pipeToNext` FORWARD, so L28f
+  //     (`cat <<EOF | bash`) keeps working — the body a pipe delivers to a shell IS
+  //     that shell's program — while A48/A49 pin the two directions that must NOT
+  //     over-fire: a benign body stays data, and a `;` (or `&`, or `||`) ends the
+  //     pipeline, so nothing downstream receives it.
+  ["L29a a heredoc fed to a shell on the LEFT of a pipe (was [])",
+    "bash <<'EOF' | tee /tmp/log\nnpm exec electron .\nEOF", 1, "electron", true],
+  ["L29b …the same as a here-string on the left of a pipe",
+    'bash <<< "npm exec electron ." | tee log', 1, "electron", true],
+  ["L29c …with the redirect in the MIDDLE of a pipeline",
+    "true | bash <<'EOF' | tee log\nnpm exec electron .\nEOF", 1, "electron", true],
+  ["L29d …and through a three-stage pipeline (`|&` is a pipe too)",
+    "bash <<'EOF' |& tee log | cat\nnpm exec electron .\nEOF", 1, "electron", true],
+  // ⛔ `2>&1` IS A REDIRECT, NOT A SEPARATOR (review round 2, P2 — measured). Treating
+  // every `&` as a command separator cut the pipeline at `2>&`, so the forward scan
+  // stopped before `bash` and these were `[]` — a regression the round-11 code did not
+  // have, on a shape real bash executes (`cat <<EOF 2>&1 | bash` → `BODY_RAN`). The fd
+  // number before the `>` decides: `2>&1` DUPLICATES stderr onto stdout, so stdout is
+  // still piped and the body still reaches bash. A53 pins the other side — `>&2` sends
+  // stdout AWAY from the pipe, so nothing reaches the shell and the body is data.
+  ["L29e `2>&1` between the heredoc and the pipe does NOT end the pipeline (was [])",
+    "cat <<EOF 2>&1 | bash\nnpm exec electron .\nEOF", 1, "electron", true],
+  ["L29f …the same in the MIDDLE of a pipeline (was [])",
+    "cat <<EOF | tee 2>&1 | bash\nnpm exec electron .\nEOF", 1, "electron", true],
+  ["A48 the ALLOW twin of L29a: a NON-shell head's body stays data even when it names the launch",
+    "cat <<'EOF' | tee /tmp/log\nnpm exec electron .\nEOF", 0, null, false],
+  ["A53 `>&2` sends stdout AWAY from the pipe, so the body does not reach the shell",
+    "cat <<EOF >&2 | bash\nnpm exec electron .\nEOF", 0, null, false],
+  ["A49 a `;` after the heredoc ends the pipeline, so the body is NOT the shell's",
+    "cat <<EOF; bash\nelectron .\nEOF", 0, null, false],
+  // ── L30 (round 12, P2) — `open <bundle>/Contents/MacOS/<bin>` produced NO finding:
+  //     the positional arm accepted only a `.app` SUFFIX, while the identical token as
+  //     a command word is refused by the electron rule. README:33-35 lists the
+  //     `…/Contents/MacOS/<bin>` shape as a recorded kind, so the `open` spelling
+  //     contradicted the file's own list — and no row means R1 missed it too.
+  ["L30a open a bundle's INNER binary (was []; the command-word spelling blocks)",
+    "open /Applications/DMeer.app/Contents/MacOS/DMeer", 1, "open", true],
+  ["L30b …and the relative `Contents/MacOS/<bin>` spelling (was [])",
+    "open Contents/MacOS/DMeer", 1, "open", true],
+  ["A50 the ALLOW twin of L30: `open` on an ordinary document is not a launch",
+    "open notes.txt", 0, null, false],
+  // ── L31 (round 12, P2) — `electron-forge` is the first-party Electron launcher and
+  //     it was unclassified: every head test keyed on the package name `electron`
+  //     exactly, so `npx electron-forge start` was `[]` — no refusal, no ledger row —
+  //     against README:27's "an Electron launch" contract. It is distinguishable from
+  //     a plain `node` run by its leftmost word, so it is not in the declared residual
+  //     class. A51/A52 keep the fix from over-firing on the routine build verbs.
+  ["L31a npx electron-forge start (was [])", "npx electron-forge start", 1, "electron", true],
+  ["L31b …bare, as a package.json `start` script spells it (was [])",
+    "electron-forge start", 1, "electron", true],
+  ["L31c …behind `npm exec … --` (was [])", "npm exec electron-forge -- start", 1, "electron", true],
+  ["L31d …and through its scoped package name `@electron-forge/cli`",
+    "@electron-forge/cli start", 1, "electron", true],
+  ["L31e …and version-pinned", "npx electron-forge@7.4.0 start", 1, "electron", true],
+  ["A51 the ALLOW twin of L31a: `electron-forge package` BUILDS, it does not launch",
+    "npx electron-forge package", 0, null, false],
+  ["A52 …and `lint` inspects rather than launches", "npx electron-forge lint", 0, null, false],
   // ── A34–A41 — ALLOW twins for L24/L25 AND for round 7's P2-5 over-fire. The
   //     fail-safe word scan is now gated on the prefix having SKIPPED A FLAG: with
   //     no flag between the prefix and the command word, nothing could have
@@ -414,6 +482,14 @@ const APP_ROWS = [
   ["P2-4 `open -bna com.x` hands the NEXT word to `-a` (was `na`)", "open -bna com.x", "com.x"],
   ["P2-4 `open -na <name>` (was `[]`, so nothing was recorded)", 'open -na "Google Chrome"', "Google Chrome"],
   ["L21h twin: an ATTACHED `-a<app>`", "open -aDMeer", "DMeer"],
+  // ⛔ THE `open <bundle>/Contents/MacOS/<bin>` SPELLING NAMES THE BUNDLE, not the inner
+  // binary (round 12, P2): the owner quits `DMeer.app`, and the ledger's `app` is what
+  // R1's "which app?" answer is read from. A count/rule/media row cannot see a mangled
+  // identity, so it is pinned here the same way the round-7 rows are.
+  ["L30a twin: an `open` of a bundle's inner binary names the BUNDLE",
+    "open /Applications/DMeer.app/Contents/MacOS/DMeer", "/Applications/DMeer.app"],
+  ["L30b twin: the relative inner-binary path names itself",
+    "open Contents/MacOS/DMeer", "Contents/MacOS/DMeer"],
 ];
 for (const [name, cmd, expected] of APP_ROWS) {
   const found = classify(cmd);

@@ -24,15 +24,16 @@ owner's machine unable to take a call.
 | rule | when | effect |
 |---|---|---|
 | **R1 RECORD** | an **unattended** run launches a host GUI app | one row appended to `~/.pi/agent/state/host-app-launches.jsonl` |
-| **R2 BLOCK THE MEDIA SHAPES** | an Electron launch, a **headed** Playwright run, or `open <path>.app`, without `--use-fake-device-for-media-stream --use-fake-ui-for-media-stream` | the `bash` call is refused, and the refusal names both flags |
+| **R2 BLOCK THE MEDIA SHAPES** | an Electron launch (including `electron-forge start`), a **headed** Playwright run, or `open <path>.app` / `open …/Contents/MacOS/<bin>`, without `--use-fake-device-for-media-stream --use-fake-ui-for-media-stream` | the `bash` call is refused, and the refusal names both flags |
 
 R1 is the cheap half and the one that would have cut the incident to a single
 lookup. R2 is the load-bearing half: it stops the seizure instead of documenting
 it.
 
 **Kinds recorded:** Electron (`electron`, `npx/npm exec electron`, a
-`node_modules/.bin/electron`, the `…/Contents/MacOS/<bin>` shape), macOS
-`open -a` / `open -b` / `open <path>.app`, and headed Playwright/Puppeteer.
+`node_modules/.bin/electron`, `electron-forge start`, the `…/Contents/MacOS/<bin>`
+shape), macOS `open -a` / `open -b` / `open <path>.app` / `open …/Contents/MacOS/<bin>`,
+and headed Playwright/Puppeteer.
 
 **A PATH is a media shape; a NAME is not.** `open ./Build/DMeer.app` — the
 incident's own app, launched the way a lane launches the bundle it just built — is
@@ -182,6 +183,33 @@ copy, in opposite directions (`round 7, P1-1 and P2-4`):
   `open -bna com.x` recorded `app: "na"`. L23d/L23e pin the cluster and its
   identity.
 
+**A redirect binds to the SEGMENT IT SITS IN, not to the line's last one.**
+`lineFeedsShell` asked about the last segment, so `bash <<'EOF' | tee /tmp/log`
+was measured against `tee log` — not a shell — and the body was blanked as data:
+**no refusal and no ledger row**, the same double loss rounds 3/4/5/11 treat as
+blocking, on the pipeline spelling of the shape round 11 closed for a bare
+`bash <<'EOF'`. The redirect's own offset now selects the segment, and the scan
+follows pipes FORWARD, because a body a pipe delivers to a shell *is* that shell's
+program (`cat <<EOF | bash` must keep firing). A `;`, `&`, newline or `||` ends the
+pipeline — EXCEPT an fd duplicate (`2>&1`, `3>&1`), which leaves stdout in the pipe
+(`cat <<EOF 2>&1 | bash` runs the body, measured), all of which keeps the body
+data when nothing downstream receives it (`round 12`, rows L29a–L29f, A48/A49/A53).
+
+**`electron-forge` is an Electron launch; only its `start` verb is.** Every head
+test keyed on the package name `electron` exactly, so `npx electron-forge start` —
+the first-party launcher, and what an Electron repo's own `start` script calls —
+was `[]`: no refusal, no ledger row. It is distinguishable from a plain `node` run
+by its leftmost word, so it was never in the declared residual class (only a
+package.json script genuinely is). `start` launches; `package`/`make`/`publish`/
+`lint`/`import` do not, so they stay allowed (`round 12`, rows L31a–L31e, A51/A52).
+
+**A bundle's INNER BINARY is a bundle, in both spellings.** `open`'s positional arm
+accepted only a `.app` suffix, so `open /Applications/X.app/Contents/MacOS/X` — the
+same token the electron rule refuses as a command word — produced NO finding, while
+the kind list above already names the `…/Contents/MacOS/<bin>` shape. The ledger
+names the BUNDLE, which is what the owner quits (`round 12`, rows L30a/L30b and
+their identity twins).
+
 **A `<<` inside a comment is DATA.** The heredoc scanner reads raw lines with the
 quote model, and `#` is not a quote character — so a comment merely *mentioning*
 the idiom (`# usage: write a file with cat <<EOF`) used to open a heredoc, find no
@@ -233,7 +261,8 @@ This is a residual list, not a completeness claim:
   fed to a **non-shell** interpreter (`python <<EOF`) and a shell started by a
   **flag** (`sudo -s <<EOF`, `su` with no `-c`). A body fed to a stdin-program
   shell (`bash`/`sh`/`zsh`/… with no `-c`) **is** read, and a body behind `-c` is
-  that script's data — L28a–L28h pin both directions.
+  that script's data — L28a–L28h pin both directions, and L29a–L29d pin the
+  pipeline spelling (a shell on the LEFT of a pipe is still fed by the heredoc).
 - A wrapper word that is **not** in the list above, in front of a launch word
   that is **not** brought in by a package-runner (`systemd-inhibit -w electron .`)
   behaves like a plain command: its own arguments are not scanned. That is the one
@@ -263,7 +292,7 @@ This is a residual list, not a completeness claim:
 ## Tests
 
 ```bash
-node extensions/gui-device-guard/test.mjs                    # 208 assertions, threat table L1–L28 + handler H1–H15
+node extensions/gui-device-guard/test.mjs                    # 229 assertions, threat table L1–L31 + handler H1–H15
 node extensions/gui-device-guard/test.mjs --classify 'npm exec electron .'
 ```
 
@@ -274,11 +303,13 @@ stays green while `index.ts` is broken and the guard is inert in every session.
 Mutations are pinned, each attributable to the row it is about, all measured at
 ONE head (**this** head — re-measured, not carried over: the counts are the output
 of running the mutant against `test.mjs`, and the assertion total is
-`208 = 150 ROWS + 5 APP_ROWS + 53 explicit \`check()\` calls`): the Electron
-rule's `media` → `false` reds **86**; the wrapper recursion
+`229 = 169 ROWS + 7 APP_ROWS + 53 explicit \`check()\` calls`): the Electron
+rule's `media` → `false` reds **97**; the wrapper recursion
 removed reds **8**; the wrapper WORDS removed reds **2**; the structural rule that
 reads a package-runner anywhere in the segment removed reds **2** (L19h/L19i); the
-comment stripper removed reds **1** (L11d); the fail-safe word scan removed reds
+comment stripper removed reds **2** (L11d and L11f — re-measured at this head; the
+earlier claim of `1` in this ledger was wrong at every head it was quoted for);
+the fail-safe word scan removed reds
 **5**; the quote-aware paren scan removed reds **1** (L17); honouring the fake
 switches on an `open` line reds **3** (L18b + H3b/H3c); forcing `faked: false`
 for the whole `open` rule again reds **3** (L18c, H3d, H3d1 — the `--args` spelling
@@ -302,11 +333,21 @@ by the defect, so it is the record-half twin: it reds if the fix over-cuts and
 reports nothing); deleting the escape guard that the wider set needs reds **1**
 (L27c — without it `x\)#` is cut as a comment and the launch after the `;` is lost);
 removing the shell-STDIN recursion (a heredoc/here-string fed to a shell, the
-round-11 blocking defect) reds **6** (L28a–L28f — the body is deleted as data, so
-there is no block AND no ledger row); treating an unquoted `<<<word` as a heredoc
+round-11 blocking defect) reds **12** (L28a–L28f and L29a–L29f — the body is
+deleted as data, so there is no block AND no ledger row); treating an unquoted
+`<<<word` as a heredoc
 opener reds **1** (L28h — the phantom heredoc deletes the rest of the input);
 reading the body behind `bash -c` as a program reds **1** (A46, the ALLOW twin that
-keeps the fix from over-firing on the fleet's own idiom).
+keeps the fix from over-firing on the fleet's own idiom); reverting
+`lineFeedsShell` to the line's LAST segment (the round-12 blocking defect — a
+heredoc fed to a shell on the left of a pipe) reds **6** (L29a–L29d and A49 plus
+A53, which pin the other direction: `cat <<EOF; bash` and `cat <<EOF >&2 | bash`
+must stay data); dropping the fd-duplication exception (`2>&1` read as a command
+separator) reds **2** (L29e, L29f — measured, and a regression the round-11 code
+did not have); accepting only a
+`.app` SUFFIX in `open`'s positional arm reds **4** (L30a/L30b and their two
+identity twins); dropping `electron-forge` from the electron head test reds **5**
+(L31a–L31e).
 
 ⛔ **The `<<<`-is-not-a-heredoc guard has no attributable red of its OWN, and is not
 claimed as covered on its own.** Dropping it leaves L28g GREEN, because the body

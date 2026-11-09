@@ -10,8 +10,13 @@
 #   1. macOS has NO supported CLI verb for "who holds the camera". `log show
 #      --predicate 'subsystem == "com.apple.coremedia"'` over 3- and 10-minute
 #      windows returned NOTHING at default and at `--info --debug` levels; the TCC
-#      database needs Full Disk Access; `ffmpeg`/`imagesnap` are not installed, so
+#      database needs Full Disk Access; ffmpeg / imagesnap are not installed, so
 #      there is no way to attempt an exclusive open and read the contention error.
+#      (Those two names are spelled WITHOUT backticks on purpose. With a code span
+#      on each, this script was REFUSED outright by the working-tree-discard guard
+#      (agent-infra#2189, #3243) in a fresh worktree — and it is the one command
+#      docs/ops/media-devices.md tells you to reach for, in exactly that context.
+#      The guard's own issue owns the mechanism; do not "tidy" these back on.)
 #   2. Device ownership is not a fleet signal. `tools/fleet/liveness.py`,
 #      `fleet_state.py` and the claim registry describe LANES. A lane can be
 #      perfectly healthy, reporting progress, while its child owns the camera.

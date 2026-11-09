@@ -78,8 +78,9 @@ never from a launcher-set variable). An interactive session is never guarded.
   it, the incident above is one lookup instead of six rounds of `ps`. (The bound is
   the classifier, not the shell: `npm run dev` / `npm start` run a launch through a
   SCRIPT NAME, which argv cannot resolve — see the README's declared residuals.)
-- **R2 BLOCK THE MEDIA SHAPES** — an Electron launch, a **headed** Playwright run,
-  or `open <path>.app`, without
+- **R2 BLOCK THE MEDIA SHAPES** — an Electron launch (including `electron-forge
+  start`), a **headed** Playwright run, or `open <path>.app` / `open
+  …/Contents/MacOS/<bin>`, without
   `--use-fake-device-for-media-stream --use-fake-ui-for-media-stream` is refused,
   and the refusal names both flags. A named-app launch (`open -a Safari`) is only
   recorded: refusing every GUI launch is the friction the scoping comment rejects.
@@ -99,8 +100,9 @@ jq -c 'select(.media)' ~/.pi/agent/state/host-app-launches.jsonl | tail -20
 jq -r '[.ts, .decision, .rule, .app, .cwd] | @tsv' ~/.pi/agent/state/host-app-launches.jsonl
 ```
 
-`select(.media)` answers "what could take the camera": Electron, headed Playwright,
-and an `open <path>.app`. A named-app launch (`open -a Safari`) is recorded with
+`select(.media)` answers "what could take the camera": Electron (including
+`electron-forge start`), headed Playwright, and an `open <path>.app` or `open` of a
+bundle's inner binary. A named-app launch (`open -a Safari`) is recorded with
 `media: false` deliberately, so use plain `jq -c '.' …` for every GUI launch.
 
 See [`extensions/gui-device-guard/README.md`](../../extensions/gui-device-guard/README.md)

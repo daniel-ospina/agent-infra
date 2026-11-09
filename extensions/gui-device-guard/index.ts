@@ -26,8 +26,9 @@
  *      process and not from who launched it) that launches a host GUI app writes
  *      ONE row to the app-launch ledger
  *      (`~/.pi/agent/state/host-app-launches.jsonl`, override
- *      `GUI_DEVICE_GUARD_RECORD`). Kinds: an Electron invocation, a macOS `open
- *      -a`/`-b`/`.app` launch, an executable inside `…/Contents/MacOS/`. The
+ *      `GUI_DEVICE_GUARD_RECORD`). Kinds: an Electron invocation (including
+ *      `electron-forge start`), a macOS `open -a`/`-b`/`.app` launch or `open` of
+ *      a bundle's inner binary, an executable inside `…/Contents/MacOS/`. The
  *      ledger is the whole point of R1: with it, the incident above is one
  *      `jq` lookup instead of six rounds of `ps`.
  *
@@ -67,7 +68,11 @@
  *     NON-shell interpreter (`python <<EOF`) and a shell started by a FLAG
  *     (`sudo -s <<EOF`, `su` with no `-c`) — neither resolves a stdin-program
  *     SHELL as a command word. A body fed to `bash`/`sh`/`zsh`/… IS read (round
- *     11), and a body behind `-c` is that script's DATA (A46).
+ *     11), INCLUDING when that shell sits on the LEFT of a pipe (`bash <<EOF |
+ *     tee log` — round 12; the redirect binds to its own segment, because
+ *     `lineFeedsShell` used to ask about the line's LAST segment and answered
+ *     "not a shell" for `tee`), and a body behind `-c` is that script's DATA
+ *     (A46).
  *   - A GUI launch built by a shell variable (`APP=Electron; open -a "$APP"`) is
  *     not expanded: the token is `$APP` and the guard records it as an `open`
  *     launch with the unexpanded app name. Recording the SHAPE is still worth
@@ -286,6 +291,48 @@ const EXEC_VERBS = new Set(["exec", "dlx", "x", "execx"]);
 /** Words that NAME a GUI launch — used only as the last-resort fail-safe scan. */
 const LAUNCH_WORDS = new Set(["electron", "playwright", "puppeteer", "playwright-core"]);
 
+/**
+ * Electron's own launcher packages, as a runner's payload spells them.
+ *
+ * ⛔ `electron-forge` IS AN ELECTRON LAUNCH (round 12, P2). Every head test keyed on
+ * the package name `electron` exactly, so `npx electron-forge start` — the first-party
+ * launcher, and the one an Electron repo's own `start` script calls — classified `[]`:
+ * no refusal, no ledger row. It is distinguishable from a plain `node` run by its
+ * leftmost word, so it is NOT in the declared residual class ("argv cannot tell them
+ * apart from a plain `node` run"); only a package.json script genuinely is.
+ *
+ * `@electron-forge/cli` is the same tool under its scoped name, so both spellings are
+ * here rather than the bare word alone.
+ */
+const ELECTRON_FORGE = new Set(["electron-forge", "@electron-forge/cli"]);
+
+/** Is this token an Electron Forge package spec — optionally version-pinned? */
+function isElectronForge(tok: string): boolean {
+  // Strip a trailing `@version` WITHOUT eating a scope: `@electron-forge/cli` has no
+  // version to strip (its only `@` is followed by `/`), `@electron-forge/cli@7` does.
+  const spec = tok.replace(/@[^/@]+$/, "");
+  return ELECTRON_FORGE.has(spec) || (spec.split("/").pop() ?? spec) === "electron-forge";
+}
+
+/**
+ * Does this Electron Forge invocation LAUNCH the app? Only `start` does.
+ *
+ * `package`, `make`, `publish`, `import`, `lint` and `init` build, publish or inspect
+ * an app and never open a window — refusing them would be the category-B friction of
+ * blocking a routine build, and `start` is the only verb the incident's shape needs.
+ * The verb is the first non-flag word after the package; `npm exec electron-forge --
+ * start` spells it after a `--`, which is skipped for the same reason `afterRunner`
+ * skips it. No verb at all (`electron-forge` alone) prints help.
+ */
+function forgeLaunches(toks: string[], from: number): boolean {
+  for (let i = from; i < toks.length; i++) {
+    const tok = toks[i];
+    if (tok === "--" || tok.startsWith("-")) continue;
+    return tok === "start";
+  }
+  return false;
+}
+
 /** A headed-browser signal: the run can present a real device picker. */
 const HEADED_FLAGS = new Set(["--headed", "--ui", "--debug", "--pause"]);
 
@@ -349,6 +396,79 @@ export function splitSegments(command: string): string[] {
   }
   out.push(cur);
   return out.map((s) => s.trim()).filter((s) => s.length > 0);
+}
+
+/** One segment of a line, with the character range it occupies in that line. */
+interface LineSegment {
+  text: string;
+  /** First character of the segment in the line (its separator excluded). */
+  start: number;
+  /** One past the last character, i.e. the index of its separator. */
+  end: number;
+  /** Does this segment feed the NEXT one through a pipe (`|` or `|&`)? */
+  pipeToNext: boolean;
+}
+
+/**
+ * `splitSegments` with OFFSETS kept, so a caller that knows WHERE an operator sits
+ * can ask about the segment that operator binds to.
+ *
+ * ⛔ THE OFFSETS ARE THE POINT, AND `splitSegments` CANNOT SUPPLY THEM (round 12,
+ * P1). It trims and drops empty segments, which is right for the argv rules and
+ * useless for "which segment carries this redirect". `pipeToNext` distinguishes a
+ * PIPE (`|`, and `|&`, which IS a pipe with stderr folded in) from a command
+ * separator (`;`, `&`, newline) and from `||` — the logical OR, whose right-hand
+ * side does NOT receive the left-hand side's standard input.
+ */
+function lineSegments(line: string): LineSegment[] {
+  const mask = unquotedMask(line);
+  const out: LineSegment[] = [];
+  let cur = "";
+  let start = 0;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (!mask[i] || !SEPARATORS.has(ch)) {
+      cur += ch;
+      continue;
+    }
+    // ⛔ `>&` IS A REDIRECT, NOT A COMMAND SEPARATOR — and WHICH redirect decides
+    // whether the pipe still carries the body (round 12 review round 2, P2).
+    // `cat <<EOF 2>&1 | bash` RUNS the body (measured: `BODY_RAN`), because `2>&1`
+    // duplicates stderr ONTO stdout — stdout itself is still piped. Reading that
+    // `&` as a separator cut the pipeline at `2>&`, the forward scan stopped before
+    // the shell, and the line became `[]`: the double loss (no refusal, no ledger
+    // row) that L28f/L29a exist to close, introduced by the very fix for `bash
+    // <<EOF | tee`. The fd number before the `>` decides — absent means fd 1:
+    //   `2>&1`, `3>&1`, `2>&-`  stdout stays in the pipe  → keep the pipeline
+    //   `>&2`, `>&-`, `1>&2`    stdout LEAVES the pipe    → the pipeline ends
+    // `&>` / `&>>` are not this case: the `&` comes BEFORE the `>`, so it is still
+    // read as a separator below, which is also the right answer (stdout went to a
+    // file, so nothing reaches the shell).
+    if (ch === "&" && line[i - 1] === ">") {
+      let k = i - 2;
+      let fd = "";
+      while (k >= 0 && /\d/.test(line[k])) {
+        fd = line[k] + fd;
+        k--;
+      }
+      if (fd !== "" && fd !== "1") {
+        cur += ch;
+        continue;
+      }
+    }
+    const pipeToNext = ch === "|" && line[i + 1] !== "|";
+    // `||` / `&&` are ONE operator each and `|&` is ONE pipe, so each pair is
+    // consumed as a single separator — otherwise the second `|` of a `||` would be
+    // read as a PIPE and a redirect on its left would look like it reaches the next
+    // segment.
+    if (ch === "|" && line[i + 1] === "&") i++;
+    else if (line[i + 1] === ch) i++;
+    out.push({ text: cur, start, end: i, pipeToNext });
+    cur = "";
+    start = i + 1;
+  }
+  out.push({ text: cur, start, end: line.length, pipeToNext: false });
+  return out;
 }
 
 /**
@@ -522,16 +642,43 @@ function shellExecutesStdin(toks: string[]): boolean {
 }
 
 /**
- * Does the LINE that carries this redirect feed a shell? The redirect binds to the
- * segment it appears in — the LAST one on the line, so `cat x | bash <<EOF` asks
- * about `bash` (yes: the body reaches bash's stdin) and `cat <<EOF | bash` ALSO
- * asks about the last segment (yes, and correctly: bash reads the piped body).
+ * Does this redirect feed a shell?
+ *
+ * ⛔ THE REDIRECT BINDS TO THE SEGMENT IT SITS IN — NOT TO THE LINE'S LAST ONE
+ * (round 12, P1). The predecessor asked `shellExecutesStdin(segs[segs.length - 1])`
+ * and its docstring claimed that was safe because "the redirect binds to the LAST
+ * segment on the line". It does not: a redirect binds to the COMMAND it follows.
+ *
+ *     bash <<'EOF' | tee log        the redirect is in `bash`'s segment
+ *     npm exec electron .
+ *     EOF
+ *
+ * ran the body on this host, but the last segment is `tee log` — not a shell — so
+ * the body was blanked as data and the line classified `[]`: no refusal AND no
+ * ledger row (the handler returns early on an empty list), the double loss cycles
+ * 3/4/5/11 treat as blocking, on the PIPE-LEFT spelling of the shape round 11
+ * closed for a bare `bash <<'EOF'`.
+ *
+ * The mirror case must keep working: in `cat <<EOF | bash` the redirect is in
+ * `cat`'s segment, but bash really does execute the body — it arrives over the
+ * PIPE — so the scan follows `pipeToNext` and asks each piped-to segment too. A
+ * `;`, `&`, newline or `||` ends the pipeline: nothing downstream receives the
+ * body, so `cat <<EOF; bash` stays data.
  */
-function lineFeedsShell(line: string, cut: number): boolean {
+function lineFeedsShell(line: string, cut: number, offset: number): boolean {
   const head = cut === -1 ? line : line.slice(0, cut);
-  const segs = splitSegments(head);
-  if (segs.length === 0) return false;
-  return shellExecutesStdin(tokenize(segs[segs.length - 1]));
+  const segs = lineSegments(head);
+  let at = segs.findIndex((s) => offset >= s.start && offset <= s.end);
+  // A redirect can only be outside a segment if the caller's offset is stale;
+  // the last segment is then the safe (over-reading) answer.
+  if (at < 0) at = segs.length - 1;
+  if (at < 0) return false;
+  if (shellExecutesStdin(tokenize(segs[at].text))) return true;
+  for (let k = at; k + 1 < segs.length; k++) {
+    if (!segs[k].pipeToNext) return false;
+    if (shellExecutesStdin(tokenize(segs[k + 1].text))) return true;
+  }
+  return false;
 }
 
 export function splitShellStdin(command: string): ShellStdin {
@@ -552,19 +699,20 @@ export function splitShellStdin(command: string): ShellStdin {
     out.push(line);
     const base = starts[li];
     const cut = commentCutIndex(line, base, mask);
-    const shellFed = lineFeedsShell(line, cut);
     // ── here-STRING (`<<<`): its operand is the shell's stdin too, and `tokenize`
     //    folds `<<<"npm exec …"` into ONE token, so nothing else ever looks at it.
     for (const m of line.matchAll(HERESTRING)) {
       if (mask[base + m.index] !== true) continue;          // a quoted `<<<` is data
       if (cut !== -1 && m.index > cut) continue;             // a commented `<<<` is data
       const operand = m[1] ?? (m[2] === undefined ? m[3] : unescapeDouble(m[2])) ?? "";
-      if (operand === "" || !shellFed) continue;
+      // The redirect's own offset decides which segment's shell (if any) receives it.
+      if (operand === "" || !lineFeedsShell(line, cut, m.index)) continue;
       programs.push(operand);
     }
     const re = /<<(-?)\s*(['"]?)([A-Za-z_][A-Za-z0-9_]*)\2/g;
     let m: RegExpExecArray | null;
     let delim: string | null = null;
+    let delimOffset = 0;
     let stripTabs = false;
     while ((m = re.exec(line)) !== null) {
       // ⛔ A `<<` THAT IS PART OF `<<<` IS A HERE-STRING, not a heredoc: otherwise
@@ -577,6 +725,7 @@ export function splitShellStdin(command: string): ShellStdin {
       // to delete every following line, which lost the block AND the ledger row.
       if (cut !== -1 && m.index > cut) continue;
       delim = m[3];
+      delimOffset = m.index;
       stripTabs = m[1] === "-";
     }
     if (delim === null) continue;
@@ -590,7 +739,9 @@ export function splitShellStdin(command: string): ShellStdin {
       body.push(stripTabs ? lines[j].replace(/^\t+/, "") : lines[j]);
       j++;
     }
-    if (shellFed && body.length > 0) programs.push(body.join("\n"));
+    if (delim !== null && body.length > 0 && lineFeedsShell(line, cut, delimOffset)) {
+      programs.push(body.join("\n"));
+    }
     if (j < lines.length) {
       out.push("");
       li = j;
@@ -834,6 +985,22 @@ function appBundleBinary(tok: string): string | null {
 }
 
 /**
+ * Is this token the INNER BINARY of a macOS bundle — `…/X.app/Contents/MacOS/X`, or
+ * the relative `Contents/MacOS/X` a shell inside the bundle would name?
+ *
+ * ⛔ THE `open` RULE AND THE COMMAND-WORD RULE MUST SPELL ONE SHAPE THE SAME WAY
+ * (round 12, P2). `appBundleBinary` is consulted when the token is the COMMAND WORD,
+ * so `/Applications/X.app/Contents/MacOS/X` was refused — while the identical token
+ * after `open` was accepted only if it ended in `.app`, i.e. never. `open` on a
+ * bundle's inner binary therefore produced NO finding at all: nothing refused and
+ * nothing recorded, which is the diagnosis half of #2249 lost on a launch the guard
+ * already blocks in its other spelling.
+ */
+function bundleInnerBinary(tok: string): boolean {
+  return /(^|\/)Contents\/MacOS\/[^/]+$/.test(tok);
+}
+
+/**
  * The bodies of every command substitution in a command line — `$( … )` and
  * `` ` … ` `` — that is NOT inside single quotes.
  *
@@ -1030,12 +1197,16 @@ function classifySegment(
   const { index } = afterRunner(toks, cwi);
   // ⛔ THE PAYLOAD'S *PACKAGE* NAME, NOT ITS VERBATIM TOKEN (round 7 P1-2):
   // `npx electron@30 .` must read the same as `npx electron .`.
-  const head = index >= 0 ? packageBaseName(toks[index]) : basename(toks[cwi]);
+  // The RAW token is kept as well: a scoped spec (`@electron-forge/cli`) does not
+  // survive `packageBaseName`, which reduces it to its last path segment.
+  const headTok = index >= 0 ? toks[index] : toks[cwi];
+  const head = packageBaseName(headTok);
 
   // R-electron: `electron .`, `npx electron .`, `npm exec electron -- .`,
-  // or a binary inside an Electron bundle.
+  // `npx electron-forge start`, or a binary inside an Electron bundle.
   const bundle = index >= 0 ? appBundleBinary(toks[index]) : null;
-  if (bundle || head === "electron") {
+  const forge = isElectronForge(headTok) && forgeLaunches(toks, (index >= 0 ? index : cwi) + 1);
+  if (bundle || head === "electron" || forge) {
     return {
       rule: "electron",
       app: bundle ?? "Electron",
@@ -1074,8 +1245,16 @@ function classifySegment(
         fromIdFlag = flagArg.letter === "b";
         break;
       }
-      if (tok.endsWith(".app")) {
-        app = tok;
+      // ⛔ A BUNDLE'S INNER BINARY IS A BUNDLE (round 12, P2): `open` of
+      // `…/X.app/Contents/MacOS/X` — or the relative `Contents/MacOS/X` — used to
+      // match NOTHING here, because only a `.app` SUFFIX was accepted, while the
+      // identical token as a command word is refused by the electron rule. Two
+      // spellings of one launch must not disagree (README:33-35 lists the shape as a
+      // recorded kind). The identity is the BUNDLE, not the inner binary, so the
+      // ledger's `app` names what the owner would quit.
+      const asBundle = appBundleBinary(tok);
+      if (tok.endsWith(".app") || asBundle !== null || bundleInnerBinary(tok)) {
+        app = asBundle ?? tok;
         fromFlag = false;
         break;
       }
