@@ -8,7 +8,7 @@
 # TRUST SPLIT — read this before describing what is "protected" (authoritative
 # statement: the module header of scripts/check-pi-pin-lockstep.mjs; this is a
 # pointer to it, not a second copy, so the two cannot drift apart):
-#   - The content lock (scripts/workflow-lock.json) is a conspicuousness
+#   - The content lock (scripts/workflow-lock.d/) is a conspicuousness
 #     tripwire enforced by PR-EDITABLE code, NOT a PR-uneditable control. Its
 #     only call site is the PR's own copy of the checker, run from the
 #     PR-editable .github/workflows/ci.yml.
