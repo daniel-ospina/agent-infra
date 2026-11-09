@@ -45,7 +45,8 @@
 # idiom (`:690-730`), which resolves a tortoise-repo tool the same way for the same reason, plus its
 # rule: ⛔ a refusal that does not say WHERE it looked sends the operator to guess.
 #
-# USAGE (source it; it sets nothing and exits nothing):
+# USAGE (source it; it never exits, and the ONLY variable it sets is the caller's `SCRIPTS` when the
+# caller has none — see the fill-in below, which also explains why that name is deliberate):
 #   . "$SCRIPTS/lib/cmux-dispatch-path.sh"
 #   if DISPATCH="$(cmux_dispatch_resolve "${SAFE_SEND_DISPATCH:-}")"; then ...; else
 #     refuse "...looked in: $(cmux_dispatch_candidates_one_line "${SAFE_SEND_DISPATCH:-}")"
@@ -89,7 +90,12 @@ cmux_dispatch_candidates() {
     #    fail the pin. A variable-prefixed join is the declared residual, honestly — this is a SEARCH,
     #    not an exec site. Measured while writing this: an F2-shaped example in THIS comment was read as
     #    a producer by that scan, which is the form's rule working as designed.)
-    common="$(git -C "$SCRIPTS/.." rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"
+    #    `|| true`: this is a PROBE, and a missing git / a non-checkout `$SCRIPTS/..` makes it exit
+    #    non-zero. Without it, an assignment holding a failed command substitution aborts a consumer
+    #    running under `set -e` — turning "no sibling checkout here" into a dead send path. (Nothing
+    #    is broken today: `safe-send.sh` does not use `-e`. A future consumer would be, and the failure
+    #    would look like the dispatcher, not like this probe.)
+    common="$(git -C "$SCRIPTS/.." rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)"
     if [ -n "$common" ]; then
       sibdir="$(dirname "${common%/.git}")"
       printf '%s\n' "$sibdir/tortoise/tools/cmux_dispatch.py"

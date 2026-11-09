@@ -126,7 +126,13 @@ def test_the_derived_SIBLING_checkout_is_used_without_any_configured_path():
     must be `<parent-of-the-MAIN-checkout>/tortoise/tools/cmux_dispatch.py` even when this file is
     loaded from a worktree — which is exactly where this suite runs.
     """
-    got = _candidates(scripts=_HERE)
+    # ⛔ THE CONVENTIONAL PATH IS COMPUTED FROM THE ENV THIS ARM SETS, NOT FROM THIS BOX'S HOME.
+    # This arm used to guard the ordering assertion with `"/h/…" in got`, i.e. a path no env here
+    # ever produces: the expression was `assert True` (MEASURED: 0 occurrences of `/h/`), so moving
+    # the derived sibling BELOW the conventional clones — the exact regression the comment above it
+    # promises to catch — reddened no row at all (#3836 F3).
+    conv = "/h/Documents/GitHub/tortoise/tools/cmux_dispatch.py"
+    got = _candidates(scripts=_HERE, env={"HOME": "/h"})
     assert "/Users/" not in " ".join(got), got
     common_dir = subprocess.run(
         ["git", "-C", _HERE, "rev-parse", "--path-format=absolute", "--git-common-dir"],
@@ -137,15 +143,50 @@ def test_the_derived_SIBLING_checkout_is_used_without_any_configured_path():
     assert expected in got, (expected, got)
     # ...and it outranks the box's conventional clones, so a sibling checkout wins over a stale clone
     # in the owner's `~/Documents` — the ordering is the contract, not just membership.
-    assert got.index(expected) < got.index("/h/Documents/GitHub/tortoise/tools/cmux_dispatch.py") \
-        if "/h/Documents/GitHub/tortoise/tools/cmux_dispatch.py" in got else True
+    assert conv in got, (conv, got)
+    assert got.index(expected) < got.index(conv), got
 
 
 def test_the_list_is_DEDUPLICATED():
-    """`SCRIPTS=/x/tortoise/tools` makes candidates 1 and 2 the same file; it is listed once."""
-    got = _candidates(scripts="/x/tortoise/tools", env={"TORTOISE_REPO": "/x/tortoise/tools/.."})
-    assert got.count(got[0]) == 1, got
+    """Candidates 1 and 2 must be the SAME STRING for this contract to be observable at all.
+
+    The dedup is `awk 'NF && !seen[$0]++'`, i.e. BYTE-EXACT. So `SCRIPTS=/x/tortoise/tools` with
+    `TORTOISE_REPO=/x/tortoise/tools/..` — this arm as it first shipped — produced two candidates
+    that are the same FILE but different STRINGS (`…/tools/…` vs `…/tools/../tools/…`), which the
+    dedup is right to keep: `!seen[]` never fires, so `got.count(got[0]) == 1` was true by
+    construction and the arm stayed green under a `| cat` mutant (MEASURED, #3836 F2). Under #3442
+    rule 3 an assertion no mutation of the diff can vary is dead weight that tells the next reader
+    dedup is covered.
+
+    `TORTOISE_REPO=/x/tortoise` collides candidate 2 with candidate 1 on the exact same string.
+    """
+    dup = "/x/tortoise/tools/cmux_dispatch.py"
+    got = _candidates(scripts="/x/tortoise/tools", env={"TORTOISE_REPO": "/x/tortoise"})
+    assert got[0] == dup, got
+    assert got.count(dup) == 1, got          # the collision is real; it is listed once
     assert len(got) == len(set(got)), got
+
+
+def test_SOURCING_under_set_eu_does_not_abort_on_a_non_checkout(tmp_path):
+    """CONSUMER CONTRACT: a `set -e` caller must not die on "there is no sibling checkout here".
+
+    The sibling candidate is derived with a `git -C` call that legitimately FAILS on a non-checkout —
+    and on `$HOME/.pi/agent/scripts`, which is exactly where this lib is farmed to. A plain
+    assignment holding a failed command substitution makes the SHELL exit, so "no sibling checkout"
+    would kill the send path with a bare rc that looks like a dispatcher verdict — the silent failure
+    #1957 exists to remove, one level down. Nothing breaks today (`safe-send.sh` does not use `-e`);
+    this arm is what keeps the next `set -e` consumer from inheriting it.
+
+    ⛔ `-o pipefail` IS PART OF THE FIXTURE, not decoration: the candidate list is emitted through an
+    internal `| awk` pipeline, so under plain `set -e` the pipeline's status is `awk`'s (0) and the
+    failure is swallowed. `pipefail` is what makes the subshell's abort reach the caller — MEASURED:
+    with `|| true` stripped from the git probe, this arm exits 128; as shipped it exits 0.
+    """
+    scripts = tmp_path / "not-a-checkout" / "scripts"
+    scripts.mkdir(parents=True)
+    r = _bash(f'set -euo pipefail; SCRIPTS="{scripts}"; . "{_LIB}"; cmux_dispatch_candidates')
+    assert r.returncode == 0, (r.returncode, r.stdout, r.stderr)
+    assert r.stdout.splitlines()[0] == f"{scripts}/cmux_dispatch.py", r.stdout
 
 
 def test_an_UNSET_HOME_renders_as_a_HOME_shaped_candidate_not_as_a_root_path():
@@ -322,16 +363,25 @@ def test_the_interpreter_ladder_names_every_path_it_tried_including_the_override
 def test_safe_send_still_exits_78_for_a_missing_brief_gate(tmp_path):
     """PRECEDENCE, pinned: the brief gate is the FIRST refusal, so a caller that reads 78 keeps
     reading 78. Moving the producer check ahead of it would reclassify every broken-install refusal
-    as a dispatch failure."""
+    as a dispatch failure.
+
+    ⛔ NO PRODUCER IS WRITTEN HERE, AND THAT IS THE FIXTURE (#3836 F4). This arm used to place a
+    RESOLVABLE `cmux_dispatch.py` first, so the precedence was never exercised: with a producer
+    present, a producer check moved ahead of the brief gate resolves, falls through, and still exits
+    78 — MEASURED, the whole block deleted left this arm green. BOTH refusals present is the only
+    state in which order is observable, so the brief gate has to win with nothing else resolvable.
+    """
     ss, _brief, home = _safe_send_fixture(tmp_path)
     brief = tmp_path / "nobrief.txt"
     brief.write_text("no research contract here\n")
-    (tmp_path / "scripts" / "cmux_dispatch.py").write_text("import sys\nsys.exit(0)\n")
     r = subprocess.run(["bash", str(ss), "0000-1111", "lane", str(brief)],
                        capture_output=True, text=True, cwd=str(tmp_path),
                        env={"PATH": "/usr/local/bin:/usr/bin:/bin", "HOME": str(home),
                             "AGENT_INFRA_PATH": str(tmp_path / "absent")})
     assert r.returncode == 78, (r.returncode, r.stdout, r.stderr)
+    # the refusal is the BRIEF gate's, so a mutant that reorders the blocks reddens on rc AND here
+    assert "brief-gate.sh not found" in r.stderr, r.stderr
+    assert "cmux_dispatch.py NOT FOUND" not in r.stderr, r.stderr
 
 
 if __name__ == "__main__":
