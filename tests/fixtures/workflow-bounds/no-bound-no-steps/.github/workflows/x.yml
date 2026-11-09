@@ -1,0 +1,8 @@
+name: fixture no-bound-no-steps — neither a job bound nor any steps
+on:
+  pull_request:
+jobs:
+  j:
+    # The violation must use the zero-step wording, not an empty "and NOT every step is bounded either ()"
+    # parenthetical (review finding, P3).
+    runs-on: ubuntu-latest

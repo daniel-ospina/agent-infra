@@ -324,7 +324,10 @@ function main() {
       if (typeof job.uses === "string" && job.uses.trim() !== "") {
         callers++;
         const local = resolveLocalCallee(job.uses);
-        const own = classifyBound(job["timeout-minutes"]);
+        // The test is a PRESENCE test, not a validity test: GitHub's caller schema rejects the KEY, so an
+        // empty or malformed value fails the run just as a valid one does. Reading it as a validity test
+        // (`own.ok`) let an empty-valued bound fall through to the callee path and certify the file GREEN
+        // through the workflow it calls (review finding, P3, mutant M15 stayed green).
         if (job["timeout-minutes"] !== undefined) {
           violations.push(
             `${where} declares timeout-minutes on a reusable-workflow CALL job — GitHub's caller schema ` +
@@ -383,6 +386,9 @@ function main() {
         // silently — Finding A's class, on this branch. The NUMERIC subtotal is provable on its own, so
         // it is always checked; only the part that depends on the expression is downgraded to a NOTE.
         // A job with UNBOUNDED steps is out of scope entirely (the JOB-level NOTE below covers it).
+        // `steps.length > 0` is load-bearing, not decoration: a job with NO steps has no step budget to
+        // check, so without it the expression branch below tells the reader "every step carries a bound"
+        // about a job that has none (review finding, P3, mutant M4 stayed green).
         const everyStepBounded = steps.length > 0 && badSteps.length === 0;
         if (everyStepBounded) {
           const numeric = steps.map((s) => Number(s && s["timeout-minutes"]));
@@ -442,10 +448,15 @@ function main() {
         // A job bound is a BACKSTOP; if its steps are unbounded, say so once per job so the
         // weaker shape is visible rather than implied. It is a NOTE, not a violation:
         // `check-ci-lane-parity.mjs` refuses that shape in the two lane documents already.
+        // `badSteps.length > 0` is load-bearing: without it every FULLY step-bounded job also gets this
+        // note, saying "0/2 step(s) carry no bound" (review finding, P3, mutant M7 stayed green).
         if (steps.length > 0 && badSteps.length > 0) {
           // …and name any step bound that is ALREADY beyond the job bound, so the NOTE genuinely covers
           // the shape the all-numeric rule above cannot (review finding, P3: it claimed coverage it did not give).
           const ceilingHere = verdict.expression || verdict.inert ? PLATFORM_CEILING_MIN : Number(verdict.value);
+          // `>=`, not `>`: a step bound EQUAL to the job bound is cancelled at the same instant the job
+          // is, so it can never fire — the note's own wording says "at or above" (review finding, P3,
+          // mutant M8 stayed green because arm 23's fixture only exercises 400 against 20).
           const stranded = steps.filter((s) => Number(s && s["timeout-minutes"]) >= ceilingHere).length;
           notes.push(
             `${where} is bounded only at the JOB level — ${badSteps.length}/${steps.length} step(s) carry no bound, so its trip is ` +
@@ -493,6 +504,9 @@ function main() {
         boundedBySteps++;
         continue;
       }
+      // The zero-step arm is its OWN wording: `badSteps` is necessarily empty there, so the
+      // "NOT every step is bounded either ()" clause would be an empty parenthetical (review finding,
+      // P3, mutant M23 stayed green — every bad-values fixture carries a step).
       violations.push(
         steps.length === 0
           ? `${where} ${verdict.why}`

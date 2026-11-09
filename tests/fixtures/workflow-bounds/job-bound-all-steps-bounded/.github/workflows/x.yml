@@ -1,0 +1,16 @@
+name: fixture job-bound-all-steps-bounded — every step bounded UNDER the job bound
+on:
+  pull_request:
+jobs:
+  j:
+    # Nothing is weaker than its shape implies, so the JOB-level note must NOT be emitted at all
+    # (review finding, P3).
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: first
+        timeout-minutes: 10
+        run: echo hi
+      - name: second
+        timeout-minutes: 5
+        run: echo hi
