@@ -2696,7 +2696,10 @@ assert_absent "$(grep '^remedy=' "$T/t24c2/state/harness-apply.status" 2>/dev/nu
 # alphabetic `stale` sits inside EVERY one of those classes, so no reshaping of the class can re-admit it
 # — only MEMBERSHIP can refuse it, which is what the closed vocabulary now does for all three. Any
 # trailing token outside the instrument's own vocabulary is now a refusal, and each token is its own run
-# because the scan exits on the first hit.
+# because the scan exits on the first hit. Mutant that reds the `stale` row — the only token here refused
+# by MEMBERSHIP ALONE (`drift:2`/`DRIFTED!` are duplicated by t24bx/t24by, so their allow-list mutant
+# reds both blocks and proves neither): `if (v == "stale") next` in the allow-list — measured 648 passed
+# / 2 failed, exactly this row's two assertions.
 mk_origin t24c3; mk_clone t24c3
 REPO_P="$CLONE"; MODE_P=sync
 mkdir -p "$T/t24c3/home/.pi/agent/scripts"
@@ -2943,11 +2946,13 @@ assert_contains "$(grep '^farm_rows=' "$T/t24ay/state/harness-apply.status" 2>/d
 # ⛔ THE SUMMARY IS THE THIRD HALF OF THE rc=0 CONTRADICTION CHECK (review round 29, measured: the arm
 # read the row predicate and the verdict line but NEVER the three-label summary — `farm_sum_count` was
 # called only inside the `1|3` arm — so the same bytes recorded `farm: ok` at rc=0 and RED at rc=1). The
-# rows here carry the verdicts under DIFFERENT names (`drift`, `missing`) on purpose: round 32's closed
-# vocabulary is not blind to those, so the ROW operand fires here too — which is why the SUMMARY half
-# needs a fixture of its own (t24c5 below, where every row is benign). Mutant that reds the summary half
-# THERE: drop `|| { [ -n "$FARM_EXPECT0" ] && [ "$FARM_EXPECT0" -gt 0 ]; }` — a no-op in THIS block,
-# because the row operand refuses first.
+# rows here carry the verdicts under DIFFERENT names (`drift`, `missing`) on purpose: the row PREDICATE
+# (`farm_drift_rows`) is blind to them, but the unclassifiable-TOKEN operand (`FARM_UNC0`) is not — so this
+# block cannot tell its own two halves apart, which is why the SUMMARY half needs a fixture of its own
+# (t24c5 below, where every row is benign). HERE the summary disjunct is the one that is TRUE and
+# short-circuits (it is evaluated BEFORE `FARM_UNC0` at pass:1703); deleting it is a no-op in THIS block
+# only because the token operand then refuses instead. Mutant that reds the summary half THERE: drop
+# `|| { [ -n "$FARM_EXPECT0" ] && [ "$FARM_EXPECT0" -gt 0 ]; }`.
 mk_origin t24bd; mk_clone t24bd
 REPO_P="$CLONE"; MODE_P=sync
 mkdir -p "$T/t24bd/home/.pi/agent/scripts"
