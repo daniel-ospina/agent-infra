@@ -2462,7 +2462,10 @@ _orch_argv_is_loop() { # shellcheck disable=SC2086
 # ⚠️ ONE NAMED OVER-REFUSAL, stated rather than discovered later: the token scan is ANY-token (so that
 # no plausible option form can miss the script), which means a non-controller whose argv merely NAMES the
 # script behind an option — `bash -x grep /abs/orch-loop.sh` — is refused as ambiguous instead of
-# reclaimed. That is the SAFE direction: a refusal costs a human one `rm -f`, while a wrong reclaim puts
+# reclaimed. `bash -- /abs/orch-loop.sh` is the same class and belongs in this list rather than in a
+# reviewer's notes (fresh review of #3865 at a2da4598b, note — MEASURED `flagged=0`): `--` ends option
+# parsing and the script really runs, but it is not a `-c`-family token, so it is deferred to a human.
+# That is the SAFE direction: a refusal costs a human one `rm -f`, while a wrong reclaim puts
 # two controllers on one queue (#1715). Do not narrow the scan to the "first non-option token" to fix
 # it: every option-taking form (`-o errexit`, `--rcfile FILE`, `+O shopt`) then makes that token an
 # argument rather than the script, and the missed script becomes a reclaim over a live owner.
@@ -2484,9 +2487,10 @@ _orch_argv_is_loop_flagged() { # shellcheck disable=SC2086
     # and `bash +cx 'echo X'` both EXECUTE the string).
     # ⛔ AND `-c` IS A LETTER IN A SHORT-OPTION CLUSTER, NOT A WHOLE TOKEN: `-cx`, `-ce` and `+cx` are
     # the same family and a whole-token match (`-[!-]*c*`) missed `-cx`/`-ce` entirely, so those spellings
-    # were refused as ambiguous while executing the string (fresh review of #3865 at 8c3346680, P3;
-    # `+cx` answered RECLAIM on the base and CANNOT-TELL here — a NEW over-refusal for a spelling this
-    # rule names). LONG options are NOT the family (`--rcfile FILE` leaves the script as an argument, so
+    # were refused as ambiguous while executing the string (fresh review of #3865 at 8c3346680, P3 — before
+    # `+*c*` joined the family at d74aea019a, `+cx` was the one cluster the `-`-only test got WRONG in the
+    # over-refusal direction; it answers RECLAIM since, and §17c drives it). LONG options are NOT the
+    # family (`--rcfile FILE` leaves the script as an argument, so
     # `--*` falls through to the ambiguous answer), and a short cluster only means `-c` when it carries a
     # literal `c` — `-o pipefail`, `-x`, `+o errexit` do not.
     # ⛔ `--command` IS DEFENSIVE, NOT A CLAIM THAT A SHELL TAKES IT (fresh review of #3865, P3 —

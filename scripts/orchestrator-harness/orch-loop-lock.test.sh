@@ -266,8 +266,9 @@ exit_trap_count() {
   trap_regs "$1" | grep -c '^EXIT :: ' || true
 }
 # trap_reg_total <text> — how many trap registrations sit at a COMMAND POSITION anywhere in the text:
-# line start, after `;`/`&&`/`||`/`(`/`{`, or after a keyword that OPENS a command (`then`, `do`, `else`,
-# `elif`, `while`, `until`) or a negation (`!`). Trailing `\`+newline continuations are JOINED first, so a
+# line start, after `;`/`&&`/`||`/`(`/`{`/`)`, or after a keyword that OPENS a command (`then`,
+# `do`, `else`, `elif`, `while`, `until`) or a negation (`!`). Trailing `\`+newline continuations are
+# JOINED first, so a
 # registration split across a line break is still one logical line. This exists so the per-LINE scan
 # above cannot be defeated by a second registration that simply does not start its line (fresh review of
 # #3865, P2 — false PASS, MEASURED: `trap '…' EXIT; trap 'true' EXIT`, `[ -d "$O/state" ] && trap 'true'
@@ -276,6 +277,13 @@ exit_trap_count() {
 # …` and a backslash-continued registration, which the next review measured at `PASS=142 FAIL=0`).
 # An accounting arm compares this count against the number of lines the per-line scan matched, so a line
 # it cannot see — or one carrying two registrations — is a RED, not a blind spot.
+# ⛔ `)` IS A COMMAND POSITION AND WAS THE ONE HOLE IN THE CLASS (fresh review of #3865 at a2da4598b, P2 —
+# false GREEN, MEASURED: `)` closes a `case` arm's pattern, and a registration written inside an arm —
+# `case "$X" in *) trap 'true' EXIT ;; esac` — is invisible to BOTH scans, so the counts still AGREED and
+# the accounting arm reported ✅ while bash REPLACED the releaser and the lock was left on disk. Every
+# other position in the shell grammar was already covered: `;` also covers `;;`, and `&`, `&&`, `||`, `|`,
+# `(`, `{`, `!` and the opening keywords are above. One character closes the class; §9d drives the
+# spellings so the closed position is a witness and not prose.)
 # ⏳ STATED RESIDUAL (not silently missed): a registration whose command word is BUILT (`eval "trap …"`, a
 # `trap` token held in a variable) defeats both scans. Asserting the handler bash actually INSTALLED
 # (`trap -p EXIT`) is the stricter shape and the follow-up if one ever appears in the subject.
@@ -283,7 +291,7 @@ trap_reg_total() {
   printf '%s\n' "$1" \
     | sed -e 's/[[:space:]]*#.*$//' \
     | awk '{ while ($0 ~ /\\$/ && (getline nxt) > 0) { sub(/\\$/, "", $0); $0 = $0 " " nxt } ; print }' \
-    | grep -oE '(^|[;&|({]|then|do|else|elif|while|until|!)[[:space:]]*((builtin|command)[[:space:]]+)?trap[[:space:]]' \
+    | grep -oE '(^|[;&|({)]|then|do|else|elif|while|until|!)[[:space:]]*((builtin|command)[[:space:]]+)?trap[[:space:]]' \
     | grep -c . || true
 }
 trap_pin() {
@@ -333,6 +341,10 @@ ck "the releasing trap is the ONLY 'EXIT' trap (a second EXIT-family registratio
 # EXIT registration while bash kept only the LAST handler — the lock was never removed and this pair of
 # arms stayed green. The count below sees a registration ANYWHERE a command can start, so the two can no
 # longer disagree: any registration the line scan missed, and any line carrying two, RED here.)
+# ⛔ INCLUDING ONE INSIDE A `case` ARM (fresh review of #3865 at a2da4598b, P2 — false GREEN, MEASURED:
+# `)` closes an arm's pattern and was the one command position missing from the class, so
+# `case "$X" in *) trap 'true' EXIT ;; esac` — a lane's cleanup tripwire is exactly this shape — left
+# this arm at ✅ (both counts 3/3) while bash REPLACED the releaser. §9d drives the closed spellings.)
 [ "$(trap_reg_total "$TRAP_TEXT")" = "$(grep -c . <<<"$ALL_TRAPS")" ]
 ck "every trap registration sits at a command position the per-line scan can see (a registration it misses, or a line carrying two, RED)" $?
 # ⛔ AND AN UNREADABLE SIGNAL LIST IS RED, NOT ABSENT (fresh review of #3865 at 000d86dcd, P2 — false
@@ -342,6 +354,14 @@ ck "every trap registration sits at a command position the per-line scan can see
 # answers, and this side is the fail-OPEN one. `trap_regs` emits `UNKNOWN` when it cannot recover a
 # list, so the answer is now READ-ME rather than absent, and the registration is RED rather than
 # silently "not this family".)
+# ⛔ AND THE UNKNOWN ARM'S TEXT SOURCE IS A STATED LIMIT, NOT A ROW (fresh review of #3865 at
+# a2da4598b, note): this arm reads `$(cat "$SUBJECT")` while the scans above read `trap_join`'s output, so
+# a releaser split by a trailing `\` reads UNKNOWN here and parses fine above — one spelling, two answers,
+# and this side is FAIL-CLOSED (a false RED). Pointing it at `$TRAP_TEXT` is the fix, but it is not
+# attributable in this suite: reverting that line leaves every row GREEN, because the shipped subject has
+# no split releaser (MEASURED: `PASS=160 FAIL=0` with the arm reverted to `$(cat "$SUBJECT")`). An
+# assertion no mutant can redden is the #3442 rule 3 defect, so the repair belongs with a subject fixture
+# that carries a backslash-continued releaser — a follow-up, not this PR.
 [ "$(trap_regs "$(cat "$SUBJECT")" | grep -c '^UNKNOWN :: ' || true)" = 0 ]
 ck "every trap registration's SIGNAL LIST is readable (an unparseable one is UNKNOWN — never silently 'not this family')" $?
 # ⛔ AND A RETURNING `INT`/`TERM` HANDLER IS THE #1715 CLASS, AND THE `LOCKF` FILTER CANNOT SEE IT (fresh
@@ -497,6 +517,45 @@ _unkrow "trap 'true' SIGEXIT" \
   "an UNPARSEABLE signal list reads UNKNOWN (never silently 'not this family')"
 _unkrow "trap 'true' 2>/dev/null" \
   "a registration naming NO signal at all reads UNKNOWN"
+# ⛔ AND THE ACCOUNTING PREDICATE IS DRIVEN OVER ITS OWN POSITIONS (fresh review of #3865 at a2da4598b, P2
+# — the command-position class omitted `)` and NOTHING drove it, so the hole was invisible to the suite as
+# well as to the scan: `case "$X" in *) trap 'true' EXIT ;; esac` left BOTH counts at 1 (the releaser)
+# and the arm GREEN while bash REPLACED the releaser. The `case` rows below are GREEN on the pre-fix
+# class and RED after `)`; the keyword and `;` rows are the regression witnesses for the
+# positions the class already had, so a later narrowing of it reds a row instead of a review.)
+_acctrow() { # <agree|disagree> <text> <label>
+  local _want="$1" _txt="$2" _tot _lines _got
+  _tot="$(trap_reg_total "$_txt")"; _lines="$(trap_regs "$_txt" | grep -c . || true)"
+  [ "$_tot" = "$_lines" ] && _got=agree || _got=disagree
+  [ "$_got" = "$_want" ]
+  ck "9d: $3 (total=$_tot, per-line=$_lines, want $_want)" $?
+}
+_acctrow agree "$_REL" \
+  "ACCOUNTING positive control: one column-0 releaser, both scans agree"
+_acctrow disagree "$_REL
+case \"\$X\" in *) trap 'true' EXIT ;; esac" \
+  "a registration inside a ONE-LINE case arm is SEEN (a ')' is a command position — the closed hole)"
+_acctrow disagree "$_REL
+case \"\$X\" in
+  *) trap 'true' EXIT ;;
+esac" \
+  "a registration inside a MULTI-LINE case arm is SEEN (a lane's cleanup tripwire takes exactly this shape)"
+_acctrow disagree "$_REL
+else trap 'true' EXIT" \
+  "a registration after 'else' is SEEN (the keyword class — was a false PASS once)"
+_acctrow disagree "$_REL
+! trap 'true' EXIT" \
+  "a registration after a negation is SEEN (the '!' class — was a false PASS once)"
+_acctrow disagree "$_REL; trap 'true' EXIT" \
+  "TWO registrations on ONE line disagree with the per-line scan (the original false PASS)"
+# ⛔ AND THE UNKNOWN ARM'S TEXT SOURCE IS A STATED LIMIT, NOT A ROW (fresh review of #3865 at
+# a2da4598b, note): this arm reads `$(cat "$SUBJECT")` while the scans above read `trap_join`'s output, so
+# a releaser split by a trailing `\` reads UNKNOWN here and parses fine above — one spelling, two answers,
+# and this side is FAIL-CLOSED (a false RED). Pointing it at `$TRAP_TEXT` is the fix, but it is not
+# attributable in this suite: reverting that line leaves every row GREEN, because the shipped subject has
+# no split releaser (MEASURED: `PASS=160 FAIL=0` with the arm reverted to `$(cat "$SUBJECT")`). An
+# assertion no mutant can redden is the #3442 rule 3 defect, so the repair belongs with a subject fixture
+# that carries a backslash-continued releaser — a follow-up, not this PR.
 okc "acq() still takes the lock with set -o noclobber (unchanged primitive)" \
   grep -qF 'acq() { ( set -o noclobber; echo $$ > "$LOCKF" ) 2>/dev/null; }' "$SUBJECT"
 okc_not "the OLD liveness-only reclaim is GONE (it must not survive beside the new verdict)" \
