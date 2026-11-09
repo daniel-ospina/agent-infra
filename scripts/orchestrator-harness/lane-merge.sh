@@ -272,6 +272,18 @@ INTERVAL="${LANE_MERGE_INTERVAL:-20}"; is_limit "$INTERVAL" || INTERVAL=20
 #   (2) if no heartbeat target resolves, CAP the wait BELOW the watchdog's allowance rather than out-reach
 #       a bound that will kill the lane unlabelled — a bound the lane cannot reach is an inert guard, which
 #       is this file's own rule (#3584) applied one layer down.
+#   (3) AND THE SAME APPLIES TO THE WATCHDOG'S **WALL** BOUND (review round 2, P1 — verified by arithmetic):
+#       `WAIT_S` was clamped only against this file's TOTAL clock, never against what of it is LEFT when the
+#       merge phase is actually entered. A lane entering at `LANE_WALL_S - 5400` … i.e. 1800 s in, has the
+#       wall fire MID-WAIT and dies unlabelled — the very failure the heartbeat removes on the idle axis.
+#       So the wait's deadline is clamped to the wall budget that remains, RESERVING the `--watch` allowance
+#       after it; a merge phase entered too late to wait at all hands off immediately, labelled, instead of
+#       waiting for a kill. The lane's spawn time comes from `LANE_SPAWN_EPOCH` (exported by spawn-gate at
+#       the same moment it arms the watchdog); without it the clamp stands down and says so rather than
+#       guessing — the idle cap (2) still applies.
+# ⛔ AND NOT ON A READ-ONLY `--status` (review round 2, P3 — verified): the cap block is module scope, and
+# `--status` is documented as "no network, no writes", so an unlabelled `say_err` about capping a wait that
+# will never happen is operator noise on the one path that inspects state without touching it.
 HB_F="${LANE_MERGE_HB:-}"
 # ⛔ THE INVARIANT BELOW KEEPS ITS DESIGN OPERAND: the cap is a RUNTIME limit on how long this pass waits,
 # and must never feed back into `MAX_WATCH` — otherwise the supervision budget a lane gets would depend on
@@ -298,9 +310,16 @@ IDLE_BOUND_S="${LANE_BOUND_IDLE_S:-2700}"; is_limit "$IDLE_BOUND_S" || IDLE_BOUN
 # Two polls of headroom, so the first heartbeat lands before the bound can fire; floored so a tiny
 # LANE_MERGE_INTERVAL cannot make the cap degenerate.
 _hb_margin=$(( INTERVAL * 2 )); [ "$_hb_margin" -ge 10 ] || _hb_margin=10
-if [ -z "$HB_F" ] && [ "$IDLE_BOUND_S" -gt 0 ] && [ "$WAIT_S" -ge "$IDLE_BOUND_S" ]; then
+if [ "${STATUS:-0}" != 1 ] && [ -z "$HB_F" ] && [ "$IDLE_BOUND_S" -gt 0 ] && [ "$WAIT_S" -ge "$IDLE_BOUND_S" ]; then
   WAIT_S=$(( IDLE_BOUND_S - _hb_margin ))
-  [ "$WAIT_S" -ge "$POLL_S" ] || WAIT_S="$POLL_S"
+  # ⛔ THE FLOOR MUST NOT DEFEAT THE BOUND IT GUARDS (review round 2, P3 — verified): `IDLE_BOUND_S` smaller
+  # than `POLL_S + _hb_margin` (120 s at the shipped POLL_S=120) made the floor hand back a wait EQUAL to
+  # the allowance it was supposed to stay under — a guard that silently stops guarding at exactly the
+  # settings an operator would reach for. So: never below one poll, and never at/above the allowance — if
+  # both cannot hold, wait NOTHING and hand off now, which is still labelled.
+  [ "$WAIT_S" -ge 1 ] || WAIT_S=1
+  [ "$WAIT_S" -lt "$IDLE_BOUND_S" ] || WAIT_S=$(( IDLE_BOUND_S - 1 ))
+  [ "$WAIT_S" -ge 1 ] || WAIT_S=0
   say_err "lane-merge: no watchdog-visible heartbeat target (nothing at \$O/logs/lane-${ISSUE:-<issue>}.log or \$O/logs/fix-$PR.log, and LANE_MERGE_HB is unset) — the check wait is CAPPED at ${WAIT_S}s, below lane-bound.sh's ${IDLE_BOUND_S}s progress allowance. An uncapped wait would be killed as 'stalled' before it could write its hand-off verdict (#3584 review, P1). Set LANE_MERGE_HB, or run the lane with --issue, to get the full wait."
 fi
 # The divisor is floored at the shipped chunk length: LANE_MERGE_POLL=0 is a legitimate value (a chunk
@@ -1388,7 +1407,40 @@ esac
 # wedged and so a human reading the transcript can see it is making progress and not hung.
 CHECK_TMP="$(mktemp "${TMPDIR:-/tmp}/lane-merge-checks.XXXXXX")" || exit 2
 trap 'rm -f "$CHECK_TMP"' EXIT
-deadline=$(( $(date +%s) + WAIT_S ))
+# ⛔ THE WAIT IS CLAMPED TO THE WATCHDOG'S **WALL** BUDGET, NOT ONLY TO THIS FILE'S TOTAL (#3584 review
+# round 2, P1 — verified by arithmetic). `spawn-gate.sh` arms `lane-bound.sh watch --wall $LANE_BACKSTOP_S`
+# at the moment it spawns the lane, so that bound is measured from the lane's START — while `WAIT_S` was
+# being measured from MERGE-PHASE ENTRY. For a lane that enters 1800 s in, `WAIT_S=5400` runs past the wall
+# and the watchdog TERMs it MID-WAIT: no verdict, no hand-off, no resumable counter — the same unlabelled
+# death the heartbeat removes on the idle axis, on the clock this file THINKS it owns. So the deadline is
+# clamped to what remains, RESERVING the `--watch` allowance after it (spending the whole remainder on the
+# wait would leave the supervision that follows with nothing and turn a reachable chain into
+# BLOCKED_ATTEMPTS). The spawn epoch is EXPORTED by spawn-gate rather than re-derived here — a guessed
+# epoch is worse than an admitted unknown, which is why the else-branch below says so out loud.
+wall_left() { # prints the seconds of the lane's wall bound still available; fails when it is unknown
+  case "${LANE_SPAWN_EPOCH:-}" in ''|*[!0-9]*) return 1 ;; esac
+  [ "${LANE_SPAWN_EPOCH:-0}" -gt 1000000000 ] 2>/dev/null || return 1
+  [ "${LANE_WALL_S:-0}" -gt 0 ] || return 1
+  printf '%s' $(( LANE_SPAWN_EPOCH + LANE_WALL_S - $(date +%s) ))
+}
+_now0="$(date +%s)"
+deadline=$(( _now0 + WAIT_S ))
+if _wl="$(wall_left)"; then
+  _wall_reserve=$(( MAX_WATCH * POLL_S + _hb_margin ))
+  _wall_capd=$(( _now0 + _wl - _wall_reserve ))
+  if [ "$_wall_capd" -lt "$deadline" ]; then
+    if [ "$_wall_capd" -le "$_now0" ]; then
+      log_line "… only ${_wl}s of the lane's ${LANE_WALL_S}s wall clock remain and $(( _wall_reserve ))s of it is reserved for --watch, which cannot cover a check wait — handing off NOW rather than being killed mid-wait"
+      disposition WAITING_CHECKS
+      verdict WAITING_CHECKS "no wall budget left to wait for checks (${_wl}s remaining, $(( _wall_reserve ))s reserved for --watch)"
+      exit 11
+    fi
+    log_line "… clamping the check wait to $(( _wall_capd - _now0 ))s: only ${_wl}s of the lane's ${LANE_WALL_S}s wall clock remain, less $(( _wall_reserve ))s reserved for --watch"
+    deadline="$_wall_capd"
+  fi
+else
+  log_line "… LANE_SPAWN_EPOCH is unset or not an epoch, so this wait cannot be clamped to the lane's remaining wall clock — the bounds that still apply are the idle cap (${WAIT_S}s) and the watchdog's own kill"
+fi
 while :; do
   rows="$(checks_read "$HEAD")"
   # The single-page read carries a TOTAL line so "this page is all of it" is distinguishable from
@@ -1486,7 +1538,12 @@ while :; do
     printf '[lane-merge] heartbeat %s: %s check(s) in flight at head %s (%ss left in this bound)\n' \
       "$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date)" "${IF:-?}" "${HEAD:0:12}" \
       "$(( deadline - $(date +%s) ))" >> "$HB_F" 2>/dev/null || {
-        say_err "lane-merge: the heartbeat target '$HB_F' became unwritable — progress is no longer visible to lane-bound.sh's ${IDLE_BOUND_S}s allowance; re-run with LANE_MERGE_HB pointing at the lane log."
+        # ⛔ A FAILED HEARTBEAT IS A LOST PROGRESS SIGNAL, SO IT MUST ALSO SHORTEN THE WAIT (review round 2,
+        # P3 — verified): clearing HB_F alone left the remaining wait silent, which is exactly the kill this
+        # branch exists to prevent. Re-derive the deadline to the idle allowance and say so.
+        _hb_deadline=$(( now + IDLE_BOUND_S - _hb_margin ))
+        [ "$_hb_deadline" -lt "$deadline" ] && deadline="$_hb_deadline" 2>/dev/null
+        say_err "lane-merge: the heartbeat target became unwritable — progress is no longer visible to lane-bound.sh's ${IDLE_BOUND_S}s allowance; the wait is re-clamped to it so this pass still writes a verdict."
         HB_F=""
       }
   fi
