@@ -10765,6 +10765,32 @@ run_record_delta $EH167 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42545501" \
     STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..HEAD\$3 worth of commits; no issues found."
 assert_eq "$RECORD_RC" "0" "20h85 a '\$' run after the tip word (..<HEAD>\$3) is prose, not an unparseable token — ACCEPTED (rc 0)"
 [ -f "$(Q2 $EH167)" ] || bad "20h85 FALSE BLOCK: '\$' was in neither class, so the endpoint's spelling decided whether the range parsed"
+# 20h85b THE OTHER THREE NAME-LEGAL PUNCTUATION RUNS, PINNED AS A CLASS (twenty-seventh cycle). The
+#       twenty-fourth cycle's P2 named FIVE characters — `! = & % $` — as one false-block class, and
+#       the first fix restored only `!` (20h77g); `$` got its own row at 20h85. These three had NO
+#       vector at all: at the reviewed head `3481e09de` each was rc 3 "MENTIONS a delta: range this
+#       code cannot parse", and a regression that drops one character from the run class would
+#       reproduce exactly that with nothing in the corpus to redden (the `$` history, one row over).
+#       The guard they measure is the RUN CLASS plus the peel (20h81/M74): M78 removes `%` from the run
+#       class and refuses 20h85d, so this acceptance is measured rather than asserted.
+EH169=425458; rm -f "$(Q2 $EH169)"
+run_record_delta $EH169 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42545901" \
+    STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" \
+    STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..HEAD=3 commits; no issues found."
+assert_eq "$RECORD_RC" "0" "20h85b an '=' run after the tip word (..<HEAD>=3 commits) is prose, not an unparseable token — ACCEPTED (rc 0)"
+[ -f "$(Q2 $EH169)" ] || bad "20h85b FALSE BLOCK: '=' as a name-legal run made an honest range unparseable"
+EH170=425460; rm -f "$(Q2 $EH170)"
+run_record_delta $EH170 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42546101" \
+    STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" \
+    STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..HEAD&3 more; no issues found."
+assert_eq "$RECORD_RC" "0" "20h85c …and an '&' run (..<HEAD>&3 more) is prose — ACCEPTED (rc 0)"
+[ -f "$(Q2 $EH170)" ] || bad "20h85c FALSE BLOCK: '&' as a name-legal run made an honest range unparseable"
+EH171=425462; rm -f "$(Q2 $EH171)"
+run_record_delta $EH171 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42546301" \
+    STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" \
+    STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..HEAD%3 of it; no issues found."
+assert_eq "$RECORD_RC" "0" "20h85d …and a '%' run (..<HEAD>%3 of it) is prose — ACCEPTED (rc 0)"
+[ -f "$(Q2 $EH171)" ] || bad "20h85d FALSE BLOCK: '%' as a name-legal run made an honest range unparseable"
 # 20h86 THE REFUSAL QUOTES THE CLAIM AS WRITTEN (P2 — MEASURED). The recovered brace was rebuilt as
 #       `${operand}${group}` while the group had been rewritten to carry an `@`, so the refusal told an
 #       author their artifact read `..@@{u}` — an accusation about text they never wrote.
@@ -12022,6 +12048,13 @@ MUT="$(mk_mutant nonresolvecmp '        if [ -z "$_sbrace" ]; then
             HEAD|@) : ;;')"
 mut_check "M77 a resolvable endpoint is compared by CONTENT, so a hex-named branch at the range start is not the head" 425452 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42545301" accepted STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..ce41c945; no issues found."
 git -C "$DG" branch -D ce41c945 >/dev/null 2>&1 || true
+# M78 — THE RUN CLASS ADMITS EVERY CHARACTER THE TERMINATOR CLASS EXCLUDES (twenty-seventh cycle).
+#       `$` was in NEITHER class until 20h85, and `=`/`&`/`%` were covered by no vector at all: the
+#       twenty-fourth cycle's P2 named `! = & % $` as one class and only `!` was restored. Removing
+#       `%` from the run alternative puts it in neither class again — the endpoint can neither continue
+#       nor end a token — so the honest `..<HEAD>%3` is refused as unparseable. 20h85d's body.
+MUT="$(mk_mutant nopercentrun '|$|[0-9A-Za-z_/+=%$&@-]+) ]]; do' '|$|[0-9A-Za-z_/+=$&@-]+) ]]; do')"
+mut_check "M78 a name-legal punctuation run ('%') continues the token, so the honest range parses" 425462 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42546301" refused STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..HEAD%3 of it; no issues found."
 # (The M73 cell carries this guard's history: it was retired in the twenty-fifth cycle because a
 # descendant test measured NOTHING — the operand class could not see a ref name, so the row was really
 # measuring the commit-token scan that refuses a hex descendant. The twenty-sixth cycle fixed the class
