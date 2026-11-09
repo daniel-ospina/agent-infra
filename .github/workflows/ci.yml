@@ -422,7 +422,6 @@ jobs:
     timeout-minutes: 35
     steps:
       - uses: actions/checkout@v4
-        timeout-minutes: 10
         with:
           # #2818 — this gate judges the PR's OWN COMMIT, not the synthetic merge
           # GitHub checks out for `pull_request` (a merge result mixes the branch's
@@ -430,6 +429,11 @@ jobs:
           # moved). Depth 2 = the merge commit plus its two parents, i.e. the head
           # tree, without a full clone.
           fetch-depth: 2
+        # #2055 — the bound sits AFTER `with:` on purpose: arm (w2) of
+        # extensions/main-worktree-guard/test-sanctioned-pin-merge-base.mjs requires the checkout's
+        # `uses:` line to be followed immediately by its `with:` block, so a sibling key in between
+        # would red that suite for a reason unrelated to what it pins.
+        timeout-minutes: 10
       - uses: actions/setup-node@v4
         timeout-minutes: 10
         with:
