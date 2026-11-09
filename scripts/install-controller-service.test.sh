@@ -496,7 +496,9 @@ awk '/SERVICE MODE: this process IS the controller/{on=1}
 # The fixture controller records the environment it was given, then exits; §F replaces it per mode.
 B="$(arm_root b)"; mk_systemctl "$B/bin" "$B/state" "$B/sc.log"; mk_tmux "$B/bin" "$B/tmux.log"
 mk_quiet_bin "$B/bin" "$B/say.calls"   # ⛔ layer 2: `say` here RECORDS its argv, it never speaks (#2910)
-mkdir -p "$B/o/gh-limit"
+# A cell after #2039 ships BOTH gh layers, so the fixture must carry both — otherwise this arm takes the
+# fragment's adapter-absent branch and never exercises the order the shipped code actually builds.
+mkdir -p "$B/o/gh-limit" "$B/o/gh-rest"
 cat > "$B/harness/orch-loop.sh" <<STUB
 #!/bin/bash
 printf '%s|%s|%s|%s|%s\n' "\$HOME" "\$O" "\$SCOPE" "\$HARNESS_REPO" "\$PATH" > "$B/loop.env"
@@ -544,15 +546,20 @@ esac
 [ -f "$B/doctor.called" ] && ok '§B: the doctor loop is launched on the service path too (before the exec)' \
                           || bad '§B: service mode never launched the doctor loop — the cell would dispatch but never land (#1989)'
 # The environment the tmux session string used to re-establish by hand. HARNESS_REPO is the value that
-# matters most (a controller with no OR/HARNESS_REPO re-derives a different queue), and the gh-limit
-# layer is FIRST on PATH — #1988, which service mode dropped before this arm existed.
+# matters most (a controller with no OR/HARNESS_REPO re-derives a different queue), and the gh layers are
+# FIRST on PATH — the REST adapter AHEAD of the limit layer (#2039), which service mode dropped entirely
+# before this arm existed. ⛔ This arm used to assert `$O/gh-limit` leads, and it stayed green only because
+# the fixture created no `$O/gh-rest`: the shipped fragment prepends the adapter last so it resolves
+# first, so with a realistic `$O` the old expectation is the one a wrong order would satisfy. Both dirs
+# are present now, and the position of each is asserted.
 case "$(cat "$B/loop.env" 2>/dev/null)" in
-  "$B/home|$B/o|own|daniel-ospina/agent-infra|$B/o/gh-limit:"*)
-    ok '§B: HOME/O/SCOPE/HARNESS_REPO exported AND the gh-limit layer is first on PATH (#1988)' ;;
+  "$B/home|$B/o|own|daniel-ospina/agent-infra|$B/o/gh-rest:$B/o/gh-limit:"*)
+    ok '§B: HOME/O/SCOPE/HARNESS_REPO exported AND the REST adapter leads PATH with the gh-limit layer behind it (#2039 + #1988)' ;;
   *)  bad "§B: the environment was not exported by the fragment — $(cat "$B/loop.env" 2>/dev/null)" ;;
 esac
-# ...and a cell that legitimately ships no gh-limit layer must NOT gain a PATH entry that does not exist.
-rmdir "$B/o/gh-limit"
+# ...and a cell that legitimately ships NEITHER layer must not gain a PATH entry that does not exist.
+# BOTH dirs go, or the arm below would still see an `$O/gh-rest` and RED on the adapter's own prepend.
+rmdir "$B/o/gh-rest" "$B/o/gh-limit"
 # its own verdict: the second fragment RUN is a separate site (#2910), so it starts from an empty record
 : > "$B/say.calls"
 B2_OUT="$(bnd env ORCH_FOREGROUND=1 CELL_HOME="$B/home" HOME="$B/home" O="$B/o" REPO="$B/repo" \
@@ -561,7 +568,7 @@ B2_OUT="$(bnd env ORCH_FOREGROUND=1 CELL_HOME="$B/home" HOME="$B/home" O="$B/o" 
 [ -s "$B/say.calls" ] && bad "§B: the second fragment run REACHED a real say binary — $(cat "$B/say.calls") (#2910)" \
                       || ok '§B: and neither did the second fixture-less fragment run (#2910)'
 case "$(cat "$B/loop.env" 2>/dev/null)" in
-  *"|$B/bin:/usr/bin:/bin") ok '§B: no gh-limit layer, no PATH entry invented (the warning path stays honest)' ;;
+  *"|$B/bin:/usr/bin:/bin") ok '§B: no gh layer at all, no PATH entry invented (the warning path stays honest)' ;;
   *) bad "§B: PATH was rewritten for a layer that does not exist — $(cat "$B/loop.env" 2>/dev/null) — $B2_OUT" ;;
 esac
 

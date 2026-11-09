@@ -138,14 +138,22 @@ cp -p "$H"/*.sh "$O"/ || die "seed failed"
 # ⛔ STAGE-THEN-RENAME. Both files are EXECUTED by every gh call on the live cell, and a plain `cp`
 # truncates before it writes — a call in that window would run `python3` on half a file. The
 # supervisor seeds the same pair this way for the same reason.
+# ⛔ AND THE HELPER IS DEFINED **OUTSIDE** THE BRANCH — review finding, P2, and it was a real hole: as
+# written below inside the `if`, bash defines the function only when its command RUNS, so a harness
+# that ships `gh-rest/gh` while the limit PAIR is missing (a state `install.sh:806-821` calls
+# legitimate and survivable — the adapter fails open with a warning) reached the adapter block with
+# `_seed_one: command not found`; `set -uo pipefail` has no `-e`, so the deploy did not die, printed
+# "seeded the gh REST adapter" over an EMPTY `$O/gh-rest`, and started the controller with a
+# non-existent dir leading its PATH — i.e. the #2039 defect this seed exists to remove, plus a false
+# success line over it (#2041's shape). Same hoist as `cloud-cell-supervisor.sh:2390`.
+_seed_one() {  # <src> <dest>
+  local _src="$1" _dst="$2" _tmp="$O/.seed-$(basename "$2").$$"
+  cp -p "$_src" "$_tmp" || { rm -f "$_tmp"; die "cannot stage $(basename "$_dst") into $O"; }
+  chmod +x "$_tmp"      || { rm -f "$_tmp"; die "cannot chmod $(basename "$_dst")"; }
+  mv -f "$_tmp" "$_dst" || { rm -f "$_tmp"; die "cannot install $_dst"; }
+}
 if [ -f "$H/gh-limit/gh" ] && [ -f "$H/gh-limit.py" ]; then
   mkdir -p "$O/gh-limit" || die "cannot create $O/gh-limit"
-  _seed_one() {  # <src> <dest>
-    local _src="$1" _dst="$2" _tmp="$O/.seed-$(basename "$2").$$"
-    cp -p "$_src" "$_tmp" || { rm -f "$_tmp"; die "cannot stage $(basename "$_dst") into $O"; }
-    chmod +x "$_tmp"      || { rm -f "$_tmp"; die "cannot chmod $(basename "$_dst")"; }
-    mv -f "$_tmp" "$_dst" || { rm -f "$_tmp"; die "cannot install $_dst"; }
-  }
   _seed_one "$H/gh-limit/gh" "$O/gh-limit/gh"
   _seed_one "$H/gh-limit.py" "$O/gh-limit.py"
   log_line "seeded the gh-limit layer (serialised gh; path=$O/gh-limit)"
@@ -163,6 +171,33 @@ else
   log_line "WARN: this harness ships no gh-limit layer — gh calls on this cell will NOT be serialised (#1988)"
 fi
 log_line "seeded $O with $(ls "$O"/*.sh | wc -l | tr -d ' ') scripts (claims.sh present)"
+# ── the gh REST adapter (#2039) ──────────────────────────────────────────────
+# ⛔ THE SAME PAIR THE LIMIT LAYER IS: an adapter without it is unbacked-off, and the LIMIT LAYER
+# WITHOUT THE ADAPTER is what this box had — the per-candidate pre-flight stays on GraphQL, so a
+# GraphQL exhaustion ABORTs the refresh and the cell dispatches nothing (measured 2026-10-18 on
+# `pi-cell-2`, REST at 1952/5000). This script is a THIRD cell install path (besides
+# `cloud-cell-supervisor.sh start` and `install.sh`), so it carries the same seed and the same
+# mirror rule; `cloud-cell-supervisor.test.sh` sweeps every installer for the pair rather than
+# naming them, so a fourth cannot be forgotten.
+if [ -f "$H/gh-rest/gh" ]; then
+  mkdir -p "$O/gh-rest" || die "cannot create $O/gh-rest"
+  _seed_one "$H/gh-rest/gh" "$O/gh-rest/gh"
+  # ⛔ THE LIMIT CLAUSE IS CONDITIONAL (review finding, same block): on the path where the `gh-limit`
+  # `else` above just REMOVED `$O/gh-limit.py`, "its limit layer is $O/gh-limit.py" was a false
+  # sentence in the one log an operator has. Same shape as `cloud-cell-supervisor.sh`'s check line.
+  if [ -f "$O/gh-limit.py" ]; then
+    log_line "seeded the gh REST adapter (path=$O/gh-rest; its limit layer is $O/gh-limit.py)"
+  else
+    log_line "seeded the gh REST adapter (path=$O/gh-rest) — but $O/gh-limit.py is ABSENT, so its calls are NOT serialised or backed off (#1988)"
+  fi
+else
+  if [ -e "$O/gh-rest/gh" ]; then
+    rm -f "$O/gh-rest/gh" || die "cannot remove the stale gh-rest adapter from $O"
+    rmdir "$O/gh-rest" 2>/dev/null || true
+    log_line "seed: removed the stale gh-rest adapter — this harness no longer ships it"
+  fi
+  log_line "WARN: this harness ships no gh-rest adapter — the pre-flight stays on GraphQL, so a GraphQL exhaustion stops dispatch (#2039)"
+fi
 
 # ── 4. restart the controller, cold, with HOME carried into tmux ──────────────
 # ⛔ `unset GH_REPO` AFTER `set +a` (#2235). `keys.env` is re-sourced INSIDE the session, so a
@@ -175,7 +210,7 @@ log_line "seeded $O with $(ls "$O"/*.sh | wc -l | tr -d ' ') scripts (claims.sh 
 log_line "starting controller: OR=$OR REPO=$REPO SCOPE=$SCOPE MAX_LANES=$MAX_LANES"
 tmux new-session -d -s orch -c "$H" \
   "set -a; [ ! -f '$CELL_HOME/keys.env' ] || . '$CELL_HOME/keys.env'; set +a; unset GH_REPO; \
-   PATH='$O/gh-limit':\"\$PATH\" \
+   PATH='$O/gh-rest':'$O/gh-limit':\"\$PATH\" \
    HOME='$CELL_HOME' REPO='$REPO' O='$O' OR='$OR' SCOPE='$SCOPE' MAX_LANES='$MAX_LANES' \
    bash '$H/orch-loop.sh' 2>&1 | tee -a '$O/logs/controller.log'"
 sleep 8
