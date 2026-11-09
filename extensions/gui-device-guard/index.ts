@@ -758,7 +758,8 @@ function shellExecutesStdin(rawToks: string[]): boolean {
     const at = Math.max(text.lastIndexOf("$("), text.lastIndexOf("<("), text.lastIndexOf("`"));
     if (at < 0) return false;
     const inner = text[at] === "`" ? text.slice(at + 1) : text.slice(at + 2);
-    const next = stripRedirections(tokenize(inner)).map(stripTrailingMetachars);
+    const innerQuoted: boolean[][] = [];
+    const next = stripRedirections(tokenize(inner, innerQuoted), innerQuoted).map(stripTrailingMetachars);
     if (next.length === 0) return false;
     toks = next;
   }
@@ -802,7 +803,10 @@ function lineFeedsShell(line: string, cut: number, offset: number): boolean {
   // read the redirect as the command word, said "not a shell", and blanked the body
   // as data — losing the block AND the ledger row, one fix away from the main pass
   // that already strips redirections.
-  const words = (text: string) => stripRedirections(tokenize(text));
+  const words = (text: string) => {
+    const quoted: boolean[][] = [];
+    return stripRedirections(tokenize(text, quoted), quoted);
+  };
   if (shellExecutesStdin(words(segs[at].text))) return true;
   for (let k = at; k + 1 < segs.length; k++) {
     if (!segs[k].pipeToNext) return false;
@@ -1142,42 +1146,61 @@ export function stripHeredocBodies(command: string): string {
 }
 
 /** Whitespace split that honours `'…'`, `"…"` and backslash escapes. */
-export function tokenize(segment: string): string[] {
+export function tokenize(segment: string, quotedOut?: boolean[][]): string[] {
   const toks: string[] = [];
   let cur = "";
   let quote: string | null = null;
   let has = false;
+  // Per CHARACTER, not per token: `stripRedirections` must judge the operator character
+  // itself. A `<`/`>` inside QUOTED text is DATA — `bash -c "cat <<-EOF …"` is ONE
+  // token and truncating it at the `<` threw the whole program away (round-12 review,
+  // fifteenth pass, P0) — while `bash<<'EOF'` is an unquoted operator followed by a
+  // quoted delimiter, and its `<` must still be read as a redirect (L35a). A per-token
+  // flag cannot tell those apart; a per-character one can.
+  let flags: boolean[] = [];
+  const emit = () => {
+    toks.push(cur);
+    quotedOut?.push(flags);
+    cur = "";
+    has = false;
+    flags = [];
+  };
   for (let i = 0; i < segment.length; i++) {
     const ch = segment[i];
     if (quote !== null) {
-      if (ch === quote) quote = null;
-      else if (quote === '"' && ch === "\\" && i + 1 < segment.length) cur += segment[++i];
-      else cur += ch;
+      if (ch === quote) {
+        quote = null;
+        continue;
+      }
+      if (quote === '"' && ch === "\\" && i + 1 < segment.length) {
+        cur += segment[++i];
+        flags.push(true);
+      } else {
+        cur += ch;
+        flags.push(true);
+      }
       has = true;
       continue;
     }
     if (ch === "'" || ch === '"') {
       quote = ch;
-      has = true;
       continue;
     }
     if (ch === "\\" && i + 1 < segment.length) {
       cur += segment[++i];
+      flags.push(true);
       has = true;
       continue;
     }
     if (/\s/.test(ch)) {
-      if (has) {
-        toks.push(cur);
-        cur = "";
-        has = false;
-      }
+      if (has) emit();
       continue;
     }
     cur += ch;
+    flags.push(false);
     has = true;
   }
-  if (has) toks.push(cur);
+  if (has) emit();
   return toks;
 }
 
@@ -1591,19 +1614,32 @@ function attachedShortArg(tok: string, letter: string): string | null {
  * `>` is treated as an operator here — the same accepted trade `stripTrailingMetachars`
  * makes.)
  */
-function stripRedirections(toks: string[]): string[] {
+function stripRedirections(toks: string[], quoted?: boolean[][]): string[] {
   const out: string[] = [];
   for (let i = 0; i < toks.length; i++) {
     const tok = toks[i];
+    const chars = quoted?.[i];
     // A token that IS a redirection (`>`, `2>`, `>>f`, `2>&1`, `&>f`, `<<EOF`): bash
     // never passes it as a word. With no target attached, the target is the NEXT word.
     const lead = /^(?:\d{1,2})?(?:&>>|&>|>{1,3}|<{1,3}|>\||&)(.*)$/.exec(tok);
+    if (lead && chars?.[lead[0].length - lead[1].length - 1] === true) {
+      out.push(tok); // a QUOTED operator is data
+      continue;
+    }
     if (lead) {
       if (lead[1] === "") i++;
       continue;
     }
-    // A redirect glued to the END of an ordinary word ends the word at the operator.
+    // A redirect glued to the END of an ordinary word ends the word at the operator —
+    // but a `<`/`>` that came from QUOTED text is DATA, not a redirect. `bash -c "cat
+    // <<-EOF …"` is ONE token; truncating it at the `<` left the recursion `cat `, which
+    // re-read nothing and could not see the launch after the terminator (measured:
+    // bash runs it, the guard returned [] — round-12 review, fifteenth pass, P0).
     const at = tok.search(/[<>]/);
+    if (at > 0 && chars?.[at] === true) {
+      out.push(tok); // the operator character came from QUOTED text: DATA, not a redirect
+      continue;
+    }
     if (at > 0) {
       out.push(tok.slice(0, at));
       continue;
@@ -2015,8 +2051,13 @@ export function classifyLaunchCommand(command: string, depth = 0): LaunchFinding
     // Order matters: redirections are removed from the RAW tokens (a bare `>` must
     // not be emptied first), then a trailing metacharacter is stripped, so
     // `(open X.app)` and `--headed>log` are both reduced to the word bash runs.
+    // The quoting flags travel WITH the token list so a `<`/`>` inside a quoted
+    // command string is read as data, not as a redirect (fifteenth pass, P0).
+    const quotedTok: boolean[][] = [];
+    const rawToks = tokenize(segment, quotedTok);
     const toks = stripRedirections(
-      tokenize(segment).map((t) => t.replace(/^[({]+/, "")),
+      rawToks.map((t) => t.replace(/^[({]+/, "")),
+      quotedTok,
     ).map(stripTrailingMetachars);
     if (toks.length === 0) continue;
     const flags: { sawFlag?: boolean; payloadStart?: number } = {};

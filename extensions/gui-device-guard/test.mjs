@@ -741,7 +741,7 @@ const ROWS = [
   //        MIDDLE of it survives — `EO\` + tab + `F` assembles to `EO<TAB>F`, not the
   //        terminator, so the document runs to end-of-input and the launch is data
   //        (measured: `cat` prints `EO<TAB>F`).
-  ["A81 the ALLOW twin: `<<-` does not strip a continuation line's tab, so `EO\`+tab+`F` is no terminator",
+  ["A81 the ALLOW twin: a continuation tab that lands MID-line survives the `<<-` strip, so `EO\`+tab+`F` ends nothing",
     "cat <<-EOF\n\tbody\n\tEO\\\n\tF\nnpm exec electron .", 0, null, false],
   //   A82: the backslash COLLAPSE is body-only — the terminator is compared BEFORE it,
   //        so a body line `A\$B` does not terminate `<<A$B` (measured).
@@ -754,6 +754,15 @@ const ROWS = [
   //        swallowed the launch as data: no block, no row.
   ["L61 `<<-` strips the leading tabs of the ASSEMBLED terminator line (`\\` + tab + `EOF`) (was [])",
     "cat <<-EOF\n\tbody\n\\\n\tEOF\nnpm exec electron .", 1, "electron", true],
+  //   L62: a wrapper's command-string argument is ONE token, and stripping redirections
+  //        from it cut the token at its first `<`/`>` — so `bash -c "cat <<-EOF …"`
+  //        reached the recursion as `cat `, the heredoc was never scanned, and a launch
+  //        bash RUNS was allowed with no row (measured). A `<`/`>` that came from QUOTED
+  //        text is data, so the operator CHARACTER now decides, not the token.
+  ["L62 a `<` inside a wrapper's QUOTED command string is data, not a redirect (was [])",
+    "bash -c \"cat <<-EOF\n\tbody\n\\\n\tEOF\nnpm exec electron .\"", 1, "electron", true],
+  ["A84 the ALLOW twin: …so the same command string with a benign tail stays clean",
+    "bash -c \"cat <<EOF\nbody\nEOF\nls\"", 0, null, false],
   //   A83: the twin that keeps the strip honest — a SPACE before the continuation's tab
   //        means the tab is not LEADING, so the terminator is not recognised and the
   //        document runs to end-of-input (measured: `cat` prints ` \tEOF`).
