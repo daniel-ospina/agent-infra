@@ -1689,6 +1689,16 @@ ck "LANE_TIMEOUT=0 with NO LANE_BACKSTOP_S is UNBOUNDED supervision: the 1000th 
    $([ "$RC" = 11 ] && [ "$(verdict_of 51 | cut -d' ' -f1)" = WAITING_CHAIN_ABSENT ] && echo 0 || echo 1)
 ck "the LANE_TIMEOUT=0 disclosure NAMES what the supervision axis got, instead of claiming a finite count it does not have" \
    $(grep -q 'the --watch supervision allowance is NOT derived' "$SCRIPT" && grep -q 'UNBOUNDED (there is no counter to spend)' "$SCRIPT" && echo 0 || echo 1)
+# ⛔ AND IT MUST NOT STATE A NUMBER THE CODE WILL NOT USE (review cycle 14, observation 2 — measured:
+# `LANE_BACKSTOP_S=3600 LANE_MERGE_MAX_WATCH=2` printed "a FINITE 29 chunk(s)" while the real allowance was 2).
+# The plain path reaches this line; a `--watch` call returns inside its chunk loop before it.
+new_o "$T/pr4.tsv"
+OUT="$(REPO_PATH="${REPO_PATH:-$RUN_REPO}" PATH="$BIN:$PATH" GH_LOG="$T/gh.log" O="$OT" HOME="$T/home" \
+      LANE_MERGE_INTERVAL=5 LANE_MERGE_WAIT=6 LANE_MERGE_POLL=5 \
+      LANE_TIMEOUT=0 LANE_BACKSTOP_S=3600 LANE_MERGE_MAX_WATCH=2 \
+      bash "$SCRIPT" 52 --repo o/r --pr-tsv "$T/pr4.tsv" --checks-tsv "$T/checks-inflight.tsv" 2>&1)"; RC=$?
+ck "the LANE_TIMEOUT=0 line reports the PINNED allowance (2 chunks) rather than the backstop's 29, so it never states a number the re-derivation will not use" \
+   $(grep -q 'a FINITE 2 chunk(s), because LANE_MERGE_MAX_WATCH pins it' <<<"$OUT" && ! grep -q 'a FINITE 29 chunk(s)' <<<"$OUT" && echo 0 || echo 1)
 
 # ⛔ THE RE-INVOCATION PATH (review round 3, P2 — verified): the documented resume omits `--issue` and
 # recovers it from `$O/state/lanemerge-<pr>.issue`. Resolving the heartbeat target BEFORE that recovery

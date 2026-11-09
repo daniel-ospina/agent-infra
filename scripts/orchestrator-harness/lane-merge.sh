@@ -416,7 +416,7 @@ MAX_WATCH="$MAX_WATCH_FIT"
 # worst case's 7 chunks (840 s) while thousands of seconds still stood on its clock. And 840 s is BELOW the
 # chain this loop supervises: `merge-one.sh` budgets a fresh-context review at `REVIEW_TIMEOUT` = 1800 s and
 # leases the PR claim for `REVIEW_TIMEOUT + _gw + 300` = 3000 s at the defaults (`claims.sh:166`), and
-# `chain-merge.sh`'s merge-phase wait is 1890 s (`claims.sh:107`). A lane that finally cleared the wait
+# `chain-merge.sh`'s merge-phase wait is 1890 s (`claims.sh:110`). A lane that finally cleared the wait
 # could therefore hand off a FALSE blocker — `BLOCKED_ATTEMPTS … the chain was STILL RUNNING` — over a
 # chain that was legitimately still reviewing, and `WATCH_F` is only rewound by a fix round or a head move,
 # so every later `--watch` re-entered the same arm.
@@ -1629,7 +1629,14 @@ if [ "$LANE_WALL_S" -eq 0 ]; then
   if is_limit "${LANE_BACKSTOP_S:-}" && [ "${LANE_BACKSTOP_S:-0}" -gt 0 ]; then
     _watch_basis_note="lane-bound.sh's own backstop (LANE_BACKSTOP_S=${LANE_BACKSTOP_S}s), because the wall axis (LANE_TIMEOUT) is OFF"
     _backstop_chunks=$(( (LANE_BACKSTOP_S - _hb_margin) / _fit_poll )); [ "$_backstop_chunks" -ge 1 ] || _backstop_chunks=1
-    _watch_supervision_note="a FINITE ${_backstop_chunks} chunk(s) derived from it, further capped by the watchdog allowance when that is smaller"
+    # ⛔ A PINNED `LANE_MERGE_MAX_WATCH` OVERRIDES THIS NUMBER (review cycle 14, observation 2 — measured:
+    # `LANE_BACKSTOP_S=3600 LANE_MERGE_MAX_WATCH=2` printed "a FINITE 29 chunk(s)" while the real allowance
+    # was 2). An operator line that states a number the code will not use is the class this branch fixes.
+    if is_limit "${LANE_MERGE_MAX_WATCH:-}"; then
+      _watch_supervision_note="a FINITE ${LANE_MERGE_MAX_WATCH} chunk(s), because LANE_MERGE_MAX_WATCH pins it (the backstop would allow ${_backstop_chunks})"
+    else
+      _watch_supervision_note="a FINITE ${_backstop_chunks} chunk(s) derived from it, further capped by the watchdog allowance when that is smaller"
+    fi
   else
     _watch_basis_note="no clock at all, because the wall axis is OFF (LANE_TIMEOUT=0) and no LANE_BACKSTOP_S is exported"
     _watch_supervision_note="UNBOUNDED (there is no counter to spend)"

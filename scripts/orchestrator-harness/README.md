@@ -2170,11 +2170,12 @@ the reserve hands off (`WAITING_CHECKS`, exit 11) and the next invocation resume
 wait, out of whatever clock is left, so a lane whose checks settled early received the *worst case's*
 seven chunks while thousands of seconds still stood. Meanwhile the chain being supervised declares
 `REVIEW_TIMEOUT` = **1800 s** for its reviewer and a PR-claim lease of `REVIEW_TIMEOUT + _gw + 300` =
-**3000 s** (`claims.sh:166`, `chain-merge.sh`'s merge-phase wait 1890 s at `claims.sh:107`) — so 840 s
+**3000 s** (`claims.sh:166`, `chain-merge.sh`'s merge-phase wait 1890 s at `claims.sh:110`) — so 840 s
 could not cover a chain that was merely still reviewing, and the hand-off then posted a FALSE blocker
 (`BLOCKED_ATTEMPTS … the chain was STILL RUNNING`) that `WATCH_F` did not rewind, so every later `--watch`
 re-entered it. `MAX_WATCH` is therefore re-derived in the `--watch` path from the clock actually left —
-`(LANE_WALL_S − elapsed − one chunk) / POLL`, never below the 7-chunk design floor, never beyond the
+`(LANE_WALL_S − elapsed − one chunk) / POLL`, never below the design floor (`MAX_WATCH_FIT`, 7 chunks at the
+shipped defaults and 1 when the wall axis is off), never beyond the
 watchdog's `IDLE_S` allowance (that bound WINS when it is smaller: a labelled hand-off beats an unlabelled
 kill), and skipped when `LANE_MERGE_MAX_WATCH` is pinned. A controller re-run has no lane clock, resolves
 nothing, and keeps exactly the 7 shipped chunks.
