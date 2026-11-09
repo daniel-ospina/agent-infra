@@ -2384,7 +2384,8 @@ esac
 REQUIRED_READS=" state_write:role state_write:rc state_write_rehearsal:role state_write_rehearsal:own \
  lock_claim:d lock_claim:tmp reclaim_lock:d role_lock:role role_unlock:d bounded:s run_bounded:s \
  pid_ident:pid human_above:pid attestation_clean:pr attestation_clean:head \
- controller_heartbeat_verdict:who role_row:role role_row:bound run_role_pass:role "
+ controller_heartbeat_verdict:who role_row:role role_row:bound run_role_pass:role \
+ require_repo:role "
 # ⛔ EVERY ENTRY MUST NAME ITS FUNCTION. A bare `role`/`s`/`d` entry would restore the name-keyed
 # grandfathering this list was re-keyed to remove, and it would do it silently. The pattern is
 # `*:*` (HAS a colon) — the first version tested `*:*:*`, i.e. TWO colons, which no real entry has,
