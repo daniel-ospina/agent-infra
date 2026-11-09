@@ -3128,11 +3128,19 @@ cmd_check() {
     if [ ! -f "$O/gh-rest/gh" ]; then
       die "the pinned harness ships gh-rest/gh but $O/gh-rest/gh is MISSING — the per-candidate pre-flight would stay on GraphQL, so a GraphQL exhaustion stops dispatch entirely while this cell reports RUNNING (#2039). Run '$0 start' (and 'apply' first if the pin is behind) to seed it."
     fi
-    # Same probe shape as the gh-limit layer above, and for the same reason: presence is not enough,
-    # because an adapter that cannot resolve the real gh exits 127 on EVERY call. `NO_WAIT` keeps the
-    # diagnostic from waiting on the layer's lock (the adapter routes through the same helper).
-    PATH="$O/gh-rest:$PATH" GH_LIMIT_NO_WAIT=1 GH_LIMIT_NO_WAIT_LOCK_S=2 gh --version >/dev/null 2>&1 \
-      || die "the gh REST adapter at $O/gh-rest/gh cannot run gh — every gh call in the session would fail, and the pre-flight would fall back to GraphQL (#2039). Fix the adapter (or remove it) before starting."
+    # ⛔ A REGULAR FILE IS NOT A RUNNABLE ONE, AND PATH HIDES THE DIFFERENCE (fresh review, P2, measured).
+    # The kernel SKIPS a candidate it cannot execute and CONTINUES the search, so with a mode-`-x`
+    # `$O/gh-rest/gh` a `PATH="$O/gh-rest:$PATH" gh --version` answered from `$O/gh-limit/gh` (or the real
+    # binary) and `check` certified a box whose pre-flight was back on GraphQL — a false PASS on the one
+    # surface this change exists to make truthful. So the MODE is required (and named), and the adapter is
+    # then executed BY PATH rather than through a PATH lookup that can silently resolve elsewhere.
+    [ -x "$O/gh-rest/gh" ] \
+      || die "the gh REST adapter at $O/gh-rest/gh is PRESENT but NOT EXECUTABLE — the shell SKIPS it and resolves gh to $O/gh-limit/gh or the real binary, so the pre-flight is back on GraphQL while this box would report the adapter (#2039). Remedy: chmod +x it, or re-seed from the pin with '$0 start'."
+    # ⛔ EXECUTED BY PATH, not via `PATH=… gh`. `GH_LIMIT_NO_WAIT` keeps the diagnostic from waiting on the
+    # layer's lock (the adapter routes through the same helper); an adapter that cannot resolve the real
+    # gh exits 127 on every call, which is worse than an absent one.
+    GH_LIMIT_NO_WAIT=1 GH_LIMIT_NO_WAIT_LOCK_S=2 "$O/gh-rest/gh" --version >/dev/null 2>&1 \
+      || die "the gh REST adapter at $O/gh-rest/gh cannot run gh — every gh call in the session would fail, and the pre-flight would fall back to GraphQL (#2039). Remedy: '$0 start' re-seeds it from the pinned harness and '$0 apply' first if the pin is behind — removing it while the harness still ships it only moves this refusal one line up."
     # ⛔ SAID OUT LOUD ON THE GREEN PATH TOO (#2039, and #2041's measured complaint: the deploy announced
     # "convergence COMPLETE" over a missing layer). The operator's question is not only "did check pass"
     # but "IS this box's gh the adapter, and does it have a limit layer beside it" — the same one-answer

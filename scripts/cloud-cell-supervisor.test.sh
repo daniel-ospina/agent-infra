@@ -5768,6 +5768,18 @@ case "$QT_OUT" in
   *"cannot run gh"*) ok "…naming 'cannot run gh' rather than a generic refusal" ;;
   *) bad "the unrunnable-adapter refusal is not named: $(printf '%s' "$QT_OUT" | tail -3 | tr '\n' ' ')" ;;
 esac
+# ⛔ THE MODE MUTANT IS A DIFFERENT STATE AND PATH HIDES IT (fresh review, P2, measured): the kernel
+# SKIPS a candidate it cannot execute and continues the search, so a mode-`-x` adapter answered from
+# `$O/gh-limit/gh` and `check` certified a GraphQL-only box. Executable-but-127 is NOT that state.
+chmod -x "$QT/o/gh-rest/gh"
+g2039 check
+[ "$QT_RC" -ne 0 ] && ok "check REFUSES an adapter that is PRESENT but NOT EXECUTABLE (PATH skips it and answers from the limit layer)" \
+                   || bad "check certified a non-executable adapter — gh resolves PAST it, so the pre-flight is back on GraphQL while this box reports the adapter"
+case "$QT_OUT" in
+  *"NOT EXECUTABLE"*) ok "…naming the mode, so the operator is not sent to debug the adapter's own logic" ;;
+  *) bad "the non-executable refusal is not named: $(printf '%s' "$QT_OUT" | tail -3 | tr '\n' ' ')" ;;
+esac
+chmod +x "$QT/o/gh-rest/gh"
 g2039 apply >/dev/null 2>&1
 g2039 check
 [ "$QT_RC" -eq 0 ] && ok "a re-apply clears it (the refusal is about the file, not a latched flag)" \
@@ -5790,11 +5802,16 @@ case "$QSESS" in
   *"PATH='$QT/o/gh-limit'"*) bad "the controller PATH still starts with the LIMIT layer — the adapter is never resolved (REST wins nothing)" ;;
   *) bad "the controller PATH carries neither seeded shim: $(printf '%s' "$QSESS" | cut -c1-300)" ;;
 esac
-QP_R="$(printf '%s' "$QSESS" | grep -bo 'gh-rest' | head -1 | cut -d: -f1)"
-QP_L="$(printf '%s' "$QSESS" | grep -bo 'gh-limit' | head -1 | cut -d: -f1)"
+# ⛔ THE TOKENS ARE THE PATH ENTRIES, NOT THE DIRECTORY NAME (fresh review, measured: this row was
+# vacuous). `grep -bo 'gh-rest'` matched the FIXTURE's own directory name FIRST — `$QT` is
+# `<tmp>/gh-rest-2039`, interpolated into `ENV_FILE='…/keys.env'` at the head of the session string — so
+# the offset came from the fixture path and the row stayed green under the swap mutant AND on the
+# pre-fix code. `$QT/o/gh-rest` occurs only inside the PATH assignment, so its offset is the answer.
+QP_R="$(printf '%s' "$QSESS" | grep -bo -- "$QT/o/gh-rest" | head -1 | cut -d: -f1)"
+QP_L="$(printf '%s' "$QSESS" | grep -bo -- "$QT/o/gh-limit" | head -1 | cut -d: -f1)"
 [ -n "$QP_R" ] && [ -n "$QP_L" ] && [ "$QP_R" -lt "$QP_L" ] \
-  && ok "…by POSITION in the string, not merely by presence (rest before limit)" \
-  || bad "gh-rest does not precede gh-limit in the session command (rest=${QP_R:-absent} limit=${QP_L:-absent})"
+  && ok "…by POSITION in the PATH assignment, not merely by presence (rest before limit)" \
+  || bad "the adapter does not precede the limit layer in the session PATH (rest=${QP_R:-absent} limit=${QP_L:-absent})"
 
 # (f) THE SERVICE-MODE PATH (#2402): there is no session string there, so the export in the foreground
 #     branch is the ONLY thing that gives a service-managed controller the adapter — and this box is one.
@@ -5882,10 +5899,20 @@ for _d in "$HERE" "$HERE/orchestrator-harness"; do
   for _f in "$_d"/*; do
     case "$_f" in *.sh) ;; *) continue ;; esac
     case "$(basename "$_f")" in *.test.sh) continue ;; esac   # fixtures are not install paths
-    # A real INSTALL of the helper into a state dir (cp/mv/seed_one), not a mention in a comment.
-    grep -qE '(cp|mv|seed_one|_seed_one)[^|]*gh-limit\.py' "$_f" 2>/dev/null || continue
+    # A real INSTALL of the helper into a state dir (cp/mv/seed_one), not a mention in a COMMENT — the
+    # review noted the regexes matched prose as readily as code, so the comment lines are stripped first
+    # (the `-ge 3` floor was doing the honesty work; this makes the match itself mean "an install").
+    # ⛔ HERE-STRINGS, NEVER A PIPE (#841, enforced by scripts/check-no-sigpipe-grep.sh). This suite runs
+    # `set -o pipefail` (:35), so `printf '%s\n' "$_body" | grep -qE …` takes SIGPIPE (141) whenever the
+    # match is EARLY and the body exceeds the ~64 KiB pipe buffer — and pipefail reports the WRITER's 141,
+    # so a line that matched reads as a line that did not. Measured on this very sweep before the fix:
+    # `install.sh` is >64 KiB, its `cp … gh-limit.py` matched and the pipeline still returned non-zero, so
+    # `|| continue` DROPPED it — the sweep reported 2 seeders and blamed `install.sh` for not seeding the
+    # adapter, i.e. the parity arm failed OPEN in the direction that reads as a real divergence.
+    _body="$(grep -vE '^[[:space:]]*#' "$_f" 2>/dev/null)"
+    grep -qE '(cp|mv|seed_one|_seed_one)[^|]*gh-limit\.py' <<<"$_body" || continue
     QSEEDERS=$((QSEEDERS + 1))
-    grep -qE '(cp|mv|seed_one|_seed_one)[^|]*gh-rest/gh' "$_f" 2>/dev/null \
+    grep -qE '(cp|mv|seed_one|_seed_one)[^|]*gh-rest/gh' <<<"$_body" \
       || QSEEDERS_BAD="$QSEEDERS_BAD $(basename "$_f")"
   done
 done
