@@ -5288,7 +5288,7 @@ def test_the_cascade_fix_arm_names_the_class_it_is_reporting(monkeypatch):
     assert "fix->" not in casc[0], casc[0]
 
 
-def test_the_cascade_no_slot_arm_names_the_BINDING_constraint(monkeypatch):
+def test_the_cascade_no_slot_arm_names_the_BINDING_constraint(monkeypatch, tmp_path):
     """A NO SLOT arm must name the term that is actually 0, not a hardcoded class.
 
     ⛔ THE MEASURED DEFECT (review P2, round 4): both arms printed `"<class> budget 0"`, but the
@@ -5302,8 +5302,17 @@ def test_the_cascade_no_slot_arm_names_the_BINDING_constraint(monkeypatch):
     AGGREGATE ceiling when that is the binding term, and the CLASS when the class is 0. Both
     directions are pinned here so neither can be satisfied by a string that fits one of them.
     """
-    # (a) the aggregate ceiling binds while the class budget is healthy -> name the ceiling.
-    monkeypatch.setenv("MAX_FIX", "3")
+    # ⛔ ISOLATE THE STATE DIR FIRST (agent-infra#3813 — measured on main at 871e455, and again on a
+    # fleet box). `pass_budgets()` decides whether a row still HOLDS its slot from
+    # `_worker_state()`, which answers from `$ORCH_DIR/bg/*.pid` — and `_worker_pid_files()` matches a
+    # repo-scoped pid file by its TRAILING NUMBER, deliberately, so a row naming `w0`/`r3` matches any
+    # live `bg/*-0.pid`/`*-3.pid`. On a real box that directory holds >1000 pid files, so 9 of the 13
+    # fixture rows below read `gone`, their slots were RELEASED, and the "genuinely saturated fleet"
+    # fixture was not saturated: this test's verdict depended on the HOST's live state dir instead of
+    # on the code under test, and `ci / test` went red for every PR on the repo for it.
+    # An EMPTY dir makes every row `unknown` ⇒ held, which is exactly what "every slot held" means.
+    monkeypatch.setattr(pr, "ORCH_DIR", str(tmp_path))
+
     monkeypatch.setenv("MAX_REVIEW", "3")
     _rc, joined, _payload = _drive_pass(
         monkeypatch, [_pr(62)], ("record-review", "why", []),
