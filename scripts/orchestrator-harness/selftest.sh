@@ -5307,9 +5307,12 @@ ck "§6g: NO launchd call in this run addressed a production label (loop AND wat
 # go away together": a released lock may only ever be observed as the process is leaving.
 sed -n '/^# single-instance lock/,/^trap .orc_singleton_release .*EXIT$/p' "$LOOP" > "$TMP/lockblock.sh"
 if need "$TMP/lockblock.sh" "the lock+trap block is extracted from the shipped orch-loop.sh"; then
-  # ⛔ A RANGE THAT STOPPED MATCHING ITS END WOULD RUN TO EOF AND STILL "EXIST" — so the block is
-  # asserted by CONTENT, not by presence. Both halves must be there: the decision (the module call)
-  # and the trap. Rewriting the lock path without either is the state this gate exists to notice.
+  # ⛔ ASSERTED BY CONTENT, NOT BY PRESENCE. Both halves must be there: the decision (the module
+  # call) and the trap. ⛔ AND BE PRECISE ABOUT WHAT THIS CATCHES (fresh-context review of #3846): it
+  # catches a START anchor that moved (an empty or decision-less extraction), NOT an END anchor that
+  # stopped matching — a range that runs to EOF still contains both names. The end anchor is pinned by
+  # the `trap .orc_singleton_release` pattern itself and by the driver's own `bash -n`; what this arm
+  # buys is that the two lines this PR wired are still the lines being extracted.
   if grep -q 'orc_singleton_acquire' "$TMP/lockblock.sh" && grep -q 'orc_singleton_release' "$TMP/lockblock.sh"; then rc=0; else
     rc=1; echo "      the extracted block is not the shipped lock+trap pair (its end marker moved)"; fi
   ck "the lock block is extracted WITH its decision and its trap (not a run to EOF)" $rc

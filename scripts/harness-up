@@ -1410,17 +1410,23 @@ hu_row_exec() {
 
 # hp_launchd_dead_text <label> — NAME the state of a loaded job that has NO process.
 #
-# ⛔ FOUR FACTS, FOUR REMEDIES — and the exit CODE is what separates the first two:
-#   EXITED-CLEAN      last exit = 0. NOT a crash: the job ran and returned success. Reachable on
-#                     THIS job whenever a second controller holds the lock — `orch-loop.sh`'s
-#                     `acq()` failure path prints "already running" and `exit 0` — and because
+# ⛔ FIVE FACTS, FIVE REMEDIES — and the exit CODE is what separates them:
+#   EXITED-CLEAN      last exit = 0. NOT a crash: the job ran and returned success. Because
 #                     KeepAlive keeps relaunching, the row would otherwise read "every attempt is
-#                     failing" about a job that is exiting IMMEDIATELY and cleanly. It also points
-#                     at `launchd.out`, where that message actually goes (`echo`, not stderr).
-#   DIED              a NON-ZERO exit status: launchd retries it on its ThrottleInterval, so a job
-#                     that STAYS here is failing on every attempt. The launch count is printed as
-#                     EVIDENCE of how many times it has been started since load — never as proof
-#                     that the failure is persistent (see the note on `runs` above).
+#                     failing" about a job that is exiting IMMEDIATELY and cleanly. It points at
+#                     `launchd.out` (where a `echo` goes — not stderr).
+#   REFUSED-SINGLETON last exit = 75: `orch-loop.sh` REFUSED to start because this state dir already
+#                     has a controller (agent-infra#2095). ⛔ THIS IS THE STATE THE `EXITED-CLEAN` ROW
+#                     ABOVE USED TO COVER, and it must not fall through to DIED: the refusal is
+#                     correct and repeats on every ThrottleInterval for as long as the other
+#                     controller lives, so `DIED … every attempt is failing` would be a permanent
+#                     FALSE-RED on a healthy box — the mirror of the false-green the old silent
+#                     `exit 0` produced. `[singleton]` in `orch-loop.log` names the holder pid, the
+#                     state dir and the reason; an unreadable record fails CLOSED by design.
+#   DIED              a NON-ZERO exit status OTHER than 75: launchd retries it on its
+#                     ThrottleInterval, so a job that STAYS here is failing on every attempt. The
+#                     launch count is printed as EVIDENCE of how many times it has been started since
+#                     load — never as proof that the failure is persistent (see the note on `runs`).
 #   NEVER-STARTED     no process, no exit code, and `runs = 0`: launchd has never launched it.
 #   LOADED-NO-PROCESS anything else launchd would not explain. The row says what it actually knows.
 #
@@ -1459,8 +1465,18 @@ hp_launchd_dead_text() { # <label>
     printf 'NEVER-STARTED (%s is loaded with NO process and launchd reports 0 launches — it has never been kicked; start it: launchctl kickstart -k gui/%s/%s)' \
       "$label" "$(id -u)" "$label"
   elif [ "$lexit" = "0" ]; then
-    printf 'EXITED-CLEAN (last exit 0%s — a KeepAlive job is relaunched on its ThrottleInterval, so a job that STAYS here is exiting IMMEDIATELY rather than crashing. For the fleet loop the usual cause is a second controller holding %s/.orch.lock ("already running", orch-loop.sh) — read %s/logs/launchd.out)' \
-      "$seen" "$O" "$O"
+    printf 'EXITED-CLEAN (last exit 0%s — a KeepAlive job is relaunched on its ThrottleInterval, so a job that STAYS here is exiting IMMEDIATELY rather than crashing; read %s/logs/launchd.out)' \
+      "$seen" "$O"
+  elif [ "$lexit" = "75" ]; then
+    # ⛔ 75 IS A DELIBERATE REFUSAL, NOT A CRASH (agent-infra#2095). `orch-loop.sh` used to print
+    # "already running (pid N)" and `exit 0` — the false PASS this row was written around — and a
+    # reviewer measured that removing it left THIS row as the one shipped consumer whose branch logic
+    # depended on the old code: exit 75 fell through to `DIED … every attempt is failing`, a
+    # FALSE-RED on a correct refusal that repeats every ThrottleInterval for as long as the other
+    # controller legitimately holds the state dir. The two states have opposite remedies, so they
+    # must not share a row: a refusal means "nothing to do here", DIED means "the loop is broken".
+    printf 'REFUSED-SINGLETON (last exit 75%s — orch-loop.sh REFUSED to start because this state dir already has a controller, which is the singleton working, not a crash. It keeps exiting 75 on every ThrottleInterval for as long as that controller lives. Confirm with: tail -3 %s/logs/orch-loop.log — a [singleton] line names the holder pid, the state dir and the reason. The holder is the authority, so do NOT remove %s/.orch.lock while it runs; if the [singleton] line names a pid that is not an orch-loop.sh of %s, read the reason it gives — an unreadable record fails CLOSED by design)' \
+      "$seen" "$O" "$O" "$O"
   elif [ -n "$lexit" ]; then
     printf 'DIED (last exit %s%s; launchd retries a failing KeepAlive job on its ThrottleInterval, so if it STAYS here every attempt is failing; read %s/logs/launchd.err)' \
       "$lexit" "$seen" "$O"
@@ -1475,7 +1491,7 @@ hp_launchd_dead_text() { # <label>
 # holds for the only production caller; a different `HU_LAUNCHD_LABEL` makes "launchd relaunches it"
 # an assumption rather than a fact, so the wording says "a KeepAlive job" instead of asserting it.
 # ⛔ `ps` ALONE CANNOT ANSWER THIS, and the states have different remedies: NOT LOADED (load it —
-# `launchctl load`), EXITED-CLEAN / DIED / NEVER-STARTED / LOADED-NO-PROCESS with no process (the job
+# `launchctl load`), EXITED-CLEAN / REFUSED-SINGLETON / DIED / NEVER-STARTED / LOADED-NO-PROCESS with no process (the job
 # is installed and nothing is running: `hp_launchd_dead_text` names which). The `loop` row collapses
 # them into `MISSING`, which is how a job that was never loaded reads exactly like one that is loaded
 # and dead
