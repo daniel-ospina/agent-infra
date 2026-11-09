@@ -1,0 +1,12 @@
+name: fixture job-no-steps-expression — an expression job bound on a job with NO steps
+on:
+  workflow_dispatch:
+    inputs:
+      t:
+        type: number
+        default: 30
+jobs:
+  j:
+    # A 0-step job has no step budget to check, so it must get NO "every step carries a bound" note.
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ inputs.t }}

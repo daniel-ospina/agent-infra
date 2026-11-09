@@ -402,6 +402,208 @@ if command -v ensure_agent_gh_real >/dev/null 2>&1; then ensure_agent_gh_real ||
 
 mkdir -p "$O/logs" "$O/state"
 LOG="$O/logs/orch-loop.log"
+# BEGIN gh-bound (gh-bound.test.sh extracts this block verbatim — keep it self-contained)
+# ── BOUNDED GITHUB CALLS (agent-infra#2028) ──────────────────────────────────────────────────────
+# THE DEFECT. Every `gh` call in this cycle body used to be UNBOUNDED, and `docs/ops/gh-rate-limits.md`
+# states the limit it fell through: "The child `gh` has no timeout … a legitimate `gh` call's duration is
+# not knowable here" — so the bound belongs at the CALL SITE, and the shell call sites had none.
+# MEASURED, twice, on the live fleet:
+#   * 2026-10-18: the `[res]` line's `gh api rate_limit` probe (the `rate=` call site below) left a `gh`
+#     child alive for 2h 08m with 0.01 s CPU and NO open sockets, while the supervisor reported the
+#     controller `running` and its heartbeat was 2h stale. `kill -TERM` on that ONE child let the
+#     iteration complete immediately — nothing was lost, the datum is read-only.
+#   * the same day, `ps` showed eight `bash orch-loop.sh` processes 23-43 minutes old: ONE controller
+#     plus its substitution subshells (a subshell inherits argv), which is why a bare
+#     `pgrep -c orch-loop.sh` must never be read as a duplicate-controller check (#1856/#1859).
+# The end state of that pile-up was a fully spent REST quota (core 0/5000) with dispatch stopped and
+# merges failing — a feedback loop rather than an incident: slow call -> live subshell -> more concurrent
+# callers -> more rate limiting -> slower calls.
+#
+# 120 s IS DERIVED FROM A MEASUREMENT, NOT PICKED. The same runbook measures a serialised `gh pr view`
+# at 63.0 s on a 13-lane box (0.676 s at 3 lanes) because `gh-limit.py` keeps ONE call in flight per box,
+# so this box's latency is a function of its own lane count. A bound UNDER that manufactures a false
+# absence — the failure the runbook calls out by name — so the default is ~1.9x the measured worst case,
+# and below one CYC (240 s), which is what makes #2028's indicator (b) ("no child outlives one cycle")
+# hold on the default clock.
+GH_BOUND_S="${GH_BOUND_S:-120}"
+# ⛔ A PER-CALL BOUND IS NOT A CYCLE BOUND, AND #2028'S INDICATOR (c) IS ABOUT THE CYCLE. The sweep
+# reads every open PR (>= 2 calls each), so a window in which EVERY call hangs costs
+# `GH_BOUND_S x 2 x open_prs` — hours, which is the measured 161-minute cycle body under a new name.
+# Once GH_BOUND_TRIP calls have hit the bound in ONE cycle, the rest of that cycle's gh calls FAIL FAST
+# with rc=124 WITHOUT spawning `gh` at all: the box does its non-GitHub work and the next cycle retries,
+# instead of queueing further callers behind a dead network.
+GH_BOUND_TRIP="${GH_BOUND_TRIP:-3}"
+# ⛔ A KNOB THAT DOES NOT PARSE MUST NOT DISARM THE CALLS. `tb_timeout` answers 125 (refusal, never run)
+# for a non-integer bound, so a typo'd GH_BOUND_S would make EVERY gh call fail and take the controller
+# dark — the fail-closed shape this file refuses elsewhere. Falls back loudly, and the length test bounds
+# the digits before `[ … -gt … ]` can error at 2**63 (the `is_limit` hazard this file documents).
+# gh_bound_knob <value> — 0 when <value> is a positive integer of at most 6 digits, 1 otherwise.
+# No `eval` and no nameref (bash 3.2): a knob is untrusted text, so it is validated, never re-parsed.
+gh_bound_knob() {
+  case "${1:-}" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  [ "${#1}" -le 6 ] && [ "$((10#$1))" -ge 1 ] && return 0
+  return 1
+}
+if ! gh_bound_knob "${GH_BOUND_S:-}"; then
+  printf '[bound] ⚠️ GH_BOUND_S=%s does not parse as a positive integer — using 120 s (agent-infra#2028)\n' "${GH_BOUND_S:-}" >> "$LOG" 2>/dev/null || true
+  GH_BOUND_S=120
+fi
+if ! gh_bound_knob "${GH_BOUND_TRIP:-}"; then
+  printf '[bound] ⚠️ GH_BOUND_TRIP=%s does not parse as a positive integer — using 3 (agent-infra#2028)\n' "${GH_BOUND_TRIP:-}" >> "$LOG" 2>/dev/null || true
+  GH_BOUND_TRIP=3
+fi
+GH_BOUND_STATE="$O/state/gh-bound-trips"
+# `scripts/lib/bounded.sh` is the ONE bounded-execution helper (#2046: `timeout` -> `gtimeout` -> an
+# internal watchdog, because macOS ships neither `timeout` nor, without Homebrew, `gtimeout`). It is not
+# part of the flat `$O` seed, so look beside the RUNNING script as well: the daemon execs
+# `<pin root>/<sha12>/scripts/orchestrator-harness/orch-loop.sh`, whose sibling `../lib/bounded.sh` is
+# present at every pin, and the farmed copy covers a box that runs this file from `~/.pi/agent/scripts/`.
+_ghb_lib=""
+for _ghb_cand in "$O/lib/bounded.sh" "${_HERE_RS:-/nonexistent}/../lib/bounded.sh" "${HOME:-/nonexistent}/.pi/agent/scripts/lib/bounded.sh"; do
+  if [ -f "$_ghb_cand" ]; then _ghb_lib="$_ghb_cand"; break; fi
+done
+GH_BOUND_OFF=0
+# ⛔ THERE ARE THREE WAYS TO HAVE NO USABLE BOUND, AND ALL THREE GET THE SAME ANSWER: degrade, disclose,
+# and do NOT refuse to start. Two of them are not "library missing": a library that sourced but defines
+# no `tb_timeout`, and — the arm that used to slip through — a library reporting `TB_TIMEOUT_KIND=invalid`
+# because an operator's `TB_TIMEOUT_BIN` pin is not executable (`bounded.sh:19-20,64`). THAT ONE WAS THE
+# WORST: the pin satisfied `command -v tb_timeout`, so the block announced "bounded", DELETED
+# `state/gh-bound` (the only machine-readable record a reader has), and then `tb_timeout` exec'd the
+# nonexistent pin (`bounded.sh:279`) — rc=127 on EVERY call, i.e. a controller fully dark while its own
+# state file says the bound is fine. `bounded.sh`'s contract is "callers REFUSE at startup, they do not
+# silently fall back" (`disk-reaper.sh` exits 3 on exactly this); this block keeps its own #2320 stance
+# instead — a controller that will not start is the worse outage — but it must not CLAIM a bound it does
+# not have, so the unusable pin is DEGRADED and NAMED, with the remedy that does work.
+_ghb_bad=""; _ghb_fix="ship lib/bounded.sh beside the harness (it is in scripts/lib/)"
+if [ -n "$_ghb_lib" ] && . "$_ghb_lib" 2>/dev/null; then
+  if [ "${TB_TIMEOUT_KIND:-}" = "invalid" ]; then
+    _ghb_bad="UNRESOLVED (TB_TIMEOUT_BIN=${TB_TIMEOUT_BIN:-} cannot be executed — bounded.sh resolves TB_TIMEOUT_KIND=invalid and tb_timeout would exec it, answering 127 on EVERY call)"
+    _ghb_fix="correct or unset TB_TIMEOUT_BIN, or set TB_TIMEOUT_FORCE_INTERNAL=1 to use bounded.sh's internal watchdog"
+  elif ! command -v tb_timeout >/dev/null 2>&1; then
+    _ghb_bad="UNRESOLVED ($_ghb_lib sourced but defines no tb_timeout)"
+  fi
+else
+  _ghb_bad="UNRESOLVED (no bounded.sh in $O/lib, ${_HERE_RS:-?}/../lib or ~/.pi/agent/scripts/lib)"
+fi
+if [ -z "$_ghb_bad" ]; then
+  GH_BOUND_HOW="$(tb_watchdog_description 2>/dev/null)"
+  rm -f "$O/state/gh-bound" 2>/dev/null || true
+  printf '[bound] gh calls bounded at %ss (%s), %s per cycle before the rest fail fast — agent-infra#2028\n' \
+    "$GH_BOUND_S" "${GH_BOUND_HOW:-?}" "$GH_BOUND_TRIP" >> "$LOG" 2>/dev/null || true
+else
+  # ⛔ DEGRADED, DISCLOSED, AND NOT A REFUSAL. A controller that refused to START because a bound it
+  # cannot find is missing would be a worse outage than the bound prevents — the same stance #2320 takes
+  # for `ensure_agent_gh_real` ("a controller that refuses to start because its gh could not be pinned
+  # would be a worse failure than the one this prevents"). It is not silent: the degradation is recorded
+  # in `state/gh-bound` for a reader AND printed by every cycle at the point the counter is reset.
+  GH_BOUND_OFF=1
+  GH_BOUND_HOW="$_ghb_bad"
+  printf 'DEGRADED %s — gh calls are UNBOUNDED (rc=124 cannot happen; a hung gh call can still pin the cycle)\n' \
+    "$GH_BOUND_HOW" > "$O/state/gh-bound" 2>/dev/null || true
+  printf '[bound] ⚠️ DEGRADED: %s — gh calls are UNBOUNDED. Fix: %s.\n' \
+    "$GH_BOUND_HOW" "$_ghb_fix" >> "$LOG" 2>/dev/null || true
+fi
+unset _ghb_bad _ghb_fix
+# gh_bound_cleanup — reap the ONE scratch dir the internal watchdog uses; called from the
+# controller's EXIT trap. A no-op on a host that resolved GNU `timeout`/`gtimeout` (no scratch is ever
+# made there) and on the DEGRADED path (bounded.sh never sourced), so the trap can call it
+# unconditionally under `set -u`.
+gh_bound_cleanup() {
+  [ -n "${TB_BOUND_TMP:-}" ] || return 0
+  command -v tb_bound_cleanup >/dev/null 2>&1 && tb_bound_cleanup
+  return 0
+}
+# ⛔ ONE SCRATCH DIR FOR THE WHOLE CONTROLLER, CREATED IN THE PARENT — MEASURED, NOT ASSUMED. Nine of
+# this block's sixteen call sites are CAPTURED (`x="$(gh_bounded …)"`), and on a host whose watchdog
+# resolves to the INTERNAL one (no GNU `timeout`, no `gtimeout` — macOS, i.e. the daemon host) every
+# `tb_watchdog` run creates `TB_BOUND_TMP` with `tb_bound_tmp` INSIDE that substitution's SUBSHELL.
+# The assignment then dies with the subshell, so no caller-side cleanup can ever see it, and the parent
+# keeps no record to reap: MEASURED at this head, 8 captured calls -> 8 orphaned empty
+# `bounded.XXXXXX` directories, one per call, for the life of a process that `bounded.sh` itself notes
+# "outlives a month of cycles". `bounded.sh` names this exact defect and its fix on `disk-reaper.sh`'s
+# own scratch — "CREATE THE PROBE SCRATCH IN THE PARENT … a subshell inherits the parent's variable,
+# so creating it here means every probe reuses THIS directory and `tb_bound_cleanup` can actually reap
+# it" — so the block does the same: ONE dir, made here while the controller can still fork and while an
+# unwritable TMPDIR is still reportable, inherited by every call. Sharing it is safe because
+# `tb_watchdog` names its sentinel/done files from the COMMAND's own pid (`$pid`, "unique per call in
+# this shell AND across subshells" — the reason that naming was chosen), each call removes its own two
+# files, and `disk-reaper.sh` already shares one dir across concurrent probes.
+if [ "${TB_TIMEOUT_KIND:-}" = "internal" ] && command -v tb_bound_tmp >/dev/null 2>&1; then
+  if ! tb_bound_tmp; then
+    printf '[bound] ⚠️ no writable TMPDIR — the internal watchdog runs WITHOUT its sentinel, so a bound that fires cannot be told from a command that died 137 on its own; every call re-creates the attempt (agent-infra#2028)\n' >> "$LOG" 2>/dev/null || true
+  fi
+fi
+# gh_trips_read — how many calls have hit the bound in the CURRENT cycle. `read` with a redirect is a
+# BUILTIN, so this costs no fork inside the `$( )` call sites below.
+gh_trips_read() {
+  _ghb_n=0
+  if [ -f "$GH_BOUND_STATE" ]; then
+    read -r _ghb_n 2>/dev/null < "$GH_BOUND_STATE" || _ghb_n=0
+    case "${_ghb_n:-}" in ''|*[!0-9]*) _ghb_n=0 ;; esac
+  fi
+  return 0
+}
+# gh_bounded <gh args...> — `gh` under a hard wall-clock bound, plus this cycle's trip latch.
+# Returns the call's OWN status, or 124 when the bound fired (GNU `timeout`'s code — every call site here
+# already treats a non-zero status as a failed read, and a failed read is what an unbounded hung call
+# never gets to be). A bounded call is otherwise BYTE-FOR-BYTE transparent: same stdout, same stderr,
+# same status on the success path.
+# ⛔ NOTHING IS EVER PRINTED TO STDOUT OR STDERR: several call sites capture `2>&1` and PARSE the merged
+# bytes (`gh pr view --json …`), and the shim's own contract is that a note never rides a good answer.
+# Every diagnostic goes to $LOG, which no caller parses.
+gh_bounded() {
+  [ "$#" -gt 0 ] || return 125
+  if [ "${GH_BOUND_OFF:-0}" = "1" ]; then command gh "$@"; return $?; fi
+  gh_trips_read
+  # TRIPPED: no fork, no socket, no queue position — and no second log line (the trip already printed).
+  if [ "$_ghb_n" -ge "$GH_BOUND_TRIP" ]; then return 124; fi
+  # ⛔ THE BOUND MUST NOT BE DECIDED BY A LAYER SLEEPING INSIDE THE CALL. `gh` here resolves through
+  # `gh-limit.py` (`gh-rest/gh` on the Mac daemon PATH, `gh-limit/gh` on a cell), and that layer WAITS
+  # IN-PROCESS: 60/120/240 s per refusal attempt (`MAX_ATTEMPTS=4`, `gh-limit.py:215-216,3540`) — so a
+  # rate-limited call answers at ~420 s — and up to `LOCK_TIMEOUT=600` s in the box-wide single-flight
+  # lock (`gh-limit.py:218`). Against a 120 s bound the kill therefore lands DURING the second wait,
+  # BEFORE `fail_loudly()` can print the RATE-LIMITED refusal: the caller gets empty output and a 124
+  # instead of the limit it actually hit, `sweep_fail_kind` reads `other`, the deferral is never armed,
+  # and three kills blind the cycle. That is #2028's own fix-direction #2 ("never sleep inside a
+  # substitution; the backoff belongs to the cycle, not inside `$( )`") — truncating the sleep is not
+  # removing it.
+  # The repo's documented contract for exactly this caller class is `GH_LIMIT_NO_WAIT` (`gh-limit.py`'s
+  # NO_WAIT: "1 = never sleep in-process" — the eight heartbeat .py tools set it via `setdefault`, and
+  # the shell callers in this tree pass it per call: `lander.sh` on its `gh api rate_limit` read, its
+  # two `gh api graphql` reads and its `rerun-failed-jobs` POST, and `cloud-cell-supervisor.sh` on its
+  # `gh --version` probe). Under it the layer records the limit and answers
+  # AT ONCE, and `acquire_lock`'s `budget = min(LOCK_TIMEOUT, NO_WAIT_LOCK_S) if NO_WAIT` also bounds
+  # the LOCK wait to 5 s — which is why this sets ONE variable and lets the layer keep its own default
+  # rather than freezing a copy of it here.
+  # ⛔ PER CALL, NOT EXPORTED FOR THE CONTROLLER: the controller spawns lanes, fixers and reviewers, and a
+  # block-scope export would change THEIR gh patience for the life of the box. It is saved and put back
+  # (set-ness included, never merely emptied) for the same reason TB_WATCHDOGS is.
+  _ghb_nw="${GH_LIMIT_NO_WAIT-}"; _ghb_nw_set="${GH_LIMIT_NO_WAIT+1}"
+  GH_LIMIT_NO_WAIT=1; export GH_LIMIT_NO_WAIT
+  # ⛔ THE WATCHDOG LIST IS PUT BACK, NOT APPENDED TO. `tb_timeout` records every watchdog it forks so a
+  # caller's EXIT trap can TERM them; it has already `wait`ed this one by the time it returns, so its
+  # record is dead weight — and this loop outlives a month of cycles, where dead pids accumulate. A
+  # caller-set TB_WATCHDOGS is left exactly as it was found.
+  _ghb_wd="${TB_WATCHDOGS:-}"
+  tb_timeout "$GH_BOUND_S" gh "$@"
+  _ghb_rc=$?
+  TB_WATCHDOGS="$_ghb_wd"
+  if [ -n "$_ghb_nw_set" ]; then GH_LIMIT_NO_WAIT="$_ghb_nw"; else unset GH_LIMIT_NO_WAIT; fi
+  if [ "$_ghb_rc" -eq 124 ]; then
+    printf '%s\n' "$(( _ghb_n + 1 ))" > "$GH_BOUND_STATE" 2>/dev/null || true
+    case "${1:-?}" in
+      merge|rerun|ready) _ghb_what="a MUTATING gh ${1} (outcome UNKNOWN — the next cycle's state re-read decides, which every arm here already does on a failed call)" ;;
+      *)                 _ghb_what="a gh ${1} read" ;;
+    esac
+    printf '[bound] %s hit the %ss bound and was killed (rc=124) — %s of %s this cycle%s\n' \
+      "$_ghb_what" "$GH_BOUND_S" "$(( _ghb_n + 1 ))" "$GH_BOUND_TRIP" \
+      "$([ "$(( _ghb_n + 1 ))" -ge "$GH_BOUND_TRIP" ] && printf ', so the REST of this cycle fails fast without calling gh')" >> "$LOG" 2>/dev/null || true
+  fi
+  return "$_ghb_rc"
+}
+# END gh-bound
 # ── THE WORKER LAUNCHER (worker-terminal.sh) ────────────────────────────────────
 # Every worker this loop starts — fixers, reviewers, rail workers — is started, counted and killed
 # through ONE module. That is not tidiness: the launcher, the census the caps read, and the reaper
@@ -2082,14 +2284,262 @@ case "${1:-}" in
 esac
 # [refresh-check:end]
 
+# [orchlock:begin]
 LOCKF="$O/.orch.lock"
+# ⛔ LIVENESS IS NOT IDENTITY (agent-infra#1985). The reclaim below used to be `kill -0 "$OPID"` and
+# nothing else, and that is BROKEN whenever a controller dies without its EXIT trap running (kill -9,
+# an OOM kill, a panic): the lock then names a pid the OS will recycle, so the next controller exits
+# `already running (pid N)` over a REUSED pid, the box dispatches nothing, and its own recovery is
+# blocked — launching a controller cannot fix a lock the controller itself refuses. Measured on a live
+# box: the watchdog saw the named pid alive, `ps -p <pid> -o command=` showed a process that was not
+# the controller, and the reload failed on every pass (`RECOVERY FAILED`, rc 1, three passes).
+#
+# ⛔ THE RULE IS THE FLEET'S ONE PROCESS-IDENTITY RULE (#1178), NOT A NEW ONE. A lock owner is
+#   (a) ALIVE, (b) an `orch-loop.sh` INVOCATION (argv shape — `registry_pid_is_controller`), and
+#   (c) a process that did NOT begin after the lock was written.
+# (c) is the discriminator for a recycled pid: the writer held that pid until it died, so any process
+# now holding the pid BEGAN AFTER the writer wrote the lock. It is the same `pid_began_after` fence
+# `orchestrator-bringup.sh:lock_pid` applies to this very file, and the same one the supervisor, the
+# registry and the installer apply (#1856: one predicate, one answer).
+#
+# ⛔ WHAT THE VERDICT MAY DO. Only POSITIVE evidence of non-ownership reclaims — absent, or not an
+# orch-loop.sh, or provably begun after the lock. A pid we cannot date is NOT reclaimed: reclaiming on
+# an unreadable read is how two controllers end up sweeping one PR queue (#1715), which is worse than
+# a stopped box. That case refuses (as before) and now says so LOUDLY, naming the remedy — the #1985
+# defect was that the refusal was one silent line in the log.
+#
+# ⛔ PINNED MIRRORS, NOT A SOURCE. `$O` is a FLAT seed (`deploy-harness.sh` copies
+# `orchestrator-harness/*`), so it has no `scripts/lib/` to source — the same constraint
+# `harness-refresh.sh:_began_before_lock` and `cloud-cell-supervisor.sh` document for their copies.
+# `orch-loop-lock.test.sh` pins both bodies and the slack to the canonical declarations, so drift
+# reddens CI instead of becoming a wrong reclaim.
+ORCH_LOCK_START_SLACK_SECONDS="${ORCH_LOCK_START_SLACK_SECONDS:-5}"
+# ⛔ VALIDATED BEFORE IT REACHES ARITHMETIC, BECAUSE AN UNVALIDATED READ FAILS OPEN — AND HERE THE
+# OPEN DIRECTION IS THE DESTRUCTIVE ONE. This seam is the ONLY input to the reclaim decision that comes
+# from the environment, and `$(( lt + … ))` below is evaluated inside a `set -u` shell. MEASURED on the
+# extracted block (a LIVE, loop-shaped owner in the lock, the exact `OWNER` case):
+#   unset → `already running (pid N)` (refused, correct)
+#   `1.5` → "syntax error: invalid arithmetic operator" → the ENCLOSING `if ! acq` COMPOUND IS ABORTED,
+#           so the block neither refuses nor reclaims: the newcomer prints STARTED with NO lock of its
+#           own while the LIVE owner's lock stays on disk — and its EXIT trap then deletes THAT lock
+#           (two controllers on one PR queue, #1715, plus a third-party deletion of a live lock).
+#           ⛔ THAT WAS THE PRE-FIX BEHAVIOUR of a fault inside the verdict; the containment for the
+#           NEXT one is the subshell transport at the verdict's call site (see its comment) — this
+#           validation stays the FIRST line because it stops that fault happening at all.
+#   `abc` → "unbound variable" → the controller DIES at the lock check naming neither the variable nor
+#           the remedy (the cryptic-stop class #1985 exists to end)
+#   `08`  → "value too great for base" — ⛔ ALL-DIGITS AND STILL FATAL: bash reads a leading zero as
+#           OCTAL, so a digits-only guard is NOT enough (`10#`, or the textual strip below, is)
+# The fleet's own copy of this same fence validates the same seam and documents the same reason
+# (scripts/lib/fleet-inventory.sh:_fleet_lock_owner). Fail to the documented default instead.
+case "$ORCH_LOCK_START_SLACK_SECONDS" in ''|*[!0-9]*) ORCH_LOCK_START_SLACK_SECONDS=5 ;; esac
+# ⛔ LEADING ZEROS STRIPPED TEXTUALLY, never normalised through `$(( ))`: `08` is all-digits and an
+# OCTAL ERROR in arithmetic (measured above), so the strip is what closes that half of the class.
+# ⛔ WHAT THIS STRIP DOES, EXACTLY — it NORMALISES, it does not REJECT (fresh review of #1985, P3;
+# MEASURED on this block, 11 values): `08` becomes **8** and `007` becomes **7**, and BOTH are KEPT,
+# because both are inside the bound below. The fallback to the documented 5 s covers only a value that
+# is NOT all-digits (`1.5`, `abc`, empty) or is wider than 60; an all-digit value with leading zeros is
+# neither, and no arm observes the resulting value unless §14's value rows run.
+while [ "${#ORCH_LOCK_START_SLACK_SECONDS}" -gt 1 ] \
+      && [ "${ORCH_LOCK_START_SLACK_SECONDS#0}" != "$ORCH_LOCK_START_SLACK_SECONDS" ]; do
+  ORCH_LOCK_START_SLACK_SECONDS="${ORCH_LOCK_START_SLACK_SECONDS#0}"
+ done
+# A slack wider than the fence itself is not a setting, it is a defeat of the fence; the length test
+# comes FIRST so an absurd value is capped instead of reaching `[ -le ]` as an "integer expression
+# expected" error. Same bound as fleet-inventory.sh's copy of this fence.
+{ [ "${#ORCH_LOCK_START_SLACK_SECONDS}" -le 2 ] && [ "$ORCH_LOCK_START_SLACK_SECONDS" -le 60 ]; } \
+  || ORCH_LOCK_START_SLACK_SECONDS=5
+# The one literal this block needs for field parsing: `awk` separates the `stat` column from the argv
+# with a TAB, and the reassembled argv contains no TAB by construction (awk's fields split on whitespace).
+TAB="$(printf '\t')"
+# _orch_ps_start_epoch <pid> — when the process began, from `ps -o etime=` (one shape on BSD and GNU).
+# rc 1 when it cannot be read. PINNED MIRROR of `pid_start_epoch` in scripts/lib/pid-identity.sh.
+# ⛔ `10#`, NOT a bare `$(( ))`: etime ZERO-PADS, and bash reads a leading zero as OCTAL, so
+# `$((08 * 3600))` is an ERROR — which read as "cannot date it" for a few percent of live reads (#1856).
+_orch_ps_start_epoch() {
+  local p="${1:-}" e d h m s r
+  case "$p" in ''|*[!0-9]*) return 1 ;; esac
+  e="$("${PS_BIN:-/bin/ps}" -o etime= -p "$p" 2>/dev/null | tr -d '[:space:]')" || return 1
+  [ -n "$e" ] || return 1
+  d=0
+  case "$e" in *-*) d="${e%%-*}"; r="${e#*-}" ;; *) r="$e" ;; esac
+  case "$d" in ''|*[!0-9]*) return 1 ;; esac
+  case "$r" in
+    *:*:*) h="${r%%:*}"; r="${r#*:}"; m="${r%%:*}"; s="${r##*:}" ;;
+    *:*)   h=0;                 m="${r%%:*}"; s="${r##*:}" ;;
+    *) return 1 ;;
+  esac
+  case "$h$m$s" in ''|*[!0-9]*) return 1 ;; esac
+  h=$((10#${h:-0})); m=$((10#${m:-0})); s=$((10#${s:-0})); d=$((10#${d:-0}))
+  printf '%s\n' "$(( $(date +%s) - (d * 86400 + h * 3600 + m * 60 + s) ))"
+}
+# _orch_lock_probe <pid> — ONE process read, THREE outcomes, because HERE "cannot read" must never be
+# minted into "provably not the owner": the caller answers that verdict by DELETING the lock, so a false
+# negative is two controllers on one state dir (#1715). ⛔ THE DIRECTION IS INVERTED FROM THE SAME
+# PREDICATE'S REPORTING HOMES (`registry_pid_is_controller`, `lock_pid`, `argv_is_orch_loop`), where a
+# false negative only degrades a row to STOPPED — which is why the read/absence arms are NOT mirrored
+# verbatim and carry their own three outcomes (fresh review of #1985, P1).
+#   rc 0  PRESENT  stdout IS the argv, read from a table that provably ran
+#   rc 1  ABSENT   the read RAN and produced a table; the pid is not in it (and we cannot even signal
+#                  it), so the lock outlived its writer
+#   rc 2  UNKNOWN  the read failed, the table was empty, the pid is alive outside the table we could
+#                  read, or its argv could not be had — NEVER reclaim on this
+_orch_lock_probe() {
+  local p="${1:-}" t row stat cmd
+  case "$p" in ''|*[!0-9]*) return 1 ;; esac
+  # ⛔ `-ww`, BECAUSE `COLUMNS` OVERRIDES THE SAFE DEFAULT (#2926). A command substitution is not a
+  # tty, so this read would normally be width-independent — but `ps(1)` checks `COLUMNS` FIRST, and an
+  # exported COLUMNS TRUNCATES the command column. The path token is the LAST thing on the line, so it
+  # is cut mid-name, `${2##*/}` stops equalling `orch-loop.sh`, and the verdict becomes "PROVABLY NOT
+  # the owner" over a LIVE owner whose lock is then deleted — the worst direction of the eight reads
+  # #2926 tracks. `-ww` is unlimited on procps and "at least 131 columns" on BSD ps, so it raises the
+  # ceiling and never lowers it; it cannot narrow an already-unlimited read. Witnessed by
+  # `orch-loop-lock.test.sh` §11, which re-drives the refusal arms under `COLUMNS=20`.
+  t="$("${PS_BIN:-/bin/ps}" -ww -axo pid=,stat=,command= 2>/dev/null)" || return 2
+  # ⛔ AN EMPTY TABLE IS UNREADABLE, NOT EMPTY: the probing process itself appears in any real table,
+  # so a read that "succeeds" and prints nothing never witnesses absence (#1178 C3).
+  case "$t" in *[![:space:]]*) ;; *) return 2 ;; esac
+  row="$(printf '%s\n' "$t" | awk -v p="$p" '$1 == p { c = ""; for (i = 3; i <= NF; i++) c = (c == "" ? $i : c " " $i); print $2 "\t" c; exit }')"
+  if [ -z "$row" ]; then
+    # Not in a table we COULD read. Corroborate with `kill -0`: a pid we can signal is ALIVE, so the
+    # absence belongs to the read, not to the process → UNKNOWN. Otherwise it is positively gone.
+    kill -0 "$p" 2>/dev/null && return 2
+    return 1
+  fi
+  stat="${row%%"$TAB"*}"
+  case "$stat" in Z*) return 1 ;; esac          # a zombie cannot hold a lock — its EXIT trap has run
+  cmd="${row#*"$TAB"}"
+  [ -n "$cmd" ] || return 2                     # present, but its argv is unreadable → UNKNOWN
+  printf '%s\n' "$cmd"
+  return 0
+}
+# _orch_argv_is_loop <argv…> — 0 only when the INVOCATION is an orch-loop.sh.
+# ⛔ THE TWO TOKEN RULES ARE A PINNED MIRROR of `registry_pid_is_controller` in
+# scripts/lib/orchestrator-registry.sh: `${1##*/}` must be a shell and `${2##*/}` must be exactly
+# `orch-loop.sh`. A looser ANY-token match (`/?*orch-loop.sh`) accepted `bash -c "sleep 300; /abs/orch-
+# loop.sh"` — a non-controller — and a caller that merely MENTIONS the path (an editor, a grep) is not a
+# controller either (#1856 review). `orch-loop-lock.test.sh` pins these two rules to the canonical
+# declaration; only the READ arms above are deliberately different (see their header).
+# ⚠ THE CANONICAL'S ONE DOCUMENTED BLIND SPOT IS INHERITED HERE AND IS NOT FIXED BY THESE RULES:
+# `orchestrator-registry.sh` records "NOT handled on purpose: a state dir containing a space" — `set --
+# $*` word-splits, so such a path arrives as two tokens. A future reader who relaxes `safe_argv`
+# upstream must know this copy inherits the same caveat rather than silently diverging.
+_orch_argv_is_loop() { # shellcheck disable=SC2086
+  set -- $*
+  [ "$#" -ge 2 ] || return 1
+  case "${1##*/}" in bash|sh|dash|zsh) ;; *) return 1 ;; esac
+  case "${2##*/}" in orch-loop.sh) return 0 ;; esac
+  return 1
+}
+# _orch_argv_is_loop_flagged <argv…> — 0 when a shell is invoked WITH AN OPTION in front of an
+# `orch-loop.sh` (`bash -x /abs/orch-loop.sh`), i.e. a controller-shaped argv the two-token rule above
+# cannot ATTRIBUTE. Deliberately OUTSIDE that function: its body is a pinned mirror of
+# `orchestrator-registry.sh:registry_pid_is_controller` (the suite pins both the five-line body and the
+# `set --` tail), and this rule is the loop's OWN, because only the loop answers "not the owner" by
+# DELETING a lock.
+# ⛔ WHY IT EXISTS (fresh review of PR #3837 at 185e7c5bd, P2; MEASURED): `bash -x …/orch-loop.sh` failed
+# the two-token rule and was minted into rc 1 = PROVABLY NOT THE OWNER, so the next start printed
+# `STARTED`, logged `[lock] reclaiming …`, and the owner was STILL ALIVE — a second controller on one PR
+# queue (#1715), from an argv we READ but could not attribute. An argv that was read and could not be
+# attributed is `CANNOT-TELL`, never proof of non-ownership; the caller refuses and names it.
+# ⛔ `-c` IS NOT THIS CASE, AND THAT IS A RECORDED DECISION, NOT AN OVERSIGHT: #1856 established that
+# `bash -c "sleep 300; /abs/orch-loop.sh"` is a WRAPPER's argv rather than a controller (accepting it was
+# the loose any-token arm that failed open), and `orch-loop-lock.test.sh` arm 4c asserts such a pid is
+# RECLAIMED. So the `-c`/`--command` forms return 1 here and keep that behaviour, and only the option
+# forms no decision reaches (`-x`, `-e`, `--posix`, …) are deferred to a human as ambiguous.
+_orch_argv_is_loop_flagged() { # shellcheck disable=SC2086
+  local _t
+  set -- $*
+  [ "$#" -ge 3 ] || return 1
+  case "${1##*/}" in bash|sh|dash|zsh) ;; *) return 1 ;; esac
+  case "$2" in -c|--command|-[!-]*c*) return 1 ;; esac    # #1856: a `-c` wrapper is not a controller
+  case "$2" in -*) ;; *) return 1 ;; esac                 # token 2 must be a shell OPTION
+  for _t in "$@"; do
+    case "${_t##*/}" in orch-loop.sh) return 0 ;; esac
+  done
+  return 1
+}
+# _orch_lock_verdict <pid> <lockfile> -> 0 OWNER · 1 PROVABLY NOT the owner · 2 CANNOT TELL
+# Sets ORCH_LOCK_WHY (only on rc 2) to the read that failed, so the refusal names WHICH datum is missing
+# instead of asserting a fact about a process it could not read (fresh review of #1985, P1).
+# ⛔ THREE OUTCOMES, AND 2 IS NOT 1. Folding "cannot read it" into 1 would reclaim a lock whose live
+# owner it simply could not read (two controllers, #1715); folding it into 0 would keep the #1985 silent
+# stop. The caller refuses on 2, loudly, with the remedy named.
+ORCH_LOCK_WHY=""
+_orch_lock_verdict() {
+  local p="${1:-}" lf="${2:-}" lt pstart cmd
+  ORCH_LOCK_WHY=""
+  case "$p" in ''|*[!0-9]*) return 1 ;; esac
+  # ⛔ ONLY PID 0 IS EXCLUDED NUMERICALLY. `kill -0 0` targets OUR OWN PROCESS GROUP, so 0 can never
+  # be a lock owner — but pid 1 is a normal answer in a container whose entrypoint IS the loop, and
+  # the shape arm answers it correctly either way (init is not `<shell> <…/orch-loop.sh>`). Treating 1
+  # as "provably not the owner" was a THIRD reclaim reason the design does not sanction, and a
+  # numeric assumption is not positive evidence (fresh review of #1985, P2).
+  [ "$p" -gt 0 ] || return 1
+  cmd="$(_orch_lock_probe "$p")"; case $? in
+    0) ;;                                         # present, argv read
+    1) return 1 ;;                                # positively absent — the lock outlived its writer
+    *) ORCH_LOCK_WHY="the process table or that pid's argv cannot be read"; return 2 ;;
+  esac
+  # ⛔ AN ARGV WE READ BUT COULD NOT ATTRIBUTE IS NOT PROOF OF NON-OWNERSHIP. `_orch_argv_is_loop` answers
+  # "is this the canonical shape"; a controller started with a shell OPTION (`bash -x …/orch-loop.sh`) is
+  # neither that shape nor provably a non-controller, so it is deferred to a human as CANNOT-TELL rather
+  # than reclaimed out from under a live owner (#1715). Everything the shape rule DOES attribute as a
+  # non-controller (a `sleep`, a `-c` wrapper — #1856) still reclaims on rc 1 below, unchanged.
+  _orch_argv_is_loop "$cmd" || {
+    if _orch_argv_is_loop_flagged "$cmd"; then
+      ORCH_LOCK_WHY="that pid's argv is a SHELL INVOCATION of orch-loop.sh carrying an option the ownership rule cannot attribute"; return 2
+    fi
+    return 1                                      # argv READ, and it is not an orch-loop.sh
+  }
+  lt="$(date -r "$lf" +%s 2>/dev/null)" || { ORCH_LOCK_WHY="the lock file's own timestamp cannot be read"; return 2; }
+  case "$lt" in ''|*[!0-9]*) ORCH_LOCK_WHY="the lock file's own timestamp cannot be read"; return 2 ;; esac
+  pstart="$(_orch_ps_start_epoch "$p")" || { ORCH_LOCK_WHY="that pid's START TIME cannot be read"; return 2; }
+  [ "$pstart" -gt "$(( lt + ORCH_LOCK_START_SLACK_SECONDS ))" ] && return 1   # began AFTER the lock
+  return 0
+}
 acq() { ( set -o noclobber; echo $$ > "$LOCKF" ) 2>/dev/null; }
 if ! acq; then
-  OPID="$(cat "$LOCKF" 2>/dev/null || echo 0)"
-  if [ "${OPID:-0}" -gt 0 ] && kill -0 "$OPID" 2>/dev/null; then echo "[orch-loop] already running (pid $OPID)"; exit 0; fi
+  # Digits only, like `orchestrator-bringup.sh:lock_pid`: a lock carrying `abc` reached `[ abc -gt 0 ]`
+  # — an ERRORED test, which is FALSE, which reclaimed it — so the read is sanitised before any test.
+  OPID="$(tr -dc '0-9' 2>/dev/null < "$LOCKF")"
+  # ⛔ THE VERDICT RUNS IN A SUBSHELL AND TRANSPORTS ITS ANSWER THROUGH STDOUT — A STATEMENT SPLIT DOES
+  # NOT CONTAIN ANYTHING (fresh review of #1985, P3; MEASURED, both shapes). `v; _OV=$?` and `v`⏎`_OV=$?`
+  # are the SAME AND-OR list, so a bash ARITHMETIC fault inside the verdict does not stop at the
+  # verdict — it aborts the whole `if ! acq` compound (no refusal, no CANNOT-TELL, no reclaim log, no
+  # `rm`) and execution then continues PAST it: the newcomer prints STARTED with NO lock of its own
+  # while the live owner's lock stays on disk, and its EXIT trap later deletes THAT lock (#1715).
+  # ⛔ A PLAIN `( verdict ); _OV=$?` CONTAINS THE FAULT BUT IS NOT A FIX: it mints rc **1**, which is
+  # the RECLAIM answer — the destructive direction (MEASURED). So the verdict reports its rc AND its
+  # reason on stdout from inside the subshell, and a substitution that produced NO result (the fault
+  # aborted it) is mapped to 2 = CANNOT-TELL, which refuses LOUDLY. The input validation above stays
+  # the FIRST line of defence; this is the containment for a fault it cannot know about, which is the
+  # shape the slack fault arrived in.
+  _OVR="$( _orch_lock_verdict "${OPID:-0}" "$LOCKF"; printf '%s\t%s' "$?" "${ORCH_LOCK_WHY:-}" )"
+  _OV="${_OVR%%"$TAB"*}"
+  ORCH_LOCK_WHY="${_OVR#*"$TAB"}"
+  case "${_OV:-}" in
+    0|1|2) ;;
+    *) _OV=2
+       [ -n "${_OVR:-}" ] || ORCH_LOCK_WHY="the ownership verdict itself faulted: it produced NO result, so nothing about the owner was established" ;;
+  esac
+  if [ "$_OV" = 0 ]; then echo "[orch-loop] already running (pid $OPID)"; exit 0; fi
+  if [ "$_OV" = 2 ]; then
+    _MSG="[orch-loop] CANNOT-TELL: lock $LOCKF names pid ${OPID:-none} and ${ORCH_LOCK_WHY:-the owner cannot be identified}, so a RECYCLED pid cannot be ruled out — a second controller is refused (agent-infra#1715). If no controller is running: rm -f $LOCKF (agent-infra#1985)"
+    echo "$_MSG" >&2
+    # ⛔ `${LOG:-/dev/null}`, NOT `$LOG`: this block is EXTRACTED and driven by consumers that supply
+    # only `O` (`selftest.sh` §20 runs it under `set -u`), where an unbound `$LOG` ABORTS the shell
+    # before the reclaim — a red shard AND a vacuously green refusal arm (fresh review of #1985, P2).
+    echo "[lock] CANNOT-TELL — $_MSG" >> "${LOG:-/dev/null}" 2>/dev/null || true
+    exit 0
+  fi
+  # Positive evidence only: absent, not an orch-loop.sh, or provably begun AFTER the lock. Logged,
+  # because a silent reclaim is the other half of the #1715 class (it must never be invisible).
+  echo "[lock] reclaiming $LOCKF — pid ${OPID:-none} is provably NOT the owner (absent, not an orch-loop.sh invocation, or begun after the lock was written)" >> "${LOG:-/dev/null}" 2>/dev/null || true
   rm -f "$LOCKF"
   acq || { echo "[orch-loop] lock race — exiting"; exit 0; }
 fi
+# [orchlock:end]
 # ⛔ THE SIGNAL HANDLERS ONLY TERMINATE — THE LOCK IS RELEASED BY THE `EXIT` TRAP ALONE.
 # Was `trap 'rm -f "$LOCKF"' EXIT INT TERM`, and for INT/TERM a handler that RETURNS does NOT
 # terminate: bash RESUMES the interrupted command loop, so the documented stop path
@@ -2105,7 +2555,11 @@ fi
 # (measured), which is fail-closed — `acq()` reclaims a dead pid.
 trap 'exit 143' TERM
 trap 'exit 130' INT
-trap 'rm -f "$LOCKF"' EXIT
+# ⛔ AND THE SCRATCH DIR IS REAPED HERE TOO. `gh_bound_cleanup` (defined in the gh-bound block) removes
+# the ONE `bounded.*` dir the internal watchdog inherited, so a controller that lives for a month does
+# not leave it behind for the next boot to find. It is a `command -v`-guarded no-op on every host that
+# resolved a real `timeout` and on the DEGRADED path.
+trap 'rm -f "$LOCKF"; command -v gh_bound_cleanup >/dev/null 2>&1 && gh_bound_cleanup' EXIT
 
 # ── THE FORK-FREE TIMER IS OPENED HERE, WHILE THE BOX CAN STILL FORK (agent-infra#2293) ─────────
 # The starved path must wait without spawning, and `mkfifo`/`exec` themselves spawn/CREATE — so both
@@ -3605,7 +4059,7 @@ spawn_gate_tok() {
 # The polarity is the same ALLOW-LIST the sweep's classifier and fix-one.sh use (#1714): a state this
 # code has never seen is RED, never "not in the red set".
 head_reds() {
-  gh pr checks "$1" --repo "$OR" --json name,state 2>/dev/null | python3 -c '
+  gh_bounded pr checks "$1" --repo "$OR" --json name,state 2>/dev/null | python3 -c '
 import sys, json
 try:
     d = json.load(sys.stdin)
@@ -3860,7 +4314,7 @@ cascade_main_probe() {
   # helper prints GREEN, and a blind read becomes an all-clear — the fail-open this probe exists to
   # avoid. The rc is checked before anything is interpreted.
   local rows rc
-  rows="$(gh api "repos/$repo/commits/main/check-runs?per_page=100&filter=all" --paginate \
+  rows="$(gh_bounded api "repos/$repo/commits/main/check-runs?per_page=100&filter=all" --paginate \
         --jq '.check_runs[] | [.id, (.app.slug // "?"), (.name // "?"), (.status // ""), (.conclusion // "")] | @tsv' 2>/dev/null)"
   rc=$?
   if [ "$rc" -ne 0 ]; then
@@ -4203,7 +4657,7 @@ res_line() {
     /mds_stores|mds$/ {m+=$1}
     END {printf "opendirectoryd=%.0f%% automountd=%.0f%% kernel_task=%.0f%% fseventsd=%.0f%% mds=%.0f%%", o,a,k,f,m}')"
   # GitHub API ceiling — a capacity limit that is NOT on this machine
-  rate="$(gh api rate_limit --jq '.resources.graphql | "\(.remaining)/\(.limit)"' 2>/dev/null)"
+  rate="$(gh_bounded api rate_limit --jq '.resources.graphql | "\(.remaining)/\(.limit)"' 2>/dev/null)"
   echo "[res] cpu(${cpu:-?}) | mem(${pmem:-?}) | swap(${swapfree:-?}/${swaptotal:-?}) | disk(${dline:-?}) | procs=$procs runnable=$runnable | svc(${svcs:-?}) | gh_gql=${rate:-?}" >> "$LOG"
 }
 review_slots() { # <unowned_prs>
@@ -4358,6 +4812,69 @@ sweep_defer_until() {
   [ "$cand" -gt $(( now + 3600 )) ] && cand=$(( now + 3600 ))
   printf '%s\n' "$cand"
 }
+# gh_limit_recorded_until -> the block WINDOW `gh-limit.py` recorded for its last refusal, as epoch
+# seconds, or EMPTY. The same `last-limit` record `gh_limit_token` prints: `gh-limit.py:480-495`
+# writes `until=` from `record_window`/`marker_until`, and #2137 states the rule every reader owes it
+# — "a reader must block until `until`, never until `reset`" (the reset of a secondary/unclassified
+# refusal is not a recovery time).
+# ⛔ AGE-BOUNDED AND RECOVERY-SUPPRESSED ON READ, exactly like the token: the record outlives the
+# process that wrote it, so a stale one is not evidence about THIS cycle, and a limit the layer has
+# since recovered from is not one to defer for. `GH_LIMIT_STALE_S` is the cycle's own 900 s window and
+# the default here matches it, so this helper stays self-contained for the extraction-driven suite.
+gh_limit_recorded_until() {
+  local f rec kv at="" until="" recovered="" bucket="" age
+  f="${GH_LIMIT_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/gh-limit}/last-limit"
+  [ -f "$f" ] || return 0
+  rec="$(cat "$f" 2>/dev/null)" || return 0
+  # ONE line of `key=value` pairs, no spaces in any value, so word splitting IS the parse.
+  for kv in $rec; do
+    case "$kv" in
+      at=*)        at="${kv#at=}" ;;
+      until=*)     until="${kv#until=}" ;;
+      recovered=*) recovered="${kv#recovered=}" ;;
+      bucket=*)    bucket="${kv#bucket=}" ;;
+    esac
+  done
+  is_num "${at:-}" && is_num "${until:-}" && [ "$until" -gt 0 ] || return 0
+  # ⛔ THE RECORD IS ONE PER BOX, NOT ONE PER BUCKET (`record_limit` replaces `last-limit` —
+  # gh-limit.py says so in as many words, "one record per box, by design"), and the layer writes it
+  # OUTSIDE the box lock. So between the sweep's own refusal and this read, a concurrent GRAPHQL
+  # refusal can replace a core one — and a graphql primary exhaustion's `until=` is that bucket's
+  # reset, up to an hour out. Deferring the REST sweep on it would stop merges on a box whose `core`
+  # has quota, and the header path this companion backstops can never do that (a header belongs to
+  # the response's own bucket). Only a `core` observation may defer the sweep; anything else falls
+  # back to the now+60 floor. A record with no `bucket=` predates the field and is treated as core,
+  # which is the bucket every pre-#2137 record was written for.
+  [ "${bucket:-core}" = "core" ] || return 0
+  if is_num "${recovered:-}" && [ "$recovered" -ge "$at" ]; then return 0; fi
+  age=$(( $(date +%s) - at ))
+  { [ "$age" -ge 0 ] && [ "$age" -le "${GH_LIMIT_STALE_S:-900}" ]; } || return 0
+  printf '%s\n' "$until"
+}
+# sweep_defer_until_recorded <raw-response> -> sweep_defer_until, PLUS the layer's own window when the
+# response carried no rate-limit headers at all.
+# ⛔ THE DEFERRAL HAD NO WINDOW TO READ ON THE PATH THAT MATTERS MOST. The controller's calls are now
+# bounded AND `GH_LIMIT_NO_WAIT` (see the gh-bound block), so a rate-limited call comes back AT ONCE
+# with the RATE-LIMITED refusal on STDERR and NO response headers — there was no request to take them
+# from. `sweep_defer_until ""` can only floor that at now+60, so the box re-attempted a spent bucket
+# once a minute for the length of the limit. The layer already recorded the window its own
+# classification justifies; this takes the LATER of the two.
+# A header always WINS: it is this response's truth, while the record is the last one's — so the record
+# is consulted only when the response carries neither `retry-after` nor `x-ratelimit-reset`, and the
+# result keeps the same now+3600 ceiling the header path applies.
+sweep_defer_until_recorded() {
+  local raw="${1:-}" cand until now
+  cand="$(sweep_defer_until "$raw")"
+  if [ -n "$(printf '%s\n' "$raw" | rl_header 'retry-after')" ] \
+     || [ -n "$(printf '%s\n' "$raw" | rl_header 'x-ratelimit-reset')" ]; then
+    printf '%s\n' "$cand"; return 0
+  fi
+  until="$(gh_limit_recorded_until)"
+  [ -n "$until" ] && [ "$until" -gt "$cand" ] && cand="$until"
+  now="$(date +%s)"
+  [ "$cand" -gt $(( now + 3600 )) ] && cand=$(( now + 3600 ))
+  printf '%s\n' "$cand"
+}
 # END sweep-quota
 
 # Count of open PRs. This number drives the SCOPE decision (BROAD drain vs OWN) and the sticky
@@ -4386,7 +4903,7 @@ open_pr_count() { # -> echoes the open-PR count; never 0 on failure; writes stat
   # ⛔ THE BRANCH TRAVELS WITH THE ROW BECAUSE OWNERSHIP IS A LIVE FACT PER PR (2026-10-18). The
   # predicate is "a running process's cwd is a checkout of this PR's head ref", so the head ref has
   # to be in the row. A git ref cannot contain ':', so ':' stays an unambiguous separator.
-  if raw="$(gh pr list --repo "$OR" --state open --limit 300 \
+  if raw="$(gh_bounded pr list --repo "$OR" --state open --limit 300 \
              --json number,headRefOid,headRefName \
              --jq '"\(length) \(map("\(.number):\(.headRefOid):\(.headRefName)") | join(" "))"' \
              2>"$O/state/.open-err.$$")"; then
@@ -4898,6 +5415,16 @@ while true; do
   # interval, which is why `boot` covers the fork probe: a fork probe that costs seconds is exactly
   # the kind of structural cost this instrument exists to surface.
   stg_cycle_reset
+  # ── agent-infra#2028: the gh bound's PER-CYCLE trip latch starts empty ────────────────────────
+  # ⛔ FORK-FREE ON PURPOSE. `:` and `printf` are builtins and `>` is a redirect; `rm` would be a fork,
+  # and this line sits ABOVE `fork_gate` — the one place in the file where a failed fork TERMINATES the
+  # controller (#2293). A truncated file reads as 0 trips in `gh_trips_read`, which is exactly right.
+  : > "$GH_BOUND_STATE" 2>/dev/null || true
+  # ⛔ A DEGRADED BOUND IS DISCLOSED EVERY CYCLE, NOT ONCE AT STARTUP: a log read by `tail` must be able
+  # to tell "bounded" from "unbounded" from this cycle's own lines (agent-infra#2028).
+  if [ "${GH_BOUND_OFF:-0}" = "1" ]; then
+    printf '[bound] ⚠️ DEGRADED this cycle: %s — gh calls are UNBOUNDED (agent-infra#2028)\n' "${GH_BOUND_HOW:-?}" >> "$LOG" 2>/dev/null || true
+  fi
   # ── 0) FORK HEADROOM, BEFORE THE FIRST FORK OF THE CYCLE (agent-infra#2293) ───────────────────
   # ⛔ THIS BLOCK MUST STAY ABOVE `date`/`git`/`gh`/ANY `$( )`. A box that cannot fork dies on the
   # first spawn (measured: bash exits, rc 254), so a gate placed after the clock is a gate that never
@@ -5251,7 +5778,8 @@ while true; do
   [ "${#DEFER_UNTIL}" -le 10 ] || DEFER_UNTIL=0
   LAST_FULL="$(cat "$O/state/sweep-stamp" 2>/dev/null || true)";       is_num "${LAST_FULL:-}"  || LAST_FULL=0
   [ "${#LAST_FULL}" -le 10 ] || LAST_FULL=0
-  # Clamp on READ, not only on write. Both writers below go through sweep_defer_until (<= now+3600),
+  # Clamp on READ, not only on write. Both writers below go through sweep_defer_until (or its
+  # `_recorded` twin, which applies the same ceiling) (<= now+3600),
   # so an implausible value can only arrive from a corrupt/truncated/hand-edited state file — but it
   # is the one piece of new state whose corruption stops the fleet merging and is never left, so it
   # degrades to a FULL sweep rather than a permanent stall.
@@ -5285,7 +5813,7 @@ while true; do
     # them this cycle. Named on every per-PR row rather than folded into the generic string.
     SWEEP_CACHE_NOTE="the sweep is DEFERRED (rate-limited until ${DEFER_UNTIL}) — no listing was requested, so no PR was read this cycle"
   else
-    if SWEEP_RAW="$(gh api --paginate -i ${COND[@]+"${COND[@]}"} --jq \
+    if SWEEP_RAW="$(gh_bounded api --paginate -i ${COND[@]+"${COND[@]}"} --jq \
         ".[]|{number,headRefName:.head.ref,isDraft:.draft,created:.created_at,sha:.head.sha}|select((.isDraft|not) or (.headRefName|test(\"-tm$|-cap$|^fix/\")))|$SEL|\"\(.number)\t\(.headRefName)\t\(.isDraft)\t\(.created)\t\(.sha)\"" \
         "repos/$OR/pulls?state=open&per_page=100" 2>"$O/state/.sweep-err.$$")"; then
       SWEEP_RC=0
@@ -5338,7 +5866,9 @@ while true; do
       # never confirmed this cycle. The failure is named instead, and the row reason carries it.
       SWEEP_CACHE_NOTE="the PR listing FAILED ($SWEEP_KIND) — the cached rows were NOT used, so no PR was read this cycle"
       if [ "$SWEEP_KIND" = "rate-limit" ]; then
-        DEFER_UNTIL="$(sweep_defer_until "${SWEEP_RAW:-}")"
+        # ⛔ `_recorded`: a bounded `GH_LIMIT_NO_WAIT` refusal carries NO headers, so the layer's own
+        # recorded `until=` is the only window available here (see the helper in the sweep-quota block).
+        DEFER_UNTIL="$(sweep_defer_until_recorded "${SWEEP_RAW:-}")"
         printf '%s\n' "$DEFER_UNTIL" > "$O/state/sweep-defer-until"
         echo "[sweep] ⛔ RATE-LIMITED (HTTP ${SWEEP_STATUS:-?} rc=$SWEEP_RC; remaining=${RL_REMAIN:-?} reset=${RL_RESET:-?} retry-after=${RL_AFTER:-?}) — sweep DEFERRED $(( (DEFER_UNTIL - NOW + 59) / 60 ))m. THIS CELL CANNOT MERGE, NOT IDLE. (${SWEEP_ERR:-no stderr})" >> "$LOG"
       else
@@ -5904,7 +6434,7 @@ while true; do
       # `(not draft) or (branch matches the OWN pattern)`, so a draft that reaches this loop IS
       # selected for action and `gh pr ready` is that action. Recording it as a wait would write a
       # false wait onto an acted PR — the inverse of the defect this change removes.
-      if gh pr ready "$PR" --repo "$OR" >/dev/null 2>&1; then
+      if gh_bounded pr ready "$PR" --repo "$OR" >/dev/null 2>&1; then
         echo "#$PR readied (was a draft)" >>"$LOG"; disp "$PR" - - act "draft readied"
       else
         echo "#$PR draft: 'gh pr ready' FAILED — it will be retried next cycle" >>"$LOG"
@@ -5912,7 +6442,7 @@ while true; do
       fi
       continue
     fi
-    PR_ST="$(gh pr view "$PR" --repo "$OR" --json state --jq .state 2>/dev/null)"
+    PR_ST="$(gh_bounded pr view "$PR" --repo "$OR" --json state --jq .state 2>/dev/null)"
     # CLOSED too: a PR listed open can close between `gh pr list` and here. The retired sweep.sh
     # guarded both; the live rewrite kept only MERGED, so a closed PR fell through to
     # `gh pr ready` + `gh pr merge` every cycle and logged `#<PR> merge fail` forever.
@@ -5939,7 +6469,7 @@ while true; do
       rm -f "$O/state/redfix-$PR" 2>/dev/null || true
       rm -f "$O/state/fixgate-$PR-"* 2>/dev/null || true
       disp "$PR" - - wait "${PR_ST:-closed} since the count was read (nothing to do)"; continue ;; esac
-    HEAD_N="$(gh pr view "$PR" --repo "$OR" --json headRefOid --jq .headRefOid 2>/dev/null)"
+    HEAD_N="$(gh_bounded pr view "$PR" --repo "$OR" --json headRefOid --jq .headRefOid 2>/dev/null)"
     # ── THE DURABLE CLAIM DECIDES BEFORE ANY ARM ACTS (agent-infra#2466) ──────────────────────
     # ⛔ THIS IS THE SELECTION POINT, and it is the one place where a second controller's work is
     # invisible: everything below (`redfix`, the parked guard, the spawn guards, the GREEN arm that
@@ -6349,7 +6879,7 @@ while true; do
     # Two copies of these rules is exactly how the harness and the merge rail disagreed before (#1714),
     # so the arm calls this file instead of a lookalike. `$_CK_PY` is resolved once at startup (see
     # there) and is an ABSOLUTE path, so this pipeline's subshell inherits it.
-    V="$(gh pr checks "$PR" --repo "$OR" --json name,state,workflow 2>/dev/null | REQ="$REQ" REVIEW_GATE="$REVIEW_GATE" python3 "${_CK_PY:-/nonexistent/check-class.py}" 2>/dev/null)"
+    V="$(gh_bounded pr checks "$PR" --repo "$OR" --json name,state,workflow 2>/dev/null | REQ="$REQ" REVIEW_GATE="$REVIEW_GATE" python3 "${_CK_PY:-/nonexistent/check-class.py}" 2>/dev/null)"
     # ⛔ AN EMPTY VERDICT IS A READ FAILURE, NEVER A CLASS (#3110). `check-class.py` ALWAYS prints one
     # token, so `V` empty means the classifier never answered at all — a python that could not start, a
     # file that vanished between the startup guard and this line, a killed pipeline. That reached the
@@ -6464,7 +6994,7 @@ while true; do
     # `[redfix:end]` close); only the actual conflict repair is level 3.
     case "$V" in
       GREEN|PENDING:*)
-        MSTAT="$(gh pr view "$PR" --repo "$OR" --json mergeable --jq .mergeable 2>/dev/null)"
+        MSTAT="$(gh_bounded pr view "$PR" --repo "$OR" --json mergeable --jq .mergeable 2>/dev/null)"
         if [ "${MSTAT:-}" = "CONFLICTING" ]; then
           stg_lvl_start l3_fix || :   # a conflicting PR is repaired: cascade level 3
           # A bailed fixer must not have consumed an attempt here (P2, second review round).
@@ -6522,7 +7052,7 @@ while true; do
         # job is to shrink the open-PR queue. Crediting it here is what lets a record answer "was
         # the long cycle merging, fixing, reviewing, or none of the above".
         stg_lvl_start l2_merge || :
-        gh pr ready "$PR" --repo "$OR" >/dev/null 2>&1 || true
+        gh_bounded pr ready "$PR" --repo "$OR" >/dev/null 2>&1 || true
         # ⛔ ONLY WHERE GREEN MEANS THE EVIDENCE EXISTS (review round 2, P2 — agent-infra#2132). On a
         # RAIL repo `ai-review-gate` is not in `$REQ`, so V=GREEN means "the required checks pass",
         # NOT "a reviewer recorded something" — the exact premise agent-infra#1825 exists to refute.
@@ -6579,7 +7109,7 @@ while true; do
           # ANY authority that was not `rail` — INCLUDING `unknown` — reached a RAW `gh pr merge`,
           # the exact bypass this whole change exists to prevent. Allow-list polarity: a raw merge
           # happens only on an authority that NAMES the gate.
-          if gh pr merge "$PR" --repo "$OR" --squash >>"$LOG" 2>&1; then
+          if gh_bounded pr merge "$PR" --repo "$OR" --squash >>"$LOG" 2>&1; then
             echo "#$PR MERGED" >>"$LOG"; disp "$PR" "${HEAD_N:-}" GREEN act "merged (gate authority)"
           else
             echo "#$PR merge fail" >>"$LOG"; disp "$PR" "${HEAD_N:-}" GREEN wait "gate-authority merge FAILED (retried next cycle)"
@@ -6595,9 +7125,9 @@ while true; do
         # not doing — and on a rail repo, where PENDING is the majority state, the field answered "was
         # this cycle fixing?" for a cycle that was only waiting to merge.
         stg_lvl_start l2_merge || :
-        gh pr ready "$PR" --repo "$OR" >/dev/null 2>&1 || true
+        gh_bounded pr ready "$PR" --repo "$OR" >/dev/null 2>&1 || true
         if [ "$MERGE_AUTHORITY" = "gate" ]; then
-          if gh pr merge "$PR" --repo "$OR" --squash --auto >>"$LOG" 2>&1; then
+          if gh_bounded pr merge "$PR" --repo "$OR" --squash --auto >>"$LOG" 2>&1; then
             echo "#$PR auto-armed" >>"$LOG"; disp "$PR" "${HEAD_N:-}" "$V" act "auto-merge armed (gate authority)"
           else
             disp "$PR" "${HEAD_N:-}" "$V" wait "auto-merge arm FAILED (retried next cycle)"
@@ -7025,7 +7555,7 @@ while true; do
           # now that every arm settles its own, it would have been attributed to NO level at all. Its
           # `gh pr checks` RID lookup and `gh run rerun` are both CI repair work.
           stg_lvl_start l3_fix || :
-          RID="$(gh pr checks "$PR" --repo "$OR" --json name,link --jq '.[]|select(.name=="python-ci-gate")|.link' 2>/dev/null | sed -nE 's#.*/runs/([0-9]+).*#\1#p')"
+          RID="$(gh_bounded pr checks "$PR" --repo "$OR" --json name,link --jq '.[]|select(.name=="python-ci-gate")|.link' 2>/dev/null | sed -nE 's#.*/runs/([0-9]+).*#\1#p')"
           # ⛔ A RERUN IS A CI-SPENDING ACT, so it is gated like one (#2333 review P2). `gh run rerun`
           # enqueues work on the same runners the gate is holding work OUT of — the one surface in
           # this sweep that ADDS queue while the gate says "do not". Reviewing, re-recording and
@@ -7045,7 +7575,7 @@ while true; do
               echo "#$PR CI rerun WITHHELD by the ci-queue gate — this PR already has a disposition row this cycle, so it is left standing rather than overwritten" >> "$LOG"
             fi
           elif [ -n "${RID:-}" ] && [ ! -f "$O/state/rerun-$PR-$RID" ]; then
-            if gh run rerun "$RID" --repo "$OR" --failed >>"$LOG" 2>&1; then
+            if gh_bounded run rerun "$RID" --repo "$OR" --failed >>"$LOG" 2>&1; then
               touch "$O/state/rerun-$PR-$RID"; echo "#$PR rerun CI" >>"$LOG"
               _prior="$(awk -F'\t' -v p="$PR" '$1==p && $4=="act"{printf "%s", $5}' "$PRDISP" 2>/dev/null | tail -1)"
               if [ -n "${_prior:-}" ]; then

@@ -49,6 +49,11 @@ sed -n '/# \[sweep-cursor:begin\]/,/# \[sweep-cursor:end\]/p' "$LOOP" | sed '1d;
 grep -m1 '^is_num() {' "$LOOP"   > "$T/deps.sh"
 grep -m1 '^is_limit() {' "$LOOP" >> "$T/deps.sh"
 awk '/^# BEGIN sweep-quota/,/^# END sweep-quota/' "$LOOP" >> "$T/deps.sh"
+# ⛔ THE EXTRACTED BLOCKS' `gh` CALLS GO THROUGH THE SHIPPED `gh_bounded` (agent-infra#2028). Stubbed as a
+# TRANSPARENT PASS-THROUGH: the bound itself is graded by `gh-bound.test.sh` against the real block, and
+# repeating it here would make this suite depend on `scripts/lib/bounded.sh` on the runner. The name is
+# pinned — a rename in the shipped block leaves these calls unresolved and the checks RED.
+printf 'gh_bounded() { gh "$@"; }\n' >> "$T/deps.sh"
 # The loop's own row reader, so "the rows are consumable" is graded on the shipped read, not a copy.
 grep -E 'read -r PR BR DRAFT OWN' "$LOOP" | head -1 | sed -E 's/^ *//' > "$T/reader.sh"
 

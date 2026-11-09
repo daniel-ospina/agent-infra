@@ -42,6 +42,13 @@ awk '/^  # BEGIN sweep-listing/,/^  # END sweep-listing/' "$LOOP" > "$T/block.sh
 # cannot drift.
 grep -m1 '^is_num() {' "$LOOP" > "$T/deps.sh"
 cat "$T/quota.sh" >> "$T/deps.sh"
+# ⛔ EVERY `gh` CALL IN THE EXTRACTED BLOCK NOW GOES THROUGH THE SHIPPED `gh_bounded` (agent-infra#2028),
+# so the rig needs that name. It is stubbed as a TRANSPARENT PASS-THROUGH here on purpose: the bound
+# ITSELF is graded by `gh-bound.test.sh` against the real shipped block, and repeating it here would make
+# this suite depend on `scripts/lib/bounded.sh` being installed on the runner — a quota suite that fails
+# for a reason it does not test. The name is still pinned: a rename in the shipped block would leave the
+# call unresolved and every check below RED.
+printf 'gh_bounded() { gh "$@"; }\n' >> "$T/deps.sh"
 
 # ── the stub `gh` ───────────────────────────────────────────────────────────────
 # Records every argv to $GH_CALLS, then prints a canned `gh api --include` response. The 200 body is
@@ -187,11 +194,64 @@ if need "$T/quota.sh" "the sweep-quota helper block"; then
   got="$(sweep_defer_until "$raw")"
   [ "$got" -le $(( now + 3610 )) ] && ok "sweep_defer_until: an absurd reset is capped at 1h" \
                                     || bad "sweep_defer_until returned a runaway '$got'"
+  # ⛔ A BOUNDED `GH_LIMIT_NO_WAIT` REFUSAL CARRIES NO HEADERS AT ALL (agent-infra#2028 review P1). The
+  # layer answers before the request is servable, so `sweep_defer_until ""` can only floor the deferral
+  # at now+60 — and the box re-attempted a spent bucket once a minute for the whole limit. The layer
+  # records the window its own classification justifies (`until=`, gh-limit.py record_window);
+  # `sweep_defer_until_recorded` takes the LATER of the two. Every case below is driven from a fixture
+  # `GH_LIMIT_DIR`, never the runner's own cache.
+  mkdir -p "$T/ghlimit"; export GH_LIMIT_DIR="$T/ghlimit"
+  rec() { printf 'at=%s bucket=core reset=0 attempts=1 waited=0 status=403 kind=primary until=%s remaining=0 recovered=%s\n' "$1" "$2" "${3:-0}" > "$T/ghlimit/last-limit"; }
+  rec "$now" "$(( now + 3000 ))"
+  got="$(sweep_defer_until_recorded '')"
+  [ "$got" -ge $(( now + 2990 )) ] && [ "$got" -le $(( now + 3010 )) ] \
+    && ok "sweep_defer_until_recorded: no headers → the layer's recorded until= window is used, not the 60s floor" \
+    || bad "sweep_defer_until_recorded ignored the recorded until= ('$got', want ~$(( now + 3000 )))"
+  raw="$(printf 'HTTP/2.0 403 x\r\nX-Ratelimit-Reset: %s\r\n\r\n' "$(( now + 120 ))")"
+  got="$(sweep_defer_until_recorded "$raw")"
+  [ "$got" -le $(( now + 140 )) ] \
+    && ok "sweep_defer_until_recorded: a response header WINS over a later recorded window (this response's truth, not the last one's)" \
+    || bad "sweep_defer_until_recorded let a stale record overrule the response headers ('$got')"
+  rec "$(( now - 1800 ))" "$(( now + 3000 ))"
+  got="$(sweep_defer_until_recorded '')"
+  [ "$got" -le $(( now + 70 )) ] \
+    && ok "sweep_defer_until_recorded: a record older than the window is not evidence about THIS cycle (falls back to the floor)" \
+    || bad "sweep_defer_until_recorded trusted a stale record ('$got')"
+  rec "$now" "$(( now + 3000 ))" "$now"
+  got="$(sweep_defer_until_recorded '')"
+  [ "$got" -le $(( now + 70 )) ] \
+    && ok "sweep_defer_until_recorded: a limit the layer already RECOVERED from defers nothing" \
+    || bad "sweep_defer_until_recorded deferred on a recovered limit ('$got')"
+  rec "$now" "$(( now + 999999 ))"
+  got="$(sweep_defer_until_recorded '')"
+  [ "$got" -le $(( now + 3610 )) ] \
+    && ok "sweep_defer_until_recorded: the recorded window keeps the same 1h ceiling as the header path" \
+    || bad "sweep_defer_until_recorded returned a runaway '$got'"
+  # ⛔ THE RECORD IS ONE PER BOX, NOT ONE PER BUCKET, and the layer writes it outside the box lock. A
+  # GRAPHQL refusal (the `gh pr` calls) must therefore never defer the REST sweep: its window is that
+  # bucket's, and core may have quota — the header path this backstops cannot make that mistake.
+  printf 'at=%s bucket=graphql reset=0 attempts=1 waited=0 status=403 kind=primary until=%s remaining=0 recovered=0\n' \
+    "$now" "$(( now + 3000 ))" > "$T/ghlimit/last-limit"
+  got="$(sweep_defer_until_recorded '')"
+  [ "$got" -le $(( now + 70 )) ] \
+    && ok "sweep_defer_until_recorded: another BUCKET's refusal does not defer the REST sweep (one record per box, so the bucket is checked)" \
+    || bad "sweep_defer_until_recorded let a graphql window defer the core sweep ('$got')"
+  printf 'at=%s bucket=core reset=0 attempts=1 waited=0 status=403 kind=primary until=%s remaining=0 recovered=0\n' \
+    "$now" "$(( now + 3000 ))" > "$T/ghlimit/last-limit"
+  got="$(sweep_defer_until_recorded '')"
+  [ "$got" -ge $(( now + 2990 )) ] \
+    && ok "sweep_defer_until_recorded: …while a CORE refusal still defers it (the control half — the bucket check is not vacuous)" \
+    || bad "sweep_defer_until_recorded ignored a core record ('$got')"
+  unset GH_LIMIT_DIR
 fi
 
 # ── 2) the listing must be the conditional REST call, not `gh pr list` ───────────
 if need "$T/block.sh" "the sweep-listing block"; then
-  grep -q 'gh api --paginate -i' "$T/block.sh" && ok "the shipped listing uses a REST \`gh api\` call (ETags live there)" \
+  # ⛔ THE ARGV, NOT THE CALLER'S NAME: since agent-infra#2028 the listing runs through `gh_bounded`, so a
+  # literal `grep 'gh api --paginate -i'` reddened on a fix that kept the REST call and bounded it. What
+  # this check is FOR is that the listing is REST + paginated + `-i` (headers are where ETags live) —
+  # whichever wrapper precedes it.
+  grep -qE '(gh|gh_bounded) api --paginate -i' "$T/block.sh" && ok "the shipped listing uses a REST \`gh api\` call (ETags live there)" \
     || bad "the shipped listing is not a \`gh api\` call — no conditional request is possible"
   grep -q 'gh pr list' "$T/block.sh" && bad "the shipped listing still shells out to \`gh pr list\` (GraphQL, no ETag)" \
     || ok "the shipped listing no longer uses \`gh pr list\` (GraphQL cannot be conditional)"
