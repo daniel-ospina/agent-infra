@@ -2691,20 +2691,24 @@ assert_absent "$(grep '^remedy=' "$T/t24c2/state/harness-apply.status" 2>/dev/nu
 # ⛔ AND THE VERDICT VOCABULARY IS CLOSED, NOT BLOCKED (review round 35, measured: the token test was a
 # BLOCK-list of token shapes, so `N/A`, `drift+1`, `x=y`, `#2`, `2-drift`, `DRIFT/2` and `stale;` all
 # escaped it and certified `farm: ok` / `farm_rows=none` / `farm_n=0` with the drifting name durable
-# nowhere; `drift:2` and `DRIFTED!` were already refused by that block-list, and a lowercase `stale`
-# matches every historical class. Those three are listed for two DIFFERENT reasons: NARROWING the
-# block-list re-admits `drift:2` and `DRIFTED!` (widening it only refuses more), while a purely
-# alphabetic `stale` sits inside EVERY one of those classes, so no reshaping of the class can re-admit it
-# — only MEMBERSHIP can refuse it, which is what the closed vocabulary now does for all three. Any
-# trailing token outside the instrument's own vocabulary is now a refusal, and each token is its own run
-# because the scan exits on the first hit. Mutant that reds the `stale` row: `if (v == "stale") next` in
-# the allow-list — measured 648 passed / 2 failed, exactly this row's two assertions. `stale` is refused
-# by MEMBERSHIP ALONE, unlike `drift:2`/`DRIFTED!` — the ROUND-34 widened class (never merged) refused
-# those on SHAPE, and t24bx/t24by duplicate them, so their allow-list mutant reds both blocks and proves
-# neither. The rest of
-# this fixture's out-of-vocabulary tokens (`stale;`, `N/A`, `drift+1`, `x=y`, `#2`, `2-drift`, `DRIFT/2`)
-# are membership-only too — `stale` is called out because the OTHER two of the three above are the ones
-# that are duplicated, not because it is the only membership-only token here.
+# nowhere. The MERGED class (`871e455fe`, an ancestor of main: `^[A-Za-z][A-Za-z0-9_ ()-]*$`) did refuse
+# a purely alphabetic `stale` ON SHAPE and let `drift:2` (`:`) and `DRIFTED!` (`!`) straight through —
+# which is why round 34 widened it to `[A-Za-z][A-Za-z0-9_.:! ()-]`; that revision was never merged, and
+# being a strict superset it matched all three. AT THIS HEAD the test is a CLOSED allow-list, so all
+# three are refused by MEMBERSHIP ALONE — nothing else exists, and none is refused on shape any more.
+# Any trailing token outside the instrument's own vocabulary is now a refusal, and each token is its own
+# run because the scan exits on the first hit. Mutant that reds the `stale` row: `if (v == "stale") next`
+# in the allow-list — measured 650 passed / 2 failed, exactly this row's two assertions. What makes
+# `stale` the token to NAME is mutant ATTRIBUTION: t24bx/t24by duplicate `drift:2`/`DRIFTED!`, so each of
+# their mutants reds BOTH blocks (648 passed / 4 failed) and proves neither, while `stale` has no
+# duplicate and its mutant reds one block. It is also the only one of the three that no character class
+# could separate from the instrument's BENIGN `ok` row (same shape — see the round-32 note on the
+# benign-token fixture below), so a shape rule that refuses `stale` refuses every healthy farm, and only
+# a vocabulary list can refuse it without that collateral. The rest of this fixture's out-of-vocabulary
+# tokens (`stale;`, `N/A`, `drift+1`, `x=y`, `#2`, `2-drift`, `DRIFT/2`) are membership-only too — they
+# were under the block-list as well, each carrying a character the class never admitted. `stale` is
+# called out because it is the one the duplication argument does not cover, not because it is the only
+# membership-only token here.
 mk_origin t24c3; mk_clone t24c3
 REPO_P="$CLONE"; MODE_P=sync
 mkdir -p "$T/t24c3/home/.pi/agent/scripts"

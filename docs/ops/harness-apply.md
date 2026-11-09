@@ -258,8 +258,12 @@ match, so the verdict line by itself is the contradiction. The row half uses the
 SAME three-label summary proof as the drift arm (one vocabulary, so the guard can never be weaker than
 the branch it guards) — and the two halves catch different reports: the row scan refuses a trailing token
 the vocabulary does not know, while the summary catches drift a report only TOTALS (no row carries a class
-token at all), so a `2 stale, …` total beside an `rc=0` is a contradiction on its own. A ZERO total is not one: a copy printing both verdict forms over a
-matching farm says `0 stale, 0 declared-but-absent, 0 unsourced`, and that stays a match.
+token at all), so a THREE-LABEL `2 stale, 0 declared-but-absent, 0 unsourced` total beside an `rc=0` is a
+contradiction on its own. A one-label total is not: `farm_sum_count` requires all three label words (a
+single label word in prose is not a summary at all — pinned by the benign-token fixture), so a summary
+printing only `2 stale.` is certified, by design. A ZERO total is not one either: a copy printing both
+verdict forms over a matching farm says `0 stale, 0 declared-but-absent, 0 unsourced`, and that stays a
+match.
 **Absence of evidence is not a match either:** an `rc=0` report this pass cannot CLASSIFY is refused,
 because every other test on this arm fires only on something it can positively recognise. Two signals,
 each named in the journal as an unclassifiable summary or row
