@@ -6,11 +6,11 @@
     "scripts/checkout-hygiene/hub-worktree.sh": "13c74d486851f3edb8f1a94997d7ab07f7da4149fb2a558a67395f867e7f9e0b",
     "scripts/scratch-worktree.sh": "45c8672e2ea2c84a288f89e211577c515cbfeb11c7eb018e875aa0ca97f19db5",
     "scripts/record-review.sh": "16380f77ed6f7e888fe1bfadbea7c638342c85cd8649da5ab7c7efc7fea7daad",
-    "scripts/admin-merge.sh": "c10783f43e04c1987071694a644b13e6c942fbae7a7ee37ee8e4857a7469b4e6",
+    "scripts/admin-merge.sh": "b6049b6c669416e59c20af0c0e2bef9d6c1626d18dabb1391e40637e34e5ac9a",
     "scripts/gh-shim/gh": "def5111b8735a6875e7d7b3cd4c76ad75caa42f8f2bdd2b044f1f86df6774be7"
   },
   "delegates": {
-    "scripts/admin-merge.sh": "c10783f43e04c1987071694a644b13e6c942fbae7a7ee37ee8e4857a7469b4e6",
+    "scripts/admin-merge.sh": "b6049b6c669416e59c20af0c0e2bef9d6c1626d18dabb1391e40637e34e5ac9a",
     "scripts/check-pipeline-compliance.sh": "a95d557c8ab1941bb1b5d4234367efdd83cff13eb474a841d987a5ee3164fd62",
     "scripts/checkout-hygiene/hub-worktree-refresh-advance.sh": "88bde611c5f53bc75c94d56f97b8d6048d21029b1396cb0db162b082ebb9a643",
     "scripts/checkout-hygiene/hub-worktree-salvage-commit.sh": "f747ad00b5babe4474a625b3564f27d3e6523f05147bef79126ff5e4a5a5c29e",

@@ -80,10 +80,12 @@ cells keep their home under `/tmp`** (`/tmp/cell-home`) and their harness pin un
 (`/tmp/cell-home/harness/<sha>/scripts/…`, the shape cell-3 measured as correct), so "under `/tmp`"
 alone cannot be the rule without blocking every cell bring-up. The refusal names the durable
 alternatives (`$AGENT_INFRA_PATH/scripts/…`, the harness pin, and `$HOME/.pi/agent/scripts/…`) and writes
-**nothing** — the preview verb refuses too. ⛔ **The farmed path is only viable on a box that already has
-the file there**: `cloud-cell-supervisor.sh` is in **no** `pi-bootstrap` array (setup.sh records it as a named
-residual owned by #1938), so `bash pi-bootstrap/setup.sh` alone does not create it — the refusal says so
-rather than handing an operator a remedy that cannot be followed.
+**nothing** — the preview verb refuses too. ⛔ **The farmed path IS delivered by this landing (#1938)**:
+`cloud-cell-supervisor.sh` is farmed FLAT by `setup.sh`'s `fleet_srcs`, so `bash pi-bootstrap/setup.sh`
+DOES create `$HOME/.pi/agent/scripts/cloud-cell-supervisor.sh` and the refusal names it as a durable
+alternative. ⚠️ A box installed by an OLDER `setup.sh` may still lack it — re-run the installer rather
+than copying from a clone. (This paragraph said the opposite until the entry landed; kept as a record
+because the refusal text is what an operator acts on.)
 
 ⛔ **"Lane worktree" is decided by GIT — and by the BRANCH, not by being a worktree.** A name list cannot
 be the guard (the measured shape was `/tmp/wt-2433-fu`; the next lane picks the next name, and a copy
@@ -171,9 +173,11 @@ before the preference is consulted, so what the bring-up loses is only the unmer
 must not arm, and it falls through to the **harness pin** (`$CELL_HOME/harness/<pin-sha>`, the box's own
 pinned revision — `check_harness_pin` runs before `check_controller_service`, so it exists by then) and
 then to the farm. ⛔ The pin is graded at preference strength and is tried **before** the two farm paths
-because a pin is this cell's revision where the farm is a possibly-stale copy; note the farm does not ship
-`cloud-cell-supervisor.sh` at all (#1938's named residual), so on a fresh cell the pin is the only
-durable candidate that exists.
+because a pin is this cell's revision where the farm is a possibly-stale copy. `cloud-cell-supervisor.sh`
+itself IS farmed flat as of this landing (#1938), so on a fresh provisioned cell BOTH the pin and the farm can
+deliver it; the pin still wins, because a copy the cell chose beats a copy the installer last happened to
+write. ⚠️ On a box whose installer predates that entry the farm copy is absent and the pin remains the
+only durable candidate — which is why the pin is content-checked rather than assumed.
 
 ## Install targets
 

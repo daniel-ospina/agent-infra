@@ -3212,6 +3212,14 @@ echo 'GraphQL: API rate limit already exceeded for user ID 81560491.' >&2
 exit 1
 SH
 chmod +x "$D/bin/gh"
+# ⛔ ONE SEEDED DISPATCHED ROW, SO THE REAPER'S WINDOWS ARE ACTUALLY ASKED (agent-infra#1984).
+# The pass now SKIPS a window whose reader is empty (`.open_iss` is read only by the dispatched reap,
+# `.pr_brs` by the reap and the checked classification), so a fixture with no `dispatched.txt` — which
+# is what `mk_case` gives — issues ZERO listing requests. That is the bound working, not the transport
+# under test; this case grades the TRANSPORT, so it must have a row to reap. The row cannot be
+# un-blacklisted here: the stub answers no open window and no PR branches, and its fallthrough refuses
+# every GraphQL verb, so the targeted re-check cannot answer either and the row is KEPT (fail-closed).
+printf '77\n' > "$D/o/dispatched.txt"
 rf "$D" refresh GH_LOG="$D/gh-calls"
 [ "$RC" -eq 0 ] && ok "starved-graphql: the pass SUCCEEDS on REST (rc=0) — a starved bucket is not a broken box" \
                || bad "starved-graphql: rc=$RC (want 0) — REST answered and the pass still refused — output: $OUT"
@@ -3292,14 +3300,23 @@ chmod +x "$D/bin/gh"
 # A sentinel makes "nothing written" DISCRIMINATING: an empty file cannot distinguish "the pass
 # refused" from "the backlog was clobbered".
 echo 99 > "$D/o/candidates.txt"
+# ⛔ ONE SEEDED DISPATCHED ROW, SO THE TWO WINDOWS ARE ACTUALLY ASKED (#1984, fresh review P2). The
+# pass now SKIPS a window whose reader is empty, and this fixture seeded only `candidates.txt` — so
+# both windows took the skip arm (each of which `rm -f`s its file) and the rows below were green for
+# ANY implementation of the failure path, including the regressions they exist to catch (`: >`
+# `"$O/.open_iss"` in place of the `rm -f`). That is the same false-PASS shape the three sibling
+# fixtures were seeded for; this is the fourth. `checked.txt` stays EMPTY and that is deliberate: the
+# checked half must not be what keeps the PR window alive.
+printf '77\n' > "$D/o/dispatched.txt"
 # ⛔ PACING IS OFF FOR THIS CASE, DELIBERATELY (agent-infra#1736 follow-up, 2026-10-18, reconciled with
 # #1729). The fixture serves `core.remaining=0` to model a starved bucket, and the shipped script now
 # has a BUDGET gate for exactly that state: a pass that cannot buy one candidate refuses after the
-# `dispatched.txt` reaper (spending two listings instead of the ~40 the pool listing would cost). That
-# refusal is a DIFFERENT subject — it is covered by `refresh-quota.test.sh` (`unaffordable:` case) —
-# while this case's subject is what the LISTINGS do when the bucket refuses them MID-READ: the named
-# 403, no `.open_iss`/`.pr_brs`, and an untouched backlog. Leaving pacing on here would let the budget
-# gate answer for the listing gate, and the assertions below would pass without exercising it.
+# `dispatched.txt` reaper (spending ONE rows-sized page per window since #1984, instead of the ~40 the
+# pool listing would cost). That refusal is a DIFFERENT subject — it is covered by
+# `refresh-quota.test.sh` (`unaffordable:` case) — while this case's subject is what the LISTINGS do
+# when the bucket refuses them MID-READ: the named 403, no `.open_iss`/`.pr_brs`, and an untouched
+# backlog. Leaving pacing on here would let the budget gate answer for the listing gate, and the
+# assertions below would pass without exercising it.
 rf "$D" refresh COLLISION_PREFLIGHT_CORE_PACING=0
 [ "$RC" -eq 1 ] && ok "rest-403: the pass exits TRANSIENT (rc=1) — a starved REST bucket is an outage, not 'no work'" \
                || bad "rest-403: rc=$RC (want 1) — output: $OUT"
@@ -3307,6 +3324,22 @@ rf "$D" refresh COLLISION_PREFLIGHT_CORE_PACING=0
                           || bad "rest-403: a failed issue listing was written as an empty/partial .open_iss"
 [ ! -e "$D/o/.pr_brs" ] && ok "rest-403: a FAILED PR listing leaves NO .pr_brs" \
                          || bad "rest-403: a failed PR listing was written as an empty/partial .pr_brs"
+# ⛔ AND THE ABSENCE IS THE READ'S, NOT THE SKIP ARM'S (#1984, fresh review P2). The two `[ ! -e ]`
+# rows above CANNOT tell the two apart on their own: the end-of-reap cleanup removes both files on
+# every completed pass, so an EMPTY `.open_iss` written by a regressed failure arm is gone by the time
+# they run (measured: mutating the failure arm's `rm -f` to `: >` leaves both of them GREEN). The
+# discriminating observable is the one the failure arm alone produces — the reap's skip naming BOTH
+# listings as NOT READABLE. A listing written as an EMPTY one leaves that file PRESENT, so the skip
+# line names only the other one; hence this row greps BOTH names. Reverting that mutation reddens it
+# and nothing else in the case does.
+case "$OUT" in
+  *"[reap] SKIPPED:"*".open_iss"*".pr_brs"*"not readable"*) ok "rest-403: the reap names BOTH listings as unreadable — each absence above is the failed READ's, not the skip arm's and not an empty answer written in its place" ;;
+  *) bad "rest-403: the reap does not name both listings as unreadable (got: $(printf '%s' "$OUT" | grep -F '[reap] SKIPPED:' | head -1)) — a failed listing may have been written as an EMPTY one (#1705), or the skip arm answered for the read" ;;
+esac
+case "$OUT" in
+  *"window is NOT requested"*) bad "rest-403: a window was reported as deliberately NOT requested — this fixture seeds a dispatched row, so the read was owed and failed" ;;
+  *) ok "rest-403: no deliberate-skip line (the windows were asked and refused)" ;;
+esac
 case "$(tr '\n' ' ' < "$D/o/candidates.txt" 2>/dev/null)" in
   *42*) bad "rest-403: candidates were queued from a listing that failed" ;;
   *99*) ok "rest-403: the backlog was NOT touched (seed 99 intact)" ;;

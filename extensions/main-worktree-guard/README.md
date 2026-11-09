@@ -455,9 +455,15 @@ realpath STRING EQUALITY against `resolve(_frameworkRoot, rel)`, where
 `_frameworkRoot` is the directory the guard MODULE was loaded from. That is
 correct only where the guard and the scripts live in one tree, and pi's
 deployment does not guarantee it: on a copy-deployed box the module root is
-`~/.pi/agent`, whose `scripts/` is a PARTIAL surface that does **not** contain
+`~/.pi/agent`, whose `scripts/` WAS a PARTIAL surface that did **not** contain
 `admin-merge.sh` (#2176), while the rail's real home is
-`$AGENT_INFRA_PATH/scripts/`. Measured 2026-10-22 from a hub-rooted session:
+`$AGENT_INFRA_PATH/scripts/`. ⛔ `WAS` is the correction, not a typo: since #3531
+the rail is a `merge_gate_srcs` member and IS farmed flat to
+`$DEST/scripts/admin-merge.sh`, so on a copy-deployed box the farmed copy is now
+resolvable under `_frameworkRoot` and arm 2 is what reaches the CHECKOUT instead.
+Arm 2 is therefore still required — without it the mandated rail is refused from
+every hub-rooted session — and the #2176 deployment shape it was built for now
+describes an UN-REFRESHED farm rather than the normal one. Measured 2026-10-22 from a hub-rooted session:
 
 ```
 ⛔ Script execution blocked — script content contains a blocked git operation (#1484).
@@ -1661,6 +1667,112 @@ heredoc parser, and a pipeline whose stage head is a VARIABLE INDIRECTION
 the mask must resolve that delimiter exactly (above) — a wrong word there would
 have regressed a real refusal. Recorded rather than silently inherited.
 
+## Hub working-tree SWEEP detection (#718)
+
+**The gap:** a session authored six artifacts in the shared hub — one new
+untracked skill directory, four tracked `SKILL.md` edits, one new doc — and a
+concurrent session returned the hub to `main`. All six vanished. Nothing warned
+the working session: it discovered the loss when an `edit` came back `ENOENT`
+about an hour later, and the work survived only because a sibling had
+coincidentally run a salvage commit first. Recovery must not be a probabilistic
+function of whether a sibling snapshotted.
+
+**Why no existing gate could see it.** M1 (#265) compares the hub's **branch**
+against the session baseline; the branch was `main` before and after. The
+hub-state check and the #350 inventory (below) describe the hub's **current**
+state; after a sweep the hub is clean and on main, so every one of them PASSES.
+The destruction is invisible by construction — which is why this is a
+detection gap and not a discipline gap.
+
+**The discriminator:** the only difference between "the hub is clean" and "the
+hub was erased" is a **baseline** — the dirty-path set THIS session observed. A
+path this session saw in `git status` and that is no longer there was swept or
+reverted. So the per-session baseline (`baselines`, recorded at `session_start`
+for main-checkout sessions) is joined by the observed dirty-path set, and every
+`tool_call` diffs against it.
+
+**Set membership is not absence.** `git status` establishes only that a path left
+the **uncommitted** set; `git add -A` and `git commit` move work into the
+index/HEAD and delete nothing (`?? docs/` even becomes `A  docs/plans/plan.md` —
+a collapsed untracked directory is re-listed per-file, so its own entry vanishes
+while the directory is untouched). The porcelain is read with `-z`, so a path is
+never C-quoted: git spells any non-ASCII path as `\NNN` octal escapes under the
+default `core.quotePath=true`, and decoding those by hand produced a key that
+was not the path (`café.md` → `caf303251.md`), which then `lstat`-ed as missing
+and reported a present, committed path as ABSENT. `-z` output is never quoted,
+so there is nothing to decode — at the cost that a rename arrives as two
+NUL-separated fields with the destination FIRST, which is why the origin side is
+taken positionally rather than by splitting on ` -> ` (a rename is therefore not
+a sweep: both sides are observed). The banner names **two
+populations** with different advice, because its payload is a recovery
+instruction:
+
+- **truly absent** (nothing of it survives) — the sweep headline, and the
+  salvage-restore route with its contamination warning;
+- **still on disk** — reported as "no longer UNCOMMITTED — still ON DISK:
+  staged/committed elsewhere, or the edit was REVERTED — check `git status` /
+  `git log -1 --stat` BEFORE restoring". It is reported rather than dropped
+  because a `checkout -f` + `reset --hard` reverts a tracked edit and leaves the
+  file present, which is the incident's own shape (four tracked `SKILL.md`
+  edits); going silent there would hide the loss the arm exists for. A pure
+  collapse (`?? dir/` → `A  dir/f`) is a representation change, not a change of
+  state, and is not reported at all.
+
+The banner names the paths in each population, the **reflog** entries that
+record *what* moved the tree (the incident's own evidence was `reset: moving to
+HEAD`), the salvage routes **this repo actually writes**
+(`refs/wip/*` on origin, `refs/wip-local` — `scripts/bg-rescue-wip.sh:12-20`,
+`:396`; the pre-review banner pointed at `~/hub-backups`, which no tool in this
+repo creates and which `2>/dev/null` turned into a silent "no backups"), and
+#718's second finding: **a salvage is a MIXTURE of every session's tree**, so a
+restore must be scoped to the paths you authored,
+and must read the diff **contents** — `git diff --stat` line counts are not a
+contamination check (a reconciliation by line count looked plausible and passed
+while it re-imported another session's half-written edit). The banner also
+names the honest ambiguity: a hub command in the *victim's own* session can
+produce the same disappearance (a salvage NAMES every path it reverses, #854),
+so the reader is told to check its own tool output first.
+
+**Cost and scope.** Hub-ROOTED sessions only — a worktree session (every fleet
+lane) returns on one predicate and pays nothing. Behind that, a 3-`stat`
+signature (the git index, the HEAD reflog, the hub root: the surfaces every
+`checkout`/`reset`/`commit` writes, plus any path entering or leaving the tree)
+gates the `git status`, with a 1.5s burst ceiling so a subtler change (a file
+removed from inside an untracked directory) is still caught at the next tool
+call. The `git status` carries `GIT_OPTIONAL_LOCKS=0` — the repo's own
+convention for a read-only git call in a **shared** tree
+(`scripts/bg-rescue-wip.sh:33-34`, `:243`): a plain `git status` rewrites the
+real index and takes `.git/index.lock`, which would fail a live sibling lane's
+next git command at exactly the frequency this arm samples. Skips under the env
+hatch, matching the sibling #350 hygiene check.
+
+**Declared residuals.** (a) Collapsed porcelain is used deliberately — an
+untracked DIRECTORY arrives as one `?? dir/` entry, exactly the artifact shape
+the incident lost — so a file removed from inside an untracked directory that
+still has other entries does not change the collapsed entry, and that sub-case
+is not reported. When the whole entry leaves the dirty set it is classified by
+**content**, not by the survival of the directory node (`readdir` non-empty ⇒ on
+disk), so an `rm dir/*` that leaves the empty directory behind IS reported as
+ABSENT: the node surviving is not survival. (b) A path swept and re-created
+with identical content between two observations is invisible. (c) This is
+detection, not recovery: nothing here restores the work. (d) A `git add -A` or
+`git commit` performed by a concurrent process on paths that were NOT collapsed
+reports them in the still-on-disk population: accurate (they are on disk and the
+banner says so) but possibly benign. It is not suppressed, because from git
+state alone a commit and a reverted edit are indistinguishable and only the
+second is a loss. (e) The dedupe set re-arms when a path is observed dirty
+again, so a path lost twice is reported twice — one banner per LOSS, not one per
+path per session. (f) A collapsed untracked directory that survives holding
+only TRACKED content (its untracked payload deleted, a tracked file underneath
+it remaining) still lands in the still-on-disk population: presence is answered
+per entry, and per-file precision inside a collapsed entry would cost the
+unbounded expansion (a) is there to avoid. (g) A path whose bytes are not valid
+UTF-8 cannot be `lstat`-ed by its decoded name and so lands in the ABSENT
+population — the one lossy step left after `-z` removed git's octal quoting.
+
+**Warn-only, always.** The arm has already happened by the time it can fire, and
+refusing the victim's next command would punish it for someone else's write.
+
 ## Hub-WIP hygiene warnings — put WIP in a worktree (#350) + #437 tracked-write gate
 
 The **#347 amplifier**: agents write WIP (plan docs to `docs/plans/`,
@@ -2322,8 +2434,9 @@ marker fixes **guard-blocked** sessions only.
 
 | Suite | Command | Covers |
 |---|---|---|
-| `test.mjs` | `node extensions/main-worktree-guard/test.mjs` | `classify-git.mjs` + `branch-ownership.mjs` decision surfaces (pure functions). **3 KNOWN PRE-EXISTING REDS at this base** (identical at `origin/main`: `git worktree` detached at `d5c6dc753` gives 1904/3) — named so the next lane does not re-discover them: `bd runtime with set (unchecked-out) → recovery: block`, `bd runtime branch -D unchecked-out → recovery: block` (#1150 cwd-sensitive cases) and `X2: partial craft (two-way passes, porcelain disagrees) → rejected by cross-check` (#2964). None touches `maskRemoteExecPayloads` |
+| `test.mjs` | `node extensions/main-worktree-guard/test.mjs` | `classify-git.mjs` + `branch-ownership.mjs` decision surfaces (pure functions). **5 KNOWN PRE-EXISTING REDS at `871e455fe`** (re-measured 2026-11-10; the count is HEAD-BOUND — it was 3 at `d5c6dc753`, where the earlier note stopped, and the whole tree minus this PR's two edited files gives the identical 1902/5, so none is this PR's) — named so the next lane does not re-discover them: `bd runtime with set (unchecked-out) → recovery: block`, `bd runtime branch -D unchecked-out → recovery: block` (#1150 cwd-sensitive cases), and three `#1139` M5 sanctioned-exempt pins (one helper, the audit line, and the T6 fail-closed anchor) that `34d190c7f` (#2332) left stale. `X2: partial craft …` (#2964), previously listed here, is GREEN now. None touches `maskRemoteExecPayloads` |
 | `test-command-position.mjs` | `node extensions/main-worktree-guard/test-command-position.mjs` | **command POSITION for the `git` token (#1158)** — the highest-leverage false positive in the stack: an OPERAND `git` (`command -v git >/dev/null 2>&1 || exit 1`) started a phantom invocation whose "verb" was the next shell operator, so the canonical defensive idiom refused the whole script (`check-deployed-drift.sh`, `harness-refresh.sh`). Part A pins the predicate (operand shapes ALLOW; command-position, newline/`then`/pipe/`!`/subshell/case separators, path-qualified invocations, process substitution, and **every wrapper word in `SPAWNER_WORDS` — one fixture each** — still REFUSE); Part B the script-content verdict; Part C the REAL `tool_call` handler against a hermetic MAIN checkout (the idiom ALLOWED, the idiom beside a real destructive invocation STILL BLOCKED, `git status --porcelain` ALLOWED); Part D **measured pins of five KNOWN-FALSE shapes deliberately left unfixed** (`bash -n` noexec, a leading `~`, `<<<` whole-file co-occurrence, `join(" ")` prose rejoin, quoted `\|` alternation) each with a control, so the next lane inherits a map rather than a surprise |
+| `test-hub-sweep.mjs` | `node extensions/main-worktree-guard/test-hub-sweep.mjs` | **hub working-tree SWEEP detection (#718)** — the incident end to end, BEHAVIORAL: the REAL `index.ts` handler is driven against a hermetic hub and the sweep is performed OUT-OF-PROCESS (`git checkout -f` + `git reset --hard` + `rm`, exactly what a concurrent session does), then the suite pins that the banner fires, names the vanished TRACKED path and the vanished untracked DIRECTORIES, cites the issue, names the salvage/backup routes and the reflog, carries the "a salvage is a MIXTURE" contamination warning, keeps every row inside its box, and never refuses the victim's next command. Plus the negative controls that keep it from becoming noise: a worktree-rooted session is silent, the env hatch is silent, a hub that was never dirty is silent, a path APPEARING is not a loss, and one path is reported once (dedupe) |
 | `test-module-load.mjs` | `node extensions/main-worktree-guard/test-module-load.mjs` | **the `index.ts` LOAD path** — the wiring `test.mjs` cannot see |
 | `test-remote-context.mjs` | `node extensions/main-worktree-guard/test-remote-context.mjs` (mutation leg: `… --mutations`) | **the REMOTE-EXEC boundary (#3444)** — Part A pins `maskRemoteExecPayloads` (identity for every non-remote command; `cmux vm exec`/`ssh`/`docker exec` payloads masked including multi-line, heredoc, base64 and direct-argv spellings; LOCAL text after/before the boundary, redirect targets — including a redirect in the OPERAND position — locally-executed substitutions and whole backtick regions preserved; heredoc terminator kept on its own line with `<<`/`<<-` semantics, the delimiter line's LOCAL tail kept verbatim, quoted delimiters (`<<$'EOS'`, `<<E"OS"`) resolved through shell quote removal; wrapper heads, path-qualified/quoted heads, redefined transports and two-heredoc lines NOT masked; a trailing separator does not throw). Part B drives the REAL `index.ts` handler against a hermetic hub and pins BOTH directions of every measured refusal — the remote form ALLOWED and the SAME command run locally still REFUSED by the guard that owns it (#1919 for `git worktree add`, #1484/M3 for `git checkout`, #1144 for a compound `git pull`, #709 for a piped payload, plus the `ssh` bare-argv and `docker exec` spellings) — on a clean AND a dirty hub, with the local-redirect / local-backtick / trailing-local / heredoc-then-local safety pins. Part M (`--mutations`, its own CI step, which FAILS rather than skips if the real-module loader is unavailable) rebuilds a TEMP copy of the extension and requires TWENTY-ONE mutants — the pre-fix identity mask, an over-reaching mask that ignores top-level separators, a swallowed heredoc terminator, a split unquoted-backtick region, a quote-scanned comment, an ANSI-C quote read as a plain quote, a piped payload that blinds the local-shell arm, a dropped heredoc delimiter-line tail, a pipe-head shell allow-list, a heredoc body cut at the physical newline, a delimiter word without quote removal, a pipe bail that skips no redirection target, an array literal treated as command position, an undecodable ANSI-C escape taken literally, a CRLF delimiter word trimmed, a paren depth ignored for the heredoc newline, a process substitution not bailed, a substitution feeding a local command, a delimiter continuation kept as a newline, a local substitution masked anyway (the spawner-wrapper loss), and a redirection `&` treated as a job separator — to redden exactly the pins they revert |
 | `test-discard-gate.mjs` | `node extensions/main-worktree-guard/test-discard-gate.mjs` | **the M5 discard gate (#709)** — pure extraction/effect (Part A) + the REAL `index.ts` handler driven against a hermetically built hub + linked worktree (Part B): dirty/clean targets, staged-only, untracked-only, hub-targeted from a worktree session, prefix spellings, quote-split verbs, bare-path/`-f <path>` ref-vs-path, magic pathspecs, numeric stages, `rm`/`read-tree`/`apply -R [-R3]`/`checkout -p`/`checkout --ours`/`checkout-index`, script + `eval` + heredoc (plain and punctuated delimiter) + list-form-heredoc + filtered head + piped-script + backtick + `$( )` + alias + ANSI-C + `$VAR` + verb-indirection + xargs-feeder + here-string + process-substitution + opaque `-c` + `--work-tree` bypass closures, fail-closed forms, false-positive guards (heredoc data, arithmetic `<<`, mid-line/escaped-whitespace comments, substitution-in-data, index-only `rm`/`restore`/`apply -R`, report-only `apply -R`, `checkout-index --prefix`/`-a`, cd chains, conflict resolution, phantom heredocs), the #1139 sanctioned-script exemption (the recovery helper allowed from a hub-rooted session; the same content at the same relpath in another checkout NOT exempt — allowed on a pristine fixture and BLOCKED while a candidate checkout carries tracked dirt; a linked-worktree copy still gated; set-scoped so a direct discard in the same command is still blocked; a wrapper that SOURCES the helper still blocked; a `-c` payload naming the helper still blocked; a **quoted** path piped into a shell walked like the unquoted spelling, the two NEGATIVE pipe cases — an unquoted word pair must not invent a joined seed, a quoted word with a space must not be over-split — and an eight-row pipeline-seed **shell-fidelity** table over single quotes, escaped spaces, a backslash inside single quotes, an apostrophe inside double quotes and an escaped quote inside double quotes; the unclean-vs-unresolvable message split, a cause-neutral fail-closed headline, the absolute-path remedy being itself allowed, a discard aimed at a non-checkout target allowed, and a null-anchor/guard-without-`scripts/` case where the inert exemption leaves the discard GATED — a BLOCK with the `#709` reason, driven from a hermetic DIRTY cwd so the assertion cannot depend on the runner's own checkout), the #1060 state predicate for `git show <rev>:<path> > <target>` (Part D: the X4 self-overwrite BLOCKED from both hub-rooted and worktree-rooted sessions and ALLOWED on a pristine hub; the redirect target named rather than the source; bare reads — including a `$var` source — and `/dev/null` allowed; untracked-only dirt allowed; the declared outside-checkout fail-closed cost on a dirty tree; the #940 four-shape matrix on a pristine vs a tracked-dirty hub; M4 no longer shadowing M5 on a disordered hub; and the negative controls), #1125 (the read-only `scripts/stale-main-triage.sh` RUNS on the dirty hub it diagnoses; a `for`-loop `git cat-file -e` existence probe with no write surface is allowed; and the negative controls — a `$f`-to-`$f` redirect hint, a resolvable hint landing on its own path, and the M4 block naming the disordered checkout + `dirty: N path(s)` on BOTH the bash and write/edit routes), and both escape hatches |

@@ -291,7 +291,7 @@ jobs:
         # → session transcript exists → cwd/binary resolve) and its "never emit respawn-pane" rule
         # are exactly the kind of thing a later rewrite deletes without noticing. A suite the repo
         # does not RUN is a suite it does not have.
-        run: python3.12 -m pytest scripts/test_parallel_work_check.py tests/test_ci_exemption.py tests/test_ci_exemption_producer.py scripts/test_lane_status.py scripts/test_lane_actions.py scripts/test_lane_watchdog.py scripts/test_admin_merge_head.py scripts/test_objective.py scripts/test_cmux_payload.py scripts/test_merge_queue.py scripts/test_turn_classify_state.py scripts/test_pr_doctor.py scripts/test_ask_owner.py scripts/test_dispatch_wiring.py scripts/test_pr_loop.py tests/test_pytest_root_cut.py scripts/test_beta_progress.py scripts/test_bounce_state.py scripts/test_lane_registry.py scripts/test_lane_wip.py scripts/test_graph_target_address.py scripts/test_lane_relaunch.py mcp-servers/orchestrator/test_server.py -x --timeout=60 -q
+        run: python3.12 -m pytest scripts/test_parallel_work_check.py tests/test_ci_exemption.py tests/test_ci_exemption_producer.py scripts/test_lane_status.py scripts/test_lane_actions.py scripts/test_lane_watchdog.py scripts/test_admin_merge_head.py scripts/test_objective.py scripts/test_cmux_payload.py scripts/test_merge_queue.py scripts/test_turn_classify_state.py scripts/test_pr_doctor.py scripts/test_ask_owner.py scripts/test_dispatch_wiring.py scripts/test_pr_loop.py tests/test_pytest_root_cut.py scripts/test_beta_progress.py scripts/test_bounce_state.py scripts/test_lane_registry.py scripts/test_lane_wip.py scripts/test_graph_target_address.py scripts/test_lane_relaunch.py scripts/test_cmux_dispatch_path.py mcp-servers/orchestrator/test_server.py -x --timeout=60 -q
 
   sanctioned-pin:
     # ⛔ ITS OWN JOB, NOT A STEP IN `verify` (agent-infra#3121). The pin-freshness
@@ -1085,6 +1085,34 @@ jobs:
         # before anything reads it.
         # Zero-dep (`node:*` + the `git` binary), no `npm ci`, ~5s.
         run: node extensions/main-worktree-guard/test-command-position.mjs
+      - name: main-worktree-guard hub working-tree SWEEP detection (#718)
+        # #718 (2026-09-10): a session authored six artifacts in the shared hub
+        # — one new untracked skill DIRECTORY, four tracked SKILL.md edits, one
+        # new doc — and a concurrent session returned the hub to `main`. ALL SIX
+        # vanished, nothing warned the working session (it learned when an `edit`
+        # returned ENOENT ~1h later), and the work survived only because a sibling
+        # had coincidentally salvaged first.
+        # NO existing gate could see it, which is why this step exists: M1 (#265)
+        # compares the hub's BRANCH and the #350 inventory describes the hub's
+        # CURRENT state — after a sweep the hub is clean and on main, so every
+        # state check PASSES. This suite pins the missing discriminator: a
+        # per-session baseline of the dirty paths observed. Behavioral: loads the
+        # REAL index.ts through module-load-hooks.mjs, drives the tool_call
+        # handler against a hermetic hub, and performs the sweep OUT-OF-PROCESS
+        # (plain git/rm, exactly what a concurrent session does), then pins the
+        # negative controls that keep it from becoming noise — a worktree-rooted
+        # session is silent, the env hatch is silent, a never-dirty hub is
+        # silent, an APPEARING path is not a loss, a RENAME is not a loss, and a
+        # path is reported once.
+        # Zero-dep (`node:*` + the `git` binary), no `npm ci`, ~16s. Its own step
+        # (the post-merge `extensions/*/test*.mjs` glob in ci-main.yml is not
+        # PR-triggered). The wall clock is deliberate, not fixture cost: the
+        # arm's burst ceiling is 1.5s, so every control that must PROVABLY reach
+        # `git status` carries a real `pause(1600)` — a dozen of them. Do not
+        # "optimise" them away; they are what makes those rows pins rather than
+        # no-ops (three review rounds found a control passing because the call it
+        # asserted on had been skipped).
+        run: node extensions/main-worktree-guard/test-hub-sweep.mjs
       - name: main-worktree-guard nested-worktree hub gate (#1919)
         # `git worktree add 8779-optA` (a RELATIVE path) puts a registered
         # worktree INSIDE the repo root; git reports it as an untracked

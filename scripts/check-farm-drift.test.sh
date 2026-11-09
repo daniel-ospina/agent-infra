@@ -266,11 +266,21 @@ RC=$?
 ck $([ "$RC" -eq 2 ] && echo 0 || echo 1) "a DANGLING-SYMLINK pin record is UNKNOWN, not a pass (rc=$RC)"
 ck $(grep -q 'OK — ' "$OUT" && echo 1 || echo 0) "...and prints no OK verdict at all"
 
-# 22. ⛔ A STALE FILE NO FARM ARRAY DELIVERS IS NOT FATAL. `admin-merge.sh`, `heartbeat-loop.sh` and
-# the declared #1553 gap live on the box and are delivered by NO farm array (measured: grep count 0 in
+# 22. ⛔ A STALE FILE NO FARM ARRAY DELIVERS IS NOT FATAL. When this case was written, the stale-file
+# population on a provisioned box included `admin-merge.sh`, `heartbeat-loop.sh` and the declared #1553
+# gap, none of them delivered by any farm array (the author's screen: grep count 0 in
 # pi-bootstrap/setup.sh), so setup.sh's rc=1 arm fired on a file its own printed remedy could never
 # fix — and sync.sh (set -euo pipefail) died every run. Same split the author already made for
 # UNSOURCED: a deploy cannot fix it, a human must → 3, loud and never a pass.
+# ⛔ THAT MEASUREMENT IS HISTORICAL AND IS NOW FALSE FOR `admin-merge.sh` — do NOT read the count-0
+# screen as describing today's farm. The rail joined `merge_gate_srcs` (its identity pin and the three
+# `$SELF_DIR` helpers it resolves came with it), so at HEAD `grep -c 'admin-merge\.sh'
+# pi-bootstrap/setup.sh` is 4, not 0, and it self-converges like any other declared member.
+# ⛔ AND IT IS A WEAK PROXY EVEN WHERE IT STILL FIRES: `heartbeat-loop.sh` is in no farm array and its
+# grep count is 6, every one of them a COMMENT mention — so a count-0 screen both MISSES an undelivered
+# script (false negative) and would CALL a comment mention delivered (false positive). The case below is
+# therefore about what the TOOL must do with a stale file outside the declaration, NOT about which files
+# happen to be undelivered today; read the derived population for that, never this comment or a count.
 # The declaration lists ONLY beta.sh, so alpha.py's drift is outside what the farm owes.
 C22="$TMP/c22"; mk_farm "$C22/scripts"; mkdir -p "$C22/state"
 printf 'scripts/beta.sh\n' > "$C22/state/farm-declared.txt"

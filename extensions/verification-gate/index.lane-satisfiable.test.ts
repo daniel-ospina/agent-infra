@@ -32,6 +32,17 @@
  *                                                              test observes the bridge WITHOUT one)
  *   M6 un-widen the heredoc detector (`<<\EOF`)            → the split unit test
  *   M7 drop the `$'…'` ANSI-C state                          → the split unit test
+ *   M8 delete the interactive block site's `...orderMattersLines(allBlocked)` render
+ *      (`index.ts`, the non-sub-agent `reason` array)        → (#2087) "a PASS taken before any
+ *                                                              scope exists …" — `/ORDER MATTERS/`
+ *   M9 stop recording the scope at the block site (drop both  → (#2087) "… a push of an already-made
+ *      `lastBlockedFiles = [...changedFiles]` and `rememberBlock`    commit is refused, then the dispatch
+ *      there, so the retry's PASS has nothing to merge into)          merges into the recorded scope" —
+ *                                                                    its converging `equal(…, undefined)`.
+ *                                                                    ⛔ The COMMIT-shaped case does NOT
+ *                                                                    red here (its scope survives in the
+ *                                                                    staged diff) — which is why the push
+ *                                                                    case exists; measured, not assumed.
  *
  * NOT mutation-pinned, and stated rather than implied: bridge recovery now answers "matched?" and
  * "what to store?" from ONE read (`matchAndStoredDigest`, shared with the merge path) instead of
@@ -91,6 +102,7 @@ async function fire(evt: string, event: any, ctx: any = {}): Promise<any> {
   return result;
 }
 const commitOp = () => ({ type: "tool_call", toolName: "bash", input: { command: "git commit -m wip" } });
+const pushOp = () => ({ type: "tool_call", toolName: "bash", input: { command: "git push origin main" } });
 
 /** A `task` tool_result carrying a [VGATE] verdict (the in-band dispatch a pi -p lane can make). */
 function vgateResult(projectRoot: string, promptFiles: string, body: unknown) {
@@ -122,6 +134,22 @@ async function freshRepo(label: string): Promise<string> {
   git(repo, "commit -m baseline");
   process.chdir(repo);
   await fire("session_start", {});
+  return repo;
+}
+
+/**
+ * The same, plus a BARE ORIGIN whose `main` already carries the baseline commit — so a later local
+ * commit produces a non-empty push RANGE (the scope a `git push` is gated on, #487) and the push
+ * shape has something to refuse. Without the base, the first-push fallback is the staged index and
+ * an empty staged index would empty-allow instead of blocking.
+ */
+async function freshRepoPush(label: string): Promise<string> {
+  const bare = join(TEST_ROOT, `${label}-origin.git`);
+  mkdirSync(bare, { recursive: true });
+  execSync("git init --bare -b main .", { cwd: bare, encoding: "utf-8", timeout: 20000 });
+  const repo = await freshRepo(label);
+  git(repo, `remote add origin ${bare}`);
+  git(repo, "push -q -u origin main");
   return repo;
 }
 
@@ -373,6 +401,73 @@ test("unit: splitMutationFromCommit splits at the commit arm, and is null withou
   // remedy committed the wrong message.
   equal(mod.splitMutationFromCommit("cat <<\\EOF > m.txt\nx &&\ngit commit -m y\nEOF\ngit commit -F m.txt"),
     null, "a backslash-quoted heredoc delimiter is still a heredoc");
+});
+
+// ── #2087 — THE ORDER THE GATE PRESCRIBES ───────────
+//
+// A [VGATE] PASS merges ONLY the files this root's recorded blocked set or its CURRENT STAGED
+// diff contains (`mergeScopeFor`/`scopeFiles`). The harness tells a lane to "verify, then push",
+// and following that literally — verify BEFORE the session's first blocked op, or before the
+// change is staged — makes the PASS merge 0 of N: the record cannot be attached to anything, the
+// retry is refused with the identical text, and the old remedy ("re-dispatch naming the EXACT
+// blocked files") could not help because those names were already exact.
+//
+// So BOTH halves are pinned here: the mis-order still fails CLOSED (protection — the anchor is
+// not widened to the branch's unpushed diff, which is the weakening #2087 explicitly did not
+// prefer), AND the order the block now PRINTS (stage / block → dispatch → retry) converges in
+// one extra cycle instead of looping.
+test("(#2087) a PASS taken before any scope exists records nothing — fail CLOSED, and the printed ORDER converges", async () => {
+  const repo = await freshRepo("e-order-wrong");
+  writeFileSync(join(repo, "a.txt"), "a2\n");
+  // The WRONG order: dispatch first, with nothing staged and no block recorded for this root.
+  await fire("tool_result", hashResult(repo, "a.txt", sha256("a2\n")));
+  git(repo, "add a.txt");
+  const wrong = await fire("tool_call", commitOp());
+  ok(wrong?.block === true, "a PASS taken before any scope existed must NOT bless the commit (fail closed)");
+  const reason = String(wrong?.reason ?? "");
+  ok(/zero-merge-pass/.test(reason), "the retry block names the prior dispatch class");
+  ok(/SEQUENCING state, not a verifier defect/.test(reason), "the remedy names the ORDER, not a verifier defect (#2087)");
+  ok(/stage the change first/.test(reason), "the remedy names the achievable action that creates the scope");
+  ok(/ORDER MATTERS \(#2087\)/.test(reason), "the block states the order that works");
+  ok(/git add a\.txt/.test(reason), "the block names the concrete staging command for THESE files");
+  // The printed order, run as printed: the change is staged now — dispatch, then retry.
+  await fire("tool_result", hashResult(repo, "a.txt", sha256("a2\n")));
+  equal(await fire("tool_call", commitOp()), undefined, "the printed order converges — one extra cycle, not a loop");
+});
+
+test("(#2087) ORDER: block first, then dispatch, then retry — converges without re-staging (COMMIT shape)", async () => {
+  // ⛔ HONEST SCOPE (review round 1, P2): for a COMMIT this case is satisfied by the staged diff ON
+  // ITS OWN, so it pins the ORDER's convergence but does NOT prove the block recorded anything —
+  // the shape where the recorded set is the ONLY scope is a PUSH of an already-made commit, pinned
+  // in the case below.
+  const repo = await freshRepo("e-order-right");
+  writeFileSync(join(repo, "a.txt"), "a2\n");
+  git(repo, "add a.txt");
+  ok((await fire("tool_call", commitOp()))?.block === true, "pre-state: refused before any PASS");
+  await fire("tool_result", hashResult(repo, "a.txt", sha256("a2\n")));
+  equal(await fire("tool_call", commitOp()), undefined, "the block armed the scope; the PASS merges into it");
+});
+
+// ⛔ #2087's HEADLINE SHAPE: a `push` of an ALREADY-MADE commit. Nothing is staged and nothing can
+// be staged — the commit exists — so the ONLY scope a PASS can merge into is the one the REFUSED push
+// recorded. This is therefore the discriminating case: drop the block site's scope recording and it
+// zero-merges, while the commit-shaped case above still converges off the index.
+test("(#2087) ORDER: a push of an already-made commit is refused, then the dispatch merges into the recorded scope", async () => {
+  const repo = await freshRepoPush("e-order-push");
+  writeFileSync(join(repo, "a.txt"), "a2\n");
+  // The commit is made outside the gate (the parent-session shape); the lane's next op is the push.
+  git(repo, "commit -aqm change");
+  // The WRONG order the harness prescribes: verify before the push is ever attempted.
+  await fire("tool_result", hashResult(repo, "a.txt", sha256("a2\n")));
+  const blocked = await fire("tool_call", pushOp());
+  ok(blocked?.block === true, "the push is refused (nothing staged, and the first PASS recorded nothing)");
+  const reason = String(blocked?.reason ?? "");
+  ok(/zero-merge-pass/.test(reason), "the refusal names the zero-merge dispatch class");
+  ok(/ORDER MATTERS \(#2087\)/.test(reason), "the refusal prints the order that works");
+  ok(/push \/ gh op needs no staging/.test(reason), "the push exemption is stated for the push shape");
+  // The printed order, run as printed: the refusal has recorded the push range — dispatch, then retry.
+  await fire("tool_result", hashResult(repo, "a.txt", sha256("a2\n")));
+  equal(await fire("tool_call", pushOp()), undefined, "the PASS merged into the scope the refusal recorded — the retry is allowed");
 });
 
 // ── runner ────────────────────────────────────────────
