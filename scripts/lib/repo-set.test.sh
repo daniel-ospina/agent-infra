@@ -1042,9 +1042,10 @@ def _strip_comment(line):
         RED) on valid bash. Moves 0 files, and no fixture line carries the spaced spelling.
       * `_openers`' QUOTE-CLOSE test (inside the double-quote state) — delete `if c == quote: quote = None`
         and every definition after `echo "a" ; cat <<EOF` + a body is invented as a body line (FALSE RED);
-        it moves 41 of the 438 files and invents 109 names — the largest delta among the guards THIS BLOCK
-        declares (the `head` anchor, declared separately below, is larger at 66 files and 133 names) — and
-        it was undeclared until this note.
+        it moves 41 of the 438 files and invents 109 names — the largest INVENTED-NAME delta among the guards
+        this block declares (the charset members declared below LOSE names over more files, 86 and 92, and
+        digits loses more names, 209, but those are FALSE PASSES; the `head` anchor, declared separately
+        below, is larger on both at 66 files and 133 names) — and it was undeclared until this note.
       * `_openers`' IN-QUOTE escape (`if c == '\\': i += 2` inside that state) — a separate condition from
         the outside-quote escape below; `echo "a \" # b" ; cat <<EOF` + a body invents the body line, and
         it moves 1 file (`rank-queue.test.sh`, losing 15 names).
