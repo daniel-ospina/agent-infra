@@ -2,6 +2,24 @@
 # heartbeat-launch.test.sh — self-check for scripts/heartbeat-launch.sh (#1867).
 #
 # Run: bash scripts/heartbeat-launch.test.sh
+#      (from a CHECKOUT or worktree of this repo — see RUNNABLE BY A LANE below)
+#
+# RUNNABLE BY A LANE (#1867 review P2, round 4)
+# --------------------------------------------
+# This suite used to be UNRUNNABLE by any agent: `extensions/main-worktree-guard`'s script-indirection
+# arm refused it with `the body … cannot be fully read — "$LOOP_STANDIN" is invoked as a script`, from
+# a hub session AND from a clean worktree, so its greenness was a claim no lane could check. The
+# stand-in file is gone (see `loop_pid`) and the suite now runs. Two things a future editor must keep
+# true, because each makes it unrunnable again:
+#   · never invoke a nested script through a VARIABLE — a literal path, or no nested script at all;
+#   · the suite does execute `scripts/heartbeat-launch.sh`, whose body transitively names
+#     `heartbeat-loop.sh` (a script that does git operations), so a HUB-ROOTED session still hits the
+#     `#1484` content arm. Run it from the worktree/checkout that owns the change, which is what the
+#     guard's own refusal prescribes. CI is unaffected — the shard runner applies no guard at all.
+# ⛔ AND NO SCRIPT PATH IN COMMAND POSITION IN THIS HEADER. The guard reads comments too (a recorded
+# residual in its own source), and a `;` followed by a backticked script path was parsed as an
+# invocation of a script it could not read — this comment block reintroduced the very refusal it
+# documents, which is why the sentence above names the shard runner in words and not as a path.
 #
 # WHAT THIS SUITE IS FOR
 # ----------------------
@@ -82,15 +100,20 @@ live_pid() {
 }
 
 # A LIVE process whose OWN ARGV is the loop (#1867 review P2) — what the pidfile legitimately names.
-# ⛔ NO `exec` OF A SLEEPER: the process's argv must keep naming the script, which is the identity the
-# launcher now proves. `while :; do sleep 1; done` keeps only a one-second child, so this leaves no
-# long-lived litter for the next case's cleanup to chase.
-LOOP_STANDIN="$T/standin/scripts/heartbeat-loop.sh"
-mkdir -p "$(dirname "$LOOP_STANDIN")"
-printf '#!/usr/bin/env bash\nwhile :; do sleep 1; done\n' > "$LOOP_STANDIN"
-chmod +x "$LOOP_STANDIN"
+#
+# ⛔ NO STAND-IN FILE, AND NO NESTED `bash <path>` (#1867 review P2, round 4). The stand-in used to be
+# a scratch script invoked as `bash "$LOOP_STANDIN"`, and a nested script path held in a VARIABLE is
+# unreadable to `extensions/main-worktree-guard`'s script-indirection arm — which refuses the WHOLE
+# suite with `the body … cannot be fully read — "$LOOP_STANDIN" is invoked as a script`, from a clean
+# worktree as well as a hub. So the suite could not be run by any lane, and its greenness was a claim
+# no agent could check. Nothing needs a file: `pid_is_loop` matches the process's own argv by
+# BASENAME, so a literal `-c` payload whose last argument is the loop's basename gives the pid exactly
+# the identity the launcher proves — and leaves the guard nothing it cannot read. The payload is also
+# deliberately a bare sleep loop: no discard, no nested script, nothing for any arm to fail closed on.
+# ⛔ NO `exec`: the process's argv must keep naming the loop, which is the identity under test. The
+# one-second child means no long-lived litter for the next case's cleanup to chase.
 loop_pid() {
-    bash "$LOOP_STANDIN" >/dev/null 2>&1 &
+    bash -c 'while :; do sleep 1; done' heartbeat-loop.sh >/dev/null 2>&1 &
     printf '%s\n' "$!" >> "$T/livepids"
     printf '%s' "$!"
 }
@@ -302,6 +325,22 @@ printf '[{"lane":"a","degraded":false},{"lane":"b","degraded":false}]\n' > "$R/a
 OUT="$(run "$R" -- check)"; RC=$?
 assert_eq "$RC" "0" "§13b a LIVE loop with a FRESH, non-degenerate read is OK (0)"
 assert_contains "$OUT" "0 degraded" "§13b …and the green line states the counts it read"
+
+# ⛔ A MALFORMED BOUND IS A CONFIGURATION ANSWER, NOT A DRIFT VERDICT (#1867 review P3).
+# `HEARTBEAT_CHECK_MAX_AGE=15m` reached `int(sys.argv[2])`, raised, and the TRACEBACK was printed as
+# the verdict line while rc=1 was accepted by the `0|1|2` case as a real DRIFT — an operator who
+# mistyped a variable was told the fleet read was stale. Pre-fix this row reads 1 (and the output is
+# a Python traceback); the fix answers 2 UNKNOWN and names the VARIABLE.
+for _bad_age in 15m -1 0 1234567890123; do
+    OUT="$(run "$R" HEARTBEAT_CHECK_MAX_AGE="$_bad_age" -- check)"; RC=$?
+    assert_eq "$RC" "2" "§13c HEARTBEAT_CHECK_MAX_AGE='$_bad_age' is UNKNOWN (2), never a DRIFT verdict"
+    assert_contains "$OUT" "HEARTBEAT_CHECK_MAX_AGE" "§13c …and the line names the VARIABLE to fix ('$_bad_age')"
+    assert_not_contains "$OUT" "Traceback" "§13c …and never prints a Python traceback as the verdict ('$_bad_age')"
+done
+# Positive control: the SAME state under a VALID bound is still the green case, so the validator did
+# not turn the whole verb into a refusal.
+OUT="$(run "$R" HEARTBEAT_CHECK_MAX_AGE=900 -- check)"; RC=$?
+assert_eq "$RC" "0" "§13c control: a VALID bound still yields OK (0) on the same state"
 
 echo "── 14. the launcher and the loop carry no literal user home ──"
 

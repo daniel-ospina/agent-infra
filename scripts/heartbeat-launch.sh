@@ -67,6 +67,19 @@ LOG="$STATE/orchestrator-heartbeat.log"
 SNAP="$STATE/lane-status.last.json"
 MAX_AGE="${HEARTBEAT_CHECK_MAX_AGE:-900}"
 
+# ⛔ VALIDATED, NOT TRUSTED (#1867 review P3). `MAX_AGE` is operator input that ends up in
+# `int(sys.argv[2])` inside the snapshot reader, where anything non-numeric raises — and a raise was
+# reported as DRIFT because the traceback arrived on the same stream as the verdict. A bound is
+# valid when it is digits only, non-zero, and short enough that bash's own arithmetic cannot overflow
+# it (a 20-digit "number" is not a freshness bound on any machine). Leading zeros are fine.
+_valid_max_age() {
+    case "${MAX_AGE:-}" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    [ "${#MAX_AGE}" -le 9 ] || return 1
+    [ "$MAX_AGE" -gt 0 ]
+}
+
 # Prefer the FARMED copy: that is what a launched loop must run in production (the farm is the
 # deployed layout, and a launcher pinned to a checkout dies when a worktree is reaped). Fall back to
 # this script's sibling so the launch path works from a plain checkout before a farm lands.
@@ -380,6 +393,16 @@ PY
 cmd_check() {
     if ! command -v python3 >/dev/null 2>&1; then
         note "UNKNOWN: python3 not on PATH — cannot read the fleet snapshot, so this probe refuses to answer"
+        return 2
+    fi
+    # ⛔ A MALFORMED BOUND IS A CONFIGURATION ANSWER, NOT A DRIFT VERDICT (#1867 review P3).
+    # `MAX_AGE` went straight into `int(sys.argv[2])`, so `HEARTBEAT_CHECK_MAX_AGE=15m` raised inside
+    # the reader — the traceback was captured by `2>&1`, printed as the VERDICT LINE, and rc=1 was then
+    # accepted by `case "$prc" in 0|1|2)` as a genuine DRIFT. It fails closed either way, but it
+    # MISATTRIBUTES: an operator who typed the variable wrong was told the fleet read was stale. The
+    # bound is validated here, once, and answers 2 UNKNOWN by name.
+    if ! _valid_max_age; then
+        note "UNKNOWN: HEARTBEAT_CHECK_MAX_AGE='${MAX_AGE:-}' is not a positive whole number of seconds (e.g. 900) — fix the VARIABLE; this is a configuration answer, never a DRIFT verdict"
         return 2
     fi
     if [ ! -d "$STATE" ]; then
