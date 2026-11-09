@@ -1013,7 +1013,9 @@ def _strip_comment(line):
       * `_strip_comment` quote-open, below — `echo 'a # b' ; cat <<EOF` plus a body: the mutant scans the
         body as code, a FALSE RED. Moves 0 files.
       * `_strip_comment` word set (` \t;|&(`) — `x=1;# note cat <<NOPE` loses the very next definition, a
-        FALSE PASS. Moves 0 files.
+        FALSE PASS. Moves 0 files when ONE member of the set is dropped; dropping the WHOLE condition moves
+        1 (`scripts/pi-reap-idle.sh`, inventing `prints`), so the shape is what is pinned here and the
+        delta depends on which member you pull.
       * `_openers` DOUBLE-quote state — `echo "a <<b"` then a real heredoc loses every definition after it.
         This one is NOT hypothetical: it moves 5 files and invents `pass` in `pr-path-reads.test.sh`, so
         the namespace arm's own direction is exposed — and it is still unpinned, because no arm scans that
@@ -1033,14 +1035,22 @@ def _strip_comment(line):
     losing 14 of its 26 definitions — so `_reader_defs_n` drops below the floor and `f11f` reds at 245/1.
     The suite DOES catch that one; do not "declare" it.
 
-    NO-OP AT THIS HEAD — no input in this repo or in the fixture separates them, and each moves 0 files:
-    `_strip_comment`'s SINGLE-quote state, its DOUBLE-quote state, and its backslash escape.
+    NOT REACHED BY THIS POPULATION — and NOT because they are inert, which is the distinction that matters:
+    `_strip_comment`'s SINGLE-quote state, its DOUBLE-quote state, and its backslash escape each move 0 of
+    the 437 files and each leaves the suite at 246/0, but every one of them ALSO separates on a valid-bash
+    input — the quote-open shape above with the OTHER quote character, and a trailing `#` after an escaped
+    quote. So the honest label is "nothing here reaches it", not "no-op": the quote-open shape above pins
+    the single-quote state as soon as its single-quoted spelling is written into `FIXTURE`, which is itself
+    proof that the guard is load-bearing.
 
-    ⛔ SO THIS IS A DECLARATION, NOT A PIN, and it says so: writing the five shapes above into `FIXTURE` is
-    the work that turns them into pins — until then a lane that "simplifies" one of those five is removing
-    bash-faithfulness that only the fixture would catch. Each shape is written out by name rather than
-    counted, because the names are what survives a new head — and the population numbers above are already
-    two files stale, which is the argument for the shape and against the count.
+    ⛔ SO THIS IS A DECLARATION, NOT A PIN, and it says so: writing the shapes above into `FIXTURE` is the
+    work that turns them into pins — SEVEN shapes for EIGHT guards, because one single-quoted spelling
+    separates the setter, the single-quote BRANCH and (in the same statement) the setter's own quote tuple,
+    while the blanket double-quote branch needs the OTHER quote character. Until then a lane that
+    "simplifies" one of those eight is removing bash-faithfulness that only the fixture would catch. Each
+    shape is written out by name rather than counted, because the names are what survives a new head — and
+    the population numbers above are already two files stale, which is the argument for the shape and
+    against the count.
 
     ⛔ A COMMENT ENDS AT THE NEWLINE HOWEVER MANY BACKSLASHES IT CARRIES (round 48 review, P2 — measured).
     The join tested the RAW line, so `x=1  # note \\` was read as a continuation, the next line was
