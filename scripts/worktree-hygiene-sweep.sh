@@ -125,7 +125,11 @@ PREFLIGHT_ONLY=0
 # explicitly) or DERIVED from a candidate that proves itself, or the pass refuses.
 REPO="${REPO:-}"
 # ⛔ THE OPERATOR VARIABLE IS AN INPUT OF THE DERIVATION — OFFERED ALONE, NEVER AS A CO-EQUAL
-# CANDIDATE BESIDE THE CWD (fresh-context review of #3833, F2 and #3849 review round 1, P2).
+# CANDIDATE BESIDE THE CWD (fresh-context review of #3833, F2, and #3849 review round 1, where the
+# RECORDED review grades it P1: "### P1 — scripts/worktree-hygiene-sweep.sh:126 — $TORTOISE_REPO stops
+# being a *proven* candidate and becomes a *deciding* value". The independently-dispatched review of
+# the same head graded it P2; both name this one finding, and the round is named here because the
+# grade is not what carries it — the measurement below is).
 # WHY NOT BESIDE `$PWD` (F2): #1974 §1 names `$TORTOISE_REPO`/`$TORTOISE` as an INPUT, and before
 # #1974 it DECIDED (`REPO="${TORTOISE_REPO:-$HOME/eldato/tortoise}"`). Offering it as ONE candidate
 # beside `$PWD` demoted a value the box explicitly declares to a TIE, so a box that names its target
