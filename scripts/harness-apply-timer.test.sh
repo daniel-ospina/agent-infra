@@ -2262,7 +2262,7 @@ FARM
 printf '#!/usr/bin/env bash\nbash "$(dirname "$0")/inner/odd-vocab.sh" "$@" 2>&1 | tee -a "$(dirname "$0")/log.txt"\n' >"$T/t24aq/wrap.sh"
 chmod +x "$T/t24aq/wrap.sh" "$T/t24aq/inner/odd-vocab.sh"
 OUT="$(HARNESS_APPLY_FARM_CHECKER="$T/t24aq/wrap.sh" run_pass "$T/t24aq" 2>&1)"; RC=$?
-assert_eq "$RC" "24" "T24 control: rc=0 over a report that prints a DRIFT verdict line is RED — the VERDICT operand fires here, not the summary (the summary half is pinned by t24c5)"
+assert_eq "$RC" "24" "T24 control: rc=0 over a report printing a DRIFT verdict line is RED — three operands are true here (verdict line, summary, row token), so the VERDICT pin lives in t24c6, not in this wrapper fixture"
 assert_contains "$OUT" "exited 0 but its output reports drift" "T24 control: and it names the contradiction even though the extractor matched no row"
 assert_contains "$OUT" "verdict: check-farm-drift: DRIFT — 2 stale" \
     "T24 control: and the log quotes the verdict line, so the evidence behind the refusal is on the line"
@@ -2699,8 +2699,9 @@ assert_absent "$(grep '^remedy=' "$T/t24c2/state/harness-apply.status" 2>/dev/nu
 # trailing token outside the instrument's own vocabulary is now a refusal, and each token is its own run
 # because the scan exits on the first hit. Mutant that reds the `stale` row: `if (v == "stale") next` in
 # the allow-list — measured 648 passed / 2 failed, exactly this row's two assertions. `stale` is refused
-# by MEMBERSHIP ALONE, unlike `drift:2`/`DRIFTED!` — the old block-list refused those on SHAPE, and
-# t24bx/t24by duplicate them, so their allow-list mutant reds both blocks and proves neither. The rest of
+# by MEMBERSHIP ALONE, unlike `drift:2`/`DRIFTED!` — the ROUND-34 widened class (never merged) refused
+# those on SHAPE, and t24bx/t24by duplicate them, so their allow-list mutant reds both blocks and proves
+# neither. The rest of
 # this fixture's out-of-vocabulary tokens (`stale;`, `N/A`, `drift+1`, `x=y`, `#2`, `2-drift`, `DRIFT/2`)
 # are membership-only too — `stale` is called out because the OTHER two of the three above are the ones
 # that are duplicated, not because it is the only membership-only token here.
@@ -3000,6 +3001,27 @@ OUT="$(HARNESS_APPLY_FARM_CHECKER="$T/t24c5/summary-only.sh" run_pass "$T/t24c5"
 assert_eq "$RC" "24" "T24 control: an OK line over a summary reporting 2 stale rows is refused even when every ROW is benign"
 assert_contains "$OUT" "summary reports 2 row(s)" \
     "T24 control: and the journal quotes the summary, which is the only half that could have fired"
+
+# ⛔ AND THE VERDICT LINE ALONE MUST DO IT (review round 39, measured: NO fixture pinned the VERDICT
+# operand — deleting `[ -n "$FARM_VERDICT0" ] ||` from pass:1703 left the suite fully GREEN, because every
+# other fixture that prints a `DRIFT —` line also trips the row-TOKEN or the summary operand, and t24aq's
+# wrapper report trips both). Here the DRIFT line carries NO parsable counts (`farm_sum_count` finds no
+# `<n> stale`) and the only row is BENIGN (`ok`), so the verdict line is the ONLY signal that can refuse.
+# Mutant that reds these rows: delete `[ -n "$FARM_VERDICT0" ] ||`.
+mk_origin t24c6; mk_clone t24c6
+REPO_P="$CLONE"; MODE_P=sync
+mkdir -p "$T/t24c6/home/.pi/agent/scripts"
+cat >"$T/t24c6/verdict-only.sh" <<'FARM'
+#!/usr/bin/env bash
+printf 'check-farm-drift: DRIFT — rows changed, counts unavailable.\n' >&2
+printf '%-46s | %-12s | %-12s | %s\n' 'handmade.py' aaaa11112222 bbbb33334444 ok >&2
+exit 0
+FARM
+chmod +x "$T/t24c6/verdict-only.sh"
+OUT="$(HARNESS_APPLY_FARM_CHECKER="$T/t24c6/verdict-only.sh" run_pass "$T/t24c6" 2>&1)"; RC=$?
+assert_eq "$RC" "24" "T24 control: an rc=0 report printing a DRIFT verdict line is refused even when every row is benign and the counts unreadable"
+assert_contains "$OUT" "verdict: check-farm-drift: DRIFT — rows changed" \
+    "T24 control: and the journal quotes the verdict line, which is the only operand that could have fired"
 
 # ⛔ AND THE MIRROR: A SUMMARY THAT REPORTS ZERO ROWS IS STILL A MATCH (review round 29). A copy that
 # prints both verdict forms must not be refused for saying 0 — the contradiction is a NON-ZERO total.
