@@ -2082,14 +2082,110 @@ case "${1:-}" in
 esac
 # [refresh-check:end]
 
+# [orchlock:begin]
 LOCKF="$O/.orch.lock"
+# ⛔ LIVENESS IS NOT IDENTITY (agent-infra#1985). The reclaim below used to be `kill -0 "$OPID"` and
+# nothing else, and that is BROKEN whenever a controller dies without its EXIT trap running (kill -9,
+# an OOM kill, a panic): the lock then names a pid the OS will recycle, so the next controller exits
+# `already running (pid N)` over a REUSED pid, the box dispatches nothing, and its own recovery is
+# blocked — launching a controller cannot fix a lock the controller itself refuses. Measured on a live
+# box: the watchdog saw the named pid alive, `ps -p <pid> -o command=` showed a process that was not
+# the controller, and the reload failed on every pass (`RECOVERY FAILED`, rc 1, three passes).
+#
+# ⛔ THE RULE IS THE FLEET'S ONE PROCESS-IDENTITY RULE (#1178), NOT A NEW ONE. A lock owner is
+#   (a) ALIVE, (b) an `orch-loop.sh` INVOCATION (argv shape — `registry_pid_is_controller`), and
+#   (c) a process that did NOT begin after the lock was written.
+# (c) is the discriminator for a recycled pid: the writer held that pid until it died, so any process
+# now holding the pid BEGAN AFTER the writer wrote the lock. It is the same `pid_began_after` fence
+# `orchestrator-bringup.sh:lock_pid` applies to this very file, and the same one the supervisor, the
+# registry and the installer apply (#1856: one predicate, one answer).
+#
+# ⛔ WHAT THE VERDICT MAY DO. Only POSITIVE evidence of non-ownership reclaims — absent, or not an
+# orch-loop.sh, or provably begun after the lock. A pid we cannot date is NOT reclaimed: reclaiming on
+# an unreadable read is how two controllers end up sweeping one PR queue (#1715), which is worse than
+# a stopped box. That case refuses (as before) and now says so LOUDLY, naming the remedy — the #1985
+# defect was that the refusal was one silent line in the log.
+#
+# ⛔ PINNED MIRRORS, NOT A SOURCE. `$O` is a FLAT seed (`deploy-harness.sh` copies
+# `orchestrator-harness/*`), so it has no `scripts/lib/` to source — the same constraint
+# `harness-refresh.sh:_began_before_lock` and `cloud-cell-supervisor.sh` document for their copies.
+# `orch-loop-lock.test.sh` pins both bodies and the slack to the canonical declarations, so drift
+# reddens CI instead of becoming a wrong reclaim.
+ORCH_LOCK_START_SLACK_SECONDS="${ORCH_LOCK_START_SLACK_SECONDS:-5}"
+# _orch_ps_start_epoch <pid> — when the process began, from `ps -o etime=` (one shape on BSD and GNU).
+# rc 1 when it cannot be read. PINNED MIRROR of `pid_start_epoch` in scripts/lib/pid-identity.sh.
+# ⛔ `10#`, NOT a bare `$(( ))`: etime ZERO-PADS, and bash reads a leading zero as OCTAL, so
+# `$((08 * 3600))` is an ERROR — which read as "cannot date it" for a few percent of live reads (#1856).
+_orch_ps_start_epoch() {
+  local p="${1:-}" e d h m s r
+  case "$p" in ''|*[!0-9]*) return 1 ;; esac
+  e="$("${PS_BIN:-/bin/ps}" -o etime= -p "$p" 2>/dev/null | tr -d '[:space:]')" || return 1
+  [ -n "$e" ] || return 1
+  d=0
+  case "$e" in *-*) d="${e%%-*}"; r="${e#*-}" ;; *) r="$e" ;; esac
+  case "$d" in ''|*[!0-9]*) return 1 ;; esac
+  case "$r" in
+    *:*:*) h="${r%%:*}"; r="${r#*:}"; m="${r%%:*}"; s="${r##*:}" ;;
+    *:*)   h=0;                 m="${r%%:*}"; s="${r##*:}" ;;
+    *) return 1 ;;
+  esac
+  case "$h$m$s" in ''|*[!0-9]*) return 1 ;; esac
+  h=$((10#${h:-0})); m=$((10#${m:-0})); s=$((10#${s:-0})); d=$((10#${d:-0}))
+  printf '%s\n' "$(( $(date +%s) - (d * 86400 + h * 3600 + m * 60 + s) ))"
+}
+# _orch_pid_is_loop <pid> — 0 only for a live process whose INVOCATION is an orch-loop.sh.
+# PINNED MIRROR of `registry_pid_is_controller` in scripts/lib/orchestrator-registry.sh: `${1##*/}` must
+# be a shell and `${2##*/}` must be exactly `orch-loop.sh`. A looser ANY-token match (`/?*orch-loop.sh`)
+# accepted `bash -c "sleep 300; /abs/orch-loop.sh"` — a non-controller — and a caller that merely
+# MENTIONS the path (an editor, a grep) is not a controller either (#1856 review).
+_orch_pid_is_loop() {
+  local p="${1:-}" c tok
+  case "$p" in ''|*[!0-9]*) return 1 ;; esac
+  kill -0 "$p" 2>/dev/null || return 1
+  c="$(ps -o command= -p "$p" 2>/dev/null)" || return 1
+  # shellcheck disable=SC2086
+  set -- $c
+  [ "$#" -ge 2 ] || return 1
+  case "${1##*/}" in bash|sh|dash|zsh) ;; *) return 1 ;; esac
+  case "${2##*/}" in orch-loop.sh) return 0 ;; esac
+  return 1
+}
+# _orch_lock_verdict <pid> <lockfile> -> 0 OWNER · 1 PROVABLY NOT the owner · 2 CANNOT TELL
+# ⛔ THREE OUTCOMES. 2 must reach the caller AS 2: folding "cannot date it" into 1 would reclaim a lock
+# whose live owner it simply could not read (two controllers, #1715), and folding it into 0 would keep
+# the #1985 silent stop. The caller refuses on 2, loudly.
+_orch_lock_verdict() {
+  local p="${1:-}" lf="${2:-}" lt pstart
+  case "$p" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$p" -gt 1 ] || return 1                      # pid 0 is our own process group; 1 is init
+  kill -0 "$p" 2>/dev/null || return 1             # absent — the lock outlived its writer
+  _orch_pid_is_loop "$p" || return 1              # alive, but the invocation is not an orch-loop.sh
+  lt="$(date -r "$lf" +%s 2>/dev/null)" || return 2
+  case "$lt" in ''|*[!0-9]*) return 2 ;; esac
+  pstart="$(_orch_ps_start_epoch "$p")" || return 2
+  [ "$pstart" -gt "$(( lt + ORCH_LOCK_START_SLACK_SECONDS ))" ] && return 1   # began AFTER the lock
+  return 0
+}
 acq() { ( set -o noclobber; echo $$ > "$LOCKF" ) 2>/dev/null; }
 if ! acq; then
-  OPID="$(cat "$LOCKF" 2>/dev/null || echo 0)"
-  if [ "${OPID:-0}" -gt 0 ] && kill -0 "$OPID" 2>/dev/null; then echo "[orch-loop] already running (pid $OPID)"; exit 0; fi
+  # Digits only, like `orchestrator-bringup.sh:lock_pid`: a lock carrying `abc` reached `[ abc -gt 0 ]`
+  # — an ERRORED test, which is FALSE, which reclaimed it — so the read is sanitised before any test.
+  OPID="$(tr -dc '0-9' 2>/dev/null < "$LOCKF")"
+  _orch_lock_verdict "${OPID:-0}" "$LOCKF"; _OV=$?
+  if [ "$_OV" = 0 ]; then echo "[orch-loop] already running (pid $OPID)"; exit 0; fi
+  if [ "$_OV" = 2 ]; then
+    _MSG="[orch-loop] CANNOT-TELL: lock $LOCKF names pid ${OPID:-none}, which is ALIVE and is an orch-loop.sh invocation, but its START TIME cannot be read — a RECYCLED pid cannot be ruled out, so a second controller is refused (agent-infra#1715). If no controller is running: rm -f $LOCKF (agent-infra#1985)"
+    echo "$_MSG" >&2
+    echo "[lock] CANNOT-TELL — $_MSG" >> "$LOG" 2>/dev/null || true
+    exit 0
+  fi
+  # Positive evidence only: absent, not an orch-loop.sh, or provably begun AFTER the lock. Logged,
+  # because a silent reclaim is the other half of the #1715 class (it must never be invisible).
+  echo "[lock] reclaiming $LOCKF — pid ${OPID:-none} is provably NOT the owner (absent, not an orch-loop.sh invocation, or begun after the lock was written)" >> "$LOG" 2>/dev/null || true
   rm -f "$LOCKF"
   acq || { echo "[orch-loop] lock race — exiting"; exit 0; }
 fi
+# [orchlock:end]
 # ⛔ THE SIGNAL HANDLERS ONLY TERMINATE — THE LOCK IS RELEASED BY THE `EXIT` TRAP ALONE.
 # Was `trap 'rm -f "$LOCKF"' EXIT INT TERM`, and for INT/TERM a handler that RETURNS does NOT
 # terminate: bash RESUMES the interrupted command loop, so the documented stop path
