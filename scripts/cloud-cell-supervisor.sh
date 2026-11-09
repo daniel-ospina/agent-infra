@@ -2494,10 +2494,6 @@ sup_lane_terms() { # sup_lane_terms <path>
   printf '%s %s %s %s %s\n' "$(( worst + reserve ))" "$tree" "$self" "$reserve" "$cls"
 }
 
-sup_lane_need_mb() { # sup_lane_need_mb <path> -> the live arm's need alone (first field)
-  local t; t="$(sup_lane_terms "${1:-.}")"; printf '%s\n' "${t%% *}"
-}
-
 # sup_seam_terms — the PRE-START SEAM's terms: `<need> <tree> <self> <reserve>`. Mirrors
 # `spawn-gate.sh`'s `disk_worktree_terms` + `disk_worktree_need`, and it is TARGET-INDEPENDENT on
 # purpose: the seam charges the PYTHON class unconditionally (`spawn-gate.sh`: "this is why the seam
