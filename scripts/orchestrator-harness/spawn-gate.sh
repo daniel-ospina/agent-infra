@@ -61,6 +61,26 @@
 # the canonical one plus the gate. A port that silently regresses the receiving tree is not a port.
 set -u
 
+# ── THE LANE'S gh CREDENTIAL RESOLVER (agent-infra#2509) ──────────────────────────────────────────
+# ⛔ SOURCED HERE, AT LOAD TIME, so `run_agent` can resolve gh's config dir for the lane before the
+# land-backlog gate reads GitHub with it. `gh-auth.sh` is its own module for the same reason
+# `key-gate.sh` and `lane-env.sh` are: it is one question ("where does this lane's gh find a
+# credential?") with an order of precedence that deserves its own arms, and five callers that must not
+# each re-derive it.
+# ⛔ RESOLUTION ORDER IS `$O` FIRST, THEN THE COPY BESIDE THIS FILE — the same rule
+# `nonblocking-dispatch.sh` applies to spawn-gate.sh itself (the daemon's tree is what the box runs).
+# ⛔ A MISSING MODULE IS REPORTED, NEVER FATAL. Refusing a spawn because an instrument is absent is the
+# refusal loop #2210 exists to stop, and the module is new: a `$O` half-synced by a commit that
+# predates it must keep dispatching with a LOUD line (the drift lists in `install.sh`,
+# `check-single-source.sh` and `cloud-cell-supervisor.sh` are what make the absence visible).
+for _gh_auth_d in "${O:-}" "$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)"; do
+  [ -n "$_gh_auth_d" ] || continue
+  [ -r "$_gh_auth_d/gh-auth.sh" ] || continue
+  # shellcheck disable=SC1090
+  . "$_gh_auth_d/gh-auth.sh" && break
+done
+unset _gh_auth_d
+
 # `is_num` is shared by every numeric coercion below AND by orch-loop.sh's own coercions (which are
 # a SEPARATE copy: orch-loop.sh does NOT source this file — see the header). It lives here because the
 # ceiling is derived at SOURCE time, below, and a guard that runs after the arithmetic it protects is
@@ -1270,6 +1290,70 @@ land_backlog_exempt() { # <issue> <owner/repo> -> prints the reason + ". ", rc 0
       printf 'a main-broken-by-merge repair reduces the backlog for every PR behind it — exempt. '; return 0 ;;
   esac
   return 1
+}
+
+# ── THE EVIDENCE READ'S OWN VERDICT, IN THE LOG (agent-infra#2509) ───────────────────────────────
+# ⛔ THE DEFECT THIS NAMES: when the label/title read failed, the ONLY trace was an appended clause on
+# the verdict line — and on an UNDER-ceiling repo the log printed `[land-backlog] OK …` and nothing
+# else, so an unreadable exemption was indistinguishable from "this issue is not urgent". Measured
+# 2026-11-09: the same cause (no gh credential in the lane's redirected HOME) failed BOTH reads, and an
+# operator reading the lane log could not tell a P0-blocker held by a broken gh chain from one that was
+# judged non-urgent. This line is printed whenever the evidence read failed, whatever the ratio read
+# then said.
+# ⛔ AND IT SEPARATES THE TWO CAUSES IT CAN SEE, because their remedies differ: a missing credential
+# (fix the lane's env) versus a read that failed WITH a credential resolved (fix permissions/the
+# chain). It never claims a cause it cannot read (`gh_auth_cause` is silent on anything but a positive
+# absence).
+land_backlog_exempt_note() { # <label> <exempt-why>
+  local label="${1:-}" why="${2:-}" cause r st
+  case "$why" in *EXEMPTION-UNREADABLE*) ;; *) return 0 ;; esac
+  cause="$(gh_auth_cause "${HOME:-}" 2>/dev/null)"
+  if [ -n "$cause" ]; then
+    printf '[land-backlog] NOTE %s: EXEMPTION-UNREADABLE — the %s labels/title read FAILED (%s), so a P0-blocker or a base-red repair cannot be PROVEN exempt on this lane; the ratio decides below, and OVER the ceiling that means HELD.\n' \
+      "$label" "${TAG:-issue}" "$cause"
+  else
+    r="$(gh_auth_resolve "${HOME:-}" 2>/dev/null)"; st="${r%%|*}"
+    printf '[land-backlog] NOTE %s: EXEMPTION-UNREADABLE — the %s labels/title read FAILED even though the lane'"'"'s gh IS credentialed (state=%s); fix the READ (issue/permalink, permissions, network), not the credential. A P0/base-red exemption cannot be proven, so the ratio decides below, and OVER the ceiling that means HELD.\n' \
+      "$label" "${TAG:-issue}" "${st:-unknown}"
+  fi
+}
+
+# ── ONE DEFINITION OF THE REFUSAL TEXT (agent-infra#2509) ────────────────────────────────────────
+# ⛔ THE REMEDY MUST MATCH THE CAUSE. The two call sites (`prfix` fall-through and `bg`) carried
+# byte-identical copies of a refusal whose remedy was the RATIO one — "land/fix the open PRs (this is
+# the drain), or dispatch a P0/base-red item" — printed on the `UNREADABLE` arm as well. Measured
+# 2026-11-09: the cause was a lane whose `gh` had NO credential at all, so acting on the printed remedy
+# meant landing PRs to fix a `hosts.yml` problem. The ratio remedy is now printed only when the read
+# actually RESOLVED (the `LAND-BACKLOG` state), and the credential remedy when it did not.
+# ⛔ STILL A REFUSAL: no agent started, nothing consumed, and the item stays eligible on another box —
+# #2210's contract is that the refusal is READABLE, not that it is quiet.
+land_backlog_refuse() { # <label> <verdict-line> <exempt-why>
+  local label="${1:-}" line="${2:-}" why="${3:-}" cause r st d
+  printf '[land-backlog] REFUSED %s: %s. No agent started, nothing consumed.' "$label" "$line"
+  case "$line" in
+    UNREADABLE*)
+      cause="$(gh_auth_cause "${HOME:-}" 2>/dev/null)"
+      if [ -n "$cause" ]; then
+        printf ' ⛔ THIS IS NOT THE LANDING RATIO: %s. Remedy: give the lane'"'"'s gh a credential — export GH_CONFIG_DIR=<the directory holding hosts.yml> or GH_TOKEN — then re-dispatch. Landing is unaffected and no open PR was judged by this line; a re-dispatch to a box whose dispatch environment is the same refuses identically (every cell redirects HOME the same way), so fix the cause rather than re-dispatching.' "$cause"
+      else
+        r="$(gh_auth_resolve "${HOME:-}" 2>/dev/null)"; st="${r%%|*}"; d="${r#*|}"
+        printf ' Remedy: land/fix the open PRs (this is the drain), or dispatch a P0/base-red item — those are exempt by evidence. The lane'"'"'s gh IS credentialed (state=%s%s), so this read failed for another reason: check the gh/network chain. The issue returns to the pool and is re-dispatched when the next read succeeds.' \
+          "${st:-unknown}" "${d:+ at $d}"
+      fi
+      ;;
+    *)
+      printf ' Remedy: land/fix the open PRs (this is the drain), or dispatch a P0/base-red item — those are exempt by evidence. The issue returns to the pool and is re-dispatched when the ratio clears.'
+      ;;
+  esac
+  # ⛔ THE EXEMPTION CLAUSE IS PRINTED ON EVERY ARM (agent-infra#2509): an unreadable EVIDENCE read is a
+  # fact whatever the credential state and whatever the ratio read then said — and it is the sentence
+  # that stops the refusal being read as "this issue was judged not urgent". It is unconditional here
+  # because the alternative (an append on one arm) is how it was lost on the `LAND-BACKLOG` arm: measured
+  # in this change's own suite, B6 held the P0 correctly while the refusal line said nothing about why.
+  case "$why" in
+    *EXEMPTION-UNREADABLE*) printf ' The %s evidence read failed too, so a P0-blocker or a base-red repair dispatched here is HELD, not judged non-urgent.' "${TAG:-issue}" ;;
+  esac
+  printf '\n'
 }
 
 # ── the CAP-KILL WORKTREE SNAPSHOT (agent-infra#2045) ───────────────────────────
@@ -4207,6 +4291,25 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
     echo "[load-gate] REFUSED $label: load=$l >= max_load=$MAX_LOAD — no agent started; the controller re-dispatches when load falls, and nothing was consumed" >> "$log"
     return "$AGENT_LOAD_REFUSED"
   fi
+  # ── THE LANE'S gh CREDENTIAL (agent-infra#2509) — BEFORE THE CREATION GATE, WHICH READS GITHUB ────
+  # ⛔ IT HAS TO RUN HERE, NOT IN A CALLER. The land-backlog gate below reads the open-PR ratio AND the
+  # issue's evidence (labels/title) with `gh`, in THIS process, and a lane runs with `HOME` redirected
+  # to the operational home while gh's `hosts.yml` lives in the ACCOUNT home — so without this the lane's
+  # `gh` is simply unauthenticated, the ratio reads UNREADABLE, and (measured 2026-11-09, two cells) the
+  # refusal blamed the PR queue. `run_agent` is the single invocation every worker goes through, so
+  # resolving here covers `lane.sh`, `fix-one.sh` and `nonblocking-dispatch.sh` at once, and the export
+  # is INHERITED by the `pi` this function starts and by `wt_spawn`'s launch line — so the store the gate
+  # read and the store the lane reads are the same one by construction.
+  # ⛔ A MISSING MODULE (a `$O` that predates it) is reported and changes NOTHING else: this gate must
+  # never be the reason a lane cannot start.
+  if command -v gh_auth_log >/dev/null 2>&1; then
+    local _ga_rc=0
+    gh_auth_log "${HOME:-}" >> "$log" 2>/dev/null || _ga_rc=$?
+    [ "$_ga_rc" -eq 0 ] \
+      || echo "[gh-auth] UNAVAILABLE: gh-auth.sh resolved but its resolver failed (rc=$_ga_rc) — the lane's gh config dir was NOT resolved, so a redirected HOME may leave gh unauthenticated (agent-infra#2509)" >> "$log"
+  else
+    echo "[gh-auth] UNAVAILABLE: gh-auth.sh is not beside this spawn-gate.sh or in \$O — the lane's gh config dir was NOT resolved, so a redirected HOME may leave gh unauthenticated (agent-infra#2509). A half-synced \$O is the cause; 'bash install.sh' or deploy-harness.sh --sync fixes it." >> "$log"
+  fi
   # ── THE CREATION GATE (agent-infra#2409) ────────────────────────────────────────────────────
   # LAST, and only for a CREATION worker. Two ordering decisions, both load-bearing:
   #   * AFTER the disk and load gates, so a box that is genuinely out of room reports the refusal
@@ -4261,12 +4364,10 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
       if lb_why="$(land_backlog_exempt "${TAG:-}" "$lb_repo")"; then
         echo "[land-backlog] EXEMPT $label: $lb_why(#2409 creation back-pressure)" >> "$log"
       else
+        land_backlog_exempt_note "$label" "$lb_why" >> "$log"
         lb_line="$(land_backlog_verdict "$lb_repo")"; lb_rc=$?
-        case "$lb_why" in
-          *EXEMPTION-UNREADABLE*) lb_line="$lb_line [the $TAG exemption read ALSO failed: if this issue is a P0-blocker or a base-red repair it could not be proven, so fix the gh chain rather than assume it was judged non-urgent]" ;;
-        esac
         if [ "$lb_rc" -ne 0 ]; then
-          echo "[land-backlog] REFUSED $label: $lb_line. No agent started, nothing consumed. Remedy: land/fix the open PRs (this is the drain), or dispatch a P0/base-red item — those are exempt by evidence. The issue returns to the pool and is re-dispatched when the ratio clears." >> "$log"
+          land_backlog_refuse "$label" "$lb_line" "$lb_why" >> "$log"
           return "$AGENT_LAND_BACKLOG"
         fi
         echo "[land-backlog] $lb_line" >> "$log"
@@ -4274,12 +4375,10 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
     elif lb_why="$(land_backlog_exempt "${TAG:-}" "$lb_repo")"; then
       echo "[land-backlog] EXEMPT $label: $lb_why(#2409 creation back-pressure)" >> "$log"
     else
+      land_backlog_exempt_note "$label" "$lb_why" >> "$log"
       lb_line="$(land_backlog_verdict "$lb_repo")"; lb_rc=$?
-      case "$lb_why" in
-        *EXEMPTION-UNREADABLE*) lb_line="$lb_line [the $TAG exemption read ALSO failed: if this issue is a P0-blocker or a base-red repair it could not be proven, so fix the gh chain rather than assume it was judged non-urgent]" ;;
-      esac
       if [ "$lb_rc" -ne 0 ]; then
-        echo "[land-backlog] REFUSED $label: $lb_line. No agent started, nothing consumed. Remedy: land/fix the open PRs (this is the drain), or dispatch a P0/base-red item — those are exempt by evidence. The issue returns to the pool and is re-dispatched when the ratio clears." >> "$log"
+        land_backlog_refuse "$label" "$lb_line" "$lb_why" >> "$log"
         return "$AGENT_LAND_BACKLOG"
       fi
       echo "[land-backlog] $lb_line" >> "$log"
