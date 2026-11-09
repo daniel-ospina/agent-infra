@@ -3126,20 +3126,25 @@ test("both block messages print the ORDER a PASS can merge in (#2087)", () => {
   // The gate's remedy is an instruction an agent follows literally, so the order has to be IN
   // the message: a verifier dispatched before the first blocked op (or before staging) records
   // 0 of N files, and the retry is refused with the identical text. `orderMattersLines` is the
-  // ONE producer both block sites render (the interactive handler and buildSubAgentBlockMessage),
-  // so its content is pinned here and its PRESENCE at each site is pinned at the e2e layer.
+  // ONE producer both block sites render. THIS test pins its content plus the SUB-AGENT site
+  // (the `buildSubAgentBlockMessage` call below); the INTERACTIVE site is pinned where a block
+  // message can actually be rendered — `index.lane-satisfiable.test.ts`'s `(#2087) a PASS taken
+  // before any scope exists …` case asserts the real handler's `reason` carries it.
   const lines = orderMattersLines(["a.ts"], "  ").join("\n");
   ok(/ORDER MATTERS \(#2087\)/.test(lines), "the order is stated");
   ok(/dispatched BEFORE the first block/.test(lines), "names the failing order explicitly");
   ok(/git add a\.ts/.test(lines), "names the concrete staging command for THESE files");
   ok(/THIS refusal recorded the scope/.test(lines), "says the scope already exists after the block");
   ok(/push \/ gh op needs no staging/.test(lines), "distinguishes a push (nothing to stage) from a commit");
+  // #2087 precision: the push exemption is NOT unconditional — a push whose range could not be
+  // resolved keeps the staged-index fallback, so the line must not tell that shape to skip staging.
+  ok(/first push with no[\s\S]*usable base[\s\S]*staged index/.test(lines), "names the staged-index fallback for an unresolvable push range");
   // Every rendered line is indented once by the caller — the block bodies are one level in.
   ok(lines.split("\n").every((l) => l.startsWith("  ")), "every line carries the caller's indent");
   // An empty blocked set must not render a dangling `git add ` with no arguments.
   const empty = orderMattersLines([], "  ").join("\n");
   ok(!/git add\s*$/.test(empty), "no dangling `git add` when the blocked set is empty");
-  // And the sub-agent message carries it in-band (the child's own ceremony).
+  // And the sub-agent message carries it in-band (the child's own ceremony) — the site pin.
   ok(/ORDER MATTERS \(#2087\)/.test(buildSubAgentBlockMessage(["  Unverified files:"], "/repo", ["a.ts"])), "sub-agent block states the order too");
 });
 

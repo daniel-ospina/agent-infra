@@ -4390,16 +4390,6 @@ export function dispatchState(): { klass: DispatchFailureClass | null; streak: n
 }
 
 /**
- * #285 P1-A Surface 1: the sub-agent block message, task-tool-aware. The old
- * text unconditionally claimed "This session HAS the task tool" — false for
- * the 7 task-restricted user agents (--tools allowlists without task: planner,
- * verifier, reviewer, scout, code-reviewer, bug-scanner, product-verifier).
- * Task-capable → in-band self-satisfy (dispatch [VGATE] via the task tool,
- * retry). Task-restricted → FINAL block: return to the parent session (it runs
- * the verification ceremony and will re-dispatch). The argv param is the e2e
- * seam (the harness's process.argv has no --tools → task-capable by default).
- */
-/**
  * #2087: the ORDER the VGATE ceremony must be run in, printed by BOTH block messages.
  *
  * MEASURED 2026-11-04 while fixing #2087 (the finding's remedy had been re-derived in a
@@ -4427,11 +4417,26 @@ export function orderMattersLines(allBlocked: string[], indent = "  "): string[]
     allBlocked.length > 0
       ? `  If the change is not staged yet, stage it FIRST: git add ${allBlocked.join(' ')}`
       : "  If the change is not staged yet, stage it FIRST, then dispatch.",
-    "  A push / gh op needs no staging — this refusal IS its scope.",
+    // #2087 precision: a normal push/gh op is scoped by its own diff range, and the refusal has
+    // just recorded it — nothing to stage. The ONE exception is documented at the push-scope
+    // section of 01-preflight.md: a push with NO usable base (a fresh `git init` first push, or any
+    // probe failure) falls back to the STAGED index, so that shape must stage like a commit.
+    "  A push / gh op needs no staging — this refusal IS its scope (except a first push with no",
+    "  usable base, whose fallback scope is the staged index: stage it as for a commit).",
   ];
   return lines.map(l => `${indent}${l}`);
 }
 
+/**
+ * #285 P1-A Surface 1: the sub-agent block message, task-tool-aware. The old
+ * text unconditionally claimed "This session HAS the task tool" — false for
+ * the 7 task-restricted user agents (--tools allowlists without task: planner,
+ * verifier, reviewer, scout, code-reviewer, bug-scanner, product-verifier).
+ * Task-capable → in-band self-satisfy (dispatch [VGATE] via the task tool,
+ * retry). Task-restricted → FINAL block: return to the parent session (it runs
+ * the verification ceremony and will re-dispatch). The argv param is the e2e
+ * seam (the harness's process.argv has no --tools → task-capable by default).
+ */
 export function buildSubAgentBlockMessage(
   reasons: string[],
   cwd: string,

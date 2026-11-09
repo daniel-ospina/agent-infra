@@ -593,13 +593,16 @@ discarded, the retry is refused with the identical text, and re-dispatching the 
 repeats it (`zero-merge-pass`). The order that works:
 
 1. **Stage the change** (`git add <files>`) — or, for a `push`/`gh pr` op, simply attempt it
-   once: the refusal IS what records the push range. Nothing to stage on a push.
+   once: the refusal IS what records the push range. Nothing to stage on a push, **except** the
+   documented first-push fallback (a push with no usable base — a fresh `git init` first push, or
+   any range-probe failure — keeps the staged-index scope, so that shape stages like a commit).
 2. **Dispatch the verifier** naming the files the block printed.
 3. **Retry the git operation.**
 
-Measured 2026-11-04: `stage → verify → commit` and `block → verify → retry` both converge in
-one cycle; `verify → stage → commit` is refused (fail-closed, deliberately — seeding the scope
-from the branch's unpushed diff was considered in #2087 and rejected as an anchor weakening).
+Measured 2026-11-04: `stage → verify → commit`, `block → verify → retry`, and (the headline shape,
+`push` of an already-made commit) `refused push → verify → retry` all converge in one cycle;
+`verify → stage → commit` is refused (fail-closed, deliberately — seeding the scope from the
+branch's unpushed diff was considered in #2087 and rejected as an anchor weakening).
 The block message prints this order, and the `zero-merge-pass` remedy now names ordering as the
 cause instead of blaming the verifier.
 
