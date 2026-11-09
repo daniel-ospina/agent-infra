@@ -3044,7 +3044,9 @@ _pr_not_asked = _REAP_PR_LIMIT == "0"
 # settled only by its own CLOSED state) — a narrower window can make this pass keep MORE, never
 # release more. An absent marker reads as the full window, i.e. unchanged behaviour.
 _pr_limit = int(_REAP_PR_LIMIT) if _REAP_PR_LIMIT.isdigit() else 500
-_pr_window_narrow = _pr_limit < 500
+# ⛔ "NOT ASKED" IS NOT A ZERO-ROW WINDOW: the marker `0` means the caller declined to ask, so the
+# narrowing line below must not claim a 0-row window was read. Only an ACTUAL narrowing counts.
+_pr_window_narrow = (not _pr_not_asked) and _pr_limit < 500
 have_open = have_open or _open_not_asked
 have_pr = have_pr or _pr_not_asked
 # PRESENT BUT UNDECODABLE IS THE ABSENT CASE (see `lines()`): existence is not readability, and the
