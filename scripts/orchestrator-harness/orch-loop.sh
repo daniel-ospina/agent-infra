@@ -4843,8 +4843,12 @@ gh_limit_recorded_until() {
   # reset, up to an hour out. Deferring the REST sweep on it would stop merges on a box whose `core`
   # has quota, and the header path this companion backstops can never do that (a header belongs to
   # the response's own bucket). Only a `core` observation may defer the sweep; anything else falls
-  # back to the now+60 floor. A record with no `bucket=` predates the field and is treated as core,
-  # which is the bucket every pre-#2137 record was written for.
+  # back to the now+60 floor. A record with no `bucket=` is MISSING the field this parse expects, and
+  # core is the bucket an unattributable record is safest read as. (`bucket=` has been in
+  # `record_limit`'s format string since the file's first version —
+  # `git show 81a190ee4:scripts/orchestrator-harness/gh-limit.py` → line 302
+  # `"at=%d bucket=%s reset=%s attempts=%d waited=%d status=%s"` — so an absent field means a damaged
+  # or foreign record, never an old one; #2137 added `kind=`/`until=`/`remaining=`, not `bucket=`.)
   [ "${bucket:-core}" = "core" ] || return 0
   if is_num "${recovered:-}" && [ "$recovered" -ge "$at" ]; then return 0; fi
   age=$(( $(date +%s) - at ))
@@ -4853,12 +4857,18 @@ gh_limit_recorded_until() {
 }
 # sweep_defer_until_recorded <raw-response> -> sweep_defer_until, PLUS the layer's own window when the
 # response carried no rate-limit headers at all.
-# ⛔ THE DEFERRAL HAD NO WINDOW TO READ ON THE PATH THAT MATTERS MOST. The controller's calls are now
-# bounded AND `GH_LIMIT_NO_WAIT` (see the gh-bound block), so a rate-limited call comes back AT ONCE
-# with the RATE-LIMITED refusal on STDERR and NO response headers — there was no request to take them
-# from. `sweep_defer_until ""` can only floor that at now+60, so the box re-attempted a spent bucket
-# once a minute for the length of the limit. The layer already recorded the window its own
-# classification justifies; this takes the LATER of the two.
+# ⛔ WHAT THIS ACTUALLY BUYS, AND WHAT IT DOES NOT (measured — #2028 review round 2, finding 1). The
+# record's `until=` is the LAYER's classification of its last refusal: `marker_until` yields the real
+# `reset` only for `kind=primary` (or a `retry-after` window), and `now+BASE_WAIT` — 60 s — for a
+# `secondary`/`unclassified` one. A `NO_WAIT` refusal, which is the shape the sweeps now get, has no
+# headers to classify, so it IS `secondary`/`unclassified`: its record is the now+60 floor and this
+# companion adds NOTHING on that path. What closed the "re-attempts a spent bucket once a minute" gap
+# is `GH_LIMIT_NO_WAIT` itself (the layer answers at once and the cycle's own deferral takes the
+# backoff — #2028 fix-direction #2), not this helper. The helper pays only when the last recorded CORE
+# observation was a `primary`/`retry-after` refusal written by a DIFFERENT core call that did reach the
+# headers; then the window outlives this refusal and the box need not re-attempt.
+# Residual, stated rather than overstated: a `NO_WAIT` refusal defers on the 60 s floor and re-attempts
+# once a minute until the layer's own window clears it. That path is bounded and now cheap.
 # A header always WINS: it is this response's truth, while the record is the last one's — so the record
 # is consulted only when the response carries neither `retry-after` nor `x-ratelimit-reset`, and the
 # result keeps the same now+3600 ceiling the header path applies.

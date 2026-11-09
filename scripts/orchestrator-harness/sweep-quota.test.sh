@@ -194,19 +194,29 @@ if need "$T/quota.sh" "the sweep-quota helper block"; then
   got="$(sweep_defer_until "$raw")"
   [ "$got" -le $(( now + 3610 )) ] && ok "sweep_defer_until: an absurd reset is capped at 1h" \
                                     || bad "sweep_defer_until returned a runaway '$got'"
-  # ⛔ A BOUNDED `GH_LIMIT_NO_WAIT` REFUSAL CARRIES NO HEADERS AT ALL (agent-infra#2028 review P1). The
-  # layer answers before the request is servable, so `sweep_defer_until ""` can only floor the deferral
-  # at now+60 — and the box re-attempted a spent bucket once a minute for the whole limit. The layer
-  # records the window its own classification justifies (`until=`, gh-limit.py record_window);
-  # `sweep_defer_until_recorded` takes the LATER of the two. Every case below is driven from a fixture
-  # `GH_LIMIT_DIR`, never the runner's own cache.
+  # ⛔ A BOUNDED `GH_LIMIT_NO_WAIT` REFUSAL CARRIES NO HEADERS AT ALL (agent-infra#2028 review P1).
+  # `GH_LIMIT_NO_WAIT` is what stops the in-call sleep and the once-a-minute retry; the companion below
+  # reads the layer's recorded `until=` when the response carries none. **What the record can be:**
+  # `marker_until` writes the real `reset` only for `kind=primary` (or a `retry-after` window) and
+  # `now+BASE_WAIT` for `secondary`/`unclassified` — so BOTH shapes are graded below, and the
+  # `secondary` row is the control that keeps the `primary` row from being read as a benefit on the
+  # `NO_WAIT` path (agent-infra#2028 review round 2, finding 1). Every case below is driven from a
+  # fixture `GH_LIMIT_DIR`, never the runner's own cache.
   mkdir -p "$T/ghlimit"; export GH_LIMIT_DIR="$T/ghlimit"
-  rec() { printf 'at=%s bucket=core reset=0 attempts=1 waited=0 status=403 kind=primary until=%s remaining=0 recovered=%s\n' "$1" "$2" "${3:-0}" > "$T/ghlimit/last-limit"; }
+  rec() { printf 'at=%s bucket=core reset=0 attempts=1 waited=0 status=403 kind=%s until=%s remaining=0 recovered=%s\n' "$1" "${4:-primary}" "$2" "${3:-0}" > "$T/ghlimit/last-limit"; }
   rec "$now" "$(( now + 3000 ))"
   got="$(sweep_defer_until_recorded '')"
   [ "$got" -ge $(( now + 2990 )) ] && [ "$got" -le $(( now + 3010 )) ] \
-    && ok "sweep_defer_until_recorded: no headers → the layer's recorded until= window is used, not the 60s floor" \
+    && ok "sweep_defer_until_recorded: no headers → a recorded PRIMARY until= window is used, not the 60s floor" \
     || bad "sweep_defer_until_recorded ignored the recorded until= ('$got', want ~$(( now + 3000 )))"
+  # …and the shape the layer actually writes for a headers-less (NO_WAIT) refusal: `secondary`, whose
+  # `until=` IS the now+60 floor. The companion must add nothing here — it cannot invent a window the
+  # layer did not record, and this row is what makes the row above honest.
+  rec "$now" "$(( now + 60 ))" 0 secondary
+  got="$(sweep_defer_until_recorded '')"
+  [ "$got" -ge $(( now + 55 )) ] && [ "$got" -le $(( now + 75 )) ] \
+    && ok "sweep_defer_until_recorded: a kind=secondary record (what a NO_WAIT refusal writes) stays on the 60s floor — no invented window" \
+    || bad "sweep_defer_until_recorded invented a window from a kind=secondary record ('$got')"
   raw="$(printf 'HTTP/2.0 403 x\r\nX-Ratelimit-Reset: %s\r\n\r\n' "$(( now + 120 ))")"
   got="$(sweep_defer_until_recorded "$raw")"
   [ "$got" -le $(( now + 140 )) ] \

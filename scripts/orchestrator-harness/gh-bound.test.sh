@@ -276,12 +276,30 @@ esac
 
 # Case F — STRUCTURAL, and the one that keeps the fix from rotting: no gh call in the shipped loop may
 # bypass the bound. The pre-fix tree fails this on 16 sites; a new unbounded call site fails it too.
-UNBOUNDED="$(awk '{ line=$0; sub(/^[ \t]+/,"",line); if (line ~ /^#/) next;
-  if (line ~ /(^|[|;&({]|\$\(|(if|then|elif|while|!|do|else)[ \t])[ \t]*(command[ \t]+)?gh[ \t]/) print NR": "line }' "$LOOP" \
-  | grep -v 'gh rc=%s' | grep -v 'then command gh "\$@"')"
+# ⛔ ONE DEFINITION, TWO CALLERS (the real file and the mutation fixture below): a second copy of this
+# expression is the "pin over a COPY" shape that let the verdict-extractor pin drift from its
+# producer on this repo. The prefix set is the COMMAND-POSITION set — it includes a `case`-arm arm
+# (`pat) gh api … ;;`), anchored on a single token or a quoted token so a `) gh` inside a string
+# literal cannot red it (agent-infra#2028 review round 2, finding 3).
+_unbounded_scan() {
+  awk '{ line=$0; sub(/^[ \t]+/,"",line); if (line ~ /^#/) next;
+  if (line ~ /(^|[|;&({]|\$\(|(if|then|elif|while|!|do|else)[ \t]|^[^ \t]*\)[ \t]|^"[^"]*"\)[ \t])[ \t]*(command[ \t]+)?gh[ \t]/) print NR": "line }' "$@" \
+    | grep -v 'gh rc=%s' | grep -v 'then command gh "\$@"'
+}
+UNBOUNDED="$(_unbounded_scan "$LOOP")"
 [ -z "$UNBOUNDED" ] && ok "structural: every gh invocation in orch-loop.sh goes through gh_bounded (0 unbounded sites)" \
   || bad "structural: unbounded gh call site(s) remain in orch-loop.sh:
 $UNBOUNDED"
+# …and the catcher itself must SEE a case-arm command position, or a future site written that way
+# bypasses the bound with this assertion still green. Two lines: an unbounded case arm (must be
+# reported) and an already-bounded one (`gh_bounded`, which must NOT be, or every case-arm site reds).
+printf '%s\n' 'core) gh api repos/o/r/pulls' '  other) gh_bounded api repos/o/r' > "$T/casearm.sh"
+CASEARM="$(_unbounded_scan "$T/casearm.sh")"
+if grep -q '^1: ' <<<"$CASEARM" && ! grep -q '^2: ' <<<"$CASEARM"; then
+  ok "structural: a \`case\`-arm command position IS caught, and an already-bounded one is not (the blind spot is closed, not documented)"
+else
+  bad "structural: the case-arm blind spot is UNCLOSED — scan said '${CASEARM:-<nothing>}' (want line 1 only)"
+fi
 # … and the ONE permitted bare `gh` is the degraded pass-through inside gh_bounded itself.
 grep -q 'then command gh "\$@"' "$LOOP" && ok "structural: the degraded pass-through is the only bare gh, and it is inside gh_bounded" \
   || bad "structural: gh_bounded's degraded pass-through is missing (degraded mode would call nothing)"
