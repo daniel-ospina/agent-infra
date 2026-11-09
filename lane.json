@@ -1,0 +1,40 @@
+{
+  "artifacts": [
+    {
+      "kind": "log",
+      "value": "/tmp/cell-home/orchestrator/bg/issue-11642.log"
+    },
+    {
+      "kind": "branch",
+      "value": "feat/11642-vector-move"
+    },
+    {
+      "kind": "sha",
+      "value": "5a97c8199e9f6482f53f55ef69a195bcb87d9368"
+    },
+    {
+      "kind": "worktree",
+      "value": "/home/cmux/wt-11642"
+    }
+  ],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 7800,
+  "duration_s": 7224,
+  "ended_at": 1794267974,
+  "exit_code": 143,
+  "heartbeat_at": 1794267974,
+  "host": "cmux",
+  "issue": null,
+  "kind": "bg",
+  "lane_id": "cmux.kbg-issue-11642-1794260750-p141318-145b6c0c",
+  "lease_until": 1794275774,
+  "pid": 141318,
+  "reason": "bound:exceeded-wallclock",
+  "repo": "daniel-ospina/tortoise",
+  "schema": 1,
+  "started_at": 1794260750,
+  "state": "FAILED",
+  "tag": "issue-11642",
+  "worktree": "/home/cmux/wt-11642"
+}
