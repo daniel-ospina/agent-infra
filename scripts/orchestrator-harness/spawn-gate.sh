@@ -1313,8 +1313,18 @@ land_backlog_exempt_note() { # <label> <exempt-why>
       "$label" "${TAG:-issue}" "$cause"
   else
     r="$(gh_auth_resolve "${HOME:-}" 2>/dev/null)"; st="${r%%|*}"
-    printf '[land-backlog] NOTE %s: EXEMPTION-UNREADABLE — the %s labels/title read FAILED even though the lane'"'"'s gh IS credentialed (state=%s); fix the READ (issue/permalink, permissions, network), not the credential. A P0/base-red exemption cannot be proven, so the ratio decides below, and OVER the ceiling that means HELD.\n' \
-      "$label" "${TAG:-issue}" "${st:-unknown}"
+    case "$st" in
+      # ⛔ THE SAME FALSE-CLAIM GUARD AS THE REFUSAL: an unresolved state is not evidence of a credential, and the
+      # advice "fix the READ, not the credential" is exactly wrong on the arm where the credential is the cause.
+      ''|none|ambient-missing)
+        printf '[land-backlog] NOTE %s: EXEMPTION-UNREADABLE — the %s labels/title read FAILED, and this lane'"'"'s gh credential could NOT be resolved either (state=%s) — so the CAUSE MAY BE THE CREDENTIAL (check `gh auth status` under the lane'"'"'s HOME / the [gh-auth] line). A P0/base-red exemption cannot be proven, so the ratio decides below, and OVER the ceiling that means HELD.\n' \
+          "$label" "${TAG:-issue}" "${st:-unresolved}"
+        ;;
+      *)
+        printf '[land-backlog] NOTE %s: EXEMPTION-UNREADABLE — the %s labels/title read FAILED even though the lane'"'"'s gh IS credentialed (state=%s); fix the READ (issue/permalink, permissions, network), not the credential. A P0/base-red exemption cannot be proven, so the ratio decides below, and OVER the ceiling that means HELD.\n' \
+          "$label" "${TAG:-issue}" "$st"
+        ;;
+    esac
   fi
 }
 
@@ -1337,8 +1347,19 @@ land_backlog_refuse() { # <label> <verdict-line> <exempt-why>
         printf ' ⛔ THIS IS NOT THE LANDING RATIO: %s. Remedy: give the lane'"'"'s gh a credential — export GH_CONFIG_DIR=<the directory holding hosts.yml> or GH_TOKEN — then re-dispatch. Landing is unaffected and no open PR was judged by this line; a re-dispatch to a box whose dispatch environment is the same refuses identically (every cell redirects HOME the same way), so fix the cause rather than re-dispatching.' "$cause"
       else
         r="$(gh_auth_resolve "${HOME:-}" 2>/dev/null)"; st="${r%%|*}"; d="${r#*|}"
-        printf ' Remedy: land/fix the open PRs (this is the drain), or dispatch a P0/base-red item — those are exempt by evidence. The lane'"'"'s gh IS credentialed (state=%s%s), so this read failed for another reason: check the gh/network chain. The issue returns to the pool and is re-dispatched when the next read succeeds.' \
-          "${st:-unknown}" "${d:+ at $d}"
+        case "$st" in
+          # ⛔ AN EMPTY RESOLUTION IS NOT EVIDENCE OF A CREDENTIAL (fresh-eyes pass on this diff): with the module
+          # absent (or silent) `gh_auth_cause` cannot speak, so claiming "the lane's gh IS credentialed" would be a
+          # confident false statement about the exact thing this change exists to measure. Say what was NOT measured.
+          ''|none|ambient-missing)
+            printf ' Remedy: land/fix the open PRs (this is the drain), or dispatch a P0/base-red item — those are exempt by evidence. ⛔ BUT FIRST: this lane'"'"'s gh credential could NOT be resolved either (state=%s), so the read may be a CREDENTIAL fault — check `gh auth status` under the lane'"'"'s HOME before acting on the ratio. The issue returns to the pool and is re-dispatched when the next read succeeds.\n' \
+              "${st:-unresolved}"
+            ;;
+          *)
+            printf ' Remedy: land/fix the open PRs (this is the drain), or dispatch a P0/base-red item — those are exempt by evidence. The lane'"'"'s gh IS credentialed (state=%s%s), so this read failed for another reason: check the gh/network chain. The issue returns to the pool and is re-dispatched when the next read succeeds.\n' \
+              "$st" "${d:+ at $d}"
+            ;;
+        esac
       fi
       ;;
     *)

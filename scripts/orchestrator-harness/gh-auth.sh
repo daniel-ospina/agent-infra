@@ -188,22 +188,6 @@ gh_auth_ensure() {
   printf '%s\n' "$r"
 }
 
-# gh_auth_where — a short human description of the resolution, for a log line.
-gh_auth_where() { # <lane-home> [env-file] [account-home]
-  local r; r="$(gh_auth_resolve "$@")"
-  case "${r%%|*}" in
-    token)           printf 'a token NAME holds a value (GH_TOKEN/GITHUB_TOKEN)' ;;
-    ambient)         printf 'GH_CONFIG_DIR=%s' "${r#*|}" ;;
-    ambient-missing) printf 'GH_CONFIG_DIR=%s (which holds NO hosts.yml)' "${r#*|}" ;;
-    xdg)             printf '$XDG_CONFIG_HOME/gh (%s)' "${r#*|}" ;;
-    keys)            printf 'GH_CONFIG_DIR=%s, read from %s' "${r#*|}" "${2:-${ENV_FILE:-${1:-$HOME}/keys.env}}" ;;
-    keys-xdg)        printf 'XDG_CONFIG_HOME read from %s (gh dir %s)' "${2:-${ENV_FILE:-${1:-$HOME}/keys.env}}" "${r#*|}" ;;
-    home)            printf '$HOME/.config/gh (%s)' "${r#*|}" ;;
-    account)         printf "the ACCOUNT home's %s" "${r#*|}" ;;
-    *)               printf 'NOWHERE the lane can see' ;;
-  esac
-}
-
 # gh_auth_log <lane-home> [env-file] [account-home] — resolve, export when needed, and print ONE line
 # for the lane log (`[gh-auth] state=… dir=… lane_home=… — …`). The caller appends it to its log.
 # ⛔ EVERY LANE GETS THIS LINE, healthy or not: "which store did the gate read, and did the lane get the
