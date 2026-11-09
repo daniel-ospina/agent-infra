@@ -696,6 +696,15 @@ fi
 mk_case idle-reap 1000
 mk_gh "$D" "$(rows 2)"
 mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+# ⛔ AND ONE ARM THIS FIXTURE WAS NOT MODELING: a box whose `tmux` cannot answer (#1984). The
+# checked half then REFUSES by design (`[reap] SKIPPED (checked: the live-session list could not be
+# read)` — `lane` is a keep fact and an unreadable session list is not "no lanes"), and the suites
+# runner has no tmux, so it emits that line on EVERY idle pass. Without the stub the two
+# "checked-half" rows below could only be green for the absence of ANY such line — measured on the
+# runner, where a bare `(checked:` glob reddened the row over the tmux probe rather than over
+# `.pr_brs`. The stub fails like a missing/broken tmux, so this box now sees the same log a CI pass
+# does and the rows grade what they name.
+printf '#!/bin/bash\nexit 1\n' > "$D/bin/tmux"; chmod +x "$D/bin/tmux"
 rf "$D" refresh
 idle_pulls="$(grep -cE '^repos/[^ ]*/pulls\?' "$D/bin/gh.argv" 2>/dev/null | tr -d ' ')"
 idle_open="$(grep -E '^repos/[^ ]*/issues\?' "$D/bin/gh.argv" 2>/dev/null | grep -vc 'labels=')"
@@ -741,8 +750,12 @@ esac
 # above GREEN (its glob requires the colon right after `SKIPPED`) while the pass prints `[reap]
 # SKIPPED (checked: .pr_brs unreadable)` over a window it never asked for — the same log-lie, one arm
 # over. So the claim that the pair is dead weight is falsifiable, and this is what falsifies it.
+# ⛔ NARROWED TO THE `.pr_brs` SHAPE, DELIBERATELY (#1984). Other arms print their own
+# `[reap] SKIPPED (checked: …)` refusals and those are CORRECT on this pass — a box without tmux
+# cannot read the `lane` keep fact and must refuse (measured on the bash-suites runner, where that
+# line is present on every idle pass). A bare `(checked:` glob would grade the tmux probe, not this.
 case "$OUT" in
-  *"[reap] SKIPPED (checked:"*) bad "idle-reap: a window this pass never ASKED for was reported as an UNREADABLE .pr_brs to the checked half — 'we did not ask' must not read as a broken reader" ;;
+  *"[reap] SKIPPED (checked: .pr_brs"*) bad "idle-reap: a window this pass never ASKED for was reported as an UNREADABLE .pr_brs to the checked half — 'we did not ask' must not read as a broken reader" ;;
   *) ok "idle-reap: the checked half is not refused as unreadable over a window that was never requested" ;;
 esac
 # Non-vacuity: the SAME fixture with one row then asks for both windows, so the zero above is the
