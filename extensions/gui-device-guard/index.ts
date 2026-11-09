@@ -269,6 +269,10 @@ const TIMEOUT_DURATION = /^\d+(\.\d+)?[smhd]?$/;
  * getopt CLUSTER (`-aSafari` vs `-na`). `-a`, `-b`, `-s`, `-u`, `-t` take values;
  * the rest are switches. Used only by `clusterShortArg`.
  */
+/**
+ * The letters `open` accepts as options. Kept for documentation of the option
+ * contract the `-a`/`-b` predicates assume; the parsing itself is pure getopt.
+ */
 const OPEN_FLAG_LETTERS = "abefghjnstuwREFW";
 
 /**
@@ -441,13 +445,26 @@ const defaultWarn: Warn = (m) => console.warn(`[gui-device-guard] ${m}`);
 const SEPARATORS = new Set([";", "&", "|", "\n", "\r"]);
 
 /** Split a command line on UNQUOTED separators. A quote-aware mention stays inside. */
+/**
+ * Is this `&` part of a REDIRECTION rather than a command separator?
+ *
+ * ⛔ `2>&1` AND `&>file` ARE NOT `&` SEPARATORS (round-12 review, HIGH). Splitting on
+ * every unquoted `&` cut `2>&1 electron .` into `2>` and `1 electron .`, so the launch
+ * was never the command word (`[]` — no block, no ledger row) even after the redirect
+ * tokens themselves were dropped.
+ */
+function isRedirectionAmp(command: string, i: number): boolean {
+  if (command[i] !== "&") return false;
+  return command[i - 1] === ">" || command[i + 1] === ">";
+}
+
 export function splitSegments(command: string): string[] {
   const mask = unquotedMask(command);
   const out: string[] = [];
   let cur = "";
   for (let i = 0; i < command.length; i++) {
     const ch = command[i];
-    if (mask[i] && SEPARATORS.has(ch)) {
+    if (mask[i] && SEPARATORS.has(ch) && !isRedirectionAmp(command, i)) {
       out.push(cur);
       cur = "";
       continue;
@@ -1362,10 +1379,49 @@ function attachedShortArg(tok: string, letter: string): string | null {
  * bare flag), and the LAST of `letters` present in the cluster wins — so `-bna`
  * is `-b -n -a` and its argument is the next word, matching `-na`.
  */
+/**
+ * Remove REDIRECTIONS from the word list, the way bash does before running a
+ * command.
+ *
+ * ⛔ A REDIRECTION IS NOT A WORD (round-12 review, HIGH). `commandWordIndex`
+ * returned the first non-prefix token, and a leading redirection is such a token —
+ * so `2>/dev/null electron .` resolved the command word to `null` (from the redirect
+ * TARGET) and `>/tmp/o.log /Applications/DMeer.app/Contents/MacOS/DMeer` to `o.log`:
+ * both `[]`, losing the refusal AND the ledger row, while the runner spelling of the
+ * same line (`2>/dev/null npm exec electron .`) fired because the nested-payload scan
+ * starts at index 1. A redirect GLUED to the end of a word hid the exact-token flags
+ * in the other direction: `npx playwright test --headed>/tmp/pw.log` was `[]` and
+ * `electron . <both fake switches>/tmp/log` was REFUSED although both switches were
+ * in argv. Bash deletes redirections from the word list and ends a word at the
+ * operator; so does this. (Quotes are already removed by `tokenize`, so a QUOTED
+ * `>` is treated as an operator here — the same accepted trade `stripTrailingMetachars`
+ * makes.)
+ */
+function stripRedirections(toks: string[]): string[] {
+  const out: string[] = [];
+  for (let i = 0; i < toks.length; i++) {
+    const tok = toks[i];
+    // A token that IS a redirection (`>`, `2>`, `>>f`, `2>&1`, `&>f`, `<<EOF`): bash
+    // never passes it as a word. With no target attached, the target is the NEXT word.
+    const lead = /^(?:\d{1,2})?(?:&>>|&>|>{1,3}|<{1,3}|>\||&)(.*)$/.exec(tok);
+    if (lead) {
+      if (lead[1] === "") i++;
+      continue;
+    }
+    // A redirect glued to the END of an ordinary word ends the word at the operator.
+    const at = tok.search(/[<>]/);
+    if (at > 0) {
+      out.push(tok.slice(0, at));
+      continue;
+    }
+    out.push(tok);
+  }
+  return out;
+}
+
 function clusterShortArg(
   tok: string,
   letters: readonly string[],
-  hasNext: boolean,
 ): { letter: string; arg: string } | null {
   if (!tok.startsWith("-") || tok.startsWith("--")) return null;
   const body = tok.slice(1);
@@ -1377,29 +1433,21 @@ function clusterShortArg(
   // produced NO finding at all — losing the ledger row for the whole attached
   // spelling family, while `-aDMeer` (the pinned row) happened to survive. getopt
   // stops at the first VALUE-taking letter: `-aSafari` is `-a Safari`.
+  //
+  // ⛔ PURE GETOPT, NO HEURISTIC (round-12 review, eighth pass): the remainder after
+  // the first value letter IS the argument — full stop. A "could be more flags"
+  // reading of `-anews`/`-aweb` made `open -anews notes.txt` record NOTHING and
+  // `open -aweb index.html` record `app: "index.html"` (the launched app is `web`).
+  // bash's own `getopts` settles it: `set -- -bna com.x` → `opt=b arg=na`, so the
+  // P2-4 row that pinned `-bna com.x` → `com.x` was WRONG about getopt and has been
+  // corrected to `na` (the README's own sentence — "getopt stops at the first
+  // VALUE-taking letter" — already said so).
   let run = 0;
   while (run < body.length && /[A-Za-z]/.test(body[run])) run++;
   for (let i = 0; i < run; i++) {
     const ch = body[i];
     if (!letters.includes(ch)) continue;
-    const rest = body.slice(i + 1);
-    // A rest that `open` itself could accept as FLAGS (`-na`, `-bna`) is a getopt
-    // CLUSTER, and its value is the NEXT word — the reading the P2-4 rows pin. A
-    // rest with a letter `open` has no flag for (`-aSafari`) is the argument.
-    // ⛔ A CLUSTER NEEDS A NEXT WORD TO TAKE ITS VALUE FROM (round-12 review, LOW):
-    // `open -anews` (Apple's News app) was read as the cluster `-a -n -e -w -s` with
-    // no value left, and recorded NOTHING — the same word list makes `-a news` work
-    // and `-anews` vanish. With nothing following, the attached reading is the only
-    // one that can be right.
-    if (
-      hasNext &&
-      rest !== "" &&
-      /^[A-Za-z]+$/.test(rest) &&
-      [...rest].every((c) => OPEN_FLAG_LETTERS.includes(c))
-    ) {
-      continue;
-    }
-    return { letter: ch, arg: rest };
+    return { letter: ch, arg: body.slice(i + 1) };
   }
   return null;
 }
@@ -1519,7 +1567,7 @@ function classifySegment(
       // P2-4): `-a<app>` / `-b<id>` / `-na <name>` / `-bna <id>` hand their ARGUMENT
       // to the option letter, and a plain word never does. The letter comes from
       // the caller's own list, exactly like `attachedShortArg`.
-      const flagArg = clusterShortArg(tok, ["a", "b"], i + 1 < rest.length);
+      const flagArg = clusterShortArg(tok, ["a", "b"]);
       if (flagArg !== null) {
         // An empty remainder means the argument is the NEXT token (`-a <app>`,
         // `-na <name>`); a non-empty one is the ATTACHED spelling (`-aDMeer`).
@@ -1707,7 +1755,12 @@ export function classifyLaunchCommand(command: string, depth = 0): LaunchFinding
     // review, P1): `(open X.app)` must segment exactly like `open X.app`. Leading
     // metachars are stripped by `commandWordIndex`; trailing ones are stripped
     // here, ONCE, so every predicate sees the word bash sees.
-    const toks = tokenize(segment).map(stripTrailingMetachars).map((t) => t.replace(/^[({]+/, ""));
+    // Order matters: redirections are removed from the RAW tokens (a bare `>` must
+    // not be emptied first), then a trailing metacharacter is stripped, so
+    // `(open X.app)` and `--headed>log` are both reduced to the word bash runs.
+    const toks = stripRedirections(
+      tokenize(segment).map((t) => t.replace(/^[({]+/, "")),
+    ).map(stripTrailingMetachars);
     if (toks.length === 0) continue;
     const flags: { sawFlag?: boolean; payloadStart?: number } = {};
     const cwi = commandWordIndex(toks, flags);

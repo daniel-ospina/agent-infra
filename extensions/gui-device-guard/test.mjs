@@ -624,6 +624,27 @@ const ROWS = [
   //        attached reading is the only one that can be right (`open -anews`).
   ["L49a `open -anews` records the app `news` (was [])",
     "open -anews", 1, "open", false],
+  ["L49b …and with a FILE argument after it (was []; the identity was the file)",
+    "open -anews notes.txt", 1, "open", false],
+  ["L49c …and `-aweb index.html` names `web`, not the file (was app 'index.html')",
+    "open -aweb index.html", 1, "open", false],
+  // ── L50–L51 (round-12 review, eighth pass) — a REDIRECTION is not a word, and it
+  //     can be glued to the flag that decides the answer.
+  //   L50: a leading redirection became the command word, so a BARE launch word was
+  //        `[]` — no block, no row — while the runner spelling of the same line fired
+  //        (the nested-payload scan starts at index 1).
+  ["L50a a leading redirect does not become the command word (was [])",
+    "2>/dev/null electron .", 1, "electron", true],
+  ["L50b …including a bare `>` + target before the command (was [])",
+    "> /tmp/o.log open ./Build/DMeer.app", 1, "open", true],
+  ["L50c …and an fd duplicate (`2>&1`) is not an `&` separator (was [])",
+    "2>&1 electron .", 1, "electron", true],
+  ["A73 the ALLOW twins: redirects around a benign command stay clean",
+    "2>/dev/null ls > /tmp/x", 0, null, false],
+  //   L51: a redirect glued to the flag ends the WORD at the operator, so an exact-token
+  //        predicate saw `--headed>/tmp/pw.log` and lost the headed run.
+  ["L51a a redirect glued to `--headed` does not hide the headed run (was [])",
+    "npx playwright test --headed>/tmp/pw.log", 1, "playwright", true],
   //   L30c: tab completion appends a slash to directories, and `open
   //         ./Build/DMeer.app/` — the incident's own app — matched none of the three
   //         bundle tests while the `-a` spelling of the SAME token was refused.
@@ -668,7 +689,14 @@ for (const [name, cmd, count, rule, media] of ROWS) {
 const APP_ROWS = [
   ["P1-1 an app name whose 2nd letter is `a` keeps its FULL identity", "open Banjo.app", "Banjo.app"],
   ["P1-1 …and a `Safari.app` bundle is not truncated to `fari.app`", "open Safari.app", "Safari.app"],
-  ["P2-4 `open -bna com.x` hands the NEXT word to `-a` (was `na`)", "open -bna com.x", "com.x"],
+  // ⛔ CORRECTED IN ROUND 12, EIGHTH PASS — this row used to expect "com.x" on the
+  // theory that `-bna` is the cluster `-b -n -a`. That is not getopt: `-b` TAKES A
+  // VALUE, so it consumes the rest of the token. bash's own `getopts` settles it —
+  // `set -- -bna com.x; getopts "a:b:"` gives `opt=b arg=na` — and the README's own
+  // sentence ("getopt stops at the first VALUE-taking letter") already said so. The
+  // identity is `na`; `com.x` is the FILE argument. Not a security change: both
+  // readings record the launch with `media: false`.
+  ["P2-4 (corrected) `open -bna com.x` is `-b na`, not a cluster", "open -bna com.x", "na"],
   ["P2-4 `open -na <name>` (was `[]`, so nothing was recorded)", 'open -na "Google Chrome"', "Google Chrome"],
   ["L21h twin: an ATTACHED `-a<app>`", "open -aDMeer", "DMeer"],
   // ⛔ THE `open <bundle>/Contents/MacOS/<bin>` SPELLING NAMES THE BUNDLE, not the inner
@@ -689,6 +717,10 @@ const APP_ROWS = [
     "open -bcom.apple.Safari", "com.apple.Safari"],
   ["L49a twin: a flag-only-letters app name is still the ATTACHED argument",
     "open -anews", "news"],
+  ["L49b twin: a FILE argument is not the app identity",
+    "open -anews notes.txt", "news"],
+  ["L49c twin: `-aweb` names web",
+    "open -aweb index.html", "web"],
 ];
 for (const [name, cmd, expected] of APP_ROWS) {
   const found = classify(cmd);
@@ -723,6 +755,12 @@ check(
 check(
   "L48a1 both fake switches are recognised across a line continuation",
   (() => { const f = classify(`electron . \\\n  ${FAKE}`); return f.length === 1 && f[0].faked === true; })(),
+);
+// ⛔ A REDIRECT GLUED TO THE LAST SWITCH IS NOT PART OF THE SWITCH (round-12 review,
+// eighth pass): the mitigated launch was refused with its own two flags in argv.
+check(
+  "L51b1 both fake switches are recognised when a redirect is glued to the last one",
+  (() => { const f = classify(`electron . ${FAKE}>/tmp/log`); return f.length === 1 && f[0].faked === true; })(),
 );
 // L11d — the mitigation must be ARGV, not COMMENT text (review cycle 2, F2).
 check(

@@ -174,9 +174,14 @@ finding at all — so the whole attached spelling family could lose BOTH halves 
 #2249, and one letter of an app's name changed the answer (`round 12`, rows
 L44a–L44c and their identity twins). A rest that could itself be `open` flags
 (`-na`, `-bna`) still reads as a getopt CLUSTER whose value is the next word, which
-is what the P2-4 rows pin — but only when a NEXT WORD exists to take the value from:
-`open -anews` (Apple's News app) has no following word, so the attached reading is the
-only one that can be right, and it records `app: "news"` (L49a and its identity twin).
+is what the P2-4 rows pin. There is no "could be more flags" heuristic on top of that:
+the remainder after the first value letter IS the argument, whatever follows it.
+`open -anews notes.txt` records `news` and `open -aweb index.html` records `web` —
+without that clause the first recorded NOTHING and the second recorded the FILE as the
+app (`round 12`, rows L49a–L49c and their identity twins). bash's own `getopts`
+settles the remaining case: `set -- -bna com.x` gives `opt=b arg=na`, so the row that
+used to pin `-bna com.x` → `com.x` was wrong about getopt and now expects `na` (both
+readings record the launch, so nothing is loosened).
 
 **`open`'s argument goes to an OPTION LETTER, and a plain word is never a flag.**
 `-a<app>`, `-na <name>`, `-bna <id>` are spellings of the same option: a cluster
@@ -307,6 +312,16 @@ This is a residual list, not a completeness claim:
   bodies arrive in the order the operators appear: `bash <<A; cat <<B` feeds A's
   body to `bash`, so locating only the last `<<` on the line turned the body the
   shell actually executes into data (L42a, A66).
+- A REDIRECTION IS NOT A WORD: bash deletes it from the word list, so a leading
+  `2>/dev/null` can never be the command word — but it was, and
+  `2>/dev/null electron .` / `>/tmp/o.log <bundle>/Contents/MacOS/<bin>` were `[]`
+  (no block, NO row) while the runner spelling of the same line fired. A redirect
+  GLUED to a flag ends the WORD at the operator, so
+  `npx playwright test --headed>/tmp/pw.log` lost the headed run and
+  `electron . <both fake switches>/tmp/log` was refused with its own mitigation in
+  argv. And the `&` of `2>&1` is not a command separator — splitting there cut the
+  launch out of its own segment (`round 12`, rows L50a–L50c, L51a/L51b1, allow twin
+  A73).
 - A LINE CONTINUATION (`\` + newline) is NOT a command separator: bash deletes it
   before word splitting, so
   `npm exec electron . \` + `--use-fake-device-for-media-stream --use-fake-ui-for-media-stream`
@@ -388,7 +403,7 @@ This is a residual list, not a completeness claim:
 ## Tests
 
 ```bash
-node extensions/gui-device-guard/test.mjs                    # 290 assertions, threat table L1–L49 + handler H1–H15
+node extensions/gui-device-guard/test.mjs                    # 300 assertions, threat table L1–L51 + handler H1–H15
 node extensions/gui-device-guard/test.mjs --classify 'npm exec electron .'
 ```
 
@@ -399,8 +414,8 @@ stays green while `index.ts` is broken and the guard is inert in every session.
 Mutations are pinned, each attributable to the row it is about, all measured at
 ONE head (**this** head — re-measured, not carried over: the counts are the output
 of running the mutant against `test.mjs`, and the assertion total is
-`290 = 223 ROWS + 12 APP_ROWS + 55 explicit \`check()\` calls`): the Electron
-rule's `media` → `false` reds **123**; the wrapper recursion
+`300 = 230 ROWS + 14 APP_ROWS + 56 explicit \`check()\` calls`): the Electron
+rule's `media` → `false` reds **125**; the wrapper recursion
 removed reds **8**; the wrapper WORDS removed reds **2**; the structural rule that
 reads a package-runner anywhere in the segment removed reds **2** (L19h/L19i); the
 comment stripper removed reds **2** (L11d and L11f — re-measured at this head; the
@@ -466,9 +481,11 @@ dropping `until`/`select` from the control-flow words reds **1** (L46c); droppin
 leading `(`/`{` normalisation reds **1** (L46b); and dropping the substitution unwrap
 in `shellExecutesStdin` reds **1** (L47a); not joining LINE CONTINUATIONS reds **3**
 (L48b, L48c, L48a1 — the mitigated launch was refused with its own remedy already
-written, and the continued headed run lost block AND row); and treating an attached
-`-a<name>` as a cluster when nothing follows it reds **2** (L49a and its identity
-twin — `open -anews` recorded nothing); dropping `electron-forge` from the electron head test reds **5**
+written, and the continued headed run lost block AND row); treating an attached `-a<name>` as a
+cluster reds **7** (L44b, L44c, the corrected P2-4 identity and four identity twins);
+NOT removing redirects from the word list reds **5** (L50a, L50b, L51a, L51b1 — a
+leading redirect became the command word, and a redirect glued to `--headed` or to the
+fake switches hid them); and splitting on the `&` of `2>&1` reds **1** (L50c); dropping `electron-forge` from the electron head test reds **5**
 (L31a–L31e); removing the PROCESS-substitution arm (`<( … )` / `>( … )`, the
 round-12 review's second P2) reds **3** (L32a–L32c, and A55 stays green because the
 double-quoted spelling never was a substitution); dropping the inner-binary term from
