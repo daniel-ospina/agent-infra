@@ -570,10 +570,21 @@ fi
 # an executable path. Pinned so the ground cannot silently become false again — if this template ever
 # grows a `{{HOME}}`-built program path, the arm reds and the render's contract has to be re-argued.
 PLIST="$REPO_ROOT/templates/launchd/harness-apply/com.eldato.harness-apply.plist"
+# ⛔ NO PIPE INTO A QUIET GREP (the `sigpipe-grep` idiom ban, #841/#864): a non-quiet `grep -A1` piped
+# into `grep -qF` takes SIGPIPE once the consumer exits on its first match, so under `pipefail` the
+# answer can be "not found" for a line that IS there — the false PASS this suite exists to prevent,
+# inside the suite itself. Capture the producer and test the captured text in the shell instead.
+_plist_home=""
+[ -f "$PLIST" ] && _plist_home="$(grep -A1 -F '<key>HOME</key>' "$PLIST" 2>/dev/null || true)"
 if [ ! -f "$PLIST" ]; then
   bad "d3: the launchd template is missing from the tree, so the render contract above is unpinned"
-elif [ "$(grep -cF '{{HOME}}' "$PLIST")" = "1" ] && grep -A1 -F '<key>HOME</key>' "$PLIST" | grep -qF '<string>{{HOME}}</string>'; then
-  ok "d3 the plist's only {{HOME}} is EnvironmentVariables→HOME (so deriving it moves the job's home, not its program)"
+elif [ "$(grep -cF '{{HOME}}' "$PLIST")" = "1" ]; then
+  case "$_plist_home" in
+    *'<string>{{HOME}}</string>'*)
+      ok "d3 the plist's only {{HOME}} is EnvironmentVariables→HOME (so deriving it moves the job's home, not its program)" ;;
+    *)
+      bad "d3 the plist carries {{HOME}} somewhere other than EnvironmentVariables→HOME — the launchd render's ground must be re-checked before it is described" ;;
+  esac
 else
   bad "d3 the plist carries {{HOME}} somewhere other than EnvironmentVariables→HOME — the launchd render's ground must be re-checked before it is described"
 fi
