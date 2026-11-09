@@ -1038,11 +1038,16 @@ def _strip_comment(line):
         declares (the `head` anchor, declared separately below, is larger at 66 files and 133 names) — and
         it was undeclared until this note.
       * `_openers`' IN-QUOTE escape (`if c == '\\': i += 2` inside that state) — a separate condition from
-        the outside-quote escape below; `echo "a \\" # b" ; cat <<EOF` + a body invents the body line, and
+        the outside-quote escape below; `echo "a \" # b" ; cat <<EOF` + a body invents the body line, and
         it moves 1 file (`rank-queue.test.sh`, losing 15 names).
       * AND THREE MORE OF THE SAME CLASS, named so this list is not read as exhaustive: `_openers`'
         single-quote CLOSE, and `_strip_comment`'s single-quote close and its in-quote escape. Each
         separates on a valid-bash input and each moves 0 of the 438 files.
+      * the head-branch KEYWORD exclusion (`if not m or m.group(1) in KEYWORDS` on the NEXT-LINE path) —
+        delete it and a valid-bash input `local ()` + `{ :; }` is FOUND instead of missed, so the mutant is
+        the faithful one: this guard's failure direction is a FALSE PASS on a definition bash really makes.
+        It moves 0 of the 438 files and the KEYWORDS set is pinned in aggregate (emptying the set reds the
+        suite), but the exclusion itself is unpinned, so it is declared here too.
       * the trailing flush (`if _buf is not None`) — a file ENDING mid-continuation (`last_def() { :; }`
         followed by a single backslash AND a newline) drops the last definition, a FALSE PASS; the shape is
         valid bash. Moves 0. The same bytes WITHOUT the trailing newline are not a fixture: `bash -n`
@@ -1050,7 +1055,7 @@ def _strip_comment(line):
         the dangling backslash — so ground truth (nothing defined) and the baseline (it prints the name)
         disagree there. ⛔ "EXECUTING errors" was wrong here until it was measured: only `source` does.
 
-    PINNED, and the one case worth naming because it looks like the five above: the delimiter charset
+    PINNED, and the one case worth naming because it looks like the ones above: the delimiter charset
     `_.-` on the PLAIN path moves 3 files but also truncates the three `EOF_*` delimiters in `repo-set.sh`
     (`EOF_NORM`, `EOF_STATE_KEY`, `EOF_GOT`; the bare `EOF` carries no charset character and is never
     affected), losing 14 of its 26 definitions — so `_reader_defs_n` drops below the floor and `f11f`
@@ -1065,7 +1070,7 @@ def _strip_comment(line):
     proof that the guard is load-bearing.
 
     ⛔ SO THIS IS A DECLARATION, NOT A PIN, and it says so: writing the shapes above into `FIXTURE` is the
-    work that turns them into pins — one shape per guard named below, because one single-quoted spelling
+    work that turns them into pins — one shape per guard named above, because one single-quoted spelling
     separates the setter, the single-quote BRANCH and (in the same statement) the setter's own quote tuple,
     while the blanket double-quote branch needs the OTHER quote character. Until then a lane that
     "simplifies" one of those guards is removing bash-faithfulness that only the fixture would catch. Each
