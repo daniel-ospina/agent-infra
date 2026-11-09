@@ -865,6 +865,16 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     note: "worker-log freshness bound — an AGED, not family-named, bound",
   },
   {
+    name: "HEARTBEAT_CHECK_MAX_AGE",
+    owners: ["scripts/heartbeat-launch.sh"],
+    value: '"${HEARTBEAT_CHECK_MAX_AGE:-900}"',
+    axis: "gate",
+    guardedBy:
+      "scripts/heartbeat-launch.test.sh §12 and §13c — §12 ages the fleet snapshot 40 min and requires the 900 s default to answer STALE (a bound past ~40 min would read the same file as fresh and go green), and §13c drives the validator: `15m`, `-1`, `0` and a 13-digit number are all UNKNOWN (rc 2) that NAMES the variable, never a DRIFT verdict, with a positive control on the same state so the validator did not turn the verb into a refusal. The VALUE is pinned by the forward check; the suite sets its own bound in the environment it drives.",
+    overrides: [],
+    note: "#1867 — how old `state/lane-status.last.json` may be and still count as a FRESH fleet read (900 s) before `scripts/heartbeat-launch.sh check` answers STALE/DRIFT instead of reporting the old rows as current. On the GATE axis for the same reason CIQ_STALE_MAX is: it is an EVIDENCE AGE that decides whether a verdict may be given at all, not a kill or reclaim floor — a bound that only the launcher knew would let a dead publisher read as a live fleet. ⛔ Rewritten from the shell name `MAX_AGE`, which is a DIFFERENT registered term (monitor-worker.sh, 60 s, worker-log freshness): two unrelated numbers under one symbol is the divergence this registry exists to surface, and the LANE_IDLE_MIN note above records the identical collision. The shell variable now carries the env seam's own name, so there is no translation layer to shadow.",
+  },
+  {
     name: "SWEEP_MAX_AGE",
     owners: ["scripts/orchestrator-harness/orch-loop.sh"],
     value: '"${SWEEP_MAX_AGE:-600}"',

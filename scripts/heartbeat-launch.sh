@@ -65,19 +65,25 @@ PIDFILE="$STATE/heartbeat-loop.pid"
 KILLFILE="$STATE/HEARTBEAT-OFF"
 LOG="$STATE/orchestrator-heartbeat.log"
 SNAP="$STATE/lane-status.last.json"
-MAX_AGE="${HEARTBEAT_CHECK_MAX_AGE:-900}"
+# ⛔ ONE NAME, ONE AUTHORITY (#1867 review). This bound is the SHELL variable `HEARTBEAT_CHECK_MAX_AGE`,
+# not `MAX_AGE`: `MAX_AGE` is a REGISTERED term owned by `scripts/monitor-worker.sh` (a 60 s worker-log
+# freshness bound), and naming an unrelated 900 s snapshot bound the same thing is the divergence the
+# declared-surface registry exists to surface — its own LANE_IDLE_MIN note records the identical
+# collision. The env seam and the shell variable now carry the SAME name, so there is nothing to
+# translate and nothing to shadow.
+HEARTBEAT_CHECK_MAX_AGE="${HEARTBEAT_CHECK_MAX_AGE:-900}"
 
-# ⛔ VALIDATED, NOT TRUSTED (#1867 review P3). `MAX_AGE` is operator input that ends up in
+# ⛔ VALIDATED, NOT TRUSTED (#1867 review P3). The bound is operator input that ends up in
 # `int(sys.argv[2])` inside the snapshot reader, where anything non-numeric raises — and a raise was
 # reported as DRIFT because the traceback arrived on the same stream as the verdict. A bound is
 # valid when it is digits only, non-zero, and short enough that bash's own arithmetic cannot overflow
 # it (a 20-digit "number" is not a freshness bound on any machine). Leading zeros are fine.
 _valid_max_age() {
-    case "${MAX_AGE:-}" in
+    case "${HEARTBEAT_CHECK_MAX_AGE:-}" in
         ''|*[!0-9]*) return 1 ;;
     esac
-    [ "${#MAX_AGE}" -le 9 ] || return 1
-    [ "$MAX_AGE" -gt 0 ]
+    [ "${#HEARTBEAT_CHECK_MAX_AGE}" -le 9 ] || return 1
+    [ "$HEARTBEAT_CHECK_MAX_AGE" -gt 0 ]
 }
 
 # Prefer the FARMED copy: that is what a launched loop must run in production (the farm is the
@@ -543,13 +549,13 @@ cmd_check() {
         return 2
     fi
     # ⛔ A MALFORMED BOUND IS A CONFIGURATION ANSWER, NOT A DRIFT VERDICT (#1867 review P3).
-    # `MAX_AGE` went straight into `int(sys.argv[2])`, so `HEARTBEAT_CHECK_MAX_AGE=15m` raised inside
+    # the bound went straight into `int(sys.argv[2])`, so `HEARTBEAT_CHECK_MAX_AGE=15m` raised inside
     # the reader — the traceback was captured by `2>&1`, printed as the VERDICT LINE, and rc=1 was then
     # accepted by `case "$prc" in 0|1|2)` as a genuine DRIFT. It fails closed either way, but it
     # MISATTRIBUTES: an operator who typed the variable wrong was told the fleet read was stale. The
     # bound is validated here, once, and answers 2 UNKNOWN by name.
     if ! _valid_max_age; then
-        note "UNKNOWN: HEARTBEAT_CHECK_MAX_AGE='${MAX_AGE:-}' is not a positive whole number of seconds (e.g. 900) — fix the VARIABLE; this is a configuration answer, never a DRIFT verdict"
+        note "UNKNOWN: HEARTBEAT_CHECK_MAX_AGE='${HEARTBEAT_CHECK_MAX_AGE:-}' is not a positive whole number of seconds (e.g. 900) — fix the VARIABLE; this is a configuration answer, never a DRIFT verdict"
         return 2
     fi
     if [ ! -d "$STATE" ]; then
@@ -585,7 +591,7 @@ cmd_check() {
 
     # ONE reader, and it FAILS CLOSED: an unparseable snapshot is UNKNOWN, never "no degraded rows".
     local report
-    report="$(_check_reader "$SNAP" "$MAX_AGE" 2>&1)"
+    report="$(_check_reader "$SNAP" "$HEARTBEAT_CHECK_MAX_AGE" 2>&1)"
     local prc=$?
     # `prc` is the python verdict; a heredoc that failed to run at all (127/126) is UNKNOWN.
     case "$prc" in
