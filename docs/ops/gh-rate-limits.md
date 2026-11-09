@@ -136,8 +136,9 @@ What the controller now does (`orch-loop.sh`, the `# BEGIN gh-bound` block):
   deferral is that response's `x-ratelimit-reset` / `retry-after`, floored at the sweep's OWN 60 s
   (`orch-loop.sh:4802-4814` — both bounds are literals in `sweep_defer_until`, NOT the layer's
   operator-configurable `GH_LIMIT_BASE_WAIT` at `gh-limit.py:216`, so raising that knob does not
-  move this floor) and held to the sweep's own 1 h ceiling — **not** a once-a-minute retry. **The record branch is narrower than it looks, and its own reachability is part of the
-  claim:** the call site defers ONLY on a failure `sweep_fail_kind` classifies `rate-limit`
+  move this floor) and held to the sweep's own 1 h ceiling — **not** a once-a-minute retry.
+  **The record branch is narrower than it looks, and its own reachability is part of the claim:**
+  the call site defers ONLY on a failure `sweep_fail_kind` classifies `rate-limit`
   (`orch-loop.sh:5893`, `:4778-4796`), so the shape that can reach it is a `rate-limit` refusal
   whose response carried no reset — `x-ratelimit-remaining: 0` with no `x-ratelimit-reset`, or a
   stderr-phrase-only refusal with an empty `raw`. A timeout or a no-response failure is classified
