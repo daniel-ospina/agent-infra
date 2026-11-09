@@ -915,7 +915,16 @@ function joinContinuedLine(line: string, next: string): string | null {
       dq = !dq;
       continue;
     }
-    if (!sq && ch === "\\" && i === line.length - 1) contAt = i;
+    if (!sq && ch === "\\") {
+      // ⛔ A BACKSLASH ESCAPES THE NEXT CHARACTER, so the PAIR is consumed and only an
+      // ODD trailing run continues the line. `echo hi \\` is a LITERAL backslash and
+      // the line ENDS there — bash runs the next line as its own command — but taking
+      // the last `\` at face value joined that launch into `echo` and lost it
+      // (measured; round-12 review, eleventh pass, L57a). Exactly the parity rule
+      // `joinLineContinuations` applies to the whole command.
+      if (i === line.length - 1) contAt = i;
+      else i += 1;
+    }
   }
   if (contAt < 0 || comment) return null;
   return line.slice(0, contAt) + next;
@@ -946,21 +955,44 @@ export function splitShellStdin(command: string): ShellStdin {
     // makes for a quoted delimiter (a body is literal).
     let line = lines[li];
     let lastLine = li;
+    // Where each joined line BEGINS inside `line` (after its predecessor's continuation
+    // backslash). Needed because the quote model is indexed by ABSOLUTE offset into the
+    // raw command: a match past the seam must be looked up in ITS OWN line's span.
+    const seams: number[] = [];
     for (;;) {
       const next = lastLine + 1;
       if (next >= lines.length) break;
       const joinedLine = joinContinuedLine(line, lines[next]);
       if (joinedLine === null) break;
+      seams.push(line.length - 1);
       line = joinedLine;
       lastLine = next;
     }
+    // ⛔ THE JOINED LINE IS NOT THE RAW LINE (round-12 review, eleventh pass, P0):
+    // reading `mask[base + m.index]` on a joined line shifted every offset past the
+    // seam, so a `<<` INSIDE a double-quoted word looked unquoted and opened a phantom
+    // heredoc that blanked the launch after it — bash runs that launch (measured:
+    // `echo "a \` + newline + `<<EOF b"` + newline + `npm exec electron .` → npm runs,
+    // the guard returned []). Mask, comment cut and quote spans are all taken from THIS
+    // text, mapped back per segment; unknown offsets count as UNQUOTED, so an
+    // off-by-one can only over-read (a phantom heredoc), never lose a body.
+    const jmask: boolean[] = [];
+    for (let k = 0; k < line.length; k++) {
+      let seg = 0;
+      while (seg < seams.length && k >= seams[seg]) seg++;
+      const local = seg === 0 ? k : k - seams[seg - 1];
+      jmask.push(mask[starts[li + seg] + local] !== false);
+    }
     out.push(line);
-    const base = starts[li];
-    const cut = commentCutIndex(line, base, mask);
+    // The continuation lines are CONSUMED, not re-emitted: without this they were
+    // pushed a second time on their own iteration, and a duplicated fragment can carry
+    // a lone quote that changes how the rest of the command reads.
+    li = lastLine;
+    const cut = commentCutIndex(line, 0, jmask);
     // ── here-STRING (`<<<`): its operand is the shell's stdin too, and `tokenize`
     //    folds `<<<"npm exec …"` into ONE token, so nothing else ever looks at it.
     for (const m of line.matchAll(HERESTRING)) {
-      if (mask[base + m.index] !== true) continue;          // a quoted `<<<` is data
+      if (jmask[m.index] !== true) continue;               // a quoted `<<<` is data
       if (cut !== -1 && m.index > cut) continue;             // a commented `<<<` is data
       const operand = m[1] ?? (m[2] === undefined ? m[3] : unescapeDouble(m[2])) ?? "";
       // The redirect's own offset decides which segment's shell (if any) receives it.
@@ -975,8 +1007,7 @@ export function splitShellStdin(command: string): ShellStdin {
       //    `bash <<<EOF` opened a heredoc with delimiter `EOF` and swallowed the
       //    rest of the input.
       if (m.index > 0 && line[m.index - 1] === "<") continue;
-      const idx = base + m.index;
-      if (mask[idx] === false) continue; // quoted `<<` inside a string, not a redirect
+      if (jmask[m.index] === false) continue; // quoted `<<` inside a string, not a redirect
       // ⛔ A COMMENTED `<<` IS DATA (review cycle 5, F2) — see the header. It used
       // to delete every following line, which lost the block AND the ledger row.
       if (cut !== -1 && m.index > cut) continue;
@@ -1796,6 +1827,15 @@ function joinLineContinuations(text: string): string {
     }
     if (!sq && ch === "\\") {
       const nx = text[i + 1];
+      // ⛔ A BACKSLASH ESCAPES THE NEXT ONE, so `\\` + newline is NOT a continuation
+      // (bash keeps one literal backslash and ENDS the line — `echo hi \\` + newline +
+      // `electron .` runs `electron .`; measured, L57a). The pair is emitted verbatim
+      // and skipped, which makes the odd-run parity fall out for free.
+      if (nx === "\\") {
+        out += ch + nx;
+        i += 1;
+        continue;
+      }
       if (nx === "\n") {
         i += 1;
         continue;

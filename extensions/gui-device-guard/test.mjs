@@ -687,6 +687,40 @@ const ROWS = [
     'env FOO=1 watch -n 1 "npm exec electron ."', 1, "electron", true],
   ["A76 the ALLOW twin: a prefixed `watch` with a benign operand stays clean",
     "timeout 30 watch -n 1 ls", 0, null, false],
+  // ── L57–L59 (round-12 review, ELEVENTH pass) — three MISSES the per-line join
+  //     introduced or left, all reproduced against bash first.
+  //   L57: a backslash escapes the NEXT character, so only an ODD trailing run is a
+  //        continuation. `echo hi \` is a literal backslash and the line ENDS there —
+  //        bash runs `electron .` on the next line — but the joiner took the last
+  //        backslash at face value, joined the launch into `echo` and lost it.
+  ["L57a `\\` at end of line is a LITERAL backslash — the launch on the next line runs (was [])",
+    "echo hi \\\\\nelectron .", 1, "electron", true],
+  ["A77 the ALLOW twin: three backslashes DO continue, so the word is an `echo` argument",
+    "echo hi \\\\\\\nelectron .", 0, null, false],
+  //   L58: joining re-emitted the consumed continuation line, and a duplicate fragment
+  //        carrying a lone quote changed how the rest of the command read — the launch
+  //        after it lost the refusal AND the row (was []).
+  ["L58 a continuation whose joined line carries the closing quote must not be re-emitted (was [])",
+    "cat > /tmp/x.log 2>/dev/null <<'EOF'\nplaceholder\nEOF\necho \"=== starting \\\napp ===\"\nnpm exec electron .",
+    1, "electron", true],
+  //   L59: the quote model is indexed by ABSOLUTE offset, so a `<<` past a join seam
+  //        read the wrong characters, looked unquoted, and opened a phantom heredoc
+  //        that blanked the launch after it (was []).
+  ["L59 a `<<` inside a quoted word after a continuation is not an operator (was [])",
+    "echo \"a \\\n<<EOF b\"\nnpm exec electron .", 1, "electron", true],
+  //   L57b: the SAME parity rule on the per-line joiner, in a command that also carries
+  //         a heredoc — the whole-command joiner cannot rescue a line it never sees
+  //         separately, so without the per-line parity this launch was joined into
+  //         `echo` and lost (was []).
+  ["L57b …the per-line joiner applies the same parity (heredoc in the same command) (was [])",
+    "cat > /tmp/x.log <<'EOF'\nplaceholder\nEOF\necho hi \\\\\nelectron .",
+    1, "electron", true],
+  //   A78: with the join seam in play, the quote model must be consulted at the JOINED
+  //        text's own offsets. Off by one, the `<<` was read as quoted, no heredoc was
+  //        found, and the body line was then executed as a command — an OVER-FIRE
+  //        (`<<EOF` with no command discards its body; measured).
+  ["A78 the ALLOW twin: `<<EOF` with no command discards its body, even after a join seam",
+    "echo \"a \\\n\"<<EOF\nnpm exec electron .\nEOF", 0, null, false],
   //   L30c: tab completion appends a slash to directories, and `open
   //         ./Build/DMeer.app/` — the incident's own app — matched none of the three
   //         bundle tests while the `-a` spelling of the SAME token was refused.

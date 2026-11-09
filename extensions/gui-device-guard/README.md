@@ -331,7 +331,24 @@ This is a residual list, not a completeness claim:
   and swallow every command after it (L54a/L54b). A continuation at the end of a
   COMMENT is not a continuation — `# note \` + newline + a launch RUNS the launch
   (A74) — and the comment predicate is bash's own set (a `#` glued to `;` or `)` starts
-  one too: L55a/L55b), shared with `commentCutIndex`'s rule.
+  one too: L55a/L55b), shared with `commentCutIndex`'s rule. ⛔ Those two rows pin the
+  BEHAVIOUR, not the predicate in isolation: measured, reverting the shared predicate
+  to "previous char is a blank" reds **0**, because `stripComments` — whose rule always
+  had the full set — runs before the join on the no-heredoc path. They are regression
+  rows for the end-to-end shape (a `#` glued to `;`/`)` must not swallow the launch
+  after it), and the predicate stays because it is the rule the SCANNER's per-line
+  joiner applies to RAW lines.
+- A backslash ESCAPES THE NEXT CHARACTER, so only an ODD trailing run of them continues
+  a line: `echo hi \\` is a literal backslash and the line ENDS there — bash runs the
+  launch on the next line — while `echo hi \\\` continues into it and makes the launch an
+  `echo` ARGUMENT. Taking the last backslash at face value joined the launch into
+  `echo` and lost it (`round 12`, rows L57a/L57b, allow twin A77), in both joiners.
+- The continuation lines a join CONSUMES are not re-emitted. Re-emitting them duplicated
+  a fragment that could carry a lone quote — and a duplicated closing quote changed how
+  the rest of the command read, losing the launch after it (L58) — and the quote model
+  is consulted at the JOINED text's own offsets, so a `<<` past a join seam is not read
+  as an operator by accident (L59; allow twin A78, where `<<EOF` with no command
+  discards its body and nothing runs).
 - A LINE CONTINUATION (`\` + newline) is NOT a command separator: bash deletes it
   before word splitting, so
   `npm exec electron . \` + `--use-fake-device-for-media-stream --use-fake-ui-for-media-stream`
@@ -420,7 +437,7 @@ This is a residual list, not a completeness claim:
 ## Tests
 
 ```bash
-node extensions/gui-device-guard/test.mjs                    # 314 assertions, threat table L1–L56 + handler H1–H15
+node extensions/gui-device-guard/test.mjs                    # 320 assertions, threat table L1–L59 + handler H1–H15
 node extensions/gui-device-guard/test.mjs --classify 'npm exec electron .'
 ```
 
@@ -431,9 +448,9 @@ stays green while `index.ts` is broken and the guard is inert in every session.
 Mutations are pinned, each attributable to the row it is about, all measured at
 ONE head (**this** head — re-measured, not carried over: the counts are the output
 of running the mutant against `test.mjs`, and the assertion total is
-`314 = 243 ROWS + 14 APP_ROWS + 57 explicit \`check()\` calls`): the Electron
-rule's `media` → `false` reds **137**; the wrapper recursion
-removed reds **8**; the wrapper WORDS removed reds **2**; the structural rule that
+`320 = 249 ROWS + 14 APP_ROWS + 57 explicit \`check()\` calls`): the Electron
+rule's `media` → `false` reds **141**; the wrapper recursion
+removed reds **8**; the wrapper WORDS removed reds **4** (L45a + L56a–L56c); the structural rule that
 reads a package-runner anywhere in the segment removed reds **2** (L19h/L19i); the
 comment stripper removed reds **2** (L11d and L11f — re-measured at this head; the
 earlier claim of `1` in this ledger was wrong at every head it was quoted for);
@@ -509,7 +526,11 @@ command word, so a body the shell runs was blanked as data); joining continuatio
 AFTER the heredoc scan reds **5** (L48b, L48c, L48a1, L53a, L53b); joining over the WHOLE
 command again (instead of per line inside the scanner) reds **2** (L54a/L54b — a
 trailing `\` in a QUOTED body ate the terminator); disabling the scanner's per-line
-join reds **2** (L53a/L53b); and reading `watch`'s operand from token 0 again reds **3**
+join reds **2** (L53a/L53b); dropping the escape-PAIR parity from the whole-command
+joiner reds **2** (L57a/L57b) and from the per-line joiner alone reds **1** (L57b);
+re-emitting the consumed continuation lines reds **2** (L58/L59); reading the quote
+model at the RAW line's base instead of the joined text's offsets reds **1** (A78);
+and reading `watch`'s operand from token 0 again reds **3**
 (L56a–L56c); dropping `electron-forge` from the electron head test reds **5**
 (L31a–L31e); removing the PROCESS-substitution arm (`<( … )` / `>( … )`, the
 round-12 review's second P2) reds **3** (L32a–L32c, and A55 stays green because the
