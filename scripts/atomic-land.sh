@@ -191,6 +191,11 @@
 #                           (default: 60) — closes the mkdir→pid TOCTOU (B11).
 #   ATOMIC_LAND_UNKNOWN_POLLS  re-polls for a transient `mergeStateStatus=UNKNOWN`
 #                           before failing closed (default: 5).
+#   ATOMIC_LAND_TRANSIENT_POLLS  re-polls EVERY GitHub value this rail captures
+#                           when the read comes back EMPTY, before the caller's
+#                           fail-closed test sees it (default: 5, capped at 20;
+#                           spaced at min(--poll, 2)s). See `gh_read()` — the
+#                           shared helper #1558 moved the re-poll into.
 #   ATOMIC_LAND_REFRESH_ALWAYS  1 = always refresh a drifting head (a BEHIND enum, or
 #                               base drift on a landable state), ignoring the live
 #                               `strict` read (the #1565 fail-safe restore)
@@ -342,6 +347,67 @@ repo_args=()
 
 gh_() { "$GH" "$@"; }
 
+# ── a TRANSIENT empty read is RE-POLLED; a persistent one still fails closed ──
+# #1558 — the class, one level up from #1404. Every GitHub value this rail
+# CAPTURES used to be read ONCE and treated as authoritative, so a single
+# transiently-empty reply (a spent REST budget window, a 5xx, a truncated body)
+# was indistinguishable from a permanently unreadable value. At `base_tip()`
+# that was fatal on the FIRST attempt, and it aborted at B12 AFTER `[1/4]
+# update` had already force-pushed a refreshed head — so the unit left the PR
+# strictly worse than it found it (the record stayed at the old head). MEASURED
+# (tortoise#6168): the same command aborted, then succeeded seconds later with
+# no intervening change, and the failing read itself returned the base tip
+# before, during and after the abort from the same box (`gh api rate_limit`
+# 5000/5000). A false abort on a transient.
+#
+# ONE HELPER, EVERY CAPTURE — this is the half that stops the class recurring.
+# #1404 fixed the instance it named (`mergeStateStatus=UNKNOWN`, re-polled in
+# do_update below); the class then recurred at the next read, because the
+# remedy was written per-instance. So the re-poll lives HERE, in the shape
+# every capture already goes through, and each capture inherits it instead of
+# carrying its own loop.
+#
+# ⛔ FAIL-CLOSED IS UNCHANGED, and that is the load-bearing half: an empty
+# result still comes back EMPTY after the bound, so every caller's existing
+# `-z` / `!=` refusal fires exactly as before. The bound converts a TRANSIENT
+# into a settled read; it never converts a genuine failure into a value.
+#
+# ⛔ WHERE IT APPLIES — and the line is not "every `gh` call". The re-poll is for
+# the reads whose EMPTY answer makes a VERDICT: it ABORTS the unit (`base_tip`,
+# `merge_base_of`, `resolve_state`, the pre-land head/base re-read), refuses an
+# update (`pr_has_carry_evidence`), or SELECTS the refresh decision (#1533's
+# `behind_by_of`, whose empty result reaches the B13 stop). It deliberately does
+# NOT wrap the two reads whose empty answer already routes to the SAFE default —
+# `strict_of` and `mergeable_of` both read as "unreadable ⇒ refresh" and never as
+# "current". Retrying those would change no verdict and would multiply a read
+# that is PINNED at one per invocation (the #1565 declaration the suite asserts:
+# "ONE positive read of `strict` per invocation"), i.e. it would weaken a
+# recorded contract to buy nothing.
+#
+# The ceiling matters as much as the retry: a bound that cannot be reached is
+# not a bound, and an unbounded retry here would turn one unreadable value into
+# a lock-holding spin (the B11 lock is held for the whole unit).
+#
+# stdout = the value. rc 0 = non-empty; rc 1 = still empty after the bound.
+# Callers keep their own emptiness test: the rc is reported, never required.
+gh_read() { # <gh argv...>
+  local tries="${ATOMIC_LAND_TRANSIENT_POLLS:-5}" out="" t=0 nap="$POLL"
+  case "$tries" in ''|*[!0-9]*) tries=5 ;; esac
+  [ "$tries" -le 20 ] 2>/dev/null || tries=20
+  # Spaced like the UNKNOWN re-poll, but NIPPED at 2 s: this read sits on the
+  # critical path of every capture (a landing makes a handful), so a 30 s
+  # `--poll` must not turn one transient into minutes of stall. `--poll 0`
+  # stays instant, which is what keeps the hermetic suite fast.
+  [ "$nap" -gt 2 ] 2>/dev/null && nap=2
+  while :; do
+    out="$(gh_ "$@" 2>/dev/null || true)"
+    if [ -n "$out" ]; then printf '%s' "$out"; return 0; fi
+    t=$((t + 1))
+    [ "$t" -gt "$tries" ] && return 1
+    sleep "$nap" 2>/dev/null || true
+  done
+}
+
 # ── B11 — one rail per PR ─────────────────────────────────────────────────
 # Two concurrent rails on the SAME PR interleave update/record/land: each can
 # move the head the other verified, and each can re-record on the other's head.
@@ -417,7 +483,7 @@ CERT_BASE=""; CERT_MB=""; CERT_BASE_TIP=""
 # not assumed — an untested assumption about a protection setting is exactly the
 # class this rail exists to catch.
 merge_base_of() { # <base> <head>
-  gh_ api "repos/$REPO/compare/$1...$2" --jq .merge_base_commit.sha 2>/dev/null || true
+  gh_read api "repos/$REPO/compare/$1...$2" --jq .merge_base_commit.sha
 }
 # How many commits the HEAD is behind the BASE. Same compare call merge_base_of()
 # already makes — the response carries `behind_by`, so this is a second read of an
@@ -434,7 +500,7 @@ merge_base_of() { # <base> <head>
 # we actually want; the enum is a coarse proxy that NEVER says it for these PRs.
 behind_by_of() { # <base> <head> -> N (empty on any unreadable/non-numeric reply)
   local n
-  n="$(gh_ api "repos/$REPO/compare/$1...$2" --jq '.behind_by // 0' 2>/dev/null || true)"
+  n="$(gh_read api "repos/$REPO/compare/$1...$2" --jq '.behind_by // 0')"
   case "$n" in ''|*[!0-9]*) echo ""; return 0 ;; esac
   echo "$n"
 }
@@ -769,7 +835,11 @@ drift_safe_of() { # -> 1 | "" (empty = not positively safe ⇒ the caller refres
 # `strict`, so the rail must re-establish the up-to-date guarantee itself rather
 # than depend on the protection setting.
 base_tip() {
-  gh_ api "repos/$REPO/pulls/$PR" --jq .base.sha 2>/dev/null || true
+  # The #1558 site. `gh_read` re-polls a transient empty reply and still returns
+  # EMPTY after the bound, so the B12 capture below keeps its fail-closed verdict
+  # while a transient settles instead of aborting the unit after `[1/4] update`
+  # has already moved the head.
+  gh_read api "repos/$REPO/pulls/$PR" --jq .base.sha
 }
 
 # The review gate key — the SAME source and normalisation as the producer
@@ -803,7 +873,7 @@ GATE_KEY="$(printf '%s' "$GATE_KEY_RAW" | tr -d '[:space:]')"
 # opaque identity and cites it verbatim.
 pr_has_carry_evidence() {
   local line="" text="" sig="" expect=""
-  line="$(gh_ api "repos/$REPO/pulls/$PR" --jq .body 2>/dev/null \
+  line="$(gh_read api "repos/$REPO/pulls/$PR" --jq .body \
     | grep -m1 -E "^review recorded: reviews/${PR}\\.json verdict=${RECORD_VERDICT} @ [0-9a-f]{40} diff=[0-9a-f]{64} \\(.*\\) sig=[0-9a-f]{64}$" || true)"
   [ -n "$line" ] || return 1
   [ -n "$GATE_KEY" ] || return 1
@@ -858,9 +928,9 @@ resolve_repo() {
 
 resolve_state() {
   local line
-  line="$(gh_ pr view "$PR" ${repo_args[@]+"${repo_args[@]}"} \
+  line="$(gh_read pr view "$PR" ${repo_args[@]+"${repo_args[@]}"} \
             --json headRefOid,baseRefName,mergeStateStatus,isDraft \
-            --jq '"\(.headRefOid)\t\(.baseRefName)\t\(.mergeStateStatus)\t\(.isDraft)"' 2>/dev/null || true)"
+            --jq '"\(.headRefOid)\t\(.baseRefName)\t\(.mergeStateStatus)\t\(.isDraft)"')"
   if [ -z "$line" ]; then stop "could not read PR #$PR state (gh/API failure?)"; fi
   HEAD="$(printf '%s' "$line" | cut -f1)"
   BASE="$(printf '%s' "$line" | cut -f2)"
@@ -2079,6 +2149,17 @@ while :; do
   # pre-land arm (which runs only when this is non-empty) would skip silently —
   # landing on a base the checks never covered. An unreadable tip is not a
   # licence to certify without a base binding.
+  #
+  # ⛔ AND IT IS NOT FATAL ON THE FIRST ATTEMPT (#1558). "Fail-closed" and
+  # "abort on one empty reply" are NOT the same requirement, and conflating them
+  # is what the issue measured: a transient empty read here aborted the unit
+  # AFTER `[1/4] update` had already pushed a refreshed head. `base_tip()` now
+  # re-polls through `gh_read()` (`ATOMIC_LAND_TRANSIENT_POLLS`), so a transient
+  # settles and this arm fires only on a PERSISTENTLY unreadable base — which is
+  # still a refusal, reached with evidence instead of on a coin flip.
+  # (The other half of #1404 problem 2 — an update spends an attestation it
+  # cannot restore — is B5's, guarded BEFORE the head moves: the rail refuses to
+  # update a head whose record no verifiable marker could re-bind.)
   if [ -z "$CERT_BASE_TIP" ]; then
     stop "could not read the base tip of $BASE — refusing to certify without a base binding (B12)"
   fi
@@ -2131,9 +2212,9 @@ while :; do
   # what merges changes (agent-infra #1362). A base that merely ADVANCED does not
   # move the merge base, so it is not a repoint and is not refused.
   if [ "$DRY_RUN" -eq 0 ] && [ "$QUEUE_MODE" -eq 0 ]; then
-    pre="$(gh_ pr view "$PR" ${repo_args[@]+"${repo_args[@]}"} \
+    pre="$(gh_read pr view "$PR" ${repo_args[@]+"${repo_args[@]}"} \
             --json headRefOid,baseRefName \
-            --jq '"\(.headRefOid)\t\(.baseRefName)"' 2>/dev/null || true)"
+            --jq '"\(.headRefOid)\t\(.baseRefName)"')"
     now="$(printf '%s' "$pre" | cut -f1)"
     now_base="$(printf '%s' "$pre" | cut -f2)"
     if [ -z "$now" ] || [ -z "$now_base" ]; then
