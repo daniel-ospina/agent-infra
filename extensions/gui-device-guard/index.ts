@@ -1365,6 +1365,7 @@ function attachedShortArg(tok: string, letter: string): string | null {
 function clusterShortArg(
   tok: string,
   letters: readonly string[],
+  hasNext: boolean,
 ): { letter: string; arg: string } | null {
   if (!tok.startsWith("-") || tok.startsWith("--")) return null;
   const body = tok.slice(1);
@@ -1385,7 +1386,17 @@ function clusterShortArg(
     // A rest that `open` itself could accept as FLAGS (`-na`, `-bna`) is a getopt
     // CLUSTER, and its value is the NEXT word — the reading the P2-4 rows pin. A
     // rest with a letter `open` has no flag for (`-aSafari`) is the argument.
-    if (rest !== "" && /^[A-Za-z]+$/.test(rest) && [...rest].every((c) => OPEN_FLAG_LETTERS.includes(c))) {
+    // ⛔ A CLUSTER NEEDS A NEXT WORD TO TAKE ITS VALUE FROM (round-12 review, LOW):
+    // `open -anews` (Apple's News app) was read as the cluster `-a -n -e -w -s` with
+    // no value left, and recorded NOTHING — the same word list makes `-a news` work
+    // and `-anews` vanish. With nothing following, the attached reading is the only
+    // one that can be right.
+    if (
+      hasNext &&
+      rest !== "" &&
+      /^[A-Za-z]+$/.test(rest) &&
+      [...rest].every((c) => OPEN_FLAG_LETTERS.includes(c))
+    ) {
       continue;
     }
     return { letter: ch, arg: rest };
@@ -1508,7 +1519,7 @@ function classifySegment(
       // P2-4): `-a<app>` / `-b<id>` / `-na <name>` / `-bna <id>` hand their ARGUMENT
       // to the option letter, and a plain word never does. The letter comes from
       // the caller's own list, exactly like `attachedShortArg`.
-      const flagArg = clusterShortArg(tok, ["a", "b"]);
+      const flagArg = clusterShortArg(tok, ["a", "b"], i + 1 < rest.length);
       if (flagArg !== null) {
         // An empty remainder means the argument is the NEXT token (`-a <app>`,
         // `-na <name>`); a non-empty one is the ATTACHED spelling (`-aDMeer`).
@@ -1613,6 +1624,68 @@ function classifySegment(
  * is a finding against it, not a residual: the handler returns early on `[]`, so a
  * miss loses the refusal AND the ledger row together (cycles 3, 4 and 5).
  */
+export /**
+ * Remove bash's line CONTINUATIONS (`\` + newline) before the text is split into
+ * segments.
+ *
+ * ⛔ A CONTINUATION IS NOT A SEPARATOR (round-12 review, HIGH). Bash deletes
+ * `\`+newline before word splitting, so
+ *
+ *     npm exec electron . \
+ *       --use-fake-device-for-media-stream --use-fake-ui-for-media-stream
+ *
+ * is ONE command whose argv carries both switches — but `splitSegments` split on the
+ * newline, so the launch landed in one segment and its mitigation in the next. Two
+ * failures, in both directions: the mitigated launch was REFUSED (the refusal's own
+ * printed remedy was what the lane had already written), and
+ * `npx playwright test \` + `--headed` lost the block AND the ledger row.
+ *
+ * The rules that decide what a continuation is:
+ *   - inside SINGLE quotes it is literal text (`'x \` + newline + `y'` prints `x \ny`);
+ *   - inside DOUBLE quotes and unquoted it is removed;
+ *   - a `\` at the end of a COMMENT is not a continuation at all (`# c \` + newline +
+ *     `echo two` runs `echo two` — measured), which is why this runs AFTER
+ *     `stripComments` rather than before it.
+ */
+function joinLineContinuations(text: string): string {
+  if (!/\\\r?\n/.test(text)) return text;
+  let out = "";
+  let sq = false;
+  let dq = false;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (!sq && ch === "\\") {
+      const nx = text[i + 1];
+      if (nx === "\n") {
+        i += 1;
+        continue;
+      }
+      if (nx === "\r" && text[i + 2] === "\n") {
+        i += 2;
+        continue;
+      }
+      out += ch;
+      if (dq && nx !== undefined) {
+        out += nx;
+        i += 1;
+      }
+      continue;
+    }
+    if (!dq && ch === "'") {
+      sq = !sq;
+      out += ch;
+      continue;
+    }
+    if (!sq && ch === '"') {
+      dq = !dq;
+      out += ch;
+      continue;
+    }
+    out += ch;
+  }
+  return out;
+}
+
 export function classifyLaunchCommand(command: string, depth = 0): LaunchFinding[] {
   const findings: LaunchFinding[] = [];
   // ⛔ A SHELL FED BY A HEREDOC / HERE-STRING RUNS ITS STDIN AS A PROGRAM (round 11,
@@ -1622,7 +1695,7 @@ export function classifyLaunchCommand(command: string, depth = 0): LaunchFinding
   const heredocs = splitShellStdin(command);
   // Comments are removed BEFORE tokens are read, so a comment can never satisfy
   // the fake-capture mitigation (review cycle 2, F2).
-  const body = stripComments(heredocs.cleaned);
+  const body = joinLineContinuations(stripComments(heredocs.cleaned));
 
   // ⛔ A `PWDEBUG` EXPORTED IN AN EARLIER SEGMENT STILL APPLIES (review cycle 1,
   // F2: `export PWDEBUG=1; npx playwright test` used to classify as `[]` because

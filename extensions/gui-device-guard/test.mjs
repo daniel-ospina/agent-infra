@@ -604,6 +604,26 @@ const ROWS = [
     "x=$(bash <<'EOF'\nnpm exec electron .\nEOF\n)", 1, "electron", true],
   ["A70 the ALLOW twin: the same shape with a NON-shell head stays data",
     "x=$(cat <<'EOF'\nopen ./Build/DMeer.app\nEOF\n)", 0, null, false],
+  // ── L48–L49 (round-12 review, seventh pass) — a LINE CONTINUATION, and an attached
+  //     `-a<name>` whose name is spelled only in letters `open` accepts as flags.
+  //   L48: bash deletes `\\`+newline BEFORE word splitting, so the launch and its
+  //        switches are ONE argv. Splitting on the newline put them in different
+  //        segments: the mitigated launch was REFUSED (its own printed remedy was
+  //        what the lane wrote) and the headed Playwright run lost block AND row.
+  ["L48a a line continuation keeps the launch and its mitigation in ONE argv",
+    "npm exec electron . \\\n  --use-fake-device-for-media-stream --use-fake-ui-for-media-stream", 1, "electron", true],
+  ["L48b …and a continued HEADED Playwright run is still a media shape (was [])",
+    "npx playwright test \\\n  --headed", 1, "playwright", true],
+  ["L48c …including a continued `open -a <name>` (the R1 row was lost)",
+    "open \\\n  -a Safari", 1, "open", false],
+  ["A71 the ALLOW twins: a continuation inside SINGLE quotes is literal text",
+    "echo 'x \\\ny'", 0, null, false],
+  ["A72 …and a continuation at the end of a COMMENT is not a continuation",
+    "# note \\\nls", 0, null, false],
+  //   L49: a cluster needs a NEXT WORD for its value, so with nothing following, the
+  //        attached reading is the only one that can be right (`open -anews`).
+  ["L49a `open -anews` records the app `news` (was [])",
+    "open -anews", 1, "open", false],
   //   L30c: tab completion appends a slash to directories, and `open
   //         ./Build/DMeer.app/` — the incident's own app — matched none of the three
   //         bundle tests while the `-a` spelling of the SAME token was refused.
@@ -667,6 +687,8 @@ const APP_ROWS = [
     "open -aBanana", "Banana"],
   ["L44c twin: `-b<id>` keeps the whole bundle identifier",
     "open -bcom.apple.Safari", "com.apple.Safari"],
+  ["L49a twin: a flag-only-letters app name is still the ATTACHED argument",
+    "open -anews", "news"],
 ];
 for (const [name, cmd, expected] of APP_ROWS) {
   const found = classify(cmd);
@@ -695,6 +717,12 @@ check(
 check(
   "L11b1 both fake switches are recognised INSIDE a glued grouping `)`",
   (() => { const f = classify(`(electron . ${FAKE})`); return f.length === 1 && f[0].faked === true; })(),
+);
+// ⛔ A LINE CONTINUATION KEEPS THE MITIGATION IN THE SAME ARGV (round-12 review,
+// seventh pass) — the launch was refused with its own remedy already written.
+check(
+  "L48a1 both fake switches are recognised across a line continuation",
+  (() => { const f = classify(`electron . \\\n  ${FAKE}`); return f.length === 1 && f[0].faked === true; })(),
 );
 // L11d — the mitigation must be ARGV, not COMMENT text (review cycle 2, F2).
 check(

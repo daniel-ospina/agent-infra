@@ -174,7 +174,9 @@ finding at all — so the whole attached spelling family could lose BOTH halves 
 #2249, and one letter of an app's name changed the answer (`round 12`, rows
 L44a–L44c and their identity twins). A rest that could itself be `open` flags
 (`-na`, `-bna`) still reads as a getopt CLUSTER whose value is the next word, which
-is what the P2-4 rows pin.
+is what the P2-4 rows pin — but only when a NEXT WORD exists to take the value from:
+`open -anews` (Apple's News app) has no following word, so the attached reading is the
+only one that can be right, and it records `app: "news"` (L49a and its identity twin).
 
 **`open`'s argument goes to an OPTION LETTER, and a plain word is never a flag.**
 `-a<app>`, `-na <name>`, `-bna <id>` are spellings of the same option: a cluster
@@ -305,6 +307,15 @@ This is a residual list, not a completeness claim:
   bodies arrive in the order the operators appear: `bash <<A; cat <<B` feeds A's
   body to `bash`, so locating only the last `<<` on the line turned the body the
   shell actually executes into data (L42a, A66).
+- A LINE CONTINUATION (`\` + newline) is NOT a command separator: bash deletes it
+  before word splitting, so
+  `npm exec electron . \` + `--use-fake-device-for-media-stream --use-fake-ui-for-media-stream`
+  is one argv and the mitigation applies. Splitting on the newline put the launch and
+  its switches in different segments, which REFUSED the mitigated launch (the refusal
+  printed the very remedy the lane had already written) and dropped both halves for
+  `npx playwright test \` + `--headed`. Inside SINGLE quotes it stays literal text,
+  and a `\` at the end of a COMMENT is not a continuation — both pinned (`round 12`,
+  rows L48a–L48c, allow twins A71/A72).
 - A CONTROL-FLOW WORD sits where a command word would, and the list is bash's
   grammar, not a heuristic: `until`/`select` join `if`/`while`/`do`, so
   `until electron .; do break; done` no longer answers `[]` while `while` fires
@@ -377,7 +388,7 @@ This is a residual list, not a completeness claim:
 ## Tests
 
 ```bash
-node extensions/gui-device-guard/test.mjs                    # 282 assertions, threat table L1–L47 + handler H1–H15
+node extensions/gui-device-guard/test.mjs                    # 290 assertions, threat table L1–L49 + handler H1–H15
 node extensions/gui-device-guard/test.mjs --classify 'npm exec electron .'
 ```
 
@@ -388,8 +399,8 @@ stays green while `index.ts` is broken and the guard is inert in every session.
 Mutations are pinned, each attributable to the row it is about, all measured at
 ONE head (**this** head — re-measured, not carried over: the counts are the output
 of running the mutant against `test.mjs`, and the assertion total is
-`282 = 217 ROWS + 11 APP_ROWS + 54 explicit \`check()\` calls`): the Electron
-rule's `media` → `false` reds **122**; the wrapper recursion
+`290 = 223 ROWS + 12 APP_ROWS + 55 explicit \`check()\` calls`): the Electron
+rule's `media` → `false` reds **123**; the wrapper recursion
 removed reds **8**; the wrapper WORDS removed reds **2**; the structural rule that
 reads a package-runner anywhere in the segment removed reds **2** (L19h/L19i); the
 comment stripper removed reds **2** (L11d and L11f — re-measured at this head; the
@@ -453,7 +464,11 @@ reds **5** (L44b, L44c and the three identity twins — `-aSafari` recorded `app
 and `-aBanana` found nothing); dropping `watch`'s command operand reds **1** (L45a);
 dropping `until`/`select` from the control-flow words reds **1** (L46c); dropping the
 leading `(`/`{` normalisation reds **1** (L46b); and dropping the substitution unwrap
-in `shellExecutesStdin` reds **1** (L47a); dropping `electron-forge` from the electron head test reds **5**
+in `shellExecutesStdin` reds **1** (L47a); not joining LINE CONTINUATIONS reds **3**
+(L48b, L48c, L48a1 — the mitigated launch was refused with its own remedy already
+written, and the continued headed run lost block AND row); and treating an attached
+`-a<name>` as a cluster when nothing follows it reds **2** (L49a and its identity
+twin — `open -anews` recorded nothing); dropping `electron-forge` from the electron head test reds **5**
 (L31a–L31e); removing the PROCESS-substitution arm (`<( … )` / `>( … )`, the
 round-12 review's second P2) reds **3** (L32a–L32c, and A55 stays green because the
 double-quoted spelling never was a substitution); dropping the inner-binary term from
