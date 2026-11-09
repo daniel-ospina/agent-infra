@@ -5796,6 +5796,280 @@ async function main() {
       "1660x: src2/h8.ts is not under the named dir 'src' and must stay BLOCKED (pre-fix prefix match blessed it and the retry was allowed)");
   });
 
+  // ── #1265 (AC a/b/c) — the session's OWN root is what recovery counts, the
+  // non-adoption is durable, and a worktree that had no entries can be verified
+  // and used normally afterwards. ──
+  //
+  // PRE-FIX (measured by running this scenario against the pre-change source):
+  // session_start ran recovery at the root `recoveryOnlyRoot` handed back — the
+  // same-repo SIBLING — so a worktree with ZERO entries printed
+  // "📂 Recovered N verified files from bridge" with the sibling's count, audited
+  // `gate_recovery` for it, and (because the count was > 0) never reached the
+  // `else if (isTaskSubAgent())` zero-entry warning. Every one of those N entries
+  // is then dropped at the git-op root filter, so the claim is false AND the
+  // parent never learns every commit will block. The root-mismatch diagnosis was
+  // `console.log` only — nothing durable, nothing a parent can read.
+  test("scenario 1265a: recovery counts THIS worktree (not the sibling), the non-adoption is durable, and the worktree becomes usable after its own PASS", async () => {
+    const hub = join(TEST_ROOT, "repo-1265-hub");
+    mkdirSync(hub, { recursive: true });
+    git(hub, "init -b main");
+    git(hub, "config user.email e2e@test");
+    git(hub, "config user.name e2e");
+    writeFileSync(join(hub, "base1265.txt"), "b\n");
+    git(hub, "add base1265.txt");
+    git(hub, "commit -m base");
+    const wtA = join(hub, ".worktrees", "wt-1265-a");
+    const wtB = join(hub, ".worktrees", "wt-1265-b");
+    // A THIRD worktree, also with no entries, so the ops can ALTERNATE roots.
+    // #1265 review F5: a single-slot dedupe only suppresses CONSECUTIVE repeats,
+    // and the hub/linked-worktree case #3255 exists for alternates — without a
+    // third root this row could not tell a Set from a single slot.
+    const wtC = join(hub, ".worktrees", "wt-1265-c");
+    git(hub, `worktree add ${wtA} -b feat-1265-a`);
+    git(hub, `worktree add ${wtB} -b feat-1265-b`);
+    git(hub, `worktree add ${wtC} -b feat-1265-c`);
+    mkdirSync(join(wtC, "src"), { recursive: true });
+    writeFileSync(join(wtC, "src", "c1265.ts"), "c\n");
+    git(wtC, "add src/c1265.ts");
+    mkdirSync(join(wtA, "src"), { recursive: true });
+    writeFileSync(join(wtA, "src", "a1265.ts"), "a\n");
+    // #1265 review cycle 3: a path that A and B BOTH hold, BYTE-IDENTICAL. Without it the
+    // "no fail-open" row below was VACUOUS: A's entry was `src/a1265.ts` and B's commit
+    // `src/b1265.ts`, so B's lookup key could never intersect anything A contributes and B
+    // blocked under EVERY adoption mutant. Measured: re-keying the inspected sibling's
+    // entries onto the own root — R1's exact failure mode — left the whole suite green.
+    // With a shared, identical-bytes path the re-keyed digest MATCHES B's copy, so an
+    // adopting gate ALLOWS the op and `block1` reddens.
+    writeFileSync(join(wtA, "src", "shared1265.ts"), "s\n");
+    git(wtA, "add src/a1265.ts");
+    git(wtA, "add src/shared1265.ts");
+    git(wtA, "commit -m work-a");
+    mkdirSync(join(wtB, "src"), { recursive: true });
+    // B's FIRST op touches ONLY the shared path, so its whole scope is satisfiable by an
+    // adopted A entry — that is what makes the fail-open row discriminating. `b1265.ts` is
+    // written here but staged AFTER that op, so it cannot mask the result.
+    writeFileSync(join(wtB, "src", "shared1265.ts"), "s\n");
+    writeFileSync(join(wtB, "src", "b1265.ts"), "b\n");
+    git(wtB, "add src/shared1265.ts");
+
+    // The bridge holds REAL, hash-matching entries for worktree A ONLY.
+    const realA = realpathSync(wtA);
+    const realB = realpathSync(wtB);
+    const realC = realpathSync(wtC);
+    const bridgeDir = join(TEST_ROOT, ".pi", "agent", "verification");
+    mkdirSync(bridgeDir, { recursive: true });
+    writeFileSync(join(bridgeDir, "latest.json"), JSON.stringify({
+      status: "PASS",
+      verified_files: [
+        { path: `${realA}::src/a1265.ts`, hash: sha("a\n") },
+        { path: `${realA}::src/shared1265.ts`, hash: sha("s\n") },
+      ],
+      timestamp: new Date().toISOString(),
+    }));
+
+    // A session rooted in B, whose own registry is EMPTY. process.cwd() is the
+    // session root the handler resolves, so it is redirected for the duration.
+    //
+    // #1265 review: run this as a TASK CHILD (PI_MODE=print + TASK_HEARTBEAT=1,
+    // the pair builtin-tools injects). The pre-fix defect had TWO halves, and the
+    // second — `recovered > 0` suppressing the `else if (isTaskSubAgent())`
+    // zero-entry warning (#264 P2) — is only reachable in a sub-agent session. An
+    // interactive run leaves that half untested, so a revert that kept the
+    // foreign-root record would still look green here.
+    const prevMode = process.env.PI_MODE;
+    const prevHeartbeat = process.env.TASK_HEARTBEAT;
+    const captured: string[] = [];
+    const origLog = console.log;
+    const opB = { type: "tool_call", toolName: "bash", input: { command: `cd ${realB} && git commit -m b1265`, cwd: realB } };
+    const prevCwd = process.cwd();
+    let block1: any = undefined;
+    let block2: any = undefined;
+    // #1265 review F5: alternate roots INSIDE the session (B -> C -> B), which is the
+    // shape a hub/linked-worktree session actually produces. A single-slot dedupe
+    // re-records B on the second visit; the stated invariant is "once per session per
+    // (root, siblings)", so B and C must each land exactly one record.
+    const opC = { type: "tool_call", toolName: "bash", input: { command: `cd ${realC} && git commit -m c1265`, cwd: realC } };
+    let blockC: any = undefined;
+    process.env.PI_MODE = "print";
+    process.env.TASK_HEARTBEAT = "1";
+    try {
+      console.log = ((msg: string, ...rest: unknown[]) => { captured.push(String(msg)); origLog(msg, ...rest); }) as typeof console.log;
+      process.chdir(realB);
+      await fire("session_start", {});
+      block1 = await fire("tool_call", opB);
+      block2 = await fire("tool_call", opB);
+      blockC = await fire("tool_call", opC);
+      await fire("tool_call", opB);
+    } finally {
+      console.log = origLog;
+      process.chdir(prevCwd);
+      if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
+      if (prevHeartbeat === undefined) delete process.env.TASK_HEARTBEAT; else process.env.TASK_HEARTBEAT = prevHeartbeat;
+    }
+
+    // The defect ITSELF, in the child's own transcript: pre-fix this printed
+    // "📂 Recovered 2 verified files from bridge" (A's count — the fixture holds TWO
+    // entries for A, one of them the shared path) and therefore never warned.
+    // Post-fix B recovers 0 and the #264 P2 warning is audible again.
+    ok(!captured.some((l) => /Recovered \d+ verified files from bridge/.test(l)),
+      `1265a: B must not claim a recovery count for a sibling's entries, got: ${captured.join(" | ")}`);
+    ok(captured.some((l) => l.includes("0 bridge-recovered files")),
+      `1265a: the #264 P2 zero-entry warning must be reachable when THIS worktree has none (pre-fix it was suppressed), got: ${captured.join(" | ")}`);
+    ok(captured.some((l) => l.includes("INSPECTION ONLY") && l.includes(realA) && l.includes(realB)),
+      `1265a: the inspection merge must be announced as INSPECTION ONLY and name both roots, got: ${captured.join(" | ")}`);
+    // R3: the REWORDED remedy is the change — #1265's one worktree killed three consecutive
+    // children, and the FIRST followed "cd into it" into a tree it did not own. Pin it. The
+    // block reason is NOT the evidence here even though it can now carry a root (block1 commits
+    // `src/shared1265.ts`, which A also holds, so `rootsHoldingPath` names a recorded root);
+    // R3 is about the REMEDY wording, which only the diagnosis line carries.
+    ok(captured.some((l) => l.includes("re-dispatch verification for THIS root") && l.includes(realB)),
+      `1265a: the mismatch remedy must be the followable one and name THIS root, got: ${captured.join(" | ")}`);
+    ok(captured.some((l) => l.includes("refused by design")),
+      `1265a: the mismatch remedy must state that adopting a sibling's entries is refused by design, got: ${captured.join(" | ")}`);
+    // R3's other half, and the only place it can be checked as RENDERED text: the
+    // pre-fix transcript put "(cd into it)" in the output the child acted on. The
+    // source-level pin in index.test.ts is a structural proxy; this is the behaviour.
+    ok(!captured.some((l) => l.includes("cd into it")),
+      `1265a: the un-followable "cd into it" remedy must not be rendered at all, got: ${captured.join(" | ")}`);
+
+    const audit = readAuditLines();
+    const forB = (e: string) => audit.filter((l) => l.event === e && String(l.root ?? "").endsWith("wt-1265-b") && String(l.session_cwd ?? "").startsWith(realB));
+    // The DURABLE half, asserted in the shape that CAN hold. `gate_recovery` now
+    // carries the root it recovered for, so the inspection merge is recorded against
+    // A and never against B. The A-keyed assertion is fail-able in the direction that
+    // matters: with no `root` field (the pre-fix record) it counts 0. The
+    // SIBLING-COUNTING revert is caught by the transcript assertions above
+    // (`📂 Recovered N … for <ownRoot>`), NOT here — there is one emit site, so that
+    // revert still leaves exactly one A-keyed record (the repeat call is short-
+    // circuited by the mtime guard).
+    //
+    // ⛔ A `… root === realB … .length === 0` row sat here and was DELETED (review
+    // cycle 5, rule 3). It could not fail in EITHER direction: pre-fix there is no
+    // `root` field, so `"" === realB` is false and the count is 0 → green on the code
+    // it is named after; and no reversion-shaped mutation of this diff can produce a
+    // B-keyed record, because the only compound key in the bridge is A's, so
+    // `recoverBridgeForRoot(realB)` returns 0 whatever the code does. The property it
+    // named is covered twice already — by the transcript row above (the pre-fix
+    // "Recovered N verified files" line) and by this A-keyed row — and both redden
+    // under the mutants named in the PR's evidence comment.
+    equal(audit.filter((l) => l.event === "gate_recovery" && String(l.root ?? "") === realA).length, 1,
+      "1265a: the inspection merge must record exactly ONE gate_recovery against the SIBLING root it recovered for");
+    // The other half of the same defect: B has no entries of its own, so the
+    // durable zero-entry record must exist for B's own root.
+    equal(forB("gate_recovery_empty").length, 1,
+      "1265a: B's own root has no entries — exactly one durable gate_recovery_empty binds it (the pre-fix run skipped it)");
+    // #1265 review: the REMEDY differs by class (a task-capable child self-verifies in-band; a
+    // task-restricted one is blocked for good and the parent must re-dispatch, #285 P1-A). A parent
+    // reading the log is deciding exactly that, so the class must be IN the row, not only in the
+    // child's stdout — which is the whole premise of AC (b). Pre-fix there is no field at all, so the
+    // typeof row reddens; the agreement row reddens if the field is ever written from anything other
+    // than the same `argvAllowsTask()` the console line is built from.
+    equal(typeof forB("gate_recovery_empty")[0].task_capable, "boolean",
+      "1265a: the durable empty row must carry task_capable — the remedy (wait vs parent re-dispatch) cannot be inferred from the log without it");
+    equal(forB("gate_recovery_empty")[0].task_capable,
+      captured.some((l) => l.includes("0 bridge-recovered files") && l.includes("in-band via the task tool")),
+      "1265a: task_capable must agree with the console line's remedy (in-band vs the block being final)");
+    equal(forB("gate_recovery_foreign_root").length, 1,
+      "1265a: the inspection-only merge of A's entries must leave ONE durable record (AC b)");
+    equal(String(forB("gate_recovery_foreign_root")[0].inspected_root), realA,
+      "1265a: the record must name the sibling root it inspected");
+    equal(forB("gate_recovery_foreign_root")[0].inspected, 2,
+      "1265a: the record must carry the inspected count (A's two entries)");
+
+    // AC (a): the op still FAILS CLOSED, and the diagnosis names THIS root.
+    // ⛔ THIS is the row that makes ADOPTION observable, and it is discriminating ONLY
+    // because `block1`'s scope is the path A and B share with identical bytes. Under the
+    // re-keying mutant `realB::src/shared1265.ts` exists with a digest of A's "s\n", which
+    // matches B's identical copy — so an adopting gate ALLOWS the op and this row reddens.
+    ok(block1 && block1.block === true, "1265a: B's commit must still be BLOCKED — A's entries are inert here (no fail-open)");
+    ok(String(block1.reason).includes("src/shared1265.ts"), "1265a: the block names B's own changed file");
+    ok(!/src\/a1265\.ts/.test(String(block1.reason)), "1265a: the block must not carry A's entry for a path B did not change (src/a1265.ts)");
+
+    // AC (b): exactly ONE durable root-mismatch record for this (root, siblings)
+    // pair, however many git ops run. ONE read of the log — `audit` above is
+    // already the post-op snapshot (all FOUR ops ran inside the guarded block: three
+    // on B, one on C), so concatenating a second read would count every line twice.
+    ok(block2 && block2.block === true, "1265a: the retry is still blocked (no verification happened)");
+    const mismatch = audit.filter((l) => l.event === "gate_root_mismatch" && String(l.root ?? "") === realB);
+    equal(mismatch.length, 1, "1265a: the mismatch must be recorded exactly ONCE per session per (root, siblings) — not once per git op, and not again after the root alternates away and back");
+    equal(JSON.stringify(mismatch[0].verified_roots), JSON.stringify([realA]),
+      "1265a: the record must name the sibling roots whose entries cannot be compared");
+    ok(blockC && blockC.block === true, "1265a: C's commit is blocked too (its own registry is empty)");
+    // ⛔ SCOPED TO WHAT IT CHECKS. C is visited ONCE, so its count here is 1 under the
+    // single-slot mutant too (B→record, B→suppressed, C→record, B→record-again leaves
+    // C at 1) — the row below cannot discriminate that. The ALTERNATION claim belongs
+    // to the B row above, which is the only row that moves (B→2 under a single slot).
+    equal(audit.filter((l) => l.event === "gate_root_mismatch" && String(l.root ?? "") === realC).length, 1,
+      "1265a: C's own (root, siblings) pair records its mismatch exactly once too");
+
+    // B's SECOND op adds its OWN private file, `src/b1265.ts`, which no tree has verified.
+    // Blocked too, and the reason still names only files in B's own scope — A holds
+    // `a1265.ts` and `shared1265.ts`, and B is not committing either under this name.
+    git(wtB, "add src/b1265.ts");
+    const blockB2 = await fire("tool_call", opB);
+    ok(blockB2 && blockB2.block === true, "1265a: B's second op (its own private file) is blocked too");
+    ok(String(blockB2.reason).includes("src/b1265.ts"), "1265a: the block names B's own changed file");
+    ok(!/src\/a1265\.ts/.test(String(blockB2.reason)), "1265a: the block must not carry A's entry for a path B did not change (src/a1265.ts)");
+
+    // AC (c): a worktree that had no entries becomes usable after ITS OWN PASS —
+    // and only after it. No temp-path/sibling root is ever substituted.
+    await fire("tool_result", {
+      toolName: "task",
+      input: { prompt: `[VGATE] verify files: src/shared1265.ts src/b1265.ts. Classification: backend. Project root: ${realB}` },
+      content: [{ type: "text", text: "## Verification Report\nAll good.\nPASS\n" }],
+    });
+    const retry = await fire("tool_call", opB);
+    equal(retry, undefined, "1265a: after B's OWN PASS the op is allowed — the worktree is usable again");
+    const bridgeAfter = readFileSync(join(bridgeDir, "latest.json"), "utf8");
+    ok(bridgeAfter.includes(`${realB}::src/b1265.ts`), "1265a: B's own entry is what unblocked it");
+    // ⛔ SCOPED TO WHAT IT CHECKS (review F3). This row pins AC (c)'s END STATE — B's
+    // PASS does not erase the entry it never owned — and it CANNOT discriminate a
+    // snapshot revert on its own: the write passes `Array.from(verifiedSet.keys())`,
+    // which already holds A's keys (the inspection merge at session_start put them
+    // there), so a whole-file-snapshot `writeBridge` writes A too. Measured: filtering
+    // the caller's list to the writing root (both `pp.root === projectRoot` and the
+    // normalised form) leaves this row GREEN, because `writeBridge`'s own
+    // merge-with-existing (#1225/#1573) restores A regardless. The row that DOES
+    // discriminate the snapshot revert is scenario 21b (:956), whose writer's
+    // registry never held the foreign entry — do not read this row as covering that,
+    // and do not delete 21b on the strength of this one.
+    ok(bridgeAfter.includes(`${realA}::src/a1265.ts`), "1265a: B's PASS leaves A's entry in the bridge (AC c end state — see scenario 21b for the snapshot-revert discriminator)");
+
+    // ── SECOND ARM: the task-RESTRICTED class — the branch the new `task_capable` field exists for. ──
+    // ⛔ The arm above runs in the HARNESS's argv, which carries no `--tools` flag, so
+    // `argvAllowsTask()` is TRUE by default: there `task_capable` can only ever be `true`, and a
+    // mutant that HARDCODED true (or derived it from `isTaskSubAgent()`, true in both arms) stays
+    // green. So this arm injects a restricted allowlist — the same argv seam scenario 285 uses — and
+    // asserts the OTHER branch: the block is FINAL and only the parent can end it (#285 P1-A).
+    // C is used because its own registry is still empty (only A and B have entries by now).
+    const prevArgv = process.argv;
+    const prevMode2 = process.env.PI_MODE;
+    const prevHeartbeat2 = process.env.TASK_HEARTBEAT;
+    const capturedRestricted: string[] = [];
+    const auditBeforeRestricted = readAuditLines().length;
+    try {
+      process.argv = ["pi", "-p", "--tools", "read,bash,edit,write"] as unknown as string[];
+      process.env.PI_MODE = "print";
+      process.env.TASK_HEARTBEAT = "1";
+      console.log = ((msg: string, ...rest: unknown[]) => { capturedRestricted.push(String(msg)); origLog(msg, ...rest); }) as typeof console.log;
+      process.chdir(realC);
+      await fire("session_start", {});
+    } finally {
+      console.log = origLog;
+      process.chdir(prevCwd);
+      process.argv = prevArgv;
+      if (prevMode2 === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode2;
+      if (prevHeartbeat2 === undefined) delete process.env.TASK_HEARTBEAT; else process.env.TASK_HEARTBEAT = prevHeartbeat2;
+    }
+    ok(capturedRestricted.some((l) => l.includes("task-restricted") && l.includes("block is final")),
+      `1265a: a task-RESTRICTED child must be told the block is FINAL and the parent must act, got: ${capturedRestricted.join(" | ")}`);
+    const restrictedRows = readAuditLines().slice(auditBeforeRestricted)
+      .filter((l) => l.event === "gate_recovery_empty" && String(l.root ?? "") === realC);
+    equal(restrictedRows.length, 1, "1265a: the restricted arm records exactly one durable empty row for C");
+    equal(restrictedRows[0].task_capable, false,
+      "1265a: task_capable must be FALSE for a restricted child — without this arm a hardcoded true stays green");
+  });
+
 } // main: plugin loaded; tests run sequentially via runAll()
 
 main()
