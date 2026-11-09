@@ -2422,7 +2422,7 @@ seed_and_stamp() {
   # and the cell dispatched NOTHING for as long as the refusal lasted, while the REST budget sat at
   # 1952/5000 and the log said only `FAILED rc=1 (transient — retried next cycle)`. `install.sh` seeds
   # this adapter on the Mac and puts it first on the daemon PATH (`install.sh:789-884`); the cell path
-  # seeded its TEST and never the adapter, so the two platforms diverged on exactly the surface that
+  # seeded its LIMIT layer and never the adapter, so the two platforms diverged on exactly the surface that
   # decides whether a GraphQL exhaustion degrades the cycle or stops it.
   # ⛔ SAME `$O/gh-limit.py` SIBLING AS THE MAC, and that is not a coincidence: the adapter resolves
   # its limit layer as `$SELF_DIR/../gh-limit.py`, which for `$O/gh-rest/gh` IS `$O/gh-limit.py` — the
