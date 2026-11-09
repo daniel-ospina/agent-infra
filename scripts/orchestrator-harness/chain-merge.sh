@@ -4,6 +4,9 @@
 set -u
 REPO="$1"; OR="$2"; N="$3"; BR="$4"
 O="${O:-$HOME/orchestrator}"; mkdir -p "$O/logs" "$O/state"
+# ⛔ THE WORK ROOT (#2095, review of #3846, P1). The controller exports `O` = its STATE dir and `O_WORK`
+# = the harness root. Everything this chain EXECUTES lives in the work root; its logs stay on `$O`.
+_CM_WORK="${O_WORK:-$O}"
 export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH
 # ⛔ THE gh SHIM MUST STAY FIRST (#1988). The line above prepends the tool dirs, so a REAL gh in
 # either of them outranks the seeded `$O/gh-rest` (Mac REST adapter) / `$O/gh-limit` (cell
@@ -181,7 +184,7 @@ CHAIN_CLAIM_COMMIT="${CHAIN_CLAIM_COMMIT:-}"
 # `claim_issue_release_record` (claims.sh), which is the ONE implementation of that handover — this
 # function only owns the TRAP and the log line.
 release_issue_claim() {
-  local csh="$O/claims.sh" out rc=0
+  local csh="$_CM_WORK/claims.sh" out rc=0
   trap - EXIT INT TERM
   [ -f "$csh" ] || return 0
   # CLAIM_REPO is the repo the claim was pushed to (refs/claims live in the TARGET repo's origin),
@@ -507,7 +510,7 @@ else
   echo "[chain $N] no merge-phase marker after ${PHASE_GRACE}s (a pre-merge-phase lane, or it failed before the PR) — reviewing now, as before" >> "$LOG"
 fi
 
-bash "$O/merge-one.sh" "$REPO" "$OR" "$PR" "$BR" >> "$LOG" 2>&1
+bash "$_CM_WORK/merge-one.sh" "$REPO" "$OR" "$PR" "$BR" >> "$LOG" 2>&1
 rc=$?
 # A capacity refusal is not a failure of the work: nothing ran and nothing was consumed. Name it
 # HERE, in the log the operator reads for this chain — the reviewer's own line is inside
