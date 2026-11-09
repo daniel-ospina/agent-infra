@@ -154,7 +154,8 @@ ck "LOCKF is defined ONCE in the whole loop (no split identity of the lock path)
 # indented by construction, and under a column-0 anchor it was invisible to this arm AND to the two
 # below it — a false GREEN, which is the direction that matters (fresh review of #3865 at 062ff3ca, P2).
 # A `#`-prefixed line still cannot match, so the comment false PASS this anchor was added for stays shut.
-TRAP_L="$(grep -nE '^[[:space:]]*trap .*LOCKF' "$SUBJECT" 2>/dev/null | head -1 | cut -d: -f1)"
+# ⛔ AND `builtin`/`command` PREFIXES ARE THE SAME REGISTRATION (fresh review of #3865, P3 — MEASURED: `trap_regs` already accepted them, but these two SELECTIONS did not, so a `builtin trap 'rm -f "$LOCKF"' EXIT` subject reddened BOTH this arm and the ONE-trap arm while `trap_pin` was green — a false RED, and three comments claiming the prefixed form PASSED were false. Selecting through the same pattern as `trap_regs` is what makes the claim true; the §9d row that drives the literal never exercised these greps.)
+TRAP_L="$(grep -nE '^[[:space:]]*((builtin|command)[[:space:]]+)?trap .*LOCKF' "$SUBJECT" 2>/dev/null | head -1 | cut -d: -f1)"
 [ -n "$TRAP_L" ] && [ "$TRAP_L" -gt "$END_L" ]
 ck "the EXIT trap that releases the lock sits BELOW the section (the block runs first)" $?
 # ⛔ THE ARM MUST RED ON THE EXACT #1715 REVERT, AND THE FIRST FORM DID NOT (fresh review of #1985,
@@ -229,6 +230,21 @@ trap_regs() {
 exit_trap_count() {
   trap_regs "$1" | grep -c '^EXIT :: ' || true
 }
+# trap_reg_total <text> — how many trap registrations sit at a COMMAND POSITION anywhere in the text:
+# line start, after `;`/`&&`/`||`/`(`/`{`, or after `then`/`do`. This exists so the per-LINE scan above
+# cannot be defeated by a second registration that simply does not start its line (fresh review of
+# #3865 at 6a8fcc33f, P2 — false PASS, MEASURED: `trap '…' EXIT; trap 'true' EXIT`,
+# `[ -d "$O/state" ] && trap 'true' EXIT` and `_run_cleanup && trap 'true' EXIT` each left the suite at
+# `PASS=141 FAIL=0` while bash REPLACED the releaser, so the lock was never removed — the ONLY-EXIT arm,
+# the one written for exactly that, was green because `trap_regs` is anchored at `^[[:space:]]*`.
+# An accounting arm compares this count against the number of lines `trap_regs` matched, so a line the
+# per-line scan cannot see — or one carrying two registrations — is a RED, not a blind spot.
+trap_reg_total() {
+  printf '%s\n' "$1" \
+    | sed -e 's/[[:space:]]*#.*$//' \
+    | grep -oE '(^|[;&|({]|then|do)[[:space:]]*((builtin|command)[[:space:]]+)?trap[[:space:]]' \
+    | grep -c . || true
+}
 trap_pin() {
   local _lt="$1" _cmd _flat _regs _sigs _body
   _cmd="$(printf '%s' "$_lt" | sed -e 's/[[:space:]]*#.*$//')"
@@ -240,7 +256,7 @@ trap_pin() {
   [ "${1:-}" = "rm" ] || return 1
   [ "$(grep -c . <<<"$_regs")" = 1 ] && [ "$_sigs" = "EXIT" ] && grep -qF 'rm -f "$LOCKF"' <<<"$_flat"
 }
-LOCK_TRAPS="$(grep -E '^[[:space:]]*trap .*LOCKF' "$SUBJECT" 2>/dev/null)"
+LOCK_TRAPS="$(grep -E '^[[:space:]]*((builtin|command)[[:space:]]+)?trap .*LOCKF' "$SUBJECT" 2>/dev/null)"
 trap_pin "$LOCK_TRAPS"
 ck "the lock is released by ONE trap and its signal list is EXACTLY 'EXIT' (a returning INT/TERM handler deleted it while the loop lived — #1715)" $?
 # ⛔ AND IT MUST BE THE ONLY `EXIT` TRAP, BECAUSE A LATER ONE REPLACES IT (fresh review of #3865 at
@@ -259,6 +275,14 @@ ALL_TRAPS="$(trap_regs "$(cat "$SUBJECT")")"
 EXIT_TRAPS="$(exit_trap_count "$(cat "$SUBJECT")")"
 [ "$EXIT_TRAPS" = 1 ]
 ck "the releasing trap is the ONLY 'EXIT' trap (a second EXIT-family registration REPLACES the first, so the lock is never removed)" $?
+# ⛔ AND EVERY REGISTRATION MUST BE ONE THE PER-LINE SCAN CAN SEE (fresh review of #3865 at 6a8fcc33f,
+# P2 — false PASS, MEASURED: the scan above is anchored at `^[[:space:]]*`, so `trap '…' EXIT; trap 'true'
+# EXIT`, `[ -d "$O/state" ] && trap 'true' EXIT` and `_run_cleanup && trap 'true' EXIT` each counted ONE
+# EXIT registration while bash kept only the LAST handler — the lock was never removed and this pair of
+# arms stayed green. The count below sees a registration ANYWHERE a command can start, so the two can no
+# longer disagree: any registration the line scan missed, and any line carrying two, RED here.)
+[ "$(trap_reg_total "$(cat "$SUBJECT")")" = "$(grep -c . <<<"$ALL_TRAPS")" ]
+ck "every trap registration sits at a command position the per-line scan can see (a registration it misses, or a line carrying two, RED)" $?
 # ⛔ AND A RETURNING `INT`/`TERM` HANDLER IS THE #1715 CLASS, AND THE `LOCKF` FILTER CANNOT SEE IT (fresh
 # review of #3865 at 062ff3ca, P3 — MEASURED: `release_lock() { rm -f "$LOCKF"; }; trap 'release_lock'
 # INT` is dropped by every `grep … LOCKF` above, so trap_pin answered GREEN while a RETURNING INT handler
