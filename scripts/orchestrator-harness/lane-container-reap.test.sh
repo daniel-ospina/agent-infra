@@ -266,6 +266,21 @@ out="$(run_reaper --apply)"
 has "$out" "REMOVED cap9664-pg" "apply removes the proven-gone container"
 eq "$(cat "$RM_LOG")" "cap9664-pg" "docker rm -f was the exact removal"
 
+# K. A REPO THAT IS NOT A CHECKOUT IS REFUSED, not swept (fresh-context review of #3833: the git stub's
+# `STUB_IS_CHECKOUT=0` arm models exactly this shape and NOTHING set it, so the branch was dead and the
+# fixture's own honesty claim was unexercised). This is the arm the resolver's proof exists to make: a
+# directory that cannot prove it is a checkout must never reach a `docker rm -f`, and the refusal must
+# name the value that is wrong rather than the library that is absent.
+echo " K. a REPO that is NOT a checkout is refused and sweeps nothing"
+printf 'cap9664-pg\trunning\n' > "$T/docker.list"
+: > "$T/ps.fixture"
+: > "$RM_LOG"
+out="$(STUB_IS_CHECKOUT=0 run_reaper --apply 2>&1)"; rc=$?
+eq "$rc" "2" "a REPO that cannot prove it is a checkout exits 2 (rc=$rc)"
+has "$out" "is not a git checkout" "the refusal names the value, not a missing library"
+eq "$(cat "$RM_LOG")" "" "nothing was removed from a directory that is not a checkout"
+hasnt "$out" "REMOVED" "no removal is claimed on the refusal"
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" = 0 ] || exit 1
 exit 0
