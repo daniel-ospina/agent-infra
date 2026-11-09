@@ -2179,9 +2179,12 @@ spent, so a lane entering its merge phase more than ~1800 s in (7200 − 5400) w
 is strictly worse than the 1500 s bound this change replaces. `lane-merge.sh` now reads the start epoch
 out of the run token `lane.sh` stamps before it spawns the agent (`$O/logs/lane-<issue>.owner`, whose
 epoch OVER-states the start, the conservative direction) and clamps the wait to what is left, minus a
-margin to write the hand-off. The token's pid must be LIVE, so a stale token from a finished run cannot
-clamp a later invocation to 0; `LANE_MERGE_ELAPSED_S` is the explicit seam, and an elapsed it cannot
-resolve is reported as a residual instead of being read as "the lane just started".
+margin to write the hand-off. The token's pid must be an **ANCESTOR** of the running script — a bounded
+`ps -o ppid=` walk from its own pid — and not merely a LIVE one: a pid can be live and RECYCLED, so
+liveness cannot rule out a finished run (and a newer dispatch re-stamps the per-issue token, which
+would under-state an older lane's elapsed). A non-ancestor, unreadable or future-dated token is the
+disclosed UNCLAMPED path, never a silent clamp. `LANE_MERGE_ELAPSED_S` is the explicit seam, and an
+elapsed it cannot resolve is reported as a residual instead of being read as "the lane just started".
 ⛔ **THE CHECK WAIT IS THE LONG POLE AND ITS COVERAGE IS FINITE**: 5400 s covers 79.9 % of the
 measured lane-visible wait (`created_at` → `updated_at`, including the pre-start queue) and 94.3 % of
 run duration (the window holds NO successful run, so those are failing-run figures; the newest 100

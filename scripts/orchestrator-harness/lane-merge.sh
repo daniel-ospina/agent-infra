@@ -205,8 +205,10 @@ is_limit "$MAX_ROUNDS" || { say_err "lane-merge: LANE_MERGE_MAX_ROUNDS='$MAX_ROU
 # A bound that only fires when a lane happens to enter late is still a bound that costs every other lane its
 # merge, and the duration population above is why the common case is that it fires.
 # The 1500 s figure came from a 22-check commit on a loaded box, taken when `bash-suites` was a single
-# ~73 min job; `scripts/run-bash-shards.sh --list` derives 193 shards today, and the matrix changed what a
-# lane waits through.
+# ~73 min job; `scripts/run-bash-shards.sh --list` now derives a 195-shard matrix (count STAMPED
+# 2026-11-09 — the list moves, so read `--list` rather than trusting this number: an earlier draft said
+# 193, which is the same stale-number defect this block exists to fix, one line lower), and the matrix
+# changed what a lane waits through.
 #
 # 5400 s (90 min): a round number a reader can hold, and the most this clock can afford (below).
 #
@@ -520,6 +522,14 @@ if [ -z "$HB_F" ]; then
   elif [ -f "$O/logs/fix-$PR.log" ]; then HB_F="$O/logs/fix-$PR.log"
   fi
 fi
+# ⛔ THE SECOND TARGET IS ANOTHER PROCESS'S STALL DETECTOR, STATED RATHER THAN HIDDEN (review, P3 —
+# verified). `$O/logs/fix-$PR.log` is the log a FIXER's own `lane-bound.sh --log` watches, so appending
+# this wait's heartbeats to it is progress evidence for whoever that watchdog is supervising: a genuinely
+# stalled fixer for the SAME PR would keep reading as alive while this merge phase runs. The shape needs
+# both a re-invocation without `--issue` AND a concurrently live fixer on that PR — which the per-PR
+# claim is what normally prevents — so this is a narrow disclosed edge rather than a live defect.
+# Closing it properly means preferring a target only THIS invocation's watchdog reads (or probing the
+# claim before falling back); neither is done here, and `LANE_MERGE_HB` is the way to be explicit.
 # The watchdog's allowance, resolved the way `lane-bound.sh` resolves it. This script is never handed the
 # flag, so env → default is the whole chain here — and the default is THEIRS, not a second copy of it.
 # ⛔ THE RESIDUAL, MEASURED RATHER THAN ASSUMED: the heartbeat only counts if it lands in the file the
@@ -1545,7 +1555,7 @@ _wait_elapsed_note=""
 # `TimeoutSec=0` disables the timeout, and `systemd#9556` is the bug filed when `0s` was read as a
 # zero-second budget instead — the same misreading fixed here.)
 if [ "$LANE_WALL_S" -eq 0 ]; then
-  say_err "lane-merge: LANE_TIMEOUT=0 is the documented 'wall axis OFF' value (unbounded), not a zero-second budget — the ${WAIT_S}s check wait is NOT clamped, and no wall ceiling is enforced for this lane. Reading it as 0 would hand off WAITING_CHECKS on the first poll for ever (#3850 review, P2)."
+  say_err "lane-merge: LANE_TIMEOUT=0 is the documented 'wall axis OFF' value (unbounded), not a zero-second budget — the ${WAIT_S}s check wait is NOT clamped, and no wall ceiling is enforced for this lane. Reading it as 0 would hand off WAITING_CHECKS on the first poll for ever (#3850 review, P2). ⛔ ONLY THE CHECK WAIT IS UNBOUNDED HERE: the `--watch` supervision allowance is still a FINITE ${MAX_WATCH} chunk(s) (${MAX_WATCH} x ${POLL_S}s), derived by the same arithmetic from a clock that is now 0, so the floor at :391 is what it is — do not read this line as 'this lane has no bounds at all'."
 elif [ -n "$_lane_elapsed" ]; then
   _wall_left=$(( LANE_WALL_S - _lane_elapsed - _hb_margin ))
   [ "$_wall_left" -ge 0 ] || _wall_left=0
