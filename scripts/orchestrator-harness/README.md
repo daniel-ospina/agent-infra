@@ -2159,6 +2159,13 @@ of processes still ALIVE, measured `cpu_delta_cs=0` across a healthy wait). So `
 heartbeat to the lane log each poll, and **caps the wait below `IDLE_S`** when it cannot resolve a
 heartbeat target — an uncapped wait is killed as `stalled` before it can write `WAITING_CHECKS`, which is
 strictly worse than the shorter bound it replaces (#3584 review, P1).
+⛔ **THE CHECK WAIT IS THE LONG POLE AND ITS COVERAGE IS FINITE**: 5400 s covers 79.9 % of the
+measured lane-visible wait (`created_at` → `updated_at`, including the pre-start queue) and 94.3 % of
+run duration (the window holds NO successful run, so those are failing-run figures; the newest 100
+successful runs are faster, so failing runs are the binding case). One run in five therefore still
+hands off as `WAITING_CHECKS` (exit 11), and 29 of 209 exceeded this lane's whole wall clock, which no
+value of `WAIT_S` can wait out. That tail is the run queue's, not this bound's — see #3584.
+
 
 **The cap is 3 fix rounds, enforced by the tool**, not by the brief: a lane that would start round 4 is
 refused, the verdict becomes `BLOCKED_ATTEMPTS`, and a **PR comment names the exact blocker**. A lane stuck
@@ -2807,8 +2814,8 @@ stalled fleet and a human reading a report.
 **How to see why a lane died** — one line, three surfaces (the lane log, stdout, and
 `<lane log>.lanebound`):
 ```text
-[lane-bound] VERDICT verdict=stalled tag=lane-42 pid=4242 rc=143 elapsed=1204s wall_bound=7200s
-  idle_bound=1200s silent=1204s bytes=0 bytes_delta=0 cpu_cs=7 cpu_delta_cs=0 tol_cs=10
+[lane-bound] VERDICT verdict=stalled tag=lane-42 pid=4242 rc=143 elapsed=2820s wall_bound=7200s
+  idle_bound=2700s silent=2805s bytes=0 bytes_delta=0 cpu_cs=7 cpu_delta_cs=0 tol_cs=10
   cpu_unreadable=0 signal=TERM log=/home/cmux/orchestrator/logs/lane-42.log
 ```
 
@@ -2917,7 +2924,9 @@ operator who picked it got the previous attempt's verdict.
 **Two observations, and when to expect the kill.** A lane is judged on the sample interval
 `--poll`, default `min(60 s, idle/4)` — ~3 `ps` calls a minute per lane, because on this box the FLEET
 is the load. The silence limit needs **two consecutive confirming samples**, so it fires between
-`LANE_BOUND_IDLE_S` and `LANE_BOUND_IDLE_S + 2 x poll` (20–22 min at the defaults); the wall ceiling is
+`LANE_BOUND_IDLE_S` and `LANE_BOUND_IDLE_S + 2 x poll` (45–47 min at the defaults, which are 2700 s and
+60 s — ⛔ the range read "20–22 min" while this row still carried the retired 1200 s default; a derive-from-
+`LANE_BOUND_IDLE_S` range is only as good as the default it was derived from); the wall ceiling is
 exact to the sample interval it is not allowed to overrun. One sample is never enough: a single reading
 cannot tell a freeze from a missed measurement, which is the same rule §6.5.1 states for the outside
 reapers.
@@ -2939,10 +2948,14 @@ a lane a longer wall, raise the seam the CALLER owns — `LANE_BACKSTOP_S`, `LAN
 directly (its own flag/env, `mac-lane.sh`) still honours the value as given: no lease is derived there.
 
 ⛔ **STATED RESIDUAL.** A lane whose model call takes longer than the silence limit with no output and
-no tool CPU is killed as `stalled`. That is the same bound `task` applies to a sub-agent
-(`TASK_STREAM_STALL_MS` = 20 min) and the same window a human used by hand (5–15 min) — but it IS a
+no tool CPU is killed as `stalled`. That is the same KIND of bound `task` applies to a sub-agent
+(`TASK_STREAM_STALL_MS` = 20 min, a smaller one) and a longer window than a human used by hand (5–15 min)
+— but it IS a
 bound on a legitimate-but-pathological case, and the verdict line says so instead of hiding it, because
-`silent=1204s bytes=0 cpu_delta_cs=0` is exactly what a 20-minute model call looks like from outside.
+`silent=2805s bytes=0 cpu_delta_cs=0` is exactly what a 45-minute model call looks like from outside.
+(⛔ This sentence read "20-minute" while the row above still carried the retired 1200 s idle default; a
+20-minute silence is 1200 s, which is BELOW the 2700 s bound and therefore not killed at all — the
+illustration contradicted the bound it was illustrating.)
 
 ### 6.5.2 The instrument that decides must itself be bounded
 

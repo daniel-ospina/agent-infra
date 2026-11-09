@@ -1353,11 +1353,16 @@ ck "WAIT_S ($_ws) + MAX_WATCH x POLL ($_mw x $_ps) + IMPL_RESERVE ($_ir) = $(( $
 # so `INFLIGHT` never reached 0, the loop always expired into `WAITING_CHECKS`, and the file's own success
 # path ("tail in flight == 0 → launch the chain") fired zero times. A bound no completing run can reach is
 # an inert guard, and no arithmetic asserts it away.
-# The floor is MEASURED, and the window is part of it (round-2 review, P1 — verified). Completed
-# non-cancelled non-main `ci.yml` runs on daniel-ospina/agent-infra over the runs endpoint's 1000-run cap
-# as measured 2026-11-09: n=212 · min 1623 s · p50 3837 s · p90 4960 s · p95 5612 s · max 7968 s.
-# 4800 s clears the FASTEST measured day's p95 (11-09: 4565 s) and is 3.2x the bound this arm exists to
-# keep out.
+# The floor is MEASURED, and BOTH CLOCKS ARE STATED because they differ by 14.4 points at 5400 s (94.3 vs
+# 79.9; review cycle 6, P2). Completed non-cancelled non-main `ci.yml` runs on daniel-ospina/agent-infra
+# over the runs
+# endpoint's 1000-run cap as measured 2026-11-09: LANE-VISIBLE (`created_at` -> `updated_at`, which is the
+# clock a lane sits through) min 1931 s, p50 4062 s, p90 9825 s, p95 17185 s, max 32157 s;
+# RUN DURATION
+# (`run_started_at` -> `updated_at`, excluding the pre-start queue) min 1623 s, p50 3836 s, p90 4928 s,
+# p95 5612 s, max 7968 s. 4800 s sits above the fast day's run-duration p95 (4565 s) and is 3.2x the bound
+# this arm exists to keep out, and the shipped 5400 s covers 79.9 % of the lane-visible population
+# (167/209) / 94.3 % of the run-duration one (197/209) — both stated in the script.
 # ⛔ THE CLAIM IS STATED NO STRONGER THAN THE DATA SUPPORTS, TWICE OVER.
 #   (a) NOT A PERCENTAGE (review cycle 3, P2): a share of a SLIDING window rots — an earlier draft said
 #       "88.2 %" and the same query re-run hours later measured 87.7 %, because new runs push old ones out
@@ -1366,14 +1371,19 @@ ck "WAIT_S ($_ws) + MAX_WATCH x POLL ($_mw x $_ps) + IMPL_RESERVE ($_ir) = $(( $
 #       loop's deadline starts at PROCESS START — at merge-phase entry, AFTER the push. So the bound a lane
 #       must survive is `run duration - entry latency`, and 123 s of margin means a lane entering late
 #       COULD have seen `INFLIGHT == 0` inside 1500 s. What the data supports is that 1500 s sat below the
-#       fastest run and 2.5x under the median, so the success path only fired for lanes that entered
-#       late — and the deployed record shows it did not: 2 x `WAITING_CHECKS … after 1500s` (#10302,
-#       #2973) and 0 x MERGED. That empirical record is what makes 1500 s a defect rather than a tight fit.
+#       fastest run and 2.5x under the median, so the success path only fired for lanes that entered late.
+#   (c) NOT A CAUSAL CLAIM ABOUT MERGES (review cycle 5, P2): the deployed record is FOUR verdict files —
+#       2 x `WAITING_CHECKS … after 1500s` and 2 x `FIX_REQUIRED … this head's own checks are RED` — and a
+#       RED short-circuits BEFORE the `INFLIGHT` test, so those two lanes never reached the wait and their
+#       0 merges are explained by the reds, not by the bound. The supportable statement is the COST: a lane
+#       that exhausts 1500 s writes a verdict that is neither a fix order nor a merge, and `INFLIGHT` is not
+#       recorded on that path at all. Whether the bound also stopped a GREEN head is argued from the
+#       duration population, not from these four files.
 # The floor is deliberately NOT the three-day p95 (5612 s): no wait above 5460 s fits this lane's clock at
 # all (see the arithmetic ceiling in lane-merge.sh), so a floor there could never be satisfied and would
 # red on every correct tree. The residual above 5400 s is stated in the script; it is not this arm's to
 # close.
-ck "the per-round check wait ($_ws s) is not back under the measured distribution (floor 4800 s; the old 1500 s sat below the fastest measured run of 1623 s and 2.5x under the median, and the deployed record shows it produced zero merges) — a wait below it can only succeed for a lane that entered its merge phase late" \
+ck "the per-round check wait ($_ws s) is not back under the measured distribution (floor 4800 s; the old 1500 s sat below the fastest measured run of 1623 s and 2.5x under the median) — a wait below it can only succeed for a lane that entered its merge phase late" \
    $([ -n "$_ws" ] && [ "${_ws:-0}" -ge 4800 ] && echo 0 || echo 1)
 # ⛔ AND THE OTHER SIDE MUST NOT BE STARVED IN THE SAME EDIT (round-2 review, P2). The two bounds are paid
 # out of ONE clock, so raising the wait without a floor on what it leaves would trade a wait that cannot
