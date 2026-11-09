@@ -1018,8 +1018,9 @@ def _strip_comment(line):
     "declared" entry as covering its members unless the entry says otherwise.
 
     LOAD-BEARING, UNPINNED — a VALID-bash input separates the guard from its mutant (`bash -n` rc 0, and
-    `declare -F` agrees with the BASELINE and not with the mutant), NO fixture line carries that input, and
-    the mutant leaves the suite at 246/0:
+    `declare -F` agrees with the BASELINE and not with the mutant — or with the MUTANT where the guard ITSELF
+    is the false pass, which is the head-branch KEYWORD exclusion's case below and the only entry here that
+    runs in that direction), NO fixture line carries that input, and the mutant leaves the suite at 246/0:
       * `_strip_comment` quote-open, below — `echo 'a # b' ; cat <<EOF` plus a body: the mutant scans the
         body as code, a FALSE RED. Moves 0 files.
       * `_strip_comment` word set (` \t;|&(`) — `x=1;# note cat <<NOPE` loses the very next definition, a
@@ -1089,6 +1090,18 @@ def _strip_comment(line):
         ⛔ Both are measured, not estimated, and both are FALSE PASSES: a digit-named or uppercase-named
         fixture line is what would pin either, and none exists. `head`'s copies of both classes are inert on
         this population (0 files), which is why the SET is declared and not one occurrence.
+      * THE `defn`/`head` PATTERNS' WHITESPACE TOLERANCES — FIVE mutations over FOUR tolerances, every one
+        unpinned, none named until now, and every one a FALSE PASS on valid bash (suite 246/0, fixture
+        24 -> 24, 0 of the 438 files, `bash -n` rc 0, `declare -F` defines the name, the mutant loses it):
+          - the optional space BEFORE `()` (both patterns): `name () { :; }`. ⛔ This is the spelling the
+            pattern's own comment advertises as supported, and NOTHING exercises it — the fixture has
+            `name_same_line() {` and `indented_same_line() {`, never a space before the parens, and no tracked
+            `*.sh` carries it in definition position either (0 of the 7065 lines the `defn` pattern matches).
+            So it is DECLARED, not pinned, and the fixture line in that spelling is the pin — the cheapest
+            fix in this whole file.
+          - an optional space INSIDE the parens (`defn`): `name( ) { :; }`.
+          - trailing blanks before the end of the line (`head`): `name ()` + spaces, then `{ :; }` below.
+          - more than one space after `function` (`defn`): `function  name { :; }`.
       * the `function` WORD TEST (`re.match(r'function[ \t]', ...)`) — mutant it to a bare
         `startswith('function')` and the suite stays at 246/0 with 0 of the 438 files moving, but a
         valid-bash file containing `function_helper` followed by `{ :; }` is then reported as a DEFINITION
