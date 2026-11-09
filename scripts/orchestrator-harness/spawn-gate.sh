@@ -4537,6 +4537,12 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
   # Not earlier: the gates above can still refuse, and a refusal has its own record (FAILED,
   # `agent-never-started`) rather than a RUNNING record that would read EXPIRED two hours later.
   lane_registry_begin "$label" "${KIND:-lane}" "$log" "$t"
+  # ⛔ THE LANE'S WALL CLOCK STARTS HERE, AND ITS DESCENDANTS MUST BE ABLE TO READ IT (#3584 review round 2,
+  # P1). The `--wall` bound armed below is measured from THIS moment, but a merge-phase wait inside the lane
+  # only knows the TOTAL (`LANE_BACKSTOP_S`); without the epoch it cannot tell what is LEFT and waits past
+  # its own kill — the lane is TERMed mid-wait with no verdict, no hand-off and no resumable counter.
+  # Exported rather than inferred by the child: a guessed epoch is worse than an admitted unknown.
+  LANE_SPAWN_EPOCH="$(date +%s)"; export LANE_SPAWN_EPOCH
   pi -p --provider "$lane_provider" --model "$lane_model" --no-session "$(cat "$prompt")" >> "$log" 2>&1 < /dev/null &
   pid=$!
   # …and the lease starts renewing as soon as there is a pid to watch. The beat loop exits on its own
