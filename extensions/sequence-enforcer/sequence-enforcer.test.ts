@@ -858,6 +858,16 @@ await test("#1418 F1 (round 6): the rebase TARGET is bound to the ref C4 measure
       "origin//main",
       "evil",
       "main",
+      // ⛔ ROUND 10, P1 — A REF WHOSE NAME CONTAINS THE FLAG. `_REF` admits `-`,
+      // and round 6's token was built with `.replace("--autostash", "")`, which
+      // deletes the first occurrence ANYWHERE — so these normalised to
+      // `origin/main` while git resolved the literal branch. Both were ADMITTED
+      // at the previous head (measured), which is the round-6 forge back again:
+      // the branch rewrites `parallel_work_check.sh`, and a bare `git fetch` +
+      // this rebase lands it with `HEAD..origin/main == 0`.
+      "origin/main--autostash",
+      "origin/ma--autostashin",
+      "origin/--autostash",
     ]) {
       const r = validateToolCall("bash", `git rebase ${target}`, step, "gate");
       ok(r.block, `refused: git rebase ${target}`);
@@ -875,6 +885,47 @@ await test("#1418 F1 (round 6): the rebase TARGET is bound to the ref C4 measure
     ok(!isAllowedRebaseTarget("evil/main"), "a non-remote prefix is not");
     equal(CHECKER_BASE_REF, "origin/main", "the bound is the checker's own base ref");
   } finally { _setRemotesProbeForTest(null); }
+});
+
+// #1418 review round 10, P1 — THE SANITISER WAS A DELETION, NOT A PARSE.
+// `command.slice(…).replace("--autostash", "")` removes the first occurrence
+// ANYWHERE in the tail, so the token handed to the semantic bound stopped being
+// the ref git resolves. Measured at the previous head:
+//   rebaseTargetToken("git rebase origin/main--autostash")  === "origin/main"
+//   rebaseTargetToken("git rebase origin/ma--autostashin")  === "origin/main"
+// while git resolved `origin/main--autostash` / `origin/ma--autostashin`. The
+// token is now the REGEX CAPTURE GROUP — the ref the pattern actually matched —
+// so no substring surgery can rewrite what the bound judges.
+await test("#1418 P1 (round 10): the rebase target is the CAPTURED ref, never a string with the flag deleted", () => {
+  // the extractor is exact
+  equal(rebaseTargetToken("git rebase origin/main"), "origin/main");
+  equal(rebaseTargetToken("git rebase --autostash origin/main"), "origin/main");
+  equal(rebaseTargetToken("git rebase --autostash  origin/main"), "origin/main", "the doubled space after the flag does not shift the capture");
+  equal(rebaseTargetToken("git  rebase origin/main"), "origin/main", "a doubled space after the verb does not shift it either");
+  equal(rebaseTargetToken("git rebase origin/main--autostash"), "origin/main--autostash", "a ref NAMED like the flag keeps its name");
+  equal(rebaseTargetToken("git rebase --autostash origin/main--autostash"), "origin/main--autostash", "…and the flag is only stripped where it IS the flag");
+  equal(rebaseTargetToken("git rebase origin/ma--autostashin"), "origin/ma--autostashin", "…including mid-name");
+  equal(rebaseTargetToken("git rebase --continue"), null, "a continuation verb has no target");
+  equal(rebaseTargetToken("git rebase --exec id origin/main"), null, "an arbitrary-code flag is not a target");
+  // ⛔ AND THE BOUND, NOT JUST THE PARSER: these are the spellings that scored
+  // `origin/main` at the previous head. The token must be REFUSED both by the
+  // class and by the semantic bound.
+  _setTokenFileForTest(null);
+  _setRemotesProbeForTest(() => REMOTES);
+  const step = makeStep({ name: "check", gate: "checkpoint", token_phase: "implement" });
+  try {
+    for (const cmd of [
+      "git rebase origin/main--autostash",
+      "git rebase origin/ma--autostashin",
+      "git rebase --autostash origin/main--autostash",
+      "git rebase --autostash origin/ma--autostashin",
+    ]) {
+      const r = validateToolCall("bash", cmd, step, "gate");
+      ok(r.block, `refused at the gate: ${cmd} (token was the real ref, not origin/main)`);
+    }
+    ok(!isAllowedRebaseTarget("origin/main--autostash"), "the semantic bound agrees");
+    ok(!isAllowedRebaseTarget("origin/ma--autostashin"), "…and for the mid-name spelling");
+  } finally { _setRemotesProbeForTest(null); _setTokenFileForTest(null); }
 });
 
 // #1418 review round 7, F1 — THE LANDING CHAIN. `git add` was unbounded and the
@@ -1014,7 +1065,13 @@ await test("#1418 F2 (round 3): mid-rebase writes are REFUSED for every non-conf
       ["the checker that mints the token", "scripts/parallel_work_check.py"],
       ["the checker wrapper", "scripts/parallel_work_check.sh"],
       ["the skill-enforcer manifest", "enforcement/dangerous-ops.txt"],
-      ["the sequence-enforcer itself", "extensions/sequence-enforcer/index.ts"],
+      // ⛔ LABEL CORRECTED (review round 10, P3): this path is refused by the
+      // UNMERGED-SET bound (the probe above names only `src/conflicted.ts`), NOT
+      // by identity — the identity list protects the artefacts that MINT the
+      // token and the manifest, and deliberately does not protect this file,
+      // because a lane rebasing onto a moving main hits a conflict in it
+      // routinely and must be able to resolve it. Declared, not implied.
+      ["the sequence-enforcer itself (refused by the UNMERGED set, not identity)", "extensions/sequence-enforcer/index.ts"],
       ["the operator force-pass file", "/tmp/parallel-check-force.json"],
       ["an absolute path outside the worktree", "/etc/passwd"],
       ["a traversal escape", "../../etc/passwd"],

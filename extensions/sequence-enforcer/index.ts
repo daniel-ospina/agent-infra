@@ -1435,14 +1435,27 @@ export function rebaseFetchTarget(command: unknown): string | null {
 // bounded the wrong half — `git rebase origin/<any-branch>` re-opened the same
 // forge. The target must be a remote-tracking ref of a configured remote ON THAT
 // REMOTE'S DEFAULT BRANCH, i.e. the ref C4 measures.
+// #1418 (review round 10, P1): THE TOKEN IS CAPTURED, NEVER RECONSTRUCTED BY
+// STRING SURGERY. Round 6's sanitiser was
+//   command.slice(i + "rebase".length).replace("--autostash", "").trim()
+// and `.replace` deletes the FIRST occurrence ANYWHERE in the string — it is not
+// anchored to the flag position. `_REF` admits `-`, so a BRANCH NAME may contain
+// `--autostash`, and the token handed to `isAllowedRebaseTarget` then stopped
+// being the ref git resolves. Measured: `git rebase origin/ma--autostashin`
+// tokenised to `origin/main` and was ADMITTED, while git resolved
+// `origin/ma--autostashin`. End-to-end in a real repo: an agent pushes a branch
+// that rewrites `scripts/parallel_work_check.sh`, a bare admitted `git fetch`
+// makes it visible, the admitted rebase lands the rewritten grader and leaves
+// `HEAD..origin/main == 0` so C4 reads not-behind — the round-6 forge, restored
+// through the sanitiser. The capture group is the ref the regex matched, which is
+// the only thing the semantic bound may judge.
 export const CHECKPOINT_REMEDY_REBASE_RE = new RegExp(
-  `^git[ ]+rebase[ ]+(?:--autostash[ ]+)?${_REF}$`,
+  `^git[ ]+rebase[ ]+(?:--autostash[ ]+)?(${_REF})$`,
 );
 export function rebaseTargetToken(command: unknown): string | null {
   if (typeof command !== "string") return null;
-  if (!CHECKPOINT_REMEDY_REBASE_RE.test(command)) return null;
-  const i = command.indexOf("rebase");
-  return command.slice(i + "rebase".length).replace("--autostash", "").trim();
+  const m = CHECKPOINT_REMEDY_REBASE_RE.exec(command);
+  return m && m[1] !== undefined ? m[1] : null;
 }
 
 // A ref whose resolution is a PATH rather than a ref is not a ref. `..` is the
