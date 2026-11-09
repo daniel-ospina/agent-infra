@@ -646,11 +646,22 @@ assert_not_contains "$(calls)" "bootstrap" "nothing was bootstrapped over the fo
 # box (measured: 102). That is worse than the unscoped line it replaced, and nothing asserted the form.
 assert_contains "$out" 'pkill -f "[b]ash'  "the printed remedy keeps the QUOTED scoped pattern"
 assert_not_contains "$out" "pkill -f [b]ash" "…and never prints the bare ERE that matches every shell"
+# ⛔ THE SAME CLASS, ONE SENTENCE LATER (fresh review of agent-infra#1985, P2): `lc_err` builds its
+# argument with `printf '%s\n' "$*"`, so a BACKTICKED snippet inside the double-quoted message is
+# COMMAND-SUBSTITUTED while the argument is built, not printed. The recycled-pid remedy read
+# `check \`ps -o command= -p $lock\``, so the operator was told to run a command whose text had
+# already been executed and discarded — worst exactly in the case the sentence exists for (a dead pid,
+# where `ps` prints nothing and the message rendered `check )`). Off-`macOS` this arm still runs: the
+# refusal path is pure string building. Both start paths must keep the LITERAL command.
+assert_contains "$out" '`ps -o command= -p' "the recycled-pid remedy survives as a LITERAL command, not a substitution"
+assert_not_contains "$out" "RECYCLED pid — check )" "…and never renders the emptied 'check )' form"
 # the same message is reachable from lc_ensure (the other start path)
 fresh
 printf '%s\n' "$$" > "$T/o/.orch.lock"
 out="$( . "$LIB"; lc_ensure "$LABEL" "$T/o/x.plist" "$T/o" 1 2 2>&1 )"; rc=$?
 assert_contains "$out" 'pkill -f "[b]ash'  "the lc_ensure refusal keeps the quoted scoped pattern too"
+assert_contains "$out" '`ps -o command= -p' "…and its recycled-pid remedy is a LITERAL command too"
+assert_not_contains "$out" "RECYCLED pid — check )" "…not the emptied 'check )' form"
 rm -f "$T/o/.orch.lock"
 
 echo "-- D5. the staleness bound tracks the CELL's cycle, not a constant"

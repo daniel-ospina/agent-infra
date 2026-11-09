@@ -2221,12 +2221,15 @@ if ! acq; then
   if [ "$_OV" = 2 ]; then
     _MSG="[orch-loop] CANNOT-TELL: lock $LOCKF names pid ${OPID:-none} and ${ORCH_LOCK_WHY:-the owner cannot be identified}, so a RECYCLED pid cannot be ruled out — a second controller is refused (agent-infra#1715). If no controller is running: rm -f $LOCKF (agent-infra#1985)"
     echo "$_MSG" >&2
-    echo "[lock] CANNOT-TELL — $_MSG" >> "$LOG" 2>/dev/null || true
+    # ⛔ `${LOG:-/dev/null}`, NOT `$LOG`: this block is EXTRACTED and driven by consumers that supply
+    # only `O` (`selftest.sh` §20 runs it under `set -u`), where an unbound `$LOG` ABORTS the shell
+    # before the reclaim — a red shard AND a vacuously green refusal arm (fresh review of #1985, P2).
+    echo "[lock] CANNOT-TELL — $_MSG" >> "${LOG:-/dev/null}" 2>/dev/null || true
     exit 0
   fi
   # Positive evidence only: absent, not an orch-loop.sh, or provably begun AFTER the lock. Logged,
   # because a silent reclaim is the other half of the #1715 class (it must never be invisible).
-  echo "[lock] reclaiming $LOCKF — pid ${OPID:-none} is provably NOT the owner (absent, not an orch-loop.sh invocation, or begun after the lock was written)" >> "$LOG" 2>/dev/null || true
+  echo "[lock] reclaiming $LOCKF — pid ${OPID:-none} is provably NOT the owner (absent, not an orch-loop.sh invocation, or begun after the lock was written)" >> "${LOG:-/dev/null}" 2>/dev/null || true
   rm -f "$LOCKF"
   acq || { echo "[orch-loop] lock race — exiting"; exit 0; }
 fi
