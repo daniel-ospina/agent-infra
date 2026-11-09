@@ -70,7 +70,7 @@ fi
 if [ -n "$CELL_HOME_LIB" ]; then . "$CELL_HOME_LIB"; CELL_HOME="$(cell_home_resolve)"; else CELL_HOME="${CELL_HOME:-${HOME:-}}"; fi
 # ⛔ AN EMPTY CELL_HOME IS NOT A HOME — it is the FILESYSTEM ROOT (`O=/orchestrator`,
 # `SCRIPTS=/.pi/agent/scripts`, a layer installed at `/.pi/agent`). A missing resolver is the
-# incomplete-install case the resolver's header names, so it is the SAME refusal the five sibling
+# incomplete-install case the resolver's header names, so it is the SAME refusal the sibling
 # consumers already make (exit 78, EX_CONFIG) instead of a silent walk to `/`.
 [ -n "$CELL_HOME" ] || { printf '%s: FATAL: %s is not readable and neither CELL_HOME nor HOME is set — refusing to default the cell home (agent-infra#3453)\n' "${0##*/}" "${CELL_HOME_LIB:-lib/cell-home.sh}" >&2; exit 78; }
 # ⛔ DEFINED HERE, NOT ONLY INTERPOLATED (fresh-context review of #3833, F1 — measured). `require_repo`'s
@@ -79,9 +79,17 @@ if [ -n "$CELL_HOME_LIB" ]; then . "$CELL_HOME_LIB"; CELL_HOME="$(cell_home_reso
 # and rc 1 — on the exact case #1974 indicator (a) names (a box with REPO unset), instead of the
 # rc 3 cannot-verify and the one actionable line. It stayed invisible on a cell because the supervisor
 # passes ENV_FILE explicitly, and on a developer box because the variable was ambient in every shell.
-# The same default as the six siblings that own this variable (cloud-cell-supervisor.sh:150,
-# cloud-cell-bringup.sh:78, cloud-cell-quiesce.sh:24, pr-repair-loop.sh:154,
-# install-controller-service.sh:146, install-repair-service.sh:89).
+# The same default as the sibling consumers that spell it this way (cloud-cell-supervisor.sh,
+# cloud-cell-bringup.sh, cloud-cell-quiesce.sh, pr-repair-loop.sh,
+# install-controller-service.sh, install-repair-service.sh, orchestrator-bringup.sh).
+# ⛔ NAME THE CLASS, NEVER THE TALLY (review cycle-9 #1): this line said "the six siblings" and the list
+# beside it named six while a SEVENTH (`orchestrator-bringup.sh`) carried the same default — the count
+# was wrong as it was written, and the list is named instead of a number. ⛔ AND IT IS THE `${ENV_FILE:-…}`
+# SPELLING, NOT THE WHOLE POPULATION (review cycle-10 #6): `scripts/harness-up` (no `.sh` — that is the
+# file's name) reaches the same value
+# on a cell through a condition rather than this expansion, so the sentence is scoped to the spelling it
+# lists. A reader who needs the population must grep — a list presented as the population is the same
+# over-claim in list form.
 ENV_FILE="${ENV_FILE:-$CELL_HOME/keys.env}"
 O="${O:-$CELL_HOME/orchestrator}"
 # ⛔ REPO HAS NO PATH DEFAULT (agent-infra#1974). This line used to read `REPO="${REPO:-/tmp/cell}"`

@@ -107,12 +107,29 @@ if [ "$MODE" = "--help" ]; then sed -n '2,12p' "${BASH_SOURCE[0]:-$0}" | sed 's/
 HOME_DURABLE_GIVEN=0
 [ -n "${CELL_HOME:-}" ] && HOME_DURABLE_GIVEN=1
 HOME_DURABLE="$(cell_home_resolve)"
+# ⛔ NORMALISED HERE, ONCE (review cycle-5 #2, measured). `cell_home_resolve` step 1 returns an explicit
+# `CELL_HOME` VERBATIM and does not second-guess an operator, so `CELL_HOME=/home/cmux/` produced
+# `HOME_DURABLE=/home/cmux/` — and this value is CONCATENATED (`.config/systemd/user`, and the projector's
+# `$home$rest`), so `--apply` wrote `Environment=HOME=/home/cmux//x` into unit files, and the user-unit
+# population listed one directory twice under two spellings (the `awk` dedupe cannot collapse two
+# different strings). One strip here fixes every consumer; `/` itself must survive as `/`, never as "".
+HOME_DURABLE="${HOME_DURABLE%/}"; [ -n "$HOME_DURABLE" ] || HOME_DURABLE=/
 HOME_LEGACY="$CELL_HOME_LEGACY"
 INVOKER_UID="$(id -u 2>/dev/null || printf '1')"
 INVOKER="$(id -un 2>/dev/null || printf '?')"
 
 # The unit directories, in the order the installers try them — the same read-side seams the bring-up
 # and the supervisor use, so "which units this tool grades" cannot drift from "which units exist".
+# ⛔ THE USER DIR COMES FROM THE HOME THIS TOOL ACTED ON, NOT FROM THE INVOKING SHELL'S `$HOME`
+# (review F1, reproduced). It used to be `${HOME:+$HOME/.config/systemd/user}`, and NOTHING in this
+# tool ever consulted `$HOME_DURABLE` — so the population was whatever the invoker's `$HOME` made it.
+# Measured: ONE byte-identical legacy-naming unit under `$HOME_DURABLE/.config/systemd/user` answered
+# `RC=0 VERDICT: one home` when the invoking `HOME` was elsewhere, and `RC=1 drift` when it was not.
+# The two channels that reach this are the ones this project names itself — `cmux vm exec`
+# (`HOME=/home/ubuntu`) and this tool's own printed root remedy — and the dir is real:
+# `install-harness-apply-timer.sh` writes `UNIT_DIR="$HOME/.config/systemd/user"`.
+# ⛔ AND `$HOME`'s DIR IS KEPT AS AN ADDITIONAL CANDIDATE when it differs: a unit really can live
+# there, and this tool grades what systemd loads.
 unit_dirs() {
   if [ -n "${CELL_HOME_MIGRATE_UNIT_DIRS:-}" ]; then
     printf '%s' "$CELL_HOME_MIGRATE_UNIT_DIRS" | tr ':' '\n'
@@ -123,10 +140,37 @@ unit_dirs() {
   # form yields the ABSOLUTE `/.config/systemd/user`, a directory nobody has, which then enters the
   # population walk as if an installer had chosen it. `:+` yields the empty string and the `[ -n "$d" ]`
   # filter below drops it — the same spelling `reap-abandoned-worktrees.sh` already uses for this hazard.
-  for d in "${SYSTEMD_UNIT_DIR:-}" "${CONTROLLER_SYSTEM_UNIT_DIR:-/etc/systemd/system}" \
-           "${CONTROLLER_USER_UNIT_DIR:-${HOME:+$HOME/.config/systemd/user}}"; do
-    [ -n "$d" ] && printf '%s\n' "${d%/}"
-  done | awk 'NF && !s[$0]++'
+  {
+    for d in "${SYSTEMD_UNIT_DIR:-}" "${CONTROLLER_SYSTEM_UNIT_DIR:-/etc/systemd/system}"; do
+      [ -n "$d" ] && printf '%s\n' "${d%/}"
+    done
+    if [ -n "${CONTROLLER_USER_UNIT_DIR:-}" ]; then
+      printf '%s\n' "${CONTROLLER_USER_UNIT_DIR%/}"
+    else
+      [ -n "${HOME_DURABLE:-}" ] && printf '%s\n' "$HOME_DURABLE/.config/systemd/user"
+      # ⛔ THE COMPARISON NO LONGER NEEDS `${HOME_DURABLE%/}` HERE: `HOME_DURABLE` is normalised once at
+      # the top of the script (review cycle-5 #2). This line was ALSO the precedent the harness pass cites
+      # as "the sibling tool already normalises", which was half true — it stripped `HOME` only.
+      [ -n "${HOME:-}" ] && [ "${HOME%/}" != "$HOME_DURABLE" ] && printf '%s\n' "${HOME%/}/.config/systemd/user"
+    fi
+  } | awk 'NF && !s[$0]++'
+}
+
+# walkable_dir <dir> — 0 WALK IT, 1 ABSENT (a measurable reading: nothing was installed here),
+# 3 CANNOT MEASURE. ⛔ `[ -d "$d" ] || continue` READ AS "ABSENT" FOR "I WAS NOT ALLOWED TO LOOK" (review
+# F1): an ancestor that exists and denies this account search makes `-d` answer false, so the dir left
+# the population with no record at all and the box read "clear of the legacy home". That is the same
+# false PASS the file's `probe_open` / `cannot_traverse` pair removes one level down, applied to the DIR
+# — and it matters most for the durable home's user-unit dir, which is the population review F1 is about.
+walkable_dir() {
+  local d="${1:-}"
+  [ -n "$d" ] || return 1
+  if [ -d "$d" ]; then
+    [ -x "$d" ] && return 0
+    return 3
+  fi
+  cannot_traverse "$d" && return 3
+  return 1
 }
 
 # ── CREDENTIALS ────────────────────────────────────────────────────────────────────────────────
@@ -535,7 +579,13 @@ is_comment() {
   return 1
 }
 
-# paths_in <line> — every absolute path token in a directive line, as "<need>\t<path>".
+# paths_in <line> <directive> — every absolute path token in a directive line, as
+# "<need>\t<path>", where need is 1 (must exist), 2 (its PARENT must exist) or 3 (may be absent — the
+# unit's own `-` prefix said so). ⛔ BOTH CALL SITES PASS THE DIRECTIVE, and they must: the EXISTENCE grade
+# depends on it (`-` and `Standard*=` differ per directive), while the membership question ("was this
+# token already on the line") ignores it for everything but completeness. Omitting it is not a supported
+# shape — a tokens-only call grades every token as mandatory, so restoring that form would silently
+# re-break the optional-target arms.
 # ⛔ THE SEPARATOR SET IS THE PROJECTOR'S TOKEN-START SET (review F2 round 5): `=`, whitespace, quotes,
 # `,`, `;`, `:` and the shell metacharacters `>`, `<`, `|`, `&`, `(`. A `:` matters because
 # `Environment=PATH=/a/bin:/usr/bin` is a PATH LIST (measured: a `:`-less split produced one token that
@@ -546,7 +596,7 @@ is_comment() {
 # exist is its PARENT DIRECTORY (`need=2`), not the file. Requiring the file refused every real redirect;
 # requiring nothing would write a unit that cannot start. A `|` / `(` target IS a command (`need=1`).
 paths_in() {
-  printf '%s' "$1" | awk '
+  printf '%s' "$1" | awk -v dir="${2:-}" '
     BEGIN { seps = " \t\"\047;,=:|&<>()" }
     {
       line = $0; cur = ""; prev = ""
@@ -559,13 +609,65 @@ paths_in() {
       }
       if (cur != "") emit(prev, cur)
     }
-    function emit(sep, tok,   need) {
+    function emit(sep, tok,   need, dash) {
+      # ⛔ A systemd EXEC PREFIX RUN BELONGS TO THE TOKEN (review P1, reproduced). `systemd.service(5)`
+      # Table 2: `@`, `-`, `:`, `+`, `!` (and `!!`) may prefix an executable path, and `-` is also a
+      # documented per-item prefix for `WorkingDirectory=`, `EnvironmentFile=` and `ReadWritePaths=`.
+      # The PROJECTOR moves a prefixed path (lib `cell_home_project_line` strips the run before its
+      # token-start test), so a prefixed token DROPPED here is repointed without its durable counterpart
+      # ever being graded: `--apply` wrote `ExecStart=+<durable>/run.sh` for a missing target, printed
+      # `VERDICT: one home — nothing to do` and exited 0 — and that 0 is the stated RECLAIM precondition.
+      # The identical line WITHOUT the prefix was correctly refused, so the hole was the prefix only.
+      # ⛔ BUT `-` IS NOT DECORATION, AND STRIPPING IT IS NOT THE SAME AS GRADING IT AS MANDATORY
+      # (review P1-1, reproduced). On `EnvironmentFile=`, `ReadWritePaths=`/`ReadOnlyPaths=`,
+      # `WorkingDirectory=` a leading `-` means "ignore if it does not exist" (`systemd.exec(5)`, the
+      # per-item prefix clause), so a rewrite that leaves such a target absent produces a unit that
+      # STARTS — and the repair of the strip above refused every one of them. The refusal then makes the
+      # file un-repointable, so `--check` can never reach 0: the RECLAIM precondition becomes permanently
+      # unreachable for a unit that is fine. On `ExecStart*` the same `-` means only "this exit status is
+      # not fatal" and the binary MUST exist, so a blanket exemption would be wrong in the other
+      # direction — hence the directive is consulted. need=3 is that third state.
+      # ⛔ THE FAMILY IS THE DIRECTIVES THIS TOOL ACTUALLY GRADES **AND** THAT DOCUMENT `-` FOR A PATH
+      # (review A/B on the cycle-2 head, measured with `systemd-analyze verify`). The first cut listed
+      # `RootDirectory=`/`RootImage=` — systemd does NOT document a `-` prefix for them, and an absolute
+      # `RootDirectory=-/x` is a FATAL configuration error ("path is not absolute", unit will not start),
+      # so exempting them let the tool write exactly the unrunnable unit rule 4 forbids and still exit 0.
+      # It also listed `BindPaths=`/`BindReadOnlyPaths=`/`BindDirectories=`, which are absent from
+      # `UNIT_DIRECTIVES` (and `BindDirectories=` is not a systemd directive at all), so they could never
+      # reach this test: the claim was unreachable coverage, which reads as protection that does not exist.
+      dash = 0
+      while (substr(tok, 1, 1) ~ /[-+!@]/) {
+        if (substr(tok, 1, 1) == "-") dash = 1
+        tok = substr(tok, 2)
+      }
       if (substr(tok, 1, 1) != "/") return
       if (sep == ">" || sep == "<") need = 2
       else need = 1
-      if (!seen[tok]++) printf "%d\t%s\n", need, tok
-    }'
+      if (dash && dir ~ /^(EnvironmentFile|WorkingDirectory|ReadWritePaths|ReadOnlyPaths)$/) need = 3
+      # ⛔ `StandardOutput=`/`StandardError=` NAMED FILES ARE CREATED BY SYSTEMD (review P2, measured):
+      # `file:`/`append:`/`truncate:` open-or-create, so the FILE need not exist while its PARENT must —
+      # refusing on the file was the same false block, one directive family over. (`StandardInput=` is not
+      # in `UNIT_DIRECTIVES`, so it cannot reach here and is deliberately not listed.)
+      if (dir ~ /^(StandardOutput|StandardError)$/) need = 2
+      # ⛔ THE STRICTEST GRADE PER TOKEN WINS, NOT THE FIRST (review cycle-9 #5, measured). The dedupe used
+      # to be first-mention-wins, which was harmless while a token had one spelling. Stripping the exec
+      # prefix ended that: `ReadWritePaths=-/x /x` now reaches here as the SAME token twice — once as an
+      # optional (`need=3`) and once as a mandatory (`need=1`) path — and first-mention-wins graded it
+      # OPTIONAL, so a rewrite could leave a path absent that the unit also names mandatorily. That is a
+      # fail-open on the rule-4/`--check`->0 surface this tool exists to protect. `needmin` keeps the
+      # smallest number (1 = must exist is the strictest) for a token seen more than once; the emission
+      # order stays first-mention, so callers see the same sequence.
+      if (!(tok in needmin)) { order[++n] = tok; needmin[tok] = need }
+      else if (need < needmin[tok]) needmin[tok] = need
+    }
+    END { for (i = 1; i <= n; i++) printf "%d\t%s\n", needmin[order[i]], order[i] }
+    '
 }
+
+# ⛔ `paths_in` NEEDS THE DIRECTIVE, NOT JUST THE LINE: the `-` and `Standard*` rules above are
+# directive-specific, and a token alone cannot carry that fact. ⛔ BOTH CALL SITES PASS IT (`orig_paths`
+# and the projected grade); there is no tokens-only caller, and adding one would silently grade every
+# token as mandatory — re-breaking the optional-target arms. See the contract in `paths_in`'s own header.
 
 # unit_scan <file> — one record per DIRECTIVE line that carries the legacy home:
 #   "<lineno>\t<directive>\t<projected-line>\t<missing-targets>"
@@ -636,7 +738,7 @@ trim_tail() {
 }
 
 unit_scan() {
-  local f="$1" n=0 line stripped dir projected miss p cont=""
+  local f="$1" n=0 line stripped dir projected miss p q _need grade orig_paths cont=""
   # ⛔ A FILE THAT CANNOT BE OPENED HAS NO RECORD ONLY IF YOU LET THE REDIRECT FAIL SILENTLY. `done < "$f"`
   # produced zero records for an unreadable unit, which the verdict then read as "clear of the legacy
   # home" (review F1). The open is attempted here, so the caller gets a NAMED CANNOT-MEASURE record.
@@ -694,17 +796,48 @@ unit_scan() {
     fi
     case "$stripped" in *\\ ) cont="$dir" ;; *) cont="" ;; esac
     miss=""
-    while IFS='	' read -r _need p; do
-      [ -n "$p" ] || continue
-      case "$p" in *'$'*|*'{'*|*'%'*) continue ;; esac   # systemd specifiers are not resolved here
-      case "$p" in "$HOME_DURABLE"|"$HOME_DURABLE"/*) ;; *) continue ;; esac   # only what WE introduce
-      case "$_need" in
-        2) [ -d "$(dirname "$p")" ] || miss="$miss $p" ;;   # a redirect target: its DIRECTORY must exist
-        *) [ -e "$p" ] || miss="$miss $p" ;;                # a command/binary/path: it must exist
-      esac
-    done <<EOF
-$(paths_in "$projected")
+    # ⛔ ONLY THE PATHS THE REWRITE INTRODUCES, AND NOT THE ONES systemd MANAGES OR IGNORES (review F2,
+    # reproduced).
+    # The guard filtered by LOCATION — any token under `$HOME_DURABLE` on the projected line — which is
+    # not the same question as "the REWRITE introduced this token". Two ordinary shapes were therefore
+    # refused with a false `203/EXEC` diagnosis:
+    #   * `StateDirectory=<legacy>/state` — these directives name SUBVOLUMES systemd manages, and the unit
+    #     is not made unrunnable by the path being absent. ⛔ THE REASON IS `systemd-analyze verify`, NOT
+    #     "systemd creates it": the man page requires the names to be RELATIVE, an absolute value is
+    #     *IGNORED* ("StateDirectory= path is absolute, ignoring"), and an operator's absolute form is
+    #     exactly what this tool sees. Either way the unit starts, so neither shape may refuse;
+    #     `CacheDirectory=`/`LogsDirectory=`/`RuntimeDirectory=` follow the same rule.
+    #   * `Environment=PATH=<legacy>/bin:/usr/bin` — a variable VALUE list; systemd does not require its
+    #     entries to exist, and `Environment=` carries no payload the service opens.
+    # A refused file never repoints, so `--check` could never reach 0 on that box: the RECLAIM
+    # precondition became PERMANENTLY UNREACHABLE, with a remedy built on a wrong diagnosis. This is the
+    # scope the note above `unit_scan` already claimed ("grades the paths the rewrite introduces — not
+    # paths that were already in the unit, unrelated and untouched") and the code did not implement.
+    case "$dir" in
+      StateDirectory|CacheDirectory|LogsDirectory|RuntimeDirectory) grade=0 ;;
+      Environment) grade=0 ;;
+      *) grade=1 ;;
+    esac
+    if [ "$grade" = 1 ]; then
+      # the tokens this line ALREADY carried: a projected token is "introduced" only when its legacy
+      # counterpart is one of them, and not when the line already named it under the durable home.
+      orig_paths="$(paths_in "$line" "$dir" | awk -F'\t' '{print $2}')"
+      while IFS='	' read -r _need p; do
+        [ -n "$p" ] || continue
+        case "$p" in *'$'*|*'{'*|*'%'*) continue ;; esac   # systemd specifiers are not resolved here
+        case "$p" in "$HOME_DURABLE"|"$HOME_DURABLE"/*) ;; *) continue ;; esac   # only the durable home
+        q="$HOME_LEGACY${p#"$HOME_DURABLE"}"
+        case $'\n'"$orig_paths"$'\n' in *$'\n'"$q"$'\n'*) ;; *) continue ;; esac   # not a legacy token here
+        case $'\n'"$orig_paths"$'\n' in *$'\n'"$p"$'\n'*) continue ;; esac              # already there: not introduced
+        case "$_need" in
+          2) [ -d "$(dirname "$p")" ] || miss="$miss $p" ;;   # a redirect target: its DIRECTORY must exist
+          3) ;;                                                # `-`: the unit itself says "ignore if missing"
+          *) [ -e "$p" ] || miss="$miss $p" ;;                # a command/binary/path: it must exist
+        esac
+      done <<EOF
+$(paths_in "$projected" "$dir")
 EOF
+    fi
     # ⛔ THREE FIELDS, NO RAW LINE (review F2): `n`, the DIRECTIVE NAME, and the MISS list. The line itself
     # is re-read from the file by number wherever a message needs it, so a TAB in a unit can never move a
     # field — and a "missing durable counterpart" can never be fabricated from a line's tail.
@@ -782,9 +915,15 @@ EOF
 
 # unit_scan_all — every unit/drop-in under the declared dirs, one "<file>\t<record…>" line per hit.
 unit_scan_all() {
-  local dir f hit st
+  local dir f hit st wst
   while IFS= read -r dir; do
-    [ -n "$dir" ] && [ -d "$dir" ] || continue
+    walkable_dir "$dir"; wst=$?
+    case "$wst" in
+      0) ;;
+      3) printf '%s\t0\tUNMEASURABLE\t%s\n' "$dir" "$(_notab "$dir: this account cannot tell 'no unit here' from 'could not look' — an ancestor denies search, so 'no unit here names the legacy home' is not a reading this tool took")"
+         continue ;;
+      *) continue ;;
+    esac
     unit_files "$dir"
     if [ -n "$UNIT_FIND_ERR" ]; then
       printf '%s\t0\tUNMEASURABLE\t%s\n' "$dir" "$(_notab "$dir: part of this population cannot be walked by $INVOKER ($(printf '%s' "$UNIT_FIND_ERR" | tr '\n' ' ')), so 'no unit here names the legacy home' is not a reading this tool took")"
@@ -914,9 +1053,18 @@ check_units() {
 # The rewrite. One file at a time, atomically, with a one-time backup that preserves the mode.
 # Writes ONLY the projected lines of directives whose every projected path exists.
 migrate_units() {
-  local dir f n directive projected miss rec rc=0 applied=0 refused=0 cant=0 backup tmpdir
+  local dir f n directive projected miss rec rc=0 applied=0 refused=0 cant=0 backup tmpdir wst
   while IFS= read -r dir; do
-    [ -n "$dir" ] && [ -d "$dir" ] || continue
+    # ⛔ A DIR THIS ACCOUNT CANNOT SEARCH IS NOT AN EMPTY POPULATION (review F1) — `[ -d ]` answers false
+    # both for "nothing was installed here" and for "an ancestor denies me search", and the second one
+    # used to leave the writer with nothing to repoint and nothing to report.
+    walkable_dir "$dir"; wst=$?
+    case "$wst" in
+      0) ;;
+      3) warn_line "  CANNOT MEASURE: $dir — this account cannot tell 'nothing to repoint here' from 'could not look' (an ancestor denies search), so nothing under it was repointed or ruled out"
+         cant=1; continue ;;
+      *) continue ;;
+    esac
     # ⛔ THE WRITER WALKS THE SAME POPULATION THE CHECK DOES (review F1): a dir find cannot traverse
     # contributes no file, so "nothing to repoint here" would be a reading this tool never took — and
     # the box would read converged on the very half that was skipped.
@@ -1066,7 +1214,8 @@ unit_users() {
   # answers (bar a root invoker and a home that does not exist), and `main` runs the CREDENTIAL half first
   # — so `--apply` copied `keys.env` / `.pi/agent/auth.json` into a third home, printed `VERDICT: one
   # home` and exited 0, and a follow-up `--check` then also read 0 because the durable side now held the
-  # copies. That 0 is the stated precondition for RECLAIMING `/tmp/cell-home` (`:44-49`, `:899`): the tool
+  # copies. That 0 is the stated precondition for RECLAIMING `/tmp/cell-home` (see the EXIT CODES table at
+  # the top of this file and `check_derivation`'s converged verdict): the tool
   # could move the only copy of the cell's credentials into an account the units do not run as and then
   # authorise deleting the source. Reachable whenever the invoking account is not the units' account and
   # its passwd home EXISTS (`cmux` units repaired from an `ubuntu` operator path, a CI/runner account).
@@ -1124,11 +1273,11 @@ account_home() {
 
 # check_derivation — 0 when HOME_DURABLE may be acted on; 1 with the reason on stderr when it may not.
 check_derivation() {
-  local u h conflicts="" d f
+  local u h conflicts="" d f wst
   [ "$HOME_DURABLE_GIVEN" = 0 ] || return 0        # an explicit CELL_HOME is the operator's decision
   # (i) a PRIVILEGED invoker: the resolver answers root's passwd home, which is not a cell home at all.
   if [ "$INVOKER_UID" = 0 ]; then
-    warn_line "  REFUSED: refusing to DERIVE the durable home from a privileged invoking account ($INVOKER -> $HOME_DURABLE). The units run as the cell account, not as root, so this would repoint them (and their credentials) into $HOME_DURABLE. Name the home explicitly: sudo -n env CELL_HOME=/home/cmux bash $0 --apply"
+    warn_line "  REFUSED: refusing to DERIVE the durable home from a privileged invoking account ($INVOKER -> $HOME_DURABLE). The units run as the cell account, not as root, so this would repoint them (and their credentials) into $HOME_DURABLE. Name the home explicitly: sudo -n env CELL_HOME=$CELL_HOME_FLEET_DEFAULT bash $0 --apply"
     return 1
   fi
   # (0) ⛔ THE POPULATION MUST BE MEASURABLE BEFORE "NO CONFLICTING User=" CAN BE AN ANSWER (review F3).
@@ -1144,7 +1293,17 @@ check_derivation() {
   # proved measurable — one walk, one population, no second source of truth to drift.
   GRADED_FILES=""
   while IFS= read -r d; do
-    [ -n "$d" ] && [ -d "$d" ] || continue
+    # ⛔ THE SAME THREE-VALUED DIR READ THE OTHER TWO WALKERS USE (review F1): a dir this account cannot
+    # search answered `[ -d ]` false, left the population empty, and `unit_users`'s empty `User=` list was
+    # then read as "the units declare no other account" — an ACCEPTED derivation on a population this
+    # tool never saw. Refusing before any write is the posture leg (0) already takes for a find error.
+    walkable_dir "$d"; wst=$?
+    case "$wst" in
+      0) ;;
+      3) warn_line "  REFUSED: $d — this account cannot tell 'no unit here' from 'could not look' (an ancestor denies search), so 'the units declare no other account' is not a reading this tool took. Refusing BEFORE any write; name the home explicitly: CELL_HOME=<the units account's home> $0 $MODE"
+         return 1 ;;
+      *) continue ;;
+    esac
     unit_files "$d"
     if [ -n "$UNIT_FIND_ERR" ]; then
       warn_line "  REFUSED: $d — part of this population cannot be walked by $INVOKER ($(printf '%s' "$UNIT_FIND_ERR" | tr '\n' ' ')), so 'the units declare no other account' is not a reading this tool took. Refusing BEFORE any write; name the home explicitly: CELL_HOME=<the units account's home> $0 $MODE"

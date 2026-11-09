@@ -45,7 +45,7 @@ fi
 if [ -n "$CELL_HOME_LIB" ]; then . "$CELL_HOME_LIB"; CELL_HOME="$(cell_home_resolve)"; else CELL_HOME="${CELL_HOME:-${HOME:-}}"; fi
 # ⛔ AN EMPTY CELL_HOME IS NOT A HOME — it is the FILESYSTEM ROOT (`O=/orchestrator`,
 # `SCRIPTS=/.pi/agent/scripts`, a layer installed at `/.pi/agent`). A missing resolver is the
-# incomplete-install case the resolver's header names, so it is the SAME refusal the five sibling
+# incomplete-install case the resolver's header names, so it is the SAME refusal the sibling
 # consumers already make (exit 78, EX_CONFIG) instead of a silent walk to `/`.
 [ -n "$CELL_HOME" ] || { printf '%s: FATAL: %s is not readable and neither CELL_HOME nor HOME is set — refusing to default the cell home (agent-infra#3453)\n' "${0##*/}" "${CELL_HOME_LIB:-lib/cell-home.sh}" >&2; exit 78; }
 if [ -z "${HOME:-}" ] || [ ! -d "${HOME:-}" ]; then

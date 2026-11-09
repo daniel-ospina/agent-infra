@@ -28,6 +28,9 @@
 #      This is the honest answer even when `$HOME` is not: `cmux vm exec` hands over `HOME=/home/ubuntu`,
 #      a directory that does not exist on the image. Same ordering `cloud-cell-bringup.sh::_one_home_want`
 #      already uses for its `--check` gate — this file is that derivation given ONE home instead of two.
+#      ⛔ AND IT IS GRADED BY THE PREDICATE THAT DECIDES "IS THIS A HOME AT ALL" — absolute, and not
+#      `/` — because the passwd record is the box's AUTHORITATIVE answer for its own account, not a guess
+#      to be second-guessed. The volatile-root test is step 3's, where the value IS a guess.
 #   3. `${HOME_ORIG}` / `${HOME}` — only when the value is absolute and NOT under a volatile root.
 #   4. `CELL_HOME_FLEET_DEFAULT` — the fleet's durable cell home. ⛔ THIS IS THE ONLY PLACE THE LITERAL
 #      LIVES. A second copy of it is the defect this file exists to remove, so a consumer that needs a
@@ -115,9 +118,29 @@ cell_home_account_home() {
 }
 
 # cell_home_resolve — print the ONE home for this box. Always prints exactly one line; never fails.
-# The precedence is the header's list, in the header's order — including the two checks that make it
-# a DERIVATION rather than a preference: a value that is not absolute, or that sits under a volatile
-# root, is not a durable home and is skipped rather than trusted.
+# The precedence is the header's list, in the header's order — including the checks that make the derived
+# answers a DERIVATION rather than a preference: a value that is not absolute, or that names the root, or
+# that sits under a volatile root, is not a durable home and is skipped rather than trusted. ⛔ WHICH
+# CHECKS APPLY DEPENDS ON THE ARM, and the arms differ on purpose (see steps 2 and 3 below): ABSOLUTE +
+# not-the-root applies to both derived arms, the VOLATILE-ROOT test to step 3 only. A version of this
+# paragraph that said "the two checks … a value that is not absolute, or that sits under a volatile root,
+# is skipped" was read as covering the passwd record too, and step 2 deliberately does not (the passwd
+# record is the box's authoritative answer; arm a10 pins that a volatile passwd home IS returned).
+# ⛔ AND THE CHECKS APPLY TO STEP 2 TOO (review P3). They used to gate step 3 only, while step 2 — the
+# arm that WINS BY DEFAULT — accepted any non-empty string: with a stubbed passwd record that answers
+# `/` (a container account, `sysd:x:100:100::/:/usr/sbin/nologin`), `cell_home_resolve` printed `/`, the
+# exact value the sibling consumers' guards exist to prevent (`O=/orchestrator`, `SCRIPTS=/.pi/agent/scripts`, a
+# layer installed at `/.pi/agent`). ⛔ NAME THE CLASS, NEVER THE TALLY: the consumer files used to say
+# "five sibling consumers", and the tree carried far more than five by the time anyone counted — a number
+# that was wrong the moment a consumer was added, and that a reader who trusts it under-counts the blast
+# radius with.
+# The "is this a home at all" half — ABSOLUTE, not `/`, and not one of the root's own aliases — is
+# applied HERE, in BOTH DERIVED ARMS (step 2's passwd record and step 3's environment guesses), so no
+# caller has to re-ask it for a DERIVED home. ⛔ STEP 1 IS NOT GRADED AND THIS SENTENCE DOES NOT COVER IT
+# (review cycle-7 #5, measured): an explicit `CELL_HOME` is an operator's answer and is printed verbatim,
+# including `/` — that is a recorded decision (`cmux vm exec` may hand `HOME=/home/ubuntu` and an operator
+# fixing a box may name a scratch home), so a caller that passes `CELL_HOME` still owns the sanity of the
+# value it passes. ⛔ THE VOLATILE-ROOT HALF IS NOT APPLIED, deliberately: see step 2 below.
 cell_home_resolve() {
   local v=""
   # 1. explicit override — always wins, even if it is under a volatile root (an operator running a
@@ -125,12 +148,53 @@ cell_home_resolve() {
   if [ -n "${CELL_HOME:-}" ]; then
     printf '%s\n' "$CELL_HOME"; return 0
   fi
-  # 2. the account's home — the durable answer, and the reason this file exists.
+  # 2. the account's home — the durable answer, and the reason this file exists. ⛔ IT IS GRADED BY THE
+  #    PREDICATE THAT DECIDES "IS THIS A HOME AT ALL" — ABSOLUTE, and not the filesystem root — and NOT
+  #    by the volatile-root test. Step 3 is a GUESS lifted from the environment, so a volatile guess is
+  #    wrong and gets skipped; the passwd record is the box's AUTHORITATIVE answer for its own account,
+  #    so substituting the fleet default for a real account home under `/tmp` would answer a directory
+  #    that does not exist on that box (measured: 37 arms of `harness-apply-timer.test.sh` pin a fixture
+  #    account home under `/tmp`, and every one of them flipped to `/home/cmux` under that reading).
   v="$(cell_home_account_home || true)"
+  # ⛔ `/` HAS ALIASES, AND `/?*` ACCEPTS THEM (review P2, measured). `//`, `/.`, `/./` and `/..` all name
+  # the filesystem root — POSIX leaves a leading `//` implementation-defined, and Linux resolves it to `/`
+  # — so a stubbed passwd record answering any of them walked through the predicate that exists to reject
+  # `/`, and the resolver printed it. Every consumer then built `O=<that>/orchestrator` and
+  # `SCRIPTS=<that>/.pi/agent/scripts`, i.e. the root walk this file's step-2 note, the guards below it and
+  # `refresh-candidates.sh`'s empty-CELL_HOME refusal all exist to prevent — reached by one character.
+  # ⛔ THE TEST IS "NAMES NOTHING BUT SEPARATORS AND `.`", NOT A LIST OF SPELLINGS: an enumeration covered
+  # `//`, `/.` and `/./` and still missed `/..`, `/../..` and every other spelling of the root. A value that
+  # names ANY real component (`/home`, `/.hidden`, `relhome`) falls through to the ABSOLUTE test below,
+  # which is what rejects `relhome`. ⛔ "NOTHING BUT SEPARATORS" IS NOT THE WHOLE RULE (review cycle-4 #2,
+  # measured): a value with real components can still RESOLVE to the root — `/usr/..`, `/var/log/../..` —
+  # and both passed, from step 2 AND step 3, so consumers built `/usr/../orchestrator` = the root walk.
+  # Containment in the string is not resolution, so a `..` COMPONENT is refused outright below: no passwd
+  # record or HOME meaning a durable home carries one, and normalising here would mean shipping a path
+  # resolver in a file whose job is to answer one string.
+  # A SEPARATE CASE for each rule, ON PURPOSE: the `/?*` branch is what the `e4` mutant removes, and
+  # folding either of these into it would leave that mutation matching nothing (the arm proving nothing).
+  case "$v" in */../*|*/..) v="" ;; esac
+  case "$v" in
+    *[!/.]*) ;;               # names a real component: not the root under any spelling
+    *)       v="" ;;          # `/`, `//`, `/.`, `/./`, `/..`, `/../..` — the root, or nothing at all
+  esac
+  case "$v" in
+    /?*) ;;                 # ABSOLUTE and not the filesystem root — the two shapes that are not a home
+    *)   v="" ;;
+  esac
   if [ -n "$v" ]; then printf '%s\n' "$v"; return 0; fi
   # 3. HOME_ORIG (the pre-override value) then HOME, each only when it is a plausible durable home.
   for v in "${HOME_ORIG:-}" "${HOME:-}"; do
     case "$v" in /*) ;; *) continue ;; esac
+    # ⛔ THE ROOT'S ALIASES ARE REJECTED HERE TOO (review N5, measured). Step 3 tested ABSOLUTENESS only,
+    # so with an unreadable passwd record and `HOME=//` (or `/.`, `/..`) the resolver printed the root under
+    # another name and every consumer built `O=/../orchestrator` — the same walk step 2 rejects. The
+    # docstring below claims "the 'is this a home at all' half … is applied HERE, so no caller has to
+    # re-ask it": applying it in ONE arm made that sentence false, and a docstring that overstates its
+    # own coverage is how the gap survives a reading. Same three rules as step 2 (`..` component, nothing
+    # but separators, ABSOLUTE), so the two arms cannot disagree.
+    case "$v" in */../*|*/..) continue ;; esac
+    case "$v" in *[!/.]*) ;; *) continue ;; esac
     cell_home_under_volatile "$v" && continue
     printf '%s\n' "$v"; return 0
   done

@@ -79,7 +79,7 @@ source_in() {
 # ⛔ A PATTERN THAT ONLY KNOWS THE FLAT FORM CERTIFIES NOTHING (review F3a, verified). The pre-#3453
 # default survives in NESTED shapes — `${CELL_HOME:-${SOME_SEAM:-/tmp/cell-home}}` — where the literal
 # sits one level deeper than any of the three alternatives the first cut carried. Measured:
-# `reap-abandoned-worktrees.sh:219` piped through that RE answered NO-MATCH while the arm's message said
+# `reap-abandoned-worktrees.sh`'s `CELL_HOME_DEFAULT` assignment, piped through that RE, answered NO-MATCH while the arm's message said
 # "NO non-test script defaults CELL_HOME to the legacy path". The two alternatives below are
 # (1) ANY assignment whose name contains CELL_HOME and whose default reaches `/tmp/cell-home`, however
 # deeply nested, and (2) a bare `CELL_HOME…` DEFAULT taken without an assignment (still a default being
@@ -164,6 +164,82 @@ out="$(resolve_in "$LIB" HOME=/tmp/cell-home)"
 out="$(resolve_in "$LIB" HOME=/tmp/cell-home HOME_ORIG=/var/tmp/other)"
 [ "$out" = "/home/cmux" ] && ok "a6 neither HOME nor HOME_ORIG under a volatile root is used, even together" \
   || bad "a6 neither volatile HOME nor HOME_ORIG is used (got '$out')"
+
+# ⛔ THE PASSWD ANSWER IS GRADED TOO — BY THE "IS THIS A HOME AT ALL" PREDICATE (review P3, reproduced).
+# Step 2 — the arm that WINS BY DEFAULT — used to accept any NON-EMPTY string while the checks that make
+# this a derivation were applied to step 3 alone, so a container account whose passwd record answers `/`
+# (the real shape: `sysd:x:100:100::/:/usr/sbin/nologin`) made `cell_home_resolve` print `/` — the exact
+# value the sibling consumers' guards exist to prevent (`O=/orchestrator`, `SCRIPTS=/.pi/agent/scripts`, a layer
+# installed at `/.pi/agent`). ⛔ NO COUNT HERE EITHER: "five" was already wrong (the tree carries more),
+# and a count tells the next reader the blast radius is bounded at a number nobody re-checks. A RELATIVE
+# passwd home is the same class: it cannot name a directory.
+# ⛔ AND THE VOLATILE-ROOT TEST IS DELIBERATELY NOT APPLIED HERE (a9 pins that, in the opposite
+# direction): step 3 is a GUESS lifted from the environment, so a volatile guess is skipped; the passwd
+# record is the box's AUTHORITATIVE answer for its own account, and answering the fleet default instead
+# would name a directory that does not exist on that box — measured, that reading flipped 37 arms of
+# `harness-apply-timer.test.sh`, whose fixtures pin their account home under `/tmp`.
+stub_root_account() { stub getent 'case "$1" in passwd) echo "sysd:x:100:100::/:/usr/sbin/nologin" ;; esac'
+                      stub id     'case "$1" in -un) echo sysd ;; esac'; }
+stub_relative_account() { stub getent 'case "$1" in passwd) echo "rel:x:1003:1003::relhome:/bin/bash" ;; esac'
+                          stub id     'case "$1" in -un) echo rel ;; esac'; }
+stub_volatile_account() { stub getent 'case "$1" in passwd) echo "acct:x:1002:1002::/tmp/acct-home:/bin/bash" ;; esac'
+                          stub id     'case "$1" in -un) echo acct ;; esac'; }
+stub_root_account
+out="$(resolve_in "$LIB")"
+[ "$out" != "/" ] && ok "a7 a passwd home of / is NOT a home — the derivation falls through instead of answering the filesystem root (got '$out')" \
+  || bad "a7 the passwd record's / was returned as the cell home"
+case "$out" in
+  /home/cmux) ok "a8 …and it falls through to the fleet default, not to a second guess" ;;
+  *)          bad "a8 the fall-through answered '$out' instead of the fleet default" ;;
+esac
+stub_relative_account
+out="$(resolve_in "$LIB")"
+[ "$out" = "/home/cmux" ] && ok "a9 a RELATIVE passwd home cannot name a directory, so it falls through too" \
+  || bad "a9 a relative passwd home was returned as the cell home (got '$out')"
+# ⛔ `/` HAS ALIASES, AND THE PREDICATE ACCEPTED THEM (review P2, reproduced). `//`, `/.` and `/./` all
+# name the filesystem root — POSIX leaves a leading `//` implementation-defined and Linux resolves it to
+# `/` — so a passwd record answering any of them walked through the test that exists to reject `/`, and
+# the resolver printed it: `O=/orchestrator`, `SCRIPTS=/.pi/agent/scripts`, a layer at `/.pi/agent`.
+stub_dslash_account() { stub getent 'case "$1" in passwd) echo "sysd:x:100:100:://:/usr/sbin/nologin" ;; esac'
+                        stub id     'case "$1" in -un) echo sysd ;; esac'; }
+stub_dotroot_account() { stub getent 'case "$1" in passwd) echo "sysd:x:100:100::/.:/usr/sbin/nologin" ;; esac'
+                         stub id     'case "$1" in -un) echo sysd ;; esac'; }
+stub_dotroot2_account() { stub getent 'case "$1" in passwd) echo "sysd:x:100:100::/./:/usr/sbin/nologin" ;; esac'
+                          stub id     'case "$1" in -un) echo sysd ;; esac'; }
+stub_dotdot_account() { stub getent 'case "$1" in passwd) echo "sysd:x:100:100::/..:/usr/sbin/nologin" ;; esac'
+                        stub id     'case "$1" in -un) echo sysd ;; esac'; }
+# ⛔ REAL COMPONENTS THAT RESOLVE TO THE ROOT (review cycle-4 #2, measured): `/usr/..` names nothing but
+# real components and still IS `/`, so "names nothing but separators" alone let it through from step 2 and
+# step 3. The `..`-component rule is what rejects it.
+stub_dotdotpath_account() { stub getent 'case "$1" in passwd) echo "sysd:x:100:100::/usr/..:/usr/sbin/nologin" ;; esac'
+                             stub id     'case "$1" in -un) echo sysd ;; esac'; }
+for _which in dslash dotroot dotroot2 dotdot dotdotpath; do
+    "stub_${_which}_account"
+    out="$(resolve_in "$LIB")"
+    case "$out" in
+      /home/cmux) ok "a11 the passwd record's root alias ($_which) is rejected and falls through, not returned as the cell home" ;;
+      *)          bad "a11 the passwd record's root alias ($_which) was returned as the cell home (got '$out')" ;;
+    esac
+done
+unset _which
+# ⛔ AND STEP 3 CARRIES THE SAME PREDICATE (review N5, measured): step 3 tested ABSOLUTENESS only, so with
+# an unreadable passwd record AND a root-alias HOME the resolver printed the alias and every consumer built
+# `O=/../orchestrator` — the same root walk a11 rejects from step 2. The function's own docstring claims
+# the "is this a home at all" half covers the derivation; applying it in one arm made that false.
+stub_no_account
+for _which in '//' '/.' '/..' '/../..' '/usr/..' '/var/log/../..'; do
+    out="$(resolve_in "$LIB" HOME="$_which" HOME_ORIG=/tmp/volatile-guess)"
+    case "$out" in
+      /home/cmux) ok "a12 a root-alias HOME ($_which) is not a durable home — step 3 falls through, not to the root" ;;
+      *)          bad "a12 the HOME arm returned '$_which' as the cell home (got '$out')" ;;
+    esac
+done
+unset _which
+stub_volatile_account
+out="$(resolve_in "$LIB")"
+[ "$out" = "/tmp/acct-home" ] && ok "a10 …while a VOLATILE passwd home IS the answer — the passwd record is authoritative, not a guess to correct" \
+  || bad "a10 a volatile passwd home was second-guessed (got '$out'); step 2 must not substitute the fleet default for a real account home"
+stub_account
 
 printf '\n── (b) THE LEGACY HOME IS NEVER DERIVED ─────────────────────────────────────────────\n'
 
@@ -403,7 +479,7 @@ printf '\n── (d) THE CONSUMERS CONSUME IT ───────────�
 # (`cell-home-migrate.sh`) that grades only the LEGACY literal and therefore reported the box converged.
 # A no-op loop, authored by four files this pin did not know about. They are in the list now.
 # The ONE DECLARED EXCEPTION remains
-# `scripts/orchestrator-harness/worker-terminal.sh:724` `wt_launcher_home`, which still probes
+# `scripts/orchestrator-harness/worker-terminal.sh`'s `wt_launcher_home`, which still probes
 # `/tmp/cell-home` as a credential home for a spawned worker. It is named here rather than silently
 # omitted: migrating it re-orders CREDENTIAL resolution for every worker spawn (the loop tries
 # `$HOME` then the cell home, each only when it actually holds a token), which is a credential-surface
@@ -574,6 +650,30 @@ else
   m="$(resolve_in "$MUT/lib/cell-home.sh" HOME=/tmp/cell-home HOME_ORIG=/var/tmp/also-volatile)"
   [ "$m" = "/tmp/cell-home" ] && ok "e1 MUTATED default (legacy) IS what b1 would then answer — b1 measures the default" \
     || bad "e1 MUTATED default (legacy) was not returned (got '$m') — b1 may not be measuring the default"
+  stub_account
+fi
+
+# e4: THE STEP-2 GUARD MUST DISCRIMINATE — otherwise a7-a9 are arms about a predicate that never runs.
+# The mutant removes the absolute/root test and keeps the non-emptiness test, so it IS the pre-fix arm;
+# if it also passed a7/a9, those arms would be measuring a constant in the file.
+# ⛔ IT TAKES **TWO** SUBSTITUTIONS, AND THE SECOND IS NOT OPTIONAL (measured). The root test is now two
+# cases: the alias/root-shape filter (which alone rejects `/`) and the `/?*` absolute test. Neutralising
+# only the `/?*` branch leaves the filter in place, so the mutant answered the fleet default instead of
+# `/` and this arm reddened for a reason that has nothing to do with a7 — the mutation must reproduce the
+# PRE-FIX behaviour (accept any non-empty passwd string), which means both branches become no-ops.
+MUT2="$T/mut2"; mkdir -p "$MUT2/lib"
+sed -e 's#/?\*) ;;#*) ;;#' -e 's#^    \*)       v="" ;;#    *) ;;#' "$LIB" >"$MUT2/lib/cell-home.sh"
+if cmp -s "$LIB" "$MUT2/lib/cell-home.sh"; then
+  bad "e4 the absolute/root mutation could not be applied — a7/a9 are not checking the passwd-home grading"
+else
+  stub_root_account
+  m="$(resolve_in "$MUT2/lib/cell-home.sh")"
+  [ "$m" = "/" ] && ok "e4 MUTATED (no absolute/root test) DOES answer / — a7/a8 measure the grading" \
+    || bad "e4 the ungraded mutant answered '$m', not / — a7 may be measuring something else"
+  stub_relative_account
+  m="$(resolve_in "$MUT2/lib/cell-home.sh")"
+  [ "$m" = "relhome" ] && ok "e4b …and DOES answer a RELATIVE passwd home — a9 measures it" \
+    || bad "e4b the ungraded mutant answered '$m', not the relative home — a9 may be measuring something else"
   stub_account
 fi
 

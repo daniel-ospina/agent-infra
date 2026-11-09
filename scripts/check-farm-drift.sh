@@ -162,13 +162,15 @@ CELL_HOME="${CELL_HOME:-$HOME}"
 
 # ── WHICH RECORD SAYS THIS BOX HAS A PIN TREE ────────────────────────────────────────────────
 # ⛔ A PIN IS TWO RECORDS in two places, and THE REPO WRITES THEM UNDER TWO DIFFERENT ROOTS:
-#   • `scripts/harness-apply-pass.sh:183-184` co-roots BOTH at CELL_HOME —
+#   • `scripts/harness-apply-pass.sh`'s `HARNESS_PIN` / `HARNESS_PIN_FILE` defaults (`PIN_SHA_FILE`,
+#     `PIN_PATH_FILE`) co-root BOTH at `$CELL_HOME` —
 #     `$CELL_HOME/.pi/agent/state/HARNESS-PIN` and `$CELL_HOME/.harness-path`;
-#   • `scripts/orchestrator-harness/install.sh:741` roots the DIR record at `$HOME`.
+#   • `scripts/orchestrator-harness/install.sh`'s `HARNESS_PIN_FILE` default (`$HOME/.harness-path`) roots
+#     the DIR record at `$HOME` (its `HARNESS_PIN` sibling does the same for the sha).
 # So the sibling of a sha record named by `--pin-file` is at the pin record's OWN root, and it may
 # ALSO be at `$CELL_HOME` — and the old code read only `${CELL_HOME:-$HOME}`: when the caller named a
-# `$HOME`-rooted pin (which `pi-bootstrap/setup.sh:1063` does — `DEST="$HOME/.pi/agent"`, `:20`,
-# `--pin-file "$DEST/state/HARNESS-PIN"`) on a box whose records are CELL_HOME-rooted, the LOST-PIN
+# `$HOME`-rooted pin (which `pi-bootstrap/setup.sh` does — its `DEST="$HOME/.pi/agent"` default,
+# passed as `--pin-file "$DEST/state/HARNESS-PIN"`) on a box whose records are CELL_HOME-rooted, the LOST-PIN
 # arm looked in the wrong home, found nothing and reported a FIRST INSTALL — `OK`, rc=0, pin identity
 # unverified. That is the false PASS the arm exists against, one variable over (measured at
 # 14683c442: CELL_HOME=<the record's root> ⇒ rc=2; CELL_HOME=<any home without .harness-path> ⇒ rc=0

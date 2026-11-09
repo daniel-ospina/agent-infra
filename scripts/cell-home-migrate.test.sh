@@ -82,6 +82,12 @@ run_tool() { # <tool> <mode> — the tool against the fixture, hermetic
   CELL_HOME="$DUR" CELL_HOME_LEGACY="$LEG" CELL_HOME_MIGRATE_UNIT_DIRS="$UNITS" \
   CELL_HOME_MIGRATE_NO_RELOAD=1 bash "$1" "$2" 2>&1
 }
+# ⛔ THE DERIVATION ARMS BELOW STUB THEIR PASSWD HOME UNDER `$T` (I.E. UNDER A VOLATILE ROOT), AND THAT IS
+# FINE — `cell_home_resolve`'s step 2 applies the "is this a home at all" test (absolute, not `/`) and NOT
+# the volatile-root test, because the passwd record is the box's AUTHORITATIVE answer rather than a guess
+# lifted from the environment. See `lib/cell-home.sh` step 2 and its `a10` arm (`scripts/lib/cell-home.test.sh`),
+# which pins that polarity in the opposite direction. So a fixture account home under `/tmp` is what these
+# arms get, and no seam is needed to make it stick.
 run_tool_rc() { # <tool> <mode> — same, printing only the rc
   local out rc
   out="$(run_tool "$1" "$2")"; rc=$?
@@ -313,6 +319,10 @@ if grep -q "Environment=\"HOME=$DUR\"" "$UNITS/app.service" && grep -q "ReadWrit
 else
   bad "d24 --apply left a legacy path in place: $(grep -E 'Environment="HOME=|ReadWritePaths=' "$UNITS/app.service" | tr '\n' ' ')"
 fi
+
+# ⛔ `mk_box` PLANTS `export HOME=$DUR` IN BOTH `keys.env` FILES, AND THE DERIVATION ARMS BELOW STUB THEIR
+# PASSWD HOME UNDER `$T` — see the note beside `run_tool`: that is the authoritative answer, not a guess,
+# so it is what the resolver returns and what these arms grade.
 
 printf '\n── (i) THE DERIVATION: the account the UNITS RUN AS, not the invoker (review F2) ────────\n'
 # ⛔ THE DANGEROUS WRITE. `sudo` re-sets HOME to the target account's home and drops an ambient
@@ -1008,6 +1018,166 @@ mkdir -p "$LEG/.pi/agent/sessions"; printf 'x\n' >"$LEG/.pi/agent/sessions/s1.js
 _out="$(run_tool "$TOOL" --check)"
 case "$_out" in *"PARTIALLY graded"*".pi"*) ok "k38 a directory holding a graded credential AND ungraded content is reported PARTIALLY graded" ;; *) bad "k38 the partially-graded directory is silently dropped from the advisory" ;; esac
 
+printf '\n── (m) THE POPULATION, THE EXEC PREFIX, AND THE EXISTENCE GUARD (review F1/F2/P1) ───\n'
+
+# ⛔ F1 (review, reproduced): the USER-UNIT DIR came from the invoking shell's `$HOME` and the home this
+# tool DERIVED was never consulted. ONE byte-identical legacy-naming unit under
+# `$HOME_DURABLE/.config/systemd/user` answered `0 one home` when the tool was started with a different
+# `HOME`, and `1 drift` when it was not — opposite verdicts for the same box. The two channels that reach
+# it are the ones this project names itself (`cmux vm exec` hands over `HOME=/home/ubuntu`, and the
+# tool's own printed root remedy runs with the target account's `HOME`), and the directory is real: the
+# fleet's installer writes `UNIT_DIR="$HOME/.config/systemd/user"`. `--check` -> 0 is the RECLAIM
+# precondition, so the quiet half authorises deleting the directory every user unit still names.
+# The three system dirs are pinned to an empty fixture dir, so the arm grades the USER-DIR RESOLUTION
+# instead of this host's `/etc/systemd/system` (a real cell carries vendor units there).
+mk_box "$T/m1"
+cp "$LEG/.pi/agent/auth.json" "$DUR/.pi/agent/auth.json"; chmod 600 "$DUR/.pi/agent/auth.json"   # credentials CONVERGED
+mkdir -p "$DUR/.config/systemd/user" "$T/m1/wronghome" "$T/m1/nodir"
+printf '[Service]\nEnvironment=HOME=%s\nExecStart=/bin/echo hi\n' "$LEG" >"$DUR/.config/systemd/user/legacyunit.service"
+run_nodirs() { # <tool> <mode> — NO `CELL_HOME_MIGRATE_UNIT_DIRS` seam: the tool resolves its own population
+  CELL_HOME="$DUR" CELL_HOME_LEGACY="$LEG" CELL_HOME_MIGRATE_NO_RELOAD=1 \
+  SYSTEMD_UNIT_DIR="$T/m1/nodir" CONTROLLER_SYSTEM_UNIT_DIR="$T/m1/nodir" HOME="$T/m1/wronghome" \
+  bash "$1" "$2" 2>&1
+}
+_out="$(run_nodirs "$TOOL" --check)"; _rc=$?
+[ "$_rc" = 1 ] && ok "m1 a legacy-naming USER unit under the DURABLE home is DRIFT even when the invoking HOME is elsewhere (CHECK 1, not a false one home)" \
+  || bad "m1 a user unit under the durable home read as converged (rc $_rc) — the population follows the invoker's HOME"
+case "$_out" in *legacyunit.service*) ok "m2 …and the report NAMES it" ;; *) bad "m2 the graded user unit is not named: $_out" ;; esac
+# ⛔ CONTROL: the invoker's own user-unit dir is an ADDITIONAL candidate, not a replacement — a unit that
+# really lives there must still be graded, or the fix would trade one blind spot for another.
+mkdir -p "$T/m1/wronghome/.config/systemd/user"
+mv "$DUR/.config/systemd/user/legacyunit.service" "$T/m1/wronghome/.config/systemd/user/legacyunit.service"
+_out="$(run_nodirs "$TOOL" --check)"; _rc=$?
+[ "$_rc" = 1 ] && ok "m3 …while a unit under the INVOKING home's user-unit dir is still graded (additional candidate, not a replacement)" \
+  || bad "m3 a unit under the invoking home's user dir is no longer graded (rc $_rc)"
+mv "$T/m1/wronghome/.config/systemd/user/legacyunit.service" "$DUR/.config/systemd/user/legacyunit.service"
+
+# ⛔ F2 (review, reproduced): the existence guard filtered by LOCATION — "any token under $HOME_DURABLE on
+# the projected line" — not by "the REWRITE introduced this token". So a `StateDirectory=` (which
+# systemd MANAGES rather than opens — and whose required form is RELATIVE, so an absolute value is
+# IGNORED by systemd, `systemd-analyze verify` saying so) and an `Environment=PATH=` list entry were
+# refused with a false `203/EXEC` diagnosis. A refused file never repoints, so `--check` could never
+# reach 0 on that box: the RECLAIM precondition was PERMANENTLY unreachable, with a remedy built on a
+# wrong diagnosis.
+mk_box "$T/m2"
+printf '[Service]\nStateDirectory=%s/state\nEnvironment=PATH=%s/bin:/usr/bin\nExecStart=/bin/echo hi\n' "$LEG" "$LEG" >"$UNITS/statedir.service"
+[ ! -e "$DUR/state" ] && [ ! -e "$DUR/bin" ] && ok "m4 the fixture premise: BOTH projected targets are absent ($DUR/state, $DUR/bin)" \
+  || bad "m4 the fixture accidentally created a target, so m5 proves nothing"
+_out="$(run_tool "$TOOL" --apply)"; _rc=$?
+[ "$_rc" = 0 ] && ok "m5 a StateDirectory=/PATH-list whose durable paths do NOT exist is not refused (the unit still starts: systemd IGNORES an absolute StateDirectory= and never opens an Environment= value), so the box converges" \
+  || bad "m5 a unit systemd will start anyway was refused (rc $_rc) — the box can never reach one home"
+case "$(cat "$UNITS/statedir.service" 2>/dev/null)" in
+  *"StateDirectory=$DUR/state"*) ok "m6 …and it IS repointed onto the durable home" ;;
+  *) bad "m6 the StateDirectory line was not repointed: $(grep StateDirectory "$UNITS/statedir.service" 2>/dev/null)" ;;
+esac
+case "$(cat "$UNITS/statedir.service" 2>/dev/null)" in
+  *"PATH=$DUR/bin:/usr/bin"*) ok "m7 …and so is a PATH list entry under the legacy home" ;;
+  *) bad "m7 the PATH list was not repointed" ;;
+esac
+
+# ⛔ B-P1 (review, reproduced): the projector MOVES a systemd exec-prefixed path (`-/…`, `+/…`, `!/…`,
+# `@/…`) — `lib/cell-home.sh`'s `cell_home_project_line` strips the prefix run — while `paths_in` dropped every token that did
+# not begin with `/`. So a PREFIXED path was repointed without its durable counterpart ever being graded:
+# `--apply` wrote `ExecStart=+<durable>/run.sh` for a missing target, printed `VERDICT: one home` and
+# exited 0, and that 0 is the stated RECLAIM precondition. The identical line WITHOUT the prefix was
+# correctly refused, which is what made this a hole in the prefix and not in the guard.
+mk_box "$T/m3"; run_tool "$TOOL" --apply >/dev/null 2>&1        # converge, so only the new unit drifts
+rm -f "$DUR/harness/run.sh"
+printf '[Service]\nEnvironment=HOME=%s\nExecStart=+%s/harness/run.sh\n' "$LEG" "$LEG" >"$UNITS/p.service"
+_out="$(run_tool "$TOOL" --apply)"; _rc=$?
+[ "$_rc" != 0 ] && ok "m8 a PREFIXED exec path whose durable counterpart is MISSING is REFUSED (rc $_rc, not a silent repoint)" \
+  || bad "m8 a prefixed exec path was repointed at a path that does not exist (rc $_rc)"
+case "$_out" in *"$DUR/harness/run.sh"*) ok "m9 …and the refusal names the missing durable target, so the diagnosis is checkable" ;; *) bad "m9 the refusal does not name the target: $_out" ;; esac
+case "$(cat "$UNITS/p.service" 2>/dev/null)" in
+  *"$LEG/harness/run.sh"*) ok "m10 …and the file is UNTOUCHED (still on the legacy home, never written to a dead target)" ;;
+  *) bad "m10 the unit was rewritten anyway" ;;
+esac
+mkdir -p "$DUR/harness"; printf '#!/bin/sh\n' >"$DUR/harness/run.sh"
+run_tool "$TOOL" --apply >/dev/null 2>&1; _rc=$?
+[ "$_rc" = 0 ] && ok "m11 …while the same prefixed unit converges once the target EXISTS (the refusal grades the target, not the shape)" \
+  || bad "m11 the prefixed unit was still refused with its target present (rc $_rc)"
+
+# ⛔ B-P1'S FIX OVERSHOT, AND THAT IS ITS OWN FALSE BLOCK (review P1-1, reproduced). Stripping the exec
+# prefix is right for the PROJECTOR (it moves the path either way), but `-` is NOT decoration: on
+# `EnvironmentFile=`, `ReadWritePaths=`/`ReadOnlyPaths=` and `WorkingDirectory=` a leading `-` means
+# "ignore if it does not exist" (`systemd.exec(5)`), so a rewrite that leaves such a target absent
+# produces a unit that STARTS. ⛔ `RootDirectory=` IS NOT IN THIS FAMILY (review A): systemd documents no
+# `-` prefix there and an absolute value is a FATAL error — m16 pins the refusal.
+# The strip graded them as MANDATORY, so
+# the repair refused every one of them, the file never repointed, and `--check` could never reach 0 —
+# the RECLAIM precondition permanently unreachable on a unit that is fine (the same shape the A-F2 scan
+# scope was widened for, one fix later). On `ExecStart*` the same `-` means only "this exit status is not
+# fatal" and the binary MUST exist, so a blanket exemption is wrong in the other direction: the
+# DIRECTIVE decides — m12/m15 (optional) against m14 (not optional).
+mk_box "$T/m4"; run_tool "$TOOL" --apply >/dev/null 2>&1
+rm -f "$DUR/f.env"
+printf '[Service]\nEnvironment=HOME=%s\nEnvironmentFile=-%s/f.env\nExecStart=/bin/echo hi\n' "$LEG" "$LEG" >"$UNITS/opt.service"
+_out="$(run_tool "$TOOL" --apply)"; _rc=$?
+[ "$_rc" = 0 ] && ok "m12 EnvironmentFile=-<legacy>/f.env with NO durable counterpart converges (the unit itself says 'ignore if missing')" \
+  || bad "m12 an optional EnvironmentFile was refused (rc $_rc) — that box can never reach one home"
+case "$(cat "$UNITS/opt.service" 2>/dev/null)" in
+  *"EnvironmentFile=-$DUR/f.env"*) ok "m13 …and it is repointed WITH its '-' prefix intact" ;;
+  *) bad "m13 the prefix or the repointing was lost: $(grep EnvironmentFile "$UNITS/opt.service" 2>/dev/null)" ;;
+esac
+rm -f "$DUR/harness/run.sh"
+printf '[Service]\nEnvironment=HOME=%s\nExecStart=-%s/harness/run.sh\n' "$LEG" "$LEG" >"$UNITS/optexec.service"
+_out="$(run_tool "$TOOL" --apply)"; _rc=$?
+[ "$_rc" != 0 ] && ok "m14 …while ExecStart=-<legacy>/run.sh is STILL refused: there '-' only means the exit status is not fatal, so the binary must exist (rc $_rc)" \
+  || bad "m14 an optional EXEC target was repointed at a path that does not exist (rc $_rc)"
+rm -f "$UNITS/optexec.service"
+rm -f "$DUR/out.log"
+printf '[Service]\nEnvironment=HOME=%s\nStandardOutput=file:%s/out.log\nExecStart=/bin/echo hi\n' "$LEG" "$LEG" >"$UNITS/stdout.service"
+_out="$(run_tool "$TOOL" --apply)"; _rc=$?
+[ "$_rc" = 0 ] && ok "m15 StandardOutput=file:<legacy>/out.log converges: systemd CREATES the file, so only its parent must exist" \
+  || bad "m15 a StandardOutput= file that systemd creates was refused (rc $_rc)"
+# ⛔ `RootDirectory=` HAS NO `-` SEMANTICS, SO IT MUST NOT BE EXEMPT (review A, measured with
+# `systemd-analyze verify`): unlike `EnvironmentFile=`/`ReadWritePaths=`/`WorkingDirectory=`, an absolute
+# `RootDirectory=-<path>` is a FATAL configuration error ("path is not absolute", "unit will not be
+# started"), so a rewrite that leaves the target absent writes exactly the unrunnable unit rule 4 exists
+# to prevent — and still exits 0, which is the RECLAIM precondition. The first cut of the `-` exemption
+# listed it, so this is the arm that keeps the family honest.
+rm -f "$UNITS/stdout.service"
+rm -rf "$DUR/chroot"
+printf '[Service]\nEnvironment=HOME=%s\nRootDirectory=-%s/chroot\nExecStart=/bin/echo hi\n' "$LEG" "$LEG" >"$UNITS/rootdir.service"
+_out="$(run_tool "$TOOL" --apply)"; _rc=$?
+[ "$_rc" != 0 ] && ok "m16 RootDirectory=-<legacy>/chroot with no durable counterpart is REFUSED: '-' is not a path prefix there, an absolute one is fatal (rc $_rc)" \
+  || bad "m16 an absolute RootDirectory=-… was written with a missing target and the tool reported one home (rc $_rc)"
+rm -f "$UNITS/rootdir.service"
+# ⛔ THE INCLUSION SIDE OF THE FAMILY IS PINNED FOR EVERY MEMBER (review N6): m12 covers
+# `EnvironmentFile=-` with an ABSENT twin, and m17 covers `WorkingDirectory=-`/`ReadWritePaths=-`/
+# `ReadOnlyPaths=-` with absent twins — ⛔ NOT `k26`, WHICH DOES NOT CARRY THOSE TWO AT ALL (review
+# cycle-6 #4): k26's fixture has `EnvironmentFile=` and `WorkingDirectory=` only, both with their durable
+# targets CREATED, where need=1 and need=3 behave IDENTICALLY. So the arms that can see a member dropped
+# from the exemption are m12 and m17, and nothing narrower: narrowing the regex to one member keeps m12's
+# half green and reds m17. An absent `ReadWritePaths=`/`ReadOnlyPaths=` target is
+# the shape an operator uses BEFORE the mount point exists, and `WorkingDirectory=-` is documented to be
+# non-fatal when the directory is missing.
+rm -rf "$DUR/wd" "$DUR/rw" "$DUR/ro"
+printf '[Service]\nEnvironment=HOME=%s\nWorkingDirectory=-%s/wd\nReadWritePaths=-%s/rw\nReadOnlyPaths=-%s/ro\nExecStart=/bin/echo hi\n' \
+    "$LEG" "$LEG" "$LEG" "$LEG" >"$UNITS/optpaths.service"
+_out="$(run_tool "$TOOL" --apply)"; _rc=$?
+[ "$_rc" = 0 ] && ok "m17 WorkingDirectory=/ReadWritePaths=/ReadOnlyPaths= with '-' and NO durable target converge (every family member except `EnvironmentFile=`, which m12 pins)" \
+  || bad "m17 a '-' -prefixed working/mount path was refused (rc $_rc) — the exemption covers fewer members than it claims"
+case "$(cat "$UNITS/optpaths.service" 2>/dev/null)" in
+  *"WorkingDirectory=-$DUR/wd"*"ReadWritePaths=-$DUR/rw"*"ReadOnlyPaths=-$DUR/ro"*)
+    ok "m18 …and ALL THREE are repointed with their '-' intact (the pattern names each one, so a writer that dropped a line reds here)" ;;
+  *) bad "m18 the repointing or the prefix was lost: $(grep -E 'WorkingDirectory|ReadWritePaths|ReadOnlyPaths' "$UNITS/optpaths.service" 2>/dev/null)" ;;
+esac
+rm -f "$UNITS/optpaths.service"
+# ⛔ THE STRICTEST GRADE PER PATH WINS, NOT THE FIRST MENTION (review cycle-9 #5, reproduced on the real
+# function). Stripping the exec prefix folded `-/x` and `/x` onto ONE key, and the dedupe was
+# first-mention-wins — so a path the SAME directive lists both optionally and mandatorily was graded
+# OPTIONAL (need=3) whenever the `-` spelling came first, and a rewrite could then leave it absent. That
+# is a fail-open on the rule-4 / `--check`→0 surface this tool exists to protect. Both orders are pinned:
+# the reverse order already graded correctly, and an arm that only tested one order would pass on the bug.
+rm -rf "$DUR/twice"
+printf '[Service]\nEnvironment=HOME=%s\nReadWritePaths=-%s/twice %s/twice\nExecStart=/bin/echo hi\n' \
+    "$LEG" "$LEG" "$LEG" >"$UNITS/twice.service"
+_out="$(run_tool "$TOOL" --apply)"; _rc=$?
+[ "$_rc" != 0 ] && ok "m19 ReadWritePaths=-<legacy>/twice <legacy>/twice is REFUSED: the mandatory mention of an absent path outranks the optional one on the same line (rc $_rc)" \
+  || bad "m19 an absent path that the same directive also names MANDATORILY was graded optional and repointed (rc $_rc) — first-mention-wins"
+rm -f "$UNITS/twice.service"
+
 # mut_sub <src> <dst> <function> <old-substring> <new> — replace ONE substring on the FIRST line of ONE
 # function that carries it. Scoped by function because several guards share a spelling; a control whose
 # mutation cannot be applied must fail loudly rather than silently grade the unmutated tool.
@@ -1246,14 +1416,17 @@ else
 fi
 
 
-# g10: REMOVE THE DERIVATION'S MEASURABILITY GATE and i7/i8 must redden — i.e. those arms measure the
-# gate, not a fixture that happens to refuse for another reason. Both read failures (an unwalkable dir
-# and an unopenable unit) are mutated together: either one alone still blocks i7.
+# g10: REMOVE THE DERIVATION'S MEASURABILITY GATES and i7/i8 must redden — i.e. those arms measure the
+# gates, not a fixture that happens to refuse for another reason. ⛔ ALL THREE legs are mutated together:
+# the DIR-walkability gate, `find`'s traversal error, and the unit's own open. Any one left in place still
+# refuses i7's box, and the mutant then writes nothing — the control says nothing (measured: with only
+# the first two mutated, the third alone answered for i7 and g10 went red).
 mkdir -p "$T/mutdir10/lib"; cp "$HERE/lib/cell-home.sh" "$T/mutdir10/lib/cell-home.sh"
 MUT10="$T/mutdir10/cell-home-migrate.sh"
-mut_sub "$TOOL" "$T/mutdir10/m1.sh" check_derivation 'if [ -n "$UNIT_FIND_ERR" ]; then' 'if false; then'
-mut_sub "$T/mutdir10/m1.sh" "$MUT10" check_derivation 'if ! probe_open "$f"; then' 'if false; then'
-rm -f "$T/mutdir10/m1.sh"
+mut_sub "$TOOL" "$T/mutdir10/m1.sh" check_derivation 'walkable_dir "$d"; wst=$?' 'wst=0'
+mut_sub "$T/mutdir10/m1.sh" "$T/mutdir10/m2.sh" check_derivation 'if [ -n "$UNIT_FIND_ERR" ]; then' 'if false; then'
+mut_sub "$T/mutdir10/m2.sh" "$MUT10" check_derivation 'if ! probe_open "$f"; then' 'if false; then'
+rm -f "$T/mutdir10/m1.sh" "$T/mutdir10/m2.sh"
 if cmp -s "$TOOL" "$MUT10"; then
   bad "g10 the derivation-gate mutation could not be applied — i7/i8 are not checking it"
 elif ! ls "$UNITS" >/dev/null 2>&1; then
@@ -1602,6 +1775,14 @@ else
   mk_box "$T/g28"
   run_tool "$MUT28" --apply >/dev/null 2>&1            # converge with the mutant itself (explicit CELL_HOME)
   rm -f "$DUR/keys.env" "$DUR/.pi/agent/auth.json"
+  # ⛔ THE LEGACY `keys.env` MUST STOP NAMING A HOME FIRST (review P2, measured). `mk_box` writes it as
+  # `export HOME=$DUR`, and under the mutant's FOREIGN derivation `$DUR` is not the durable home — so
+  # `report_env_file` refuses the copy on the volatile-root rule and the mutant answers 1, not the 0 this
+  # row asserts. That made the arm measure the CONTENT rule instead of the population read it claims
+  # (green on macOS, where `$T` is under `/var/folders`; RED on Linux). Strip the assignment: with
+  # nothing to refuse, the only thing left that can make the run converge is the emptied population.
+  printf 'DEEPSEEK_API_KEY=%s\n' "$SENTINEL" >"$LEG/keys.env"
+  chmod 600 "$LEG/keys.env"
   mkdir -p "$T/g28/inv-home" "$T/g28/stub"
   printf '#!/bin/sh\ncase "$1" in -u) echo 1001 ;; -un) echo ubuntu ;; *) exit 1 ;; esac\n' >"$T/g28/stub/id"
   printf '#!/bin/sh\ncase "$1:$2" in\n  passwd:cmux) echo "cmux:x:1000:1000::%s:/bin/bash" ;;\n  passwd:ubuntu) echo "ubuntu:x:1001:1001::%s:/bin/bash" ;;\nesac\n' "$DUR" "$T/g28/inv-home" >"$T/g28/stub/getent"
@@ -1610,6 +1791,80 @@ else
     CELL_HOME_MIGRATE_NO_RELOAD=1 bash "$MUT28" --apply >/dev/null 2>&1; _m28rc=$?
   [ "$_m28rc" = 0 ] && ok "g28 WITH the population emptied a converged box ACCEPTS the foreign derivation (rc 0) — i15 measures the VACUITY" \
     || bad "g28 the emptied-population mutant answered $_m28rc — i15 is not measuring the population read"
+fi
+
+# g29: revert the population to the INVOKING home's user-unit dir (the pre-fix shape) and m1 must redden —
+# i.e. m1 measures WHICH home the population is resolved from, not a fixture that happens to be graded.
+MUT29="$T/mutdir26/cell-home-migrate-homepop.sh"
+mkdir -p "$T/mutdir26/lib"; cp "$HERE/lib/cell-home.sh" "$T/mutdir26/lib/cell-home.sh"
+# the durable-home candidate becomes a no-op; the `$HOME` candidate below it is untouched, so the mutant
+# resolves exactly the population the tool resolved before review F1.
+sed 's#\[ -n "${HOME_DURABLE:-}" \].*systemd/user"#:#' "$TOOL" >"$MUT29"
+if cmp -s "$TOOL" "$MUT29"; then
+  bad "g29 the population mutation could not be applied — m1 is not checking WHICH home the population comes from"
+else
+  # a FRESH box: `run_nodirs` reads $DUR/$LEG at CALL time, and the boxes above have moved them.
+  mk_box "$T/g29"
+  cp "$LEG/.pi/agent/auth.json" "$DUR/.pi/agent/auth.json"; chmod 600 "$DUR/.pi/agent/auth.json"
+  mkdir -p "$DUR/.config/systemd/user"
+  printf '[Service]\nEnvironment=HOME=%s\nExecStart=/bin/echo hi\n' "$LEG" >"$DUR/.config/systemd/user/legacyunit.service"
+  _out="$(run_nodirs "$MUT29" --check)"; _m29rc=$?
+  [ "$_m29rc" = 0 ] && ok "g29 WITH only the invoker's home in the population the durable home's user unit reads 'one home' (0) — m1 measures the resolution" \
+    || bad "g29 the invoker-home mutant still reported drift (rc $_m29rc) — m1 is not measuring the resolution"
+fi
+
+# g30: put the systemd-CREATED directories back into the existence requirement and m5 must redden — i.e.
+# m5 measures the SCOPE of the guard rather than a fixture that could never have been refused.
+MUT30="$T/mutdir26/cell-home-migrate-statedir.sh"
+mut_sub "$TOOL" "$MUT30" unit_scan 'StateDirectory|CacheDirectory|LogsDirectory|RuntimeDirectory) grade=0 ;;' 'NoSuchDirectiveX) grade=0 ;;'
+if cmp -s "$TOOL" "$MUT30"; then
+  bad "g30 the created-directory mutation could not be applied — m5 is not checking the guard's scope"
+else
+  mk_box "$T/g30"
+  printf '[Service]\nStateDirectory=%s/state\nExecStart=/bin/echo hi\n' "$LEG" >"$UNITS/statedir.service"
+  run_tool "$MUT30" --apply >/dev/null 2>&1; _m30rc=$?
+  [ "$_m30rc" != 0 ] && ok "g30 WITH the created directories graded by LOCATION a legitimate StateDirectory= unit is refused (rc $_m30rc) — m5 measures the scope" \
+    || bad "g30 the mutant converged anyway — m5 is not measuring the exclusion"
+fi
+
+# g31: drop the exec-prefix strip from `paths_in` (the pre-fix shape) and m8 must redden — i.e. m8
+# measures the prefix grading, not the existence guard as a whole (which g1 already covers).
+MUT31="$T/mutdir26/cell-home-migrate-prefix.sh"
+cp "$HERE/lib/cell-home.sh" "$T/mutdir26/lib/cell-home.sh"
+# ⛔ THE MUTATION TARGET IS THE LOOP HEADER, NOT THE OLD ONE-LINER (measured): the `-`-exemption fix
+# turned the single-line strip into a block (it must also RECORD that a `-` was present), so the pre-fix
+# spelling `while (substr(tok, 1, 1) ~ /[-+!@]/) tok = substr(tok, 2)` no longer exists and this mutant
+# could not be applied at all — the arm silently stopped proving anything. `while (0)` leaves the body
+# dead, which IS the pre-fix behaviour: a prefixed token does not start with `/` and is dropped.
+mut_sub "$TOOL" "$MUT31" paths_in 'while (substr(tok, 1, 1) ~ /[-+!@]/) {' 'while (0) {'
+if cmp -s "$TOOL" "$MUT31"; then
+  bad "g31 the exec-prefix mutation could not be applied — m8 is not checking the prefix strip"
+else
+  mk_box "$T/g31"; run_tool "$MUT31" --apply >/dev/null 2>&1
+  rm -f "$DUR/harness/run.sh"
+  printf '[Service]\nEnvironment=HOME=%s\nExecStart=+%s/harness/run.sh\n' "$LEG" "$LEG" >"$UNITS/p.service"
+  run_tool "$MUT31" --apply >/dev/null 2>&1; _m31rc=$?
+  if [ "$_m31rc" = 0 ] && grep -q "ExecStart=+$DUR/harness/run.sh" "$UNITS/p.service"; then
+    ok "g31 WITHOUT the prefix strip the tool DOES write a unit whose exec target is missing (rc 0) — m8 measures the prefix"
+  else
+    bad "g31 the mutant still refused (rc $_m31rc) — m8 is not measuring the prefix strip"
+  fi
+fi
+
+# g32: drop the `-` EXEMPTION from `paths_in` (the shape B-P1 shipped before review P1-1) and m12 must
+# redden — i.e. m12 measures the exemption, not the existence guard as a whole (which g1 covers).
+MUT32="$T/mutdir26/cell-home-migrate-dashopt.sh"
+cp "$HERE/lib/cell-home.sh" "$T/mutdir26/lib/cell-home.sh"
+mut_sub "$TOOL" "$MUT32" paths_in 'if (dash && dir ~ /^(EnvironmentFile|WorkingDirectory|ReadWritePaths|ReadOnlyPaths)$/) need = 3' 'if (0) need = 3'
+if cmp -s "$TOOL" "$MUT32"; then
+  bad "g32 the optional-target mutation could not be applied — m12 is not checking the '-' exemption"
+else
+  mk_box "$T/g32"; run_tool "$MUT32" --apply >/dev/null 2>&1
+  rm -f "$DUR/f.env"
+  printf '[Service]\nEnvironment=HOME=%s\nEnvironmentFile=-%s/f.env\nExecStart=/bin/echo hi\n' "$LEG" "$LEG" >"$UNITS/opt.service"
+  run_tool "$MUT32" --apply >/dev/null 2>&1; _m32rc=$?
+  [ "$_m32rc" != 0 ] && ok "g32 WITHOUT the '-' exemption an optional EnvironmentFile whose durable twin is absent is REFUSED (rc $_m32rc) — m12 measures the exemption" \
+    || bad "g32 the mutant converged anyway — m12 is not measuring the '-' exemption"
 fi
 
 printf '\n── (h) argument handling ────────────────────────────────────────────────────────────\n'

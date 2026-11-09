@@ -3996,7 +3996,7 @@ cmd_start() {
   # pinned a different root the re-pin would still create a worktree nobody reads and write a pin
   # pointing at it — advancing nothing while reporting success. So the values are passed explicitly.
   # The doctor's own note (see `start_doctor_loop`) records the measured cost of this same omission for
-  # SCOPE. Every value here is already in the injection guard's list below (:1697).
+  # SCOPE. Every value here is already in the injection guard's list in `cmd_start` (the `safe_argv` loop).
   # ── SERVICE MODE: this process IS the controller (agent-infra#2402) ──────────────────────────────
   # ⛔ THERE IS NO SECOND BOUNDARY HERE, SO THERE IS NO SECOND COPY OF THE ENVIRONMENT. The tmux command
   # string just below exists because a session is served the SERVER's environment, not this shell's —

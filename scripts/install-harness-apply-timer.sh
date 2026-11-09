@@ -139,8 +139,9 @@ PLATFORM="${ELDATO_PLATFORM:-$(uname -s 2>/dev/null || printf 'unknown')}"
 # `/home/cmux`) the unit carried `HOME=/home/cmux` AND `HARNESS_APPLY_STATE_DIR=/home/ubuntu/.pi/agent/state`:
 # one unit, two homes, i.e. the split this PR exists to remove, reintroduced inside a single file's
 # environment. The observable is the #2416/#2032 inert-enforcer shape with the parts swapped — the
-# scheduled pass writes `harness-apply.status` where nobody reads it, while an operator (or
-# fleet-health) reads `$CELL_HOME/.pi/agent/state/harness-apply.status` and finds nothing. The explicit
+# scheduled pass writes `harness-apply.status` where nobody reads it, while an operator — and
+# `tools/fleet/fleet-health.py`, which resolves the record from `HARNESS_APPLY_STATE_DIR` else `$HOME`
+# (agent-infra#3870) — read `$CELL_HOME/.pi/agent/state/harness-apply.status` and find nothing. The explicit
 # override still wins, which is the seam the suite and an unusual box use.
 STATE_DIR="${HARNESS_APPLY_STATE_DIR:-${CELL_HOME:?CELL_HOME is required}/.pi/agent/state}"
 INTERVAL_MIN="${HARNESS_APPLY_INTERVAL_MIN:-10}"
@@ -764,8 +765,23 @@ do_status() {
     # every bring-up that installs this. It is a FAILURE when the job claims it ran and left no usable
     # record: that is a pass refusing before it can write anything. Same split the disk-reaper status
     # verb records, and for the same reason.
-    case "$REC" in
-        status=never*)
+    # ⛔ THE VERDICT IS A LINE, NOT THE FIRST LINE (agent-infra#3453, measured). `--print-status` now
+    # emits READINGS before its verdict — `split_home=… derived=… why=[…]` on stdout for every verb (a
+    # refusal that exits before `write_record` leaves the PREVIOUS tick standing, so the split must be
+    # sayable on a status read), and, on a hand-run, a one-line note on stderr that `2>&1` above folds
+    # into the same blob. `case "$REC" in status=never*)` was therefore a PREFIX match on a blob that no
+    # longer starts with the verdict, so a no-record box whose blob BEGAN with a reading fell to the
+    # generic `*)` arm, which fails on `REC_RC` (3 for `status=never`) — `--status` exited 1 for a HEALTHY
+    # fresh install. ⛔ NOT EVERY NO-RECORD BOX (review cycle-10 #5): one whose blob is only the verdict
+    # still matched `status=never*`, so the blast radius is the READING-CARRYING blobs: a detected split, a
+    # `split_home=unmeasurable`, and the hand-run note. ⛔ "WHICH THE ARM BELOW EXERCISES" WOULD OVERSTATE
+    # IT (review cycle-11 #3): that arm pins the detected-split shape only, so the other two are measured
+    # here but not pinned there. In those shapes none of the three `never` states below could be reached,
+    # so the inert-timer diagnosis was unreachable in the state it exists for. Classifying the `status=`
+    # authoritative wherever the readings sit, and keeps working if another field is added in front.
+    REC_STATUS="$(printf '%s\n' "$REC" | sed -n 's/^status=\([a-z-]*\).*/\1/p' | head -1)"
+    case "${REC_STATUS:-}" in
+        never)
             # ⛔ "NEVER" IS TWO DIFFERENT STATES, and conflating them is how a dead timer certifies a
             # box: (a) the job has NOT FIRED YET — a fresh install, a note; (b) the job HAS fired and
             # left no record — the pass is refusing before it can write one, a FAILURE. The scheduler's

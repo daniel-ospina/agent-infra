@@ -123,7 +123,8 @@
 #   HARNESS_MATERIALISER  the script that materialises a pin (default <repo>/scripts/cloud-cell-supervisor.sh)
 #   HARNESS_APPLY_MODE    pin|sync — force one path (default: pin when a pin record exists, else sync
 #                         when the checkout carries ./sync.sh, else pin)
-#   HARNESS_APPLY_STATE_DIR  the pass record dir (default $HOME/.pi/agent/state)
+#   HARNESS_APPLY_STATE_DIR  the pass record dir (default $CELL_HOME/.pi/agent/state — the ONE home, so
+#                         the record lands beside the pin record the same pass writes)
 #   HARNESS_APPLY_STALE_SECONDS  a record older than this is STALE (default 3600 = 6 cadences)
 #   HARNESS_APPLY_SYNC_CMD   the sync verb to run on the sync path (default <repo>/sync.sh; the suite
 #                            points it at a stub so the fixture never runs pi-bootstrap)
@@ -174,7 +175,7 @@ set -uo pipefail
 # defeat `$REPO` resolution and any EXACT comparison against it). ⛔ THIS SITE **IS** PINNED — `T28` —
 # and the earlier note that it could not be was wrong about WHERE to look. The `case "$HERE"` farm-shape
 # refusals below are SUFFIX matches, so they cannot discriminate a doubled value; the observable that
-# does is the `deployed_drift=not-run` line (`:856`), which QUOTES `$HERE` — a two-line value pushes a
+# does is the `deployed_drift=not-run` line (the `log_line` that spells it), which QUOTES `$HERE` — a two-line value pushes a
 # newline into the text that must follow it on the same line. So T28 invokes this file by a RELATIVE
 # path from a cwd carrying `CDPATH` (the pair that makes `cd <dirname>` print) and asserts the boundary
 # after the quoted path: removing this `CDPATH=` reds that row and nothing else. Note the directory must
@@ -379,32 +380,62 @@ environment_cell_home() { # <file> — the CELL_HOME its Environment= lines set 
 $(logical_lines "$1")
 EOF
     case "$out" in
-        ''|*'{'*|*'%'*) return 0 ;;   # an unrendered placeholder or a specifier is not a reading
+        '') return 0 ;;   # no CELL_HOME= on this unit: a reading, and it is "nothing pinned"
+        # ⛔ AN UNRENDERED VALUE IS NOT A READING, AND IT IS NOT AGREEMENT EITHER (review cycle-9 #6).
+        # `{{CELL_HOME}}` (a template the installer never expanded) and `%h` (a systemd specifier) are both
+        # values this function cannot turn into a home. It used to answer '' for them — indistinguishable
+        # from "this unit pins no home", so the split test read `split_home=none` and every reader took it
+        # as measured agreement. Exit 3 is a THIRD ANSWER, carried up to `SPLIT_HOME_STATE=unmeasurable`:
+        # the split could not be measured, so nothing may claim it was.
+        *'{'*|*'%'*) return 3 ;;
     esac
     printf '%s\n' "$out"
 }
 
 dropin_cell_home() { # <unit-path> — the last CELL_HOME its drop-ins set, systemd's precedence order
-    local unit="$1" base d g name out="" v pre
+    local unit="$1" base d g name out="" v pre stem typ _rc unrend=0
     base="${unit##*/}"
-    local -a dirs=() names=()
+    local -a dirs=() names=() pres=()
     # ⛔ DROP-INS ARE NOT "THE DIRECTORY THE UNIT FILE WAS FOUND IN" (review round-3 F3, verified).
     # systemd.unit(5): drop-in files live in /etc, /run, /usr/local/lib and /usr/lib "regardless of where
     # the unit file itself is located" — so an /etc drop-in for a /usr/lib-installed unit IS applied, and
     # a `${unit}.d`-only reader misses it. Measured in a container: a unit under /usr/lib with its drop-in
     # under /etc/systemd/system/<name>.service.d read NOTHING.
-    # ⛔ AND A UNIT NAME CONTAINING `-` ALSO GETS DASH-TRUNCATED PREFIX DIRECTORIES (`eldato-…-.service.d`).
-    for pre in "$base" "${base%%-*}-"; do
-        # ⛔ `"${unit}.d"` FIRST: a unit found at an ARBITRARY path (the `HARNESS_APPLY_CONTROLLER_UNIT`
-        # seam, or a `CONTROLLER_SYSTEM_UNIT_DIR` override) keeps its own drop-in directory. Dropping it in
-        # favour of the standard dirs alone made the reader blind to the seam's own `.d` — measured by the
-        # T27 drop-in arm going red — which is the same class of blindness this function exists to remove.
-        [ "$pre" = "$base" ] && [ -d "${unit}.d" ] && dirs+=("${unit}.d")
-        for d in "/etc/systemd/system/$pre.d" "/run/systemd/system/$pre.d" \
-                 "/usr/local/lib/systemd/system/$pre.d" "/usr/lib/systemd/system/$pre.d" \
-                 ${HOME:+"$HOME/.config/systemd/user/$pre.d"} "/etc/systemd/user/$pre.d" \
-                 "/run/systemd/user/$pre.d" "/usr/local/lib/systemd/user/$pre.d" \
-                 "/usr/lib/systemd/user/$pre.d"; do
+    # ⛔ AND A UNIT NAME CONTAINING `-` ALSO GETS DASH-TRUNCATED PREFIX DIRECTORIES — with the TYPE
+    # SUFFIX KEPT AND EVERY DASH BOUNDARY A CANDIDATE (review F3, both reviewers). `systemd.unit(5)`:
+    # for `foo-bar-baz.service` the drop-in dirs are `foo-bar-baz.service.d`, `foo-bar-.service.d` and
+    # `foo-.service.d`. This used to build `<prefix>-.d` (`eldato-.d`), which systemd NEVER reads, and
+    # only ever built the FIRST truncation — so a `CELL_HOME=` pinned through a truncated drop-in
+    # measured nothing, `split_home` came back `none`, and a reading that did not happen read as
+    # agreement (the F-B/F-C class this file already closed twice).
+    pres=("${base}.d")
+    case "$base" in
+        *-*)
+            # ⛔ THE TYPE SUFFIX IS EVERYTHING AFTER THE **LAST** DOT, NOT THE FIRST (review P2, measured).
+            # `${base%%.*}`/`${base#*.}` split on the FIRST dot, and a dot is legal in a unit's name prefix
+            # (`systemd.unit(5)`), so `foo.bar-baz.service` produced `stem=foo` / `typ=bar-baz.service` —
+            # `[ "$typ" = "$stem" ]` did not fire, the loop found no `-` in `foo`, and the truncated dir
+            # `foo.bar-.service.d` was NEVER built (that name has ONE dash, so it has exactly one truncation).
+            # A `CELL_HOME=` pinned through it then measured nothing, `split_home` read `none`, and a reading
+            # that did not happen read as agreement — the exact class this block exists to close, one
+            # character of the name away.
+            stem="${base%.*}"; typ="${base##*.}"
+            [ "$typ" = "$stem" ] && typ=""          # no type suffix: nothing to keep
+            while :; do
+                case "$stem" in *-*) stem="${stem%-*}"; pres+=("${stem}-${typ:+.$typ}.d") ;; *) break ;; esac
+            done ;;
+    esac
+    # ⛔ `"${unit}.d"` FIRST: a unit found at an ARBITRARY path (the `HARNESS_APPLY_CONTROLLER_UNIT`
+    # seam, or a `CONTROLLER_SYSTEM_UNIT_DIR` override) keeps its own drop-in directory. Dropping it in
+    # favour of the standard dirs alone made the reader blind to the seam's own `.d` — measured by the
+    # T27 drop-in arm going red — which is the same class of blindness this function exists to remove.
+    [ -d "${unit}.d" ] && dirs+=("${unit}.d")
+    for pre in "${pres[@]}"; do
+        for d in "/etc/systemd/system/$pre" "/run/systemd/system/$pre" \
+                 "/usr/local/lib/systemd/system/$pre" "/usr/lib/systemd/system/$pre" \
+                 ${HOME:+"$HOME/.config/systemd/user/$pre"} "/etc/systemd/user/$pre" \
+                 "/run/systemd/user/$pre" "/usr/local/lib/systemd/user/$pre" \
+                 "/usr/lib/systemd/user/$pre"; do
             [ -d "$d" ] && dirs+=("$d")
         done
     done
@@ -417,19 +448,29 @@ dropin_cell_home() { # <unit-path> — the last CELL_HOME its drop-ins set, syst
         [ -n "$name" ] || continue
         for d in "${dirs[@]}"; do
             [ -r "$d/$name" ] || continue
-            v="$(environment_cell_home "$d/$name")"
-            [ -n "$v" ] && out="$v"
+            v="$(environment_cell_home "$d/$name")"; _rc=$?
+            # ⛔ AN UNMEASURABLE VALUE MUST DISPLACE A MEASURED ONE IT OVERRIDES (review cycle-10 #1,
+            # reproduced). This loop walks NAMES lexicographically and DIRECTORIES by precedence, so the
+            # LAST assignment here is the value systemd would apply. The first cut only LATCHED the
+            # unmeasurable flag, so a higher-precedence drop-in pinning `{{CELL_HOME}}` over a lower one
+            # pinning a real home left `out` holding the LOWER value: the reading printed agreement for a
+            # value the box does not run. The effective value is what must be reported, so an unmeasurable
+            # answer CLEARS `out` here and a measured one clears the flag — last mention wins either way.
+            if [ "$_rc" -eq 3 ]; then out=""; unrend=1
+            elif [ -n "$v" ]; then out="$v"; unrend=0; fi
             break   # the highest-precedence directory owns this NAME
         done
     done <<EOF
 $names
 EOF
-    [ -n "$out" ] && printf '%s\n' "$out"
+    [ -n "$out" ] && { printf '%s\n' "$out"; return 0; }
+    # a drop-in that pins an unrenderable CELL_HOME: the drop-in was READ and could not be measured
+    [ "${unrend:-0}" -eq 1 ] && return 3
     return 0
 }
 
 split_home_controller() { # prints the controller's pinned CELL_HOME, or nothing when it cannot be measured
-    local f v out="" name
+    local f v out="" name _rc unrend=0
     local -a units=()
     if [ -n "${HARNESS_APPLY_CONTROLLER_UNIT:-}" ]; then
         units=("$HARNESS_APPLY_CONTROLLER_UNIT")
@@ -448,13 +489,22 @@ split_home_controller() { # prints the controller's pinned CELL_HOME, or nothing
     fi
     for f in "${units[@]}"; do
         [ -r "$f" ] || continue
-        v="$(environment_cell_home "$f")"
-        [ -n "$v" ] && out="$v"
-        v="$(dropin_cell_home "$f")"
-        [ -n "$v" ] && out="$v"
+        # ⛔ SAME PRECEDENCE RULE AS `dropin_cell_home`: the LAST measurable-or-not answer wins, and an
+        # unmeasurable drop-in OVERRIDES the unit's measured value because systemd applies the drop-in
+        # (review cycle-10 #1 — the flag alone left `out` holding the value the box does not run).
+        v="$(environment_cell_home "$f")"; _rc=$?
+        if [ "$_rc" -eq 3 ]; then out=""; unrend=1
+        elif [ -n "$v" ]; then out="$v"; unrend=0; fi
+        v="$(dropin_cell_home "$f")"; _rc=$?
+        if [ "$_rc" -eq 3 ]; then out=""; unrend=1
+        elif [ -n "$v" ]; then out="$v"; unrend=0; fi
         break   # the first READABLE controller unit wins: a box has one controller
     done
-    [ -n "$out" ] && printf '%s\n' "$out"
+    [ -n "$out" ] && { printf '%s\n' "$out"; return 0; }
+    # ⛔ READ, BUT NOT MEASURABLE (review cycle-9 #6). The unit exists and was read; its CELL_HOME is a
+    # value this function refuses to interpret. Answering '' made that a `none` — the reading-did-not-
+    # happen class — so it answers exit 3 instead and the caller records `unmeasurable`.
+    [ "${unrend:-0}" -eq 1 ] && return 3
     return 0
 }
 CELL_HOME_LIB=""
@@ -467,6 +517,8 @@ _CELL_HOME_EXPLICIT="${CELL_HOME:-}"
 SPLIT_HOME=""
 SPLIT_HOME_WHY=""
 SPLIT_HOME_SRC=""
+SPLIT_HOME_STATE=""
+SPLIT_HOME_STATE_WHY=""
 if [ -n "$CELL_HOME_LIB" ]; then
   . "$CELL_HOME_LIB"
   CELL_HOME="$(cell_home_resolve)"
@@ -494,7 +546,30 @@ if [ -n "$CELL_HOME_LIB" ]; then
   # unconditionally on every invocation shape.
   _unit_invoked=0
   if [ -n "${INVOCATION_ID:-}" ] || [ -n "${JOURNAL_STREAM:-}" ]; then _unit_invoked=1; fi
-  if [ -z "$_CELL_HOME_EXPLICIT" ] && [ -n "${HOME:-}" ] && [ "$HOME" != "$CELL_HOME" ]; then
+  # ⛔ THE COMPARISON NORMALISES THE TRAILING SLASH (review P2, measured). It compared RAW strings, so a
+  # unit rendering `Environment=HOME=/home/cmux/` against the derived `/home/cmux` — one home, one
+  # character apart — exited 27 with "two live homes on one box". The installer refuses whitespace and
+  # backslashes in that value, NOT a trailing slash, and `/home/cmux/` is exactly the home this guard
+  # exists to protect; the sibling tool now normalises its own `HOME_DURABLE` once at startup
+  # (`cell-home-migrate.sh`). ⛔ WHAT PROTECTS THE SIBLING IS ITS `[ -n "${HOME:-}" ] &&` SHORT-CIRCUIT,
+  # NOT THE SPELLING (review cycle-5 #4 + cycle-6 #3): its line is
+  # `[ -n "${HOME:-}" ] && [ "${HOME%/}" != "$HOME_DURABLE" ] && printf …`, so the bare `${HOME%/}` is
+  # only ever evaluated when `HOME` is non-empty. Copying that expression WITHOUT the guard would abort
+  # under `set -u`. What is borrowed here is the RULE, not the expression: `${HOME:-}` above, then a
+  # separate strip, then `/` preserved as `/`.
+  # ⛔ `${HOME:-}`, NOT `${HOME}` (review N1, measured). This file runs under `set -uo pipefail` (see the
+  # `set` at the top), and these are STANDALONE assignments: a bare `${HOME%/}` on an unset `HOME` is a
+  # fatal expansion that ABORTS every verb before `write_record` — the installer then reports "the pass
+  # record is not healthy" and the
+  # tick leaves no record, i.e. exactly the silence this pass's doctrine refuses. The pre-change one-liner
+  # was safe only because `[ -n "${HOME:-}" ]` short-circuited BEFORE it touched `HOME`; the sibling
+  # spelling quoted above is safe for the same reason, which the normalisation dropped. Reachable by any
+  # HOME-less launcher (`env -i`, a minimal container/cron shape) that carries a `lib/cell-home.sh`
+  # sibling. `CELL_HOME` is always set by this point (the resolver prints exactly one line), and `:-` on it
+  # too keeps the two assignments identical in shape.
+  _home_n="${HOME:-}"; _home_n="${_home_n%/}"; [ -n "$_home_n" ] || _home_n=/
+  _cell_n="${CELL_HOME:-}"; _cell_n="${_cell_n%/}"; [ -n "$_cell_n" ] || _cell_n=/
+  if [ -z "$_CELL_HOME_EXPLICIT" ] && [ -n "${HOME:-}" ] && [ "$_home_n" != "$_cell_n" ]; then
     if [ "$_unit_invoked" = 1 ]; then
       SPLIT_HOME="$HOME"
       SPLIT_HOME_SRC="unit"
@@ -512,16 +587,48 @@ if [ -n "$CELL_HOME_LIB" ]; then
   # is the authoritative one — short-circuiting on `HOME` is what made a manual run's harmless reading
   # silence (or, before, pre-empt) the leg that can really mis-place a pin.
   if [ -z "$SPLIT_HOME" ]; then
-    _ctrl_home="$(split_home_controller)"
-    if [ -n "$_ctrl_home" ] && [ "$_ctrl_home" != "$CELL_HOME" ]; then
+    _ctrl_home="$(split_home_controller)"; _ctrl_rc=$?
+    # ⛔ THE SAME THREE-STEP NORMALISATION AS `_home_n`, NOT A BARE `%/` (review cycle-4 #6, measured):
+    # `%/` alone turns a controller pinning `/` into the EMPTY string, which was then compared against
+    # `_cell_n=/` — so the one configuration where the two sides AGREE (`CELL_HOME=/` explicit and a
+    # controller pinning `/`) exited 27 claiming "two live homes on one box", a false block whose message
+    # is false. The empty-to-`/` recovery is what keeps the two legs symmetric.
+    _ctrl_n="${_ctrl_home:-}"; _ctrl_n="${_ctrl_n%/}"; [ -n "$_ctrl_n" ] || _ctrl_n=/
+    if [ -n "$_ctrl_home" ] && [ "$_ctrl_n" != "$_cell_n" ]; then
       SPLIT_HOME="$_ctrl_home"
       SPLIT_HOME_SRC="controller"
       SPLIT_HOME_WHY="the controller's unit pins CELL_HOME=$_ctrl_home"
     fi
-    unset _ctrl_home
+    # ⛔ A READABLE UNIT WITH AN UNREADABLE VALUE IS A THIRD STATE, NOT AGREEMENT (review cycle-9 #6).
+    # `environment_cell_home` answers exit 3 for a CELL_HOME it cannot turn into a home (`{{CELL_HOME}}`
+    # from an unrendered template, `%h` a systemd specifier). Without this arm `_ctrl_home` was empty, the
+    # split test concluded `none`, and every reader took "I could not read the controller" as "the
+    # controller agrees" — which is the same class the `unmeasurable` state was added for, reached by a
+    # second route. The reason is carried so the reading can say WHICH route it came by.
+    if [ "$_ctrl_rc" -eq 3 ] && [ -z "$SPLIT_HOME" ]; then
+      SPLIT_HOME_STATE="unmeasurable"
+      SPLIT_HOME_STATE_WHY="the controller's unit was read but its CELL_HOME is not a value this box can interpret (an unrendered template, or a systemd specifier)"
+    fi
+    unset _ctrl_home _ctrl_n _ctrl_rc
   fi
+  unset _home_n _cell_n
 else
+  # ⛔ NO RESOLVER IS A THIRD STATE, NOT "NO SPLIT" (review P2). Without `lib/cell-home.sh` neither split
+  # leg runs, so `SPLIT_HOME` stays empty — and the acting path's reading line
+  # (`harness: … split_home=…`, the `log_line` that spells the whole reading) then reads as a MEASUREMENT
+  # that found agreement, which is the reading this file's own notes call worse than no guard. ⛔ IT IS A
+  # LOG FIELD, NOT A RECORD FIELD (review cycle-5 #3): `write_record` never writes `split_home`, so a
+  # reader chasing this justification into the record file would find nothing there and conclude the
+  # reading is unrecorded. The pass is the guard; every sibling consumer REFUSES (exit 78) when it cannot
+  # resolve, so the guard degrading silently is the one place that must not. The verdict is spelled in the
+  # reading, and the refusal on the acting verb is deliberately NOT invented (a piped `bash -s` start has
+  # no sibling file at all, which this file documents as ordinary): the reading says which of the two it is.
   CELL_HOME="${CELL_HOME:-${HOME:?HOME is required}}"
+  SPLIT_HOME_STATE="unmeasurable"
+  SPLIT_HOME_STATE_WHY="scripts/lib/cell-home.sh was not found beside this pass, so neither this pass's HOME nor the controller's CELL_HOME could be compared"
+fi
+if [ -z "${SPLIT_HOME_STATE:-}" ]; then
+  if [ -n "$SPLIT_HOME" ]; then SPLIT_HOME_STATE="$SPLIT_HOME"; else SPLIT_HOME_STATE="none"; fi
 fi
 unset _CELL_HOME_EXPLICIT
 O="${O:-$CELL_HOME/orchestrator}"
@@ -537,7 +644,30 @@ FETCH="${HARNESS_FETCH:-1}"
 PIN_SHA_FILE="${HARNESS_PIN:-$CELL_HOME/.pi/agent/state/HARNESS-PIN}"
 PIN_PATH_FILE="${HARNESS_PIN_FILE:-$CELL_HOME/.harness-path}"
 PIN_ROOT="${HARNESS_PIN_DIR:-$CELL_HOME/harness}"
-STATE_DIR="${HARNESS_APPLY_STATE_DIR:-${HOME}/.pi/agent/state}"
+# ⛔ THE RECORD LIVES UNDER THE ONE HOME, NOT UNDER `$HOME` (review cycle-5 #5). The pin record three
+# lines above (`HARNESS_PIN`, `.harness-path`, `harness/`) is rooted at `$CELL_HOME`; rooting the STATUS
+# record at `$HOME` made the pass write its pins under the DERIVED home and its own `.status` record under
+# the INVOKING shell's home — so on exactly the shapes this change is about (`cmux vm exec`, `HOME` at a
+# directory that does not exist on the image) a reader looking under the cell home finds the pins and no
+# record: a reading that does not happen, and it reads as "no pass yet". `$CELL_HOME` is already resolved
+# above, and the installer renders `HARNESS_APPLY_STATE_DIR` explicitly, so this default is the
+# manual/fallback answer and it is now the SAME home as everything else the pass writes.
+# ⛔ SCOPE, STATED PLAINLY (review cycle-6 #1, corrected cycle-10 #2): this makes the pass agree with the
+# installer's `--status`, with its own `--print-status`, and with the rendered unit, which exports
+# `HARNESS_APPLY_STATE_DIR` on both platforms. TWO in-repo readers resolve the same file WITHOUT that
+# export and therefore differ on the HAND-RUN shape only: `tools/fleet/fleet-health.py` reads the variable
+# but DEFAULTS to `~` (it does not resolve `CELL_HOME`), and `scripts/orchestrator-harness/harness-roles.sh`
+# resolves the apply LOG the same way (`${HARNESS_APPLY_STATE_DIR:-$HOME/.pi/agent/state}/harness-apply.log`).
+# ⛔ "DOES NOT HONOUR THE VARIABLE" WOULD BE FALSE FOR BOTH — each honours it and defaults to `$HOME`, so
+# EXPORTING THE SEAM IS A WORKING FIX for either (that is the correction: the earlier text said
+# `fleet-health.py` ignores it, which would have told whoever fixes #3870 that exporting cannot help). On a
+# box whose `HOME` is not the derived home a hand-run pass's record/log is visible to `--print-status` and
+# to neither of those two; the SCHEDULED record agrees with all of them, because the unit exports the
+# variable. That gap is agent-infra#3870 (filed, category A: an alarm surface that silently misses a
+# record) and this comment must not be read as closing it.
+# ⛔ AND IT REMOVES A `set -u` FATAL: the old default spelled `${HOME}` inside a `:-`, which aborts on a
+# HOME-less launcher (`env -i`, a minimal cron shape) before `write_record`.
+STATE_DIR="${HARNESS_APPLY_STATE_DIR:-$CELL_HOME/.pi/agent/state}"
 STALE_SECONDS="${HARNESS_APPLY_STALE_SECONDS:-3600}"
 RECORD="$STATE_DIR/harness-apply.status"
 LOG="$STATE_DIR/harness-apply.log"
@@ -773,9 +903,14 @@ farm_sum_count() {
 }
 
 # ⛔ ONE PUBLISH PATH FOR EVERY ARM THAT HAS SOMETHING TO NAME (review round 13, reproduced). The
-# `farm-unknown` arm (instrument exit 2) ALSO prints per-file rows BEFORE it gives up — its
-# `matched -eq 0` and mixed-ungradeable exits come AFTER the per-file loop (check-farm-drift.sh:689,
-# :699) — so "no grade" was taken to mean "nothing was reported" and those names were dropped.
+# `farm-unknown` arm (instrument exit 2) ALSO prints per-file rows BEFORE it gives up — the POST-LOOP
+# give-up exits in `check-farm-drift.sh` (its `matched -eq 0` arm and the mixed-ungradeable pair, the two
+# this parenthetical names) come after the per-file loop, so "no grade" was taken to mean "nothing was
+# reported" and those names were dropped. ⛔ NO UNIVERSAL (review cycle-9 #2, corrected cycle-10 #4): the
+# instrument ALSO gives up in places that are not post-loop — before its loop on an unresolvable `--src`,
+# a missing `$DEST`, an unresolvable `--ref` or a broken symlinked layer (which have no row to publish),
+# and INSIDE the loop on a file it cannot grade (which has already published the earlier rows). "Every
+# give-up exit" and "every post-loop exit" were both wrong; the two arms are named instead.
 # Measured: 2 UNSOURCED rows then exit 2 printed only the UNKNOWN reason, wrote no artifact, and named
 # both files NOWHERE. The write is atomic (temp + rename), REFUSES a directory at the published path,
 # and records its own outcome, so neither arm can drift from the other.
@@ -796,9 +931,9 @@ publish_farm_rows() {   # $1 body, $2 header note → sets REC_FARM_ROWS, FARM_R
     # `[ -f ]` is DEFENCE IN DEPTH for the concurrent case and is stated as such (#3442).
     # ⛔ AND IT IS UNPINNED BY CONSTRUCTION — one of this file's DECLARED inert-defence sites. The
     # others, each measured to leave the suite green when deleted (review rounds 25 and 30):
-    #   * the `CDPATH=` on the `$FARM_DEST_REAL`/`$HERE_REAL` legs (`:1516`, `:1525`),
-    #   * `[ -n "$HERE_REAL" ] &&` in the self-grade comparison (`:1526`),
-    #   * `[ -n "$FARM_DEST_REAL" ] &&` in the inside-the-farm containment test (`:1532`) — searched
+    #   * the `CDPATH=` on the `$FARM_DEST_REAL`/`$HERE_REAL` legs (two `CDPATH=` prefixes),
+    #   * `[ -n "$HERE_REAL" ] &&` in the self-grade comparison (the self-grade leg),
+    #   * `[ -n "$FARM_DEST_REAL" ] &&` in the inside-the-farm containment test (the containment leg) — searched
     #     for by the round-30 reviewer precisely because this list did not name it.
     # Measured (review round 25): deleting `&& [ -f "$FARM_ROWS_FILE" ]` leaves the suite green. That is not an oversight — the only
     # state it can catch is a race (something replacing the published path with a directory between the
@@ -880,6 +1015,10 @@ print_status() {
 # or an operator inspecting a box is the last to learn why it is red.
 if [ -n "$SPLIT_HOME" ]; then
     log_line "split_home=$SPLIT_HOME derived=$CELL_HOME from=${SPLIT_HOME_SRC:-unknown} why=[$SPLIT_HOME_WHY] — two live homes on one box (agent-infra#3453); the refusal on the acting verb names the instrument that resolves it"
+elif [ "$SPLIT_HOME_STATE" = unmeasurable ]; then
+    # ⛔ SAY THE THIRD STATE (review P2). Silence here was indistinguishable from "measured, no split",
+    # and `--print-status`/`--dry-run` are exactly the verbs an operator uses to find out.
+    log_line "split_home=unmeasurable — ${SPLIT_HOME_STATE_WHY:-the split could not be measured}; NOTHING was measured, so this is not agreement (agent-infra#3453)"
 fi
 
 if [ "$MODE" = "status" ]; then print_status; exit $?; fi
@@ -1096,7 +1235,7 @@ recompute_deployed() {
 # measured from the DEPLOYED commit. Printing only the checkout's made the log say `behind=1` on a box
 # whose record (correctly) said `behind=0` — two numbers for one box in one pass, and the log's was the
 # one an operator is told to trust.
-log_line "harness: mode=$PASS_MODE repo=$REPO ref=$REF fetch=$FETCH_STATE head=$(short "$HEAD_SHA") checkout_relation=$RELATION checkout_behind=$BEHIND ref_sha=$(short "$REF_SHA") dirty=$DIRTY_N pin=$REC_PIN pin_tree=$REC_PIN_TREE split_home=${SPLIT_HOME:-none}"
+log_line "harness: mode=$PASS_MODE repo=$REPO ref=$REF fetch=$FETCH_STATE head=$(short "$HEAD_SHA") checkout_relation=$RELATION checkout_behind=$BEHIND ref_sha=$(short "$REF_SHA") dirty=$DIRTY_N pin=$REC_PIN pin_tree=$REC_PIN_TREE split_home=$SPLIT_HOME_STATE"
 [ "$PASS_MODE" = pin ] && [ "$REC_PIN_TREE" != "none" ] && \
     log_line "harness: deployed=$REC_PIN_TREE (the tree the pin names — this is what the box RUNS; the checkout above is not moved by a pin advance)"
 
@@ -1137,7 +1276,7 @@ read_deployed_drift() {
         # executing harness, which is exactly the silent green this change exists to end.
         # `$O` is where the checker IS deployed, so it is the candidate that works in production.
         # ⛔ AND THE GOVERNED CHECKOUT IS A CANDIDATE (review P2, #10114). `$AGENT_INFRA_PATH` is DEAD
-        # under the scheduler — this file says so itself (:225: "under the scheduler — where there is no
+        # under the scheduler — this file says so itself (the `HARNESS_APPLY_REPO`/`HARNESS_APPLY_REF` note: "under the scheduler — where there is no
         # AGENT_INFRA_PATH and the farmed copy has no checkout beside it") — and `pi-bootstrap`'s
         # `fleet_srcs` farms THIS PASS WITHOUT the checker, so on a box whose `$O` carries no checker
         # candidates 1-4 all miss while the checker sits in `$REPO`, which the unit DOES export
@@ -1505,8 +1644,14 @@ if [ -n "$SPLIT_HOME" ]; then
     # printed remedy is a no-op, and the tick stays red forever. The remedy is now derived from WHERE the
     # disagreement came from: the legacy literal → the migration really is the tool; any other home →
     # the installer that rendered the unit, which is the thing that must be re-run.
-    case "$SPLIT_HOME" in
-      "$CELL_HOME_LEGACY")
+    # ⛔ COMPARED NORMALISED, LIKE THE GUARD ABOVE (review cycle-9 #4). `$SPLIT_HOME` is the RAW pin, and a
+    # unit whose value ends in `/` is refused by the split test (both sides are stripped there) yet failed
+    # this selector, which sent the operator to the installer with a sentence claiming the migration
+    # "reports this box converged" — false: `cell_home_project_line` treats a trailing `/` as a component
+    # boundary, so `--check` DOES report drift and `--apply` DOES repoint it. One normalisation, used by
+    # both, so the branch cannot disagree with the refusal it explains.
+    case "${SPLIT_HOME%/}" in
+      "${CELL_HOME_LEGACY%/}")
         REC_REMEDY="converge the box: bash scripts/cell-home-migrate.sh --check, then --apply (it repoints the legacy $CELL_HOME_LEGACY)" ;;
       *)
         if [ "$SPLIT_HOME_SRC" = controller ]; then
@@ -1897,7 +2042,7 @@ if [ "$FARM_CHECK_ON" = "1" ]; then
         FARM_RC=$?
         # The checker's own per-file vocabulary, matched on the FINAL column, and ONLY the four it
         # actually prints as a verdict. `MISSING` and `LOCAL (undeclared)` are not tokens it emits;
-        # `SYMLINK` IS printed (`check-farm-drift.sh:486`, "SYMLINK (graded via its target)") but that
+        # `SYMLINK` IS printed (the instrument's `SYMLINK (graded via its target)` line) but that
         # row is INFORMATIONAL — a healthy link — so matching the bare token would name a good file as
         # drift the moment the anchor is relaxed (#10114 review round 2).
         # (A `FARM_NAMED` short list was computed here and never read — the row extraction below owns
@@ -2029,7 +2174,7 @@ if [ "$FARM_CHECK_ON" = "1" ]; then
         # verdictless, and recorded `farm_rows=none` / `farm_n=0` / `farm: ok` — the values the doc
         # defines as "the farm matched", over a farm that was never graded, with `--print-status`
         # answering `status=ok`. A match is PROVEN by the instrument's own `OK —` line
-        # (`check-farm-drift.sh:706`), which it prints before exiting; anything else is a grade nobody
+        # (the instrument's own `OK —` line), which it prints before exiting; anything else is a grade nobody
         # can read, and it fails CLOSED. This SUBSUMES the emptiness test (empty output carries no
         # verdict either), so the two are one condition rather than two that can drift apart.
         # Case-insensitive because the suite's clean stubs print `check-farm-drift: ok — 0 stale …`.
@@ -2223,7 +2368,7 @@ if [ "$FARM_CHECK_ON" = "1" ]; then
                     # ⛔ ONE POPULATION, ONE COUNT (review round 12, reproduced). The excerpt was
                     # `head -12` of the raw output while the elision counted `grep -c .` — NON-BLANK
                     # lines — and the real instrument prints a blank line before its summary
-                    # (check-farm-drift.sh:688). Measured: 11 rows + a blank + the summary (13 lines,
+                    # (the instrument prints it after its rows). Measured: 11 rows + a blank + the summary (13 lines,
                     # 12 non-blank) printed a 12-line excerpt that swallowed the summary, then said
                     # nothing at all because `12 -gt 12` is false; 20 rows + 4 blanks printed 12 lines
                     # holding 10 rows and claimed "and 8 more line(s)". Blanks are dropped ONCE, in the
@@ -2361,8 +2506,9 @@ if [ "$FARM_CHECK_ON" = "1" ]; then
             *)
                 REC_ACTION=farm-unknown
                 # ⛔ BUT WHAT IT DID PRINT IS STILL PUBLISHED (review round 13, reproduced). The
-                # instrument prints its per-file rows BEFORE the exits that give up (check-farm-drift.sh
-                # :689 `matched -eq 0`, :699 mixed ungradeable), so "no grade" never meant "nothing was
+                # instrument prints its per-file rows BEFORE the exits that give up after GRADING (the
+                # instrument's pre-loop exits have no rows to publish — see `publish_farm_rows`), so
+                # "no grade" never meant "nothing was
                 # reported": measured, 2 UNSOURCED rows then exit 2 was recorded as `farm_rows=not-graded`
                 # with both names durable NOWHERE. `action=farm-unknown` still says no grade was
                 # produced; the file now carries the instrument's output when it printed any.
