@@ -39,6 +39,16 @@ set -uo pipefail
 # cell's keys.env) would be compared against every fixture checkout's origin and redden unrelated arms
 # — and would let this harness carry the very defect the new conformance arm exists to catch.
 unset GH_REPO
+# ⛔ THE SAME RULE FOR `ORCH_FOREGROUND`, AND IT IS NOT COSMETIC (#2093). The fleet's own controller
+# exports `ORCH_FOREGROUND=1` to every lane it spawns, so a suite run from a lane — the normal place
+# this contract is run — inherited =1 and every `start` arm took the SERVICE-MANAGER path
+# (`foreground_handover`) instead of the operator path these arms are about. Measured 2026-11-09 on
+# this box: with the ambient value left in place, `start` hung on a fixture session for the whole
+# orphan bound and the suite never finished (killed at 1800 s), and four unrelated arms reddened with
+# "never reached the launch" / "could not recover the command string" — none of them about the code
+# under test. A contract that cannot be run where the work happens grades nothing, so the caller
+# variable is pinned to the OPERATOR shape here, exactly as GH_REPO is stripped above.
+unset ORCH_FOREGROUND
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # SUP may be OVERRIDDEN so the suite can be run against another copy of the supervisor — that is how
@@ -3204,6 +3214,17 @@ esac
 #       skipping the check whenever the addressed unit is disabled hides exactly this case.
 say_case "stop on a service-managed box: the unit's effect is read AFTER the teardown"
 S2="$T/svc2"; rm -rf "$S2"; mkdir -p "$S2/units" "$S2/o" "$S2/home" "$S2/repo" "$S2/bin"
+# ⛔ THE FIXTURE CHECKOUT NEEDS ITS ORIGIN (#2093). `stop` now runs the queue-target pre-flight, so it
+# reads `git -C $REPO remote get-url origin` the way `start`/`check` always have — and a fixture `repo`
+# with no origin is the ONE shape a real cell never has. Without it every teardown arm below reddened
+# on the #1901 gate instead of on the behaviour it pins (a false red that would hide a real regression
+# in the unit stop). A real cell's checkout has an origin, so the fixture now has the one `OR` names.
+cell_repo() { # <dir> <owner/repo> — a checkout that answers `remote get-url origin` like a real cell's
+  git -C "$1" init -q 2>/dev/null || return 1
+  git -C "$1" remote remove origin >/dev/null 2>&1 || true
+  git -C "$1" remote add origin "https://github.com/$2.git" || return 1
+}
+cell_repo "$S2/repo" daniel-ospina/agent-infra || bad "fixture: could not give the svc2 checkout an origin"
 : > "$S2/units/eldato-orchestrator.service"
 cat > "$S2/bin/systemctl" <<'SH'
 #!/bin/bash
@@ -3262,6 +3283,7 @@ S2C="$(cat "$S2/o/.orch.lock" 2>/dev/null)"; { [ -n "$S2C" ] && kill -9 "$S2C"; 
 # remove — while `status` printed "nothing will restart it" over a supervised cell.
 say_case "unit ownership survives a keys.env that repoints \$O, and a genuinely foreign unit is still foreign"
 S3="$T/svc3"; rm -rf "$S3"; mkdir -p "$S3/units" "$S3/o" "$S3/home" "$S3/repo" "$S3/bin" "$T/no-user-units"
+cell_repo "$S3/repo" daniel-ospina/agent-infra || bad "fixture: could not give the svc3 checkout an origin"
 printf 'O=%s/o\n' "$S3" > "$S3/home/keys.env"
 # the installer rendered ITS OWN $O — a different path from the one keys.env resolves the controller to
 cat > "$S3/units/eldato-orchestrator.service" <<SH
@@ -5634,6 +5656,10 @@ fi
 #      controller)". Driven against the SHIPPED script (not the extracted functions): the decision
 #      lives in cmd_stop's refusal path, and a re-implementation of it would pass on the broken copy.
 C2="$T/own-session"; mkdir -p "$C2/bin" "$C2/o" "$C2/home"
+# ⛔ `REPO` HERE IS `$C2/home`, SO IT NEEDS AN ORIGIN TOO (#2093). `stop`'s queue pre-flight reads it,
+# and a checkout with no origin is a state the verb refuses — which would turn every #2315 arm below
+# into a red on the gate rather than on the leftover sweep it pins. See `cell_repo` in §2402.
+cell_repo "$C2/home" daniel-ospina/agent-infra || bad "fixture: could not give the own-session checkout an origin"
 : > "$C2/home/keys.env"
 # The tmux double is STATEFUL: a session exists while $C2/session does, and kill-session removes it —
 # so "did stop clear it" is answered by the next has-session, exactly as the real verb reads it.
