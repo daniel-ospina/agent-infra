@@ -1365,7 +1365,8 @@ ck "WAIT_S ($_ws) + MAX_WATCH x POLL ($_mw x $_ps) + IMPL_RESERVE ($_ir) = $(( $
 # clock a lane sits through) min 1931 s, p50 4062 s, p90 9825 s, p95 17185 s, max 32157 s;
 # RUN DURATION
 # (`run_started_at` -> `updated_at`, excluding the pre-start queue) min 1623 s, p50 3836 s, p90 4928 s,
-# p95 5612 s, max 7968 s. 4800 s sits above the fast day's run-duration p95 (4565 s) and is 3.2x the bound
+# p95 5612 s, max 7968 s. 4800 s sits above the fast day's run-duration p95 (~4565 s on the first read,
+# 4708 s later — it is quoted as a bound, not a measurement) and is 3.2x the bound
 # this arm exists to keep out, and the shipped 5400 s covers 79.9 % of the lane-visible population
 # (167/209) / 94.3 % of the run-duration one (197/209) — both stated in the script.
 # ⛔ THE CLAIM IS STATED NO STRONGER THAN THE DATA SUPPORTS, TWICE OVER.
@@ -1544,6 +1545,25 @@ new_o "$T/pr4.tsv"
 WAIT_S=60 POLL_S=5 LANE_MERGE_ELAPSED_S=7180 run 35 --repo o/r --pr-tsv "$T/pr4.tsv" --checks-tsv "$T/checks-inflight.tsv"
 ck "a lane that has already spent 7180 s of its 7200 s clock CAPS the check wait to the 10 s that is left (still WAITING_CHECKS, still a verdict) instead of waiting to be WALL-TERMed with none" \
    $([ "$RC" = 11 ] && [ "$(verdict_of 35 | cut -d' ' -f1)" = WAITING_CHECKS ] && grep -q 'CAPPED at 10s' <<<"$OUT" && grep -q 'already spent 7180s' <<<"$OUT" && echo 0 || echo 1)
+# …and the clock it clamps against is the ARMED one, including the ceiling-reducer seam (review, P3 —
+# verified against spawn-gate.sh's `lane_wall_bound`, which arms `min(caller, LANE_BOUND_WALL_S)` for a
+# POSITIVE value and REFUSES to reduce to a `0`). Mirroring only LANE_TIMEOUT/LANE_BACKSTOP_S clamped
+# against a clock the lane does not have: with `LANE_BOUND_WALL_S=3600` and 3000 s spent, the 5400 s wait
+# was cut to 4160 s (7200 − 3000 − 40, the shipped 20 s interval ⇒ 40 s margin) — 560 s PAST a clock that
+# ends at 3600 s, i.e. TERMed mid-wait with no verdict, the unlabelled kill the clamp exists to prevent.
+# (This arm's harness forces `LANE_MERGE_INTERVAL=5` ⇒ a 10 s margin, so its arithmetic is 4190/590 —
+# the same 560 s overshoot measured against the same clock, with the margin the fixture actually uses.)
+# ⛔ THIS ARM MUST READ THE *WALL* CLAMP, NOT "THE FIRST CAPPED LINE" (verified by mutation — the first
+# draft of this arm read `head -1` and was both WRONG and VACUOUS: this fixture emits the WATCHDOG cap
+# first (2690 s, because WAIT_S 5400 ≥ the 2700 s allowance) and the wall clamp second (590 s), so `head -1`
+# measured the watchdog cap, produced the same number with the new block disabled, and could never have
+# caught the regression it exists for). The wall clamp's message is the one carrying the spent/clock
+# sentence, so it is matched specifically — and the assertion is the RELATION, not a stamped integer.
+new_o "$T/pr4.tsv"
+WAIT_S=5400 POLL_S=5 LANE_BOUND_WALL_S=3600 LANE_MERGE_ELAPSED_S=3000 run 39 --repo o/r --pr-tsv "$T/pr4.tsv" --checks-tsv "$T/checks-inflight.tsv"
+_cap39="$(sed -n 's/.*CAPPED at \([0-9][0-9]*\)s (this lane had already spent.*/\1/p' <<<"$OUT" | head -1)"
+ck "LANE_BOUND_WALL_S=3600 (the documented CEILING REDUCER) is the clock the wait is clamped against, not the 7200 s caller bound — the WALL clamp reads ${_cap39:-?}s, and cap + 3000 spent + 10 margin = $(( ${_cap39:-0} + 3010 )) = the armed wall" \
+   $([ "$RC" = 11 ] && [ "$(verdict_of 39 | cut -d' ' -f1)" = WAITING_CHECKS ] && [ -n "${_cap39:-}" ] && [ $(( ${_cap39:-0} + 3010 )) = 3600 ] && echo 0 || echo 1)
 # …and a lane's elapsed time it CANNOT resolve is disclosed, never silently treated as "the lane just started".
 new_o "$T/pr4.tsv"
 WAIT_S=0 run 36 --repo o/r --pr-tsv "$T/pr4.tsv" --checks-tsv "$T/checks-inflight.tsv"
@@ -1727,7 +1747,7 @@ printf '1\n' > "$OT/state/lanemerge-54.watch"
 OUT="$(REPO_PATH="${REPO_PATH:-$RUN_REPO}" PATH="$BIN:$PATH" GH_LOG=/dev/null O="$OT" HOME="$T/home" \
       LANE_TIMEOUT=0 LANE_BACKSTOP_S=3600 LANE_MERGE_ELAPSED_S=3400 LANE_MERGE_WAIT=0 LANE_MERGE_POLL=0 LANE_BOUND_IDLE_S=0 \
       bash "$SCRIPT" 54 --watch --repo o/r --pr-tsv "$T/pr-fit.tsv" 2>&1)"; RC=$?
-ck "the backstop-derived allowance counts only what is LEFT of the backstop: (3600-3400-10)/120 = 1 chunk, so the 2nd is refused (the un-subtracted branch would admit 29)" \
+ck "the backstop-derived allowance counts only what is LEFT of the backstop: (3600-3400-40)/120 = 1 chunk, so the 2nd is refused (the un-subtracted branch would admit 29)" \
    $([ "$RC" = 13 ] && grep -q '1 --watch chunks spent' <<<"$OUT" && echo 0 || echo 1)
 
 # ⛔ THE RE-INVOCATION PATH (review round 3, P2 — verified): the documented resume omits `--issue` and
