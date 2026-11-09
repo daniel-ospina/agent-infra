@@ -734,6 +734,17 @@ case "$OUT" in
   *"[reap] SKIPPED:"*) bad "idle-reap: the reap printed an UNREADABLE-listing skip for a window it deliberately did not ask for — that sends an operator after a reader that never ran" ;;
   *) ok "idle-reap: no 'not readable' skip is printed for a window that was never requested" ;;
 esac
+# ⛔ THE OTHER UNREADABLE-SKIP SHAPE, WHICH THE ROW ABOVE DOES NOT MATCH (fresh review of #1984,
+# observation 1 — refuted as inert). `[reap] SKIPPED:` is the LISTING half; `[reap] SKIPPED (checked: …)`
+# is the REFUSAL of the checked classification, and it is what the reap's
+# `have_pr = have_pr or _pr_not_asked` exists to prevent. Measured: dropping that `or` leaves the row
+# above GREEN (its glob requires the colon right after `SKIPPED`) while the pass prints `[reap]
+# SKIPPED (checked: .pr_brs unreadable)` over a window it never asked for — the same log-lie, one arm
+# over. So the claim that the pair is dead weight is falsifiable, and this is what falsifies it.
+case "$OUT" in
+  *"[reap] SKIPPED (checked:"*) bad "idle-reap: a window this pass never ASKED for was reported as an UNREADABLE .pr_brs to the checked half — 'we did not ask' must not read as a broken reader" ;;
+  *) ok "idle-reap: the checked half is not refused as unreadable over a window that was never requested" ;;
+esac
 # Non-vacuity: the SAME fixture with one row then asks for both windows, so the zero above is the
 # empty blacklist rather than a stub that records nothing.
 mk_case idle-reap-control 1000

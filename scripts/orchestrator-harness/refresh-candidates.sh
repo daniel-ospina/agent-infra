@@ -3107,6 +3107,13 @@ _pr_window_blind = (not _pr_not_asked) and _pr_clipped and _pr_limit < 500
 # narrowing lines sit inside the `if [ "$REAP_PR_LIMIT" -eq 0 ] else` branch, so a declined window
 # cannot reach them — and a Python twin of it would be DEAD CODE (defined, never read) claiming a duty
 # it does not perform. It is deliberately not restated here.
+# ⛔ THESE TWO ARE NOT BELT-AND-BRACES, AND NOT DEAD WEIGHT (fresh review of #1984, observation 1,
+# refuted): drop one and the refusal below reads it. Without `or _pr_not_asked`, `have_pr` is False for
+# the ABSENT file a deliberate skip leaves behind, so `if not have_pr:` REFUSES the checked
+# classification and publishes `refused=pr-brs-unreadable` — a pass that never asked for the window
+# reporting a broken reader that never ran, which is the log-lie the block above forbids. They are
+# inert only in STATISTICS (a not-asked window implies both row files are empty, so there is nothing
+# left to classify); the POLARITY they carry is the whole point.
 have_open = have_open or _open_not_asked
 have_pr = have_pr or _pr_not_asked
 # PRESENT BUT UNDECODABLE IS THE ABSENT CASE (see `lines()`): existence is not readability, and the
