@@ -1105,6 +1105,39 @@ out="$(darwin_run --verify)"; rc=$?
 [ "$rc" -eq 1 ] && ok "--verify still FAILS a genuine NOT INSTALLED (the scan was not neutered by the fix)" \
   || bad "closing the retired false-FAIL also stopped flagging real absences (rc=$rc): $out"
 
+# ⛔ AND THE NEW WORDINGS ARE COUNTED, NOT JUST CARRIED BY THE EXIT CODE (#1867 review P3).
+# `install-launchd.sh --status` gained `UNMANAGED` (installed with no template) and `UNKNOWN` (the
+# installed set could not be enumerated). Neither was in the count scan, so a run whose ONLY failures
+# were those printed `SCHEDULE NOT VERIFIED — 0 launchd job(s) … above` while returning 1 — the status
+# was right and the count beside it said nothing failed. This delegate isolates the COUNT from the rc:
+# it exits 0 and fails only in the new wording, so a scan that cannot see the wording reports 0.
+cat > "$DARWIN_ROOT/scripts/install-launchd.sh" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "${1:-<no args>}" >> "$DELEGATE_RECORD"
+echo "  ⛔ UNMANAGED — installed with NO template in the declared set:" >&2
+echo "    com.eldato.mystery ($HOME/Library/LaunchAgents/com.eldato.mystery.plist)" >&2
+exit 0
+SH
+chmod +x "$DARWIN_ROOT/scripts/install-launchd.sh"
+out="$(darwin_run --verify)"; rc=$?
+grep -q 'SCHEDULE NOT VERIFIED — 1 launchd job(s)' <<<"$out" \
+  && ok "an UNMANAGED-only failure is COUNTED as 1 job, not printed as '0 … above'" \
+  || bad "an UNMANAGED-only failure printed a 0-job verdict — the count scan cannot see the new wording: $out"
+[ "$rc" -eq 1 ] && ok "…and the verdict is still NOT VERIFIED" \
+  || bad "the UNMANAGED-only failure returned $rc, not 1"
+cat > "$DARWIN_ROOT/scripts/install-launchd.sh" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "${1:-<no args>}" >> "$DELEGATE_RECORD"
+echo "  ⛔ UNKNOWN — $HOME/Library/LaunchAgents exists but could NOT be enumerated (rc 2)." >&2
+exit 2
+SH
+chmod +x "$DARWIN_ROOT/scripts/install-launchd.sh"
+out="$(darwin_run --verify)"; rc=$?
+grep -q 'SCHEDULE NOT VERIFIED — 1 launchd job(s)' <<<"$out" \
+  && ok "an UNKNOWN-only failure is COUNTED too (the enumeration answer is a failure, not a caveat)" \
+  || bad "an UNKNOWN-only failure printed a 0-job verdict: $out"
+
+
 # ── 11. a Label is a PATH COMPONENT, so it is validated before it is used as one ─────────────
 case_ "11. a Label that is not a safe file name is refused, and cannot escape the state dir"
 LABELDIR="$FIX/bad-label"; mkdir -p "$LABELDIR"; cp "$GOOD/RETIRED" "$LABELDIR/RETIRED"

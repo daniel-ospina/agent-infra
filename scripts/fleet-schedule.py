@@ -3641,10 +3641,21 @@ def cmd_darwin(mode):
             text=True,
         )
         text = out.stdout + out.stderr
+        # ⛔ THE NEW WORDINGS COUNT TOO (#1867 review P3). `install-launchd.sh --status` reports an
+        # installed job with no template as `UNMANAGED` and an enumeration it could not perform as
+        # `UNKNOWN`; neither word was in this scan, so a run whose ONLY failures were those printed
+        # `SCHEDULE NOT VERIFIED — 0 launchd job(s) … above` while returning 1 — the exit status was
+        # right and the count beside it said nothing failed. Both are named here, and so is the
+        # identity prefix those two lines carry (`⛔ UNMANAGED` / `⛔ UNKNOWN`), because a bare
+        # substring would also match a healthy row that merely mentions the word.
         bad = [
             line
             for line in text.splitlines()
-            if "NOT INSTALLED" in line or "DRIFTED" in line or "not loaded" in line
+            if "NOT INSTALLED" in line
+            or "DRIFTED" in line
+            or "not loaded" in line
+            or "UNMANAGED" in line
+            or "UNKNOWN" in line
         ]
         for line in bad:
             print("  FAIL   %s" % line.strip(), file=sys.stderr)
@@ -3660,7 +3671,9 @@ def cmd_darwin(mode):
             )
         if bad or out.returncode != 0:
             print(
-                "SCHEDULE NOT VERIFIED — %d launchd job(s) not installed/loaded/in sync above"
+                "SCHEDULE NOT VERIFIED — %d launchd job(s) not installed/loaded/in sync/declared "
+                "above (UNMANAGED = installed with no template; UNKNOWN = the installed set could "
+                "not be enumerated)"
                 % len(bad),
                 file=sys.stderr,
             )

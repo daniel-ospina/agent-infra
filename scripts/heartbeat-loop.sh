@@ -370,11 +370,6 @@ fi
 # BELOW the HOME pin (the re-exec block above it must not freeze an ambient-HOME value). Same value
 # the nine resolvers look for: `$O/gh-rest/gh`, then `$O/gh-limit/gh`.
 export O="${O:-$HOME/orchestrator}"
-# `~/.pi/agent/shims` is where `gh` lives on this box (a symlink to the agent-infra
-# gh-shim). It was MISSING from the first version of this PATH, and the very first
-# tick logged "NOTE ask-owner scan produced nothing usable" — the gate was silently
-# dead while the heartbeat reported a green. Add a PATH entry only when it is
-# needed, but never omit this one silently.
 # `~/.pi/agent/shims` is where `gh` lives on this box (a symlink to the agent-infra gh-shim). It
 # was MISSING from the first version of this PATH, and the very first tick logged "NOTE ask-owner
 # scan produced nothing usable" — the gate was silently dead while the heartbeat reported a green.
