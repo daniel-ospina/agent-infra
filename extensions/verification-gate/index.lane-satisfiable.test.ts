@@ -375,6 +375,47 @@ test("unit: splitMutationFromCommit splits at the commit arm, and is null withou
     null, "a backslash-quoted heredoc delimiter is still a heredoc");
 });
 
+// ── #2087 — THE ORDER THE GATE PRESCRIBES ───────────
+//
+// A [VGATE] PASS merges ONLY the files this root's recorded blocked set or its CURRENT STAGED
+// diff contains (`mergeScopeFor`/`scopeFiles`). The harness tells a lane to "verify, then push",
+// and following that literally — verify BEFORE the session's first blocked op, or before the
+// change is staged — makes the PASS merge 0 of N: the record cannot be attached to anything, the
+// retry is refused with the identical text, and the old remedy ("re-dispatch naming the EXACT
+// blocked files") could not help because those names were already exact.
+//
+// So BOTH halves are pinned here: the mis-order still fails CLOSED (protection — the anchor is
+// not widened to the branch's unpushed diff, which is the weakening #2087 explicitly did not
+// prefer), AND the order the block now PRINTS (stage / block → dispatch → retry) converges in
+// one extra cycle instead of looping.
+test("(#2087) a PASS taken before any scope exists records nothing — fail CLOSED, and the printed ORDER converges", async () => {
+  const repo = await freshRepo("e-order-wrong");
+  writeFileSync(join(repo, "a.txt"), "a2\n");
+  // The WRONG order: dispatch first, with nothing staged and no block recorded for this root.
+  await fire("tool_result", hashResult(repo, "a.txt", sha256("a2\n")));
+  git(repo, "add a.txt");
+  const wrong = await fire("tool_call", commitOp());
+  ok(wrong?.block === true, "a PASS taken before any scope existed must NOT bless the commit (fail closed)");
+  const reason = String(wrong?.reason ?? "");
+  ok(/zero-merge-pass/.test(reason), "the retry block names the prior dispatch class");
+  ok(/SEQUENCING state, not a verifier defect/.test(reason), "the remedy names the ORDER, not a verifier defect (#2087)");
+  ok(/stage the change first/.test(reason), "the remedy names the achievable action that creates the scope");
+  ok(/ORDER MATTERS \(#2087\)/.test(reason), "the block states the order that works");
+  ok(/git add a\.txt/.test(reason), "the block names the concrete staging command for THESE files");
+  // The printed order, run as printed: the change is staged now — dispatch, then retry.
+  await fire("tool_result", hashResult(repo, "a.txt", sha256("a2\n")));
+  equal(await fire("tool_call", commitOp()), undefined, "the printed order converges — one extra cycle, not a loop");
+});
+
+test("(#2087) ORDER: block first, then dispatch, then retry — the refusal itself arms the scope", async () => {
+  const repo = await freshRepo("e-order-right");
+  writeFileSync(join(repo, "a.txt"), "a2\n");
+  git(repo, "add a.txt");
+  ok((await fire("tool_call", commitOp()))?.block === true, "pre-state: refused before any PASS");
+  await fire("tool_result", hashResult(repo, "a.txt", sha256("a2\n")));
+  equal(await fire("tool_call", commitOp()), undefined, "the block armed the scope; the PASS merges into it");
+});
+
 // ── runner ────────────────────────────────────────────
 async function main() {
   const mod = await import("./index.js");
