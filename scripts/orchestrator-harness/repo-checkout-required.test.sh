@@ -64,7 +64,13 @@ run_bare() { # <cwd> <script> [args…]
   # ⛔ rc 127 IS "NOT FOUND", NOT "REFUSED": an arm whose script path is wrong would otherwise read as a
   # pass on every refusal assertion below. Every caller's path is checked here, once.
   [ -f "$scr" ] || { printf 'run_bare: NO SUCH SCRIPT: %s\n' "$scr"; return 127; }
+  # ⛔ EVERY VARIABLE THE SUITE COULD INHERIT IS SCRUBBED, NOT THE ONES THAT BIT SO FAR (fresh-context
+  # review of #3833, F1b — measured). This list omitted `ENV_FILE`, which this box exports ambiently and
+  # a GitHub runner does not; the suite was therefore 23/0 here and 21/2 on CI, and the two reds were a
+  # REAL defect (a `set -u` abort inside the doctor's refusal) that the leak hid. A scrub list is only
+  # hermetic when it is the whole class, so CELL_HOME/ENV_FILE/O/OR/HOME are all removed here.
   ( cd "$cwd" && env -u REPO -u OR -u TORTOISE_REPO -u TORTOISE -u LANE_CONTAINER_REPO \
+      -u ENV_FILE -u CELL_HOME -u O \
       AGENT_INFRA_PATH= HOME="${TMPDIR:-/tmp}" bash "$scr" "$@" 2>&1 )
 }
 
@@ -155,7 +161,7 @@ _b_or
 
 # B6 THE DOCTOR'S REFUSAL IS rc 3 "cannot-verify", not rc 0 and not a pass: a role that records a green
 # state while it read no checkout is the same defect one layer down.
-_doc_out="$( ( cd "$NOTREPO" && env -u REPO -u OR HOME="${TMPDIR:-/tmp}" \
+_doc_out="$( ( cd "$NOTREPO" && env -u REPO -u OR -u ENV_FILE -u CELL_HOME -u O HOME="${TMPDIR:-/tmp}" \
   bash "$HERE/cloud-cell-doctor.sh" hygiene 2>&1 ) )"; _doc_rc=$?
 if [ "$_doc_rc" -eq 3 ] && printf '%s' "$_doc_out" | grep -qi 'no checkout'; then
   ok "B6 cloud-cell-doctor.sh hygiene: rc 3 cannot-verify naming the checkout (rc=$_doc_rc)"
@@ -231,6 +237,32 @@ if [ "$_rc" -ne 0 ] && printf '%s' "$_out" | grep -q 'not a git checkout'; then
 else
   bad "D4 a declared-but-bogus --repo was not refused by value (rc=$_rc) — $_out"
 fi
+
+# D5-D6 THE FARM SHAPE: a copy with NO `repo-slug.sh` beside it (what `~/.pi/agent/scripts/` is — a flat
+# farm with no orchestrator-harness subtree). A DECLARED value must still work, and only an UNRESOLVED
+# REPO may refuse (fresh-context review of #3833, F3 — verified: two of the five scripts refused whenever
+# the LIBRARY was missing and then told the operator to `--repo`, an action the absent library could not
+# honour). Pinned with a copy, so it is not a claim about this host's layout.
+FARM="$T/farm"; mkdir -p "$FARM"
+cp "$HERE/../stale-worktrees.sh" "$HERE/../stale-main-triage.sh" "$FARM/" 2>/dev/null
+for _s in stale-worktrees.sh stale-main-triage.sh; do
+  # no repo-slug.sh anywhere it looks, and AGENT_INFRA_PATH empty
+  _out="$( cd "$CHECKOUT" && env -u REPO -u OR -u ENV_FILE -u CELL_HOME -u O AGENT_INFRA_PATH= \
+    HOME="${TMPDIR:-/tmp}" bash "$FARM/$_s" 2>&1 )"; _rc=$?
+  if [ "$_rc" -ne 0 ] && printf '%s' "$_out" | grep -q 'REPO is unset'; then
+    ok "D5 $_s (farm copy, no library, nothing declared): refuses naming REPO (rc=$_rc)"
+  else
+    bad "D5 $_s (farm copy, no library, nothing declared): rc=$_rc — $_out"
+  fi
+  # A DECLARED value must proceed to the LOCAL validation, not be refused for the absent library.
+  _out="$( cd "$NOTREPO" && env -u REPO -u OR -u ENV_FILE -u CELL_HOME -u O AGENT_INFRA_PATH= \
+    HOME="${TMPDIR:-/tmp}" bash "$FARM/$_s" --repo "$CHECKOUT" 2>&1 )"; _rc=$?
+  if [ "$_rc" -eq 0 ] && ! printf '%s' "$_out" | grep -q 'was not found beside this script'; then
+    ok "D6 $_s (farm copy, no library, --repo declared): runs, never refused for the absent library"
+  else
+    bad "D6 $_s (farm copy, no library, --repo declared): rc=$_rc — $_out"
+  fi
+done
 
 echo
 echo "== N. NON-VACUITY: the gate reds when a default is planted back =="
