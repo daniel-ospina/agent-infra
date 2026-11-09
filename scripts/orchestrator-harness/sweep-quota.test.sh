@@ -217,13 +217,25 @@ if need "$T/quota.sh" "the sweep-quota helper block"; then
     && ok "sweep_defer_until_recorded: no headers → a recorded PRIMARY until= window is used, not the 60s floor" \
     || bad "sweep_defer_until_recorded ignored the recorded until= ('$got', want ~$(( now + 3000 )))"
   # …and the shape the layer actually writes for a headers-less (NO_WAIT) refusal: `secondary`, whose
-  # `until=` IS the now+60 floor. The companion must add nothing here — it cannot invent a window the
-  # layer did not record, and this row is what makes the row above honest.
+  # `until=` IS the layer's DEFAULT `now+BASE_WAIT` (60 s) floor. The companion must add nothing here —
+  # it cannot invent a window the layer did not record, and this row is what makes the row above
+  # honest. The row BELOW re-runs it with the knob raised, where the record must be adopted.
   rec "$now" "$(( now + 60 ))" 0 secondary
   got="$(sweep_defer_until_recorded '')"
   [ "$got" -ge $(( now + 55 )) ] && [ "$got" -le $(( now + 75 )) ] \
     && ok "sweep_defer_until_recorded: a kind=secondary record (what a NO_WAIT refusal writes) stays on the 60s floor — no invented window" \
     || bad "sweep_defer_until_recorded invented a window from a kind=secondary record ('$got')"
+  # …and the SAME `secondary` record with the knob RAISED past the sweep's own literal floor must be
+  # ADOPTED, not clamped. `GH_LIMIT_BASE_WAIT` is operator-configurable (`gh-limit.py:216`, 60–3600),
+  # so on a box that raises it the layer's `now+BASE_WAIT` floor IS wider than `sweep_defer_until`'s
+  # literal 60 s, and `orch-loop.sh:4897-4898` keeps the larger of the two. Without this row the
+  # runbook's "with the knob raised the record is the wider window and the companion adopts it" would
+  # be prose with nothing grading it (review round 8, finding 1).
+  rec "$now" "$(( now + 300 ))" 0 secondary
+  got="$(sweep_defer_until_recorded '')"
+  [ "$got" -ge $(( now + 295 )) ] && [ "$got" -le $(( now + 310 )) ] \
+    && ok "sweep_defer_until_recorded: a kind=secondary record WIDER than the sweep's 60s literal (GH_LIMIT_BASE_WAIT raised) is adopted, not clamped to the sweep's floor" \
+    || bad "sweep_defer_until_recorded clamped a wider secondary record to the sweep's own 60s floor ('$got', want ~$(( now + 300 )))"
   # ⛔ THE RECORD IN PLACE FOR THE NEXT ROW MUST BE **LATER THAN THE HEADER**, or the row cannot tell
   # "the header won" from "the record won" — both answers sit under its ceiling and it passes either
   # way. That is agent-infra#2028 review round 5's P1: the `secondary` row above left `until=now+60`

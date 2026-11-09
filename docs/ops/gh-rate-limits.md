@@ -121,9 +121,14 @@ What the controller now does (`orch-loop.sh`, the `# BEGIN gh-bound` block):
   #2028's fix-direction #2 ("never sleep inside a substitution").
   Companion: `sweep_defer_until_recorded` takes the layer's recorded `until=` window when a refusal
   carries no rate-limit headers. **Its scope, measured:** the layer's `marker_until` yields a real
-  `reset` only for a `kind=primary` (or `retry-after`) refusal and `now+60` for a
-  `secondary`/`unclassified` one — and a **headers-less** `NO_WAIT` refusal is classified the latter,
-  so on THAT path the record is the 60 s floor and the companion adds nothing. ⛔ **But the sweep's
+  `reset` only for a `kind=primary` (or `retry-after`) refusal and `now+BASE_WAIT` for a
+  `secondary`/`unclassified` one (`gh-limit.py:518`; `BASE_WAIT = cfg_secs("GH_LIMIT_BASE_WAIT", 60,
+  60, 3600)` at `:216`, so that floor is 60 s only on a DEFAULT box) — and a **headers-less**
+  `NO_WAIT` refusal is classified the latter, so on THAT path the record is the `now+BASE_WAIT`
+  floor: on a default box the two coincide and the companion adds nothing, while with the knob raised
+  the record is the WIDER window and the companion adopts it (`orch-loop.sh:4897-4898` keeps the
+  larger; `sweep-quota.test.sh` grades both halves — the default coincidence and the raised-knob
+  adoption). ⛔ **But the sweep's
   call site is not that path, and the cadence follows from the response, not the record.** The sweep
   passes `-i` (`orch-loop.sh:5841`, the sweep's own `gh_bounded api --paginate -i`), which is why the
   layer's own `classify()` sees no headers
@@ -151,7 +156,8 @@ What the controller now does (`orch-loop.sh`, the `# BEGIN gh-bound` block):
   `x-ratelimit-reset` is adopted as the sweep's deferral. That is the exact shape #2137 refuses
   INSIDE the layer (`gh-limit.py:3498-3500`: "a reset read beside a secondary/unclassified refusal is
   not a recovery time … Adopting it produced the full-window block this change removes") — so the
-  caller can park a cell for up to 1 h on a window the layer would have floored at 60 s. A cell that
+  caller can park a cell for up to 1 h on a window the layer would have floored at its own
+  `now+BASE_WAIT` (60 s on a default box, `GH_LIMIT_BASE_WAIT`). A cell that
   has not swept in 40 minutes is behaving as written, not wedged.
 - A `GH_BOUND_S`/`GH_BOUND_TRIP` that does not parse falls back LOUDLY. `tb_timeout` answers 125 for a
   non-integer bound, so an unvalidated typo would make every `gh` call fail and take the controller dark.
@@ -189,13 +195,18 @@ What the controller now does (`orch-loop.sh`, the `# BEGIN gh-bound` block):
   The stripper keeps the code inside
   `$( … )` and blanks only the literal around it, so the quoted and unquoted spellings of one call are
   seen alike. All of it is graded by ONE fixture, so each is a pinned property rather than prose: the
-  multi-line arm, the one-line `case`, the `while`/`until` heads, the `time`/`exec` wrappers, and
-  `x="$(gh api …)"` (incl. the `orch-loop.sh:4910` shape) MUST red; an already-bounded arm,
-  `pattern="a) gh api"` (and its SINGLE-quoted spelling `pattern='a) gh api'`), a literal `) gh` in
+  multi-line arm, the one-line `case`, the `while`/`until` heads, the `time`/`exec` wrappers,
+  `x="$(gh api …)"` (incl. the `orch-loop.sh:4910` shape), and an ASSIGNMENT-PREFIXED call
+  (`X=1 gh api …` — bash's grammar admits `[assignment]… command`, so the command word there is a
+  real command position with no `)`/`|`/keyword anchor) MUST red; an already-bounded arm, its
+  assignment-prefixed spelling (`X=1 gh_bounded api …`), `pattern="a) gh api"` (and its SINGLE-quoted
+  spelling `pattern='a) gh api'`), a literal `) gh` in
   prose, and an already-bounded capture MUST NOT. What is
   still out of its reach is a call hidden behind a variable, in `eval`, inside a python heredoc, in a
   BACKTICK substitution (the alternation anchors on `$(`,
-  not on a backtick), or behind a WRAPPER WORD the group does not carry. Of the wrapper words it
+  not on a backtick), or behind a WRAPPER WORD the group does not carry — that last one including a
+  wrapper word BEFORE an assignment (`env GH_TOKEN=x gh api …`), which the assignment anchor cannot
+  reach because the wrapper is the command word. Of the wrapper words it
   carries only `time` and `exec` — its other members are the keywords `if`/`then`/`elif`/`while`/
   `until`/`!`/`do`/`else` — so `env`, `nice`, `timeout`, `xargs`, `nohup` and `stdbuf` are unmodelled
   whether or not an assignment follows (`env gh api …` and `env GH_TOKEN=x gh api …` are equally
