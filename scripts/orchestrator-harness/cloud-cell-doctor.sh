@@ -55,6 +55,16 @@
 set -uo pipefail
 
 CELL_HOME="${CELL_HOME:-/tmp/cell-home}"
+# ⛔ DEFINED HERE, NOT ONLY INTERPOLATED (fresh-context review of #3833, F1 — measured). `require_repo`'s
+# two refusal lines name this file, and before this line existed the file never defined it: with
+# `set -uo pipefail` (line 55) the interpolation ABORTED the refusal with `ENV_FILE: unbound variable`
+# and rc 1 — on the exact case #1974 indicator (a) names (a box with REPO unset), instead of the
+# rc 3 cannot-verify and the one actionable line. It stayed invisible on a cell because the supervisor
+# passes ENV_FILE explicitly, and on a developer box because the variable was ambient in every shell.
+# The same default as the six siblings that own this variable (cloud-cell-supervisor.sh:150,
+# cloud-cell-bringup.sh:78, cloud-cell-quiesce.sh:24, pr-repair-loop.sh:154,
+# install-controller-service.sh:146, install-repair-service.sh:89).
+ENV_FILE="${ENV_FILE:-$CELL_HOME/keys.env}"
 O="${O:-$CELL_HOME/orchestrator}"
 # ⛔ REPO HAS NO PATH DEFAULT (agent-infra#1974). This line used to read `REPO="${REPO:-/tmp/cell}"`
 # — a path that exists on NO machine — and it is the second of the two defaults #1974 was filed for.

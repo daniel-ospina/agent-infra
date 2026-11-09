@@ -37,9 +37,21 @@ for _rsl in "$SCRIPT_DIR/orchestrator-harness/repo-slug.sh" "$SCRIPT_DIR/repo-sl
   command -v resolve_repo >/dev/null 2>&1 && break
   unset -f resolve_repo 2>/dev/null || true
 done
-command -v resolve_repo >/dev/null 2>&1 \
-  || { echo "stale-main-triage: REPO is unset and repo-slug.sh (the ONE resolver) was not found beside this script ($SCRIPT_DIR/orchestrator-harness, $SCRIPT_DIR) or in \$AGENT_INFRA_PATH — pass --repo <checkout> (exit 2)" >&2; exit 2; }
-REPO="$(resolve_repo)" || exit $?
+# ⛔ AN UNRESOLVED REPO IS THE ONLY CASE THAT MAY NOT PROCEED (fresh-context review of #3833, F3 —
+# verified). This refusal used to fire whenever the LIBRARY was absent, even with a perfectly good
+# `--repo`, and told the operator to "pass --repo" — an action the absent library could not honour.
+# Same rule as pi-reap-worktrees.sh: the FARM copy (`~/.pi/agent/scripts/`, no orchestrator-harness
+# subtree) legitimately finds no library, and a DECLARED value keeps the local validation below.
+if command -v resolve_repo >/dev/null 2>&1; then
+  REPO="$(resolve_repo)" || exit $?
+elif [ -z "$REPO" ]; then
+  echo "stale-main-triage: REPO is unset and repo-slug.sh (the ONE resolver) was not found beside this script ($SCRIPT_DIR/orchestrator-harness, $SCRIPT_DIR) or in \$AGENT_INFRA_PATH — set REPO or pass --repo <checkout> (exit 2)" >&2
+  exit 2
+fi
+# ONE precondition, ONE message — for the declared value on a farm copy as much as for a derived one.
+[ -d "$REPO" ] || { echo "stale-main-triage: not a directory: $REPO (exit 2)" >&2; exit 2; }
+git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1 \
+  || { echo "stale-main-triage: not a git repository: $REPO (exit 2)" >&2; exit 2; }
 
 cd "$REPO"
 
