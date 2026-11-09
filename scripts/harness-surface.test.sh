@@ -790,6 +790,27 @@ ck "(d) …and it does NOT read as a crash — no 'every attempt is failing', no
    "$(case "$launchd_row" in ""|*"every attempt is failing"*|*DIED*) echo 1 ;; *) echo 0 ;; esac)"
 ck "(d) …and it says the refusal is the singleton working, and points at the [singleton] record [$(printf '%s' "$launchd_row" | cut -c1-220)]" \
    "$(case "$launchd_row" in *"singleton working"*orch-loop.log*) echo 0 ;; *) echo 1 ;; esac)"
+# ⛔ AND THE WITNESS PATH IT SENDS THEM TO MUST EXIST (fresh review of #3846, P3). Since agent-infra#2095
+# `orch-loop.sh` ranks `ORC_STATE_DIR` above `O` and writes `[singleton]` — and the lock itself — into the
+# dir it RESOLVED, so on a box whose plist renders `ORC_STATE_DIR` a row naming `<O>/logs/orch-loop.log`
+# sends the operator to a file that does not contain the witness. That is the same defect
+# `launchd-controller.sh` fixed with `_LC_STATE="${ORC_STATE_DIR:-$O}"` (its test case J), one reader over.
+# ⛔ THE SECOND ARM IS THE CONTROL: with `ORC_STATE_DIR` unset the row still names `$O`, so no existing
+# install's output changes and the arm above is reading the block rather than a hard-coded path.
+OUT="$( cd "$TMP" && PATH="$TMP/darwinbin:$TMP:$PATH" HOME="$TMP/home" CELL_HOME="$CELL" ORC_STATE_DIR="$TMP/splitstate" \
+        HARNESS_PIN_DIR="$PINROOT" HARNESS_PIN_FILE="$CELL/.harness-path" HARNESS_UP_OS=Darwin \
+        LAUNCHD_MODE=refused-singleton HU_PS="$TMP/ps-probe" PS_TABLE="$TMP/ps-pinned" HU_LOADAVG_FILE="$TMP/load" \
+        bash "$UP" status --repo "$REPO_FIX" --harness "$PIN_TREE" --no-fetch 2>&1 )"; RC=$?
+launchd_row="$(printf '%s\n' "$OUT" | grep -E '^launchd ' | head -1)"
+ck "(d) a split state dir: the 75 row names the RESOLVED dir's log AND lock, not \$O's [$(printf '%s' "$launchd_row" | cut -c1-260)]" \
+   "$(case "$launchd_row" in *"$TMP/splitstate/logs/orch-loop.log"*"$TMP/splitstate/.orch.lock"*) case "$launchd_row" in *"$TMP/home/orchestrator/logs/orch-loop.log"*|*"$TMP/home/orchestrator/.orch.lock"*) echo 1 ;; *) echo 0 ;; esac ;; *) echo 1 ;; esac)"
+OUT="$( cd "$TMP" && PATH="$TMP/darwinbin:$TMP:$PATH" HOME="$TMP/home" CELL_HOME="$CELL" \
+        HARNESS_PIN_DIR="$PINROOT" HARNESS_PIN_FILE="$CELL/.harness-path" HARNESS_UP_OS=Darwin \
+        LAUNCHD_MODE=refused-unjudged HU_PS="$TMP/ps-probe" PS_TABLE="$TMP/ps-pinned" HU_LOADAVG_FILE="$TMP/load" \
+        bash "$UP" status --repo "$REPO_FIX" --harness "$PIN_TREE" --no-fetch 2>&1 )"; RC=$?
+launchd_row="$(printf '%s\n' "$OUT" | grep -E '^launchd ' | head -1)"
+ck "(d) control: with ORC_STATE_DIR unset the 74 row still names \$O, so an existing install's row is unchanged [$(printf '%s' "$launchd_row" | cut -c1-260)]" \
+   "$(case "$launchd_row" in *"$TMP/home/orchestrator/logs/orch-loop.log"*) echo 0 ;; *) echo 1 ;; esac)"
 # NON-VACUITY CONTROL: the same row family still calls a genuine failure DIED. Without this, an arm
 # that labelled EVERY exit code REFUSED-SINGLETON would pass the three checks above.
 OUT="$( cd "$TMP" && PATH="$TMP/darwinbin:$TMP:$PATH" HOME="$TMP/home" CELL_HOME="$CELL" \

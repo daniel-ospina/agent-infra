@@ -1444,6 +1444,21 @@ hu_row_exec() {
 # dropped rather than echoed.
 hp_launchd_dead_text() { # <label>
   local label="${1:-}" runs="${HP_LAUNCHD_RUNS:-}" lexit="${HP_LAUNCHD_LAST_EXIT:-}" seen=""
+  # ⛔ THE SINGLETON WITNESS LIVES IN THE **RESOLVED** STATE DIR, NOT IN `$O` (fresh review of #3846,
+  # P3). Since agent-infra#2095 `orch-loop.sh` ranks `ORC_STATE_DIR` above `O`
+  # (`controller-state.sh:orc_state_pick`) and writes `[singleton]` — and the lock record itself —
+  # into the dir it RESOLVED. These rows exist to send an operator to that evidence, so naming
+  # `$O/logs/orch-loop.log` and `$O/.orch.lock` sends them to a file and a lock that do not exist on
+  # such a box: the row fails in exactly the situation it was written for. `launchd-controller.sh`
+  # already resolves it this way (`_LC_STATE="${ORC_STATE_DIR:-$O}"`, with test case J, which was
+  # the same defect one reader over) — this is that resolution, in the reader that had none.
+  # ⛔ NOT A SECOND COPY OF `orc_state_pick`: ranks 1 and 2 are all a reader here can decide — a unit
+  # that renders `ORC_STATE_DIR` sets it, and every deployed plist, cell supervisor and `keys.env`
+  # sets `O`; ranks 3/4 (the production convention, the isolated copy) need the loop's own identity.
+  # ⛔ `launchd.out` / `launchd.err` are NOT resolved: the plist's `StandardOutPath` /
+  # `StandardErrorPath` render `__O__/logs/…`, so those files follow `O` by construction and would
+  # become wrong if they were moved with the state dir.
+  local state="${ORC_STATE_DIR:-$O}"
   # ⛔ THE PATTERNS ARE EXACT, NOT LAX (2026-10-22, review round 4). `[0-9]*` accepts `128x` and
   # `00`, and `-0` then reads as a crash and `00` defeats the `runs = 0` test below -- i.e. the
   # stated invariants ("a garbled field is dropped", "runs = 0 wins") were asserted in prose and
@@ -1471,7 +1486,7 @@ hp_launchd_dead_text() { # <label>
       "$label" "$(id -u)" "$label"
   elif [ "$lexit" = "0" ]; then
     printf 'EXITED-CLEAN (last exit 0%s — a KeepAlive job is relaunched on its ThrottleInterval, so a job that STAYS here is exiting IMMEDIATELY rather than crashing. A singleton refusal does NOT land here: the loop exits 75 (REFUSED-SINGLETON) or 74 (REFUSED-UNJUDGED), so a 0 is never a refusal. ⛔ AND A [singleton] LINE IN %s/logs/orch-loop.log IS NOT THE VERDICT OF THIS RUN: that log is APPEND-ONLY and never rotated, so one refusal stays in it for the life of the state dir — read the me= and rc= tokens on that line and check whether it predates this launch before believing it; read %s/logs/launchd.out)' \
-      "$seen" "$O" "$O"
+      "$seen" "$state" "$O"
   elif [ "$lexit" = "75" ]; then
     # ⛔ 75 IS A DELIBERATE REFUSAL, NOT A CRASH (agent-infra#2095). `orch-loop.sh` used to print
     # "already running (pid N)" and `exit 0` — the false PASS this row was written around — and a
@@ -1481,7 +1496,7 @@ hp_launchd_dead_text() { # <label>
     # controller legitimately holds the state dir. The two states have opposite remedies, so they
     # must not share a row: a refusal means "nothing to do here", DIED means "the loop is broken".
     printf 'REFUSED-SINGLETON (last exit 75%s — orch-loop.sh REFUSED to start because this state dir already has a controller, which is the singleton working, not a crash. It keeps exiting 75 on every ThrottleInterval for as long as that controller lives. Confirm with: tail -3 %s/logs/orch-loop.log — a [singleton] line names the holder pid, the state dir and the reason. The holder is the authority, so do NOT remove %s/.orch.lock while it runs; if the [singleton] line names a pid that is not an orch-loop.sh of %s, read the reason it gives — an unreadable record fails CLOSED by design)' \
-      "$seen" "$O" "$O" "$O"
+      "$seen" "$state" "$state" "$O"
   elif [ "$lexit" = "74" ]; then
     # ⛔ UNJUDGED IS NOT HELD (fresh-context review of #3846). The lock record exists but could not be
     # read or dated (an unreadable `ps`, a corrupt record, an unwritable state dir), so the loop
@@ -1489,7 +1504,7 @@ hp_launchd_dead_text() { # <label>
     # remove the record" — opposite remedies, so they must not share a row (the reason this file
     # already splits 0 from non-zero one arm up).
     printf 'REFUSED-UNJUDGED (last exit 74%s — orch-loop.sh could NOT JUDGE the lock record at %s/.orch.lock: it is present, and either its pid cannot be read or its age cannot be dated, so the loop refused rather than displace a controller it cannot identify. Nothing was removed. Read the [singleton] line in %s/logs/orch-loop.log: it names the record contents and why. Next: ps -o pid=,etime=,command= -p <the pid>; if no controller of %s is running, rm -f %s/.orch.lock and start again — UNLIKE the exit-75 row, removing it is the remedy here when nothing holds it)' \
-      "$seen" "$O" "$O" "$O" "$O"
+      "$seen" "$state" "$state" "$O" "$state"
   elif [ -n "$lexit" ]; then
     printf 'DIED (last exit %s%s; launchd retries a failing KeepAlive job on its ThrottleInterval, so if it STAYS here every attempt is failing; read %s/logs/launchd.err)' \
       "$lexit" "$seen" "$O"

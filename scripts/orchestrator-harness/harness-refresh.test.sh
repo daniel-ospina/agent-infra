@@ -357,6 +357,41 @@ case "$R" in *lanes=1*) ok "the lane is still counted with COLUMNS=20 — the ta
              *) bad "no lane count in the record: $R" ;; esac
 reap "$LANEPID"
 
+# ⛔ A22c: ON A SPLIT STATE DIR THE LANE RUNS FROM THE WORK ROOT, NOT FROM `$O` (fresh review of
+# #3846, P3). Since agent-infra#2095 `$O` is the STATE dir and every spawn names
+# `${O_WORK:-$O}/<name>.sh` (`dispatch-merge.sh:483`/`:520`, `orch-loop.sh:6731`/`:6941`/`:7181`/`:7435`),
+# so a single `$O/` prefix matches NOTHING on exactly the boxes this PR introduces — `lanes=0` while a
+# lane really runs. That direction is DESTRUCTIVE (it is what lets `--re-seed` swap a tree under a running
+# lane) and it blinds the `GATE_CODE=lanes` deferral. On every existing box `O_WORK == O`, so the second
+# arm below is the same string and changes nothing there.
+_CASE=$((_CASE+1)); echo "=== A22c: a lane spawned from the WORK root is counted when O is a separate STATE dir ==="
+D="$T/a38c"; mkdir -p "$D/pin" "$D/O" "$D/work"; PIN="$D/pin/HARNESS-PIN"; printf '%s\n' "$C1" > "$PIN"
+printf '%s\n' "$$" > "$D/O/.orch.lock"     # a live controller, as on a real cell
+LANEPID="$(mk_fake_lane "$D/work")"
+MAT="$(mk_stub_mat "$D")"
+R="$(O="$D/O" O_WORK="$D/work" HARNESS_MATERIALISER="$MAT" bash "$RR" --no-fetch --repo "$T/src" \
+      --ref origin/main --pin "$PIN" --self "$(harness_at "$C1")" 2>&1)"; RC=$?
+case "$R" in
+  *lanes=1*) ok "a WORK-root lane under a split state dir is COUNTED (lanes=1) — the record does not understate in-flight work" ;;
+  *lanes=0*) bad "a live WORK-root lane read as lanes=0 — the census still looks only in the state dir, so \$O can be re-seeded under it and GATE_CODE=lanes is blind" ;;
+  *)         bad "no lane count in the record: $R" ;;
+esac
+lane_alive "$LANEPID" && ok "…and the work-root lane was not signalled" || bad "the run killed the work-root lane $LANEPID"
+reap "$LANEPID"
+# NON-VACUITY: the SAME shape with `O_WORK` unset must NOT be counted, so the arm above is reading the
+# WORK ROOT and not merely matching any `*.sh` token in the process table.
+D2="$T/a38c2"; mkdir -p "$D2/pin" "$D2/O" "$D2/work"; PIN2="$D2/pin/HARNESS-PIN"; printf '%s\n' "$C1" > "$PIN2"
+printf '%s\n' "$$" > "$D2/O/.orch.lock"
+LANEPID2="$(mk_fake_lane "$D2/work")"
+MAT2="$(mk_stub_mat "$D2")"
+R2="$(O="$D2/O" HARNESS_MATERIALISER="$MAT2" bash "$RR" --no-fetch --repo "$T/src" \
+       --ref origin/main --pin "$PIN2" --self "$(harness_at "$C1")" 2>&1)"
+case "$R2" in
+  *lanes=0*) ok "control: with O_WORK unset that same lane is NOT counted — the arm above reads the work root, not any '*.sh' token" ;;
+  *)         bad "control: a work-root lane was counted with O_WORK unset, so the arm above cannot discriminate: $R2" ;;
+esac
+reap "$LANEPID2"
+
 _CASE=$((_CASE+1)); echo "=== A23: the DESTRUCTIVE advance (--re-seed) under a mid-turn lane -> REFUSES 26, names what blocks it ==="
 D="$T/a23"; mkdir -p "$D/pin" "$D/O"; PIN="$D/pin/HARNESS-PIN"; printf '%s\n' "$C1" > "$PIN"
 printf '%s\n' "$$" > "$D/O/.orch.lock"
