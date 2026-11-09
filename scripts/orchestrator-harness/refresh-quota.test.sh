@@ -135,13 +135,14 @@ mk_case() {
 # case 4 would pass by vacuity rather than by the reaper running.
 mk_gh() {
   local d="$1" rows="$2" rate_body="${3:-}" open_rows="${4:-[]}"
-  # ⛔ `$d/bin/clip-pulls` IS THE CLIPPED-PULLS SENTINEL, AND IT CARRIES THE PAYLOAD (#1984). The body
-  # below is an INTERPOLATING heredoc, so a JSON payload cannot be passed through it without a quoting
-  # nightmare; a file is both simpler and less fragile, and its EXISTENCE is what the wrapper reads to
-  # emit `link: … rel="next"`. A clipped pulls answer is the ONLY way to drive `rest_list`'s own
-  # `REST_WINDOW_FILLED` fact — the fact that decides whether absence may be read as evidence, which
-  # is the whole P1 of the fresh review. Absent (the default) = the historical `[]` answer.
-  rm -f "$d/bin/clip-pulls"
+  # ⛔ `$d/bin/pulls-body` CARRIES THE PULLS ANSWER; `$d/bin/pulls-clip` IS THE TRUNCATION MARKER
+  # (#1984). The body below is an INTERPOLATING heredoc, so a JSON payload cannot be passed through it
+  # without a quoting nightmare; a file is both simpler and less fragile, and the MARKER's existence is
+  # what the wrapper reads to emit `link: … rel="next"`. Two facts are therefore drivable
+  # INDEPENDENTLY: a FULL page that ENDS the collection (body, no marker — a complete answer at any
+  # limit) and a full page that still advertises a next one (both — `REST_WINDOW_FILLED`, the fact that
+  # decides whether absence may be read as evidence). Absent = the historical `[]` answer.
+  rm -f "$d/bin/pulls-body" "$d/bin/pulls-clip"
   cat > "$d/bin/gh.body" <<SH
 #!/bin/bash
 charge() {  # <cost> — spend from the scripted budget (never below 0)
@@ -152,8 +153,8 @@ case "\$*" in
   "api rate_limit")
     if [ -n "$rate_body" ]; then printf '%s\n' "$rate_body"
     else printf '{"resources":{"core":{"remaining":%s},"graphql":{"remaining":4990}}}\n' "\$(cat "$d/core")"; fi ;;
-  *"/pulls?"*) charge 1; if [ -f "$d/bin/clip-pulls" ]; then cat "$d/bin/clip-pulls"; else printf '[]\n'; fi ;;
-  *"labels=P0-blocker"*) charge 1; printf '%s\n' '$rows' ;;
+  *"/pulls?"*) charge 1; if [ -f "$d/bin/pulls-body" ]; then cat "$d/bin/pulls-body"; else printf '[]\n'; fi ;;
+  *"labels="*) charge 1; printf '%s\n' '$rows' ;;
   *"/issues?"*) charge 1; printf '%s\n' '$open_rows' ;;
   *) printf '[]\n' ;;
 esac
@@ -176,7 +177,7 @@ if [ "$1" = api ] && [ "$2" = -i ]; then
   # only way a fixture can drive `rest_list`'s `REST_WINDOW_FILLED` — the fact #1984's guard now
   # reads instead of inferring from the limit. Emitted ONLY for the pulls listing, and only when the
   # CLIPPED fixture asked for it, so every other case keeps its historical complete answer.
-  case "$*" in *"/pulls?"*) [ -f "$d/clip-pulls" ] && printf 'link: <https://api.github.com/x?page=2>; rel="next"\r\n' ;; esac
+  case "$*" in *"/pulls?"*) [ -f "$d/pulls-clip" ] && printf 'link: <https://api.github.com/x?page=2>; rel="next"\r\n' ;; esac
   printf '\r\n%s\n' "$out"
   exit 0
 fi
@@ -269,6 +270,23 @@ open(core_p, "w").write(str(c))
 print("VERDICT: CLEAN")
 PY
   chmod +x "$1"
+}
+
+# mk_pulls_full <case-dir> <n> [clip] — serve n head refs from the pulls listing, optionally CLIPPED.
+# ⛔ THE PAGE COUNT MUST VARY WITH THE LIMIT OR THE ASSERTION IS UNFALSIFIABLE (fresh review of #1984,
+# P2). `rest_list` breaks after page 1 on a SHORT page, so a fixture that answers a handful of rows
+# cannot tell `--limit 100` from `--limit 500`: both are one request, and the "one request per row" and
+# "no page=2" rows would pass on ANY limit. A FULL page is what makes the limit observable.
+# ⛔ AND THE REF NAMES CARRY NO BARE DIGIT RUN: `has_pr`/`pr_ref` match `(^|[-/])N([-/]|$)`, so
+# `chore/nope-41` IS a match for issue #41 and the fixture would grade a row that has a PR.
+mk_pulls_full() {
+  local d="$1" n="$2" clip="${3:-}" i out='['
+  for i in $(seq 1 "$n"); do
+    [ "$i" -gt 1 ] && out="$out,"
+    out="$out{\"head\":{\"ref\":\"chore/nope-xx$i\"}}"
+  done
+  printf '%s]' "$out" > "$d/bin/pulls-body"
+  if [ -n "$clip" ]; then : > "$d/bin/pulls-clip"; else rm -f "$d/bin/pulls-clip"; fi
 }
 
 # rf <dir> <refresh|check> [KEY=VAL ...] — runs the SHIPPED script hermetically; $OUT/$RC.
@@ -743,7 +761,11 @@ ctl_pulls="$(grep -cE '^repos/[^ ]*/pulls\?' "$D/bin/gh.argv" 2>/dev/null | tr -
 #   narrowed + CLIPPED   → it is not            → KEPT (§10)
 #   shipped 500 (either) → unchanged from the shipped behaviour
 mk_case row-bounded 1000
-mk_gh "$D" "$(rows 2)" "" "$(rows 6)"      # .open_iss = issues 41..46; pulls answers a COMPLETE []
+# ⛔ BOTH WINDOWS ANSWER A FULL PAGE, so the request COUNT is a function of the limit and nothing else
+# (a short page ends the collection at any limit — see `mk_pulls_full`). `.open_iss` = 200 open issues
+# including 41..46, answered as one 200-row page; the pulls answer is 100 refs that END the collection.
+mk_gh "$D" "$(rows 2)" "" "$(rows 200)"
+mk_pulls_full "$D" 100
 mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
 printf '#!/bin/bash\nexit 0\n' > "$D/bin/tmux"; chmod +x "$D/bin/tmux"
 printf '41\n' > "$D/o/dispatched.txt"
@@ -758,6 +780,10 @@ rb_open="$(grep -E '^repos/[^ ]*/issues\?' "$D/bin/gh.argv" 2>/dev/null | grep -
 rb_page2="$(grep -cE '^repos/[^ ]*/(issues|pulls)\?[^ ]*page=2' "$D/bin/gh.argv" 2>/dev/null | tr -d ' ')"
 [ "${rb_page2:-1}" = "0" ] && ok "row-bounded: no window paged past ONE page for a one-row pass" \
                             || bad "row-bounded: $rb_page2 listing(s) asked for page=2 — the window is still the fixed 500-row shape"
+case "$OUT" in
+  *"the open-issue window is NARROWED to 100 rows"*) ok "row-bounded: the OPEN window's narrowing is DISCLOSED too (it narrows the release arm, so an operator must be able to see it) — fresh review P2-3" ;;
+  *) bad "row-bounded: the open-issue window was narrowed to a rows-sized bound without saying so — the release path is silently narrower than the shipped 500" ;;
+esac
 case "$OUT" in
   *"the PR-branch window is NARROWED to 100 rows"*"COMPLETE answer for this pass"*) ok "row-bounded: the narrowed window is NAMED as a COMPLETE answer (the provider ended the collection), not as a truncation" ;;
   *) bad "row-bounded: the narrowed-and-complete window is not disclosed as complete — output: $OUT" ;;
@@ -785,7 +811,7 @@ printf '#!/bin/bash\nexit 0\n' > "$D/bin/tmux"; chmod +x "$D/bin/tmux"
 # A FULL page of head refs, NONE of which name the seeded issues, and a `link: … rel="next"` the
 # wrapper emits because this file exists: the listing is genuinely clipped and genuinely does not
 # contain #41 — exactly the shape that must NOT be read as "no PR".
-_i=0; _out='['; while [ "$_i" -lt 100 ]; do _i=$(( _i + 1 )); [ "$_i" -gt 1 ] && _out="$_out,"; _out="$_out{\"head\":{\"ref\":\"chore/nope-xx$_i\"}}"; done; printf '%s]' "$_out" > "$D/bin/clip-pulls"
+mk_pulls_full "$D" 100 clip
 printf '41\n' > "$D/o/dispatched.txt"
 rf "$D" refresh
 rc_pulls="$(grep -cE '^repos/[^ ]*/pulls\?' "$D/bin/gh.argv" 2>/dev/null | tr -d ' ')"
@@ -811,7 +837,7 @@ mk_case row-bounded-clipped-control 1000
 mk_gh "$D" "$(rows 2)" "" "$(rows 6)"
 mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
 printf '#!/bin/bash\nexit 0\n' > "$D/bin/tmux"; chmod +x "$D/bin/tmux"
-_i=0; _out='['; while [ "$_i" -lt 100 ]; do _i=$(( _i + 1 )); [ "$_i" -gt 1 ] && _out="$_out,"; _out="$_out{\"head\":{\"ref\":\"chore/nope-xx$_i\"}}"; done; printf '%s]' "$_out" > "$D/bin/clip-pulls"
+mk_pulls_full "$D" 100 clip
 for _r in 41 42 43 44 45; do printf '%s\n' "$_r" >> "$D/o/dispatched.txt"; done
 rf "$D" refresh
 case "$(tr '\n' ' ' < "$D/o/dispatched.txt" 2>/dev/null)" in
@@ -828,7 +854,7 @@ mk_case checked-pr-clipped 1000
 mk_gh "$D" "$(rows 2)" "" "$(rows 6)"
 mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
 printf '#!/bin/bash\nexit 0\n' > "$D/bin/tmux"; chmod +x "$D/bin/tmux"
-_i=0; _out='['; while [ "$_i" -lt 100 ]; do _i=$(( _i + 1 )); [ "$_i" -gt 1 ] && _out="$_out,"; _out="$_out{\"head\":{\"ref\":\"chore/nope-xx$_i\"}}"; done; printf '%s]' "$_out" > "$D/bin/clip-pulls"
+mk_pulls_full "$D" 100 clip
 printf '41\n' > "$D/o/dispatched.txt"
 printf '41\n42\n' > "$D/o/checked.txt"
 rf "$D" refresh

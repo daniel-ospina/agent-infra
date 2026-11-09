@@ -2899,6 +2899,13 @@ export REAP_OPEN_LIMIT REAP_PR_LIMIT
 # narrowed-window warning over a COMPLETE answer. Both facts are recorded here; the decision is made
 # once, in the reap, from BOTH.
 PR_WINDOW_CLIPPED=0
+# ⛔ THE OPEN WINDOW IS NARROWED TOO, SO IT IS DISCLOSED TOO (fresh review of #1984, P2). `.open_iss`
+# answers "is this dispatched issue still open", and a row outside a NARROWED window is no longer
+# PROVED open: it takes the window-blind path (KEPT, or settled by its own CLOSED state through ONE
+# targeted `gh issue view` — a GraphQL read — per row). That is the safe direction, but it is a TRADE
+# (up to 9 saved REST requests can become up to 12 GraphQL ones on a ≤4-row pass), and an undisclosed
+# trade is the defect: the operator could not tell from the log that the release arm had been narrowed.
+OPEN_WINDOW_CLIPPED=0
 # The stage is set HERE, before the first network read of the pass: from this point a failure is about
 # the LISTING (a gh/tier/jq read), not about provisioning, and the record must say which.
 refresh_stage list "rest_list issues/pulls --repo $OR (open-issue + PR-branch listings, REAP_OPEN_LIMIT=$REAP_OPEN_LIMIT REAP_PR_LIMIT=$REAP_PR_LIMIT)"
@@ -2913,6 +2920,11 @@ elif ! rest_list issues --repo "$OR" --state open --limit "$REAP_OPEN_LIMIT" --j
   rm -f "$O/.open_iss"
   echo "[refresh] WARN: open-issue listing FAILED — reaping pass will be skipped (an unreadable listing is not an empty one)"
   [ -s "$O/.list-err" ] && sed -n '1,2p' "$O/.list-err" | sed 's/^/[refresh]   /'
+else
+  if [ "${REST_WINDOW_FILLED:-0}" = "1" ]; then OPEN_WINDOW_CLIPPED=1; fi
+  if [ "$REAP_OPEN_LIMIT" -lt 500 ]; then
+    echo "[refresh] listings: the open-issue window is NARROWED to ${REAP_OPEN_LIMIT} rows (it serves ${DISP_ROWS} row(s); the shipped window is 500) and the provider $([ "$OPEN_WINDOW_CLIPPED" -eq 1 ] && echo 'ended it with a next page still advertised' || echo 'ENDED the collection inside it') — a dispatched row outside it is not a proved-open row, so it takes the window-blind path (KEPT, or settled by its own CLOSED state through ONE targeted read each) (#1984)"
+  fi
 fi
 if [ "$REAP_PR_LIMIT" -eq 0 ]; then
   rm -f "$O/.pr_brs"
@@ -2940,7 +2952,10 @@ else
   fi
 fi
 rm -f "$O/.list-err"
-# The CLIPPED fact travels with the limits, so no consumer has to infer it from the limit again.
+# The PR window's CLIPPED fact travels with its limit, so no consumer has to infer it from the limit
+# again. ⛔ ONLY the PR window's: the open window's clipping is DISCLOSED but decides nothing in the
+# reap (absence from it means "not proved open", which the window-blind path already handles), and an
+# exported marker nothing reads is dead code wearing the shape of a guard.
 export REAP_PR_CLIPPED="$PR_WINDOW_CLIPPED"
 # ── NOTHING THIS PASS DID NOT CLASSIFY MAY BE READ AS THIS PASS'S CLASSIFICATION (agent-infra#2183)
 # ⛔ TRUNCATED AT PASS START, AS AN EXPLICIT LIST — never a `checked-*` glob, which would also delete
@@ -3076,9 +3091,11 @@ _pr_not_asked = _REAP_PR_LIMIT == "0"
 _pr_limit = int(_REAP_PR_LIMIT) if _REAP_PR_LIMIT.isdigit() else 500
 _pr_clipped = (os.environ.get("REAP_PR_CLIPPED") or "").strip() == "1"
 _pr_window_blind = (not _pr_not_asked) and _pr_clipped and _pr_limit < 500
-# ⛔ "NOT ASKED" IS NOT A ZERO-ROW WINDOW: the marker `0` means the caller declined to ask, so the
-# narrowing line below must not claim a 0-row window was read. Only an ACTUAL narrowing counts.
-_pr_window_narrow = (not _pr_not_asked) and _pr_limit < 500
+# ⛔ "NOT ASKED" IS NOT A ZERO-ROW WINDOW (fresh review of #1984, P2). The marker `0` means the caller
+# declined to ask, so nothing may claim a 0-row window was read. That guard lives in the SHELL — the
+# narrowing lines sit inside the `if [ "$REAP_PR_LIMIT" -eq 0 ] else` branch, so a declined window
+# cannot reach them — and a Python twin of it would be DEAD CODE (defined, never read) claiming a duty
+# it does not perform. It is deliberately not restated here.
 have_open = have_open or _open_not_asked
 have_pr = have_pr or _pr_not_asked
 # PRESENT BUT UNDECODABLE IS THE ABSENT CASE (see `lines()`): existence is not readability, and the
@@ -3467,9 +3484,10 @@ if have_open and _disp_ok:
 #   pr          a PR head ref names it
 #   lane        a live `lane-N` session exists (the ONE `tmux ls` above, already paid for)
 # NOT keep facts, and why:
-#   absent from `.open_iss`  it is a 500-row created-DESC WINDOW: the oldest open issues fall out of
-#                            it permanently, so absence is not "closed". Its documented loss only
-#                            NARROWS this pass, so it can never be a terminal fact.
+#   absent from `.open_iss`  it is a created-DESC WINDOW (500 rows, or the rows-sized bound when a
+#                            pass serves four or fewer — see the listing block), so the oldest open
+#                            issues fall out of it permanently and absence is not "closed". Its
+#                            documented loss only NARROWS this pass, so it can never be a terminal fact.
 #   a branch ref             the scout is fetched without `--prune`, so a deleted branch's ref never
 #                            goes away — unbounded evidence. The pre-flight's own branch/PR COLLISION
 #                            already refuses to queue such an issue, TTL-bounded by the collision
@@ -3559,10 +3577,10 @@ print("[reap] checked: %d entr(ies) — dispatched=%d queued=%d pr=%d lane=%d pr
 # done and suppressing it is a false LANDED. Either way: release, loudly.
 #
 # ⛔ IT READS THE ENTRY'S OWN STATE — it does NOT infer CLOSED from ABSENCE in the capped
-# `.open_iss` listing. `.open_iss` is `--limit 500` against a repo with >500 open issues, so it is
-# PERMANENTLY saturated and absence from it proves nothing; an earlier `len(open_iss) < 500` guard
-# was a no-op on every pass. The targeted, UNCAPPED `gh issue view <N> --json state` answers the
-# actual question.
+# `.open_iss` listing. `.open_iss` is a created-DESC window (500 rows, or fewer when a pass serves
+# four or fewer — see the listing block) against a repo with >500 open issues, so it is PERMANENTLY
+# saturated and absence from it proves nothing; an earlier `len(open_iss) < 500` guard was a no-op on
+# every pass. The targeted, UNCAPPED `gh issue view <N> --json state` answers the actual question.
 #
 # ⛔ FAIL CLOSED PER ENTRY: an entry whose state cannot be read is KEPT — a failed read never drops a
 # suppression that may still be owed. Named in the log, so it is never silent.
