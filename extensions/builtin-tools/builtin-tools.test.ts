@@ -7502,12 +7502,19 @@ test("#1698: an existing cwd whose stat FAILS keeps the plain message (the fail-
 // row above pins the catch: a failure that is neither `ENOENT` nor `ENOTDIR` must
 // claim nothing. But `isAbsentPath` accepts the PAIR, and dropping `ENOTDIR` from it
 // (`return code === "ENOENT"`) reddened NO row before this one existed — measured on
-// the real `index.ts`; now this is the only row that reddens. The arm is not decorative:
-// a target whose ancestor is a FILE cannot exist, so the cause IS the missing cwd and
-// must be named — an `ENOENT`-only guard sends that dispatch back to reading
-// "spawn <binary> ENOENT" with no cause at all, which is the #1698 defect again for
-// the one shape a wrong `--work-tree`/`cwd` most often produces.
-test("#1698: a target whose ancestor is a FILE (ENOTDIR) names the missing cwd", () => {
+// the real `index.ts`; now this is the only row that reddens. The arm is kept as
+// DEFENCE-IN-DEPTH, not as the guard that rescues a common shape — measured (node
+// v24.21.0): a cwd whose ANCESTOR IS A FILE makes `spawn` throw SYNCHRONOUSLY with
+// `code: "ENOTDIR"` / message `spawn ENOTDIR`, so no ChildProcess exists, no async
+// `error` event fires, and `describeSpawnFailure` (reached only from `proc.on("error")`)
+// is never called for that shape at all — which is why THIS ROW IS A PREDICATE-CONTRACT
+// ROW, not a replay of a producible state: it calls the helper with `{ code: "ENOENT" }`
+// deliberately, to pin `isAbsentPath`'s answer for an `ENOTDIR` path. It must not be
+// read as claiming that spawn ever reports ENOENT for that path (it does not). The
+// arm still earns its place: it keeps `isAbsentPath` correct as a plain predicate — a
+// path under a FILE cannot exist — so any caller that DOES hand it one (a cross-check,
+// a future sync `catch`) gets the true answer instead of "this path exists".
+test("#1698: isAbsentPath's ENOTDIR arm — a path under a FILE is ABSENT (predicate contract, not a spawn replay)", () => {
   const dir = mkdtempSync(join(tmpdir(), "t1698-enotdir-"));
   try {
     const file = join(dir, "not-a-dir");
@@ -7522,7 +7529,7 @@ test("#1698: a target whose ancestor is a FILE (ENOTDIR) names the missing cwd",
     equal(code, "ENOTDIR", "premise — the probe really hits ENOTDIR here, not ENOENT");
     ok(
       describeSpawnFailure({ code: "ENOENT", message: "spawn /x ENOENT" }, under).includes("DOES NOT EXIST"),
-      "a target under a FILE cannot exist, so the missing-cwd cause IS named (the ENOTDIR arm is kept)",
+      "the ENOTDIR arm names the cause for a path under a FILE (called directly: production throws ENOTDIR synchronously, so this pins the PREDICATE, not a spawn replay)",
     );
   } finally {
     rmSync(dir, { recursive: true, force: true });

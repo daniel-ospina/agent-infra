@@ -600,11 +600,24 @@ When you encounter a **pre-existing bug** (not introduced by your current work),
 
 ## ⛔ HARD RULE: Durable Paths — never park work under `/tmp`
 
-**`/tmp` is swept, and the sweep is silent.** macOS periodically clears `/tmp`/`/private/tmp`; a Linux
-cell clears it on reboot and its own reapers walk it. The rule is therefore **durable vs volatile**, not
-one literal path: `$TMPDIR` is a *different* directory (`/var/folders/…` on macOS) with its own cleanup
-policy (idle-based, days) — fine for a message file that lives seconds, **not** durable for a worktree or
-a plan.
+**`/tmp` is swept, and the sweep is silent.** macOS periodically clears `/tmp`/`/private/tmp`. On a
+**Linux cell** the mechanism is *not* a reboot: `/tmp` is not its own mount there, so
+`systemd-tmpfiles --clean` removes an entry once it ages out of the box's `tmpfiles.d` window (`D /tmp …
+30d` on this fleet's Ubuntu/systemd-255 image, `10d` on some others) and the reapers walk it too — the
+box looks healthy for a while and then goes silently dead (`docs/ops/controller-service.md:72-74`;
+`docs/ops/disk-consumers.md:259`). "Cleared on reboot" would read as *safe until the next reboot*, which
+is the unsafe direction. The rule is therefore **durable vs volatile**, not one literal path: `$TMPDIR`
+is a *different* directory (`/var/folders/…` on macOS) with its own cleanup policy (idle-based, days) —
+fine for a message file that lives seconds, **not** durable for a worktree or a plan.
+
+- **⛔ On a CELL, "under `/tmp`" is not the test — the durable ROOT is.** The cells keep their home under
+`/tmp` (`HOME=/tmp/cell-home`, checkout `/tmp/cell-t3` — `docs/ops/disk-consumers.md:31-33`), so both roots
+prescribed below are *themselves* under `/tmp` there and a bare "never under `/tmp`" is unsatisfiable. The
+durable roots on a cell are `CELL_HOME`, the cell's own repo checkout, and `$AGENT_INFRA_PATH` — the same
+set `docs/ops/controller-service.md:78-82` accepts, having recorded that "under `/tmp`" "alone cannot be
+the rule without blocking every cell bring-up". So never `/tmp/wt-*` on a cell either, but
+`<cell-repo>/.worktrees/<type>/<name>` is durable **because it is the cell's working filesystem**, not
+because it escapes `/tmp`.
 
 - **Worktrees go inside the repo**: `<repo>/.worktrees/<type>/<name>` (gitignored, survives what the OS
 does to `/tmp`). Never `/tmp/wt-*`, `/private/tmp/wt-*` or `$TMPDIR/wt-*`. Measured twice in one session
