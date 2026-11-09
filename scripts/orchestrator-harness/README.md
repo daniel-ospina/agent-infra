@@ -1933,9 +1933,17 @@ off macOS (it renders a launchd plist) — the portability that matters is `orch
    (agent-infra#1889). The token marks TWO exits: `fixer-loop.md` emits it for
    `EXIT_REASON == "adversarial-capped"`, and `AGENTS.md` §Hard Cap REQUIRES it as the disclosure of
    a **clean** threat-coverage exit. The veto therefore reads the `residuals=` value: the marker is
-   clean evidence **iff every marker in the artifact says `residuals=none`**. A non-`none` value
-   (`#12`, `filed`, `none,#12`), an unsubstituted template (`<#N,…|none>`), and a marker with **no**
-   `residuals=` field all still refuse. Matching the bare token refused the honest case — the lane
+   clean evidence **iff every marker in the artifact says `residuals=none`**. **FOUR** things still
+   refuse a marker — the first three are on the `residuals=` value itself, the fourth is on the counts
+   beside it: (i) a non-`none` value (`#12`, `filed`, `none,#12`); (ii) an unsubstituted template
+   (`<#N,…|none>`); (iii) a marker with **no** `residuals=` field; and (iv) a **contradictory
+   disclosure** — when the marker line ALSO carries `threats=N` and `covered=M` and the two DIFFER,
+   `residuals=none` beside a declared class the artifact itself admits was not covered is refused
+   (`threats=17 covered=15 residuals=none` is a contradiction, not a clean exit). The counts are not
+   required: only a CONTRADICTION refuses, so the terse `residuals=none` form with neither field still
+   passes. The comparison takes the FIRST `threats=`/`covered=` on the line, so a cycle-log line that
+   mentions an earlier `covered=` before the marker's own fields is refused too — fail-closed, and
+   diagnosed by the refusal message. Matching the bare token refused the honest case — the lane
    whose verifier returned `THREAT SURFACE COVERED` with nothing filed — which made the cheapest way
    to pass be DROPPING the mandated disclosure, inverting the arm's own intent.
 3. **Scope adapts to the queue — and can be pinned.** `open PRs > 10` → **broad** mode: the sweep
