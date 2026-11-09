@@ -245,7 +245,7 @@ This is a residual list, not a completeness claim:
 ## Tests
 
 ```bash
-node extensions/gui-device-guard/test.mjs                    # 182 assertions, threat table L1–L25 + handler H1–H15
+node extensions/gui-device-guard/test.mjs                    # 190 assertions, threat table L1–L26 + handler H1–H15
 node extensions/gui-device-guard/test.mjs --classify 'npm exec electron .'
 ```
 
@@ -259,18 +259,38 @@ removed reds **8**; the wrapper WORDS removed reds **2**; the structural rule th
 reads a package-runner anywhere in the segment removed reds **2** (L19h/L19i); the
 comment stripper removed reds **1** (L11d); the fail-safe word scan removed reds
 **5**; the quote-aware paren scan removed reds **1** (L17); honouring the fake
-switches on an `open` line reds **3** (L18b + H3b/H3c); refusing to normalise an
+switches on an `open` line reds **3** (L18b + H3b/H3c); forcing `faked: false`
+for the whole `open` rule again reds **3** (L18c, H3d, H3d1 — the `--args` spelling
+it refused is a REAL mitigation); refusing to normalise an
 ATTACHED short-option argument reds **8** (L21a–L21f, H13, H13a); removing the
 `open -a<name>` attached branch reds **3** (L21g, L21h, H13b); reading a commented
-`<<` as a heredoc again reds **4** (L22a, L22b, H14, H14a); dropping the `-` guard
-from the `open` option predicate reds **3** (L23a, L23b + the identity rows);
-refusing a getopt CLUSTER reds **2** (L23d, L23e); reading a runner's payload
+`<<` as a heredoc again reds **4** (L22a, L22b, H14, H14a); reverting
+`clusterShortArg` to the pre-round-7 single-letter predicate (`tok[1] === "a" ||
+tok[1] === "b"`) reds **6** (L23d, L23e and the four identity rows — `njo.app`,
+`fari.app`, `na`, `undefined`, so L23a–L23c stay green); refusing a getopt CLUSTER
+reds **2** (L23d, L23e); reading a runner's payload
 verbatim instead of by package name reds **3** (L24e–L24g); removing `bun` from the
 runner set reds **2** (L24a, L24b); dropping the `env -S`/runner `-c` command-string
 rows reds **6** (L25a–L25f); ungating the fail-safe word scan from `sawFlag` reds
 **4** (A38–A41); reverting the pre-hook's `safeLane()`/`safeCwd()` to the raw
 `laneContract()`/`process.cwd()` reds **3** (H15a–H15c, with `ENOENT uv_cwd`);
 removing the `.app` suffix from the `open` predicate reds **1** (L9f).
+
+⛔ **The `-` prefix guard in `clusterShortArg` has NO attributable red, and is not
+claimed as covered.** Dropping `!tok.startsWith("-")` reds **0** rows, because a
+second term in the same predicate (`/^[A-Za-z]*$/` on the text before the option
+letter) already rejects `Banjo.app`, and the faithful pre-round-7 revert above
+leaves L23a–L23c GREEN too (a mangled identity still ends in `.app`, so the
+`.app`-suffix term keeps `media: true`). It is defence in depth; the rows that
+CATCH the class are the identity rows, named in the revert above.
+
+⛔ **`media-holders.sh`'s identity read: F2j is the row the incident verb needed.**
+No verdict row can see a COST, so the suite counts interpreter launches through a
+stub: 120 innocuous `/dev/null` fds cost **1** launch now, and the per-fd
+`realpath` arm it replaced cost **240** (measured on the same 40-pid fixture). F2i
+pins the identity read itself on a buildable shape (a same-device node under a
+non-matching name is `HELD-BY`, never `FREE`); the root-only twin that needs a
+second device node is declared in `docs/ops/media-devices.md` instead of claimed.
 
 ⛔ Deleting the `if (cwi < 0) continue;` guard does not print a red row — it makes
 the SUITE CRASH (`Cannot read properties of undefined`, from `basename(toks[-1])`),

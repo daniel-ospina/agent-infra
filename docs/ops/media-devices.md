@@ -73,14 +73,24 @@ A `tool_call` pre-hook on pi's `bash` tool, active only for **unattended** runs
 (print mode, or a headless run in a linked worktree — derived from the process,
 never from a launcher-set variable). An interactive session is never guarded.
 
-- **R1 RECORD** — every host GUI launch appends one row to
-  `~/.pi/agent/state/host-app-launches.jsonl`. This is the cheap half: with it,
-  the incident above is one lookup instead of six rounds of `ps`.
+- **R1 RECORD** — every host GUI launch **the classifier recognises** appends one
+  row to `~/.pi/agent/state/host-app-launches.jsonl`. This is the cheap half: with
+  it, the incident above is one lookup instead of six rounds of `ps`. (The bound is
+  the classifier, not the shell: `npm run dev` / `npm start` run a launch through a
+  SCRIPT NAME, which argv cannot resolve — see the README's declared residuals.)
 - **R2 BLOCK THE MEDIA SHAPES** — an Electron launch, a **headed** Playwright run,
   or `open <path>.app`, without
   `--use-fake-device-for-media-stream --use-fake-ui-for-media-stream` is refused,
   and the refusal names both flags. A named-app launch (`open -a Safari`) is only
   recorded: refusing every GUI launch is the friction the scoping comment rejects.
+  ⛔ For `open`, the switches count as a mitigation **only after a `--args` token**:
+  `open(1)` passes every remaining argument to the app's `main()` argv, so
+  `open ./Build/DMeer.app --args <both switches>` is the spelling that actually
+  reaches Chromium and it is ALLOWED (recorded, `faked: true`). Without `--args`
+  they are FILE arguments to `open`, so `open ./Build/DMeer.app <both switches>` is
+  still refused — that was the false PASS the earlier round fixed, and the "`open`
+  does not forward Chromium switches" wording it left behind was false for `--args`
+  and pointed the lane at the `ALLOW_MEDIA=1` hatch, which permits REAL capture.
 
 The lookup that was missing:
 
@@ -121,18 +131,31 @@ a reason:
 ⛔ `FREE` is the only answer that rests on absence, and it may rest only on a
 **complete** census. A `/proc` scan that could not read another user's fd
 directory yields `UNVERIFIABLE(partial: N unreadable)` — and so does a process
-holding a camera-shaped character device that is **not** one of the globbed nodes
-(an alias, a bind mount, a second node with the same major/minor). Holder identity
-is compared as a **device**, not as a path string: the target and the globbed node
-are both resolved (`python3 -c 'os.path.realpath(…)'` — not `readlink -f`, which is
-a GNU extension the portability checker rejects and which the script therefore does
-not use) before they are compared. ⛔ If the resolver itself cannot run (`python3`
-missing or failing), the answer is `UNVERIFIABLE(device identity could not be
-RESOLVED for: …)` — **not** `FREE`. The first cut of that helper fell back to the
-path **unresolved**, which silently reverted the comparison to raw string equality:
-a holder naming a `/dev/v4l/by-id/…` alias matched no globbed node, was not
-"suspicious" (it *is* in the device tree), the census was complete and `UNREADABLE`
-stayed `0` — so the script printed `FREE` over a device the process provably held.
+holding a character device that is **not** one of the globbed nodes and cannot be
+shown to be a different device (a bind mount, or a node the identity read cannot
+stat). Holder identity is compared as a **DEVICE NUMBER** (`st_rdev`), not as a
+path string and **not as a name**: a node in the device tree whose basename does
+not match `video*` — a root `mknod`, or a udev rule naming the camera anything —
+IS the camera when its major/minor match, and it is reported `HELD-BY(… via=…)`
+instead of being assumed innocuous. The whole census costs **one** reader launch:
+`st_rdev` needs no path resolution, and the previous per-fd `realpath` comparison
+forked `python3` twice for every character device (`/dev/null`, ttys and ptys are
+all character devices), which measured 240 launches / 10.7 s on a 40-pid fixture.
+⛔ If that identity read cannot run (`python3` missing or failing), the answer is
+`UNVERIFIABLE(device identity could not be RESOLVED for: …)` — **not** `FREE`. The
+first cut of the resolver fell back to the path **unresolved**, which silently
+reverted the comparison to raw string equality: a holder naming a
+`/dev/v4l/by-id/…` alias matched no globbed node, was not "suspicious" (it *is* in
+the device tree), the census was complete and `UNREADABLE` stayed `0` — so the
+script printed `FREE` over a device the process provably held.
+
+⛔ **The residual the suite cannot pin (stated, not claimed).** Two paths to one
+device with *no symlink between them* (two real nodes, one major/minor) needs a
+second device node — root `mknod`, or a bind mount — so no fixture can build the
+shape that the name arm used to miss. The identity read covers it by construction
+(`st_rdev`), and F2i pins the read on a shape a fixture CAN build; a revert that
+drops the read reds F2i with `FREE`. A node the read cannot `stat` is
+`UNVERIFIABLE`, never `FREE`.
 An unreadable read is never a definitive answer. The exit code is part of the answer: `2` means
 **cannot verify**, which is not the same as "nothing to report". Silence is not an
 acceptable answer to #2249; "I cannot tell you" is.
