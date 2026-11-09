@@ -581,6 +581,12 @@ if [ -s "$TMP/greenarm.sh" ] && grep -q 'MERGE_AUTHORITY.*rail' "$TMP/greenarm.s
       LOG="$TMP/g.log"; O="$TMP/gO"; mkdir -p "$O/state"
       sess() { return 1; }; claim_live() { return 1; }; can_spawn() { return 0; }
       gh()   { echo "GH $*" >> "$TMP/g.spy"; return 0; }
+      # ⛔ THE SHIPPED ARMS CALL `gh_bounded`, NOT `gh` (agent-infra#2028). A TRANSPARENT PASS-THROUGH on
+      # purpose: the bound itself is graded by `gh-bound.test.sh` against the real block, and repeating it
+      # here would make this suite depend on `scripts/lib/bounded.sh` on the runner. The name is pinned —
+      # measured at 40e736e4 on CI, without it `$TMP/g.spy` stayed EMPTY and GREEN+gate read
+      # "spy=[] — gate authority must merge directly", a rig failing for a reason it does not test.
+      gh_bounded() { gh "$@"; }
       # ⛔ THE SPAWN IS A DURABLE TERMINAL WHERE THE DAEMON ANSWERS (worker-terminal.sh); on a box
       # without one it is tmux with an explicit HOME+keys.env contract — the `~21 log lines` death was
       # the missing environment, not tmux (agent-infra#2210, reopened). The spy records the SPAWN ARGV,
@@ -756,7 +762,7 @@ if grep -qE 'decode\("utf-8"' <<<"$_RA_CODE"; then _enc_ok=0; fi
   && { echo "  ✅ _normalise_set decodes AND encodes with the FILESYSTEM codec (the exact assignment, no shadowing literal) — the same source os.environ uses"; PASS=$((PASS+1)); } \
   || { echo "  ❌ _normalise_set no longer decodes/encodes with sys.getfilesystemencoding()/encodeerrors() — under a single-byte locale the classifier and the authority can disagree again (the §5.1 bypass) "; FAIL=$((FAIL+1)); }
 _au_ln="$(grep -nF -- "$_au_expr" "$ORCH" | head -1 | cut -d: -f1)"
-_cls_ln="$(grep -nF 'V="$(gh pr checks' "$ORCH" | head -1 | cut -d: -f1)"
+_cls_ln="$(grep -nE 'V="\$\((gh|gh_bounded) pr checks' "$ORCH" | head -1 | cut -d: -f1)"
 if [ -n "$_au_ln" ] && [ -n "$_cls_ln" ] && [ "$_au_ln" -lt "$_cls_ln" ]; then
   echo "  ✅ AUTHORITY_UNKNOWN guard exists and precedes the classifier (line $_au_ln < $_cls_ln)"; PASS=$((PASS+1))
 else
@@ -770,7 +776,7 @@ _au_hits=0; AUTHORITY_UNKNOWN=1
 # ⛔ #2126: the extracted range END is the guard LINE, not the literal `&& continue` — the guard now
 # records the refusal inside the same `&& { … }`, so a literal-end sed would truncate the extraction
 # and this drive would silently grade a half block (the "a test that cannot run" shape).
-sed -n '/^    HEAD_N="\$(gh pr view/,/AUTHORITY_UNKNOWN:-0.*] && /p' "$ORCH" > "$TMP/aublock.sh"
+sed -n '/^    HEAD_N="\$(gh\(_bounded\)\? pr view/,/AUTHORITY_UNKNOWN:-0.*] && /p' "$ORCH" > "$TMP/aublock.sh"
 if [ -s "$TMP/aublock.sh" ] && bash -n "$TMP/aublock.sh" 2>/dev/null; then
   mkdir -p "$TMP/auO/state"
   _au_run() { # _au_run <flag> [<claim-verdict rc>] -> prints how many PRs passed the guard
@@ -781,6 +787,8 @@ if [ -s "$TMP/aublock.sh" ] && bash -n "$TMP/aublock.sh" 2>/dev/null; then
       AUTHORITY_UNKNOWN="$1"; OR=daniel-ospina/agent-infra; O="$TMP/auO"; LOG="$TMP/auO/guard.log"
       mkdir -p "$O/state"; : > "$LOG"
       gh() { case "$1 $2" in "pr view") echo deadbeef ;; *) return 1 ;; esac; }
+      # the shipped pre-classifier block reads HEAD_N through `gh_bounded` (agent-infra#2028)
+      gh_bounded() { gh "$@"; }
       disp() { return 0; }   # the shipped block records the refusal first; the recorder is not under test
       # THE CLAIM GUARD IS INSIDE THIS EXTRACTED RANGE (agent-infra#2466) and decides BEFORE the
       # authority guard. Stubbed here so this drive grades the authority guard; the claim guard's own
@@ -895,6 +903,7 @@ if [ -s "$TMP/pendingarm.sh" ] && bash -n "$TMP/pendingarm.sh" 2>/dev/null; then
     : > "$TMP/g.spy"; : > "$TMP/g.log"
     ( PR=1767; OR=daniel-ospina/agent-infra; MERGE_AUTHORITY="$1"; LOG="$TMP/g.log"; O="$TMP/gO"
       gh()   { echo "GH $*" >> "$TMP/g.spy"; return 0; }
+      gh_bounded() { gh "$@"; }   # the shipped arms read/merge through the bound (agent-infra#2028)
       # shellcheck disable=SC1090
       . "$TMP/pendingarm.sh" ) >/dev/null 2>&1
   }
@@ -1456,6 +1465,12 @@ FAKE
   # NO tunable in the environment.
   { echo 'set -u'; grep -m1 '^is_num() {' "$ORCH"; sed -n '/^open_pr_count() {/,/^}/p' "$ORCH"; echo 'open_pr_count'; } > "$TMP/ocdrive.sh"
   mkdir -p "$TMP/ocstub"; printf '#!/bin/bash\nexit 1\n' > "$TMP/ocstub/gh"; chmod +x "$TMP/ocstub/gh"
+  # ⛔ THE SHIPPED `open_pr_count` LISTS THROUGH `gh_bounded` (agent-infra#2028), and this drive runs it
+  # in a CHILD (`bash "$TMP/ocdrive.sh"`), so the name must be an EXECUTABLE on that child's PATH. A
+  # transparent pass-through: the bound is graded by `gh-bound.test.sh` against the real shipped block.
+  # Measured at 40e736e4 on CI — without it the listing "returned 26" (the failure fallback) instead of
+  # the stub's 25, and `last-open-n`/`last-open-prs` were never written.
+  printf '#!/bin/bash\nexec gh "$@"\n' > "$TMP/ocstub/gh_bounded"; chmod +x "$TMP/ocstub/gh_bounded"
   rm -f "$TMP/ownO/state/last-open-n"
   # ⛔ The stale row file must be PRESENT before the failing run, or the assertion below is
   # vacuous: pre-deleting it made the post-condition hold whether or not open_pr_count removes it.

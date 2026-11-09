@@ -180,6 +180,74 @@ grep -q '^rc=0 out={"ok":1' <<<"$out" && ok "degraded: calls still work (the bou
 grep -q 'DEGRADED' "$T/oe/logs/orch-loop.log" 2>/dev/null \
   && ok "degraded: the log says so" || bad "degraded: the log is silent"
 
+# Case G — THE LAYER'S OWN IN-CALL WAITS ARE SUPPRESSED PER CALL (agent-infra#2028 review, P1). A 120 s
+# bound against a layer that sleeps 60/120/240 s per refusal attempt, and up to 600 s in the lock, kills
+# the call DURING a wait — so the RATE-LIMITED refusal never prints, the caller reads `other`, and the
+# deferral is never armed. `GH_LIMIT_NO_WAIT` is the repo's documented seam for exactly this caller
+# class. It must reach every call, and it must be put BACK afterwards so the lanes the controller spawns
+# keep their own patience.
+# Its OWN stub directory: this stub reports what it INHERITED (`in_call`), which is the only place the
+# seam is observable, and rewriting the shared stub mid-suite would silently change what Cases A–E drove.
+mkdir -p "$T/gbin"
+cat > "$T/gbin/gh" <<'SH'
+#!/bin/bash
+printf '%s\n' "$*" >> "${GH_CALLS:-/dev/null}"
+printf '{"ok":1,"argv":"%s","in_call":"%s"}\n' "$*" "${GH_LIMIT_NO_WAIT-<unset>}"
+SH
+chmod +x "$T/gbin/gh"
+G="$T/G"; rig "$G/rig.sh"
+cat >> "$G/rig.sh" <<'SH'
+printf 'child=%s\n' "$(gh_bounded pr view 7 2>/dev/null | sed -n 's/.*"in_call":"\([^"]*\)".*/\1/p')"
+printf 'restored-unset=%s\n' "$(gh_bounded pr view 8 >/dev/null 2>&1; printf '%s' "${GH_LIMIT_NO_WAIT-<unset>}")"
+SH
+# `unset` in a subshell, not `env -u`: `run_rig` is a shell FUNCTION, and `env` can only exec a file on
+# PATH — it died with `env: 'run_rig': No such file or directory` before the rig ran, which read as three
+# reds over behaviour that was never exercised.
+out="$( (unset GH_LIMIT_NO_WAIT; PATH="$T/gbin:$PATH" GH_CALLS="$T/G.calls" GH_BOUND_S=5 run_rig "$G/rig.sh" "$T/og" "$HERE") 2>&1)"
+grep -qx 'child=1' <<<"$out" \
+  && ok "no-wait: the controller's gh children carry GH_LIMIT_NO_WAIT=1 (the layer answers the refusal at once instead of sleeping past the bound)" \
+  || bad "no-wait: the child did not inherit GH_LIMIT_NO_WAIT=1 — got: $(echo "$out" | sed -n 1p)"
+grep -qx 'restored-unset=<unset>' <<<"$out" \
+  && ok "no-wait: it is NOT left set on the controller (the lanes it spawns keep their own patience)" \
+  || bad "no-wait: GH_LIMIT_NO_WAIT leaked into the controller — got: $(echo "$out" | sed -n 2p)"
+# …and a caller's OWN value is restored to that value, never merely emptied.
+G2="$T/G2"; rig "$G2/rig.sh"
+cat >> "$G2/rig.sh" <<'SH'
+GH_LIMIT_NO_WAIT=0; export GH_LIMIT_NO_WAIT
+gh_bounded pr view 9 >/dev/null 2>&1
+printf 'restored-caller=%s\n' "${GH_LIMIT_NO_WAIT-<unset>}"
+SH
+out2="$( (unset GH_LIMIT_NO_WAIT; PATH="$T/gbin:$PATH" GH_CALLS="$T/G2.calls" GH_BOUND_S=5 run_rig "$G2/rig.sh" "$T/og2" "$HERE") 2>&1)"
+grep -qx 'restored-caller=0' <<<"$out2" \
+  && ok "no-wait: a caller's OWN value is restored (set-ness preserved, never merely emptied)" \
+  || bad "no-wait: a caller-set GH_LIMIT_NO_WAIT was not restored — got: $(echo "$out2" | sed -n 1p)"
+
+# Case H — an UNUSABLE `TB_TIMEOUT_BIN` pin (agent-infra#2028 review, P2). `bounded.sh` resolves
+# `TB_TIMEOUT_KIND=invalid` and leaves the pin set, so a presence check on `tb_timeout` alone passes
+# while `tb_timeout` execs a nonexistent binary: rc=127 on EVERY call, with `state/gh-bound` deleted.
+# That is a fully dark controller whose own state file says the bound is fine.
+H="$T/H"; rig "$H/rig.sh"
+cat >> "$H/rig.sh" <<'SH'
+printf 'off=%s\n' "${GH_BOUND_OFF:-unset}"
+out="$(GH_MODE=ok gh_bounded pr view 11 2>/dev/null)"; printf 'rc=%s out=%s\n' "$?" "$out"
+SH
+out="$(PATH="$T/bin:$PATH" GH_CALLS="$T/H.calls" TB_TIMEOUT_BIN="$T/no-such-timeout" run_rig "$H/rig.sh" "$T/oh" "$HERE" 2>&1)"
+grep -qx 'off=1' <<<"$out" \
+  && ok "bad pin: an unexecutable TB_TIMEOUT_BIN is DEGRADED, not announced as a working bound" \
+  || bad "bad pin: the block claimed a bound it does not have — got: $out"
+grep -q '^rc=0 out={"ok":1' <<<"$out" \
+  && ok "bad pin: calls still RUN (rc=0, not the 127 every call would otherwise answer)" \
+  || bad "bad pin: a call answered $(echo "$out" | sed -n 2p) — the controller is dark"
+[ -s "$T/oh/state/gh-bound" ] && grep -q 'DEGRADED' "$T/oh/state/gh-bound" \
+  && ok "bad pin: state/gh-bound records the degradation (it used to be DELETED on this path)" \
+  || bad "bad pin: state/gh-bound does not record the degradation — a reader sees 'bounded'"
+grep -q 'TB_TIMEOUT_BIN' "$T/oh/state/gh-bound" 2>/dev/null \
+  && ok "bad pin: the record NAMES the pin, so the operator knows what to fix" \
+  || bad "bad pin: the record does not name TB_TIMEOUT_BIN"
+grep -q 'TB_TIMEOUT_FORCE_INTERNAL=1' "$T/oh/logs/orch-loop.log" 2>/dev/null \
+  && ok "bad pin: the log names the remedy that does work (the internal watchdog)" \
+  || bad "bad pin: the log names no remedy"
+
 # Case F — STRUCTURAL, and the one that keeps the fix from rotting: no gh call in the shipped loop may
 # bypass the bound. The pre-fix tree fails this on 16 sites; a new unbounded call site fails it too.
 UNBOUNDED="$(awk '{ line=$0; sub(/^[ \t]+/,"",line); if (line ~ /^#/) next;

@@ -194,6 +194,40 @@ if need "$T/quota.sh" "the sweep-quota helper block"; then
   got="$(sweep_defer_until "$raw")"
   [ "$got" -le $(( now + 3610 )) ] && ok "sweep_defer_until: an absurd reset is capped at 1h" \
                                     || bad "sweep_defer_until returned a runaway '$got'"
+  # ⛔ A BOUNDED `GH_LIMIT_NO_WAIT` REFUSAL CARRIES NO HEADERS AT ALL (agent-infra#2028 review P1). The
+  # layer answers before the request is servable, so `sweep_defer_until ""` can only floor the deferral
+  # at now+60 — and the box re-attempted a spent bucket once a minute for the whole limit. The layer
+  # records the window its own classification justifies (`until=`, gh-limit.py record_window);
+  # `sweep_defer_until_recorded` takes the LATER of the two. Every case below is driven from a fixture
+  # `GH_LIMIT_DIR`, never the runner's own cache.
+  mkdir -p "$T/ghlimit"; export GH_LIMIT_DIR="$T/ghlimit"
+  rec() { printf 'at=%s bucket=core reset=0 attempts=1 waited=0 status=403 kind=primary until=%s remaining=0 recovered=%s\n' "$1" "$2" "${3:-0}" > "$T/ghlimit/last-limit"; }
+  rec "$now" "$(( now + 3000 ))"
+  got="$(sweep_defer_until_recorded '')"
+  [ "$got" -ge $(( now + 2990 )) ] && [ "$got" -le $(( now + 3010 )) ] \
+    && ok "sweep_defer_until_recorded: no headers → the layer's recorded until= window is used, not the 60s floor" \
+    || bad "sweep_defer_until_recorded ignored the recorded until= ('$got', want ~$(( now + 3000 )))"
+  raw="$(printf 'HTTP/2.0 403 x\r\nX-Ratelimit-Reset: %s\r\n\r\n' "$(( now + 120 ))")"
+  got="$(sweep_defer_until_recorded "$raw")"
+  [ "$got" -le $(( now + 140 )) ] \
+    && ok "sweep_defer_until_recorded: a response header WINS over a later recorded window (this response's truth, not the last one's)" \
+    || bad "sweep_defer_until_recorded let a stale record overrule the response headers ('$got')"
+  rec "$(( now - 1800 ))" "$(( now + 3000 ))"
+  got="$(sweep_defer_until_recorded '')"
+  [ "$got" -le $(( now + 70 )) ] \
+    && ok "sweep_defer_until_recorded: a record older than the window is not evidence about THIS cycle (falls back to the floor)" \
+    || bad "sweep_defer_until_recorded trusted a stale record ('$got')"
+  rec "$now" "$(( now + 3000 ))" "$now"
+  got="$(sweep_defer_until_recorded '')"
+  [ "$got" -le $(( now + 70 )) ] \
+    && ok "sweep_defer_until_recorded: a limit the layer already RECOVERED from defers nothing" \
+    || bad "sweep_defer_until_recorded deferred on a recovered limit ('$got')"
+  rec "$now" "$(( now + 999999 ))"
+  got="$(sweep_defer_until_recorded '')"
+  [ "$got" -le $(( now + 3610 )) ] \
+    && ok "sweep_defer_until_recorded: the recorded window keeps the same 1h ceiling as the header path" \
+    || bad "sweep_defer_until_recorded returned a runaway '$got'"
+  unset GH_LIMIT_DIR
 fi
 
 # ── 2) the listing must be the conditional REST call, not `gh pr list` ───────────

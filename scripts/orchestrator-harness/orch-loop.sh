@@ -450,7 +450,29 @@ for _ghb_cand in "$O/lib/bounded.sh" "${_HERE_RS:-/nonexistent}/../lib/bounded.s
   if [ -f "$_ghb_cand" ]; then _ghb_lib="$_ghb_cand"; break; fi
 done
 GH_BOUND_OFF=0
-if [ -n "$_ghb_lib" ] && . "$_ghb_lib" 2>/dev/null && command -v tb_timeout >/dev/null 2>&1; then
+# ⛔ THERE ARE THREE WAYS TO HAVE NO USABLE BOUND, AND ALL THREE GET THE SAME ANSWER: degrade, disclose,
+# and do NOT refuse to start. Two of them are not "library missing": a library that sourced but defines
+# no `tb_timeout`, and — the arm that used to slip through — a library reporting `TB_TIMEOUT_KIND=invalid`
+# because an operator's `TB_TIMEOUT_BIN` pin is not executable (`bounded.sh:19-20,64`). THAT ONE WAS THE
+# WORST: the pin satisfied `command -v tb_timeout`, so the block announced "bounded", DELETED
+# `state/gh-bound` (the only machine-readable record a reader has), and then `tb_timeout` exec'd the
+# nonexistent pin (`bounded.sh:279`) — rc=127 on EVERY call, i.e. a controller fully dark while its own
+# state file says the bound is fine. `bounded.sh`'s contract is "callers REFUSE at startup, they do not
+# silently fall back" (`disk-reaper.sh` exits 3 on exactly this); this block keeps its own #2320 stance
+# instead — a controller that will not start is the worse outage — but it must not CLAIM a bound it does
+# not have, so the unusable pin is DEGRADED and NAMED, with the remedy that does work.
+_ghb_bad=""; _ghb_fix="ship lib/bounded.sh beside the harness (it is in scripts/lib/)"
+if [ -n "$_ghb_lib" ] && . "$_ghb_lib" 2>/dev/null; then
+  if [ "${TB_TIMEOUT_KIND:-}" = "invalid" ]; then
+    _ghb_bad="UNRESOLVED (TB_TIMEOUT_BIN=${TB_TIMEOUT_BIN:-} cannot be executed — bounded.sh resolves TB_TIMEOUT_KIND=invalid and tb_timeout would exec it, answering 127 on EVERY call)"
+    _ghb_fix="correct or unset TB_TIMEOUT_BIN, or set TB_TIMEOUT_FORCE_INTERNAL=1 to use bounded.sh's internal watchdog"
+  elif ! command -v tb_timeout >/dev/null 2>&1; then
+    _ghb_bad="UNRESOLVED ($_ghb_lib sourced but defines no tb_timeout)"
+  fi
+else
+  _ghb_bad="UNRESOLVED (no bounded.sh in $O/lib, ${_HERE_RS:-?}/../lib or ~/.pi/agent/scripts/lib)"
+fi
+if [ -z "$_ghb_bad" ]; then
   GH_BOUND_HOW="$(tb_watchdog_description 2>/dev/null)"
   rm -f "$O/state/gh-bound" 2>/dev/null || true
   printf '[bound] gh calls bounded at %ss (%s), %s per cycle before the rest fail fast — agent-infra#2028\n' \
@@ -462,12 +484,13 @@ else
   # would be a worse failure than the one this prevents"). It is not silent: the degradation is recorded
   # in `state/gh-bound` for a reader AND printed by every cycle at the point the counter is reset.
   GH_BOUND_OFF=1
-  GH_BOUND_HOW="UNRESOLVED (no bounded.sh in $O/lib, ${_HERE_RS:-?}/../lib or ~/.pi/agent/scripts/lib)"
+  GH_BOUND_HOW="$_ghb_bad"
   printf 'DEGRADED %s — gh calls are UNBOUNDED (rc=124 cannot happen; a hung gh call can still pin the cycle)\n' \
     "$GH_BOUND_HOW" > "$O/state/gh-bound" 2>/dev/null || true
-  printf '[bound] ⚠️ DEGRADED: %s — gh calls are UNBOUNDED. Fix: ship lib/bounded.sh beside the harness (it is in scripts/lib/).\n' \
-    "$GH_BOUND_HOW" >> "$LOG" 2>/dev/null || true
+  printf '[bound] ⚠️ DEGRADED: %s — gh calls are UNBOUNDED. Fix: %s.\n' \
+    "$GH_BOUND_HOW" "$_ghb_fix" >> "$LOG" 2>/dev/null || true
 fi
+unset _ghb_bad _ghb_fix
 # gh_trips_read — how many calls have hit the bound in the CURRENT cycle. `read` with a redirect is a
 # BUILTIN, so this costs no fork inside the `$( )` call sites below.
 gh_trips_read() {
@@ -492,6 +515,27 @@ gh_bounded() {
   gh_trips_read
   # TRIPPED: no fork, no socket, no queue position — and no second log line (the trip already printed).
   if [ "$_ghb_n" -ge "$GH_BOUND_TRIP" ]; then return 124; fi
+  # ⛔ THE BOUND MUST NOT BE DECIDED BY A LAYER SLEEPING INSIDE THE CALL. `gh` here resolves through
+  # `gh-limit.py` (`gh-rest/gh` on the Mac daemon PATH, `gh-limit/gh` on a cell), and that layer WAITS
+  # IN-PROCESS: 60/120/240 s per refusal attempt (`MAX_ATTEMPTS=4`, `gh-limit.py:215-216,3540`) — so a
+  # rate-limited call answers at ~420 s — and up to `LOCK_TIMEOUT=600` s in the box-wide single-flight
+  # lock (`gh-limit.py:218`). Against a 120 s bound the kill therefore lands DURING the second wait,
+  # BEFORE `fail_loudly()` can print the RATE-LIMITED refusal: the caller gets empty output and a 124
+  # instead of the limit it actually hit, `sweep_fail_kind` reads `other`, the deferral is never armed,
+  # and three kills blind the cycle. That is #2028's own fix-direction #2 ("never sleep inside a
+  # substitution; the backoff belongs to the cycle, not inside `$( )`") — truncating the sleep is not
+  # removing it.
+  # The repo's documented contract for exactly this caller class is `GH_LIMIT_NO_WAIT` (`gh-limit.py:219-224`,
+  # `git grep GH_LIMIT_NO_WAIT`: the eight heartbeat tools use `setdefault`, `lander.sh:609,734` and
+  # `cloud-cell-supervisor.sh:2913` pass it per call). Under it the layer records the limit and answers
+  # AT ONCE, and `budget = min(LOCK_TIMEOUT, NO_WAIT_LOCK_S) if NO_WAIT` (`gh-limit.py:721`) also bounds
+  # the LOCK wait to 5 s — which is why this sets ONE variable and lets the layer keep its own default
+  # rather than freezing a copy of it here.
+  # ⛔ PER CALL, NOT EXPORTED FOR THE CONTROLLER: the controller spawns lanes, fixers and reviewers, and a
+  # block-scope export would change THEIR gh patience for the life of the box. It is saved and put back
+  # (set-ness included, never merely emptied) for the same reason TB_WATCHDOGS is.
+  _ghb_nw="${GH_LIMIT_NO_WAIT-}"; _ghb_nw_set="${GH_LIMIT_NO_WAIT+1}"
+  GH_LIMIT_NO_WAIT=1; export GH_LIMIT_NO_WAIT
   # ⛔ THE WATCHDOG LIST IS PUT BACK, NOT APPENDED TO. `tb_timeout` records every watchdog it forks so a
   # caller's EXIT trap can TERM them; it has already `wait`ed this one by the time it returns, so its
   # record is dead weight — and this loop outlives a month of cycles, where dead pids accumulate. A
@@ -500,6 +544,7 @@ gh_bounded() {
   tb_timeout "$GH_BOUND_S" gh "$@"
   _ghb_rc=$?
   TB_WATCHDOGS="$_ghb_wd"
+  if [ -n "$_ghb_nw_set" ]; then GH_LIMIT_NO_WAIT="$_ghb_nw"; else unset GH_LIMIT_NO_WAIT; fi
   if [ "$_ghb_rc" -eq 124 ]; then
     printf '%s\n' "$(( _ghb_n + 1 ))" > "$GH_BOUND_STATE" 2>/dev/null || true
     case "${1:-?}" in
@@ -4469,6 +4514,58 @@ sweep_defer_until() {
   [ "$cand" -gt $(( now + 3600 )) ] && cand=$(( now + 3600 ))
   printf '%s\n' "$cand"
 }
+# gh_limit_recorded_until -> the block WINDOW `gh-limit.py` recorded for its last refusal, as epoch
+# seconds, or EMPTY. The same `last-limit` record `gh_limit_token` prints: `gh-limit.py:480-495`
+# writes `until=` from `record_window`/`marker_until`, and #2137 states the rule every reader owes it
+# — "a reader must block until `until`, never until `reset`" (the reset of a secondary/unclassified
+# refusal is not a recovery time).
+# ⛔ AGE-BOUNDED AND RECOVERY-SUPPRESSED ON READ, exactly like the token: the record outlives the
+# process that wrote it, so a stale one is not evidence about THIS cycle, and a limit the layer has
+# since recovered from is not one to defer for. `GH_LIMIT_STALE_S` is the cycle's own 900 s window and
+# the default here matches it, so this helper stays self-contained for the extraction-driven suite.
+gh_limit_recorded_until() {
+  local f rec kv at="" until="" recovered="" age
+  f="${GH_LIMIT_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/gh-limit}/last-limit"
+  [ -f "$f" ] || return 0
+  rec="$(cat "$f" 2>/dev/null)" || return 0
+  # ONE line of `key=value` pairs, no spaces in any value, so word splitting IS the parse.
+  for kv in $rec; do
+    case "$kv" in
+      at=*)        at="${kv#at=}" ;;
+      until=*)     until="${kv#until=}" ;;
+      recovered=*) recovered="${kv#recovered=}" ;;
+    esac
+  done
+  is_num "${at:-}" && is_num "${until:-}" && [ "$until" -gt 0 ] || return 0
+  if is_num "${recovered:-}" && [ "$recovered" -ge "$at" ]; then return 0; fi
+  age=$(( $(date +%s) - at ))
+  { [ "$age" -ge 0 ] && [ "$age" -le "${GH_LIMIT_STALE_S:-900}" ]; } || return 0
+  printf '%s\n' "$until"
+}
+# sweep_defer_until_recorded <raw-response> -> sweep_defer_until, PLUS the layer's own window when the
+# response carried no rate-limit headers at all.
+# ⛔ THE DEFERRAL HAD NO WINDOW TO READ ON THE PATH THAT MATTERS MOST. The controller's calls are now
+# bounded AND `GH_LIMIT_NO_WAIT` (see the gh-bound block), so a rate-limited call comes back AT ONCE
+# with the RATE-LIMITED refusal on STDERR and NO response headers — there was no request to take them
+# from. `sweep_defer_until ""` can only floor that at now+60, so the box re-attempted a spent bucket
+# once a minute for the length of the limit. The layer already recorded the window its own
+# classification justifies; this takes the LATER of the two.
+# A header always WINS: it is this response's truth, while the record is the last one's — so the record
+# is consulted only when the response carries neither `retry-after` nor `x-ratelimit-reset`, and the
+# result keeps the same now+3600 ceiling the header path applies.
+sweep_defer_until_recorded() {
+  local raw="${1:-}" cand until now
+  cand="$(sweep_defer_until "$raw")"
+  if [ -n "$(printf '%s\n' "$raw" | rl_header 'retry-after')" ] \
+     || [ -n "$(printf '%s\n' "$raw" | rl_header 'x-ratelimit-reset')" ]; then
+    printf '%s\n' "$cand"; return 0
+  fi
+  until="$(gh_limit_recorded_until)"
+  [ -n "$until" ] && [ "$until" -gt "$cand" ] && cand="$until"
+  now="$(date +%s)"
+  [ "$cand" -gt $(( now + 3600 )) ] && cand=$(( now + 3600 ))
+  printf '%s\n' "$cand"
+}
 # END sweep-quota
 
 # Count of open PRs. This number drives the SCOPE decision (BROAD drain vs OWN) and the sticky
@@ -5372,7 +5469,8 @@ while true; do
   [ "${#DEFER_UNTIL}" -le 10 ] || DEFER_UNTIL=0
   LAST_FULL="$(cat "$O/state/sweep-stamp" 2>/dev/null || true)";       is_num "${LAST_FULL:-}"  || LAST_FULL=0
   [ "${#LAST_FULL}" -le 10 ] || LAST_FULL=0
-  # Clamp on READ, not only on write. Both writers below go through sweep_defer_until (<= now+3600),
+  # Clamp on READ, not only on write. Both writers below go through sweep_defer_until (or its
+  # `_recorded` twin, which applies the same ceiling) (<= now+3600),
   # so an implausible value can only arrive from a corrupt/truncated/hand-edited state file — but it
   # is the one piece of new state whose corruption stops the fleet merging and is never left, so it
   # degrades to a FULL sweep rather than a permanent stall.
@@ -5459,7 +5557,9 @@ while true; do
       # never confirmed this cycle. The failure is named instead, and the row reason carries it.
       SWEEP_CACHE_NOTE="the PR listing FAILED ($SWEEP_KIND) — the cached rows were NOT used, so no PR was read this cycle"
       if [ "$SWEEP_KIND" = "rate-limit" ]; then
-        DEFER_UNTIL="$(sweep_defer_until "${SWEEP_RAW:-}")"
+        # ⛔ `_recorded`: a bounded `GH_LIMIT_NO_WAIT` refusal carries NO headers, so the layer's own
+        # recorded `until=` is the only window available here (see the helper in the sweep-quota block).
+        DEFER_UNTIL="$(sweep_defer_until_recorded "${SWEEP_RAW:-}")"
         printf '%s\n' "$DEFER_UNTIL" > "$O/state/sweep-defer-until"
         echo "[sweep] ⛔ RATE-LIMITED (HTTP ${SWEEP_STATUS:-?} rc=$SWEEP_RC; remaining=${RL_REMAIN:-?} reset=${RL_RESET:-?} retry-after=${RL_AFTER:-?}) — sweep DEFERRED $(( (DEFER_UNTIL - NOW + 59) / 60 ))m. THIS CELL CANNOT MERGE, NOT IDLE. (${SWEEP_ERR:-no stderr})" >> "$LOG"
       else
