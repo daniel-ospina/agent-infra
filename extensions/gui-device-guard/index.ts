@@ -1085,19 +1085,27 @@ export function splitShellStdin(command: string): ShellStdin {
         // the shell runs is the tab-stripped text — not the source bytes.
         const tabfree = (k: number) => (p.stripTabs ? lines[k].replace(/^\t+/, "") : lines[k]);
         // ⛔ AN UNQUOTED DELIMITER MAKES THIS A DIFFERENT DOCUMENT (round-12 review,
-        // twelfth pass, P0). bash removes `\` + newline and collapses `\\`, `\$` and
-        // `\`` before the shell ever sees the body — and the TERMINATOR IS MATCHED
-        // AGAINST THAT TEXT: `EO\` + newline + `F` ends the here-document (measured),
-        // which the raw comparison did not see, so the whole rest of the command —
-        // including a launch bash runs — was swallowed as body. A QUOTED delimiter is
-        // literal and is matched raw, terminator included (L54).
+        // twelfth pass, P0). bash removes `\` + newline while reading the document, and
+        // the TERMINATOR IS MATCHED AGAINST THE JOINED TEXT: `EO\` + newline + `F` ends
+        // the here-document (measured), which the raw comparison did not see, so the
+        // whole rest of the command — including a launch bash runs — was swallowed as
+        // body. The backslash COLLAPSE is a separate, BODY-ONLY step: it does not apply
+        // to the comparison (`<<A$B` is not terminated by a body line `A\$B` —
+        // measured, allow twin A82). A QUOTED delimiter is literal and is matched raw,
+        // terminator included (L54).
         let text = tabfree(j);
         let end = j;
         if (!p.quoted) {
           for (;;) {
             const nx = end + 1;
             if (nx >= lines.length) break;
-            const joined = joinContinuedLine(text, tabfree(nx));
+            // ⛔ `<<-` STRIPS THE LEADING TABS OF THE LOGICAL LINE, NOT OF ITS
+            // CONTINUATION (round-12 review, thirteenth pass, P2): the tab on a
+            // continuation line survives the join — bash's own warning calls the
+            // document `body\nEO\tF\n…` — so stripping it here made `EO\`+`\tF`
+            // look like `EOF`, ended a document bash leaves OPEN, and refused a
+            // launch bash treats as data (measured, allow twin A81).
+            const joined = joinContinuedLine(text, lines[nx]);
             if (joined === null) break;
             text = joined;
             end = nx;

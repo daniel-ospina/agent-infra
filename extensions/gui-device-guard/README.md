@@ -348,16 +348,20 @@ This is a residual list, not a completeness claim:
   launch on the next line — while `echo hi \\\` continues into it and makes the launch an
   `echo` ARGUMENT. Taking the last backslash at face value joined the launch into
   `echo` and lost it (`round 12`, rows L57a/L57b, allow twin A77), in both joiners.
-- An UNQUOTED heredoc is a DIFFERENT document from the source bytes: bash removes
-  `\` + newline and collapses `\\`, `\$` and `` \` `` in it, and — measured — matches the
-  TERMINATOR against that text. `<<EOF` … `EO\` + newline + `F` ends the here-document and
-  the launch after it RUNS, which the raw comparison did not see: the rest of the
-  command, launch included, was swallowed as body (L60). The body the consuming shell
-  receives is the COLLAPSED text, so `sh <<EOF` with `echo a \\` hands the shell
+- An UNQUOTED heredoc is a DIFFERENT document from the source bytes, in TWO separate
+  steps that go to different places. (1) CONTINUATION REMOVAL happens while the
+  document is read, and the TERMINATOR IS COMPARED against the joined text: `<<EOF` …
+  `EO\` + newline + `F` ends the here-document and the launch after it RUNS, which the
+  raw comparison did not see — the rest of the command, launch included, was swallowed
+  as body (L60). `<<-` strips the leading tabs of each DOCUMENT line only, so a
+  continuation line keeps its tab and `EO\`+tab+`F` is NOT a terminator (allow twin
+  A81). (2) The BACKSLASH COLLAPSE (`\\`, `\$`, `` \` ``) applies to the BODY the
+  consuming shell receives, NOT to the comparison — `<<A$B` is not terminated by a body
+  line `A\$B` (allow twin A82) — so `sh <<EOF` with `echo a \\` hands the shell
   `echo a \` + newline + `electron .`, which its own continuation join turns into one
-  `echo` — classifying the raw body over-blocked that (allow twin A79). A QUOTED
-  delimiter keeps both properties of a literal document: no collapse, no joining, and
-  `EO\`+`F` is NOT its terminator (allow twin A80).
+  `echo` (allow twin A79). A QUOTED delimiter keeps both properties of a literal
+  document: no collapse, no joining, and `EO\`+`F` is NOT its terminator (allow twin
+  A80).
 - The continuation lines a join CONSUMES are not re-emitted. Re-emitting them duplicated
   a fragment that could carry a lone quote — and a duplicated closing quote changed how
   the rest of the command read, losing the launch after it (L58) — and the quote model
@@ -452,7 +456,7 @@ This is a residual list, not a completeness claim:
 ## Tests
 
 ```bash
-node extensions/gui-device-guard/test.mjs                    # 323 assertions, threat table L1–L60 + handler H1–H15
+node extensions/gui-device-guard/test.mjs                    # 325 assertions, threat table L1–L60 + handler H1–H15
 node extensions/gui-device-guard/test.mjs --classify 'npm exec electron .'
 ```
 
@@ -463,7 +467,7 @@ stays green while `index.ts` is broken and the guard is inert in every session.
 Mutations are pinned, each attributable to the row it is about, all measured at
 ONE head (**this** head — re-measured, not carried over: the counts are the output
 of running the mutant against `test.mjs`, and the assertion total is
-`323 = 252 ROWS + 14 APP_ROWS + 57 explicit \`check()\` calls`): the Electron
+`325 = 254 ROWS + 14 APP_ROWS + 57 explicit \`check()\` calls`): the Electron
 rule's `media` → `false` reds **142**; the wrapper recursion
 removed reds **8**; the wrapper WORDS removed reds **4** (L45a + L56a–L56c); the structural rule that
 reads a package-runner anywhere in the segment removed reds **2** (L19h/L19i); the
@@ -548,7 +552,9 @@ model at the RAW line's base instead of the joined text's offsets reds **1** (A7
 matching an UNQUOTED heredoc's terminator against the raw line again reds **1** (L60);
 dropping the `\\`/`\$`/`` \` `` collapse from an unquoted body reds **1** (A79); and
 joining a QUOTED body — or failing to notice that its delimiter was quoted — reds
-**3** (L54a/L54b, A80);
+**3** (L54a/L54b, A80); tab-stripping a continuation line again (the `<<-` rule) reds
+**1** (A81); and comparing the terminator AFTER the body's backslash collapse reds
+**1** (A82);
 and reading `watch`'s operand from token 0 again reds **3**
 (L56a–L56c); dropping `electron-forge` from the electron head test reds **5**
 (L31a–L31e); removing the PROCESS-substitution arm (`<( … )` / `>( … )`, the

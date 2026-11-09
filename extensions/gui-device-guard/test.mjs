@@ -737,6 +737,15 @@ const ROWS = [
   //        Classifying the raw body instead OVER-blocked (measured).
   ["A79 the ALLOW twin: an unquoted body's `\\\\` collapses to `\\`, so the inner shell joins",
     "sh <<EOF\necho a \\\\\nelectron .\nEOF", 0, null, false],
+  //   A81: `<<-` strips the leading tabs of each DOCUMENT LINE, not of a CONTINUATION
+  //        line — bash keeps that tab, so `EO\` + tab + `F` is not the terminator and
+  //        the document runs to end-of-input, leaving the launch as data (measured).
+  ["A81 the ALLOW twin: `<<-` does not strip a continuation line's tab, so `EO\`+tab+`F` is no terminator",
+    "cat <<-EOF\n\tbody\n\tEO\\\n\tF\nnpm exec electron .", 0, null, false],
+  //   A82: the backslash COLLAPSE is body-only — the terminator is compared BEFORE it,
+  //        so a body line `A\$B` does not terminate `<<A$B` (measured).
+  ["A82 the ALLOW twin: the terminator is compared before the body's backslash collapse",
+    "cat <<A$B\nline\nA\\$B\nnpm exec electron .", 0, null, false],
   //   L30c: tab completion appends a slash to directories, and `open
   //         ./Build/DMeer.app/` — the incident's own app — matched none of the three
   //         bundle tests while the `-a` spelling of the SAME token was refused.
