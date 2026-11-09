@@ -72,7 +72,7 @@ SHARED_EXCLUDED_NOTE="fork arm covers the curated SHARED set (${SHARED// /, }); 
 # it stops every dispatch); origin/main adds brief-gate.sh (#2258), repo-target.sh (#2724/#2694) and
 # harness-provenance.sh. A file executed from the installed $O that is absent from this list is a
 # divergence nothing byte-compares.
-EXECUTED="orch-loop.sh harness-refresh.sh rail-refusal.sh spawn-gate.sh brief-gate.sh mandate-preflight.sh refresh-candidates.sh claims.sh nonblocking-dispatch.sh worker-terminal.sh wt-lifecycle.sh lane.sh lane-merge.sh lane-bound.sh merge-rate.sh install.sh report.sh repo-authority.sh repo-slug.sh repo-target.sh live-ownership.sh ci-queue.sh dispatch-merge.sh chain-merge.sh merge-one.sh fix-one.sh adopt-fix.sh stall-fix.sh merged-not-closed.sh check-deployed-drift.sh check-port-drift.sh harness-provenance.sh key-gate.sh lane-env.sh"
+EXECUTED="orch-loop.sh harness-refresh.sh rail-refusal.sh spawn-gate.sh brief-gate.sh mandate-preflight.sh refresh-candidates.sh claims.sh nonblocking-dispatch.sh worker-terminal.sh wt-lifecycle.sh lane.sh lane-merge.sh lane-bound.sh merge-rate.sh install.sh report.sh repo-authority.sh repo-slug.sh repo-target.sh live-ownership.sh ci-queue.sh dispatch-merge.sh chain-merge.sh merge-one.sh fix-one.sh adopt-fix.sh stall-fix.sh merged-not-closed.sh check-deployed-drift.sh check-port-drift.sh harness-provenance.sh key-gate.sh lane-env.sh controller-state.sh"
 # …`stall-fix.sh` (#2929) joins the EXECUTED half on the list's own test: `orch-loop.sh` runs it as
 # `bash "$O/stall-fix.sh"` on every stalled pass, and this list byte-compares only files that are
 # PRESENT — so before this line a `$O` WITHOUT it produced NO divergence. The shipped escalation would
@@ -87,6 +87,12 @@ EXECUTED="orch-loop.sh harness-refresh.sh rail-refusal.sh spawn-gate.sh brief-ga
 # (review of #3331, verified `grep -c lane-env.sh` = 0 on both), so a `$O` deployed before #3060 — or
 # half-synced — stops every lane on the box while this check reports no divergence. Nothing else changes:
 # this arm is presence + byte comparison.
+# …`controller-state.sh` (agent-infra#2095) is presence-required on exactly the `lane-env.sh` shape, one
+# degree sharper: `orch-loop.sh` sources it at startup and `exit 78`s without it, so a `$O` deployed
+# before this change — or half-synced, or hand-`cp`ed — stops the CONTROLLER on every tick while this
+# check reports no divergence and `install.sh`'s drift loop does not name it either. Absent from both
+# lists, the reachable state is: the box dispatches nothing, and both instruments say it is verified.
+# (fresh-context review of #3846.) Nothing else changes: presence + byte comparison, one word per list.
 # …`key-gate.sh` (agent-infra#3331) is presence-required on the sharpest form of the rule above: `lane.sh`
 # SOURCES it fail-loud (`exit 78`) as the last gate before `pi` is spawned, so a `$O` that predates it
 # does not merely lose an assertion — it stops every lane on that box. And the divergence is invisible
