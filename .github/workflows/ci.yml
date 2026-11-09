@@ -506,9 +506,9 @@ jobs:
     # 3.11/3.12 divergence would pass PR CI and only break post-merge.
     runs-on: ubuntu-latest
     # #2055 — this job carries NO job-level bound on purpose. ⛔ THE REASON IS NOT ARITHMETIC, and saying
-    # it was arithmetic was FALSE (review finding, P2): the first draft of this change had 65 steps
-    # summing to 381 min, above the platform's 360-minute ceiling, so no bound could satisfy
-    # `job-bound > Σ step-bounds` — "a 66-step job cannot" was true THEN. It is not true now: Σ is 326, so
+    # it was arithmetic was FALSE (review finding, P2): this change's FIRST draft had 66 steps of which 65
+    # carried a bound, summing 381 min — above the platform's 360-minute ceiling — so no bound could satisfy
+    # `job-bound > Σ step-bounds`, and "a 66-step job cannot" was true THEN. It is not true now: Σ is 326, so
     # a job bound in 327..359 WOULD satisfy it. The step-only shape is kept deliberately, because a job
     # bound above Σ can never fire (the last step bound always arrives first) and therefore buys nothing —
     # while it would relabel this job from step-bounded to job-bounded, i.e. to the shape whose trip is

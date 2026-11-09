@@ -82,6 +82,10 @@
 # 26.  FIXTURE — the REMEDY EDGE: Σ = 359 under a 20-min job bound. "Raise the job bound above 359 and
 #      below 360" names no integer that exists, so that branch must not be taken at 359 — the message has
 #      to say the step bounds are what must come down.
+# 27.  FIXTURE — an INERT job bound: J = 500 (above the platform's 360 ceiling, so it can never fire) over
+#      Σ = 400. The ceiling that actually covers the job is 360, so the step bounds are unreachable and the
+#      job must be REFUSED. Dropping the `verdict.inert` term from the ceiling expression — i.e. treating
+#      the ceiling as J — certifies it green with only the "inert" note, and NOTHING pinned that term.
 #
 # HERMETIC: fixtures + temp copies only; no network, no gh, no clock. The live tree is READ, never
 # written (the temp copy is where the mutations land).
@@ -424,6 +428,14 @@ grep -q 'No job bound can sit above 359' "$ERR" \
 grep -q 'above 359 and below 360' "$ERR" \
   && no "the remedy prescribes a job bound in (359,360), where no integer exists" \
   || ok "the remedy does NOT prescribe an impossible job bound"
+
+echo "== 27. FIXTURE: an INERT job bound (J above the 360 ceiling) does not raise the ceiling to J"
+run_case job-bound-inert
+[ "$rc" -eq 1 ] && ok "job-bound-inert (J 500, Σ 400) → rc 1" || no "job-bound-inert → rc $rc, expected 1"
+grep -q "at or above the platform's 360-minute ceiling (which pre-empts its inert 500)" "$ERR" \
+  && ok "the finding says WHICH ceiling covers the job (360, not the inert 500)" \
+  || no "the finding does not name the platform ceiling as the one that covers an inert job bound"
+grep -q 'SUM to 400 min' "$ERR" && ok "the finding names the step SUM" || no "the sum is not named"
 
 echo
 if [ "$fail" -eq 0 ]; then
