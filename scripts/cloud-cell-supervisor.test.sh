@@ -1440,14 +1440,30 @@ PPATH=""
 # The issue's thesis, one instrument over: `check` used to admit on `free >= MIN_FREE_MB` alone, so a
 # cell could be certified HEALTHY at 1,469MB while the dispatch gate refused every spawn because one
 # lane's tree did not fit. #2721/#3395 closed the dispatch half; these arms pin the `check` half.
-# ⛔ THE REFERENCE IS `spawn-gate.sh`'s OWN `disk_lane_costs` + `disk_lane_need`, driven through the
-# shipped file — never a number retyped here. Drift in EITHER file's constants, package-manager marker
-# set, or reserve multiple moves one side only, and reddens these arms: that is the only thing keeping
-# two separate scripts from certifying two different floors, which IS the defect this issue records.
+# ⛔ TWO ADMISSION BOUNDS, AND THE REFERENCE IS THE BINDING ONE (review round 7, P1). The dispatch
+# gate admits TWICE: `disk_lane_need` inside `run_agent` (class from the target's markers) and, one
+# step EARLIER at `wt_provision`, `disk_worktree_need` — which charges the python class
+# UNCONDITIONALLY, so it is TARGET-INDEPENDENT and sits ABOVE the live arm on any plain target. Every
+# worktree-creating path (`fix-one.sh`, `adopt-fix.sh`, `dispatch-merge.sh`) refuses at the SEAM, so a
+# `check` that asserted only the live arm certified this fleet's own plain-target harness cell at
+# 2,064MB while every lane checkout was refused at 8,144MB — #1852's false PASS narrowed, not closed.
+# These arms drive BOTH numbers out of the shipped gate and demand `check` refuse below their maximum.
 say_case "check refuses a cell that cannot fit ONE lane — on spawn-gate.sh's own numbers (#1852)"
 GATE="$HERE/orchestrator-harness/spawn-gate.sh"
-gate_need() { # gate_need <target> <floor-mb> -> the MB spawn-gate.sh itself would require
-  DISK_MIN_FREE_MB="$2" bash -c 'set -u; . "$1" >/dev/null 2>&1 || exit 3; set -- $(disk_lane_costs "$2"); disk_lane_need "$1" "$2" "$3"' _ "$GATE" "$1" 2>/dev/null
+# ⛔ BOTH REFERENCES CLEAR THE DISK_LANE_* KNOBS. `prov()` neutralises them (0), so a cell that
+# exports the documented `DISK_LANE_SELF_MB` remedy would otherwise move the reference and not the
+# subject — the suite's own false red (recorded as a review observation, closed here).
+gate_need() { # gate_need <target> <floor-mb> -> the LIVE arm's MB, per spawn-gate.sh itself
+  env -u MIN_FREE_MB -u DISK_LANE_TREE_MB -u DISK_LANE_SELF_MB -u DISK_LANE_RESERVE_MB \
+    DISK_MIN_FREE_MB="$2" bash -c 'set -u; . "$1" >/dev/null 2>&1 || exit 3; set -- $(disk_lane_costs "$2"); disk_lane_need "$1" "$2" "$3"' _ "$GATE" "$1" 2>/dev/null
+}
+gate_worktree_need() { # gate_worktree_need <floor-mb> -> the PRE-START seam's MB, per spawn-gate.sh
+  env -u MIN_FREE_MB -u DISK_LANE_TREE_MB -u DISK_LANE_SELF_MB -u DISK_LANE_RESERVE_MB \
+    DISK_MIN_FREE_MB="${1:-500}" bash -c 'set -u; . "$1" >/dev/null 2>&1 || exit 3; disk_worktree_need' _ "$GATE" 2>/dev/null
+}
+gate_worktree_need_ovr() { # gate_worktree_need_ovr <SELF_MB> <floor-mb> -> the seam with ONE override
+  env -u MIN_FREE_MB -u DISK_LANE_TREE_MB -u DISK_LANE_RESERVE_MB DISK_LANE_SELF_MB="$1" \
+    DISK_MIN_FREE_MB="${2:-500}" bash -c 'set -u; . "$1" >/dev/null 2>&1 || exit 3; disk_worktree_need' _ "$GATE" 2>/dev/null
 }
 PROV_FLOOR=500; PROV_TREE=; PROV_SELF=; PROV_RESERVE=    # the SHIPPED derivation, no overrides
 REF_PLAIN="$(gate_need "$P/repo" 500)"
@@ -1455,27 +1471,43 @@ case "${REF_PLAIN:-}" in
   ''|*[!0-9]*) bad "could not read spawn-gate.sh's own lane requirement (got '${REF_PLAIN:-}') — every arm below would be vacuous"; REF_PLAIN=2064 ;;
 esac
 [ "$REF_PLAIN" -gt 500 ]; rc=$?
-[ "$rc" -eq 0 ] && ok "spawn-gate.sh's requirement for a NON-python target is ${REF_PLAIN}MB, strictly ABOVE the 500MB floor — the band this change closes is real" \
+[ "$rc" -eq 0 ] && ok "spawn-gate.sh's LIVE arm requirement for a NON-python target is ${REF_PLAIN}MB, strictly ABOVE the 500MB floor — the band this change closes is real" \
                 || bad "the reference requirement ${REF_PLAIN}MB is not above the floor — these arms cannot see the band"
-mkdf "$P/needbelow" $(( (REF_PLAIN - 1) * 1024 ))
+REF_WT="$(gate_worktree_need 500)"
+case "${REF_WT:-}" in
+  ''|*[!0-9]*) bad "could not read spawn-gate.sh's own PRE-START seam requirement (got '${REF_WT:-}')"; REF_WT=8144 ;;
+esac
+[ "$REF_WT" -gt "$REF_PLAIN" ]; rc=$?
+[ "$rc" -eq 0 ] && ok "the PRE-START seam needs ${REF_WT}MB vs the live arm's ${REF_PLAIN}MB for this PLAIN target — the binding bound is the seam, and it is the one check must ask against" \
+                || bad "the seam (${REF_WT}MB) is not above the live arm (${REF_PLAIN}MB) on a plain target — this fixture cannot show the false pass, so every arm below is vacuous"
+REF_BIND="$REF_PLAIN"; [ "$REF_WT" -gt "$REF_BIND" ] && REF_BIND="$REF_WT"
+mkdf "$P/needbelow" $(( (REF_BIND - 1) * 1024 ))
 PPATH="$P/needbelow"; prov check
-[ "$PROV_RC" -ne 0 ] && ok "check REFUSES at ${REF_PLAIN}MB-1: ABOVE the floor, BELOW one lane's cost (the false pass in this issue's title)" \
-                     || bad "check certified a cell one MB short of one lane's cost — the band is still open"
+[ "$PROV_RC" -ne 0 ] && ok "check REFUSES at ${REF_BIND}MB-1: ABOVE the floor, BELOW the BINDING lane requirement (the false pass in this issue's title)" \
+                     || bad "check certified a cell one MB short of the binding requirement — the band is still open"
 case "$PROV_OUT" in
-  *"ONE lane for this cell's target needs ${REF_PLAIN}MB"*) ok "…and the refusal names the lane requirement, so an operator can recompute it against the box" ;;
-  *) bad "the refusal does not name the lane requirement — $PROV_OUT" ;;
+  *"it needs ${REF_BIND}MB"*) ok "…and the refusal names the binding requirement, so an operator can recompute it against the box" ;;
+  *) bad "the refusal does not name the binding requirement — $PROV_OUT" ;;
+esac
+case "$PROV_OUT" in
+  *"PRE-START worktree seam"*) ok "…and names WHICH bound binds (the pre-start seam every wt_provision caller refuses on)" ;;
+  *) bad "the refusal does not name the binding instrument — $PROV_OUT" ;;
+esac
+case "$PROV_OUT" in
+  *": ${REF_PLAIN}MB = max(tree "*) ok "…and still reports the live arm's own number (${REF_PLAIN}MB), so both are recomputable" ;;
+  *) bad "the refusal hides the live arm's number — $PROV_OUT" ;;
 esac
 case "$PROV_OUT" in
   *"below the 500MB floor"*) bad "the refusal is the FLOOR die, not the lane-fit arm — the arm would pass against the pre-fix script too" ;;
-  *) ok "…and it is NOT the floor die (the floor is satisfied at ${REF_PLAIN}MB) — the NEW arm decided it" ;;
+  *) ok "…and it is NOT the floor die (the floor is satisfied at ${REF_BIND}MB) — the NEW arm decided it" ;;
 esac
-mkdf "$P/needat" $(( REF_PLAIN * 1024 ))
+mkdf "$P/needat" $(( REF_BIND * 1024 ))
 PPATH="$P/needat"; prov check
-[ "$PROV_RC" -eq 0 ] && ok "check PASSES exactly AT one lane's cost (inclusive boundary, no false block)" \
-                     || bad "check: FALSE BLOCK at exactly the lane requirement — $PROV_OUT"
+[ "$PROV_RC" -eq 0 ] && ok "check PASSES exactly AT the binding lane requirement (inclusive boundary, no false block)" \
+                     || bad "check: FALSE BLOCK at exactly the binding requirement — $PROV_OUT"
 case "$PROV_OUT" in
-  *"one lane for '"*"' needs ${REF_PLAIN}MB"*) ok "…and reports the requirement it admitted on" ;;
-  *) bad "check did not report the lane requirement it used — $PROV_OUT" ;;
+  *"ONE lane needs ${REF_BIND}MB"*) ok "…and reports the requirement it admitted on" ;;
+  *) bad "check did not report the requirement it used — $PROV_OUT" ;;
 esac
 # ⛔ A PYTHON TARGET MUST BE DISCRIMINATED FROM A PLAIN ONE. This is the half that made the measured
 # cells unable to work (a tortoise lane materialises ~6GB of venv on a cold cache; an agent-infra
@@ -1498,6 +1530,42 @@ PPATH="$P/pyat"; prov check
 [ "$PROV_RC" -eq 0 ] && ok "check PASSES a python-target cell AT its lane cost (no false block on a cell that really can work)" \
                      || bad "check: FALSE BLOCK of a python cell at exactly ${REF_PY}MB — $PROV_OUT"
 PROV_REPO=""
+
+# ⛔ THE REFUSAL MUST PRINT THE **EFFECTIVE** TERMS (review round 7, Issue 2). `DISK_LANE_SELF_MB` is
+# not an exotic knob: it is the remedy `spawn-gate.sh`'s own refusal text recommends. The pre-fix line
+# interpolated the shipped CONSTANTS while refusing on overridden terms, so the operator who took the
+# documented remedy got three numbers that did not add up to the verdict — in a line whose whole point
+# is that they can recompute it instead of taking it on faith.
+say_case "the lane-fit refusal prints the EFFECTIVE terms, so an override can recompute its own verdict (#1852)"
+REF_OVR="$(gate_worktree_need_ovr 2048 500)"
+case "${REF_OVR:-}" in
+  ''|*[!0-9]*) bad "could not read the seam's requirement under DISK_LANE_SELF_MB=2048 (got '${REF_OVR:-}')"; REF_OVR=4048 ;;
+esac
+[ "$REF_OVR" -ne "$REF_WT" ]; rc=$?
+[ "$rc" -eq 0 ] && ok "DISK_LANE_SELF_MB=2048 MOVES the seam's own requirement (${REF_OVR}MB vs ${REF_WT}MB shipped) — the override is load-bearing, not decorative" \
+                || bad "the override did not move the reference (${REF_OVR}MB == ${REF_WT}MB) — the arm below would grade nothing"
+PROV_TREE=; PROV_SELF=2048; PROV_RESERVE=
+mkdf "$P/ovrbelow" $(( (REF_OVR - 1) * 1024 ))
+PPATH="$P/ovrbelow"; prov check
+[ "$PROV_RC" -ne 0 ] && ok "check REFUSES at ${REF_OVR}MB-1 under DISK_LANE_SELF_MB=2048 (the override reaches the admission bound)" \
+                     || bad "check admitted at ${REF_OVR}MB-1 with DISK_LANE_SELF_MB=2048 — the override did not reach the bound — $PROV_OUT"
+case "$PROV_OUT" in
+  *"self 2048)MB"*) ok "…and the message carries the EFFECTIVE self term (2048), not the shipped constant" ;;
+  *) bad "the message does not carry the effective self term — $PROV_OUT" ;;
+esac
+case "$PROV_OUT" in
+  *6144*) bad "the message still prints the shipped 6144 constant, so its arithmetic cannot reproduce the ${REF_OVR}MB it refused on — the Issue-2 defect" ;;
+  *) ok "…and does NOT print the shipped 6144 constant it did not use" ;;
+esac
+case "$PROV_OUT" in
+  *"it needs ${REF_OVR}MB"*) ok "…and the refusal's own arithmetic is recomputable: max(tree, self 2048) + 2000 = ${REF_OVR}MB" ;;
+  *) bad "the refusal does not name ${REF_OVR}MB — $PROV_OUT" ;;
+esac
+mkdf "$P/ovrat" $(( REF_OVR * 1024 ))
+PPATH="$P/ovrat"; prov check
+[ "$PROV_RC" -eq 0 ] && ok "check PASSES exactly AT the overridden requirement (no false block from honouring the override)" \
+                     || bad "check: FALSE BLOCK at exactly the overridden requirement ${REF_OVR}MB — $PROV_OUT"
+unset PROV_TREE PROV_SELF PROV_RESERVE
 
 # ── (h3) ONE FLOOR, WHICHEVER KNOB SETS IT (agent-infra#1852) ────────────────────────────────────
 # `spawn-gate.sh`'s `DISK_MIN_FREE_MB` defaults to `MIN_FREE_MB` when unset, and this file's
