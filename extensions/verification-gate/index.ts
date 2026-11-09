@@ -484,6 +484,27 @@ function recoveryOnlyRoot(root: string): string {
 // per-file hash mismatch (which reads as "the gate is broken" and invites a
 // bypass). This only NARRATES; the block/mismatch decision is unchanged and
 // stays fail-closed.
+//
+// #1265 AC (b): narration alone is not enough. A task child's stdout is only read
+// once the child is dead, so the parent's `task` return said "wedged" and the
+// next lane re-dispatched into the same tree (measured: three consecutive
+// children). The decision therefore lands in the SHARED durable audit log too —
+// the artifact AC (b) accepts in lieu of a task-tool contract change. Deduped per
+// (root, siblings) so a git-op-heavy session writes one record, not one per op;
+// reset at session_start (it is a session fact, like the block registry).
+// #1265 (review F5): a SET, not a single slot. The stated invariant is "once per
+// session per (root, siblings)", and a single slot only dedupes CONSECUTIVE
+// repeats. ⛔ The shape that ALTERNATES is TWO roots that both LACK entries — one
+// session working in two unverified worktrees of one repo (B and C, with A
+// verified): each records once, while a single slot re-records B on the return
+// visit, unbounded. An op IN the verified worktree cannot be the other half: this
+// function returns at the `roots.some(…)` guard below when the op's root IS a
+// bridge root, so it records nothing at all. And it is not `git -C` either — that
+// is a REPO-REDIRECTING global (GIT_REDIRECT), `isGitOp` refuses the invocation as
+// foreign, and the tool_call handler returns before this function ever runs. The
+// root alternates through the `cd` prefix (`extractCdPath`) or a differing
+// `inputCwd`; e2e 1265a exercises exactly that by alternating B -> C -> B.
+const recordedRootMismatches = new Set<string>();
 function diagnoseRootMismatch(root: string): void {
   const roots = bridgeRoots();
   const norm = normalizeWorktreeRoot(root);
@@ -492,11 +513,39 @@ function diagnoseRootMismatch(root: string): void {
   if (mine === null) return;
   const siblings = roots.filter((r) => gitCommonDir(r) === mine);
   if (siblings.length === 0) return;
+  // The SAFE remedy comes FIRST. The old advice — re-run the op from the verified
+  // tree, i.e. `cd` into it — used to lead, and it is not merely unhelpful: the FIRST of three
+  // consecutive children that died in one worktree followed it into a tree it did
+  // not own (issue #1265: "doing so is what the first child did, after which it too
+  // was killed"; the three deaths are attributed there to per-worktree
+  // determinism). The followable remedy is a verifier dispatch for THIS
+  // root; adoption is named as refused-by-design so nobody re-proposes it.
   console.log(
-    `[verification-gate] ⚠ #3255: this git op resolves to ${norm}, but the bridge holds verified entries for ` +
-      `${siblings.join(", ")} (same repo). Those are different trees, so hashes cannot be compared — ` +
-      `re-run the op from the verified tree (cd into it) or re-dispatch verification for ${norm} (#3255).`,
+    `[verification-gate] ⚠ #3255/#1265: this git op resolves to ${norm}, but the bridge holds verified entries for ` +
+      `${siblings.join(", ")} (same repo). Those are different trees, so hashes cannot be compared. ` +
+      `Remedy: re-dispatch verification for THIS root (${norm}) — the git-op root stays the command's own cwd. ` +
+      `Adopting another tree's entries is refused by design: they are keyed on that tree, so they are inert here, ` +
+      `and an adopted clean tree yields an EMPTY scope that would ALLOW an op carrying unverified content.`,
   );
+  // #1265 review: SORT the sibling list. `bridgeRoots()` derives its order from
+  // `readBridge().verified_files`, and `writeBridge` publishes the SURVIVORS in file
+  // order and then applies the writer's own keys — `merged.set(...)` keeps an
+  // existing key's POSITION, so the order only moves when an entry is dropped and
+  // later re-added: the writer prunes entries whose root is dead or whose file is
+  // gone at write time (`writeBridge`'s prune), so a sibling root that is pruned and
+  // then re-verified lands at the END of that array while the (root, siblings) SET is
+  // unchanged. The fingerprint is on a SET, so it must not depend on array order.
+  const fingerprint = `${norm}|${[...siblings].sort().join(",")}`;
+  if (recordedRootMismatches.has(fingerprint)) return;
+  recordedRootMismatches.add(fingerprint);
+  appendJsonl({
+    event: "gate_root_mismatch",
+    extension: "verification-gate",
+    root: norm,
+    verified_roots: siblings,
+    subagent: isTaskSubAgent(),
+    session_cwd: process.cwd(),
+  });
 }
 
 // ── #1225/#1573 P0: the bridge is a SHARED, MULTI-ROOT registry ──────────
@@ -761,11 +810,20 @@ function recoverBridgeForRoot(normRoot: string): number {
     }
   }
   if (recovered > 0) {
-    console.log(`[verification-gate] 📂 Bridge recovery: merged ${recovered} verified files for this worktree`);
+    // #1265: name the ROOT. The blanket "for this worktree" was false whenever the
+    // caller passed a same-repo sibling for inspection — the count then described a
+    // different tree than the one the session's git ops resolve to.
+    console.log(`[verification-gate] 📂 Bridge recovery: merged ${recovered} verified files for ${normRoot}`);
     // #190 review: audit parity with gate_bypass — a silent verifiedSet
     // injection must leave a durable record (the bridge is a same-user trust
     // channel; any recovery is worth an audit entry).
-    appendJsonl({ event: "gate_recovery", extension: "verification-gate", recovered, session_cwd: process.cwd() });
+    // #1265 review: name the ROOT in the durable record too. `recoverBridgeForRoot`
+    // is now called for the session's own root AND (inspection only) for a
+    // same-repo sibling, so an emit without a root was byte-indistinguishable
+    // between "own root recovered N" and "a sibling's N were merged for
+    // inspection" — the false verified-state claim, in the durable half this PR
+    // exists to make truthful.
+    appendJsonl({ event: "gate_recovery", extension: "verification-gate", root: normRoot, recovered, session_cwd: process.cwd() });
   }
   return recovered;
 }
@@ -4385,10 +4443,24 @@ export default function (pi: ExtensionAPI) {
     // #190: recover verification state from the bridge, root-filtered + stored-
     // hash match-or-drop. (Replaces the blind loader — the bridge now persists
     // compound keys with verifier-authoritative hashes.)
-    const sessionRoot = normalizeWorktreeRoot(recoveryOnlyRoot(resolveGitRoot(process.cwd())));
-    const recovered = recoverBridgeForRoot(sessionRoot);
+    //
+    // #1265: recover the SESSION'S OWN root first and report THAT count. The
+    // sibling root `recoveryOnlyRoot` may name is merged for INSPECTION only: its
+    // entries carry the sibling's root, so they enter `verifiedSet` INERT — every
+    // lookup is keyed on the OP's root (`compoundKey(worktreeRoot, …)`), and the op
+    // path's own `recoverBridgeForRoot(<op root>)` re-drops them at the same
+    // `parsed.root !== normRoot` guard. ⛔ The INSPECTION call does NOT drop them —
+    // it is made WITH the sibling root, precisely so `inspected` can count them.
+    // Counting them as "recovered for this worktree" was a false verified-state claim — and
+    // because `recovered > 0` it also SKIPPED the `else if (isTaskSubAgent())`
+    // zero-entry warning below, which exists precisely so a parent learns that
+    // every changed-file commit in a fresh worktree will block (#264 P2).
+    const ownRoot = normalizeWorktreeRoot(resolveGitRoot(process.cwd()));
+    const recovered = recoverBridgeForRoot(ownRoot);
+    const inspectRoot = normalizeWorktreeRoot(recoveryOnlyRoot(ownRoot));
+    const inspected = inspectRoot === ownRoot ? 0 : recoverBridgeForRoot(inspectRoot);
     if (recovered > 0) {
-      console.log(`[verification-gate] 📂 Recovered ${recovered} verified files from bridge`);
+      console.log(`[verification-gate] 📂 Recovered ${recovered} verified files from bridge for ${ownRoot}`);
     } else if (isTaskSubAgent()) {
       // #264 P2: bridge-absent (or stale) task-sub-agent session — the parent's
       // verified-file registry is not available here, so EVERY changed-file
@@ -4399,14 +4471,34 @@ export default function (pi: ExtensionAPI) {
       // #285 P1-A Surface 2: task-tool-aware instruction — a restricted
       // sub-agent cannot self-satisfy in-band; the block is final.
       const taskCapable = argvAllowsTask();
-      console.log(`[verification-gate] ⚠️ Sub-agent session started with 0 bridge-recovered files for root ${sessionRoot} — the parent's verified-file registry is not available to this session; every changed-file commit will block until VGATE verification is dispatched ${taskCapable ? "(in-band via the task tool)." : "by the parent session — this session is task-restricted, so return to the parent (the block is final)."}`);
-      appendJsonl({ event: "gate_recovery_empty", extension: "verification-gate", subagent: true, root: sessionRoot, session_cwd: process.cwd() });
+      console.log(`[verification-gate] ⚠️ Sub-agent session started with 0 bridge-recovered files for root ${ownRoot} — the parent's verified-file registry is not available to this session; every changed-file commit will block until VGATE verification is dispatched ${taskCapable ? "(in-band via the task tool)." : "by the parent session — this session is task-restricted, so return to the parent (the block is final)."}`);
+      appendJsonl({ event: "gate_recovery_empty", extension: "verification-gate", subagent: true, root: ownRoot, task_capable: taskCapable, session_cwd: process.cwd() });
+    }
+    if (inspected > 0) {
+      // The sibling's entries ARE in `verifiedSet`, but inert for every op rooted
+      // here. Say that once, durably, instead of leaving the transcript's recovery
+      // line counting a foreign tree (#1265 AC (b): "a shared log", not child
+      // stdout alone).
+      console.log(
+        `[verification-gate] ↔ #1265: ${inspected} verified entr${inspected === 1 ? "y" : "ies"} recorded for ${inspectRoot} merged for INSPECTION ONLY — ` +
+          `they are keyed on that tree and are inert for git ops rooted at ${ownRoot}`,
+      );
+      appendJsonl({
+        event: "gate_recovery_foreign_root",
+        extension: "verification-gate",
+        root: ownRoot,
+        inspected_root: inspectRoot,
+        inspected,
+        subagent: isTaskSubAgent(),
+        session_cwd: process.cwd(),
+      });
     }
     lastRecoveryMtime = 0;
     vgateFailures = 0;
     lastBlockedCwd = null;
     lastBlockedFiles = [];
     blockedFilesByRoot.clear(); // #1660: block context is session-scoped (the bridge is the durable channel)
+    recordedRootMismatches.clear(); // #1265: the root-mismatch record is once per session per (root, siblings)
     lastVerifierNote = null;
     pendingRehash = null;
     pendingRehashFiles = [];
@@ -4495,10 +4587,11 @@ export default function (pi: ExtensionAPI) {
     // #190: mid-session bridge recovery FIRST — defense-in-depth for the
     // incident's event-miss class (a merge that landed via another path, e.g.
     // a sub-agent's own tool_result handler, becomes visible at the next git
-    // op). Must run BEFORE the pendingRehash writeBridge snapshot: the rehash
-    // overwrites the bridge with the parent registry, which would destroy a
-    // sub-agent's freshly-written mid-session entry before recovery could
-    // merge it (review #214 ordering bug).
+    // op). Must run BEFORE the pendingRehash bridge write: that write's OWNER keys
+    // win in `writeBridge`'s merge (#1225), so a write built from the parent
+    // registry alone would replace a same-key entry the sub-agent had just written.
+    // Recovering first merges the sub-agent's entry into the in-memory registry, so
+    // the subsequent write carries it (review #214 ordering bug).
     recoverBridgeForRoot(normalizeWorktreeRoot(cwd));
 
     // #190: narrowed to the allowed commit's files (pendingRehashFiles) — only
