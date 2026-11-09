@@ -5782,13 +5782,13 @@ fi
 #     → :2482 :4186 :6501 :6613, plus a comment mention at :2356) and the
 #     same four PREDICATE sites are at head
 #     (`grep -n 'grep -qxF' scripts/record-review.sh` prints all four PREDICATE lines at head —
-#     CITE-CHECK: :3492 :5218 :7588 :7762, plus a comment mention at :3361; `14.1c-CITE` below
+#     CITE-CHECK: :3547 :5273 :7643 :7817, plus a comment mention at :3416; `14.1c-CITE` below
 #     re-derives these numbers, so they cannot rot silently): in #3168's diff the only
-#     hunk at `post_marker()` (:3470) ADDS A COMMENT — this PR does not touch
+#     hunk at `post_marker()` (:3525) ADDS A COMMENT — this PR does not touch
 #     `post_marker()` at all — and the
-#     predicate line beside it (CITE-CHECK: :3492) is CONTEXT, not a change.
+#     predicate line beside it (CITE-CHECK: :3547) is CONTEXT, not a change.
 #     WHAT THE VECTOR BELOW ACTUALLY PINS: the BODY-APPEND site
-#     (`if ! grep -qxF -- "$MARKER" <<<"$BODY"`; on main at bd1b205d :6501 — at head CITE-CHECK: :7588). It is a
+#     (`if ! grep -qxF -- "$MARKER" <<<"$BODY"`; on main at bd1b205d :6501 — at head CITE-CHECK: :7643). It is a
 #     MAIN-REGRESSION pin — reverting this PR leaves 14.1c GREEN, and 14.10f is a
 #     main-regression pin for the same reason. Keeping them is right (main's
 #     anchoring should not silently regress); calling them evidence about this diff
@@ -5814,7 +5814,7 @@ fi
 #     `:6625` / `:6770` at `dc7e3ae99`, `:6634` / `:6779` at `921109de2` and `:6639` / `:6796` at
 #     `17551325e` as comment blocks were added above them, while the CITES beside them still read
 #     `:6625` / `:6770` at all three — that divergence IS the rot this paragraph describes — and at
-#     this head the predicates are `:7588` / `:7762` — CITE-CHECK: :7588 :7762 — re-derived by the
+#     this head the predicates are `:7643` / `:7817` — CITE-CHECK: :7643 :7817 — re-derived by the
 #     guard below, like every other head cite of a predicate). One
 #     lane's response was to delete the numbers — which removes the rot but also removes the
 #     reader's target. Both intents are kept here: the number stays, and it is CHECKED.
@@ -6716,14 +6716,14 @@ assert_eq "$REC_BEFORE_14B" "$(cat "$F_HOME/.pi/agent/reviews/daniel-ospina-agen
 #       not. `if command grep -qxF -- "$marker" <<<"$body"` is ALREADY `-qxF` on main
 #       (`git show bd1b205d:scripts/record-review.sh | grep -n 'grep -qxF'` — the sha is NAMED
 #       because `origin/main` moves and a bare "main :NNNN" rots the moment it does → :2482),
-#       and in #3168's diff the only hunk at `post_marker()` (head :3470) ADDS A COMMENT above
+#       and in #3168's diff the only hunk at `post_marker()` (head :3525) ADDS A COMMENT above
 #       it (this PR does not touch `post_marker()` at all) — the
-#       predicate line (head :3492) is CONTEXT. Reverting #3168 leaves this vector GREEN; it is kept
+#       predicate line (head :3547) is CONTEXT. Reverting #3168 leaves this vector GREEN; it is kept
 #       because main's anchoring should not silently regress, and it is labelled so the
 #       next reader does not mistake it for evidence about this diff. The predicate must
 #       match the gate's line-anchored `^…$` admission, exactly like the three other
 #       sites already anchored on main (bd1b205d :4186 :6501 :6613) — the same four that the grep
-#       above prints at head, CITE-CHECK: :5218 :7588 :7762 (`14.1c-CITE` re-derives the triple).
+#       above prints at head, CITE-CHECK: :5273 :7643 :7817 (`14.1c-CITE` re-derives the triple).
 #       ⛔ ASSERTS THE TRANSPORT (a PATCH was issued), not the exit code: the destructive
 #       mutant also exited 0.
 if [ -n "${QB_LINE:-}" ]; then
@@ -10829,6 +10829,32 @@ run_record_delta $EH172 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42547501" \
     STUB_EVIDENCE_BODY="I only actually reviewed delta:${DG_BASE}..${DG_HEAD}@{1}; the rest was not read."
 assert_eq "$RECORD_RC" "3" "20h89 an elder reflog position on the head's sha is refused (rc 3)"
 assert_contains "$RECORD_ERR" "@{1}" "20h89 …and the refusal QUOTES the selector, so it does not print two identical ranges"
+# 20h90 THE OMITTED LEFT ENDPOINT IS THE SAME CLAIM (P1 — MEASURED, a fail-open). gitrevisions(7)
+#       defaults the missing end to HEAD in EITHER direction, so `..X` states `HEAD..X`. The
+#       omitted-RIGHT arm (`<tip>..`) already refused the empty claim; its mirror matched NO arm, so an
+#       artifact that stated the honest range AND `..<head>` beside it minted a signed `clean` while
+#       its narrowing sentence named nought commits (MEASURED rc 0 in two checkout frames). Symmetry
+#       is the whole argument: the same claim must not be decided by which end the author left out.
+for _olft in '' '@{0}' '^{commit}'; do
+    EH173=425476; rm -f "$(Q2 $EH173)"
+    run_record_delta $EH173 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42547701" \
+        STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" \
+        STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
+I only actually reviewed ..${DG_HEAD}${_olft} and nothing else."
+    assert_eq "$RECORD_RC" "3" "20h90 an omitted LEFT endpoint resolving to the head (..<head>${_olft}) is an EMPTY range — REFUSED (rc 3)"
+    [ -f "$(Q2 $EH173)" ] && bad "20h90 FAIL-OPEN: the mirror of <tip>.. matched no arm, so a nought-commit claim minted a signed clean" || ok "20h90 no record was written"
+done
+# 20h90b the LEADING CONTEXT is not an operand — the false-block side of the same fix: a two-endpoint
+#        range whose BASE ends in a selector must not be re-measured by the new arm. The selector sits
+#        in the BODY TEXT, not in `--evidence`: `evidence_ref_split()` pins the delta ref shape to two
+#        bare shas (`record-review.sh:928`), so the earlier draft of this vector was refused by the
+#        REFERENCE PARSER and never reached the arm it names (MEASURED — the trace showed the arm was
+#        never entered, and the identical rc 3 at bb6a03d35).
+EH174=425478; rm -f "$(Q2 $EH174)"
+run_record_delta $EH174 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42547901" \
+    STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" \
+    STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD} and also delta:${DG_BASE}^{commit}..${DG_HEAD}; no issues found."
+assert_eq "$RECORD_RC" "0" "20h90b a two-endpoint range with a selector on the BASE is not the omitted-left form — ACCEPTED (rc 0)"
 # 20h86 THE REFUSAL QUOTES THE CLAIM AS WRITTEN (P2 — MEASURED). The recovered brace was rebuilt as
 #       `${operand}${group}` while the group had been rewritten to carry an `@`, so the refusal told an
 #       author their artifact read `..@@{u}` — an accusation about text they never wrote.
@@ -12055,6 +12081,17 @@ MUT="$(mk_mutant nopeelfull '        _scand="${_straw}${_srun}"' '        _scand
 mut_check "M72 a tip-word base whose continuation IS a ref is resolved WHOLE, not read as the tip" 425436 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42543701" accepted STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="I only actually reviewed delta:${DG_BASE}..hEaD+1; the rest was not read."
 MUT="$(mk_mutant norunboundary '[^0-9A-Za-z_/+=$%&@~^{}-]|$|[0-9A-Za-z_/+=%$&@~^{}-]+) ]]; do' '[^0-9A-Za-z_/+=$%&@~^{}-]|$) ]]; do')"
 mut_check "M74 a name-legal run after the range is ADMITTED, so an artifact quoting its own evidence ref is not refused" 425438 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42543901" refused STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}+comment:42543901; no issues found."
+# M80 — THE MIRROR OMISSION IS REFUSED (P1, twenty-eighth cycle). Disabling the arm restores the
+#       fail-open: `..<head>` beside the honest range mints a signed clean over the whole range while
+#       its narrowing sentence names nought commits. 20h90's body.
+# ⛔ M80'S ANCHOR WAS NOT UNIQUE AT FIRST (MEASURED, and the cell certified nothing): the guard text
+#       `if [ "$_osha" = "$to" ]; then` occurs in BOTH the older `<tip>..` arm and this mirror arm, and
+#       `mk_mutant` replaces the FIRST occurrence — so the mutant neutered the WRONG arm, the shipped
+#       mirror arm still refused, and the cell reported "mutant still refused". Anchor on this arm's
+#       own sentence instead.
+MUT="$(mk_mutant nomirror '_emptyrange=1; _emptystated="..${_orhs} (the left endpoint is omitted' '_emptystated="..${_orhs} (the left endpoint is omitted')"
+mut_check "M80 an omitted LEFT endpoint that resolves to the head is an EMPTY range, not prose" 425476 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42547701" accepted STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
+I only actually reviewed ..${DG_HEAD} and nothing else."
 # M73 RETIRED (twenty-seventh cycle) — SUBSUMED by the OPERAND test, and the geometry is why: a chain
 #       only moves BACKWARD (`~N`, `^N` select ancestors), so a commit AFTER the head can never be
 #       reached through a selector — it can only be NAMED as the operand (`afterhead`, `afterhead~0`,

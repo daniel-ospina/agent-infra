@@ -1559,7 +1559,7 @@ _tipvariant() { # <token> -> the token, with a tip-word case variant normalised 
 delta_verify() { # <id: A..B[+artifact]> <head_sha> -> 0 = verified (sets DELTA_*)
   local id="$1" head="$2" range from to cover="" root="" tmp="" norm=""
   local authored="" newest="" n_authored=0 anchor="" dg_rc=0 base_sha="" base_ref=""
-  local merges_in_range="" evil="" evil_shas="" m="" parents="" pcount="" p1="" p2="" prest="" want="" actual="" cands="" mrc="" body_claim="" stated_from="" stated_to="" stated_sep="" _delta_tok="" E_OUT="" E_RC="" _scan="" _any="" _all_ok="" _sf="" _ss="" _st="" _straw="" _stcmp="" _sbrace="" _sin="" _ok="" _sfs="" _r="" _claim="" _toks="" _tok_rc=0 _tok="" _tsha="" _tipscan="" _tref="" _top="" _tiprel=0 _tisref="" _tosha="" _tipchain="" _tbase="" _svsh="" _tv="" _tsel="" _lid=0 _rid=0 _lrest="" _rrest="" _elhs="" _erhs="" _elsha="" _ersha="" _eranges="" _opends="" _olhs="" _olrest="" _olid=0 _osha="" _emptyrange="" _emptystated="" _estated="" _dident="" _drivers="" _dg_rc=0 _gitdir="" _gd_rc=0 _commondir="" _cd_rc=0 _attr_amb="" _wt_amb="" _ls_rc=0 _st_amb="" _st_rc=0 _ad="" _adrift="" _adr_rc=0
+  local merges_in_range="" evil="" evil_shas="" m="" parents="" pcount="" p1="" p2="" prest="" want="" actual="" cands="" mrc="" body_claim="" stated_from="" stated_to="" stated_sep="" _delta_tok="" E_OUT="" E_RC="" _scan="" _any="" _all_ok="" _sf="" _ss="" _st="" _straw="" _stcmp="" _sbrace="" _sin="" _ok="" _sfs="" _r="" _claim="" _toks="" _tok_rc=0 _tok="" _tsha="" _tipscan="" _tref="" _top="" _tiprel=0 _tisref="" _tosha="" _tipchain="" _tbase="" _svsh="" _tv="" _tsel="" _lid=0 _rid=0 _lrest="" _rrest="" _elhs="" _erhs="" _elsha="" _ersha="" _eranges="" _opends="" _olhs="" _orhs="" _orid=0 _olrest="" _olid=0 _osha="" _emptyrange="" _emptystated="" _estated="" _dident="" _drivers="" _dg_rc=0 _gitdir="" _gd_rc=0 _commondir="" _cd_rc=0 _attr_amb="" _wt_amb="" _ls_rc=0 _st_amb="" _st_rc=0 _ad="" _adrift="" _adr_rc=0
   range="${id%%+*}"
   [ "$range" != "$id" ] && cover="${id#*+}"
   from="${range%%..*}"; to="${range##*..}"
@@ -3145,6 +3145,61 @@ $m"
       [ -n "$_osha" ] || continue
       if [ "$_osha" = "$to" ]; then
         _emptyrange=1; _emptystated="${_olhs}..HEAD (the endpoint is omitted, so it defaults to the head)"; break
+      fi
+    done
+    # ⛔ THE MIRROR OMISSION — `..<tip>` — IS THE SAME CLAIM (twenty-eighth review cycle, P1 —
+    # MEASURED, a fail-open the arm above does not reach). gitrevisions(7) defaults the MISSING end to
+    # HEAD in either direction, so `..X` states `HEAD..X`; when X resolves to the attested head that is
+    # again ZERO commits. It matched no arm: the loop above needs an operand BEFORE the dots, the
+    # parser needs a hex run adjacent to them, and the tip arm needs a CHAIN — so an artifact that
+    # stated the honest range AND `..<head>` beside it minted a signed `clean` over the whole range
+    # while its narrowing sentence named nought commits. MEASURED with the arms lifted verbatim:
+    # `..<head>`, `..@{0}` and `..<head>^{commit}` were all rc 0, in two different checkout frames,
+    # while the mirror `<head>..` was refused by the arm above. Symmetry is the whole argument: the
+    # same claim must not be decided by which end the author left out.
+    # ⛔ LEADING CONTEXT IS NOT AN OPERAND (the false-block side, DECLARED): the dots must not be
+    # preceded by a run that ENDS an operand — `.`, `}`, `*`, `~`, `^`, `@` are excluded
+    # from the leading class, so `A^{commit}..B`, `A@{0}..B` and `A~1..B` are left to the two-endpoint
+    # arm and are never measured twice here. A three-dot ellipsis (`...`) is likewise out: its `..` is
+    # followed by `.`, which the operand class refuses.
+    # ⛔ DECLARED REMAINDER: an omitted RIGHT endpoint whose left side is an INTERIOR ancestor spelled
+    # as a REF NAME (`<midref>..` — a strictly narrower range) is NOT refused here, because this arm
+    # refuses EQUALITY with the head and cannot tell "narrower" from "starts before the recorded from"
+    # without the ancestry test the tip arm uses. Pre-existing, recorded rather than silently kept.
+    _opends="$_claim"
+    while [[ "$_opends" =~ (^|[^0-9A-Za-z_.^~@*}])\.\.([0-9a-fA-F]{4,40}|[Hh][Ee][Aa][Dd]|@\{[^}]+\}|@|[A-Za-z0-9_][A-Za-z0-9_/-]*)(${_dident}*)([^0-9A-Za-z_.]|$) ]]; do
+      _orhs="${BASH_REMATCH[2]}${BASH_REMATCH[3]}"
+      _opends="${_opends#*"${BASH_REMATCH[0]}"}"
+      _orhs="$(_tipvariant "$_orhs")"
+      # ⛔ AN IDENTITY REFLOG POSITION ON A SHA IS STILL THE SAME COMMIT — and git REFUSES the spelling
+      # (`rev-parse <sha>@{0}` → "fatal: Needed a single revision": a reflog position needs a REF), so
+      # resolving the token whole answered with nothing and the claim was silently DROPPED (MEASURED:
+      # `..<head>@{0}` rc 0 while `..<head>` and `..<head>^{commit}` refused). Identity is decided on
+      # the POSITION, exactly as the two-endpoint arm decides it, and only `@{0}`/`@{00}` (a zero
+      # count) is identity — `@{1}` is an elder position and is not stripped.
+      while [[ "$_orhs" =~ ^(.+)@\{0+\}$ ]]; do _orhs="${BASH_REMATCH[1]}"; done
+      _orid=0
+      [[ "$_orhs" =~ ^(HEAD|@|@\{0+\}|@\{now\})(${_dident}*)$ ]] && _orid=1
+      if [ "$_orid" = 1 ]; then
+        _osha="$to"
+      else
+        case "$_orhs" in
+          HEAD[~^@]*) _olrest="${_orhs#HEAD}" ;;
+          HEAD) _olrest='' ;;
+          @\{*\}) continue ;;
+          @*) _olrest="${_orhs#@}" ;;
+          *) _olrest='' ;;
+        esac
+        case "$_orhs" in
+          HEAD|HEAD[~^@]*|@*)
+            _osha="$(delta_git "$root" rev-parse --verify "${_tosha}${_olrest}^{commit}" 2>/dev/null || true)" ;;
+          *)
+            _osha="$(delta_git "$root" rev-parse --verify "${_orhs}^{commit}" 2>/dev/null || true)" ;;
+        esac
+      fi
+      [ -n "$_osha" ] || continue
+      if [ "$_osha" = "$to" ]; then
+        _emptyrange=1; _emptystated="..${_orhs} (the left endpoint is omitted, so it defaults to the head — HEAD..${_orhs} is an EMPTY range)"; break
       fi
     done
     # ⛔ THE REFUSAL NAMES WHICH CLAIM WAS REFUSED (twentieth cycle). An empty range is not
