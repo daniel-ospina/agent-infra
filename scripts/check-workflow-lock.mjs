@@ -30,14 +30,59 @@
  * legitimate edit to a locked workflow must re-run `--update-lock`) is intended
  * loud behaviour.
  *
+ * WHY ONE LOCK FILE PER REGION, NOT ONE HASH PER FILE (agent-infra#1955)
+ * --------------------------------------------------------------------
+ * The lock used to be ONE file holding ONE hash per workflow. Every edit to a
+ * locked workflow rewrote a line of that file, so two branches that both edited
+ * a locked workflow ALWAYS conflicted on it — even when their actual edits were
+ * in different jobs. That conflict cannot be resolved by choosing a side (both
+ * recorded values are wrong for the merged tree), so resolving it meant a
+ * regenerate, which moves the head and discards the green check-run evidence.
+ * Measured on this repo (2026-11: 14 open PRs, of which 2 touched a locked
+ * workflow, 0 conflicted on the lock; the October measurement was 17 of 54 open
+ * PRs, and the last 60 commits touching `ci.yml` ALL also touched
+ * `ci-main.yml`) — the contention is *same-file*, always.
+ *
+ * So the recording is partitioned by REGION: one top-level file region, and one
+ * region per job under `jobs:`. Each region hash is stored in its own file under
+ * `scripts/workflow-lock.d/<workflow path>/<region>.sha256`. Two consequences,
+ * and both are the point:
+ *
+ *   1. Two branches editing DIFFERENT regions touch DIFFERENT files, so the lock
+ *      cannot conflict at all — the merge is a clean union of independent
+ *      equality constraints, and the merged tree is GREEN with no re-lock.
+ *   2. Two branches editing the SAME region still conflict — but that is the
+ *      region their real edits collide in, i.e. the lock no longer amplifies an
+ *      ordinary "main moved" into a conflict of its own.
+ *
+ * The partition cannot weaken the guard, by construction: the regions are a
+ * PARTITION of the same bytes (every byte belongs to exactly one region), the
+ * region NAME SET is closed (a renamed/added/removed region is RED), and the
+ * check is per-region equality. So an edit anywhere is RED unless re-locked,
+ * exactly as with the whole-file hash — this is a granularity change, not a
+ * semantic one. #666's decision (a CONTENT property, not an execution-semantics
+ * model) is untouched.
+ *
+ * WHAT NO DESIGN CAN FIX (the bound, stated so nobody re-derives it): the lock
+ * records content that only exists AFTER the merge. Any per-branch record of
+ * current content is therefore wrong at the merge result whenever both sides
+ * changed the same region, so that case is irreducible while the lock stays a
+ * committed equality record. The alternatives all trade the guard away: a
+ * content-addressed (append-only) ledger leaves `main` unverifiable or green by
+ * vacuity, a merge-time recompute needs a writer that can commit to `main`
+ * (this repo merges server-side, squash-only, with no bot pushing to main), and
+ * dropping the record reverses #666. Region granularity is the part that IS
+ * removable, and it is what removes the amplification.
+ *
  * CLI
  * ---
  *   node scripts/check-workflow-lock.mjs                  # report; exit 1 on any mismatch
- *   node scripts/check-workflow-lock.mjs --update-lock    # rewrite scripts/workflow-lock.json
+ *   node scripts/check-workflow-lock.mjs --update-lock    # rewrite scripts/workflow-lock.d/
  *   node scripts/check-workflow-lock.mjs --root <dir>     # operate on <dir> instead of the repo root (tests)
  *
- * Exports `hashLockedFiles(root)` and `lockFindings(root, lock)` so the CI suite
- * can aggregate findings instead of throwing.
+ * Exports `hashLockedFiles(root)`, `hashLockedRegions(root)` and
+ * `lockFindings(root, lock)` so the CI suite can aggregate findings instead of
+ * throwing.
  */
 
 import { createHash } from "node:crypto";
@@ -46,8 +91,16 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 export const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-export const LOCK_REL = "scripts/workflow-lock.json";
-export const LOCK_VERSION = 1;
+/** The lock DIRECTORY: one subdirectory per locked workflow, one file per region. */
+export const LOCK_DIR_REL = "scripts/workflow-lock.d";
+/** The single-file lock this replaced (#1955). Only referenced by the migration hint. */
+export const LEGACY_LOCK_REL = "scripts/workflow-lock.json";
+export const LOCK_VERSION = 2;
+/** A regionless file whose content is a bare sha256 — the shape of every lock entry. */
+const SHA256_RE = /^[0-9a-f]{64}$/;
+const REGION_FILE_RE = /\.sha256$/;
+/** Region names are derived from YAML keys, so this is a guard against path tricks, not a style rule. */
+const REGION_NAME_RE = /^[A-Za-z0-9_.~-]+$/;
 /** The exact, closed set of locked paths. Not derived — spelling it out is the point. */
 export const LOCKED_FILES = Object.freeze([
   ".github/workflows/ci.yml",
@@ -70,16 +123,28 @@ export const UNLOCKED_WORKFLOWS = Object.freeze([
   ".github/workflows/workflow-lock.yml",
   // agent-infra#2160 — the harness single-source gate. Its own workflow on purpose: it would
   // otherwise live in the BYTE-LOCKED ci.yml, forcing every branch that touches the harness to also
-  // re-cut `scripts/workflow-lock.json`, which is a last-writer-wins recording of ci.yml's hash — so
-  // two concurrent PRs conflict on it every time one of them re-locks. Unlocked and classified, per
-  // this file's own rule that a workflow must be in one list or the other.
+  // re-cut the lock for `ci.yml`'s `jobs.ci` region — so two concurrent PRs contend on it every time
+  // one of them re-locks. Unlocked and classified, per this file's own rule that a workflow must be
+  // in one list or the other. (#1955 later made that contention region-scoped rather than per-file,
+  // which narrows this reason but does not remove it: a harness PR that edits `ci.yml` still edits
+  // `jobs.ci`.)
   ".github/workflows/harness-single-source.yml",
 ]);
 export const UPDATE_COMMAND = "node scripts/check-workflow-lock.mjs --update-lock";
 
-/** Absolute path to the lock file under `root`. */
+/** Absolute path to the lock DIRECTORY under `root`. */
 export function lockPath(root) {
-  return path.join(root, LOCK_REL);
+  return path.join(root, LOCK_DIR_REL);
+}
+
+/** Absolute path to one workflow's region directory under `root`. */
+function regionDir(root, rel) {
+  return path.join(lockPath(root), rel);
+}
+
+/** Absolute path to one region's lock file under `root`. */
+export function regionPath(root, rel, region) {
+  return path.join(regionDir(root, rel), `${region}.sha256`);
 }
 
 function isPlainMap(v) {
@@ -193,9 +258,79 @@ export function sha256File(absPath) {
 }
 
 /**
- * Hash every locked file under `root`.
+ * Split a workflow's bytes into addressable REGIONS — a PARTITION, not a parse.
+ * → Map<region name, exact bytes of that region>.
+ *
+ * The split is deliberately dumb, and it is safe *because* it is dumb:
+ *
+ *   - A top-level key (`^key:` at column 0) starts a region named `top.<key>`.
+ *     Everything before the first top-level key (file-level comments) is `top`.
+ *   - A key at two-space indent starts `jobs.<key>` — but only while we are
+ *     inside the `jobs:` region, so `on.pull_request:` and `concurrency.group:`
+ *     stay in their `top.*` region instead of inventing job regions.
+ *   - Every other line belongs to the region it is in, so the union of the
+ *     regions is EXACTLY the file's bytes: nothing is dropped, nothing overlaps.
+ *
+ * No YAML structure is modelled beyond those two line shapes, and that is the
+ * point: the partition carries no security decision. A mis-split (a `run: |`
+ * body containing a line that looks like a job key) can only change GRANULARITY,
+ * because every byte still lands in exactly one region and the check compares
+ * the region NAME SET as well as the hashes. A weak writer is fine; a weak
+ * partition is impossible.
+ *
+ * Region names are made unique by a `~<n>` suffix if the same key appears twice
+ * (invalid YAML — which is precisely why it cannot be a way to hide a region).
+ */
+export function lockRegions(text) {
+  const lines = text.split("\n");
+  const regions = new Map();
+  let name = "top";
+  let body = [];
+  const seen = new Map();
+
+  const flush = () => {
+    // The initial `top` region holds nothing when the file starts with a key;
+    // recording it as an empty region would emit a phantom lock entry AND break
+    // the reassembly invariant (`join("\n")` of the regions === the file).
+    if (body.length === 0 && name === "top") return;
+    const count = (seen.get(name) ?? 0) + 1;
+    seen.set(name, count);
+    regions.set(count === 1 ? name : `${name}~${count}`, body.join("\n"));
+  };
+
+  let inJobs = false;
+  for (const line of lines) {
+    const topKey = /^([A-Za-z_][A-Za-z0-9_.-]*):(?:\s|$)/.exec(line);
+    const jobKey = /^ {2}([A-Za-z0-9_.-]+):(?:\s|$)/.exec(line);
+    if (topKey !== null) {
+      flush();
+      name = `top.${topKey[1]}`;
+      body = [line];
+      inJobs = topKey[1] === "jobs";
+      continue;
+    }
+    if (inJobs && jobKey !== null) {
+      flush();
+      name = `jobs.${jobKey[1]}`;
+      body = [line];
+      continue;
+    }
+    body.push(line);
+  }
+  flush();
+  // A lone `top` region can only exist before the first `top.*` key and is kept:
+  // dropping it would leave those bytes unrecorded.
+  return regions;
+}
+
+/**
+ * Hash every locked file under `root`, whole-file.
  * → { "<repo-relative path>": "<sha256 hex>" } for exactly LOCKED_FILES.
  * Throws if a locked file is missing (the caller decides how to report that).
+ *
+ * NOT what the lock stores any more (#1955 — the lock is region-keyed, see
+ * `hashLockedRegions`). Kept because "is this byte-identical to main's copy?" is
+ * a different, still-useful question for a caller that only wants a digest.
  */
 export function hashLockedFiles(root) {
   const files = {};
@@ -203,23 +338,133 @@ export function hashLockedFiles(root) {
   return files;
 }
 
-/** Read and parse `scripts/workflow-lock.json` under `root`. Throws if absent/invalid. */
-export function readLock(root) {
-  return JSON.parse(fs.readFileSync(lockPath(root), "utf8"));
+/**
+ * → { "<repo-relative path>": { "<region>": "<sha256 hex>" } }
+ * Throws if a locked file is missing (the caller decides how to report that).
+ */
+export function hashLockedRegions(root) {
+  const files = {};
+  for (const rel of LOCKED_FILES) {
+    const text = fs.readFileSync(path.join(root, rel), "utf8");
+    const regions = {};
+    for (const [region, bytes] of lockRegions(text)) {
+      regions[region] = createHash("sha256").update(bytes).digest("hex");
+    }
+    files[rel] = regions;
+  }
+  return files;
 }
 
-/** Rewrite the lock under `root` from the current bytes. Returns the written lock object. */
+/**
+ * Read the lock DIRECTORY under `root` into the same object shape the check
+ * consumes: `{ version, files: { rel: { region: sha256 } } }`.
+ *
+ * A missing directory is NOT an error here — it reads as an empty lock, so
+ * `lockFindings` reports the ordinary "does not cover <rel>" finding (with the
+ * `--update-lock` remedy) instead of this function throwing and the whole check
+ * dying with a stack trace.
+ */
+export function readLock(root) {
+  const lock = { version: LOCK_VERSION, files: {} };
+  const dir = lockPath(root);
+
+  // Walk the lock directory for the directories that hold `<region>.sha256`
+  // files. The workflow path is the directory's path RELATIVE to the lock dir
+  // (`.github/workflows/ci.yml`), so the layout mirrors the repo and a nested
+  // path cannot be mistaken for a region name.
+  const walk = (abs, rel) => {
+    let entries;
+    try {
+      entries = fs.readdirSync(abs, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    const files = entries.filter((e) => e.isFile());
+    const dirs = entries.filter((e) => e.isDirectory());
+    if (files.some((e) => REGION_FILE_RE.test(e.name))) {
+      const regions = {};
+      for (const entry of entries) {
+        if (entry.isDirectory()) {
+          // A nested directory inside a region directory is never an entry.
+          regions[`!${entry.name}`] = "";
+          continue;
+        }
+        if (!REGION_FILE_RE.test(entry.name)) {
+          regions[`!${entry.name}`] = "";
+          continue;
+        }
+        const region = entry.name.replace(REGION_FILE_RE, "");
+        let raw;
+        try {
+          raw = fs.readFileSync(path.join(abs, entry.name), "utf8").trim();
+        } catch {
+          raw = "";
+        }
+        regions[region] = raw;
+      }
+      lock.files[rel] = regions;
+      return;
+    }
+    // A plain FILE directly under the lock root is not a lock entry — recorded
+    // with a null mapping so `lockFindings` refuses it rather than ignores it.
+    for (const entry of files) lock.files[`${rel}/${entry.name}`] = null;
+    for (const entry of dirs) walk(path.join(abs, entry.name), `${rel}/${entry.name}`);
+  };
+  walk(dir, "");
+  // The walk starts at "", so top-level entries carry a leading slash.
+  for (const key of Object.keys(lock.files)) {
+    if (key.startsWith("/")) {
+      lock.files[key.slice(1)] = lock.files[key];
+      delete lock.files[key];
+    }
+  }
+  return lock;
+}
+
+/**
+ * Rewrite the lock DIRECTORY under `root` from the current bytes, and prune what
+ * no longer exists (a removed region, a renamed job). Returns the written lock
+ * object.
+ *
+ * Pruning is why the directory is self-limiting: a rename leaves ONE stale entry
+ * until the next `--update-lock`, instead of accumulating forever. The prune is
+ * also why `lockFindings` reports an unknown region as RED rather than ignoring
+ * it — an entry nobody prunes is an entry nobody notices.
+ */
 export function writeLockFile(root) {
-  const lock = { version: LOCK_VERSION, files: hashLockedFiles(root) };
-  fs.mkdirSync(path.dirname(lockPath(root)), { recursive: true });
-  fs.writeFileSync(lockPath(root), JSON.stringify(lock, null, 2) + "\n");
+  const lock = { version: LOCK_VERSION, files: hashLockedRegions(root) };
+  for (const rel of LOCKED_FILES) {
+    const abs = regionDir(root, rel);
+    fs.mkdirSync(abs, { recursive: true });
+    const want = lock.files[rel];
+    for (const [region, hash] of Object.entries(want)) {
+      const file = regionPath(root, rel, region);
+      let current = null;
+      try {
+        current = fs.readFileSync(file, "utf8").trim();
+      } catch {
+        current = null;
+      }
+      if (current !== hash) fs.writeFileSync(file, `${hash}\n`);
+    }
+    for (const entry of fs.readdirSync(abs)) {
+      const region = REGION_FILE_RE.test(entry) ? entry.replace(REGION_FILE_RE, "") : null;
+      if (region !== null && Object.hasOwn(want, region)) continue;
+      fs.rmSync(path.join(abs, entry), { force: true });
+    }
+  }
   return lock;
 }
 
 /**
  * Evaluate a lock against the files under `root`.
- * → [] when every locked file exists and matches its hash, else one message per
- * broken invariant. Returns findings (never throws) so the CI suite can aggregate.
+ * → [] when every locked file exists and every REGION matches its hash, else one
+ * message per broken invariant. Returns findings (never throws) so the CI suite
+ * can aggregate.
+ *
+ * Region-level, not file-level (#1955): the finding names the region, so a
+ * reader learns WHICH part of the workflow moved, and two branches editing
+ * different regions never touch the same lock file.
  */
 export function lockFindings(root, lock) {
   const findings = [];
@@ -274,12 +519,40 @@ export function lockFindings(root, lock) {
       );
       continue;
     }
-    const actual = sha256File(abs);
-    if (actual !== files[rel]) {
+    const recorded = files[rel];
+    if (!isPlainMap(recorded)) {
       findings.push(
-        `the locked workflow file ${rel} changed (sha256 ${actual} != locked ${files[rel]}) — ` +
-          "every edit to a locked workflow is a deliberate, reviewed act: re-run " +
-          `\`${UPDATE_COMMAND}\` and commit the updated lock alongside the edit`
+        `the workflow lock entry for ${rel} is not a region mapping — re-lock with ` +
+          `\`${UPDATE_COMMAND}\``
+      );
+      continue;
+    }
+    const actualRegions = lockRegions(fs.readFileSync(abs, "utf8"));
+    for (const [region, bytes] of actualRegions) {
+      if (!Object.hasOwn(recorded, region)) {
+        findings.push(
+          `the locked workflow file ${rel} has a region \`${region}\` the lock does not cover — ` +
+            "every edit to a locked workflow is a deliberate, reviewed act: re-run " +
+            `\`${UPDATE_COMMAND}\` and commit the updated lock alongside the edit`
+        );
+        continue;
+      }
+      const actual = createHash("sha256").update(bytes).digest("hex");
+      const locked = recorded[region];
+      if (actual !== locked) {
+        findings.push(
+          `the locked workflow file ${rel} changed in region \`${region}\` ` +
+            `(sha256 ${actual} != locked ${locked}) — every edit to a locked workflow is a ` +
+            "deliberate, reviewed act: re-run " +
+            `\`${UPDATE_COMMAND}\` and commit the updated lock alongside the edit`
+        );
+      }
+    }
+    for (const region of Object.keys(recorded)) {
+      if (actualRegions.has(region)) continue;
+      findings.push(
+        `the workflow lock records region \`${region}\` of ${rel}, which no longer exists ` +
+          `— prune it with \`${UPDATE_COMMAND}\``
       );
     }
   }
@@ -359,9 +632,13 @@ function main(argv) {
     const lock = writeLockFile(root);
     console.log(
       `✅ workflow lock updated — ${LOCKED_FILES.length} files hashed into ` +
-        `${path.relative(process.cwd(), lockPath(root)) || LOCK_REL}`
+        `${path.relative(process.cwd(), lockPath(root)) || LOCK_DIR_REL}`
     );
-    for (const rel of LOCKED_FILES) console.log(`   ${lock.files[rel]}  ${rel}`);
+    for (const rel of LOCKED_FILES) {
+      const regions = lock.files[rel];
+      const count = Object.keys(regions).length;
+      console.log(`   ${rel} — ${count} region${count === 1 ? "" : "s"}`);
+    }
     return 0;
   }
 
@@ -372,8 +649,7 @@ function main(argv) {
     console.error(`❌ could not read ${path.relative(process.cwd(), lockPath(root))}: ${err.message}`);
     console.error(`   create it with \`${UPDATE_COMMAND}\``);
     return 1;
-  }
-  const findings = lockFindings(root, lock);
+  }  const findings = lockFindings(root, lock);
   // The coverage classification is a repo-root property (the fixture roots used
   // by `--root <dir>` hold only the three locked files on purpose).
   if (path.resolve(root) === REPO_ROOT) findings.push(...workflowCoverageFindings(root));
@@ -382,7 +658,7 @@ function main(argv) {
     for (const msg of findings) console.error(`   - ${msg}`);
     return 1;
   }
-  console.log(`✅ workflow content lock matches (${LOCKED_FILES.length} files)`);
+  console.log(`✅ workflow content lock matches (${LOCKED_FILES.length} files, region-keyed)`);
   return 0;
 }
 

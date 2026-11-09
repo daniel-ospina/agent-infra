@@ -259,10 +259,14 @@ import { PI_VERSION_PIN } from "./frontmatter-fixtures.mjs";
 import { parseWorkflowYaml, WorkflowYamlError } from "./workflow-yaml.mjs";
 import {
   LOCKED_FILES,
+  LOCK_VERSION,
   UNLOCKED_WORKFLOWS,
   hashLockedFiles,
+  hashLockedRegions,
   lockFindings,
   lockPath,
+  lockRegions,
+  regionPath,
   readLock,
   workflowCoverageFindings,
   writeLockFile,
@@ -961,6 +965,9 @@ const REQUIRED_TESTS = Object.freeze([
   "minimal fixture trio satisfies every narrow wiring invariant",
   "the ci-main fixture declares the pin-gate job and its `with:` keys",
   "the lock covers exactly the three pin-gate workflow paths",
+  "two regions of one workflow live in TWO lock files, so one edit moves exactly one of them (#1955)",
+  "the region split is a PARTITION of the workflow bytes — every byte is covered exactly once (#1955)",
+  "a region the lock no longer covers is RED and names the prune remedy (#1955)",
   "head-ref mode runs the structural assertions and does NOT apply the content lock",
   "head-ref mode is RED for an empty or comments-only ci.yml / node-ci.yml (#675 P1-1)",
   "the GitHub blob decode fails CLOSED on encoding 'none' or a lossy decode (#675 P1-1)",
@@ -2031,6 +2038,11 @@ function makeLockFixture(overrides = {}) {
   return dir;
 }
 
+/** The lock object `lockFindings` consumes, built from `dir`'s current bytes. */
+function liveLock(dir) {
+  return { version: LOCK_VERSION, files: hashLockedRegions(dir) };
+}
+
 /** Append raw bytes to a file in a lock fixture. */
 function bumpBytes(dir, rel, text) {
   const abs = path.join(dir, rel);
@@ -2046,7 +2058,7 @@ test("the lock covers exactly the three pin-gate workflow paths", () => {
   const hashed = hashLockedFiles(REPO_ROOT);
   assert.deepEqual(Object.keys(hashed).sort(), [...LOCKED_FILES].sort());
   const lock = readLock(REPO_ROOT);
-  assert.equal(lock.version, 1, "the committed lock must be version 1");
+  assert.equal(lock.version, LOCK_VERSION, `the committed lock must be version ${LOCK_VERSION}`);
   assert.deepEqual(
     Object.keys(lock.files).sort(),
     [...LOCKED_FILES].sort(),
@@ -2059,7 +2071,7 @@ test("the live workflow content lock matches the committed workflows (GREEN)", (
   assert.deepEqual(
     findings,
     [],
-    `the committed workflows no longer match scripts/workflow-lock.json — re-lock a ` +
+    `the committed workflows no longer match scripts/workflow-lock.d/ — re-lock a ` +
       `deliberate edit with \`node scripts/check-workflow-lock.mjs --update-lock\`:\n  ` +
       findings.join("\n  ")
   );
@@ -2067,7 +2079,7 @@ test("the live workflow content lock matches the committed workflows (GREEN)", (
 
 test("a locked file whose bytes changed is RED, names the file, and prints the --update-lock remedy", () => {
   const dir = makeLockFixture();
-  const lock = { version: 1, files: hashLockedFiles(dir) };
+  const lock = liveLock(dir);
   assert.deepEqual(lockFindings(dir, lock), [], "the fixture must start GREEN");
   bumpBytes(dir, ".github/workflows/ci.yml", "\n# one byte\n");
   const findings = lockFindings(dir, lock);
@@ -2078,7 +2090,7 @@ test("a locked file whose bytes changed is RED, names the file, and prints the -
 
 test("a missing locked file is RED", () => {
   const dir = makeLockFixture();
-  const lock = { version: 1, files: hashLockedFiles(dir) };
+  const lock = liveLock(dir);
   fs.rmSync(path.join(dir, ".github/workflows/node-ci.yml"));
   const findings = lockFindings(dir, lock);
   assert.equal(findings.length, 1, `expected exactly one finding, got ${findings.length}`);
@@ -2102,9 +2114,92 @@ test("the --update-lock CLI rewrites the lock and exits 0", () => {
     encoding: "utf8",
   });
   assert.match(out, /workflow lock updated/);
-  const written = JSON.parse(fs.readFileSync(lockPath(dir), "utf8"));
+  const written = readLock(dir);
   assert.deepEqual(Object.keys(written.files).sort(), [...LOCKED_FILES].sort());
   assert.deepEqual(lockFindings(dir, written), []);
+});
+
+// ── #1955 — REGION granularity, the property the change exists for ──────────
+// The lock used to be one file with one hash per workflow, so two branches that
+// both edited a locked workflow ALWAYS conflicted on it — even when their edits
+// were in different jobs — and neither side's recorded value was right for the
+// merged tree. These tests pin the replacement property: a lock file belongs to
+// ONE region, so an edit to region A cannot touch region B's lock file, and the
+// merged tree needs no re-lock. (A git-level reproduction of the old conflict
+// and of the clean merge is in the PR body for #1955; a unit suite cannot own
+// git's merge machinery, so what is pinned here is the disjointness it rests on.)
+function lockFiles(dir) {
+  const files = new Map();
+  const walk = (abs) => {
+    for (const entry of fs.readdirSync(abs, { withFileTypes: true })) {
+      const child = path.join(abs, entry.name);
+      if (entry.isDirectory()) walk(child);
+      else files.set(path.relative(lockPath(dir), child), fs.readFileSync(child, "utf8"));
+    }
+  };
+  walk(lockPath(dir));
+  return files;
+}
+
+/** Insert a line inside `jobs.<name>` of a fixture's ci.yml. */
+function editJob(dir, name, marker) {
+  const rel = ".github/workflows/ci.yml";
+  const live = fs.readFileSync(path.join(dir, rel), "utf8");
+  const anchor = `  ${name}:\n`;
+  assert.ok(live.includes(anchor), `fixture must contain ${anchor.trim()}`);
+  fs.writeFileSync(path.join(dir, rel), live.replace(anchor, `${anchor}    # ${marker}\n`));
+}
+
+test("two regions of one workflow live in TWO lock files, so one edit moves exactly one of them (#1955)", () => {
+  const dir = makeLockFixture();
+  writeLockFile(dir);
+  const before = lockFiles(dir);
+  const jobA = ".github/workflows/ci.yml/jobs.drift-check.sha256";
+  const jobB = ".github/workflows/ci.yml/jobs.test.sha256";
+  assert.ok(
+    before.has(jobA) && before.has(jobB),
+    `expected per-region lock files, saw: ${[...before.keys()].join(", ")}`
+  );
+
+  editJob(dir, "drift-check", "only region A moved");
+  const findings = lockFindings(dir, readLock(dir));
+  assert.equal(findings.length, 1, `expected ONE finding, got ${findings.length}: ${findings.join("; ")}`);
+  assert.match(findings[0], /jobs\.drift-check/, "the finding must name the region that moved");
+
+  writeLockFile(dir);
+  const after = lockFiles(dir);
+  const moved = [...after.keys()].filter((k) => before.get(k) !== after.get(k));
+  assert.deepEqual(moved, [jobA], "an edit confined to one job must move exactly that job's lock file — " +
+    "anything else re-creates the whole-file collision point this change removes");
+});
+
+test("the region split is a PARTITION of the workflow bytes — every byte is covered exactly once (#1955)", () => {
+  for (const rel of LOCKED_FILES) {
+    const text = fs.readFileSync(path.join(REPO_ROOT, rel), "utf8");
+    const regions = lockRegions(text);
+    assert.ok(regions.size > 1, `${rel} must split into more than one region`);
+    assert.equal(
+      [...regions.values()].join("\n"),
+      text,
+      `${rel}: concatenating the regions must reproduce the file byte-for-byte — the partition is what ` +
+        "makes the finer granularity as strong as the whole-file hash"
+    );
+  }
+});
+
+test("a region the lock no longer covers is RED and names the prune remedy (#1955)", () => {
+  const dir = makeLockFixture();
+  writeLockFile(dir);
+  const stale = regionPath(dir, ".github/workflows/ci.yml", "jobs.a-region-that-is-gone");
+  fs.mkdirSync(path.dirname(stale), { recursive: true });
+  fs.writeFileSync(stale, `${"0".repeat(64)}\n`);
+  const findings = lockFindings(dir, readLock(dir));
+  assert.equal(findings.length, 1, `expected one finding, got ${findings.length}`);
+  assert.match(findings[0], /no longer exists/);
+  assert.match(findings[0], /--update-lock/);
+  writeLockFile(dir);
+  assert.ok(!fs.existsSync(stale), "--update-lock must prune the entry it reports as stale");
+  assert.deepEqual(lockFindings(dir, readLock(dir)), []);
 });
 
 test("the default CLI exits 1 on a mismatch, naming the file and the remedy", () => {
@@ -2159,7 +2254,7 @@ test("the lock CLI is not a silent no-op through a symlinked path (#708 class, #
 // identical while GitHub Actions saw a broken workflow entry and ran 0 jobs.
 test("a symlinked locked workflow is RED from lockFindings (#675 P1-2)", () => {
   const dir = makeLockFixture();
-  const lock = { version: 1, files: hashLockedFiles(dir) };
+  const lock = liveLock(dir);
   assert.deepEqual(lockFindings(dir, lock), [], "the fixture must start GREEN");
   const abs = path.join(dir, ".github/workflows/ci.yml");
   const target = path.join(dir, ".github/ci-workflow.yml");
@@ -2221,32 +2316,32 @@ test("lockFindings: a non-object lock is RED with the --update-lock remedy (#675
 });
 test("lockFindings: a version mismatch is RED with the --update-lock remedy (#675 P2-e)", () => {
   const dir = makeLockFixture();
-  const findings = lockFindings(dir, { version: 2, files: hashLockedFiles(dir) });
+  const findings = lockFindings(dir, { version: 1, files: hashLockedRegions(dir) });
   assert.equal(findings.length, 1, `expected one finding, got ${findings.length}`);
   assert.match(findings[0], /version/);
   assert.match(findings[0], /--update-lock/);
 });
 test("lockFindings: a lock with no `files` mapping is RED (#675 P2-e)", () => {
   const dir = makeLockFixture();
-  const findings = lockFindings(dir, { version: 1 });
+  const findings = lockFindings(dir, { version: LOCK_VERSION });
   assert.equal(findings.length, 1, `expected one finding, got ${findings.length}`);
   assert.match(findings[0], /`files` mapping/);
   assert.match(findings[0], /--update-lock/);
 });
 test("lockFindings: an uncovered expected path is RED (#675 P2-e)", () => {
   const dir = makeLockFixture();
-  const files = hashLockedFiles(dir);
+  const files = hashLockedRegions(dir);
   delete files[".github/workflows/node-ci.yml"];
-  const findings = lockFindings(dir, { version: 1, files });
+  const findings = lockFindings(dir, { version: LOCK_VERSION, files });
   assert.equal(findings.length, 1, `expected one finding, got ${findings.length}`);
   assert.match(findings[0], /node-ci\.yml/);
   assert.match(findings[0], /--update-lock/);
 });
 test("lockFindings: an unexpected extra path is RED (#675 P2-e)", () => {
   const dir = makeLockFixture();
-  const files = hashLockedFiles(dir);
-  files[".github/workflows/extra.yml"] = "0".repeat(64);
-  const findings = lockFindings(dir, { version: 1, files });
+  const files = hashLockedRegions(dir);
+  files[".github/workflows/extra.yml"] = { top: "0".repeat(64) };
+  const findings = lockFindings(dir, { version: LOCK_VERSION, files });
   assert.equal(findings.length, 1, `expected one finding, got ${findings.length}`);
   assert.match(findings[0], /extra\.yml/);
   assert.match(findings[0], /--update-lock/);
@@ -2349,7 +2444,7 @@ test("workflow coverage: a `.yaml` workflow is classified, not ignored (#675 P2,
 // happily hashed through it.
 test("lockFindings: a symlinked `.github` ancestor is RED (#675 P2, third revision)", () => {
   const dir = makeLockFixture();
-  const lock = { version: 1, files: hashLockedFiles(dir) };
+  const lock = liveLock(dir);
   assert.deepEqual(lockFindings(dir, lock), [], "the fixture must start GREEN");
   const real = path.join(dir, "real-github");
   fs.renameSync(path.join(dir, ".github"), real);
@@ -3086,7 +3181,7 @@ test("workflow-lock.yml's committed RUN BODY is behaviourally load-bearing — t
 function expectLockRedForEdit(label, rel, edit) {
   test(label, () => {
     const dir = makeLockFixture();
-    const lock = { version: 1, files: hashLockedFiles(dir) };
+    const lock = liveLock(dir);
     assert.deepEqual(lockFindings(dir, lock), [], "the fixture must start GREEN");
     const live = fs.readFileSync(path.join(REPO_ROOT, rel), "utf8");
     fs.writeFileSync(path.join(dir, rel), edit(live));
