@@ -102,8 +102,17 @@ ck "LOCKF is defined ONCE in the whole loop (no split identity of the lock path)
 TRAP_L="$(grep -nF "trap 'rm -f \"\$LOCKF\"' EXIT" "$SUBJECT" | head -1 | cut -d: -f1)"
 [ -n "$TRAP_L" ] && [ "$TRAP_L" -gt "$END_L" ]
 ck "the EXIT trap that releases the lock sits BELOW the section (the block runs first)" $?
-okc_not "NO signal handler removes the lock (a returning INT/TERM handler deleted it while the loop lived — #1715)" \
-  grep -qE "^trap 'rm -f \"\\\$LOCKF\"' (INT|TERM|HUP)" "$SUBJECT"
+# ⛔ THE ARM MUST RED ON THE EXACT #1715 REVERT, AND THE FIRST FORM DID NOT (fresh review of #1985,
+# P2 — MEASURED: restoring `trap 'rm -f "$LOCKF"' EXIT INT TERM` byte for byte left every arm green,
+# because the regex anchored the signal names at the START of the trap while the historical regression
+# has them AFTER `EXIT`). So this pins the WHOLE SET: one trap line may mention $LOCKF at all, and it
+# must be exactly the EXIT-only form.
+LOCK_TRAPS="$(grep -E '^trap .*LOCKF' "$SUBJECT" 2>/dev/null)"
+# ⛔ `-qxF`, NOT `-qF`: a SUBSTRING match accepts `trap 'rm -f "$LOCKF"' EXIT INT TERM`, which is the
+# very regression this arm exists for (MEASURED on the first fix of this arm — the revert stayed green).
+[ "$(printf '%s\n' "$LOCK_TRAPS" | grep -c .)" = 1 ] \
+  && printf '%s\n' "$LOCK_TRAPS" | grep -qxF "trap 'rm -f \"\$LOCKF\"' EXIT"
+ck "the lock is released by ONE trap and it is EXACTLY the EXIT-only form (a returning INT/TERM handler deleted it while the loop lived — #1715)" $?
 okc "acq() still takes the lock with set -o noclobber (unchanged primitive)" \
   grep -qF 'acq() { ( set -o noclobber; echo $$ > "$LOCKF" ) 2>/dev/null; }' "$SUBJECT"
 okc_not "the OLD liveness-only reclaim is GONE (it must not survive beside the new verdict)" \
@@ -129,10 +138,16 @@ if [ -f "$LIB_PID" ] && [ -f "$LIB_REG" ]; then
   B_START="$(extract_fn "$LIB_PID" pid_start_epoch | norm_fn)"
   [ -n "$A_START" ] && [ "$A_START" = "$B_START" ]
   ck "the age mirror's CODE is identical to pid-identity.sh:pid_start_epoch" $?
-  A_LOOP="$(extract_fn "$SUBJECT" _orch_pid_is_loop | norm_fn)"
-  B_LOOP="$(extract_fn "$LIB_REG" registry_pid_is_controller | norm_fn)"
+  # ⛔ THE TOKEN RULES ARE THE PINNED PART, NOT THE WHOLE BODY (fresh review of #1985, P1). The READ
+  # arms deliberately differ: in a REPORTING consumer a false "not the owner" degrades a row to
+  # STOPPED, while HERE the caller answers it by DELETING a live owner's lock (#1715), so the loop's
+  # read is three-valued (`_orch_lock_probe`) and the canonical one is not. What must never drift are
+  # the two argv TOKEN rules (#1856: a looser ANY-token match accepts a non-controller).
+  token_rules() { grep -E "##\*/|-ge 2" | sed -e 's/[[:space:]]\+$//' -e '/^[[:space:]]*#/d'; }
+  A_LOOP="$(extract_fn "$SUBJECT" _orch_argv_is_loop | token_rules)"
+  B_LOOP="$(extract_fn "$LIB_REG" registry_pid_is_controller | token_rules)"
   [ -n "$A_LOOP" ] && [ "$A_LOOP" = "$B_LOOP" ]
-  ck "the argv-shape mirror's CODE is identical to orchestrator-registry.sh:registry_pid_is_controller" $?
+  ck "the argv-shape mirror's TOKEN RULES are identical to orchestrator-registry.sh:registry_pid_is_controller" $?
   _a="$(sed -n 's/^ORCH_LOCK_START_SLACK_SECONDS="\${ORCH_LOCK_START_SLACK_SECONDS:-\([0-9]*\)}"/\1/p' "$SUBJECT" | head -1)"
   _b="$(sed -n 's/^PID_START_SLACK_SECONDS="\${PID_START_SLACK_SECONDS:-\([0-9]*\)}"/\1/p' "$LIB_PID" | head -1)"
   [ -n "${_a:-}" ] && [ "$_a" = "$_b" ]
@@ -161,19 +176,18 @@ mkcase() {
 }
 # spawn_loop <dir> — a process whose argv IS an orch-loop.sh invocation (`<shell> <dir>/orch-loop.sh`).
 # Prints its pid. This is the shape `registry_pid_is_controller` accepts and a `sleep` does not.
+# ⛔ THE CALLER APPENDS TO KIDS, THE HELPER DOES NOT (fresh review of #1985, P2 — MEASURED: every call
+# site is `X="$(spawn_loop …)"`, which runs the helper in a SUBSHELL, so `KIDS="$KIDS $_pid"` inside it
+# never reached the parent and `cleanup()` killed NOTHING — a dead registry that reads as protection).
 spawn_loop() {
   printf '#!/bin/bash\ntrap "exit 0" TERM INT\nwhile :; do sleep 1; done\n' > "$1/orch-loop.sh"
   chmod +x "$1/orch-loop.sh"
   bash "$1/orch-loop.sh" >/dev/null 2>&1 &
-  _pid=$!
-  KIDS="$KIDS $_pid"
-  printf '%s\n' "$_pid"
+  printf '%s\n' "$!"
 }
 spawn_sleep() {
   sleep 300 >/dev/null 2>&1 &
-  _pid=$!
-  KIDS="$KIDS $_pid"
-  printf '%s\n' "$_pid"
+  printf '%s\n' "$!"
 }
 run_drv() { # <case-dir> [env...] -> sets RC, OUT, ERR
   RC=0
@@ -182,6 +196,13 @@ run_drv() { # <case-dir> [env...] -> sets RC, OUT, ERR
 }
 ran() { want "$OUT" "STARTED pid="; }
 lock_pid() { tr -dc '0-9' 2>/dev/null < "$1"; }
+
+# ⛔ EVERY SPAWN CALL SITE MUST REGISTER ITS PID IN THE PARENT (fresh review of #1985, P2). Both
+# helpers are called through `$( … )`, so the helper's own `KIDS=…` would be lost to a subshell — the
+# arm above asserts the trap exists, this one asserts it has something to kill.
+UNREG="$(grep -nE '\$\(spawn_(loop|sleep)' "$HERE/orch-loop-lock.test.sh" | grep -v 'KIDS="\$KIDS' | grep -v '^[0-9]*: *#' | wc -l | tr -d ' ')"
+[ "$UNREG" = "0" ]
+ck "every spawn call site registers its pid in the PARENT shell ($UNREG unregistered)" $?
 
 # ── 1) NO LOCK → acquire and run ─────────────────────────────────────────────────────────────────
 echo "── 1. no lock: the controller acquires it and runs"
@@ -196,7 +217,7 @@ ck "1: the lock names the process that acquired it ($OWN)" $?
 # ── 2) a LIVE owner (real order) → REFUSE, name it, do not clobber ────────────────────────────────
 echo "── 2. a live orch-loop.sh owner: refuse, name the pid, leave the lock alone"
 mkcase; CASE_DIR="$C"
-HP="$(spawn_loop "$C/peer")"; sleep 0.4
+HP="$(spawn_loop "$C/peer")"; KIDS="$KIDS $HP"; sleep 0.4
 printf '%s\n' "$HP" > "$C/o/.orch.lock"          # AFTER the process started — the real write order
 run_drv O="$C/o"
 ck "2: refuses (does not run a second controller over a live owner)" "$(ran && echo 1 || echo 0)"
@@ -208,7 +229,7 @@ kill -9 "$HP" 2>/dev/null
 # ── 3) a DEAD owner → reclaim and run ────────────────────────────────────────────────────────────
 echo "── 3. a dead owner: reclaim and run"
 mkcase; CASE_DIR="$C"
-DP="$(spawn_loop "$C/peer")"; sleep 0.4
+DP="$(spawn_loop "$C/peer")"; KIDS="$KIDS $DP"; sleep 0.4
 printf '%s\n' "$DP" > "$C/o/.orch.lock"
 kill -9 "$DP" 2>/dev/null; sleep 0.3
 run_drv O="$C/o"
@@ -220,7 +241,7 @@ ck "3: the reclaim is LOGGED (never silent)" "$(want "$(cat "$C/o/logs/orch-loop
 # old code refused to start over it forever. The acceptance criterion of #1985, verbatim.
 echo "── 4. ⭐ a RECYCLED pid that is not an orch-loop.sh: reclaim and run (the #1985 acceptance)"
 mkcase; CASE_DIR="$C"
-RP="$(spawn_sleep)"; sleep 0.2
+RP="$(spawn_sleep)"; KIDS="$KIDS $RP"; sleep 0.2
 printf '%s\n' "$RP" > "$C/o/.orch.lock"
 touch -t 202001010000 "$C/o/.orch.lock" 2>/dev/null || touch -d '2020-01-01 00:00:00' "$C/o/.orch.lock"
 run_drv O="$C/o"
@@ -237,7 +258,7 @@ kill -9 "$RP" 2>/dev/null
 # for verbatim ("with $O/.orch.lock naming a live non-controller pid, orch-loop.sh starts and runs").
 echo "── 4b. a live NON-controller pid with a FRESH lock: reclaim (the argv-shape arm is load-bearing)"
 mkcase; CASE_DIR="$C"
-SP="$(spawn_sleep)"; sleep 0.4
+SP="$(spawn_sleep)"; KIDS="$KIDS $SP"; sleep 0.4
 printf '%s\n' "$SP" > "$C/o/.orch.lock"          # lock written AFTER the process began
 run_drv O="$C/o"
 ck "4b: a live pid that is not an orch-loop.sh is not an owner (it starts and runs)" \
@@ -249,7 +270,7 @@ kill -9 "$SP" 2>/dev/null
 # path, so the argv shape matches PERFECTLY. The age fence is the half that answers (#1178/#1856).
 echo "── 5. ⭐ a peer orch-loop.sh that began AFTER the lock was written: reclaim and run"
 mkcase; CASE_DIR="$C"
-PP="$(spawn_loop "$C/peer")"; sleep 0.2
+PP="$(spawn_loop "$C/peer")"; KIDS="$KIDS $PP"; sleep 0.2
 printf '%s\n' "$PP" > "$C/o/.orch.lock"
 touch -t 202001010000 "$C/o/.orch.lock" 2>/dev/null || touch -d '2020-01-01 00:00:00' "$C/o/.orch.lock"
 run_drv O="$C/o"
@@ -261,7 +282,7 @@ kill -9 "$PP" 2>/dev/null
 # Without this arm, 5 could pass by reclaiming everything — which is #1715 in the other direction.
 echo "── 6. the same live peer controller, lock written AFTER it started: refuse (positive control)"
 mkcase; CASE_DIR="$C"
-QP="$(spawn_loop "$C/peer")"; sleep 0.4
+QP="$(spawn_loop "$C/peer")"; KIDS="$KIDS $QP"; sleep 0.4
 printf '%s\n' "$QP" > "$C/o/.orch.lock"
 run_drv O="$C/o"
 ck "6: refuses a genuine owner (the fence is not a blanket reclaim)" \
@@ -281,7 +302,7 @@ case "$*" in *etime*) exit 1 ;; esac
 exec /bin/ps "$@"
 PSSHIM
 chmod +x "$C/bin/ps-noetime"
-UP="$(spawn_loop "$C/peer")"; sleep 0.4
+UP="$(spawn_loop "$C/peer")"; KIDS="$KIDS $UP"; sleep 0.4
 printf '%s\n' "$UP" > "$C/o/.orch.lock"
 run_drv O="$C/o" PS_BIN="$C/bin/ps-noetime"
 ck "7: refuses to start a second controller over an owner it cannot date" "$(ran && echo 1 || echo 0)"
@@ -294,6 +315,30 @@ ck "7: records it in the log too (a stderr-only line is invisible under launchd)
 ck "7: the undatable owner's lock is NOT removed (a refusal clobbers nothing)" \
    "$( [ "$(lock_pid "$C/o/.orch.lock")" = "$UP" ] && echo 0 || echo 1 )"
 kill -9 "$UP" 2>/dev/null
+
+# ── 7b) an UNREADABLE PROCESS TABLE over a genuine loop-shaped owner → REFUSE (the P1 the fresh
+# review of #1985 reproduced). The shape read is the OTHER half of the same doctrine: "cannot read"
+# must never become "provably not the owner", because the caller answers that by DELETING the lock.
+# This arm is the mirror of 7 for the table read; before it existed, a `ps` that refused the table
+# turned a live owner into a reclaimed lock (MEASURED: OUT=STARTED, lock re-pointed at the newcomer).
+echo "── 7b. an UNREADABLE process table over a live loop-shaped owner: refuse, never reclaim"
+mkcase; CASE_DIR="$C"
+cat > "$C/bin/ps-notable" <<'PSSHIM2'
+#!/bin/bash
+# Answers the AGE read, refuses the process TABLE — the shape read's failure mode.
+case "$*" in *etime*) echo 00:42; exit 0 ;; esac
+exit 1
+PSSHIM2
+chmod +x "$C/bin/ps-notable"
+VP="$(spawn_loop "$C/peer")"; KIDS="$KIDS $VP"; sleep 0.4
+printf '%s\n' "$VP" > "$C/o/.orch.lock"
+run_drv O="$C/o" PS_BIN="$C/bin/ps-notable"
+ck "7b: an unreadable TABLE does not become a reclaimed lock (it refuses)" "$(ran && echo 1 || echo 0)"
+ck "7b: the refusal says CANNOT-TELL and names the read that failed" \
+   "$(want "$ERR" "CANNOT-TELL" && want "$ERR" "process table" && echo 0 || echo 1)"
+ck "7b: the live owner's lock is UNTOUCHED (a failed read clobbers nothing)" \
+   "$( [ "$(lock_pid "$C/o/.orch.lock")" = "$VP" ] && echo 0 || echo 1 )"
+kill -9 "$VP" 2>/dev/null
 
 # ── 8) a lock carrying NO digits, and a lock naming pid 0 ────────────────────────────────────────
 # `[ abc -gt 0 ]` is an ERRORED test, which is FALSE, which reclaimed — the #1831 class. pid 0 is the
