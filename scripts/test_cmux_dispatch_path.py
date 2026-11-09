@@ -26,12 +26,15 @@ What is pinned here is the CONTRACT, not the code shape:
   * `-f`, not `-x`: the producer is read by the interpreter, and a non-executable `.py` is fine.
 
 The end-to-end arms run `safe-send.sh --force` with `HOME`, `TORTOISE_REPO` and `SAFE_SEND_DISPATCH`
-stripped, so the resolution is the host's OUTSIDE this repo — a device-independent statement about a
-box with no tortoise checkout, not about this laptop.
+stripped, and with a `python3.12` THE ARM PLANTS on its own `PATH` (`_plant_python312`), so BOTH halves
+of the resolution are the host's OUTSIDE this repo — a **device-independent statement** about a box
+with no tortoise checkout, not about this laptop. (The producer is the arm's; the interpreter must be
+the arm's too, or the arm asserts a property of the runner image instead — #3836 F1.)
 """
 from __future__ import annotations
 
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -240,6 +243,39 @@ def _safe_send_fixture(tmp_path):
     return scripts / "safe-send.sh", brief, tmp_path / "home"
 
 
+def _plant_python312(tmp_path):
+    """A `python3.12` THE ARM OWNS, first on the arm's `PATH` -> (path, the stub's invocation log).
+
+    ⛔ WHY THE POSITIVE CONTROLS NEED THIS (#3836 F1): both of them pin `PATH` so the resolution is
+    the environment the arm states — and then required the INTERPRETER ladder (`safe-send.sh:245-250`
+    -> `exit 5`) to find a `python >= 3.12` in the RUNNER IMAGE. Nothing in the arm provided one, so
+    the assertion's truth value was a property of the machine: green here and on `ubuntu-24.04`
+    (`/usr/bin/python3` = 3.12), RED on any runner whose `/usr/bin`/`/usr/local/bin` python is
+    3.10-3.11 (`ubuntu-22.04`, Debian 12, a self-hosted runner) — on a REQUIRED job (`ci.yml:294`,
+    `ci-main.yml:796`). That is the one device-dependence this suite's own docstring disclaims, and
+    it is the shape `tests/test_pytest_root_cut.py` records this repo already paying for once.
+
+    The stub is NAMED `python3.12` because the ladder takes a versioned name at its word (the name IS
+    the version — see `cmux_dispatch_python_candidates`), so no probe decides anything: it execs the
+    interpreter running this suite, whichever that is. Its log is the DECISIVE assertion — it proves
+    the ladder picked the arm's interpreter rather than the image's, which is what keeps the fix
+    non-vacuous on a host (like this one) that carries a 3.12 of its own: remove the plant and the
+    log is absent even though the arm still passes.
+    """
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    log = tmp_path / "python-invoked.log"
+    real = sys.executable or shutil.which("python3") or "/usr/bin/python3"
+    stub = bindir / "python3.12"
+    stub.write_text(textwrap.dedent(f"""\
+        #!/bin/sh
+        printf '%s\\n' "$*" >> {str(log)!r}
+        exec {shlex.quote(real)} "$@"
+    """))
+    stub.chmod(0o755)
+    return f"{bindir}:/usr/local/bin:/usr/bin:/bin", log
+
+
 def _run_safe_send(tmp_path, *args, env=None, path_prefix=None):
     ss, brief, home = _safe_send_fixture(tmp_path)
     bare = {"PATH": (f"{path_prefix}:/usr/local/bin:/usr/bin:/bin" if path_prefix
@@ -287,6 +323,7 @@ def test_safe_send_RESOLVES_a_sibling_producer_on_a_box_with_no_checkout(tmp_pat
     reason — on CI nothing resolved — so this arm is what makes the sibling-first contract real.
     """
     ss, brief, home = _safe_send_fixture(tmp_path)
+    path, py_log = _plant_python312(tmp_path)
     mark = tmp_path / "mark.txt"
     (tmp_path / "scripts" / "cmux_dispatch.py").write_text(textwrap.dedent(f"""
         import os, sys
@@ -295,24 +332,29 @@ def test_safe_send_RESOLVES_a_sibling_producer_on_a_box_with_no_checkout(tmp_pat
     """).lstrip())
     r = subprocess.run(["bash", str(ss), "0000-1111", "lane", str(brief), "--force"],
                        capture_output=True, text=True, cwd=str(tmp_path),
-                       env={"PATH": "/usr/local/bin:/usr/bin:/bin", "HOME": str(home)})
+                       env={"PATH": path, "HOME": str(home)})
     assert r.returncode == 0, (r.returncode, r.stdout, r.stderr)
     assert mark.exists(), (r.stdout, r.stderr)
     assert mark.read_text().startswith("send --workspace 0000-1111 --label lane"), mark.read_text()
+    # the interpreter came from the ARM, not from the runner image (#3836 F1)
+    assert py_log.exists(), (r.stdout, r.stderr)
+    assert "send --workspace 0000-1111" in py_log.read_text(), py_log.read_text()
 
 
 def test_the_producer_is_the_ONLY_thing_read_needs_no_execute_bit_and_still_sends(tmp_path):
     """Same positive control with the producer NOT executable: `-x` would have refused it."""
     ss, brief, home = _safe_send_fixture(tmp_path)
+    path, py_log = _plant_python312(tmp_path)
     mark = tmp_path / "mark2.txt"
     producer = tmp_path / "scripts" / "cmux_dispatch.py"
     producer.write_text(f'import os\nopen({str(mark)!r}, "w").write("ran")\n')
     producer.chmod(0o444)
     r = subprocess.run(["bash", str(ss), "0000-1111", "lane", str(brief), "--force"],
                        capture_output=True, text=True, cwd=str(tmp_path),
-                       env={"PATH": "/usr/local/bin:/usr/bin:/bin", "HOME": str(home)})
+                       env={"PATH": path, "HOME": str(home)})
     assert r.returncode == 0, (r.returncode, r.stdout, r.stderr)
     assert mark.read_text() == "ran"
+    assert py_log.exists(), (r.stdout, r.stderr)  # the arm's interpreter, not the image's (#3836 F1)
 
 
 def test_a_python_older_than_3_12_is_never_accepted_on_NAME_alone(tmp_path):
