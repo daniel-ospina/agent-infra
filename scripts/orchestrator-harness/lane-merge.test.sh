@@ -103,8 +103,14 @@ git -C "$RUN_REPO" checkout -q -b feat/fixture-run
 # seam's demotions in tests/pr-state-wiring/run.sh; here it must simply not run.
 PR_STATE_BIN="$T/no-router-in-this-suite"; export PR_STATE_BIN
 run() { # run <pr> <args…>  → sets RC, OUT
+  # ⛔ `RUN_TMO` BOUNDS A CASE THAT IS EXPECTED TO *HANG* — and it exists because one did (review round 2,
+  # P1's regression arm): the pre-fix code, given ~50 s of wall clock and a 5400 s wait, waits the WHOLE
+  # 5400 s instead of handing off, so the arm could only "fail" by hanging the suite for 90 minutes and
+  # starving every arm after it. A case whose pre-fix failure mode is a hang must be bounded at the case,
+  # or it is not a test — it is an outage. `124` = the bound fired = the behaviour under test is missing.
   OUT="$(PATH="$BIN:$PATH" GH_LOG="$T/gh.log" O="$OT" HOME="$T/home" REPO_PATH="${REPO_PATH:-$RUN_REPO}" \
         LANE_MERGE_INTERVAL=5 LANE_MERGE_WAIT="${WAIT_S:-0}" LANE_MERGE_POLL="${POLL_S:-0}" \
+        ${RUN_TMO:+timeout "$RUN_TMO"} \
         bash "$SCRIPT" "$@" 2>&1)"; RC=$?
 }
 verdict_of() { cat "$OT/state/lanemerge-$1.verdict" 2>/dev/null; }
@@ -1452,9 +1458,41 @@ ck "…and the heartbeat target is the LANE's own log by DEFAULT (no operator wi
    $([ "$RC" = 11 ] && grep -q '\[lane-merge\] heartbeat' "$OT/logs/lane-33.log" && ! grep -q 'CAPPED at' <<<"$OUT" && echo 0 || echo 1)
 # (2) the self-cap when no target resolves: the wait must land BELOW the watchdog's allowance, WITH a verdict.
 new_o "$T/pr4.tsv"
-WAIT_S=60 POLL_S=5 LANE_BOUND_IDLE_S=20 run 34 --repo o/r --pr-tsv "$T/pr4.tsv" --checks-tsv "$T/checks-inflight.tsv"
+RUN_TMO=25 WAIT_S=60 POLL_S=5 LANE_BOUND_IDLE_S=20 run 34 --repo o/r --pr-tsv "$T/pr4.tsv" --checks-tsv "$T/checks-inflight.tsv"
 ck "with NO heartbeat target the check wait CAPS itself below lane-bound.sh's allowance (60 s wait, 20 s allowance → 10 s) and still writes WAITING_CHECKS, instead of waiting to be killed unlabelled" \
    $([ "$RC" = 11 ] && [ "$(verdict_of 34 | cut -d' ' -f1)" = WAITING_CHECKS ] && grep -q 'CAPPED at 10s' <<<"$OUT" && echo 0 || echo 1)
+
+# ⛔ AND THE SAME ON THE WALL AXIS (review round 2, P1 — verified by arithmetic): `WAIT_S` was measured from
+# MERGE-PHASE ENTRY while the watchdog's `--wall` is measured from the LANE's spawn, so a lane entering
+# 1800 s in waited past its own kill and died unlabelled — on the clock this file claims to own.
+ck "the check wait is also clamped to what REMAINS of the watchdog's wall clock, reserving the --watch allowance after it, from an EXPORTED spawn epoch (not a guessed one)" \
+   $(grep -q 'LANE_SPAWN_EPOCH' "$SCRIPT" && grep -q 'wall_left()' "$SCRIPT" \
+     && grep -q '_wall_reserve=$(( MAX_WATCH \* POLL_S + _hb_margin ))' "$SCRIPT" && echo 0 || echo 1)
+ck "…and spawn-gate EXPORTS that epoch at the moment it arms the watchdog (a child that cannot read the lane's start cannot clamp to its wall)" \
+   $(grep -q 'LANE_SPAWN_EPOCH="$(date +%s)"; export LANE_SPAWN_EPOCH' "$HERE/spawn-gate.sh" && echo 0 || echo 1)
+# the HARD branch: so little wall remains that no wait fits — hand off NOW, labelled, instead of waiting to
+# be TERMed mid-wait with no verdict at all (this is the measured shape: "TERM 143, no lanemerge.verdict").
+new_o "$T/pr4.tsv"
+# ⛔ `WAIT_S=5400` IS PASSED EXPLICITLY AND THAT IS THE POINT: `run`'s own default is `LANE_MERGE_WAIT=0`,
+# so an arm that omitted it would leave `deadline` already expired and pass by a completely different path
+# (the loop's own bound) while measuring nothing about the clamp — verified red before this line existed.
+# `POLL_S=120` too: the wall clamp RESERVES `MAX_WATCH x POLL` for the `--watch` that follows, and `run`'s
+# own default of 0 would reserve nothing and leave 50 s looking like enough for a 40 s wait — the arm would
+# then measure the CLAMP branch instead of the hand-off branch it names.
+RUN_TMO=25 WAIT_S=5400 POLL_S=120 LANE_SPAWN_EPOCH=$(( $(date +%s) - 7150 )) run 35 --repo o/r --pr-tsv "$T/pr4.tsv" --checks-tsv "$T/checks-inflight.tsv"
+ck "with only ~50s of the lane's wall clock left the wait does NOT start: it writes WAITING_CHECKS and exits 11 now, instead of being killed mid-wait with no verdict" \
+   $([ "$RC" = 11 ] && [ "$(verdict_of 35 | cut -d' ' -f1)" = WAITING_CHECKS ] && grep -q 'cannot cover a check wait' <<<"$OUT" && echo 0 || echo 1)
+# …and when the epoch is unknown the clamp STANDS DOWN AND SAYS SO (an admitted unknown, never a guess).
+new_o "$T/pr4.tsv"
+WAIT_S=2 run 36 --repo o/r --pr-tsv "$T/pr4.tsv" --checks-tsv "$T/checks-inflight.tsv"
+ck "with no spawn epoch the wall clamp stands down and SAYS it cannot clamp, rather than guessing a start time" \
+   $([ "$RC" = 11 ] && grep -q 'cannot be clamped to the lane' <<<"$OUT" && echo 0 || echo 1)
+# the FLOOR must never defeat the bound it guards (review round 2, P3 — verified): with an allowance this
+# small the old floor handed back a wait AT the allowance (0 s here, ≥120 s at the shipped POLL_S).
+new_o "$T/pr4.tsv"
+RUN_TMO=25 WAIT_S=60 LANE_BOUND_IDLE_S=2 run 37 --repo o/r --pr-tsv "$T/pr4.tsv" --checks-tsv "$T/checks-inflight.tsv"
+ck "the self-cap always lands STRICTLY BELOW the allowance it guards (an allowance of 2s must not yield a 2s 'cap'), and never below one poll of its own" \
+   $([ "$RC" = 11 ] && grep -q 'CAPPED at 1s' <<<"$OUT" && echo 0 || echo 1)
 
 # ── 19. an EMPTY PR read must not blank the head or read as merged (E7) ────────────────────────
 new_o "$T/pr25.tsv"
