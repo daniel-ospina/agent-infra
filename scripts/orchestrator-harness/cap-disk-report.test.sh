@@ -184,27 +184,27 @@ if [ -n "$BLOCK" ]; then
         SPAWN_GATE_SH="$gate"; REPO="$T"; LOG="$T/drive.log"
         is_num() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; 0) return 0 ;; 0*) return 1 ;; *) return 0 ;; esac; }
         . "$BLOCK"
-        printf '%s|%s|%s|%s|%s\n' "${DISK_SRC:-unset}" "${DISK_STATE:-?}" "${DISK_FREE_MB:-}" "${DISK_NEED_MB:-}" "${DISK_HEADROOM:-?}"
+        printf '%s|%s|%s|%s\n' "${DISK_SRC:-unset}" "${DISK_FREE_MB:-}" "${DISK_NEED_MB:-}" "${DISK_HEADROOM:-?}"
       ) 2>/dev/null
   }
   G="$(FIXTURE_ROW='[disk-report] ADMITTED 9000 8144 tree=350 self=6144 reserve=2000 box=b target=/x' FIXTURE_RC=0 drive "$T/fixture/spawn-gate.sh")"
-  eq "G1 an ADMITTED report lands on the line fields" "report|ADMITTED|9000|8144|ok" "$G"
+  eq "G1 an ADMITTED report lands on the line fields" "report|9000|8144|ok" "$G"
   G="$(FIXTURE_ROW='[disk-report] REFUSED-DISK 179 8144 tree=350 self=6144 reserve=2000 box=b target=/x' FIXTURE_RC=0 drive "$T/fixture/spawn-gate.sh")"
-  eq "G2 free BELOW the bound reports headroom=no — the 179 MB cell reads as 'no' and not as a capacity" "report|REFUSED-DISK|179|8144|no" "$G"
+  eq "G2 free BELOW the bound reports headroom=no — the 179 MB cell reads as 'no' and not as a capacity" "report|179|8144|no" "$G"
   G="$(FIXTURE_ROW='[disk-report] ADMITTED 8144 8144 tree=350 self=6144 reserve=2000 box=b target=/x' FIXTURE_RC=0 drive "$T/fixture/spawn-gate.sh")"
-  eq "G3 AT the bound is ok (the gate's own predicate is '>=' - a boundary that refuses would be a false block)" "report|ADMITTED|8144|8144|ok" "$G"
+  eq "G3 AT the bound is ok (the gate's own predicate is '>=' - a boundary that refuses would be a false block)" "report|8144|8144|ok" "$G"
   G="$(FIXTURE_ROW='[disk-report] REFUSED-UNKNOWN ? 8144 tree=350 self=6144 reserve=2000 box=b target=/x' FIXTURE_RC=0 drive "$T/fixture/spawn-gate.sh")"
-  eq "G4 an unreadable probe reads headroom=unknown and free='?'" "report|REFUSED-UNKNOWN|?|8144|unknown" "$G"
+  eq "G4 an unreadable probe reads headroom=unknown and free='?'" "report|?|8144|unknown" "$G"
 
   # ⛔ THE DEPLOY-SKEW ARM, and it must be LOUD: a copy that predates the verb (a non-zero rc with no
   # row) is the #2033 half-deployed shape. It is NOT a capacity change — the enforcing gate is
   # elsewhere — so the cycle proceeds, but it says so once.
   G="$(FIXTURE_ROW='' FIXTURE_RC=64 drive "$T/fixture/spawn-gate.sh")"
-  eq "G5 a gate that does not answer leaves the fields explicitly UNSET (src=absent, headroom='?')" "absent|?|||?" "$G"
+  eq "G5 a gate that does not answer leaves the fields UNSET (empty, never 0 — the [cap] line renders them '?')" "absent|||?" "$G"
   has "PREDATES the report verb" "$(cat "$T/drive.log")" "G6 …and the cycle SAYS SO (a silent absence is the defect)"
   # ⛔ ABSENT is the same class: the loop must not refuse to run because a log field cannot be produced.
   G="$(FIXTURE_ROW='' FIXTURE_RC=0 drive "$T/does-not-exist/spawn-gate.sh")"
-  eq "G7 a missing spawn-gate.sh is also 'absent' (not a fabricated figure)" "absent|?|||?" "$G"
+  eq "G7 a missing spawn-gate.sh is also 'absent' (not a fabricated figure, and not a stale one)" "absent|||?" "$G"
   has "no spawn-gate.sh found" "$(cat "$T/drive.log")" "G8 …and names what it looked for"
 
   # ⛔ AND THE BLOCK MEASURES NOTHING ITSELF. This is the property that keeps the `[cap]` figure equal

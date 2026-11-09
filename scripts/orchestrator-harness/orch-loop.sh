@@ -7634,12 +7634,18 @@ PY
   # duplicate the refusal. The refusal that matters is upstream of every lane checkout
   # (`wt_provision` → `disk_admit`, exit 77) and at the spawn point (`DISK-NOHEADROOM`).
   # [capdisk:begin] (extracted and DRIVEN by cap-disk-report.test.sh — keep the markers)
-  DISK_FREE_MB=""; DISK_NEED_MB=""; DISK_HEADROOM="?"; DISK_SRC="unset"; DISK_STATE="?"
+  DISK_FREE_MB=""; DISK_NEED_MB=""; DISK_HEADROOM="?"; DISK_SRC="unset"
+  _dr_rc=0
   if [ -n "${SPAWN_GATE_SH:-}" ] && [ -f "${SPAWN_GATE_SH:-}" ]; then
-    _dr_line="$(bash "$SPAWN_GATE_SH" --disk-report "${REPO:-.}" --label '[cap]' 2>/dev/null)"; _dr_rc=$?
+    # `if`-shaped, not `cmd; rc=$?`: the report is EXPECTED to fail on a predating copy, and a bare
+    # failing assignment is the shape `set -e` turns into a dead controller.
+    if _dr_line="$(bash "$SPAWN_GATE_SH" --disk-report "${REPO:-.}" --label '[cap]' 2>/dev/null)"; then :; else _dr_rc=$?; fi
     if [ "$_dr_rc" -eq 0 ] && [ -n "${_dr_line:-}" ]; then
       # Positional: `[disk-report] <STATE> <free|?> <need> …` (`disk_report`'s documented format).
-      read -r _dr_tag DISK_STATE DISK_FREE_MB DISK_NEED_MB _dr_rest <<< "$_dr_line"
+      # The STATE is parsed but NOT printed: `disk_headroom` IS the comparison an operator acts on,
+      # and two fields for one verdict is how a line and the gate it quotes start disagreeing. It
+      # stays in the parse so the row is consumed as documented (a shifted row is not silently read).
+      read -r _dr_tag _dr_state DISK_FREE_MB DISK_NEED_MB _dr_rest <<< "$_dr_line"
       DISK_SRC="report"
       # `?` (unreadable probe) is NOT coerced to 0 — a gate that treats "cannot measure" as "empty"
       # refuses a healthy box, and one that treats it as "ample" is the false PASS this line exists

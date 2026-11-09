@@ -855,7 +855,10 @@ disk_admit() { # <target> [<label>]
   DISK_ADMIT_SELF_MB="$self"; DISK_ADMIT_RESERVE_MB="$reserve"
   DISK_ADMIT_BOX="$box"
   avail="$(disk_free_mb_target "$target")"
-  disk_readable "$avail" && DISK_ADMIT_FREE_MB="$avail"
+  # ⛔ `if`, NOT `disk_readable … && DISK_ADMIT_FREE_MB=…`: the `&&` form leaves a NON-ZERO status as
+  # the list's result, and a caller that sources this file under `set -e` would abort the sweep on an
+  # unreadable probe — turning a fail-OPEN reading into a stopped box.
+  if disk_readable "$avail"; then DISK_ADMIT_FREE_MB="$avail"; fi
   if ! disk_readable "$avail"; then
     DISK_ADMIT_STATE="REFUSED-UNKNOWN"
     DISK_ADMIT_LINE="[disk-admit] REFUSED-UNKNOWN $label: free=? need=$(disk_mb_gb "$need") box=$box target=$target — the free-space probe could not answer (no readable \`df\` for that path or its nearest EXISTING ancestor), so the lane's headroom CANNOT be verified. Nothing was created, no worktree, no branch; a PRE-START admission fails CLOSED (an unmeasurable box is not an empty one). Check PATH/'df' on this box, or pass the volume explicitly (agent-infra#3395/#3231)"
