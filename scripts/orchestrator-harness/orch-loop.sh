@@ -387,6 +387,132 @@ if command -v ensure_agent_gh_real >/dev/null 2>&1; then ensure_agent_gh_real ||
 
 mkdir -p "$O/logs" "$O/state"
 LOG="$O/logs/orch-loop.log"
+# BEGIN gh-bound (gh-bound.test.sh extracts this block verbatim — keep it self-contained)
+# ── BOUNDED GITHUB CALLS (agent-infra#2028) ──────────────────────────────────────────────────────
+# THE DEFECT. Every `gh` call in this cycle body used to be UNBOUNDED, and `docs/ops/gh-rate-limits.md`
+# states the limit it fell through: "The child `gh` has no timeout … a legitimate `gh` call's duration is
+# not knowable here" — so the bound belongs at the CALL SITE, and the shell call sites had none.
+# MEASURED, twice, on the live fleet:
+#   * 2026-10-18: the `[res]` line's `gh api rate_limit` probe (the `rate=` call site below) left a `gh`
+#     child alive for 2h 08m with 0.01 s CPU and NO open sockets, while the supervisor reported the
+#     controller `running` and its heartbeat was 2h stale. `kill -TERM` on that ONE child let the
+#     iteration complete immediately — nothing was lost, the datum is read-only.
+#   * the same day, `ps` showed eight `bash orch-loop.sh` processes 23-43 minutes old: ONE controller
+#     plus its substitution subshells (a subshell inherits argv), which is why a bare
+#     `pgrep -c orch-loop.sh` must never be read as a duplicate-controller check (#1856/#1859).
+# The end state of that pile-up was a fully spent REST quota (core 0/5000) with dispatch stopped and
+# merges failing — a feedback loop rather than an incident: slow call -> live subshell -> more concurrent
+# callers -> more rate limiting -> slower calls.
+#
+# 120 s IS DERIVED FROM A MEASUREMENT, NOT PICKED. The same runbook measures a serialised `gh pr view`
+# at 63.0 s on a 13-lane box (0.676 s at 3 lanes) because `gh-limit.py` keeps ONE call in flight per box,
+# so this box's latency is a function of its own lane count. A bound UNDER that manufactures a false
+# absence — the failure the runbook calls out by name — so the default is ~1.9x the measured worst case,
+# and below one CYC (240 s), which is what makes #2028's indicator (b) ("no child outlives one cycle")
+# hold on the default clock.
+GH_BOUND_S="${GH_BOUND_S:-120}"
+# ⛔ A PER-CALL BOUND IS NOT A CYCLE BOUND, AND #2028'S INDICATOR (c) IS ABOUT THE CYCLE. The sweep
+# reads every open PR (>= 2 calls each), so a window in which EVERY call hangs costs
+# `GH_BOUND_S x 2 x open_prs` — hours, which is the measured 161-minute cycle body under a new name.
+# Once GH_BOUND_TRIP calls have hit the bound in ONE cycle, the rest of that cycle's gh calls FAIL FAST
+# with rc=124 WITHOUT spawning `gh` at all: the box does its non-GitHub work and the next cycle retries,
+# instead of queueing further callers behind a dead network.
+GH_BOUND_TRIP="${GH_BOUND_TRIP:-3}"
+# ⛔ A KNOB THAT DOES NOT PARSE MUST NOT DISARM THE CALLS. `tb_timeout` answers 125 (refusal, never run)
+# for a non-integer bound, so a typo'd GH_BOUND_S would make EVERY gh call fail and take the controller
+# dark — the fail-closed shape this file refuses elsewhere. Falls back loudly, and the length test bounds
+# the digits before `[ … -gt … ]` can error at 2**63 (the `is_limit` hazard this file documents).
+# gh_bound_knob <value> — 0 when <value> is a positive integer of at most 6 digits, 1 otherwise.
+# No `eval` and no nameref (bash 3.2): a knob is untrusted text, so it is validated, never re-parsed.
+gh_bound_knob() {
+  case "${1:-}" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  [ "${#1}" -le 6 ] && [ "$((10#$1))" -ge 1 ] && return 0
+  return 1
+}
+if ! gh_bound_knob "${GH_BOUND_S:-}"; then
+  printf '[bound] ⚠️ GH_BOUND_S=%s does not parse as a positive integer — using 120 s (agent-infra#2028)\n' "${GH_BOUND_S:-}" >> "$LOG" 2>/dev/null || true
+  GH_BOUND_S=120
+fi
+if ! gh_bound_knob "${GH_BOUND_TRIP:-}"; then
+  printf '[bound] ⚠️ GH_BOUND_TRIP=%s does not parse as a positive integer — using 3 (agent-infra#2028)\n' "${GH_BOUND_TRIP:-}" >> "$LOG" 2>/dev/null || true
+  GH_BOUND_TRIP=3
+fi
+GH_BOUND_STATE="$O/state/gh-bound-trips"
+# `scripts/lib/bounded.sh` is the ONE bounded-execution helper (#2046: `timeout` -> `gtimeout` -> an
+# internal watchdog, because macOS ships neither `timeout` nor, without Homebrew, `gtimeout`). It is not
+# part of the flat `$O` seed, so look beside the RUNNING script as well: the daemon execs
+# `<pin root>/<sha12>/scripts/orchestrator-harness/orch-loop.sh`, whose sibling `../lib/bounded.sh` is
+# present at every pin, and the farmed copy covers a box that runs this file from `~/.pi/agent/scripts/`.
+_ghb_lib=""
+for _ghb_cand in "$O/lib/bounded.sh" "${_HERE_RS:-/nonexistent}/../lib/bounded.sh" "${HOME:-/nonexistent}/.pi/agent/scripts/lib/bounded.sh"; do
+  if [ -f "$_ghb_cand" ]; then _ghb_lib="$_ghb_cand"; break; fi
+done
+GH_BOUND_OFF=0
+if [ -n "$_ghb_lib" ] && . "$_ghb_lib" 2>/dev/null && command -v tb_timeout >/dev/null 2>&1; then
+  GH_BOUND_HOW="$(tb_watchdog_description 2>/dev/null)"
+  rm -f "$O/state/gh-bound" 2>/dev/null || true
+  printf '[bound] gh calls bounded at %ss (%s), %s per cycle before the rest fail fast — agent-infra#2028\n' \
+    "$GH_BOUND_S" "${GH_BOUND_HOW:-?}" "$GH_BOUND_TRIP" >> "$LOG" 2>/dev/null || true
+else
+  # ⛔ DEGRADED, DISCLOSED, AND NOT A REFUSAL. A controller that refused to START because a bound it
+  # cannot find is missing would be a worse outage than the bound prevents — the same stance #2320 takes
+  # for `ensure_agent_gh_real` ("a controller that refuses to start because its gh could not be pinned
+  # would be a worse failure than the one this prevents"). It is not silent: the degradation is recorded
+  # in `state/gh-bound` for a reader AND printed by every cycle at the point the counter is reset.
+  GH_BOUND_OFF=1
+  GH_BOUND_HOW="UNRESOLVED (no bounded.sh in $O/lib, ${_HERE_RS:-?}/../lib or ~/.pi/agent/scripts/lib)"
+  printf 'DEGRADED %s — gh calls are UNBOUNDED (rc=124 cannot happen; a hung gh call can still pin the cycle)\n' \
+    "$GH_BOUND_HOW" > "$O/state/gh-bound" 2>/dev/null || true
+  printf '[bound] ⚠️ DEGRADED: %s — gh calls are UNBOUNDED. Fix: ship lib/bounded.sh beside the harness (it is in scripts/lib/).\n' \
+    "$GH_BOUND_HOW" >> "$LOG" 2>/dev/null || true
+fi
+# gh_trips_read — how many calls have hit the bound in the CURRENT cycle. `read` with a redirect is a
+# BUILTIN, so this costs no fork inside the `$( )` call sites below.
+gh_trips_read() {
+  _ghb_n=0
+  if [ -f "$GH_BOUND_STATE" ]; then
+    read -r _ghb_n 2>/dev/null < "$GH_BOUND_STATE" || _ghb_n=0
+    case "${_ghb_n:-}" in ''|*[!0-9]*) _ghb_n=0 ;; esac
+  fi
+  return 0
+}
+# gh_bounded <gh args...> — `gh` under a hard wall-clock bound, plus this cycle's trip latch.
+# Returns the call's OWN status, or 124 when the bound fired (GNU `timeout`'s code — every call site here
+# already treats a non-zero status as a failed read, and a failed read is what an unbounded hung call
+# never gets to be). A bounded call is otherwise BYTE-FOR-BYTE transparent: same stdout, same stderr,
+# same status on the success path.
+# ⛔ NOTHING IS EVER PRINTED TO STDOUT OR STDERR: several call sites capture `2>&1` and PARSE the merged
+# bytes (`gh pr view --json …`), and the shim's own contract is that a note never rides a good answer.
+# Every diagnostic goes to $LOG, which no caller parses.
+gh_bounded() {
+  [ "$#" -gt 0 ] || return 125
+  if [ "${GH_BOUND_OFF:-0}" = "1" ]; then command gh "$@"; return $?; fi
+  gh_trips_read
+  # TRIPPED: no fork, no socket, no queue position — and no second log line (the trip already printed).
+  if [ "$_ghb_n" -ge "$GH_BOUND_TRIP" ]; then return 124; fi
+  # ⛔ THE WATCHDOG LIST IS PUT BACK, NOT APPENDED TO. `tb_timeout` records every watchdog it forks so a
+  # caller's EXIT trap can TERM them; it has already `wait`ed this one by the time it returns, so its
+  # record is dead weight — and this loop outlives a month of cycles, where dead pids accumulate. A
+  # caller-set TB_WATCHDOGS is left exactly as it was found.
+  _ghb_wd="${TB_WATCHDOGS:-}"
+  tb_timeout "$GH_BOUND_S" gh "$@"
+  _ghb_rc=$?
+  TB_WATCHDOGS="$_ghb_wd"
+  if [ "$_ghb_rc" -eq 124 ]; then
+    printf '%s\n' "$(( _ghb_n + 1 ))" > "$GH_BOUND_STATE" 2>/dev/null || true
+    case "${1:-?}" in
+      merge|rerun|ready) _ghb_what="a MUTATING gh ${1} (outcome UNKNOWN — the next cycle's state re-read decides, which every arm here already does on a failed call)" ;;
+      *)                 _ghb_what="a gh ${1} read" ;;
+    esac
+    printf '[bound] %s hit the %ss bound and was killed (rc=124) — %s of %s this cycle%s\n' \
+      "$_ghb_what" "$GH_BOUND_S" "$(( _ghb_n + 1 ))" "$GH_BOUND_TRIP" \
+      "$([ "$(( _ghb_n + 1 ))" -ge "$GH_BOUND_TRIP" ] && printf ', so the REST of this cycle fails fast without calling gh')" >> "$LOG" 2>/dev/null || true
+  fi
+  return "$_ghb_rc"
+}
+# END gh-bound
 # ── THE WORKER LAUNCHER (worker-terminal.sh) ────────────────────────────────────
 # Every worker this loop starts — fixers, reviewers, rail workers — is started, counted and killed
 # through ONE module. That is not tidiness: the launcher, the census the caps read, and the reaper
@@ -3590,7 +3716,7 @@ spawn_gate_tok() {
 # The polarity is the same ALLOW-LIST the sweep's classifier and fix-one.sh use (#1714): a state this
 # code has never seen is RED, never "not in the red set".
 head_reds() {
-  gh pr checks "$1" --repo "$OR" --json name,state 2>/dev/null | python3 -c '
+  gh_bounded pr checks "$1" --repo "$OR" --json name,state 2>/dev/null | python3 -c '
 import sys, json
 try:
     d = json.load(sys.stdin)
@@ -3845,7 +3971,7 @@ cascade_main_probe() {
   # helper prints GREEN, and a blind read becomes an all-clear — the fail-open this probe exists to
   # avoid. The rc is checked before anything is interpreted.
   local rows rc
-  rows="$(gh api "repos/$repo/commits/main/check-runs?per_page=100&filter=all" --paginate \
+  rows="$(gh_bounded api "repos/$repo/commits/main/check-runs?per_page=100&filter=all" --paginate \
         --jq '.check_runs[] | [.id, (.app.slug // "?"), (.name // "?"), (.status // ""), (.conclusion // "")] | @tsv' 2>/dev/null)"
   rc=$?
   if [ "$rc" -ne 0 ]; then
@@ -4188,7 +4314,7 @@ res_line() {
     /mds_stores|mds$/ {m+=$1}
     END {printf "opendirectoryd=%.0f%% automountd=%.0f%% kernel_task=%.0f%% fseventsd=%.0f%% mds=%.0f%%", o,a,k,f,m}')"
   # GitHub API ceiling — a capacity limit that is NOT on this machine
-  rate="$(gh api rate_limit --jq '.resources.graphql | "\(.remaining)/\(.limit)"' 2>/dev/null)"
+  rate="$(gh_bounded api rate_limit --jq '.resources.graphql | "\(.remaining)/\(.limit)"' 2>/dev/null)"
   echo "[res] cpu(${cpu:-?}) | mem(${pmem:-?}) | swap(${swapfree:-?}/${swaptotal:-?}) | disk(${dline:-?}) | procs=$procs runnable=$runnable | svc(${svcs:-?}) | gh_gql=${rate:-?}" >> "$LOG"
 }
 review_slots() { # <unowned_prs>
@@ -4371,7 +4497,7 @@ open_pr_count() { # -> echoes the open-PR count; never 0 on failure; writes stat
   # ⛔ THE BRANCH TRAVELS WITH THE ROW BECAUSE OWNERSHIP IS A LIVE FACT PER PR (2026-10-18). The
   # predicate is "a running process's cwd is a checkout of this PR's head ref", so the head ref has
   # to be in the row. A git ref cannot contain ':', so ':' stays an unambiguous separator.
-  if raw="$(gh pr list --repo "$OR" --state open --limit 300 \
+  if raw="$(gh_bounded pr list --repo "$OR" --state open --limit 300 \
              --json number,headRefOid,headRefName \
              --jq '"\(length) \(map("\(.number):\(.headRefOid):\(.headRefName)") | join(" "))"' \
              2>"$O/state/.open-err.$$")"; then
@@ -4883,6 +5009,16 @@ while true; do
   # interval, which is why `boot` covers the fork probe: a fork probe that costs seconds is exactly
   # the kind of structural cost this instrument exists to surface.
   stg_cycle_reset
+  # ── agent-infra#2028: the gh bound's PER-CYCLE trip latch starts empty ────────────────────────
+  # ⛔ FORK-FREE ON PURPOSE. `:` and `printf` are builtins and `>` is a redirect; `rm` would be a fork,
+  # and this line sits ABOVE `fork_gate` — the one place in the file where a failed fork TERMINATES the
+  # controller (#2293). A truncated file reads as 0 trips in `gh_trips_read`, which is exactly right.
+  : > "$GH_BOUND_STATE" 2>/dev/null || true
+  # ⛔ A DEGRADED BOUND IS DISCLOSED EVERY CYCLE, NOT ONCE AT STARTUP: a log read by `tail` must be able
+  # to tell "bounded" from "unbounded" from this cycle's own lines (agent-infra#2028).
+  if [ "${GH_BOUND_OFF:-0}" = "1" ]; then
+    printf '[bound] ⚠️ DEGRADED this cycle: %s — gh calls are UNBOUNDED (agent-infra#2028)\n' "${GH_BOUND_HOW:-?}" >> "$LOG" 2>/dev/null || true
+  fi
   # ── 0) FORK HEADROOM, BEFORE THE FIRST FORK OF THE CYCLE (agent-infra#2293) ───────────────────
   # ⛔ THIS BLOCK MUST STAY ABOVE `date`/`git`/`gh`/ANY `$( )`. A box that cannot fork dies on the
   # first spawn (measured: bash exits, rc 254), so a gate placed after the clock is a gate that never
@@ -5270,7 +5406,7 @@ while true; do
     # them this cycle. Named on every per-PR row rather than folded into the generic string.
     SWEEP_CACHE_NOTE="the sweep is DEFERRED (rate-limited until ${DEFER_UNTIL}) — no listing was requested, so no PR was read this cycle"
   else
-    if SWEEP_RAW="$(gh api --paginate -i ${COND[@]+"${COND[@]}"} --jq \
+    if SWEEP_RAW="$(gh_bounded api --paginate -i ${COND[@]+"${COND[@]}"} --jq \
         ".[]|{number,headRefName:.head.ref,isDraft:.draft,created:.created_at,sha:.head.sha}|select((.isDraft|not) or (.headRefName|test(\"-tm$|-cap$|^fix/\")))|$SEL|\"\(.number)\t\(.headRefName)\t\(.isDraft)\t\(.created)\t\(.sha)\"" \
         "repos/$OR/pulls?state=open&per_page=100" 2>"$O/state/.sweep-err.$$")"; then
       SWEEP_RC=0
@@ -5889,7 +6025,7 @@ while true; do
       # `(not draft) or (branch matches the OWN pattern)`, so a draft that reaches this loop IS
       # selected for action and `gh pr ready` is that action. Recording it as a wait would write a
       # false wait onto an acted PR — the inverse of the defect this change removes.
-      if gh pr ready "$PR" --repo "$OR" >/dev/null 2>&1; then
+      if gh_bounded pr ready "$PR" --repo "$OR" >/dev/null 2>&1; then
         echo "#$PR readied (was a draft)" >>"$LOG"; disp "$PR" - - act "draft readied"
       else
         echo "#$PR draft: 'gh pr ready' FAILED — it will be retried next cycle" >>"$LOG"
@@ -5897,7 +6033,7 @@ while true; do
       fi
       continue
     fi
-    PR_ST="$(gh pr view "$PR" --repo "$OR" --json state --jq .state 2>/dev/null)"
+    PR_ST="$(gh_bounded pr view "$PR" --repo "$OR" --json state --jq .state 2>/dev/null)"
     # CLOSED too: a PR listed open can close between `gh pr list` and here. The retired sweep.sh
     # guarded both; the live rewrite kept only MERGED, so a closed PR fell through to
     # `gh pr ready` + `gh pr merge` every cycle and logged `#<PR> merge fail` forever.
@@ -5924,7 +6060,7 @@ while true; do
       rm -f "$O/state/redfix-$PR" 2>/dev/null || true
       rm -f "$O/state/fixgate-$PR-"* 2>/dev/null || true
       disp "$PR" - - wait "${PR_ST:-closed} since the count was read (nothing to do)"; continue ;; esac
-    HEAD_N="$(gh pr view "$PR" --repo "$OR" --json headRefOid --jq .headRefOid 2>/dev/null)"
+    HEAD_N="$(gh_bounded pr view "$PR" --repo "$OR" --json headRefOid --jq .headRefOid 2>/dev/null)"
     # ── THE DURABLE CLAIM DECIDES BEFORE ANY ARM ACTS (agent-infra#2466) ──────────────────────
     # ⛔ THIS IS THE SELECTION POINT, and it is the one place where a second controller's work is
     # invisible: everything below (`redfix`, the parked guard, the spawn guards, the GREEN arm that
@@ -6334,7 +6470,7 @@ while true; do
     # Two copies of these rules is exactly how the harness and the merge rail disagreed before (#1714),
     # so the arm calls this file instead of a lookalike. `$_CK_PY` is resolved once at startup (see
     # there) and is an ABSOLUTE path, so this pipeline's subshell inherits it.
-    V="$(gh pr checks "$PR" --repo "$OR" --json name,state,workflow 2>/dev/null | REQ="$REQ" REVIEW_GATE="$REVIEW_GATE" python3 "${_CK_PY:-/nonexistent/check-class.py}" 2>/dev/null)"
+    V="$(gh_bounded pr checks "$PR" --repo "$OR" --json name,state,workflow 2>/dev/null | REQ="$REQ" REVIEW_GATE="$REVIEW_GATE" python3 "${_CK_PY:-/nonexistent/check-class.py}" 2>/dev/null)"
     # ⛔ AN EMPTY VERDICT IS A READ FAILURE, NEVER A CLASS (#3110). `check-class.py` ALWAYS prints one
     # token, so `V` empty means the classifier never answered at all — a python that could not start, a
     # file that vanished between the startup guard and this line, a killed pipeline. That reached the
@@ -6449,7 +6585,7 @@ while true; do
     # `[redfix:end]` close); only the actual conflict repair is level 3.
     case "$V" in
       GREEN|PENDING:*)
-        MSTAT="$(gh pr view "$PR" --repo "$OR" --json mergeable --jq .mergeable 2>/dev/null)"
+        MSTAT="$(gh_bounded pr view "$PR" --repo "$OR" --json mergeable --jq .mergeable 2>/dev/null)"
         if [ "${MSTAT:-}" = "CONFLICTING" ]; then
           stg_lvl_start l3_fix || :   # a conflicting PR is repaired: cascade level 3
           # A bailed fixer must not have consumed an attempt here (P2, second review round).
@@ -6507,7 +6643,7 @@ while true; do
         # job is to shrink the open-PR queue. Crediting it here is what lets a record answer "was
         # the long cycle merging, fixing, reviewing, or none of the above".
         stg_lvl_start l2_merge || :
-        gh pr ready "$PR" --repo "$OR" >/dev/null 2>&1 || true
+        gh_bounded pr ready "$PR" --repo "$OR" >/dev/null 2>&1 || true
         # ⛔ ONLY WHERE GREEN MEANS THE EVIDENCE EXISTS (review round 2, P2 — agent-infra#2132). On a
         # RAIL repo `ai-review-gate` is not in `$REQ`, so V=GREEN means "the required checks pass",
         # NOT "a reviewer recorded something" — the exact premise agent-infra#1825 exists to refute.
@@ -6564,7 +6700,7 @@ while true; do
           # ANY authority that was not `rail` — INCLUDING `unknown` — reached a RAW `gh pr merge`,
           # the exact bypass this whole change exists to prevent. Allow-list polarity: a raw merge
           # happens only on an authority that NAMES the gate.
-          if gh pr merge "$PR" --repo "$OR" --squash >>"$LOG" 2>&1; then
+          if gh_bounded pr merge "$PR" --repo "$OR" --squash >>"$LOG" 2>&1; then
             echo "#$PR MERGED" >>"$LOG"; disp "$PR" "${HEAD_N:-}" GREEN act "merged (gate authority)"
           else
             echo "#$PR merge fail" >>"$LOG"; disp "$PR" "${HEAD_N:-}" GREEN wait "gate-authority merge FAILED (retried next cycle)"
@@ -6580,9 +6716,9 @@ while true; do
         # not doing — and on a rail repo, where PENDING is the majority state, the field answered "was
         # this cycle fixing?" for a cycle that was only waiting to merge.
         stg_lvl_start l2_merge || :
-        gh pr ready "$PR" --repo "$OR" >/dev/null 2>&1 || true
+        gh_bounded pr ready "$PR" --repo "$OR" >/dev/null 2>&1 || true
         if [ "$MERGE_AUTHORITY" = "gate" ]; then
-          if gh pr merge "$PR" --repo "$OR" --squash --auto >>"$LOG" 2>&1; then
+          if gh_bounded pr merge "$PR" --repo "$OR" --squash --auto >>"$LOG" 2>&1; then
             echo "#$PR auto-armed" >>"$LOG"; disp "$PR" "${HEAD_N:-}" "$V" act "auto-merge armed (gate authority)"
           else
             disp "$PR" "${HEAD_N:-}" "$V" wait "auto-merge arm FAILED (retried next cycle)"
@@ -7010,7 +7146,7 @@ while true; do
           # now that every arm settles its own, it would have been attributed to NO level at all. Its
           # `gh pr checks` RID lookup and `gh run rerun` are both CI repair work.
           stg_lvl_start l3_fix || :
-          RID="$(gh pr checks "$PR" --repo "$OR" --json name,link --jq '.[]|select(.name=="python-ci-gate")|.link' 2>/dev/null | sed -nE 's#.*/runs/([0-9]+).*#\1#p')"
+          RID="$(gh_bounded pr checks "$PR" --repo "$OR" --json name,link --jq '.[]|select(.name=="python-ci-gate")|.link' 2>/dev/null | sed -nE 's#.*/runs/([0-9]+).*#\1#p')"
           # ⛔ A RERUN IS A CI-SPENDING ACT, so it is gated like one (#2333 review P2). `gh run rerun`
           # enqueues work on the same runners the gate is holding work OUT of — the one surface in
           # this sweep that ADDS queue while the gate says "do not". Reviewing, re-recording and
@@ -7030,7 +7166,7 @@ while true; do
               echo "#$PR CI rerun WITHHELD by the ci-queue gate — this PR already has a disposition row this cycle, so it is left standing rather than overwritten" >> "$LOG"
             fi
           elif [ -n "${RID:-}" ] && [ ! -f "$O/state/rerun-$PR-$RID" ]; then
-            if gh run rerun "$RID" --repo "$OR" --failed >>"$LOG" 2>&1; then
+            if gh_bounded run rerun "$RID" --repo "$OR" --failed >>"$LOG" 2>&1; then
               touch "$O/state/rerun-$PR-$RID"; echo "#$PR rerun CI" >>"$LOG"
               _prior="$(awk -F'\t' -v p="$PR" '$1==p && $4=="act"{printf "%s", $5}' "$PRDISP" 2>/dev/null | tail -1)"
               if [ -n "${_prior:-}" ]; then
