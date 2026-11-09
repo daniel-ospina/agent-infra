@@ -1424,6 +1424,38 @@ ck "a NEW fix round also clears apiretry / headmoved / lastdisp (a stale disposi
    $([ ! -f "$OT/state/lanemerge-32.apiretry" ] && [ ! -f "$OT/state/lanemerge-32.headmoved" ] \
       && [ ! -f "$OT/state/lanemerge-32.lastdisp" ] && echo 0 || echo 1)
 
+# ⛔ AND THE CHECK WAIT HAS A *SECOND* BOUND THAT IS NOT THIS FILE'S CLOCK (#3584 review, P1 — MEASURED).
+# `WAIT_S` is spent inside ONE tool call, under `lane-bound.sh watch`, whose bound is IDLE (`LANE_BOUND_IDLE_S`,
+# default 2700 s) and whose only working progress arm for a polling loop is LANE-LOG GROWTH. Measured on this
+# change's own review: `lane-bound.sh run --idle 60 -- … bash lane-merge.sh 99 --checks-tsv <in-flight>`
+# returned `verdict=stalled … bytes_delta=0 cpu_delta_cs=0` at 75 s and wrote NO verdict — the CPU arm cannot
+# see a poll's short-lived `gh`/`python3` child (`ps time` reports accumulated time of processes still ALIVE).
+# These arms pin both halves of the fix: the heartbeat the watchdog needs, and the self-cap that keeps an
+# unhearted wait from out-reaching the bound that would kill the lane UNLABELLED (`lane.sh`'s
+# "NO merge-phase verdict", no PR comment, no resumable counter) — strictly worse than the 1500 s bound.
+ck "the check wait is bounded by the WATCHDOG's progress allowance too, not only by this file's clock (the measured 2700 s idle bound is named, and an unhearted wait CAPS itself instead of out-reaching it)" \
+   $(grep -q 'LANE_BOUND_IDLE_S:-2700' "$SCRIPT" && grep -q 'the check wait is CAPPED at' "$SCRIPT" \
+     && grep -q 'heartbeat' "$SCRIPT" && echo 0 || echo 1)
+# (1) the heartbeat the watchdog reads. Pre-fix this file wrote NOTHING: `log_line` is stdout, and a `-p`
+# lane's stdout reaches no log, so the wait was silent for its whole length.
+new_o "$T/pr4.tsv"
+: > "$T/hb-38.log"
+WAIT_S=2 LANE_MERGE_HB="$T/hb-38.log" run 38 --repo o/r --pr-tsv "$T/pr4.tsv" --checks-tsv "$T/checks-inflight.tsv"
+ck "the check wait writes a WATCHDOG-VISIBLE heartbeat every poll (LANE_MERGE_HB) — an unhearted wait is killed as 'stalled' with no verdict" \
+   $([ "$RC" = 11 ] && grep -q '\[lane-merge\] heartbeat' "$T/hb-38.log" && echo 0 || echo 1)
+# …and the target is DISCOVERED without any operator wiring when the lane's own log exists (`--issue` →
+# `$O/logs/lane-<issue>.log`, the file `lane.sh` writes and `run_agent` hands the watchdog as `--log`).
+new_o "$T/pr4.tsv"
+: > "$OT/logs/lane-33.log"
+WAIT_S=6 POLL_S=5 LANE_BOUND_IDLE_S=5 run 33 --issue 33 --repo o/r --pr-tsv "$T/pr4.tsv" --checks-tsv "$T/checks-inflight.tsv"
+ck "…and the heartbeat target is the LANE's own log by DEFAULT (no operator wiring), so the full wait is allowed rather than capped" \
+   $([ "$RC" = 11 ] && grep -q '\[lane-merge\] heartbeat' "$OT/logs/lane-33.log" && ! grep -q 'CAPPED at' <<<"$OUT" && echo 0 || echo 1)
+# (2) the self-cap when no target resolves: the wait must land BELOW the watchdog's allowance, WITH a verdict.
+new_o "$T/pr4.tsv"
+WAIT_S=60 POLL_S=5 LANE_BOUND_IDLE_S=20 run 34 --repo o/r --pr-tsv "$T/pr4.tsv" --checks-tsv "$T/checks-inflight.tsv"
+ck "with NO heartbeat target the check wait CAPS itself below lane-bound.sh's allowance (60 s wait, 20 s allowance → 10 s) and still writes WAITING_CHECKS, instead of waiting to be killed unlabelled" \
+   $([ "$RC" = 11 ] && [ "$(verdict_of 34 | cut -d' ' -f1)" = WAITING_CHECKS ] && grep -q 'CAPPED at 10s' <<<"$OUT" && echo 0 || echo 1)
+
 # ── 19. an EMPTY PR read must not blank the head or read as merged (E7) ────────────────────────
 new_o "$T/pr25.tsv"
 sleep 120 & SPID2=$!
