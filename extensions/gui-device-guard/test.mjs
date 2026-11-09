@@ -442,6 +442,32 @@ const ROWS = [
   ["A51 the ALLOW twin of L31a: `electron-forge package` BUILDS, it does not launch",
     "npx electron-forge package", 0, null, false],
   ["A52 …and `lint` inspects rather than launches", "npx electron-forge lint", 0, null, false],
+  // ── L32 (round-12 review round 2, P2) — a PROCESS SUBSTITUTION runs its body in a
+  //     subshell, exactly like `$(…)`: `diff <(echo RAN) /dev/null` prints `1d0 < RAN`
+  //     (measured). Only `$(` and backticks were scanned, so every `<(`/`>(` spelling
+  //     was `[]` — no refusal AND no ledger row, on a class the README already claims
+  //     to recurse into, and one the residual list did not declare. A55 keeps the
+  //     double-quoted spelling as DATA: `echo "<(npm exec electron .)"` prints the
+  //     text (measured) — bash does not run it inside quotes, while it DOES run `"$(…)"`.
+  ["L32a a process substitution `<(...)` runs its body (was [])",
+    "diff <(npm exec electron .) /dev/null", 1, "electron", true],
+  ["L32b …the `< <(...)` spelling", "cat < <(npm exec electron .)", 1, "electron", true],
+  ["L32c …and the OUTPUT-direction `>(...)` spelling",
+    "tee > >(npm exec electron .)", 1, "electron", true],
+  ["A54 the ALLOW twin: a benign process substitution stays data",
+    "diff <(ls) /dev/null", 0, null, false],
+  ["A55 …and a DOUBLE-QUOTED `<(…)` is literal text, not a substitution",
+    'echo "<(npm exec electron .)"', 0, null, false],
+  // ── L33 (round-12 review round 2, P3) — the inner-binary shape must not depend on
+  //     which rule is asking. `bundleInnerBinary` lived only in the `open` arm, so
+  //     `open Contents/MacOS/DMeer` fired (L30b) while the SAME token as the COMMAND
+  //     WORD — which executes the bundle's binary — was `[]`, against the comment on
+  //     `bundleInnerBinary` and README's "in both spellings". A56 is the ALLOW twin:
+  //     the DIRECTORY is not the binary.
+  ["L33a a bundle's inner binary as the COMMAND WORD (was [])",
+    "Contents/MacOS/DMeer", 1, "electron", true],
+  ["A56 the ALLOW twin: the `Contents/MacOS` DIRECTORY is not the binary",
+    "ls Contents/MacOS", 0, null, false],
   // ── A34–A41 — ALLOW twins for L24/L25 AND for round 7's P2-5 over-fire. The
   //     fail-safe word scan is now gated on the prefix having SKIPPED A FLAG: with
   //     no flag between the prefix and the command word, nothing could have

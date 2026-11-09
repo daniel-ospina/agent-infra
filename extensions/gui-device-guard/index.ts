@@ -45,7 +45,8 @@
  * ── WRAPPERS AND SUBSTITUTIONS ARE RE-READ, NOT DECLARED AWAY ───────────────
  * `bash -c "<cmd>"` and its ATTACHED spelling `bash -c"<cmd>"`, `sh -c`,
  * `sudo bash -lc`, `eval …`, and the body of
- * `$( … )` / backticks are RECURSED INTO (bounded to 3 levels), because the
+ * `$( … )` / a process substitution `< ( … )` / `> ( … )` / backticks are RECURSED
+ * INTO (bounded to 3 levels), because the
  * command string is argv and can be classified. Review cycle 1 (F2) found these
  * were an UNDECLARED bypass of R2 while the header claimed completeness — and
  * `bash -c` is a shape `AGENTS.md` hands lanes routinely. Playwright's `codegen`
@@ -1001,8 +1002,8 @@ function bundleInnerBinary(tok: string): boolean {
 }
 
 /**
- * The bodies of every command substitution in a command line — `$( … )` and
- * `` ` … ` `` — that is NOT inside single quotes.
+ * The bodies of every command substitution in a command line — `$( … )`, `<( … )`,
+ * `>( … )` and `` ` … ` `` — that EXECUTES.
  *
  * ⛔ SINGLE-QUOTED MATTERS (review cycle 1, F2's twin). `unquotedMask` cannot be
  * used here: it masks `$(…)` inside DOUBLE quotes too, and a double-quoted
@@ -1010,16 +1011,39 @@ function bundleInnerBinary(tok: string): boolean {
  * A single-quoted one is literal text, and treating it as a launch is the exact
  * false BLOCK this guard already paid for once (`git commit` message bodies).
  * Parenthesis depth is counted so `$(a $(b))` yields the outer body whole.
+ *
+ * ⛔ A PROCESS SUBSTITUTION IS THE SAME CLASS AND WAS AN UNDECLARED MISS (round-12
+ * review, P2). `<( … )` and `>( … )` run their body in a subshell and hand its
+ * /dev/fd to the command — bash executes the body (`diff <(echo RAN) /dev/null`
+ * prints `1d0 < RAN`, measured) — yet only `$(` was scanned, so `diff <(npm exec
+ * electron .) /dev/null`, `cat < <(npm exec electron .)` and `tee > >(npm exec
+ * electron .)` were all `[]`: no refusal AND no ledger row, on the shape the
+ * README already claims to recurse into ("the body of `$( … )` or backticks").
+ * ⛔ AND IT IS NOT EXECUTED INSIDE DOUBLE QUOTES: `echo "<(npm exec electron .)"`
+ * prints the text (measured), so that spelling must stay data — which is why the
+ * `<(`/`>(` arm is gated on the double-quote state while the `$(` arm is not.
  */
 export function extractSubstitutions(command: string): string[] {
   const bodies: string[] = [];
   let i = 0;
+  // Double-quote state, tracked ONLY for the process-substitution arm (a `$(`
+  // inside double quotes still executes, and is handled exactly as before).
+  let dq = false;
   while (i < command.length) {
     const ch = command[i];
+    if (ch === "\\" && i + 1 < command.length) {
+      i += 2;
+      continue;
+    }
     if (ch === "'") {
       // Skip a single-quoted run wholesale.
       const end = command.indexOf("'", i + 1);
       i = end === -1 ? command.length : end + 1;
+      continue;
+    }
+    if (ch === '"') {
+      dq = !dq;
+      i++;
       continue;
     }
     if (ch === "`") {
@@ -1029,7 +1053,10 @@ export function extractSubstitutions(command: string): string[] {
       i = end + 1;
       continue;
     }
-    if (ch === "$" && command[i + 1] === "(") {
+    if (
+      (ch === "$" && command[i + 1] === "(") ||
+      (!dq && (ch === "<" || ch === ">") && command[i + 1] === "(")
+    ) {
       // ⛔ QUOTE STATE, NOT A BARE DEPTH COUNTER (review cycle 3, F3).
       // `echo "$(echo ")"; npm exec electron .)"` closes the body early at the
       // `)` inside the quoted string, the remainder is dropped, and the launch
@@ -1205,8 +1232,17 @@ function classifySegment(
   // R-electron: `electron .`, `npx electron .`, `npm exec electron -- .`,
   // `npx electron-forge start`, or a binary inside an Electron bundle.
   const bundle = index >= 0 ? appBundleBinary(toks[index]) : null;
+  // ⛔ THE INNER-BINARY SHAPE MUST NOT DEPEND ON WHICH RULE IS ASKING (round-12
+  // review, P3). `bundleInnerBinary` was consulted only in the `open` arm, so
+  // `open Contents/MacOS/DMeer` fired while the SAME token as the COMMAND WORD —
+  // which executes the bundle's binary — was `[]`: no refusal, no ledger row, and
+  // the comment above `bundleInnerBinary` plus the README both claim the two
+  // spellings agree. An ABSOLUTE `…/X.app/Contents/MacOS/X` is already caught by
+  // `appBundleBinary`; this term is the RELATIVE spelling (and any bundle whose
+  // `.app` is not in the token, e.g. a cwd inside the bundle).
+  const inner = bundle === null && bundleInnerBinary(headTok) ? headTok : null;
   const forge = isElectronForge(headTok) && forgeLaunches(toks, (index >= 0 ? index : cwi) + 1);
-  if (bundle || head === "electron" || forge) {
+  if (bundle || inner !== null || head === "electron" || forge) {
     return {
       rule: "electron",
       app: bundle ?? "Electron",
@@ -1457,8 +1493,10 @@ export function classifyLaunchCommand(command: string, depth = 0): LaunchFinding
     }
   }
 
-  // R-substitution: the body of `$( … )` / backticks executes, so it is
-  // classified as its own command line. Recurse rather than declare.
+  // R-substitution: the body of `$( … )` / `< ( … )` / `> ( … )` / backticks
+  // executes, so it is classified as its own command line. Recurse rather than
+  // declare. (`extractSubstitutions` gates the process-substitution spellings on
+  // the double-quote state; a quoted `< ( … )` is literal text.)
   if (depth < MAX_WRAPPER_DEPTH) {
     for (const sub of extractSubstitutions(body)) {
       findings.push(...classifyLaunchCommand(sub, depth + 1));

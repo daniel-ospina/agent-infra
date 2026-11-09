@@ -78,10 +78,12 @@ want every GUI launch regardless, drop the filter: `jq -c '.' …`.
 ## Wrappers and substitutions are RE-READ, not declared away
 
 `bash -c "<cmd>"`, `sh -c`, `sudo bash -lc`, `flock … -c "<cmd>"`, `eval …`, and
-the body of `$( … )` or backticks are **recursed into** (bounded to 3 levels) — the
+the body of `$( … )`, a PROCESS substitution `< ( … )` / `> ( … )` (no space), or
+backticks are **recursed into** (bounded to 3 levels) — the
 command string is argv and can be classified. Playwright's `codegen` and `open`
 subcommands are headed **by default**, and a `PWDEBUG` exported in an earlier
-segment applies to the whole line.
+segment applies to the whole line. A `< ( … )` inside DOUBLE QUOTES is literal text
+and stays data — unlike `"$( … )"`, which bash does execute.
 
 **Wrapper words are prefixes.** `setsid`, `caffeinate`, `arch`, `taskset`, `flock`,
 `script`, `chrt`, `unbuffer`, `prlimit`, `numactl`, `builtin`, `busybox`,
@@ -292,7 +294,7 @@ This is a residual list, not a completeness claim:
 ## Tests
 
 ```bash
-node extensions/gui-device-guard/test.mjs                    # 229 assertions, threat table L1–L31 + handler H1–H15
+node extensions/gui-device-guard/test.mjs                    # 236 assertions, threat table L1–L33 + handler H1–H15
 node extensions/gui-device-guard/test.mjs --classify 'npm exec electron .'
 ```
 
@@ -303,8 +305,8 @@ stays green while `index.ts` is broken and the guard is inert in every session.
 Mutations are pinned, each attributable to the row it is about, all measured at
 ONE head (**this** head — re-measured, not carried over: the counts are the output
 of running the mutant against `test.mjs`, and the assertion total is
-`229 = 169 ROWS + 7 APP_ROWS + 53 explicit \`check()\` calls`): the Electron
-rule's `media` → `false` reds **97**; the wrapper recursion
+`236 = 176 ROWS + 7 APP_ROWS + 53 explicit \`check()\` calls`): the Electron
+rule's `media` → `false` reds **101**; the wrapper recursion
 removed reds **8**; the wrapper WORDS removed reds **2**; the structural rule that
 reads a package-runner anywhere in the segment removed reds **2** (L19h/L19i); the
 comment stripper removed reds **2** (L11d and L11f — re-measured at this head; the
@@ -347,7 +349,11 @@ separator) reds **2** (L29e, L29f — measured, and a regression the round-11 co
 did not have); accepting only a
 `.app` SUFFIX in `open`'s positional arm reds **4** (L30a/L30b and their two
 identity twins); dropping `electron-forge` from the electron head test reds **5**
-(L31a–L31e).
+(L31a–L31e); removing the PROCESS-substitution arm (`<( … )` / `>( … )`, the
+round-12 review's second P2) reds **3** (L32a–L32c, and A55 stays green because the
+double-quoted spelling never was a substitution); dropping the inner-binary term from
+the electron arm reds **1** (L33a — `Contents/MacOS/DMeer` as a COMMAND WORD, the
+spelling `open` already refused).
 
 ⛔ **The `<<<`-is-not-a-heredoc guard has no attributable red of its OWN, and is not
 claimed as covered on its own.** Dropping it leaves L28g GREEN, because the body
