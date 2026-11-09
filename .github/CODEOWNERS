@@ -81,7 +81,7 @@
 # dependency-free YAML reader the lock and the wiring guard both parse with; a
 # weakened reader is a weakened guard (its fail-open was #675's P1).
 /scripts/check-workflow-lock.mjs          @daniel-ospina
-/scripts/workflow-lock.json               @daniel-ospina
+/scripts/workflow-lock.d/                  @daniel-ospina
 /scripts/workflow-yaml.mjs                @daniel-ospina
 
 # Review-record writer + the in-session gates that consume its verdict

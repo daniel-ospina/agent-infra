@@ -38,7 +38,8 @@
  * THE CONTENT LOCK IS A CONSPICUOUSNESS TRIPWIRE, NOT A PR-UNEDITABLE CONTROL.
  * scripts/check-workflow-lock.mjs hashes `.github/workflows/ci.yml`,
  * `.github/workflows/node-ci.yml` and `.github/workflows/ci-main.yml`
- * byte-for-byte against scripts/workflow-lock.json. Every bypass above requires
+ * byte-for-byte, REGION BY REGION (one region per top-level key and one per job,
+ * #1955), against `scripts/workflow-lock.d/`. Every bypass above requires
  * EDITING one of those files, which changes its hash — there is nothing left to
  * enumerate. But the ONLY call site of `lockFindings()` is THIS script's own
  * copy, run from the PR-EDITABLE `.github/workflows/ci.yml`, so the lock is
@@ -2763,7 +2764,7 @@ test("workflow-lock.yml is wired to validate the MERGE RESULT, not the head (#67
   // trigger beside it re-opens everything the first one closes. Measured: adding
   // `on.pull_request: types: [edited]` next to the pinned block left this suite (124/124), the
   // `ci-trigger-scope` shard (33/33) AND the content lock green — `workflow-lock.yml` is not one of
-  // the three paths in `scripts/workflow-lock.json` — so `edited` came back one line away from the
+  // the three LOCKED_FILES (`scripts/workflow-lock.d/`, #1955) — so `edited` came back one line away from the
   // assertion that says it is gone. Every other object in this test is pinned by exact key set
   // (`permissions` above, `jobs`, `step.env`); `on:` was the one that was not.
   assert.deepEqual(
