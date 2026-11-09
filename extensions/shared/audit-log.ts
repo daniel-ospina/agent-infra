@@ -55,6 +55,41 @@ export const GATE_EVENT_NAMES = [
   "reviewer_preflight", // #2148: the reviewer requirement disclosed BEFORE the work (session_start → phase:"session_start", first push → phase:"first_push", refused op → phase:"block_recovery")
   "bridge_clear", // #561: scripts/vgate.sh clear — root-scoped bridge rewrite (type-documentation; vgate.sh appends raw JSONL)
   "review_spawn_no_verdict", // #2665: a reviewer spawn returned no verdict (attempt, NOT a dispatch)
+  "gate_recovery", // verification-gate: N verified entries were merged for `root` — the root the
+  //                   record NAMES, which is the discriminator (not the call site — THREE CALL
+  //                   SITES reach the ONE emit site, `index.ts` recoverBridgeForRoot). AT
+  //                   `session_start`, when `root` is NOT the session's own root the merge is
+  //                   INSPECTION-ONLY and it IS paired with `gate_recovery_foreign_root`; the
+  //                   entries are inert for git ops rooted elsewhere. When `root` IS the own root
+  //                   there, the merge is LIVE — it is the state that gates the op.
+  //                   `session_start` has two call sites, own-root (LIVE) and inspected sibling
+  //                   (INSPECTION-ONLY), and at most ONE of them emits: a sibling is only
+  //                   inspected when the own root has no entries (`pickVerifiedRoot` returns null
+  //                   otherwise).
+  //                   The git-op path is a THIRD call site and it emits only the LIVE shape, for
+  //                   the op's own resolved cwd — and it is NEVER paired with
+  //                   `gate_recovery_foreign_root`, because a hub session running
+  //                   `cd <linked-worktree> && git commit` legitimately recovers the worktree's
+  //                   entries with `root` != the session's root. So a session-keyed reader must
+  //                   NOT infer "inspection only" from `root` != its own root alone: inspection is
+  //                   the shape that emits BOTH rows. Read `root`, never the count alone (#1265).
+  "gate_recovery_empty", // verification-gate #264/#1265: a task child recovered ZERO entries for its own
+  //                          root — every changed-file commit will block. The REMEDY differs by class and
+  //                          the row CARRIES the class (`task_capable`, from `argvAllowsTask`), because a
+  //                          parent reading this log is deciding exactly one thing — wait, or re-verify and
+  //                          re-dispatch. task_capable=true: the child blocks until it dispatches its own
+  //                          VGATE verification (in-band). task_capable=false: the block is FINAL and the
+  //                          parent must act (#285 P1-A) — "until it self-verifies" is unreachable for it.
+  "gate_recovery_foreign_root", // verification-gate #1265: a same-repo sibling's entries were merged for
+  //                               INSPECTION only. They carry the sibling's root, so they are inert for
+  //                               git ops rooted at the SESSION'S OWN root (`index.ts`'s root filter) — a
+  //                               later op that `cd`s into the sibling resolves to the SIBLING's root,
+  //                               where those same entries are LIVE (that is the `gate_recovery` shape
+  //                               above, not this one). The record exists so the non-adoption is durable and
+  //                               parent-readable, not only a child's stdout line
+  "gate_root_mismatch", // verification-gate #3255/#1265: a git op resolved to a root the bridge holds no
+  //                        entries for while a same-repo sibling has them — hashes cannot be compared. The
+  //                        block decision is unchanged; this is the durable half of the diagnosis (AC (b))
   // #3297: the argv-level gh shim (#984) was NOT LOADED on this box, so the admin-merge gate
   // refused to certify a merge. Recorded as an EVENT, not only as console prose: row 1 of
   // docs/ops/ACTIVATION-MATRIX.md promises a report can read the degraded state without
