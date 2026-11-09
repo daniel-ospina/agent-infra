@@ -204,7 +204,7 @@ _lc_refusal_exit() {
 # template cannot silently fail to reach the controller.
 CONTROLLER_ENV="PATH HOME OR REPO O ORC_STATE_DIR HARNESS_PIN HARNESS_PIN_FILE HARNESS_PIN_DIR HARNESS_REPO HARNESS_MATERIALISER SCOPE MAX_LOAD MAX_LANES MAX_REVIEW MERGE_PRIORITY_AT MERGE_PRIORITY_MAX_AGE_MIN FUNNEL_MAX_AGE_MIN MAX_FIX MAX_FIX_TRIES MAX_RED_FIX MAX_RED_FIX_TRIES MIN_SWAP_FREE MIN_MEM_FREE_MB MEM_MIN_AVAIL_MB MEM_LANE_RESERVE_MB MEM_SPAWN_RESERVE_LANES BATCH PRODUCT_FLOOR CYC UV_CACHE_DIR UV_LINK_MODE ORCH_ENTRY ORC_CONTROLLER_ORIGIN"
 # ⛔ `ORC_STATE_DIR` IS FORWARDED BECAUSE THE WRAPPER ALREADY READS IT (fresh-context review of #3846,
-# P2). `_LC_STATE` above (`:157`) resolves the singleton witness from it, and `README.md`'s row calls it
+# P2). `_LC_STATE` above resolves the singleton witness from it, and `README.md`'s row calls it
 # "the way a launcher can name a state dir without impersonating the legacy variable" — so on the one
 # surface the #2095 incident happened on, a value the operator renders into the plist was STRIPPED
 # here before the pane saw it. That is the same presence-only-parity defect `ORC_CONTROLLER_ORIGIN` had
