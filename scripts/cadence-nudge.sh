@@ -833,7 +833,42 @@ _ract=$(printf '%s' "$res" | sed -n 's/.*| DO: \([A-Za-z-]*\).*/\1/p')
 # (keep the clause) if the gate itself cannot run: losing the whole DO line is worse.
 _g=$(printf '%s' "$doact" | /usr/bin/python3 "$HOME/.pi/agent/scripts/objective.py" --gate-clause "$res" 2>/dev/null)
 [ -n "$_g" ] && doact="$_g"
-MSG="[HEARTBEAT ${hms}] fleet ${fleet}. ${obj} ${res} ${prov}DO: ${doact} GOAL: ${goal} · GRAPH: the objectives + their order live in the TORTOISE GRAPH (read before deriving, write findings back) · ROLE: orchestrate — give each lane a LIST OF ISSUES, verify the ARTIFACT, and CHECK EVERY LANE IS MOVING; a lane that is stuck is yours to unstick (never implement, never decide for the owner) · MODEL: 6 lanes, each owning ISSUES END-TO-END (implement -> fresh-context review -> rail -> merge -> next issue); a PR is a STEP INSIDE AN ISSUE, never a queue item; A FINISHED ITEM IS THE TRIGGER TO START THE NEXT -- never stop between items, and budget/context is never a stopping reason (context auto-compacts); NO separate landing lanes and do NOT create new lanes -- retire as they finish · LANES: IN BOUNDS = ~/Documents/GitHub/tortoise AND agent-infra (BOTH fine to dispatch) · OUT OF BOUNDS = DMeer lanes (DMeer, DMeer - linkedin outreach, DMeer - marketing), a DIFFERENT repo/product — check the lane's cwd/name before every dispatch, never dispatch from a bare UUID list · NEXT: waiting>10 -> the PR queue gets the attention; otherwise merge and spend spare capacity on P0, then P1, then P2 product issues · PERIODIC: re-read the whole open issue list and ask whether the most customer-impactful ones are the ones prioritised; if the reclassification pass has an UNFINISHED progress file under state/, RESUME it from that file instead of restarting it · classify lanes by the decision tree (CPU-delta > child > tool-age > words; spinner is WEAK) · PR state from artifacts, never a queue row"
+# ── THE FLEET ADVANCE STANDING ORDER (#1993: the complementary half of #1991) ───────────────────
+# #1991 put the owner's FLEET ADVANCE order on the TICK. That file is not the only sender of a beat
+# and it is not the dominant one: THIS is. The derivation is from the two senders' own constants,
+# both clocked off the same log line — this file is due at `PULSE_MIN` (5 min, above), and it is
+# driven by `cadence-timer.sh` on a fixed `INTERVAL` of 450 s (7.5 min); the tick runs once per loop
+# pass (TARGET 540 s + up to 120 s sleep, i.e. >= 9 min) and then rate-limits ITSELF out whenever the
+# last beat is under `MIN_GAP_MIN` (4 min, `orchestrator-heartbeat.sh`) old. So the floor lands a beat
+# in every 7.5-min window and the tick's pass boundary usually falls inside the floor's 4-min
+# suppression window: the message a lane usually receives is this one, and until this clause it
+# carried ROLE/MODEL/NEXT/PERIODIC and no order to advance anything (#1993; NOT a count of beats by
+# sender — the log that count lives in was not on the box that made this change, and a derivation
+# from shipped constants does not go stale the way a 24 h count does).
+# ⛔ STATIC TEXT, NOT A READ. The floor's one invariant is that a beat leaves on time on a broken box
+# (its header's own words: "a low-information heartbeat on time beats a rich one that never arrives"),
+# so this may not add a `gh` call, a subshell, a network read, or anything that can block — and a read
+# of the order from another file is a NEW way to fail (a partial farm yields an EMPTY order and the
+# clause vanishes silently, which is exactly the failure #1991 spent eight review rounds on).
+# ⛔ VERBATIM FROM #1991'S SHORT WORDING, AND PINNED AGAINST DRIFT. A second wording of a standing
+# order is the defect: two files would then tell the fleet two different things and nothing would be
+# red. The text below is the tick's `FLEETADV_SHORT` sentence for sentence, and
+# `tests/heartbeat-floor-advance/run.sh` asserts that equality against the SHIPPED tick, so an edit to
+# either file that is not made to both fails CI instead of drifting.
+# ⛔ NOT AT THE TAIL, AND NOT INSIDE `${doact}`. (a) Placement: #1187 MEASURED a 1,962-byte payload
+# arriving as its FIRST SENTENCE, so the most important clause may not be the last thing in a payload
+# this long — the tick can end with the order because its body is ~1.6 k, while this one is ~1.7 k
+# before the objective/goal/resource segments are filled in. It rides directly behind the state header
+# and before `DO:` (whose `${prov}` marker stays adjacent to the classes it qualifies). (b) The gate
+# above rewrites `${doact}` on a `DO: RECLAIM` resource verdict; a standing order is not a dispatch
+# OFFER and must not be neutralised by it — and `[RES RECLAIM] …: adding lanes makes it worse`
+# prefixed onto the order would invert it.
+# ⛔ FORMATION RULES, ALL LOAD-BEARING: `MSG` is a DOUBLE-QUOTED assignment, so a backticked span in
+# this literal is command-substituted at assignment time and silently disappears, `$` expands, and a
+# raw `"` ends the string. No backtick, no `$`, no double quote, no newline (ONE MESSAGE, ONE LINE —
+# `cmux send` submits every newline as its own turn).
+FLEETADV_FLOOR="⛔ FLEET ADVANCE — an ORDER, not a report. CHECK THE cmux LANES AND ALL FOUR BOXES (local + the three cloud VMs) and push each toward AUTOPILOT — dispatching, creating PRs, fixing them, merging them UNATTENDED. USE THE CAPACITY, DO NOT REPORT IT: dispatch locally if the local machine has room, on a cloud VM if it is idle. DRIVE THE P0/P1 PRs: name the specific PRs that should land this cycle, take each one to the rail via scripts/admin-merge.sh, and advance agent-infra (cell-2 owns it) toward automating dispatch, PR creation, fixing and merging. A beat that reports state and dispatches nothing is a WASTED BEAT."
+MSG="[HEARTBEAT ${hms}] fleet ${fleet}. ${obj} ${res} ${FLEETADV_FLOOR} ${prov}DO: ${doact} GOAL: ${goal} · GRAPH: the objectives + their order live in the TORTOISE GRAPH (read before deriving, write findings back) · ROLE: orchestrate — give each lane a LIST OF ISSUES, verify the ARTIFACT, and CHECK EVERY LANE IS MOVING; a lane that is stuck is yours to unstick (never implement, never decide for the owner) · MODEL: 6 lanes, each owning ISSUES END-TO-END (implement -> fresh-context review -> rail -> merge -> next issue); a PR is a STEP INSIDE AN ISSUE, never a queue item; A FINISHED ITEM IS THE TRIGGER TO START THE NEXT -- never stop between items, and budget/context is never a stopping reason (context auto-compacts); NO separate landing lanes and do NOT create new lanes -- retire as they finish · LANES: IN BOUNDS = ~/Documents/GitHub/tortoise AND agent-infra (BOTH fine to dispatch) · OUT OF BOUNDS = DMeer lanes (DMeer, DMeer - linkedin outreach, DMeer - marketing), a DIFFERENT repo/product — check the lane's cwd/name before every dispatch, never dispatch from a bare UUID list · NEXT: waiting>10 -> the PR queue gets the attention; otherwise merge and spend spare capacity on P0, then P1, then P2 product issues · PERIODIC: re-read the whole open issue list and ask whether the most customer-impactful ones are the ones prioritised; if the reclassification pass has an UNFINISHED progress file under state/, RESUME it from that file instead of restarting it · classify lanes by the decision tree (CPU-delta > child > tool-age > words; spinner is WEAK) · PR state from artifacts, never a queue row"
 
 # DRY MODE (2026-10-05): print the message and send NOTHING. Added so this file can be verified
 # against live state without typing into the orchestrator pane. Off by default and read from the
