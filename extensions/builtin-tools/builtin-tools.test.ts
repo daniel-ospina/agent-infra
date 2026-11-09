@@ -7869,7 +7869,17 @@ testAsync("#2105: countCommitsBetween counts what landed since the snapshot, and
     const now = execSync("git rev-parse HEAD", { cwd: dir, encoding: "utf-8" }).trim();
     equal(countCommitsBetween(dir, first, now), 3, "the three commits that landed after the snapshot");
     equal(countCommitsBetween(dir, now, now), 0, "nothing between a head and itself");
-    equal(countCommitsBetween(dir, "--help", now), null, "a non-hex ref is refused (no shell interpolation of arbitrary text)");
+    // The hex gate's PROOF must use a ref git itself would ACCEPT. With the argv
+    // reader in place, `--help` / `zzz` are refused by git (`fatal: bad revision`,
+    // exit 128) and `tryGitArgv` swallows the throw to `null` — so those rows read
+    // `null` whether the regex exists or not and cannot red when it is deleted.
+    // `HEAD` is a git-VALID rev that is NOT hex: with the gate deleted the call
+    // returns a NUMBER here and these rows go red. Measured both ways: gate on →
+    // null, gate deleted → 0 (`HEAD..<now>`) and 3 (`<first>..HEAD`).
+    equal(countCommitsBetween(dir, "HEAD", now), null, "a git-valid but non-hex ref is refused BY THE HEX GATE (deleting the regex returns 0 here)");
+    equal(countCommitsBetween(dir, first, "HEAD"), null, "…on either side (deleting the regex returns 3 here)");
+    // Kept as defence-in-depth rows, not as the gate's proof (git refuses them itself).
+    equal(countCommitsBetween(dir, "--help", now), null, "an option-shaped ref is refused (no shell interpolation of arbitrary text)");
     equal(countCommitsBetween(dir, first, "zzz"), null, "…on either side");
   } finally {
     rmSync(dir, { recursive: true, force: true });
