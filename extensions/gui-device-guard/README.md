@@ -165,6 +165,17 @@ rule: **not** refused (a named app is recorded, `media: false`), but not recorde
 either — which lost R1, the diagnosis half of #2249 (`review cycle 5, F1`, rows
 L21a–L21h).
 
+**An attached option argument is the same argument — and starts right after its
+letter.** getopt stops at the first VALUE-taking letter, so `-aSafari` is `-a
+Safari`. Searching the token for the option letter's LAST occurrence searched the
+app's own name too and cut it there: `open -aSafari` recorded `app: "ri"`,
+`open -aBrave` → `"ve"`, and `open -aBanana` / `open -bcom.apple.Safari` produced no
+finding at all — so the whole attached spelling family could lose BOTH halves of
+#2249, and one letter of an app's name changed the answer (`round 12`, rows
+L44a–L44c and their identity twins). A rest that could itself be `open` flags
+(`-na`, `-bna`) still reads as a getopt CLUSTER whose value is the next word, which
+is what the P2-4 rows pin.
+
 **`open`'s argument goes to an OPTION LETTER, and a plain word is never a flag.**
 `-a<app>`, `-na <name>`, `-bna <id>` are spellings of the same option: a cluster
 is a thing for `open` (`open -na "Google Chrome"` is `-n -a`, getopt clustering,
@@ -277,7 +288,10 @@ This is a residual list, not a completeness claim:
   shell (`bash`/`sh`/`zsh`/… with no `-c`) **is** read — including its GLUED
   spelling `bash<<'EOF'`, which `tokenize` delivers as one token and which used to
   miss the shell test entirely (L35a) — and a body behind `-c` is that script's
-  data. L28a–L28h pin both directions, L29a–L29f and L36a/L36b the pipeline and
+  data. A shell INSIDE a substitution is the same shell: in `x=$(bash <<'EOF' … EOF)`
+  the segment's command word is the redirect operator, so the body was blanked as
+  data even though bash runs it (L47a, allow twin A70). L28a–L28h pin both
+  directions, L29a–L29f and L36a/L36b the pipeline and
   fd-redirect spellings (a shell on the LEFT of a pipe is still fed by the
   heredoc). The DELIMITER is any word with quote removal applied, because bash
   says so: `<<\EOF` (the standard non-expanding spelling), `<<"E-O-F"` and
@@ -291,6 +305,11 @@ This is a residual list, not a completeness claim:
   bodies arrive in the order the operators appear: `bash <<A; cat <<B` feeds A's
   body to `bash`, so locating only the last `<<` on the line turned the body the
   shell actually executes into data (L42a, A66).
+- A CONTROL-FLOW WORD sits where a command word would, and the list is bash's
+  grammar, not a heuristic: `until`/`select` join `if`/`while`/`do`, so
+  `until electron .; do break; done` no longer answers `[]` while `while` fires
+  (L46a/L46c, allow twin A69). A grouping `(` glued to a token AFTER such a keyword
+  is normalised too (`if (npm exec electron .)` — L46b).
 - A bash METACHARACTER GLUED TO A TOKEN IS NOT PART OF THE WORD: `tokenize` splits
   on whitespace only, so `(open ./Build/DMeer.app)` carries the `)` on its last
   token — and every exact-token predicate (`.app` suffix, the bundle regexes, the
@@ -301,6 +320,10 @@ This is a residual list, not a completeness claim:
   `(npx playwright test --headed)` → no block AND no row) and a FALSE BLOCK on
   working work (`(electron . --use-fake-… --use-fake-ui-…)` was refused instead of
   recorded as mitigated) (`round 12`, rows L40a–L40c, A64, L11b1).
+- A wrapper **in** the list whose bare OPERAND is a `sh -c` script is re-read:
+  `watch -n 1 "electron ."` was `[]` (no block, no row) while the UNQUOTED spelling
+  fired, although `watch --help` states the default is `sh -c` and a real run
+  executes the operand (`round 12`, row L45a, allow twin A68).
 - A wrapper **in** the list takes its own leading POSITIONAL before the command
   (`flock FILE CMD`, `taskset MASK CMD`, `chrt PRIORITY CMD`, `script FILE CMD`,
   `chroot ROOT CMD`),
@@ -332,6 +355,10 @@ This is a residual list, not a completeness claim:
   (`flock /tmp/l.lock rg electron .`) is now refused, because skipping the
   positional means the word scan has to run and it cannot tell that payload from a
   launch. Same trade, same waiver.
+- A `case … in` PATTERN body is not resolved: the pattern's `)` is indistinguishable
+  from a command boundary once metacharacters are stripped, so `case x in x) electron
+  .;; esac` can read as a miss. (`until`/`while`/`if`/`select` bodies ARE read — they
+  have no per-branch pattern grammar.)
 - A launch built from a shell variable (`APP=Electron; open -a "$APP"`) is
   recorded with the unexpanded name — the shape is kept, the string is not. The
   same limit reaches a heredoc DELIMITER built from a variable (`cat <<$X`), because
@@ -350,7 +377,7 @@ This is a residual list, not a completeness claim:
 ## Tests
 
 ```bash
-node extensions/gui-device-guard/test.mjs                    # 268 assertions, threat table L1–L43 + handler H1–H15
+node extensions/gui-device-guard/test.mjs                    # 282 assertions, threat table L1–L47 + handler H1–H15
 node extensions/gui-device-guard/test.mjs --classify 'npm exec electron .'
 ```
 
@@ -361,8 +388,8 @@ stays green while `index.ts` is broken and the guard is inert in every session.
 Mutations are pinned, each attributable to the row it is about, all measured at
 ONE head (**this** head — re-measured, not carried over: the counts are the output
 of running the mutant against `test.mjs`, and the assertion total is
-`268 = 206 ROWS + 8 APP_ROWS + 54 explicit \`check()\` calls`): the Electron
-rule's `media` → `false` reds **117**; the wrapper recursion
+`282 = 217 ROWS + 11 APP_ROWS + 54 explicit \`check()\` calls`): the Electron
+rule's `media` → `false` reds **122**; the wrapper recursion
 removed reds **8**; the wrapper WORDS removed reds **2**; the structural rule that
 reads a package-runner anywhere in the segment removed reds **2** (L19h/L19i); the
 comment stripper removed reds **2** (L11d and L11f — re-measured at this head; the
@@ -391,7 +418,7 @@ by the defect, so it is the record-half twin: it reds if the fix over-cuts and
 reports nothing); deleting the escape guard that the wider set needs reds **1**
 (L27c — without it `x\)#` is cut as a comment and the launch after the `;` is lost);
 removing the shell-STDIN recursion (a heredoc/here-string fed to a shell, the
-round-11 blocking defect) reds **18** (L28a–L28f, L29a–L29f and L35a/L36a/L36b/L37a/L38a/L42a —
+round-11 blocking defect) reds **19** (L28a–L28f, L29a–L29f, L35a/L36a/L36b/L37a/L38a/L42a/L47a —
 the body is deleted as data, so there is no block AND no ledger row); treating an unquoted
 `<<<word` as a heredoc
 opener reds **1** (L28h — the phantom heredoc deletes the rest of the input);
@@ -411,8 +438,8 @@ and A58, which the pre-fix code refused); dropping the glued-heredoc split reds
 **1** (L35a, `bash<<'EOF'` with no space); dropping the trailing-slash
 normalisation reds **2** (L30c and its identity twin); reverting the heredoc
 DELIMITER grammar to the pre-fix identifier-only regex (`<<\EOF` and `<<"E-O-F"`
-stop being heredocs, so their bodies are parsed as argv) reds **4** (L37a, L37b,
-L43a and the over-fire twin A61); dropping the `{fd}` term from the fd-duplicate rule reds
+stop being heredocs, so their bodies are parsed as argv) reds **4** (L37a, L37b and
+the two ALLOW twins A61/A67 — the mis-read now over-fires on a body that is data); dropping the `{fd}` term from the fd-duplicate rule reds
 **1** (L38a — `{fd}>&2` allocates a NEW descriptor, so stdout stays on the pipe);
 dropping the wrapper POSITIONAL skip reds **4** (L39a–L39c and L41a — `flock FILE`,
 `taskset MASK`, `chrt PRIORITY`, `chroot ROOT`), and starting the fail-safe scan AFTER the resolved
@@ -421,7 +448,12 @@ strip reds **4** (L40a–L40c and L11b1 — a glued `)` is a bash metacharacter,
 word character); dropping `chroot` from the positional table reds **1** (L41a);
 locating only the LAST heredoc on a line reds **1** (L42a — `bash <<A; cat <<B`
 feeds A's body to `bash`); and dropping `$'…'`/`$"…"` from the delimiter's quote
-removal reds **1** (L43a); dropping `electron-forge` from the electron head test reds **5**
+removal reds **1** (L43a); reverting the ATTACHED-option rule to `lastIndexOf(letter)`
+reds **5** (L44b, L44c and the three identity twins — `-aSafari` recorded `app: "ri"`
+and `-aBanana` found nothing); dropping `watch`'s command operand reds **1** (L45a);
+dropping `until`/`select` from the control-flow words reds **1** (L46c); dropping the
+leading `(`/`{` normalisation reds **1** (L46b); and dropping the substitution unwrap
+in `shellExecutesStdin` reds **1** (L47a); dropping `electron-forge` from the electron head test reds **5**
 (L31a–L31e); removing the PROCESS-substitution arm (`<( … )` / `>( … )`, the
 round-12 review's second P2) reds **3** (L32a–L32c, and A55 stays green because the
 double-quoted spelling never was a substitution); dropping the inner-binary term from

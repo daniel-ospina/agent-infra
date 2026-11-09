@@ -265,6 +265,13 @@ const RUNNER_VALUE_FLAGS = [
 const TIMEOUT_DURATION = /^\d+(\.\d+)?[smhd]?$/;
 
 /**
+ * The letters `open` accepts as options, for telling an attached ARGUMENT from a
+ * getopt CLUSTER (`-aSafari` vs `-na`). `-a`, `-b`, `-s`, `-u`, `-t` take values;
+ * the rest are switches. Used only by `clusterShortArg`.
+ */
+const OPEN_FLAG_LETTERS = "abefghjnstuwREFW";
+
+/**
  * How many LEADING POSITIONAL arguments a prefix takes before the real command.
  *
  * ⛔ A WRAPPER'S OWN POSITIONAL IS NOT THE COMMAND WORD (round-12 review, P3).
@@ -302,7 +309,20 @@ const PREFIX_POSITIONALS: Record<string, number> = {
  * spellings are now covered — the spaced one by `commandWordIndex`'s leading-token
  * drop (review cycle 4, F1), which is why a bare `(`/`{` never reaches this set.
  */
-const TRANSPARENT = new Set(["{", "}", "(", ")", "then", "do", "done", "fi", "else", "elif", "if", "while"]);
+const TRANSPARENT = new Set(["{", "}", "(", ")", "then", "do", "done", "fi", "else", "elif", "if", "while", "until", "select"]);
+
+/**
+ * Wrapper words whose bare OPERAND is a command string for `sh -c`.
+ *
+ * ⛔ `watch` RUNS ITS OPERAND, AND ITS OPERAND IS NOT THE COMMAND WORD (round-12
+ * review, HIGH). `watch -n 1 "electron ."` was `[]` — no block, no ledger row —
+ * while the UNQUOTED spelling fired, and `watch --exec electron .` fired too: the
+ * one listed prefix whose command-string operand had no `COMMAND_STRING_FLAGS` row.
+ * `watch --help` states the default is `sh -c`, and a stubbed `electron` on PATH was
+ * executed by a real `watch` run. The whole remaining operand is re-read, which is
+ * exactly what `sh -c` would do with it.
+ */
+const PREFIX_COMMAND_OPERAND = new Set(["watch"]);
 
 /**
  * Package-runners whose first PACKAGE argument is the thing being launched.
@@ -692,21 +712,41 @@ function unescapeDouble(s: string): string {
  * `-s` is the explicit "read commands from standard input" spelling and needs no
  * special case: a shell with no `-c` reads stdin anyway.
  */
-function shellExecutesStdin(toks: string[]): boolean {
-  const cwi = commandWordIndex(toks);
-  if (cwi < 0) return false;
-  // ⛔ A SHELL GLUED TO ITS REDIRECT IS STILL THE COMMAND WORD (round-12 review,
-  // P2). `tokenize` never splits `<<` off a word, so `bash<<'EOF'` arrives as ONE
-  // token, `basename` reads `bash<<EOF`, it misses `SHELLS`, and the body was
-  // blanked as data: `bash<<'EOF'` + a launch was `[]` while the SPACED twin fired
-  // — and real bash runs the body either way (`bash <<'EOF'|tee` and `bash<<'EOF'|
-  // tee` both printed it). Truncating at the operator is what `tokenize` would
-  // have done had the redirect been spaced.
-  if (!SHELLS.has(basename(toks[cwi].split("<<")[0]))) return false;
-  for (let i = cwi + 1; i < toks.length; i++) {
-    if (/^-[A-Za-z]*c[A-Za-z]*$/.test(toks[i]) || toks[i] === "--command") return false;
+function shellExecutesStdin(rawToks: string[]): boolean {
+  let toks = rawToks;
+  for (let depth = 0; depth < 3; depth++) {
+    const cwi = commandWordIndex(toks);
+    if (cwi >= 0) {
+      // ⛔ A SHELL GLUED TO ITS REDIRECT IS STILL THE COMMAND WORD (round-12 review,
+      // P2). `tokenize` never splits `<<` off a word, so `bash<<'EOF'` arrives as ONE
+      // token, `basename` reads `bash<<EOF`, it misses `SHELLS`, and the body was
+      // blanked as data: `bash<<'EOF'` + a launch was `[]` while the SPACED twin fired
+      // — and real bash runs the body either way (`bash <<'EOF'|tee` and `bash<<'EOF'|
+      // tee` both printed it). Truncating at the operator is what `tokenize` would
+      // have done had the redirect been spaced.
+      const head = basename(toks[cwi].split("<<")[0]);
+      if (head !== "" && SHELLS.has(head)) {
+        for (let i = cwi + 1; i < toks.length; i++) {
+          if (/^-[A-Za-z]*c[A-Za-z]*$/.test(toks[i]) || toks[i] === "--command") return false;
+        }
+        return true;
+      }
+    }
+    // ⛔ THE SHELL CAN BE INSIDE A SUBSTITUTION, AND THE REDIRECT CAN BE ITS OWN
+    // TOKEN (round-12 review, LOW): `x=$(bash <<'EOF'` resolves to the command word
+    // `<<EOF` (the assignment is skipped, the operator is not), so there is NO
+    // shell at this level and the body was blanked as data even though bash runs it
+    // (measured: `x=$(bash <<'EOF' … EOF)` captured the body's output). Unwrap the
+    // substitution and ask again.
+    const text = toks.join(" ");
+    const at = Math.max(text.lastIndexOf("$("), text.lastIndexOf("<("), text.lastIndexOf("`"));
+    if (at < 0) return false;
+    const inner = text[at] === "`" ? text.slice(at + 1) : text.slice(at + 2);
+    const next = tokenize(inner).map(stripTrailingMetachars);
+    if (next.length === 0) return false;
+    toks = next;
   }
-  return true;
+  return false;
 }
 
 /**
@@ -967,7 +1007,7 @@ function stripLeadingMetachars(tok: string): string {
  */
 function stripTrailingMetachars(tok: string): string {
   let end = tok.length;
-  while (end > 0 && ";&|()<>".includes(tok[end - 1])) end--;
+  while (end > 0 && ";&|()<>`".includes(tok[end - 1])) end--;
   return end === tok.length ? tok : tok.slice(0, end);
 }
 
@@ -1328,11 +1368,29 @@ function clusterShortArg(
 ): { letter: string; arg: string } | null {
   if (!tok.startsWith("-") || tok.startsWith("--")) return null;
   const body = tok.slice(1);
-  let at = -1;
-  for (const letter of letters) at = Math.max(at, body.lastIndexOf(letter));
-  if (at < 0) return null;
-  if (!/^[A-Za-z]*$/.test(body.slice(0, at))) return null;
-  return { letter: body[at], arg: body.slice(at + 1) };
+  // ⛔ THE ATTACHED ARGUMENT STARTS AFTER THE OPTION LETTER, NOT AFTER ITS LAST
+  // OCCURRENCE ANYWHERE IN THE TOKEN (round-12 review, HIGH). `body.lastIndexOf
+  // (letter)` searched the ARGUMENT too, so the app's own name was cut at its last
+  // `a`/`b`: `open -aSafari` recorded `app: "ri"`, `open -aBrave` → `"ve"`, and
+  // `open -aBanana` / `open -bcom.apple.Safari` failed every `.app` predicate and
+  // produced NO finding at all — losing the ledger row for the whole attached
+  // spelling family, while `-aDMeer` (the pinned row) happened to survive. getopt
+  // stops at the first VALUE-taking letter: `-aSafari` is `-a Safari`.
+  let run = 0;
+  while (run < body.length && /[A-Za-z]/.test(body[run])) run++;
+  for (let i = 0; i < run; i++) {
+    const ch = body[i];
+    if (!letters.includes(ch)) continue;
+    const rest = body.slice(i + 1);
+    // A rest that `open` itself could accept as FLAGS (`-na`, `-bna`) is a getopt
+    // CLUSTER, and its value is the NEXT word — the reading the P2-4 rows pin. A
+    // rest with a letter `open` has no flag for (`-aSafari`) is the argument.
+    if (rest !== "" && /^[A-Za-z]+$/.test(rest) && [...rest].every((c) => OPEN_FLAG_LETTERS.includes(c))) {
+      continue;
+    }
+    return { letter: ch, arg: rest };
+  }
+  return null;
 }
 
 /**
@@ -1576,7 +1634,7 @@ export function classifyLaunchCommand(command: string, depth = 0): LaunchFinding
     // review, P1): `(open X.app)` must segment exactly like `open X.app`. Leading
     // metachars are stripped by `commandWordIndex`; trailing ones are stripped
     // here, ONCE, so every predicate sees the word bash sees.
-    const toks = tokenize(segment).map(stripTrailingMetachars);
+    const toks = tokenize(segment).map(stripTrailingMetachars).map((t) => t.replace(/^[({]+/, ""));
     if (toks.length === 0) continue;
     const flags: { sawFlag?: boolean; payloadStart?: number } = {};
     const cwi = commandWordIndex(toks, flags);
@@ -1679,7 +1737,13 @@ export function classifyLaunchCommand(command: string, depth = 0): LaunchFinding
       // `sudo bash -c "…"`, where the wrapper is `sudo` and the shell is `bash`.
       const shellBody = wrapperCommandArg(toks);
       const evalBody = head === "eval" ? toks.slice(cwi + 1).join(" ") : null;
-      const nested = shellBody ?? evalBody;
+      // ⛔ `watch … "<cmd>"` / `watch … <cmd> …` — the operand IS a `sh -c` script
+      // (see PREFIX_COMMAND_OPERAND). Read from the resolved command word so a flag
+      // that consumed a value cannot leave a `--flag` token where the script begins.
+      const operandBody = PREFIX_COMMAND_OPERAND.has(basename(toks[0] ?? ""))
+        ? toks.slice(Math.max(cwi, 1)).join(" ")
+        : null;
+      const nested = shellBody ?? evalBody ?? operandBody;
       if (nested !== null && nested !== "") {
         findings.push(...classifyLaunchCommand(nested, depth + 1));
         continue;

@@ -569,6 +569,41 @@ const ROWS = [
     "cat <<$'EOF'\nhi\nEOF\nnpm exec electron .", 1, "electron", true],
   ["A67 the ALLOW twin: a benign body under `$'…'` quoting stays data",
     "cat <<$'EOF'\nopen ./Build/DMeer.app\nEOF", 0, null, false],
+  // ── L44–L47 (round-12 review, sixth pass) — an ATTACHED option argument, `watch`'s
+  //     command operand, the `until` keyword, and a heredoc inside a substitution.
+  //   L44: `body.lastIndexOf(letter)` searched the ATTACHED ARGUMENT too, so the app
+  //        name was cut at its last `a`/`b`: `open -aSafari` recorded `app: "ri"` and
+  //        `open -aBanana` / `open -bcom.apple.Safari` produced NO finding at all
+  //        (no block, NO ledger row) — one letter of the name changed the answer.
+  ["L44a an ATTACHED `-a<app>` keeps the whole name (`-aSafari` was app 'ri')",
+    "open -aSafari", 1, "open", false],
+  ["L44b …including a name whose LAST letter is the option letter (was [])",
+    "open -aBanana", 1, "open", false],
+  ["L44c …and a reverse-DNS `-b<id>` (`-bcom.apple.Safari` was [])",
+    "open -bcom.apple.Safari", 1, "open", false],
+  //   L45: `watch`'s bare operand is a `sh -c` script, so it is re-read — the unquoted
+  //        spelling already fired and the quoted one, the spelling a developer writes,
+  //        produced no block and no row.
+  ["L45a `watch … \"<cmd>\"` runs its operand and is re-read (was [])",
+    'watch -n 1 "npm exec electron ."', 1, "electron", true],
+  ["A68 the ALLOW twin: a benign `watch` operand stays clean",
+    "watch -n 1 ls", 0, null, false],
+  ["A69 the ALLOW twin: a benign `until` loop stays clean",
+    "until false; do break; done", 0, null, false],
+  //   L46: `until` is the same reserved word as `while` (which fired), and a `(` glued
+  //        to a token AFTER the keyword was never normalised.
+  ["L46a `until <launch>; do …` is a control-flow word like `while` (was [])",
+    "until npm exec electron .; do break; done", 1, "electron", true],
+  ["L46b a GLUED `(` after a control-flow word is normalised (was [])",
+    "if (npm exec electron .); then :; fi", 1, "electron", true],
+  ["L46c …and `until` resolves the bare launch word with no runner to rescue it",
+    "until electron .; do break; done", 1, "electron", true],
+  //   L47: the shell can sit INSIDE a substitution, where the resolved command word is
+  //        the redirect operator — the body bash runs was blanked as data.
+  ["L47a a heredoc fed to a shell inside `$( … )` is still the shell's program (was [])",
+    "x=$(bash <<'EOF'\nnpm exec electron .\nEOF\n)", 1, "electron", true],
+  ["A70 the ALLOW twin: the same shape with a NON-shell head stays data",
+    "x=$(cat <<'EOF'\nopen ./Build/DMeer.app\nEOF\n)", 0, null, false],
   //   L30c: tab completion appends a slash to directories, and `open
   //         ./Build/DMeer.app/` — the incident's own app — matched none of the three
   //         bundle tests while the `-a` spelling of the SAME token was refused.
@@ -626,6 +661,12 @@ const APP_ROWS = [
     "open Contents/MacOS/DMeer", "Contents/MacOS/DMeer"],
   ["L30c twin: a trailing slash is not part of the identity",
     "open ./Build/DMeer.app/", "./Build/DMeer.app"],
+  ["L44a twin: `-aSafari` names Safari, not `ri`",
+    "open -aSafari", "Safari"],
+  ["L44b twin: `-aBanana` names Banana",
+    "open -aBanana", "Banana"],
+  ["L44c twin: `-b<id>` keeps the whole bundle identifier",
+    "open -bcom.apple.Safari", "com.apple.Safari"],
 ];
 for (const [name, cmd, expected] of APP_ROWS) {
   const found = classify(cmd);
