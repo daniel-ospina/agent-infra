@@ -149,7 +149,10 @@ _b "lane-container-reap.sh"  "$HERE/lane-container-reap.sh" --dry-run
 # about REPO.
 _b_or() {
   local out rc
-  out="$( ( cd "$NOTREPO" && env -u REPO HOME="${TMPDIR:-/tmp}" OR="acme/widget" \
+  # ⛔ SAME SCRUB AS `run_bare` (fresh-context review of #3833, F1b): `ENV_FILE` is ambient on the box
+  # this was written on and unset on a runner, so leaving it here keeps one arm's message text
+  # box-specific — the leak the whole scrub list exists to remove.
+  out="$( ( cd "$NOTREPO" && env -u REPO -u ENV_FILE -u CELL_HOME -u O HOME="${TMPDIR:-/tmp}" OR="acme/widget" \
     bash "$HERE/cloud-cell-doctor.sh" merge 2>&1 ) )"; rc=$?
   if [ "$rc" -ne 0 ] && grep -q 'REPO' <<<"$out"; then
     ok "B  cloud-cell-doctor.sh merge (with \$OR set): refuses (rc=$rc) and names REPO"
