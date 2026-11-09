@@ -162,6 +162,51 @@ orc_lock_reclaim() {
   orc_lock_write "$lockf"
 }
 
+# ── the slack seam, VALIDATED BEFORE IT REACHES ARITHMETIC (agent-infra#2095 review, P1) ─────────
+# ⛔ AN UNVALIDATED READ OF THIS SEAM FAILS OPEN, AND HERE THE OPEN DIRECTION IS THE DESTRUCTIVE ONE.
+# It is the ONLY input to the reclaim decision that comes from the environment, and the arithmetic it
+# feeds runs inside a `set -u` shell. `origin/main` carried this guard INLINE in its own lock block
+# (`orch-loop.sh:2335-2351`); this module inherited the VARIABLE and lost the GUARD, so the guard is
+# restored here, one place, rather than folded into the arithmetic line.
+#
+# MEASURED on the pre-fix head, driving `orc_singleton_acquire` with a LIVE process and a record whose
+# mtime is LATER than that process's start (the normal HELD case):
+#
+#   unset      -> rc 1 HELD by live controller pid N           (correct)
+#   -100       -> rc 0 'reclaimed a RECYCLED pid (… began after …)'  ⛔ THE LIVE OWNER'S RECORD IS
+#                 DISPLACED: two controllers on one state dir (#1715), and an UNOWNED lock afterwards.
+#                 On main the same value is non-digit -> 5 -> HELD.
+#   60/100000  -> rc 1 HELD                                    (correct: fail-closed)
+#   1.5        -> 'syntax error: invalid arithmetic operator', then `ORC_SINGLETON_RC: unbound
+#                 variable` -> the loop dies with NO `[singleton]` line and NO 74/75
+#   08         -> 'value too great for base' — ⛔ ALL-DIGITS AND STILL FATAL: bash reads a leading
+#                 zero as OCTAL, so a digits-only guard is NOT enough (the textual strip below is)
+#   abc        -> 'abc: unbound variable'                     -> the same cryptic death
+#
+# ⛔ AND THE ARITHMETIC FAULT ABORTS THE AND-OR LIST. `orc_singleton_acquire "$LOCKF"; RC=$?` never
+# assigns, so the caller dies on `case "$ORC_SINGLETON_RC"` under `set -u` — neither the loud refusal
+# nor `exit 75` is reached, which is the #1985 cryptic-stop class this file exists to end. Validating
+# here is what stops that fault happening at all.
+# ⛔ `scripts/lib/pid-identity.sh:188` carries the SAME unvalidated seam for `PID_START_SLACK_SECONDS`,
+# reachable through the `pid_began_after` arm below. That gap is PRE-EXISTING on main and is NAMED
+# here rather than silently copied — this fix restores the guard for THIS module's seam only.
+_orc_lock_slack() { # <candidate> -> a bounded, decimal, all-digit slack on stdout
+  local s="${1:-}"
+  case "$s" in ''|*[!0-9]*) s=5 ;; esac
+  # Leading zeros stripped TEXTUALLY, never normalised through `$(( ))`: `08` is all-digits and an
+  # OCTAL ERROR in arithmetic. This NORMALISES (`08` -> 8, `007` -> 7); it does not reject, and main
+  # documented the same behaviour for the same values.
+  while [ "${#s}" -gt 1 ] && [ "${s#0}" != "$s" ]; do s="${s#0}"; done
+  # A slack wider than the fence itself is not a setting, it is a DEFEAT of the fence. The LENGTH test
+  # comes FIRST so an absurd value is capped instead of reaching `[ -le ]` as an 'integer expression
+  # expected' error. Same bound as `fleet-inventory.sh`'s copy of this fence.
+  { [ "${#s}" -le 2 ] && [ "$s" -le 60 ]; } || s=5
+  printf '%s\n' "$s"
+}
+# Established once at load, so the variable always MEANS a decided value to any later reader (the same
+# doctrine `orc_state_pick` applies to `O`: a decision, not a default).
+ORC_LOCK_START_SLACK_SECONDS="$(_orc_lock_slack "${ORC_LOCK_START_SLACK_SECONDS:-5}")"
+
 # orc_began_after <pid> <epoch> — 0 the process BEGAN after that epoch (so it cannot own a record
 # written earlier: a recycled pid), 1 provably before (it may own it), 2 CANNOT TELL.
 #
@@ -196,11 +241,16 @@ _orc_proc_start_epoch() {
   printf '%s\n' "$(( $(date +%s) - (d * 86400 + h * 3600 + m * 60 + s) ))"
 }
 orc_began_after() {
-  local pe="${2-}" ps
+  local pe="${2-}" ps slack
   if command -v pid_began_after >/dev/null 2>&1; then pid_began_after "$1" "$pe"; return $?; fi
   case "$pe" in ''|*[!0-9]*) return 2 ;; esac
   ps="$(_orc_proc_start_epoch "${1:-}")" || return 2
-  [ "$ps" -gt "$((pe + ${ORC_LOCK_START_SLACK_SECONDS:-5}))" ]
+  # ⛔ RE-VALIDATED AT THE POINT OF USE, not only at load. A caller that assigns the seam AFTER
+  # sourcing this module would otherwise reach the arithmetic with it again — and that is exactly the
+  # path a reviewer takes to check this fix, so leaving it open would re-open the finding. One rule,
+  # `_orc_lock_slack`, applied at both ends.
+  slack="$(_orc_lock_slack "${ORC_LOCK_START_SLACK_SECONDS:-5}")"
+  [ "$ps" -gt "$((pe + slack))" ]
 }
 
 # orc_singleton_acquire <lockf> — 0 ACQUIRED, 1 HELD by a live controller, 2 UNJUDGED.

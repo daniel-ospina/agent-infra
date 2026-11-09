@@ -476,6 +476,60 @@ PAIRS
     || ck "§7 spawn-gate does not search O_WORK — on a state-dir instance its fork floor is silently OFF" 1
 fi
 
+# ─────────────────────────────────────────────────────────────────────────────────────────────
+hdr "§8 THE SLACK SEAM — validated before it reaches arithmetic (fresh review of #3846, P1)"
+# ⛔ THE GUARD `main` CARRIED AND THIS MODULE LOST. `orch-loop.sh:2335-2351` on main validated
+# `ORCH_LOCK_START_SLACK_SECONDS` before its arithmetic; the replacement name was added without it.
+# Two distinct failures followed, and the FIRST is a fail-OPEN on the singleton — the exact class this
+# file exists to prevent:
+#   a NEGATIVE value makes `orc_began_after` answer 0 for a process that IS the current owner, so
+#   `orc_singleton_acquire` returns 0 and the LIVE owner's record is displaced (two controllers on
+#   one state dir, #1715, plus an unowned lock afterwards);
+#   a NON-NUMERIC value aborts the and-or list `orc_singleton_acquire "$LOCKF"; RC=$?`, so `RC` is
+#   never assigned and the caller dies on `case "$ORC_SINGLETON_RC"` under `set -u` with NO
+#   `[singleton]` line and NO 74/75 (#1985's cryptic-stop class).
+# The matrix is pinned FIRST, then the dangerous values are DRIVEN through the shipped acquire against
+# a live holder — the matrix alone cannot prove the value reaches the arithmetic.
+# ⛔ THE EXPECTED VALUES ARE main's DOCUMENTED BEHAVIOUR, not a restatement of the code: an all-digit
+# value with leading zeros is NORMALISED (`08`->8, `007`->7) and KEPT, because both are inside the
+# bound; only a NON-digit value or one wider than 60 falls to the documented 5.
+_lsv=""
+for _lv in "" "-100" "1.5" "08" "007" "61" "100000" "abc"; do
+  _lsv="$_lsv$(_orc_lock_slack "$_lv") "
+done
+[ "$_lsv" = "5 5 5 8 7 5 5 5 " ] \
+  && ck "§8 every invalid slack falls to 5, and all-digit values are normalised not rejected" 0 \
+  || ck "§8 the slack matrix drifted from main's documented behaviour — for ''/-100/1.5/08/007/61/100000/abc got '$_lsv', wanted '5 5 5 8 7 5 5 5 '" 1
+# ⛔ DRIVEN: a live process whose record was written AFTER it started (the normal HELD case) must be
+# REFUSED for every one of these. Pre-fix, `-100` reclaimed it (rc 0, the owner's record replaced) and
+# the three non-numeric ones died inside the arithmetic instead of returning a verdict.
+SLK="$T/slk"; mkdir -p "$SLK"
+sleep 30 & SLH=$!
+for _bad in -100 1.5 abc 08; do
+  printf '%s\n' "$SLH" > "$SLK/.orch.lock"
+  ( export ORC_LOCK_START_SLACK_SECONDS="$_bad"
+    . "$MOD"
+    orc_singleton_acquire "$SLK/.orch.lock"; rc=$?
+    printf '%s|%s|%s\n' "$rc" "$(cat "$SLK/.orch.lock")" "$ORC_SINGLETON_WHY" ) > "$T/slk-$_bad" 2>&1
+  case "$(cat "$T/slk-$_bad")" in
+    1\|"$SLH"\|*) ck "§8 slack '$_bad' still REFUSES the live owner (rc 1, the holder's record intact)" 0 ;;
+    *) ck "§8 slack '$_bad' did NOT refuse the live owner — got '$(cat "$T/slk-$_bad")' (a fail-OPEN reclaims a live controller's lock; a cryptic death skips the refusal entirely)" 1 ;;
+  esac
+done
+# ⛔ AND THE SAME SEAM ASSIGNED **AFTER** THE MODULE IS LOADED. That is the measurement path a reviewer
+# takes to check this fix, so it is closed explicitly: `orc_began_after` re-validates at the point of
+# use rather than trusting the load-time value.
+printf '%s\n' "$SLH" > "$SLK/.orch.lock"
+( . "$MOD"
+  ORC_LOCK_START_SLACK_SECONDS=-100
+  orc_singleton_acquire "$SLK/.orch.lock"; rc=$?
+  printf '%s|%s\n' "$rc" "$(cat "$SLK/.orch.lock")" ) > "$T/slk-post" 2>&1
+case "$(cat "$T/slk-post")" in
+  1\|"$SLH"*) ck "§8 a slack assigned AFTER load cannot reach the arithmetic either (no fail-OPEN on a later caller)" 0 ;;
+  *) ck "§8 a slack assigned after load still reached the reclaim decision — got '$(cat "$T/slk-post")'" 1 ;;
+esac
+kill -TERM "$SLH" 2>/dev/null; wait "$SLH" 2>/dev/null
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1
 exit 0
