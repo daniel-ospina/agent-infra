@@ -173,7 +173,7 @@ fi
 # mkcase <name> — a fresh `$O`, an empty log, and a driver that runs the EXTRACTED section and then
 # prints its own pid, which is what proves the section ran past the lock instead of exiting.
 CASE_N=0
-mkcase() {
+mkcase() { # [section-file] — defaults to the pinned extraction from orch-loop.sh
   CASE_N=$((CASE_N+1))
   C="$TMP/c$CASE_N"
   mkdir -p "$C/o/logs" "$C/peer" "$C/bin"
@@ -182,7 +182,7 @@ mkcase() {
     printf 'set -u\n'
     printf 'O="%s/o"\n' "$C"
     printf 'LOG="%s/o/logs/orch-loop.log"\n' "$C"
-    cat "$SECTION"
+    cat "${1:-$SECTION}"
     printf 'echo "STARTED pid=$$"\n'
   } > "$C/drv.sh"
   : > "$C/o/logs/orch-loop.log"
@@ -207,6 +207,14 @@ run_drv() { # <case-dir> [env...] -> sets RC, OUT, ERR
   OUT="$(env "$@" bash "$CASE_DIR/drv.sh" 2>"$CASE_DIR/err.txt")" || RC=$?
   ERR="$(cat "$CASE_DIR/err.txt" 2>/dev/null)"
 }
+# ⛔ THE `#1831` ARM NEEDS A MUTATED SUBJECT, OR IT CANNOT FAIL (fresh review of #1985, P3;
+# mutation-contract rule 3). The non-digit read is guarded TWICE — the caller's `tr -dc '0-9'` and
+# `_orch_lock_verdict`'s own `case "$p" in ''|*[!0-9]*` — so replacing the caller's sanitisation with a
+# plain `cat` leaves every row green: the verdict guard returns before any numeric test. MEASURED
+# (`PASS=46 FAIL=0` for that exact mutant). The row therefore pins the PAIR, and does it by removing the
+# verdict's half in the fixture, which is the only way the caller's half becomes individually
+# attributable: with the guard gone, a `not-a-pid` lock reaches `[ "$p" -gt 0 ]`, and only the `tr -dc`
+# keeps "integer expression expected" off stderr.
 ran() { want "$OUT" "STARTED pid="; }
 lock_pid() { tr -dc '0-9' 2>/dev/null < "$1"; }
 
@@ -398,8 +406,27 @@ printf 'not-a-pid\n' > "$C/o/.orch.lock"
 touch -t 202001010000 "$C/o/.orch.lock" 2>/dev/null || touch -d '2020-01-01 00:00:00' "$C/o/.orch.lock"
 run_drv O="$C/o"
 ck "8a: a lock with no digits is reclaimed and the loop runs" "$(ran && [ "$RC" -eq 0 ] && echo 0 || echo 1)"
-ck "8a: no 'integer expression expected' leaked (the read is sanitised before any test)" \
+ck "8a: no 'integer expression expected' leaked on the SHIPPED block (defensive; the verdict guard answers first — 8a-noguard is the attributable half)" \
    "$(want "$ERR" "integer expression" && echo 1 || echo 0)"
+# ⛔ THE ATTRIBUTABLE HALF (fresh review of #1985, P3). Same lock, with `_orch_lock_verdict`'s own
+# non-digit guard STRIPPED from the extracted section — the edit a future reader makes when they
+# therefore conclude the caller does not need to sanitise. Red on the named mutant
+# (OPID="$(tr -dc '0-9' …)"` -> `OPID="$(cat "$LOCKF" …)"`); green on the shipped code.
+mkcase; CASE_DIR="$C"
+SECTION_NOGUARD="$C/section-noguard.sh"
+# Every non-digit guard in the section (three call sites carry the identical line), removed at once.
+grep -vF "''|*[!0-9]*) return 1 ;;" "$SECTION" > "$SECTION_NOGUARD"
+GUARDS_REMOVED=$(( $(grep -cF "''|*[!0-9]*) return 1 ;;" "$SECTION") - $(grep -cF "''|*[!0-9]*) return 1 ;;" "$SECTION_NOGUARD") ))
+[ "$GUARDS_REMOVED" -ge 1 ]
+ck "8a-noguard: the fixture really removes the verdict's non-digit guard (the arm is not a copy of 8a)" $?
+mkcase "$SECTION_NOGUARD"; CASE_DIR="$C"
+printf 'not-a-pid\n' > "$C/o/.orch.lock"
+touch -t 202001010000 "$C/o/.orch.lock" 2>/dev/null || touch -d '2020-01-01 00:00:00' "$C/o/.orch.lock"
+run_drv O="$C/o"
+ck "8a-noguard: with the verdict guard gone, the CALLER's sanitisation still keeps 'integer expression expected' out" \
+   "$(want "$ERR" "integer expression" && echo 1 || echo 0)"
+ck "8a-noguard: …and the lock is still reclaimed and the loop runs (the sanitisation does not refuse)" \
+   "$(ran && [ "$RC" -eq 0 ] && echo 0 || echo 1)"
 mkcase; CASE_DIR="$C"
 printf '0\n' > "$C/o/.orch.lock"
 touch -t 202001010000 "$C/o/.orch.lock" 2>/dev/null || touch -d '2020-01-01 00:00:00' "$C/o/.orch.lock"
