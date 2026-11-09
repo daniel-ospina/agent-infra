@@ -34,7 +34,7 @@ ck() { # ck <name> <0|1>
   if [ "$2" -eq 0 ]; then printf '  ✅ %s\n' "$1"; PASS=$((PASS+1));
   else printf '  ❌ %s\n' "$1"; FAIL=$((FAIL+1)); fi
 }
-say() { printf '\n── %s\n' "$1"; }
+hdr() { printf '\n── %s\n' "$1"; }
 need() { # need <path> <description> — a missing input is a FAILED case, never a silent skip
   if [ -e "$1" ]; then return 0; fi
   printf '  ❌ MISSING: %s (%s)\n' "$2" "$1"; FAIL=$((FAIL+1)); return 1
@@ -43,7 +43,7 @@ T="${TMPDIR:-/tmp}/orc-cs-test-$$"
 trap 'rm -rf "$T"' EXIT
 mkdir -p "$T" || { echo "cannot create $T"; exit 1; }
 
-say "§0 the suite cannot reach a production state dir"
+hdr "§0 the suite cannot reach a production state dir"
 if need "$MOD" "the shipped controller-state.sh"; then
   # shellcheck disable=SC1090
   . "$MOD"
@@ -62,7 +62,7 @@ if need "$MOD" "the shipped controller-state.sh"; then
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────────────────────────
-say "§1 WHICH STATE DIR — an existing install is untouched, a copy is isolated"
+hdr "§1 WHICH STATE DIR — an existing install is untouched, a copy is isolated"
 # The order is the contract: (1) ORC_STATE_DIR, (2) an explicit `O` (what every plist and cell
 # supervisor sets), (3) the copy that LIVES in production, (4) anything else is isolated.
 mkdir -p "$T/prod" "$T/proof" "$T/other"
@@ -139,7 +139,7 @@ if need "$LOOP" "the shipped orch-loop.sh"; then
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────────────────────────
-say "§2 THE SINGLETON — a live holder is refused, a recycled pid is reclaimed"
+hdr "§2 THE SINGLETON — a live holder is refused, a recycled pid is reclaimed"
 LK="$T/lk"; mkdir -p "$LK"
 
 # Acquire in a SEPARATE PROCESS (not a subshell: under bash `$$` is the parent's pid even inside
@@ -235,7 +235,7 @@ case "$(ls "$LKR"/.orch.lock.reclaim.* 2>/dev/null)" in
 esac
 
 # ─────────────────────────────────────────────────────────────────────────────────────────────────
-say "§3 FAIL CLOSED — an unjudgeable record is a refusal, not a guess"
+hdr "§3 FAIL CLOSED — an unjudgeable record is a refusal, not a guess"
 # The age is unreadable when `ps` cannot answer. `PS_BIN` is the seam the fleet's own suites use
 # (#1856/#2402), so the box does not have to be broken for this arm to run.
 cat > "$T/badps" <<'STUB'
@@ -290,7 +290,7 @@ if need "$LOOP" "the shipped orch-loop.sh"; then
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────────────────────────
-say "§4 release is OWNERSHIP-SCOPED"
+hdr "§4 release is OWNERSHIP-SCOPED"
 printf '4242\n' > "$LK/.orch.lock"
 ( . "$MOD"; orc_singleton_release "$LK/.orch.lock" )
 [ -f "$LK/.orch.lock" ] \
@@ -303,7 +303,7 @@ printf '4242\n' > "$LK/.orch.lock"
   || ck "§4 the owner's own release removes its record" 0
 
 # ─────────────────────────────────────────────────────────────────────────────────────────────────
-say "§5 the identity mirror has not drifted from scripts/lib/pid-identity.sh"
+hdr "§5 the identity mirror has not drifted from scripts/lib/pid-identity.sh"
 LIB="$HERE/../lib/pid-identity.sh"
 if need "$LIB" "the fleet's one process-identity rule (#1178)"; then
   # The rule is extracted from BOTH files and compared after normalising only the NAME line and the
@@ -330,7 +330,7 @@ if need "$LIB" "the fleet's one process-identity rule (#1178)"; then
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────────────────────────
-say "§6 the provenance tokens a [cap] line needs"
+hdr "§6 the provenance tokens a [cap] line needs"
 # ⛔ DRIVEN FROM THE SHIPPED LINES, not from a model of them: the MAX_LOAD provenance block is
 # extracted out of `orch-loop.sh` and run in a bare shell with a substituted core probe, exactly the
 # way selftest.sh drives the lane derivation. A copy of the rule here would pass on a loop whose own
@@ -381,7 +381,7 @@ if need "$LOOP" "the shipped orch-loop.sh"; then
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────────────────────────
-say "§7 the state dir and the HARNESS ROOT are two homes, and the module seam knows it"
+hdr "§7 the state dir and the HARNESS ROOT are two homes, and the module seam knows it"
 # ⛔ WHICH MODULES A STATE-DIR INSTANCE CAN STILL LOAD (fresh-context review of #3846, P1). `orch-loop.sh`
 # makes `$O` the state dir and exports it, so every module resolved `$O`-first needs a second home or the
 # documented `ORC_STATE_DIR` arrangement silently loses it — for `claims.sh` that meant the snapshot never
