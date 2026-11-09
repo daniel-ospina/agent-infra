@@ -577,7 +577,9 @@ rm -f "$FH/capacity.sh"
 # for the overflow/zero coercion — at which point the anchored pattern matched NOTHING, `cap_const` was
 # empty, and the assertion below read as a permanent RED on main (`up=800 capacity=`). A parse that
 # silently yields nothing is the same class as a check that cannot fail: it must find the default in
-# either shape, and the assertion still refuses an empty read.
+# either shape, and the assertion still refuses an empty read. Passing an empty value is not "equal", so
+# the arm still fails closed if the literal ever disappears for real. (Both sides of the merge onto
+# origin/main fixed this same false red; this keeps the shape-independent parse, which is a superset.)
 cap_const="$(sed -n 's/^CAP_LPC_CEILING=.*CAP_LPC_CEILING:-\([0-9][0-9]*\).*/\1/p' "$HERE/orchestrator-harness/capacity.sh" 2>/dev/null | head -1)"
 up_const="$(sed -n 's/.*percpu="${HU_LOAD_PER_CPU:-\([0-9]*\)}".*/\1/p' "$UP" | head -1)"
 ck "(c) the load ceiling default equals capacity.sh's CAP_LPC_CEILING (up=$up_const capacity=$cap_const)" "$([ -n "$cap_const" ] && [ "$cap_const" = "$up_const" ] && echo 0 || echo 1)"

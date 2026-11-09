@@ -154,7 +154,45 @@
 
 set -uo pipefail
 
-CELL_HOME="${CELL_HOME:-/tmp/cell-home}"
+# ── THE ONE HOME (agent-infra#3453) — DERIVED, never re-spelled ──────────────────────────────────
+# ⛔ THIS LINE USED TO BE `CELL_HOME="${CELL_HOME:-/tmp/cell-home}"`, and that default is the measured
+# root of a 17-lane wave that landed ZERO work: this supervisor is the process the cell's controller
+# unit execs, it hands every session `HOME='$CELL_HOME'`, and `/tmp/cell-home` was NOT the home the
+# unit that SPAWNS lanes gave them (`/home/cmux`), so `gh`/`git` resolved a fine-grained PAT with
+# `contents=read` and every `git push` answered 403 while every `gh` READ worked. It is also the 23 GB
+# that pins the runner ceiling at `by_disk=1` on cell-3/cell-4. The rule and the precedence live in
+# `scripts/lib/cell-home.sh`.
+# ⛔ THE FALLBACK IS `$HOME`, NEVER THE LEGACY PATH: this script is deployed in places a farm's `lib/`
+# may not reach (a hand-copied controller payload, a pinned harness worktree), and `cell-self-pin.sh`
+# already defaults on `$HOME` for the same reason — two different defaults for one home IS the skew.
+# A cell whose `$HOME` is not its durable home is refused by `cloud-cell-bringup.sh --check`, which
+# reads the passwd record itself rather than trusting this value.
+# ⛔ THE SELF PATH COUNTS ONLY WHEN IT NAMES THIS FILE — see `lib/cell-home.sh` §CONSUMERS. Under a
+# PIPED start (`bash -s`) there is no `BASH_SOURCE` and `$0` is LITERALLY `bash`, so
+# `dirname "${BASH_SOURCE[0]:-$0}"` answers `.` and the candidate becomes `$PWD/lib/cell-home.sh` — this
+# supervisor then SOURCES the resolver out of the directory it happens to be started in (measured: a
+# planted `$PWD/lib/cell-home.sh` was sourced and executed). Guarded, a piped start has no sibling to
+# trust and takes the documented `$HOME` fallback below (with its exit-78 refusal when `$HOME` is unset).
+_SELF="${BASH_SOURCE[0]:-}"; [ -f "$_SELF" ] || _SELF=""
+SUP_SELF_DIR=""
+if [ -n "$_SELF" ]; then SUP_SELF_DIR="$(cd "$(dirname "$_SELF")" 2>/dev/null && pwd -P)"; fi
+CELL_HOME_LIB="${SUP_SELF_DIR:+$SUP_SELF_DIR/lib/cell-home.sh}"
+if [ -n "$CELL_HOME_LIB" ] && [ -r "$CELL_HOME_LIB" ]; then
+  . "$CELL_HOME_LIB"
+  CELL_HOME="$(cell_home_resolve)"
+else
+  # ⛔ AN EXPLICIT `CELL_HOME` IS NOT A DEFAULT, AND MUST NOT BE REPORTED AS ONE (review FOLLOW-UP 1).
+  # This branch used to print "using HOME as the cell home" even when the box HAD named its home, so an
+  # operator who did the right thing was told it was defaulted — and then had no reason to look again
+  # when the RESOLVER went missing, which is the condition this warning exists to expose.
+  if [ -n "${CELL_HOME:-}" ]; then
+    printf '%s: warn: %s is not readable — keeping the CELL_HOME this box named (%s). The DURABLE-home resolver is unavailable on this copy; run pi-bootstrap/setup.sh to place it (agent-infra#3453)\n' "${0##*/}" "${CELL_HOME_LIB:-lib/cell-home.sh}" "$CELL_HOME" >&2
+  else
+    CELL_HOME="${HOME:-}"
+    [ -n "$CELL_HOME" ] || { printf '%s: FATAL: neither %s nor HOME is set, so the cell home cannot be derived — refusing to default it to the legacy /tmp/cell-home (agent-infra#3453)\n' "${0##*/}" "${CELL_HOME_LIB:-lib/cell-home.sh}" >&2; exit 78; }
+    printf '%s: warn: %s is not readable — using HOME as the cell home (%s). The DURABLE-home default is unavailable on this copy; run pi-bootstrap/setup.sh to place the resolver (agent-infra#3453)\n' "${0##*/}" "${CELL_HOME_LIB:-lib/cell-home.sh}" "$CELL_HOME" >&2
+  fi
+fi
 # ⛔ REPO HAS NO PATH DEFAULT (agent-infra#1935). This line used to be `REPO="${REPO:-/tmp/cell}"`,
 # and that path does not exist on the cloud cell: `start` died with `FATAL: no git repo at /tmp/cell`
 # — a controller that will not start, for a directory the operator never chose and nothing creates.
@@ -4149,11 +4187,13 @@ cmd_start() {
   # controller now re-pins ITSELF once per cycle (`harness-refresh.sh`), and the ONLY materialiser it may
   # call is this supervisor — so `HARNESS_MATERIALISER` names this very file, and the pin root/ref it
   # must act on are the OPERATOR'S, not whatever the child would re-derive from defaults. Without them
-  # the child would default HARNESS_PIN_DIR to $CELL_HOME/harness: with CELL_HOME unset in the session
-  # that default is `/tmp/cell-home/harness` (this file's own default), so the re-pin would create a
-  # worktree nobody reads and write a pin pointing at it — a re-pin that advances nothing while reporting
-  # success. The doctor's own note (see `start_doctor_loop`) records the measured cost of this same
-  # omission for SCOPE. Every value here is already in the injection guard's list below (:1697).
+  # the child would default HARNESS_PIN_DIR to $CELL_HOME/harness. That default is now the SAME
+  # derivation this file uses (scripts/lib/cell-home.sh, agent-infra#3453 — it used to be
+  # `/tmp/cell-home`, a home no other unit used), but a derivation is not the OPERATOR'S pin: if they
+  # pinned a different root the re-pin would still create a worktree nobody reads and write a pin
+  # pointing at it — advancing nothing while reporting success. So the values are passed explicitly.
+  # The doctor's own note (see `start_doctor_loop`) records the measured cost of this same omission for
+  # SCOPE. Every value here is already in the injection guard's list in `cmd_start` (the `safe_argv` loop).
   # ── SERVICE MODE: this process IS the controller (agent-infra#2402) ──────────────────────────────
   # ⛔ THERE IS NO SECOND BOUNDARY HERE, SO THERE IS NO SECOND COPY OF THE ENVIRONMENT. The tmux command
   # string just below exists because a session is served the SERVER's environment, not this shell's —
