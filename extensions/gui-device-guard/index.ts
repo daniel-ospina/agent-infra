@@ -446,13 +446,28 @@ function lineSegments(line: string): LineSegment[] {
     // read as a separator below, which is also the right answer (stdout went to a
     // file, so nothing reaches the shell).
     if (ch === "&" && line[i - 1] === ">") {
+      // `N>&M` copies fd N onto fd M, so STDOUT LEAVES THE PIPE IFF N is 1 (or
+      // absent, which defaults to 1) and M is not 1. Both sides are needed:
+      //   `2>&1`, `3>&1`, `2>&-`, `{fd}>&1`, `>&1`, `1>&1`  stdout stays → keep
+      //   `>&2`, `1>&2`, `>&-`, `1>&-`                      stdout leaves → end
+      // ⛔ KEYING ON THE LEFT FD ALONE LOST `>&1` AND `1>&1` (round-12 review,
+      // P3): those are no-ops that leave stdout ON the pipe, and treating them as
+      // separators dropped a heredoc body `bash` really executes (`cat <<'EOF' >&1
+      // | bash` printed `BODY_RAN` — measured).
       let k = i - 2;
-      let fd = "";
+      let left = "";
       while (k >= 0 && /\d/.test(line[k])) {
-        fd = line[k] + fd;
+        left = line[k] + left;
         k--;
       }
-      if (fd !== "" && fd !== "1") {
+      let m = i + 1;
+      let right = "";
+      while (m < line.length && /\d/.test(line[m])) {
+        right += line[m];
+        m++;
+      }
+      const stdoutMoves = (left === "" || left === "1") && right !== "1";
+      if (!stdoutMoves) {
         cur += ch;
         continue;
       }
@@ -635,7 +650,14 @@ function unescapeDouble(s: string): string {
 function shellExecutesStdin(toks: string[]): boolean {
   const cwi = commandWordIndex(toks);
   if (cwi < 0) return false;
-  if (!SHELLS.has(basename(toks[cwi]))) return false;
+  // ⛔ A SHELL GLUED TO ITS REDIRECT IS STILL THE COMMAND WORD (round-12 review,
+  // P2). `tokenize` never splits `<<` off a word, so `bash<<'EOF'` arrives as ONE
+  // token, `basename` reads `bash<<EOF`, it misses `SHELLS`, and the body was
+  // blanked as data: `bash<<'EOF'` + a launch was `[]` while the SPACED twin fired
+  // — and real bash runs the body either way (`bash <<'EOF'|tee` and `bash<<'EOF'|
+  // tee` both printed it). Truncating at the operator is what `tokenize` would
+  // have done had the redirect been spaced.
+  if (!SHELLS.has(basename(toks[cwi].split("<<")[0]))) return false;
   for (let i = cwi + 1; i < toks.length; i++) {
     if (/^-[A-Za-z]*c[A-Za-z]*$/.test(toks[i]) || toks[i] === "--command") return false;
   }
@@ -1036,6 +1058,18 @@ export function extractSubstitutions(command: string): string[] {
       continue;
     }
     if (ch === "'") {
+      // ⛔ A SINGLE QUOTE INSIDE DOUBLE QUOTES IS DATA (round-12 review, P2), and
+      // the unconditional skip made it a LITERAL RUN: `echo "it's" "$(npm exec
+      // electron .)"` skipped from the apostrophe to the `'` that opens the next
+      // argument, swallowed the `$( … )` between them, and returned `[]` — while
+      // bash prints `it's` and RUNS the substitution (measured: `BODY_RAN`). One
+      // line of prose in an echo is all it took to lose the refusal AND the ledger
+      // row. The `dq` state is the one bash uses: `'` only opens a literal run
+      // OUTSIDE double quotes.
+      if (dq) {
+        i++;
+        continue;
+      }
       // Skip a single-quoted run wholesale.
       const end = command.indexOf("'", i + 1);
       i = end === -1 ? command.length : end + 1;
@@ -1288,9 +1322,17 @@ function classifySegment(
       // spellings of one launch must not disagree (README:33-35 lists the shape as a
       // recorded kind). The identity is the BUNDLE, not the inner binary, so the
       // ledger's `app` names what the owner would quit.
-      const asBundle = appBundleBinary(tok);
-      if (tok.endsWith(".app") || asBundle !== null || bundleInnerBinary(tok)) {
-        app = asBundle ?? tok;
+      // ⛔ A TRAILING SLASH IS THE SAME BUNDLE (round-12 review, P2). Tab
+      // completion appends it to a directory, so `open ./Build/DMeer.app/` — the
+      // incident's own app — matched NONE of the three tests below (`.app` suffix,
+      // the `\.app/Contents…` regex, and `bundleInnerBinary`'s `[^/]+$`) and
+      // produced no finding at all, while the `-a` spelling of the SAME token was
+      // refused. Trailing slashes are stripped before the shape is judged, and the
+      // ledger records the bundle path a human would type.
+      const bare = tok.replace(/\/+$/, "");
+      const asBundle = appBundleBinary(bare);
+      if (bare.endsWith(".app") || asBundle !== null || bundleInnerBinary(bare)) {
+        app = asBundle ?? bare;
         fromFlag = false;
         break;
       }

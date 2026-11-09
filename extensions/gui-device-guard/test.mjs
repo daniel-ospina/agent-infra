@@ -468,6 +468,43 @@ const ROWS = [
     "Contents/MacOS/DMeer", 1, "electron", true],
   ["A56 the ALLOW twin: the `Contents/MacOS` DIRECTORY is not the binary",
     "ls Contents/MacOS", 0, null, false],
+  // ── L34–L36 (round-12 review, third pass) — three more spellings of classes this
+  //     file claims to cover, each measured as `[]` (no block, no ledger row) while
+  //     real bash runs the body.
+  //   L34: ONE APOSTROPHE inside double quotes is DATA to bash, but the
+  //        single-quote skip ran before any double-quote check, so
+  //        `echo "it's" "$(npm exec electron .)"` skipped from the apostrophe to the
+  //        quote opening the NEXT argument and swallowed the `$( … )` between them.
+  //        bash prints `it's` and runs the substitution (measured `BODY_RAN`).
+  ["L34a an apostrophe inside DOUBLE quotes does not hide a later `$( … )` (was [])",
+    'echo "it\'s" "$(npm exec electron .)"', 1, "electron", true],
+  ["A58 …and the SAME body in single quotes is literal text (must stay data)",
+    'echo "it\'s" \'$(npm exec electron .)\'', 0, null, false],
+  //   L35: a shell GLUED to its heredoc operator (`bash<<'EOF'`) arrives as one token
+  //        from `tokenize`, so `basename` read `bash<<EOF`, missed `SHELLS`, and the
+  //        body was blanked as data — while the spaced spelling fired and bash runs
+  //        both (`bash<<'EOF'|tee` printed the body).
+  ["L35a a shell GLUED to its heredoc operator (`bash<<'EOF'`, no space) (was [])",
+    "bash<<'EOF'\nnpm exec electron .\nEOF", 1, "electron", true],
+  ["A59 the ALLOW twin: a NON-shell glued head keeps its body as data",
+    "cat<<'EOF'\nnpm exec electron .\nEOF", 0, null, false],
+  //   L36: `>&1` / `1>&1` are NO-OP fd duplicates that leave stdout ON the pipe, but
+  //        the exception keyed on the LEFT fd alone, so they ended the pipeline and
+  //        the body was dropped (`cat <<'EOF' >&1 | bash` printed `BODY_RAN`).
+  //        A53/A60 hold the other side: stdout leaving the pipe keeps the body data.
+  ["L36a `>&1` is a no-op duplicate — stdout stays on the pipe (was [])",
+    "cat <<'EOF' >&1 | bash\nnpm exec electron .\nEOF", 1, "electron", true],
+  ["L36b …and the explicit `1>&1` spelling (was [])",
+    "cat <<'EOF' 1>&1 | bash\nnpm exec electron .\nEOF", 1, "electron", true],
+  ["A60 `1>&2` sends stdout AWAY from the pipe (the twin of L36)",
+    "cat <<'EOF' 1>&2 | bash\nnpm exec electron .\nEOF", 0, null, false],
+  //   L30c: tab completion appends a slash to directories, and `open
+  //         ./Build/DMeer.app/` — the incident's own app — matched none of the three
+  //         bundle tests while the `-a` spelling of the SAME token was refused.
+  ["L30c open a bundle PATH with a trailing slash (tab completion; was [])",
+    "open ./Build/DMeer.app/", 1, "open", true],
+  ["A57 the ALLOW twin: a trailing-slash DIRECTORY that is not a bundle",
+    "open ./build/", 0, null, false],
   // ── A34–A41 — ALLOW twins for L24/L25 AND for round 7's P2-5 over-fire. The
   //     fail-safe word scan is now gated on the prefix having SKIPPED A FLAG: with
   //     no flag between the prefix and the command word, nothing could have
@@ -516,6 +553,8 @@ const APP_ROWS = [
     "open /Applications/DMeer.app/Contents/MacOS/DMeer", "/Applications/DMeer.app"],
   ["L30b twin: the relative inner-binary path names itself",
     "open Contents/MacOS/DMeer", "Contents/MacOS/DMeer"],
+  ["L30c twin: a trailing slash is not part of the identity",
+    "open ./Build/DMeer.app/", "./Build/DMeer.app"],
 ];
 for (const [name, cmd, expected] of APP_ROWS) {
   const found = classify(cmd);

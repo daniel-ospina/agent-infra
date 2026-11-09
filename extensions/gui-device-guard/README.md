@@ -83,7 +83,11 @@ backticks are **recursed into** (bounded to 3 levels) — the
 command string is argv and can be classified. Playwright's `codegen` and `open`
 subcommands are headed **by default**, and a `PWDEBUG` exported in an earlier
 segment applies to the whole line. A `< ( … )` inside DOUBLE QUOTES is literal text
-and stays data — unlike `"$( … )"`, which bash does execute.
+and stays data — unlike `"$( … )"`, which bash does execute. And a single quote
+INSIDE double quotes is data to bash, so it must not open a literal run for the
+scanner: `echo "it's" "$(npm exec electron .)"` used to skip from the apostrophe to
+the quote opening the next argument and swallow the substitution (L34a; A58 pins the
+genuinely single-quoted twin as data).
 
 **Wrapper words are prefixes.** `setsid`, `caffeinate`, `arch`, `taskset`, `flock`,
 `script`, `chrt`, `unbuffer`, `prlimit`, `numactl`, `builtin`, `busybox`,
@@ -193,9 +197,12 @@ blocking, on the pipeline spelling of the shape round 11 closed for a bare
 `bash <<'EOF'`. The redirect's own offset now selects the segment, and the scan
 follows pipes FORWARD, because a body a pipe delivers to a shell *is* that shell's
 program (`cat <<EOF | bash` must keep firing). A `;`, `&`, newline or `||` ends the
-pipeline — EXCEPT an fd duplicate (`2>&1`, `3>&1`), which leaves stdout in the pipe
-(`cat <<EOF 2>&1 | bash` runs the body, measured), all of which keeps the body
-data when nothing downstream receives it (`round 12`, rows L29a–L29f, A48/A49/A53).
+pipeline — EXCEPT an fd duplicate that LEAVES STDOUT ON THE PIPE (`2>&1`, `3>&1`,
+and the no-ops `>&1` / `1>&1`), which is decided by BOTH fds: `N>&M` moves stdout
+only when N is 1 or absent and M is not 1, so `cat <<EOF 2>&1 | bash` and
+`cat <<EOF >&1 | bash` both run the body (measured) while `>&2` / `1>&2` do not.
+Every other case keeps the body data when nothing downstream receives it
+(`round 12`, rows L29a–L29f, L36a/L36b, A48/A49/A53/A60).
 
 **`electron-forge` is an Electron launch; only its `start` verb is.** Every head
 test keyed on the package name `electron` exactly, so `npx electron-forge start` —
@@ -210,7 +217,10 @@ accepted only a `.app` suffix, so `open /Applications/X.app/Contents/MacOS/X` �
 same token the electron rule refuses as a command word — produced NO finding, while
 the kind list above already names the `…/Contents/MacOS/<bin>` shape. The ledger
 names the BUNDLE, which is what the owner quits (`round 12`, rows L30a/L30b and
-their identity twins).
+their identity twins). A TRAILING SLASH is the same bundle too: tab completion
+appends one to a directory, so `open ./Build/DMeer.app/` matched none of the three
+shape tests while the `-a` spelling of the same token was refused — it is stripped
+before the shape is judged (L30c, and its identity twin).
 
 **A `<<` inside a comment is DATA.** The heredoc scanner reads raw lines with the
 quote model, and `#` is not a quote character — so a comment merely *mentioning*
@@ -262,9 +272,12 @@ This is a residual list, not a completeness claim:
   the command those are data, not argv. Same class, same reason: a heredoc body
   fed to a **non-shell** interpreter (`python <<EOF`) and a shell started by a
   **flag** (`sudo -s <<EOF`, `su` with no `-c`). A body fed to a stdin-program
-  shell (`bash`/`sh`/`zsh`/… with no `-c`) **is** read, and a body behind `-c` is
-  that script's data — L28a–L28h pin both directions, and L29a–L29d pin the
-  pipeline spelling (a shell on the LEFT of a pipe is still fed by the heredoc).
+  shell (`bash`/`sh`/`zsh`/… with no `-c`) **is** read — including its GLUED
+  spelling `bash<<'EOF'`, which `tokenize` delivers as one token and which used to
+  miss the shell test entirely (L35a) — and a body behind `-c` is that script's
+  data. L28a–L28h pin both directions, L29a–L29f and L36a/L36b the pipeline and
+  fd-redirect spellings (a shell on the LEFT of a pipe is still fed by the
+  heredoc).
 - A wrapper word that is **not** in the list above, in front of a launch word
   that is **not** brought in by a package-runner (`systemd-inhibit -w electron .`)
   behaves like a plain command: its own arguments are not scanned. That is the one
@@ -294,7 +307,7 @@ This is a residual list, not a completeness claim:
 ## Tests
 
 ```bash
-node extensions/gui-device-guard/test.mjs                    # 236 assertions, threat table L1–L33 + handler H1–H15
+node extensions/gui-device-guard/test.mjs                    # 246 assertions, threat table L1–L36 + handler H1–H15
 node extensions/gui-device-guard/test.mjs --classify 'npm exec electron .'
 ```
 
@@ -305,8 +318,8 @@ stays green while `index.ts` is broken and the guard is inert in every session.
 Mutations are pinned, each attributable to the row it is about, all measured at
 ONE head (**this** head — re-measured, not carried over: the counts are the output
 of running the mutant against `test.mjs`, and the assertion total is
-`236 = 176 ROWS + 7 APP_ROWS + 53 explicit \`check()\` calls`): the Electron
-rule's `media` → `false` reds **101**; the wrapper recursion
+`246 = 185 ROWS + 8 APP_ROWS + 53 explicit \`check()\` calls`): the Electron
+rule's `media` → `false` reds **105**; the wrapper recursion
 removed reds **8**; the wrapper WORDS removed reds **2**; the structural rule that
 reads a package-runner anywhere in the segment removed reds **2** (L19h/L19i); the
 comment stripper removed reds **2** (L11d and L11f — re-measured at this head; the
@@ -335,20 +348,25 @@ by the defect, so it is the record-half twin: it reds if the fix over-cuts and
 reports nothing); deleting the escape guard that the wider set needs reds **1**
 (L27c — without it `x\)#` is cut as a comment and the launch after the `;` is lost);
 removing the shell-STDIN recursion (a heredoc/here-string fed to a shell, the
-round-11 blocking defect) reds **12** (L28a–L28f and L29a–L29f — the body is
-deleted as data, so there is no block AND no ledger row); treating an unquoted
+round-11 blocking defect) reds **15** (L28a–L28f, L29a–L29f and L35a/L36a/L36b —
+the body is deleted as data, so there is no block AND no ledger row); treating an unquoted
 `<<<word` as a heredoc
 opener reds **1** (L28h — the phantom heredoc deletes the rest of the input);
 reading the body behind `bash -c` as a program reds **1** (A46, the ALLOW twin that
 keeps the fix from over-firing on the fleet's own idiom); reverting
 `lineFeedsShell` to the line's LAST segment (the round-12 blocking defect — a
-heredoc fed to a shell on the left of a pipe) reds **6** (L29a–L29d and A49 plus
-A53, which pin the other direction: `cat <<EOF; bash` and `cat <<EOF >&2 | bash`
-must stay data); dropping the fd-duplication exception (`2>&1` read as a command
-separator) reds **2** (L29e, L29f — measured, and a regression the round-11 code
-did not have); accepting only a
-`.app` SUFFIX in `open`'s positional arm reds **4** (L30a/L30b and their two
-identity twins); dropping `electron-forge` from the electron head test reds **5**
+heredoc fed to a shell on the left of a pipe) reds **7** (L29a–L29d plus A49, A53
+and A60, which pin the other direction: `cat <<EOF; bash`, `cat <<EOF >&2 | bash`
+and `cat <<EOF 1>&2 | bash` must stay data); dropping the fd-duplication exception
+entirely (`2>&1` read as a command separator) reds **4** (L29e, L29f, L36a, L36b —
+measured, and a regression the round-11 code did not have), while the narrower
+pre-fix rule (keyed on the LEFT fd only) reds **2** (L36a `>&1`, L36b `1>&1`);
+accepting only a `.app` SUFFIX in `open`'s positional arm reds **6** (L30a–L30c and
+their three identity twins); ungating the single-quote skip from the double-quote
+state reds **2** (L34a — one apostrophe in `echo "it's"` hid every later `$( … )` —
+and A58, which the pre-fix code refused); dropping the glued-heredoc split reds
+**1** (L35a, `bash<<'EOF'` with no space); dropping the trailing-slash
+normalisation reds **2** (L30c and its identity twin); dropping `electron-forge` from the electron head test reds **5**
 (L31a–L31e); removing the PROCESS-substitution arm (`<( … )` / `>( … )`, the
 round-12 review's second P2) reds **3** (L32a–L32c, and A55 stays green because the
 double-quoted spelling never was a substitution); dropping the inner-binary term from
