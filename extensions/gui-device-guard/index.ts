@@ -469,7 +469,18 @@ function isRedirectionAmp(command: string, i: number): boolean {
  */
 function isRedirectionPipe(command: string, i: number): boolean {
   if (command[i] !== "|") return false;
-  return command[i - 1] === ">";
+  if (command[i - 1] !== ">") return false;
+  // ⛔ AN ESCAPED `>` IS A WORD CHARACTER, NOT A REDIRECT (round-12 review, eighteenth
+  // pass, P0). `a\>|open X.app` is a PIPE with a literal `a>` word on the left, so bash
+  // runs the right-hand side — but the raw-character test merged the two, the merged
+  // token resolved to no command word, and the launch vanished (measured: bash runs
+  // `open X.app`, the guard returned [] with no block and no row). Only an ODD run of
+  // backslashes escapes, so the parity is counted here rather than read from the mask
+  // (`unquotedMask` leaves an escaped character UNQUOTED by design — it answers "may
+  // this shell metacharacter act", not "is it escaped").
+  let run = 0;
+  for (let k = i - 2; k >= 0 && command[k] === "\\"; k--) run++;
+  return run % 2 === 0;
 }
 
 export function splitSegments(command: string): string[] {

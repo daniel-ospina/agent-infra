@@ -794,6 +794,13 @@ const ROWS = [
     ">|x electron .", 1, "electron", true],
   ["A86 the ALLOW twin: …with a benign word it stays clean",
     ">|x ls", 0, null, false],
+  //   L68: an ESCAPED `>` is a word character, so the `|` after it is still a PIPE and
+  //        the right-hand side runs — merging the two into one token resolved the
+  //        command word to nothing and allowed the launch (measured).
+  ["L68 an escaped `>` does not join the following pipe into one segment (was [])",
+    "a\\>|open ./Build/DMeer.app", 1, "open", true],
+  ["A87 the ALLOW twin: a genuinely escaped `>` on the left of a pipe with a benign word",
+    "a\\>|ls", 0, null, false],
   //   A83: the twin that keeps the strip honest — a SPACE before the continuation's tab
   //        means the tab is not LEADING, so the terminator is not recognised and the
   //        document runs to end-of-input (measured: `cat` prints ` \tEOF`).

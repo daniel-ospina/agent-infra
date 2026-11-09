@@ -286,6 +286,23 @@ This is a residual list, not a completeness claim:
 - `node script.js` that `require("electron")`s, a compiled `.app` started by a
   shell function, `xcodebuild test`, `xcrun simctl` — **not classified**. argv
   cannot tell them from a plain `node` run.
+- **Not classified, measured, and KNOWN at this head** — each one is a spelling bash
+  RUNS while the guard returns `[]`, so it is a miss, not an over-fire. They are listed
+  rather than fixed because closing them means modelling more of bash's grammar than a
+  lexer can carry, and pretending otherwise is what this list exists to prevent:
+  - `{fd}>` — bash's brace FD-ASSIGNMENT redirect (`{fd}>x electron .`, `{fd}>">" …`).
+    It is neither a word nor a `\d{1,2}` redirect to the stripper, so the token is cut
+    at its `>` and the launch is lost.
+  - `<<""` — an EMPTY quoted delimiter (`<<""></…`, `<<"" electron .`). `heredocDelimiter`
+    returns null for a delimiter that quote-removal empties, so the operator is stripped
+    as an ordinary redirect and the word after it is read as the command.
+  - `a\>&electron .` — an ESCAPED `&` after a word: `isRedirectionAmp` reads the raw
+    previous character, so the pair is merged and the command word is lost (the `|` half
+    of this class is fixed and pinned by L68).
+- **Over-blocks, declared**: an operator run with a quoted metacharacter in the MIDDLE
+  (`>">"> electron .`) is refused although bash treats the rest as further redirects and
+  never runs a command — the run stops at the first quoted character by design (L66 is the
+  same rule doing its job in the attached-target case).
 - **Parameter, command and arithmetic expansion inside an UNQUOTED heredoc body** is
   not modelled: the docstring of `unquoteHeredocBackslashes` says so, and only the
   backslash step (`\\`, `\$`, `` \` ``, continuation) is applied. A body whose launch is
@@ -340,7 +357,9 @@ This is a residual list, not a completeness claim:
   quoted character, because `>">" electron .` is ONE bare redirect whose target is the
   quoted `>`: taking the regex remainder as "no target attached" ate the next word and
   lost the launch (L66/L66b). `>|` is a redirect too, not a pipe, and segmentation used
-  to split there before the stripper ever saw it (L67, allow twin A86).
+  to split there before the stripper ever saw it (L67, allow twin A86) — but only when
+  that `>` is a REAL operator: in `a\>|open X.app` the `>` is escaped, so the `|` is a
+  pipe and the right-hand side runs (L68, allow twin A87).
 - A LINE CONTINUATION is joined per line INSIDE the heredoc scanner, so the operator can
   sit on the continued line (`bash \` + newline + `<<'EOF'`, `bash <<<\` + newline +
   `'electron .'` — both hand a body to `bash`, L53a/L53b) while a BODY is never joined:
@@ -469,7 +488,7 @@ This is a residual list, not a completeness claim:
 ## Tests
 
 ```bash
-node extensions/gui-device-guard/test.mjs                    # 337 assertions, threat table L1–L67 + handler H1–H15
+node extensions/gui-device-guard/test.mjs                    # 339 assertions, threat table L1–L68 + handler H1–H15
 node extensions/gui-device-guard/test.mjs --classify 'npm exec electron .'
 ```
 
@@ -480,7 +499,7 @@ stays green while `index.ts` is broken and the guard is inert in every session.
 Mutations are pinned, each attributable to the row it is about, all measured at
 ONE head (**this** head — re-measured, not carried over: the counts are the output
 of running the mutant against `test.mjs`, and the assertion total is
-`337 = 266 ROWS + 14 APP_ROWS + 57 explicit \`check()\` calls`): the Electron
+`339 = 268 ROWS + 14 APP_ROWS + 57 explicit \`check()\` calls`): the Electron
 rule's `media` → `false` reds **150**; the wrapper recursion
 removed reds **8**; the wrapper WORDS removed reds **4** (L45a + L56a–L56c); the structural rule that
 reads a package-runner anywhere in the segment removed reds **2** (L19h/L19i); the
@@ -578,8 +597,9 @@ matched operator RUN — so a redirect whose target begins with a quoted `<`/`>`
 quoted — reds **3** (L63–L65: `>">"x electron .` displaced the command word and was
 allowed); letting the greedy operator run decide whether a target is ATTACHED reds
 **2** (L66/L66b — `>">"` is one bare `>` whose quoted `>` is the target, so eating the
-next word lost `>">" electron .`); and segmenting `>|` as a pipe again reds **1**
-(L67); and reading `watch`'s operand from token 0 again
+next word lost `>">" electron .`); segmenting `>|` as a pipe again reds **1** (L67); and treating an ESCAPED
+`>` as a redirect operator — which merges the pipe after it into one token and loses
+the right-hand side — reds **1** (L68, allow twin A87); and reading `watch`'s operand from token 0 again
 reds **3** (L56a–L56c); dropping `electron-forge` from the electron head test reds **5**
 (L31a–L31e); removing the PROCESS-substitution arm (`<( … )` / `>( … )`, the
 round-12 review's second P2) reds **3** (L32a–L32c, and A55 stays green because the
