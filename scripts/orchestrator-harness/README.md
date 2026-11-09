@@ -2178,6 +2178,13 @@ re-entered it. `MAX_WATCH` is therefore re-derived in the `--watch` path from th
 watchdog's `IDLE_S` allowance (that bound WINS when it is smaller: a labelled hand-off beats an unlabelled
 kill), and skipped when `LANE_MERGE_MAX_WATCH` is pinned. A controller re-run has no lane clock, resolves
 nothing, and keeps exactly the 7 shipped chunks.
+⛔ **AND "WALL AXIS OFF" (`LANE_TIMEOUT=0`) IS NOT READ AS A ZERO CLOCK FOR SUPERVISION EITHER** (review
+cycle 13, P2 — measured: the same arithmetic floored that lane at ONE chunk, 120 s, on a lane documented
+as unbounded, so `--watch` posted a blocker two minutes into a legitimate chain wait). With the wall axis
+off the allowance comes from `LANE_BACKSTOP_S` when the fleet exports it — still capped by the watchdog
+allowance, which applies whatever clock the wall axis was set to — and with neither it is **unbounded**
+(a zero allowance now means *there is no counter*, not *it is spent*), so it ends when the chain resolves
+or dies. The `LANE_TIMEOUT=0` operator line says which of the two it got.
 ⛔ **And the wait is spent inside ONE tool call**, so it has a SECOND bound that is not this clock: the
 watchdog's progress allowance (`lane-bound.sh`'s `IDLE_S`, `LANE_BOUND_IDLE_S`, default **2700 s** —
 spawn-gate passes no `--idle`). Its only working progress arm for a polling loop is growth of the LANE

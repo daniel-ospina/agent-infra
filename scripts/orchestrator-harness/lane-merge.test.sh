@@ -1662,8 +1662,33 @@ _btick="$(printf '\140')"
 _bt_hits="$(grep -E '(say_err|log_line|disposition|verdict|post_handoff) "' "$SCRIPT" || true)"
 ck "no say_err / log_line / disposition / verdict / post_handoff message carries a backtick inside its double quotes (it would run as COMMAND SUBSTITUTION and silently delete the word from the operator-facing line)" \
    $(! grep -qF "$_btick" <<<"$_bt_hits" && echo 0 || echo 1)
-ck "the LANE_TIMEOUT=0 disclosure still states that --watch supervision stays FINITE (so it cannot read as 'this lane has no bounds at all')" \
-   $(grep -q 'ONLY THE CHECK WAIT IS UNBOUNDED HERE' "$SCRIPT" && echo 0 || echo 1)
+# ⛔ THE WALL-AXIS-OFF ALLOWANCE IS DERIVED FROM SOMETHING, NOT FROM THE ZERO CLOCK (review cycle 13,
+# P2 — measured: the design arithmetic floors at ONE chunk = 120 s of supervision on a lane documented as
+# unbounded, so --watch posted a blocker two minutes into a legitimate chain wait). Three arms: the
+# backstop source is FINITE and sized from LANE_BACKSTOP_S, the no-backstop case is UNBOUNDED, and an
+# unbounded allowance must not fire the budget block (a zero allowance means NO COUNTER, not "spent").
+new_o "$T/pr-fit.tsv"
+printf 'open||fithead|clean\n' > "$T/pr-fit.tsv"
+printf '28\n' > "$OT/state/lanemerge-50.watch"
+OUT="$(REPO_PATH="${REPO_PATH:-$RUN_REPO}" PATH="$BIN:$PATH" GH_LOG=/dev/null O="$OT" HOME="$T/home" \
+      LANE_TIMEOUT=0 LANE_BACKSTOP_S=3600 LANE_MERGE_WAIT=0 LANE_MERGE_POLL=0 LANE_BOUND_IDLE_S=0 \
+      bash "$SCRIPT" 50 --watch --repo o/r --pr-tsv "$T/pr-fit.tsv" 2>&1)"; RC=$?
+ck "LANE_TIMEOUT=0 with LANE_BACKSTOP_S=3600 sizes supervision from the BACKSTOP ((3600-10)/120 = 29 chunks), so the 29th chunk is admitted rather than the 2nd being refused" \
+   $([ "$RC" = 11 ] && [ "$(verdict_of 50 | cut -d' ' -f1)" = WAITING_CHAIN_ABSENT ] && echo 0 || echo 1)
+printf '29\n' > "$OT/state/lanemerge-50.watch"
+OUT="$(REPO_PATH="${REPO_PATH:-$RUN_REPO}" PATH="$BIN:$PATH" GH_LOG=/dev/null O="$OT" HOME="$T/home" \
+      LANE_TIMEOUT=0 LANE_BACKSTOP_S=3600 LANE_MERGE_WAIT=0 LANE_MERGE_POLL=0 LANE_BOUND_IDLE_S=0 \
+      bash "$SCRIPT" 50 --watch --repo o/r --pr-tsv "$T/pr-fit.tsv" 2>&1)"; RC=$?
+ck "…and the NEXT one is refused (counter 29 → chunk 30) and the hand-off SAYS 29, so the backstop-derived bound is pinned by its own number (pre-fix prints 1 and reds here)" \
+   $([ "$RC" = 13 ] && [ "$(verdict_of 50 | cut -d' ' -f1)" = BLOCKED_ATTEMPTS ] && grep -q '29 --watch chunks spent' <<<"$OUT" && echo 0 || echo 1)
+printf '999\n' > "$OT/state/lanemerge-51.watch"
+OUT="$(REPO_PATH="${REPO_PATH:-$RUN_REPO}" PATH="$BIN:$PATH" GH_LOG=/dev/null O="$OT" HOME="$T/home" \
+      LANE_TIMEOUT=0 LANE_MERGE_WAIT=0 LANE_MERGE_POLL=0 LANE_BOUND_IDLE_S=0 \
+      bash "$SCRIPT" 51 --watch --repo o/r --pr-tsv "$T/pr-fit.tsv" 2>&1)"; RC=$?
+ck "LANE_TIMEOUT=0 with NO LANE_BACKSTOP_S is UNBOUNDED supervision: the 1000th chunk is NOT refused (a zero allowance means there is no counter, not that it is spent)" \
+   $([ "$RC" = 11 ] && [ "$(verdict_of 51 | cut -d' ' -f1)" = WAITING_CHAIN_ABSENT ] && echo 0 || echo 1)
+ck "the LANE_TIMEOUT=0 disclosure NAMES what the supervision axis got, instead of claiming a finite count it does not have" \
+   $(grep -q 'the --watch supervision allowance is NOT derived' "$SCRIPT" && grep -q 'UNBOUNDED (there is no counter to spend)' "$SCRIPT" && echo 0 || echo 1)
 
 # ⛔ THE RE-INVOCATION PATH (review round 3, P2 — verified): the documented resume omits `--issue` and
 # recovers it from `$O/state/lanemerge-<pr>.issue`. Resolving the heartbeat target BEFORE that recovery

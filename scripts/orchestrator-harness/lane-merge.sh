@@ -1245,12 +1245,28 @@ if [ "$WATCH" -eq 1 ]; then
   if [ -z "${LANE_MERGE_MAX_WATCH:-}" ]; then
     _mw_rt="$MAX_WATCH"
     _watch_elapsed="$(lane_elapsed_s)"
-    if [ -n "$_watch_elapsed" ] && [ "$LANE_WALL_S" -gt 0 ]; then
+    # ⛔ THE WALL AXIS CAN BE OFF, AND THEN THERE IS NO CLOCK TO DERIVE FROM ' SO DO NOT DERIVE FROM THE
+    # ZERO (review cycle 13, P2 ' MEASURED: with `LANE_TIMEOUT=0` this block's `-gt 0` guard did not run,
+    # leaving the design operand's `MAX_WATCH_FIT`, which the arithmetic floors at ONE chunk ' 120 s of
+    # supervision on a lane DOCUMENTED AS UNBOUNDED ' and `--watch` then posted a blocker two minutes into
+    # a legitimate chain wait. That is the same 0-semantics inversion this branch fixed for the check wait,
+    # one layer down). The backstop lane-bound.sh was armed with is the honest source when the fleet exports
+    # it; with neither, supervision is unbounded too (a zero allowance means NO COUNTER, not "spent") and
+    # the operator line says which of the two it got.
+    if [ "$LANE_WALL_S" -eq 0 ]; then
+      if is_limit "${LANE_BACKSTOP_S:-}" && [ "${LANE_BACKSTOP_S:-0}" -gt 0 ]; then
+        _backstop_fit=$(( (LANE_BACKSTOP_S - _hb_margin) / _fit_poll ))
+        [ "$_backstop_fit" -ge 1 ] || _backstop_fit=1
+        _mw_rt="$_backstop_fit"
+      else
+        _mw_rt=0
+      fi
+    elif [ -n "$_watch_elapsed" ]; then
       _wall_fit=$(( (LANE_WALL_S - _watch_elapsed - POLL_S) / _fit_poll ))
       [ "$_wall_fit" -gt "$_mw_rt" ] && _mw_rt="$_wall_fit"
     fi
-    [ "$_mw_rt" -ge "$MAX_WATCH_FIT" ] || _mw_rt="$MAX_WATCH_FIT"   # never below the design floor
-    if [ "$IDLE_BOUND_S" -gt 0 ]; then
+    [ "$_mw_rt" -eq 0 ] || { [ "$_mw_rt" -ge "$MAX_WATCH_FIT" ] || _mw_rt="$MAX_WATCH_FIT"; }   # never below the design floor, unless unbounded
+    if [ "$_mw_rt" -gt 0 ] && [ "$IDLE_BOUND_S" -gt 0 ]; then
       _idle_fit=$(( (IDLE_BOUND_S - _hb_margin) / _fit_poll ))
       if [ "$_idle_fit" -ge 1 ] && [ "$_idle_fit" -lt "$_mw_rt" ]; then _mw_rt="$_idle_fit"; fi
     fi
@@ -1316,7 +1332,10 @@ if [ "$WATCH" -eq 1 ]; then
     verdict MERGED "$(merged_confirmed 2>/dev/null || printf '%s' "${MT:-${HD:-}}")"
     log_line "✅ MERGED — PR #$PR at head ${HD:-}"; exit 0
   fi
-  if [ "$w" -gt "$MAX_WATCH" ]; then
+  # ⛔ A ZERO ALLOWANCE MEANS "NO COUNTER", NOT "SPENT" (the wall axis is OFF and no `LANE_BACKSTOP_S` was
+  # exported): without this conjunct the comparison fires on the FIRST chunk for ever, which is the same
+  # inversion one more time.
+  if [ "$MAX_WATCH" -gt 0 ] && [ "$w" -gt "$MAX_WATCH" ]; then
     # ⛔ A CHUNK THAT ESTABLISHED NOTHING MUST NOT BE REPORTED AS "UNRESOLVED" (reviewer finding, P2,
     # verified). `WAITING_API` returns in seconds and explicitly refuses to judge the PR, so a run of
     # them could burn the whole budget and then post "the merge chain has not resolved this PR" — a
@@ -1603,7 +1622,19 @@ if [ "$LANE_WALL_S" -eq 0 ]; then
   # "command not found" to stderr and DELETED the word from the line — corrupting the one message a
   # LANE_TIMEOUT=0 operator reads, on the exact path this branch exists to fix. `bash -n` passes and a
   # prefix-grep arm cannot see it, so `lane-merge.test.sh` now pins "no backtick in any say_err".
-  say_err "lane-merge: LANE_TIMEOUT=0 is the documented 'wall axis OFF' value (unbounded), not a zero-second budget — the ${WAIT_S}s check wait is NOT clamped, and no wall ceiling is enforced for this lane. Reading it as 0 would hand off WAITING_CHECKS on the first poll for ever (#3850 review, P2). ⛔ ONLY THE CHECK WAIT IS UNBOUNDED HERE: the --watch supervision allowance is still a FINITE ${MAX_WATCH} chunk(s) (${MAX_WATCH} x ${POLL_S}s), derived by the same arithmetic from a clock that is now 0 and floored at one chunk — do not read this line as 'this lane has no bounds at all'."
+  # ⛔ AND IT QUOTES THE DESIGN OPERAND, NOT THE WATCHDOG-CAPPED VALUE (review cycle 13, P3 — measured: it
+  # read 10s while the line printed IMMEDIATELY ABOVE it said the wait was capped at 10s, and this line
+  # claimed nothing had clamped it). ⛔ AND IT STATES WHAT HAPPENS TO THE SUPERVISION AXIS, which is no
+  # longer "floored at one chunk" — see the re-derivation in the `--watch` branch.
+  if is_limit "${LANE_BACKSTOP_S:-}" && [ "${LANE_BACKSTOP_S:-0}" -gt 0 ]; then
+    _watch_basis_note="lane-bound.sh's own backstop (LANE_BACKSTOP_S=${LANE_BACKSTOP_S}s), because the wall axis (LANE_TIMEOUT) is OFF"
+    _backstop_chunks=$(( (LANE_BACKSTOP_S - _hb_margin) / _fit_poll )); [ "$_backstop_chunks" -ge 1 ] || _backstop_chunks=1
+    _watch_supervision_note="a FINITE ${_backstop_chunks} chunk(s) derived from it, further capped by the watchdog allowance when that is smaller"
+  else
+    _watch_basis_note="no clock at all, because the wall axis is OFF (LANE_TIMEOUT=0) and no LANE_BACKSTOP_S is exported"
+    _watch_supervision_note="UNBOUNDED (there is no counter to spend)"
+  fi
+  say_err "lane-merge: LANE_TIMEOUT=0 is the documented 'wall axis OFF' value (unbounded), not a zero-second budget — the design check wait is ${WAIT_S_DESIGN}s and it is NOT clamped by the wall clock (a WATCHDOG cap may still have reduced it to ${WAIT_S}s, and the line above says so when it did), and no wall ceiling is enforced for this lane. Reading 0 as a zero-second budget would hand off WAITING_CHECKS on the first poll for ever (#3850 review, P2). ⛔ AND NOTE THE OTHER AXIS: the --watch supervision allowance is NOT derived from that zero clock (review cycle 13, P2) — it comes from ${_watch_basis_note}, so it is ${_watch_supervision_note} here. Do not read this line as 'this lane has no bounds at all'."
 elif [ -n "$_lane_elapsed" ]; then
   _wall_left=$(( LANE_WALL_S - _lane_elapsed - _hb_margin ))
   [ "$_wall_left" -ge 0 ] || _wall_left=0
