@@ -49,8 +49,17 @@ RECORD_DEFAULT="${HOME:-/tmp}/.pi/agent/state/disk-reaper.deployed"
 # KEEP live-process/live-cwd verdict comes from. It was outside the set until review round 3 (P1), so
 # `--source <checkout>` could report `deployed ok` while the census ran a different library than the
 # checkout's.
+# ⛔ `lib/cell-home.sh` IS THE THIRD LIBRARY AND THE SAME CLASS (agent-infra#3453, review F2).
+# `reap-abandoned-worktrees.sh` resolves it from `$SELF_DIR/lib/` and `exit 3`
+# (`SKIP reason=cell-home-library-missing`) without it, so with the library outside this census the
+# deployment gate certified `deployed ok` over a set in which the abandoned-worktree class was DEAD on
+# every pass — the exact "`deployed ok` while a delegate cannot run" defect this list exists to make
+# impossible to miss, one library later. It is also the one library whose absence silently changes a
+# DELETE policy (it supplies `CELL_HOME_LEGACY`, the home the gitless guard protects), which is the
+# #3278 shape.
 FILES="disk-reaper.sh disk-reaper-run.sh pi-cache-reap.sh reap-lane-venvs.sh pi-reap-worktrees.sh
-reap-abandoned-worktrees.sh reap-duplicate-installs.sh reap-runner-work.sh lib/bounded.sh lib/live-paths.sh"
+reap-abandoned-worktrees.sh reap-duplicate-installs.sh reap-runner-work.sh lib/bounded.sh
+lib/cell-home.sh lib/live-paths.sh"
 
 usage() {
     cat <<EOF

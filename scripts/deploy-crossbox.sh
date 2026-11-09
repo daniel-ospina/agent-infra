@@ -15,8 +15,29 @@
 # execute mixed content — the running loop holds orch-loop.sh open.
 set -uo pipefail
 
+# ── THE ONE HOME (agent-infra#3453) — DERIVED, never re-spelled ──────────────────────────────────
+# The default here used to be `/tmp/cell-home`, the legacy volatile home. This script exports
+# `HOME="$CELL_HOME"` for the controller session it builds, so a default pointing at the legacy home
+# handed every lane a home the spawning unit did not use — the measured 403-contents=write split.
+# The rule and its precedence live in `scripts/lib/cell-home.sh`.
+# ⛔ THE SELF PATH COUNTS ONLY WHEN IT NAMES THIS FILE — see `lib/cell-home.sh` §CONSUMERS.
+_SELF="${BASH_SOURCE[0]:-}"; [ -f "$_SELF" ] || _SELF=""     # under `bash -s` $0 is literally `bash` -> `.`
+CROSSBOX_SELF_DIR=""
+if [ -n "$_SELF" ]; then CROSSBOX_SELF_DIR="$(cd "$(dirname "$_SELF")" 2>/dev/null && pwd -P)"; fi
+CELL_HOME_LIB="${CROSSBOX_SELF_DIR:+$CROSSBOX_SELF_DIR/lib/cell-home.sh}"
+if [ -n "$CELL_HOME_LIB" ] && [ -r "$CELL_HOME_LIB" ]; then
+  . "$CELL_HOME_LIB"
+  CELL_HOME="$(cell_home_resolve)"
+elif [ -n "${CELL_HOME:-}" ]; then
+  :   # an explicit CELL_HOME is a complete answer; the resolver only supplies the DEFAULT
+elif [ -n "${HOME:-}" ]; then
+  CELL_HOME="$HOME"
+  printf '%s: warn: %s is not readable — using HOME (%s) as the cell home; the durable-home default is unavailable on this copy (agent-infra#3453)\n' "${0##*/}" "${CELL_HOME_LIB:-lib/cell-home.sh}" "$CELL_HOME" >&2
+else
+  printf '%s: FATAL: %s is not readable and neither CELL_HOME nor HOME is set — refusing to default the cell home to the legacy /tmp/cell-home (agent-infra#3453)\n' "${0##*/}" "${CELL_HOME_LIB:-lib/cell-home.sh}" >&2
+  exit 78
+fi
 BR="${BR:-}"   # unused now the deploy fast-forwards main; kept for callers
-CELL_HOME="${CELL_HOME:-/tmp/cell-home}"
 AI="${AI:-/tmp/cell-ai}"
 O="${O:-$CELL_HOME/orchestrator}"
 H="$AI/scripts/orchestrator-harness"

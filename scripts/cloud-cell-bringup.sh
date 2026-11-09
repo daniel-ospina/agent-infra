@@ -68,7 +68,29 @@
 
 set -uo pipefail
 
-CELL_HOME="${CELL_HOME:-/tmp/cell-home}"
+# ── THE ONE HOME (agent-infra#3453) — DERIVED, never re-spelled ──────────────────────────────────
+# This file used to DEFAULT the cell home to `/tmp/cell-home`, the legacy volatile home, while its own
+# `check_one_home` gate refuses exactly that value (CELL_HOME must BE the account's home). So the
+# default and the gate disagreed, and a bring-up run with `CELL_HOME` unset resolved a home the same
+# file then failed the box for — the two-home split restated inside one script. The rule, the
+# precedence, and the ONLY literal now live in `scripts/lib/cell-home.sh`.
+# ⛔ A MISSING SIBLING IS NOT A REFUSAL HERE, for the same reason `UV_ENV_HELPER` below is not: a
+# bring-up must still be able to REPORT the state of a box. The fallback is `$HOME` (never the legacy
+# path), and it is not trusted — `check_one_home` re-derives the account home from the passwd record
+# and refuses a mismatch, so a wrong `$HOME` becomes a named CHECK FAILURE, not a silent second home.
+# ⛔ THE SELF PATH COUNTS ONLY WHEN IT NAMES THIS FILE — see `lib/cell-home.sh` §CONSUMERS.
+_SELF="${BASH_SOURCE[0]:-}"; [ -f "$_SELF" ] || _SELF=""     # under `bash -s` $0 is literally `bash` -> `.`
+BRINGUP_SELF_DIR=""
+if [ -n "$_SELF" ]; then BRINGUP_SELF_DIR="$(cd "$(dirname "$_SELF")" 2>/dev/null && pwd -P)"; fi
+CELL_HOME_LIB="${BRINGUP_SELF_DIR:+$BRINGUP_SELF_DIR/lib/cell-home.sh}"
+if [ -n "$CELL_HOME_LIB" ] && [ -r "$CELL_HOME_LIB" ]; then
+  . "$CELL_HOME_LIB"
+  CELL_HOME="$(cell_home_resolve)"
+else
+  CELL_HOME="${CELL_HOME:-${HOME:-}}"
+  CELL_HOME_LIB_MISSING=1
+  [ -n "$CELL_HOME" ] || { printf '%s: FATAL: %s is not readable and neither CELL_HOME nor HOME is set — refusing to invent a cell home. FIX: run pi-bootstrap/setup.sh (its lib farm places the resolver), or pass CELL_HOME=<the box home> (agent-infra#3453)\n' "${0##*/}" "${CELL_HOME_LIB:-lib/cell-home.sh}" >&2; exit 78; }
+fi
 # The agent-infra checkout `check_operational_layer` trusted and installed the layer from. Global so
 # later steps (the disk-reaper timer's TEMPLATES_DIR) use the SAME checkout, rather than resolving a
 # second, possibly untrusted one.
@@ -103,7 +125,7 @@ MODE="${1:---check}"
 #     measured 50 minutes later as 257 MB of free disk.
 # A helper that cannot be read is not fatal here (a bring-up must still be able to report the state of
 # a box): `check_uv_env` says so and the values are computed from the same one-line formula.
-BRINGUP_HERE="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd -P)"
+BRINGUP_HERE="${BRINGUP_SELF_DIR:-}"
 UV_ENV_HELPER="${BRINGUP_HERE:+$BRINGUP_HERE/orchestrator-harness/uv-env.sh}"
 if [ -n "$UV_ENV_HELPER" ] && [ -r "$UV_ENV_HELPER" ]; then
   . "$UV_ENV_HELPER"
@@ -467,7 +489,14 @@ check_one_home() { # <env|units>
 $(printf '%s\n' "$bad" | sed 's/^/    /')
 FIX: move the state under \$HOME (CELL_HOME=\$HOME, and point WORKDIR/ENV_FILE/HARNESS_PIN_DIR there), then re-run this --check."
     fi
-    ok "one home: CELL_HOME=$got (this box's home) — the env this run hands the cell carries no path outside it"
+    # ⛔ THE DERIVATION IS NAMED ON THIS LINE, not on a line of its own: a bring-up's stdout is
+    # machine-read (the suite captures blocks of it), so a degraded derivation is reported as a FIELD of
+    # the verdict that already exists rather than as a new line that shifts everything after it.
+    if [ "${CELL_HOME_LIB_MISSING:-0}" = 1 ]; then
+      ok "one home: CELL_HOME=$got (this box's home; derived by \$HOME — ${CELL_HOME_LIB:-lib/cell-home.sh} is not readable on this copy, so the durable-home DEFAULT is unavailable, agent-infra#3453) — the env this run hands the cell carries no path outside it"
+    else
+      ok "one home: CELL_HOME=$got (this box's home) — the env this run hands the cell carries no path outside it"
+    fi
     return 0
   fi
   # ── units leg — runs LAST in --check, because the installers RENDER the units (scanning earlier
