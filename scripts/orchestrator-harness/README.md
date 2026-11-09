@@ -2146,19 +2146,42 @@ liveness instrument we have). Supervision is **bounded and sized to what the lan
 `WAIT_S + MAX_WATCH × POLL + IMPL_RESERVE ≤ LANE_TIMEOUT` (5400 + 7 × 120 + 900 = 7140 of the 7200 s
 clock), so the merge phase leaves the declared implementation reserve standing — a bound the lane itself
 reaches before its own kill, not one only a later lane could inherit.
-⛔ **The trade is stated, because the arithmetic does not make it small.** The merge phase's share of the
-one clock went 2340 s → 6240 s, so what is left for implement → commit → push → open PR went 4860 s →
-**960 s** — 60 s above the 900 s reserve, not "unchanged". A lane that needs longer hands off
-(`WAITING_CHECKS`, exit 11) and the next invocation resumes the SAME counter; buying more headroom means
-raising `LANE_BACKSTOP_S`, which is not this constant's decision.
+⛔ **The trade is stated, because the arithmetic does not make it small — and the FIRST version of this
+paragraph got it backwards** (review cycle 7, P2 — recomputed from both trees instead of carried): it
+compared 1500 s + 7 chunks against 5400 s + 7 chunks and concluded the implementation reserve fell
+"4860 s → 960 s". Main does not ship 7 chunks; it derives **40** (`(7200−1500−900)/120`, the same
+invariant one paragraph up), so the honest row is:
+
+| | `origin/main` | this tree |
+|---|---|---|
+| `WAIT_S` | 1500 | 5400 |
+| derived `MAX_WATCH` × `POLL` | 40 × 120 = 4800 | 7 × 120 = 840 |
+| merge phase's share of the clock | 6300 | 6240 |
+| left for implement → commit → push → open PR | 900 | 960 |
+
+The merge phase's share goes **down** slightly and the implementation reserve goes **up** by 60 s, so this
+constant does not starve implementation. What it costs is **supervision chunks, 40 → 7**: a 5400 s wait on
+a 7200 s clock leaves one 840 s `--watch` allowance. That is the deliberate trade — 7 chunks over a wait
+that reaches the merge phase, instead of 40 over a wait that can never be satisfied — and buying more of
+it means raising `LANE_BACKSTOP_S`, which is not this constant's decision. A lane that needs longer than
+the reserve hands off (`WAITING_CHECKS`, exit 11) and the next invocation resumes the SAME counter.
 ⛔ **And the wait is spent inside ONE tool call**, so it has a SECOND bound that is not this clock: the
 watchdog's progress allowance (`lane-bound.sh`'s `IDLE_S`, `LANE_BOUND_IDLE_S`, default **2700 s** —
 spawn-gate passes no `--idle`). Its only working progress arm for a polling loop is growth of the LANE
 log (the CPU arm cannot see a poll's short-lived `gh`/`python3` child: `ps time` reports accumulated time
 of processes still ALIVE, measured `cpu_delta_cs=0` across a healthy wait). So `lane-merge.sh` appends a
 heartbeat to the lane log each poll, and **caps the wait below `IDLE_S`** when it cannot resolve a
-heartbeat target — an uncapped wait is killed as `stalled` before it can write `WAITING_CHECKS`, which is
-strictly worse than the shorter bound it replaces (#3584 review, P1).
+heartbeat target — an uncapped wait is killed as `stalled` before it can write `WAITING_CHECKS`, which is strictly worse than the shorter bound it replaces (#3584 review, P1).
+⛔ **And it has a THIRD bound: the lane's own REMAINING wall clock** (#3584 review, P1).
+`deadline` was `now + WAIT_S` with nothing comparing it to how much of `LANE_WALL_S` THIS lane had already
+spent, so a lane entering its merge phase more than ~1800 s in (7200 − 5400) was TERMed by
+`lane-bound.sh`'s wall ceiling MID-wait — no `WAITING_CHECKS`, no verdict file, no hand-off, which
+is strictly worse than the 1500 s bound this change replaces. `lane-merge.sh` now reads the start epoch
+out of the run token `lane.sh` stamps before it spawns the agent (`$O/logs/lane-<issue>.owner`, whose
+epoch OVER-states the start, the conservative direction) and clamps the wait to what is left, minus a
+margin to write the hand-off. The token's pid must be LIVE, so a stale token from a finished run cannot
+clamp a later invocation to 0; `LANE_MERGE_ELAPSED_S` is the explicit seam, and an elapsed it cannot
+resolve is reported as a residual instead of being read as "the lane just started".
 ⛔ **THE CHECK WAIT IS THE LONG POLE AND ITS COVERAGE IS FINITE**: 5400 s covers 79.9 % of the
 measured lane-visible wait (`created_at` → `updated_at`, including the pre-start queue) and 94.3 % of
 run duration (the window holds NO successful run, so those are failing-run figures; the newest 100
@@ -3432,7 +3455,7 @@ lives in the ONE tracked watchdog, `scripts/orchestrator-harness/watchdog-loop.s
 | **REMOVED** (absent from every domain, **and no controller process alive**) | `launchctl enable` then `launchctl bootstrap <domain> <plist>` — the state `KeepAlive` cannot reach, and the one a routine `-w`/`bootout` flow leaves behind. ⛔ ONLY when the controller is **GONE**: the arm re-probes the recorded pid at the moment of the mutation, because a bootstrap beside a live (`WEDGED`) controller is a SECOND controller on one PR queue. ⚠ **AND IT THEREFORE CLEARS A DELIBERATE STOP TOO** (review P2, cycle 11): `launchctl disable`/`bootout` leaves exactly this state, and on this evidence a `Disabled` override is indistinguishable from the `-w` residue the arm exists to clear — so an operator who wants the fleet stopped must keep a live controller, or point `WATCHDOG_PLIST` at nothing. This row used to imply the arm protected a deliberate stop; the live-controller re-probe is what it actually protects. ⚠ THAT RE-PROBE IS SCOPED AND MUST SEE THE **PIN TREE**: launchd runs `bash __HARNESS__/__ENTRY__` (`launchd.plist.template:24`), which is neither `$O` nor the watchdog's own dir — measured on a live box, `bash /home/cmux/harness/<sha12>/scripts/orchestrator-harness/orch-loop.sh`, while `$O` is the deployed harness dir. So the probe also scans the pin root (`PIN_ROOT`, `$HOME/harness` by default); without that it is lock-only and a controller alive with an absent/stale lock gets bootstrapped over (measured) |
 | **UNREADABLE** ⚠ CORRECTED (`rc 64` `Unrecognized target specifier.`, or any non-zero whose text names neither a missing service nor a missing domain) | `kickstart` only — never a bootstrap, because that action must not re-load a job that may exist |
 | REMOVED **with no plist on disk** | nothing; `verdict=RESTART-UNAVAILABLE` names the label and the path it looked for — and its `detail=` remedy is **label-aware** (review P2, cycle 4): for the default **stack** label (`com.eldato.orchestrator-stack`, the box's own supervision job — `orchestrator-bringup.sh:1065-1069`) it says `install.sh` does **NOT** repair it, because that script renders the **loop** label only (`com.eldato.orchestrator-loop`) and following it would load a DIFFERENT job beside the box's model (the duplicate-controller class, #1761). For `com.eldato.orchestrator-loop` itself it names `install.sh`, which on that box IS the correct provisioning verb. ⚠ this row used to claim unconditionally that the line never names `install.sh`, which was false for the one label where that advice is right |
-| REMOVED, plist present but **not this job** (its `Label` is another label, or its `ProgramArguments` name a controller outside every root this box owns) | nothing; `verdict=RESTART-REFUSED` says nothing was issued and names the `Label` it actually found. ⛔ PROVENANCE IS READ BEFORE ANY MUTATION (review P1, cycle 4): `launchctl bootstrap` resolves the job by the plist's OWN `Label`, never by the file name, so "a file exists at `$PLIST_PATH`" is not evidence that loading it restores THIS label — a stale, copied or foreign plist there would `enable` a label launchd does not hold and load a DIFFERENT job beside the box's model (#1761/#1715), then report it as a failed restart of a controller nothing touched. ⛔ **AND IT IS READ AS XML, NOT AS RAW TEXT** (review P1, cycle 11): `launchctl` resolves the plist with CFPropertyList, so the proof decodes character references exactly as the loader does — `&#46;&#46;` IS `..` (a raw-text read passed a path that resolves outside every root, measured), and a root holding `&`/non-ASCII written `&amp;`/`&#233;` is not refused for its own spelling. A reference this reader does not resolve is REFUSED with that reason (never guessed at: `sprintf("%c", n)` for n > 126 means a code point in gawk and a single BYTE in BWK awk), so the arm cannot be silently inert for a character it cannot prove. The proof is the plist's `Label` **and** a `ProgramArguments` program under `$O`, this file's tree, or
+| REMOVED, plist present but **not this job** (its `Label` is another label, or its `ProgramArguments` name a controller outside every root this box owns) | nothing; `verdict=RESTART-REFUSED` says nothing was issued and names the `Label` it actually found. ⛔ PROVENANCE IS READ BEFORE ANY MUTATION (review P1, cycle 4): `launchctl bootstrap` resolves the job by the plist's OWN `Label`, never by the file name, so "a file exists at `$PLIST_PATH`" is not evidence that loading it restores THIS label — a stale, copied or foreign plist there would `enable` a label launchd does not hold and load a DIFFERENT job beside the box's model (#1761/#1715), then report it as a failed restart of a controller nothing touched. ⛔ **AND IT IS READ AS XML, NOT AS RAW TEXT** (review P1, cycle 11): `launchctl` resolves the plist with CFPropertyList, so the proof decodes character references exactly as the loader does — `&#46;&#46;` IS `..` (a raw-text read passed a path that resolves outside every root, measured), and a root holding `&`/non-ASCII written `&amp;`/`&#233;` is not refused for its own spelling. A reference this reader does not resolve is REFUSED with that reason (never guessed at: `sprintf(\"%c\", n)` for n > 126 means a code point in gawk and a single BYTE in BWK awk), so the arm cannot be silently inert for a character it cannot prove. The proof is the plist's `Label` **and** a `ProgramArguments` program under `$O`, this file's tree, or
 `$PIN_ROOT` — the same three roots the liveness probe uses. ⛔ It is deliberately NOT a basename
 allowlist: the shipped stack label runs `/bin/bash $O/supervisor.sh` while `com.eldato.orchestrator-loop`
 runs `orch-loop.sh`, so a name list refuses the box's own configuration and makes the arm inert (the
@@ -4729,7 +4752,7 @@ already holding):
   there work?". ⛔ #2040 later proved that SENTENCE itself was the defect (`backlog empty
   queue=READ(223)` while 223 candidates had been read and every one filtered away), so resolving this
   branch against it does **not** resurrect the claim: the yield count rides the funnel that replaced it
-  (`dispatch_funnel`'s `yields=<n>`, in words: "this is NOT "the fleet has nothing to do""). The note
+  (`dispatch_funnel`'s `yields=<n>`, in words: "this is NOT \"the fleet has nothing to do\""). The note
   is **additive** — measured by the loop, never one of the refresh's reconciled buckets — so a yielded
   backlog is visible on the no-dispatch line AND a yields note can never make an unreconciled funnel
   read as summed. With no yields the line is byte-for-byte the #2040 shape, so nothing that parses it

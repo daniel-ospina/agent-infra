@@ -341,11 +341,63 @@ IDLE_BOUND_S="${LANE_BOUND_IDLE_S:-2700}"; is_limit "$IDLE_BOUND_S" || IDLE_BOUN
 # Two polls of headroom, so the first heartbeat lands before the bound can fire; floored so a tiny
 # LANE_MERGE_INTERVAL cannot make the cap degenerate.
 _hb_margin=$(( INTERVAL * 2 )); [ "$_hb_margin" -ge 10 ] || _hb_margin=10
-if [ -z "$HB_F" ] && [ "$IDLE_BOUND_S" -gt 0 ] && [ "$WAIT_S" -ge "$IDLE_BOUND_S" ]; then
-  WAIT_S=$(( IDLE_BOUND_S - _hb_margin ))
-  [ "$WAIT_S" -ge "$POLL_S" ] || WAIT_S="$POLL_S"
+# ⛔ THIS IS A RUNTIME LIMIT ON A REAL WAIT, SO `--status` MUST NOT PAY FOR IT (review finding, P3 —
+# verified). `--status` is documented "no network, no writes" and exits at :452, BELOW this block, so on
+# the pre-fix tree a read-only status query emitted the cap's multi-line `say_err` about a wait it was
+# never going to sit through. Nothing here can change a `--status` answer, so it does not run for one.
+if [ "$STATUS" -eq 0 ] && [ -z "$HB_F" ] && [ "$IDLE_BOUND_S" -gt 0 ] && [ "$WAIT_S" -ge "$IDLE_BOUND_S" ]; then
+  # ⛔ THE ALLOWANCE IS AN UPPER BOUND, AND THE OLD FLOOR MADE IT A LOWER ONE (review finding, P3 —
+  # verified by arithmetic). `[ "$WAIT_S" -ge "$POLL_S" ] || WAIT_S="$POLL_S"` RAISED the capped wait
+  # back to one poll chunk whenever the allowance was SMALLER than a chunk — with
+  # `LANE_BOUND_IDLE_S=120` and the shipped 120 s poll that is `WAIT_S=120 >= 120`, i.e. the "cap"
+  # lands ON the bound it exists to stay strictly under and the guard stops guarding. The floor is 0
+  # now: a wait of 0 is a labelled hand-off on the first poll, which is the right answer when the
+  # allowance cannot fit one (the loop's own `[ "$now" -ge "$deadline" ]` test terminates it).
+  WAIT_S=$(( IDLE_BOUND_S - _hb_margin )); [ "$WAIT_S" -ge 0 ] || WAIT_S=0
   say_err "lane-merge: no watchdog-visible heartbeat target (nothing at \$O/logs/lane-${ISSUE:-<issue>}.log or \$O/logs/fix-$PR.log, and LANE_MERGE_HB is unset) — the check wait is CAPPED at ${WAIT_S}s, below lane-bound.sh's ${IDLE_BOUND_S}s progress allowance. An uncapped wait would be killed as 'stalled' before it could write its hand-off verdict (#3584 review, P1). Set LANE_MERGE_HB, or run the lane with --issue, to get the full wait."
 fi
+# ── how much of the LANE's wall clock is already spent ────────────────────────────────────────────
+# ⛔ THE WAIT NEEDS THIS AND MUST NOT GUESS IT (#3584 review, P1 — see the clamp at the deadline).
+# `run_agent` arms `lane-bound.sh`'s WALL ceiling around the lane's `pi` with `LANE_BACKSTOP_S`, so the
+# datum is "when did THIS lane's run start" — and it is READ rather than inferred: `lane.sh` stamps
+# `LANE_RUN_TOKEN="<issue>.<pid>.<epoch>"` into `$O/logs/lane-<issue>.owner` BEFORE it spawns the agent,
+# so that epoch over-states the agent's own start by the spawn latency (the conservative direction for
+# a bound that must never fire late).
+# ⛔ EMPTY MEANS "UNKNOWN", NEVER ZERO. Reading an unresolvable elapsed as 0 would leave the wait
+# uncapped exactly when the lane is oldest — the same inert guard from the other side.
+# ⛔ AND A STALE TOKEN MUST NOT COUNT AS THIS LANE'S. The file is per-ISSUE and outlives the run that
+# wrote it, so a LATER invocation (the controller's merge step re-running this script for a PR whose
+# lane has exited) would otherwise read a token from a dead run, compute an elapsed larger than the
+# whole clock, and clamp the wait to 0 — handing off instantly instead of resuming. The token's pid is
+# therefore required to be ALIVE: a live lane.sh is the proof that the token describes a run in
+# flight. A token from the future (clock skew, another box) is unknown for the same reason.
+lane_elapsed_s() {
+  local now tok lpid ep
+  now="$(date +%s)"
+  # 1. the explicit seam — fixtures, and an operator whose caller stamps no token
+  if is_limit "${LANE_MERGE_ELAPSED_S:-}"; then printf '%s' "$LANE_MERGE_ELAPSED_S"; return 0; fi
+  # 2. lane.sh's own run token
+  [ -n "${ISSUE:-}" ] || return 0
+  [ -r "$O/logs/lane-$ISSUE.owner" ] || return 0
+  # `IFS= read -r` (a builtin) strips the newline; no `tr`/`sed` dialect to get wrong. Trailing
+  # whitespace is trimmed by parameter expansion, the way `round_of` above reads its counter.
+  tok=""; IFS= read -r tok 2>/dev/null < "$O/logs/lane-$ISSUE.owner" || true
+  tok="${tok%"${tok##*[![:space:]]}"}"
+  ep="${tok##*.}"
+  lpid="${tok#*.}"; lpid="${lpid%%.*}"
+  # ⛔ THE EPOCH IS NOT AN `is_limit` VALUE (verified: `is_limit` refuses anything over 9 digits, and a
+  # unix epoch has 10 — the guard would have rejected EVERY real token and left the clamp permanently
+  # inert on the only path that can feed it). Digits-only, plus a length sanity bound, is the test here.
+  case "$ep" in ''|*[!0-9]*) return 0 ;; esac
+  [ "${#ep}" -le 12 ] || return 0
+  [ "$ep" -gt 0 ] || return 0                 # `printf 0` when lane.sh's `date` failed
+  [ "$ep" -le "$now" ] || return 0            # a future stamp is a clock we cannot reason about
+  case "$lpid" in ''|*[!0-9]*) return 0 ;; esac
+  is_limit "$lpid" || return 0
+  [ "$lpid" -gt 0 ] || return 0
+  kill -0 "$lpid" 2>/dev/null || return 0      # nobody is running: this token is stale
+  printf '%s' "$(( now - ep ))"
+}
 # The divisor is floored at the shipped chunk length: LANE_MERGE_POLL=0 is a legitimate value (a chunk
 # that exits at once at its deadline), and dividing by it would break the arithmetic below instead of
 # yielding a bound.
@@ -1435,7 +1487,33 @@ esac
 # wedged and so a human reading the transcript can see it is making progress and not hung.
 CHECK_TMP="$(mktemp "${TMPDIR:-/tmp}/lane-merge-checks.XXXXXX")" || exit 2
 trap 'rm -f "$CHECK_TMP"' EXIT
-deadline=$(( $(date +%s) + WAIT_S ))
+# ⛔ THE WAIT MUST FIT WHAT IS LEFT OF THE LANE'S **REMAINING** WALL CLOCK, NOT JUST THE WHOLE OF IT
+# (#3584 review, P1 — verified). `deadline` was `now + WAIT_S` and nothing compared it with how much of
+# `LANE_WALL_S` THIS lane had already spent. At the shipped numbers a lane entering its merge phase more
+# than ~1800 s into its run (7200 - 5400) was TERMed by `lane-bound.sh`'s WALL ceiling MID-wait: the
+# `now >= deadline` arm never ran, so `WAITING_CHECKS` was never emitted, no `lanemerge-<pr>.verdict`
+# was written, and `lane.sh` printed "NO merge-phase verdict" over a lane that HAD a labelled hand-off
+# available. ⛔ THAT IS STRICTLY WORSE THAN THE 1500 s BOUND THIS CHANGE REPLACES (which reached its own
+# deadline for any implementation under 5700 s), and it is this file's own rule — "a bound the lane
+# cannot reach is an inert guard" — applied to the number that replaced it. So the wait is clamped to
+# the seconds actually LEFT, minus a margin to write the hand-off, which lands the label BEFORE the
+# kill. ⛔ THE DESIGN OPERAND IS ALREADY CAPTURED (`WAIT_S_DESIGN` above), so this clamp cannot move the
+# supervision budget — same rule as the watchdog cap, for the same reason.
+_lane_elapsed="$(lane_elapsed_s)"
+_wait_elapsed_note=""
+if [ -n "$_lane_elapsed" ]; then
+  _wall_left=$(( LANE_WALL_S - _lane_elapsed - _hb_margin ))
+  [ "$_wall_left" -ge 0 ] || _wall_left=0
+  if [ "$WAIT_S" -gt "$_wall_left" ]; then
+    WAIT_S="$_wall_left"
+    _wait_elapsed_note=" (this lane had already spent ${_lane_elapsed}s of its ${LANE_WALL_S}s clock, so the wait is what was left after a ${_hb_margin}s margin to write the hand-off)"
+    say_err "lane-merge: the check wait is CAPPED at ${WAIT_S}s${_wait_elapsed_note}. Uncapped it would out-live lane-bound.sh's ${LANE_WALL_S}s wall ceiling, which TERMs the lane with NO verdict file and no WAITING_CHECKS hand-off (#3584 review, P1)."
+  fi
+else
+  say_err "lane-merge: this lane's elapsed wall-clock time could not be resolved (no live run token at \$O/logs/lane-${ISSUE:-<issue>}.owner and LANE_MERGE_ELAPSED_S is unset), so the ${WAIT_S}s check wait is NOT clamped to what is left of LANE_WALL_S=${LANE_WALL_S}s. A lane that entered its merge phase late can be TERMed mid-wait with no verdict (#3584 review, P1). Set LANE_MERGE_ELAPSED_S=<seconds>, or run the lane with --issue, to make the clamp apply."
+fi
+_wait_t0="$(date +%s)"
+deadline=$(( _wait_t0 + WAIT_S ))
 while :; do
   rows="$(checks_read "$HEAD")"
   # The single-page read carries a TOTAL line so "this page is all of it" is distinguishable from
@@ -1519,9 +1597,14 @@ while :; do
   if [ "$now" -ge "$deadline" ]; then
     # In flight at the bound is NOT a failure of the lane and NOT a green: it is an unexplained
     # wait. Say so and let the caller re-run (a re-run costs one PR read).
-    log_line "… checks still IN FLIGHT (${IF}) after ${WAIT_S}s — re-run this script; nothing was merged"
+    # ⛔ THE QUOTED NUMBER IS THE WAIT THAT ACTUALLY RAN, NOT THE CONSTANT (review finding, P3 — the
+    # same "quote the operand you measured" rule this file holds elsewhere). `WAIT_S` can now be capped
+    # four ways AFTER the constant is read (watchdog allowance, remaining wall clock, a lost heartbeat,
+    # the seam), so a line rendered from `WAIT_S` would name a bound that never fired.
+    _waited=$(( now - _wait_t0 ))
+    log_line "… checks still IN FLIGHT (${IF}) after ${_waited}s — re-run this script; nothing was merged"
     disposition WAITING_CHECKS
-    verdict WAITING_CHECKS "checks still in flight after ${WAIT_S}s"
+    verdict WAITING_CHECKS "checks still in flight after ${_waited}s"
     exit 11
   fi
   # ⛔ WATCHDOG-VISIBLE PROGRESS, EVERY POLL (#3584 review, P1 — measured). `lane_bound`'s only working
@@ -1535,6 +1618,17 @@ while :; do
       "$(( deadline - $(date +%s) ))" >> "$HB_F" 2>/dev/null || {
         say_err "lane-merge: the heartbeat target '$HB_F' became unwritable — progress is no longer visible to lane-bound.sh's ${IDLE_BOUND_S}s allowance; re-run with LANE_MERGE_HB pointing at the lane log."
         HB_F=""
+        # ⛔ DETECTING THE LOSS IS NOT ACTING ON IT (review finding, P2 — verified). Clearing `HB_F`
+        # stops the heartbeats, but the deadline still held the FULL wait — so the loop went on waiting
+        # while visibly silent and was TERMed as `stalled` with no verdict: exactly the outcome the
+        # heartbeat exists to prevent, on a path this branch has just PROVEN it is on. The remaining
+        # wait is clamped to the watchdog's own allowance measured from NOW (silence starts the moment
+        # the last heartbeat landed) minus the same margin, which lands the labelled hand-off before the
+        # stall bound instead of after it.
+        if [ "$IDLE_BOUND_S" -gt 0 ]; then
+          _hb_left=$(( IDLE_BOUND_S - _hb_margin )); [ "$_hb_left" -ge 0 ] || _hb_left=0
+          [ "$deadline" -gt $(( now + _hb_left )) ] && deadline=$(( now + _hb_left ))
+        fi
       }
   fi
   sleep "$INTERVAL"

@@ -105,6 +105,7 @@ PR_STATE_BIN="$T/no-router-in-this-suite"; export PR_STATE_BIN
 run() { # run <pr> <args…>  → sets RC, OUT
   OUT="$(PATH="$BIN:$PATH" GH_LOG="$T/gh.log" O="$OT" HOME="$T/home" REPO_PATH="${REPO_PATH:-$RUN_REPO}" \
         LANE_MERGE_INTERVAL=5 LANE_MERGE_WAIT="${WAIT_S:-0}" LANE_MERGE_POLL="${POLL_S:-0}" \
+        LANE_MERGE_ELAPSED_S="${LANE_MERGE_ELAPSED_S:-}" \
         bash "$SCRIPT" "$@" 2>&1)"; RC=$?
 }
 verdict_of() { cat "$OT/state/lanemerge-$1.verdict" 2>/dev/null; }
@@ -1350,9 +1351,14 @@ ck "WAIT_S ($_ws) + MAX_WATCH x POLL ($_mw x $_ps) + IMPL_RESERVE ($_ir) = $(( $
 # ⛔ AND THE CHECK WAIT MUST BE ABLE TO REACH A COMPLETING CI (agent-infra#3584). The arithmetic above is
 # satisfied by ANY positive `_ws` — including one SMALLER than the fastest real CI pass, which is the
 # shipped defect this arm exists to keep out: at 1500 s the wait was BELOW the measured minimum (1623 s),
-# so `INFLIGHT` never reached 0, the loop always expired into `WAITING_CHECKS`, and the file's own success
-# path ("tail in flight == 0 → launch the chain") fired zero times. A bound no completing run can reach is
-# an inert guard, and no arithmetic asserts it away.
+# so `INFLIGHT` never reached 0 on the slow population and the loop expired into `WAITING_CHECKS`. ⛔ THE
+# EARLIER WORDING HERE SAID THE SUCCESS PATH "fired zero times" AND THAT WAS FALSE (review cycle 7, P2 —
+# verified against the deployed record): `state/lanemerge-*.chain` holds FIVE launches on 2026-11-08
+# inside the cited window, and `lanemerge-3796.verdict` is `WAITING_HEAD_MOVED`, which requires a live
+# chain pid — so heads DID reach `launch_chain`. What the record supports is `0 x MERGED`: the heads that
+# got through the wait were then blocked downstream. The arithmetic leg is unaffected (1500 s sits below
+# the 1623 s minimum, so which lanes got through was decided by how late they entered, not by CI). A
+# bound no completing run can reach is an inert guard, and no arithmetic asserts it away.
 # The floor is MEASURED, and BOTH CLOCKS ARE STATED because they differ by 14.4 points at 5400 s (94.3 vs
 # 79.9; review cycle 6, P2). Completed non-cancelled non-main `ci.yml` runs on daniel-ospina/agent-infra
 # over the runs
@@ -1390,8 +1396,10 @@ ck "the per-round check wait ($_ws s) is not back under the measured distributio
 # finish for a supervision budget that cannot supervise: `MAX_WATCH` floors at 1 chunk, so a wait raised
 # to 6100 s would still pass the arithmetic arm above (`_mw` = 1, 6100 + 120 + 900 = 7120 ≤ 7200) while
 # leaving a single 120 s `--watch` call — a supervision allowance that exists only formally. 7 chunks is
-# the SHIPPED allowance (it is what the 3300 s clock afforded at a 1500 s wait, and what the 7200 s clock
-# affords at the 5400 s wait), so it is the regression floor: a future edit that eats it must raise
+# the FLOOR (it is the allowance the retired 3300 s clock afforded at a 1500 s wait, and what the 7200 s
+# clock affords at the 5400 s wait — ⛔ NOT "the SHIPPED allowance": `origin/main` derives 40, because
+# `(7200-1500-900)/120 = 40` there; a label that read as a claim about main was false and is corrected
+# in place — review cycle 7, P3), so it is the regression floor: a future edit that eats it must raise
 # LANE_BACKSTOP_S (which raises `_mw`) rather than quietly convert supervision into waiting.
 # ⛔ THE EXAMPLE VALUES ARE CHECKED, NOT ASSUMED — AND BOTH EARLIER DRAFTS WERE WRONG (review cycles 2 and
 # 3, verified by mutation on copies): 6300 s reds this arm's own ARITHMETIC sibling (`_mw` = 0, which its
@@ -1465,6 +1473,65 @@ new_o "$T/pr4.tsv"
 WAIT_S=60 POLL_S=5 LANE_BOUND_IDLE_S=20 run 34 --repo o/r --pr-tsv "$T/pr4.tsv" --checks-tsv "$T/checks-inflight.tsv"
 ck "with NO heartbeat target the check wait CAPS itself below lane-bound.sh's allowance (60 s wait, 20 s allowance → 10 s) and still writes WAITING_CHECKS, instead of waiting to be killed unlabelled" \
    $([ "$RC" = 11 ] && [ "$(verdict_of 34 | cut -d' ' -f1)" = WAITING_CHECKS ] && grep -q 'CAPPED at 10s' <<<"$OUT" && echo 0 || echo 1)
+# (3) ⛔ THE WAIT MUST FIT WHAT IS LEFT OF THE LANE'S OWN CLOCK, NOT JUST THE WHOLE OF IT (#3584 review,
+# P1 — verified). `deadline` was `now + WAIT_S`, so a lane entering its merge phase more than ~1800 s in
+# (7200 − 5400) was TERMed by lane-bound.sh's WALL ceiling mid-wait: no `WAITING_CHECKS`, no verdict file,
+# no hand-off — strictly worse than the 1500 s bound this change replaces. `LANE_MERGE_ELAPSED_S` is the
+# seam for "how long has this lane been running"; the token path is what a real lane uses.
+new_o "$T/pr4.tsv"
+WAIT_S=60 POLL_S=5 LANE_MERGE_ELAPSED_S=7180 run 35 --repo o/r --pr-tsv "$T/pr4.tsv" --checks-tsv "$T/checks-inflight.tsv"
+ck "a lane that has already spent 7180 s of its 7200 s clock CAPS the check wait to the 10 s that is left (still WAITING_CHECKS, still a verdict) instead of waiting to be WALL-TERMed with none" \
+   $([ "$RC" = 11 ] && [ "$(verdict_of 35 | cut -d' ' -f1)" = WAITING_CHECKS ] && grep -q 'CAPPED at 10s' <<<"$OUT" && grep -q 'already spent 7180s' <<<"$OUT" && echo 0 || echo 1)
+# …and an elapsed time it CANNOT resolve is disclosed, never silently treated as "the lane just started".
+new_o "$T/pr4.tsv"
+WAIT_S=0 run 36 --repo o/r --pr-tsv "$T/pr4.tsv" --checks-tsv "$T/checks-inflight.tsv"
+ck "an UNRESOLVABLE lane elapsed is reported as a residual (named, with the remedy) rather than read as 0 s spent — the wait is honoured and still hands off" \
+   $([ "$RC" = 11 ] && [ "$(verdict_of 36 | cut -d' ' -f1)" = WAITING_CHECKS ] && grep -q 'NOT clamped to what is left of LANE_WALL_S' <<<"$OUT" && echo 0 || echo 1)
+# …and the PRODUCTION path is the token, not the seam, so it is pinned too: `lane.sh` stamps
+# `<issue>.<pid>.<epoch>` into `$O/logs/lane-<issue>.owner` before spawning the agent. A live pid (`$$`,
+# this suite) plus an epoch 7180 s ago must clamp exactly as the seam does — the earlier draft wrote this
+# reader with `is_limit` on the epoch, which refuses anything over NINE digits and would have left the
+# whole clamp permanently inert on the only path that feeds it in production.
+new_o "$T/pr4.tsv"
+printf '%s.%s.%s\n' 41 "$$" "$(( $(date +%s) - 7180 ))" > "$OT/logs/lane-41.owner"
+WAIT_S=60 POLL_S=5 run 41 --issue 41 --repo o/r --pr-tsv "$T/pr4.tsv" --checks-tsv "$T/checks-inflight.tsv"
+ck "the RUN TOKEN lane.sh stamps is read as the lane's elapsed (10-digit epoch accepted, live pid accepted) → the same 10 s cap" \
+   $([ "$RC" = 11 ] && grep -q 'CAPPED at 10s' <<<"$OUT" && grep -q 'already spent 7180s' <<<"$OUT" && echo 0 || echo 1)
+# …and a token from a run that is OVER must not clamp a later invocation to 0 (the file is per-ISSUE and
+# outlives the run that wrote it), so the pid in it is required to be alive.
+new_o "$T/pr4.tsv"
+printf '%s.%s.%s\n' 44 999999 "$(( $(date +%s) - 7180 ))" > "$OT/logs/lane-44.owner"
+WAIT_S=0 POLL_S=5 run 44 --issue 44 --repo o/r --pr-tsv "$T/pr4.tsv" --checks-tsv "$T/checks-inflight.tsv"
+ck "a STALE run token (its pid is dead) is not read as this lane's elapsed — the wait is disclosed as unclamped instead of being clamped to 0 by a finished run" \
+   $([ "$RC" = 11 ] && grep -q 'NOT clamped to what is left of LANE_WALL_S' <<<"$OUT" && echo 0 || echo 1)
+# (4) ⛔ THE CAP'S FLOOR MUST NEVER OUT-REACH THE CAP (review finding, P3 — verified). The old floor
+# `[ "$WAIT_S" -ge "$POLL_S" ] || WAIT_S="$POLL_S"` RAISED the capped wait back to a poll chunk when the
+# allowance was smaller than one, i.e. it returned the value it exists to stay under. With a 15 s
+# allowance (15 s idle bound − 10 s margin) and the shipped 120 s poll chunk, the pre-fix code produced
+# WAIT_S=120 — ON the bound it was capping to.
+new_o "$T/pr4.tsv"
+WAIT_S=60 POLL_S=120 LANE_BOUND_IDLE_S=15 run 37 --repo o/r --pr-tsv "$T/pr4.tsv" --checks-tsv "$T/checks-inflight.tsv"
+ck "the watchdog cap is a MINIMUM even when the allowance is smaller than one poll chunk (15 s allowance, 120 s chunk → 5 s, NOT 120 s), so it cannot land on the bound it caps to" \
+   $([ "$RC" = 11 ] && grep -q 'CAPPED at 5s' <<<"$OUT" && ! grep -q 'CAPPED at 120s' <<<"$OUT" && echo 0 || echo 1)
+# (5) ⛔ DETECTING A LOST HEARTBEAT IS NOT ACTING ON IT (review finding, P2 — verified). `HB_F` is
+# cleared when the append fails, but the deadline held the FULL wait — so the loop kept waiting while
+# visibly silent and was TERMed as `stalled` with no verdict: the outcome the heartbeat exists to
+# prevent, on a path the branch had just detected. A DIRECTORY as the heartbeat target makes the append
+# fail on the very first poll, which is the smallest reproduction of the storage/permission fault.
+new_o "$T/pr4.tsv"
+mkdir -p "$T/hb-dir-39"
+WAIT_S=60 POLL_S=5 LANE_BOUND_IDLE_S=20 LANE_MERGE_HB="$T/hb-dir-39" run 39 --repo o/r --pr-tsv "$T/pr4.tsv" --checks-tsv "$T/checks-inflight.tsv"
+_w39="$(verdict_of 39 | sed -n 's/.*after \([0-9][0-9]*\)s.*/\1/p')"
+ck "a heartbeat that becomes unwritable RE-DERIVES the deadline (60 s wait, 20 s allowance → handed off at ${_w39:-?}s, not 60 s) — otherwise the lane waits silently to be killed as 'stalled' with no verdict" \
+   $([ "$RC" = 11 ] && [ "$(verdict_of 39 | cut -d' ' -f1)" = WAITING_CHECKS ] && grep -q 'became unwritable' <<<"$OUT" && [ -n "${_w39:-}" ] && [ "${_w39:-0}" -le 30 ] && echo 0 || echo 1)
+# (6) ⛔ `--status` IS "no network, no writes" AND MUST STAY QUIET (review finding, P3 — verified). The
+# cap block runs at module scope, ABOVE the `--status` exit, so a read-only status query used to emit the
+# cap's multi-line `say_err` about a wait it was never going to sit through.
+OUT="$(PATH="$BIN:$PATH" GH_LOG="$T/gh.log" O="$OT" HOME="$T/home" LANE_MERGE_INTERVAL=5 \
+      LANE_MERGE_WAIT=60 LANE_MERGE_POLL=120 LANE_BOUND_IDLE_S=15 \
+      bash "$SCRIPT" 99 --status 2>&1)"; RC=$?
+ck "--status emits NOTHING but the verdict record even when the cap conditions hold (no cap chatter on a read-only query, got: $(printf '%s' "$OUT" | tr '\n' '|'))" \
+   $([ "$RC" = 0 ] && ! grep -q 'CAPPED at' <<<"$OUT" && echo 0 || echo 1)
 
 # ── 19. an EMPTY PR read must not blank the head or read as merged (E7) ────────────────────────
 new_o "$T/pr25.tsv"
