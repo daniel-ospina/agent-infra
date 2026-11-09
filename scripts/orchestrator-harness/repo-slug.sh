@@ -203,8 +203,17 @@ resolve_repo() {
       # PROOF 2 — only when a queue target is declared: its origin NAMES that target. `derive_or` is
       # the one URL parser on this file's shelf; repeating the arm list here is how the four copies
       # drifted (#3188) and what `refresh-provision.test.sh`'s `(h5)` exists to catch.
+      # ⛔ COMPARED FOLDED, LIKE EVERY OTHER SLUG COMPARISON IN THIS FILE (fresh-context review of
+      # #3833, F2 — verified). GitHub slugs are CASE-INSENSITIVE — this file states it at :104 and
+      # folds in `repo_identity_fold` / `repo_identity_scan` — so a raw `=` here was the only
+      # case-sensitive slug test in the file: a candidate whose origin is
+      # `https://github.com/Premise-Labs/agent-infra.git` against an `OR=premise-labs/agent-infra`
+      # pinned in keys.env (a SUPPORTED form: an explicit `OR` wins) failed the proof, nothing proved,
+      # and the operator was told to set REPO on a checkout that is correct. #1974 §1's "names exactly
+      # $OR" is about WHICH REPO, never about letter case, so folding delivers the decision rather than
+      # departing from it.
       if [ -n "${OR:-}" ]; then
-        [ "$(derive_or "$_cand" 2>/dev/null)" = "$OR" ] || continue
+        [ "$(repo_identity_fold "$(derive_or "$_cand" 2>/dev/null)")" = "$(repo_identity_fold "$OR")" ] || continue
       fi
       # ⛔ THE DEDUPE KEY IS THE CANONICAL PATH, NOT THE STRING (the same rule `pwd -P` already applies
       # to the value this function returns). A checkout offered twice — the real path and a symlink to
