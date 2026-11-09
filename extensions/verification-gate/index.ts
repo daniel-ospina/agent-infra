@@ -4085,7 +4085,12 @@ const DISPATCH_CLASS_REMEDIES: Record<DispatchFailureClass, string> = {
   unparseable: "the verifier response was not parseable — it must contain PASS on its own line, or exact JSON {status, failures, verified_files}. Re-dispatch with the prompt exactly as printed above.",
   "fail-open-refused": "the verifier response was unparseable and the fail-open merge was REFUSED for this task sub-agent (#285) — files were NOT recorded. Re-dispatch a verifier whose response is PASS on its own line or the exact JSON shape.",
   "fail-verdict": "the verifier judged the files NOT ready — do NOT re-dispatch blindly; address the failures it listed, fix the files, then re-dispatch.",
-  "zero-merge-pass": "the verifier PASSed but nothing was recorded (its file list matched no block/diff scope). Re-dispatch naming the EXACT blocked files printed above.",
+  // #2087: a zero-merge is a SEQUENCING state, and the old remedy ("re-dispatch naming the
+  // EXACT blocked files") misdiagnosed it as a verifier defect — the names WERE exact. A PASS
+  // merges only files this root's blocked set or its STAGED diff already contains, so a PASS
+  // obtained before either exists ("verify, then push" — the order the harness prescribes)
+  // records 0 of N and the retry is refused identically. The remedy is the ORDER, not the list.
+  "zero-merge-pass": "the verifier PASSed but nothing was recorded — 0 of its files merged, so NOTHING was blessed. This is a SEQUENCING state, not a verifier defect: a PASS merges only files this root's blocked set or its STAGED diff already contains, and a PASS obtained before either exists has no scope to merge into. Fix the ORDER, then re-dispatch naming the EXACT blocked files printed above — stage the change first (`git add <the files>`); for a refused push, the block above has already recorded the push range, so re-dispatch now (agent-infra#2087).",
 };
 
 /**
@@ -4385,6 +4390,44 @@ export function dispatchState(): { klass: DispatchFailureClass | null; streak: n
 }
 
 /**
+ * #2087: the ORDER the VGATE ceremony must be run in, printed by BOTH block messages.
+ *
+ * MEASURED 2026-11-04 while fixing #2087 (the finding's remedy had been re-derived in a
+ * comment but never applied): the harness says "verify, then push". A [VGATE] PASS merges
+ * ONLY the files this root's recorded blocked set or its CURRENT STAGED diff contains
+ * (`mergeScopeFor`/`scopeFiles`). A verifier dispatched BEFORE the session's first blocked git
+ * op — or before the change is staged — matches NEITHER, records 0 of N, and the retry is
+ * refused with the identical "Unverified files" text. The old remedy ("re-dispatch naming the
+ * EXACT blocked files") cannot help: those names were already exact, and the missing
+ * ingredient is the block context that only a refused/normalised op creates.
+ *
+ * The anchor is deliberately NOT widened (the issue's option 2 — seeding the scope from the
+ * branch's unpushed diff — weakens "only files the gate blocked, or the operator staged for
+ * this op, can be blessed"; agent-infra#2087 records option 1 as the preference). So the gate
+ * keeps failing closed on a mis-ordered dispatch and instead prints the order that works.
+ */
+export function orderMattersLines(allBlocked: string[], indent = "  "): string[] {
+  const lines = [
+    "⛔ ORDER MATTERS (#2087) — a [VGATE] PASS merges ONLY files this root's blocked",
+    "  set or its STAGED diff already contains. THIS refusal recorded the scope, so",
+    "  dispatch the verifier now, then retry the git operation.",
+    "  A verifier dispatched BEFORE the first block — or before the change is staged —",
+    "  PASSes with 0 files recorded (zero-merge), and the retry is refused IDENTICALLY",
+    "  with a message that blames the verifier instead of the order.",
+    allBlocked.length > 0
+      ? `  If the change is not staged yet, stage it FIRST: git add ${allBlocked.join(' ')}`
+      : "  If the change is not staged yet, stage it FIRST, then dispatch.",
+    // #2087 precision: a normal push/gh op is scoped by its own diff range, and the refusal has
+    // just recorded it — nothing to stage. The ONE exception is documented at the push-scope
+    // section of 01-preflight.md: a push with NO usable base (a fresh `git init` first push, or any
+    // probe failure) falls back to the STAGED index, so that shape must stage like a commit.
+    "  A push / gh op needs no staging — this refusal IS its scope (except a first push with no",
+    "  usable base, whose fallback scope is the staged index: stage it as for a commit).",
+  ];
+  return lines.map(l => `${indent}${l}`);
+}
+
+/**
  * #285 P1-A Surface 1: the sub-agent block message, task-tool-aware. The old
  * text unconditionally claimed "This session HAS the task tool" — false for
  * the 7 task-restricted user agents (--tools allowlists without task: planner,
@@ -4411,6 +4454,8 @@ export function buildSubAgentBlockMessage(
         "",
         "  → On PASS, retry the git operation. Sub-agent commits get NO #7591",
         "    auto-bypass: an unverified commit blocks every time until verified.",
+        "",
+        ...orderMattersLines(allBlocked),
       ]
     : [
         "  This session is task-RESTRICTED (task is not in the tool allowlist),",
@@ -5117,6 +5162,8 @@ export default function (pi: ExtensionAPI) {
           "",
           `  → Dispatch the verifier sub-agent:`,
           `    task(prompt='[VGATE] verify files: ${allBlocked.join(' ')}. Classification: <UI|backend|both>. Project root: ${cwd}. Return ONLY JSON: {"status":"PASS","failures":[],"verified_files":[{"path":"<repo-relative>","hash":"<sha256>"}]}.', ...)`,
+          "",
+          ...orderMattersLines(allBlocked),
           "",
           "  → Or set ELDATO_SKIP_VGATE=1 to bypass (emergency only).",
         ].join("\n") + ceremonyDiag + verdictLineDiag;
