@@ -520,13 +520,13 @@ resolve_repo() {
 # operator reading that must be told nothing was stopped and how to stop anyway. This leg was the ONE
 # queue-unusable path that reached `die` without the suffix — so on a cell whose `keys.env` is missing
 # (a plausible reason to be stopping it) the new pre-flight refused with no way past it.
-# ⛔ AND IT PASSES `nofix`: this `die` fires BEFORE any ONE-LINE FIX exists, so the generic tail's
-# "repair the pair with the fix above" would send the operator hunting for a line that was never
-# printed. One tail, one `--force` escape, two repair clauses.
+# ⛔ AND IT PASSES ITS OWN REPAIR CLAUSE: this `die` fires BEFORE any ONE-LINE FIX exists, so the generic
+# tail's "repair the pair with the fix above" would send the operator hunting for a line that was never
+# printed. One tail, one `--force` escape, a per-branch repair clause.
 assert_repo() { # [$1 = the asking verb, so a `stop` refusal carries its own tail]
   local verb="${1:-}"
   if ! resolve_repo; then
-    die "REPO is not set and no single checkout could be derived from ${REPO_SEEN:-the provisioning candidates} — set REPO=<a checkout of the repo this cell should work> (e.g. in $ENV_FILE), or clone it to /tmp/cell.${verb:+ $(queue_refusal_suffix "$verb" nofix)}"
+    die "REPO is not set and no single checkout could be derived from ${REPO_SEEN:-the provisioning candidates} — set REPO=<a checkout of the repo this cell should work> (e.g. in $ENV_FILE), or clone it to /tmp/cell.${verb:+ $(queue_refusal_suffix "$verb" "Set REPO to a checkout of the repo this cell should work (the message above says how)")}"
   fi
   # ⛔ THE GUARD MUST SEE THE VALUE THAT IS INTERPOLATED, not only the one the OPERATOR passed
   # (agent-infra#1935 review). `cmd_start` validates REPO before this derives it — and skips an
@@ -1727,22 +1727,29 @@ assert_queue_target() {
   # shell: $ENV_FILE is sourced, and an ambient export is inherited). The message names that case too,
   # because the `sed` cannot touch it and would otherwise send the operator straight back to the same
   # refusal with no new information.
-  local onefix="ONE-LINE FIX: let the queue follow the checkout — sed -i -E '/^[[:space:]]*(export[[:space:]]+|declare[[:space:]]+-x[[:space:]]+)?OR[[:space:]]*=/d' '$ENV_FILE' (this matches the column-0, indented, 'export OR=' and 'declare -x OR=' shapes alike; drop an ambient OR export yourself if that is where yours is set) — after which the queue derives from the checkout and targets '$QUEUE_DERIVED'; to point the cell at '$QUEUE_DECLARED' instead, $needs"
+  local onefix_cmd="sed -i -E '/^[[:space:]]*(export[[:space:]]+|declare[[:space:]]+-x[[:space:]]+)?OR[[:space:]]*=/d' '$ENV_FILE'"
+  local onefix="ONE-LINE FIX: let the queue follow the checkout — $onefix_cmd (this matches the column-0, indented, 'export OR=' and 'declare -x OR=' shapes alike; drop an ambient OR export yourself if that is where yours is set) — after which the queue derives from the checkout and targets '$QUEUE_DERIVED'; to point the cell at '$QUEUE_DECLARED' instead, $needs"
   case "$QUEUE_STATE" in
     mismatch)
       die "the QUEUE and the CHECKOUT name DIFFERENT repos — this box is MERGE-INERT: the queue targets '$QUEUE_DECLARED' (OR) but $REPO is a checkout of '$QUEUE_DERIVED' (origin $QUEUE_REMOTE). A controller on this pair dispatches $QUEUE_DECLARED PRs from a $QUEUE_DERIVED tree: its candidate pre-flight cannot run there, every candidate comes back unqueryable, and every '$QUEUE_DECLARED' merge looks for that repo's merge rail inside a '$QUEUE_DERIVED' checkout and refuses — so the queue never advances while every other observable reads green (agent-infra#1901, #1764). $onefix.${verb:+ $(queue_refusal_suffix "$verb")}"
       ;;
     invalid)
-      die "OR='$QUEUE_DECLARED' is not an <owner>/<repo> (want e.g. daniel-ospina/tortoise) — a queue target must name a repo on a git host, and a typo here is a cell that dispatches nothing. $needs.${verb:+ $(queue_refusal_suffix "$verb")}"
+      # ⛔ THIS BRANCH PRINTS NO `$onefix` — the full one names '$QUEUE_DERIVED'/`$needs`, which are
+      # about a PAIR this state does not have (the queue target itself is malformed) — so its tail must
+      # name ITS OWN repair. It reaches `die` through the same `queue_refusal_suffix` as the others, and
+      # the generic tail would say "with the fix above" over a fix that was never printed (review P3).
+      # The clause reuses the SAME `$onefix_cmd` (deleting OR does repair this state: the queue then
+      # follows the checkout) rather than restating the sed — one command, one place.
+      die "OR='$QUEUE_DECLARED' is not an <owner>/<repo> (want e.g. daniel-ospina/tortoise) — a queue target must name a repo on a git host, and a typo here is a cell that dispatches nothing. $needs.${verb:+ $(queue_refusal_suffix "$verb" "Fix OR to name an <owner>/<repo>, or let the queue follow the checkout with: $onefix_cmd")}"
       ;;
     unreadable)
-      die "cannot read the QUEUE this cell would target: 'git -C $REPO remote get-url origin' returned no URL${QUEUE_DECLARED:+, so OR='$QUEUE_DECLARED' cannot be verified against the checkout}. Starting anyway is the measured agent-infra#1901 failure — the controller runs, reports lanes and a loaded queue, and judges nothing. $needs.${verb:+ $(queue_refusal_suffix "$verb")}"
+      die "cannot read the QUEUE this cell would target: 'git -C $REPO remote get-url origin' returned no URL${QUEUE_DECLARED:+, so OR='$QUEUE_DECLARED' cannot be verified against the checkout}. Starting anyway is the measured agent-infra#1901 failure — the controller runs, reports lanes and a loaded queue, and judges nothing. $needs.${verb:+ $(queue_refusal_suffix "$verb" "Give $REPO a readable 'origin' remote — clone the repo, or point REPO at a checkout of it, because the queue is READ from that remote (deleting OR does NOT help here)")}"
       ;;
     underivable)
-      die "cannot derive the QUEUE from $REPO's origin remote '$QUEUE_REMOTE' — it does not name <owner>/<repo> in an accepted form (https://, http://, ssh://, or scp-like git@host:owner/repo.git, with no empty path segment: 'git@host:/owner/repo.git' is refused), so there is no repo on a git host to target. $needs.${verb:+ $(queue_refusal_suffix "$verb")}"
+      die "cannot derive the QUEUE from $REPO's origin remote '$QUEUE_REMOTE' — it does not name <owner>/<repo> in an accepted form (https://, http://, ssh://, or scp-like git@host:owner/repo.git, with no empty path segment: 'git@host:/owner/repo.git' is refused), so there is no repo on a git host to target. $needs.${verb:+ $(queue_refusal_suffix "$verb" "Point $REPO's 'origin' at a URL in one of those forms (git -C '$REPO' remote set-url origin <url>); deleting OR does NOT help here, because the queue is derived from the remote before OR is read")}"
       ;;
     *)
-      die "cannot determine the QUEUE this cell would target (state '${QUEUE_STATE:-unknown}') — refusing to run a controller that cannot judge the queue it names. $needs.${verb:+ $(queue_refusal_suffix "$verb")}"
+      die "cannot determine the QUEUE this cell would target (state '${QUEUE_STATE:-unknown}') — refusing to run a controller that cannot judge the queue it names. $needs.${verb:+ $(queue_refusal_suffix "$verb" "Run '$0 status' to see this cell's REPO and ENV_FILE, then repair the pair")}"
       ;;
   esac
 }
@@ -1751,17 +1758,19 @@ assert_queue_target() {
 # declines to START something, so "refused" is the whole story; `stop` declined to END something, and
 # an operator reading that must be told, in the message, both that nothing was stopped and how to
 # stop anyway (agent-infra#2093).
-# $1 = the asking verb. $2 (optional) selects the REPAIR CLAUSE: "nofix" is passed by assert_repo(),
-# which reaches `die` BEFORE any ONE-LINE FIX exists — its own message names the repair (set REPO, or
-# clone the checkout), so a tail pointing at "the fix above" would send the operator hunting for a line
-# that was never printed. One tail, one `--force` escape, no second copy of the prose.
+# $1 = the asking verb. $2 = THIS refusal's repair clause, phrased as an imperative WITHOUT the
+# `stop` → `start` sequence (this function owns that).
+# ⛔ $2 IS REQUIRED ON EVERY BRANCH THAT PRINTS NO ONE-LINE FIX, AND ITS ABSENCE WAS A REAL DEFECT
+# (review P3, #2093): the default says "with the fix above", but `$onefix` is interpolated only by the
+# branches that print it, so on `unreadable`/`underivable`/`nocheckout` the operator was told to apply
+# a fix that had never been shown. The default is therefore valid ONLY for a branch that prints the
+# ONE-LINE FIX; every other caller passes its own sentence. One tail, one `--force` escape, no second
+# copy of the prose, and no pointer to a line that does not exist.
 queue_refusal_suffix() {
-  local repair="Repair the pair with the fix above, then run 'stop' → 'start'"
-  [ "${2:-}" = nofix ] \
-    && repair="Set REPO to a checkout of the repo this cell should work (the message above says how), then run 'stop' → 'start'"
-  case "$1" in
+  local verb="${1:-}" repair="${2-Repair the pair with the ONE-LINE FIX above}"
+  case "$verb" in
     stop)
-      printf '%s' "NOTHING WAS STOPPED: this is the pre-flight for the deploy sequence, because 'start' refuses this same pair and a box stopped under it cannot be refreshed — that is how lane-1 was left on an 8-day-old sha with no way forward (agent-infra#2093). $repair. To stop this box anyway (it will not be startable until the pair is repaired): $0 stop --force"
+      printf '%s' "NOTHING WAS STOPPED: this is the pre-flight for the deploy sequence, because 'start' refuses this same pair and a box stopped under it cannot be refreshed — that is how lane-1 was left on an 8-day-old sha with no way forward (agent-infra#2093). $repair, then run 'stop' → 'start'. To stop this box anyway (it will not be startable until the pair is repaired): $0 stop --force"
       ;;
     *) printf '' ;;
   esac

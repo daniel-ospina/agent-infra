@@ -2815,10 +2815,22 @@ grep -q 'OR=' "$Q_EXP" \
 Q_OUT3=''; Q_OUT3="$(env -u OR Q_STATE="$Q/st-export-shape3" PATH="$Q/bin:$PATH" CELL_HOME="$Q/home" \
           ENV_FILE="$Q_EXP" SESSION="ai2093exp3-$$" O="$Q/st-export-shape3/o" REPO="$Q/agent-repo" \
           HARNESS="$Q/harness" HARNESS_REPO="$AI" HARNESS_FETCH=0 HARNESS_REF="$Q_REF" \
-          bash "$SUP" check 2>&1)"
+          bash "$SUP" check 2>&1)"; Q_RC3=$?
+# ⛔ ABSENCE OF THE REFUSAL IS NOT PROOF OF A REPAIR (review P3): any OTHER non-zero exit, or an
+# unrelated `die`, also fails to print `MERGE-INERT`, so an absence-only assertion passes for the wrong
+# reason. The positive claim is that `check` now reaches its ACCEPTING path and SAYS SO — the same
+# `ok: queue … == checkout …` line the recipe's step 3 tells the operator to expect.
+# ⛔ AND `rc` IS NOT THE SIGNAL HERE: this fixture is a bare state dir with no worker scripts in `o/`, so
+# `check` always exits non-zero on 'worker scripts missing …' (pre-existing, unrelated to the pair, and
+# present on the unmutated tree) — asserting rc=0 would test the fixture, not the repair. The state may
+# also read `— explicit` rather than `— derived`: the load-time OR="$QUEUE_REPO" re-feeds the derived
+# value, and both are ACCEPTING states. So assert exactly the fact this row exists for: the pair is
+# ACCEPTED, on one of the two accepting states, and the refusal is gone.
 case "$Q_OUT3" in
   *"MERGE-INERT"*|*"DIFFERENT repos"*) bad "after the repair the box is STILL MERGE-INERT — the one-line fix did not repair the pair: $Q_OUT3" ;;
-  *) ok "…and after the repair the same box is no longer refused on the queue pair (the refusal is gone, not just the line)" ;;
+  *"ok: queue daniel-ospina/agent-infra == checkout "*" — derived"*|*"ok: queue daniel-ospina/agent-infra == checkout "*" — explicit"*)
+    ok "…and after the repair \`check\` ACCEPTS the pair on its accepting path ('ok: queue … == checkout … — derived|explicit'), not merely silent about the refusal" ;;
+  *) bad "the refusal is gone, but \`check\` never reached its ACCEPTING path — it failed for an UNRELATED reason (rc=$Q_RC3), so the repair is unproven: $Q_OUT3" ;;
 esac
 
 # (9) `status` answers "is this cell pointed at what it is standing in?" on ONE line, and REPORTS a
@@ -3106,11 +3118,20 @@ case "$Q_OUT" in
   *"DIFFERENT repos"*|*"MERGE-INERT"*) bad "the queue pre-flight fired because a PEER session shares the machine-scoped name — it counted a session this state dir does not own (rc=$Q_RC): $Q_OUT" ;;
   *) ok "stop: a PEER cell's session under the same machine-scoped name does NOT trip the queue pre-flight (#1856 ownership proof)" ;;
 esac
+# ⛔ ONE REFUSAL, TWO INDEPENDENT FACTS — BOTH ASSERTED, BOTH LIVE (review P3). The message arm below
+# used to test `cannot be proven`, a substring this refusal NEVER contains (the kill path says "nothing in
+# it can be proven to be this state dir's controller"), so it could not fire and the run silently fell
+# through to the marker arm. Each is now its own row: the MESSAGE (the kill path told the operator it would
+# not signal a session it cannot prove) and the EFFECT (the peer's `up` marker is still there). Deleting the
+# kill path's proof reddens BOTH.
 case "$Q_OUT" in
-  *"cannot be proven"*|*"does NOT belong to this state dir"*)
+  *"proven to be this state dir"*|*"does NOT belong to this state dir"*)
     ok "…and when stop does proceed, the KILL path applies the SAME ownership proof (pre-flight and kill agree about ownership, one rule)" ;;
-  *) ok "…and stop did not have to reach the kill path at all in this fixture" ;;
+  *) bad "(3c) the kill path did not report an ownership failure — it either signalled a session it cannot prove, or refused for an UNRELATED reason (rc=$Q_RC): $Q_OUT" ;;
 esac
+[ -f "$S4B/up" ] \
+  && ok "…and stop did not reach the kill path (rc=$Q_RC) — the PEER session's 'up' marker survives, so the machine-scoped name was never signalled" \
+  || bad "stop KILLED a session it cannot prove it owns (the peer's 'up' marker is gone) — the #1856 ownership proof is missing from the kill path (rc=$Q_RC): $Q_OUT"
 #  (3d) THE POSITIVE CONTROL for (3c): the same live-session shape whose pane DOES name this state dir
 #  must still refuse — otherwise (3c) could be satisfied by deleting the session leg entirely, which
 #  would quietly drop the one signal that catches a controller whose pid reads are blind.

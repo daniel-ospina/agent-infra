@@ -284,9 +284,13 @@ and it is labelled **MERGE-INERT** — the state `check` and `status` report too
 What counts as "something" is the code's answer, not a slogan: a desired-state marker (`state/roles/.desired`),
 a **provably-own** controller session (proven by the session's own pane command, because `SESSION` is a
 machine-scoped name — a neighbour cell's `orch` session is not evidence, #1856), a doctor loop, or a
-controller pid. So **a box with none of those can still be stopped** — including one that is already down
-but still carries `.desired`, which does need `--force`; the marker leg is deliberately read as-is, since
-a stop that cannot be redone costs the cell and its leases while a refused stop costs one flag. `stop
+controller pid; and a read that cannot be made (an unreadable process table) counts as "something is
+running" too, so the gate fails closed rather than stopping a box it cannot see into. So **a box with none
+of those legs can still be stopped** — that is the case this pre-flight is deliberately narrow about. The
+marker leg is read as-is and is the strictest: a box that is already down but still carries `.desired` is
+**not** "a box with none of those" — carrying the marker is itself one of them, so it needs `--force`; the
+leg is deliberate, since a stop that cannot be redone costs the cell and its leases while a refused stop
+costs one flag. `stop
 --force` exists for an operator who means to stop a misconfigured box anyway (`cloud-cell-quiesce.sh`
 passes it: its sweep stops everything regardless).
 
@@ -320,8 +324,11 @@ cp /tmp/cell-home/keys.env /tmp/cell-home/keys.env.bak-$(date -u +%Y%m%dT%H%M%SZ
 sed -i -E '/^[[:space:]]*(export[[:space:]]+|declare[[:space:]]+-x[[:space:]]+)?OR[[:space:]]*=/d' /tmp/cell-home/keys.env
 grep -n 'OR=' /tmp/cell-home/keys.env || echo 'ok: no OR line left — the queue now derives from the checkout'
 # (b) …or point the CHECKOUT at the repo the queue names (a different repo on disk — here agent-infra).
-#     Same prefix rule, for the same reason:
-#     sed -i -E 's|^[[:space:]]*(export[[:space:]]+|declare[[:space:]]+-x[[:space:]]+)?REPO[[:space:]]*=.*|REPO=/tmp/cell-ai|' /tmp/cell-home/keys.env
+#     Same prefix rule, for the same reason. ⛔ THE DELIMITER IS `#`, NOT `|`: the PATTERN itself uses `|`
+#     as ERE alternation, so a `s|…|…|` form is truncated at the first inner `|` and sed exits 1 with
+#     "unknown option to 's'" having edited nothing — the same silent-no-op class this step exists to
+#     remove, one layer down (measured).
+#     sed -i -E 's#^[[:space:]]*(export[[:space:]]+|declare[[:space:]]+-x[[:space:]]+)?REPO[[:space:]]*=.*#REPO=/tmp/cell-ai#' /tmp/cell-home/keys.env
 
 # 3. PRE-FLIGHT AGAIN. Must print: ok: queue <owner/repo> == checkout <path> (origin <url>) — derived
 bash $SUP check
