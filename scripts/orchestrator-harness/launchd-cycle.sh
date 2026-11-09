@@ -592,7 +592,7 @@ lc_restart() {
   if [ -z "$pid" ]; then
     lock="$(lc_foreign_controller "$O")"
     if [ -n "$lock" ]; then
-      lc_err "❌ refusing to start $label: a controller started OUTSIDE launchd already holds $O/.orch.lock (pid $lock), so launchd's copy would exit at once and KeepAlive would relaunch it forever. Next: stop it (pkill -f \"[b]ash $O/orch-loop.sh\", then verify with pgrep -fl '[o]rch-loop' and only then rm -f $O/.orch.lock), then re-run. If that pid is NOT really a controller (a RECYCLED pid — check `ps -o command= -p $lock`), the lock is stale: just rm -f $O/.orch.lock and re-run (agent-infra#3660)"
+      lc_err "❌ refusing to start $label: a controller started OUTSIDE launchd already holds $O/.orch.lock (pid $lock), so launchd's copy would exit at once and KeepAlive would relaunch it forever. Next: stop it (pkill -f \"[b]ash $O/orch-loop.sh\", then verify with pgrep -fl '[o]rch-loop' and only then rm -f $O/.orch.lock), then re-run. If that pid is NOT really a controller (a RECYCLED pid — check \`ps -o command= -p $lock\`), the lock is stale: just rm -f $O/.orch.lock and re-run (agent-infra#3660)"
       return 1
     fi
   fi
@@ -675,7 +675,7 @@ lc_ensure() {
   if [ -z "$pid" ]; then
     lock="$(lc_foreign_controller "$O")"
     if [ -n "$lock" ]; then
-      lc_err "❌ refusing to start $label: a controller started OUTSIDE launchd already holds $O/.orch.lock (pid $lock), so launchd's copy would exit at once and KeepAlive would relaunch it forever. Next: stop it (pkill -f \"[b]ash $O/orch-loop.sh\", then verify with pgrep -fl '[o]rch-loop' and only then rm -f $O/.orch.lock), then re-run. If that pid is NOT really a controller (a RECYCLED pid — check `ps -o command= -p $lock`), the lock is stale: just rm -f $O/.orch.lock and re-run (agent-infra#3660)"
+      lc_err "❌ refusing to start $label: a controller started OUTSIDE launchd already holds $O/.orch.lock (pid $lock), so launchd's copy would exit at once and KeepAlive would relaunch it forever. Next: stop it (pkill -f \"[b]ash $O/orch-loop.sh\", then verify with pgrep -fl '[o]rch-loop' and only then rm -f $O/.orch.lock), then re-run. If that pid is NOT really a controller (a RECYCLED pid — check \`ps -o command= -p $lock\`), the lock is stale: just rm -f $O/.orch.lock and re-run (agent-infra#3660)"
       return 1
     fi
   fi
