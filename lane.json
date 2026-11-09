@@ -1,0 +1,42 @@
+{
+  "_ref": "refs/lanes/cmux.klane-1895-1794191287-p1680922-11858bad",
+  "_sha": "2273ba93a2b7872203319342888b8e9ee098c6b1",
+  "artifacts": [
+    {
+      "kind": "log",
+      "value": "/home/cmux/orchestrator/logs/lane-1895.log"
+    },
+    {
+      "kind": "branch",
+      "value": "feat/1895-tm"
+    },
+    {
+      "kind": "sha",
+      "value": "e7d70d9b4a5093c051c2a5c25b8ce193608a4bf9"
+    },
+    {
+      "kind": "worktree",
+      "value": "/home/cmux/agent-infra/.worktrees/tm-1895"
+    }
+  ],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 7800,
+  "duration_s": 4052,
+  "ended_at": 1794195339,
+  "exit_code": 0,
+  "heartbeat_at": 1794195339,
+  "host": "cmux",
+  "issue": 1895,
+  "kind": "lane",
+  "lane_id": "cmux.klane-1895-1794191287-p1680922-11858bad",
+  "lease_until": 1794203139,
+  "pid": 1680922,
+  "reason": null,
+  "repo": "daniel-ospina/agent-infra",
+  "schema": 1,
+  "started_at": 1794191287,
+  "state": "DONE",
+  "tag": "1895",
+  "worktree": "/home/cmux/agent-infra/.worktrees/tm-1895"
+}
