@@ -1006,6 +1006,8 @@ def _strip_comment(line):
     ⛔ NO GUARD IN THIS SCANNER IS UNDECLARED ANY MORE, BUT FIVE ARE LOAD-BEARING AND UNPINNED — DECLARED
     HERE, BECAUSE "EVERY GUARD IS PINNED OR DECLARED" WAS FALSE UNTIL EVERY GUARD WAS MUTATED ONE AT A TIME
     (baseline 246/0; population `git ls-files '*.sh'`, which was 435 when that sweep ran and is 438 now).
+    ⛔ ONE OF THE FIVE IS PINNED FOR ONE MEMBER OF ITS CONDITION — see the word-set bullet, which is split
+    by member because the mutant's delta depends on which character you pull.
 
     LOAD-BEARING, UNPINNED — a VALID-bash input separates the guard from its mutant (`bash -n` rc 0, and
     `declare -F` agrees with the BASELINE and not with the mutant), NO fixture line carries that input, and
@@ -1013,9 +1015,12 @@ def _strip_comment(line):
       * `_strip_comment` quote-open, below — `echo 'a # b' ; cat <<EOF` plus a body: the mutant scans the
         body as code, a FALSE RED. Moves 0 files.
       * `_strip_comment` word set (` \t;|&(`) — `x=1;# note cat <<NOPE` loses the very next definition, a
-        FALSE PASS. Moves 0 files when ONE member of the set is dropped; dropping the WHOLE condition moves
-        1 (`scripts/pi-reap-idle.sh`, inventing `prints`), so the shape is what is pinned here and the
-        delta depends on which member you pull.
+        FALSE PASS, and the delta is not one number: dropping `\t`, `;`, `|`, `&` or `(` moves 0 files, but
+        dropping the SPACE moves 1 — `scripts/check-false-pass-shapes.sh`, whose awk comment mentioning
+        `cat <<EOF` stops being a comment and swallows eight tokens — and THAT member is pinned, because it
+        reds `f11f-0` at 245/1. Dropping the whole condition moves 1 the other way
+        (`scripts/pi-reap-idle.sh`, inventing `prints`). So of the SIX members of the set — SPACE, TAB, `;`,
+        `|`, `&`, `(` — five are unpinned and the SPACE is pinned: read the member, not the guard.
       * `_openers` DOUBLE-quote state — `echo "a <<b"` then a real heredoc loses every definition after it.
         This one is NOT hypothetical: it moves 5 files and invents `pass` in `pr-path-reads.test.sh`, so
         the namespace arm's own direction is exposed — and it is still unpinned, because no arm scans that
@@ -1413,6 +1418,12 @@ head_with_comment_between()
 #     DUPLICATE report of a name the file already had (the ordered scan moves, the name set does not). That is
 #     the inert-enforcer shape this file exists to catch, so this guard is still OWED a fixture line that
 #     changes under it. Until then it is DECLARED, not pinned.
+#     ⛔ AND THE BARE-WORD GUARD BELOW IS WHAT MOVED THIS MUTANT'S DELTA, so an anchor figure measured before
+#     it landed is not comparable: with the bare-word guard REVERTED, the SAME anchor mutant invents 261 names
+#     across 131 of these 438 files and DOES change the fixture scan (25 -> 26 names), so it reds `f11f-0`.
+#     The anchor was pinned before that guard and is NOT pinned after it. A mutation delta belongs to a HEAD,
+#     not to a guard — so the 130 / 261 / 4 / 29 / 54 figures an earlier revision of this note carried are
+#     withdrawn BY NAME here rather than dropped silently, and none of them is a number at this head.
 #   * DELETING THE NEXT-LINE-BRACE BRANCH IS PINNED: revert it and `f11f-0` reds (245 passed / 1 failed). It
 #     invents NOTHING and HIDES names on the FIXTURE ONLY — 6 of them (`name_next_line`, `name_func_next`,
 #     `head_after_inline_comment`, `head_with_comment_between`, `indented_head_only`, `head_then_blank`) — and
