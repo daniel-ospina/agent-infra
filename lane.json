@@ -1,0 +1,23 @@
+{
+  "_ref": "refs/lanes/cmux.klane-2275-1794183813-p646573-a4299afe",
+  "_sha": "6559ef34b1e1a510e3741eed20212766e58f9e2b",
+  "artifacts": [],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 7800,
+  "exit_code": null,
+  "heartbeat_at": 1794187747,
+  "host": "cmux",
+  "issue": 2275,
+  "kind": "lane",
+  "lane_id": "cmux.klane-2275-1794183813-p646573-a4299afe",
+  "lease_until": 1794195547,
+  "pid": 646573,
+  "reason": null,
+  "repo": "daniel-ospina/tortoise",
+  "schema": 1,
+  "started_at": 1794183813,
+  "state": "RUNNING",
+  "tag": "2275",
+  "worktree": "/home/cmux/tortoise/.worktrees/tm-2275"
+}
