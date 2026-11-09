@@ -2813,6 +2813,136 @@ assert_contains "$(cat "$TEMPLATES/com.eldato.pi-reap-orphans.plist")" "{{REAP_O
     "§16 the template carries the {{REAP_ORPHAN_MODE}} placeholder, not a literal — arming stays reachable"
 
 
+# ── §17: the cmux LAUNCH-PATH gate (#1867) ─────────────────────────────────────────────────────────
+# The heartbeat was installed as a launchd job for its whole life and never delivered a message: the
+# cmux socket (`socketControlMode = cmuxOnly`) refuses a launchd-spawned caller, so the job ran, logged
+# `Access denied - only processes started inside cmux can connect` on every tick, and delivered 0
+# nudges over 1,695 degraded reads. A gate that can never open is not a gate — and the installer used to
+# install one while reporting success, because it had NO knowledge of the socket at all.
+#
+# These assertions fail on pre-change code by construction: before the gate there was nothing to refuse
+# with, so every row below was a green `installed + loaded`.
+echo ""
+echo "── 17. cmux-gated scripts refuse to install under launchd (#1867) ──"
+
+[ -f "$REPO_TEMPLATES/LAUNCHD-INCOMPATIBLE" ] \
+    && ok "§17 the repo SHIPS the gate manifest (templates/launchd/LAUNCHD-INCOMPATIBLE)" \
+    || bad "§17 the repo SHIPS the gate manifest (templates/launchd/LAUNCHD-INCOMPATIBLE)"
+assert_contains "$(cat "$REPO_TEMPLATES/LAUNCHD-INCOMPATIBLE" 2>/dev/null || echo MISSING)" "scripts/heartbeat-loop.sh" \
+    "§17 ... and it declares scripts/heartbeat-loop.sh, the script the blind job ran"
+
+# A template that names the cmux-gated script is REFUSED, hard, and nothing is installed from it.
+# Case A uses the CHECKOUT path (`<repo>/scripts/heartbeat-loop.sh`), which exists in this tree.
+set +e
+OUT="$(probe_install "$PROBE_HOME" /bin/bash "$AGENT_INFRA_PATH/scripts/heartbeat-loop.sh" --loop 2>&1)"; RC=$?
+set -e
+assert_eq "$RC" "1" "§17 a template running a cmux-gated script REFUSES the install (exit 1)"
+assert_contains "$OUT" "cmux-GATED script cannot run under launchd" "§17 ... and says the job would be BLIND, not merely broken"
+assert_contains "$OUT" "socketControlMode" "§17 ... and names the socket gate that makes it so"
+assert_contains "$OUT" "heartbeat-launch.sh start" "§17 ... and names the documented launch path instead"
+[ -f "$PROBE_HOME/Library/LaunchAgents/com.eldato.tccprobe.plist" ] \
+    && bad "§17 ... and installed NOTHING" \
+    || ok "§17 ... and installed NOTHING"
+
+# ⛔ SUFFIX MATCH, NOT PREFIX (#1867): the gate is a property of the SCRIPT, so the FARMED copy a real
+# plist names must refuse too — and so must a copy in any worktree. A prefix-only rule would pass the
+# repo path and quietly bless the deployed one, which is the path that actually runs.
+# Case B therefore names the identical script under $HOME/.pi/agent/scripts — the farmed deployment
+# path, which shares NO prefix with the checkout.
+mkstub "$PROBE_HOME/.pi/agent/scripts/heartbeat-loop.sh"
+set +e
+OUT="$(probe_install "$PROBE_HOME" /bin/bash "$PROBE_HOME/.pi/agent/scripts/heartbeat-loop.sh" 2>&1)"; RC=$?
+set -e
+assert_eq "$RC" "1" "§17 the FARMED copy of the gated script refuses too (suffix match, not prefix)"
+assert_contains "$OUT" "cmux-GATED" "§17 ... with the same named refusal"
+
+# DIRECT control: a DIFFERENT script in the same directory installs, so the refusal above is about the
+# manifest entry and not about the directory or the interpreter.
+set +e
+OUT="$(probe_install "$PROBE_HOME" /bin/bash "$PROBE_HOME/.pi/agent/scripts/probe-ok.sh" 2>&1)"; RC=$?
+set -e
+assert_eq "$RC" "0" "§17 control: a NEIGHBOURING non-gated script in the same dir still installs"
+
+# ⛔ AN EMPTY OR MISSING MANIFEST IS A NO-OP GATE, so the run is refused rather than proceeding
+# ungated — the "installs blindness while reporting success" shape, one layer up.
+GATE_DIR="$T/gate-templates"; rm -rf "$GATE_DIR"; mkdir -p "$GATE_DIR"
+printf '# no entries at all\n' > "$GATE_DIR/LAUNCHD-INCOMPATIBLE"
+set +e
+OUT="$( export HOME="$PROBE_HOME"
+         export PATH="$T/bin:$PATH"
+         export FAKE_LAUNCHCTL_LOG="$LOG"
+         export TEMPLATES_DIR="$GATE_DIR"
+         export AGENTS_DIR="$PROBE_HOME/Library/LaunchAgents"
+         export ELDATO_ALLOW_TEST_HOME=1
+         unset TORTOISE_REPO SWARM_ROOT PYTHON_BIN
+         bash "$INSTALLER" 2>&1 )"; RC=$?
+set -e
+assert_eq "$RC" "1" "§17 an EMPTY manifest refuses the install (an empty gate is the same no-op as none)"
+assert_contains "$OUT" "lists no scripts" "§17 ... and says the gate is empty rather than passing everything"
+
+
+# ── §18: an installed plist with NO template is UNMANAGED (#1867) ──────────────────────────────────
+# The blind heartbeat was installed, loaded and ticking with no template describing it, so neither the
+# status pass (which iterates TEMPLATES) nor any content comparison could see it. That is the hole this
+# closes: --status names it AND the exit code carries it, because a status command that prints a caveat
+# and exits 0 is read by every caller as green.
+echo ""
+echo "── 18. --status reports an installed plist with no template as UNMANAGED ──"
+
+STRAY_HOME="$T/stray-home"; mkfakehome "$STRAY_HOME"
+run_stray_status() {
+    ( export HOME="$STRAY_HOME"
+      export PATH="$T/bin:$PATH"
+      export FAKE_LAUNCHCTL_LOG="$LOG"
+      export TEMPLATES_DIR="$TEMPLATES"
+      export AGENTS_DIR="$STRAY_HOME/Library/LaunchAgents"
+      export ELDATO_ALLOW_TEST_HOME=1
+      unset TORTOISE_REPO SWARM_ROOT PYTHON_BIN
+      bash "$INSTALLER" --status 2>&1 )
+}
+set +e
+OUT="$(run_stray_status)"; RC=$?
+set -e
+assert_eq "$RC" "0" "§18 control: --status on a box with NOTHING unmanaged exits 0"
+assert_not_contains "$OUT" "UNMANAGED" "§18 ... and does not cry UNMANAGED over an empty LaunchAgents dir"
+
+# The blind heartbeat's exact shape: a plist on the box that no template describes.
+cat > "$STRAY_HOME/Library/LaunchAgents/com.eldato.heartbeat.plist" <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>Label</key><string>com.eldato.heartbeat</string>
+<key>ProgramArguments</key><array><string>/bin/bash</string><string>/x/heartbeat-loop.sh</string></array>
+<key>StartInterval</key><integer>120</integer>
+</dict></plist>
+PLIST
+set +e
+OUT="$(run_stray_status)"; RC=$?
+set -e
+assert_eq "$RC" "1" "§18 --status exits NON-ZERO when an installed job has no template (a caveat with exit 0 is green)"
+assert_contains "$OUT" "UNMANAGED" "§18 ... and names the condition"
+assert_contains "$OUT" "com.eldato.heartbeat" "§18 ... and names the label, so it is actionable"
+assert_contains "$OUT" "no template change and no content comparison can" "§18 ... and says WHY no existing instrument could see it"
+
+# A RETIRED label is deliberately template-less — it is DECLARED and removed by retire_pass. It must
+# NOT be reported as unmanaged, or every box that installed the pre-retirement jobs would cry wolf.
+rm -f "$STRAY_HOME/Library/LaunchAgents/com.eldato.heartbeat.plist"
+cp "$REPO_TEMPLATES/RETIRED" "$STRAY_HOME/Library/LaunchAgents/" 2>/dev/null || true
+cat > "$STRAY_HOME/Library/LaunchAgents/com.eldato.hub-state-check.plist" <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>Label</key><string>com.eldato.hub-state-check</string>
+<key>ProgramArguments</key><array><string>/bin/bash</string><string>/x/old.sh</string></array>
+</dict></plist>
+PLIST
+set +e
+OUT="$(run_stray_status)"; RC=$?
+set -e
+assert_eq "$RC" "0" "§18 a RETIRED label is NOT unmanaged (it is declared, and retire_pass removes it)"
+assert_not_contains "$OUT" "UNMANAGED" "§18 ... so no false alarm on a box that installed the pre-retirement jobs"
+
+
 echo "  PASS=$PASS FAIL=$FAIL"
 [ "$FAIL" -eq 0 ] || { echo "  ❌ FAILURES — fix and re-run"; exit 1; }
 echo "  ✅ all checks passed"

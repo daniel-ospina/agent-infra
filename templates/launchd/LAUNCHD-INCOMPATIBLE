@@ -1,0 +1,50 @@
+# Scripts that CANNOT be launched by launchd (#1867).
+#
+# One REPO-RELATIVE path per line. `#` starts a comment; blank lines are ignored.
+# scripts/install-launchd.sh REFUSES (hard, non-zero, nothing installed) any
+# template whose ProgramArguments name one of these scripts, and reports the
+# documented launch path instead.
+#
+# ── WHY THIS FILE EXISTS ─────────────────────────────────────────────────────────────────────────
+# A gate that can never open is not a gate, and the installer used to install one while reporting
+# success. Measured 2026-10-16 on the Mac the heartbeat runs on:
+#
+#     launchd-spawned instance:  1,695 x "lane-status: DEGRADED"
+#                                  210 x "lane-actions: REFUSING a DEGRADED snapshot"
+#                                    0 x nudges delivered
+#
+# with the cmux control socket answering every tick:
+#
+#     cmux send -> rc=1 :: Access denied - only processes started inside cmux can connect
+#
+# `socketControlMode` is `cmuxOnly`, so the socket gates on the LAUNCH-CHAIN ATTRIBUTION macOS keeps
+# for the process tree — not on parentage. A process that STARTED inside a cmux terminal keeps
+# access after it is orphaned (`real_ppid=1`, verified 3/3), and so do its children. A launchd job
+# never had it, so every job listed here is BLIND under launchd: it runs, it logs, it does nothing,
+# and the log reads as activity. That is the false PASS this manifest exists to make impossible.
+#
+# ⛔ THE FIX IS THE LAUNCH PATH, NOT THE SOCKET. Relaxing `automation.socketControlMode` from
+# `cmuxOnly` to `automation` widens "only processes started inside cmux" to "any process by this
+# user" for the whole machine. That is an OWNER DECISION, argued on its own issue — never smuggled
+# in through a bug fix.
+#
+# ── THE DOCUMENTED PATH ──────────────────────────────────────────────────────────────────────────────────
+# Instead of a timer, the correct portable shape is a DETACHED LAUNCHED-ONCE LOOP, started from any
+# cmux-attributed shell:
+#
+#     bash scripts/heartbeat-launch.sh start        # refuses under launchd, names the path
+#     bash scripts/heartbeat-launch.sh status
+#     bash scripts/heartbeat-launch.sh check        # behaviour probe: 0 OK / 1 DRIFT / 2 UNKNOWN
+#
+# The full contract, and the macOS/Linux divergence, is docs/ops/heartbeat-launch-path.md.
+#
+# ⛔ PARITY NOTE — this file governs the LAUNCHD renderer only. On a Linux cell there is no cmux
+# desktop app and therefore no `cmuxOnly` socket, so the same loop is legitimate there; it is
+# delivered by scripts/fleet-schedule.py (the #1864 runtime), not by install-launchd.sh. That is a
+# DOCUMENTED divergence, not an omission — see docs/ops/heartbeat-launch-path.md.
+#
+# ── MATCHING RULE (stated so a reader can predict the refusal) ──────────────────────────────────
+# A ProgramArguments entry matches when its path ends with `/<entry>`. Repo-relative suffix, not
+# absolute prefix: the farmed deployment copy (`$HOME/.pi/agent/scripts/<name>`) and a worktree copy
+# must both refuse, because the gate is a property of the SCRIPT, not of where it is checked out.
+scripts/heartbeat-loop.sh

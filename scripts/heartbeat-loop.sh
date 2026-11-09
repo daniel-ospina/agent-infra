@@ -15,7 +15,39 @@ export PI_FLEET_PATH_PINNED=1
 # `objective.py`'s refresh, the heaviest gh reader in the tree — kept calling gh unserialised and
 # un-backed-off, while the cells (whose supervisor exports `O`) had the layer. Same default as
 # `orch-loop.sh` and `deploy-mac-orchestrator.sh`.
-export PATH="/Users/danielospina/bin:/Users/danielospina/.pi/agent/shims:$PATH"
+# ⛔ DERIVED FROM `$HOME`, NOT FROM A USERNAME (#1867). This line used to name one user's home
+# LITERALLY (`/Users/danielospina/bin:/Users/danielospina/.pi/agent/shims`). On that one laptop it
+# was correct; on every other box — a second Mac, a Linux cell — it prepended two paths that do not
+# exist and pushed the load-bearing `gh` shim dir NOT onto PATH at all, so `gh` silently fell back to
+# whatever the launch environment happened to carry. A pin is a repair; a repair spelled with one
+# user's name is a divergence that only shows up on the machine nobody tested.
+# The ORDER is unchanged (bin, then shims, then whatever was already on PATH) and an entry is added
+# only when it EXISTS, so the same line means the same thing on macOS and Linux.
+if [ -n "${HOME:-}" ] && [ -d "$HOME" ]; then
+    for _pin_dir in "$HOME/bin" "$HOME/.pi/agent/shims"; do
+        [ -d "$_pin_dir" ] || continue
+        case ":$PATH:" in *":$_pin_dir:"*) continue ;; esac
+        PATH="$_pin_dir:$PATH"
+    done
+    unset _pin_dir
+fi
+# `HOME` IS REQUIRED, NEVER FORCE-SET (#1867). The one-user pin that used to live here
+# (`if [ -d /Users/danielospina ]; then export HOME=…`) re-homed the process to a path derived from
+# the CALLER's HOME above, so the loop wrote its state under one home and changed into another —
+# the file's own note records that disagreement. Worse, on a box that did not have that directory
+# it silently did nothing, and `cd "$HOME" || exit 0` below then exited 0 having logged NOTHING.
+# A loop that cannot say which home it runs in must refuse loudly: every path it publishes is
+# derived from this root.
+if [ -z "${HOME:-}" ] || [ ! -d "$HOME" ]; then
+    if [ -n "${STATE:-}" ]; then mkdir -p "$STATE" 2>/dev/null || true; fi
+    if [ -n "${STATE:-}" ] && [ -d "$STATE" ]; then
+        printf '%s LOOP REFUSING to start: HOME=%s is unset or not a directory — every state path\n' \
+            "$(date '+%m-%d %H:%M:%S')" "${HOME:-<unset>}" >> "$LOG" 2>/dev/null || true
+    fi
+    echo "heartbeat-loop: REFUSING to start: HOME=${HOME:-<unset>} is unset or not a directory" >&2
+    exit 2
+fi
+export HOME
 # RAISE THE CLI DEADLINE. Measured 2026-10-01: `cmux workspace list` takes 0.2-2s on a
 # quiet box but 13.4-15.1s at load 130+, against a fixed 15s CLI deadline — so a slow
 # answer is indistinguishable from a hang (`Error: Command timed out`). That made the
@@ -325,7 +357,11 @@ fi
 # CALLER's HOME above, so pinning HOME afterwards left the two disagreeing: state written under
 # one home, cwd changed to another. Guarded, a box that HAS the pin gets it unchanged, and a box
 # that does not gets its own HOME -- consistent with the state and scripts paths.
-if [ -d /Users/danielospina ]; then export HOME="/Users/danielospina"; fi
+# ⛔ HOME IS REQUIRED AND ALREADY PINNED ABOVE (#1867). The one-user `if [ -d /Users/danielospina ]
+# then export HOME=…` pin that lived here is gone: it named one person's home in a script that ships
+# to every machine, and it re-pinned HOME AFTER `STATE`/`SCRIPTS` had been derived from the caller's
+# HOME — state under one home, cwd under another. The requirement is now checked once, near the top,
+# and refuses loudly instead of driving `cd "$HOME" || exit 0` into a silent green.
 # ⛔ DERIVED FROM THE **PINNED** HOME — i.e. after the `export HOME=` above, never before it. A `:-`
 # default is evaluated once; computing it from the AMBIENT `$HOME` (a `sudo`/`su` shell, an agent
 # session) exports a path that does not exist on this box, and every tool silently falls back to its
@@ -338,7 +374,28 @@ export O="${O:-$HOME/orchestrator}"
 # tick logged "NOTE ask-owner scan produced nothing usable" — the gate was silently
 # dead while the heartbeat reported a green. Add a PATH entry only when it is
 # needed, but never omit this one silently.
-export PATH="/Users/danielospina/bin:/Applications/cmux.app/Contents/Resources/bin:/Users/danielospina/.pi/agent/bin:/Users/danielospina/.pi/agent/shims:/Users/danielospina/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+# `~/.pi/agent/shims` is where `gh` lives on this box (a symlink to the agent-infra gh-shim). It
+# was MISSING from the first version of this PATH, and the very first tick logged "NOTE ask-owner
+# scan produced nothing usable" — the gate was silently dead while the heartbeat reported a green.
+# Add a PATH entry only when it is needed, but never omit this one silently.
+#
+# ⛔ NO LITERAL USER HOME (#1867). Every home-relative entry is derived from `$HOME` and appended
+# only when it exists; the absolutist list this replaced (`/Users/danielospina/bin:…`) was correct
+# on exactly one machine and produced a PATH full of non-directories everywhere else. The system
+# tail is kept as-is because those paths are the same on macOS and on the Linux cells.
+for _path_dir in \
+    "$HOME/bin" \
+    "/Applications/cmux.app/Contents/Resources/bin" \
+    "$HOME/.pi/agent/bin" \
+    "$HOME/.pi/agent/shims" \
+    "$HOME/.local/bin" \
+    "/opt/homebrew/bin"; do
+    [ -d "$_path_dir" ] || continue
+    case ":$PATH:" in *":$_path_dir:"*) continue ;; esac
+    PATH="$_path_dir:$PATH"
+done
+unset _path_dir
+export PATH="/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
 export CMUX_QUIET=1     # the deprecation notice otherwise PREFIXES --json output
 
 # ⛔ REPO EVIDENCE FOR THE DETACHED PASS, PINNED HERE BECAUSE THIS LOOP *IS* THE LAUNCHER (agent-infra#2280).

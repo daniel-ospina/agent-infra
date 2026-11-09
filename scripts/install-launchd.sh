@@ -33,6 +33,18 @@
 # A template whose script target does not resolve (broken symlink / missing
 # file) is a HARD FAILURE — a dead job must never be installed.
 #
+# ⛔ cmux-GATED SCRIPTS REFUSE TO INSTALL (#1867). A template whose ProgramArguments
+# name a script listed in templates/launchd/LAUNCHD-INCOMPATIBLE is a HARD FAILURE:
+# the cmux control socket (`socketControlMode = cmuxOnly`) gates on launch-chain
+# ATTRIBUTION, which a launchd job never has, so such a job would run, log and do
+# nothing — the false PASS measured as 1,695 `lane-status: DEGRADED` reads and 0
+# delivered nudges. The refusal names the documented launch path instead of widening
+# the socket (that is an owner decision, argued on its own issue).
+#
+# `--status` also reports an INSTALLED plist with NO template as UNMANAGED and exits
+# non-zero: that was the blind heartbeat's exact shape — a job on the box that the
+# declared set no longer describes, invisible to every content-drift comparison.
+#
 # Usage:
 #   install-launchd.sh               install/refresh all templates (idempotent)
 #   install-launchd.sh --status      per-job: installed? loaded? version? drift?
@@ -73,9 +85,17 @@ TEMPLATES_DIR="${TEMPLATES_DIR:-$INFRA_ROOT/templates/launchd}"
 AGENTS_DIR="${AGENTS_DIR:-${HOME:?HOME is required}/Library/LaunchAgents}"
 DOMAIN="gui/$(id -u)"
 
-# The range is literal and moves with the header: it ends on `set -uo pipefail`,
-# exactly as it did before the {{PATH}} note above was added.
-usage() { sed -n '2,64p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+# The range is DERIVED, not literal (#1867). It used to be `sed -n '2,64p'` with a comment saying
+# the number "moves with the header" — i.e. every header edit silently truncated `--help`, and an
+# earlier one already had. The block still ends on `set -uo pipefail`; the line number is now read
+# from the file instead of restated, so a header edit cannot desynchronise it.
+usage() {
+    local end
+    end="$(grep -n '^set -uo pipefail' "$0" | head -1 | cut -d: -f1)"
+    [ -n "${end:-}" ] && [ "$end" -gt 2 ] || end=76
+    sed -n "2,$((end - 1))p" "$0" | sed 's/^# \{0,1\}//'
+    exit 2
+}
 
 # ── THE PLACEHOLDER CONTRACT ──────────────────────────────────────────────────────────────────
 # ONE list, TWO consumers: `render` substitutes every name here, and `install_job` SKIPS a template
@@ -1207,6 +1227,22 @@ verify_targets() {
             bad=1
             continue
         fi
+        # ⛔ THE cmux GATE, BEFORE THE TCC AND FILE-TYPE VERDICTS (#1867). A cmux-gated script is
+        # not "protected" and it is not "broken" — it is a job that will install cleanly, load
+        # cleanly, tick cleanly and be BLIND for its whole life. Every other arm here answers "can
+        # launchd execute this file"; this one answers "may the result see anything", which no
+        # content comparison can. Measured cost of not having it: 1,695 degraded reads, 0 nudges.
+        if is_cmux_gated "$arg"; then
+            echo "    cmux-GATED script cannot run under launchd: $arg" >&2
+            echo "        the cmux socket (socketControlMode = cmuxOnly) gates on launch-chain" >&2
+            echo "        attribution, which a launchd job never has — this job would install, load," >&2
+            echo "        tick and deliver NOTHING while its log read as activity (#1867)." >&2
+            echo "        Documented launch path: bash scripts/heartbeat-launch.sh start" >&2
+            echo "        See docs/ops/heartbeat-launch-path.md. Relaxing the socket is an owner" >&2
+            echo "        decision and is NOT the fix." >&2
+            bad=1
+            continue
+        fi
         # ⛔ THE TCC VERDICT COMES FIRST. A 0-byte or non-regular file INSIDE a TCC root is verdict 2
         # (skip that unit, disarm any copy) — the class this whole change exists for — not verdict 1:
         # a FAIL aborts the install and takes `sync.sh` with it.
@@ -1576,6 +1612,33 @@ status_job() {
     echo "  $label: installed=$state version=v$version ($drift)"
 }
 
+# ── UNMANAGED INSTALLED PLISTS (#1867) ─────────────────────────────────────────────────────────────
+# A plist installed on the box that NO template in the declared set describes is invisible to every
+# content comparison this file makes — the loop in `--status` and the install loop both iterate
+# TEMPLATES, so a job that was installed by hand (or by a template that has since been deleted)
+# simply is not looked at. That was the blind heartbeat's exact shape: installed, loaded, ticking
+# on the wrong launch path, and reported by nothing. Behaviour drift is invisible to a drift check
+# on content; a job outside the declared set is invisible to BOTH.
+#
+# Scoped to the labels this repo can plausibly own (`com.eldato.*`, `com.tortoise.*`) so a box's
+# own unrelated LaunchAgents are not this installer's business — the same boundary the rest of the
+# file uses when it probes for an eldato domain.
+unmanaged_plists() {
+    local installed label have_template=0
+    [ -d "$AGENTS_DIR" ] || return 0
+    for installed in "$AGENTS_DIR"/com.eldato.*.plist "$AGENTS_DIR"/com.tortoise.*.plist; do
+        [ -f "$installed" ] || continue
+        label="$(basename "$installed" .plist)"
+        have_template=0
+        [ -f "$TEMPLATES_DIR/$label.plist" ] && have_template=1
+        [ "$have_template" = 1 ] && continue
+        # A RETIRED label is deliberately template-less: it is DECLARED and it is removed by
+        # retire_pass on the next install, so it is not "unmanaged" — it is pending retirement.
+        is_retired "$label" && continue
+        printf '%s\n' "$label"
+    done
+}
+
 uninstall_job() {
     local template="$1" label installed
     label="$(job_label "$template")"
@@ -1618,6 +1681,84 @@ retired_labels() {
         esac
         printf '%s\n' "$label"
     done < "$manifest"
+}
+
+# ── THE cmux LAUNCH-PATH GATE (#1867) ────────────────────────────────────────────────────────────
+# Templates/launchd/LAUNCHD-INCOMPATIBLE declares, once and in the repo, the scripts that a
+# launchd job must never run because their whole job is to touch the cmux socket — which refuses a
+# launchd-spawned caller. The check lives HERE, at the renderer, because that is where the wrong
+# launch path was being produced (the installer had NO knowledge of the gate: grep for `cmux` /
+# `socketControlMode` returned nothing, so it installed blindness by design and silently).
+cmux_gated_scripts() {
+    local manifest entry
+    manifest="$(cmux_manifest)"
+    [ -n "$manifest" ] || return 0
+    while IFS= read -r entry; do
+        case "$entry" in
+            ""|\#*) continue ;;
+        esac
+        printf '%s\n' "$entry"
+    done < "$manifest"
+}
+
+# cmux_manifest — the manifest this run will use, or EMPTY when the checkout does not carry one.
+#
+# ⛔ FAIL-CLOSED RESOLUTION, and the fallback is the point. `TEMPLATES_DIR` is an env override (the
+# test suite isolates through it), so reading the manifest ONLY from there made the gate a no-op on
+# any box where the override points at a directory without it — the "a gate that silently does
+# nothing" class this whole change is about. The REPO's own copy is therefore the fallback, and a
+# run where NEITHER exists is refused outright by `cmux_gate_required` below rather than proceeding
+# ungated.
+cmux_manifest() {
+    if [ -f "$TEMPLATES_DIR/LAUNCHD-INCOMPATIBLE" ]; then
+        printf '%s\n' "$TEMPLATES_DIR/LAUNCHD-INCOMPATIBLE"
+    elif [ -f "$INFRA_ROOT/templates/launchd/LAUNCHD-INCOMPATIBLE" ]; then
+        printf '%s\n' "$INFRA_ROOT/templates/launchd/LAUNCHD-INCOMPATIBLE"
+    fi
+}
+
+# cmux_gate_required — refuse to install ANYTHING when the gate has no manifest to evaluate.
+# An installer that cannot tell whether a template is cmux-gated must not install on the assumption
+# that none are: that is precisely how the blind heartbeat was installed and reported as success.
+cmux_gate_required() {
+    local manifest listing
+    manifest="$(cmux_manifest)"
+    if [ -z "$manifest" ]; then
+        echo "ERROR: the cmux launch-path gate cannot be evaluated — no LAUNCHD-INCOMPATIBLE manifest" >&2
+        echo "       looked in: $TEMPLATES_DIR/ and $INFRA_ROOT/templates/launchd/" >&2
+        echo "       Without it this installer cannot tell whether a template would install a job that" >&2
+        echo "       is blind under launchd (#1867), so it installs NOTHING." >&2
+        return 1
+    fi
+    listing="$(cmux_gated_scripts || true)"
+    if [ -z "$listing" ]; then
+        echo "ERROR: $manifest lists no scripts — an EMPTY gate is the same no-op as a missing one" >&2
+        return 1
+    fi
+    return 0
+}
+
+# is_cmux_gated <absolute argv path> → 0 when it is a declared cmux-gated script.
+#
+# ⛔ SUFFIX MATCH, NOT PREFIX. The gate is a property of the SCRIPT, not of the directory it was
+# checked out into: `$HOME/.pi/agent/scripts/heartbeat-loop.sh` (the farmed deployment copy that a
+# plist actually names) and `<worktree>/scripts/heartbeat-loop.sh` are the same script and must
+# both refuse. Resolving both sides and comparing the repo-relative tail is what makes the refusal
+# predictable from the manifest alone; the matching rule is stated in the manifest's own header.
+# Capture-then-herestring, never a pipe into `grep -q` — under `pipefail` the producer takes
+# SIGPIPE at grep's first match and the verdict inverts (#864's shape).
+is_cmux_gated() {
+    local arg="$1" entry gated
+    [ -n "$arg" ] || return 1
+    gated="$(cmux_gated_scripts || true)"
+    [ -n "$gated" ] || return 1
+    while IFS= read -r entry; do
+        [ -n "$entry" ] || continue
+        case "$arg" in
+            "$entry"|*/"$entry") return 0 ;;
+        esac
+    done <<<"$gated"
+    return 1
 }
 
 is_retired() { # $1 = label → 0 when it is listed in RETIRED
@@ -1733,6 +1874,24 @@ if [ "${1:-}" = "--status" ]; then
         fi
         status_job "$template"
     done
+    # ⛔ AN INSTALLED JOB WITH NO TEMPLATE IS NOT "NOTHING TO REPORT" (#1867). It is a job on the
+    # box the declared set does not describe, so neither this pass nor the content comparison can
+    # say anything about it — the blind heartbeat sat in exactly that hole. Named loudly, and the
+    # EXIT CODE carries it: a status command that prints a caveat and exits 0 is read by every
+    # caller as "green".
+    status_rc=0
+    unmanaged="$(unmanaged_plists || true)"
+    if [ -n "$unmanaged" ]; then
+        echo ""
+        echo "  ⛔ UNMANAGED — installed with NO template in the declared set:" >&2
+        while IFS= read -r _lbl; do
+            [ -n "$_lbl" ] || continue
+            echo "    $_lbl ($AGENTS_DIR/$_lbl.plist)" >&2
+        done <<<"$unmanaged"
+        echo "    Not described by this repo, so no template change and no content comparison can" >&2
+        echo "    reach it. Inspect it, then either add a template or uninstall it." >&2
+        status_rc=1
+    fi
     if [ -n "$(retired_labels)" ]; then
         echo "Retired (moved to session-checks, #432): $(retired_labels | tr '\n' ' ')"
     fi
@@ -1748,7 +1907,7 @@ if [ "${1:-}" = "--status" ]; then
     else
         echo "     orphan-reaper: DISARMED (report-only; arm with --arm-orphan-reaper)"
     fi
-    exit 0
+    exit "$status_rc"
 fi
 
 if [ $# -gt 0 ]; then
@@ -1801,6 +1960,10 @@ fi
 
 echo "=== Installing agent-infra launchd agents (idempotent) ==="
 fail=0
+# ⛔ THE GATE IS EVALUATED BEFORE THE FIRST TEMPLATE IS TOUCHED. A cmux-gated job that installs is
+# blind for its whole life and reports success; there is nothing to repair afterwards, so this is a
+# precondition of the run rather than a verdict on individual jobs.
+cmux_gate_required || exit 1
 # Retire first (#432): unload jobs whose work moved to session-checks.
 retire_pass || fail=1
 for template in "$TEMPLATES_DIR"/*.plist; do
