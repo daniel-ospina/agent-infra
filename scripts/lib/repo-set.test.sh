@@ -519,8 +519,25 @@ ck "f5 …and the degradation is LOGGED every pass, with the file to create" \
 # proof — and one line later the wrapper printed `<path> does not exist` flat. The degrade line is now
 # neutral about existence, and this arm reds it back if the claim returns (it is not a wording preference:
 # the sentence and the evidence above it must agree).
+# ⛔ THE PIPE WAS THE FALSE-PASS SHAPE (`#841`/`#864`, `sigpipe-grep-guard` — red on `main` from the round-44
+# merge, and this file was one of the sites). `producer | grep -q` under `pipefail` lets `grep -q` exit as
+# soon as it matches, the producer dies of SIGPIPE, and the PIPELINE's status becomes the failure — which
+# is a NEGATED assertion passing on its own absence, so it is never the right idiom for `! grep -q`.
+# ⛔ BUT NOT BECAUSE A FALSE PASS WAS OBSERVED HERE (round 48 review, P3 — measured, and an earlier
+# revision of this note got BOTH halves of the mechanism wrong, so here is what actually happens). The
+# payload is under a KILOBYTE — 919 B at a 31-character path, and it is not a fixed number because it grows
+# with the path length — but it is TEN WRITES, not one, so buffer size is irrelevant: `grep -q` exits on
+# the first match, the wrapper's next write hits a closed reader, and the producer dies of SIGPIPE 200/200
+# at that size. What the measurement ALSO shows is that this arm never saw it, because
+# `shard_exec` forks a child `bash` and shell options do not inherit — so the arm runs with `pipefail`
+# OFF, where the OLD form passed 200/200 and discriminated every time. The fix therefore stands on the
+# SHAPE, not on an observation: under `pipefail` the same arm is a hard 0/200 RED on correct code (the
+# producer's 141 becomes the pipeline's status), and the negation is the half that inverts — under
+# `pipefail` it passes in BOTH states (measured 200/200 with the forbidden claim present AND 200/200 with
+# it absent), so it cannot red that claim at all: it goes inert, not merely wrong. A red-on-correct-code
+# arm gets "fixed" by weakening the assertion, which is how the false pass would arrive a revision later.
 ck "f5b …and the degrade line asserts no existence proof the reader may have disclaimed" \
-   'run_wrapper_err "$nofile" | grep -q "DEGRADED — NO-REPO-SET" && ! run_wrapper_err "$nofile" | grep -q "DEGRADED — NO-REPO-SET: $nofile does not exist"'
+   'out="$(run_wrapper_err "$nofile")"; grep -q "DEGRADED — NO-REPO-SET" <<<"$out" && ! grep -q "DEGRADED — NO-REPO-SET: $nofile does not exist" <<<"$out"'
 ck "f6 …and it names the line format so the fix is copy-paste" \
    'run_wrapper_err "$nofile" | grep -q "slug=OWNER/NAME checkout=/abs/checkout"'
 
@@ -917,17 +934,290 @@ defn = re.compile(r'^\s*(?:function\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*(?:\(\s*\))?\
 head = re.compile(r'^\s*(?:function\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*(?:\(\s*\))?\s*$')
 
 raw_lines = [l.rstrip('\n') for l in open(sys.argv[1], encoding='utf-8')]
+
 # ⛔ A BACKSLASH CONTINUATION HID A REAL DEFINITION (round 48 review, P3 — measured): `name() \` and
 # `{ … }` on the next line is a genuine definition (`declare -F` lists it), but `head` requires
-# end-of-line after the name, so that spelling was never reported. Join continuations before scanning.
+# end-of-line after the name, so that spelling was never reported.
+# ⛔ AND THE JOIN MUST FOLLOW BASH IN THE TWO PLACES IT MATTERS (measured, same review): a COMMENT ENDS at
+# the newline however many backslashes it carries, and a HEREDOC BODY is never scanned. The naive join LOST a
+# real definition that followed a `\`-terminated comment line (a false PASS for the namespace arm) and
+# FABRICATED one from `key \` + `{ value` inside a heredoc (a false RED) — both reproduced, both gone, and
+# each is pinned by a fixture line.
+# ⛔ WHAT THIS SCANNER IS AND IS NOT. It answers ONE question — which names does a VALID bash file define —
+# and it is not a bash parser. A "terminator followed by `;`" convenience was tried and REMOVED because it
+# was a live DISAGREEMENT with bash (`INNER;` does not close a heredoc: bash warns "delimited by end-of-file"
+# and the body runs on, so a body line leaked into the scan as a definition); the fixture carries an
+# `INNER2;` case so that rule is pinned rather than merely stated.
+# ⛔ AND THE JOIN IS BASH'S JOIN, ON THE ONE POINT THAT MATTERS (round 48 review, P2 — measured): a line
+# continues only on an ODD run of trailing backslashes. `echo a\\` (an EVEN run) is valid bash whose line ENDS
+# there, and stripping one backslash and joining anyway swallowed the real definition on the next line — a
+# FALSE PASS for the namespace arm, the same class as the phantom heredoc below. The note that used to sit
+# here justified removing an odd-run test by saying "bash REJECTS the only line that could exercise it".
+# ⛔ AND THAT SENTENCE HAD THE PARITY BACKWARDS (round 48 review, P1 — measured, and this note repeated the
+# error for one round): `probe() \\` carries TWO trailing backslashes — an EVEN run — and `bash -n` refuses it
+# (rc 2) BECAUSE the run is even: `\\` is one escaped backslash left dangling as a word. The ODD shape is the
+# one bash ACCEPTS — `probe() \` + a newline + `{ :; }` is `bash -n` rc 0 and `declare -F` lists `probe` — so
+# "no valid script contains the shape" is FALSE as stated. What is rejected is that definition SIGNATURE, and
+# the removed test was about a different shape: an EVEN run on a line bash ACCEPTS (`echo a\\`), which is the
+# live defect. Both directions are pinned, and the mutation measures it: restoring the pre-cycle-2 rule
+# `s.endswith('\\')` drops `after_even_backslash_run` from the fixture scan, and deleting the join loses
+# `continued_name` (the odd continuation).
+# ⛔ THE OPENER IS FOUND BY A WALK, NOT BY A SUBSTRING SEARCH (round 48 review, P2 — measured). A regex
+# over the whole line has no idea whether a `<<` sits in a comment or in an arithmetic expansion, and two
+# valid-bash shapes made it open a PHANTOM heredoc that swallowed the rest of the file — so the namespace arm
+# stayed GREEN with an out-of-namespace helper defined right there (a FALSE PASS), and a body line leaked
+# into the scan as a definition (a FALSE RED). `_openers` therefore walks the line with bash's own quoting,
+# comment and `$(( … ))` rules, and RECORDS EVERY opener in bash's order rather than only the first.
+# ⛔ DECLARED LIMITS, each a limit of a LINE-SHAPE model rather than an accident, and each in a KNOWN
+# direction. (i) `<<$X` — a delimiter spelled with a parameter expansion — is not modelled, so bash opens a
+# heredoc whose body this scans as code. (ii) a `$((` that NEVER closes leaves the residue of the file in
+# arithmetic — but ⛔ NOT in the direction this note used to claim (round 48 review, P2 — measured):
+# `_arith_depth` is read and written by `_openers` ALONE, so the definition loop still scans every logical
+# line and an unclosed depth cannot HIDE a definition. The reachable effect is the OPPOSITE one — a `<<`
+# after the stuck opener is never recorded, so the heredoc BODY is scanned as code and a body line can be
+# INVENTED as a definition (a FALSE RED). Measured, on valid bash: `x='ab((cd'` + `y=${x#((}` makes bash
+# read `((` as a pattern while the walk enters arithmetic, and the `cat <<INNER` body line is then reported
+# where `declare -F` lists only `after_heredoc`. (iii) the three definition
+# SPELLINGS the `defn`/`head` patterns cannot see — a SUB-SHELL body (`name() (`), a SECOND definition on
+# one line, and a name inside a MULTI-LINE quoted string (that one is INVENTED, not missed). (iv) QUOTING IS
+# TRACKED PER LINE, so a `<<` on a line INSIDE a multi-line quoted string opens a PHANTOM heredoc (round 48
+# review, P2 — measured): `usage="Run it like this:` / `  cat <<EOF` / `to pipe a file"` / `after_quoted() {
+# :; }` is `bash -n` rc 0 and `declare -F` lists `after_quoted`, while this scanner prints NOTHING — the
+# phantom terminator never arrives and the rest of the file is swallowed, i.e. the FALSE-PASS direction. It is
+# latent today only because the reader's own scan still equals `declare -F` (26/26), and nothing here claims
+# more than that. ⛔ The list this
+# replaced was wrong in BOTH directions: it declared `$(( … ))` inside a `$( … )` substitution "not
+# modelled" when it IS (measured: `out=$(cat <<EOF … )` scans identically to bash), and `[[ a << b ]]`
+# when that spelling is a bash SYNTAX ERROR (`rc 2`) and so is vacuous. None of (i)–(iv) occurs in
+# `repo-set.sh`, the only file the namespace arm scans, and the closing sentence of the old note had the
+# arrow backwards — it said the unmodelled list was what the walk EXCLUDES, while the walk excludes
+# comments and arithmetic, which were never on it.
+def _odd_backslashes(s):
+    """True when s ends in a run of backslashes that bash reads as a line continuation."""
+    n = 0
+    while n < len(s) and s[len(s) - 1 - n] == '\\':
+        n += 1
+    return n % 2 == 1
+
+
+def _strip_comment(line):
+    """`line` with a trailing comment removed — bash's rule: an unquoted `#` that starts a WORD.
+
+    ⛔ A COMMENT ENDS AT THE NEWLINE HOWEVER MANY BACKSLASHES IT CARRIES (round 48 review, P2 — measured).
+    The join tested the RAW line, so `x=1  # note \\` was read as a continuation, the next line was
+    swallowed and a real definition went invisible (a FALSE PASS) — and inside a `cat <<EOF` body the
+    lost opener then invented a body line as a definition (a FALSE RED). Cutting the comment BEFORE the
+    continuation test is what makes the file's own "a comment ends at the newline" true of both the
+    whole-line and the trailing form, instead of only the whole-line one.
+    """
+    i, n = 0, len(line)
+    quote = None
+    while i < n:
+        c = line[i]
+        if quote == "'":
+            if c == "'":
+                quote = None
+            i += 1
+            continue
+        if quote in ('"', '`'):
+            if c == '\\':
+                i += 2
+                continue
+            if c == quote:
+                quote = None
+            i += 1
+            continue
+        if c == '\\':
+            i += 2
+            continue
+        if c == '#' and (i == 0 or line[i - 1] in ' \t;|&('):
+            return line[:i]
+        if c in ('"', "'", '`'):
+            quote = c
+        i += 1
+    return line
+
+
+# ⛔ ARITHMETIC OUTLIVES THE LINE (round 48 review, P2 — measured): `$(( 1 +` may close on a LATER line with
+# no backslash, and a `<<` inside it is still a SHIFT. A per-line depth started every line at 0, so such a
+# shift reopened a phantom heredoc and swallowed the rest of the file (a FALSE PASS). The depth is carried
+# between logical lines now. ⛔ AN `arith` THAT NEVER CLOSES IS NOT THE FAIL-CLOSED DIRECTION (round 48
+# review, P2 — measured, and this note used to claim the opposite): the depth is read and written by
+# `_openers` ALONE, so the definition loop still sees every logical line and nothing is hidden. The reachable
+# effect is the OTHER direction — a `<<` after the stuck opener is never recorded, its body is scanned as
+# code, and a body line is INVENTED as a definition (a FALSE RED). It is a declared limit, not a claim.
+_arith_depth = 0
+
+
+def _openers(line):
+    """Every heredoc opened on ONE logical line, in bash's order, as (delimiter, strip_tabs, quoted).
+
+    `quoted` is read from the FIRST character of the delimiter word (a quote, or a backslash), which is the
+    only spelling this walk models — and it is LOAD-BEARING, because bash joins a backslash-newline inside an
+    UNQUOTED here-document and does not inside a quoted one (see the body loop).
+
+    A comment ends at the newline — `_strip_comment` has already removed it, so this walk never sees one.
+    ⛔ THE COMMENT RULE IS NOT DEFINED ONCE IN THIS FILE, AND THIS SENTENCE USED TO CLAIM IT WAS (round 48
+    review, P3 — measured): `_strip_comment` is the QUOTE-AWARE rule, and the definition loop carries a
+    SECOND one — a `re.sub` that cuts at the first whitespace-preceded `#` — which is whitespace-anchored and
+    quote-BLIND, so the two disagree on a line like `echo "a #b"` (untouched there, truncated to `echo "a`
+    here). Neither is a redundant copy: delete `_strip_comment` and the walk opens phantom heredocs (6 of the
+    437 files change and the fixture loses 18 names — `after_bare_word_brace` among them, which is why this
+    number is one more than the 17 measured before this fixture grew); delete that `re.sub` and `f11f-0` reds by losing
+    `head_after_inline_comment`. This walk owns NEITHER; a quoted delimiter keeps its own quoting rules, and
+    `$(( … ))` / `(( … ))` are arithmetic where `<<` is a shift.
+    """
+    global _arith_depth
+    out = []
+    i, n = 0, len(line)
+    quote = None
+    arith = _arith_depth
+    while i < n:
+        c = line[i]
+        if quote == "'":
+            if c == "'":
+                quote = None
+            i += 1
+            continue
+        if quote in ('"', '`'):
+            if c == '\\':
+                i += 2
+                continue
+            if c == quote:
+                quote = None
+            i += 1
+            continue
+        if c == '\\':
+            i += 2
+            continue
+        if c in ('"', "'", '`'):
+            quote = c
+            i += 1
+            continue
+        if arith:
+            if line.startswith('))', i):
+                arith -= 1
+                i += 2
+                continue
+            i += 1
+            continue
+        # `(( … ))` and `$(( … ))` alike: `$` is walked as an ordinary character, so the two parens
+        # that follow it open the arithmetic context. Inside it, `<<` is a SHIFT, never an opener.
+        if line.startswith('((', i):
+            arith += 1
+            i += 2
+            continue
+        if line.startswith('<<', i):
+            j = i + 2
+            if j < n and line[j] == '<':      # `<<<` is a here-STRING: it has no body
+                # ⛔ DECLARED NO-OP, not a pinned arm (round 48 review): every `<<<` spelling yields an
+                # EMPTY delimiter below anyway, because the third `<` is never a delimiter word — so no
+                # fixture can discriminate this guard and none pretends to. It is kept because it states
+                # the intent at the point a reader would otherwise wonder, and the fixture's two `<<<`
+                # lines still pin the PROPERTY (a here-string never swallows the lines after it).
+                i = j + 1
+                continue
+            strip_tabs = False
+            if j < n and line[j] == '-':
+                strip_tabs = True
+                j += 1
+            while j < n and line[j] in ' \t':
+                j += 1
+            delim = ''
+            quoted = False
+            if j < n and line[j] in '\'"\\':
+                quoted = True
+                q = line[j]
+                j += 1
+                # ⛔ DECLARED NO-OP, not a pinned arm (round 48 review, P3 — measured): a quoted delimiter
+                # holding a character OUTSIDE [A-Za-z0-9_.-] (e.g. `<<'A,B'`) is the only spelling that tells
+                # this branch from the fallback loop below, and no fixture line carries one — deleting the
+                # branch leaves the suite at 246/0 and changes the scan of 0 of 435 `git ls-files '*.sh'`
+                # files. Declared rather than pinned because a pin here would encode a spelling no real
+                # script uses; if one ever appears, this note is the fixture to write.
+                if q in ("'", '"'):          # a QUOTED delimiter may hold any character
+                    while j < n and line[j] != q:
+                        delim += line[j]
+                        j += 1
+                    j += 1
+                # ⛔ PINNED, and only by ONE spelling (round 48 review, P3 — measured at this head): the
+                # `cat <<\!BANG` fixture below is what separates this branch from the fallback loop, and
+                # deleting the branch reds `f11f-0` because `delim` stays empty, no opener is recorded, and
+                # the body line leaks into the scan. The two other backslash spellings in the fixture
+                # (`<<\BSLASHED`, `<<\HY-PHEN`) do NOT discriminate — `B` and `H` are name characters, so
+                # the fallback loop re-appends the rest identically — which is why the discriminating one
+                # quotes a NON-name character. Do not "simplify" this branch into the plain quote scan: that
+                # is the mutant, and it fabricates a definition out of a heredoc body.
+                elif j < n:                    # `<<\WORD`: the backslash quotes ONE character
+                    delim = line[j]
+                    j += 1
+                while j < n and (line[j].isalnum() or line[j] in '_.-'):
+                    delim += line[j]
+                    j += 1
+            else:
+                while j < n and (line[j].isalnum() or line[j] in '_.-'):
+                    delim += line[j]
+                    j += 1
+            # ⛔ NO NUMERIC-DELIMITER EXEMPTION (review cycle 2): it existed for `$(( x << 15 ))`, which
+            # the arithmetic context above already skips, and it was WRONG about `cat <<123` — a real
+            # heredoc bash runs. The fixture pins the numeric spelling now.
+            # ⛔ DECLARED NO-OP (round 48 review, P3 — measured): every opener the walk can produce on a
+            # fixture or repo line yields a non-empty delimiter, because `#` blocks the whole-line form and
+            # the trailing-comment strip runs before the walk. Deleting this test leaves the suite at 246/0
+            # and moves 0 of 435 files. It stays as the boundary for `cat <<` with nothing after it, which is
+            # a bash syntax error rather than a construct to model.
+            if delim:
+                out.append((delim, strip_tabs, quoted))
+            i = j
+            continue
+        i += 1
+    _arith_depth = arith
+    return out
+
+
 lines = []
+_pending = []       # heredocs whose BODIES are still to come, in bash's order
+_body = None        # an UNQUOTED body line that ended in a continuation, waiting for its next line
+_buf = None
 for _l in raw_lines:
-    if lines and lines[-1].endswith('\\'):
-        lines[-1] = lines[-1][:-1] + _l.lstrip()
-    else:
-        lines.append(_l)
+    if _pending:
+        _delim, _strip, _quoted = _pending[0]
+        _cand = _l.lstrip('\t') if _strip else _l
+        # ⛔ A BODY LINE ENDING IN A BACKSLASH IS JOINED BEFORE THE TERMINATOR TEST (round 48 review, P3 —
+        # measured): for an UNQUOTED delimiter bash removes each `\<newline>` "while reading the
+        # here-document, before the check for the ending delimiter", so `JOIN\` + `ED` CLOSES a `<<JOINED`
+        # heredoc and the line after it is a new command. Comparing raw lines left the opener pending
+        # forever, so the rest of the file became body and every definition below it vanished — a FALSE PASS
+        # in the namespace arm's own direction, which had no fixture and was not on the declared-limits list.
+        # ⛔ AND THE JOIN IS THE UNQUOTED PATH ONLY: with `<<'JQ'` the same `J\` + `Q` is LITERAL, the
+        # terminator never arrives there, and the next line is still body. Both directions are pinned, so the
+        # lazy fix — joining whatever ends in a backslash — reds `f11f-0` by inventing the quoted body's line.
+        if _body is not None:
+            _cand = _body + _cand
+            _body = None
+        if not _quoted and _odd_backslashes(_cand):
+            _body = _cand[:-1]
+            continue
+        if _cand == _delim:            # `<<-` permits leading TABS, nothing else permits anything
+            _pending.pop(0)
+        continue
+    _buf = _l if _buf is None else _buf + _l
+    if _odd_backslashes(_strip_comment(_buf)):
+        _buf = _buf[:-1]
+        continue
+    lines.append(_buf)
+    _pending.extend(_openers(_strip_comment(_buf)))
+    _buf = None
+if _buf is not None:
+    lines.append(_buf)
 defs = []
 for i, raw in enumerate(lines):
+    # ⛔ DECLARED NO-OP, and structurally so (round 48 review, P3 — measured): a whole-line comment cannot
+    # reach a definition here, because `defn` opens with `^\s*(?:function\s+)?([A-Za-z_]...)` and `#` is not
+    # a name character — measured directly: `#foo() {`, `  # foo() {`, `#a(){`, `#!/bin/bash` all fail
+    # `defn.match` with this skip removed. Deleting it leaves the suite at 246/0 and moves 0 of 435
+    # `git ls-files '*.sh'` files. Kept as the read-aloud statement of intent, not as a guard; do not cite
+    # it as pinned.
     if raw.lstrip().startswith('#'):
         continue
     s = re.sub(r'\s#.*$', '', raw)
@@ -941,6 +1231,27 @@ for i, raw in enumerate(lines):
         defs.append(m.group(1)); continue
     m = head.match(s)
     if not m or m.group(1) in KEYWORDS:
+        continue
+    # ⛔ `head` ALONE CANNOT TELL A DEFINITION FROM A BARE WORD (round 48 review, P3 — measured): bash defines
+    # a function on a LATER line only after `name()` or after the `function` keyword. A bare word followed by
+    # `{ … }` is a COMMAND followed by a GROUP COMMAND, and nothing is defined — `echo_one` + `{ :; }` is
+    # `bash -n` rc 0 with `declare -F` listing only the real definition, while `head` (which makes BOTH the
+    # parens and the keyword optional) reported `echo_one`. That is an INVENTED name — the fail-closed
+    # direction, so not the dangerous one, but still a claim about a name bash never defined.
+    # ⛔ AND THE KEYWORD IS A WORD, NOT A PREFIX (round 48 re-review, P3 — measured): `startswith('function')`
+    # admitted `function_helper`, `functions` and `functional`, which are BARE WORDS — `bash -n` rc 0 and
+    # `declare -F` listing only the real definition, while the scanner printed each one as a definition. That
+    # is the same invented name this guard exists to refuse, so the test is the reserved word followed by
+    # whitespace, which is how bash reads it.
+    # ⛔ ITS COST IS MEASURED, NOT "NOTHING" (round 48 re-review, P3 — measured over the 437
+    # `git ls-files '*.sh'` files at this head): the name SET never moves, but 4 files' ORDERED scan does —
+    # `scripts/disk-reaper.sh` and scripts/orchestrator-harness/{capacity-transfer,pr-sickness,repo-slug}.test.sh
+    # each lose one DUPLICATE report of a bare word that is also defined properly (`check_peer_locks`,
+    # `lbgh_clear`, `reset_all`, `rr`). So: 0 name sets move, 4 of 437 ordered scans move. On the fixture the
+    # guard removes nothing except the invention itself — reverted, the fixture scan gains ONLY
+    # `bare_word_then_brace`. It is PINNED (revert it and `f11f-0` reds on that name, a command and not a
+    # definition).
+    if '(' not in s and not re.match(r'function[ \t]', s.lstrip()):
         continue
     for later in lines[i+1:]:
         t = later.strip()
@@ -1001,10 +1312,220 @@ continued_name() \
 {
   :
 }
+# ⛔ AND A COMMENT THAT *MENTIONS* AN OPENER MUST NOT OPEN ONE, AND IT IS PINNED BY THE TWO LINES BELOW
+# (round 48 review, P2 — measured at this head): delete the `#` suppression and the scan truncates after
+# `continued_name`, so `after_notes_comment()` disappears and `f11f-0` reds at 245/1. It also moves the
+# scan of 6 of the `git ls-files '*.sh'` files (435 at the head that measured this; 437 now) — an earlier
+# revision of THIS note called that "20" and
+# an even earlier one "21". ⛔ THOSE DELTAS ARE THE PART THAT DID NOT REPRODUCE, and the "446" was a
+# DEFINITION rather than a count: it reproduces only as 435 `*.sh` PLUS the 11 tracked extensionless
+# scripts whose shebang names bash, which is not the population this note named ("shebang-marked,
+# `bash -n`-clean" — 452). So the mutant and the population are the reproducible half and the delta follows
+# from them; the old numbers are withdrawn, not replaced. Cycle 2 also measured the SHAPE it fails on: a
+# TRAILING comment (`x=1  # see cat <<'NOTE'`) opened the phantom heredoc even where the whole-line form
+# was exempted, so the fixture carries that spelling too.
+# see cat <<'NOTES' in the wiki for why this is spelled out
+after_notes_comment() { :; }
+# ⛔ BOTH DIRECTIONS OF THE JOIN ARE PINNED HERE (round 48 review, P2 — measured). A comment ENDS at the
+# newline however many backslashes it carries, so this definition must still be SEEN (the naive join
+# swallowed it, a false PASS for the namespace arm) — this note deliberately ENDS in a backslash \
+after_comment_continuation() { :; }
+# … and a backslash inside a HEREDOC BODY must never be JOINED, because the naive join fabricated a
+# definition named `key` out of the two lines below (a false RED).
+cat <<'INNER'
+key \
+{ value
+INNER
+# ⛔ AND THREE MORE CONDITIONS, EACH PINNED BY THE LINE THAT EXERCISES IT (measured — all three changed what the
+# namespace arm sees while every mutant stayed green):
+#   (a) an INLINE COMMENT after the head, which the trailing-comment strip removes — without the strip the
+#       definition is invisible;
+#   (b) a KEYWORD on the same line as `{`, which the KEYWORDS exclusion must reject — without it `until` is
+#       reported as a definition;
+#   (c) a COMMENT LINE between the head and its `{`, which the later-lines loop must skip — without the skip
+#       the definition is invisible.
+head_after_inline_comment() # note
+{
+  :
+}
+until { :; }
+head_with_comment_between()
+# explanation
+{
+  :
+}
+# ⛔ ONE OF THESE TWO GUARDS IS STILL UNPINNED, AND THE TWO MUTANTS ARE NOT THE SAME SHAPE. Measured at
+# this head over the 437 `git ls-files '*.sh'` files; re-measure rather than copy any number below.
+#   * DELETING `head`'s END-OF-LINE ANCHOR HAS NO PIN: the suite stays at 246 passed / 0 failed — every arm
+#     green — while the mutant INVENTS 133 names. They appear in 63 of the 437 files; 3 more change only by a
+#     DUPLICATE report of a name the file already had (the ordered scan moves, the name set does not). That is
+#     the inert-enforcer shape this file exists to catch, so this guard is still OWED a fixture line that
+#     changes under it. Until then it is DECLARED, not pinned.
+#   * DELETING THE NEXT-LINE-BRACE BRANCH IS PINNED: revert it and `f11f-0` reds (245 passed / 1 failed). It
+#     invents NOTHING and HIDES names on the FIXTURE ONLY — 6 of them (`name_next_line`, `name_func_next`,
+#     `head_after_inline_comment`, `head_with_comment_between`, `indented_head_only`, `head_then_blank`) — and
+#     moves 0 of the repo's own files.
+#   * THE BARE-WORD GUARD ABOVE IS PINNED too: revert it and `f11f-0` reds on `bare_word_then_brace`
+#     (245 passed / 1 failed).
+# Of the five names an earlier revision quoted as invented (`echo`, `printf`, `mkdir`, `awk`, `shift`), only
+# `echo`, `printf` and `mkdir` are invented here — by the ANCHOR mutant alone, among its 133; the next-line
+# mutant invents nothing. `awk` and `shift` appear in neither, so do not re-add a name without a measurement.
+# ⛔ WHAT SURVIVES IS THE DIRECTION — deleting the anchor INVENTS names, deleting the next-line branch HIDES
+# them — so delete a guard, run the suite, run the mutant over `git ls-files '*.sh'`, and read the delta yourself. None of these may be reported:
+#   * a bare command name followed by `:` (not a brace) — a `head` match that must NOT be claimed;
+#   * a command with arguments, then `{` on the next line — likewise;
+#   * a head followed by a line that CONTAINS `{` but does not start with it.
+bare_command_name
+:
+build_it --fast
+{
+  :
+}
+prefix_name
+echo x { :; }
+# ⛔ A BARE WORD IS NOT A DEFINITION, EVEN WITH A BRACE ON THE NEXT LINE (round 48 review, P3 — measured):
+# bash defines a function there only after `name()` or the `function` keyword, so this is a COMMAND followed
+# by a GROUP COMMAND and `bare_word_then_brace` must NOT be reported. `head` makes both the parens and the
+# keyword optional, so it reported it — an INVENTED name. Only the definition after it may be reported, and
+# reverting the guard reds `f11f-0` on the invention.
+bare_word_then_brace
+{ :; }
+after_bare_word_brace() { :; }
+#   * and a heredoc whose terminator line is `INNER2;` — bash does NOT close it there (the body runs on), so
+#     the line after must not be scanned as code.
+cat <<'INNER2'
+INNER2;
+after_bad_terminator() { :; }
+INNER2
+# ⛔ THREE MORE CONDITIONS, EACH UNPINNED UNTIL ITS OWN LINE EXISTED (measured — and ALL THREE are the
+# false-PASS direction: each makes a real definition INVISIBLE while all 246 arms stay green. ⛔ AN EARLIER CUT
+# OF THIS NOTE CALLED (f) THE FALSE-RED DIRECTION, and that was measured FALSE — see (f)):
+#   (d) an INDENTED head with the brace on the next line — pins `head`'s leading `\s*`, which the arm label
+#       "brace on either line, any indent" had claimed all along;
+#   (e) a head separated from its `{` by a BLANK line — pins the empty-line half of the later-lines skip (the
+#       comment-line half already had its own line);
+#   (f) a heredoc opened with `<<-` whose body holds a brace-looking line — pins the `-` branch of the opener
+#       WALK (`_openers`, NOT a regex — see the note below at "THE OPENER IS FOUND BY A WALK"), and it pins
+#       the false-PASS direction. ⛔ Measured by deleting that branch: `-` is itself in the delimiter charset,
+#       so the opener is recorded with delimiter `-`, never terminates, and the rest of the fixture is
+#       SWALLOWED — eleven real definitions are LOST (`real_after_tab_heredoc` through `after_paren_arith`)
+#       and NOTHING is invented (`not_a_def_from_a_tab_heredoc` is not reported either). So the body line is not
+#       "scanned as code"; it and everything after it disappear.
+  indented_head_only()
+{
+  :
+}
+head_then_blank()
+
+{
+  :
+}
+cat <<-'INNER3'
+	not_a_def_from_a_tab_heredoc() { :; }
+	INNER3
+real_after_tab_heredoc() { :; }
+# ⛔ THE OPENER IS FOUND BY A WALK, NOT A SEARCH (round 48 review, P2 — measured). Each of these
+# shapes opened a PHANTOM heredoc and swallowed everything after it, so the namespace arm went GREEN with an
+# out-of-namespace helper defined right there (a FALSE PASS). None may open one, so these definitions MUST
+# be seen: an ARITHMETIC SHIFT, and a TRAILING COMMENT that mentions an opener.
+_rs_shift=$(( 1 << 3 ))
+_rs_depth=3
+_rs_cap=$(( 1 << _rs_depth ))
+_rs_note=1   # see cat <<'NOTES' in the handbook
+_rs_other='a <<b not an opener'
+after_arith_and_trailing_comment() { :; }
+# ⛔ A DELIMITER CLOSES ONLY ON THE EXACT LINE (round 48 review, P2 — measured). `<<-` permits LEADING
+# TABS; plain `<<` permits nothing, not even a space. A space-padded terminator therefore does not close, so
+# the definition after it is still BODY and must NOT be reported; the tab-arm is pinned in the POSITIVE
+# direction, so `after_tabbed_terminator` MUST be reported.
+cat <<PADDED
+  PADDED
+still_body_after_space_padded_terminator() { :; }
+PADDED
+cat <<-'TABBED'
+	TABBED
+after_tabbed_terminator() { :; }
+TABBED
+# ⛔ AND THE DELIMITER TOKEN FOLLOWS BASH'S OWN QUOTING (round 48 review, P2 — measured): `<<\EOD` is a
+# standard spelling whose body bash never runs, and TWO openers on ONE line read their bodies IN ORDER. The
+# single-opener model fabricated a definition out of each body, so only the trailing real definitions below
+# may be reported.
+cat <<\BSLASHED
+body_of_backslashed_opener() { :; }
+BSLASHED
+# …and a backslash-quoted delimiter is a WORD, so it keeps its own punctuation: the delimiter here is
+# `HY-PHEN`, not `HY`. Getting that wrong leaves the heredoc open forever (a silent swallow).
+cat <<\HY-PHEN
+body_of_hyphenated_backslashed_opener() { :; }
+HY-PHEN
+# …and a NUMERIC delimiter is a real heredoc bash runs, so its body must not be scanned as code.
+cat <<123
+body_of_numeric_delimiter() { :; }
+123
+# ⛔ A HERE-STRING IS NOT A HEREDOC (round 48 review, P2 — measured). `<<<` takes a WORD and has NO body,
+# but with a QUOTED operand the `<<`-lookalike opened a phantom heredoc whose delimiter was the operand and
+# swallowed the rest. Both spellings must leave the scan intact, so this definition MUST be seen.
+grep -q x <<< 'quoted value'
+grep -q x <<<plain_word
+after_here_strings() { :; }
+cat <<ONE <<TWO
+body_of_first_opener() { :; }
+ONE
+body_of_second_opener() { :; }
+TWO
+after_two_openers() { :; }
+# ⛔ AN EVEN RUN OF BACKSLASHES IS NOT A CONTINUATION (round 48 review, P2 — measured). `echo a\\` is
+# VALID bash whose line ends there, so the definition after it is a new command and MUST be seen; the join
+# stripped one backslash and continued anyway, which swallowed it (a FALSE PASS).
+echo a\\
+after_even_backslash_run() { :; }
+# ⛔ A COMMENT IS NOT A CONTINUATION, even when it ENDS in a backslash (round 48 review, P2 — measured):
+# bash ends the comment at the newline, so the next line is a NEW command and this definition MUST be seen.
+# The join only exempted WHOLE-LINE comments, which lost it (a FALSE PASS).
+x_trailing=1  # a note ending in a backslash \
+after_backslash_comment() { :; }
+# ⛔ AND ARITHMETIC OUTLIVES THE LINE (round 48 review, P2 — measured): `$((` may close on a LATER line with
+# no backslash, and a `<<` inside it is still a SHIFT. The depth is carried across lines now, so the
+# definition after the closing `))` MUST be seen.
+_rs_ml=$(( 1 +
+   2 << 3 ))
+after_multiline_arith() { :; }
+# ⛔ THE BACKSLASH-QUOTED FORM QUOTES *ONE* CHARACTER (round 48 review, P3 — measured): `<<\!BANG` delimits
+# `!BANG`; collapsing that branch to a plain quote scan invents the body line as a definition.
+cat <<\!BANG
+body_of_bang_delimiter() { :; }
+!BANG
+# ⛔ A BODY LINE ENDING IN A BACKSLASH IS JOINED BEFORE THE TERMINATOR TEST (round 48 review, P3 — measured):
+# for an UNQUOTED delimiter bash removes each `\<newline>` from the body "before the check for the ending
+# delimiter", so `JOIN\` + `ED` really closes this heredoc and the definition after it is a NEW command and
+# MUST be seen. It was not: the body loop compared RAW lines, the opener stayed pending, and everything below
+# was read as body — a FALSE PASS in the namespace arm's own direction, with no fixture and no entry on the
+# declared-limits list. ⛔ AND THE JOIN IS THE UNQUOTED PATH ONLY: with `<<'JQ'` the identical `J\` + `Q` is
+# LITERAL, the terminator never arrives there, and the next line is still BODY. Both directions are pinned,
+# so joining whatever ends in a backslash — the lazy fix — reds this arm by inventing `still_body_of_quoted_join`
+# (the line AFTER the false terminator; `body_of_quoted_join` above carries no trailing backslash and is
+# never reported by either the correct scanner or the mutant, so naming it would point a reader at the wrong
+# fixture line).
+cat <<JOINED
+body_of_joined_terminator() { :; }
+JOIN\
+ED
+after_joined_terminator() { :; }
+cat <<'JQ'
+body_of_quoted_join() { :; }
+J\
+Q
+still_body_of_quoted_join() { :; }
+JQ
+after_quoted_join() { :; }
+# ⛔ AND AN ARITHMETIC CONTEXT CLOSES ON `))`, not `)` (round 48 review, P3 — measured): `$(( (a+b) << 3 ))`
+# closes on the doubled paren, and a single-`)` model reopens a phantom heredoc at the shift.
+_rs_pair=$(( ( _rs_shift + 1 ) << 3 ))
+after_paren_arith() { :; }
 FIXTURE
 _scan_fixture="$(python3 "$T/defs.py" "$T/defs-fixture.sh")"
 ck "f11f-0 …and every one of those spellings is really SEEN (brace on either line, any indent), while bare keywords followed by '{' are not counted" \
-   '[ "$_scan_fixture" = "name_same_line name_func_kw indented_same_line name_next_line name_func_next continued_name" ]'
+   '[ "$_scan_fixture" = "name_same_line name_func_kw indented_same_line name_next_line name_func_next continued_name after_notes_comment after_comment_continuation head_after_inline_comment head_with_comment_between after_bare_word_brace indented_head_only head_then_blank real_after_tab_heredoc after_arith_and_trailing_comment after_tabbed_terminator after_here_strings after_two_openers after_even_backslash_run after_backslash_comment after_multiline_arith after_joined_terminator after_quoted_join after_paren_arith" ]'
 # ⛔ THE DEGRADED PATH MUST NOT CLAIM TO GRADE WHEN IT CANNOT NAME A REPO (review round 2, P1). The
 # doctor's REPO-only arm raises when the checkout's `origin` proves nothing — the TCC shape on the
 # default macOS install — so `f4`'s stub (which echoes argv) would pass on a wrapper that dies in
@@ -1581,15 +2102,18 @@ ck "j16s2 …while with a stat answer the ABSENT verdict IS stated as proof (bot
 # walk SKIPPED it and returned a traversable grandparent ABOVE the link. The caller reads a traversable
 # ancestor as proof of absence and answers code 3 — the one code the wrapper DEGRADES on — for a set that
 # exists.
-# ⛔ AND THE ARM IS THE `unknown` PATH ONLY — ITS LABEL USED TO CLAIM THE GENERAL RULE (round 46 review, P2 —
-# measured): with the SHIPPED reader a symlink LOOP answers `other` → 5 through the errno arm (same verdict,
-# different arm), and a DANGLING link answers `absent` → 3 — which the ROUND-48 REVIEW FALSIFIED as a general
-# rule: 3 is right only for the LEAF spelling, and even then only on the `unknown` route (`j16l` owns that).
-# One component up it was a measurably WRONG claim — `$T/dirlink/repos.conf` answered 3 with an interpreter
-# and 5 without one, so the better-equipped reader gave the more dangerous answer — `j16t`/`j16t2` pin the
-# agreement. So "never (3)" is true of THIS reader and this arm, not of symlinks in
-# general: `$NI` has no usable interpreter, `_rs_stat_kind` cannot answer, and the walk decides. Measured
-# before the fix, on this reader: rc 3 with `does not exist`. No privileges needed, so no `chmod 000` guard.
+# ⛔ THIS ARM'S ROUTE, NOT A GENERAL RULE (round 46 review, P2; rewritten round 48 after the verdict changed
+# under it — measured): with the SHIPPED reader a symlink LOOP answers `other` → 5 through the errno arm
+# (same verdict, different arm), and a DANGLING link USED TO answer `absent` → 3 — WITHDRAWN in round 48: NO
+# spelling of a path whose chain holds an unresolvable link is absent, on either reader, and `j16r`/`j16t`
+# pin it. (No counts here on purpose: three independently built generators gave three different totals, so an
+# integer would be a claim nobody can re-verify; the invariant held on every one.)
+# What WAS wrong, and what this arm's neighbourhood is really about, was the ANCESTOR spelling:
+# `$T/dirlink/repos.conf` answered 3 with an interpreter and 5 without one, so the better-equipped reader
+# gave the more dangerous answer, and `j16t`/`j16t2` pin the agreement. ⛔ THIS ARM (`j16l`) IS A COMPONENT
+# fixture that asserts 5 and never owned a claim about 3. What is true of it ALONE is the ROUTE it exercises
+# — `$NI` has no usable interpreter, `_rs_stat_kind` cannot answer, and the walk decides — not the verdict,
+# which is 5 everywhere. No privileges needed, so no `chmod 000` guard.
 ln -s "$T/linkloop2" "$T/linkloop"; ln -s "$T/linkloop" "$T/linkloop2"
 _o_ll="$(_rs_bound 30 env REPO_SET_FILE="$T/linkloop/inside.conf" /bin/bash "$NI/lib/repo-set.sh" check 2>&1)"; _rc_ll=$?
 ck "j16l with NO stat answer, an unresolvable SYMLINK component is BROKEN (5) — never a proof of absence (3)" \

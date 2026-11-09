@@ -1958,6 +1958,52 @@ off macOS (it renders a launchd plist) — the portability that matters is `orch
    `(` `)` `{` `}` `"` `<` `>` `#` in a ref (only spaces are forbidden, and `${IFS}` supplies
    those), so a fork PR on `fix/x';touch${IFS}/tmp/x;#` achieved arbitrary command execution on the
    host holding the merge key. Reproduced before the fix; the self-test now pins the validator.
+10. **The gate a lane bypasses has a substitute, and the substitute is VERIFIED (#2977).**
+   Lanes run with `AGENT_SKIP_REVIEW_GATE`/`ELDATO_SKIP_VGATE` off by owner ruling (2026-10-28), so the
+   harness owes the equivalent guarantee: a durable per-lane report (`WORKTREE-REPORT.md`, tortoise#10220)
+   and a verifier that REFUSES to merge without it. `lane-report-gate.sh` is that verifier: it resolves
+   the lane worktree for the PR's branch, runs the repo's own consumer (`tools/worktree_report.py check
+   --json`), and refuses on **absent, invalid, red, or head-moved** evidence. `lane-merge.sh` runs it
+   before the paid chain; `merge-one.sh` runs it before the rail short-circuit and the reviewer.
+   ⛔ **SCOPE — WHICH PATHS ARE COVERED, STATED PLAINLY (round-7 review, P1).** The two carriers above
+   are the LANE's paths. The unattended actuator (`auto-rail.sh`) merges by repo slug through
+   `admin-merge.sh` and does **not** consult this gate — it has no local checkout to resolve and no
+   branch in scope, so wiring it is a feature, not a call. Until that is done the guarantee is "a lane
+   cannot merge unverified work", **not** "no merge can land unverified": a lane that dies mid-run and
+   whose checks go green can still be landed by the actuator. That gap is tracked rather than implied —
+   do not read this section as claiming the actuator is covered.
+   ⛔ It is deliberately STRICTER than the consumer's `$?`: `check` EXITS 0 on a moved head (a recorded
+   decision whose docstring hands the judgement to "the consumer"), and two review rounds on 2026-11-07
+   were re-run because a report described a tree one commit behind the head being merged.
+   ⛔ Two outcomes ABSTAIN rather than refuse, and are logged as such (`5` = the repo ships no writer, so
+   no report of this format can exist; `6` = no worktree for this branch on this box AND no writer state
+   on it that names this branch or this head, so the lane's evidence is not reachable from here —
+   measured 2026-11-08: 13 of 13 open tortoise PRs had none on the hub). Refusing on either would stop
+   every cross-box merge in the fleet; counting either as green would be the false PASS the ruling exists
+   to close. ⛔ `6` IS NOT REACHABLE BY MOVING THE WORKTREE ITSELF: detaching at the merging head, at
+   ANY other commit, or onto a scratch branch leaves writer state that still names the branch/head, so
+   those answer `7` — one `git switch` must not convert a refusal into the abstention both carriers
+   merge on. `7` (a report that exists and could not be VERIFIED) refuses.
+   ⛔ **`2` NOW COVERS THREE MALFORMED-REPORT REASONS, EACH MEASURED AGAINST THE REAL WRITER** (rounds 13–15):
+   a report whose recorded suites ALL logged zero bytes with no parsed counts (`init; run --cmd true;
+   write` — the consumer itself calls that VALID, so the gate is the only refusal point, and the ruling
+   says "claims tests without output" must be refused); a report carrying more than one **header** stamp
+   (a newline in a lane-writable state value rendering an injected stamp line above the real one); and a
+   report whose **seal is not readable where the writer puts it** — a `Base:` line split by a lane-writable
+   value, a header ended before it by an injected `## `, a lane-supplied stamp with the real one pushed
+   into the body, or a second `Base:` line outside a code fence. Those last spellings are one class: any of
+   them makes the sealed cross-check go dark (or read a stamp of the lane's choosing) while the writer
+   re-seals its own digest honestly. Shapes cannot separate the writer's lines from a lane's, because the
+   writer renders `issue`/`worktree`/`branch` VERBATIM — so the gate validates the header **positionally**
+   against what `render()` emits (title, blank, the three generated-by comment lines, blank, optional
+   `Issue`, `Worktree`, `Branch`, the Base stamp, `Started`, one verdict line, blank, then the writer's first
+   heading `## Files changed`), requires that exact length, and compares the `Worktree`/`Branch` values to the
+   writer state by string equality. Any surplus line — an injected block, a fence delimiter, a second heading
+   — is tampering by construction; nothing in the report BODY can seal or refuse, so suite logs that print
+   backtick runs or the stamp shape are harmless (measured). The stamp count is scoped to
+   the report HEADER — the writer renders suite commands, their log tails and `note` text VERBATIM below
+   it, so a body line reproducing the shape is lane-authored prose, not a seal, and refusing it refused
+   untampered reports.
 
 ### 5.3 Untrusted input and worker containment — read before running this unattended
 

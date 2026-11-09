@@ -191,11 +191,28 @@ _rs_nearest_existing_ancestor() {
   # resolves but cannot execute, so `_rs_stat_kind` answers `unknown` and no errno ever arrives to name the
   # denial. `[ -L ]` is true for an existing link REGARDLESS of its target, so the link becomes the nearest
   # existing component and the caller REFUSES it as a broken state (5) instead of proving absence through
-  # what it could not resolve. ⛔ THAT REFUSAL IS THE `unknown` PATH ONLY (round 46 review, P2 — measured):
-  # when the stat call DOES answer, its errno arm names the cause first — a denied target is `denied` → 5,
-  # and a DANGLING link is `absent`, whose 3 is correct because nothing can exist below a link whose target
-  # does not. This function's job is to stop the walk from answering `-e`-false with a traversable
-  # grandparent; what the caller does with the link is the fallback's business, stated there.
+  # what it could not resolve. This function's job is to stop the walk from answering `-e`-false with a
+  # traversable grandparent; what the caller does with the link is the caller's business, stated there.
+  # ⛔ AND THE CALLER NOW REFUSES IT ON BOTH ROUTES (round 48 review, P2 — this note used to say the refusal
+  # was the `unknown` path only, "because a DANGLING link is `absent`, whose 3 is correct"). THE STAT ANSWER
+  # DOES NOT DECIDE THE VERDICT ANY MORE: a shape whose chain holds a link that cannot be resolved is
+  # refused 5 before the absence test can see it. ⛔ BUT IT IS NOT ALWAYS THIS ARM THAT REFUSES IT (round 48
+  # review, P3 — measured, and this sentence used to claim the opposite): a link LOOP answers
+  # `other` at `_rs_stat_kind`, and `denied|other` returns 5 from the ERRNO arm, which runs EARLIER — so the
+  # loop's 5 has the same verdict through a different arm. ⛔ AND THIS ARM'S SCOPE IS NARROWER THAN "EVERY
+  # `absent` ROUTE" (round 48 cycle 4, P2 — measured, and the line below over-generalised): it is the refusal
+  # route for an `absent`-with-errno spelling whose LEAF is below the link (`<a dangling link>/repos.conf`)
+  # and for `unknown`. A dangling link spelled with a TRAILING SLASH is `absent` as well, but it is refused
+  # EARLIER, by `repo_set_parse`'s stripped-spelling arm — measured: `dang/` on a dangling link answers 5
+  # quoting "the spelling without its trailing slash is a symbolic link", NOT this arm's "nearest existing
+  # component". Measured: every unresolvable-link spelling answers 5 on both
+  # readers whatever the arm, and the rc-3 set is IDENTICAL between them and contains no UNRESOLVABLE link.
+  # ⛔ AND IT MUST NOT OVERCLAIM THE OTHER WAY EITHER: rc 3 IS right for a spelling that traverses a link
+  # which RESOLVES, because then only the remainder is absent (`<a good link>/nope.conf` → 3). No COUNTS are
+  # quoted here on purpose — three independently built generators produced three different totals, so an
+  # integer would be a claim a reader cannot re-verify; the invariant is what matters, and it survived all
+  # three.
+  # The old sentence was falsified by that arm and would teach the next lane to restore the 3.
   # A link that DOES resolve is still found by `-e` first, so the ordinary walk is untouched.
   while [ -n "$d" ] && [ "$d" != "/" ] && [ "$d" != "." ]; do
     if [ -e "$d" ] || [ -L "$d" ]; then printf '%s' "$d"; return 0; fi
@@ -561,11 +578,17 @@ repo_set_parse() {
     # review, P1). `stat("<file>/")` is ENOTDIR, so `[ -e "<file>/" ]` is FALSE while `[ -e "<file>" ]` is
     # true — which is how this arm was reached for a set that is right there. The walk cannot see it
     # either: it strips the trailing slash and then starts at the PARENT, so `anc` is a TRAVERSABLE
-    # DIRECTORY and the ancestor test alone proves absence. With a stat answer the `notdir` errno now names
-    # the cause (below); with none — `unknown`, the no-interpreter route — the stripped spelling is the
-    # ONLY evidence available, so it is tested before absence is claimed. Tested only on the `unknown`
-    # branch: `absent` (ENOENT) cannot have an existing stripped form, because ENOTDIR is the answer when
-    # it does.
+    # DIRECTORY and the ancestor test alone proves absence. With a stat answer the `notdir` errno names what
+    # the path IS (a file, not a directory), and NOT who found it: the refusal below branches on the SPELLING
+    # (`[ -e "$stripped" ] && [ ! -d "$stripped" ]`), so an errno route and a no-errno route answer the same
+    # text — measured, byte-identical output with and without an interpreter; with none — `unknown`, the
+    # no-interpreter route — the stripped spelling is the ONLY evidence available, so it is tested before
+    # absence is claimed.
+    # ⛔ AND IT IS NOT GATED ON `kind` (round 48 — measured, and this note used to claim the opposite): a
+    # dangling link spelled with a trailing slash answers `absent` (ENOENT), NOT ENOTDIR, and it very much
+    # has an existing stripped form. The stripped-spelling test therefore fires on the `absent` route as well
+    # as on `unknown`, which is precisely what `j16r` pins — gate it on `unknown` and that shape degrades to
+    # rc 3, the code the wrapper acts on.
     local stripped="$f"
     while [ "${stripped%/}" != "$stripped" ] && [ -n "$stripped" ]; do stripped="${stripped%/}"; done
     # ⛔ `/` ONLY — AND `/.` WAS TRIED AND REMOVED (round 48, measured, twice). `/srv/state` and `/srv/./state`
@@ -695,12 +718,12 @@ repo_set_parse() {
     # `(nearest existing: /tmp/f1/den)`, which refutes it, in `j16f`'s OWN fixture). The walk's answer is one of:
     #   * a SYMLINK that cannot be resolved here (`-L` true, `-e` false). It is returned as the nearest
     #     existing component (round 46: `[ -e ]` used to SKIP it and hand back a traversable grandparent, so
-    #     absence was "proven" through the link — the degrade code for a set that exists). ⛔ THIS ARM IS
-    #     REACHED ONLY WHEN NO STAT ANSWER CAME BACK (round 46 review, P2 — measured): with an executable
-    #     interpreter a denied target answers `denied` (the errno arm, also 5) and a DANGLING link answers
-    #     `absent`, which the absent test above turns into 3 — correct, because nothing can exist below a
-    #     link whose target does not. Here we could neither resolve the link NOR stat through it, so
-    #     neither existence nor absence is shown, and that is 5, never 3.
+    #     absence was "proven" through the link — the degrade code for a set that exists). ⛔ THIS ARM HAS
+    #     MOVED: it is now tested BEFORE the absence claim, so it fires on the `unknown` route AND on the
+    #     `absent`-with-errno route, and the `absent` test below can no longer turn a link into 3. The
+    #     earlier note here said the opposite ("reached only when no stat answer came back", because "a
+    #     DANGLING link answers `absent`, which the absent test above turns into 3 — correct") — that was
+    #     measured false in round 48 and is the reason a set spelled BELOW a dangling link degraded.
     #   * a nearest existing component that is not a DIRECTORY — a file, a FIFO, or a link resolving to one.
     #   * a TRAILING-SLASH path whose stripped spelling is an existing NON-directory (`<an existing set>/`).
     #     ⛔ THE WALK CANNOT SEE THAT COMPONENT: it strips the trailing slash and then starts at the PARENT,

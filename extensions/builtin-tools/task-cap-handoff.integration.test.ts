@@ -336,7 +336,20 @@ test("circuit_open: the PRE-SPAWN refusal shape is unchanged (Task 3 scope guard
 	// (`retries === 0`) must keep its current refusal text + details — the
 	// composer has no access to a child's stderr/stdout at that scope.
 	ok(source.includes("❌ Sub-agent circuit breaker open — too many consecutive zero-output failures. Wait 60s before retrying."), "pre-spawn refusal text unchanged");
-	ok(source.includes('details: { model, provider, status: "circuit_open", retries: result.retries }'), "pre-spawn details literal unchanged");
+	// #1208 moved this details literal onto multiple lines (the liveness spread). The SCOPE GUARD is
+	// that the pre-spawn arm's own details are unchanged, so it is asserted by token: the spread is
+	// gated on the existing `retries === 0` discriminator.
+	//
+	// ⛔ WHAT THAT GATE BUYS — corrected (review round 5, P3). The previous text here claimed a
+	// never-spawned breaker "adds NO key at all", and that is FALSE: this arm returns through
+	// `withSessionDegraded` → `stampToolLiveness` → `stampLivenessDefaults`, which adds all four
+	// liveness keys unconditionally. What the discriminator preserves is their VALUE — at
+	// `retries === 0` the spread is empty, so the stamp fills `never-started`/`null` (a refusal)
+	// instead of a measured snapshot. The value-level assertion for that invariant lives with the
+	// other #1208 field-set tests in `builtin-tools.test.ts`; this test pins only the source shape
+	// (which is why it cannot see a regression that keeps the tokens and changes the values).
+	ok(source.includes('status: "circuit_open"') && source.includes("retries: result.retries"), "pre-spawn details tokens unchanged");
+	ok(source.includes("breakerNeverSpawned ? {} : (lastLiveness ?? {})"), "the #1208 liveness spread is gated on the never-spawned discriminator");
 	// The real-spawn discriminator (venice-route guard, #512) still marks
 	// circuit_open-with-retries>0 as "a child ran".
 	ok(source.includes('result.status === "circuit_open" && result.retries === 0'), "never-spawned discriminator still present");

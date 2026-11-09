@@ -252,6 +252,222 @@ OUT="$(REPO_PATH="${REPO_PATH:-$RUN_REPO}" PATH="$BIN:$PATH" O="$OT" HOME="$T/ho
 ck "a finished chain whose reviewer said ISSUES → exit 10 FIX_REQUIRED with a round spent (the fix list is the review)" \
    $([ "$RC" = 10 ] && [ "$(verdict_of 25 | cut -d' ' -f1)" = FIX_REQUIRED ] && [ "$(cat "$OT/state/lanemerge-25.round")" = 1 ] && echo 0 || echo 1)
 
+# ── 11c-quater. a REFUSED LANE REPORT is FIX_REQUIRED, never BLOCKED_ATTESTATION (#2977) ────────
+# ⛔ merge-one.sh exits 9 with NO `needsfix` marker on a report refusal — deliberately, because the
+# remedy (re-run the suites at this head) costs no push and a HEAD-keyed park would deadlock the
+# lane's own retry. Without the classifier arm the refusal fell through to the `*)` arm and reached
+# the lane as exit 12 "green and mergeable, but no signed review record exists for this head" — a
+# hand-off over something the lane fixes in place. DISCRIMINATOR: against the pre-fix classifier this
+# row exits 12, so it cannot pass by accident (it is the one arm the delete-it mutant reds).
+new_o "$T/pr17.tsv"
+printf '%s deadbeef %s\n' 999997 "$OT/logs/lane-merge-42.log" > "$OT/state/lanemerge-42.chain"
+printf '[merge 42] LANE REPORT REFUSED (rc=4) at head=abc123 — refusing to merge on a lane report that does not support this tree (#2977). No review was bought and nothing was merged.\n' > "$OT/logs/merge-42.log"
+OUT="$(REPO_PATH="${REPO_PATH:-$RUN_REPO}" PATH="$BIN:$PATH" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 \
+      bash "$SCRIPT" 42 --watch --repo o/r --pr-tsv "$T/pr4.tsv" 2>&1)"; RC=$?
+ck "a REFUSED lane report → exit 10 FIX_REQUIRED (the lane re-runs in place; no push, no hand-off)" \
+   $([ "$RC" = 10 ] && [ "$(verdict_of 42 | cut -d' ' -f1)" = FIX_REQUIRED ] && echo 0 || echo 1)
+ck "…and it is NOT BLOCKED_ATTESTATION/12 (that would hand off a report the lane fixes itself)" \
+   $([ "$RC" != 12 ] && [ "$(verdict_of 42 | cut -d' ' -f1)" != BLOCKED_ATTESTATION ] && echo 0 || echo 1)
+
+# ── 11c-quinquies. THE GATE IS *REACHED* — the observable outcome, not a syntactic neighbour ──────
+# ⛔ THE SYNTACTIC PINS CANNOT PROVE REACHABILITY (fresh review, P2): wrapping the block in
+# `while false; do`, or extracting it into an uncalled function, keeps every anchor green while the
+# gate is inert. This row drives the SHIPPED script: a real repo, a real linked worktree on the branch,
+# a real consumer, and NO report → one FIX_REQUIRED round and NO chain. The abstention row proves the
+# audit half too (5/6 must be LOGGED as an abstention, never as a verification).
+GR="$T/gate-repo"; GL="$T/gate-lane"
+rm -rf "$GR" "$GL"; mkdir -p "$GR/tools"
+cat > "$GR/tools/worktree_report.py" <<'GEOF'
+import json, subprocess, sys
+wt = sys.argv[sys.argv.index("--worktree") + 1] if "--worktree" in sys.argv else "."
+head = subprocess.run(["git", "-C", wt, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+print(json.dumps({"ok": True, "rules": [], "suites": 1, "failing_suites": 0,
+                  "head": head, "head_moved_since_write": False}))
+GEOF
+printf 'x\n' > "$GR/f"
+git -C "$GR" init -q -b main 2>/dev/null || true
+git -C "$GR" add f tools/worktree_report.py
+git -C "$GR" -c user.email=t@t -c user.name=t commit -qm base
+git -C "$GR" worktree add -q -b feat/lane "$GL" main
+GHED="$(git -C "$GL" rev-parse HEAD)"
+printf 'allgood\tcompleted\tsuccess\t41\n' > "$T/checks-gate.tsv"
+
+new_o "$T/pr.tsv"
+printf 'open||%s|clean\n' "$GHED" > "$T/pr-gate.tsv"
+OUT="$(PATH="$BIN:$PATH" GH_LOG=/dev/null O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 REPO_PATH="$GL" \
+      bash "$SCRIPT" 90 --repo o/r --branch feat/lane --pr-tsv "$T/pr-gate.tsv" --checks-tsv "$T/checks-gate.tsv" 2>&1)"; RC=$?
+ck "an ABSENT lane report REFUSES the merge (exit 10 FIX_REQUIRED) and launches NO chain" \
+   $([ "$RC" = 10 ] && [ "$(verdict_of 90 | cut -d' ' -f1)" = FIX_REQUIRED ] \
+      && ! grep -q 'launched the merge chain' <<<"$OUT" && grep -q 'VERDICT=ABSENT' <<<"$OUT" && echo 0 || echo 1)
+
+# ── 11c-quater-bis. rc=7 IS A BAG: the BOX-only reasons hand off with no round, the LANE-fixable
+# ones still spend one (round-19/20 review, P1) ────────────────────────────────────────────────
+# ⛔ MEASURED BEFORE THE FIX: 7 fell through the `*)` arm into emit_fix, so a box whose python is below
+# 3.12 (stock macOS, Debian 11) burned ALL THREE of the lane's rounds on pushes that cannot change the
+# verdict and then reported `round cap reached` — a box defect labelled a lane failure. Round 19 then
+# over-corrected: it treated EVERY 7 as a box fault, but 7 is a bag of ~10 reasons and only the
+# interpreter/consumer ones are box-only. The rest (`writer-state-absent|corrupt`,
+# `worktree-registered-but-unreadable`, a detached/moved worktree) are cleared by an action the gate's
+# own code-7 remedy names, so they must keep their fix round — otherwise the hand-off tells the lane to
+# re-run something the disposition just made un-runnable.
+# DISCRIMINATOR: each row reds against the other branch's mapping (the box rows on exit 10, the lane row
+# on exit 14 / zero rounds), so neither can pass by accident. The gate is stubbed beside the script (the
+# deployed `$O/lane-merge.sh` shape) because rc=7 depends on the BOX, not on a report a fixture can write.
+mk7row() { # mk7row <pr> <reason> [rounds-already-spent]
+  new_o "$T/pr.tsv"
+  cp "$SCRIPT" "$OT/lane-merge.sh"
+  cat > "$OT/lane-report-gate.sh" <<LRGEOF
+lane_report_gate() { printf 'lane-report: VERDICT=UNMEASURABLE branch=feat/lane reason=$2\\n'; return 7; }
+lane_report_remedy() { printf '  (remedy %s)\\n' "\${1:-}"; }
+LRGEOF
+  # ⛔ SEEDED AFTER new_o: new_o wipes $OT, so a round file written before it does not exist at run time.
+  [ -n "${3:-}" ] && printf '%s\n' "$3" > "$OT/state/lanemerge-$1.round"
+  OUT="$(PATH="$BIN:$PATH" GH_LOG="$OT/gh.log" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 REPO_PATH="$GL" \
+        bash "$OT/lane-merge.sh" "$1" --repo o/r --branch feat/lane --pr-tsv "$T/pr-gate.tsv" --checks-tsv "$T/checks-gate.tsv" 2>&1)"; RC=$?
+}
+mk7row 91 no-interpreter-at-or-above-python-3.12
+ck "a BOX-only rc=7 (no interpreter) hands off as BLOCKED_ATTEMPTS/14 instead of a FIX round" \
+   $([ "$RC" = 14 ] && [ "$(verdict_of 91 | cut -d' ' -f1)" = BLOCKED_ATTEMPTS ] \
+      && ! grep -q 'launched the merge chain' <<<"$OUT" && echo 0 || echo 1)
+ck "…and it spends NO fix round (the lane can re-run from round 0 once the box is repaired)" \
+   $([ "$(cat "$OT/state/lanemerge-91.round" 2>/dev/null || echo 0)" = 0 ] && echo 0 || echo 1)
+ck "…and it still says UNMEASURABLE rather than a verdict about the PR" \
+   $(grep -q 'UNMEASURABLE (rc=7' <<<"$OUT" && [ "$(verdict_of 91 | cut -d' ' -f1)" != FIX_REQUIRED ] && echo 0 || echo 1)
+# ⛔ THE HAND-OFF BODY MUST NOT BORROW THE BUDGET DIAGNOSIS. Measured on the round-19 arm: it rendered
+# `- Rounds spent: 0/3` plus "another watch chunk is charged before it does any work", neither of which
+# is true here (no round, no chunk) — the next holder inherited "reset the budget" as the reason.
+ck "…and the hand-off says the blocker is the BOX, not a spent budget (no false 'watch chunk' claim)" \
+   $(grep -q 'blocker is the BOX' "$OT/gh.log" && ! grep -q 'another watch chunk is charged' "$OT/gh.log" && echo 0 || echo 1)
+mk7row 92 writer-state-absent
+ck "a LANE-fixable rc=7 (writer state absent) STILL spends its fix round (FIX_REQUIRED/10)" \
+   $([ "$RC" = 10 ] && [ "$(verdict_of 92 | cut -d' ' -f1)" = FIX_REQUIRED ] \
+      && [ "$(cat "$OT/state/lanemerge-92.round" 2>/dev/null)" = 1 ] && echo 0 || echo 1)
+# ⛔ THE SPLIT IS BY REASON TOKEN, NOT BY A SUBSTRING OF THE LINE (round-21 review, P1). The gate renders
+# `branch=$branch worktree=$wt` BEFORE `reason=`, and a lane creates its own branch, so a branch named
+# `fix/2977-reason=no-interpreter-…` (legal: `git check-ref-format --branch` accepts it) matched the box
+# arm on a raw-line glob. Measured pre-fix: same lane-fixable reason, branch spoofed → RC=14 / no round,
+# so the 3-round cap never fired for a fault the lane owned. The branch is carried in the STUB'S OWN
+# `branch=` field here, exactly as the real gate would render it.
+mk7row_spoof() { # mk7row_spoof <pr> <branch> <reason>
+  new_o "$T/pr.tsv"
+  cp "$SCRIPT" "$OT/lane-merge.sh"
+  cat > "$OT/lane-report-gate.sh" <<LRGEOF
+lane_report_gate() { printf 'lane-report: VERDICT=UNMEASURABLE branch=$2 worktree=/tmp/wt reason=$3\\n'; return 7; }
+lane_report_remedy() { printf '  (remedy %s)\\n' "\${1:-}"; }
+LRGEOF
+  OUT="$(PATH="$BIN:$PATH" GH_LOG="$OT/gh.log" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 REPO_PATH="$GL" \
+        bash "$OT/lane-merge.sh" "$1" --repo o/r --branch feat/lane --pr-tsv "$T/pr-gate.tsv" --checks-tsv "$T/checks-gate.tsv" 2>&1)"; RC=$?
+}
+mk7row_spoof 93 'fix/2977-reason=no-interpreter-at-or-above-python-3.12' writer-state-absent
+ck "a branch named to CONTAIN a box reason cannot move a LANE-fixable 7 into the no-round arm" \
+   $([ "$RC" = 10 ] && [ "$(verdict_of 93 | cut -d' ' -f1)" = FIX_REQUIRED ] \
+      && [ "$(cat "$OT/state/lanemerge-93.round" 2>/dev/null)" = 1 ] && echo 0 || echo 1)
+# ⛔ AND THE SAME SPOOF THROUGH A PATH FIELD IS SELF-DETECTING (round-22 review, P1). `##*reason=` takes the
+# LAST occurrence, so ANY lane-chosen value carrying the literal `reason=` anywhere on the line can win —
+# a worktree path is as lane-controlled as a branch name, and the gate's own writer-state line rendered
+# `state=$wt/…` AFTER the token (measured: worktree `…/lane-wt-reason=no-interpreter-…` → extracted token
+# was the path tail → box arm, 14, round 0). The ordering is fixed on the emit, and the carrier ALSO refuses
+# to hand the budget to a line it cannot read: more than one `reason=` is LANE-fixable by construction.
+mk7row_dup() { # mk7row_dup <pr> <worktree-containing-a-decoy> <real-reason>
+  new_o "$T/pr.tsv"
+  cp "$SCRIPT" "$OT/lane-merge.sh"
+  cat > "$OT/lane-report-gate.sh" <<LRGEOF
+lane_report_gate() { printf 'lane-report: VERDICT=UNMEASURABLE branch=feat/lane worktree=$2 tool=/t/report.py reason=writer-state-$3 state=$2/.worktree-report/state.json head=abc\\n'; return 7; }
+lane_report_remedy() { printf '  (remedy %s)\\n' "\${1:-}"; }
+LRGEOF
+  OUT="$(PATH="$BIN:$PATH" GH_LOG="$OT/gh.log" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 REPO_PATH="$GL" \
+        bash "$OT/lane-merge.sh" "$1" --repo o/r --branch feat/lane --pr-tsv "$T/pr-gate.tsv" --checks-tsv "$T/checks-gate.tsv" 2>&1)"; RC=$?
+}
+mk7row_dup 95 '/tmp/lane-wt-reason=no-interpreter-at-or-above-python-3.12' absent
+ck "a WORKTREE path carrying 'reason=' cannot buy the no-round arm — an ambiguous line is LANE-fixable" \
+   $([ "$RC" = 10 ] && [ "$(verdict_of 95 | cut -d' ' -f1)" = FIX_REQUIRED ] \
+      && [ "$(cat "$OT/state/lanemerge-95.round" 2>/dev/null)" = 1 ] && echo 0 || echo 1)
+ck "…and it SAYS the line is ambiguous rather than guessing a cause" \
+   $(grep -q 'reason=. tokens\|reason=. tokens\|cannot be read unambiguously' <<<"$OUT" && echo 0 || echo 1)
+# ⛔ THE WITNESS LINE IS CUT BY A BUILTIN, SO A `tail` SHIM CANNOT AUTHOR IT (round-23 review, P1).
+# `lane-merge.sh` sets no PATH and a lane runs it itself, so a `tail` earlier on PATH could rewrite the
+# gate's output: keep only the UNMEASURABLE line and print a BOX reason, and the entire round-22 split —
+# including its reason= count — is computed over text the lane wrote. Measured pre-fix with the shim and an
+# identical stub: control 10/FIX_REQUIRED/round 1, shimmed 14/BLOCKED_ATTEMPTS/round 0. The shim below
+# rewrites ONLY a UNMEASURABLE verdict, so if this row ever goes green on 14 the decision read the shim.
+SHIMDIR="$T/tailshim"; rm -rf "$SHIMDIR"; mkdir -p "$SHIMDIR"
+cat > "$SHIMDIR/tail" <<'TSHIM'
+#!/usr/bin/env bash
+_out="$(cat)"
+case "$_out" in
+  *VERDICT=UNMEASURABLE*) printf 'lane-report: VERDICT=UNMEASURABLE branch=feat/lane reason=no-interpreter-at-or-above-python-3.12\n' ;;
+  *) printf '%s\n' "$_out" ;;
+esac
+TSHIM
+chmod +x "$SHIMDIR/tail"
+mk7row_shim() { # mk7row_shim <pr> <reason>
+  new_o "$T/pr.tsv"
+  cp "$SCRIPT" "$OT/lane-merge.sh"
+  cat > "$OT/lane-report-gate.sh" <<LRGEOF
+lane_report_gate() { printf 'lane-report: VERDICT=UNMEASURABLE branch=feat/lane worktree=/tmp/wt reason=$2\\n'; return 7; }
+lane_report_remedy() { printf '  (remedy %s)\\n' "\${1:-}"; }
+LRGEOF
+  OUT="$(PATH="$SHIMDIR:$BIN:$PATH" GH_LOG="$OT/gh.log" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 REPO_PATH="$GL" \
+        bash "$OT/lane-merge.sh" "$1" --repo o/r --branch feat/lane --pr-tsv "$T/pr-gate.tsv" --checks-tsv "$T/checks-gate.tsv" 2>&1)"; RC=$?
+}
+mk7row_shim 96 writer-state-absent
+ck "a PATH-shimmed 'tail' cannot rewrite the verdict line the round budget is decided on" \
+   $([ "$RC" = 10 ] && [ "$(verdict_of 96 | cut -d' ' -f1)" = FIX_REQUIRED ] \
+      && [ "$(cat "$OT/state/lanemerge-96.round" 2>/dev/null)" = 1 ] && echo 0 || echo 1)
+ck "…and the carrier logs the gate's OWN reason, not the shim text" \
+   $(grep -q 'reason=writer-state-absent' <<<"$OUT" && ! grep -q 'blocker is the BOX' "$OT/gh.log" && echo 0 || echo 1)
+# ⛔ AND THE ROUND COUNTER IS READ WITH A BUILTIN, SO THE CAP CANNOT BE SHIMMED AWAY (round-24 review, P1).
+# `round_of` read `"$(cat "$ROUND_F")"`: a `cat` answering 0 for `*.round` made every call report round 0,
+# so `emit_fix` granted round 1 for ever and MAX_ROUNDS never fired — an unbounded budget on the one
+# number this script exists to bound. Measured with only PATH differing, round file seeded AT the cap:
+# control 13/BLOCKED_ATTEMPTS, shimmed 10/FIX_REQUIRED on every run. The shim touches only `*.round`, so it
+# isolates the counter read from the many legitimate `cat` uses in the carrier.
+CATSHIM="$T/catshim"; rm -rf "$CATSHIM"; mkdir -p "$CATSHIM"
+cat > "$CATSHIM/cat" <<'CSHIM'
+#!/usr/bin/env bash
+case "${1:-}" in
+  *.round) printf '0\n' ;;
+  *) exec /bin/cat "$@" ;;
+esac
+CSHIM
+chmod +x "$CATSHIM/cat"
+mk7row_shimcat() { # mk7row_shimcat <pr> <reason> <rounds-seeded>
+  new_o "$T/pr.tsv"
+  cp "$SCRIPT" "$OT/lane-merge.sh"
+  cat > "$OT/lane-report-gate.sh" <<LRGEOF
+lane_report_gate() { printf 'lane-report: VERDICT=UNMEASURABLE branch=feat/lane worktree=/tmp/wt reason=$2\\n'; return 7; }
+lane_report_remedy() { printf '  (remedy %s)\\n' "\${1:-}"; }
+LRGEOF
+  printf '%s\n' "$3" > "$OT/state/lanemerge-$1.round"
+  OUT="$(PATH="$CATSHIM:$BIN:$PATH" GH_LOG="$OT/gh.log" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 REPO_PATH="$GL" \
+        bash "$OT/lane-merge.sh" "$1" --repo o/r --branch feat/lane --pr-tsv "$T/pr-gate.tsv" --checks-tsv "$T/checks-gate.tsv" 2>&1)"; RC=$?
+}
+mk7row_shimcat 97 writer-state-absent 3
+ck "a PATH-shimmed 'cat' cannot reset the round counter — the cap still fires (exit 13 BLOCKED_ATTEMPTS)" \
+   $([ "$RC" = 13 ] && [ "$(verdict_of 97 | cut -d' ' -f1)" = BLOCKED_ATTEMPTS ] && echo 0 || echo 1)
+# ⛔ AND THE BODY MUST NOT CONTRADICT ITSELF (round-21 review, P2). The rounds line rendered
+# "Rounds spent: 0/3 ("the loop is capped by design")" and the footer said "after a fix" under a box
+# arm whose next line says NOTHING YOU CAN PUSH. Both were measured on a run with rounds already spent.
+mk7row 94 no-interpreter-at-or-above-python-3.12 2
+ck "the box hand-off does not imply this run spent the budget, nor claim a fix is owed" \
+   $(grep -q 'this run spent NONE' "$OT/gh.log" && ! grep -q 'after a fix' "$OT/gh.log" \
+      && ! grep -q 'another watch chunk is charged' "$OT/gh.log" && echo 0 || echo 1)
+ck "…and it states the rounds EARLIER runs spent rather than promising round 0" \
+   $(grep -q 'EARLIER runs: 2' "$OT/gh.log" && ! grep -q 'starts from round 0' "$OT/gh.log" && echo 0 || echo 1)
+
+# The abstention arm: no worktree for the branch on this box is 6, LOGGED, and the chain still gets the
+# PR. It must never read as a verification — that string is the entire justification for not refusing.
+# ⛔ A GENUINE CROSS-BOX 6 NEEDS A HEAD NO STANZA SITS AT (round-11 review, P0). The gate now refuses with
+# 7 whenever a worktree of this box is AT the merging head ("named but unreadable" has a remedy), so a
+# fixture that keeps its worktree at the PR head models a SELF-DETACHED lane and correctly gets 7. The
+# ordinary cross-box shape (the 13/13 hub measurement) is a head this box has no stanza for.
+new_o "$T/pr.tsv"
+printf 'open||%s|clean\n' "2222222222222222222222222222222222222222" > "$T/pr-crossbox.tsv"
+OUT="$(PATH="$BIN:$PATH" GH_LOG=/dev/null O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 REPO_PATH="$GL" \
+      bash "$SCRIPT" 91 --repo o/r --branch feat/no-such-branch --pr-tsv "$T/pr-crossbox.tsv" --checks-tsv "$T/checks-gate.tsv" 2>&1)"; RC=$?
+ck "NO-WORKTREE (6) is an ABSTENTION: logged, never 'verified at head', and the chain still gets the PR" \
+   $([ "$RC" = 11 ] && grep -q 'abstention, not a green' <<<"$OUT" && ! grep -q 'verified at head' <<<"$OUT" && echo 0 || echo 1)
+
 # ── 11c-bis. the DURABLE marker wins even when the log has been rotated away ─────────────────────
 new_o "$T/pr21.tsv"
 printf '%s deadbeef %s\n' 999998 "$OT/logs/lane-merge-30.log" > "$OT/state/lanemerge-30.chain"
@@ -316,6 +532,33 @@ kill "$CH_PID" 2>/dev/null || true
 ck "a head-moved chain: pass 1 re-runs (11), pass 2 is TERMINAL (14) and names the pid — not an endless re-arm" \
    $([ "$RC1" = 11 ] && [ "$RC2" = 14 ] && [ "$(verdict_of 40 | cut -d' ' -f1)" = BLOCKED ] \
       && grep -q 'still bound to head oldhead' "$OT/state/lanemerge-40.verdict" && echo 0 || echo 1)
+# ⛔ THE HEAD-MOVED COUNTER IS A COUNTER, SO IT IS READ WITH A BUILTIN (round-25 review, P1). This was
+# `$(cat headmoved)`: a `cat` answering 0 for `*.headmoved` pins `_hm` at 1, so "pass 2" never arrives and
+# a chain stuck on an older head re-arms for ever while the same path truncates WATCH_F each pass —
+# measured on the carrier with only PATH differing (control: terminal at pass 2, headmoved=2; shimmed: 6
+# passes all rc=11, headmoved=1). The shim touches ONLY `*.headmoved`, so the rest of the carrier is
+# untouched and this row isolates the counter read.
+HMHIM="$T/hmshim"; rm -rf "$HMHIM"; mkdir -p "$HMHIM"
+cat > "$HMHIM/cat" <<'HSHIM'
+#!/usr/bin/env bash
+case "${1:-}" in
+  *.headmoved) printf '0\n' ;;
+  *) exec /bin/cat "$@" ;;
+esac
+HSHIM
+chmod +x "$HMHIM/cat"
+new_o "$T/junk-q2b.tsv"
+printf 'open||newhead1|clean\n' > "$T/pr-open2b.tsv"
+sleep 60 & CH_PID2=$!
+printf '%s oldhead %s\n' "$CH_PID2" "$OT/logs/lane-merge-43.log" > "$OT/state/lanemerge-43.chain"
+printf 'nothing here\n' > "$OT/logs/lane-merge-43.log"
+OUT="$(REPO_PATH="${REPO_PATH:-$RUN_REPO}" PATH="$HMHIM:$BIN:$PATH" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 \
+      bash "$SCRIPT" 43 --watch --repo o/r --pr-tsv "$T/pr-open2b.tsv" 2>&1)"; RC1=$?
+OUT2="$(PATH="$HMHIM:$BIN:$PATH" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 \
+      bash "$SCRIPT" 43 --watch --repo o/r --pr-tsv "$T/pr-open2b.tsv" 2>&1)"; RC2=$?
+kill "$CH_PID2" 2>/dev/null || true
+ck "a PATH-shimmed 'cat' cannot stop the head-moved bound from firing (pass 2 still TERMINAL)" \
+   $([ "$RC1" = 11 ] && [ "$RC2" = 14 ] && [ "$(verdict_of 43 | cut -d' ' -f1)" = BLOCKED ] && echo 0 || echo 1)
 
 # ── 11c-sexies. a LIVE lock is adopted: the record gets the LIVE pid and KEEPS the recorded head ─
 new_o "$T/junk-q3.tsv"
@@ -548,7 +791,27 @@ ck "a classifier that cannot run → it STAMPS WAITING_CLASSIFIER (an unjudged h
    $([ "$RC" = 2 ] && [ "$(cat "$OT/state/lanemerge-61.lastdisp" 2>/dev/null)" = "WAITING_CLASSIFIER" ] \
       && [ "$(cut -d' ' -f1 "$OT/state/lanemerge-61.verdict" 2>/dev/null)" = WAITING_CLASSIFIER ] && echo 0 || echo 1)
 
-# ── 11c-sedecies. the budget hand-off has an arm per disposition it can actually find ──────────
+# ── 11c-septendecies. `O` MUST NOT BE REQUIRED IN THE ENVIRONMENT (fresh review, P1) ───────────
+# ⛔ THE GATE-SOURCING LOOP LANDED AT FILE SCOPE ABOVE THE `O` DEFAULT AND DIED ON `set -u`. `O` is
+# documented as optional (`O="${O:-$HOME/orchestrator}"`) but that default is set BELOW argv parsing,
+# so `"$O/lane-report-gate.sh"` raised `line 85: O: unbound variable` and exited **1** before a single
+# argument was read — an exit code outside this file's own contract (0/10/11/12/13/14/15/2), on the box
+# shape the header supports: `lane.sh` sets `O` WITHOUT `export`, and the brief hands the lane a literal
+# `$O/lane-merge.sh` path. Every other row in this suite exports `O`, which is exactly why none saw it.
+# The assertion is that argv parsing is REACHED: a bad flag must produce the documented 2, not 1.
+OUT="$(env -u O bash "$SCRIPT" --definitely-not-a-flag 2>&1)"; RC=$?
+ck "with `O` UNSET the script still reaches argv parsing (a bad flag is usage 2, not an unbound-variable 1)" \
+   $([ "$RC" = 2 ] && echo 0 || echo 1)
+case "$OUT" in
+  *"unbound variable"*) ck "…and it does not die on \$O under set -u" 1 ;;
+  *) ck "…and it does not die on \$O under set -u" 0 ;;
+esac
+# The same run with a VALID shape must not be refused by `O` either: `--help` names the usage contract.
+OUT="$(env -u O bash "$SCRIPT" --help 2>&1)"; RC=$?
+ck "…and `--help` with `O` unset exits 0 instead of 1" $([ "$RC" = 0 ] && echo 0 || echo 1)
+
+# ── 11c-octodecies. the budget hand-off has an arm per disposition it can actually find ────────
+────
 # ⛔ WITHOUT THIS the `WAITING_NO_VERDICT` arm was dead text: deleting it left ALL 63 green (measured),
 # so the hand-off still said "the merge chain has not resolved this PR" about chunks that had resolved
 # the question (nothing to fix) — and the same catch-all swallowed CHECKS/CLASSIFIER.
@@ -835,6 +1098,29 @@ ck "…the chain is handed the MAIN worktree, not the lane's own checkout (got: 
    $([ -n "$LM_GOT" ] && [ "$(cd "$LM_GOT" && pwd -P)" = "$(cd "$LMFR" && pwd -P)" ] && echo 0 || echo 1)
 ck "…so the rail the chain will exec is the TRUSTED copy, not the lane's tampered one" \
    $(grep -q "the TRUSTED rail" "$LM_GOT/scripts/admin-merge.sh" 2>/dev/null && echo 0 || echo 1)
+# ⛔ AND A PATH-SHIMMED `awk` MUST NOT BE ABLE TO CHOOSE THE "TRUSTED" TREE (round-24 review, P2). The
+# resolver parsed `git worktree list --porcelain` with `awk`, which the lane's PATH owns: a shim answering
+# the lane's own path defeats the fail-closed property this function exists for (measured: control handed
+# the chain the hub, the awk shim handed it the lane). The shim below answers ONLY for the worktree-list
+# program string and passes everything else through, so it isolates exactly that read.
+AWKSHIM="$T/awkshim"; rm -rf "$AWKSHIM"; mkdir -p "$AWKSHIM"
+cat > "$AWKSHIM/awk" <<ASHIM
+#!/usr/bin/env bash
+case "\${1:-}" in
+  *worktree*) printf '%s\\n' "$LMWT" ;;
+  *) exec /usr/bin/awk "\$@" ;;
+esac
+ASHIM
+chmod +x "$AWKSHIM/awk"
+rm -f "$T/chain-repo.txt"
+new_o "$T/junk-q6.tsv"
+OUT="$(cd "$LMWT" && REPO_PATH="$LMWT" PATH="$AWKSHIM:$BIN:$PATH" GH_LOG="$T/gh.log" O="$OT" HOME="$T/home" T="$T" \
+      LANE_MERGE_INTERVAL=5 LANE_MERGE_WAIT=0 LANE_MERGE_POLL=0 \
+      bash "$SCRIPT" 61 --repo o/r --pr-tsv "$T/pr-open6.tsv" --checks-tsv "$T/checks-green.tsv" 2>&1)"; RC=$?
+sleep 1
+LM_GOT2="$(head -n 1 "$T/chain-repo.txt" 2>/dev/null)"
+ck "a PATH-shimmed 'awk' cannot hand the chain the lane's own checkout (got: ${LM_GOT2:-<nothing>})" \
+   $([ -n "$LM_GOT2" ] && [ "$(cd "$LM_GOT2" && pwd -P)" = "$(cd "$LMFR" && pwd -P)" ] && echo 0 || echo 1)
 
 # ── 11c-nonies-a. THE HAND-OFF'S PRINTED REMEDY NAMES THE SAME TREE (landing review F1, P1) ──────────
 # ⛔ F1 WAS REINTRODUCED AS DOCUMENTATION. `launch_chain` refuses to run the chain from a lane worktree —

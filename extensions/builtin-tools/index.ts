@@ -2109,6 +2109,279 @@ export function classifyTaskExit(code: number | null, toolsInFlight: number): Ta
   return "success";
 }
 
+// ── #1208: child liveness as a FIELD on every task result ───────────────
+//
+// THE DEFECT this block exists to close: the task tool's own result was the
+// only liveness signal a parent got, and for a child that died before it could
+// emit its first message the result was structurally identical to "the child
+// ran and had nothing to say" — no pid, no message count, no terminal state.
+// The parent then had to go find the child's pid and `ps` for it, which is not
+// in the tool's contract and which the fleet got wrong repeatedly (measured
+// 2026-09-18: a dead child in every lane that dispatched; parents waiting on
+// panes long after the process was gone). Every consumer that could not do that
+// reconstruction — `lane-status.py`, `lane-actions.py`, the harness instruments
+// — rebuilt it from cwd matching, transcript mtimes and pane scrapes, and got
+// it wrong in BOTH directions (a live child read `CHILD-STUCK`; a working child
+// reported CUT while it went on to open a PR).
+//
+// So the fields ride the RESULT, on every path, composed at the one funnel every
+// in-spawn resolution passes through (`doResolve`) rather than at each of the
+// dozen call sites — a field set that has to be remembered at every composition
+// is the same "each consumer reconstructs it" defect with a shorter half-life.
+
+/** What the parent can now say about the child, as ONE value. The distinction
+ * that matters is `died-before-first-message` vs `completed`: an empty payload
+ * from the former is NOT an answer, and no amount of further waiting changes
+ * it. */
+export type TaskChildState =
+  /** A message was emitted and/or a readable result came back. */
+  | "completed"
+  /** The parent killed it (cut / hard cap / backstop / heartbeat bound). The
+   * partial output that rides the result is NOT a verdict. */
+  | "killed"
+  /** The child ran (emitted messages) but no readable result came back. */
+  | "exited-no-result"
+  /** The child produced ZERO completed messages: it died during startup and
+   * never said anything, so whatever rides the result must never be read as an
+   * empty answer. */
+  | "died-before-first-message"
+  /** NO child process ever existed (a pre-spawn refusal, a provider halt, a
+   * circuit breaker). Distinct from every state above: there is no pid to
+   * probe and no transcript to read, so "it died" would be a false claim. */
+  | "never-started"
+  /** The child's process end has NOT been observed — a background dispatch
+   * (`task_status` is the instrument for it), or any settle that resolves while
+   * the child is still alive (the `onAbort`-after-`session_end` arm, which
+   * exists precisely so the lingering child is reaped later). Present so such a
+   * result does not have to borrow a state that asserts an outcome nobody has
+   * observed yet. */
+  | "running";
+
+/** The canonical liveness field set, present on EVERY `task` result `details`
+ * (exported so a consumer imports the vocabulary instead of re-enumerating it,
+ * and so the suites assert against the same list the composer emits).
+ *
+ * TWO producers fill it, because a `task` call has two layers of failure:
+ *   * `doResolve` inside `spawnSubAgent` — a child DID run, so the values are
+ *     measured (pid, terminal state, message count);
+ *   * `stampLivenessDefaults` at the TOOL layer — no child ran at all (a
+ *     pre-spawn refusal / provider halt), or every attempt resolved with no
+ *     output so the retry wrapper produced the result. The keys are still
+ *     PRESENT, carrying `null`/`never-started`, because the contract a
+ *     consumer imports is presence: a missing key and "no child existed" are
+ *     not the same claim, and a consumer that has to branch on absence is back
+ *     to reconstructing the signal itself. */
+export const TASK_LIVENESS_DETAIL_KEYS = [
+  "childPid",
+  "childState",
+  "childExited",
+  "childMessagesSent",
+] as const;
+
+/** Fill the liveness keys onto a TOOL-LEVEL result that never got them from a
+ * spawn. ONLY fills absent keys — a value the spawn path measured always wins,
+ * so this can be applied at a single choke point without erasing evidence. */
+export function stampLivenessDefaults(details: Record<string, unknown>): Record<string, unknown> {
+  const out = { ...details };
+  if (!("childPid" in out)) out.childPid = null;
+  if (!("childState" in out)) out.childState = "never-started";
+  // `null`, not `false`: "no child existed" is not "the child was seen alive".
+  if (!("childExited" in out)) out.childExited = null;
+  if (!("childMessagesSent" in out)) out.childMessagesSent = null;
+  return out;
+}
+
+/** #1208: settle reasons that are NOT a parent kill — an exit-path failure, a clean-but-silent
+ * exit, or a failed exec. Every other reason `doResolve` accepts is a watchdog kill. */
+export const NON_KILL_SETTLE_REASONS = new Set(["failed", "clean-empty", "spawn-error"]);
+
+/** #1208: the measured liveness of ONE settle, as the funnel computes it. Exported so the
+ * caller-side retry wrapper can carry it onto the terminal result it composes when every attempt
+ * resolved with no payload at all (review of this PR round 2, P2). */
+export interface TaskChildLivenessSnapshot {
+  childPid: number | null;
+  childState: TaskChildState;
+  childExited: boolean | null;
+  childMessagesSent: number | null;
+}
+
+/** #1208: the classifications that assert the child's life is OVER. A settle that reaches one of
+ * these while `exited` is false would contradict its own `childExited`, so it reports `running`
+ * instead. `killed` is deliberately absent (a kill signal precedes the OS's exit report). */
+const UNCONFIRMED_END_STATES: ReadonlySet<TaskChildState> = new Set<TaskChildState>([
+  "died-before-first-message",
+  "exited-no-result",
+]);
+
+/** #1208: build one snapshot from the evidence available at settle time.
+ *
+ * `spawnError` is its own arm: `proc.on("error")` composes a payload with `isError` and NO exit
+ * code, and no process ever ran — so it is `never-started`, not "the child ran and produced
+ * nothing" (review round 2, P3). */
+export function childLivenessFor(i: {
+  details: Record<string, unknown>;
+  hbState: Pick<HeartbeatState, "messagesSent" | "everSawMsg" | "sawReady" | "markerCount" | "lastProgressAt" | "turnsCompleted" | "turnActive">;
+  pid: number | undefined;
+  stdout: string;
+  exited: boolean;
+  /** #1208 (review round 3, P3): the settle was a WATCHDOG KILL even though it composed no payload.
+   * The zero-output kills resolve `undefined`, so `details.killed` is absent and the child would
+   * otherwise be measured `died-before-first-message` — losing the difference between "the parent
+   * cut it, raise the bound" and "the child died on its own". */
+  killedByReason?: boolean;
+}): TaskChildLivenessSnapshot {
+  const spawnError = i.details.isError === true && i.details.killed !== true && !("exitCode" in i.details);
+  const hasStdout = i.stdout.trim().length > 0;
+  const measured = childMessagesSent(i.hbState);
+  // ⛔ THE FIELD SET MUST NOT CONTRADICT ITSELF (review round 4, P3). stdout content IS a message the
+  // child emitted, so it floors the count at 1 exactly as the `everSawMsg` latch does — otherwise a
+  // child that wrote to stdout and then exited non-zero reported `childState: "completed"` alongside
+  // `childMessagesSent: 0`, and a consumer applying this PR's own rule ("0 messages is never a valid
+  // empty answer") would have had to choose which field to disbelieve.
+  const messagesSent = hasStdout ? Math.max(measured ?? 0, 1) : measured;
+  const classified = spawnError
+    ? "never-started"
+    : classifyChildLiveness({
+        killed: i.details.killed === true || i.killedByReason === true,
+        hasStdout,
+        messagesSent,
+      });
+  // ⛔ A DEATH CLAIM REQUIRES A CONFIRMED PROCESS END (review round 8, P3). `died-before-first-message`
+  // means "it died during startup", and every OTHER route to it settles through `exit`/`close`, where
+  // `proc.exitCode`/`signalCode` is set. The `onAbort`-after-`session_end` arm (index.ts:5025-5043)
+  // resolves a payload while the child is STILL ALIVE — it exists so the lingering child is reaped by
+  // the completion watchdog, and it passes no `reason`, so no kill clause fires. For an E-shape child
+  // (zero content-bearing turns, empty stdout) that arm produced
+  // `{childState: "died-before-first-message", childExited: false}`: `childState` asserting a death the
+  // same payload's `childExited` denies, and a parent told "it died during startup" about a child that
+  // had just emitted `session_end` and was running. Constraint 6 forbids exactly that pairing.
+  //
+  // The `killed` state is deliberately NOT gated: a kill signal is sent BEFORE the OS reports the exit,
+  // so `childExited: false` is the CORRECT and documented reading there (see the round-2 kill test).
+  // Only a TERMINAL-OUTCOME claim needs the end confirmed.
+  //
+  // ⛔ `exited-no-result` IS SUCH A CLAIM TOO (review round 9, P2). Round 8 substituted it for
+  // `died-before-first-message` above and thereby replaced a false DEATH with a false EXIT: its own
+  // docstring says "the child ran (emitted messages) but no readable result came back", yet the arm
+  // that needs this gate reports `childMessagesSent: 0` and `childExited: false` beside it — three
+  // fields disagreeing in one payload, which is the same constraint-6 violation one value over. The
+  // vocabulary already has the truthful member: `running` asserts no outcome, and it is exactly the
+  // claim "the OS has not told us this child is gone".
+  const childState = !i.exited && UNCONFIRMED_END_STATES.has(classified) ? "running" : classified;
+  return {
+    childPid: typeof i.pid === "number" ? i.pid : null,
+    childState,
+    childExited: spawnError ? null : i.exited,
+    childMessagesSent: messagesSent,
+  };
+}
+
+/** #1208: the status a zero-output RETRY EXHAUSTION names, from the last settle's measurement.
+ *
+ * Extracted so the decision is testable without paying three killed spawns: the arm is reached only
+ * when every attempt resolved `undefined`, which needs a real watchdog kill. `0` messages is the
+ * slow-start death and is named as such; `null` keeps `failed`, because with no heartbeat evidence
+ * "no attempt produced a message" is not provable and a false death claim is the worse error.
+ * (Review round 2, P2 — the tool layer used to stamp `never-started` for a child that DID run.)
+ *
+ * ⛔ A KILL IS NEVER A STARTUP DEATH (review round 4, P2). This arm is reachable ONLY through the
+ * payload-less watchdog kills (hard cap / backstop / heartbeat bound), so the snapshot it reads
+ * carries `childState: "killed"`. Naming that `died-before-first-message` would put two
+ * contradictory claims in ONE payload — `status` says "it died on its own, re-dispatch it" while
+ * `childState` says "the parent cut it, raise the bound" — and `classifyBackgroundOutcome`
+ * persists `reason: d.status`, so a lane the watchdog killed three times would be durably recorded
+ * as having died of its own accord. The kill stays `failed` and `childState` names the cause.
+ *
+ * ⛔ THE `died-before-first-message` RETURN BELOW IS DEFENSIVE-UNREACHABLE (review round 8, P3).
+ * DOCUMENTED CLAIM, CORRECTED: an earlier revision of this comment said `childMessagesSent === 0`
+ * "is named as such" here. It cannot be. `result.status === "failed"` means every attempt resolved
+ * `undefined`, and all three `doResolve(undefined, …)` sites (hard-cap:4586, heartbeat decision:4907,
+ * backstop:5002) pass a reason outside `NON_KILL_SETTLE_REASONS`, so `killedByReason` is true,
+ * `childState` is `"killed"`, and the line above returns `failed` first. A settle that could be
+ * `died-before-first-message` necessarily carried a payload — and then `retry()` returns `success`,
+ * so this arm is never entered. The branch is kept because dropping it would turn a future
+ * non-kill payload-less settle into a silent `undefined`; it is a fail-closed guard, NOT coverage,
+ * and the unit row that exercises it constructs its input directly. */
+export function exhaustionStatusFor(snap: TaskChildLivenessSnapshot | null): "failed" | "died-before-first-message" {
+  if (snap === null) return "failed";
+  if (snap.childState === "killed") return "failed";
+  return snap.childMessagesSent === 0 ? "died-before-first-message" : "failed";
+}
+
+/** #1208: how many messages the child is known to have sent, or `null` when the
+ * child never ran the heartbeat emitter and the parent therefore has NO
+ * evidence either way.
+ *
+ * ⛔ `null` IS NOT `0`. `0` is positive evidence of a slow-start death; `null`
+ * means the question cannot be answered (an older/absent emitter, or
+ * TASK_HEARTBEAT_DISABLE=1 in the child). Collapsing them would classify every
+ * dispatch on a heartbeat-less box as dead — a false failure in the one place
+ * the fleet reads as "stop, do not continue".
+ *
+ * The count is COMPLETED, CONTENT-BEARING turns (`turn_end` with `content=1`,
+ * monotonic).
+ *
+ * ⛔ A `turn_end` is NOT by itself a message: the E-shape child cycles
+ * `turn_start`/`turn_end` producing nothing (#5195). Only a `content=1` turn — or
+ * a legacy marker carrying no flag at all, read as content-bearing so version
+ * skew degrades to the pre-#1208 behaviour — counts.
+ *
+ * ⛔ THE FLOOR IS CONTENT-BEARING TOO (review round 4, P1). The floor exists for
+ * the child that streamed and died mid-turn before a `turn_end`, but it must not
+ * be built on `everSawMsg`: that latch is set by a bare assistant `message_start`
+ * and by ANY `message_update` delta with no content inspection (task-heartbeat.ts
+ * says so itself), so a whitespace/retry-chatter loop — exactly the #5195 E shape —
+ * would answer "1 message sent" and be classified a quiet success. `lastProgressAt`
+ * advances only on a completed tool or a tick whose `progress=1`, both of which are
+ * content/tool evidence, so it is the floor's honest basis.
+ *
+ * Residual, stated rather than hidden: a child that begins streaming real content
+ * and dies inside the final interval, before any tick could report `progress=1`,
+ * answers `0` (the tick evidence below). That window is bounded by one heartbeat
+ * interval; the alternative — trusting the content-blind latch — is a systematic
+ * false PASS on the E shape, which is the worse error. */
+export function childMessagesSent(
+  state: Pick<
+    HeartbeatState,
+    "messagesSent" | "everSawMsg" | "sawReady" | "markerCount" | "lastProgressAt" | "turnsCompleted" | "turnActive"
+  >,
+): number | null {
+  if (!state.sawReady && state.markerCount === 0) return null;
+  if (state.messagesSent > 0) return state.messagesSent;
+  // A content-bearing unit of work was observed before any `turn_end` (a completed tool, or a
+  // content-bearing progress tick): the child demonstrably said something.
+  if (state.lastProgressAt > 0) return 1;
+  // No stream activity of any kind: the child never spoke. `ready`-then-exit is the headline
+  // slow-start death this field exists to name, so this must stay 0 — not `null`.
+  if (!state.everSawMsg) return 0;
+  // Stream activity, but no content evidence. We can still prove zero when the child COMPLETED
+  // turns and none of them carried content (the #5195 E shape): every turn ended, so nothing is
+  // mid-flight, and every completed turn was empty.
+  if (state.turnsCompleted > 0 && !state.turnActive) return 0;
+  // Otherwise the activity sits in an UNFINISHED turn and the parent cannot separate real content
+  // from a whitespace/retry-chatter delta (`everSawMsg` is content-blind by construction). UNKNOWN is
+  // the only truthful answer: `1` is the false liveness this field exists to stop, and `0` would be a
+  // false death claim about a working child. `null` → `exited-no-result`, never `isError`.
+  return null;
+}
+
+/** #1208: the ONE child-liveness classifier. Ordered so the strongest claim
+ * wins: a kill is a kill whatever else happened, a readable result is an
+ * answer, and "zero messages" is only reachable once both are excluded. */
+export function classifyChildLiveness(i: {
+  killed: boolean;
+  /** The child's OWN stdout came back (the composer's own fallback sentences
+   * such as `Sub-agent exited with code 0` do NOT count — they are the tool
+   * talking, not the child). */
+  hasStdout: boolean;
+  messagesSent: number | null;
+}): TaskChildState {
+  if (i.killed) return "killed";
+  if (i.hasStdout) return "completed";
+  if (i.messagesSent === 0) return "died-before-first-message";
+  return "exited-no-result";
+}
+
 /** Alive state parsed from [task-heartbeat] markers. Ticks overwrite the
  * per-event fields (self-healing if an event marker was lost). */
 export interface HeartbeatState {
@@ -2181,6 +2454,22 @@ export interface HeartbeatState {
   /** Session latch — tool activity was ever observed (tool_start/tool_end or
    * tick saw_tool=1). Distinct from per-turn turnSawTool (resets on turn_start). */
   everSawTool: boolean;
+  /** #1208: COMPLETED, CONTENT-BEARING model turns — the parent-side "did this
+   * child ever say anything" count. Monotonic and session-level (a child's turn
+   * resets cannot erase it), so `0` is positive evidence that NO turn ever ran
+   * to completion, which is the slow-start death. Deliberately NOT derived from
+   * ticks: `saw_msg=1` repeats on every tick of a turn, so a tick-derived
+   * counter measures ticks, not messages. Also not derived from a bare
+   * `turn_end`: an EMPTY turn emits one too (#5195's E shape), so the marker's
+   * own `content` flag decides. Read it through `childMessagesSent()`, never
+   * directly. */
+  messagesSent: number;
+  /** #1208 (review round 4, P1): how many `turn_end` markers were seen AT ALL, content-bearing or
+   * not. `messagesSent` counts only the content-bearing ones; this counts the completions, and the
+   * difference is what lets `childMessagesSent()` prove "every completed turn was empty" instead of
+   * having to answer `null` for it. A turn that is still open (`turnActive`) is the one case that
+   * cannot be judged by this pair, because its content may simply not have arrived yet. */
+  turnsCompleted: number;
   /** ts of the first everSawRealActivity source (0 = none) — the parent's
    * time-to-first-observable-activity, comparable to the child's own
    * time-to-first-activity measured from session logs (#282 sweep). */
@@ -2248,6 +2537,8 @@ export function createHeartbeatState(): HeartbeatState {
     firstTickAt: 0,
     everSawMsg: false,
     everSawTool: false,
+    messagesSent: 0,
+    turnsCompleted: 0,
     firstActivityAt: 0,
     toolsMaxInFlight: 0,
     activityTrace: [],
@@ -2420,8 +2711,22 @@ export function parseHeartbeatLine(
       state.streamAgeMs = 0;
       state.toolAgeMaxMs = 0;
       break;
-    case "turn_end":
+    case "turn_end": {
       state.turnActive = false;
+      // #1208: every completion counts here; whether it carried CONTENT is the separate question
+      // the marker's own flag answers below. (`messagesSent` = content-bearing completions.)
+      state.turnsCompleted += 1;
+      // #1208: one COMPLETED, CONTENT-BEARING model turn = one message the child
+      // emitted. `turn_end` alone is NOT sufficient: the E-shape child cycles
+      // turn_start/turn_end producing nothing (#5195), so a bare count reports
+      // "the child said something" for a child that said nothing — the
+      // false-liveness direction this whole field exists to close. The child
+      // stamps `content=` from `hasTurnContent`; an ABSENT flag means an older
+      // emitter and is read as content-bearing (the pre-#1208 reading), so
+      // version skew degrades to yesterday's behaviour rather than inventing a
+      // false silence.
+      const contentFlag = rest.match(/(?:^|\s)content=([01])(?:\s|$)/);
+      if (!contentFlag || contentFlag[1] === "1") state.messagesSent += 1;
       // Mirror the child's outstanding-tools clear on turn_end (pi guarantees
       // all tools finalize before turn_end). Prevents a stale event counter
       // after a lost tool_end from causing a false tool-stall kill (code-
@@ -2445,6 +2750,7 @@ export function parseHeartbeatLine(
       state.toolCpuStallMs = 0;
       state.toolCpuAdvanced = false;
       break;
+    }
     case "tick": {
       state.tickCount += 1;
       if (state.firstTickAt === 0) state.firstTickAt = now;
@@ -2684,6 +2990,232 @@ export interface HeartbeatKillDecision {
    * true iff the kill fired and no REAL output ever arrived (#5926 retry
    * preservation). */
   resolveUndefined: boolean;
+  /** #1339: the marker age THIS DECISION was taken on (ms; `-1` = no marker),
+   * snapshotted exactly like `progressAgeMs` and `toolCpuStallMs` above.
+   *
+   * The kill path is not instantaneous: the #318 network probe is awaited
+   * BEFORE the kill runs (default ON, timeout up to 9 s), and every `await`
+   * yields the event loop, which is where the child's `data` handlers run. So
+   * a marker can land between this decision and the headline that describes it.
+   * Reading `lastMarkerAt` again after the await made the payload contradict
+   * its own verdict — measured: `no life signs for -1s (marker gap exceeded
+   * 113s)` with `lastMarkerAgeMs=-532`, load1=190.62 (#1339). The headline
+   * therefore prints THIS value, and the loop re-validates it before killing. */
+  markerAgeMs?: number;
+  /** #1339 review P2: the DECISION's `readMarkerAge().invalid`, so the kill
+   * payload can distinguish a CLAMPED age from a genuinely fresh marker (#1339
+   * exists because a negative age made this bug unreadable; a clamp that prints
+   * an indistinguishable `0` would repeat it one layer in). This is the caller
+   * that reports the flag (see `MarkerAgeReading.invalid` for why the
+   * completion/backstop payloads do not). */
+  markerAgeInvalid?: boolean;
+}
+
+/**
+ * #1339 — THE reader for the marker age. Every decision, headline and
+ * diagnostic goes through it so a nonsensical age can never be printed or
+ * compared against a threshold.
+ *
+ * Two pieces of invalid input, handled differently and deliberately:
+ *
+ *  · `lastMarkerAt <= 0` — no marker was ever parsed. `-1` is a SENTINEL
+ *    meaning "never", never an age; the clauses express the condition with
+ *    `stateFresh` (which requires `lastMarkerAt > 0`), not with this number.
+ *  · `lastMarkerAt > now` — the marker timestamp is in the FUTURE of the clock
+ *    the caller captured. This is not "negative silence": it happens whenever
+ *    a marker is ingested after `now` was snapshot and before the age is read
+ *    — i.e. inside the awaited kill path (`probeNetwork`), or across any other
+ *    yield. Measured on a live cut: `lastMarkerAgeMs=-532` beside `no life
+ *    signs for -1s` (`retry`-class false kill, load1=190.62). A threshold
+ *    comparison against a negative age is meaningless, so the age is clamped
+ *    to 0 and `invalid` is reported for the caller to log.
+ *
+ * Clamping here does NOT contradict #1070's "warn, never clamp" rule: that
+ * rule protects an operator's BOUND (`stream_stall_ms`, the cut gap) from being
+ * silently rescaled. This clamps a MEASUREMENT that has no valid value, and it
+ * clamps toward "no evidence of silence", the fail-safe direction — a child is
+ * never killed on an age the parent could not compute.
+ */
+export interface MarkerAgeReading {
+  /** ms since the last parsed marker; `-1` = never (sentinel); `0` when the
+   * raw difference was negative (invalid input, clamped). */
+  ageMs: number;
+  /** True iff a marker timestamp lay in the future of `now` and was clamped.
+   *
+   * Reported on the TICK-KILL payload (`decMarkerAgeInvalid=` /
+   * `lastMarkerAgeInvalid=`), which is the one reader taken after an `await`
+   * (`probeNetwork`) and therefore the only place a marker ingested inside that
+   * window can make a live read clamp. The completion/backstop payloads read
+   * `.ageMs` only and take `now` AT the read: a future timestamp there implies a
+   * WALL-CLOCK step backwards, which the decision's own flag already reports
+   * (#1339 review-6, P3 — stated here so the narrower reporting is a decision
+   * on the record, not an omission to re-discover). */
+  invalid: boolean;
+}
+
+export function readMarkerAge(lastMarkerAt: number, now: number): MarkerAgeReading {
+  if (!(lastMarkerAt > 0)) return { ageMs: -1, invalid: false };
+  const raw = now - lastMarkerAt;
+  if (raw < 0) return { ageMs: 0, invalid: true };
+  return { ageMs: raw, invalid: false };
+}
+
+/**
+ * #1339 — is the kill decision STALE?
+ *
+ * True iff either liveness channel observed something AFTER the instant the
+ * decision was computed (`snapshotAt`): a parsed heartbeat marker, or any real
+ * output byte (`lastLifeSignAt`, which the stdout handler and every stderr
+ * chunk advance). The decision is an inference that the child is not making
+ * progress; evidence stamped after the snapshot contradicts that premise, so
+ * the verdict must not be executed.
+ *
+ * WHY THIS EXISTS AT ALL. `heartbeatKillDecision` is pure and its inputs are a
+ * snapshot, but the kill path is not: the #318 network probe is awaited
+ * (default ON, `networkProbeTimeoutMs` up to 9 s) between the decision and
+ * `killTreeAndEscalate()`. Every `await` yields the event loop, and that is
+ * exactly where the child's `data` handlers run — so the child could prove
+ * itself alive and be killed a millisecond later on the superseded verdict.
+ * Measured (#1339 re-measurement on this box, session `01a1a95c`): the child
+ * emitted markers during the probe (`lastMarkerAgeMs=-532`) while the harness
+ * cut it for "no life signs for 951s". The pre-existing `settled`/`exitCode`
+ * re-check after the await guards the SAME window for the promise's state and
+ * simply never asked whether the EVIDENCE had moved.
+ *
+ * This can only ever DELAY a kill, never cause one. It also cannot delay it
+ * forever, but the honest bound is NOT "one tick": the suppression repeats for
+ * exactly as long as the child keeps producing evidence newer than each tick's
+ * OWN snapshot, and the byte channel never goes quiet on its own — a grandchild
+ * (MCP server) inherits the child's fd 2, so `onLifeSign` fires on ITS stderr
+ * too (a pre-existing property of that channel, `ingestHeartbeatChunk`, not of
+ * this guard). A suppressed clause is therefore bounded by the clause's own
+ * bound and, as the last resort, `TASK_HARD_CAP_MS` — not by the guard. What
+ * cannot happen is a kill executed on a verdict the child has already refuted.
+ *
+ * This predicate is the MARKER + BYTE half only. A clause whose own clock is
+ * neither of those must be asked about ITS clock — see `supersedingEvidence`,
+ * which is what the kill path actually calls.
+ */
+export function decisionSnapshotStale(
+  snapshotAt: number,
+  lastMarkerAt: number,
+  lastLifeSignAt: number,
+): boolean {
+  return lastMarkerAt > snapshotAt || lastLifeSignAt > snapshotAt;
+}
+
+/** The evidence channel that superseded a kill verdict, named so the operator
+ * log can print the one delta that is real (#1339 review). The last two are
+ * SCOPE changes rather than clocks: they make a clause inapplicable without any
+ * timed quantity moving. */
+export type SupersedingChannel =
+  | "marker"
+  | "bytes"
+  | "progress"
+  | "session-end"
+  | "tool-in-flight";
+
+/**
+ * #1339 (review) — WHICH clock displaced this verdict, if any.
+ *
+ * For the ONE clause whose clock is not a function of marker/byte arrival, the
+ * guard asks about that clause's own clock: `no-progress` is the clause where
+ * that matters, because its binding rule is that the clock is
+ * `lastProgressAt`, which advances ONLY on a completed unit of work — "ticks
+ * and turn boundaries do NOT advance it, so a child that keeps emitting them
+ * while completing nothing cannot reset this bound — the property no other
+ * clause has" (`heartbeatKillDecision`, the `no-progress` clause). A tick
+ * marker or a stray stderr byte landing inside the awaited probe window sets
+ * `lastMarkerAt`/`lastLifeSignAt` and leaves `lastProgressAt` untouched, so
+ * asking the marker/byte question would restore exactly the reset that clause
+ * exists to deny — the content-free loop / drip stream would survive to the
+ * hard cap. It is asked about progress instead, which is still the fail-safe
+ * direction: real work completing inside the window DOES disprove the verdict,
+ * and suppresses it.
+ *
+ * Returns `null` for "the verdict still stands". `max-dispatch` is exempt at
+ * the call site (a wall-clock policy cap is not an inference about progress, so
+ * no new evidence makes the dispatch younger) and is not handled here.
+ *
+ * ⛔ `no-progress` is NOT just "a different clock" — it also has two SCOPE
+ * gates that can flip inside the awaited window with `lastProgressAt`
+ * untouched, and the clause returns `kill: false` for both at that same
+ * instant (`heartbeatKillDecision`):
+ *
+ *  · `state.sessionEnded` — the `#191` early return, "no stall/silence clause
+ *    may race it and misclassify completed work as a partial-result kill". A
+ *    `session_end` marker sets it (and `lastMarkerAt`) but never touches
+ *    `lastProgressAt`.
+ *  · `state.toolsInFlight > 0` — the clause's declared SCOPE: an in-flight tool
+ *    is a DECLARED long operation owned by the tool clauses. `tool_start` sets
+ *    it, and again never touches `lastProgressAt`.
+ *
+ * Missing them is not a policy trade — the policy ("a wedge with no completed
+ * unit of work") is simply unreachable for an ended session or a running tool,
+ * so a kill executed here would contradict the clause's own gate at that very
+ * instant, and for `session_end` it would discard finished work as a
+ * partial-result kill (#1339 cycle-2 review, reproduced).
+ */
+export function supersedingEvidence(
+  reason: HeartbeatKillReason | undefined,
+  snapshotAt: number,
+  channels: {
+    lastMarkerAt: number;
+    lastLifeSignAt: number;
+    lastProgressAt: number;
+    startedAt: number;
+    /** `state.sessionEnded` at re-validation time (#191 scope gate). */
+    sessionEnded: boolean;
+    /** `state.toolsInFlight` at re-validation time (the clause's scope gate). */
+    toolsInFlight: number;
+  },
+): SupersedingChannel | null {
+  if (reason === "no-progress") {
+    // The clause's OWN gates first, strongest first — see the docblock.
+    if (channels.sessionEnded) return "session-end";
+    if (channels.toolsInFlight > 0) return "tool-in-flight";
+    // Same anchor the clause itself uses (`lastProgressAt > 0 ? … : startedAt`),
+    // so "advanced" means the very quantity the clause measured has moved.
+    const anchor = channels.lastProgressAt > 0 ? channels.lastProgressAt : channels.startedAt;
+    return anchor > snapshotAt ? "progress" : null;
+  }
+  if (!decisionSnapshotStale(snapshotAt, channels.lastMarkerAt, channels.lastLifeSignAt)) {
+    return null;
+  }
+  // Name the channel that actually fired, so a log line can never print a
+  // negative delta for a channel that did not move (#1339 review: the first
+  // version printed `marker +-45123ms` when only bytes had arrived).
+  //
+  // ⛔ This branch is where the "ask the clause's OWN clock" rule STOPS, and the
+  // scope is deliberate rather than an omission. The reasons that reach here
+  // fall into three groups, and the marker/byte question is the right one for
+  // each — stated per group, because a blanket rule would be false for some of
+  // them (#1339 cycle-4 review: the earlier "each is gated on `stateFresh` or on
+  // byte-arrival" covered `zero-output` only by accident and mis-described the
+  // age clauses):
+  //  · `silence-threshold` decides on `now - lastLifeSignAt`, which IS the byte
+  //    clock — a byte or a marker refutes it OUTRIGHT, so the question is the
+  //    clause's own.
+  //  · `cut` decides on `markerAge` — a fresh marker refutes it OUTRIGHT too.
+  //  · `zero-output` is NOT `stateFresh`-gated: it fires on ABSENCE latches
+  //    (`!hasOutput`, `!everSawWork`, `!sawReady`, past tier-1). A marker proves
+  //    the child is running, and a `tick` marker sets none of those latches, so
+  //    here the channel refutes a premise the clause does not measure directly.
+  //    Still FAIL-SAFE: the child re-decides and is caught by
+  //    `silence-threshold` at T, or by `TASK_HARD_CAP_MS`.
+  //  · the AGE clauses (`stream-stall`, `tool-stall`, `tool-silence`,
+  //    `tool-dead`, `first-message-stall`) are `stateFresh`-gated and decide on
+  //    `effStreamAge`/`effToolAge` = the child's frozen sample + `markerAge`, so
+  //    a fresh marker NARROWS the decided age rather than refuting it. Those are
+  //    therefore the clauses whose own bound can be deferred for as long as
+  //    markers keep landing inside the probe window; their backstop is
+  //    `TASK_HARD_CAP_MS`, NOT their own bound (defeating that bound is what the
+  //    suppression does). Comparing those ages against live values is a tracked
+  //    follow-up (agent-infra#3814), not something this branch should start doing
+  //    without its own test.
+  // Suppressing is the FAIL-SAFE direction throughout: a live child is not
+  // killed, and the clause re-decides on the next tick.
+  return channels.lastMarkerAt > snapshotAt ? "marker" : "bytes";
 }
 
 export interface HeartbeatDecisionInput {
@@ -2833,10 +3365,18 @@ export function inFlightProgress(
 export function heartbeatKillDecision(
   i: HeartbeatDecisionInput,
 ): HeartbeatKillDecision {
+  const st = i.state;
+  // #1339: ONE clamped read, taken before the first clause, so every kill below
+  // carries the age it was actually decided on (`markerAgeMs`) and no clause or
+  // headline can ever consume a negative age. See `readMarkerAge` for why a
+  // future timestamp is invalid input rather than "negative silence".
+  const ageReading = readMarkerAge(st.lastMarkerAt, i.now);
   const kill = (reason: HeartbeatKillReason): HeartbeatKillDecision => ({
     kill: true,
     reason,
     resolveUndefined: !i.hasOutput,
+    markerAgeMs: ageReading.ageMs,
+    markerAgeInvalid: ageReading.invalid,
   });
 
   // #191: the child declared the session complete (session_end marker) — the
@@ -2868,8 +3408,7 @@ export function heartbeatKillDecision(
     return kill("zero-output");
   }
 
-  const st = i.state;
-  const markerAge = st.lastMarkerAt > 0 ? i.now - st.lastMarkerAt : 0;
+  const markerAge = ageReading.ageMs < 0 ? 0 : ageReading.ageMs;
   const stateFresh =
     st.lastMarkerAt > 0 &&
     markerAge <= Math.max(2 * i.heartbeatTimeoutMs, 2 * i.intervalMs);
@@ -3709,6 +4248,10 @@ export interface SpawnObservers {
    * (#1662 review). The blocking path is unchanged: it surfaces the same
    * `details.status: "invalid-cwd"` through `FAILED_TASK_STATUS`. */
   onRefusal?: (refusal: PreSpawnRefusal) => void;
+  /** #1208: the measured liveness of the settle, fired BEFORE the resolution is handed back so
+   * the value survives a settle that resolves `undefined` (a retryable zero-output kill carries no
+   * payload, and that is the issue's own case). */
+  onLiveness?: (snapshot: TaskChildLivenessSnapshot) => void;
   /** When set, every raw stdout/stderr chunk is appended here (the background
    * run's capture log). The log carries the `[task-heartbeat]` markers verbatim,
    * so liveness is derived from markers — never from `%CPU` (#1662). */
@@ -4082,8 +4625,14 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
       );
     };
 
+    // #1208: a settle payload may carry the tool-level `isError` flag (pi shows
+    // the model an error, and `tool_execution_end.isError` becomes true), which
+    // a child-liveness state can require. Declared here so `doResolve` is the
+    // only place that decides it — never a call site.
+    type TaskSettlePayload = { content: any[]; details: Record<string, unknown>; isError?: boolean };
+
     const doResolve = (
-      value: { content: any[]; details: Record<string, unknown> } | undefined,
+      value: TaskSettlePayload | undefined,
       // `reason` is the row discriminator. A row is written IFF `reason` is
       // provided, and the enumeration is exact (#783 review — the previous
       // "success → NO row" phrasing was false for `clean-empty`):
@@ -4099,10 +4648,45 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
       // the #796 population; #783 review closed that gap rather than documenting
       // it — the row needs nothing unavailable at that point, and `settled`
       // already guarantees exactly-once (no double row when `close` follows).
+      //
+      // ⛔ `died-before-first-message` IS ITS OWN ROW REASON (review round 10, P3). The settle-path
+      // labels above are chosen BEFORE the child is measured, so a slow-start death that exited 0
+      // with empty stdout was written as `clean-empty` — the label this block documents as a SUCCESS —
+      // while the payload on the SAME settle said `status: died-before-first-message`, `isError: true`,
+      // `childMessagesSent: 0`. One settle, two durable surfaces, contradictory claims — and the
+      // ledger is the surface a lane reader trusts longest. The row reason is now derived from the
+      // measurement, so the two cannot disagree.
       opts?: { reason?: string; exitCode?: number | null; keepCompletionWatchdog?: boolean; sweep?: boolean },
     ) => {
       if (settled) return;
       settled = true;
+      // ── #1208: child liveness, measured ONCE per settle — INCLUDING the settles that resolve
+      // `undefined` ────────────────────────────────────────────────────────────────────────────────
+      // ⛔ THE `undefined` SETTLES ARE THE ISSUE'S OWN CASE (review of this PR round 2, P2). Every
+      // zero-output kill — silence-threshold, cut-with-no-output, hard cap, backstop — resolves
+      // `undefined` so the retry wrapper can re-spawn, and the first cut of this change computed
+      // liveness only where a payload object existed. The retry-exhaustion result then stamped
+      // `never-started` / `childPid: null` for a child that DID exist, WAS killed, HAS a pid and HAS
+      // a transcript: a consumer would read "no child existed, fix the arguments" where the honest
+      // verdict is "a child ran and died before its first message — re-dispatch". The measurement is
+      // therefore taken BEFORE the payload branch and handed to the caller through the observer,
+      // so the evidence survives a resolution that carries no payload.
+      //
+      // ⛔ AND BEFORE THE OUTCOME ROW (review round 10, P3). The row's `reason` is a durable claim
+      // about what happened; deriving it from the settle path while the payload derived it from the
+      // measurement let ONE settle be `clean-empty` (documented as a success) in the ledger and a
+      // proven zero-message death in the result. The measurement is the single source for both.
+      const livenessSnapshot = childLivenessFor({
+        details: value && typeof value === "object" ? (value.details ?? {}) : {},
+        hbState: hbCtx.state,
+        pid: proc.pid,
+        stdout,
+        exited: proc.exitCode !== null || proc.signalCode !== null,
+        // The `undefined` settles carry no payload, so the kill is named by the REASON that
+        // settled them. `failed` / `clean-empty` / `spawn-error` are not kills.
+        killedByReason: opts?.reason !== undefined && !NON_KILL_SETTLE_REASONS.has(opts.reason),
+      });
+      observers?.onLiveness?.(livenessSnapshot);
       // #783 Task 4 — THE choke point, immediately after `settled = true`, and
       // deliberately NOT at the call sites. `finalize` is invoked
       // UNCONDITIONALLY from both proc.on("exit") (after the 2s grace) and
@@ -4115,7 +4699,12 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
       // would miss it, leaving that population uncountable).
       if (opts?.reason) {
         const transcriptPath = resolveTranscript();
-        const recordResult = writeOutcomeRow(opts.reason, opts.exitCode ?? null, transcriptPath);
+        // ⛔ THE MEASUREMENT OUTRANKS THE SETTLE PATH (review round 10, P3). A proven zero-message
+        // death is not "success", and `clean-empty` is the label this block documents as one. The
+        // row's reason is the SAME claim the payload makes, derived from the same snapshot.
+        const rowReason =
+          livenessSnapshot.childState === "died-before-first-message" ? "died-before-first-message" : opts.reason;
+        const recordResult = writeOutcomeRow(rowReason, opts.exitCode ?? null, transcriptPath);
         if (value && typeof value === "object") {
           const details: Record<string, unknown> = { ...(value.details ?? {}), transcriptPath };
           // Never name a path when nothing was written: an unwritable/full
@@ -4178,8 +4767,61 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
         }
         if (hbCtx.state.everSawTool) details.sawTools = true;
         else if (hbEnabled && hbCtx.state.markerCount === 0) details.sawToolsUnknown = true;
-        if (Object.keys(details).length > 0) {
-          value = { ...value, details };
+        // ── #1208: the measured snapshot rides the payload ────────────────────
+        // Measured ONCE, above, so the `undefined` settles get the same evidence.
+        details.childPid = livenessSnapshot.childPid;
+        details.childState = livenessSnapshot.childState;
+        // "terminal status" (issue ask 1): whether the OS told us the child is
+        // gone. On the kill paths it is still false at settle time — the kill
+        // was just signalled — and saying so is the point: `childState: killed`
+        // with `childExited: false` is a child the parent believes is still
+        // dying, not one it proved dead.
+        details.childExited = livenessSnapshot.childExited;
+        // `0` is positive evidence (no completed message ever); `null` means
+        // the child ran no heartbeat emitter and the parent knows nothing.
+        details.childMessagesSent = livenessSnapshot.childMessagesSent;
+        value = { ...value, details };
+        if (livenessSnapshot.childState === "died-before-first-message") {
+          // Issue asks 3 + 4: a DISTINCT result for the slow-start death, and a
+          // non-zero exit by default so a parent's default handling is to stop
+          // rather than to continue on a payload that means "nothing happened".
+          // Without this the parent got `Sub-agent exited with code 0` — the
+          // exact collapse the issue was filed for: a dead child's result read
+          // as a completed one.
+          //
+          // ⛔ PREPEND, NEVER REPLACE (review of this PR, P2 — a real defect in
+          // the first cut). On this arm stdout is empty, so `finalize`'s composed
+          // text IS the child's cleaned STDERR (`const text = output ||
+          // stderrClean || …`) and the arm carries no `details.stderr`. Replacing
+          // it destroyed the only diagnostic the parent had, so a death caused by
+          // an auth or provider error reported "re-dispatch it" with the cause
+          // gone — and, worse, it was fail-SILENT in the failover layer:
+          // `connectionErrorDetected` reads `details.stderr` and falls back to the
+          // content, so #152's fallback and #476's markerless-hop branch could no
+          // longer see the signature for any such death. Keeping the composed
+          // text below the header preserves both.
+          const composed = (value.content ?? [])
+            .map((part: any) => (typeof part?.text === "string" ? part.text : ""))
+            .join("\n")
+            .trim();
+          details.status = "died-before-first-message";
+          details.isError = true;
+          const header =
+            `\u26d4 Sub-agent died before its first message \u2014 it completed no content-bearing turn and returned no result ` +
+            `(pid ${details.childPid ?? "unknown"}, exit ${details.exitCode ?? "not recorded"}).\n\n` +
+            `This is NOT an empty answer. Nothing the child was asked to do produced a message with content, ` +
+            `so there is no verdict, no report and no "nothing to say" to read here. ` +
+            `Re-dispatch it, or investigate the child's transcript before assuming the work happened.`;
+          value = {
+            content: [
+              {
+                type: "text",
+                text: composed ? `${header}\n\n--- what the child left behind ---\n${composed}` : header,
+              },
+            ],
+            details,
+            isError: true,
+          };
         }
       }
       // #271 settle-path sweep hook (round-3 F2): runs whenever the exit-settle
@@ -4240,7 +4882,7 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
         doResolve(undefined, { sweep: true, reason: "hard-cap" });
         return;
       }
-      const markerAgeMs = hbCtx.state.lastMarkerAt > 0 ? Date.now() - hbCtx.state.lastMarkerAt : -1;
+      const markerAgeMs = readMarkerAge(hbCtx.state.lastMarkerAt, Date.now()).ageMs;
       doResolve(composeAbnormalExit(
         { model, provider, killed: true, reason: "hard-cap", hardCapMs: getTaskHardCapMs() },
         {
@@ -4341,7 +4983,9 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
         // #271 cut composition (F10): resolveUndefined = !hasOutput — a
         // zero-partial cut stays retryable by the retry wrapper, mirroring
         // the kill-clause contract.
-        const markerAgeMs = hbCtx.state.lastMarkerAt > 0 ? Date.now() - hbCtx.state.lastMarkerAt : -1;
+        // #1339: clamped through the one reader — this composition runs on the
+        // EXIT path, where the last `now` may already be stale.
+        const markerAgeMs = readMarkerAge(hbCtx.state.lastMarkerAt, Date.now()).ageMs;
         const aliveSummary = `Alive state: toolsInFlight=${hbCtx.state.toolsInFlight} turnActive=${hbCtx.state.turnActive} streamAgeMs=${hbCtx.state.streamAgeMs} effStreamAgeMs=${hbCtx.state.streamAgeMs + (markerAgeMs > 0 ? markerAgeMs : 0)} toolAgeMaxMs=${hbCtx.state.toolAgeMaxMs} effToolAgeMs=${hbCtx.state.toolAgeMaxMs + (markerAgeMs > 0 ? markerAgeMs : 0)} toolCpuMs=${hbCtx.state.toolCpuMs} toolCpuStallMs=${hbCtx.state.toolCpuStallMs} toolCpuAdvanced=${hbCtx.state.toolCpuAdvanced} everSawRealActivity=${hbCtx.state.everSawRealActivity} lastMarkerAgeMs=${markerAgeMs} tickCount=${hbCtx.state.tickCount} markerCount=${hbCtx.state.markerCount} firstMarkerLagMs=${hbCtx.state.firstMarkerAt > 0 ? hbCtx.state.firstMarkerAt - startedAt : -1} firstTickLagMs=${hbCtx.state.firstTickAt > 0 ? hbCtx.state.firstTickAt - startedAt : -1} firstActivityLagMs=${hbCtx.state.firstActivityAt > 0 ? hbCtx.state.firstActivityAt - startedAt : -1} everSawMsg=${hbCtx.state.everSawMsg} everSawTool=${hbCtx.state.everSawTool} toolsMaxInFlight=${hbCtx.state.toolsMaxInFlight} trace=[${hbCtx.state.activityTrace.join(",")}] ${repoStateText()} ${machineStateText()}`;
         const headline = "⚠️ Sub-agent was cut — process exited mid-tool / no life signs. Partial results below — parent should decide: accept, re-dispatch, or escalate.";
         doResolve(
@@ -4368,8 +5012,14 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
       // non-zero exit (cls === "failed"), and a SUCCESS-but-SILENT child that
       // exited 0 with empty stdout and no sessionEnded. Recording the latter
       // as `reason: "failed"` with `exitCode: 0` would be self-contradictory,
-      // so the label distinguishes them (`clean-empty`) — the payload itself
-      // is unchanged.
+      // so the label distinguishes them (`clean-empty`).
+      //
+      // ⛔ DOCUMENTED CLAIM, CORRECTED (review round 10, P3): this used to add "— the payload itself
+      // is unchanged". The payload IS what this PR changes on this arm: a silent child with zero
+      // content-bearing turns is reclassified `died-before-first-message` with `isError: true`. Only
+      // the LABEL is chosen here; `doResolve` derives BOTH the payload's status and the ledger row's
+      // reason from the same measurement, so `clean-empty` is reserved for the silent settle that is
+      // NOT a proven death.
       const output = stdout.trim();
       const text = output || stderrClean || `Sub-agent exited with code ${code}`;
       const extra = output ? (stderrClean ? `\n\n--- stderr ---\n${stderrClean}` : "") : "";
@@ -4389,6 +5039,17 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
     // condition is per-dispatch, not per-tick — an unlatched warn would spam
     // every 10s decision tick).
     let cutInertWarned = false;
+    // #1339: rate-limited log for the stale-decision suppression below. The
+    // condition can recur every tick while a child ticks slowly under a load
+    // storm (each tick's probe is awaited, and each tick the marker lands inside
+    // it), so an unlatched log would spam the parent's stderr on every tick —
+    // but a permanent one-shot hides exactly the recurrence the parent must see
+    // (#1339 review). One line per minute of continuous suppression, carrying
+    // the running count, is the bounded middle: the sibling `networkSuppressLogged`
+    // re-arms on transition for the same reason.
+    const STALE_SUPPRESS_RELOG_MS = 60_000;
+    let staleSuppressCount = 0;
+    let staleSuppressLoggedAt = 0;
     // #318: network-aware kill suppression — before honoring a stall-kill,
     // probe connectivity to the sub-agent's provider. When the network is
     // unreachable and the child is alive (fresh heartbeat markers), the
@@ -4544,6 +5205,67 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
       // the kill path against a settled/exited child — treeKill on a
       // recycled pid would signal an unrelated process tree (#318 review).
       if (settled || proc.exitCode !== null) return;
+      // #1339: the SAME window, asked about EVIDENCE rather than about the
+      // promise. `decision` was computed from a snapshot at `now`; the probe was
+      // awaited after it, so the child's `data` handlers have had the event loop
+      // and may have stamped a marker or a byte AFTER that snapshot. Evidence
+      // newer than the snapshot disproves the verdict's premise ("this child is
+      // not making progress") and must never be executed on: re-decide on the
+      // next 10 s tick with the evidence the child actually produced. Measured
+      // false kill this fixes: `no life signs for -1s (marker gap exceeded
+      // 113s)`, `lastMarkerAgeMs=-532`, load1=190.62 — the child was ticking
+      // while the kill ran (session `01a1a95c`, 2026-11-05T02:16:58Z).
+      //
+      // `max-dispatch` is exempt: it is a declared WALL-CLOCK policy cap, not an
+      // inference about progress, so a fresh byte does not make the dispatch
+      // younger. Every other reason is a liveness inference, and each is
+      // re-validated against the clock THAT CLAUSE READS (`supersedingEvidence`:
+      // `no-progress` is measured on `lastProgressAt`, which ticks and bytes do
+      // NOT advance, so a marker inside the window cannot refute it).
+      //
+      // Fail-safe by construction: a genuinely wedged child emits nothing, so
+      // neither channel moves and the next tick kills on the same evidence. A
+      // child that keeps producing evidence IS the refutation — that is the whole
+      // point. The bound on the SUPPRESSION is `TASK_HARD_CAP_MS`, NOT the
+      // clause's own bound: deferring that bound is exactly what a suppression
+      // does, and the hard cap is enforced by its own timer outside this path
+      // (#1339 cycle-4 review — "bounded by its own clause" was the over-claim).
+      const supersededBy =
+        decision.reason === "max-dispatch"
+          ? null
+          : supersedingEvidence(decision.reason, now, {
+              lastMarkerAt: hbCtx.state.lastMarkerAt,
+              lastLifeSignAt: lastHeartbeat,
+              lastProgressAt: hbCtx.state.lastProgressAt,
+              startedAt,
+              sessionEnded: hbCtx.state.sessionEnded,
+              toolsInFlight: hbCtx.state.toolsInFlight,
+            });
+      if (supersededBy) {
+        staleSuppressCount += 1;
+        if (staleSuppressLoggedAt === 0 || now - staleSuppressLoggedAt >= STALE_SUPPRESS_RELOG_MS) {
+          staleSuppressLoggedAt = now;
+          // Stated as "how much newer on the channel that actually fired", never
+          // as an age and never for a channel that did not move: a negative age
+          // is what made this bug unreadable in the first place (#1339). The two
+          // SCOPE channels have no timed delta, so they carry a label instead of
+          // a fabricated `+0ms`.
+          const evidenceDelta =
+            supersededBy === "marker"
+              ? hbCtx.state.lastMarkerAt - now
+              : supersededBy === "bytes"
+                ? lastHeartbeat - now
+                : supersededBy === "progress"
+                  ? (hbCtx.state.lastProgressAt > 0 ? hbCtx.state.lastProgressAt : startedAt) - now
+                  : null;
+          const evidence = evidenceDelta === null ? supersededBy : `${supersededBy} +${evidenceDelta}ms`;
+          console.error(
+            `[task] ${decision.reason ?? "stall"} kill suppressed — the verdict was refuted AFTER the decision snapshot ` +
+              `(${evidence} relative to the snapshot; ${staleSuppressCount} suppression(s) this dispatch); re-deciding on the next tick (#1339)`,
+          );
+        }
+        return;
+      }
       clearInterval(heartbeat);
       // #208: treeKill — the direct child's grandchildren (nested pi, MCP
       // server pairs) would otherwise survive as orphans holding worktrees.
@@ -4562,7 +5284,28 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
         return;
       }
 
-      const markerAgeMs = hbCtx.state.lastMarkerAt > 0 ? now - hbCtx.state.lastMarkerAt : -1;
+      // #1339: the DECISION's snapshot, not a post-await re-read of the live
+      // state — the probe may have moved it, which is exactly how the payload
+      // came to print a NEGATIVE age beside a 951 s verdict. Both readings are
+      // clamped through `readMarkerAge`.
+      const liveMarkerAge = readMarkerAge(hbCtx.state.lastMarkerAt, now);
+      const markerAgeMs = liveMarkerAge.ageMs;
+      const decMarkerAgeMs = decision.markerAgeMs ?? -1;
+      // #1339 review P2: `readMarkerAge` documents `invalid` as "reported for the
+      // caller to log" — this is the caller. Without it a CLAMPED age prints as
+      // an ordinary `0` and is indistinguishable from a marker that landed
+      // exactly now, which is the same unreadability that hid the original bug.
+      const decMarkerAgeInvalid = decision.markerAgeInvalid === true;
+      // …and the DECISION's flag alone is not enough (#1339 cycle-4 review). The
+      // decision-time read is taken before any yield — nothing can stamp a marker
+      // or output between the tick's `now` and the synchronous
+      // `heartbeatKillDecision` call — so that read can only be invalid if the
+      // WALL CLOCK stepped backwards. The clamped case this diagnostic exists for
+      // happens on the LIVE read above, taken AFTER the awaited probe, where a
+      // marker or byte ingested in the window is newer than `now`. Reporting only
+      // the decision's flag therefore prints "valid" beside precisely the clamped
+      // live age it exists to expose, one layer in from the original bug.
+      const lastMarkerAgeInvalid = liveMarkerAge.invalid;
       // #1070 item 1, applied to the HEADLINE as well as the payload. The
       // clauses below fire on the EFFECTIVE ages (`effStreamAge`/`effToolAge`
       // in heartbeatKillDecision = the frozen sample + markerAge), and §6 of
@@ -4578,7 +5321,7 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
       // therefore labelled apart, exactly as `streamAgeMs`/`effStreamAgeMs` above
       // already are: `toolCpuStallMs` is the live sample, `decToolCpuStallMs` is
       // the value the DECISION actually used.
-      const aliveSummary = `Alive state: toolsInFlight=${hbCtx.state.toolsInFlight} turnActive=${hbCtx.state.turnActive} streamAgeMs=${hbCtx.state.streamAgeMs} effStreamAgeMs=${effStreamAgeMs} toolAgeMaxMs=${hbCtx.state.toolAgeMaxMs} effToolAgeMs=${effToolAgeMs} toolCpuMs=${hbCtx.state.toolCpuMs} toolCpuStallMs=${hbCtx.state.toolCpuStallMs} toolCpuAdvanced=${hbCtx.state.toolCpuAdvanced} decToolCpuStallMs=${decision.toolCpuStallMs ?? -1} everSawRealActivity=${hbCtx.state.everSawRealActivity} lastMarkerAgeMs=${markerAgeMs} tickCount=${hbCtx.state.tickCount} markerCount=${hbCtx.state.markerCount} firstMarkerLagMs=${hbCtx.state.firstMarkerAt > 0 ? hbCtx.state.firstMarkerAt - startedAt : -1} firstTickLagMs=${hbCtx.state.firstTickAt > 0 ? hbCtx.state.firstTickAt - startedAt : -1} firstActivityLagMs=${hbCtx.state.firstActivityAt > 0 ? hbCtx.state.firstActivityAt - startedAt : -1} everSawMsg=${hbCtx.state.everSawMsg} everSawTool=${hbCtx.state.everSawTool} toolsMaxInFlight=${hbCtx.state.toolsMaxInFlight} trace=[${hbCtx.state.activityTrace.join(",")}] ${repoStateText()} ${machineStateText()}`;
+      const aliveSummary = `Alive state: toolsInFlight=${hbCtx.state.toolsInFlight} turnActive=${hbCtx.state.turnActive} streamAgeMs=${hbCtx.state.streamAgeMs} effStreamAgeMs=${effStreamAgeMs} toolAgeMaxMs=${hbCtx.state.toolAgeMaxMs} effToolAgeMs=${effToolAgeMs} toolCpuMs=${hbCtx.state.toolCpuMs} toolCpuStallMs=${hbCtx.state.toolCpuStallMs} toolCpuAdvanced=${hbCtx.state.toolCpuAdvanced} decToolCpuStallMs=${decision.toolCpuStallMs ?? -1} decMarkerAgeMs=${decMarkerAgeMs} decMarkerAgeInvalid=${decMarkerAgeInvalid} lastMarkerAgeInvalid=${lastMarkerAgeInvalid} everSawRealActivity=${hbCtx.state.everSawRealActivity} lastMarkerAgeMs=${markerAgeMs} tickCount=${hbCtx.state.tickCount} markerCount=${hbCtx.state.markerCount} firstMarkerLagMs=${hbCtx.state.firstMarkerAt > 0 ? hbCtx.state.firstMarkerAt - startedAt : -1} firstTickLagMs=${hbCtx.state.firstTickAt > 0 ? hbCtx.state.firstTickAt - startedAt : -1} firstActivityLagMs=${hbCtx.state.firstActivityAt > 0 ? hbCtx.state.firstActivityAt - startedAt : -1} everSawMsg=${hbCtx.state.everSawMsg} everSawTool=${hbCtx.state.everSawTool} toolsMaxInFlight=${hbCtx.state.toolsMaxInFlight} trace=[${hbCtx.state.activityTrace.join(",")}] ${repoStateText()} ${machineStateText()}`;
       const headlines: Record<string, string> = {
         "silence-threshold": `⚠️ Sub-agent reached silence threshold (${HEARTBEAT_TIMEOUT_MS / 1000}s). Partial results below — parent should decide: accept, re-dispatch, or escalate.`,
         // #5389 — the headline names the evidence on BOTH channels, because the
@@ -4600,7 +5343,7 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
         // indistinguishable here — rather than asserting a cause the parent
         // cannot prove, which is the same discipline clause 1's headline uses.
         "no-progress": `⛔ Sub-agent completed no work for ${Math.round((decision.progressAgeMs ?? hbThresholds.progressAgeMs) / 1000)}s with no tool in flight (bound ${Math.round(hbThresholds.progressAgeMs / 1000)}s, TASK_PROGRESS_AGE_MS) — a content-free loop or a stalled stream; the two are indistinguishable from here. Partial results below — parent should decide: accept, re-dispatch, or escalate.`,
-        "cut": `⚠️ Sub-agent was cut — no life signs for ${Math.round(markerAgeMs / 1000)}s (marker gap exceeded ${Math.round(effCutGapMs / 1000)}s). Partial results below — parent should decide: accept, re-dispatch, or escalate.`,
+        "cut": `⚠️ Sub-agent was cut — no life signs for ${Math.round(decMarkerAgeMs / 1000)}s (marker gap exceeded ${Math.round(effCutGapMs / 1000)}s) — the age the DECISION read; the live read beside it is lastMarkerAgeMs. Partial results below — parent should decide: accept, re-dispatch, or escalate.`,
       };
       // #282: first-message-stall triage line — every clause-4 kill is a
       // never-worked session by construction (#279 gate); record the run's
@@ -4640,7 +5383,16 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
       const backstopFire = () => {
         if (settled) return;
         const now = Date.now();
-        const markerAge = hbCtx.state.lastMarkerAt > 0 ? now - hbCtx.state.lastMarkerAt : Infinity;
+        // #1339 cycle-4 review (P3, pre-existing): this was the last hand-rolled
+        // marker age in the file, and it could go NEGATIVE — `lastMarkerAt > now`
+        // whenever a marker is ingested between the timer's `now` and this read —
+        // i.e. it compared a THRESHOLD (`freshWindowMs`) against an uncomputable
+        // age, contradicting `readMarkerAge`'s "never compared against a
+        // threshold". Fail-safe either way (a clamped 0 keeps `stateFresh` true,
+        // exactly as the negative raw value did), but the single-reader invariant
+        // is only true if this site goes through it too; `-1` = never.
+        const backstopMarkerAge = readMarkerAge(hbCtx.state.lastMarkerAt, now).ageMs;
+        const markerAge = backstopMarkerAge < 0 ? Infinity : backstopMarkerAge;
         const stateFresh = hbCtx.state.lastMarkerAt > 0 && markerAge <= freshWindowMs;
         if (stateFresh) {
           // healthy ticking agent — exempt by construction; re-arm for
@@ -4656,7 +5408,7 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
           doResolve(undefined, { sweep: true, reason: "backstop" });
           return;
         }
-        const markerAgeMs = hbCtx.state.lastMarkerAt > 0 ? now - hbCtx.state.lastMarkerAt : -1;
+        const markerAgeMs = readMarkerAge(hbCtx.state.lastMarkerAt, now).ageMs;
         const aliveSummary = `Alive state: toolsInFlight=${hbCtx.state.toolsInFlight} turnActive=${hbCtx.state.turnActive} streamAgeMs=${hbCtx.state.streamAgeMs} effStreamAgeMs=${hbCtx.state.streamAgeMs + (markerAgeMs > 0 ? markerAgeMs : 0)} toolAgeMaxMs=${hbCtx.state.toolAgeMaxMs} effToolAgeMs=${hbCtx.state.toolAgeMaxMs + (markerAgeMs > 0 ? markerAgeMs : 0)} toolCpuMs=${hbCtx.state.toolCpuMs} toolCpuStallMs=${hbCtx.state.toolCpuStallMs} toolCpuAdvanced=${hbCtx.state.toolCpuAdvanced} everSawRealActivity=${hbCtx.state.everSawRealActivity} lastMarkerAgeMs=${markerAgeMs} tickCount=${hbCtx.state.tickCount} markerCount=${hbCtx.state.markerCount} firstMarkerLagMs=${hbCtx.state.firstMarkerAt > 0 ? hbCtx.state.firstMarkerAt - startedAt : -1} firstTickLagMs=${hbCtx.state.firstTickAt > 0 ? hbCtx.state.firstTickAt - startedAt : -1} firstActivityLagMs=${hbCtx.state.firstActivityAt > 0 ? hbCtx.state.firstActivityAt - startedAt : -1} everSawMsg=${hbCtx.state.everSawMsg} everSawTool=${hbCtx.state.everSawTool} toolsMaxInFlight=${hbCtx.state.toolsMaxInFlight} trace=[${hbCtx.state.activityTrace.join(",")}] ${repoStateText()} ${machineStateText()}`;
         doResolve(composeAbnormalExit(
           { model, provider, killed: true, reason: "cut", backstop: true, heartbeatTimeout: HEARTBEAT_TIMEOUT_MS },
@@ -4780,7 +5532,7 @@ type TaskResultDetails = {
  * legitimises `DEFAULT_TOOL_STALL_MS` in §6. Dropping the keyword does not
  * weaken the set; it silently re-reds that contract as "documented but read by
  * nothing", which reads as a phantom knob to whoever hits it next. */
-export const FAILED_TASK_STATUS = new Set(["failed", "circuit_open", "invalid-cwd", "invalid-session-id", "fleet-saturated"]);
+export const FAILED_TASK_STATUS = new Set(["failed", "circuit_open", "invalid-cwd", "invalid-session-id", "fleet-saturated", "died-before-first-message"]);
 
 // ── #1662: background dispatch (returns-early) + status/collect seam ────────
 //
@@ -5205,8 +5957,12 @@ export function formatCollectedRunHead(view: TaskCollectView): string {
   return `${icon} Background run ${view.run_id} finished — status: ${view.status}${exit}${view.reason ? ` [${view.reason}]` : ""}`;
 }
 
-/** Map a settled `spawnSubAgent` result to a terminal run status. */
-function classifyBackgroundOutcome(
+/** Map a settled `spawnSubAgent` result to a terminal run status.
+ *
+ * Exported for its own suite: it is pure, and the arm ORDER below is the fix (review round 9, P3) —
+ * without a direct test, reverting the order silently records a child that ran and died as
+ * `reason: "spawn-error"` ("pi never started") with nothing reddening. */
+export function classifyBackgroundOutcome(
   result: { content: any[]; details: Record<string, unknown> } | undefined,
 ): { status: TaskRunStatus; exitCode: number | null; reason?: string } {
   if (result === undefined) return { status: "failed", exitCode: null, reason: "zero-output" };
@@ -5215,11 +5971,15 @@ function classifyBackgroundOutcome(
   if (d.killed === true) {
     return { status: "cut", exitCode, reason: typeof d.reason === "string" ? d.reason : "killed" };
   }
-  if (d.isError === true) {
-    return { status: "failed", exitCode, reason: typeof d.reason === "string" ? d.reason : "spawn-error" };
-  }
+  // #1208 review (P3): the STATUS arm must precede the `isError` arm. A background lane that died
+  // before its first message carries BOTH, and testing `isError` first recorded it as
+  // `reason: "spawn-error"` — which this module documents as "pi never started". A child that ran
+  // and died is not a spawn error, and the durable record would name the wrong cause.
   if (typeof d.status === "string" && FAILED_TASK_STATUS.has(d.status)) {
     return { status: "failed", exitCode, reason: d.status };
+  }
+  if (d.isError === true) {
+    return { status: "failed", exitCode, reason: typeof d.reason === "string" ? d.reason : "spawn-error" };
   }
   if (typeof exitCode === "number" && exitCode !== 0) {
     return { status: "failed", exitCode, reason: "non-zero-exit" };
@@ -5469,7 +6229,11 @@ export function buildBackgroundDispatchResult(handle: BackgroundDispatchHandle):
     // flips the dispatch to `isError`.
     return {
       content: handle.refusal.content as Array<{ type: string; text: string }>,
-      details: { ...handle.refusal.details, background: true },
+      // #1208: a refused background dispatch never created a child — say so in the field set rather
+      // than leaving it absent (review round 2, P3: this arm carried none of the keys, which made the
+      // exported "present on every `task` result" contract false for the one arm whose subject is a
+      // child that is still running).
+      details: stampLivenessDefaults({ ...handle.refusal.details, background: true }),
     };
   }
   return {
@@ -5488,7 +6252,7 @@ export function buildBackgroundDispatchResult(handle: BackgroundDispatchHandle):
         `Reap:  task_collect({ run_id: "${handle.run_id}" }) → final message + exit status\n\n` +
         `⚠️ REVIEW GATE IS A PARENT STEP (#825): the child runs with AGENT_SKIP_REVIEW_GATE=1 and cannot review itself. After task_collect returns a terminal result, run the review ceremony for this lane BEFORE treating it as complete.`,
     }],
-    details: {
+    details: stampLivenessDefaults({
       run_id: handle.run_id,
       pid: handle.pid,
       pgid: handle.pgid,
@@ -5497,7 +6261,25 @@ export function buildBackgroundDispatchResult(handle: BackgroundDispatchHandle):
       background: true,
       record_persisted: handle.record_persisted,
       review_gate: handle.review_gate,
-    },
+      // #1208: this dispatch's child IS the pid the handle carries, and it has not
+      // exited — the blocking path's `never-started` default would be a false claim
+      // on the arm that exists precisely because the child is alive.
+      //
+      // ⛔ BUT ONLY WHEN THERE IS A PID (review round 5, P3). `handle.pid` comes from
+      // `observers.onSpawn({ pid: proc.pid ?? null })` and `proc.pid` is `undefined`
+      // SYNCHRONOUSLY when the exec itself fails (measured: `spawn('/definitely/not/here')`
+      // yields `pid: undefined` then an `ENOENT` `error` event), and the pre-spawn refusals
+      // above cannot cover it — they are checked before `spawn()` is reached. Stamping
+      // `childState: "running"` there produced `{ childPid: null, childState: "running",
+      // childExited: false }`: the exact self-contradiction the field set exists to prevent,
+      // and it claimed a live child on a box where none was ever created. `null`/`never-started`
+      // is the same claim `stampLivenessDefaults` makes, and the text above already tolerates it
+      // (`pid: ${handle.pid ?? "unknown"}`).
+      childPid: handle.pid,
+      childState: handle.pid === null ? "never-started" : "running",
+      childExited: handle.pid === null ? null : false,
+      childMessagesSent: null,
+    }),
   };
 }
 
@@ -6124,13 +6906,16 @@ export default function (pi: ExtensionAPI) {
           })
         : { leg: { provider, model }, halted: false, hop: null, family: undefined };
       if (failoverResolution.halted) {
-        return haltDispatchResult({
+        // #1208: a PRE-SPAWN halt never created a child, so the liveness field set says exactly
+        // that (`never-started`, pid null) rather than being absent — see stampLivenessDefaults.
+        const halt = haltDispatchResult({
           family: failoverResolution.family!,
           provider,
           model,
           reason: failoverResolution.haltReason ?? "halt",
           state: readLatchState(subAgentEnv),
         });
+        return { ...halt, details: stampLivenessDefaults(halt.details) };
       }
       const family = failoverResolution.family; // undefined = not a chain member
       let dispatchLeg: LegRef = failoverResolution.leg;
@@ -6188,29 +6973,41 @@ export default function (pi: ExtensionAPI) {
           const msg = err instanceof Error ? err.message : String(err);
           return {
             content: [{ type: "text", text: `❌ Sub-agent dispatch refused: invalid child session id — ${msg}` }],
-            details: { model, provider, status: "invalid-session-id", retryable: false, error: msg },
+            details: stampLivenessDefaults({ model, provider, status: "invalid-session-id", retryable: false, error: msg }),
           };
         }
       }
-      type DispatchPayload = { content: any[]; details: Record<string, unknown> };
+      type DispatchPayload = { content: any[]; details: Record<string, unknown>; isError?: boolean };
+      // #1208: EVERY `task` result carries the liveness field set — including the arms where no
+      // child ever existed (a pre-spawn refusal / provider halt) and the arm the retry wrapper
+      // produces after every attempt resolved with no output. Those get `never-started` / `null`,
+      // which is a DIFFERENT claim from a measured one and must not be absent (review of this PR,
+      // P2: the field set was documented as present on every result while the tool-level arms —
+      // including the issue's own "child killed with no output" path — carried none).
+      const stampToolLiveness = (value: DispatchPayload): DispatchPayload => ({
+        ...value,
+        details: stampLivenessDefaults(value.details ?? {}),
+      });
       // #783 Task 1: a dispatch that could not persist a transcript is still a
       // dispatch (the tool result is real), but the degradation must be
       // visible AND non-retryable — a retry cannot fix an unwritable root.
       const withSessionDegraded = (value: DispatchPayload): DispatchPayload =>
-        sessionRootStatus.ok
-          ? value
-          : {
-              ...value,
-              details: {
-                ...value.details,
-                sessionDegraded: {
-                  reason: "task-session-root-unwritable",
-                  error: sessionRootStatus.error ?? "unknown",
-                  root: sessionRootStatus.root,
-                  retryable: false,
+        stampToolLiveness(
+          sessionRootStatus.ok
+            ? value
+            : {
+                ...value,
+                details: {
+                  ...value.details,
+                  sessionDegraded: {
+                    reason: "task-session-root-unwritable",
+                    error: sessionRootStatus.error ?? "unknown",
+                    root: sessionRootStatus.root,
+                    retryable: false,
+                  },
                 },
               },
-            };
+        );
       const buildArgs = (leg: LegRef): string[] =>
         ["-p", "--provider", leg.provider, "--model", leg.model, ...childSessionArgs(), params.prompt];
       // #783 Task 4: per-ATTEMPT record identity. `retry()` passes the attempt
@@ -6225,8 +7022,13 @@ export default function (pi: ExtensionAPI) {
         parentSessionId,
         dispatchClass,
       });
+      // #1208 (review round 2, P2): the LAST settle's measured liveness. A zero-output kill resolves
+      // `undefined`, so the payload that would have carried this evidence does not exist — the
+      // observer is how it reaches the terminal result the retry wrapper composes instead.
+      let lastLiveness: TaskChildLivenessSnapshot | null = null;
+      const livenessObserver: SpawnObservers = { onLiveness: (snap) => { lastLiveness = snap; } };
       const spawnLeg = (leg: LegRef, attempt = 1) =>
-        spawnSubAgent(leg.model, leg.provider, subAgentEnv, buildArgs(leg), signal, recordCtx(attempt), params.cwd, dispatchStreamStallMs);
+        spawnSubAgent(leg.model, leg.provider, subAgentEnv, buildArgs(leg), signal, recordCtx(attempt), params.cwd, dispatchStreamStallMs, livenessObserver);
 
       // #1662: returns-early BACKGROUND dispatch. Everything above — provider
       // resolution, the failover leg, child session, env, heartbeat nonce — is
@@ -6272,7 +7074,7 @@ export default function (pi: ExtensionAPI) {
       if (sessionIdError) {
         return {
           content: [{ type: "text", text: `❌ Sub-agent dispatch refused: invalid child session id — ${sessionIdError}` }],
-          details: { model, provider, status: "invalid-session-id", retryable: false, error: sessionIdError },
+          details: stampLivenessDefaults({ model, provider, status: "invalid-session-id", retryable: false, error: sessionIdError }),
         };
       }
 
@@ -6332,16 +7134,19 @@ export default function (pi: ExtensionAPI) {
         // four post-spawn returns so the caller can see that. (The pre-spawn
         // halt above is deliberately NOT wrapped — the root is untouched
         // there.)
-        return withSessionDegraded(
-          haltDispatchResult({
-            family: loopOut.halted.family,
-            provider: loopOut.halted.provider,
-            model: loopOut.halted.model,
-            reason: loopOut.halted.reason,
-            state: readLatchState(subAgentEnv),
-            attempted: true,
-          }),
-        );
+        // #1208 (review round 3, P2): a POST-spawn halt ran a real child ("the dispatch ran on
+        // <provider>/<model> and exhausted it"), so it must carry the MEASURED liveness rather than
+        // the tool layer's `never-started` default — otherwise a consumer reads "no child existed,
+        // fix the arguments" for a dispatch that spawned, ran and exhausted a child.
+        const halt = haltDispatchResult({
+          family: loopOut.halted.family,
+          provider: loopOut.halted.provider,
+          model: loopOut.halted.model,
+          reason: loopOut.halted.reason,
+          state: readLatchState(subAgentEnv),
+          attempted: true,
+        });
+        return withSessionDegraded({ ...halt, details: { ...(lastLiveness ?? {}), ...halt.details } });
       }
       result = loopOut.result;
       dispatchLeg = loopOut.dispatchLeg;
@@ -6375,7 +7180,7 @@ export default function (pi: ExtensionAPI) {
         const buildFbArgs = (): string[] =>
           ["-p", "--provider", fallbackProvider, "--model", fallbackModel, ...childSessionArgs(), params.prompt];
         const fbResult = await retry(
-          (attempt) => spawnSubAgent(fallbackModel, fallbackProvider, subAgentEnv, buildFbArgs(), signal, recordCtx(attempt), params.cwd, dispatchStreamStallMs),
+          (attempt) => spawnSubAgent(fallbackModel, fallbackProvider, subAgentEnv, buildFbArgs(), signal, recordCtx(attempt), params.cwd, dispatchStreamStallMs, livenessObserver),
           retryOptions,
         );
         if (fbResult.status === "success" && fbResult.value) {
@@ -6399,16 +7204,67 @@ export default function (pi: ExtensionAPI) {
       }
 
       if (result.status === "circuit_open") {
+        const breakerNeverSpawned = result.retries === 0;
         return withSessionDegraded({
           content: [{ type: "text", text: "❌ Sub-agent circuit breaker open — too many consecutive zero-output failures. Wait 60s before retrying." }],
-          details: { model, provider, status: "circuit_open", retries: result.retries },
+          // #1208 (review round 3, P2): the half-open path that reaches this arm had a REAL child
+          // run, so the measurement is available and must be used — gated on the file's EXISTING
+          // never-spawned discriminator (`retries === 0`).
+          //
+          // ⛔ WHAT THE GATE ACTUALLY BUYS (review round 5, P3 — this comment claimed the pre-spawn
+          // refusal "keeps the exact key set", which is FALSE): the tool-level stamp this payload
+          // passes through (`stampToolLiveness` → `stampLivenessDefaults`) adds all four liveness
+          // keys unconditionally, so a never-spawned breaker's payload DOES carry them. What the
+          // discriminator preserves is their VALUE: because the spread is empty at `retries === 0`,
+          // the stamp fills `childPid: null, childState: "never-started", childExited: null,
+          // childMessagesSent: null` — a refusal, not a measured snapshot. At `retries > 0` the
+          // spread wins and the half-open path keeps the measurement it actually took.
+          details: {
+            ...(breakerNeverSpawned ? {} : (lastLiveness ?? {})),
+            model,
+            provider,
+            status: "circuit_open",
+            retries: result.retries,
+          },
         });
       }
 
       if (result.status === "failed") {
+        // #1208 ask 4: NON-ZERO by default. `status: "failed"` is a machine
+        // field the review floor reads, but the MODEL saw an ordinary successful
+        // tool call whose text happened to say "failed" — so a parent's default
+        // handling was to keep going on a dispatch that never produced a
+        // terminal message. `isError` is what makes the default handling stop;
+        // `details.isError` is the same fact in the load-order-independent form
+        // `shared/spawn-capacity.ts` reads.
+        //
+        // #1208 (review round 2, P2): a child DID run — the last settle measured
+        // its pid and its message count — so the terminal result names the
+        // MEASURED state rather than the tool layer's `never-started` default.
+        // `null` (no heartbeat evidence) keeps `failed`, because "no attempt ever
+        // produced a message" is not provable there.
+        //
+        // ⛔ `childMessagesSent === 0` IS NOT NAMED AS THE DEATH ON THIS ARM (review
+        // round 8, P3 — the sentence that stood here claimed it was, and that was
+        // false). Every settle that reaches this arm is a watchdog kill, so
+        // `childState` is always `"killed"` and `exhaustionStatusFor` answers
+        // `failed` for it — which is the round-4 rule: a kill's remedy is "raise the
+        // bound", never "re-dispatch it". `exhaustionStatusFor`'s
+        // `died-before-first-message` branch is a fail-closed guard for a settle
+        // shape this arm does not currently receive.
+        const snap = lastLiveness as TaskChildLivenessSnapshot | null;
         return withSessionDegraded({
           content: [{ type: "text", text: `❌ Sub-agent failed after ${result.retries} attempts with no output. Model may be hung or overloaded.` }],
-          details: { model, provider, status: "failed", retries: result.retries, elapsedMs: result.elapsedMs },
+          details: {
+            model,
+            provider,
+            status: exhaustionStatusFor(snap),
+            retries: result.retries,
+            elapsedMs: result.elapsedMs,
+            isError: true,
+            ...(snap ?? {}),
+          },
+          isError: true,
         });
       }
 
