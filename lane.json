@@ -1,0 +1,21 @@
+{
+  "artifacts": [],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 7800,
+  "exit_code": null,
+  "heartbeat_at": 1794238601,
+  "host": "cmux",
+  "issue": 666666,
+  "kind": "fixer",
+  "lane_id": "cmux.kfixer-666666-1794238601-p3775662-43349cbd",
+  "lease_until": 1794246401,
+  "pid": 3775662,
+  "reason": null,
+  "repo": "daniel-ospina/agent-infra",
+  "schema": 1,
+  "started_at": 1794238601,
+  "state": "RUNNING",
+  "tag": "666666",
+  "worktree": "/tmp/xb-crossbox-repo.3682324"
+}
