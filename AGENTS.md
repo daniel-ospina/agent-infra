@@ -649,18 +649,21 @@ is a *different* directory (`/var/folders/…` on macOS) with its own cleanup po
 fine for a message file that lives seconds, **not** durable for a worktree or a plan.
 
 - **⛔ On a CELL, "under `/tmp`" is not the test — the durable ROOT is.** The cells keep their home under
-`/tmp` (`HOME=/tmp/cell-home`, checkout `/tmp/cell-t3` — `docs/ops/disk-consumers.md:31-33`), so both roots
-prescribed below are *themselves* under `/tmp` there and a bare "never under `/tmp`" is unsatisfiable. The
-durable roots on a cell are `CELL_HOME`, the cell's own repo checkout, and `$AGENT_INFRA_PATH` — the same
-set `docs/ops/controller-service.md:78-82` accepts, having recorded that "under `/tmp`" "alone cannot be
-the rule without blocking every cell bring-up". So never `/tmp/wt-*` on a cell either, but
+`/tmp` (`HOME=/tmp/cell-home`, with the checkouts also there — `/tmp/cell-t3` is the tortoise tree and
+`/tmp/cell-ai` the agent-infra one — `docs/ops/disk-consumers.md:31-33,42,46`), so both roots prescribed
+below are *themselves* under `/tmp` there and a bare "never under `/tmp`" is unsatisfiable. The durable
+roots on a cell are `CELL_HOME`, the cell's own repo checkout, and `$AGENT_INFRA_PATH` — the same set
+`docs/ops/controller-service.md:78-82` accepts, having recorded that "under `/tmp`" "alone cannot be the
+rule without blocking every cell bring-up". So never `/tmp/wt-*` on a cell either, but
 `<cell-repo>/.worktrees/<type>/<name>` is durable **because it is the cell's working filesystem**, not
 because it escapes `/tmp`.
 
-- **Worktrees go inside the repo**: `<repo>/.worktrees/<type>/<name>` (gitignored, survives what the OS
-does to `/tmp`). Never `/tmp/wt-*`, `/private/tmp/wt-*` or `$TMPDIR/wt-*`. Measured twice in one session
-(2026-10-12→13): `/tmp/wt-agent-infra` and `/tmp/wt-7860` vanished under live lanes, and the dispatch then
-failed `ENOENT (spawn cwd: …)` — a lost *directory* reported as a spawn bug (#1698).
+- **Worktrees go inside the repo**: `<repo>/.worktrees/<type>/<name>` — on a cell, durable **because the
+repo IS the cell's working filesystem** (see the carve-out above; the repo is itself under `/tmp` there,
+so this bullet does not claim it escapes the sweep), and elsewhere because it is outside `$TMPDIR`. Never
+`/tmp/wt-*`, `/private/tmp/wt-*` or `$TMPDIR/wt-*`. Measured twice in one session (2026-10-12→13):
+`/tmp/wt-agent-infra` and `/tmp/wt-7860` vanished under live lanes, and the dispatch then failed `ENOENT
+(spawn cwd: …)` — a lost *directory* reported as a spawn bug (#1698).
 - **Durable artifacts** — the plan, the problem statement, review findings, a note you will still need —
 belong in `~/.pi/agent/state/`, the repo, or **the issue itself**. A `/tmp/*.md` is not recoverable from
 git because it was never committed; that is the same reasoning the commit-message rule above already
