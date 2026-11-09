@@ -4862,9 +4862,10 @@ gh_limit_recorded_until() {
 # `reset` only for `kind=primary` (or a `retry-after` window), and `now+BASE_WAIT` — 60 s — for a
 # `secondary`/`unclassified` one. A `NO_WAIT` refusal, which is the shape the sweeps now get, has no
 # headers to classify, so it IS `secondary`/`unclassified`: its record is the now+60 floor and this
-# companion adds NOTHING on that path. What closed the "re-attempts a spent bucket once a minute" gap
-# is `GH_LIMIT_NO_WAIT` itself (the layer answers at once and the cycle's own deferral takes the
-# backoff — #2028 fix-direction #2), not this helper. The helper pays only when the last recorded CORE
+# companion adds NOTHING on that path. What `GH_LIMIT_NO_WAIT` closed is the layer's own IN-CALL sleep
+# (an attempt no longer pins a substitution for ~7 min — #2028 fix-direction #2), NOT the "re-attempts a
+# spent bucket once a minute" cadence: that deferral is the 60 s floor and the cadence is unchanged
+# (see the residual below). The helper pays only when the last recorded CORE
 # observation was a `primary`/`retry-after` refusal written by a DIFFERENT core call that did reach the
 # headers; then the window outlives this refusal and the box need not re-attempt.
 # Residual, stated rather than overstated: a `NO_WAIT` refusal defers on the 60 s floor and re-attempts

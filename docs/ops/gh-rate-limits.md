@@ -115,16 +115,18 @@ What the controller now does (`orch-loop.sh`, the `# BEGIN gh-bound` block):
   caller gets an empty body and a 124 instead of the limit it hit; `sweep_fail_kind` then reads `other`
   and the deferral is never armed. `NO_WAIT` is the repo's documented contract for a caller that owns
   its own bound (the eight heartbeat tools, `lander.sh`, `cloud-cell-supervisor.sh`): the layer records
-  the limit and answers AT ONCE, and derives its own 5 s lock budget from it, so the backoff moves to
-  the CYCLE's deferral — which is #2028's fix-direction #2 ("never sleep inside a substitution").
+  the limit and answers AT ONCE, and derives its own 5 s lock budget from it. What that closes is the
+  multi-minute in-call sleep — and the pinned substitution it caused — NOT the cadence: the attempt is
+  simply cheap now, and the box still re-attempts on the 60 s floor (see the residual below). This is
+  #2028's fix-direction #2 ("never sleep inside a substitution").
   Companion: `sweep_defer_until_recorded` takes the layer's recorded `until=` window when a refusal
   carries no headers (a `NO_WAIT` answer has no response to take them from). **Its scope, measured:**
   the layer's `marker_until` yields a real `reset` only for a `kind=primary` (or `retry-after`)
-  refusal and `now+60` for a `secondary`/`unclassified` one — and a `NO_WAIT` refusal is classified the
-  latter, so on that path the record IS the 60 s floor and the companion adds nothing. What closes the
-  once-a-minute retry is `NO_WAIT` itself; the companion pays only when the last recorded **core**
-  observation was a `primary`/`retry-after` refusal from a different core call that reached the
-  headers.
+  refusal and `now+60` for a `secondary`/`unclassified` one — and a headers-less `NO_WAIT` refusal is
+  classified the latter, so on that path the record IS the 60 s floor and the companion adds nothing;
+  that floor is also why the retry cadence does not change. The companion pays only when the last
+  recorded **core** observation was a `primary`/`retry-after` refusal from a different core call that
+  reached the headers.
 - A `GH_BOUND_S`/`GH_BOUND_TRIP` that does not parse falls back LOUDLY. `tb_timeout` answers 125 for a
   non-integer bound, so an unvalidated typo would make every `gh` call fail and take the controller dark.
 - No usable `bounded.sh` is DEGRADED, DISCLOSED and not a refusal to start (the #2320 stance): each
@@ -139,7 +141,7 @@ What the controller now does (`orch-loop.sh`, the `# BEGIN gh-bound` block):
   worse outage — but it does not claim a bound it does not have.
 - Graded by `scripts/orchestrator-harness/gh-bound.test.sh`, whose structural assertion reddens if a
   NEW **shell** `gh` command position bypasses the bound. That is the scope it can see: it matches a
-  command position in `orch-loop.sh`'s own text — including a `case`-arm arm such as `pat) gh api …`,
+  command position in `orch-loop.sh`'s own text — including a `case` arm such as `pat) gh api …`,
   which the first version of the alternation missed (review round 2) and a mutation row now guards. So
   a call hidden behind a variable, in `eval`, or inside a python heredoc is out of its reach. No such
   site exists today (independently re-derived over the file: every remaining `gh` is a string literal,

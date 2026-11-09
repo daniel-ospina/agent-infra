@@ -195,8 +195,9 @@ if need "$T/quota.sh" "the sweep-quota helper block"; then
   [ "$got" -le $(( now + 3610 )) ] && ok "sweep_defer_until: an absurd reset is capped at 1h" \
                                     || bad "sweep_defer_until returned a runaway '$got'"
   # ⛔ A BOUNDED `GH_LIMIT_NO_WAIT` REFUSAL CARRIES NO HEADERS AT ALL (agent-infra#2028 review P1).
-  # `GH_LIMIT_NO_WAIT` is what stops the in-call sleep and the once-a-minute retry; the companion below
-  # reads the layer's recorded `until=` when the response carries none. **What the record can be:**
+  # `GH_LIMIT_NO_WAIT` is what stops the in-call sleep — NOT the once-a-minute cadence, which is the
+  # floor this record's `until=` writes; the companion below reads the layer's recorded `until=` when
+  # the response carries none. **What the record can be:**
   # `marker_until` writes the real `reset` only for `kind=primary` (or a `retry-after` window) and
   # `now+BASE_WAIT` for `secondary`/`unclassified` — so BOTH shapes are graded below, and the
   # `secondary` row is the control that keeps the `primary` row from being read as a benefit on the

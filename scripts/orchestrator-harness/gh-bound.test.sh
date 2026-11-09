@@ -278,7 +278,7 @@ esac
 # bypass the bound. The pre-fix tree fails this on 16 sites; a new unbounded call site fails it too.
 # ⛔ ONE DEFINITION, TWO CALLERS (the real file and the mutation fixture below): a second copy of this
 # expression is the "pin over a COPY" shape that let the verdict-extractor pin drift from its
-# producer on this repo. The prefix set is the COMMAND-POSITION set — it includes a `case`-arm arm
+# producer on this repo. The prefix set is the COMMAND-POSITION set — it includes a `case` arm
 # (`pat) gh api … ;;`), anchored on a single token or a quoted token so a `) gh` inside a string
 # literal cannot red it (agent-infra#2028 review round 2, finding 3).
 _unbounded_scan() {
