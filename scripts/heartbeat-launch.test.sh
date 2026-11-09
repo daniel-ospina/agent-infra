@@ -175,9 +175,11 @@ assert_eq "$RC" "0" "§5b a RECYCLED pid does not block the launch (start contin
 assert_contains "$OUT" "stale pidfile" "§5b …the record is named STALE, not trusted"
 assert_contains "$OUT" "is NOT heartbeat-loop.sh" "§5b …and the reason is the identity, not the liveness"
 assert_not_contains "$OUT" "already running" "§5b …and 'already running' is NOT claimed over a stranger (§5 kept green: polarity is not 'anything alive is stale')"
-OUT="$(env HEARTBEAT_PI_AGENT_DIR="$R/agent" bash "$LAUNCH" status 2>&1)"; RC=$?
-assert_eq "$RC" "0" "§5b status still exits 0 (it is informational)"
-assert_contains "$OUT" "another process" "§5b …and its 'alive:' column says the pid is someone else, not 'yes'"
+# ⛔ NO EXIT-CODE ROW HERE (review round 3, rule-3): `cmd_status` ends `return 0` unconditionally, so
+# no mutation of this diff could redden one. The live assertion is the COLUMN — the verdict that was
+# wrong on a recycled pid.
+OUT="$(env HEARTBEAT_PI_AGENT_DIR="$R/agent" bash "$LAUNCH" status 2>&1)"
+assert_contains "$OUT" "another process" "§5b status's 'alive:' column says the pid is someone else, not 'yes'"
 
 R="$(newroot s5)"
 printf '999999\n' > "$R/agent/state/heartbeat-loop.pid"
