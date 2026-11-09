@@ -272,6 +272,72 @@ grep -qx 'camera: FREE' <<<"$OUT"
 check "F2h2 …and NOT the FREE it printed while the fallback compared raw text" \
   "$([ "$?" -ne 0 ] && echo 0 || echo 1)" "$OUT"
 
+# F2i — round 9, P3: a node in the device tree whose NAME does not match the
+# camera pattern but whose DEVICE is the camera. A root `mknod`, or a udev rule
+# that names the camera outside `video*`, produces exactly this shape. The old arm
+# compared BASENAMES, so a node reached without a resolvable path fell through as
+# innocuous and a COMPLETE census answered `FREE` over a device the process provably
+# held — the one absence-based claim this script makes, resting on a name.
+# ⛔ HONEST SCOPE OF THIS ROW: the pre-fix arm ALSO caught THIS fixture, because the
+# fixture's node is a symlink and the pre-fix `realpath` comparison followed it. The
+# P3 mutant proper — two paths, one device number, NO symlink between them — needs a
+# second device node, i.e. root `mknod` or a bind mount, so the suite cannot build it.
+# This row is therefore a live REGRESSION pin on the identity read (delete the
+# `device_identity_matches` call and it reds with FREE), not a mutant of the pre-fix
+# code. The root-only shape is declared in docs/ops/media-devices.md.
+SIDENODE="$TMP/sidenode"
+mkdir -p "$SIDENODE/dev" "$SIDENODE/proc/600/fd"
+ln -s /dev/zero "$SIDENODE/dev/video0"        # the camera
+ln -s /dev/zero "$SIDENODE/dev/camside0"      # the SAME device, another name
+ln -s "$SIDENODE/dev/camside0" "$SIDENODE/proc/600/fd/4"
+printf 'obs-camera\n' > "$SIDENODE/proc/600/comm"
+OUT="$(run_linux "$SIDENODE/proc" "$SIDENODE/dev/video*" "$ASOUND")"
+grep -q 'camera: HELD-BY(pid=600 comm=obs-camera device='"$SIDENODE"'/dev/video0 via='"$SIDENODE"'/dev/camside0)' <<<"$OUT"
+check "F2i a same-DEVICE node under a non-matching NAME is HELD-BY, never FREE" $? "$OUT"
+grep -qx 'camera: FREE' <<<"$OUT"
+check "F2i2 …and NOT the FREE the name comparison printed over a proven holder" \
+  "$([ "$?" -ne 0 ] && echo 0 || echo 1)" "$OUT"
+
+# F2j — round 9, F1: the COST of the identity read. `/dev/null`, ttys and ptys are
+# ALL character devices, so an arm that forks an interpreter per fd pays 1 + len(devs)
+# launches for essentially every record: measured at 240 python3 launches / 10.7 s on
+# this 40-pid fixture, in the verb whose whole purpose is a fast answer during an
+# incident. A cost that NO assertion varies with cannot be caught by a verdict row —
+# so this row COUNTS interpreter launches through a stub and pins the budget.
+COUNTBIN="$TMP/countbin"
+mkdir -p "$COUNTBIN"
+COUNTFILE="$TMP/python3-launches"
+: > "$COUNTFILE"
+REAL_PY="$(command -v python3 || true)"
+if [ -n "$REAL_PY" ]; then
+  cat > "$COUNTBIN/python3" <<STUB
+#!/usr/bin/env bash
+printf 'x' >> "$COUNTFILE"
+exec "$REAL_PY" "\$@"
+STUB
+  chmod +x "$COUNTBIN/python3"
+  COSTFIX="$TMP/cost"
+  mkdir -p "$COSTFIX/dev"
+  ln -s /dev/zero "$COSTFIX/dev/video0"
+  for p in $(seq 1 40); do
+    mkdir -p "$COSTFIX/proc/$p/fd"
+    printf 'bystander\n' > "$COSTFIX/proc/$p/comm"
+    ln -s /dev/null "$COSTFIX/proc/$p/fd/0"
+    ln -s /dev/null "$COSTFIX/proc/$p/fd/1"
+    ln -s /dev/null "$COSTFIX/proc/$p/fd/2"
+  done
+  OUT="$(PATH="$COUNTBIN:$PATH" MH_PLATFORM=Linux MH_PROC="$COSTFIX/proc" \
+         MH_V4L_GLOB="$COSTFIX/dev/video*" MH_ASOUND_PCM="$ASOUND" bash "$SCRIPT" 2>&1)"
+  launches="$(wc -c < "$COUNTFILE" 2>/dev/null | tr -d ' ')"
+  [ -n "$launches" ] || launches=0
+  check "F2j 120 innocuous char-device fds cost <= 5 python3 launches (got $launches)" \
+    "$([ "$launches" -le 5 ] && echo 0 || echo 1)" "$OUT"
+  grep -qx 'camera: FREE' <<<"$OUT"
+  check "F2j2 …and the answer is still FREE over that innocuous census" $? "$OUT"
+else
+  check "F2j a python3 is available to count interpreter launches" 1 "command -v python3 is empty"
+fi
+
 # ── F3 (review cycle 1) — `--ancestry --json` must survive a multi-line argv ──
 # The lane root's argv IS multi-line: `pi -p "<multi-line brief>"`. `json_str`
 # used to strip the control range and escape TAB only, so a literal LF passed

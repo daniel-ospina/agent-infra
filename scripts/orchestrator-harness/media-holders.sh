@@ -230,22 +230,64 @@ EOF
   return 0
 }
 
-# resolve_path <path> — a portable realpath. `readlink -f` is a GNU extension
-# (absent on macOS, and the portability checker flags it), and `cd … && pwd -P`
-# resolves only the DIRECTORY, not a trailing symlink — which is the hop this
-# needs. python3 ships on both platforms and `os.path.realpath` is exact.
+# ⛔ THE RESOLVER THAT USED TO LIVE HERE IS GONE, AND ITS FAILURE MODE IS NOT.
+# `resolve_path` (python3 `os.path.realpath`) compared the holder's RESOLVED PATH to
+# the globbed node's resolved path. Its first cut fell back to the path UNRESOLVED
+# (review P2), which silently reverted device identity to a path-STRING comparison:
+# a holder naming a `/dev/v4l/by-id/…` alias then matched no globbed node, was not
+# suspicious (it IS under /dev), the census was COMPLETE and `UNREADABLE` stayed 0 —
+# so the script printed **FREE over a device the process provably held**. Resolving
+# paths was always the wrong question (two nodes of one device share `st_rdev`, not
+# a path), so identity is now read as a DEVICE NUMBER — and an identity read that
+# cannot run is still an ABSTENTION, never a definitive answer.
 #
-# ⛔ IT PRINTS NOTHING AND RETURNS NON-ZERO WHEN IT CANNOT RESOLVE (review P2).
-# The first cut fell back to `printf '%s' "$1"` — the path UNRESOLVED — so a host
-# with no working `python3` silently reverted the device-identity comparison (F2,
-# review cycle 3) back to the path-STRING comparison F2 was filed to remove: a
-# holder naming a standard `/dev/v4l/by-id/…` alias then matched no globbed node,
-# was not "suspicious" (it IS under /dev), the census was COMPLETE and `UNREADABLE`
-# stayed 0 — so the script printed **FREE over a device the process provably
-# held**. An unreadable read must never be reported as a definitive answer: the
-# caller abstains instead, which is the file's whole contract.
-resolve_path() {
-  python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$1" 2>/dev/null
+# ⛔ IDENTITY IS `st_rdev`, NOT A NAME AND NOT A RESOLVED PATH (round 9, P3). The
+# "cannot attribute" arm compared the held node's BASENAME to the camera glob, so a
+# second node of the SAME major/minor — a root `mknod`, or a udev rule naming the
+# camera outside `video*` — fell through as innocuous and a complete census then
+# answered `FREE` over a device a process provably held. That is the one
+# absence-based claim this file makes, so it may not rest on a name.
+#
+# ⛔ ONE INTERPRETER LAUNCH FOR THE WHOLE CENSUS (round 9, F1). The arm it replaces
+# forked `python3` twice per character-device fd — and `/dev/null`, ttys and ptys
+# are ALL char devices — so 120 innocuous fds cost 240 interpreter launches / 10.7 s
+# on a 40-process fixture, contradicting this file's own header (`one ls -l census,
+# not one fork per fd`) in the verb whose purpose is a fast answer. `st_rdev` needs
+# no path resolution, so every character-device record is answered by ONE read.
+#
+# Prints one line per node that is NOT a different device:
+#   MATCH|<pid>|<target>|<camera node>   the node IS that camera (same st_rdev)
+#   UNREADABLE|<pid>|<target>            stat failed — an unread node may not be `free`
+# and nothing at all when every node is a genuinely different device (`/dev/null`,
+# the DRM tree, ttys — the ordinary case, and the one that keeps FREE reachable).
+# A NON-ZERO EXIT IS AN ABSTENTION, not an empty answer: the caller turns it into
+# UNVERIFIABLE, exactly as the deleted `|| printf '%s' "$1"` fallback should have.
+# `$devs` and the records are passed as single arguments so a path with spaces cannot
+# be re-split.
+device_identity_matches() {
+  python3 - "$1" "$2" <<'PY' 2>/dev/null
+import os, sys
+cameras = sys.argv[1].split()
+records = sys.argv[2].split("\n")
+by_dev = {}
+for dev in cameras:
+    try:
+        by_dev.setdefault(os.stat(dev).st_rdev, dev)
+    except OSError:
+        pass
+for rec in records:
+    pid, _, target = rec.partition("|")
+    if not pid:
+        continue
+    try:
+        rdev = os.stat(target).st_rdev
+    except OSError:
+        print("UNREADABLE|%s|%s" % (pid, target))
+        continue
+    dev = by_dev.get(rdev)
+    if dev is not None:
+        print("MATCH|%s|%s|%s" % (pid, target, dev))
+PY
 }
 
 # pid_comm <pid> — a DISPLAY-only process name, stripped of every byte that could
@@ -264,7 +306,8 @@ pid_comm() {
 }
 
 linux_camera() {
-  local devs dev found=0 hit pid target real devreal base devroot unresolved="" suspicious=""
+  local devs dev found=0 hit pid target base devroot unresolved="" suspicious=""
+  local deferred="" match rec rpid rtarget rdev
   devs="$(ls -d $MH_V4L_GLOB 2>/dev/null)"
   if [ -z "$devs" ]; then
     emit_device camera ABSENT "no video device (no $MH_V4L_GLOB)"
@@ -297,41 +340,17 @@ linux_camera() {
       fi
     done
     [ "$hit" -eq 1 ] && continue
-    # 2. an ALIAS of a globbed device (udev `by-id`/`by-path`, a symlinked node):
-    #    resolve the target and compare the RESOLVED path to the device list.
+    # 2. ANY character device: identity is its DEVICE NUMBER, read once for the
+    #    whole census after this loop (round 9 F1/P3). Deferring is not an
+    #    optimisation detail — it is what makes the read affordable, because
+    #    `/dev/null`, ttys and ptys are all char devices and the arm this replaces
+    #    forked `python3` twice for each of them.
     if [ -c "$target" ]; then
-      real="$(resolve_path "$target")"
-      # ⛔ A RESOLVER WE COULD NOT RUN IS AN ABSTENTION, NOT A COMPARISON. With the
-      # path unresolved the next loop would compare text to text, which is exactly
-      # the fail-open F2 removed — and it fails SILENTLY, so it is collected here
-      # and turned into UNVERIFIABLE below.
-      if [ -z "$real" ]; then
-        unresolved="$unresolved $target"
-        continue
-      fi
-      for dev in $devs; do
-        # BOTH SIDES RESOLVED: the holder may name an alias, and the GLOBBED path
-        # may itself be a symlinked node (udev ships `by-id`/`by-path` links), so a
-        # one-sided `readlink` would compare a resolved path to an unresolved one.
-        devreal="$(resolve_path "$dev")"
-        if [ -z "$devreal" ]; then
-          unresolved="$unresolved $dev"
-          break
-        fi
-        if [ "$real" = "$devreal" ]; then
-          emit_device camera HELD-BY "pid=$pid comm=$(pid_comm "$pid") device=$dev via=$target"
-          found=1
-          hit=1
-          break
-        fi
-      done
-      [ "$hit" -eq 1 ] && continue
-      # 3. a character device we CANNOT attribute: name-matching (a second node of
-      #    the same major/minor) or outside /dev (a bind mount of the camera into a
-      #    containerised cell). This is what stops a silent FREE — we say we cannot
-      #    tell instead of inventing one. Innocuous nodes (/dev/null, the DRM tree,
-      #    ttys) never reach here because their basename does not match the pattern
-      #    and their path IS under /dev.
+      deferred="$deferred$pid|$target"$'\n'
+      # The NAME/TREE floor is still applied here, so a node we cannot identify is
+      # never declared innocuous by a missing device number alone: a basename that
+      # matches the camera pattern, or a node OUTSIDE the device tree (a bind mount
+      # of the camera into a containerised cell), is suspicious on its own.
       case "${target##*/}" in
         $base|$base[0-9]*) suspicious="$suspicious $target" ;;
         *)
@@ -339,7 +358,9 @@ linux_camera() {
           # a device, not like a foreign mount. `/dev` is that tree in production
           # (it is where MH_V4L_GLOB points); `$devroot` is the same tree as the
           # seam states it, so a fixture can model the real udev layout
-          # (`/dev/v4l/by-id/…`) without writing to /dev.
+          # (`/dev/v4l/by-id/…`) without writing to /dev. Whether such a node IS the
+          # camera is answered by its `st_rdev` below — NOT by this name test, which
+          # is exactly the assumption round 9's P3 removed.
           case "$target" in
             /dev/*|"$devroot"/*) ;;
             *) suspicious="$suspicious $target" ;;
@@ -349,9 +370,43 @@ linux_camera() {
   done <<EOF
 $(printf '%s' "$HOLDERS")
 EOF
+  # ⛔ NO EARLY RETURN HERE, EVEN WHEN A HOLDER IS FOUND (round 9, regression):
+  # a holder found by EXACT PATH must not stop the device-identity read, or a second
+  # holder reached through an alias vanishes from the answer while the verdict still
+  # reads HELD-BY — only a two-holder row can see that (F2f).
+  # ⛔ ONE DEVICE-IDENTITY READ FOR EVERY CHARACTER-DEVICE RECORD (round 9 P3/F1).
+  # Identity is `st_rdev`: a second node of the SAME major/minor IS the camera however
+  # it is spelled, and the previous arm decided that by BASENAME. `st_rdev` also needs
+  # no path resolution, so the whole census costs ONE interpreter launch instead of
+  # two per fd. A read that cannot run is an ABSTENTION (see `unresolved`), never the
+  # empty answer that read as "no match".
+  if [ -n "$deferred" ]; then
+    if match="$(device_identity_matches "$devs" "$deferred")"; then
+      if grep -q '^MATCH|' <<<"$match"; then
+        while IFS='|' read -r rec rpid rtarget rdev; do
+          [ "$rec" = MATCH ] || continue
+          emit_device camera HELD-BY "pid=$rpid comm=$(pid_comm "$rpid") device=$rdev via=$rtarget"
+          found=1
+        done <<EOF
+$match
+EOF
+        [ "$found" -eq 1 ] && return 0
+      fi
+      if grep -q '^UNREADABLE|' <<<"$match"; then
+        while IFS='|' read -r rec rpid rtarget; do
+          [ "$rec" = UNREADABLE ] || continue
+          suspicious="$suspicious $rtarget"
+        done <<EOF
+$match
+EOF
+      fi
+    else
+      unresolved="$unresolved $devs"
+    fi
+  fi
   [ "$found" -eq 1 ] && return 0
   if [ -n "$unresolved" ]; then
-    emit_device camera UNVERIFIABLE "device identity could not be RESOLVED for:$unresolved — the resolver (python3 os.path.realpath) is missing or failing, so an alias cannot be told from a different device, and no free claim may rest on that read"
+    emit_device camera UNVERIFIABLE "device identity could not be RESOLVED for:$unresolved — the reader (python3 st_rdev) is missing or failing, so a node cannot be told from a different device, and no free claim may rest on that read"
     return 0
   fi
   if [ -n "$suspicious" ]; then

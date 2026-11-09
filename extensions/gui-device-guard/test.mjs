@@ -311,6 +311,13 @@ const ROWS = [
   ["L25d npm exec -c <cmd> (npm's documented --call)", 'npm exec -c "electron ."', 1, "electron", true],
   ["L25e npx -c <cmd>", 'npx -c "electron ."', 1, "electron", true],
   ["L25f npx --package=<pinned> -c <cmd>", 'npx --package=electron@30 -c "electron ."', 1, "electron", true],
+  // ── L26 (round 9, P2) — `open` forwards Chromium switches ONLY after `--args`
+  //     (`open(1)`: "All remaining arguments are passed to the opened application
+  //     in the argv parameter to main()"). The mitigation is real THERE and only
+  //     there, so the two spellings must not read the same: before `--args` they
+  //     are file arguments to `open` (the false PASS cycle 3 fixed).
+  ["L26a open a bundle with the switches AFTER `--args`", `open ./Build/DMeer.app --args ${FAKE}`, 1, "open", true],
+  ["L26b …and the un-forwarded twin (switches BEFORE `--args`)", `open ./Build/DMeer.app ${FAKE} --args`, 1, "open", true],
   // ── A34–A41 — ALLOW twins for L24/L25 AND for round 7's P2-5 over-fire. The
   //     fail-safe word scan is now gated on the prefix having SKIPPED A FLAG: with
   //     no flag between the prefix and the command word, nothing could have
@@ -396,6 +403,24 @@ check(
     return f.length === 1 && f[0].faked === false && f[0].media === true;
   })(),
 );
+// L18c/L18d (round 9, P2) — the `--args` distinction, on the FIELD. L18b pins the
+// un-forwarded spelling; these pin the forwarded one and its ordering twin, so the
+// rule cannot regress to a blanket `false` (refusing mitigated work) or a blanket
+// `toks.includes` (the false PASS cycle 3 fixed).
+check(
+  "L18c fake switches AFTER `--args` ARE a mitigation (faked === true)",
+  (() => {
+    const f = classify(`open ./Build/DMeer.app --args ${FAKE}`);
+    return f.length === 1 && f[0].faked === true && f[0].media === true;
+  })(),
+);
+check(
+  "L18d one switch after `--args` is not a mitigation (half is not enough)",
+  (() => {
+    const f = classify(`open ./Build/DMeer.app --args ${mod.FAKE_DEVICE_FLAG}`);
+    return f.length === 1 && f[0].faked === false;
+  })(),
+);
 // L12 — a launch embedded after a separator is still a launch.
 check(
   "L12 a launch after `&&` is still classified",
@@ -463,11 +488,45 @@ if (handler) {
     JSON.stringify(openFaked ?? null).slice(0, 160),
   );
   check(
-    "H3c …and its reason offers the ALLOW_MEDIA hatch, not a switch `open` cannot forward",
+    "H3c …and its reason names the ONE spelling that actually forwards a switch",
     typeof openFaked?.reason === "string" &&
       openFaked.reason.includes("GUI_DEVICE_GUARD_ALLOW_MEDIA") &&
-      openFaked.reason.includes("does not forward"),
+      openFaked.reason.includes("--args"),
     String(openFaked?.reason ?? "").slice(0, 200),
+  );
+
+  // ── H3d/H3e (round 9, P2) — `--args` IS the forwarding token (`open(1)`), so
+  //         the mitigated spelling must RUN and be recorded faked=true, and the
+  //         un-forwarded twin must stay refused. Driven through the handler on
+  //         purpose: only the handler shows the ALLOW and the ledger row, and the
+  //         defect was that the ONLY documented way past the refusal was the
+  //         hatch that permits REAL capture.
+  resetLedger();
+  const openViaArgs = await drive(`open ./Build/DMeer.app --args ${FAKE}`);
+  check(
+    "H3d `open <bundle>.app --args <both switches>` is ALLOWED (a real mitigation)",
+    openViaArgs === undefined,
+    JSON.stringify(openViaArgs ?? null).slice(0, 160),
+  );
+  const viaArgsRows = ledgerRows();
+  check(
+    "H3d1 …and recorded with faked=true (the ledger does not lose the mitigation)",
+    viaArgsRows.length === 1 && viaArgsRows[0].faked === true &&
+      viaArgsRows[0].decision === "record",
+    JSON.stringify(viaArgsRows).slice(0, 220),
+  );
+  resetLedger();
+  const beforeArgs = await drive(`open ./Build/DMeer.app ${FAKE} --args`);
+  check(
+    "H3e the twin — both switches BEFORE `--args` — is still REFUSED",
+    Boolean(beforeArgs?.block),
+    JSON.stringify(beforeArgs ?? null).slice(0, 160),
+  );
+  check(
+    "H3e1 …and that refusal is ATTRIBUTED to a real launch decision (faked=false, media=true)",
+    classify(`open ./Build/DMeer.app ${FAKE} --args`)[0]?.faked === false &&
+      classify(`open ./Build/DMeer.app ${FAKE} --args`)[0]?.media === true,
+    JSON.stringify(classify(`open ./Build/DMeer.app ${FAKE} --args`)),
   );
 
   // ── H4 — a RECORD-ONLY launch: the ledger keeps it, the tool call proceeds ─

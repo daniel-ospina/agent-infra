@@ -562,12 +562,12 @@ function packageBaseName(tok: string): string {
  * (and the values their own flags consume) and grouping words. Returns -1 when
  * the segment holds no command word.
  */
-function commandWordIndex(toks: string[], out?: { prefixSeen?: boolean }): number {
+function commandWordIndex(toks: string[], out?: { sawFlag?: boolean }): number {
   // ⛔ AN OPERATOR TOKEN IS SEPARATION, NOT A COMMAND WORD (review cycle 4, F1).
   // `stripLeadingMetachars` strips metacharacters from INSIDE a token, so a token
   // that IS a metachar became `""` — and `""` was accepted as the command word.
-  // `classifySegment` then returned `null` for it, `prefixSeen` stayed false (the
-  // `PREFIXES` loop was never entered), and the hint at index 1 was never asked
+  // `classifySegment` then returned `null` for it, the `PREFIXES` loop was never
+  // entered, and the hint at index 1 was never asked
   // about: `( electron . &)`, `{ electron . ; }`, `! electron .` produced NO
   // finding — which is not "allow", because the handler returns early on an empty
   // list and R1 wrote no ledger row either. Both halves of #2249 skipped, on the
@@ -584,7 +584,6 @@ function commandWordIndex(toks: string[], out?: { prefixSeen?: boolean }): numbe
   while (toks.length > 0 && stripLeadingMetachars(toks[0]) === "") toks.shift();
   if (toks.length === 0) return -1;
   let i = 0;
-  let prefixSeen = false;
   // ⛔ A PREFIX THAT SKIPPED NO FLAG CANNOT HAVE SWALLOWED THE COMMAND WORD
   // (round 7 P2-5). `out.sawFlag` records whether the prefix's flag loop consumed
   // at least one token; the fail-safe scan is gated on it, so `sudo rg electron .
@@ -608,7 +607,6 @@ function commandWordIndex(toks: string[], out?: { prefixSeen?: boolean }): numbe
       if (tok === "command" && i + 1 < toks.length && /^(-v|-V|--help|--version)$/.test(toks[i + 1])) {
         return -1;
       }
-      prefixSeen = true;
       const valueFlags = PREFIX_VALUE_FLAGS[tok] ?? [];
       i++;
       // ⛔ ONE LOOP FOR EVERY PREFIX (review cycle 2, F1). `timeout` used to have
@@ -630,10 +628,8 @@ function commandWordIndex(toks: string[], out?: { prefixSeen?: boolean }): numbe
       if (tok === "timeout" && i < toks.length && TIMEOUT_DURATION.test(toks[i])) i++;
       continue;
     }
-    if (out) out.prefixSeen = prefixSeen;
     return i;
   }
-  if (out) out.prefixSeen = prefixSeen;
   return -1;
 }
 
@@ -967,15 +963,27 @@ function classifySegment(
       // path, so the recorded category-B rejection of "block every GUI launch"
       // is untouched.
       const isPath = !fromFlag || app.includes("/") || (!fromIdFlag && app.endsWith(".app"));
+      // ⛔ `open` FORWARDS SWITCHES ONLY AFTER `--args` (round 9 P2). Cycle 3 was
+      // right that a switch on an `open` line is NOT a mitigation by itself:
+      // `open App.app --use-fake-device-for-media-stream` hands them to `open` as
+      // FILE ARGUMENTS, so honouring them unconditionally was a false PASS. But
+      // `open(1)` says of `--args`: "All remaining arguments are passed to the
+      // opened application in the argv parameter to main()" — so after that token
+      // the switches ARE argv to the app, which is the standard Electron idiom and
+      // a REAL mitigation. Forcing `false` for the whole rule refused correct,
+      // mitigated work AND offered `GUI_DEVICE_GUARD_ALLOW_MEDIA=1` — the one
+      // documented way past the refusal permitted REAL capture — as the remedy.
+      // Both halves are now decided by the token that changes the meaning.
+      const argsAt = rest.indexOf("--args");
+      const forwarded = argsAt >= 0 ? rest.slice(argsAt + 1) : [];
+      const fakedViaArgs =
+        forwarded.includes(FAKE_DEVICE_FLAG) && forwarded.includes(FAKE_UI_FLAG);
       return {
         rule: "open",
         app,
         argv: toks.join(" "),
         media: isPath,
-        // ⛔ `faked` is FORCED false for this rule: `open` does not forward
-        // Chromium switches, so a line that carries them is not a mitigation —
-        // honouring it was a false PASS (review cycle 3, minor, reproduced).
-        faked: false,
+        faked: fakedViaArgs,
       };
     }
     return null;
@@ -1023,7 +1031,7 @@ export function classifyLaunchCommand(command: string, depth = 0): LaunchFinding
   for (const segment of splitSegments(body)) {
     const toks = tokenize(segment);
     if (toks.length === 0) continue;
-    const flags: { prefixSeen?: boolean } = {};
+    const flags: { sawFlag?: boolean } = {};
     const cwi = commandWordIndex(toks, flags);
     if (cwi < 0) {
       // ⛔ A WRAPPER CAN CONSUME ITS WHOLE SEGMENT (`flock -c"<cmd>"`, `su -c
@@ -1240,11 +1248,12 @@ function safeCwd(): string {
  * The block's reason — names the incident, the remedy that actually applies, and
  * the hatch.
  *
- * ⛔ THE REMEDY IS PER-RULE (review cycle 3, minor). For every Electron/Playwright
- * shape the fix is the two Chromium switches. For `open <path>.app` it is NOT:
- * `open` does not forward Chromium switches, and appending them to the `open`
- * argv made `faked` true and ALLOWED the launch while the app received nothing —
- * a remedy that inverts the gate. So that rule names only the escape hatch.
+ * ⛔ THE REMEDY IS PER-RULE (review cycle 3, minor; corrected round 9 P2). For
+ * every Electron/Playwright shape the fix is the two Chromium switches. For
+ * `open <path>.app` the switches only reach the app after a `--args` token —
+ * without it they are file arguments to `open` and the first cut honoured them,
+ * making the refusal's own remedy invert the gate. So this rule names the
+ * `--args` spelling and no longer claims `open` cannot forward them at all.
  */
 export function blockReason(finding: LaunchFinding, recordPath: string): string {
   if (finding.rule === "open") {
@@ -1258,8 +1267,10 @@ export function blockReason(finding: LaunchFinding, recordPath: string): string 
       `five minutes before a customer call — and killing the APP did not help, because the live`,
       `LANE relaunched it. Only killing the lane released the devices.`,
       ``,
-      `There is no fake-capture switch to add here: \`open\` does not forward Chromium switches,`,
-      `so the only ways past this refusal are`,
+      `There is no direct switch to add here: \`open\` forwards arguments to the app`,
+      `only AFTER a \`--args\` token — without it they are FILE arguments to \`open\`.`,
+      `So the ways past this refusal are`,
+      `  · \`open <bundle>.app --args ${FAKE_FLAGS_HINT}\`, or`,
       `  · run the bundle's test harness with ${FAKE_FLAGS_HINT}, or`,
       `  · ${ALLOW_MEDIA}=1 for one deliberate real-device launch (still recorded).`,
       `Launch ledger: ${recordPath}`,
