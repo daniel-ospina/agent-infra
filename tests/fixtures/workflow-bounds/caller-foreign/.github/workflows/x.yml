@@ -1,0 +1,6 @@
+name: fixture third-party caller
+on:
+  pull_request:
+jobs:
+  caller:
+    uses: some-other-org/some-other-repo/.github/workflows/build.yml@v3

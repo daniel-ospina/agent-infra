@@ -38,6 +38,15 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    # #2055 — unbounded, a hang in a consumer's test command would hold this job (and, for a consumer
+    # whose branch protection requires it, that consumer's queue) until the platform's 6-hour ceiling.
+    # Derivation: no local distribution exists to take a p90 from — measured, this workflow is
+    # `workflow_call`-only and its old in-repo `push` runs' job records are purged
+    # (`/actions/runs/32717465915/jobs` → `total_count: 0`). The only in-repo observation is tortoise-
+    # style usage via ci-main.yml, whose `python-ci / test` job measured p50 3.6 / p90 3.6 / max 4.1
+    # min over 12 runs — a REAL pytest run, not a stub. 30 min is ~7x that max: room for a cold pip
+    # install plus a suite several times this one, and finite.
+    timeout-minutes: 30
     if: inputs.test-command != ''
     steps:
       - uses: actions/checkout@v4
@@ -53,6 +62,9 @@ jobs:
 
   lint:
     runs-on: ubuntu-latest
+    # #2055 — same ceiling basis as `test` above (no local distribution; `workflow_call`-only). A
+    # lint pass is one pinned ruff invocation over the consumer's tree, so it needs far less: 15 min.
+    timeout-minutes: 15
     if: inputs.lint-command != ''
     steps:
       - uses: actions/checkout@v4
@@ -71,6 +83,9 @@ jobs:
 
   typecheck:
     runs-on: ubuntu-latest
+    # #2055 — mypy over the consumer's package, plus an editable install of it: slower than `lint`,
+    # cheaper than `test`. Same no-local-distribution basis as its siblings above; 20 min.
+    timeout-minutes: 20
     if: inputs.typecheck-command != ''
     steps:
       - uses: actions/checkout@v4

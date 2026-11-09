@@ -208,6 +208,16 @@ permissions:
 jobs:
   workflow-lock:
     runs-on: ubuntu-latest
+    # #2055 — unbounded, a hang here would park the merge queue indefinitely (measured on PR #2168: a
+    # peer job held `in_progress` for >55 min and the landing rail refused to classify ANY check on
+    # that head). Measured over 14 completed runs (2026-11-09): p50 9 s, p90 11 s, max 12 s — it reads
+    # one merge commit and hashes three files. 15 min is ~75x the max: enough for an API-throttled
+    # retry loop (the step re-reads mergeability up to 3 times), nowhere near a hang.
+    #
+    # ⛔ A JOB-LEVEL BOUND IS `cancelled`, WHICH THE RAIL READS NON-RED — this bounds the leak and
+    # names the failure, it does not turn a hang into a red. That distinction is #3242's, and this
+    # file does not create a new one.
+    timeout-minutes: 15
     steps:
       # No `ref:` on purpose: pull_request_target checks out the BASE branch
       # (main), so this step runs main's copy of the workflow + script. Do NOT

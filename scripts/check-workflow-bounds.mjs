@@ -1,0 +1,354 @@
+#!/usr/bin/env node
+/**
+ * check-workflow-bounds — EVERY JOB in EVERY workflow declares a time bound.
+ *
+ * ── THE DEFECT THIS PINS (agent-infra#2055) ──────────────────────────────────────────────────────
+ * `grep -c timeout-minutes .github/workflows/*.yml` returned 0 for most of this tree, and a job with
+ * no bound is a job that can hang for as long as GitHub will let it. Measured: PR #2168's
+ * `bash-suites` step sat `in_progress` for >55 min with every peer job long finished, and the landing
+ * rail refused to classify ANYTHING — "a running job is not a failure, and this is NOT a stall claim"
+ * — so the PR was unlandable for as long as one job failed to reach a terminal conclusion. A bound
+ * cannot make the work finish; it makes the job END, which is what turns an indefinite queue hold
+ * into a named, failing check.
+ *
+ * ── WHY THIS IS A NODE READ, NOT A GREP (the #666 / #675 lesson) ─────────────────────────────────
+ * The question is "does job J have its own `timeout-minutes`?", which is a question about PARSED
+ * STRUCTURE. Text matching answers a different one ("does the string appear somewhere in the file")
+ * and three generations of text-matching guards in this repo were defeated by YAML's own syntax:
+ * quoted keys, block scalars, a decoy `timeout-minutes:` inside a `run: |` body, and a STEP's bound
+ * standing in for a JOB's. So this reads `scripts/workflow-yaml.mjs` (the structural parser #675
+ * landed) and asks the parsed node. A decoy inside a scalar is not a node and cannot satisfy it, and
+ * a step's bound lives under `steps[i]`, never on the job.
+ *
+ * ── WHAT IT ASSERTS, EXACTLY ─────────────────────────────────────────────────────────────────────
+ *   (a) every workflow file parses, and has a `jobs` mapping with at least one job;
+ *   (b) every job is BOUNDED, in one of two shapes — and the difference is not cosmetic:
+ *         • it carries its own `timeout-minutes` (a JOB bound), or
+ *         • EVERY one of its steps carries one (a STEP bound), which bounds the job's total by
+ *           their sum.
+ *       A STEP bound is the STRONGER of the two: its trip is `failure`, which the rail reds. A JOB
+ *       bound's trip is `cancelled`, which the rail reads NON-RED — it ends the hold and names the
+ *       job, but it does not turn a hang into a red. `ci.yml`'s `verify` is the job that only has
+ *       the step shape (65 steps; a 65-step job cannot satisfy the lane guard's “job > Σ steps”
+ *       under the platform's 360-minute ceiling, and a bound it cannot satisfy is not a bound).
+ *       A reusable-workflow CALL job (`jobs.<id>.uses`) is the third case — see (d);
+ *   (c) the value is a positive integer number of minutes, or a `${{ … }}` expression (GitHub
+ *       resolves `jobs.<id>.timeout-minutes` from the `github`, `needs`, `strategy`, `matrix`,
+ *       `vars` and `inputs` contexts, so a reusable workflow may legitimately forward one);
+ *   (d) a CALL job cannot be bounded directly: GitHub's schema for `jobs.<id>.uses` accepts only
+ *       `name, uses, with, secrets, strategy, needs, if, concurrency, permissions`, and a
+ *       `timeout-minutes` there is a WORKFLOW VALIDATION ERROR ("Unexpected value"), i.e. every run
+ *       of the file dies. So for a call job this guard asserts the OPPOSITE (no bound may be
+ *       declared) and then follows the call INTO the called file when that file is ours, requiring
+ *       every job inside it to be bounded. That is what closes the hole instead of relabelling it: a
+ *       caller's work is bounded by the callee's jobs, so the callee is where the bound must be.
+ *       A call to a workflow that is NOT in this repo is reported as a NOTE, never silently passed —
+ *       its bounds are not ours to assert, and the summary counts it so the exemption is visible.
+ *
+ * ⛔ WHAT IT DOES **NOT** CLAIM, STATED SO IT CANNOT BE MISREAD (#2055's own amended indicator):
+ * a `jobs.<job_id>.timeout-minutes` trip is reported **`cancelled`**, and this repo's merge rail reads
+ * `cancelled` as NON-RED. A job bound is therefore a RUNNER-LEAK BACKSTOP and a NAMING device, not a
+ * red-producing bound. The red-producing bound is the STEP bound, which is `failure`, and the jobs
+ * that run long work in this repo already carry one (#2482 sized them, #3187 pins them: `bash-suites`
+ * 70 min on the shard step, `bash-suites-gate` 70, `script-validate*` on their shard steps). Where a
+ * job has NO step bound, a job bound still converts "the whole queue waits forever" into "one named
+ * job ends", which is strictly better than the measured 55-minute hold — the remaining false-pass
+ * surface (a non-verdict scored non-red) is ONE root, tracked as #3242, and is not created here.
+ *
+ * ── WHY NO UNIVERSAL "job bound > sum of step bounds" HERE ──────────────────────────────────────
+ * Measured on this tree: `ci.yml`'s `verify` job has 65 steps and `ci-main.yml`'s shard slices have
+ * three. The `check-ci-lane-parity.mjs` invariant (`job > Σ steps`) is satisfiable for three steps and
+ * not in general: a 65-step job under the platform's 360-minute ceiling would need steps averaging
+ * <5.5 min, which would false-block a slow-but-healthy step. That invariant stays where it was
+ * proven — on the lane jobs it was written for — rather than being asserted everywhere and being
+ * either wrong or vacuous.
+ *
+ * ── FAIL-CLOSED ─────────────────────────────────────────────────────────────────────────────────
+ * Exit 2 (refusal) — not 0 — when the guard cannot answer: no workflow files, a file whose `jobs` is
+ * not a mapping or holds no job, unparseable YAML, or a `--root` with no `.github/workflows`. A guard
+ * that passes when it read nothing is the class of defect it exists to find (#637, #675 P2).
+ *
+ * Exit codes: 0 every job bounded (or bounded through its callee) · 1 a job has no usable bound (or a
+ * call job declares one, which GitHub rejects) — each named with its file · 2 refusal.
+ *
+ * Usage:
+ *   node scripts/check-workflow-bounds.mjs [--root DIR] [--list]
+ *     --root DIR   audit DIR/.github/workflows instead of this repo's (fixtures, mutations)
+ *     --list       print `<file>::<job>\t<bound>` for every job, then the verdict (used by the suite
+ *                  to prove the parse is NON-VACUOUS — it must see the jobs it claims to check)
+ */
+
+import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import { parseWorkflowYaml, WorkflowYamlError } from "./workflow-yaml.mjs";
+
+const HERE = dirname(fileURLToPath(import.meta.url));
+
+/**
+ * This repo's own slug. A `uses:` naming it can be resolved to a file HERE, which is what lets a
+ * caller job be certified through its callee. Spelled out (not derived from git) on purpose: a guard
+ * whose own subject changes with the checkout can be satisfied by moving the checkout.
+ */
+const SELF_SLUG = "daniel-ospina/agent-infra";
+
+function parseArgs(argv) {
+  const out = { root: resolve(HERE, ".."), list: false };
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === "--root") {
+      const v = argv[++i];
+      if (!v) {
+        process.stderr.write("check-workflow-bounds: --root needs a directory\n");
+        process.exit(2);
+      }
+      out.root = resolve(v);
+    } else if (a === "--list") {
+      out.list = true;
+    } else if (a === "--help" || a === "-h") {
+      process.stdout.write("usage: check-workflow-bounds.mjs [--root DIR] [--list]\n");
+      process.exit(0);
+    } else {
+      process.stderr.write(`check-workflow-bounds: unknown argument ${JSON.stringify(a)}\n`);
+      process.exit(2);
+    }
+  }
+  return out;
+}
+
+/** A bound this guard can accept: a positive integer, or an expression it cannot evaluate. */
+function classifyBound(raw) {
+  if (raw === undefined || raw === null) return { ok: false, why: "declares no timeout-minutes at all" };
+  if (typeof raw !== "string") return { ok: false, why: `is not a scalar (${typeof raw})` };
+  const v = raw.trim();
+  if (v === "") return { ok: false, why: "declares timeout-minutes with an EMPTY value" };
+  if (/^\$\{\{[\s\S]*\}\}$/.test(v)) return { ok: true, expression: true, value: v };
+  if (!/^[0-9]+$/.test(v)) {
+    return { ok: false, why: `declares a non-integer timeout-minutes (${JSON.stringify(v)})` };
+  }
+  if (Number(v) <= 0) {
+    return { ok: false, why: `declares timeout-minutes ${v}, which is not a positive number of minutes` };
+  }
+  if (Number(v) > 360) {
+    // Not fatal: GitHub cancels at the runner's own ceiling first, so a larger number is inert
+    // rather than wrong. Reported as a NOTE so nobody believes it protects anything.
+    return { ok: true, value: v, inert: true };
+  }
+  return { ok: true, value: v };
+}
+
+/**
+ * Resolve a `uses:` value to a workflow path inside THIS repo, or null when it is not ours.
+ * Accepted: `<slug>/.github/workflows/<f>@<ref>`, `<slug>/.github/workflows/<f>` (no ref), and
+ * `./.github/workflows/<f>`.
+ */
+function resolveLocalCallee(uses) {
+  const m = /^(?:(\.\/)|([^/@\s]+\/[^/@\s]+)\/)?(\.github\/workflows\/[^@\s]+?\.ya?ml)(?:@.*)?$/.exec(
+    uses.trim()
+  );
+  if (!m) return null;
+  const [, dotSlash, slug, rel] = m;
+  if (dotSlash) return rel;
+  if (slug === SELF_SLUG) return rel;
+  return null;
+}
+
+function main() {
+  const { root, list } = parseArgs(process.argv.slice(2));
+  const dir = join(root, ".github", "workflows");
+
+  let entries;
+  try {
+    entries = readdirSync(dir);
+  } catch (e) {
+    process.stderr.write(
+      `check-workflow-bounds: ✗ REFUSING — cannot read ${dir} (${e.code || e.message}).\n` +
+        `   A guard that read no workflow cannot say every job is bounded; this is exit 2, not a pass.\n`
+    );
+    process.exit(2);
+  }
+  const files = entries.filter((f) => /\.ya?ml$/.test(f)).sort();
+  if (files.length === 0) {
+    process.stderr.write(
+      `check-workflow-bounds: ✗ REFUSING — ${dir} holds no .yml/.yaml file.\n` +
+        `   Nothing was checked, so nothing can be certified: exit 2.\n`
+    );
+    process.exit(2);
+  }
+
+  const violations = [];
+  const notes = [];
+  const seen = new Set();
+  let jobCount = 0;
+  let bounded = 0;
+  let boundedBySteps = 0;
+  let callers = 0;
+  let viaCallee = 0;
+
+  /** Load one workflow file's `jobs`, refusing (exit 2) rather than guessing. */
+  function loadJobs(file) {
+    let doc;
+    try {
+      doc = parseWorkflowYaml(readFileSync(join(dir, file), "utf8"));
+    } catch (e) {
+      const kind = e instanceof WorkflowYamlError ? "unparseable by the structural reader" : "unreadable";
+      process.stderr.write(
+        `check-workflow-bounds: ✗ REFUSING — ${file} is ${kind}: ${e.message}\n` +
+          `   Fail-closed on purpose: a workflow this guard cannot read is NOT one it may certify.\n`
+      );
+      process.exit(2);
+    }
+    const jobs = doc && doc.jobs;
+    if (!jobs || typeof jobs !== "object" || Array.isArray(jobs)) {
+      process.stderr.write(
+        `check-workflow-bounds: ✗ REFUSING — ${file} has no \`jobs\` mapping.\n` +
+          `   Either the file is not a workflow or the parser lost it; both mean "nothing was checked".\n`
+      );
+      process.exit(2);
+    }
+    const ids = Object.keys(jobs);
+    if (ids.length === 0) {
+      process.stderr.write(
+        `check-workflow-bounds: ✗ REFUSING — ${file} declares \`jobs\` with NO jobs in it.\n` +
+          `   A file with nothing to check cannot be a pass: exit 2.\n`
+      );
+      process.exit(2);
+    }
+    return jobs;
+  }
+
+  /** Certify every job in one file. `label` names the file as the reader sees it. */
+  function auditFile(file, depth) {
+    if (seen.has(file)) return; // a diamond, not a new hole
+    seen.add(file);
+    if (depth > 3) {
+      process.stderr.write(
+        `check-workflow-bounds: ✗ REFUSING — reusable-workflow calls nest deeper than 3 levels at ${file}.\n` +
+          `   GitHub allows a chain, this guard does not follow one further; raise the bound deliberately.\n`
+      );
+      process.exit(2);
+    }
+    const jobs = loadJobs(file);
+    for (const id of Object.keys(jobs)) {
+      jobCount++;
+      const job = jobs[id] || {};
+      const where = `${file}::${id}`;
+
+      // ── A CALLER JOB: GitHub's caller schema has no `timeout-minutes` at all ────────────────
+      if (typeof job.uses === "string" && job.uses.trim() !== "") {
+        callers++;
+        const local = resolveLocalCallee(job.uses);
+        const own = classifyBound(job["timeout-minutes"]);
+        if (job["timeout-minutes"] !== undefined) {
+          violations.push(
+            `${where} declares timeout-minutes on a reusable-workflow CALL job — GitHub's caller schema ` +
+              `(name, uses, with, secrets, strategy, needs, if, concurrency, permissions) rejects it as ` +
+              `"Unexpected value", which fails EVERY run of this file. The bound belongs on the jobs inside ` +
+              `${job.uses.trim()}.`
+          );
+          continue;
+        }
+        if (list) process.stdout.write(`${where}\t(call → ${job.uses.trim()})\n`);
+        if (local === null) {
+          notes.push(
+            `${where} calls ${job.uses.trim()}, which is not a workflow in this repo — its jobs are not ` +
+              `certified here (the caller schema forbids a bound, so a third-party callee's own bounds are the only ones that can exist)`
+          );
+          continue;
+        }
+        if (!existsSync(join(dir, local.replace(/^\.github\/workflows\//, "")))) {
+          violations.push(
+            `${where} calls ${job.uses.trim()}, resolved to ${local} in THIS repo, but that file does not ` +
+              `exist — the call is broken, so nothing inside it can be bounded`
+          );
+          continue;
+        }
+        viaCallee++;
+        auditFile(local.replace(/^\.github\/workflows\//, ""), depth + 1);
+        continue;
+      }
+
+      // ── AN ORDINARY JOB: a JOB bound, or a bound on EVERY step ─────────────────────────────
+      const steps = Array.isArray(job.steps) ? job.steps : [];
+      const badSteps = [];
+      for (let i = 0; i < steps.length; i++) {
+        const s = steps[i];
+        const sv = classifyBound(s && typeof s === "object" ? s["timeout-minutes"] : undefined);
+        if (!sv.ok) {
+          const what = s && typeof s === "object" ? s.name || s.uses || `step #${i + 1}` : `step #${i + 1}`;
+          badSteps.push(`${what} ${sv.why}`);
+        }
+      }
+      const verdict = classifyBound(job["timeout-minutes"]);
+      if (list) {
+        process.stdout.write(
+          `${where}\t${verdict.value ?? (verdict.ok === false && steps.length && badSteps.length === 0 ? `(steps: ${steps.length} bounded)` : "(none)")}\n`
+        );
+      }
+      if (verdict.ok) {
+        bounded++;
+        if (verdict.inert) {
+          notes.push(
+            `${where} declares ${verdict.value} min — above the platform's 360-minute ceiling, so the runner cancels first and the number is inert`
+          );
+        }
+        // A job bound is a BACKSTOP; if its steps are unbounded, say so once per job so the
+        // weaker shape is visible rather than implied. It is a NOTE, not a violation:
+        // `check-ci-lane-parity.mjs` refuses that shape in the two lane documents already.
+        if (steps.length > 0 && badSteps.length > 0) {
+          notes.push(
+            `${where} is bounded only at the JOB level — ${badSteps.length}/${steps.length} step(s) carry no bound, so its trip is ` +
+              `\`cancelled\` (NON-RED to the rail). The job ends and names itself; a step bound would red it.`
+          );
+        }
+        continue;
+      }
+      if (steps.length > 0 && badSteps.length === 0) {
+        boundedBySteps++;
+        continue;
+      }
+      violations.push(
+        steps.length === 0
+          ? `${where} ${verdict.why}`
+          : `${where} ${verdict.why}, and NOT every step is bounded either (${badSteps.join("; ")})`
+      );
+    }
+  }
+
+  for (const file of files) auditFile(file, 0);
+
+  if (jobCount === 0) {
+    process.stderr.write(
+      `check-workflow-bounds: ✗ REFUSING — parsed ${files.length} workflow file(s) and found ZERO jobs.\n` +
+        `   That is the guard failing to read, not the tree being clean: exit 2.\n`
+    );
+    process.exit(2);
+  }
+
+  for (const n of notes) process.stdout.write(`⚠️  ${n}\n`);
+
+  if (violations.length > 0) {
+    process.stderr.write(
+      `\n❌ check-workflow-bounds: ${violations.length} job(s) fail the time-bound rule (agent-infra#2055).\n` +
+        `   A job with no \`timeout-minutes\` can hang until the platform's 6-hour ceiling, holding the merge\n` +
+        `   queue: measured, PR #2168's \`bash-suites\` held an otherwise-reviewed PR for >55 minutes.\n` +
+        `   Add \`timeout-minutes\` to the JOB, sized from CI's own measured p90, and put the derivation in a\n` +
+        `   comment beside it so a later edit cannot silently raise it (see .github/workflows/ci.yml's\n` +
+        `   \`bash-suites\` for the form). A reusable-workflow CALL job cannot carry one — bound the jobs\n` +
+        `   inside the workflow it calls.\n\n`
+    );
+    for (const v of violations) process.stderr.write(`   • ${v}\n`);
+    process.stderr.write("\n");
+    return 1;
+  }
+
+  process.stdout.write(
+    `✅ check-workflow-bounds: ${bounded} job(s) declare their own bound` +
+      (boundedBySteps > 0 ? `, ${boundedBySteps} are bounded by EVERY step's own bound` : "") +
+      (callers > 0 ? `, ${viaCallee}/${callers} call job(s) are bounded through the workflow they call` : "") +
+      ` — ${jobCount} job(s) across ${files.length} workflow file(s).\n`
+  );
+  return 0;
+}
+
+process.exit(main());

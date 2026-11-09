@@ -66,6 +66,13 @@ jobs:
   drift-check:
     name: agent-infra drift
     runs-on: ubuntu-latest
+    # #2055 — unbounded, this job could hang until the platform's 6-hour ceiling, and it is a
+    # reusable workflow whose caller gets no other signal. No local distribution exists to take a p90
+    # from (measured: `/actions/workflows/drift-check.yml/runs` → `total_count: 0`; the workflow is
+    # `workflow_call`-only), so the bound is a stated ceiling for the work it actually does: two
+    # checkouts (the consumer, and a pinned agent-infra ref) plus one consumer-supplied check
+    # command. 20 min covers a large consumer clone and a slow command; a wedged clone ends the job.
+    timeout-minutes: 20
     steps:
       - name: Checkout consumer repo
         uses: actions/checkout@v4

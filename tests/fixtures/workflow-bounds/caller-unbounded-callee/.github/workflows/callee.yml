@@ -1,0 +1,8 @@
+name: callee with an unbounded job
+on:
+  workflow_call:
+jobs:
+  hangs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
