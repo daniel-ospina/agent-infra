@@ -1781,7 +1781,12 @@ queue_state_text() {
   case "$QUEUE_STATE" in
     derived)     printf 'ok — derived from the checkout' ;;
     explicit)    printf 'ok — OR matches the checkout' ;;
-    mismatch)    printf 'MISMATCH — start/check refuse, and stop refuses while a controller is live (MERGE-INERT, agent-infra#1901)' ;;
+    # ⛔ NAME THE CONDITION THE CODE APPLIES (review P3). `stop_would_end_something` refuses on more
+    # than "a controller is live": the first leg is `$ROLES_DIR/.desired`, which a box that is DOWN (OOM,
+    # reboot, an earlier partial stop) still carries. That is the state this PR's own doc §3.2 names
+    # ("including one that is already down but still carries `.desired`, which does need `--force`"), so
+    # "while a controller is live" told an operator the opposite of what `stop` does.
+    mismatch)    printf 'MISMATCH — start/check refuse, and stop refuses while this state dir has anything a stop would end (.desired, a provably-own session, or a controller) — MERGE-INERT, agent-infra#1901' ;;
     nocheckout)  printf 'NO CHECKOUT — REPO is not set; start/check derive one or refuse (agent-infra#1935)' ;;
     unreadable)  printf 'UNREADABLE — the checkout has no origin remote; start/check refuse' ;;
     underivable) printf 'UNDERIVABLE — origin is not https/http/ssh/scp-like naming <owner>/<repo>; start/check refuse' ;;
