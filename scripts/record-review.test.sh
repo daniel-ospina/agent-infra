@@ -5064,6 +5064,11 @@ _m6l_mut="$T/record-review.mut1889d.sh"
 command sed 's#^[[:space:]]*if \[ "\$_ab_ok" -ne 1 \] &&.*$#            :#' "$RECORD" > "$_m6l_mut"
 # The `&&` above is load-bearing: without it the pattern also matches the POST-LOOP check
 # (`if [ "$_ab_ok" -ne 1 ] || [ "$_ab_n" -eq 0 ]`), leaving the mutant unparseable — measured, rc 2.
+# ⛔ IT NOW MATCHES ONE LINE PER FILED SPELLING (#3829 review): the branch is deliberately TWO
+# self-contained one-liners, a numeric list and the bare word `filed`, so this pin disables BOTH and the
+# control below still proves the ARM survived. That is why each spelling must stay a single line — a
+# multi-line `if …; then / … / fi` would leave this pattern matching only the header and the mutant
+# would not parse (measured: the pin reported "could not build the filed-value mutant copy").
 # So the pin self-checks BOTH that the branch went and that the mutant still parses.
 if ! command grep -qF 'none|<|>|…' "$_m6l_mut" && command grep -qF '[ "$_ab_ok" -ne 1 ] ||' "$_m6l_mut" \
    && bash -n "$_m6l_mut" 2>/dev/null && ! cmp -s "$_m6l_mut" "$RECORD"; then
@@ -5171,6 +5176,110 @@ $VACUITY_BLOCK"
     assert_eq "$RECORD_RC" "0" "13m6p MUTATION: with the ambiguity guard disabled an ambiguous count line is ACCEPTED (rc 0) — 13m6m is load-bearing"
 else
     bad "13m6p could not build the ambiguity-guard mutant copy — the pin did not run"
+fi
+
+# 13m6q — THE SECOND SPELLING OF THE FILED VALUE: the bare word `filed` (#3829 review, measured at
+# `3bef6262`, where it was REFUSED with rc 1). The filed branch demanded a DIGIT in the value — a
+# requirement no decision states, none of the enumerated refusal causes names, and the refusal message
+# did not name either, so an honest lane met a message listing only conditions it already satisfied.
+# It is not hypothetical: `docs/plans/2026-09-21-issue-1321-1322-skill-enforcer-gates.md:463` records
+# `threats=13 covered=13 residuals=filed` as that lane's CLEAN exit, and
+# `skills/writing-plans/workflow/05-review-handoff.md` instructs every lane to copy that disclosure out
+# of the plan doc into the PR body — so the fleet was TOLD to write a spelling this arm refused, and the
+# cheap path was rewriting a TRUE disclosure into `none`: the inversion #1889 exists to remove.
+# Every acceptance here is BOUNDED like the others: the same word with no counts (vector B), beside a
+# contradiction (C), and a near-miss spelling (D) all still REFUSE — the protection is the coverage
+# comparison, which is identical for both spellings, so widening the value grammar cannot become "any
+# word at all".
+rm -f "$(Q2 424982)"
+EV_REF="comment:42498201" run_record_ev 424982 STUB_EVIDENCE_BODY="## Review — THREAT SURFACE COVERED
+
+Every declared threat class C1–C13 is covered by a test; the two residuals are filed and not chased.
+
+[ADVERSARIAL-BOUND] cycles=2 threats=13 covered=13 residuals=filed — bounded by the declared threat surface
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "0" "13m6q the bare word residuals=filed with EQUAL counts is ACCEPTED (rc 0) [err: $(printf '%s' "$RECORD_ERR" | tr '\n' ' ')]"
+R13M6Q="$(cat "$(Q2 424982)" 2>/dev/null || true)"
+assert_contains "$R13M6Q" '"evidence":"comment:42498201"' "13m6q the accepted artifact is the one the record names"
+assert_contains "$R13M6Q" '"mint":"fresh"' "13m6q the bare-word filed form mints a FRESH record"
+# Vector A2 — case-insensitivity belongs to BOTH spellings of the filed form (the `none` form and the
+# LOWER-CASE marker are already pinned by 13m6b/13m6h; the word must not be the one case-sensitive bit).
+rm -f "$(Q2 424983)"
+EV_REF="comment:42498301" run_record_ev 424983 STUB_EVIDENCE_BODY="## Review — THREAT SURFACE COVERED
+
+[ADVERSARIAL-BOUND] cycles=2 threats=13 covered=13 residuals=FILED
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "0" "13m6q residuals=FILED (upper case) is ACCEPTED (rc 0) [err: $(printf '%s' "$RECORD_ERR" | tr '\n' ' ')]"
+# Vector B — FAIL-CLOSED boundary: the word's legality rests on the coverage comparison, exactly like a
+# numeric list's, so with NO counts it is a cannot-verify (13m6k vector B, one spelling over).
+rm -f "$(Q2 424984)"
+EV_REF="comment:42498401" run_record_ev 424984 STUB_EVIDENCE_BODY="## Review
+
+[ADVERSARIAL-BOUND] residuals=filed — residuals filed, not chased
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13m6q residuals=filed with NO counts is a cannot-verify — refused (rc 3)"
+[ ! -f "$(Q2 424984)" ] && ok "13m6q no record minted from a count-less filed word" || bad "13m6q minted from a count-less filed word"
+# Vector C — and it cannot LAUNDER an uncovered surface either: the contradiction refuses before the
+# value is judged (13m6k vector C, one spelling over).
+rm -f "$(Q2 424985)"
+EV_REF="comment:42498501" run_record_ev 424985 STUB_EVIDENCE_BODY="## Review
+
+[ADVERSARIAL-BOUND] cycles=2 threats=13 covered=11 residuals=filed — residuals filed, not chased
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13m6q residuals=filed beside covered < threats is a contradiction — refused (rc 3)"
+[ ! -f "$(Q2 424985)" ] && ok "13m6q no record minted from a filed word admitting an uncovered class" || bad "13m6q minted from a filed word beside an uncovered class"
+# Vector D — THE WIDENING DID NOT LEAK. Only the EXACT word (up to its own delimiter) is the filed
+# form: a word that merely CONTAINS it, and a digit-free value that asserts nothing, both refuse.
+_m6q=0
+while IFS= read -r _m6q_val; do
+    _m6q=$((_m6q + 1)); _m6q_pr=$((424985 + _m6q))
+    rm -f "$(Q2 $_m6q_pr)"
+    EV_REF="comment:${_m6q_pr}01" run_record_ev "$_m6q_pr" STUB_EVIDENCE_BODY="## Review
+
+[ADVERSARIAL-BOUND] cycles=2 threats=13 covered=13 residuals=${_m6q_val}
+
+$VACUITY_BLOCK"
+    assert_eq "$RECORD_RC" "3" "13m6q near-miss filed value '${_m6q_val}' is REFUSED (rc 3) — the word is matched exactly"
+done <<'M6QVALUES'
+filed-off
+some
+yes
+unknown
+done
+M6QVALUES
+
+# 13m6r — MUTATION PIN (attribution for the bare-word branch, and the control that keeps it honest).
+# 13m6q asserts the word is accepted; this pin proves THAT branch (`(ii-c)`) is what accepts it — with
+# the branch replaced by `:` the identical body must REFUSE — and, the CONTROL, a NUMERIC filed list on
+# the SAME mutant must still ACCEPT, so the pin cannot pass by having killed the whole filed branch.
+# The `sed` pattern carries the branch's own literal (`filed[,.:;)]*$`) and is asserted to bind EXACTLY
+# ONCE and to stay parseable, so a refactor that moves the line reddens HERE instead of silently
+# letting this pin test unmutated code (#3442).
+_m6r_mut="$T/record-review.mut1889f.sh"
+command sed 's#^[[:space:]]*if \[ "\$_ab_ok" -ne 1 \].*\^\[\[:space:\]\]\*filed.*$#            :#' "$RECORD" > "$_m6r_mut"
+_m6r_binds=$(command diff "$RECORD" "$_m6r_mut" 2>/dev/null | command grep -c '^< ' || true)
+if [ "${_m6r_binds:-0}" = "1" ] && ! command grep -qF 'filed[,.:;)]*' "$_m6r_mut" && bash -n "$_m6r_mut" 2>/dev/null \
+   && ! cmp -s "$_m6r_mut" "$RECORD"; then
+    _m6r_pr=424991
+    rm -f "$(Q2 $_m6r_pr)"
+    EV_REF="comment:${_m6r_pr}01" run_record_ev "$_m6r_pr" RECORD="$_m6r_mut" \
+        STUB_EVIDENCE_BODY="[ADVERSARIAL-BOUND] cycles=2 threats=13 covered=13 residuals=filed
+
+$VACUITY_BLOCK"
+    assert_eq "$RECORD_RC" "3" "13m6r MUTATION: with the bare-word branch disabled residuals=filed is REFUSED (rc 3) — 13m6q is load-bearing"
+    _m6r_pr=424992
+    rm -f "$(Q2 $_m6r_pr)"
+    EV_REF="comment:${_m6r_pr}01" run_record_ev "$_m6r_pr" RECORD="$_m6r_mut" \
+        STUB_EVIDENCE_BODY="[ADVERSARIAL-BOUND] cycles=2 threats=13 covered=13 residuals=#1269
+
+$VACUITY_BLOCK"
+    assert_eq "$RECORD_RC" "0" "13m6r control: on the SAME mutant a NUMERIC filed list still ACCEPTS (rc 0) — the pin killed the word branch, not the filed branch"
+else
+    bad "13m6r could not build the bare-word mutant copy (binds='${_m6r_binds:-?}') — the pin did not run"
 fi
 
 # 13g3 — the marker veto must be anchored to a LINE START, not to position 0. The
@@ -5527,13 +5636,13 @@ fi
 #     → :2482 :4186 :6501 :6613, plus a comment mention at :2356) and the
 #     same four PREDICATE sites are at head
 #     (`grep -n 'grep -qxF' scripts/record-review.sh` prints all four PREDICATE lines at head —
-#     CITE-CHECK: :2701 :4427 :6797 :6971, plus a comment mention at :2570; `14.1c-CITE` below
+#     CITE-CHECK: :2722 :4448 :6818 :6992, plus a comment mention at :2591; `14.1c-CITE` below
 #     re-derives these numbers, so they cannot rot silently): in #3168's diff the only
-#     hunk at `post_marker()` (:2679) ADDS A COMMENT — this PR does not touch
+#     hunk at `post_marker()` (:2700) ADDS A COMMENT — this PR does not touch
 #     `post_marker()` at all — and the
-#     predicate line beside it (CITE-CHECK: :2701) is CONTEXT, not a change.
+#     predicate line beside it (CITE-CHECK: :2722) is CONTEXT, not a change.
 #     WHAT THE VECTOR BELOW ACTUALLY PINS: the BODY-APPEND site
-#     (`if ! grep -qxF -- "$MARKER" <<<"$BODY"`; on main at bd1b205d :6501 — at head CITE-CHECK: :6797). It is a
+#     (`if ! grep -qxF -- "$MARKER" <<<"$BODY"`; on main at bd1b205d :6501 — at head CITE-CHECK: :6818). It is a
 #     MAIN-REGRESSION pin — reverting this PR leaves 14.1c GREEN, and 14.10f is a
 #     main-regression pin for the same reason. Keeping them is right (main's
 #     anchoring should not silently regress); calling them evidence about this diff
@@ -5559,7 +5668,7 @@ fi
 #     `:6625` / `:6770` at `dc7e3ae99`, `:6634` / `:6779` at `921109de2` and `:6639` / `:6796` at
 #     `17551325e` as comment blocks were added above them, while the CITES beside them still read
 #     `:6625` / `:6770` at all three — that divergence IS the rot this paragraph describes — and at
-#     this head the predicates are `:6797` / `:6971` — CITE-CHECK: :6797 :6971 — re-derived by the
+#     this head the predicates are `:6818` / `:6992` — CITE-CHECK: :6818 :6992 — re-derived by the
 #     guard below, like every other head cite of a predicate). One
 #     lane's response was to delete the numbers — which removes the rot but also removes the
 #     reader's target. Both intents are kept here: the number stays, and it is CHECKED.
@@ -6461,14 +6570,14 @@ assert_eq "$REC_BEFORE_14B" "$(cat "$F_HOME/.pi/agent/reviews/daniel-ospina-agen
 #       not. `if command grep -qxF -- "$marker" <<<"$body"` is ALREADY `-qxF` on main
 #       (`git show bd1b205d:scripts/record-review.sh | grep -n 'grep -qxF'` — the sha is NAMED
 #       because `origin/main` moves and a bare "main :NNNN" rots the moment it does → :2482),
-#       and in #3168's diff the only hunk at `post_marker()` (head :2679) ADDS A COMMENT above
+#       and in #3168's diff the only hunk at `post_marker()` (head :2700) ADDS A COMMENT above
 #       it (this PR does not touch `post_marker()` at all) — the
-#       predicate line (head :2701) is CONTEXT. Reverting #3168 leaves this vector GREEN; it is kept
+#       predicate line (head :2722) is CONTEXT. Reverting #3168 leaves this vector GREEN; it is kept
 #       because main's anchoring should not silently regress, and it is labelled so the
 #       next reader does not mistake it for evidence about this diff. The predicate must
 #       match the gate's line-anchored `^…$` admission, exactly like the three other
 #       sites already anchored on main (bd1b205d :4186 :6501 :6613) — the same four that the grep
-#       above prints at head, CITE-CHECK: :4427 :6797 :6971 (`14.1c-CITE` re-derives the triple).
+#       above prints at head, CITE-CHECK: :4448 :6818 :6992 (`14.1c-CITE` re-derives the triple).
 #       ⛔ ASSERTS THE TRANSPORT (a PATCH was issued), not the exit code: the destructive
 #       mutant also exited 0.
 if [ -n "${QB_LINE:-}" ]; then

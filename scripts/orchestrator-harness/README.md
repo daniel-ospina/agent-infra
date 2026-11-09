@@ -1935,20 +1935,34 @@ off macOS (it renders a launchd plist) — the portability that matters is `orch
    a **clean** threat-coverage exit. The veto therefore reads the marker's own line, and its
    acceptance criterion is the one the decision states — **coverage** — not the `residuals=` value:
    the marker is clean evidence **iff every marker in the artifact carries a legal clean value**, and
-   a legal clean value is exactly `residuals=none` **or** a FILED residual list
-   (`residuals=#1083,#1084`) **with `threats=<K>` and `covered=<K>` both present on that line and
-   EQUAL**. The filed form is the normal state of a clean bounded exit — the decision files residuals
-   "from cycle 1, not chased", renders the field `<#N,…|none>`, and two merged plans record exactly
-   that shape as clean (`docs/plans/2026-09-15-issue-1051-bounded-scan-root.md`,
-   `docs/plans/2026-09-28-issue-1505-…`) — so refusing it made the honest lane strip its own
-   disclosure to mint. **FIVE** things still refuse a marker: (i) a value that merely MENTIONS `none`
+   a legal clean value is exactly `residuals=none` **or** a FILED residual list, in **either** of its
+   two spellings — a NUMERIC list (`residuals=#1083,#1084`) **or** the bare word `filed`
+   (`residuals=filed`, case-insensitive) — **with `threats=<K>` and `covered=<K>` both present on that
+   line and EQUAL**. The filed form is the normal state of a clean bounded exit — the decision files
+   residuals "from cycle 1, not chased", renders the field `<#N,…|none>`, and three merged plans
+   record exactly that shape as clean (`docs/plans/2026-09-15-issue-1051-bounded-scan-root.md`,
+   `docs/plans/2026-09-28-issue-1505-…`, and
+   `docs/plans/2026-09-21-issue-1321-1322-skill-enforcer-gates.md:463`, whose disclosure is the bare
+   word: `threats=13 covered=13 residuals=filed`) — so refusing it made the honest lane strip its own
+   disclosure to mint. ⛔ **The bare word is accepted because it is what the fleet is INSTRUCTED to
+   write:** `skills/writing-plans/workflow/05-review-handoff.md` tells every lane to copy the
+   `[ADVERSARIAL-BOUND] … residuals=…` disclosure out of the plan doc into the PR body, so a
+   digit-only grammar refused a spelling the handoff itself produces (found in review of #3829 at
+   `3bef6262`, where `residuals=filed` with equal counts was refused by a message naming only
+   conditions the artifact already met). It widens nothing that matters: the protection is the
+   coverage comparison, which is identical for both spellings, and the word is matched EXACTLY —
+   `filed-off`, `some`, `yes`, `unknown` all still refuse. **SIX** things still refuse a marker:
+   (i) a value that merely MENTIONS `none`
    (`none,#12`, `none-filed`, `noneX`); (ii) an unsubstituted template (`<#N,…|none>`); (iii) a
    marker with **no** `residuals=` field; (iv) a **contradictory disclosure** — when the marker line
    ALSO carries `threats=N` and `covered=M` and the two DIFFER, the artifact itself admits a declared
    class went uncovered, and that refuses regardless of the value (`threats=17 covered=15` is a
-   contradiction, not a clean exit); and (v) a **FILED list with no counts** — its legality rests on
-   the coverage comparison, so without both counts it is a cannot-verify, like (iii). The TERSE
-   `residuals=none` form needs no counts and still passes: only a CONTRADICTION refuses, so demanding
+   contradiction, not a clean exit); (v) a **FILED list with no counts** — its legality rests on
+   the coverage comparison, so without both counts it is a cannot-verify, like (iii); and (vi) a
+   **digit-free value that is not the word `filed`** (`residuals=yes`, `residuals=done`) — only the
+   numeric list and the bare word assert that residuals were filed, and anything else asserts
+   nothing. The TERSE `residuals=none` form needs no counts and still passes: only a CONTRADICTION
+   refuses, so demanding
    the counts would re-create the friction #1889 removed. The count fields must identify **ONE pair on
    the marker's own line**: when a field appears more than once with DIFFERENT values (`threats=17 …
    threats=12`), or a count pair sits earlier on the line than the marker's own, the marker's pair

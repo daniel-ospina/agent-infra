@@ -1181,11 +1181,28 @@ verify_review_evidence() { # <ref> <head_sha> [polarity] -> 0 = verified
   #         artifact refuses it, so prose that merely mentions a clean form beside a real
   #         `residuals=#12` on an UNCOVERED line cannot launder the capped exit.
   #   (ii)  EVERY `residuals=` field on the marker's own line must carry a LEGAL CLEAN VALUE, which is
-  #         exactly `none` (case-insensitive, up to its own delimiter) **or** a FILED residual list —
-  #         and the filed form is admitted ONLY on POSITIVE coverage evidence: both `threats=<K>` and
-  #         `covered=<K>` present on the same line and EQUAL. Near-misses still REFUSE: values that
-  #         merely MENTION `none` (`residuals=none,#12`, `residuals=none-filed`, `residuals=noneX`),
-  #         and the unsubstituted template `residuals=<#N,…|none>`.
+  #         exactly `none` (case-insensitive, up to its own delimiter) **or** a FILED residual list in
+  #         EITHER of its two spellings: a NUMERIC list (`residuals=#1083,#1084`) **or** the bare WORD
+  #         `filed` (`residuals=filed`, case-insensitive) — and the filed form is admitted ONLY on
+  #         POSITIVE coverage evidence: both `threats=<K>` and `covered=<K>` present on the same line
+  #         and EQUAL. Near-misses still REFUSE: values that merely MENTION `none`
+  #         (`residuals=none,#12`, `residuals=none-filed`, `residuals=noneX`), and the unsubstituted
+  #         template `residuals=<#N,…|none>`.
+  #         ⛔ THE BARE WORD WAS REFUSED AND MUST NOT BE (review of #3829, measured at `3bef6262`).
+  #         The first cut of this branch demanded a DIGIT in the value, which is not a requirement any
+  #         decision states, is not one of the enumerated refusal causes, and was not named by the
+  #         refusal message — so an honest lane met a message listing only conditions it already
+  #         satisfied. It is not hypothetical: `docs/plans/2026-09-21-issue-1321-1322-skill-enforcer-gates.md`
+  #         records `[ADVERSARIAL-BOUND] cycles=2 threats=13 covered=13 residuals=filed` as that lane's
+  #         CLEAN exit (:463; :407 is its capped predecessor), and
+  #         `skills/writing-plans/workflow/05-review-handoff.md` tells every lane to copy that very
+  #         disclosure out of the plan doc into the PR body — so the fleet is INSTRUCTED to write a
+  #         spelling this arm refused, and the cheapest way to mint was rewriting a TRUE disclosure into
+  #         `none`, the inversion #1889 exists to remove. It adds no fail-open either: a numeric filed
+  #         list with equal counts is already accepted, and `filed` asserts the same thing without
+  #         enumerating it — the coverage comparison, which is where the protection actually lives, is
+  #         identical. The word is matched EXACTLY (`filed`, up to its own delimiter); every other
+  #         digit-free value (`filed-off`, `some`, `yes`, `unknown`) still refuses.
   #   (iii) A marker with NO `residuals=` field at all REFUSES: an unparseable disclosure is a
   #         cannot-verify, and a cannot-verify is never a pass (the posture of every arm here).
   #   (v)   A FILED list WITHOUT the counts REFUSES: its legality rests on the coverage comparison, so
@@ -1263,12 +1280,16 @@ verify_review_evidence() { # <ref> <head_sha> [polarity] -> 0 = verified
           _ab_ok=0
           # (ii) the documented TERSE clean value: exactly `none`, case-insensitive, up to a delimiter.
           grep -qiE '^residuals=[[:space:]]*none[,.:;)]*$' <<<"$_ab_f" && _ab_ok=1
-          # (ii-b) the OTHER legal clean value — a FILED residual list — admitted ONLY when coverage is
-          # POSITIVELY established on the same line (both counts present and equal; (iv) already
-          # refused a contradiction). A value that merely MENTIONS `none`, or the unsubstituted
-          # template, is not a filed list and refuses here: the list must carry a digit and none of
-          # `none`, `<`, `>`, `…`.
+          # (ii-b)/(ii-c) the OTHER legal clean value — a FILED residual list — admitted ONLY when
+          # coverage is POSITIVELY established on the same line (both counts present and equal; (iv)
+          # already refused a contradiction). BOTH spellings are one self-contained branch each, so a
+          # mutation pin can disable one and prove the other still works: (ii-b) a NUMERIC list (it
+          # must carry a digit and none of `none`, `<`, `>` or an ellipsis), and (ii-c) the SAME
+          # assertion in words — the bare word `filed`, case-insensitive up to its own delimiter, with
+          # an optional space after the `=` as in (ii). The word is matched EXACTLY, so `filed-off`,
+          # `some` and `yes` still refuse. Pinned by 13m6k/13m6l and 13m6q/13m6r.
           if [ "$_ab_ok" -ne 1 ] && [ -n "$_ab_t" ] && [ "$_ab_t" = "$_ab_c" ] && ! grep -qiE 'none|<|>|…' <<<"$_ab_v" && grep -qE '[0-9]' <<<"$_ab_v"; then _ab_ok=1; fi
+          if [ "$_ab_ok" -ne 1 ] && [ -n "$_ab_t" ] && [ "$_ab_t" = "$_ab_c" ] && ! grep -qiE 'none|<|>|…' <<<"$_ab_v" && grep -qiE '^[[:space:]]*filed[,.:;)]*$' <<<"$_ab_v"; then _ab_ok=1; fi
           [ "$_ab_ok" -eq 1 ] || break
         # ⛔ `[[:space:]]*` AFTER THE `=` IS LOAD-BEARING, AND IT HAS TO BE REACHABLE (#3829 review). The
         # predicate above accepts `residuals= none` — the spelling a human types — but the first
@@ -1287,7 +1308,7 @@ verify_review_evidence() { # <ref> <head_sha> [polarity] -> 0 = verified
       _ab_rest="${_ab_rest#*"$_ab_sep"}"
     done
     if [ "$_ab_bad" -eq 1 ]; then
-      echo "   $kind $id carries an [ADVERSARIAL-BOUND] disclosure that is NOT the clean form (${_ab_seen:-unparseable}) — the token marks TWO exits, and its own fields split them: a CLEAN bounded exit is \`residuals=none\` OR a filed residual list with \`threats=\` and \`covered=\` present and EQUAL (agent-infra#1889, #3829)." >&2
+      echo "   $kind $id carries an [ADVERSARIAL-BOUND] disclosure that is NOT the clean form (${_ab_seen:-unparseable}) — the token marks TWO exits, and its own fields split them: a CLEAN bounded exit is \`residuals=none\` OR a filed residual list — \`residuals=#1083,#1084\`, or the bare word \`residuals=filed\` — with \`threats=\` and \`covered=\` present and EQUAL (agent-infra#1889, #3829). Any OTHER value refuses, including one that merely MENTIONS \`none\` and the unsubstituted template." >&2
       echo "   If the review DID conclude clean, its disclosure must read \`[ADVERSARIAL-BOUND] cycles=<N> threats=<K> covered=<K> residuals=<#N,…|none>\` with nothing left uncovered — the machine-readable line belongs in the PR BODY, and this post may spell it out in plain words instead; if the exit was capped, name the capped artifact and record the not-clean outcome instead." >&2
       return 1
     fi
