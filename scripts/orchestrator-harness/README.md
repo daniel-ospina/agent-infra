@@ -1929,23 +1929,36 @@ off macOS (it renders a launchd plist) — the portability that matters is `orch
    legitimate clean phrasing "No issues remain after the fixes" — which also means a CLEAN comment
    whose body says (uncounted) that issues remain does pass the veto. Quote the gate's list, not a
    wider one.
-   ⛔ **`[ADVERSARIAL-BOUND]` is deliberately NOT in that flat list — it is split by its own field**
-   (agent-infra#1889). The token marks TWO exits: `fixer-loop.md` emits it for
+   ⛔ **`[ADVERSARIAL-BOUND]` is deliberately NOT in that flat list — it is split by its own fields**
+   (agent-infra#1889, #3829). The token marks TWO exits: `fixer-loop.md` emits it for
    `EXIT_REASON == "adversarial-capped"`, and `AGENTS.md` §Hard Cap REQUIRES it as the disclosure of
-   a **clean** threat-coverage exit. The veto therefore reads the `residuals=` value: the marker is
-   clean evidence **iff every marker in the artifact says `residuals=none`**. **FOUR** things still
-   refuse a marker — the first three are on the `residuals=` value itself, the fourth is on the counts
-   beside it: (i) a non-`none` value (`#12`, `filed`, `none,#12`); (ii) an unsubstituted template
-   (`<#N,…|none>`); (iii) a marker with **no** `residuals=` field; and (iv) a **contradictory
-   disclosure** — when the marker line ALSO carries `threats=N` and `covered=M` and the two DIFFER,
-   `residuals=none` beside a declared class the artifact itself admits was not covered is refused
-   (`threats=17 covered=15 residuals=none` is a contradiction, not a clean exit). The counts are not
-   required: only a CONTRADICTION refuses, so the terse `residuals=none` form with neither field still
-   passes. The comparison takes the FIRST `threats=`/`covered=` on the line, so a cycle-log line that
-   mentions an earlier `covered=` before the marker's own fields is refused too — fail-closed, and
-   diagnosed by the refusal message. Matching the bare token refused the honest case — the lane
-   whose verifier returned `THREAT SURFACE COVERED` with nothing filed — which made the cheapest way
-   to pass be DROPPING the mandated disclosure, inverting the arm's own intent.
+   a **clean** threat-coverage exit. The veto therefore reads the marker's own line, and its
+   acceptance criterion is the one the decision states — **coverage** — not the `residuals=` value:
+   the marker is clean evidence **iff every marker in the artifact carries a legal clean value**, and
+   a legal clean value is exactly `residuals=none` **or** a FILED residual list
+   (`residuals=#1083,#1084`) **with `threats=<K>` and `covered=<K>` both present on that line and
+   EQUAL**. The filed form is the normal state of a clean bounded exit — the decision files residuals
+   "from cycle 1, not chased", renders the field `<#N,…|none>`, and two merged plans record exactly
+   that shape as clean (`docs/plans/2026-09-15-issue-1051-bounded-scan-root.md`,
+   `docs/plans/2026-09-28-issue-1505-…`) — so refusing it made the honest lane strip its own
+   disclosure to mint. **FIVE** things still refuse a marker: (i) a value that merely MENTIONS `none`
+   (`none,#12`, `none-filed`, `noneX`); (ii) an unsubstituted template (`<#N,…|none>`); (iii) a
+   marker with **no** `residuals=` field; (iv) a **contradictory disclosure** — when the marker line
+   ALSO carries `threats=N` and `covered=M` and the two DIFFER, the artifact itself admits a declared
+   class went uncovered, and that refuses regardless of the value (`threats=17 covered=15` is a
+   contradiction, not a clean exit); and (v) a **FILED list with no counts** — its legality rests on
+   the coverage comparison, so without both counts it is a cannot-verify, like (iii). The TERSE
+   `residuals=none` form needs no counts and still passes: only a CONTRADICTION refuses, so demanding
+   the counts would re-create the friction #1889 removed. The comparison takes the FIRST
+   `threats=`/`covered=` on the line, so a cycle-log line that mentions an earlier `covered=` before
+   the marker's own fields is refused too — fail-closed, and diagnosed by the refusal message.
+   ⛔ **THE REMAINING SEAM, stated rather than hidden:** a capped run that substituted equal counts and
+   filed nothing writes `residuals=none` and mints; the two exits cannot be told apart in-band (the
+   capped emission carries the same text). Omitting the marker was always available, so this is not a
+   new capability — but the gate's claim is "the disclosure is checked", not "the exit label is
+   re-derived". Matching the bare token refused the honest case — the lane whose verifier returned
+   `THREAT SURFACE COVERED` with nothing filed — which made the cheapest way to pass be DROPPING the
+   mandated disclosure, inverting the arm's own intent.
 3. **Scope adapts to the queue — and can be pinned.** `open PRs > 10` → **broad** mode: the sweep
    covers every non-draft PR in the repo except the branch classes it deliberately never touches
    (`design/`, `scope/`, `dependabot/` — the selector is
