@@ -1003,11 +1003,11 @@ def _odd_backslashes(s):
 def _strip_comment(line):
     """`line` with a trailing comment removed — bash's rule: an unquoted `#` that starts a WORD.
 
-    ⛔ NO GUARD IN THIS SCANNER IS UNDECLARED ANY MORE, BUT ELEVEN ARE LOAD-BEARING AND UNPINNED — DECLARED
+    ⛔ NO GUARD IN THIS SCANNER IS UNDECLARED ANY MORE, AND THE ONES NOTHING PINS ARE NAMED BELOW — DECLARED
     HERE, BECAUSE "EVERY GUARD IS PINNED OR DECLARED" WAS FALSE UNTIL EVERY GUARD WAS MUTATED ONE AT A TIME
     (baseline 246/0; population `git ls-files '*.sh'`, which was 435 when that sweep ran and is 438 now).
-    ⛔ ONE OF THE ELEVEN IS PINNED FOR ONE MEMBER OF ITS CONDITION — see the word-set bullet, which is split
-    by member because the mutant's delta depends on which character you pull.
+    ⛔ ONE OF THE GUARDS LISTED BELOW IS PINNED FOR ONE MEMBER OF ITS CONDITION — see the word-set bullet,
+    which is split by member because the mutant's delta depends on which character you pull.
 
     LOAD-BEARING, UNPINNED — a VALID-bash input separates the guard from its mutant (`bash -n` rc 0, and
     `declare -F` agrees with the BASELINE and not with the mutant), NO fixture line carries that input, and
@@ -1034,8 +1034,9 @@ def _strip_comment(line):
         RED) on valid bash. Moves 0 files, and no fixture line carries the spaced spelling.
       * `_openers`' QUOTE-CLOSE test (inside the double-quote state) — delete `if c == quote: quote = None`
         and every definition after `echo "a" ; cat <<EOF` + a body is invented as a body line (FALSE RED);
-        it moves 41 of the 438 files and invents 109 names, so this is the LARGEST unpinned delta in the
-        scanner and it was undeclared until this note.
+        it moves 41 of the 438 files and invents 109 names — the largest delta among the guards THIS BLOCK
+        declares (the `head` anchor, declared separately below, is larger at 66 files and 133 names) — and
+        it was undeclared until this note.
       * `_openers`' IN-QUOTE escape (`if c == '\\': i += 2` inside that state) — a separate condition from
         the outside-quote escape below; `echo "a \\" # b" ; cat <<EOF` + a body invents the body line, and
         it moves 1 file (`rank-queue.test.sh`, losing 15 names).
@@ -1064,10 +1065,10 @@ def _strip_comment(line):
     proof that the guard is load-bearing.
 
     ⛔ SO THIS IS A DECLARATION, NOT A PIN, and it says so: writing the shapes above into `FIXTURE` is the
-    work that turns them into pins — TEN shapes for TWELVE guards, because one single-quoted spelling
+    work that turns them into pins — one shape per guard named below, because one single-quoted spelling
     separates the setter, the single-quote BRANCH and (in the same statement) the setter's own quote tuple,
     while the blanket double-quote branch needs the OTHER quote character. Until then a lane that
-    "simplifies" one of those twelve is removing bash-faithfulness that only the fixture would catch. Each
+    "simplifies" one of those guards is removing bash-faithfulness that only the fixture would catch. Each
     shape is written out by name rather than counted, because the names are what survives a new head — and
     the population numbers above will be stale at the next head, which is the argument for the shape and
     against the count.
@@ -1198,13 +1199,14 @@ def _openers(line):
                 quoted = True
                 q = line[j]
                 j += 1
-                # ⛔ DECLARED NO-OP, not a pinned arm (round 48 review, P3 — measured): a quoted delimiter
-                # holding a character OUTSIDE [A-Za-z0-9_.-] (e.g. `<<'A,B'`) is the only spelling that tells
-                # this branch from the fallback loop below, and no fixture line carries one — deleting the
-                # branch leaves the suite at 246/0 and changes the scan of 0 of the `git ls-files '*.sh'`
-                # population it was measured over (435 then, 438 at this head). Declared rather than pinned
-                # because a pin here would encode a spelling no real script uses; if one ever appears, this
-                # note is the fixture to write.
+                # ⛔ NOT REACHED BY THIS POPULATION — and LOAD-BEARING, not a no-op, which is the label this
+                # note carried until it was mutated: a quoted delimiter holding a character OUTSIDE
+                # [A-Za-z0-9_.-] (`<<'A,B'`) is the only spelling that tells this branch from the fallback
+                # loop, and deleting the branch LOSES a real definition (`after` disappears on valid bash,
+                # `bash -n` rc 0) — a FALSE PASS in the namespace arm's direction. It moves 0 of the 438
+                # files and no fixture line carries the spelling, so nothing here reaches it; declared
+                # because a pin would encode a spelling no real script uses, and that spelling is the
+                # fixture to write if one ever appears.
                 if q in ("'", '"'):          # a QUOTED delimiter may hold any character
                     while j < n and line[j] != q:
                         delim += line[j]
