@@ -2953,10 +2953,23 @@ SAFE_SEND_RC = {0: "DELIVERED (consumed)", 3: "REFUSED (lane busy or state unkno
 
 # Phrases with which safe-send.sh says NOTHING was consumed. These are the only refusals that may be
 # retried on the next poll; everything else non-zero is suppressed until the failure shape changes.
+# ⛔ THIS IS A COPY OF ANOTHER FILE'S WORDING, SO IT DRIFTS SILENTLY — AND THE DRIFT IS PERMANENT
+# SUPPRESSION, not a cosmetic mismatch. rc 5 is deliberately NOT in the refused set below (it also
+# means sent-but-unconfirmed), so a reworded FATAL loses its entry, falls through to rc 5's AMBIGUOUS
+# class, and the fleet's only controller alert is then suppressed on every later poll (#3836 F1
+# re-worded the interpreter refusal and did exactly that). The phrase below is deliberately the one
+# BOTH of safe-send.sh's pre-send refusals say, so the class is covered by a shared wording rather
+# than by two entries that can each go stale; the test
+# `test_every_FATAL_pre_send_refusal_in_safe_send_is_REFUSED` reads the real script and grades every
+# such line it finds, so a future reword reddens the suite instead of silencing the canary.
 NOTHING_CONSUMED_PHRASES = (
     "Nothing consumed",          # rc 3 lane-guard refusal
     "Nothing was written",       # rc 5 FAILED-TO-START
-    "no python3.12 found",       # rc 5 FATAL (no send attempted)
+    "nothing was sent",          # rc 5 FATAL — no interpreter >= 3.12, or no cmux_dispatch.py producer
+    "no python3.12 found",       # the PRE-#1957 wording of the interpreter refusal: dead against
+                                 # this tree's safe-send.sh, kept for a box whose FARMED copy of it
+                                 # predates the rewording (the canary always runs its sibling, but a
+                                 # partially re-farmed box is a pairing we do not control)
     "usage:",                    # rc 2
 )
 
