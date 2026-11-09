@@ -287,8 +287,9 @@ workers_maybe_live() {
 #                        name is what puts both layers in front of every lane's and worker's `gh` too.
 #                        Without it only the controller would be served. ORDER MATTERS: the adapter
 #                        routes every call through the same `$O/gh-limit.py`, so it must resolve first
-#                        or the adapter is never reached (this file's `start` builds exactly that order,
-#                        :3945; `lane.sh:83-84` re-asserts it for lanes).
+#                        or the adapter is never reached (this file's `start` builds exactly that order
+#                        in both carriers — :4101 for the service-mode export, :4129 for the tmux
+#                        string; `lane.sh:83-84` re-asserts it for lanes).
 WORKER_ENV_NAMES="AI_REVIEW_GATE_KEY HOME O DEEPSEEK_API_KEY PATH"
 
 log_line() { printf '%s %s\n' "$(date -u +%FT%TZ)" "$*"; }
@@ -3116,7 +3117,7 @@ cmd_check() {
   # search, so the probe was answered by `$O/gh-rest/gh` or the real binary and rc=0 certified a box
   # whose rate-limit layer is INERT — the identical false PASS the adapter block below was fixed for
   # (and the same mechanism mise/asdf document as shim fall-through). (2) It is not the session's PATH
-  # either: `start` leads with `$O/gh-rest` (:3945), so no `PATH=` form here answers about an order
+  # either: `start` leads with `$O/gh-rest` (:4101, :4129), so no `PATH=` form answers about the order
   # this box will ever have. The MODE is therefore required (and named), and the layer is executed BY
   # PATH — the same rule, applied three lines early because the adapter probe sits one layer down.
   if [ -f "$O/gh-limit/gh" ] && [ -f "$O/gh-limit.py" ]; then
@@ -3163,7 +3164,16 @@ cmd_check() {
     # shape the Mac's install.sh prints. A status verb that stays silent about a seeded shim leaves the
     # next GraphQL exhaustion to be diagnosed from a log line that names neither.
     if [ -f "$O/gh-limit.py" ]; then
-      log_line "ok: gh REST adapter -> $O/gh-rest (first on the controller's PATH, ahead of $O/gh-limit; its limit layer is $O/gh-limit.py) — a GraphQL refusal degrades the pre-flight to REST instead of stopping dispatch (#2039)"
+      # ⛔ THE SENTENCE NAMES THE READ THAT MOVED, AND ONLY IT (fresh review round 7, P2, measured). It
+      # used to end "a GraphQL refusal degrades the pre-flight to REST instead of stopping dispatch" —
+      # FALSE on the second half, and it contradicted this PR's own body. The pre-flight's ISSUE read
+      # (`gh issue view`) moved to REST, but its BLOCKING open-PR read still asks
+      # `mergedAt,closingIssuesReferences`, neither of which is in the adapter's `PR_FIELDS`
+      # (`gh-rest/gh:184`), so `fields_ok pr || delegate` (`gh-rest/gh:506`) hands the whole call back to
+      # GraphQL — still refused — and the tool's own REST rescue then marks the surface
+      # `closing-references-unmeasured` and exits 2, which STOPS dispatch. `check` is the artifact an
+      # operator reads on the cell, so it must not promise the half the chain does not deliver.
+      log_line "ok: gh REST adapter -> $O/gh-rest (first on the controller's PATH, ahead of $O/gh-limit; its limit layer is $O/gh-limit.py) — the pre-flight's ISSUE read is served over REST, so a GraphQL refusal no longer makes it INCOMPLETE; the blocking open-PR read is still GraphQL (#2143, #2039)"
     else
       log_line "ok: gh REST adapter -> $O/gh-rest (first on the controller's PATH) — but $O/gh-limit.py is ABSENT, so its calls are NOT serialised or backed off (#1988)"
     fi

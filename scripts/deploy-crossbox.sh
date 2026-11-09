@@ -145,7 +145,7 @@ cp -p "$H"/*.sh "$O"/ || die "seed failed"
 # `_seed_one: command not found`; `set -uo pipefail` has no `-e`, so the deploy did not die, printed
 # "seeded the gh REST adapter" over an EMPTY `$O/gh-rest`, and started the controller with a
 # non-existent dir leading its PATH — i.e. the #2039 defect this seed exists to remove, plus a false
-# success line over it (#2041's shape). Same hoist as `cloud-cell-supervisor.sh:2352`.
+# success line over it (#2041's shape). Same hoist as `cloud-cell-supervisor.sh:2390`.
 _seed_one() {  # <src> <dest>
   local _src="$1" _dst="$2" _tmp="$O/.seed-$(basename "$2").$$"
   cp -p "$_src" "$_tmp" || { rm -f "$_tmp"; die "cannot stage $(basename "$_dst") into $O"; }

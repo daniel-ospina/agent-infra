@@ -5658,7 +5658,7 @@ say_case "the cell seeds the gh REST adapter into \$O and puts it FIRST on the c
 # box can RUN it and the adapter resolves `$SELF_DIR/../gh-limit.py` = `$O/gh-limit.py`, so a stub would
 # let a broken seed pass. `gh` itself IS a stub, and it is what the adapter must find at the END of its
 # walk — past both seeded shim directories.
-# ⛔ IT SEEDS ITS OWN `bin`, AND THAT IS DELIBERATE: `P` is re-pointed at `$T/peer` (:2988) long before
+# ⛔ IT SEEDS ITS OWN `bin`, AND THAT IS DELIBERATE: `P` is re-pointed at `$T/peer` (:3259) long before
 # this section, so borrowing `$P/bin` gave an EMPTY stub dir — `check` then found the host's real `gh`
 # and refused with "gh not authenticated", which read as five #2039 defects (measured). A fixture that
 # silently loses its stubs is worse than one that never had them.
