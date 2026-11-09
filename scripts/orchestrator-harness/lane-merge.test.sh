@@ -1511,6 +1511,11 @@ OUT="$(PATH="$BIN:$PATH" GH_LOG="$T/gh.log" O="$OT" HOME="$T/home" REPO_PATH="${
 _w43="$(verdict_of 43 | sed -n 's/.*after \([0-9][0-9]*\)s.*/\1/p')"
 ck "LANE_TIMEOUT=0 (the documented 'wall axis OFF' value) is UNBOUNDED, not a 0 s budget — the 6 s wait is honoured (handed off after ${_w43:-?}s) instead of clamping to 0 and handing off on the first poll for ever" \
    $([ "$RC" = 11 ] && [ "$(verdict_of 43 | cut -d' ' -f1)" = WAITING_CHECKS ] && ! grep -q 'CAPPED at' <<<"$OUT" && grep -q 'LANE_TIMEOUT=0 is the documented' <<<"$OUT" && [ -n "${_w43:-}" ] && [ "${_w43:-0}" -ge 5 ] && echo 0 || echo 1)
+# ⛔ AND PIN THE RENDERING, NOT THE SOURCE TEXT (review cycle 12, observation 1): the defect that shipped
+# was a backtick being SUBSTITUTED, so an arm that greps the source sentence passes on the broken tree.
+# These two clauses read the message that actually came out.
+ck "…and its rendered disclosure really contains the word --watch and emits no 'command not found' (a substituted backtick deletes the word and prints the error)" \
+   $(grep -qF -- '--watch supervision allowance' <<<"$OUT" && ! grep -q 'command not found' <<<"$OUT" && echo 0 || echo 1)
 # …and the PRODUCTION path is the token, not the seam, so it is pinned too: `lane.sh` stamps
 # `<issue>.<pid>.<epoch>` into `$O/logs/lane-<issue>.owner` before spawning the agent. A live pid (`$$`,
 # this suite) plus an epoch 7180 s ago must clamp exactly as the seam does — the earlier draft wrote this
@@ -1519,8 +1524,17 @@ ck "LANE_TIMEOUT=0 (the documented 'wall axis OFF' value) is UNBOUNDED, not a 0 
 new_o "$T/pr4.tsv"
 printf '%s.%s.%s\n' 41 "$$" "$(( $(date +%s) - 7180 ))" > "$OT/logs/lane-41.owner"
 WAIT_S=60 POLL_S=5 run 41 --issue 41 --repo o/r --pr-tsv "$T/pr4.tsv" --checks-tsv "$T/checks-inflight.tsv"
-ck "the RUN TOKEN lane.sh stamps is read as the lane's elapsed (10-digit epoch accepted, live pid accepted) → the same 10 s cap" \
-   $([ "$RC" = 11 ] && grep -q 'CAPPED at 10s' <<<"$OUT" && grep -q 'already spent 7180s' <<<"$OUT" && echo 0 || echo 1)
+# ⛔ ASSERT THE RELATION, NEVER TWO STAMPED INTEGERS (review cycle 12, P2 — MEASURED). The epoch
+# below is stamped with the SUITE's `date`, but the script recomputes `elapsed = date - epoch` after its own
+# startup, so crossing one whole second between the two makes the message read `CAPPED at 9s` /
+# `already spent 7181s` and an exact-match arm REDS ON A CORRECT TREE. Measured on an idle box: 1 in 24
+# runs (4 %) rendered 7181; on a loaded CI runner the window exceeds a second and it reds nearly always —
+# and this suite is a CI shard, so that is a false red for EVERY PR, not a local annoyance. The invariant
+# is arithmetic and does not drift: `elapsed + cap == LANE_WALL_S - _hb_margin` (7200 − 10 = 7190).
+_cap41="$(sed -n 's/.*CAPPED at \([0-9][0-9]*\)s.*/\1/p' <<<"$OUT" | head -1)"
+_spent41="$(sed -n 's/.*already spent \([0-9][0-9]*\)s.*/\1/p' <<<"$OUT" | head -1)"
+ck "the RUN TOKEN lane.sh stamps is read as the lane's elapsed (10-digit epoch accepted, live pid accepted) → cap ${_cap41:-?}s + spent ${_spent41:-?}s = 7190, the clock minus the hand-off margin" \
+   $([ "$RC" = 11 ] && [ "$(verdict_of 41 | cut -d' ' -f1)" = WAITING_CHECKS ] && [ -n "${_cap41:-}" ] && [ -n "${_spent41:-}" ] && [ $(( ${_cap41:-0} + ${_spent41:-0} )) -eq 7190 ] && echo 0 || echo 1)
 # …and a token from a run that is OVER must not clamp a later invocation to 0 (the file is per-ISSUE and
 # outlives the run that wrote it), so the pid in it is required to be THIS run's ANCESTOR — not merely
 # a live process. Two arms: a DEAD pid, and a LIVE pid that is not in the chain that leads here.
@@ -1582,8 +1596,12 @@ ck "--status emits NOTHING but the verdict record even when the cap conditions h
 # so the operator-facing line shipped corrupted, and `bash -n` cannot see it. A prefix-grep arm cannot either,
 # which is why this arm is generic: EVERY say_err in the file is scanned for a backtick.
 _btick="$(printf '\140')"
-ck "no say_err message carries a backtick inside its double quotes (it would run as COMMAND SUBSTITUTION and silently delete the word from the operator-facing line)" \
-   $(! grep 'say_err "' "$SCRIPT" | grep -qF "$_btick" && echo 0 || echo 1)
+# Scope, stated exactly: this scans the single-line `say_err "`, `log_line "`, `disposition "`, `verdict "`
+# and `post_handoff "` EMITTERS. A multi-line message, or a backtick in some other emitter, is not
+# covered — none exists today (every other non-comment backtick in the file sits inside a
+# SINGLE-QUOTED printf format, where it is literal), so this is a stated scope and not a hole.
+ck "no say_err / log_line / disposition / verdict / post_handoff message carries a backtick inside its double quotes (it would run as COMMAND SUBSTITUTION and silently delete the word from the operator-facing line)" \
+   $(! grep -E '(say_err|log_line|disposition|verdict|post_handoff) "' "$SCRIPT" | grep -qF "$_btick" && echo 0 || echo 1)
 ck "the LANE_TIMEOUT=0 disclosure still states that --watch supervision stays FINITE (so it cannot read as 'this lane has no bounds at all')" \
    $(grep -q 'ONLY THE CHECK WAIT IS UNBOUNDED HERE' "$SCRIPT" && echo 0 || echo 1)
 

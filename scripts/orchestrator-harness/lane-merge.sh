@@ -1577,7 +1577,7 @@ else
   # still be rejected for being a non-ancestor (an operator would check `kill -0`, see it alive, and have no
   # way to reconcile that with the message), and `--issue` is what makes the token FINDABLE — it is not
   # what makes it apply, because a controller re-running this script is not under a lane.
-  say_err "lane-merge: this lane's elapsed wall-clock time could not be resolved — no run token OF THIS LANE at \$O/logs/lane-${ISSUE:-<issue>}.owner (absent, unreadable, future-dated, or naming a pid that is not an ANCESTOR of this script) and LANE_MERGE_ELAPSED_S is unset — so the ${WAIT_S}s check wait is NOT clamped to what is left of LANE_WALL_S=${LANE_WALL_S}s, and a lane that entered its merge phase late can be TERMed mid-wait with no verdict (#3584 review, P1). ⛔ THE REMEDY IS LANE_MERGE_ELAPSED_S=<seconds>; --issue only makes the token findable, and a token whose pid is not this script's ancestor is never read as this lane's age."
+  say_err "lane-merge: this lane's elapsed wall-clock time could not be resolved — no run token OF THIS LANE at \$O/logs/lane-${ISSUE:-<issue>}.owner (absent, unreadable, future-dated, or naming a pid that is not an ANCESTOR of this script) and LANE_MERGE_ELAPSED_S is unset or unusable — so the ${WAIT_S}s check wait is NOT clamped to what is left of LANE_WALL_S=${LANE_WALL_S}s, and a lane that entered its merge phase late can be TERMed mid-wait with no verdict (#3584 review, P1). ⛔ THE REMEDY IS LANE_MERGE_ELAPSED_S=<seconds>; --issue only makes the token findable, and a token whose pid is not this script's ancestor is never read as this lane's age."
 fi
 _wait_t0="$(date +%s)"
 deadline=$(( _wait_t0 + WAIT_S ))
