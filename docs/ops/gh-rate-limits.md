@@ -194,13 +194,17 @@ What the controller now does (`orch-loop.sh`, the `# BEGIN gh-bound` block):
   `until` and `time` were unmodelled while `while` was), so the alternation's group carries all four.
   The stripper keeps the code inside
   `$( … )` and blanks only the literal around it, so the quoted and unquoted spellings of one call are
-  seen alike. All of it is graded by ONE fixture, so each is a pinned property rather than prose, and
-  every alternative in the scan's group has its OWN row — the multi-line arm, the one-line `case`, the
-  `while`/`until` loop heads, the other keyword heads (`if`, `then`, `elif`, `!`, `do`, `else`), the
-  `time`/`exec` wrappers, the `{`/`|`/`&`/`(` anchors,
-  `x="$(gh api …)"` (incl. the `orch-loop.sh:4910` shape), and an ASSIGNMENT-PREFIXED call
-  (`X=1 gh api …` — bash's grammar admits `[assignment]… command`, so the command word there is a
-  real command position with no `)`/`|`/keyword anchor) MUST red; an already-bounded arm, its
+  seen alike. All of it is graded by ONE fixture, so each is a pinned property rather than prose.
+  Every LOAD-BEARING alternative in the scan's group has its OWN row, and each of these MUST red:
+  the multi-line arm, the one-line `case`, the `while`/`until` loop heads, the other keyword heads
+  (`if`, `then`, `!`, `do`, `else`), the `time`/`exec` wrappers, the `{`/`|`/`&`/`(` anchors, a
+  `command`-prefixed call behind `;` (`; command gh api …`), `x="$(gh api …)"` (incl. the
+  `orch-loop.sh:4910` shape), and an ASSIGNMENT-PREFIXED call (`X=1 gh api …` — bash's grammar
+  admits `[assignment]… command`, so the command word there is a real command position with no
+  `)`/`|`/keyword anchor). The two alternatives that are NOT row-pinned are measured TRUE
+  redundancies, not assumed: `elif` (the group is not word-anchored, so `if` matches its tail) and
+  the `$\(` alternative (the `(` in the anchor class matches the same character) — deleting
+  either leaves the suite GREEN *and* the scan still catches the line. An already-bounded arm, its
   assignment-prefixed spelling (`X=1 gh_bounded api …`), `pattern="a) gh api"` (and its SINGLE-quoted
   spelling `pattern='a) gh api'`), a literal `) gh` in
   prose, and an already-bounded capture MUST NOT. What is

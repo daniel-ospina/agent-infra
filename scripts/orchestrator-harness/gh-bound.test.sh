@@ -317,14 +317,23 @@ esac
 #     invisible to the scan that feeds the 0-unbounded-sites row) — a survived mutant in a group that
 #     has been edited in four of nine review rounds (agent-infra#2028 review round 9). Measured at this
 #     head, the same was true of `if`, `then`, `!`, `do`, `else`, `{`, `|`, `&` and `(`, so each got a
-#     row; deleting any of those alternatives now REDS. THREE alternatives stay unpinned on purpose,
+#     row; deleting any of those alternatives now REDS. TWO alternatives stay unpinned on purpose,
 #     because another one covers every position they cover (measured, deleting each leaves the suite
 #     GREEN *and* the scan still catches the line): `elif` (row 25 — the group is not word-anchored, so
 #     `if` matches its tail — the same reason `sudo` REDS), `$\(` (the `(` in `[|;&({]` matches the same
-#     character) and `(command[ \t]+)?` (`command` sits behind `$(` with no space, which the assignment
-#     group's `[^ \t]*` swallows) — all three err CLOSED, so a redundancy, never a gap. The residual is
-#     the whole WRAPPER CLASS, not one spelling of it: of the wrapper words the group carries only
-#     `time` and `exec` (its other members are the keywords `if`/`then`/`elif`/`while`/`until`/`!`/
+#     character) — both err CLOSED, so a redundancy, never a gap.
+#     ⛔ `(command[ \t]+)?` is NOT in that set, and reading it as one was WRONG (review round 10):
+#     `command` reaches the command word after `;`/`|`/`&&`, behind a keyword head, and under `$(`
+#     with NO assignment word in front of it — so deleting the alternative left the suite GREEN while
+#     `; command gh api …`, `| command gh api …`, `then command gh api …` and `if command gh api …`
+#     all became INVISIBLE to the scan that feeds the 0-unbounded-sites row: a survived mutant in a
+#     load-bearing branch, the same class round 9 fixed for `while`. Row 8 was the only row still
+#     firing, and only because it carries `Z=` earlier on the line (the assignment group's `[^ \t]*`
+#     swallows it) — one fixture line, never the alternative. It has its OWN row now (33), and
+#     `command gh` is a spelling this repo already uses: `gh_bounded`'s degraded pass-through,
+#     `orch-loop.sh:558`. The residual is the whole WRAPPER CLASS, not one spelling of it: of the
+#     wrapper words the group carries only `time` and `exec` (its other members are the keywords
+#     `if`/`then`/`elif`/`while`/`until`/`!`/
 #     `do`/`else`), so `env`, `nice`, `timeout`, `xargs`, `nohup` and `stdbuf` are unmodelled whether or
 #     NOT an assignment follows — measured at this head (`env gh api …`, `env GH_TOKEN=x gh api …` and
 #     `nice gh api …` are all invisible; `exec gh api …` reports). `sudo` is the sole exception, and
@@ -395,7 +404,7 @@ UNBOUNDED="$(_unbounded_scan "$LOOP")"
   || bad "structural: unbounded gh call site(s) remain in orch-loop.sh:
 $UNBOUNDED"
 # …and the catcher itself must SEE every command position a call can be hidden in, or a future site
-# written the other way passes with this assertion still green. Thirty-two lines, each graded:
+# written the other way passes with this assertion still green. Thirty-three lines, each graded:
 #   1  a multi-line arm, unbounded              -> MUST be reported
 #   2  a multi-line arm, already bounded        -> must NOT (else every case-arm site reds)
 #   3  a ONE-LINE `case … in pat) gh api …`     -> MUST be reported (the form `orch-loop.sh` uses 88x)
@@ -439,6 +448,11 @@ $UNBOUNDED"
 #  30  a `|` pipe                                                  -> MUST (anchor alternative)
 #  31  a `&&` list                                                 -> MUST (anchor alternative)
 #  32  a `(` subshell open                                         -> MUST (anchor alternative)
+#  33  a `command`-prefixed call after `;` (`; command gh api …`)  -> MUST (the `(command[ \t]+)?`
+#      alternative's OWN row: with NO assignment word in front of it, that alternative is the only
+#      anchor for `[;|&]… command gh`, `then|do|else|if … command gh` and a `$(… command gh…)`
+#      substitution — deleting it leaves those positions UNSCANNED while the suite stays GREEN
+#      unless this row exists. Coverage, not the redundancy review round 10 took it for.)
 printf '%s\n' \
   'core) gh api repos/o/r/pulls' \
   '  other) gh_bounded api repos/o/r' \
@@ -471,12 +485,13 @@ printf '%s\n' \
   '{ gh api repos/o/r; }' \
   'x | gh api repos/o/r' \
   'x && gh api repos/o/r' \
-  '( gh api repos/o/r )' > "$T/casearm.sh"
+  '( gh api repos/o/r )' \
+  '; command gh api repos/o/r' > "$T/casearm.sh"
 CASEARM="$(_unbounded_scan "$T/casearm.sh")"
-if [ "$(awk -F: '{print $1}' <<<"$CASEARM" | tr '\n' ' ')" = "1 3 6 7 8 9 10 13 14 15 16 17 18 20 22 23 24 25 26 27 28 29 30 31 32 " ]; then
-  ok "structural: every command position IS caught — both \`case\` layouts, the \`while\`/\`until\` loop heads, the other keyword heads (\`if\`/\`then\`/\`elif\`/\`!\`/\`do\`/\`else\`) and the \`{\`/\`|\`/\`&\`/\`(\` anchors, the \`time\`/\`exec\` wrappers, an assignment-prefixed call (\`X=1 gh api …\`), a \`\$( … gh …)\` substitution inside a double-quoted span (incl. the pre-fix capture idiom from orch-loop.sh:4910), AND an ESCAPED quote (\`it\\'s\`) or an ANSI-C \`\$'…'\` span around it — while a literal \`) gh\` in DOUBLE or SINGLE quotes and an already-bounded call (bare or assignment-prefixed) do not red it: the blind spot is closed, not documented"
+if [ "$(awk -F: '{print $1}' <<<"$CASEARM" | tr '\n' ' ')" = "1 3 6 7 8 9 10 13 14 15 16 17 18 20 22 23 24 25 26 27 28 29 30 31 32 33 " ]; then
+  ok "structural: every command position IS caught — both \`case\` layouts, the \`while\`/\`until\` loop heads, the other keyword heads (\`if\`/\`then\`/\`elif\`/\`!\`/\`do\`/\`else\`) and the \`{\`/\`|\`/\`&\`/\`(\` anchors, the \`time\`/\`exec\` wrappers, an assignment-prefixed call (\`X=1 gh api …\`), a \`command\`-prefixed call behind a \`;\` (\`; command gh api …\`), a \`\$( … gh …)\` substitution inside a double-quoted span (incl. the pre-fix capture idiom from orch-loop.sh:4910), AND an ESCAPED quote (\`it\\'s\`) or an ANSI-C \`\$'…'\` span around it — while a literal \`) gh\` in DOUBLE or SINGLE quotes and an already-bounded call (bare or assignment-prefixed) do not red it: the blind spot is closed, not documented"
 else
-  bad "structural: a command position is UNSCANNED — scan said '${CASEARM:-<nothing>}' (want lines 1, 3, 6, 7, 8, 9, 10, 13–18, 20 and 22–32 only)"
+  bad "structural: a command position is UNSCANNED — scan said '${CASEARM:-<nothing>}' (want lines 1, 3, 6, 7, 8, 9, 10, 13–18, 20 and 22–33 only)"
 fi
 # … and the ONE permitted bare `gh` is the degraded pass-through inside gh_bounded itself.
 grep -q 'then command gh "\$@"' "$LOOP" && ok "structural: the degraded pass-through is the only bare gh, and it is inside gh_bounded" \
