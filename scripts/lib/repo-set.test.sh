@@ -1006,8 +1006,10 @@ def _strip_comment(line):
     ⛔ NO GUARD IN THIS SCANNER IS UNDECLARED ANY MORE, AND THE ONES NOTHING PINS ARE NAMED BELOW — DECLARED
     HERE, BECAUSE "EVERY GUARD IS PINNED OR DECLARED" WAS FALSE UNTIL EVERY GUARD WAS MUTATED ONE AT A TIME
     (baseline 246/0; population `git ls-files '*.sh'`, which was 435 when that sweep ran and is 438 now).
-    ⛔ ONE OF THE GUARDS LISTED BELOW IS PINNED FOR ONE MEMBER OF ITS CONDITION — see the word-set bullet,
-    which is split by member because the mutant's delta depends on which character you pull.
+    ⛔ MEMBERSHIP IS PER-GUARD BUT PINNING IS PER-MEMBER, AND THE TWO DO NOT COINCIDE — see the word-set
+    and charset bullets, which are split by member because the mutant's delta depends on WHICH character you
+    pull: one member reds the suite, the next one moves nothing. A guard listed as "pinned" below is pinned
+    for the members an arm actually exercises, and every other member of it is DECLARED here.
 
     LOAD-BEARING, UNPINNED — a VALID-bash input separates the guard from its mutant (`bash -n` rc 0, and
     `declare -F` agrees with the BASELINE and not with the mutant), NO fixture line carries that input, and
@@ -1041,13 +1043,17 @@ def _strip_comment(line):
         the outside-quote escape below; `echo "a \" # b" ; cat <<EOF` + a body invents the body line, and
         it moves 1 file (`rank-queue.test.sh`, losing 15 names).
       * AND FOUR MORE OF THE SAME CLASS, named so this list is not read as exhaustive: `_openers`'
-        single-quote CLOSE, and `_strip_comment`'s single-quote close, its in-quote escape, and — the one
-        that is a FALSE PASS rather than noise — its DOUBLE-quote CLOSE (`if c == quote: quote = None`).
-        That last one over `echo "a" # cat <<NOPE` followed by a real definition: ground truth and the
-        baseline both find the definition, and deleting the close loses it, because the `#` stops being a
-        comment and a phantom `NOPE` heredoc swallows the definition below it. It is the same shape pinned
-        for `head_after_inline_comment`, one quote character over. Each of the four separates on a
-        valid-bash input, moves 0 of the 438 files and leaves the suite at 246/0.
+        single-quote CLOSE, and `_strip_comment`'s single-quote close, its in-quote escape, and its
+        DOUBLE-quote CLOSE.
+        ⛔ TWO OF THESE FOUR ARE FALSE PASSES, NOT NOISE, and they are the two quote CLOSES. Each over
+        `echo 'a' # cat <<NOPE` / `echo "a" # cat <<NOPE` followed by a real definition: ground truth and the
+        baseline both find it, the mutant LOSES it, and for the same reason in both — the `#` stops being a
+        comment and the phantom `NOPE` heredoc swallows the definition below. Which quote character you
+        write changes the spelling, not the direction, so a note that calls one dangerous and its neighbour
+        noise is describing the spelling. `head_after_inline_comment` pins this shape in the definition
+        loop, quote-blind. The other two — `_openers`' single-quote close and the in-quote escape — INVENT a
+        body line instead, the direction the namespace arm already fails closed on. All four separate on
+        valid-bash input, move 0 of the 438 files and leave the suite at 246/0.
       * the head-branch KEYWORD exclusion (`if not m or m.group(1) in KEYWORDS` on the NEXT-LINE path) —
         delete it and a valid-bash input `local ()` + `{ :; }` is FOUND instead of missed, so the mutant is
         the faithful one: this guard's failure direction is a FALSE PASS on a definition bash really makes.
@@ -1064,7 +1070,11 @@ def _strip_comment(line):
     `_.-` on the PLAIN path moves 3 files but also truncates the three `EOF_*` delimiters in `repo-set.sh`
     (`EOF_NORM`, `EOF_STATE_KEY`, `EOF_GOT`; the bare `EOF` carries no charset character and is never
     affected), losing 14 of its 26 definitions — so `_reader_defs_n` drops below the floor and `f11f`
-    reds at 245/1. The suite DOES catch that one; do not "declare" it.
+    reds at 245/1. The suite catches that one — and ONLY that one: drop `.` or `-` from the same set instead
+    and the suite stays at 246/0, because `cat <<A.B` / `cat <<A-B` then lose the definition below them on
+    valid bash. A member an arm pins is pinned; a member nothing pins is DECLARED. "The suite catches this
+    guard" is a statement about one member, never a reason to skip the others — that reading is how this
+    bullet came to tell a future lane NOT to declare two members that lose a real definition.
 
     NOT REACHED BY THIS POPULATION — and NOT because they are inert, which is the distinction that matters:
     `_strip_comment`'s SINGLE-quote state, its DOUBLE-quote state, and its backslash escape each move 0 of
@@ -1453,7 +1463,13 @@ head_with_comment_between()
 #     not to a guard — so the 130 / 29 / 54 figures an earlier revision of this note carried are withdrawn
 #     BY NAME here rather than dropped silently, and none of the three is a number at this head. The 261
 #     above and the 4 in the bare-word paragraph are NOT withdrawals: both are re-measured at this head.
-#   * DELETING THE NEXT-LINE-BRACE BRANCH IS PINNED: revert it and `f11f-0` reds (245 passed / 1 failed). It
+#   * DELETING THE NEXT-LINE-BRACE BRANCH IS PINNED — the BRANCH, not each condition inside it: removing only
+#     its `t.startswith('{')` TEST leaves the suite at 246/0 (fixture 24 -> 24, `repo-set.sh` 26 -> 26, so
+#     neither scanner consumer moves), and it moves 1 set + 2 ordered-only scans of the 438, INVENTING `flush`
+#     in `check-workflow-concurrency.sh` — an awk function inside a multi-line quoted program, i.e. a name
+#     bash never defines. Inventing is the direction the namespace arm fails closed on, and limit (iii) above
+#     already declares that this scanner invents names from quoted programs, so the test is DECLARED, not
+#     dropped. Revert the whole branch and it is a different measurement: `f11f-0` reds (245 passed / 1 failed). It
 #     invents NOTHING and HIDES names on the FIXTURE ONLY — 6 of them (`name_next_line`, `name_func_next`,
 #     `head_after_inline_comment`, `head_with_comment_between`, `indented_head_only`, `head_then_blank`) — and
 #     moves 0 of the repo's own files.
