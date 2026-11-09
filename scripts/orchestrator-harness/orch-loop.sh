@@ -2229,6 +2229,34 @@ _orch_argv_is_loop() { # shellcheck disable=SC2086
   case "${2##*/}" in orch-loop.sh) return 0 ;; esac
   return 1
 }
+# _orch_argv_is_loop_flagged <argv…> — 0 when a shell is invoked WITH AN OPTION in front of an
+# `orch-loop.sh` (`bash -x /abs/orch-loop.sh`), i.e. a controller-shaped argv the two-token rule above
+# cannot ATTRIBUTE. Deliberately OUTSIDE that function: its body is a pinned mirror of
+# `orchestrator-registry.sh:registry_pid_is_controller` (the suite pins both the five-line body and the
+# `set --` tail), and this rule is the loop's OWN, because only the loop answers "not the owner" by
+# DELETING a lock.
+# ⛔ WHY IT EXISTS (fresh review of PR #3837 at 185e7c5bd, P2; MEASURED): `bash -x …/orch-loop.sh` failed
+# the two-token rule and was minted into rc 1 = PROVABLY NOT THE OWNER, so the next start printed
+# `STARTED`, logged `[lock] reclaiming …`, and the owner was STILL ALIVE — a second controller on one PR
+# queue (#1715), from an argv we READ but could not attribute. An argv that was read and could not be
+# attributed is `CANNOT-TELL`, never proof of non-ownership; the caller refuses and names it.
+# ⛔ `-c` IS NOT THIS CASE, AND THAT IS A RECORDED DECISION, NOT AN OVERSIGHT: #1856 established that
+# `bash -c "sleep 300; /abs/orch-loop.sh"` is a WRAPPER's argv rather than a controller (accepting it was
+# the loose any-token arm that failed open), and `orch-loop-lock.test.sh` arm 4c asserts such a pid is
+# RECLAIMED. So the `-c`/`--command` forms return 1 here and keep that behaviour, and only the option
+# forms no decision reaches (`-x`, `-e`, `--posix`, …) are deferred to a human as ambiguous.
+_orch_argv_is_loop_flagged() { # shellcheck disable=SC2086
+  local _t
+  set -- $*
+  [ "$#" -ge 3 ] || return 1
+  case "${1##*/}" in bash|sh|dash|zsh) ;; *) return 1 ;; esac
+  case "$2" in -c|--command|-[!-]*c*) return 1 ;; esac    # #1856: a `-c` wrapper is not a controller
+  case "$2" in -*) ;; *) return 1 ;; esac                 # token 2 must be a shell OPTION
+  for _t in "$@"; do
+    case "${_t##*/}" in orch-loop.sh) return 0 ;; esac
+  done
+  return 1
+}
 # _orch_lock_verdict <pid> <lockfile> -> 0 OWNER · 1 PROVABLY NOT the owner · 2 CANNOT TELL
 # Sets ORCH_LOCK_WHY (only on rc 2) to the read that failed, so the refusal names WHICH datum is missing
 # instead of asserting a fact about a process it could not read (fresh review of #1985, P1).
@@ -2251,7 +2279,17 @@ _orch_lock_verdict() {
     1) return 1 ;;                                # positively absent — the lock outlived its writer
     *) ORCH_LOCK_WHY="the process table or that pid's argv cannot be read"; return 2 ;;
   esac
-  _orch_argv_is_loop "$cmd" || return 1           # argv READ, and it is not an orch-loop.sh
+  # ⛔ AN ARGV WE READ BUT COULD NOT ATTRIBUTE IS NOT PROOF OF NON-OWNERSHIP. `_orch_argv_is_loop` answers
+  # "is this the canonical shape"; a controller started with a shell OPTION (`bash -x …/orch-loop.sh`) is
+  # neither that shape nor provably a non-controller, so it is deferred to a human as CANNOT-TELL rather
+  # than reclaimed out from under a live owner (#1715). Everything the shape rule DOES attribute as a
+  # non-controller (a `sleep`, a `-c` wrapper — #1856) still reclaims on rc 1 below, unchanged.
+  _orch_argv_is_loop "$cmd" || {
+    if _orch_argv_is_loop_flagged "$cmd"; then
+      ORCH_LOCK_WHY="that pid's argv is a SHELL INVOCATION of orch-loop.sh carrying an option the ownership rule cannot attribute"; return 2
+    fi
+    return 1                                      # argv READ, and it is not an orch-loop.sh
+  }
   lt="$(date -r "$lf" +%s 2>/dev/null)" || { ORCH_LOCK_WHY="the lock file's own timestamp cannot be read"; return 2; }
   case "$lt" in ''|*[!0-9]*) ORCH_LOCK_WHY="the lock file's own timestamp cannot be read"; return 2 ;; esac
   pstart="$(_orch_ps_start_epoch "$p")" || { ORCH_LOCK_WHY="that pid's START TIME cannot be read"; return 2; }

@@ -49,6 +49,10 @@
 #      verdict is called in a subshell and transports its answer through stdout, so a fault it cannot
 #      contain lands in CANNOT-TELL instead of aborting the whole `if ! acq` compound — which is what
 #      made the newcomer run with NO lock while the live owner's lock stayed on disk.
+#  16. ⭐ AN ARGV WE READ BUT COULD NOT ATTRIBUTE IS CANNOT-TELL (fresh review of PR #3837 at 185e7c5bd,
+#      P2): a controller started with a shell OPTION (`bash -x …/orch-loop.sh`) is neither the canonical
+#      shape nor provably a non-controller, so it must refuse rather than be reclaimed out from under a
+#      live owner. `-c` wrappers stay RECLAIMED — #1856 decided they are not controllers, and 4c pins it.
 #
 # ⛔ THE SUBJECT IS THE REAL `orch-loop.sh`, NOT A RE-IMPLEMENTATION. The lock block lives in a marked
 # section (`# [orchlock:begin] … # [orchlock:end]`), which this suite EXTRACTS with `sed` and runs as
@@ -214,9 +218,24 @@ mkcase() { # [section-file] — defaults to the pinned extraction from orch-loop
 # site is `X="$(spawn_loop …)"`, which runs the helper in a SUBSHELL, so `KIDS="$KIDS $_pid"` inside it
 # never reached the parent and `cleanup()` killed NOTHING — a dead registry that reads as protection).
 spawn_loop() {
-  printf '#!/bin/bash\ntrap "exit 0" TERM INT\nwhile :; do sleep 1; done\n' > "$1/orch-loop.sh"
+  # ⛔ THE STUB IS SELF-BOUNDED (60 s), because it is a process literally named `orch-loop.sh` in a
+  # layout this repo's arms read by that shape: if this suite is KILLED between the spawn and its own
+  # `kill -9`, an unbounded stub outlives it as an orphan (`ppid 1`) and a LATER arm — in this suite or
+  # a sibling's — reads it as a live owner (fresh review of PR #3837 at 185e7c5bd, P3; MEASURED, and
+  # two such orphans were already alive on this host from exactly this suite's layouts). `selftest.sh`
+  # §20 bounds its own stub for the same reason. 60 s is far longer than the 0.4 s any arm needs.
+  printf '#!/bin/bash\ntrap "exit 0" TERM INT\nfor _ in $(seq 1 60); do sleep 1; done\n' > "$1/orch-loop.sh"
   chmod +x "$1/orch-loop.sh"
   bash "$1/orch-loop.sh" >/dev/null 2>&1 &
+  printf '%s\n' "$!"
+}
+spawn_loop_flagged() {
+  # The SAME stub, launched through a shell OPTION (`bash -x`), so `_orch_argv_is_loop`'s two-token rule
+  # cannot attribute it. This is the shape §16 turns on: a controller we could not PARSE, which is
+  # neither an owner we can confirm nor a non-controller we have proved.
+  printf '#!/bin/bash\ntrap "exit 0" TERM INT\nfor _ in $(seq 1 60); do sleep 1; done\n' > "$1/orch-loop.sh"
+  chmod +x "$1/orch-loop.sh"
+  bash -x "$1/orch-loop.sh" >/dev/null 2>&1 &
   printf '%s\n' "$!"
 }
 spawn_sleep() {
@@ -733,6 +752,49 @@ ck "15: …the live owner's lock is UNTOUCHED (the half that #1715 turns on)" \
 ck "15: …and it does not KILL the controller (rc=0 — the #1985 cryptic-stop class)" \
    "$( [ "$RC" -eq 0 ] && echo 0 || echo 1)"
 kill -9 "$FTP" 2>/dev/null
+
+# ── 16) AN ARGV WE READ BUT COULD NOT ATTRIBUTE IS CANNOT-TELL, NOT "PROVABLY NOT THE OWNER" ──────
+# (fresh review of PR #3837 at 185e7c5bd, P2; MEASURED on the pre-fix block: a controller started with a
+# shell OPTION between the shell and the script — `bash -x …/orch-loop.sh` — failed `_orch_argv_is_loop`'s
+# two-token rule and was therefore minted into rc 1 = PROVABLY NOT the owner. The next start printed
+# `STARTED`, logged `[lock] reclaiming … pid N is provably NOT the owner …`, and `kill -0 N` was STILL
+# TRUE: a second controller sweeping one PR queue, which is #1715.)
+# ⛔ THE RULE IS "ONLY POSITIVE EVIDENCE OF NON-OWNERSHIP RECLAIMS", AND "I COULD NOT PARSE IT" IS NOT
+# EVIDENCE. An argv that was READ and could not be ATTRIBUTED is the third outcome the verdict already
+# has for every unreadable read: refuse, loudly, and leave the owner's lock alone.
+# ⛔ WHY `-c` IS EXEMPT, SAID HERE SO NOBODY "FIXES" IT LATER: #1856 decided `bash -c "sleep 300;
+# /abs/orch-loop.sh"` is a WRAPPER's argv, not a controller, and arm 4c above asserts such a pid is
+# RECLAIMED. That recorded decision stands — the exemption is deliberate, not an oversight — and only the
+# option forms no decision reaches are deferred to a human as ambiguous.
+echo "── 16. ⭐ an unparseable-but-loop-shaped argv REFUSES (CANNOT-TELL); it is not 'provably NOT the owner'"
+mkcase; CASE_DIR="$C"
+GP="$(spawn_loop_flagged "$C/peer")"; KIDS="$KIDS $GP"; sleep 0.4
+printf '%s\n' "$GP" > "$C/o/.orch.lock"        # AFTER the process started — the real write order
+run_drv O="$C/o"
+ck "16: a live owner whose argv carries a shell OPTION is not reclaimed (it refuses instead)" \
+   "$(ran && echo 1 || echo 0)"
+ck "16: …the refusal says CANNOT-TELL and names the pid and the lock" \
+   "$(want "$ERR" "CANNOT-TELL" && want "$ERR" "$GP" && want "$ERR" ".orch.lock" && echo 0 || echo 1)"
+ck "16: …and names the unparsed argv, not a read that failed (the human must know WHICH ambiguity)" \
+   "$(want "$ERR" "cannot attribute" && echo 0 || echo 1)"
+ck "16: …the live owner's lock is UNTOUCHED (a refusal clobbers nothing)" \
+   "$( [ "$(lock_pid "$C/o/.orch.lock")" = "$GP" ] && echo 0 || echo 1)"
+ck "16: …and the owner is still ALIVE (the unchanged owner is what made the old reclaim a #1715)" \
+   "$(kill -0 "$GP" 2>/dev/null && echo 0 || echo 1)"
+kill -9 "$GP" 2>/dev/null
+# The positive control, so §16 cannot pass by refusing every shell-option argv it cannot parse: the
+# SAME option form with a NON-loop script must still be RECLAIMED (rc 1), which is what keeps this arm
+# from being a blanket refusal.
+mkcase; CASE_DIR="$C"
+printf '#!/bin/bash\nfor _ in $(seq 1 60); do sleep 1; done\n' > "$C/peer/notalock.sh"
+chmod +x "$C/peer/notalock.sh"
+bash -x "$C/peer/notalock.sh" >/dev/null 2>&1 &
+XP=$!; KIDS="$KIDS $XP"; sleep 0.4
+printf '%s\n' "$XP" > "$C/o/.orch.lock"
+run_drv O="$C/o"
+ck "16b: the same OPTION form over a NON-loop script is still RECLAIMED (§16 is not a blanket refusal)" \
+   "$(ran && [ "$RC" -eq 0 ] && echo 0 || echo 1)"
+kill -9 "$XP" 2>/dev/null
 
 # ── recap ───────────────────────────────────────────────────────────────────────────────────────
 echo
