@@ -1185,14 +1185,18 @@ export REPO=$HOME/eldato/tortoise        # REQUIRED: the target repo's local mai
                                          # `pi-reap-worktrees.sh` (882),
                                          # `stale-worktrees.sh` (45),
                                          # `stale-main-triage.sh` (23) — plus
-                                         # `lane-container-reap.sh` and
-                                         # `cloud-cell-doctor.sh` — carry
-                                         # `REPO="${REPO:-}"`, i.e. an explicit NO DEFAULT that
-                                         # cannot invent a path. `worktree-hygiene-sweep.sh`
-                                         # carries `REPO="${REPO:-${TORTOISE_REPO:-${TORTOISE:-}}}"`:
-                                         # the box's own declared target still DECIDES (as it did
-                                         # before #1974), the cwd is only a CANDIDATE, and the
-                                         # value is PROVEN by `resolve_repo` either way. The
+                                         # `lane-container-reap.sh` (74:
+                                         # `REPO="${LANE_CONTAINER_REPO:-${REPO:-}}"`) and
+                                         # `cloud-cell-doctor.sh` (84: `REPO="${REPO:-}"`) — carry
+                                         # an explicit fallback whose LAST resort is EMPTY, i.e. a
+                                         # NO DEFAULT that cannot invent a path.
+                                         # `worktree-hygiene-sweep.sh` (126) also carries
+                                         # `REPO="${REPO:-}"`; its operator variable
+                                         # `$TORTOISE_REPO`/`$TORTOISE` is a CANDIDATE, not a
+                                         # default, so `resolve_repo` PROVES it (a git checkout,
+                                         # and — when `$OR` is declared — that its `origin` names
+                                         # that target) and it is offered ALONE, never tied against
+                                         # the cwd. The
                                          # `$PWD` three were the worst
                                          # shape: $PWD is `/` under launchd, so the default
                                          # resolved to a real non-repo directory and failed later

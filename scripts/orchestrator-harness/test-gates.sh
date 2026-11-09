@@ -2979,11 +2979,32 @@ _clean() { rm -f "$RS"/state/needsfix-* "$RS"/state/needsreview-* "$RS"/state/pa
   # verdict). This pin still grepped for the OLD expression, and its `else` arm returned an EMPTY
   # string — so all six rows below read `expected […], got []` on a tree whose extractor is correct.
   # That is a red which names nothing, and it sat on `main` for two merges: `main`'s `bash-suites` was
-  # red (499 passed, 6 failed) for a reason no PR caused. The block is now located by its ANCHORS and
-  # EVALUATED, so this still drives the producer's OWN code (never a re-typed copy) and a future shape
-  # change fails the locatability row below — loudly, once — instead of the six after it.
-  _last_src="$(sed -n '/^LAST=""$/,/^done < "\$L\.log"$/p' "$MERGE" 2>/dev/null)"
+  # red (499 passed, 6 failed) for a reason no PR caused.
+  # ⛔ THE BLOCK IS LOCATED BY A RANGE THAT CANNOT RUN AWAY, AND IT MUST PARSE ON ITS OWN (#3849 review,
+  # P1 — the first version of this fix shipped both defects). That version used
+  # `sed -n '/^LAST=""$/,/^done < "\$L\.log"$/p'`, but merge-one.sh INDENTS its `done` line by two
+  # spaces, so the end anchor never matched: the range ran to EOF and handed 1,007 lines to `eval`.
+  # It still went GREEN because (a) the runaway tail happens to contain the block's closing `fi`, and
+  # (b) bash executes the parseable PREFIX of an `eval` before erroring — so 506/0 rested on an
+  # accident of the file's current text, plus six `syntax error near unexpected token 'fi'` lines on
+  # stderr that nothing graded. The extraction now walks to the `fi` that CLOSES the `if [ -f "$L.log" ]`
+  # arm, refuses to run past 60 lines, and the row below requires the result to parse standalone
+  # (`bash -n`) — so a broken anchor or a widened shape reds a NAMED row instead of feeding eval
+  # unrelated top-level statements (`echo "[merge $PR] verdict: …" >> "$L.log"` and the `case`
+  # mapping are three lines past the block).
+  _last_src="$(awk '
+    /^LAST=""$/ { emit = 1 }
+    emit { buf = buf $0 "\n"; n++ }
+    emit && /^[[:space:]]*done < "\$L\.log"[[:space:]]*$/ { saw_done = 1 }
+    saw_done && /^[[:space:]]*fi[[:space:]]*$/ { print buf; exit }
+    n > 60 { exit }
+  ' "$MERGE" 2>/dev/null)"
+  _last_state="MISSING"
   if [ -n "$_last_src" ]; then
+    if printf '%s\n' "$_last_src" | bash -n 2>/dev/null; then _last_state="located"
+    else _last_state="UNBALANCED"; fi
+  fi
+  if [ "$_last_state" = "located" ]; then
     _last_of() {
       ( L="$TMP/extract"; printf '%s\n' "$1" > "$TMP/extract.log"
         eval "$_last_src"
@@ -2992,8 +3013,10 @@ _clean() { rm -f "$RS"/state/needsfix-* "$RS"/state/needsreview-* "$RS"/state/pa
   else
     _last_of() { printf '%s' ''; }
   fi
-  eqv "the shipped verdict extractor is LOCATABLE in merge-one.sh (this pin reads code, not nothing)" \
-      "located" "$( [ -n "$_last_src" ] && printf located || printf MISSING )"
+  eqv "the shipped verdict extractor block is LOCATED and SELF-CONTAINED in merge-one.sh" \
+      "located" "$_last_state"
+  eqv "…and the extraction is BOUNDED (a range that never closes is not a pin)" \
+      "yes" "$( [ "$(printf '%s\n' "$_last_src" | grep -c .)" -le 40 ] 2>/dev/null && printf yes || printf no )"
   eqv "the shipped verdict extractor accepts ISSUES 3" "ISSUES 3" "$(_last_of 'ISSUES 3')"
   eqv "…accepts ISSUES: 3" "ISSUES: 3" "$(_last_of 'ISSUES: 3')"
   eqv "…accepts ISSUES - 2" "ISSUES - 2" "$(_last_of 'ISSUES - 2')"

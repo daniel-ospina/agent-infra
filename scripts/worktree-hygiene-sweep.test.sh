@@ -251,6 +251,34 @@ assert_eq "$_rc" "0" "T3b control: nothing declared ⇒ the cwd is derived and t
 assert_contains "$_out" "a candidate that proved it is a checkout" "T3b control: …and the derived value is ANNOUNCED, never silent"
 assert_contains "$(cat "$T/engine-argv.txt" 2>/dev/null)" "--repo $CWD_REPO" "T3b control: …and it drives the derived checkout"
 
+# ── T3c: the operator variable is PROVEN, not merely believed ────────────
+# ⛔ #1974 §1 puts `$TORTOISE_REPO`/`$TORTOISE` INSIDE the derivation that "must prove itself … each
+# accepted only when its `origin` remote names exactly `$OR`". A fix that moves it UP into the declared
+# channel (`REPO="${REPO:-${TORTOISE_REPO:-…}}"`) loses that second proof, because `resolve_repo`
+# applies it only in the candidate loop — and then a pass that REMOVES worktrees runs against a
+# checkout of a repo `$OR` does not name (measured in review: declared shape drove the foreign
+# checkout, candidate shape refused it). This arm is that pair.
+FORIGIN_T="$(mk_repo origin-tortoise)"
+FORIGIN_A="$(mk_repo origin-agentinfra)"
+"$REAL_GIT" -C "$FORIGIN_T" remote add origin https://github.com/daniel-ospina/tortoise.git
+"$REAL_GIT" -C "$FORIGIN_A" remote add origin https://github.com/daniel-ospina/agent-infra.git
+reset_state
+_out="$( sweep_env; cd "$FORIGIN_A" && env -u REPO -u TORTOISE \
+        STUB_ENGINE_RC=0 STUB_ENGINE_ROWS_FILE="$ROWS_NONE" STUB_REAPER_RC=0 \
+        OR=daniel-ospina/agent-infra TORTOISE_REPO="$FORIGIN_T" \
+        bash "$SWEEP" --engine "$STUB_ENGINE" 2>&1 )"; _rc=$?
+assert_absent "$(cat "$T/engine-argv.txt" 2>/dev/null)" "--repo $FORIGIN_T" "T3c a declared \$TORTOISE_REPO that does NOT name \$OR is rejected by the origin proof"
+assert_eq "$_rc" "3" "T3c …and the pass REFUSES (rc 3) instead of sweeping a foreign checkout"
+# The CONTROL: the same two checkouts with `OR` naming the declared one — the value proves and is used,
+# so the row above is about the PROOF and not about the operator variable being ignored outright.
+reset_state
+_out="$( sweep_env; cd "$FORIGIN_A" && env -u REPO -u TORTOISE \
+        STUB_ENGINE_RC=0 STUB_ENGINE_ROWS_FILE="$ROWS_NONE" STUB_REAPER_RC=0 \
+        OR=daniel-ospina/tortoise TORTOISE_REPO="$FORIGIN_T" \
+        bash "$SWEEP" --engine "$STUB_ENGINE" 2>&1 )"; _rc=$?
+assert_eq "$_rc" "0" "T3c control: the same declared value PROVES when \$OR names it, and the pass runs"
+assert_contains "$(cat "$T/engine-argv.txt" 2>/dev/null)" "--repo $FORIGIN_T" "T3c control: …and it drives the declared checkout"
+
 # ── T4: a dry run writes and removes nothing ─────────────────────────────────
 echo ""
 echo "── T4. a dry run writes NOTHING and removes NOTHING ──"
