@@ -163,6 +163,26 @@ else
   log_line "WARN: this harness ships no gh-limit layer — gh calls on this cell will NOT be serialised (#1988)"
 fi
 log_line "seeded $O with $(ls "$O"/*.sh | wc -l | tr -d ' ') scripts (claims.sh present)"
+# ── the gh REST adapter (#2039) ──────────────────────────────────────────────
+# ⛔ THE SAME PAIR THE LIMIT LAYER IS: an adapter without it is unbacked-off, and the LIMIT LAYER
+# WITHOUT THE ADAPTER is what this box had — the per-candidate pre-flight stays on GraphQL, so a
+# GraphQL exhaustion ABORTs the refresh and the cell dispatches nothing (measured 2026-10-18 on
+# `pi-cell-2`, REST at 1952/5000). This script is a THIRD cell install path (besides
+# `cloud-cell-supervisor.sh start` and `install.sh`), so it carries the same seed and the same
+# mirror rule; `cloud-cell-supervisor.test.sh` sweeps every installer for the pair rather than
+# naming them, so a fourth cannot be forgotten.
+if [ -f "$H/gh-rest/gh" ]; then
+  mkdir -p "$O/gh-rest" || die "cannot create $O/gh-rest"
+  _seed_one "$H/gh-rest/gh" "$O/gh-rest/gh"
+  log_line "seeded the gh REST adapter (path=$O/gh-rest; its limit layer is $O/gh-limit.py)"
+else
+  if [ -e "$O/gh-rest/gh" ]; then
+    rm -f "$O/gh-rest/gh" || die "cannot remove the stale gh-rest adapter from $O"
+    rmdir "$O/gh-rest" 2>/dev/null || true
+    log_line "seed: removed the stale gh-rest adapter — this harness no longer ships it"
+  fi
+  log_line "WARN: this harness ships no gh-rest adapter — the pre-flight stays on GraphQL, so a GraphQL exhaustion stops dispatch (#2039)"
+fi
 
 # ── 4. restart the controller, cold, with HOME carried into tmux ──────────────
 # ⛔ `unset GH_REPO` AFTER `set +a` (#2235). `keys.env` is re-sourced INSIDE the session, so a
@@ -175,7 +195,7 @@ log_line "seeded $O with $(ls "$O"/*.sh | wc -l | tr -d ' ') scripts (claims.sh 
 log_line "starting controller: OR=$OR REPO=$REPO SCOPE=$SCOPE MAX_LANES=$MAX_LANES"
 tmux new-session -d -s orch -c "$H" \
   "set -a; [ ! -f '$CELL_HOME/keys.env' ] || . '$CELL_HOME/keys.env'; set +a; unset GH_REPO; \
-   PATH='$O/gh-limit':\"\$PATH\" \
+   PATH='$O/gh-rest':'$O/gh-limit':\"\$PATH\" \
    HOME='$CELL_HOME' REPO='$REPO' O='$O' OR='$OR' SCOPE='$SCOPE' MAX_LANES='$MAX_LANES' \
    bash '$H/orch-loop.sh' 2>&1 | tee -a '$O/logs/controller.log'"
 sleep 8

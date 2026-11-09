@@ -3133,6 +3133,16 @@ cmd_check() {
     # diagnostic from waiting on the layer's lock (the adapter routes through the same helper).
     PATH="$O/gh-rest:$PATH" GH_LIMIT_NO_WAIT=1 GH_LIMIT_NO_WAIT_LOCK_S=2 gh --version >/dev/null 2>&1 \
       || die "the gh REST adapter at $O/gh-rest/gh cannot run gh — every gh call in the session would fail, and the pre-flight would fall back to GraphQL (#2039). Fix the adapter (or remove it) before starting."
+    # ⛔ SAID OUT LOUD ON THE GREEN PATH TOO (#2039, and #2041's measured complaint: the deploy announced
+    # "convergence COMPLETE" over a missing layer). The operator's question is not only "did check pass"
+    # but "IS this box's gh the adapter, and does it have a limit layer beside it" — the same one-answer
+    # shape the Mac's install.sh prints. A status verb that stays silent about a seeded shim leaves the
+    # next GraphQL exhaustion to be diagnosed from a log line that names neither.
+    if [ -f "$O/gh-limit.py" ]; then
+      log_line "ok: gh REST adapter -> $O/gh-rest (first on the controller's PATH, ahead of $O/gh-limit; its limit layer is $O/gh-limit.py) — a GraphQL refusal degrades the pre-flight to REST instead of stopping dispatch (#2039)"
+    else
+      log_line "ok: gh REST adapter -> $O/gh-rest (first on the controller's PATH) — but $O/gh-limit.py is ABSENT, so its calls are NOT serialised or backed off (#1988)"
+    fi
   else
     log_line "WARN: $HARNESS ships no gh-rest adapter — the per-candidate pre-flight stays on GraphQL, so a GraphQL exhaustion stops dispatch (#2039); advance the pin with '$0 apply'"
   fi

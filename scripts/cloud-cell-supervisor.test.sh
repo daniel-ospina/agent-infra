@@ -5646,6 +5646,205 @@ case "$out" in
   *) bad "the O= read failed on a large environ (got [$out]) — a real leaked controller would be classified not-a-leak and never reaped: the SIGPIPE/pipefail fail-open (#2315 review MEDIUM)" ;;
 esac
 
+# ══ #2039 — the gh REST ADAPTER reaches $O on a CELL, and it is FIRST on the controller's PATH ══
+say_case "the cell seeds the gh REST adapter into \$O and puts it FIRST on the controller PATH (#2039)"
+# MEASURED 2026-10-18 on `pi-cell-2`: the adapter lived ONLY in the pinned harness, so the
+# per-candidate pre-flight (`gh issue view` / `gh pr list`, both GraphQL) could not certify ONE
+# candidate while the GraphQL budget was exhausted — every candidate came back INCOMPLETE, the refresh
+# ABORTed, and the cell dispatched NOTHING for the whole refusal, with the REST budget at 1952/5000 and
+# the log saying only `FAILED rc=1 (transient — retried next cycle)`. `install.sh` seeds this adapter on
+# the Mac (`install.sh:789-884`); the cell path seeded `gh-limit` + `gh-limit.py` and never it.
+# ⛔ THE FIXTURE CARRIES THE REAL ADAPTER AND THE REAL LIMIT LAYER, not stubs: the arms below are
+# `check`'s own probe ("can this box RUN it") and the path the adapter resolves (`$SELF_DIR/../gh-limit.py`
+# = `$O/gh-limit.py`), so a stub would let a broken seed pass. `gh` itself IS a stub (`$P/bin/gh`), which
+# is what the adapter must find at the END of its walk — past both seeded shim directories.
+Q="$T/gr2039"; mkdir -p "$Q/home" "$Q/o" "$Q/bin" "$Q/pin"
+seed_provider_store "$Q/home" || { echo "FATAL: #2039 fixture: cannot seed the provider store"; exit 1; }
+mkdir -p "$Q/home/.pi/agent/scripts/lib"
+printf '#!/bin/bash\nexit 0\n' > "$Q/home/.pi/agent/scripts/record-review.sh"
+chmod +x "$Q/home/.pi/agent/scripts/record-review.sh"
+printf '#!/usr/bin/env python3\n' > "$Q/home/.pi/agent/scripts/lib/diff-normalize.py"
+git clone -q --bare "$AI_ORIGIN" "$Q/ai-origin.git" || { echo "FATAL: #2039 fixture: cannot clone the suite's bare origin"; exit 1; }
+# ⛔ `-b main`: the bare origin's HEAD still names the default `master`, so a plain clone of it checks
+# NOTHING out and every arm below would grade an empty tree (measured: "remote HEAD refers to
+# nonexistent ref" then 'no gh-rest in the shipped harness').
+git clone -q -b main "$Q/ai-origin.git" "$Q/ai" || { echo "FATAL: #2039 fixture: cannot clone the harness checkout"; exit 1; }
+QH="$Q/ai/scripts/orchestrator-harness"
+cp -R "$HERE/orchestrator-harness/gh-rest" "$QH/gh-rest" || { echo "FATAL: #2039 fixture: no gh-rest in the shipped harness"; exit 1; }
+mkdir -p "$QH/gh-limit"
+cp "$HERE/orchestrator-harness/gh-limit/gh" "$QH/gh-limit/gh"
+cp "$HERE/orchestrator-harness/gh-limit.py" "$QH/gh-limit.py"
+# A CONTROLLER THAT SAYS WHAT ITS PATH IS, so the SERVICE-MODE arm measures the environment the
+# controller really gets instead of grepping a comment. Every other arm ignores it.
+printf '#!/bin/bash\nprintf "ORCHLOOP-PATH=%%s\\n" "$PATH"\n' > "$QH/orch-loop.sh"
+git -C "$Q/ai" add -A >/dev/null 2>&1
+git -C "$Q/ai" commit -q -m 'harness ships the gh shims (#2039 fixture)' >/dev/null 2>&1
+git -C "$Q/ai" push -q origin main >/dev/null 2>&1
+git -C "$Q/ai" fetch -q origin >/dev/null 2>&1
+ai_init_repo "$Q/repo"
+# The §9 fixture's stubs (gh -> exit 0 is the "real gh" at the end of the adapter's walk; pi is a CI
+# gap), then a RECORDING tmux double so the controller's own command line can be read back.
+cp -R "$P/bin/." "$Q/bin/" 2>/dev/null || { echo "FATAL: #2039 fixture: the §9 stub bin is missing"; exit 1; }
+cat > "$Q/bin/tmux" <<SH
+#!/bin/bash
+case "\${1:-}" in
+  has-session) [ -f "$Q/tmuxup" ] && exit 0; exit 1 ;;
+  new-session) printf '%s\\n' "\$*" >> "$Q/sessions.log"; : > "$Q/tmuxup"; exit 0 ;;
+  ls)          [ -f "$Q/tmuxup" ] && echo orch || true; exit 0 ;;
+  *) exit 0 ;;
+esac
+SH
+chmod +x "$Q/bin/tmux"
+QRC=0; QOUT=''
+g2039() { # <sub> [args]; ORCH_FOREGROUND is pinned by the caller, never inherited (this box is service-managed)
+  rm -f "$Q/tmuxup"
+  QOUT="$(PATH="$Q/bin:$PATH" CELL_HOME="$Q/home" ENV_FILE="$Q/keys.env" SESSION="ai2039-$$" \
+           O="$Q/o" REPO="$Q/repo" OR=daniel-ospina/tortoise HARNESS_REPO="$Q/ai" HARNESS_FETCH=0 \
+           HARNESS_REF=origin/main HARNESS_PIN_DIR="$Q/pin" HARNESS_PIN_FILE="$Q/home/.harness-path" \
+           HARNESS="$QH" ORCH_FOREGROUND="${QFG:-0}" bash "$SUP" "$@" 2>&1)"
+  QRC=$?
+}
+
+# (a) SEEDING — the issue's own indicator: the adapter LANDS in $O and is EXECUTABLE.
+g2039 apply
+[ "$QRC" -eq 0 ] && ok "apply succeeds on a harness that ships the adapter (no false block)" \
+                 || bad "apply failed on the #2039 fixture: $(printf '%s' "$QOUT" | tail -3 | tr '\n' ' ')"
+[ -x "$Q/o/gh-rest/gh" ] && ok "apply SEEDS \$O/gh-rest/gh and makes it executable — the adapter is no longer harness-only" \
+                         || bad "\$O/gh-rest/gh is absent or not executable after apply: $(ls -l "$Q/o/gh-rest" 2>&1 | tr '\n' ' ')"
+cmp -s "$QH/gh-rest/gh" "$Q/o/gh-rest/gh" \
+  && ok "…and it is the PINNED harness's bytes, not a copy from somewhere else" \
+  || bad "\$O/gh-rest/gh differs from the harness copy — a stale adapter would answer commands this pin does not ship"
+[ -x "$Q/o/gh-limit/gh" ] && [ -f "$Q/o/gh-limit.py" ] \
+  && ok "…alongside the limit layer the adapter resolves as \$SELF_DIR/../gh-limit.py, so the seed keeps #1988's serialisation" \
+  || bad "the #2039 fixture is not the composition it claims: \$O is missing gh-limit/gh or gh-limit.py ($(ls "$Q/o" | tr '\n' ' '))"
+
+# (b) THE STATUS ANSWER — one line that says the box's gh IS the adapter, and which layer backs it (the
+#     issue's own second property: "is this box's gh actually the adapter, and is its limit layer live?").
+g2039 check
+[ "$QRC" -eq 0 ] && ok "check PASSES a cell whose pinned harness ships the adapter and whose \$O has it" \
+                 || bad "check FALSE-BLOCKED a correctly seeded cell: $(printf '%s' "$QOUT" | tail -3 | tr '\n' ' ')"
+case "$QOUT" in
+  *"ok: gh REST adapter -> $Q/o/gh-rest"*) ok "check NAMES the adapter and where it resolved, on the green path" ;;
+  *) bad "check stayed silent about the adapter it just proved runnable — the operator's 'is gh the adapter?' has no answer ($(printf '%s' "$QOUT" | grep -c . ) lines, none matching)" ;;
+esac
+case "$QOUT" in
+  *"ahead of $Q/o/gh-limit"*) ok "…and states the ORDER (adapter ahead of the limit layer), which is what makes REST win" ;;
+  *) bad "check does not say the adapter sits ahead of the limit layer" ;;
+esac
+
+# (c) NON-VACUITY — the refusal must FIRE when the adapter is missing, or the arm above proves nothing.
+rm -f "$Q/o/gh-rest/gh"
+g2039 check
+[ "$QRC" -ne 0 ] && ok "check REFUSES a cell whose harness ships the adapter but whose \$O lost it (the measured cell state)" \
+                 || bad "check accepted a cell with no REST adapter — that is the #2039 false green, on the verb that is the last gate before start"
+case "$QOUT" in
+  *"gh-rest/gh is MISSING"*) ok "…naming the missing file and the consequence (a GraphQL exhaustion stops dispatch)" ;;
+  *) bad "the refusal does not name the missing adapter: $(printf '%s' "$QOUT" | tail -3 | tr '\n' ' ')" ;;
+esac
+case "$QOUT" in
+  *"CELL CAN RUN"*) bad "check printed CELL CAN RUN A CONTROLLER over a cell with no REST adapter" ;;
+  *) ok "…and no CELL CAN RUN banner came with it" ;;
+esac
+g2039 apply >/dev/null 2>&1   # restore the seeded state for the arms below
+
+# (d) PRESENT IS NOT RUNNABLE — a shim that cannot resolve the real gh exits 127 on EVERY call, which is
+#     worse than an absent one (the reason cmd_check probes the gh-limit layer at all).
+printf '#!/bin/bash\nexit 127\n' > "$Q/o/gh-rest/gh"; chmod +x "$Q/o/gh-rest/gh"
+g2039 check
+[ "$QRC" -ne 0 ] && ok "check REFUSES a PRESENT but UNRUNNABLE adapter (presence alone is not a pass)" \
+                 || bad "check certified an adapter that exits 127 on every call — every gh call in the session would fail"
+case "$QOUT" in
+  *"cannot run gh"*) ok "…naming 'cannot run gh' rather than a generic refusal" ;;
+  *) bad "the unrunnable-adapter refusal is not named: $(printf '%s' "$QOUT" | tail -3 | tr '\n' ' ')" ;;
+esac
+g2039 apply >/dev/null 2>&1
+g2039 check
+[ "$QRC" -eq 0 ] && ok "a re-apply clears it (the refusal is about the file, not a latched flag)" \
+                 || bad "re-apply did not restore a green check: $(printf '%s' "$QOUT" | tail -2 | tr '\n' ' ')"
+
+# (e) THE TMUX PATH — the controller session's OWN command line, read back from the double. This is the
+#     path the refresh pre-flight (`refresh-candidates.sh`) runs under, i.e. the surface the issue
+#     measured; `lane.sh:83-84` already prefers the adapter for lanes, so a controller without it was the
+#     remaining half.
+: > "$Q/sessions.log"
+QFG=0 g2039 start
+QSESS="$(grep 'orch-loop.sh' "$Q/sessions.log" 2>/dev/null | head -1)"
+[ -n "$QSESS" ] && ok "the tmux path launched a CONTROLLER session (non-vacuity: this box is service-managed, so the branch is pinned)" \
+                || bad "no controller new-session was recorded — the tmux arm would pass vacuously"
+case "$QSESS" in
+  *"PATH='$Q/o/gh-rest':'$Q/o/gh-limit':"*) ok "the controller's PATH puts \$O/gh-rest FIRST, ahead of \$O/gh-limit" ;;
+  *"PATH='$Q/o/gh-limit'"*) bad "the controller PATH still starts with the LIMIT layer — the adapter is never resolved (REST wins nothing)" ;;
+  *) bad "the controller PATH carries neither seeded shim: $(printf '%s' "$QSESS" | cut -c1-300)" ;;
+esac
+QP_R="$(printf '%s' "$QSESS" | grep -bo 'gh-rest' | head -1 | cut -d: -f1)"
+QP_L="$(printf '%s' "$QSESS" | grep -bo 'gh-limit' | head -1 | cut -d: -f1)"
+[ -n "$QP_R" ] && [ -n "$QP_L" ] && [ "$QP_R" -lt "$QP_L" ] \
+  && ok "…by POSITION in the string, not merely by presence (rest before limit)" \
+  || bad "gh-rest does not precede gh-limit in the session command (rest=$QP_R limit=$QP_L)"
+
+# (f) THE SERVICE-MODE PATH (#2402): there is no session string there, so the export in the foreground
+#     branch is the ONLY thing that gives a service-managed controller the adapter — and this box is one.
+QFG=1 g2039 start
+QPATH="$(printf '%s' "$QOUT" | sed -n 's/^ORCHLOOP-PATH=//p' | head -1)"
+[ -n "$QPATH" ] && ok "the service-mode controller really started (it printed its PATH)" \
+                || bad "the foreground controller never ran — the service-mode arm would pass vacuously"
+case ":$QPATH:" in
+  ":$Q/o/gh-rest:$Q/o/gh-limit:"*) ok "the SERVICE-MODE controller's PATH is \$O/gh-rest:\$O/gh-limit:… — same order as the tmux path" ;;
+  *) bad "the service-mode controller's PATH does not lead with the adapter: [$QPATH]" ;;
+esac
+
+# (g) MIRROR, NOT OVERLAY — a harness that stops shipping the adapter must not leave a live copy behind
+#     (the rule the *.sh workers and the gh-limit pair already follow).
+git -C "$Q/ai" rm -r -q scripts/orchestrator-harness/gh-rest
+git -C "$Q/ai" commit -q -m 'harness drops gh-rest (#2039 fixture)'
+git -C "$Q/ai" push -q origin main
+git -C "$Q/ai" fetch -q origin
+g2039 apply
+[ ! -e "$Q/o/gh-rest/gh" ] && ok "apply REMOVES a stale \$O/gh-rest/gh when the harness stops shipping it" \
+                          || bad "a stale adapter survived a harness that no longer ships it — the box would keep translating with bytes its pin does not have"
+case "$QOUT" in
+  *"removed the stale gh-rest adapter"*) ok "…and says so, rather than removing silently" ;;
+  *) bad "the mirror-away was silent: $(printf '%s' "$QOUT" | tail -3 | tr '\n' ' ')" ;;
+esac
+g2039 check
+[ "$QRC" -eq 0 ] && ok "check does NOT refuse a pin that predates the adapter (a warning, not a false block)" \
+                 || bad "check refused a cell whose HARNESS ships no adapter — an honest restart on an older pin would be blocked: $(printf '%s' "$QOUT" | tail -2 | tr '\n' ' ')"
+case "$QOUT" in
+  *"ships no gh-rest adapter"*) ok "…and WARNS with the consequence (the pre-flight stays on GraphQL)" ;;
+  *) bad "no warning that the pin ships no adapter" ;;
+esac
+
+# (h) PARITY PIN (#2039, the issue's own property 4): the adapter is not a cell-only artifact, so every
+#     installer that seeds the shared limit helper must seed it too. That divergence IS the defect — the
+#     cell seeded `gh-limit.py` and never `gh-rest/gh` — so it is pinned by SWEEPING the shipped
+#     installers rather than by naming them, which is what the owner's property 3 asks for: adding a
+#     fourth cell install path that forgets the adapter must redden HERE instead of on a cell.
+QSEEDERS=0; QSEEDERS_BAD=""
+# ⛔ ITERATE THE DIRECTORIES AND FILTER INSIDE — a `for _f in "$HERE"/*.sh …` line is the very shape
+# the worker-seed guard above forbids (two or more literal `*.sh` names on one `for … in`), and it
+# would redden that guard from a section that has nothing to do with worker lists (measured).
+for _d in "$HERE" "$HERE/orchestrator-harness"; do
+  for _f in "$_d"/*; do
+    case "$_f" in *.sh) ;; *) continue ;; esac
+    case "$(basename "$_f")" in *.test.sh) continue ;; esac   # fixtures are not install paths
+    # A real INSTALL of the helper into a state dir (cp/mv/seed_one), not a mention in a comment.
+    grep -qE '(cp|mv|seed_one|_seed_one)[^|]*gh-limit\.py' "$_f" 2>/dev/null || continue
+    QSEEDERS=$((QSEEDERS + 1))
+    grep -qE '(cp|mv|seed_one|_seed_one)[^|]*gh-rest/gh' "$_f" 2>/dev/null \
+      || QSEEDERS_BAD="$QSEEDERS_BAD $(basename "$_f")"
+  done
+done
+[ "$QSEEDERS" -ge 3 ] && ok "the sweep found $QSEEDERS installer(s) that seed the gh limit layer (non-vacuity: $QSEEDERS named, not zero)" \
+                      || bad "the sweep found only $QSEEDERS installer(s) seeding gh-limit.py — it is no longer reading the shipped install paths, so the parity arm would pass over anything"
+[ -z "$QSEEDERS_BAD" ] && ok "EVERY installer that seeds the limit layer ALSO seeds the REST adapter — 'works on my Mac' and 'works on a cell' cannot diverge here again" \
+  || bad "installer(s) seed gh-limit.py but NOT the REST adapter:$QSEEDERS_BAD — that is exactly the #2039 divergence (the pre-flight stays on GraphQL there)"
+grep -qE 'seed_one "\$HARNESS/gh-rest/gh"' "$SUP" \
+  && ok "cloud-cell-supervisor.sh carries a real SEED of the adapter into \$O (a seeding call, not a mention)" \
+  || bad "cloud-cell-supervisor.sh no longer seeds \$O/gh-rest/gh"
+grep -qE 'cp "\$HERE/gh-rest/gh"' "$HERE/orchestrator-harness/install.sh" \
+  && ok "install.sh carries a real CP of the adapter (the Mac half of the same seed set)" \
+  || bad "install.sh no longer copies the adapter — the Mac half of the parity is gone"
+
 
 echo "── Summary ───────────────────────────────────────────────────────"
 echo "  PASS=$PASS FAIL=$FAIL"
