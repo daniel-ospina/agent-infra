@@ -1005,7 +1005,7 @@ def _strip_comment(line):
 
     ⛔ NO GUARD IN THIS SCANNER IS UNDECLARED ANY MORE, BUT FIVE ARE LOAD-BEARING AND UNPINNED — DECLARED
     HERE, BECAUSE "EVERY GUARD IS PINNED OR DECLARED" WAS FALSE UNTIL EVERY GUARD WAS MUTATED ONE AT A TIME
-    (baseline 246/0; population `git ls-files '*.sh'`, which was 435 when that sweep ran and is 437 now).
+    (baseline 246/0; population `git ls-files '*.sh'`, which was 435 when that sweep ran and is 438 now).
 
     LOAD-BEARING, UNPINNED — a VALID-bash input separates the guard from its mutant (`bash -n` rc 0, and
     `declare -F` agrees with the BASELINE and not with the mutant), NO fixture line carries that input, and
@@ -1037,7 +1037,7 @@ def _strip_comment(line):
 
     NOT REACHED BY THIS POPULATION — and NOT because they are inert, which is the distinction that matters:
     `_strip_comment`'s SINGLE-quote state, its DOUBLE-quote state, and its backslash escape each move 0 of
-    the 437 files and each leaves the suite at 246/0, but every one of them ALSO separates on a valid-bash
+    the 438 files and each leaves the suite at 246/0, but every one of them ALSO separates on a valid-bash
     input — the quote-open shape above with the OTHER quote character, and a trailing `#` after an escaped
     quote. So the honest label is "nothing here reaches it", not "no-op": the quote-open shape above pins
     the single-quote state as soon as its single-quoted spelling is written into `FIXTURE`, which is itself
@@ -1049,7 +1049,7 @@ def _strip_comment(line):
     while the blanket double-quote branch needs the OTHER quote character. Until then a lane that
     "simplifies" one of those eight is removing bash-faithfulness that only the fixture would catch. Each
     shape is written out by name rather than counted, because the names are what survives a new head — and
-    the population numbers above are already two files stale, which is the argument for the shape and
+    the population numbers above are already stale at this head, which is the argument for the shape and
     against the count.
 
     ⛔ A COMMENT ENDS AT THE NEWLINE HOWEVER MANY BACKSLASHES IT CARRIES (round 48 review, P2 — measured).
@@ -1111,7 +1111,7 @@ def _openers(line):
     SECOND one — a `re.sub` that cuts at the first whitespace-preceded `#` — which is whitespace-anchored and
     quote-BLIND, so the two disagree on a line like `echo "a #b"` (untouched there, truncated to `echo "a`
     here). Neither is a redundant copy: delete `_strip_comment` and the walk opens phantom heredocs (6 of the
-    437 files change and the fixture loses 18 names — `after_bare_word_brace` among them, which is why this
+    438 files change and the fixture loses 18 names — `after_bare_word_brace` among them, which is why this
     number is one more than the 17 measured before this fixture grew); delete that `re.sub` and `f11f-0` reds by losing
     `head_after_inline_comment`. This walk owns NEITHER; a quoted delimiter keeps its own quoting rules, and
     `$(( … ))` / `(( … ))` are arithmetic where `<<` is a shift.
@@ -1182,8 +1182,9 @@ def _openers(line):
                 # holding a character OUTSIDE [A-Za-z0-9_.-] (e.g. `<<'A,B'`) is the only spelling that tells
                 # this branch from the fallback loop below, and no fixture line carries one — deleting the
                 # branch leaves the suite at 246/0 and changes the scan of 0 of the `git ls-files '*.sh'`
-                # population it was measured over (435 then, 437 at this head) Declared rather than pinned because a pin here would encode a spelling no real
-                # script uses; if one ever appears, this note is the fixture to write.
+                # population it was measured over (435 then, 438 at this head). Declared rather than pinned
+                # because a pin here would encode a spelling no real script uses; if one ever appears, this
+                # note is the fixture to write.
                 if q in ("'", '"'):          # a QUOTED delimiter may hold any character
                     while j < n and line[j] != q:
                         delim += line[j]
@@ -1213,7 +1214,7 @@ def _openers(line):
             # ⛔ DECLARED NO-OP (round 48 review, P3 — measured): every opener the walk can produce on a
             # fixture or repo line yields a non-empty delimiter, because `#` blocks the whole-line form and
             # the trailing-comment strip runs before the walk. Deleting this test leaves the suite at 246/0
-            # and moves 0 of the `git ls-files '*.sh'` population it was measured over (435 then, 437 at
+            # and moves 0 of the `git ls-files '*.sh'` population it was measured over (435 then, 438 at
             # this head). It stays as the boundary for `cat <<` with nothing after it, which is
             # a bash syntax error rather than a construct to model.
             if delim:
@@ -1266,7 +1267,7 @@ for i, raw in enumerate(lines):
     # reach a definition here, because `defn` opens with `^\s*(?:function\s+)?([A-Za-z_]...)` and `#` is not
     # a name character — measured directly: `#foo() {`, `  # foo() {`, `#a(){`, `#!/bin/bash` all fail
     # `defn.match` with this skip removed. Deleting it leaves the suite at 246/0 and moves 0 of the
-    # `git ls-files '*.sh'` population (435 when measured, 437 at this head). Kept as the read-aloud
+    # `git ls-files '*.sh'` population (435 when measured, 438 at this head). Kept as the read-aloud
     # statement of intent, not as a guard; do not cite
     # it as pinned.
     if raw.lstrip().startswith('#'):
@@ -1294,11 +1295,11 @@ for i, raw in enumerate(lines):
     # `declare -F` listing only the real definition, while the scanner printed each one as a definition. That
     # is the same invented name this guard exists to refuse, so the test is the reserved word followed by
     # whitespace, which is how bash reads it.
-    # ⛔ ITS COST IS MEASURED, NOT "NOTHING" (round 48 re-review, P3 — measured over the 437
+    # ⛔ ITS COST IS MEASURED, NOT "NOTHING" (round 48 re-review, P3 — measured over the 438
     # `git ls-files '*.sh'` files at this head): the name SET never moves, but 4 files' ORDERED scan does —
     # `scripts/disk-reaper.sh` and scripts/orchestrator-harness/{capacity-transfer,pr-sickness,repo-slug}.test.sh
     # each lose one DUPLICATE report of a bare word that is also defined properly (`check_peer_locks`,
-    # `lbgh_clear`, `reset_all`, `rr`). So: 0 name sets move, 4 of 437 ordered scans move. On the fixture the
+    # `lbgh_clear`, `reset_all`, `rr`). So: 0 name sets move, 4 of 438 ordered scans move. On the fixture the
     # guard removes nothing except the invention itself — reverted, the fixture scan gains ONLY
     # `bare_word_then_brace`. It is PINNED (revert it and `f11f-0` reds on that name, a command and not a
     # definition).
@@ -1406,9 +1407,9 @@ head_with_comment_between()
   :
 }
 # ⛔ ONE OF THESE TWO GUARDS IS STILL UNPINNED, AND THE TWO MUTANTS ARE NOT THE SAME SHAPE. Measured at
-# this head over the 437 `git ls-files '*.sh'` files; re-measure rather than copy any number below.
+# this head over the 438 `git ls-files '*.sh'` files; re-measure rather than copy any number below.
 #   * DELETING `head`'s END-OF-LINE ANCHOR HAS NO PIN: the suite stays at 246 passed / 0 failed — every arm
-#     green — while the mutant INVENTS 133 names. They appear in 63 of the 437 files; 3 more change only by a
+#     green — while the mutant INVENTS 133 names. They appear in 63 of the 438 files; 3 more change only by a
 #     DUPLICATE report of a name the file already had (the ordered scan moves, the name set does not). That is
 #     the inert-enforcer shape this file exists to catch, so this guard is still OWED a fixture line that
 #     changes under it. Until then it is DECLARED, not pinned.
