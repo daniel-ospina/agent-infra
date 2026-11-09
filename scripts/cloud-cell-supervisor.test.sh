@@ -3082,9 +3082,15 @@ esac
 [ -f "$S1/o/state/roles/.desired" ] && [ "$(sgen "$S1")" = 3 ] && [ -f "$S1/up" ] \
   && ok "stop→start on a mismatch leaves the box RUNNING its old harness (indicator a)" \
   || bad "after stop→start the box is not as it was found (marker=$([ -f "$S1/o/state/roles/.desired" ] && echo present || echo GONE) gen=$(sgen "$S1") session=$([ -f "$S1/up" ] && echo up || echo GONE))"
-[ ! -e "$S1/o/orch-loop.sh" ] \
-  && ok "stop→start seeded nothing into \$O (the refused start wrote no harness)" \
-  || bad "a refused start seeded \$O — it wrote the harness it then refused to run"
+# ⛔ THERE IS DELIBERATELY NO "the refused start seeded nothing into $O" ROW HERE (review P3). It was
+# added, then deleted as INERT: no mutation of this diff can redden it, because the diff changes no
+# code `cmd_start` executes — `start` passes no verb, so its gate and its message are byte-identical
+# pre- and post-fix, and it still refuses before `harness_apply`. MEASURED, not reasoned: the suite run
+# against `origin/main`'s supervisor prints this row ✅ while its sibling above goes ❌. Pinning
+# `start`'s own ordering is a real property, but it needs a `start`-side arm whose mutant actually
+# reaches `harness_apply` — a different diff. `start`'s refusal IS still graded here (rc, the gate's
+# own string, and the claim row below), and the box-as-found row above reddens when the gate is
+# deleted; nothing is lost by its absence.
 case "$Q_OUT" in
   *"controller started"*) bad "start CLAIMED success on the mismatched pair" ;;
   *) ok "start never claims 'controller started' on the mismatched pair" ;;
