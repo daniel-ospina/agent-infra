@@ -12,10 +12,34 @@
 
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO="${1:-$PWD}"
-if [[ "${1:-}" == "--repo" ]]; then REPO="${2:-$PWD}"; fi
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+# ⛔ REPO HAS NO PATH DEFAULT (agent-infra#1974). Both reads here used to fall back to `$PWD`, and the
+# gate that forbids a private default (`check-single-source.sh`'s REPO arm) calls that spelling the
+# WORST of the shapes it refuses: under launchd `$PWD` is `/`, a REAL directory that is not a repo, so
+# the pass got past every existence check and died several probes later as "not a git repository: /".
+# The cwd is now a CANDIDATE to the box's ONE resolver, which uses it only after PROVING it is a git
+# checkout (and, when a queue target `$OR` is declared, that its `origin` names that target), says
+# which value it derived, and otherwise refuses with the two supported ways to set REPO.
+REPO="${REPO:-}"
+# ⛔ A DECLARED VALUE IS NEVER REPLACED BY A DERIVED ONE (agent-infra#1974, point 3): the cwd is a
+# candidate only until an argument DECLARES a repo — including `--repo ""`, which is a refusal.
+REPO_CANDIDATES="$PWD"
+if [[ "${1:-}" == "--repo" ]]; then REPO="${2:-}"; REPO_CANDIDATES=""; elif [[ $# -gt 0 ]]; then REPO="$1"; REPO_CANDIDATES=""; fi
 BRANCH="${STALE_TRIAGE_BRANCH:-main}"
+
+# The ONE resolver (`repo-slug.sh`), located beside this script first, then the operator's
+# `$AGENT_INFRA_PATH`; an entry counts only if it actually DEFINES `resolve_repo`.
+for _rsl in "$SCRIPT_DIR/orchestrator-harness/repo-slug.sh" "$SCRIPT_DIR/repo-slug.sh" \
+            "${AGENT_INFRA_PATH:-}/scripts/orchestrator-harness/repo-slug.sh"; do
+  [ -n "$_rsl" ] && [ -f "$_rsl" ] || continue
+  # shellcheck disable=SC1090
+  . "$_rsl" 2>/dev/null || continue
+  command -v resolve_repo >/dev/null 2>&1 && break
+  unset -f resolve_repo 2>/dev/null || true
+done
+command -v resolve_repo >/dev/null 2>&1 \
+  || { echo "stale-main-triage: REPO is unset and repo-slug.sh (the ONE resolver) was not found beside this script ($SCRIPT_DIR/orchestrator-harness, $SCRIPT_DIR) or in \$AGENT_INFRA_PATH — pass --repo <checkout> (exit 2)" >&2; exit 2; }
+REPO="$(resolve_repo)" || exit $?
 
 cd "$REPO"
 

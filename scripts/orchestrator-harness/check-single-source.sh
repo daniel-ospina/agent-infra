@@ -646,12 +646,19 @@ repo_path_default_hits() {
     }
   ' "$@"
 }
-# The scripts that STILL carry a path default, kept NAMED so the debt is visible instead of the arm
-# being narrowed silently. Every entry is pre-existing and is somebody's separate fix; the arm PRINTS
-# them on every run (below) so an operator reads "2 scripts still default REPO", never "REPO is clean".
-# ⛔ Deleting an entry is what FIXING the file looks like; adding one is how this arm gets defeated, and
-# an entry whose file no longer carries a default is reported as stale.
-REPO_DEFAULT_KNOWN="cloud-cell-doctor.sh lane-container-reap.sh stale-main-triage.sh stale-worktrees.sh worktree-hygiene-sweep.sh"
+# The scripts that STILL carry a path default. ⛔ THE LIST IS NOW EMPTY AND THAT IS THE POINT
+# (agent-infra#1974): every entry it ever held was a shipped `REPO="${REPO:-<a path>}"`, and five of
+# them named a path that is wrong on every box but the one they were written on — a developer's home
+# directory, `/tmp/cell` (which exists nowhere), and `$PWD` (which under launchd is `/`, a real
+# directory that is not a repo). All five are fixed: `cloud-cell-doctor.sh`, `lane-container-reap.sh`,
+# `stale-main-triage.sh`, `stale-worktrees.sh`, `worktree-hygiene-sweep.sh` now resolve through
+# `repo-slug.sh`'s `resolve_repo` (environment → a candidate that PROVES it is a checkout → refuse).
+# ⛔ AN EMPTY LIST IS THE STRICTER STATE, NOT A DISARMED ONE: the arm below still scans every shipped
+# script, and ANY new `REPO=` path default now REDS the check instead of being excused by name. Adding
+# an entry back is how this arm would be defeated, so it is not a supported edit — fix the script.
+# An entry whose file no longer carries a default is reported as STALE, which is the note this empty
+# list exists to stop producing.
+REPO_DEFAULT_KNOWN=""
 # ⛔ THE POPULATION IS TWO DIRECTORIES, NOT ONE — and the second is not optional. Two of the three
 # offenders live in the repo's `scripts/` (`pi-reap-worktrees.sh`, `deploy-crossbox.sh`), so a scan of
 # this directory alone left this arm blind to the very file it was written for: measured, re-introducing

@@ -155,12 +155,29 @@ derive_or() {
 # carries NO default of its own: it reads the operator's value, PROVES it is a git checkout, and
 # otherwise refuses with the two supported ways to set it.
 #
+# ⛔ THE RESOLUTION ORDER IS THE ONE agent-infra#1974 STATES: environment → a DERIVATION THAT MUST
+# PROVE ITSELF → refuse. `$REPO_CANDIDATES` is the middle arm, and it is NOT a default:
+#   * a DEFAULT is a value used because nothing was set — the defect. `$PWD`, `/tmp/cell` and a home
+#     directory are all accepted by a default with no evidence behind them, which is why the pass
+#     then dies far from the cause ("not a git repository: /").
+#   * a CANDIDATE is a path offered for INSPECTION. It is used only if it PROVES it is a git checkout
+#     (git env scrubbed, exactly as below) — and, when a queue target `$OR` is declared, only if its
+#     `origin` NAMES that target, through `derive_or` above rather than a second copy of the URL
+#     predicate. A path that proves nothing is skipped silently; a path that proves the WRONG repo is
+#     skipped the same way, so the derivation cannot land this box on another repo's queue (#1901).
+# Two candidates that BOTH prove are a refusal, not a coin toss: a device-local choice between two
+# checkouts of one repo is unrecoverable downstream, so the operator is asked.
+# A caller that sets nothing keeps the old behaviour exactly (refuse by name), which is why the three
+# original call sites — report.sh, pi-reap-worktrees.sh, deploy-crossbox.sh — are untouched.
+#
 # Contract: rc 0 and the canonicalized path on stdout; rc 2 and a refusal on STDERR (2 = "the
 # operator's value is absent or wrong", the same code `derive_or` uses for a bad `OR` pin — one
 # vocabulary for configuration errors). stdout carries the VALUE ONLY, so callers write
 #   REPO="$(resolve_repo)" || exit $?
 # and never have to parse a message out of a path. ⛔ Call it BARE — not inside a function that must
 # survive the refusal: the refusal is the caller's `exit`, because a subshell could not end the pass.
+# The ONE thing it may print on stderr on SUCCESS is which candidate it derived, because a value the
+# operator did not type must be visible in the log the pass writes.
 #
 # ⛔ `refresh-candidates.sh` ALSO DEFINES A `resolve_repo`, AND THAT IS NOT A SECOND COPY OF THIS RULE.
 # Its resolver (line ~255) answers "is this checkout PROVISIONABLE for the DECLARED queue target
@@ -169,9 +186,43 @@ derive_or() {
 # Neither may be dropped in favour of the other: one is the box's config check, the other is the
 # queue/checkout pairing check (#1901).
 resolve_repo() {
-  local repo="${REPO:-}" top=""
+  local repo="${REPO:-}" top="" _cand _seen="" _hits="" _n=0
   # ⛔ SET-BUT-EMPTY IS "UNSET", NOT A REASON TO FALL BACK. A blank line in a plist or a keys.env is
   # an operator typo; treating it as "nothing was set" is how a typo becomes a silent default.
+  if [ -z "$repo" ] && [ -n "${REPO_CANDIDATES:-}" ]; then
+    # ⛔ DERIVATION (the middle arm of the #1974 order). Every candidate must PROVE itself before it
+    # is used, and the proof is the ONLY reason a path is acceptable here.
+    for _cand in $REPO_CANDIDATES; do
+      [ -n "$_cand" ] || continue
+      case " $_seen " in *" $_cand "*) continue ;; esac   # the same dir offered twice is one candidate
+      _seen="$_seen $_cand"
+      [ -d "$_cand" ] || continue
+      # PROOF 1 — it IS a checkout. The git env is scrubbed for the reason stated below: an ambient
+      # `GIT_DIR` would forge a checkout for any directory at all.
+      top="$(env -u GIT_DIR -u GIT_WORK_TREE -u GIT_COMMON_DIR -u GIT_INDEX_FILE \
+             git -C "$_cand" rev-parse --show-toplevel 2>/dev/null)" || continue
+      [ -n "$top" ] || continue
+      # PROOF 2 — only when a queue target is declared: its origin NAMES that target. `derive_or` is
+      # the one URL parser on this file's shelf; repeating the arm list here is how the four copies
+      # drifted (#3188) and what `refresh-provision.test.sh`'s `(h5)` exists to catch.
+      if [ -n "${OR:-}" ]; then
+        [ "$(derive_or "$_cand" 2>/dev/null)" = "$OR" ] || continue
+      fi
+      _hits="$_hits$_cand
+"
+    done
+    _n="$(printf '%s' "$_hits" | grep -c .)"
+    case "$_n" in
+      1) repo="$(printf '%s' "$_hits" | head -1)"
+         echo "REPO is unset — using $repo (a candidate that proved it is a checkout${OR:+ of $OR})" >&2 ;;
+      0) : ;;   # nothing proved itself: fall through to the refusal below, which names the remedy
+      *) echo "REPO is unset and $_n candidate checkouts qualify${OR:+ for $OR}:" >&2
+         printf '%s' "$_hits" | sed 's/^/       /' >&2
+         echo "  refusing to choose between them — set REPO to the one this box should work." >&2
+         _resolve_repo_remedy
+         return 2 ;;
+    esac
+  fi
   if [ -z "$repo" ]; then
     echo "REPO is unset — the harness has no default for it, on purpose: every default it ever carried" >&2
     echo "was a path that is true on ONE machine and absent on the next, and \$PWD is not even stable." >&2

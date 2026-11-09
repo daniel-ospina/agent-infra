@@ -118,7 +118,18 @@ EXIT_PREREQ=6
 
 MODE=dry-run
 PREFLIGHT_ONLY=0
-REPO="${TORTOISE_REPO:-$HOME/eldato/tortoise}"
+# ⛔ REPO HAS NO PATH DEFAULT (agent-infra#1974). This line used to read
+# `REPO="${TORTOISE_REPO:-$HOME/eldato/tortoise}"` — ONE DEVELOPER'S HOME DIRECTORY, baked into a
+# pass every machine runs on a 6-hourly job. A default is only safe if it is TRUE ON EVERY MACHINE and
+# a home directory never is, so there is none: the value is DECLARED (the plist renders `--repo`
+# explicitly) or DERIVED from a candidate that proves itself, or the pass refuses.
+REPO="${REPO:-}"
+# The candidates, in the order #1974 states (the operator's own variables, then the current
+# directory). ⛔ A CANDIDATE IS NOT A DEFAULT: `repo-slug.sh`'s `resolve_repo` uses one only after
+# PROVING it is a git checkout (and, when a queue target `$OR` is declared, that its `origin` names
+# that target), and says which value it derived. `$PWD` failed precisely because nothing proved it —
+# under launchd `$PWD` is `/`, a real directory that is not a repo.
+REPO_CANDIDATES="${TORTOISE_REPO:-${TORTOISE:-}} $PWD"
 ENGINE=""
 AGED_DAYS=7
 BACKUP_DIR="${HYGIENE_BACKUP_DIR:-$HOME/orchestrator/state/reaped-patches}"
@@ -140,7 +151,7 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --apply)      MODE=apply; shift ;;
         --dry-run)    MODE=dry-run; shift ;;
-        --repo)       REPO="${2:-}"; shift 2 ;;
+        --repo)       REPO="${2:-}"; REPO_CANDIDATES=""; shift 2 ;;
         --engine)     ENGINE="${2:-}"; shift 2 ;;
         --aged-days)  AGED_DAYS="${2:-}"; shift 2 ;;
         --backup-dir) BACKUP_DIR="${2:-}"; shift 2 ;;
@@ -157,6 +168,27 @@ case "$AGED_DAYS" in
     ''|*[!0-9]*) echo "worktree-hygiene: --aged-days must be a non-negative integer, got '$AGED_DAYS'" >&2
                  exit "$EXIT_USAGE" ;;
 esac
+
+# ⛔ THE TARGET CHECKOUT IS RESOLVED, NEVER INVENTED (agent-infra#1974 indicator (a)): ONE actionable
+# line on refusal, naming the value to set — instead of a pass that starts against a path nobody
+# chose. `repo-slug.sh` is located beside this script first, then the operator's `$AGENT_INFRA_PATH`,
+# and an entry counts only if it actually DEFINES `resolve_repo` (a stale copy must not shadow a good
+# one and leave the consolidation silently inert).
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+for _rsl in "$SCRIPT_DIR/orchestrator-harness/repo-slug.sh" "$SCRIPT_DIR/repo-slug.sh" \
+            "${AGENT_INFRA_PATH:-}/scripts/orchestrator-harness/repo-slug.sh"; do
+    [ -n "$_rsl" ] && [ -f "$_rsl" ] || continue
+    # shellcheck disable=SC1090
+    . "$_rsl" 2>/dev/null || continue
+    command -v resolve_repo >/dev/null 2>&1 && break
+    unset -f resolve_repo 2>/dev/null || true
+done
+if command -v resolve_repo >/dev/null 2>&1; then
+    REPO="$(resolve_repo)" || exit "$EXIT_USAGE"
+elif [ -z "$REPO" ]; then
+    echo "worktree-hygiene: REPO is unset and repo-slug.sh (the ONE resolver) was not found beside this script ($SCRIPT_DIR/orchestrator-harness, $SCRIPT_DIR) or in \$AGENT_INFRA_PATH — pass --repo <checkout>" >&2
+    exit "$EXIT_USAGE"
+fi
 
 [ -d "$REPO" ] || { echo "worktree-hygiene: repo not found: $REPO" >&2; exit "$EXIT_USAGE"; }
 git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1 || {

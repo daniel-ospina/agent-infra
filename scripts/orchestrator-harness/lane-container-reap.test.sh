@@ -41,7 +41,12 @@ mkdir -p "$T/bin" "$T/state"
 
 NOW=1790000000                      # pinned clock; the suite never reads the real one
 MIN_AGE=14400
-REPO="/repo"
+# ⛔ A REAL DIRECTORY, NOT `/repo` (agent-infra#1974). The reaper now resolves REPO through the box's
+# ONE resolver, which PROVES the value is a checkout — so a fixture path that exists nowhere would be
+# refused before any arm ran. (That is the defect the resolver removes: `/repo`, `/tmp/cell` and a
+# developer's home directory were all "paths the script invented" and the arms could not tell.)
+REPO="$T/repo"
+mkdir -p "$REPO"
 SNAP="$T/state/claims-snapshot"
 RM_LOG="$T/rm.log"
 export NOW MIN_AGE REPO SNAP RM_LOG
@@ -107,10 +112,15 @@ printf '%s %s %s\n' "1" "0" "/sbin/init"
 cat "$PS_FIXTURE"
 SH
 
-# `git` answers only `worktree list --porcelain`.
+# `git` answers the resolver's proof and `worktree list --porcelain`. The proof arm is what makes the
+# fixture honest: `STUB_IS_CHECKOUT=0` models a directory that is NOT a checkout, which is the shape
+# the reaper must refuse rather than sweep.
 cat > "$T/bin/git" <<'SH'
 #!/bin/sh
 case " $* " in
+  *" rev-parse --show-toplevel "*)
+    if [ "${STUB_IS_CHECKOUT:-1}" = 1 ]; then printf '%s\n' "$REPO"; exit 0; fi
+    exit 1 ;;
   *" worktree list "*)
     cat "$WORKTREE_LIST"
     ;;
@@ -141,9 +151,9 @@ run_reaper() {
     )
 }
 
-SLUG_OLD="$(slug_for "/repo/.worktrees/fix-8888")"
-SLUG_LIVE="$(slug_for "/repo/.worktrees/fix-7777")"
-SLUG_PROC="$(slug_for "/repo/.worktrees/fix-6666")"
+SLUG_OLD="$(slug_for "$REPO/.worktrees/fix-8888")"
+SLUG_LIVE="$(slug_for "$REPO/.worktrees/fix-7777")"
+SLUG_PROC="$(slug_for "$REPO/.worktrees/fix-6666")"
 
 : > "$SNAP"
 printf 'refs/claims/9665-abc123def456\tbox1:123\t%s\n' "$(( NOW + 3600 ))" > "$SNAP"
@@ -175,8 +185,8 @@ export PS_FIXTURE="$T/ps.fixture"
 
 # WORKTREE_LIST: the live slug is listed; the old slug is gone.
 cat > "$T/worktree.list" <<EOF
-worktree /repo
-worktree /repo/.worktrees/fix-7777
+worktree $REPO
+worktree $REPO/.worktrees/fix-7777
 EOF
 export WORKTREE_LIST="$T/worktree.list"
 
