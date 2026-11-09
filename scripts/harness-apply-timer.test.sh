@@ -2338,7 +2338,8 @@ assert_contains "$(grep '^farm_n=' "$T/t24ar/state/harness-apply.status" 2>/dev/
 # measured: the only fixture with an unparseable label — `5 fresh` — is rejected by the `<n> stale`
 # pre-filter before the label checks are reached). HISTORY, because the mechanics moved twice: round 31
 # gave `_a`'s sed a start-of-line form, so this fixture's column-1 stale count now PARSES (the count is
-# readable, and the ROW carries the verdict word `CHANGED`, which is what refuses the report); and the
+# readable, and the ROW's `CHANGED` is what leaves the extraction SHORT of it — `farm_n=unparsed` with the
+# header naming the count mismatch, not a refusal of the report, which its own exit 3 already made); and the
 # pass's own note records that `_a` can never fail (the `<n> stale` pre-filter already matched it), so
 # deleting that test changes no verdict — measured — and the round-26 mutant ("drop the `_a`
 # requirement") is a NO-OP at this head. What reds these rows now: adding `CHANGED` to
@@ -2789,8 +2790,8 @@ unset _tok _safe
 # farm_n=unparsed with the header claiming no parsable summary — an over-block with a false reason). A
 # lagging farmed copy that prints the counts on its own line proves the extraction just as well. Mutant
 # that reds these rows: drop the `^\([0-9][0-9]*\) stale` start-of-line expression from `_a`'s sed — the
-# OTHER two labels lead with `stale` in this fixture, so their start-of-line forms are never the one that
-# matched (t24bl/t24bm order those labels first and pin those forms instead).
+# OTHER two labels do not lead the line here — `stale` does — so their start-of-line forms are never the
+# one that matched (t24bl/t24bm order those labels first and pin those forms instead).
 mk_origin t24bk; mk_clone t24bk
 REPO_P="$CLONE"; MODE_P=sync
 mkdir -p "$T/t24bk/home/.pi/agent/scripts"
@@ -2971,7 +2972,7 @@ chmod +x "$T/t24bd/ok-line-over-drift.sh"
 OUT="$(HARNESS_APPLY_FARM_CHECKER="$T/t24bd/ok-line-over-drift.sh" run_pass "$T/t24bd" 2>&1)"; RC=$?
 assert_eq "$RC" "24" "T24 control: an OK line over a summary that reports 2 stale rows is a CONTRADICTION (RED, 24)"
 assert_contains "$OUT" "summary reports 2 row(s)" \
-    "T24 control: and the journal quotes the summary, which is the half that fired"
+    "T24 control: and the journal quotes the summary it refused on (the row operand would also refuse this report, which is why t24c5 exists)"
 assert_contains "$(cat "$T/t24bd/state/harness-apply-farm-rows.txt" 2>/dev/null || true)" "handmade.py" \
     "T24 control: with the first name the row vocabulary could not classify published durably"
 assert_contains "$(cat "$T/t24bd/state/harness-apply-farm-rows.txt" 2>/dev/null || true)" "gone.py" \
