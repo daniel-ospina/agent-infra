@@ -140,13 +140,19 @@ What the controller now does (`orch-loop.sh`, the `# BEGIN gh-bound` block):
   (`disk-reaper.sh` exits 3); this file keeps its own stance — a controller that cannot start is the
   worse outage — but it does not claim a bound it does not have.
 - Graded by `scripts/orchestrator-harness/gh-bound.test.sh`, whose structural assertion reddens if a
-  NEW **shell** `gh` command position bypasses the bound. That is the scope it can see: it matches a
-  command position in `orch-loop.sh`'s own text — including a `case` arm such as `pat) gh api …`,
-  which the first version of the alternation missed (review round 2) and a mutation row now guards. So
-  a call hidden behind a variable, in `eval`, or inside a python heredoc is out of its reach. No such
-  site exists today (independently re-derived over the file: every remaining `gh` is a string literal,
-  the `command gh` pass-through, or the `tb_timeout … gh` argv inside `gh_bounded`), so this is a
-  stated limit, not a live bypass.
+  NEW **shell** `gh` command position bypasses the bound. **What it decides, and how:** a `)` closes a
+  `case` PATTERN list wherever it appears — the grammar is newline-agnostic (`case word in
+  [ [(] pattern [| pattern ]...) command-list ;;]... esac`) — so an expression anchored on a *line's
+  first token* sees only one of the two layouts, and left the one-line
+  `case … in pat) gh api … ;; esac` (the form `orch-loop.sh` itself writes on 76 lines) unscanned
+  (review rounds 2 and 3). The scan therefore accepts `)` at any offset, and drops quoted spans first:
+  quote removal runs before a command is executed, so a `)` inside a literal is never a command
+  position. Both are graded together by ONE fixture — the multi-line arm and the one-line `case` MUST
+  red, while an already-bounded arm and a `pattern="a) gh api"` control MUST NOT — so each is a pinned
+  property rather than prose. So a call hidden behind a variable, in `eval`, or inside a python heredoc
+  is out of its reach. No such site exists today (independently re-derived over the file: every
+  remaining `gh` is a string literal, the `command gh` pass-through, or the `tb_timeout … gh` argv
+  inside `gh_bounded`), so this is a stated limit, not a live bypass.
 
 The other half of that report — "a heartbeat-age assertion that fails the cell rather than waiting to be
 noticed" — already exists and is not part of this change: `watchdog-loop.sh` reports `WEDGED` ("pid is
