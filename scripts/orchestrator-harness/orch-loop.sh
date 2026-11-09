@@ -2243,16 +2243,31 @@ _orch_argv_is_loop() { # shellcheck disable=SC2086
 # ⛔ `-c` IS NOT THIS CASE, AND THAT IS A RECORDED DECISION, NOT AN OVERSIGHT: #1856 established that
 # `bash -c "sleep 300; /abs/orch-loop.sh"` is a WRAPPER's argv rather than a controller (accepting it was
 # the loose any-token arm that failed open), and `orch-loop-lock.test.sh` arm 4c asserts such a pid is
-# RECLAIMED. So the `-c`/`--command` forms return 1 here and keep that behaviour, and only the option
-# forms no decision reaches (`-x`, `-e`, `--posix`, …) are deferred to a human as ambiguous.
+# RECLAIMED. That decision is a fact about the ARGV, not about one POSITION: a `-c`-family option seen
+# BEFORE the loop-shaped token means the shell was handed a COMMAND STRING, so an option in front of it
+# changes nothing (`bash -x -c "…; /abs/orch-loop.sh"` reclaims exactly as `bash -c …` does). Only the
+# option forms that leave the script as an ARGUMENT (`-x`, `-e`, `--posix`, `+o errexit`, …) are
+# deferred to a human as ambiguous.
+# ⛔ BOTH POLARITIES COUNT AS AN OPTION. `bash` accepts the `+` form of every `set`-style option, and
+# this repo already uses `bash +o errexit <…>/orch-loop.sh` for a REAL invocation
+# (`check-deployed-drift.sh`). A `-`-only option test minted that form into rc 1 = RECLAIM over a LIVE
+# owner — a fail-OPEN regression versus `main`, which refused any live pid (fresh review at 8eb852d27,
+# P2; MEASURED end-to-end: STARTED, `[lock] reclaiming …`, owner still alive).
+# ⚠️ ONE NAMED OVER-REFUSAL, stated rather than discovered later: the token scan is ANY-token (so that
+# no plausible option form can miss the script), which means a non-controller whose argv merely NAMES the
+# script behind an option — `bash -x grep /abs/orch-loop.sh` — is refused as ambiguous instead of
+# reclaimed. That is the SAFE direction: a refusal costs a human one `rm -f`, while a wrong reclaim puts
+# two controllers on one queue (#1715). Do not narrow the scan to the "first non-option token" to fix
+# it: every option-taking form (`-o errexit`, `--rcfile FILE`, `+O shopt`) then makes that token an
+# argument rather than the script, and the missed script becomes a reclaim over a live owner.
 _orch_argv_is_loop_flagged() { # shellcheck disable=SC2086
   local _t
   set -- $*
   [ "$#" -ge 3 ] || return 1
   case "${1##*/}" in bash|sh|dash|zsh) ;; *) return 1 ;; esac
-  case "$2" in -c|--command|-[!-]*c*) return 1 ;; esac    # #1856: a `-c` wrapper is not a controller
-  case "$2" in -*) ;; *) return 1 ;; esac                 # token 2 must be a shell OPTION
-  for _t in "$@"; do
+  case "$2" in -*) ;; +*) ;; *) return 1 ;; esac          # token 2 must be a shell OPTION, either polarity
+  for _t in "$@"; do                                # ORDERED: a `-c` before the script is #1856's wrapper
+    case "$_t" in -c|--command|-[!-]*c*) return 1 ;; esac
     case "${_t##*/}" in orch-loop.sh) return 0 ;; esac
   done
   return 1
