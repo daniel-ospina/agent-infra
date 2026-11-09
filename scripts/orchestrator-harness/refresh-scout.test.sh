@@ -3300,14 +3300,24 @@ chmod +x "$D/bin/gh"
 # A sentinel makes "nothing written" DISCRIMINATING: an empty file cannot distinguish "the pass
 # refused" from "the backlog was clobbered".
 echo 99 > "$D/o/candidates.txt"
+# ⛔ ONE SEEDED DISPATCHED ROW, SO THE TWO WINDOWS ARE ACTUALLY ASKED (#1984, fresh review P2). The
+# pass now SKIPS a window whose reader is empty, and this fixture seeded only `candidates.txt` — so
+# both windows took the skip arm (each of which `rm -f`s its file) and the two `[ ! -e ]` rows below
+# were green for ANY implementation of the failure path, including the regressions they exist to catch
+# (`|| : > "$O/.open_iss"`, or dropping the `rm -f`). That is the same false-PASS shape the three
+# sibling fixtures were seeded for; this is the fourth. With the row seeded, the windows are asked at
+# their rows-sized bound, the 403 makes them fail, and each file's ABSENCE is a property of the READ.
+# `checked.txt` stays EMPTY and that is deliberate: the checked half must not be what keeps the row.
+printf '77\n' > "$D/o/dispatched.txt"
 # ⛔ PACING IS OFF FOR THIS CASE, DELIBERATELY (agent-infra#1736 follow-up, 2026-10-18, reconciled with
 # #1729). The fixture serves `core.remaining=0` to model a starved bucket, and the shipped script now
 # has a BUDGET gate for exactly that state: a pass that cannot buy one candidate refuses after the
-# `dispatched.txt` reaper (spending two listings instead of the ~40 the pool listing would cost). That
-# refusal is a DIFFERENT subject — it is covered by `refresh-quota.test.sh` (`unaffordable:` case) —
-# while this case's subject is what the LISTINGS do when the bucket refuses them MID-READ: the named
-# 403, no `.open_iss`/`.pr_brs`, and an untouched backlog. Leaving pacing on here would let the budget
-# gate answer for the listing gate, and the assertions below would pass without exercising it.
+# `dispatched.txt` reaper (spending ONE rows-sized page per window since #1984, instead of the ~40 the
+# pool listing would cost). That refusal is a DIFFERENT subject — it is covered by
+# `refresh-quota.test.sh` (`unaffordable:` case) — while this case's subject is what the LISTINGS do
+# when the bucket refuses them MID-READ: the named 403, no `.open_iss`/`.pr_brs`, and an untouched
+# backlog. Leaving pacing on here would let the budget gate answer for the listing gate, and the
+# assertions below would pass without exercising it.
 rf "$D" refresh COLLISION_PREFLIGHT_CORE_PACING=0
 [ "$RC" -eq 1 ] && ok "rest-403: the pass exits TRANSIENT (rc=1) — a starved REST bucket is an outage, not 'no work'" \
                || bad "rest-403: rc=$RC (want 1) — output: $OUT"
@@ -3315,6 +3325,23 @@ rf "$D" refresh COLLISION_PREFLIGHT_CORE_PACING=0
                           || bad "rest-403: a failed issue listing was written as an empty/partial .open_iss"
 [ ! -e "$D/o/.pr_brs" ] && ok "rest-403: a FAILED PR listing leaves NO .pr_brs" \
                          || bad "rest-403: a failed PR listing was written as an empty/partial .pr_brs"
+# ⛔ AND THE ABSENCE IS NOT THE SKIP ARM'S (#1984). Both files are absent either way, so the rows above
+# only grade the READ if the reap says the listings were ASKED FOR and could not be read — the
+# deliberate-skip line names the other cause and must not appear here.
+# ⛔ AND THE ABSENCE IS THE READ'S, NOT THE SKIP ARM'S (#1984, fresh review P2) — asserted on the ONE
+# observable the failure arm alone produces: the reap's skip names BOTH listings as NOT READABLE. A
+# failed listing that was written as an EMPTY one leaves that file PRESENT, so the skip line names
+# only the other one — which is why this row greps BOTH names rather than just one, and why it is the
+# discriminating half of the two `[ ! -e ]` rows above (a bare absence cannot tell the two apart: the
+# end-of-reap cleanup removes both files on every completed pass).
+case "$OUT" in
+  *"[reap] SKIPPED:"*".open_iss"*".pr_brs"*"not readable"*) ok "rest-403: the reap names BOTH listings as unreadable — each absence above is the failed READ's, not the skip arm's and not an empty answer written in its place" ;;
+  *) bad "rest-403: the reap does not name both listings as unreadable (got: $(printf '%s' "$OUT" | grep -F '[reap] SKIPPED:' | head -1)) — a failed listing may have been written as an EMPTY one (#1705), or the skip arm answered for the read" ;;
+esac
+case "$OUT" in
+  *"window is NOT requested"*) bad "rest-403: a window was reported as deliberately NOT requested — this fixture seeds a dispatched row, so the read was owed and failed" ;;
+  *) ok "rest-403: no deliberate-skip line (the windows were asked and refused)" ;;
+esac
 case "$(tr '\n' ' ' < "$D/o/candidates.txt" 2>/dev/null)" in
   *42*) bad "rest-403: candidates were queued from a listing that failed" ;;
   *99*) ok "rest-403: the backlog was NOT touched (seed 99 intact)" ;;
