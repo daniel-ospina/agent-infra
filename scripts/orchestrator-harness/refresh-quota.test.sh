@@ -871,6 +871,25 @@ mk_case unreadable-rows 1000
 mk_gh "$D" "$(rows 2)"
 mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
 mkdir "$D/o/dispatched.txt"
+# ⛔ THE ROW COUNT MUST NOT DEPEND ON WHAT THIS BOX'S `awk` DOES WITH A DIRECTORY (#1984). The first
+# cut of the shipped guard tested `-e` then `-r`, leaving every other path shape to awk — and that is
+# BUILD-DEPENDENT: on the bash-suites runner (gawk) a command-line directory is SKIPPED with a
+# warning, so the END block still ran and printed `0` rows at rc 0, the count collapsed to "nothing
+# to reap", and the pass skipped both listings while calling them deliberately not-requested. That
+# is the red this case was dispatched for (job 128992051819 on 82cb2aab1's merge commit: "0 PR / 0
+# open request(s) with an unreadable dispatched.txt"). ⛔ The host's own awk ERRORS on a directory
+# (mawk: "read error (Is a directory)", empty stdout), which the shipped count maps to 1 — so
+# without this stub the case is GREEN for the broken count and cannot prove the fix. The stub
+# reproduces the runner's answer (`0`, rc 0) for a directory argument and delegates everything else
+# to the real awk, so the case grades the SHIPPED guard on either build.
+REAL_AWK="$(command -v awk)"
+cat > "$D/bin/awk" <<SH
+#!/bin/bash
+for _a in "\$@"; do _last="\$_a"; done
+if [ -d "\$_last" ]; then printf '0'; exit 0; fi
+exec "$REAL_AWK" "\$@"
+SH
+chmod +x "$D/bin/awk"
 rf "$D" refresh
 ur_pulls="$(grep -cE '^repos/[^ ]*/pulls\?' "$D/bin/gh.argv" 2>/dev/null | tr -d ' ')"
 ur_open="$(grep -E '^repos/[^ ]*/issues\?' "$D/bin/gh.argv" 2>/dev/null | grep -vc 'labels=')"

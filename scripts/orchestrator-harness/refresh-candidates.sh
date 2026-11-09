@@ -2859,10 +2859,20 @@ lists_transport_note
 # The counts are read from the FILES the reap will rewrite, before it runs, so a listing is skipped
 # only when the file it serves is genuinely empty. UNREADABLE COUNTS AS 1, never as 0: a blacklist
 # this pass cannot read is not an empty one, and skipping the listings on it would be that inference.
+# ⛔ "UNREADABLE" IS DECIDED HERE, NOT BY WHAT `awk` DOES WITH THE PATH. The first cut tested only
+# `-e` then `-r`, leaving every other shape to awk's directory/odd-file behaviour — and that is
+# IMPLEMENTATION-DEPENDENT: measured on the bash-suites runner, a DIRECTORY named `dispatched.txt`
+# reached awk, awk exited with an empty row count under that box's awk, the count collapsed to 0, and
+# the pass SKIPPED both listings while calling them deliberately not-requested (the `unreadable-rows`
+# case in `refresh-quota.test.sh`, red on 82cb2aab1's merge commit, job 128992051819). An unreadable
+# blacklist silently becoming "no rows to reap" is exactly the inference this block exists to refuse,
+# so the row count must not depend on a tool's error path at all: anything PRESENT that is not a
+# readable REGULAR file is 1. `-e` stays the absence test because it is the one `lines()` uses
+# (`os.path.exists`, so a dangling link is absent to both readers, and neither can disagree).
 _reap_rows_in() {  # <file> → non-blank rows; unreadable/unparseable ⇒ 1 (never "nothing to do")
   _rr_f="$1"
   if [ ! -e "$_rr_f" ]; then printf '0'; return 0; fi
-  if [ ! -r "$_rr_f" ]; then printf '1'; return 0; fi
+  if [ ! -f "$_rr_f" ] || [ ! -r "$_rr_f" ]; then printf '1'; return 0; fi
   _rr_n="$(awk 'NF { n++ } END { printf "%d", n+0 }' "$_rr_f" 2>/dev/null)"
   case "$_rr_n" in
     ''|*[!0-9]*) printf '1' ;;
