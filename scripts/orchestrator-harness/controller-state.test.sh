@@ -36,7 +36,6 @@ ck() { # ck <name> <0|1>
 }
 say() { printf '\n── %s\n' "$1"; }
 need() { # need <path> <description> — a missing input is a FAILED case, never a silent skip
-  [ -e "$1" ] || [ -n "${2:-}" ]
   if [ -e "$1" ]; then return 0; fi
   printf '  ❌ MISSING: %s (%s)\n' "$2" "$1"; FAIL=$((FAIL+1)); return 1
 }
@@ -119,6 +118,25 @@ esac
 [ "$(cut -d'|' -f1 "$T/o6")" = "$(cut -d'|' -f2 "$T/o6")" ] \
   && ck "§1 a trailing slash and a symlinked spelling resolve to the SAME state dir" 0 \
   || ck "§1 path spelling changed the state dir — got '$(cat "$T/o6")'" 1
+
+# ⛔ AND THE RESOLVED DIR MUST BE EXPORTED (fresh-context review of #3846, P1). Three of the loop's
+# DIRECT children re-default `O` themselves (`harness-refresh.sh`, `refresh-candidates.sh`,
+# `dispatch-merge.sh`, each with `O="${O:-$HOME/orchestrator}"`), so an instance whose state dir is not
+# production had its refresh rewrite PRODUCTION's queue and its dispatch-merge write production's
+# bookkeeping — while the loop printed "PRODUCTION state is untouched by this instance". The worker
+# path already exported it (`worker-terminal.sh`'s env snapshot exists for exactly this reason); the
+# direct children did not. An unexported assignment is invisible behaviour, so it is pinned here.
+if need "$LOOP" "the shipped orch-loop.sh"; then
+  _assign_line="$(grep -n '^O="\$ORC_STATE_RESOLVED"$' "$LOOP" | head -1 | cut -d: -f1)"
+  _export_line="$(grep -n '^export O$' "$LOOP" | head -1 | cut -d: -f1)"
+  if [ -z "$_assign_line" ] || [ -z "$_export_line" ]; then
+    ck "§1 the loop assigns the resolved state dir AND exports it (children re-default to production)" 1
+  elif [ "$_export_line" -gt "$_assign_line" ]; then
+    ck "§1 the loop EXPORTS the resolved O, after the assignment (children cannot fall back to production)" 0
+  else
+    ck "§1 'export O' sits BEFORE the resolved assignment — children would get the un-resolved value" 1
+  fi
+fi
 
 # ─────────────────────────────────────────────────────────────────────────────────────────────────
 say "§2 THE SINGLETON — a live holder is refused, a recycled pid is reclaimed"
