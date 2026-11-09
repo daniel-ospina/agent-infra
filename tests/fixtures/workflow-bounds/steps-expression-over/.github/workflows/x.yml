@@ -1,0 +1,20 @@
+name: fixture a step-only job whose NUMERIC bounds alone breach the ceiling
+on:
+  workflow_call:
+    inputs:
+      step_timeout:
+        type: number
+jobs:
+  expr-over:
+    # The expression bound cannot be summed, but the numeric ones already reach 360 on their own, so
+    # the refusal must not be excused by the unevaluable step.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        timeout-minutes: 200
+      - name: an unevaluable bound
+        timeout-minutes: ${{ inputs.step_timeout }}
+        run: echo hi
+      - name: the tail bound can never fire
+        timeout-minutes: 200
+        run: echo hi

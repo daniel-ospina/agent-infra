@@ -48,7 +48,7 @@
 // extension.
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { execSync } from "node:child_process";
+import { execFileSync, execSync } from "node:child_process";
 import { existsSync, realpathSync } from "node:fs";
 import { isPrintMode } from "./shared/print-mode.js";
 import { execFileAsync, type ExecFn } from "./session-checks.js";
@@ -180,6 +180,54 @@ export function aheadCount(cwd: string, branch: string): number {
 
 export function repoClean(cwd: string): boolean {
   return tryGit(cwd, "status --porcelain") === "";
+}
+
+/**
+ * #2105 P1 — the REPORT-TIME reader, and it is deliberately a SEPARATE mechanism
+ * from `git()` above.
+ *
+ * `git()` interpolates `repo` into an `/bin/sh` command string
+ * (`` `git -C "${repo}" ${args}` ``). That is safe only while every `repo` is a
+ * path this module chose. `syncRepoState` broke that assumption: its `cwd` is the
+ * `task` tool's CALLER-SUPPLIED `cwd`, so a cwd containing `$(…)`, backticks or
+ * `;` was shell-expanded **in the parent process** — the one holding the fleet's
+ * credentials — on the first read that happens after a child has settled
+ * (child → parent execution). `taskCwdRefusal` rejects only NUL and
+ * non-directories, so the metacharacters reached the shell intact.
+ *
+ * The fix is the MECHANISM, not a denylist: argv form has no shell, so there is
+ * nothing to enumerate and nothing to escape. `asyncRepoState` always probed the
+ * same value this way (`exec("git", ["-C", cwd, …])` → `execFile`); this makes
+ * the sync twin match it.
+ *
+ * ⛔ NO `.trim()` HERE, for the second half of the same finding. `git()` trims,
+ * and porcelain-v1 `-z` entries are `XY<space>PATH\0` where `X` is a SPACE for
+ * every unstaged change. Trimming ate the `X` column of the FIRST entry only, so
+ * `parsePorcelainZ`'s `slice(3)` was one character out of alignment
+ * (`" M a.txt"` → `".txt"`), and a worktree whose sole change was a 1-character
+ * path parsed to `[]` → `dirty=false`. That is precisely the fabricated clean
+ * this whole change exists to prevent, so the reader returns stdout VERBATIM and
+ * each caller trims only the scalar fields it knows are line-oriented.
+ *
+ * `maxBuffer` matches `execFileAsync`'s 32 MiB. `execSync`'s 1 MiB default could
+ * throw on a tree the size of this repo's, turning an observed tree into
+ * `dirty=unknown` (fail-safe, but a silent loss of the reading).
+ */
+function gitArgv(cwd: string, args: string[], opts: { timeout?: number } = {}): string {
+  return execFileSync("git", ["-C", cwd, ...args], {
+    encoding: "utf-8",
+    timeout: opts.timeout ?? 10_000,
+    maxBuffer: 32 * 1024 * 1024,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+}
+
+function tryGitArgv(cwd: string, args: string[], opts: { timeout?: number } = {}): string | null {
+  try {
+    return gitArgv(cwd, args, opts);
+  } catch {
+    return null;
+  }
 }
 
 /** Shell-quote a path for execSync interpolation (single-quote wrap + escape). */
@@ -345,11 +393,23 @@ export interface RepoState {
   /** Porcelain paths (a rename/copy contributes only its new path); null when
    * the status probe failed (unknown, not "no paths"). */
   paths: string[] | null;
+  /** #2105: when this state was READ (epoch ms). Optional only so that the
+   * pre-existing call sites and fixtures that construct a `RepoState` literal
+   * keep compiling — every probe in this module stamps it. A snapshot with no
+   * `observedAt` is UNKNOWN-AGED, which a report must treat as "cannot prove
+   * this is current", never as "fresh" (see `repoStateReportText`). */
+  observedAt?: number;
 }
 
 /** Parse `git status --porcelain -z`: entries are `XY<space>PATH`,
  * NUL-terminated; rename/copy entries are followed by a second NUL-terminated
- * ORIG_PATH which must not be counted as a changed path. */
+ * ORIG_PATH which must not be counted as a changed path.
+ *
+ * ⛔ THE INPUT MUST BE UNTRIMMED (#2105 review P2). `X` is a SPACE for every
+ * unstaged change, so a trimmed string loses the first entry's `X` column and
+ * `slice(3)` returns a truncated path — `" M a.txt"` → `".txt"`, and a sole
+ * 1-character path (`" M a"` → `"M a"`, length 3) falls under the `length < 4`
+ * guard and disappears entirely, yielding `[]` ⇒ a confident `dirty=false`. */
 export function parsePorcelainZ(out: string): string[] {
   const parts = out.split("\0");
   const paths: string[] = [];
@@ -369,13 +429,17 @@ export function parsePorcelainZ(out: string): string[] {
  * synchronous readers above use `execSync` (tryGit); running them per tick
  * would block the parent's event loop every 10s mid-dispatch.
  *
+ * #2105: the CACHE IS NOT CURRENT STATE. This snapshot is what the tree looked
+ * like at spawn; every report renders what it looks like NOW, through
+ * `syncRepoState` (see that function for the incident and the rule).
+ *
  * Returns null when nothing could be determined (git missing, not a repo,
  * aborted) — callers render `unknown`, never throw. `exec` is a test seam
  * (defaults to session-checks' `execFileAsync`, which takes an AbortSignal).
  */
 export async function asyncRepoState(
   cwd: string,
-  opts: { signal?: AbortSignal; exec?: ExecFn } = {},
+  opts: { signal?: AbortSignal; exec?: ExecFn; observedAt?: number } = {},
 ): Promise<RepoState | null> {
   const exec = opts.exec ?? execFileAsync;
   const run = (args: string[]) =>
@@ -398,10 +462,75 @@ export async function asyncRepoState(
       headSha: shaRes.code === 0 ? shaRes.stdout.trim() || null : null,
       dirty: paths === null ? null : paths.length > 0,
       paths,
+      observedAt: opts.observedAt ?? Date.now(),
     };
   } catch {
     return null;
   }
+}
+
+/**
+ * #2105 — the REPORT-TIME repo-state read: the same fields as `asyncRepoState`,
+ * read synchronously at the instant a report is emitted.
+ *
+ * WHY THIS EXISTS AT ALL. `asyncRepoState` is probed ONCE at spawn and cached
+ * (#783 Task 2, to keep git off the 10 s heartbeat), and the cached value was
+ * then rendered as CURRENT state in every `Alive state:` wedge report. Measured
+ * on three workers in one session: the report said `dirty=false dirtyPaths=0
+ * headSha=<spawn sha>` while the worktree held modified files and the branch had
+ * advanced — on one of them the worker had committed SEVEN commits (#2105). The
+ * report was a snapshot of another moment presented as the present, and its
+ * effect is the worst possible one: a lane reads "nothing here" and discards
+ * finished work as a failed attempt.
+ *
+ * WHY SYNC IS ACCEPTABLE HERE. `machineStateText()` beside it already samples
+ * `ps`/load synchronously at Report time, and this runs only when an abnormal
+ * exit or a cut is composed — never per tick. The timeout is deliberately short
+ * (5 s per git call): a report must never be held hostage by a pathological
+ * repository, and an unreadable tree degrades to `unknown`, never to a
+ * confident clean.
+ */
+export function syncRepoState(cwd: string, now: number = Date.now()): RepoState | null {
+  const opts = { timeout: 5_000 };
+  // #2105 P1/P2 — ARGV form, never the shell: `cwd` is the `task` tool's
+  // caller-supplied path. No `.trim()` on the status read — see `gitArgv`. The
+  // scalar fields are line-oriented and ARE trimmed.
+  const branchRaw = tryGitArgv(cwd, ["branch", "--show-current"], opts);
+  const shaRaw = tryGitArgv(cwd, ["rev-parse", "HEAD"], opts);
+  const statusRaw = tryGitArgv(cwd, ["status", "--porcelain", "-z"], opts);
+  // Nothing readable at all → UNKNOWN (never a clean tree).
+  if (branchRaw === null && shaRaw === null && statusRaw === null) return null;
+  const paths = statusRaw === null ? null : parsePorcelainZ(statusRaw);
+  return {
+    branch: branchRaw ? branchRaw.trim() : null,
+    headSha: shaRaw ? shaRaw.trim() : null,
+    dirty: paths === null ? null : paths.length > 0,
+    paths,
+    observedAt: now,
+  };
+}
+
+/**
+ * #2105 — how many commits the branch gained between a snapshot's head and the
+ * head observed at report time (`git rev-list --count FROM..TO`).
+ *
+ * This is the number the incident was missing: the report said "nothing
+ * happened" while SEVEN commits had landed. It is diagnostic only — it never
+ * decides anything — so every failure returns `null` rather than a fabricated
+ * zero. The two shas are validated as hex before interpolation (they come from
+ * a parsed `rev-parse HEAD`, but a shell-interpolated value is quoted by
+ * construction here, not by trust).
+ */
+export function countCommitsBetween(cwd: string, from: string, to: string): number | null {
+  const hex = /^[0-9a-f]{7,64}$/i;
+  if (!hex.test(from) || !hex.test(to)) return null;
+  // #2105 P1 — argv form for the same reason as `syncRepoState`: `cwd` comes from
+  // the report path's caller-supplied path. The hex test stays as a second lock,
+  // not as the mechanism.
+  const out = tryGitArgv(cwd, ["rev-list", "--count", `${from}..${to}`], { timeout: 5_000 });
+  if (out === null) return null;
+  const n = Number(out.trim());
+  return Number.isInteger(n) && n >= 0 ? n : null;
 }
 
 /** Default branch checked out in any worktree ≠ current checkout → true.

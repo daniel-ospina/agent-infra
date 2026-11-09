@@ -583,15 +583,27 @@ repo_path_default_hits() {
       #   graded here. The RUNTIME is unaffected (`resolve_repo` refuses any value that is not a
       #   checkout), so what is lost is the coverage of the gate, not the safety of the box.
       #   ⛔ RESIDUAL 2 — THE CANDIDATE CHANNEL, and do NOT read "the debt list is empty" as "nothing
-      #   invents a path" (fresh-context review of #3833, minor note). Since #1974 the shipped scripts
-      #   offer the cwd as a CANDIDATE via `REPO_CANDIDATES=<newline-delimited paths>`, which this arm
-      #   does not examine at all (it grades only lines matching `^REPO=`). A per-machine path planted
-      #   there reds nothing here. It is bounded by `resolve_repo`, which accepts a candidate ONLY after
-      #   `rev-parse --show-toplevel` proves it (and, with `$OR` declared, that its origin names that
-      #   target) — so a planted candidate can never make a pass SWEEP the wrong directory; the worst it
-      #   buys is a derivation that refuses (fail-closed). Grading the channel would mean parsing a
-      #   value whose whole point is to be a list, and this arm states that a gate which refuses
-      #   honest trees gets switched off; so it is named, not half-implemented.
+      #   invents a path" (fresh-context review of #3833). Since #1974 the shipped scripts offer the cwd
+      #   as a CANDIDATE via `REPO_CANDIDATES=<newline-delimited paths>`, which this arm does not examine
+      #   at all (it grades only lines matching `^REPO=`). A per-machine path planted there reds nothing
+      #   here. ⛔ AND IT IS NOT FAIL-CLOSED — an earlier version of this note claimed it was, and that
+      #   claim was MEASURED FALSE (fresh-context review of #3833, F1). With NO `$OR` declared, the
+      #   `resolve_repo` proof is only "this path is a git checkout", never "this box chose it", so a
+      #   planted candidate is ADOPTED on exactly the box that has that path — the #1974 defect
+      #   (`worktree-hygiene-sweep.sh` and one developer home directory) re-expressed in a channel this
+      #   arm does not read. Measured on the merged tree: with `REPO_CANDIDATES="/tmp/…/aaa"` planted
+      #   into `stale-worktrees.sh` and no `$OR` set, this gate returned rc 0 ("scanned 76 shipped
+      #   script(s)", no DIVERGENCE), and running that script from a DIFFERENT real checkout printed
+      #   `REPO is unset — using /tmp/…/aaa` and swept `aaa` (rc 0). ⛔ THE RESIDUAL IS NARROWER THAN IT
+      #   FIRST READS (#3849 review, P3): with `$OR` DECLARED the second proof applies, and the same
+      #   planted candidate IS rejected (measured: `OR=daniel-ospina/agent-infra` + a candidate whose
+      #   origin is the tortoise repo → the refusal, not adoption). So the hole is "boxes that declare no
+      #   queue target". The announcement on stderr is the only mitigation there, and `--execute` can
+      #   REMOVE worktrees, so the cost of the wrong directory is not zero. Grading the channel would
+      #   mean parsing a value whose whole point is to be a LIST, and the widening that was tried on the
+      #   matcher above (#3054) was measured reddening honest sites and reverted — this arm states that a
+      #   gate which refuses honest trees gets switched off, so the residual is named precisely rather
+      #   than half-implemented. Closing it is its own change, with its own arms.
       if (ln !~ /^REPO=/) next
       val = ln
       sub(/^REPO=/, "", val)                              # the value, without the assignment

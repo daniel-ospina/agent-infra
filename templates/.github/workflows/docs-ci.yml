@@ -34,6 +34,15 @@ on:
 jobs:
   markdownlint:
     runs-on: ubuntu-latest
+    # #2055 — an unbounded job can hang until the platform's 6-hour ceiling. These three jobs are a
+    # REUSABLE workflow shipped to consumer repos, so the derivation cannot be "this repo's p90":
+    # measured, the in-repo `push` trigger was removed 2026-08-24 and those runs' job records are
+    # gone (`/actions/runs/32717466822/jobs` → `total_count: 0`), so there is no local distribution
+    # to take a p90 from. The bound is therefore a stated CEILING for an ARBITRARY consumer's docs
+    # tree — the work is one npm-installed linter over a consumer-chosen glob, which is seconds on a
+    # small tree and minutes on a large one. 20 min is generous enough not to false-block a big
+    # consumer and far below the 6-hour default a hang would otherwise get.
+    timeout-minutes: 20
     if: inputs.markdownlint-command != ''
     steps:
       - uses: actions/checkout@v4
@@ -44,6 +53,12 @@ jobs:
 
   link-check:
     runs-on: ubuntu-latest
+    # #2055 — the slowest of the three by construction: `lychee` walks EVERY link in the consumer's
+    # docs and resolves each one over the network, so its wall clock is a function of the consumer's
+    # link count and of remote servers' latency, not of this repo's code. Same measurement basis as
+    # `markdownlint` above (no local distribution exists). 30 min: wide enough that a large docs tree
+    # against slow external hosts is not false-blocked, finite so a wedged DNS resolver ends the job.
+    timeout-minutes: 30
     if: inputs.link-check-args != ''
     steps:
       - uses: actions/checkout@v4
@@ -55,6 +70,10 @@ jobs:
 
   frontmatter:
     runs-on: ubuntu-latest
+    # #2055 — the same ceiling basis as its two siblings: a consumer-supplied command over a
+    # consumer's tree, with no local distribution to size from. It runs one script over the docs
+    # (`check-doc-affiliation.cjs` when present) — the cheapest of the three, so the tightest bound.
+    timeout-minutes: 15
     if: inputs.frontmatter-command != ''
     steps:
       - uses: actions/checkout@v4

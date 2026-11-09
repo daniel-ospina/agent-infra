@@ -79,7 +79,7 @@ import type {
 } from "../shared/provider-failover.js";
 // #783 Task 2 — repo state for the handoff payload (probed once per dispatch,
 // never from the heartbeat).
-import { asyncRepoState, type RepoState } from "../repo-freshness.js";
+import { asyncRepoState, syncRepoState, countCommitsBetween, type RepoState } from "../repo-freshness.js";
 // #783 Task 1 — durable child session per spawn (fresh id + dir per attempt).
 import {
   assertValidSessionId,
@@ -2978,6 +2978,18 @@ export interface HeartbeatKillDecision {
    * matters here because the `networkDown` early return can suppress the kill
    * for hours, so the first firing may be far past the bound. */
   progressAgeMs?: number;
+  /** #2105: the child had NOT BEGUN when this verdict was taken
+   * (`isNotYetStarted`): no turn, no tool, no message, nothing in flight. It is
+   * carried on the payload so the kill headline can name the CONDITION instead
+   * of listing "content-free loop or stalled stream" as the only possibilities —
+   * the two have opposite correct responses (a stalled child should be killed; a
+   * child that never started should be waited for or the work reassigned).
+   *
+   * It never turns a kill into a non-kill by itself. The ONLY bound it gates is
+   * `stream-stall`, whose failure mode was measuring spawn latency as a wedge;
+   * such a child is still bounded by `no-progress` (a LONGER window) and by
+   * `silence-threshold` when it emits nothing at all. */
+  notStarted?: boolean;
   /** #5389: the OBSERVED `toolCpuStallMs` at the moment the in-flight clause
    * fired. Snapshotted for the same reason `progressAgeMs` is: the kill path
    * `await`s the network probe between the decision and the headline, and a
@@ -3356,6 +3368,64 @@ export function inFlightProgress(
 }
 
 /**
+ * #2105 — has this child NOT YET STARTED, as opposed to having stalled?
+ *
+ * THE TELL, from the incident, verbatim: "A child with `toolsInFlight=0` and no
+ * first tick has not stalled — it has not begun. A stall requires something to
+ * be in flight and then stop." Four consecutive sub-agents were cut on one unit
+ * with alive-states reading `tickCount=1 firstMarkerLagMs=989453
+ * firstTickLagMs=2045960 toolsInFlight=0` — a process that had emitted `ready`
+ * and ONE tick and had never begun model work. Nothing had hung; the detector
+ * was measuring CHILD-SPAWN LATENCY UNDER LOAD and reporting it as "this child is
+ * wedged". Those are different conditions with OPPOSITE correct responses: a
+ * wedged child should be killed, a child that has not started should be waited
+ * for or the work moved — killing it loses the dispatch and burns the fleet
+ * further (4 and 6 retries per lane in the incident).
+ *
+ * EVERY term is a LATCH or a count (a state, not a duration), deliberately: a
+ * duration threshold here would make the answer depend on when it is asked, and
+ * the whole point is that "not started" and "stalled" are different STATES. The
+ * elapsed element lives in the bound that acts (see the `stream-stall` clause,
+ * which no longer owns this state: `no-progress` does, at its longer window).
+ *
+ *   · `!everSawWork` — no `turn_start`, no `tool_start`. This is the term that
+ *     separates "has not begun" from the already-correct tighter detectors: a
+ *     child that STARTED a turn and produced nothing is the hung-first-request
+ *     class (#5926), owned by `first-message-stall` at M, and a parsed
+ *     `turn_start` clears this predicate by construction.
+ *   · `!everSawRealActivity` / `firstActivityAt === 0` — no message, no tool, no
+ *     tick that carried `saw_msg`/`saw_tool`/`tools>0`. A drip stream or a
+ *     content-free loop does NOT clear these (that is #5195's point), but those
+ *     shapes also require a TURN, so they are separated by the term above.
+ *   · `lastProgressAt === 0` — no completed unit of work ever. Redundant with the
+ *     latches in practice; kept because the `no-progress` clause reads exactly
+ *     this clock, and a state that sets one without the other must not be able
+ *     to route a live child into the "never started" payload.
+ *   · `toolsInFlight === 0`, `!turnActive` — nothing is in flight and nothing is
+ *     open (a stall requires one of them).
+ *   · `!sessionEnded` — a child that declared completion is finished, not
+ *     unstarted (#191's early return owns that case).
+ */
+export function isNotYetStarted(
+  st: Pick<
+    HeartbeatState,
+    | "toolsInFlight"
+    | "turnActive"
+    | "everSawWork"
+    | "everSawRealActivity"
+    | "firstActivityAt"
+    | "lastProgressAt"
+    | "sessionEnded"
+  >,
+): boolean {
+  if (st.sessionEnded) return false;
+  if (st.toolsInFlight > 0 || st.turnActive) return false;
+  if (st.everSawWork || st.everSawRealActivity) return false;
+  if (st.firstActivityAt > 0 || st.lastProgressAt > 0) return false;
+  return true;
+}
+
+/**
  * The idle detector (#176): tier-1 + the nine kill clauses. Precedence
  * (pinned, E10): no-progress (#5195) → tool-silence → tool-dead → tool-stall →
  * stream-stall → silence → cut → first-message → max-dispatch.
@@ -3371,6 +3441,24 @@ export function heartbeatKillDecision(
   // headline can ever consume a negative age. See `readMarkerAge` for why a
   // future timestamp is invalid input rather than "negative silence".
   const ageReading = readMarkerAge(st.lastMarkerAt, i.now);
+  // #2105: computed ONCE, above the first clause that reads it, so the
+  // "has not begun" state is a property of this decision rather than a second
+  // inference made at a different clause (see `isNotYetStarted`).
+  const notStarted = isNotYetStarted(st);
+  // #2105 review P2 — the suppression below is only safe while the SUBSTITUTE
+  // bound is ARMED. `no-progress` is gated on `i.progressAgeMs > 0` (`:3546`),
+  // and `getProgressAgeMs()` returns 0 for an explicit `TASK_PROGRESS_AGE_MS=0`
+  // (a documented disable valve). With it disabled, suppressing stream-stall for
+  // a not-started child left NO bound below the 6 h hard cap (silence needs
+  // `lastLifeSignAt` to go stale, which ticks keep refreshing; `cut` needs
+  // `toolsInFlight > 0`; `first-message-stall` needs `turnActive`, which
+  // `isNotYetStarted` excludes by construction). On `main` that class was cut at
+  // S = 20 min, so the suppression was a silent 20 min → 6 h widening in a
+  // supported configuration. Keeping `notStarted` pure for the payload/headline
+  // and gating the CLAUSE on the armed substitute means: with the valve pulled,
+  // the old 20-min bound still applies and no operator knob removes the only
+  // bound on the class.
+  const notStartedBounded = notStarted && i.progressAgeMs > 0;
   const kill = (reason: HeartbeatKillReason): HeartbeatKillDecision => ({
     kill: true,
     reason,
@@ -3476,7 +3564,8 @@ export function heartbeatKillDecision(
   if (stateFresh && st.toolsInFlight === 0 && i.progressAgeMs > 0) {
     const progressAnchor = st.lastProgressAt > 0 ? st.lastProgressAt : i.startedAt;
     if (i.now - progressAnchor > i.progressAgeMs) {
-      return { ...kill("no-progress"), progressAgeMs: i.now - progressAnchor };
+      // #2105: payload flag → the headline routes to reassign (isNotYetStarted).
+      return { ...kill("no-progress"), progressAgeMs: i.now - progressAnchor, notStarted };
     }
   }
 
@@ -3659,7 +3748,27 @@ export function heartbeatKillDecision(
 
   // 3. stream-stall — no tools, stream idle beyond S. No turnActive
   //    requirement: also bounds between-turn wedges with flowing ticks.
-  if (stateFresh && st.toolsInFlight === 0 && effStreamAge > i.streamStallMs) {
+  //
+  //    #2105 — BUT NEVER a child that has not begun. This clause was the one
+  //    that killed not-yet-started children at S: with `toolsInFlight=0` and no
+  //    turn ever started, `effStreamAge` is simply the time since spawn, so S
+  //    (20 min) measured SPAWN LATENCY and called it a wedge — under fleet load
+  //    a child's first tick took 34 min and its first marker 16 min, so the
+  //    "wedge" was the box, not the child. Four consecutive dispatches were cut
+  //    on it, none for a task reason, and both lanes kept retrying (4 and 6
+  //    times) and kept losing. Such a child is NOT left unbounded: with nothing
+  //    ever completed, `no-progress` anchors on `startedAt` and fires at X (45
+  //    min, `TASK_PROGRESS_AGE_MS`) — a LONGER wait, which is exactly the
+  //    correct response (wait, or reassign the work; do not cut as wedged) — and
+  //    `silence-threshold` still owns a child that emits nothing at all. The
+  //    kill it eventually composes names the condition instead of calling it a
+  //    wedge (see the `not-started` headline at the kill site).
+  //
+  //    ⛔ AND ONLY WHILE THAT SUBSTITUTE IS ARMED (`notStartedBounded`): with
+  //    `TASK_PROGRESS_AGE_MS=0` the no-progress clause is inert, so the
+  //    suppression must not apply either — otherwise this clause stops bounding
+  //    the class at all and the 6 h hard cap becomes the only limit.
+  if (stateFresh && st.toolsInFlight === 0 && !notStartedBounded && effStreamAge > i.streamStallMs) {
     return kill("stream-stall");
   }
 
@@ -3818,6 +3927,135 @@ export function renderRepoStateLine(repoState: RepoState | null, cwd: string): s
   const dirty = repoState ? (repoState.dirty === null ? "unknown" : String(repoState.dirty)) : "unknown";
   const dirtyPaths = repoState ? (repoState.paths === null ? "unknown" : String(repoState.paths.length)) : "unknown";
   return `branch=${branch} headSha=${sha} worktree=${cwd} dirty=${dirty} dirtyPaths=${dirtyPaths}`;
+}
+
+/**
+ * #2105 — is the RECORDED snapshot stale relative to what the tree reads NOW?
+ *
+ * True iff both heads are known and they differ. A moved head is the tell that
+ * the whole report describes some other moment: the branch advanced while the
+ * snapshot said "nothing happened". An unknown head on either side is NOT a
+ * staleness claim (absence of evidence must not manufacture one) — it is
+ * handled by the source/age tokens instead.
+ */
+export function repoStateSnapshotStale(
+  snapshot: RepoState | null,
+  observed: RepoState | null,
+): boolean {
+  return Boolean(snapshot?.headSha && observed?.headSha && snapshot.headSha !== observed.headSha);
+}
+
+/**
+ * #2105 — the repo-state text appended to the `Alive state:` wedge report.
+ *
+ * The defect this replaces: the report rendered the SPAWN-TIME snapshot with no
+ * timestamp and no way to tell it from a current reading, so `dirty=false
+ * dirtyPaths=0 headSha=<spawn sha>` read as "this worker did nothing" on a
+ * worktree holding modified files and seven uncommitted commits. Two lanes hit
+ * it on eight cut children in one session; one of them nearly discarded the
+ * work (agent-infra#2105).
+ *
+ * What it does now, in the order the issue asks for it:
+ *
+ *  1. READS THE ARTIFACT AT REPORT TIME (`syncRepoState`: `git status
+ *     --porcelain -z`, `git rev-parse HEAD`, `git branch --show-current`) and
+ *     names the instant it read them (`repoStateAt=`). The tree facts in the
+ *     line are always the fresh ones — the cached snapshot is never rendered as
+ *     current state.
+ *  2. MAKES THE STALE CASE A REFUSAL, not a report: when the observed head is
+ *     not the recorded head the line carries `verdictWithheld=stale-snapshot`, a
+ *     readable `VERDICT WITHHELD — snapshot is stale` sentence, and how many
+ *     commits the branch gained since the probe (`commitsSinceSnapshot=`) — the
+ *     number that was missing in the incident.
+ *  3. NEVER PROVES A NEGATIVE FROM A FAILED READ: if git cannot be read at
+ *     report time, every tree field is `unknown` with `repoStateSource=unavailable`
+ *     and the snapshot head is labelled `snapshotHeadSha=` (a past reading, not
+ *     a current one).
+ *
+ * `probe`/`countCommits` are test seams (the codebase's usual shape, cf.
+ * `asyncRepoState`'s `exec`); production takes the real git readers.
+ */
+export function repoStateReportText(
+  snapshot: RepoState | null,
+  cwd: string,
+  now: number = Date.now(),
+  opts: {
+    probe?: (cwd: string, now: number) => RepoState | null;
+    countCommits?: (cwd: string, from: string, to: string) => number | null;
+  } = {},
+): string {
+  const observed = (opts.probe ?? syncRepoState)(cwd, now);
+  const snapshotAgeMs = snapshot?.observedAt ? Math.max(0, now - snapshot.observedAt) : null;
+  const snapHead = snapshot?.headSha ?? null;
+  if (!observed) {
+    // NOTHING may be asserted as current. `dirty=unknown` is the established
+    // sentinel for "could not observe" (#783 review) and is the safe direction:
+    // it cannot be mistaken for a clean tree.
+    const parts = [
+      renderRepoStateLine(null, cwd),
+      "repoStateSource=unavailable",
+      `repoStateAt=${now}`,
+    ];
+    if (snapHead) parts.push(`snapshotHeadSha=${snapHead}`);
+    if (snapshotAgeMs !== null) parts.push(`snapshotAgeMs=${snapshotAgeMs}`);
+    parts.push("verdictWithheld=state-unreadable");
+    parts.push(
+      "(tree could not be read at report time — the fields above are UNKNOWN, not clean; do not treat this report as evidence that nothing happened)",
+    );
+    return parts.join(" ");
+  }
+  const stale = repoStateSnapshotStale(snapshot, observed);
+  const parts = [renderRepoStateLine(observed, cwd), "repoStateSource=fresh", `repoStateAt=${now}`];
+  if (snapHead && snapshotAgeMs !== null) parts.push(`snapshotAgeMs=${snapshotAgeMs}`);
+  // #2105 review P2 — a PARTIALLY unreadable tree is not a verdict either, and it
+  // is the COMMON unreadable case, not the rare one. `syncRepoState` returns a
+  // state as long as ONE of its three reads succeeds, so `status` failing ALONE
+  // leaves a readable branch/head with `dirty=unknown dirtyPaths=unknown` — and
+  // the causes are the incident's own shape: `index.lock` held by the very commit
+  // the child is making, or the 5 s timeout on a tree this repo's size, while
+  // `rev-parse`/`branch` answer in milliseconds. The FIELDS were already safe
+  // (`unknown`, never `dirty=false`); the TOKEN was not — it said "no verdict
+  // withheld" for a tree nobody observed, so a consumer routing on
+  // `verdictWithheld` was told a verdict had been given.
+  //
+  // PRECEDENCE: this refusal WINS over `stale-snapshot`. "I could not observe the
+  // tree" is the more fundamental refusal — a moved head does not make the tree
+  // facts observable — and a reader must not have to infer that from a
+  // `stale-snapshot` token whose sentence promises fresh tree facts. Nothing is
+  // lost: the moved head is still reported below, with its commit count, because
+  // BOTH heads were read successfully.
+  if (observed.paths === null) {
+    const movedFrom = stale && snapHead && observed.headSha ? snapHead : null;
+    const movedTo = movedFrom ? observed.headSha : null;
+    if (movedFrom && movedTo) {
+      const commits = (opts.countCommits ?? countCommitsBetween)(cwd, movedFrom, movedTo);
+      parts.push(`snapshotHeadSha=${movedFrom}`);
+      parts.push(`commitsSinceSnapshot=${commits === null ? "unknown" : commits}`);
+    }
+    parts.push("verdictWithheld=state-unreadable");
+    parts.push(
+      "(tree status could not be read at report time — dirty/dirtyPaths above are UNKNOWN, not clean; do not treat this report as evidence that nothing happened" +
+        (movedFrom && movedTo
+          ? `; the head ALSO moved ${movedFrom.slice(0, 12)} -> ${movedTo.slice(0, 12)} after the probe, so the snapshot is stale as well`
+          : "") +
+        ")",
+    );
+    return parts.join(" ");
+  }
+  if (stale && snapHead && observed.headSha) {
+    const commits = (opts.countCommits ?? countCommitsBetween)(cwd, snapHead, observed.headSha);
+    parts.push(`snapshotHeadSha=${snapHead}`);
+    parts.push(`commitsSinceSnapshot=${commits === null ? "unknown" : commits}`);
+    parts.push("verdictWithheld=stale-snapshot");
+    parts.push(
+      `(VERDICT WITHHELD — snapshot is stale: the head moved ${snapHead.slice(0, 12)} -> ${observed.headSha.slice(0, 12)} after the probe` +
+        `${commits === null ? "" : ` (${commits} commit${commits === 1 ? "" : "s"})`}; ` +
+        "the tree facts above were read at report time — read the worktree before discarding anything)",
+    );
+    return parts.join(" ");
+  }
+  parts.push("verdictWithheld=none");
+  return parts.join(" ");
 }
 
 /** #1485 (from tortoise#3001): count live `pi` processes — the fleet-concurrency
@@ -4468,14 +4706,19 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
     const FIRST_OUTPUT_TIMEOUT_MS = getFirstOutputTimeoutMs();
     let hasOutput = false;
     // #783 Task 2: repo state is probed ONCE per dispatch (async, off the 10s
-    // heartbeat) and cached here. The cap/cut/heartbeat/backstop payloads read
-    // the cached value and never invoke git themselves; null until/unless the
-    // probe resolves → fields render `unknown`.
+    // heartbeat) and cached here. null until/unless the probe resolves → fields
+    // render `unknown`.
+    // #2105: the cache is the SPAWN-TIME snapshot and is no longer what the
+    // report shows. Every report READS the tree at report time
+    // (`repoStateReportText` → `syncRepoState`) and withholds the verdict when
+    // the head moved since this snapshot: a stale head presented as current
+    // state is how a report that said "nothing happened" nearly got seven
+    // commits discarded.
     let repoState: RepoState | null = null;
     void asyncRepoState(targetCwd, { signal })
       .then((s) => { repoState = s; })
       .catch(() => { repoState = null; });
-    const repoStateText = (): string => renderRepoStateLine(repoState, targetCwd);
+    const repoStateText = (): string => repoStateReportText(repoState, targetCwd, Date.now());
     // #1485 (from tortoise#3001): machine-level evidence (load/cores/freeMB/pi
     // procs) so a starved box is not misread as a provider hang. Probed once,
     // here at the settle path — never per heartbeat tick.
@@ -4561,6 +4804,15 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
       },
     };
 
+    // #2105: "this child has not begun" as a REPORT token, read live at emission
+    // (like every other `Alive state:` field) so an operator can tell the two
+    // conditions apart in a post-mortem. A child with `toolsInFlight=0` and no
+    // first turn has not stalled — it has not started, and the correct response
+    // is to wait or reassign rather than to kill and retry. The kill path prints
+    // the DECISION's snapshot of the same state as `decNotStarted=` beside it
+    // (the file's established live/decision pair, cf. `decToolCpuStallMs`).
+    const notStartedText = (): string => `notStarted=${isNotYetStarted(hbCtx.state)}`;
+
     proc.stdout.on("data", (data: Buffer) => {
       logTee?.write(data); // #1662 background capture tee
       stdout = appendCap(stdout, data.toString(), 1_000_000);
@@ -4598,6 +4850,16 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
     // via a follow-up row).
     const writeOutcomeRow = (reason: string, exitCode: number | null, transcriptPath: string | null): RecordWriteResult => {
       if (!dispatchLedgerEnabled(subAgentEnv)) return { ok: false, path: "", skipped: true };
+      // #2105 review P2 — the comment above is the contract, so READ AT SETTLE.
+      // `repoState` is the SPAWN-time snapshot (`asyncRepoState`, assigned once at
+      // :4664 and never re-read); persisting it here wrote
+      // `headSha=<spawn sha> dirty=false` for a child that had since committed
+      // seven times — the incident's false clean, in the append-only ledger that
+      // outlives the report and is read by every ledger consumer. #2105's ask 1
+      // ("never emit `dirty=false` from a cached snapshot") is not limited to the
+      // human renderer. This runs once per settle, so it costs what the report
+      // costs. Unreadable ⇒ `null`, never a confident clean.
+      const settleState = syncRepoState(targetCwd);
       return recordDispatchOutcome(
         buildDispatchOutcomeRow({
           dispatchId: hbNonce || null,
@@ -4605,16 +4867,16 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
           childSessionId,
           attempt,
           cwd: targetCwd,
-          branch: repoState?.branch ?? null,
-          headSha: repoState?.headSha ?? null,
-          dirty: repoState?.dirty ?? null,
+          branch: settleState?.branch ?? null,
+          headSha: settleState?.headSha ?? null,
+          dirty: settleState?.dirty ?? null,
           // MUST stay null when the status probe failed, not `[]` (#783 §6.6
           // review): repo-freshness returns `paths: null` for UNKNOWN
           // deliberately ("A failed status probe MUST NOT become a confident
           // `dirty=false`"), and `?? []` laundered that UNKNOWN back into a
           // confident "zero dirty paths" for any machine consumer of the JSONL
           // row. The human renderer was already correct; this aligns the row.
-          dirtyPaths: repoState?.paths ?? null,
+          dirtyPaths: settleState?.paths ?? null,
           reason,
           toolAgeMaxMs: hbCtx.state.toolAgeMaxMs,
           toolsInFlight: hbCtx.state.toolsInFlight,
@@ -4889,7 +5151,7 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
         { model, provider, killed: true, reason: "hard-cap", hardCapMs: getTaskHardCapMs() },
         {
           headline: `⚠️ Sub-agent exceeded the task hard cap (${getTaskHardCapMs() / 1000}s). Partial results below — parent should decide: accept, re-dispatch, or escalate.`,
-          aliveSummary: `Alive state: toolsInFlight=${hbCtx.state.toolsInFlight} turnActive=${hbCtx.state.turnActive} streamAgeMs=${hbCtx.state.streamAgeMs} effStreamAgeMs=${hbCtx.state.streamAgeMs + (markerAgeMs > 0 ? markerAgeMs : 0)} toolAgeMaxMs=${hbCtx.state.toolAgeMaxMs} effToolAgeMs=${hbCtx.state.toolAgeMaxMs + (markerAgeMs > 0 ? markerAgeMs : 0)} toolCpuMs=${hbCtx.state.toolCpuMs} toolCpuStallMs=${hbCtx.state.toolCpuStallMs} toolCpuAdvanced=${hbCtx.state.toolCpuAdvanced} everSawRealActivity=${hbCtx.state.everSawRealActivity} lastMarkerAgeMs=${markerAgeMs} tickCount=${hbCtx.state.tickCount} markerCount=${hbCtx.state.markerCount} firstMarkerLagMs=${hbCtx.state.firstMarkerAt > 0 ? hbCtx.state.firstMarkerAt - startedAt : -1} firstTickLagMs=${hbCtx.state.firstTickAt > 0 ? hbCtx.state.firstTickAt - startedAt : -1} firstActivityLagMs=${hbCtx.state.firstActivityAt > 0 ? hbCtx.state.firstActivityAt - startedAt : -1} everSawMsg=${hbCtx.state.everSawMsg} everSawTool=${hbCtx.state.everSawTool} toolsMaxInFlight=${hbCtx.state.toolsMaxInFlight} trace=[${hbCtx.state.activityTrace.join(",")}] ${repoStateText()} ${machineStateText()}`,
+          aliveSummary: `Alive state: toolsInFlight=${hbCtx.state.toolsInFlight} turnActive=${hbCtx.state.turnActive} streamAgeMs=${hbCtx.state.streamAgeMs} effStreamAgeMs=${hbCtx.state.streamAgeMs + (markerAgeMs > 0 ? markerAgeMs : 0)} toolAgeMaxMs=${hbCtx.state.toolAgeMaxMs} effToolAgeMs=${hbCtx.state.toolAgeMaxMs + (markerAgeMs > 0 ? markerAgeMs : 0)} toolCpuMs=${hbCtx.state.toolCpuMs} toolCpuStallMs=${hbCtx.state.toolCpuStallMs} toolCpuAdvanced=${hbCtx.state.toolCpuAdvanced} everSawRealActivity=${hbCtx.state.everSawRealActivity} ${notStartedText()} lastMarkerAgeMs=${markerAgeMs} tickCount=${hbCtx.state.tickCount} markerCount=${hbCtx.state.markerCount} firstMarkerLagMs=${hbCtx.state.firstMarkerAt > 0 ? hbCtx.state.firstMarkerAt - startedAt : -1} firstTickLagMs=${hbCtx.state.firstTickAt > 0 ? hbCtx.state.firstTickAt - startedAt : -1} firstActivityLagMs=${hbCtx.state.firstActivityAt > 0 ? hbCtx.state.firstActivityAt - startedAt : -1} everSawMsg=${hbCtx.state.everSawMsg} everSawTool=${hbCtx.state.everSawTool} toolsMaxInFlight=${hbCtx.state.toolsMaxInFlight} trace=[${hbCtx.state.activityTrace.join(",")}] ${repoStateText()} ${machineStateText()}`,
           stderrSection: { delimiter: "--- last stderr ---", slice: 2000, trimFirst: false, omitWhenEmpty: false },
           stdoutSection: { delimiter: "--- last stdout ---", slice: 500, trimFirst: false, omitWhenEmpty: false },
         },
@@ -4988,7 +5250,7 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
         // #1339: clamped through the one reader — this composition runs on the
         // EXIT path, where the last `now` may already be stale.
         const markerAgeMs = readMarkerAge(hbCtx.state.lastMarkerAt, Date.now()).ageMs;
-        const aliveSummary = `Alive state: toolsInFlight=${hbCtx.state.toolsInFlight} turnActive=${hbCtx.state.turnActive} streamAgeMs=${hbCtx.state.streamAgeMs} effStreamAgeMs=${hbCtx.state.streamAgeMs + (markerAgeMs > 0 ? markerAgeMs : 0)} toolAgeMaxMs=${hbCtx.state.toolAgeMaxMs} effToolAgeMs=${hbCtx.state.toolAgeMaxMs + (markerAgeMs > 0 ? markerAgeMs : 0)} toolCpuMs=${hbCtx.state.toolCpuMs} toolCpuStallMs=${hbCtx.state.toolCpuStallMs} toolCpuAdvanced=${hbCtx.state.toolCpuAdvanced} everSawRealActivity=${hbCtx.state.everSawRealActivity} lastMarkerAgeMs=${markerAgeMs} tickCount=${hbCtx.state.tickCount} markerCount=${hbCtx.state.markerCount} firstMarkerLagMs=${hbCtx.state.firstMarkerAt > 0 ? hbCtx.state.firstMarkerAt - startedAt : -1} firstTickLagMs=${hbCtx.state.firstTickAt > 0 ? hbCtx.state.firstTickAt - startedAt : -1} firstActivityLagMs=${hbCtx.state.firstActivityAt > 0 ? hbCtx.state.firstActivityAt - startedAt : -1} everSawMsg=${hbCtx.state.everSawMsg} everSawTool=${hbCtx.state.everSawTool} toolsMaxInFlight=${hbCtx.state.toolsMaxInFlight} trace=[${hbCtx.state.activityTrace.join(",")}] ${repoStateText()} ${machineStateText()}`;
+        const aliveSummary = `Alive state: toolsInFlight=${hbCtx.state.toolsInFlight} turnActive=${hbCtx.state.turnActive} streamAgeMs=${hbCtx.state.streamAgeMs} effStreamAgeMs=${hbCtx.state.streamAgeMs + (markerAgeMs > 0 ? markerAgeMs : 0)} toolAgeMaxMs=${hbCtx.state.toolAgeMaxMs} effToolAgeMs=${hbCtx.state.toolAgeMaxMs + (markerAgeMs > 0 ? markerAgeMs : 0)} toolCpuMs=${hbCtx.state.toolCpuMs} toolCpuStallMs=${hbCtx.state.toolCpuStallMs} toolCpuAdvanced=${hbCtx.state.toolCpuAdvanced} everSawRealActivity=${hbCtx.state.everSawRealActivity} ${notStartedText()} lastMarkerAgeMs=${markerAgeMs} tickCount=${hbCtx.state.tickCount} markerCount=${hbCtx.state.markerCount} firstMarkerLagMs=${hbCtx.state.firstMarkerAt > 0 ? hbCtx.state.firstMarkerAt - startedAt : -1} firstTickLagMs=${hbCtx.state.firstTickAt > 0 ? hbCtx.state.firstTickAt - startedAt : -1} firstActivityLagMs=${hbCtx.state.firstActivityAt > 0 ? hbCtx.state.firstActivityAt - startedAt : -1} everSawMsg=${hbCtx.state.everSawMsg} everSawTool=${hbCtx.state.everSawTool} toolsMaxInFlight=${hbCtx.state.toolsMaxInFlight} trace=[${hbCtx.state.activityTrace.join(",")}] ${repoStateText()} ${machineStateText()}`;
         const headline = "⚠️ Sub-agent was cut — process exited mid-tool / no life signs. Partial results below — parent should decide: accept, re-dispatch, or escalate.";
         doResolve(
           !hasOutput
@@ -5323,7 +5585,7 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
       // therefore labelled apart, exactly as `streamAgeMs`/`effStreamAgeMs` above
       // already are: `toolCpuStallMs` is the live sample, `decToolCpuStallMs` is
       // the value the DECISION actually used.
-      const aliveSummary = `Alive state: toolsInFlight=${hbCtx.state.toolsInFlight} turnActive=${hbCtx.state.turnActive} streamAgeMs=${hbCtx.state.streamAgeMs} effStreamAgeMs=${effStreamAgeMs} toolAgeMaxMs=${hbCtx.state.toolAgeMaxMs} effToolAgeMs=${effToolAgeMs} toolCpuMs=${hbCtx.state.toolCpuMs} toolCpuStallMs=${hbCtx.state.toolCpuStallMs} toolCpuAdvanced=${hbCtx.state.toolCpuAdvanced} decToolCpuStallMs=${decision.toolCpuStallMs ?? -1} decMarkerAgeMs=${decMarkerAgeMs} decMarkerAgeInvalid=${decMarkerAgeInvalid} lastMarkerAgeInvalid=${lastMarkerAgeInvalid} everSawRealActivity=${hbCtx.state.everSawRealActivity} lastMarkerAgeMs=${markerAgeMs} tickCount=${hbCtx.state.tickCount} markerCount=${hbCtx.state.markerCount} firstMarkerLagMs=${hbCtx.state.firstMarkerAt > 0 ? hbCtx.state.firstMarkerAt - startedAt : -1} firstTickLagMs=${hbCtx.state.firstTickAt > 0 ? hbCtx.state.firstTickAt - startedAt : -1} firstActivityLagMs=${hbCtx.state.firstActivityAt > 0 ? hbCtx.state.firstActivityAt - startedAt : -1} everSawMsg=${hbCtx.state.everSawMsg} everSawTool=${hbCtx.state.everSawTool} toolsMaxInFlight=${hbCtx.state.toolsMaxInFlight} trace=[${hbCtx.state.activityTrace.join(",")}] ${repoStateText()} ${machineStateText()}`;
+      const aliveSummary = `Alive state: toolsInFlight=${hbCtx.state.toolsInFlight} turnActive=${hbCtx.state.turnActive} streamAgeMs=${hbCtx.state.streamAgeMs} effStreamAgeMs=${effStreamAgeMs} toolAgeMaxMs=${hbCtx.state.toolAgeMaxMs} effToolAgeMs=${effToolAgeMs} toolCpuMs=${hbCtx.state.toolCpuMs} toolCpuStallMs=${hbCtx.state.toolCpuStallMs} toolCpuAdvanced=${hbCtx.state.toolCpuAdvanced} decToolCpuStallMs=${decision.toolCpuStallMs ?? -1} decMarkerAgeMs=${decMarkerAgeMs} decMarkerAgeInvalid=${decMarkerAgeInvalid} lastMarkerAgeInvalid=${lastMarkerAgeInvalid} decNotStarted=${decision.notStarted === true} everSawRealActivity=${hbCtx.state.everSawRealActivity} ${notStartedText()} lastMarkerAgeMs=${markerAgeMs} tickCount=${hbCtx.state.tickCount} markerCount=${hbCtx.state.markerCount} firstMarkerLagMs=${hbCtx.state.firstMarkerAt > 0 ? hbCtx.state.firstMarkerAt - startedAt : -1} firstTickLagMs=${hbCtx.state.firstTickAt > 0 ? hbCtx.state.firstTickAt - startedAt : -1} firstActivityLagMs=${hbCtx.state.firstActivityAt > 0 ? hbCtx.state.firstActivityAt - startedAt : -1} everSawMsg=${hbCtx.state.everSawMsg} everSawTool=${hbCtx.state.everSawTool} toolsMaxInFlight=${hbCtx.state.toolsMaxInFlight} trace=[${hbCtx.state.activityTrace.join(",")}] ${repoStateText()} ${machineStateText()}`;
       const headlines: Record<string, string> = {
         "silence-threshold": `⚠️ Sub-agent reached silence threshold (${HEARTBEAT_TIMEOUT_MS / 1000}s). Partial results below — parent should decide: accept, re-dispatch, or escalate.`,
         // #5389 — the headline names the evidence on BOTH channels, because the
@@ -5347,6 +5609,28 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
         "no-progress": `⛔ Sub-agent completed no work for ${Math.round((decision.progressAgeMs ?? hbThresholds.progressAgeMs) / 1000)}s with no tool in flight (bound ${Math.round(hbThresholds.progressAgeMs / 1000)}s, TASK_PROGRESS_AGE_MS) — a content-free loop or a stalled stream; the two are indistinguishable from here. Partial results below — parent should decide: accept, re-dispatch, or escalate.`,
         "cut": `⚠️ Sub-agent was cut — no life signs for ${Math.round(decMarkerAgeMs / 1000)}s (marker gap exceeded ${Math.round(effCutGapMs / 1000)}s) — the age the DECISION read; the live read beside it is lastMarkerAgeMs. Partial results below — parent should decide: accept, re-dispatch, or escalate.`,
       };
+      // #2105 — the not-started condition gets its OWN headline, because it has an
+      // opposite correct response and the generic one actively misroutes it. A
+      // child that never began was measured being cut four times on one unit and
+      // six on another, each lane retrying into the same startup latency; "a
+      // content-free loop or a stalled stream" invites exactly that retry. This
+      // text says what is true (nothing hung; the child never began), names the
+      // bound that acted (the LONGER no-progress window, not the stream-stall
+      // wedge), and routes to reassign.
+      //
+      // ⛔ REASSIGN, NOT "WAIT or REASSIGN" (#2105 review P3). This headline is
+      // composed on the KILL path (`decision.kill === true` — the abnormal-exit
+      // composer is invoked with `{ killed: true, reason: "no-progress" }`), so by
+      // the time the parent reads it the child is already dead. "WAIT" is then not
+      // an instruction anyone can follow — an orchestrator taking it literally
+      // waits for a run that will never progress. Gated on the DECISION's snapshot, never
+      // on live state — the network probe is awaited between the two and a
+      // `turn_start` inside that window makes live state say "started" (#5389's
+      // live/decision split, applied here).
+      if (decision.notStarted === true) {
+        headlines["no-progress"] =
+          `⛔ Sub-agent NEVER STARTED — no turn, no tool and no message for ${Math.round((decision.progressAgeMs ?? hbThresholds.progressAgeMs) / 1000)}s since dispatch (bound ${Math.round(hbThresholds.progressAgeMs / 1000)}s, TASK_PROGRESS_AGE_MS). Nothing hung: the child never began work, so this is spawn latency under load, not a wedge. Partial results below — parent should REASSIGN the work; re-dispatching into the same box pays the same startup latency again.`;
+      }
       // #282: first-message-stall triage line — every clause-4 kill is a
       // never-worked session by construction (#279 gate); record the run's
       // tick/marker history so the cut can be triaged into "genuinely hung
@@ -5411,7 +5695,7 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
           return;
         }
         const markerAgeMs = readMarkerAge(hbCtx.state.lastMarkerAt, now).ageMs;
-        const aliveSummary = `Alive state: toolsInFlight=${hbCtx.state.toolsInFlight} turnActive=${hbCtx.state.turnActive} streamAgeMs=${hbCtx.state.streamAgeMs} effStreamAgeMs=${hbCtx.state.streamAgeMs + (markerAgeMs > 0 ? markerAgeMs : 0)} toolAgeMaxMs=${hbCtx.state.toolAgeMaxMs} effToolAgeMs=${hbCtx.state.toolAgeMaxMs + (markerAgeMs > 0 ? markerAgeMs : 0)} toolCpuMs=${hbCtx.state.toolCpuMs} toolCpuStallMs=${hbCtx.state.toolCpuStallMs} toolCpuAdvanced=${hbCtx.state.toolCpuAdvanced} everSawRealActivity=${hbCtx.state.everSawRealActivity} lastMarkerAgeMs=${markerAgeMs} tickCount=${hbCtx.state.tickCount} markerCount=${hbCtx.state.markerCount} firstMarkerLagMs=${hbCtx.state.firstMarkerAt > 0 ? hbCtx.state.firstMarkerAt - startedAt : -1} firstTickLagMs=${hbCtx.state.firstTickAt > 0 ? hbCtx.state.firstTickAt - startedAt : -1} firstActivityLagMs=${hbCtx.state.firstActivityAt > 0 ? hbCtx.state.firstActivityAt - startedAt : -1} everSawMsg=${hbCtx.state.everSawMsg} everSawTool=${hbCtx.state.everSawTool} toolsMaxInFlight=${hbCtx.state.toolsMaxInFlight} trace=[${hbCtx.state.activityTrace.join(",")}] ${repoStateText()} ${machineStateText()}`;
+        const aliveSummary = `Alive state: toolsInFlight=${hbCtx.state.toolsInFlight} turnActive=${hbCtx.state.turnActive} streamAgeMs=${hbCtx.state.streamAgeMs} effStreamAgeMs=${hbCtx.state.streamAgeMs + (markerAgeMs > 0 ? markerAgeMs : 0)} toolAgeMaxMs=${hbCtx.state.toolAgeMaxMs} effToolAgeMs=${hbCtx.state.toolAgeMaxMs + (markerAgeMs > 0 ? markerAgeMs : 0)} toolCpuMs=${hbCtx.state.toolCpuMs} toolCpuStallMs=${hbCtx.state.toolCpuStallMs} toolCpuAdvanced=${hbCtx.state.toolCpuAdvanced} everSawRealActivity=${hbCtx.state.everSawRealActivity} ${notStartedText()} lastMarkerAgeMs=${markerAgeMs} tickCount=${hbCtx.state.tickCount} markerCount=${hbCtx.state.markerCount} firstMarkerLagMs=${hbCtx.state.firstMarkerAt > 0 ? hbCtx.state.firstMarkerAt - startedAt : -1} firstTickLagMs=${hbCtx.state.firstTickAt > 0 ? hbCtx.state.firstTickAt - startedAt : -1} firstActivityLagMs=${hbCtx.state.firstActivityAt > 0 ? hbCtx.state.firstActivityAt - startedAt : -1} everSawMsg=${hbCtx.state.everSawMsg} everSawTool=${hbCtx.state.everSawTool} toolsMaxInFlight=${hbCtx.state.toolsMaxInFlight} trace=[${hbCtx.state.activityTrace.join(",")}] ${repoStateText()} ${machineStateText()}`;
         doResolve(composeAbnormalExit(
           { model, provider, killed: true, reason: "cut", backstop: true, heartbeatTimeout: HEARTBEAT_TIMEOUT_MS },
           {
@@ -5680,6 +5964,7 @@ function parseRunHeartbeat(rec: TaskRunRecord): TaskRunStatusView["heartbeat"] {
     tool_updates: state.toolUpdates,
     cpu_advanced: state.toolCpuAdvanced,
     cpu_stall_ms: state.toolCpuStallMs,
+    not_started: isNotYetStarted(state),
   };
 }
 
@@ -5691,8 +5976,17 @@ export interface TaskRunStatusView {
   /** #1662: the view vocabulary is `alive | wedged | done | failed | cut | gone
    * | unknown` — `alive`/`wedged` are the two most common non-terminal verdicts
    * and MUST be in the declared union, or a consumer switching on it is told
-   * they are impossible. */
-  status: TaskRunStatus | "alive" | "wedged" | "unknown" | "gone";
+   * they are impossible.
+   *
+   * #2105 adds `not-started`: the child's process is up and it has not wedged,
+   * but it has never started a turn, run a tool or produced a message. It is a
+   * NON-terminal live state, and it is deliberately distinct from `wedged`
+   * because the two have opposite correct responses — `wedged` is a re-dispatch
+   * signal, while a not-yet-started lane should be WAITED for or its work moved.
+   * Reporting it as `wedged` duplicated work on live lanes (measured: four
+   * consecutive dispatches cut on one unit, six on another, none for a task
+   * reason). */
+  status: TaskRunStatus | "alive" | "wedged" | "not-started" | "unknown" | "gone";
   /** true only when the run has reached a terminal state and its outcome is
    * persisted — i.e. `task_collect` will return the final message. */
   terminal: boolean;
@@ -5718,6 +6012,11 @@ export interface TaskRunStatusView {
     tool_updates: boolean;
     cpu_advanced: boolean;
     cpu_stall_ms: number;
+    /** #2105 — the same `isNotYetStarted` predicate the idle detector uses, so
+     * the view cannot drift from the watchdog about what "has not begun" means.
+     * A child with this set has never started a turn, run a tool or produced a
+     * message: it is NOT wedged (see the `not-started` status below). */
+    not_started: boolean;
   } | null;
   exit_code?: number | null;
   reason?: string;
@@ -5857,6 +6156,36 @@ export function evaluateTaskRunStatus(
       }
     } else if (effStreamAge > streamStallMs) {
       // clause 3 (stream-stall): no tools in flight, stream idle beyond S.
+      //
+      // #2105 — UNLESS THE CHILD HAS NOT BEGUN. For a child that never started a
+      // turn, `stream_age_ms` is just the time since spawn, so this clause
+      // measured SPAWN LATENCY and reported it as `wedged` — the re-dispatch
+      // signal — on lanes that were still starting up. That reads as "kill and
+      // retry" when the correct answer is "wait, or move the work": measured
+      // four consecutive cuts on one unit and six on another, none for a task
+      // reason. `not-started` is a distinct non-terminal state for exactly this
+      // reason (see the field's note), and it can never be `terminal`, so a
+      // poller keyed on `task_collect` is unaffected — it will reap the run when
+      // the no-progress bound (a LONGER window than S) or the hard cap acts.
+      // #2105 review P2 — name the bound that will ACTUALLY act. With
+      // `TASK_PROGRESS_AGE_MS=0` (the documented disable valve) `no-progress` is
+      // inert, and — since `notStartedBounded` no longer suppresses it — the
+      // stream-stall bound is what cuts the child. Printing "the no-progress window
+      // (0 min)" there is a claim a reader will act on and it is false.
+      const progressBoundMs = getProgressAgeMs();
+      const boundNote =
+        progressBoundMs > 0
+          ? `The bound that will act on it is the no-progress window (${Math.round(progressBoundMs / 60_000)} min), not the stream-stall bound.`
+          : `TASK_PROGRESS_AGE_MS=0 disables the no-progress window, so the bound that will act on it is the stream-stall bound (${Math.round(streamStallMs / 60_000)} min).`;
+      if (heartbeat.not_started) {
+        return {
+          ...base,
+          status: "not-started",
+          terminal: false,
+          alive,
+          note: `not yet started — no turn, no tool and no message in ${Math.round(effStreamAge / 60_000)} min since dispatch (process is up: ${heartbeat.ticks} tick(s), ${heartbeat.markers} marker(s)). This is not a wedge: WAIT, or reassign the work. ${boundNote}`,
+        };
+      }
       return { ...base, status: "wedged", terminal: false, alive, note: `stream idle over the stream-stall bound (${Math.round(streamStallMs / 60_000)} min)` };
     }
   }
@@ -5883,8 +6212,8 @@ export function evaluateTaskRunStatus(
  * once terminal (the exact payload a blocking `task` call would have returned). */
 export interface TaskCollectView {
   run_id: string;
-  /** Same vocabulary as `TaskRunStatusView` — see the note there (#1662). */
-  status: TaskRunStatus | "alive" | "wedged" | "unknown" | "gone";
+  /** Same vocabulary as `TaskRunStatusView` — see the note there (#1662, #2105). */
+  status: TaskRunStatus | "alive" | "wedged" | "not-started" | "unknown" | "gone";
   terminal: boolean;
   exit_code?: number | null;
   reason?: string;
@@ -6306,7 +6635,7 @@ export function buildBackgroundDispatchResult(handle: BackgroundDispatchHandle):
           ? ""
           : `⚠️ run record was NOT persisted — task_status/task_collect will read UNKNOWN for this run_id; re-dispatch or check TASK_RUNS_ROOT.\n`) +
         `\n` +
-        `Poll: task_status({ run_id: "${handle.run_id}" })  → alive | wedged | gone | done\n` +
+        `Poll: task_status({ run_id: "${handle.run_id}" })  → alive | wedged | not-started | gone | done\n` +
         `Reap:  task_collect({ run_id: "${handle.run_id}" }) → final message + exit status\n\n` +
         `⚠️ REVIEW GATE IS A PARENT STEP (#825): the child runs with AGENT_SKIP_REVIEW_GATE=1 and cannot review itself. After task_collect returns a terminal result, run the review ceremony for this lane BEFORE treating it as complete.`,
     }],
@@ -6739,7 +7068,7 @@ export default function (pi: ExtensionAPI) {
       background: Type.Optional(
         Type.Boolean({
           description:
-            "#1662: RETURN IMMEDIATELY instead of awaiting the child. Spawns the lane detached and returns `{ run_id, pid, pgid, log_path }` without blocking. Observe it with `task_status({ run_id })` (alive | wedged | gone | done, derived from the child's `[task-heartbeat]` markers — NOT %CPU) and reap it with `task_collect({ run_id })` once done. Reuses the same watchdog/hard-cap/settle-sweep machinery as a blocking dispatch; it is ONE spawn (no zero-output retry, no failover hop chain) — a failed lane is surfaced as status `failed` and the orchestrator re-dispatches it (#208 resume contract). ⚠️ The review gate is a PARENT step: sub-agents run with AGENT_SKIP_REVIEW_GATE=1 and cannot review themselves (#825), so after `task_collect` you MUST run the review ceremony for the lane before treating it as complete.",
+            "#1662: RETURN IMMEDIATELY instead of awaiting the child. Spawns the lane detached and returns `{ run_id, pid, pgid, log_path }` without blocking. Observe it with `task_status({ run_id })` (alive | wedged | not-started | gone | done, derived from the child's `[task-heartbeat]` markers — NOT %CPU) and reap it with `task_collect({ run_id })` once done. Reuses the same watchdog/hard-cap/settle-sweep machinery as a blocking dispatch; it is ONE spawn (no zero-output retry, no failover hop chain) — a failed lane is surfaced as status `failed` and the orchestrator re-dispatches it (#208 resume contract). ⚠️ The review gate is a PARENT step: sub-agents run with AGENT_SKIP_REVIEW_GATE=1 and cannot review themselves (#825), so after `task_collect` you MUST run the review ceremony for the lane before treating it as complete.",
         })
       ),
     }),
@@ -7340,7 +7669,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   // ═══════════════════════════════════════════════════════════════
-  // task_status — background-run liveness (alive | wedged | gone | done)
+  // task_status — background-run liveness (alive | wedged | not-started | gone | done)
   // ═══════════════════════════════════════════════════════════════
   // #1662: the status seam for `task({ background: true })`. Liveness is
   // derived from the child's `[task-heartbeat]` markers + a pid probe — NEVER
@@ -7351,10 +7680,10 @@ export default function (pi: ExtensionAPI) {
     name: "task_status",
     label: "Task Status (background run)",
     description:
-      "Check a background `task({ background: true })` run: alive | wedged | gone | done. `gone` means the process exited but no terminal record was persisted yet — call `task_collect`, which reaps it once the settle grace expires (or salvages it fail-closed). Derived from the child's `[task-heartbeat]` markers and a pid probe, never from %CPU. Non-blocking — polls state only, never waits. Poll this between other work, then `task_collect` once terminal or `gone`, then RUN THE REVIEW GATE (a parent step, #825).",
+      "Check a background `task({ background: true })` run: alive | wedged | not-started | gone | done. `not-started` means the process is up but has never begun a turn/tool/message — WAIT or reassign; it is NOT a wedge, and killing it loses the dispatch. `gone` means the process exited but no terminal record was persisted yet — call `task_collect`, which reaps it once the settle grace expires (or salvages it fail-closed). Derived from the child's `[task-heartbeat]` markers and a pid probe, never from %CPU. Non-blocking — polls state only, never waits. Poll this between other work, then `task_collect` once terminal or `gone`, then RUN THE REVIEW GATE (a parent step, #825).",
     promptSnippet: "Check the liveness of a background task run",
     promptGuidelines: [
-      "Use task_status({ run_id }) to observe a lane dispatched with task({ background: true }). It returns immediately: alive | wedged | gone | done. `gone` means the process is gone but the terminal record is not yet persisted — call task_collect; it reaps the run once the settle grace expires, never as a success.",
+      "Use task_status({ run_id }) to observe a lane dispatched with task({ background: true }). It returns immediately: alive | wedged | not-started | gone | done. `gone` means the process is gone but the terminal record is not yet persisted — call task_collect; it reaps the run once the settle grace expires, never as a success.",
       "Liveness comes from the child's [task-heartbeat] markers and a pid probe — never from %CPU. A lane blocked in a long tool call reads 0 % CPU but is still alive.",
       "Poll task_status between other work; call task_collect({ run_id }) once it reports a terminal status OR `gone` (process gone, terminal record not yet persisted — collect it directly; it is reaped once the settle grace expires or salvaged fail-closed), then run the review ceremony (a PARENT step, #825).",
     ],

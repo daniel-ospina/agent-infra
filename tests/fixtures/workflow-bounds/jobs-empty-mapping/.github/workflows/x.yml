@@ -1,0 +1,10 @@
+name: fixture jobs-empty-mapping — a workflow with one bounded job (control file)
+on:
+  pull_request:
+jobs:
+  ok:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: work
+        run: echo hi

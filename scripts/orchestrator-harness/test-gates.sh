@@ -2989,18 +2989,67 @@ _clean() { rm -f "$RS"/state/needsfix-* "$RS"/state/needsreview-* "$RS"/state/pa
   # P2). The first form re-typed the pattern here, so reverting merge-one.sh's expression left the
   # whole suite green: a pin over a COPY, the exact false PASS the round-8 finding was about. This
   # evaluates the producer's own `LAST=` line, so the two cannot drift apart again.
-  if grep -q '^LAST="$(grep -aE' "$MERGE"; then
+  # ⛔ THE EXTRACTOR'S SHAPE MOVED AND THIS PIN DID NOT FOLLOW IT (round-26 review of #2132 replaced
+  # `LAST="$(grep -aE …)"` with a BUILTIN `while read` loop, so a shimmed grep/tail cannot fabricate a
+  # verdict). This pin still grepped for the OLD expression, and its `else` arm returned an EMPTY
+  # string — so all six rows below read `expected […], got []` on a tree whose extractor is correct.
+  # That is a red which names nothing, and it sat on `main` for two merges: `main`'s `bash-suites` was
+  # red (499 passed, 6 failed) for a reason no PR caused.
+  # ⛔ THE BLOCK IS LOCATED BY A RANGE THAT CANNOT RUN AWAY, AND IT MUST PARSE ON ITS OWN (#3849 review,
+  # P1 — the first version of this fix shipped both defects). That version used
+  # `sed -n '/^LAST=""$/,/^done < "\$L\.log"$/p'`, but merge-one.sh INDENTS its `done` line by two
+  # spaces, so the end anchor never matched: the range ran to EOF and handed 1,007 lines to `eval`.
+  # It still went GREEN because (a) the runaway tail happens to contain the block's closing `fi`, and
+  # (b) bash executes the parseable PREFIX of an `eval` before erroring — so 506/0 rested on an
+  # accident of the file's current text, plus six `syntax error near unexpected token 'fi'` lines on
+  # stderr that nothing graded. The extraction now walks to the `fi` that CLOSES the `if [ -f "$L.log" ]`
+  # arm, refuses to run past 80 lines, and the row below requires the result to parse standalone
+  # (`bash -n`) — so a broken anchor or a widened shape reds a NAMED row instead of feeding eval
+  # unrelated top-level statements (`echo "[merge $PR] verdict: …" >> "$L.log"` and the `case`
+  # mapping are three lines past the block).
+  # ⛔ ONE BOUND, ONE ROW (#3849 review round 2, P2). The first version of this pin also carried a
+  # separate `BOUNDED` row written as `[ line-count -le 40 ]` — which was GREEN on an EMPTY extraction
+  # (0 ≤ 40), i.e. green on the exact "reads nothing" failure the row was named for, while a CORRECT
+  # 45-line block (a future arm with comments) reddened it. Two bounds for one property, and the
+  # weaker of the two was the one asserted. ONE constant now: the awk caps the extraction at 80 lines
+  # — six times the block's 13, so honest growth has room and only a RUNAWAY is refused — and prints
+  # NOTHING when it cannot close, so `MISSING` is that outcome and one row names all three states.
+  _last_src="$(awk '
+    /^LAST=""$/ { emit = 1 }
+    emit { buf = buf $0 "\n"; n++ }
+    emit && /^[[:space:]]*done < "\$L\.log"[[:space:]]*$/ { saw_done = 1 }
+    saw_done && /^[[:space:]]*fi[[:space:]]*$/ { print buf; exit }
+    n > 80 { exit }
+  ' "$MERGE" 2>/dev/null)"
+  _last_state="MISSING"
+  if [ -n "$_last_src" ]; then
+    if printf '%s\n' "$_last_src" | bash -n 2>/dev/null; then _last_state="located"
+    else _last_state="UNBALANCED"; fi
+  fi
+  if [ "$_last_state" = "located" ]; then
     _last_of() {
       ( L="$TMP/extract"; printf '%s\n' "$1" > "$TMP/extract.log"
-        eval "$(grep -m1 '^LAST="$(grep -aE' "$MERGE")"
+        eval "$_last_src"
         printf '%s' "${LAST:-}" )
     }
   else
     _last_of() { printf '%s' ''; }
   fi
+  eqv "the shipped verdict extractor block is LOCATED, SELF-CONTAINED and BOUNDED in merge-one.sh" \
+      "located" "$_last_state"
   eqv "the shipped verdict extractor accepts ISSUES 3" "ISSUES 3" "$(_last_of 'ISSUES 3')"
   eqv "…accepts ISSUES: 3" "ISSUES: 3" "$(_last_of 'ISSUES: 3')"
   eqv "…accepts ISSUES - 2" "ISSUES - 2" "$(_last_of 'ISSUES - 2')"
+  # ⛔ THE PRODUCER ACCEPTS SIX SEPARATOR FORMS AND THIS PIN DROVE THREE (#3849 review round 2, P3).
+  # `merge-one.sh` states the two halves are pinned "against every accepted form"; deleting the
+  # `|ISSUES-*` arm or the `|CLEAN:*|CLEAN-*` arms left this suite 8/8 GREEN, because `ISSUES - 2`
+  # matches through `ISSUES[[:space:]]*` and not through `ISSUES-*`. The consequence of the gap is the
+  # #2132 loop itself: a reviewer's `ISSUES-3` would read NO-VERDICT, the fixer would be withheld, and
+  # nothing here would red. Each arm is named by its own row now.
+  eqv "…accepts ISSUES-3 (the \`ISSUES-*\` arm)" "ISSUES-3" "$(_last_of 'ISSUES-3')"
+  eqv "…accepts CLEAN: with its URL (the \`CLEAN:*\` arm)" "CLEAN: https://github.com/o/r/pull/1#issuecomment-9" "$(_last_of 'CLEAN: https://github.com/o/r/pull/1#issuecomment-9')"
+  eqv "…accepts CLEAN-ok (the \`CLEAN-*\` arm)" "CLEAN-ok" "$(_last_of 'CLEAN-ok')"
+  eqv "…and an ISSUES-3 line CLASSIFIES as findings (the two halves agree)" "ISSUES" "$(_vc "$(_last_of 'ISSUES-3')")"
   eqv "…accepts a CLEAN line with its URL" "CLEAN https://github.com/o/r/pull/1#issuecomment-9" "$(_last_of 'CLEAN https://github.com/o/r/pull/1#issuecomment-9')"
   eqv "…ignores earlier noise and takes the LAST verdict" "ISSUES 2" "$(_last_of 'ISSUES 5
 noise

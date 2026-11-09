@@ -1,0 +1,7 @@
+name: fixture jobs-empty-mapping — `jobs` is a MAPPING that holds no job
+on:
+  pull_request:
+# `jobs: {}` parses as a mapping, so the "not a mapping" refusal does not fire; the "zero jobs overall"
+# backstop does not fire either while another file has a job. Without the dedicated refusal this file is
+# certified green with nothing read from it (review finding, P2).
+jobs: {}

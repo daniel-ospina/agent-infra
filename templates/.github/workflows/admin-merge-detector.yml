@@ -80,6 +80,16 @@ permissions:
 jobs:
   detect:
     runs-on: ubuntu-latest
+    # #2055 — unbounded, a hang in this detector would never be noticed: it is triggered by
+    # `workflow_run`, so nothing upstream fails when it does. Measured over 14 completed runs
+    # (2026-11-09): p50 61 s, p90 80 s, max 84 s (it reads the triggering run's jobs and, on a main
+    # push, files or closes the "main broken by merge" issue). 20 min is ~14x the max.
+    #
+    # ⛔ A JOB-LEVEL BOUND REPORTS `cancelled`, WHICH THE RAIL READS NON-RED (agent-infra#3242 owns
+    # that surface). This job is not on a PR's merge path at all — it runs AFTER a main-lane CI run
+    # completes — so the bound is a pure runner-leak backstop whose value is that the job ends and
+    # names itself instead of sitting silent.
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
         with:

@@ -1,0 +1,12 @@
+name: fixture steps bounded
+on:
+  pull_request:
+jobs:
+  steps-only:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        timeout-minutes: 10
+      - name: do the work
+        timeout-minutes: 5
+        run: echo hi
