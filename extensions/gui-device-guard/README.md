@@ -201,6 +201,8 @@ pipeline — EXCEPT an fd duplicate that LEAVES STDOUT ON THE PIPE (`2>&1`, `3>&
 and the no-ops `>&1` / `1>&1`), which is decided by BOTH fds: `N>&M` moves stdout
 only when N is 1 or absent and M is not 1, so `cat <<EOF 2>&1 | bash` and
 `cat <<EOF >&1 | bash` both run the body (measured) while `>&2` / `1>&2` do not.
+Bash's brace form is the same rule with a fresh descriptor: `{fd}>&M` allocates a
+NEW fd, so stdout stays on the pipe whatever M is (L38a/L38b).
 Every other case keeps the body data when nothing downstream receives it
 (`round 12`, rows L29a–L29f, L36a/L36b, A48/A49/A53/A60).
 
@@ -277,7 +279,23 @@ This is a residual list, not a completeness claim:
   miss the shell test entirely (L35a) — and a body behind `-c` is that script's
   data. L28a–L28h pin both directions, L29a–L29f and L36a/L36b the pipeline and
   fd-redirect spellings (a shell on the LEFT of a pipe is still fed by the
-  heredoc).
+  heredoc). The DELIMITER is any word with quote removal applied, because bash
+  says so: `<<\EOF` (the standard non-expanding spelling), `<<"E-O-F"` and
+  `<<E\OF` are the same delimiter as `<<EOF`. Treating only an identifier as a
+  delimiter left the body in the parsed line, and one apostrophe in ordinary prose
+  then opened a literal run in the quote model — masking every later command
+  (L37a/L37b: no refusal AND no ledger row) — while a body that merely DOCUMENTED a
+  launch was refused (A61, the direction this file treats as a defect in its own
+  right).
+- A wrapper **in** the list takes its own leading POSITIONAL before the command
+  (`flock FILE CMD`, `taskset MASK CMD`, `chrt PRIORITY CMD`, `script FILE CMD`),
+  and that positional is skipped rather than read as the command word — otherwise
+  `flock /tmp/l.lock electron .` and `taskset 0x3 electron .` were `[]` (no block,
+  no ledger row) while the runner spelling of the SAME wrapper fired, even though
+  `flock`/`taskset` run the payload either way (measured with a stubbed `electron`
+  on PATH; L39a–L39e). When the fail-safe word scan runs for such a wrapper it
+  starts at the payload, so a wrapper that only LOOKS like it takes a positional
+  cannot swallow the launch.
 - A wrapper word that is **not** in the list above, in front of a launch word
   that is **not** brought in by a package-runner (`systemd-inhibit -w electron .`)
   behaves like a plain command: its own arguments are not scanned. That is the one
@@ -293,7 +311,12 @@ This is a residual list, not a completeness claim:
   line (`echo "npm exec electron ."`) is the workaround, and
   `GUI_DEVICE_GUARD_ALLOW_MEDIA=1` waives one run. A miss is not waivable; this is.
   The unprefixed or flag-free spelling of a search is NOT affected
-  (`sudo rg electron .`, `timeout 30 rg electron .` — A38–A40).
+  (`sudo rg electron .`, `timeout 30 rg electron .` — A38–A40), and neither is a
+  wrapper's positional on its own (`flock /tmp/l.lock ls` — A63). The one addition
+  from the positional fix: a SEARCH behind a positional-taking wrapper
+  (`flock /tmp/l.lock rg electron .`) is now refused, because skipping the
+  positional means the word scan has to run and it cannot tell that payload from a
+  launch. Same trade, same waiver.
 - A launch built from a shell variable (`APP=Electron; open -a "$APP"`) is
   recorded with the unexpanded name — the shape is kept, the string is not.
 - A process started by anything that is not `pi` (`cron`, systemd, a human
@@ -307,7 +330,7 @@ This is a residual list, not a completeness claim:
 ## Tests
 
 ```bash
-node extensions/gui-device-guard/test.mjs                    # 246 assertions, threat table L1–L36 + handler H1–H15
+node extensions/gui-device-guard/test.mjs                    # 257 assertions, threat table L1–L39 + handler H1–H15
 node extensions/gui-device-guard/test.mjs --classify 'npm exec electron .'
 ```
 
@@ -318,8 +341,8 @@ stays green while `index.ts` is broken and the guard is inert in every session.
 Mutations are pinned, each attributable to the row it is about, all measured at
 ONE head (**this** head — re-measured, not carried over: the counts are the output
 of running the mutant against `test.mjs`, and the assertion total is
-`246 = 185 ROWS + 8 APP_ROWS + 53 explicit \`check()\` calls`): the Electron
-rule's `media` → `false` reds **105**; the wrapper recursion
+`257 = 196 ROWS + 8 APP_ROWS + 53 explicit \`check()\` calls`): the Electron
+rule's `media` → `false` reds **114**; the wrapper recursion
 removed reds **8**; the wrapper WORDS removed reds **2**; the structural rule that
 reads a package-runner anywhere in the segment removed reds **2** (L19h/L19i); the
 comment stripper removed reds **2** (L11d and L11f — re-measured at this head; the
@@ -348,7 +371,7 @@ by the defect, so it is the record-half twin: it reds if the fix over-cuts and
 reports nothing); deleting the escape guard that the wider set needs reds **1**
 (L27c — without it `x\)#` is cut as a comment and the launch after the `;` is lost);
 removing the shell-STDIN recursion (a heredoc/here-string fed to a shell, the
-round-11 blocking defect) reds **15** (L28a–L28f, L29a–L29f and L35a/L36a/L36b —
+round-11 blocking defect) reds **17** (L28a–L28f, L29a–L29f and L35a/L36a/L36b/L37a/L38a —
 the body is deleted as data, so there is no block AND no ledger row); treating an unquoted
 `<<<word` as a heredoc
 opener reds **1** (L28h — the phantom heredoc deletes the rest of the input);
@@ -358,7 +381,7 @@ keeps the fix from over-firing on the fleet's own idiom); reverting
 heredoc fed to a shell on the left of a pipe) reds **7** (L29a–L29d plus A49, A53
 and A60, which pin the other direction: `cat <<EOF; bash`, `cat <<EOF >&2 | bash`
 and `cat <<EOF 1>&2 | bash` must stay data); dropping the fd-duplication exception
-entirely (`2>&1` read as a command separator) reds **4** (L29e, L29f, L36a, L36b —
+entirely (`2>&1` read as a command separator) reds **6** (L29e, L29f, L36a, L36b —
 measured, and a regression the round-11 code did not have), while the narrower
 pre-fix rule (keyed on the LEFT fd only) reds **2** (L36a `>&1`, L36b `1>&1`);
 accepting only a `.app` SUFFIX in `open`'s positional arm reds **6** (L30a–L30c and
@@ -366,7 +389,14 @@ their three identity twins); ungating the single-quote skip from the double-quot
 state reds **2** (L34a — one apostrophe in `echo "it's"` hid every later `$( … )` —
 and A58, which the pre-fix code refused); dropping the glued-heredoc split reds
 **1** (L35a, `bash<<'EOF'` with no space); dropping the trailing-slash
-normalisation reds **2** (L30c and its identity twin); dropping `electron-forge` from the electron head test reds **5**
+normalisation reds **2** (L30c and its identity twin); reverting the heredoc
+DELIMITER grammar to the pre-fix identifier-only regex (`<<\EOF` and `<<"E-O-F"`
+stop being heredocs, so their bodies are parsed as argv) reds **3** (L37a, L37b and
+the over-fire twin A61); dropping the `{fd}` term from the fd-duplicate rule reds
+**1** (L38a — `{fd}>&2` allocates a NEW descriptor, so stdout stays on the pipe);
+dropping the wrapper POSITIONAL skip reds **3** (L39a–L39c, `flock FILE`,
+`taskset MASK`, `chrt PRIORITY`), and starting the fail-safe scan AFTER the resolved
+word instead of at the payload reds **1** (L39e); dropping `electron-forge` from the electron head test reds **5**
 (L31a–L31e); removing the PROCESS-substitution arm (`<( … )` / `>( … )`, the
 round-12 review's second P2) reds **3** (L32a–L32c, and A55 stays green because the
 double-quoted spelling never was a substitution); dropping the inner-binary term from

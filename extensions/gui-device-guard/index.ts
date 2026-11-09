@@ -78,6 +78,10 @@
  *     not expanded: the token is `$APP` and the guard records it as an `open`
  *     launch with the unexpanded app name. Recording the SHAPE is still worth
  *     more than the exact string.
+ *   - The heredoc DELIMITER is any word with quote removal applied (`<<\EOF`,
+ *     `<<"E-O-F"`, `<<EOF` are the same), because that is bash's rule — a
+ *     delimiter that is not recognised leaves its body in the parsed line, which
+ *     is how one apostrophe in prose used to hide every later command.
  *   - A WRAPPER WORD the table above has never heard of, in front of a launch
  *     word that no package-runner introduces (`systemd-inhibit -w electron .`) is
  *     not classified. This cannot be closed structurally: with no command database,
@@ -89,7 +93,12 @@
  *   - Declared OVER-FIRE: an UNQUOTED line that only PRINTS a runner launch
  *     (`echo npm exec electron .`) is refused, because a runner anywhere in the
  *     segment counts. Quoting it is the workaround, and `ALLOW_MEDIA=1` waives one
- *     run — an over-fire is waivable, a miss is not.
+ *     run — an over-fire is waivable, a miss is not. The same trade applies to a
+ *     SEARCH behind a positional-taking wrapper (`flock /tmp/l.lock rg electron
+ *     .`): the wrapper's own positional is skipped (round 12, so `flock FILE
+ *     electron .` is no longer `[]`), which means the word scan has to run and it
+ *     cannot tell that payload from a launch. A positional on its own stays clean
+ *     (`flock /tmp/l.lock ls` — A63).
  *   - The guard is a `tool_call` pre-hook on pi's `bash` tool. A process started
  *     by something that is not pi (`cron`, a systemd unit, a human shell) is not
  *     seen. The host-side read is `scripts/orchestrator-harness/media-holders.sh`
@@ -254,6 +263,31 @@ const RUNNER_VALUE_FLAGS = [
 
 /** `timeout`'s own duration (`30`, `2.5s`, `1m`), or its `-s`\/`-k` value. */
 const TIMEOUT_DURATION = /^\d+(\.\d+)?[smhd]?$/;
+
+/**
+ * How many LEADING POSITIONAL arguments a prefix takes before the real command.
+ *
+ * ⛔ A WRAPPER'S OWN POSITIONAL IS NOT THE COMMAND WORD (round-12 review, P3).
+ * `commandWordIndex` skipped only `-`-prefixed tokens after a prefix, so the
+ * wrapper's positional BECAME the command word and the launch behind it vanished:
+ * `flock /tmp/l.lock electron .` and `taskset 0x3 electron .` were `[]` — no
+ * refusal and no ledger row — while the runner spelling of the SAME wrapper
+ * (`flock /tmp/l.lock npm exec electron .`) fired. Real `flock`/`taskset` run the
+ * payload in both spellings (measured with a stubbed `electron` on PATH).
+ *
+ * These arities are the canonical single-positional grammars: `flock FILE CMD`,
+ * `taskset MASK CMD` (the mask is omitted when `-c/--cpu-list` supplies it),
+ * `chrt PRIORITY CMD`, and `script FILE [CMD …]`. A wrapper that is not listed
+ * keeps its old behaviour, and the fail-safe word scan is enabled whenever a
+ * positional was skipped, so a wrapper that only LOOKS like it takes one cannot
+ * swallow the launch.
+ */
+const PREFIX_POSITIONALS: Record<string, number> = {
+  flock: 1,
+  taskset: 1,
+  chrt: 1,
+  script: 1,
+};
 
 /**
  * Shell grouping / control-flow words sit where a command word would.
@@ -460,13 +494,19 @@ function lineSegments(line: string): LineSegment[] {
         left = line[k] + left;
         k--;
       }
+      // ⛔ `{fd}>&2` ALLOCATES A NEW DESCRIPTOR (round-12 review, P3): the left side
+      // is `{name}`, not an absent fd 1, so stdout stays on the pipe — yet the digit
+      // scan saw nothing and treated it as fd 1 (`cat <<'EOF' {fd}>&2 | bash` printed
+      // `BRACEFD_RAN` while the guard returned `[]`).
+      const braceFd = left === "" && k >= 0 && line[k] === "}";
       let m = i + 1;
       let right = "";
       while (m < line.length && /\d/.test(line[m])) {
         right += line[m];
         m++;
       }
-      const stdoutMoves = (left === "" || left === "1") && right !== "1";
+      const leftIsStdout = !braceFd && (left === "" || left === "1");
+      const stdoutMoves = leftIsStdout && right !== "1";
       if (!stdoutMoves) {
         cur += ch;
         continue;
@@ -704,7 +744,58 @@ function lineFeedsShell(line: string, cut: number, offset: number): boolean {
   return false;
 }
 
+/**
+ * Bash's heredoc DELIMITER: the word after `<<`, with quote removal applied.
+ *
+ * ⛔ THE DELIMITER IS ANY WORD, NOT AN IDENTIFIER (round-12 review, P1/P2). The
+ * scanner accepted only `['"]?[A-Za-z_][A-Za-z0-9_]*`, so the STANDARD way to write
+ * a non-expanding heredoc — `<<\EOF` — was not a heredoc at all: its body was left
+ * in `cleaned` and parsed as ARGV. Two failures followed from that one gap:
+ *   - a lone apostrophe in the body (`don't touch the camera`) opened a literal run
+ *     in the shared quote model, masking the newline separators and every later
+ *     command → the launch was invisible (`[]`: no refusal, no ledger row);
+ *   - a body that merely DOCUMENTED a launch was refused (`cat >> runbook.md <<\EOF`
+ *     with `open ./Build/DMeer.app` inside) — a block on correct work, which this
+ *     file treats as a defect in its own right.
+ * `<<\EOF`, `<<'EOF'`, `<<"EOF"`, `<<E\OF`, `<<"E-O-F"` and `<<EOF` are all the
+ * same delimiter to bash, and no expansion is performed on the word.
+ */
+function heredocDelimiter(raw: string): string | null {
+  let out = "";
+  let i = 0;
+  while (i < raw.length) {
+    const ch = raw[i];
+    if (ch === "'") {
+      const end = raw.indexOf("'", i + 1);
+      if (end < 0) return null;
+      out += raw.slice(i + 1, end);
+      i = end + 1;
+      continue;
+    }
+    if (ch === '"') {
+      const end = raw.indexOf('"', i + 1);
+      if (end < 0) return null;
+      out += raw.slice(i + 1, end);
+      i = end + 1;
+      continue;
+    }
+    if (ch === "\\") {
+      if (i + 1 >= raw.length) return null;
+      out += raw[i + 1];
+      i += 2;
+      continue;
+    }
+    // A metacharacter ends the delimiter word (`<<EOF;` → `EOF`), and meeting one
+    // FIRST means this `<<` is not a heredoc at all (`<<<EOF` → `<EOF` → null).
+    if (";&|<>()`".includes(ch)) break;
+    out += ch;
+    i++;
+  }
+  return out === "" ? null : out;
+}
+
 export function splitShellStdin(command: string): ShellStdin {
+
   if (!command.includes("<<")) return { cleaned: command, programs: [] };
   const lines = command.split("\n");
   const mask = unquotedMask(command);
@@ -732,7 +823,7 @@ export function splitShellStdin(command: string): ShellStdin {
       if (operand === "" || !lineFeedsShell(line, cut, m.index)) continue;
       programs.push(operand);
     }
-    const re = /<<(-?)\s*(['"]?)([A-Za-z_][A-Za-z0-9_]*)\2/g;
+    const re = /<<(-?)\s*(\S+)/g;
     let m: RegExpExecArray | null;
     let delim: string | null = null;
     let delimOffset = 0;
@@ -747,7 +838,9 @@ export function splitShellStdin(command: string): ShellStdin {
       // ⛔ A COMMENTED `<<` IS DATA (review cycle 5, F2) — see the header. It used
       // to delete every following line, which lost the block AND the ledger row.
       if (cut !== -1 && m.index > cut) continue;
-      delim = m[3];
+      const word = heredocDelimiter(m[2]);
+      if (word === null) continue; // `<<<` and a bare `<<` with no usable word
+      delim = word;
       delimOffset = m.index;
       stripTabs = m[1] === "-";
     }
@@ -872,7 +965,7 @@ function packageBaseName(tok: string): string {
  * (and the values their own flags consume) and grouping words. Returns -1 when
  * the segment holds no command word.
  */
-function commandWordIndex(toks: string[], out?: { sawFlag?: boolean }): number {
+function commandWordIndex(toks: string[], out?: { sawFlag?: boolean; payloadStart?: number }): number {
   // ⛔ AN OPERATOR TOKEN IS SEPARATION, NOT A COMMAND WORD (review cycle 4, F1).
   // `stripLeadingMetachars` strips metacharacters from INSIDE a token, so a token
   // that IS a metachar became `""` — and `""` was accepted as the command word.
@@ -936,6 +1029,18 @@ function commandWordIndex(toks: string[], out?: { sawFlag?: boolean }): number {
         }
       }
       if (tok === "timeout" && i < toks.length && TIMEOUT_DURATION.test(toks[i])) i++;
+      // A wrapper's own positional (lock file, CPU mask, priority) is skipped — see
+      // PREFIX_POSITIONALS. `taskset -c 0-3` supplies the mask by flag, so the token
+      // that lands on the command word is skipped here and found by the fail-safe
+      // scan instead (which starts at the payload, so it sees the real command).
+      const positionals = PREFIX_POSITIONALS[tok] ?? 0;
+      if (positionals > 0 && i < toks.length && !toks[i].startsWith("-")) {
+        if (out) {
+          out.sawFlag = true;
+          out.payloadStart = i;
+        }
+        i += positionals;
+      }
       continue;
     }
     return i;
@@ -1429,7 +1534,7 @@ export function classifyLaunchCommand(command: string, depth = 0): LaunchFinding
   for (const segment of splitSegments(body)) {
     const toks = tokenize(segment);
     if (toks.length === 0) continue;
-    const flags: { sawFlag?: boolean } = {};
+    const flags: { sawFlag?: boolean; payloadStart?: number } = {};
     const cwi = commandWordIndex(toks, flags);
     if (cwi < 0) {
       // ⛔ A WRAPPER CAN CONSUME ITS WHOLE SEGMENT (`flock -c"<cmd>"`, `su -c
@@ -1503,7 +1608,10 @@ export function classifyLaunchCommand(command: string, depth = 0): LaunchFinding
     // `electron`. A prefix that DID skip a flag keeps the over-fire, which is the
     // declared direction (README's Declared residuals).
     if (flags.sawFlag || execVerb) {
-      const alt = launchWordIndex(toks, cwi + 1);
+      // A skipped POSITIONAL can also have swallowed the command word, and it sits
+      // BEFORE the resolved word — so the scan starts at the payload, not after it.
+      const from = flags.payloadStart !== undefined ? flags.payloadStart : cwi + 1;
+      const alt = launchWordIndex(toks, from);
       if (alt >= 0 && alt !== cwi) {
         const rescued = classifySegment(toks, alt, faked, pwdebug);
         if (rescued) {

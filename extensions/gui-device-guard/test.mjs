@@ -498,6 +498,42 @@ const ROWS = [
     "cat <<'EOF' 1>&1 | bash\nnpm exec electron .\nEOF", 1, "electron", true],
   ["A60 `1>&2` sends stdout AWAY from the pipe (the twin of L36)",
     "cat <<'EOF' 1>&2 | bash\nnpm exec electron .\nEOF", 0, null, false],
+  // ── L37–L39 (round-12 review, fourth pass) — the delimiter SPELLING, a brace fd,
+  //     and a listed wrapper's own POSITIONAL. Each was `[]` at 948b406b4/b10376f5a.
+  //   L37: bash's delimiter is ANY word with quote removal applied. The scanner
+  //        accepted only an identifier, so `<<\EOF` — the standard way to write a
+  //        non-expanding heredoc — was not a heredoc: its body stayed in `cleaned`,
+  //        and one apostrophe in it opened a literal run in the shared quote model,
+  //        masking the newline separators and every later command.
+  ["L37a `<<\\EOF` is a heredoc — its body cannot poison the quote model (was [])",
+    "cat > /tmp/msg.txt <<\\EOF\ndon't touch the camera\nEOF\nnpm exec electron .", 1, "electron", true],
+  ["L37b …and a QUOTED hyphenated delimiter `<<\"E-O-F\"` is the same word",
+    'cat > /tmp/msg.txt <<"E-O-F"\ndon\'t touch the camera\nE-O-F\nnpm exec electron .', 1, "electron", true],
+  ["A61 the over-fire twin: a WRITE whose heredoc body merely names a launch",
+    "cat >> /tmp/runbook.md <<\\EOF\nopen ./Build/DMeer.app\nEOF", 0, null, false],
+  //   L38: `{fd}>&2` ALLOCATES A NEW descriptor, so stdout stays on the pipe — the
+  //        digit scan before `>` saw no left fd, read it as fd 1, and ended the
+  //        pipeline (`cat <<'EOF' {fd}>&2 | bash` printed `BRACEFD_RAN`).
+  ["L38a `{fd}>&2` allocates a descriptor — stdout stays on the pipe (was [])",
+    "cat <<'EOF' {fd}>&2 | bash\nnpm exec electron .\nEOF", 1, "electron", true],
+  ["L38b …and the `{fd}>&1` spelling of the same brace fd",
+    "cat <<'EOF' {fd}>&1 | bash\nnpm exec electron .\nEOF", 1, "electron", true],
+  //   L39: a LISTED wrapper's own positional (lock file, CPU mask, priority) became
+  //        the command word, so the launch behind it vanished — while the runner
+  //        spelling of the same wrapper fired, and real `flock`/`taskset` run the
+  //        payload in both (measured with a stubbed `electron` on PATH).
+  ["L39a a listed wrapper's own POSITIONAL is skipped: `flock FILE electron .` (was [])",
+    "flock /tmp/l.lock electron .", 1, "electron", true],
+  ["L39b …`taskset MASK electron .` (was [])",
+    "taskset 0x3 electron .", 1, "electron", true],
+  ["L39c …`chrt PRIORITY electron .` (was [])",
+    "chrt 10 electron .", 1, "electron", true],
+  ["L39d …and with the wrapper's own option in front of it (was [])",
+    "flock -w 5 /tmp/l.lock electron .", 1, "electron", true],
+  ["L39e …and with the positional MISSING, the launch after it is still found",
+    "flock electron .", 1, "electron", true],
+  ["A63 the ALLOW twin: a wrapper positional must not make every later word a launch",
+    "flock /tmp/l.lock ls", 0, null, false],
   //   L30c: tab completion appends a slash to directories, and `open
   //         ./Build/DMeer.app/` — the incident's own app — matched none of the three
   //         bundle tests while the `-a` spelling of the SAME token was refused.
