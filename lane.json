@@ -1,0 +1,36 @@
+{
+  "artifacts": [
+    {
+      "kind": "log",
+      "value": "/var/folders/lh/4zv9grjx0958bnrclvkt8dv40000gn/T/tmp.h27MQOFxAk/pg.log"
+    },
+    {
+      "kind": "sha",
+      "value": "39e9f7f3f8f88b675bb08bcf9a2081a8dcddd703"
+    },
+    {
+      "kind": "worktree",
+      "value": "/var/folders/lh/4zv9grjx0958bnrclvkt8dv40000gn/T/tmp.h27MQOFxAk/lbwt2"
+    }
+  ],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 605,
+  "duration_s": 63,
+  "ended_at": 1794190103,
+  "exit_code": 0,
+  "heartbeat_at": 1794190103,
+  "host": "Daniels-MacBook-Air-new",
+  "issue": 78,
+  "kind": "prfix",
+  "lane_id": "Daniels-MacBook-Air-new.kprfix-78-1794190040-p87482-4dba2a3c",
+  "lease_until": 1794190708,
+  "pid": 87482,
+  "reason": "cap-hit:rc=0",
+  "repo": "daniel-ospina/agent-infra",
+  "schema": 1,
+  "started_at": 1794190040,
+  "state": "FAILED",
+  "tag": "78",
+  "worktree": "/private/var/folders/lh/4zv9grjx0958bnrclvkt8dv40000gn/T/tmp.h27MQOFxAk/lbwt2"
+}
