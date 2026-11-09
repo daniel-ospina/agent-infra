@@ -44,8 +44,8 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { homedir } from "node:os";
 import { execFileSync } from "node:child_process";
-import { existsSync, readFileSync, writeFileSync, appendFileSync, mkdirSync, unlinkSync, renameSync } from "node:fs";
-import { resolve, join, dirname } from "node:path";
+import { existsSync, readFileSync, writeFileSync, appendFileSync, mkdirSync, unlinkSync, renameSync, statSync, lstatSync, realpathSync } from "node:fs";
+import { resolve, join, dirname, relative, isAbsolute } from "node:path";
 import { isIP } from "node:net"; // #383 (Task 3, P3-1 FINAL mechanical): true IPv6 mirror — zero-dep builtin
 import { isPrintMode, isPrintModeEnv } from "../shared/print-mode.js";
 // #357 (Task 1) introduced the inline; #1330 gave it ONE home and a pin.
@@ -1276,14 +1276,506 @@ const CHECKPOINT_ESCAPE_RE = new RegExp(
 // Plain U+0020 must NOT match (regression-pinned).
 export const CHECKPOINT_WHITESPACE_REJECT = /[^\S\u0020]|[\u200B-\u200D\u2060\u0085]/u;
 
+// #1418: THE GATE MUST NEVER BLOCK THE REMEDY ITS OWN VERDICT PRESCRIBES.
+// The checker writes its PASS token ONLY on a CLEAR verdict, and C4 reports
+// `STALE behind-origin by N commit(s) options=rebase` on any branch main has
+// moved past — the normal state of a lane on an active repo. Before this
+// escape, that state was a closed loop: the gate required CLEAR, CLEAR
+// required not-behind, not-behind required a rebase, and the rebase was
+// blocked. Every stale branch escalated to a human; the lane's only other
+// exit was the end of its turn.
+//
+// The remedy set is POSITIVELY bounded to what the checker's own verdicts
+// prescribe — it is not a general widening of the hatch:
+//   * `git fetch` / `git status` / `git diff` — read-only (fetch updates
+//     remote-tracking refs only; it is also what makes `behind` measurable).
+//     A REFSPEC or a repository URL is NOT admitted (review F2): `git fetch
+//     +refs/heads/x:refs/heads/y` writes a LOCAL ref non-fast-forward, which is
+//     a discard of that ref's previous position, so `:` and `+` are outside the
+//     value classes. `git fetch` takes at most ONE bare token.
+//     ⛔ AND THE TOKEN MUST BE A CONFIGURED REMOTE, CHECKED SEMANTICALLY (review
+//     round 5, F1 — MEASURED BYPASS). A character class cannot tell a ref from a
+//     PATH, so `git fetch /tmp/evil` and `git fetch ./evil` matched, and the
+//     positive `git rebase FETCH_HEAD` row composed with them: fetch an agent-
+//     prepared repository, rebase onto its commit, and the checkout now holds
+//     content the gate never reviewed — INCLUDING A REWRITTEN
+//     `scripts/parallel_work_check.py`, which the escape then admits running.
+//     That is a token forge (T4) and it lands content (T3), i.e. a bypass of the
+//     two bounds this set exists to hold, and the comment here claimed it was
+//     closed. Two bounds now: `_REF`'s first character is never `.` or `/`, and
+//     the token is validated against `git remote` at the decision point.
+//     `git fetch` (bare) stays admitted — it needs no token and refreshes the
+//     configured remote's refs, which is all C4 measures.
+//   * `git rebase <target>` where the TARGET IS BOUND SEMANTICALLY, not lexically
+//     (review round 6, F1). Round 5 bounded the fetch token and left the rebase
+//     target unbounded — but the LANDING command is the rebase, so `git rebase
+//     origin/<any-branch>` reproduced the round-5 exploit against the real origin
+//     with no path trick at all: the fleet pushes hundreds of lane branches, and a
+//     branch carrying a rewritten checker became a minted token. The target is now
+//     literally the ref C4 measures — `origin/main` (see CHECKER_BASE_REF, and the
+//     checker's own `rev-list --count HEAD..origin/main`) — plus the three
+//     continuation flags. `FETCH_HEAD`, `refs/...`, another branch of the same
+//     remote and another remote's `main` are gone: a rebase onto a ref C4 does not
+//     measure both fails to clear the verdict and is the forge itself.
+//   * `--autostash` is allowed on the rebase: C4/C3 prescribes `rebase` verbatim
+//     (`options=rebase`), and
+//     the three continuation flags are what finishes or unwinds a rebase that
+//     hit a conflict. `--autostash` is not a convenience: `git rebase` REFUSES
+//     to start on a dirty tree ("cannot rebase: You have unstaged changes"),
+//     and this checkpoint sits immediately BEFORE the step that commits the
+//     implementation — so at the moment C4 reports STALE the tree is dirty by
+//     construction, and without `--autostash` the prescribed remedy cannot run
+//     in exactly the state it is prescribed for (review round 3, F1). It is the
+//     mechanism the pre-commit framework uses for the same problem, git keeps
+//     the stash entry if the reapply conflicts, and it is a flag on the verb
+//     already prescribed rather than a new verb (`git commit`/`stash`/`checkout`
+//     stay blocked, so the remedy cannot land an ARBITRARY commit or move a ref
+//     arbitrarily — but be precise about what IS admitted: `git rebase origin/main`
+//     moves the branch ref to the base, and `git rebase --continue` CREATES the
+//     replayed commit. That is why `git add`/`git rm` are bounded to the unmerged
+//     set, and it is why the step cannot ADVANCE without a fresh CLEAR token).
+//   * `git add PATHS` — stages a conflict resolution before `--continue`.
+//     Index-only; `git commit` stays blocked — BUT `git rebase --continue` IS a
+//     commit, so `git add` is bounded to the UNMERGED set exactly like `git rm`
+//     (review round 7, F1): otherwise `git add .` + `--continue` lands the lane's
+//     uncommitted implementation, which is the work this checkpoint holds back.
+//   * `edit` / `write` while a rebase is IN PROGRESS, TARGET-SCOPED — without
+//     them the conflict path is the same circle one level deeper (review F1):
+//     `git rebase` only REPLAYS, `git add` only stages what is already on disk,
+//     and no admitted command writes file content — so a lane stopped on a
+//     content conflict could only `--skip` (discard the commit), `--abort`
+//     (back to STALE), or stage the conflict MARKERS and continue. A rebase in
+//     progress is detected from the checkout (`rebase-merge/` or
+//     `rebase-apply/` in the git dir — the `.git` file indirection of a linked
+//     worktree is followed), so the allowance exists only inside the
+//     remediation window this escape opens. The TARGET must also be inside
+//     this worktree and must not be one of the gate's ledgers or the git dir
+//     (see checkpointWriteTargetAllowed): an unscoped allowance would let one
+//     `write` mint the operator FORCE-PASS file, which is the gate's own second
+//     advance path — a bypass, not a remedy (review round 2, F1).
+// NONE of these can advance the step: only a fresh phase-correct CLEAR token
+// can, and no admitted command can forge one. Value classes are the same
+// safe set the checker escape uses and reject a LEADING `-`, which is what
+// keeps the flags that execute arbitrary commands out (`git rebase --exec`,
+// `git fetch --upload-pack=…`, `git -c core.pager=…`), plus every shell
+// metacharacter. The whitespace pre-check above is shared, so tabs, newlines
+// and zero-width characters are rejected identically.
+// ⛔ `_REF` may not START with `.` or `/` (review round 5, F1): a leading `./` or
+// `/` is how a local PATH is spelled, and a path is a fetch source. See the
+// semantic remote check at the decision point — the class alone is not the bound.
+const _REF = "[A-Za-z0-9_][A-Za-z0-9_./@-]*";
+// `_PATH` keeps a leading `.`/`/` (`git add .` is a legitimate resolution) and is
+// bounded SEMANTICALLY instead: only a path git reports as UNMERGED is admitted.
+const _PATH = "[A-Za-z0-9_./@][A-Za-z0-9_./@-]*";
+export const CHECKPOINT_REMEDY_RE = new RegExp(
+  "^git[ ]+(?:" +
+    `(?:fetch|status|diff)(?:[ ]+${_REF})?` +
+    `|rebase[ ]+(?:--autostash[ ]+)?${_REF}` +
+    "|rebase[ ]+--(?:continue|abort|skip)" +
+    `|add[ ]+${_PATH}(?:[ ]+${_PATH})*` +
+    // #1418 (review round 4, F3): a `delete/modify` or `rename/delete` conflict
+    // is resolved by REMOVING the path. Without `git rm` the only exits were
+    // `git add` (keeps a file upstream deleted), `--skip` (drops the replayed
+    // commit) and `--abort` (back to STALE) — the issue's own headline, still
+    // true for that conflict class. Bounded exactly like `git add`, and (below)
+    // to the UNMERGED set, so it can never remove a live file.
+    `|rm[ ]+${_PATH}(?:[ ]+${_PATH})*` +
+  ")$",
+);
+
+// #1418 (review round 4, F3): `git rm` is the DELETION resolution of a
+// delete/modify or rename/delete conflict, so it is admitted — but only for the
+// paths git currently reports as UNMERGED (`rebaseWriteTargets` below). That is
+// what keeps it from becoming a general "delete any tracked file" verb.
+// ⛔ `git add` IS BOUNDED TO THE UNMERGED SET, EXACTLY LIKE `git rm` (review round 7,
+// F1 — a P1 hole in the declared T3 class). The old comment said "Index-only;
+// `git commit` stays blocked, so this can never land anything", and that is FALSE:
+// **`git rebase --continue` IS the commit.** Measured: at a stopped rebase, the two
+// admitted commands `git add .` then `git rebase --continue` commit the lane's
+// uncommitted implementation — the exact work this checkpoint exists to hold back
+// until the checker is CLEAR. Staging is only needed for a CONFLICT resolution,
+// and a conflicted path is by definition unmerged, so the bound costs the remedy
+// nothing. (Residual, declared: content the lane WRITES into a conflicted file is
+// still carried into the replayed commit by `--continue` — inherent to conflict
+// resolution, and the step still cannot ADVANCE without a fresh CLEAR token.)
+export const CHECKPOINT_REMEDY_ADD_RE = new RegExp(`^git[ ]+add[ ]+(${_PATH}(?:[ ]+${_PATH})*)$`);
+export const CHECKPOINT_REMEDY_RM_RE = new RegExp(`^git[ ]+rm[ ]+(${_PATH}(?:[ ]+${_PATH})*)$`);
+
+// Targets captured from a `git add` / `git rm`, so a doubled space cannot shift the
+// parse (review round 7, F4 — the sibling of the fetch defect round 6 fixed).
+function remedyPathTargets(re: RegExp, command: unknown, cwd: string): string[] | null {
+  if (typeof command !== "string") return null;
+  const m = re.exec(command);
+  if (!m || m[1] === undefined) return null;
+  return m[1].split(" ").filter((p) => p !== "").map((p) => resolve(cwd, p));
+}
+export function rebaseAddTargets(command: unknown, cwd: string = process.cwd()): string[] | null {
+  return remedyPathTargets(CHECKPOINT_REMEDY_ADD_RE, command, cwd);
+}
+export function rebaseRmTargets(command: unknown, cwd: string = process.cwd()): string[] | null {
+  return remedyPathTargets(CHECKPOINT_REMEDY_RM_RE, command, cwd);
+}
+
+// #1418 (review round 5, F1): the `git fetch <remote>` token, so the decision
+// point can check it is a CONFIGURED remote. Lexically `git fetch evil` is
+// indistinguishable from `git fetch <a relative path>`, and that is precisely
+// the hole — a path is a fetch source that injects unreviewed commits.
+export const CHECKPOINT_REMEDY_FETCH_RE = new RegExp(`^git[ ]+fetch[ ]+(${_REF})$`);
+export function rebaseFetchTarget(command: unknown): string | null {
+  if (typeof command !== "string") return null;
+  // Capture the token rather than slicing a fixed prefix (review round 6, F6):
+  // the regex allows `[ ]+`, so `git  fetch origin` sliced to `" origin"` and the
+  // lane got a nonsense refusal for correct input.
+  const m = CHECKPOINT_REMEDY_FETCH_RE.exec(command);
+  return m ? command.slice(command.indexOf("fetch") + "fetch".length).trim() : null;
+}
+
+// #1418 (review round 6, F1): the LANDING command. `git rebase <target>` is what
+// actually writes content into the checkout, so bounding the fetch token alone
+// bounded the wrong half — `git rebase origin/<any-branch>` re-opened the same
+// forge. The target must be a remote-tracking ref of a configured remote ON THAT
+// REMOTE'S DEFAULT BRANCH, i.e. the ref C4 measures.
+// #1418 (review round 10, P1): THE TOKEN IS CAPTURED, NEVER RECONSTRUCTED BY
+// STRING SURGERY. Round 6's sanitiser was
+//   command.slice(i + "rebase".length).replace("--autostash", "").trim()
+// and `.replace` deletes the FIRST occurrence ANYWHERE in the string — it is not
+// anchored to the flag position. `_REF` admits `-`, so a BRANCH NAME may contain
+// `--autostash`, and the token handed to `isAllowedRebaseTarget` then stopped
+// being the ref git resolves. Measured: `git rebase origin/ma--autostashin`
+// tokenised to `origin/main` and was ADMITTED, while git resolved
+// `origin/ma--autostashin`. End-to-end in a real repo: an agent pushes a branch
+// that rewrites `scripts/parallel_work_check.sh`, a bare admitted `git fetch`
+// makes it visible, the admitted rebase lands the rewritten grader and leaves
+// `HEAD..origin/main == 0` so C4 reads not-behind — the round-6 forge, restored
+// through the sanitiser. The capture group is the ref the regex matched, which is
+// the only thing the semantic bound may judge.
+export const CHECKPOINT_REMEDY_REBASE_RE = new RegExp(
+  `^git[ ]+rebase[ ]+(?:--autostash[ ]+)?(${_REF})$`,
+);
+export function rebaseTargetToken(command: unknown): string | null {
+  if (typeof command !== "string") return null;
+  const m = CHECKPOINT_REMEDY_REBASE_RE.exec(command);
+  return m && m[1] !== undefined ? m[1] : null;
+}
+
+// A ref whose resolution is a PATH rather than a ref is not a ref. `..` is the
+// spelling that turns `<remote>/<ref>` into a repository path git will happily
+// fetch from (measured: `git fetch origin/../../evil-bare` exits 0 and writes
+// FETCH_HEAD), so it is refused in both semantic validators.
+function isPathShapedRef(token: string): boolean {
+  return token.includes("..") || token.startsWith("/") || token.endsWith("/") || token.includes("//");
+}
+
+// ⛔ THE BASE IS THE REF C4 MEASURES, LITERALLY (review round 7, F5). The checker
+// measures exactly one ref — `parallel_work_check.py:404`
+// `rev-list --count HEAD..origin/main` (and `:893/:922/:927/:934`) — so
+// `<remote>/<any default branch>` was still too broad: a lane with an `upstream`
+// remote could run an admitted rebase onto `upstream/main` that can never clear
+// C4. If the checker's base ever changes, this bound fails CLOSED (remedy
+// refused, escalate) rather than open.
+export const CHECKER_BASE_REF = "origin/main";
+export function isAllowedRebaseTarget(token: string): boolean {
+  return token === CHECKER_BASE_REF;
+}
+// The configured remote names for this checkout. Fail-closed: an unreadable git
+// dir yields [] and every `git fetch <token>` is refused (bare `git fetch` still
+// works, so the remedy never depends on this probe succeeding).
+let remotesProbeForTest: ((cwd: string) => string[]) | null = null;
+export function _setRemotesProbeForTest(fn: ((cwd: string) => string[]) | null): void {
+  if (process.env.NODE_ENV !== "test") return;
+  remotesProbeForTest = fn;
+}
+export function configuredRemotes(cwd: string = process.cwd()): string[] {
+  if (remotesProbeForTest) return remotesProbeForTest(cwd);
+  try {
+    const out = execFileSync("git", ["remote"], {
+      cwd, encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"], timeout: 5000,
+    });
+    return out.split("\n").map((s) => s.trim()).filter((s) => s !== "");
+  } catch {
+    return [];
+  }
+}
+
+// A fetch source the repo itself agreed to: a configured remote (`origin`), or a
+// ref on one of them (`origin/main`). A PATH is neither — `/tmp/evil`, `./evil`,
+// `evil` and `tmp/evil` all fail, which is the whole point (round 5, F1).
+export function isConfiguredFetchSource(token: string, cwd: string = process.cwd()): boolean {
+  if (isPathShapedRef(token)) return false;
+  // A bare remote NAME only (review round 7, F3): `git fetch`'s first positional
+  // is a REPOSITORY, so `git fetch origin/main` is read by git as the PATH
+  // `./origin/main` (measured: "fatal: 'origin/main' does not appear to be a git
+  // repository"). A remote name cannot contain `/`, so a slash means a path.
+  if (token.includes("/")) return false;
+  return configuredRemotes(cwd).includes(token);
+}
+
 // #357 (d): non-bash escape tools + bash sole-command checker. Malformed bash
 // input (non-string/missing command) is NOT the escape (fail-closed).
+// #1418: + the stale-branch remedy set (see CHECKPOINT_REMEDY_RE above).
 export function isCheckpointEscape(toolName: string, command: unknown): boolean {
   if (toolName === "read" || toolName === "loop_enforcer") return true;
   if (toolName !== "bash") return false;
   if (typeof command !== "string") return false;
   if (CHECKPOINT_WHITESPACE_REJECT.test(command)) return false;
-  return CHECKPOINT_ESCAPE_RE.test(command);
+  return CHECKPOINT_ESCAPE_RE.test(command) || CHECKPOINT_REMEDY_RE.test(command);
+}
+
+// #1418 (review F1): is a rebase IN PROGRESS in this checkout? This is a
+// FILESYSTEM read (no subprocess) so the probe itself costs nothing — but it is
+// NOT true that the whole gate is subprocess-free: at a pending checkpoint the
+// write allowance calls `repoTopLevel`, `conflictedPaths` (`git ls-files -u`) and
+// (for a `git fetch` remedy) `git remote` (review round 8, F5 — this comment used
+// to imply otherwise, and the PR-body rationale for rejecting shape (a) leaned on
+// it). The real distinction from shape (a): shape (a) would need a staleness
+// subprocess on EVERY tool call, including every allowed one; this escape spawns
+// git only at a pending checkpoint, only for the admitted verbs.
+// git marks an unfinished rebase by leaving `rebase-merge/` or `rebase-apply/`
+// in the git dir, and removes it on `--continue`/`--abort`/completion.
+// A LINKED WORKTREE has a `.git` FILE (`gitdir: <path>`) rather than a
+// directory — the lanes this gate runs in are exactly that shape — so the
+// indirection is followed. Any failure (unreadable `.git`, no git dir, a
+// malformed gitdir line) returns FALSE: the allowance is fail-closed, and an
+// undetected rebase leaves the lane where it was before this change.
+let rebaseProbeForTest: (() => boolean) | null = null;
+export function _setRebaseProbeForTest(fn: (() => boolean) | null): void {
+  if (process.env.NODE_ENV !== "test") return;
+  rebaseProbeForTest = fn;
+}
+export function rebaseInProgress(cwd: string = process.cwd()): boolean {
+  if (rebaseProbeForTest) return rebaseProbeForTest();
+  const markers = ["rebase-merge", "rebase-apply"];
+  // Resolved from the TOP LEVEL: a subdirectory cwd has no `.git`, so a
+  // cwd-relative probe reported "no rebase" for every subdirectory session and
+  // silently refused the conflict remedy (review round 6, F3 — fail-closed, but
+  // wrong about reality).
+  const gitDir = resolveGitDir(repoTopLevel(cwd) ?? cwd);
+  if (!gitDir) return false;
+  return markers.some((d) => existsSync(join(gitDir, d)));
+}
+
+// The checkout's git dir, following the `.git` FILE indirection a linked
+// worktree uses. null when there is none / it cannot be read (fail-closed).
+function resolveGitDir(cwd: string): string | null {
+  try {
+    const dotGit = resolve(cwd, ".git");
+    const st = statSync(dotGit, { throwIfNoEntry: false });
+    if (!st) return null;
+    if (!st.isFile()) return dotGit;
+    const gitdirLine = readFileSync(dotGit, "utf-8");
+    const m = /^gitdir:[ ]*(.+)$/m.exec(gitdirLine);
+    return m ? resolve(cwd, m[1]!.trim()) : null;
+  } catch {
+    return null;
+  }
+}
+
+/** is `child` at or below `parent` (both absolute, already resolved)? */
+function pathInside(child: string, parent: string): boolean {
+  const rel = relative(parent, child);
+  return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+}
+
+// #1418 (review round 2, F1): TARGET-SCOPED write allowance.
+// The round-1 allowance was "edit/write anywhere while a rebase is in progress",
+// which hands the agent the gate's own second advance path: the operator
+// force-pass file is an ordinary JSON file that `write` could mint, and
+// `checkpointTokenOk` honours it whenever the real token fails — so one write
+// would advance the step with no checker run and an audit line recording an
+// "operator" the agent invented. That is a bypass of the gate this escape is
+// meant to unblock, so the allowance is now bounded the way the F1 argument
+// itself describes — to the conflict the rebase is actually stopping on:
+//   * the path must resolve INSIDE this worktree (an interrupted rebase can
+//     only be conflicted on tracked files, and a rebase never touches anything
+//     outside the checkout);
+//   * the gate's LEDGERS are refused by IDENTITY, even if one is relocated into
+//     the tree (the token file is settable via PARALLEL_CHECK_TOKEN_FILE);
+//   * the git dir is refused (hooks, config and refs are not conflict content,
+//     and a `.git` write outlives the rebase window entirely);
+//   * symlinks are resolved on the nearest existing ancestor, so a link inside
+//     the worktree cannot point the write back outside it.
+// Everything else still fails closed: a non-string/empty target is a BLOCK.
+//
+// REVIEW ROUND 4 (F1) — EACH BOUND IS PINNED INDEPENDENTLY AND IN ITS OWN CHECK.
+// Round 3 put the unmerged-set test FIRST, which made the ledger / containment /
+// git-dir refusals unreachable for every refused row in the suite: deleting any
+// of them left the suite green (the same "a row no mutation can redden" class
+// round 2 found). The checks below therefore run in the order ledger → git dir →
+// containment → unmerged, and the suite seeds each refused path INTO the
+// conflicted set so every row exercises the bound it names (and only that one).
+
+// The paths git currently reports as UNMERGED in this checkout — ABSOLUTE, the
+// exact set a stopped rebase is asking to be resolved. Empty when nothing is
+// conflicted and empty on any failure (fail-closed: then no write is allowed).
+// ⛔ `--full-name` prints paths relative to the PROJECT TOP LEVEL, not to `cwd`
+// (review round 4, F2): resolving them against `cwd` denied the real file and
+// admitted a wrong one whose spelling happened to match from a subdirectory. The
+// toplevel is resolved once and the git output is joined to IT.
+let conflictedProbeForTest: ((cwd: string) => string[]) | null = null;
+export function _setConflictedProbeForTest(fn: ((cwd: string) => string[]) | null): void {
+  if (process.env.NODE_ENV !== "test") return;
+  conflictedProbeForTest = fn;
+}
+export function repoTopLevel(cwd: string = process.cwd()): string | null {
+  try {
+    const out = execFileSync("git", ["rev-parse", "--show-toplevel"], {
+      cwd, encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"], timeout: 5000,
+    }).trim();
+    return out === "" ? null : out;
+  } catch {
+    return null;
+  }
+}
+export function conflictedPaths(cwd: string = process.cwd()): string[] {
+  // The probe stands in for `git ls-files -u --full-name`. It is resolved against
+  // the TOP LEVEL (falling back to `cwd`), because that is what the real path does
+  // — a probe resolved against `cwd` would make every subdirectory assertion test
+  // the seam instead of the code (review round 6, F3).
+  if (conflictedProbeForTest) {
+    const base = repoTopLevel(cwd) ?? cwd;
+    return conflictedProbeForTest(cwd).map((p) => resolve(base, p));
+  }
+  try {
+    const top = repoTopLevel(cwd);
+    if (!top) return [];
+    // ⛔ RUN AT THE TOP LEVEL, not at `cwd` (measured: from a subdirectory git
+    // confines the listing to the pathspec = that subdirectory, so an unmerged
+    // file elsewhere in the tree is reported as NOT conflicted and the remedy is
+    // denied with a misleading reason). With cwd = toplevel, `--full-name`
+    // output is root-relative, which is exactly what `resolve(top, p)` expects.
+    // ⛔ `-z`, BECAUSE GIT'S OUTPUT IS SEMANTIC AND A LINE PARSE IS LEXICAL (review
+    // round 9, F1). Without `-z` git C-QUOTES any path it considers
+    // unrepresentable — every non-ASCII byte becomes an escape like `\303\272` —
+    // so the set held the QUOTED spelling and `resolve(top, …)` built a path that
+    // does not exist. Measured on a real conflict (git 2.43.0): `menú café.txt`
+    // came back as `"men\303\272 caf\303\251.txt"`, so the REAL file was refused as
+    // "not unmerged" (edit/write blocked — the exact stranding #1418 removes)
+    // while the quoted junk path was ADMITTED. `-z` never quotes and is
+    // NUL-delimited, so any byte is safe in a path — including the newline that
+    // would split a line-based read.
+    // (A space-named path resolves correctly here but cannot be STAGED: `_PATH`
+    // admits no space, so `git add`/`git rm` cannot express it. Declared
+    // residual — the content fix (edit/write) is the part this row restores.)
+    const out = execFileSync("git", ["ls-files", "-u", "-z", "--full-name"], {
+      cwd: top, encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"], timeout: 5000,
+    });
+    // `<mode> <sha> <stage>\t<path>\0` — one entry per unmerged STAGE, so the same
+    // path repeats (up to three times); the set is what callers mean.
+    const seen = new Set<string>();
+    for (const entry of out.split("\0")) {
+      if (entry === "") continue;
+      const i = entry.indexOf("\t");
+      if (i < 0) continue;
+      // ⛔ NO `.trim()`: with `-z` the path is exact, and a path may legally END
+      // in a space — trimming would silently rewrite the target.
+      const rel = entry.slice(i + 1);
+      if (rel !== "") seen.add(resolve(top, rel));
+    }
+    return [...seen];
+  } catch {
+    return [];
+  }
+}
+
+// The canonical form of a path that may not exist yet: the real path of its
+// nearest EXISTING ancestor, with the remaining components appended. Comparing
+// these (rather than a lexical `resolve()`) is what makes "the same FILE spelled
+// differently" — through a symlink, a `..`, or a different base — the same
+// refusal. Round 3 compared the ledgers lexically while containment used the
+// canonical form, so a symlink inside the tree could reach a ledger through one
+// bound and not the other (review round 4, F1.2).
+function canonicalPath(p: string): string {
+  const rest: string[] = [];
+  let cur = p;
+  for (let i = 0; i < 64; i++) {
+    try {
+      if (existsSync(cur)) return join(realpathSync(cur), ...rest.reverse());
+    } catch {
+      return p;
+    }
+    const up = dirname(cur);
+    if (up === cur) return p;
+    rest.push(basenamePart(cur));
+    cur = up;
+  }
+  return p;
+}
+function basenamePart(p: string): string {
+  const i = Math.max(p.lastIndexOf("/"), p.lastIndexOf("\\"));
+  return i >= 0 ? p.slice(i + 1) : p;
+}
+
+export function checkpointWriteTargetAllowed(target: unknown, cwd: string = process.cwd()): boolean {
+  if (typeof target !== "string" || target.trim() === "") return false;
+  try {
+    const abs = resolve(cwd, target);
+    const real = canonicalPath(abs);
+    // 1. THE GATE'S OWN DECISION ARTEFACTS, by canonical IDENTITY — the
+    //    force-pass file is the gate's own second advance path and the token
+    //    file is the first, so even an UNMERGED path that resolves onto one of
+    //    them is refused.
+    //    ⛔ AND THE GRADER ITSELF (review round 5, F3): round 3 bounded writes to
+    //    the UNMERGED set, which refuses the grader only while the grader is NOT
+    //    the conflict — so a branch that conflicts ON `parallel_work_check.py`
+    //    could still rewrite it and mint its own CLEAR token. The identity bound
+    //    is unconditional: these files are never conflict content a lane may
+    //    author, conflicted or not. A genuine conflict on one of them is a
+    //    declared residual (resolve it out-of-session and escalate).
+    //    ⛔ THE BASE IS THE REPO TOP LEVEL, NOT `cwd` (review round 6, F3): the
+    //    relative artefact names were spelled against `cwd`, so in a subdirectory
+    //    session NOTHING was protected by identity — a bound this comment calls
+    //    "unconditional" and the doc calls "UNCONDITIONALLY".
+    const top = repoTopLevel(cwd) ?? cwd;
+    const protectedByIdentity = [
+      tokenFile(),
+      forceFile(),
+      resolve(top, "scripts/parallel_work_check.sh"),
+      resolve(top, "scripts/parallel_work_check.py"),
+      resolve(top, "enforcement/dangerous-ops.txt"),
+    ].map((p) => canonicalPath(resolve(cwd, p)));
+    if (protectedByIdentity.includes(real) || protectedByIdentity.includes(abs)) return false;
+    // 1b. A SYMLINK IS NEVER CONFLICT CONTENT (review round 6, F2). A DANGLING
+    //    symlink defeats `canonicalPath` (existsSync follows links, so the link
+    //    reads as non-existent and the link PATH is returned while the write
+    //    lands on the TARGET) — measured: a dangling link at an unmerged path
+    //    resolving to the force-pass ledger was admitted and the write created
+    //    it OUTSIDE the checkout. Refusing the link shape closes it structurally
+    //    rather than relying on canonicalisation catching every case.
+    const lst = lstatSync(abs, { throwIfNoEntry: false });
+    if (lst && lst.isSymbolicLink()) return false;
+    // 2. THE GIT DIR — hooks/config/refs are not conflict content, and a `.git`
+    //    write outlives the rebase window entirely. Both the `.git` the path
+    //    names (a FILE in a linked worktree, so the prefix check matters) and the
+    //    git dir it resolves to.
+    const gitDir = resolveGitDir(top);
+    if (gitDir) {
+      const realGit = canonicalPath(gitDir);
+      if (
+        pathInside(abs, resolve(top, ".git")) ||
+        pathInside(abs, gitDir) ||
+        pathInside(real, realGit)
+      ) return false;
+    }
+    // 3. CONTAINMENT — an interrupted rebase can only be conflicted on tracked
+    //    files, and a rebase never touches anything outside the checkout.
+    //    ⛔ THE ROOT IS THE REPO TOP LEVEL, NOT `cwd` (review round 5, F2): the
+    //    unmerged set is measured at the top level, so bounding containment by
+    //    `cwd` made the two halves disagree — a session whose cwd is a
+    //    subdirectory got the top-level conflict LISTED and then DENIED as
+    //    outside the checkout, which is the doc's exact claim in reverse.
+    const root = canonicalPath(top);
+    if (!pathInside(real, root)) return false;
+    // 4. THE CONTENT BOUND (review round 3, F2): only a path git currently
+    //    reports as UNMERGED. A worktree-wide allowance reached the artefacts
+    //    that DECIDE this gate — `scripts/parallel_work_check.py` (which mints
+    //    the PASS token) and `enforcement/dangerous-ops.txt` — so "inside the
+    //    checkout" was a bound on the wrong thing.
+    const conflicted = conflictedPaths(cwd);
+    if (!conflicted.includes(abs) && !conflicted.includes(real)) return false;
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 // #357 (Task 7): extract the checker's phase argument (the first positional arg
@@ -1900,7 +2392,11 @@ export function gateGuidance(step: Step, mode: Mode = "gate"): string {
     const resolvedBin = bin || (infraPath && join(infraPath, "scripts", "parallel_work_check.sh"));
     if (!resolvedBin) {
       return `→ To proceed: set AGENT_INFRA_PATH (a required prerequisite per AGENTS.md), then run \`…/scripts/parallel_work_check.sh ${requiredPhase}\` until the verdict is CLEAR (writes the PASS token).
-→ Escape tools available: read, loop_enforcer
+→ If the checker reports STALE (behind origin/main), clear it first: \`git fetch\`, then rebase, then re-run the checker. With uncommitted work (the normal case at this step) use \`git rebase --autostash origin/main\` — a plain rebase refuses to start on a dirty tree.
+→ If that rebase stops on a conflict, resolve the CONFLICTED path in place (edit/write are admitted while a rebase is in progress OR while a path is unmerged, for the unmerged paths only; a delete/modify or rename/delete conflict is resolved with \`git rm\` on that FILE path), then \`git add\` (or \`git rm\`) and \`git rebase --continue\`.
+→ ⛔ \`git rebase --continue\` runs git's COMMIT step, which may open an editor: with no TTY it fails ("Terminal is dumb, but EDITOR unset") or hangs in one. If that happens the ENVIRONMENT must supply a no-op editor (GIT_EDITOR=true) — an env PREFIX on the command is NOT admitted — and if it cannot, this checkpoint is unpassable in this session: end your turn and report.
+→ A conflict on a DIRECTORY path (a file/directory conflict) cannot be resolved through this escape at all — end your turn and report it.
+→ Escape tools available: read, loop_enforcer, and bash for the checker invocation or the stale-branch remedy (git fetch, git status, git diff, git rebase, git add, git rm)
 → If the check cannot CLEAR in this environment, the checkpoint is unpassable — end your turn and report`;
     }
     // #383 (Task 3) State-1: ENFORCE-prefix emission for the start phase (C1 is
@@ -1917,7 +2413,11 @@ export function gateGuidance(step: Step, mode: Mode = "gate"): string {
       ? " (note: the resolved path does not exist — check PARALLEL_CHECK_BIN / AGENT_INFRA_PATH)"
       : "";
     return `→ To proceed: run \`${enforcePrefix}${resolvedBin} ${requiredPhase}\`${ghostHint} until the verdict is CLEAR (writes the PASS token).
-→ Escape tools available: read, loop_enforcer
+→ If the checker reports STALE (behind origin/main), clear it first: \`git fetch\`, then rebase, then re-run the checker. With uncommitted work (the normal case at this step) use \`git rebase --autostash origin/main\` — a plain rebase refuses to start on a dirty tree.
+→ If that rebase stops on a conflict, resolve the CONFLICTED path in place (edit/write are admitted while a rebase is in progress OR while a path is unmerged, for the unmerged paths only; a delete/modify or rename/delete conflict is resolved with \`git rm\` on that FILE path), then \`git add\` (or \`git rm\`) and \`git rebase --continue\`.
+→ ⛔ \`git rebase --continue\` runs git's COMMIT step, which may open an editor: with no TTY it fails ("Terminal is dumb, but EDITOR unset") or hangs in one. If that happens the ENVIRONMENT must supply a no-op editor (GIT_EDITOR=true) — an env PREFIX on the command is NOT admitted — and if it cannot, this checkpoint is unpassable in this session: end your turn and report.
+→ A conflict on a DIRECTORY path (a file/directory conflict) cannot be resolved through this escape at all — end your turn and report it.
+→ Escape tools available: read, loop_enforcer, and bash for the checker invocation or the stale-branch remedy (git fetch, git status, git diff, git rebase, git add, git rm)
 → If the check cannot CLEAR in this environment, the checkpoint is unpassable — end your turn and report`;
   }
   const { allow } = getExpectedToolsForStep(step);
@@ -1976,10 +2476,18 @@ export function getExpectedToolsForStep(step: Step): { allow: string[]; block: R
   }
   // checkpoint (issue #5039): token-gated — validateToolCall blocks everything
   // until a fresh phase-correct CLEAR token exists, EXCEPT the #357 (d) escape
-  // (read/loop_enforcer/sole-command checker). The allow list here mirrors the
-  // escape so audit entries reflect what an agent may actually use at the gate.
+  // (read/loop_enforcer/sole-command checker) plus the #1418 stale-branch
+  // remedy set (git fetch/status/diff/rebase/add, and edit/write while a rebase
+  // is in progress). The allow list here mirrors the escape so audit entries
+  // reflect what an agent may actually use at the gate — it names the TOOLS
+  // reachable, and the `hint` field spells out the per-tool constraint (the
+  // same shape the verifier gate uses for `task`). Omitting `bash` here meant
+  // the audit told a stranded lane that only read+loop_enforcer were usable
+  // while the checker invocation it was being told to run was in fact
+  // permitted (#1418 comment thread). `edit`/`write` are NOT listed because
+  // they are conditional on a rebase being in progress; the hint says so.
   if (gate === "checkpoint") {
-    return { allow: ["read", "loop_enforcer"], block: [] };
+    return { allow: ["read", "loop_enforcer", "bash"], block: [] };
   }
   // No gate or unknown — standard work phase. Block destructive ops.
   return { allow: [], block: [GIT_OP, DESTRUCTIVE_MCP] };
@@ -2022,6 +2530,10 @@ function blockAuditEntry(event: string, toolName: string, step: Step, mode: Mode
 
 export function validateToolCall(
   toolName: string, command: unknown, step: Step, mode: Mode,
+  // #1418 (review round 2, F1): the WRITE TARGET (`event.input.path` for
+  // edit/write). Optional so every existing caller/test stays valid, and its
+  // absence is a DENY — the write allowance is fail-closed.
+  targetPath?: unknown,
 ): { block: boolean; reason?: string; wouldBlock?: boolean; freshTokenBlock?: boolean } {
   // #357 (Task 5): validateToolCall is PURE — it never writes audit. The
   // handler owns every audit write (single-audit: one entry per blocked /
@@ -2083,12 +2595,98 @@ export function validateToolCall(
     // No fresh token — the escape is the ONLY way out: read, loop_enforcer,
     // or the sole-command checker invocation (CLEAR-able). Everything else
     // fails closed with the token reason + escape guidance.
+    // #1418 (review F1): the conflict-resolution step of the remedy. `git
+    // rebase` only REPLAYS and `git add` only stages what is already on disk,
+    // so a rebase stopped on a content conflict has no reachable exit unless
+    // the agent can EDIT the file — it could otherwise only `--skip` (discard
+    // the commit), `--abort` (straight back to STALE), or stage the conflict
+    // markers.
+    // ⛔ THE WINDOW IS "A REBASE IS IN PROGRESS **OR A PATH IS UNMERGED**" (review
+    // round 9, F2). `rebaseInProgress()` ALONE is false in a conflict state this
+    // escape's OWN newly-admitted flag produces: `git rebase --autostash`
+    // completes the replay and then the STASH REAPPLY conflicts. Measured on git
+    // 2.43.0 — rc=0, "Applying autostash resulted in conflicts", NO `rebase-merge/`
+    // marker, index `UU s.txt`. So the content fix was REFUSED while the blanket
+    // `git add` (which stages the conflict MARKERS) was ADMITTED — exactly
+    // inverted, and the checker has no conflict-marker check to catch it.
+    // The widened predicate widens nothing that carries the safety argument: the
+    // target is STILL bounded by `checkpointWriteTargetAllowed` (identity, git
+    // dir, containment, and the UNMERGED set), and with no rebase in progress no
+    // admitted command can COMMIT what was written — `git rebase --continue` has
+    // nothing to continue, and `git commit`/`push` stay blocked.
+    if (
+      (toolName === "edit" || toolName === "write") &&
+      (rebaseInProgress() || conflictedPaths().length > 0) &&
+      checkpointWriteTargetAllowed(targetPath)
+    ) {
+      return { block: false };
+    }
     if (isCheckpointEscape(toolName, command)) {
+      // #1418 (round 5, F1): `git fetch <token>` is bounded to a CONFIGURED
+      // remote. A path or URL is a source the repo never agreed to fetch from,
+      // and fetch + `git rebase FETCH_HEAD` lands content the gate never reviewed
+      // (measured: a rewritten checker, i.e. a minted CLEAR token).
+      const fetchTarget = toolName === "bash" ? rebaseFetchTarget(command) : null;
+      if (fetchTarget !== null && !isConfiguredFetchSource(fetchTarget)) {
+        return { block: true, reason: `⛔ checkpoint gate — \`git fetch\` is admitted only for a CONFIGURED remote; "${fetchTarget}" is not one. A local path or URL is a fetch source that smuggles commits this gate never reviewed (a rewritten checker is a minted token) — use bare \`git fetch\` or a configured remote name` };
+      }
+      // #1418 (round 6, F1): the LANDING command is the rebase, so the TARGET is
+      // the bound that matters. Only `<configured-remote>/<that remote's default
+      // branch>` — the ref C4 measures — is admitted; `FETCH_HEAD`, `refs/...` and
+      // any other branch of the remote are not.
+      const rebaseTarget = toolName === "bash" ? rebaseTargetToken(command) : null;
+      if (rebaseTarget !== null && !isAllowedRebaseTarget(rebaseTarget)) {
+        return { block: true, reason: `⛔ checkpoint gate — \`git rebase\` is admitted only onto the base C4 measures, \`${CHECKER_BASE_REF}\`. "${rebaseTarget}" is not that ref — a rebase onto content nobody reviewed is a way to rewrite the checker, so it is refused` };
+      }
+      // #1418 (round 7, F1): `git add` AND `git rm` are bounded to the UNMERGED SET.
+      // `git rm` needed it because it deletes (round 4, F3); `git add` needs it
+      // because **`git rebase --continue` is a commit** — so `git add .` followed by
+      // `--continue` stages and lands the lane's uncommitted implementation.
+      // ⛔ AND THE BOUND IS SEMANTIC, NOT LEXICAL (review round 8, F1): `git add`
+      // takes a PATHSPEC, so `git add <dir>` stages the whole subtree. With only the
+      // string comparison, an unmerged path that is a DIRECTORY on disk (a
+      // file/directory conflict) matched, and the two admitted commands
+      // `git add <dir>` + `git rebase --continue` landed every file under it —
+      // including untracked ones in no unmerged stage. Measured: `git add sub`
+      // staged `sub/a.txt` and `sub~HEAD`. A conflicted FILE is never a directory on
+      // disk, so refusing directory targets costs the remedy nothing; the
+      // file/directory class cannot be resolved through this escape AT ALL — the
+      // check below refuses a directory for `git add` and `git rm` alike, so the
+      // guidance must say ESCALATE rather than prescribe the command it just
+      // refused (review round 9, F4).
+      const pathTargets = toolName === "bash"
+        ? (rebaseAddTargets(command) !== null ? { verb: "git add", paths: rebaseAddTargets(command)! }
+          : rebaseRmTargets(command) !== null ? { verb: "git rm", paths: rebaseRmTargets(command)! }
+          : null)
+        : null;
+      if (pathTargets) {
+        const dirTargets = pathTargets.paths.filter((t) => {
+          const st = lstatSync(t, { throwIfNoEntry: false });
+          return st !== undefined && st !== null && st.isDirectory();
+        });
+        if (dirTargets.length > 0) {
+          // ⛔ DO NOT PRESCRIBE THE COMMAND THIS CHECK REFUSES (review round 9,
+          // F4). The message used to say a file/directory conflict "is resolved by
+          // `git rm` on the path" — while this same check refuses `git rm <dir>`
+          // (pinned by the round-8 row). A stranded lane following it loops on the
+          // same refusal, and three consecutive blocks park the checkpoint.
+          return { block: true, reason: `⛔ checkpoint gate — \`${pathTargets.verb}\` is admitted only for a conflicted FILE path; ${dirTargets.join(", ")} is a DIRECTORY on disk, so git reads it as a pathspec and stages the whole subtree. A file/directory conflict cannot be resolved through this escape (\`git rm\` on a directory is refused too — it needs a tree flag) — end your turn and report it (escalate); do not retry the same command` };
+        }
+        const unmerged = conflictedPaths();
+        const stray = pathTargets.paths.filter((t) => !unmerged.includes(t));
+        if (stray.length > 0) {
+          return { block: true, reason: `⛔ checkpoint gate — \`${pathTargets.verb}\` is admitted only for an UNMERGED path during a rebase; not unmerged: ${stray.join(", ")}. Staging is the conflict resolution; \`git rebase --continue\` is a COMMIT, so staging anything else would land unreviewed work` };
+        }
+      }
       // #357 (Task 7): wrong-phase guard (checkpoint_token_fresh extension) —
       // a checker bash whose phase ≠ this step's token_phase would write a
       // token that can NEVER satisfy this checkpoint → block with guidance
       // (prevents the wrong-phase strand at a pending checkpoint).
-      if (toolName === "bash" && typeof command === "string") {
+      // #1418: only a CHECKER command carries a phase. A remedy command
+      // (`git fetch`) would otherwise yield the bogus phase "fetch" and be
+      // refused by the wrong-phase guard — reinstating the very block this
+      // escape exists to remove.
+      if (toolName === "bash" && typeof command === "string" && CHECKPOINT_ESCAPE_RE.test(command)) {
         const phase = checkpointEscapePhase(command);
         if (phase !== null && step.token_phase && phase !== step.token_phase) {
           return { block: true, reason: `⛔ checkpoint gate — step "${step.name}" requires phase "${step.token_phase}" but the checker would write phase "${phase}" — run \`parallel_work_check ${step.token_phase}\` instead` };
@@ -2514,6 +3112,11 @@ export default function (pi: ExtensionAPI) {
     const command = isToolCallEventType("bash", event)
       ? (event.input as any)?.command ?? ""
       : "";
+    // #1418 (review round 2, F1): the write allowance is TARGET-scoped, so the
+    // handler must hand over the path edit/write is aimed at — `command` is ""
+    // for every non-bash event, which is what made the round-1 allowance blind
+    // to what it was allowing.
+    const writeTarget = (event.input as any)?.path;
 
     const mode = resolveMode();
 
@@ -2599,7 +3202,7 @@ export default function (pi: ExtensionAPI) {
           });
         }
         advanceCheckpoint(target);
-        const result = validateToolCall(toolName, command, ownerStep, mode);
+        const result = validateToolCall(toolName, command, ownerStep, mode, writeTarget);
         if (result.block) {
           const trail = target.steps
             .map((s, i) => i === checkpointIndex ? `[${s.name}]` : s.name)
@@ -2633,7 +3236,7 @@ export default function (pi: ExtensionAPI) {
       // token NOT ok — the escape is the only way out; record an ok:false marker
       // for allowed calls so a producer-timing tool_result (!ok@call → ok@result)
       // can advance. Blocked calls never advance and emit no marker.
-      const result = validateToolCall(toolName, command, ownerStep, mode);
+      const result = validateToolCall(toolName, command, ownerStep, mode, writeTarget);
       if (result.block) {
         const key = checkpointKey(target);
         // #357 (Task 8, j): consecutive-block streak — ≥3 → park immediately.
@@ -2659,7 +3262,7 @@ export default function (pi: ExtensionAPI) {
       return undefined;
     }
 
-    const result = validateToolCall(toolName, command, step, mode);
+    const result = validateToolCall(toolName, command, step, mode, writeTarget);
 
     if (result.block) {
       const trail = top.steps
