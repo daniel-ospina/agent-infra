@@ -1721,7 +1721,8 @@ ck "a PINNED allowance of 0 is reported as UNBOUNDED, not as 'a FINITE 0 chunk(s
 # ⛔ AND THE BACKSTOP BRANCH SUBTRACTS THE LANE'S ELAPSED TIME, like its finite-wall sibling (review cycle
 # 15, P2 — measured: a lane with 100 s of backstop left got 22 chunks = 2640 s of supervision, so
 # lane-bound.sh TERMed it mid-supervision with no verdict). 3400 s spent of a 3600 s backstop leaves
-# (3600-3400-10)/120 = 1 chunk, so chunk 2 is refused; without the subtraction it would be 29.
+# (3600-3400-margin)/120 = 1 chunk (margin is 2 x LANE_MERGE_INTERVAL, so 40 here), so chunk 2 is refused;
+# without the subtraction it would be 29.
 printf '1\n' > "$OT/state/lanemerge-54.watch"
 OUT="$(REPO_PATH="${REPO_PATH:-$RUN_REPO}" PATH="$BIN:$PATH" GH_LOG=/dev/null O="$OT" HOME="$T/home" \
       LANE_TIMEOUT=0 LANE_BACKSTOP_S=3600 LANE_MERGE_ELAPSED_S=3400 LANE_MERGE_WAIT=0 LANE_MERGE_POLL=0 LANE_BOUND_IDLE_S=0 \

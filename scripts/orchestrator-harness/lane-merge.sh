@@ -1648,14 +1648,26 @@ if [ "$LANE_WALL_S" -eq 0 ]; then
     _watch_supervision_note="UNBOUNDED (there is no counter to spend)"
   elif is_limit "${LANE_BACKSTOP_S:-}" && [ "${LANE_BACKSTOP_S:-0}" -gt 0 ]; then
     _watch_basis_note="lane-bound.sh's own backstop (LANE_BACKSTOP_S=${LANE_BACKSTOP_S}s), because the wall axis (LANE_TIMEOUT) is OFF"
-    _backstop_chunks=$(( (LANE_BACKSTOP_S - _hb_margin) / _fit_poll )); [ "$_backstop_chunks" -ge 1 ] || _backstop_chunks=1
+    # ⛔ THE FIGURE MUST BE WHAT THE CODE WILL USE, WHICH INCLUDES THE ELAPSED SUBTRACTION (review cycle
+    # 16, P3 — measured: the line printed "a FINITE 29 chunk(s)" on a lane that had spent 3400 s of its 3600 s
+    # backstop, where `--watch` derives 1). `_lane_elapsed` is already resolved above for the wait clamp; this
+    # is the same datum the `--watch` branch reads as `_watch_elapsed`.
+    _backstop_chunks=$(( (LANE_BACKSTOP_S - _hb_margin - ${_lane_elapsed:-0}) / _fit_poll ))
+    [ "$_backstop_chunks" -ge 1 ] || _backstop_chunks=1
     # ⛔ A PINNED `LANE_MERGE_MAX_WATCH` OVERRIDES THIS NUMBER (review cycle 14, observation 2 — measured:
     # `LANE_BACKSTOP_S=3600 LANE_MERGE_MAX_WATCH=2` printed "a FINITE 29 chunk(s)" while the real allowance
     # was 2). An operator line that states a number the code will not use is the class this branch fixes.
     if is_limit "${LANE_MERGE_MAX_WATCH:-}"; then
       _watch_supervision_note="a FINITE ${LANE_MERGE_MAX_WATCH} chunk(s), because LANE_MERGE_MAX_WATCH pins it"
     else
-      _watch_supervision_note="a FINITE ${_backstop_chunks} chunk(s) derived from it, further capped by the watchdog allowance when that is smaller"
+      if [ -n "${_lane_elapsed:-}" ]; then
+        _watch_supervision_note="a FINITE ${_backstop_chunks} chunk(s) derived from what is LEFT of it (${_lane_elapsed}s of this lane's clock already spent), further capped by the watchdog allowance when that is smaller"
+      else
+        # ⛔ THE RATIONALE MUST MATCH THE NUMBER (review cycle 16, observation): with an unresolvable elapsed
+        # it subtracted 0 while still saying "after this lane's elapsed time", which reads as if a subtraction
+        # had happened. Same rule as every other line in this file: state what the code did.
+        _watch_supervision_note="a FINITE ${_backstop_chunks} chunk(s) derived from it, further capped by the watchdog allowance when that is smaller (this lane's elapsed time could not be resolved, so nothing was subtracted from it)"
+      fi
     fi
   else
     _watch_basis_note="no clock at all, because the wall axis is OFF (LANE_TIMEOUT=0) and no LANE_BACKSTOP_S is exported"
