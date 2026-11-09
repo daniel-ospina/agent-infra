@@ -1596,6 +1596,27 @@ for badfloor in abc 000; do
     bad "DISK_MIN_FREE_MB=$badfloor was ACCEPTED as a floor — it can never fire, or it means zero"
   fi
 done
+# ⛔ WHEN BOTH FLOOR KNOBS ARE SET AND DIFFER, THE DIVERGENCE IS RECORDED — admission is unchanged, but
+# it cannot be silent (review round 7, non-blocking observation). `MIN_FREE_MB` wins HERE while the
+# dispatch gate reads `DISK_MIN_FREE_MB`, so the two instruments bound different floors; the harmful
+# pair is a stale keys.env beside a newer plist, which is the direction this PR's own comment names.
+say_case "two floor spellings that disagree are RECORDED, without changing admission (#1852)"
+PROV_FLOOR=2000; PROV_DISK_FLOOR=3000; PROV_TREE=0; PROV_SELF=0; PROV_RESERVE=0
+mkdf "$P/floordisagree" $(( 2500 * 1024 ))
+PPATH="$P/floordisagree"; prov check
+case "$PROV_OUT" in
+  *"DISK_MIN_FREE_MB=3000 DISAGREE"*) ok "a MIN_FREE_MB/ DISK_MIN_FREE_MB split is named in the log, with both values" ;;
+  *) bad "the two floors disagree silently — $PROV_OUT" ;;
+esac
+[ "$PROV_RC" -eq 0 ] && ok "…and admission is NOT changed by the warning: 2500MB is still admitted on MIN_FREE_MB=2000 (the documented precedence decides, not the warning)" \
+                   || bad "the divergence warning changed admission — check refused a cell at 2500MB under a 2000MB floor — $PROV_OUT"
+PROV_FLOOR=2000; PROV_DISK_FLOOR=2000
+prov check
+case "$PROV_OUT" in
+  *DISAGREE*) bad "the warning fired for a MATCHED pair — it would train an operator to ignore it" ;;
+  *) ok "…and a matched pair produces no warning (the arm above is not an always-on line)" ;;
+esac
+PROV_DISK_FLOOR=
 # ── reset to the PRE-CHANGE semantics for every arm below (§10 onward): shipped floor, lane-fit off.
 unset PROV_FLOOR PROV_DISK_FLOOR PROV_TREE PROV_SELF PROV_RESERVE
 PPATH=""

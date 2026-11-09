@@ -1797,6 +1797,14 @@ HARNESS_MATERIALISER="${HARNESS_MATERIALISER:-}"
 # knob they never set (the reason the message names the variable that was actually wrong).
 # ⛔ `MIN_FREE_MB` still WINS when both are set: that is the declaration this file already documents,
 # and the dispatch gate reads `DISK_MIN_FREE_MB` explicitly in that case.
+# ⛔ BOTH SET TO DIFFERENT VALUES IS RECORDED, NOT SILENT (review round 7, non-blocking observation).
+# `MIN_FREE_MB=100` beside `DISK_MIN_FREE_MB=5000` makes this file enforce 100 while the gate enforces
+# 5000, and neither instrument named the other knob — the harmful direction being exactly the pair the
+# comment above calls out (a stale keys.env beside a newer plist). This does NOT change admission (the
+# documented precedence still decides); it only stops the divergence from being invisible in the log.
+if [ -n "${MIN_FREE_MB:-}" ] && [ -n "${DISK_MIN_FREE_MB:-}" ] && [ "$MIN_FREE_MB" != "$DISK_MIN_FREE_MB" ]; then
+  log_line "warn: MIN_FREE_MB=${MIN_FREE_MB} and DISK_MIN_FREE_MB=${DISK_MIN_FREE_MB} DISAGREE — check enforces MIN_FREE_MB while the dispatch gate enforces DISK_MIN_FREE_MB, so the two instruments bound different floors. Declare the floor with ONE spelling, or set both to the same value."
+fi
 if [ -z "${MIN_FREE_MB:-}" ] && [ -n "${DISK_MIN_FREE_MB:-}" ]; then
   case "$DISK_MIN_FREE_MB" in ''|*[!0-9]*|?????????*) die "DISK_MIN_FREE_MB must be a positive whole number of megabytes (got '$DISK_MIN_FREE_MB') — it sets MIN_FREE_MB when MIN_FREE_MB is unset (agent-infra#1852: one floor serves check and the dispatch gate)" ;; esac
   [ "$((10#$DISK_MIN_FREE_MB))" -gt 0 ] || die "DISK_MIN_FREE_MB must be a positive whole number of megabytes (got '$DISK_MIN_FREE_MB') — it sets MIN_FREE_MB when MIN_FREE_MB is unset (agent-infra#1852)"
@@ -1817,6 +1825,11 @@ case "$MIN_FREE_MB" in ''|*[!0-9]*|?????????*) die "MIN_FREE_MB must be a positi
 # check that exists because a full disk read healthy cannot be disarmed by a spelling of zero. The
 # digit cap matters too: bash arithmetic wraps at 2^63, so `18446744073709551617` (2^64+1) normalises
 # to 1 — a huge floor silently became 1 MiB. 9 digits is ~1 PB, beyond any real cell.
+# ⛔ THE CAP IS 8 DIGITS HERE AND 9 IN `spawn-gate.sh` (`is_limit`'s `-le 9`), and the asymmetry is
+# DELIBERATE, not drift (review round 7, non-blocking observation): this file DIES loudly on a 9-digit
+# floor while the gate would accept it, i.e. the divergence is in the safe direction (a false block an
+# operator sees, never a floor that cannot fire). Naming it here is what keeps the next reader from
+# "tidying" one cap into the other and losing the loud half.
 [ "$((10#$MIN_FREE_MB))" -gt 0 ] || die "MIN_FREE_MB must be a positive whole number of megabytes (got '$MIN_FREE_MB')"
 MIN_FREE_MB="$((10#$MIN_FREE_MB))"
 
