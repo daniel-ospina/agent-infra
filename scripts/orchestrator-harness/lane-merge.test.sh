@@ -1654,8 +1654,14 @@ _btick="$(printf '\140')"
 # and `post_handoff "` EMITTERS. A multi-line message, or a backtick in some other emitter, is not
 # covered — none exists today (every other non-comment backtick in the file sits inside a
 # SINGLE-QUOTED printf format, where it is literal), so this is a stated scope and not a hole.
+# ⛔ CAPTURE, THEN TEST — NO PIPE (the `sigpipe-grep` lane reds this file otherwise, correctly):
+# `grep 'x' f | grep -q pat` is the #841/#864 false-negative idiom, because `grep -q` exits at its first
+# match and the writer upstream takes EPIPE, which `pipefail` turns into a non-zero status — so the arm can
+# report a CLEAN file on a line that IS there. The producer here is a non-quiet `grep`, so it captures first
+# and the test runs against the capture.
+_bt_hits="$(grep -E '(say_err|log_line|disposition|verdict|post_handoff) "' "$SCRIPT" || true)"
 ck "no say_err / log_line / disposition / verdict / post_handoff message carries a backtick inside its double quotes (it would run as COMMAND SUBSTITUTION and silently delete the word from the operator-facing line)" \
-   $(! grep -E '(say_err|log_line|disposition|verdict|post_handoff) "' "$SCRIPT" | grep -qF "$_btick" && echo 0 || echo 1)
+   $(! grep -qF "$_btick" <<<"$_bt_hits" && echo 0 || echo 1)
 ck "the LANE_TIMEOUT=0 disclosure still states that --watch supervision stays FINITE (so it cannot read as 'this lane has no bounds at all')" \
    $(grep -q 'ONLY THE CHECK WAIT IS UNBOUNDED HERE' "$SCRIPT" && echo 0 || echo 1)
 
