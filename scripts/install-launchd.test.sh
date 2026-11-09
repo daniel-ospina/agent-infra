@@ -3050,29 +3050,42 @@ done
 # com.eldato.*/com.tortoise.* label an installer here writes into LaunchAgents, in any of the four
 # spellings — and the rows below assert each one is a template (flat OR one dir down), RETIRED, or
 # listed in OWNED-BY-OTHER-INSTALLERS. That is the direction that reds when an entry goes missing.
-# STATED LIMIT: the two greps read LITERAL labels; a label assembled at runtime from something other
-# than `UNIT_NAME` (which is resolved below) would not be enumerated. Every label this repo installs
-# today is reached by one of the five arms — the population row below pins that `com.eldato.lane-arm`
-# is in it, so a gate that stopped seeing it cannot pass silently.
+# STATED LIMIT: the greps read LITERAL labels; a label assembled at runtime from something other
+# than `UNIT_NAME` (which is resolved below) is not enumerated. Every label this repo installs today
+# is reached by one of the arms below — the population rows pin that `com.eldato.lane-arm` (an inline
+# plist body) and `com.eldato.orchestrator-stack` (a `${LABEL:-…}` default) are BOTH in it, so a gate
+# that stopped seeing either cannot pass silently.
+#
+# ⛔ INSTALLERS ARE NOT ALL SHELL (#1867 review P2, round 5). The first version of this population
+# walked `install-*.sh` and four `orchestrator-harness/*.sh` only, so `scripts/orchestrator-harness/
+# merge-reminder.py` — which writes `~/Library/LaunchAgents/com.tortoise.merge-reminder.plist` on
+# darwin — was invisible to the gate that exists to catch exactly it: the label was undeclared,
+# `--status` reported it UNMANAGED, and the remedy printed for it was `launchctl bootout … && rm -f`
+# on a live job of this repo's own. `*.py` modules are a declaring surface for the same reason an
+# installer script is, and the assignment spelling (`LABEL = "com.…"`, `label = "com.…"`) is one of
+# the arms below.
 installed_labels_in_repo() {
     local f unit
     for f in "$SCRIPT_DIR"/install-*.sh "$SCRIPT_DIR"/orchestrator-bringup.sh \
-             "$SCRIPT_DIR"/orchestrator-harness/install.sh \
-             "$SCRIPT_DIR"/orchestrator-harness/watchdog-loop.sh \
-             "$SCRIPT_DIR"/orchestrator-harness/launchd-cycle.sh; do
+             "$SCRIPT_DIR"/*.py "$SCRIPT_DIR"/orchestrator-harness/*.sh \
+             "$SCRIPT_DIR"/orchestrator-harness/*.py; do
         [ -f "$f" ] || continue
         # ⛔ NOT A SUITE. `scripts/install-*.sh` matches this very file's siblings' fixtures —
         # `install-launchd.test.sh` seeds `com.eldato.tccprobe` / `com.eldato.hand-installed` plists as
         # FIXTURES, and a suite is not a declaring surface: including it made the reverse gate demand
-        # an exemption for a label that exists only inside a test's scratch home.
-        case "$f" in *.test.sh) continue ;; esac
-        # (1) LABEL="com.…" / BASE_LABEL="com.…" assignments and ${LABEL:-com.…} defaults.
-        grep -hoE '(BASE_)?LABEL="(\$\{(BASE_)?LABEL:-)?com\.(eldato|tortoise)\.[A-Za-z0-9._-]+' "$f" \
+        # an exemption for a label that exists only inside a test's scratch home. The same exclusion
+        # applies to the python suites, which build fake `~/Library/LaunchAgents` trees.
+        case "$f" in *.test.sh|*.test.py|*/test_*.py) continue ;; esac
+        # (1) A `label`-shaped name assigned a literal label — shell `LABEL="com.…"`,
+        # `BASE_LABEL="com.…"`, and python `label = "com.…"` / `GATE_JOB_LABEL = "com.…"`. The
+        # `${LABEL:-…}` default form is arm (5).
+        grep -hoE '[A-Za-z_]*(LABEL|label)[A-Za-z_]*[[:space:]]*[:=][[:space:]]*"com\.(eldato|tortoise)\.[A-Za-z0-9._-]+' "$f" \
             | grep -oE 'com\.(eldato|tortoise)\.[A-Za-z0-9._-]+' || true
         # (2) an inline plist body — the spelling lane-arm uses and nothing else does.
         grep -hoE '<key>Label</key><string>com\.(eldato|tortoise)\.[A-Za-z0-9._-]+</string>' "$f" \
             | sed -E 's:.*<string>(.*)</string>:\1:' || true
-        # (3) a literal installed-plist path.
+        # (3) a literal installed-plist path (`"Library" / "LaunchAgents" / f"{label}.plist"` does NOT
+        # name a label, which is why the python installer is reached by arm (1) instead).
         grep -hoE 'Library/LaunchAgents/com\.(eldato|tortoise)\.[A-Za-z0-9._-]+\.plist' "$f" \
             | sed -E 's:.*LaunchAgents/::; s:\.plist$::' || true
         # (4) LABEL="com.eldato.${UNIT_NAME#eldato-}" — resolved against THIS file's own UNIT_NAME=.
@@ -3083,6 +3096,9 @@ installed_labels_in_repo() {
             unit="$(grep -m1 -oE '^UNIT_NAME="eldato-[A-Za-z0-9._-]+"' "$f" | sed -E 's/.*"eldato-//; s/"$//' || true)"
             [ -n "$unit" ] && printf 'com.eldato.%s\n' "$unit"
         fi
+        # (5) LABEL="${LABEL:-com.….}" — the default IS the declaration (`watchdog-loop.sh`).
+        grep -hoE '\$\{(BASE_)?LABEL:-com\.(eldato|tortoise)\.[A-Za-z0-9._-]+' "$f" \
+            | grep -oE 'com\.(eldato|tortoise)\.[A-Za-z0-9._-]+' || true
     done | LC_ALL=C sort -u
 }
 
@@ -3107,6 +3123,18 @@ if grep -qxF -- 'com.eldato.lane-arm' <<<"$DECLARED_IN_REPO"; then
     ok "§18 the population is read from the installers, and it includes the inline-plist label (com.eldato.lane-arm)"
 else
     bad "§18 installed_labels_in_repo MISSED com.eldato.lane-arm — the reverse gate below would be looking at a narrower population than it claims"
+fi
+# ⛔ AND THE PYTHON-ASSIGNMENT SPELLING IS IN IT TOO (#1867 review P2, round 5).
+# `scripts/orchestrator-harness/merge-reminder.py --install` writes a LaunchAgent on darwin, so the
+# label it writes is installed by this repo; the first version of this population walked only
+# `install-*.sh` and four `*.sh` under orchestrator-harness, so that label was INVISIBLE — it went
+# undeclared, `--status` called it UNMANAGED, and the remedy printed for a live job of this repo's own
+# was `launchctl bootout … && rm -f`. Pinning it here means a future narrowing of the file walk reds
+# this row instead of silently re-opening the hole.
+if grep -qxF -- 'com.tortoise.merge-reminder' <<<"$DECLARED_IN_REPO"; then
+    ok "§18 …and the label a PYTHON installer writes (com.tortoise.merge-reminder), so *.py is walked too"
+else
+    bad "§18 installed_labels_in_repo MISSED com.tortoise.merge-reminder — the file walk does not include *_*.py installers, so a python-installed label is undeclared and gets a bootout+rm remedy"
 fi
 while IFS= read -r _foreign; do
     [ -n "$_foreign" ] || continue

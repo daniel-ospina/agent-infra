@@ -347,28 +347,19 @@ if [ -z "${LOOP_DETACHED:-}" ]; then
 fi
 
 # launchd is not involved, but a detached process still inherits the environment it
-# was started with, which may be a cmux pane's interactive shell. Pin the two
-# variables everything downstream actually needs rather than trusting that.
-# ⛔ A PIN IS A REPAIR, NOT AN OVERRIDE (#1933). It is applied only when the directory it names
-# EXISTS. Unconditionally, it also silently turned the whole loop into a no-op on any box that is
-# not this laptop: `cd "$HOME" || exit 0` below went to a path that does not exist and exited 0
-# having written NOTHING to the log -- the exact silent-green shape this file documents twice
-# above. MEASURED (`HOME=$tmp LOOP_DETACHED=1 bash scripts/heartbeat-loop.sh` on a box without
-# /Users/danielospina): rc=0, heartbeat log absent. And `STATE`/`SCRIPTS` are derived from the
-# CALLER's HOME above, so pinning HOME afterwards left the two disagreeing: state written under
-# one home, cwd changed to another. Guarded, a box that HAS the pin gets it unchanged, and a box
-# that does not gets its own HOME -- consistent with the state and scripts paths.
-# ⛔ HOME IS REQUIRED AND ALREADY PINNED ABOVE (#1867). The one-user `if [ -d /Users/danielospina ]
+# was started with, which may be a cmux pane's interactive shell. Derive what everything
+# downstream needs from the CALLER's environment rather than trusting it.
+# ⛔ HOME IS REQUIRED AND ALREADY SETTLED ABOVE (#1867). The one-user `if [ -d /Users/danielospina ]
 # then export HOME=…` pin that lived here is gone: it named one person's home in a script that ships
 # to every machine, and it re-pinned HOME AFTER `STATE`/`SCRIPTS` had been derived from the caller's
 # HOME — state under one home, cwd under another. The requirement is now checked once, near the top,
 # and refuses loudly instead of driving `cd "$HOME" || exit 0` into a silent green.
-# ⛔ DERIVED FROM THE **PINNED** HOME — i.e. after the `export HOME=` above, never before it. A `:-`
-# default is evaluated once; computing it from the AMBIENT `$HOME` (a `sudo`/`su` shell, an agent
+# ⛔ `O` IS DERIVED FROM THAT SAME HOME, never from an ambient re-read. A `:-` default is evaluated
+# once; computing it from a different `$HOME` than the one above (a `sudo`/`su` shell, an agent
 # session) exports a path that does not exist on this box, and every tool silently falls back to its
 # pinned real gh — an inert layer with nothing on any stream (#1988, review round 9). Keep this line
-# BELOW the HOME pin (the re-exec block above it must not freeze an ambient-HOME value). Same value
-# the nine resolvers look for: `$O/gh-rest/gh`, then `$O/gh-limit/gh`.
+# BELOW the HOME requirement. Same value the nine resolvers look for: `$O/gh-rest/gh`, then
+# `$O/gh-limit/gh`.
 export O="${O:-$HOME/orchestrator}"
 # `~/.pi/agent/shims` is where `gh` lives on this box (a symlink to the agent-infra gh-shim). It
 # was MISSING from the first version of this PATH, and the very first tick logged "NOTE ask-owner

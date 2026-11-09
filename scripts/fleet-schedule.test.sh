@@ -1111,18 +1111,23 @@ out="$(darwin_run --verify)"; rc=$?
 # were those printed `SCHEDULE NOT VERIFIED — 0 launchd job(s) … above` while returning 1 — the status
 # was right and the count beside it said nothing failed. This delegate isolates the COUNT from the rc:
 # it exits 0 and fails only in the new wording, so a scan that cannot see the wording reports 0.
+# ⛔ TWO JOBS, ONE VERDICT WORD PER LINE (#1867 review P3, round 5). The delegate prints the marker on
+# each JOB line and keeps the word out of its section intro; a scan matching the BARE substring would
+# count the intro as well, so it would report 2 here whether one job was undeclared or twenty. The
+# fixture below mirrors the shipped format exactly, which is what makes this row discriminating.
 cat > "$DARWIN_ROOT/scripts/install-launchd.sh" <<'SH'
 #!/usr/bin/env bash
 printf '%s\n' "${1:-<no args>}" >> "$DELEGATE_RECORD"
-echo "  ⛔ UNMANAGED — installed with NO template in the declared set:" >&2
-echo "    com.eldato.mystery ($HOME/Library/LaunchAgents/com.eldato.mystery.plist)" >&2
+echo "  ⛔ Installed job(s) with NO template in the declared set — one line per job:" >&2
+echo "  ⛔ UNMANAGED   com.eldato.mystery ($HOME/Library/LaunchAgents/com.eldato.mystery.plist)" >&2
+echo "  ⛔ UNMANAGED   com.eldato.other ($HOME/Library/LaunchAgents/com.eldato.other.plist)" >&2
 exit 0
 SH
 chmod +x "$DARWIN_ROOT/scripts/install-launchd.sh"
 out="$(darwin_run --verify)"; rc=$?
-grep -q 'SCHEDULE NOT VERIFIED — 1 launchd job(s)' <<<"$out" \
-  && ok "an UNMANAGED-only failure is COUNTED as 1 job, not printed as '0 … above'" \
-  || bad "an UNMANAGED-only failure printed a 0-job verdict — the count scan cannot see the new wording: $out"
+grep -q 'SCHEDULE NOT VERIFIED — 2 launchd job(s)' <<<"$out" \
+  && ok "an UNMANAGED-only failure counts EVERY job line (2 of 2), never the section intro" \
+  || bad "the UNMANAGED count is not per job — two undeclared jobs did not read as 2 jobs: $out"
 [ "$rc" -eq 1 ] && ok "…and the verdict is still NOT VERIFIED" \
   || bad "the UNMANAGED-only failure returned $rc, not 1"
 cat > "$DARWIN_ROOT/scripts/install-launchd.sh" <<'SH'

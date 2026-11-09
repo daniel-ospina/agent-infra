@@ -29,11 +29,12 @@
 #
 # ⛔ DRIFT-GATED IN BOTH DIRECTIONS: `scripts/install-launchd.test.sh` §18 asserts (1) every entry
 # below still has a DECLARING SURFACE in this repo — matched against `LABEL="…"`, `BASE_LABEL="…"`,
-# `LABEL="${LABEL:-com.…}"`, an inline `<string>com.…</string>` plist label, or a literal
-# `Library/LaunchAgents/com.….plist` path, so an entry cannot go stale — and (2) the REVERSE: every
-# `com.eldato.*` / `com.tortoise.*` label any installer in this repo writes into `LaunchAgents` is a
-# template, RETIRED, or listed here, so a MISSING entry fails the suite instead of becoming a delete
-# advice. A gate that can only drift one way cannot notice the direction that does harm.
+# `LABEL="${LABEL:-com.…}"`, a python `label = "com.…"` assignment, an inline
+# `<string>com.…</string>` plist label, or a literal `Library/LaunchAgents/com.….plist` path, so an
+# entry cannot go stale — and (2) the REVERSE: every `com.eldato.*` / `com.tortoise.*` label any
+# installer in this repo (shell OR python — see `merge-reminder.py` below) writes into `LaunchAgents`
+# is a template, RETIRED, or listed here, so a MISSING entry fails the suite instead of becoming a
+# delete advice. A gate that can only drift one way cannot notice the direction that does harm.
 #
 #   com.eldato.orchestrator-loop   ← scripts/orchestrator-harness/install.sh (BASE_LABEL + LABEL)
 #                                   also scripts/orchestrator-bringup.sh (LABEL)
@@ -49,6 +50,10 @@
 #                                   (`LABEL="${LABEL:-com.eldato.orchestrator-stack}"`). No installer
 #                                   in this repo writes its plist — which is precisely why flagging it
 #                                   aimed a `bootout && rm -f` at the box's live controller.
+#   com.tortoise.merge-reminder    ← scripts/orchestrator-harness/merge-reminder.py (`--install` on
+#                                   darwin writes ~/Library/LaunchAgents/<label>.plist; the label is a
+#                                   PYTHON assignment, which is why the drift gate walks *.py too)
 com.eldato.orchestrator-loop
 com.eldato.lane-arm
 com.eldato.orchestrator-stack
+com.tortoise.merge-reminder

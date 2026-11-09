@@ -2007,10 +2007,16 @@ if [ "${1:-}" = "--status" ]; then
     fi
     if [ -n "$unmanaged" ]; then
         echo ""
-        echo "  ⛔ UNMANAGED — installed with NO template in the declared set:" >&2
+        # ⛔ ONE LINE PER JOB, AND EACH ONE CARRIES THE VERDICT WORD (#1867 review P3, round 5). The
+        # intro used to carry `UNMANAGED` and the job lines did not, so a consumer counting occurrences
+        # of the word counted ONE however many jobs there were. `scripts/fleet-schedule.py --verify`
+        # prints that count in its verdict, so it said "1 launchd job(s) …" over three — the same
+        # family of lie as the `0` it replaced, one order of magnitude smaller. The word now appears on
+        # the JOB lines and not in the intro, so counting `⛔ UNMANAGED` is counting jobs.
+        echo "  ⛔ Installed job(s) with NO template in the declared set — one line per job:" >&2
         while IFS= read -r _lbl; do
             [ -n "$_lbl" ] || continue
-            echo "    $_lbl ($AGENTS_DIR/$_lbl.plist)" >&2
+            echo "  ⛔ UNMANAGED   $_lbl ($AGENTS_DIR/$_lbl.plist)" >&2
         done <<<"$unmanaged"
         echo "    None of these is described by this repo, so no template change and no content comparison can" >&2
         echo "    reach one. DECIDE before acting — three declarations are not a deletion:" >&2

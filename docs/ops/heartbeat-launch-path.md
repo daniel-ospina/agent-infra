@@ -109,7 +109,7 @@ is red on a healthy box is one operators learn to ignore:
   there, so **the same change that diagnoses it removes it** — otherwise `--status` stayed red until
   a human hand-deleted a plist, since `--uninstall` iterates templates and nothing describes it.
 - `templates/launchd/OWNED-BY-OTHER-INSTALLERS` — installed, **or adopted and supervised**, by
-  another surface of this repo. Three labels are there today, each with its declaring surface named
+  another surface of this repo. Four labels are there today, each with its declaring surface named
   in the manifest:
   - `com.eldato.orchestrator-loop` — rendered by `scripts/orchestrator-harness/install.sh` from its
     own template, so it is not this installer's set to describe;
@@ -118,25 +118,34 @@ is red on a healthy box is one operators learn to ignore:
     and documented as installed on both platforms;
   - `com.eldato.orchestrator-stack` — the supervision job a box already carries. No installer here
     writes its plist: `scripts/orchestrator-bringup.sh` **adopts** it rather than rendering over it,
-    and it is the default target of `scripts/orchestrator-harness/watchdog-loop.sh`.
+    and it is the default target of `scripts/orchestrator-harness/watchdog-loop.sh`;
+  - `com.tortoise.merge-reminder` — written on darwin by `scripts/orchestrator-harness/merge-reminder.py
+    --install`. The label there is a **Python assignment**, so a gate that only read installer
+    *shell scripts* could not see it: that is how it went undeclared while being installed.
 
   The list is drift-gated by `install-launchd.test.sh` §18 **in both directions and against every
-  spelling**: each entry must still have a declaring surface (a `LABEL=`/`BASE_LABEL=` assignment, a
-  `${LABEL:-com.…}` default, an inline `<string>com.…</string>` plist label, a literal
-  `Library/LaunchAgents/<label>.plist` path, or a `LABEL="com.eldato.${UNIT_NAME#eldato-}"` resolved
-  against that installer's own `UNIT_NAME=`), **and** every label an installer in this repo writes
-  into `LaunchAgents` must be a template, RETIRED, or listed here. The second direction is the one
-  that does harm: a gate that only catches a *stale* entry cannot notice a **missing** one.
+  spelling**: each entry must still have a declaring surface (a shell `LABEL=`/`BASE_LABEL=`
+  assignment, a Python `label = "com.…"` assignment, a `${LABEL:-com.…}` default, an inline
+  `<string>com.…</string>` plist label, a literal `Library/LaunchAgents/<label>.plist` path, or a
+  `LABEL="com.eldato.${UNIT_NAME#eldato-}"` resolved against that installer's own `UNIT_NAME=`),
+  **and** every label any installer in this repo — shell **or** Python — writes into `LaunchAgents`
+  must be a template, RETIRED, or listed here. The second direction is the one that does harm: a
+  gate that only catches a *stale* entry cannot notice a **missing** one, and the missing one is
+  the entry that turns a live job of this repo's own into a delete advice.
 
 A job **nobody** declares is still `UNMANAGED` — but the report is no longer a delete order. It names
 the four answers in order (add a template / declare it in `OWNED-BY-OTHER-INSTALLERS` / retire it /
 it is nobody's) and prints the `bootout && rm -f` command last, per label, under *"only after
-checking that nothing of yours supervises the label"*. That change came from the second finding: the
-old wording opened each line with that command, and for `com.eldato.lane-arm` and
-`com.eldato.orchestrator-stack` the remedy offered for a live job of this repo's own was to delete it.
+checking that nothing of yours supervises the label"*. Each job is **one line carrying its own
+verdict word**, so counting `⛔ UNMANAGED` counts jobs. That change came from the second finding: the
+old wording opened each line with the command, and for `com.eldato.lane-arm` and
+`com.eldato.orchestrator-stack` the remedy offered for a live job of this repo's own was to delete it
+— and from a third, where the word appeared only in the section intro, so the count in
+`fleet-schedule.py`'s verdict read `1 launchd job(s)` however many jobs there were.
 
-`fleet-schedule.py --verify` counts all four failure wordings (`NOT INSTALLED`, `DRIFTED`,
-`not loaded`, `UNMANAGED`, `UNKNOWN`), so a run that fails only on the new two prints
+`fleet-schedule.py --verify` counts the verdict **markers** (`NOT INSTALLED`, `DRIFTED`, `not loaded`,
+`⛔ UNMANAGED`, `⛔ UNKNOWN`), not bare words — the bare-word scan matched the section intro too, so
+three undeclared jobs and one both read as `1`. A run that fails only on the new two prints
 `SCHEDULE NOT VERIFIED — N launchd job(s) …` with a truthful N instead of `0`.
 
 ## ⛔ What is NOT the fix

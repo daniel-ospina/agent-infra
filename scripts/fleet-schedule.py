@@ -3645,18 +3645,13 @@ def cmd_darwin(mode):
         # installed job with no template as `UNMANAGED` and an enumeration it could not perform as
         # `UNKNOWN`; neither word was in this scan, so a run whose ONLY failures were those printed
         # `SCHEDULE NOT VERIFIED — 0 launchd job(s) … above` while returning 1 — the exit status was
-        # right and the count beside it said nothing failed. Both are named here, and so is the
-        # identity prefix those two lines carry (`⛔ UNMANAGED` / `⛔ UNKNOWN`), because a bare
-        # substring would also match a healthy row that merely mentions the word.
-        bad = [
-            line
-            for line in text.splitlines()
-            if "NOT INSTALLED" in line
-            or "DRIFTED" in line
-            or "not loaded" in line
-            or "UNMANAGED" in line
-            or "UNKNOWN" in line
-        ]
+        # right and the count beside it said nothing failed.
+        # ⛔ AND THE COUNT IS PER JOB, NOT PER WORDING (#1867 review P3, round 5). Matching the bare
+        # substring made the intro line match too, so three undeclared jobs and one both reported
+        # "1 launchd job(s) …". The delegate now prints the marker ON EACH JOB LINE and keeps the word
+        # out of its intro; this scan matches the marker, so `len(bad)` counts what it names.
+        JOB_MARKERS = ("NOT INSTALLED", "DRIFTED", "not loaded", "⛔ UNMANAGED", "⛔ UNKNOWN")
+        bad = [line for line in text.splitlines() if any(m in line for m in JOB_MARKERS)]
         for line in bad:
             print("  FAIL   %s" % line.strip(), file=sys.stderr)
         # ⛔ THE DELEGATE'S EXIT STATUS IS THE SECOND HALF OF THE GATE, not an implementation
