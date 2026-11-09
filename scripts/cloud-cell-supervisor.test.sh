@@ -3073,28 +3073,22 @@ esac
 # (2) INDICATOR (a): the DOCUMENTED deploy (`stop` -> `start`) on this box leaves it exactly as found —
 # running its old harness — and never "stopped and unrefreshed". `start` runs in the SAME state dir.
 qverb start "$Q/agent-repo" "$S1" daniel-ospina/tortoise
-[ "$Q_RC" -ne 0 ] && ok "start: still refuses the pair (the gate is not weakened by #2093)" \
-                  || bad "start returned 0 on a mismatched pair — $Q_OUT"
-case "$Q_OUT" in
-  *"DIFFERENT repos"*) ok "start's refusal IS the queue gate" ;;
-  *) bad "start refused for an unrelated reason — $Q_OUT" ;;
-esac
 [ -f "$S1/o/state/roles/.desired" ] && [ "$(sgen "$S1")" = 3 ] && [ -f "$S1/up" ] \
   && ok "stop→start on a mismatch leaves the box RUNNING its old harness (indicator a)" \
   || bad "after stop→start the box is not as it was found (marker=$([ -f "$S1/o/state/roles/.desired" ] && echo present || echo GONE) gen=$(sgen "$S1") session=$([ -f "$S1/up" ] && echo up || echo GONE))"
-# ⛔ THERE IS DELIBERATELY NO "the refused start seeded nothing into $O" ROW HERE (review P3). It was
-# added, then deleted as INERT: no mutation of this diff can redden it, because the diff changes no
-# code `cmd_start` executes — `start` passes no verb, so its gate and its message are byte-identical
-# pre- and post-fix, and it still refuses before `harness_apply`. MEASURED, not reasoned: the suite run
-# against `origin/main`'s supervisor prints this row ✅ while its sibling above goes ❌. Pinning
-# `start`'s own ordering is a real property, but it needs a `start`-side arm whose mutant actually
-# reaches `harness_apply` — a different diff. `start`'s refusal IS still graded here (rc, the gate's
-# own string, and the claim row below), and the box-as-found row above reddens when the gate is
-# deleted; nothing is lost by its absence.
-case "$Q_OUT" in
-  *"controller started"*) bad "start CLAIMED success on the mismatched pair" ;;
-  *) ok "start never claims 'controller started' on the mismatched pair" ;;
-esac
+# ⛔ NO `start`-SIDE ASSERTION ROWS ABOVE, DELIBERATELY — AND NOT AS COVERAGE (agent-infra#3442 rule 3:
+# "Either make it reachable or delete it. A comment explaining why it cannot fail is not a fix").
+# `qverb start` above is FIXTURE for the box-as-found row, which is indicator (a)'s assertion — and
+# that row reddens when the gate is deleted. The three rows that used to grade `start`'s own refusal
+# (rc≠0, "start's refusal IS the queue gate", and "never claims 'controller started'"), plus the
+# earlier "the refused start seeded nothing into $O" row, were all DELETED as INERT per that rule: no
+# mutation of this diff can redden any of them, because the diff changes no code `cmd_start` executes.
+# `start` calls `assert_queue_target` with NO argument, so `local verb=""` leaves its verdict and
+# every message byte-identical pre- and post-fix; it still refuses at its own #1901 gate before
+# `harness_apply`; and even with `stop`'s gate deleted it dies in the leftover-session branch, never
+# at the launch. MEASURED, not reasoned: the suite run against `origin/main`'s supervisor prints these
+# rows ✅ while the box-as-found row goes ❌. Pinning `start`'s own ordering is a real property, but it
+# needs its own `start`-side arm whose mutant reaches `harness_apply` — a different diff.
 
 # (3) NON-VACUITY, the other direction: `stop` must NOT refuse a cell it has nothing to lose on, and
 # must not refuse a MATCHED pair. Two arms, because both are ways the new gate could false-block:
