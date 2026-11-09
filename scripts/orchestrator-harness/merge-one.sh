@@ -1150,12 +1150,24 @@ rail_attempt() {
   # rail refuses it (the merge is the one operation that cannot tolerate at-least-once, #1908).
   # ⛔ The token is the HEAD claim's commit, not the landing claim's: the head key is the one that
   # binds evidence to the sha being merged (the landing `pr-<N>` key carries no head).
+  # ⛔ NO COMMENT MAY SIT INSIDE THE `\`-CONTINUED ELEMENT LIST BELOW (agent-infra#2095 review, P0).
+  # Bash ends the continued command list at an unescaped newline after a line that is ENTIRELY a
+  # comment, and the element that line follows is then DISCARDED — so a comment placed after
+  # `CLAIM_ACTION_HEAD_TOKEN=… \` silently swallows that assignment while the elements below it
+  # still arrive. MEASURED on the extracted block with a stub `$RAIL` that echoes its env:
+  #   with a comment inside the list → `head_token=[<UNSET>] claims_sh=[…] repo=[…]`
+  #   with the comment moved above       → `head_token=[deadbeefcafe] claims_sh=[…] repo=[…]`
+  # `CLAIM_ACTION_CLAIMS_SH` surviving is what makes this invisible: it enters the rail's
+  # `if [ -n "${CLAIM_ACTION_CLAIMS_SH:-}" ]` gate and then `admin-merge.sh:11738` refuses EVERY
+  # merge with `REFUSED [hold-proof] … reason=no-token` — a total outage of the only merge path,
+  # on all three ingresses, reported as a claims fault. `test-gates.sh` L7 now pins the token's
+  # arrival for this reason.
+  # ⛔ `${_M1_MOD:-$O}` IS SELF-SUFFICIENT ON PURPOSE: this block is EXTRACTED and DRIVEN by
+  # `test-gates.sh` from a range that starts far below `_M1_MOD`'s assignment, so a bare
+  # `$_M1_MOD` is unbound there — under `set -u` the subshell dies at the expansion and the `if`
+  # silently takes the "rail FAILED" branch, i.e. the rail is never invoked at all.
   if ( cd "$REPO" && \
        CLAIM_ACTION_HEAD_TOKEN="${CROSS_OWN:-}" \
-       # ⛔ `${_M1_MOD:-$O}` IS SELF-SUFFICIENT ON PURPOSE: this block is EXTRACTED and DRIVEN by
-       # `test-gates.sh` from a range that starts far below `_M1_MOD`'s assignment, so a bare
-       # `$_M1_MOD` is unbound there — under `set -u` the subshell dies at the expansion and the `if`
-       # silently takes the "rail FAILED" branch, i.e. the rail is never invoked at all.
        CLAIM_ACTION_CLAIMS_SH="${_M1_MOD:-$O}/claims.sh" \
        CLAIM_ACTION_REPO="$REPO" \
        bash "$RAIL" "$PR" --repo "$OR" -- --squash ) >> "$L.log" 2>&1; then

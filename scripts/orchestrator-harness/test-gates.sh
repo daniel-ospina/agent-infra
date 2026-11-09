@@ -2506,6 +2506,97 @@ SH
   fi
 fi
 
+# ── L11: THE RAIL MUST ACTUALLY RECEIVE THE HOLD-PROOF TOKEN ─────────────────────────────────
+# ⛔ NOTHING ELSE IN THIS TREE CAN SEE THIS, AND THE FAILURE IS TOTAL (agent-infra#2095 review, P0).
+# `admin-merge.sh:11738` refuses EVERY merge with `REFUSED [hold-proof] … reason=no-token` when
+# `CLAIM_ACTION_CLAIMS_SH` arrives but `CLAIM_ACTION_HEAD_TOKEN` does not — an outage of the fleet's
+# only merge path, on all three ingresses (the controller's `merge-<PR>`, `fix-one.sh`'s re-review,
+# `chain-merge.sh`), reported by the rail as a CLAIMS fault. `claim-action-proof.test.sh` drives
+# `claim_action_proof` DIRECTLY and never runs `merge-one.sh`, so it cannot catch this; L7 extracts
+# the LANDING block, which stops above the rail invocation. The shape that shipped was an
+# UNPINNED PASS-THROUGH, which is why every other suite stayed green over it.
+# ⛔ AND THE SHAPE IS INVISIBLE BY CONSTRUCTION: bash ends a `\`-continued command list at an
+# unescaped newline following a line that is ENTIRELY a comment, and the element that comment line
+# follows is then DISCARDED. So a comment placed after `CLAIM_ACTION_HEAD_TOKEN="${CROSS_OWN:-}" \`
+# swallowed the TOKEN while every element BELOW the comment still arrived — the rail's
+# `[ -n "$CLAIM_ACTION_CLAIMS_SH" ]` gate was still entered and the refusal still fired.
+# Two arms: a STATIC guard (no comment inside the element list, so re-introducing one reddens by
+# name) and a DRIVEN one (a stub `$RAIL` records the env it was actually handed — `hardware`, not a
+# grep over the source, because a grep cannot see what bash does with the continuation).
+_rb_s="$(grep -n 'if ( cd "$REPO" && \\' "$MERGE" | head -1 | cut -d: -f1)"
+_rb_e="$(grep -nF 'bash "$RAIL" "$PR" --repo "$OR" -- --squash ) >> "$L.log" 2>&1; then' "$MERGE" | head -1 | cut -d: -f1)"
+if [ -n "$_rb_s" ] && [ -n "$_rb_e" ] && [ "$_rb_s" -lt "$_rb_e" ]; then
+  # (a) STATIC: nothing between the anchor and the rail invocation may be a comment line.
+  if sed -n "$((_rb_s + 1)),${_rb_e}p" "$MERGE" | grep -qE '^[[:space:]]*#'; then
+    echo "  ❌ L11 the rail invocation carries a COMMENT inside its \`\\\`-continued element list (merge-one.sh:$_rb_s-$_rb_e) — bash DISCARDS the element above it, so a comment after an assignment silently swallows that assignment"; FAIL=$((FAIL+1))
+  else
+    echo "  ✅ L11 no comment sits inside the rail invocation's continued element list — every element survives"; PASS=$((PASS+1))
+  fi
+  # (b) DRIVEN: extract the invocation verbatim, bind what the real caller binds, and let a stub
+  # `$RAIL` print what it received. The `then` body is not part of the pin — substituting `:` keeps
+  # the extract to the CONDITION that builds the environment, which is the object under test.
+  { echo '_M1_MOD="${_M1_MOD:-$O}"'
+    sed -n "${_rb_s},${_rb_e}p" "$MERGE"
+    echo '    :'
+    echo 'fi'; } > "$TMP/raildrive.sh"
+  # drive_rail <cross_own> <dir> — CROSS_OWN is the fencing token the caller computed; passing it in
+  # (rather than setting it inside) is what makes the EMPTY case a real non-vacuity control.
+  drive_rail() {
+    local cross="$1" d="$2"
+    rm -rf "$d"; mkdir -p "$d/O/state" "$d/repo"
+    # The stub prints UNSET differently from EMPTY on purpose: an empty token is DELIBERATE here (a
+    # lane that reached the rail without a head claim cannot prove ownership, and the rail must
+    # refuse it), while an UNSET one means the assignment was discarded — which is the defect.
+    cat > "$d/rail.sh" <<'SH'
+printf 'head_token=[%s] claims_sh=[%s] repo=[%s]\n' \
+  "${CLAIM_ACTION_HEAD_TOKEN-<UNSET>}" "${CLAIM_ACTION_CLAIMS_SH-<UNSET>}" "${CLAIM_ACTION_REPO-<UNSET>}"
+SH
+    ( trap - EXIT
+      O="$d/O"; REPO="$d/repo"; PR=9001; OR=acme/widget; RAIL="$d/rail.sh"
+      L="$d/merge"; RC_N=1; CROSS_OWN="$cross"
+      # shellcheck source=/dev/null
+      . "$TMP/raildrive.sh" ) > "$d/out" 2>&1
+  }
+  if bash -n "$TMP/raildrive.sh" 2>/dev/null \
+     && grep -qF 'CLAIM_ACTION_HEAD_TOKEN="${CROSS_OWN:-}"' "$TMP/raildrive.sh"; then
+    drive_rail deadbeefcafe "$TMP/rail-tok"
+    # ⛔ THE STUB'S OUTPUT LANDS IN `$L.log`, NOT ON THE SUITE'S STDOUT: the shipped invocation
+    # redirects its whole subshell there, so that log IS the rail's witness — the same place an
+    # operator would read the refusal from.
+    _rseen="$(grep -m1 '^head_token=' "$TMP/rail-tok/merge.log" 2>/dev/null)"
+    if [ -z "$_rseen" ]; then
+      echo "  ❌ L11 the stub rail was never invoked by the extracted block — the pin proves nothing"; FAIL=$((FAIL+1))
+    else
+      case "$_rseen" in
+        *'head_token=[deadbeefcafe]'*) echo "  ✅ L11 the rail RECEIVES CLAIM_ACTION_HEAD_TOKEN (the hold-proof fencing token) from merge-one.sh"; PASS=$((PASS+1)) ;;
+        *) echo "  ❌ L11 the rail did NOT receive the head claim token — got [$_rseen] while CROSS_OWN=deadbeefcafe. admin-merge.sh:11738 then refuses EVERY merge with 'REFUSED [hold-proof] … reason=no-token'"; FAIL=$((FAIL+1)) ;;
+      esac
+      case "$_rseen" in
+        *"claims_sh=[$TMP/rail-tok/O/claims.sh]"*) echo "  ✅ L11 …and CLAIM_ACTION_CLAIMS_SH beside it (which is WHY a lost token reaches the rail's gate instead of skipping it)"; PASS=$((PASS+1)) ;;
+        *) echo "  ❌ L11 CLAIM_ACTION_CLAIMS_SH did not reach the rail — got [$_rseen]"; FAIL=$((FAIL+1)) ;;
+      esac
+      case "$_rseen" in
+        *"repo=[$TMP/rail-tok/repo]"*) echo "  ✅ L11 …and CLAIM_ACTION_REPO, so the proof is bound to the repo being merged"; PASS=$((PASS+1)) ;;
+        *) echo "  ❌ L11 CLAIM_ACTION_REPO did not reach the rail — got [$_rseen]"; FAIL=$((FAIL+1)) ;;
+      esac
+    fi
+    # NON-VACUITY: an empty CROSS_OWN must reach the rail as an EMPTY token, NOT as `<UNSET>`. If the
+    # three arms above could pass from the driver's own environment rather than through the block,
+    # this reads `<UNSET>` too and reddens — and separately, the deliberate empty-token refusal is
+    # pinned as a behaviour rather than left to a comment.
+    drive_rail "" "$TMP/rail-empty"
+    _rese="$(grep -m1 '^head_token=' "$TMP/rail-empty/merge.log" 2>/dev/null)"
+    case "$_rese" in
+      *'head_token=[]'*) echo "  ✅ L11 non-vacuity: an EMPTY CROSS_OWN reaches the rail as an empty token (refused by the rail), not as an unset one"; PASS=$((PASS+1)) ;;
+      *) echo "  ❌ L11 non-vacuity: an empty CROSS_OWN did not present as an empty token — got [$_rese], so the three arms above may be passing from the driver's environment, not through the block"; FAIL=$((FAIL+1)) ;;
+    esac
+  else
+    echo "  ❌ L11 could not extract the rail invocation from merge-one.sh (anchors: [$_rb_s]/[$_rb_e]) — the hold-proof's delivery is unproven"; FAIL=$((FAIL+1))
+  fi
+else
+  echo "  ❌ L11 could not locate the rail invocation in merge-one.sh (anchors: [$_rb_s]/[$_rb_e]) — an anchor moved, so the hold-proof's delivery is unproven rather than passing"; FAIL=$((FAIL+1))
+fi
+
 echo "=== NO TIME BOUND, NO AGE-BASED RELEASE (owner ruling, 2026-10-18 — #2099) ==="
 # ⛔ THIS SECTION REPLACES agent-infra#2040's bounded-gate suite. #2040 built an age/land/youngest-evidence
 # RELEASE of the merge-priority gate; the owner's ruling has no such arm ("Only when NO un-owned PR
