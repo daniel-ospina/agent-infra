@@ -1485,11 +1485,26 @@ new_o "$T/pr4.tsv"
 WAIT_S=60 POLL_S=5 LANE_MERGE_ELAPSED_S=7180 run 35 --repo o/r --pr-tsv "$T/pr4.tsv" --checks-tsv "$T/checks-inflight.tsv"
 ck "a lane that has already spent 7180 s of its 7200 s clock CAPS the check wait to the 10 s that is left (still WAITING_CHECKS, still a verdict) instead of waiting to be WALL-TERMed with none" \
    $([ "$RC" = 11 ] && [ "$(verdict_of 35 | cut -d' ' -f1)" = WAITING_CHECKS ] && grep -q 'CAPPED at 10s' <<<"$OUT" && grep -q 'already spent 7180s' <<<"$OUT" && echo 0 || echo 1)
-# …and an elapsed time it CANNOT resolve is disclosed, never silently treated as "the lane just started".
+# …and a lane's elapsed time it CANNOT resolve is disclosed, never silently treated as "the lane just started".
 new_o "$T/pr4.tsv"
 WAIT_S=0 run 36 --repo o/r --pr-tsv "$T/pr4.tsv" --checks-tsv "$T/checks-inflight.tsv"
 ck "an UNRESOLVABLE lane elapsed is reported as a residual (named, with the remedy) rather than read as 0 s spent — the wait is honoured and still hands off" \
    $([ "$RC" = 11 ] && [ "$(verdict_of 36 | cut -d' ' -f1)" = WAITING_CHECKS ] && grep -q 'NOT clamped to what is left of LANE_WALL_S' <<<"$OUT" && echo 0 || echo 1)
+# ⛔ `LANE_TIMEOUT=0` IS "WALL AXIS OFF", NOT A ZERO-SECOND BUDGET (#3850 review, P2 — verified).
+# `is_limit 0` accepts `0` (by design — it is the harness's OFF switch), so the clamp's arithmetic
+# `0 - <elapsed> - <margin>` went negative, floored at 0, and the wait became ZERO for ever: the loop
+# handed off `WAITING_CHECKS` on its FIRST poll, so an UNBOUNDED lane could never wait a head out.
+# `spawn-gate.sh` documents `0` as a raise (unbounded) and `lane.sh` passes it straight through, so this
+# is a reachable production value, not a hypothetical. The wait must be HONOURED here — the verdict's
+# own `after <n>s` is asserted, because "did not print CAPPED" alone would pass on a wait that
+# silently collapsed for a different reason.
+new_o "$T/pr4.tsv"
+OUT="$(PATH="$BIN:$PATH" GH_LOG="$T/gh.log" O="$OT" HOME="$T/home" REPO_PATH="${REPO_PATH:-$RUN_REPO}" \
+      LANE_MERGE_INTERVAL=5 LANE_MERGE_WAIT=6 LANE_MERGE_POLL=5 LANE_MERGE_ELAPSED_S=7180 LANE_TIMEOUT=0 \
+      bash "$SCRIPT" 43 --repo o/r --pr-tsv "$T/pr4.tsv" --checks-tsv "$T/checks-inflight.tsv" 2>&1)"; RC=$?
+_w43="$(verdict_of 43 | sed -n 's/.*after \([0-9][0-9]*\)s.*/\1/p')"
+ck "LANE_TIMEOUT=0 (the documented 'wall axis OFF' value) is UNBOUNDED, not a 0 s budget — the 6 s wait is honoured (handed off after ${_w43:-?}s) instead of clamping to 0 and handing off on the first poll for ever" \
+   $([ "$RC" = 11 ] && [ "$(verdict_of 43 | cut -d' ' -f1)" = WAITING_CHECKS ] && ! grep -q 'CAPPED at' <<<"$OUT" && grep -q 'LANE_TIMEOUT=0 is the documented' <<<"$OUT" && [ -n "${_w43:-}" ] && [ "${_w43:-0}" -ge 5 ] && echo 0 || echo 1)
 # …and the PRODUCTION path is the token, not the seam, so it is pinned too: `lane.sh` stamps
 # `<issue>.<pid>.<epoch>` into `$O/logs/lane-<issue>.owner` before spawning the agent. A live pid (`$$`,
 # this suite) plus an epoch 7180 s ago must clamp exactly as the seam does — the earlier draft wrote this
@@ -1527,9 +1542,16 @@ WAIT_S=60 POLL_S=5 LANE_BOUND_IDLE_S=20 LANE_MERGE_HB="$T/hb-dir-39" run 39 --re
 _w39="$(verdict_of 39 | sed -n 's/.*after \([0-9][0-9]*\)s.*/\1/p')"
 ck "a heartbeat that becomes unwritable RE-DERIVES the deadline (60 s wait, 20 s allowance → handed off at ${_w39:-?}s, not 60 s) — otherwise the lane waits silently to be killed as 'stalled' with no verdict" \
    $([ "$RC" = 11 ] && [ "$(verdict_of 39 | cut -d' ' -f1)" = WAITING_CHECKS ] && grep -q 'became unwritable' <<<"$OUT" && [ -n "${_w39:-}" ] && [ "${_w39:-0}" -le 30 ] && echo 0 || echo 1)
-# (6) ⛔ `--status` IS "no network, no writes" AND MUST STAY QUIET (review finding, P3 — verified). The
-# cap block runs at module scope, ABOVE the `--status` exit, so a read-only status query used to emit the
-# cap's multi-line `say_err` about a wait it was never going to sit through.
+# (6) ⛔ `--status` IS "no network, no writes" AND MUST STAY QUIET (review finding, P3 — verified).
+# ⛔ AND THE RUNTIME ASSERTION ALONE COULD NOT REDDEN (#3850 review, P3 — verified): the cap block now
+# sits BELOW the `--status` exit, so the arm passes whether or not the block would have printed — it
+# passed on `origin/main` too, where no cap block exists at all. THE ORDER IS THE GUARD, so the order is
+# what is pinned: the mutant this defends is moving the block back ABOVE the exit (which is where it was
+# before `8de98255f`, and what made a read-only query emit the cap's chatter).
+_status_exit_line="$(grep -n '^if \[ "\$STATUS" -eq 1 \]; then$' "$SCRIPT" | head -1 | cut -d: -f1)"
+_cap_block_line="$(grep -n 'say_err "lane-merge: no watchdog-visible heartbeat target' "$SCRIPT" | head -1 | cut -d: -f1)"
+ck "the watchdog cap block sits BELOW the --status exit in the SOURCE (status exit :${_status_exit_line:-?}, cap say_err :${_cap_block_line:-?}) — that order is what keeps a read-only query silent, and moving the block back above the exit reddens this arm" \
+   $([ -n "$_status_exit_line" ] && [ -n "$_cap_block_line" ] && [ "$_cap_block_line" -gt "$_status_exit_line" ] && echo 0 || echo 1)
 OUT="$(PATH="$BIN:$PATH" GH_LOG="$T/gh.log" O="$OT" HOME="$T/home" LANE_MERGE_INTERVAL=5 \
       LANE_MERGE_WAIT=60 LANE_MERGE_POLL=120 LANE_BOUND_IDLE_S=15 \
       bash "$SCRIPT" 99 --status 2>&1)"; RC=$?

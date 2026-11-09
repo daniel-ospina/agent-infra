@@ -516,10 +516,13 @@ IDLE_BOUND_S="${LANE_BOUND_IDLE_S:-2700}"; is_limit "$IDLE_BOUND_S" || IDLE_BOUN
 # LANE_MERGE_INTERVAL cannot make the cap degenerate.
 _hb_margin=$(( INTERVAL * 2 )); [ "$_hb_margin" -ge 10 ] || _hb_margin=10
 # ⛔ THIS IS A RUNTIME LIMIT ON A REAL WAIT, SO `--status` MUST NOT PAY FOR IT (review finding, P3 —
-# verified). `--status` is documented "no network, no writes" and exits at :452, BELOW this block, so on
-# the pre-fix tree a read-only status query emitted the cap's multi-line `say_err` about a wait it was
-# never going to sit through. Nothing here can change a `--status` answer, so it does not run for one.
-if [ "$STATUS" -eq 0 ] && [ -z "$HB_F" ] && [ "$IDLE_BOUND_S" -gt 0 ] && [ "$WAIT_S" -ge "$IDLE_BOUND_S" ]; then
+# verified). `--status` is documented "no network, no writes" and exits ABOVE this block, so a read-only
+# status query never emits the cap's multi-line `say_err` about a wait it was never going to sit
+# through. ⛔ THE ORDER IS THE GUARD, AND IT MUST STAY THIS WAY (`8de98255f` moved this block below the
+# `--status` exit; that MOVE is what fixed the P3 — not the `[ "$STATUS" -eq 0 ]` conjunct, which was
+# dead here because `STATUS=1` always returned above and has been removed). `lane-merge.test.sh` pins
+# the ORDER, so moving the block back above the exit reddens its arm.
+if [ -z "$HB_F" ] && [ "$IDLE_BOUND_S" -gt 0 ] && [ "$WAIT_S" -ge "$IDLE_BOUND_S" ]; then
   # ⛔ THE ALLOWANCE IS AN UPPER BOUND, AND THE OLD FLOOR MADE IT A LOWER ONE (review finding, P3 —
   # verified by arithmetic). `[ "$WAIT_S" -ge "$POLL_S" ] || WAIT_S="$POLL_S"` RAISED the capped wait
   # back to one poll chunk whenever the allowance was SMALLER than a chunk — with
@@ -1509,7 +1512,21 @@ trap 'rm -f "$CHECK_TMP"' EXIT
 # supervision budget — same rule as the watchdog cap, for the same reason.
 _lane_elapsed="$(lane_elapsed_s)"
 _wait_elapsed_note=""
-if [ -n "$_lane_elapsed" ]; then
+# ⛔ `LANE_TIMEOUT=0` IS "THE WALL AXIS IS OFF", NOT A ZERO-SECOND WAITING BUDGET (#3850 review, P2 —
+# verified). `is_limit` accepts `0` as a valid value (by design: it is the harness's OFF switch), and
+# `spawn-gate.sh` documents it as exactly that — *"`0` — the documented "wall axis OFF" value — is a
+# raise in this sense (unbounded) … the OFF switch remains available … through the caller's own seam,
+# `LANE_TIMEOUT=0`"* — while `lane.sh` passes it straight through. Clamped against it, the arithmetic
+# below (`0 - elapsed - margin`) goes negative, floors at 0, and the wait becomes ZERO for ever: the
+# loop hands off `WAITING_CHECKS` on its FIRST poll, so an unbounded lane can never wait a head out.
+# That is the inversion the harness already has a rule about (`spawn-gate.sh`: "a numeric `-le` would
+# read it as the largest possible SHORTENING"), so the clamp applies ONLY to a FINITE wall, and the
+# unbounded case is disclosed rather than left to be inferred. (External convention agrees: systemd's
+# `TimeoutSec=0` disables the timeout, and `systemd#9556` is the bug filed when `0s` was read as a
+# zero-second budget instead — the same misreading fixed here.)
+if [ "$LANE_WALL_S" -eq 0 ]; then
+  say_err "lane-merge: LANE_TIMEOUT=0 is the documented 'wall axis OFF' value (unbounded), not a zero-second budget — the ${WAIT_S}s check wait is NOT clamped, and no wall ceiling is enforced for this lane. Reading it as 0 would hand off WAITING_CHECKS on the first poll for ever (#3850 review, P2)."
+elif [ -n "$_lane_elapsed" ]; then
   _wall_left=$(( LANE_WALL_S - _lane_elapsed - _hb_margin ))
   [ "$_wall_left" -ge 0 ] || _wall_left=0
   if [ "$WAIT_S" -gt "$_wall_left" ]; then
