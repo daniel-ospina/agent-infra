@@ -1518,6 +1518,15 @@ assert_eq "$DP_RC" "0" "§30r a lock whose recorded pid is GONE is reclaimed pro
 assert_contains "$DP_OUT" "is gone (a killed run)" "§30r ...and the reclaim names the killed run"
 if [ -f "$DP_BOX/$LCK_KEY.json" ]; then ok "§30r ...and the pull then did its work"; else bad "§30r ...the pull skipped the record"; fi
 rm -rf "$DP_BOX/.registry-sync.lock"
+# (t) — NOT PINNED HERE, and said so rather than faked. `claim_stale`'s put-back (and `claim_restore`'s)
+# now require the `mv` to have actually PLACED the directory: if the lock name appears between the
+# `[ ! -e "$LOCKDIR" ]` test and the `mv`, `mv` moves the held directory INSIDE the new one and exits 0, so
+# the old code reported "restored, not removed", never set `PENDING_STALE`, and then ACQUIRED beside the
+# live holder it had just disarmed (round 12, reproduced by the reviewer with three actors). Scheduling
+# that window with an `mv` shim inside this harness did not reproduce reliably here (the shim's own mkdir
+# re-created the name on the claim path, which sent the arm down the ceiling branch instead), so this arm
+# is RECORDED AS UNPINNED. The fix's evidence is the reviewer's reproduction, not a suite assertion.
+
 # (s) NO AMBIENT KNOB CAN WEAKEN THE LOCK. `LOCK_STALE_MAX` was `${REGISTRY_SYNC_LOCK_STALE_MAX:-…}` with a
 # floor of 1 s, so an exported value of 1 let the CEILING arm steal a LIVE lock inside its own critical
 # section — the "disable a gate by ambient env" class, and nothing on this box ever read the variable
@@ -1531,6 +1540,14 @@ NE_BOX="$MINI_ROOT/box"; mkdir -p "$NE_BOX"
 mkdir -p "$NE_BOX/.registry-sync.lock"; printf '%s\n' "$$" > "$NE_BOX/.registry-sync.lock/pid"
 NE_OLD="$(python3 -c 'import time;print(time.strftime("%Y%m%d%H%M.%S", time.localtime(time.time()-30)))')"
 touch -t "$NE_OLD" "$NE_BOX/.registry-sync.lock"
+# PREMISE: the holder is LIVE and the lock is past the 2 s grace — so an exported ceiling of 1 s WOULD
+# have reclaimed it, and a fresh lock (age < grace < ceiling) cannot make the arm pass for the wrong reason.
+NE_AGE="$(python3 -c 'import os,sys,time; print(int(time.time()-os.stat(sys.argv[1]).st_mtime))' "$NE_BOX/.registry-sync.lock" 2>/dev/null)"
+if ps -p "$$" >/dev/null 2>&1 && [ -n "$NE_AGE" ] && [ "$NE_AGE" -ge 2 ]; then
+  ok "§30s (premise) the holder is LIVE and the lock is past the grace (${NE_AGE}s), so a 1 s ceiling would have reclaimed it"
+else
+  bad "§30s (premise) the fixture is not the shape the arm needs (pid alive=$? age=${NE_AGE:-none})"
+fi
 NE_OUT="$(REGISTRY_SYNC_LOCK_STALE_MAX=1 REGISTRY_SYNC_LOCK_PID_GRACE=1 bash "$SYNC" pull --repo "$MINI_STORE" --dir "$NE_BOX" --remote origin --timeout 30 2>&1)"; NE_RC=$?
 assert_eq "$NE_RC" "1" "§30s an exported ceiling of 1 s does NOT let the lock be stolen from a LIVE holder"
 if [ -d "$NE_BOX/.registry-sync.lock" ]; then ok "§30s ...the live holder's lock is still there"; else bad "§30s ...the ambient env overrode the ceiling and the lock was STOLEN"; fi

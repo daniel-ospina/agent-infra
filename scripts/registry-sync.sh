@@ -571,7 +571,7 @@ lock_age() { # <path> → SECONDS since its mtime, "" when no `stat`/`date` can 
 claim_stale() { # <judged-pid> <message>
   # a UNIQUE scratch name per attempt: a repeated reclaim inside one loop would otherwise `mv` the
   # second lock INTO the debris the first left behind (mv-into-existing-dir), silently disarming a peer.
-  local judged="$1" gone="$LOCKDIR.stale.$$.$RANDOM" got="" aged=""
+  local judged="$1" gone="$LOCKDIR.stale.$$.$RANDOM" got="" aged="" base=""
   [ -n "$2" ] && warn "$2"
   mv "$LOCKDIR" "$gone" 2>/dev/null || return 1
   [ -f "$gone/pid" ] && got="$(command cat "$gone/pid" 2>/dev/null)"
@@ -593,16 +593,26 @@ claim_stale() { # <judged-pid> <message>
       return 0
     fi
   fi
-  if [ ! -e "$LOCKDIR" ] && mv "$gone" "$LOCKDIR" 2>/dev/null; then
+  # ⛔ `mv`'s rc IS NOT PROOF OF A RESTORE. If the lock name appears BETWEEN this test and the `mv`, the
+  # `mv` moves the held directory INSIDE the new one and exits 0 — a nested "restore" that the old code
+  # reported as "restored, not removed", never set `PENDING_STALE` for, and then ACQUIRED past, entering the
+  # critical section beside the live holder it had just disarmed (measured, 3 actors). The file already
+  # names this hazard for the `.stale.` scratch name (`mv`-into-existing-dir); the put-back had it too.
+  base="$(basename "$gone")"
+  if [ ! -e "$LOCKDIR" ] && mv "$gone" "$LOCKDIR" 2>/dev/null && [ ! -e "$LOCKDIR/$base" ]; then
     warn "  · $LOCKDIR was re-created while being reclaimed — restored, not removed."
   else
-    # ⛔ THE PUT-BACK CAN LOSE THE NAME TO A THIRD ACQUIRER, and abandoning the moved directory as
-    # "harmless debris" falsifies this block's own claim: the moved lock may be a LIVE holder's, and
-    # freeing the name lets another run into the critical section beside it (measured, all four actors
-    # real). So the restore is REMEMBERED and retried on every later pass of `reg_lock`'s bounded loop,
-    # and this run refuses to acquire while one is outstanding.
-    PENDING_STALE="$gone"
-    warn "  · $LOCKDIR was re-created while being reclaimed — $gone is HELD for restore (this run will not enter)."
+    # ⛔ THE PUT-BACK CAN LOSE THE NAME TO A THIRD ACQUIRER (or nest inside it), and abandoning the moved
+    # directory as "harmless debris" falsifies this block's own claim: the moved lock may be a LIVE
+    # holder's, and freeing the name lets another run into the critical section beside it (measured, all
+    # four actors real). So the restore is REMEMBERED and retried on every later pass of `reg_lock`'s
+    # bounded loop, and this run refuses to acquire while one is outstanding.
+    if [ -e "$LOCKDIR/$base" ]; then
+      PENDING_STALE="$LOCKDIR/$base"
+    else
+      PENDING_STALE="$gone"
+    fi
+    warn "  · $LOCKDIR was re-created while being reclaimed — $PENDING_STALE is HELD for restore (this run will not enter)."
   fi
   return 1
 }
@@ -611,10 +621,14 @@ claim_stale() { # <judged-pid> <message>
 claim_restore() {
   [ -n "${PENDING_STALE:-}" ] || return 0
   [ -e "$PENDING_STALE" ] || { PENDING_STALE=""; return 0; }
-  if [ ! -e "$LOCKDIR" ] && mv "$PENDING_STALE" "$LOCKDIR" 2>/dev/null; then
+  local base
+  base="$(basename "$PENDING_STALE")"
+  # the same nesting trap as `claim_stale`: only an `mv` that actually PLACED the directory counts.
+  if [ ! -e "$LOCKDIR" ] && mv "$PENDING_STALE" "$LOCKDIR" 2>/dev/null && [ ! -e "$LOCKDIR/$base" ]; then
     PENDING_STALE=""
     return 0
   fi
+  if [ -e "$LOCKDIR/$base" ]; then PENDING_STALE="$LOCKDIR/$base"; fi
   return 1
 }
 
