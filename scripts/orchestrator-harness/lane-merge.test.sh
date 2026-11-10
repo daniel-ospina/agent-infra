@@ -592,7 +592,12 @@ ck "a live merge lock is adopted: the record carries the LIVE pid and the RECORD
 _mw_poll="$(sed -n 's/.*LANE_MERGE_POLL:-*\([0-9]*\)}.*/\1/p' "$SCRIPT" | head -1)"
 _mw_wait="$(sed -n 's/.*LANE_MERGE_WAIT:-*\([0-9]*\)}.*/\1/p' "$SCRIPT" | head -1)"
 _mw_res="$(sed -n 's/.*LANE_MERGE_IMPL_RESERVE:-*\([0-9]*\)}.*/\1/p' "$SCRIPT" | head -1)"
-_mw_wall="$(sed -n 's/.*LANE_WALL_S="${LANE_TIMEOUT:-${LANE_BACKSTOP_S:-\([0-9][0-9]*\)}}".*/\1/p' "$SCRIPT" | head -1)"
+# ⛔ THE EXPRESSION TRACKS THE SCRIPT, INCLUDING THE OPERAND NAME (verified the hard way): when the backstop
+# normalisation moved into a local (`LANE_BACKSTOP_S_N`) to stop `lane-merge.sh` becoming a second OWNER of a
+# registered term, this pattern silently stopped matching — `MAXW` went EMPTY and 12 arms downstream of the
+# `.watch` seed regressed while every static gate (bash -n, diff --check, the registry scan) stayed green. A
+# text extractor is a CONTRACT with the shipped text; when that text moves, the extractor reds or it lies.
+_mw_wall="$(sed -n 's/.*LANE_WALL_S="${LANE_TIMEOUT:-${LANE_BACKSTOP_S_N:-\([0-9][0-9]*\)}}".*/\1/p' "$SCRIPT" | head -1)"
 MAXW=""
 if [ -n "$_mw_poll" ] && [ -n "$_mw_wait" ] && [ -n "$_mw_res" ] && [ -n "$_mw_wall" ] \
    && [ "$_mw_poll" -ge 1 ] && [ "$(( _mw_wall - _mw_wait - _mw_res ))" -gt 0 ]; then
@@ -1335,7 +1340,7 @@ _ps="$(sed -n 's/.*LANE_MERGE_POLL:-*\([0-9]*\)}.*/\1/p' "$SCRIPT" | head -1)"
 # literal — so the check passed on a wider margin and would ALSO have passed if that default drifted,
 # which is exactly the property it exists to protect. Now `_lt` is lane-merge.sh's OWN resolved
 # default, and a second assertion requires the two files to name the SAME bound.
-_lt="$(sed -n 's/.*LANE_WALL_S="${LANE_TIMEOUT:-${LANE_BACKSTOP_S:-\([0-9][0-9]*\)}}".*/\1/p' "$SCRIPT" | head -1)"
+_lt="$(sed -n 's/.*LANE_WALL_S="${LANE_TIMEOUT:-${LANE_BACKSTOP_S_N:-\([0-9][0-9]*\)}}".*/\1/p' "$SCRIPT" | head -1)"
 [ -n "$_lt" ] || _lt="$(grep -o 'LANE_TIMEOUT:-[0-9]*' "$SCRIPT" | head -1 | tr -dc '0-9')"
 _LANE_SIDE="$(grep -o 'LANE_TIMEOUT:-[0-9]*' "$HERE/lane.sh" | head -1 | tr -dc '0-9')"
 [ -n "$_LANE_SIDE" ] || _LANE_SIDE="$(grep -o 'LANE_BACKSTOP_S:-[0-9]*' "$HERE/spawn-gate.sh" | head -1 | tr -dc '0-9')"
@@ -1588,7 +1593,7 @@ OUT="$(REPO_PATH="${REPO_PATH:-$RUN_REPO}" PATH="$BIN:$PATH" GH_LOG="$T/gh.log" 
       LANE_MERGE_MAX_WATCH=15 LANE_BOUND_WALL_S=3600 LANE_MERGE_WAIT=5400 LANE_MERGE_ELAPSED_S=3590 \
       bash "$SCRIPT" 40 --repo o/r --pr-tsv "$T/pr4.tsv" --checks-tsv "$T/checks-inflight.tsv" 2>&1)"; RC=$?
 ck "the LANE_MERGE_MAX_WATCH warning names the lane's ARMED wall and its source (LANE_BOUND_WALL_S), not a LANE_TIMEOUT this run never set — an operator line must never send you to the wrong knob" \
-   $(grep -q 'exceeds what the lane.s 3600s wall clock (from LANE_BOUND_WALL_S' <<<"$OUT" && ! grep -q 'exceeds what LANE_TIMEOUT=' <<<"$OUT" && echo 0 || echo 1)
+   $(grep -q 'but the lane.s 3600s wall clock (from LANE_BOUND_WALL_S' <<<"$OUT" && ! grep -q 'exceeds what LANE_TIMEOUT=' <<<"$OUT" && echo 0 || echo 1)
 # …and with no ceiling reducer in play the source is still named correctly, so the fix cannot decay into
 # "always says LANE_BOUND_WALL_S".
 new_o "$T/pr4.tsv"
@@ -1596,7 +1601,7 @@ OUT="$(REPO_PATH="${REPO_PATH:-$RUN_REPO}" PATH="$BIN:$PATH" GH_LOG="$T/gh.log" 
       LANE_MERGE_MAX_WATCH=15 LANE_TIMEOUT=3600 LANE_BACKSTOP_S= LANE_BOUND_WALL_S= LANE_MERGE_WAIT=5400 LANE_MERGE_ELAPSED_S=3590 \
       bash "$SCRIPT" 41 --repo o/r --pr-tsv "$T/pr4.tsv" --checks-tsv "$T/checks-inflight.tsv" 2>&1)"; RC=$?
 ck "with LANE_TIMEOUT=3600 (and no LANE_BOUND_WALL_S) the same warning attributes it to LANE_TIMEOUT — the source is resolved, not hard-coded the other way" \
-   $(grep -q 'exceeds what the lane.s 3600s wall clock (from LANE_TIMEOUT)' <<<"$OUT" && echo 0 || echo 1)
+   $(grep -q 'but the lane.s 3600s wall clock (from LANE_TIMEOUT)' <<<"$OUT" && echo 0 || echo 1)
 # ⛔ THE SAME OPERAND IN ITS LEADING-ZERO FORM MUST BE HONOURED IDENTICALLY (P3, MEASURED). `lane_wall_bound`
 # ACCEPTS `03630` — its test is `''|*[!0-9]*` and POSIX `test` reads the operand as DECIMAL 3630 — so the lane
 # IS armed at 3630 s. This file's `is_limit` deliberately rejects the `0*` form, so the clamp was SKIPPED and
@@ -1615,6 +1620,61 @@ OUT="$(PATH="$BIN:$PATH" GH_LOG="$T/gh.log" O="$OT" HOME="$T/home" REPO_PATH="${
 _cap42="$(sed -n 's/.*CAPPED at \([0-9][0-9]*\)s (this lane had already spent.*/\1/p' <<<"$OUT" | head -1)"
 ck "LANE_BOUND_WALL_S=03630 (leading zero — the form lane_wall_bound ACCEPTS) arms the lane at 3630 s and the wait is clamped to it: pre-fix there is NO wall CAPPED line at all, and a fix that kept the octal reading clamps to 1944 s and prints 0 s" \
    $([ "$RC" = 11 ] && [ -n "${_cap42:-}" ] && [ $(( ${_cap42:-0} + 3610 )) = 3630 ] && grep -q 'the 3630s wall this lane is armed with (from LANE_BOUND_WALL_S' <<<"$OUT" && echo 0 || echo 1)
+# ⛔ AND THE OTHER TWO DIRECTIONS, WITHOUT WHICH THE CLAMP PINS ONLY ONE PROPERTY (review, P3 — verified by
+# mutation: making the block UNCONDITIONAL — dropping the strict `<` — kept every check green, because no other
+# arm fed it a reducer LARGER than the caller bound. That mutation lets the wait be clamped against a clock
+# larger than the lane has: the unlabelled kill from the other side).
+# A reducer LARGER than the caller bound must not be applied: the armed wall stays the caller's 7200.
+new_o "$T/pr4.tsv"
+WAIT_S=60 POLL_S=5 LANE_BOUND_WALL_S=99999 LANE_MERGE_ELAPSED_S=7180 run 71 --repo o/r --pr-tsv "$T/pr4.tsv" --checks-tsv "$T/checks-inflight.tsv"
+ck "a LANE_BOUND_WALL_S LARGER than the caller bound (99999 > 7200) is NOT applied — the clamp still sizes itself off 7200, so 7180 spent leaves 10 s" \
+   $([ "$RC" = 11 ] && grep -q 'CAPPED at 10s' <<<"$OUT" && grep -q 'of its 7200s clock' <<<"$OUT" && echo 0 || echo 1)
+# A reducer of 0 is "wall axis OFF", which `lane_wall_bound` refuses to reduce to — so it must not be applied either.
+new_o "$T/pr4.tsv"
+WAIT_S=60 POLL_S=5 LANE_BOUND_WALL_S=0 LANE_MERGE_ELAPSED_S=7180 run 72 --repo o/r --pr-tsv "$T/pr4.tsv" --checks-tsv "$T/checks-inflight.tsv"
+ck "LANE_BOUND_WALL_S=0 is 'wall axis OFF', not a zero-second clock — it is NOT applied, so the caller's 7200 s clock still caps the wait at 10 s (a zero clock would take the unbounded branch)" \
+   $([ "$RC" = 11 ] && grep -q 'CAPPED at 10s' <<<"$OUT" && grep -q 'of its 7200s clock' <<<"$OUT" && echo 0 || echo 1)
+# ⛔ THE CEILING REDUCER MUST NOT RESIZE THE *DESIGN* ALLOWANCE (review, P2 — verified by mutation: pointing
+# `MAX_WATCH_FIT` back at the ARMED `LANE_WALL_S` reddened NOTHING, 164/164 still green, so the fix was
+# unguarded and only prose held it). That mutant is a live false block, not a theory: with a 3600 s ceiling and
+# NO resolvable lane clock — the documented controller-resume path — the design allowance falls 7 chunks → 1,
+# i.e. ONE 120 s chunk for a chain whose median reviewer run is 316 s, and `--watch` then declares
+# BLOCKED_ATTEMPTS over work that is still legitimately running. The observation point is the override
+# warning, which prints the design fit whenever an explicit LANE_MERGE_MAX_WATCH exceeds it and does so BEFORE
+# any wait.
+# ⛔ THE OPERANDS MUST BE THE SHIPPED ONES (verified by mutation — the first draft set WAIT_S=60 POLL_S=5,
+# which makes `_fit_poll` 5 and the fit (7200-60-900)/5 = 1248, so MAX_WATCH=50 never EXCEEDED it, the warning
+# never printed, and the arm reddened the FIXED tree while staying identical on the mutant: vacuous AND a false
+# red). The fit is only the shipped 7 at WAIT_S_DESIGN=5400 with POLL_S=120. The positive pattern is anchored on
+# the message's own em-dash so `— 7 chunk(s) fit` cannot match `— 17 chunk(s) fit`.
+new_o "$T/pr4.tsv"
+WAIT_S=5400 POLL_S=120 LANE_BOUND_WALL_S=3600 LANE_MERGE_ELAPSED_S=7180 LANE_MERGE_MAX_WATCH=50 run 73 --repo o/r --pr-tsv "$T/pr4.tsv" --checks-tsv "$T/checks-inflight.tsv"
+ck "a CEILING REDUCER does not shrink the DESIGN supervision allowance: with LANE_BOUND_WALL_S=3600 the fit is still the shipped 7 chunks off the 7200 s caller bound (computing it from the armed 3600 s would floor to 1, which is one 120 s chunk for a chain whose median reviewer run is 316 s)" \
+   $(grep -q "the 7200s DESIGN allowance" <<<"$OUT" && grep -q -- '— 7 chunk(s) fit' <<<"$OUT" && ! grep -q -- '— 1 chunk(s) fit' <<<"$OUT" && echo 0 || echo 1)
+# ⛔ THE BACKSTOP'S LEADING-ZERO FORM IS NORMALISED, AND NOTHING ELSE PINNED IT (review, P3 — verified by
+# mutation: deleting the normalisation left the suite red the SAME way, delta = zero arms).
+# `lane_wall_bound` ACCEPTS `03600`, and POSIX `test` reads it as DECIMAL 3600, so the lane IS armed at
+# 3600 s — but bash's ARITHMETIC reads a leading-zero integer as OCTAL (`$(( 03600 ))` = 1920), so a raw
+# value reaching `$(( LANE_BACKSTOP_S_N - _hb_margin ))` would size supervision off 1920 s.
+# This arm is the PASSING sibling above (`.watch` seeded 28, `LANE_TIMEOUT=0`, `--watch`) with ONE change:
+# the knob is written in the leading-zero form. Its expectation is the sibling's own numbers, so the arm
+# discriminates all three wrong shapes at once — a skipped clamp (allowance falls to the octal 15, so the
+# 28th chunk is refused and part 1 reds), an unnormalised fall-through to the 7200 s default (allowance 59,
+# so the 29th chunk is admitted and part 2 reds), and the correct 29 (both parts pass).
+new_o "$T/pr-fit.tsv"
+printf 'open||fithead|clean\n' > "$T/pr-fit.tsv"
+printf '28\n' > "$OT/state/lanemerge-74.watch"
+OUT="$(REPO_PATH="${REPO_PATH:-$RUN_REPO}" PATH="$BIN:$PATH" GH_LOG=/dev/null O="$OT" HOME="$T/home" \
+      LANE_TIMEOUT=0 LANE_BACKSTOP_S=03600 LANE_MERGE_WAIT=0 LANE_MERGE_POLL=0 LANE_BOUND_IDLE_S=0 \
+      bash "$SCRIPT" 74 --watch --repo o/r --pr-tsv "$T/pr-fit.tsv" 2>&1)"; RC=$?
+ck "LANE_BACKSTOP_S=03600 (leading zero — the form lane_wall_bound ACCEPTS) is normalised before it reaches ARITHMETIC: supervision is still sized off 3600 s, so the 28th chunk is ADMITTED (an octal 1920 s reading would cap at 15 and refuse it)" \
+   $([ "$RC" = 11 ] && [ "$(verdict_of 74 | cut -d' ' -f1)" = WAITING_CHAIN_ABSENT ] && echo 0 || echo 1)
+printf '29\n' > "$OT/state/lanemerge-74.watch"
+OUT="$(REPO_PATH="${REPO_PATH:-$RUN_REPO}" PATH="$BIN:$PATH" GH_LOG=/dev/null O="$OT" HOME="$T/home" \
+      LANE_TIMEOUT=0 LANE_BACKSTOP_S=03600 LANE_MERGE_WAIT=0 LANE_MERGE_POLL=0 LANE_BOUND_IDLE_S=0 \
+      bash "$SCRIPT" 74 --watch --repo o/r --pr-tsv "$T/pr-fit.tsv" 2>&1)"; RC=$?
+ck "…and the NEXT one is refused at the SAME 29-chunk bound (counter 29 → chunk 30), so the leading-zero backstop is normalised rather than read as octal 1920 s (which would refuse chunk 16) or left at the 7200 s default (which would admit chunk 30)" \
+   $([ "$RC" = 13 ] && [ "$(verdict_of 74 | cut -d' ' -f1)" = BLOCKED_ATTEMPTS ] && grep -q '29 --watch chunks spent' <<<"$OUT" && echo 0 || echo 1)
 # ⛔ THE WALL-OFF DISCLOSURE MUST NAME THE KNOB THAT IS ACTUALLY OFF (review, P3 — MEASURED, and this is the
 # arm that reds on the pre-fix text). `LANE_BACKSTOP_S=0` with `LANE_TIMEOUT` unset resolves `LANE_WALL_S` to 0
 # FROM THE BACKSTOP — a real configuration, because `lane.sh:882` hands that value to `lane_wall_bound`, whose
