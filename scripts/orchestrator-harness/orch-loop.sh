@@ -8221,16 +8221,6 @@ PY
     echo "[disk] CANNOT-VERIFY (agent-infra#2159): no spawn-gate.sh found (\$O and beside the loop) — the [cap] line cannot show free disk or one lane's cost. The ENFORCING disk gate lives in spawn-gate.sh/wt-lifecycle.sh, so lanes are still refused on a full box; this is a reporting gap. Re-seed \$O." >> "$LOG"
   fi
   # [capdisk:end]
-  # `@${OR}` is part of this line on purpose: the repo the count came from is the datum whose absence
-  # let a wrong-surface read run for hours. bare `$OR` is avoided for the same reason `${OR:-}` is used
-  # below — selftest.sh extracts and drives parts of this file in a subshell with no OR.
-  # ⛔ `lanes=<live>/<total>` and `zombie=<n>` (#2163). The TOTAL is the field that makes a leak
-  # visible: `lanes=14/25` still reads "full" while `lanes=14/76` says the box is carrying 62 finished
-  # residents. `max_lanes=` keeps the ceiling the gate applies, so no reader has to infer it.
-  echo "[cap] load=$L/$MAX_LOAD lanes=${LANES_DISPLAY:-?}/$LANES_TOTAL max_lanes=$MAX_LANES zombie=$ZOMBIES lanes_src=${LANES_SOURCE:-unset} mem_avail=${MEMAVAIL_MB}M/${MIN_MEM_FREE_MB}M swap_free=${SWFREE}M/${MIN_SWAP_FREE}M disk_free=${DISK_FREE_MB:-?}M/${DISK_NEED_MB:-?}M disk_headroom=${DISK_HEADROOM:-?} disk_src=${DISK_SRC:-unset} open=${OPEN_N:-?}@${OR:-?} unowned=${UPN:-?} last_land=${LAND_AGE:-?}m review_slots=${MR:-?} fix_slots=${MF:-?}" >> "$LOG"
-  # Four gates. swap_total=0 => swap uninitialised (fresh boot), NOT pressure — allow.
-  # Name the binding gate: an earlier version logged "skipped (load=…)" while load was never
-  # consulted, so a lanes-bound or swap-bound stall looked like a load stall.
   # ── THE CI QUEUE, MEASURED ONCE PER CYCLE (see ci-queue.sh's header for the arithmetic) ──────
   # Read in THIS shell, never in a `$( )`: a command substitution would end the subshell with the
   # record inside it, and every arm below (and the deferral line) would read an empty one.
@@ -8249,6 +8239,48 @@ PY
   else
     echo "[ci-queue] ci-queue.sh is NOT available (looked in \$O and the script directory) — CI capacity is UNMEASURED this cycle, so this arm is INERT; the issue path still has to clear every other gate" >> "$LOG"
   fi
+  # [capci:begin] (extracted and DRIVEN by ci-queue.test.sh (c0)-(c7) — keep the markers)
+  # ⛔ WHY THE QUEUE RIDES THIS LINE AT ALL (agent-infra#2296 item 2, and the reason it is here rather
+  # than a second printer elsewhere). The `[ci-queue]` line above carries the whole DECISION — verdict,
+  # runners, ceiling, state, age. What it could not do is TRAVEL: `[cap]` is the line that gets pasted
+  # into a report, an incident note or `docs/ops/fleet-harness-baseline.md` §4's health check, and a
+  # `[cap]` lifted out of its neighbourhood read `load=5/250 lanes=3/25` with NOTHING about a 140-deep
+  # queue, so the box advertised free capacity while the constraint that bound it was invisible — the
+  # measured 2026-10-22 state, where nothing could reach a green tree.
+  # ⛔ THE READING MOVES, THE VERDICT DOES NOT. `ci=` renders the SAME record the gate decided on (it is
+  # assigned from CIQ_*, never re-read), and the verdict/ceiling stay on `[ci-queue]` and on the
+  # `[gate] gates:` vector: two renderings of ONE decision is how a line and the gate it quotes start
+  # disagreeing, which is the class this harness has already fixed twice.
+  # ⛔ THREE STATES, NAMED, NEVER A FABRICATED `0/0` — an unread queue and an empty queue must not
+  # render identically (the false-green class this loop refuses everywhere). `ci_src=` carries WHY, and
+  # a CACHED reading is labelled with its age: the cache is the module's one fail-open, and an age-less
+  # number would present a 40-minute-old reading as current.
+  CI_DISPLAY="UNMEASURED"; CI_SRC="absent"
+  if [ "${CIQ:-0}" = "1" ]; then
+    # `ciq_is_count` is guaranteed here by the ten-name source guard above, and "a number that does not
+    # fit is not a reading" is the module's own rule — so a non-comparable count is UNREADABLE, the
+    # same state as an unreadable queue, never `0/0`.
+    if [ "${CIQ_STATE:-unknown}" = unknown ] \
+       || ! ciq_is_count "${CIQ_QUEUED:-}" || ! ciq_is_count "${CIQ_RUNNING:-}"; then
+      CI_DISPLAY="UNREADABLE"; CI_SRC="unknown"
+    else
+      CI_DISPLAY="${CIQ_QUEUED}/${CIQ_RUNNING}"
+      if [ "${CIQ_STATE}" = cache ]; then CI_SRC="cache(${CIQ_AGE:-?}s)"; else CI_SRC="fresh"; fi
+    fi
+  fi
+  # [capci:end]
+  # `@${OR}` is part of this line on purpose: the repo the count came from is the datum whose absence
+  # let a wrong-surface read run for hours. bare `$OR` is avoided for the same reason `${OR:-}` is used
+  # below — selftest.sh extracts and drives parts of this file in a subshell with no OR.
+  # ⛔ `lanes=<live>/<total>` and `zombie=<n>` (#2163). The TOTAL is the field that makes a leak
+  # visible: `lanes=14/25` still reads "full" while `lanes=14/76` says the box is carrying 62 finished
+  # residents. `max_lanes=` keeps the ceiling the gate applies, so no reader has to infer it.
+  # ⛔ `ci=`/`ci_src=` are the repo's CI queue (see the [capci] block above): the ONE capacity reading
+  # this line was missing, and the only one that is not a property of the box itself.
+  echo "[cap] load=$L/$MAX_LOAD lanes=${LANES_DISPLAY:-?}/$LANES_TOTAL max_lanes=$MAX_LANES zombie=$ZOMBIES lanes_src=${LANES_SOURCE:-unset} mem_avail=${MEMAVAIL_MB}M/${MIN_MEM_FREE_MB}M swap_free=${SWFREE}M/${MIN_SWAP_FREE}M disk_free=${DISK_FREE_MB:-?}M/${DISK_NEED_MB:-?}M disk_headroom=${DISK_HEADROOM:-?} disk_src=${DISK_SRC:-unset} open=${OPEN_N:-?}@${OR:-?} ci=${CI_DISPLAY:-UNMEASURED} ci_src=${CI_SRC:-absent} unowned=${UPN:-?} last_land=${LAND_AGE:-?}m review_slots=${MR:-?} fix_slots=${MF:-?}" >> "$LOG"
+  # Four gates. swap_total=0 => swap uninitialised (fresh boot), NOT pressure — allow.
+  # Name the binding gate: an earlier version logged "skipped (load=…)" while load was never
+  # consulted, so a lanes-bound or swap-bound stall looked like a load stall.
   # ── MERGE PRIORITY IS A PRIORITY HERE — AND THE BARRIER SURVIVES AS LEVELS 2-4 (owner ruling
   # 2026-11-04; the "barrier removed" reading of this heading was RETRACTED 2026-11-06) ───────────
   # ⛔ THIS ONE LINE USED TO CLOSE THE ISSUE PATH. `GATE_WHY="$(mp_reason …)"` set the single string

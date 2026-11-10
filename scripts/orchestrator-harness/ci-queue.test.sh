@@ -1637,6 +1637,59 @@ else
 fi
 
 printf '\n──────────────────────────────────────────────────────────────────────\n'
+printf '\n── (c) THE [cap] LINE CARRIES THE QUEUE (agent-infra#2296 item 2) ─────
+'
+# ⛔ WHY THIS ARM EXISTS. `[cap]` is the line that TRAVELS — pasted into a report, an incident note, or
+# `docs/ops/fleet-harness-baseline.md` §4's health check — and a `[cap]` lifted out of its neighbourhood
+# read `load=5/250 lanes=3/25` with NOTHING about a 140-deep CI queue, so the box advertised free
+# capacity while the constraint that bound it was invisible. The block is EXTRACTED from orch-loop.sh
+# and driven in every state, so dropping the field, or moving the read back BELOW the line it feeds,
+# goes red instead of silently printing `UNMEASURED` for ever.
+CAPCI_RAW="$T/capci.raw"
+sed -n '/# \[capci:begin\]/,/# \[capci:end\]/p' "$LOOP" | sed '1d;$d' > "$CAPCI_RAW"
+ck "(c0) the [cap] ci= derivation was EXTRACTED from orch-loop.sh (not restated here)" \
+   "$( { [ -s "$CAPCI_RAW" ] && grep -qF 'CI_DISPLAY' "$CAPCI_RAW" && grep -qF 'ciq_is_count' "$CAPCI_RAW"; } ; echo $? )"
+capci() { # <CIQ> <state> <queued> <running> <age> -> "<display>|<src>"
+  ( CIQ="$1"; CIQ_STATE="$2"; CIQ_QUEUED="$3"; CIQ_RUNNING="$4"; CIQ_AGE="$5"
+    # shellcheck source=/dev/null
+    . "$CAPCI_RAW"
+    printf '%s|%s' "$CI_DISPLAY" "$CI_SRC" ) 2>/dev/null
+}
+ck "(c1) a FRESH reading renders ci=<queued>/<in_progress> ('$(capci 1 fresh 26 3 0)')" \
+   "$( [ "$(capci 1 fresh 26 3 0)" = '26/3|fresh' ]; echo $? )"
+ck "(c2) a CACHED reading is LABELLED WITH ITS AGE ('$(capci 1 cache 26 3 2410)') — a 40-min-old number is not current" \
+   "$( [ "$(capci 1 cache 26 3 2410)" = '26/3|cache(2410s)' ]; echo $? )"
+ck "(c3) an UNREADABLE queue says UNREADABLE ('$(capci 1 unknown '' '' '' )') — NOT 0/0, which an EMPTY queue also renders" \
+   "$( [ "$(capci 1 unknown '' '' '')" = 'UNREADABLE|unknown' ]; echo $? )"
+# ⛔ `fresh` WITH A NON-COMPARABLE COUNT IS NOT A READING. The module's own rule ("a number that does
+# not fit is not a reading") must not be relaxed one field over, or `ci=/3` reaches a report as a
+# measurement nobody made.
+ck "(c3b) a count that is not a number is UNREADABLE too, not a fabricated half-pair ('$(capci 1 fresh '' 3 0)')" \
+   "$( [ "$(capci 1 fresh '' 3 0)" = 'UNREADABLE|unknown' ]; echo $? )"
+ck "(c4) with the module ABSENT the field says UNMEASURED/absent ('$(capci 0 fresh 26 3 0)') — never a zero" \
+   "$( [ "$(capci 0 fresh 26 3 0)" = 'UNMEASURED|absent' ]; echo $? )"
+# ⛔ THE FIELD IS ONLY HONEST IF THE READ HAPPENS FIRST. `ci=` renders the record in CIQ_*, so a read
+# moved BELOW the `[cap]` echo prints UNMEASURED on EVERY cycle while (c1)-(c4) above stay green — a
+# false PASS of exactly the class this suite exists to refuse. The ORDER is therefore asserted against
+# the shipped file, by line number, and the predicate is proved DISCRIMINATING by a fixture pair.
+capline_ln() { grep -nF 'echo "[cap] load=' "$1" | head -1 | cut -d: -f1; }
+ciqread_ln() { grep -nF 'THE CI QUEUE, MEASURED ONCE PER CYCLE' "$1" | head -1 | cut -d: -f1; }
+capci_ln()  { grep -nF '# [capci:begin]' "$1" | head -1 | cut -d: -f1; }
+order_ok() { # <file> -> 0 iff read < derivation < line
+  local c i d
+  c="$(capline_ln "$1")"; i="$(ciqread_ln "$1")"; d="$(capci_ln "$1")"
+  [ -n "$c" ] && [ -n "$i" ] && [ -n "$d" ] && [ "$i" -lt "$d" ] && [ "$d" -lt "$c" ]
+}
+ck "(c5) the CI-queue READ precedes the derivation, which precedes the [cap] line it feeds (read=$(ciqread_ln "$LOOP") deriv=$(capci_ln "$LOOP") cap=$(capline_ln "$LOOP"))" \
+   "$( order_ok "$LOOP"; echo $? )"
+printf '%s\n' 'THE CI QUEUE, MEASURED ONCE PER CYCLE' '# [capci:begin]' 'echo "[cap] load=1/1' > "$T/order-good.sh"
+printf '%s\n' 'echo "[cap] load=1/1' '# [capci:begin]' 'THE CI QUEUE, MEASURED ONCE PER CYCLE' > "$T/order-bad.sh"
+ck "(c6) MUTANT — the same predicate REJECTS the inverted order, so (c5) is not always-green" \
+   "$( { order_ok "$T/order-good.sh" && ! order_ok "$T/order-bad.sh"; } ; echo $? )"
+ck "(c7) the shipped [cap] line actually carries ci= and ci_src= after the disk readings" \
+   "$( { grep -qF 'disk_src=${DISK_SRC:-unset} open=${OPEN_N:-?}@${OR:-?} ci=${CI_DISPLAY' "$LOOP" \
+        && grep -qF 'ci_src=${CI_SRC:-absent} unowned=' "$LOOP"; } ; echo $? )"
+
 printf 'ci-queue.test.sh: %d passed, %d failed\n' "$PASS" "$FAIL"
 if [ "$FAIL" -gt 0 ]; then printf '%s' "$FAILED_LINES" | sed 's/^/  - /'; exit 1; fi
 printf 'CLEAN\n'
