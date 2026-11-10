@@ -18,7 +18,10 @@ another module's answer**, and where a module cannot answer the tool's own signa
     pr.queue              per-PR actions (15 answers), mapped to the issue's 6 classes as a VIEW
     claim.check           the ref-claim registry: abstention vocabulary ONLY, never freedom
     lane.dispatch         launch one lane; typed refusals, never stderr prose
-    box.exec              {rc, stdout, timed_out, truncated} over `cmux vm exec`, argv-only, allowlisted
+    box.exec              {rc, stdout, stderr, timed_out, truncated, outcome} over `cmux vm exec`,
+                          argv-only, allowlisted — and a LINK REFUSAL is `CHANNEL-REFUSED` +
+                          `channel_refused` (`link-refused` / `no-known-daemon` /
+                          `daemon-binary-absent`), never the command's verdict (#2345)
     pr.review_record      current | stale | absent + the head the record is bound to
     pr.closure_audit      what a merge ACTUALLY closed, vs what it merely mentioned
     fleet.reminder        set/list/cancel a durable reminder (file-backed queue + timer lifecycle)
@@ -307,7 +310,15 @@ TOOLS: List[Dict[str, Any]] = [
             "A command that is not on the allowlist is a TYPED REFUSAL (`command-not-allowlisted`), never "
             "a pass-through. ⛔ `timed_out` / `truncated` are CHANNEL facts: they are never evidence about "
             "the box, and a timeout is never reported as `box-unreachable` (a disk-full guest answers "
-            "`running` while every exec times out). MUTATING."
+            "`running` while every exec times out). "
+            # ⛔ THE SHAPE A CALLER ACTUALLY READS. The inventory rows carry this, but the whole point of
+            # #2345 is that a caller keying on `rc` reads a dead link as success — so the description the
+            # caller is handed must say to branch on `outcome`, or the surface documents the defect.
+            "⛔ A LINK REFUSAL is a CHANNEL fact too: `outcome: CHANNEL-REFUSED` + `channel_refused` "
+            "(`link-refused` / `no-known-daemon` / `daemon-binary-absent`, three different remedies — the "
+            "last is on the CALLING box), plus `fail_open` when the transport exited 0 while refusing. "
+            "Branch on `outcome` where it is present, read `refused` / `unmeasured` first (those return "
+            "with NO outcome), and NEVER on `rc` alone. MUTATING."
         ),
         "inputSchema": {
             "type": "object",
@@ -2243,6 +2254,160 @@ def _harden_argv(argv: List[str]) -> List[str]:
     out = head + [verb] + rest[1:]
     return out
 
+
+# ⛔ A LINK REFUSAL IS A CHANNEL FACT, NOT THE COMMAND'S OWN rc (agent-infra#2345).
+# MEASURED 2026-11-08 from `pi-cell-5`: `cmux vm ls --json` printed `"reachable":true` for all four
+# peers while `cmux vm exec <peer> -- hostname` failed against all four (`rc=3`, stderr
+# `cmux: link to '<peer>' exited; see ~/.cmux/peer-links/<peer>.log`). This surface then reported
+# `outcome: NONZERO, rc: 3`, which reads as "the peer RAN the command and it failed" and sends the
+# operator to the command — or to the peer's state — when the peer never ran anything at all.
+# The classes below name the remedy from the stderr line this surface already holds, so no caller has to
+# re-parse prose or open a log behind a path. ⛔ THE CLASSES ARE NOT SYMMETRIC: `daemon-binary-absent` has
+# ONE measured cause and one remedy (the calling box), while `link-refused` and `no-known-daemon` each
+# cover TWO measured causes that print the IDENTICAL line — this box's pairing/route refused a healthy
+# peer (`pi-cell-4`, 2026-11-03: the vendor's `vm exec` never spends the `--carrier` mode that DOES
+# connect), and a peer with nothing accepting on its link port (`:1337` closed on cell-1/cell-4, `ss`
+# showing no listener). No key in this payload can separate those two, which is why each detail names
+# both and says to probe the peer's `:1337` from the CALLING box — naming one cause would send half the
+# callers to a remedy that cannot help them, which is the failure #2345 exists to remove.
+#   link-refused          `cmux: link to '<peer>' exited` — the two causes above.
+#   no-known-daemon       the same refusal in the client's own words (also what `~/.cmux/peer-links/
+#                         <peer>.log` holds): an unpaired route OR a peer whose daemon is gone.
+#   daemon-binary-absent  THIS CALLING box has no usable `cmux-tui` (#3195), so EVERY peer fails at
+#                         once and the remedy is on this box — not on the peer, and not in the command.
+# ⛔ rc=0 IS STILL A REFUSAL. A refusal reported with exit status 0 was measured on `pi-cell-3`
+# (2026-10-23, on the issue): a caller that checks only `rc` read a dead link as success. The class is
+# reported whatever the rc. ⛔ RESIDUALS, NOT COVERED — both are TRUNCATION, and both are disclosed rather
+# than claimed closed: (a) `_drain_into` keeps each stream's HEAD, so a refusal printed after `cap` bytes is
+# dropped; (b) `cap` is the CALLER's `max_output`, so too small a cap cuts the line before the pattern can
+# match. ⛔ (b) IS BOUNDED BY THE PATTERN'S OWN MATCH LENGTH, NOT BY THE LINE'S — and for `link-refused`
+# that length GROWS WITH THE PEER NAME (23 + len(peer)): 24 B floor, 32 B for the measured `pi-cell-4`,
+# 39 B for `early-ivory-moth`, 40 B for `smart-sage-cougar` — both display-name spellings are measured in
+# #2345, and `vm exec` echoes either. 44 B for `no-known-daemon`; 65 B for the measured
+# `daemon-binary-absent` line (37 B is that pattern's floor). Below the match the class is simply unmatched and the caller gets `RAN` at rc=0 — or, at the measured
+# rc=3, plain `NONZERO`, i.e. THE PRE-FIX MIS-VERDICT — with only `truncated: true` to tell them apart.
+# (a) needs a refusal after 20 KB of relayed output; every measured refusal is the transport's FIRST line,
+# far inside the default 20 000, so neither residual is reachable by a default call.
+# ⛔ EVERY PATTERN IS ANCHORED TO ITS LINE START, because these two streams are SHARED: `cmux vm exec`
+# relays the remote command's stdout/stderr into the same `ran.stdout`/`ran.stderr` this classifier reads
+# (`payload["stderr"]` below is exactly that relay), so a bare phrase match would re-label a peer that
+# merely PRINTED one of these sentences — the symmetric mis-verdict to the one this change removes
+# ("the peer ran it and failed" → "the peer never ran it").
+# WHERE a prefix bounds the class, it is required — and it is required only where the transport has been
+# MEASURED emitting the line with it:
+#   link-refused         always `cmux: link to '<peer>' exited` (every measurement on #2345)
+#   no-known-daemon      always `cmux-tui: no known daemon matches this route` — measured BOTH as direct
+#                        `cmux vm exec` output (`pi-cell-1`, #2345) and as the peer log's own last line.
+# ⛔ WHAT BOUNDS A PEER FROM PRINTING ONE OF THESE ITSELF IS THE ALLOWLIST, NOT THE PREFIX — a prefix does
+# not separate transport from log-echo (the log carries the PREFIXED form too). `cat`/`tail` are absent
+# from ALLOWLIST (`_allowlisted`), so a peer cannot be asked to dump a log through this surface; a peer
+# that prints the prefixed line for some other reason stays indistinguishable, and that residual is
+# DISCLOSED rather than implied.
+# ⛔ BUT `daemon-binary-absent` HAS BEEN MEASURED IN BOTH SHAPES — `cmux: cmux-tui daemon binary not
+# found at …` (pi-lane-1, 2026-10-23) AND un-prefixed `cmux-tui daemon binary not found at …` (measured
+# FROM pi-cell-1, calling pi-cell-2, issue #2345) — so its prefix is OPTIONAL: requiring one silently disabled the whole #3195 class on the
+# boxes that print the bare form. Its bound is the line anchor + the `cmux-tui ` token, not the prefix,
+# and the residual is DISCLOSED rather than implied: a peer that echoes that exact sentence is still
+# indistinguishable from the transport, because the streams offer no structural separator.
+LINK_REFUSAL_CLASSES = (
+    # ⛔ FIRST MATCH WINS, AND THE ORDER IS LOAD-BEARING, because a refusal can carry BOTH the transport's
+    # link line and the client's own words (measured 2026-11-03 from `pi-cell-3`: `cmux: link to
+    # 'pi-cell-3' exited` followed by `cmux-tui: no known daemon matches this route; connect with an
+    # invitation`). The transport's line is the one that names the PEER, so it outranks the client's words
+    # — pinned by an arm on that exact two-line buffer, because a reorder here silently changes which
+    # class (and whether `peer`) reaches the caller.
+    ("daemon-binary-absent",
+     re.compile(r"^(?:cmux: )?cmux-tui daemon binary not found at (?P<path>\S+)", re.M)),
+    ("link-refused", re.compile(r"^cmux: link to ['\"](?P<peer>[^'\"]+)['\"] exited", re.M)),
+    ("no-known-daemon", re.compile(r"^cmux-tui: no known daemon matches this route", re.M)),
+)
+LINK_REFUSAL_DETAIL = {
+    # ⛔ NEITHER CLASS MAY TELL THE CALLER THE PEER IS FINE, because MEASUREMENT DOES NOT SUPPORT IT. The
+    # identical `cmux: link to '<peer>' exited` line was measured BOTH when this box's pairing refused a
+    # perfectly healthy peer AND when the peer had nothing listening on its link port at all (#2345:
+    # `:1337` closed on cell-1/cell-4, `ss -ltnp` showing no listener on either peer) — the streams carry
+    # no discriminator, so naming one cause sends half the callers to a remedy that cannot help them. That
+    # is the same wrong-remedy failure #2345 exists to remove, so the payload names BOTH and says how to
+    # separate them.
+    "link-refused":
+        "the client could not open the link to this peer, and TWO measured causes print this identical "
+        "line: this box's route/identity pairing refused it (`vm exec` never spends the `--carrier` mode "
+        "that does connect), or the peer has nothing accepting on its link port. This surface cannot tell "
+        "them apart — probe the peer's `:1337` from the CALLING box to separate them (agent-infra#2345). "
+        "The command itself was never run, so the rc is the transport's either way",
+    "no-known-daemon":
+        "this box's registry holds no daemon for this route: no pairing. Measured BOTH when the route was "
+        "never paired AND when the peer's daemon is not listening at all (`:1337` closed, "
+        "agent-infra#2345) — the line does not distinguish them, so probe the peer's `:1337` from the "
+        "CALLING box before concluding which. The command was never run",
+    "daemon-binary-absent":
+        "THIS box has no usable cmux-tui, so every peer refuses — the remedy is on the calling box, "
+        "not on the peer (agent-infra#3195)",
+}
+PEER_LOG_RE = re.compile(r"(?P<path>(?:~|/)[^\s]*peer-links/[^\s]+)")
+
+
+def _link_refusal(ran: "Ran") -> Optional[Dict[str, Any]]:
+    """Classify a `cmux vm exec` LINK REFUSAL, or None when the transport ran something.
+
+    ⛔ IT CANNOT CONSUME *ONLY* WHAT THE TRANSPORT ANSWERED: `stderr`/`stdout` here are the same two
+    streams the peer's own output arrives on, so "the transport said this" and "the peer printed
+    this" are not separable by content. What bounds the class is therefore the ANCHOR (line start +
+    the transport's prefix — see LINK_REFUSAL_CLASSES), not the stream. Never a re-probe and never the
+    peer's daemon state, neither of which this surface can measure (skill §3: `timed_out` and a
+    refusal are CHANNEL facts, never a box verdict).
+    """
+    text = "\n".join(part for part in (ran.stderr or "", ran.stdout or "") if part)
+    if not text:
+        return None
+    for klass, rx in LINK_REFUSAL_CLASSES:
+        match = rx.search(text)
+        if not match:
+            continue
+        # ⛔ NOT `refused`. That key already means "this surface ran NOTHING" in this file —
+        # `argv-must-be-a-list-of-strings`, `command-not-allowlisted`, `repo-config-names-a-program`,
+        # `read-only` all return BEFORE the transport is invoked, and the inventory row calls it "a
+        # fail-closed allowlist with a typed refusal". These classes DID invoke the transport and are
+        # reporting the CHANNEL's answer, so a caller switching on `refused` to mean "amend my request,
+        # nothing executed" must not also match "the channel refused; the remedy is elsewhere".
+        out: Dict[str, Any] = {
+            "channel_refused": klass,
+            "outcome": "CHANNEL-REFUSED",
+            # ⛔ THE MATCHED LINE, NOT THE FIRST LINE OF THE BUFFER. `text` is `stderr` + `\n` +
+            # `stdout`, so a transport that printed anything before the refusal (a warning, a probe
+            # line) put THAT sentence in the field named for the refusal, and the diagnostic the caller
+            # needs was dropped. Every pattern is `^`-anchored with re.M, so `match.start()` is always a
+            # line start.
+            "refusal": text[match.start():].splitlines()[0].strip()[:300],
+            "refusal_detail": LINK_REFUSAL_DETAIL[klass],
+            "channel_note": "a link refusal is a CHANNEL fact — the peer never ran the command, so "
+                            "this rc is the TRANSPORT's, never the command's verdict",
+        }
+        groups = match.groupdict()
+        peer = groups.get("peer")
+        if peer:
+            out["peer"] = peer
+        # ⛔ THE PATH GROUP IS READ, NOT DECLARED-AND-DROPPED. For `daemon-binary-absent` it is the one
+        # datum the CALLING-box remedy needs (which path `cmux-tui` was looked for at), and this file
+        # has already deleted one declared-but-unreferenced constant (`DISK_OK_VERBS`) rather than let
+        # a named group read as wired-in.
+        binary_path = groups.get("path")
+        if binary_path:
+            out["binary_path"] = binary_path
+        log = PEER_LOG_RE.search(text[match.start():].splitlines()[0])
+        # ⛔ ONLY THE MATCHED LINE, for the same reason as `refusal` below: `PEER_LOG_RE` over the whole
+        # buffer attached a path scraped from ANY line — e.g. a peer's own `sha256sum` output naming a
+        # `.cmux/peer-links/…` file — to a class the inventory rows say never carries one. Every measured
+        # refusal line names its log ON THE SAME LINE (`cmux: link to '<peer>' exited; see <path>`).
+        if log:
+            out["peer_log"] = log.group("path")
+        if ran.rc == 0:
+            out["fail_open"] = ("the transport exited 0 while refusing the link — a caller that checks "
+                                "only `rc` reads this as success (agent-infra#2345)")
+        return out
+    return None
+
+
 def _box_exec(mods: Modules, args: Dict[str, Any], read_only: bool) -> Tuple[bool, Dict[str, Any]]:
     if read_only:
         return True, {"refused": "read-only",
@@ -2334,6 +2499,20 @@ def _box_exec(mods: Modules, args: Dict[str, Any], read_only: bool) -> Tuple[boo
     })
     if ran.error:
         payload["unmeasured"] = ran.unmeasured()
+        return True, payload
+    refusal = _link_refusal(ran)
+    if refusal:
+        # ⛔ BEFORE `timed_out` ON PURPOSE: a refusal is an ANSWER the transport gave, not a slow
+        # channel, and reporting it as the command's own non-zero rc is what #2345 costs.
+        # ⛔ AND THE CHANNEL NOTE IS **APPENDED**, NEVER REPLACED. `channel_only` above already explains
+        # `timed_out`/`truncated`, both of which stay in this very payload — a bare `payload.update()`
+        # replaced that sentence with the refusal's, so a transport that BOTH printed a refusal line
+        # AND timed out carried `timed_out: true` with nothing left saying it is a channel reading.
+        note = refusal.pop("channel_note", "")
+        payload.update(refusal)
+        if note:
+            base = payload.get("channel_only") or ""
+            payload["channel_only"] = (base + " | " + note) if base else note
         return True, payload
     if ran.timed_out:
         payload["outcome"] = "CHANNEL-TIMEOUT"

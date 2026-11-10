@@ -574,7 +574,16 @@ for _g in load disk land fork capability skew key mem; do
   has "$_fmt" "\`$_g\`" "4e …and the FORMAT contract names the \`$_g\` gate (a consumer built from it cannot fold it)"
 done
 has "$_fmt" "EIGHT refusal gates" "4e …and the COUNT agrees with the list (it said SIX beside seven names, then SEVEN beside eight)"
-_ret="$(head -n 80 "$(dirname "$LANE")/chain-merge.sh" | grep -n '^cap_refusal_gate()')"
+# ⛔ LOCATE THE DECLARATION BY NAME, NOT BY LINE NUMBER (agent-infra#2095). This read used to be
+# `head -n 80 … | grep -n '^cap_refusal_gate()'`, which gave the three arms below a SECOND, unstated
+# precondition: that no unrelated change ever pushes the function past line 80. #2095 adds lines of
+# comment above it (the work-root split) and moved the declaration 75 → 81, at which point `_ret` went
+# EMPTY and all three arms failed — a red ABOUT A POSITION, reported as a red about the return
+# contract, inside a suite nobody suspects because `bash-suites` reds are routinely attributed to the
+# base. The property these arms assert is "the contract line names the gate its `case` dispatches on",
+# and the contract lives ON the declaration line; position was never part of it. Same class as the
+# #2095 P0: an assertion that silently encoded a positional assumption the diff never mentioned.
+_ret="$(grep -n '^cap_refusal_gate()' "$(dirname "$LANE")/chain-merge.sh" | head -1)"
 for _g in key skew mem; do
   has "$_ret" "$_g" "4e …and chain-merge's return contract names \`$_g\`, which its case arm dispatches on"
 done
