@@ -1070,35 +1070,54 @@ tsv_decode() { # <tsv-framed body> -> the decoded text on stdout
 
 # 0 = a DECLARED `Outcome:` line names blocking findings; 1 = none does.
 #
-# THREE ESCAPES, and each is a spelling a genuinely clean outcome uses. They are enumerable and
-# small on purpose: a vocabulary arm that guesses is a fail-open, and one that is too clever is a
-# false refusal — so the set is fixed here, named, and extended from fixer-loop.md, never from
-# memory (the same rule arms 1/1b follow).
+# ⛔ EVERY ESCAPE IS PREDICATED ON THE COUNT IT ESCAPES — a line-wide "does the line mention X"
+# test is the wrong shape, and it was MEASURED wrong here (agent-infra#2661 review, F1): the first
+# cut's `(a)` matched the `non-blocking` mention in a FOLLOW-UP clause and cancelled the live
+# `2 blocking (P1)` declaration beside it, and its `(b)` matched `closed` inside "an unclosed
+# session" and `fixed` inside "the fixed-width clip". Four real bodies that declare a live blocker
+# were ADMITTED — a one-word variant of the very artifact this arm exists to refuse. An exception
+# must be scoped to the match it excepts, never to the line it happens to share (the rule Semgrep's
+# `pattern-not`, OPA's negation and Apache Traffic Server's regex guidance all state).
+#
+# THREE ESCAPES, each a spelling a genuinely clean outcome uses:
 #   (a) ZEROED / NEGATED — "no blocking", "non-blocking", "0 blocking", "zero blocking",
 #       "none blocking". This is `Outcome: CLEAN — no blocking issues found` (tortoise#8866), the
-#       measured false-refusal case that must stay ACCEPTED.
-#   (b) RESOLVED — the blocking findings are named as CLOSED: "3 blocking findings were fixed and
-#       re-verified". The window is bounded and `;`/`.`/`:`-terminated so an unrelated later clause
-#       cannot supply the verb.
-#   (c) NOT RESOLVED — a persistence qualifier inside the SAME window cancels (b): "2 blocking
-#       fixed, 1 blocking remain" is still a live blocker, and exits (b) on the wrong half was the
-#       whole point of adding it.
+#       measured false-refusal case that must stay ACCEPTED. ⛔ IT DOES NOT APPLY WHEN THE SAME LINE
+#       DECLARES A LIVE POSITIVE COUNT: `2 blocking (P1), 2 non-blocking (P3)` is a live blocker with
+#       a negated follow-up clause, not a clean review, and `... all 4 findings non-blocking` (no
+#       count) still escapes.
+#   (b) RESOLVED — the count is declared CLOSED: "3 blocking findings were fixed and re-verified".
+#       Three predicates, each of which a measured F1 vector defeated when it was missing:
+#         * a POSITIVE COUNT precedes the noun;
+#         * a COPULA/AUXILIARY (`were|was|are|is|being|been|now|all|both`) sits between the noun and
+#           the verb, because "closed the socket too early" is a description, not a resolution;
+#         * the verb is LEFT word-anchored (`[^[:alpha:]]`, so `unclosed` is not `closed`) and its
+#           RIGHT boundary excludes `-` (so `fixed-width` is not `fixed`).
+#       The window is bounded and `;`/`.`/`:`-terminated so an unrelated later clause cannot supply
+#       the verb.
+#   (c) NOT RESOLVED — a persistence qualifier inside the SAME window cancels (b):
+#       "2 blocking were fixed, 1 blocking remain" is still a live blocker, and exiting (b) on the
+#       wrong half was the whole point of adding it.
 # What the arm deliberately does NOT judge is whether a declared blocker was later fixed: `(b)` and
-# `(c)` read only the vocabulary of persistence, exactly as every other arm in this file reads
-# shape and never substance. An outcome line that mixes a clean verdict WITH a live blocking count
-# is a DECLARED blocker here — a declaration is not cancelled by a second declaration on the same
-# line, which is the rule arms (1) and (1b) already apply (§13n4/§13n5).
+# `(c)` read only the vocabulary of persistence, exactly as every other arm in this file reads shape
+# and never substance.
 outcome_declares_blocking() { # <tsv-framed body> -> 0 = a declared Outcome line names blocking findings
-  local decoded line
+  local decoded line live_count
   decoded="$(tsv_decode "$1")"
   while IFS= read -r line; do
     # Only an `Outcome:` DECLARATION is this arm's question — anchored the way arm (1b) anchors it,
     # so prose that discusses an outcome is untouched.
     grep -qiE '(^|[*[:space:]])outcome:[[:space:]]*[*[:space:]]*' <<<"$line" || continue
-    # (a) zeroed / negated
-    grep -qiE '(^|[^[:alnum:]])(no|non|zero|none)[[:space:]_-]*block(ing|ers?)|(^|[^0-9])0[[:space:]_-]*block(ing|ers?)' <<<"$line" && continue
-    # (b) resolved, and (c) not a live blocker
-    if grep -qiE 'block(ing|ers?)[^.;:]{0,60}(fixed|resolved|closed|addressed|re-verified)' <<<"$line" \
+    # A LIVE POSITIVE COUNT. The escapes may ANSWER it; none of them may CANCEL it.
+    live_count=0
+    grep -qiE '[1-9][0-9]*[[:space:]_-]*block(ing|ers?)' <<<"$line" && live_count=1
+    # (a) zeroed / negated, and ONLY with no live count on the line.
+    if [ "$live_count" -eq 0 ] \
+       && grep -qiE '(^|[^[:alnum:]])(no|non|zero|none)[[:space:]_-]*block(ing|ers?)|(^|[^0-9])0[[:space:]_-]*block(ing|ers?)' <<<"$line"; then
+      continue
+    fi
+    # (b) resolved — count, then copula, then a word-anchored verb — and (c) not a live blocker.
+    if grep -qiE '[1-9][0-9]*[[:space:]_-]*block(ing|ers?)[^.;:]{0,40}(were|was|are|is|being|been|now|all|both)[^.;:]{0,15}[^[:alpha:]](fixed|resolved|closed|addressed|re-verified)([[:space:],.;:!?)]|$)' <<<"$line" \
        && ! grep -qiE 'block(ing|ers?)[^.;:]{0,60}(remain|remaining|open|outstanding|unresolved|unfixed|unaddressed)' <<<"$line"; then
       continue
     fi

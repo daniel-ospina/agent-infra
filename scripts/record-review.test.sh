@@ -5130,6 +5130,61 @@ EV_REF="comment:42501501" run_record_ev 425015 STUB_EVIDENCE_BODY="**Outcome: 1 
 $VACUITY_BLOCK"
 assert_eq "$RECORD_RC" "3" "13n11 the singular 'blocker' spelling is a declared blocking finding too (rc 3)"
 
+# 13n13-13n17 — THE ESCAPES ARE PREDICATED ON THE COUNT THEY ESCAPE (agent-infra#2661 review, F1).
+# The first cut's escapes were evaluated LINE-WIDE and UNPREDICATED, so a one-word variant of the very
+# artifact 13n6 refuses still recorded `clean`. All four bodies below were MEASURED admitted against
+# that head — a live blocking declaration cancelled by an unrelated token in its own follow-up clause.
+# The root is a known rule-design error: an exception must be scoped to the match it excepts, never to
+# the line it happens to share (the rule Semgrep's `pattern-not`, OPA's negation builtins and Apache
+# Traffic Server's regex guidance all state).
+#
+#   (a) matched the `non-blocking` mention and discarded the `2 blocking` declaration beside it —
+#       structurally the same defect 13n9 exists to stop, on the OTHER escape.
+#   (b) matched `closed` inside "an unclosed session" and `fixed` inside "the fixed-width clip", and
+#       would have matched a transitive "closed the socket" — a description is not a resolution.
+#
+# Each vector carries $VACUITY_BLOCK so a red is attributable to (1c) and not to a second contract.
+rm -f "$(Q2 425020)"
+EV_REF="comment:42502001" run_record_ev 425020 STUB_EVIDENCE_BODY="**Outcome: 3 findings — 2 blocking (P1), 2 non-blocking (P3).**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n13 the negated escape does NOT cancel a live count on the same line (rc 3)"
+[ ! -f "$(Q2 425020)" ] && ok "13n13 no record minted over 2 blocking P1s wearing a 'non-blocking' follow-up" || bad "13n13 minted a record — escape (a) cancelled a live declaration"
+
+rm -f "$(Q2 425021)"
+EV_REF="comment:42502101" run_record_ev 425021 STUB_EVIDENCE_BODY="**Outcome: 2 blocking (P1) plus 3 non-blocking notes.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n14 'plus 3 non-blocking notes' does not cancel 2 declared blockers (rc 3)"
+
+rm -f "$(Q2 425022)"
+EV_REF="comment:42502201" run_record_ev 425022 STUB_EVIDENCE_BODY="**Outcome: 1 blocking (P1), an unclosed session is leaked.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n15 'unclosed' in the finding's DESCRIPTION is not a resolution claim (rc 3)"
+
+rm -f "$(Q2 425023)"
+EV_REF="comment:42502301" run_record_ev 425023 STUB_EVIDENCE_BODY="**Outcome: 1 blocking (P1) — the fixed-width clip drops the fold.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n16 'fixed-width' is not the word 'fixed' — the verb's RIGHT boundary excludes '-' (rc 3)"
+
+rm -f "$(Q2 425024)"
+EV_REF="comment:42502401" run_record_ev 425024 STUB_EVIDENCE_BODY="**Outcome: 1 blocking (P1) — closed the socket too early.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n17 a transitive 'closed' with NO copula is a description, not a resolution (rc 3)"
+
+# 13n18 — THE OVER-BLOCK CONTROL for the whole F1 narrowing. Requiring a copula and a count must not
+# take the (a) escape with it: a clean review that only ever mentions NON-blocking findings, with no
+# live count on the line, still records. Without this vector the obvious over-correction (veto
+# anything containing "blocking") would pass every other row in this section.
+rm -f "$(Q2 425025)"
+EV_REF="comment:42502501" run_record_ev 425025 STUB_EVIDENCE_BODY="**Outcome: CLEAN — 2 non-blocking (P3) findings, filed as follow-ups.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "0" "13n18 a clean outcome naming only NON-blocking findings still records (rc 0)"
+
 # 13n12 — MUTATION PIN. 13n6 could be red for a reason that has nothing to do with (1c), so the arm
 # is removed from a copy and the SAME artifact must then be ADMITTED. A pin that only asserts the
 # refusal proves the refusal, never that THIS arm produced it.
@@ -6196,13 +6251,13 @@ fi
 #     → :2482 :4186 :6501 :6613, plus a comment mention at :2356) and the
 #     same four PREDICATE sites are at head
 #     (`grep -n 'grep -qxF' scripts/record-review.sh` prints all four PREDICATE lines at head —
-#     CITE-CHECK: :4277 :6003 :8377 :8551, plus a comment mention at :4146; `14.1c-CITE` below
+#     CITE-CHECK: :4296 :6022 :8396 :8570, plus a comment mention at :4165; `14.1c-CITE` below
 #     re-derives these numbers, so they cannot rot silently): in #3168's diff the only
 #     hunk at `post_marker()` (:4159) ADDS A COMMENT — this PR does not touch
 #     `post_marker()` at all — and the
-#     predicate line beside it (CITE-CHECK: :4277) is CONTEXT, not a change.
+#     predicate line beside it (CITE-CHECK: :4296) is CONTEXT, not a change.
 #     WHAT THE VECTOR BELOW ACTUALLY PINS: the BODY-APPEND site
-#     (`if ! grep -qxF -- "$MARKER" <<<"$BODY"`; on main at bd1b205d :6501 — at head CITE-CHECK: :8377). It is a
+#     (`if ! grep -qxF -- "$MARKER" <<<"$BODY"`; on main at bd1b205d :6501 — at head CITE-CHECK: :8396). It is a
 #     MAIN-REGRESSION pin — reverting this PR leaves 14.1c GREEN, and 14.10f is a
 #     main-regression pin for the same reason. Keeping them is right (main's
 #     anchoring should not silently regress); calling them evidence about this diff
@@ -6228,7 +6283,7 @@ fi
 #     `:6625` / `:6770` at `dc7e3ae99`, `:6634` / `:6779` at `921109de2` and `:6639` / `:6796` at
 #     `17551325e` as comment blocks were added above them, while the CITES beside them still read
 #     `:6625` / `:6770` at all three — that divergence IS the rot this paragraph describes — and at
-#     this head the predicates are `:8377` / `:8551` — CITE-CHECK: :8377 :8551 — re-derived by the
+#     this head the predicates are `:8396` / `:8570` — CITE-CHECK: :8396 :8570 — re-derived by the
 #     guard below, like every other head cite of a predicate). One
 #     lane's response was to delete the numbers — which removes the rot but also removes the
 #     reader's target. Both intents are kept here: the number stays, and it is CHECKED.
@@ -7132,12 +7187,12 @@ assert_eq "$REC_BEFORE_14B" "$(cat "$F_HOME/.pi/agent/reviews/daniel-ospina-agen
 #       because `origin/main` moves and a bare "main :NNNN" rots the moment it does → :2482),
 #       and in #3168's diff the only hunk at `post_marker()` (head :4159) ADDS A COMMENT above
 #       it (this PR does not touch `post_marker()` at all) — the
-#       predicate line (head :4277) is CONTEXT. Reverting #3168 leaves this vector GREEN; it is kept
+#       predicate line (head :4296) is CONTEXT. Reverting #3168 leaves this vector GREEN; it is kept
 #       because main's anchoring should not silently regress, and it is labelled so the
 #       next reader does not mistake it for evidence about this diff. The predicate must
 #       match the gate's line-anchored `^…$` admission, exactly like the three other
 #       sites already anchored on main (bd1b205d :4186 :6501 :6613) — the same four that the grep
-#       above prints at head, CITE-CHECK: :6003 :8377 :8551 (`14.1c-CITE` re-derives the triple).
+#       above prints at head, CITE-CHECK: :6022 :8396 :8570 (`14.1c-CITE` re-derives the triple).
 #       ⛔ ASSERTS THE TRANSPORT (a PATCH was issued), not the exit code: the destructive
 #       mutant also exited 0.
 if [ -n "${QB_LINE:-}" ]; then
