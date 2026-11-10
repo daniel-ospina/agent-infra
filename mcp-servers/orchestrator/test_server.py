@@ -1164,6 +1164,8 @@ def test_T_box_exec_reports_a_LINK_REFUSAL_as_a_channel_fact_not_the_commands_rc
     # (3b) THE BARE FORM OF THE SAME DIAGNOSTIC — the transport does NOT always prefix it. Measured on
     #      `pi-cell-2` (`cmux vm exec pi-cell-2 -- true`); #2345 carries it. Requiring `^cmux: ` silently
     #      disabled this whole class on exactly the boxes #3195 is about, so the prefix is optional here.
+    #      ⛔ AND THE LINE THAT PRINTED IT IS THE CALLING BOX (pi-cell-1), not the target (pi-cell-2) — the
+    #      distinction this class exists for: the remedy is on the CALLING box, #3195.
     monkeypatch.setenv("ORCH_MCP_CMUX", refusal_stub(
         "cmux_nobin_bare.py",
         "import sys\n"
@@ -1200,6 +1202,18 @@ def test_T_box_exec_reports_a_LINK_REFUSAL_as_a_channel_fact_not_the_commands_rc
     is_err, payload = one(mod, "box.exec", {"box": "pi-cell-1", "argv": ["uname"]})
     assert is_err is False and payload["outcome"] == "RAN", payload
     assert "channel_refused" not in payload and "fail_open" not in payload, payload
+    # …AND THE SAME FOR THE OTHER TWO CLASSES' ANCHORS, which arm 5 pinned for `no-known-daemon` only. A
+    # peer that mentions either phrase MID-LINE is still a run — dropping the `^` from either pattern left
+    # the suite GREEN, i.e. half the declared class bound was unpinned and a future edit could revert it
+    # silently.
+    monkeypatch.setenv("ORCH_MCP_CMUX", stub(
+        tmp_path, "cmux_relay_midline.py",
+        "import sys\n"
+        "sys.stdout.write(\"note: cmux: link to 'pi-cell-4' exited here previously\\n\")\n"
+        "sys.stdout.write(\"see cmux-tui daemon binary not found at /x for the older box\\n\")\n", 0))
+    is_err, payload = one(mod, "box.exec", {"box": "pi-cell-1", "argv": ["uname"]})
+    assert is_err is False and payload["outcome"] == "RAN", payload
+    assert "channel_refused" not in payload, payload
 
     # (6) ⛔ A REFUSAL **AND** A TIMEOUT: both facts stay in the payload, and `channel_only` keeps the
     #     sentence that says `timed_out`/`truncated` are channel readings. The pre-fix ordering returned

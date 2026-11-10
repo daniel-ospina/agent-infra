@@ -317,7 +317,8 @@ TOOLS: List[Dict[str, Any]] = [
             "⛔ A LINK REFUSAL is a CHANNEL fact too: `outcome: CHANNEL-REFUSED` + `channel_refused` "
             "(`link-refused` / `no-known-daemon` / `daemon-binary-absent`, three different remedies — the "
             "last is on the CALLING box), plus `fail_open` when the transport exited 0 while refusing. "
-            "Branch on `outcome`, NEVER on `rc` alone. MUTATING."
+            "Branch on `outcome` where it is present, read `refused` / `unmeasured` first (those return "
+            "with NO outcome), and NEVER on `rc` alone. MUTATING."
         ),
         "inputSchema": {
             "type": "object",
@@ -2260,19 +2261,25 @@ def _harden_argv(argv: List[str]) -> List[str]:
 # `cmux: link to '<peer>' exited; see ~/.cmux/peer-links/<peer>.log`). This surface then reported
 # `outcome: NONZERO, rc: 3`, which reads as "the peer RAN the command and it failed" and sends the
 # operator to the command — or to the peer's state — when the peer never ran anything at all.
-# The three causes have three DIFFERENT remedies, and each is visible in the stderr line this surface
-# already holds, so the class is named HERE instead of making every caller re-parse prose or open a log
-# behind a path:
-#   link-refused          the client's route/identity for the peer was refused. Measured 2026-11-03 (on
-#                         the issue): the vendor's `vm exec` link path never spends the `--carrier`
-#                         mode that DOES connect, so a perfectly healthy peer refuses too.
-#   no-known-daemon       the same refusal in the client's own words — what `~/.cmux/peer-links/
-#                         <peer>.log` holds, i.e. the line a caller is told to go read.
+# The classes below name the remedy from the stderr line this surface already holds, so no caller has to
+# re-parse prose or open a log behind a path. ⛔ THE CLASSES ARE NOT SYMMETRIC: `daemon-binary-absent` has
+# ONE measured cause and one remedy (the calling box), while `link-refused` and `no-known-daemon` each
+# cover TWO measured causes that print the IDENTICAL line — this box's pairing/route refused a healthy
+# peer (`pi-cell-4`, 2026-11-03: the vendor's `vm exec` never spends the `--carrier` mode that DOES
+# connect), and a peer with nothing accepting on its link port (`:1337` closed on cell-1/cell-4, `ss`
+# showing no listener). No key in this payload can separate those two, which is why each detail names
+# both and says to probe the peer's `:1337` from the CALLING box — naming one cause would send half the
+# callers to a remedy that cannot help them, which is the failure #2345 exists to remove.
+#   link-refused          `cmux: link to '<peer>' exited` — the two causes above.
+#   no-known-daemon       the same refusal in the client's own words (also what `~/.cmux/peer-links/
+#                         <peer>.log` holds): an unpaired route OR a peer whose daemon is gone.
 #   daemon-binary-absent  THIS CALLING box has no usable `cmux-tui` (#3195), so EVERY peer fails at
 #                         once and the remedy is on this box — not on the peer, and not in the command.
 # ⛔ rc=0 IS STILL A REFUSAL. A refusal reported with exit status 0 was measured on `pi-cell-3`
 # (2026-10-23, on the issue): a caller that checks only `rc` read a dead link as success. The class is
-# reported whatever the rc, so the fail-open form cannot pass as a run here either.
+# reported whatever the rc. ⛔ RESIDUAL, NOT COVERED: `_drain_into` keeps each stream's HEAD, so a refusal
+# printed after `cap` bytes is dropped and a rc=0 case would read `RAN` — every measured refusal is the
+# transport's FIRST line (before any relayed output), so this is disclosed rather than claimed closed.
 # ⛔ EVERY PATTERN IS ANCHORED TO ITS LINE START, because these two streams are SHARED: `cmux vm exec`
 # relays the remote command's stdout/stderr into the same `ran.stdout`/`ran.stderr` this classifier reads
 # (`payload["stderr"]` below is exactly that relay), so a bare phrase match would re-label a peer that
@@ -2289,8 +2296,8 @@ def _harden_argv(argv: List[str]) -> List[str]:
 # that prints the prefixed line for some other reason stays indistinguishable, and that residual is
 # DISCLOSED rather than implied.
 # ⛔ BUT `daemon-binary-absent` HAS BEEN MEASURED IN BOTH SHAPES — `cmux: cmux-tui daemon binary not
-# found at …` (pi-lane-1, 2026-10-23) AND un-prefixed `cmux-tui daemon binary not found at …` (pi-cell-2,
-# issue #2345) — so its prefix is OPTIONAL: requiring one silently disabled the whole #3195 class on the
+# found at …` (pi-lane-1, 2026-10-23) AND un-prefixed `cmux-tui daemon binary not found at …` (measured
+# FROM pi-cell-1, calling pi-cell-2, issue #2345) — so its prefix is OPTIONAL: requiring one silently disabled the whole #3195 class on the
 # boxes that print the bare form. Its bound is the line anchor + the `cmux-tui ` token, not the prefix,
 # and the residual is DISCLOSED rather than implied: a peer that echoes that exact sentence is still
 # indistinguishable from the transport, because the streams offer no structural separator.
@@ -2301,13 +2308,24 @@ LINK_REFUSAL_CLASSES = (
     ("no-known-daemon", re.compile(r"^cmux-tui: no known daemon matches this route", re.M)),
 )
 LINK_REFUSAL_DETAIL = {
+    # ⛔ NEITHER CLASS MAY TELL THE CALLER THE PEER IS FINE, because MEASUREMENT DOES NOT SUPPORT IT. The
+    # identical `cmux: link to '<peer>' exited` line was measured BOTH when this box's pairing refused a
+    # perfectly healthy peer AND when the peer had nothing listening on its link port at all (#2345:
+    # `:1337` closed on cell-1/cell-4, `ss -ltnp` showing no listener on either peer) — the streams carry
+    # no discriminator, so naming one cause sends half the callers to a remedy that cannot help them. That
+    # is the same wrong-remedy failure #2345 exists to remove, so the payload names BOTH and says how to
+    # separate them.
     "link-refused":
-        "the client's route/identity for this peer was refused before the peer ran anything — the "
-        "peer's health is NOT what this line measured (agent-infra#2345: `vm exec` does not spend the "
-        "`--carrier` mode that does connect)",
+        "the client could not open the link to this peer, and TWO measured causes print this identical "
+        "line: this box's route/identity pairing refused it (`vm exec` never spends the `--carrier` mode "
+        "that does connect), or the peer has nothing accepting on its link port. This surface cannot tell "
+        "them apart — probe the peer's `:1337` from the CALLING box to separate them (agent-infra#2345). "
+        "The command itself was never run, so the rc is the transport's either way",
     "no-known-daemon":
-        "the client holds no daemon for this route: no pairing. Routing is what failed, not the peer "
-        "and not the command (agent-infra#2345)",
+        "this box's registry holds no daemon for this route: no pairing. Measured BOTH when the route was "
+        "never paired AND when the peer's daemon is not listening at all (`:1337` closed, "
+        "agent-infra#2345) — the line does not distinguish them, so probe the peer's `:1337` from the "
+        "CALLING box before concluding which. The command was never run",
     "daemon-binary-absent":
         "THIS box has no usable cmux-tui, so every peer refuses — the remedy is on the calling box, "
         "not on the peer (agent-infra#3195)",
