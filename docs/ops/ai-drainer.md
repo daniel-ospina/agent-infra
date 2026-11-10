@@ -104,8 +104,12 @@ nothing, and it exits 0):
    lane total, so an unreadable probe must never read as "no lanes" (that is the over-dispatch
    direction; it dispatched 7 lanes in the suite's mutant of exactly that change). "Unreadable" means
    `ps` failed, exited 0 with **no output at all**, or answered non-numerically — a probe that answered
-   with a process table containing no lane in it is a genuinely idle box and reads **0**, which is the
-   direction this fix exists for.
+   with a process table containing no lane in it reads **0**, which is the direction this fix exists for.
+   ⛔ The clamp is one-sided in the sense that it cannot **invent** a lane, but it **can lower a real
+   count**, and that is the deliberate price of the fix: a probe that answers with a view omitting the
+   lanes (`hidepid=2` for another uid, a PID namespace, a filtered `$PS` wrapper) reads 0 and the clamp
+   then lowers a real count — the over-dispatch direction. The alternative, treating every answered
+   probe as unreadable, restores the original bug.
 4. **rotation advances per LANE, not per tick.** Each dispatched lane gets its own slice offset and its
    own brief; the cursor advances inside the loop (a tick killed mid-loop must not re-issue the slices
    it already handed out), and the count is clamped to `SLICE_TOTAL/SLICE_WIDTH` distinct windows so a

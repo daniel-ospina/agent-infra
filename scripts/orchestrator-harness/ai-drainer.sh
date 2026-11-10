@@ -694,19 +694,30 @@ _reap_leftovers() {
 #     daemon read failure must never RAISE a ceiling).
 # A worker is NEVER `pgrep`-ed for: `pgrep` answers a different population than the launcher's.
 _counts_as_lane() { # <command-line>
-  local c="$1" t b
+  local c="$1" t b rc=1 had_f=0
   [ -n "$c" ] || return 1
+  # ⛔ GLOB-FREE, for the SAME reason `_is_lane_process` below is (see its comment): the split is
+  # UNQUOTED, so `for t in $c` pathname-expands as well as word-splits, and an argv token holding a
+  # wildcard would expand against the CWD. MEASURED with a file literally named `pi` in the CWD:
+  # `_counts_as_lane "bash -c echo *"` matched it and COUNTED. That inflates `disp_alive`, which stands
+  # the tick down — the same inertness #3882's clamp exists to end, one census over (#3886 review).
+  # Restored on the single exit path, and the only call site (`_census_dispatcher`) is itself read
+  # through a `$(…)`, so a leak is not reachable either way.
+  case $- in *f*) had_f=1 ;; *) set -f ;; esac
   for t in $c; do
     case "$t" in
-      /*) b="${t##*/}"; [ "$b" = "pi" ] && return 0 ;;
-      pi) return 0 ;;                        # argv[0] literally `pi` (no shebang rewrite)
+      /*) b="${t##*/}"; if [ "$b" = "pi" ]; then rc=0; break; fi ;;
+      pi) rc=0; break ;;                     # argv[0] literally `pi` (no shebang rewrite)
     esac
   done
-  for b in nonblocking-dispatch.sh bg-dispatch.sh lane.sh fix-one.sh merge-one.sh \
-           chain-merge.sh dispatch-merge.sh; do
-    case "$c" in *"$b"*) return 0 ;; esac
-  done
-  return 1
+  if [ "$rc" -ne 0 ]; then
+    for b in nonblocking-dispatch.sh bg-dispatch.sh lane.sh fix-one.sh merge-one.sh \
+             chain-merge.sh dispatch-merge.sh; do
+      case "$c" in *"$b"*) rc=0; break ;; esac
+    done
+  fi
+  [ "$had_f" = "1" ] || set +f
+  return "$rc"
 }
 _census_dispatcher() { # prints the count of live dispatcher lanes
   local f p c n=0
@@ -758,16 +769,22 @@ fi
 # comes from the cmux daemon document's `terminals[].running` flag (worker-terminal.sh:1287-1305) —
 # **"a shell is running in that terminal"**, i.e. UI liveness. A `wt-*` terminal whose `pi` has exited
 # still reports `running=true`, so it is a live lane forever and `target − alive ≈ 0` for ever.
-# The clamp is one-sided (`min`): it can only REMOVE phantom lanes, never invent or hide a real one,
-# and when it fires it is LOUD — `census-mismatch launcher=34 pi=9 clamped=9` — so the drift is
-# visible in the log instead of silently suppressing dispatch.
+# The clamp is one-sided (`min`): it can only REMOVE phantom lanes, never invent one. ⛔ It CAN lower a
+# real count, and that is the price of the fix, not an oversight (#3886 review): a probe that ANSWERS
+# with a view that omits the lanes — `hidepid=2` for another uid, a PID namespace, a filtered `$PS`
+# wrapper — reads 0 and the clamp then lowers a real count, which is the OVER-DISPATCH direction. The
+# alternative (treating an answered probe as unreadable) restores the original bug, so the trade is
+# deliberate; it is stated here and in docs/ops/ai-drainer.md rather than left implied.
+# When it fires it is LOUD — `census-mismatch launcher=34 pi=9 clamped=9` — so the drift is visible in
+# the log instead of silently suppressing dispatch.
 #
 # ⛔ UNKNOWN IS ALIVE (the polarity the dispatcher census above states, and the reason this is safe):
 # when the PROCESS count cannot be measured the clamp does NOT apply and `wt_count` is returned
 # unchanged. Clamping on an unreadable reading would be the OVER-DISPATCH direction — the census is
 # now the only thing bounding the lane total — so the fail-safe answer is the LARGER (terminal) number.
 # A `ps` that prints NOTHING did not answer (every live box has at least a shell and this tick); a
-# `ps` that answered with no lane in it is a genuinely idle box and counts as 0.
+# `ps` that answered with no lane in it counts as 0 — a genuinely idle box **as seen by that probe**
+# (a partial view reads 0 too: see the one-sidedness note above).
 # ⛔ THE PREDICATE IS TOKEN-STRICT, AND THAT IS A MEASURED CHOICE, NOT A STYLE ONE.
 # A lane process is one whose OWN argv names it as a lane: a token whose basename is `pi` (pi sets its
 # process title, so a live lane reads as `pi` or `pi -p --provider …` in `ps`), or a token naming one of
