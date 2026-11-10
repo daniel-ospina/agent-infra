@@ -92,6 +92,17 @@ nothing, and it exits 0):
    **zero**) **plus** the launcher's workers (`wt_table`/`wt_count` in `worker-terminal.sh`, which is
    the only census that sees **durable-terminal** lanes — no pidfile names them and `pgrep` cannot see
    them). A stale module is named (`launcher census unavailable: …`) rather than read as "no workers".
+   ⛔ The launcher half is an **upper bound**, clamped to the lane processes actually present
+   (`launcher = min(wt_count, live lane processes)`), because `wt_count` counts the cmux daemon's
+   `terminals[].running` — *a shell is running in that terminal*, i.e. UI liveness — so a `wt-*`
+   terminal whose `pi` has exited counted as a live lane **for ever** and the tick stood down with exit
+   0 on a box with idle capacity (measured 2026-11-10 on pi-cell-3: `alive=36 (dispatcher=2
+   launcher=34)` against **9** live `pi` processes — agent-infra#3882). When the clamp fires it is its
+   own line, `census-mismatch launcher=34 pi=9 clamped=9`, so the drift is visible without reading
+   code. ⛔ When the **process** count is unreadable the clamp does **not** apply and `wt_count` stands
+   unchanged: the fleet's polarity is *unknown is alive*, and the census is the only thing bounding the
+   lane total, so an unreadable probe must never read as "no lanes" (that is the over-dispatch
+   direction; it dispatched 7 lanes in the suite's mutant of exactly that change).
 4. **rotation advances per LANE, not per tick.** Each dispatched lane gets its own slice offset and its
    own brief; the cursor advances inside the loop (a tick killed mid-loop must not re-issue the slices
    it already handed out), and the count is clamped to `SLICE_TOTAL/SLICE_WIDTH` distinct windows so a

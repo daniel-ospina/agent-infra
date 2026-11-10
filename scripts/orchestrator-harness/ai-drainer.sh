@@ -750,10 +750,81 @@ if [ -n "$WT_MOD" ] && [ -f "$WT_MOD" ]; then
     CENSUS_LAUNCHER_WHY="worker-terminal.sh at $WT_MOD is stale (no wt_table/wt_count, or its embedded python is empty)"
   fi
 fi
+# ⛔ THE LAUNCHER CENSUS IS AN UPPER BOUND, NOT A COUNT — clamp it to the lane processes present.
+# MEASURED 2026-11-10 on pi-cell-3: `alive=36 (dispatcher=2 launcher=34)` with **9** live `pi`
+# processes on the same box, 25 GB RAM free, 0 OOM kills — so the tick printed `SKIP: nothing to add`
+# and exited 0 on a box with idle capacity, and the starved queue had no error to point at.
+# The reason is in `wt_count`'s own signal: it counts `wt_table` rows that are not `dead`, and `dead`
+# comes from the cmux daemon document's `terminals[].running` flag (worker-terminal.sh:1287-1305) —
+# **"a shell is running in that terminal"**, i.e. UI liveness. A `wt-*` terminal whose `pi` has exited
+# still reports `running=true`, so it is a live lane forever and `target − alive ≈ 0` for ever.
+# The clamp is one-sided (`min`): it can only REMOVE phantom lanes, never invent or hide a real one,
+# and when it fires it is LOUD — `census-mismatch launcher=34 pi=9 clamped=9` — so the drift is
+# visible in the log instead of silently suppressing dispatch.
+#
+# ⛔ UNKNOWN IS ALIVE (the polarity the dispatcher census above states, and the reason this is safe):
+# when the PROCESS count cannot be measured the clamp does NOT apply and `wt_count` is returned
+# unchanged. Clamping on an unreadable reading would be the OVER-DISPATCH direction — the census is
+# now the only thing bounding the lane total — so the fail-safe answer is the LARGER (terminal) number.
+# A `ps` that prints NOTHING did not answer (every live box has at least a shell and this tick); a
+# `ps` that answered with no lane in it is a genuinely idle box and counts as 0.
+# ⛔ THE PREDICATE IS TOKEN-STRICT, AND THAT IS A MEASURED CHOICE, NOT A STYLE ONE.
+# A lane process is one whose OWN argv names it as a lane: a token whose basename is `pi` (pi sets its
+# process title, so a live lane reads as `pi` or `pi -p --provider …` in `ps`), or a token naming one of
+# the lane scripts the launcher runs. That is the same argv-shape rule `_counts_as_lane` (above) uses for
+# its first loop, and it covers BOTH shapes this box runs — the durable-terminal `pi` and the
+# `bash …/nonblocking-dispatch.sh …` subshell the drainer records.
+# ⛔ IT IS DELIBERATELY STRICTER THAN `_counts_as_lane`'s SECOND LOOP, which matches those script names as
+# a SUBSTRING of the whole command line. Measured on the operator's Mac 2026-11-11: that form returned
+# **43** matches, four of which were the diagnostic's own `bash -c '… nonblocking-dispatch.sh …'` text —
+# the same self-match lane.sh:88 records for `pgrep -f "pi -p"`. A predicate that counts the shells which
+# merely MENTION a lane script cannot bound anything: on a box whose agents quote these names it reads
+# high enough that the clamp never fires, i.e. the fix would be INERT and the log would look clean.
+# Token-strict returned 39 on that same box: the same real lanes, none of the diagnostic text.
+# WHAT IT OVER-INCLUDES, stated so nobody reads it as a true lane count: an INTERACTIVE `pi` session on
+# the operator's Mac matches too. That is the safe direction — it can only raise the bound, never lower
+# it — and it is why this is a bound and not a census.
+# ⛔ ONE `ps` PER TICK, not one per lane: the census runs inside the lock on a 20-minute cadence, and a
+# per-lane process walk is the cost option 2 of #3882 declines.
+_is_lane_process() { # <command-line> → true when THIS argv IS a lane, not when it merely names one
+  local c="$1" t b
+  [ -n "$c" ] || return 1
+  for t in $c; do
+    b="${t##*/}"
+    [ "$b" = "pi" ] && return 0
+    case "$b" in
+      nonblocking-dispatch.sh|bg-dispatch.sh|lane.sh|fix-one.sh|merge-one.sh|chain-merge.sh|dispatch-merge.sh) return 0 ;;
+    esac
+  done
+  return 1
+}
+_live_lane_processes() { # prints the count of live lane processes, or nothing when `ps` cannot answer
+  local out c n=0
+  out="$("$PS" -A -o command= 2>/dev/null)" || return 1
+  [ -n "$out" ] || return 1        # a `ps` with no output at all did NOT answer (see above)
+  while IFS= read -r c; do
+    _is_lane_process "$c" && n=$((n + 1))
+  done <<<"$out"
+  printf '%s' "$n"
+}
 _census_launcher() { # prints the count, or nothing when unreadable
-  local n
-  n="$(wt_count lane- fix- merge- chain- 2>/dev/null)"
-  case "$n" in ''|*[!0-9]*) return 1 ;; esac
+  local n wtn procs
+  wtn="$(wt_count lane- fix- merge- chain- 2>/dev/null)"
+  case "$wtn" in ''|*[!0-9]*) return 1 ;; esac
+  n="$wtn"
+  # The clamp (see the block above). An unreadable process count leaves `n` EXACTLY as today.
+  procs="$(_live_lane_processes)" || procs=""
+  case "$procs" in
+    ''|*[!0-9]*) : ;;
+    *) if [ "$procs" -lt "$wtn" ]; then
+         n="$procs"
+         # ⛔ LOGGED HERE, not by the caller, because the caller reads this function through a COMMAND
+         # SUBSTITUTION (a subshell) — a value returned that way would never be seen by it, so a caller
+         # that logged the drift would log nothing and the clamp would apply silently. `log_line`
+         # appends to `$LOG`, which the subshell can write.
+         log_line "census-mismatch launcher=$wtn pi=$procs clamped=$procs"
+       fi ;;
+  esac
   printf '%s' "$n"
 }
 
