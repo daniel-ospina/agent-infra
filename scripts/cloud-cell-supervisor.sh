@@ -4807,7 +4807,13 @@ jev_state_line() {
     # newline in the source or a heredoc, and this repo's bash 3.2 refuses a quoted heredoc inside a
     # double-quoted assignment (see STORE_STATE_PY). A store that will not parse prints nothing, which
     # reads as "no key" here — the BRING-UP is where `unreadable` is its own, distinct refusal.
-    k="$(python3 -c 'import json,sys;d=json.load(open(sys.argv[1]));print((d.get("apiKey") if isinstance(d,dict) else "") or "")' "$cfg" 2>/dev/null)"
+    # ⛔ THE SAME ACCEPTANCE RULE AS THE GATE AND THE BRING-UP (#2642 review): truthiness stringified
+    # a non-string into a false `configured`. `ask-owner.py::_key()` returns the RAW JSON value and
+    # `jev()` sends `Bearer {key}`, so a number, object, array or `true` is not a credential — it takes
+    # the unkeyed branch or 401s, and every question is UNSCORED. `isinstance(…, str)` is the type
+    # test `cloud-cell-bringup.sh::write_jev_store` already makes; both surfaces must answer alike
+    # because an operator reads them as one verdict.
+    k="$(python3 -c 'import json,sys;d=json.load(open(sys.argv[1]));k=d.get("apiKey") if isinstance(d,dict) else None;print(k if isinstance(k,str) else "")' "$cfg" 2>/dev/null)"
     if [ -n "$(printf '%s' "$k" | tr -d '[:space:]')" ]; then
       printf 'jev: configured (%s, mode %s) — ask-owner.py can score a question, so it reaches the owner queue\n' "$cfg" "$(stat -c '%a' "$cfg" 2>/dev/null || stat -f '%Lp' "$cfg" 2>/dev/null || echo unknown)"
       return 0

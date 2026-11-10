@@ -2766,6 +2766,58 @@ BR_ENV_FILE="$JEVKEYS" br ok normal --check
   && ok "a BLANK stored apiKey is repaired (a whitespace value is not a credential)" \
   || bad "a blank apiKey was accepted as configured, or the repair skipped it: $(cat "$JEVCFG" 2>/dev/null)"
 
+say_case "the decision gate: a WRONG-TYPED apiKey is not a credential (#2642 review)"
+# ⛔ `jev_store_state` used `| tostring`, so ANY non-null value — a number, an object, an array,
+# `true` — rendered as non-empty text and the store answered `present`. The gate cannot score with
+# one: `ask-owner.py::_key()` returns the RAW JSON value, so `0`/`{}` take the unkeyed branch and
+# `{"a":1}`/`true` are sent as `Bearer {'a': 1}` / `Bearer True` and 401 — every question UNSCORED.
+# MEASURED pre-fix: the box printed `jev: configured` and `CELL READY` over a dead owner queue and
+# never repaired the store. A wrong-typed value must be `empty` (the REPAIR arm), the same rule
+# `write_jev_store` already applies to what it writes.
+for wrong in '{"apiKey":{"a":1},"model":"jev-stored"}' '{"apiKey":0}' '{"apiKey":["k"]}' '{"apiKey":true}'; do
+  printf '%s\n' "$wrong" > "$JEVCFG"
+  chmod 600 "$JEVCFG"
+  printf '%s\n' "$TOK_BODY" > "$TOK"
+  BR_ENV_FILE="$JEVKEYS" br ok normal --check      # this box's keys.env DOES deliver a usable key
+  # ⛔ NO `rc` ASSERTION HERE, DELIBERATELY. The discriminating fact is the STORE'S POST-STATE: if a
+  # wrong-typed value still read `present`, the repair arm is never reached and the store keeps a value
+  # the gate cannot send. That is rc-independent, so this arm measures the fix rather than whether the
+  # whole bring-up run can complete on this host (a box missing its harness worktree fails later, for
+  # reasons unrelated to the decision gate — the sibling cases above own that rc).
+  [ "$(jq -r '.apiKey // ""' "$JEVCFG" 2>/dev/null)" = "fake-jev-key" ] \
+    && ok "…$wrong: the wrong-typed store is REPAIRED from keys.env, not read as `present`" \
+    || bad "…$wrong: the store still holds a value ask-owner.py cannot send, so it read as present: $(cat "$JEVCFG" 2>/dev/null)"
+  case "$BR_OUT" in
+    *"REPAIRED decision gate"*) ok "…$wrong: and the repair is REPORTED (not a silent rewrite)" ;;
+    *) bad "…$wrong: the repair was silent: $BR_OUT" ;;
+  esac
+  case "$BR_OUT" in
+    *"jev: configured"*) ok "…$wrong: and configured is claimed only AFTER the repair" ;;
+    *) bad "…$wrong: the bring-up never reported the repaired store as configured: $BR_OUT" ;;
+  esac
+  # …and a field the script does not understand survives the repair, exactly as for the blank case.
+  [ "$wrong" != '{"apiKey":{"a":1},"model":"jev-stored"}' ] \
+    || { [ "$(jq -r '.model // ""' "$JEVCFG" 2>/dev/null)" = "jev-stored" ] \
+           && ok "…and a field it does not understand ('model') is PRESERVED across the repair" \
+           || bad "the wrong-typed repair dropped a field it did not understand: $(cat "$JEVCFG" 2>/dev/null)"; }
+done
+# The other half of the mapping: with NOTHING to repair from, the box is REFUSED — never certified on
+# a store the gate cannot use, and never silently emptied of the value it holds.
+printf '{"apiKey":{"a":1}}\n' > "$JEVCFG"
+chmod 600 "$JEVCFG"
+printf '%s\n' "$TOK_BODY" > "$TOK"
+BR_ENV_FILE="$T/keys-nojev.env" br ok normal --check      # no decision-gate key anywhere to repair from
+[ "$BR_RC" -ne 0 ] \
+  && ok "…and with no key in keys.env a wrong-typed store REFUSES the box (not certified, not guessed)" \
+  || bad "a store ask-owner.py cannot use certified the box with nothing to repair it from"
+case "$BR_OUT" in
+  *"CELL READY"*) bad "CLAIMED readiness over a wrong-typed apiKey the gate cannot send" ;;
+  *) ok "…does not claim CELL READY over a wrong-typed apiKey" ;;
+esac
+[ "$(jq -c '.apiKey' "$JEVCFG" 2>/dev/null)" = '{"a":1}' ] \
+  && ok "…and the refused box's store is left EXACTLY as it was (no silent deletion of a credential file)" \
+  || bad "the refusal rewrote or emptied a store it could not repair: $(cat "$JEVCFG" 2>/dev/null)"
+
 say_case "the decision gate: an AMBIENT key is not a source, and the refusal says so"
 rm -f "$JEVCFG"
 printf '%s\n' "$TOK_BODY" > "$TOK"

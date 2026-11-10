@@ -28,7 +28,11 @@ existed on the laptop and on no cell.
 
 1. `$TYPESAFE_API_KEY` (the vendor's own name),
 2. `$JEV_API_KEY` (the older name — a plist or a cell env may carry it),
-3. `$HOME/.pi/agent/jev-config.json`, a 0600 JSON store with an `apiKey` field.
+3. `$HOME/.pi/agent/jev-config.json`, a 0600 JSON store with an `apiKey` field. **The field must be a
+   JSON string**: the gate reads the raw value and sends it as `Bearer <value>`, so a number, object,
+   array or `true` is not a credential — it either takes the unkeyed branch or comes back `jev http
+   401`. A store holding one reads as *no usable key* on every surface below (it is repaired from
+   `keys.env` when the box has one, and otherwise refuses), never as `configured`.
 
 On a cell, **`scripts/cloud-cell-bringup.sh::check_decision_gate` is the writer**, and the box's own
 `keys.env` is the only source it will read:
@@ -48,8 +52,8 @@ The store is durable on purpose: a reader that sources nothing (a systemd unit, 
 
 | surface | behaviour |
 |---|---|
-| `cloud-cell-bringup.sh --check` | **REFUSES** the box, by name (`CHECK FAILED [decision gate]: …`), before `CELL READY` and before the paid provider probe. A store that exists but cannot be parsed is refused too — the script will not replace a credential file it cannot read. |
-| `cloud-cell-supervisor.sh status` | one **read-only** line: `jev: configured (…)` / `⛔ jev: MISSING …` / `⛔ jev: a TypeSafe key is set in THIS shell but NOT in keys.env …`. It names the one command that repairs; it never writes. |
+| `cloud-cell-bringup.sh --check` | **REFUSES** the box, by name (`CHECK FAILED [decision gate]: …`), before `CELL READY` and before the paid provider probe. A store that exists but cannot be parsed is refused too — the script will not replace a credential file it cannot read. A store whose `apiKey` is not a JSON **string** is not a credential the gate can send: it is treated as an empty store and REPAIRED from `keys.env` (other fields preserved), or refused when the box has no key to repair it from. |
+| `cloud-cell-supervisor.sh status` | one **read-only** line: `jev: configured (…)` / `⛔ jev: MISSING …` / `⛔ jev: a TypeSafe key is set in THIS shell but NOT in keys.env …`. `configured` is claimed only for a string-valued `apiKey` the gate can actually send (the same rule the bring-up applies). It names the one command that repairs; it never writes. |
 | `ask-owner.py <repo> <n>` | exit 2 is honest, and its REASON is named: a scoring failure from `jev()` (no key, a rejected key, a failed call) prints the cause line and then `UNSCORED — the owner queue did not receive this`. The other exit-2 causes name themselves without that sentence (`could not read <repo>#<n>`, `could not read the answer state … UNKNOWN`, `jev returned no answer for …`). |
 | `ask-owner.py --scan` | the summary line carries `unscored=N` on both arms, and every unscored question is NAMED above it as `UNSCORED <repo>#<n> — …`, one line per question, with the cause on the line above. `orchestrator-heartbeat.sh` sums that field into `N_ASK` (so the naming lines reach the log) and logs one `ALERT ask-gate UNSCORED …` per tick. |
 

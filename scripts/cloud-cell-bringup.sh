@@ -1030,7 +1030,18 @@ jev_store_state() {
   local cfg="${1:-}" k
   [ -f "$cfg" ] || { printf 'absent\n'; return 0; }
   jq -e 'type == "object"' "$cfg" >/dev/null 2>&1 || { printf 'unreadable\n'; return 0; }
-  k="$(jq -r '(.["apiKey"] // "") | tostring' "$cfg" 2>/dev/null)" || { printf 'unreadable\n'; return 0; }
+  # ⛔ THE VALUE'S TYPE IS PART OF THE PREDICATE (#2642 review). `| tostring` rendered ANY non-null
+  # value — a number, an object, an array, `true` — as non-empty text, so a store the gate cannot use
+  # still answered `present` and the box went on to `CELL READY`. The gate's own reader
+  # (`ask-owner.py::_key()`) returns the RAW JSON value and `jev()` builds `Bearer {key}` from it: `0`
+  # and `{}` are falsy and take the unkeyed branch, `{"a":1}` and `true` are sent as
+  # `Bearer {'a': 1}` / `Bearer True` and 401 — every one of them UNSCORED, exit 2. `write_jev_store`
+  # below already accepts only `type == "string"`, so `tostring` made this READER wider than the
+  # WRITER and wider than the gate. A wrong-typed value is `empty`: the arm that already REPAIRS from
+  # `$ENV_FILE`, and that refuses when there is nothing to repair from.
+  jq -e '(.["apiKey"] // null) | type == "string"' "$cfg" >/dev/null 2>&1 \
+    || { printf 'empty\n'; return 0; }
+  k="$(jq -r '.apiKey // ""' "$cfg" 2>/dev/null)" || { printf 'unreadable\n'; return 0; }
   [ -n "$(printf '%s' "$k" | tr -d '[:space:]')" ] || { printf 'empty\n'; return 0; }
   printf 'present\n'
 }
@@ -1110,7 +1121,7 @@ check_decision_gate() {
       # Either the store was already provisioned, or a previous key was rotated. A store that DISAGREES
       # with what $ENV_FILE delivers is reported, never overwritten: which one is current is not this
       # script's call (the same rule the provider store follows).
-      if key="$(jev_key_env)" && [ "$key" != "$(jq -r '(.["apiKey"] // "") | tostring' "$cfg" 2>/dev/null)" ]; then
+      if key="$(jev_key_env)" && [ "$key" != "$(jq -r '.apiKey // ""' "$cfg" 2>/dev/null)" ]; then
         log_line "jev: $cfg holds a DIFFERENT key than $ENV_FILE delivers — ask-owner.py reads the STORE, so the stored value is the one used. If the key was rotated, update or remove $(printf '%s' "$cfg") by hand (this script will not overwrite an existing credential)."
       fi
       chmod 600 "$cfg" 2>/dev/null

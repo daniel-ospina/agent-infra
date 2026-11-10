@@ -6774,6 +6774,19 @@ case "$OUT" in
   *"jev: configured"*"jev-config.json"*) ok "status reads an existing 0600 store as configured, naming the file it read" ;;
   *) bad "status did not read the provisioned store as configured: $OUT" ;;
 esac
+# ⛔ A WRONG-TYPED apiKey IS NOT `configured` (#2642 review). The reader stringified a truthy
+# non-string, so `{"apiKey":{"a":1}}` read as configured while `ask-owner.py` builds
+# `Bearer {'a': 1}` from the raw value and gets a 401 — the operator would be told the gate works on a
+# box where it cannot score a single question. The bring-up's `jev_store_state` and the writer
+# `write_jev_store` both already require a string; both surfaces must answer alike.
+printf '{"apiKey":{"a":1},"model":"jev-latest"}\n' > "$DG/home/.pi/agent/jev-config.json"
+chmod 600 "$DG/home/.pi/agent/jev-config.json"
+OUT="$(dg_sup)"
+case "$OUT" in
+  *"jev: configured"*) bad "status called a wrong-typed apiKey configured — ask-owner.py cannot send it (Bearer {'a': 1} → 401), so every question is UNSCORED: $OUT" ;;
+  *"jev: MISSING"*) ok "a wrong-typed apiKey is NOT read as configured (only a JSON string is a credential the gate can send)" ;;
+  *) bad "a wrong-typed apiKey is reported as neither configured nor MISSING: $OUT" ;;
+esac
 # The FILE is the contract: an ambient export reaches no worker (tmux serves the session the SERVER's
 # environment), so it must be reported as the near-miss it is rather than as configured.
 rm -f "$DG/home/.pi/agent/jev-config.json"
