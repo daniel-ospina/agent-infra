@@ -2885,6 +2885,14 @@ is_lane_branch() { # <branch-ref> -> 0 when the harness itself created this bran
 # it is the same channel the parent already reads for `refs=remote-holds:`. `<floor>` is the class
 # floor (hours) the record is PAST — every caller applies that floor before emitting (review round 2,
 # PR #3881: a floor quoted for a record that cannot be dated states a bound that was never applied).
+# age_h_ceil <now> <ts> — whole hours PAST-ROUNDED. ⛔ EVERY stalled row uses it, because the floor
+# tests in `classify_one` compare SECONDS while the row prints HOURS: truncated, a record 24h30m old
+# printed `age=24h floor=24h` — indistinguishable from a record AT its floor, which is NOT listed, so
+# the row could not show the one thing it exists to state (that it is PAST the floor). Review rounds
+# 3 and 4 (#3881) each found an emitter still truncating; one helper is what stops a fourth site
+# being written by hand.
+age_h_ceil() { printf '%s\n' 99; }
+
 stalled_tok() {
     # ⛔ AN EMPTY ISSUE PRINTS `?`, NEVER A BARE `#` (review, PR #3881): `issue=#` is a field an
     # operator cannot read and a test cannot match, and both classes that call this are lane-owned
@@ -4141,23 +4149,21 @@ classify_one() {
                         "$cpay" "$REAP_WT_WIP_AGE_HOURS"
                     return 0
                 fi
-                if :; then
-                    # ⛔ CEILING, NOT TRUNCATION (#3881 review round 3): the floor test compares
-                    # SECONDS, so a record 24h30m old truncated to `age=24h floor=24h` could not be
-                    # SEEN to be past it — and "past its floor" is the one thing this row exists to
-                    # state. Rounding up makes `age > floor` visible by construction.
-                    _st_age=$(( ((now - wt_ts) + 3599) / 3600 ))
-                    # ⛔ THE CLASS FLOOR STILL APPLIES WITH THE SWITCH OFF (review, PR #3881). It is
-                    # what covers `worktree add` -> first commit: without it a lane's FIRST uncommitted
-                    # edit (0 commits, dirty, no live claim) was published as stale residue on the very
-                    # next sweep, and #2179 §Required 2 scopes the list to records PAST their floor for
-                    # exactly that reason. What the switch changes is the CONSEQUENCE of reaching the
-                    # floor — releasable (armed) vs REVIEWABLE (unarmed), which `why=opt-in-off` says.
-                    if [ "$((now - wt_ts))" -le "$((REAP_WT_WIP_AGE_HOURS * 3600))" ]; then
-                        printf 'preserve\tdirty\t\trule=2 proof=git-status --porcelain %s (inside the %sh abandoned-wip floor; nothing to review yet)\n' \
-                            "$cpay" "$REAP_WT_WIP_AGE_HOURS"
-                        return 0
-                    fi
+                # ⛔ `wt_ok` IS PROVEN HERE — the `!= 1` early return above is the only path that
+                # reaches this line with an undated checkout, so there is no second guard to write
+                # and none to leave behind: an `if [ "$wt_ok" = 1 ]` (or a bare `if :`) wrapper here
+                # reads as a floor guard while testing nothing (review round 3, PR #3881).
+                _st_age="$(age_h_ceil "$now" "$wt_ts")"
+                # ⛔ THE CLASS FLOOR STILL APPLIES WITH THE SWITCH OFF (review, PR #3881). It is
+                # what covers `worktree add` -> first commit: without it a lane's FIRST uncommitted
+                # edit (0 commits, dirty, no live claim) was published as stale residue on the very
+                # next sweep, and #2179 §Required 2 scopes the list to records PAST their floor for
+                # exactly that reason. What the switch changes is the CONSEQUENCE of reaching the
+                # floor — releasable (armed) vs REVIEWABLE (unarmed), which `why=opt-in-off` says.
+                if [ "$((now - wt_ts))" -le "$((REAP_WT_WIP_AGE_HOURS * 3600))" ]; then
+                    printf 'preserve\tdirty\t\trule=2 proof=git-status --porcelain %s (inside the %sh abandoned-wip floor; nothing to review yet)\n' \
+                        "$cpay" "$REAP_WT_WIP_AGE_HOURS"
+                    return 0
                 fi
                 printf 'preserve\tdirty\t\trule=2 proof=git-status --porcelain %s %s\n' "$cpay" \
                     "$(stalled_tok abandoned-wip "$issue" "$_st_age" "${REAP_WT_WIP_AGE_HOURS}h" opt-in-off)"
@@ -4205,7 +4211,7 @@ classify_one() {
                 # 0 ahead, lane-owned, old", and a stash naming this branch is exactly the parked work
                 # the dirty tree cannot show. `landing-proved=1` — the `refs=merged` case above is an
                 # ancestry proof for THIS head, the same exemption rule 3 takes on the same datum.
-                abstain_gate "$path" "$branch" "$refs" 1 "$(stalled_tok abandoned-wip "$issue" "$(((now - wt_ts) / 3600))" "${REAP_WT_WIP_AGE_HOURS}h" withheld-by-abstention)" && return 0
+                abstain_gate "$path" "$branch" "$refs" 1 "$(stalled_tok abandoned-wip "$issue" "$(age_h_ceil "$now" "$wt_ts")" "${REAP_WT_WIP_AGE_HOURS}h" withheld-by-abstention)" && return 0
                 printf 'remove\tabandoned-wip\t%s\trule=L refs=merged dirty=%s age=%sh claim=%s witness=worktree-record backup=required\n' \
                     "$cpay" "$(((now - wt_ts) / 3600))" "$claim"
                 return 0
@@ -4359,7 +4365,7 @@ classify_one() {
             # order matters: the ghost class deletes the CHECKOUT **and** its 0-ahead branch ref, so a
             # stash the register names for that branch must be able to stop it. `landing-proved=1` is
             # exactly rule 3's exemption — `refs=merged` above is an ancestry proof for this head.
-            abstain_gate "$path" "$branch" "$refs" 1 "$(stalled_tok ghost-zero-ahead "$issue" "$(((now - wt_ts) / 3600))" "${REAP_WT_GHOST_AGE_HOURS}h" withheld-by-abstention)" && return 0
+            abstain_gate "$path" "$branch" "$refs" 1 "$(stalled_tok ghost-zero-ahead "$issue" "$(age_h_ceil "$now" "$wt_ts")" "${REAP_WT_GHOST_AGE_HOURS}h" withheld-by-abstention)" && return 0
             log "CLASSIFY ghost $path issue=${issue:-?} claim=$claim age=$(((now - wt_ts) / 3600))h ghost_floor=${REAP_WT_GHOST_AGE_HOURS}h"
             printf 'remove\tghost-zero-ahead\t%s\trule=L refs=merged proof=%s ghost=lane-branch:%s claim=%s age=%sh witness=worktree-record clean=disposable-only unref=%s,no-open-pr delete_lane_branch=yes\n' \
                 "$eph" "$proof_txt" "${issue:-?}" "$claim" "$(((now - wt_ts) / 3600))" "${stale_txt:-no-proc}"

@@ -3733,6 +3733,47 @@ assert_absent "$ROW" "stalled=1" \
 assert_contains "$(grep -F 'SUMMARY ' <<<"$OUT" | tail -1)" "stalled=0" "A29h …so the tally stays 0"
 assert_dir "$WT" "A29h and nothing was removed on an unreadable probe"
 
+# ── A29i/A29j: the listed `age=` must be PAST-ROUNDED, or the row cannot show its own qualifier ─
+# ⛔ THE FLOOR TESTS COMPARE SECONDS; the row prints HOURS. Truncated, a 2h30m record printed
+# `age=2h floor=2h` — indistinguishable from a record AT its floor, which is NOT listed — so the row
+# could not show the ONE thing it exists to state (that it is PAST it). Round 3 fixed only the unarmed
+# arm's token; both armed/abstention tokens still truncated (review round 4). Each leg pins one of the
+# two sites the fix now routes through `age_h_ceil`, at a time offset that truncation CANNOT express:
+# `now` is the real clock + floor + 30m, so the truth is one hour past the printed floor.
+NOW_GHOST_PAST="$((NOW_REAL + 2 * 3600 + 1800))"     # 2h30m => age=3h, floor=2h
+NOW_WIP_PAST="$((NOW_REAL + 24 * 3600 + 1800))"      # 24h30m => age=25h, floor=24h
+
+# A29i — the GHOST arm's token (the default path: no flag needed). A durable stash entry names the
+# branch, so `abstain_gate` withholds the removal AND the row carries the class token.
+ENV=A29i; REPO="$(mk_repo $ENV)"
+WT="$(add_named_wt "$REPO" "$ENV-ghost" feat/2950-tm)"     # clean, 0 ahead, lane-owned
+register_stash "$REPO" feat/2950-tm
+rm -f "$T/$ENV/reap.log"
+OUT="$(REAP_WT_DRY_RUN_OVERRIDE=0 REAP_WT_NOW_EPOCH_OVERRIDE="$NOW_GHOST_PAST" REAP_WT_MAIN_REF_OVERRIDE=refs/heads/main \
+    run_reaper $ENV --apply --repo "$REPO")"; RC=$?
+ROW="$(row_for "$OUT" "$WT")"
+assert_contains "$ROW" "stalled=1 class=ghost-zero-ahead" \
+    "A29i non-vacuity: the ghost arm's token fired (a row without it would pass on any age)"
+assert_contains "$ROW" "age=3h floor=${REAP_WT_GHOST_AGE_HOURS_OVERRIDE:-2}h" \
+    "A29i a 2h30m record reads age=3h, NOT age=2h — the row must SHOW it is past its 2h floor"
+assert_dir "$WT" "A29i the abstention still kept the checkout"
+
+# A29j — the ARMED abandoned-wip token. Same shape as A29g (durable stash entry, `--reap-abandoned-wip`
+# armed) at a time offset truncation cannot express: 24h30m must read 25h against the 24h floor.
+ENV=A29j; REPO="$(mk_repo $ENV)"
+WT="$(add_named_wt "$REPO" "$ENV-wip" feat/2951-tm)"
+printf 'edited\n' >"$WT/base.txt"
+register_stash "$REPO" feat/2951-tm
+rm -f "$T/$ENV/reap.log"
+OUT="$(REAP_WT_DRY_RUN_OVERRIDE=0 REAP_WT_NOW_EPOCH_OVERRIDE="$NOW_WIP_PAST" REAP_WT_MAIN_REF_OVERRIDE=refs/heads/main \
+    run_reaper $ENV --apply --reap-abandoned-wip --repo "$REPO")"; RC=$?
+ROW="$(row_for "$OUT" "$WT")"
+assert_contains "$ROW" "stalled=1 class=abandoned-wip" \
+    "A29j non-vacuity: the armed arm's token fired"
+assert_contains "$ROW" "age=25h floor=${REAP_WT_WIP_AGE_HOURS_OVERRIDE:-24}h" \
+    "A29j a 24h30m record reads age=25h, NOT age=24h — the row must SHOW it is past its 24h floor"
+assert_dir "$WT" "A29j the abstention still kept the checkout"
+
 # ── A29-MUT: the COLLECTOR is load-bearing (drop it and A29a goes red) ───────────────────
 # The token is emitted inside `classify_one`, which runs in a command substitution, so the parent's
 # `case` is the ONLY thing that turns it into a list. Neutering that pattern leaves every row
