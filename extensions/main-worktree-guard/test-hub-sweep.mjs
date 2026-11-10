@@ -37,6 +37,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { register, registerHooks, stripTypeScriptTypes } from "node:module";
+import { reportVerdict } from "../shared/verdict.mjs";
 
 const HERE = fileURLToPath(new URL(".", import.meta.url));
 const INDEX_TS = join(HERE, "index.ts");
@@ -452,14 +453,20 @@ console.log("");
 // same reasoning as the sibling `test-unborn-head.mjs:344-355` (pre-fix
 // `✅ 0 passed, 0 failed, 1 skipped` exit 0; post-fix `❌ …` exit 1).
 if (skip > 0 && pass === 0) {
+  // agent-infra#2723 — `red` reports the vacuity as the failure it is, so the line
+  // stays attributable (the parser ignores a 0-failed aggregate) while the exit
+  // code below stays 1.
+  reportVerdict("test-hub-sweep", pass, fail, { skip, red: true });
   console.log(`❌ test-hub-sweep: the whole suite was SKIPPED (${skip} skipped) — ` +
     `a green step over ZERO assertions is a false PASS, not a pass`);
   process.exit(1);
 }
 if (fail === 0) {
-  console.log(`✅ test-hub-sweep: ${pass} passed, 0 failed, ${skip} skipped`);
+  // agent-infra#2723 — one attributable emitter for both arms, so the failing arm
+  // always carries the `runner::test-hub-sweep` identity the merge rail reads.
+  reportVerdict("test-hub-sweep", pass, 0, { skip });
   process.exit(0);
 }
-console.log(`❌ test-hub-sweep: ${pass} passed, ${fail} failed, ${skip} skipped`);
+reportVerdict("test-hub-sweep", pass, fail, { skip });
 for (const f of failures) console.log(`   • ${f}`);
 process.exit(1);
