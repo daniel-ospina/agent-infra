@@ -1320,7 +1320,9 @@ land_backlog_exempt_note() { # <label> <exempt-why>
       # advice "fix the READ, not the credential" is exactly wrong on the arm where the credential is the cause.
       # ⛔ `token-blank` IS ON THIS LIST, NOT THE CREDENTIAL-CAUSE ONE ABOVE, AND THAT LABEL IS DEFENSIVE: the
       # `cause`-non-empty branch above is the one that fires for it, because `gh_auth_cause` speaks for it by
-      # contract (A17, `gh-auth.test.sh:330`) — and it does so precisely so a blank-but-set token can never reach
+      # contract (arm A17 in `gh-auth.test.sh` — cited by ARM NAME, not by line: the line this comment first
+      # carried pointed at A16, the arm asserting the OPPOSITE property) — and it speaks precisely so a
+      # blank-but-set token can never reach
       # a line that says "the lane's gh IS credentialed" (gh resolves the blank instead of any store, so the
       # credential IS the cause even though a name is set — see `gh-auth.sh`'s header measurement). This arm is
       # reachable only with an empty state, i.e. when the module is absent.

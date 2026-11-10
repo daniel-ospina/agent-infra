@@ -1866,7 +1866,8 @@ found="$(cd "$ROOT" && { grep -rlE 'brief-gate\.sh|brief_gate_(lib|run|verify|se
 #     under test is reached. ⛔ CITED BY SYMBOL, NOT BY LINE — the line NUMBER was in the first cut of this
 #     sentence and the same commit's edits shifted it (review round 13, P3; the class `gh-auth.test.sh`'s
 #     header already declares: a line number in a comment about claim-accuracy is itself a claim that rots) — so the suite renders its brief fixture by CALLING
-#     `$HERE/brief-gate.sh --section lane` (`gh-auth.test.sh:163`) rather than hard-coding a block that would drift
+#     `$HERE/brief-gate.sh --section lane` from its own `run_lane` rather than hard-coding a block that would
+#     drift (cited by SYMBOL too: the line number this sentence first carried had already rotted by round 15)
 #     from the gate. It dispatches no writer of its own (the `pi` it starts is a stub), so it is a
 #     REFERENCER: it joins this equality without joining the dispatch population. Undeclared it
 #     reddens the arm with `ADDED: scripts/orchestrator-harness/gh-auth.test.sh`, which is the

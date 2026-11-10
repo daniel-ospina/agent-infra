@@ -243,18 +243,18 @@ gh_auth_resolve() {
     esac
   fi
   if [ -n "${GH_CONFIG_DIR:-}" ]; then
-    if [ -f "${GH_CONFIG_DIR}/hosts.yml" ]; then printf 'ambient|%s\n' "$GH_CONFIG_DIR"
+    if _gh_auth_store_readable "${GH_CONFIG_DIR}/hosts.yml"; then printf 'ambient|%s\n' "$GH_CONFIG_DIR"
     else printf 'ambient-missing|%s\n' "$GH_CONFIG_DIR"; fi
     return 0
   fi
-  if [ -n "${XDG_CONFIG_HOME:-}" ] && [ -f "${XDG_CONFIG_HOME}/gh/hosts.yml" ]; then
+  if [ -n "${XDG_CONFIG_HOME:-}" ] && _gh_auth_store_readable "${XDG_CONFIG_HOME}/gh/hosts.yml"; then
     printf 'xdg|%s\n' "${XDG_CONFIG_HOME}/gh"; return 0
   fi
   if v="$(_gh_auth_file_value "$ef" GH_CONFIG_DIR)"; then
-    [ -f "$v/hosts.yml" ] && { printf 'keys|%s\n' "$v"; return 0; }
+    _gh_auth_store_readable "$v/hosts.yml" && { printf 'keys|%s\n' "$v"; return 0; }
   fi
   if v="$(_gh_auth_file_value "$ef" XDG_CONFIG_HOME)"; then
-    [ -f "$v/gh/hosts.yml" ] && { printf 'keys-xdg|%s\n' "$v/gh"; return 0; }
+    _gh_auth_store_readable "$v/gh/hosts.yml" && { printf 'keys-xdg|%s\n' "$v/gh"; return 0; }
   fi
   # ⛔ A SET `XDG_CONFIG_HOME` IS A CHAIN WITH NO FALLBACK PAST IT, SO THE `home` ARM MUST NOT BE CLAIMED
   # UNDER ONE (fresh-context review of #3872, finding 1). The manual quoted in the header makes
@@ -270,13 +270,13 @@ gh_auth_resolve() {
   # The store that IS there is a real credential gh will not find on its own — the same shape as `account`
   # (and `keys-xdg` already exports over an env-file `XDG_CONFIG_HOME`) — so it is PROVIDED, under its own
   # state so no log line can read it as gh's default and no reader has to guess whether an export happened.
-  if [ -n "$home" ] && [ -f "$home/.config/gh/hosts.yml" ]; then
+  if [ -n "$home" ] && _gh_auth_store_readable "$home/.config/gh/hosts.yml"; then
     if [ -n "${XDG_CONFIG_HOME:-}" ]; then printf 'home-xdg|%s\n' "$home/.config/gh"
     else printf 'home|%s\n' "$home/.config/gh"; fi
     return 0
   fi
   [ -n "$acct" ] || acct="$(gh_auth_account_home)"
-  if [ -n "$acct" ] && [ -f "$acct/.config/gh/hosts.yml" ]; then
+  if [ -n "$acct" ] && _gh_auth_store_readable "$acct/.config/gh/hosts.yml"; then
     printf 'account|%s\n' "$acct/.config/gh"; return 0
   fi
   printf 'none|\n'
@@ -352,10 +352,23 @@ gh_auth_log() {
 # "holds no hosts.yml" about a directory it had never opened, and `ambient-missing` said the same about
 # an explicitly-set `GH_CONFIG_DIR` whose store was right there. A directory we cannot open is a source
 # we did not read, and the refusal says so.
+# ⛔ THE SAME CONFLATION EXISTED ONE LAYER DOWN (review round 15, P2): `[ -f dir/hosts.yml ]` answers TRUE
+# for a store FILE this process cannot READ, so a lane store whose `hosts.yml` is `chmod 000` — a
+# root-owned or backup-restored file on a cell — was claimed as a credential: `gh_auth_resolve` answered
+# `home`, `gh_auth_cause` stayed SILENT (it speaks only on a positive reading of an UNUSABLE credential),
+# and the refusal then told the operator "the lane's gh IS credentialed … fix the READ, not the
+# credential" while the real `gh` on that same store dies `failed to read configuration: … permission
+# denied`. Existence is not readability, and a store we cannot READ is not a store we have — so ONE
+# predicate decides it, for the helper AND for every store arm of `gh_auth_resolve`, and the two cannot
+# disagree the way `[ -f ]` and a separate readability test would.
+_gh_auth_store_readable() { # <hosts.yml path>
+  [ -f "$1" ] && [ -r "$1" ]
+}
 _gh_auth_store_in() {
   local d="${1:-}"
   [ -n "$d" ] || { printf 'empty\n'; return 0; }
-  if [ -f "$d/hosts.yml" ]; then printf 'ok\n'; return 0; fi
+  if _gh_auth_store_readable "$d/hosts.yml"; then printf 'ok\n'; return 0; fi
+  if [ -f "$d/hosts.yml" ]; then printf 'unreadable\n'; return 0; fi
   if [ -d "$d" ] && { [ ! -r "$d" ] || [ ! -x "$d" ]; }; then printf 'unreadable\n'; return 0; fi
   printf 'empty\n'
 }
@@ -402,7 +415,7 @@ gh_auth_cause() {
       ;;
     ambient-missing)
       if [ "$(_gh_auth_store_in "$d")" = unreadable ]; then
-        printf 'GH_CONFIG_DIR=%s is set but this read could not OPEN it (it exists and is not readable/traversable by this process), so it cannot say whether it holds a hosts.yml — fix that directory PERMISSIONS on the box; the credential may well be there' "$d"
+        printf 'GH_CONFIG_DIR=%s is set but this read could not OPEN it — the directory is not traversable, or its hosts.yml is not READABLE, by this process — so it cannot say whether it holds a usable store. Fix those PERMISSIONS on the box; the credential may well be there' "$d"
       else
         printf 'GH_CONFIG_DIR=%s is set but holds no hosts.yml' "$d"
       fi

@@ -43,7 +43,9 @@
 #     with a mutant that kept the suite at `passed: 61 failed: 0`.
 #
 # ⛔ HERMETIC: every arm runs `env -u GH_CONFIG_DIR -u XDG_CONFIG_HOME -u GH_TOKEN -u GITHUB_TOKEN` — the
-# resolver/cause arms through `u()` (`:85`), the end-to-end `run_lane` arms through the `env -u` it builds
+# resolver/cause arms through `u()` (the `env -u … bash -c` helper above the `pi` stub — cited by SYMBOL,
+# because a line number here is a claim that rots the moment this header grows a line), the end-to-end
+# `run_lane` arms through the `env -u` it builds
 # itself — so a runner that exports one of those (this fleet's cells DO) cannot move an arm in EITHER
 # direction: the failure #2138 records in `test_objective.py`, one suite over, and the false BLOCK four
 # `gh_auth_cause` arms produced before review round 14 put them under `u()` too. The passwd record is the
@@ -681,6 +683,35 @@ case "$CAN_AMB" in *"is set but this read could not OPEN it"*) rc=0 ;; *) rc=1 ;
 ck "B10e …and an unreadable ambient GH_CONFIG_DIR is refused as unopenable, not as 'holds no hosts.yml'" $rc
 case "$CAN_AMB" in *"is set but holds no hosts.yml"*) rc=1 ;; *) rc=0 ;; esac
 ck "B10f …which is the exact sentence that was false about a store that was right there" $rc
+
+# ── B13: A STORE THAT EXISTS BUT CANNOT BE READ IS NOT A CREDENTIAL EITHER (review round 15, P2) ─────
+# `[ -f dir/hosts.yml ]` answers TRUE for a store FILE this process cannot read, so a lane store whose
+# `hosts.yml` is `chmod 000` (root-owned, or restored from a backup with its mode) was CLAIMED as a
+# credential: resolve said `home`, `gh_auth_cause` stayed silent, and the refusal told the operator "the
+# lane's gh IS credentialed … fix the READ", while the real `gh` on that store dies `failed to read
+# configuration: … permission denied`. `_gh_auth_store_readable` now decides it for the helper AND for
+# every store arm of the resolver, so the two cannot disagree.
+# ⛔ THE SHAPE IS INJECTED, NOT RE-CREATED WITH `chmod`: uid 0 bypasses the permission bits, so a
+# chmod-based fixture would go GREEN on every root box (this fleet's cells run as root) — an arm that
+# cannot fail there. Overriding the ONE predicate the code uses tests the discrimination itself, at any
+# uid. (The predicate's own two directions are pinned separately, right below, on real files.)
+STORE="$TMP/store-r"; mkdir -p "$STORE/.config/gh"; cp "$ACCT/.config/gh/hosts.yml" "$STORE/.config/gh/hosts.yml"
+u ". '$GH_AUTH' >/dev/null 2>&1; _gh_auth_store_readable '$STORE/.config/gh/hosts.yml'"; rc=$?
+ck "B13 _gh_auth_store_readable answers TRUE for a readable hosts.yml — the predicate's positive direction" $rc
+u ". '$GH_AUTH' >/dev/null 2>&1; _gh_auth_store_readable '$TMP/absent/hosts.yml'" && rc=1 || rc=0
+ck "B13b …and FALSE for an absent one, so it is a test and not a constant" $rc
+_out="$(u ". '$GH_AUTH' >/dev/null 2>&1; _gh_auth_store_readable() { return 1; }; _gh_auth_store_in '$STORE/.config/gh'")"
+[ "$_out" = unreadable ]; rc=$?
+ck "B13c …with the predicate FALSE over a store that EXISTS, the helper answers unreadable, never 'ok' ('$_out')" $rc
+_r="$(u ". '$GH_AUTH' >/dev/null 2>&1; _gh_auth_store_readable() { return 1; }; gh_auth_resolve '$STORE' '$TMP/none.env' '$ACCT_EMPTY'")"
+[ "${_r%%|*}" = none ]; rc=$?
+ck "B13d …and the RESOLVER does not claim it — the lane whose store it cannot read resolves 'none', not 'home' ('${_r%%|*}')" $rc
+_c="$(u ". '$GH_AUTH' >/dev/null 2>&1; _gh_auth_store_readable() { return 1; }; gh_auth_cause '$STORE' '$TMP/none.env' '$ACCT_EMPTY'")"
+case "$_c" in *"<unreadable: $STORE/.config/gh>"*) rc=0 ;; *) rc=1 ;; esac
+ck "B13e …and the cause DISCLOSES it as unreadable rather than naming it empty" $rc
+_r2="$(u ". '$GH_AUTH' >/dev/null 2>&1; _gh_auth_store_readable() { return 1; }; GH_CONFIG_DIR='$STORE/.config/gh' gh_auth_resolve '$LANE_HOME' '$TMP/none.env' '$ACCT_EMPTY'")"
+[ "${_r2%%|*}" = ambient-missing ]; rc=$?
+ck "B13f …and a set-but-unreadable ambient GH_CONFIG_DIR stays ambient-missing ('${_r2%%|*}'), which is the state whose cause names the fault" $rc
 
 echo
 echo "───────────────────────────────────────"
