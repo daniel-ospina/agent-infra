@@ -932,9 +932,15 @@ ANCHORS = {
     # so the row falls through to the rules and a merged row is RECLAIMED. That is
     # "cannot read the register" being read as "the register is clear" (fail-open),
     # and before M5 no fixture executed this arm, so the edit kept the suite green.
+    # ⛔ THE ANCHOR IS THE CASE LABEL ALONE (PR #3881 review round 3). It used to span the label AND
+    # the next printf line, so adding a comment between them made it match ZERO times — and a mutant
+    # that matched nothing left M5 asserting a switch no mutation had flipped. The label occurs ONCE
+    # in the file, and renaming it is what the mutation MEANS: the case no longer matches, so
+    # "cannot read the register" falls through to "the register is clear". (No apostrophes here: this
+    # block is a single-quoted python -c argument — see the warning on the ANCHORS header.)
     "no-stash-unverifiable-arm": (
-        "        unreadable)\n            printf \x27preserve\\tstranded-stash-unverifiable",
-        "        __mutant_arm_removed__)\n            printf \x27preserve\\tstranded-stash-unverifiable",
+        "        unreadable)",
+        "        __mutant_arm_removed__)",
     ),
     # the ROTATION cursor per-repo key: drop the REPO_CANON component, i.e. return
     # to the repo-agnostic filename the ⛔ comment in the script says was a real
@@ -3457,7 +3463,15 @@ assert_absent "$(cat "$T/$ENV/reap.log")" "REMOVED-FORCED" "A28d the forced remo
 SUM="$(grep -F 'SUMMARY ' <<<"$OUT" | tail -1)"
 assert_contains "$SUM" "stalled=0" \
     "A28d a FAILED removal is not on the stalled list (it is counted under remove= and failed=)"
-assert_contains "$SUM" "preserved=0" "A28d precondition: the record was counted as a selected removal"
+# ⛔ EXACT FIELD, NOT A SUBSTRING (review round 3, PR #3881). `assert_contains "$SUM" "preserved=0"` can
+# NEVER fail: the SUMMARY always carries `late_preserved=0`, which supplies `preserved=0` as a substring
+# whatever the real value is. Parsed at a field boundary instead, so the precondition is pinned.
+sum_field() { sed -n "s/.*[ ]$1=\([0-9][0-9]*\).*/\1/p" <<<"$2" | head -1; }
+# preserved=1 is the MAIN CHECKOUT, and 1 is exactly what this pins: the failed removal adds NOTHING
+# to preserved (it is under remove=), which is the half that could make `preserved - stalled` underflow.
+assert_eq "$(sum_field preserved "$SUM")" "1" \
+    "A28d the failed removal is NOT counted as preserved (only the main checkout is)"
+assert_eq "$(sum_field remove "$SUM")" "1" "A28d precondition: remove=1 — the failed record is a selected removal"
 
 # ── A28e: the ref MOVES between classification and deletion => branch KEPT ───────────
 # The TOCTOU the re-proof exists for: the checkout is still residue (it is removed), but
@@ -3680,6 +3694,44 @@ assert_absent "$(row_for "$OUT" "$WT")" "stalled=1" \
     "A29f a record INSIDE the 24h abandoned-wip floor is NOT stale residue"
 assert_contains "$(grep -F 'SUMMARY ' <<<"$OUT" | tail -1)" "stalled=0" \
     "A29f …so the tally is 0 (the class floor covers worktree-add -> first commit)"
+
+# ── A29g: only a DURABLE stash entry is stalled — an unreadable REGISTER is not ───────────
+# A29f pinned the floor; this pins the OTHER half of "no later pass can resolve it". The two shapes
+# look alike in the artifact (both are an abstention that kept a lane record) and only one of them
+# survives a pass: `stranded_stash_for` re-reads the same register next sweep and finds the same entry,
+# while `STASH_STATE=unreadable` is a transient `mktemp`/timeout failure. (Round 3 of the PR's own
+# review found the token on BOTH; this leg is what makes re-adding it to the transient arm go red.)
+ENV=A29g; REPO="$(mk_repo $ENV)"
+WT="$(add_named_wt "$REPO" "$ENV-wip" feat/2948-tm)"
+printf 'edited\n' >"$WT/base.txt"
+register_stash "$REPO" feat/2948-tm
+rm -f "$T/$ENV/reap.log"
+OUT="$(REAP_WT_DRY_RUN_OVERRIDE=0 REAP_WT_NOW_EPOCH_OVERRIDE="$NOW_FUTURE" REAP_WT_MAIN_REF_OVERRIDE=refs/heads/main \
+    run_reaper $ENV --apply --reap-abandoned-wip --repo "$REPO")"; RC=$?
+ROW="$(row_for "$OUT" "$WT")"
+assert_contains "$ROW" "reason=stranded-stash" \
+    "A29g a stash ENTRY naming the branch stops the release (parked work outranks the class)"
+assert_contains "$ROW" "stalled=1 class=abandoned-wip" \
+    "A29g …and it IS stalled: the same entry is re-read by every later pass, so nothing releases it"
+assert_contains "$ROW" "why=withheld-by-abstention" "A29g …with the abstention named"
+assert_dir "$WT" "A29g nothing was removed"
+
+# The unreadable REGISTER (not a stash hit) on the same 0-ahead lane class, driven the way M5 drives
+# it: the register READ fails, so the arm abstains. It must NOT be published as stalled residue.
+ENV=A29h; REPO="$(mk_repo $ENV)"
+WT="$(add_named_wt "$REPO" "$ENV-ghost" feat/2949-tm)"
+register_stash "$REPO" feat/2949-tm
+rm -f "$T/$ENV/reap.log"
+OUT="$(GIT_BIN_OVERRIDE="$T/bin/git-fail-stash-log" REAP_WT_DRY_RUN_OVERRIDE=0 \
+    REAP_WT_NOW_EPOCH_OVERRIDE="$NOW_FUTURE" REAP_WT_MAIN_REF_OVERRIDE=refs/heads/main \
+    run_reaper $ENV --apply --repo "$REPO")"; RC=$?
+ROW="$(row_for "$OUT" "$WT")"
+assert_contains "$ROW" "reason=stranded-stash-unverifiable" \
+    "A29h non-vacuity: the pass reached the unreadable-register arm (an empty row would pass on anything)"
+assert_absent "$ROW" "stalled=1" \
+    "A29h an UNREADABLE register is NOT stalled — a transient probe failure the next pass re-takes"
+assert_contains "$(grep -F 'SUMMARY ' <<<"$OUT" | tail -1)" "stalled=0" "A29h …so the tally stays 0"
+assert_dir "$WT" "A29h and nothing was removed on an unreadable probe"
 
 # ── A29-MUT: the COLLECTOR is load-bearing (drop it and A29a goes red) ───────────────────
 # The token is emitted inside `classify_one`, which runs in a command substitution, so the parent's
