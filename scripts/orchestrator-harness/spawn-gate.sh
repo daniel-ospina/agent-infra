@@ -4321,10 +4321,15 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
   # issue's evidence (labels/title) with `gh`, in THIS process, and a lane runs with `HOME` redirected
   # to the operational home while gh's `hosts.yml` lives in the ACCOUNT home — so without this the lane's
   # `gh` is simply unauthenticated, the ratio reads UNREADABLE, and (measured 2026-11-09, two cells) the
-  # refusal blamed the PR queue. `run_agent` is the single invocation every worker goes through, so
-  # resolving here covers `lane.sh`, `fix-one.sh` and `nonblocking-dispatch.sh` at once, and the export
+  # refusal blamed the PR queue. `run_agent` HERE is the invocation `lane.sh`, `fix-one.sh` and
+  # `nonblocking-dispatch.sh` all go through, so resolving here covers those three at once, and the export
   # is INHERITED by the `pi` this function starts and by `wt_spawn`'s launch line — so the store the gate
   # read and the store the lane reads are the same one by construction.
+  # ⛔ AND IT IS NOT "EVERY WORKER" — `merge-one.sh` defines its OWN `run_agent` (`merge-one.sh:512`) that
+  # never sources this module (`grep -c gh_auth merge-one.sh` = 0) while making ~52 `gh` calls, including
+  # the `gh pr view` that decides the head it lands. Saying "every worker" here claimed coverage of a path
+  # that has none: a cell with a redirected lane HOME leaves the merge lane's gh unauthenticated, which is
+  # #2509's OWN defect on the merge path. Recorded on #2509 rather than silently widened here.
   # ⛔ A MISSING MODULE (a `$O` that predates it) is reported and changes NOTHING else: this gate must
   # never be the reason a lane cannot start.
   if command -v gh_auth_log >/dev/null 2>&1; then
