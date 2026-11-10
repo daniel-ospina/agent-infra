@@ -226,8 +226,16 @@ jobs:
           [ -z "${O:-}" ] || { echo "FAIL: O is still set — this arm grades the canonical tree, not the box's deployment"; exit 1; }
           bash scripts/orchestrator-harness/check-single-source.sh
       - name: a REAL comparison passes (deployed copy identical to canonical)
+        # ⛔ THE PREMISE IS ON EVERY ARM THAT INVOKES THE CHECKER, NOT ONLY THE `${O:-}` ONES (#2726,
+        # review round). `--o "$d"` does win over the fallback, so this pair of lines is a no-op HERE —
+        # and that is the point: the guard no longer reasons about the `--o` VALUE, because `--o "$d"`
+        # with `d=""` sets `O_DIR` to the empty string, which `check-single-source.sh:155` reads as
+        # "no target" and re-enters `O_DIR="${O:-}"`. A step that LOOKS explicit therefore still graded
+        # the runner. A uniform premise has no value-shaped hole in it.
         run: |
           set -euo pipefail
+          unset O
+          [ -z "${O:-}" ] || { echo "FAIL: O is still set — this arm compares a copy it builds itself, not the box's deployment"; exit 1; }
           d="$(mktemp -d)"
           cp scripts/orchestrator-harness/*.sh "$d"/
           bash scripts/orchestrator-harness/check-single-source.sh --require-target --o "$d"
@@ -257,8 +265,11 @@ jobs:
             echo "FAIL: rc 1, but no divergence names /tmp/planted-fork/lane.sh — the planted fork was NOT what redded this run:";
             sed -n '1,20p' /tmp/planted-fork.err; exit 1; }
       - name: NON-VACUITY — a divergent deployed copy is refused
+        # Same premise as every other arm here — see the note on the step above (#2726, review round).
         run: |
           set -euo pipefail
+          unset O
+          [ -z "${O:-}" ] || { echo "FAIL: O is still set — this arm grades the copy it diverges on purpose, not the box's deployment"; exit 1; }
           d="$(mktemp -d)"
           cp scripts/orchestrator-harness/*.sh "$d"/
           printf '%s\n' '# drift' >> "$d/spawn-gate.sh"

@@ -70,7 +70,7 @@ job-level `env:` cannot substitute for an `unset`.
 | `unset O` (step 2) | `check-single-source.sh:155` → `:331` | without it, `${O:-}` names the box's deployment and the arm byte-compares it instead of grading canonical completeness |
 | `unset O` (step 6) | `check-single-source.sh:155` → `:383` | without it, `--require-target` finds the ambient target and exits 1 (DIVERGENCE) where the arm requires 2 (UNKNOWN) |
 | the premise assertion | the same two steps | names a dropped `unset` in place, instead of redding later with a misleading divergence count |
-| `--o "$d"` steps (unchanged) | `check-single-source.sh` arg parsing | explicit `--o` already wins over `${O:-}`, so steps 3 and 5 are hermetic by construction — no change needed |
+| `--o "$d"` steps | `check-single-source.sh` arg parsing | explicit `--o` already wins over `${O:-}` — but they now carry the same premise too (`unset O` + assertion), see the review round below: the guard stopped reasoning about the `--o` VALUE, because `--o "$d"` with `d=""` re-enters `${O:-}` |
 
 ## Implementation steps
 
@@ -115,3 +115,44 @@ job-level `env:` cannot substitute for an `unset`.
   to adjudicate — that is a rail-side question, named there, not here.
 
 **Acceptance:** every `R<n>` has its named evidence, and no open item remains on the declared surface.
+
+## Review round 2 — the premise GUARD was syntactic (P1), and one posted number was wrong (P2)
+
+A fresh-context reviewer (the harness's, at `2859a5fcc`) found the workflow change correct and the
+**new guard** unsound: three measured routes certified an UNGUARDED arm as guarded. Each was
+reproduced here before any fix (a mutant of the full workflow, suite unchanged):
+
+| route | shape | pre-fix result |
+|---|---|---|
+| (a) body extraction | `run_body` collected only on `run: \|`, so a **single-line `run:`** yielded an empty body and the step was dropped at `audit`'s `[ -n "$body" ] \|\| continue` | `PASS 9 · FAIL 0` with an unguarded arm present |
+| (b) `--o` exemption | the exemption matched `--o` with no notion of its **value**; `:155` re-enters `${O:-}` for an EMPTY `O_DIR` | `PASS 9 · FAIL 0` with an arm whose `--o "$d"` had `d=""` |
+| (c) order | `grep -Fxq 'unset O'` tested PRESENCE while the header claimed "preceded by" | `PASS 9 · FAIL 0` with the unset moved below the invocation |
+
+**Fix (all four of the reviewer's required halves):**
+
+1. Generic `run:` extraction — `|`/`>` blocks (with `-`/`+` and indentation indicators) **and**
+   single-line bodies — plus a fail-closed `UNEXTRACTABLE` finding for a step that names the checker
+   but whose body cannot be read. No shape is silently skipped.
+2. The `--o` exemption is **dropped**, so every invoking arm carries the premise. `unset O` is a
+   no-op on an explicit-`--o` arm (measured: all 5 checker steps rc 0 with `O` unset, with
+   `O=$HOME/orchestrator`, and with `O=''`), and a uniform rule has no value-shaped hole. This is
+   the reviewer's sanctioned alternative, and it supersedes the "steps 3 and 5 need no change" line
+   in the Wiring table above.
+3. ORDER is compared (line, then column) for both the `unset` and the assertion.
+4. One negative control per new shape: premised-accepted, non-invoking-not-flagged,
+   comment-only-not-an-invocation, single-line (premise and assertion variants), folded `>`,
+   explicit `--o`, empty `--o`, `LATE-PREMISE`, `LATE-ASSERTION`, `UNEXTRACTABLE`; the mutant
+   population is now DERIVED from the workflow (and FAILS if it shrinks below 5), and a new
+   order-mutant pins the ordering claim.
+
+Non-vacuity: the rewritten suite is **23/23 on the fixed tree**, **4 failures against this branch's
+pre-fix workflow** (the two now-premised `--o` arms), and each of the three routes above reds it by
+name. The two new arms' in-place assertions were re-measured live: deleting their `unset O` and
+running with `O=$HOME/orchestrator` gives rc 1 with the named message.
+
+**Finding 2 (P2, the shard count) — FALSIFIED, no change.** The comment posted "201 shards; new
+suite discovered as #183" and the reviewer read the two numbers as disagreeing (claiming 182/183).
+Re-measured at this head: `bash scripts/run-bash-shards.sh --list | wc -l` → **201** paths and
+`... --list | grep -n harness-single-source-premise` → **183**; `--list` prints only paths, and
+`tests/harness-single-source-premise/run.sh` is discovered by the `tests/*/run.sh` glob. Both numbers
+reproduce exactly as posted, so the line stands.
