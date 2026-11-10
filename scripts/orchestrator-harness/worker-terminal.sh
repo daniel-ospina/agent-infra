@@ -1340,14 +1340,24 @@ if mode=="liveness" and not isinstance(d.get("terminals"),list):
     sys.exit(3)
 ws={w.get("id"):(w.get("name") or "") for w in d.get("workspaces",[]) or []}
 tabs={t.get("id"):t.get("content_id") for t in d.get("tabs",[]) or []}
-# ⛔ A RECORD THAT IS PRESENT BUT DOES NOT STATE LIVENESS IS NOT AN EXITED ONE (review P1).
-# `bool(t.get("running"))` mapped an ABSENT `running` key to `False`, i.e. to "this terminal exited",
-# so a build that renamed the field (`"state": "running"`, measured as the review's repro) made every
-# tab read as NOT RUNNING — the accounting below then passed (no `None`, no `True`) and `idle` — the one
-# value the sweep DELETES on — was assigned for a workspace that may be live. The census tolerates an
-# absent key in the SAFE direction elsewhere (`wt_tree_probe` reads it dead, which costs a re-spawn);
-# in this path it decides a deletion, so absence is `None` (UNREADABLE) and `exit(3)` is taken below.
-run={t.get("id"):(bool(t.get("running")) if "running" in t else None) for t in d.get("terminals",[]) or []}
+# ⛔ A RECORD THAT DOES NOT STATE LIVENESS IS NOT AN EXITED ONE (review rounds 2 and 3).
+# `bool(t.get("running"))` mapped an ABSENT key to `False`, i.e. to "this terminal exited", so a build
+# that renamed the field (`"state": "running"`, measured) made every tab read as NOT RUNNING; and testing
+# only for key PRESENCE still let a value that states NOTHING (`null`, `""`) fall through `bool()` to the
+# same `False` (measured: `running:null` and `running:""` both ran `workspace rm`). Both then satisfied
+# the accounting below and assigned `idle` — the ONE value the sweep DELETES on — for a workspace that may
+# be live. The census tolerates an absent key in the SAFE direction elsewhere (`wt_tree_probe` reads it
+# dead, which costs a re-spawn); on the deletion path it must be UNREADABLE, so anything that is not a
+# boolean or a number is `None` and `exit(3)` is taken below. 0/1 stays READABLE on purpose: a numeric
+# encoding is a plausible build difference, and folding it into `None` would turn this sweep into an
+# enforcer that can never fire.
+def _live(v):
+    if isinstance(v,bool):
+        return v
+    if isinstance(v,(int,float)):
+        return bool(v)
+    return None
+run={t.get("id"):_live(t.get("running")) for t in d.get("terminals",[]) or []}
 seen=[]
 # ⛔ LIVENESS MODE IS PER WORKSPACE, NOT PER SCREEN (agent-infra#2312 fix-round review, reproduced).
 # `screens` is MANY-TO-ONE on `workspace_id` — a workspace holds panes/tabs, each carrying its own
@@ -2375,14 +2385,31 @@ wt_sweep_idle_workspaces() {
   max="${WT_IDLE_SWEEP_MAX:-50}"; case "$max" in ''|*[!0-9]*|0*) max=50 ;; esac
   tree="$(wt_bounded "${WT_TREE_TIMEOUT:-15}" cmux tree --json 2>/dev/null)" || return 0
   [ -n "$tree" ] || return 0
-  rows="$(printf '%s\n' "$tree" | python3 -c "$WT_WS_PY" "$name" liveness 2>/dev/null)" || rows=""
+  # ⛔ AN UNREADABLE READING IS NOT AN EMPTY ONE — AT THE READ THAT DECIDES WHETHER THIS RUNS AT ALL
+  # (review P2). Discarding python's status here made an `exit(3)` refusal — the shape the liveness
+  # accounting exists for — BYTE-IDENTICAL to "there was nothing to free": same silence, same rc 0. One
+  # drifted tab (a `terminals[]`/id-shape difference across builds, the file's own recorded risk) then
+  # disarmed the sweep for that name for ever while every operator surface read healthy, and `wt_spawn`
+  # went on adding one workspace per dispatch — the leak this change exists to stop, resumed in silence.
+  # It now SAYS SO and frees nothing: a refusal is a reading about the CENSUS, not a clearance.
+  if ! rows="$(printf '%s\n' "$tree" | python3 -c "$WT_WS_PY" "$name" liveness 2>/dev/null)"; then
+    wt_warn "IDLE SWEEP ${name:-<all wt-*>}: the census could NOT be read for liveness (an unreadable or drifted document) — nothing was freed, and this is not a 'nothing to free' reading"
+    return 0
+  fi
   [ -n "$rows" ] || return 0
   while IFS="$(printf '\t')" read -r k id st; do
     [ "$k" = "ws" ] || continue
     [ "$st" = "idle" ] || continue      # live | empty | anything else: spared, never guessed at
     [ -n "$id" ] || continue
     [ "$n" -lt "$max" ] || break
-    cmux workspace rm "$id" >/dev/null 2>&1
+    # ⛔ BOUNDED, LIKE THE TWO READS BESIDE IT (review P2). `cmux workspace rm` was the ONE unbounded
+    # daemon call this function put on the controller's SYNCHRONOUS spawn path, up to WT_IDLE_SWEEP_MAX
+    # (50) per spawn — and the loop that drains a 124-workspace backlog is precisely the case that runs
+    # when the daemon is degraded. The file's own rule for this path (:159-171) is that an unbounded
+    # daemon call there is "a controller that silently stops cycling". A bound that fires costs one
+    # un-freed workspace that the next pass retries; the re-read below already reports the outcome
+    # honestly, so a killed `rm` cannot be mistaken for a clearance.
+    wt_bounded "${WT_TREE_TIMEOUT:-15}" cmux workspace rm "$id" >/dev/null 2>&1
     n=$(( n + 1 ))
   done <<EOF
 $rows

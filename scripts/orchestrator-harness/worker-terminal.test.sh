@@ -251,6 +251,10 @@ case "${1:-}" in
     [ "${2:-}" = "close" ] && printf '%s\n' "${3:-}" >> "${CMUX_CLOSED:-/dev/null}"
     ;;
   workspace)
+    # ⛔ A WEDGED DAEMON ON THE MUTATION PATH (review round 3, P2): it ACCEPTS the call and never returns.
+    # The sweep's `workspace rm` is on the controller's synchronous spawn path, so the only thing that may
+    # stop it is the bound this function already gives the two reads beside it.
+    [ "${2:-}" = "rm" ] && [ "${CMUX_RM_HANG:-0}" = "1" ] && { sleep "${CMUX_RM_HANG_SECS:-30}"; exit 0; }
     # the stateful registry: `workspace rm <id>` really removes the row (see the `tree` arm)
     if [ "${2:-}" = "rm" ] && [ -n "${CMUX_WS_STATE:-}" ] && [ -n "${3:-}" ]; then
       [ "${CMUX_RM_IGNORED:-0}" = "1" ] && exit 0
@@ -3021,6 +3025,28 @@ case "${5:-}" in
     CMUX_TREE_JSON='{"workspaces":[{"id":"ws_live","name":"wt-lane-7"}],"screens":[{"id":"s1","workspace_id":"ws_live","layout":{"root":{"tab_ids":["t1"]}}}],"tabs":[{"id":"t1","content_id":"term_1"}],"terminals":[{"id":"term_1","state":"running"}]}' \
       wt_sweep_idle_workspaces "lane-7"
     printf 'rm_calls=%s\n' "$(grep -c 'workspace rm' "$CMUX_LOG" 2>/dev/null || echo 0)" ;;
+  nullrun)
+    # ⛔ A `running` VALUE THAT STATES NOTHING IS NOT AN EXITED ONE (review round 3, P2, reproduced):
+    # `running: null` and `running: ""` are PRESENT keys, so a presence test passed them through `bool()`
+    # to `False` — "this terminal exited" — and the sweep deleted the workspace. Measured before the fix:
+    # `running:null` ⇒ 1 `workspace rm`.
+    unset CMUX_WS_STATE
+    CMUX_TREE_JSON='{"workspaces":[{"id":"ws_l","name":"wt-lane-7"}],"screens":[{"id":"s1","workspace_id":"ws_l","layout":{"root":{"tab_ids":["t1"]}}}],"tabs":[{"id":"t1","content_id":"term_1"}],"terminals":[{"id":"term_1","running":null}]}' \
+      wt_sweep_idle_workspaces "lane-7"
+    printf 'rm_calls=%s\n' "$(grep -c 'workspace rm' "$CMUX_LOG" 2>/dev/null || echo 0)" ;;
+  rmbounded)
+    # ⛔ THE MUTATION IS BOUNDED (review round 3, P2): a daemon that accepts `workspace rm` and never
+    # returns must not hang the controller's synchronous spawn path. WT_TREE_TIMEOUT is the bound this
+    # function already gives its two reads; this arms it at 1s against a 30s hang.
+    printf 'ws_old1\twt-lane-7\t0\n' > "$CMUX_WS_STATE"
+    _t0="$(date +%s)"
+    CMUX_RM_HANG=1 CMUX_RM_HANG_SECS=30 WT_TREE_TIMEOUT=1 wt_sweep_idle_workspaces "lane-7"
+    printf 'elapsed=%s\n' "$(( $(date +%s) - _t0 ))" ;;
+  nothingfree)
+    # …and a genuinely EMPTY registry is a READING, not a refusal: the sweep prints nothing at all, so the
+    # refusal message cannot become noise on every healthy cycle.
+    wt_sweep_idle_workspaces "lane-7"
+    printf 'done=1\n' ;;
   twoscreensempty)
     # ⛔ `empty` MUST OUTRANK `idle` ACROSS SCREENS (mutation check, 2026-11-10): one screen whose terminal
     # EXITED and one with NO tab at all (a create in flight on a second screen of the same workspace). The
@@ -3118,6 +3144,23 @@ ck "…and the count says 1 workspace, never 2, for one address" $rc
 out="$(bash "$TMP/s1.sh" "$LIB" "$TMP/bin-cmux" "$TMP/O2s5" "$TMP/cmux2s5.log" staterename 2>&1)"
 case "$out" in *"rm_calls=0"*) rc=0 ;; *) rc=1; echo "      $out";; esac
 ck "⛔ a terminal record that does not STATE liveness is UNREADABLE, not exited — a renamed field removes nothing" $rc
+
+out="$(bash "$TMP/s1.sh" "$LIB" "$TMP/bin-cmux" "$TMP/O2s10" "$TMP/cmux2s10.log" nullrun 2>&1)"
+case "$out" in *"rm_calls=0"*) rc=0 ;; *) rc=1; echo "      $out";; esac
+ck "⛔ a \`running\` value that states NOTHING (null) removes nothing — a present key is not a verdict" $rc
+
+out="$(bash "$TMP/s1.sh" "$LIB" "$TMP/bin-cmux" "$TMP/O2s11" "$TMP/cmux2s11.log" rmbounded 2>&1)"
+_el="$(printf '%s\n' "$out" | sed -n 's/^elapsed=//p' | tail -1)"
+[ -n "$_el" ] && [ "$_el" -lt 10 ] 2>/dev/null && rc=0 || { rc=1; echo "      $out"; }
+ck "⛔ a daemon that never returns from \`workspace rm\` is BOUNDED (elapsed ${_el:-?}s, hang was 30s)" $rc
+
+out="$(bash "$TMP/s1.sh" "$LIB" "$TMP/bin-cmux" "$TMP/O2s12" "$TMP/cmux2s12.log" nothingfree 2>&1)"
+case "$out" in *"could NOT be read for liveness"*) rc=1 ;; *) rc=0 ;; esac
+ck "…while a genuinely empty registry stays SILENT (the refusal above is not noise on a healthy cycle)" $rc
+
+out="$(bash "$TMP/s1.sh" "$LIB" "$TMP/bin-cmux" "$TMP/O2s13" "$TMP/cmux2s13.log" unreadable 2>&1)"
+case "$out" in *"could NOT be read for liveness"*) rc=0 ;; *) rc=1; echo "      $out";; esac
+ck "⛔ a census the sweep cannot READ says so — an \`exit(3)\` refusal is not a 'nothing to free' silence" $rc
 
 out="$(bash "$TMP/s1.sh" "$LIB" "$TMP/bin-cmux" "$TMP/O2s9" "$TMP/cmux2s9.log" twoscreensempty 2>&1)"
 case "$out" in *"rm_calls=0"*) rc=0 ;; *) rc=1; echo "      $out";; esac
