@@ -374,7 +374,20 @@ case "$ASK_RAW" in
       N_ASK=$((N_ASK + 1))
       ASK_EV="$ASK_EV scan_failed=${N_SCANFAIL}"
     fi
-    N_ASK=$(printf '%s' "$ASK_EV" | awk '{for(i=1;i<=NF;i++){if(split($i,a,"=")==2 && (a[1]=="pass" || a[1]=="bounce" || a[1]=="answered")) s+=a[2]}} END{print s+0}')
+    N_ASK=$(printf '%s' "$ASK_EV" | awk '{for(i=1;i<=NF;i++){if(split($i,a,"=")==2 && (a[1]=="pass" || a[1]=="bounce" || a[1]=="answered" || a[1]=="unscored")) s+=a[2]}} END{print s+0}')
+    # ⛔ `unscored` IS PART OF THIS SUM (agent-infra#2642), and it is summing it that makes the
+    # questions NAMED rather than merely counted: a question the gate could not score (no TypeSafe key
+    # on the box) exits 2, which put it in NO bucket — so a fleet whose decision gate was dead read
+    # exactly like a quiet tick, and the `ask|` lines that name the questions were dropped by the
+    # `N_ASK -gt 0` gate below. `ask-owner.py` emits the field on both summary arms and prints the
+    # `UNSCORED — the owner queue did not receive this` sentence, which is what lands in the log here.
+    N_UNSCORED=$(printf '%s' "$ASK_EV" | awk '{for(i=1;i<=NF;i++){if(split($i,a,"=")==2 && a[1]=="unscored") s+=a[2]}} END{print s+0}')
+    if [ "${N_UNSCORED:-0}" -gt 0 ]; then
+      # Forced into the log for the same reason as `scan_failed` above: a question that never reached
+      # the owner's queue is not a statistic to be rate-limited away. The beat itself already carries
+      # `unscored=N` inside $ASK_EV; this line says what it costs and where to look.
+      log "ALERT ask-gate UNSCORED ${N_UNSCORED} question(s) — ask-owner.py could not score them (no TypeSafe key on this box), so they are posted and READABLE but NOT in the owner-decision queue. Provision it: docs/ops/decision-gate.md"
+    fi
     # An answer that could not be routed to a lane has to be carried by hand, so the
     # whole scan output is kept: the summary line says HOW MANY, only these lines say
     # WHICH. Without this the failure mode is an answer nobody ever delivers.

@@ -342,7 +342,19 @@ _blk_sig="$(grep -E '^[[:space:]]*(if|while|until|for|case|fi|done|esac)([[:spac
 # before and after, the diff of the matched lines is exactly this one line, and the byte delta
 # 5720 → 5732 reconciles character for character (`1.0` twice = +4, `,"/262k"` = +8). The
 # executable-line pin below did NOT move, and the shipped egress is untouched.
-lint 'block-keyword line signature (cksum of the opener/closer lines)' "$_blk_sig" "9059128745732"
+# ⛔ RE-PINNED A SIXTH TIME 2026-11-10, DELIBERATELY, WITH THE DIFF CHECKED — and this one is an
+# ADDITIVE block in the ASK section (agent-infra#2642), not a rewrite. `ask-owner.py` now puts the
+# questions it could not score in their own bucket (`unscored=N` on both summary arms) and prints the
+# `UNSCORED — the owner queue did not receive this` sentence; the heartbeat therefore SUMS that field
+# into N_ASK (so the `ask|` lines that NAME the questions are no longer dropped when the gate scored
+# nothing) and logs one ALERT when it is non-zero. Verified when re-pinning, not assumed: the added
+# executable lines are exactly FOUR — `N_UNSCORED=…`, the `if`, the `log`, and the `fi` (589 → 593) —
+# and the block-keyword signature moved only because that `if`/`fi` pair is itself the added block.
+# NOTHING on the shipped egress moved: no `send` token was added, no `$MSG` read was added (the alert
+# goes to the LOG, never to the payload), and both block depths are unmoved. The delivered beat was
+# already carrying the field — `ASK_EV` is the scan's own last line — so no golden changed either,
+# which the byte-for-byte golden assertions below prove rather than assume.
+lint 'block-keyword line signature (cksum of the opener/closer lines)' "$_blk_sig" "31830192925781"
 # ⛔ AND THE FOOTER SIGNATURE MUST ACCEPT THE BUDGET pi ACTUALLY DRAWS (2026-10-31).
 # `_pane_has_pi` decides whether a pane is driven by pi from a footer marker, so a marker that
 # does not match the LIVE rendering reads a settled lane as unread/idle — the failure that cost a
@@ -365,7 +377,7 @@ done
 # extra line with no block keyword and no `send` token — `[ "$N_TOTAL" -le 4 ] || exit 0` — was measured
 # green, silencing the beat on every 5-11 lane fleet. So the number of executable lines is pinned.
 _exec_lines="$(printf '%s\n' "$_nc" | grep -c '[^[:space:]]' | tr -d ' ')"
-lint 'executable lines (comment-stripped, non-blank)' "$_exec_lines" 589
+lint 'executable lines (comment-stripped, non-blank)' "$_exec_lines" 593
 case "$_case_prev" in
   '#'*) pass "the primary send has a comment immediately above it (no control line was inserted)" ;;
   *)    fail "the line above the primary send is not a comment ('${_case_prev:0:60}') — a conditional was wrapped around the send, which silences the beat for whichever states fail it" ;;
