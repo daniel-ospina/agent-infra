@@ -852,6 +852,13 @@ has_legend=0
 awk '/^#   REFUSED-UNJUDGED/,/^#   DIED/' "$UP" 2>/dev/null | grep -qF 'TWO SHAPES' && \
   awk '/^#   REFUSED-UNJUDGED/,/^#   DIED/' "$UP" 2>/dev/null | grep -qF 'NO-OP' && has_legend=1
 ck "(d) the row LEGEND also names rc 2 as two shapes with opposite remedies (not one, above the row)" "$([ "$has_legend" = 1 ] && echo 0 || echo 1)"
+# ⛔ AND IT MUST NOT SEND THE OPERATOR TO `$O` (fresh-context review of #3846, cycle 5). The lock lives in
+# the RESOLVED state dir (`${ORC_STATE_DIR:-$O}`, `hp_launchd_dead_text`) — this file records that exact
+# wording as the P3 defect it fixed one reader over, and the legend named `$O/.orch.lock` anyway, 26 lines
+# above its own correction. A path-naming revert reddens here instead of shipping a path that may not exist.
+legend_has_O=0
+awk '/^#   REFUSED-UNJUDGED/,/^#   DIED/' "$UP" 2>/dev/null | grep -qF '$O/.orch.lock' && legend_has_O=1
+ck "(d) …and the legend names NO \$O path for the lock (it is in the resolved state dir)" "$([ "$legend_has_O" = 1 ] && echo 1 || echo 0)"
 
 # ⛔ `runs = 0` SETTLES "NEVER KICKED" even with no exit code — the count is not discarded when the
 # code is absent (review cycle 2).

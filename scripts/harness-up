@@ -1429,11 +1429,16 @@ hu_row_exec() {
 #                     left alone; here, somebody has to investigate. Sharing one row told the operator
 #                     not to touch a lock that may be the only thing wrong.
 #                     ⛔ AND 74 IS ITSELF TWO SHAPES, WITH A DIFFERENT REMEDY EACH (fresh-context
-#                     review of #3846): (a) the record is still THERE and cannot be read or dated —
-#                     removing it IS the remedy once nothing holds it; (b) a displaced record could
-#                     NOT BE PUT BACK, so `$O/.orch.lock` is absent or 0-byte and the only copy is
-#                     KEPT at a `.reclaim.` path named by `[singleton]` — `rm -f` the lock is then a
-#                     NO-OP and the copy must be moved BACK. This legend is the header an agent greps
+#                     review of #3846). The discriminator is whether `[singleton]` names a KEPT copy:
+#                     (a) NO KEPT COPY IS NAMED — the record is either still there and unreadable or
+#                     undatable (removing it IS the remedy once nothing holds it), or it was already
+#                     gone when the reclaim went to write a new one, in which case there is nothing to
+#                     move back; (b) a displaced record could NOT BE PUT BACK, so the state dir's
+#                     `.orch.lock` is absent or 0-byte and the only copy is KEPT at a `.reclaim.` path
+#                     named by `[singleton]` — `rm -f` the lock is then a NO-OP and the copy must be
+#                     moved BACK. ⛔ THE LOCK IS IN THE **RESOLVED** STATE DIR, never `$O` (see
+#                     `hp_launchd_dead_text` below); this legend names no `$O` path for exactly the
+#                     reason the row it describes does not. This legend is the header an agent greps
 #                     for the row meanings, so it names both shapes rather than the shorter half: the
 #                     rendered row below says which, and sent to the no-op alone it would repeat the
 #                     defect that put the copy there.
