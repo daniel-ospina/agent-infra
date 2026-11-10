@@ -343,14 +343,30 @@ gh_auth_log() {
   printf '[gh-auth] state=%s dir=%s lane_home=%s — %s\n' "$st" "$dshow" "${home:--}" "$why"
 }
 
+# _gh_auth_store_in <dir> — CAN this read tell whether <dir> holds a store? `ok` | `empty` | `unreadable`.
+# ⛔ `[ -f dir/hosts.yml ]` ANSWERS FALSE FOR TWO DIFFERENT FACTS — "no store here" and "I cannot open
+# this directory" — and a cause must not report the second as the first. Measured: a store directory at
+# `chmod 000` holding a real hosts.yml makes `-f` false, so before this helper `gh_auth_cause` said
+# "holds no hosts.yml" about a directory it had never opened, and `ambient-missing` said the same about
+# an explicitly-set `GH_CONFIG_DIR` whose store was right there. A directory we cannot open is a source
+# we did not read, and the refusal says so.
+_gh_auth_store_in() {
+  local d="${1:-}"
+  [ -n "$d" ] || { printf 'empty\n'; return 0; }
+  if [ -f "$d/hosts.yml" ]; then printf 'ok\n'; return 0; fi
+  if [ -d "$d" ] && { [ ! -r "$d" ] || [ ! -x "$d" ]; }; then printf 'unreadable\n'; return 0; fi
+  printf 'empty\n'
+}
+
 # gh_auth_cause <lane-home> [env-file] [account-home] — the CAUSE + REMEDY, or EMPTY when a credential
 # resolves (in which case the caller must NOT blame the credential).
 # ⛔ IT SPEAKS ONLY ON A POSITIVE READING (see POLARITY above): `none` means every directory this read
-# COULD REACH holds no hosts.yml and no token name holds a value. The account home is the one stop it
-# may be unable to reach (an unreadable passwd record); the text then prints `<unresolved account
-# home>` in place of that path rather than asserting it was checked.
+# COULD REACH holds no hosts.yml and no token name holds a value. TWO things can stop it reaching one,
+# and both are DISCLOSED in the text rather than asserted away: an unresolvable passwd record prints
+# `<unresolved account home>` in place of the account path, and a directory this read cannot OPEN prints
+# `<unreadable: …>` in place of its path — see `_gh_auth_store_in`.
 gh_auth_cause() {
-  local home="${1:-${HOME:-}}" ef="${2:-}" acct="${3:-}" r st d
+  local home="${1:-${HOME:-}}" ef="${2:-}" acct="${3:-}" r st d hd ad
   [ -n "$ef" ] || ef="${ENV_FILE:-${home}/keys.env}"
   r="$(gh_auth_resolve "$home" "$ef" "$acct")"
   st="${r%%|*}"; d="${r#*|}"
@@ -361,11 +377,23 @@ gh_auth_cause() {
       ;;
     none)
       [ -n "$acct" ] || acct="$(gh_auth_account_home)"
+      hd="${home:-$HOME}/.config/gh"
+      [ "$(_gh_auth_store_in "$hd")" = unreadable ] && hd="<unreadable: $hd>"
+      if [ -z "$acct" ]; then
+        ad='<unresolved account home>/.config/gh'
+      else
+        ad="$acct/.config/gh"
+        [ "$(_gh_auth_store_in "$ad")" = unreadable ] && ad="<unreadable: $ad>"
+      fi
       printf 'no gh credential for the lane: no GH_TOKEN/GITHUB_TOKEN value in its environment, and no hosts.yml under %s or %s' \
-        "${home:-$HOME}/.config/gh" "${acct:-<unresolved account home>}/.config/gh"
+        "$hd" "$ad"
       ;;
     ambient-missing)
-      printf 'GH_CONFIG_DIR=%s is set but holds no hosts.yml' "$d"
+      if [ "$(_gh_auth_store_in "$d")" = unreadable ]; then
+        printf 'GH_CONFIG_DIR=%s is set but this read could not OPEN it (it exists and is not readable/traversable by this process), so it cannot say whether it holds a hosts.yml — fix that directory PERMISSIONS on the box; the credential may well be there' "$d"
+      else
+        printf 'GH_CONFIG_DIR=%s is set but holds no hosts.yml' "$d"
+      fi
       ;;
     *) return 0 ;;
   esac
