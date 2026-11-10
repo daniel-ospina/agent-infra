@@ -60,7 +60,7 @@ SG="$HERE/spawn-gate.sh"
 # documented operator escape, declared where it applies (see capacity-transfer.test.sh's header).
 export LANE_PREFLIGHT=0
 export MEM_MIN_AVAIL_MB=1
-PASS=0; FAIL=0
+PASS=0; FAIL=0; SKIPPED=0
 ck() { # ck <name> <0|1>
   if [ "$2" -eq 0 ]; then printf '  ✅ %s\n' "$1"; PASS=$((PASS+1));
   else printf '  ❌ %s\n' "$1"; FAIL=$((FAIL+1)); fi
@@ -691,15 +691,37 @@ ck "B10f …which is the exact sentence that was false about a store that was ri
 # lane's gh IS credentialed … fix the READ", while the real `gh` on that store dies `failed to read
 # configuration: … permission denied`. `_gh_auth_store_readable` now decides it for the helper AND for
 # every store arm of the resolver, so the two cannot disagree.
-# ⛔ THE SHAPE IS INJECTED, NOT RE-CREATED WITH `chmod`: uid 0 bypasses the permission bits, so a
-# chmod-based fixture would go GREEN on every root box (this fleet's cells run as root) — an arm that
-# cannot fail there. Overriding the ONE predicate the code uses tests the discrimination itself, at any
-# uid. (The predicate's own two directions are pinned separately, right below, on real files.)
+# ⛔ THE CONSUMER SHAPE IS INJECTED, NOT RE-CREATED WITH `chmod`: uid 0 bypasses the permission bits, so a
+# chmod-based consumer fixture would go GREEN on every root box (this fleet's cells run as root) — an arm
+# that cannot fail there. But injection alone leaves the predicate's own `-r` half unpinned, so B13g/B13h
+# DO build the real shape on a real file and SKIP LOUDLY when the uid makes that impossible (round 16).
 STORE="$TMP/store-r"; mkdir -p "$STORE/.config/gh"; cp "$ACCT/.config/gh/hosts.yml" "$STORE/.config/gh/hosts.yml"
 u ". '$GH_AUTH' >/dev/null 2>&1; _gh_auth_store_readable '$STORE/.config/gh/hosts.yml'"; rc=$?
 ck "B13 _gh_auth_store_readable answers TRUE for a readable hosts.yml — the predicate's positive direction" $rc
 u ". '$GH_AUTH' >/dev/null 2>&1; _gh_auth_store_readable '$TMP/absent/hosts.yml'" && rc=1 || rc=0
 ck "B13b …and FALSE for an absent one, so it is a test and not a constant" $rc
+# ⛔ THE READABILITY DIMENSION NEEDS A REAL-FILE ARM OF ITS OWN (review round 16, P2): the four arms
+# below all move the predicate in the permissive direction, and B13/B13b are satisfied by `[ -f ]` alone —
+# MEASURED: deleting `[ -r "$1" ]` from `_gh_auth_store_readable` left the suite at 105/0 while the
+# round-5 defect came straight back on a real `chmod 000` lane store. So this arm builds the shape on the
+# filesystem, not by injection.
+# ⛔ uid 0 BYPASSES THE PERMISSION BITS (`access(R_OK)` succeeds for the superuser), so this shape CANNOT
+# be constructed as root — the arm is then a declared RESERVATION, printed as a SKIP and never counted as a
+# pass. It is not silently absent: the skip line names the reason, and the suite's count is printed with
+# it. Every non-root box — CI's runners, and the lane that found this — measures the real discrimination.
+FUNREAD="$TMP/store-unread"; mkdir -p "$FUNREAD/.config/gh"; cp "$ACCT/.config/gh/hosts.yml" "$FUNREAD/.config/gh/hosts.yml"
+chmod 000 "$FUNREAD/.config/gh/hosts.yml"
+if [ "$(id -u)" = 0 ]; then
+  SKIPPED=$((SKIPPED+1))
+  printf '  ⏭️  B13g SKIPPED (uid 0 bypasses permission bits, so an unreadable FILE cannot be built here) — the readability dimension is UNMEASURED in this run\n'
+else
+  u ". '$GH_AUTH' >/dev/null 2>&1; _gh_auth_store_readable '$FUNREAD/.config/gh/hosts.yml'" && rc=1 || rc=0
+  ck "B13g …and a REAL hosts.yml that exists but cannot be read is not one — the -r half, not just -f" $rc
+  _ru="$(u ". '$GH_AUTH' >/dev/null 2>&1; _gh_auth_store_in '$FUNREAD/.config/gh'")"
+  [ "$_ru" = unreadable ]; rc=$?
+  ck "B13h …so the helper calls that real store unreadable, not ok ('$_ru')" $rc
+fi
+chmod 644 "$FUNREAD/.config/gh/hosts.yml"
 _out="$(u ". '$GH_AUTH' >/dev/null 2>&1; _gh_auth_store_readable() { return 1; }; _gh_auth_store_in '$STORE/.config/gh'")"
 [ "$_out" = unreadable ]; rc=$?
 ck "B13c …with the predicate FALSE over a store that EXISTS, the helper answers unreadable, never 'ok' ('$_out')" $rc
@@ -715,6 +737,6 @@ ck "B13f …and a set-but-unreadable ambient GH_CONFIG_DIR stays ambient-missing
 
 echo
 echo "───────────────────────────────────────"
-echo "  passed: $PASS   failed: $FAIL"
+echo "  passed: $PASS   failed: $FAIL$([ "$SKIPPED" -gt 0 ] && printf '   SKIPPED: %s (uid 0 — see the ⏭️ line)' "$SKIPPED")"
 [ "$FAIL" -eq 0 ] || exit 1
 exit 0

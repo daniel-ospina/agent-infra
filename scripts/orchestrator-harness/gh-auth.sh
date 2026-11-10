@@ -215,7 +215,8 @@ _gh_auth_file_value() {
 #                    call in this lane fails, and NO config dir may be claimed or exported for it
 #                    (`|<name>` carries which name shadowed)
 #   ambient          GH_CONFIG_DIR is set and holds hosts.yml
-#   ambient-missing  GH_CONFIG_DIR is set and holds NO hosts.yml (an explicit setting is NOT overridden)
+#   ambient-missing  GH_CONFIG_DIR is set and holds NO hosts.yml this read could READ (an explicit
+#                    setting is NOT overridden) — a store FILE that exists but cannot be read lands here
 #   xdg              $XDG_CONFIG_HOME/gh holds hosts.yml
 #   keys             GH_CONFIG_DIR read from the env file (absolute, and holds hosts.yml)
 #   keys-xdg         XDG_CONFIG_HOME read from the env file (becomes `<v>/gh`)
@@ -223,7 +224,7 @@ _gh_auth_file_value() {
 #                    default (nothing to export)
 #   home-xdg         $HOME/.config/gh holds hosts.yml but XDG_CONFIG_HOME is SET, so gh reads
 #                    `<xdg>/gh` instead and this store is exported (gh would never find it on its own)
-#   account          the lane HOME holds none and the ACCOUNT home does (the cell shape)
+#   account          the lane HOME holds none it can READ and the ACCOUNT home does (the cell shape)
 #   none             no credential this module can see
 # The `[env-file]` and `[account-home]` ARGUMENTS are the test seams — argv, not environment, for the
 # reason `lane.sh` records about `LANE_KEY_GATE`: an ambient switch can be set by the very env file it
@@ -327,15 +328,15 @@ gh_auth_log() {
   case "$st" in
     token)           why='a token NAME holds a value, so gh authenticates without any config dir' ;;
     token-blank)     why="${d} is set but BLANK, and gh resolves a SET value instead of any store — so every gh call in this lane WILL fail until it is unset or given a real value (no config dir is exported for it: gh would not read one)" ;;
-    ambient)         why='GH_CONFIG_DIR is already set and holds a hosts.yml — left as the caller set it' ;;
-    ambient-missing) why='GH_CONFIG_DIR is set but holds NO hosts.yml — an explicit setting is NOT overridden, so gh in this lane WILL be unauthenticated' ;;
+    ambient)         why='GH_CONFIG_DIR is already set and holds a hosts.yml this read could READ — left as the caller set it' ;;
+    ambient-missing) why='GH_CONFIG_DIR is set but holds NO hosts.yml this read could READ (missing, or there but not readable) — an explicit setting is NOT overridden, so gh in this lane WILL be unauthenticated' ;;
     xdg)             why='$XDG_CONFIG_HOME/gh holds a hosts.yml — gh resolves it without an export' ;;
     keys)            why="read from $ef (parsed statically; the file is never executed) and exported" ;;
     keys-xdg)        why="XDG_CONFIG_HOME read from $ef (parsed statically) and exported as GH_CONFIG_DIR" ;;
     home)            why="the lane HOME holds gh's own default store — nothing to export" ;;
     home-xdg)        why='the lane HOME holds a store, but $XDG_CONFIG_HOME is set and gh reads ONLY $XDG_CONFIG_HOME/gh while it is set — so the lane HOME store is exported as GH_CONFIG_DIR (gh would not find it on its own)' ;;
-    account)         why="the lane HOME holds no store and the ACCOUNT home does — GH_CONFIG_DIR exported so the gate, the lane and every worker it starts read the same hosts.yml" ;;
-    *)               why='NO gh credential: no GH_TOKEN/GITHUB_TOKEN value and no hosts.yml in any directory gh would read — every gh call in this lane will fail' ;;
+    account)         why="the lane HOME holds no store this read could READ and the ACCOUNT home does — GH_CONFIG_DIR exported so the gate, the lane and every worker it starts read the same hosts.yml" ;;
+    *)               why='NO gh credential: no GH_TOKEN/GITHUB_TOKEN value and no hosts.yml this read could READ in any directory gh would read — a store that is there but UNREADABLE lands here too, and the cause names it `<unreadable: …>` — every gh call in this lane will fail' ;;
   esac
   # ⛔ `dir=` is a CONFIG DIR on every state but `token-blank`, where the second field is the token NAME
   # that shadowed — printing `dir=GH_TOKEN` beside `state=token-blank` reads as a directory, and a log line
