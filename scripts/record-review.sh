@@ -1025,6 +1025,92 @@ evidence_fetch() { # <kind> <id> -> tsv row; non-zero = unreadable
   esac
 }
 
+# ── agent-infra#2661 — ARM (1c): THE DECLARED BLOCKING COUNT ───────────────────────────────────
+# `Outcome:` is the review skills' free-form verdict field, and a NEGATIVE review declares its
+# blocking count THERE. Measured on tortoise#9859, at the very head a `clean` record was minted at:
+#     **Outcome: 3 findings — 2 blocking (P1), 1 documentation (P2).**
+# Two blocking P1s, declared in the canonical field — and all three arms admitted it: arm (1) vetoes
+# the aborted-EXIT vocabulary (this review did not abort, it CONCLUDED with blockers), arm (1b)
+# accepts only the literal `Outcome: not-clean` spelling, and arm (2) is suppressed by the presence
+# of an `Outcome:` field and would not have matched the text anyway.
+#
+# The authority for the rule is the file that OWNS the vocabulary —
+# `skills/code-review/references/fixer-loop.md`: "The gate clears on ZERO BLOCKING findings, not on
+# zero findings." So an `Outcome:` field that names a blocking finding is a declaration that the
+# gate did NOT clear, and a `clean` mint over it is the false PASS #7391/#3549 exist to stop.
+#
+# WHY A SEPARATE, LINE-SCOPED PASS RATHER THAN ONE MORE ALTERNATIVE IN ARM (1b). `gh --jq @tsv`
+# frames the body with every newline as the TWO characters `\n`, so grep sees the WHOLE comment as
+# ONE line: an `outcome:.*blocking` alternative would reach across the entire body and veto a
+# legitimate clean review for a "blocking" that appears ten paragraphs later — the tortoise#8866
+# false-refusal class this file has already paid for once (§13n). The DECLARATION is a line, so the
+# framing is undone first and the arm is line-scoped.
+#
+# THE DECODER IS ONE LEFT-TO-RIGHT PASS, deliberately: the framed body's `\\n` is a LITERAL `\n` in
+# the reviewer's prose and must NOT become a line break, so the escapes are consumed as they are
+# met. A pipeline of substitutions gets that wrong in one of its two orderings.
+tsv_decode() { # <tsv-framed body> -> the decoded text on stdout
+  LC_ALL=C awk '
+    { s = (NR > 1 ? s "\n" : "") $0 }
+    END {
+      out = ""; n = length(s)
+      for (i = 1; i <= n; i++) {
+        c = substr(s, i, 1)
+        if (c == "\\" && i < n) {
+          i++; c = substr(s, i, 1)
+          if (c == "n") out = out "\n"
+          else if (c == "t") out = out "\t"
+          else if (c == "r") out = out "\r"
+          else out = out c
+        } else out = out c
+      }
+      printf "%s", out
+    }' <<<"$1"
+}
+
+# 0 = a DECLARED `Outcome:` line names blocking findings; 1 = none does.
+#
+# THREE ESCAPES, and each is a spelling a genuinely clean outcome uses. They are enumerable and
+# small on purpose: a vocabulary arm that guesses is a fail-open, and one that is too clever is a
+# false refusal — so the set is fixed here, named, and extended from fixer-loop.md, never from
+# memory (the same rule arms 1/1b follow).
+#   (a) ZEROED / NEGATED — "no blocking", "non-blocking", "0 blocking", "zero blocking",
+#       "none blocking". This is `Outcome: CLEAN — no blocking issues found` (tortoise#8866), the
+#       measured false-refusal case that must stay ACCEPTED.
+#   (b) RESOLVED — the blocking findings are named as CLOSED: "3 blocking findings were fixed and
+#       re-verified". The window is bounded and `;`/`.`/`:`-terminated so an unrelated later clause
+#       cannot supply the verb.
+#   (c) NOT RESOLVED — a persistence qualifier inside the SAME window cancels (b): "2 blocking
+#       fixed, 1 blocking remain" is still a live blocker, and exits (b) on the wrong half was the
+#       whole point of adding it.
+# What the arm deliberately does NOT judge is whether a declared blocker was later fixed: `(b)` and
+# `(c)` read only the vocabulary of persistence, exactly as every other arm in this file reads
+# shape and never substance. An outcome line that mixes a clean verdict WITH a live blocking count
+# is a DECLARED blocker here — a declaration is not cancelled by a second declaration on the same
+# line, which is the rule arms (1) and (1b) already apply (§13n4/§13n5).
+outcome_declares_blocking() { # <tsv-framed body> -> 0 = a declared Outcome line names blocking findings
+  local decoded line
+  decoded="$(tsv_decode "$1")"
+  while IFS= read -r line; do
+    # Only an `Outcome:` DECLARATION is this arm's question — anchored the way arm (1b) anchors it,
+    # so prose that discusses an outcome is untouched.
+    grep -qiE '(^|[*[:space:]])outcome:[[:space:]]*[*[:space:]]*' <<<"$line" || continue
+    # (a) zeroed / negated
+    grep -qiE '(^|[^[:alnum:]])(no|non|zero|none)[[:space:]_-]*block(ing|ers?)|(^|[^0-9])0[[:space:]_-]*block(ing|ers?)' <<<"$line" && continue
+    # (b) resolved, and (c) not a live blocker
+    if grep -qiE 'block(ing|ers?)[^.;:]{0,60}(fixed|resolved|closed|addressed|re-verified)' <<<"$line" \
+       && ! grep -qiE 'block(ing|ers?)[^.;:]{0,60}(remain|remaining|open|outstanding|unresolved|unfixed|unaddressed)' <<<"$line"; then
+      continue
+    fi
+    # Anything else that NAMES blocking findings declares the gate did not clear.
+    if grep -qiE 'block(ing|ers?)' <<<"$line"; then
+      OUTCOME_BLOCKING_LINE="$line"
+      return 0
+    fi
+  done <<<"$decoded"
+  return 1
+}
+
 # Verify that <ref> is a review artifact attesting THIS PR at <head>.
 # Prints one confirmation line on success; prints WHY on stderr and returns 1.
 verify_review_evidence() { # <ref> <head_sha> [polarity] -> 0 = verified
@@ -1171,7 +1257,7 @@ verify_review_evidence() { # <ref> <head_sha> [polarity] -> 0 = verified
   # a lane whose review ABORTED could name its own Step-8 comment and mint clean.
   # An unresolved-exit prefix that this list does not name is a fail-open, so
   # extend it from fixer-loop.md, never from memory.
-  # ⛔ FOUR ARMS, AND THE SPLIT IS SECURITY-RELEVANT (1b below is unconditional too).
+  # ⛔ FIVE ARMS, AND THE SPLIT IS SECURITY-RELEVANT (1b and 1c below are unconditional too).
   #
   # (1) STRUCTURAL ABORT MARKERS — always veto, unconditionally. These are the review skills' own
   #     Step-8 exit prefixes (fixer-loop.md §"PR comment prefix"). A lane whose review ABORTED emits
@@ -1412,6 +1498,16 @@ verify_review_evidence() { # <ref> <head_sha> [polarity] -> 0 = verified
   #      passes. Arm 2 is the only arm the `Outcome: clean` field may suppress.
   if grep -qiE '(^|[*[:space:]])outcome:[[:space:]]*[*[:space:]]*(not|non|no)[[:space:]_-]*clean|(^|[[:space:]>*-])review[[:space:]]*[—–-][[:space:]]*not[[:space:]_-]*clean' <<<"$body"; then
     echo "   $kind $id DECLARES a non-clean outcome (an explicit Outcome: not-clean, or a 'Review — NOT CLEAN' header) — it is evidence the review did not conclude clean." >&2
+    return 1
+  fi
+  # (1c) DECLARED BLOCKING FINDINGS — always veto, and BEFORE the `Outcome:` suppression, because
+  #      it vetoes a DECLARATION (see `outcome_declares_blocking` above for the whole rationale, the
+  #      measured artifact, and the three escapes). Its subject is the field's own count, which is
+  #      what (1b) missed: (1b) reads only the literal `not-clean` SPELLING, so a review that
+  #      declares `Outcome: 3 findings — 2 blocking (P1)` — the shape a review actually emits — was
+  #      admitted, and a `clean` record could be minted over it (tortoise#9859, agent-infra#2661).
+  if outcome_declares_blocking "$body"; then
+    echo "   $kind $id DECLARES blocking findings in its Outcome field (${OUTCOME_BLOCKING_LINE:0:160}) — the gate clears on ZERO blocking findings (skills/code-review/references/fixer-loop.md), so this artifact is evidence the review did NOT conclude clean." >&2
     return 1
   fi
   if ! grep -qiE '(^|[*[:space:]])outcome:[[:space:]]*(clean|\*\*clean)' <<<"$body"; then

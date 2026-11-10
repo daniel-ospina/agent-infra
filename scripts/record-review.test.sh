@@ -4865,6 +4865,269 @@ $VACUITY_BLOCK"
   assert_eq "$RECORD_RC" "3" "13n5 the declaration is caught in either order (rc 3)"
   [ ! -f "$(Q2 424796)" ] && ok "13n5 no record minted regardless of the two lines' order" || bad "13n5 minted a record with the declaration first"
 
+# 13n6-13n11 — THE DECLARED BLOCKING COUNT (agent-infra#2661, measured on tortoise#9859).
+# THE DEFECT: the three arms all missed a review whose own `Outcome:` field declares blocking
+# findings. Arm (1) vetoes the aborted-EXIT vocabulary (this review did not abort — it CONCLUDED
+# with blockers); arm (1b) accepts only the literal `Outcome: not-clean` SPELLING; arm (2) is
+# SUPPRESSED by the presence of an `Outcome:` field and would not have matched the text anyway. So
+# `Outcome: 3 findings — 2 blocking (P1)` was admitted and a `verdict=clean` record could be minted
+# over it — the outcome #7391/tortoise#3549 exist to prevent.
+# The authority for the rule is the file that OWNS the vocabulary
+# (`skills/code-review/references/fixer-loop.md`): "The gate clears on ZERO BLOCKING findings, not
+# on zero findings."
+#
+# ⛔ 13n6 IS THE REAL ARTIFACT, VERBATIM — `tortoise#9859` issue comment 6381081933, fetched with
+# `gh api` and pasted unchanged. It is NOT a paraphrase: the whole claim is that THIS body was
+# admitted, and a hand-written approximation of it would prove nothing about the artifact that did
+# the damage. It is carried in a QUOTED heredoc because the body is full of backticks, `$` and
+# single quotes that a shell-quoted assignment would execute or mangle.
+#
+# ⛔ THE ESCAPE VECTORS (13n7/13n10) CARRY THE #3442 BLOCK. Without it a green result would be a
+# green for the NON-VACUITY arm's reason, not for the escape's — the unrelated-row trap #3442 names.
+# The VETO vectors carry it too, so a red is attributable to (1c) and not to a second contract.
+N9859_BODY="$(cat <<'N9859_REAL_BODY_EOF'
+## Code review — PR #9859 (`fix/5006-near-dup-merge`, head `3e669aa6a`)
+
+**Outcome: 3 findings — 2 blocking (P1), 1 documentation (P2).** Everything else I traced
+is sound; the specifics are in "Verified clean" below so the fixer does not re-derive them.
+
+Reviewed at the PR head, full files (not hunks): `tortoise/near_dup_merge.py` (new, 424 lines),
+`tortoise/extractor_v2.py`, `tortoise/sdk.py` (the `_extract_session_v2` capture path),
+`tortoise/vet_gate.py`, `tests/test_near_dup_merge_5006.py`, `config/ci-surfaces.yml`,
+`config/v4-mechanisms.yml`, and the two architecture docs.
+
+---
+
+### F1 — BLOCKING (P1): the verdict→fusion routing key is clipped differently on each side, so a `MERGE` verdict is silently ignored for any candidate over 1000 characters — and a duplicate Point is minted
+
+`tortoise/extractor_v2.py:7895` `_merge_flagged_contents` builds the key as
+
+```python
+text = str(d.get("text") or "").strip()
+if text:
+    flagged.add(_norm(text))          # ← no [:_MAX_CONTENT] clip
+```
+
+`execute_embed` looks the flag up with a **clipped** content (`extractor_v2.py:7030`):
+
+```python
+content = str(p.get("content", "")).strip()[:_MAX_CONTENT]   # _MAX_CONTENT = 1000 (line 3287)
+...
+merge_flagged=n in merge_flagged                              # line 7077
+```
+
+`_norm` (line 3248) does **no** truncation — it only lower-cases and collapses whitespace. So for a
+candidate whose content exceeds 1000 characters the two sides normalise **different strings** and
+`n in merge_flagged` is `False`.
+
+Consequence, traced through `classify_consolidation`: `merge_flagged=False` ⇒ the `#9424` guard
+`if not _attachments_preserved(p, point): … continue` refuses the fold ⇒ the claim falls to **`ADD`**
+⇒ a second Point is minted for a pair the arbiter marked `MERGE`. That is exactly the pre-#5006
+defect (de-facto duplicate) and it is **silent** — no warning, `stats["merges"]` stays 0, and the
+registry row reads `implemented`.
+
+This is not a new convention question: `vet_gate._normalised_text_variants` (`vet_gate.py:290`) already
+keeps **both** `_norm(raw)` and `_norm(raw[:_MAX_CONTENT])` precisely because the write path caps at
+1000 — the new routing function skips the mirror of that and is the only consumer of a VET decision
+that does.
+
+Same class, one line up: VET's `text` is `_item_text` = `name or content` (`vet_gate.py:289`), so a
+`points` item that carries a `name` key keys the verdict on the **name** while `execute_embed` keys on
+the **content**. `vet_gate`'s own docstring calls out that items can carry both keys.
+
+**Fix:** clip at the routing site (accept both variants, mirroring `_normalised_text_variants`), or key
+on the field the write path actually keys on.
+
+**Settlement (fixer runs this, not me):**
+```bash
+TORTOISE_TEST_CARVE_OUT=1 uv run pytest tests/test_near_dup_merge_5006.py -q -k flagged
+# add: assert v2._merge_flagged_contents({"decisions": {"p": {"section": "points", "outcome": "MERGE",
+#        "text": "x" * 1200}}}) == frozenset({v2._norm(("x" * 1200)[:v2._MAX_CONTENT])})
+```
+
+---
+
+### F2 — BLOCKING (P1): the fusion write applies **no** subject-channel skip, so a union name that is a subject-kind name also naming an existing `:Object` gets an un-gated `aboutObject` edge that capture deliberately refuses
+
+Capture's attachment pass, `tortoise/sdk.py:12118-12131`:
+
+```python
+_n = name.strip()
+if _n in subject_entity_names:
+    # #1370: the binder owns the gated `aboutSubject` edge; the topic channel must
+    # not produce an un-gated one, nor an id-less Object stub for a subject-kind name
+    continue
+_oid_rows = proj.g.query("MATCH (o:Object {name:$n}) RETURN o.id", …)
+```
+
+`apply_merge_union` (`tortoise/near_dup_merge.py`, attachment loop) has **no equivalent guard**: every
+union name is resolved with `MATCH (o:Object {name:$n})` and linked via `link_entity`. The module's own
+docstring states the premise that makes this reachable — *"`about_entities` is not object-only — the
+SUBJECT channel (team/role/person, the gated `aboutSubject` edge) also contributes names to it"* — and
+then bounds the consequence to *"a subject-kind attachment … lands in `unresolved` instead of being
+bound"*. **That bound is false in the coincidence case**: `sdk.py:11849-11857` (F6) records explicitly
+that an `:Object` may legitimately share a subject's name (that is why the skip is exact-name, not
+case-folded), and in exactly that case the fusion mints the un-gated `aboutObject` edge capture's `if
+_n in subject_entity_names: continue` exists to prevent (#4934 label leak).
+
+The guard is available at the call site — the merge block is `sdk.py:12327-12332`, inside
+`_extract_session_v2`, and `subject_entity_names` is built at `sdk.py:11857` in the same function — so
+this is a filter at the call site or a new argument, not a redesign.
+
+**Wrong outcome:** a Point gains an attachment to an Object under a subject's name — an edge the same
+capture path refuses to write on the normal (non-merge) route. The merge is supposed to *preserve*
+attachments, not add forbidden ones.
+
+---
+
+### F3 — P2 (documentation, same file this PR edits): `vet_gate.py`'s docstring now contradicts itself, and the axis list is one token short
+
+`tortoise/vet_gate.py:85-88` still says:
+
+> A merge candidate is flagged `MERGE` and **recorded in the VET evidence surface only — nothing
+> consumes it yet**: no code routes a `MERGE` verdict to S3, and the merge *itself* is #5006's
+
+and `vet_gate.py:89-96`, added by this PR, says:
+
+> ✅ **Updated (#5006) — the verdict HAS a consumer now.**
+
+Both statements are in the same docstring, six lines apart, and the stale one was left in place. Also
+`vet_gate.py:82-84` still lists `extractor_v2.DecisionRecord`'s consolidation axis as
+`ADD/UPDATE/NOOP/DELETE` — it is five tokens now.
+
+**Why it matters here rather than as a nit:** this repo treats a record that cannot distinguish a
+deliberate ruling from an accident of history as the failure mode (`OVERRIDES:`/contradiction-test
+rules) — and a lane reading the first paragraph concludes the mechanism is unimplemented, which is the
+state #5006 exists to end. The fix is to delete the superseded sentence (and extend the axis list), not
+to append a third note.
+
+---
+
+### Verified clean (so the fixer does not re-open these)
+
+- **Manifest integrity** — `config/ci-surfaces.yml` registers `test_near_dup_merge_5006.py` exactly
+  once on the `core` surface (line 3837), with the correct rationale for this repo's selector
+  (`extractor_v2.py` is not a `SHARED_MODULE` ⇒ a diff touching only it selects `core`), and a
+  `durations` row (line 8076) so the #3400 coverage floor is not dropped. No duplicate entry, no
+  `carve_out`/`TEST_NO_REDIRECT_STEMS` mirror needed: `tests/test_embedded_lifecycle.py` explicitly
+  allows `TortoiseSDK(` everywhere, and the redirect derives a per-path graph from `tmp_path`, so the
+  two graph fixtures are isolated in both the docker and embedded lanes.
+- **`merge_flagged=False` really is byte-identical** to pre-#5006: both new refusal branches are
+  guarded by `merge_flagged`, and the final `if best_noop is not None and (best_merge is None or …)`
+  short-circuits on `best_merge is None`. The only production caller of `classify_consolidation` is
+  `execute_embed`, so no other consumer had to learn a fifth outcome.
+- **The verdict is genuinely necessary, never sufficient**: `near_dup_merge`'s ladder refuses on
+  `not flagged` → non-empty `identity` → `difference is not None` → `below_bar` → `unreadable_attachments`
+  → `nothing_to_union`, and `_boundary` is called once per pair in `classify_consolidation` (so
+  `difference is not None` already subsumes a non-empty identity set — the ladder cannot disagree with
+  the classifier).
+- **Both false-PASS fixes hold**: `contained` and the id-less `linked` both read `RETURN count(*)`, and
+  a `MATCH` that resolves nothing returns 0 rather than counting the attempt. `link_entity` returns
+  only 0/1 by its own contract, so `linked` stays a measurement on both branches.
+- **The union's case contract is right and is pinned**: comparison case-folds (`_entity_names`), the
+  emitted spelling is the prior's/original, and `apply_merge_union` resolves with an exact
+  `Object {name:$n}` — matching `sdk.py:12136`. The test fixtures are capitalised so the
+  lowered-union mutation is discriminating.
+- **No vacuous test** that would pass on pre-fix code: every behavioural test either imports the new
+  module, passes `merge_flagged=` (a `TypeError` pre-fix), or reads `result["merges"]` (a `KeyError`
+  pre-fix). `TestTheCapturePathExecutesTheFusion` genuinely covers the one production invocation — the
+  merge block sits after `_write_session_and_turns` (`sdk.py:10565` before `10746`), so the Session
+  node exists, and a deleted block loses both the `aboutObject` edges and the
+  `(Session)-[:CONTAINS]->(Point)` edge the test asserts on.
+- **No injection surface**: every Cypher statement in `near_dup_merge.py` is parameterised; the only
+  interpolated identifiers are literals; no `eval`, no file writes, no secrets.
+- **Registry/docs consistency**: `<!-- v4-mechanism: near_dup_merge -->` is present in both
+  `declared_in:` documents (`EXTRACTOR-V4-ARCHITECTURE.md:1740`, `STORAGE-ARCHITECTURE.md:1448`), the
+  registry row carries `code`/`tests`/`symbols`, and no test pins a literal implemented/absent count.
+  The stale *"The flagged verdict has no consumer yet"* sentence at
+  `EXTRACTOR-V4-ARCHITECTURE.md:774` **is** updated by this PR.
+- **Inertness is declared, not hidden** — `implemented` + "with no arbiter injected it is INERT" is
+  stated in the registry note, the design doc, both changelogs and the test docstring, and no
+  production caller injects `vet_arbiter`. Same posture VET (already `implemented`) ships with, so it
+  is consistent rather than a new claim.
+
+**Not run (no `.venv` in this checkout; execution is the fixer's step):** `uv run pytest` for the
+listed batteries, `uv run ruff check`, and `tools/ci_selection.py --integrity`. The manifest reasoning
+above is from the selector source, not from a run.
+N9859_REAL_BODY_EOF
+)"
+rm -f "$(Q2 425010)"
+EV_REF="comment:42501001" run_record_ev 425010 STUB_EVIDENCE_BODY="$N9859_BODY"
+assert_eq "$RECORD_RC" "3" "13n6 the REAL tortoise#9859 artifact — 'Outcome: 3 findings — 2 blocking (P1)' — is REFUSED (rc 3)"
+[ ! -f "$(Q2 425010)" ] && ok "13n6 no clean record minted over a review that declares 2 blocking P1s" || bad "13n6 a clean record WAS minted over a review declaring blocking findings — the #2661 false PASS"
+assert_contains "$RECORD_ERR" "DECLARES blocking findings" "13n6 …and the refusal NAMES the declaration, not a generic unverified-evidence diagnostic"
+assert_contains "$RECORD_ERR" "2 blocking" "13n6 …quoting the Outcome line, so the lane sees WHICH count blocked it"
+
+# 13n7 — THE OVER-BLOCK GUARD for the 'resolved' escape: a clean review that names its blockers as
+# CLOSED is clean evidence, and must keep recording. Without this the arm would false-refuse every
+# review that reports its fixes — the tortoise#8866 class this file has already paid for once (§13n).
+rm -f "$(Q2 425011)"
+EV_REF="comment:42501101" run_record_ev 425011 STUB_EVIDENCE_BODY="**Outcome: CLEAN — 3 blocking findings were fixed and re-verified.**  
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "0" "13n7 a clean outcome naming its blockers as RESOLVED still records (rc 0)"
+R13N7="$(cat "$(Q2 425011)" 2>/dev/null || true)"
+assert_contains "$R13N7" '"evidence":"comment:42501101"' "13n7 the clean artifact is what the record names"
+
+# 13n8 — A CLEAN VERDICT DOES NOT CANCEL A LIVE BLOCKER. This is the mixed declaration (the
+# §13n4/§13n5 rule, applied to the count): pasting `Outcome: CLEAN` in front of a standing blocker is
+# a declaration of a blocker, not a suppression of one.
+rm -f "$(Q2 425012)"
+EV_REF="comment:42501201" run_record_ev 425012 STUB_EVIDENCE_BODY="**Outcome: CLEAN — 2 blocking (P1) remain.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n8 'Outcome: CLEAN' does NOT cancel a declared live blocking count (rc 3)"
+[ ! -f "$(Q2 425012)" ] && ok "13n8 no record minted over a live blocker wearing a clean verdict" || bad "13n8 minted a record over a live blocking count"
+
+# 13n9 — THE PERSISTENCE QUALIFIER CANCELS the 'resolved' escape, which is the whole reason that
+# escape is bounded. Without this vector, deleting the (c) clause would keep every other vector
+# green: 'fixed' appears, so '2 blocking fixed, 1 blocking remain' would record clean.
+rm -f "$(Q2 425013)"
+EV_REF="comment:42501301" run_record_ev 425013 STUB_EVIDENCE_BODY="**Outcome: CLEAN — 2 blocking fixed, 1 blocking remain.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n9 'fixed' does not excuse the blocker that is still REMAINING (rc 3)"
+[ ! -f "$(Q2 425013)" ] && ok "13n9 no record minted while one of the declared blockers remains" || bad "13n9 minted a record over the remaining blocker"
+
+# 13n10 — LINE SCOPING, and it is the arm's most important over-block guard. `gh --jq @tsv` frames
+# the body with every newline as the TWO characters `\n`, so grep sees the WHOLE comment as ONE
+# line; a body-wide `outcome:.*blocking` would veto a legitimate clean review for a 'blocking' that
+# appears ten paragraphs later. This body is exactly that: a clean Outcome line, and a fixer note
+# about cycle-1 blockers far below it.
+rm -f "$(Q2 425014)"
+EV_REF="comment:42501401" run_record_ev 425014 STUB_EVIDENCE_BODY="**Outcome: CLEAN — verified.**
+
+Prose far below the declaration body: the 2 blocking findings from cycle 1 were fixed in 9f1a2b3 and
+re-verified at the same head; no follow-up is owed.
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "0" "13n10 the arm is LINE-SCOPED: a 'blocking' mention far from the Outcome line does not refuse a clean review (rc 0)"
+
+# 13n11 — the singular 'blocker' spelling, and the SINGULAR case is not decoration: `blockers?` in one
+# branch and a bare `blocking` in the other is how a vocabulary arm silently covers half its inputs.
+rm -f "$(Q2 425015)"
+EV_REF="comment:42501501" run_record_ev 425015 STUB_EVIDENCE_BODY="**Outcome: 1 blocker, 3 follow-ups.**
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "3" "13n11 the singular 'blocker' spelling is a declared blocking finding too (rc 3)"
+
+# 13n12 — MUTATION PIN. 13n6 could be red for a reason that has nothing to do with (1c), so the arm
+# is removed from a copy and the SAME artifact must then be ADMITTED. A pin that only asserts the
+# refusal proves the refusal, never that THIS arm produced it.
+N1C_MUT="$T/mutant-1c-neutered.sh"
+sed 's#^  if outcome_declares_blocking "\$body"; then#  if false; then#' "$RECORD" > "$N1C_MUT"
+if cmp -s "$RECORD" "$N1C_MUT"; then
+    bad "13n12 MUTANT: the sed anchor no longer matches — re-anchor the pin rather than dropping it"
+else
+    bash -n "$N1C_MUT" && ok "13n12 MUTANT: the neutered-arm mutant still parses" || bad "13n12 MUTANT: the neutered-arm mutant does not parse"
+    N1C_RECORD_SAVE="$RECORD"
+    RECORD="$N1C_MUT"
+    rm -f "$(Q2 425016)"
+    EV_REF="comment:42501601" run_record_ev 425016 STUB_EVIDENCE_BODY="$N9859_BODY"
+    RECORD="$N1C_RECORD_SAVE"
+    assert_eq "$RECORD_RC" "0" "13n12 MUTATION PIN: with (1c) neutered the REAL tortoise#9859 artifact is ADMITTED (rc 0) — the arm is load-bearing"
+fi
+
 # 13m3 — a SECOND unresolved-exit vocabulary the widened veto must cover: the
 # plan-review skill's block marker is "Requires Human Input", which the earlier
 # "require … human attention" pattern did NOT match (found in cycle 3 by reading
