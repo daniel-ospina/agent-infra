@@ -134,13 +134,17 @@ orc_lock_write() { ( set -o noclobber; printf '%s\n' "$$" > "$1" ) 2>/dev/null; 
 
 # orc_lock_pid <lockf> — the digits in the record, or "". The SAME read every sibling tool uses,
 # so this file cannot disagree with them about who holds the lock.
-orc_lock_pid() { tr -dc '0-9' < "$1" 2>/dev/null; }
+# ⛔ `2>/dev/null` BEFORE the redirect, not after: redirections apply left to right, so a FAILED
+# `<` reports to a stderr that is already silenced here — but with the order reversed the shell itself
+# printed `…/.orch.lock: No such file or directory` onto the controller's stderr for a record that was
+# legitimately absent mid-reclaim (measured; it read as a fault in the module).
+orc_lock_pid() { tr -dc '0-9' 2>/dev/null < "$1"; }
 
 # orc_mtime <file> — epoch seconds of the record's last write. `date -r` is BSD and GNU both.
 orc_mtime() { date -r "$1" +%s 2>/dev/null; }
 
 # orc_lock_fill <displaced record> <lockf> — put a record back into a FREE path, ATOMICALLY.
-# rc 0 restored · rc 1 the path was already taken (a newer holder owns it) · rc 2 no paths given
+# rc 0 restored · rc 1 the path was already taken (a newer holder owns it) · rc 2 could not be restored
 # ⛔ ONE OPERATION, NOT A CHECK THEN A WRITE (fresh review of #3846, P2 — the check-then-act was real).
 # The shipped restore was `[ -e "$lockf" ] || mv -f "$tmp" "$lockf"`: two operations, and the second is
 # `rename(2)`, which REPLACES its target unconditionally. A third starter that noclobber-created its
@@ -150,18 +154,40 @@ orc_mtime() { date -r "$1" +%s 2>/dev/null; }
 # `File exists` and left the target untouched.
 # `ln` is the atomic create-if-absent, and it is the SAME class of guarantee `orc_lock_write` gets
 # from `noclobber` — the primitive this module already relies on everywhere else.
-# ⛔ NOT a noclobber WRITE of the captured pid, on purpose: that mints a NEW mtime, and the record's
-# mtime is the evidence the identity fence reads (`orc_began_after`, i.e. "did this process begin
-# after the record was written"). A fresh mtime would make a reclaimable stale record permanent
-# (every later starter reads "began before the record" → HELD), which is a self-inflicted lockout.
-# A hard link keeps the INODE, and so the displaced record's own mtime.
-# Both names are in the same directory by construction (`$lockf.reclaim.$$`), so there is no
-# cross-device case for `ln` to fail on and no "hard links unsupported" fallback to be tempted by
-# (a fallback would be the non-atomic path again, wearing a different name).
+# ⛔ `ln` RATHER THAN A NOCLOBBER WRITE OF THE CAPTURED PID, because a hard link keeps the INODE and so
+# the displaced record's own mtime — and that mtime is the evidence the identity fence reads
+# (`orc_began_after`: "did this process begin after the record was written"). A fresh mtime would make
+# a reclaimable stale record permanent. Both names are in the same directory by construction
+# (`$lockf.reclaim.$$`), so there is no cross-device case for `ln` to fail on.
+# ⛔ BUT "ln FAILED" IS NOT "THE PATH IS TAKEN", AND COLLAPSING THE TWO DESTROYS THE ONLY COPY (same
+# review round, measured). `ln` also fails with the destination FREE: EPERM under
+# `fs.protected_hardlinks=1` when the record is owned by another user (a sudo/service-installed
+# controller), ENOSPC on an inode-exhausted state dir, or a filesystem with no hard links — while
+# `mv`/`rename` in that same directory still succeeds (measured: EPERM and ENOSPC both gave `mv` rc 0
+# and `ln` rc 1). Reporting that as "taken" made the caller delete the record it had just moved aside
+# — the only copy of another instance's record — after which the state dir reads FREE and the next
+# starter ACQUIRES over a third instance that still believes it holds it (#1715). So: a failure with
+# an OCCUPIED target is rc 1 (the occupant wins, our copy is surplus); a failure with a FREE target is
+# restored with the other atomic create this module already uses (noclobber, which needs no link
+# permission), and only a target that is STILL FREE and unwritable is rc 2.
 orc_lock_fill() {
-  local tmp="${1:-}" lockf="${2:-}"
+  local tmp="${1:-}" lockf="${2:-}" pid=""
   [ -n "$tmp" ] && [ -n "$lockf" ] || return 2
-  ln "$tmp" "$lockf" 2>/dev/null || return 1
+  if ln "$tmp" "$lockf" 2>/dev/null; then
+    rm -f "$tmp" 2>/dev/null
+    return 0
+  fi
+  if [ -e "$lockf" ]; then return 1; fi        # EEXIST: a newer holder owns the path; ours is surplus
+  pid="$(orc_lock_pid "$tmp")"
+  [ -n "$pid" ] || return 2                    # nothing to restore — the caller must not delete the temp
+  # The path is FREE and could not be linked into. Restore it the other atomic way: a noclobber create
+  # can only succeed if the path is still free, so a third starter that got there first still wins.
+  # The mtime cost above is the right trade HERE: this branch is the case where the alternative is an
+  # empty state dir, and a record that reads "written now" is HELD (refuse) rather than FREE (co-run).
+  ( set -o noclobber; printf '%s\n' "$pid" > "$lockf" ) 2>/dev/null || {
+    [ -e "$lockf" ] || return 2                # still free and unwritable: cannot tell
+    return 1
+  }
   rm -f "$tmp" 2>/dev/null
   return 0
 }
@@ -183,8 +209,9 @@ orc_lock_fill() {
 # about a FRESH, perfectly readable record naming the LIVE winner (fresh review of #3846, P2).
 # So: 0 = we hold it · 1 = ANOTHER pid holds it, named in ORC_RECLAIM_HOLDER · 2 = cannot tell.
 orc_lock_reclaim() {
-  local lockf="${1:-}" expected="${2-}" tmp got="" winner=""
+  local lockf="${1:-}" expected="${2-}" tmp got="" winner="" frc=0
   ORC_RECLAIM_HOLDER=""
+  ORC_RECLAIM_TEMP=""
   [ -n "$lockf" ] || return 2
   tmp="$lockf.reclaim.$$"
   mv -f "$lockf" "$tmp" 2>/dev/null || return 2
@@ -193,7 +220,15 @@ orc_lock_reclaim() {
     # Somebody took the lock while we were judging it: this record is THEIRS, not the stale one this
     # caller judged. Put it back into a FREE path — the fill is atomic, so a THIRD starter that
     # created its own record first keeps it — and report who holds the state dir now.
-    orc_lock_fill "$tmp" "$lockf" || rm -f "$tmp" 2>/dev/null
+    # ⛔ THE TEMP IS DELETED ONLY WHEN THE PATH IS DEMONSTRABLY TAKEN. `|| rm -f "$tmp"` deleted the
+    # only copy for EVERY failure, including the non-EEXIST ones where the path is FREE — see
+    # `orc_lock_fill`'s header for the measured EPERM/ENOSPC cases. A failed restore keeps the record.
+    orc_lock_fill "$tmp" "$lockf"; frc=$?
+    case "$frc" in
+      0) : ;;                                   # restored; the fill consumed the temp
+      1) rm -f "$tmp" 2>/dev/null ;;            # the path is TAKEN: its occupant is the holder
+      *) ORC_RECLAIM_TEMP="$tmp" ;;             # not restored: keep the only copy, and say where it is
+    esac
     winner="$(orc_lock_pid "$lockf")"
     if [ -n "$winner" ] && [ "$winner" != "$expected" ]; then
       ORC_RECLAIM_HOLDER="$winner"
@@ -324,7 +359,11 @@ _orc_reclaim() {
        # to have just written. rc 2 here sent the operator to `rm -f` a live winner's record.
        ORC_SINGLETON_WHY="HELD by pid ${ORC_RECLAIM_HOLDER:-?} — it CREATED $lockf while this instance was judging $judged, and that create was atomic, so it owns this state dir and this instance does not"
        return 1 ;;
-    *) ORC_SINGLETON_WHY="the record at $lockf could not be judged and could not be replaced while judging $judged (is the state dir writable?); nothing was removed"
+    *) if [ -n "${ORC_RECLAIM_TEMP:-}" ]; then
+         ORC_SINGLETON_WHY="the record at $lockf could not be judged while judging $judged, and it could NOT be put back (is the state dir writable?). Nothing was deleted: the displaced record is KEPT at $ORC_RECLAIM_TEMP, so no state was lost — move it back to $lockf once the state dir is writable again"
+       else
+         ORC_SINGLETON_WHY="the record at $lockf could not be judged and could not be replaced while judging $judged (is the state dir writable?); nothing was removed"
+       fi
        return 2 ;;
   esac
 }

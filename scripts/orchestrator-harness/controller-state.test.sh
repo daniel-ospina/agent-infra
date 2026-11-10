@@ -299,7 +299,7 @@ printf '999999\n' > "$LKW/.orch.lock"
   orc_lock_reclaim "$LKW/.orch.lock" 999999; printf 'rc=%s holder=%s\n' "$?" "$ORC_RECLAIM_HOLDER" ) > "$T/rcl-lost" 2>&1
 [ "$(cat "$T/rcl-lost" | tr '\n' ' ')" = "rc=1 holder=333 " ] \
   && ck "§2 losing our own create race reports HELD (rc 1) naming the winner — NOT UNJUDGED" 0 \
-  || ck "§2 losing our own create race returned '$(cat "$T/rcl-lost" | tr '\n' ' ')' — wanted 'rc=1 holder=333 ' (rc 2 turns a live winner into a `rm -f` remedy)" 1
+  || ck "§2 losing our own create race returned '$(cat "$T/rcl-lost" | tr '\n' ' ')' — wanted 'rc=1 holder=333 ' (rc 2 turns a live winner into a \`rm -f\` remedy)" 1
 
 # …AND THE ACQUIRE ARM MUST PROPAGATE THAT, because the operator text is built from it: rc 2 is what
 # `orch-loop.sh` prints "could not be judged" for and what `harness-up` answers with "rm -f the record".
@@ -325,6 +325,34 @@ case "$(cat "$T/acq-raced")" in
   *) ck "§2 …and its refusal does not assert an unjudgeable record" 0 ;;
 esac
 
+# ⛔ A NON-EEXIST `ln` FAILURE MUST NOT DESTROY THE ONLY COPY (fresh-context review of #3846, P2).
+# `ln` does not fail only on EEXIST. Measured on this box with NO shims: EPERM (`fs.protected_hardlinks=1`
+# with a record owned by another user — a sudo/service-installed controller) and ENOSPC (an
+# inode-exhausted state dir) both fail with the destination FREE, while `mv`/`rename` in that same
+# directory still succeeds. Collapsing every failure into "the path is taken" made this caller delete
+# the record it had just moved aside — the only copy of another instance's record — after which the
+# state dir reads FREE, the next starter's `orc_lock_write` succeeds and ACQUIRES, and two controllers
+# share one state dir (#1715) — while the rc-2 text told the operator "nothing was removed".
+# The `ln` shim below fails with the destination FREE, which is exactly that shape.
+LKF="$T/lkf"; mkdir -p "$LKF"
+printf '111\n' > "$LKF/.orch.lock"
+( . "$MOD"
+  orc_lock_pid() { case "${1:-}" in */.orch.lock.reclaim.*) printf '222\n' ;; *) command tr -dc '0-9' 2>/dev/null < "$1" ;; esac; }
+  ln() { return 1; }
+  orc_lock_reclaim "$LKF/.orch.lock" 111; printf 'rc=%s holder=%s\n' "$?" "$ORC_RECLAIM_HOLDER" ) > "$T/rcl-nolink" 2>&1
+[ -f "$LKF/.orch.lock" ] \
+  && ck "§2 a non-EEXIST ln failure still RESTORES the displaced record (the state dir cannot read FREE)" 0 \
+  || ck "§2 a non-EEXIST ln failure DELETED the only copy of the displaced record — the state dir now reads FREE, so the next starter acquires over a live instance (#1715)" 1
+[ "$(cat "$LKF/.orch.lock" 2>/dev/null)" = "222" ] \
+  && ck "§2 …and what it restored names the pid the record was carrying (the one this caller did not judge)" 0 \
+  || ck "§2 …and the restored record is '$(cat "$LKF/.orch.lock" 2>/dev/null)', wanted 222" 1
+[ "$(cat "$T/rcl-nolink" | tr '\n' ' ')" = "rc=1 holder=222 " ] \
+  && ck "§2 …and it is reported HELD naming that holder, not UNJUDGED" 0 \
+  || ck "§2 …and the no-link reclaim returned '$(cat "$T/rcl-nolink" | tr '\n' ' ')' — wanted 'rc=1 holder=222 '" 1
+case "$(ls "$LKF"/.orch.lock.reclaim.* 2>/dev/null)" in
+  '') ck "§2 …and the fallback consumed the temp (no .reclaim file left beside the record)" 0 ;;
+  *)  ck "§2 …and the fallback left a reclaim temp: $(ls "$LKF"/.orch.lock.reclaim.* 2>/dev/null | tr '\n' ' ')" 1 ;;
+esac
 # ─────────────────────────────────────────────────────────────────────────────────────────────────
 hdr "§3 FAIL CLOSED — an unjudgeable record is a refusal, not a guess"
 # The age is unreadable when `ps` cannot answer. `PS_BIN` is the seam the fleet's own suites use
