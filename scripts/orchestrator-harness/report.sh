@@ -31,6 +31,10 @@ H="${1:-12}"
 # file being changed rather than filed as a peer.)
 case "$H" in ''|*[!0-9]*|0[0-9]*) H=12 ;; esac
 O="${O:-$HOME/orchestrator}"
+# ⛔ THE WORK ROOT (#2095, review of #3846 — follow-up P3). `O` is the STATE dir on an `ORC_STATE_DIR`
+# instance; the census MODULE is code and lives in the harness root, so sourcing it from `$O` left this
+# row `sessions: UNKNOWN` on exactly the split box this PR introduces.
+_RP_WORK="${O_WORK:-$O}"
 # repo-slug.sh ships beside this script (both are in install.sh's copied set), so a deployed `$O` has
 # it too; `$O` is the second candidate for an operator running a copy from elsewhere.
 _REPO_LIB=""
@@ -144,7 +148,7 @@ fi
 # every worker is a cmux durable terminal, so `tmux ls | wc -l` printed `0` for a busy box. Read the
 # launcher's census; UNKNOWN when it cannot answer, never a confident 0.
 sessions=UNKNOWN
-if [ -f "$O/worker-terminal.sh" ]; then
+if [ -f "$_RP_WORK/worker-terminal.sh" ]; then
   # ⛔ CAPTURE FIRST, COUNT SECOND. A substitution that ends in `| wc -l` reports `wc`'s status, so a
   # `|| sessions=UNKNOWN` after it can never fire (no pipefail here) — a module that cannot source
   # printed a confident `sessions: 0`. And `wt_table` prints ONE newline for an empty table, so
@@ -153,7 +157,7 @@ if [ -f "$O/worker-terminal.sh" ]; then
   # `if cmd=$(…)` keeps the SUBSHELL's exit status (a plain assignment in a pipe reports `wc`):
   # rc 0 means the census ANSWERED, and an empty answer is then 0 workers — not UNKNOWN. Only a
   # module that cannot source / defines no `wt_table` / exits non-zero leaves UNKNOWN standing.
-  if _wt_tbl=$( ( . "$O/worker-terminal.sh" >/dev/null 2>&1 && command -v wt_table >/dev/null 2>&1 && wt_table ) 2>/dev/null ); then
+  if _wt_tbl=$( ( . "$_RP_WORK/worker-terminal.sh" >/dev/null 2>&1 && command -v wt_table >/dev/null 2>&1 && wt_table ) 2>/dev/null ); then
     # Count LIVE worker rows: `wt_table` also emits `dead` rows (a record whose surface is gone,
     # which the reap has not cleared yet), and "sessions" is a population, not a ledger size.
     sessions=$(printf '%s\n' "${_wt_tbl:-}" | awk -F'\t' 'NF && $2 != "dead"' | wc -l | tr -d ' ')

@@ -34,8 +34,90 @@ if [ ! -d "$REPO" ]; then echo "orch-loop: FATAL REPO=$REPO does not exist" >&2;
 # wrong-repo WARN went to stderr only, because the guard below saw an EMPTY `$O` and skipped the log
 # append. stderr on a launchd box is launchd.err: that is the invisible failure the append exists to
 # prevent (review round 3).
+# ⛔ WHETHER THE CALLER *SET* O IS CAPTURED BEFORE THE DEFAULT (agent-infra#2095). The line below is
+# a DEFAULT, and a defaulted value is indistinguishable from a supplied one afterwards — which is the
+# whole reason a proof copy started with `bash /tmp/orc-proof/orch-loop.sh` silently adopted
+# PRODUCTION's state dir and log for 5 h 15 m while applying its own derived MAX_LOAD=100 against the
+# plist's 250. `controller-state.sh` needs the difference to decide the state dir; this is the seam
+# that preserves it.
+_ORC_ENV_O="${O:-}"
 O="${O:-$HOME/orchestrator}"
 _HERE_RS="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)"
+# ── WHICH STATE DIR, AND WHETHER THIS INSTANCE MAY RUN AT ALL (agent-infra#2095) ─────────────────
+# Both answers live in one module because they are one question: an instance that does not know which
+# state dir it owns cannot take that dir's lock, and two instances that each think the lock is theirs
+# are two controllers on one PR queue. Fail CLOSED when the module is absent — a controller without
+# its own state guard is exactly the shape that ran unsupervised for five hours.
+for _cs_cand in "$O/controller-state.sh" "${_HERE_RS:-}/controller-state.sh"; do
+  [ -f "$_cs_cand" ] && { . "$_cs_cand"; break; }
+done
+if ! command -v orc_state_pick >/dev/null 2>&1; then
+  echo "orch-loop: FATAL controller-state.sh is missing or stale (no orc_state_pick) — looked in $O and ${_HERE_RS:-<unresolved>}. Refusing to run a controller that cannot decide its own state dir or guard its own singleton; fix: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o $O" >&2
+  exit 78
+fi
+# Sets ORC_STATE_RESOLVED and ORC_STATE_SRC as GLOBALS (never `$( )`: `[cap]` has to read them).
+orc_state_pick "${_HERE_RS:-}" "$_ORC_ENV_O"
+O="$ORC_STATE_RESOLVED"
+ORC_INSTANCE="$(orc_instance_id "$O" "${_HERE_RS:-unknown}")"
+# ── WHICH TREE THE WORKER SCRIPTS COME FROM (agent-infra#2095, fresh-context review P1) ──────────
+# ⛔ `O` IS NOW THE STATE DIR *AND* IT WAS ALREADY THE HARNESS ROOT, AND THAT WAS COINCIDENTAL. Every
+# module this loop SOURCES has a beside-the-loop fallback (repo-slug.sh, worker-terminal.sh,
+# nochk-guard.sh, check-class.py …), but the eight WORKER spawn sites run `bash '$O/<script>'` with no
+# resolution step and no startup check at all — and `wt_spawn` validates the launcher and the
+# environment contract, not the script path in the command it is handed. So the moment a state dir can
+# differ from the tree beside the loop (an isolated proof copy — the very case this change creates — or
+# a documented `ORC_STATE_DIR`), the loop would start healthy, fill its queue from `$O/candidates.txt`,
+# and then run `bash '<state dir>/fix-one.sh'` for every dispatch: 127 in the lane's log while `[state]`,
+# `[cap]` and the run report all read healthy. That is category A — a controller that reports healthy
+# and can dispatch nothing — and it is why this resolves ONCE, here, and refuses to start when neither
+# tree can run a worker.
+ORC_WORK_ROOT="$O"
+if [ ! -f "$ORC_WORK_ROOT/fix-one.sh" ] && [ -f "${_HERE_RS:-}/fix-one.sh" ]; then
+  ORC_WORK_ROOT="${_HERE_RS:-}"
+fi
+_missing_w=""
+for _w in fix-one.sh merge-one.sh stall-fix.sh dispatch-merge.sh; do
+  [ -f "$ORC_WORK_ROOT/$_w" ] || _missing_w="$_missing_w $_w"
+done
+if [ -n "$_missing_w" ]; then
+  echo "orch-loop: FATAL the worker scripts are missing from BOTH the state dir ($O) and the directory beside this loop (${_HERE_RS:-<unresolved>}):$_missing_w — refusing to run a controller that would fill its queue and then fail every dispatch with 127. Fix: point O at a SEEDED runtime (bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o $O), or set ORC_STATE_DIR to keep the state elsewhere — the tree beside the loop is still where the workers AND their modules are resolved from (it is exported as O_WORK)." >&2
+  mkdir -p "$O/logs" 2>/dev/null || true
+  echo "[startup] FATAL worker scripts missing from $O and ${_HERE_RS:-?}:$_missing_w — the controller refuses to run" >> "$O/logs/orch-loop.log" 2>/dev/null || true
+  exit 78
+fi
+# Where the WORKER scripts live. Named separately from `O` (state) because the two can now differ; the
+# `$O/state/argv-*`, `$O/.batch` and `$O/candidates.txt` arguments stay `$O` — they ARE state.
+O_WORK="$ORC_WORK_ROOT"
+# ⛔ AND EXPORT IT (review of #3846, P1). `export O` below hands every child the STATE dir, and the
+# workers resolve their own modules from `$O` — so without this a worker sees a state dir that holds no
+# scripts at all and silently loses claims and the per-repo merge contract. `fix-one.sh` and
+# `merge-one.sh` prefer `$O_WORK` when it is set, which is the harness root.
+export O_WORK
+# ⛔ AND `O` MUST BE EXPORTED, or the isolation is a claim the children contradict (fresh-context review
+# of #3846, P1 — the second one, and the sharper). Three DIRECT children re-default `O` themselves —
+# `harness-refresh.sh`, `refresh-candidates.sh` (`:212`) and `dispatch-merge.sh` (`:13`) — each with
+# `O="${O:-$HOME/orchestrator}"`, i.e. PRODUCTION. So an isolated instance printed "PRODUCTION state is
+# untouched by this instance" and then had its refresh rewrite production's `candidates.txt`/`.pool`/
+# `state/refresh-last`, and had `dispatch-merge.sh` write production's `.dispatched-ids` and prune its
+# `dispatched.txt`. The documented `ORC_STATE_DIR` arrangement was worse in the other direction: the
+# loop read `$O/candidates.txt` from the new dir while the refresh wrote it into the old one, so the box
+# reported `[cap]`/`[state]` healthy with an empty queue and dispatched nothing.
+# `worker-terminal.sh:1804` already emits `export O=…` in its env snapshot for exactly this reason ("a
+# worker falling back to $HOME/orchestrator is how a box silently runs a different harness") — the
+# worker path was covered and these three were not.
+export O
+# ⛔ SAY IT OUT LOUD, ONCE, AND ON THE `console` SIDE TOO. The incident needed `ps` archaeology
+# because NOTHING in either controller's log named the state dir it was writing or the fact that it
+# had adopted production as a DEFAULT rather than because a unit told it to. A derived (isolated)
+# state dir also goes to stderr: a proof run whose parent was captured is precisely the case where
+# the operator must learn it is NOT driving production before it reads any of its own output.
+mkdir -p "$O/logs" 2>/dev/null || true
+echo "[state] dir=$O src=$ORC_STATE_SRC ctl=$ORC_INSTANCE" >> "$O/logs/orch-loop.log" 2>/dev/null || true
+case "$ORC_STATE_SRC" in
+  derived:isolated*)
+    echo "[orch-loop] NOT driving production: state dir is $O ($ORC_STATE_SRC). PRODUCTION state ($ORC_PROD_STATE) is untouched by this instance. Set O=<dir> or ORC_STATE_DIR=<dir> to address a state dir explicitly." >&2
+    echo "[state] ISOLATED: this instance does NOT drive production; see $O/logs/orch-loop.log" >> "$O/logs/orch-loop.log" 2>/dev/null || true ;;
+esac
 # The directory of the RUNNING script, named once: `resolve_refresh_sh` looks beside the loop for a
 # refresh that can write the pass record this loop reads (agent-infra#2308), and the SEED-SKEW line
 # names it as the copy the controller itself runs. `_HERE_RS` already resolved it for repo-slug.sh.
@@ -160,8 +242,8 @@ export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH
 # serialiser) — and a shim that is never resolved is an INERT layer: it reports protection and
 # provides none. Re-assert both here, adapter last so `$O/gh-rest` (which itself calls the same
 # helper) wins where it exists. Guarded by `-d`, so a box that ships neither is unchanged.
-if [ -d "$O/gh-limit" ]; then PATH="$O/gh-limit:$PATH"; fi
-if [ -d "$O/gh-rest" ]; then PATH="$O/gh-rest:$PATH"; fi
+if [ -d "${O_WORK:-$O}/gh-limit" ]; then PATH="${O_WORK:-$O}/gh-limit:$PATH"; fi
+if [ -d "${O_WORK:-$O}/gh-rest" ]; then PATH="${O_WORK:-$O}/gh-rest:$PATH"; fi
 # ── THE GATE DECISION IS MEASURED, NOT ASSUMED (agent-infra#2319) — see lane.sh for the full note.
 # The controller is a shell, but every child it spawns INHERITS its environment, so this export used to
 # be the fleet-wide permanent bypass even on carriers that also set it themselves.
@@ -243,8 +325,31 @@ is_limit "${_NCPU:-}"    || _NCPU=4
 # `[ "$L" -ge 0 ]` is always true, so the load gate CLOSES and the box dispatches nothing, forever.
 # install.sh carries the identical line (P3, fifth review round, 2026-10-14).
 [ "${_NCPU:-0}" -ge 1 ] || _NCPU=4
+# ⛔ AND THE NUMBER CARRIES ITS PROVENANCE, because a ceiling whose ORIGIN is invisible is the other
+# half of agent-infra#2095: two instances printed `load=N/<their own ceiling>` into ONE log and no
+# line said which ceiling was the unit's and which was the copy's, so the divergence had to be
+# inferred from a plist read hours later. `_ORC_ENV_MAX_LOAD` is captured before the default for the
+# same reason `_ORC_ENV_O` is.
+_ORC_ENV_MAX_LOAD="${MAX_LOAD:-}"
 MAX_LOAD="${MAX_LOAD:-$(( 10#$_NCPU * 10 ))}"
-is_limit "${MAX_LOAD:-}" || MAX_LOAD=$(( 10#$_NCPU * 10 )); is_limit "${MAX_LOAD:-}" || MAX_LOAD=40
+# ⛔ PURE SHELL, NO FUNCTION CALL, and that is a constraint rather than a style choice: selftest.sh's
+# lane-derivation driver EXTRACTS the `^_NCPU=` .. `^MAX_REVIEW=` range and runs it in a bare shell to
+# prove MAX_LANES is derived (and that a pin is not recomputed). A `$(orc_max_load_src …)` in here
+# would print `command not found` into that driver's captured stdout and turn a correct MAX_LANES into
+# a red. The provenance is therefore derived from the two inputs directly.
+if [ -z "$_ORC_ENV_MAX_LOAD" ]; then
+  MAX_LOAD_SRC="derived:cores"
+elif [ -n "${ORC_CONTROLLER_ORIGIN:-}" ]; then
+  MAX_LOAD_SRC="plist(${ORC_CONTROLLER_ORIGIN})"
+else
+  MAX_LOAD_SRC="env"
+fi
+# ⛔ TWO COERCIONS ON ONE LINE, AND IT MUST STAY ONE LINE. selftest.sh's `NGRD` extraction picks up
+# coercion lines by an ANCHORED `^is_limit "${MAX_LOAD:` pattern, pins their EXACT COUNT (22) and then
+# EVALUATES what it extracted to drive them (`nlim`, `maxload_probe`). Splitting these two repairs
+# changes the count AND drops the derive-to-cores step out of that driver, so `nlim abc` comes back 40
+# instead of 100 — a false RED in a suite asserting on this very block.
+is_limit "${MAX_LOAD:-}" || { MAX_LOAD=$(( 10#$_NCPU * 10 )); MAX_LOAD_SRC="repair:derived:cores"; }; is_limit "${MAX_LOAD:-}" || { MAX_LOAD=40; MAX_LOAD_SRC="repair:default40"; }
 # ⛔ CAPACITY, NOT A LANE COUNT (owner ruling, 2026-10-17): "dispatch should be gated on capacity,
 # not on number of lanes. max lanes 8 is too low. that needs to be configured to 2.5x the number of
 # CPUs". Both numbers in play were LANE COUNTS that no hardware decided: the shipped default was a
@@ -2203,6 +2308,28 @@ REFRESH_RC=0              # the resolution's own answer (0 recorder · 2 found-b
 REFRESH_SH=""            # the script this loop executes (empty only when NO refresh exists at all)
 REFRESH_SH_SKEW=""       # the first copy passed over because it cannot record
 REFRESH_TRIED=""         # every path tried, in order — the SEED-SKEW verdict names them
+# ⛔ WHERE "SEEDED" LIVES IS A CODE QUESTION, NOT A STATE-DIR ONE (#2095; fresh-context review of
+# #3846, P2, MEASURED). Both call sites below used to hardcode `$O/refresh-candidates.sh` as "the seed",
+# and since this PR `O` is the controller's STATE DIR while the harness root is `O_WORK`. On the
+# documented `ORC_STATE_DIR` arrangement `<state>/refresh-candidates.sh` NEVER exists, so:
+#   * the beat logged `[refresh] SEED-SKEW: the seeded path $O/refresh-candidates.sh is MISSING …`
+#     EVERY CYCLE, with a remedy (`re-seed $O`) that would un-split the box — i.e. the same instrument
+#     the beat uses for a GENUINE skew, turned into noise that stops discriminating; and
+#   * `--check-refresh`, whose exit codes are its documented contract (0 ok / 1 divergence / 2
+#     unknown), answered `relation=skew` and exit **1** on a HEALTHY box — a monitor reading "this box
+#     cannot prove its origination".
+# ⛔ THE ORDER IS THE OPERATOR'S, UNCHANGED: a copy in `$O` still wins outright (#2278 — an operator
+# may seed the state dir deliberately, and no existing box changes behaviour). `$O_WORK` is the fallback
+# because it is the tree the controller RUNS the harness from — the same two-home rule `_claims_home`
+# above already applies. When neither carries one, the answer is `$O`'s path, so the remedy still reads
+# as the path an operator expected to exist.
+refresh_seed_home() {
+  if [ -f "$O/refresh-candidates.sh" ]; then printf '%s\n' "$O/refresh-candidates.sh"; return 0; fi
+  if [ -n "${O_WORK:-}" ] && [ -f "$O_WORK/refresh-candidates.sh" ]; then
+    printf '%s\n' "$O_WORK/refresh-candidates.sh"; return 0
+  fi
+  printf '%s\n' "$O/refresh-candidates.sh"
+}
 # 0 = a RECORDER was found (possibly beside the loop) · 2 = a script was found but NONE can record
 # (the box still runs one — origination keeps queueing, the BEAT just refuses to read its silence as
 # a cause) · 1 = no refresh script anywhere. The three answers are kept apart because their remedies
@@ -2259,340 +2386,98 @@ refresh_contract_gap() {   # <result> <at> <d>
 case "${1:-}" in
   --check-refresh)
     resolve_refresh_sh; _rc=$?
+    # The seed is resolved ONCE per answer (it is a filesystem probe, and the three arms below must
+    # name exactly the same path they compared against).
+    _seed_path="$(refresh_seed_home)"
+    _seed_dir="$(dirname "$_seed_path" 2>/dev/null)"; [ -n "$_seed_dir" ] || _seed_dir="$O"
     if [ "$_rc" = "0" ]; then
-      if [ "$REFRESH_SH" = "$O/refresh-candidates.sh" ]; then
-        printf 'refresh-contract relation=ok executed=%s tried=%s\n' "$REFRESH_SH" "$REFRESH_TRIED"
+      if [ "$REFRESH_SH" = "$_seed_path" ]; then
+        printf 'refresh-contract relation=ok executed=%s seed=%s tried=%s\n' "$REFRESH_SH" "$_seed_path" "$REFRESH_TRIED"
         exit 0
       fi
-      printf 'refresh-contract relation=skew executed=%s passed_over=%s tried=%s\n' \
-        "$REFRESH_SH" "${REFRESH_SH_SKEW:-none}" "$REFRESH_TRIED"
+      printf 'refresh-contract relation=skew executed=%s seed=%s passed_over=%s tried=%s\n' \
+        "$REFRESH_SH" "$_seed_path" "${REFRESH_SH_SKEW:-none}" "$REFRESH_TRIED"
       # ⛔ "MISSING OR CANNOT RECORD", NOT "CANNOT RECORD" (review P2): the skew arm is reachable when
-      # `$O` has NO copy at all (the resolver then finds the one beside the loop), and calling that a
-      # copy that "cannot record" is a false statement about a file that is not there. `passed_over=none`
-      # says which it is; the prose names both states.
-      printf '  DIVERGENCE: the seeded copy is MISSING or cannot record a pass outcome, so this controller would run a different copy. Fix: re-seed $O with the VERIFYING seeder (bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o $O) — a bare `cp *.sh` can deploy a partial harness with no verdict (agent-infra#2041)\n' >&2
+      # the seed has NO copy at all (the resolver then finds the one beside the loop), and calling that
+      # a copy that "cannot record" is a false statement about a file that is not there.
+      # `passed_over=none` says which it is; the prose names both states.
+      # ⛔ AND THE REMEDY NAMES THE SEED'S OWN HOME, not `$O` (fresh-context review of #3846, P2): on a
+      # split box `$O` is the state dir, so `re-seed $O` installed a harness INTO the state dir —
+      # exactly the arrangement this PR removes.
+      printf '  DIVERGENCE: the seeded copy (%s) is MISSING or cannot record a pass outcome, so this controller would run a different copy. Fix: re-seed %s with the VERIFYING seeder (bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o %s) — a bare `cp *.sh` can deploy a partial harness with no verdict (agent-infra#2041)\n' \
+        "$_seed_path" "$_seed_dir" "$_seed_dir" >&2
       exit 1
     fi
     if [ "$_rc" = "2" ]; then
       printf 'refresh-contract relation=unwritable executed=%s tried=%s\n' "${REFRESH_SH:-none}" "${REFRESH_TRIED:-none}"
-      printf '  BROKEN: no refresh-candidates.sh on this box defines refresh_record_write, so state/refresh-last cannot advance and its age proves nothing. Fix: re-seed $O with the VERIFYING seeder (bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o $O) — a bare `cp *.sh` can deploy a partial harness with no verdict (agent-infra#2041)\n' >&2
+      printf '  BROKEN: no refresh-candidates.sh on this box defines refresh_record_write, so state/refresh-last cannot advance and its age proves nothing. Fix: re-seed %s with the VERIFYING seeder (bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o %s) — a bare `cp *.sh` can deploy a partial harness with no verdict (agent-infra#2041)\n' "$_seed_dir" "$_seed_dir" >&2
       exit 2
     fi
     printf 'refresh-contract relation=absent tried=%s\n' "${REFRESH_TRIED:-none}"
-    printf '  UNKNOWN: no refresh-candidates.sh was found at all, so origination cannot run. Fix: re-seed $O with the VERIFYING seeder (bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o $O) — a bare `cp *.sh` can deploy a partial harness with no verdict (agent-infra#2041)\n' >&2
+    printf '  UNKNOWN: no refresh-candidates.sh was found at all, so origination cannot run. Fix: re-seed %s with the VERIFYING seeder (bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o %s) — a bare `cp *.sh` can deploy a partial harness with no verdict (agent-infra#2041)\n' "$_seed_dir" "$_seed_dir" >&2
     exit 2 ;;
 esac
 # [refresh-check:end]
 
 # [orchlock:begin]
 LOCKF="$O/.orch.lock"
-# ⛔ LIVENESS IS NOT IDENTITY (agent-infra#1985). The reclaim below used to be `kill -0 "$OPID"` and
-# nothing else, and that is BROKEN whenever a controller dies without its EXIT trap running (kill -9,
-# an OOM kill, a panic): the lock then names a pid the OS will recycle, so the next controller exits
-# `already running (pid N)` over a REUSED pid, the box dispatches nothing, and its own recovery is
-# blocked — launching a controller cannot fix a lock the controller itself refuses. Measured on a live
-# box: the watchdog saw the named pid alive, `ps -p <pid> -o command=` showed a process that was not
-# the controller, and the reload failed on every pass (`RECOVERY FAILED`, rc 1, three passes).
-#
-# ⛔ THE RULE IS THE FLEET'S ONE PROCESS-IDENTITY RULE (#1178), NOT A NEW ONE. A lock owner is
-#   (a) ALIVE, (b) an `orch-loop.sh` INVOCATION (argv shape — `registry_pid_is_controller`), and
-#   (c) a process that did NOT begin after the lock was written.
-# (c) is the discriminator for a recycled pid: the writer held that pid until it died, so any process
-# now holding the pid BEGAN AFTER the writer wrote the lock. It is the same `pid_began_after` fence
-# `orchestrator-bringup.sh:lock_pid` applies to this very file, and the same one the supervisor, the
-# registry and the installer apply (#1856: one predicate, one answer).
-#
-# ⛔ WHAT THE VERDICT MAY DO. Only POSITIVE evidence of non-ownership reclaims — absent, or not an
-# orch-loop.sh, or provably begun after the lock. A pid we cannot date is NOT reclaimed: reclaiming on
-# an unreadable read is how two controllers end up sweeping one PR queue (#1715), which is worse than
-# a stopped box. That case refuses (as before) and now says so LOUDLY, naming the remedy — the #1985
-# defect was that the refusal was one silent line in the log.
-#
-# ⛔ PINNED MIRRORS, NOT A SOURCE. `$O` is a FLAT seed (`deploy-harness.sh` copies
-# `orchestrator-harness/*`), so it has no `scripts/lib/` to source — the same constraint
-# `harness-refresh.sh:_began_before_lock` and `cloud-cell-supervisor.sh` document for their copies.
-# `orch-loop-lock.test.sh` pins both bodies and the slack to the canonical declarations, so drift
-# reddens CI instead of becoming a wrong reclaim.
-ORCH_LOCK_START_SLACK_SECONDS="${ORCH_LOCK_START_SLACK_SECONDS:-5}"
-# ⛔ VALIDATED BEFORE IT REACHES ARITHMETIC, BECAUSE AN UNVALIDATED READ FAILS OPEN — AND HERE THE
-# OPEN DIRECTION IS THE DESTRUCTIVE ONE. This seam is the ONLY input to the reclaim decision that comes
-# from the environment, and `$(( lt + … ))` below is evaluated inside a `set -u` shell. MEASURED on the
-# extracted block (a LIVE, loop-shaped owner in the lock, the exact `OWNER` case):
-#   unset → `already running (pid N)` (refused, correct)
-#   `1.5` → "syntax error: invalid arithmetic operator" → the ENCLOSING `if ! acq` COMPOUND IS ABORTED,
-#           so the block neither refuses nor reclaims: the newcomer prints STARTED with NO lock of its
-#           own while the LIVE owner's lock stays on disk — and its EXIT trap then deletes THAT lock
-#           (two controllers on one PR queue, #1715, plus a third-party deletion of a live lock).
-#           ⛔ THAT WAS THE PRE-FIX BEHAVIOUR of a fault inside the verdict; the containment for the
-#           NEXT one is the subshell transport at the verdict's call site (see its comment) — this
-#           validation stays the FIRST line because it stops that fault happening at all.
-#   `abc` → "unbound variable" → the controller DIES at the lock check naming neither the variable nor
-#           the remedy (the cryptic-stop class #1985 exists to end)
-#   `08`  → "value too great for base" — ⛔ ALL-DIGITS AND STILL FATAL: bash reads a leading zero as
-#           OCTAL, so a digits-only guard is NOT enough (`10#`, or the textual strip below, is)
-# The fleet's own copy of this same fence validates the same seam and documents the same reason
-# (scripts/lib/fleet-inventory.sh:_fleet_lock_owner). Fail to the documented default instead.
-case "$ORCH_LOCK_START_SLACK_SECONDS" in ''|*[!0-9]*) ORCH_LOCK_START_SLACK_SECONDS=5 ;; esac
-# ⛔ LEADING ZEROS STRIPPED TEXTUALLY, never normalised through `$(( ))`: `08` is all-digits and an
-# OCTAL ERROR in arithmetic (measured above), so the strip is what closes that half of the class.
-# ⛔ WHAT THIS STRIP DOES, EXACTLY — it NORMALISES, it does not REJECT (fresh review of #1985, P3;
-# MEASURED on this block, 11 values): `08` becomes **8** and `007` becomes **7**, and BOTH are KEPT,
-# because both are inside the bound below. The fallback to the documented 5 s covers only a value that
-# is NOT all-digits (`1.5`, `abc`, empty) or is wider than 60; an all-digit value with leading zeros is
-# neither, and no arm observes the resulting value unless §14's value rows run.
-while [ "${#ORCH_LOCK_START_SLACK_SECONDS}" -gt 1 ] \
-      && [ "${ORCH_LOCK_START_SLACK_SECONDS#0}" != "$ORCH_LOCK_START_SLACK_SECONDS" ]; do
-  ORCH_LOCK_START_SLACK_SECONDS="${ORCH_LOCK_START_SLACK_SECONDS#0}"
- done
-# A slack wider than the fence itself is not a setting, it is a defeat of the fence; the length test
-# comes FIRST so an absurd value is capped instead of reaching `[ -le ]` as an "integer expression
-# expected" error. Same bound as fleet-inventory.sh's copy of this fence.
-{ [ "${#ORCH_LOCK_START_SLACK_SECONDS}" -le 2 ] && [ "$ORCH_LOCK_START_SLACK_SECONDS" -le 60 ]; } \
-  || ORCH_LOCK_START_SLACK_SECONDS=5
-# The one literal this block needs for field parsing: `awk` separates the `stat` column from the argv
-# with a TAB, and the reassembled argv contains no TAB by construction (awk's fields split on whitespace).
-TAB="$(printf '\t')"
-# _orch_ps_start_epoch <pid> — when the process began, from `ps -o etime=` (one shape on BSD and GNU).
-# rc 1 when it cannot be read. PINNED MIRROR of `pid_start_epoch` in scripts/lib/pid-identity.sh.
-# ⛔ `10#`, NOT a bare `$(( ))`: etime ZERO-PADS, and bash reads a leading zero as OCTAL, so
-# `$((08 * 3600))` is an ERROR — which read as "cannot date it" for a few percent of live reads (#1856).
-_orch_ps_start_epoch() {
-  local p="${1:-}" e d h m s r
-  case "$p" in ''|*[!0-9]*) return 1 ;; esac
-  e="$("${PS_BIN:-/bin/ps}" -o etime= -p "$p" 2>/dev/null | tr -d '[:space:]')" || return 1
-  [ -n "$e" ] || return 1
-  d=0
-  case "$e" in *-*) d="${e%%-*}"; r="${e#*-}" ;; *) r="$e" ;; esac
-  case "$d" in ''|*[!0-9]*) return 1 ;; esac
-  case "$r" in
-    *:*:*) h="${r%%:*}"; r="${r#*:}"; m="${r%%:*}"; s="${r##*:}" ;;
-    *:*)   h=0;                 m="${r%%:*}"; s="${r##*:}" ;;
-    *) return 1 ;;
-  esac
-  case "$h$m$s" in ''|*[!0-9]*) return 1 ;; esac
-  h=$((10#${h:-0})); m=$((10#${m:-0})); s=$((10#${s:-0})); d=$((10#${d:-0}))
-  printf '%s\n' "$(( $(date +%s) - (d * 86400 + h * 3600 + m * 60 + s) ))"
-}
-# _orch_lock_probe <pid> — ONE process read, THREE outcomes, because HERE "cannot read" must never be
-# minted into "provably not the owner": the caller answers that verdict by DELETING the lock, so a false
-# negative is two controllers on one state dir (#1715). ⛔ THE DIRECTION IS INVERTED FROM THE SAME
-# PREDICATE'S REPORTING HOMES (`registry_pid_is_controller`, `lock_pid`, `argv_is_orch_loop`), where a
-# false negative only degrades a row to STOPPED — which is why the read/absence arms are NOT mirrored
-# verbatim and carry their own three outcomes (fresh review of #1985, P1).
-#   rc 0  PRESENT  stdout IS the argv, read from a table that provably ran
-#   rc 1  ABSENT   the read RAN and produced a table; the pid is not in it (and we cannot even signal
-#                  it), so the lock outlived its writer
-#   rc 2  UNKNOWN  the read failed, the table was empty, the pid is alive outside the table we could
-#                  read, or its argv could not be had — NEVER reclaim on this
-_orch_lock_probe() {
-  local p="${1:-}" t row stat cmd
-  case "$p" in ''|*[!0-9]*) return 1 ;; esac
-  # ⛔ `-ww`, BECAUSE `COLUMNS` OVERRIDES THE SAFE DEFAULT (#2926). A command substitution is not a
-  # tty, so this read would normally be width-independent — but `ps(1)` checks `COLUMNS` FIRST, and an
-  # exported COLUMNS TRUNCATES the command column. The path token is the LAST thing on the line, so it
-  # is cut mid-name, `${2##*/}` stops equalling `orch-loop.sh`, and the verdict becomes "PROVABLY NOT
-  # the owner" over a LIVE owner whose lock is then deleted — the worst direction of the eight reads
-  # #2926 tracks. `-ww` is unlimited on procps and "at least 131 columns" on BSD ps, so it raises the
-  # ceiling and never lowers it; it cannot narrow an already-unlimited read. Witnessed by
-  # `orch-loop-lock.test.sh` §11, which re-drives the refusal arms under `COLUMNS=20`.
-  t="$("${PS_BIN:-/bin/ps}" -ww -axo pid=,stat=,command= 2>/dev/null)" || return 2
-  # ⛔ AN EMPTY TABLE IS UNREADABLE, NOT EMPTY: the probing process itself appears in any real table,
-  # so a read that "succeeds" and prints nothing never witnesses absence (#1178 C3).
-  case "$t" in *[![:space:]]*) ;; *) return 2 ;; esac
-  row="$(printf '%s\n' "$t" | awk -v p="$p" '$1 == p { c = ""; for (i = 3; i <= NF; i++) c = (c == "" ? $i : c " " $i); print $2 "\t" c; exit }')"
-  if [ -z "$row" ]; then
-    # Not in a table we COULD read. Corroborate with `kill -0`: a pid we can signal is ALIVE, so the
-    # absence belongs to the read, not to the process → UNKNOWN. Otherwise it is positively gone.
-    kill -0 "$p" 2>/dev/null && return 2
-    return 1
-  fi
-  stat="${row%%"$TAB"*}"
-  case "$stat" in Z*) return 1 ;; esac          # a zombie cannot hold a lock — its EXIT trap has run
-  cmd="${row#*"$TAB"}"
-  [ -n "$cmd" ] || return 2                     # present, but its argv is unreadable → UNKNOWN
-  printf '%s\n' "$cmd"
-  return 0
-}
-# _orch_argv_is_loop <argv…> — 0 only when the INVOCATION is an orch-loop.sh.
-# ⛔ THE TWO TOKEN RULES ARE A PINNED MIRROR of `registry_pid_is_controller` in
-# scripts/lib/orchestrator-registry.sh: `${1##*/}` must be a shell and `${2##*/}` must be exactly
-# `orch-loop.sh`. A looser ANY-token match (`/?*orch-loop.sh`) accepted `bash -c "sleep 300; /abs/orch-
-# loop.sh"` — a non-controller — and a caller that merely MENTIONS the path (an editor, a grep) is not a
-# controller either (#1856 review). `orch-loop-lock.test.sh` pins these two rules to the canonical
-# declaration; only the READ arms above are deliberately different (see their header).
-# ⚠ THE CANONICAL'S ONE DOCUMENTED BLIND SPOT IS INHERITED HERE AND IS NOT FIXED BY THESE RULES:
-# `orchestrator-registry.sh` records "NOT handled on purpose: a state dir containing a space" — `set --
-# $*` word-splits, so such a path arrives as two tokens. A future reader who relaxes `safe_argv`
-# upstream must know this copy inherits the same caveat rather than silently diverging.
-_orch_argv_is_loop() { # shellcheck disable=SC2086
-  set -- $*
-  [ "$#" -ge 2 ] || return 1
-  case "${1##*/}" in bash|sh|dash|zsh) ;; *) return 1 ;; esac
-  case "${2##*/}" in orch-loop.sh) return 0 ;; esac
-  return 1
-}
-# _orch_argv_is_loop_flagged <argv…> — 0 when a shell is invoked WITH AN OPTION in front of an
-# `orch-loop.sh` (`bash -x /abs/orch-loop.sh`), i.e. a controller-shaped argv the two-token rule above
-# cannot ATTRIBUTE. Deliberately OUTSIDE that function: its body is a pinned mirror of
-# `orchestrator-registry.sh:registry_pid_is_controller` (the suite pins both the five-line body and the
-# `set --` tail), and this rule is the loop's OWN, because only the loop answers "not the owner" by
-# DELETING a lock.
-# ⛔ WHY IT EXISTS (fresh review of PR #3837 at 185e7c5bd, P2; MEASURED): `bash -x …/orch-loop.sh` failed
-# the two-token rule and was minted into rc 1 = PROVABLY NOT THE OWNER, so the next start printed
-# `STARTED`, logged `[lock] reclaiming …`, and the owner was STILL ALIVE — a second controller on one PR
-# queue (#1715), from an argv we READ but could not attribute. An argv that was read and could not be
-# attributed is `CANNOT-TELL`, never proof of non-ownership; the caller refuses and names it.
-# ⛔ `-c` IS NOT THIS CASE, AND THAT IS A RECORDED DECISION, NOT AN OVERSIGHT: #1856 established that
-# `bash -c "sleep 300; /abs/orch-loop.sh"` is a WRAPPER's argv rather than a controller (accepting it was
-# the loose any-token arm that failed open), and `orch-loop-lock.test.sh` arm 4c asserts such a pid is
-# RECLAIMED. That decision is a fact about the ARGV, not about one POSITION: a `-c`-family option seen
-# BEFORE the loop-shaped token means the shell was handed a COMMAND STRING, so an option in front of it
-# changes nothing (`bash -x -c "…; /abs/orch-loop.sh"` reclaims exactly as `bash -c …` does). Only the
-# option forms that leave the script as an ARGUMENT (`-x`, `-e`, `--posix`, `+o errexit`, …) are
-# deferred to a human as ambiguous.
-# ⛔ BOTH POLARITIES COUNT AS AN OPTION. `bash` accepts the `+` form of every `set`-style option, and this
-# repo's OWN classifier decision says such an argv IS an invocation: `check-deployed-drift.test.sh`
-# §10a-3e (the `for _v in 'bash -o pipefail' … 'bash +o errexit' …` fixture) asserts that every one of
-# those forms over `<abs>/orch-loop.sh` is an INVOCATION. A `-`-only option test minted that form into
-# rc 1 = RECLAIM over a LIVE owner — which `main` does too, MEASURED (its own predicate is the `-`-only
-# form), so this CLOSES a fail-open band that both `main` and the pre-#1985 loop had in different shapes:
-# the pre-#1985 loop refused any live pid, and #1985's shape rule reclaimed on a `+`-form option
-# (fresh review of #3865 at 8c3346680, P3 — an earlier wording here called it a regression versus `main`,
-# which is measurably wrong).
-# ⚠️ ONE NAMED OVER-REFUSAL, stated rather than discovered later: the token scan is ANY-token (so that
-# no plausible option form can miss the script), which means a non-controller whose argv merely NAMES the
-# script behind an option — `bash -x grep /abs/orch-loop.sh` — is refused as ambiguous instead of
-# reclaimed. `bash -- /abs/orch-loop.sh` is the same class and belongs in this list rather than in a
-# reviewer's notes (fresh review of #3865 at a2da4598b, note — MEASURED `flagged=1` / rc 0, this file's
-# own reading of `flagged`, where rc 0 IS the refusal): `--` ends option
-# parsing and the script really runs, but it is not a `-c`-family token, so it is deferred to a human.
-# That is the SAFE direction: a refusal costs a human one `rm -f`, while a wrong reclaim puts
-# two controllers on one queue (#1715). Do not narrow the scan to the "first non-option token" to fix
-# it: every option-taking form (`-o errexit`, `--rcfile FILE`, `+O shopt`) then makes that token an
-# argument rather than the script, and the missed script becomes a reclaim over a live owner.
-# ⚠️ AND ONE NAMED RESIDUAL IN THE OTHER DIRECTION (fresh review of #3865, P3 — MEASURED): a `-c`-family
-# token that is an OPTION'S VALUE is read as a command string. `bash --rcfile -c <abs>/orch-loop.sh` really
-# RUNS the script (its `ps` column is `bash --rcfile -c /abs/orch-loop.sh`), and it answers rc 1 = RECLAIM
-# over a running controller — the #1715 direction. ⛔ IT NEEDS ONLY THE LITERAL TOKEN `-c` IN ARGV, NOT A
-# FILE NAMED `-c` (fresh review of #3865 at 0fdd46dbc, P3 — this line claimed otherwise and was FALSE,
-# MEASURED: in a directory holding no `-c`, `cd /tmp/rcprobe && bash --rcfile -c ./s.sh` printed the
-# script's output and exited 0, because bash ignores `--rcfile` for a NON-INTERACTIVE shell — it consumes
-# `-c` as the option's operand and never looks for a file). So the precondition is a stranger argv than a
-# missing file, but it is NOT the filesystem exotica this comment used to claim, and the risk was
-# understated rather than overstated. Still not narrowed here: skipping a value-taking option's operand
-# would re-open the ambiguity this rule exists for. Named here rather than left to be rediscovered; the
-# fix, if it ever bites, is to skip the operand of the known value-taking long options (`--rcfile`,
-# `--init-file`) only.
-_orch_argv_is_loop_flagged() { # shellcheck disable=SC2086
-  local _t
-  set -- $*
-  [ "$#" -ge 3 ] || return 1
-  case "${1##*/}" in bash|sh|dash|zsh) ;; *) return 1 ;; esac
-  case "$2" in -*) ;; +*) ;; *) return 1 ;; esac          # token 2 must be a shell OPTION, either polarity
-  for _t in "$@"; do                                # ORDERED: a `-c` before the script is #1856's wrapper
-    # ⛔ `+c` IS THE SAME TOKEN IN THE OTHER POLARITY (fresh review of #3865, MEASURED: `bash +c 'echo X'`
-    # and `bash +cx 'echo X'` both EXECUTE the string).
-    # ⛔ AND `-c` IS A LETTER IN A SHORT-OPTION CLUSTER, NOT A WHOLE TOKEN: `-cx`, `-ce` and `+cx` are
-    # the same family and a whole-token match (`-[!-]*c*`) missed `-cx`/`-ce` entirely, so those spellings
-    # were refused as ambiguous while executing the string (fresh review of #3865 at 8c3346680, P3 — before
-    # `+*c*` joined the family at d74aea019a, `+cx` was the one cluster the `-`-only test got WRONG in the
-    # over-refusal direction; it answers RECLAIM since, and §17c drives it). LONG options are NOT the
-    # family (`--rcfile FILE` leaves the script as an argument, so
-    # `--*` falls through to the ambiguous answer), and a short cluster only means `-c` when it carries a
-    # literal `c` — `-o pipefail`, `-x`, `+o errexit` do not.
-    # ⛔ `--command` IS DEFENSIVE, NOT A CLAIM THAT A SHELL TAKES IT (fresh review of #3865, P3 —
-    # MEASURED: bash 5.2 and dash both REJECT it, `bash: --command: invalid option`, so the branch is
-    # unreachable today and no arm drives it). It is kept — and labelled — so that a future shell's long
-    # spelling is not silently treated as ambiguous, which is the fail-closed direction.
-    case "$_t" in
-      --command) return 1 ;;
-      --*) ;;                                                             # any other long option: not the family
-      -c|-*c*|+c|+*c*) return 1 ;;                                        # short cluster carrying `c`
-    esac
-    case "${_t##*/}" in orch-loop.sh) return 0 ;; esac
-  done
-  return 1
-}
-# _orch_lock_verdict <pid> <lockfile> -> 0 OWNER · 1 PROVABLY NOT the owner · 2 CANNOT TELL
-# Sets ORCH_LOCK_WHY (only on rc 2) to the read that failed, so the refusal names WHICH datum is missing
-# instead of asserting a fact about a process it could not read (fresh review of #1985, P1).
-# ⛔ THREE OUTCOMES, AND 2 IS NOT 1. Folding "cannot read it" into 1 would reclaim a lock whose live
-# owner it simply could not read (two controllers, #1715); folding it into 0 would keep the #1985 silent
-# stop. The caller refuses on 2, loudly, with the remedy named.
-ORCH_LOCK_WHY=""
-_orch_lock_verdict() {
-  local p="${1:-}" lf="${2:-}" lt pstart cmd
-  ORCH_LOCK_WHY=""
-  case "$p" in ''|*[!0-9]*) return 1 ;; esac
-  # ⛔ ONLY PID 0 IS EXCLUDED NUMERICALLY. `kill -0 0` targets OUR OWN PROCESS GROUP, so 0 can never
-  # be a lock owner — but pid 1 is a normal answer in a container whose entrypoint IS the loop, and
-  # the shape arm answers it correctly either way (init is not `<shell> <…/orch-loop.sh>`). Treating 1
-  # as "provably not the owner" was a THIRD reclaim reason the design does not sanction, and a
-  # numeric assumption is not positive evidence (fresh review of #1985, P2).
-  [ "$p" -gt 0 ] || return 1
-  cmd="$(_orch_lock_probe "$p")"; case $? in
-    0) ;;                                         # present, argv read
-    1) return 1 ;;                                # positively absent — the lock outlived its writer
-    *) ORCH_LOCK_WHY="the process table or that pid's argv cannot be read"; return 2 ;;
-  esac
-  # ⛔ AN ARGV WE READ BUT COULD NOT ATTRIBUTE IS NOT PROOF OF NON-OWNERSHIP. `_orch_argv_is_loop` answers
-  # "is this the canonical shape"; a controller started with a shell OPTION (`bash -x …/orch-loop.sh`) is
-  # neither that shape nor provably a non-controller, so it is deferred to a human as CANNOT-TELL rather
-  # than reclaimed out from under a live owner (#1715). Everything the shape rule DOES attribute as a
-  # non-controller (a `sleep`, a `-c` wrapper — #1856) still reclaims on rc 1 below, unchanged.
-  _orch_argv_is_loop "$cmd" || {
-    if _orch_argv_is_loop_flagged "$cmd"; then
-      ORCH_LOCK_WHY="that pid's argv is a SHELL INVOCATION of orch-loop.sh carrying an option the ownership rule cannot attribute"; return 2
+# ⛔ THE REFUSAL IS LOUD AND NON-ZERO, AND THE HOLDER TEST IS AN IDENTITY TEST (agent-infra#2095).
+# Three false-PASS mechanisms lived in the five lines this replaces:
+#   * `echo "already running"` then `exit 0` — a second controller exiting ZERO is indistinguishable
+#     from a healthy no-op, so launchd, a cell supervisor and a human all read "fine";
+#   * `kill -0 "$OPID"` as the WHOLE holder test — a recycled pid satisfies it, and on this fleet the
+#     recycled target is a PEER repo's controller running the same shared harness path, so the shape
+#     matches too (#1178/#2402);
+#   * `rm -f "$LOCKF"` before re-creating — an unconditional delete that could remove a LIVE holder's
+#     record when two starters judged the same stale pid at once.
+# The decision (acquire / held / unjudged) and its evidence live in `controller-state.sh`, so the
+# loop, the suites and any future caller cannot form different opinions about who owns this state dir.
+orc_singleton_acquire "$LOCKF"; ORC_SINGLETON_RC=$?
+case "$ORC_SINGLETON_RC" in
+  0)
+    # ⛔ A RECLAIM IS LOGGED (agent-infra#1985's rule, kept across the #2095 rewrite). A silent reclaim is
+    # the other half of the #1715 class: two starters judging the same stale pid, one reclaiming while
+    # the other is still deciding, is invisible unless the pass says which record it displaced and why.
+    # `orc_singleton_acquire` already carries the evidence in `ORC_SINGLETON_WHY` for exactly this use;
+    # only the reclaim arms are logged, because "acquired" on a free path is not news and would bury it.
+    case "${ORC_SINGLETON_WHY:-}" in
+      reclaimed*) echo "[lock] $ORC_SINGLETON_WHY (agent-infra#2095; record $LOCKF)" >> "$LOG" 2>/dev/null || true ;;
+    esac ;;
+  *)
+    # ⛔ `rc=` IS IN THE LINE ON PURPOSE: it is the only durable record of WHICH refusal this was, and
+    # the launchd wrapper propagates that distinction (74 UNJUDGED / 75 HELD) to launchd and to
+    # `harness-up`, whose two rows have opposite remedies. A line without the code made the wrapper
+    # collapse them, and `harness-up` then told the operator not to touch a lock that was the problem.
+    # ⛔ 75, NOT 0, AND THE NAME OF THE HOLDER GOES ON EVERY SURFACE. `exit 0` was the false PASS:
+    # under launchd KeepAlive a silent zero reads as "the controller ran and found nothing to do". A
+    # non-zero exit is what makes a launchd throttle, a cell supervisor's `status` and a human's
+    # `echo $?` agree that this instance did NOT run.
+    _orc_refusal="[singleton] rc=$ORC_SINGLETON_RC refused me=$ORC_INSTANCE state=$O state_src=$ORC_STATE_SRC max_load=$MAX_LOAD src=$MAX_LOAD_SRC — $ORC_SINGLETON_WHY"
+    echo "[orch-loop] $_orc_refusal" >&2
+    echo "$_orc_refusal" >> "$LOG" 2>/dev/null || true
+    # ⛔ TWO REFUSALS, TWO EXIT CODES, BECAUSE THEY HAVE OPPOSITE REMEDIES (fresh-context review of
+    # #3846). HELD (rc 1) means a controller of this state dir owns it: do nothing, the box is fine.
+    # UNJUDGED (rc 2) means the record could not be read or dated: somebody has to LOOK, and possibly
+    # remove it. Collapsing both into 75 made the launchd row assert the HELD story — "this state dir
+    # already has a controller, which is the singleton working" — and tell the operator NOT to touch
+    # the lock, while the loop's own text said the opposite. 74 is UNJUDGED and has its own row.
+    if [ "$ORC_SINGLETON_RC" = "2" ]; then
+      # ⛔ THE TEXT MUST MATCH WHAT THE MODULE ACTUALLY DID (fresh-context review of #3846, cycle 2).
+      # rc 2 has two arms that leave the state dir in OPPOSITE states: an UNREADABLE record is still
+      # THERE, so `rm -f` is the remedy once nothing holds it; a FAILED RESTORE leaves `$LOCKF`
+      # absent or empty and KEEPS the displaced record at `ORC_RECLAIM_TEMP`, where `rm -f $LOCKF` is a
+      # no-op and the copy has to be PUT BACK. Saying "it is present / nothing was removed" for both
+      # sent the operator to a no-op while the only copy sat orphaned — the module was fixed for this
+      # and this line was not.
+      if [ -n "${ORC_RECLAIM_TEMP:-}" ]; then
+        echo "[orch-loop] the record at $LOCKF could not be put back (contents: '$(orc_lock_pid "$LOCKF" 2>/dev/null)'). NOTHING WAS DELETED: the displaced record is KEPT at $ORC_RECLAIM_TEMP. Next: find out why this state dir would not take a record (writable? space/inodes? hard links?), then mv '$ORC_RECLAIM_TEMP' '$LOCKF' and start again. Do NOT delete that file: it is the only record of a controller that may still be running." >&2
+      else
+        echo "[orch-loop] the record at $LOCKF could not be judged (contents: '$(orc_lock_pid "$LOCKF" 2>/dev/null)'). Nothing was removed: an unreadable record is not a dead one. Next: read that pid's identity with 'ps -o pid=,etime=,command= -p <pid>'; if no controller of $O is running, rm -f '$LOCKF' and start again." >&2
+      fi
+      exit 74
     fi
-    return 1                                      # argv READ, and it is not an orch-loop.sh
-  }
-  lt="$(date -r "$lf" +%s 2>/dev/null)" || { ORCH_LOCK_WHY="the lock file's own timestamp cannot be read"; return 2; }
-  case "$lt" in ''|*[!0-9]*) ORCH_LOCK_WHY="the lock file's own timestamp cannot be read"; return 2 ;; esac
-  pstart="$(_orch_ps_start_epoch "$p")" || { ORCH_LOCK_WHY="that pid's START TIME cannot be read"; return 2; }
-  [ "$pstart" -gt "$(( lt + ORCH_LOCK_START_SLACK_SECONDS ))" ] && return 1   # began AFTER the lock
-  return 0
-}
-acq() { ( set -o noclobber; echo $$ > "$LOCKF" ) 2>/dev/null; }
-if ! acq; then
-  # Digits only, like `orchestrator-bringup.sh:lock_pid`: a lock carrying `abc` reached `[ abc -gt 0 ]`
-  # — an ERRORED test, which is FALSE, which reclaimed it — so the read is sanitised before any test.
-  OPID="$(tr -dc '0-9' 2>/dev/null < "$LOCKF")"
-  # ⛔ THE VERDICT RUNS IN A SUBSHELL AND TRANSPORTS ITS ANSWER THROUGH STDOUT — A STATEMENT SPLIT DOES
-  # NOT CONTAIN ANYTHING (fresh review of #1985, P3; MEASURED, both shapes). `v; _OV=$?` and `v`⏎`_OV=$?`
-  # are the SAME AND-OR list, so a bash ARITHMETIC fault inside the verdict does not stop at the
-  # verdict — it aborts the whole `if ! acq` compound (no refusal, no CANNOT-TELL, no reclaim log, no
-  # `rm`) and execution then continues PAST it: the newcomer prints STARTED with NO lock of its own
-  # while the live owner's lock stays on disk, and its EXIT trap later deletes THAT lock (#1715).
-  # ⛔ A PLAIN `( verdict ); _OV=$?` CONTAINS THE FAULT BUT IS NOT A FIX: it mints rc **1**, which is
-  # the RECLAIM answer — the destructive direction (MEASURED). So the verdict reports its rc AND its
-  # reason on stdout from inside the subshell, and a substitution that produced NO result (the fault
-  # aborted it) is mapped to 2 = CANNOT-TELL, which refuses LOUDLY. The input validation above stays
-  # the FIRST line of defence; this is the containment for a fault it cannot know about, which is the
-  # shape the slack fault arrived in.
-  _OVR="$( _orch_lock_verdict "${OPID:-0}" "$LOCKF"; printf '%s\t%s' "$?" "${ORCH_LOCK_WHY:-}" )"
-  _OV="${_OVR%%"$TAB"*}"
-  ORCH_LOCK_WHY="${_OVR#*"$TAB"}"
-  case "${_OV:-}" in
-    0|1|2) ;;
-    *) _OV=2
-       [ -n "${_OVR:-}" ] || ORCH_LOCK_WHY="the ownership verdict itself faulted: it produced NO result, so nothing about the owner was established" ;;
-  esac
-  if [ "$_OV" = 0 ]; then echo "[orch-loop] already running (pid $OPID)"; exit 0; fi
-  if [ "$_OV" = 2 ]; then
-    _MSG="[orch-loop] CANNOT-TELL: lock $LOCKF names pid ${OPID:-none} and ${ORCH_LOCK_WHY:-the owner cannot be identified}, so a RECYCLED pid cannot be ruled out — a second controller is refused (agent-infra#1715). If no controller is running: rm -f $LOCKF (agent-infra#1985)"
-    echo "$_MSG" >&2
-    # ⛔ `${LOG:-/dev/null}`, NOT `$LOG`: this block is EXTRACTED and driven by consumers that supply
-    # only `O` (`selftest.sh` §20 runs it under `set -u`), where an unbound `$LOG` ABORTS the shell
-    # before the reclaim — a red shard AND a vacuously green refusal arm (fresh review of #1985, P2).
-    echo "[lock] CANNOT-TELL — $_MSG" >> "${LOG:-/dev/null}" 2>/dev/null || true
-    exit 0
-  fi
-  # Positive evidence only: absent, not an orch-loop.sh, or provably begun AFTER the lock. Logged,
-  # because a silent reclaim is the other half of the #1715 class (it must never be invisible).
-  echo "[lock] reclaiming $LOCKF — pid ${OPID:-none} is provably NOT the owner (absent, not an orch-loop.sh invocation, or begun after the lock was written)" >> "${LOG:-/dev/null}" 2>/dev/null || true
-  rm -f "$LOCKF"
-  acq || { echo "[orch-loop] lock race — exiting"; exit 0; }
-fi
+    exit 75 ;;
+esac
 # [orchlock:end]
 # ⛔ THE SIGNAL HANDLERS ONLY TERMINATE — THE LOCK IS RELEASED BY THE `EXIT` TRAP ALONE.
 # Was `trap 'rm -f "$LOCKF"' EXIT INT TERM`, and for INT/TERM a handler that RETURNS does NOT
@@ -2609,11 +2494,15 @@ fi
 # (measured), which is fail-closed — `acq()` reclaims a dead pid.
 trap 'exit 143' TERM
 trap 'exit 130' INT
-# ⛔ AND THE SCRATCH DIR IS REAPED HERE TOO. `gh_bound_cleanup` (defined in the gh-bound block) removes
-# the ONE `bounded.*` dir the internal watchdog inherited, so a controller that lives for a month does
-# not leave it behind for the next boot to find. It is a `command -v`-guarded no-op on every host that
-# resolved a real `timeout` and on the DEGRADED path.
-trap 'rm -f "$LOCKF"; command -v gh_bound_cleanup >/dev/null 2>&1 && gh_bound_cleanup' EXIT
+# ⛔ OWNERSHIP-SCOPED RELEASE (agent-infra#2095). The shipped trap was `rm -f "$LOCKF"`, which is safe
+# only while nothing else can have written the record between acquire and exit. After a reclaim race
+# (or an operator's manual `rm -f` followed by a fresh start) it is not: the exiting instance would
+# delete the NEW holder's record, and the next start would co-run with it. `orc_singleton_release`
+# removes the record only when it names THIS pid.
+# ⛔ AND THE SCRATCH DIR IS REAPED HERE TOO (main, #2028). `gh_bound_cleanup` removes the ONE
+# `bounded.*` dir the internal watchdog inherited, so a controller that lives for a month does not
+# leave it behind for the next boot to find. `command -v`-guarded: a no-op where `timeout` resolved.
+trap 'orc_singleton_release "$LOCKF"; command -v gh_bound_cleanup >/dev/null 2>&1 && gh_bound_cleanup' EXIT
 
 # ── THE FORK-FREE TIMER IS OPENED HERE, WHILE THE BOX CAN STILL FORK (agent-infra#2293) ─────────
 # The starved path must wait without spawning, and `mkfifo`/`exec` themselves spawn/CREATE — so both
@@ -2682,7 +2571,7 @@ is_limit "${STALE_MIN:-}" || STALE_MIN=40
 # PR #3756, P0 — reproduced). `worker-terminal.sh` launches a worker on a durable cmux terminal
 # (`/bin/bash $O/state/run-<w>.sh`, `:2066`/`:2075`) or, where the cmux daemon does not answer — "the
 # launchd Mac and **the Linux cell**" (`:1888`), "on a cell tmux is the only surface" (`:2041`) — in a
-# TMUX PANE whose command is `bash -c '<env>; cd <cwd> && bash $O/fix-one.sh --argv $O/state/argv-<PR>'`
+# TMUX PANE whose command is `bash -c '<env>; cd <cwd> && bash $O_WORK/fix-one.sh --argv $O/state/argv-<PR>'`
 # (`:2020`). On the tmux arm the run script is never written (that arm returns at `:2028`/`:2038`) and
 # the log path is a shell REDIRECT, not an argv element (`spawn-gate.sh`'s `run_agent`), so an identity
 # set built from `<log>.log` / `wt-<w>` / `run-<w>.sh` matched NOTHING there — i.e. #2104, which was
@@ -6001,9 +5890,19 @@ while true; do
   # ── cross-box claim snapshot (agent-infra#1709 recs 1-3) ─────────────────────
   # ONE fetch refreshes every claim ref, so claim_live() answers "is another box on this?"
   # from a local file. Per-PR network calls would be 2 x N round trips per cycle.
-  if [ -f "$O/claims.sh" ]; then
+  # ⛔ TWO HOMES, LIKE EVERY SIBLING MODULE (fresh-context review of #3846, P1). This was the ONE
+  # module-resolution site with no beside-the-loop fallback, and it is the load-bearing one: with the
+  # documented `ORC_STATE_DIR` (or a case-4 isolated instance, whose `$O` is an empty temp dir) the
+  # snapshot never loads, the sweep abstains, every PR reads `claim-unreadable` and NOTHING is spawned
+  # while `[cap]` keeps printing a healthy line. That is verbatim the "reports healthy and can dispatch
+  # nothing" class the O_WORK block above exists to remove, one module over from the four it fixed.
+  _claims_home=""
+  if [ -f "$O/claims.sh" ]; then _claims_home="$O"
+  elif [ -n "${_HERE_RS:-}" ] && [ -f "$_HERE_RS/claims.sh" ]; then _claims_home="$_HERE_RS"
+  fi
+  if [ -n "$_claims_home" ]; then
     # shellcheck source=/dev/null
-    . "$O/claims.sh"
+    . "$_claims_home/claims.sh"
     # ⛔ CLAIM_REPO IS STILL SET EXPLICITLY HERE (agent-infra#1996). launchd starts the job at cwd `/`
     # and macOS DENIES the read of it, so a relative registry resolves against a cwd that cannot even
     # be read: every git call inside claims.sh then fails, and the snapshot came back empty with live
@@ -6092,7 +5991,7 @@ while true; do
     # exactly as if it were alone on the repo, which is the duplicate dispatch this whole mechanism
     # exists to prevent. It is now the loud, named abstention: nothing is selected until the one-line
     # remedy is run. `refresh-candidates.sh --check` refuses the same state up front.
-    echo "[claims] ⛔ claim-unreadable: no registry at $O/claims.sh — every PR reads claim-unreadable, so NOTHING is spawned or armed this cycle (silence is not freedom); fix: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o ${O:-~/orchestrator}" >> "$LOG"
+    echo "[claims] ⛔ claim-unreadable: no registry at $O/claims.sh or ${_HERE_RS:-?}/claims.sh — every PR reads claim-unreadable, so NOTHING is spawned or armed this cycle (silence is not freedom); fix: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o ${O:-~/orchestrator}" >> "$LOG"
   fi
 
   stg_mark claims
@@ -6895,7 +6794,7 @@ while true; do
             RF_BOOK=$(( RF_N + 1 ))
             if printf '%s %s\n' "$HEAD_N" "$RF_BOOK" > "$RF_CF" 2>/dev/null \
                && printf '%s\n' "$(( RF_FN + 1 ))" > "$RF_FC" 2>/dev/null; then
-              if wt_spawn "fix-$PR" "$SPAWN_CWD" "unset OPENAI_API_KEY OPENAI_BASE_URL; bash '$O/fix-one.sh' --argv '$O/state/argv-$PR'"; then
+              if wt_spawn "fix-$PR" "$SPAWN_CWD" "unset OPENAI_API_KEY OPENAI_BASE_URL; bash '${O_WORK:-$O}/fix-one.sh' --argv '$O/state/argv-$PR'"; then
                 RF_N="$RF_BOOK"
                 # (7) PR NUMBER, the refusal VERBATIM, the attempt counter and the session name, in ONE
                 # line: an operator reading this log must not have to join three files to learn why a
@@ -7105,7 +7004,7 @@ while true; do
             # `fix-one.sh`'s own spawn gate. `ci-queue.sh`'s header states the class rule: only work
             # that ADDS a new CI run is queue-gated. Do not re-nest it here.
             printf '%s\n' "$REPO" "$OR" "$PR" "$BR" > "$O/state/argv-$PR"
-            if wt_spawn "fix-$PR" "$SPAWN_CWD" "bash '$O/fix-one.sh' --argv '$O/state/argv-$PR'"; then
+            if wt_spawn "fix-$PR" "$SPAWN_CWD" "bash '${O_WORK:-$O}/fix-one.sh' --argv '$O/state/argv-$PR'"; then
               echo $((NFC + 1)) > "$CF"
               echo "#$PR CONFLICTING -> fixer attempt $((NFC + 1))" >>"$LOG"
               disp "$PR" "${HEAD_N:-}" CONFLICTED act "conflict fixer spawned (attempt $((NFC + 1)))"
@@ -7172,7 +7071,7 @@ while true; do
             # set as the worker's REQ makes it the override — one resolution, one authority.
             # ⛔ shq, never %q: `%q` emits `$'…'` for a non-printable byte and dash does not parse
             # that as quoting, so the value would execute (round-8 adversarial review, B6).
-            if wt_spawn "merge-$PR" "$SPAWN_CWD" "REQ=$(shq "$REQ") REVIEW_GATE=$(shq "$REVIEW_GATE") bash '$O/merge-one.sh' --argv '$O/state/argv-$PR'"; then
+            if wt_spawn "merge-$PR" "$SPAWN_CWD" "REQ=$(shq "$REQ") REVIEW_GATE=$(shq "$REVIEW_GATE") bash '${O_WORK:-$O}/merge-one.sh' --argv '$O/state/argv-$PR'"; then
               echo "#$PR GREEN -> rail worker merge-$PR" >>"$LOG"
               disp "$PR" "${HEAD_N:-}" GREEN act "rail worker merge-$PR spawned"
             else
@@ -7345,7 +7244,7 @@ while true; do
               # It is the counterpart `refund_bailed_fixer … 1` requires: this is the ONLY site that
               # consumes a findings marker, so it is the only site that may authorise a restore.
               : > "$O/state/fixspend-$PR-$HEAD_N"
-              if wt_spawn "fix-$PR" "$SPAWN_CWD" "bash '$O/fix-one.sh' --argv '$O/state/argv-$PR'"; then
+              if wt_spawn "fix-$PR" "$SPAWN_CWD" "bash '${O_WORK:-$O}/fix-one.sh' --argv '$O/state/argv-$PR'"; then
                 echo $((NF + 1)) > "$FIXN"; rm -f "$O/state/needsfix-$PR-$HEAD_N"
                 echo "#$PR fixer attempt $((NF + 1))" >>"$LOG"
                 disp "$PR" "${HEAD_N:-}" "$V" act "review-gate fixer spawned (attempt $((NF + 1)))"
@@ -7509,7 +7408,7 @@ while true; do
               # ⛔ A SPAWN THAT DID NOT HAPPEN MUST SAY SO (#2126 T1). This line was `tmux … && echo`,
               # so a FAILED re-record spawn was completely unremarked — the PR looked idle with no
               # reason. Every other spawn site in this file has an explicit failure branch.
-              if wt_spawn "review-$PR" "$SPAWN_CWD" "REV_PAID=1 REV_ROUND=$(( ${_rrn:-0} + 1 )) REQ=$(shq "$REQ") REVIEW_GATE=$(shq "$REVIEW_GATE") bash '$O/merge-one.sh' --argv '$O/state/argv-$PR'"; then
+              if wt_spawn "review-$PR" "$SPAWN_CWD" "REV_PAID=1 REV_ROUND=$(( ${_rrn:-0} + 1 )) REQ=$(shq "$REQ") REVIEW_GATE=$(shq "$REVIEW_GATE") bash '${O_WORK:-$O}/merge-one.sh' --argv '$O/state/argv-$PR'"; then
                 # SPEND THE REVIEW BUDGET ONLY ON A SPAWN THAT HAPPENED — the same rule `fixcount`
                 # follows one arm above: bookkeeping before the spawn makes a killed/failed spawn cost
                 # a real attempt, and this counter is the only thing standing between a wedged reviewer
@@ -7599,7 +7498,7 @@ while true; do
             # (#2927): a CI-red fixer is REPAIR, and the bounds on it are this `$MF` fix-lane ceiling,
             # `can_spawn`'s load/disk/memory gate and the cross-box claim.
             printf '%s\n' "$REPO" "$OR" "$PR" "$BR" > "$O/state/argv-$PR"
-            if wt_spawn "fix-$PR" "$SPAWN_CWD" "bash '$O/fix-one.sh' --argv '$O/state/argv-$PR'"; then
+            if wt_spawn "fix-$PR" "$SPAWN_CWD" "bash '${O_WORK:-$O}/fix-one.sh' --argv '$O/state/argv-$PR'"; then
               echo $((NFC2 + 1)) > "$O/state/fixcount-$PR"
               echo "#$PR CI-red ($V) -> fixer attempt $((NFC2 + 1))" >>"$LOG"
               disp "$PR" "${HEAD_N:-}" "$V" act "CI-red fixer spawned (attempt $((NFC2 + 1)))"
@@ -8281,7 +8180,7 @@ PY
   # ⛔ `lanes=<live>/<total>` and `zombie=<n>` (#2163). The TOTAL is the field that makes a leak
   # visible: `lanes=14/25` still reads "full" while `lanes=14/76` says the box is carrying 62 finished
   # residents. `max_lanes=` keeps the ceiling the gate applies, so no reader has to infer it.
-  echo "[cap] load=$L/$MAX_LOAD lanes=${LANES_DISPLAY:-?}/$LANES_TOTAL max_lanes=$MAX_LANES zombie=$ZOMBIES lanes_src=${LANES_SOURCE:-unset} mem_avail=${MEMAVAIL_MB}M/${MIN_MEM_FREE_MB}M swap_free=${SWFREE}M/${MIN_SWAP_FREE}M disk_free=${DISK_FREE_MB:-?}M/${DISK_NEED_MB:-?}M disk_headroom=${DISK_HEADROOM:-?} disk_src=${DISK_SRC:-unset} open=${OPEN_N:-?}@${OR:-?} unowned=${UPN:-?} last_land=${LAND_AGE:-?}m review_slots=${MR:-?} fix_slots=${MF:-?}" >> "$LOG"
+  echo "[cap] load=$L/$MAX_LOAD lanes=${LANES_DISPLAY:-?}/$LANES_TOTAL max_lanes=$MAX_LANES zombie=$ZOMBIES lanes_src=${LANES_SOURCE:-unset} mem_avail=${MEMAVAIL_MB}M/${MIN_MEM_FREE_MB}M swap_free=${SWFREE}M/${MIN_SWAP_FREE}M disk_free=${DISK_FREE_MB:-?}M/${DISK_NEED_MB:-?}M disk_headroom=${DISK_HEADROOM:-?} disk_src=${DISK_SRC:-unset} open=${OPEN_N:-?}@${OR:-?} unowned=${UPN:-?} last_land=${LAND_AGE:-?}m review_slots=${MR:-?} fix_slots=${MF:-?} ctl=${ORC_INSTANCE:-?} state_src=${ORC_STATE_SRC:-?} max_load_src=${MAX_LOAD_SRC:-?}" >> "$LOG"
   # Four gates. swap_total=0 => swap uninitialised (fresh boot), NOT pressure — allow.
   # Name the binding gate: an earlier version logged "skipped (load=…)" while load was never
   # consulted, so a lanes-bound or swap-bound stall looked like a load stall.
@@ -8920,12 +8819,12 @@ PY
     # is a different file, and an escalation the operator cannot find where he reads is not one.
     if [ "${_stalled:-0}" = "1" ] && [ "${_dpok:-0}" != "1" ]; then
       echo "[dispatch] DRAIN STALL -> STALL FIX SKIPPED (the pass counter could not be persisted to state/drain-stall, so the one-per-${DRAIN_STALL_FIX_EVERY:-3} bound cannot be enforced — dispatching anyway would fire on every stalled pass)" >> "$LOG"
-    elif [ "${_stalled:-0}" = "1" ] && [ -x "$O/stall-fix.sh" ]; then
+    elif [ "${_stalled:-0}" = "1" ] && [ -x "${O_WORK:-$O}/stall-fix.sh" ]; then
       O="$O" UPN_WORK="${UPN_WORK:-}" HARNESS_REPO="${HARNESS_REPO:-}" \
         PRDISP_SPAWNS="${PRDISP_SPAWNS:-}" _AGESRC="${_agesrc:-measured}" \
-        bash "$O/stall-fix.sh" "${_dpass:-0}" "${_lage:-?}" >> "$LOG" 2>&1 || true
+        bash "${O_WORK:-$O}/stall-fix.sh" "${_dpass:-0}" "${_lage:-?}" >> "$LOG" 2>&1 || true
     elif [ "${_stalled:-0}" = "1" ]; then
-      echo "[dispatch] DRAIN STALL -> STALL FIX MISSING ($O/stall-fix.sh absent or not executable) — the escalation recorded the stall and dispatched nobody" >> "$LOG"
+      echo "[dispatch] DRAIN STALL -> STALL FIX MISSING (${O_WORK:-$O}/stall-fix.sh absent or not executable) — the escalation recorded the stall and dispatched nobody" >> "$LOG"
     fi
     # [drain-health:end]
   else
@@ -9273,7 +9172,20 @@ PY
       # INCOMPLETE is a fail-open that can duplicate a peer's work — so it stops the dispatch, names
       # the fix, and `refresh-candidates.sh --check` refuses the cell up front. Pre-flight and
       # dispatch now take the SAME polarity on the same condition.
-      if [ -f "$O/claims.sh" ] && declare -f claim_issue_acquire >/dev/null 2>&1; then
+      # ⛔ THE REGISTRY IS RESOLVED SELF-SUFFICIENTLY, NOT READ FROM `_claims_home` (fresh-context review
+      # of #3846, P1). Two reasons. It used to test `$O/claims.sh` while the sweep block sourced the
+      # registry from `$_claims_home`, so on a state-dir instance the registry was LOADED and this guard
+      # said absent — no issue claim taken, and a remedy that cannot help. But `_claims_home` is assigned
+      # 3000 lines ABOVE, and this arm is EXTRACTED and DRIVEN on its own (`refresh-scout.test.sh`), where
+      # that name is UNBOUND — which read as "no registry" and stopped every dispatch. So the two-home
+      # rule is spelled here: the sweep's answer when it has one, otherwise resolved inline.
+      _dch="${_claims_home-}"
+      if [ -z "$_dch" ]; then
+        if [ -f "$O/claims.sh" ]; then _dch="$O"
+        elif [ -n "${_HERE_RS:-}" ] && [ -f "$_HERE_RS/claims.sh" ]; then _dch="$_HERE_RS"
+        fi
+      fi
+      if [ -n "${_dch:-}" ] && declare -f claim_issue_acquire >/dev/null 2>&1; then
         if claim_issue_acquire "" "$ISS"; then
           # The commit this box pushed, for the FENCED release. Written only on a successful acquire,
           # so a refusal can never leave a release path pointing at someone else's claim.
@@ -9308,10 +9220,10 @@ PY
           fi
           continue
         fi
-      elif [ -f "$O/claims.sh" ]; then
+      elif [ -n "${_dch:-}" ]; then
         # PRESENT BUT STALE — see the polarity note above. The box would have to dispatch unclaimed,
         # which is the fail-open this branch now refuses.
-        echo "[dispatch] #$ISS NOT dispatched — \$O/claims.sh predates the issue key (no claim_issue_acquire), so this box cannot take the claim; fix: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o ~/orchestrator" >> "$LOG"
+        echo "[dispatch] #$ISS NOT dispatched — \${_dch:-?}/claims.sh predates the issue key (no claim_issue_acquire), so this box cannot take the claim; fix: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o ~/orchestrator" >> "$LOG"
         continue
       else
         # ⛔ NO REGISTRY IS NOT FREEDOM, NOT EVEN FOR DISPATCH (agent-infra#2466). This arm used to
@@ -9321,7 +9233,7 @@ PY
         # the duplicate-dispatch shape the issue claim exists for — it cannot take the claim AND it
         # cannot see a peer's. The cost of abstaining is one command and one cycle of delay; the cost
         # of dispatching is two lanes on one issue.
-        echo "[dispatch] #$ISS NOT dispatched — claim-unreadable: no registry at $O/claims.sh, so this box can neither take the issue claim nor see a peer's; an absent registry is not evidence of freedom. Fix: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o ${O:-~/orchestrator}" >> "$LOG"
+        echo "[dispatch] #$ISS NOT dispatched — claim-unreadable: no registry at $O/claims.sh or ${_HERE_RS:-?}/claims.sh, so this box can neither take the issue claim nor see a peer's; an absent registry is not evidence of freedom. Fix: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o ${O:-~/orchestrator}" >> "$LOG"
         continue
       fi
       # ⛔ THE BATCH CAP IS THE CASCADE'S, NOT `BATCH` (owner ruling 2026-11-04). `BATCH` was the
@@ -9497,7 +9409,7 @@ PY
       _dmrc=0
       # The recount below reads a file THIS call writes, so a stale one must not be mistaken for it.
       rm -f "$O/.dispatched-ids" 2>/dev/null || true
-      bash "$O/dispatch-merge.sh" "$REPO" "$OR" $(tr '\n' ' ' < "$O/.batch") >> "$LOG" 2>&1 || _dmrc=$?
+      bash "${O_WORK:-$O}/dispatch-merge.sh" "$REPO" "$OR" $(tr '\n' ' ' < "$O/.batch") >> "$LOG" 2>&1 || _dmrc=$?
       if [ "$_dmrc" = "3" ]; then
         echo "[dispatch] ci-queue gate DEFERRED the whole batch ($K issue(s)) — nothing was dispatched; claims released, rows dropped, re-decided next cycle" >> "$LOG"
         K=0; : > "$O/.batch"
@@ -9747,29 +9659,37 @@ PY
       # cell whose skew was invisible except to `--check-refresh`, which nobody runs per cycle. The arm
       # below asks the only question the contract is about: is the copy being executed the SEEDED one?
       resolve_refresh_sh; _rrc=$?
-      _seeded_refresh="$O/refresh-candidates.sh"
+      # ⛔ THE SEED IS A CODE HOME, NOT A STATE-DIR PATH (#2095; fresh-context review of #3846, P2).
+      # `$O` stays FIRST (an operator-seeded state dir keeps exact priority, #2278), and `$O_WORK` — the
+      # tree the controller runs the harness from — is the fallback. Resolving it from `$O` alone made
+      # EVERY cycle log a permanent SEED-SKEW on a split box, for a copy that is in fact exactly the
+      # seeded one there, which turns the same instrument the beat uses for a genuine skew into noise.
+      _seeded_refresh="$(refresh_seed_home)"
+      # ⛔ AND THE REMEDY NAMES THE SEED'S OWN HOME. `re-seed $O` on a split box installs a harness INTO
+      # the state dir — undoing the split this PR exists to create.
+      _seed_dir="$(dirname "$_seeded_refresh" 2>/dev/null)"; [ -n "$_seed_dir" ] || _seed_dir="$O"
       if [ "$_rrc" = "2" ]; then
-        echo "[refresh] SEED-SKEW: no refresh-candidates.sh on this box can record a pass outcome (passed over: ${REFRESH_SH_SKEW:-none}; tried: ${REFRESH_TRIED:-none}) — running $REFRESH_SH anyway so the pool still fills, but the BEAT will report SEED-SKEW, not a dead pass. Fix: re-seed \$O with the VERIFYING seeder (bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o \$O)" >> "$LOG"
+        echo "[refresh] SEED-SKEW: no refresh-candidates.sh on this box can record a pass outcome (passed over: ${REFRESH_SH_SKEW:-none}; tried: ${REFRESH_TRIED:-none}) — running $REFRESH_SH anyway so the pool still fills, but the BEAT will report SEED-SKEW, not a dead pass. Fix: re-seed ${_seed_dir} with the VERIFYING seeder (bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o ${_seed_dir})" >> "$LOG"
       elif [ "$_rrc" = "1" ]; then
-        echo "[refresh] SEED-SKEW: no refresh-candidates.sh found at all (tried: ${REFRESH_TRIED:-none}) — NOT spawning a pass that cannot run. Fix: re-seed \$O with the VERIFYING seeder (bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o \$O)" >> "$LOG"
+        echo "[refresh] SEED-SKEW: no refresh-candidates.sh found at all (tried: ${REFRESH_TRIED:-none}) — NOT spawning a pass that cannot run. Fix: re-seed ${_seed_dir} with the VERIFYING seeder (bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o ${_seed_dir})" >> "$LOG"
         rm -rf "$O/.refresh.lock"
       elif [ -n "$REFRESH_SH" ] && [ "$REFRESH_SH" != "$_seeded_refresh" ]; then
         # ⛔ A COPY OTHER THAN THE SEEDED ONE IS DISCLOSED, NOT SILENT (review P2). Two shapes reach this
         # arm and they are named apart, because their remedies read differently: a seed that EXISTS but
-        # cannot record (the MEASURED cell — a stale `$O` seed, a recording copy beside the loop), and a
-        # seed that is ABSENT entirely. On the pre-fix key, both logged only `spawning`. No lock removal
-        # here — a pass IS being spawned; only the CHOICE OF COPY is being announced.
+        # cannot record (the MEASURED cell — a stale seed, a recording copy beside the loop), and a seed
+        # that is ABSENT entirely. On the pre-fix key, both logged only `spawning`. No lock removal here
+        # — a pass IS being spawned; only the CHOICE OF COPY is being announced.
         if [ -n "$REFRESH_SH_SKEW" ]; then
-          echo "[refresh] SEED-SKEW: the seeded ${REFRESH_SH_SKEW} cannot record a pass outcome — running the recorder beside the loop (${REFRESH_SH:-none}) instead; the BEAT reads no cause from the seed's silence, it was never the writer. Fix: re-seed \$O with the VERIFYING seeder (bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o \$O)" >> "$LOG"
+          echo "[refresh] SEED-SKEW: the seeded ${REFRESH_SH_SKEW} cannot record a pass outcome — running the recorder beside the loop (${REFRESH_SH:-none}) instead; the BEAT reads no cause from the seed's silence, it was never the writer. Fix: re-seed ${_seed_dir} with the VERIFYING seeder (bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o ${_seed_dir})" >> "$LOG"
         else
-          echo "[refresh] SEED-SKEW: the seeded path ${_seeded_refresh} is MISSING (never seeded, or deleted) — running the copy beside the loop (${REFRESH_SH:-none}) instead, which the operator did not seed here; only the beside-the-loop copy's record is evidence, never the absent seed's. Fix: re-seed \$O with the VERIFYING seeder (bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o \$O)" >> "$LOG"
+          echo "[refresh] SEED-SKEW: the seeded path ${_seeded_refresh} is MISSING (never seeded, or deleted) — running the copy beside the loop (${REFRESH_SH:-none}) instead, which the operator did not seed here; only the beside-the-loop copy's record is evidence, never the absent seed's. Fix: re-seed ${_seed_dir} with the VERIFYING seeder (bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o ${_seed_dir})" >> "$LOG"
         fi
       elif [ -z "$REFRESH_SH" ]; then
         # ⛔ EVERY ARM RELEASES THE LOCK AND SPEAKS (review P2). An answer this branch does not recognise
         # (a future resolver code, a helper that is `command not found` in an extracted rig) used to fall
         # past `if [ -n "$REFRESH_SH" ]` with no `else`: the log had already said `spawning`, nothing ran,
         # and `.refresh.lock` stayed on disk — a silent no-op wearing a spawn line.
-        echo "[refresh] SEED-SKEW: the refresh resolver returned an UNRECOGNISED answer (rc=$_rrc, script='${REFRESH_SH:-none}') — NOT spawning a pass whose writer cannot be identified; tried: ${REFRESH_TRIED:-none}. Fix: re-seed \$O with the VERIFYING seeder (bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o \$O)" >> "$LOG"
+        echo "[refresh] SEED-SKEW: the refresh resolver returned an UNRECOGNISED answer (rc=$_rrc, script='${REFRESH_SH:-none}') — NOT spawning a pass whose writer cannot be identified; tried: ${REFRESH_TRIED:-none}. Fix: re-seed ${_seed_dir} with the VERIFYING seeder (bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o ${_seed_dir})" >> "$LOG"
         rm -rf "$O/.refresh.lock"
       fi
       # ⛔ A TRANSIENT PASS IS NOW RETRIED ON A SHORT BOUNDED BACKOFF, NOT ONLY AT THE NEXT CYCLE

@@ -1081,6 +1081,22 @@ wt_launcher_env() {
     printf '; unset GH_CONFIG_DIR XDG_CONFIG_HOME'
   fi
   [ -n "${O:-}" ] && printf '; export O=%s' "$(wt_q "$O")"
+  # ⛔ AND THE WORK ROOT, WHICH IS A SEPARATE NAME ON A STATE-DIR INSTANCE (#2095; fresh-context
+  # review of #3846, P1). `O` is the controller's STATE dir and `O_WORK` is the harness root, so with
+  # only `O` handed over a tmux-launched worker resolves `_FIX_MOD_DIR`/`_M1_MOD` to the STATE dir:
+  # `fix-one.sh` then skips its whole cross-box claim block with no line at all (`-f "$dir/claims.sh"`
+  # has no `else`) and 127s its re-review; `merge-one.sh` skips BOTH the landing claim and the head
+  # claim the same silent way. That is the duplicate-merge exclusion, lost and unlogged.
+  # ⛔ BOTH DIRECTIONS, exactly like the `GH_CONFIG_DIR` block above and for the same measured reason:
+  # a pane inherits the tmux SERVER's environment, so an OLD controller's leftover `O_WORK` would
+  # point this worker at a different tree — the inverse of the bug. A caller that never set it gets
+  # the pre-#2095 behaviour (`$O`), which is what §7's "unchanged for a caller that never set O_WORK"
+  # arm asserts.
+  if [ -n "${O_WORK:-}" ]; then
+    printf '; export O_WORK=%s' "$(wt_q "$O_WORK")"
+  else
+    printf '; unset O_WORK'
+  fi
   # ⛔ A BLANK VALUE IS NOT A CREDENTIAL, AND THE CLEAR MUST SEE WHAT THE SOURCE WROTE (P1 review
   # finding, 2026-10-23, MEASURED): the pre-source clear could not, so a `keys.env` re-introducing
   # `GH_TOKEN='   '` survived on every arm whose post-source check did not fire. Both names, because gh
@@ -1801,8 +1817,8 @@ wt_count() {
 }
 
 # ── spawn ────────────────────────────────────────────────────────────────────────────────────
-# The env snapshot: everything the controller exports, plus O (which the controller sets but does
-# NOT export — a worker falling back to $HOME/orchestrator is how a box silently runs a different
+# The env snapshot: everything the controller exports, plus O and O_WORK re-asserted explicitly — a
+# worker falling back to $HOME/orchestrator is how a box silently runs a different
 # harness). Mode 0600 and removed with the worker: it carries the same secrets as the cell's keys.env.
 #
 # ⛔ THE uv PIN IS EMITTED AFTER `export -p`, AND THAT POSITION IS THE WHOLE POINT (agent-infra#2159).
