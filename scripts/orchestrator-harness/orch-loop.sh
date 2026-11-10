@@ -2445,16 +2445,70 @@ _orch_argv_is_loop() { # shellcheck disable=SC2086
 # ⛔ `-c` IS NOT THIS CASE, AND THAT IS A RECORDED DECISION, NOT AN OVERSIGHT: #1856 established that
 # `bash -c "sleep 300; /abs/orch-loop.sh"` is a WRAPPER's argv rather than a controller (accepting it was
 # the loose any-token arm that failed open), and `orch-loop-lock.test.sh` arm 4c asserts such a pid is
-# RECLAIMED. So the `-c`/`--command` forms return 1 here and keep that behaviour, and only the option
-# forms no decision reaches (`-x`, `-e`, `--posix`, …) are deferred to a human as ambiguous.
+# RECLAIMED. That decision is a fact about the ARGV, not about one POSITION: a `-c`-family option seen
+# BEFORE the loop-shaped token means the shell was handed a COMMAND STRING, so an option in front of it
+# changes nothing (`bash -x -c "…; /abs/orch-loop.sh"` reclaims exactly as `bash -c …` does). Only the
+# option forms that leave the script as an ARGUMENT (`-x`, `-e`, `--posix`, `+o errexit`, …) are
+# deferred to a human as ambiguous.
+# ⛔ BOTH POLARITIES COUNT AS AN OPTION. `bash` accepts the `+` form of every `set`-style option, and this
+# repo's OWN classifier decision says such an argv IS an invocation: `check-deployed-drift.test.sh`
+# §10a-3e (the `for _v in 'bash -o pipefail' … 'bash +o errexit' …` fixture) asserts that every one of
+# those forms over `<abs>/orch-loop.sh` is an INVOCATION. A `-`-only option test minted that form into
+# rc 1 = RECLAIM over a LIVE owner — which `main` does too, MEASURED (its own predicate is the `-`-only
+# form), so this CLOSES a fail-open band that both `main` and the pre-#1985 loop had in different shapes:
+# the pre-#1985 loop refused any live pid, and #1985's shape rule reclaimed on a `+`-form option
+# (fresh review of #3865 at 8c3346680, P3 — an earlier wording here called it a regression versus `main`,
+# which is measurably wrong).
+# ⚠️ ONE NAMED OVER-REFUSAL, stated rather than discovered later: the token scan is ANY-token (so that
+# no plausible option form can miss the script), which means a non-controller whose argv merely NAMES the
+# script behind an option — `bash -x grep /abs/orch-loop.sh` — is refused as ambiguous instead of
+# reclaimed. `bash -- /abs/orch-loop.sh` is the same class and belongs in this list rather than in a
+# reviewer's notes (fresh review of #3865 at a2da4598b, note — MEASURED `flagged=1` / rc 0, this file's
+# own reading of `flagged`, where rc 0 IS the refusal): `--` ends option
+# parsing and the script really runs, but it is not a `-c`-family token, so it is deferred to a human.
+# That is the SAFE direction: a refusal costs a human one `rm -f`, while a wrong reclaim puts
+# two controllers on one queue (#1715). Do not narrow the scan to the "first non-option token" to fix
+# it: every option-taking form (`-o errexit`, `--rcfile FILE`, `+O shopt`) then makes that token an
+# argument rather than the script, and the missed script becomes a reclaim over a live owner.
+# ⚠️ AND ONE NAMED RESIDUAL IN THE OTHER DIRECTION (fresh review of #3865, P3 — MEASURED): a `-c`-family
+# token that is an OPTION'S VALUE is read as a command string. `bash --rcfile -c <abs>/orch-loop.sh` really
+# RUNS the script (its `ps` column is `bash --rcfile -c /abs/orch-loop.sh`), and it answers rc 1 = RECLAIM
+# over a running controller — the #1715 direction. ⛔ IT NEEDS ONLY THE LITERAL TOKEN `-c` IN ARGV, NOT A
+# FILE NAMED `-c` (fresh review of #3865 at 0fdd46dbc, P3 — this line claimed otherwise and was FALSE,
+# MEASURED: in a directory holding no `-c`, `cd /tmp/rcprobe && bash --rcfile -c ./s.sh` printed the
+# script's output and exited 0, because bash ignores `--rcfile` for a NON-INTERACTIVE shell — it consumes
+# `-c` as the option's operand and never looks for a file). So the precondition is a stranger argv than a
+# missing file, but it is NOT the filesystem exotica this comment used to claim, and the risk was
+# understated rather than overstated. Still not narrowed here: skipping a value-taking option's operand
+# would re-open the ambiguity this rule exists for. Named here rather than left to be rediscovered; the
+# fix, if it ever bites, is to skip the operand of the known value-taking long options (`--rcfile`,
+# `--init-file`) only.
 _orch_argv_is_loop_flagged() { # shellcheck disable=SC2086
   local _t
   set -- $*
   [ "$#" -ge 3 ] || return 1
   case "${1##*/}" in bash|sh|dash|zsh) ;; *) return 1 ;; esac
-  case "$2" in -c|--command|-[!-]*c*) return 1 ;; esac    # #1856: a `-c` wrapper is not a controller
-  case "$2" in -*) ;; *) return 1 ;; esac                 # token 2 must be a shell OPTION
-  for _t in "$@"; do
+  case "$2" in -*) ;; +*) ;; *) return 1 ;; esac          # token 2 must be a shell OPTION, either polarity
+  for _t in "$@"; do                                # ORDERED: a `-c` before the script is #1856's wrapper
+    # ⛔ `+c` IS THE SAME TOKEN IN THE OTHER POLARITY (fresh review of #3865, MEASURED: `bash +c 'echo X'`
+    # and `bash +cx 'echo X'` both EXECUTE the string).
+    # ⛔ AND `-c` IS A LETTER IN A SHORT-OPTION CLUSTER, NOT A WHOLE TOKEN: `-cx`, `-ce` and `+cx` are
+    # the same family and a whole-token match (`-[!-]*c*`) missed `-cx`/`-ce` entirely, so those spellings
+    # were refused as ambiguous while executing the string (fresh review of #3865 at 8c3346680, P3 — before
+    # `+*c*` joined the family at d74aea019a, `+cx` was the one cluster the `-`-only test got WRONG in the
+    # over-refusal direction; it answers RECLAIM since, and §17c drives it). LONG options are NOT the
+    # family (`--rcfile FILE` leaves the script as an argument, so
+    # `--*` falls through to the ambiguous answer), and a short cluster only means `-c` when it carries a
+    # literal `c` — `-o pipefail`, `-x`, `+o errexit` do not.
+    # ⛔ `--command` IS DEFENSIVE, NOT A CLAIM THAT A SHELL TAKES IT (fresh review of #3865, P3 —
+    # MEASURED: bash 5.2 and dash both REJECT it, `bash: --command: invalid option`, so the branch is
+    # unreachable today and no arm drives it). It is kept — and labelled — so that a future shell's long
+    # spelling is not silently treated as ambiguous, which is the fail-closed direction.
+    case "$_t" in
+      --command) return 1 ;;
+      --*) ;;                                                             # any other long option: not the family
+      -c|-*c*|+c|+*c*) return 1 ;;                                        # short cluster carrying `c`
+    esac
     case "${_t##*/}" in orch-loop.sh) return 0 ;; esac
   done
   return 1
