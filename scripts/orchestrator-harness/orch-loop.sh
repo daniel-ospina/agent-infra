@@ -8889,6 +8889,19 @@ PY
   # state only, bounded and logged here with the counts the decision was taken from.
   # ⛔ ONE ESCAPE PER N INERT PASSES, NOT ONE PER PASS: `pl_escape_record` resets the streak on a
   # successful write, so the loop cannot spin, and it reports when the record could NOT be written.
+  # ⛔ THE ESCAPE'S TOKEN IS RESET HERE, ON EVERY PASS, BEFORE THE ARM THAT MAY SET IT (review P1,
+  # 2nd cycle). `CASCADE_ESCAPE_SLOTS` is assigned by the arm below, which runs ONLY when
+  # `LO_CHOICE=pr` AND `pl_escape_open` answers YES — a minority of passes. The cycle body is ONE
+  # shell for the whole process (`while true; do` above, its `done` below), so a variable assigned
+  # inside that arm PERSISTS into the next iteration: cycle N fires and publishes 2; cycle N+1 skips
+  # the arm and re-published that stale `escape=2` as though the valve had spent two slots again, on
+  # a pass where it did not fire at all. `escape=` is documented as a MEASUREMENT of this pass, and
+  # the whole point of the field is that the record distinguishes exactly these states — so the token
+  # must be zeroed where the block runs unconditionally, and the arm below is its only override.
+  # Resetting HERE (not in the cascade block) also keeps the reset INSIDE the block test-cascade.sh
+  # extracts and drives, so the two-pass arm below grades the shipped assignment rather than a
+  # fixture that supplies what production does not (§6).
+  CASCADE_ESCAPE_SLOTS=0
   _eb=${DRAIN_ESCAPE_PASSES:-3}
   if [ "${PL_MOD:-0}" = "1" ]; then _eb="$(pl_escape_bound "${DRAIN_ESCAPE_PASSES:-}" 2>/dev/null)" || _eb=3; fi
   if [ "${LO_CHOICE:-none}" != "pr" ]; then
@@ -8988,8 +9001,9 @@ PY
     # ⛔ THE ESCAPE PUBLISHES ITS OWN GRANT, SEPARATELY FROM THE RUNG'S (agent-infra#3909 review P1).
     # It RE-ASSIGNS `CASCADE_ISSUE_SLOTS` above, so a record that reads that global at emit time carries
     # the escape's number under the rung's name — guaranteed, because the escape can only fire on a
-    # level-HOLDS pass. Set unconditionally (0 = the escape granted nothing), so the record's `escape=`
-    # is a measurement on every path the block runs, not an absence that has to be read as a zero.
+    # level-HOLDS pass. This assignment is the OVERRIDE, not the measurement: the token is zeroed at
+    # the TOP of this block on every pass (see the reset there), so `escape=0` means "the valve did not
+    # fire" and cannot be confused with "the previous cycle's grant, still lying in the variable".
     CASCADE_ESCAPE_SLOTS="${_egrant:-0}"
     # DOES THIS PASS ACTUALLY HAVE A SLOT TO SPEND? UNSET is the driver-rig/older-caller contract (the
     # escape keeps its pre-change behaviour); an explicit 0, or a grant that produced 0 because the
