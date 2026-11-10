@@ -49,11 +49,14 @@
 #                            the loop's own freshness gate for the same artefact)
 #
 # macOS / LINUX
-#   The cmux gate exists only where the cmux desktop app does. On a Linux cell there is no
-#   `cmuxOnly` socket and no launchd, so the same loop is legitimate there and is delivered by
-#   scripts/fleet-schedule.py (#1864), not by install-launchd.sh. That divergence is DOCUMENTED,
-#   one line, in docs/ops/heartbeat-launch-path.md — the default is parity, and any difference is
-#   named rather than discovered.
+#   The cmux gate exists only where the cmux desktop app does: on a Linux cell there is no
+#   `cmuxOnly` socket and no launchd, so the same loop is LEGITIMATE there. ⛔ It is not DELIVERED
+#   there, though, and this header used to say it was: `scripts/fleet-schedule.py` (#1864) schedules
+#   the same `templates/launchd/*.plist` declarations, and no template may name this loop
+#   (`LAUNCHD-INCOMPATIBLE`), so nothing on a cell starts it — it is hand-started on both platforms,
+#   and delivering it on a cell is #1864's remaining half. Stated here because the sentence an
+#   operator reads in `--help` is the one they act on; the full table is in
+#   docs/ops/heartbeat-launch-path.md.
 #
 # EXIT CODES: 0 ok (or an explicit --help) · 1 refused/drift · 2 usage ERROR or cannot-answer
 set -uo pipefail
@@ -522,6 +525,20 @@ if not rows:
     # set `any(...)` is vacuously False — the same trap lane-status.py's own publisher documents.
     print("DRIFT\tempty fleet snapshot (%ds old) — zero rows is a failed read, not a quiet fleet" % age)
     raise SystemExit(1)
+# ⛔ AND A ROW WITHOUT THE FLAG IS NOT A CLEAN ROW (#1867 review, round 9). The degraded COUNT only
+# looked at dicts that CARRY `degraded`, and the row count took everything else, so a snapshot this
+# reader does not understand read as a healthy fleet: MEASURED pre-fix, `[{"lane":"a","verdict":
+# "WEDGED"}, …]` (no `degraded` key at all) → `OK … (2 rows, 0 degraded)` rc 0, and `[1,2,"x"]` →
+# `OK … (3 rows, 0 degraded)` rc 0 — not rows at all. That is the same vacuity as the empty-list arm
+# one level deeper: a producer that stops writing the flag (or any corruption that stays valid JSON)
+# turns this probe green. Both real producers put the flag on EVERY row — `lane-status.py`'s row
+# builder says so verbatim ("THE TWO READ-QUALITY FLAGS, ON EVERY ROW") and `lane-scan-fallback.sh`
+# publishes that same `--json` output — so requiring it costs nothing and refuses everything else.
+if not all(isinstance(r, dict) and "degraded" in r for r in rows):
+    print("UNKNOWN\tfleet snapshot rows do not carry the read-quality flag (`degraded`): "
+          "%d of %d rows do not" % (sum(1 for r in rows if not (isinstance(r, dict) and "degraded" in r)),
+                                     len(rows)))
+    raise SystemExit(2)
 if age > max_age:
     print("DRIFT\tfleet read is STALE: %ds old, bound %ds" % (age, max_age))
     raise SystemExit(1)

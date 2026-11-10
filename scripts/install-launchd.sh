@@ -55,14 +55,20 @@
 # until an install removes it — `retire_pass` runs on INSTALL, never on `--status`, so
 # exempting the class from BOTH the row and the exit code certified a box that was
 # still ticking the blind job this change exists to remove.
-# Exit codes for `--status`: 0 clean · 1 UNMANAGED or RETIRED-but-still-installed ·
-# 2 the installed set could NOT be enumerated (UNKNOWN, never a pass — #1867 review P2).
-# `2` is ALSO the global usage code; see the second Exit-codes line below the env list,
-# which spells both.
+# Exit codes for `--status`: 0 clean · 1 something on the box is not what this repo declares —
+# a per-job verdict on an INSTALLABLE template (NOT INSTALLED, `not loaded`, or `DRIFTED`), an
+# installed job with no template (UNMANAGED), or a RETIRED label still installed — · 2 a question
+# could NOT be answered (the installed set, or the declared set, could not be read: UNKNOWN, never a
+# pass — #1867 review P2). A template the installer would SKIP for an unset placeholder prints
+# `NOT APPLICABLE` and is NOT a failure: a Mac with no tortoise checkout is a legitimate box, not a
+# broken one. `2` is ALSO the global usage code; see the second Exit-codes line below the env list.
 #
 # Usage:
 #   install-launchd.sh               install/refresh all templates (idempotent)
-#   install-launchd.sh --status      per-job: installed? loaded? version? drift?
+#   install-launchd.sh --status      per-job: installed? loaded? version? drift?  (non-zero if an
+#                                    INSTALLABLE job is absent, unloaded or drifted, or a job is
+#                                    undeclared or retired-installed; NOT APPLICABLE is a skip, not a
+#                                    failure)
 #   install-launchd.sh --uninstall   bootout + remove installed plists
 #   install-launchd.sh --arm-worktree-hygiene [--reason TEXT]
 #                                    ARM the worktree-hygiene sweep on THIS box
@@ -94,8 +100,10 @@
 #
 # Exit codes: 0 = ok (or clean skip), 1 = failure (loud), 2 = usage error.
 # ⛔ AND `--status` REUSES 2 FOR A THIRD MEANING, so it is spelled here as well as in the
-# UNMANAGED paragraph above (#1867 review P3): for THAT verb the three codes are 0 clean ·
-# 1 UNMANAGED found · 2 the installed set could NOT be enumerated (UNKNOWN, never a pass).
+# UNMANAGED paragraph above (#1867 review P3): for THAT verb the three codes are 0 clean · 1 something
+# on the box is not what this repo declares (a per-job verdict, UNMANAGED, or RETIRED-INSTALLED) ·
+# 2 a question could not be answered (the installed set or the declared set could not be read —
+# UNKNOWN, never a pass).
 # The two readings of `2` cannot be confused in practice — `usage()` exits before any work
 # starts and never prints a status body, while the UNKNOWN arm prints and exits 2 from a
 # completed run — but a caller reading only this line would be told the wrong thing, and the
@@ -1612,15 +1620,44 @@ install_job() {
 }
 
 status_job() {
-    local template="$1" label installed rendered version state drift
+    local template="$1" label installed rendered version state drift ph unset_ph
     label="$(job_label "$template")"
     installed="$AGENTS_DIR/$label.plist"
     rendered="$(render "$template")"
     version="$(version_of "$template" || echo "?")"
 
+    # ⛔ A TEMPLATE THE INSTALLER WOULD SKIP IS `NOT APPLICABLE`, NOT A FAILURE (#1867 review, round 9).
+    # `install_job` deliberately SKIPs a template whose placeholder resolves empty ("is this a swarm
+    # host?") and a {{PATH}} that renders empty. Those boxes are LEGITIMATE — a Mac with no tortoise
+    # checkout is the common case — and calling them failures would make this verb permanently red on
+    # a healthy box, which is the anti-pattern that produced the OWNED-BY-OTHER-INSTALLERS exemption in
+    # the first place. The two guards below are the install path's own, mirrored verbatim; one list,
+    # one meaning, so a template cannot be skipped at install time and demanded by `--status`.
+    unset_ph=""
+    for ph in "${PLIST_PLACEHOLDERS[@]}"; do
+        if grep -q "{{$ph}}" "$template" && [ -z "${!ph:-}" ]; then
+            unset_ph="$unset_ph {{$ph}}"
+        fi
+    done
+    if [ -z "$unset_ph" ] && grep -q '{{PATH}}' "$template" && [ -z "$(launchd_path)" ]; then
+        unset_ph=" {{PATH}}"
+    fi
     if [ ! -f "$installed" ]; then
+        if [ -n "$unset_ph" ]; then
+            echo "  $label: NOT APPLICABLE (needs$unset_ph, unset on this box — the installer SKIPs it)"
+            return 0
+        fi
+        # ⛔ AND AN INSTALLABLE TEMPLATE THAT IS NOT THERE IS A FAILURE ROW WITH A FAILURE CODE
+        # (#1867 review, round 9). This function used to print the three failure verdicts and return
+        # 0 for all of them, so `--status` exited 0 on a box whose declared jobs were absent, unloaded
+        # or drifted — while its own header promised "for `--status`: 0 clean". MEASURED pre-fix with a
+        # fake `launchctl`: an absent, installable declared job printed `NOT INSTALLED (template
+        # v0.1.0)` and rc was 0; a drifted one printed `(DRIFTED (template changed — re-run
+        # installer))` and rc was 0. `fleet-schedule.py --verify` was safe only because it ALSO scans
+        # the text for markers, i.e. the verb had two answers to "is this box clean?" and the one a
+        # shell caller reads was the wrong one.
         echo "  $label: NOT INSTALLED (template v$version)"
-        return 0
+        return 1
     fi
     if job_loaded "$label"; then
         state="loaded"
@@ -1633,6 +1670,10 @@ status_job() {
         drift="DRIFTED (template changed — re-run installer)"
     fi
     echo "  $label: installed=$state version=v$version ($drift)"
+    case "$state/$drift" in
+        "loaded/in sync") return 0 ;;
+    esac
+    return 1
 }
 
 # ── THE DECLARED SET — every template this directory describes, at ANY depth (#1867 review P1) ────
@@ -1702,6 +1743,18 @@ unmanaged_plists() {
     # are"). Refuse instead: 2 = UNKNOWN, never a pass.
     if [ ! -d "$AGENTS_DIR" ] || [ ! -r "$AGENTS_DIR" ] || [ ! -x "$AGENTS_DIR" ]; then
         return 2
+    fi
+    # ⛔ AND THE DECLARED SET NEEDS THE SAME GUARD (#1867 review, round 9). `is_declared` asks "is this
+    # label in the declared set?", and with an EMPTY declared set the answer for EVERY label is no — so
+    # an unreadable or empty TEMPLATES_DIR turns this function's own output into the delete advice
+    # above, aimed at the repo's armed jobs. MEASURED with a fixture where `com.eldato.ai-drainer` was
+    # installed AND its template was present: declared set intact → `installed=loaded … (DRIFTED)` and
+    # no bootout; TEMPLATES_DIR empty → `⛔ UNMANAGED …` plus `launchctl bootout … && rm -f …`;
+    # TEMPLATES_DIR chmod 000 → the identical row and the identical delete command. `cmux_gate_required`
+    # already refuses an EMPTY gate on the install path ("an EMPTY gate is the same no-op as a missing
+    # one"); this is that rule on the status path. rc 3 = "the declared set could not answer".
+    if [ -z "$(declared_labels 2>/dev/null)" ]; then
+        return 3
     fi
     for installed in "$AGENTS_DIR"/com.eldato.*.plist "$AGENTS_DIR"/com.tortoise.*.plist; do
         [ -f "$installed" ] || continue
@@ -2005,6 +2058,12 @@ resolve_env
 
 if [ "${1:-}" = "--status" ]; then
     echo "=== agent-infra launchd status (templates: $TEMPLATES_DIR) ==="
+    # ⛔ THE PER-JOB ROWS CARRY THE EXIT CODE (round 9). `status_rc` used to start at 0 AFTER the loop
+    # and was raised only by the three set-level arms, so a declared job that was absent, unloaded or
+    # drifted printed a failure row and still exited 0 — the "caveat with exit 0 is read as green"
+    # class this file fixes for UNMANAGED and RETIRED-INSTALLED, left unfixed for the three verdicts
+    # that fire on a normal day. A 2 (UNKNOWN) is never downgraded to 1: the higher answer wins.
+    status_rc=0
     for template in "$TEMPLATES_DIR"/*.plist; do
         [ -f "$template" ] || continue
         # ⛔ A RETIRED LABEL IS A NAMED STATE, NEVER AN ABSENCE (#2908 review, P1). A retired job is
@@ -2018,6 +2077,9 @@ if [ "${1:-}" = "--status" ]; then
         # The installed-copy arm stays a FAILURE on purpose: the manifest says retired, so a copy
         # still on disk is DRIFT from the declaration — a false PASS here would be worse than the
         # false FAIL being closed, and `--install` is what clears it (retire_pass unloads + removes).
+        # ⛔ AND IT NOW CARRIES THE EXIT CODE (#1867 rounds 8/9): the set-level `RETIRED-INSTALLED`
+        # pass below names every retired label still on disk — template or not — and raises status_rc,
+        # so this row and that one agree rather than one of them printing a caveat behind an rc=0.
         label="$(job_label "$template")"
         if is_retired "$label"; then
             if [ -f "$AGENTS_DIR/$label.plist" ]; then
@@ -2027,14 +2089,16 @@ if [ "${1:-}" = "--status" ]; then
             fi
             continue
         fi
-        status_job "$template"
+        if ! status_job "$template"; then
+            [ "$status_rc" -eq 0 ] && status_rc=1
+        fi
     done
     # ⛔ AN INSTALLED JOB WITH NO TEMPLATE IS NOT "NOTHING TO REPORT" (#1867). It is a job on the
     # box the declared set does not describe, so neither this pass nor the content comparison can
     # say anything about it — the blind heartbeat sat in exactly that hole. Named loudly, and the
     # EXIT CODE carries it: a status command that prints a caveat and exits 0 is read by every
     # caller as "green".
-    status_rc=0
+    status_rc=${status_rc:-0}
     unmanaged=""
     unr_rc=0
     unmanaged="$(unmanaged_plists)" || unr_rc=$?
@@ -2043,9 +2107,22 @@ if [ "${1:-}" = "--status" ]; then
         # a pass). A hard failure of `unmanaged_plists` used to be erased by `|| true` into the same
         # empty string a clean box produces, so an enumeration that failed read as GREEN.
         echo "" >&2
-        echo "  ⛔ UNKNOWN — $AGENTS_DIR exists but could NOT be enumerated (rc $unr_rc)." >&2
-        echo "     The installed-job set was NOT inspected: this is an unanswered question, not a" >&2
-        echo "     clean box. Re-run with a readable $AGENTS_DIR before trusting any green." >&2
+        if [ "$unr_rc" -eq 3 ]; then
+            # ⛔ AND "CANNOT READ THE DECLARED SET" GETS ITS OWN SENTENCE (round 9), because its
+            # consequence is worse than a missed alarm: with an empty declared set EVERY installed job
+            # reads UNMANAGED, and the remedy those rows carry is `launchctl bootout … && rm -f …`
+            # aimed at this repo's own armed jobs. MEASURED pre-fix with `TEMPLATES_DIR` empty (and
+            # again with it chmod 000): `com.eldato.ai-drainer` was reported UNMANAGED with the delete
+            # command, on a box where its template was present and merely unreadable.
+            echo "  ⛔ UNKNOWN — the DECLARED SET under $TEMPLATES_DIR could NOT be read, so every" >&2
+            echo "     installed job would be classified against an EMPTY set. Nothing was classified:" >&2
+            echo "     this is an unanswered question, not a box full of strays. Re-run with a readable" >&2
+            echo "     $TEMPLATES_DIR before trusting any green — or any deletion it advises." >&2
+        else
+            echo "  ⛔ UNKNOWN — $AGENTS_DIR exists but could NOT be enumerated (rc $unr_rc)." >&2
+            echo "     The installed-job set was NOT inspected: this is an unanswered question, not a" >&2
+            echo "     clean box. Re-run with a readable $AGENTS_DIR before trusting any green." >&2
+        fi
         status_rc=2
     fi
     if [ -n "$unmanaged" ]; then

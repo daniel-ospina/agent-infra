@@ -163,9 +163,11 @@ old wording opened each line with the command, and for `com.eldato.lane-arm` and
 `fleet-schedule.py`'s verdict read `1 launchd job(s)` however many jobs there were.
 
 `fleet-schedule.py --verify` counts the verdict **markers** (`NOT INSTALLED`, `DRIFTED`, `not loaded`,
-`⛔ UNMANAGED`, `⛔ UNKNOWN`), not bare words — the bare-word scan matched the section intro too, so
-three undeclared jobs and one both read as `1`. A run that fails only on the new two prints
-`SCHEDULE NOT VERIFIED — N launchd job(s) …` with a truthful N instead of `0`.
+`⛔ UNMANAGED`, `⛔ RETIRED-INSTALLED`, `⛔ UNKNOWN`), not bare words — the bare-word scan matched the
+section intro too, so three undeclared jobs and one both read as `1`. A run that fails only on one of
+the classes that arrived with this change (`UNMANAGED`, `RETIRED-INSTALLED`, `UNKNOWN`) prints
+`SCHEDULE NOT VERIFIED — N launchd job(s) …` with a truthful N instead of `0`, and the delegate's own
+exit code now agrees with those rows (`--status` is non-zero whenever any job row is a failure).
 
 ## ⛔ What is NOT the fix
 
@@ -176,18 +178,30 @@ bug fix.
 
 ## macOS / Linux — the divergence, stated once
 
-The default is **parity**. The differences below are the whole list; each one is here because the
-platform genuinely lacks the mechanism, not because it was easier.
+⛔ **THE LOOP IS HAND-STARTED ON BOTH PLATFORMS, AND IT IS NOT DELIVERED ON A CELL AT ALL.** The
+table below says what each platform *has*; read it with that sentence, because the earlier version of
+it claimed parity and was wrong in the direction that matters — an operator checking a fresh cell
+against it would conclude the heartbeat was running there.
+
+- On **macOS** the launch path is `scripts/heartbeat-launch.sh start` from a cmux-attributed shell, and
+  **nothing schedules it**: a launchd job cannot pass the `cmuxOnly` gate, which is why
+  `templates/launchd/LAUNCHD-INCOMPATIBLE` refuses to install any template that would name the loop.
+- On a **cell** nothing starts it either. `scripts/fleet-schedule.py` (#1864) runs the same declared
+  set from a supervised in-session loop, but that set is `templates/launchd/*.plist` — and no
+  template may name the loop — so the heartbeat is not in it. Delivering the loop on a cell is
+  **#1864's remaining half**, not something this document can assert.
+- `check` is identical on both, which is exactly how you find out: on a cell with no loop it answers
+  **DRIFT** (`not running`), never a comfortable silence.
 
 | | macOS | Linux (cloud cell) |
 |---|---|---|
-| Launcher | `heartbeat-launch.sh start`, once, from a cmux-attributed shell | same script, run under the cell's `tmux` lifetime |
-| Scheduled layer | `install-launchd.sh` (launchd) | `scripts/fleet-schedule.py` (#1864) — the **same** plist declarations |
-| cmux socket gate | **present** (`cmuxOnly`) → a launchd job is blind, hence `LAUNCHD-INCOMPATIBLE` | **absent** (no cmux desktop app) → the same loop is legitimate here |
+| Launcher | `heartbeat-launch.sh start`, once, from a cmux-attributed shell | the same script; **nothing starts it** — no scheduler in this repo delivers the loop (see above, #1864) |
+| Scheduled layer | `install-launchd.sh` (launchd), and deliberately **not** the loop | `scripts/fleet-schedule.py` (#1864) — the **same** plist declarations, which by construction cannot include the loop |
+| cmux socket gate | **present** (`cmuxOnly`) → a launchd job is blind, hence `LAUNCHD-INCOMPATIBLE` | **absent** (no cmux desktop app) → a hand-started loop is legitimate here |
 | `check` | identical | identical |
 
-The cmux gate is the **only** behavioural difference, and it is on the launch path rather than on
-the code: the loop is the same file, with the same contract, on both.
+The loop's **code** is the same file with the same contract on both platforms; the difference is
+where it can be started from, and whether anything schedules it (nothing does).
 
 **Reboot does not restart the loop** on either platform. Re-run `heartbeat-launch.sh start` after a
 reboot; that is a property of "detached launched-once loop" and it is why `check` exists — a loop

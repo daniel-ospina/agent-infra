@@ -2415,7 +2415,7 @@ set +e
 OUT="$(run_installer "$HOME1" --status)"
 RC=$?
 set -e
-assert_eq "$RC" "0" "--status exits 0"
+assert_eq "$RC" "1" "--status exits NON-ZERO when a DECLARED job is DRIFTED (a caveat with exit 0 is green)"
 assert_contains "$OUT" "provider-latency-tripwire: installed=loaded version=v0.1.0 (DRIFTED" "status flags drifted tripwire"
 assert_contains "$OUT" "corruption-canary: installed=loaded version=v0.1.0 (in sync)" "status reports canary in sync"
 assert_contains "$OUT" "Retired in this repo (no template; the next install unloads + removes each)" "status lists retired jobs"
@@ -2890,6 +2890,34 @@ echo ""
 echo "── 18. --status reports an installed plist with no template as UNMANAGED ──"
 
 STRAY_HOME="$T/stray-home"; mkfakehome "$STRAY_HOME"
+# ⛔ THE FIXTURE IS PROVISIONED FIRST, IN THE *SAME* ENVIRONMENT `run_stray_status` USES (#1867
+# review, round 9). Round 9 made a per-job failure verdict carry the exit code, and `NOT INSTALLED` on
+# an INSTALLABLE template is one — so a bare `mkfakehome` with nothing installed read rc 1 for every
+# row in this section, poisoning fourteen `want: 0` assertions whose SUBJECT ("is this label wrongly
+# called UNMANAGED?") was fine. The honest repair is not to re-polarise those rows: it is to give the
+# fixture the state they assume, a box whose declared set IS installed. The environment is deliberately
+# IDENTICAL to `run_stray_status`'s (TORTOISE_REPO/SWARM_ROOT/PYTHON_BIN unset), so "installs there"
+# and "is applicable here" answer the same way and a template cannot be installed and then reported
+# NOT APPLICABLE — the predicates are the installer's own, in both directions.
+# ⛔ DEFINED BEFORE ITS FIRST CALL, NOT AFTER IT: bash resolves a function at CALL time, and the first
+# cut of this block sat 35 lines below its use — `run_stray_installer: command not found`, rc 127, the
+# fixture stayed bare and the same 14 rows failed for a reason that looked exactly like the bug being
+# fixed. A fixture that cannot run is not a fixture.
+run_stray_installer() {
+    ( export HOME="$STRAY_HOME"
+      export PATH="$T/bin:$PATH"
+      export FAKE_LAUNCHCTL_LOG="$LOG"
+      export TEMPLATES_DIR="$TEMPLATES"
+      export AGENTS_DIR="$STRAY_HOME/Library/LaunchAgents"
+      export ELDATO_ALLOW_TEST_HOME=1
+      unset TORTOISE_REPO SWARM_ROOT PYTHON_BIN
+      bash "$INSTALLER" 2>&1 )
+}
+set +e
+STRAY_INSTALL_OUT="$(run_stray_installer)"
+STRAY_INSTALL_RC=$?
+set -e
+assert_eq "$STRAY_INSTALL_RC" "0" "§18 fixture: the declared set installs cleanly (so 'clean' is reachable here)"
 # seed_stray_plist <label> — an installed plist on the box naming <label>. Only the FILENAME matters
 # to `unmanaged_plists` (it classifies by basename); the body is a minimal valid plist so nothing
 # downstream mistakes it for a truncated file.
@@ -2906,7 +2934,9 @@ run_stray_status() { # [agents-dir] — defaults to the fake home's LaunchAgents
     ( export HOME="$STRAY_HOME"
       export PATH="$T/bin:$PATH"
       export FAKE_LAUNCHCTL_LOG="$LOG"
-      export TEMPLATES_DIR="$TEMPLATES"
+      # `STRAY_TEMPLATES` is the seam for the DECLARED-set arms (§18d): the same fake home and the same
+      # installed set, judged against a different declaration tree.
+      export TEMPLATES_DIR="${STRAY_TEMPLATES:-$TEMPLATES}"
       export AGENTS_DIR="${1:-$STRAY_HOME/Library/LaunchAgents}"
       export ELDATO_ALLOW_TEST_HOME=1
       unset TORTOISE_REPO SWARM_ROOT PYTHON_BIN
@@ -3256,6 +3286,55 @@ assert_eq "$RC" "0" "§18b a template THREE levels down is DECLARED — the decl
 assert_not_contains "$OUT" "com.eldato.nested" "§18b ...so no bootout+rm advice is aimed at a job this repo ships"
 rm -f "$TEMPLATES/group/sub/com.eldato.nested.plist" "$STRAY_HOME/Library/LaunchAgents/com.eldato.nested.plist"
 rmdir "$TEMPLATES/group/sub" "$TEMPLATES/group" 2>/dev/null || true
+
+# ── 18c. THE PER-JOB VERDICTS NOW CARRY THE EXIT CODE (#1867 review, round 9) ────────────────────
+# Two arms, because the fix has two halves that fail in opposite directions:
+#   · an INSTALLABLE template that is ABSENT must be a FAILURE (`NOT INSTALLED`, rc 1). Pre-fix it
+#     printed the row and returned 0, so `--status` certified a box missing a job its own repo ships —
+#     MEASURED on the round-8 code: row printed, rc 0.
+#   · a template the installer would SKIP for an unset placeholder must NOT be (that would be a
+#     permanent red on a legitimate box — a Mac with no tortoise checkout is the common case, and the
+#     `OWNED-BY-OTHER-INSTALLERS` exemption exists precisely because such reds get "fixed" by deleting
+#     live plists). It prints `NOT APPLICABLE` and leaves the code alone.
+# The control runs the OTHER way too: the corrected fixture (declared set installed) is rc 0 above, so
+# a change that made every row fail would not pass as "the guard works".
+INSTALLABLE=com.eldato.objective-reminder
+[ -f "$STRAY_HOME/Library/LaunchAgents/$INSTALLABLE.plist" ] \
+    && ok "§18c fixture: $INSTALLABLE is installed, so its removal is what the arm below measures" \
+    || bad "§18c fixture: $INSTALLABLE was NOT installed — the NOT-INSTALLED arm would be vacuous"
+rm -f "$STRAY_HOME/Library/LaunchAgents/$INSTALLABLE.plist"
+set +e
+OUT="$(run_stray_status)"; RC=$?
+set -e
+assert_eq "$RC" "1" "§18c an INSTALLABLE declared template that is ABSENT is a FAILURE code, not a caveat"
+assert_contains "$OUT" "$INSTALLABLE: NOT INSTALLED" "§18c ... and the row says NOT INSTALLED"
+set +e
+run_stray_installer >/dev/null 2>&1
+set -e
+# ⚠️ NOT APPLICABLE — measured on the SAME invocation, so the two arms cannot disagree about env.
+set +e
+OUT="$(run_stray_status)"; RC=$?
+set -e
+assert_eq "$RC" "0" "§18c control: re-installing restores a clean box (the failure above was the absence, not the verb)"
+assert_contains "$OUT" "com.tortoise.pr-doctor: NOT APPLICABLE" "§18c a template the installer SKIPs is NOT APPLICABLE (not a failure)"
+assert_not_contains "$OUT" "com.tortoise.pr-doctor: NOT INSTALLED" "§18c ...and is never reported as an absent job"
+
+# ── 18d. THE DECLARED SET MUST BE READABLE OR THE ANSWER IS UNKNOWN (#1867 review, round 9) ──────
+# With an EMPTY declared set, "is this label declared?" is `no` for every label — so every installed
+# job reads UNMANAGED and the rows carry `launchctl bootout … && rm -f …` aimed at this repo's own
+# armed jobs. MEASURED pre-fix with `TEMPLATES_DIR` empty (and again chmod 000):
+# `⛔ UNMANAGED   com.eldato.objective-reminder` plus that delete command, rc 1 — the delete advice
+# being the harm, not the rc. The `AGENTS_DIR` arm already refuses this way; this is the other side.
+EMPTY_TEMPLATES="$T/empty-templates"; mkdir -p "$EMPTY_TEMPLATES"
+STRAY_TEMPLATES="$EMPTY_TEMPLATES"
+set +e
+OUT="$(run_stray_status)"; RC=$?
+set -e
+unset STRAY_TEMPLATES
+assert_eq "$RC" "2" "§18d an EMPTY declared set is UNKNOWN (2), never 'everything is a stray'"
+assert_contains "$OUT" "DECLARED SET" "§18d ... naming the uncountable set, not the installed one"
+assert_not_contains "$OUT" "UNMANAGED" "§18d ... and printing NO stray rows (a row would carry delete advice)"
+assert_not_contains "$OUT" 'bootout gui/' "§18d ... and therefore no bootout+rm command for a live job"
 
 # ⛔ AND "I COULD NOT LOOK" IS NOT "NOTHING TO REPORT" (#1867 review P2). An AGENTS_DIR that exists
 # but cannot be enumerated used to produce no rows, and no rows read as a CLEAN box: `--status`

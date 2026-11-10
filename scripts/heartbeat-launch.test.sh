@@ -410,6 +410,28 @@ done
 OUT="$(run "$R" HEARTBEAT_CHECK_MAX_AGE=900 -- check)"; RC=$?
 assert_eq "$RC" "0" "§13c control: a VALID bound still yields OK (0) on the same state"
 
+# ⛔ A ROW WITHOUT THE READ-QUALITY FLAG IS NOT A CLEAN ROW (#1867 review, round 9). The degraded COUNT
+# only looked at dicts that CARRY `degraded`, and the row count took everything else — so a snapshot
+# this reader does not understand read as a healthy fleet. MEASURED pre-fix on the two shapes below:
+# `[{"lane":"a","verdict":"WEDGED"},…]` → `OK … (2 rows, 0 degraded)` rc 0, and `[1,2,"x"]` →
+# `OK … (3 rows, 0 degraded)` rc 0 — not even rows. That is the same vacuity as the empty-list arm one
+# level deeper (a producer that stops writing the flag, or corruption that stays valid JSON), and it is
+# reachable by a producer change rather than only by a bad file. BOTH real producers put the flag on
+# every row — `lane-status.py`'s row builder says so verbatim ("THE TWO READ-QUALITY FLAGS, ON EVERY
+# ROW") and `lane-scan-fallback.sh` publishes that same `--json` output — so requiring it costs nothing.
+for _bad_snap in '[{"lane":"a","verdict":"WEDGED"},{"lane":"b","verdict":"OK"}]' '[1,2,"x"]' '[{"lane":"a","degraded":false},{"lane":"b"}]'; do
+    printf '%s\n' "$_bad_snap" > "$R/agent/state/lane-status.last.json"
+    OUT="$(run "$R" -- check)"; RC=$?
+    assert_eq "$RC" "2" "§13d a row set without the flag on EVERY row is UNKNOWN (2), never '0 degraded'"
+    assert_contains "$OUT" "degraded" "§13d …and the line names the missing flag"
+    assert_not_contains "$OUT" "0 degraded" "§13d …and never reports it as a clean read"
+done
+# The control: the REAL row shape is still OK, so the schema check did not turn the verb into a refusal.
+printf '[{"lane":"a","verdict":"OK","degraded":false},{"lane":"b","verdict":"OK","degraded":false}]\n' \
+    > "$R/agent/state/lane-status.last.json"
+OUT="$(run "$R" -- check)"; RC=$?
+assert_eq "$RC" "0" "§13d control: the shipped row shape (every row carrying the degraded flag) is still OK"
+
 echo "── 14. the launcher and the loop carry no literal user home ──"
 
 # ⛔ THIS IS THE ONE ASSERTION THAT FAILS ON PRE-CHANGE CODE BY CONSTRUCTION. The loop exported
