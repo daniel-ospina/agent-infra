@@ -651,6 +651,34 @@ assert_contains "$OUT" "DIRTY" "L5m …for its own reason"
 assert_contains "$OUT" "cwd witness is UNAVAILABLE" "L5m …AND the preserve verdict discloses the missing witness"
 assert_contains "$OUT" "#2744" "L5m …naming what that gap would have missed"
 
+# ── L5n: a target that STILL reads quoted/escaped marks the census UNUSABLE, never "no holder" ──
+# ⛔ THIS PINS THE `bad` GUARD, WHICH HAD NO ARM AT ALL (#2744 review round 3, MEASURED). Every `ls`
+# shim in this suite emitted either LITERAL or wholly UNPARSABLE output, so the `bad` file was never
+# populated by any arm and this line could be deleted with the whole suite green:
+#
+#     if (t ~ /^["\047]/ || t ~ /\\ /) { print $0 >> bad; next }
+#
+# That is the quietest fail-open there is: the row is PRESENT but can never equal `$path`, so it reads
+# as "no holder", with no disclosure, and the reap proceeds. It is also what makes the busybox/BSD
+# retry (an `ls` that ignores `--quoting-style`) sound — on such a build THIS is the only thing between
+# a quoted target and a silent deletion, so one arm covers both.
+# The checkout path deliberately CONTAINS A SPACE: that is the shape an escaping `ls` turns into
+# `re\ po\ wt`, a path which can never match.
+ENV=L5n; REPO="$(mk_repo $ENV)"; FAKE="$T/$ENV/fakeproc"; WTP="$REPO/.worktrees/re po wt"
+QUOTELS="$T/$ENV/quoting-ls"
+in_wt "wt_provision '$REPO' '.worktrees/re po wt' feat/18-tm origin/main" "$REPO" >/dev/null
+mkdir -p "$FAKE/4242" "$FAKE/self"
+ln -sfn "$WTP" "$FAKE/4242/cwd"
+ln -sfn "$FAKE" "$FAKE/self/cwd"
+# An `ls` that escapes the target WHATEVER option it is handed — the residue case the `bad` guard owns.
+printf '#!/bin/sh\nprintf "lrwxrwxrwx 1 root root 0 Nov 10 20:00 %%s/4242/cwd -> %%s\\n" "%s" "%s"\n' \
+  "$FAKE" "${WTP// /\\ }" >"$QUOTELS"
+chmod +x "$QUOTELS"
+OUT="$(in_wt "WT_PROC_ROOT='$FAKE' WT_LS='$QUOTELS' WT_LSOF=/nonexistent-lsof; wt_reap_if_empty '$REPO' '$WTP' feat/18-tm 'lane 18'; echo rc=\$?; echo \"WT_RESULT=\$WT_RESULT\"" "$REPO")"
+assert_contains "$OUT" "rc=1" "L5n a still-quoted target PRESERVES the checkout"
+assert_contains "$OUT" "cwd census produced nothing usable" "L5n …as an UNUSABLE census, not 'no holder'"
+assert_dir "$WTP" "L5n the live checkout survives a quoting ls (#2744)"
+
 # ⛔ L6/L7 ALSO PIN `MAX_LOAD`, AND THAT IS THE SAME CLASS OF FIXTURE DEFECT (measured 2026-11-03 while
 # reviewing #3331). Both arms read "the lane REACHED its agent" from the ABSENCE of a land-backlog line,
 # so a LOAD refusal (75) — which the ambient load on a busy box produces, with no other symptom — reaps

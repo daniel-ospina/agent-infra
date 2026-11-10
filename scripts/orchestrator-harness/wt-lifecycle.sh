@@ -63,10 +63,15 @@
 # halfway MUST stop dispatching: continuing would create worktrees whose rollback does not exist.
 #
 # Env seams (tests set them; production never needs them):
-#   WT_GIT   git binary            (default `git`)
-#   WT_PS    ps binary             (default `/bin/ps`)
-#   WT_LSOF  lsof binary           (default `lsof`)
-#   WT_BASE  default base ref      (default `origin/main`)
+#   WT_GIT       git binary              (default `git`)
+#   WT_PS        ps binary               (default `/bin/ps`)
+#   WT_LSOF      lsof binary             (default `lsof`)
+#   WT_LS        ls binary               (default `ls`) — the Linux `wt_cwd_rows` probe
+#   WT_PROC_ROOT the `/proc` root it reads (default `/proc`; a missing one selects the lsof arm)
+#   WT_BASE      default base ref        (default `origin/main`)
+# ⛔ THIS REGISTRY AND THE ONE AT `wt_cwd_rows` ARE ONE LIST IN TWO PLACES: a seam a suite can set and
+# this block does not name is a knob an operator cannot find. `WT_PROC_ROOT` and `WT_LS` were both
+# added by #2744 and named only down there (round-3 review, cosmetic — fixed with L5n).
 set -u
 
 # The declared-disposable allowlist, ROOT-ONLY, exactly as `pi-reap-worktrees.sh` declares it — and
