@@ -505,19 +505,29 @@ hdr "§8 THE SLACK SEAM — validated before it reaches arithmetic (fresh review
 # ⛔ THE EXPECTED VALUES ARE main's DOCUMENTED BEHAVIOUR, not a restatement of the code: an all-digit
 # value with leading zeros is NORMALISED (`08`->8, `007`->7) and KEPT, because both are inside the
 # bound; only a NON-digit value or one wider than 60 falls to the documented 5.
+# ⛔ `-1` AND `+1` ARE IN THE MATRIX BECAUSE THEY ISOLATE THE STAGE THE REST CANNOT REACH (fresh review of
+# #3846, P2). The guard has three stages — the length bound, the octal strip, and the non-digit test —
+# and every non-digit value above is >=3 characters, so the LENGTH bound catches it first: deleting the
+# non-digit stage (`case "$s" in ''|*[!0-9]*) s=5 ;; esac`) left this suite 68 passed, 0 failed, while
+# `_orc_lock_slack -1` returned `-1` instead of 5 and `+1` returned `+1`. `-1` is TWO characters, so it
+# passes the length bound and the octal strip leaves it alone — straight into `[ "$ps" -gt "$((pe + slack))" ]`
+# with a NEGATIVE slack, i.e. the fail-OPEN reclaim this whole section exists to prevent. Two characters,
+# signed, is the only shape that reaches the stage alone.
 _lsv=""
-for _lv in "" "-100" "1.5" "08" "007" "61" "100000" "abc"; do
+for _lv in "" "-100" "1.5" "08" "007" "61" "100000" "abc" "-1" "+1"; do
   _lsv="$_lsv$(_orc_lock_slack "$_lv") "
 done
-[ "$_lsv" = "5 5 5 8 7 5 5 5 " ] \
+[ "$_lsv" = "5 5 5 8 7 5 5 5 5 5 " ] \
   && ck "§8 every invalid slack falls to 5, and all-digit values are normalised not rejected" 0 \
-  || ck "§8 the slack matrix drifted from main's documented behaviour — for ''/-100/1.5/08/007/61/100000/abc got '$_lsv', wanted '5 5 5 8 7 5 5 5 '" 1
+  || ck "§8 the slack matrix drifted from main's documented behaviour — for ''/-100/1.5/08/007/61/100000/abc/-1/+1 got '$_lsv', wanted '5 5 5 8 7 5 5 5 5 5 '" 1
 # ⛔ DRIVEN: a live process whose record was written AFTER it started (the normal HELD case) must be
 # REFUSED for every one of these. Pre-fix, `-100` reclaimed it (rc 0, the owner's record replaced) and
-# the three non-numeric ones died inside the arithmetic instead of returning a verdict.
+# the three non-numeric ones died inside the arithmetic instead of returning a verdict. `-1` is driven
+# as well as matrixed: it is the shortest signed value that reaches the arithmetic, so it is the one
+# that proves the NON-DIGIT stage alone still refuses a live holder.
 SLK="$T/slk"; mkdir -p "$SLK"
 sleep 30 & SLH=$!
-for _bad in -100 1.5 abc 08; do
+for _bad in -100 -1 1.5 abc 08; do
   printf '%s\n' "$SLH" > "$SLK/.orch.lock"
   ( export ORC_LOCK_START_SLACK_SECONDS="$_bad"
     . "$MOD"

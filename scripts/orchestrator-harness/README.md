@@ -1712,6 +1712,14 @@ carries **35** placeholders (counted, not incremented — a number beside a list
 of these and re-running `install.sh` silently has no effect, and a hand-added plist key is
 overwritten by the next render. Set them through `$ENV_FILE` on a cell, or edit the defaults in the
 scripts.
+⛔ **`ORC_STATE_DIR` and `ORC_CONTROLLER_ORIGIN` are the same hazard with the opposite remedy, and the difference is the point.** Neither is a `__NAME__`
+placeholder: both ship as **literal** keys (`<key>ORC_STATE_DIR</key><string></string>`, `<key>ORC_CONTROLLER_ORIGIN</key><string>launchd</string>`),
+so `install.sh` never fills them from the environment — exporting either and re-running `install.sh` has no effect on the
+render. What they buy in exchange is **durability**: the installed plist's own entry is not overwritten by the next render, so a
+hand-edit survives a reinstall. And an EMPTY string is a MEANING, not an absence — empty `ORC_STATE_DIR` is "rank `O`, then
+`$HOME/orchestrator`" (the template comment at that key says why) and empty `ORC_CONTROLLER_ORIGIN` is "no origin label" — so a
+render that filled them from the environment would silently move a controller's state dir instead. Give either one a `__…__`
+placeholder and both properties are lost at once.
 ⛔ **The three memory knobs ARE rendered** (`MEM_MIN_AVAIL_MB`, `MEM_LANE_RESERVE_MB`,
 `MEM_SPAWN_RESERVE_LANES`), unlike the row above: the spawn gate's memory floor is enforced by the
 controller's own plist, so a knob the render dropped would be a floor an operator could set and never
