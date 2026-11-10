@@ -128,6 +128,35 @@
 # Anything failing clean / reachable / unreferenced is SURFACED with its
 # deciding reason and NEVER auto-removed.
 #
+# ── STALLED REVIEW LIST AND THE BOUND (agent-infra#2179) ──────────────────────────────────────
+# A release that never happens is not a preserve, it is a BLOCK: a lane-residue record that holds a
+# branch naming an issue keeps that issue un-dispatchable on every box, and the pass that leaves it
+# in place must say so. #2179 fixes both halves — a short, per-class floor for the 0-commits class
+# (done by #2033's ghost/abandoned-wip classes above) and a REVIEW LIST for what the floors do not
+# reach.
+#
+# THE BOUND, STATED: a lane-residue record must resolve — completed, released, or explicitly parked
+# with an owner — within ITS CLASS FLOOR PLUS ONE SWEEP. The pass ASSERTS it in the only direction it
+# can be asserted from here: a record it RELEASES is removed AND its 0-ahead lane ref deleted, so the
+# issue it named is dispatchable again on the next pre-flight; a record it does NOT release is either
+# inside its floor (nothing to assert yet — the next sweep acts) or on the STALLED list, NAMED with
+# the issue, its age and the reason no floor will move it. `floor=none` is the strongest of those: the
+# class's release switch is off, so no later pass releases it at all.
+#
+# WHAT PUTS A RECORD ON THE LIST — only 0-commits-ahead lane residue (`refs=merged`, i.e. the branch
+# holds no commit the main ref does not), and only when this pass could not release it:
+#   * `--reap-abandoned-wip` unarmed and a dirty tree  => floor=none  why=opt-in-off
+#   * a verified-backup failure                        => why=backup-unverified
+#   * the removal-time holder/dirty re-check kept it    => why=removal-time-recheck
+#   * the stash / unpushed abstention withheld it       => why=withheld-by-abstention
+#   * the claim registry or the checkout age unreadable => why=claim-registry-unreadable /
+#                                                        why=worktree-age-unreadable
+# A LIVE CLAIM is NOT stalled (the issue is held by a lease, which expires) and a record inside its
+# floor is NOT stalled (the next sweep resolves it), so neither appears.
+# The list is `log_line` output on stdout, so it reaches whoever ran the pass; the tally travels as
+# `stalled=<n>` on the SUMMARY line and `STALLED=<n>` on the footer. ⛔ It is a SUBSET of `preserved`,
+# never a fourth verdict — the SUMMARY identities are unchanged.
+#
 # ── SEVEN-RULE DECISION TABLE (#2721) — every row PRINTS the rule and its proof.
 # A KEEP whose reason does not name the evidence it used is indistinguishable from
 # a bug, and three of the classes below were unprovable for days because the tool
@@ -909,6 +938,16 @@ DEFERRED_REMOVE=0
 WT_TOTAL=0
 REMOVE_C=0
 PRESERVE_C=0
+# ── THE STALLED REVIEW LIST (agent-infra#2179) ─────────────────────────────────────────────────────
+# A record that is 0 commits ahead (lane residue by construction), is NOT released by this pass, and
+# has no releasing floor in force or was withheld by a gate past it, is residue that holds its issue
+# out of dispatch for EVER — which is the defect #2179 exists to remove. It is counted and NAMED below
+# instead of reading as a routine `preserve`. ⛔ STALLED_N IS A SUBSET OF `preserved`, never a fourth
+# verdict: the SUMMARY identities (`examined = classified + deferred`, `classified = remove +
+# preserved`) are unchanged, and `stalled=` answers a DIFFERENT question — "how much residue can no
+# later pass release on its own" — so folding it into either side of those identities would break them.
+STALLED_N=0
+STALLED_LIST=""
 # Records the pass actually DECIDED (a deferred record never reached classify_one).
 CLASSIFIED_C=0
 # Every preserved reason, space-separated, folded into the SUMMARY line by summary_reasons().
@@ -973,6 +1012,8 @@ Usage:
                   ahead (a lane that never committed; #2033). OFF by default, and even when given
                   the removal happens only after a VERIFIED backup under REAP_WT_BACKUP_DIR
                   (default \$O/state/reaped-patches/<date>). Age floor: REAP_WT_WIP_AGE_HOURS (24).
+                  While it is OFF, a dirty 0-commits-ahead lane record is PRESERVEd and named on the
+                  STALLED review list with floor=none (#2179) — never a silent block.
   --list          print worktrees and exit
   --help          this text
 
@@ -995,7 +1036,7 @@ remote's advertised default branch and its oid, with the local ref chain as
 the fallback. REAP_WT_MAIN_PROOF=local forces the local chain (no network).
 
 The pass ends with ONE machine-readable SUMMARY line (examined/classified/
-remove/preserved/deferred/removed/reasons/main_proof/pr_merged/verdict).
+remove/preserved/deferred/removed/reasons/main_proof/pr_merged/stalled/verdict).
 \`verdict=\` is the PASS's own answer, not a counter: \`reclaimed\` (it removed
 something), \`idle\` (nothing to do), \`dry-run\`, \`unmeasured\` (it decided work
 and removed none, but free space could not be read), or \`reap-ineffective\` —
@@ -1004,6 +1045,13 @@ space is below REAP_WT_DISK_FLOOR_MB. The last one is also RECORDED in
 \$STATE_DIR/reap-ineffective; any pass that EVALUATES the condition removes that
 file when it does not hold, and a pass that never reached the verdict (a
 fail-closed abort) neither writes nor deletes it.
+
+\`stalled=\` is the STALLED REVIEW LIST's tally (#2179): 0-commits-ahead lane
+residue this pass did NOT release and no later pass will release on its own. It is
+a SUBSET of \`preserved=\`. A non-zero tally prints the list itself, each row
+naming the ISSUE its branch holds out of dispatch, with the reason and the floor
+in force (\`floor=none\` = no floor is in force). The bound is the class floor plus
+one sweep.
 
 `git worktree remove` deletes the CHECKOUT, never the branch — named-branch
 worktrees lose no commits, and this script never runs \`git branch -D\`.
@@ -2817,6 +2865,18 @@ is_lane_branch() { # <branch-ref> -> 0 when the harness itself created this bran
     grep -Eq -- "$REAP_WT_LANE_BRANCH_RE" <<<"$1"
 }
 
+# stalled_tok <class> <issue> <age-h|?> <floor> <why> — the STALLED LIST's machine token (#2179).
+# ⛔ IT RIDES ON THE ROW'S DETAIL FIELD, not on a shell global, and that is forced by the caller's
+# shape: `classify_one` runs inside `crumb="$(classify_one …)"`, i.e. a COMMAND SUBSTITUTION, so every
+# variable it sets dies with that subshell. A token in the row is the only channel that survives, and
+# it is the same channel the parent already reads for `refs=remote-holds:`. `<floor>` is `none` when NO
+# releasing floor is in force (the class's release switch is off) — which is a STRONGER statement than
+# a floor that has merely not been reached, and the two must not read alike.
+stalled_tok() {
+    printf 'stalled=1 class=%s issue=#%s age=%sh floor=%s why=%s' \
+        "$1" "${2:-?}" "${3:-?}" "$4" "$5"
+}
+
 # claims_load — ONE bounded fetch of the registry into this pass's own namespace.
 # The destination is `refs/pireap-claims/*`, never `refs/claims/*`: a fetch INTO the registry's
 # namespace would look like an acquisition to every reader on every box. `--prune` is scoped to
@@ -3327,20 +3387,26 @@ rotate_records() {
 # provably landed) would be frozen forever.
 abstain_gate() {
     local path="$1" branch="$2" refs="$3" proved="${4:-0}" hit unp
+    # <5>: the STALLED token (#2179) the CALLER supplies when the record it is deciding is 0-commits
+    # lane residue — the caller is the only frame that knows the class and its floor. It is appended to
+    # each preserve row, so a withholding gate on that class is NAMED on the review list rather than
+    # reading as a routine preserve. `${st:+ $st}` emits NOTHING when the argument is absent, so every
+    # other call site's row text is byte-identical to before this change.
+    local st="${5:-}"
     # A stash register entry naming this branch is the most specific evidence of
     # parked work there is, and an UNREADABLE register fails closed.
     case "$STASH_STATE" in
         unreadable)
-            printf 'preserve\tstranded-stash-unverifiable\t\trule=P proof=stash-register:unreadable cannot read the stash register — a register we cannot read is not a clear register\n'
+            printf 'preserve\tstranded-stash-unverifiable\t\trule=P proof=stash-register:unreadable cannot read the stash register — a register we cannot read is not a clear register%s\n' "${st:+ $st}"
             return 0 ;;
     esac
     if hit="$(stranded_stash_for "$branch")"; then
-        printf 'preserve\tstranded-stash\t\trule=P proof=stash-register:%s the stash register holds work for %s\n' "${hit%%$'\t'*}" "${branch#refs/heads/}"
+        printf 'preserve\tstranded-stash\t\trule=P proof=stash-register:%s the stash register holds work for %s%s\n' "${hit%%$'\t'*}" "${branch#refs/heads/}" "${st:+ $st}"
         return 0
     fi
     [ "$proved" = 1 ] && { UNPUSHED_NOTE=""; return 1; }
     if ! unp="$(unpushed_ahead "$path")"; then
-        printf 'preserve\tunpushed-unverifiable\t\trule=P proof=git rev-list --count HEAD --not --remotes:unreadable cannot evaluate whether this head is pushed — abstaining\n'
+        printf 'preserve\tunpushed-unverifiable\t\trule=P proof=git rev-list --count HEAD --not --remotes:unreadable cannot evaluate whether this head is pushed — abstaining%s\n' "${st:+ $st}"
         return 0
     fi
     # ⛔ IT DOES NOT VETO AN UNPUSHED HEAD, AND THAT IS A RECORDED DECISION, not an
@@ -3953,7 +4019,12 @@ classify_one() {
                return 0 ;;
         esac
         if [ "$claim" = "unknown" ]; then
-            printf 'preserve\tclaim-unverified\t\tthe claim registry is unreadable and issue #%s could be in flight — abstaining (fail-closed)\n' "${issue:-?}"
+            # #2179: an unreadable registry is not a transient state a later pass resolves on its own
+            # — nothing in the fleet retries it for this record — so a 0-ahead record held by it is
+            # NAMED on the stalled list (`refs=merged` is the 0-ahead test).
+            _st=""
+            [ "$refs" = "merged" ] && _st=" $(stalled_tok interrupted-add "$issue" "$((init_age / 3600))" "${REAP_WT_STALE_INIT_SECONDS}s" claim-registry-unreadable)"
+            printf 'preserve\tclaim-unverified\t\tthe claim registry is unreadable and issue #%s could be in flight — abstaining (fail-closed)%s\n' "${issue:-?}" "$_st"
             return 0
         fi
         # ⛔ #2541's ABSTENTION PAIR RUNS ON THIS CLASS TOO (the merge's rule: a lane-residue class may
@@ -3961,7 +4032,7 @@ classify_one() {
         # value: the surviving refs above only promise the commits are RETAINED on a branch, which is
         # not the same claim as "landed on main" — so the unpushed arm is allowed to fail closed here.
         # A stash the register names for this branch is parked lane work, and it outranks the class.
-        abstain_gate "$path" "$branch" "$refs" 0 && return 0
+        abstain_gate "$path" "$branch" "$refs" 0 "$(stalled_tok interrupted-add "$issue" "$((init_age / 3600))" "${REAP_WT_STALE_INIT_SECONDS}s" withheld-by-abstention)" && return 0
         printf 'remove\tinterrupted-add\t%s\trule=L lock=initializing age=%ss refs=%s claim=%s — an add that never returned; nothing was materialised into it\n' \
             "" "$init_age" "$refs" "$claim"
         return 0
@@ -4025,6 +4096,26 @@ classify_one() {
     case "$cverdict" in
         clean) eph="$cpay" ;;
         dirty)
+            # ── STALLED (#2179): 0-commits-ahead LANE residue this pass cannot release ───────────
+            # This arm exists because the class was INVISIBLE: with `--reap-abandoned-wip` unarmed
+            # (the shipped default, and what the sweep wrapper runs) a dirty, 0-commits-ahead,
+            # lane-owned record fell through to the generic rule-2 preserve below, which carries no
+            # AGE, no CLASS and no ISSUE — so the record held its issue out of dispatch for ever and
+            # the pass reported nothing an operator could act on. `refs=merged` IS the 0-ahead test
+            # (the tip is an ancestor of the main ref), i.e. the branch holds no commit main does not.
+            # ⛔ IT CHANGES NO VERDICT — the row is `preserve` before and after, and it is placed
+            # BEFORE the opt-in arm so the armed path's own rows (removal, its floors, its abstentions)
+            # are untouched. It only NAMES the class and the reason it cannot move.
+            if [ "$REAP_WT_WIP" != 1 ] && is_lane_branch "$branch" \
+                    && [ "$(commits_survive "$sha" "$branch")" = "merged" ]; then
+                _st_age="?"
+                [ "$wt_ok" = 1 ] && _st_age=$(((now - wt_ts) / 3600))
+                # floor=none, NOT the WIP floor: with the release switch off there is no floor this
+                # record will ever cross, so quoting 24h here would name a bound that is not in force.
+                printf 'preserve\tdirty\t\trule=2 proof=git-status --porcelain %s %s\n' "$cpay" \
+                    "$(stalled_tok abandoned-wip "$issue" "$_st_age" none opt-in-off)"
+                return 0
+            fi
             # ── abandoned WIP, OPT-IN (#2033): 0 commits ahead, dirty, lane-owned ──────────────
             # 24 of these were measured in one repo: a lane that never made its first commit, so the
             # ONLY copy of its work is this working tree. A normal pass PRESERVES it (`dirty` is rule
@@ -4033,7 +4124,10 @@ classify_one() {
             # the run loop runs BEFORE `remove_one_forced`). Nothing here is default behaviour.
             if [ "$REAP_WT_WIP" = 1 ] && is_lane_branch "$branch"; then
                 if [ "$claim" = "unknown" ]; then
-                    printf 'preserve\tclaim-unverified\t\tthe claim registry is unreadable and issue #%s could be in flight — abstaining (fail-closed)\n' "${issue:-?}"
+                    # #2179: named on the stalled list — `refs=merged` was proven above, so this is the
+                    # 0-ahead class, and no later pass resolves an unreadable registry by itself.
+                    printf 'preserve\tclaim-unverified\t\tthe claim registry is unreadable and issue #%s could be in flight — abstaining (fail-closed) %s\n' "${issue:-?}" \
+                        "$(stalled_tok abandoned-wip "$issue" "$([ "$wt_ok" = 1 ] && echo $(((now - wt_ts) / 3600)) || echo '?')" "${REAP_WT_WIP_AGE_HOURS}h" claim-registry-unreadable)"
                     return 0
                 fi
                 refs="$(commits_survive "$sha" "$branch")"
@@ -4049,7 +4143,9 @@ classify_one() {
                     # The floor exists to protect a checkout someone may still be working in. If the
                     # CHECKOUT's age cannot be read, that floor cannot be applied — abstain rather than
                     # reap on the base commit's date, which is what made the floor decorative.
-                    printf 'preserve\tunreadable-worktree-age\t\trule=P cannot date the checkout at %s (REAP_WT_WIP_AGE_HOURS cannot be applied)\n' "$path"
+                    # #2179: an unreadable datum is not a transient that resolves itself either.
+                    printf 'preserve\tunreadable-worktree-age\t\trule=P cannot date the checkout at %s (REAP_WT_WIP_AGE_HOURS cannot be applied) %s\n' "$path" \
+                        "$(stalled_tok abandoned-wip "$issue" '?' "${REAP_WT_WIP_AGE_HOURS}h" worktree-age-unreadable)"
                     return 0
                 fi
                 if [ "$((now - wt_ts))" -le "$((REAP_WT_WIP_AGE_HOURS * 3600))" ]; then
@@ -4061,7 +4157,7 @@ classify_one() {
                 # 0 ahead, lane-owned, old", and a stash naming this branch is exactly the parked work
                 # the dirty tree cannot show. `landing-proved=1` — the `refs=merged` case above is an
                 # ancestry proof for THIS head, the same exemption rule 3 takes on the same datum.
-                abstain_gate "$path" "$branch" "$refs" 1 && return 0
+                abstain_gate "$path" "$branch" "$refs" 1 "$(stalled_tok abandoned-wip "$issue" "$(((now - wt_ts) / 3600))" "${REAP_WT_WIP_AGE_HOURS}h" withheld-by-abstention)" && return 0
                 printf 'remove\tabandoned-wip\t%s\trule=L refs=merged dirty=%s age=%sh claim=%s witness=worktree-record backup=required\n' \
                     "$cpay" "$(((now - wt_ts) / 3600))" "$claim"
                 return 0
@@ -4183,14 +4279,18 @@ classify_one() {
         # a non-lane branch keeps the operator's full cooldown, so this widens nothing else.
         if is_lane_branch "$branch"; then
             if [ "$claim" = "unknown" ]; then
-                printf 'preserve\tclaim-unverified\t\tthe claim registry is unreadable and issue #%s could be in flight — abstaining (fail-closed)\n' "${issue:-?}"
+                # #2179: `refs=merged` (this arm's own precondition) is the 0-ahead test, so an
+                # unreadable registry leaves a lane record nothing in the fleet will ever retry.
+                printf 'preserve\tclaim-unverified\t\tthe claim registry is unreadable and issue #%s could be in flight — abstaining (fail-closed) %s\n' "${issue:-?}" \
+                    "$(stalled_tok ghost-zero-ahead "$issue" "$([ "$wt_ok" = 1 ] && echo $(((now - wt_ts) / 3600)) || echo '?')" "${REAP_WT_GHOST_AGE_HOURS}h" claim-registry-unreadable)"
                 return 0
             fi
             if [ "$wt_ok" != 1 ]; then
                 # Same fail-closed rule as abandoned-wip: the ghost floor is the ONLY thing separating a
                 # dispatch that started seconds ago from residue, so it must be applied on the
                 # checkout's own age or not at all.
-                printf 'preserve\tunreadable-worktree-age\t\trule=P cannot date the checkout at %s (REAP_WT_GHOST_AGE_HOURS cannot be applied)\n' "$path"
+                printf 'preserve\tunreadable-worktree-age\t\trule=P cannot date the checkout at %s (REAP_WT_GHOST_AGE_HOURS cannot be applied) %s\n' "$path" \
+                    "$(stalled_tok ghost-zero-ahead "$issue" '?' "${REAP_WT_GHOST_AGE_HOURS}h" worktree-age-unreadable)"
                 return 0
             fi
             if [ "$((now - wt_ts))" -le "$((REAP_WT_GHOST_AGE_HOURS * 3600))" ]; then
@@ -4206,7 +4306,7 @@ classify_one() {
             # order matters: the ghost class deletes the CHECKOUT **and** its 0-ahead branch ref, so a
             # stash the register names for that branch must be able to stop it. `landing-proved=1` is
             # exactly rule 3's exemption — `refs=merged` above is an ancestry proof for this head.
-            abstain_gate "$path" "$branch" "$refs" 1 && return 0
+            abstain_gate "$path" "$branch" "$refs" 1 "$(stalled_tok ghost-zero-ahead "$issue" "$(((now - wt_ts) / 3600))" "${REAP_WT_GHOST_AGE_HOURS}h" withheld-by-abstention)" && return 0
             log "CLASSIFY ghost $path issue=${issue:-?} claim=$claim age=$(((now - wt_ts) / 3600))h ghost_floor=${REAP_WT_GHOST_AGE_HOURS}h"
             printf 'remove\tghost-zero-ahead\t%s\trule=L refs=merged proof=%s ghost=lane-branch:%s claim=%s age=%sh witness=worktree-record clean=disposable-only unref=%s,no-open-pr delete_lane_branch=yes\n' \
                 "$eph" "$proof_txt" "${issue:-?}" "$claim" "$(((now - wt_ts) / 3600))" "${stale_txt:-no-proc}"
@@ -4741,7 +4841,7 @@ report_row() { # <verdict> <path> <reason> <detail>
 }
 
 print_footer() {
-    log "MODE=$MODE NOW=$1 AGED_DAYS=$REAP_WT_AGED_DAYS MIN_AGE_MINUTES=$REAP_WT_MIN_AGE_MINUTES WORKTREES=$WT_TOTAL REMOVE=$REMOVE_C PRESERVE=$PRESERVE_C REMOVED=$REMOVED FAILED=$FAILED LATE_PRESERVE=$LATE_PRESERVE DEFERRED=$DEFERRED DEFERRED_REMOVE=$DEFERRED_REMOVE CLASSIFIED=$CLASSIFIED_C BRANCH_DELETED=$BRANCH_DELETED BRANCH_KEPT=$BRANCH_KEPT CLAIMS=$CLAIMS_STATE GH=$GH_STATE CWD_PROBE=$([ "$CWD_DEGRADED" = 1 ] && printf degraded || printf ok) PRUNE_BLOCKED=$PRUNE_BLOCKED MAIN_PROOF=$MAIN_PROOF PR_MERGED=$PR_MERGED_STATE VERDICT=${PASS_VERDICT:-?} FREE_MB=${FREE_MB:-?}"
+    log "MODE=$MODE NOW=$1 AGED_DAYS=$REAP_WT_AGED_DAYS MIN_AGE_MINUTES=$REAP_WT_MIN_AGE_MINUTES WORKTREES=$WT_TOTAL REMOVE=$REMOVE_C PRESERVE=$PRESERVE_C REMOVED=$REMOVED FAILED=$FAILED LATE_PRESERVE=$LATE_PRESERVE DEFERRED=$DEFERRED DEFERRED_REMOVE=$DEFERRED_REMOVE CLASSIFIED=$CLASSIFIED_C BRANCH_DELETED=$BRANCH_DELETED BRANCH_KEPT=$BRANCH_KEPT CLAIMS=$CLAIMS_STATE GH=$GH_STATE CWD_PROBE=$([ "$CWD_DEGRADED" = 1 ] && printf degraded || printf ok) PRUNE_BLOCKED=$PRUNE_BLOCKED MAIN_PROOF=$MAIN_PROOF PR_MERGED=$PR_MERGED_STATE STALLED=$STALLED_N VERDICT=${PASS_VERDICT:-?} FREE_MB=${FREE_MB:-?}"
 }
 
 # ── THE PASS VERDICT (#3041) ───────────────────────────────────────────────────────────────────
@@ -4918,9 +5018,9 @@ summary_reasons() {
 # what `verdict=` and $STATE_DIR/reap-ineffective add (#3041): a pass can be perfectly self-consistent
 # and still be wrong (52 records, 0 removals, 0 bytes free).
 summary_line() {
-    printf 'SUMMARY examined=%s classified=%s remove=%s preserved=%s deferred=%s deferred_remove=%s removed=%s failed=%s late_preserved=%s prune_blocked=%s reasons=%s main_proof=%s main_ref=%s pr_merged=%s verdict=%s\n' \
+    printf 'SUMMARY examined=%s classified=%s remove=%s preserved=%s deferred=%s deferred_remove=%s removed=%s failed=%s late_preserved=%s prune_blocked=%s reasons=%s main_proof=%s main_ref=%s pr_merged=%s stalled=%s verdict=%s\n' \
         "$WT_TOTAL" "$CLASSIFIED_C" "$REMOVE_C" "$((PRESERVE_C - DEFERRED))" "$DEFERRED" "$DEFERRED_REMOVE" \
-        "$REMOVED" "$FAILED" "$LATE_PRESERVE" "$PRUNE_BLOCKED" "$(summary_reasons)" "$MAIN_PROOF" "${MAIN_REF_NAME:-${MAIN_REF:-?}}" "$PR_MERGED_STATE" "${PASS_VERDICT:-?}"
+        "$REMOVED" "$FAILED" "$LATE_PRESERVE" "$PRUNE_BLOCKED" "$(summary_reasons)" "$MAIN_PROOF" "${MAIN_REF_NAME:-${MAIN_REF:-?}}" "$PR_MERGED_STATE" "$STALLED_N" "${PASS_VERDICT:-?}"
 }
 
 # ── main ───────────────────────────────────────────────────────────────
@@ -5405,6 +5505,11 @@ run() {
                         if ! _bk="$(backup_before_removal "$p" "$b" "$h" "$reason")"; then
                             log_line "         PRESERVED — the backup did NOT verify, so nothing was removed (reason=$reason; see $REAP_WT_LOG)"
                             log "BACKUP-UNVERIFIED-KEEP $p reason=$reason"
+                            # #2179: a release that was SELECTED and then withheld leaves the record
+                            # past its floor and unremoved — precisely the stalled state, so it is
+                            # named on the review list instead of surviving only in the log.
+                            STALLED_N=$((STALLED_N + 1))
+                            STALLED_LIST="${STALLED_LIST}${p}"$'\t'"${reason}"$'\t'"stalled=1 class=${reason} issue=#$(lane_issue_of "$b" || true) age=? floor=current why=backup-unverified"$'\n'
                             FAILED=$((FAILED + 1))
                             continue
                         fi
@@ -5478,7 +5583,11 @@ run() {
                             # evaluated — different operator actions.
                             log_line "         PRESERVED — removal-time re-check kept it (${REMOVE_SKIP_VERDICT:-unknown}); nothing removed"
                             LATE_PRESERVE=$((LATE_PRESERVE + 1))
-                            log "PRESERVED-LATE $p" ;;
+                            log "PRESERVED-LATE $p"
+                            # #2179: selected, past its floor, and NOT released — the same stalled
+                            # state the backup failure above names, reached through the re-check.
+                            STALLED_N=$((STALLED_N + 1))
+                            STALLED_LIST="${STALLED_LIST}${p}"$'\t'"${reason}"$'\t'"stalled=1 class=${reason} issue=#$(lane_issue_of "$b" || true) age=? floor=current why=removal-time-recheck"$'\n' ;;
                         *)
                             log_line "         REMOVE-FAILED — see the log ($REAP_WT_LOG)"
                             FAILED=$((FAILED + 1)) ;;
@@ -5489,6 +5598,16 @@ run() {
             PRESERVE_C=$((PRESERVE_C + 1))
             PRESERVE_REASONS="$PRESERVE_REASONS$reason "
             log "CLASSIFY preserve $p reason=$reason $detail"
+            # ── THE STALLED REVIEW LIST (#2179) ───────────────────────────────────────────────────
+            # `classify_one` cannot set a global (it runs in a command substitution), so a record that
+            # is 0-commits-ahead lane residue with no releasing floor in force — or withheld past it —
+            # carries the token on its own detail and is collected HERE. The token is emitted only by
+            # the lane-residue arms, so this cannot pick up a generic preserve.
+            case "$detail" in
+                *"stalled=1 class="*)
+                    STALLED_N=$((STALLED_N + 1))
+                    STALLED_LIST="${STALLED_LIST}${p}"$'\t'"${reason}"$'\t'"${detail}"$'\n' ;;
+            esac
             # A preserved record that git may ALSO deem prunable must not be
             # swept up by the global, path-filterless prune. The AUTHORITATIVE
             # predicate is git's OWN `prunable` flag: as of the pass-start
@@ -5651,6 +5770,28 @@ run() {
     # ── the pass's own verdict (#3041), computed BEFORE the summary so the one machine-readable
     # line carries it. It also writes/clears $STATE_DIR/reap-ineffective.
     reap_verdict
+
+    # ── THE STALLED REVIEW LIST (agent-infra#2179) ────────────────────────────────────────────────
+    # #2179's other half: a residue that this pass does NOT release must be REVIEWED, not silently
+    # preserved. The bound is the class floor plus one sweep — a record inside its floor is not
+    # listed (the next sweep resolves it), and a record that can no longer cross any floor is
+    # listed with the ISSUE its branch holds out of dispatch, so a human or a lane can complete or
+    # release it. Printed only when non-empty: a header with no rows under it is noise an operator
+    # learns to skip.
+    if [ "$STALLED_N" -gt 0 ]; then
+        log_line ""
+        log_line "STALLED REVIEW LIST (#2179) — ${STALLED_N} record(s) in the 0-commits-ahead lane class that"
+        log_line "this pass did NOT release and cannot release on its own. The bound is the class floor plus"
+        log_line "one sweep: a record inside its floor is not listed here (the next sweep resolves it)."
+        while IFS=$'\t' read -r _sp _sr _sd; do
+            [ -n "$_sp" ] || continue
+            log_line "  $_sp"
+            log_line "      reason=$_sr  $_sd"
+        done <<<"$STALLED_LIST"
+        log_line "  each row names the ISSUE its branch holds out of dispatch. Release a dirty record with"
+        log_line "  \`--reap-abandoned-wip\` (backup verified FIRST), or land/complete the work; a record that"
+        log_line "  stays here past its bound IS the #2179 defect, and floor=none means no floor is in force."
+    fi
 
     log_line ""
     if [ "$MODE" = dry-run ]; then
