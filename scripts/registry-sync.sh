@@ -168,40 +168,83 @@ git_b() { # <git args…>
 }
 
 # ── fields ───────────────────────────────────────────────────────────────────────────────
-# ⛔ NO `jq` — and, since agent-infra#3180, NO `sed` EITHER. `record-review.sh` WRITES a record with
-# one `printf` and reads its own fields back the same way, so this stays a STRING read: a second JSON
-# parser here would be a second definition of the record's shape (the same reason that script's
-# record_identity() is an exact-string compare).
+# ⛔ NO `jq`. ⛔ AND ONE DEFINITION OF THE RECORD'S SHAPE, NOT TWO (agent-infra#2510, #2374).
+# `read_record` (scripts/atomic-land.sh) and `extensions/review-enforcer` parse a record as STRICT
+# JSON and take its TOP-LEVEL value — and this file ORDERS records by `reviewed_at` and VERIFIES
+# keys by `repo`/`pr`. So a field read that disagreed with the gate would decide the merge rules on
+# one value while the gate acted on another. The `sed` (and #3180's spawn-free replica, which
+# preserved its semantics on purpose) takes the LAST match on the LINE, which is a NESTED value
+# whenever the record carries an object. Measured on this box: a record whose top level said
+# `reviewed_at=2099…`, `repo=other/repo`, `pr=999` while a nested `evidence` object said
+# `reviewed_at=2000…`, `repo=daniel-ospina/agent-infra`, `pr=2374` read back EVERY field from the
+# nested side — so rule 3's key check PASSED a record belonging to another repo, and rule 1 ranked
+# the store's newer record as older. Both directions lose a newer record, unrecoverably (one record
+# per PR, no delete path, no history).
 #
-# ⛔ THIS IS A `sed` REPLACEMENT, NOT AN IMPROVEMENT — the `sed` cost 2 process spawns per call and
-# the sync calls it 3-8 times PER RECORD, which measured 0.37 s/record on the landing path (#3180).
-# It is now pure parameter expansion, and its semantics are the OLD ONES EXACTLY: per LINE, the LAST
-# feasible occurrence of `"<name>":` (sed's greedy leading `.*`), an OPTIONAL opening quote, a
-# maximal run of [^",}], an optional closing quote; the FIRST matching line wins. Parity with the
-# `sed` is ASSERTED in scripts/registry-sync.test.sh §27 rather than argued here — including the
-# cases a "cleaner" reimplementation gets wrong (a nested duplicate key, where the LAST wins rather
-# than the top-level one; an unquoted number; a value containing `,` or `}`).
+# SO THE READ IS THE READER'S PARSE. What keeps it cheap (#3180's win: a converged 4,027-record run
+# must not spawn per record) is a SHAPE GATE, not a second semantics. A record whose bytes are ONE
+# line, one outer `{…}`, and NO nested container can only be read one way: on such a line a
+# last-match scan IS the top-level value — including a repeated key, which resolves to the LAST one,
+# exactly as `json.load` resolves it — so that shape takes the spawn-free path. Everything else (a
+# nested object or array, a multi-line file, anything that is not a JSON object) goes to `python3`'s
+# strict parse. Every record `record-review.sh` writes is the flat shape (its `printf` emits one
+# flat line), so the fast path is the whole real registry and the spawn cost is paid only on bytes
+# that are anomalous by construction.
+# No python3 ⇒ EMPTY, which every caller already treats as unreadable, so the run fails CLOSED and
+# nothing is overwritten — the same posture as `record_usable`.
 #
 # ⛔ THREE trims, never one bracket class: `${rest%%[,\"}]*}` ends the EXPANSION at the `}` inside the
 # class and leaves literal garbage in the value (reproduced). The three trims are order-independent:
 # each takes the prefix before the first occurrence of its own character.
 field() { # <file> <name>
-  local f="$1" n="$2" line rest
+  local f="$1" n="$2" l1="" l2="" rest
   [ -f "$f" ] || return 0
-  while IFS= read -r line || [ -n "$line" ]; do
-    case "$line" in
-      *"\"$n\":"*) ;;
-      *) continue ;;
-    esac
-    rest="${line##*"\"$n\":"}"    # greedy-LAST occurrence — sed's leading `.*`
-    rest="${rest#\"}"               # the OPTIONAL opening quote (`\{0,1\}` in the sed)
-    rest="${rest%%[,]*}"            # ┐
-    rest="${rest%%\}*}"             # ├ sed's [^",}] class, applied as three prefix trims
-    rest="${rest%%\"*}"            # ┘
-    printf '%s' "$rest"
-    return 0
-  done < "$f"
-  return 0
+  { IFS= read -r l1 || :; IFS= read -r l2 || :; } < "$f" 2>/dev/null
+  case "$l1" in
+    '{'*'}')
+      if [ -z "$l2" ]; then
+        # ⛔ a `}` inside a `${var//…}` pattern TERMINATES the expansion (measured: it yields the
+        # input followed by a literal `]/}`), so the natural `[^}]` class silently does nothing
+        # here. `case` patterns have no such problem, and stripping the outer braces by hand is
+        # enough: any container character left in the INTERIOR means "not the flat shape".
+        rest="${l1%\}}"; rest="${rest#*\{}"
+        case "$rest" in
+          *'{'*|*'}'*|*'['*|*']'*) ;;
+          *)
+            case "$l1" in *"\"$n\":"*) ;; *) return 0 ;; esac
+            rest="${l1##*"\"$n\":"}"    # greedy-LAST occurrence — on a flat line, THE top level
+            rest="${rest#\"}"               # the OPTIONAL opening quote
+            rest="${rest%%[,]*}"            # ┐
+            rest="${rest%%\}*}"             # ├ the value class, applied as three prefix trims
+            rest="${rest%%\"*}"             # ┘
+            printf '%s' "$rest"
+            return 0 ;;
+        esac
+      fi ;;
+  esac
+  _field_json "$f" "$n"
+}
+
+# The reader's own parse, for a record whose shape cannot be read line-wise (see `field`). One
+# `python3` per CALL, and only for those shapes — never for a record `record-review.sh` writes.
+_field_json() { # <file> <name>
+  command -v python3 >/dev/null 2>&1 || return 0
+  python3 - "$1" "$2" <<'PY' 2>/dev/null
+import json, sys
+try:
+    with open(sys.argv[1]) as fh:
+        d = json.load(fh)
+except Exception:
+    sys.exit(0)
+v = d.get(sys.argv[2], "") if isinstance(d, dict) else ""
+if v is None or isinstance(v, (dict, list)):
+    v = ""
+elif isinstance(v, bool):
+    v = "true" if v else "false"
+elif not isinstance(v, str):
+    v = str(v)
+print(v)
+PY
 }
 
 # ── what the CONSUMER can actually use ───────────────────────────────────────────────────
@@ -369,7 +412,43 @@ write_local() { # <key> <content-file>
 
 same_bytes() { [ -f "$1" ] && [ -f "$2" ] && cmp -s "$1" "$2"; }
 
+# ── serialising compare+write ────────────────────────────────────────────────────────────
+# `pull` reads this box's record, decides, then writes. Without a lock a record MINTED between the
+# comparison and the rename is silently replaced by the peer's older bytes — rule 1 lost to a race,
+# and unrecoverably (the store keeps one record per PR and there is no delete path). Nothing else
+# that writes this directory takes a lock of its own (a `record-review.sh` mint, an operator's
+# `registry-sync.sh pull`, and `cloud-cell-bringup.sh`'s union all land here), so the most a lock can
+# do is exclude a CONCURRENT SYNC RUN — which is the interleaving that actually loses bytes on one
+# box, and it is taken per KEY rather than per run so a long network-bound pull cannot block a
+# second one for minutes (#2510 P2).
+#
+# mkdir, not flock: flock is absent on stock macOS (this file already avoids `timeout` for the same
+# reason). Bounded (~5 s) so a landing can never hang on it, and reclaimable: a lock whose recorded
+# holder pid is GONE is a killed run, and is reclaimed rather than allowed to wedge every future pull.
+reg_lock() { # 0 = held, 1 = could not serialise (the caller must NOT write)
+  local i=0 pidf pid
+  [ -d "$REG_DIR" ] || mkdir -p "$REG_DIR" 2>/dev/null || return 1
+  LOCKDIR="$REG_DIR/.registry-sync.lock"
+  while [ "$i" -lt 50 ]; do
+    if mkdir "$LOCKDIR" 2>/dev/null; then
+      printf '%s\n' "$$" > "$LOCKDIR/pid" 2>/dev/null || :
+      return 0
+    fi
+    pidf="$LOCKDIR/pid"; pid=""
+    [ -f "$pidf" ] && pid="$(command cat "$pidf" 2>/dev/null)"
+    if [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null; then
+      warn "  ⚠️ reclaiming $LOCKDIR — its holder (pid $pid) is gone (a killed run)."
+      rm -rf "$LOCKDIR" 2>/dev/null || :
+      continue
+    fi
+    sleep 0.1; i=$((i + 1))
+  done
+  return 1
+}
+reg_unlock() { [ -n "${LOCKDIR:-}" ] && rm -rf "$LOCKDIR" 2>/dev/null; LOCKDIR=""; return 0; }
+
 PUSHED=0 SKIPPED_OLDER=0 SAME=0 WROTE=0 CONFLICT=0 UNKEYED=0 UNREADABLE=0 FAILED=0 PUSH_FAILED=0 UNCHANGED=0
+LOCKDIR=""
 # ── ONE listing per run (agent-infra#3180) ───────────────────────────────────────────────────────
 # `union` = `do_pull` then `do_push`, and both called `fetch_refs` — 4 git network calls to read the
 # SAME namespace twice (measured: ls-remote 2.4-3.9 s + fetch 3.7 s, so ~10-15 s of a land bought
@@ -534,6 +613,21 @@ push_one() { # <key> <source-file>
 }
 
 pull_one() { # <key>
+  # The lock covers the COMPARE and the WRITE (see reg_lock). The wrapper exists so every one of
+  # pull_one_locked's early returns releases it — a lock leaked on an early return would wedge the
+  # next run, which is a worse failure than the race it prevents.
+  if ! reg_lock; then
+    warn "  ⚠️ skip $1 — could not serialise the registry (another run holds $REG_DIR/.registry-sync.lock);"
+    warn "     NOTHING was written, so no record was overwritten with an older one. Re-run to retry."
+    FAILED=$((FAILED + 1)); return 0
+  fi
+  pull_one_locked "$1"
+  local rc=$?
+  reg_unlock
+  return "$rc"
+}
+
+pull_one_locked() { # <key>
   local key="$1" tmp lf rat lat pull_reason=""
   tmp="$(mktemp "${TMPDIR:-/tmp}/registry-sync-pull.XXXXXX")" || { FAILED=$((FAILED + 1)); return 0; }
   if ! remote_record "$key" >"$tmp" 2>/dev/null || [ ! -s "$tmp" ]; then
@@ -552,15 +646,19 @@ pull_one() { # <key>
     fi
     rm -f "$tmp"; return 0
   fi
+  # ⛔ USABILITY BEFORE ORDERING, AND BEFORE ANY FIELD READ. A record the rail cannot read must
+  # never win the comparison: it would replace a usable local record with bytes `read_record`
+  # refuses (see `record_usable`). It is checked FIRST because `field` is now the READER'S parse: a
+  # record that is not strict JSON has no readable `reviewed_at` either, so the ordering arm below
+  # would report "no readable reviewed_at" for a file whose real defect is that it is UNUSABLE — a
+  # less accurate reason for the same skip, and the one §19 pins.
+  if ! record_usable "$tmp"; then
+    warn "  ⚠️ skip $key — the peer's record is not one this box's rail can USE (no 40-hex head_sha, no verdict, or not strict JSON); refusing to install it over $(if local_record_for_key "$key" >/dev/null 2>&1; then echo 'the local record'; else echo 'nothing'; fi)."
+    rm -f "$tmp"; UNREADABLE=$((UNREADABLE + 1)); return 0
+  fi
   rat="$(field "$tmp" reviewed_at)"
   if [ -z "$rat" ]; then
     warn "  ⚠️ skip $key — the peer's record carries no readable reviewed_at."
-    rm -f "$tmp"; UNREADABLE=$((UNREADABLE + 1)); return 0
-  fi
-  # ⛔ USABILITY BEFORE ORDERING. A record the rail cannot read must never win the comparison: it
-  # would replace a usable local record with bytes `read_record` refuses (see `record_usable`).
-  if ! record_usable "$tmp"; then
-    warn "  ⚠️ skip $key — the peer's record is not one this box's rail can USE (no 40-hex head_sha, no verdict, or not strict JSON); refusing to install it over $(if local_record_for_key "$key" >/dev/null 2>&1; then echo 'the local record'; else echo 'nothing'; fi)."
     rm -f "$tmp"; UNREADABLE=$((UNREADABLE + 1)); return 0
   fi
   # ⛔ THE KEY MUST MATCH WHAT THE RECORD SAYS IT IS, on the way IN as well as out. `push` refuses
@@ -593,6 +691,18 @@ pull_one() { # <key>
     same_bytes "$lf" "$tmp" && { SAME=$((SAME + 1)); rm -f "$tmp"; return 0; }
     lat="$(field "$lf" reviewed_at)"
     if [ -n "$lat" ] && [[ "$lat" > "$rat" ]]; then
+      # ⛔ A local record that is NEWER but that this box's own reader cannot USE wins the
+      # comparison for ever, and `pull` is named as the remedy on the very refusal it causes
+      # (atomic-land.sh's "no review record" message) — so a lane was told to run a verb that can
+      # never help. Rule 1 is NOT relaxed (the newer bytes are not overwritten); what changes is
+      # that the run NAMES the real state and the real remedy instead of reporting a
+      # converged-looking `keep` (#2510 P2).
+      if ! record_usable "$lf"; then
+        warn "  ⚠️ skip $key — this box's record is NEWER ($lat > $rat) but is NOT one its own rail can use"
+        warn "     (no 40-hex head_sha, no verdict, or not strict JSON). It is NOT overwritten (#2374 rule 1)"
+        warn "     and \`pull\` cannot repair it — remove or re-mint $lf, or the lane keeps reading the older one."
+        UNREADABLE=$((UNREADABLE + 1)); rm -f "$tmp"; return 0
+      fi
       log_line "  · keep $key — this box is NEWER ($lat > $rat); an older record never overwrites a newer one (#2374 rule 1)"
       SKIPPED_OLDER=$((SKIPPED_OLDER + 1)); rm -f "$tmp"; return 0
     fi
