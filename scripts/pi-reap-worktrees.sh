@@ -5483,8 +5483,10 @@ run() {
     # leave this consolidation silently inert — measured: with `AGENT_INFRA_PATH` naming a checkout that
     # predates `resolve_repo`, sourcing the first existing candidate left the resolver undefined and the
     # reaper answered with the OLD refusal.
-    # The FARM copy (`~/.pi/agent/scripts/`, no orchestrator-harness subtree) legitimately finds none,
-    # and it always arrives with `--repo` from its launchd template — so an UNRESOLVED REPO is the only
+    # The FARM copy (`~/.pi/agent/scripts/`) is a flat tree with no `orchestrator-harness` subtree, so
+    # only the SECOND candidate can match there — and it does: since ai#1552 the farm delivers
+    # `repo-slug.sh` beside this script, so that box resolves like any other. It also always arrives with
+    # `--repo` from its launchd template — so an UNRESOLVED REPO is the only
     # case that may not proceed, and an already-named one keeps the validation four lines below
     # (`rev-parse --git-common-dir`, which proves strictly more than resolve_repo's toplevel probe).
     _repo_lib_stale=""
