@@ -1484,9 +1484,20 @@ assert_not_contains "$RECORD_ERR" "cannot be certified" "8.16 unreadable: a 401 
 # `move the echo back above the read` reds ONLY the first vector below, and
 # deleting the echo reds only the second.
 #
-# A PATH shim ahead of the real `mktemp` — not `TMPDIR=/nonexistent`, which also
-# kills the compare arm's `CMP_ERR` (`:907`) and so degrades two arms at once
-# instead of the one under test.
+# A PATH shim ahead of the real `mktemp` is used to reach it. ⛔ THE SHIM IS NOT
+# NARROWER THAN `TMPDIR=/nonexistent` — an earlier revision of this comment claimed
+# it was, and that claim is false (measured by the a3ceaae2f round's reviewer): a
+# missing `mktemp` fails EVERY bare call in the recorder (`:845` this pulls status,
+# `:907` `CMP_ERR`, `:1568`/`:1952`/`:1953` the delta arms, `:3758`/`:3805`/`:3806`
+# the diff hash, `:3931`/`:3956`/`:3974`/`:4005` the record/evidence temps), and
+# `TMPDIR=/nonexistent` fails the same set. That is deliberate, not a limitation:
+# a box with no working `mktemp` IS globally degraded, so the vector must assert
+# what such a box actually does rather than a hypothetical one-arm version of it.
+# It is also why 424375 asserts that the run still CERTIFIES (the compare arm has
+# its own silent `:907` fallback and survives on it) instead of asserting that only
+# the pulls arm degraded. The compare arm's fallback still cannot KEEP a status, so
+# a compare 404 on a `mktemp`-less box reads as transport — pre-existing, not this
+# change's, and recorded with its measurement on #2624.
 NOMKT="$T/nomktemp"; mkdir -p "$NOMKT"
 printf '%s\n' '#!/usr/bin/env bash' 'exit 1' > "$NOMKT/mktemp"; chmod +x "$NOMKT/mktemp"
 
