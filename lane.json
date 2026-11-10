@@ -1,0 +1,21 @@
+{
+  "artifacts": [],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 7800,
+  "exit_code": null,
+  "heartbeat_at": 1794313069,
+  "host": "cmux",
+  "issue": 2465,
+  "kind": "lane",
+  "lane_id": "cmux.klane-2465-1794313069-p2442785-3abe1080",
+  "lease_until": 1794320869,
+  "pid": 2442785,
+  "reason": null,
+  "repo": "daniel-ospina/agent-infra",
+  "schema": 1,
+  "started_at": 1794313069,
+  "state": "RUNNING",
+  "tag": "2465",
+  "worktree": "/home/cmux/agent-infra/.worktrees/tm-2465"
+}
