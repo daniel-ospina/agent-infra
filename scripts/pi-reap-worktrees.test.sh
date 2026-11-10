@@ -3949,9 +3949,9 @@ assert_contains "$OUT" "  $WT" "A29p …with the stranded record's path"
 assert_contains "$OUT" "AT OR PAST" \
     "A29p the legend states the qualifier the row is printed under, on the row's own terms"
 assert_contains "$OUT" "in that class's own unit" \
-    "A29p …and the UNIT, so `floor=1800s` is not contradicted two lines further down"
+    "A29p …and the UNIT, so a floor=1800s row is not contradicted two lines further down"
 assert_contains "$OUT" "CANNOT release that one" \
-    "A29p …and a class-aware remedy, because `--reap-abandoned-wip` cannot release a stash-withheld record"
+    "A29p …and a class-aware remedy, because --reap-abandoned-wip cannot release a stash-withheld record"
 assert_dir "$WT" "A29p nothing was removed — the stash entry still parks lane work"
 
 # A29p-MUT: the token is what makes the leg above able to fail. This mutation IS the pre-fix code —
@@ -4039,7 +4039,7 @@ assert_dir "$WT" "A29r-MUT the mutation changes the REPORT only — nothing is r
 # documentation fixes could have been undone in silence. One leg, one grep per claim.
 HELP="$("$REAPER" --help)"
 assert_contains "$HELP" "REAP_WT_STALE_INIT_SECONDS" \
-    "A29u --help NAMES the interrupted-add floor (a `floor=1800s` row is look-up-able)"
+    "A29u --help NAMES the interrupted-add floor (a floor=1800s row is look-up-able)"
 assert_contains "$HELP" "The three floors a listed row can name" \
     "A29u …and says there are THREE floors, not two"
 assert_absent "$HELP" "always an hour count" \
